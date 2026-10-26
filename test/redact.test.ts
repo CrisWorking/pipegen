@@ -637,6 +637,16 @@ describe('redact: speed', () => {
     shapes.push(('ey' + 'J' + 'a'.repeat(1990) + '.' + 'b'.repeat(1990) + '\n').repeat(250));
     shapes.push((('a'.repeat(30) + 'tok' + 'en ').repeat(110) + '\n').repeat(250));
     shapes.push(('pass' + 'word: |\n' + '  x\n'.repeat(250_000)));
+    // round 4: namespaced and closed elements, attribute runs, many tags or keys before one '>', trailing CRs
+    shapes.push(...[
+      '<a:pass' + 'word ', '<a:pass' + 'word>', '</pass' + 'word>', '<pass' + 'word>x</pass' + 'word>', '<a key="a:b/c d tok' + 'en" ',
+      'a b:c/d tok' + 'en ', ' tok' + 'en', '<a:b:tok' + 'en ', '<x:tok' + 'en value="', '<add key="Smtp:Pass' + 'word" value="x"/>',
+    ].map((u) => (line(u) + '\n').repeat(250)));
+    shapes.push((('<a key="tok' + 'en" value="').repeat(160) + '>\n').repeat(250));
+    shapes.push((("<a key='tok" + "en' value=\"").repeat(160) + '>\n').repeat(250));
+    shapes.push((('<tok' + 'en>').repeat(570) + '</tok' + 'en>\n').repeat(250));
+    shapes.push(('<a key=' + ' '.repeat(2000) + '"' + (' tok' + 'en').repeat(330) + '\n').repeat(250));
+    shapes.push(('pass' + 'word: |' + '\r'.repeat(3990) + '\n').repeat(250));
     redact(shapes[0]); // warm-up
     for (const text of shapes) {
       const runs = [0, 1, 2].map(() => {
@@ -858,5 +868,105 @@ describe('fix round 3', () => {
     expect(redact(`run --${k} = x y`)).toBe(`run --${k} = ${R} y`);
     expect(redact(`run --${k}: x y`)).toBe(`run --${k}: ${R} y`);
     expect(redact(`run --${t} := "a b" c`)).toBe(`run --${t} := "${R}" c`);
+  });
+});
+
+describe('fix round 4', () => {
+  const k = 'pass' + 'word';
+  const K = 'Pass' + 'word';
+  const t = 'tok' + 'en';
+  const sec = 'sec' + 'ret';
+  const au = 'au' + 'th';
+  const S = 'S3kr' + 'etV4l';
+
+  // [input, expected] pairs; every input holds S, every expected output hides it.
+  const xmlCases = (): [string, string][] => [
+    // attributes after a tag whose name holds a keyword are still checked
+    [`<basic${au[0].toUpperCase()}${au.slice(1)} user="admin" ${k}="${S}"/>`, `<basic${au[0].toUpperCase()}${au.slice(1)} user="admin" ${k}="${R}"/>`],
+    [`<${au} username="u" ${k}="${S}"/>`, `<${au} username="u" ${k}="${R}"/>`],
+    [`<${t} type="bearer" ${sec}="${S}">`, `<${t} type="bearer" ${sec}="${R}">`],
+    [`<${t} type="bearer" ${sec}="${S}">abc</${t}>`, `<${t} type="bearer" ${sec}="${R}">${R}</${t}>`],
+    [`<Au${'th'}Provider client${sec[0].toUpperCase()}${sec.slice(1)}="${S}">`, `<Au${'th'}Provider client${sec[0].toUpperCase()}${sec.slice(1)}="${R}">`],
+    [`if (i <${t} && y) { ${k} = "${S}"; } else if (z > 1) {}`, `if (i <${t} && y) { ${k} = "${R}"; } else if (z > 1) {}`],
+    // a tag named after a keyword also has its value attributes hidden
+    [`<${k} value="${S}"/>`, `<${k} value="${R}"/>`],
+    [`<${sec} name="db" value="${S}"/>`, `<${sec} name="db" value="${R}"/>`],
+    // round-3 shapes
+    [`<${k}>${S}</${k}>`, `<${k}>${R}</${k}>`],
+    [`<${k} type="t">${S}</${k}>`, `<${k} type="t">${R}</${k}>`],
+    [`<add key="Db${k}" value="${S}"/>`, `<add key="Db${k}" value="${R}"/>`],
+    [`<add value='${S}' key='Api${t}' />`, `<add value='${R}' key='Api${t}' />`],
+  ];
+
+  it('redact: XML attributes after a secret-named tag are still checked', () => {
+    for (const [input, want] of xmlCases()) expect(redact(input), want).toBe(want);
+    // a generic type in code is not a tag: what follows is still scanned
+    expect(redact(`List<${t[0].toUpperCase()}${t.slice(1)}> a = b; String ${k} = "${S}";`)).toBe(`List<${t[0].toUpperCase()}${t.slice(1)}> a = b; String ${k} = "${R}";`);
+  });
+
+  it('bundle: XML attributes after a secret-named tag are still checked', async () => {
+    const dir = makeTempDir();
+    const cases = xmlCases();
+    const files = ['config/web.xml', 'src/App.tsx', 'src/loop.c'];
+    files.forEach((f) => writeIn(dir, f, cases.map(([input]) => input).join('\n') + '\n'));
+    const b = await bundleCode(dir);
+    const want = cases.map(([, w]) => w).join('\n') + '\n';
+    for (const f of files) expect(b.files.find((x) => x.path === f)?.content, f).toBe(want);
+    expect(allText(b)).not.toContain(S);
+  });
+
+  it('redact: .NET and Spring key variants, Hibernate element text, namespaced elements', () => {
+    const cases: [string, string][] = [
+      [`<add key="Smtp:${K}" value="${S}" />`, `<add key="Smtp:${K}" value="${R}" />`],
+      [`<add key="App/Db${K}" value="${S}" />`, `<add key="App/Db${K}" value="${R}" />`],
+      [`<add key="Smtp ${K}" value="${S}" />`, `<add key="Smtp ${K}" value="${R}" />`],
+      [`<add key="Smtp.${K}" value="${S}" />`, `<add key="Smtp.${K}" value="${R}" />`],
+      [`<property name="hibernate.connection.${k}">${S}</property>`, `<property name="hibernate.connection.${k}">${R}</property>`],
+      [`<entry key="db.${k}">${S}</entry>`, `<entry key="db.${k}">${R}</entry>`],
+      [`<setting name="Db${K}" serializeAs="String"><value>${S}</value></setting>`, `<setting name="Db${K}" serializeAs="String">${R}</setting>`],
+      [`<db:${k}>${S}</db:${k}>`, `<db:${k}>${R}</db:${k}>`],
+      [`<db:${k} type="t">${S}</db:${k}>`, `<db:${k} type="t">${R}</db:${k}>`],
+    ];
+    for (const [input, want] of cases) expect(redact(input), want).toBe(want);
+    for (const keep of ['<add key="Smtp:Host" value="mail.example.com" />', '<property name="hibernate.dialect">x</property>', '<db:host>h</db:host>']) {
+      expect(redact(keep), keep).toBe(keep);
+    }
+  });
+
+  it('redact: block rule off only for code files (denylist), template and backup suffixes stripped', () => {
+    const text = `${k}:\n  hidden-line\n`;
+    const hidden = `${k}:\n  ${R}\n`;
+    for (const path of ['config.yml.example', 'values.yaml.j2', 'app.yaml.tmpl', 'README.md', 'settings.json', 'Dockerfile', 'notes.txt', 'x.unknown', 'deploy/app.yml.dist', '.env.local', 'Procfile']) {
+      expect(redact(text, { path }), path).toBe(hidden);
+    }
+    for (const path of ['app.py.bak', 'x.py', 'src/a.ts', 'b.go', 'Main.JAVA', 'run.sh', 'x.py.example.bak', 'lib/x.rb.orig']) {
+      expect(redact(text, { path }), path).toBe(text);
+    }
+  });
+
+  it('bundle: block rule off only for code files (denylist)', async () => {
+    const dir = makeTempDir();
+    const text = `${k}:\n  hidden-line\n`;
+    for (const f of ['config.yml.example', 'values.yaml.j2', 'README.md', 'settings.json', 'Dockerfile', 'app.py.bak', 'x.py']) writeIn(dir, f, text);
+    const b = await bundleCode(dir);
+    for (const f of ['config.yml.example', 'values.yaml.j2', 'README.md', 'settings.json', 'Dockerfile']) expect(b.files.find((x) => x.path === f)?.content, f).toBe(`${k}:\n  ${R}\n`);
+    for (const f of ['app.py.bak', 'x.py']) expect(b.files.find((x) => x.path === f)?.content, f).toBe(text);
+  });
+
+  it('scrubKnownValues: a typed value holding CRLF or a lone CR is removed from an LF file', async () => {
+    expect(scrubKnownValues('a pre\nmid b', ['pre\r\nmid'])).toBe(`a ${R} b`);
+    expect(scrubKnownValues('a pre\nmid b', ['pre\rmid'])).toBe(`a ${R} b`);
+    expect(scrubKnownValues('a pre\r\nmid b', ['pre\r\nmid'])).toBe(`a ${R} b`);
+    const dir = makeTempDir();
+    writeIn(dir, 'src/a.txt', 'x pre\nmid y\n');
+    writeIn(dir, 'src/b.txt', 'x pre\r\nmid y\r\n');
+    const b = await bundleCode(dir, { knownValues: ['pre\r\nmid'] });
+    for (const f of b.files) expect(f.content, f.path).toBe(`x ${R} y\n`);
+  });
+
+  it('redact: several trailing CRs on a line all count as the line end', () => {
+    expect(redact(`${k}: |\r\r\n  v\r\r\nnext: 1`)).toBe(`${k}: |\r\r\n  ${R}\r\r\nnext: 1`);
+    expect(redact(`${k}:\r\r\n  v\r\nnext: 1`)).toBe(`${k}:\r\r\n  ${R}\r\nnext: 1`);
+    expect(redact(`${k}=x y\r\r\nok=1`)).toBe(`${k}=${R}\r\r\nok=1`);
   });
 });

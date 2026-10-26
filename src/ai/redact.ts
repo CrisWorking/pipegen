@@ -160,6 +160,10 @@ function jwtSpans(s: string): Span[] {
  * password, or the user holds an `@`), the whole token is used: from the authority's first `:` to the
  * token's last `@` before a host-like character (hiding too much is the safe side). Each character is
  * visited a bounded number of times: linear time.
+ * Known limits (gitleaks' connection-string rule covers them): with user `admin`, password `P@ss#2024` and
+ * host `db`, the `2024` stays (the authority ends at the `#` and already holds user:password@; a later `@`
+ * could as well be in a query, `?y=z@w`); and a password with `#` or `?` before a percent-encoded socket
+ * host (`@%2Fvar%2Frun/db`), whose `@` is not followed by a host-like character.
  */
 function connectionSpans(s: string): Span[] {
   const spans: Span[] = [];
@@ -271,10 +275,10 @@ function isSecretName(name: string): boolean {
 
 const isQuote = (c: number) => c === 34 || c === 39 || c === 96; // " ' `
 
-/** Index of the quote closing the one at `open` (backslash escapes honoured), or -1. */
-function closingQuote(s: string, open: number): number {
+/** Index of the quote closing the one at `open` (backslash escapes honoured), looked for before `limit`, or -1. */
+function closingQuote(s: string, open: number, limit = s.length): number {
   const q = code(s, open);
-  for (let j = open + 1; j < s.length; j++) {
+  for (let j = open + 1; j < limit; j++) {
     const c = code(s, j);
     if (c === 92) j++; // backslash
     else if (c === q) return j;
@@ -289,25 +293,67 @@ const skipBlanks = (s: string, i: number) => {
 
 /**
  * Hides values given to password-like names. A name is a run of [A-Za-z0-9_.-] holding a keyword
- * (password, passwd, pwd, secret, token, api key, private key, access key, client secret, or auth as a
- * word); it may be quoted or a subscript (`env["DB_PASSWORD"]`). Forms covered:
+ * (password, passwd, pwd, secret, token, api key, private key, access key, client secret, or auth; see
+ * isSecretName); it may be quoted or a subscript (`env["DB_PASSWORD"]`). Forms covered:
  * - `name SEP value` with SEP one of `=`, `:`, `=>`, `:=`: a quoted value (single, double, backtick,
  *   or triple quotes) has its inside replaced, quotes kept; an unquoted value hides the rest of the line;
  *   an empty value or a YAML block indicator (`|`, `>`, with `-`/`+`) starts an indented block, which
  *   redact() hides line by line.
  * - Authorization with a Bearer/Basic/Token/Digest value: the scheme word stays, what follows is hidden.
- * - long CLI flags `--name value` / `--name=value`; XML `<name>value</name>` on one line.
- * Known limits (gitleaks is the second line there): a quoted value that continues on the next lines (e.g.
- * Python/TOML triple quotes spanning lines), string concatenation after the first quoted part
- * (`"abc" + "def"`), setter calls (`setPassword("x")`), keys with spaces (`"api key"`) and non-ASCII names.
+ * - long CLI flags `--name value` / `--name=value`;
+ * - XML on one line: an element named after a secret (`<password>`, `<db:password ...>`) has its
+ *   value="..." attributes hidden, and its text when a matching end tag follows; a quoted attribute value
+ *   holding a secret name (`key="DbPassword"`, `key="Smtp:Password"`, `name="db.password"`) hides the
+ *   tag's value="..." attributes and the element's text the same way. Other attributes are scanned as
+ *   ordinary `name="value"` assignments.
+ * Known limits (gitleaks is the second line there, including its connection-string rule): a quoted value
+ * that continues on the next lines (e.g. Python/TOML triple quotes spanning lines), XML values split across
+ * lines, string concatenation after the first quoted part (`"abc" + "def"`), setter calls
+ * (`setPassword("x")`), keys with spaces (`"api key"`) and non-ASCII names; the names `authorisation` and
+ * `authentication` (they start with a word on the safe list) and `oauthkey` (a bare oauth); and two
+ * connection-string shapes (see connectionSpans): a password holding `#` after a user:password@ part (a
+ * postgres URL with user `admin`, password `P@ss#2024` and host `db` is only partly hidden, since the `@`
+ * after the `#` cannot be told apart from an `@` in a query such as `?y=z@w`), and a percent-encoded socket
+ * host after the `@` (password `pa#ss`, host `%2Fvar%2Frun`).
  * Over-redacting is the safe direction: type annotations such as `token: string` lose their type too.
  */
 function assignmentSpans(s: string): { spans: Span[]; block: boolean } {
   const spans: Span[] = [];
   const n = s.length;
   let block = false;
-  const tags = tagFinder(s);
-  let handledTag = -1;
+  const tags = tagTables(s);
+  let handledTag = -1; // tags are reached in order of their '<', so one number marks those already handled
+  const hideElementText = (qname: string, tagEnd: number) => {
+    const close = tags.closerAfter(qname, tagEnd);
+    if (close > tagEnd + 1) spans.push([tagEnd + 1, close]);
+  };
+  // The tag opened at `open`: hide its value="..." attributes and, for a start tag, its text up to a matching end tag.
+  const handleTag = (open: number) => {
+    if (open <= handledTag) return;
+    handledTag = open;
+    const tag = tags.tagAt(open);
+    spans.push(...valueAttributeSpans(s, open, tag.end));
+    if (tag.closed && code(s, tag.end - 1) !== 47 /* not self-closing */) {
+      let e = open + 1;
+      while (e < n && (isNameChar(code(s, e)) || code(s, e) === 58)) e++;
+      if (e > open + 1) hideElementText(s.slice(open + 1, e), tag.end);
+    }
+  };
+  // The run of name characters, ':', '/' and blanks around a name (as in key="Smtp:Password"). Runs never
+  // overlap and names come in order, so only the last one is kept and each character is walked once.
+  // Returns null for a run already looked at (the answer would be the same).
+  let runA = -1;
+  let runB = -1;
+  const newAttributeRun = (from: number, to: number): Span | null => {
+    if (from >= runA && from < runB) return null;
+    let a = from;
+    while (a > 0 && isAttributeRunChar(code(s, a - 1))) a--;
+    let b = to;
+    while (b < n && isAttributeRunChar(code(s, b))) b++;
+    runA = a;
+    runB = b;
+    return [a, b];
+  };
   let i = 0;
   while (i < n) {
     if (!isNameChar(code(s, i))) { i++; continue; }
@@ -318,26 +364,31 @@ function assignmentSpans(s: string): { spans: Span[]; block: boolean } {
     const before = start > 0 ? code(s, start - 1) : -1;
     let p = i;
 
-    // XML element: <name>value</...> or <name attr="...">value</...> (not self-closing). The searches cover
-    // text the scan then jumps over, so they stay linear.
-    if (before === 60 /* < */ && (code(s, p) === 62 || code(s, p) === 32 || code(s, p) === 9)) {
-      const tagEnd = code(s, p) === 62 ? p : s.indexOf('>', p);
-      if (tagEnd < 0) { i = n; continue; }
-      if (code(s, tagEnd - 1) === 47 /* / */) { i = tagEnd + 1; continue; }
-      const close = s.indexOf('<', tagEnd + 1);
-      const end = close < 0 ? n : close;
-      if (end > tagEnd + 1) spans.push([tagEnd + 1, end]);
-      i = end;
-      continue;
+    // XML element named after a secret: <name>, <name attr="...">, <ns:name ...>. Its value="..." attributes
+    // are hidden, and its text when a matching </name> follows on the line. The scan then goes on from just
+    // after the name, so the tag's other attributes (password="...") and the rest of the line are still
+    // checked; a `<` that is not a tag (`i <token && y`) changes nothing else. All lookups use one-pass
+    // tables, so this stays linear.
+    let lt = -1; // the '<' opening this element, if any
+    if (before === 60 /* < */) lt = start - 1;
+    else if (before === 58 /* : */) { // a namespace prefix: walk back over it (each prefix is walked once)
+      let b = start - 2;
+      while (b >= 0 && isNameChar(code(s, b))) b--;
+      if (b >= 0 && b < start - 2 && code(s, b) === 60) lt = b;
     }
-    // XML attribute naming a secret, .NET style: <add key="DbPassword" value="..."/> hides the value attribute
-    if ((before === 34 || before === 39) && code(s, p) === before) {
-      const eq = skipBlanksBack(s, start - 2);
-      if (eq >= 0 && code(s, eq) === 61 /* = */) {
-        const tag = tags.enclosing(start);
-        if (tag !== null && tag[0] > handledTag) {
-          handledTag = tag[0];
-          spans.push(...valueAttributeSpans(s, tag[0], tag[1]));
+    if (lt >= 0 && (p >= n || code(s, p) === 62 || code(s, p) === 32 || code(s, p) === 9 || code(s, p) === 47)) handleTag(lt);
+    // A quoted attribute value holding a secret name, .NET/Spring style: <add key="DbPassword" value="..."/>,
+    // also key="Smtp:Password", "App/DbPassword", "Smtp Password". Hides every value="..." attribute of
+    // the tag, and the element's text when a matching end tag follows (<property name="db.password">x</property>).
+    const run = name.startsWith('--') ? null : newAttributeRun(start, i);
+    if (run !== null) {
+      const [a, b] = run;
+      const q = b < n ? code(s, b) : -1;
+      if ((q === 34 || q === 39) && a > 0 && code(s, a - 1) === q) {
+        const eq = skipBlanksBack(s, a - 2);
+        if (eq >= 0 && code(s, eq) === 61 /* = */) {
+          const open = tags.enclosing(start);
+          if (open >= 0) handleTag(open);
         }
       }
     }
@@ -417,42 +468,75 @@ const skipBlanksBack = (s: string, i: number) => {
   return i;
 };
 
-/** Finds the `<...>` tag around a position; tables built in one pass on first use. */
-function tagFinder(s: string): { enclosing(i: number): Span | null } {
+const isAttributeRunChar = (c: number) => isNameChar(c) || c === 58 /* : */ || c === 47 /* / */ || c === 32 || c === 9;
+
+/**
+ * Lookups for `<...>` tags on one line, each table built in one pass on first use:
+ * - enclosing(i): the '<' of the tag around i (a '<' before i with no '>' between), or -1;
+ * - tagAt(open): where that tag ends: at its '>' (closed), or, when another '<' or the end of the line
+ *   comes first, there (not closed). Tags found this way never overlap, so scanning each one is linear;
+ * - closerAfter(name, from): the '<' of the first `</name` (any case, then '>' or a blank) after `from`, or -1.
+ */
+function tagTables(s: string) {
+  const n = s.length;
   let lastLt: Int32Array | null = null;
   let lastGt: Int32Array | null = null;
-  let nextGt: Int32Array | null = null;
+  let nextStop: Int32Array | null = null; // next '<' or '>' at or after i, or n
+  let closers: Map<string, number[]> | null = null;
+  const build = () => {
+    lastLt = new Int32Array(n);
+    lastGt = new Int32Array(n);
+    nextStop = new Int32Array(n + 1);
+    let lt = -1;
+    let gt = -1;
+    for (let p = 0; p < n; p++) {
+      if (code(s, p) === 60) lt = p;
+      if (code(s, p) === 62) gt = p;
+      lastLt[p] = lt;
+      lastGt[p] = gt;
+    }
+    nextStop[n] = n;
+    for (let p = n - 1; p >= 0; p--) nextStop[p] = code(s, p) === 60 || code(s, p) === 62 ? p : nextStop[p + 1];
+  };
   return {
-    enclosing(i: number): Span | null {
-      if (lastLt === null || lastGt === null || nextGt === null) {
-        const n = s.length;
-        lastLt = new Int32Array(n);
-        lastGt = new Int32Array(n);
-        nextGt = new Int32Array(n + 1);
-        let lt = -1;
-        let gt = -1;
-        for (let p = 0; p < n; p++) {
-          if (code(s, p) === 60) lt = p;
-          if (code(s, p) === 62) gt = p;
-          lastLt[p] = lt;
-          lastGt[p] = gt;
-        }
-        let ngt = -1;
-        nextGt[n] = -1;
-        for (let p = n - 1; p >= 0; p--) {
-          if (code(s, p) === 62) ngt = p;
-          nextGt[p] = ngt;
+    enclosing(i: number): number {
+      if (lastLt === null || lastGt === null) build();
+      const open = lastLt![i];
+      return open < 0 || lastGt![i] > open ? -1 : open;
+    },
+    tagAt(open: number): { end: number; closed: boolean } {
+      if (nextStop === null) build();
+      const end = nextStop![open + 1];
+      return { end, closed: end < n && code(s, end) === 62 };
+    },
+    closerAfter(name: string, from: number): number {
+      if (closers === null) {
+        closers = new Map();
+        for (let k = s.indexOf('</'); k >= 0; k = s.indexOf('</', k + 2)) {
+          let e = k + 2;
+          while (e < n && (isNameChar(code(s, e)) || code(s, e) === 58)) e++;
+          if (e === k + 2 || (e < n && code(s, e) !== 62 && code(s, e) !== 32 && code(s, e) !== 9)) continue;
+          const key = s.slice(k + 2, e).toLowerCase();
+          const list = closers.get(key);
+          if (list === undefined) closers.set(key, [k]);
+          else list.push(k);
         }
       }
-      const open = lastLt[i];
-      if (open < 0 || lastGt[i] > open) return null; // not inside a tag
-      const end = nextGt[i];
-      return end < 0 ? null : [open, end];
+      const list = closers.get(name.toLowerCase());
+      if (list === undefined) return -1;
+      let lo = 0;
+      let hi = list.length; // first position > from (binary search)
+      while (lo < hi) {
+        const mid = (lo + hi) >> 1;
+        if (list[mid] > from) hi = mid;
+        else lo = mid + 1;
+      }
+      return lo < list.length ? list[lo] : -1;
     },
   };
 }
 
-/** Spans of the inside of every `value="..."` attribute in the tag s[start..end]. */
+/** Spans of the inside of every `value="..."` attribute in the tag s[start..end) (a quote left open ends at `end`). */
 function valueAttributeSpans(s: string, start: number, end: number): Span[] {
   const spans: Span[] = [];
   const lower = s.slice(start, end).toLowerCase();
@@ -460,11 +544,11 @@ function valueAttributeSpans(s: string, start: number, end: number): Span[] {
     const at = start + k;
     if (!isSpace(code(s, at - 1))) continue;
     let q = skipBlanks(s, at + 5);
-    if (code(s, q) !== 61) continue;
+    if (q >= end || code(s, q) !== 61) continue;
     q = skipBlanks(s, q + 1);
-    if (code(s, q) !== 34 && code(s, q) !== 39) continue;
-    const close = closingQuote(s, q);
-    const stop = close < 0 || close > end ? end : close;
+    if (q >= end || (code(s, q) !== 34 && code(s, q) !== 39)) continue;
+    const close = closingQuote(s, q, end);
+    const stop = close < 0 ? end : close;
     if (stop > q + 1) spans.push([q + 1, stop]);
   }
   return spans;
@@ -543,36 +627,49 @@ const indentOf = (line: string): { chars: number; cols: number } => {
   return { chars: i, cols };
 };
 
-const CONFIG_EXTENSIONS = new Set(['.yml', '.yaml', '.ini', '.cfg', '.conf', '.properties', '.toml', '.env']);
+// Code files, where `name:` followed by an indented block is ordinary code (`class TokenStore:`), not a value.
+const CODE_EXTENSIONS = new Set([
+  '.py', '.js', '.mjs', '.cjs', '.jsx', '.ts', '.tsx', '.mts', '.cts', '.go', '.rb', '.java', '.kt', '.kts', '.scala', '.cs', '.php',
+  '.rs', '.swift', '.c', '.h', '.cpp', '.hpp', '.m', '.sh', '.bash', '.zsh', '.ps1', '.lua', '.pl', '.r', '.dart', '.ex', '.exs', '.clj', '.groovy',
+]);
+// Template and backup suffixes, removed (repeatedly) before the extension is looked at: app.py.bak is code, config.yml.example is not.
+const WRAPPER_SUFFIXES = new Set(['.example', '.sample', '.dist', '.tpl', '.tmpl', '.template', '.j2', '.jinja', '.jinja2', '.bak', '.orig', '.old', '.default', '.local']);
 
-/** YAML-like or config-like file names, where a value can sit on the next indented lines. */
-function isConfigLikePath(path: string): boolean {
-  const base = path.slice(path.lastIndexOf('/') + 1).toLowerCase();
-  if (base.startsWith('.env')) return true;
+/** True for a known code file (CODE_EXTENSIONS, after template/backup suffixes are removed); any other name may hold config. */
+function isCodePath(path: string): boolean {
+  let base = path.slice(Math.max(path.lastIndexOf('/'), path.lastIndexOf('\\')) + 1).toLowerCase();
+  for (;;) {
+    const dot = base.lastIndexOf('.');
+    if (dot <= 0 || !WRAPPER_SUFFIXES.has(base.slice(dot))) break;
+    base = base.slice(0, dot);
+  }
   const dot = base.lastIndexOf('.');
-  return dot <= 0 || CONFIG_EXTENSIONS.has(base.slice(dot)); // no extension (or a dotfile) counts as config
+  return dot > 0 && CODE_EXTENSIONS.has(base.slice(dot));
 }
 
 /**
- * Replaces secret-like text with [REDACTED]. Works line by line (a trailing `\r` counts as part of the line
- * end, so CRLF text behaves like LF text), with a little state:
+ * Replaces secret-like text with [REDACTED]. Works line by line (the `\r`s at the end of a line count as
+ * part of the line end, so CRLF text behaves like LF text), with a little state:
  * - a private key block is replaced whole, up to its END line, or to the end of the text when it has none;
  * - after a password-like name with an empty value or a YAML block header, every following line that is
- *   more indented than that line is hidden (blank lines stay blank). This block rule applies when
- *   `hint.path` is YAML- or config-like (.yml, .yaml, .env*, .ini, .cfg, .conf, .properties, .toml, no
- *   extension) or when no path is given (the safe default); in code files (`class TokenStore:`) it would hide
- *   ordinary code, and same-line values are still hidden there;
+ *   more indented than that line is hidden (blank lines stay blank). This block rule is off only when
+ *   `hint.path` is a known code file (.py, .js, .ts, .go, .java, … after removing template and backup
+ *   suffixes such as .example, .j2, .bak), where it would hide ordinary code (`class TokenStore:`); same-line
+ *   values are still hidden there. Every other file (YAML, JSON, Markdown, unknown or no extension) and a
+ *   call without a path keep it;
  * - a line over 4 KB is replaced whole (it is too long to scan safely), and so are the more-indented
  *   lines right after it, since it may have opened such a block (in every kind of file).
  */
 export function redact(text: string, hint?: { path?: string }): string {
-  const blockRule = hint?.path === undefined || isConfigLikePath(hint.path);
+  const blockRule = hint?.path === undefined || !isCodePath(hint.path);
   const out: string[] = [];
   let inKey = false;
   let blockCols = -1; // >= 0 while hiding an indented value block
   for (const raw of text.split('\n')) {
-    const cr = raw.endsWith('\r') ? '\r' : '';
-    const line = cr ? raw.slice(0, -1) : raw;
+    let lineEnd = raw.length;
+    while (lineEnd > 0 && raw.charCodeAt(lineEnd - 1) === 13) lineEnd--;
+    const cr = raw.slice(lineEnd); // every trailing '\r', put back on output
+    const line = raw.slice(0, lineEnd);
     const startedInKey = inKey;
     const pieces: string[] = []; // plain text pieces, with R where a key block starts
     const plain: string[] = [];
@@ -673,7 +770,10 @@ function knownForms(values: string[]): string[] {
   const forms = new Set<string>();
   for (const raw of values) {
     if (typeof raw !== 'string') continue;
-    for (const v of new Set([raw, raw.trim()])) {
+    // bundleCode turns CRLF and lone CRs into LF before scrubbing, so a typed value holding them is looked for in those forms too
+    const crlfOnly = raw.split('\r\n').join('\n');
+    const lf = crlfOnly.split('\r').join('\n');
+    for (const v of new Set([raw, raw.trim(), crlfOnly, crlfOnly.trim(), lf, lf.trim()])) {
       if (v.trim() === '') continue;
       const b64 = Buffer.from(v, 'utf8').toString('base64');
       const urlSafe = b64.replaceAll('+', '-').replaceAll('/', '_');
