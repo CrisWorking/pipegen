@@ -47,10 +47,14 @@ interface Found { kind: DependencyKind; name: string; evidence: string; keywords
 const inDir = (dir: string, name: string) => (dir === '.' ? name : `${dir}/${name}`);
 const validName = (s: string | undefined): s is string => s !== undefined && NAME_RE.test(s);
 
-/** True when `s` (starting right after an opening quote) contains the matching unescaped closing quote. */
+/**
+ * True when `s` (starting right after an opening quote) contains the matching unescaped closing quote.
+ * A backslash escapes the next character in every quote kind. Real dotenv parsers differ on single quotes (the common Node one
+ * treats \' as escaped), so when in doubt the quote stays open: a lost name is cheap, a leaked value fragment is not.
+ */
 function closesQuote(s: string, q: string): boolean {
   for (let i = 0; i < s.length; i++) {
-    if (s[i] === '\\' && q !== "'") i++; // a backslash escapes only inside "..." and `...`; in '...' it is literal
+    if (s[i] === '\\') i++;
     else if (s[i] === q) return true;
   }
   return false;
@@ -59,8 +63,9 @@ const isPostgresUrl = (v: unknown): boolean => typeof v === 'string' && regexSaf
 
 /**
  * Names from a dotenv-style file. A value that opens a quote and does not close it on the same line is multi-line (a PEM key, JSON):
- * its continuation lines are skipped until the closing quote, so no part of a value can look like a name. A line over 4 KB inside
- * an open quote stays inside it. A file that ends inside an open quote just stops. The value itself is never kept.
+ * its continuation lines are skipped until the closing quote, so no part of a value can look like a name. A line over 4 KB is never
+ * a name but can open a quote, and inside an open quote it is scanned character by character (it ends the quote if it holds the
+ * closing quote). A file that ends inside an open quote just stops. The value itself is never kept.
  */
 async function envFileNames(root: string, rel: string, names: Set<string>, pgUrl: string[]): Promise<void> {
   const text = await readTextLimited(joinOs(root, rel));

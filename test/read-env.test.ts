@@ -165,10 +165,12 @@ describe('readEnv', () => {
     expect(JSON.stringify(out)).not.toContain('frag');
   });
 
-  it('env: a backslash is literal inside single quotes', async () => {
+  it('env: backslash-quote inside single quotes keeps the value open (safe side)', async () => {
     const dir = makeTempDir();
-    writeIn(dir, '.env', "P='C:\\dir\\'\nNEXT=1\n");
-    expect((await readEnv(dir, svc())).envVars).toEqual(['NEXT', 'P']);
+    writeIn(dir, '.env', "P='C:\\dir\\'\nLEAK=" + 'pa' + "rt\n'\nNEXT=1\n");
+    const out = await readEnv(dir, svc());
+    expect(out.envVars).toEqual(['NEXT', 'P']);
+    expect(JSON.stringify(out)).not.toContain('LEAK');
   });
 
   it('env: package names over 4 KB are skipped', async () => {
