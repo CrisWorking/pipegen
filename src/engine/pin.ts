@@ -1,0 +1,579 @@
+// Exact pinning (Plan B Task 4). Every tool is pinned to something that can't change under it:
+// - a GitHub Action → the 40-character commit SHA its tag points to, read from the upstream repo's own tag refs
+//   (annotated tags dereferenced to the commit). A SHA from the AI or from repo text is never used (ruling S32);
+// - a GitHub release binary → the version plus the sha256 of the linux amd64 asset, from the release's own
+//   checksums file, else downloaded and hashed by pipegen (marked `checksumSource: computed`, ruling S20);
+// - an npm package → the exact version plus `dist.integrity` (sha512);
+// - a pip package → the exact version plus the sha256 of the py3-none-any wheel, else the sdist (ruling S20);
+// - a container image → the digest of its multi-platform index (OCI index or Docker manifest list, ruling S20).
+//
+// A moved tag is an alert, never an update. A reviewed or remembered pin is verified, never replaced: when its tag
+// now points somewhere else, `deps.alert(new PinMovedWarning(...))` is called and the stored pin is returned. The
+// new SHA or digest is never adopted (the tj-actions and Trivy attacks rewrote version tags; SHA-pinned users
+// stayed safe).
+//
+// Cooldown (ruling S26): a new pin is only made for a release published at least 7 days ago, by a date the server
+// records (GitHub release and asset dates, npm publish time, PyPI upload time, Docker Hub push time). Dates set
+// by whoever made the commit or the image (commit, tag or image `created` dates) are never used. A date that can't
+// be read, or is in the future, refuses the pin (fail closed).
+//
+// Requests: every name is checked before any request and each path segment is encoded (ruling S14). Only
+// `deps.gh` (api.github.com) carries the user's credential (ruling S15). `deps.fetch` never gets it; the one
+// header it gets is the anonymous pull token a registry hands out, sent back to that same registry only. Fetches
+// follow redirects by hand, to allow-listed https hosts only, with size-bounded bodies. GitHub calls go through
+// the shared rate-limit helper with the run's budget (ruling S16).
+import { createHash } from 'node:crypto';
+import type { Octokit } from '@octokit/rest';
+import { z } from 'zod';
+import { safeText } from '../util/safe-text.js';
+import type { Candidate, InstallSpec, ReviewedTool } from '../types.js';
+import { BUDGET_SPENT_MESSAGE, GitHubRateLimitError, withRateLimit, type RateClock } from './github-rate.js';
+import { advisoryVersion, COMMIT_SHA_RE, isFullSemver, isGitHubRepo, isNpmName, isPypiName, npmEscapedName, pep503, repoSegments } from './names.js';
+
+/** A new pin needs a release at least this old (spec §6 cooldown, T27, T40). */
+export const COOLDOWN_DAYS = 7;
+/** Default cap on a release asset pipegen downloads to hash. */
+export const MAX_DOWNLOAD_BYTES = 512 * 1024 * 1024;
+
+export interface PinDeps extends RateClock {
+  gh: Octokit;
+  fetch: typeof fetch;
+  /** A loud warning: the CLI prints it in red and adds it to PIPEGEN.md and the run report. */
+  alert: (w: PinMovedWarning) => void;
+  /** Plain-English notes for the reviewer (already cleaned), e.g. a computed checksum or a deleted tag. */
+  notes?: string[];
+  /** Cap on a downloaded release asset (default MAX_DOWNLOAD_BYTES). */
+  maxDownloadBytes?: number;
+}
+
+export class PinError extends Error {
+  constructor(message: string, options?: { cause?: unknown }) {
+    super(safeText(message, 400), options);
+    this.name = 'PinError';
+  }
+}
+
+/** A tag that now points somewhere other than the reviewed pin. The fields stay raw; `message` is cleaned for display. */
+export class PinMovedWarning {
+  readonly message: string;
+  constructor(
+    readonly repo: string, readonly tag: string, readonly storedSha: string, readonly liveSha: string,
+    what: 'commit' | 'image' = 'commit',
+  ) {
+    this.message = `Possible supply-chain attack: tag ${safeText(tag, 130)} of ${safeText(repo, 260)} moved. pipegen keeps the reviewed ${what} ${safeText(storedSha, 80)}.`;
+  }
+}
+
+/** No 'cache': pipegen uses no caches (spec §19). */
+export type PlatformActions = Record<'checkout' | 'setup-node' | 'setup-python' | 'upload-artifact' | 'download-artifact' | 'docker-login' | 'setup-buildx' | 'build-push' | 'upload-sarif' | 'attest', Candidate>;
+
+/** PlatformActions key → ReviewedTool.id (the ids are set by Plan B Task 8's reviewed list). */
+export const PLATFORM_ACTION_IDS: Record<keyof PlatformActions, string> = {
+  checkout: 'actions-checkout',
+  'setup-node': 'actions-setup-node',
+  'setup-python': 'actions-setup-python',
+  'upload-artifact': 'actions-upload-artifact',
+  'download-artifact': 'actions-download-artifact',
+  'docker-login': 'docker-login-action',
+  'setup-buildx': 'docker-setup-buildx-action',
+  'build-push': 'docker-build-push-action',
+  'upload-sarif': 'codeql-upload-sarif',
+  attest: 'actions-attest',
+};
+
+const DAY_MS = 86_400_000;
+const REQUEST_TIMEOUT_MS = 20_000;
+const DOWNLOAD_TIMEOUT_MS = 300_000;
+const MAX_JSON_BYTES = 4 * 1024 * 1024;
+/** npm's full package document (publish times) can be large for long-lived packages. */
+const MAX_PACKUMENT_BYTES = 64 * 1024 * 1024;
+const MAX_CHECKSUMS_BYTES = 1024 * 1024;
+/** At most this many checksums files are read for one asset (they must all agree). */
+const MAX_CHECKSUM_FILES = 4;
+const MAX_REDIRECTS = 3;
+/** Nested annotated tags followed before giving up. */
+const MAX_TAG_DEPTH = 3;
+/** Where GitHub serves release downloads (github.com redirects to its asset hosts). */
+const DOWNLOAD_HOSTS = ['github.com', 'objects.githubusercontent.com', 'release-assets.githubusercontent.com', 'github-releases.githubusercontent.com'];
+
+const NPM = 'https://registry.npmjs.org/';
+const PYPI = 'https://pypi.org/pypi/';
+const DOCKER_HUB_API = 'https://hub.docker.com/v2/repositories/';
+const INDEX_TYPES = ['application/vnd.oci.image.index.v1+json', 'application/vnd.docker.distribution.manifest.list.v2+json'];
+/** The registries pipegen can pin from, with their anonymous token service. */
+const REGISTRIES = {
+  'docker.io': { api: 'https://registry-1.docker.io/v2/', token: 'https://auth.docker.io/token', service: 'registry.docker.io' },
+  'ghcr.io': { api: 'https://ghcr.io/v2/', token: 'https://ghcr.io/token', service: 'ghcr.io' },
+} as const;
+type Registry = keyof typeof REGISTRIES;
+const DOCKER_HUB_ALIASES = new Set(['docker.io', 'index.docker.io', 'registry-1.docker.io']);
+
+/** A git tag pipegen will look up: no `/`, no leading `-` or `.`, nothing a URL treats specially. */
+const TAG_RE = /^[A-Za-z0-9][A-Za-z0-9._+-]{0,127}$/;
+const ASSET_RE = /^[A-Za-z0-9][A-Za-z0-9._+-]{0,254}$/;
+const SHA256_RE = /^[0-9a-f]{64}$/;
+const DIGEST_RE = /^sha256:[0-9a-f]{64}$/;
+const SRI_SHA512_RE = /^sha512-[A-Za-z0-9+/]{86}==$/;
+const IMAGE_COMPONENT_RE = /^[a-z0-9]+(?:(?:[._]|__|-+)[a-z0-9]+)*$/;
+const IMAGE_TAG_RE = /^[A-Za-z0-9_][A-Za-z0-9._-]{0,127}$/;
+const REGISTRY_TOKEN_RE = /^[A-Za-z0-9._~+/=-]{1,8192}$/;
+const ISO_DATE_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2}(?:\.\d{1,9})?)?(?:Z|[+-]\d{2}:?\d{2})$/;
+/** A linux amd64 release asset (Go and Rust naming). */
+const LINUX_AMD64_RE = /linux[_-](?:amd64|x86_64)|x86_64-unknown-linux/i;
+/** Files beside a release archive that are never the tool itself. */
+const SIDE_FILE_RE = /\.(?:sha256|sha256sum|sha512|sha512sum|md5|sig|asc|pem|cert|crt|bundle|sbom|spdx|json|jsonl|txt|deb|rpm|apk|msi|zst)$/i;
+/** A checksums file covering several assets: checksums.txt, tool_1.0_checksums.txt, SHA256SUMS. */
+const COMBINED_SUMS_RE = /(?:^|[._-])(?:checksums|sha256sums?)(?:\.txt)?$/i;
+
+const refSchema = z.object({ ref: z.string(), object: z.object({ type: z.string(), sha: z.string() }) });
+const tagObjectSchema = z.object({ object: z.object({ type: z.string(), sha: z.string() }) });
+const assetSchema = z.object({ name: z.string(), size: z.number().int().nonnegative(), updated_at: z.string().nullish() });
+const releaseSchema = z.object({ tag_name: z.string(), published_at: z.string().nullish(), draft: z.boolean().optional(), assets: z.array(assetSchema).optional() });
+const npmVersionSchema = z.object({ name: z.string(), version: z.string(), dist: z.object({ integrity: z.string() }) });
+const npmTimesSchema = z.object({ time: z.record(z.string(), z.unknown()) });
+const pypiSchema = z.object({
+  info: z.object({ version: z.string() }),
+  urls: z.array(z.object({
+    filename: z.string(), packagetype: z.string(), digests: z.object({ sha256: z.string() }),
+    upload_time_iso_8601: z.string().nullish(), yanked: z.boolean().optional(),
+  })),
+});
+const tokenSchema = z.object({ token: z.string().optional(), access_token: z.string().optional() });
+const hubTagSchema = z.object({ digest: z.string().nullish(), tag_last_pushed: z.string().nullish() });
+
+type Asset = z.infer<typeof assetSchema>;
+type Release = z.infer<typeof releaseSchema>;
+interface Image { registry: Registry; path: string; display: string }
+
+const isStored = (c: Candidate) => c.source === 'reviewed' || c.source === 'memory';
+const isNotFound = (e: unknown) => (e as { status?: unknown } | null)?.status === 404;
+
+function checkTag(tag: unknown, what: string): string {
+  if (typeof tag !== 'string' || tag === '') throw new PinError(`${what} has no version tag to pin.`);
+  if (!TAG_RE.test(tag)) throw new PinError(`"${safeText(tag, 80)}" isn't a tag pipegen can look up for ${what}.`);
+  return tag;
+}
+
+function checkRepo(repo: unknown): string {
+  if (!isGitHubRepo(repo)) throw new PinError(`"${safeText(String(repo), 120)}" isn't a GitHub repo (owner/name) pipegen can pin.`);
+  return repo;
+}
+
+/** A date the server recorded, as ms; null when it isn't a plain ISO 8601 timestamp. */
+function readDate(s: unknown): number | null {
+  if (typeof s !== 'string' || !ISO_DATE_RE.test(s)) return null;
+  const t = Date.parse(s);
+  return Number.isFinite(t) ? t : null;
+}
+
+/**
+ * Resolves the exact pin for a candidate. `install` says how a `kind: 'cli'` tool is installed (ruling B2): npm,
+ * pip or docker; none (or github-release) → a GitHub release binary. Images need `install` with the image name.
+ * Reviewed and memory pins are verified, never replaced; discovery candidates get a new pin (cooldown applies).
+ * Throws PinError (or GitHubRateLimitError) when the pin can't be made safely.
+ */
+export async function resolvePin(c: Candidate, deps: PinDeps, install?: InstallSpec): Promise<Candidate> {
+  const now = () => (deps.now ?? Date.now)();
+  const note = (text: string) => deps.notes?.push(safeText(text, 400));
+  const maxDownload = deps.maxDownloadBytes ?? MAX_DOWNLOAD_BYTES;
+
+  if (c.kind === 'action') return pinAction();
+  if (c.kind === 'docker' || install?.method === 'docker') return pinImage();
+  if (c.kind !== 'cli') throw new PinError(`pipegen can't pin a tool of kind "${safeText(String(c.kind), 40)}".`);
+  if (install?.method === 'npm') return pinNpm(install);
+  if (install?.method === 'pip') return pinPip(install);
+  if (install === undefined || install.method === 'github-release') return pinRelease();
+  throw new PinError(`pipegen can't pin a tool installed with "${safeText(String(install.method), 40)}".`);
+
+  // ---------- GitHub Actions ----------
+
+  async function pinAction(): Promise<Candidate> {
+    const repo = checkRepo(c.repo);
+    const gh = github(repo);
+    const stored = c.pin.sha;
+    if (isStored(c) && stored !== undefined) {
+      if (!COMMIT_SHA_RE.test(stored)) throw new PinError(`The stored pin of ${repo} isn't a full commit SHA.`);
+      const tag = checkTag(c.version, repo);
+      const live = await gh.tagCommit(tag);
+      if (live === null) {
+        note(`The tag ${tag} of ${repo} no longer exists; pipegen keeps the reviewed commit ${stored}.`);
+      } else if (live !== stored) {
+        deps.alert(new PinMovedWarning(repo, tag, stored, live));
+      }
+      return c; // the stored, reviewed pin: never replaced
+    }
+    // a new pin: the tag comes from c.version or the latest release, the SHA only from the upstream refs
+    const wanted = c.version === '' ? null : checkTag(c.version, repo);
+    const release = wanted === null ? await gh.latestRelease() : null;
+    const tag = wanted ?? checkTag(release?.tag_name, repo);
+    const sha = await gh.tagCommit(tag);
+    if (sha === null) throw new PinError(`The tag ${tag} doesn't exist in ${repo}.`);
+    checkAge(`${repo} ${tag}`, releaseDates(release ?? (await gh.releaseByTag(tag)), tag, `${repo} ${tag}`));
+    return { ...c, version: tag, pin: { sha } };
+  }
+
+  /** The release's own date: it must be published (not a draft) for exactly this tag; a missing release → age unknown. */
+  function releaseDates(release: Release | null, tag: string, what: string): unknown[] {
+    if (release === null || release.tag_name !== tag || release.draft === true) {
+      throw new PinError(`Couldn't establish the age of ${what}: it has no published GitHub release, and pipegen doesn't trust commit dates. Not pinned.`);
+    }
+    return [release.published_at];
+  }
+
+  // ---------- GitHub release binaries ----------
+
+  async function pinRelease(): Promise<Candidate> {
+    const repo = checkRepo(c.repo);
+    const label = install?.version || c.version;
+    const wanted = label === '' ? null : checkTag(label, repo);
+    const assetName = install?.package || null;
+    if (assetName !== null && !ASSET_RE.test(assetName)) throw new PinError(`"${safeText(assetName, 80)}" isn't a release asset name pipegen can download.`);
+    if (isStored(c) && c.pin.checksum !== undefined) {
+      if (!SHA256_RE.test(c.pin.checksum)) throw new PinError(`The stored checksum of ${repo} isn't a sha256.`);
+      if (wanted === null) throw new PinError(`The stored pin of ${repo} has no version.`);
+      return c; // a stored binary hash: the install step checks it, and it is never replaced
+    }
+    const gh = github(repo);
+    const release = wanted === null ? await gh.latestRelease() : await gh.releaseByTag(wanted);
+    if (release === null) throw new PinError(`${repo} has no published release ${wanted ?? ''} to pin.`);
+    const tag = checkTag(release.tag_name, repo);
+    const what = `${repo} ${tag}`;
+    const dates = releaseDates(release, wanted ?? tag, what);
+    const assets = (release.assets ?? []).filter((a) => ASSET_RE.test(a.name));
+    const chosen = pickAsset(assets, assetName, what);
+    dates.push(chosen.updated_at);
+    const base = `https://github.com/${repoSegments(repo).path}/releases/download/${encodeURIComponent(tag)}/`;
+    const sums = checksumFiles(assets, chosen.name);
+    let checksum: string;
+    if (sums.length > 0) {
+      const found = new Set<string>();
+      for (const s of sums) {
+        if (s.size > MAX_CHECKSUMS_BYTES) throw new PinError(`The checksums file ${s.name} of ${what} is too large.`);
+        dates.push(s.updated_at);
+        const text = new TextDecoder().decode(await download(base + encodeURIComponent(s.name), MAX_CHECKSUMS_BYTES));
+        const hash = hashFor(text, chosen.name, s.name !== chosen.name && s.name.startsWith(chosen.name));
+        if (hash !== null) found.add(hash);
+      }
+      if (found.size === 0) throw new PinError(`The checksums file of ${what} doesn't list ${chosen.name}.`);
+      if (found.size > 1) throw new PinError(`The checksums files of ${what} disagree about ${chosen.name}.`);
+      checkAge(what, dates);
+      checksum = [...found][0] as string;
+    } else {
+      if (chosen.size > maxDownload) throw new PinError(`${chosen.name} of ${what} is too large to download (${chosen.size} bytes).`);
+      checkAge(what, dates); // before downloading anything
+      const hash = createHash('sha256');
+      await download(base + encodeURIComponent(chosen.name), maxDownload, (b) => hash.update(b));
+      checksum = hash.digest('hex');
+      note(`checksumSource: computed. ${what} has no checksums file, so pipegen downloaded ${chosen.name} and computed its sha256 itself; a reviewer must confirm it.`);
+    }
+    return { ...c, version: tag, pin: { checksum } };
+  }
+
+  // ---------- npm ----------
+
+  async function pinNpm(spec: InstallSpec): Promise<Candidate> {
+    if (!isNpmName(spec.package)) throw new PinError(`"${safeText(String(spec.package), 80)}" isn't an npm package name pipegen can pin.`);
+    const pkg = spec.package;
+    const version = spec.version || c.version;
+    if (typeof version !== 'string' || !isFullSemver(version)) throw new PinError(`npm package ${pkg} needs an exact version (like 1.2.3), not "${safeText(String(version), 40)}".`);
+    if (isStored(c) && c.pin.checksum !== undefined) {
+      if (!SRI_SHA512_RE.test(c.pin.checksum)) throw new PinError(`The stored integrity of ${pkg} isn't a sha512.`);
+      return c;
+    }
+    const what = `${pkg}@${version}`;
+    const doc = npmVersionSchema.safeParse(await getJson(`npm's record of ${what}`, `${NPM}${npmEscapedName(pkg)}/${encodeURIComponent(version)}`, MAX_JSON_BYTES));
+    if (!doc.success || doc.data.name !== pkg || doc.data.version !== version) throw new PinError(`npm gave an unexpected answer for ${what}.`);
+    const integrity = doc.data.dist.integrity;
+    if (!SRI_SHA512_RE.test(integrity)) throw new PinError(`npm has no sha512 integrity for ${what}.`);
+    const times = npmTimesSchema.safeParse(await getJson(`npm's publish times of ${pkg}`, `${NPM}${npmEscapedName(pkg)}`, MAX_PACKUMENT_BYTES));
+    checkAge(what, [times.success ? times.data.time[version] : undefined]);
+    return { ...c, version, pin: { checksum: integrity } };
+  }
+
+  // ---------- pip ----------
+
+  async function pinPip(spec: InstallSpec): Promise<Candidate> {
+    if (!isPypiName(spec.package)) throw new PinError(`"${safeText(String(spec.package), 80)}" isn't a PyPI package name pipegen can pin.`);
+    const pkg = spec.package;
+    const version = spec.version || c.version;
+    if (typeof version !== 'string' || version === '' || advisoryVersion(version, 'pep440') !== version) {
+      throw new PinError(`PyPI package ${pkg} needs an exact version (like 1.2.3), not "${safeText(String(version), 40)}".`);
+    }
+    if (isStored(c) && c.pin.checksum !== undefined) {
+      if (!SHA256_RE.test(c.pin.checksum)) throw new PinError(`The stored checksum of ${pkg} isn't a sha256.`);
+      return c;
+    }
+    const what = `${pkg} ${version}`;
+    const doc = pypiSchema.safeParse(await getJson(`PyPI's record of ${what}`, `${PYPI}${encodeURIComponent(pep503(pkg))}/${encodeURIComponent(version)}/json`, MAX_JSON_BYTES));
+    if (!doc.success || doc.data.info.version !== version) throw new PinError(`PyPI gave an unexpected answer for ${what}.`);
+    const wheels = doc.data.urls.filter((f) => f.packagetype === 'bdist_wheel' && isPy3AnyWheel(f.filename));
+    const sdists = doc.data.urls.filter((f) => f.packagetype === 'sdist');
+    const pool = wheels.length > 0 ? wheels : sdists;
+    if (pool.length !== 1) {
+      throw new PinError(pool.length === 0 ? `${what} has no py3-none-any wheel or sdist to pin.` : `${what} has several files of the same kind; pipegen won't guess which one to pin.`);
+    }
+    const file = pool[0] as (typeof pool)[number];
+    if (file.yanked === true) throw new PinError(`${file.filename} of ${what} was yanked.`);
+    const hex = file.digests.sha256;
+    if (!SHA256_RE.test(hex)) throw new PinError(`PyPI has no readable sha256 for ${what}.`);
+    checkAge(what, [file.upload_time_iso_8601]);
+    return { ...c, version, pin: { checksum: hex } };
+  }
+
+  // ---------- container images ----------
+
+  async function pinImage(): Promise<Candidate> {
+    if (install?.method !== 'docker') throw new PinError(`An image needs an install spec with its name to be pinned.`);
+    const image = parseImage(install.package);
+    const tag = install.version || c.version;
+    if (typeof tag !== 'string' || !IMAGE_TAG_RE.test(tag)) throw new PinError(`"${safeText(String(tag), 80)}" isn't an image tag pipegen can look up for ${image.display}.`);
+    const stored = isStored(c) ? c.pin.digest : undefined;
+    if (stored !== undefined && !DIGEST_RE.test(stored)) throw new PinError(`The stored digest of ${image.display} isn't a sha256 digest.`);
+    // GHCR has no anonymous, server-recorded push date, so a new GHCR pin can't pass the cooldown
+    if (stored === undefined && image.registry === 'ghcr.io') {
+      throw new PinError(`Couldn't establish the age of ${image.display}:${tag}: GHCR gives no server-recorded push date without a login. Not pinned.`);
+    }
+    const reg = REGISTRIES[image.registry];
+    const tokenUrl = `${reg.token}?${new URLSearchParams({ service: reg.service, scope: `repository:${image.path}:pull` })}`;
+    const tokens = tokenSchema.safeParse(await getJson(`a pull token for ${image.display}`, tokenUrl, MAX_JSON_BYTES));
+    const token = tokens.success ? (tokens.data.token ?? tokens.data.access_token) : undefined;
+    if (token === undefined || !REGISTRY_TOKEN_RE.test(token)) throw new PinError(`The registry gave no usable anonymous pull token for ${image.display}.`);
+    const res = await fetchAllowed(`${reg.api}${image.path.split('/').map(encodeURIComponent).join('/')}/manifests/${encodeURIComponent(tag)}`, {
+      method: 'HEAD', timeoutMs: REQUEST_TIMEOUT_MS, hosts: [new URL(reg.api).hostname],
+      // the registry's own anonymous token, sent only to that registry; never the user's credential
+      headers: { accept: INDEX_TYPES.join(', '), ['author' + 'ization']: `Bearer ${token}` },
+    });
+    await res.body?.cancel().catch(() => {});
+    const type = (res.headers.get('content-type') ?? '').split(';')[0]?.trim() ?? '';
+    if (!INDEX_TYPES.includes(type)) throw new PinError(`${image.display}:${tag} isn't a multi-platform image index; pipegen pins the index digest only.`);
+    const digest = res.headers.get('docker-content-digest') ?? '';
+    if (!DIGEST_RE.test(digest)) throw new PinError(`The registry gave no readable digest for ${image.display}:${tag}.`);
+    if (stored !== undefined) {
+      if (digest !== stored) deps.alert(new PinMovedWarning(image.display, tag, stored, digest, 'image'));
+      return c; // the stored, reviewed digest: never replaced
+    }
+    // Docker Hub records when the tag was pushed; the date must belong to this very digest
+    const [ns, name] = image.path.split('/') as [string, string];
+    const hub = hubTagSchema.safeParse(await getJson(`Docker Hub's record of ${image.display}:${tag}`, `${DOCKER_HUB_API}${encodeURIComponent(ns)}/${encodeURIComponent(name)}/tags/${encodeURIComponent(tag)}`, MAX_JSON_BYTES));
+    if (!hub.success || hub.data.digest !== digest) throw new PinError(`Couldn't establish the age of ${image.display}:${tag}: Docker Hub's record doesn't match the digest. Not pinned.`);
+    checkAge(`${image.display}:${tag}`, [hub.data.tag_last_pushed]);
+    return { ...c, version: tag, pin: { digest } };
+  }
+
+  // ---------- shared ----------
+
+  /** Refuses the pin unless every date is readable, not in the future, and at least COOLDOWN_DAYS old. */
+  function checkAge(what: string, dates: unknown[]): void {
+    const nowMs = now();
+    let newest = Number.NEGATIVE_INFINITY;
+    for (const d of dates) {
+      const t = readDate(d);
+      if (t === null) throw new PinError(`Couldn't establish the age of ${what} (no readable release date). Not pinned.`);
+      if (t > nowMs) throw new PinError(`${what} has a release date in the future, which pipegen can't trust. Not pinned.`);
+      newest = Math.max(newest, t);
+    }
+    if (dates.length === 0) throw new PinError(`Couldn't establish the age of ${what}. Not pinned.`);
+    if (nowMs - newest < COOLDOWN_DAYS * DAY_MS) {
+      throw new PinError(`${what} changed less than ${COOLDOWN_DAYS} days ago (${new Date(newest).toISOString()}); pipegen waits ${COOLDOWN_DAYS} days before pinning a new release.`);
+    }
+  }
+
+  /** GitHub calls for one checked repo, through the rate-limit helper. */
+  function github(repo: string) {
+    const { owner, name } = repoSegments(repo);
+    async function call<T>(what: string, fn: () => Promise<{ data: unknown }>, schema: z.ZodType<T>): Promise<T | null> {
+      let data: unknown;
+      try {
+        data = (await withRateLimit(fn, deps)).data;
+      } catch (e) {
+        if (e instanceof GitHubRateLimitError && e.budgetSpent) throw new PinError(BUDGET_SPENT_MESSAGE, { cause: e });
+        if (e instanceof GitHubRateLimitError) throw e;
+        if (isNotFound(e)) return null;
+        throw new PinError(`Couldn't read ${what} of ${repo} from GitHub.`, { cause: e });
+      }
+      const parsed = schema.safeParse(data);
+      if (!parsed.success) throw new PinError(`GitHub gave an unexpected answer for ${what} of ${repo}.`);
+      return parsed.data;
+    }
+    return {
+      latestRelease: async (): Promise<Release> => {
+        const r = await call('the latest release', () => deps.gh.rest.repos.getLatestRelease({ owner, repo: name }), releaseSchema);
+        if (r === null) throw new PinError(`${repo} has no published release to pin.`);
+        return r;
+      },
+      releaseByTag: (tag: string) => call(`the release ${tag}`, () => deps.gh.rest.repos.getReleaseByTag({ owner, repo: name, tag }), releaseSchema),
+      /** The commit a tag points to, from the repo's own refs (annotated tags dereferenced); null when the tag doesn't exist. */
+      tagCommit: async (tag: string): Promise<string | null> => {
+        const r = await call(`the tag ${tag}`, () => deps.gh.request('GET /repos/{owner}/{repo}/git/ref/tags/{tag}', { owner, repo: name, tag }), refSchema);
+        if (r === null) return null;
+        if (r.ref !== `refs/tags/${tag}`) throw new PinError(`GitHub answered with another ref for the tag ${tag} of ${repo}.`);
+        let obj = r.object;
+        for (let depth = 0; obj.type === 'tag'; depth++) {
+          if (depth >= MAX_TAG_DEPTH || !COMMIT_SHA_RE.test(obj.sha)) throw new PinError(`The tag ${tag} of ${repo} doesn't lead to a commit.`);
+          const sha = obj.sha;
+          const t = await call(`the tag ${tag}`, () => deps.gh.rest.git.getTag({ owner, repo: name, tag_sha: sha }), tagObjectSchema);
+          if (t === null) throw new PinError(`The tag ${tag} of ${repo} doesn't lead to a commit.`);
+          obj = t.object;
+        }
+        if (obj.type !== 'commit' || !COMMIT_SHA_RE.test(obj.sha)) throw new PinError(`The tag ${tag} of ${repo} doesn't point to a commit.`);
+        return obj.sha;
+      },
+    };
+  }
+
+  /** A fetch with no credential, following redirects by hand to the allowed https hosts only. */
+  async function fetchAllowed(url: string, opts: { method: 'GET' | 'HEAD'; timeoutMs: number; hosts: readonly string[]; headers?: Record<string, string> }): Promise<Response> {
+    let current = new URL(url);
+    for (let hop = 0; ; hop++) {
+      if (current.protocol !== 'https:' || !opts.hosts.includes(current.hostname) || current.port !== '' || current.username !== '' || current.password !== '') {
+        throw new PinError(`pipegen won't fetch from ${current.protocol}//${current.host}: not an allowed https host.`);
+      }
+      let res: Response;
+      try {
+        res = await deps.fetch(current.href, {
+          method: opts.method, redirect: 'manual', headers: { accept: 'application/json', ...opts.headers }, signal: AbortSignal.timeout(opts.timeoutMs),
+        });
+      } catch (e) {
+        throw new PinError(`Couldn't reach ${current.host}.`, { cause: e });
+      }
+      if ([301, 302, 303, 307, 308].includes(res.status)) {
+        const location = res.headers.get('location');
+        await res.body?.cancel().catch(() => {});
+        if (location === null || hop >= MAX_REDIRECTS) throw new PinError(`${current.host} redirected too often or nowhere.`);
+        current = new URL(location, current);
+        continue;
+      }
+      if (!res.ok) {
+        await res.body?.cancel().catch(() => {});
+        throw new PinError(`${current.host} answered HTTP ${res.status} for ${current.pathname}.`);
+      }
+      return res;
+    }
+  }
+
+  /** A JSON document from the URL's own host (redirects only within that host), size-bounded. */
+  async function getJson(what: string, url: string, maxBytes: number): Promise<unknown> {
+    const res = await fetchAllowed(url, { method: 'GET', timeoutMs: REQUEST_TIMEOUT_MS, hosts: [new URL(url).hostname] });
+    const chunks: Uint8Array[] = [];
+    await readBody(res, maxBytes, (b) => chunks.push(b), what);
+    try {
+      return JSON.parse(Buffer.concat(chunks).toString('utf8'));
+    } catch (e) {
+      throw new PinError(`Couldn't read ${what}: not JSON.`, { cause: e });
+    }
+  }
+
+  /** A release download from GitHub's hosts, size-bounded; with `onChunk` the bytes are streamed to it instead. */
+  async function download(url: string, maxBytes: number, onChunk?: (b: Uint8Array) => void): Promise<Uint8Array> {
+    const res = await fetchAllowed(url, { method: 'GET', timeoutMs: DOWNLOAD_TIMEOUT_MS, hosts: DOWNLOAD_HOSTS, headers: { accept: 'application/octet-stream' } });
+    const chunks: Uint8Array[] = [];
+    await readBody(res, maxBytes, onChunk ?? ((b) => chunks.push(b)), decodeURIComponent(new URL(url).pathname.split('/').pop() ?? 'the download'));
+    return Buffer.concat(chunks);
+  }
+}
+
+/** Reads a body up to `maxBytes`; anything larger is refused (the declared length and the bytes actually sent). */
+async function readBody(res: Response, maxBytes: number, onChunk: (b: Uint8Array) => void, what: string): Promise<void> {
+  const tooLarge = () => new PinError(`${what} is too large (more than ${maxBytes} bytes).`);
+  const declared = res.headers.get('content-length');
+  if (declared !== null && Number(declared) > maxBytes) {
+    await res.body?.cancel().catch(() => {});
+    throw tooLarge();
+  }
+  if (res.body === null) return;
+  const reader = res.body.getReader();
+  let total = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) return;
+    total += value.byteLength;
+    if (total > maxBytes) {
+      await reader.cancel().catch(() => {});
+      throw tooLarge();
+    }
+    onChunk(value);
+  }
+}
+
+/** The linux amd64 asset: the one the install spec names, else the only archive whose name says linux amd64. */
+function pickAsset(assets: Asset[], wanted: string | null, what: string): Asset {
+  if (wanted !== null) {
+    const named = assets.find((a) => a.name === wanted);
+    if (named === undefined) throw new PinError(`${what} has no asset named ${wanted}.`);
+    return named;
+  }
+  const matches = assets.filter((a) => LINUX_AMD64_RE.test(a.name) && !SIDE_FILE_RE.test(a.name));
+  if (matches.length === 0) throw new PinError(`${what} has no linux amd64 asset to pin.`);
+  if (matches.length > 1) throw new PinError(`${what} has several linux amd64 assets; the install spec must name one.`);
+  return matches[0] as Asset;
+}
+
+/** The checksums files for an asset: `<asset>.sha256` (or .sha256sum) and combined files like checksums.txt. */
+function checksumFiles(assets: Asset[], asset: string): Asset[] {
+  const own = new Set([`${asset}.sha256`, `${asset}.sha256sum`, `${asset}.sha256.txt`]);
+  const owned = assets.filter((a) => own.has(a.name));
+  const combined = assets.filter((a) => !own.has(a.name) && COMBINED_SUMS_RE.test(a.name) && !/512|sha1|md5/i.test(a.name));
+  return [...owned, ...combined].slice(0, MAX_CHECKSUM_FILES);
+}
+
+/** The sha256 a checksums file gives for `asset` (`<hex>  [*]<name>` lines; a per-asset file may hold the hex alone). */
+function hashFor(text: string, asset: string, perAsset: boolean): string | null {
+  const hashes = new Set<string>();
+  for (const raw of text.split(/\r?\n/)) {
+    const line = raw.trim();
+    if (line === '') continue;
+    const m = /^([0-9A-Fa-f]{64})(?:\s+\*?(?:\.\/)?(\S+))?$/.exec(line);
+    if (m === null) continue;
+    const name = m[2];
+    if (name === asset || (name === undefined && perAsset)) hashes.add((m[1] as string).toLowerCase());
+  }
+  if (hashes.size > 1) throw new PinError(`A checksums file lists ${asset} more than once with different hashes.`);
+  return hashes.size === 1 ? ([...hashes][0] as string) : null;
+}
+
+/** A wheel tagged for any Python 3, any ABI, any platform (py3-none-any, py2.py3-none-any). */
+function isPy3AnyWheel(filename: string): boolean {
+  if (!filename.endsWith('.whl')) return false;
+  const parts = filename.slice(0, -4).split('-');
+  if (parts.length < 5) return false;
+  const [py, abi, platform] = parts.slice(-3) as [string, string, string];
+  return py.split('.').includes('py3') && abi === 'none' && platform === 'any';
+}
+
+/** `[registry/]path` → a checked image on Docker Hub or GHCR (Docker Hub official images get `library/`). */
+function parseImage(ref: unknown): Image {
+  const bad = () => new PinError(`"${safeText(String(ref), 120)}" isn't an image name pipegen can pin (Docker Hub or GHCR, lower case, no tag).`);
+  if (typeof ref !== 'string' || ref.length > 255) throw bad();
+  const parts = ref.split('/');
+  let registry: Registry = 'docker.io';
+  const first = parts[0] ?? '';
+  if (parts.length > 1 && (first.includes('.') || first.includes(':') || first === 'localhost')) {
+    if (DOCKER_HUB_ALIASES.has(first)) registry = 'docker.io';
+    else if (first === 'ghcr.io') registry = 'ghcr.io';
+    else throw bad();
+    parts.shift();
+  }
+  if (parts.length === 0 || !parts.every((p) => IMAGE_COMPONENT_RE.test(p))) throw bad();
+  if (registry === 'docker.io' && parts.length === 1) parts.unshift('library');
+  if (parts.length < 2 || (registry === 'docker.io' && parts.length !== 2)) throw bad();
+  const path = parts.join('/');
+  return { registry, path, display: `${registry}/${path}` };
+}
+
+/**
+ * The platform actions from the REVIEWED list, found by PLATFORM_ACTION_IDS. Each stored pin is re-verified
+ * against its tag: a moved tag raises a PinMovedWarning and the stored SHA is kept.
+ */
+export async function platformActions(reviewed: ReviewedTool[], deps: PinDeps): Promise<PlatformActions> {
+  const out: Partial<PlatformActions> = {};
+  for (const [key, id] of Object.entries(PLATFORM_ACTION_IDS) as [keyof PlatformActions, string][]) {
+    const matches = reviewed.filter((t) => t.id === id);
+    if (matches.length !== 1) throw new PinError(matches.length === 0 ? `The reviewed list has no ${id} entry.` : `The reviewed list has more than one ${id} entry.`);
+    const c = (matches[0] as ReviewedTool).candidate;
+    if (c.kind !== 'action' || c.source !== 'reviewed' || c.reviewed !== true || c.pin.sha === undefined) {
+      throw new PinError(`The reviewed entry ${id} isn't a reviewed action with a pinned commit.`);
+    }
+    out[key] = await resolvePin(c, deps);
+  }
+  return out as PlatformActions;
+}

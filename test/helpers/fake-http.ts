@@ -3,7 +3,8 @@
 import { Octokit } from '@octokit/rest';
 
 export interface Call { method: string; url: URL; headers: Record<string, string>; body?: string }
-export interface Reply { status?: number; body?: unknown; headers?: Record<string, string> }
+/** `raw`: the body sent as is (text or bytes) instead of `body` as JSON. */
+export interface Reply { status?: number; body?: unknown; raw?: string | Uint8Array; headers?: Record<string, string> }
 /** Keyed by `METHOD origin+pathname` (no query); a handler sees the whole call, query included. */
 export type Routes = Record<string, Reply | ((c: Call) => Reply)>;
 
@@ -30,7 +31,8 @@ export function fakeFetch(routes: Routes): { fetch: typeof fetch; calls: Call[] 
         url = new URL(location, url);
         continue;
       }
-      return new Response(JSON.stringify(reply.body ?? {}), { status, headers: { 'content-type': 'application/json', ...reply.headers } });
+      const payload = reply.raw !== undefined ? reply.raw : JSON.stringify(reply.body ?? {});
+      return new Response(payload as BodyInit, { status, headers: { 'content-type': 'application/json', ...reply.headers } });
     }
   };
   return { fetch: fn as typeof fetch, calls };
