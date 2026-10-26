@@ -637,6 +637,7 @@ describe('redact: speed', () => {
     shapes.push(('ey' + 'J' + 'a'.repeat(1990) + '.' + 'b'.repeat(1990) + '\n').repeat(250));
     shapes.push((('a'.repeat(30) + 'tok' + 'en ').repeat(110) + '\n').repeat(250));
     shapes.push(('pass' + 'word: |\n' + '  x\n'.repeat(250_000)));
+    const firstNew = shapes.length; // the shapes from here on also get the 4 MB / 1 MB linearity check
     // round 4: namespaced and closed elements, attribute runs, many tags or keys before one '>', trailing CRs
     shapes.push(...[
       '<a:pass' + 'word ', '<a:pass' + 'word>', '</pass' + 'word>', '<pass' + 'word>x</pass' + 'word>', '<a key="a:b/c d tok' + 'en" ',
@@ -651,16 +652,25 @@ describe('redact: speed', () => {
     shapes.push(...['<tok' + 'en>a', '<tok' + 'en>', '"tok' + 'en": {', '[sec' + 'rets]'].map((u) => (line(u) + '\n').repeat(250)));
     shapes.push('[sec' + 'rets]\n' + 'a = b\n'.repeat(160_000));
     shapes.push(('[sec' + 'rets]\nkey: x\n').repeat(60_000));
-    redact(shapes[0]); // warm-up
-    for (const text of shapes) {
+    // Median of 3 runs after a warm-up. The per-shape bound is loose (it only has to catch a pathological
+    // slowdown on any machine); the linearity check catches quadratic behaviour: 4 times the text must take
+    // under 6 times as long (linear is about 4, quadratic about 16). Times under 5 ms count as 5 ms, so timer
+    // noise on very fast shapes cannot fail it.
+    const median = (text: string, warm = true) => {
+      if (warm) redact(text); // warm-up (the 4 MB text is warmed by the 1 MB runs before it)
       const runs = [0, 1, 2].map(() => {
         const t = performance.now();
         redact(text);
         return performance.now() - t;
       }).sort((a, b) => a - b);
-      expect(runs[1], text.slice(0, 12)).toBeLessThan(300); // median of 3, about 1 MB each
-    }
-  });
+      return runs[1];
+    };
+    shapes.forEach((text, i) => {
+      const t1 = median(text);
+      expect(t1 / (text.length / 1e6), text.slice(0, 12)).toBeLessThan(1000); // ms per MB, each shape about 1 MB
+      if (i >= firstNew) expect(median(text.repeat(4), false) / Math.max(t1, 5), `4 MB / 1 MB: ${text.slice(0, 12)}`).toBeLessThan(6);
+    });
+  }, 300_000);
 });
 
 describe('fix round 2', () => {
@@ -1031,5 +1041,30 @@ describe('fix round 5', () => {
     expect(redact(xml, { path: 'App.config' })).toBe(`<setting name="Db${K}" serializeAs="String">\n    ${R}\n</setting>\n<setting name="Theme">\n    <value>dark</value>\n</setting>\n`);
     expect(redact(`<${k}>\n  ${S}\n</${k}>`, { path: 'a.xml' })).toBe(`<${k}>\n  ${R}\n</${k}>`);
     expect(redact(xml, { path: 'Gen.cs' })).toBe(xml);
+  });
+});
+
+describe('closing patch', () => {
+  const sec = 'sec' + 'ret';
+  const S = 'S3kr' + 'etV4l';
+
+  it('redact: in a secret section, a line is kept only when the text before its separator is a plain key name', () => {
+    const head = `[${sec}s]\n`;
+    const red = (body: string) => redact(head + body, { path: 'config.toml' }).slice(head.length);
+    expect(red(`api ${S} = v`)).toBe(R);
+    expect(red(`  note ${S} more: v`)).toBe(`  ${R}`);
+    expect(red(`x(${S}) = v`)).toBe(R);
+    expect(red(`${fake.githubClassic()} = v`)).toBe(`${R} = ${R}`); // a plain key still goes through the token rules
+    expect(red('admin =')).toBe('admin =');
+    expect(red('admin = x')).toBe(`admin = ${R}`);
+    expect(red(`"db.main" = x`)).toBe(`"db.main" = ${R}`);
+    expect(red(`  key-1: x`)).toBe(`  key-1: ${R}`);
+  });
+
+  it('redact: sections named after credentials hide their values', () => {
+    for (const header of ['[credentials]', '[[credentials]]', '[aws.credentials]', '[Credential]']) {
+      expect(redact(`${header}\nuser = u\nother = ${S}\n[pub]\nname = keep\n`, { path: 'a.toml' }), header)
+        .toBe(`${header}\nuser = ${R}\nother = ${R}\n[pub]\nname = keep\n`);
+    }
   });
 });

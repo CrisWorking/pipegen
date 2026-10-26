@@ -319,7 +319,10 @@ const skipBlanks = (s: string, i: number) => {
  * connection-string shapes (see connectionSpans): a password holding `#` after a user:password@ part (a
  * postgres URL with user `admin`, password `P@ss#2024` and host `db` is only partly hidden, since the `@`
  * after the `#` cannot be told apart from an `@` in a query such as `?y=z@w`), and a percent-encoded socket
- * host after the `@` (password `pa#ss`, host `%2Fvar%2Frun`).
+ * host after the `@` (password `pa#ss`, host `%2Fvar%2Frun`). Also:
+ * text after an unrelated end tag or after a self-closing secret tag (`<password/>x`) is not element text and is scanned as ordinary text;
+ * a value whose block is not more indented than its key (`"Passwords":` then `{` at the same indent, an unindented `<setting>`/`<value>` pair);
+ * only name="..."/key="..." (or the element's own name) start a block; other attributes (`id="DbPassword"`) do not;
  * Over-redacting is the safe direction: type annotations such as `token: string` lose their type too.
  */
 function assignmentSpans(s: string): { spans: Span[]; block: boolean } {
@@ -687,16 +690,29 @@ function sectionName(line: string): string | null {
   return line.slice(from, close);
 }
 
-/** A line inside a secret section: what follows its first `=` or `:` is hidden; a line without one is hidden whole. */
+/** True when `s` is only a plain key name (`[A-Za-z0-9_."'-]+`) with blanks around it. Hand-checked, linear. */
+function isPlainKey(s: string): boolean {
+  const a = skipBlanks(s, 0);
+  let b = a;
+  while (b < s.length && (isNameChar(code(s, b)) || code(s, b) === 34 || code(s, b) === 39)) b++;
+  return b > a && skipBlanks(s, b) >= s.length;
+}
+
+/**
+ * A line inside a secret section: when the text before its first `=` or `:` is a plain key name, the key is
+ * kept (through the same rules as any other text) and what follows the separator is hidden; any other line
+ * (no separator, a key that is not a plain name, a line over 4 KB) is hidden whole, indentation kept.
+ */
 function hideSectionValue(line: string): string {
   let sep = -1;
   for (let j = 0; j < line.length; j++) {
     const c = code(line, j);
     if (c === 61 || c === 58) { sep = j; break; }
   }
-  if (sep < 0) return line.slice(0, indentOf(line).chars) + R;
+  if (sep < 0 || !regexSafe(line) || !isPlainKey(line.slice(0, sep))) return line.slice(0, indentOf(line).chars) + R;
+  const key = redactSegment(line.slice(0, sep)).text;
   const v = skipBlanks(line, sep + 1);
-  return v >= line.length ? line : line.slice(0, v) + R; // an empty value (a list on the next lines) is hidden there
+  return v >= line.length ? key + line.slice(sep) : key + line.slice(sep, v) + R; // an empty value (a list on the next lines) is hidden there
 }
 
 /**
@@ -761,10 +777,11 @@ export function redact(text: string, hint?: { path?: string }): string {
       blockCols = -1;
     }
     // TOML/INI sections (block rule files only): under a [section] whose name holds a secret name ([secrets],
-    // [database.password], [auth]), every value is hidden, up to the next section header.
+    // [database.password], [auth]) or "credential" ([credentials], [aws.credentials]), every value is hidden,
+    // up to the next section header.
     if (blockRule && !startedInKey && !startsBlock) {
       const section = sectionName(line);
-      if (section !== null) secretSection = section.split(/[^A-Za-z0-9_.-]+/).some((part) => part !== '' && isSecretName(part));
+      if (section !== null) secretSection = section.split(/[^A-Za-z0-9_.-]+/).some((part) => part !== '' && (isSecretName(part) || part.toLowerCase().includes('credential')));
       else if (secretSection && line.trim() !== '') {
         out.push(hideSectionValue(line) + cr);
         continue;
