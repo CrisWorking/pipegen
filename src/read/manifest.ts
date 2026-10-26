@@ -35,7 +35,6 @@ export function readPyproject(toml: Obj | null): PyInfo {
   };
 }
 
-
 /** Test files and test folders: test/, tests/, __tests__/, *.test.*, *.spec.*, test_*.py, *_test.py. `rel` is relative to the service. */
 export const isTestFile = (rel: string): boolean => {
   if (!regexSafe(rel)) return false;

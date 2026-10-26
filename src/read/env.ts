@@ -50,7 +50,7 @@ const validName = (s: string | undefined): s is string => s !== undefined && NAM
 /** True when `s` (starting right after an opening quote) contains the matching unescaped closing quote. */
 function closesQuote(s: string, q: string): boolean {
   for (let i = 0; i < s.length; i++) {
-    if (s[i] === '\\') i++;
+    if (s[i] === '\\' && q !== "'") i++; // a backslash escapes only inside "..." and `...`; in '...' it is literal
     else if (s[i] === q) return true;
   }
   return false;
@@ -67,10 +67,19 @@ async function envFileNames(root: string, rel: string, names: Set<string>, pgUrl
   let open: string | null = null;
   for (const line of text === null ? [] : text.split(/\r?\n/)) {
     if (open !== null) {
-      if (regexSafe(line) && closesQuote(line, open)) open = null;
+      if (closesQuote(line, open)) open = null; // char-by-char scan, no regex, so safe on any length
       continue;
     }
-    if (!regexSafe(line)) continue;
+    if (!regexSafe(line)) {
+      // Too long for a regex and never a name, but it may still open a multi-line quote whose next lines must be skipped.
+      const eq = line.indexOf('=');
+      if (eq >= 0 && !line.trimStart().startsWith('#')) {
+        const rest = line.slice(eq + 1).trimStart();
+        const q = rest[0];
+        if ((q === '"' || q === "'" || q === '`') && !closesQuote(rest.slice(1), q)) open = q;
+      }
+      continue;
+    }
     const m = /^\s*(?:export\s+)?([^\s=#]+)\s*=\s*(.*)$/.exec(line);
     if (!m || !validName(m[1])) continue;
     const rest = m[2] ?? '';
@@ -189,6 +198,7 @@ export async function readEnv(dir: string, service: Pick<Service, 'path' | 'name
   }
 
   for (const { file, name } of await packages(dir, base, rels)) {
+    if (!regexSafe(name)) continue;
     const kind = KIND_PACKAGES.find(([, re]) => re.test(name))?.[0];
     if (kind && kind !== 'external') {
       found.push({ kind, name: kind, evidence: `${file}: ${name}`, keywords: KIND_KEYWORDS[kind as Exclude<DependencyKind, 'external'>] });

@@ -157,6 +157,26 @@ describe('readEnv', () => {
     expect((await readEnv(dir, svc())).envVars).toEqual(['A', 'B']);
   });
 
+  it('env: over-4KB line that opens a quote does not leak its continuation lines', async () => {
+    const dir = makeTempDir();
+    writeIn(dir, '.env', `BEFORE=1\nLONG_ONE='${'y'.repeat(5000)}\n  "x":1,\nABC=${'frag'}'\nREAL_AFTER=2\n`);
+    const out = await readEnv(dir, svc());
+    expect(out.envVars).toEqual(['BEFORE', 'REAL_AFTER']);
+    expect(JSON.stringify(out)).not.toContain('frag');
+  });
+
+  it('env: a backslash is literal inside single quotes', async () => {
+    const dir = makeTempDir();
+    writeIn(dir, '.env', "P='C:\\dir\\'\nNEXT=1\n");
+    expect((await readEnv(dir, svc())).envVars).toEqual(['NEXT', 'P']);
+  });
+
+  it('env: package names over 4 KB are skipped', async () => {
+    const dir = makeTempDir();
+    writeIn(dir, 'package.json', pkg({ ['pg' + 'x'.repeat(5000)]: '1', stripe: '1' }));
+    expect((await readEnv(dir, svc())).dependsOn.map((d) => d.name)).toEqual(['stripe']);
+  });
+
   it('env: root service does not inherit a nested service\'s env vars or dependencies', async () => {
     const dir = makeTempDir();
     writeIn(dir, 'Dockerfile', 'FROM node\n');
