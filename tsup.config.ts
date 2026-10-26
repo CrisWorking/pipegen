@@ -13,6 +13,8 @@ export const tsupOptions = {
   banner: { js: "#!/usr/bin/env node\nimport { createRequire as __pipegenCreateRequire } from 'node:module';\nconst require = __pipegenCreateRequire(import.meta.url);" },
   noExternal: [/.*/],
   removeNodeProtocol: false, // keep node: prefixes so the bundle imports only node: built-ins
+  // marks the bundle as a release build: loadReviewed then refuses reviewed-tools entries still PENDING review (ruling S21)
+  define: { 'process.env.PIPEGEN_RELEASE': '"1"' },
 } satisfies Options;
 
 export default defineConfig(tsupOptions);

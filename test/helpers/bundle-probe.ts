@@ -6,6 +6,7 @@ import { floorNeeds, jobCounts, needsSchema } from '../../src/engine/needs.js';
 import { loadPinnedBinaries } from '../../src/engine/linters.js';
 import { loadBundledMemory } from '../../src/engine/memory.js';
 import { checkQualityBar, loadQualityBar } from '../../src/engine/quality-bar.js';
+import { loadReviewed } from '../../src/engine/reviewed.js';
 import { readProject } from '../../src/read/project.js';
 import type { Capabilities, RepoProfile } from '../../src/types.js';
 
@@ -26,6 +27,14 @@ const capNames = ['branchProtection', 'environments', 'envRequiredReviewers', 'a
 const caps = Object.fromEntries(capNames.map((n) => [n, false])) as unknown as Capabilities;
 // data/quality-bar.yml is found through packageDataPath from the bundled file (the probe sits in <pkg>/dist/cli/)
 const qualityBar = loadQualityBar();
+// data/reviewed-tools.yml through the bundled loader: a release build (PIPEGEN_RELEASE defined by tsup, ruling S21)
+// refuses entries nobody has reviewed yet
+let reviewed: { loaded: number } | { refused: string };
+try {
+  reviewed = { loaded: loadReviewed().length };
+} catch (e) {
+  reviewed = { refused: e instanceof Error ? e.message : String(e) };
+}
 const verdict = checkQualityBar({ repo: 'o/r', stars: 1, archived: false, lastReleaseAt: null, scorecard: null, scorecardAt: null, verifiedPublisher: false, license: 'MIT', advisories: null }, qualityBar, new Date());
 console.log(JSON.stringify({
   owner: profile.owner,
@@ -44,4 +53,5 @@ console.log(JSON.stringify({
   pinnedBinaries: loadPinnedBinaries(),
   // data/memory.json, read and validated by the bundled loader
   bundledMemory: await loadBundledMemory(),
+  reviewed,
 }));

@@ -1,0 +1,738 @@
+# pipegen's reviewed tool list (Plan B Task 8), read by loadReviewed (src/engine/reviewed.ts). This file is a trust
+# root: only the tools listed here ever run in a user's CI. Each entry is one exact tool, version, pin and step
+# template. Code owners must review every change (Plan R's CODEOWNERS covers data/).
+#
+# Every value was pinned live on 2026-10-26T23:11:58Z with resolvePin (src/engine/pin.ts), read-only: actions by the
+# commit SHA of their tag (from the upstream repo's own refs), release binaries by the linux amd64 asset's sha256
+# (from the release's own checksums file, unless marked checksumSource: computed), images by the digest of their
+# multi-platform index. Every release was published at least 7 days before that (ruling S26); releasedAt is the
+# server-recorded date. A tool also in data/pinned-binaries.yml has the same version and hash there (ruling S25).
+#
+# reviewedBy is PENDING until the owner has reviewed the entry (repo, version, pin, fixedInputs, choices,
+# configFiles) and sets reviewedBy and reviewedAt in a PR. A release build refuses this list while any entry is
+# PENDING (ruling S21).
+#
+# Entry fields: categories (need categories, plus platform, egress, workflow-lint); languages; candidate (the exact
+# pin); step (the template: step.action for actions, step.cli for binaries and images); fixedInputs (set by the
+# template, the AI can never change them; config is pipegen's own pinned config, so repo config files are never
+# picked up silently); choices (the only inputs the AI may set, each limited to these values); configFiles (files
+# the tool would load from a repo by itself; added to the protected paths); proofs (passed Plan E runs).
+
+pinnedOn: "2026-10-26T23:11:58Z"
+tools:
+  # Checks out the repo. The job credential is never written to .git/config (persist-credentials false).
+  # Source: git ref refs/tags/v7.0.1 of actions/checkout (GitHub API), release published_at. Released 2026-07-20T15:10:05Z.
+  - id: actions-checkout
+    categories: ["platform"]
+    languages: ["any"]
+    releasedAt: "2026-07-20T15:10:05Z"
+    candidate:
+      id: actions-checkout
+      name: "actions/checkout"
+      kind: action
+      repo: actions/checkout
+      version: "v7.0.1"
+      pin: { sha: "3d3c42e5aac5ba805825da76410c181273ba90b1" }
+      source: reviewed
+      reviewed: true
+      categories: ["platform"]
+    step:
+      action:
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: "false"
+          allow-unsafe-pr-checkout: "false"
+      output: { path: "", format: none }
+    fixedInputs:
+      with:
+        persist-credentials: "false"
+        allow-unsafe-pr-checkout: "false"
+    choices:
+      fetch-depth: ["1", "0"]
+    configFiles: []
+    reviewedBy: PENDING
+    reviewedAt: PENDING
+    proofs: 0
+
+  # Installs Node.js. Its automatic package-manager cache is off (pipegen uses no caches, spec §19).
+  # Source: git ref refs/tags/v7.1.0 of actions/setup-node (GitHub API), release published_at. Released 2026-10-08T02:52:34Z.
+  - id: actions-setup-node
+    categories: ["platform"]
+    languages: ["node"]
+    releasedAt: "2026-10-08T02:52:34Z"
+    candidate:
+      id: actions-setup-node
+      name: "actions/setup-node"
+      kind: action
+      repo: actions/setup-node
+      version: "v7.1.0"
+      pin: { sha: "949feb2413d6458794dcd2491c4babbbce0c15c1" }
+      source: reviewed
+      reviewed: true
+      categories: ["platform"]
+    step:
+      action:
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1
+        with:
+          package-manager-cache: "false"
+      output: { path: "", format: none }
+    fixedInputs:
+      with:
+        package-manager-cache: "false"
+    choices:
+      node-version: ["20", "22", "24"]
+    configFiles: []
+    reviewedBy: PENDING
+    reviewedAt: PENDING
+    proofs: 0
+
+  # Installs Python. No cache input is set or offered (pipegen uses no caches, spec §19).
+  # Source: git ref refs/tags/v7.0.0 of actions/setup-python (GitHub API), release published_at. Released 2026-07-20T03:15:01Z.
+  - id: actions-setup-python
+    categories: ["platform"]
+    languages: ["python"]
+    releasedAt: "2026-07-20T03:15:01Z"
+    candidate:
+      id: actions-setup-python
+      name: "actions/setup-python"
+      kind: action
+      repo: actions/setup-python
+      version: "v7.0.0"
+      pin: { sha: "5fda3b95a4ea91299a34e894583c3862153e4b97" }
+      source: reviewed
+      reviewed: true
+      categories: ["platform"]
+    step:
+      action:
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+        with: {}
+      output: { path: "", format: none }
+    fixedInputs: {}
+    choices:
+      python-version: ["3.10", "3.11", "3.12", "3.13", "3.14"]
+    configFiles: []
+    reviewedBy: PENDING
+    reviewedAt: PENDING
+    proofs: 0
+
+  # Uploads scan results for the gate. Hidden files (.env and the like) are never included.
+  # Source: git ref refs/tags/v7.0.2 of actions/upload-artifact (GitHub API), release published_at. Released 2026-10-07T10:08:14Z.
+  - id: actions-upload-artifact
+    categories: ["platform"]
+    languages: ["any"]
+    releasedAt: "2026-10-07T10:08:14Z"
+    candidate:
+      id: actions-upload-artifact
+      name: "actions/upload-artifact"
+      kind: action
+      repo: actions/upload-artifact
+      version: "v7.0.2"
+      pin: { sha: "cf430e030ddbb5b0abf93d22962f4752f3646cd9" }
+      source: reviewed
+      reviewed: true
+      categories: ["platform"]
+    step:
+      action:
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          include-hidden-files: "false"
+          if-no-files-found: "error"
+      output: { path: "", format: none }
+    fixedInputs:
+      with:
+        include-hidden-files: "false"
+        if-no-files-found: "error"
+    choices: {}
+    configFiles: []
+    reviewedBy: PENDING
+    reviewedAt: PENDING
+    proofs: 0
+
+  # Downloads scan results in the gate job (exact artifact names are set by the renderer).
+  # Source: git ref refs/tags/v8.0.2 of actions/download-artifact (GitHub API), release published_at. Released 2026-10-07T10:09:51Z.
+  - id: actions-download-artifact
+    categories: ["platform"]
+    languages: ["any"]
+    releasedAt: "2026-10-07T10:09:51Z"
+    candidate:
+      id: actions-download-artifact
+      name: "actions/download-artifact"
+      kind: action
+      repo: actions/download-artifact
+      version: "v8.0.2"
+      pin: { sha: "9000827ccba6bdab643e8b6fd33ac0654aef8333" }
+      source: reviewed
+      reviewed: true
+      categories: ["platform"]
+    step:
+      action:
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
+        with: {}
+      output: { path: "", format: none }
+    fixedInputs: {}
+    choices: {}
+    configFiles: []
+    reviewedBy: PENDING
+    reviewedAt: PENDING
+    proofs: 0
+
+  # Logs in to a container registry for image builds; logs out at the end of the job.
+  # Source: git ref refs/tags/v4.6.0 of docker/login-action (GitHub API), release published_at. Released 2026-07-29T12:12:00Z.
+  - id: docker-login-action
+    categories: ["platform"]
+    languages: ["any"]
+    releasedAt: "2026-07-29T12:12:00Z"
+    candidate:
+      id: docker-login-action
+      name: "docker/login-action"
+      kind: action
+      repo: docker/login-action
+      version: "v4.6.0"
+      pin: { sha: "dbcb813823bdd20940b903addbd779551569679f" }
+      source: reviewed
+      reviewed: true
+      categories: ["platform"]
+    step:
+      action:
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f
+        with:
+          logout: "true"
+      output: { path: "", format: none }
+    fixedInputs:
+      with:
+        logout: "true"
+    choices:
+      registry: ["ghcr.io", "docker.io"]
+    configFiles: []
+    reviewedBy: PENDING
+    reviewedAt: PENDING
+    proofs: 0
+
+  # Sets up Docker Buildx. Its binary cache is off (pipegen uses no caches, spec §19).
+  # Source: git ref refs/tags/v4.4.1 of docker/setup-buildx-action (GitHub API), release published_at. Released 2026-09-16T07:50:21Z.
+  - id: docker-setup-buildx-action
+    categories: ["platform"]
+    languages: ["any"]
+    releasedAt: "2026-09-16T07:50:21Z"
+    candidate:
+      id: docker-setup-buildx-action
+      name: "docker/setup-buildx-action"
+      kind: action
+      repo: docker/setup-buildx-action
+      version: "v4.4.1"
+      pin: { sha: "f87e5991a6d7451dcb8d9637bfbc97413f497069" }
+      source: reviewed
+      reviewed: true
+      categories: ["platform"]
+    step:
+      action:
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069
+        with:
+          cache-binary: "false"
+      output: { path: "", format: none }
+    fixedInputs:
+      with:
+        cache-binary: "false"
+    choices: {}
+    configFiles: []
+    reviewedBy: PENDING
+    reviewedAt: PENDING
+    proofs: 0
+
+  # Builds the container image once (no build cache), so the same image is scanned and deployed.
+  # Source: git ref refs/tags/v7.4.0 of docker/build-push-action (GitHub API), release published_at. Released 2026-09-15T08:22:01Z.
+  - id: docker-build-push-action
+    categories: ["platform", "image-build"]
+    languages: ["any"]
+    releasedAt: "2026-09-15T08:22:01Z"
+    candidate:
+      id: docker-build-push-action
+      name: "docker/build-push-action"
+      kind: action
+      repo: docker/build-push-action
+      version: "v7.4.0"
+      pin: { sha: "c3c9e263c25d99ce0380d002d59b67737d91b0dc" }
+      source: reviewed
+      reviewed: true
+      categories: ["platform", "image-build"]
+    step:
+      action:
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc
+        with:
+          no-cache: "true"
+      output: { path: "", format: none }
+    fixedInputs:
+      with:
+        no-cache: "true"
+    choices:
+      push: ["false", "true"]
+    configFiles: []
+    reviewedBy: PENDING
+    reviewedAt: PENDING
+    proofs: 0
+
+  # Uploads SARIF results to GitHub code scanning (only where code scanning is available).
+  # Source: git ref refs/tags/v4.39.0 of github/codeql-action (GitHub API), release published_at. Released 2026-10-15T10:57:05Z.
+  - id: codeql-upload-sarif
+    categories: ["platform"]
+    languages: ["any"]
+    releasedAt: "2026-10-15T10:57:05Z"
+    candidate:
+      id: codeql-upload-sarif
+      name: "github/codeql-action"
+      kind: action
+      repo: github/codeql-action
+      version: "v4.39.0"
+      pin: { sha: "6f2ac81f5cd81fe351a197ba0b00d91d03cd2aee" }
+      source: reviewed
+      reviewed: true
+      categories: ["platform"]
+    step:
+      action:
+        uses: github/codeql-action/upload-sarif@6f2ac81f5cd81fe351a197ba0b00d91d03cd2aee
+        with: {}
+      output: { path: "", format: none }
+    fixedInputs: {}
+    choices: {}
+    configFiles: []
+    reviewedBy: PENDING
+    reviewedAt: PENDING
+    proofs: 0
+
+  # Records a GitHub build attestation for the image (v4, ruling S24: checked live).
+  # Source: git ref refs/tags/v4.2.2 of actions/attest (GitHub API), release published_at. Released 2026-08-04T20:36:29Z.
+  - id: actions-attest
+    categories: ["platform", "attestation"]
+    languages: ["any"]
+    releasedAt: "2026-08-04T20:36:29Z"
+    candidate:
+      id: actions-attest
+      name: "actions/attest"
+      kind: action
+      repo: actions/attest
+      version: "v4.2.2"
+      pin: { sha: "1e69f48acb82d1966a394da916b4c1698aa569d6" }
+      source: reviewed
+      reviewed: true
+      categories: ["platform", "attestation"]
+    step:
+      action:
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6
+        with: {}
+      output: { path: "", format: none }
+    fixedInputs: {}
+    choices: {}
+    configFiles: []
+    reviewedBy: PENDING
+    reviewedAt: PENDING
+    proofs: 0
+
+  # Egress control for proof and CI jobs (ruling S24). Spike S8 decides its mode for private repos.
+  # Source: git ref refs/tags/v2.22.2 of step-security/harden-runner (GitHub API), release published_at. Released 2026-10-19T16:55:35Z.
+  - id: harden-runner
+    categories: ["egress"]
+    languages: ["any"]
+    releasedAt: "2026-10-19T16:55:35Z"
+    candidate:
+      id: harden-runner
+      name: "step-security/harden-runner"
+      kind: action
+      repo: step-security/harden-runner
+      version: "v2.22.2"
+      pin: { sha: "dc2769abcc0fcfbadfc1df54081c1608579ef6b2" }
+      source: reviewed
+      reviewed: true
+      categories: ["egress"]
+    step:
+      action:
+        uses: step-security/harden-runner@dc2769abcc0fcfbadfc1df54081c1608579ef6b2
+        with: {}
+      output: { path: "", format: none }
+    fixedInputs: {}
+    choices:
+      egress-policy: ["audit", "block"]
+    configFiles: []
+    reviewedBy: PENDING
+    reviewedAt: PENDING
+    proofs: 0
+
+  # The registry:2 image, a local registry service for image builds in proof jobs (no scan output).
+  # Source: Docker Hub library/registry:2.8.3 index digest (registry-1.docker.io HEAD), push date from hub.docker.com. Released 2025-02-14T22:38:32.712916Z.
+  - id: registry
+    categories: ["platform"]
+    languages: ["any"]
+    releasedAt: "2025-02-14T22:38:32.712916Z"
+    candidate:
+      id: registry
+      name: "distribution/distribution"
+      kind: docker
+      repo: distribution/distribution
+      version: "2.8.3"
+      pin: { digest: "sha256:a3d8aaa63ed8681a604f1dea0aa03f100d5895b6a58ace528858a7b332415373" }
+      source: reviewed
+      reviewed: true
+      categories: ["platform"]
+    step:
+      cli:
+        install: { method: docker, package: "registry", version: "2.8.3" }
+        command: []
+      output: { path: "", format: none }
+    fixedInputs: {}
+    choices: {}
+    configFiles: []
+    reviewedBy: PENDING
+    reviewedAt: PENDING
+    proofs: 0
+
+  # OWASP ZAP baseline scan of the running app. zap-json output, converted by pipegen's parser.
+  # Source: Docker Hub zaproxy/zap-stable:20261016 index digest (registry-1.docker.io HEAD), push date from hub.docker.com. Released 2026-10-16T09:36:50.415097Z.
+  # zaproxy/zap-stable:20261016 is the newest dated stable build at least 7 days old (2.17.0 and latest were pushed on the pin day).
+  - id: zap-baseline
+    categories: ["dast"]
+    languages: ["any"]
+    releasedAt: "2026-10-16T09:36:50.415097Z"
+    candidate:
+      id: zap-baseline
+      name: "zaproxy/zaproxy"
+      kind: docker
+      repo: zaproxy/zaproxy
+      version: "20261016"
+      pin: { digest: "sha256:5ccfff9a411743ab2615136a2edd7416bec9ce41572fa94e935df38c14adb2b6" }
+      source: reviewed
+      reviewed: true
+      categories: ["dast"]
+    step:
+      cli:
+        install: { method: docker, package: "zaproxy/zap-stable", version: "20261016" }
+        command: ["zap-baseline.py", "-J", "zap.json"]
+      output: { path: "zap.json", format: zap-json }
+    fixedInputs:
+      args: ["-J", "zap.json"]
+      config:
+        content: "# pipegen's pinned ZAP baseline rules: the defaults, nothing ignored\n"
+        passAs: { flag: "-c" }
+    choices: {}
+    configFiles: [".zap/**"]
+    reviewedBy: PENDING
+    reviewedAt: PENDING
+    proofs: 0
+
+  # Trivy config scan of Terraform and other infrastructure code. Release binary, no cache.
+  # Source: release v0.76.0 of aquasecurity/trivy: trivy_0.76.0_Linux-64bit.tar.gz sha256 from the release checksums file. Released 2026-10-14T11:45:44Z.
+  - id: trivy-config
+    categories: ["iac"]
+    languages: ["any"]
+    releasedAt: "2026-10-14T11:45:44Z"
+    candidate:
+      id: trivy-config
+      name: "aquasecurity/trivy"
+      kind: cli
+      repo: aquasecurity/trivy
+      version: "v0.76.0"
+      pin: { checksum: "e24b1c51293c1b15e4ba8d45bbc7891ba053f90278ec2698f3562c993e145fe7" }
+      source: reviewed
+      reviewed: true
+      categories: ["iac"]
+    step:
+      cli:
+        install: { method: github-release, package: "trivy_0.76.0_Linux-64bit.tar.gz", version: "v0.76.0" }
+        command: ["trivy", "config", "--format", "sarif", "--output", "trivy-config.sarif", "--exit-code", "1", "."]
+      output: { path: "trivy-config.sarif", format: sarif }
+    fixedInputs:
+      args: ["--format", "sarif"]
+      config:
+        content: "# pipegen's pinned trivy config: no cache kept between runs\ncache:\n  backend: memory\n"
+        passAs: { flag: "--config" }
+    choices:
+      severity: ["CRITICAL", "HIGH,CRITICAL", "MEDIUM,HIGH,CRITICAL"]
+    configFiles: ["trivy.yaml", ".trivyignore", ".trivyignore.yaml"]
+    reviewedBy: PENDING
+    reviewedAt: PENDING
+    proofs: 0
+
+  # Trivy scan of the built container image. Release binary, no cache.
+  # Source: release v0.76.0 of aquasecurity/trivy: trivy_0.76.0_Linux-64bit.tar.gz sha256 from the release checksums file. Released 2026-10-14T11:45:44Z.
+  - id: trivy-image
+    categories: ["image-scan"]
+    languages: ["any"]
+    releasedAt: "2026-10-14T11:45:44Z"
+    candidate:
+      id: trivy-image
+      name: "aquasecurity/trivy"
+      kind: cli
+      repo: aquasecurity/trivy
+      version: "v0.76.0"
+      pin: { checksum: "e24b1c51293c1b15e4ba8d45bbc7891ba053f90278ec2698f3562c993e145fe7" }
+      source: reviewed
+      reviewed: true
+      categories: ["image-scan"]
+    step:
+      cli:
+        install: { method: github-release, package: "trivy_0.76.0_Linux-64bit.tar.gz", version: "v0.76.0" }
+        command: ["trivy", "image", "--format", "sarif", "--output", "trivy-image.sarif", "--exit-code", "1"]
+      output: { path: "trivy-image.sarif", format: sarif }
+    fixedInputs:
+      args: ["--format", "sarif"]
+      config:
+        content: "# pipegen's pinned trivy config: no cache kept between runs\ncache:\n  backend: memory\n"
+        passAs: { flag: "--config" }
+    choices:
+      severity: ["CRITICAL", "HIGH,CRITICAL", "MEDIUM,HIGH,CRITICAL"]
+    configFiles: ["trivy.yaml", ".trivyignore", ".trivyignore.yaml"]
+    reviewedBy: PENDING
+    reviewedAt: PENDING
+    proofs: 0
+
+  # Secret scan. Same release as data/pinned-binaries.yml (ruling S25). Runs unredacted in the job; the gate scrubs.
+  # Source: release v8.30.1 of gitleaks/gitleaks: gitleaks_8.30.1_linux_x64.tar.gz sha256 from the release checksums file. Released 2026-03-21T02:17:58Z.
+  - id: gitleaks
+    categories: ["secrets"]
+    languages: ["any"]
+    releasedAt: "2026-03-21T02:17:58Z"
+    candidate:
+      id: gitleaks
+      name: "gitleaks/gitleaks"
+      kind: cli
+      repo: gitleaks/gitleaks
+      version: "v8.30.1"
+      pin: { checksum: "551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb" }
+      source: reviewed
+      reviewed: true
+      categories: ["secrets"]
+    step:
+      cli:
+        install: { method: github-release, package: "gitleaks_8.30.1_linux_x64.tar.gz", version: "v8.30.1" }
+        command: ["gitleaks", "git", "--no-banner", "--report-format", "sarif", "--report-path", "gitleaks.sarif", "."]
+      output: { path: "gitleaks.sarif", format: sarif }
+    fixedInputs:
+      args: ["--report-format", "sarif", "--report-path", "gitleaks.sarif"]
+      config:
+        content: "[extend]\nuseDefault = true\n"
+        passAs: { flag: "--config" }
+    choices: {}
+    configFiles: [".gitleaks.toml", ".gitleaksignore"]
+    reviewedBy: PENDING
+    reviewedAt: PENDING
+    proofs: 0
+
+  # Semgrep CE (image). Rules come only from a pinned semgrep-rules archive, never the registry (ruling S22).
+  # Source: Docker Hub semgrep/semgrep:1.181.0 index digest (registry-1.docker.io HEAD), push date from hub.docker.com. Released 2026-10-14T21:25:26.956057Z.
+  # Rules: semgrep/semgrep-rules commit 17e31e11ebac99fb7dfe1cd288f7a32151b6f3f9 on develop ("Merge pull request #4083 from semgrep/malaverdiere/fix-keyvault-timeadd-duration"), committed and GitHub-signed (web-flow) 2026-10-15T21:04:55Z.
+  # Rules archive sha256 computed by downloading https://github.com/semgrep/semgrep-rules/archive/17e31e11ebac99fb7dfe1cd288f7a32151b6f3f9.tar.gz twice (same hash, 1214304 bytes): checksumSource: computed.
+  - id: semgrep
+    categories: ["sast"]
+    languages: ["node", "python"]
+    releasedAt: "2026-10-14T21:25:26.956057Z"
+    candidate:
+      id: semgrep
+      name: "semgrep/semgrep"
+      kind: docker
+      repo: semgrep/semgrep
+      version: "1.181.0"
+      pin: { digest: "sha256:81474464c1f07483ba0682a44787fd93c91397419762a04abe2bafaae396304b" }
+      source: reviewed
+      reviewed: true
+      categories: ["sast"]
+    step:
+      cli:
+        install: { method: docker, package: "semgrep/semgrep", version: "1.181.0" }
+        command: ["semgrep", "scan", "--metrics=off", "--disable-version-check", "--sarif", "--output", "semgrep.sarif"]
+        env:
+          PIPEGEN_RULES_URL: "https://github.com/semgrep/semgrep-rules/archive/17e31e11ebac99fb7dfe1cd288f7a32151b6f3f9.tar.gz"
+          PIPEGEN_RULES_SHA256: "9dfe6866fbecd557f507078cb79721a9eb8f4764fc2f6163648ea1320be25933"
+      output: { path: "semgrep.sarif", format: sarif }
+    fixedInputs:
+      args: ["--metrics=off", "--disable-version-check"]
+      env:
+        PIPEGEN_RULES_URL: "https://github.com/semgrep/semgrep-rules/archive/17e31e11ebac99fb7dfe1cd288f7a32151b6f3f9.tar.gz"
+        PIPEGEN_RULES_SHA256: "9dfe6866fbecd557f507078cb79721a9eb8f4764fc2f6163648ea1320be25933"
+    choices:
+      rules: ["javascript", "typescript", "python"]
+    configFiles: [".semgrepignore"]
+    reviewedBy: PENDING
+    reviewedAt: PENDING
+    proofs: 0
+
+  # Dependency scan against the OSV database. Release binary.
+  # Source: release v2.7.0 of google/osv-scanner: osv-scanner_linux_amd64 sha256 from the release checksums file. Released 2026-10-12T01:32:07Z.
+  - id: osv-scanner
+    categories: ["deps"]
+    languages: ["any"]
+    releasedAt: "2026-10-12T01:32:07Z"
+    candidate:
+      id: osv-scanner
+      name: "google/osv-scanner"
+      kind: cli
+      repo: google/osv-scanner
+      version: "v2.7.0"
+      pin: { checksum: "160c6253e2922e9e0a6a9771c5c4c40a4b3c6090b34a3cdd5e80c96cc2e4218b" }
+      source: reviewed
+      reviewed: true
+      categories: ["deps"]
+    step:
+      cli:
+        install: { method: github-release, package: "osv-scanner_linux_amd64", version: "v2.7.0" }
+        command: ["osv-scanner", "scan", "source", "--recursive", "--format", "sarif", "--output", "osv.sarif", "."]
+      output: { path: "osv.sarif", format: sarif }
+    fixedInputs:
+      args: ["--format", "sarif"]
+      config:
+        content: "# pipegen's pinned osv-scanner config: no ignored vulnerabilities\n"
+        passAs: { flag: "--config" }
+    choices: {}
+    configFiles: ["**/osv-scanner.toml"]
+    reviewedBy: PENDING
+    reviewedAt: PENDING
+    proofs: 0
+
+  # Git hook manager: sets up the pre-commit hooks, and runs them in CI on all files.
+  # Source: release v2.2.2 of evilmartians/lefthook: lefthook_2.2.2_Linux_x86_64 sha256 from the release checksums file. Released 2026-10-13T09:20:36Z.
+  - id: lefthook
+    categories: ["hooks", "hooks-ci"]
+    languages: ["any"]
+    releasedAt: "2026-10-13T09:20:36Z"
+    candidate:
+      id: lefthook
+      name: "evilmartians/lefthook"
+      kind: cli
+      repo: evilmartians/lefthook
+      version: "v2.2.2"
+      pin: { checksum: "4fbf89eb7748c6aed84d833ee1a29edac48fae614468ca9a82896ec32f2800b6" }
+      source: reviewed
+      reviewed: true
+      categories: ["hooks", "hooks-ci"]
+    step:
+      cli:
+        install: { method: github-release, package: "lefthook_2.2.2_Linux_x86_64", version: "v2.2.2" }
+        command: ["lefthook", "run", "pre-commit", "--all-files"]
+      output: { path: "", format: none }
+    fixedInputs: {}
+    choices: {}
+    configFiles: ["lefthook.yml", "lefthook.yaml", ".lefthook.yml", ".lefthook.yaml", "lefthook-local.yml", "lefthook-local.yaml", ".lefthook-local.yml", ".lefthook-local.yaml", ".lefthook/**", ".lefthook-local/**"]
+    reviewedBy: PENDING
+    reviewedAt: PENDING
+    proofs: 0
+
+  # Lists every component of the built image (SBOM, SPDX JSON). Release binary.
+  # Source: release v1.55.0 of anchore/syft: syft_1.55.0_linux_amd64.tar.gz sha256 from the release checksums file. Released 2026-10-19T19:01:26Z.
+  - id: syft
+    categories: ["sbom"]
+    languages: ["any"]
+    releasedAt: "2026-10-19T19:01:26Z"
+    candidate:
+      id: syft
+      name: "anchore/syft"
+      kind: cli
+      repo: anchore/syft
+      version: "v1.55.0"
+      pin: { checksum: "bb65249542db5fedeeb4d3f9b018b75e7264dbfbbb10486f044581a92f90490d" }
+      source: reviewed
+      reviewed: true
+      categories: ["sbom"]
+    step:
+      cli:
+        install: { method: github-release, package: "syft_1.55.0_linux_amd64.tar.gz", version: "v1.55.0" }
+        command: ["syft", "scan", "--output", "spdx-json=sbom.spdx.json"]
+      output: { path: "", format: none }
+    fixedInputs:
+      config:
+        content: "check-for-app-update: false\n"
+        passAs: { flag: "--config" }
+    choices: {}
+    configFiles: [".syft.yaml", ".syft.yml", ".syft/**", "syft.yaml"]
+    reviewedBy: PENDING
+    reviewedAt: PENDING
+    proofs: 0
+
+  # Signs the built image. Same release as data/pinned-binaries.yml (ruling S25).
+  # Source: release v3.1.3 of sigstore/cosign: cosign-linux-amd64 sha256 from the release checksums file. Released 2026-08-06T01:09:23Z.
+  - id: cosign
+    categories: ["signing"]
+    languages: ["any"]
+    releasedAt: "2026-08-06T01:09:23Z"
+    candidate:
+      id: cosign
+      name: "sigstore/cosign"
+      kind: cli
+      repo: sigstore/cosign
+      version: "v3.1.3"
+      pin: { checksum: "4629c757b7618056f8ddd7e2625ae9fdd94c0372a65049520bc7d9df9efc7f71" }
+      source: reviewed
+      reviewed: true
+      categories: ["signing"]
+    step:
+      cli:
+        install: { method: github-release, package: "cosign-linux-amd64", version: "v3.1.3" }
+        command: ["cosign", "sign", "--yes"]
+      output: { path: "", format: none }
+    fixedInputs:
+      args: ["--yes"]
+    choices: {}
+    configFiles: []
+    reviewedBy: PENDING
+    reviewedAt: PENDING
+    proofs: 0
+
+  # Lints GitHub workflow files. Same release as data/pinned-binaries.yml (ruling S25). The cache-mode ignore lands with Task 7 Part 2 (v0.2).
+  # Source: release v1.7.12 of rhysd/actionlint: actionlint_1.7.12_linux_amd64.tar.gz sha256 from the release checksums file. Released 2026-03-30T17:49:21Z.
+  - id: actionlint
+    categories: ["workflow-lint"]
+    languages: ["any"]
+    releasedAt: "2026-03-30T17:49:21Z"
+    candidate:
+      id: actionlint
+      name: "rhysd/actionlint"
+      kind: cli
+      repo: rhysd/actionlint
+      version: "v1.7.12"
+      pin: { checksum: "8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8" }
+      source: reviewed
+      reviewed: true
+      categories: ["workflow-lint"]
+    step:
+      cli:
+        install: { method: github-release, package: "actionlint_1.7.12_linux_amd64.tar.gz", version: "v1.7.12" }
+        command: ["actionlint", "-no-color"]
+      output: { path: "", format: none }
+    fixedInputs:
+      config:
+        content: "self-hosted-runner:\n  labels: []\n"
+        passAs: { flag: "-config-file" }
+    choices: {}
+    configFiles: [".github/actionlint.yaml", ".github/actionlint.yml"]
+    reviewedBy: PENDING
+    reviewedAt: PENDING
+    proofs: 0
+
+  # Security audit of GitHub workflow files, offline. Release binary.
+  # Source: release v1.31.1 of zizmorcore/zizmor: zizmor-x86_64-unknown-linux-gnu.tar.gz sha256 computed by pipegen (the release has no checksums file). Released 2026-10-15T23:16:39Z.
+  # checksumSource: computed. zizmorcore/zizmor v1.31.1 has no checksums file, so pipegen downloaded zizmor-x86_64-unknown-linux-gnu.tar.gz and computed its sha256 itself; a reviewer must confirm it.
+  - id: zizmor
+    categories: ["workflow-lint"]
+    languages: ["any"]
+    releasedAt: "2026-10-15T23:16:39Z"
+    candidate:
+      id: zizmor
+      name: "zizmorcore/zizmor"
+      kind: cli
+      repo: zizmorcore/zizmor
+      version: "v1.31.1"
+      pin: { checksum: "d185f726bdaf92df78273217dfdd24ebcd6b0ef48cf3ce776ff5762b6e138c99" }
+      source: reviewed
+      reviewed: true
+      categories: ["workflow-lint"]
+    step:
+      cli:
+        install: { method: github-release, package: "zizmor-x86_64-unknown-linux-gnu.tar.gz", version: "v1.31.1" }
+        command: ["zizmor", "--offline", ".github/workflows"]
+      output: { path: "", format: none }
+    fixedInputs:
+      args: ["--offline"]
+      config:
+        content: "rules: {}\n"
+        passAs: { flag: "--config" }
+    choices: {}
+    configFiles: ["zizmor.yml", "zizmor.yaml", ".github/zizmor.yml", ".github/zizmor.yaml"]
+    reviewedBy: PENDING
+    reviewedAt: PENDING
+    proofs: 0
