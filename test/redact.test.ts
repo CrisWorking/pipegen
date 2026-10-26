@@ -1,5 +1,5 @@
 import { execFileSync } from 'node:child_process';
-import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { isAbsolute, join, relative, resolve } from 'node:path';
 import picomatch from 'picomatch';
 import { afterEach, describe, expect, it } from 'vitest';
@@ -8,6 +8,7 @@ import {
   isBinary, redact, scrubKnownValues, type CodeBundle,
 } from '../src/ai/redact.js';
 import { isBinary as limitsIsBinary } from '../src/read/limits.js';
+import { CLEAN, makeStub } from './helpers/gitleaks-stub.js';
 import { cleanupRepos, makeTempDir, writeIn } from './helpers/make-repo.js';
 import { fake, makeSecretRepo } from './helpers/secret-repo.js';
 
@@ -16,38 +17,6 @@ const R = '[REDACTED]';
 
 afterEach(() => cleanupRepos());
 
-// ---------- gitleaks stub ----------
-// A small node script standing in for the pinned gitleaks binary. It records what it was given
-// (argv, cwd, env names, the scanned files) and then runs `body` to write a report and exit.
-interface StubRecord { argv: string[]; cwd: string; envKeys: string[]; files: Record<string, string>; src: string }
-
-function makeStub(body: string): { bin: string; record: () => StubRecord } {
-  const dir = makeTempDir();
-  const rec = join(dir, 'record.json');
-  const bin = join(dir, 'gitleaks-stub.cjs');
-  writeFileSync(bin, `#!/usr/bin/env node
-const fs = require('fs'), path = require('path');
-const argv = process.argv.slice(2);
-const src = argv[argv.indexOf('--source') + 1];
-const report = argv[argv.indexOf('--report-path') + 1];
-const files = {};
-for (const f of fs.readdirSync(src)) files[f] = fs.readFileSync(path.join(src, f), 'utf8');
-fs.writeFileSync(${JSON.stringify(rec)}, JSON.stringify({ argv, cwd: process.cwd(), envKeys: Object.keys(process.env), files, src }));
-function findingsFor(value, match) {
-  const out = [];
-  for (const [f, text] of Object.entries(files)) {
-    const lines = text.split('\\n');
-    lines.forEach((l, i) => { if (l.includes(value)) out.push({ File: path.join(src, f), StartLine: i + 1, EndLine: i + 1, Match: match || value, ['Sec' + 'ret']: value }); });
-  }
-  return out;
-}
-${body}
-`);
-  chmodSync(bin, 0o755);
-  return { bin, record: () => JSON.parse(readFileSync(rec, 'utf8')) as StubRecord };
-}
-
-const CLEAN = `fs.writeFileSync(report, '[]'); process.exit(0);`;
 const reportValue = (value: string) => `const f = findingsFor(${JSON.stringify(value)}); fs.writeFileSync(report, JSON.stringify(f)); process.exit(f.length ? 1 : 0);`;
 
 // Byte length of bundleText(b), computed independently (works for count-only bundles too).

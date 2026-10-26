@@ -57,8 +57,10 @@ describe('build', () => {
       const err = e as { status?: number; stderr?: string };
       throw new Error(`probe exited with ${err.status}: ${String(err.stderr).split('\n').slice(0, 8).join('\n')}`);
     }
-    const result = JSON.parse(stdout.trim()) as { owner: string; repo: string; services: string[]; files: number; bytes: number; gitleaksChecked: boolean; providers: string[] };
+    const result = JSON.parse(stdout.trim()) as { owner: string; repo: string; services: string[]; files: number; bytes: number; gitleaksChecked: boolean; providers: string[]; pushJobs: number; needsSchemaKeys: string[] };
     expect(result).toMatchObject({ owner: 'o', repo: 'r', services: ['.'], gitleaksChecked: false, providers: ['claude', 'openai', 'ollama'] });
+    expect(result.pushJobs).toBe(6); // hooks-ci, secrets + sast, deps, unit-tests, lint for the one service
+    expect(result.needsSchemaKeys).toEqual(['add', 'skipLayers', 'requireDeployApproval']);
     expect(code).toContain('server-side-fallback-2026-07-01'); // the Anthropic SDK client really is in the bundle
     expect(result.files).toBeGreaterThan(0);
     expect(result.bytes).toBeGreaterThan(0);

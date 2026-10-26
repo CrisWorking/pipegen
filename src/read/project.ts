@@ -18,9 +18,12 @@ const NODE_LOCKS: [string, PackageManager][] = [['pnpm-lock.yaml', 'pnpm'], ['ya
 const PYTHON_LOCKS: [string, PackageManager][] = [['poetry.lock', 'poetry'], ['uv.lock', 'uv']];
 const NODE_FRAMEWORKS: [string, string][] = [['express', 'express'], ['fastify', 'fastify'], ['@nestjs/core', '@nestjs/core'], ['next', 'next'], ['koa', 'koa'], ['@hapi/hapi', 'hapi'], ['hapi', 'hapi']];
 const PYTHON_FRAMEWORKS = ['flask', 'fastapi', 'django'];
+/** Every name readProject can put in Service.frameworks. */
+export const SERVER_FRAMEWORKS: readonly string[] = [...new Set([...NODE_FRAMEWORKS.map(([, name]) => name), ...PYTHON_FRAMEWORKS])];
 const NODE_TEST_FRAMEWORKS = ['jest', 'vitest', 'mocha', 'ava'];
 const MAX_PORT_SCAN_FILES = 100;
-const SERVICE_NAME_RE = /^[A-Za-z0-9._@/-]{1,214}$/;
+/** Service.name pattern (types.ts identifier rule). Exported so the needs planner (Plan B Task 1) re-checks names before an AI prompt. */
+export const SERVICE_NAME_RE = /^[A-Za-z0-9._@/-]{1,214}$/;
 const MAX_WORKSPACE_PATTERNS = 100;
 const NOT_SERVICE_DIRS = ['.devcontainer', 'test', 'tests', '__tests__', 'fixtures', 'examples', 'docs'];
 // Root files read by direct path so the file cap can never hide them.
