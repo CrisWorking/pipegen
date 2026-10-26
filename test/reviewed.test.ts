@@ -202,6 +202,12 @@ describe('loadReviewed', () => {
     rejects([semgrepEntry(undefined, scan('--config', 'auto'))], REGISTRY);
     rejects([semgrepEntry(undefined, scan('--config=auto'))], REGISTRY);
     rejects([semgrepEntry(undefined, scan('--config=r/python.lang'))], REGISTRY);
+    // glued short options are configs too (N3)
+    rejects([semgrepEntry(undefined, scan('-fauto'))], REGISTRY);
+    rejects([semgrepEntry(undefined, scan('-cp/default'))], REGISTRY);
+    rejects([semgrepEntry(undefined, scan('-f=auto'))], REGISTRY);
+    rejects([semgrepEntry(undefined, scan('-c/tmp/x'))], /--config/);
+    rejects([semgrepEntry(undefined, scan('-f=/tmp/x'))], /--config/);
     // semgrep's default config is auto: a command with no --config at the verified rules dir is refused (I2)
     const noConfig = ['semgrep', 'scan', '--metrics=off', '--sarif'];
     rejects([semgrepEntry(undefined, noConfig, ['--metrics=off'])], /--config/);
@@ -303,6 +309,11 @@ describe('loadReviewed', () => {
     const at = (reviewedBy: string, reviewedAt: string) => ({ ...actionEntry(), reviewedBy, reviewedAt });
     for (const variant of ['pending', 'Pending', 'PENDING ', ' PENDING']) rejects([at(variant, '2026-11-01')], /PENDING/);
     for (const blank of ['', '   ']) rejects([at(blank, '2026-11-01')]);
+    // a printable name only: no zero-width or control characters (M3+)
+    rejects([at('PENDING\u200b', '2026-11-01')], /printable name/);
+    rejects([at('Cristiano\u200dPereira', '2026-11-01')], /printable name/);
+    rejects([at('C', '2026-11-01')], /printable name/);
+    expect(load([at("Cristiano O'Brien-Pereira", '2026-11-01')])).toHaveLength(1);
     rejects([at('Cristiano Pereira', '2026-02-30')], /real date/); // no such day
     rejects([at('Cristiano Pereira', '2026-10-25')], /pinnedOn/); // the fixture list is pinned on 2026-10-26
     expect(load([at('Cristiano Pereira', '2026-10-26')])).toHaveLength(1);
@@ -427,6 +438,14 @@ describe('data/reviewed-tools.yml', () => {
     loud.step.cli.command = ['zap-baseline.py', '-J', 'zap.json'];
     loud.fixedInputs.args = ['-J', 'zap.json'];
     rejects([loud], /-silent/);
+    // zap-baseline.py keeps the LAST -z: exactly one -z, and its value is -silent (N2)
+    const twice = structuredClone(raw);
+    twice.step.cli.command = ['zap-baseline.py', '-J', 'zap.json', '-z', '-silent', '-z', '-addoninstall x'];
+    rejects([twice], /-silent/);
+    const extra = structuredClone(raw);
+    extra.step.cli.command = ['zap-baseline.py', '-J', 'zap.json', '-z', '-silent -addoninstall x'];
+    extra.fixedInputs.args = ['-J', 'zap.json', '-z', '-silent -addoninstall x'];
+    rejects([extra], /-silent/);
   });
 
   it('reviewed: egress entry has enable-sudo false and block (S8: Bullfrog, not Harden-Runner)', () => {
@@ -449,6 +468,18 @@ describe('data/reviewed-tools.yml', () => {
       loose.step.action.with[key] = weak;
       rejects([loose], new RegExp(key));
     }
+    // only the three fixed inputs and the two allow-list choices: no api-token or control-plane setting (N1)
+    const withPlaneKey = structuredClone(raw);
+    const planeKey = ['api', 'to' + 'ken'].join('-');
+    withPlaneKey.fixedInputs.with[planeKey] = 'x';
+    withPlaneKey.step.action.with[planeKey] = 'x';
+    rejects([withPlaneKey], new RegExp(planeKey));
+    const plane = structuredClone(raw);
+    plane.choices['_control-plane-api-base-url'] = ['https://example.invalid/'];
+    rejects([plane], /_control-plane/);
+    const stepOnly = structuredClone(raw);
+    stepOnly.step.action.with['collect-process-info'] = 'false';
+    rejects([stepOnly], /collect-process-info/);
   });
 
   it('reviewed: build-push fixes context "." and an empty github-token, so the job credential is no build secret (I3)', () => {

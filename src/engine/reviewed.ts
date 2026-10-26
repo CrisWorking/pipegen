@@ -58,6 +58,8 @@ const DIGEST_RE = /^sha256:[0-9a-f]{64}$/;
 const IMAGE_RE = /^(?:(?:docker\.io|ghcr\.io)\/)?[a-z0-9]+(?:(?:[._]|__|-+)[a-z0-9]+)*(?:\/[a-z0-9]+(?:(?:[._]|__|-+)[a-z0-9]+)*){0,2}$/;
 const FLAG_RE = /^-{1,2}[A-Za-z][A-Za-z0-9-]{0,63}$/;
 const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
+/** A reviewer's name: printable letters and digits, spaces, `.`, `'` and `-` only (no zero-width or control characters). */
+const REVIEWER_RE = /^[\p{L}\p{N} .'-]{2,80}$/u;
 const DAY_MS = 86_400_000;
 const ISO_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?Z$/;
 /** A repo-relative path or glob: no absolute path, no `..`, no backslash. */
@@ -141,7 +143,7 @@ const entrySchema = z.strictObject({
   fixedInputs: fixedSchema,
   choices: z.record(z.string().regex(INPUT_RE), z.array(z.string().min(1).max(100).pipe(safeValue)).min(1).max(32)),
   configFiles: z.array(z.string().regex(REL_GLOB_RE)).max(32),
-  reviewedBy: z.string().max(100).pipe(safeValue).refine((s) => s.trim() !== '', 'reviewedBy must be a name or PENDING'),
+  reviewedBy: z.string().max(100).pipe(safeValue).refine((s) => REVIEWER_RE.test(s) && s.trim().length >= 2, 'reviewedBy must be PENDING or a printable name (letters, digits, spaces, . \' -; 2 to 80 characters)'),
   reviewedAt: z.string(),
   proofs: z.number().int().nonnegative(),
 }).superRefine((e, ctx) => {
@@ -274,11 +276,20 @@ function entryProblems(e: Entry): { message: string; path: (string | number)[] }
   if (repo === 'bullfrogsec/bullfrog') {
     const want: Record<string, string> = { 'egress-policy': 'block', 'dns-policy': 'allowed-domains-only', 'enable-sudo': 'false' };
     for (const [k, v] of Object.entries(want)) if (fx.with?.[k] !== v) bad(`the Bullfrog entry must fix ${k}: "${v}"`, 'fixedInputs', 'with', k);
+    // nothing else: an api-token or a control-plane URL would let Bullfrog's control plane override the policy
+    const allowed = new Set([...Object.keys(want), 'allowed-domains', 'allowed-ips']);
+    for (const k of [...Object.keys(stepWith), ...Object.keys(fx.with ?? {}), ...Object.keys(e.choices)]) {
+      if (!allowed.has(k)) bad(`the Bullfrog entry may not set ${k}: only ${[...allowed].join(', ')}`, 'step', 'action', 'with', k);
+    }
   }
   // I1: without -silent, zap-baseline.py updates and installs add-ons from the internet at run time
   if (repo === 'zaproxy/zaproxy' || /(^|\/)zap(-[a-z]+)?$/.test(cli?.install.package ?? '')) {
-    const silent = (args: readonly string[]) => args.some((a, i) => a === '-z' && (args[i + 1] ?? '').split(/\s+/).includes('-silent'));
-    if (!silent(cli?.command ?? []) || !silent(fx.args ?? [])) bad('the ZAP entry must pass -z "-silent" (in the command and fixedInputs.args): no add-on downloads at run time', 'step', 'cli', 'command');
+    // zap-baseline.py keeps the LAST -z, so there must be exactly one, and its value must be -silent alone
+    const silent = (args: readonly string[]) => {
+      const at = args.flatMap((a, i) => (a === '-z' || a.startsWith('-z') ? [i] : []));
+      return at.length === 1 && args[at[0] as number] === '-z' && args[(at[0] as number) + 1] === '-silent';
+    };
+    if (!silent(cli?.command ?? []) || !silent(fx.args ?? [])) bad('the ZAP entry must pass exactly one -z, with the value -silent (in the command and fixedInputs.args): no add-on downloads at run time', 'step', 'cli', 'command');
   }
   if (repo === 'semgrep/semgrep' || /(^|\/)semgrep$/.test(cli?.install.package ?? '')) out.push(...semgrepProblems(e));
   return out;
@@ -304,7 +315,7 @@ function semgrepProblems(e: Entry): { message: string; path: (string | number)[]
     ...Object.values(e.step.action?.with ?? {}), ...Object.values(e.choices).flat(),
   ];
   const registry = (v: string) => {
-    const t = v.replace(/^--config=|^-c=?/, '');
+    const t = v.replace(/^--config=|^-[cf]=?/, '');
     return t === 'auto' || /^(?:p|r|s)\//.test(t) || /semgrep\.dev/i.test(t);
   };
   if (values.some(registry)) out.push({ message: 'semgrep must not use registry rule packs (p/…, r/…), semgrep.dev or --config auto: they change without review', path: ['step', 'cli', 'command'] });
@@ -319,12 +330,13 @@ function semgrepProblems(e: Entry): { message: string; path: (string | number)[]
   return out;
 }
 
-/** Every config semgrep would load from these args: --config X, -c X, -f X, --config=X, -c=X. */
+/** Every config semgrep would load from these args: --config X, -c X, -f X, --config=X, and glued -cX, -fX, -c=X, -f=X. */
 function semgrepConfigs(args: readonly string[]): string[] {
   const out: string[] = [];
   args.forEach((a, i) => {
     if (a === '--config' || a === '-c' || a === '-f') out.push(args[i + 1] ?? '');
-    else if (/^(?:--config|-c|-f)=/.test(a)) out.push(a.slice(a.indexOf('=') + 1));
+    else if (a.startsWith('--config=')) out.push(a.slice('--config='.length));
+    else if (/^-[cf]./.test(a)) out.push(a.slice(2).replace(/^=/, ''));
   });
   return out;
 }

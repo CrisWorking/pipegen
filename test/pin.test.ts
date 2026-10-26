@@ -299,6 +299,15 @@ describe('pin: release binaries', () => {
     expect(notes.join('\n')).toContain('checksumSource: computed');
   });
 
+  it('pin: a checksums file and GitHub\'s asset digest must agree', async () => {
+    const want = sha256('the real archive');
+    const routes = (digest: string) => setup(binGithub([{ ...asset(BIN), digest }, asset('checksums.txt', 100)]), {
+      [`GET ${DL}/o/tool/releases/download/v1.4.0/checksums.txt`]: { raw: `${want}  ${BIN}\n` },
+    });
+    expect((await resolvePin(binCand(), routes(`sha256:${want}`).deps)).pin).toEqual({ checksum: want });
+    await expect(resolvePin(binCand(), routes(`sha256:${'7'.repeat(64)}`).deps)).rejects.toThrow(/disagree/);
+  });
+
   it("pin: no checksums file but GitHub's own asset digest → that digest, marked checksumSource github-asset-digest, nothing downloaded", async () => {
     const hex = sha256(BIN_BYTES);
     const immutable = (assets: unknown[]): Routes => ({

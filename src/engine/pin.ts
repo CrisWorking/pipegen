@@ -298,6 +298,10 @@ export async function resolvePin(c: Candidate, deps: PinDeps, install?: InstallS
       }
       if (found.size === 0) throw new PinError(`The checksums file of ${what} doesn't list ${chosen.name}.`);
       if (found.size > 1) throw new PinError(`The checksums files of ${what} disagree about ${chosen.name}.`);
+      // GitHub's own record of the asset, when it has one, must say the same
+      if (typeof chosen.digest === 'string' && DIGEST_RE.test(chosen.digest) && chosen.digest !== `sha256:${[...found][0] as string}`) {
+        throw new PinError(`The checksums file of ${what} and GitHub's record of ${chosen.name} disagree.`);
+      }
       checkAge(what, dates);
       checksum = [...found][0] as string;
     } else if (typeof chosen.digest === 'string' && DIGEST_RE.test(chosen.digest)) {
