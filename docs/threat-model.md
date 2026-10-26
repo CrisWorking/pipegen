@@ -84,7 +84,7 @@
 | T41 | **A hostile repo redirects `npx`** (its own `.npmrc` registry, or a local `node_modules/.bin/pipegen`) | Run from outside the repo with `--dir` and an explicit `--registry`. The audit warns about a registry `.npmrc` or a local pipegen binary | A user who ignores the instructions |
 | T42 | **`--out` writes through a symlink** (e.g. into `~/.bashrc`) | No-follow + exclusive create, symlinks refused, default output location outside the repo | None known |
 | T43 | **Terminal / Markdown injection** from repo-controlled names (ANSI/OSC escape codes, bidi, links) | Every repo- or AI-derived string goes through `safeText`/`safeMarkdown` | New terminal features (regular fixture updates) |
-| T44 | **Parser or regex denial of service** (YAML alias bombs, huge files, very long lines) | 1 MB file limit, 20k file limit, `maxAliasCount`, line-length limit for regexes, no child processes during the audit | Slow but bounded runs on huge repos |
+| T44 | **Parser or regex denial of service** (YAML alias bombs, huge files, very long lines) | 1 MB file limit, 20k file limit, `maxAliasCount`, line-length limit for regexes, no child processes during the audit without `--ai`; with `--ai`, only the pinned, checksum-verified gitleaks binary | Slow but bounded runs on huge repos |
 | T45 | **Token leak** (sent to a wrong host, printed in errors or JSON) | Hard-coded `api.github.com`, never printed, tests on `--json`/`--out` | None known |
 
 ### Which threats matter in which milestone
