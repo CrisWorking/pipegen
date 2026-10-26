@@ -1,3 +1,14 @@
+// Identifier rule for RepoProfile (and every type built from a repo): data is kept RAW but VALIDATED; it is
+// cleaned only at output.
+// - A reader keeps a repo-derived identifier exactly as found when it passes its pattern, and otherwise drops it
+//   (with a note when it was a whole file) or replaces it with a safe fallback. It never stores a cleaned copy:
+//   cleaning changes the value, so a later lookup or comparison with the raw repo would no longer match.
+//   Patterns: workflow paths must be unchanged by safeText (else the file is skipped with a note); job ids
+//   /^[A-Za-z_][A-Za-z0-9_-]*$/; triggers /^[a-z_]+$/; secret and env var names /^[A-Za-z_][A-Za-z0-9_]{0,127}$/;
+//   Service.name /^[A-Za-z0-9._@/-]{1,214}$/, else the folder name (same pattern), else 'app'.
+// - Every value is cleaned where it leaves pipegen: safeText() for the terminal, safeMarkdown() for Markdown.
+//   Fields not validated at read time (Service.path, runtimeVersion, dockerfile, Dependency.evidence) must always
+//   go through those at output.
 // ---------- project ----------
 export type Language = 'node' | 'python' | 'go' | 'java' | 'dotnet' | 'ruby' | 'php' | 'other';
 export type PackageManager = 'npm' | 'pnpm' | 'yarn' | 'bun' | 'pip' | 'poetry' | 'uv' | 'other';

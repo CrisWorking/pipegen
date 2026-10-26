@@ -122,12 +122,30 @@ secrets_note${':'} hunter2
     expect(await readWorkflows(dir)).toEqual([]);
   });
 
-  it('workflows: hostile filename carries no control characters', async () => {
+  it('workflows: a file whose name has control characters is skipped with a note; other paths are stored raw', async () => {
     const dir = makeTempDir();
     wf(dir, 'a\u001b[31mb.yml', 'on: push\njobs: {}\n');
-    const out = await readWorkflows(dir);
-    expect(out).toHaveLength(1);
-    expect(out[0]?.path).not.toMatch(/\u001b/);
+    wf(dir, 'c\u202ed.yml', 'on: push\njobs: {}\n');
+    wf(dir, 'ok name.yml', 'on: push\njobs: {}\n');
+    const notes: string[] = [];
+    const out = await readWorkflows(dir, undefined, notes);
+    expect(out.map((w) => w.path)).toEqual(['.github/workflows/ok name.yml']);
+    expect(notes).toEqual([
+      'Skipped .github/workflows/ab.yml: its file name has control or invisible characters, or is too long.',
+      'Skipped .github/workflows/cd.yml: its file name has control or invisible characters, or is too long.',
+    ]);
+    for (const n of notes) expect(n).not.toMatch(/[\u001b\u202e]/);
+  });
+
+  it('workflows: job ids that GitHub would not accept are dropped', async () => {
+    const w = await one('on: push\njobs:\n  build:\n    runs-on: x\n  ok-job_2:\n    runs-on: x\n  _private:\n    runs-on: x\n  "bad id":\n    runs-on: x\n  "1st":\n    runs-on: x\n  "x\\e[31m":\n    runs-on: x\n  "a.b":\n    runs-on: x\n');
+    expect(w?.jobs).toEqual(['build', 'ok-job_2', '_private']);
+  });
+
+  it('workflows: trigger names other than lowercase words are dropped', async () => {
+    expect((await one('on: [push, "pu\\x01sh", Push, "pull-request", workflow_dispatch]\njobs: {}\n'))?.triggers).toEqual(['push', 'workflow_dispatch']);
+    expect((await one('on:\n  "pu\\x01sh":\n  pull_request:\njobs: {}\n'))?.triggers).toEqual(['pull_request']);
+    expect((await one('on: "pu\\x01sh"\njobs: {}\n'))?.triggers).toEqual([]);
   });
 
   it('workflows: ignores non-yaml files, subfolders and symlinks', async () => {

@@ -285,6 +285,25 @@ describe('read', () => {
     expect(p.monorepo).toBe('none');
   });
 
+  it('read: service names are kept raw when valid, else the folder name, else "app"', async () => {
+    const dir = repo('node-library');
+    writeIn(dir, 'package.json', JSON.stringify({ name: 'root', workspaces: ['apps/*'] }));
+    const svc = (name: string | undefined, folder: string) => writeIn(dir, `apps/${folder}/package.json`, JSON.stringify({ ...(name === undefined ? {} : { name }), scripts: { dev: 'x' } }));
+    svc('@scope/good.name_1-x', 'a1');      // valid: kept exactly
+    svc('bad\u001b[31mname', 'a2');        // control characters: folder name instead
+    svc('has space', 'a3');                 // not a valid package name: folder name instead
+    svc('x'.repeat(215), 'a4');             // too long: folder name instead
+    svc('also bad\u202e', 'bad folder');    // invalid name and invalid folder: 'app'
+    svc(undefined, 'a6');                   // no name: folder name
+    const p = await readProject(dir);
+    expect(p.services.map((s) => [s.path, s.name])).toEqual([
+      ['apps/a1', '@scope/good.name_1-x'], ['apps/a2', 'a2'], ['apps/a3', 'a3'], ['apps/a4', 'a4'], ['apps/a6', 'a6'], ['apps/bad folder', 'app'],
+    ]);
+    const root = repo('node-library');
+    writeIn(root, 'package.json', JSON.stringify({ name: 'bad\u0007name' }));
+    expect((await readProject(root)).services[0]?.name).toBe('r'); // the root folder's name is the repo name
+  });
+
   it('read: skip notes give the real reason', async () => {
     const dir = repo('node-npm');
     writeFileSync(join(dir, 'package.json'), '{"name":"x"}' + ' '.repeat(1_000_001));

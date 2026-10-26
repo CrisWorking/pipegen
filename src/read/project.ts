@@ -20,6 +20,7 @@ const NODE_FRAMEWORKS: [string, string][] = [['express', 'express'], ['fastify',
 const PYTHON_FRAMEWORKS = ['flask', 'fastapi', 'django'];
 const NODE_TEST_FRAMEWORKS = ['jest', 'vitest', 'mocha', 'ava'];
 const MAX_PORT_SCAN_FILES = 100;
+const SERVICE_NAME_RE = /^[A-Za-z0-9._@/-]{1,214}$/;
 const MAX_WORKSPACE_PATTERNS = 100;
 const NOT_SERVICE_DIRS = ['.devcontainer', 'test', 'tests', '__tests__', 'fixtures', 'examples', 'docs'];
 // Root files read by direct path so the file cap can never hide them.
@@ -150,8 +151,11 @@ async function readService(ctx: Ctx, dir: string, shared: Shared): Promise<Servi
 
   const port = (dockerfile ? await exposedPort(ctx, dockerfile) : undefined) ?? (await codePort(ctx, owned.filter((f) => !isTestFile(relTo(f)))));
 
-  const name = asString(pkg?.name) ?? py.name ?? (dir === '.' ? shared.repo : basename(dir));
-  return { name: safeText(name), path: dir, language, packageManager, runtimeVersion, dockerfile, port, hasTests, testFramework, ...(await readEnv(ctx.root, { path: dir, name: safeText(name) }, owned)), scripts, frameworks };
+  // Raw but validated (see src/types.ts): the declared name if valid, else the folder name if valid, else 'app'.
+  const declared = asString(pkg?.name) ?? py.name;
+  const folder = dir === '.' ? shared.repo : basename(dir);
+  const name = [declared, folder].find((n): n is string => n !== undefined && SERVICE_NAME_RE.test(n)) ?? 'app';
+  return { name, path: dir, language, packageManager, runtimeVersion, dockerfile, port, hasTests, testFramework, ...(await readEnv(ctx.root, { path: dir, name }, owned)), scripts, frameworks };
 }
 
 async function anyFileHasLine(ctx: Ctx, files: string[], re: RegExp): Promise<boolean> {

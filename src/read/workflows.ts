@@ -6,10 +6,13 @@ import { listFiles, parseYamlLimited, readTextLimitedWithReason, regexLines, reg
 import { asObj } from './manifest.js';
 
 // Only names are kept: event names, job ids and secret NAMES. No step, command or secret value leaves this file.
+// Every kept name is raw but validated (see src/types.ts): a name that fails its pattern is dropped, never cleaned.
 
 const MAX_WORKFLOWS = 200;
 const WORKFLOW_FILE = /^\.github\/workflows\/[^/]+\.ya?ml$/;
 const NAME_RE = /^[A-Za-z_][A-Za-z0-9_]{0,127}$/;
+const JOB_ID_RE = /^[A-Za-z_][A-Za-z0-9_-]*$/;
+const TRIGGER_RE = /^[a-z_]+$/;
 // Plan regex with whole-word guards: a leading guard on every token and a trailing guard on the short ones, so
 // "butterfly" and "overwhelm" do not count while "deployment.sh" and "npm_deploy" still do. (helmfile is a known miss.)
 const DEPLOY_RE = /(?<![A-Za-z])(deploy|vercel|netlify|fly(?:ctl)?(?![A-Za-z])|heroku|aws (?:ecs|s3|lambda)|kubectl|helm(?![A-Za-z])|gcloud (?:run|app)|az (?:webapp|containerapp)|docker push|npm publish|twine upload)/i;
@@ -26,7 +29,7 @@ function looksLikeDeploy(text: string, re: RegExp): boolean {
 
 function triggersOf(on: unknown): string[] {
   const names = typeof on === 'string' ? [on] : Array.isArray(on) ? on.flatMap(strings) : Object.keys(asObj(on));
-  return [...new Set(names.map((n) => safeText(n, 60)))];
+  return [...new Set(names.filter((n) => regexSafe(n) && TRIGGER_RE.test(n)))];
 }
 
 // Scans line by line, so a secret inside a multi-line ${{ }} expression is missed (a safe miss), and a name
@@ -75,6 +78,10 @@ export async function readWorkflows(dir: string, files?: string[], notes: string
   if (all.length > MAX_WORKFLOWS) notes.push(`Only the first ${MAX_WORKFLOWS} workflow files were read.`);
   const out: ExistingWorkflow[] = [];
   for (const path of all.slice(0, MAX_WORKFLOWS)) {
+    if (safeText(path) !== path) {
+      notes.push(`Skipped ${safeText(path)}: its file name has control or invisible characters, or is too long.`);
+      continue;
+    }
     const read = await readTextLimitedWithReason(join(dir, path));
     if (!('text' in read)) {
       notes.push(`Skipped ${safeText(path)}: it could not be read (${read.skipped}).`);
@@ -88,11 +95,11 @@ export async function readWorkflows(dir: string, files?: string[], notes: string
       continue;
     }
     out.push({
-      path: safeText(path, 300),
+      path,
       triggers: triggersOf(doc.on ?? doc.true),
       deploys: deploysOf(doc, path),
       secretsUsed: secretsOf(read.text),
-      jobs: Object.keys(asObj(doc.jobs)).map((j) => safeText(j, 100)),
+      jobs: Object.keys(asObj(doc.jobs)).filter((j) => regexSafe(j) && JOB_ID_RE.test(j)),
     });
   }
   return out;
