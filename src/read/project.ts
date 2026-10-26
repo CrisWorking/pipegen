@@ -4,14 +4,13 @@ import picomatch from 'picomatch';
 import { parse as parseToml } from 'smol-toml';
 import type { Language, Monorepo, PackageManager, RepoProfile, Service } from '../types.js';
 import { safeText } from '../util/safe-text.js';
-import { asObj, asString, asStrings, pythonNames, readPyproject } from './manifest.js';
+import { asObj, asString, asStrings, isTestFile, pythonNames, readPyproject, type Obj } from './manifest.js';
 import { readEnv } from './env.js';
 import { listFiles, parseYamlLimited, readTextLimitedWithReason, regexLines, regexSafe, type Skipped } from './limits.js';
 
 export class NotGitHubRepoError extends Error {}
 
 type Profile = Omit<RepoProfile, 'private' | 'ownerType' | 'plan'>;
-type Obj = Record<string, unknown>;
 
 const IGNORED_DIRS = ['node_modules', '.git', '.venv', 'dist', 'build', 'vendor', 'target'];
 const NPM_DEFAULT_TEST = 'echo "Error: no test specified" && exit 1';
@@ -94,13 +93,6 @@ async function readOrigin(root: string): Promise<{ owner: string; repo: string }
   return { owner, repo };
 }
 
-const isTestFile = (rel: string): boolean => {
-  if (!regexSafe(rel)) return false;
-  const segments = rel.split('/');
-  const name = segments[segments.length - 1] ?? '';
-  return segments.slice(0, -1).some((s) => ['test', 'tests', '__tests__'].includes(s)) || /^.+\.(test|spec)\..+$/.test(name) || /^test_.+\.py$/.test(name) || /_test\.py$/.test(name);
-};
-
 interface Shared { repo: string; serviceDirs: string[] }
 
 async function readService(ctx: Ctx, dir: string, shared: Shared): Promise<Service> {
@@ -159,7 +151,7 @@ async function readService(ctx: Ctx, dir: string, shared: Shared): Promise<Servi
   const port = (dockerfile ? await exposedPort(ctx, dockerfile) : undefined) ?? (await codePort(ctx, owned.filter((f) => !isTestFile(relTo(f)))));
 
   const name = asString(pkg?.name) ?? py.name ?? (dir === '.' ? shared.repo : basename(dir));
-  return { name: safeText(name), path: dir, language, packageManager, runtimeVersion, dockerfile, port, hasTests, testFramework, ...(await readEnv(ctx.root, { path: dir, name: safeText(name) }, files)), scripts, frameworks };
+  return { name: safeText(name), path: dir, language, packageManager, runtimeVersion, dockerfile, port, hasTests, testFramework, ...(await readEnv(ctx.root, { path: dir, name: safeText(name) }, owned)), scripts, frameworks };
 }
 
 async function anyFileHasLine(ctx: Ctx, files: string[], re: RegExp): Promise<boolean> {

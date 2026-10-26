@@ -1,10 +1,18 @@
 import { afterEach, describe, expect, it } from 'vitest';
-import { readEnv } from '../src/read/env.js';
+import { readEnv as readEnvOwned } from '../src/read/env.js';
+import { listFiles } from '../src/read/limits.js';
 import { readProject } from '../src/read/project.js';
 import type { Service } from '../src/types.js';
 import { cleanupRepos, makeRepo, makeTempDir, writeIn } from './helpers/make-repo.js';
 
 afterEach(cleanupRepos);
+
+/** Lists the repo like readProject does, then keeps only the files this service owns (not a deeper service's). */
+async function readEnv(dir: string, service: Service, deeper: string[] = []) {
+  const all = (await listFiles(dir, ['**/*'], ['**/node_modules/**', '**/.git/**'])).files;
+  const owned = all.filter((f) => !deeper.some((d) => f.startsWith(`${d}/`)));
+  return readEnvOwned(dir, service, owned);
+}
 
 const svc = (path = '.', name = 'app'): Service => ({ name, path, language: 'node', hasTests: false, envVars: [], dependsOn: [], scripts: [], frameworks: [] });
 const pkg = (deps: Record<string, string>) => JSON.stringify({ name: 'app', dependencies: deps });
@@ -129,6 +137,84 @@ describe('readEnv', () => {
     const dir = makeTempDir();
     writeIn(dir, 'compose.yml', 'services: [unclosed\n');
     expect(await readEnv(dir, svc())).toEqual({ envVars: [], dependsOn: [] });
+  });
+
+  it('env: multi-line quoted values (PEM key, JSON) never become names', async () => {
+    const dir = makeTempDir();
+    const pem = ['-----BEGIN ' + 'PRIVATE KEY-----', 'ABC=' + 'frag1', 'secretpart=' + 'frag2', 'MIIE' + 'frag3==', '-----END ' + 'PRIVATE KEY-----'];
+    const json = ['{', '  "ABC_JSON": "' + 'frag4' + '",', '  "k": "x"', "}'"];
+    writeIn(dir, '.env', `FIRST=1\nPRIVATE_KEY="${pem.join('\n')}"\nJSON_CONF='${json.join('\n')}\nLAST_ONE=2\n`);
+    writeIn(dir, '.env.example', `TICK=\`line1\nINSIDE=${'frag5'}\n\`\nAFTER=1\nOPEN_END="never closed\nLOST=1\n`);
+    const out = await readEnv(dir, svc());
+    expect(out.envVars).toEqual(['AFTER', 'FIRST', 'JSON_CONF', 'LAST_ONE', 'OPEN_END', 'PRIVATE_KEY', 'TICK']);
+    const text = JSON.stringify(out);
+    for (const f of ['frag1', 'frag2', 'frag3', 'frag4', 'frag5']) expect(text).not.toContain(f);
+  });
+
+  it('env: a line over 4 KB inside an open quote stays inside the quote', async () => {
+    const dir = makeTempDir();
+    writeIn(dir, '.env', `A="start\n${'x'.repeat(5000)}\nHIDDEN=1\n"\nB=2\n`);
+    expect((await readEnv(dir, svc())).envVars).toEqual(['A', 'B']);
+  });
+
+  it('env: root service does not inherit a nested service\'s env vars or dependencies', async () => {
+    const dir = makeTempDir();
+    writeIn(dir, 'Dockerfile', 'FROM node\n');
+    writeIn(dir, 'worker/Dockerfile', 'FROM node\n');
+    writeIn(dir, 'worker/index.js', 'process.env.WORKER_ONLY;\n');
+    writeIn(dir, 'worker/prisma/schema.prisma', 'datasource db {\n  provider = "postgresql"\n}\n');
+    const root = await readEnv(dir, svc('.', 'root'), ['worker']);
+    expect(root).toEqual({ envVars: [], dependsOn: [] });
+    const worker = await readEnv(dir, svc('worker', 'worker'));
+    expect(worker.envVars).toEqual(['WORKER_ONLY']);
+    expect(worker.dependsOn.map((d) => d.kind)).toEqual(['postgres']);
+  });
+
+  it('env: compose service builds another folder → its env keys are not ours, even with the same name', async () => {
+    const dir = makeTempDir();
+    writeIn(dir, 'compose.yml', 'services:\n  api:\n    build: ./other\n    environment:\n      - OTHER_KEY=1\n  web:\n    image: x\n    environment:\n      - NO_BUILD_WEB=1\n');
+    writeIn(dir, 'api/index.js', '1;\n');
+    expect((await readEnv(dir, svc('api', 'api'))).envVars).toEqual([]);
+    expect((await readEnv(dir, svc('other', 'other'))).envVars).toEqual(['OTHER_KEY']);
+    // no build at all: falls back to the name
+    expect((await readEnv(dir, svc('web', 'web'))).envVars).toEqual(['NO_BUILD_WEB']);
+  });
+
+  it('env: compose build contexts that leave the repo or are absolute/URLs never match', async () => {
+    const dir = makeTempDir();
+    writeIn(dir, 'compose.yml', 'services:\n  a:\n    build: ../x\n    environment: [ESC_A=1]\n  b:\n    build:\n      context: /abs\n    environment: [ABS_B=1]\n  c:\n    build: https://example.com/r.git\n    environment: [URL_C=1]\n');
+    for (const p of ['x', 'abs', '..', '.']) expect((await readEnv(dir, svc(p, 'zz'))).envVars, p).toEqual([]);
+  });
+
+  it('env: names used only in test files are not collected', async () => {
+    const dir = makeTempDir();
+    writeIn(dir, 'src/a.ts', 'process.env.REAL_ONE;\n');
+    writeIn(dir, 'src/a.test.ts', 'process.env.ONLY_IN_TEST;\n');
+    writeIn(dir, 'tests/helper.py', "import os\nos.getenv('PY_TEST_ONLY')\n");
+    writeIn(dir, 'test_x.py', "import os\nos.getenv('PY_TEST_X')\n");
+    writeIn(dir, '__tests__/b.js', 'process.env.UNDERSCORE_TEST;\n');
+    expect((await readEnv(dir, svc())).envVars).toEqual(['REAL_ONE']);
+  });
+
+  it('env: single-line prisma datasource with postgresql is detected', async () => {
+    const dir = makeTempDir();
+    writeIn(dir, 'schema.prisma', 'datasource db { provider = "postgresql" url = env("DATABASE_URL") }\n');
+    expect((await readEnv(dir, svc())).dependsOn.map((d) => [d.kind, d.evidence])).toEqual([['postgres', 'schema.prisma: datasource provider postgresql']]);
+  });
+
+  it('readProject: parent service does not inherit a nested service\'s names or dependencies', async () => {
+    const dir = makeRepo('node-express', 'https://github.com/o/r.git');
+    writeIn(dir, 'Dockerfile', 'FROM node\n');
+    writeIn(dir, 'worker/Dockerfile', 'FROM node\n');
+    writeIn(dir, 'worker/index.js', 'process.env.WORKER_ONLY;\n');
+    writeIn(dir, 'worker/prisma/schema.prisma', 'datasource db {\n  provider = "postgresql"\n}\n');
+    const p = await readProject(dir);
+    const root = p.services.find((s) => s.path === '.');
+    const worker = p.services.find((s) => s.path === 'worker');
+    expect(root?.envVars).not.toContain('WORKER_ONLY');
+    expect(root?.dependsOn.map((d) => d.kind)).not.toContain('postgres');
+    expect(worker?.envVars).toEqual(['WORKER_ONLY']);
+    expect(worker?.dependsOn.map((d) => d.kind)).toEqual(['postgres']);
   });
 
   it('readProject fills envVars and dependsOn', async () => {

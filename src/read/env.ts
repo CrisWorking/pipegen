@@ -1,8 +1,8 @@
 import { join as joinOs, posix } from 'node:path';
 import { parse as parseToml } from 'smol-toml';
 import type { Dependency, DependencyKind, Service } from '../types.js';
-import { listFiles, parseYamlLimited, readTextLimited, regexLines, regexSafe } from './limits.js';
-import { asObj, pythonNames, readPyproject } from './manifest.js';
+import { parseYamlLimited, readTextLimited, regexLines, regexSafe } from './limits.js';
+import { asObj, isTestFile, pythonNames, readPyproject } from './manifest.js';
 
 // Only NAMES are ever kept. A value is read, looked at for at most a yes/no answer, and dropped on the same line.
 
@@ -47,25 +47,51 @@ interface Found { kind: DependencyKind; name: string; evidence: string; keywords
 const inDir = (dir: string, name: string) => (dir === '.' ? name : `${dir}/${name}`);
 const validName = (s: string | undefined): s is string => s !== undefined && NAME_RE.test(s);
 
-/** Name of an assignment line (`KEY=...`, `export KEY=...`) plus a yes/no for "the value is a postgres URL". The value is not returned. */
-function parseAssignment(line: string): { name: string; postgresUrl: boolean } | null {
-  const m = /^\s*(?:export\s+)?([^\s=#]+)\s*=(.*)$/.exec(line);
-  if (!m || !validName(m[1])) return null;
-  return { name: m[1], postgresUrl: isPostgresUrl(m[2]) };
+/** True when `s` (starting right after an opening quote) contains the matching unescaped closing quote. */
+function closesQuote(s: string, q: string): boolean {
+  for (let i = 0; i < s.length; i++) {
+    if (s[i] === '\\') i++;
+    else if (s[i] === q) return true;
+  }
+  return false;
 }
-const isPostgresUrl = (v: unknown): boolean => typeof v === 'string' && /^\s*['"]?postgres(ql)?:\/\//i.test(v);
+const isPostgresUrl = (v: unknown): boolean => typeof v === 'string' && regexSafe(v) && /^\s*['"]?postgres(ql)?:\/\//i.test(v);
 
+/**
+ * Names from a dotenv-style file. A value that opens a quote and does not close it on the same line is multi-line (a PEM key, JSON):
+ * its continuation lines are skipped until the closing quote, so no part of a value can look like a name. A line over 4 KB inside
+ * an open quote stays inside it. A file that ends inside an open quote just stops. The value itself is never kept.
+ */
 async function envFileNames(root: string, rel: string, names: Set<string>, pgUrl: string[]): Promise<void> {
   const text = await readTextLimited(joinOs(root, rel));
-  for (const line of text === null ? [] : regexLines(text)) {
-    const a = parseAssignment(line);
-    if (!a) continue;
-    names.add(a.name);
-    if (a.name === 'DATABASE_URL' && a.postgresUrl) pgUrl.push(`${rel}: DATABASE_URL`);
+  let open: string | null = null;
+  for (const line of text === null ? [] : text.split(/\r?\n/)) {
+    if (open !== null) {
+      if (regexSafe(line) && closesQuote(line, open)) open = null;
+      continue;
+    }
+    if (!regexSafe(line)) continue;
+    const m = /^\s*(?:export\s+)?([^\s=#]+)\s*=\s*(.*)$/.exec(line);
+    if (!m || !validName(m[1])) continue;
+    const rest = m[2] ?? '';
+    const q = rest[0];
+    if ((q === '"' || q === "'" || q === '`') && !closesQuote(rest.slice(1), q)) open = q;
+    names.add(m[1]);
+    if (m[1] === 'DATABASE_URL' && isPostgresUrl(rest.replace(/^\s*/, ''))) pgUrl.push(`${rel}: DATABASE_URL`);
   }
 }
 
-/** Keys of `environment:` for the compose services that build this service (by name or build context). */
+/** True when a compose `build` (string or `{ context }`) points at the service folder. Absolute, URL and repo-escaping contexts never match. */
+function buildsHere(composeDir: string, build: unknown, servicePath: string): boolean {
+  const context = typeof build === 'string' ? build : asObj(build).context;
+  if (typeof context !== 'string' || !regexSafe(context)) return false;
+  if (context.startsWith('/') || context.startsWith('\\') || /^[A-Za-z]:/.test(context) || /^[a-z][a-z0-9+.-]*:\/\//i.test(context) || context.startsWith('git@')) return false;
+  const joined = posix.normalize(posix.join(composeDir, context.replace(/\\/g, '/'))).replace(/\/+$/, '') || '.';
+  if (joined === '..' || joined.startsWith('../')) return false;
+  return joined === servicePath;
+}
+
+/** Keys of `environment:` for the compose services that build this service (by build context; by name only when the compose service has no build). */
 async function composeNames(root: string, composeRel: string, service: Pick<Service, 'path' | 'name'>, names: Set<string>, pgUrl: string[]): Promise<void> {
   const text = await readTextLimited(joinOs(root, composeRel));
   if (text === null) return;
@@ -75,15 +101,15 @@ async function composeNames(root: string, composeRel: string, service: Pick<Serv
   for (const [cname, raw] of Object.entries(asObj(asObj(doc).services))) {
     const svc = asObj(raw);
     const build = svc.build;
-    const context = typeof build === 'string' ? build : typeof asObj(build).context === 'string' ? (asObj(build).context as string) : undefined;
-    const builtHere = context !== undefined && !/^[a-z]+:\/\//i.test(context) && posix.normalize(posix.join(composeDir, context)).replace(/\/$/, '') === (service.path === '.' ? '.' : service.path);
-    if (!builtHere && cname !== service.name && cname !== posix.basename(service.path)) continue;
+    if (build === undefined) {
+      if (cname !== service.name && cname !== posix.basename(service.path)) continue;
+    } else if (!buildsHere(composeDir, build, service.path)) continue;
     const env = svc.environment;
     const entries: [string, unknown][] = Array.isArray(env)
-      ? env.filter((e): e is string => typeof e === 'string').map((e) => { const i = e.indexOf('='); return i < 0 ? [e, undefined] : [e.slice(0, i), e.slice(i + 1)]; })
+      ? env.filter((e): e is string => typeof e === 'string' && regexSafe(e)).map((e) => { const i = e.indexOf('='); return i < 0 ? [e, undefined] : [e.slice(0, i), e.slice(i + 1)]; })
       : Object.entries(asObj(env));
     for (const [key, value] of entries) {
-      if (!validName(key.trim())) continue;
+      if (!regexSafe(key) || !validName(key.trim())) continue;
       names.add(key.trim());
       if (key.trim() === 'DATABASE_URL' && isPostgresUrl(value)) pgUrl.push(`${composeRel}: DATABASE_URL`);
     }
@@ -114,7 +140,7 @@ async function packages(root: string, dir: string, rels: string[]): Promise<{ fi
   if (tomlText !== null) {
     try { for (const n of readPyproject(asObj(parseToml(tomlText))).all) out.push({ file: tomlFile, name: n }); } catch { /* unparseable */ }
   }
-  for (const rel of rels.filter((f) => f.startsWith(dir === '.' ? '' : `${dir}/`) && !f.slice(dir === '.' ? 0 : dir.length + 1).includes('/') && /^requirements.*\.txt$/.test(f.slice(f.lastIndexOf('/') + 1)))) {
+  for (const rel of rels.filter((f) => regexSafe(f) && f.startsWith(dir === '.' ? '' : `${dir}/`) && !f.slice(dir === '.' ? 0 : dir.length + 1).includes('/') && /^requirements.*\.txt$/.test(f.slice(f.lastIndexOf('/') + 1)))) {
     const text = await readTextLimited(joinOs(root, rel));
     for (const n of pythonNames(text === null ? [] : regexLines(text).filter((l) => !/^\s*(#|-)/.test(l)))) out.push({ file: rel, name: n });
   }
@@ -125,6 +151,7 @@ async function packages(root: string, dir: string, rels: string[]): Promise<{ fi
 function prismaPostgres(text: string): boolean {
   let inDatasource = false;
   for (const line of regexLines(text)) {
+    if (/^\s*datasource\s+\w+\s*\{[^}]*\bprovider\s*=\s*"postgresql"/.test(line)) return true;
     if (/^\s*datasource\s+\w+\s*\{/.test(line)) inDatasource = true;
     else if (/^\s*\}/.test(line)) inDatasource = false;
     else if (inDatasource && /^\s*provider\s*=\s*"postgresql"/.test(line)) return true;
@@ -135,8 +162,9 @@ function prismaPostgres(text: string): boolean {
 const matchesKeyword = (name: string, keyword: string): boolean => name.startsWith(keyword) || name.includes(`_${keyword}`);
 
 /** Env var names (never values) and the services this service depends on. `dir` is the repo root; `service.path` is relative to it.
- * `listed` is readProject's already-capped repo-relative file list, so no second walk is made; without it one capped walk of the service folder is done. */
-export async function readEnv(dir: string, service: Pick<Service, 'path' | 'name'>, listed?: string[]): Promise<{ envVars: string[]; dependsOn: Dependency[] }> {
+ * `owned` is the repo-relative list of files that belong to this service and not to a deeper one (readProject's already-capped listing),
+ * so there is no second walk and a parent service never inherits a nested service's names or dependencies. */
+export async function readEnv(dir: string, service: Pick<Service, 'path' | 'name'>, owned: string[]): Promise<{ envVars: string[]; dependsOn: Dependency[] }> {
   const names = new Set<string>();
   const pgUrl: string[] = [];
   const base = service.path;
@@ -145,18 +173,16 @@ export async function readEnv(dir: string, service: Pick<Service, 'path' | 'name
   const composeDirs = base === '.' ? ['.'] : [base, '.'];
   for (const d of composeDirs) for (const f of COMPOSE_FILES) await composeNames(dir, inDir(d, f), service, names, pgUrl);
 
-  const isRelevant = (f: string) => regexSafe(f) && new RegExp(`\\.(${CODE_EXT.replaceAll(',', '|')})$`).test(f) || /(^|\/)schema\.prisma$/.test(f) || /^requirements[^/]*\.txt$/.test(f.slice(f.lastIndexOf('/') + 1));
-  const underBase = (f: string) => base === '.' || f.startsWith(`${base}/`);
-  const ignored = (f: string) => f.split('/').some((s) => IGNORED_DIRS.includes(s));
-  const rels = listed
-    ? listed.filter((f) => underBase(f) && !ignored(f) && isRelevant(f))
-    : (await listFiles(joinOs(dir, base), [`**/*.{${CODE_EXT}}`, '**/schema.prisma', 'requirements*.txt'], IGNORED_DIRS.map((d) => `**/${d}/**`))).files.map((f) => inDir(base, f));
+  const baseName = (f: string) => f.slice(f.lastIndexOf('/') + 1);
+  const isRelevant = (f: string) => regexSafe(f) && (new RegExp(`\\.(${CODE_EXT.replaceAll(',', '|')})$`).test(f) || baseName(f) === 'schema.prisma' || /^requirements[^/]*\.txt$/.test(baseName(f)));
+  const relToBase = (f: string) => (base === '.' ? f : f.slice(base.length + 1));
+  const rels = owned.filter((f) => (base === '.' || f.startsWith(`${base}/`)) && !f.split('/').some((p) => IGNORED_DIRS.includes(p)) && isRelevant(f));
   const found: Found[] = [];
   for (const rel of rels) {
-    if (/(^|\/)schema\.prisma$/.test(rel)) {
+    if (baseName(rel) === 'schema.prisma') {
       const text = await readTextLimited(joinOs(dir, rel));
       if (text !== null && prismaPostgres(text)) found.push({ kind: 'postgres', name: 'postgres', evidence: `${rel}: datasource provider postgresql`, keywords: KIND_KEYWORDS.postgres });
-    } else if (/\.(js|mjs|cjs|jsx|ts|tsx|mts|cts|py)$/.test(rel)) {
+    } else if (/\.(js|mjs|cjs|jsx|ts|tsx|mts|cts|py)$/.test(rel) && !isTestFile(relToBase(rel))) {
       const text = await readTextLimited(joinOs(dir, rel));
       if (text !== null) codeNames(text, names);
     }
