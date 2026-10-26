@@ -627,12 +627,130 @@ describe('fix round 1', () => {
 
 describe('redact: speed', () => {
   it('redact: worst-case lines stay fast (no quadratic backtracking)', () => {
-    const line = (s: string) => s.repeat(Math.floor(4000 / s.length));
-    for (const unit of ['tok' + 'en', 'ey' + 'J', 'a://', 'sk-', 'x="', 'au' + 'th.']) {
-      const text = (line(unit) + '\n').repeat(250); // about 1 MB
+    const line = (u: string) => u.repeat(Math.floor(4000 / u.length));
+    const shapes = [
+      'tok' + 'en', 'ey' + 'J', 'ey' + 'J.', 'ey' + 'Ja.', 'a://', 'a://:', 'a://a:@/', 'a:/' + '/a:b', '@', 'sk-', 'x="', 'au' + 'th.',
+      'a.tok' + 'en-', 'tok' + 'en:', 'tok' + 'en="', '"pass' + 'word":"', 'tok' + 'en="\\"', '--tok' + 'en ', '<pass' + 'word>', 'au' + 'thau' + 'th',
+    ].map((u) => (line(u) + '\n').repeat(250));
+    shapes.push(('a:/' + '/b:' + 'c'.repeat(3990) + '\n').repeat(250));
+    shapes.push(('ey' + 'J' + 'a'.repeat(1990) + '.' + 'b'.repeat(1990) + '\n').repeat(250));
+    shapes.push((('a'.repeat(30) + 'tok' + 'en ').repeat(110) + '\n').repeat(250));
+    shapes.push(('pass' + 'word: |\n' + '  x\n'.repeat(250_000)));
+    for (const text of shapes) {
       const t = performance.now();
       redact(text);
-      expect(performance.now() - t, unit).toBeLessThan(1500);
+      expect(performance.now() - t, text.slice(0, 12)).toBeLessThan(300); // about 1 MB each
     }
+  });
+});
+
+describe('fix round 2', () => {
+  // Expected strings start with "'scheme' + `://...`" so this file holds no literal URL with a password.
+  it('redact: connection strings found by a linear scan (user with @, password with quotes, / or @)', () => {
+    const cases: [string, string][] = [
+      ['redis' + '://:' + 'pw' + '@host:6379', 'redis' + `://:${R}@host:6379`],
+      ['postgres' + '://u:' + 'p@ss' + '@host:5432/db', 'postgres' + `://u:${R}@host:5432/db`],
+      ['smtp' + '://me@gmail.com:' + 'hunter2' + '@smtp.gmail.com', 'smtp' + `://me@gmail.com:${R}@smtp.gmail.com`],
+      ['mysql' + '://admin@srv:' + 'pw' + '@db', 'mysql' + `://admin@srv:${R}@db`],
+      ['postgres' + "://u:" + "pa'ss" + '@db/x', 'postgres' + `://u:${R}@db/x`],
+      ['postgres' + '://u:' + 'pa"ss' + '@db/x', 'postgres' + `://u:${R}@db/x`],
+      ['postgres' + '://u:' + 'pa/ss' + '@db/x', 'postgres' + `://u:${R}@db/x`],
+      ['postgres' + '://u:' + 'pa?ss' + '@db/x', 'postgres' + `://u:${R}@db/x`],
+      ['postgres' + '://u:' + 'p@a/b' + '@host/db', 'postgres' + `://u:${R}@host/db`],
+      ['mongodb+srv' + '://u:' + 'p' + '@cluster/x?y=z@w', 'mongodb+srv' + `://u:${R}@cluster/x?y=z@w`],
+      ['https://user@host/path', 'https://user@host/path'],
+      ['see http://example.com:8080/a', 'see http://example.com:8080/a'],
+      ['[db](postgres' + '://u:' + 'pw' + '@h/db) more', '[db](postgres' + `://u:${R}@h/db) more`],
+      ['"postgres' + '://u:' + 'pw' + '@h/db"', '"postgres' + `://u:${R}@h/db"`],
+      ['go https://a.com/?r=postgres' + '://u:' + 'pw' + '@h', 'go https://a.com/?r=postgres' + `://u:${R}@h`],
+      ['xpostgres' + '://u:' + 'pw' + '@h', 'xpostgres' + `://u:${R}@h`],
+      ['jdbc:postgresql' + '://u:' + 'pw' + '@h/db', 'jdbc:postgresql' + `://u:${R}@h/db`],
+      ['a=postgres' + '://u:' + 'p1' + '@h1/db b=postgres' + '://v:' + 'p2' + '@h2', 'a=postgres' + `://u:${R}@h1/db b=postgres` + `://v:${R}@h2`],
+    ];
+    for (const [input, want] of cases) expect(redact(input), want).toBe(want);
+  });
+
+  it('redact: JWT glued after letters, digits or underscore is replaced', () => {
+    const jwt = fake.jwt();
+    for (const pre of ['x', '9', 'jwt_', '#id_' + 'tok' + 'en=', '']) expect(redact(`${pre}${jwt} end`)).toBe(`${pre}${R}${pre.endsWith('=') ? '' : ' end'}`);
+    expect(redact('ey' + 'J' + 'abc no dots')).toBe('ey' + 'J' + 'abc no dots');
+    expect(redact('ey' + 'Ja.b.c')).toBe('ey' + 'Ja.b.c'); // second segment shorter than 4
+  });
+
+  it('bundle: a found secret shorter than 6 characters drops only its file, never scrubbed everywhere', async () => {
+    const dir = makeTempDir();
+    const short = 'zq' + '5';
+    writeIn(dir, 'src/a.ts', `const k = "${short}";\n`);
+    writeIn(dir, 'src/b.ts', `const other = "${short}";\n`);
+    writeIn(dir, 'src/c.ts', 'export {};\n');
+    const stub = makeStub(`const f = findingsFor(${JSON.stringify(short)}).slice(0, 1); fs.writeFileSync(report, JSON.stringify(f)); process.exit(1);`);
+    const b = await bundleCode(dir, { gitleaks: stub.bin });
+    expect(paths(b)).toEqual(['src/b.ts', 'src/c.ts']);
+    expect(b.files.find((f) => f.path === 'src/b.ts')?.content).toBe(`const other = "${short}";\n`);
+    const notes = b.notes.join('\n');
+    expect(notes).toMatch(/short/);
+    expect(notes).not.toContain('src/a.ts');
+  });
+
+  it('redact: auth counts only as a word (also authorization), not author, authority or OAuth', () => {
+    for (const keep of ['author: Jane Doe', 'authority = central', 'OAuth: enabled', 'authenticate(user)']) expect(redact(keep)).toBe(keep);
+    for (const name of ['au' + 'th', 'au' + 'th_mode', 'AU' + 'TH', 'au' + 'thorization', 'basic' + 'Auth', 'X-Au' + 'th-Key']) {
+      expect(redact(fake.assign(name, 'v4lue')), name).toBe(fake.assign(name, R));
+    }
+  });
+
+  it('redact: Authorization header keeps the scheme, hides the credentials', () => {
+    const h = 'Author' + 'ization';
+    expect(redact(`${h}: Bearer abc123`)).toBe(`${h}: Bearer ${R}`);
+    expect(redact(`curl -H "${h}: Basic dXNlcjpw" https://x`)).toBe(`curl -H "${h}: Basic ${R}`);
+    expect(redact(`{"${h}": "Token abc def", "a": 1}`)).toBe(`{"${h}": "Token ${R}", "a": 1}`);
+    expect(redact(`${h.toLowerCase()} = digest x y`)).toBe(`${h.toLowerCase()} = digest ${R}`);
+    expect(redact(`${h}: custom-value`)).toBe(`${h}: ${R}`);
+  });
+
+  it('redact: unquoted value hides the rest of the line', () => {
+    const k = 'pass' + 'word';
+    expect(redact(`${k}: my secret phrase`)).toBe(`${k}: ${R}`);
+    expect(redact(`${k.toUpperCase()}=x y # note`)).toBe(`${k.toUpperCase()}=${R}`);
+  });
+
+  it('redact: YAML block and next-line values hidden by indentation', () => {
+    const k = 'pass' + 'word';
+    expect(redact(`${k}: |\n  line-one\n\n  line-two\nnext: 1`)).toBe(`${k}: |\n  ${R}\n\n  ${R}\nnext: 1`);
+    expect(redact(`db:\n  ${k}:\n    on-next-line\n  user: bob`)).toBe(`db:\n  ${k}:\n    ${R}\n  user: bob`);
+    expect(redact(`- ${k}: >-\n    folded\n    more\n- x: 1`)).toBe(`- ${k}: >-\n    ${R}\n    ${R}\n- x: 1`);
+  });
+
+  it('redact: long CLI flags, subscripts, XML and triple-quoted values', () => {
+    const k = 'pass' + 'word';
+    const q3 = '"'.repeat(3);
+    expect(redact(`run --${k} hunter2 --verbose`)).toBe(`run --${k} ${R} --verbose`);
+    expect(redact('run --tok' + 'en=abc --x')).toBe('run --tok' + `en=${R} --x`);
+    expect(redact("os.environ['API_KEY" + "']='x y'")).toBe("os.environ['API_KEY" + `']='${R}'`);
+    expect(redact('env["DB_PASS' + 'WORD"] = "x"')).toBe('env["DB_PASS' + `WORD"] = "${R}"`);
+    expect(redact(`<${k}>hunter2</${k}>`)).toBe(`<${k}>${R}</${k}>`);
+    expect(redact(`${k} = ${q3}abc def${q3}`)).toBe(`${k} = ${q3}${R}${q3}`);
+  });
+
+  it('redact: an over-long line also hides the indented lines right after it', () => {
+    const k = 'pass' + 'word';
+    expect(redact(`${k}:${' '.repeat(5000)}\n  hidden-value\nnext: 1`)).toBe(`[REDACTED: line too long]\n  ${R}\nnext: 1`);
+  });
+
+  it('bundle: a control character inside a file name cannot hide a secret-like name', async () => {
+    const dir = makeTempDir();
+    writeIn(dir, 'pass' + 'word\x01=hunter2-Q8.ts', 'x\n');
+    writeIn(dir, 'ok.ts', 'y\n');
+    const b = await bundleCode(dir, { gitleaks: makeStub(CLEAN).bin });
+    expect(paths(b)).toEqual(['ok.ts']);
+    expect(bundleText(b)).not.toContain('hunter2');
+  });
+
+  it('scrubKnownValues: encodeURI and mixed-case percent forms removed', () => {
+    const v = 'p@ss w/rd+"é';
+    const mixed = encodeURIComponent(v).replace('%2F', '%2f').replace('%C3', '%c3');
+    const ascii = JSON.stringify(v).slice(1, -1).replace('é', '\\u00e9');
+    const out = scrubKnownValues(`1 ${encodeURI(v)} 2 ${mixed} 3 ${ascii} 4`, [v]);
+    expect(out).toBe(`1 ${R} 2 ${R} 3 ${R} 4`);
   });
 });

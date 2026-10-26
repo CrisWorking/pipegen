@@ -74,6 +74,10 @@ export function isExcludedPath(path: string): boolean {
 }
 
 // ---------- redaction ----------
+//
+// Everything here runs in linear time on lines of at most 4 KB: the token formats are regexes with a
+// fixed prefix, and the shapes that need context (JWTs, connection strings, password-like assignments)
+// are hand-written scans that look at each character a bounded number of times.
 
 // Token formats, each replaced whole. Names are what findSecretLike reports (never the value).
 const TOKEN_RULES: readonly (readonly [string, RegExp])[] = [
@@ -83,47 +87,296 @@ const TOKEN_RULES: readonly (readonly [string, RegExp])[] = [
   ['slack-token', /xox[abpr]-[A-Za-z0-9-]+/g],
   ['stripe-key', /sk_(?:live|test)_[A-Za-z0-9]{10,}/g],
   ['sk-api-key', /sk-[A-Za-z0-9_-]{20,}/g],
-  // starts where a token starts (lookbehind): a failed match then costs one scan of the run, not one per 'eyJ'
-  ['jwt', /(?<![A-Za-z0-9_-])eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+/g],
   ['slack-webhook', /https:\/\/hooks\.slack\.com\/(?:services|workflows|triggers)\/[A-Za-z0-9/_-]+/g],
   ['google-api-key', /AIza[0-9A-Za-z_-]{35}/g],
   ['npm-token', /npm_[A-Za-z0-9]{36}/g],
 ];
-// Connection string (scheme, '://', user, ':', password, '@', host): scheme, user (may be empty) and host stay. Everything
-// from the ':' after the user up to the LAST '@' of the authority is hidden, so an unencoded '@' in the
-// password cannot leak the rest of it. The candidate runs to the next space or quote; hideConnectionPassword
-// decides where the authority ends.
-const CONNECTION_STRING = /((?<![a-z0-9+.-])[a-z][a-z0-9+.-]*:\/\/[^:/\s@]*:)([^\s'"`<>]*)/gi;
 
-function hideConnectionPassword(whole: string, head: string, rest: string): string {
-  const first = rest.indexOf('@');
-  if (first < 0) return whole; // no credentials (e.g. host:port)
-  let authorityEnd = rest.length;
-  for (const c of ['/', '?', '#']) {
-    const k = rest.indexOf(c, first);
-    if (k >= 0 && k < authorityEnd) authorityEnd = k;
+type Span = [number, number];
+
+/** `s` with each span (sorted, not overlapping) replaced by [REDACTED]. */
+function replaceSpans(s: string, spans: Span[]): string {
+  if (spans.length === 0) return s;
+  let out = '';
+  let pos = 0;
+  for (const [a, b] of spans) {
+    if (b <= a) continue; // nothing to hide (e.g. an empty password)
+    out += s.slice(pos, a) + R;
+    pos = b;
   }
-  return head + R + rest.slice(rest.lastIndexOf('@', authorityEnd - 1));
+  return out + s.slice(pos);
 }
 
-// A value given to a password-like name. The name may carry other name characters around the keyword
-// (AWS_SECRET_ACCESS_KEY, apiKeyProd, db.password) and may be quoted ("password": ...); the separator is
-// ':', '=', '=>' or ':='. The value is a quoted string (quotes kept, escapes honoured) or the next
-// non-space run. Only the value is replaced. This also hides type annotations such as `token: string`:
-// over-redacting is the safe direction. A match may only start where a name starts (the lookbehind), and
-// the keyword is checked by a lookahead inside that name, so a long name is scanned once (linear time).
-const KEYWORDS = 'password|passwd|pwd|secret|token|api[_-]?key|private[_-]?key|access[_-]?key|client[_-]?secret|auth';
-const ASSIGNED_VALUE = new RegExp(
-  `((?<![\\w.-])(?=[\\w.-]*?(?:${KEYWORDS}))[\\w.-]+["'\`]?\\s*(?:=>|:=|:|=)\\s*)` +
-  `("(?:[^"\\\\]|\\\\.)*"|'(?:[^'\\\\]|\\\\.)*'|\`(?:[^\`\\\\]|\\\\.)*\`|\\S+)`,
-  'gi',
-);
+const code = (s: string, i: number) => s.charCodeAt(i);
+const isLetter = (c: number) => (c >= 65 && c <= 90) || (c >= 97 && c <= 122);
+const isUpper = (c: number) => c >= 65 && c <= 90;
+const isLower = (c: number) => c >= 97 && c <= 122;
+const isDigit = (c: number) => c >= 48 && c <= 57;
+const isB64Url = (c: number) => isLetter(c) || isDigit(c) || c === 95 /* _ */ || c === 45 /* - */;
+const isSchemeChar = (c: number) => isLetter(c) || isDigit(c) || c === 43 /* + */ || c === 46 /* . */ || c === 45 /* - */;
+const isSpace = (c: number) => c === 32 || c === 9 || c === 13 || c === 10 || c === 12 || c === 11;
+const isNameChar = (c: number) => isLetter(c) || isDigit(c) || c === 95 || c === 46 || c === 45; // [A-Za-z0-9_.-]
 
-function hideAssignedValue(_whole: string, head: string, value: string): string {
-  const q = value[0];
-  const quoted = value.length >= 2 && (q === '"' || q === "'" || q === '`') && value.endsWith(q);
-  return head + (quoted ? q + R + q : R);
+/**
+ * JWTs: `eyJ` + three dot-separated base64url segments (the first two at least 4 characters), also when
+ * glued after other characters. After a failed candidate the scan resumes at the end of its first segment,
+ * since every later `eyJ` inside that segment would fail the same way: linear time.
+ */
+function jwtSpans(s: string): Span[] {
+  const spans: Span[] = [];
+  let from = 0;
+  for (let i = s.indexOf('eyJ', from); i >= 0; i = s.indexOf('eyJ', from)) {
+    let j = i + 3;
+    while (j < s.length && isB64Url(code(s, j))) j++;
+    const seg1End = j;
+    let ok = seg1End - i >= 4 && code(s, j) === 46; // '.'
+    let k = j + 1;
+    if (ok) {
+      while (k < s.length && isB64Url(code(s, k))) k++;
+      ok = k - (j + 1) >= 4 && code(s, k) === 46;
+    }
+    let m = k + 1;
+    if (ok) {
+      while (m < s.length && isB64Url(code(s, m))) m++;
+      ok = m > k + 1;
+    }
+    if (ok) {
+      spans.push([i, m]);
+      from = m;
+    } else {
+      from = Math.max(seg1End, i + 1);
+    }
+  }
+  return spans;
 }
+
+/**
+ * Passwords in URLs (scheme, '://', user, ':', password, '@', host): the scheme, the user and the host stay. For each
+ * `://` with a scheme before it, the token is the non-space run after it and the authority runs to the first
+ * `/`, `?` or `#` (extended over a `/` while the next path segment holds an `@`, for a password with a
+ * `/` in it). The userinfo is everything before the authority's LAST `@`; the password is what follows its
+ * first `:`. With no `@` in the authority but one later in the token and a `:` in the authority, everything
+ * from that `:` to the token's last `@` is hidden (a password holding `?` or `#`; hiding too much is the safe
+ * side). Each character is visited a bounded number of times: linear time.
+ */
+function connectionSpans(s: string): Span[] {
+  const spans: Span[] = [];
+  const n = s.length;
+  // lastAt[i]: the last '@' in s[i .. end of the non-space run holding i], or -1.
+  let lastAt: Int32Array | null = null;
+  const lastAtFrom = (i: number) => {
+    if (lastAt === null) {
+      lastAt = new Int32Array(n + 1).fill(-1);
+      let cur = -1;
+      for (let p = n - 1; p >= 0; p--) {
+        const c = code(s, p);
+        if (isSpace(c)) cur = -1;
+        else if (c === 64 && cur === -1) cur = p;
+        lastAt[p] = cur;
+      }
+    }
+    return i < n ? lastAt[i] : -1;
+  };
+  let from = 0;
+  for (let sep = s.indexOf('://', from); sep >= 0; sep = s.indexOf('://', from)) {
+    from = sep + 1;
+    if (sep === 0 || !isSchemeChar(code(s, sep - 1))) continue; // no scheme
+    const start = sep + 3; // token start
+    // authority: up to the first '/', '?', '#' or space (it never runs past the next '://', which holds a '/')
+    let authEnd = start;
+    while (authEnd < n) {
+      const c = code(s, authEnd);
+      if (c === 47 || c === 63 || c === 35 || isSpace(c)) break;
+      authEnd++;
+    }
+    // a '/' inside the password: extend while the next path segment holds an '@' (a segment never crosses a '://')
+    while (authEnd < n && code(s, authEnd) === 47) {
+      let segEnd = authEnd + 1;
+      let hasAt = false;
+      while (segEnd < n) {
+        const c = code(s, segEnd);
+        if (c === 47 || c === 63 || c === 35 || isSpace(c)) break;
+        if (c === 64) hasAt = true;
+        segEnd++;
+      }
+      if (!hasAt) break;
+      authEnd = segEnd;
+    }
+    let at = -1;
+    for (let p = authEnd - 1; p >= start; p--) if (code(s, p) === 64) { at = p; break; }
+    let colon = -1;
+    const colonLimit = at >= 0 ? at : authEnd;
+    for (let p = start; p < colonLimit; p++) if (code(s, p) === 58) { colon = p; break; }
+    if (at >= 0) {
+      if (colon >= 0 && at > colon + 1) spans.push([colon + 1, at]);
+    } else if (colon >= 0) {
+      const later = lastAtFrom(authEnd);
+      if (later >= 0) spans.push([colon + 1, later]);
+    }
+    // resume right after this '://' (a later one may sit inside this authority), but never inside a hidden span
+    const last = spans.length > 0 ? spans[spans.length - 1][1] : 0;
+    from = Math.max(sep + 1, last);
+  }
+  // spans are produced in order and never overlap (each scan resumes after the previous span)
+  return spans;
+}
+
+/** Spans of a token-rule regex in `s`. */
+function regexSpans(s: string, re: RegExp): Span[] {
+  const spans: Span[] = [];
+  re.lastIndex = 0;
+  for (let m = re.exec(s); m !== null; m = re.exec(s)) {
+    spans.push([m.index, m.index + m[0].length]);
+    if (m[0].length === 0) re.lastIndex++;
+  }
+  return spans;
+}
+
+// ----- password-like assignments -----
+
+const KEYWORD = /password|passwd|pwd|secret|token|api[_-]?key|private[_-]?key|access[_-]?key|client[_-]?secret/i;
+const AUTH_SCHEMES = new Set(['bearer', 'basic', 'token', 'digest']);
+
+/** True when a name (a run of [A-Za-z0-9_.-]) holds a password-like keyword. `auth` counts only as a word
+ * (or a camelCase part): auth, AUTH, auth_mode, basicAuth, X-Auth-Key, authorization; not author, authority, OAuth. */
+function isSecretName(name: string): boolean {
+  if (KEYWORD.test(name)) return true;
+  const lower = name.toLowerCase();
+  const wordEnd = (e: number) => e >= name.length || !isLetter(code(name, e)) || (isLower(code(name, e - 1)) && isUpper(code(name, e)));
+  for (let i = lower.indexOf('auth'); i >= 0; i = lower.indexOf('auth', i + 1)) {
+    const wordStart = i === 0 || !isLetter(code(name, i - 1)) || (isLower(code(name, i - 1)) && isUpper(code(name, i)));
+    if (!wordStart) continue;
+    if (wordEnd(i + 4) || (lower.startsWith('authorization', i) && wordEnd(i + 13))) return true;
+  }
+  return false;
+}
+
+const isQuote = (c: number) => c === 34 || c === 39 || c === 96; // " ' `
+
+/** Index of the quote closing the one at `open` (backslash escapes honoured), or -1. */
+function closingQuote(s: string, open: number): number {
+  const q = code(s, open);
+  for (let j = open + 1; j < s.length; j++) {
+    const c = code(s, j);
+    if (c === 92) j++; // backslash
+    else if (c === q) return j;
+  }
+  return -1;
+}
+
+const skipBlanks = (s: string, i: number) => {
+  while (i < s.length && (code(s, i) === 32 || code(s, i) === 9)) i++;
+  return i;
+};
+
+/**
+ * Hides values given to password-like names. A name is a run of [A-Za-z0-9_.-] holding a keyword
+ * (password, passwd, pwd, secret, token, api key, private key, access key, client secret, or auth as a
+ * word); it may be quoted or a subscript (`env["DB_PASSWORD"]`). Forms covered:
+ * - `name SEP value` with SEP one of `=`, `:`, `=>`, `:=`: a quoted value (single, double, backtick,
+ *   or triple quotes) has its inside replaced, quotes kept; an unquoted value hides the rest of the line;
+ *   an empty value or a YAML block indicator (`|`, `>`, with `-`/`+`) starts an indented block, which
+ *   redact() hides line by line.
+ * - Authorization with a Bearer/Basic/Token/Digest value: the scheme word stays, what follows is hidden.
+ * - long CLI flags `--name value` / `--name=value`; XML `<name>value</name>` on one line.
+ * Known limits (gitleaks is the second line there): a quoted value that continues on the next lines (e.g.
+ * Python/TOML triple quotes spanning lines), string concatenation after the first quoted part
+ * (`"abc" + "def"`), setter calls (`setPassword("x")`), keys with spaces (`"api key"`) and non-ASCII names.
+ * Over-redacting is the safe direction: type annotations such as `token: string` lose their type too.
+ */
+function assignmentSpans(s: string): { spans: Span[]; block: boolean } {
+  const spans: Span[] = [];
+  const n = s.length;
+  let block = false;
+  let i = 0;
+  while (i < n) {
+    if (!isNameChar(code(s, i))) { i++; continue; }
+    const start = i;
+    while (i < n && isNameChar(code(s, i))) i++;
+    const name = s.slice(start, i);
+    if (!isSecretName(name)) continue;
+    const before = start > 0 ? code(s, start - 1) : -1;
+    let p = i;
+
+    // XML: <name>value</...>
+    if (before === 60 /* < */ && code(s, p) === 62 /* > */) {
+      const close = s.indexOf('<', p + 1);
+      const end = close < 0 ? n : close;
+      if (end > p + 1) spans.push([p + 1, end]);
+      i = end;
+      continue;
+    }
+    // long CLI flag: --name value / --name=value
+    if (name.startsWith('--')) {
+      let v = -1;
+      if (code(s, p) === 61 /* = */) v = p + 1;
+      else if (code(s, p) === 32 || code(s, p) === 9) v = skipBlanks(s, p);
+      if (v < 0 || v >= n) continue;
+      if (isQuote(code(s, v))) {
+        const close = closingQuote(s, v);
+        const end = close < 0 ? n : close;
+        if (end > v + 1) spans.push([v + 1, end]);
+        i = close < 0 ? n : close + 1;
+      } else {
+        let e = v;
+        while (e < n && !isSpace(code(s, e))) e++;
+        spans.push([v, e]);
+        i = e;
+      }
+      continue;
+    }
+    // name SEP value (the name may be quoted, or a subscript: ["name"])
+    if (p < n && isQuote(code(s, p))) p++;
+    if (p < n && code(s, p) === 93 /* ] */) p++;
+    p = skipBlanks(s, p);
+    if (s.startsWith('=>', p) || s.startsWith(':=', p)) p += 2;
+    else if (p < n && (code(s, p) === 58 || code(s, p) === 61)) p++; // : =
+    else continue;
+    const v = skipBlanks(s, p);
+    if (v >= n) { block = true; break; } // empty: the value may be on the next, indented lines
+    const c = code(s, v);
+    if (c === 124 /* | */ || c === 62 /* > */) {
+      let e = v + 1;
+      if (e < n && (code(s, e) === 45 || code(s, e) === 43)) e++; // - +
+      const rest = skipBlanks(s, e);
+      if (rest >= n || code(s, rest) === 35 /* # comment */) { block = true; break; }
+    }
+    // Authorization: <scheme> <credentials>
+    if (name.toLowerCase().includes('authorization')) {
+      const inner = isQuote(c) ? v + 1 : v;
+      let w = inner;
+      while (w < n && isLetter(code(s, w))) w++;
+      if (AUTH_SCHEMES.has(s.slice(inner, w).toLowerCase()) && (code(s, w) === 32 || code(s, w) === 9)) {
+        const credStart = skipBlanks(s, w);
+        const close = isQuote(c) ? closingQuote(s, v) : -1;
+        const end = close < 0 ? n : close;
+        if (end > credStart) spans.push([credStart, end]);
+        i = close < 0 ? n : close + 1;
+        continue;
+      }
+    }
+    if (isQuote(c)) {
+      const triple = c !== 96 && s.startsWith(s[v].repeat(3), v);
+      if (triple) {
+        const close = s.indexOf(s[v].repeat(3), v + 3);
+        const end = close < 0 ? n : close;
+        if (end > v + 3) spans.push([v + 3, end]);
+        i = close < 0 ? n : close + 3;
+        continue;
+      }
+      const close = closingQuote(s, v);
+      const end = close < 0 ? n : close;
+      if (end > v + 1) spans.push([v + 1, end]);
+      i = close < 0 ? n : close + 1;
+      continue;
+    }
+    spans.push([v, n]); // unquoted: the rest of the line
+    i = n;
+  }
+  return { spans, block };
+}
+
+// ----- private keys -----
 
 // Private key markers, found without a regex so they are seen on lines of any length.
 const MARK_START = '-----';
@@ -141,21 +394,34 @@ function findKeyMarker(line: string, kind: 'BEGIN' | 'END', from: number): { sta
   return null;
 }
 
-function redactSegment(s: string): string {
+/** One plain piece of a line (no key markers, at most 4 KB) with every rule applied, in order. */
+function redactSegment(s: string): { text: string; block: boolean } {
   let out = s;
-  for (const [, re] of TOKEN_RULES) out = out.replace(re, R);
-  out = out.replace(CONNECTION_STRING, hideConnectionPassword);
-  return out.replace(ASSIGNED_VALUE, hideAssignedValue);
+  for (const [, re] of TOKEN_RULES) out = replaceSpans(out, regexSpans(out, re));
+  out = replaceSpans(out, jwtSpans(out));
+  out = replaceSpans(out, connectionSpans(out));
+  const a = assignmentSpans(out);
+  return { text: replaceSpans(out, a.spans), block: a.block };
 }
 
+const indentOf = (line: string) => {
+  let i = 0;
+  while (i < line.length && (line[i] === ' ' || line[i] === '\t')) i++;
+  return i;
+};
+
 /**
- * Replaces secret-like text with [REDACTED]. Works line by line: a line over 4 KB is replaced whole
- * (it is too long to scan safely), and a private key block is replaced whole, up to its END line, or to
- * the end of the text when it has none.
+ * Replaces secret-like text with [REDACTED]. Works line by line with a little state:
+ * - a private key block is replaced whole, up to its END line, or to the end of the text when it has none;
+ * - after a password-like name with an empty value or a YAML block indicator, every following line that is
+ *   more indented than that line is hidden (blank lines stay blank);
+ * - a line over 4 KB is replaced whole (it is too long to scan safely), and so are the more-indented
+ *   lines right after it, since it may have opened such a block.
  */
 export function redact(text: string): string {
   const out: string[] = [];
   let inKey = false;
+  let blockIndent = -1; // >= 0 while hiding an indented value block
   for (const line of text.split('\n')) {
     const startedInKey = inKey;
     const pieces: string[] = []; // plain text pieces, with R where a key block starts
@@ -179,19 +445,40 @@ export function redact(text: string): string {
       }
     }
     const startsBlock = pieces.includes(R);
-    // A line that only continues (or closes) a block already shown as [REDACTED] is dropped.
+    // A line that only continues (or closes) a key block already shown as [REDACTED] is dropped.
     if (startedInKey && !startsBlock && plain.every((p) => p === '')) continue;
+    if (blockIndent >= 0) {
+      if (line.trim() === '') {
+        out.push(line); // blank: nothing to hide
+        continue;
+      }
+      const ind = indentOf(line);
+      if (ind > blockIndent) {
+        out.push(line.slice(0, ind) + R);
+        continue;
+      }
+      blockIndent = -1;
+    }
     if (!regexSafe(line)) {
+      // Not scanned, so it may have started an indented value block: hide the more-indented lines after it too.
       out.push(LONG_LINE);
+      blockIndent = indentOf(line);
       continue;
     }
-    out.push(pieces.map((p) => (p === R ? R : redactSegment(p))).join(''));
+    let block = false;
+    out.push(pieces.map((p) => {
+      if (p === R) return R;
+      const r = redactSegment(p);
+      block ||= r.block;
+      return r.text;
+    }).join(''));
+    if (block) blockIndent = indentOf(line);
   }
   return out.join('\n');
 }
 
 /**
- * Names of the secret-like formats found in `text` (token formats, private keys, connection string
+ * Names of the secret-like formats found in `text` (token formats, JWTs, private keys, connection string
  * passwords), never the values. Unlike redact() it ignores `name = value` assignments, which are common
  * in ordinary code. Lines over 4 KB are not scanned, except for private key markers.
  */
@@ -200,8 +487,9 @@ export function findSecretLike(text: string): string[] {
   for (const line of text.split('\n')) {
     if (findKeyMarker(line, 'BEGIN', 0)) found.add('private-key');
     if (!regexSafe(line)) continue;
-    for (const [name, re] of TOKEN_RULES) if (line.search(re) >= 0) found.add(name);
-    if (line.replace(CONNECTION_STRING, hideConnectionPassword) !== line) found.add('connection-string-password');
+    for (const [name, re] of TOKEN_RULES) if (regexSpans(line, re).length > 0) found.add(name);
+    if (jwtSpans(line).length > 0) found.add('jwt');
+    if (connectionSpans(line).length > 0) found.add('connection-string-password');
   }
   return [...found];
 }
@@ -214,6 +502,22 @@ const stripPadding = (s: string) => {
   return s.slice(0, end);
 };
 
+const isHex = (c: number) => isDigit(c) || (c >= 65 && c <= 70) || (c >= 97 && c <= 102);
+
+/** `s` with the two hex digits after each `%` in upper case. Same length; linear. */
+function upperPercent(s: string): string {
+  if (!s.includes('%')) return s;
+  let out = '';
+  let pos = 0;
+  for (let i = s.indexOf('%'); i >= 0; i = s.indexOf('%', i + 1)) {
+    if (i + 2 < s.length && isHex(code(s, i + 1)) && isHex(code(s, i + 2))) {
+      out += s.slice(pos, i + 1) + s.slice(i + 1, i + 3).toUpperCase();
+      pos = i + 3;
+    }
+  }
+  return out + s.slice(pos);
+}
+
 /** Every form of a typed value that is looked for (see scrubKnownValues). */
 function knownForms(values: string[]): string[] {
   const forms = new Set<string>();
@@ -224,11 +528,12 @@ function knownForms(values: string[]): string[] {
       const b64 = Buffer.from(v, 'utf8').toString('base64');
       const urlSafe = b64.replaceAll('+', '-').replaceAll('/', '_');
       forms.add(v).add(b64).add(stripPadding(b64)).add(urlSafe).add(stripPadding(urlSafe));
-      forms.add(JSON.stringify(v).slice(1, -1)); // as written inside a JSON string
+      const json = JSON.stringify(v).slice(1, -1); // as written inside a JSON string
+      forms.add(json).add(json.replace(/[\u007f-\uffff]/g, (ch) => `\\u${ch.charCodeAt(0).toString(16).padStart(4, '0')}`)); // and ASCII-only JSON
       try {
         const enc = encodeURIComponent(v);
-        const lower = enc.replace(/%[0-9A-F]{2}/g, (m) => m.toLowerCase()); // our own value, not repo text
-        forms.add(enc).add(lower).add(enc.replaceAll('%20', '+')).add(lower.replaceAll('%20', '+')); // + form-encoded
+        forms.add(enc).add(enc.replaceAll('%20', '+')); // + form-encoded
+        forms.add(encodeURI(v));
       } catch {
         // a lone surrogate has no URL-encoded form
       }
@@ -244,13 +549,18 @@ function knownForms(values: string[]): string[] {
  * Every occurrence of every form is found in the original text first (plain substring search, no regex),
  * overlapping or touching matches are merged, and each merged span becomes one [REDACTED], so overlapping
  * values cannot leave a piece behind.
- * Known limit: the base64 of a value embedded at a non-aligned offset inside a longer base64 blob (e.g.
- * base64 of "user:value") is not detected; the gitleaks pass is the second line of defence there.
+ * Percent escapes match in any hex case (`%2f` = `%2F`); encodeURI and ASCII-only JSON (`\u00e9`) forms count too.
+ * Known limits (the gitleaks pass is the second line of defence there): the base64 of a value embedded at a
+ * non-aligned offset inside a longer base64 blob (e.g. base64 of "user:value"); a value whose own letters
+ * changed case; HTML-entity or language-specific escapes (Python `\xe9`).
  */
 export function scrubKnownValues(text: string, values: string[]): string {
   const spans: [number, number][] = [];
-  for (const f of knownForms(values)) {
-    for (let i = text.indexOf(f); i >= 0; i = text.indexOf(f, i + 1)) spans.push([i, i + f.length]);
+  // Percent escapes match in any hex case: spans are found on a copy with every %xx in upper case (same
+  // length, so the spans apply to the original text), against forms normalised the same way.
+  const hay = upperPercent(text);
+  for (const f of new Set(knownForms(values).map(upperPercent))) {
+    for (let i = hay.indexOf(f); i >= 0; i = hay.indexOf(f, i + 1)) spans.push([i, i + f.length]);
   }
   if (spans.length === 0) return text;
   spans.sort((a, b) => a[0] - b[0] || b[1] - a[1]);
@@ -352,7 +662,12 @@ export async function bundleCode(dir: string, opts: BundleOptions = {}): Promise
   // again in case a redaction exposed a new exact match. The same order applies to file names.
   const clean = (s: string) => scrub(redact(scrub(s)));
   const flagged: string[] = []; // secrets the gitleaks pass found; a path holding one is never shown
-  const nameHidden = (p: string) => clean(p) !== p || flagged.some((v) => p.includes(v));
+  // Checked on the raw name and on the name as shown (control characters removed), so a control character
+  // inside a name cannot split a secret-like pattern.
+  const nameHidden = (p: string) => {
+    const shown = displayPath(p);
+    return clean(p) !== p || clean(shown) !== shown || flagged.some((v) => p.includes(v) || shown.includes(v));
+  };
   const show = (p: string) => (nameHidden(p) ? '(a file whose name looks like a secret)' : safeText(p, 300));
   const notes = new Notes();
   const inRoots = (p: string) => roots === null || roots.some((r) => underRoot(p, r));
@@ -531,6 +846,8 @@ function applyFinding(content: string, f: Finding): string | null {
 const ALLOW_COMMENT = 'gitleaks' + ':allow';
 
 const PATHS_FILE = 'paths.txt';
+// A found secret shorter than this is not removed from every file (it would hit ordinary text).
+const MIN_GLOBAL_SECRET = 6;
 
 /**
  * Scans the (already cleaned) files with gitleaks and returns what may be sent. Every finding is replaced
@@ -568,11 +885,15 @@ async function gitleaksPass(files: FileEntry[], bin: string, timeoutMs: number, 
     const unplaced = new Set<number>();
     const badPath = new Set<number>();
     const secrets = new Set<string>();
+    const shortHit = new Set<number>();
     let strays = 0;
     for (const f of findings) {
-      // The secret-bearing text of every finding is removed everywhere below.
+      // The secret-bearing text of every finding is removed everywhere below, unless it is too short to
+      // remove safely everywhere (it would hit ordinary text): then only the reported file is left out.
       const found = f.secret !== '' ? f.secret : f.match;
-      if (found.trim() !== '' && found !== R) secrets.add(found);
+      const short = found.length < MIN_GLOBAL_SECRET;
+      if (!short && found.trim() !== '' && found !== R) secrets.add(found);
+      const texts = [f.secret, f.match].filter((t) => t.length >= MIN_GLOBAL_SECRET);
       const abs = isAbsolute(f.file) ? resolve(f.file) : resolve(tmp, f.file);
       const rel = insideDir(tmp, abs) ? relative(tmp, abs) : undefined;
       if (rel === PATHS_FILE) {
@@ -584,7 +905,7 @@ async function gitleaksPass(files: FileEntry[], bin: string, timeoutMs: number, 
           hit = true;
         }
         shownPaths.forEach((p, k) => {
-          if ((f.secret !== '' && p.includes(f.secret)) || (f.match !== '' && p.includes(f.match))) {
+          if (texts.some((t) => p.includes(t))) {
             badPath.add(k);
             hit = true;
           }
@@ -594,7 +915,8 @@ async function gitleaksPass(files: FileEntry[], bin: string, timeoutMs: number, 
       }
       const i = rel === undefined ? undefined : index.get(rel);
       if (i !== undefined) {
-        perFile.set(i, [...(perFile.get(i) ?? []), f]);
+        if (short) shortHit.add(i);
+        else perFile.set(i, [...(perFile.get(i) ?? []), f]);
         continue;
       }
       // Not one of the scanned files (outside the temp dir, or unknown): ignore the finding, and drop any
@@ -603,7 +925,7 @@ async function gitleaksPass(files: FileEntry[], bin: string, timeoutMs: number, 
       const named = index.get(f.file.replaceAll('\\', '/').split('/').pop() ?? '');
       if (named !== undefined) unplaced.add(named);
       scanned.forEach((s, j) => {
-        if ((f.secret !== '' && s.content.includes(f.secret)) || (f.match !== '' && s.content.includes(f.match))) unplaced.add(j);
+        if (texts.some((t) => s.content.includes(t))) unplaced.add(j);
       });
     }
     let redacted = 0;
@@ -634,12 +956,13 @@ async function gitleaksPass(files: FileEntry[], bin: string, timeoutMs: number, 
     notes.add(`gitleaks checked the bundle: ${plural(redacted, 'finding', 'findings')} redacted.`);
     notes.addPaths('Left out because gitleaks found something pipegen could not locate to redact:', pathsOf(drop), show);
     notes.addPaths('Left out because a found secret was still in them after redaction:', pathsOf(leftover), show);
+    if (shortHit.size > 0) notes.add(`Left out ${plural(shortHit.size, 'file', 'files')} where gitleaks found a short value (under ${MIN_GLOBAL_SECRET} characters), too short to remove everywhere.`);
     if (badPath.size > 0) notes.add(`Left out ${plural(badPath.size, 'file whose path', 'files whose paths')} gitleaks flagged as secret-like (names not shown).`);
     if (strays > 0) {
       notes.add(`Ignored ${plural(strays, 'gitleaks finding', 'gitleaks findings')} for a file outside the scanned folder.`);
       notes.addPaths('Left out because a gitleaks finding outside the scanned folder may relate to them:', pathsOf(unplaced), show);
     }
-    return scanned.filter((_, i) => !drop.has(i) && !unplaced.has(i) && !leftover.has(i) && !badPath.has(i));
+    return scanned.filter((_, i) => !drop.has(i) && !unplaced.has(i) && !leftover.has(i) && !badPath.has(i) && !shortHit.has(i));
   } finally {
     await rm(tmp, { recursive: true, force: true });
   }

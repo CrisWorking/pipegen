@@ -13,17 +13,15 @@ title = "pipegen code bundle"
 useDefault = true
 
 # The password part of a connection string (scheme, then user, a colon, the password, an @
-# and the host). The user may be empty, and the password runs to the LAST @ before the end of
-# the token, so an unencoded @ inside it is covered too (this may also take part of a path or
-# query that holds an @: hiding too much is the safe side). Only the password is reported, so
-# only it is replaced.
+# and the host). RE2-safe and greedy: the user part may hold @ and the password runs to the
+# last @ before a slash, so it over-matches rather than misses. pipegen's own scan in
+# src/ai/redact.ts is the precise one; this rule is the second line.
 [[rules]]
 id = "pipegen-connection-string-password"
 description = "Password inside a connection string"
-regex = '''[a-zA-Z][a-zA-Z0-9+.-]*://[^:/\s@]*:([^\s'"`<>]*)@'''
+regex = '''[a-zA-Z][a-zA-Z0-9+.-]*://[^/\s]*:([^\s/]+)@'''
 secretGroup = 1
 
-# API keys of the sk- form (several AI providers use it).
 [[rules]]
 id = "pipegen-sk-key"
 description = "API key of the sk- form"
