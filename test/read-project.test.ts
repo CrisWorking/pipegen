@@ -142,10 +142,8 @@ describe('read', () => {
     expect((await readProject(repo('node-npm'))).services[0]?.frameworks).toEqual([]);
   });
 
-  it('later fields start as stubs (existingWorkflows [], precommit null, defaultBranch \'main\')', async () => {
+  it('defaultBranch is still a stub (\'main\') until the GitHub step', async () => {
     const p = await readProject(repo('node-pnpm-workspaces'));
-    expect(p.existingWorkflows).toEqual([]);
-    expect(p.precommit).toBeNull();
     expect(p.defaultBranch).toBe('main');
     expect(p.services.length).toBeGreaterThan(0);
   });

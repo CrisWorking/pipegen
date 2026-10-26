@@ -6,6 +6,7 @@ import type { Language, Monorepo, PackageManager, RepoProfile, Service } from '.
 import { safeText } from '../util/safe-text.js';
 import { asObj, asString, asStrings, isTestFile, pythonNames, readPyproject, type Obj } from './manifest.js';
 import { readEnv } from './env.js';
+import { readPrecommit, readWorkflows } from './workflows.js';
 import { listFiles, parseYamlLimited, readTextLimitedWithReason, regexLines, regexSafe, type Skipped } from './limits.js';
 
 export class NotGitHubRepoError extends Error {}
@@ -256,6 +257,6 @@ export async function readProject(dir: string, opts?: { notes?: string[] }): Pro
     owner, repo, defaultBranch: 'main', monorepo, services,
     terraformDirs: [...new Set(files.filter((f) => f.endsWith('.tf')).map(dirOf))].sort(),
     hasCompose: files.some((f) => /^(docker-)?compose\.ya?ml$/.test(baseOf(f))),
-    existingWorkflows: [], precommit: null,
+    existingWorkflows: await readWorkflows(dir, files, ctx.notes), precommit: readPrecommit(dir),
   };
 }
