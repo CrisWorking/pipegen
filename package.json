@@ -1,0 +1,41 @@
+{
+  "name": "pipegen",
+  "version": "0.1.0",
+  "description": "Audits and protects GitHub CI pipelines",
+  "type": "module",
+  "bin": {
+    "pipegen": "dist/cli/main.js"
+  },
+  "engines": {
+    "node": ">=24"
+  },
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/CrisWorking/pipegen.git"
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsup",
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@anthropic-ai/sdk": "^1.3.0",
+    "@clack/prompts": "^1.8.1",
+    "@octokit/rest": "^22.0.1",
+    "@types/node": "^26.6.5",
+    "execa": "^10.2.1",
+    "fast-glob": "^3.3.3",
+    "openai": "^7.44.0",
+    "smol-toml": "^1.9.1",
+    "tsup": "^9.0.0",
+    "typescript": "^7.0.2",
+    "vitest": "^5.0.5",
+    "yaml": "^2.9.1",
+    "zod": "^4.6.7",
+    "zod-to-json-schema": "^3.25.2"
+  }
+}
