@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
-import { GitHubRateLimitError, MAX_RATE_WAIT_MS, rateLimitWaitMs, withRateLimit } from '../src/engine/github-rate.js';
+import { DEFAULT_RATE_BUDGET_MS, GitHubRateLimitError, MAX_RATE_WAIT_MS, rateLimitWaitMs, withRateLimit } from '../src/engine/github-rate.js';
 import { fakeOctokit } from './helpers/fake-http.js';
 
 const NOW = Date.parse('2026-10-26T12:00:00Z');
@@ -59,6 +59,31 @@ describe('github rate limit', () => {
     await expect(withRateLimit(() => gh.rest.repos.get({ owner: 'o', repo: 'denied' }), clock)).rejects.toMatchObject({ status: 403 });
     await expect(withRateLimit(() => gh.rest.repos.get({ owner: 'o', repo: 'gone' }), clock)).rejects.toMatchObject({ status: 404 });
     expect(clock.sleep).not.toHaveBeenCalled();
+  });
+
+  it('githubRate: total wait budget per run; once spent, the next limit throws instead of sleeping', async () => {
+    let n = 0;
+    const clock = fakeClock(); // one clock object = one run: the default budget (120 s) is shared by every call made with it
+    // every other call is limited until 40 s after the clock's current time (41 s with the margin)
+    const limitedNow = () => ({ status: 403, headers: { 'x-ratelimit-remaining': '0', 'x-ratelimit-reset': String(Math.floor(clock.now() / 1000) + 40) } });
+    const { gh } = fakeOctokit({ 'GET https://api.github.com/repos/o/r': () => (n++ % 2 === 0 ? limitedNow() : { body: {} }) });
+    const call = () => withRateLimit(() => gh.rest.repos.get({ owner: 'o', repo: 'r' }), clock);
+    await call();
+    await call(); // 82 s spent
+    const spent = await call().catch((e: unknown) => e); // 41 s more would pass 120 s
+    expect(spent).toBeInstanceOf(GitHubRateLimitError);
+    expect((spent as GitHubRateLimitError).message).toBe('GitHub rate limit: stopped waiting.');
+    expect((spent as GitHubRateLimitError).budgetSpent).toBe(true);
+    expect(clock.waits).toEqual([41_000, 41_000]);
+    expect(DEFAULT_RATE_BUDGET_MS).toBe(120_000);
+
+    // an injected budget is used instead (and shared by whoever holds it)
+    const other = fakeOctokit({ 'GET https://api.github.com/repos/o/r': limited(40) });
+    const budget = { remainingMs: 10_000 };
+    const small = { ...fakeClock(), budget };
+    await expect(withRateLimit(() => other.gh.rest.repos.get({ owner: 'o', repo: 'r' }), small)).rejects.toThrow('GitHub rate limit: stopped waiting.');
+    expect(small.sleep).not.toHaveBeenCalled();
+    expect(budget.remainingMs).toBe(10_000);
   });
 
   it('githubRate: rateLimitWaitMs reads the headers; no reset header → never waits', () => {

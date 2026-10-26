@@ -1,20 +1,45 @@
 // GitHub rate limits, shared by discovery, stats and pinning (Plan B ruling S16).
 // A rate-limited answer is a 403 or 429 with `x-ratelimit-remaining: 0` (wait until `x-ratelimit-reset`) or with
 // `retry-after` (secondary limits). pipegen waits only when that is at most 60 s away, then retries once. Anything
-// longer, or a second limit, is a GitHubRateLimitError for the caller to report. sleep and now are injected so
-// tests never really wait.
+// longer, or a second limit, is a GitHubRateLimitError for the caller to report. Waits also come out of a total
+// budget per run (default 120 s): once a wait would go past it, the call fails with
+// GitHubRateLimitError("GitHub rate limit: stopped waiting.") (budgetSpent: true) instead of sleeping.
+// sleep, now and the budget are injected so tests never really wait.
 
 export const MAX_RATE_WAIT_MS = 60_000;
 /** Added to each wait: the reset time is in whole seconds. */
 const RESET_MARGIN_MS = 1_000;
 
-export interface RateClock { sleep?: (ms: number) => Promise<void>; now?: () => number }
+export const DEFAULT_RATE_BUDGET_MS = 120_000;
+export const BUDGET_SPENT_MESSAGE = 'GitHub rate limit: stopped waiting.';
+
+/** What is left of a run's total wait budget; whoever holds the object shares it. */
+export interface RateBudget { remainingMs: number }
+/**
+ * `budget`: the run's wait budget. When it is not given, one default budget is kept per clock object, so every
+ * call made with the same deps object (one run) shares it.
+ */
+export interface RateClock { sleep?: (ms: number) => Promise<void>; now?: () => number; budget?: RateBudget }
 
 export class GitHubRateLimitError extends Error {
-  constructor(message: string, options?: { cause?: unknown }) {
+  /** True when the run's total wait budget is spent (rather than one reset being too far away). */
+  readonly budgetSpent: boolean;
+  constructor(message: string, options?: { cause?: unknown; budgetSpent?: boolean }) {
     super(message, options);
     this.name = 'GitHubRateLimitError';
+    this.budgetSpent = options?.budgetSpent ?? false;
   }
+}
+
+const defaultBudgets = new WeakMap<object, RateBudget>();
+function budgetOf(clock: RateClock): RateBudget {
+  if (clock.budget) return clock.budget;
+  let budget = defaultBudgets.get(clock);
+  if (budget === undefined) {
+    budget = { remainingMs: DEFAULT_RATE_BUDGET_MS };
+    defaultBudgets.set(clock, budget);
+  }
+  return budget;
 }
 
 const realSleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
@@ -45,7 +70,7 @@ function limitError(waitMs: number, cause: unknown): GitHubRateLimitError {
   return new GitHubRateLimitError(`GitHub's rate limit was reached; it resets ${when}.`, { cause });
 }
 
-/** Runs one GitHub call; on a rate limit that resets within 60 s, waits and retries it once. */
+/** Runs one GitHub call; on a rate limit that resets within 60 s (and fits the run's budget), waits and retries it once. */
 export async function withRateLimit<T>(call: () => Promise<T>, clock: RateClock = {}): Promise<T> {
   const sleep = clock.sleep ?? realSleep;
   const now = clock.now ?? Date.now;
@@ -55,7 +80,11 @@ export async function withRateLimit<T>(call: () => Promise<T>, clock: RateClock 
     const wait = rateLimitWaitMs(e, now());
     if (wait === undefined) throw e;
     if (wait > MAX_RATE_WAIT_MS) throw limitError(wait, e);
-    await sleep(wait + RESET_MARGIN_MS);
+    const budget = budgetOf(clock);
+    const cost = wait + RESET_MARGIN_MS;
+    if (!(cost <= budget.remainingMs)) throw new GitHubRateLimitError(BUDGET_SPENT_MESSAGE, { cause: e, budgetSpent: true });
+    budget.remainingMs -= cost;
+    await sleep(cost);
   }
   try {
     return await call();

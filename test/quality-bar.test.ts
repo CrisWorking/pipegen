@@ -8,12 +8,18 @@ import { cleanupRepos, makeTempDir, writeIn } from './helpers/make-repo.js';
 afterEach(cleanupRepos);
 
 const root = resolve(import.meta.dirname, '..');
-const BAR: QualityBar = { minStars: 500, minScorecard: 5, strongScorecard: 7, maxMonthsSinceRelease: 12 };
+const BAR: QualityBar = { minStars: 500, minScorecard: 5, strongScorecard: 7, scorecardMaxAgeDays: 180, maxMonthsSinceRelease: 12 };
 const NOW = new Date('2026-10-26T12:00:00Z');
 
-/** Passes every rule: popular, scored 8/10, released last month, MIT, no advisories. */
+/** Passes every rule: popular, scored 8/10 this month, released last month, MIT, no advisories. */
+/** Writes a valid-looking file and returns its path. */
+function writeOk(dir: string, text: string): string {
+  writeIn(dir, 'ok.yml', text);
+  return join(dir, 'ok.yml');
+}
+
 const good = (over: Partial<ToolStats> = {}): ToolStats => ({
-  repo: 'o/r', stars: 2000, archived: false, lastReleaseAt: '2026-09-20T00:00:00Z', scorecard: 8,
+  repo: 'o/r', stars: 2000, archived: false, lastReleaseAt: '2026-09-20T00:00:00Z', scorecard: 8, scorecardAt: '2026-10-20T00:00:00Z',
   verifiedPublisher: false, license: 'MIT', advisories: 0, ...over,
 });
 
@@ -67,6 +73,24 @@ describe('quality bar', () => {
     expect(checkQualityBar(good({ lastReleaseAt: 'not a date' }), BAR, NOW).reasons).toEqual(["Couldn't read the date of the last release."]);
   });
 
+  it('qualityBar: a release date in the future fails', () => {
+    // a forged commit or release date can't make an old project look maintained
+    expect(checkQualityBar(good({ lastReleaseAt: '2099-01-01T00:00:00Z' }), BAR, NOW).reasons).toEqual(["Couldn't read the date of the last release."]);
+    expect(checkQualityBar(good({ lastReleaseAt: '2026-10-27T13:00:00Z' }), BAR, NOW).pass).toBe(false); // more than a day ahead
+    expect(checkQualityBar(good({ lastReleaseAt: '2026-10-27T11:00:00Z' }), BAR, NOW).pass).toBe(true); // clock skew under a day
+  });
+
+  it('qualityBar: a stale Scorecard result is not strong', () => {
+    const few = { stars: 12, scorecard: 8 };
+    expect(checkQualityBar(good({ ...few, scorecardAt: '2026-06-01T00:00:00Z' }), BAR, NOW).pass).toBe(true); // 147 days old
+    for (const scorecardAt of ['2026-01-01T00:00:00Z', null, 'not a date', '2099-01-01T00:00:00Z']) {
+      const v = checkQualityBar(good({ ...few, scorecardAt }), BAR, NOW);
+      expect(v.reasons, String(scorecardAt)).toEqual(['Few users (12 stars) and no strong security score.']);
+    }
+    // the minimum-score rule still uses the score itself
+    expect(checkQualityBar(good({ scorecard: 6, scorecardAt: '2026-01-01T00:00:00Z' }), BAR, NOW).pass).toBe(true);
+  });
+
   it('qualityBar: values that are not numbers fail closed', () => {
     const v = checkQualityBar(good({ stars: Number.NaN, scorecard: Number.NaN, advisories: Number.NaN }), BAR, NOW);
     expect(v.pass).toBe(false);
@@ -79,7 +103,7 @@ describe('quality bar', () => {
 
   it('qualityBar: lists every failing reason', () => {
     const v = checkQualityBar({
-      repo: 'o/r', stars: 3, archived: true, lastReleaseAt: '2024-10-01T00:00:00Z', scorecard: 2,
+      repo: 'o/r', stars: 3, archived: true, lastReleaseAt: '2024-10-01T00:00:00Z', scorecard: 2, scorecardAt: '2026-10-01T00:00:00Z',
       verifiedPublisher: true, license: null, advisories: 2,
     }, BAR, NOW);
     expect(v.pass).toBe(false);
@@ -102,13 +126,19 @@ describe('loadQualityBar', () => {
 
   it('qualityBar: loadQualityBar refuses a malformed file', () => {
     const dir = makeTempDir();
+    const ok = { minStars: '500', minScorecard: '5', strongScorecard: '7', scorecardMaxAgeDays: '180', maxMonthsSinceRelease: '12' };
+    const file = (over: Record<string, string | undefined>) => Object.entries({ ...ok, ...over })
+      .filter(([, v]) => v !== undefined).map(([k, v]) => `${k}: ${v}`).join('\n') + '\n';
+    expect(loadQualityBar(writeOk(dir, file({})))).toEqual(BAR); // the builder itself makes a valid file
     const bad = {
-      missing: 'minStars: 500\nminScorecard: 5\nstrongScorecard: 7\n',
-      extra: 'minStars: 500\nminScorecard: 5\nstrongScorecard: 7\nmaxMonthsSinceRelease: 12\nskip: true\n',
-      negative: 'minStars: -1\nminScorecard: 5\nstrongScorecard: 7\nmaxMonthsSinceRelease: 12\n',
-      score: 'minStars: 500\nminScorecard: 11\nstrongScorecard: 7\nmaxMonthsSinceRelease: 12\n',
-      order: 'minStars: 500\nminScorecard: 8\nstrongScorecard: 7\nmaxMonthsSinceRelease: 12\n',
-      text: 'minStars: "500"\nminScorecard: 5\nstrongScorecard: 7\nmaxMonthsSinceRelease: 12\n',
+      missing: file({ maxMonthsSinceRelease: undefined }),
+      noAge: file({ scorecardMaxAgeDays: undefined }),
+      age: file({ scorecardMaxAgeDays: '0' }),
+      extra: file({ skip: 'true' }),
+      negative: file({ minStars: '-1' }),
+      score: file({ minScorecard: '11' }),
+      order: file({ minScorecard: '8' }),
+      text: file({ minStars: '"500"' }),
       yaml: 'minStars: [\n',
     };
     for (const [name, text] of Object.entries(bad)) {

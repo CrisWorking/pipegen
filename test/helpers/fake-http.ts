@@ -7,21 +7,31 @@ export interface Reply { status?: number; body?: unknown; headers?: Record<strin
 /** Keyed by `METHOD origin+pathname` (no query); a handler sees the whole call, query included. */
 export type Routes = Record<string, Reply | ((c: Call) => Reply)>;
 
-/** Unmatched requests get a GitHub-style 404. */
+/** Unmatched requests get a GitHub-style 404. Redirect replies (with a `location` header) are followed, like fetch. */
 export function fakeFetch(routes: Routes): { fetch: typeof fetch; calls: Call[] } {
   const calls: Call[] = [];
   const fn = async (input: string | URL | Request, init?: RequestInit): Promise<Response> => {
     const req = input instanceof Request ? input : undefined;
-    const url = new URL(req ? req.url : String(input));
+    let url = new URL(req ? req.url : String(input));
     const headers: Record<string, string> = {};
     new Headers(init?.headers ?? req?.headers).forEach((v, k) => { headers[k] = v; });
     const method = (init?.method ?? req?.method ?? 'GET').toUpperCase();
     const body = typeof init?.body === 'string' ? init.body : undefined;
-    const call: Call = { method, url, headers, body };
-    calls.push(call);
-    const route = routes[`${method} ${url.origin}${url.pathname}`];
-    const reply: Reply = route === undefined ? { status: 404, body: { message: 'Not Found' } } : typeof route === 'function' ? route(call) : route;
-    return new Response(JSON.stringify(reply.body ?? {}), { status: reply.status ?? 200, headers: { 'content-type': 'application/json', ...reply.headers } });
+    // Redirects are followed (as fetch does by default) unless the caller asked for 'manual' or 'error'.
+    for (let hops = 0; ; hops++) {
+      const call: Call = { method, url, headers, body };
+      calls.push(call);
+      const route = routes[`${method} ${url.origin}${url.pathname}`];
+      const reply: Reply = route === undefined ? { status: 404, body: { message: 'Not Found' } } : typeof route === 'function' ? route(call) : route;
+      const status = reply.status ?? 200;
+      const location = reply.headers?.location;
+      if ([301, 302, 307, 308].includes(status) && location !== undefined && init?.redirect !== 'manual' && hops < 5) {
+        if (init?.redirect === 'error') throw new TypeError('fetch failed: redirect');
+        url = new URL(location, url);
+        continue;
+      }
+      return new Response(JSON.stringify(reply.body ?? {}), { status, headers: { 'content-type': 'application/json', ...reply.headers } });
+    }
   };
   return { fetch: fn as typeof fetch, calls };
 }

@@ -3,4 +3,5 @@
 minStars: 500                # fewer stars only pass with a strong OpenSSF Scorecard score
 minScorecard: 5              # OpenSSF Scorecard score out of 10; a project Scorecard hasn't scored skips this rule
 strongScorecard: 7           # this score or higher makes up for few stars
+scorecardMaxAgeDays: 180     # an older Scorecard result never counts as a strong score
 maxMonthsSinceRelease: 12    # the last release must be newer than this

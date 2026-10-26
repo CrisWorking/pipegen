@@ -24,7 +24,7 @@ const capNames = ['branchProtection', 'environments', 'envRequiredReviewers', 'a
 const caps = Object.fromEntries(capNames.map((n) => [n, false])) as unknown as Capabilities;
 // data/quality-bar.yml is found through packageDataPath from the bundled file (the probe sits in <pkg>/dist/cli/)
 const qualityBar = loadQualityBar();
-const verdict = checkQualityBar({ repo: 'o/r', stars: 1, archived: false, lastReleaseAt: null, scorecard: null, verifiedPublisher: false, license: 'MIT', advisories: null }, qualityBar, new Date());
+const verdict = checkQualityBar({ repo: 'o/r', stars: 1, archived: false, lastReleaseAt: null, scorecard: null, scorecardAt: null, verifiedPublisher: false, license: 'MIT', advisories: null }, qualityBar, new Date());
 console.log(JSON.stringify({
   owner: profile.owner,
   repo: profile.repo,

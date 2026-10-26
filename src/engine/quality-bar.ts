@@ -1,14 +1,15 @@
 // Quality bar (Plan B Task 3): pipegen only suggests or uses a tool it hasn't reviewed when the tool is maintained,
 // used and free of known advisories for the version in question. Every rule fails closed: a value that is missing
 // or isn't a number fails its rule (the one exception, from the plan: a project OpenSSF Scorecard hasn't scored
-// skips the score rule, but never counts as a strong score).
+// skips the score rule, but never counts as a strong score). A date more than a day in the future is unreadable,
+// and a Scorecard result older than scorecardMaxAgeDays (or with no date) never counts as a strong score.
 import { readFileSync } from 'node:fs';
 import { parse } from 'yaml';
 import { z } from 'zod';
 import { packageDataPath } from '../util/package-data.js';
 import type { ToolStats } from '../types.js';
 
-export interface QualityBar { minStars: number; minScorecard: number; strongScorecard: number; maxMonthsSinceRelease: number }
+export interface QualityBar { minStars: number; minScorecard: number; strongScorecard: number; scorecardMaxAgeDays: number; maxMonthsSinceRelease: number }
 /** `reasons`: plain English, every failing rule (empty when it passes). */
 export interface QualityVerdict { pass: boolean; reasons: string[] }
 
@@ -17,6 +18,7 @@ const barSchema = z.strictObject({
   minStars: z.number().int().nonnegative(),
   minScorecard: score,
   strongScorecard: score,
+  scorecardMaxAgeDays: z.number().int().positive(),
   maxMonthsSinceRelease: z.number().int().positive(),
 }).refine((b) => b.strongScorecard >= b.minScorecard, { message: 'strongScorecard must not be below minScorecard' });
 
@@ -39,6 +41,17 @@ export function loadQualityBar(path: string = packageDataPath('quality-bar.yml')
 /** A number for a reason text; anything that isn't a finite number shows as "?". */
 const show = (n: number) => (Number.isFinite(n) ? String(Math.round(n * 10) / 10) : '?');
 
+const DAY_MS = 86_400_000;
+/** Allowed clock skew: a date later than now plus this can't be right. */
+const FUTURE_SLACK_MS = DAY_MS;
+
+/** The time of an ISO date string, or null when it doesn't parse or is more than a day in the future. */
+function pastTime(s: string | null, now: Date): number | null {
+  if (s === null) return null;
+  const t = Date.parse(s);
+  return Number.isFinite(t) && t <= now.getTime() + FUTURE_SLACK_MS ? t : null;
+}
+
 /** Whole calendar months (UTC) from `from` to `to`; 0 when `from` is in the future. */
 function monthsBetween(from: Date, to: Date): number {
   let months = (to.getUTCFullYear() - from.getUTCFullYear()) * 12 + (to.getUTCMonth() - from.getUTCMonth());
@@ -56,11 +69,11 @@ export function checkQualityBar(s: ToolStats, bar: QualityBar, now: Date): Quali
   if (s.lastReleaseAt === null) {
     reasons.push('No releases published.');
   } else {
-    const at = new Date(s.lastReleaseAt);
-    if (Number.isNaN(at.getTime())) {
+    const at = pastTime(s.lastReleaseAt, now);
+    if (at === null) {
       reasons.push("Couldn't read the date of the last release.");
     } else {
-      const months = monthsBetween(at, now);
+      const months = monthsBetween(new Date(at), now);
       if (months >= bar.maxMonthsSinceRelease) reasons.push(`No release in ${months} months.`);
     }
   }
@@ -69,7 +82,10 @@ export function checkQualityBar(s: ToolStats, bar: QualityBar, now: Date): Quali
   if (s.scorecard !== null && !(s.scorecard >= bar.minScorecard)) {
     reasons.push(`OpenSSF security score ${show(s.scorecard)}/10 is below ${show(bar.minScorecard)}.`);
   }
-  const strongScore = s.scorecard !== null && s.scorecard >= bar.strongScorecard;
+  // A strong score makes up for few stars only when the Scorecard result is recent (and its date is readable).
+  const scoredAt = pastTime(s.scorecardAt, now);
+  const fresh = scoredAt !== null && now.getTime() - scoredAt <= bar.scorecardMaxAgeDays * DAY_MS;
+  const strongScore = s.scorecard !== null && s.scorecard >= bar.strongScorecard && fresh;
   if (!(s.stars >= bar.minStars) && !strongScore) reasons.push(`Few users (${show(s.stars)} stars) and no strong security score.`);
 
   if (s.license === null || s.license.trim() === '' || s.license === 'NOASSERTION') reasons.push("No licence: can't be used safely.");
