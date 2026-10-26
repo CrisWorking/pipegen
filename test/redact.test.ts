@@ -631,8 +631,9 @@ describe('redact: speed', () => {
   // - per line: the same 256 KB built from 4 KB lines vs 512-byte lines must take under 3 times as long (code
   //   linear in the line length costs about the same per MB; quadratic costs about 8 times more);
   // - total size: 1 MB vs 256 KB (4 KB lines) must take under 6 times as long (linear is about 4).
-  // Plus a ceiling of 1000 ms/MB. Each 256 KB timing is the median of 3 after one warm-up per shape; times
-  // under 3 ms count as 3 ms, so timer noise on very fast shapes cannot fail a ratio.
+  // Plus a ceiling of 1000 ms/MB. Each 256 KB timing is the median of 3 after one warm-up per shape (a ratio that
+  // looks slow is timed again as the fastest of 3); times under 3 ms count as 3 ms, so timer noise on very fast
+  // shapes cannot fail a ratio.
   it('redact: worst-case lines stay fast (linear in line length and in text size)', () => {
     const unit = (u: string) => (L: number) => u.repeat(Math.max(1, Math.floor(L / u.length)));
     const lineShapes: [string, (L: number) => string][] = [
@@ -701,8 +702,13 @@ describe('redact: speed', () => {
       const long = fromLines(make, 4000, KB256);
       const short = fromLines(make, 512, KB256);
       redact(long); // warm-up
-      const tLong = median(long);
-      const tShort = median(short);
+      let tLong = median(long);
+      let tShort = median(short);
+      // Like the size check: a slow-looking ratio is timed again, both texts as the fastest of 3 runs.
+      if (tLong / floor(tShort) >= 3) {
+        tLong = fastest(long);
+        tShort = fastest(short);
+      }
       if (tLong / floor(tShort) >= 3) failures.push(`${name}: 4 KB lines / 512 B lines = ${(tLong / floor(tShort)).toFixed(2)} (${tLong.toFixed(1)} ms vs ${tShort.toFixed(1)} ms per 256 KB)`);
       checkSize(name, long, tLong, fromLines(make, 4000, MB));
     }

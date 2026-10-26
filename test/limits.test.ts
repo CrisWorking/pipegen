@@ -38,6 +38,7 @@ describe('limits', () => {
     writeFileSync(join(dir, 'a.bin'), Buffer.from([0x41, 0x00, 0x42]));
     expect(isBinary(Buffer.from([0x41, 0x00]))).toBe(true);
     expect(isBinary(Buffer.from('plain text'))).toBe(false);
+    expect(await readTextLimitedWithReason(join(dir, 'a.bin'))).toEqual({ skipped: 'binary' });
     expect(await readTextLimited(join(dir, 'a.bin'))).toBeNull();
   });
 

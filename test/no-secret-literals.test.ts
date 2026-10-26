@@ -1,6 +1,6 @@
 import { execFileSync } from 'node:child_process';
-import { readFileSync } from 'node:fs';
-import { join, resolve } from 'node:path';
+import { readdirSync, readFileSync } from 'node:fs';
+import { join, relative, resolve } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { findSecretLike, redact } from '../src/ai/redact.js';
 import { isBinary } from '../src/read/limits.js';
@@ -8,13 +8,38 @@ import { fake } from './helpers/secret-repo.js';
 
 const root = resolve(import.meta.dirname, '..');
 
-/** Committed files plus new files not yet committed (not ignored), so the check also covers the working tree. */
+/** Every regular file under `dir` (repo-relative, forward slashes), for when git is not available (a tarball, no git). */
+function walkFiles(dir: string): string[] {
+  return readdirSync(join(root, dir), { recursive: true, withFileTypes: true })
+    .filter((e) => e.isFile())
+    .map((e) => relative(root, join(e.parentPath, e.name)).split('\\').join('/'))
+    .sort();
+}
+
+/** Committed files plus new files not yet committed (not ignored), so the check also covers the working tree. Without git, a walk. */
 function repoFiles(dir: string): string[] {
-  const out = execFileSync('git', ['ls-files', '--cached', '--others', '--exclude-standard', '-z', '--', dir], { cwd: root, encoding: 'utf8' });
-  return out.split('\0').filter(Boolean);
+  try {
+    const out = execFileSync('git', ['ls-files', '--cached', '--others', '--exclude-standard', '-z', '--', dir], { cwd: root, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] });
+    return out.split('\0').filter(Boolean);
+  } catch {
+    return walkFiles(dir);
+  }
 }
 
 describe('fixtures', () => {
+  it('fixtures: without git (not installed, or no .git) the file list falls back to a walk of the folder', () => {
+    const path = process.env.PATH;
+    process.env.PATH = ''; // git cannot be found
+    let files: string[];
+    try {
+      files = ['test', 'src', 'data'].flatMap(repoFiles);
+    } finally {
+      process.env.PATH = path;
+    }
+    expect(files).toEqual(expect.arrayContaining(['test/helpers/secret-repo.ts', 'src/ai/redact.ts', 'data/gitleaks-bundle.toml']));
+    for (const dir of ['test', 'src', 'data']) expect(walkFiles(dir)).toEqual(expect.arrayContaining(repoFiles(dir)));
+  });
+
   it('fixtures: secret-like strings built at runtime; no redact pattern matches any committed file under test/', () => {
     // the runtime-built values really look like secrets, and each one is fully redacted
     for (const v of [fake.githubClassic(), fake.githubPat(), fake.stripeKey(), fake.openaiKey(), fake.awsKey(), fake.slackBot(), fake.jwt(), fake.slackWebhook(), fake.googleKey(), fake.npmPublish()]) {
