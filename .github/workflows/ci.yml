@@ -25,6 +25,10 @@ jobs:
           node-version: 24
       - run: npm ci
       - run: npm test
+      - name: Live test against the real pinned gitleaks (downloads the pinned release from github.com)
+        run: npx vitest run test/gitleaks-live.test.ts
+        env:
+          PIPEGEN_LIVE_TESTS: '1'
       - run: npx tsc --noEmit
 
   no-runtime-deps:

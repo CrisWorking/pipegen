@@ -3,6 +3,7 @@
 import { makeProvider } from '../../src/ai/provider.js';
 import { bundleCode } from '../../src/ai/redact.js';
 import { floorNeeds, jobCounts, needsSchema } from '../../src/engine/needs.js';
+import { loadPinnedBinaries } from '../../src/engine/linters.js';
 import { checkQualityBar, loadQualityBar } from '../../src/engine/quality-bar.js';
 import { readProject } from '../../src/read/project.js';
 import type { Capabilities, RepoProfile } from '../../src/types.js';
@@ -38,4 +39,6 @@ console.log(JSON.stringify({
   needsSchemaKeys: Object.keys((needsSchema(full).jsonSchema as { properties: object }).properties),
   qualityBar,
   qualityReasons: verdict.reasons.length,
+  // data/pinned-binaries.yml, read and validated by the bundled loader
+  pinnedBinaries: loadPinnedBinaries(),
 }));

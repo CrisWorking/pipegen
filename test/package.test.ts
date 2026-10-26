@@ -5,6 +5,7 @@ import { join, resolve } from 'node:path';
 import { build } from 'tsup';
 import { afterEach, describe, expect, it } from 'vitest';
 import { tsupOptions } from '../tsup.config.js';
+import { loadPinnedBinaries } from '../src/engine/linters.js';
 import { loadQualityBar } from '../src/engine/quality-bar.js';
 import { cleanupRepos, makeRepo, makeTempDir, writeIn } from './helpers/make-repo.js';
 
@@ -14,7 +15,7 @@ const pkg = JSON.parse(readFileSync(resolve(root, 'package.json'), 'utf8'));
 afterEach(cleanupRepos);
 
 /** The data files the bundled probe loads at runtime. */
-const DATA_FILES = ['quality-bar.yml'];
+const DATA_FILES = ['quality-bar.yml', 'pinned-binaries.yml'];
 
 /** Names passed to esbuild's __require shim (the CommonJS libraries' own require calls). Each must be a Node built-in. */
 const shimRequires = (code: string) => [...code.matchAll(/__require\d*\(\s*["']([^"']+)/g)].map((m) => m[1] as string);
@@ -66,12 +67,13 @@ describe('build', () => {
       const err = e as { status?: number; stderr?: string };
       throw new Error(`probe exited with ${err.status}: ${String(err.stderr).split('\n').slice(0, 8).join('\n')}`);
     }
-    const result = JSON.parse(stdout.trim()) as { owner: string; repo: string; services: string[]; files: number; bytes: number; gitleaksChecked: boolean; providers: string[]; pushJobs: number; needsSchemaKeys: string[]; qualityBar: unknown; qualityReasons: number };
+    const result = JSON.parse(stdout.trim()) as { owner: string; repo: string; services: string[]; files: number; bytes: number; gitleaksChecked: boolean; providers: string[]; pushJobs: number; needsSchemaKeys: string[]; qualityBar: unknown; qualityReasons: number; pinnedBinaries: unknown };
     expect(result).toMatchObject({ owner: 'o', repo: 'r', services: ['.'], gitleaksChecked: false, providers: ['claude', 'openai', 'ollama'] });
     expect(result.pushJobs).toBe(6); // hooks-ci, secrets + sast, deps, unit-tests, lint for the one service
     expect(result.needsSchemaKeys).toEqual(['add', 'skipLayers', 'requireDeployApproval']);
     expect(result.qualityBar).toEqual(loadQualityBar()); // read from <pkg>/data/quality-bar.yml by the bundled loader
     expect(result.qualityReasons).toBe(3); // few stars, no releases, advisories unknown
+    expect(result.pinnedBinaries).toEqual(loadPinnedBinaries()); // read from <pkg>/data/pinned-binaries.yml by the bundled loader
     expect(code).toContain('server-side-fallback-2026-07-01'); // the Anthropic SDK client really is in the bundle
     expect(result.files).toBeGreaterThan(0);
     expect(result.bytes).toBeGreaterThan(0);

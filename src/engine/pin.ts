@@ -381,7 +381,7 @@ export async function resolvePin(c: Candidate, deps: PinDeps, install?: InstallS
     const tokens = tokenSchema.safeParse(await getJson(`a pull token for ${image.display}`, tokenUrl, MAX_JSON_BYTES));
     const token = tokens.success ? (tokens.data.token ?? tokens.data.access_token) : undefined;
     if (token === undefined || !REGISTRY_TOKEN_RE.test(token)) throw new PinError(`The registry gave no usable anonymous pull token for ${image.display}.`);
-    const res = await fetchAllowed(`${reg.api}${image.path.split('/').map(encodeURIComponent).join('/')}/manifests/${encodeURIComponent(tag)}`, {
+    const res = await fetchAllowed(deps.fetch, `${reg.api}${image.path.split('/').map(encodeURIComponent).join('/')}/manifests/${encodeURIComponent(tag)}`, {
       method: 'HEAD', timeoutMs: REQUEST_TIMEOUT_MS, hosts: [new URL(reg.api).hostname], notFound: 'null',
       // the registry's own anonymous token, sent only to that registry; never the user's credential
       headers: { accept: INDEX_TYPES.join(', '), authorization: `Bearer ${token}` },
@@ -474,42 +474,9 @@ export async function resolvePin(c: Candidate, deps: PinDeps, install?: InstallS
     };
   }
 
-  /** A fetch with no credential, following redirects by hand to the allowed https hosts only. */
-  async function fetchAllowed(url: string, opts: FetchOptions & { notFound: 'null' }): Promise<Response | null>;
-  async function fetchAllowed(url: string, opts: FetchOptions): Promise<Response>;
-  async function fetchAllowed(url: string, opts: FetchOptions & { notFound?: 'null' }): Promise<Response | null> {
-    let current = new URL(url);
-    for (let hop = 0; ; hop++) {
-      if (current.protocol !== 'https:' || !opts.hosts.includes(current.hostname) || current.port !== '' || current.username !== '' || current.password !== '') {
-        throw new PinError(`pipegen won't fetch from ${current.protocol}//${current.host}: not an allowed https host.`);
-      }
-      let res: Response;
-      try {
-        res = await deps.fetch(current.href, {
-          method: opts.method, redirect: 'manual', headers: { accept: 'application/json', ...opts.headers }, signal: AbortSignal.timeout(opts.timeoutMs),
-        });
-      } catch (e) {
-        throw new PinError(`Couldn't reach ${current.host}.`, { cause: e });
-      }
-      if ([301, 302, 303, 307, 308].includes(res.status)) {
-        const location = res.headers.get('location');
-        await res.body?.cancel().catch(() => {});
-        if (location === null || hop >= MAX_REDIRECTS) throw new PinError(`${current.host} redirected too often or nowhere.`);
-        current = new URL(location, current);
-        continue;
-      }
-      if (!res.ok) {
-        await res.body?.cancel().catch(() => {});
-        if (res.status === 404 && opts.notFound === 'null') return null;
-        throw new PinError(`${current.host} answered HTTP ${res.status} for ${current.pathname}.`);
-      }
-      return res;
-    }
-  }
-
   /** A JSON document from the URL's own host (redirects only within that host), size-bounded. */
   async function getJson(what: string, url: string, maxBytes: number): Promise<unknown> {
-    const res = await fetchAllowed(url, { method: 'GET', timeoutMs: REQUEST_TIMEOUT_MS, hosts: [new URL(url).hostname] });
+    const res = await fetchAllowed(deps.fetch, url, { method: 'GET', timeoutMs: REQUEST_TIMEOUT_MS, hosts: [new URL(url).hostname] });
     const chunks: Uint8Array[] = [];
     await readBody(res, maxBytes, (b) => chunks.push(b), what);
     try {
@@ -519,13 +486,56 @@ export async function resolvePin(c: Candidate, deps: PinDeps, install?: InstallS
     }
   }
 
-  /** A release download from GitHub's hosts, size-bounded; with `onChunk` the bytes are streamed to it instead. */
-  async function download(url: string, maxBytes: number, onChunk?: (b: Uint8Array) => void): Promise<Uint8Array> {
-    const res = await fetchAllowed(url, { method: 'GET', timeoutMs: DOWNLOAD_TIMEOUT_MS, hosts: DOWNLOAD_HOSTS, headers: { accept: 'application/octet-stream' } });
-    const chunks: Uint8Array[] = [];
-    await readBody(res, maxBytes, onChunk ?? ((b) => chunks.push(b)), decodeURIComponent(new URL(url).pathname.split('/').pop() ?? 'the download'));
-    return Buffer.concat(chunks);
+  function download(url: string, maxBytes: number, onChunk?: (b: Uint8Array) => void): Promise<Uint8Array> {
+    return downloadRelease(deps.fetch, url, maxBytes, onChunk);
   }
+}
+
+/**
+ * A fetch with no credential (the caller's headers only), following redirects by hand to the allowed https hosts
+ * only (used by pinning and by downloadRelease).
+ */
+async function fetchAllowed(fetchFn: typeof fetch, url: string, opts: FetchOptions & { notFound: 'null' }): Promise<Response | null>;
+async function fetchAllowed(fetchFn: typeof fetch, url: string, opts: FetchOptions): Promise<Response>;
+async function fetchAllowed(fetchFn: typeof fetch, url: string, opts: FetchOptions & { notFound?: 'null' }): Promise<Response | null> {
+  let current = new URL(url);
+  for (let hop = 0; ; hop++) {
+    if (current.protocol !== 'https:' || !opts.hosts.includes(current.hostname) || current.port !== '' || current.username !== '' || current.password !== '') {
+      throw new PinError(`pipegen won't fetch from ${current.protocol}//${current.host}: not an allowed https host.`);
+    }
+    let res: Response;
+    try {
+      res = await fetchFn(current.href, {
+        method: opts.method, redirect: 'manual', headers: { accept: 'application/json', ...opts.headers }, signal: AbortSignal.timeout(opts.timeoutMs),
+      });
+    } catch (e) {
+      throw new PinError(`Couldn't reach ${current.host}.`, { cause: e });
+    }
+    if ([301, 302, 303, 307, 308].includes(res.status)) {
+      const location = res.headers.get('location');
+      await res.body?.cancel().catch(() => {});
+      if (location === null || hop >= MAX_REDIRECTS) throw new PinError(`${current.host} redirected too often or nowhere.`);
+      current = new URL(location, current);
+      continue;
+    }
+    if (!res.ok) {
+      await res.body?.cancel().catch(() => {});
+      if (res.status === 404 && opts.notFound === 'null') return null;
+      throw new PinError(`${current.host} answered HTTP ${res.status} for ${current.pathname}.`);
+    }
+    return res;
+  }
+}
+
+/**
+ * A GitHub release download (github.com and its release-asset hosts, https, no credential), size-bounded; with
+ * `onChunk` the bytes are streamed to it instead of returned. Shared by pinning and ensurePinnedBinary (Task 7).
+ */
+export async function downloadRelease(fetchFn: typeof fetch, url: string, maxBytes: number, onChunk?: (b: Uint8Array) => void): Promise<Uint8Array> {
+  const res = await fetchAllowed(fetchFn, url, { method: 'GET', timeoutMs: DOWNLOAD_TIMEOUT_MS, hosts: DOWNLOAD_HOSTS, headers: { accept: 'application/octet-stream' } });
+  const chunks: Uint8Array[] = [];
+  await readBody(res, maxBytes, onChunk ?? ((b) => chunks.push(b)), decodeURIComponent(new URL(url).pathname.split('/').pop() ?? 'the download'));
+  return Buffer.concat(chunks);
 }
 
 /** Reads a body up to `maxBytes`; anything larger is refused (the declared length and the bytes actually sent). */
