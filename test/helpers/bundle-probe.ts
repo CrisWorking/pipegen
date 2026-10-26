@@ -4,6 +4,7 @@ import { makeProvider } from '../../src/ai/provider.js';
 import { bundleCode } from '../../src/ai/redact.js';
 import { floorNeeds, jobCounts, needsSchema } from '../../src/engine/needs.js';
 import { loadPinnedBinaries } from '../../src/engine/linters.js';
+import { loadBundledMemory } from '../../src/engine/memory.js';
 import { checkQualityBar, loadQualityBar } from '../../src/engine/quality-bar.js';
 import { readProject } from '../../src/read/project.js';
 import type { Capabilities, RepoProfile } from '../../src/types.js';
@@ -41,4 +42,6 @@ console.log(JSON.stringify({
   qualityReasons: verdict.reasons.length,
   // data/pinned-binaries.yml, read and validated by the bundled loader
   pinnedBinaries: loadPinnedBinaries(),
+  // data/memory.json, read and validated by the bundled loader
+  bundledMemory: await loadBundledMemory(),
 }));

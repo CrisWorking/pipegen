@@ -20,7 +20,7 @@
 //   file by a test, not at run time.
 import { createHash, randomBytes } from 'node:crypto';
 import { constants, readFileSync } from 'node:fs';
-import { lstat, mkdir, open, readdir, realpath, rename, rm, unlink } from 'node:fs/promises';
+import { lstat, open, readdir, rename, rm, unlink } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { dirname, isAbsolute, join } from 'node:path';
 import { gunzipSync } from 'node:zlib';
@@ -29,6 +29,7 @@ import { z } from 'zod';
 import type { ReviewedTool } from '../types.js';
 import { packageDataPath } from '../util/package-data.js';
 import { safeText } from '../util/safe-text.js';
+import { prepareTrustedDir, type TrustedDirKind } from '../util/trusted-dir.js';
 import { TarError, readTarMember } from '../util/tar.js';
 import { downloadRelease } from './pin.js';
 import { isGitHubRepo } from './names.js';
@@ -142,6 +143,11 @@ export interface PinnedBinaryDeps {
 /** A temp file left in a tool dir longer than this is from a run that died; it is removed. */
 const STALE_TMP_MS = 3_600_000;
 const TMP_RE = /^\.[a-z]+-[0-9a-f]{16}\.tmp$/;
+
+const CACHE_KIND: TrustedDirKind = {
+  noun: 'tool cache', keeping: 'tools', risk: 'swap the tool pipegen runs',
+  error: (message, cause) => new PinnedBinaryError(message, cause === undefined ? undefined : { cause }),
+};
 
 const sha256 = (b: Uint8Array) => createHash('sha256').update(b).digest('hex');
 const errCode = (e: unknown) => (e as { code?: unknown } | null)?.code;
@@ -328,69 +334,10 @@ async function removeStaleTemps(toolDir: string, uid: number, now: number): Prom
  * between its check and its use.
  */
 async function prepareCache(name: string, version: string, cacheDir: string | undefined, deps: PinnedBinaryDeps, uid: number): Promise<string> {
-  // the root, on its real path, and everything above it
-  let root: string;
-  const own: string[] = [];
-  if (cacheDir !== undefined) {
-    await mkdirOwn(cacheDir, true);
-    root = await realDir(cacheDir);
-  } else {
-    const xdg = (deps.env ?? process.env).XDG_CACHE_HOME;
-    const base = xdg !== undefined && isAbsolute(xdg) ? xdg : join(deps.home ?? homedir(), '.cache');
-    await mkdirOwn(base, true);
-    root = await realDir(base);
-    own.push('pipegen', 'tools');
-  }
-  for (let dir = root; ; dir = dirname(dir)) {
-    await checkDir(dir, uid, cacheDir !== undefined && dir === root);
-    if (dirname(dir) === dir) break;
-  }
-  // pipegen's own levels: each created 0700 and checked before anything is created inside it
-  let dir = root;
-  for (const part of [...own, `${name}-${version}`]) {
-    dir = join(dir, part);
-    await mkdirOwn(dir, false);
-    await checkDir(dir, uid, true);
-  }
-  return dir;
-}
-
-/** Creates a directory 0700 when it is missing (with its parents when `parents`). An existing one is checked later. */
-async function mkdirOwn(dir: string, parents: boolean): Promise<void> {
-  try {
-    await mkdir(dir, { mode: 0o700, recursive: parents });
-  } catch (e) {
-    if (errCode(e) !== 'EEXIST') throw new PinnedBinaryError(`Couldn't create pipegen's tool cache directory ${dir}.`, { cause: e });
-  }
-}
-
-async function realDir(dir: string): Promise<string> {
-  try {
-    return await realpath(dir);
-  } catch (e) {
-    throw new PinnedBinaryError(`Couldn't resolve pipegen's tool cache directory ${dir}.`, { cause: e });
-  }
-}
-
-/** One directory on the path to the tool: see prepareCache. */
-async function checkDir(dir: string, uid: number, pipegenOwned: boolean): Promise<void> {
-  const refuse = (why: string, fix = ''): never => {
-    throw new PinnedBinaryError(`pipegen won't keep tools under ${dir}: ${why}.${fix === '' ? '' : ` Fix it with: ${fix}`}`);
-  };
-  let info;
-  try {
-    info = await lstat(dir);
-  } catch (e) {
-    throw new PinnedBinaryError(`Couldn't check pipegen's tool cache directory ${dir}.`, { cause: e });
-  }
-  if (info.isSymbolicLink()) refuse('it is a symbolic link where pipegen keeps its own folder', `rm '${dir}'`);
-  if (!info.isDirectory()) refuse('it is not a directory');
-  const rootOwned = info.uid === 0;
-  if (info.uid !== uid && (pipegenOwned || !rootOwned)) refuse('it is not owned by you' + (pipegenOwned ? '' : ' (or root)'));
-  const sticky = (info.mode & 0o1000) !== 0;
-  if ((info.mode & 0o022) !== 0 && !(rootOwned && sticky && !pipegenOwned)) {
-    refuse('other users can write to it, so they could swap the tool pipegen runs', `chmod g-w,o-w '${dir}'`);
-  }
+  if (cacheDir !== undefined) return prepareTrustedDir(cacheDir, [`${name}-${version}`], true, uid, CACHE_KIND);
+  const xdg = (deps.env ?? process.env).XDG_CACHE_HOME;
+  const base = xdg !== undefined && isAbsolute(xdg) ? xdg : join(deps.home ?? homedir(), '.cache');
+  return prepareTrustedDir(base, ['pipegen', 'tools', `${name}-${version}`], false, uid, CACHE_KIND);
 }
 
 /**
