@@ -266,8 +266,10 @@ async function verifyCached(path: string, asset: PinnedAsset, what: string, uid:
   } catch (e) {
     if (errCode(e) === 'ENOENT') return 'missing';
     if (errCode(e) === 'ELOOP') {
-      await unlink(path).catch(() => {});
-      return refuse('is a symbolic link, not the verified file', true);
+      // unlink only if the path is still a symlink (not a good copy another run renamed into place meanwhile)
+      const still = await lstat(path).catch(() => null);
+      const removed = still !== null && still.isSymbolicLink() && (await unlink(path).then(() => true, () => false));
+      return refuse('is a symbolic link, not the verified file', removed);
     }
     return refuse(`could not be opened safely (${safeText(String(errCode(e) ?? 'error'), 20)})`, false);
   }
@@ -297,8 +299,8 @@ async function verifyCached(path: string, asset: PinnedAsset, what: string, uid:
   if (mismatch === null) return 'ok';
   // delete only the file that was checked (not a good copy another run renamed into place meanwhile)
   const now = await lstat(path).catch(() => null);
-  if (now !== null && now.dev === mismatch.dev && now.ino === mismatch.ino) await unlink(path).catch(() => {});
-  return refuse('changed since pipegen verified it (its checksum no longer matches)', true);
+  const removed = now !== null && now.dev === mismatch.dev && now.ino === mismatch.ino && (await unlink(path).then(() => true, () => false));
+  return refuse('changed since pipegen verified it (its checksum no longer matches)', removed);
 }
 
 /** Removes temp files (pipegen's own name pattern, regular files of this user) left over an hour by a run that died. */
