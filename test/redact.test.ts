@@ -626,38 +626,48 @@ describe('fix round 1', () => {
 });
 
 describe('redact: speed', () => {
-  it('redact: worst-case lines stay fast (no quadratic backtracking)', () => {
-    const line = (u: string) => u.repeat(Math.floor(4000 / u.length));
-    const shapes = [
+  // Hostile shapes, each built for a given line length L (at most 4000, so every line is scanned). Two checks
+  // catch quadratic behaviour without benchmarking the machine:
+  // - per line: the same 256 KB built from 4 KB lines vs 512-byte lines must take under 3 times as long (code
+  //   linear in the line length costs about the same per MB; quadratic costs about 8 times more);
+  // - total size: 1 MB vs 256 KB (4 KB lines) must take under 6 times as long (linear is about 4).
+  // Plus a ceiling of 1000 ms/MB. Each 256 KB timing is the median of 3 after one warm-up per shape; times
+  // under 3 ms count as 3 ms, so timer noise on very fast shapes cannot fail a ratio.
+  it('redact: worst-case lines stay fast (linear in line length and in text size)', () => {
+    const unit = (u: string) => (L: number) => u.repeat(Math.max(1, Math.floor(L / u.length)));
+    const lineShapes: [string, (L: number) => string][] = [
       'tok' + 'en', 'ey' + 'J', 'ey' + 'J.', 'ey' + 'Ja.', 'a://', 'a://:', 'a://a:@/', 'a:/' + '/a:b', '@', 'sk-', 'x="', 'au' + 'th.',
       'a.tok' + 'en-', 'tok' + 'en:', 'tok' + 'en="', '"pass' + 'word":"', 'tok' + 'en="\\"', '--tok' + 'en ', '<pass' + 'word>', 'au' + 'thau' + 'th',
       '<a key="tok' + 'en" ', 'key="tok' + 'en" value="x" ', '<pass' + 'word ', '--pass' + 'word = ', 'pass' + 'word: &a !b ', 'x@y:/' + '/', 'smtp:/' + '/me@g:p#', '%', '\r', 'pass' + 'word:\r',
-    ].map((u) => (line(u) + '\n').repeat(250));
-    shapes.push(('a:/' + '/b:' + 'c'.repeat(3990) + '\n').repeat(250));
-    shapes.push(('ey' + 'J' + 'a'.repeat(1990) + '.' + 'b'.repeat(1990) + '\n').repeat(250));
-    shapes.push((('a'.repeat(30) + 'tok' + 'en ').repeat(110) + '\n').repeat(250));
-    shapes.push(('pass' + 'word: |\n' + '  x\n'.repeat(250_000)));
-    const firstNew = shapes.length; // the shapes from here on also get the 4 MB / 1 MB linearity check
-    // round 4: namespaced and closed elements, attribute runs, many tags or keys before one '>', trailing CRs
-    shapes.push(...[
+      // round 4: namespaced and closed elements, attribute runs
       '<a:pass' + 'word ', '<a:pass' + 'word>', '</pass' + 'word>', '<pass' + 'word>x</pass' + 'word>', '<a key="a:b/c d tok' + 'en" ',
       'a b:c/d tok' + 'en ', ' tok' + 'en', '<a:b:tok' + 'en ', '<x:tok' + 'en value="', '<add key="Smtp:Pass' + 'word" value="x"/>',
-    ].map((u) => (line(u) + '\n').repeat(250)));
-    shapes.push((('<a key="tok' + 'en" value="').repeat(160) + '>\n').repeat(250));
-    shapes.push((("<a key='tok" + "en' value=\"").repeat(160) + '>\n').repeat(250));
-    shapes.push((('<tok' + 'en>').repeat(570) + '</tok' + 'en>\n').repeat(250));
-    shapes.push(('<a key=' + ' '.repeat(2000) + '"' + (' tok' + 'en').repeat(330) + '\n').repeat(250));
-    shapes.push(('pass' + 'word: |' + '\r'.repeat(3990) + '\n').repeat(250));
-    // round 5: unclosed secret elements, JSON blocks, a secret section, many section headers
-    shapes.push(...['<tok' + 'en>a', '<tok' + 'en>', '"tok' + 'en": {', '[sec' + 'rets]'].map((u) => (line(u) + '\n').repeat(250)));
-    shapes.push('[sec' + 'rets]\n' + 'a = b\n'.repeat(160_000));
-    shapes.push(('[sec' + 'rets]\nkey: x\n').repeat(60_000));
-    // Median of 3 runs after a warm-up. The per-shape bound is loose (it only has to catch a pathological
-    // slowdown on any machine); the linearity check catches quadratic behaviour: 4 times the text must take
-    // under 6 times as long (linear is about 4, quadratic about 16). Times under 5 ms count as 5 ms, so timer
-    // noise on very fast shapes cannot fail it.
-    const median = (text: string, warm = true) => {
-      if (warm) redact(text); // warm-up (the 4 MB text is warmed by the 1 MB runs before it)
+      // round 5: unclosed secret elements, JSON blocks, section headers
+      '<tok' + 'en>a', '<tok' + 'en>', '"tok' + 'en": {', '[sec' + 'rets]', 'a'.repeat(30) + 'tok' + 'en ',
+    ].map((u): [string, (L: number) => string] => [u, unit(u)]);
+    lineShapes.push(
+      ['url with a long password', (L) => 'a:/' + '/b:' + 'c'.repeat(L - 6)],
+      ['jwt with long segments', (L) => 'ey' + 'J' + 'a'.repeat((L >> 1) - 3) + '.' + 'b'.repeat((L >> 1) - 1)],
+      ['many keys before one >', (L) => unit('<a key="tok' + 'en" value="')(L - 1) + '>'],
+      ['mixed quotes before one >', (L) => unit("<a key='tok" + "en' value=\"")(L - 1) + '>'],
+      ['many token tags then one closer', (L) => unit('<tok' + 'en>')(L - 8) + '</tok' + 'en>'],
+      ['blanks before a quote, then keywords', (L) => '<a key=' + ' '.repeat(L >> 1) + '"' + unit(' tok' + 'en')((L >> 1) - 8)],
+      ['block header then CRs', (L) => 'pass' + 'word: |' + '\r'.repeat(L - 11)],
+    );
+    const KB256 = 256 * 1024;
+    const MB = 1024 * 1024;
+    const fromLines = (make: (L: number) => string, L: number, bytes: number) => {
+      const l = make(L) + '\n';
+      return l.repeat(Math.max(1, Math.round(bytes / l.length)));
+    };
+    // shapes whose cost does not depend on the line length: only the total-size check and the ceiling
+    const textShapes: [string, (bytes: number) => string][] = [
+      ['indented block', (b) => 'pass' + 'word: |\n' + '  x\n'.repeat(Math.round(b / 4))],
+      ['secret section', (b) => '[sec' + 'rets]\n' + 'a = b\n'.repeat(Math.round(b / 6))],
+      ['alternating section headers', (b) => ('[sec' + 'rets]\nkey: x\n').repeat(Math.round(b / 17))],
+    ];
+
+    const median = (text: string) => {
       const runs = [0, 1, 2].map(() => {
         const t = performance.now();
         redact(text);
@@ -665,12 +675,44 @@ describe('redact: speed', () => {
       }).sort((a, b) => a - b);
       return runs[1];
     };
-    shapes.forEach((text, i) => {
-      const t1 = median(text);
-      expect(t1 / (text.length / 1e6), text.slice(0, 12)).toBeLessThan(1000); // ms per MB, each shape about 1 MB
-      if (i >= firstNew) expect(median(text.repeat(4), false) / Math.max(t1, 5), `4 MB / 1 MB: ${text.slice(0, 12)}`).toBeLessThan(6);
-    });
-  }, 300_000);
+    const floor = (ms: number) => Math.max(ms, 3);
+    const failures: string[] = [];
+    const once = (text: string) => {
+      const t = performance.now();
+      redact(text);
+      return performance.now() - t;
+    };
+    // The 1 MB text is timed once (the 256 KB runs warmed it up). A slow-looking result is timed again, both
+    // sizes as the fastest of 3 runs (pauses only ever add time), so a stray pause cannot fail the check and
+    // the test stays quick; a real quadratic (about 16 times) still fails.
+    const fastest = (text: string) => Math.min(once(text), once(text), once(text));
+    const checkSize = (name: string, small: string, tSmall: number, big: string) => {
+      const looksSlow = (ms: number, base: number) => ms / floor(base) >= 6 || ms / (big.length / 1e6) >= 1000;
+      let tBig = once(big);
+      if (looksSlow(tBig, tSmall)) {
+        tSmall = fastest(small);
+        tBig = fastest(big);
+      }
+      const perMB = tBig / (big.length / 1e6);
+      if (tBig / floor(tSmall) >= 6) failures.push(`${name}: 1 MB / 256 KB = ${(tBig / floor(tSmall)).toFixed(2)} (${tBig.toFixed(1)} ms vs ${tSmall.toFixed(1)} ms)`);
+      if (perMB >= 1000) failures.push(`${name}: ${perMB.toFixed(0)} ms/MB`);
+    };
+    for (const [name, make] of lineShapes) {
+      const long = fromLines(make, 4000, KB256);
+      const short = fromLines(make, 512, KB256);
+      redact(long); // warm-up
+      const tLong = median(long);
+      const tShort = median(short);
+      if (tLong / floor(tShort) >= 3) failures.push(`${name}: 4 KB lines / 512 B lines = ${(tLong / floor(tShort)).toFixed(2)} (${tLong.toFixed(1)} ms vs ${tShort.toFixed(1)} ms per 256 KB)`);
+      checkSize(name, long, tLong, fromLines(make, 4000, MB));
+    }
+    for (const [name, make] of textShapes) {
+      const small = make(KB256);
+      redact(small); // warm-up
+      checkSize(name, small, median(small), make(MB));
+    }
+    expect(failures).toEqual([]);
+  }, 120_000);
 });
 
 describe('fix round 2', () => {
