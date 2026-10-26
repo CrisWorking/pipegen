@@ -86,10 +86,11 @@
 | T43 | **Terminal / Markdown injection** from repo-controlled names (ANSI/OSC escape codes, bidi, links) | Every repo- or AI-derived string goes through `safeText`/`safeMarkdown` | New terminal features (regular fixture updates) |
 | T44 | **Parser or regex denial of service** (YAML alias bombs, huge files, very long lines) | 1 MB file limit, 20k file limit, `maxAliasCount`, line-length limit for regexes, no child processes during the audit without `--ai`; with `--ai`, only the pinned, checksum-verified gitleaks binary | Slow but bounded runs on huge repos |
 | T45 | **Token leak** (sent to a wrong host, printed in errors or JSON) | Hard-coded `api.github.com`, never printed, tests on `--json`/`--out` | None known |
+| T46 | **AI key leak** (`ANTHROPIC_API_KEY` / `OPENAI_API_KEY` sent to a wrong host, or shown in errors) | Keys are read only from the environment pipegen is given, never from the repo. Claude uses a hard-coded `https://api.anthropic.com` (`ANTHROPIC_BASE_URL` and `ANTHROPIC_AUTH_TOKEN` are ignored), OpenAI a hard-coded `https://api.openai.com/v1/chat/completions`, and Ollama gets no key. Error messages are pipegen's own text, never a response body (OpenAI echoes part of a wrong key). Tests build keys at runtime and check every error | The Anthropic SDK also adds the headers listed in the user's own `ANTHROPIC_CUSTOM_HEADERS` variable to every Claude request, and it has no switch to turn that off. Those headers still go only to `api.anthropic.com`, and they come from the user's environment, not the repo |
 
 ### Which threats matter in which milestone
 
-- **v0.1 (audit):** T5, T11, T14, T24, T27, T39 (with `--ai`), T40–T45.
+- **v0.1 (audit):** T5, T11, T14, T24, T27, T39 (with `--ai`), T40–T46 (T46 with `--ai`).
 - **v0.2 (full run):** all of the above, plus T1–T4, T6–T10, T12, T13, T15–T23, T25, T26, T28–T38.
 - **v0.3:** adds the watcher- and Slack-specific parts of T3, T26, T33.
 

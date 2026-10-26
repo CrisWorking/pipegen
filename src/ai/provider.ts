@@ -8,10 +8,11 @@ import { ollamaProvider } from './ollama.js';
 import { openaiProvider } from './openai.js';
 
 export { AiError, type AiErrorKind } from './errors.js';
+export { fallbackEnabled } from './claude.js';
 
 export const MISSING_AI_MESSAGE = 'pipegen needs an AI to do the full job. Set ANTHROPIC_API_KEY, OPENAI_API_KEY, or run a local model with --ai ollama.';
 
-/** Plain-English line shown at consent when the provider is Claude (Task 8). */
+/** Plain-English line shown at consent when the provider is Claude and fallbackEnabled(provider.model) is true (Task 8). */
 export const REFUSAL_FALLBACK_NOTE = 'If Claude declines a request, Anthropic automatically runs it again on another Claude model of its choice (the refusal fallback). Your code still goes only to Anthropic.';
 
 export const OLLAMA_EXPERIMENTAL_NOTE = 'Ollama support is experimental: answers from local models may be weaker, and pipegen checks every one against its schema.';

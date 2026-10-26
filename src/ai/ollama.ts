@@ -40,7 +40,7 @@ export function ollamaProvider(opts: OllamaOptions = {}): AiProvider {
   const where = url.host; // shown in errors: host and port only, never userinfo or a path
   const model = opts.model ?? OLLAMA_DEFAULT_MODEL;
   const numCtx = opts.numCtx ?? OLLAMA_DEFAULT_CTX;
-  if (!Number.isInteger(numCtx) || numCtx < 1) throw new Error('--ollama-ctx must be a whole number above 0.');
+  if (!Number.isInteger(numCtx) || numCtx < 1) throw new AiError('invalid', '--ollama-ctx must be a whole number above 0.');
   const doFetch = opts.fetch ?? globalThis.fetch;
 
   return {
