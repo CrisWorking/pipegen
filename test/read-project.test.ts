@@ -142,16 +142,12 @@ describe('read', () => {
     expect((await readProject(repo('node-npm'))).services[0]?.frameworks).toEqual([]);
   });
 
-  it('later fields start as stubs (existingWorkflows [], precommit null, envVars [], dependsOn [], defaultBranch \'main\')', async () => {
+  it('later fields start as stubs (existingWorkflows [], precommit null, defaultBranch \'main\')', async () => {
     const p = await readProject(repo('node-pnpm-workspaces'));
     expect(p.existingWorkflows).toEqual([]);
     expect(p.precommit).toBeNull();
     expect(p.defaultBranch).toBe('main');
     expect(p.services.length).toBeGreaterThan(0);
-    for (const s of p.services) {
-      expect(s.envVars).toEqual([]);
-      expect(s.dependsOn).toEqual([]);
-    }
   });
 
   it('mixed folders → folders monorepo; library without start script or Dockerfile → root service', async () => {
