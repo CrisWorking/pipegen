@@ -1,6 +1,7 @@
 import * as childProcess from 'node:child_process';
-import { mkdirSync, writeFileSync } from 'node:fs';
+import { mkdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
+import fg from 'fast-glob';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { NotGitHubRepoError, readProject } from '../src/read/project.js';
 import { cleanupRepos, makeRepo, writeIn } from './helpers/make-repo.js';
@@ -21,7 +22,10 @@ vi.mock('execa', () => ({ execa: vi.fn(), execaSync: vi.fn(), execaCommand: vi.f
 const GH = 'https://github.com/o/r.git';
 const repo = (fixture: string) => makeRepo(fixture, GH);
 
-afterEach(cleanupRepos);
+afterEach(() => {
+  vi.restoreAllMocks();
+  cleanupRepos();
+});
 
 describe('read', () => {
   it('node-npm → 1 service, packageManager npm, runtimeVersion from .nvmrc', async () => {
@@ -197,8 +201,10 @@ describe('read', () => {
       for (let f = 0; f < 201; f++) writeFileSync(join(dir, `bulk${d}`, `f${f}.txt`), '');
     }
     const notes: string[] = [];
-    await readProject(dir, { notes });
-    expect(notes).toContain('Only the first 20,000 files were read.');
+    const p = await readProject(dir, { notes });
+    expect(notes).toContain('Only the first 20,000 files were read. Results may be incomplete.');
+    // root manifests are read by direct path, so the 20k cap cannot hide them
+    expect(p.services[0]).toMatchObject({ path: '.', packageManager: 'npm', runtimeVersion: '20' });
   });
 
   it('read limits: port regex ignores lines longer than 4 KB', async () => {
@@ -207,5 +213,91 @@ describe('read', () => {
     expect((await readProject(dir)).services[0]?.port).toBeUndefined();
     writeIn(dir, 'server.js', 'app.listen(process.env.PORT || 7777);\n');
     expect((await readProject(dir)).services[0]?.port).toBe(7777);
+  });
+
+  it('read: hostile workspace globs (\'../**\', \'/**\', \'C:/x\') are refused with a note and no out-of-repo service', async () => {
+    const outside = makeRepo('node-library'); // a sibling directory with a package.json that would match '../**'
+    const dir = repo('node-library');
+    writeIn(dir, 'package.json', JSON.stringify({ name: 'root', workspaces: ['../**', '/**', 'C:/x', '~/x', 'a/../../b', 'apps/*'] }));
+    writeIn(dir, 'apps/one/package.json', JSON.stringify({ name: 'one', scripts: { dev: 'x' } }));
+    const spy = vi.spyOn(fg, 'stream');
+    const notes: string[] = [];
+    const p = await readProject(dir, { notes });
+    expect(spy).toHaveBeenCalledTimes(1); // only the one capped listing; workspace globs match in memory
+    expect(p.services.map((s) => s.path)).toEqual(['apps/one']);
+    expect(notes.filter((n) => /workspace pattern/i.test(n))).toHaveLength(5);
+    expect(outside).not.toBe(dir);
+  });
+
+  it('read: at most 100 workspace patterns are used, with a note', async () => {
+    const dir = repo('node-library');
+    const patterns = Array.from({ length: 101 }, (_, i) => `apps/a${i}`);
+    writeIn(dir, 'package.json', JSON.stringify({ name: 'root', workspaces: patterns }));
+    writeIn(dir, 'apps/a0/package.json', JSON.stringify({ name: 'a0', scripts: { dev: 'x' } }));
+    writeIn(dir, 'apps/a100/package.json', JSON.stringify({ name: 'a100', scripts: { dev: 'x' } }));
+    const notes: string[] = [];
+    const p = await readProject(dir, { notes });
+    expect(p.services.map((s) => s.name)).toEqual(['a0']);
+    expect(notes.some((n) => /100 workspace patterns/.test(n))).toBe(true);
+  });
+
+  it('read: a 5 KB script value containing node --test does not set node:test', async () => {
+    const dir = repo('node-library');
+    writeIn(dir, 'package.json', JSON.stringify({ name: 'x', scripts: { test: `${'x'.repeat(5000)} node --test` } }));
+    expect((await readProject(dir)).services[0]?.testFramework).toBeUndefined();
+  });
+
+  it('read: .git that is a symlink, a file (worktree) or has a non-regular config is refused', async () => {
+    const link = makeRepo('node-npm', GH);
+    rmSync(join(link, '.git'), { recursive: true });
+    symlinkSync(join(link, 'package.json'), join(link, '.git'));
+    await expect(readProject(link)).rejects.toThrow(/symbolic link; refusing to follow it/);
+
+    const wt = makeRepo('node-npm', GH);
+    rmSync(join(wt, '.git'), { recursive: true });
+    writeIn(wt, '.git', 'gitdir: /elsewhere/.git/worktrees/x\n');
+    await expect(readProject(wt)).rejects.toThrow(/worktree or submodule; run pipegen from the main checkout/);
+
+    const cfg = makeRepo('node-npm', GH);
+    rmSync(join(cfg, '.git/config'));
+    symlinkSync(join(cfg, 'package.json'), join(cfg, '.git/config'));
+    await expect(readProject(cfg)).rejects.toBeInstanceOf(NotGitHubRepoError);
+  });
+
+  it('read: git config section and key names are case-insensitive, "origin" is not', async () => {
+    const ok = makeRepo('node-npm');
+    writeIn(ok, '.git/config', '[Core]\n\tbare = false\n[Remote "origin"]\n\tURL = git@github.com:octo/hello.git\n');
+    expect(await readProject(ok)).toMatchObject({ owner: 'octo', repo: 'hello' });
+    const upper = makeRepo('node-npm');
+    writeIn(upper, '.git/config', '[remote "Origin"]\n\turl = https://github.com/octo/hello.git\n');
+    await expect(readProject(upper)).rejects.toBeInstanceOf(NotGitHubRepoError);
+  });
+
+  it('read: owner and repo names are validated', async () => {
+    const bad = [
+      'https://github.com/-bad/repo.git', 'https://github.com/a_b/repo.git', `https://github.com/${'a'.repeat(40)}/repo`,
+      'https://github.com/o/..', 'https://github.com/o/.', 'https://github.com/o/..git', `https://github.com/o/${'r'.repeat(101)}`,
+    ];
+    for (const url of bad) await expect(readProject(makeRepo('node-npm', url)), url).rejects.toBeInstanceOf(NotGitHubRepoError);
+    expect(await readProject(makeRepo('node-npm', 'https://github.com/o-1/my.repo_x-y.git'))).toMatchObject({ owner: 'o-1', repo: 'my.repo_x-y' });
+  });
+
+  it('read: Dockerfiles under .devcontainer, test, fixtures, examples, docs are not services', async () => {
+    const dir = repo('node-npm');
+    writeIn(dir, 'Dockerfile', 'FROM node:20\n');
+    for (const d of ['.devcontainer', 'test/e2e', 'tests', '__tests__', 'fixtures/a', 'examples/demo', 'docs']) writeIn(dir, `${d}/Dockerfile`, 'FROM node:20\n');
+    const p = await readProject(dir);
+    expect(p.services.map((s) => s.path)).toEqual(['.']);
+    expect(p.monorepo).toBe('none');
+  });
+
+  it('read: skip notes give the real reason', async () => {
+    const dir = repo('node-npm');
+    writeFileSync(join(dir, 'package.json'), '{"name":"x"}' + ' '.repeat(1_000_001));
+    writeIn(dir, 'pyproject.toml', 'not [valid');
+    const notes: string[] = [];
+    await readProject(dir, { notes });
+    expect(notes).toContain('Skipped package.json: it is larger than 1 MB.');
+    expect(notes).toContain('Skipped pyproject.toml: it could not be parsed.');
   });
 });

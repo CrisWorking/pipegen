@@ -24,16 +24,26 @@ export function isBinary(buf: Buffer): boolean {
   return buf.subarray(0, 8192).includes(0);
 }
 
-/** Text of a regular file, or null when it is missing, a symlink, over 1 MB, or binary. */
-export async function readTextLimited(path: string): Promise<string | null> {
+export type Skipped = 'too-large' | 'binary' | 'link' | 'not-a-file' | 'unreadable';
+
+/** Like readTextLimited, but says why a file was skipped. */
+export async function readTextLimitedWithReason(path: string): Promise<{ text: string } | { skipped: Skipped }> {
   try {
     const info = await lstat(path);
-    if (!info.isFile() || info.size > READ_LIMITS.maxFileBytes) return null;
+    if (info.isSymbolicLink()) return { skipped: 'link' };
+    if (!info.isFile()) return { skipped: 'not-a-file' };
+    if (info.size > READ_LIMITS.maxFileBytes) return { skipped: 'too-large' };
     const buf = await readFile(path);
-    return isBinary(buf) ? null : buf.toString('utf8');
+    return isBinary(buf) ? { skipped: 'binary' } : { text: buf.toString('utf8') };
   } catch {
-    return null;
+    return { skipped: 'unreadable' };
   }
+}
+
+/** Text of a regular file, or null when it is missing, unreadable, a symlink, over 1 MB, or binary. */
+export async function readTextLimited(path: string): Promise<string | null> {
+  const result = await readTextLimitedWithReason(path);
+  return 'text' in result ? result.text : null;
 }
 
 /** YAML with at most 50 aliases (guards against alias-bomb files). Throws when the limit is exceeded. */
@@ -43,5 +53,10 @@ export function parseYamlLimited(text: string): unknown {
 
 /** Only the lines of 4 KB or less; regex rules run on these so a huge line cannot stall a pattern. */
 export function regexLines(text: string): string[] {
-  return text.split(/\r?\n/).filter((line) => Buffer.byteLength(line) <= READ_LIMITS.maxRegexLineBytes);
+  return text.split(/\r?\n/).filter(regexSafe);
+}
+
+/** True when a repo-derived string is short enough (4 KB) to run a regex on. */
+export function regexSafe(s: string): boolean {
+  return Buffer.byteLength(s) <= READ_LIMITS.maxRegexLineBytes;
 }

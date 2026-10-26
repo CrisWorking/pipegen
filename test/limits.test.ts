@@ -1,8 +1,8 @@
-import { mkdirSync, symlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, mkdirSync, symlinkSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import fg from 'fast-glob';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { READ_LIMITS, isBinary, listFiles, parseYamlLimited, readTextLimited, regexLines } from '../src/read/limits.js';
+import { READ_LIMITS, isBinary, listFiles, parseYamlLimited, readTextLimited, readTextLimitedWithReason, regexLines, regexSafe } from '../src/read/limits.js';
 import { cleanupRepos, makeTempDir } from './helpers/make-repo.js';
 
 afterEach(() => {
@@ -67,5 +67,45 @@ describe('limits', () => {
     const long = 'x'.repeat(READ_LIMITS.maxRegexLineBytes + 1);
     const exact = 'y'.repeat(READ_LIMITS.maxRegexLineBytes);
     expect(regexLines(`short\r\n${long}\n${exact}\nend`)).toEqual(['short', exact, 'end']);
+  });
+
+  it('symlinked directory not walked', async () => {
+    const dir = makeTempDir();
+    const outside = makeTempDir();
+    writeFileSync(join(outside, 'secret.txt'), 'x');
+    mkdirSync(join(dir, 'real'));
+    writeFileSync(join(dir, 'real', 'a.txt'), '');
+    symlinkSync(outside, join(dir, 'linked'), 'dir');
+    expect((await listFiles(dir, ['**/*'], [])).files).toEqual(['real/a.txt']);
+  });
+
+  it('regexSafe refuses strings over 4 KB', () => {
+    expect(regexSafe('a'.repeat(READ_LIMITS.maxRegexLineBytes))).toBe(true);
+    expect(regexSafe('a'.repeat(READ_LIMITS.maxRegexLineBytes + 1))).toBe(false);
+    expect(regexSafe('é'.repeat(READ_LIMITS.maxRegexLineBytes / 2 + 1))).toBe(false); // counted in bytes
+  });
+
+  it('readTextLimitedWithReason tells why a file was skipped', async () => {
+    const dir = makeTempDir();
+    writeFileSync(join(dir, 'ok.txt'), 'hi');
+    writeFileSync(join(dir, 'big.txt'), 'a'.repeat(READ_LIMITS.maxFileBytes + 1));
+    writeFileSync(join(dir, 'bin'), Buffer.from([0, 1]));
+    symlinkSync(join(dir, 'ok.txt'), join(dir, 'link'));
+    mkdirSync(join(dir, 'folder'));
+    expect(await readTextLimitedWithReason(join(dir, 'ok.txt'))).toEqual({ text: 'hi' });
+    expect(await readTextLimitedWithReason(join(dir, 'big.txt'))).toEqual({ skipped: 'too-large' });
+    expect(await readTextLimitedWithReason(join(dir, 'bin'))).toEqual({ skipped: 'binary' });
+    expect(await readTextLimitedWithReason(join(dir, 'link'))).toEqual({ skipped: 'link' });
+    expect(await readTextLimitedWithReason(join(dir, 'folder'))).toEqual({ skipped: 'not-a-file' });
+    expect(await readTextLimitedWithReason(join(dir, 'missing'))).toEqual({ skipped: 'unreadable' });
+  });
+
+  it.skipIf(process.getuid?.() === 0)('readTextLimitedWithReason: unreadable file', async () => {
+    const dir = makeTempDir();
+    const file = join(dir, 'locked.txt');
+    writeFileSync(file, 'x');
+    chmodSync(file, 0o000);
+    expect(await readTextLimitedWithReason(file)).toEqual({ skipped: 'unreadable' });
+    expect(await readTextLimited(file)).toBeNull();
   });
 });

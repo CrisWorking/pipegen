@@ -1,8 +1,10 @@
+import { lstat } from 'node:fs/promises';
 import { basename, join as joinOs } from 'node:path';
+import picomatch from 'picomatch';
 import { parse as parseToml } from 'smol-toml';
 import type { Language, Monorepo, PackageManager, RepoProfile, Service } from '../types.js';
 import { safeText } from '../util/safe-text.js';
-import { listFiles, parseYamlLimited, readTextLimited, regexLines } from './limits.js';
+import { listFiles, parseYamlLimited, readTextLimitedWithReason, regexLines, regexSafe, type Skipped } from './limits.js';
 
 export class NotGitHubRepoError extends Error {}
 
@@ -17,6 +19,17 @@ const NODE_FRAMEWORKS: [string, string][] = [['express', 'express'], ['fastify',
 const PYTHON_FRAMEWORKS = ['flask', 'fastapi', 'django'];
 const NODE_TEST_FRAMEWORKS = ['jest', 'vitest', 'mocha', 'ava'];
 const MAX_PORT_SCAN_FILES = 100;
+const MAX_WORKSPACE_PATTERNS = 100;
+const NOT_SERVICE_DIRS = ['.devcontainer', 'test', 'tests', '__tests__', 'fixtures', 'examples', 'docs'];
+// Root files read by direct path so the file cap can never hide them.
+const ROOT_FILES = ['package.json', 'pnpm-workspace.yaml', 'turbo.json', 'nx.json', '.nvmrc', '.node-version', '.python-version', 'pyproject.toml', 'setup.py', 'Dockerfile', ...NODE_LOCKS.map(([f]) => f), ...PYTHON_LOCKS.map(([f]) => f)];
+const SKIP_REASON: Record<Skipped, string> = {
+  'too-large': 'it is larger than 1 MB',
+  binary: 'it is a binary file',
+  link: 'it is a symbolic link',
+  'not-a-file': 'it is not a regular file',
+  unreadable: 'it could not be read',
+};
 
 interface Ctx { root: string; fileSet: Set<string>; notes: string[] }
 
@@ -35,9 +48,10 @@ function note(ctx: Ctx, line: string): void {
 /** Reads a listed file through the read limits; a skipped file is noted in plain English. */
 async function readFile(ctx: Ctx, rel: string): Promise<string | null> {
   if (!ctx.fileSet.has(rel)) return null;
-  const text = await readTextLimited(joinOs(ctx.root, rel));
-  if (text === null) note(ctx, `Skipped ${safeText(rel)}: it is too large, binary or a link.`);
-  return text;
+  const result = await readTextLimitedWithReason(joinOs(ctx.root, rel));
+  if ('text' in result) return result.text;
+  note(ctx, `Skipped ${safeText(rel)}: ${SKIP_REASON[result.skipped]}.`);
+  return null;
 }
 
 async function readStructured(ctx: Ctx, rel: string, parse: (text: string) => unknown): Promise<Obj | null> {
@@ -56,25 +70,34 @@ const readYaml = (ctx: Ctx, rel: string) => readStructured(ctx, rel, parseYamlLi
 
 /** Owner and repo from the `origin` URL in .git/config, read as plain text. Never runs git. */
 async function readOrigin(root: string): Promise<{ owner: string; repo: string }> {
-  const text = await readTextLimited(joinOs(root, '.git', 'config'));
-  if (text === null) throw new NotGitHubRepoError('This folder is not a git repository (no .git/config found).');
+  const gitDir = joinOs(root, '.git');
+  const gitInfo = await lstat(gitDir).catch(() => null);
+  if (gitInfo === null) throw new NotGitHubRepoError('This folder is not a git repository (no .git folder found).');
+  if (gitInfo.isSymbolicLink()) throw new NotGitHubRepoError('.git is a symbolic link; refusing to follow it.');
+  if (gitInfo.isFile()) throw new NotGitHubRepoError('.git is a file, so this is a git worktree or submodule; run pipegen from the main checkout.');
+  const config = await readTextLimitedWithReason(joinOs(gitDir, 'config'));
+  if (!('text' in config)) throw new NotGitHubRepoError('.git/config is missing or is not a regular text file, so pipegen cannot read the remote.');
   let inOrigin = false;
   let url: string | undefined;
-  for (const raw of regexLines(text)) {
+  for (const raw of regexLines(config.text)) {
     const line = raw.trim();
-    const section = /^\[(.+)\]$/.exec(line);
-    if (section) inOrigin = /^remote\s+"origin"$/.test(section[1] ?? '');
-    else if (inOrigin && url === undefined) url = /^url\s*=\s*(.+)$/.exec(line)?.[1]?.trim().replace(/^"(.*)"$/, '$1');
+    const section = /^\[\s*([A-Za-z0-9.-]+)(?:\s+"([^"]*)")?\s*\]$/.exec(line);
+    if (section) inOrigin = section[1]?.toLowerCase() === 'remote' && section[2] === 'origin'; // section names ignore case, the subsection does not
+    else if (inOrigin && url === undefined) url = /^url\s*=\s*(.+)$/i.exec(line)?.[1]?.trim().replace(/^"(.*)"$/, '$1');
   }
   if (url === undefined) throw new NotGitHubRepoError('This repository has no "origin" remote, so pipegen cannot tell which GitHub repository it is.');
   const m = /^git@github\.com:([\w.-]+)\/([\w.-]+?)(?:\.git)?$/.exec(url) ?? /^https:\/\/github\.com\/([\w.-]+)\/([\w.-]+?)(?:\.git)?\/?$/.exec(url);
   if (!m) throw new NotGitHubRepoError('The "origin" remote is not a GitHub repository. pipegen only works with GitHub.');
-  return { owner: m[1] as string, repo: m[2] as string };
+  const [owner, repo] = [m[1] as string, m[2] as string];
+  if (!/^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})$/.test(owner) || !/^[A-Za-z0-9._-]{1,100}$/.test(repo) || repo === '.' || repo === '..') {
+    throw new NotGitHubRepoError('The "origin" remote has an owner or repository name that GitHub would not accept.');
+  }
+  return { owner, repo };
 }
 
 /** Package names from PEP 508 strings or requirements lines, lowercased with _ as -. */
 function pythonNames(lines: string[]): string[] {
-  return lines.flatMap((l) => {
+  return lines.filter(regexSafe).flatMap((l) => {
     const name = /^\s*([A-Za-z0-9][A-Za-z0-9._-]*)/.exec(l)?.[1];
     return name ? [name.toLowerCase().replace(/[._]/g, '-')] : [];
   });
@@ -103,6 +126,7 @@ function readPyproject(toml: Obj | null): PyInfo {
 }
 
 const isTestFile = (rel: string): boolean => {
+  if (!regexSafe(rel)) return false;
   const segments = rel.split('/');
   const name = segments[segments.length - 1] ?? '';
   return segments.slice(0, -1).some((s) => ['test', 'tests', '__tests__'].includes(s)) || /^.+\.(test|spec)\..+$/.test(name) || /^test_.+\.py$/.test(name) || /_test\.py$/.test(name);
@@ -156,7 +180,7 @@ async function readService(ctx: Ctx, dir: string, shared: Shared): Promise<Servi
   let testFramework: string | undefined;
   if (language === 'node') {
     testFramework = NODE_TEST_FRAMEWORKS.find((f) => f in deps || f in devDeps);
-    if (!testFramework && Object.values(pkgScripts).some((s) => typeof s === 'string' && /\bnode\s+(--\S+\s+)*--test\b/.test(s))) testFramework = 'node:test';
+    if (!testFramework && Object.values(pkgScripts).some((s) => typeof s === 'string' && regexSafe(s) && /\bnode\s+(--\S+\s+)*--test\b/.test(s))) testFramework = 'node:test';
   } else if (language === 'python') {
     const names = [...py.all, ...requirementNames];
     if (names.includes('pytest')) testFramework = 'pytest';
@@ -211,32 +235,48 @@ function workspacePatterns(pnpm: Obj | null, rootPkg: Obj | null): string[] {
   return Array.isArray(ws) ? asStrings(ws) : asStrings(asObj(ws).packages);
 }
 
+/** Workspace patterns are matched in memory against the listed files; one that points outside the repo is refused. */
+function usablePatterns(ctx: Ctx, all: string[]): string[] {
+  if (all.length > MAX_WORKSPACE_PATTERNS) note(ctx, `Only the first ${MAX_WORKSPACE_PATTERNS} workspace patterns were used.`);
+  return all.slice(0, MAX_WORKSPACE_PATTERNS).filter((p) => {
+    const bare = p.replace(/^!/, '');
+    const outside = !regexSafe(p) || bare.startsWith('/') || bare.startsWith('~') || /^[A-Za-z]:/.test(bare) || bare.split(/[\\/]/).includes('..');
+    if (outside) note(ctx, `Ignored workspace pattern "${safeText(p, 60)}": it points outside the repository or is not valid.`);
+    return !outside;
+  });
+}
+
+function workspaceDirs(ctx: Ctx, patterns: string[]): string[] {
+  const clean = (p: string) => p.replace(/^!/, '').replace(/^\.\//, '').replace(/\/+$/, '');
+  const include = patterns.filter((p) => !p.startsWith('!')).map((p) => picomatch(`${clean(p)}/package.json`, { dot: true }));
+  const exclude = patterns.filter((p) => p.startsWith('!')).map((p) => picomatch(`${clean(p)}/**`, { dot: true }));
+  return [...ctx.fileSet]
+    .filter((f) => baseOf(f) === 'package.json' && f !== 'package.json' && include.some((m) => m(f)) && !exclude.some((m) => m(f)))
+    .map(dirOf)
+    .sort();
+}
+
 export async function readProject(dir: string, opts?: { notes?: string[] }): Promise<Profile> {
   const notes = opts?.notes ?? [];
   const { owner, repo } = await readOrigin(dir);
   const ignore = IGNORED_DIRS.map((d) => `**/${d}/**`);
   const listing = await listFiles(dir, ['**/*'], ignore);
-  const ctx: Ctx = { root: dir, fileSet: new Set(listing.files), notes };
-  if (listing.truncated) note(ctx, 'Only the first 20,000 files were read.');
+  const ctx: Ctx = { root: dir, fileSet: new Set(listing.files.filter(regexSafe)), notes };
+  if (listing.truncated) note(ctx, 'Only the first 20,000 files were read. Results may be incomplete.');
+  for (const name of ROOT_FILES) if (!ctx.fileSet.has(name) && (await lstat(joinOs(dir, name)).catch(() => null))) ctx.fileSet.add(name);
 
   const rootPkg = await readJson(ctx, 'package.json');
   const pnpmWs = ctx.fileSet.has('pnpm-workspace.yaml') ? await readYaml(ctx, 'pnpm-workspace.yaml') : null;
-  const patterns = workspacePatterns(pnpmWs, rootPkg);
+  const patterns = usablePatterns(ctx, workspacePatterns(pnpmWs, rootPkg));
 
   // Which directories are services: workspace packages that can run, else directories with a Dockerfile, else the root.
   let dirs: string[] = [];
-  if (patterns.length > 0) {
-    const include = patterns.filter((p) => !p.startsWith('!')).map((p) => `${p.replace(/\/+$/, '')}/package.json`);
-    const exclude = patterns.filter((p) => p.startsWith('!')).map((p) => `${p.slice(1).replace(/\/+$/, '')}/**`);
-    const found = include.length === 0 ? [] : (await listFiles(dir, include, [...ignore, ...exclude])).files;
-    for (const file of found.sort()) {
-      const pkgDir = dirOf(file);
-      if (pkgDir === '.') continue;
-      const scripts = asObj((await readJson(ctx, file))?.scripts);
-      if ('start' in scripts || 'dev' in scripts || ctx.fileSet.has(inDir(pkgDir, 'Dockerfile'))) dirs.push(pkgDir);
-    }
+  for (const pkgDir of patterns.length > 0 ? workspaceDirs(ctx, patterns) : []) {
+    const scripts = asObj((await readJson(ctx, inDir(pkgDir, 'package.json')))?.scripts);
+    if ('start' in scripts || 'dev' in scripts || ctx.fileSet.has(inDir(pkgDir, 'Dockerfile'))) dirs.push(pkgDir);
   }
-  const dockerDirs = [...new Set([...ctx.fileSet].filter((f) => baseOf(f) === 'Dockerfile').map(dirOf))].sort();
+  const isAppDockerfile = (f: string) => baseOf(f) === 'Dockerfile' && !dirOf(f).split('/').some((s) => NOT_SERVICE_DIRS.includes(s));
+  const dockerDirs = [...new Set([...ctx.fileSet].filter(isAppDockerfile).map(dirOf))].sort();
   if (dirs.length === 0) dirs = dockerDirs.length > 0 ? dockerDirs : ['.'];
 
   let monorepo: Monorepo = 'none';
