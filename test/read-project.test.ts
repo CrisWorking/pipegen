@@ -5,6 +5,7 @@ import fg from 'fast-glob';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { NotGitHubRepoError, readProject } from '../src/read/project.js';
 import { cleanupRepos, makeRepo, writeIn } from './helpers/make-repo.js';
+import { fake } from './helpers/secret-repo.js';
 
 const CP_FNS = ['spawn', 'exec', 'execFile', 'fork', 'spawnSync', 'execSync', 'execFileSync'] as const;
 
@@ -265,6 +266,26 @@ describe('read', () => {
     const upper = makeRepo('node-npm');
     writeIn(upper, '.git/config', '[remote "Origin"]\n\turl = https://github.com/octo/hello.git\n');
     await expect(readProject(upper)).rejects.toBeInstanceOf(NotGitHubRepoError);
+  });
+
+  it('read: https remotes with user and token, and ssh:// remotes, are accepted; the user info is never kept or shown', async () => {
+    const cred = fake.githubClassic();
+    const https = (userInfo: string, rest: string) => 'https' + '://' + userInfo + '@' + rest; // built at runtime: no URL with a password in this file
+    const urls = [
+      https('user:' + cred, 'github.com/octo/hello.git'), https('x-access-' + 'tok' + 'en:' + cred, 'github.com/octo/hello'), https(cred, 'github.com/octo/hello/'),
+      'ssh://git@github.com/octo/hello.git', 'ssh://git@github.com/octo/hello', 'ssh://git@github.com:22/octo/hello.git',
+    ];
+    for (const url of urls) {
+      const notes: string[] = [];
+      const p = await readProject(makeRepo('node-npm', url), { notes });
+      expect([p.owner, p.repo], url.replace(cred, '(hidden)')).toEqual(['octo', 'hello']);
+      expect(JSON.stringify(p) + notes.join('\n')).not.toContain(cred);
+    }
+    for (const url of [https('user:' + cred, 'gitlab.com/octo/hello.git'), https('user:' + cred, 'github.com.evil.example/octo/hello'), https('github.com', 'evil.example/octo/hello'), 'ssh://git@github.com:2222/octo/hello', 'ssh://root@github.com/octo/hello']) {
+      const err = await readProject(makeRepo('node-npm', url)).catch((e: unknown) => e);
+      expect(err, url.replace(cred, '(hidden)')).toBeInstanceOf(NotGitHubRepoError);
+      expect(String((err as Error).message)).not.toContain(cred);
+    }
   });
 
   it('read: owner and repo names are validated', async () => {

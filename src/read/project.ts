@@ -75,7 +75,12 @@ async function readOrigin(root: string): Promise<{ owner: string; repo: string }
     else if (inOrigin && url === undefined) url = /^url\s*=\s*(.+)$/i.exec(line)?.[1]?.trim().replace(/^"(.*)"$/, '$1');
   }
   if (url === undefined) throw new NotGitHubRepoError('This repository has no "origin" remote, so pipegen cannot tell which GitHub repository it is.');
-  const m = /^git@github\.com:([\w.-]+)\/([\w.-]+?)(?:\.git)?$/.exec(url) ?? /^https:\/\/github\.com\/([\w.-]+)\/([\w.-]+?)(?:\.git)?\/?$/.exec(url);
+  // Accepted forms (each with an optional .git): scp-style git@github.com:o/r; https to github.com/o/r, with or without
+  // user info (a user name and token) before the host; ssh://git@github.com/o/r, also on port 22.
+  // User info is matched only to be dropped: it is never stored, returned or printed.
+  const m = /^git@github\.com:([\w.-]+)\/([\w.-]+?)(?:\.git)?$/.exec(url)
+    ?? /^https:\/\/(?:[^/@\s]+@)?github\.com\/([\w.-]+)\/([\w.-]+?)(?:\.git)?\/?$/.exec(url)
+    ?? /^ssh:\/\/git@github\.com(?::22)?\/([\w.-]+)\/([\w.-]+?)(?:\.git)?\/?$/.exec(url);
   if (!m) throw new NotGitHubRepoError('The "origin" remote is not a GitHub repository. pipegen only works with GitHub.');
   const [owner, repo] = [m[1] as string, m[2] as string];
   if (!/^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})$/.test(owner) || !/^[A-Za-z0-9._-]{1,100}$/.test(repo) || repo === '.' || repo === '..') {
