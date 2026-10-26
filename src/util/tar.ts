@@ -67,7 +67,8 @@ export function readTarMember(tar: Uint8Array, member: string, maxBytes: number)
     if (magic !== 'ustar\u000000' && magic !== 'ustar  \u0000') throw new TarError('The archive is not in the ustar format pipegen reads.');
 
     const name = text(h, 0, 100);
-    const prefix = text(h, 345, 155);
+    // POSIX ustar keeps a path prefix at 345; GNU tar keeps times and other fields there instead, so it is ignored
+    const prefix = magic === 'ustar  \u0000' ? '' : text(h, 345, 155);
     const path = prefix === '' ? name : `${prefix}/${name}`;
     const type = String.fromCharCode(h[156] as number);
     const size = octal(h, 124, 12, 'the entry size');

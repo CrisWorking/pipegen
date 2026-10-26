@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto';
-import { chmodSync, existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { chmodSync, existsSync, lutimesSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { dirname, join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
   checkPinnedAgainstReviewed, ensurePinnedBinary, loadPinnedBinaries, PinnedBinaryError, pinnedBinariesSchema,
@@ -95,7 +96,7 @@ function setup(opts: {
     dir, cache, marker, binary, archive, pins, routes,
     deps: (over = {}) => {
       const f = fakeFetch(routes);
-      return { fetch: f.fetch, calls: f.calls, pins, platform: 'linux', arch: 'x64', now: () => NOW, ...over };
+      return { fetch: f.fetch, calls: f.calls, pins, platform: 'linux', arch: 'x64', now: () => NOW, env: {}, ...over };
     },
   };
 }
@@ -174,7 +175,7 @@ describe('ensurePinnedBinary', () => {
     const elsewhere = join(s.dir, 'elsewhere');
     writeFileSync(elsewhere, s.binary);
     symlinkSync(elsewhere, join(toolDir, 'gitleaks'));
-    await expect(ensurePinnedBinary('gitleaks', s.cache, s.deps())).rejects.toThrow(/cached gitleaks.*not a regular file/i);
+    await expect(ensurePinnedBinary('gitleaks', s.cache, s.deps())).rejects.toThrow(/cached gitleaks.*symbolic link.*deleted/i);
     expect(existsSync(join(toolDir, 'gitleaks'))).toBe(false);
     expect(readFileSync(elsewhere).equals(s.binary)).toBe(true); // the link target is untouched
   });
@@ -209,6 +210,11 @@ describe('ensurePinnedBinary: tar reader', () => {
       expect(existsSync(join(s.dir, 'escape'))).toBe(false);
     });
   }
+
+  it('ensurePinnedBinary: GNU-format tar: the prefix field (GNU keeps times there) is ignored', async () => {
+    const s = setup({ entries: (bin) => [{ name: 'gitleaks', content: bin, magic: 'ustar  \u0000', prefix: '14567123456' }] });
+    expect(readFileSync(await ensurePinnedBinary('gitleaks', s.cache, s.deps())).equals(s.binary)).toBe(true);
+  });
 
   it('ensurePinnedBinary: tar member bigger than the pinned binary size → refused before it is copied out', async () => {
     const s = setup({ asset: (a) => ({ binarySize: a.binarySize - 1 }) });
@@ -260,10 +266,20 @@ describe('ensurePinnedBinary: download', () => {
 });
 
 describe('ensurePinnedBinary: cache directory', () => {
+  /** A home dir (0700) under the test dir; `.cache` inside it when `cacheMode` is given. */
+  function homeWith(s: Setup, cacheMode?: number): string {
+    const home = join(s.dir, 'home');
+    mkdirSync(home, { mode: 0o700 });
+    if (cacheMode !== undefined) {
+      mkdirSync(join(home, '.cache'));
+      chmodSync(join(home, '.cache'), cacheMode);
+    }
+    return home;
+  }
+
   it('ensurePinnedBinary: default cache is ~/.cache/pipegen/tools/<name>-<version>, every level created 0700', async () => {
     const s = setup();
-    const home = join(s.dir, 'home');
-    mkdirSync(home);
+    const home = homeWith(s);
     const path = await ensurePinnedBinary('gitleaks', undefined, s.deps({ home }));
     expect(path).toBe(join(home, '.cache', 'pipegen', 'tools', `gitleaks-${VERSION}`, 'gitleaks'));
     for (const level of ['.cache', '.cache/pipegen', '.cache/pipegen/tools', `.cache/pipegen/tools/gitleaks-${VERSION}`]) {
@@ -271,23 +287,81 @@ describe('ensurePinnedBinary: cache directory', () => {
     }
   });
 
-  it('ensurePinnedBinary: a symlinked level of the cache path → refused', async () => {
+  it('ensurePinnedBinary: XDG_CACHE_HOME is honoured when absolute, ignored when relative', async () => {
     const s = setup();
-    const home = join(s.dir, 'home');
+    const home = homeWith(s);
+    const xdg = join(s.dir, 'xdg', 'cache');
+    const path = await ensurePinnedBinary('gitleaks', undefined, s.deps({ home, env: { XDG_CACHE_HOME: xdg } }));
+    expect(path).toBe(join(xdg, 'pipegen', 'tools', `gitleaks-${VERSION}`, 'gitleaks'));
+    const relative = await ensurePinnedBinary('gitleaks', undefined, s.deps({ home, env: { XDG_CACHE_HOME: 'rel/cache' } }));
+    expect(relative).toBe(join(home, '.cache', 'pipegen', 'tools', `gitleaks-${VERSION}`, 'gitleaks'));
+  });
+
+  it('ensurePinnedBinary: a group-writable ~/.cache (0775) → refused, naming the folder and the fix', async () => {
+    const s = setup();
+    const home = homeWith(s, 0o775);
+    const deps = s.deps({ home });
+    const err = await ensurePinnedBinary('gitleaks', undefined, deps).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(PinnedBinaryError);
+    expect(String((err as Error).message)).toContain(join(home, '.cache'));
+    expect(String((err as Error).message)).toMatch(/other users can write to it.*chmod g-w,o-w/i);
+    expect(deps.calls).toEqual([]);
+  });
+
+  it('ensurePinnedBinary: a world-writable home (0777) → refused (the path above the cache counts too)', async () => {
+    const s = setup();
+    const home = homeWith(s);
+    chmodSync(home, 0o777);
+    await expect(ensurePinnedBinary('gitleaks', undefined, s.deps({ home }))).rejects.toThrow(new RegExp(`${home.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}.*other users can write`));
+  });
+
+  it('ensurePinnedBinary: a sticky world-writable folder not owned by root (1777) → refused', async () => {
+    const s = setup();
+    const home = homeWith(s, 0o1777);
+    await expect(ensurePinnedBinary('gitleaks', undefined, s.deps({ home }))).rejects.toThrow(/other users can write/i);
+  });
+
+  it.runIf(statSync(tmpdir()).uid === 0 && (statSync(tmpdir()).mode & 0o1000) !== 0)('ensurePinnedBinary: a root-owned sticky ancestor (the system temp dir) is accepted', async () => {
+    const s = setup();
+    expect(s.dir.startsWith(tmpdir())).toBe(true);
+    await expect(ensurePinnedBinary('gitleaks', s.cache, s.deps())).resolves.toBe(join(s.cache, `gitleaks-${VERSION}`, 'gitleaks'));
+  });
+
+  it("ensurePinnedBinary: group write on pipegen's own level (~/.cache/pipegen 0770) → refused", async () => {
+    const s = setup();
+    const home = homeWith(s, 0o700);
+    mkdirSync(join(home, '.cache', 'pipegen'));
+    chmodSync(join(home, '.cache', 'pipegen'), 0o770);
+    await expect(ensurePinnedBinary('gitleaks', undefined, s.deps({ home }))).rejects.toThrow(/pipegen.*other users can write/i);
+  });
+
+  it('ensurePinnedBinary: a symlinked ~/.cache pointing to a safe real folder is accepted (checked on its real path)', async () => {
+    const s = setup();
+    const home = homeWith(s);
+    const real = join(s.dir, 'real-cache');
+    mkdirSync(real, { mode: 0o700 });
+    symlinkSync(real, join(home, '.cache'));
+    const path = await ensurePinnedBinary('gitleaks', undefined, s.deps({ home }));
+    expect(path).toBe(join(real, 'pipegen', 'tools', `gitleaks-${VERSION}`, 'gitleaks'));
+  });
+
+  it('ensurePinnedBinary: a symlinked ~/.cache pointing to an unsafe folder → refused', async () => {
+    const s = setup();
+    const home = homeWith(s);
+    const real = join(s.dir, 'real-cache');
+    mkdirSync(real);
+    chmodSync(real, 0o777);
+    symlinkSync(real, join(home, '.cache'));
+    await expect(ensurePinnedBinary('gitleaks', undefined, s.deps({ home }))).rejects.toThrow(/other users can write/i);
+  });
+
+  it("ensurePinnedBinary: a symlink at pipegen's own levels (pipegen/, the tool dir) → refused", async () => {
+    const s = setup();
+    const home = homeWith(s, 0o700);
     const other = join(s.dir, 'attacker');
-    mkdirSync(join(home, '.cache'), { recursive: true });
     mkdirSync(other, { mode: 0o700 });
     symlinkSync(other, join(home, '.cache', 'pipegen'));
     await expect(ensurePinnedBinary('gitleaks', undefined, s.deps({ home }))).rejects.toThrow(/symbolic link/i);
-    expect(readdirSync(other)).toEqual([]);
-  });
-
-  it('ensurePinnedBinary: a symlinked cache dir or tool dir → refused', async () => {
-    const s = setup();
-    const other = join(s.dir, 'attacker');
-    mkdirSync(other, { mode: 0o700 });
-    symlinkSync(other, s.cache);
-    await expect(ensurePinnedBinary('gitleaks', s.cache, s.deps())).rejects.toThrow(/symbolic link/i);
     const s2 = setup();
     mkdirSync(s2.cache, { mode: 0o700 });
     symlinkSync(other, join(s2.cache, `gitleaks-${VERSION}`));
@@ -295,12 +369,20 @@ describe('ensurePinnedBinary: cache directory', () => {
     expect(readdirSync(other)).toEqual([]);
   });
 
-  it('ensurePinnedBinary: a cache dir owned by another user → refused', async () => {
+  it('ensurePinnedBinary: a given cache dir that is a symlink to a safe folder is used on its real path', async () => {
+    const s = setup();
+    const real = join(s.dir, 'real-tools');
+    mkdirSync(real, { mode: 0o700 });
+    symlinkSync(real, s.cache);
+    expect(await ensurePinnedBinary('gitleaks', s.cache, s.deps())).toBe(join(real, `gitleaks-${VERSION}`, 'gitleaks'));
+  });
+
+  it('ensurePinnedBinary: a cache dir owned by another user → refused before any download', async () => {
     const s = setup();
     const uid = (process.getuid?.() ?? 0) + 1;
     const deps = s.deps({ uid });
-    await expect(ensurePinnedBinary('gitleaks', s.cache, deps)).rejects.toThrow(/tool cache directory .* is not owned by you/i);
-    expect(deps.calls).toEqual([]); // refused before any download
+    await expect(ensurePinnedBinary('gitleaks', s.cache, deps)).rejects.toThrow(/is not owned by you/i);
+    expect(deps.calls).toEqual([]);
   });
 
   it('ensurePinnedBinary: a cache dir others can write to → refused', async () => {
@@ -309,9 +391,52 @@ describe('ensurePinnedBinary: cache directory', () => {
     chmodSync(s.cache, 0o777);
     await expect(ensurePinnedBinary('gitleaks', s.cache, s.deps())).rejects.toThrow(/other users can write/i);
   });
+
+  it('ensurePinnedBinary: stale temp files (over 1 hour old) are removed; fresh ones, links and other files are kept', async () => {
+    const s = setup();
+    const toolDir = join(s.cache, `gitleaks-${VERSION}`);
+    mkdirSync(toolDir, { recursive: true, mode: 0o700 });
+    const old = (NOW - 2 * 3_600_000) / 1000;
+    const stale = join(toolDir, '.gitleaks-aaaaaaaaaaaaaaaa.tmp');
+    const fresh = join(toolDir, '.gitleaks-bbbbbbbbbbbbbbbb.tmp');
+    const link = join(toolDir, '.gitleaks-cccccccccccccccc.tmp');
+    const other = join(toolDir, 'notes.txt');
+    for (const f of [stale, fresh, other]) writeFileSync(f, 'x');
+    symlinkSync(join(s.dir, 'nowhere'), link);
+    utimesSync(stale, old, old);
+    utimesSync(other, old, old);
+    lutimesSync(link, old, old);
+    utimesSync(fresh, (NOW - 60_000) / 1000, (NOW - 60_000) / 1000);
+    await ensurePinnedBinary('gitleaks', s.cache, s.deps());
+    expect(filesIn(toolDir).sort()).toEqual(['.gitleaks-bbbbbbbbbbbbbbbb.tmp', '.gitleaks-cccccccccccccccc.tmp', 'gitleaks', 'notes.txt']);
+  });
 });
 
-describe('ensurePinnedBinary: platforms and cooldown', () => {
+describe('ensurePinnedBinary: parallel first runs', () => {
+  it('ensurePinnedBinary: 8 parallel first-run calls all succeed and never delete the good binary (5 rounds)', async () => {
+    const s = setup();
+    const home = join(s.dir, 'home');
+    mkdirSync(home, { mode: 0o700 });
+    for (let round = 0; round < 5; round++) {
+      rmSync(join(home, '.cache'), { recursive: true, force: true });
+      const results = await Promise.allSettled(Array.from({ length: 8 }, () => ensurePinnedBinary('gitleaks', undefined, s.deps({ home }))));
+      const failed = results.filter((r) => r.status === 'rejected').map((r) => String((r as PromiseRejectedResult).reason));
+      expect(failed, `round ${round}`).toEqual([]);
+      const path = join(home, '.cache', 'pipegen', 'tools', `gitleaks-${VERSION}`, 'gitleaks');
+      expect(readFileSync(path).equals(s.binary), `round ${round}`).toBe(true);
+      expect(filesIn(dirname(path)), `round ${round}`).toEqual(['gitleaks']);
+    }
+  });
+
+  it('ensurePinnedBinary: a cached copy removed by another run is downloaded again (not reported as tampering)', async () => {
+    const s = setup();
+    const path = await ensurePinnedBinary('gitleaks', s.cache, s.deps());
+    rmSync(path);
+    expect(await ensurePinnedBinary('gitleaks', s.cache, s.deps())).toBe(path);
+  });
+});
+
+describe('ensurePinnedBinary: platforms', () => {
   it('ensurePinnedBinary: linux and darwin on x64 and arm64 each use their own asset', async () => {
     const s = setup();
     for (const [platform, arch] of [['linux', 'x64'], ['linux', 'arm64'], ['darwin', 'x64'], ['darwin', 'arm64']] as const) {
@@ -327,19 +452,17 @@ describe('ensurePinnedBinary: platforms and cooldown', () => {
   });
 
   for (const [platform, arch] of [['win32', 'x64'], ['freebsd', 'x64'], ['linux', 'ia32'], ['darwin', 'ppc64']]) {
-    it(`ensurePinnedBinary: ${platform}-${arch} → a clear "Linux or macOS" error, nothing downloaded`, async () => {
+    it(`ensurePinnedBinary: ${platform}-${arch} → a clear, tool-neutral "Linux or macOS" error, nothing downloaded`, async () => {
       const s = setup();
       const deps = s.deps({ platform, arch });
-      await expect(ensurePinnedBinary('gitleaks', s.cache, deps)).rejects.toThrow(/audit --ai needs Linux or macOS for now \(WSL works\)/);
+      await expect(ensurePinnedBinary('cosign', s.cache, deps)).rejects.toThrow(/pipegen's cosign download needs Linux or macOS for now \(WSL works\)/);
       expect(deps.calls).toEqual([]);
     });
   }
 
-  it(`ensurePinnedBinary: a release newer than ${COOLDOWN_DAYS} days, or dated in the future → refused (ruling S26)`, async () => {
-    const recent = setup({ releasedAt: new Date(NOW - 3 * DAY).toISOString() });
-    await expect(ensurePinnedBinary('gitleaks', recent.cache, recent.deps())).rejects.toThrow(/7 days/);
-    const future = setup({ releasedAt: new Date(NOW + DAY).toISOString() });
-    await expect(ensurePinnedBinary('gitleaks', future.cache, future.deps())).rejects.toThrow(/future/);
+  it('ensurePinnedBinary: the release date is not re-checked at run time (the data-file test holds the cooldown)', async () => {
+    const s = setup({ releasedAt: new Date(NOW - 3 * DAY).toISOString() });
+    await expect(ensurePinnedBinary('gitleaks', s.cache, s.deps())).resolves.toContain('gitleaks');
   });
 
   it('ensurePinnedBinary: an unknown tool name → refused', async () => {
