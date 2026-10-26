@@ -288,6 +288,11 @@ describe('read', () => {
     }
   });
 
+  it('read: https remotes whose user info hides another host are refused', async () => {
+    const bad = ['https://evil.com\\@github.com/o/r', 'https://evil.com?@github.com/o/r', 'https://evil.com#@github.com/o/r'];
+    for (const url of bad) await expect(readProject(makeRepo('node-npm', url)), url).rejects.toBeInstanceOf(NotGitHubRepoError);
+  });
+
   it('read: owner and repo names are validated', async () => {
     const bad = [
       'https://github.com/-bad/repo.git', 'https://github.com/a_b/repo.git', `https://github.com/${'a'.repeat(40)}/repo`,

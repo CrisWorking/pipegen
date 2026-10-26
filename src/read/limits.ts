@@ -1,7 +1,6 @@
 import { lstat, readFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import fg from 'fast-glob';
-import picomatch from 'picomatch';
 import { parse as parseYaml } from 'yaml';
 
 /** Read limits that protect the user's machine from hostile repos. Every reader goes through this file. */
@@ -33,8 +32,10 @@ export async function listFiles(dir: string, patterns: string[], ignore: string[
   const links: string[] = [];
   const usable: string[] = [];
   for (const pattern of patterns) {
-    const base = pattern.startsWith('!') ? '' : picomatch.scan(pattern).base;
-    const link = base === '' ? null : await linkedLevel(dir, base);
+    // The bases fast-glob will actually open: braces in a folder part (`l{n,x}k/*`) expand to several fixed bases.
+    const bases = pattern.startsWith('!') ? [] : fg.generateTasks([pattern], { cwd: dir }).map((t) => t.base).filter((b) => b !== '.' && b !== '');
+    let link: string | null = null;
+    for (const base of bases) if (link === null) link = await linkedLevel(dir, base);
     if (link !== null) {
       if (!links.includes(link)) links.push(link);
       if (found && found.links.length < READ_LIMITS.maxFiles && !found.links.includes(link)) found.links.push(link);

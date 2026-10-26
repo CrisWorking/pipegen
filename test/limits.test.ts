@@ -99,6 +99,12 @@ describe('limits', () => {
     mkdirSync(join(deep, '.github'));
     symlinkSync(join(outside, 'workflows'), join(deep, '.github', 'workflows'), 'dir');
     expect(await listFiles(deep, ['.github/workflows/*.yml'], [])).toEqual({ files: [], truncated: false, links: ['.github/workflows'] });
+    // a brace in a folder part expands to several fixed bases; each one is checked
+    const braces = makeTempDir();
+    mkdirSync(join(braces, 'outside'));
+    writeFileSync(join(braces, 'outside', 'secret.txt'), 'x');
+    symlinkSync(join(braces, 'outside'), join(braces, 'lnk'));
+    expect((await listFiles(braces, ['l{n,x}k/*'], [])).files).toEqual([]);
     expect(await listFiles(dir, ['real/*.yml'], [])).toEqual({ files: ['real/b.yml'], truncated: false });
   });
 

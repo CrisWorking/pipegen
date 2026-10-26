@@ -8,7 +8,7 @@
 //   Service.name /^[A-Za-z0-9._@/-]{1,214}$/, else the folder name (same pattern), else 'app'.
 // - Every value is cleaned where it leaves pipegen: safeText() for the terminal, safeMarkdown() for Markdown.
 //   Fields not validated at read time (Service.path, runtimeVersion, dockerfile, Dependency.evidence) must always
-//   go through those at output.
+//   go through those at output. Service.name may contain '.', '..' and '/': never use it as a path component unchecked.
 // ---------- project ----------
 export type Language = 'node' | 'python' | 'go' | 'java' | 'dotnet' | 'ruby' | 'php' | 'other';
 export type PackageManager = 'npm' | 'pnpm' | 'yarn' | 'bun' | 'pip' | 'poetry' | 'uv' | 'other';
