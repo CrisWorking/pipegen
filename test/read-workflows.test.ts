@@ -100,6 +100,36 @@ secrets_note: hunter2
     expect(notes.length).toBeGreaterThanOrEqual(2);
   });
 
+  it('workflows: deploy words inside other words do not count (butterfly, overwhelm)', async () => {
+    const body = (run: string) => `name: CI\non: push\njobs:\n  a:\n    runs-on: x\n    steps:\n      - run: ${run}\n`;
+    expect((await one(body('echo butterfly')))?.deploys).toBe(false);
+    expect((await one(body('echo overwhelm')))?.deploys).toBe(false);
+  });
+
+  it('workflows: deployment script and npm_deploy still count as deploy', async () => {
+    const body = (run: string) => `name: CI\non: push\njobs:\n  a:\n    runs-on: x\n    steps:\n      - run: ${run}\n`;
+    for (const run of ['./deployment.sh', 'npm run npm_deploy', 'flyctl deploy', 'helm upgrade x']) {
+      expect((await one(body(run)))?.deploys, run).toBe(true);
+    }
+  });
+
+  it('workflows: symlinked .github/workflows directory not read', async () => {
+    const dir = makeTempDir();
+    const other = makeTempDir();
+    writeIn(other, 'a.yml', 'on: push\njobs: {}\n');
+    writeIn(dir, '.github/keep', '1');
+    symlinkSync(other, join(dir, '.github/workflows'));
+    expect(await readWorkflows(dir)).toEqual([]);
+  });
+
+  it('workflows: hostile filename carries no control characters', async () => {
+    const dir = makeTempDir();
+    wf(dir, 'a\u001b[31mb.yml', 'on: push\njobs: {}\n');
+    const out = await readWorkflows(dir);
+    expect(out).toHaveLength(1);
+    expect(out[0]?.path).not.toMatch(/\u001b/);
+  });
+
   it('workflows: ignores non-yaml files, subfolders and symlinks', async () => {
     const dir = makeTempDir();
     wf(dir, 'a.yml', 'on: push\njobs: {}\n');

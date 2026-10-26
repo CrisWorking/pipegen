@@ -10,7 +10,9 @@ import { asObj } from './manifest.js';
 const MAX_WORKFLOWS = 200;
 const WORKFLOW_FILE = /^\.github\/workflows\/[^/]+\.ya?ml$/;
 const NAME_RE = /^[A-Za-z_][A-Za-z0-9_]{0,127}$/;
-const DEPLOY_RE = /(deploy|vercel|netlify|fly(ctl)?|heroku|aws (ecs|s3|lambda)|kubectl|helm|gcloud (run|app)|az (webapp|containerapp)|docker push|npm publish|twine upload)/i;
+// Plan regex with whole-word guards: a leading guard on every token and a trailing guard on the short ones, so
+// "butterfly" and "overwhelm" do not count while "deployment.sh" and "npm_deploy" still do. (helmfile is a known miss.)
+const DEPLOY_RE = /(?<![A-Za-z])(deploy|vercel|netlify|fly(?:ctl)?(?![A-Za-z])|heroku|aws (?:ecs|s3|lambda)|kubectl|helm(?![A-Za-z])|gcloud (?:run|app)|az (?:webapp|containerapp)|docker push|npm publish|twine upload)/i;
 const NAME_OR_FILE_RE = /deploy|release|publish/i;
 const EXPRESSION_RE = /\$\{\{([^}]*)\}\}/g;
 const SECRET_REF_RE = /\bsecrets(?:\.([A-Za-z_][A-Za-z0-9_]*)(?![\w-])|\[\s*['"]([^'"]*)['"]\s*\])/g;
@@ -27,6 +29,8 @@ function triggersOf(on: unknown): string[] {
   return [...new Set(names.map((n) => safeText(n, 60)))];
 }
 
+// Scans line by line, so a secret inside a multi-line ${{ }} expression is missed (a safe miss), and a name
+// mentioned inside a YAML comment on a line with ${{ }} is counted.
 function secretsOf(text: string): string[] {
   const found = new Set<string>();
   for (const line of regexLines(text)) {
@@ -62,6 +66,11 @@ function deploysOf(doc: Record<string, unknown>, path: string): boolean {
  */
 export async function readWorkflows(dir: string, files?: string[], notes: string[] = []): Promise<ExistingWorkflow[]> {
   const listed = files ?? (await listFiles(dir, ['.github/workflows/*.{yml,yaml}'], [])).files;
+  // A symlinked .github or .github/workflows would lead outside the repo; read nothing from it.
+  if (isLink(join(dir, '.github')) || isLink(join(dir, '.github/workflows'))) {
+    notes.push('Skipped .github/workflows: it is reached through a symbolic link.');
+    return [];
+  }
   const all = listed.filter((f) => WORKFLOW_FILE.test(f)).sort();
   if (all.length > MAX_WORKFLOWS) notes.push(`Only the first ${MAX_WORKFLOWS} workflow files were read.`);
   const out: ExistingWorkflow[] = [];
@@ -79,7 +88,7 @@ export async function readWorkflows(dir: string, files?: string[], notes: string
       continue;
     }
     out.push({
-      path,
+      path: safeText(path, 300),
       triggers: triggersOf(doc.on ?? doc.true),
       deploys: deploysOf(doc, path),
       secretsUsed: secretsOf(read.text),
@@ -89,8 +98,16 @@ export async function readWorkflows(dir: string, files?: string[], notes: string
   return out;
 }
 
-const isRealFile = (p: string) => lstatSync(p, { throwIfNoEntry: false })?.isFile() === true;
-const isRealDir = (p: string) => lstatSync(p, { throwIfNoEntry: false })?.isDirectory() === true;
+const info = (p: string) => {
+  try {
+    return lstatSync(p, { throwIfNoEntry: false });
+  } catch {
+    return undefined; // permission errors and the like count as absent
+  }
+};
+const isLink = (p: string) => info(p)?.isSymbolicLink() === true;
+const isRealFile = (p: string) => info(p)?.isFile() === true;
+const isRealDir = (p: string) => info(p)?.isDirectory() === true;
 
 /** Which hook manager the repo uses. A symbolic link never counts. Priority: pre-commit, husky, lefthook. */
 export function readPrecommit(dir: string): RepoProfile['precommit'] {
