@@ -478,6 +478,142 @@ describe('pin: images', () => {
   });
 });
 
+describe('pin: fix round 1', () => {
+  const DAY = 86_400_000;
+  const iso = (ms: number) => new Date(ms).toISOString();
+  const blobRef: Routes = {
+    [`GET ${GH}/repos/o/r/git/ref/tags/v1.2.3`]: ref('v1.2.3', 'tag', TAG_OBJECT),
+    [`GET ${GH}/repos/o/r/git/tags/${TAG_OBJECT}`]: { body: { sha: TAG_OBJECT, object: { type: 'blob', sha: LIVE_SHA } } },
+  };
+  const deepChain: Routes = Object.fromEntries([
+    [`GET ${GH}/repos/o/r/git/ref/tags/v1.2.3`, ref('v1.2.3', 'tag', '1'.repeat(40))],
+    ...[1, 2, 3, 4].map((i) => [`GET ${GH}/repos/o/r/git/tags/${String(i).repeat(40)}`, { body: { object: { type: 'tag', sha: String(i + 1).repeat(40) } } }]),
+  ]);
+
+  it('pin: a stored pin whose tag now leads to a tree, a blob or a deep tag chain → alert, stored sha kept', async () => {
+    for (const routes of [{ [`GET ${GH}/repos/o/r/git/ref/tags/v1.2.3`]: ref('v1.2.3', 'tree' as 'commit', LIVE_SHA) }, blobRef, deepChain]) {
+      const { deps, alert } = setup(github(routes));
+      const c = stored();
+      expect(await resolvePin(c, deps)).toEqual(c);
+      expect(alert).toHaveBeenCalledTimes(1);
+      expect(alert.mock.calls[0][0]).toMatchObject({ storedSha: SHA, liveSha: '<not a commit>' });
+    }
+    // a new pin still refuses them
+    const { deps } = setup(github(blobRef));
+    await expect(resolvePin(cand(), deps)).rejects.toThrow(PinError);
+  });
+
+  it('pin: a nested annotated tag chain (tag → tag → commit) resolves to the commit', async () => {
+    const { deps } = setup(github({
+      [`GET ${GH}/repos/o/r/git/ref/tags/v1.2.3`]: ref('v1.2.3', 'tag', TAG_OBJECT),
+      [`GET ${GH}/repos/o/r/git/tags/${TAG_OBJECT}`]: { body: { object: { type: 'tag', sha: AI_SHA } } },
+      [`GET ${GH}/repos/o/r/git/tags/${AI_SHA}`]: { body: { object: { type: 'commit', sha: SHA } } },
+    }));
+    expect((await resolvePin(cand(), deps)).pin).toEqual({ sha: SHA });
+  });
+
+  const storedImage = () => ({ ...dockerCand(), source: 'reviewed' as const, reviewed: true, version: '3.20', pin: { digest: DIGEST } });
+
+  it('pin: a stored image tag that no longer serves an index → alert, stored digest kept', async () => {
+    const { deps, alert } = setup({}, hubRoutes({ [`HEAD https://registry-1.docker.io/v2/library/alpine/manifests/3.20`]: manifest(LIVE_DIGEST, 'application/vnd.oci.image.manifest.v1+json') }));
+    const c = storedImage();
+    expect(await resolvePin(c, deps, docker())).toEqual(c);
+    expect(alert).toHaveBeenCalledTimes(1);
+    expect(alert.mock.calls[0][0]).toMatchObject({ storedSha: DIGEST, liveSha: '<not an index>' });
+  });
+
+  it('pin: a stored image tag that is gone (404) → note, stored digest kept', async () => {
+    const { deps, alert, notes } = setup({}, hubRoutes({ [`HEAD https://registry-1.docker.io/v2/library/alpine/manifests/3.20`]: { status: 404 } }));
+    const c = storedImage();
+    expect(await resolvePin(c, deps, docker())).toEqual(c);
+    expect(alert).not.toHaveBeenCalled();
+    expect(notes.join(' ')).toMatch(/3\.20.*no longer exists/);
+    // a new pin of a missing tag is an error
+    const fresh = setup({}, hubRoutes({ [`HEAD https://registry-1.docker.io/v2/library/alpine/manifests/3.20`]: { status: 404 } }));
+    await expect(resolvePin(dockerCand(), fresh.deps, docker())).rejects.toThrow(PinError);
+  });
+
+  it('pin: notes are required in PinDeps', () => {
+    const { deps } = setup();
+    const { notes: _notes, ...rest } = deps;
+    // @ts-expect-error notes is required, so the computed-checksum marker can't be lost
+    const missing: PinDeps = rest;
+    expect(missing.notes).toBeUndefined();
+  });
+
+  it('pin: a release whose target_commitish is another commit → new pin refused (tag moved after release)', async () => {
+    const moved = setup(github({ [`GET ${GH}/repos/o/r/releases/tags/v1.2.3`]: { body: { tag_name: 'v1.2.3', published_at: OLD, draft: false, target_commitish: LIVE_SHA } } }));
+    await expect(resolvePin(cand(), moved.deps)).rejects.toThrow('The tag v1.2.3 was moved after its release was published.');
+    for (const target of [SHA, 'main', null]) {
+      const ok = setup(github({ [`GET ${GH}/repos/o/r/releases/tags/v1.2.3`]: { body: { tag_name: 'v1.2.3', published_at: OLD, draft: false, target_commitish: target } } }));
+      expect((await resolvePin(cand(), ok.deps)).pin).toEqual({ sha: SHA });
+    }
+  });
+
+  it('pin: every new pin adds a human-review note; a verified stored pin does not', async () => {
+    const a = setup();
+    await resolvePin(cand(), a.deps);
+    expect(a.notes).toEqual([`New pin for o/r v1.2.3 → ${SHA}: needs human review before release (reviewed-tools Step 6).`]);
+    const n = setup({}, npmRoutes());
+    await resolvePin(cand({ kind: 'cli' }), n.deps, npm());
+    expect(n.notes).toEqual([`New pin for tool@2.0.1 → ${INTEGRITY}: needs human review before release (reviewed-tools Step 6).`]);
+    const d = setup({}, hubRoutes());
+    await resolvePin(dockerCand(), d.deps, docker());
+    expect(d.notes.join(' ')).toContain(`New pin for docker.io/library/alpine:3.20 → ${DIGEST}`);
+    const s = setup();
+    await resolvePin(stored(), s.deps);
+    expect(s.notes).toEqual([]);
+  });
+
+  it('pin: the 7-day boundary: exactly 7 days old is accepted, 1 ms less is refused', async () => {
+    const at = setup(github({ [`GET ${GH}/repos/o/r/releases/tags/v1.2.3`]: release('v1.2.3', iso(NOW - 7 * DAY)) }));
+    expect((await resolvePin(cand(), at.deps)).pin).toEqual({ sha: SHA });
+    const under = setup(github({ [`GET ${GH}/repos/o/r/releases/tags/v1.2.3`]: release('v1.2.3', iso(NOW - 7 * DAY + 1)) }));
+    await expect(resolvePin(cand(), under.deps)).rejects.toThrow(/7 days/);
+  });
+
+  it('pin: a registry HEAD redirect to another host is refused and the pull token is not sent there', async () => {
+    const { deps, netCalls } = setup({}, hubRoutes({
+      [`HEAD https://registry-1.docker.io/v2/library/alpine/manifests/3.20`]: { status: 307, headers: { location: 'https://evil.example/v2/x' } },
+      ['HEAD https://evil.example/v2/x']: manifest(),
+    }));
+    await expect(resolvePin(dockerCand(), deps, docker())).rejects.toThrow(/not an allowed https host/);
+    expect(netCalls.some((c) => c.url.host === 'evil.example')).toBe(false);
+  });
+
+  it('pin: more checksums files than pipegen reads → refused, never silently cut', async () => {
+    const files = ['checksums.txt', 'SHA256SUMS', 'tool_checksums.txt', 'sha256sums.txt', `${BIN}.sha256`];
+    const { deps } = setup({ [`GET ${GH}/repos/o/tool/releases/tags/v1.4.0`]: release('v1.4.0', OLD, [asset(BIN), ...files.map((f) => asset(f, 100))]) });
+    await expect(resolvePin(binCand(), deps)).rejects.toThrow(/checksums files/);
+  });
+
+  it('pin: an install spec hash that disagrees with the candidate pin is refused', async () => {
+    const hex = '4'.repeat(64);
+    const cases: [Candidate, InstallSpec][] = [
+      [stored({ kind: 'cli', version: '1.4.0', pin: { checksum: hex } }), { ...pip(), checksum: OTHER_HASH }],
+      [stored({ kind: 'cli', version: '1.4.0', pin: {} }), { ...pip(), checksum: hex }],
+      [{ ...storedImage() }, { ...docker(), digest: LIVE_DIGEST }],
+      [{ ...storedImage(), pin: {} }, { ...docker(), digest: DIGEST }],
+    ];
+    for (const [c, spec] of cases) {
+      const { deps, ghCalls, netCalls } = setup({}, hubRoutes());
+      await expect(resolvePin(c, deps, spec)).rejects.toThrow(/stored hash .* and its pin disagree/);
+      expect([...ghCalls, ...netCalls]).toHaveLength(0);
+    }
+    const same = setup();
+    const c = stored({ kind: 'cli', version: '1.4.0', pin: { checksum: hex } });
+    expect(await resolvePin(c, same.deps, { ...pip(), checksum: hex })).toEqual(c);
+  });
+
+  it('pin: a prerelease is never newly pinned', async () => {
+    const pre = (assets: unknown[] = []): Reply => ({ body: { tag_name: 'v1.2.3', published_at: OLD, draft: false, prerelease: true, assets } });
+    const action = setup(github({ [`GET ${GH}/repos/o/r/releases/tags/v1.2.3`]: pre() }));
+    await expect(resolvePin(cand(), action.deps)).rejects.toThrow(/pre-release/);
+    const bin = setup({ [`GET ${GH}/repos/o/tool/releases/tags/v1.2.3`]: pre([asset(BIN)]) });
+    await expect(resolvePin(binCand(), bin.deps, { method: 'github-release', package: BIN, version: 'v1.2.3' })).rejects.toThrow(/pre-release/);
+  });
+});
+
 describe('pin: inputs, credentials, rate limits', () => {
   it('pin: bad repo, tag or package names are refused before any request (S14), and errors are cleaned', async () => {
     const bad: [Candidate, InstallSpec?][] = [
@@ -508,7 +644,7 @@ describe('pin: inputs, credentials, rate limits', () => {
       [`GET ${DL}/o/tool/releases/download/v1.4.0/checksums.txt`]: { raw: `${want}  ${BIN}\n` },
       [`GET ${PYPI}/pypi/some-tool/1.4.0/json`]: { body: { info: { version: '1.4.0' }, urls: [pypiFile('some_tool-1.4.0-py3-none-any.whl', 'bdist_wheel', want)] } },
     });
-    const deps: PinDeps = { gh: g.gh, fetch: f.fetch, alert: vi.fn(), sleep: async () => {}, now: () => NOW, budget: newRateBudget() };
+    const deps: PinDeps = { gh: g.gh, fetch: f.fetch, alert: vi.fn(), notes: [], sleep: async () => {}, now: () => NOW, budget: newRateBudget() };
     await resolvePin(cand(), deps);
     await resolvePin(binCand(), deps);
     await resolvePin(cand({ kind: 'cli' }), deps, npm());

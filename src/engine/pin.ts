@@ -15,7 +15,10 @@
 // Cooldown (ruling S26): a new pin is only made for a release published at least 7 days ago, by a date the server
 // records (GitHub release and asset dates, npm publish time, PyPI upload time, Docker Hub push time). Dates set
 // by whoever made the commit or the image (commit, tag or image `created` dates) are never used. A date that can't
-// be read, or is in the future, refuses the pin (fail closed).
+// be read, or is in the future, refuses the pin (fail closed). Pre-releases are never newly pinned, and a release
+// whose target_commitish is another commit than its tag's means the tag moved: refused. Every new pin adds a note
+// asking for human review (reviewed-tools Step 6). A stored pin whose tag now leads somewhere odd (not a commit,
+// not an image index) is still a moved tag: alert, stored pin kept; a deleted tag is a note, stored pin kept.
 //
 // Requests: every name is checked before any request and each path segment is encoded (ruling S14). Only
 // `deps.gh` (api.github.com) carries the user's credential (ruling S15). `deps.fetch` never gets it; the one
@@ -40,8 +43,11 @@ export interface PinDeps extends RateClock {
   fetch: typeof fetch;
   /** A loud warning: the CLI prints it in red and adds it to PIPEGEN.md and the run report. */
   alert: (w: PinMovedWarning) => void;
-  /** Plain-English notes for the reviewer (already cleaned), e.g. a computed checksum or a deleted tag. */
-  notes?: string[];
+  /**
+   * Plain-English notes for the reviewer (already cleaned). Required, so these markers can't be lost: a computed
+   * checksum (`checksumSource: computed`), a deleted tag, and one "needs human review" note per new pin.
+   */
+  notes: string[];
   /** Cap on a downloaded release asset (default MAX_DOWNLOAD_BYTES). */
   maxDownloadBytes?: number;
 }
@@ -128,7 +134,10 @@ const COMBINED_SUMS_RE = /(?:^|[._-])(?:checksums|sha256sums?)(?:\.txt)?$/i;
 const refSchema = z.object({ ref: z.string(), object: z.object({ type: z.string(), sha: z.string() }) });
 const tagObjectSchema = z.object({ object: z.object({ type: z.string(), sha: z.string() }) });
 const assetSchema = z.object({ name: z.string(), size: z.number().int().nonnegative(), updated_at: z.string().nullish() });
-const releaseSchema = z.object({ tag_name: z.string(), published_at: z.string().nullish(), draft: z.boolean().optional(), assets: z.array(assetSchema).optional() });
+const releaseSchema = z.object({
+  tag_name: z.string(), published_at: z.string().nullish(), draft: z.boolean().optional(), prerelease: z.boolean().optional(),
+  target_commitish: z.string().nullish(), assets: z.array(assetSchema).optional(),
+});
 const npmVersionSchema = z.object({ name: z.string(), version: z.string(), dist: z.object({ integrity: z.string() }) });
 const npmTimesSchema = z.object({ time: z.record(z.string(), z.unknown()) });
 const pypiSchema = z.object({
@@ -143,7 +152,13 @@ const hubTagSchema = z.object({ digest: z.string().nullish(), tag_last_pushed: z
 
 type Asset = z.infer<typeof assetSchema>;
 type Release = z.infer<typeof releaseSchema>;
+/** Where a tag leads: a commit, nowhere (the tag is gone), or something that isn't a commit (tree, blob, too-deep chain). */
+type TagTarget = { kind: 'commit'; sha: string } | { kind: 'missing' } | { kind: 'not-commit' };
+/** Stands in for the live value in a PinMovedWarning when the tag no longer leads to a commit or an image index. */
+const NOT_A_COMMIT = '<not a commit>';
+const NOT_AN_INDEX = '<not an index>';
 interface Image { registry: Registry; path: string; display: string }
+interface FetchOptions { method: 'GET' | 'HEAD'; timeoutMs: number; hosts: readonly string[]; headers?: Record<string, string> }
 
 const isStored = (c: Candidate) => c.source === 'reviewed' || c.source === 'memory';
 const isNotFound = (e: unknown) => (e as { status?: unknown } | null)?.status === 404;
@@ -174,9 +189,18 @@ function readDate(s: unknown): number | null {
  */
 export async function resolvePin(c: Candidate, deps: PinDeps, install?: InstallSpec): Promise<Candidate> {
   const now = () => (deps.now ?? Date.now)();
-  const note = (text: string) => deps.notes?.push(safeText(text, 400));
+  const note = (text: string) => { deps.notes.push(safeText(text, 400)); };
+  /** Every new pin is flagged for a human: nothing pipegen pins by itself runs until it is reviewed. */
+  const reviewNote = (what: string, value: string) => note(`New pin for ${what} → ${value}: needs human review before release (reviewed-tools Step 6).`);
   const maxDownload = deps.maxDownloadBytes ?? MAX_DOWNLOAD_BYTES;
 
+  // a hash in the install spec must be the candidate's own pin (one source of truth for what runs)
+  for (const field of ['checksum', 'digest'] as const) {
+    const fromSpec = install?.[field];
+    if (fromSpec !== undefined && fromSpec !== c.pin[field]) {
+      throw new PinError(`The stored hash for ${safeText(String(install?.package), 120)} and its pin disagree.`);
+    }
+  }
   if (c.kind === 'action') return pinAction();
   if (c.kind === 'docker' || install?.method === 'docker') return pinImage();
   if (c.kind !== 'cli') throw new PinError(`pipegen can't pin a tool of kind "${safeText(String(c.kind), 40)}".`);
@@ -195,27 +219,42 @@ export async function resolvePin(c: Candidate, deps: PinDeps, install?: InstallS
       if (!COMMIT_SHA_RE.test(stored)) throw new PinError(`The stored pin of ${repo} isn't a full commit SHA.`);
       const tag = checkTag(c.version, repo);
       const live = await gh.tagCommit(tag);
-      if (live === null) {
+      if (live.kind === 'missing') {
         note(`The tag ${tag} of ${repo} no longer exists; pipegen keeps the reviewed commit ${stored}.`);
-      } else if (live !== stored) {
-        deps.alert(new PinMovedWarning(repo, tag, stored, live));
+      } else if (live.kind === 'not-commit') {
+        deps.alert(new PinMovedWarning(repo, tag, stored, NOT_A_COMMIT));
+      } else if (live.sha !== stored) {
+        deps.alert(new PinMovedWarning(repo, tag, stored, live.sha));
       }
       return c; // the stored, reviewed pin: never replaced
     }
+    // A new pin. The cooldown can't see a tag force-moved onto new code under an old release; target_commitish
+    // catches some of those cases, and the human review of every new pin (B8 Step 6) is the control.
     // a new pin: the tag comes from c.version or the latest release, the SHA only from the upstream refs
     const wanted = c.version === '' ? null : checkTag(c.version, repo);
     const release = wanted === null ? await gh.latestRelease() : null;
     const tag = wanted ?? checkTag(release?.tag_name, repo);
-    const sha = await gh.tagCommit(tag);
-    if (sha === null) throw new PinError(`The tag ${tag} doesn't exist in ${repo}.`);
-    checkAge(`${repo} ${tag}`, releaseDates(release ?? (await gh.releaseByTag(tag)), tag, `${repo} ${tag}`));
+    const target = await gh.tagCommit(tag);
+    if (target.kind === 'missing') throw new PinError(`The tag ${tag} doesn't exist in ${repo}.`);
+    if (target.kind === 'not-commit') throw new PinError(`The tag ${tag} of ${repo} doesn't lead to a commit.`);
+    const sha = target.sha;
+    checkAge(`${repo} ${tag}`, releaseDates(release ?? (await gh.releaseByTag(tag)), tag, `${repo} ${tag}`, sha));
+    reviewNote(`${repo} ${tag}`, sha);
     return { ...c, version: tag, pin: { sha } };
   }
 
-  /** The release's own date: it must be published (not a draft) for exactly this tag; a missing release → age unknown. */
-  function releaseDates(release: Release | null, tag: string, what: string): unknown[] {
+  /**
+   * The release's own date: it must be published (not a draft, not a pre-release) for exactly this tag; a missing
+   * release → age unknown. With the tag's commit known, a release made from another commit means the tag moved.
+   */
+  function releaseDates(release: Release | null, tag: string, what: string, sha?: string): unknown[] {
     if (release === null || release.tag_name !== tag || release.draft === true) {
       throw new PinError(`Couldn't establish the age of ${what}: it has no published GitHub release, and pipegen doesn't trust commit dates. Not pinned.`);
+    }
+    if (release.prerelease === true) throw new PinError(`${what} is a pre-release; pipegen doesn't pin pre-releases.`);
+    const made = release.target_commitish;
+    if (sha !== undefined && typeof made === 'string' && /^[0-9a-fA-F]{40}$/.test(made) && made.toLowerCase() !== sha) {
+      throw new PinError(`The tag ${tag} was moved after its release was published. pipegen won't pin ${what}.`);
     }
     return [release.published_at];
   }
@@ -244,6 +283,7 @@ export async function resolvePin(c: Candidate, deps: PinDeps, install?: InstallS
     dates.push(chosen.updated_at);
     const base = `https://github.com/${repoSegments(repo).path}/releases/download/${encodeURIComponent(tag)}/`;
     const sums = checksumFiles(assets, chosen.name);
+    if (sums.length > MAX_CHECKSUM_FILES) throw new PinError(`${what} has more than ${MAX_CHECKSUM_FILES} checksums files; pipegen won't read only some of them.`);
     let checksum: string;
     if (sums.length > 0) {
       const found = new Set<string>();
@@ -266,6 +306,7 @@ export async function resolvePin(c: Candidate, deps: PinDeps, install?: InstallS
       checksum = hash.digest('hex');
       note(`checksumSource: computed. ${what} has no checksums file, so pipegen downloaded ${chosen.name} and computed its sha256 itself; a reviewer must confirm it.`);
     }
+    reviewNote(what, checksum);
     return { ...c, version: tag, pin: { checksum } };
   }
 
@@ -287,6 +328,7 @@ export async function resolvePin(c: Candidate, deps: PinDeps, install?: InstallS
     if (!SRI_SHA512_RE.test(integrity)) throw new PinError(`npm has no sha512 integrity for ${what}.`);
     const times = npmTimesSchema.safeParse(await getJson(`npm's publish times of ${pkg}`, `${NPM}${npmEscapedName(pkg)}`, MAX_PACKUMENT_BYTES));
     checkAge(what, [times.success ? times.data.time[version] : undefined]);
+    reviewNote(what, integrity);
     return { ...c, version, pin: { checksum: integrity } };
   }
 
@@ -317,6 +359,7 @@ export async function resolvePin(c: Candidate, deps: PinDeps, install?: InstallS
     const hex = file.digests.sha256;
     if (!SHA256_RE.test(hex)) throw new PinError(`PyPI has no readable sha256 for ${what}.`);
     checkAge(what, [file.upload_time_iso_8601]);
+    reviewNote(what, hex);
     return { ...c, version, pin: { checksum: hex } };
   }
 
@@ -339,13 +382,22 @@ export async function resolvePin(c: Candidate, deps: PinDeps, install?: InstallS
     const token = tokens.success ? (tokens.data.token ?? tokens.data.access_token) : undefined;
     if (token === undefined || !REGISTRY_TOKEN_RE.test(token)) throw new PinError(`The registry gave no usable anonymous pull token for ${image.display}.`);
     const res = await fetchAllowed(`${reg.api}${image.path.split('/').map(encodeURIComponent).join('/')}/manifests/${encodeURIComponent(tag)}`, {
-      method: 'HEAD', timeoutMs: REQUEST_TIMEOUT_MS, hosts: [new URL(reg.api).hostname],
+      method: 'HEAD', timeoutMs: REQUEST_TIMEOUT_MS, hosts: [new URL(reg.api).hostname], notFound: 'null',
       // the registry's own anonymous token, sent only to that registry; never the user's credential
-      headers: { accept: INDEX_TYPES.join(', '), ['author' + 'ization']: `Bearer ${token}` },
+      headers: { accept: INDEX_TYPES.join(', '), authorization: `Bearer ${token}` },
     });
+    if (res === null) {
+      if (stored === undefined) throw new PinError(`The tag ${tag} of ${image.display} doesn't exist.`);
+      note(`The tag ${tag} of ${image.display} no longer exists; pipegen keeps the reviewed image ${stored}.`);
+      return c;
+    }
     await res.body?.cancel().catch(() => {});
     const type = (res.headers.get('content-type') ?? '').split(';')[0]?.trim() ?? '';
-    if (!INDEX_TYPES.includes(type)) throw new PinError(`${image.display}:${tag} isn't a multi-platform image index; pipegen pins the index digest only.`);
+    if (!INDEX_TYPES.includes(type)) {
+      if (stored === undefined) throw new PinError(`${image.display}:${tag} isn't a multi-platform image index; pipegen pins the index digest only.`);
+      deps.alert(new PinMovedWarning(image.display, tag, stored, NOT_AN_INDEX, 'image'));
+      return c; // the stored, reviewed digest: never replaced
+    }
     const digest = res.headers.get('docker-content-digest') ?? '';
     if (!DIGEST_RE.test(digest)) throw new PinError(`The registry gave no readable digest for ${image.display}:${tag}.`);
     if (stored !== undefined) {
@@ -357,6 +409,7 @@ export async function resolvePin(c: Candidate, deps: PinDeps, install?: InstallS
     const hub = hubTagSchema.safeParse(await getJson(`Docker Hub's record of ${image.display}:${tag}`, `${DOCKER_HUB_API}${encodeURIComponent(ns)}/${encodeURIComponent(name)}/tags/${encodeURIComponent(tag)}`, MAX_JSON_BYTES));
     if (!hub.success || hub.data.digest !== digest) throw new PinError(`Couldn't establish the age of ${image.display}:${tag}: Docker Hub's record doesn't match the digest. Not pinned.`);
     checkAge(`${image.display}:${tag}`, [hub.data.tag_last_pushed]);
+    reviewNote(`${image.display}:${tag}`, digest);
     return { ...c, version: tag, pin: { digest } };
   }
 
@@ -402,27 +455,29 @@ export async function resolvePin(c: Candidate, deps: PinDeps, install?: InstallS
         return r;
       },
       releaseByTag: (tag: string) => call(`the release ${tag}`, () => deps.gh.rest.repos.getReleaseByTag({ owner, repo: name, tag }), releaseSchema),
-      /** The commit a tag points to, from the repo's own refs (annotated tags dereferenced); null when the tag doesn't exist. */
-      tagCommit: async (tag: string): Promise<string | null> => {
+      /** Where a tag leads, from the repo's own refs (annotated tags dereferenced, at most MAX_TAG_DEPTH deep). */
+      tagCommit: async (tag: string): Promise<TagTarget> => {
         const r = await call(`the tag ${tag}`, () => deps.gh.request('GET /repos/{owner}/{repo}/git/ref/tags/{tag}', { owner, repo: name, tag }), refSchema);
-        if (r === null) return null;
+        if (r === null) return { kind: 'missing' };
         if (r.ref !== `refs/tags/${tag}`) throw new PinError(`GitHub answered with another ref for the tag ${tag} of ${repo}.`);
         let obj = r.object;
         for (let depth = 0; obj.type === 'tag'; depth++) {
-          if (depth >= MAX_TAG_DEPTH || !COMMIT_SHA_RE.test(obj.sha)) throw new PinError(`The tag ${tag} of ${repo} doesn't lead to a commit.`);
+          if (depth >= MAX_TAG_DEPTH || !COMMIT_SHA_RE.test(obj.sha)) return { kind: 'not-commit' };
           const sha = obj.sha;
           const t = await call(`the tag ${tag}`, () => deps.gh.rest.git.getTag({ owner, repo: name, tag_sha: sha }), tagObjectSchema);
-          if (t === null) throw new PinError(`The tag ${tag} of ${repo} doesn't lead to a commit.`);
+          if (t === null) return { kind: 'not-commit' };
           obj = t.object;
         }
-        if (obj.type !== 'commit' || !COMMIT_SHA_RE.test(obj.sha)) throw new PinError(`The tag ${tag} of ${repo} doesn't point to a commit.`);
-        return obj.sha;
+        if (obj.type !== 'commit' || !COMMIT_SHA_RE.test(obj.sha)) return { kind: 'not-commit' };
+        return { kind: 'commit', sha: obj.sha };
       },
     };
   }
 
   /** A fetch with no credential, following redirects by hand to the allowed https hosts only. */
-  async function fetchAllowed(url: string, opts: { method: 'GET' | 'HEAD'; timeoutMs: number; hosts: readonly string[]; headers?: Record<string, string> }): Promise<Response> {
+  async function fetchAllowed(url: string, opts: FetchOptions & { notFound: 'null' }): Promise<Response | null>;
+  async function fetchAllowed(url: string, opts: FetchOptions): Promise<Response>;
+  async function fetchAllowed(url: string, opts: FetchOptions & { notFound?: 'null' }): Promise<Response | null> {
     let current = new URL(url);
     for (let hop = 0; ; hop++) {
       if (current.protocol !== 'https:' || !opts.hosts.includes(current.hostname) || current.port !== '' || current.username !== '' || current.password !== '') {
@@ -445,6 +500,7 @@ export async function resolvePin(c: Candidate, deps: PinDeps, install?: InstallS
       }
       if (!res.ok) {
         await res.body?.cancel().catch(() => {});
+        if (res.status === 404 && opts.notFound === 'null') return null;
         throw new PinError(`${current.host} answered HTTP ${res.status} for ${current.pathname}.`);
       }
       return res;
@@ -513,7 +569,7 @@ function checksumFiles(assets: Asset[], asset: string): Asset[] {
   const own = new Set([`${asset}.sha256`, `${asset}.sha256sum`, `${asset}.sha256.txt`]);
   const owned = assets.filter((a) => own.has(a.name));
   const combined = assets.filter((a) => !own.has(a.name) && COMBINED_SUMS_RE.test(a.name) && !/512|sha1|md5/i.test(a.name));
-  return [...owned, ...combined].slice(0, MAX_CHECKSUM_FILES);
+  return [...owned, ...combined];
 }
 
 /** The sha256 a checksums file gives for `asset` (`<hex>  [*]<name>` lines; a per-asset file may hold the hex alone). */
