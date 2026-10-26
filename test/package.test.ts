@@ -41,7 +41,7 @@ describe('build', () => {
     for (const name of shimRequires(out)) expect(isBuiltin(name), `non-builtin require: ${name}`).toBe(true);
   });
 
-  it('a probe bundled with the same options runs readProject and bundleCode under plain node', async () => {
+  it('a probe bundled with the same options runs readProject, bundleCode and makeProvider under plain node', async () => {
     const outDir = makeTempDir();
     await build({ ...tsupOptions, entry: { probe: 'test/helpers/bundle-probe.ts' }, outDir, config: false, silent: true });
     const probe = join(outDir, 'probe.js');
@@ -57,8 +57,9 @@ describe('build', () => {
       const err = e as { status?: number; stderr?: string };
       throw new Error(`probe exited with ${err.status}: ${String(err.stderr).split('\n').slice(0, 8).join('\n')}`);
     }
-    const result = JSON.parse(stdout.trim()) as { owner: string; repo: string; services: string[]; files: number; bytes: number; gitleaksChecked: boolean };
-    expect(result).toMatchObject({ owner: 'o', repo: 'r', services: ['.'], gitleaksChecked: false });
+    const result = JSON.parse(stdout.trim()) as { owner: string; repo: string; services: string[]; files: number; bytes: number; gitleaksChecked: boolean; providers: string[] };
+    expect(result).toMatchObject({ owner: 'o', repo: 'r', services: ['.'], gitleaksChecked: false, providers: ['claude', 'openai', 'ollama'] });
+    expect(code).toContain('server-side-fallback-2026-07-01'); // the Anthropic SDK client really is in the bundle
     expect(result.files).toBeGreaterThan(0);
     expect(result.bytes).toBeGreaterThan(0);
   });
