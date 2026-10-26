@@ -47,7 +47,7 @@ export class PackageCheckError extends Error {
 
 // ---------- schema ----------
 
-const ID_RE = /^[a-z0-9][a-z0-9-]{0,63}$/;
+export const ID_RE = /^[a-z0-9][a-z0-9-]{0,63}$/;
 const INPUT_RE = /^[A-Za-z_][A-Za-z0-9_-]{0,63}$/;
 const ENV_RE = /^[A-Za-z_][A-Za-z0-9_]{0,127}$/;
 const TAG_RE = /^[A-Za-z0-9][A-Za-z0-9._+-]{0,127}$/;
