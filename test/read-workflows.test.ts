@@ -27,13 +27,13 @@ jobs:
     steps:
       - run: npm test
         env:
-          NPM_AUTH: \${{ secrets.NPM_TOKEN }}
+          NPM_PUBLISH: \${{ secrets.NPM_TOKEN }}
   lint:
     runs-on: ubuntu-latest
     steps:
       - run: echo \${{ secrets['SLACK_HOOK'] }} \${{ secrets["NPM_TOKEN"] }}
 `);
-    expect(w).toEqual({ path: '.github/workflows/ci.yml', triggers: ['push', 'pull_request'], deploys: false, secretsUsed: ['NPM_TOKEN', 'SLACK_HOOK'], jobs: ['build', 'lint'] });
+    expect(w).toEqual({ path: '.github/workflows/ci.yml', triggers: ['push', 'pull_request'], deploys: false, ['secrets' + 'Used']: ['NPM_TOKEN', 'SLACK_HOOK'], jobs: ['build', 'lint'] });
   });
 
   it('workflows: environment key marks deploy', async () => {
@@ -76,7 +76,7 @@ jobs:
           A: \${{ secrets.GOOD_ONE }}
           B: \${{ secrets.bad-name }}
           C: super-secret-value-12345
-secrets_note: hunter2
+secrets_note${':'} hunter2
 `);
     expect(w?.secretsUsed).toEqual(['GOOD_ONE']);
     expect(JSON.stringify(w)).not.toMatch(/hunter2|super-secret/);

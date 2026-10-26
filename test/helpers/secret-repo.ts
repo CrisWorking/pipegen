@@ -14,7 +14,7 @@ export const fake = {
   jwt: () => ['ey' + 'J' + 'hbGciOiJIUzI1NiJ9', 'ey' + 'J' + 'zdWIiOiIxIn0', 'g'.repeat(24)].join('.'),
   slackWebhook: () => 'https://hooks.' + 'slack.com/' + 'services/' + 'T0000/B0000/' + 'h'.repeat(24),
   googleKey: () => 'AI' + 'za' + 'j'.repeat(35),
-  npmAuth: () => 'np' + 'm_' + 'k'.repeat(36),
+  npmPublish: () => 'np' + 'm_' + 'k'.repeat(36),
   keyBegin: () => '-----' + 'BEGIN ' + KEY_KIND + '-----',
   keyEnd: () => '-----' + 'END ' + KEY_KIND + '-----',
   keyBody: () => 'MIIEo' + 'w'.repeat(59),
@@ -34,7 +34,7 @@ export function makeSecretRepo(): SecretRepo {
   const gh = fake.githubClassic();
   const jwt = fake.jwt();
   const hook = fake.slackWebhook();
-  const npm = fake.npmAuth();
+  const npm = fake.npmPublish();
   const body = fake.keyBody();
   const envPass = 'env' + 'pass' + 'value1';
   const tfstate = 'tfstate' + 'value2';
@@ -44,7 +44,7 @@ export function makeSecretRepo(): SecretRepo {
 
   writeIn(dir, '.env', fake.assign('PASS' + 'WORD', 'x') + '\n' + fake.assign('DB_PASS', envPass) + '\n');
   writeIn(dir, '.env.example', 'DB_HOST=\nDB_PORT=\n');
-  writeIn(dir, 'package.json', JSON.stringify({ name: 'app', scripts: { release: `GH_AUTH=${gh} npm publish`, start: 'node src/app.ts' } }, null, 2) + '\n');
+  writeIn(dir, 'package.json', JSON.stringify({ name: 'app', scripts: { release: `GH_PUBLISH=${gh} npm publish`, start: 'node src/app.ts' } }, null, 2) + '\n');
   writeIn(dir, 'config/dev.pem', `${fake.keyBegin()}\n${body}\n${body}\n${fake.keyEnd()}\n`);
   writeIn(dir, 'infra/prod.tfstate', JSON.stringify({ outputs: { db: { value: tfstate } } }) + '\n');
   writeIn(dir, 'infra/prod.tfvars', `db_value = "${tfvars}"\n`);

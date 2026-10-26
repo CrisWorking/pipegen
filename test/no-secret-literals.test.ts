@@ -16,8 +16,8 @@ function repoFiles(dir: string): string[] {
 
 describe('fixtures', () => {
   it('fixtures: secret-like strings built at runtime; no redact pattern matches any committed file under test/', () => {
-    // the runtime-built values really are secret-like: each one is fully redacted
-    for (const v of [fake.githubClassic(), fake.githubPat(), fake.stripeKey(), fake.openaiKey(), fake.awsKey(), fake.slackBot(), fake.jwt(), fake.slackWebhook(), fake.googleKey(), fake.npmAuth()]) {
+    // the runtime-built values really look like secrets, and each one is fully redacted
+    for (const v of [fake.githubClassic(), fake.githubPat(), fake.stripeKey(), fake.openaiKey(), fake.awsKey(), fake.slackBot(), fake.jwt(), fake.slackWebhook(), fake.googleKey(), fake.npmPublish()]) {
       expect(redact(v), v.slice(0, 3)).toBe('[REDACTED]');
     }
     const testFiles = repoFiles('test');

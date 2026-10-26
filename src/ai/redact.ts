@@ -15,6 +15,7 @@ export class GitleaksRequiredError extends Error {}
 /** gitleaks could not run or gave an unusable result (not a finding): no bundle is returned. */
 export class GitleaksError extends Error {}
 
+/** `bytes` is the exact UTF-8 size of bundleText(bundle) (wrapper and per-file headers included), never over maxBytes. */
 export interface CodeBundle { files: { path: string; content: string }[]; bytes: number; truncated: boolean; gitleaksChecked: boolean; notes: string[] }
 
 export interface BundleOptions {
@@ -54,6 +55,8 @@ export const EXCLUDED_PATTERNS: readonly string[] = Object.freeze([
   '**/.npmrc', '**/.netrc',
   '**/*.p12', '**/*.pfx', '**/*.jks',
   '**/kubeconfig', '**/kubeconfig.*', '**/*.kubeconfig', '**/.kube/config', '**/.kube/**',
+  '**/.git-credentials', '**/.aws/credentials', '**/.aws/config', '**/credentials.json', '**/.pgpass', '**/.pypirc',
+  '**/.docker/config.json', '**/*.env', '**/*.keystore', '**/*.ppk', '**/*.p8', '**/.htpasswd', '**/service-account*.json',
   ...LOCKFILES.map((f) => `**/${f}`),
   ...IGNORED_DIRS.map((d) => `**/${d}/**`),
 ]);
@@ -80,27 +83,60 @@ const TOKEN_RULES: readonly (readonly [string, RegExp])[] = [
   ['slack-token', /xox[abpr]-[A-Za-z0-9-]+/g],
   ['stripe-key', /sk_(?:live|test)_[A-Za-z0-9]{10,}/g],
   ['sk-api-key', /sk-[A-Za-z0-9_-]{20,}/g],
-  ['jwt', /eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+/g],
+  // starts where a token starts (lookbehind): a failed match then costs one scan of the run, not one per 'eyJ'
+  ['jwt', /(?<![A-Za-z0-9_-])eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+/g],
   ['slack-webhook', /https:\/\/hooks\.slack\.com\/(?:services|workflows|triggers)\/[A-Za-z0-9/_-]+/g],
   ['google-api-key', /AIza[0-9A-Za-z_-]{35}/g],
   ['npm-token', /npm_[A-Za-z0-9]{36}/g],
 ];
-// Connection string: keeps scheme, user and host; only the password between ':' and '@' is replaced.
-const CONNECTION_STRING = /([a-z][a-z0-9+.-]*:\/\/[^:/\s]+:)[^@\s]+@/gi;
-// A value assigned to a password-like name: the name and separator stay, the value is replaced.
-const ASSIGNED_VALUE = /(password|passwd|secret|token|api[_-]?key)(\s*[:=]\s*)\S+/gi;
+// Connection string (scheme, '://', user, ':', password, '@', host): scheme, user (may be empty) and host stay. Everything
+// from the ':' after the user up to the LAST '@' of the authority is hidden, so an unencoded '@' in the
+// password cannot leak the rest of it. The candidate runs to the next space or quote; hideConnectionPassword
+// decides where the authority ends.
+const CONNECTION_STRING = /((?<![a-z0-9+.-])[a-z][a-z0-9+.-]*:\/\/[^:/\s@]*:)([^\s'"`<>]*)/gi;
+
+function hideConnectionPassword(whole: string, head: string, rest: string): string {
+  const first = rest.indexOf('@');
+  if (first < 0) return whole; // no credentials (e.g. host:port)
+  let authorityEnd = rest.length;
+  for (const c of ['/', '?', '#']) {
+    const k = rest.indexOf(c, first);
+    if (k >= 0 && k < authorityEnd) authorityEnd = k;
+  }
+  return head + R + rest.slice(rest.lastIndexOf('@', authorityEnd - 1));
+}
+
+// A value given to a password-like name. The name may carry other name characters around the keyword
+// (AWS_SECRET_ACCESS_KEY, apiKeyProd, db.password) and may be quoted ("password": ...); the separator is
+// ':', '=', '=>' or ':='. The value is a quoted string (quotes kept, escapes honoured) or the next
+// non-space run. Only the value is replaced. This also hides type annotations such as `token: string`:
+// over-redacting is the safe direction. A match may only start where a name starts (the lookbehind), and
+// the keyword is checked by a lookahead inside that name, so a long name is scanned once (linear time).
+const KEYWORDS = 'password|passwd|pwd|secret|token|api[_-]?key|private[_-]?key|access[_-]?key|client[_-]?secret|auth';
+const ASSIGNED_VALUE = new RegExp(
+  `((?<![\\w.-])(?=[\\w.-]*?(?:${KEYWORDS}))[\\w.-]+["'\`]?\\s*(?:=>|:=|:|=)\\s*)` +
+  `("(?:[^"\\\\]|\\\\.)*"|'(?:[^'\\\\]|\\\\.)*'|\`(?:[^\`\\\\]|\\\\.)*\`|\\S+)`,
+  'gi',
+);
+
+function hideAssignedValue(_whole: string, head: string, value: string): string {
+  const q = value[0];
+  const quoted = value.length >= 2 && (q === '"' || q === "'" || q === '`') && value.endsWith(q);
+  return head + (quoted ? q + R + q : R);
+}
 
 // Private key markers, found without a regex so they are seen on lines of any length.
 const MARK_START = '-----';
-const KEY_TAIL = 'PRIVATE KEY';
+const KEY_TAILS = ['PRIVATE KEY', 'PRIVATE KEY BLOCK'];
 
-/** Finds `-----BEGIN [A-Z ]*PRIVATE KEY-----` (or END) in `line` from `from`. Linear time. */
+/** Finds `-----BEGIN [A-Z ]*PRIVATE KEY-----` or `... PRIVATE KEY BLOCK-----` (PGP), or END, in `line` from `from`. Linear time. */
 function findKeyMarker(line: string, kind: 'BEGIN' | 'END', from: number): { start: number; end: number } | null {
   const head = `${MARK_START}${kind} `;
   for (let i = line.indexOf(head, from); i >= 0; i = line.indexOf(head, i + 1)) {
     let j = i + head.length;
     while (j < line.length && (line[j] === ' ' || (line[j] >= 'A' && line[j] <= 'Z'))) j++;
-    if (line.slice(i + head.length, j).endsWith(KEY_TAIL) && line.startsWith(MARK_START, j)) return { start: i, end: j + MARK_START.length };
+    const label = line.slice(i + head.length, j);
+    if (KEY_TAILS.some((t) => label.endsWith(t)) && line.startsWith(MARK_START, j)) return { start: i, end: j + MARK_START.length };
   }
   return null;
 }
@@ -108,8 +144,8 @@ function findKeyMarker(line: string, kind: 'BEGIN' | 'END', from: number): { sta
 function redactSegment(s: string): string {
   let out = s;
   for (const [, re] of TOKEN_RULES) out = out.replace(re, R);
-  out = out.replace(CONNECTION_STRING, `$1${R}@`);
-  return out.replace(ASSIGNED_VALUE, `$1$2${R}`);
+  out = out.replace(CONNECTION_STRING, hideConnectionPassword);
+  return out.replace(ASSIGNED_VALUE, hideAssignedValue);
 }
 
 /**
@@ -165,7 +201,7 @@ export function findSecretLike(text: string): string[] {
     if (findKeyMarker(line, 'BEGIN', 0)) found.add('private-key');
     if (!regexSafe(line)) continue;
     for (const [name, re] of TOKEN_RULES) if (line.search(re) >= 0) found.add(name);
-    if (line.search(CONNECTION_STRING) >= 0) found.add('connection-string-password');
+    if (line.replace(CONNECTION_STRING, hideConnectionPassword) !== line) found.add('connection-string-password');
   }
   return [...found];
 }
@@ -178,12 +214,8 @@ const stripPadding = (s: string) => {
   return s.slice(0, end);
 };
 
-/**
- * Replaces every value the user typed with [REDACTED]: the exact value, its base64 forms (standard and
- * URL-safe, with and without `=` padding) and its encodeURIComponent form. Empty and whitespace-only
- * values are ignored; longer forms are replaced first. Plain substring replacement, no regex.
- */
-export function scrubKnownValues(text: string, values: string[]): string {
+/** Every form of a typed value that is looked for (see scrubKnownValues). */
+function knownForms(values: string[]): string[] {
   const forms = new Set<string>();
   for (const raw of values) {
     if (typeof raw !== 'string') continue;
@@ -191,18 +223,50 @@ export function scrubKnownValues(text: string, values: string[]): string {
       if (v.trim() === '') continue;
       const b64 = Buffer.from(v, 'utf8').toString('base64');
       const urlSafe = b64.replaceAll('+', '-').replaceAll('/', '_');
-      for (const f of [v, b64, stripPadding(b64), urlSafe, stripPadding(urlSafe)]) forms.add(f);
+      forms.add(v).add(b64).add(stripPadding(b64)).add(urlSafe).add(stripPadding(urlSafe));
+      forms.add(JSON.stringify(v).slice(1, -1)); // as written inside a JSON string
       try {
-        forms.add(encodeURIComponent(v));
+        const enc = encodeURIComponent(v);
+        const lower = enc.replace(/%[0-9A-F]{2}/g, (m) => m.toLowerCase()); // our own value, not repo text
+        forms.add(enc).add(lower).add(enc.replaceAll('%20', '+')).add(lower.replaceAll('%20', '+')); // + form-encoded
       } catch {
         // a lone surrogate has no URL-encoded form
       }
     }
   }
-  const ordered = [...forms].filter((f) => f.trim() !== '').sort((a, b) => b.length - a.length || (a < b ? -1 : a > b ? 1 : 0));
-  let out = text;
-  for (const f of ordered) if (out.includes(f)) out = out.split(f).join(R);
-  return out;
+  return [...forms].filter((f) => f.trim() !== '');
+}
+
+/**
+ * Replaces every value the user typed with [REDACTED]: the exact value, its base64 forms (standard and
+ * URL-safe, with and without `=` padding), its URL-encoded forms (encodeURIComponent, lowercase percent
+ * escapes, `+` for spaces) and its JSON-escaped form. Empty and whitespace-only values are ignored.
+ * Every occurrence of every form is found in the original text first (plain substring search, no regex),
+ * overlapping or touching matches are merged, and each merged span becomes one [REDACTED], so overlapping
+ * values cannot leave a piece behind.
+ * Known limit: the base64 of a value embedded at a non-aligned offset inside a longer base64 blob (e.g.
+ * base64 of "user:value") is not detected; the gitleaks pass is the second line of defence there.
+ */
+export function scrubKnownValues(text: string, values: string[]): string {
+  const spans: [number, number][] = [];
+  for (const f of knownForms(values)) {
+    for (let i = text.indexOf(f); i >= 0; i = text.indexOf(f, i + 1)) spans.push([i, i + f.length]);
+  }
+  if (spans.length === 0) return text;
+  spans.sort((a, b) => a[0] - b[0] || b[1] - a[1]);
+  let out = '';
+  let pos = 0;
+  let [start, end] = spans[0];
+  for (const [s, e] of spans) {
+    if (s <= end) {
+      end = Math.max(end, e);
+      continue;
+    }
+    out += text.slice(pos, start) + R;
+    pos = end;
+    [start, end] = [s, e];
+  }
+  return out + text.slice(pos, start) + R + text.slice(end);
 }
 
 // ---------- default priority ----------
@@ -271,18 +335,24 @@ const insideDir = (base: string, target: string) => {
 
 /**
  * Collects the repo's code for the AI: lists files (symlinks never followed), drops EXCLUDED_PATTERNS
- * matches and binaries, reads within the read limits, then redact() → scrubKnownValues (if knownValues)
- * → the gitleaks pass (if opts.gitleaks) → cuts to maxBytes by priority (whole files, lowest priority
- * first). Without opts.gitleaks the result is for counting only: bundleText refuses it.
+ * matches and binaries, reads within the read limits, then scrubKnownValues → redact() → scrubKnownValues
+ * (known values only when given) → the gitleaks pass (if opts.gitleaks; it also removes every secret it
+ * found from all files, and the known values again) → cuts to maxBytes by priority (whole files, lowest
+ * priority first, sized as the final bundleText). Without opts.gitleaks the result is for counting only:
+ * bundleText refuses it.
  */
 export async function bundleCode(dir: string, opts: BundleOptions = {}): Promise<CodeBundle> {
   const maxBytes = opts.maxBytes ?? DEFAULT_MAX_BYTES;
-  if (!Number.isFinite(maxBytes) || maxBytes <= 0) throw new RangeError('maxBytes must be a positive number.');
+  if (!Number.isFinite(maxBytes) || maxBytes < MIN_MAX_BYTES) throw new RangeError(`maxBytes must be a number of at least ${MIN_MAX_BYTES}.`);
   const roots = normalizeRoots(opts.roots);
   const priority = opts.priority ?? defaultPriority;
   const known = opts.knownValues ?? [];
   const scrub = (s: string) => (known.length > 0 ? scrubKnownValues(s, known) : s);
-  const nameHidden = (p: string) => redact(p) !== p || scrub(p) !== p;
+  // Known values first (so redact() cannot break one up and leave pieces), then redact(), then known values
+  // again in case a redaction exposed a new exact match. The same order applies to file names.
+  const clean = (s: string) => scrub(redact(scrub(s)));
+  const flagged: string[] = []; // secrets the gitleaks pass found; a path holding one is never shown
+  const nameHidden = (p: string) => clean(p) !== p || flagged.some((v) => p.includes(v));
   const show = (p: string) => (nameHidden(p) ? '(a file whose name looks like a secret)' : safeText(p, 300));
   const notes = new Notes();
   const inRoots = (p: string) => roots === null || roots.some((r) => underRoot(p, r));
@@ -336,10 +406,10 @@ export async function bundleCode(dir: string, opts: BundleOptions = {}): Promise
       (result.skipped === 'link' ? links : skipped[result.skipped]).push(path);
       continue;
     }
-    const content = scrub(redact(result.text));
-    const bytes = Buffer.byteLength(content);
-    if (bytes > maxBytes) { tooBig.push(path); continue; }
-    collected.push({ path, content });
+    const entry = { path, content: clean(result.text) };
+    const bytes = blockBytes(entry);
+    if (WRAPPER_BYTES + bytes > maxBytes) { tooBig.push(path); continue; }
+    collected.push(entry);
     collectedBytes += bytes;
   }
 
@@ -354,19 +424,20 @@ export async function bundleCode(dir: string, opts: BundleOptions = {}): Promise
 
   let gitleaksChecked = false;
   if (opts.gitleaks !== undefined) {
-    collected = await gitleaksPass(collected, opts.gitleaks, opts.gitleaksTimeoutMs ?? GITLEAKS_TIMEOUT_MS, notes, show);
+    collected = await gitleaksPass(collected, opts.gitleaks, opts.gitleaksTimeoutMs ?? GITLEAKS_TIMEOUT_MS, known, flagged, notes, show);
     gitleaksChecked = true;
   } else {
     notes.add('gitleaks was not run: this bundle is for counting only and cannot be sent to the AI.');
   }
 
-  // Cut to maxBytes: keep the highest-priority files that fit; once one does not fit, the rest are dropped.
+  // Cut to maxBytes, counted as the exact size of bundleText (wrapper and per-file headers included): keep
+  // the highest-priority files that fit; once one does not fit, the rest are dropped.
   const files: FileEntry[] = [];
   const dropped: string[] = [];
-  let bytes = 0;
+  let bytes = WRAPPER_BYTES;
   for (const f of collected) {
-    const b = Buffer.byteLength(f.content);
-    if (b > maxBytes) tooBig.push(f.path);
+    const b = blockBytes(f);
+    if (WRAPPER_BYTES + b > maxBytes) tooBig.push(f.path);
     else if (dropped.length === 0 && bytes + b <= maxBytes) {
       files.push(f);
       bytes += b;
@@ -459,18 +530,33 @@ function applyFinding(content: string, f: Finding): string | null {
 // gitleaks skips any line holding its inline allow comment; the bundle never carries one, so a repo cannot opt a line out.
 const ALLOW_COMMENT = 'gitleaks' + ':allow';
 
-async function gitleaksPass(files: FileEntry[], bin: string, timeoutMs: number, notes: Notes, show: (p: string) => string): Promise<FileEntry[]> {
+const PATHS_FILE = 'paths.txt';
+
+/**
+ * Scans the (already cleaned) files with gitleaks and returns what may be sent. Every finding is replaced
+ * where it was reported; then every secret gitleaks found (and the known values) is removed from ALL files
+ * in all its forms, so a secret reported on one line cannot survive on another line or in another file.
+ * The bundle paths are scanned too (paths.txt, one per line, as bundleText shows them); a file whose path
+ * gitleaks flags, or whose path holds a found secret, is left out. Found secrets are added to `flagged`.
+ */
+async function gitleaksPass(files: FileEntry[], bin: string, timeoutMs: number, known: string[], flagged: string[], notes: Notes, show: (p: string) => string): Promise<FileEntry[]> {
   // An absolute path only: a bare name would be looked up on PATH.
   if (!isAbsolute(bin)) throw new GitleaksError('The gitleaks binary must be given as an absolute path.');
-  const config = gitleaksConfigPath();
-  if (!(await stat(config).catch(() => null))?.isFile()) throw new GitleaksError("pipegen's gitleaks config (data/gitleaks-bundle.toml) is missing.");
+  let config: string;
+  try {
+    config = gitleaksConfigPath();
+  } catch (e) {
+    throw new GitleaksError(e instanceof Error ? e.message : "pipegen's gitleaks config could not be found.");
+  }
   const scanned = files.map((f) => ({ path: f.path, content: f.content.split(ALLOW_COMMENT).join('gitleaks-allow') }));
+  const shownPaths = scanned.map((f) => displayPath(f.path));
   const tmp = await realpath(await mkdtemp(join(tmpdir(), 'pipegen-gitleaks-')));
   try {
     await chmod(tmp, 0o700);
     // Neutral names: no repo file name (.gitleaksignore, .gitleaks.toml, allowlisted paths) reaches gitleaks.
     const names = scanned.map((_, i) => `f${String(i + 1).padStart(6, '0')}.txt`);
     for (let i = 0; i < scanned.length; i++) await writeFile(join(tmp, names[i]), scanned[i].content, { flag: 'wx', mode: 0o600 });
+    await writeFile(join(tmp, PATHS_FILE), shownPaths.join('\n').split(ALLOW_COMMENT).join('gitleaks-allow'), { flag: 'wx', mode: 0o600 });
     const reportPath = join(tmp, 'report.json');
     const code = await runGitleaks(bin, ['detect', '--no-git', '--source', tmp, '--config', config, '--report-format', 'json', '--report-path', reportPath], tmp, timeoutMs);
     if (code !== 0 && code !== 1) throw new GitleaksError(`gitleaks failed (exit code ${code}).`);
@@ -480,10 +566,33 @@ async function gitleaksPass(files: FileEntry[], bin: string, timeoutMs: number, 
     const perFile = new Map<number, Finding[]>();
     const drop = new Set<number>();
     const unplaced = new Set<number>();
+    const badPath = new Set<number>();
+    const secrets = new Set<string>();
     let strays = 0;
     for (const f of findings) {
+      // The secret-bearing text of every finding is removed everywhere below.
+      const found = f.secret !== '' ? f.secret : f.match;
+      if (found.trim() !== '' && found !== R) secrets.add(found);
       const abs = isAbsolute(f.file) ? resolve(f.file) : resolve(tmp, f.file);
-      const i = insideDir(tmp, abs) ? index.get(relative(tmp, abs)) : undefined;
+      const rel = insideDir(tmp, abs) ? relative(tmp, abs) : undefined;
+      if (rel === PATHS_FILE) {
+        // A finding in a file name: leave out the files on the reported lines, and any whose path holds the text.
+        const { startLine: s, endLine: e } = f;
+        let hit = false;
+        if (s !== undefined && e !== undefined && s <= e && e <= shownPaths.length) {
+          for (let k = s - 1; k < e; k++) badPath.add(k);
+          hit = true;
+        }
+        shownPaths.forEach((p, k) => {
+          if ((f.secret !== '' && p.includes(f.secret)) || (f.match !== '' && p.includes(f.match))) {
+            badPath.add(k);
+            hit = true;
+          }
+        });
+        if (!hit) shownPaths.forEach((_, k) => badPath.add(k)); // cannot tell which name: leave them all out
+        continue;
+      }
+      const i = rel === undefined ? undefined : index.get(rel);
       if (i !== undefined) {
         perFile.set(i, [...(perFile.get(i) ?? []), f]);
         continue;
@@ -509,13 +618,28 @@ async function gitleaksPass(files: FileEntry[], bin: string, timeoutMs: number, 
       if (content === null) drop.add(i);
       else scanned[i].content = content;
     }
+
+    // Remove every found secret (and the known values again) from every file, in all its forms, then check.
+    flagged.push(...secrets);
+    const everywhere = [...known, ...secrets];
+    const leftover = new Set<number>();
+    scanned.forEach((f, i) => {
+      if (everywhere.length > 0) f.content = scrubKnownValues(f.content, everywhere);
+      const bare = f.content.split(R).join('\u0000'); // a secret that is part of the word REDACTED is not a leftover
+      if ([...secrets].some((v) => bare.includes(v))) leftover.add(i);
+      if ([...secrets].some((v) => f.path.includes(v) || shownPaths[i].includes(v))) badPath.add(i);
+    });
+
+    const pathsOf = (set: Set<number>) => [...set].sort((a, b) => a - b).map((i) => scanned[i].path);
     notes.add(`gitleaks checked the bundle: ${plural(redacted, 'finding', 'findings')} redacted.`);
-    notes.addPaths('Left out because gitleaks found something pipegen could not locate to redact:', [...drop].sort((a, b) => a - b).map((i) => scanned[i].path), show);
+    notes.addPaths('Left out because gitleaks found something pipegen could not locate to redact:', pathsOf(drop), show);
+    notes.addPaths('Left out because a found secret was still in them after redaction:', pathsOf(leftover), show);
+    if (badPath.size > 0) notes.add(`Left out ${plural(badPath.size, 'file whose path', 'files whose paths')} gitleaks flagged as secret-like (names not shown).`);
     if (strays > 0) {
       notes.add(`Ignored ${plural(strays, 'gitleaks finding', 'gitleaks findings')} for a file outside the scanned folder.`);
-      notes.addPaths('Left out because a gitleaks finding outside the scanned folder may relate to them:', [...unplaced].sort((a, b) => a - b).map((i) => scanned[i].path), show);
+      notes.addPaths('Left out because a gitleaks finding outside the scanned folder may relate to them:', pathsOf(unplaced), show);
     }
-    return scanned.filter((_, i) => !drop.has(i) && !unplaced.has(i));
+    return scanned.filter((_, i) => !drop.has(i) && !unplaced.has(i) && !leftover.has(i) && !badPath.has(i));
   } finally {
     await rm(tmp, { recursive: true, force: true });
   }
@@ -546,15 +670,27 @@ function neutralizeTags(s: string): string {
  * `--- path ---` header. Byte-identical for the same bundle. Throws GitleaksRequiredError unless the
  * bundle is bundleCode's own result after a gitleaks pass, so unchecked code can never reach a provider.
  */
+const OPEN_TAG = '<code-bundle>\n';
+const CLOSE_TAG = '</code-bundle>';
+const WRAPPER_BYTES = Buffer.byteLength(OPEN_TAG + CLOSE_TAG);
+const MIN_MAX_BYTES = 64;
+
+/** A path as bundleText shows it (and as the gitleaks pass scans it). */
+function displayPath(path: string): string {
+  return neutralizeTags(safeText(path, 1000));
+}
+
+/** One file's part of bundleText: header line, content, a final newline. */
+function fileBlock(f: FileEntry): string {
+  const content = neutralizeTags(f.content);
+  return `--- ${displayPath(f.path)} ---\n${content}${content === '' || content.endsWith('\n') ? '' : '\n'}`;
+}
+const blockBytes = (f: FileEntry) => Buffer.byteLength(fileBlock(f));
+
 export function bundleText(bundle: CodeBundle): string {
   if (bundle === null || typeof bundle !== 'object' || bundle.gitleaksChecked !== true || !CHECKED.has(bundle)) {
     throw new GitleaksRequiredError('This code bundle has not passed the required gitleaks check, so it cannot be sent to the AI.');
   }
   const files = [...bundle.files].sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
-  let out = '<code-bundle>\n';
-  for (const f of files) {
-    const content = neutralizeTags(f.content);
-    out += `--- ${neutralizeTags(safeText(f.path, 1000))} ---\n${content}${content === '' || content.endsWith('\n') ? '' : '\n'}`;
-  }
-  return `${out}</code-bundle>`;
+  return OPEN_TAG + files.map(fileBlock).join('') + CLOSE_TAG;
 }

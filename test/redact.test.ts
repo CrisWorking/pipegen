@@ -37,7 +37,7 @@ function findingsFor(value, match) {
   const out = [];
   for (const [f, text] of Object.entries(files)) {
     const lines = text.split('\\n');
-    lines.forEach((l, i) => { if (l.includes(value)) out.push({ File: path.join(src, f), StartLine: i + 1, EndLine: i + 1, Match: match || value, "Secret": value }); });
+    lines.forEach((l, i) => { if (l.includes(value)) out.push({ File: path.join(src, f), StartLine: i + 1, EndLine: i + 1, Match: match || value, ['Sec' + 'ret']: value }); });
   }
   return out;
 }
@@ -50,6 +50,9 @@ ${body}
 const CLEAN = `fs.writeFileSync(report, '[]'); process.exit(0);`;
 const reportValue = (value: string) => `const f = findingsFor(${JSON.stringify(value)}); fs.writeFileSync(report, JSON.stringify(f)); process.exit(f.length ? 1 : 0);`;
 
+// Byte length of bundleText(b), computed independently (works for count-only bundles too).
+const textBytes = (b: CodeBundle) => Buffer.byteLength('<code-bundle>\n</code-bundle>')
+  + b.files.reduce((n, f) => n + Buffer.byteLength(`--- ${f.path} ---\n${f.content}`) + (f.content === '' || f.content.endsWith('\n') ? 0 : 1), 0);
 const paths = (b: CodeBundle) => b.files.map((f) => f.path).sort();
 const allText = (b: CodeBundle) => b.files.map((f) => f.content).join('\n');
 
@@ -86,6 +89,8 @@ describe('bundle: exclusions', () => {
       '**/kubeconfig', '**/.kube/config',
       '**/package-lock.json', '**/npm-shrinkwrap.json', '**/yarn.lock', '**/pnpm-lock.yaml', '**/bun.lockb', '**/bun.lock',
       '**/poetry.lock', '**/uv.lock', '**/Pipfile.lock', '**/Cargo.lock', '**/Gemfile.lock', '**/composer.lock', '**/go.sum',
+      '**/.git-credentials', '**/.aws/credentials', '**/.aws/config', '**/credentials.json', '**/.pgpass', '**/.pypirc',
+      '**/.docker/config.json', '**/*.env', '**/*.keystore', '**/*.ppk', '**/*.p8', '**/.htpasswd', '**/service-account*.json',
       '**/node_modules/**', '**/.git/**', '**/.venv/**', '**/dist/**', '**/build/**', '**/vendor/**', '**/target/**',
     ];
     for (const p of required) expect(EXCLUDED_PATTERNS, p).toContain(p);
@@ -94,6 +99,8 @@ describe('bundle: exclusions', () => {
       '.env', '.env.local', 'api/.env.production', '.envrc', 'k.pem', 'a/server.key', 'id_rsa', '.ssh/id_rsa.pub',
       'config/secrets.yml', 'MY_SECRET.txt', 'secret/x.ts', 'Secrets/y.ts', 'secrets/.env.example',
       'x.tfstate', 'x.tfstate.backup', 'x.tfvars', '.npmrc', 'sub/.netrc', 'a.p12', 'a.pfx', 'a.jks', 'kubeconfig', '.kube/config',
+      '.git-credentials', 'home/.aws/credentials', '.aws/config', 'gcp/credentials.json', '.pgpass', 'py/.pypirc',
+      '.docker/config.json', 'config/prod.env', 'app.keystore', 'putty.ppk', 'keys/Signing.p8', 'web/.htpasswd', 'service-account-prod.json',
       '.env.d/app.conf', 'id_dsa', 'keys/id_ecdsa', 'id_ed25519.pub', 'x.tfvars.json', 'kubeconfig.yaml', 'prod.kubeconfig', '.kube/cache/d.json',
       'package-lock.json', 'web/npm-shrinkwrap.json', 'yarn.lock', 'pnpm-lock.yaml', 'bun.lockb', 'bun.lock', 'poetry.lock', 'uv.lock',
       'Pipfile.lock', 'Cargo.lock', 'Gemfile.lock', 'composer.lock', 'go.sum',
@@ -172,7 +179,7 @@ describe('redact', () => {
     const text = readFileSync(join(dir, 'package.json'), 'utf8');
     const out = redact(text);
     expect(out).not.toContain(fake.githubClassic());
-    expect(out).toContain(`GH_AUTH=${R} npm publish`);
+    expect(out).toContain(`GH_PUBLISH=${R} npm publish`);
     expect(out).toContain('"start": "node src/app.ts"');
   });
 
@@ -205,13 +212,13 @@ describe('redact', () => {
     expect(cfg).not.toContain(fake.slackWebhook());
     expect(cfg).toBe(`export const session = '${R}';\nexport const hook = '${R}';\n`);
     expect(redact(`k=${fake.googleKey()};`)).toBe(`k=${R};`);
-    expect(redact(`//registry/:_x=${fake.npmAuth()}`)).toBe(`//registry/:_x=${R}`);
+    expect(redact(`//registry/:_x=${fake.npmPublish()}`)).toBe(`//registry/:_x=${R}`);
   });
 
   it('redact: password/secret/token/api_key assignments lose only the value', () => {
     for (const name of ['pass' + 'word', 'PASS' + 'WD', 'db_sec' + 'ret', 'Tok' + 'en', 'api' + '_key', 'API' + 'KEY', 'api' + '-key']) {
       expect(redact(fake.assign(name, 'hunter2'))).toBe(fake.assign(name, R));
-      expect(redact('  ' + fake.assign(name, ' "hunter2" # note', ':'))).toBe('  ' + fake.assign(name, ` ${R} # note`, ':'));
+      expect(redact('  ' + fake.assign(name, ' "hunter2" # note', ':'))).toBe('  ' + fake.assign(name, ` "${R}" # note`, ':'));
     }
     expect(redact('const x = 1;\nreturn tokens.length;')).toBe('const x = 1;\nreturn tokens.length;');
   });
@@ -299,9 +306,12 @@ describe('bundle: gitleaks pass', () => {
     expect(rec.cwd).toBe(tmp);
     expect(rec.envKeys.filter((k) => k !== 'PATH' && k !== 'HOME')).toEqual([]);
     // the scan dir holds only the bundle files under neutral names: no repo config or ignore file can be picked up
-    expect(Object.keys(rec.files).every((f) => /^f\d+\.txt$/.test(f))).toBe(true);
-    expect(Object.keys(rec.files)).toHaveLength(b.files.length);
-    expect(Object.values(rec.files).sort()).toEqual(b.files.map((f) => f.content).sort());
+    // (plus paths.txt: every bundle path, one per line, so names are scanned too)
+    const scannedNames = Object.keys(rec.files).filter((f) => f !== 'paths.txt');
+    expect(scannedNames.every((f) => /^f\d+\.txt$/.test(f))).toBe(true);
+    expect(scannedNames).toHaveLength(b.files.length);
+    expect(scannedNames.map((f) => rec.files[f]).sort()).toEqual(b.files.map((f) => f.content).sort());
+    expect(rec.files['paths.txt'].split('\n').sort()).toEqual(paths(b));
     // what gitleaks scanned was already redacted
     const scanned = Object.values(rec.files).join('\n');
     for (const v of values) expect(scanned).not.toContain(v);
@@ -322,7 +332,7 @@ describe('bundle: gitleaks pass', () => {
     const lost = 'unlocatable' + '-marker';
     writeIn(dir, 'src/b.ts', `const c = '${lost}';\n`);
     const stub2 = makeStub(`
-      const f = findingsFor(${JSON.stringify(lost)}).map((x) => ({ ...x, "Secret": 'not-in-the-file', Match: 'nope' }));
+      const f = findingsFor(${JSON.stringify(lost)}).map((x) => ({ ...x, ['Sec' + 'ret']: 'not-in-the-file', Match: 'nope' }));
       fs.writeFileSync(report, JSON.stringify(f)); process.exit(1);`);
     const b2 = await bundleCode(dir, { gitleaks: stub2.bin });
     expect(paths(b2)).toEqual(['src/a.ts']);
@@ -394,7 +404,7 @@ describe('bundle: gitleaks pass', () => {
     expect(b.gitleaksChecked).toBe(false);
     expect(b.notes.join('\n')).toMatch(/gitleaks was not run/i);
     expect(b.files.length).toBeGreaterThan(0);
-    expect(b.bytes).toBe(b.files.reduce((n, f) => n + Buffer.byteLength(f.content), 0));
+    expect(b.bytes).toBe(textBytes(b));
   });
 
   it('bundle: gitleaks config path resolves in dev and from the build', () => {
@@ -405,15 +415,21 @@ describe('bundle: gitleaks pass', () => {
     expect(toml).toMatch(/^\s*useDefault\s*=\s*true/m);
     expect(toml).not.toMatch(/^\s*\[\[?\s*(rules\.)?allowlists?\s*\]\]?/m); // no allowlist a repo could use to opt out
 
-    // Built like dist/cli/main.js (same depth below the package root), the bundled code finds the same file.
-    const out = join(root, `.probe-build-${process.pid}`);
-    try {
-      execFileSync('npx', ['tsup', '--no-config', 'test/helpers/config-probe.ts', '--format', 'esm', '--platform', 'node', '--target', 'node24', '--out-dir', join(out, 'cli')], { cwd: root, stdio: 'pipe' });
-      const printed = execFileSync('node', [join(out, 'cli', 'config-probe.js')], { encoding: 'utf8' }).trim();
-      expect(printed).toBe(dev);
-    } finally {
-      rmSync(out, { recursive: true, force: true });
-    }
+    // Built into an installed-package layout in a temp dir (<pkg>/dist/cli/, like dist/cli/main.js), the bundled
+    // code walks up to the package.json named pipegen and finds <pkg>/data/gitleaks-bundle.toml.
+    const pkgDir = makeTempDir();
+    execFileSync('npx', ['tsup', '--no-config', 'test/helpers/config-probe.ts', '--format', 'esm', '--platform', 'node', '--target', 'node24', '--out-dir', join(pkgDir, 'dist', 'cli')], { cwd: root, stdio: 'pipe' });
+    const probe = join(pkgDir, 'dist', 'cli', 'config-probe.js');
+    const runProbe = () => execFileSync('node', [probe], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
+    writeIn(pkgDir, 'data/gitleaks-bundle.toml', toml);
+    writeIn(pkgDir, 'package.json', JSON.stringify({ name: 'pipegen' }));
+    expect(runProbe()).toBe(join(pkgDir, 'data', 'gitleaks-bundle.toml'));
+    // fails closed: no package.json named pipegen above it, or no config file → error, never a guess
+    writeIn(pkgDir, 'package.json', JSON.stringify({ name: 'other' }));
+    expect(runProbe).toThrow();
+    writeIn(pkgDir, 'package.json', JSON.stringify({ name: 'pipegen' }));
+    rmSync(join(pkgDir, 'data'), { recursive: true });
+    expect(runProbe).toThrow();
     // and the npm package ships it next to dist/
     const pkg = JSON.parse(readFileSync(join(root, 'package.json'), 'utf8')) as { files: string[] };
     expect(pkg.files).toContain('data');
@@ -483,7 +499,7 @@ describe('bundle: size', () => {
     const b = await bundleCode(dir, { maxBytes: 2000 });
     expect(b.truncated).toBe(true);
     expect(b.bytes).toBeLessThanOrEqual(2000);
-    expect(b.bytes).toBe(b.files.reduce((n, f) => n + Buffer.byteLength(f.content), 0));
+    expect(b.bytes).toBe(textBytes(b));
     expect(paths(b)).toEqual(expect.arrayContaining(['package.json', 'Dockerfile', 'src/index.ts']));
     expect(paths(b)).not.toContain('src/huge.ts');
     expect(b.files.length).toBeLessThan(23);
@@ -494,5 +510,129 @@ describe('bundle: size', () => {
     // a custom priority decides what stays
     const b2 = await bundleCode(dir, { maxBytes: 400, priority: (p) => (p === 'src/lib/m07.ts' ? 10 : 0) });
     expect(paths(b2)).toContain('src/lib/m07.ts');
+  });
+});
+
+describe('fix round 1', () => {
+  it('bundle: a secret gitleaks found on one line is removed everywhere (same file and other files)', async () => {
+    const dir = makeTempDir();
+    const v = 'only' + '-reported-' + 'once-5521';
+    writeIn(dir, 'src/a.ts', `const a = '${v}';\nconst x = 1;\nconst again = '${v}';\n`);
+    writeIn(dir, 'src/b.ts', `export const b = "${v}";\n`);
+    writeIn(dir, 'src/c.ts', `export const c = "${Buffer.from(v).toString('base64')}";\n`);
+    // gitleaks reports only the first occurrence
+    const stub = makeStub(`const f = findingsFor(${JSON.stringify(v)}).slice(0, 1); fs.writeFileSync(report, JSON.stringify(f)); process.exit(1);`);
+    const b = await bundleCode(dir, { gitleaks: stub.bin });
+    expect(paths(b)).toEqual(['src/a.ts', 'src/b.ts', 'src/c.ts']);
+    const text = bundleText(b);
+    expect(text).not.toContain(v);
+    expect(text).not.toContain(Buffer.from(v).toString('base64'));
+    expect(b.files.find((f) => f.path === 'src/a.ts')?.content).toBe(`const a = '${R}';\nconst x = 1;\nconst again = '${R}';\n`);
+  });
+
+  it('redact: connection string with empty user (redis:/' + '/:pw@host)', () => {
+    expect(redact('redis' + '://:' + 'pw-9' + '@cache:6379/0')).toBe('redis' + `://:${R}@cache:6379/0`);
+  });
+
+  it('redact: connection string with @ inside the password', () => {
+    expect(redact('url=postgres' + '://user:' + 'p@ss@w0rd' + '@db.example.com/app?x=1')).toBe('url=postgres' + `://user:${R}@db.example.com/app?x=1`);
+    expect(redact('mongodb' + '://u:' + 'pa/ss' + '@host/db?replica=a@b')).toBe('mongodb' + `://u:${R}@host/db?replica=a@b`);
+    expect(redact('http://example.com:8080/path')).toBe('http://example.com:8080/path');
+  });
+
+  it('redact: json and dict keys ("pass' + 'word": "x y")', () => {
+    const k = 'pass' + 'word';
+    expect(redact(`{"${k}": "x y", "user": "bob"}`)).toBe(`{"${k}": "${R}", "user": "bob"}`);
+    const s = 'sec' + 'ret';
+    expect(redact(`cfg = {'${s}': 'a b c'}`)).toBe(`cfg = {'${s}': '${R}'}`);
+  });
+
+  it('redact: suffixed names (AWS_SECRET_ACCESS_KEY' + '=, STRIPE_SECRET_KEY' + '=, apiKeyProd' + '=)', () => {
+    for (const name of ['AWS_SEC' + 'RET_ACCESS_KEY', 'STRIPE_SEC' + 'RET_KEY', 'api' + 'KeyProd', 'GITHUB_TOK' + 'EN', 'db.pass' + 'word', 'PRIVATE' + '_KEY_PATH', 'client' + 'Secret', 'X_AU' + 'TH']) {
+      expect(redact(fake.assign(name, 'v4lue-123')), name).toBe(fake.assign(name, R));
+    }
+  });
+
+  it('redact: quoted value with spaces fully hidden', () => {
+    const k = 'pass' + 'word';
+    expect(redact(`${k} = "correct horse battery"`)).toBe(`${k} = "${R}"`);
+    expect(redact(`${k}='correct horse'; next()`)).toBe(`${k}='${R}'; next()`);
+    expect(redact(`${k}: \`correct horse\``)).toBe(`${k}: \`${R}\``);
+    expect(redact(`${k} = "a\\" b c"`)).toBe(`${k} = "${R}"`);
+  });
+
+  it('redact: => and := separators', () => {
+    const k = 'pass' + 'word';
+    const t = 'tok' + 'en';
+    expect(redact(`:${k} => 'x y'`)).toBe(`:${k} => '${R}'`);
+    expect(redact(`${t} := os.Getenv("X")`)).toBe(`${t} := ${R}`);
+    expect(redact(`${k}=>abc`)).toBe(`${k}=>${R}`);
+  });
+
+  it('bundle: a known value that redact() would partially change is still fully removed', async () => {
+    const v = 'pre-' + fake.githubClassic() + '-post7';
+    const dir = makeTempDir();
+    writeIn(dir, 'src/a.ts', `const x = '${v}';\n`);
+    const b = await bundleCode(dir, { knownValues: [v] });
+    expect(b.files[0].content).toBe(`const x = '${R}';\n`);
+  });
+
+  it('redact: PGP private key block replaced', () => {
+    const begin = '-----' + 'BEGIN PGP PRIV' + 'ATE KEY BLOCK-----';
+    const end = '-----' + 'END PGP PRIV' + 'ATE KEY BLOCK-----';
+    expect(redact(`a\n${begin}\n\n${fake.keyBody()}\n${end}\nb`)).toBe(`a\n${R}\nb`);
+  });
+
+  it('scrubKnownValues: overlapping values are removed as one span', () => {
+    expect(scrubKnownValues('xabcdefghiy', ['abcdef', 'defghi'])).toBe(`x${R}y`);
+    expect(scrubKnownValues('aaaa', ['aa'])).toBe(R);
+  });
+
+  it('scrubKnownValues: lowercase percent, form-encoded and JSON-escaped forms removed', () => {
+    const v = 'a b/c"d';
+    const lower = 'a%20b%2fc%22d';
+    const form = 'a+b%2Fc%22d';
+    const json = 'a b/c\\"d';
+    const out = scrubKnownValues(`1 ${lower} 2 ${form} 3 ${form.toLowerCase()} 4 ${json} 5`, [v]);
+    expect(out).toBe(`1 ${R} 2 ${R} 3 ${R} 4 ${R} 5`);
+  });
+
+  it('bundle: a secret in a file path found by gitleaks → that file left out, name not shown', async () => {
+    const dir = makeTempDir();
+    const flagged = 'zq' + 'name-flag-889';
+    writeIn(dir, `src/${flagged}.ts`, 'export {};\n');
+    writeIn(dir, 'src/ok.ts', 'export {};\n');
+    const stub = makeStub(reportValue(flagged));
+    const b = await bundleCode(dir, { gitleaks: stub.bin });
+    expect(stub.record().files['paths.txt']).toContain(flagged);
+    expect(paths(b)).toEqual(['src/ok.ts']);
+    expect(bundleText(b)).not.toContain(flagged);
+    expect(b.notes.join('\n')).not.toContain(flagged);
+    expect(b.notes.join('\n')).toMatch(/path/);
+  });
+
+  it('bundle: bytes counts the whole bundleText, which never exceeds maxBytes', async () => {
+    const dir = makeTempDir();
+    for (let i = 0; i < 10; i++) writeIn(dir, `src/file-with-a-long-name-${i}.ts`, 'x'.repeat(20) + '\n');
+    const bin = makeStub(CLEAN).bin;
+    const b = await bundleCode(dir, { gitleaks: bin, maxBytes: 300 });
+    const t = bundleText(b);
+    expect(Buffer.byteLength(t)).toBe(b.bytes);
+    expect(b.bytes).toBeLessThanOrEqual(300);
+    expect(b.truncated).toBe(true); // 10 × 21 content bytes fit, the headers do not
+    const all = await bundleCode(dir, { gitleaks: bin });
+    expect(Buffer.byteLength(bundleText(all))).toBe(all.bytes);
+  });
+});
+
+describe('redact: speed', () => {
+  it('redact: worst-case lines stay fast (no quadratic backtracking)', () => {
+    const line = (s: string) => s.repeat(Math.floor(4000 / s.length));
+    for (const unit of ['tok' + 'en', 'ey' + 'J', 'a://', 'sk-', 'x="', 'au' + 'th.']) {
+      const text = (line(unit) + '\n').repeat(250); // about 1 MB
+      const t = performance.now();
+      redact(text);
+      expect(performance.now() - t, unit).toBeLessThan(1500);
+    }
   });
 });

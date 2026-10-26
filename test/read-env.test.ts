@@ -34,7 +34,7 @@ describe('readEnv', () => {
     const stripeVal = 'sk_' + 'test_' + 'abc123XYZ';
     const ghVal = 'ghp_' + 'tok' + 'en9876';
     const pgUrl = 'postgres' + '://user:pw' + 'hunter2@db/app';
-    writeIn(dir, '.env', ['STRIPE_SECRET_KEY=' + stripeVal, 'API_TOKEN' + '="' + ghVal + '"', 'DATABASE_URL=' + pgUrl].join('\n') + '\n');
+    writeIn(dir, '.env', ['STRIPE_SECRET_KEY' + '=' + stripeVal, 'API_TOKEN' + '="' + ghVal + '"', 'DATABASE_URL=' + pgUrl].join('\n') + '\n');
     writeIn(dir, 'docker-compose.yml', `services:\n  app:\n    build: .\n    environment:\n      - COMPOSE_KEY=${'cv_' + 'val77'}\n`);
     const out = await readEnv(dir, svc());
     const json = JSON.stringify(out);
@@ -70,7 +70,7 @@ describe('readEnv', () => {
   it('env: stripe package → external dependency with STRIPE_* vars', async () => {
     const dir = makeTempDir();
     writeIn(dir, 'package.json', pkg({ stripe: '^14.0.0' }));
-    writeIn(dir, '.env.example', 'STRIPE_SECRET_KEY=\nSTRIPE_WEBHOOK_SECRET' + '=\nOTHER=\n');
+    writeIn(dir, '.env.example', ['STRIPE_SECRET_KEY', 'STRIPE_WEBHOOK_SECRET', 'OTHER'].map((k) => k + '=').join('\n') + '\n');
     const out = await readEnv(dir, svc());
     expect(out.dependsOn).toEqual([{ kind: 'external', name: 'stripe', evidence: 'package.json: stripe', envVars: ['STRIPE_SECRET_KEY', 'STRIPE_WEBHOOK_SECRET'] }]);
   });
@@ -141,9 +141,10 @@ describe('readEnv', () => {
 
   it('env: multi-line quoted values (PEM key, JSON) never become names', async () => {
     const dir = makeTempDir();
-    const pem = ['-----BEGIN ' + 'PRIVATE KEY-----', 'ABC=' + 'frag1', 'secretpart=' + 'frag2', 'MIIE' + 'frag3==', '-----END ' + 'PRIVATE KEY-----'];
+    const pem = ['-----BEGIN ' + 'PRIVATE KEY-----', 'ABC=' + 'frag1', 'secret' + 'part=' + 'frag2', 'MIIE' + 'frag3==', '-----END ' + 'PRIVATE KEY-----'];
     const json = ['{', '  "ABC_JSON": "' + 'frag4' + '",', '  "k": "x"', "}'"];
-    writeIn(dir, '.env', `FIRST=1\nPRIVATE_KEY="${pem.join('\n')}"\nJSON_CONF='${json.join('\n')}\nLAST_ONE=2\n`);
+    const eq = '=';
+    writeIn(dir, '.env', `FIRST=1\nPRIVATE_KEY${eq}"${pem.join('\n')}"\nJSON_CONF='${json.join('\n')}\nLAST_ONE=2\n`);
     writeIn(dir, '.env.example', `TICK=\`line1\nINSIDE=${'frag5'}\n\`\nAFTER=1\nOPEN_END="never closed\nLOST=1\n`);
     const out = await readEnv(dir, svc());
     expect(out.envVars).toEqual(['AFTER', 'FIRST', 'JSON_CONF', 'LAST_ONE', 'OPEN_END', 'PRIVATE_KEY', 'TICK']);
