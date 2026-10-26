@@ -488,6 +488,29 @@ describe('planNeeds', () => {
     }
   });
 
+  it('planNeeds: image checks only for runnable services; deploy additions only for services the floor deploys', async () => {
+    const p = profile({ services: [web(), lib()] });
+    const ai = mockAi({
+      ...quiet,
+      add: [
+        addNeed({ id: 'image-scan', category: 'image-scan', layer: 'merge', service: 'lib' }),   // a library: refused
+        addNeed({ id: 'dast', category: 'dast', layer: 'push', service: null }),                // repo-wide: refused
+        addNeed({ id: 'image-scan', category: 'image-scan', layer: 'push', service: 'web' }),    // runnable: accepted
+        addNeed({ id: 'sbom', category: 'sbom', layer: 'deploy', service: 'lib' }),               // deploy layer covers web only: refused
+        addNeed({ id: 'license-scan', category: 'deps', layer: 'deploy', service: null }),        // repo-wide deploy addition: refused
+        addNeed({ id: 'license-scan', category: 'deps', layer: 'deploy', service: 'web' }),       // accepted
+      ],
+    });
+    const r = await planNeeds(p, PUBLIC, bundle, ai.p, 0);
+    const added = r.needs.slice(floorNeeds(p, PUBLIC).length);
+    expect(added.map((n) => `${n.layer}|${n.id}|${n.service ?? ''}`)).toEqual(['push|image-scan|web', 'deploy|license-scan|web']);
+    const text = r.notes.join('\n');
+    expect(text).toContain('image-scan in merge for lib');
+    expect(text).toContain('dast in push');
+    expect(text).toContain('sbom in deploy for lib');
+    expect(r.notes).toHaveLength(2); // one note per reason
+  });
+
   it('planNeeds: a floor-category need the AI adds is always blocking; a repeat of a floor key is refused', async () => {
     const p = profile();
     // repo-wide sast, blocking false: a new key (the floor's sast is per service) → accepted, forced blocking

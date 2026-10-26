@@ -22,7 +22,7 @@ Your job:
    - "id" must be one of the schema's ids, and "category" must be the category this table gives for that id:
 ${table}
    - "layer" is push, merge, or deploy when the floor already has a deploy layer. Nothing is added to pre-commit.
-   - An id that is also a category (sast, image-scan, signing, …) may only extend a check the floor already has to another layer or service.
+   - An id that is also a category (sast, image-scan, signing, …) may only extend a check the floor already has to another layer or service. image-build, image-scan and dast are only for services marked runnable, and deploy-layer needs only for services the floor already deploys.
    - At most 16 additions are kept, so put the most useful first.
    - "service" is the name of the service the need is for, or null for a repo-wide need.
    - "why" is one short plain-English sentence for the developer: no links, no code, no markdown.

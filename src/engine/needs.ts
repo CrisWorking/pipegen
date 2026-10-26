@@ -48,6 +48,9 @@ const MAX_AI_SKIPS = 4;
 const MAX_AI_ADDS_READ = 48;
 const MAX_AI_ADDS_KEPT = 16;
 
+/** Checks that need a running service (an image or a live app). */
+const IMAGE_IDS: ReadonlySet<NeedId> = new Set<NeedId>(['image-build', 'image-scan', 'dast']);
+
 const isFloorId = (id: NeedId): id is NeedCategory => (NEED_CATEGORIES as readonly string[]).includes(id);
 
 /** One note per reason an AI addition was dropped; `items` lists "id in layer" (enum values only). */
@@ -56,6 +59,8 @@ const REFUSED = {
   category: (items: string) => `The AI gave the wrong category to ${items}; pipegen left those needs out.`,
   notInFloor: (items: string) => `The AI suggested ${items}, which this repo's plan doesn't include (for example signing on a private Free repo, or an image scan with nothing to run); pipegen left them out.`,
   layer: (items: string) => `The AI tried to add ${items}, a layer pipegen doesn't add AI checks to here; pipegen left them out.`,
+  notRunnable: (items: string) => `The AI suggested ${items}, but image checks only apply to services that run; pipegen left them out.`,
+  notDeployed: (items: string) => `The AI suggested ${items}, but pipegen's deploy layer doesn't cover that; pipegen left them out.`,
 } as const;
 
 function listItems(items: string[]): string {
@@ -267,15 +272,17 @@ export async function planNeeds(p: RepoProfile, caps: Capabilities, bundle: Code
   }
 
   // Refused additions, grouped by reason so each reason gives one note. Items hold enum values only.
-  const refused: Record<keyof typeof REFUSED, Set<string>> = { gate: new Set(), category: new Set(), notInFloor: new Set(), layer: new Set() };
+  const refused = Object.fromEntries(Object.keys(REFUSED).map((k) => [k, new Set<string>()])) as Record<keyof typeof REFUSED, Set<string>>;
   const floorIds = new Set(floor.map((n) => n.id));
   const floorLayers = new Set(floor.map((n) => n.layer));
+  const runnable = new Set(p.services.filter(isRunnable).map((s) => s.name));
+  const deployTargets = new Set(floor.filter((n) => n.layer === 'deploy').map((n) => n.service));
   const needs = [...floor];
   const seen = new Set(floor.map(needKey));
   let added = 0;
   const read = data.add.slice(0, MAX_AI_ADDS_READ);
   for (const [i, a] of read.entries()) {
-    const item = `${a.id} in ${a.layer}`;
+    const item = `${a.id} in ${a.layer}${a.service === null ? '' : ` for ${a.service}`}`; // enum values and checked names only
     if (a.id === 'gate') { refused.gate.add(item); continue; }
     if (NEED_ID_CATEGORY[a.id] !== a.category) { refused.category.add(item); continue; }
     // A floor id only extends what the floor already has (another layer or service): never signing on a repo
@@ -283,6 +290,10 @@ export async function planNeeds(p: RepoProfile, caps: Capabilities, bundle: Code
     if (isFloorId(a.id) && !floorIds.has(a.id)) { refused.notInFloor.add(item); continue; }
     // Only layers the floor sets up (never pre-commit, never a deploy layer the repo doesn't have).
     if (a.layer === 'pre-commit' || !floorLayers.has(a.layer)) { refused.layer.add(item); continue; }
+    // Image checks need something to run: only for a runnable service, never repo-wide.
+    if (IMAGE_IDS.has(a.id) && (a.service === null || !runnable.has(a.service))) { refused.notRunnable.add(item); continue; }
+    // Deploy additions only for what the floor's deploy layer already covers.
+    if (a.layer === 'deploy' && !deployTargets.has(a.service ?? undefined)) { refused.notDeployed.add(item); continue; }
     const need: Need = {
       id: a.id, layer: a.layer, category: a.category, ...(a.service === null ? {} : { service: a.service }),
       why: cleanAiText(a.why) || WHY[a.id],
