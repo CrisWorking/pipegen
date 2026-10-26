@@ -343,14 +343,14 @@ async function prepareCache(name: string, version: string, cacheDir: string | un
 /**
  * Ruling S25: a tool pinned here and also listed in reviewed-tools.yml (for user CI) must be the same release.
  * Returns one plain-English problem per mismatch (empty = consistent). A reviewed CLI entry from the same GitHub
- * repo must have the same version, and every hash it carries must be one of this release's archive or binary
- * hashes. Task 8 calls this on the real lists.
+ * repo must have the same version, must install an asset this file pins for some platform, and every hash it
+ * carries must be that platform's archive or binary hash (not merely some platform's). Task 8 calls this on the
+ * real lists.
  */
 export function checkPinnedAgainstReviewed(pins: PinnedBinaries, reviewed: readonly ReviewedTool[]): string[] {
   const problems: string[] = [];
   for (const name of PINNED_NAMES) {
     const entry = pins[name];
-    const known = new Set(PLATFORM_KEYS.flatMap((k) => [entry.platforms[k].archiveSha256, entry.platforms[k].binarySha256]));
     for (const tool of reviewed) {
       const c = tool.candidate;
       if (c.kind !== 'cli' || typeof c.repo !== 'string' || c.repo.toLowerCase() !== entry.repo.toLowerCase()) continue;
@@ -358,13 +358,20 @@ export function checkPinnedAgainstReviewed(pins: PinnedBinaries, reviewed: reado
       if (c.version.replace(/^v/, '') !== entry.version) {
         problems.push(`${name}: the reviewed entry ${id} is version ${safeText(c.version, 40)}, but pinned-binaries.yml pins ${entry.version}.`);
       }
+      const asset = tool.step.cli?.install.package;
+      const platform = PLATFORM_KEYS.find((k) => typeof asset === 'string' && entry.platforms[k].url.endsWith(`/${asset}`));
+      if (platform === undefined) {
+        problems.push(`${name}: the reviewed entry ${id} installs a release asset pinned-binaries.yml doesn't list for ${entry.version}.`);
+        continue;
+      }
       const hashes = [c.pin.checksum, tool.step.cli?.install.checksum].filter((h): h is string => typeof h === 'string');
       if (hashes.length === 0) {
         problems.push(`${name}: the reviewed entry ${id} has no hash to compare with pinned-binaries.yml.`);
         continue;
       }
+      const known = new Set([entry.platforms[platform].archiveSha256, entry.platforms[platform].binarySha256]);
       for (const h of new Set(hashes)) {
-        if (!known.has(h.toLowerCase())) problems.push(`${name}: the reviewed entry ${id} has a hash that pinned-binaries.yml doesn't list for ${entry.version}.`);
+        if (!known.has(h.toLowerCase())) problems.push(`${name}: the reviewed entry ${id} has a hash that pinned-binaries.yml doesn't list for ${entry.version} ${platform}.`);
       }
     }
   }

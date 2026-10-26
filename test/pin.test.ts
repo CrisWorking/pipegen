@@ -299,6 +299,26 @@ describe('pin: release binaries', () => {
     expect(notes.join('\n')).toContain('checksumSource: computed');
   });
 
+  it("pin: no checksums file but GitHub's own asset digest → that digest, marked checksumSource github-asset-digest, nothing downloaded", async () => {
+    const hex = sha256(BIN_BYTES);
+    const immutable = (assets: unknown[]): Routes => ({
+      [`GET ${GH}/repos/o/tool/releases/tags/v1.4.0`]: { body: { tag_name: 'v1.4.0', published_at: OLD, draft: false, prerelease: false, immutable: true, assets } },
+    });
+    const { deps, notes, netCalls } = setup(immutable([{ ...asset(BIN, BIN_BYTES.length), digest: `sha256:${hex}` }]));
+    const out = await resolvePin(binCand(), deps);
+    expect(out.pin).toEqual({ checksum: hex });
+    expect(notes.join('\n')).toContain('checksumSource: github-asset-digest');
+    expect(notes.join('\n')).toMatch(/immutable release: yes/);
+    expect(notes.join('\n')).not.toContain('checksumSource: computed');
+    expect(netCalls).toEqual([]); // nothing downloaded
+    // a digest that isn't a sha256 is not used: back to downloading and hashing (computed)
+    const odd = setup(binGithub([{ ...asset(BIN, BIN_BYTES.length), digest: 'md5:abc' }]), {
+      [`GET ${DL}/o/tool/releases/download/v1.4.0/${BIN}`]: { raw: BIN_BYTES },
+    });
+    expect((await resolvePin(binCand(), odd.deps)).pin).toEqual({ checksum: hex });
+    expect(odd.notes.join('\n')).toContain('checksumSource: computed');
+  });
+
   it('pin: downloads only follow redirects to allow-listed https hosts, and are size-bounded', async () => {
     const evil = setup(binGithub([asset(BIN, BIN_BYTES.length)]), {
       [`GET ${DL}/o/tool/releases/download/v1.4.0/${BIN}`]: { status: 302, headers: { location: 'https://evil.example/bin' } },

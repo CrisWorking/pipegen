@@ -31,6 +31,11 @@ const RULES_URL = `https://github.com/semgrep/semgrep-rules/archive/${RULES_SHA}
 // env names for the semgrep rules pack (ruling S22), built from parts like the field names elsewhere
 const RULES_URL_ENV = ['PIPEGEN', 'RULES', 'URL'].join('_');
 const RULES_SUM_ENV = ['PIPEGEN', 'RULES', 'SHA256'].join('_');
+const RULES_TREE_ENV = ['PIPEGEN', 'RULES', 'TREE'].join('_');
+const RULES_TREE = 'e'.repeat(40);
+/** Where the renderer puts the verified rules; semgrep must be pointed at it explicitly (its default config is auto). */
+const RULES_DIR = '/pipegen-rules';
+const RULES_ENV = { [RULES_URL_ENV]: RULES_URL, [RULES_SUM_ENV]: SUM, [RULES_TREE_ENV]: RULES_TREE };
 // the checkout input that keeps the job's GitHub credential out of .git/config, built from parts
 const PERSIST = ['persist', 'credentials'].join('-');
 
@@ -77,16 +82,16 @@ function cliEntry(over: Entry = {}): Entry {
 }
 
 /** The Semgrep CE entry: an image, with a rules pack pinned by commit SHA and archive sha256 (ruling S22). */
-function semgrepEntry(env: Record<string, string> = { [RULES_URL_ENV]: RULES_URL, [RULES_SUM_ENV]: SUM }, command?: string[]): Entry {
+function semgrepEntry(env: Record<string, string> = RULES_ENV, command?: string[], args = ['--metrics=off', '--config', RULES_DIR]): Entry {
   const categories = ['sast'];
   return {
     id: 'semgrep', categories, languages: ['node', 'python'], releasedAt: '2026-01-01T00:00:00Z',
     candidate: candidate('semgrep', 'docker', 'semgrep/semgrep', '1.181.0', { digest: DIGEST }, categories),
     step: {
-      cli: { install: { method: 'docker', package: 'semgrep/semgrep', version: '1.181.0' }, command: command ?? ['semgrep', 'scan', '--metrics=off', '--sarif', '--output', 'semgrep.sarif'], env },
+      cli: { install: { method: 'docker', package: 'semgrep/semgrep', version: '1.181.0' }, command: command ?? ['semgrep', 'scan', '--metrics=off', '--config', RULES_DIR, '--sarif', '--output', 'semgrep.sarif'], env },
       output: { path: 'semgrep.sarif', format: 'sarif' },
     },
-    fixedInputs: { args: ['--metrics=off'], env },
+    fixedInputs: { args, env },
     choices: { rules: ['javascript', 'python'] },
     configFiles: ['.semgrepignore'],
     reviewedBy: 'PENDING', reviewedAt: 'PENDING', proofs: 0,
@@ -190,20 +195,32 @@ describe('loadReviewed', () => {
 
   it('reviewed: semgrep entry with a registry rule pack (p/…) or auto rejected; sha-pinned pack accepted', () => {
     expect(load([semgrepEntry()])[0]?.fixedInputs.env?.[RULES_URL_ENV]).toBe(RULES_URL);
-    // registry names and auto, anywhere in the command (the fixed --metrics=off stays, so only the pack is wrong)
-    const scan = (...rest: string[]) => ['semgrep', 'scan', '--metrics=off', ...rest];
+    // registry names and auto, anywhere in the command (the fixed args stay, so only the pack is wrong)
+    const scan = (...rest: string[]) => ['semgrep', 'scan', '--metrics=off', '--config', RULES_DIR, ...rest];
     const REGISTRY = /registry rule packs/;
     rejects([semgrepEntry(undefined, scan('--config', 'p/default'))], REGISTRY);
     rejects([semgrepEntry(undefined, scan('--config', 'auto'))], REGISTRY);
     rejects([semgrepEntry(undefined, scan('--config=auto'))], REGISTRY);
     rejects([semgrepEntry(undefined, scan('--config=r/python.lang'))], REGISTRY);
-    // a rules URL that isn't pinned to a 40-character commit, or no archive hash
-    rejects([semgrepEntry({ [RULES_URL_ENV]: 'https://github.com/semgrep/semgrep-rules/archive/refs/heads/develop.tar.gz', [RULES_SUM_ENV]: SUM })], /40-character commit/);
-    rejects([semgrepEntry({ [RULES_URL_ENV]: 'https://semgrep.dev/c/p/default', [RULES_SUM_ENV]: SUM })], /40-character commit/);
-    rejects([semgrepEntry({ [RULES_URL_ENV]: RULES_URL })], /sha256/);
-    rejects([semgrepEntry({ [RULES_URL_ENV]: RULES_URL, [RULES_SUM_ENV]: 'abc' })], /sha256/);
-    // the same command with the pinned pack only is accepted
+    // semgrep's default config is auto: a command with no --config at the verified rules dir is refused (I2)
+    const noConfig = ['semgrep', 'scan', '--metrics=off', '--sarif'];
+    rejects([semgrepEntry(undefined, noConfig, ['--metrics=off'])], /--config/);
+    rejects([semgrepEntry(undefined, ['semgrep', 'scan', '--metrics=off', '--config', '/tmp/rules'], ['--metrics=off'])], /--config/);
+    rejects([semgrepEntry(undefined, scan('--config', 'rules.yml'))], /--config/); // a second config next to the verified one
+    rejects([semgrepEntry(undefined, undefined, ['--metrics=off'])], /--config/); // the --config must be a fixed arg too
+    // a rules URL that isn't pinned to a 40-character commit, no archive hash, or no tree SHA
+    rejects([semgrepEntry({ ...RULES_ENV, [RULES_URL_ENV]: 'https://github.com/semgrep/semgrep-rules/archive/refs/heads/develop.tar.gz' })], /40-character commit/);
+    rejects([semgrepEntry({ ...RULES_ENV, [RULES_URL_ENV]: 'https://semgrep.dev/c/p/default' })], /40-character commit/);
+    rejects([semgrepEntry({ [RULES_URL_ENV]: RULES_URL, [RULES_TREE_ENV]: RULES_TREE })], /sha256/);
+    rejects([semgrepEntry({ ...RULES_ENV, [RULES_SUM_ENV]: 'abc' })], /sha256/);
+    rejects([semgrepEntry({ [RULES_URL_ENV]: RULES_URL, [RULES_SUM_ENV]: SUM })], /tree/);
+    // the explicit config at the verified rules dir is accepted, in both spellings
     expect(load([semgrepEntry(undefined, scan('--sarif'))])).toHaveLength(1);
+    expect(load([semgrepEntry(undefined, ['semgrep', 'scan', '--metrics=off', `--config=${RULES_DIR}`], ['--metrics=off', `--config=${RULES_DIR}`])])).toHaveLength(1);
+    // the real entry: explicit --config at the verified dir, and the commit's tree SHA recorded
+    const real = byId(loadReviewed(), 'semgrep')[0];
+    expect(real?.step.cli?.command.join(' ')).toContain(`--config ${RULES_DIR}`);
+    expect(real?.fixedInputs.env?.[RULES_TREE_ENV]).toBe('dd3179667faf14717e05c33b1916b0d2c349673d');
   });
 
   it('reviewed: categories limited to need categories plus platform, egress and workflow-lint (S23)', () => {
@@ -264,6 +281,31 @@ describe('loadReviewed', () => {
     rejects([multiline], /line breaks/);
     const dup = [actionEntry(), actionEntry()];
     rejects(dup, /more than once|duplicate/i);
+  });
+
+  it('reviewed: a choice may not share a name with a fixed flag or a config input (M2)', () => {
+    const flag = cliEntry();
+    flag.choices = { 'report-format': ['sarif', 'json'] }; // --report-format is a fixed arg
+    rejects([flag], /fixed/);
+    const configFlag = cliEntry();
+    configFlag.choices = { config: ['a', 'b'] }; // the pinned config goes in through --config
+    rejects([configFlag], /fixed/);
+    const input = actionEntry();
+    input.fixedInputs.config = { content: 'x: 1\n', passAs: { input: 'config-file' } };
+    input.choices = { 'config-file': ['a.yml'] };
+    rejects([input], /fixed/);
+    const ok = cliEntry();
+    ok.choices = { severity: ['high'] };
+    expect(load([ok])).toHaveLength(1);
+  });
+
+  it('reviewed: reviewedBy is PENDING exactly or a real name; reviewedAt a real date on or after pinnedOn (M3)', () => {
+    const at = (reviewedBy: string, reviewedAt: string) => ({ ...actionEntry(), reviewedBy, reviewedAt });
+    for (const variant of ['pending', 'Pending', 'PENDING ', ' PENDING']) rejects([at(variant, '2026-11-01')], /PENDING/);
+    for (const blank of ['', '   ']) rejects([at(blank, '2026-11-01')]);
+    rejects([at('Cristiano Pereira', '2026-02-30')], /real date/); // no such day
+    rejects([at('Cristiano Pereira', '2026-10-25')], /pinnedOn/); // the fixture list is pinned on 2026-10-26
+    expect(load([at('Cristiano Pereira', '2026-10-26')])).toHaveLength(1);
   });
 });
 
@@ -352,11 +394,11 @@ describe('data/reviewed-tools.yml', () => {
     const list = real();
     const ids = list.map((t) => t.id);
     for (const id of [
-      ...Object.values(PLATFORM_ACTION_IDS), 'harden-runner', 'registry', 'zap-baseline', 'trivy-config', 'trivy-image', 'gitleaks', 'semgrep',
+      ...Object.values(PLATFORM_ACTION_IDS), 'bullfrog', 'registry', 'zap-baseline', 'trivy-config', 'trivy-image', 'gitleaks', 'semgrep',
       'osv-scanner', 'lefthook', 'syft', 'cosign', 'actionlint', 'zizmor',
     ]) expect(ids, id).toContain(id);
     expect(new Set(ids).size).toBe(ids.length);
-    expect(byId(list, 'harden-runner')[0]?.categories).toEqual(['egress']);
+    expect(byId(list, 'bullfrog')[0]?.categories).toEqual(['egress']);
     expect(byId(list, 'trivy-config')[0]?.categories).toEqual(['iac']);
     expect(byId(list, 'trivy-image')[0]?.categories).toEqual(['image-scan']);
     expect(byId(list, 'zap-baseline')[0]?.step.output.format).toBe('zap-json');
@@ -372,6 +414,78 @@ describe('data/reviewed-tools.yml', () => {
     for (const repo of ['gitleaks/gitleaks', 'rhysd/actionlint', 'sigstore/cosign']) {
       expect(list.filter((t) => t.candidate.kind === 'cli' && t.candidate.repo === repo), repo).toHaveLength(1);
     }
+  });
+
+  it('reviewed: zap baseline runs with -silent, so no add-on is downloaded at run time (I1)', () => {
+    const zap = byId(real(), 'zap-baseline')[0];
+    const cmd = zap?.step.cli?.command ?? [];
+    expect(cmd[cmd.indexOf('-z') + 1]).toBe('-silent');
+    expect(zap?.fixedInputs.args?.join(' ')).toContain('-z -silent');
+    // the loader refuses a ZAP command without it
+    const raw = rawFile().tools.find((t) => t.id === 'zap-baseline') as Entry;
+    const loud = structuredClone(raw);
+    loud.step.cli.command = ['zap-baseline.py', '-J', 'zap.json'];
+    loud.fixedInputs.args = ['-J', 'zap.json'];
+    rejects([loud], /-silent/);
+  });
+
+  it('reviewed: egress entry has enable-sudo false and block (S8: Bullfrog, not Harden-Runner)', () => {
+    const list = real();
+    const egress = list.filter((t) => t.categories.includes('egress'));
+    expect(egress.map((t) => t.id)).toEqual(['bullfrog']);
+    const bf = egress[0];
+    expect(bf?.candidate.repo).toBe('bullfrogsec/bullfrog');
+    const fixed = { 'egress-policy': 'block', 'dns-policy': 'allowed-domains-only', 'enable-sudo': 'false' };
+    expect(bf?.fixedInputs.with).toMatchObject(fixed);
+    expect(bf?.step.action?.with).toMatchObject(fixed);
+    expect(Object.keys(bf?.choices ?? {}).sort()).toEqual(['allowed-domains', 'allowed-ips']); // the renderer fills the allow-list
+    // Harden-Runner's free tier failed open on private repos (S8), and trivy-action's tags were hijacked: neither is listed
+    for (const t of list) expect(['step-security/harden-runner', 'aquasecurity/trivy-action', 'aquasecurity/setup-trivy'], t.id).not.toContain(t.candidate.repo.toLowerCase());
+    // the loader refuses a Bullfrog entry that leaves sudo on, audits only, or resolves any name
+    const raw = rawFile().tools.find((t) => t.id === 'bullfrog') as Entry;
+    for (const [key, weak] of [['enable-sudo', 'true'], ['egress-policy', 'audit'], ['dns-policy', 'any']]) {
+      const loose = structuredClone(raw);
+      loose.fixedInputs.with[key] = weak;
+      loose.step.action.with[key] = weak;
+      rejects([loose], new RegExp(key));
+    }
+  });
+
+  it('reviewed: build-push fixes context "." and an empty github-token, so the job credential is no build secret (I3)', () => {
+    const bp = byId(real(), 'docker-build-push-action')[0];
+    expect(bp?.fixedInputs.with).toMatchObject({ context: '.', 'github-token': '' });
+    expect(bp?.step.action?.with).toMatchObject({ context: '.', 'github-token': '' });
+    const raw = rawFile().tools.find((t) => t.id === 'docker-build-push-action') as Entry;
+    for (const key of ['context', 'github-token']) {
+      const missing = structuredClone(raw);
+      delete missing.fixedInputs.with[key];
+      delete missing.step.action.with[key];
+      rejects([missing], new RegExp(key));
+    }
+    const other = structuredClone(raw);
+    other.fixedInputs.with.context = 'https://github.com/o/r.git';
+    other.step.action.with.context = 'https://github.com/o/r.git';
+    rejects([other], /context/);
+  });
+
+  it('reviewed: scanner flags that keep runs offline and unsuppressed (M1, M7)', () => {
+    const list = real();
+    const cmd = (id: string) => byId(list, id)[0]?.step.cli?.command ?? [];
+    const fixed = (id: string) => byId(list, id)[0]?.fixedInputs.args ?? [];
+    expect(cmd('trivy-config')).toContain('--skip-check-update'); // the checks embedded in the pinned binary
+    expect(fixed('trivy-config')).toContain('--skip-check-update');
+    expect(cmd('gitleaks')).toContain('--ignore-gitleaks-allow'); // inline gitleaks:allow comments can't hide a secret
+    expect(fixed('gitleaks')).toContain('--ignore-gitleaks-allow');
+    for (const f of ['-shellcheck=', '-pyflakes=']) {
+      expect(cmd('actionlint')).toContain(f); // no external tools from the runner's PATH
+      expect(fixed('actionlint')).toContain(f);
+    }
+    // DECISIONS #79: pipegen's actionlint config ignores only the cache-mode key actionlint 1.7.12 rejects
+    const config = byId(list, 'actionlint')[0]?.fixedInputs.config?.content ?? '';
+    expect(parse(config)).toEqual({
+      'self-hosted-runner': { labels: [] },
+      paths: { '.github/workflows/**/*.{yml,yaml}': { ignore: ['unexpected key "cache-mode" for "job" section'] } },
+    });
   });
 
   it(`reviewed-tools.yml: every release was at least ${COOLDOWN_DAYS} days old when pinned (S26)`, () => {
@@ -459,6 +573,16 @@ describe('nearDuplicate', () => {
     expect(nearDuplicate('actions/setup-nodes', l)?.id).toBe('actions-setup-node');
   });
 
+  it('nearDuplicate: a name that is not a plain ASCII GitHub repo is refused as a near-duplicate (M4)', () => {
+    const l = list();
+    // KELVIN SIGN (U+212A) for k: NFKC folds it to K, so it would compare equal to the real repo after lowercasing
+    expect(nearDuplicate('gitlea\u212As/gitleaks', l)?.id).toBe('gitleaks');
+    expect(nearDuplicate('gitleaks/gitlea\u212As', l)?.id).toBe('gitleaks');
+    expect(nearDuplicate('actions/setup-n\u043ede', l)?.id).toBe('actions-setup-node'); // Cyrillic o
+    expect(nearDuplicate('', l)).not.toBeNull();
+    expect(nearDuplicate('x/y', [])).toBeNull(); // nothing reviewed to imitate
+  });
+
   it('nearDuplicate: exact reviewed repo, in any letter case → null', () => {
     const l = list();
     expect(nearDuplicate('gitleaks/gitleaks', l)).toBeNull();
@@ -470,7 +594,6 @@ describe('nearDuplicate', () => {
     const l = load([actionEntry({ id: 'actions-setup-go', repo: 'actions/setup-go' })]);
     expect(nearDuplicate('actions/setup-node', l)).toBeNull();
     expect(nearDuplicate('someone/else', list())).toBeNull();
-    expect(nearDuplicate('', list())).toBeNull();
   });
 });
 

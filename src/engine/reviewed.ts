@@ -66,6 +66,13 @@ const REL_GLOB_RE = /^(?!\/)(?!.*(?:^|\/)\.\.(?:\/|$))[A-Za-z0-9._*/-]{1,200}$/;
 const RULES_URL_RE = /^https:\/\/github\.com\/[A-Za-z0-9-]{1,39}\/[A-Za-z0-9._-]{1,100}\/archive\/([0-9a-f]{40})\.tar\.gz$/;
 export const RULES_URL_ENV = 'PIPEGEN_RULES_URL';
 export const RULES_SHA256_ENV = 'PIPEGEN_RULES_SHA256';
+/** The git tree SHA of the rules commit: the v0.2 renderer fetches the commit and checks HEAD^{tree} against it. */
+export const RULES_TREE_ENV = 'PIPEGEN_RULES_TREE';
+/**
+ * Where the renderer puts the verified rules (in the scan container). Semgrep's default config is `auto` (the
+ * registry), so every semgrep command must name this directory explicitly, and nothing else, as its config.
+ */
+export const SEMGREP_RULES_DIR = '/pipegen-rules';
 
 /**
  * A value pipegen writes into a workflow: bounded, never a workflow expression, and printable (one line; only a
@@ -134,7 +141,7 @@ const entrySchema = z.strictObject({
   fixedInputs: fixedSchema,
   choices: z.record(z.string().regex(INPUT_RE), z.array(z.string().min(1).max(100).pipe(safeValue)).min(1).max(32)),
   configFiles: z.array(z.string().regex(REL_GLOB_RE)).max(32),
-  reviewedBy: z.string().min(1).max(100).pipe(safeValue),
+  reviewedBy: z.string().max(100).pipe(safeValue).refine((s) => s.trim() !== '', 'reviewedBy must be a name or PENDING'),
   reviewedAt: z.string(),
   proofs: z.number().int().nonnegative(),
 }).superRefine((e, ctx) => {
@@ -147,7 +154,11 @@ const fileSchema = z.strictObject({
   tools: z.array(entrySchema).min(1).max(500),
 }).superRefine((f, ctx) => {
   const pinnedOn = Date.parse(f.pinnedOn);
+  const pinnedDay = f.pinnedOn.slice(0, 10);
   f.tools.forEach((t, i) => {
+    if (t.reviewedAt !== PENDING && DATE_RE.test(t.reviewedAt) && t.reviewedAt < pinnedDay) {
+      ctx.addIssue({ code: 'custom', path: ['tools', i, 'reviewedAt'], message: `reviewedAt is before pinnedOn (${pinnedDay}): the review must cover the pins as they are` });
+    }
     if (!(pinnedOn - Date.parse(t.releasedAt) >= COOLDOWN_DAYS * DAY_MS)) {
       ctx.addIssue({ code: 'custom', path: ['tools', i, 'releasedAt'], message: `the release must be at least ${COOLDOWN_DAYS} days older than pinnedOn (cooldown, ruling S26)` });
     }
@@ -171,9 +182,10 @@ function entryProblems(e: Entry): { message: string; path: (string | number)[] }
   if (!unique(e.categories)) bad('a category is listed twice', 'categories');
   if (!unique(e.languages)) bad('a language is listed twice', 'languages');
 
-  // reviewedBy and reviewedAt go together: both PENDING, or a name and a review date
+  // reviewedBy and reviewedAt go together: both exactly PENDING, or a name and a real review date
+  if (e.reviewedBy !== PENDING && e.reviewedBy.trim().toUpperCase() === PENDING) bad('reviewedBy must be PENDING exactly (upper case, no spaces) or a name', 'reviewedBy');
   if ((e.reviewedBy === PENDING) !== (e.reviewedAt === PENDING)) bad('reviewedBy and reviewedAt must both be PENDING, or a name and a date', 'reviewedAt');
-  if (e.reviewedAt !== PENDING && !DATE_RE.test(e.reviewedAt)) bad('reviewedAt must be a date (YYYY-MM-DD)', 'reviewedAt');
+  if (e.reviewedAt !== PENDING && !isRealDate(e.reviewedAt)) bad('reviewedAt must be a real date (YYYY-MM-DD)', 'reviewedAt');
 
   // ---- the exact pin, and a step that runs exactly the pinned tool ----
   const { sha, checksum, digest } = c.pin;
@@ -236,7 +248,13 @@ function entryProblems(e: Entry): { message: string; path: (string | number)[] }
     const viaFlag = 'flag' in fx.config.passAs;
     if (c.kind === 'action' ? viaFlag : !viaFlag) bad('a pinned config is passed to an action as an input, and to a cli as a flag', 'fixedInputs', 'config', 'passAs');
   }
-  const fixedKeys = new Set([...Object.keys(stepWith), ...Object.keys(fx.with ?? {}), ...Object.keys(fx.env ?? {}), ...Object.keys(cli?.env ?? {})]);
+  // fixed keys: inputs and env set by the template, the config input, and every fixed flag (by name, without dashes)
+  const flagName = (a: string) => a.replace(/^-+/, '').split('=')[0] as string;
+  const fixedKeys = new Set([
+    ...Object.keys(stepWith), ...Object.keys(fx.with ?? {}), ...Object.keys(fx.env ?? {}), ...Object.keys(cli?.env ?? {}),
+    ...(fx.args ?? []).filter((a) => a.startsWith('-')).map(flagName),
+    ...(fx.config === undefined ? [] : ['input' in fx.config.passAs ? fx.config.passAs.input : flagName(fx.config.passAs.flag)]),
+  ]);
   for (const [k, vs] of Object.entries(e.choices)) {
     if (fixedKeys.has(k)) bad(`the AI may not choose ${k}: it is a fixed input`, 'choices', k);
     if (!unique(vs)) bad(`the choice ${k} lists a value twice`, 'choices', k);
@@ -247,8 +265,30 @@ function entryProblems(e: Entry): { message: string; path: (string | number)[] }
   if (repo === 'actions/checkout' && fx.with?.['persist-credentials'] !== 'false') {
     bad('the checkout entry must fix persist-credentials: "false" (the job credential stays out of .git/config)', 'fixedInputs', 'with');
   }
+  // I3: the default git context hands the job's GitHub credential to the Dockerfile as a build secret
+  if (repo === 'docker/build-push-action') {
+    if (fx.with?.context !== '.') bad('the build-push entry must fix context: "." (the checked-out files, not a git context)', 'fixedInputs', 'with', 'context');
+    if (fx.with?.['github-token'] !== '') bad('the build-push entry must fix github-token: "" (the job credential is never a build secret)', 'fixedInputs', 'with', 'github-token');
+  }
+  // S8: Bullfrog blocks only in block mode, and only while no later step has sudo
+  if (repo === 'bullfrogsec/bullfrog') {
+    const want: Record<string, string> = { 'egress-policy': 'block', 'dns-policy': 'allowed-domains-only', 'enable-sudo': 'false' };
+    for (const [k, v] of Object.entries(want)) if (fx.with?.[k] !== v) bad(`the Bullfrog entry must fix ${k}: "${v}"`, 'fixedInputs', 'with', k);
+  }
+  // I1: without -silent, zap-baseline.py updates and installs add-ons from the internet at run time
+  if (repo === 'zaproxy/zaproxy' || /(^|\/)zap(-[a-z]+)?$/.test(cli?.install.package ?? '')) {
+    const silent = (args: readonly string[]) => args.some((a, i) => a === '-z' && (args[i + 1] ?? '').split(/\s+/).includes('-silent'));
+    if (!silent(cli?.command ?? []) || !silent(fx.args ?? [])) bad('the ZAP entry must pass -z "-silent" (in the command and fixedInputs.args): no add-on downloads at run time', 'step', 'cli', 'command');
+  }
   if (repo === 'semgrep/semgrep' || /(^|\/)semgrep$/.test(cli?.install.package ?? '')) out.push(...semgrepProblems(e));
   return out;
+}
+
+/** A YYYY-MM-DD date that exists in the calendar. */
+function isRealDate(s: string): boolean {
+  if (!DATE_RE.test(s)) return false;
+  const d = new Date(`${s}T00:00:00Z`);
+  return Number.isFinite(d.getTime()) && d.toISOString().slice(0, 10) === s;
 }
 
 /** Ruling S22: Semgrep rules come from a pinned archive (40-hex commit SHA + sha256), never the registry or auto. */
@@ -258,6 +298,7 @@ function semgrepProblems(e: Entry): { message: string; path: (string | number)[]
   const url = env[RULES_URL_ENV];
   if (url === undefined || !RULES_URL_RE.test(url)) out.push({ message: `semgrep needs fixedInputs.env.${RULES_URL_ENV}: a rules archive at a 40-character commit SHA`, path: ['fixedInputs', 'env'] });
   if (!SHA256_RE.test(env[RULES_SHA256_ENV] ?? '')) out.push({ message: `semgrep needs fixedInputs.env.${RULES_SHA256_ENV}: the archive's sha256`, path: ['fixedInputs', 'env'] });
+  if (!COMMIT_SHA_RE.test(env[RULES_TREE_ENV] ?? '')) out.push({ message: `semgrep needs fixedInputs.env.${RULES_TREE_ENV}: the rules commit's tree SHA`, path: ['fixedInputs', 'env'] });
   const values = [
     ...(e.step.cli?.command ?? []), ...(e.fixedInputs.args ?? []), ...Object.values(e.step.cli?.env ?? {}), ...Object.values(env),
     ...Object.values(e.step.action?.with ?? {}), ...Object.values(e.choices).flat(),
@@ -268,6 +309,23 @@ function semgrepProblems(e: Entry): { message: string; path: (string | number)[]
   };
   if (values.some(registry)) out.push({ message: 'semgrep must not use registry rule packs (p/…, r/…), semgrep.dev or --config auto: they change without review', path: ['step', 'cli', 'command'] });
   if ('SEMGREP_RULES' in (e.step.cli?.env ?? {})) out.push({ message: 'semgrep rules come only from the pinned archive (no SEMGREP_RULES)', path: ['step', 'cli', 'env'] });
+  // semgrep's default config is auto: the command must name the verified rules dir, and only it (in the fixed args too)
+  const command = e.step.cli?.command ?? [];
+  const configs = semgrepConfigs(command);
+  if (configs.length === 0 || configs.some((c) => c !== SEMGREP_RULES_DIR) || !semgrepConfigs(e.fixedInputs.args ?? []).includes(SEMGREP_RULES_DIR)) {
+    out.push({ message: `semgrep must run with --config ${SEMGREP_RULES_DIR} (the verified rules) and no other config, in the command and fixedInputs.args; its default is auto`, path: ['step', 'cli', 'command'] });
+  }
+  // No --disable-nosem: a nosem comment is a suppression the gate already reports as a finding.
+  return out;
+}
+
+/** Every config semgrep would load from these args: --config X, -c X, -f X, --config=X, -c=X. */
+function semgrepConfigs(args: readonly string[]): string[] {
+  const out: string[] = [];
+  args.forEach((a, i) => {
+    if (a === '--config' || a === '-c' || a === '-f') out.push(args[i + 1] ?? '');
+    else if (/^(?:--config|-c|-f)=/.test(a)) out.push(a.slice(a.indexOf('=') + 1));
+  });
   return out;
 }
 
@@ -348,33 +406,42 @@ export function effectiveProtectedPaths(inUse: ReviewedTool[]): string[] {
 /**
  * The typosquat check. Both names lowercased, the FULL `owner/name` compared: a reviewed repo within Levenshtein
  * distance 2 that isn't the same repo → that reviewed entry (any owner, ruling S31). The same repo (any letter
- * case) → null; so is anything further away.
+ * case) → null; so is anything further away. A name that isn't a plain ASCII GitHub `owner/name` (a look-alike
+ * Unicode letter such as the Kelvin sign, which NFKC folds to K) is always refused: the result is the reviewed
+ * entry it is closest to after NFKC folding (null only when the list is empty).
  */
 export function nearDuplicate(repo: string, list: ReviewedTool[]): ReviewedTool | null {
-  if (typeof repo !== 'string' || repo === '') return null;
+  if (!isGitHubRepo(repo)) {
+    const folded = lower((typeof repo === 'string' ? repo : '').normalize('NFKC'));
+    let best: ReviewedTool | null = null;
+    let bestDistance = Number.POSITIVE_INFINITY;
+    for (const t of list) {
+      const d = levenshtein(folded, lower(t.candidate.repo));
+      if (d < bestDistance) [best, bestDistance] = [t, d];
+    }
+    return best;
+  }
   const name = lower(repo);
   if (list.some((t) => lower(t.candidate.repo) === name)) return null;
-  return list.find((t) => withinDistance(name, lower(t.candidate.repo), 2)) ?? null;
+  return list.find((t) => {
+    const other = lower(t.candidate.repo);
+    return Math.abs(other.length - name.length) <= 2 && levenshtein(name, other) <= 2;
+  }) ?? null;
 }
 
-/** Levenshtein distance of a and b is at most `max` (a band of width 2·max+1, so long inputs stay cheap). */
-function withinDistance(a: string, b: string, max: number): boolean {
-  if (Math.abs(a.length - b.length) > max) return false;
-  const INF = max + 1;
-  let prev = Array.from({ length: b.length + 1 }, (_, j) => (j <= max ? j : INF));
+/** Levenshtein distance (inputs cut to 300 characters: a GitHub owner/name is at most 140). */
+function levenshtein(x: string, y: string): number {
+  const a = x.slice(0, 300);
+  const b = y.slice(0, 300);
+  let prev = Array.from({ length: b.length + 1 }, (_, j) => j);
   for (let i = 1; i <= a.length; i++) {
-    const cur = new Array<number>(b.length + 1).fill(INF);
-    if (i <= max) cur[0] = i;
-    let best = cur[0] as number;
-    for (let j = Math.max(1, i - max); j <= Math.min(b.length, i + max); j++) {
-      const cost = a[i - 1] === b[j - 1] ? 0 : 1;
-      cur[j] = Math.min((prev[j - 1] as number) + cost, (prev[j] as number) + 1, (cur[j - 1] as number) + 1, INF);
-      best = Math.min(best, cur[j] as number);
+    const cur = [i];
+    for (let j = 1; j <= b.length; j++) {
+      cur[j] = Math.min((prev[j - 1] as number) + (a[i - 1] === b[j - 1] ? 0 : 1), (prev[j] as number) + 1, (cur[j - 1] as number) + 1);
     }
-    if (best > max) return false;
     prev = cur;
   }
-  return (prev[b.length] as number) <= max;
+  return prev[b.length] as number;
 }
 
 /** The need ids the project's own scripts cover (by id: type-check and migration-check aren't `test`/`lint`). */

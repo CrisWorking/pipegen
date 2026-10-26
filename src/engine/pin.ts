@@ -2,7 +2,9 @@
 // - a GitHub Action → the 40-character commit SHA its tag points to, read from the upstream repo's own tag refs
 //   (annotated tags dereferenced to the commit). A SHA from the AI or from repo text is never used (ruling S32);
 // - a GitHub release binary → the version plus the sha256 of the linux amd64 asset, from the release's own
-//   checksums file, else downloaded and hashed by pipegen (marked `checksumSource: computed`, ruling S20);
+//   checksums file; else the sha256 digest GitHub itself records for the asset (marked `checksumSource:
+//   github-asset-digest`, with whether the release is immutable); else downloaded and hashed by pipegen (marked
+//   `checksumSource: computed`, ruling S20);
 // - an npm package → the exact version plus `dist.integrity` (sha512);
 // - a pip package → the exact version plus the sha256 of the py3-none-any wheel, else the sdist (ruling S20);
 // - a container image → the digest of its multi-platform index (OCI index or Docker manifest list, ruling S20).
@@ -133,10 +135,10 @@ const COMBINED_SUMS_RE = /(?:^|[._-])(?:checksums|sha256sums?)(?:\.txt)?$/i;
 
 const refSchema = z.object({ ref: z.string(), object: z.object({ type: z.string(), sha: z.string() }) });
 const tagObjectSchema = z.object({ object: z.object({ type: z.string(), sha: z.string() }) });
-const assetSchema = z.object({ name: z.string(), size: z.number().int().nonnegative(), updated_at: z.string().nullish() });
+const assetSchema = z.object({ name: z.string(), size: z.number().int().nonnegative(), updated_at: z.string().nullish(), digest: z.string().nullish() });
 const releaseSchema = z.object({
   tag_name: z.string(), published_at: z.string().nullish(), draft: z.boolean().optional(), prerelease: z.boolean().optional(),
-  target_commitish: z.string().nullish(), assets: z.array(assetSchema).optional(),
+  target_commitish: z.string().nullish(), assets: z.array(assetSchema).optional(), immutable: z.boolean().optional(),
 });
 const npmVersionSchema = z.object({ name: z.string(), version: z.string(), dist: z.object({ integrity: z.string() }) });
 const npmTimesSchema = z.object({ time: z.record(z.string(), z.unknown()) });
@@ -298,6 +300,11 @@ export async function resolvePin(c: Candidate, deps: PinDeps, install?: InstallS
       if (found.size > 1) throw new PinError(`The checksums files of ${what} disagree about ${chosen.name}.`);
       checkAge(what, dates);
       checksum = [...found][0] as string;
+    } else if (typeof chosen.digest === 'string' && DIGEST_RE.test(chosen.digest)) {
+      // no checksums file: GitHub's own record of the asset's sha256 (computed by GitHub when it was uploaded)
+      checkAge(what, dates);
+      checksum = chosen.digest.slice('sha256:'.length);
+      note(`checksumSource: github-asset-digest. ${what} has no checksums file, so pipegen took the sha256 GitHub records for ${chosen.name} (immutable release: ${release.immutable === true ? 'yes' : 'no'}); a reviewer must confirm it.`);
     } else {
       if (chosen.size > maxDownload) throw new PinError(`${chosen.name} of ${what} is too large to download (${chosen.size} bytes).`);
       checkAge(what, dates); // before downloading anything

@@ -2,9 +2,10 @@
 # root: only the tools listed here ever run in a user's CI. Each entry is one exact tool, version, pin and step
 # template. Code owners must review every change (Plan R's CODEOWNERS covers data/).
 #
-# Every value was pinned live on 2026-10-26T23:11:58Z with resolvePin (src/engine/pin.ts), read-only: actions by the
-# commit SHA of their tag (from the upstream repo's own refs), release binaries by the linux amd64 asset's sha256
-# (from the release's own checksums file, unless marked checksumSource: computed), images by the digest of their
+# Every value was pinned live on 2026-10-26 with resolvePin (src/engine/pin.ts), read-only (most at 23:11:58Z;
+# Bullfrog and the zizmor re-check at 2026-10-26T23:39:15Z): actions by the commit SHA of their tag (from the upstream repo's
+# own refs), release binaries by the linux amd64 asset's sha256 (from the release's own checksums file, unless an
+# entry says checksumSource: github-asset-digest or computed), images by the digest of their
 # multi-platform index. Every release was published at least 7 days before that (ruling S26); releasedAt is the
 # server-recorded date. A tool also in data/pinned-binaries.yml has the same version and hash there (ruling S25).
 #
@@ -18,7 +19,7 @@
 # picked up silently); choices (the only inputs the AI may set, each limited to these values); configFiles (files
 # the tool would load from a repo by itself; added to the protected paths); proofs (passed Plan E runs).
 
-pinnedOn: "2026-10-26T23:11:58Z"
+pinnedOn: "2026-10-26T23:39:15Z"
 tools:
   # Checks out the repo. The job credential is never written to .git/config (persist-credentials false).
   # Source: git ref refs/tags/v7.0.1 of actions/checkout (GitHub API), release published_at. Released 2026-07-20T15:10:05Z.
@@ -239,7 +240,7 @@ tools:
     reviewedAt: PENDING
     proofs: 0
 
-  # Builds the container image once (no build cache), so the same image is scanned and deployed.
+  # Builds the container image once (no build cache), so the same image is scanned and deployed. Context "." and an empty github-token: the job credential is never a build secret.
   # Source: git ref refs/tags/v7.4.0 of docker/build-push-action (GitHub API), release published_at. Released 2026-09-15T08:22:01Z.
   - id: docker-build-push-action
     categories: ["platform", "image-build"]
@@ -259,10 +260,14 @@ tools:
       action:
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc
         with:
+          context: "."
+          github-token: ""
           no-cache: "true"
       output: { path: "", format: none }
     fixedInputs:
       with:
+        context: "."
+        github-token: ""
         no-cache: "true"
     choices:
       push: ["false", "true"]
@@ -327,30 +332,39 @@ tools:
     reviewedAt: PENDING
     proofs: 0
 
-  # Egress control for proof and CI jobs (ruling S24). Spike S8 decides its mode for private repos.
-  # Source: git ref refs/tags/v2.22.2 of step-security/harden-runner (GitHub API), release published_at. Released 2026-10-19T16:55:35Z.
-  - id: harden-runner
+  # Egress control for proof and CI jobs (spike S8): Bullfrog in block mode, sudo off, so no later step can undo it.
+  # Source: git ref refs/tags/v0.11.1 of bullfrogsec/bullfrog (GitHub API), release published_at. Released 2026-08-25T02:34:34Z.
+  # Replaces Harden-Runner: its free tier blocked nothing on a private repo, silently (S8). The action checks its agent download against a sha256 pinned inside it.
+  - id: bullfrog
     categories: ["egress"]
     languages: ["any"]
-    releasedAt: "2026-10-19T16:55:35Z"
+    releasedAt: "2026-08-25T02:34:34Z"
     candidate:
-      id: harden-runner
-      name: "step-security/harden-runner"
+      id: bullfrog
+      name: "bullfrogsec/bullfrog"
       kind: action
-      repo: step-security/harden-runner
-      version: "v2.22.2"
-      pin: { sha: "dc2769abcc0fcfbadfc1df54081c1608579ef6b2" }
+      repo: bullfrogsec/bullfrog
+      version: "v0.11.1"
+      pin: { sha: "7dee337d4575320b6d8cbe9a56d48d2fb765963a" }
       source: reviewed
       reviewed: true
       categories: ["egress"]
     step:
       action:
-        uses: step-security/harden-runner@dc2769abcc0fcfbadfc1df54081c1608579ef6b2
-        with: {}
+        uses: bullfrogsec/bullfrog@7dee337d4575320b6d8cbe9a56d48d2fb765963a
+        with:
+          egress-policy: "block"
+          dns-policy: "allowed-domains-only"
+          enable-sudo: "false"
       output: { path: "", format: none }
-    fixedInputs: {}
+    fixedInputs:
+      with:
+        egress-policy: "block"
+        dns-policy: "allowed-domains-only"
+        enable-sudo: "false"
     choices:
-      egress-policy: ["audit", "block"]
+      allowed-domains: ["github-core", "npm", "pypi", "dockerhub", "ghcr"]
+      allowed-ips: ["172.16.0.0/12"]
     configFiles: []
     reviewedBy: PENDING
     reviewedAt: PENDING
@@ -386,7 +400,8 @@ tools:
 
   # OWASP ZAP baseline scan of the running app. zap-json output, converted by pipegen's parser.
   # Source: Docker Hub zaproxy/zap-stable:20261016 index digest (registry-1.docker.io HEAD), push date from hub.docker.com. Released 2026-10-16T09:36:50.415097Z.
-  # zaproxy/zap-stable:20261016 is the newest dated stable build at least 7 days old (2.17.0 and latest were pushed on the pin day).
+  # zaproxy/zap-stable:20261016 is the newest dated stable build at least 7 days old (the 2.17.0 and latest tags were pushed on the pin day); it already holds the ZAP 2.17.0 core.
+  # -z "-silent": no add-on update or install at run time. The image bundles the release passive rules (pscanrules); pscanrulesBeta is not bundled, so beta passive rules do not run.
   - id: zap-baseline
     categories: ["dast"]
     languages: ["any"]
@@ -404,10 +419,10 @@ tools:
     step:
       cli:
         install: { method: docker, package: "zaproxy/zap-stable", version: "20261016" }
-        command: ["zap-baseline.py", "-J", "zap.json"]
+        command: ["zap-baseline.py", "-J", "zap.json", "-z", "-silent"]
       output: { path: "zap.json", format: zap-json }
     fixedInputs:
-      args: ["-J", "zap.json"]
+      args: ["-J", "zap.json", "-z", "-silent"]
       config:
         content: "# pipegen's pinned ZAP baseline rules: the defaults, nothing ignored\n"
         passAs: { flag: "-c" }
@@ -417,7 +432,7 @@ tools:
     reviewedAt: PENDING
     proofs: 0
 
-  # Trivy config scan of Terraform and other infrastructure code. Release binary, no cache.
+  # Trivy config scan of Terraform and other infrastructure code. Release binary, no cache, only the checks built into the pinned binary.
   # Source: release v0.76.0 of aquasecurity/trivy: trivy_0.76.0_Linux-64bit.tar.gz sha256 from the release checksums file. Released 2026-10-14T11:45:44Z.
   - id: trivy-config
     categories: ["iac"]
@@ -436,10 +451,10 @@ tools:
     step:
       cli:
         install: { method: github-release, package: "trivy_0.76.0_Linux-64bit.tar.gz", version: "v0.76.0" }
-        command: ["trivy", "config", "--format", "sarif", "--output", "trivy-config.sarif", "--exit-code", "1", "."]
+        command: ["trivy", "config", "--skip-check-update", "--format", "sarif", "--output", "trivy-config.sarif", "--exit-code", "1", "."]
       output: { path: "trivy-config.sarif", format: sarif }
     fixedInputs:
-      args: ["--format", "sarif"]
+      args: ["--skip-check-update", "--format", "sarif"]
       config:
         content: "# pipegen's pinned trivy config: no cache kept between runs\ncache:\n  backend: memory\n"
         passAs: { flag: "--config" }
@@ -502,10 +517,10 @@ tools:
     step:
       cli:
         install: { method: github-release, package: "gitleaks_8.30.1_linux_x64.tar.gz", version: "v8.30.1" }
-        command: ["gitleaks", "git", "--no-banner", "--report-format", "sarif", "--report-path", "gitleaks.sarif", "."]
+        command: ["gitleaks", "git", "--no-banner", "--ignore-gitleaks-allow", "--report-format", "sarif", "--report-path", "gitleaks.sarif", "."]
       output: { path: "gitleaks.sarif", format: sarif }
     fixedInputs:
-      args: ["--report-format", "sarif", "--report-path", "gitleaks.sarif"]
+      args: ["--ignore-gitleaks-allow", "--report-format", "sarif", "--report-path", "gitleaks.sarif"]
       config:
         content: "[extend]\nuseDefault = true\n"
         passAs: { flag: "--config" }
@@ -519,6 +534,8 @@ tools:
   # Source: Docker Hub semgrep/semgrep:1.181.0 index digest (registry-1.docker.io HEAD), push date from hub.docker.com. Released 2026-10-14T21:25:26.956057Z.
   # Rules: semgrep/semgrep-rules commit 17e31e11ebac99fb7dfe1cd288f7a32151b6f3f9 on develop ("Merge pull request #4083 from semgrep/malaverdiere/fix-keyvault-timeadd-duration"), committed and GitHub-signed (web-flow) 2026-10-15T21:04:55Z.
   # Rules archive sha256 computed by downloading https://github.com/semgrep/semgrep-rules/archive/17e31e11ebac99fb7dfe1cd288f7a32151b6f3f9.tar.gz twice (same hash, 1214304 bytes): checksumSource: computed.
+  # PIPEGEN_RULES_TREE is that commit's git tree SHA (GitHub API). --config /pipegen-rules is explicit because semgrep's default config is auto.
+  # No --disable-nosem: a nosem comment is a suppression the gate already reports as a finding.
   - id: semgrep
     categories: ["sast"]
     languages: ["node", "python"]
@@ -536,16 +553,18 @@ tools:
     step:
       cli:
         install: { method: docker, package: "semgrep/semgrep", version: "1.181.0" }
-        command: ["semgrep", "scan", "--metrics=off", "--disable-version-check", "--sarif", "--output", "semgrep.sarif"]
+        command: ["semgrep", "scan", "--metrics=off", "--disable-version-check", "--config", "/pipegen-rules", "--sarif", "--output", "semgrep.sarif"]
         env:
           PIPEGEN_RULES_URL: "https://github.com/semgrep/semgrep-rules/archive/17e31e11ebac99fb7dfe1cd288f7a32151b6f3f9.tar.gz"
           PIPEGEN_RULES_SHA256: "9dfe6866fbecd557f507078cb79721a9eb8f4764fc2f6163648ea1320be25933"
+          PIPEGEN_RULES_TREE: "dd3179667faf14717e05c33b1916b0d2c349673d"
       output: { path: "semgrep.sarif", format: sarif }
     fixedInputs:
-      args: ["--metrics=off", "--disable-version-check"]
+      args: ["--metrics=off", "--disable-version-check", "--config", "/pipegen-rules"]
       env:
         PIPEGEN_RULES_URL: "https://github.com/semgrep/semgrep-rules/archive/17e31e11ebac99fb7dfe1cd288f7a32151b6f3f9.tar.gz"
         PIPEGEN_RULES_SHA256: "9dfe6866fbecd557f507078cb79721a9eb8f4764fc2f6163648ea1320be25933"
+        PIPEGEN_RULES_TREE: "dd3179667faf14717e05c33b1916b0d2c349673d"
     choices:
       rules: ["javascript", "typescript", "python"]
     configFiles: [".semgrepignore"]
@@ -673,8 +692,9 @@ tools:
     reviewedAt: PENDING
     proofs: 0
 
-  # Lints GitHub workflow files. Same release as data/pinned-binaries.yml (ruling S25). The cache-mode ignore lands with Task 7 Part 2 (v0.2).
+  # Lints GitHub workflow files. Same release as data/pinned-binaries.yml (ruling S25). No shellcheck or pyflakes from the runner's PATH.
   # Source: release v1.7.12 of rhysd/actionlint: actionlint_1.7.12_linux_amd64.tar.gz sha256 from the release checksums file. Released 2026-03-30T17:49:21Z.
+  # The pinned config ignores only the cache-mode job key, which actionlint 1.7.12 rejects (DECISIONS #79; checked with the real 1.7.12 binary).
   - id: actionlint
     categories: ["workflow-lint"]
     languages: ["any"]
@@ -692,11 +712,12 @@ tools:
     step:
       cli:
         install: { method: github-release, package: "actionlint_1.7.12_linux_amd64.tar.gz", version: "v1.7.12" }
-        command: ["actionlint", "-no-color"]
+        command: ["actionlint", "-no-color", "-shellcheck=", "-pyflakes="]
       output: { path: "", format: none }
     fixedInputs:
+      args: ["-shellcheck=", "-pyflakes="]
       config:
-        content: "self-hosted-runner:\n  labels: []\n"
+        content: "self-hosted-runner:\n  labels: []\npaths:\n  .github/workflows/**/*.{yml,yaml}:\n    ignore:\n      - 'unexpected key \"cache-mode\" for \"job\" section'\n"
         passAs: { flag: "-config-file" }
     choices: {}
     configFiles: [".github/actionlint.yaml", ".github/actionlint.yml"]
@@ -705,8 +726,8 @@ tools:
     proofs: 0
 
   # Security audit of GitHub workflow files, offline. Release binary.
-  # Source: release v1.31.1 of zizmorcore/zizmor: zizmor-x86_64-unknown-linux-gnu.tar.gz sha256 computed by pipegen (the release has no checksums file). Released 2026-10-15T23:16:39Z.
-  # checksumSource: computed. zizmorcore/zizmor v1.31.1 has no checksums file, so pipegen downloaded zizmor-x86_64-unknown-linux-gnu.tar.gz and computed its sha256 itself; a reviewer must confirm it.
+  # Source: release v1.31.1 of zizmorcore/zizmor: zizmor-x86_64-unknown-linux-gnu.tar.gz sha256 GitHub records for the asset (the release has no checksums file). Released 2026-10-15T23:16:39Z.
+  # checksumSource: github-asset-digest. zizmorcore/zizmor v1.31.1 has no checksums file, so pipegen took the sha256 GitHub records for zizmor-x86_64-unknown-linux-gnu.tar.gz (immutable release: yes); a reviewer must confirm it.
   - id: zizmor
     categories: ["workflow-lint"]
     languages: ["any"]

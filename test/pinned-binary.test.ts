@@ -525,14 +525,19 @@ describe('pinned-binaries.yml', () => {
 });
 
 describe('checkPinnedAgainstReviewed (ruling S25)', () => {
-  const reviewedCli = (repo: string, version: string, checksum?: string): ReviewedTool => {
+  /** `asset`: the release asset the entry installs (S25 compares the hash to that platform's). */
+  const reviewedCli = (repo: string, version: string, checksum?: string, asset?: string): ReviewedTool => {
     const candidate: Candidate = {
       id: repo.split('/')[1] ?? repo, name: repo, kind: 'cli', repo, version, pin: checksum === undefined ? {} : { checksum },
       source: 'reviewed', reviewed: true, categories: ['workflow-lint'],
     };
     return {
       id: candidate.id, categories: candidate.categories, languages: ['any'], candidate,
-      step: { output: { path: 'out', format: 'none' } }, fixedInputs: {}, choices: {}, configFiles: [],
+      step: {
+        ...(asset === undefined ? {} : { cli: { install: { method: 'github-release', package: asset, version }, command: ['tool'] } }),
+        output: { path: 'out', format: 'none' },
+      },
+      fixedInputs: {}, choices: {}, configFiles: [],
       reviewedBy: 'reviewer', reviewedAt: '2026-10-01', proofs: 0,
     };
   };
@@ -540,22 +545,38 @@ describe('checkPinnedAgainstReviewed (ruling S25)', () => {
   it('checkPinnedAgainstReviewed: same version and hash → no problem; a tool only in one file is ignored', () => {
     const pins = loadPinnedBinaries();
     const a = pins.actionlint;
+    const assetOf = (k: 'linux-x64' | 'linux-arm64') => a.platforms[k].url.split('/').pop() as string;
     const list = [
-      reviewedCli('rhysd/actionlint', `v${a.version}`, a.platforms['linux-x64'].archiveSha256),
+      reviewedCli('rhysd/actionlint', `v${a.version}`, a.platforms['linux-x64'].archiveSha256, assetOf('linux-x64')),
       reviewedCli('zizmorcore/zizmor', 'v1.0.0', 'f'.repeat(64)),
     ];
     expect(checkPinnedAgainstReviewed(pins, list)).toEqual([]);
     // the extracted binary's hash is the same tool too
-    expect(checkPinnedAgainstReviewed(pins, [reviewedCli('rhysd/actionlint', a.version, a.platforms['linux-arm64'].binarySha256)])).toEqual([]);
+    expect(checkPinnedAgainstReviewed(pins, [reviewedCli('rhysd/actionlint', a.version, a.platforms['linux-arm64'].binarySha256, assetOf('linux-arm64'))])).toEqual([]);
+  });
+
+  it('checkPinnedAgainstReviewed: the hash must be the one of the platform the install names (M5)', () => {
+    const pins = loadPinnedBinaries();
+    const a = pins.actionlint;
+    const x64 = a.platforms['linux-x64'].url.split('/').pop() as string;
+    // another platform's hash (a real actionlint hash, but not of the asset the entry installs)
+    expect(checkPinnedAgainstReviewed(pins, [reviewedCli('rhysd/actionlint', `v${a.version}`, a.platforms['darwin-arm64'].archiveSha256, x64)]).join('\n'))
+      .toMatch(/actionlint.*linux-x64/i);
+    // an asset pinned-binaries.yml doesn't list, or no asset at all
+    expect(checkPinnedAgainstReviewed(pins, [reviewedCli('rhysd/actionlint', `v${a.version}`, a.platforms['linux-x64'].archiveSha256, 'actionlint_other.tar.gz')]).join('\n'))
+      .toMatch(/actionlint.*asset/i);
+    expect(checkPinnedAgainstReviewed(pins, [reviewedCli('rhysd/actionlint', `v${a.version}`, a.platforms['linux-x64'].archiveSha256)]).join('\n'))
+      .toMatch(/actionlint.*asset/i);
   });
 
   it('checkPinnedAgainstReviewed: another version, another hash, or no hash → a problem naming the tool', () => {
     const pins = loadPinnedBinaries();
     const a = pins.actionlint;
     const sum = a.platforms['linux-x64'].archiveSha256;
-    expect(checkPinnedAgainstReviewed(pins, [reviewedCli('rhysd/actionlint', 'v1.0.0', sum)]).join('\n')).toMatch(/actionlint.*version/i);
-    expect(checkPinnedAgainstReviewed(pins, [reviewedCli('rhysd/actionlint', `v${a.version}`, 'e'.repeat(64))]).join('\n')).toMatch(/actionlint.*hash/i);
-    expect(checkPinnedAgainstReviewed(pins, [reviewedCli('rhysd/actionlint', `v${a.version}`)]).join('\n')).toMatch(/actionlint.*no hash/i);
+    const x64 = a.platforms['linux-x64'].url.split('/').pop() as string;
+    expect(checkPinnedAgainstReviewed(pins, [reviewedCli('rhysd/actionlint', 'v1.0.0', sum, x64)]).join('\n')).toMatch(/actionlint.*version/i);
+    expect(checkPinnedAgainstReviewed(pins, [reviewedCli('rhysd/actionlint', `v${a.version}`, 'e'.repeat(64), x64)]).join('\n')).toMatch(/actionlint.*hash/i);
+    expect(checkPinnedAgainstReviewed(pins, [reviewedCli('rhysd/actionlint', `v${a.version}`, undefined, x64)]).join('\n')).toMatch(/actionlint.*no hash/i);
     expect(checkPinnedAgainstReviewed(pins, [reviewedCli('Sigstore/Cosign', 'v0.1.0', sum)]).join('\n')).toMatch(/cosign/i);
   });
 });
