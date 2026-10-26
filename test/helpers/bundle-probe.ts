@@ -3,6 +3,7 @@
 import { makeProvider } from '../../src/ai/provider.js';
 import { bundleCode } from '../../src/ai/redact.js';
 import { floorNeeds, jobCounts, needsSchema } from '../../src/engine/needs.js';
+import { checkQualityBar, loadQualityBar } from '../../src/engine/quality-bar.js';
 import { readProject } from '../../src/read/project.js';
 import type { Capabilities, RepoProfile } from '../../src/types.js';
 
@@ -21,6 +22,9 @@ const providers = [
 const full: RepoProfile = { ...profile, private: true, ownerType: 'User', plan: 'free' };
 const capNames = ['branchProtection', 'environments', 'envRequiredReviewers', 'attestations', 'codeScanning', 'keylessSigningAllowed'];
 const caps = Object.fromEntries(capNames.map((n) => [n, false])) as unknown as Capabilities;
+// data/quality-bar.yml is found through packageDataPath from the bundled file (the probe sits in <pkg>/dist/cli/)
+const qualityBar = loadQualityBar();
+const verdict = checkQualityBar({ repo: 'o/r', stars: 1, archived: false, lastReleaseAt: null, scorecard: null, verifiedPublisher: false, license: 'MIT', advisories: null }, qualityBar, new Date());
 console.log(JSON.stringify({
   owner: profile.owner,
   repo: profile.repo,
@@ -32,4 +36,6 @@ console.log(JSON.stringify({
   // the needs planner's rules and its zod → JSON schema step work when bundled
   pushJobs: jobCounts(floorNeeds(full, caps)).push,
   needsSchemaKeys: Object.keys((needsSchema(full).jsonSchema as { properties: object }).properties),
+  qualityBar,
+  qualityReasons: verdict.reasons.length,
 }));
