@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
-import { GitHubRateLimitError } from '../src/engine/github-rate.js';
+import { GitHubRateLimitError, newRateBudget } from '../src/engine/github-rate.js';
 import { fetchStats, StatsError, type StatsDeps } from '../src/engine/stats.js';
 import type { Candidate, InstallSpec } from '../src/types.js';
 import { fakeFetch, fakeOctokit, type Call, type Reply, type Routes } from './helpers/fake-http.js';
@@ -8,7 +8,8 @@ import { fake } from './helpers/secret-repo.js';
 const GH = 'https://api.github.com';
 const SCORECARD = 'https://api.scorecard.dev/projects/github.com';
 const OSV = 'https://api.osv.dev/v1/query';
-const NPM_ATTEST = 'https://registry.npmjs.org/-/npm/v1/attestations';
+const NPM = 'https://registry.npmjs.org';
+const NPM_ATTEST = `${NPM}/-/npm/v1/attestations`;
 const PYPI = 'https://pypi.org';
 const SHA = 'a'.repeat(40);
 const OTHER_SHA = 'b'.repeat(40);
@@ -46,9 +47,18 @@ const github = (over: Routes = {}): Routes => ({
   [`GET ${GH}/repos/o/r/contents/pyproject.toml`]: file('[project]\nname = "some_tool"\nversion = "1.4.0rc1"\n'),
   ...over,
 });
+/** npm's metadata for one version, with its `repository` field. */
+const npmVersion = (repository: unknown): Reply => ({ body: { name: 'tool', version: '2.0.1', repository } });
+/** PyPI's metadata for one release: its links and files. */
+const pypiRelease = (info: Record<string, unknown>, urls: { filename: string }[] = []): Reply => ({ body: { info: { home_page: null, project_urls: null, ...info }, urls } });
+/** Scorecard, OSV and the registries' metadata pointing back at o/r (no provenance anywhere). */
 const web = (over: Routes = {}): Routes => ({
   [`GET ${SCORECARD}/o/r`]: { body: { date: '2026-10-01', score: 7.5, checks: [] } },
   [`POST ${OSV}`]: { body: {} },
+  [`GET ${NPM}/tool/2.0.1`]: npmVersion({ type: 'git', url: 'git+https://github.com/o/r.git' }),
+  [`GET ${NPM}/tool/latest`]: npmVersion('github:o/r'),
+  [`GET ${NPM}/@scope%2flint-tool/2.0.1`]: npmVersion('https://github.com/o/r'),
+  [`GET ${PYPI}/pypi/some-tool/1.4.0rc1/json`]: pypiRelease({ project_urls: { Homepage: 'https://example.org', Source: 'https://github.com/o/r' } }),
   ...over,
 });
 
@@ -74,7 +84,7 @@ function setup(gh: Routes = github(), net: Routes = web(), extra: Partial<StatsD
   const g = fakeOctokit(gh);
   const f = fakeFetch(net);
   const notes: string[] = [];
-  const deps: StatsDeps = { gh: g.gh, fetch: f.fetch, notes, sleep: vi.fn(async () => {}), now: () => NOW, ...extra };
+  const deps: StatsDeps = { gh: g.gh, fetch: f.fetch, notes, sleep: vi.fn(async () => {}), now: () => NOW, budget: newRateBudget(), ...extra };
   return { deps, ghCalls: g.calls, netCalls: f.calls, notes };
 }
 const paths = (calls: Call[]) => calls.map((c) => `${c.method} ${c.url.pathname}`);
@@ -313,7 +323,11 @@ describe('stats', () => {
 
   it('stats: root manifest match → accepted (PyPI names PEP 503-normalised, poetry too)', async () => {
     expect((await fetchStats(pkgCand(), setup().deps, npm('tool'))).repo).toBe('o/r');
-    expect((await fetchStats(pkgCand(), setup().deps, pip('Some.Tool'))).repo).toBe('o/r');
+    const dotted = setup();
+    expect((await fetchStats(pkgCand(), dotted.deps, pip('Some.Tool'))).repo).toBe('o/r');
+    // PyPI URLs use the PEP 503 name
+    expect(dotted.netCalls.map((c) => c.url.pathname)).toContain('/pypi/some-tool/1.4.0rc1/json');
+    expect(dotted.netCalls.some((c) => c.url.pathname.includes('Some.Tool'))).toBe(false);
     const poetry = setup(github({ [`GET ${GH}/repos/o/r/contents/pyproject.toml`]: file('[tool.poetry]\nname = "some-tool"\n') }));
     expect((await fetchStats(pkgCand(), poetry.deps, pip('some_tool'))).repo).toBe('o/r');
   });
@@ -341,6 +355,77 @@ describe('stats', () => {
     await expect(fetchStats(pkgCand(), both.deps, npm('evil-pkg'))).rejects.toThrow(StatsError);
   });
 
+  it('stats: a private root manifest is not proof', async () => {
+    const npmPrivate = setup(github({ [`GET ${GH}/repos/o/r/contents/package.json`]: file(JSON.stringify({ name: 'tool', private: true })) }));
+    await expect(fetchStats(pkgCand(), npmPrivate.deps, npm())).rejects.toThrow("Couldn't confirm that tool is published from o/r.");
+    for (const toml of [
+      '[project]\nname = "some_tool"\nclassifiers = ["Programming Language :: Python", "Private :: Do Not Upload"]\n',
+      '[tool.poetry]\nname = "some_tool"\nclassifiers = ["Private :: Do Not Upload"]\n',
+    ]) {
+      const pyPrivate = setup(github({ [`GET ${GH}/repos/o/r/contents/pyproject.toml`]: file(toml) }));
+      await expect(fetchStats(pkgCand(), pyPrivate.deps, pip()), toml).rejects.toThrow("Couldn't confirm that some_tool is published from o/r.");
+    }
+  });
+
+  it('stats: manifest matches but registry repository points elsewhere → refused', async () => {
+    for (const repository of ['git+https://github.com/attacker/r.git', { url: 'https://github.com/o/r-fork' }, 'https://gitlab.com/o/r', null, 'not a url']) {
+      const { deps } = setup(github(), web({ [`GET ${NPM}/tool/2.0.1`]: npmVersion(repository) }));
+      await expect(fetchStats(pkgCand(), deps, npm()), JSON.stringify(repository)).rejects.toThrow("Couldn't confirm that tool is published from o/r.");
+    }
+    // no registry metadata for that version
+    const missing = setup(github(), web({ [`GET ${NPM}/tool/2.0.1`]: { status: 404 } }));
+    await expect(fetchStats(pkgCand(), missing.deps, npm())).rejects.toThrow(StatsError);
+    // PyPI: links to another repo only
+    const py = setup(github(), web({ [`GET ${PYPI}/pypi/some-tool/1.4.0rc1/json`]: pypiRelease({ home_page: 'https://github.com/attacker/r', project_urls: { Source: 'https://github.com/attacker/r' } }) }));
+    await expect(fetchStats(pkgCand(), py.deps, pip())).rejects.toThrow("Couldn't confirm that some_tool is published from o/r.");
+  });
+
+  it('stats: manifest and registry both point at the repo → accepted', async () => {
+    for (const repository of ['github:o/r', 'o/r', 'git@github.com:O/R.git', 'git+ssh://git@github.com/o/r.git', { type: 'git', url: 'git://github.com/o/r.git' }, 'https://github.com/o/r/tree/main/packages/tool']) {
+      const { deps } = setup(github(), web({ [`GET ${NPM}/tool/2.0.1`]: npmVersion(repository) }));
+      expect((await fetchStats(pkgCand(), deps, npm())).repo, JSON.stringify(repository)).toBe('o/r');
+    }
+    const py = setup(github(), web({ [`GET ${PYPI}/pypi/some-tool/1.4.0rc1/json`]: pypiRelease({ home_page: 'https://github.com/O/r' }) }));
+    expect((await fetchStats(pkgCand(), py.deps, pip())).repo).toBe('o/r');
+  });
+
+  it('stats: PyPI provenance from a publisher that is not GitHub → refused', async () => {
+    const f = 'some_tool-1.4.0rc1-py3-none-any.whl';
+    const { deps } = setup(github(), web({
+      [`GET ${PYPI}/pypi/some-tool/1.4.0rc1/json`]: pypiRelease({ project_urls: { Source: 'https://github.com/o/r' } }, [{ filename: f }]),
+      [`GET ${PYPI}/integrity/some-tool/1.4.0rc1/${f}/provenance`]: { body: { attestation_bundles: [{ publisher: { kind: 'GitLab', repository: 'o/r' } }] } },
+    }));
+    // even though the root manifest and the links match
+    await expect(fetchStats(pkgCand(), deps, pip())).rejects.toThrow("Couldn't confirm that some_tool is published from o/r.");
+  });
+
+  it('stats: PyPI release with more files than are checked, or an odd file name → no provenance proof', async () => {
+    const good = (i: number) => ({ filename: `other_tool-1.0.0-${i}-py3-none-any.whl` });
+    const provenance = { body: { attestation_bundles: [{ publisher: { kind: 'GitHub', repository: 'o/r' } }] } };
+    const routesFor = (files: { filename: string }[]): Routes => Object.fromEntries([
+      [`GET ${PYPI}/pypi/other-tool/1.0.0/json`, pypiRelease({}, files)],
+      ...files.map((x) => [`GET ${PYPI}/integrity/other-tool/1.0.0/${encodeURIComponent(x.filename)}/provenance`, provenance]),
+    ]);
+    // three files, all with provenance naming o/r → proof (control)
+    expect((await fetchStats(pkgCand(), setup(github(), web(routesFor([good(1), good(2), good(3)]))).deps, pip('other-tool', '1.0.0'))).repo).toBe('o/r');
+    // a fourth file, or a file name pipegen won't put in a URL → unknown, and the manifest (some_tool) doesn't name other-tool
+    for (const files of [[good(1), good(2), good(3), good(4)], [good(1), { filename: 'x/../other_tool.whl' }]]) {
+      const { deps } = setup(github(), web(routesFor(files)));
+      await expect(fetchStats(pkgCand(), deps, pip('other-tool', '1.0.0')), String(files.length)).rejects.toThrow("Couldn't confirm that other-tool is published from o/r.");
+    }
+  });
+
+  it('stats: more full versions on the pinned commit than are looked up → advisories null', async () => {
+    const versions = ['v1.2.3', 'v1.2.3-rc.1', 'v1.2.3-rc.2', 'v1.2.3-rc.3', 'v1.2.3-rc.4'];
+    const five = setup(github({ [`GET ${GH}/repos/o/r/tags`]: { body: versions.map((v) => tag(v, SHA)) } }));
+    expect((await fetchStats(cand(), five.deps)).advisories).toBe(0);
+    expect(affects(five.ghCalls).sort()).toEqual(versions.map((v) => `o/r@${v.slice(1)}`).sort()); // every one, the label included
+    const six = setup(github({ [`GET ${GH}/repos/o/r/tags`]: { body: [...versions, 'v1.2.3-rc.5'].map((v) => tag(v, SHA)) } }));
+    expect((await fetchStats(cand(), six.deps)).advisories).toBeNull();
+    expect(affects(six.ghCalls)).toEqual([]);
+    expect(six.notes.join('\n')).toMatch(/more than 5 versions/i);
+  });
+
   it('stats: only the Octokit carries the credential; deps.fetch never gets an authorization header', async () => {
     const cred = fake.githubClassic();
     const g = fakeOctokit(github({
@@ -348,9 +433,9 @@ describe('stats', () => {
       [`GET ${GH}/repos/o/r/git/commits/${SHA}`]: { body: { committer: { date: '2026-03-04T05:06:07Z' } } },
     }), { [LOGIN_OPTION]: cred });
     const f = fakeFetch(web());
-    const deps: StatsDeps = { gh: g.gh, fetch: f.fetch, notes: [] };
+    const deps: StatsDeps = { gh: g.gh, fetch: f.fetch, notes: [], budget: newRateBudget() };
     await fetchStats(cand({ version: '' }), deps); // actions: GitHub advisories + scorecard
-    await fetchStats(pkgCand(), deps, npm()); // + npm provenance, root manifest, OSV
+    await fetchStats(pkgCand(), deps, npm()); // + npm provenance and metadata, root manifest, OSV
     // every Octokit request went to api.github.com, with the credential
     expect(g.calls.length).toBeGreaterThan(4);
     for (const c of g.calls) {
@@ -358,7 +443,7 @@ describe('stats', () => {
       expect(c.headers[LOGIN_HEADER]).toContain(cred);
     }
     // deps.fetch (scorecard, npm, OSV) never got an auth header, or the credential anywhere
-    expect(f.calls.map((c) => c.url.origin).sort()).toEqual(['https://api.osv.dev', 'https://api.scorecard.dev', 'https://api.scorecard.dev', 'https://registry.npmjs.org']);
+    expect(f.calls.map((c) => c.url.origin).sort()).toEqual(['https://api.osv.dev', 'https://api.scorecard.dev', 'https://api.scorecard.dev', NPM, NPM]);
     for (const c of f.calls) {
       expect(Object.keys(c.headers).map((k) => k.toLowerCase())).not.toContain(LOGIN_HEADER);
       expect(JSON.stringify(c)).not.toContain(cred);
@@ -388,7 +473,7 @@ describe('stats', () => {
       [`GET ${GH}/repos/o/r`]: () => (n++ % 2 === 0 ? { status: 403, headers: { 'x-ratelimit-remaining': '0', 'x-ratelimit-reset': reset } } : { body: repoBody() }),
     }));
     await fetchStats(cand(), deps);
-    await fetchStats(cand(), deps); // 102 s of the default 120 s spent
+    await fetchStats(cand(), deps); // 102 s of this run's 120 s spent
     await expect(fetchStats(cand(), deps)).rejects.toThrow(new StatsError('GitHub rate limit: stopped waiting.'));
     expect(deps.sleep).toHaveBeenCalledTimes(2);
     // an injected budget

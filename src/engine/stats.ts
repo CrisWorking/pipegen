@@ -6,7 +6,8 @@
 // - The exact repo only: a repo GitHub reports under another name (renamed or transferred) is refused.
 // - An npm or PyPI package only borrows the repo's stats when a link the repo owner controls proves it is published
 //   from that repo: registry provenance for that version naming the repo, or the repo's root manifest naming the
-//   package. A provenance naming another repo is a refusal.
+//   package (and not marked private) while the registry's own metadata points back at the repo. A provenance naming
+//   another repo, or from a publisher that isn't GitHub, is a refusal.
 // - Only `deps.gh` (Octokit, api.github.com) carries the user's credential. `deps.fetch` (Scorecard, OSV, npm,
 //   PyPI) is called with no auth header (ruling S15).
 // - Advisories (ruling S12): a version that can't be resolved or checked gives `advisories: null`, never 0, so the
@@ -20,7 +21,8 @@ import { safeText } from '../util/safe-text.js';
 import type { Candidate, InstallSpec, ToolStats } from '../types.js';
 import { BUDGET_SPENT_MESSAGE, GitHubRateLimitError, withRateLimit, type RateClock } from './github-rate.js';
 import {
-  advisoryVersion, COMMIT_SHA_RE, compareSemver, isFullSemver, isGitHubRepo, isNpmName, isPypiName, npmEscapedName, pep503, repoSegments,
+  advisoryVersion, COMMIT_SHA_RE, compareSemver, githubRepoFromUrl, isFullSemver, isGitHubRepo, isNpmName, isPypiName, npmEscapedName, pep503,
+  repoSegments,
 } from './names.js';
 
 export interface StatsDeps extends RateClock {
@@ -39,21 +41,21 @@ export class StatsError extends Error {
 
 const SCORECARD_BASE = 'https://api.scorecard.dev/projects/github.com/';
 const OSV_QUERY = 'https://api.osv.dev/v1/query';
-const NPM_ATTESTATIONS = 'https://registry.npmjs.org/-/npm/v1/attestations/';
+const NPM_REGISTRY = 'https://registry.npmjs.org/';
+const NPM_ATTESTATIONS = `${NPM_REGISTRY}-/npm/v1/attestations/`;
 const PYPI = 'https://pypi.org';
 const REQUEST_TIMEOUT_MS = 20_000;
 const MAX_BODY_CHARS = 4_000_000;
 const MAX_MANIFEST_CHARS = 1_500_000;
 /** Pages of 100 tags searched (tags on a pinned commit, the highest version tag). */
 const TAG_PAGES = 3;
-/** At most this many versions on one commit are looked up. */
+/** At most this many versions on one commit are looked up; more → advisories unknown. */
 const MAX_VERSIONS = 5;
-/** At most this many PyPI release files are checked for a provenance. */
+/** PyPI release files checked for a provenance; a release with more gives no provenance proof (unknown). */
 const MAX_PYPI_FILES = 3;
+const PRIVATE_CLASSIFIER = 'Private :: Do Not Upload';
 const SPDX_RE = /^[A-Za-z0-9.+-]{1,64}$/;
 const PYPI_FILE_RE = /^[A-Za-z0-9._+-]{1,255}$/;
-/** `https://github.com/o/r`, `git+https://github.com/o/r.git@refs/...` → `o/r`. */
-const GITHUB_URL_RE = /^(?:git\+)?https:\/\/github\.com\/([^/@#?]+\/[^/@#?]+?)(?:\.git)?(?:@.*)?$/i;
 /** Stands for a provenance whose repo can't be read: never equal to a checked repo, so it counts as another repo. */
 const UNREADABLE_REPO = '<unreadable>';
 
@@ -74,7 +76,11 @@ const advisoriesSchema = z.array(z.object({ withdrawn_at: z.string().nullish() }
 const npmAttestationsSchema = z.object({
   attestations: z.array(z.object({ predicateType: z.string(), bundle: z.object({ dsseEnvelope: z.object({ payload: z.string() }) }) })),
 });
-const pypiReleaseSchema = z.object({ urls: z.array(z.object({ filename: z.string() })) });
+const npmVersionSchema = z.object({ repository: z.union([z.string(), z.object({ url: z.unknown() })]).nullish() });
+const pypiReleaseSchema = z.object({
+  info: z.object({ home_page: z.unknown(), project_urls: z.record(z.string(), z.unknown()).nullish() }).nullish(),
+  urls: z.array(z.object({ filename: z.string() })).nullish(),
+});
 const pypiProvenanceSchema = z.object({ attestation_bundles: z.array(z.object({ publisher: z.object({ kind: z.string(), repository: z.string().nullish() }) })) });
 
 type Tag = z.infer<typeof tagsSchema>[number];
@@ -151,6 +157,11 @@ export async function fetchStats(c: Candidate, deps: StatsDeps, install?: Instal
     }
   }
 
+  /** The package's PyPI name in URLs: PEP 503-normalised, then encoded. */
+  const pypiPath = (pkg: string) => encodeURIComponent(pep503(pkg));
+  /** The registry's metadata for the package, fetched once (see registryMetadata). */
+  let metadata: Promise<unknown> | undefined;
+
   const tagPages: Tag[][] = [];
   /** Every tag in the first TAG_PAGES pages (fetched once). */
   async function allTags(): Promise<Tag[]> {
@@ -184,15 +195,43 @@ export async function fetchStats(c: Candidate, deps: StatsDeps, install?: Instal
   return { repo, stars: info.stargazers_count, archived: info.archived, lastReleaseAt, scorecard, scorecardAt, verifiedPublisher, license, advisories };
 
   /**
-   * Ruling I1: the package must be shown to come from this repo by something the repo owner controls. Registry
-   * provenance for this exact version naming the repo, else the repo's root manifest naming the package.
-   * A provenance naming another repo, or neither proof, is a refusal.
+   * Ruling I1 (and round 2): the package must be shown to come from this repo by something the repo owner controls.
+   * Registry provenance for this exact version naming the repo; else the repo's root manifest naming the package
+   * (not marked private) AND the registry's metadata for the package pointing back at the repo. A provenance naming
+   * another repo, or neither proof, is a refusal.
    */
   async function confirmPublishedFromRepo(t: { ecosystem: 'npm' | 'PyPI'; package: string }): Promise<void> {
     const provenance = await provenanceOf(t);
     if (provenance === 'this-repo') return;
-    if (provenance === 'none' && (await rootManifestNames(t))) return;
+    if (provenance === 'none' && (await rootManifestNames(t)) && (await registryPointsBack(t))) return;
     throw new StatsError(`Couldn't confirm that ${t.package} is published from ${repo}.`);
+  }
+
+  /**
+   * The registry's metadata for the package: the exact version when the label is one, else the latest
+   * (fetched once). npm: the version document; PyPI: the release JSON (links and files).
+   */
+  function registryMetadata(t: { ecosystem: 'npm' | 'PyPI'; package: string }): Promise<unknown> {
+    const version = exactVersion();
+    const url = t.ecosystem === 'npm'
+      ? `${NPM_REGISTRY}${npmEscapedName(t.package)}/${version === null ? 'latest' : encodeURIComponent(version)}`
+      : `${PYPI}/pypi/${pypiPath(t.package)}/${version === null ? '' : `${encodeURIComponent(version)}/`}json`;
+    metadata ??= getJson(url).then((r) => r?.body);
+    return metadata;
+  }
+
+  /** The registry's own metadata names this repo: npm `repository`; PyPI `home_page` or any `project_urls` link. */
+  async function registryPointsBack(t: { ecosystem: 'npm' | 'PyPI'; package: string }): Promise<boolean> {
+    const body = await registryMetadata(t);
+    const same = (link: unknown) => githubRepoFromUrl(link)?.toLowerCase() === repo.toLowerCase();
+    if (t.ecosystem === 'npm') {
+      const parsed = npmVersionSchema.safeParse(body);
+      const r = parsed.success ? parsed.data.repository : null;
+      return same(typeof r === 'string' ? r : r?.url);
+    }
+    const parsed = pypiReleaseSchema.safeParse(body);
+    const info = parsed.success ? parsed.data.info : null;
+    return [info?.home_page, ...Object.values(info?.project_urls ?? {})].some(same);
   }
 
   /** The full version label (install spec's or candidate's), for the registry's per-version provenance. */
@@ -218,23 +257,26 @@ export async function fetchStats(c: Candidate, deps: StatsDeps, install?: Instal
       if (!parsed.success) return 'none';
       return judge(parsed.data.attestations.filter((a) => a.predicateType.startsWith('https://slsa.dev/provenance/')).map((a) => slsaRepo(a.bundle.dsseEnvelope.payload)));
     }
-    const base = `${PYPI}/pypi/${encodeURIComponent(t.package)}/${encodeURIComponent(version)}`;
-    const release = pypiReleaseSchema.safeParse((await getJson(`${base}/json`))?.body);
+    const release = pypiReleaseSchema.safeParse(await registryMetadata(t));
     if (!release.success) return 'none';
-    const files = release.data.urls.map((u) => u.filename).filter((f) => PYPI_FILE_RE.test(f)).slice(0, MAX_PYPI_FILES);
+    const files = (release.data.urls ?? []).map((u) => u.filename);
+    // more files than are checked, or a name pipegen won't put in a URL: the provenance is unknown, never partial
+    if (files.length > MAX_PYPI_FILES || files.some((f) => !PYPI_FILE_RE.test(f))) return 'none';
     const repos: string[] = [];
     for (const f of files) {
-      const url = `${PYPI}/integrity/${encodeURIComponent(t.package)}/${encodeURIComponent(version)}/${encodeURIComponent(f)}/provenance`;
+      const url = `${PYPI}/integrity/${pypiPath(t.package)}/${encodeURIComponent(version)}/${encodeURIComponent(f)}/provenance`;
       const prov = pypiProvenanceSchema.safeParse((await getJson(url, { accept: 'application/vnd.pypi.integrity.v1+json' }))?.body);
       if (!prov.success) continue;
       for (const b of prov.data.attestation_bundles) {
-        if (b.publisher.kind === 'GitHub') repos.push(typeof b.publisher.repository === 'string' && isGitHubRepo(b.publisher.repository) ? b.publisher.repository : UNREADABLE_REPO);
+        // a publisher that isn't GitHub (or a repo that can't be read) counts as another repo
+        const named = b.publisher.kind === 'GitHub' && typeof b.publisher.repository === 'string' && isGitHubRepo(b.publisher.repository);
+        repos.push(named ? (b.publisher.repository as string) : UNREADABLE_REPO);
       }
     }
     return judge(repos);
   }
 
-  /** The repo's root package.json / pyproject.toml names the package (PyPI names compared PEP 503-normalised). */
+  /** The repo's root package.json / pyproject.toml names the package (PyPI names compared PEP 503-normalised) and isn't marked private. */
   async function rootManifestNames(t: { ecosystem: 'npm' | 'PyPI'; package: string }): Promise<boolean> {
     const file = t.ecosystem === 'npm' ? 'package.json' : 'pyproject.toml';
     const content = await github(`the root ${file}`, () => deps.gh.rest.repos.getContent({ owner, repo: name, path: file }), contentSchema, 'null')
@@ -246,10 +288,16 @@ export async function fetchStats(c: Candidate, deps: StatsDeps, install?: Instal
     if (content === null) return false;
     try {
       const text = Buffer.from(content.content, 'base64').toString('utf8');
-      if (t.ecosystem === 'npm') return (JSON.parse(text) as { name?: unknown }).name === t.package;
-      const toml = parseToml(text) as { project?: { name?: unknown }; tool?: { poetry?: { name?: unknown } } };
-      const names = [toml.project?.name, toml.tool?.poetry?.name].filter((n): n is string => typeof n === 'string');
-      return names.some((n) => pep503(n) === pep503(t.package));
+      // a manifest marked private says the package is NOT published from here
+      if (t.ecosystem === 'npm') {
+        const pkg = JSON.parse(text) as { name?: unknown; private?: unknown };
+        return pkg.private !== true && pkg.name === t.package;
+      }
+      type PyMeta = { name?: unknown; classifiers?: unknown };
+      const toml = parseToml(text) as { project?: PyMeta; tool?: { poetry?: PyMeta } };
+      const sections = [toml.project, toml.tool?.poetry].filter((m): m is PyMeta => m !== undefined && m !== null);
+      const isPrivate = sections.some((m) => Array.isArray(m.classifiers) && m.classifiers.some((c) => typeof c === 'string' && c.trim() === PRIVATE_CLASSIFIER));
+      return !isPrivate && sections.some((m) => typeof m.name === 'string' && pep503(m.name) === pep503(t.package));
     } catch {
       return false;
     }
@@ -372,7 +420,12 @@ export async function fetchStats(c: Candidate, deps: StatsDeps, install?: Instal
         note(`No full version tag (like v1.2.3) points at the pinned commit of ${repo}, ${unchecked}`);
         return null;
       }
-      return (shape === 'semver' ? full.sort((a, b) => compareSemver(b, a)) : full).slice(0, MAX_VERSIONS);
+      // every full version on the commit (the label's among them) is looked up, or none: never a silent subset
+      if (full.length > MAX_VERSIONS) {
+        note(`The pinned commit of ${repo} has more than ${MAX_VERSIONS} versions tagged, ${unchecked}`);
+        return null;
+      }
+      return full;
     }
     let v = labelV;
     if (v === null) {
@@ -403,8 +456,7 @@ function slsaRepo(payload: string): string {
     };
     const url = stmt.predicate?.buildDefinition?.externalParameters?.workflow?.repository ?? stmt.predicate?.invocation?.configSource?.uri;
     if (typeof url !== 'string') return UNREADABLE_REPO;
-    const m = GITHUB_URL_RE.exec(url);
-    return m && isGitHubRepo(m[1]) ? (m[1] as string) : UNREADABLE_REPO;
+    return githubRepoFromUrl(url) ?? UNREADABLE_REPO;
   } catch {
     return UNREADABLE_REPO;
   }

@@ -11,13 +11,13 @@ const root = resolve(import.meta.dirname, '..');
 const BAR: QualityBar = { minStars: 500, minScorecard: 5, strongScorecard: 7, scorecardMaxAgeDays: 180, maxMonthsSinceRelease: 12 };
 const NOW = new Date('2026-10-26T12:00:00Z');
 
-/** Passes every rule: popular, scored 8/10 this month, released last month, MIT, no advisories. */
 /** Writes a valid-looking file and returns its path. */
 function writeOk(dir: string, text: string): string {
   writeIn(dir, 'ok.yml', text);
   return join(dir, 'ok.yml');
 }
 
+/** Passes every rule: popular, scored 8/10 this month, released last month, MIT, no advisories. */
 const good = (over: Partial<ToolStats> = {}): ToolStats => ({
   repo: 'o/r', stars: 2000, archived: false, lastReleaseAt: '2026-09-20T00:00:00Z', scorecard: 8, scorecardAt: '2026-10-20T00:00:00Z',
   verifiedPublisher: false, license: 'MIT', advisories: 0, ...over,

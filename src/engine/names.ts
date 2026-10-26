@@ -29,6 +29,21 @@ export function repoSegments(repo: string): { owner: string; name: string; path:
 export const isNpmName = (s: unknown): s is string => typeof s === 'string' && s.length <= 214 && NPM_NAME_RE.test(s);
 export const isPypiName = (s: unknown): s is string => typeof s === 'string' && s.length <= 100 && PYPI_NAME_RE.test(s);
 
+/**
+ * `owner/name` from a link to a GitHub repo, or null: npm shorthand (`o/r`, `github:o/r`), `git@github.com:o/r.git`,
+ * and https/git/ssh URLs on github.com (a `.git` suffix, a deeper path, `@ref`, `#` or `?` after the name allowed).
+ */
+export function githubRepoFromUrl(s: unknown): string | null {
+  if (typeof s !== 'string' || s.length > 500) return null;
+  const t = s.trim();
+  const m = /^(?:github:)?([A-Za-z0-9-]+)\/([A-Za-z0-9._-]+?)(?:\.git)?$/.exec(t)
+    ?? /^git@github\.com:([^/]+)\/([^/#?@]+?)(?:\.git)?\/?$/i.exec(t)
+    ?? /^(?:git\+)?(?:https?|git|ssh):\/\/(?:[^@/]+@)?(?:www\.)?github\.com\/([^/#?@]+)\/([^/#?@]+?)(?:\.git)?(?:[/#?@].*)?$/i.exec(t);
+  if (!m) return null;
+  const repo = `${m[1]}/${m[2]}`;
+  return isGitHubRepo(repo) ? repo : null;
+}
+
 /** A checked npm name as the registry's URLs take it: `@scope%2fname` for scoped names, each part encoded. */
 export function npmEscapedName(name: string): string {
   const slash = name.indexOf('/');
