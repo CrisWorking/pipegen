@@ -79,6 +79,28 @@ describe('limits', () => {
     expect((await listFiles(dir, ['**/*'], [])).files).toEqual(['real/a.txt']);
   });
 
+  it('a pattern whose fixed base goes through a symlink lists nothing and the link is recorded', async () => {
+    const dir = makeTempDir();
+    const outside = makeTempDir();
+    mkdirSync(join(outside, 'workflows'));
+    writeFileSync(join(outside, 'workflows', 'a.yml'), 'on: push\n');
+    symlinkSync(outside, join(dir, '.github'), 'dir');
+    mkdirSync(join(dir, 'real'));
+    writeFileSync(join(dir, 'real', 'b.yml'), '');
+    const result = await listFiles(dir, ['.github/workflows/*.yml', 'real/*.yml'], []);
+    expect(result.files).toEqual(['real/b.yml']);
+    expect(result.links).toEqual(['.github']);
+    const found = { links: [] as string[] };
+    expect((await listFiles(dir, ['.github/workflows/*.yml'], [], found)).files).toEqual([]);
+    expect(found.links).toEqual(['.github']);
+    // a symlink deeper in the fixed base counts too; a plain listing has no links field
+    const deep = makeTempDir();
+    mkdirSync(join(deep, '.github'));
+    symlinkSync(join(outside, 'workflows'), join(deep, '.github', 'workflows'), 'dir');
+    expect(await listFiles(deep, ['.github/workflows/*.yml'], [])).toEqual({ files: [], truncated: false, links: ['.github/workflows'] });
+    expect(await listFiles(dir, ['real/*.yml'], [])).toEqual({ files: ['real/b.yml'], truncated: false });
+  });
+
   it('regexSafe refuses strings over 4 KB', () => {
     expect(regexSafe('a'.repeat(READ_LIMITS.maxRegexLineBytes))).toBe(true);
     expect(regexSafe('a'.repeat(READ_LIMITS.maxRegexLineBytes + 1))).toBe(false);
