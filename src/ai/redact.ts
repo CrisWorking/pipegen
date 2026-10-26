@@ -1,9 +1,9 @@
 import { execFile, type ExecFileException } from 'node:child_process';
-import { chmod, lstat, mkdtemp, readFile, realpath, rm, stat, writeFile } from 'node:fs/promises';
+import { chmod, lstat, mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { isAbsolute, join, relative, resolve, sep } from 'node:path';
 import picomatch from 'picomatch';
-import { IGNORED_DIRS, listFiles, readTextLimitedWithReason, regexSafe, type Skipped } from '../read/limits.js';
+import { IGNORED_DIRS, MAX_FILES_TEXT, listFiles, readTextLimitedWithReason, regexSafe, type Skipped } from '../read/limits.js';
 import { safeText } from '../util/safe-text.js';
 import { gitleaksConfigPath } from './gitleaks-config.js';
 
@@ -1015,7 +1015,7 @@ export async function bundleCode(dir: string, opts: BundleOptions = {}): Promise
   const found = { links: [] as string[] };
   const listing = await listFiles(dir, ['**/*'], IGNORED_DIRS.map((d) => `**/${d}/**`), found);
   let truncated = listing.truncated;
-  if (listing.truncated) notes.add('Stopped listing after 20,000 files; the rest were not read.');
+  if (listing.truncated) notes.add(`Stopped listing after ${MAX_FILES_TEXT} files; the rest were not read.`);
 
   const links = found.links.filter(inRoots);
   let excluded = 0;

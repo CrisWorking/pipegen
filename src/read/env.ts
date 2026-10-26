@@ -1,13 +1,10 @@
 import { join as joinOs, posix } from 'node:path';
-import { parse as parseToml } from 'smol-toml';
 import type { Dependency, DependencyKind, Service } from '../types.js';
-import { IGNORED_DIRS, parseYamlLimited, readTextLimited, regexLines, regexSafe } from './limits.js';
-import { asObj, isTestFile, pythonNames, readPyproject } from './manifest.js';
+import { parseYamlLimited, readTextLimited, regexLines, regexSafe } from './limits.js';
+import { CODE_FILE_RE, NAME_RE, asObj, baseOf, dirOf, inDir, isTestFile, type Manifests } from './manifest.js';
 
 // Only NAMES are ever kept. A value is read, looked at for at most a yes/no answer, and dropped on the same line.
 
-const NAME_RE = /^[A-Za-z_][A-Za-z0-9_]{0,127}$/;
-const CODE_EXT = 'js,mjs,cjs,jsx,ts,tsx,mts,cts,py';
 const COMPOSE_FILES = ['docker-compose.yml', 'docker-compose.yaml', 'compose.yml', 'compose.yaml'];
 const CODE_REFS = [
   /process\.env\.([A-Za-z_][A-Za-z0-9_]*)/g,
@@ -43,7 +40,6 @@ const EXTERNAL: [RegExp, string | null, string][] = [
 
 interface Found { kind: DependencyKind; name: string; evidence: string; keywords: string[] }
 
-const inDir = (dir: string, name: string) => (dir === '.' ? name : `${dir}/${name}`);
 const validName = (s: string | undefined): s is string => s !== undefined && NAME_RE.test(s);
 
 /**
@@ -110,7 +106,7 @@ async function composeNames(root: string, composeRel: string, service: Pick<Serv
   if (text === null) return;
   let doc: unknown;
   try { doc = parseYamlLimited(text); } catch { return; }
-  const composeDir = composeRel.includes('/') ? composeRel.slice(0, composeRel.lastIndexOf('/')) : '.';
+  const composeDir = dirOf(composeRel);
   for (const [cname, raw] of Object.entries(asObj(asObj(doc).services))) {
     const svc = asObj(raw);
     const build = svc.build;
@@ -138,25 +134,13 @@ function codeNames(text: string, names: Set<string>): void {
 }
 
 /** Package names the service declares, with the manifest file they came from. */
-async function packages(root: string, dir: string, rels: string[]): Promise<{ file: string; name: string }[]> {
+function packages(dir: string, m: Manifests): { file: string; name: string }[] {
   const out: { file: string; name: string }[] = [];
   const pkgFile = inDir(dir, 'package.json');
-  const pkgText = await readTextLimited(joinOs(root, pkgFile));
-  if (pkgText !== null) {
-    try {
-      const pkg = asObj(JSON.parse(pkgText));
-      for (const n of [...Object.keys(asObj(pkg.dependencies)), ...Object.keys(asObj(pkg.devDependencies))]) out.push({ file: pkgFile, name: n });
-    } catch { /* unparseable package.json: no packages */ }
-  }
+  for (const n of [...Object.keys(asObj(m.pkg?.dependencies)), ...Object.keys(asObj(m.pkg?.devDependencies))]) out.push({ file: pkgFile, name: n });
   const tomlFile = inDir(dir, 'pyproject.toml');
-  const tomlText = await readTextLimited(joinOs(root, tomlFile));
-  if (tomlText !== null) {
-    try { for (const n of readPyproject(asObj(parseToml(tomlText))).all) out.push({ file: tomlFile, name: n }); } catch { /* unparseable */ }
-  }
-  for (const rel of rels.filter((f) => regexSafe(f) && f.startsWith(dir === '.' ? '' : `${dir}/`) && !f.slice(dir === '.' ? 0 : dir.length + 1).includes('/') && /^requirements.*\.txt$/.test(f.slice(f.lastIndexOf('/') + 1)))) {
-    const text = await readTextLimited(joinOs(root, rel));
-    for (const n of pythonNames(text === null ? [] : regexLines(text).filter((l) => !/^\s*(#|-)/.test(l)))) out.push({ file: rel, name: n });
-  }
+  for (const n of m.py.all) out.push({ file: tomlFile, name: n });
+  for (const r of m.requirements) for (const n of r.names) out.push({ file: r.file, name: n });
   return out;
 }
 
@@ -175,9 +159,11 @@ function prismaPostgres(text: string): boolean {
 const matchesKeyword = (name: string, keyword: string): boolean => name.startsWith(keyword) || name.includes(`_${keyword}`);
 
 /** Env var names (never values) and the services this service depends on. `dir` is the repo root; `service.path` is relative to it.
- * `owned` is the repo-relative list of files that belong to this service and not to a deeper one (readProject's already-capped listing),
- * so there is no second walk and a parent service never inherits a nested service's names or dependencies. */
-export async function readEnv(dir: string, service: Pick<Service, 'path' | 'name'>, owned: string[]): Promise<{ envVars: string[]; dependsOn: Dependency[] }> {
+ * `owned` is the repo-relative list of files that belong to this service and not to a deeper one (readProject's already-capped listing,
+ * which already leaves out IGNORED_DIRS), so there is no second walk and a parent service never inherits a nested service's names or
+ * dependencies. `manifests` are the service's package.json, pyproject and requirements files as readProject already read and parsed
+ * them (any skip already noted there), so they are not read a second time. */
+export async function readEnv(dir: string, service: Pick<Service, 'path' | 'name'>, owned: string[], manifests: Manifests): Promise<{ envVars: string[]; dependsOn: Dependency[] }> {
   const names = new Set<string>();
   const pgUrl: string[] = [];
   const base = service.path;
@@ -186,22 +172,20 @@ export async function readEnv(dir: string, service: Pick<Service, 'path' | 'name
   const composeDirs = base === '.' ? ['.'] : [base, '.'];
   for (const d of composeDirs) for (const f of COMPOSE_FILES) await composeNames(dir, inDir(d, f), service, names, pgUrl);
 
-  const baseName = (f: string) => f.slice(f.lastIndexOf('/') + 1);
-  const isRelevant = (f: string) => regexSafe(f) && (new RegExp(`\\.(${CODE_EXT.replaceAll(',', '|')})$`).test(f) || baseName(f) === 'schema.prisma' || /^requirements[^/]*\.txt$/.test(baseName(f)));
   const relToBase = (f: string) => (base === '.' ? f : f.slice(base.length + 1));
-  const rels = owned.filter((f) => (base === '.' || f.startsWith(`${base}/`)) && !f.split('/').some((p) => IGNORED_DIRS.includes(p)) && isRelevant(f));
+  const rels = owned.filter((f) => (base === '.' || f.startsWith(`${base}/`)) && regexSafe(f) && (CODE_FILE_RE.test(f) || baseOf(f) === 'schema.prisma'));
   const found: Found[] = [];
   for (const rel of rels) {
-    if (baseName(rel) === 'schema.prisma') {
+    if (baseOf(rel) === 'schema.prisma') {
       const text = await readTextLimited(joinOs(dir, rel));
       if (text !== null && prismaPostgres(text)) found.push({ kind: 'postgres', name: 'postgres', evidence: `${rel}: datasource provider postgresql`, keywords: KIND_KEYWORDS.postgres });
-    } else if (/\.(js|mjs|cjs|jsx|ts|tsx|mts|cts|py)$/.test(rel) && !isTestFile(relToBase(rel))) {
+    } else if (!isTestFile(relToBase(rel))) {
       const text = await readTextLimited(joinOs(dir, rel));
       if (text !== null) codeNames(text, names);
     }
   }
 
-  for (const { file, name } of await packages(dir, base, rels)) {
+  for (const { file, name } of packages(base, manifests)) {
     if (!regexSafe(name)) continue;
     const kind = KIND_PACKAGES.find(([, re]) => re.test(name))?.[0];
     if (kind && kind !== 'external') {

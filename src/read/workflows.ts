@@ -2,15 +2,14 @@ import { lstatSync } from 'node:fs';
 import { join } from 'node:path';
 import type { ExistingWorkflow, RepoProfile } from '../types.js';
 import { safeText } from '../util/safe-text.js';
-import { listFiles, parseYamlLimited, readTextLimitedWithReason, regexLines, regexSafe } from './limits.js';
-import { asObj } from './manifest.js';
+import { SKIP_REASON, listFiles, parseYamlLimited, readTextLimitedWithReason, regexLines, regexSafe } from './limits.js';
+import { NAME_RE, asObj } from './manifest.js';
 
 // Only names are kept: event names, job ids and secret NAMES. No step, command or secret value leaves this file.
 // Every kept name is raw but validated (see src/types.ts): a name that fails its pattern is dropped, never cleaned.
 
 const MAX_WORKFLOWS = 200;
 const WORKFLOW_FILE = /^\.github\/workflows\/[^/]+\.ya?ml$/;
-const NAME_RE = /^[A-Za-z_][A-Za-z0-9_]{0,127}$/;
 const JOB_ID_RE = /^[A-Za-z_][A-Za-z0-9_-]*$/;
 const TRIGGER_RE = /^[a-z_]+$/;
 // Plan regex with whole-word guards: a leading guard on every token and a trailing guard on the short ones, so
@@ -68,30 +67,33 @@ function deploysOf(doc: Record<string, unknown>, path: string): boolean {
  * A file that cannot be read or parsed is skipped and, when `notes` is given, mentioned there.
  */
 export async function readWorkflows(dir: string, files?: string[], notes: string[] = []): Promise<ExistingWorkflow[]> {
-  const listed = files ?? (await listFiles(dir, ['.github/workflows/*.{yml,yaml}'], [])).files;
-  // A symlinked .github or .github/workflows would lead outside the repo; read nothing from it.
+  const note = (line: string) => {
+    if (!notes.includes(line)) notes.push(line);
+  };
+  // A symlinked .github or .github/workflows would lead outside the repo; list and read nothing from it.
   if (isLink(join(dir, '.github')) || isLink(join(dir, '.github/workflows'))) {
-    notes.push('Skipped .github/workflows: it is reached through a symbolic link.');
+    note('Skipped .github/workflows: it is reached through a symbolic link.');
     return [];
   }
+  const listed = files ?? (await listFiles(dir, ['.github/workflows/*.{yml,yaml}'], [])).files;
   const all = listed.filter((f) => WORKFLOW_FILE.test(f)).sort();
-  if (all.length > MAX_WORKFLOWS) notes.push(`Only the first ${MAX_WORKFLOWS} workflow files were read.`);
+  if (all.length > MAX_WORKFLOWS) note(`Only the first ${MAX_WORKFLOWS} workflow files were read.`);
   const out: ExistingWorkflow[] = [];
   for (const path of all.slice(0, MAX_WORKFLOWS)) {
     if (safeText(path) !== path) {
-      notes.push(`Skipped ${safeText(path)}: its file name has control or invisible characters, or is too long.`);
+      note(`Skipped ${safeText(path)}: its file name has control or invisible characters, or is too long.`);
       continue;
     }
     const read = await readTextLimitedWithReason(join(dir, path));
     if (!('text' in read)) {
-      notes.push(`Skipped ${safeText(path)}: it could not be read (${read.skipped}).`);
+      note(`Skipped ${safeText(path)}: ${SKIP_REASON[read.skipped]}.`);
       continue;
     }
     let doc: Record<string, unknown>;
     try {
       doc = asObj(parseYamlLimited(read.text));
     } catch {
-      notes.push(`Skipped ${safeText(path)}: it could not be parsed.`);
+      note(`Skipped ${safeText(path)}: it could not be parsed.`);
       continue;
     }
     out.push({

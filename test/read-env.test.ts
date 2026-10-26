@@ -1,17 +1,34 @@
+import { join } from 'node:path';
+import { parse as parseToml } from 'smol-toml';
 import { afterEach, describe, expect, it } from 'vitest';
 import { readEnv as readEnvOwned } from '../src/read/env.js';
-import { listFiles } from '../src/read/limits.js';
+import { IGNORED_DIRS, listFiles, readTextLimited } from '../src/read/limits.js';
+import { REQUIREMENTS_FILE_RE, asObj, baseOf, dirOf, inDir, pythonNames, readPyproject, requirementLines, type Manifests } from '../src/read/manifest.js';
 import { readProject } from '../src/read/project.js';
 import type { Service } from '../src/types.js';
 import { cleanupRepos, makeRepo, makeTempDir, writeIn } from './helpers/make-repo.js';
 
 afterEach(cleanupRepos);
 
+/** The service's manifests, read and parsed the way readProject does before it calls readEnv. */
+async function manifests(dir: string, base: string, owned: string[]): Promise<Manifests> {
+  const parsed = async (rel: string, parse: (t: string) => unknown) => {
+    const text = await readTextLimited(join(dir, rel));
+    try { return text === null ? null : asObj(parse(text)); } catch { return null; }
+  };
+  const requirements: Manifests['requirements'] = [];
+  for (const file of owned.filter((f) => dirOf(f) === base && REQUIREMENTS_FILE_RE.test(baseOf(f)))) {
+    const text = await readTextLimited(join(dir, file));
+    if (text !== null) requirements.push({ file, names: pythonNames(requirementLines(text)) });
+  }
+  return { pkg: await parsed(inDir(base, 'package.json'), JSON.parse), py: readPyproject(await parsed(inDir(base, 'pyproject.toml'), parseToml)), requirements };
+}
+
 /** Lists the repo like readProject does, then keeps only the files this service owns (not a deeper service's). */
 async function readEnv(dir: string, service: Service, deeper: string[] = []) {
-  const all = (await listFiles(dir, ['**/*'], ['**/node_modules/**', '**/.git/**'])).files;
+  const all = (await listFiles(dir, ['**/*'], IGNORED_DIRS.map((d) => `**/${d}/**`))).files;
   const owned = all.filter((f) => !deeper.some((d) => f.startsWith(`${d}/`)));
-  return readEnvOwned(dir, service, owned);
+  return readEnvOwned(dir, service, owned, await manifests(dir, service.path, owned));
 }
 
 const svc = (path = '.', name = 'app'): Service => ({ name, path, language: 'node', hasTests: false, envVars: [], dependsOn: [], scripts: [], frameworks: [] });

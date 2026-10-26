@@ -4,10 +4,10 @@ import picomatch from 'picomatch';
 import { parse as parseToml } from 'smol-toml';
 import type { Language, Monorepo, PackageManager, RepoProfile, Service } from '../types.js';
 import { safeText } from '../util/safe-text.js';
-import { asObj, asString, asStrings, isTestFile, pythonNames, readPyproject, type Obj } from './manifest.js';
+import { CODE_FILE_RE, REQUIREMENTS_FILE_RE, asObj, asString, asStrings, baseOf, dirOf, inDir, isTestFile, pythonNames, readPyproject, requirementLines, type Obj } from './manifest.js';
 import { readEnv } from './env.js';
 import { readPrecommit, readWorkflows } from './workflows.js';
-import { IGNORED_DIRS, listFiles, parseYamlLimited, readTextLimitedWithReason, regexLines, regexSafe, type Skipped } from './limits.js';
+import { IGNORED_DIRS, MAX_FILES_TEXT, SKIP_REASON, listFiles, parseYamlLimited, readTextLimitedWithReason, regexLines, regexSafe } from './limits.js';
 
 export class NotGitHubRepoError extends Error {}
 
@@ -25,19 +25,9 @@ const MAX_WORKSPACE_PATTERNS = 100;
 const NOT_SERVICE_DIRS = ['.devcontainer', 'test', 'tests', '__tests__', 'fixtures', 'examples', 'docs'];
 // Root files read by direct path so the file cap can never hide them.
 const ROOT_FILES = ['package.json', 'pnpm-workspace.yaml', 'turbo.json', 'nx.json', '.nvmrc', '.node-version', '.python-version', 'pyproject.toml', 'setup.py', 'Dockerfile', ...NODE_LOCKS.map(([f]) => f), ...PYTHON_LOCKS.map(([f]) => f)];
-const SKIP_REASON: Record<Skipped, string> = {
-  'too-large': 'it is larger than 1 MB',
-  binary: 'it is a binary file',
-  link: 'it is a symbolic link',
-  'not-a-file': 'it is not a regular file',
-  unreadable: 'it could not be read',
-};
 
 interface Ctx { root: string; fileSet: Set<string>; notes: string[] }
 
-const inDir = (dir: string, name: string) => (dir === '.' ? name : `${dir}/${name}`);
-const dirOf = (file: string) => (file.includes('/') ? file.slice(0, file.lastIndexOf('/')) : '.');
-const baseOf = (file: string) => file.slice(file.lastIndexOf('/') + 1);
 const isUnder = (file: string, dir: string) => dir === '.' || file.startsWith(`${dir}/`);
 
 function note(ctx: Ctx, line: string): void {
@@ -100,8 +90,13 @@ async function readService(ctx: Ctx, dir: string, shared: Shared): Promise<Servi
   const files = [...ctx.fileSet];
   const pkg = await readJson(ctx, inDir(dir, 'package.json'));
   const toml = await readToml(ctx, inDir(dir, 'pyproject.toml'));
-  const requirementFiles = files.filter((f) => dirOf(f) === dir && /^requirements.*\.txt$/.test(baseOf(f)));
-  const requirementNames = pythonNames((await Promise.all(requirementFiles.map((f) => readFile(ctx, f)))).flatMap((t) => (t === null ? [] : regexLines(t).filter((l) => !/^\s*(#|-)/.test(l)))));
+  const requirementFiles = files.filter((f) => dirOf(f) === dir && REQUIREMENTS_FILE_RE.test(baseOf(f)));
+  const requirements: { file: string; names: string[] }[] = [];
+  for (const file of requirementFiles) {
+    const text = await readFile(ctx, file);
+    if (text !== null) requirements.push({ file, names: pythonNames(requirementLines(text)) });
+  }
+  const requirementNames = requirements.flatMap((r) => r.names);
   const py = readPyproject(toml);
   const language: Language = pkg ? 'node' : toml || requirementFiles.length > 0 || ctx.fileSet.has(inDir(dir, 'setup.py')) ? 'python' : 'other';
 
@@ -155,7 +150,7 @@ async function readService(ctx: Ctx, dir: string, shared: Shared): Promise<Servi
   const declared = asString(pkg?.name) ?? py.name;
   const folder = dir === '.' ? shared.repo : basename(dir);
   const name = [declared, folder].find((n): n is string => n !== undefined && SERVICE_NAME_RE.test(n)) ?? 'app';
-  return { name, path: dir, language, packageManager, runtimeVersion, dockerfile, port, hasTests, testFramework, ...(await readEnv(ctx.root, { path: dir, name }, owned)), scripts, frameworks };
+  return { name, path: dir, language, packageManager, runtimeVersion, dockerfile, port, hasTests, testFramework, ...(await readEnv(ctx.root, { path: dir, name }, owned, { pkg, py, requirements })), scripts, frameworks };
 }
 
 async function anyFileHasLine(ctx: Ctx, files: string[], re: RegExp): Promise<boolean> {
@@ -179,7 +174,7 @@ async function exposedPort(ctx: Ctx, dockerfile: string): Promise<number | undef
 
 /** A PORT default in the code: `process.env.PORT || 3000`, `port=8000`. Looks at the shallowest source files first. */
 async function codePort(ctx: Ctx, files: string[]): Promise<number | undefined> {
-  const sources = files.filter((f) => /\.(js|mjs|cjs|ts|py)$/.test(f)).sort((a, b) => a.split('/').length - b.split('/').length || a.localeCompare(b)).slice(0, MAX_PORT_SCAN_FILES);
+  const sources = files.filter((f) => CODE_FILE_RE.test(f)).sort((a, b) => a.split('/').length - b.split('/').length || a.localeCompare(b)).slice(0, MAX_PORT_SCAN_FILES);
   const rules = [/\bPORT\b[^\n]{0,40}?(?:\|\||\?\?)\s*['"]?(\d{2,5})\b/, /\bport\s*=\s*(\d{2,5})\b/i, /\bPORT['"]\s*,\s*['"]?(\d{2,5})\b/];
   for (const f of sources) {
     const text = await readFile(ctx, f);
@@ -227,7 +222,7 @@ export async function readProject(dir: string, opts?: { notes?: string[] }): Pro
   const ignore = IGNORED_DIRS.map((d) => `**/${d}/**`);
   const listing = await listFiles(dir, ['**/*'], ignore);
   const ctx: Ctx = { root: dir, fileSet: new Set(listing.files.filter(regexSafe)), notes };
-  if (listing.truncated) note(ctx, 'Only the first 20,000 files were read. Results may be incomplete.');
+  if (listing.truncated) note(ctx, `Only the first ${MAX_FILES_TEXT} files were read. Results may be incomplete.`);
   for (const name of ROOT_FILES) if (!ctx.fileSet.has(name) && (await lstat(joinOs(dir, name)).catch(() => null))) ctx.fileSet.add(name);
 
   const rootPkg = await readJson(ctx, 'package.json');

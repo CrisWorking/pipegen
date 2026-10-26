@@ -137,6 +137,27 @@ secrets_note${':'} hunter2
     for (const n of notes) expect(n).not.toMatch(/[\u001b\u202e]/);
   });
 
+  it('workflows: skip notes use the shared plain-English reasons and are never repeated', async () => {
+    const dir = makeTempDir();
+    writeIn(dir, '.github/workflows/bin.yml', 'on: push\u0000\n');
+    writeIn(dir, '.github/workflows/big.yml', '#'.repeat(1_000_001));
+    wf(dir, 'broken.yml', 'on: [unclosed\n');
+    const notes: string[] = [];
+    await readWorkflows(dir, undefined, notes);
+    await readWorkflows(dir, undefined, notes);
+    expect(notes).toEqual([
+      'Skipped .github/workflows/big.yml: it is larger than 1 MB.',
+      'Skipped .github/workflows/bin.yml: it is a binary file.',
+      'Skipped .github/workflows/broken.yml: it could not be parsed.',
+    ]);
+    const linked = makeTempDir();
+    symlinkSync(makeTempDir(), join(linked, '.github'));
+    const linkNotes: string[] = [];
+    expect(await readWorkflows(linked, undefined, linkNotes)).toEqual([]);
+    expect(await readWorkflows(linked, undefined, linkNotes)).toEqual([]);
+    expect(linkNotes).toEqual(['Skipped .github/workflows: it is reached through a symbolic link.']);
+  });
+
   it('workflows: job ids that GitHub would not accept are dropped', async () => {
     const w = await one('on: push\njobs:\n  build:\n    runs-on: x\n  ok-job_2:\n    runs-on: x\n  _private:\n    runs-on: x\n  "bad id":\n    runs-on: x\n  "1st":\n    runs-on: x\n  "x\\e[31m":\n    runs-on: x\n  "a.b":\n    runs-on: x\n');
     expect(w?.jobs).toEqual(['build', 'ok-job_2', '_private']);

@@ -1,6 +1,21 @@
-import { regexSafe } from './limits.js';
+import { regexLines, regexSafe } from './limits.js';
 
 export type Obj = Record<string, unknown>;
+
+/** Env var and secret names: what env.ts and workflows.ts keep. */
+export const NAME_RE = /^[A-Za-z_][A-Za-z0-9_]{0,127}$/;
+/** Source files scanned for env var references and port defaults. */
+export const CODE_FILE_RE = /\.(js|mjs|cjs|jsx|ts|tsx|mts|cts|py)$/;
+/** pip requirements files, matched on the file name (requirements.txt, requirements-dev.txt, ...). */
+export const REQUIREMENTS_FILE_RE = /^requirements.*\.txt$/;
+
+/** Repo-relative path helpers (forward slashes, '.' is the repo root). */
+export const inDir = (dir: string, name: string): string => (dir === '.' ? name : `${dir}/${name}`);
+export const dirOf = (file: string): string => (file.includes('/') ? file.slice(0, file.lastIndexOf('/')) : '.');
+export const baseOf = (file: string): string => file.slice(file.lastIndexOf('/') + 1);
+
+/** The package lines of a requirements file: comments and option lines (-r, -e, --hash ...) are left out. */
+export const requirementLines = (text: string): string[] => regexLines(text).filter((l) => !/^\s*(#|-)/.test(l));
 export const asObj = (v: unknown): Obj => (v !== null && typeof v === 'object' && !Array.isArray(v) ? (v as Obj) : {});
 export const asStrings = (v: unknown): string[] => (Array.isArray(v) ? v.filter((x): x is string => typeof x === 'string') : []);
 export const asString = (v: unknown): string | undefined => (typeof v === 'string' && v.trim() !== '' ? v.trim() : undefined);
@@ -14,6 +29,9 @@ export function pythonNames(lines: string[]): string[] {
 }
 
 export interface PyInfo { main: string[]; all: string[]; scripts: string[]; requires?: string; name?: string }
+
+/** A service's manifests, read and parsed once by readProject (with notes for anything skipped) and shared with readEnv. */
+export interface Manifests { pkg: Obj | null; py: PyInfo; requirements: { file: string; names: string[] }[] }
 
 export function readPyproject(toml: Obj | null): PyInfo {
   const project = asObj(toml?.project);

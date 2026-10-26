@@ -75,6 +75,18 @@ export function isBinary(buf: Buffer): boolean {
 
 export type Skipped = 'too-large' | 'binary' | 'link' | 'not-a-file' | 'unreadable';
 
+/** Why a file was skipped, in plain English, for notes: `Skipped <path>: <reason>.` */
+export const SKIP_REASON: Readonly<Record<Skipped, string>> = Object.freeze({
+  'too-large': 'it is larger than 1 MB',
+  binary: 'it is a binary file',
+  link: 'it is a symbolic link',
+  'not-a-file': 'it is not a regular file',
+  unreadable: 'it could not be read',
+});
+
+/** READ_LIMITS.maxFiles as people write it (20,000). */
+export const MAX_FILES_TEXT = READ_LIMITS.maxFiles.toLocaleString('en-US');
+
 /** Like readTextLimited, but says why a file was skipped. */
 export async function readTextLimitedWithReason(path: string): Promise<{ text: string } | { skipped: Skipped }> {
   try {

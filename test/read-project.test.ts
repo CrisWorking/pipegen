@@ -304,6 +304,14 @@ describe('read', () => {
     expect((await readProject(root)).services[0]?.name).toBe('r'); // the root folder's name is the repo name
   });
 
+  it('read: code port default found in .tsx, .mts and .cts files too', async () => {
+    for (const ext of ['tsx', 'mts', 'cts']) {
+      const dir = repo('node-library');
+      writeIn(dir, `server.${ext}`, 'app.listen(process.env.PORT || 4321);\n');
+      expect((await readProject(dir)).services[0]?.port, ext).toBe(4321);
+    }
+  });
+
   it('read: skip notes give the real reason', async () => {
     const dir = repo('node-npm');
     writeFileSync(join(dir, 'package.json'), '{"name":"x"}' + ' '.repeat(1_000_001));
