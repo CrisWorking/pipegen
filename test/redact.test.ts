@@ -647,6 +647,10 @@ describe('redact: speed', () => {
     shapes.push((('<tok' + 'en>').repeat(570) + '</tok' + 'en>\n').repeat(250));
     shapes.push(('<a key=' + ' '.repeat(2000) + '"' + (' tok' + 'en').repeat(330) + '\n').repeat(250));
     shapes.push(('pass' + 'word: |' + '\r'.repeat(3990) + '\n').repeat(250));
+    // round 5: unclosed secret elements, JSON blocks, a secret section, many section headers
+    shapes.push(...['<tok' + 'en>a', '<tok' + 'en>', '"tok' + 'en": {', '[sec' + 'rets]'].map((u) => (line(u) + '\n').repeat(250)));
+    shapes.push('[sec' + 'rets]\n' + 'a = b\n'.repeat(160_000));
+    shapes.push(('[sec' + 'rets]\nkey: x\n').repeat(60_000));
     redact(shapes[0]); // warm-up
     for (const text of shapes) {
       const runs = [0, 1, 2].map(() => {
@@ -887,7 +891,8 @@ describe('fix round 4', () => {
     [`<${t} type="bearer" ${sec}="${S}">`, `<${t} type="bearer" ${sec}="${R}">`],
     [`<${t} type="bearer" ${sec}="${S}">abc</${t}>`, `<${t} type="bearer" ${sec}="${R}">${R}</${t}>`],
     [`<Au${'th'}Provider client${sec[0].toUpperCase()}${sec.slice(1)}="${S}">`, `<Au${'th'}Provider client${sec[0].toUpperCase()}${sec.slice(1)}="${R}">`],
-    [`if (i <${t} && y) { ${k} = "${S}"; } else if (z > 1) {}`, `if (i <${t} && y) { ${k} = "${R}"; } else if (z > 1) {}`],
+    // (round 5: a tag with no end tag on the line also hides what follows its '>' up to the next '<')
+    [`if (i <${t} && y) { ${k} = "${S}"; } else if (z > 1) {}`, `if (i <${t} && y) { ${k} = "${R}"; } else if (z >${R}`],
     // a tag named after a keyword also has its value attributes hidden
     [`<${k} value="${S}"/>`, `<${k} value="${R}"/>`],
     [`<${sec} name="db" value="${S}"/>`, `<${sec} name="db" value="${R}"/>`],
@@ -901,7 +906,7 @@ describe('fix round 4', () => {
   it('redact: XML attributes after a secret-named tag are still checked', () => {
     for (const [input, want] of xmlCases()) expect(redact(input), want).toBe(want);
     // a generic type in code is not a tag: what follows is still scanned
-    expect(redact(`List<${t[0].toUpperCase()}${t.slice(1)}> a = b; String ${k} = "${S}";`)).toBe(`List<${t[0].toUpperCase()}${t.slice(1)}> a = b; String ${k} = "${R}";`);
+    expect(redact(`List<${t[0].toUpperCase()}${t.slice(1)}> a = b; String ${k} = "${S}";`)).toBe(`List<${t[0].toUpperCase()}${t.slice(1)}>${R}`);
   });
 
   it('bundle: XML attributes after a secret-named tag are still checked', async () => {
@@ -968,5 +973,63 @@ describe('fix round 4', () => {
     expect(redact(`${k}: |\r\r\n  v\r\r\nnext: 1`)).toBe(`${k}: |\r\r\n  ${R}\r\r\nnext: 1`);
     expect(redact(`${k}:\r\r\n  v\r\nnext: 1`)).toBe(`${k}:\r\r\n  ${R}\r\nnext: 1`);
     expect(redact(`${k}=x y\r\r\nok=1`)).toBe(`${k}=${R}\r\r\nok=1`);
+  });
+});
+
+describe('fix round 5', () => {
+  const k = 'pass' + 'word';
+  const K = 'Pass' + 'word';
+  const sec = 'sec' + 'ret';
+  const S = 'S3kr' + 'etV4l';
+
+  const unclosed = (): string[] => [
+    `<${k}>${S}`,
+    `<${k}>${S} <b>x</b>`,
+    `<add key="Db${K}" value="Ab>${S}"/>`,
+    `<property name="db.${k}" value="Ab>${S}"/>`,
+    `<${k} value="Ab>${S}"/>`,
+  ];
+
+  it('redact: a secret element with no end tag on the line hides what follows its ">" (also a ">" inside a value)', () => {
+    for (const input of unclosed()) expect(redact(input), input).not.toContain(S);
+    expect(redact(`<${k}>${S}`)).toBe(`<${k}>${R}`);
+    expect(redact(`<${k}>${S} <b>x</b>`)).toBe(`<${k}>${R}<b>x</b>`);
+    expect(redact(`<add key="Db${K}" value="Ab>${S}"/>`)).toBe(`<add key="Db${K}" value="${R}>${R}`);
+  });
+
+  it('bundle: a secret element with no end tag on the line hides what follows its ">"', async () => {
+    const dir = makeTempDir();
+    writeIn(dir, 'config/web.xml', unclosed().join('\n') + '\n');
+    writeIn(dir, 'src/App.tsx', unclosed().join('\n') + '\n');
+    const b = await bundleCode(dir);
+    expect(paths(b)).toEqual(['config/web.xml', 'src/App.tsx']);
+    expect(allText(b)).not.toContain(S);
+  });
+
+  it('redact: a JSON object or array under a secret-named key is hidden in config files, not in code', () => {
+    const json = `{\n  "Logging": { "Level": "Info" },\n  "${K}s": {\n    "Admin": "${S}",\n    "Ops": [\n      "${S}"\n    ]\n  },\n  "Name": "app"\n}\n`;
+    const hidden = `{\n  "Logging": { "Level": "Info" },\n  "${K}s": {\n    ${R}\n    ${R}\n      ${R}\n    ${R}\n  },\n  "Name": "app"\n}\n`;
+    expect(redact(json, { path: 'appsettings.json' })).toBe(hidden);
+    expect(redact(json)).toBe(hidden);
+    expect(redact(`"${k}": [\n  "${S}"\n]`, { path: 'x.json' })).toBe(`"${k}": [\n  ${R}\n]`);
+    expect(redact(json, { path: 'src/settings.ts' })).toBe(json);
+  });
+
+  it('redact: TOML/INI sections named after a secret hide the values below them', () => {
+    const toml = `[${sec}s]\nadmin = "${S}"\nops: ${S}\n\n[other]\nname = "y"\n`;
+    expect(redact(toml, { path: 'config.toml' })).toBe(`[${sec}s]\nadmin = ${R}\nops: ${R}\n\n[other]\nname = "y"\n`);
+    expect(redact(`[database.${k}]\nmain = ${S}\n[[servers]]\nhost = "h"`, { path: 'app.ini' })).toBe(`[database.${k}]\nmain = ${R}\n[[servers]]\nhost = "h"`);
+    expect(redact(`[au${'th'}]\nkey_id = ${S}\n`, { path: 'a.cfg' })).toBe(`[au${'th'}]\nkey_id = ${R}\n`);
+    expect(redact(`[author]\nname = Jane\n`, { path: 'a.toml' })).toBe('[author]\nname = Jane\n');
+    // not a header (Markdown link), and code files are left alone
+    expect(redact(`[${sec}s](https://x/docs)\nname = Jane\n`, { path: 'README.md' })).toBe(`[${sec}s](https://x/docs)\nname = Jane\n`);
+    expect(redact(toml, { path: 'gen.py' })).toBe(toml);
+  });
+
+  it('redact: .NET setting element ending its line hides the more-indented lines after it', () => {
+    const xml = `<setting name="Db${K}" serializeAs="String">\n    <value>${S}</value>\n</setting>\n<setting name="Theme">\n    <value>dark</value>\n</setting>\n`;
+    expect(redact(xml, { path: 'App.config' })).toBe(`<setting name="Db${K}" serializeAs="String">\n    ${R}\n</setting>\n<setting name="Theme">\n    <value>dark</value>\n</setting>\n`);
+    expect(redact(`<${k}>\n  ${S}\n</${k}>`, { path: 'a.xml' })).toBe(`<${k}>\n  ${R}\n</${k}>`);
+    expect(redact(xml, { path: 'Gen.cs' })).toBe(xml);
   });
 });

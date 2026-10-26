@@ -302,14 +302,19 @@ const skipBlanks = (s: string, i: number) => {
  * - Authorization with a Bearer/Basic/Token/Digest value: the scheme word stays, what follows is hidden.
  * - long CLI flags `--name value` / `--name=value`;
  * - XML on one line: an element named after a secret (`<password>`, `<db:password ...>`) has its
- *   value="..." attributes hidden, and its text when a matching end tag follows; a quoted attribute value
- *   holding a secret name (`key="DbPassword"`, `key="Smtp:Password"`, `name="db.password"`) hides the
- *   tag's value="..." attributes and the element's text the same way. Other attributes are scanned as
- *   ordinary `name="value"` assignments.
+ *   value="..." attributes hidden, and its text up to a matching end tag, or, without one on the line, up
+ *   to the next `<` or the end of the line; a quoted attribute value holding a secret name
+ *   (`key="DbPassword"`, `key="Smtp:Password"`, `name="db.password"`) hides the tag's value="..."
+ *   attributes and the element's text the same way. Other attributes are scanned as ordinary
+ *   `name="value"` assignments. Such a start tag that ends its line (and comes from its own name or a
+ *   name="..."/key="..." attribute) starts an indented block, like an empty value.
+ * - A value that is only `{` or `[` (a JSON-style object or array opened at the end of the line) starts an
+ *   indented block too.
  * Known limits (gitleaks is the second line there, including its connection-string rule): a quoted value
  * that continues on the next lines (e.g. Python/TOML triple quotes spanning lines), XML values split across
- * lines, string concatenation after the first quoted part (`"abc" + "def"`), setter calls
- * (`setPassword("x")`), keys with spaces (`"api key"`) and non-ASCII names; the names `authorisation` and
+ * lines in code files (no block rule there), an unescaped `<` inside an attribute value (illegal in XML;
+ * HTML/JSX only: the tag is taken to end there, so the tail of that value may be sent), string
+ * concatenation after the first quoted part (`"abc" + "def"`), setter calls (`setPassword("x")`), keys with spaces (`"api key"`) and non-ASCII names; the names `authorisation` and
  * `authentication` (they start with a word on the safe list) and `oauthkey` (a bare oauth); and two
  * connection-string shapes (see connectionSpans): a password holding `#` after a user:password@ part (a
  * postgres URL with user `admin`, password `P@ss#2024` and host `db` is only partly hidden, since the `@`
@@ -323,20 +328,34 @@ function assignmentSpans(s: string): { spans: Span[]; block: boolean } {
   let block = false;
   const tags = tagTables(s);
   let handledTag = -1; // tags are reached in order of their '<', so one number marks those already handled
-  const hideElementText = (qname: string, tagEnd: number) => {
+  let handledBlockable = false;
+  // The text of a start tag ending at `tagEnd`: up to a matching end tag on the line, or, without one, up to the
+  // next '<' or the end of the line (over-hiding is the safe side, and it also covers a '>' inside an attribute
+  // value, which ends the tag early). These stretches never overlap from one tag to the next: linear. A
+  // blockable tag (named after a secret, or with a secret name="..."/key="...") that ends its line may have its
+  // value on the next, more-indented lines (.NET <setting ...> then <value>), so it starts a block.
+  const hideElementText = (qname: string, tagEnd: number, blockable: boolean) => {
     const close = tags.closerAfter(qname, tagEnd);
     if (close > tagEnd + 1) spans.push([tagEnd + 1, close]);
+    else if (close < 0) {
+      const lt = s.indexOf('<', tagEnd + 1);
+      const stop = lt < 0 ? n : lt;
+      if (stop > tagEnd + 1) spans.push([tagEnd + 1, stop]);
+      if (blockable && skipBlanks(s, tagEnd + 1) >= n) block = true;
+    }
   };
-  // The tag opened at `open`: hide its value="..." attributes and, for a start tag, its text up to a matching end tag.
-  const handleTag = (open: number) => {
-    if (open <= handledTag) return;
+  // The tag opened at `open`: hide its value="..." attributes and, for a start tag, its text (see above). A tag is
+  // handled once, or twice when it first came from an attribute that cannot start a block.
+  const handleTag = (open: number, blockable: boolean) => {
+    if (open < handledTag || (open === handledTag && (handledBlockable || !blockable))) return;
+    handledBlockable = open === handledTag ? handledBlockable || blockable : blockable;
     handledTag = open;
     const tag = tags.tagAt(open);
     spans.push(...valueAttributeSpans(s, open, tag.end));
     if (tag.closed && code(s, tag.end - 1) !== 47 /* not self-closing */) {
       let e = open + 1;
       while (e < n && (isNameChar(code(s, e)) || code(s, e) === 58)) e++;
-      if (e > open + 1) hideElementText(s.slice(open + 1, e), tag.end);
+      if (e > open + 1) hideElementText(s.slice(open + 1, e), tag.end, blockable);
     }
   };
   // The run of name characters, ':', '/' and blanks around a name (as in key="Smtp:Password"). Runs never
@@ -376,7 +395,7 @@ function assignmentSpans(s: string): { spans: Span[]; block: boolean } {
       while (b >= 0 && isNameChar(code(s, b))) b--;
       if (b >= 0 && b < start - 2 && code(s, b) === 60) lt = b;
     }
-    if (lt >= 0 && (p >= n || code(s, p) === 62 || code(s, p) === 32 || code(s, p) === 9 || code(s, p) === 47)) handleTag(lt);
+    if (lt >= 0 && (p >= n || code(s, p) === 62 || code(s, p) === 32 || code(s, p) === 9 || code(s, p) === 47)) handleTag(lt, true);
     // A quoted attribute value holding a secret name, .NET/Spring style: <add key="DbPassword" value="..."/>,
     // also key="Smtp:Password", "App/DbPassword", "Smtp Password". Hides every value="..." attribute of
     // the tag, and the element's text when a matching end tag follows (<property name="db.password">x</property>).
@@ -388,7 +407,13 @@ function assignmentSpans(s: string): { spans: Span[]; block: boolean } {
         const eq = skipBlanksBack(s, a - 2);
         if (eq >= 0 && code(s, eq) === 61 /* = */) {
           const open = tags.enclosing(start);
-          if (open >= 0) handleTag(open);
+          if (open >= 0) {
+            const attrEnd = skipBlanksBack(s, eq - 1) + 1; // the attribute's name: name="..." and key="..." can start a block
+            let attrStart = attrEnd;
+            while (attrStart > open && isNameChar(code(s, attrStart - 1))) attrStart--;
+            const attr = s.slice(attrStart, attrEnd).toLowerCase();
+            handleTag(open, attr === 'name' || attr === 'key');
+          }
         }
       }
     }
@@ -421,6 +446,8 @@ function assignmentSpans(s: string): { spans: Span[]; block: boolean } {
     else continue;
     const v = skipBlanks(s, p);
     if (v >= n) { block = true; break; } // empty: the value may be on the next, indented lines
+    // a JSON-style object or array opened at the end of the line ("Passwords": {): its members are on the next, indented lines
+    if ((code(s, v) === 123 /* { */ || code(s, v) === 91 /* [ */) && skipBlanks(s, v + 1) >= n) { block = true; break; }
     const header = blockHeader(s, v);
     if (header !== null) { // the value is on the next, indented lines
       block = true;
@@ -647,6 +674,31 @@ function isCodePath(path: string): boolean {
   return dot > 0 && CODE_EXTENSIONS.has(base.slice(dot));
 }
 
+/** The name of a TOML/INI section header line (`[name]`, `[[name]]`, then only blanks or a `#`/`;` comment), or null. */
+function sectionName(line: string): string | null {
+  const open = skipBlanks(line, 0);
+  if (code(line, open) !== 91 /* [ */) return null;
+  const from = code(line, open + 1) === 91 ? open + 2 : open + 1;
+  const close = line.indexOf(']', from);
+  if (close < 0) return null;
+  let after = from === open + 2 && code(line, close + 1) === 93 ? close + 2 : close + 1;
+  after = skipBlanks(line, after);
+  if (after < line.length && code(line, after) !== 35 /* # */ && code(line, after) !== 59 /* ; */) return null;
+  return line.slice(from, close);
+}
+
+/** A line inside a secret section: what follows its first `=` or `:` is hidden; a line without one is hidden whole. */
+function hideSectionValue(line: string): string {
+  let sep = -1;
+  for (let j = 0; j < line.length; j++) {
+    const c = code(line, j);
+    if (c === 61 || c === 58) { sep = j; break; }
+  }
+  if (sep < 0) return line.slice(0, indentOf(line).chars) + R;
+  const v = skipBlanks(line, sep + 1);
+  return v >= line.length ? line : line.slice(0, v) + R; // an empty value (a list on the next lines) is hidden there
+}
+
 /**
  * Replaces secret-like text with [REDACTED]. Works line by line (the `\r`s at the end of a line count as
  * part of the line end, so CRLF text behaves like LF text), with a little state:
@@ -656,7 +708,8 @@ function isCodePath(path: string): boolean {
  *   `hint.path` is a known code file (.py, .js, .ts, .go, .java, … after removing template and backup
  *   suffixes such as .example, .j2, .bak), where it would hide ordinary code (`class TokenStore:`); same-line
  *   values are still hidden there. Every other file (YAML, JSON, Markdown, unknown or no extension) and a
- *   call without a path keep it;
+ *   call without a path keep it. The same files also hide every value under a TOML/INI section header named
+ *   after a secret (`[secrets]`, `[database.password]`), up to the next section header;
  * - a line over 4 KB is replaced whole (it is too long to scan safely), and so are the more-indented
  *   lines right after it, since it may have opened such a block (in every kind of file).
  */
@@ -665,6 +718,7 @@ export function redact(text: string, hint?: { path?: string }): string {
   const out: string[] = [];
   let inKey = false;
   let blockCols = -1; // >= 0 while hiding an indented value block
+  let secretSection = false; // inside a TOML/INI [section] named after a secret
   for (const raw of text.split('\n')) {
     let lineEnd = raw.length;
     while (lineEnd > 0 && raw.charCodeAt(lineEnd - 1) === 13) lineEnd--;
@@ -705,6 +759,16 @@ export function redact(text: string, hint?: { path?: string }): string {
         continue;
       }
       blockCols = -1;
+    }
+    // TOML/INI sections (block rule files only): under a [section] whose name holds a secret name ([secrets],
+    // [database.password], [auth]), every value is hidden, up to the next section header.
+    if (blockRule && !startedInKey && !startsBlock) {
+      const section = sectionName(line);
+      if (section !== null) secretSection = section.split(/[^A-Za-z0-9_.-]+/).some((part) => part !== '' && isSecretName(part));
+      else if (secretSection && line.trim() !== '') {
+        out.push(hideSectionValue(line) + cr);
+        continue;
+      }
     }
     if (!regexSafe(line)) {
       // Not scanned, so it may have started an indented value block: hide the more-indented lines after it too.
