@@ -43,6 +43,33 @@ const FLOOR: ReadonlySet<string> = new Set(FLOOR_NEEDS);
 const RUN_SCRIPTS = ['start', 'dev', 'serve'];
 const NEEDS_TIMEOUT_MS = 120_000;
 
+/** Bounds on what is read from one AI answer (in code, not in the schema: Claude's structured outputs don't take maxItems). */
+const MAX_AI_SKIPS = 4;
+const MAX_AI_ADDS_READ = 48;
+const MAX_AI_ADDS_KEPT = 16;
+
+const isFloorId = (id: NeedId): id is NeedCategory => (NEED_CATEGORIES as readonly string[]).includes(id);
+
+/** One note per reason an AI addition was dropped; `items` lists "id in layer" (enum values only). */
+const REFUSED = {
+  gate: (items: string) => `The AI tried to add a gate need (${items}); pipegen ignored it, since it sets up the one merge gate itself.`,
+  category: (items: string) => `The AI gave the wrong category to ${items}; pipegen left those needs out.`,
+  notInFloor: (items: string) => `The AI suggested ${items}, which this repo's plan doesn't include (for example signing on a private Free repo, or an image scan with nothing to run); pipegen left them out.`,
+  layer: (items: string) => `The AI tried to add ${items}, a layer pipegen doesn't add AI checks to here; pipegen left them out.`,
+} as const;
+
+function listItems(items: string[]): string {
+  const shown = items.slice(0, 5).join(', ');
+  return items.length > 5 ? `${shown} and ${items.length - 5} more` : shown;
+}
+
+const LINK = /https?:\/\/\S*/gi;
+/** AI text for display: links removed (before and after cleaning, so a control character can't hide one), then safeText. */
+function cleanAiText(s: string): string {
+  const noLinks = (t: string) => t.replace(LINK, '(link removed)');
+  return formatAiText(noLinks(formatAiText(noLinks(s), 4000)));
+}
+
 /** pipegen's own plain-English reason for each need (floor needs, and AI needs that come back with no usable why). */
 const WHY: Readonly<Record<NeedId, string>> = {
   secrets: 'Stops passwords, keys and tokens from being committed or merged.',
@@ -221,46 +248,64 @@ export async function planNeeds(p: RepoProfile, caps: Capabilities, bundle: Code
     timeoutMs: NEEDS_TIMEOUT_MS,
   }, schema.zod);
 
-  const notes: string[] = [];
+  const notes = new Set<string>(); // deduped
   const layersSkipped: { layer: Layer; reason: string }[] = [];
   const deployAllowed = !p.services.some(isRunnable) && !deploysExist(p);
-  for (const skip of data.skipLayers) {
-    const reason = formatAiText(skip.reason) || 'No reason given.';
+  const refusedSkips = new Set<Layer>();
+  for (const skip of data.skipLayers.slice(0, MAX_AI_SKIPS)) {
+    const reason = cleanAiText(skip.reason) || 'No reason given.';
     if (skip.layer === 'deploy' && deployAllowed) {
       if (layersSkipped.length === 0) layersSkipped.push({ layer: 'deploy', reason });
       continue;
     }
+    if (refusedSkips.has(skip.layer)) continue;
+    refusedSkips.add(skip.layer);
     const because = skip.layer === 'deploy'
       ? 'something in this repo runs or deploys'
       : 'only the deploy layer can be skipped, and only when nothing runs or deploys';
-    notes.push(`The AI suggested skipping the ${skip.layer} layer ("${reason}"), but pipegen keeps it: ${because}.`);
+    notes.add(`The AI suggested skipping the ${skip.layer} layer ("${reason}"), but pipegen keeps it: ${because}.`);
   }
 
+  // Refused additions, grouped by reason so each reason gives one note. Items hold enum values only.
+  const refused: Record<keyof typeof REFUSED, Set<string>> = { gate: new Set(), category: new Set(), notInFloor: new Set(), layer: new Set() };
+  const floorIds = new Set(floor.map((n) => n.id));
+  const floorLayers = new Set(floor.map((n) => n.layer));
   const needs = [...floor];
   const seen = new Set(floor.map(needKey));
-  for (const a of data.add) {
-    if (a.id === 'gate') {
-      notes.push('The AI tried to add a gate need; pipegen ignored it, since it sets up the one merge gate itself.');
-      continue;
-    }
-    if (NEED_ID_CATEGORY[a.id] !== a.category) {
-      notes.push(`The AI gave the need ${a.id} the category ${a.category} instead of ${NEED_ID_CATEGORY[a.id]}; pipegen ignored that need.`);
-      continue;
-    }
-    if (a.layer === 'deploy' && layersSkipped.length > 0) {
-      notes.push(`The AI added ${a.id} to the deploy layer it also skipped; pipegen left it out.`);
-      continue;
-    }
+  let added = 0;
+  const read = data.add.slice(0, MAX_AI_ADDS_READ);
+  for (const [i, a] of read.entries()) {
+    const item = `${a.id} in ${a.layer}`;
+    if (a.id === 'gate') { refused.gate.add(item); continue; }
+    if (NEED_ID_CATEGORY[a.id] !== a.category) { refused.category.add(item); continue; }
+    // A floor id only extends what the floor already has (another layer or service): never signing on a repo
+    // that can't sign, attestation without the capability, or an image scan for a repo with nothing to run.
+    if (isFloorId(a.id) && !floorIds.has(a.id)) { refused.notInFloor.add(item); continue; }
+    // Only layers the floor sets up (never pre-commit, never a deploy layer the repo doesn't have).
+    if (a.layer === 'pre-commit' || !floorLayers.has(a.layer)) { refused.layer.add(item); continue; }
     const need: Need = {
       id: a.id, layer: a.layer, category: a.category, ...(a.service === null ? {} : { service: a.service }),
-      why: formatAiText(a.why) || WHY[a.id], blocking: a.blocking, floor: false,
+      why: cleanAiText(a.why) || WHY[a.id],
+      blocking: FLOOR.has(a.category) || a.blocking, // a floor-category check never runs as warn-only
+      floor: false,
     };
     if (seen.has(needKey(need))) continue; // a floor need (or an earlier addition) stays exactly as it is
     seen.add(needKey(need));
     needs.push(need);
+    added++;
+    if (added === MAX_AI_ADDS_KEPT && i < data.add.length - 1) {
+      notes.add(`pipegen kept the first ${MAX_AI_ADDS_KEPT} of ${data.add.length} AI suggestions.`);
+      break;
+    }
+  }
+  if (data.add.length > MAX_AI_ADDS_READ && added < MAX_AI_ADDS_KEPT) {
+    notes.add(`pipegen read only the first ${MAX_AI_ADDS_READ} of ${data.add.length} AI suggestions.`);
+  }
+  for (const reason of Object.keys(REFUSED) as (keyof typeof REFUSED)[]) {
+    if (refused[reason].size > 0) notes.add(REFUSED[reason](listItems([...refused[reason]])));
   }
 
-  return { needs, notes, requireDeployApproval: deployApprovalRule(p, writers) || data.requireDeployApproval, layersSkipped, usage };
+  return { needs, notes: [...notes], requireDeployApproval: deployApprovalRule(p, writers) || data.requireDeployApproval, layersSkipped, usage };
 }
 
 /**

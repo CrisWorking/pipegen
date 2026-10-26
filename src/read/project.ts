@@ -37,6 +37,32 @@ function note(ctx: Ctx, line: string): void {
   if (!ctx.notes.includes(line)) ctx.notes.push(line);
 }
 
+/**
+ * Service names are unique (needs and the AI schema key on them). When two services share a name, the one with the
+ * first path (sorted) keeps it and each later one becomes <name>-2, <name>-3, … skipping any name already in use,
+ * cut so it still fits SERVICE_NAME_RE, with a note.
+ */
+function uniqueServiceNames(ctx: Ctx, services: Service[]): void {
+  const byPath = [...services].sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
+  const taken = new Set(services.map((s) => s.name));
+  const kept = new Set<string>();
+  for (const s of byPath) {
+    if (!kept.has(s.name)) {
+      kept.add(s.name);
+      continue;
+    }
+    let renamed = '';
+    for (let i = 2; renamed === '' || taken.has(renamed); i++) {
+      const suffix = `-${i}`;
+      renamed = s.name.slice(0, 214 - suffix.length) + suffix;
+    }
+    note(ctx, `Two services were both named ${s.name}; the second is called ${renamed} here.`);
+    taken.add(renamed);
+    kept.add(renamed);
+    s.name = renamed;
+  }
+}
+
 /** Reads a listed file through the read limits; a skipped file is noted in plain English. */
 async function readFile(ctx: Ctx, rel: string): Promise<string | null> {
   if (!ctx.fileSet.has(rel)) return null;
@@ -258,6 +284,7 @@ export async function readProject(dir: string, opts?: { notes?: string[] }): Pro
   const shared: Shared = { repo, serviceDirs: dirs };
   const services: Service[] = [];
   for (const d of dirs) services.push(await readService(ctx, d, shared));
+  uniqueServiceNames(ctx, services);
 
   const files = [...ctx.fileSet];
   return {

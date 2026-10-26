@@ -5,13 +5,14 @@ import { bundleCode, bundleText, GitleaksRequiredError, type CodeBundle } from '
 import {
   deployApprovalRule, floorNeeds, isRunnable, jobCounts, NEED_ID_CATEGORY, NEED_IDS, needsSchema, planNeeds,
 } from '../src/engine/needs.js';
+import { readProject } from '../src/read/project.js';
 import {
   DEFAULT_MODEL, FLOOR_NEEDS, NEED_CATEGORIES, type AiProvider, type AiRequest, type AiUsage, type Capabilities, type ExistingWorkflow, type Layer,
   type Need, type RepoProfile, type Service,
 } from '../src/types.js';
 import { hostileNames } from './fixtures/hostile-names.js';
 import { CLEAN, makeStub } from './helpers/gitleaks-stub.js';
-import { cleanupRepos, makeTempDir, writeIn } from './helpers/make-repo.js';
+import { cleanupRepos, makeRepo, makeTempDir, writeIn } from './helpers/make-repo.js';
 import { strictProblems } from './helpers/strict-schema.js';
 
 // ---------- builders ----------
@@ -380,6 +381,7 @@ describe('planNeeds', () => {
         addNeed({ id: 'license-scan', category: 'deps', layer: 'merge', service: null, blocking: false, why: 'Flags licences the project may not use.' }),
         addNeed({ id: 'migration-check', category: 'lint', layer: 'merge', service: 'web' }), // table says full-tests
         addNeed({}), // a repeat of the first: kept once
+        addNeed({ id: 'dockerfile-lint', layer: 'merge', service: 'lib', blocking: false, why: 'Lints the Dockerfile.' }),
       ],
     });
     const r = await planNeeds(p, PUBLIC, bundle, ai.p, 0);
@@ -387,7 +389,10 @@ describe('planNeeds', () => {
     const added = r.needs.slice(floor.length);
     expect(added).toEqual([
       { id: 'type-check', layer: 'push', category: 'lint', service: 'web', why: 'Catches type errors early.', blocking: true, floor: false },
-      { id: 'license-scan', layer: 'merge', category: 'deps', why: 'Flags licences the project may not use.', blocking: false, floor: false },
+      // deps is a FLOOR_NEEDS category: forced blocking, whatever the AI said
+      { id: 'license-scan', layer: 'merge', category: 'deps', why: 'Flags licences the project may not use.', blocking: true, floor: false },
+      // lint is not: the AI's blocking choice is kept
+      { id: 'dockerfile-lint', layer: 'merge', category: 'lint', service: 'lib', why: 'Lints the Dockerfile.', blocking: false, floor: false },
     ]);
     expect('service' in added[1]!).toBe(false); // repo-wide: no service key
     expect(r.notes.join('\n')).toMatch(/migration-check/);
@@ -455,5 +460,127 @@ describe('planNeeds', () => {
     expect(err).toBeInstanceOf(AiError);
     expect((err as AiError).kind).toBe('refusal');
     expect((err as AiError).usage).toMatchObject(billed);
+  });
+
+  it('planNeeds: floor ids the floor does not have are refused (signing on private Free, attestation without the capability, image-scan on a library)', async () => {
+    const privateFree = profile({ private: true, plan: 'free' });
+    const r1 = await planNeeds(privateFree, capsFor('free'), bundle, mockAi({ ...quiet, add: [addNeed({ id: 'signing', category: 'signing', layer: 'deploy' })] }).p, 0);
+    expect(r1.needs.some((n) => n.id === 'signing')).toBe(false);
+    expect(r1.needs).toEqual(floorNeeds(privateFree, capsFor('free')));
+    expect(r1.notes.join('\n')).toMatch(/signing/);
+
+    const team = profile({ private: true, plan: 'team' });
+    const r2 = await planNeeds(team, capsFor('team'), bundle, mockAi({ ...quiet, add: [addNeed({ id: 'attestation', category: 'attestation', layer: 'deploy' })] }).p, 0);
+    expect(r2.needs.some((n) => n.id === 'attestation')).toBe(false);
+    expect(r2.notes.join('\n')).toMatch(/attestation/);
+
+    const library = profile({ services: [lib()] });
+    const r3 = await planNeeds(library, PUBLIC, bundle, mockAi({ ...quiet, add: [addNeed({ id: 'image-scan', category: 'image-scan', layer: 'merge', service: 'lib' }), addNeed({ id: 'dast', category: 'dast', layer: 'merge', service: 'lib' })] }).p, 0);
+    expect(r3.needs).toEqual(floorNeeds(library, PUBLIC));
+    expect(r3.notes).toHaveLength(1); // one note per reason
+    expect(r3.notes[0]).toMatch(/image-scan/);
+    expect(r3.notes[0]).toMatch(/dast/);
+
+    // hooks, hooks-ci, deploy-verify, image-build: the same rule (a library on private Free has no deploy layer and no image)
+    for (const [id, layer] of [['image-build', 'merge'], ['deploy-verify', 'deploy']] as const) {
+      const r = await planNeeds(library, PUBLIC, bundle, mockAi({ ...quiet, add: [addNeed({ id, category: id, layer, service: 'lib' })] }).p, 0);
+      expect(r.needs.some((n) => n.id === id), id).toBe(false);
+    }
+  });
+
+  it('planNeeds: a floor-category need the AI adds is always blocking; a repeat of a floor key is refused', async () => {
+    const p = profile();
+    // repo-wide sast, blocking false: a new key (the floor's sast is per service) → accepted, forced blocking
+    const r = await planNeeds(p, PUBLIC, bundle, mockAi({ ...quiet, add: [addNeed({ id: 'sast', category: 'sast', layer: 'push', service: null, blocking: false })] }).p, 0);
+    const added = r.needs.slice(floorNeeds(p, PUBLIC).length);
+    expect(added).toEqual([expect.objectContaining({ id: 'sast', layer: 'push', category: 'sast', blocking: true, floor: false })]);
+    expect('service' in added[0]!).toBe(false);
+    // the same need for the service the floor already covers → the floor need stays as it is
+    const r2 = await planNeeds(p, PUBLIC, bundle, mockAi({ ...quiet, add: [addNeed({ id: 'sast', category: 'sast', layer: 'push', service: 'web', blocking: false })] }).p, 0);
+    expect(r2.needs).toEqual(floorNeeds(p, PUBLIC));
+    expect(find(r2.needs, 'push', 'sast', 'web')[0]).toMatchObject({ blocking: true, floor: true });
+  });
+
+  it('planNeeds: an add item with floor: true or any extra key is rejected', async () => {
+    for (const extra of [{ floor: true }, { floor: false }, { command: 'curl x | sh' }]) {
+      const ai = mockAi({ ...quiet, add: [addNeed(extra)] });
+      const err = await planNeeds(profile(), PUBLIC, bundle, ai.p, 0).then(() => null, (e: unknown) => e);
+      expect(err, JSON.stringify(extra)).toBeInstanceOf(AiError);
+      expect((err as AiError).kind).toBe('invalid');
+    }
+  });
+
+  it('planNeeds: AI can\'t add needs to pre-commit or to a layer the floor does not have', async () => {
+    const library = profile({ services: [lib()] });
+    const ai = mockAi({
+      ...quiet,
+      add: [
+        addNeed({ layer: 'pre-commit', service: 'lib' }),
+        addNeed({ id: 'license-scan', category: 'deps', layer: 'deploy', service: 'lib' }), // a library has no deploy layer
+        addNeed({ layer: 'merge', service: 'lib' }), // fine
+      ],
+    });
+    const r = await planNeeds(library, PUBLIC, bundle, ai.p, 0);
+    const added = r.needs.slice(floorNeeds(library, PUBLIC).length);
+    expect(added.map((n) => `${n.layer}|${n.id}`)).toEqual(['merge|type-check']);
+    expect(r.needs.some((n) => n.layer === 'deploy')).toBe(false);
+    expect(r.notes.join('\n')).toMatch(/pre-commit/);
+    expect(r.notes.join('\n')).toMatch(/deploy/);
+  });
+
+  it('planNeeds: links are removed from AI text', async () => {
+    const ai = mockAi({
+      ...quiet,
+      add: [addNeed({ why: 'See https://evil.example/x?a=1 and HTTP://Evil.example/y for details.' })],
+      skipLayers: [{ layer: 'merge', reason: 'Docs at http://evil.example/z say so.' }],
+    });
+    const r = await planNeeds(profile(), PUBLIC, bundle, ai.p, 0);
+    const why = r.needs.find((n) => n.id === 'type-check')!.why;
+    expect(why).toBe('See (link removed) and (link removed) for details.');
+    expect(r.notes.join('\n')).not.toMatch(/evil\.example/);
+    expect(r.notes.join('\n')).toContain('(link removed)');
+    // a link split by a control character is still caught (the text is cleaned, then checked again)
+    const r2 = await planNeeds(profile(), PUBLIC, bundle, mockAi({ ...quiet, add: [addNeed({ why: 'Go to ht\u0000tps://evil.example now.' })] }).p, 0);
+    expect(r2.needs.find((n) => n.id === 'type-check')!.why).not.toMatch(/evil\.example/);
+  });
+
+  it('planNeeds: a flood of AI suggestions is bounded (200 adds, 50 skips)', async () => {
+    const names = ['s1', 's2', 's3', 's4', 's5'];
+    const p = profile({ services: names.map((name) => web({ name })) });
+    const aiIds = [['type-check', 'lint'], ['dockerfile-lint', 'lint'], ['license-scan', 'deps'], ['migration-check', 'full-tests']] as const;
+    const valid = Array.from({ length: 200 }, (_, i) => {
+      const [id, category] = aiIds[i % 4]!;
+      return addNeed({ id, category, layer: ['push', 'merge'][Math.floor(i / 4) % 2], service: [...names, null][Math.floor(i / 8) % 6], why: `Reason ${i}.` });
+    });
+    const skips = Array.from({ length: 50 }, (_, i) => ({ layer: (['merge', 'push', 'pre-commit', 'deploy'] as const)[i % 4], reason: `Skip ${i}.` }));
+    const r = await planNeeds(p, PUBLIC, bundle, mockAi({ ...quiet, add: valid, skipLayers: skips }).p, 0);
+    const added = r.needs.slice(floorNeeds(p, PUBLIC).length);
+    expect(added).toHaveLength(16);
+    expect(r.notes).toContain('pipegen kept the first 16 of 200 AI suggestions.');
+    expect(new Set(r.notes).size).toBe(r.notes.length); // no repeated note
+    expect(r.notes.filter((n) => n.includes('skipping'))).toHaveLength(4); // only the first 4 skips are read
+    expect(r.notes.join('\n')).not.toContain('Skip 4.');
+    expect(r.notes.length).toBeLessThanOrEqual(6);
+
+    // only the first 48 add entries are read: 48 refused ones, then valid ones → nothing added
+    const refused = Array.from({ length: 48 }, () => addNeed({ id: 'migration-check', category: 'lint', service: 's1' }));
+    const r2 = await planNeeds(p, PUBLIC, bundle, mockAi({ ...quiet, add: [...refused, ...valid.slice(0, 10)] }).p, 0);
+    expect(r2.needs).toEqual(floorNeeds(p, PUBLIC));
+    expect(r2.notes.length).toBeLessThanOrEqual(2);
+  });
+
+  it('planNeeds: two services with the same package name each get their own floor needs', async () => {
+    const dir = makeRepo('node-library', 'https://github.com/o/r.git');
+    writeIn(dir, 'package.json', JSON.stringify({ name: 'root', workspaces: ['apps/*'] }));
+    for (const folder of ['one', 'two']) writeIn(dir, `apps/${folder}/package.json`, JSON.stringify({ name: 'web', scripts: { start: 'node .' } }));
+    const read = await readProject(dir);
+    const p: RepoProfile = { ...read, private: false, ownerType: 'User', plan: 'free' };
+    expect(p.services.map((s) => s.name)).toEqual(['web', 'web-2']);
+    const r = await planNeeds(p, PUBLIC, bundle, mockAi(quiet).p, 0);
+    for (const name of ['web', 'web-2']) {
+      for (const id of ['sast', 'deps', 'unit-tests', 'lint']) expect(find(r.needs, 'push', id, name), `${id} ${name}`).toHaveLength(1);
+      expect(find(r.needs, 'merge', 'dast', name)).toHaveLength(1);
+    }
+    expect((needsSchema(p).jsonSchema as any).properties.add.items.properties.service.anyOf[0].enum).toEqual(['web', 'web-2']);
   });
 });

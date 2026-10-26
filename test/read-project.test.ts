@@ -330,6 +330,36 @@ describe('read', () => {
     expect((await readProject(root)).services[0]?.name).toBe('r'); // the root folder's name is the repo name
   });
 
+  it('read: two packages with the same package.json name → the later one (by path) is renamed <name>-2, with a note', async () => {
+    const dir = repo('node-library');
+    writeIn(dir, 'package.json', JSON.stringify({ name: 'root', workspaces: ['apps/*'] }));
+    for (const folder of ['b', 'a', 'c']) writeIn(dir, `apps/${folder}/package.json`, JSON.stringify({ name: 'web', scripts: { start: 'x' } }));
+    writeIn(dir, 'apps/d/package.json', JSON.stringify({ name: 'web-2', scripts: { start: 'x' } })); // already taken: the suffix keeps counting
+    const notes: string[] = [];
+    const p = await readProject(dir, { notes });
+    expect(p.services.map((s) => [s.path, s.name])).toEqual([['apps/a', 'web'], ['apps/b', 'web-3'], ['apps/c', 'web-4'], ['apps/d', 'web-2']]);
+    expect(new Set(p.services.map((s) => s.name)).size).toBe(p.services.length);
+    expect(notes).toContain('Two services were both named web; the second is called web-3 here.');
+    expect(notes).toContain('Two services were both named web; the second is called web-4 here.');
+  });
+
+  it('read: two invalid-name folders that both fall back to "app" → app and app-2; a renamed long name still matches the pattern', async () => {
+    const dir = repo('node-library');
+    writeIn(dir, 'package.json', JSON.stringify({ name: 'root', workspaces: ['apps/*'] }));
+    writeIn(dir, 'apps/bad one/package.json', JSON.stringify({ name: 'bad\u202e', scripts: { dev: 'x' } }));
+    writeIn(dir, 'apps/bad two/package.json', JSON.stringify({ scripts: { dev: 'x' } }));
+    const long = 'n'.repeat(214);
+    writeIn(dir, 'apps/l1/package.json', JSON.stringify({ name: long, scripts: { dev: 'x' } }));
+    writeIn(dir, 'apps/l2/package.json', JSON.stringify({ name: long, scripts: { dev: 'x' } }));
+    const notes: string[] = [];
+    const p = await readProject(dir, { notes });
+    expect(p.services.map((s) => [s.path, s.name])).toEqual([
+      ['apps/bad one', 'app'], ['apps/bad two', 'app-2'], ['apps/l1', long], ['apps/l2', `${'n'.repeat(212)}-2`],
+    ]);
+    for (const s of p.services) expect(s.name).toMatch(/^[A-Za-z0-9._@/-]{1,214}$/);
+    expect(notes).toContain('Two services were both named app; the second is called app-2 here.');
+  });
+
   it('read: code port default found in .tsx, .mts and .cts files too', async () => {
     for (const ext of ['tsx', 'mts', 'cts']) {
       const dir = repo('node-library');
