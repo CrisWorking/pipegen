@@ -2,6 +2,11 @@ import type { Language, RepoProfile, SupportLevel } from '../types.js';
 
 const AUDIT_TODAY = 'You can run `pipegen audit` today.';
 
+/** Display names for the fixed Language union (never a repo string). */
+const LANGUAGE_NAMES: Record<Language, string> = {
+  node: 'Node', python: 'Python', go: 'Go', java: 'Java', dotnet: '.NET', ruby: 'Ruby', php: 'PHP', other: 'This language',
+};
+
 /**
  * Decides whether the full run can handle this repo, or only `pipegen audit`.
  * The full run calls this before asking for consent and stops politely on `audit-only`.
@@ -19,10 +24,10 @@ export function supportLevel(p: Pick<RepoProfile, 'monorepo' | 'services'>, mile
   const supported: Language[] = milestone === 'v0.4' ? ['node', 'python'] : ['node'];
   const unsupported = [...new Set(p.services.map((s) => s.language))].filter((l) => !supported.includes(l));
   for (const language of unsupported) {
-    const name = language === 'python' ? 'Python' : language;  // language is from the Language union, never a repo string
-    reasons.push(milestone === 'v0.2'
-      ? `${name} support arrives in v0.4. ${AUDIT_TODAY}`
-      : `${name} services are not supported yet. ${AUDIT_TODAY}`);
+    // Only Python is planned (v0.4); other languages are never promised a milestone.
+    reasons.push(language === 'python'
+      ? `Python support arrives in v0.4. ${AUDIT_TODAY}`
+      : `${LANGUAGE_NAMES[language]} is not supported yet. ${AUDIT_TODAY}`);
   }
 
   if (milestone === 'v0.2' && (p.monorepo !== 'none' || p.services.length > 1)) {

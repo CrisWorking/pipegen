@@ -41,4 +41,11 @@ describe('support', () => {
     expect(supportLevel(await profile('python-poetry'), 'v0.4')).toEqual({ level: 'full', reasons: [] });
     expect(supportLevel(await profile('node-pnpm-workspaces'), 'v0.4')).toEqual({ level: 'full', reasons: [] });
   });
+
+  it('support: other languages are not promised for v0.4', () => {
+    const svc = (language: string) => ({ monorepo: 'none' as const, services: [{ language } as never] });
+    expect(supportLevel(svc('go'), 'v0.2').reasons).toEqual(['Go is not supported yet. You can run `pipegen audit` today.']);
+    expect(supportLevel(svc('other'), 'v0.2').reasons).toEqual(['This language is not supported yet. You can run `pipegen audit` today.']);
+    expect(supportLevel(svc('dotnet'), 'v0.4').reasons).toEqual(['.NET is not supported yet. You can run `pipegen audit` today.']);
+  });
 });
