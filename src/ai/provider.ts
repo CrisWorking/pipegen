@@ -2,7 +2,7 @@
 import { z } from 'zod';
 import type { AiProvider, AiRequest, AiUsage } from '../types.js';
 import { safeText } from '../util/safe-text.js';
-import { claudeProvider } from './claude.js';
+import { claudeProvider, fallbackEnabled } from './claude.js';
 import { AiError, count } from './errors.js';
 import { ollamaProvider } from './ollama.js';
 import { openaiProvider } from './openai.js';
@@ -14,6 +14,11 @@ export const MISSING_AI_MESSAGE = 'pipegen needs an AI to do the full job. Set A
 
 /** Plain-English line shown at consent when the provider is Claude and fallbackEnabled(provider.model) is true (Task 8). */
 export const REFUSAL_FALLBACK_NOTE = 'If Claude declines a request, Anthropic automatically runs it again on another Claude model of its choice (the refusal fallback). Your code still goes only to Anthropic.';
+
+/** REFUSAL_FALLBACK_NOTE when this provider's requests turn the refusal fallback on (Claude, a model that has it), else null. */
+export function refusalFallbackNoteFor(p: AiProvider): string | null {
+  return p.name === 'claude' && fallbackEnabled(p.model) ? REFUSAL_FALLBACK_NOTE : null;
+}
 
 export const OLLAMA_EXPERIMENTAL_NOTE = 'Ollama support is experimental: answers from local models may be weaker, and pipegen checks every one against its schema.';
 
@@ -96,8 +101,9 @@ function withFeedback(req: AiRequest, problem: string): AiRequest {
 
 /**
  * provider.complete, then the answer checked with `schema`. Only an 'invalid' answer (not JSON, or not matching
- * the schema) is retried, up to `retries` times, with the zod error sent back. refusal, truncated, timeout and
- * http errors go straight to the caller. `usage` (and `error.usage` on failure) is the sum over every attempt.
+ * the schema) is retried, up to `retries` times, with the zod error sent back; an 'invalid' AiError counts only
+ * when it carries usage (the provider answered). refusal, truncated, timeout and http errors go straight to the
+ * caller. `usage` (and `error.usage` on failure) is the sum over every attempt.
  */
 export async function completeValidated<T>(p: AiProvider, req: AiRequest, schema: z.ZodType<T>, retries = 1): Promise<{ data: T; usage: AiUsage }> {
   let usage: AiUsage = { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0 };
@@ -118,7 +124,9 @@ export async function completeValidated<T>(p: AiProvider, req: AiRequest, schema
       if (!(e instanceof AiError)) throw e;
       usage = addUsage(usage, e.usage);
       billed ||= e.usage !== undefined;
-      if (e.kind !== 'invalid') throw new AiError(e.kind, e.message, billed ? usage : undefined);
+      // Only an answer that came back invalid is retried. An 'invalid' with no usage was raised before any
+      // request (a bad schema or flag), and asking again would fail the same way.
+      if (e.kind !== 'invalid' || e.usage === undefined) throw new AiError(e.kind, e.message, billed ? usage : undefined);
       problem = e.message; // pipegen's own text ("…was not valid JSON."), never the answer itself
       lastError = new AiError('invalid', e.message, billed ? usage : undefined);
     }

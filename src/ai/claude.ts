@@ -139,6 +139,10 @@ export function claudeProvider(opts: ClaudeOptions): AiProvider {
     authToken: null, // never pick up ANTHROPIC_AUTH_TOKEN from the environment
     baseURL: CLAUDE_BASE_URL, // never ANTHROPIC_BASE_URL
     logLevel: 'off', // ANTHROPIC_LOG can't make the SDK log requests (prompts hold repo code)
+    // No OpenTelemetry: no spans (a global tracer provider, e.g. loaded through NODE_OPTIONS, could export the
+    // prompts, which hold repo code, in content mode) and no trace-context headers. Given explicitly, so the
+    // ANTHROPIC_OPEN_TELEMETRY* environment variables are not read.
+    openTelemetry: { traces: false, propagation: false },
     ...(opts.fetch ? { fetch: opts.fetch } : {}),
   });
 

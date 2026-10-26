@@ -1,5 +1,6 @@
 import { randomBytes } from 'node:crypto';
 import { inspect } from 'node:util';
+import { trace, type Span, type Tracer, type TracerProvider } from '@opentelemetry/api';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { z } from 'zod';
 import { CLAUDE_MAX_TOKENS, CLAUDE_REFUSAL_MESSAGE, claudeProvider, fallbackEnabled } from '../src/ai/claude.js';
@@ -7,6 +8,7 @@ import { ollamaProvider } from '../src/ai/ollama.js';
 import { openaiProvider } from '../src/ai/openai.js';
 import {
   AiError, MISSING_AI_MESSAGE, OLLAMA_EXPERIMENTAL_NOTE, REFUSAL_FALLBACK_NOTE, completeValidated, formatAiText, makeProvider,
+  refusalFallbackNoteFor,
 } from '../src/ai/provider.js';
 import { DEFAULT_MODEL, type AiProvider, type AiRequest, type AiUsage } from '../src/types.js';
 
@@ -74,7 +76,11 @@ function claudeMessage(over: { content?: unknown[]; stop_reason?: string; stop_d
  */
 function sse(msg: ReturnType<typeof claudeMessage>): Response {
   const events: [string, unknown][] = [];
-  events.push(['message_start', { type: 'message_start', message: { ...msg, content: [], stop_reason: null, stop_details: null } }]);
+  // message_start carries the start-of-stream usage: input counts, 1 output token, no iterations.
+  // The final usage (iterations included) comes only in message_delta, as the API sends it.
+  const { iterations: _final, ...startUsage } = msg.usage as Record<string, unknown>;
+  const start = { ...startUsage, ...fields<object>(['output_tokens'], [1]) };
+  events.push(['message_start', { type: 'message_start', message: { ...msg, content: [], stop_reason: null, stop_details: null, usage: start } }]);
   msg.content.forEach((raw, index) => {
     const block = raw as { type: string; text?: string; thinking?: string };
     if (block.type === 'text') {
@@ -241,7 +247,7 @@ describe('claude', () => {
     expect(f.calls).toHaveLength(0);
   });
 
-  it('claude: refusal fallback beta header and fallbacks "default" sent on every request', async () => {
+  it('claude: refusal fallback beta header and fallbacks "default" sent for every model that supports it', async () => {
     const f = fakeFetch(() => sse(claudeMessage()));
     const p = claudeProvider({ key: runtimeKey('ak'), fetch: f.fetch });
     await p.complete(request());
@@ -253,6 +259,42 @@ describe('claude', () => {
       expect(c.body).not.toHaveProperty('betas');
     }
     expect(REFUSAL_FALLBACK_NOTE).toMatch(/declin/i);
+  });
+
+  it('claude: refusalFallbackNoteFor gives the note only for a Claude provider with fallback on', () => {
+    const key = runtimeKey('ak');
+    expect(refusalFallbackNoteFor(claudeProvider({ key }))).toBe(REFUSAL_FALLBACK_NOTE);
+    expect(refusalFallbackNoteFor(claudeProvider({ key, model: 'claude-haiku-5-5' }))).toBeNull();
+    // an OpenAI provider whose model happens to carry a Claude name: no note
+    expect(refusalFallbackNoteFor(openaiProvider({ key, model: DEFAULT_MODEL }))).toBeNull();
+    expect(refusalFallbackNoteFor(ollamaProvider({ model: DEFAULT_MODEL }))).toBeNull();
+  });
+
+  it('claude: OpenTelemetry is off: no span and no trace header, even with a global tracer provider', async () => {
+    const spans: string[] = [];
+    const recordingTracer = {
+      startSpan(name: string) {
+        spans.push(name);
+        return trace.wrapSpanContext({ traceId: 'a'.repeat(32), spanId: 'b'.repeat(16), traceFlags: 1 }) as Span;
+      },
+      startActiveSpan(name: string, ...rest: unknown[]) {
+        spans.push(name);
+        const fn = rest[rest.length - 1] as (span: Span) => unknown;
+        return fn(trace.wrapSpanContext({ traceId: 'a'.repeat(32), spanId: 'b'.repeat(16), traceFlags: 1 }));
+      },
+    } as unknown as Tracer;
+    const provider: TracerProvider = { getTracer: () => recordingTracer };
+    expect(trace.setGlobalTracerProvider(provider)).toBe(true);
+    try {
+      expect(trace.getTracerProvider().getTracer('probe')).toBe(recordingTracer); // the global provider really is in place
+      const f = fakeFetch(() => sse(claudeMessage()));
+      await claudeProvider({ key: runtimeKey('ak'), fetch: f.fetch }).complete(request());
+      expect(f.calls).toHaveLength(1);
+      expect(spans).toEqual([]);
+      expect(f.calls[0]!.headers.get('traceparent')).toBeNull();
+    } finally {
+      trace.disable();
+    }
   });
 
   it('claude: refusal stop_reason → AiError refusal', async () => {
@@ -527,6 +569,17 @@ describe('completeValidated', () => {
     const err = await caught(completeValidated(scripted([bad, bad]), request(), Answer));
     expect(err.kind).toBe('invalid');
     expect(err.usage).toEqual(u(10, 10, 0, 0));
+  });
+
+  it('completeValidated: an invalid error from before any answer (no usage) is not retried', async () => {
+    const p = scripted([
+      () => { throw new AiError('invalid', 'The answer schema must be a JSON object schema.'); },
+      () => ({ data: { answer: 'yes', count: 1 }, usage: u(1, 1) }),
+    ]);
+    const err = await caught(completeValidated(p, request(), Answer, 3));
+    expect(err.kind).toBe('invalid');
+    expect(p.requests).toHaveLength(1);
+    expect(err.usage).toBeUndefined();
   });
 
   it('completeValidated: refusal and truncated are not retried', async () => {
