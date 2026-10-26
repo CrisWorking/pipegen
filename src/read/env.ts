@@ -1,12 +1,11 @@
 import { join as joinOs, posix } from 'node:path';
 import { parse as parseToml } from 'smol-toml';
 import type { Dependency, DependencyKind, Service } from '../types.js';
-import { parseYamlLimited, readTextLimited, regexLines, regexSafe } from './limits.js';
+import { IGNORED_DIRS, parseYamlLimited, readTextLimited, regexLines, regexSafe } from './limits.js';
 import { asObj, isTestFile, pythonNames, readPyproject } from './manifest.js';
 
 // Only NAMES are ever kept. A value is read, looked at for at most a yes/no answer, and dropped on the same line.
 
-const IGNORED_DIRS = ['node_modules', '.git', '.venv', 'dist', 'build', 'vendor', 'target'];
 const NAME_RE = /^[A-Za-z_][A-Za-z0-9_]{0,127}$/;
 const CODE_EXT = 'js,mjs,cjs,jsx,ts,tsx,mts,cts,py';
 const COMPOSE_FILES = ['docker-compose.yml', 'docker-compose.yaml', 'compose.yml', 'compose.yaml'];

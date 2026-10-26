@@ -1,0 +1,27 @@
+# pipegen's own gitleaks config for the code bundle it may send to an AI provider
+# (src/ai/redact.ts). pipegen always passes it with --config, so a .gitleaks.toml in the
+# scanned repo is never used.
+#
+# Rules: gitleaks' default rule set, plus pipegen redaction patterns that the defaults do
+# not cover. There is deliberately no allowlist here: nothing in a repo can switch a rule
+# off. pipegen also writes the bundle under neutral file names (f000001.txt, ...), so the
+# path-based allowlists inside the default set never match a repo's own file names.
+
+title = "pipegen code bundle"
+
+[extend]
+useDefault = true
+
+# The password part of a connection string (scheme, then user, a colon, the password, an @
+# and the host). Only the password is reported, so only it is replaced.
+[[rules]]
+id = "pipegen-connection-string-password"
+description = "Password inside a connection string"
+regex = '''[a-zA-Z][a-zA-Z0-9+.-]*://[^:/\s]+:([^@\s]+)@'''
+secretGroup = 1
+
+# API keys of the sk- form (several AI providers use it).
+[[rules]]
+id = "pipegen-sk-key"
+description = "API key of the sk- form"
+regex = '''sk-[A-Za-z0-9_-]{20,}'''

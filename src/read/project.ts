@@ -7,13 +7,12 @@ import { safeText } from '../util/safe-text.js';
 import { asObj, asString, asStrings, isTestFile, pythonNames, readPyproject, type Obj } from './manifest.js';
 import { readEnv } from './env.js';
 import { readPrecommit, readWorkflows } from './workflows.js';
-import { listFiles, parseYamlLimited, readTextLimitedWithReason, regexLines, regexSafe, type Skipped } from './limits.js';
+import { IGNORED_DIRS, listFiles, parseYamlLimited, readTextLimitedWithReason, regexLines, regexSafe, type Skipped } from './limits.js';
 
 export class NotGitHubRepoError extends Error {}
 
 type Profile = Omit<RepoProfile, 'private' | 'ownerType' | 'plan'>;
 
-const IGNORED_DIRS = ['node_modules', '.git', '.venv', 'dist', 'build', 'vendor', 'target'];
 const NPM_DEFAULT_TEST = 'echo "Error: no test specified" && exit 1';
 const NODE_LOCKS: [string, PackageManager][] = [['pnpm-lock.yaml', 'pnpm'], ['yarn.lock', 'yarn'], ['bun.lockb', 'bun'], ['bun.lock', 'bun'], ['package-lock.json', 'npm']];
 const PYTHON_LOCKS: [string, PackageManager][] = [['poetry.lock', 'poetry'], ['uv.lock', 'uv']];

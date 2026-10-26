@@ -15,7 +15,8 @@
     "url": "git+https://github.com/CrisWorking/pipegen.git"
   },
   "files": [
-    "dist"
+    "dist",
+    "data"
   ],
   "scripts": {
     "build": "tsup",

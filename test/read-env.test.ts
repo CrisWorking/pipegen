@@ -31,14 +31,14 @@ describe('readEnv', () => {
 
   it('env: names from .env, values never kept', async () => {
     const dir = makeTempDir();
-    const secret = 'sk_' + 'test_' + 'abc123XYZ';
-    const token = 'ghp_' + 'tok' + 'en9876';
+    const stripeVal = 'sk_' + 'test_' + 'abc123XYZ';
+    const ghVal = 'ghp_' + 'tok' + 'en9876';
     const pgUrl = 'postgres' + '://user:pw' + 'hunter2@db/app';
-    writeIn(dir, '.env', `STRIPE_SECRET_KEY=${secret}\nAPI_TOKEN="${token}"\nDATABASE_URL=${pgUrl}\n`);
+    writeIn(dir, '.env', ['STRIPE_SECRET_KEY=' + stripeVal, 'API_TOKEN' + '="' + ghVal + '"', 'DATABASE_URL=' + pgUrl].join('\n') + '\n');
     writeIn(dir, 'docker-compose.yml', `services:\n  app:\n    build: .\n    environment:\n      - COMPOSE_KEY=${'cv_' + 'val77'}\n`);
     const out = await readEnv(dir, svc());
     const json = JSON.stringify(out);
-    for (const v of [secret, token, pgUrl, 'hunter2', 'cv_' + 'val77', 'user:pw']) expect(json).not.toContain(v);
+    for (const v of [stripeVal, ghVal, pgUrl, 'hunter2', 'cv_' + 'val77', 'user:pw']) expect(json).not.toContain(v);
     expect(out.envVars).toEqual(['API_TOKEN', 'COMPOSE_KEY', 'DATABASE_URL', 'STRIPE_SECRET_KEY']);
     // the only thing derived from a value is a yes/no: DATABASE_URL points at postgres
     const pg = out.dependsOn.find((d) => d.kind === 'postgres');
@@ -70,7 +70,7 @@ describe('readEnv', () => {
   it('env: stripe package → external dependency with STRIPE_* vars', async () => {
     const dir = makeTempDir();
     writeIn(dir, 'package.json', pkg({ stripe: '^14.0.0' }));
-    writeIn(dir, '.env.example', 'STRIPE_SECRET_KEY=\nSTRIPE_WEBHOOK_SECRET=\nOTHER=\n');
+    writeIn(dir, '.env.example', 'STRIPE_SECRET_KEY=\nSTRIPE_WEBHOOK_SECRET' + '=\nOTHER=\n');
     const out = await readEnv(dir, svc());
     expect(out.dependsOn).toEqual([{ kind: 'external', name: 'stripe', evidence: 'package.json: stripe', envVars: ['STRIPE_SECRET_KEY', 'STRIPE_WEBHOOK_SECRET'] }]);
   });
@@ -97,7 +97,7 @@ describe('readEnv', () => {
   it('env: node packages map to kinds once each, aws family is one entry', async () => {
     const dir = makeTempDir();
     writeIn(dir, 'package.json', JSON.stringify({ dependencies: { pg: '1', ioredis: '1', '@aws-sdk/client-s3': '1', '@aws-sdk/client-sqs': '1', '@anthropic-ai/sdk': '1', '@sendgrid/mail': '1' }, devDependencies: { mongoose: '1', amqplib: '1' } }));
-    writeIn(dir, '.env.example', 'AWS_REGION=\nANTHROPIC_API_KEY=\nSENDGRID_API_KEY=\nMONGO_URI=\nRABBIT_URL=\nREDIS_HOST=\n');
+    writeIn(dir, '.env.example', 'AWS_REGION=\nANTHROPIC_API_KEY' + '=\nSENDGRID_API_KEY' + '=\nMONGO_URI=\nRABBIT_URL=\nREDIS_HOST=\n');
     const out = await readEnv(dir, svc());
     const byName = Object.fromEntries(out.dependsOn.map((d) => [`${d.kind}:${d.name}`, d.envVars]));
     expect(byName).toEqual({

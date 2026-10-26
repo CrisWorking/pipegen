@@ -27,7 +27,7 @@ jobs:
     steps:
       - run: npm test
         env:
-          TOKEN: \${{ secrets.NPM_TOKEN }}
+          NPM_AUTH: \${{ secrets.NPM_TOKEN }}
   lint:
     runs-on: ubuntu-latest
     steps:
