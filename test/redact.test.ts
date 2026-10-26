@@ -631,15 +631,20 @@ describe('redact: speed', () => {
     const shapes = [
       'tok' + 'en', 'ey' + 'J', 'ey' + 'J.', 'ey' + 'Ja.', 'a://', 'a://:', 'a://a:@/', 'a:/' + '/a:b', '@', 'sk-', 'x="', 'au' + 'th.',
       'a.tok' + 'en-', 'tok' + 'en:', 'tok' + 'en="', '"pass' + 'word":"', 'tok' + 'en="\\"', '--tok' + 'en ', '<pass' + 'word>', 'au' + 'thau' + 'th',
+      '<a key="tok' + 'en" ', 'key="tok' + 'en" value="x" ', '<pass' + 'word ', '--pass' + 'word = ', 'pass' + 'word: &a !b ', 'x@y:/' + '/', 'smtp:/' + '/me@g:p#', '%', '\r', 'pass' + 'word:\r',
     ].map((u) => (line(u) + '\n').repeat(250));
     shapes.push(('a:/' + '/b:' + 'c'.repeat(3990) + '\n').repeat(250));
     shapes.push(('ey' + 'J' + 'a'.repeat(1990) + '.' + 'b'.repeat(1990) + '\n').repeat(250));
     shapes.push((('a'.repeat(30) + 'tok' + 'en ').repeat(110) + '\n').repeat(250));
     shapes.push(('pass' + 'word: |\n' + '  x\n'.repeat(250_000)));
+    redact(shapes[0]); // warm-up
     for (const text of shapes) {
-      const t = performance.now();
-      redact(text);
-      expect(performance.now() - t, text.slice(0, 12)).toBeLessThan(300); // about 1 MB each
+      const runs = [0, 1, 2].map(() => {
+        const t = performance.now();
+        redact(text);
+        return performance.now() - t;
+      }).sort((a, b) => a - b);
+      expect(runs[1], text.slice(0, 12)).toBeLessThan(300); // median of 3, about 1 MB each
     }
   });
 });
@@ -677,16 +682,17 @@ describe('fix round 2', () => {
     expect(redact('ey' + 'Ja.b.c')).toBe('ey' + 'Ja.b.c'); // second segment shorter than 4
   });
 
-  it('bundle: a found secret shorter than 6 characters drops only its file, never scrubbed everywhere', async () => {
+  it('bundle: a found secret shorter than 6 characters drops its file and is removed elsewhere only as a whole token', async () => {
     const dir = makeTempDir();
-    const short = 'zq' + '5';
+    const short = 'Ab' + '3';
     writeIn(dir, 'src/a.ts', `const k = "${short}";\n`);
-    writeIn(dir, 'src/b.ts', `const other = "${short}";\n`);
+    writeIn(dir, 'src/b.ts', `const other = "${short}"; const x = "${short}x"; const y = "x${short}"; const z = ${short}_1;\n`);
+    writeIn(dir, `src/${short}.ts`, 'export {};\n');
     writeIn(dir, 'src/c.ts', 'export {};\n');
     const stub = makeStub(`const f = findingsFor(${JSON.stringify(short)}).slice(0, 1); fs.writeFileSync(report, JSON.stringify(f)); process.exit(1);`);
     const b = await bundleCode(dir, { gitleaks: stub.bin });
-    expect(paths(b)).toEqual(['src/b.ts', 'src/c.ts']);
-    expect(b.files.find((f) => f.path === 'src/b.ts')?.content).toBe(`const other = "${short}";\n`);
+    expect(paths(b)).toEqual(['src/b.ts', 'src/c.ts']); // the reported file and the file named after the value are left out
+    expect(b.files.find((f) => f.path === 'src/b.ts')?.content).toBe(`const other = "${R}"; const x = "${short}x"; const y = "x${short}"; const z = ${short}_1;\n`);
     const notes = b.notes.join('\n');
     expect(notes).toMatch(/short/);
     expect(notes).not.toContain('src/a.ts');
@@ -752,5 +758,105 @@ describe('fix round 2', () => {
     const ascii = JSON.stringify(v).slice(1, -1).replace('é', '\\u00e9');
     const out = scrubKnownValues(`1 ${encodeURI(v)} 2 ${mixed} 3 ${ascii} 4`, [v]);
     expect(out).toBe(`1 ${R} 2 ${R} 3 ${R} 4`);
+  });
+});
+
+describe('fix round 3', () => {
+  const k = 'pass' + 'word';
+  const t = 'tok' + 'en';
+
+  it('redact: CRLF yaml block and next-line values hidden', () => {
+    expect(redact(`${k}: |\r\n  line-one\r\n  line-two\r\nnext: 1\r\n`)).toBe(`${k}: |\r\n  ${R}\r\n  ${R}\r\nnext: 1\r\n`);
+    expect(redact(`db:\r\n  ${k}:\r\n    on-next-line\r\n  user: bob`)).toBe(`db:\r\n  ${k}:\r\n    ${R}\r\n  user: bob`);
+    expect(redact(`${k}=x y\r\nok=1`)).toBe(`${k}=${R}\r\nok=1`);
+  });
+
+  it('bundle: CRLF files are normalised before redaction', async () => {
+    const dir = makeTempDir();
+    writeIn(dir, 'config/app.yml', `db:\r\n  ${k}:\r\n    hidden-value-1\r\n  user: bob\r\nold-mac: 1\rnext: 2\r\n`);
+    const b = await bundleCode(dir);
+    const c = b.files[0].content;
+    expect(c).not.toContain('\r');
+    expect(c).not.toContain('hidden-value-1');
+    expect(c).toBe(`db:\n  ${k}:\n    ${R}\n  user: bob\nold-mac: 1\nnext: 2\n`);
+  });
+
+  it('scrubKnownValues: a value right after a literal % is removed', () => {
+    const v = 'cafe' + '0123babe';
+    expect(scrubKnownValues(`100%${v} done`, [v])).toBe(`100%${R} done`);
+    expect(scrubKnownValues(`x %2f${v}`, [v])).toBe(`x %2f${R}`);
+  });
+
+  it('redact: YAML block headers with indentation digits, anchors, tags and comments', () => {
+    for (const header of ['|2', '>2-', '|+1', '|-2', '&pw', '!secret |', '!!str', '&a !t |-', '# a comment', '&anchor # note']) {
+      const out = redact(`${k}: ${header}\n  hidden-line\nnext: 1`);
+      expect(out, header).not.toContain('hidden-line');
+      expect(out, header).toContain(`\n  ${R}\nnext: 1`);
+    }
+    // a tag followed by a value is a value, hidden on its line
+    expect(redact(`${k}: !secret hunter2\nnext: 1`)).toBe(`${k}: ${R}\nnext: 1`);
+  });
+
+  it('redact: tab indentation counts as the next multiple of 8 columns', () => {
+    expect(redact(`  ${k}: |\n\thidden-line\n  next: 1`)).toBe(`  ${k}: |\n\t${R}\n  next: 1`);
+    expect(redact(`\t${k}: |\n        same-column\n`)).toBe(`\t${k}: |\n        same-column\n`);
+  });
+
+  it('redact: python block keywords do not hide code bodies when path is .py', async () => {
+    const py = `class ${t[0].toUpperCase()}${t.slice(1)}Store:\n    def get(self):\n        return 1\nif not ${t}:\n    run()\n${k} = "x y"\n`;
+    expect(redact(py, { path: 'src/store.py' })).toBe(py.replace('"x y"', `"${R}"`));
+    const dir = makeTempDir();
+    writeIn(dir, 'src/store.py', py);
+    writeIn(dir, 'config/app.yml', `${k}:\n  hidden-line\n`);
+    const b = await bundleCode(dir);
+    expect(b.files.find((f) => f.path === 'src/store.py')?.content).toBe(py.replace('"x y"', `"${R}"`));
+    expect(b.files.find((f) => f.path === 'config/app.yml')?.content).toBe(`${k}:\n  ${R}\n`);
+  });
+
+  it('redact: no hint → block rule still applies', () => {
+    const py = `if not ${t}:\n    body-line\n`;
+    expect(redact(py)).toBe(`if not ${t}:\n    ${R}\n`);
+    expect(redact(py, {})).toBe(`if not ${t}:\n    ${R}\n`);
+    for (const path of ['a.yml', 'b.yaml', '.env.local', 'x.ini', 'x.cfg', 'x.conf', 'x.properties', 'x.toml', 'Procfile', 'prod.env']) {
+      expect(redact(py, { path }), path).toBe(`if not ${t}:\n    ${R}\n`);
+    }
+  });
+
+  it('redact: XML element with attributes and .NET key/value settings', () => {
+    expect(redact(`<${k} type="t">hunter2</${k}>`)).toBe(`<${k} type="t">${R}</${k}>`);
+    expect(redact(`<add key="Db${k}" value="x y"/>`)).toBe(`<add key="Db${k}" value="${R}"/>`);
+    expect(redact(`<add value='x y' key='Api${t}' />`)).toBe(`<add value='${R}' key='Api${t}' />`);
+    expect(redact('<add key="Theme" value="dark"/>')).toBe('<add key="Theme" value="dark"/>');
+  });
+
+  it('redact: unsigned JWT (empty signature) replaced', () => {
+    const unsigned = 'ey' + 'JhbGciOiJub25lIn0' + '.' + 'ey' + 'JzdWIiOiIxIn0' + '.';
+    expect(redact(`x ${unsigned} y`)).toBe(`x ${R} y`);
+    expect(redact(unsigned)).toBe(R);
+  });
+
+  it('redact: auth compounds hidden (authkey, AUTHPASS, xauth)', () => {
+    for (const name of ['au' + 'thkey', 'AU' + 'THPASS', 'xau' + 'th', 'basic' + 'Auth', 'au' + 'th_mode', 'au' + 'thorization', 'my' + 'auth' + 'value']) {
+      expect(redact(fake.assign(name, 'v4lue')), name).toBe(fake.assign(name, R));
+    }
+  });
+
+  it('redact: author/authority/OAuth kept', () => {
+    for (const keep of ['author: Jane', 'authors = [a]', 'authored: x', 'authorship: y', 'authority = central', 'authoritative: yes', 'authentic: no', 'authenticity: z', 'OAuth: enabled', 'oauth = on']) {
+      expect(redact(keep), keep).toBe(keep);
+    }
+  });
+
+  it('redact: connection string password holding # or ? after an email user', () => {
+    expect(redact('smtp' + '://me@gmail.com:' + 'pa#ss' + '@host')).toBe('smtp' + `://me@gmail.com:${R}@host`);
+    expect(redact('smtp' + '://me@gmail.com:' + 'pa?ss' + '@host:25')).toBe('smtp' + `://me@gmail.com:${R}@host:25`);
+    expect(redact('mongodb+srv' + '://u:' + 'p' + '@cluster/x?y=z@w')).toBe('mongodb+srv' + `://u:${R}@cluster/x?y=z@w`);
+    expect(redact('https://user@host/@scope/pkg')).toBe('https://user@host/@scope/pkg');
+  });
+
+  it('redact: CLI flags with spaced or colon separators', () => {
+    expect(redact(`run --${k} = x y`)).toBe(`run --${k} = ${R} y`);
+    expect(redact(`run --${k}: x y`)).toBe(`run --${k}: ${R} y`);
+    expect(redact(`run --${t} := "a b" c`)).toBe(`run --${t} := "${R}" c`);
   });
 });
