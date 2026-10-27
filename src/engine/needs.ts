@@ -11,7 +11,7 @@ import { aiSchema, type AiSchema } from '../ai/schema.js';
 import { signingMode } from '../github/signing-mode.js';
 import { SERVER_FRAMEWORKS, SERVICE_NAME_RE } from '../read/project.js';
 import { NEEDS_MAX_OUTPUT_TOKENS } from './discovery-limits.js';
-import { NEED_ID_CATEGORY, NEED_IDS, REPO_WIDE_CATEGORIES, SCHEDULED_CATEGORIES, type NeedId } from './need-ids.js';
+import { NEED_ID_CATEGORY, NEED_IDS, REPO_WIDE_CATEGORIES, type NeedId } from './need-ids.js';
 import {
   FLOOR_NEEDS, NEED_CATEGORIES, type AiProvider, type AiRequest, type AiUsage, type Capabilities, type Layer, type Need, type NeedCategory,
   type RepoProfile, type Service,
@@ -46,7 +46,7 @@ const REFUSED = {
   gate: (items: string) => `The AI tried to add a gate need (${items}); pipegen ignored it, since it sets up the one merge gate itself.`,
   category: (items: string) => `The AI gave the wrong category to ${items}; pipegen left those needs out.`,
   notInFloor: (items: string) => `The AI suggested ${items}, which this repo's plan doesn't include (for example signing on a private Free repo, or an image scan with nothing to run); pipegen left them out.`,
-  layer: (items: string) => `The AI tried to add ${items}, a layer pipegen doesn't add AI checks to here (scheduled checks run only in the merge layer); pipegen left them out.`,
+  layer: (items: string) => `The AI tried to add ${items}, a layer pipegen doesn't add AI checks to here (for example a pull-request-only or scheduled check on push); pipegen left them out.`,
   notRunnable: (items: string) => `The AI suggested ${items}, but image checks only apply to services that run; pipegen left them out.`,
   repoWide: (items: string) => `The AI tried to add ${items} for one service, but that check covers the whole repo; pipegen left them out.`,
   notDeployed: (items: string) => `The AI suggested ${items}, but pipegen's deploy layer doesn't cover that; pipegen left them out.`,
@@ -119,8 +119,12 @@ export function deployApprovalRule(p: RepoProfile, writers: number): boolean {
 /** Where a check's needs go: per service, once for the repo, per runnable service, or by the deploy rules (publishing, egress). */
 type CheckScope = 'service' | 'repo' | 'runnable' | 'published' | 'deploy-target';
 
-interface CheckRule {
-  category: NeedCategory;
+/** The Plan P categories (the table's keys); typing the labels by this makes a missing label a compile error. */
+export type CheckCategory = 'format' | 'type-check' | 'coverage' | 'dead-code' | 'duplication' | 'dockerfile-lint' | 'workflow-lint' | 'workflow-pin-check'
+  | 'dependency-review' | 'licences' | 'api-dast' | 'publishing' | 'egress' | 'update-config' | 'scorecard' | 'fuzzing';
+
+export interface CheckRule {
+  category: CheckCategory;
   layers: readonly Layer[];
   scope: CheckScope;
   /** Whether a failure stops the merge; a function when it depends on the service (dead-code needs a knip config). */
@@ -143,7 +147,7 @@ const languageSkip = (s?: Service) => (s !== undefined && FORMAT_LANGUAGES.inclu
  * needLabel (model.ts) and the needs' `why`. SCHEDULED_CATEGORIES and REPO_WIDE_CATEGORIES (need-ids.ts, a leaf module)
  * must match it; a test pins that. The order here is the order of the needs after the older floor.
  */
-const CHECKS: readonly CheckRule[] = [
+export const CHECKS: readonly CheckRule[] = [
   { category: 'format', layers: ['push', 'merge'], scope: 'service', blocking: true, skip: (_p, _c, s) => languageSkip(s),
     label: 'Format check', why: 'Checks that the code is formatted one way everywhere, so reviews show real changes.' },
   { category: 'type-check', layers: ['push', 'merge'], scope: 'service', blocking: true,
@@ -189,7 +193,7 @@ const CHECKS: readonly CheckRule[] = [
 ];
 
 /** Plain-English label of each Plan P check (model.ts folds these into needLabel). */
-export const CHECK_LABELS: Readonly<Record<string, string>> = Object.freeze(Object.fromEntries(CHECKS.map((c) => [c.category, c.label])));
+export const CHECK_LABELS = Object.freeze(Object.fromEntries(CHECKS.map((c) => [c.category, c.label]))) as Readonly<Record<CheckCategory, string>>;
 
 /** pipegen's own plain-English reason for each need (floor needs, and AI needs that come back with no usable why). */
 const WHY: Readonly<Record<string, string>> = Object.freeze({ ...OLD_WHY, ...Object.fromEntries(CHECKS.map((c) => [c.category, c.why])) });
@@ -502,7 +506,7 @@ export async function planNeeds(p: RepoProfile, caps: Capabilities, bundle: Code
   const floorLayers = new Set(floor.map((n) => n.layer));
   const skipped = skippedChecks(p, caps);
   const runnable = new Set(p.services.filter(isRunnable).map((s) => s.name));
-  const deployTargets = new Set(floor.filter((n) => n.layer === 'deploy').map((n) => n.service));
+  const deployNeedTargets = new Set(floor.filter((n) => n.layer === 'deploy').map((n) => n.service));
   const needs = [...floor];
   const seen = new Set(floor.map(needKey));
   let added = 0;
@@ -518,14 +522,16 @@ export async function planNeeds(p: RepoProfile, caps: Capabilities, bundle: Code
     if (skip !== undefined) { refused.notInFloor.add(`${item} (${skip.why})`); continue; }
     if (isFloorId(a.id) && !floorIds.has(a.id)) { refused.notInFloor.add(item); continue; }
     // A scheduled check runs only in the merge layer; a repo-wide check has no service.
-    if (SCHEDULED_CATEGORIES.has(a.category) && a.layer !== 'merge') { refused.layer.add(item); continue; }
+    // A table check goes only on the layers the table gives it (duplication is PR-only, DEC #93; scheduled checks are merge only).
+    const rule = CHECKS.find((c) => c.category === a.category);
+    if (rule !== undefined && !rule.layers.includes(a.layer)) { refused.layer.add(item); continue; }
     if (REPO_WIDE_CATEGORIES.has(a.category) && a.service !== null) { refused.repoWide.add(item); continue; }
     // Only layers the floor sets up (never pre-commit, never a deploy layer the repo doesn't have).
     if (a.layer === 'pre-commit' || !floorLayers.has(a.layer)) { refused.layer.add(item); continue; }
     // Image checks need something to run: only for a runnable service, never repo-wide.
     if (IMAGE_IDS.has(a.id) && (a.service === null || !runnable.has(a.service))) { refused.notRunnable.add(item); continue; }
     // Deploy additions only for what the floor's deploy layer already covers.
-    if (a.layer === 'deploy' && !deployTargets.has(a.service ?? undefined)) { refused.notDeployed.add(item); continue; }
+    if (a.layer === 'deploy' && !deployNeedTargets.has(a.service ?? undefined)) { refused.notDeployed.add(item); continue; }
     const need: Need = {
       id: a.id, layer: a.layer, category: a.category, ...(a.service === null ? {} : { service: a.service }),
       why: cleanAiText(a.why) || needWhy(a.id) || '',

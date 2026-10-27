@@ -51,6 +51,7 @@ import { skippedWorkflowCount } from '../read/workflows.js';
 import {
   DEFAULT_MODEL, type AiProvider, type AiRequest, type AiUsage, type Capabilities, type Need, type Part, type PipelineDraft, type RepoProfile,
   type ReviewedTool, type Service,
+  type NeedCategory,
 } from '../types.js';
 import { usd } from '../util/format.js';
 import { packageVersion } from '../util/package-data.js';
@@ -224,7 +225,7 @@ export function isBuiltInNeed(need: Pick<Need, 'category'>): boolean {
 }
 
 /** A plain-English name for each check, for the report (one map, shared by every output that names a check). */
-const NEED_LABELS: Readonly<Record<string, string>> = {
+const NEED_LABELS: Readonly<Record<NeedCategory | 'migration-check', string>> = {
   secrets: 'Secret scan', sast: 'Code scan (SAST)', deps: 'Dependency check', 'unit-tests': 'Unit tests', 'full-tests': 'Full test suite',
   lint: 'Lint', 'format-lint': 'Format and lint hook', hooks: 'Git hook manager', 'hooks-ci': 'Git hooks re-run in CI',
   'image-build': 'Container image build', 'image-scan': 'Container image scan', dast: 'Running-app scan (DAST)',
@@ -241,7 +242,7 @@ const RELEASE_LABELS: Readonly<Record<string, string>> = { signing: 'Release sig
  */
 export function needLabel(id: string, opts: { noImage?: boolean } = {}): string | null {
   if (opts.noImage === true && Object.hasOwn(RELEASE_LABELS, id)) return RELEASE_LABELS[id] as string;
-  return Object.hasOwn(NEED_LABELS, id) ? (NEED_LABELS[id] as string) : null;
+  return Object.hasOwn(NEED_LABELS, id) ? (NEED_LABELS as Record<string, string>)[id] as string : null;
 }
 
 /**

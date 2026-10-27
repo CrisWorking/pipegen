@@ -5,6 +5,7 @@ import { bundleCode, bundleText, GitleaksRequiredError, type CodeBundle } from '
 import {
   deployApprovalRule, floorNeeds, isRunnable, jobCategories, jobCounts, JOB_GROUP, NEED_ID_CATEGORY, NEED_IDS, needsSchema, needWhy, planNeeds, skippedChecks,
 } from '../src/engine/needs.js';
+import { CHECKS } from '../src/engine/needs.js';
 import { AI_ONLY_IDS, REPO_WIDE_CATEGORIES, SCHEDULED_CATEGORIES } from '../src/engine/need-ids.js';
 import { needLabel } from '../src/audit/model.js';
 import { readProject } from '../src/read/project.js';
@@ -401,22 +402,22 @@ describe('planNeeds', () => {
     const ai = mockAi({
       ...quiet,
       add: [
-        addNeed({ layer: 'deploy' }),
+        addNeed({ id: 'format', category: 'format', service: null }),
         addNeed({ id: 'deps', category: 'deps', layer: 'merge', service: null, blocking: false, why: 'Flags licences the project may not use.' }),
         addNeed({ id: 'migration-check', category: 'lint', layer: 'merge', service: 'web' }), // table says full-tests
-        addNeed({ layer: 'deploy' }), // a repeat of the first: kept once
-        addNeed({ id: 'format', category: 'format', layer: 'deploy', blocking: false, why: 'Formats the code.' }),
+        addNeed({ id: 'format', category: 'format', service: null }), // a repeat of the first: kept once
+        addNeed({ id: 'coverage', category: 'coverage', layer: 'merge', service: null, blocking: false, why: 'Watches coverage.' }),
       ],
     });
     const r = await planNeeds(p, PUBLIC, bundle, ai.p, 0);
     const floor = floorNeeds(p, PUBLIC);
     const added = r.needs.slice(floor.length);
     expect(added).toEqual([
-      { id: 'type-check', layer: 'deploy', category: 'type-check', service: 'web', why: 'Catches type errors early.', blocking: true, floor: false },
+      { id: 'format', layer: 'push', category: 'format', why: 'Catches type errors early.', blocking: true, floor: false },
       // deps is a FLOOR_NEEDS category: forced blocking, whatever the AI said
       { id: 'deps', layer: 'merge', category: 'deps', why: 'Flags licences the project may not use.', blocking: true, floor: false },
-      // format is not: the AI's blocking choice is kept
-      { id: 'format', layer: 'deploy', category: 'format', service: 'web', why: 'Formats the code.', blocking: false, floor: false },
+      // coverage is not: the AI may choose warn-only
+      { id: 'coverage', layer: 'merge', category: 'coverage', why: 'Watches coverage.', blocking: false, floor: false },
     ]);
     expect('service' in added[1]!).toBe(false); // repo-wide: no service key
     expect(r.notes.join('\n')).toMatch(/migration-check/);
@@ -461,12 +462,12 @@ describe('planNeeds', () => {
 
   it('planNeeds: AI text (why, skip reasons) cleaned before it is kept or shown', async () => {
     const ai = mockAi({
-      add: [addNeed({ layer: 'deploy', why: `Checks types ${hostileNames.osc8Link} ${hostileNames.bidiOverride}\nnow` }), addNeed({ id: 'format', category: 'format', layer: 'deploy', why: '' })],
+      add: [addNeed({ id: 'format', category: 'format', service: null, why: `Checks types ${hostileNames.osc8Link} ${hostileNames.bidiOverride}\nnow` }), addNeed({ id: 'coverage', category: 'coverage', layer: 'merge', service: null, why: '' })],
       skipLayers: [{ layer: 'merge', reason: `${hostileNames.screenClear} ${hostileNames.veryLong}` }, { layer: 'deploy', reason: hostileNames.nulAndCr }],
       requireDeployApproval: false,
     });
     const r = await planNeeds(profile({ services: [web()] }), PUBLIC, bundle, ai.p, 0);
-    const added = r.needs.filter((n) => n.layer === 'deploy' && (n.id === 'type-check' || n.id === 'format'));
+    const added = r.needs.filter((n) => n.service === undefined && (n.id === 'coverage' || n.id === 'format'));
     expect(added).toHaveLength(2);
     // eslint-disable-next-line no-control-regex
     const unsafe = /[\u0000-\u001f\u007f-\u009f\u202a-\u202e\u2066-\u2069\u200e\u200f\u061c]/;
@@ -578,23 +579,23 @@ describe('planNeeds', () => {
   it('planNeeds: links are removed from AI text', async () => {
     const ai = mockAi({
       ...quiet,
-      add: [addNeed({ layer: 'deploy', why: 'See https://evil.example/x?a=1 and HTTP://Evil.example/y for details.' })],
+      add: [addNeed({ id: 'format', category: 'format', service: null, why: 'See https://evil.example/x?a=1 and HTTP://Evil.example/y for details.' })],
       skipLayers: [{ layer: 'merge', reason: 'Docs at http://evil.example/z say so.' }],
     });
     const r = await planNeeds(profile(), PUBLIC, bundle, ai.p, 0);
-    const why = r.needs.find((n) => n.id === 'type-check' && n.layer === 'deploy')!.why;
+    const why = r.needs.find((n) => n.id === 'format' && n.service === undefined)!.why;
     expect(why).toBe('See (link removed) and (link removed) for details.');
     expect(r.notes.join('\n')).not.toMatch(/evil\.example/);
     expect(r.notes.join('\n')).toContain('(link removed)');
     // a link split by a control character is still caught (the text is cleaned, then checked again)
-    const r2 = await planNeeds(profile(), PUBLIC, bundle, mockAi({ ...quiet, add: [addNeed({ layer: 'deploy', why: 'Go to ht\u0000tps://evil.example now.' })] }).p, 0);
-    expect(r2.needs.find((n) => n.id === 'type-check' && n.layer === 'deploy')!.why).not.toMatch(/evil\.example/);
+    const r2 = await planNeeds(profile(), PUBLIC, bundle, mockAi({ ...quiet, add: [addNeed({ id: 'format', category: 'format', service: null, why: 'Go to ht\u0000tps://evil.example now.' })] }).p, 0);
+    expect(r2.needs.find((n) => n.id === 'format' && n.service === undefined)!.why).not.toMatch(/evil\.example/);
   });
 
   it('planNeeds: a flood of AI suggestions is bounded (200 adds, 50 skips)', async () => {
     const names = ['s1', 's2', 's3', 's4', 's5'];
     const p = profile({ services: names.map((name) => web({ name })) });
-    const aiIds = [['type-check', 'type-check'], ['format', 'format'], ['deps', 'deps'], ['migration-check', 'full-tests']] as const;
+    const aiIds = [['sast', 'sast'], ['image-scan', 'image-scan'], ['deps', 'deps'], ['migration-check', 'full-tests']] as const;
     const valid = Array.from({ length: 200 }, (_, i) => {
       const [id, category] = aiIds[i % 4]!;
       return addNeed({ id, category, layer: 'deploy', service: names[Math.floor(i / 4) % 5], why: `Reason ${i}.` });
@@ -963,6 +964,44 @@ describe('planNeeds: Plan P rules', () => {
     expect(text).toContain('no Dockerfile found');
   });
 
+  it('planNeeds: a table check goes only on its table layers: duplication and dependency-review on push are refused, a valid layer is kept (I1, DEC #93)', async () => {
+    const p = profile({ services: [web()] });
+    const r = await run(p, [
+      addNeed({ id: 'duplication', category: 'duplication', layer: 'push', service: null }),
+      addNeed({ id: 'dependency-review', category: 'dependency-review', layer: 'push', service: null }),
+      addNeed({ id: 'egress', category: 'egress', layer: 'merge', service: 'web' }),
+      addNeed({ id: 'api-dast', category: 'api-dast', layer: 'push', service: 'web' }),
+    ]);
+    expect(r.needs).toEqual(floorNeeds(p, PUBLIC));
+    expect(r.notes.join('\n')).toMatch(/duplication in push/);
+    expect(r.notes.join('\n')).toMatch(/dependency-review in push/);
+    // a layer the table allows: coverage on merge for the repo (a new key) is accepted
+    const ok = await run(p, [addNeed({ id: 'coverage', category: 'coverage', layer: 'merge', service: null })]);
+    expect(ok.needs.slice(floorNeeds(p, PUBLIC).length).map(key)).toEqual(['merge|coverage|']);
+  });
+
+  it('JOB_GROUP and the nightly follow the table: groups point at real categories; checks with no job are the ones with no group; only merge jobs reach the nightly', () => {
+    const cats: readonly string[] = NEED_CATEGORIES;
+    for (const [c, g] of Object.entries(JOB_GROUP)) {
+      expect(CHECKS.some((r) => r.category === c), `${c} is in the table`).toBe(true);
+      if (g !== null) expect(cats, `${c} → ${g}`).toContain(g);
+    }
+    const rich = profile({
+      services: [web({ dockerfile: 'Dockerfile', quality: withQuality({ tsconfig: true, fuzzTargets: true, configs: ['knip'], apiSpec: { kind: 'file', path: 'o.yaml' } }) })],
+      existingWorkflows: [deployWorkflow, publishWorkflow()],
+    });
+    const needs = floorNeeds(rich, PUBLIC);
+    const cat = jobCategories(needs);
+    for (const rule of CHECKS) {
+      expect(needs.some((n) => n.category === rule.category), `${rule.category} planned`).toBe(true);
+      const job = Object.hasOwn(JOB_GROUP, rule.category) ? JOB_GROUP[rule.category as keyof typeof JOB_GROUP] : rule.category;
+      if (job === null) for (const l of ['push', 'merge', 'deploy'] as const) expect(cat[l], `${rule.category} ${l}`).not.toContain(rule.category);
+      else expect(rule.layers.some((l) => cat[l].includes(job as string)), `${rule.category} has a job`).toBe(true);
+    }
+    const mergeOrCard = new Set([...cat.merge, 'scorecard', 'nightly']);
+    for (const c of cat.nightly) expect(mergeOrCard.has(c), c).toBe(true);
+  });
+
   it('planNeeds: an AI addition cannot make a non-blocking check blocking, and migration-check is still accepted', async () => {
     const p = profile({ services: [web({ quality: withQuality({ configs: ['knip'] }) })] });
     const r = await run(p, [
@@ -971,7 +1010,7 @@ describe('planNeeds: Plan P rules', () => {
     ]);
     const added = r.needs.slice(floorNeeds(p, PUBLIC).length);
     expect(added.map(key)).toEqual(['merge|migration-check|web']);
-    const dup = await run(profile({ services: [web()] }), [addNeed({ id: 'duplication', category: 'duplication', layer: 'push', service: null, blocking: true })]);
-    expect(dup.needs.find((n) => n.layer === 'push' && n.id === 'duplication')).toMatchObject({ blocking: false, floor: false });
+    const dead = await run(profile({ services: [web()] }), [addNeed({ id: 'dead-code', category: 'dead-code', layer: 'push', service: null, blocking: true })]);
+    expect(dead.needs.find((n) => n.layer === 'push' && n.id === 'dead-code' && n.service === undefined)).toMatchObject({ blocking: false, floor: false }); // no knip config
   });
 });
