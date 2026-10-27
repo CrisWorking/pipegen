@@ -1,6 +1,6 @@
 # AI prices for pipegen's estimates (Plan A Task 9), in USD per million tokens, input and output priced separately.
 # Loaded by loadAiPrices (src/estimate/estimate.ts) with a strict schema; every field is required.
-# An unknown model is estimated at the price of DEFAULT_MODEL (claude-opus-5-5), and the estimate's basis says so.
+# An unknown model is estimated at the price of the most expensive model of the same provider (any provider, if the provider is unknown), and the basis says so.
 checkedAt: '2026-10-27'
 providers:
   claude:

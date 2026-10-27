@@ -143,7 +143,7 @@ describe('estimate: included minutes (S12)', () => {
 
   it('estimate: capped activity → basis says "at least N pushes"', () => {
     const e = estimate(profile(), JOBS, 2, { pushes: 287, prs: 9, capped: true }, OPUS);
-    expect(e.basis).toContain('Activity: at least 287 pushes (GitHub lists only the last 300 events) and 9 pull requests in the last 30 days.');
+    expect(e.basis).toContain('Activity: at least 287 pushes and at least 9 pull requests in the last 30 days (GitHub lists only the last 300 events and pipegen reads at most 1,000 pull requests).');
     const plain = estimate(profile(), JOBS, 2, ACTIVITY, OPUS);
     expect(plain.basis.join('\n')).not.toMatch(/at least \d+ push/);
     expect(plain.basis).toContain('Activity: 40 pushes and 10 pull requests in the last 30 days.');
@@ -177,16 +177,32 @@ describe('estimate: AI', () => {
     expect(s.aiCostUsd.high).toBeCloseTo(((IN / 1e6) * 2 + (OUT / 1e6) * 10) * 1.5, 6);
   });
 
-  it('estimate: unknown model uses DEFAULT_MODEL price, noted in basis', () => {
+  it('estimate: unknown model of a known provider is priced at that provider\'s most expensive model', () => {
     const e = estimate(profile(), JOBS, 2, ACTIVITY, { name: 'openai', model: 'gpt-unheard-of' });
-    const d = estimate(profile(), JOBS, 2, ACTIVITY, OPUS);
-    expect(e.aiCostUsd).toEqual(d.aiCostUsd);
-    expect(e.basis.join('\n')).toContain(`pipegen has no price for the model "gpt-unheard-of", so it uses the price of ${DEFAULT_MODEL}`);
-    expect(d.basis.join('\n')).not.toContain('has no price');
+    const top = estimate(profile(), JOBS, 2, ACTIVITY, { name: 'openai', model: 'gpt-5.5' }); // $5 / $30, the dearest OpenAI model
+    expect(e.aiCostUsd).toEqual(top.aiCostUsd);
+    expect(e.aiCostCapUsd).toEqual(top.aiCostCapUsd);
+    const text = e.basis.join('\n');
+    expect(text).toContain('"gpt-unheard-of"');
+    expect(text).toContain('gpt-5.5');
+    expect(text).toMatch(/highest price.*real cost is likely lower/is);
+    const c = estimate(profile(), JOBS, 2, ACTIVITY, { name: 'claude', model: 'claude-future-9' });
+    const fable = estimate(profile(), JOBS, 2, ACTIVITY, { name: 'claude', model: 'claude-fable-5-1' }); // $10 / $50
+    expect(c.aiCostUsd).toEqual(fable.aiCostUsd);
+    expect(c.basis.join('\n')).toContain('claude-fable-5');
+    expect(estimate(profile(), JOBS, 2, ACTIVITY, OPUS).basis.join('\n')).not.toMatch(/has no price/);
     // a known OpenAI model (official price list) uses its own price: gpt-5 at $1.25 / $10
     const g = estimate(profile(), JOBS, 2, ACTIVITY, { name: 'openai', model: 'gpt-5' });
     if (g.aiCostUsd === 'local') throw new Error('expected a priced estimate');
     expect(g.aiCostUsd.high).toBeCloseTo(((IN / 1e6) * 1.25 + (OUT / 1e6) * 10) * 1.5, 6);
+  });
+
+  it('estimate: unknown provider and model → the most expensive model in the whole price file', () => {
+    const e = estimate(profile(), JOBS, 2, ACTIVITY, { name: 'mystery', model: 'm1' });
+    const fable = estimate(profile(), JOBS, 2, ACTIVITY, { name: 'claude', model: 'claude-fable-5-1' });
+    expect(e.aiCostUsd).toEqual(fable.aiCostUsd);
+    expect(e.aiCostCapUsd).toEqual(fable.aiCostCapUsd);
+    expect(e.basis.join('\n')).toMatch(/"m1".*highest price.*real cost is likely lower/is);
   });
 
   it('estimate: a model name in basis is cleaned for the terminal', () => {
@@ -246,6 +262,26 @@ describe('estimate: basis', () => {
 });
 
 describe('estimateAuditAi (ruling B2)', () => {
+  it('estimateAuditAi: basis says the calls, the range and the model in plain English', () => {
+    const text = estimateAuditAi(OPUS, 5).basis.join('\n');
+    expect(text).toMatch(/1 needs call/);
+    expect(text).toMatch(new RegExp(`up to ${MAX_DISCOVERY_NEEDS} discovery calls`));
+    expect(text).toMatch(/2k input.*2k output tokens/s);
+    expect(text).toMatch(/×0\.5.*×1\.5/s);
+    expect(text).toContain(DEFAULT_MODEL);
+    expect(text).toMatch(/\$4.*\$20.*per million/s);
+  });
+
+  it('estimateAuditAi: unknown model is priced at the provider\'s most expensive model, and basis says so', () => {
+    const a = estimateAuditAi({ name: 'claude', model: 'claude-future-9' }, 5);
+    const fable = estimateAuditAi({ name: 'claude', model: 'claude-fable-5-1' }, 5);
+    expect(a.costUsd).toEqual(fable.costUsd);
+    expect(a.capUsd).toEqual(fable.capUsd);
+    expect(a.basis.join('\n')).toMatch(/"claude-future-9".*claude-fable-5.*highest price.*real cost is likely lower/is);
+    const any = estimateAuditAi({ name: 'mystery', model: 'm1' }, 5);
+    expect(any.costUsd).toEqual(fable.costUsd);
+  });
+
   it('estimateAuditAi: one needs call plus at most MAX_DISCOVERY_NEEDS candidate calls', () => {
     expect(MAX_DISCOVERY_NEEDS).toBe(5);
     expect(estimateAuditAi(OPUS, 0).tokens).toEqual({ input: 30_000, output: 3_000 });
@@ -327,6 +363,40 @@ describe('data files', () => {
     writeFileSync(badPlan, plans.replace('team: 3000', 'team: -1'));
     expect(() => loadGitHubPlans(badPlan)).toThrow(/not valid/);
   });
+
+  it('prices and plans: checkedAt must be a real calendar date', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'pipegen-est-'));
+    const prices = readFileSync(new URL('../data/ai-prices.yml', import.meta.url), 'utf8');
+    const plans = readFileSync(new URL('../data/github-plans.yml', import.meta.url), 'utf8');
+    for (const bad of ['2026-13-99', '2026-02-30', '2025-02-29', '2026-00-10']) {
+      const p = join(dir, 'p.yml');
+      writeFileSync(p, prices.replace(/^checkedAt: .*$/m, `checkedAt: '${bad}'`));
+      expect(() => loadAiPrices(p), bad).toThrow(/checkedAt: must be a date/);
+      const q = join(dir, 'q.yml');
+      writeFileSync(q, plans.replace(/^checkedAt: .*$/m, `checkedAt: '${bad}'`));
+      expect(() => loadGitHubPlans(q), bad).toThrow(/checkedAt: must be a date/);
+    }
+    const leap = join(dir, 'leap.yml');
+    writeFileSync(leap, prices.replace(/^checkedAt: .*$/m, "checkedAt: '2028-02-29'"));
+    expect(loadAiPrices(leap).checkedAt).toBe('2028-02-29');
+  });
+
+  it('prices: a price of 0 is refused for every provider except local Ollama', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'pipegen-est-'));
+    const prices = readFileSync(new URL('../data/ai-prices.yml', import.meta.url), 'utf8');
+    const tries: [string, string][] = [
+      ['claude-sonnet-5-5: { input: 2.00, output: 10.00 }', 'claude-sonnet-5-5: { input: 0, output: 10.00 }'],
+      ['claude-sonnet-5-5: { input: 2.00, output: 10.00 }', 'claude-sonnet-5-5: { input: 2.00, output: 0 }'],
+      ['gpt-5: { input: 1.25, output: 10.00 }', 'gpt-5: { input: 0, output: 0 }'],
+    ];
+    tries.forEach(([from, to], i) => {
+      expect(prices).toContain(from);
+      const f = join(dir, `zero${i}.yml`);
+      writeFileSync(f, prices.replace(from, to));
+      expect(() => loadAiPrices(f), to).toThrow(/greater than 0|must be above 0|not valid/);
+    });
+    expect(loadAiPrices().providers.ollama.anyModel).toEqual({ input: 0, output: 0 }); // local Ollama keeps its 0
+  });
 });
 
 // ---------- activity30d ----------
@@ -364,6 +434,23 @@ describe('activity30d', () => {
     const a = await activity30d(gh, profile(), { budget: newRateBudget(), now: () => NOW });
     expect(a).toEqual({ pushes: 150, prs: 0, capped: true });
     expect(calls.filter((c) => c.url.pathname.endsWith('/events'))).toHaveLength(3); // GitHub serves at most 3 pages of 100
+  });
+
+  it('activity30d: pull request page limit reached with every PR inside the window → capped', async () => {
+    const prs = Array.from({ length: 1000 }, (_, i) => ({ created_at: iso(i / 40) })); // 25 days spread
+    const { gh, calls } = fakeOctokit({ [EVENTS]: pages([]), [PULLS]: pages(prs) });
+    const a = await activity30d(gh, profile(), { budget: newRateBudget(), now: () => NOW });
+    expect(a).toEqual({ pushes: 0, prs: 1000, capped: true });
+    expect(calls.filter((c) => c.url.pathname.endsWith('/pulls'))).toHaveLength(10);
+    const e = estimate(profile(), JOBS, 2, a, OPUS);
+    expect(e.basis.join('\n')).toContain('at least 1,000 pull requests');
+  });
+
+  it('activity30d: exactly 1,000 PRs where the last page has an older one is not capped', async () => {
+    const prs = [...Array.from({ length: 999 }, (_, i) => ({ created_at: iso(i / 40) })), { created_at: iso(40) }];
+    const { gh } = fakeOctokit({ [EVENTS]: pages([]), [PULLS]: pages(prs) });
+    const a = await activity30d(gh, profile(), { budget: newRateBudget(), now: () => NOW });
+    expect(a).toEqual({ pushes: 0, prs: 999, capped: false });
   });
 
   it('activity30d: stops paging at the first event older than 30 days (not capped)', async () => {

@@ -20,7 +20,7 @@ import { packageDataPath } from '../util/package-data.js';
 import { safeText } from '../util/safe-text.js';
 
 export type AiStage = 'needs' | 'debate' | 'creators' | 'fix-loop';
-/** Pushes and pull requests opened in the last 30 days. `capped`: GitHub's event list ended (300 events) inside the window, so pushes is a lower bound. */
+/** Pushes and pull requests opened in the last 30 days. `capped`: the event list (300 events) or the pull request pages (1,000) ended inside the window, so the counts are lower bounds. */
 export interface Activity { pushes: number; prs: number; capped: boolean }
 /** The CI jobs of each layer (plus nightly), each named by its need category. Build it with jobCategories() (src/engine/needs.ts). */
 export type JobCategories = Record<Layer | 'nightly', string[]>;
@@ -37,7 +37,7 @@ export interface Estimates {
   durationMinutes: { low: number; high: number }; basis: string[];
 }
 
-export interface AuditAiEstimate { tokens: { input: number; output: number }; costUsd: AiCost | 'local'; capUsd: number | null }
+export interface AuditAiEstimate { tokens: { input: number; output: number }; costUsd: AiCost | 'local'; capUsd: number | null; basis: string[] }
 
 // ---------- minutes ----------
 
@@ -96,8 +96,14 @@ const CAP_FACTOR = 2;
 
 // ---------- data files ----------
 
-const isoDate = z.string().regex(/^\d{4}-\d{2}-\d{2}$/, 'must be a date (YYYY-MM-DD)');
+/** A real calendar date, YYYY-MM-DD: 2026-13-99 and 2026-02-30 are refused. */
+const isoDate = z.string().regex(/^\d{4}-\d{2}-\d{2}$/, 'must be a date (YYYY-MM-DD)').refine((s) => {
+  const [y, m, d] = s.split('-').map(Number) as [number, number, number];
+  const t = new Date(Date.UTC(y, m - 1, d));
+  return t.getUTCFullYear() === y && t.getUTCMonth() === m - 1 && t.getUTCDate() === d;
+}, 'must be a date (YYYY-MM-DD)');
 const price = z.strictObject({ input: z.number().finite().nonnegative(), output: z.number().finite().nonnegative() });
+const paidPrice = z.strictObject({ input: z.number().finite().positive(), output: z.number().finite().positive() });
 const providerPrices = z.strictObject({
   source: z.string().min(1),
   local: z.boolean(),
@@ -113,6 +119,16 @@ const pricesSchema = z.strictObject({
   }
   if (!p.providers.ollama.local || p.providers.ollama.anyModel === undefined) {
     ctx.addIssue({ code: 'custom', path: ['providers', 'ollama'], message: 'must be local with an anyModel price' });
+  }
+  // Only local Ollama may cost nothing: a 0 anywhere else would understate the cost and its hard cap.
+  for (const name of ['claude', 'openai'] as const) {
+    const t = p.providers[name];
+    const all: [string, unknown][] = [...Object.entries(t.models).map(([m, v]): [string, unknown] => [`models.${m}`, v]), ['anyModel', t.anyModel]];
+    for (const [where, v] of all) {
+      if (v !== undefined && !paidPrice.safeParse(v).success) {
+        ctx.addIssue({ code: 'custom', path: ['providers', name, ...where.split('.')], message: 'input and output prices must be above 0 (only local Ollama is free)' });
+      }
+    }
   }
 });
 export type AiPrices = z.infer<typeof pricesSchema>;
@@ -160,7 +176,13 @@ const thousands = (n: number) => `${n / 1000}k`;
 
 interface PriceChoice { local: boolean; input: number; output: number; model: string; notes: string[] }
 
-/** The price for this provider and model; an unknown model (or provider) gets DEFAULT_MODEL's price, with a note. */
+const perMillion = (p: { input: number; output: number }) => `${money(p.input)} per million input tokens and ${money(p.output)} per million output tokens`;
+
+/**
+ * The price for this provider and model. An unknown model gets the price of the MOST EXPENSIVE known model of the same
+ * provider (input + output price), so the hard cap is never understated; an unknown provider gets the most expensive
+ * model in the file. The note names the model used and says the real cost is likely lower.
+ */
 function priceFor(provider: AiProviderChoice): PriceChoice {
   const list = prices();
   const shown = safeText(provider.model, 80);
@@ -168,12 +190,23 @@ function priceFor(provider: AiProviderChoice): PriceChoice {
   if (table?.local) return { local: true, input: 0, output: 0, model: shown, notes: [] };
   const found = table !== undefined && Object.hasOwn(table.models, provider.model) ? table.models[provider.model] : undefined;
   if (found) {
-    return { local: false, ...found, model: shown, notes: [`Prices for ${shown}: ${money(found.input)} per million input tokens and ${money(found.output)} per million output tokens (checked ${list.checkedAt}).`] };
+    return { local: false, ...found, model: shown, notes: [`Prices for ${shown}: ${perMillion(found)} (checked ${list.checkedAt}).`] };
   }
-  const d = list.providers.claude.models[DEFAULT_MODEL] as { input: number; output: number };
+  const pool = table ? [table] : [list.providers.claude, list.providers.openai];
+  let top: { name: string; input: number; output: number } | undefined;
+  for (const t of pool) {
+    for (const [name, m] of Object.entries(t.models)) {
+      if (!top || m.input + m.output > top.input + top.output) top = { name, input: m.input, output: m.output };
+    }
+  }
+  const t = top as { name: string; input: number; output: number }; // the schema guarantees claude has models
+  const whose = table ? `the same provider (${safeText(provider.name, 40)})` : 'any provider in its price list';
   return {
-    local: false, ...d, model: DEFAULT_MODEL,
-    notes: [`pipegen has no price for the model "${shown}", so it uses the price of ${DEFAULT_MODEL}: ${money(d.input)} per million input tokens and ${money(d.output)} per million output tokens (checked ${list.checkedAt}).`],
+    local: false, input: t.input, output: t.output, model: t.name,
+    notes: [
+      `pipegen has no price for the model "${shown}", so it prices it like ${t.name}, the most expensive model it knows from ${whose}: ${perMillion(t)} (checked ${list.checkedAt}). `
+        + "This is the provider's highest price, so the real cost is likely lower.",
+    ],
   };
 }
 
@@ -228,7 +261,8 @@ export function estimate(p: RepoProfile, jobs: JobCategories, variants: number, 
   );
   basis.push(
     activity.capped
-      ? `Activity: at least ${plural(pushes, 'push', 'pushes')} (GitHub lists only the last 300 events) and ${plural(prs, 'pull request', 'pull requests')} in the last 30 days.`
+      ? `Activity: at least ${plural(pushes, 'push', 'pushes')} and at least ${plural(prs, 'pull request', 'pull requests')} in the last 30 days `
+        + `(GitHub lists only the last ${EVENT_PAGES * PER_PAGE} events and pipegen reads at most ${(PR_PAGES * PER_PAGE).toLocaleString('en-US')} pull requests).`
       : `Activity: ${plural(pushes, 'push', 'pushes')} and ${plural(prs, 'pull request', 'pull requests')} in the last 30 days.`,
     `Monthly minutes: every push runs the push layer; every push to a branch with an open pull request also runs the merge layer; every merged pull request runs the deploy layer; the nightly scan runs ${NIGHTS_PER_MONTH} times.`,
     "GitHub's event list doesn't say which pushes went to a branch with an open pull request, so pipegen approximates them: every push except one per pull request (its merge into the default branch), "
@@ -294,9 +328,13 @@ export function estimateAuditAi(provider: AiProviderChoice, needCount: number): 
   const needs = STAGE_TOKENS[0] as { input: number; output: number };
   const tokens = { input: needs.input + calls * CANDIDATE_CALL.input, output: needs.output + calls * CANDIDATE_CALL.output };
   const pr = priceFor(provider);
-  if (pr.local) return { tokens, costUsd: 'local', capUsd: null };
+  const basis = [
+    `The AI part of the audit is 1 needs call plus up to ${MAX_DISCOVERY_NEEDS} discovery calls, one for each need with no reviewed tool (${calls} here), at about ${thousands(CANDIDATE_CALL.input)} input / ${thousands(CANDIDATE_CALL.output)} output tokens for each discovery call.`,
+    `The cost range is ×${LOW} to ×${HIGH} of the token estimate, and the cap is twice the high end.`,
+  ];
+  if (pr.local) return { tokens, costUsd: 'local', capUsd: null, basis: [...basis, 'Ollama runs on your machine: no AI cost and no cost cap.'] };
   const c = cost(tokens, pr);
-  return { tokens, costUsd: c, capUsd: CAP_FACTOR * c.high };
+  return { tokens, costUsd: c, capUsd: CAP_FACTOR * c.high, basis: [...basis, `Priced with the model ${pr.model}.`, ...pr.notes] };
 }
 
 // ---------- activity30d ----------
@@ -346,6 +384,7 @@ export async function activity30d(gh: Octokit, p: RepoProfile, clock: RateClock)
 
   let prs = 0;
   let olderPr = false;
+  let prPagesFull = 0;
   for (let page = 1; page <= PR_PAGES && !olderPr; page++) {
     const res = await withRateLimit(() => gh.rest.pulls.list({ owner, repo, state: 'all', sort: 'created', direction: 'desc', per_page: PER_PAGE, page }), clock);
     const list = read(pullsSchema, res.data, 'pull request list');
@@ -355,7 +394,11 @@ export async function activity30d(gh: Octokit, p: RepoProfile, clock: RateClock)
       else if (inside) prs++;
     }
     if (list.length < PER_PAGE) break;
+    prPagesFull++;
   }
 
-  return { pushes, prs, capped: !older && events >= EVENT_PAGES * PER_PAGE };
+  // Capped: a list that ran out of pages (not of data) while everything was still inside the window; the counts are lower bounds.
+  const eventsCapped = !older && events >= EVENT_PAGES * PER_PAGE;
+  const prsCapped = !olderPr && prPagesFull >= PR_PAGES;
+  return { pushes, prs, capped: eventsCapped || prsCapped };
 }
