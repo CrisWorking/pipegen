@@ -24,10 +24,14 @@ export const FALLBACK_MODELS: readonly string[] = Object.freeze([
   'claude-fable-5-1', 'claude-mythos-5-1', 'claude-fable-5', 'claude-opus-5-5', 'claude-opus-5', 'claude-sonnet-5-5',
 ]);
 /**
- * Room for adaptive thinking plus the biggest schema answer pipegen asks for. Requests are streamed, so this
- * size is safe from HTTP timeouts; the total time is still bounded by req.timeoutMs.
+ * Room for adaptive thinking plus the biggest schema answer pipegen asks for. On models whose thinking can't be
+ * turned off, thinking counts toward this at effort `high`, and a max_tokens stop is never retried, so the ceiling
+ * is the ~64k the claude-api skill recommends for streamed requests (final review batch 2, M6). Only the tokens
+ * produced are billed; Plan E's cost meter, not this ceiling, guards spend. Requests are streamed
+ * (`.stream(...).finalMessage()`), so this size is safe from HTTP timeouts; the total time is still bounded by
+ * req.timeoutMs.
  */
-export const CLAUDE_MAX_TOKENS = 32_000;
+export const CLAUDE_MAX_TOKENS = 64_000;
 export const CLAUDE_EFFORTS = ['low', 'medium', 'high', 'xhigh', 'max'] as const;
 export type ClaudeEffort = typeof CLAUDE_EFFORTS[number];
 export const DEFAULT_EFFORT: ClaudeEffort = 'high';

@@ -191,7 +191,7 @@ describe('claude', () => {
     const f = fakeFetch(() => sse(claudeMessage()));
     await claudeProvider({ key: runtimeKey('ak'), fetch: f.fetch }).complete(request());
     expect(f.calls[0]!.body.max_tokens).toBe(CLAUDE_MAX_TOKENS);
-    expect(CLAUDE_MAX_TOKENS).toBeGreaterThanOrEqual(16_000);
+    expect(CLAUDE_MAX_TOKENS).toBe(64_000); // always-on thinking at effort high counts toward it (final review batch 2, M6)
     expect(f.calls[0]!.body.stream).toBe(true); // streamed, as the SDK asks for large max_tokens
   });
 
