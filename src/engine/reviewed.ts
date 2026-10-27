@@ -18,7 +18,9 @@
 //   MUST_VERIFY repos record the signature check made when pinning (verifiedWith). The catalogue's tool locks: Trivy's
 //   three hardening flags, no jscpd --semantic, betterleaks with the pinned --config only, Nuclei with -duc and the
 //   pinned templates only, Scorecard without publish_results, dependency-review without PR comments, and no
-//   eslint-config-prettier / eslint-plugin-prettier. Plugins (npm or pip, exact and hashed, at most 4).
+//   eslint-config-prettier / eslint-plugin-prettier. Plugins (npm or pip, exact and hashed, at most 4). Task 6:
+//   betterleaks reports only to its output file with a fixed exit code; pypi-publish with attestations and never a
+//   password; hadolint off MUST_VERIFY (ruling P16).
 import { readFileSync } from 'node:fs';
 import { parse } from 'yaml';
 import { z } from 'zod';
@@ -190,9 +192,12 @@ export const NEVER_IMAGES: Readonly<Record<string, string>> = Object.freeze({
  * (runsTool) needs verifiedWith. jscpd is not on it (ruling P12): its releases are signed from a branch
  * (refs/heads/master), which verifiedWith's tag-only identity refuses; it is an advisory, warning-only check
  * (DECISIONS #93), pinned by the sha256 of the reviewed release asset, and its bundle is recorded as information only.
+ * hadolint is not on it either (ruling P16, the same reasoning): its v2.15.1 GitHub attestation is signed by
+ * `release.yml@refs/heads/master` (a push build of the tag's commit), so it has no tag identity to bind; it is pinned
+ * by the sha256 of the reviewed binary, and the attestation is recorded in its entry comment as information only.
  */
 export const MUST_VERIFY: ReadonlySet<string> = new Set([
-  'betterleaks/betterleaks', 'aquasecurity/trivy', 'hadolint/hadolint', 'stackrox/kube-linter', 'securego/gosec',
+  'betterleaks/betterleaks', 'aquasecurity/trivy', 'stackrox/kube-linter', 'securego/gosec',
 ]);
 
 /**
@@ -483,6 +488,9 @@ function entryProblems(e: Entry): { message: string; path: (string | number)[] }
   for (const [k, v] of Object.entries(want ?? {})) {
     if (fx.with?.[k] !== v) bad(`the ${c.repo} entry must fix ${k}: "${v}"`, 'fixedInputs', 'with', k);
   }
+  for (const [k, why] of Object.entries(FORBIDDEN_ACTION_INPUTS[repo] ?? {})) {
+    if ([...Object.keys(stepWith), ...Object.keys(fx.with ?? {}), ...Object.keys(e.choices)].some((x) => lower(x) === k)) bad(`the ${c.repo} entry may not set ${k}: ${why}`, 'step', 'action', 'with', k);
+  }
   return out;
 }
 
@@ -492,6 +500,17 @@ type Problem = { message: string; path: (string | number)[] };
 const FIXED_ACTION_INPUTS: Readonly<Record<string, Readonly<Record<string, string>>>> = {
   'ossf/scorecard-action': { publish_results: 'false' },
   'actions/dependency-review-action': { 'comment-summary-in-pr': 'never' },
+  // PyPI trusted publishing with attestations (Plan P Task 6)
+  'pypa/gh-action-pypi-publish': { attestations: 'true' },
+};
+
+/** Action inputs an entry may never set or offer as a choice, by lowercased repo → why. */
+const FORBIDDEN_ACTION_INPUTS: Readonly<Record<string, Readonly<Record<string, string>>>> = {
+  // a password (or user) means a long-lived PyPI token; pipegen publishes with trusted publishing (OIDC) only
+  'pypa/gh-action-pypi-publish': {
+    password: 'a long-lived PyPI token; pipegen publishes with trusted publishing (OIDC) only',
+    user: 'only used with a password (a long-lived PyPI token); pipegen publishes with trusted publishing (OIDC) only',
+  },
 };
 
 /** PS25: npm packages pipegen never adds (CVE-2025-54313). */
@@ -778,9 +797,25 @@ function betterleaksProblems(e: Entry): Problem[] {
     if (hit === undefined && p.errors.length > 0) bad(`betterleaks ${sub}: ${p.errors[0]} (pipegen reads the command with betterleaks v1.9.0's flags and refuses any it doesn't know)`, 'step', 'cli', 'command');
     if (hit === undefined && pa.errors.length > 0) bad(`betterleaks ${sub} fixedInputs.args: ${pa.errors[0]}`, 'fixedInputs', 'args');
     if ([...p.flags, ...pa.flags].some((f) => f.name === 'config')) bad(pinnedMsg, 'step', 'cli', 'command');
+    // --report-path: the entry's own output file only. `-` (or /dev/stdout, …) prints every finding, secret
+    // included, into the CI log (Task 5 carry-forward)
+    const outPath = e.step.output.path;
+    const paths = [...p.flags, ...pa.flags].filter((f) => f.name === 'report-path').map((f) => f.value);
+    if (paths.some((v) => v !== outPath || v === '-' || v.startsWith('/'))) {
+      bad(`betterleaks --report-path must be the entry's output file (${outPath || 'none'}), never - or a device: anything else can print the findings, secrets included, into the CI log`, 'step', 'cli', 'command');
+    }
+    // --exit-code: fixed by the template, in the command AND the fixed args (both or neither), the same value, and
+    // every value a plain non-zero number (no 0, 00, +0, 0x0: 0 would pass a scan that found secrets)
+    const codes = [...p.flags, ...pa.flags].filter((f) => f.name === 'exit-code').map((f) => f.value);
+    const code = lastValue(p, 'exit-code');
+    const fixedCode = lastValue(pa, 'exit-code');
+    if (code !== fixedCode || codes.some((v) => !/^[1-9]\d{0,2}$/.test(v))) {
+      bad('betterleaks --exit-code is a fixed arg: the same non-zero value in the command and fixedInputs.args, or in neither (0 would pass a scan that found secrets)', 'fixedInputs', 'args');
+    }
     out.push(...allowlistProblems('betterleaks', [p, pa], BETTERLEAKS_ALLOWED_FLAGS, '--', (n) => n === 'config' || forbidden.has(`--${n}`) || n.startsWith('validation')));
     out.push(...choiceProblems('betterleaks', e, (k) => (g.value.has(k) || g.bool.has(k) || g.optional.has(k)) && BETTERLEAKS_ALLOWED_FLAGS.has(k),
-      (k) => (k === 'config' ? pinnedMsg : forbidden.has(`--${k}`) || k.startsWith('validation') ? `betterleaks must never use --${k}` : null)));
+      (k) => (k === 'config' ? pinnedMsg : forbidden.has(`--${k}`) || k.startsWith('validation') ? `betterleaks must never use --${k}`
+        : k === 'exit-code' || k === 'report-path' ? `the AI may not choose betterleaks' --${k}: it is fixed by the template` : null)));
   }
   const pinned = fx.config !== undefined && 'flag' in fx.config.passAs && fx.config.passAs.flag === '--config';
   if (!pinned || (fx.args ?? []).some((a) => a === '-c' || /^-c./.test(a) || flagName(a) === 'config')) bad(pinnedMsg, 'fixedInputs', 'config');

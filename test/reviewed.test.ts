@@ -835,13 +835,14 @@ describe('loader rules (Plan P Task 5)', () => {
   });
 
   it('reviewed: MUST_VERIFY repo without verifiedWith refused', () => {
-    // ruling P12: jscpd is pinned by sha256 only (branch-signed release, advisory check, DEC #93)
-    expect([...MUST_VERIFY].sort()).toEqual(['aquasecurity/trivy', 'betterleaks/betterleaks', 'hadolint/hadolint', 'securego/gosec', 'stackrox/kube-linter']);
+    // ruling P12: jscpd is pinned by sha256 only (branch-signed release, advisory check, DEC #93); ruling P16: so is
+    // hadolint, whose v2.15.1 attestation is signed from refs/heads/master (no tag identity to bind it to)
+    expect([...MUST_VERIFY].sort()).toEqual(['aquasecurity/trivy', 'betterleaks/betterleaks', 'securego/gosec', 'stackrox/kube-linter']);
     expect(load([jscpdEntry({ verifiedWith: null })])).toHaveLength(1);
+    expect(load([binEntry('hadolint/hadolint', { id: 'hadolint', command: ['hadolint', '--format', 'sarif', 'Dockerfile'], verifiedWith: null })])).toHaveLength(1);
     const entries: Record<string, (v: Entry | null, repo?: string) => Entry> = {
       'aquasecurity/trivy': (v, repo) => trivyEntry({ verifiedWith: v, ...(repo === undefined ? {} : { repo }) }),
       'betterleaks/betterleaks': (v, repo) => (repo === undefined ? betterleaksEntry({ verifiedWith: v }) : { ...betterleaksEntry({ verifiedWith: v }), candidate: { ...betterleaksEntry().candidate, repo, name: repo } }),
-      'hadolint/hadolint': (v, repo) => binEntry(repo ?? 'hadolint/hadolint', { verifiedWith: v }),
       'stackrox/kube-linter': (v, repo) => binEntry(repo ?? 'stackrox/kube-linter', { verifiedWith: v }),
       'securego/gosec': (v, repo) => binEntry(repo ?? 'securego/gosec', { verifiedWith: v }),
     };
@@ -855,7 +856,7 @@ describe('loader rules (Plan P Task 5)', () => {
       expect(load([make(v)])[0]?.verifiedWith, repo).toEqual(v); // it stays on the ReviewedTool (PS24)
     }
     // found by what it runs, whatever the repo is called
-    rejects([binEntry('someone/scanner', { command: ['hadolint', 'Dockerfile'], args: [] })], /verifiedWith is required/);
+    rejects([binEntry('someone/scanner', { command: ['kube-linter', 'lint'], args: [] })], /verifiedWith is required/);
     // any entry may record one; it is checked the same way
     expect(load([binEntry('fine/tool', { verifiedWith: verified('fine/tool') })])[0]?.verifiedWith).toMatchObject({ method: 'cosign-bundle' });
     const hado = (over: Entry) => binEntry('hadolint/hadolint', { verifiedWith: verified('hadolint/hadolint', { identity: 'https://github.com/hadolint/hadolint/.github/workflows/haskell.yml@refs/tags/v1.0.0', ...over }) });
@@ -934,6 +935,23 @@ describe('loader rules (Plan P Task 5)', () => {
     }
   });
 
+  it('reviewed: pypi-publish never takes a password (trusted publishing only) and fixes attestations "true" (Task 6)', () => {
+    const pub = (w: Record<string, string>, choices: Entry = {}) => {
+      const a = actionEntry({ id: 'pypi-publish', repo: 'pypa/gh-action-pypi-publish', categories: ['publishing'] });
+      a.step.action.with = { ...w };
+      a.fixedInputs = { with: { ...w } };
+      a.choices = choices;
+      return a;
+    };
+    expect(load([pub({ attestations: 'true' })])).toHaveLength(1);
+    rejects([pub({})], /attestations/);
+    rejects([pub({ attestations: 'false' })], /attestations/);
+    const PW = ['pass', 'word'].join('');
+    rejects([pub({ attestations: 'true', [PW]: 'x' })], /password/);
+    rejects([pub({ attestations: 'true' }, { [PW]: ['x'] })], /password/);
+    rejects([pub({ attestations: 'true' }, { user: ['x'] })], /user/);
+  });
+
   it('reviewed: a pinnedOn in the future is refused (it would void the cooldown, probe #59); a PENDING look-alike is no reviewer (probe #60)', () => {
     const dir = makeTempDir();
     writeIn(dir, 'reviewed-tools.yml', stringify({ pinnedOn: '2099-01-01T00:00:00Z', tools: [cliEntry()] }));
@@ -967,8 +985,39 @@ describe('loader rules (Plan P Task 5)', () => {
     rejects([trivyEntry({ command: ['trivy', 'image', ...TRIVY_FLAGS, '--no-such', ...tail], args: [...TRIVY_FLAGS, '--no-such'] })], /unknown flag --no-such/);
     // allowlisted flags load (the Task 6 trivy-licence, image and betterleaks shapes)
     expect(load([trivyEntry({ command: ['trivy', 'fs', ...TRIVY_FLAGS, '--scanners', 'license', '--severity', 'HIGH,CRITICAL', '--exit-code', '1', '.'], args: TRIVY_FLAGS })])).toHaveLength(1);
-    expect(load([betterleaksEntry({ command: blCmd('--no-banner', '--redact', '--ignore-gitleaks-allow', '--exit-code', '1') })])).toHaveLength(1);
+    expect(load([betterleaksEntry({ command: blCmd('--no-banner', '--redact', '--ignore-gitleaks-allow', '--exit-code', '1'), args: ['--report-format', 'sarif', '--exit-code', '1'] })])).toHaveLength(1);
     expect(load([nucleiEntry({ command: nucleiCmd('-u', 'http://localhost:8080', '-ni', '-as') })])).toHaveLength(1);
+  });
+
+  it('reviewed: betterleaks --report-path is the output file, never - (findings with secrets to the CI log); --exit-code is a fixed arg (Task 5 carry-forward)', () => {
+    const cmd = (path: string, ...rest: string[]) => ['betterleaks', 'git', '--report-format', 'sarif', '--report-path', path, ...rest];
+    for (const path of ['-', '/dev/stdout', '/dev/stderr', '/proc/self/fd/1', 'other.sarif']) {
+      rejects([betterleaksEntry({ command: cmd(path) })], /--report-path/);
+      rejects([betterleaksEntry({ command: [...blCmd(), `--report-path=${path}`] })], /--report-path/); // a later value wins
+      rejects([betterleaksEntry({ command: [...blCmd(), '-r', path] })], /--report-path/);
+      rejects([betterleaksEntry({ command: [...blCmd(), '--report-path', path], args: ['--report-format', 'sarif', '--report-path', path] })], /--report-path/);
+    }
+    const dash = betterleaksEntry({ command: cmd('-') });
+    dash.step.output = { path: '-', format: 'sarif' };
+    rejects([dash], /--report-path/);
+    // --exit-code: set by the template (in the command and the fixed args, same value, not 0), never chosen by the AI
+    const fixed = ['--report-format', 'sarif', '--exit-code', '1'];
+    expect(load([betterleaksEntry({ command: blCmd('--exit-code', '1'), args: fixed })])).toHaveLength(1);
+    rejects([betterleaksEntry({ command: blCmd('--exit-code', '1') })], /--exit-code/); // not a fixed arg
+    rejects([betterleaksEntry({ command: blCmd('--exit-code', '1', '--exit-code', '0'), args: fixed })], /--exit-code/);
+    rejects([betterleaksEntry({ command: blCmd('--exit-code', '0'), args: ['--report-format', 'sarif', '--exit-code', '0'] })], /--exit-code/);
+    rejects([betterleaksEntry({ choices: { 'exit-code': ['0', '1'] } })], /exit-code/);
+    // security scan finding (fail-open): both sources are checked, not only the command
+    rejects([betterleaksEntry({ command: [...blCmd(), '--', '--exit-code', '0'], args: ['--report-format', 'sarif', '--exit-code', '0'] })], /--exit-code/); // fixed-only 0
+    rejects([betterleaksEntry({ command: [...blCmd(), '--', '--exit-code', '1'], args: ['--report-format', 'sarif', '--exit-code', '1'] })], /--exit-code/); // fixed-only 1
+    rejects([betterleaksEntry({ command: blCmd('--exit-code', '2'), args: ['--report-format', 'sarif'] })], /--exit-code/); // command-only
+    rejects([betterleaksEntry({ command: blCmd('--exit-code', '1', '--exit-code', '2'), args: ['--report-format', 'sarif', '--exit-code', '1'] })], /--exit-code/); // both, different
+    for (const zero of ['00', '+0', '0x0', '-0', ' 1', '1 ', '01']) {
+      rejects([betterleaksEntry({ command: blCmd('--exit-code', zero), args: ['--report-format', 'sarif', '--exit-code', zero] })], /--exit-code/);
+      rejects([betterleaksEntry({ command: blCmd(`--exit-code=${zero}`), args: ['--report-format', 'sarif', `--exit-code=${zero}`] })], /--exit-code/);
+    }
+    // an earlier 0 overridden by a later 1 is still refused (every value must be non-zero)
+    rejects([betterleaksEntry({ command: blCmd('--exit-code', '0', '--exit-code', '1'), args: ['--report-format', 'sarif', '--exit-code', '0', '--exit-code', '1'] })], /--exit-code/);
   });
 
   it('reviewed: betterleaks --redact takes an optional value, as pflag reads it (NoOptDefVal "100", v1.9.0 cmd/root.go:95)', () => {
