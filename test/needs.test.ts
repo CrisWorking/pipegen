@@ -3,8 +3,10 @@ import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { AiError } from '../src/ai/provider.js';
 import { bundleCode, bundleText, GitleaksRequiredError, type CodeBundle } from '../src/ai/redact.js';
 import {
-  deployApprovalRule, floorNeeds, isRunnable, jobCategories, jobCounts, NEED_ID_CATEGORY, NEED_IDS, needsSchema, planNeeds,
+  deployApprovalRule, floorNeeds, isRunnable, jobCategories, jobCounts, JOB_GROUP, NEED_ID_CATEGORY, NEED_IDS, needsSchema, needWhy, planNeeds, skippedChecks,
 } from '../src/engine/needs.js';
+import { AI_ONLY_IDS, REPO_WIDE_CATEGORIES, SCHEDULED_CATEGORIES } from '../src/engine/need-ids.js';
+import { needLabel } from '../src/audit/model.js';
 import { readProject } from '../src/read/project.js';
 import {
   DEFAULT_MODEL, FLOOR_NEEDS, NEED_CATEGORIES, type AiProvider, type AiRequest, type AiUsage, type Capabilities, type ExistingWorkflow, type Layer,
@@ -23,7 +25,7 @@ const svc = (over: Partial<Service> = {}): Service => ({
   name: 'app', path: '.', language: 'node', packageManager: 'npm', hasTests: true, envVars: [], dependsOn: [], scripts: [], frameworks: [], quality: emptyServiceQuality(), ...over,
 });
 /** A runnable Node service (start script + express). */
-const web = (over: Partial<Service> = {}) => svc({ name: 'web', scripts: ['start', 'test'], frameworks: ['express'], ...over });
+const web = (over: Partial<Service> = {}) => svc({ name: 'web', scripts: ['start', 'test'], frameworks: ['express'], quality: { ...emptyServiceQuality(), tsconfig: true }, ...over });
 /** A library: only build and test scripts. */
 const lib = (over: Partial<Service> = {}) => svc({ name: 'lib', scripts: ['build', 'test'], ...over });
 
@@ -66,7 +68,7 @@ function mockAi(answer: unknown | ((req: AiRequest, i: number) => unknown)) {
 }
 
 const quiet = { add: [], skipLayers: [], requireDeployApproval: false };
-const addNeed = (over: Record<string, unknown>) => ({ id: 'type-check', layer: 'push', category: 'lint', service: 'web', why: 'Catches type errors early.', blocking: true, ...over });
+const addNeed = (over: Record<string, unknown>) => ({ id: 'type-check', layer: 'push', category: 'type-check', service: 'web', why: 'Catches type errors early.', blocking: true, ...over });
 
 // ---------- a gitleaks-checked bundle (stub gitleaks) ----------
 
@@ -111,6 +113,11 @@ describe('needs schema', () => {
       ...floorNeeds(profile({ services: [web(), lib()], terraformDirs: ['infra'], existingWorkflows: [deployWorkflow] }), PUBLIC),
       ...floorNeeds(profile({ private: true, plan: 'enterprise' }), capsFor('enterprise')),
       ...floorNeeds(profile({ private: true, plan: 'team' }), capsFor('team')),
+      // Plan P: one profile that turns every new check on
+      ...floorNeeds(profile({
+        services: [web({ dockerfile: 'Dockerfile', quality: { ...emptyServiceQuality(), tsconfig: true, fuzzTargets: true, configs: ['knip'], apiSpec: { kind: 'file', path: 'openapi.yaml' } } })],
+        existingWorkflows: [deployWorkflow, publishWorkflow()],
+      }), PUBLIC),
     ];
     const cats: readonly string[] = NEED_CATEGORIES;
     for (const n of all) {
@@ -125,9 +132,6 @@ describe('needs schema', () => {
   it('NEED_ID_CATEGORY: floor ids map to themselves; AI-only ids map to fixed categories; covers NEED_IDS exactly', () => {
     expect(Object.keys(NEED_ID_CATEGORY).sort()).toEqual([...NEED_IDS].sort());
     for (const c of NEED_CATEGORIES) expect(NEED_ID_CATEGORY[c]).toBe(c);
-    expect(NEED_ID_CATEGORY['type-check']).toBe('lint');
-    expect(NEED_ID_CATEGORY['dockerfile-lint']).toBe('lint');
-    expect(NEED_ID_CATEGORY['license-scan']).toBe('deps');
     expect(NEED_ID_CATEGORY['migration-check']).toBe('full-tests');
   });
 });
@@ -165,8 +169,9 @@ describe('floor', () => {
     const merge = needs.filter((n) => n.layer === 'merge').map((n) => `${n.id}|${n.service ?? ''}`);
     for (const k of push) expect(merge).toContain(k);
     expect(merge).toContain('full-tests|web');
-    expect(ids(needs, 'push').sort()).toEqual(['deps', 'hooks-ci', 'lint', 'sast', 'secrets', 'unit-tests']);
-    expect(needs.filter((n) => n.layer === 'push').every((n) => n.blocking)).toBe(true);
+    // the older push set, plus the Plan P quality checks that apply to a TypeScript service with tests
+    expect(ids(needs, 'push').sort()).toEqual(['coverage', 'dead-code', 'deps', 'format', 'hooks-ci', 'lint', 'sast', 'secrets', 'type-check', 'unit-tests', 'workflow-lint', 'workflow-pin-check']);
+    expect(needs.filter((n) => n.layer === 'push' && n.id !== 'dead-code').every((n) => n.blocking)).toBe(true); // dead-code blocks only with a knip config
     expect(ids(needs, 'deploy')).toEqual(expect.arrayContaining(['sbom', 'deploy-verify']));
     // every why is plain English
     for (const n of needs) expect(n.why).toMatch(/^[A-Z][^\n]{10,200}\.$/);
@@ -217,7 +222,7 @@ describe('floor', () => {
   it('floor: private free repo → no signing need', () => {
     const needs = floorNeeds(profile({ private: true, plan: 'free' }), capsFor('free'));
     expect(needs.some((n) => n.id === 'signing' || n.id === 'attestation')).toBe(false);
-    expect(ids(needs, 'deploy').sort()).toEqual(['deploy-verify', 'sbom']); // the rest of the deploy layer stays
+    expect(ids(needs, 'deploy').sort()).toEqual(['deploy-verify', 'egress', 'sbom']); // the rest of the deploy layer stays
   });
 
   it('floor: hooks need in pre-commit and hooks-ci in push', () => {
@@ -259,17 +264,17 @@ describe('jobCounts', () => {
     const needs = floorNeeds(profile({ terraformDirs: ['infra'] }), PUBLIC);
     const c = jobCounts(needs);
     expect(c['pre-commit']).toBe(0);
-    expect(c.push).toBe(6);    // hooks-ci, secrets, sast, deps, unit-tests, lint
-    expect(c.merge).toBe(12);  // push 6 + full-tests + gate + image-build, image-scan, dast + iac
+    expect(c.push).toBe(7);    // hooks-ci, secrets, sast, deps, unit-tests, lint + workflow-lint (format, type-check, dead-code, coverage and the pin check share jobs)
+    expect(c.merge).toBe(16);  // push 7 + full-tests + gate + image-build, image-scan, dast + iac + duplication, dependency-review, licences
     expect(c.deploy).toBe(4);  // sbom, deploy-verify, signing, attestation
     // merge-layer scanners: secrets, sast, deps, image-scan, dast, iac = 6, + the image build the image scan and
     // DAST need (S5's real nightly built it, final review M8), + the nightly job itself
-    expect(c.nightly).toBe(8);
+    expect(c.nightly).toBe(9); // + scorecard (public repo): counted only in the nightly
     expect(Object.keys(c).sort()).toEqual(['deploy', 'merge', 'nightly', 'pre-commit', 'push']);
     // two services: per-service needs count twice, repo-wide ones once
     const two = jobCounts(floorNeeds(profile({ services: [web(), lib()] }), PUBLIC));
-    expect(two.push).toBe(2 + 4 * 2);   // hooks-ci, secrets + (sast, deps, unit-tests, lint) × 2
-    expect(two.nightly).toBe(1 + 2 * 2 + 3 + 1); // secrets + (sast, deps) × 2 + web's image-build, image-scan and dast + nightly
+    expect(two.push).toBe(2 + 4 * 2 + 1);   // hooks-ci, secrets + (sast, deps, unit-tests, lint) × 2 + workflow-lint
+    expect(two.nightly).toBe(1 + 2 * 2 + 3 + 1 + 1); // scorecard + secrets + (sast, deps) × 2 + web's image-build, image-scan and dast + nightly
     expect(jobCounts([]).nightly).toBe(1);
   });
 
@@ -396,22 +401,22 @@ describe('planNeeds', () => {
     const ai = mockAi({
       ...quiet,
       add: [
-        addNeed({}),
-        addNeed({ id: 'license-scan', category: 'deps', layer: 'merge', service: null, blocking: false, why: 'Flags licences the project may not use.' }),
+        addNeed({ layer: 'deploy' }),
+        addNeed({ id: 'deps', category: 'deps', layer: 'merge', service: null, blocking: false, why: 'Flags licences the project may not use.' }),
         addNeed({ id: 'migration-check', category: 'lint', layer: 'merge', service: 'web' }), // table says full-tests
-        addNeed({}), // a repeat of the first: kept once
-        addNeed({ id: 'dockerfile-lint', layer: 'merge', service: 'lib', blocking: false, why: 'Lints the Dockerfile.' }),
+        addNeed({ layer: 'deploy' }), // a repeat of the first: kept once
+        addNeed({ id: 'format', category: 'format', layer: 'deploy', blocking: false, why: 'Formats the code.' }),
       ],
     });
     const r = await planNeeds(p, PUBLIC, bundle, ai.p, 0);
     const floor = floorNeeds(p, PUBLIC);
     const added = r.needs.slice(floor.length);
     expect(added).toEqual([
-      { id: 'type-check', layer: 'push', category: 'lint', service: 'web', why: 'Catches type errors early.', blocking: true, floor: false },
+      { id: 'type-check', layer: 'deploy', category: 'type-check', service: 'web', why: 'Catches type errors early.', blocking: true, floor: false },
       // deps is a FLOOR_NEEDS category: forced blocking, whatever the AI said
-      { id: 'license-scan', layer: 'merge', category: 'deps', why: 'Flags licences the project may not use.', blocking: true, floor: false },
-      // lint is not: the AI's blocking choice is kept
-      { id: 'dockerfile-lint', layer: 'merge', category: 'lint', service: 'lib', why: 'Lints the Dockerfile.', blocking: false, floor: false },
+      { id: 'deps', layer: 'merge', category: 'deps', why: 'Flags licences the project may not use.', blocking: true, floor: false },
+      // format is not: the AI's blocking choice is kept
+      { id: 'format', layer: 'deploy', category: 'format', service: 'web', why: 'Formats the code.', blocking: false, floor: false },
     ]);
     expect('service' in added[1]!).toBe(false); // repo-wide: no service key
     expect(r.notes.join('\n')).toMatch(/migration-check/);
@@ -456,12 +461,12 @@ describe('planNeeds', () => {
 
   it('planNeeds: AI text (why, skip reasons) cleaned before it is kept or shown', async () => {
     const ai = mockAi({
-      add: [addNeed({ why: `Checks types ${hostileNames.osc8Link} ${hostileNames.bidiOverride}\nnow` }), addNeed({ id: 'dockerfile-lint', category: 'lint', layer: 'merge', why: '' })],
+      add: [addNeed({ layer: 'deploy', why: `Checks types ${hostileNames.osc8Link} ${hostileNames.bidiOverride}\nnow` }), addNeed({ id: 'format', category: 'format', layer: 'deploy', why: '' })],
       skipLayers: [{ layer: 'merge', reason: `${hostileNames.screenClear} ${hostileNames.veryLong}` }, { layer: 'deploy', reason: hostileNames.nulAndCr }],
       requireDeployApproval: false,
     });
     const r = await planNeeds(profile({ services: [web()] }), PUBLIC, bundle, ai.p, 0);
-    const added = r.needs.filter((n) => !n.floor && (n.id === 'type-check' || n.id === 'dockerfile-lint'));
+    const added = r.needs.filter((n) => n.layer === 'deploy' && (n.id === 'type-check' || n.id === 'format'));
     expect(added).toHaveLength(2);
     // eslint-disable-next-line no-control-regex
     const unsafe = /[\u0000-\u001f\u007f-\u009f\u202a-\u202e\u2066-\u2069\u200e\u200f\u061c]/;
@@ -516,13 +521,13 @@ describe('planNeeds', () => {
         addNeed({ id: 'dast', category: 'dast', layer: 'push', service: null }),                // repo-wide: refused
         addNeed({ id: 'image-scan', category: 'image-scan', layer: 'push', service: 'web' }),    // runnable: accepted
         addNeed({ id: 'sbom', category: 'sbom', layer: 'deploy', service: 'lib' }),               // deploy layer covers web only: refused
-        addNeed({ id: 'license-scan', category: 'deps', layer: 'deploy', service: null }),        // repo-wide deploy addition: refused
-        addNeed({ id: 'license-scan', category: 'deps', layer: 'deploy', service: 'web' }),       // accepted
+        addNeed({ id: 'deps', category: 'deps', layer: 'deploy', service: null }),                // repo-wide deploy addition: refused
+        addNeed({ id: 'deps', category: 'deps', layer: 'deploy', service: 'web' }),               // accepted
       ],
     });
     const r = await planNeeds(p, PUBLIC, bundle, ai.p, 0);
     const added = r.needs.slice(floorNeeds(p, PUBLIC).length);
-    expect(added.map((n) => `${n.layer}|${n.id}|${n.service ?? ''}`)).toEqual(['push|image-scan|web', 'deploy|license-scan|web']);
+    expect(added.map((n) => `${n.layer}|${n.id}|${n.service ?? ''}`)).toEqual(['push|image-scan|web', 'deploy|deps|web']);
     const text = r.notes.join('\n');
     expect(text).toContain('image-scan in merge for lib');
     expect(text).toContain('dast in push');
@@ -558,13 +563,13 @@ describe('planNeeds', () => {
       ...quiet,
       add: [
         addNeed({ layer: 'pre-commit', service: 'lib' }),
-        addNeed({ id: 'license-scan', category: 'deps', layer: 'deploy', service: 'lib' }), // a library has no deploy layer
-        addNeed({ layer: 'merge', service: 'lib' }), // fine
+        addNeed({ id: 'deps', category: 'deps', layer: 'deploy', service: 'lib' }), // a library has no deploy layer
+        addNeed({ id: 'deps', category: 'deps', layer: 'merge', service: null }), // fine
       ],
     });
     const r = await planNeeds(library, PUBLIC, bundle, ai.p, 0);
     const added = r.needs.slice(floorNeeds(library, PUBLIC).length);
-    expect(added.map((n) => `${n.layer}|${n.id}`)).toEqual(['merge|type-check']);
+    expect(added.map((n) => `${n.layer}|${n.id}`)).toEqual(['merge|deps']);
     expect(r.needs.some((n) => n.layer === 'deploy')).toBe(false);
     expect(r.notes.join('\n')).toMatch(/pre-commit/);
     expect(r.notes.join('\n')).toMatch(/deploy/);
@@ -573,26 +578,26 @@ describe('planNeeds', () => {
   it('planNeeds: links are removed from AI text', async () => {
     const ai = mockAi({
       ...quiet,
-      add: [addNeed({ why: 'See https://evil.example/x?a=1 and HTTP://Evil.example/y for details.' })],
+      add: [addNeed({ layer: 'deploy', why: 'See https://evil.example/x?a=1 and HTTP://Evil.example/y for details.' })],
       skipLayers: [{ layer: 'merge', reason: 'Docs at http://evil.example/z say so.' }],
     });
     const r = await planNeeds(profile(), PUBLIC, bundle, ai.p, 0);
-    const why = r.needs.find((n) => n.id === 'type-check')!.why;
+    const why = r.needs.find((n) => n.id === 'type-check' && n.layer === 'deploy')!.why;
     expect(why).toBe('See (link removed) and (link removed) for details.');
     expect(r.notes.join('\n')).not.toMatch(/evil\.example/);
     expect(r.notes.join('\n')).toContain('(link removed)');
     // a link split by a control character is still caught (the text is cleaned, then checked again)
-    const r2 = await planNeeds(profile(), PUBLIC, bundle, mockAi({ ...quiet, add: [addNeed({ why: 'Go to ht\u0000tps://evil.example now.' })] }).p, 0);
-    expect(r2.needs.find((n) => n.id === 'type-check')!.why).not.toMatch(/evil\.example/);
+    const r2 = await planNeeds(profile(), PUBLIC, bundle, mockAi({ ...quiet, add: [addNeed({ layer: 'deploy', why: 'Go to ht\u0000tps://evil.example now.' })] }).p, 0);
+    expect(r2.needs.find((n) => n.id === 'type-check' && n.layer === 'deploy')!.why).not.toMatch(/evil\.example/);
   });
 
   it('planNeeds: a flood of AI suggestions is bounded (200 adds, 50 skips)', async () => {
     const names = ['s1', 's2', 's3', 's4', 's5'];
     const p = profile({ services: names.map((name) => web({ name })) });
-    const aiIds = [['type-check', 'lint'], ['dockerfile-lint', 'lint'], ['license-scan', 'deps'], ['migration-check', 'full-tests']] as const;
+    const aiIds = [['type-check', 'type-check'], ['format', 'format'], ['deps', 'deps'], ['migration-check', 'full-tests']] as const;
     const valid = Array.from({ length: 200 }, (_, i) => {
       const [id, category] = aiIds[i % 4]!;
-      return addNeed({ id, category, layer: ['push', 'merge'][Math.floor(i / 4) % 2], service: [...names, null][Math.floor(i / 8) % 6], why: `Reason ${i}.` });
+      return addNeed({ id, category, layer: 'deploy', service: names[Math.floor(i / 4) % 5], why: `Reason ${i}.` });
     });
     const skips = Array.from({ length: 50 }, (_, i) => ({ layer: (['merge', 'push', 'pre-commit', 'deploy'] as const)[i % 4], reason: `Skip ${i}.` }));
     const r = await planNeeds(p, PUBLIC, bundle, mockAi({ ...quiet, add: valid, skipLayers: skips }).p, 0);
@@ -671,5 +676,302 @@ describe('planNeeds', () => {
     const summary = JSON.parse(inner);
     expect(summary.services.map((s: { name: string }) => s.name)).toEqual(names);
     expect(summary.floorNeeds.length).toBeGreaterThan(100);
+  });
+});
+
+// ---------- Plan P Task 2: the new checks ----------
+
+const PLAN_P = ['format', 'type-check', 'coverage', 'dead-code', 'duplication', 'dockerfile-lint', 'workflow-lint', 'workflow-pin-check', 'dependency-review', 'licences', 'api-dast', 'publishing', 'egress', 'update-config', 'scorecard', 'fuzzing'] as const;
+const withQuality = (over: Partial<Service['quality']>): Service['quality'] => ({ ...emptyServiceQuality(), ...over });
+const PRIVATE_SCANNING: Capabilities = { ...capsFor('team'), codeScanning: true };
+const publishWorkflow = (): ExistingWorkflow => ({ ...workflow('.github/workflows/release.yml', false, ['publish']), publishes: ['npm'] }) as ExistingWorkflow;
+const skipFor = (p: RepoProfile, caps: Capabilities, category: string, service?: string) =>
+  skippedChecks(p, caps).filter((s) => s.category === category && s.service === service);
+
+describe('floor: Plan P checks', () => {
+  it('floor: each Plan P category is in floorNeeds or skippedChecks for every service, never both', () => {
+    const profiles: [RepoProfile, Capabilities][] = [
+      [profile({ services: [web(), lib(), svc({ name: 'py', language: 'python', packageManager: 'pip' }), svc({ name: 'other', language: 'other', packageManager: undefined, hasTests: false })] }), PUBLIC],
+      [profile({ private: true, services: [web({ dockerfile: 'Dockerfile', quality: withQuality({ tsconfig: true, fuzzTargets: true, apiSpec: { kind: 'file', path: 'openapi.yaml' } }) }), lib()],
+        existingWorkflows: [publishWorkflow(), deployWorkflow] }), capsFor('free')],
+      [profile({ services: [] }), PUBLIC],
+    ];
+    for (const [p, caps] of profiles) {
+      const needs = floorNeeds(p, caps);
+      const skipped = skippedChecks(p, caps);
+      for (const category of PLAN_P) {
+        const targets: (string | undefined)[] = p.services.length > 0 ? p.services.map((s) => s.name) : [undefined];
+        for (const service of targets) {
+          const inNeeds = needs.some((n) => n.category === category && (n.service === service || n.service === undefined));
+          const inSkipped = skipped.some((s) => s.category === category && (s.service === service || s.service === undefined));
+          expect(inNeeds || inSkipped, `${category} ${service ?? 'repo'}: neither`).toBe(true);
+          // both only when a repo-wide need sits next to a per-service skip (never the same service)
+          const needHere = needs.some((n) => n.category === category && n.service === service);
+          const skipHere = skipped.some((s) => s.category === category && s.service === service);
+          expect(needHere && skipHere, `${category} ${service ?? 'repo'}: both`).toBe(false);
+          if (service === undefined) expect(inNeeds && inSkipped, `${category} repo: both`).toBe(false);
+        }
+      }
+      for (const s of skipped) expect(s.why.length, `${s.category} why`).toBeGreaterThan(5);
+      expect(new Set(skipped.map((s) => `${s.category}|${s.service ?? ''}`)).size).toBe(skipped.length);
+    }
+  });
+
+  it('floor: python service without type hints → no type-check need; skippedChecks says how to turn it on', () => {
+    const py = svc({ name: 'py', language: 'python', packageManager: 'pip' });
+    const p = profile({ services: [py] });
+    expect(floorNeeds(p, PUBLIC).filter((n) => n.id === 'type-check')).toEqual([]);
+    expect(skipFor(p, PUBLIC, 'type-check', 'py')).toEqual([{ category: 'type-check', service: 'py', why: 'no type checker config or py.typed: add a mypy config to turn this on' }]);
+    const typed = profile({ services: [{ ...py, quality: withQuality({ pythonTyped: true }) }] });
+    expect(find(floorNeeds(typed, PUBLIC), 'push', 'type-check', 'py')).toHaveLength(1);
+    expect(skipFor(typed, PUBLIC, 'type-check', 'py')).toEqual([]);
+  });
+
+  it('floor: TS service → type-check on push and merge; JS-only service → skipped', () => {
+    const ts = web({ quality: withQuality({ tsconfig: true }) });
+    const byVersion = lib({ name: 'ver', quality: withQuality({ versions: { typescript: '5.4.5' } }) });
+    const js = lib({ name: 'js' });
+    const p = profile({ services: [ts, byVersion, js] });
+    const needs = floorNeeds(p, PUBLIC);
+    for (const name of ['web', 'ver']) for (const layer of ['push', 'merge'] as const) expect(find(needs, layer, 'type-check', name), `${name} ${layer}`).toHaveLength(1);
+    expect(needs.filter((n) => n.id === 'type-check' && n.service === 'js')).toEqual([]);
+    expect(skipFor(p, PUBLIC, 'type-check', 'js')).toHaveLength(1);
+    expect(find(needs, 'pre-commit', 'type-check', 'web')).toHaveLength(0);
+  });
+
+  it('floor: no Dockerfile → dockerfile-lint skipped; Dockerfile → dockerfile-lint on push and merge', () => {
+    const none = profile({ services: [web()] });
+    expect(floorNeeds(none, PUBLIC).some((n) => n.id === 'dockerfile-lint')).toBe(false);
+    expect(skipFor(none, PUBLIC, 'dockerfile-lint', 'web')[0]?.why).toMatch(/Dockerfile/);
+    const withFile = profile({ services: [web({ dockerfile: 'Dockerfile' })] });
+    for (const layer of ['push', 'merge'] as const) expect(find(floorNeeds(withFile, PUBLIC), layer, 'dockerfile-lint', 'web')).toHaveLength(1);
+  });
+
+  it('floor: public → scorecard; private without code scanning → skipped with why; private with it → scorecard', () => {
+    expect(find(floorNeeds(profile({ private: false }), capsFor('free')), 'merge', 'scorecard')).toHaveLength(1);
+    const priv = profile({ private: true });
+    expect(floorNeeds(priv, capsFor('team')).some((n) => n.id === 'scorecard')).toBe(false);
+    expect(skipFor(priv, capsFor('team'), 'scorecard')).toEqual([{ category: 'scorecard', why: 'Scorecard needs GitHub code scanning on private repos' }]);
+    expect(find(floorNeeds(priv, PRIVATE_SCANNING), 'merge', 'scorecard')).toHaveLength(1);
+    expect(skipFor(priv, PRIVATE_SCANNING, 'scorecard')).toEqual([]);
+  });
+
+  it('floor: no API spec → api-dast skipped with the export hint; fastapi → api-dast for the runnable service', () => {
+    const noSpec = profile({ services: [web()] });
+    expect(floorNeeds(noSpec, PUBLIC).some((n) => n.id === 'api-dast')).toBe(false);
+    expect(skipFor(noSpec, PUBLIC, 'api-dast', 'web')).toEqual([{ category: 'api-dast', service: 'web', why: 'no API spec found: export an OpenAPI file to turn on API testing' }]);
+    const fastapi = svc({ name: 'api', language: 'python', packageManager: 'pip', frameworks: ['fastapi'], quality: withQuality({ apiSpec: { kind: 'served', by: 'fastapi' } }) });
+    const p = profile({ services: [fastapi, lib({ quality: withQuality({ apiSpec: { kind: 'file', path: 'lib/openapi.yaml' } }) })] });
+    const needs = floorNeeds(p, PUBLIC);
+    expect(find(needs, 'merge', 'api-dast', 'api')).toHaveLength(1);
+    expect(needs.filter((n) => n.id === 'api-dast').map(key)).toEqual(['merge|api-dast|api']); // merge only, and not for the library
+    expect(skipFor(p, PUBLIC, 'api-dast', 'lib')[0]?.why).toMatch(/run/i);
+  });
+
+  it('floor: duplication repo-wide, merge only, blocking false; dead-code blocking only with a knip config', () => {
+    const p = profile({ services: [web({ quality: withQuality({ configs: ['knip'] }) }), lib()] });
+    const needs = floorNeeds(p, PUBLIC);
+    expect(needs.filter((n) => n.id === 'duplication').map((n) => [key(n), n.blocking, n.floor])).toEqual([['merge|duplication|', false, false]]);
+    const dead = needs.filter((n) => n.id === 'dead-code');
+    expect(dead.map((n) => [key(n), n.blocking])).toEqual([['push|dead-code|web', true], ['merge|dead-code|web', true], ['push|dead-code|lib', false], ['merge|dead-code|lib', false]]);
+    expect(floorNeeds(profile({ services: [] }), PUBLIC).some((n) => n.id === 'duplication')).toBe(false);
+    expect(skipFor(profile({ services: [] }), PUBLIC, 'duplication')).toHaveLength(1);
+  });
+
+  it('floor: k8s manifests without Terraform → iac', () => {
+    const k8s = profile({ repoFiles: { ...emptyRepoFiles(), kubernetes: true } });
+    expect(find(floorNeeds(k8s, PUBLIC), 'merge', 'iac')).toHaveLength(1);
+    const none = profile();
+    expect(floorNeeds(none, PUBLIC).some((n) => n.id === 'iac')).toBe(false);
+    expect(skipFor(none, PUBLIC, 'iac')).toEqual([{ category: 'iac', why: 'no Terraform or Kubernetes files found' }]);
+    expect(skipFor(k8s, PUBLIC, 'iac')).toEqual([]);
+  });
+
+  it('floor: scheduled checks are on the merge layer and in SCHEDULED_CATEGORIES', () => {
+    expect([...SCHEDULED_CATEGORIES].sort()).toEqual(['fuzzing', 'scorecard', 'update-config']);
+    const p = profile({ services: [web({ quality: withQuality({ fuzzTargets: true }) })] });
+    const needs = floorNeeds(p, PUBLIC);
+    for (const c of SCHEDULED_CATEGORIES) {
+      const mine = needs.filter((n) => n.category === c);
+      expect(mine.length, c).toBeGreaterThan(0);
+      expect(new Set(mine.map((n) => n.layer)), c).toEqual(new Set(['merge']));
+      expect(mine.every((n) => !n.blocking && !n.floor), c).toBe(true);
+    }
+    expect(find(needs, 'merge', 'fuzzing', 'web')).toHaveLength(1);
+    expect(skipFor(profile(), PUBLIC, 'fuzzing', 'web')).toHaveLength(1);
+  });
+
+  it('floor: the repo-wide set matches the table, and every repo-wide check is planned once with no service', () => {
+    expect([...REPO_WIDE_CATEGORIES].sort()).toEqual(['dependency-review', 'duplication', 'gate', 'hooks', 'hooks-ci', 'iac', 'licences', 'scorecard', 'secrets', 'update-config', 'workflow-lint', 'workflow-pin-check'].sort());
+    const needs = floorNeeds(profile({ services: [web(), lib()], terraformDirs: ['infra'] }), PUBLIC);
+    for (const n of needs) if (REPO_WIDE_CATEGORIES.has(n.category as never)) expect(n.service, key(n)).toBeUndefined();
+  });
+
+  it('floor: workflow checks and the supply-chain checks follow the table', () => {
+    const needs = floorNeeds(profile({ services: [web(), lib({ packageManager: undefined, language: 'other' })] }), PUBLIC);
+    for (const id of ['workflow-lint', 'workflow-pin-check']) for (const layer of ['push', 'merge'] as const) expect(find(needs, layer, id), `${id} ${layer}`).toHaveLength(1);
+    for (const id of ['dependency-review', 'licences']) expect(needs.filter((n) => n.id === id).map(key), id).toEqual([`merge|${id}|`]);
+    const noPm = profile({ services: [lib({ packageManager: undefined })] });
+    expect(floorNeeds(noPm, PUBLIC).some((n) => n.id === 'licences')).toBe(false);
+    expect(skipFor(noPm, PUBLIC, 'licences')).toHaveLength(1);
+    expect(find(needs, 'merge', 'update-config')).toHaveLength(1);
+  });
+
+  it('floor: coverage needs tests; format is for node, python and go', () => {
+    const p = profile({ services: [web(), lib({ name: 'notests', hasTests: false }), svc({ name: 'j', language: 'java' })] });
+    const needs = floorNeeds(p, PUBLIC);
+    expect(needs.filter((n) => n.id === 'coverage' && n.layer === 'merge').map((n) => n.service)).toEqual(['web', 'j']);
+    expect(skipFor(p, PUBLIC, 'coverage', 'notests')).toEqual([{ category: 'coverage', service: 'notests', why: 'no tests found' }]);
+    expect(needs.filter((n) => n.id === 'format' && n.layer === 'push').map((n) => n.service)).toEqual(['web', 'notests']);
+    expect(skipFor(p, PUBLIC, 'format', 'j')).toHaveLength(1);
+    expect(needs.filter((n) => n.id === 'format' || n.id === 'type-check').every((n) => n.blocking)).toBe(true);
+    for (const lang of ['python', 'go'] as const) expect(floorNeeds(profile({ services: [svc({ language: lang })] }), PUBLIC).some((n) => n.id === 'format')).toBe(true);
+  });
+
+  it('floor: publishing follows a publishing workflow (PS7) even with no deploy; egress follows the same targets', () => {
+    const lonely = profile({ services: [lib({ publishedPackage: true })], existingWorkflows: [publishWorkflow()] });
+    const needs = floorNeeds(lonely, PUBLIC);
+    expect(needs.filter((n) => n.layer === 'deploy').map(key)).toEqual(['deploy|publishing|lib', 'deploy|egress|lib']);
+    expect(needs.filter((n) => n.layer === 'deploy').every((n) => n.blocking && !n.floor)).toBe(true);
+    // no single published service: repo-wide
+    const many = profile({ services: [lib(), lib({ name: 'lib2', path: 'b' })], existingWorkflows: [publishWorkflow()] });
+    expect(floorNeeds(many, PUBLIC).filter((n) => n.layer === 'deploy').map(key)).toEqual(['deploy|publishing|', 'deploy|egress|']);
+    // a real deploy layer: egress for each deploy target
+    const both = profile({ services: [web(), lib({ publishedPackage: true })], existingWorkflows: [deployWorkflow, publishWorkflow()] });
+    const deploy = floorNeeds(both, PUBLIC).filter((n) => n.layer === 'deploy');
+    expect(deploy.filter((n) => n.id === 'egress').map((n) => n.service)).toEqual(['web']);
+    expect(deploy.filter((n) => n.id === 'publishing').map((n) => n.service)).toEqual(['lib']);
+    // nothing publishes, nothing deploys: skipped, no deploy layer
+    const none = profile({ services: [lib()] });
+    expect(floorNeeds(none, PUBLIC).some((n) => n.layer === 'deploy')).toBe(false);
+    expect(skipFor(none, PUBLIC, 'publishing')).toHaveLength(1);
+    expect(skipFor(none, PUBLIC, 'egress')).toHaveLength(1);
+    expect(skipFor(lonely, PUBLIC, 'egress')).toEqual([]);
+    // a runnable service with a deploy layer but nothing publishing: egress yes, publishing skipped
+    const run = profile({ services: [web()] });
+    expect(find(floorNeeds(run, PUBLIC), 'deploy', 'egress', 'web')).toHaveLength(1);
+    expect(skipFor(run, PUBLIC, 'publishing')).toHaveLength(1);
+  });
+
+  it('floor: skippedChecks is deterministic and its order follows the table', () => {
+    const p = profile({ services: [web(), lib()] });
+    expect(skippedChecks(p, capsFor('team'))).toEqual(skippedChecks(structuredClone(p), capsFor('team')));
+    expect(floorNeeds(p, PUBLIC)).toEqual(floorNeeds(structuredClone(p), PUBLIC));
+  });
+
+  it('floor: the old floor is unchanged (secrets, sast, deps, tests and gate keep floor true; new checks are never floor)', () => {
+    const needs = floorNeeds(profile({ terraformDirs: ['infra'] }), PUBLIC);
+    for (const n of needs) expect(n.floor, key(n)).toBe(FLOOR_NEEDS.includes(n.category));
+    expect(needs.find((n) => n.id === 'format-lint')!.blocking).toBe(false);
+  });
+});
+
+describe('Plan P: tables', () => {
+  it('NEED_ID_CATEGORY: AI_ONLY_IDS is migration-check only; every new category maps to itself', () => {
+    expect([...AI_ONLY_IDS]).toEqual(['migration-check']);
+    for (const c of PLAN_P) {
+      expect(NEED_CATEGORIES).toContain(c);
+      expect(NEED_ID_CATEGORY[c]).toBe(c);
+    }
+    expect(NEED_CATEGORIES.slice(-PLAN_P.length)).toEqual([...PLAN_P]);
+    expect(Object.keys(NEED_ID_CATEGORY).sort()).toEqual([...NEED_IDS].sort());
+    expect(Object.hasOwn(NEED_ID_CATEGORY, 'license-scan')).toBe(false);
+  });
+
+  it('needLabel: every NEED_CATEGORIES value has a label and a why', () => {
+    for (const c of NEED_CATEGORIES) {
+      expect(needLabel(c), `${c} label`).toEqual(expect.any(String));
+      expect(needWhy(c), `${c} why`).toMatch(/\.$/);
+    }
+    expect(needLabel('format')).toBe('Format check');
+    expect(needLabel('api-dast')).toBe('API scan against the spec (API DAST)');
+    expect(needLabel('dead-code')).toBe('Dead code and unused dependencies');
+    expect(needWhy('duplication')).toBe('Warns when a pull request adds copy-pasted code, which tends to get fixed in one copy and forgotten in the other.');
+    expect(needLabel('fuzzing')).toBe('Fuzzing (built in v0.3)');
+  });
+
+  it('jobCategories: format, type-check, dead-code share lint; coverage shares unit-tests; update-config, publishing, egress, fuzzing add no job; scorecard only in nightly', () => {
+    expect(JOB_GROUP).toMatchObject({ format: 'lint', 'type-check': 'lint', 'dead-code': 'lint', coverage: 'unit-tests', 'workflow-pin-check': 'workflow-lint', 'update-config': null, publishing: null, egress: null, fuzzing: null });
+    const p = profile({
+      services: [web({ dockerfile: 'Dockerfile', quality: withQuality({ tsconfig: true, fuzzTargets: true }) })], existingWorkflows: [publishWorkflow()],
+    });
+    const needs = floorNeeds(p, PUBLIC);
+    const base = (layer: Layer) => needs.filter((n) => n.layer === layer).length;
+    const cats = jobCategories(needs);
+    expect(cats.push.filter((c) => c === 'lint')).toHaveLength(1);
+    expect(cats.merge.filter((c) => c === 'lint')).toHaveLength(1);
+    expect(cats.push.filter((c) => c === 'unit-tests')).toHaveLength(1);
+    expect(cats.merge.filter((c) => c === 'unit-tests')).toHaveLength(1);
+    expect(cats.push.filter((c) => c === 'workflow-lint')).toHaveLength(1);
+    for (const c of ['format', 'type-check', 'dead-code', 'coverage', 'workflow-pin-check', 'update-config', 'publishing', 'egress', 'fuzzing', 'scorecard']) {
+      for (const layer of ['push', 'merge', 'deploy'] as const) expect(cats[layer], `${c} ${layer}`).not.toContain(c);
+    }
+    expect(cats.nightly.filter((c) => c === 'scorecard')).toHaveLength(1);
+    expect(cats.merge).toContain('duplication');
+    expect(cats.nightly).not.toContain('duplication');
+    expect(cats.deploy).not.toContain('publishing');
+    expect(cats.merge.length).toBeLessThan(base('merge'));
+    // scorecard counted once even with two services
+    const two = jobCategories(floorNeeds(profile({ services: [web(), lib()] }), PUBLIC));
+    expect(two.nightly.filter((c) => c === 'scorecard')).toHaveLength(1);
+  });
+
+  it('jobCategories: length equals jobCounts per layer with the Plan P categories', () => {
+    const profiles = [
+      profile({ services: [web({ dockerfile: 'Dockerfile', quality: withQuality({ tsconfig: true, fuzzTargets: true, configs: ['knip'], apiSpec: { kind: 'file', path: 'o.yaml' } }) }), lib(), svc({ name: 'py', language: 'python', packageManager: 'uv' })],
+        terraformDirs: ['infra'], existingWorkflows: [deployWorkflow, publishWorkflow()] }),
+      profile({ services: [] }), profile({ private: true, services: [lib()] }),
+    ];
+    for (const p of profiles) for (const caps of [PUBLIC, capsFor('free')]) {
+      const needs = floorNeeds(p, caps);
+      const cats = jobCategories(needs);
+      const counts = jobCounts(needs);
+      for (const l of ['pre-commit', 'push', 'merge', 'deploy', 'nightly'] as const) expect(cats[l].length, l).toBe(counts[l]);
+    }
+  });
+});
+
+describe('planNeeds: Plan P rules', () => {
+  const run = (p: RepoProfile, add: unknown[], caps: Capabilities = PUBLIC) => planNeeds(p, caps, bundle, mockAi({ ...quiet, add }).p, 0);
+
+  it("planNeeds: AI can't move a scheduled check off merge or give a repo-wide check a service", async () => {
+    const p = profile({ services: [web({ quality: withQuality({ fuzzTargets: true }) })] });
+    const r = await run(p, [
+      addNeed({ id: 'scorecard', category: 'scorecard', layer: 'push', service: null }),
+      addNeed({ id: 'update-config', category: 'update-config', layer: 'push', service: null }),
+      addNeed({ id: 'fuzzing', category: 'fuzzing', layer: 'push', service: 'web' }),
+      addNeed({ id: 'workflow-lint', category: 'workflow-lint', layer: 'merge', service: 'web' }),
+      addNeed({ id: 'duplication', category: 'duplication', layer: 'merge', service: 'web' }),
+    ]);
+    expect(r.needs).toEqual(floorNeeds(p, PUBLIC));
+    expect(r.notes.join('\n')).toMatch(/scorecard, update-config in push|scorecard in push/);
+    expect(r.notes.join('\n')).toMatch(/workflow-lint in merge for web/);
+    expect(r.notes.join('\n')).toMatch(/covers the whole repo/);
+  });
+
+  it('planNeeds: an AI addition for a skipped check is refused, and the note says why it was skipped (PS9)', async () => {
+    const p = profile({ services: [web({ quality: withQuality({ tsconfig: true }) }), lib({ name: 'js' })] });
+    const r = await run(p, [
+      addNeed({ id: 'type-check', category: 'type-check', layer: 'push', service: 'js' }),
+      addNeed({ id: 'type-check', category: 'type-check', layer: 'push', service: 'web' }), // already in the floor: unchanged
+      addNeed({ id: 'dockerfile-lint', category: 'dockerfile-lint', layer: 'merge', service: 'web' }),
+    ]);
+    expect(r.needs).toEqual(floorNeeds(p, PUBLIC));
+    const text = r.notes.join('\n');
+    expect(text).toContain('type-check in push for js');
+    expect(text).toContain('no tsconfig');
+    expect(text).toContain('no Dockerfile found');
+  });
+
+  it('planNeeds: an AI addition cannot make a non-blocking check blocking, and migration-check is still accepted', async () => {
+    const p = profile({ services: [web({ quality: withQuality({ configs: ['knip'] }) })] });
+    const r = await run(p, [
+      addNeed({ id: 'dead-code', category: 'dead-code', layer: 'push', service: 'web', blocking: false }),
+      addNeed({ id: 'migration-check', category: 'full-tests', layer: 'merge', service: 'web', blocking: true }),
+    ]);
+    const added = r.needs.slice(floorNeeds(p, PUBLIC).length);
+    expect(added.map(key)).toEqual(['merge|migration-check|web']);
+    const dup = await run(profile({ services: [web()] }), [addNeed({ id: 'duplication', category: 'duplication', layer: 'push', service: null, blocking: true })]);
+    expect(dup.needs.find((n) => n.layer === 'push' && n.id === 'duplication')).toMatchObject({ blocking: false, floor: false });
   });
 });

@@ -31,8 +31,8 @@ import { isReleaseBuild, listPending, PENDING, REVIEWER_RE, reviewMarkerProblems
 /** A built-in step that runs the project's own script. Not a reviewed third-party entry, so it has no pin. */
 export interface ProjectScriptStep { kind: 'project-script'; needId: string; service: string; script: 'test' | 'lint'; workingDir?: string }
 
-/** Categories a reviewed entry may carry (ruling S23): every need category, plus three that aren't needs. */
-export const TOOL_CATEGORIES = [...NEED_CATEGORIES, 'platform', 'egress', 'workflow-lint'] as const;
+/** Categories a reviewed entry may carry (ruling S23): every need category, plus `platform`, which isn't a need (egress and workflow-lint became needs in Plan P Task 2). */
+export const TOOL_CATEGORIES = [...NEED_CATEGORIES, 'platform'] as const;
 const LANGUAGES = ['node', 'python', 'go', 'java', 'dotnet', 'ruby', 'php', 'other', 'any'] as const satisfies readonly (Language | 'any')[];
 
 export { PENDING } from './review-marker.js';

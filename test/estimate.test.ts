@@ -92,6 +92,8 @@ describe('estimate: minutes', () => {
     for (const c of ['hooks-ci', 'lint', 'secrets', 'deps', 'gate', 'nightly']) expect(jobMinutes(c), c).toBe(1);
     for (const c of ['sast', 'unit-tests', 'full-tests', 'image-build', 'image-scan']) expect(jobMinutes(c), c).toBe(2);
     expect(jobMinutes('dast')).toBe(3);
+    for (const c of ['workflow-lint', 'dockerfile-lint', 'duplication', 'dependency-review', 'licences', 'scorecard']) expect(jobMinutes(c), c).toBe(1);
+    expect(jobMinutes('api-dast')).toBe(3);
     for (const c of ['iac', 'sbom', 'signing', 'attestation', 'deploy-verify', 'something-new']) expect(jobMinutes(c), c).toBe(2);
     // one more dast job in merge adds 3 minutes per variant (× 1.3)
     const extra = { ...JOBS, merge: [...JOBS.merge, 'dast'] };
@@ -276,6 +278,12 @@ describe('estimate: AI', () => {
 });
 
 describe('estimate: basis', () => {
+  it('estimate: scorecard in the nightly adds a basis line that it runs weekly and is counted nightly (PS10)', () => {
+    const withCard = estimate(profile(), { ...JOBS, nightly: [...JOBS.nightly, 'scorecard'] }, 2, ACTIVITY, OPUS);
+    expect(withCard.basis.join('\n')).toContain('Scorecard runs weekly; counted nightly (leans high)');
+    expect(estimate(profile(), JOBS, 2, ACTIVITY, OPUS).basis.join('\n')).not.toContain('Scorecard runs weekly');
+  });
+
   it('estimate: basis lists every assumption', () => {
     const text = estimate(profile(), JOBS, 2, ACTIVITY, OPUS).basis.join('\n');
     for (const re of [
@@ -466,7 +474,10 @@ describe('jobCategories', () => {
     const counts = jobCounts(needs);
     for (const layer of ['pre-commit', 'push', 'merge', 'deploy', 'nightly'] as const) expect(cats[layer].length, layer).toBe(counts[layer]);
     expect(cats['pre-commit']).toEqual([]);
-    expect(cats.push.sort()).toEqual([...PUSH].sort());
+    // Plan P: format and coverage share lint and unit-tests; the workflow lint is one new job; the merge layer adds three repo checks
+    expect(cats.push.sort()).toEqual([...PUSH, 'workflow-lint'].sort());
+    expect(cats.merge).toEqual(expect.arrayContaining(['workflow-lint', 'duplication', 'dependency-review', 'licences']));
+    expect(cats.merge).not.toContain('scorecard'); // private, no code scanning: skipped
     expect(cats.merge.filter((c) => c === 'gate')).toHaveLength(1);
     expect(cats.nightly).toContain('nightly');
     expect(cats.nightly).toContain('dast');

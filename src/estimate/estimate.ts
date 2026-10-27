@@ -76,6 +76,9 @@ const JOB_MINUTES: Readonly<Record<string, number>> = Object.freeze({
   'hooks-ci': 1, lint: 1, secrets: 1, deps: 1, gate: 1, nightly: 1,
   sast: 2, 'unit-tests': 2, 'full-tests': 2, 'image-build': 2, 'image-scan': 2,
   dast: 3,
+  // Plan P Task 2: estimates, S5 didn't measure these.
+  'workflow-lint': 1, 'dockerfile-lint': 1, duplication: 1, 'dependency-review': 1, licences: 1, scorecard: 1,
+  'api-dast': 3,
 });
 /** Any other category (iac, sbom, signing, attestation, deploy-verify, anything new): not measured in S5. */
 const UNKNOWN_JOB_MINUTES = 2;
@@ -296,13 +299,16 @@ export function estimate(p: RepoProfile, jobs: JobCategories, variants: number, 
   basis.push(
     'Actions minutes per job are measured, not guessed: on a small Node + Postgres app on a private repo (spike S5, 2026-10-26) a job billed about 1.1 minutes. '
       + 'pipegen counts 1 min for quick jobs (hooks, lint, secrets, dependency scan, gate, nightly), 2 min for code scans, tests, the image build and image scan (and any job S5 did not measure), '
-      + 'and 3 min for the running-app scan (DAST). That is the measured time plus about 50% for bigger apps and the egress-control step; larger apps take longer.',
+      + 'and 3 min for the running-app scans (DAST and API DAST). That is the measured time plus about 50% for bigger apps and the egress-control step; larger apps take longer. '
+      + 'The workflow, Dockerfile, copy-paste, new-dependency and licence checks and Scorecard were not measured; pipegen counts them as 1 min each (API DAST as 3).',
     `Setup runs the pipeline for ${plural(v, 'proof variant', 'proof variants')} (the real changes, and the same with planted problems), plus 30% for re-runs (× 1.3).`,
     `The setup minutes include the proof harness, ${HARNESS_MINUTES_PER_VARIANT} min per variant (app start, hooks, tests run twice, a signing round trip and the verify-first lookup).`,
     `Copies of your own workflow jobs, run in the proof to compare results, count ${UNKNOWN_JOB_MINUTES} min each per variant (${plural(compatJobs, 'job', 'jobs')} here).`,
     `The hard cap on setup minutes is twice the estimate (${setupMinutesCap} min); the proof stops there. The cap also covers the extra variants that disputes add.`,
     "Pre-commit checks run on the developer's machine, so they use no Actions minutes.",
   );
+
+  if (jobs.nightly?.includes('scorecard')) basis.push('Scorecard runs weekly; counted nightly (leans high).');
 
   // Monthly minutes.
   const pushes = count(activity.pushes);

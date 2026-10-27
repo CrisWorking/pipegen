@@ -37,7 +37,7 @@ import { needLanguage, suggestTools } from '../engine/discover.js';
 import type { RateBudget } from '../engine/github-rate.js';
 import { ensurePinnedBinary, PinnedBinaryError } from '../engine/linters.js';
 import type { MemoryStore } from '../engine/memory.js';
-import { floorNeeds, isRunnable, jobCategories, needKey, needsPromptBytes, planNeeds, type NeedsPlan } from '../engine/needs.js';
+import { CHECK_LABELS, floorNeeds, isRunnable, jobCategories, needKey, needsPromptBytes, planNeeds, type NeedsPlan } from '../engine/needs.js';
 import type { QualityBar } from '../engine/quality-bar.js';
 import { projectScriptFor, reviewedFor, type ProjectScriptStep } from '../engine/reviewed.js';
 import {
@@ -230,7 +230,8 @@ const NEED_LABELS: Readonly<Record<string, string>> = {
   'image-build': 'Container image build', 'image-scan': 'Container image scan', dast: 'Running-app scan (DAST)',
   iac: 'Infrastructure code scan (IaC)', sbom: 'Software bill of materials (SBOM)', signing: 'Image signing',
   attestation: 'Build attestation', 'deploy-verify': 'Deploy check (pipegen)', gate: 'Merge gate (pipegen)',
-  'type-check': 'Type check', 'license-scan': 'Licence check', 'dockerfile-lint': 'Dockerfile lint', 'migration-check': 'Database migration check',
+  'migration-check': 'Database migration check',
+  ...CHECK_LABELS,
 };
 /** Plan U final review M4: the names that change for a package that is released and builds no image. */
 const RELEASE_LABELS: Readonly<Record<string, string>> = { signing: 'Release signing' };

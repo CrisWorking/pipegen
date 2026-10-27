@@ -101,8 +101,8 @@ describe('memory', () => {
   it('memory: category comes from the need id', async () => {
     const root = tmp();
     const m = await open(root);
-    m.record('eslint', 'type-check', 'node', 'proven', T1);
-    expect(m.lookup('lint', 'node').map((e) => e.toolId)).toEqual(['eslint']);
+    m.record('eslint', 'migration-check', 'node', 'proven', T1);
+    expect(m.lookup('full-tests', 'node').map((e) => e.toolId)).toEqual(['eslint']);
   });
 
   it('memory: save writes a private folder and file, and a new open reads it back', async () => {

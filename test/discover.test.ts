@@ -129,16 +129,16 @@ describe('discover', () => {
 
   it('discover: candidates schema uses enums for kind, need, category and language', async () => {
     const s = setup();
-    await discover(need('type-check', { category: 'lint' }), profile({ services: [svc({ language: 'python', packageManager: 'uv' })] }), s.deps);
+    await discover(need('migration-check', { category: 'full-tests' }), profile({ services: [svc({ language: 'python', packageManager: 'uv' })] }), s.deps);
     const req = s.ai.calls[0] as AiRequest;
     const items = ((req.jsonSchema as { properties: Record<string, { items: { properties: Record<string, { enum?: string[]; type?: string }> } }> }).properties.candidates).items;
     expect(items.properties.kind?.enum).toEqual(['action', 'cli', 'docker']);
-    expect(items.properties.needId?.enum).toEqual(['type-check']);
-    expect(items.properties.category?.enum).toEqual(['lint']);
+    expect(items.properties.needId?.enum).toEqual(['migration-check']);
+    expect(items.properties.category?.enum).toEqual(['full-tests']);
     expect(items.properties.language?.enum).toEqual(['python']);
     expect(Object.keys(items.properties).sort()).toEqual(['category', 'kind', 'language', 'name', 'needId', 'repo', 'why']);
     expect(strictProblems(req.jsonSchema)).toEqual([]);
-    expect(JSON.parse(/<need>\n(.*)\n<\/need>/.exec(req.user)?.[1] ?? 'null')).toEqual({ needId: 'type-check', category: 'lint', language: 'python', packageManager: 'uv' });
+    expect(JSON.parse(/<need>\n(.*)\n<\/need>/.exec(req.user)?.[1] ?? 'null')).toEqual({ needId: 'migration-check', category: 'full-tests', language: 'python', packageManager: 'uv' });
     // an answer for another need, category or language is refused by the schema
     const bad = setup({ ai: { candidates: [aiCand('good/tool', { category: 'sast' })] }, gh: exists('good/tool') });
     await expect(discover(need('lint'), profile(), bad.deps)).rejects.toThrow(AiError);

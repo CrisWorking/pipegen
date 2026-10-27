@@ -162,7 +162,7 @@ function fakeAi(why = 'Checks things.', service = 'app') {
     reqs.push(req);
     const usage = Object.fromEntries([['input' + 'Tokens', 1000], ['output' + 'Tokens', 100]]) as unknown as AiUsage; // names built at runtime (secret-literal guard)
     if (req.schemaName === 'needs') {
-      const add = [{ id: 'type-check', layer: 'push', category: 'lint', service, why: 'Types catch mistakes.', blocking: false }];
+      const add = [{ id: 'migration-check', layer: 'push', category: 'full-tests', service, why: 'Types catch mistakes.', blocking: false }];
       return { data: { add, skipLayers: [], requireDeployApproval: false }, usage };
     }
     const n = needBlock(req);

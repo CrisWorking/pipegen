@@ -281,8 +281,9 @@ describe('loadReviewed', () => {
     expect(() => load([plus])).toThrow(/image tag/);
   });
 
-  it('reviewed: categories limited to need categories plus platform, egress and workflow-lint (S23)', () => {
-    expect([...TOOL_CATEGORIES].sort()).toEqual([...NEED_CATEGORIES, 'platform', 'egress', 'workflow-lint'].sort());
+  it('TOOL_CATEGORIES: NEED_CATEGORIES plus platform only', () => {
+    expect([...TOOL_CATEGORIES]).toEqual([...NEED_CATEGORIES, 'platform']);
+    expect(NEED_CATEGORIES).toEqual(expect.arrayContaining(['egress', 'workflow-lint']));
     rejects([actionEntry({ categories: ['cache'] })]);
     rejects([actionEntry({ categories: [] })]);
     const mismatch = actionEntry();

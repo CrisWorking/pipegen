@@ -234,7 +234,7 @@ describe('addAiSuggestions (brief, Task 2b)', () => {
       ai: {
         needs: {
           add: [
-            add({ id: 'type-check', category: 'lint', why: 'Catches *type* errors | early.' }),
+            add({ id: 'migration-check', category: 'full-tests', why: 'Catches *type* errors | early.' }),
             add({ id: 'sast', category: 'sast', why: 'A floor need again.', blocking: false }), // already in the floor: ignored
             add({ id: 'gate', category: 'gate', service: null }), // pipegen's own: refused with a note
           ],
@@ -245,7 +245,7 @@ describe('addAiSuggestions (brief, Task 2b)', () => {
     const before = structuredClone(s.r);
     const out = await addAiSuggestions(s.r, s.dir, s.deps);
     // AI text is kept raw here (Task 3 cleans it at output, ruling U10)
-    expect(out.ai?.extraNeeds).toEqual([{ id: 'type-check', layer: 'push', category: 'lint', service: 'app', why: 'Catches *type* errors | early.', blocking: false, floor: false }]);
+    expect(out.ai?.extraNeeds).toEqual([{ id: 'migration-check', layer: 'push', category: 'full-tests', service: 'app', why: 'Catches *type* errors | early.', blocking: true, floor: false }]);
     expect(out.ai?.notes.some((n) => /gate need/.test(n))).toBe(true);
     // floor needs, coverage and the would-add rows are exactly as buildAudit left them; the input report is not changed
     expect(out.coverage).toEqual(before.coverage);
@@ -253,8 +253,8 @@ describe('addAiSuggestions (brief, Task 2b)', () => {
     expect(out.profile).toEqual(before.profile);
     expect(s.r).toEqual(before);
     // the AI-added need (no reviewed tool, no project script) goes to discovery; the floor needs with reviewed tools don't
-    expect(searched()).toContain('type-check');
-    expect(s.ai.candidateReqs().map((r) => needBlock(r)?.needId)).toEqual(['type-check']);
+    expect(searched()).toContain('migration-check');
+    expect(s.ai.candidateReqs().map((r) => needBlock(r)?.needId)).toEqual(['migration-check']);
     expect(out.ai?.suggestions).toEqual([{ name: 'good', repo: 'o/good', why: 'Checks things.' }]);
   });
 
@@ -523,14 +523,14 @@ describe('addAiSuggestions (controller rulings)', () => {
   });
 
   it('B3/U11: reviewed list unavailable → no discovery, no suggestions, a note (look-alike checks need the full list)', async () => {
-    const s = await setup({ reviewedUnavailable: true, ai: { needs: { add: [{ id: 'type-check', layer: 'push', category: 'lint', service: 'app', why: 'Types.', blocking: false }], skipLayers: [], requireDeployApproval: false } } });
+    const s = await setup({ reviewedUnavailable: true, ai: { needs: { add: [{ id: 'migration-check', layer: 'push', category: 'full-tests', service: 'app', why: 'Types.', blocking: false }], skipLayers: [], requireDeployApproval: false } } });
     expect(s.r.reviewedUnavailable).toBe(true);
     const out = await addAiSuggestions(s.r, s.dir, s.deps);
     expect(suggestTools).not.toHaveBeenCalled();
     expect(s.ai.candidateReqs()).toHaveLength(0);
     expect(out.ai?.suggestions).toEqual([]);
     expect(out.ai?.notes).toContain(LOOKALIKE_SKIPPED);
-    expect(out.ai?.extraNeeds.map((n) => n.id)).toEqual(['type-check']); // the needs step still runs
+    expect(out.ai?.extraNeeds.map((n) => n.id)).toEqual(['migration-check']); // the needs step still runs
   });
 
   it('S16: an AiError from the needs call → no extra needs, no discovery, a note; a refusal says the fallback was tried', async () => {
@@ -627,7 +627,7 @@ describe('addAiSuggestions (controller rulings)', () => {
     const aiValue = ['zq', 'echo', String(NOW % 4001)].join('-');
     const s = await setup({
       reviewed: FLOOR_REVIEWED,
-      ai: { needs: { add: [{ id: 'type-check', layer: 'push', category: 'lint', service: 'app', why: `Seen ${aiValue} here.`, blocking: false }], skipLayers: [], requireDeployApproval: false } },
+      ai: { needs: { add: [{ id: 'migration-check', layer: 'push', category: 'full-tests', service: 'app', why: `Seen ${aiValue} here.`, blocking: false }], skipLayers: [], requireDeployApproval: false } },
     });
     s.deps.knownValues = [aiValue];
     const out = await addAiSuggestions(s.r, s.dir, s.deps);
