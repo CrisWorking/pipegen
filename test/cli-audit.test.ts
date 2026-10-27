@@ -276,7 +276,7 @@ describe('pipegen audit (brief)', () => {
     expect(addAiSuggestions).not.toHaveBeenCalled();
     expect(r.out).toContain('Nothing was sent to an AI.');
     expect(r.out).not.toContain('What the AI suggests');
-    expect(r.err).toContain('You said no: nothing was sent to an AI.');
+    expect(r.err).toContain('No consent (you said no, or the question was cancelled): nothing was sent to an AI.');
   });
 
   it('cli: --ai accepted → suggestions shown, consent had no repo lines and read-only permissions', async () => {
@@ -444,6 +444,16 @@ describe('pipegen audit (flags and help)', () => {
     expect(inspectOut.err).toContain('--out works with pipegen audit only.');
   });
 
+  it('flags (M8): a repeated option is refused with a clear message, exit 1', async () => {
+    const cwd = makeTempDir();
+    for (const argv of [['audit', '--ai', 'claude', '--ai', 'ollama'], ['audit', '--out', 'a.md', '--out', 'b.md'], ['audit', '--dir', 'a', '--dir', 'b'], ['audit', '--json', '--json'], ['inspect', '--dir', 'a', '--dir=b']]) {
+      const r = await audit(argv, { cwd });
+      expect(r.code, argv.join(' ')).toBe(1);
+      expect(r.err).toMatch(/^--(ai|out|dir|json) was given more than once\. Give each option once\./);
+      expect(r.calls).toEqual([]);
+    }
+  });
+
   it('flags: --ai takes an optional provider name (bare, before another flag, with = or as the next word)', async () => {
     const dir = repo();
     for (const argv of [['audit', '--ai'], ['audit', '--ai', '--json'], ['audit', '--ai', 'claude'], ['audit', '--ai=claude']]) {
@@ -553,6 +563,18 @@ describe('pipegen audit (auth and GitHub, ruling B1)', () => {
     expect(o.err).toContain('No report file was written: GitHub could not be read.');
   });
 
+  it('access, M12: GitHub names the repo differently (renamed or transferred) → a note, and the run goes on', async () => {
+    const dir = repo();
+    const moved = publicRoutes({ [`GET ${R}`]: { body: { full_name: 'newowner/new-name', private: false, default_branch: 'main', owner: { type: 'Organization', login: 'newowner' } } } });
+    const r = await audit(['audit', '--json'], { cwd: dir, routes: moved });
+    expect(r.code).toBe(0);
+    expect((JSON.parse(r.out) as { notes: string[] }).notes).toContain('GitHub says this repo is now newowner/new-name (renamed or transferred); the facts below are for that repo.');
+    // the same name in another letter case is the same repo: no note
+    const same = await audit(['audit', '--json'], { cwd: dir, routes: publicRoutes({ [`GET ${R}`]: { body: { full_name: 'O/R', private: false, default_branch: 'main', owner: { type: 'User', login: 'O' } } } }) });
+    expect(same.code).toBe(0);
+    expect(same.out).not.toContain('GitHub says this repo is now');
+  });
+
   it('reviewed list unusable (B3) → runs with no reviewed tools, the top warning first, exit 0', async () => {
     const dir = repo();
     const msg = 'This pipegen release refuses its reviewed tool list: 23 entries still wait for human review (a, b and 21 more). Nothing unreviewed may run in your CI.';
@@ -632,8 +654,12 @@ describe('pipegen audit --ai (checks before consent)', () => {
     expect(cloudHost.code).toBe(1);
     expect(cloudHost.err).toContain('OLLAMA_HOST points at ollama.com');
     expect(cloudHost.calls).toEqual([]);
-    const sub = await audit(['audit', '--ai', 'ollama'], { cwd: dir, env: { OLLAMA_HOST: 'api.OLLAMA.com:443' }, prompt: ask });
-    expect(sub.code).toBe(1);
+    for (const host of ['api.OLLAMA.com:443', 'ollama.com..', 'OLLAMA.COM.', 'https://Ollama.Com.../x', '\uff4f\uff4c\uff4c\uff41\uff4d\uff41\u3002com']) {
+      const sub = await audit(['audit', '--ai', 'ollama'], { cwd: dir, env: { OLLAMA_HOST: host }, prompt: ask });
+      expect(sub.code, host).toBe(1);
+      expect(sub.err, host).toContain('OLLAMA_HOST points at ollama.com'); // refused by name, before any request (M10)
+      expect(sub.calls, host).toEqual([]);
+    }
     const remote = await audit(['audit', '--ai', 'ollama', '--model', 'llama3.1'], { cwd: dir, env: {}, prompt: ask, routes: show({ body: { remote_host: 'https://ollama.com:443', remote_model: 'gpt-oss:120b', details: {} } }) });
     expect(remote.code).toBe(1);
     expect(remote.err).toContain('Ollama cloud models send your code to ollama.com');

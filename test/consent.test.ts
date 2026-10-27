@@ -2,12 +2,14 @@
 // (the whole run: repos, Actions minutes, AI cost and cap, time, write permissions) and 'audit-ai' (`audit --ai`:
 // files, provider, refusal note, the audit's own AI cost and cap, read-only permissions; no minutes, no repos).
 // Repos are described per DECISIONS #87: pipegen's App creates them; with a token the user does (gh repo create).
+import { realpathSync } from 'node:fs';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
-import { askConsent, consentScreen, consentText, ConsentScreen, ConsentToken } from '../src/cli/consent.js';
+import { askConsent, consentScreen, consentText, ConsentScreen } from '../src/cli/consent.js';
+import { claimTokenMinter, ConsentToken, countingSummary, CountingSummary } from '../src/audit/consent-token.js';
 import { clackPrompter, PromptCancelledError, type Prompter } from '../src/cli/io.js';
 import { REFUSAL_FALLBACK_NOTE } from '../src/ai/provider.js';
 import { ollamaProvider } from '../src/ai/ollama.js';
-import { BundleSummary, bundleCode, bundleSummary, countingSummary, CountingSummary, EXCLUDED_KEPT, EXCLUDED_PATTERN_GROUPS, EXCLUDED_PATTERNS, GitleaksRequiredError, type CodeBundle } from '../src/ai/redact.js';
+import { BundleSummary, bundleCode, bundleSummary, EXCLUDED_KEPT, EXCLUDED_PATTERN_GROUPS, EXCLUDED_PATTERNS, GitleaksRequiredError, type CodeBundle } from '../src/ai/redact.js';
 import { floorNeeds, jobCategories } from '../src/engine/needs.js';
 import { estimate, estimateAuditAi, type Estimates } from '../src/estimate/estimate.js';
 import { permissionsTable } from '../src/github/client.js';
@@ -419,7 +421,7 @@ describe('consent token (T4b: no AI call without consent, by type)', () => {
     if (granted === null) throw new Error('expected a yes');
     expect(ConsentToken.isToken(granted)).toBe(true);
     expect(Object.isFrozen(granted)).toBe(true);
-    expect(granted.terms).toEqual({ mode: 'audit-ai', pricedFor: est.pricedFor, capUsd: est.capUsd, files: bundle });
+    expect(granted.terms).toEqual({ mode: 'audit-ai', pricedFor: est.pricedFor, capUsd: est.capUsd, files: bundle, dir: null });
     const f = full();
     const fullScreen = consentScreen(f.p, claude, f.est, bundle, permissionsTable('write', { appCreatesRepos: false }), repos(f.p, [true, true]), 'full', { appCreatesRepos: false, gitleaksVersion: '8.30.1' });
     expect(fullScreen.terms).toMatchObject({ mode: 'full', capUsd: f.est.aiCostCapUsd });
@@ -435,7 +437,21 @@ describe('consent token (T4b: no AI call without consent, by type)', () => {
     await expect(askConsent(yes, 'the consent text', noErr)).rejects.toThrow(/consentScreen/);
     const hand = { text: 'x', terms: { mode: 'audit-ai' } } as unknown as ConsentScreen;
     await expect(askConsent(yes, hand, noErr)).rejects.toThrow(/consentScreen/);
+    // runtime forgery (review M1): `new` through a cast, or a subclass, is not a screen pipegen made
+    const real = consentScreen(profile(), claude, estimateAuditAi(claude, 3, 50_000), bundle, permissionsTable('read'), [], 'audit-ai', { gitleaksVersion: '8.30.1' });
+    const Screen = ConsentScreen as unknown as new (text: string, terms: unknown) => ConsentScreen;
+    class SubScreen extends Screen {}
+    for (const forged of [new Screen('x', real.terms), new SubScreen('x', real.terms)]) {
+      expect(ConsentScreen.isScreen(forged)).toBe(false);
+      await expect(askConsent(yes, forged, noErr)).rejects.toThrow(/consentScreen/);
+    }
+    const Minted = ConsentToken as unknown as new (terms: unknown) => object;
+    class SubToken extends Minted {}
+    expect(ConsentToken.isToken(new Minted(real.terms))).toBe(false);
+    expect(ConsentToken.isToken(new SubToken(real.terms))).toBe(false);
     expect(yes.asked).toEqual([]); // nothing was asked
+    // the token minter is claimed once, by the consent module; nobody else gets it
+    expect(() => claimTokenMinter()).toThrow(/already claimed/);
   });
 });
 
@@ -453,10 +469,27 @@ describe('counting summary (audit --ai: consent comes before the gitleaks downlo
     expect(() => countingSummary(checked)).toThrow(/counting-only/);
     expect(() => countingSummary({ ...counted })).toThrow(/counting-only/);
     expect(CountingSummary.isSummary({ files: 1, bytes: 1, topFolders: [] })).toBe(false);
+    const Summary = CountingSummary as unknown as new (...a: unknown[]) => object;
+    class SubSummary extends Summary {}
+    expect(CountingSummary.isSummary(new Summary(1, 1, [], dir, new Set()))).toBe(false);
+    expect(CountingSummary.isSummary(new SubSummary(1, 1, [], dir, new Set()))).toBe(false);
+    const Checked = BundleSummary as unknown as new (...a: unknown[]) => object;
+    expect(BundleSummary.isSummary(new Checked(1, 1, []))).toBe(false);
+    expect(BundleSummary.isSummary(bundle)).toBe(true);
+    // bound to the folder it counted (its real path) and to its exact file list; paths() hands out a copy
+    expect(c.dir).toBe(realpathSync(dir));
+    const ps = c.paths();
+    expect([...ps].sort()).toEqual([...FILES].sort());
+    ps.add('src/evil.ts');
+    expect(c.paths().has('src/evil.ts')).toBe(false);
     // covers(): the checked bundle of the same files is inside what was counted; a bundle with another file is not
     expect(c.covers(await bundleCode(dir, { gitleaks: makeStub(CLEAN).bin }))).toBe(true);
     writeIn(dir, 'src/new.ts', '// new\n');
     expect(c.covers(await bundleCode(dir, { gitleaks: makeStub(CLEAN).bin }))).toBe(false);
+    // onlyPaths (review I1): the walk reads only the counted files, so the checked bundle stays inside the count
+    const only = await bundleCode(dir, { gitleaks: makeStub(CLEAN).bin, onlyPaths: c.paths() });
+    expect(only.files.map((f) => f.path)).not.toContain('src/new.ts');
+    expect(c.covers(only)).toBe(true);
   });
 
   it('consent (audit-ai): a counting summary says "at most" and that gitleaks runs after the yes; the full screen refuses it', async () => {

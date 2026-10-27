@@ -28,6 +28,12 @@ export interface BundleOptions {
   gitleaks?: string;
   /** gitleaks timeout; 60 s by default (tests set a short one). */
   gitleaksTimeoutMs?: number;
+  /**
+   * Only these repo paths may be read (null or absent: every file). `audit --ai` passes the files its consent screen
+   * counted, so the gitleaks-checked bundle can only shrink: the cut to maxBytes runs over that same set and can't take
+   * in a file the user wasn't shown (Plan U T4b review I1).
+   */
+  onlyPaths?: ReadonlySet<string> | null;
 }
 
 /** The note a bundle built without gitleaks carries (counting only). The audit leaves it out of its report (nothing is sent there). */
@@ -1170,12 +1176,14 @@ export async function bundleCode(dir: string, opts: BundleOptions = {}): Promise
   let truncated = listing.truncated;
   if (listing.truncated) notes.add(`Stopped listing after ${MAX_FILES_TEXT} files; the rest were not read.`);
 
-  const links = found.links.filter(inRoots);
+  const only = opts.onlyPaths ?? null;
+  const links = found.links.filter((p) => inRoots(p) && (only === null || only.has(p)));
   let excluded = 0;
   let secretNames = 0;
   const candidates: { path: string; rank: number }[] = [];
   for (const path of listing.files) {
     if (!inRoots(path)) continue;
+    if (only !== null && !only.has(path)) continue;
     if (isExcludedPath(path)) {
       excluded++;
       continue;
@@ -1268,7 +1276,7 @@ export async function bundleCode(dir: string, opts: BundleOptions = {}): Promise
   Object.freeze(bundle.notes);
   Object.freeze(bundle);
   if (gitleaksChecked) CHECKED.add(bundle);
-  else COUNTED.add(bundle);
+  else COUNTED.set(bundle, realRoot);
   return bundle;
 }
 
@@ -1494,8 +1502,8 @@ async function gitleaksPass(files: FileEntry[], bin: string, timeoutMs: number, 
 // Bundles that passed bundleCode's gitleaks check. They are frozen, so they cannot change afterwards;
 // a copy or a hand-made object is not in the set and is refused.
 const CHECKED = new WeakSet<object>();
-// Bundles bundleCode built without gitleaks (counting only); only countingSummary() reads them.
-const COUNTED = new WeakSet<object>();
+// Bundles bundleCode built without gitleaks (counting only), with the real path of the folder they were built from.
+const COUNTED = new WeakMap<object, string>();
 
 /** Breaks any `<code-bundle` / `</code-bundle` in repo text so it cannot open or close the block. */
 function neutralizeTags(s: string): string {
@@ -1548,6 +1556,8 @@ export function bundleText(bundle: CodeBundle): string {
 // ---------- bundle summary (the consent screen's file facts) ----------
 
 let makeSummary: (files: number, bytes: number, topFolders: readonly string[]) => BundleSummary;
+/** Every BundleSummary bundleSummary() made: `private constructor` is TypeScript only (review M1). */
+const ISSUED_SUMMARIES = new WeakSet<object>();
 
 /**
  * What a gitleaks-checked code bundle holds, for the consent screen: the number of files, `bytes` (the exact size of
@@ -1563,13 +1573,17 @@ export class BundleSummary {
     Object.freeze(this);
   }
 
-  /** True only for an object bundleSummary() made. */
+  /** True only for an object bundleSummary() made (not one made with `new` through a cast, nor a subclass's). */
   static isSummary(x: unknown): x is BundleSummary {
-    return typeof x === 'object' && x !== null && #fromCheckedBundle in x;
+    return typeof x === 'object' && x !== null && #fromCheckedBundle in x && ISSUED_SUMMARIES.has(x);
   }
 
   static {
-    makeSummary = (files, bytes, topFolders) => new BundleSummary(files, bytes, Object.freeze([...topFolders]));
+    makeSummary = (files, bytes, topFolders) => {
+      const made = new BundleSummary(files, bytes, Object.freeze([...topFolders]));
+      ISSUED_SUMMARIES.add(made);
+      return made;
+    };
   }
 }
 
@@ -1582,11 +1596,11 @@ export function bundleSummary(bundle: CodeBundle): BundleSummary {
   if (!isChecked(bundle)) {
     throw new GitleaksRequiredError('This code bundle has not passed the required gitleaks check, so pipegen can\'t ask to send it.');
   }
-  return makeSummary(bundle.files.length, bundle.bytes, topFoldersOf(bundle));
+  return makeSummary(bundle.files.length, bundle.bytes, bundleTopFolders(bundle));
 }
 
 /** The raw first path segments of a bundle's files, most files first (files at the top level have none). */
-function topFoldersOf(bundle: CodeBundle): string[] {
+export function bundleTopFolders(bundle: CodeBundle): string[] {
   const counts = new Map<string, number>();
   for (const f of bundle.files) {
     const cut = f.path.indexOf('/');
@@ -1595,47 +1609,10 @@ function topFoldersOf(bundle: CodeBundle): string[] {
   return [...counts].sort((a, b) => b[1] - a[1] || (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0)).map(([name]) => name);
 }
 
-// ---------- counting summary (`audit --ai`: consent before gitleaks) ----------
-
-let makeCounting: (bundle: CodeBundle, topFolders: readonly string[]) => CountingSummary;
-
 /**
- * What a COUNTING-ONLY bundle (bundleCode without gitleaks) holds, for the `audit --ai` consent screen (Plan U ruling
- * S21: gitleaks is downloaded and run only after consent, so the screen can't count the checked bundle). It is an upper
- * bound of what is sent: the gitleaks pass only hides values and leaves files out, and the files that will really be
- * sent must all be among the ones counted here (covers()), or nothing is sent. Only countingSummary() makes one, from
- * bundleCode's own counting result (a copy or a hand-made object is refused), like BundleSummary.
+ * The real path of the folder a COUNTING-ONLY bundle (bundleCode without gitleaks) was built from, or null for any other
+ * object (a checked bundle, a copy, a hand-made one). The audit's consent summary (src/audit/consent-token.ts) uses it.
  */
-export class CountingSummary {
-  readonly #paths: ReadonlySet<string>;
-
-  private constructor(readonly files: number, readonly bytes: number, readonly topFolders: readonly string[], paths: ReadonlySet<string>) {
-    this.#paths = paths;
-    Object.freeze(this);
-  }
-
-  /** True only for an object countingSummary() made. */
-  static isSummary(x: unknown): x is CountingSummary {
-    return typeof x === 'object' && x !== null && #paths in x;
-  }
-
-  /** True when every file of `bundle` is one of the files counted here (the user agreed to send at most these). */
-  covers(bundle: CodeBundle): boolean {
-    return bundle.files.every((f) => this.#paths.has(f.path));
-  }
-
-  static {
-    makeCounting = (bundle, topFolders) => new CountingSummary(bundle.files.length, bundle.bytes, Object.freeze([...topFolders]), new Set(bundle.files.map((f) => f.path)));
-  }
-}
-
-/**
- * The consent facts of a counting-only bundle (bundleCode without gitleaks). Throws unless `bundle` is bundleCode's own
- * counting result. A checked bundle gets bundleSummary() instead.
- */
-export function countingSummary(bundle: CodeBundle): CountingSummary {
-  if (bundle === null || typeof bundle !== 'object' || bundle.gitleaksChecked !== false || !COUNTED.has(bundle)) {
-    throw new Error('countingSummary needs bundleCode\'s own counting-only bundle (built without gitleaks).');
-  }
-  return makeCounting(bundle, topFoldersOf(bundle));
+export function countedBundleRoot(bundle: unknown): string | null {
+  return typeof bundle === 'object' && bundle !== null ? COUNTED.get(bundle) ?? null : null;
 }

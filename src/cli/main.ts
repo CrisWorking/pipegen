@@ -61,11 +61,13 @@ export async function run(argv: string[], io: CliIO): Promise<number> {
     'allow-broad-token'?: boolean; help?: boolean; version?: boolean;
   };
   let positionals: string[];
+  let tokens: { kind: string; name?: string }[];
   try {
-    ({ values, positionals } = parseArgs({
+    ({ values, positionals, tokens } = parseArgs({
       args: normalizeAiFlag(argv),
       allowPositionals: true,
       strict: true,
+      tokens: true,
       options: {
         dir: { type: 'string' },
         out: { type: 'string' },
@@ -83,6 +85,16 @@ export async function run(argv: string[], io: CliIO): Promise<number> {
     fail(safeText(e instanceof Error ? e.message : String(e), 300));
     fail('Run pipegen --help to see the options.');
     return 1;
+  }
+  // a repeated option would silently use the last value (`--ai claude --ai ollama` runs Ollama): refused (review M8)
+  const seen = new Set<string>();
+  for (const t of tokens) {
+    if (t.kind !== 'option' || t.name === undefined) continue;
+    if (seen.has(t.name)) {
+      fail(`--${t.name} was given more than once. Give each option once.`);
+      return 1;
+    }
+    seen.add(t.name);
   }
   if (values.version) {
     say(`pipegen ${packageVersion() ?? 'unknown'}`);

@@ -558,10 +558,12 @@ const planOf = (data: unknown): Plan => {
  * `login` is the owner (else it would describe the wrong account); anything else, or any failure → 'unknown'.
  * The `permissions` field of GET /repos is never read (it is the user's role, not the token's rights).
  * `login` is null for anonymous access and for an installation token (ghs_, which has no user).
+ * `notes`: when given, gets a line when GitHub's full_name isn't owner/repo (any letter case): the repo was renamed or
+ * transferred and GitHub answered for the new one.
  */
-export async function readGitHubContext(gh: Octokit, owner: string, repo: string, login: string | null, clock: RateClock = clockOf(gh)): Promise<Pick<RepoProfile, 'private' | 'ownerType' | 'plan' | 'defaultBranch'>> {
+export async function readGitHubContext(gh: Octokit, owner: string, repo: string, login: string | null, clock: RateClock = clockOf(gh), notes?: string[]): Promise<Pick<RepoProfile, 'private' | 'ownerType' | 'plan' | 'defaultBranch'>> {
   checkRepoNames(owner, [repo]);
-  let data: { private?: unknown; default_branch?: unknown; owner?: { type?: unknown } };
+  let data: { private?: unknown; default_branch?: unknown; owner?: { type?: unknown }; full_name?: unknown };
   try {
     data = (await withRateLimit(() => gh.rest.repos.get({ owner, repo }), clock)).data as typeof data;
   } catch (e) {
@@ -576,6 +578,12 @@ export async function readGitHubContext(gh: Octokit, owner: string, repo: string
   const ownerType = data.owner?.type === 'Organization' ? 'Organization' : data.owner?.type === 'User' ? 'User' : undefined;
   if (typeof data.private !== 'boolean' || ownerType === undefined || typeof data.default_branch !== 'string' || data.default_branch === '') {
     throw new GitHubAccessError(`GitHub's answer about ${repoName(owner, repo)} could not be read.`);
+  }
+  // GitHub follows a renamed or transferred repo to its new name (review M12): say so, and go on with that repo's facts
+  const fullName = typeof data.full_name === 'string' ? data.full_name : null;
+  if (notes !== undefined && fullName !== null && fullName.toLowerCase() !== `${owner}/${repo}`.toLowerCase()) {
+    const shown = /^[A-Za-z0-9-]{1,39}\/[A-Za-z0-9._-]{1,100}$/.test(fullName) ? fullName : safeText(fullName, 160);
+    notes.push(`GitHub says this repo is now ${shown} (renamed or transferred); the facts below are for that repo.`);
   }
   let plan: Plan = 'unknown';
   const readPlan = async (call: () => Promise<{ data: unknown }>) => {

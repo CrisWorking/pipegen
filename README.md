@@ -54,7 +54,8 @@ It protects four stages: **pre-commit → push → merge → deploy**.
 npx --registry=https://registry.npmjs.org pipegen@0.1.0 audit --dir ./my-repo
                           # read-only report; run it from OUTSIDE the repo, exact version, explicit registry
 npx --registry=https://registry.npmjs.org pipegen@0.1.0 audit --dir ./my-repo --out report.md
-                          # also save the report as Markdown (outside the repo; --json prints JSON instead)
+                          # also save the report as a Markdown file, outside the repo
+                          # (--json prints the report as JSON instead of text)
 npx --registry=https://registry.npmjs.org pipegen@0.1.0 audit --dir ./my-repo --ai
                           # also ask an AI for extra checks and tools to mention, after it shows what it would send
                           # and asks you (default No)

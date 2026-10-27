@@ -24,7 +24,33 @@ const DATA_FILES = ['quality-bar.yml', 'pinned-binaries.yml', 'memory.json', 're
 /** Names passed to esbuild's __require shim (the CommonJS libraries' own require calls). Each must be a Node built-in. */
 const shimRequires = (code: string) => [...code.matchAll(/__require\d*\(\s*["']([^"']+)/g)].map((m) => m[1] as string);
 
+/**
+ * The code of a bundle with its comments taken out, line by line, for the import scan (review M5): `//` lines and the
+ * `*` lines inside a doc comment are dropped; a leading one-line block comment (`/* @__PURE__ *\/ require("x")`) is cut
+ * and the rest of the line is kept; an unclosed block comment's opening line is dropped.
+ */
+function codeOf(text: string): string {
+  return text.split('\n').flatMap((line) => {
+    let l = line.replace(/^\s*(?:\/\*.*?\*\/\s*)+/, '');
+    if (/^\s*(?:\/\/|\*|\/\*)/.test(l)) l = '';
+    return l === '' ? [] : [l];
+  }).join('\n');
+}
+
 describe('package', () => {
+  it('codeOf (M5): a line that starts with a one-line comment and goes on with code is still scanned', () => {
+    const code = codeOf(['/* @__PURE__ */ require("x")', '  /* a */ /* b */ import y from "y";', '// from "c"', ' * from "d"', '/**', '/* open', 'const z = 1; /* trailing */'].join('\n'));
+    expect(code).toContain('require("x")');
+    expect(code).toContain('import y from "y";');
+    expect(code).toContain('const z = 1;');
+    expect(code).not.toMatch(/from "c"|from "d"|open/);
+  });
+
+  it('prepack builds the release dist (M4): npm pack never ships a stale dist', () => {
+    expect(pkg.scripts.prepack).toBe('npm run build');
+    expect(pkg.scripts.build).toBe('tsup');
+  });
+
   it('license Apache-2.0, bin dist/cli/main.js, repository url set, no dependencies field', () => {
     expect(pkg.license).toBe('Apache-2.0');
     expect(pkg.bin.pipegen).toBe('dist/cli/main.js');
@@ -58,8 +84,10 @@ describe('build', () => {
     execFileSync('npx', ['tsup'], { cwd: root, stdio: 'pipe' });
     const raw = readFileSync(resolve(root, 'dist/cli/main.js'), 'utf8');
     expect(raw.startsWith('#!/usr/bin/env node\n')).toBe(true);
-    // comment lines left out: the bundled Anthropic SDK's doc comments say things like "from 'queued' to 'starting'"
-    const out = raw.split('\n').filter((l) => !/^\s*(?:\*|\/\*|\/\/)/.test(l)).join('\n');
+    // the release build refuses PENDING review entries: isReleaseBuild() is bundled as `return true`
+    expect(raw).toMatch(/function isReleaseBuild\(\) \{\n\s*return true;/);
+    // comments left out (the bundled Anthropic SDK's doc comments say things like "from 'queued' to 'starting'")
+    const out = codeOf(raw);
     expect(readdirSync(resolve(root, 'dist'))).toEqual(['cli']); // one file: no chunk next to main.js
     expect(readdirSync(resolve(root, 'dist/cli'))).toEqual(['main.js']);
     const specs = [

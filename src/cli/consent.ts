@@ -20,24 +20,26 @@
 // priced for the provider and model shown (Estimates.pricedFor), or the screen is refused.
 // 'audit-ai' alone may take a CountingSummary instead (Plan U T4b, ruling S21: the gitleaks download happens only after
 // consent, so the screen counts the bundle before the gitleaks pass, says so, and calls the counts "at most"; the AI
-// step then sends only files from that counted list, CountingSummary.covers()).
-// "No AI call without consent" is a type rule (Plan U T4b): consentScreen() makes the screen (its text plus the terms a
-// yes agrees to), askConsent() turns a yes into a ConsentToken, and only askConsent can make one. addAiSuggestions
-// requires the token and checks its terms against the provider and cap it is given.
+// step reads only the counted files, bundleCode `onlyPaths`, with CountingSummary.covers() as the backstop).
+// "No AI call without consent" is a type rule backed by runtime checks (Plan U T4b, review M1/M2): consentScreen() makes
+// the screen (its text plus the terms a yes agrees to; a module-private set records every screen it made), askConsent()
+// turns a yes into a ConsentToken with the minter this module claims once from src/audit/consent-token.ts, and nothing
+// else can make one. addAiSuggestions requires the token, checks its terms (provider, model, cap, folder) and spends it.
 import { ollamaHostOf } from '../ai/ollama.js';
 import { refusalFallbackNoteFor } from '../ai/provider.js';
-import { BundleSummary, CountingSummary, excludedSummaryLines } from '../ai/redact.js';
+import { BundleSummary, excludedSummaryLines } from '../ai/redact.js';
+import { claimTokenMinter, CountingSummary, type ConsentMode, type ConsentTerms, type ConsentToken } from '../audit/consent-token.js';
 import type { AiCost, AuditAiEstimate, Estimates, PricedFor } from '../estimate/estimate.js';
 import type { AiProvider, RepoProfile } from '../types.js';
 import { hostPlace } from '../util/local-host.js';
 import { safeText } from '../util/safe-text.js';
 import { PromptCancelledError, type Prompter } from './io.js';
 
-export { bundleSummary, BundleSummary, countingSummary, CountingSummary } from '../ai/redact.js';
+export { bundleSummary, BundleSummary } from '../ai/redact.js';
+export { ConsentToken, countingSummary, CountingSummary, type ConsentMode, type ConsentTerms } from '../audit/consent-token.js';
 /** A private helper repo pipegen uses (`pipelines`, `pipegen-proof-<repo>`), checked before consent. */
 export interface HelperRepo { name: string; exists: boolean }
 export type PermissionRows = { permission: string; why: string }[];
-export type ConsentMode = 'full' | 'audit-ai';
 
 /** Facts the 'audit-ai' screen must show (ruling S21). */
 export interface AuditConsentFacts {
@@ -181,18 +183,11 @@ function permissionsSection(title: string, perms: PermissionRows): string[] {
 /** Words a token-mode screen must never use about repos (DECISIONS #87). */
 const CREATES_OR_DELETES = /create the private helper repos|delete the scratch repo/i;
 
-/** What a yes agrees to: the mode, the provider and model the estimate was priced for, the AI cost cap, and the files. */
-export interface ConsentTerms {
-  readonly mode: ConsentMode;
-  readonly pricedFor: PricedFor;
-  /** The hard AI cost cap the screen showed (null: none, a local model). */
-  readonly capUsd: number | null;
-  /** The file facts the screen showed: the checked bundle's summary, or ('audit-ai' only) the counted bundle's. */
-  readonly files: BundleSummary | CountingSummary;
-}
-
+// The one minter of consent tokens (claimed once, at load): only askConsent below uses it.
+const mintToken = claimTokenMinter();
 let makeScreen: (text: string, terms: ConsentTerms) => ConsentScreen;
-let mintToken: (terms: ConsentTerms) => ConsentToken;
+/** Every screen consentScreen() made: `private constructor` is TypeScript only (review M1). */
+const ISSUED_SCREENS = new WeakSet<object>();
 
 /** The consent screen: its text and the terms a yes agrees to. Only consentScreen() makes one. */
 export class ConsentScreen {
@@ -200,31 +195,16 @@ export class ConsentScreen {
   private constructor(readonly text: string, readonly terms: ConsentTerms) {
     Object.freeze(this);
   }
-  /** True only for an object consentScreen() made. */
+  /** True only for an object consentScreen() made (not one made with `new` through a cast, nor a subclass's). */
   static isScreen(x: unknown): x is ConsentScreen {
-    return typeof x === 'object' && x !== null && #made in x;
+    return typeof x === 'object' && x !== null && #made in x && ISSUED_SCREENS.has(x);
   }
   static {
-    makeScreen = (text, terms) => new ConsentScreen(text, Object.freeze({ ...terms }));
-  }
-}
-
-/**
- * The user said yes to a consent screen (T4b). Only askConsent() makes one: the constructor is private and a private
- * field makes the type nominal, so an object literal doesn't type-check and isToken() refuses a copy. The AI step
- * (addAiSuggestions) requires one, so no AI call can happen without consent.
- */
-export class ConsentToken {
-  readonly #granted = true;
-  private constructor(readonly terms: ConsentTerms) {
-    Object.freeze(this);
-  }
-  /** True only for a token askConsent() made. */
-  static isToken(x: unknown): x is ConsentToken {
-    return typeof x === 'object' && x !== null && #granted in x;
-  }
-  static {
-    mintToken = (terms) => new ConsentToken(terms);
+    makeScreen = (text, terms) => {
+      const made = new ConsentScreen(text, Object.freeze({ ...terms }));
+      ISSUED_SCREENS.add(made);
+      return made;
+    };
   }
 }
 
@@ -297,7 +277,7 @@ function screenFor(p: RepoProfile, provider: AiProvider, est: Estimates | AuditA
   }
   const text = sections.filter((s) => s.length > 0).map((s) => s.join('\n')).join('\n\n');
   // checkPricedFor above proved est.pricedFor is set and matches the provider shown
-  return makeScreen(text, { mode, pricedFor: { ...(est.pricedFor as PricedFor) }, capUsd, files: bundle });
+  return makeScreen(text, { mode, pricedFor: { ...(est.pricedFor as PricedFor) }, capUsd, files: bundle, dir: counted ? (bundle as CountingSummary).dir : null });
 }
 
 /**

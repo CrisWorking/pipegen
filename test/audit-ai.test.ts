@@ -17,6 +17,7 @@ import { fallbackEnabled } from '../src/ai/claude.js';
 import { CANDIDATES_MAX_OUTPUT_TOKENS, CANDIDATES_REQUEST_MAX_BYTES, NEEDS_MAX_OUTPUT_TOKENS } from '../src/engine/discovery-limits.js';
 import { DEFAULT_MODEL, type AiProvider, type AiRequest, type AiUsage, type Capabilities, type ReviewedTool } from '../src/types.js';
 import { fakeFetch, fakeOctokit, type Routes } from './helpers/fake-http.js';
+import { ConsentToken, CountingSummary } from '../src/audit/consent-token.js';
 import { grantAuditAi } from './helpers/consent.js';
 import { CLEAN, makeStub } from './helpers/gitleaks-stub.js';
 import { cleanupRepos, makeTempDir, writeIn } from './helpers/make-repo.js';
@@ -192,7 +193,7 @@ describe('addAiSuggestions (brief, Task 2b)', () => {
     const out = await addAiSuggestions(s.r, s.dir, s.deps);
     expect(s.ensure).toHaveBeenCalledTimes(1);
     expect(bundleCode).toHaveBeenCalledTimes(1);
-    expect(bundleCode).toHaveBeenCalledWith(s.dir, { gitleaks: s.stub.bin, knownValues: [] });
+    expect(bundleCode).toHaveBeenCalledWith(s.dir, { gitleaks: s.stub.bin, knownValues: [], onlyPaths: (s.deps.consent.terms.files as CountingSummary).paths() });
     expect(s.stub.record().argv).toContain('detect'); // the stub really ran as gitleaks
     expect(s.ai.needsReqs()).toHaveLength(1);
     // the binary path is a local variable: never on the report, never added to deps
@@ -611,7 +612,7 @@ describe('addAiSuggestions (controller rulings)', () => {
     expect(s.r.profile.services[0]?.name).toBe(ghValue);
     s.deps.knownValues = [ghValue, aiValue];
     const out = await addAiSuggestions(s.r, s.dir, s.deps);
-    expect(bundleCode).toHaveBeenCalledWith(s.dir, { gitleaks: s.stub.bin, knownValues: [ghValue, aiValue] });
+    expect(bundleCode).toHaveBeenCalledWith(s.dir, { gitleaks: s.stub.bin, knownValues: [ghValue, aiValue], onlyPaths: expect.any(Set) });
     expect(vi.mocked(planNeeds).mock.calls[0]?.[5]).toEqual({ knownValues: [ghValue, aiValue] });
     expect(s.ai.needsReqs()[0]?.user).toContain('zq-visible-marker'); // the file was sent, with the values scrubbed
     expect(s.ai.reqs.length).toBeGreaterThan(1);
@@ -681,14 +682,86 @@ describe('consent token (T4b: no AI call without consent, by type)', () => {
     expect(other.complete).not.toHaveBeenCalled();
   });
 
-  it('consent: the checked bundle may only hold files the user agreed to (counted before gitleaks); else nothing is sent, with a note', async () => {
+  it('consent (I1): the gitleaks walk reads only the counted files, so a file added after consent is never sent and the step still runs', async () => {
     const s = await setup();
-    writeIn(s.dir, 'src/added-after-consent.js', 'export const late = 1;\n'); // a file that wasn't on the consent screen
+    writeIn(s.dir, 'src/added-after-consent.js', 'export const lateMarker = 1;\n'); // not on the consent screen
     const out = await addAiSuggestions(s.r, s.dir, s.deps);
-    expect(s.ensure).toHaveBeenCalledTimes(1);
+    expect(bundleCode).toHaveBeenCalledWith(s.dir, { gitleaks: s.stub.bin, knownValues: [], onlyPaths: (s.deps.consent.terms.files as CountingSummary).paths() });
+    expect(s.ai.needsReqs()).toHaveLength(1);
+    expect(s.ai.needsReqs()[0]?.user).not.toContain('lateMarker');
+    expect(out.ai?.notes.some((n) => /consent screen/.test(n))).toBe(false);
+  });
+
+  it('consent (I1, reviewer repro): gitleaks leaves out a counted file on a truncated repo, so another would fit; only counted files are sent, and the AI step runs', async () => {
+    // 80 files of about 3 KB: past the 150 KB cut; an early file holds a short value the stub reports (left out, not masked)
+    const files: Record<string, string> = {};
+    for (let i = 0; i < 80; i++) files[`src/f${String(i).padStart(2, '0')}.js`] = `// file ${i}\n${'export const v = 1;\n'.repeat(150)}${i === 0 ? 'const q = "zZ9";\n' : ''}`;
+    const s = await setup({ files });
+    const flagShort = makeStub(`fs.writeFileSync(report, JSON.stringify(findingsFor('zZ9'))); process.exit(1);`);
+    s.deps.ensureGitleaks = vi.fn(async () => flagShort.bin);
+    const counted = s.deps.consent.terms.files as CountingSummary;
+    // the repro is real: without the counted list, the checked bundle takes in a file that wasn't counted
+    const unrestricted = await bundleCode(s.dir, { gitleaks: flagShort.bin, knownValues: [] });
+    expect(unrestricted.truncated).toBe(true);
+    expect(counted.covers(unrestricted)).toBe(false);
+    vi.clearAllMocks();
+    const out = await addAiSuggestions(s.r, s.dir, s.deps);
+    expect(s.ai.needsReqs()).toHaveLength(1); // the AI step ran
+    const sentPaths = [...(s.ai.needsReqs()[0]?.user ?? '').matchAll(/^--- (\S+) ---$/gm)].map((m) => m[1] as string);
+    expect(sentPaths.length).toBeGreaterThan(0);
+    for (const path of sentPaths) expect(counted.paths().has(path), path).toBe(true);
+    expect(sentPaths).not.toContain('src/f00.js'); // the file gitleaks left out
+    expect(out.ai?.notes.some((n) => /consent screen/.test(n))).toBe(false);
+  });
+
+  it('consent (backstop): a checked bundle with a file the screen did not count is never sent; the note gives no "run again" advice', async () => {
+    const s = await setup();
+    writeIn(s.dir, 'src/added-after-consent.js', 'export const late = 1;\n');
+    // the gitleaks walk ignores the counted list (a bug the backstop must still catch)
+    const real = (await vi.importActual<typeof import('../src/ai/redact.js')>('../src/ai/redact.js')).bundleCode;
+    vi.mocked(bundleCode).mockImplementationOnce((dir, opts) => real(dir, { ...opts, onlyPaths: null }));
+    const out = await addAiSuggestions(s.r, s.dir, s.deps);
     expect(s.ai.complete).not.toHaveBeenCalled();
-    expect(out.ai?.notes).toContain("Nothing was sent to the AI: after the gitleaks check, the code held files that weren't on the consent screen (the repo changed?). Run the audit again.");
-    for (const n of out.ai?.notes ?? []) expect(redact(n), n).toBe(n);
+    expect(out.ai?.notes).toContain("Nothing was sent to the AI: after the gitleaks check, the code held a file that wasn't on the consent screen, and pipegen sends only files it showed you.");
+    for (const n of out.ai?.notes ?? []) {
+      expect(redact(n), n).toBe(n);
+      expect(n).not.toMatch(/run (the audit )?again/i);
+    }
+  });
+
+  it('consent (M2): a token is single-use and bound to the folder it was given for', async () => {
+    const s = await setup();
+    await addAiSuggestions(s.r, s.dir, s.deps);
+    expect(s.ai.needsReqs()).toHaveLength(1);
+    vi.clearAllMocks();
+    await expect(addAiSuggestions(s.r, s.dir, s.deps)).rejects.toThrow(/already used/);
+    expect(s.ensure).not.toHaveBeenCalled();
+    expect(s.ai.complete).not.toHaveBeenCalled();
+    // a fresh token for this folder, used on another one: refused before anything runs
+    const other = await setup({ name: 'other' });
+    const t = await s.grant();
+    await expect(addAiSuggestions(other.r, other.dir, { ...other.deps, consent: t })).rejects.toThrow(/folder/);
+    expect(other.ensure).not.toHaveBeenCalled();
+    expect(other.ai.complete).not.toHaveBeenCalled();
+  });
+
+  it('consent (M1): a forged or subclassed token, or one made from a forged counting summary, is refused at runtime', async () => {
+    const s = await setup();
+    const Minted = ConsentToken as unknown as new (terms: unknown) => object;
+    const forged = new Minted(s.deps.consent.terms);
+    expect(ConsentToken.isToken(forged)).toBe(false);
+    class Sub extends Minted {}
+    expect(ConsentToken.isToken(new Sub(s.deps.consent.terms))).toBe(false);
+    for (const fake of [forged, new Sub(s.deps.consent.terms)]) {
+      await expect(addAiSuggestions(s.r, s.dir, { ...s.deps, consent: fake as ConsentToken })).rejects.toThrow(/consent/);
+    }
+    const Summary = CountingSummary as unknown as new (...a: unknown[]) => object;
+    const fakeSummary = new Summary(1, 1, [], s.dir, new Set(['src/x.js']));
+    expect(CountingSummary.isSummary(fakeSummary)).toBe(false);
+    class SubSummary extends Summary {}
+    expect(CountingSummary.isSummary(new SubSummary(1, 1, [], s.dir, new Set()))).toBe(false);
+    expect(s.ensure).not.toHaveBeenCalled();
+    expect(s.ai.complete).not.toHaveBeenCalled();
   });
 });
 

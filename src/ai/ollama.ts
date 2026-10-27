@@ -115,7 +115,12 @@ export function ollamaProvider(opts: OllamaOptions = {}): OllamaProvider {
 }
 
 /** Ollama's own cloud: a model there runs on ollama.com, not on a machine the user controls (Plan U ruling U15/H2). */
-const OLLAMA_CLOUD_HOST = /(?:^|\.)ollama\.com\.?$/i;
+const OLLAMA_CLOUD_HOST = /(?:^|\.)ollama\.com$/;
+/**
+ * The host as DNS sees it (review M10): URL parsing has already lower-cased it and applied IDNA (fullwidth letters,
+ * U+3002 dots); trailing dots, any number of them, name the same host, so they are removed before the check.
+ */
+const dnsHost = (url: URL) => url.hostname.toLowerCase().replace(/\.+$/, '');
 const SHOW_TIMEOUT_MS = 15_000;
 /** /api/show answers with the model's metadata (licence text included); more than this is refused. */
 const MAX_SHOW_BYTES = 8 * 1024 * 1024;
@@ -131,7 +136,7 @@ export const OLLAMA_COM_HOST_MESSAGE = 'OLLAMA_HOST points at ollama.com, which 
  */
 export async function checkOllamaModelRunsThere(host: string | undefined, model: string, fetchFn: typeof fetch = globalThis.fetch): Promise<void> {
   const url = ollamaChatUrl(host);
-  if (OLLAMA_CLOUD_HOST.test(url.hostname)) throw new AiError('invalid', OLLAMA_COM_HOST_MESSAGE);
+  if (OLLAMA_CLOUD_HOST.test(dnsHost(url))) throw new AiError('invalid', OLLAMA_COM_HOST_MESSAGE);
   url.pathname = url.pathname.replace(/\/api\/chat$/, '/api/show');
   const where = url.host;
   const refuse = (why: string) => new AiError('invalid', `pipegen couldn't confirm that the Ollama model "${safeText(model, 100)}" runs on ${where} (${why}), so it won't send your code to it.`);

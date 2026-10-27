@@ -44,4 +44,11 @@ describe('module graph (final review M6)', () => {
       'src/util/claude-fallback.ts', 'src/util/local-host.ts', 'src/util/output-limit.ts', 'src/util/package-data.ts', 'src/util/safe-text.ts',
     ]);
   });
+
+  it('module graph (T4b review M11): the audit model pulls in nothing from src/cli/ (the consent token lives in src/audit/)', async () => {
+    for (const entry of ['src/audit/model.ts', 'src/audit/render.ts', 'src/audit/consent-token.ts']) {
+      const files = await graph(entry);
+      expect(files.filter((f) => f.startsWith('src/cli/')), entry).toEqual([]);
+    }
+  });
 });

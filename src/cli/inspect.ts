@@ -169,7 +169,7 @@ export async function inspect(dir: string, io: CliIO, opts: { allowBroad: boolea
     }
     const gh = makeOctokit(auth.token, { fetch: io.fetch, clock, log: fail });
     const login = await tokenLogin(gh, auth, clock, notes);
-    const ctx: GitHubContext = await readGitHubContext(gh, owner, repo, login, clock);
+    const ctx: GitHubContext = await readGitHubContext(gh, owner, repo, login, clock, notes);
     const p: RepoProfile = { ...local, ...ctx };   // GitHub's default branch replaces the reader's 'main' stub
     const caps = await probeCapabilities(gh, owner, repo, p, notes, clock);
     if (auth.kind === 'anonymous') {

@@ -1,6 +1,7 @@
 // A real consent token for tests of the AI step: the real consentScreen() and askConsent() with a prompter that says
 // yes, for a counted bundle of `dir`. Only askConsent can make a ConsentToken (Plan U T4b), so tests get one this way.
-import { bundleCode, countingSummary } from '../../src/ai/redact.js';
+import { bundleCode } from '../../src/ai/redact.js';
+import { countingSummary } from '../../src/audit/consent-token.js';
 import { askConsent, consentScreen } from '../../src/cli/consent.js';
 import type { Prompter } from '../../src/cli/io.js';
 import { estimateAuditAi } from '../../src/estimate/estimate.js';

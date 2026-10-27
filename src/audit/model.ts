@@ -22,14 +22,14 @@
 //
 // Output rule (src/types.ts): repo-derived strings are kept RAW (validated by the readers) and cleaned only where
 // Task 3 prints them. Nothing here escapes a value, and no file content or secret value is ever stored.
-import { lstat } from 'node:fs/promises';
+import { lstat, realpath } from 'node:fs/promises';
 import { join } from 'node:path';
 import type { Octokit } from '@octokit/rest';
 import { count, outputLimit } from '../ai/errors.js';
 import { ollamaHostOf } from '../ai/ollama.js';
 import { AiError, COST_CAP_MESSAGE, refusalFallbackNoteFor, type AiErrorKind } from '../ai/provider.js';
 import {
-  BundleSummary, bundleCode, COUNTING_ONLY_NOTE, CountingSummary, EXCLUDED_PATTERNS, findSecretLike, GitleaksError, isExcludedPath, redact, scrubKnownValues, type CodeBundle,
+  bundleCode, COUNTING_ONLY_NOTE, EXCLUDED_PATTERNS, findSecretLike, GitleaksError, isExcludedPath, redact, scrubKnownValues, type CodeBundle,
 } from '../ai/redact.js';
 import { needLanguage, suggestTools } from '../engine/discover.js';
 import type { RateBudget } from '../engine/github-rate.js';
@@ -41,7 +41,6 @@ import { projectScriptFor, reviewedFor, type ProjectScriptStep } from '../engine
 import {
   activity30d, aiRequestBytes, estimate, requestCeilingUsd, unpricedModel, usageCeilingUsd, usageCostUsd, type Activity, type Estimates,
 } from '../estimate/estimate.js';
-import { ConsentToken } from '../cli/consent.js';
 import { signingMode } from '../github/signing-mode.js';
 import { IGNORED_DIRS, listFiles, READ_LIMITS, readTextLimited, readTextLimitedWithReason } from '../read/limits.js';
 import { readProject } from '../read/project.js';
@@ -53,6 +52,7 @@ import {
 } from '../types.js';
 import { packageVersion } from '../util/package-data.js';
 import { safeText } from '../util/safe-text.js';
+import { ConsentToken, CountingSummary, isSpent, spend } from './consent-token.js';
 import { mapCoverage, type Coverage } from './coverage.js';
 
 // ---------- types ----------
@@ -614,7 +614,8 @@ const AI_NOTE = {
   anonymous: 'Without a GitHub token, GitHub allows 60 requests an hour, so tool suggestions may stop early. Set GITHUB_TOKEN (read-only) for a full search.',
   lookAlike: "pipegen's reviewed tool list isn't usable in this build, so it couldn't check suggested tools for look-alike names; it shows no tool suggestions.",
   noGitleaks: (why: string) => `The AI step was skipped and nothing was sent to the AI: the required gitleaks check couldn't run. ${why}`,
-  notConsented: "Nothing was sent to the AI: after the gitleaks check, the code held files that weren't on the consent screen (the repo changed?). Run the audit again.",
+  // the backstop (review I1): the walk reads only counted files, so this means a bug, not something the user can fix
+  notConsented: "Nothing was sent to the AI: after the gitleaks check, the code held a file that wasn't on the consent screen, and pipegen sends only files it showed you.",
   stopped: (why: string) => `The AI step stopped: ${why}.`,
   searchStopped: (why: string) => `The tool search stopped: ${why}.`,
   fallbackTried: "Claude's refusal fallback had already run the request again on another Claude model, and it was declined there too.",
@@ -734,26 +735,29 @@ export function needsRequestBytes(r: AuditReport, knownValues: string[]): number
 }
 
 /**
- * T4b: the AI step runs only on a ConsentToken from askConsent for the audit --ai screen, given for this provider,
- * model (and Ollama host) and this cap. Anything else is a programming error: thrown before anything runs.
+ * T4b (review M1, M2): the AI step runs only on a ConsentToken askConsent really issued for the audit --ai screen,
+ * not used before, given for this provider, model (and Ollama host) and cap, and for the files counted in this folder
+ * (a CountingSummary whose real path is `dir`'s). Anything else is a programming error, thrown before anything runs.
+ * The token is then spent: a second AI step needs a new yes. Returns the counted files.
  */
-function checkConsent(deps: AiSuggestDeps): void {
+async function checkConsent(dir: string, deps: AiSuggestDeps): Promise<CountingSummary> {
   const c: unknown = deps.consent;
   if (!ConsentToken.isToken(c) || c.terms.mode !== 'audit-ai') {
     throw new Error('addAiSuggestions needs the consent token askConsent() gives for the audit --ai screen; nothing was sent.');
   }
+  if (isSpent(c)) throw new Error('This consent was already used for an AI step; each AI step needs its own yes. Nothing was sent.');
   const t = c.terms;
   const host = deps.ai.name === 'ollama' ? ollamaHostOf(deps.ai) ?? undefined : undefined;
   if (t.pricedFor.provider !== deps.ai.name || t.pricedFor.model !== deps.ai.model || t.pricedFor.host !== host || t.capUsd !== deps.capUsd) {
     throw new Error('addAiSuggestions was given another AI provider, model or cost cap than the user agreed to; nothing was sent.');
   }
-}
-
-/** Every file of the checked bundle is one the consent screen counted (a counted summary), or within its counts (a checked one). */
-function consentCovers(consent: ConsentToken, bundle: CodeBundle): boolean {
-  const f = consent.terms.files;
-  if (CountingSummary.isSummary(f)) return f.covers(bundle);
-  return BundleSummary.isSummary(f) && bundle.files.length <= f.files && bundle.bytes <= f.bytes;
+  const files = t.files;
+  const here = await realpath(dir).catch(() => null);
+  if (!CountingSummary.isSummary(files) || t.dir === null || files.dir !== t.dir || here !== t.dir) {
+    throw new Error('This consent was given for the files counted in another folder; nothing was sent.');
+  }
+  spend(c);
+  return files;
 }
 
 /** The service's own test/lint script would run for this need (S27: a service without tests has none for tests). */
@@ -767,9 +771,10 @@ function hasProjectScript(need: Need, p: RepoProfile): boolean {
 /**
  * `audit --ai`, after consent: the needs the AI adds and mention-only tool suggestions, in `ai` of a copy of `r`
  * (the rest of the report is unchanged).
- * 0. `deps.consent` must be the ConsentToken askConsent gave for the audit --ai screen, for this provider, model and cap
- *    (Plan U T4b: no AI call without consent, by type); anything else is thrown before anything runs. Only files the
- *    screen counted may be sent: a checked bundle with another file is not sent (a note).
+ * 0. `deps.consent` must be the ConsentToken askConsent gave for the audit --ai screen, for this provider, model, cap
+ *    and folder, not used before (Plan U T4b, review M1/M2); anything else is thrown before anything runs, and the token
+ *    is spent. The gitleaks walk reads only the files the screen counted (onlyPaths, review I1); covers() is the
+ *    backstop (a note, nothing sent). File content can change between the count and the send; the cap still holds (M3).
  * 1. gitleaks is made ready right before the bundle is built with it (the path stays a local variable). No binary, or
  *    a gitleaks failure: no AI call, a note.
  * 2. planNeeds(…, writers 0, knownValues): the needs it adds become `extraNeeds`; floor needs are never changed.
@@ -780,7 +785,7 @@ function hasProjectScript(need: Need, p: RepoProfile): boolean {
  * An AiError never escapes (S16): it becomes a note, and its billed usage still counts. Other errors are thrown.
  */
 export async function addAiSuggestions(r: AuditReport, dir: string, deps: AiSuggestDeps): Promise<AuditReport> {
-  checkConsent(deps);
+  const counted = await checkConsent(dir, deps);
   const notes = new Set<string>();
   // every AI attempt goes through the meter: the one record of usage and the hard cap (ruling U13, review M1)
   const meter = new AiSpendMeter(deps.ai, deps.capUsd);
@@ -817,14 +822,15 @@ export async function addAiSuggestions(r: AuditReport, dir: string, deps: AiSugg
   let bundle: CodeBundle;
   try {
     const bin = await (deps.ensureGitleaks ?? (() => ensurePinnedBinary('gitleaks')))();
-    bundle = await bundleCode(dir, { gitleaks: bin, knownValues: deps.knownValues });
+    // only the files the consent screen counted (review I1): the checked bundle can only shrink
+    bundle = await bundleCode(dir, { gitleaks: bin, knownValues: deps.knownValues, onlyPaths: counted.paths() });
   } catch (e) {
     if (!(e instanceof PinnedBinaryError || e instanceof GitleaksError)) throw e;
     notes.add(AI_NOTE.noGitleaks(e.message));
     return done();
   }
   // only files the user agreed to (the consent screen counted them before the gitleaks pass, ruling S21)
-  if (!consentCovers(deps.consent, bundle)) {
+  if (!counted.covers(bundle)) {
     notes.add(AI_NOTE.notConsented);
     return done();
   }

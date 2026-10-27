@@ -20,7 +20,8 @@ import { resolve } from 'node:path';
 import type { Octokit } from '@octokit/rest';
 import { checkOllamaModelRunsThere } from '../ai/ollama.js';
 import { AiError, makeProvider } from '../ai/provider.js';
-import { bundleCode, countingSummary, scrubKnownValues } from '../ai/redact.js';
+import { bundleCode, scrubKnownValues } from '../ai/redact.js';
+import { countingSummary } from '../audit/consent-token.js';
 import { writeOutFile, OutFileError } from '../audit/out-file.js';
 import { addAiSuggestions, buildAudit, buildLocalAudit, needsRequestBytes, type AuditReport } from '../audit/model.js';
 import { renderJson, renderLocalJson, renderLocalTerminal, renderMarkdown, renderTerminal, type RenderOptions } from '../audit/render.js';
@@ -131,7 +132,7 @@ export async function audit(io: CliIO, flags: AuditFlags): Promise<number> {
       if (auth.token !== null) knownValues.push(auth.token);
       const gh = makeOctokit(auth.token, { fetch: io.fetch, clock, timeoutMs: GITHUB_TIMEOUT_MS, log: fail });
       const login = await tokenLogin(gh, auth, clock, notes);
-      const context = await readGitHubContext(gh, owner, repo, login, clock);
+      const context = await readGitHubContext(gh, owner, repo, login, clock, notes);
       const caps = await probeCapabilities(gh, owner, repo, { ...local, ...context }, notes, clock);
       github = { auth, gh, context, caps };
     } catch (e) {
@@ -174,7 +175,7 @@ export async function audit(io: CliIO, flags: AuditFlags): Promise<number> {
       const scrub = (s: string) => scrubKnownValues(hideToken(s, token), usableKnownValues(knownValues));
       const consent = await askConsent({ ...io.prompt, confirm: (msg, def) => io.prompt.confirm(scrub(msg), def) }, screen, fail);
       if (consent === null) {
-        fail('You said no: nothing was sent to an AI. The report below is the plain audit.');
+        fail('No consent (you said no, or the question was cancelled): nothing was sent to an AI. The report below is the plain audit.');
       } else {
         r = await addAiSuggestions(r, dir, {
           ai: ai.provider, gh: github.gh, memory: await openMemory(), fetch: io.fetch ?? globalThis.fetch, reviewed, bar: ai.bar,
