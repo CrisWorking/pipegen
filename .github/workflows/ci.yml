@@ -9,10 +9,16 @@ permissions: {}
 
 jobs:
   test:
+    name: test (node ${{ matrix.node }})
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        # engines is >=24 (maintained until 2028-04-30); 26 is the development version (.nvmrc). DECISIONS #92.
+        node: [24, 26]
     concurrency:
-      group: ci-test-${{ github.event_name == 'pull_request' && github.ref || github.sha }}
+      group: ci-test-${{ matrix.node }}-${{ github.event_name == 'pull_request' && github.ref || github.sha }}
       cancel-in-progress: ${{ github.event_name == 'pull_request' }}
     permissions:
       contents: read
@@ -22,7 +28,7 @@ jobs:
           persist-credentials: false
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
-          node-version: 24
+          node-version: ${{ matrix.node }}
       - run: npm ci
       - run: npm test
       - name: Live test against the real pinned gitleaks (downloads the pinned release from github.com)
@@ -82,7 +88,7 @@ jobs:
           echo "c872d6db8c6bf83a8eaa704fc93999f027d55dffbc63b8a6abdccb47df5f4cd4  $RUNNER_TEMP/actionlint" | sha256sum -c -
       - name: Run actionlint
         run: '"$RUNNER_TEMP/actionlint" -color .github/workflows/*.yml'
-      - uses: zizmorcore/zizmor-action@53290badfa369cb0bf7ad16342cb62c2fa47ac7b # v0.8.0
+      - uses: zizmorcore/zizmor-action@85b2b9fb8e3325e7a23d7d0a9d7ba5ae0f999e3e # v0.7.1
         with:
           advanced-security: false
           inputs: .github/workflows/
