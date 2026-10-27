@@ -505,6 +505,7 @@ describe('pinned-binaries.yml', () => {
     const raw = parse(readFileSync(PINS_FILE, 'utf8')) as Record<string, { pinnedOn?: unknown; releasedAt: string }>;
     for (const [name, entry] of Object.entries(raw)) {
       expect(typeof entry.pinnedOn, name).toBe('string');
+      expect(Date.parse(entry.pinnedOn as string), `${name}: pinnedOn is not in the future`).toBeLessThanOrEqual(Date.now());
       expect(Date.parse(entry.pinnedOn as string) - Date.parse(entry.releasedAt), name).toBeGreaterThanOrEqual(COOLDOWN_DAYS * DAY);
     }
   });

@@ -692,4 +692,8 @@ describe('packageExists', () => {
     await expect(packageExists('npm', 'moved', '1.0.0', redirect.fetch)).rejects.toThrow();
     expect(redirect.calls.map((c) => c.url.host)).toEqual(['registry.npmjs.org']);
   });
+
+  it('reviewed-tools.yml: pinnedOn is not in the future (the cooldown is measured from it)', () => {
+    expect(Date.parse(rawFile().pinnedOn), 'pinnedOn is not in the future').toBeLessThanOrEqual(Date.now());
+  });
 });

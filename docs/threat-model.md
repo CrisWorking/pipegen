@@ -1,6 +1,6 @@
 # pipegen Threat Model
 
-> Version 5, 2026-10-27, for design v3.2 (adds what spikes S2 and S3 measured on real GitHub repos: T47 and T48, and a corrected T30; DECISIONS #73–#77). Version 4 added the user's-machine threats T40–T45 and the milestone map. Plain English. It's updated whenever the design changes. v2 adds the threats found by the round-2 red team (T17–T27) and corrects T1 and T8.
+> Version 5, 2026-10-27, for design v3.2 (adds what spikes S2 and S3 measured on real GitHub repos: T47 and T48, and a corrected T30; DECISIONS #73–#78). Version 4 added the user's-machine threats T40–T45 and the milestone map. Plain English. It's updated whenever the design changes. v2 adds the threats found by the round-2 red team (T17–T27) and corrects T1 and T8.
 
 ## What we protect (assets)
 

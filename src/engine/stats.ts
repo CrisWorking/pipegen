@@ -410,8 +410,8 @@ export async function fetchStats(c: Candidate, deps: StatsDeps, install?: Instal
    *   (install spec's or candidate's version) must be one of the tags there, or a partial label (4, 4.2) fitting a
    *   full one; else null.
    * - No pinned commit: the label; else, for an npm or PyPI package, the registry's latest version (final review M4:
- *   never the GitHub release tag, which can differ from the package's version); else (an action) the latest
- *   release's tag (ruling S19). It must be a full x.y.z version.
+   *   never the GitHub release tag, which can differ from the package's version); else (an action) the latest
+   *   release's tag (ruling S19). It must be a full x.y.z version.
    * null + a note when there is none.
    */
   async function versionsToCheck(): Promise<string[] | null> {
