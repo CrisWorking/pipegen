@@ -1016,7 +1016,12 @@ describe('loader rules (Plan P Task 5)', () => {
       rejects([betterleaksEntry({ command: blCmd('--exit-code', zero), args: ['--report-format', 'sarif', '--exit-code', zero] })], /--exit-code/);
       rejects([betterleaksEntry({ command: blCmd(`--exit-code=${zero}`), args: ['--report-format', 'sarif', `--exit-code=${zero}`] })], /--exit-code/);
     }
-    // an earlier 0 overridden by a later 1 is still refused (every value must be non-zero)
+    // ruling P18: exactly 1. 256 and 512 wrap to exit status 0; 2 is refused too (one fixed value)
+    for (const code of ['2', '256', '512', '257']) {
+      rejects([betterleaksEntry({ command: blCmd('--exit-code', code), args: ['--report-format', 'sarif', '--exit-code', code] })], /--exit-code/);
+      rejects([betterleaksEntry({ command: blCmd(`--exit-code=${code}`), args: ['--report-format', 'sarif', `--exit-code=${code}`] })], /--exit-code/);
+    }
+    // an earlier 0 overridden by a later 1 is still refused (every value must be 1)
     rejects([betterleaksEntry({ command: blCmd('--exit-code', '0', '--exit-code', '1'), args: ['--report-format', 'sarif', '--exit-code', '0', '--exit-code', '1'] })], /--exit-code/);
   });
 

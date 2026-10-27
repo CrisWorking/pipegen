@@ -804,13 +804,12 @@ function betterleaksProblems(e: Entry): Problem[] {
     if (paths.some((v) => v !== outPath || v === '-' || v.startsWith('/'))) {
       bad(`betterleaks --report-path must be the entry's output file (${outPath || 'none'}), never - or a device: anything else can print the findings, secrets included, into the CI log`, 'step', 'cli', 'command');
     }
-    // --exit-code: fixed by the template, in the command AND the fixed args (both or neither), the same value, and
-    // every value a plain non-zero number (no 0, 00, +0, 0x0: 0 would pass a scan that found secrets)
+    // --exit-code (ruling P18): fixed by the template, in the command AND the fixed args (both or neither), and every
+    // value exactly 1. 0 (or 00, +0, 0x0) passes a scan that found secrets, and so does 256, 512, … (the process exit
+    // status is the code modulo 256)
     const codes = [...p.flags, ...pa.flags].filter((f) => f.name === 'exit-code').map((f) => f.value);
-    const code = lastValue(p, 'exit-code');
-    const fixedCode = lastValue(pa, 'exit-code');
-    if (code !== fixedCode || codes.some((v) => !/^[1-9]\d{0,2}$/.test(v))) {
-      bad('betterleaks --exit-code is a fixed arg: the same non-zero value in the command and fixedInputs.args, or in neither (0 would pass a scan that found secrets)', 'fixedInputs', 'args');
+    if (lastValue(p, 'exit-code') !== lastValue(pa, 'exit-code') || codes.some((v) => v !== '1')) {
+      bad('betterleaks --exit-code is a fixed arg: exactly 1, in the command and fixedInputs.args, or in neither (0, or 256 and its multiples, would pass a scan that found secrets; ruling P18)', 'fixedInputs', 'args');
     }
     out.push(...allowlistProblems('betterleaks', [p, pa], BETTERLEAKS_ALLOWED_FLAGS, '--', (n) => n === 'config' || forbidden.has(`--${n}`) || n.startsWith('validation')));
     out.push(...choiceProblems('betterleaks', e, (k) => (g.value.has(k) || g.bool.has(k) || g.optional.has(k)) && BETTERLEAKS_ALLOWED_FLAGS.has(k),
