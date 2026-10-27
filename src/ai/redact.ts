@@ -30,6 +30,9 @@ export interface BundleOptions {
   gitleaksTimeoutMs?: number;
 }
 
+/** The note a bundle built without gitleaks carries (counting only). The audit leaves it out of its report (nothing is sent there). */
+export const COUNTING_ONLY_NOTE = 'gitleaks was not run: this bundle is for counting only and cannot be sent to the AI.';
+
 const R = '[REDACTED]';
 const LONG_LINE = '[REDACTED: line too long]';
 const DEFAULT_MAX_BYTES = 150_000;
@@ -1206,7 +1209,7 @@ export async function bundleCode(dir: string, opts: BundleOptions = {}): Promise
     collected = await gitleaksPass(collected, opts.gitleaks, opts.gitleaksTimeoutMs ?? GITLEAKS_TIMEOUT_MS, known, { long: flagged, short: flaggedTokens }, notes, show);
     gitleaksChecked = true;
   } else {
-    notes.add('gitleaks was not run: this bundle is for counting only and cannot be sent to the AI.');
+    notes.add(COUNTING_ONLY_NOTE);
   }
 
   // Cut to maxBytes, counted as the exact size of bundleText (wrapper and per-file headers included): keep

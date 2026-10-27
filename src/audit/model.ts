@@ -23,14 +23,14 @@
 import { lstat } from 'node:fs/promises';
 import { join } from 'node:path';
 import type { Octokit } from '@octokit/rest';
-import { bundleCode, EXCLUDED_PATTERNS, findSecretLike, isExcludedPath, redact } from '../ai/redact.js';
+import { bundleCode, COUNTING_ONLY_NOTE, EXCLUDED_PATTERNS, findSecretLike, isExcludedPath, redact } from '../ai/redact.js';
 import { needLanguage } from '../engine/discover.js';
-import { newRateBudget, type RateBudget } from '../engine/github-rate.js';
+import type { RateBudget } from '../engine/github-rate.js';
 import { floorNeeds, isRunnable, jobCategories } from '../engine/needs.js';
 import { projectScriptFor, reviewedFor, type ProjectScriptStep } from '../engine/reviewed.js';
 import { activity30d, estimate, type Activity, type Estimates } from '../estimate/estimate.js';
 import { signingMode } from '../github/signing-mode.js';
-import { IGNORED_DIRS, listFiles, READ_LIMITS, readTextLimited } from '../read/limits.js';
+import { IGNORED_DIRS, listFiles, READ_LIMITS, readTextLimited, readTextLimitedWithReason } from '../read/limits.js';
 import { readProject } from '../read/project.js';
 import { supportLevel } from '../read/support.js';
 import { skippedWorkflowCount } from '../read/workflows.js';
@@ -81,8 +81,10 @@ export interface AuditReport {
   aiBundle: { files: number; bytes: number; truncated: boolean; excludedPatterns: string[]; topFolders: string[] };
   /** How pipegen was started (a repo .npmrc with a registry, a local node_modules/.bin/pipegen) and anonymous access. */
   warnings: string[];
-  /** Reader, workflow, capability-probe, bundle, coverage and secrets-scan notes; deduped (ruling S11). */
+  /** Reader, workflow, capability-probe, bundle, coverage and secrets-scan notes; deduped (ruling S11), each passed through redact() (a secret-like file name in a reader note is masked). */
   notes: string[];
+  /** Ruling U11: the caller couldn't use the reviewed list (B3). Task 2b drops every discovery suggestion when true. */
+  reviewedUnavailable: boolean;
   /** Only with --ai, after consent (Task 2b); mention-only. */
   ai?: { extraNeeds: Need[]; suggestions: PipelineDraft['suggestions']; notes: string[] };
 }
@@ -102,8 +104,8 @@ export interface AuditDeps {
   now: () => number;
   /** Notes the caller already has (GitHub context, capability probe); merged into report.notes. */
   notes?: string[];
-  /** The run's GitHub wait budget (one newRateBudget() per run); a fresh one when absent. */
-  budget?: RateBudget;
+  /** The run's GitHub wait budget: the one newRateBudget() the CLI makes per run, shared by every GitHub call. */
+  budget: RateBudget;
   sleep?: (ms: number) => Promise<void>;
 }
 
@@ -143,13 +145,31 @@ const NAME_RULE = 'secret-like-name';
 const MAX_SECRET_ROWS = 200;
 /** Secrets scan budget: past this many bytes read, the rest isn't scanned (with a note). */
 const MAX_SCAN_BYTES = 200_000_000;
+const SKIPPED_DIRS_NOTE = `The secrets scan did not check dependency and build folders (${IGNORED_DIRS.filter((d) => d !== '.git').join(', ')}) or .git, so committed build output was not checked either.`;
 const UNTRACKED_NOTE = "pipegen reads the files on disk without git, so files that aren't committed (for example a local .env) are in this list too.";
 
 const NO_TOKEN = 'No token: public data only, rate-limited.';
-/** `.npmrc` keys that change which package npx runs, or how node starts it (any scope: `@acme:registry`). */
-const NPMRC_KEY_RE = /^\s*["']?(?:@[^\s:="']*:)?(?:registry|node-options)["']?\s*=/i;
-/** Only the start of a line is matched, so a huge line can't stall the pattern and can't hide the key. */
+/**
+ * `.npmrc` keys that change which package npx runs or how it starts it (any scope: `@acme:registry`): the registry,
+ * node's options, and the shell `npm exec` uses.
+ */
+const NPMRC_KEY_RE = /^["']?(?:@[^\s:="']*:)?(?:registry|node-options|script-shell)["']?\s*=/i;
+/**
+ * Only the start of a line (after its leading whitespace, which npm's ini parser trims too) is matched, so a huge line
+ * can't stall the pattern and padding can't push the key out of view.
+ */
 const NPMRC_KEY_WINDOW = 300;
+
+/** The report's notes: deduped, each masked with redact() (a reader note can name a file whose name looks like a secret). */
+class Notes {
+  readonly #seen = new Set<string>();
+  add(note: string): void {
+    this.#seen.add(redact(note));
+  }
+  all(): string[] {
+    return [...this.#seen];
+  }
+}
 
 // ---------- buildAudit ----------
 
@@ -159,7 +179,7 @@ const NPMRC_KEY_WINDOW = 300;
  * Throws NotGitHubRepoError when `dir` isn't a GitHub checkout (readProject).
  */
 export async function buildAudit(dir: string, deps: AuditDeps): Promise<AuditReport> {
-  const notes = new Set<string>();
+  const notes = new Notes();
   const readerNotes: string[] = [];
   const local = await readProject(dir, { notes: readerNotes });
   const profile: RepoProfile = {
@@ -188,7 +208,7 @@ export async function buildAudit(dir: string, deps: AuditDeps): Promise<AuditRep
 
   const bundle = await bundleCode(dir);
   // A counting-only bundle says it "cannot be sent to the AI"; nothing is sent here, so that note would only confuse.
-  for (const n of bundle.notes) if (!n.startsWith('gitleaks was not run')) notes.add(n);
+  for (const n of bundle.notes) if (n !== COUNTING_ONLY_NOTE) notes.add(n);
 
   return {
     profile,
@@ -207,7 +227,8 @@ export async function buildAudit(dir: string, deps: AuditDeps): Promise<AuditRep
       excludedPatterns: [...EXCLUDED_PATTERNS], topFolders: topFolders(bundle.files.map((f) => f.path)),
     },
     warnings: await warningsOf(dir, deps.anonymous),
-    notes: [...notes],
+    notes: notes.all(),
+    reviewedUnavailable: deps.reviewedUnavailable === true,
   };
 }
 
@@ -222,7 +243,7 @@ function supportOf(p: RepoProfile): AuditSupport {
 }
 
 /** mapCoverage, or every need `unknown` with a plain note when it fails (the tool signatures can't be loaded). */
-async function coverageOf(p: RepoProfile, needs: Need[], dir: string, skippedWorkflows: number, notes: Set<string>): Promise<Coverage[]> {
+async function coverageOf(p: RepoProfile, needs: Need[], dir: string, skippedWorkflows: number, notes: Notes): Promise<Coverage[]> {
   try {
     return await mapCoverage(p, needs, dir, { skippedWorkflows });
   } catch (e) {
@@ -238,9 +259,11 @@ function wouldAddRows(p: RepoProfile, coverage: Coverage[], deps: AuditDeps): Wo
     if (c.status === 'covered') continue;
     const need = c.need;
     const service = need.service === undefined ? undefined : p.services.find((s) => s.name === need.service);
-    const { tool, note } = pick(need, service, p, deps);
-    const isTests = need.category === 'unit-tests' || need.category === 'full-tests';
-    rows.push({ need, status: c.status, tool, note: isTests && service !== undefined && !service.hasTests ? starterTests(service.name) : note });
+    // S27: a service without tests gets starter tests; its own `test` script (npm's default "no test specified") is
+    // then not offered as the tool, so the row's tool and note agree (fix round 1, M2).
+    const starter = (need.category === 'unit-tests' || need.category === 'full-tests') && service !== undefined && !service.hasTests;
+    const { tool, note } = pick(need, starter ? undefined : service, p, deps);
+    rows.push({ need, status: c.status, tool, note: starter ? starterTests(service.name) : note });
   }
   return rows;
 }
@@ -281,7 +304,7 @@ function limitsOf(p: RepoProfile, caps: Capabilities): string[] {
 /** The last 30 days of pushes and pull requests, or null when GitHub won't say (rate limit, no access, bad answer). */
 async function activityOf(deps: AuditDeps, p: RepoProfile): Promise<Activity | null> {
   try {
-    return await activity30d(deps.gh, p, { budget: deps.budget ?? newRateBudget(), now: deps.now, ...(deps.sleep === undefined ? {} : { sleep: deps.sleep }) });
+    return await activity30d(deps.gh, p, { budget: deps.budget, now: deps.now, ...(deps.sleep === undefined ? {} : { sleep: deps.sleep }) });
   } catch {
     return null;
   }
@@ -309,13 +332,14 @@ function nameLooksSecret(path: string): boolean {
  * Secret-like text in the files on disk now: every listed file (symlinks never followed; dependency and build folders
  * skipped, like every reader), lstat, then the limited reader, then findSecretLike. Rule names and file names only.
  */
-async function scanTree(dir: string, notes: Set<string>): Promise<SecretInTree[]> {
+async function scanTree(dir: string, notes: Notes): Promise<SecretInTree[]> {
   const listing = await listFiles(dir, ['**/*'], IGNORED_DIRS.map((d) => `**/${d}/**`));
   const rows: SecretInTree[] = [];
   let more = 0;
   let bytes = 0;
   let stopped = false;
   let tooLarge = 0;
+  let unreadable = 0;
   const add = (row: SecretInTree) => {
     if (rows.length < MAX_SECRET_ROWS) rows.push(row);
     else more++;
@@ -337,14 +361,20 @@ async function scanTree(dir: string, notes: Set<string>): Promise<SecretInTree[]
       stopped = true;
       continue;
     }
-    const text = await readTextLimited(abs);
-    if (text === null) continue;
+    const read = await readTextLimitedWithReason(abs);
+    if (!('text' in read)) {
+      if (read.skipped === 'unreadable') unreadable++;
+      continue;
+    }
+    const text = read.text;
     bytes += Buffer.byteLength(text);
     for (const rule of findSecretLike(text).sort()) add({ file, rule, ...extra });
   }
+  notes.add(SKIPPED_DIRS_NOTE);
   if (listing.truncated) notes.add('The secrets scan stopped listing files at the file limit; the rest were not checked.');
   if (stopped) notes.add(`The secrets scan stopped after ${MAX_SCAN_BYTES / 1_000_000} MB of files; the rest were not checked.`);
   if (tooLarge > 0) notes.add(`The secrets scan skipped ${tooLarge === 1 ? '1 file' : `${tooLarge} files`} larger than 1 MB.`);
+  if (unreadable > 0) notes.add(`The secrets scan couldn't read ${unreadable === 1 ? '1 file' : `${unreadable} files`} (no permission, or it changed while being read); ${unreadable === 1 ? 'it was' : 'they were'} not checked.`);
   if (more > 0) notes.add(`…and ${more} more secret-like findings not listed.`);
   if (rows.length > 0) notes.add(UNTRACKED_NOTE);
   return rows;
@@ -353,10 +383,11 @@ async function scanTree(dir: string, notes: Set<string>): Promise<SecretInTree[]
 // ---------- how pipegen was started ----------
 
 /**
- * Ruling S30 / Review Focus 9: a repo `.npmrc` with a registry (or node-options) line, or a local
+ * Ruling S30 / Review Focus 9: a repo `.npmrc` with a registry, node-options or script-shell line, or a local
  * node_modules/.bin/pipegen, could change which pipegen runs when started from inside the repo. The `.npmrc` is read
  * only for that yes/no (no value is kept); one that can't be read safely (a symbolic link, too large) counts as yes.
- * node_modules/.bin/pipegen is checked with lstat only: a symbolic link counts and is never followed.
+ * node_modules/.bin/pipegen is an existence check with lstat: the last part is never followed (a dangling link
+ * counts), while a symlinked node_modules or .bin folder on the way is followed, as npx would follow it too.
  */
 async function warningsOf(dir: string, anonymous: boolean): Promise<string[]> {
   const out: string[] = [];
@@ -376,5 +407,5 @@ async function npmrcSetsRegistry(dir: string): Promise<boolean> {
   if (info.isSymbolicLink() || !info.isFile()) return true; // npm would follow it; pipegen won't, so it can't say no
   const text = await readTextLimited(path);
   if (text === null) return true;
-  return text.split(/\r\n|\r|\n/).some((line) => NPMRC_KEY_RE.test(line.slice(0, NPMRC_KEY_WINDOW)));
+  return text.split(/\r\n|\r|\n/).some((line) => NPMRC_KEY_RE.test(line.trimStart().slice(0, NPMRC_KEY_WINDOW)));
 }

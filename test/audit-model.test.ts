@@ -1,13 +1,14 @@
 // Plan U Task 2a: the audit model (buildAudit). Controller rulings B1, B3, S7-S12, S27, S29, S30 and the Plan U
 // carry-forwards (estimates by jobCategories, coverage skipped count and signature errors, no child processes).
-import { mkdirSync, readFileSync, symlinkSync } from 'node:fs';
+import { chmodSync, mkdirSync, readFileSync, symlinkSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import type { Octokit } from '@octokit/rest';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import * as childProcess from 'node:child_process';
-import { EXCLUDED_PATTERNS } from '../src/ai/redact.js';
+import { COUNTING_ONLY_NOTE, EXCLUDED_PATTERNS } from '../src/ai/redact.js';
 import { mapCoverage } from '../src/audit/coverage.js';
 import { buildAudit, CURRENT_MILESTONE, type AuditDeps, type AuditReport } from '../src/audit/model.js';
+import { newRateBudget } from '../src/engine/github-rate.js';
 import { floorNeeds, jobCategories } from '../src/engine/needs.js';
 import { estimate } from '../src/estimate/estimate.js';
 import { readProject } from '../src/read/project.js';
@@ -74,7 +75,7 @@ function deps(over: Partial<AuditDeps> = {}): AuditDeps {
     gh: fakeGh().gh, anonymous: false,
     context: { private: false, ownerType: 'User', plan: 'free', defaultBranch: 'main' },
     capabilities: allCaps, permissions: [{ permission: 'Contents: read and write', why: 'to open the pull request' }],
-    reviewed: [], now: () => NOW, ...over,
+    reviewed: [], now: () => NOW, budget: newRateBudget(), ...over,
   };
 }
 
@@ -348,7 +349,7 @@ describe('buildAudit (controller rulings)', () => {
     expect(r.notes).toContain('Skipped .github/workflows/bad.yml: it could not be parsed.');
     expect(new Set(r.notes).size).toBe(r.notes.length);
     // a counting-only bundle's "cannot be sent" note is about pipegen's internals, not this report
-    expect(r.notes.some((n) => n.startsWith('gitleaks was not run'))).toBe(false);
+    expect(r.notes).not.toContain(COUNTING_ONLY_NOTE);
   });
 
   it('S12: includedMinutes and a capped activity reach the estimates', async () => {
@@ -458,6 +459,82 @@ describe('buildAudit (carry-forwards)', () => {
     await buildAudit(dir, deps());
     for (const name of ['exec', 'execFile', 'execFileSync', 'execSync', 'fork', 'spawn', 'spawnSync'] as const) {
       expect(vi.mocked(childProcess[name]), name).not.toHaveBeenCalled();
+    }
+  });
+});
+
+describe('buildAudit (fix round 1)', () => {
+  it('I1: a secret-like workflow file name and service folder name are masked in notes; secretsInTree keeps its label', async () => {
+    const tok = fake.githubClassic();
+    const key = fake.awsKey();
+    const dir = repo({
+      ...nodeApp(),
+      [`.github/workflows/${tok}.yml`]: 'on: [\n',
+      [`${key}/Dockerfile`]: 'FROM node:24\n',
+      [`${key}/package.json`]: '{\n',
+    });
+    const r = await buildAudit(dir, deps());
+    for (const v of [tok, key]) expect(r.notes.join('\n'), v.slice(0, 4)).not.toContain(v);
+    // the notes are still there, with the name masked
+    expect(r.notes.filter((n) => n.startsWith('Skipped ') && n.includes('[REDACTED]')).length).toBeGreaterThanOrEqual(2);
+    expect(r.secretsInTree.filter((s) => s.file === NAME_HIDDEN).length).toBeGreaterThanOrEqual(3);
+    for (const v of [tok, key]) expect(JSON.stringify(r.secretsInTree)).not.toContain(v);
+  });
+
+  it('I1: notes from the caller are masked too', async () => {
+    const tok = fake.githubClassic();
+    const r = await buildAudit(repo(nodeApp()), deps({ notes: [`Probe saw ${tok}.`] }));
+    expect(r.notes.join('\n')).not.toContain(tok);
+    expect(r.notes).toContain('Probe saw [REDACTED].');
+  });
+
+  it('I2: padding before the key cannot hide a registry, node-options or script-shell line', async () => {
+    for (const line of [`${' '.repeat(400)}registry=https://r.example.test/`, `${'\t'.repeat(350)}@acme:registry=https://r.example.test/`, 'script-shell=/bin/evil', `${' '.repeat(500)}script-shell = /bin/evil`, 'node-options=--require ./x.js']) {
+      const r = await buildAudit(repo({ ...nodeApp(), '.npmrc': `save-exact=true\n${line}\n` }), deps());
+      expect(r.warnings, line.trim().slice(0, 20)).toEqual([SWAP_WARNING]);
+      expect(anyContains(r, '/bin/evil')).toBe(false);
+      expect(anyContains(r, 'r.example.test')).toBe(false);
+    }
+  });
+
+  it('U11: the report says whether the reviewed list was unavailable', async () => {
+    expect((await buildAudit(repo(nodeApp()), deps())).reviewedUnavailable).toBe(false);
+    expect((await buildAudit(repo(nodeApp()), deps({ reviewedUnavailable: true }))).reviewedUnavailable).toBe(true);
+  });
+
+  it('M2: npm\'s default "no test specified" script is not offered as the tool on a starter-tests row', async () => {
+    const files = nodeApp({ scripts: { test: 'echo "Error: no test specified" && exit 1', start: 'node index.js' }, devDependencies: {} });
+    const bare = await buildAudit(repo(files), deps());
+    expect(bare.profile.services[0].hasTests).toBe(false);
+    for (const id of ['unit-tests', 'full-tests']) {
+      const rows = rowsOf(bare, id);
+      expect(rows.length, id).toBeGreaterThan(0);
+      for (const w of rows) {
+        expect(w.tool).toBeNull();
+        expect(w.note).toBe('No tests found for app: pipegen would create starter tests.');
+      }
+    }
+    const runner = tool('test-runner', ['unit-tests', 'full-tests']);
+    const withTool = await buildAudit(repo(files), deps({ reviewed: [runner] }));
+    for (const w of [...rowsOf(withTool, 'unit-tests'), ...rowsOf(withTool, 'full-tests')]) {
+      expect(w.tool).toBe(runner);
+      expect(w.note).toBe('No tests found for app: pipegen would create starter tests.');
+    }
+  });
+
+  it('M5: the report says which folders the secrets scan skipped', async () => {
+    const r = await buildAudit(repo(nodeApp()), deps());
+    expect(r.notes).toContain('The secrets scan did not check dependency and build folders (node_modules, .venv, dist, build, vendor, target) or .git, so committed build output was not checked either.');
+  });
+
+  it.skipIf(process.getuid?.() === 0)('M7: an unreadable file (mode 000) gives a note, not a crash', async () => {
+    const dir = repo({ ...nodeApp(), 'src/locked.ts': 'x\n' });
+    chmodSync(join(dir, 'src/locked.ts'), 0o000);
+    try {
+      const r = await buildAudit(dir, deps());
+      expect(r.notes).toContain("The secrets scan couldn't read 1 file (no permission, or it changed while being read); it was not checked.");
+    } finally {
+      chmodSync(join(dir, 'src/locked.ts'), 0o644);
     }
   });
 });
