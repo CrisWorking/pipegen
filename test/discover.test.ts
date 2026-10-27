@@ -565,6 +565,15 @@ describe('suggestTools', () => {
     expect(asked).toEqual(['o/good@1.2.3']);
   });
 
+  it('suggestTools: the stats notes (why advisories are unknown) reach the run\'s notes, cleaned and once each (final review M3)', async () => {
+    const w = merge(quietSearch(), healthy('plain', { action: false }), healthy('other', { action: false }));
+    const s = setup({ ai: { candidates: [actionCand('plain'), actionCand('other')] }, gh: w.gh, net: w.net });
+    await suggestTools([need('lint')], profile(), s.deps);
+    const fromStats = s.notes.filter((n) => /can't look up known vulnerabilities for release binaries yet/.test(n));
+    expect(fromStats.map((n) => /o\/(plain|other)/.exec(n)?.[0])).toEqual(['o/plain', 'o/other']);
+    expect(new Set(s.notes).size).toBe(s.notes.length);
+  });
+
   it('suggestTools: a rate limit during existence checks stops the run (no more AI calls)', async () => {
     const limited: Reply = { status: 403, body: {}, headers: { 'x-ratelimit-remaining': '0', 'x-ratelimit-reset': String(NOW / 1000 + 3600) } };
     const w = merge(quietSearch(), healthy('good'));

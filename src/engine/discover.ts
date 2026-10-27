@@ -541,9 +541,12 @@ export async function suggestTools(needs: Need[], p: RepoProfile, deps: SuggestD
         }
       }
       let s;
+      // the stats' own notes (why advisories are unknown) go into the run's notes, deduped (final review M3)
+      const statsNotes: string[] = [];
       try {
-        s = await fetchStats(c, stats, g.installs.get(found));
+        s = await fetchStats(c, { ...stats, notes: statsNotes }, g.installs.get(found));
       } catch (e) {
+        for (const n of statsNotes) note(n);
         if (!(e instanceof StatsError || e instanceof GitHubRateLimitError)) throw e;
         note(`pipegen didn't suggest ${c.repo}: ${e.message}`);
         if (isRateStop(e)) {
@@ -552,6 +555,7 @@ export async function suggestTools(needs: Need[], p: RepoProfile, deps: SuggestD
         }
         continue;
       }
+      for (const n of statsNotes) note(n);
       const verdict = checkQualityBar(s, deps.bar, at);
       if (!verdict.pass) {
         note(`pipegen didn't suggest ${c.repo}: it doesn't meet the quality bar (${verdict.reasons.join(' ')})`);
