@@ -82,7 +82,7 @@ export interface InstallSpec { method: 'npm' | 'pip' | 'github-release' | 'docke
 export interface StepSpec {
   needId: string; tool: Candidate;
   action?: { uses: string; with: Record<string, string> };
-  cli?: { install: InstallSpec; command: string[]; env?: Record<string, string> };
+  cli?: { install: InstallSpec; plugins?: InstallSpec[]; command: string[]; env?: Record<string, string> };   // plugins (Plan P Task 5): npm or pip packages installed next to the tool, each an exact version with its checksum; at most 4
   output: { path: string; format: OutputFormat };
   workingDir?: string; needsServices?: DependencyKind[]; secrets?: string[];   // names only, never values
 }
@@ -151,4 +151,11 @@ export interface ReviewedTool {
   choices: Record<string, string[]>;                       // the only inputs the AI may set, each limited to these enum values
   configFiles: string[];                                   // config/ignore files the tool auto-loads from a repo (e.g. '.gitleaks.toml', '.trivyignore'); added to the protected paths
   reviewedBy: string; reviewedAt: string; proofs: number;  // proofs = passed Plan E runs; full runs need proofs >= 1
+  verifiedWith?: VerifiedWith;                             // Plan P Task 5: the signature or attestation check made when pinning (required for MUST_VERIFY repos)
+}
+// How a pinned release was verified when it was pinned (Plan P Task 5, ruling PS24). identity is the exact certificate
+// identity (workflow URL @ ref), never a regex; asset names the file whose signature was checked (e.g. checksums.txt).
+export interface VerifiedWith {
+  method: 'cosign-bundle' | 'cosign-signature' | 'github-attestation'; asset: string; identity: string;
+  issuer: 'https://token.actions.githubusercontent.com'; verifiedOn: string;   // verifiedOn: YYYY-MM-DD, not before the list's pinnedOn day
 }

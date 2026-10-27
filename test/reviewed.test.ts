@@ -7,8 +7,9 @@ import { NEED_ID_CATEGORY } from '../src/engine/needs.js';
 import { newRateBudget } from '../src/engine/github-rate.js';
 import { COOLDOWN_DAYS, PinError, PLATFORM_ACTION_IDS, resolvePin } from '../src/engine/pin.js';
 import {
-  effectiveProtectedPaths, loadReviewed, nearDuplicate, packageExists, projectScriptFor, ReviewedListError, reviewedFor, TOOL_CATEGORIES,
+  effectiveProtectedPaths, loadReviewed, MUST_VERIFY, nearDuplicate, NEVER_REPOS, neverListed, packageExists, projectScriptFor, ReviewedListError, reviewedFor, TOOL_CATEGORIES,
 } from '../src/engine/reviewed.js';
+import { BETTERLEAKS_FORBIDDEN_FLAGS } from '../src/engine/tool-flags.js';
 import { NEED_CATEGORIES, PROTECTED_PATHS_BASE, type Need, type ReviewedTool, type Service } from '../src/types.js';
 import { fakeFetch } from './helpers/fake-http.js';
 import { cleanupRepos, makeTempDir, writeIn } from './helpers/make-repo.js';
@@ -370,6 +371,375 @@ describe('loadReviewed', () => {
     rejects([at('Cristiano Pereira', '2026-02-30')], /real date/); // no such day
     rejects([at('Cristiano Pereira', '2026-10-25')], /pinnedOn/); // the fixture list is pinned on 2026-10-26
     expect(load([at('Cristiano Pereira', '2026-10-26')])).toHaveLength(1);
+  });
+});
+
+// ---------- Plan P Task 5: the never-list, plugins, verifiedWith and the catalogue's tool locks ----------
+
+const ISSUER = 'https://token.actions.githubusercontent.com';
+/** A recorded signature check (PS24): the exact certificate identity, never a regex. */
+const verified = (over: Entry = {}): Entry => ({
+  method: 'cosign-bundle', asset: 'checksums.txt', identity: 'https://github.com/o/r/.github/workflows/release.yml@refs/tags/v1.0.0',
+  issuer: ISSUER, verifiedOn: '2026-10-27', ...over,
+});
+const SRI = `sha512-${'A'.repeat(86)}==`;
+const TRIVY_FLAGS = ['--disable-telemetry', '--skip-version-check', '--skip-check-update'];
+const TRIVY_IDENTITY = 'https://github.com/aquasecurity/trivy/.github/workflows/reusable-release.yaml@refs/tags/v0.76.0';
+// env names for the nuclei templates archive, built from parts like the semgrep ones
+const NUCLEI_URL_ENV = ['PIPEGEN', 'NUCLEI', 'TEMPLATES', 'URL'].join('_');
+const NUCLEI_SUM_ENV = ['PIPEGEN', 'NUCLEI', 'TEMPLATES', 'SHA256'].join('_');
+const NUCLEI_DIR = '/pipegen-nuclei-templates';
+const NUCLEI_URL = 'https://github.com/projectdiscovery/nuclei-templates/archive/refs/tags/v10.5.0.tar.gz';
+const NUCLEI_ENV = { [NUCLEI_URL_ENV]: NUCLEI_URL, [NUCLEI_SUM_ENV]: SUM };
+
+/** A release-binary entry for any repo, valid unless the test breaks it (cliEntry with the parts the test names). */
+function binEntry(repo: string, over: { id?: string; command?: string[]; args?: string[]; env?: Record<string, string>; config?: Entry | null; verifiedWith?: Entry | null; choices?: Entry } = {}): Entry {
+  const e = cliEntry({ id: over.id ?? 'tool', repo });
+  e.candidate.version = 'v1.0.0';
+  e.step.cli.install = { method: 'github-release', package: 'tool_1.0.0_linux_amd64.tar.gz', version: 'v1.0.0' };
+  e.step.cli.command = over.command ?? ['tool', '--format', 'sarif', '--output', 'tool.sarif'];
+  e.step.output = { path: 'tool.sarif', format: 'sarif' };
+  e.fixedInputs = { args: over.args ?? ['--format', 'sarif'] };
+  if (over.env !== undefined) {
+    e.step.cli.env = { ...over.env };
+    e.fixedInputs.env = { ...over.env };
+  }
+  if (over.config !== null) e.fixedInputs.config = over.config ?? { content: 'x: 1\n', passAs: { flag: '--config' } };
+  if (over.verifiedWith !== null && over.verifiedWith !== undefined) e.verifiedWith = over.verifiedWith;
+  e.choices = over.choices ?? {};
+  e.configFiles = [];
+  return e;
+}
+/** An image entry (kind docker) for any image name. */
+function imageEntry(image: string, repo = 'example/scanner'): Entry {
+  const e = semgrepEntry();
+  e.id = 'scanner';
+  e.candidate = candidate('scanner', 'docker', repo, '1.0.0', { digest: DIGEST }, ['sast']);
+  e.step.cli = { install: { method: 'docker', package: image, version: '1.0.0' }, command: ['scan', '--sarif'] };
+  e.fixedInputs = { args: ['--sarif'] };
+  e.choices = {};
+  e.configFiles = [];
+  return e;
+}
+/** An npm (or pip) entry with plugins. */
+function pkgEntry(method: 'npm' | 'pip', plugins: Entry[] | undefined, pkg = method === 'npm' ? 'eslint' : 'schemathesis'): Entry {
+  const version = method === 'npm' ? '10.13.0' : '4.32.2';
+  const e = cliEntry({ id: 'linter', repo: method === 'npm' ? 'eslint/eslint' : 'schemathesis/schemathesis', categories: ['lint'] });
+  e.candidate.version = version;
+  e.candidate.pin = { checksum: method === 'npm' ? SRI : SUM };
+  e.step.cli.install = { method, package: pkg, version };
+  e.step.cli.command = [method === 'npm' ? 'eslint' : 'st', '--format', 'sarif'];
+  e.fixedInputs = { args: ['--format', 'sarif'] };
+  e.configFiles = [];
+  if (plugins !== undefined) e.step.cli.plugins = plugins;
+  return e;
+}
+const npmPlugin = (pkg: string, over: Entry = {}): Entry => ({ method: 'npm', package: pkg, version: '8.72.0', checksum: SRI, ...over });
+const pipPlugin = (pkg: string, over: Entry = {}): Entry => ({ method: 'pip', package: pkg, version: '1.2.3', checksum: SUM, ...over });
+
+/** The trivy fixture: the three hardening flags in the command and the fixed args, and the signature check. */
+function trivyEntry(over: { command?: string[]; args?: string[]; verifiedWith?: Entry | null; repo?: string } = {}): Entry {
+  return binEntry(over.repo ?? 'aquasecurity/trivy', {
+    id: 'trivy-config',
+    command: over.command ?? ['trivy', 'config', ...TRIVY_FLAGS, '--format', 'sarif', '--output', 'tool.sarif', '--exit-code', '1', '.'],
+    args: over.args ?? [...TRIVY_FLAGS, '--format', 'sarif'],
+    verifiedWith: over.verifiedWith === undefined ? verified({ identity: TRIVY_IDENTITY.replace('v0.76.0', 'v1.0.0') }) : over.verifiedWith,
+  });
+}
+const jscpdEntry = (over: Parameters<typeof binEntry>[1] = {}) => binEntry('kucherenko/jscpd', {
+  id: 'jscpd', command: ['jscpd', '--reporters', 'sarif', '--output', '.'], args: ['--reporters', 'sarif'], verifiedWith: verified({ identity: 'https://github.com/kucherenko/jscpd/.github/workflows/release.yml@refs/heads/master' }), ...over,
+});
+const betterleaksEntry = (over: Parameters<typeof binEntry>[1] = {}) => binEntry('betterleaks/betterleaks', {
+  id: 'betterleaks', command: ['betterleaks', 'git', '--report-format', 'sarif', '--report-path', 'tool.sarif'], args: ['--report-format', 'sarif'],
+  config: { content: '[extend]\nuseDefault = true\n', passAs: { flag: '--config' } }, verifiedWith: verified({ identity: 'https://github.com/betterleaks/betterleaks/.github/workflows/release.yml@refs/tags/v1.0.0' }), ...over,
+});
+const nucleiCmd = (...rest: string[]) => ['nuclei', '-duc', '-t', NUCLEI_DIR, '-severity', 'medium,high,critical', '-sarif-export', 'tool.sarif', ...rest];
+const nucleiEntry = (over: Parameters<typeof binEntry>[1] = {}) => binEntry('projectdiscovery/nuclei', {
+  id: 'nuclei', command: nucleiCmd(), args: ['-duc', '-t', NUCLEI_DIR], env: NUCLEI_ENV, config: null, ...over,
+});
+
+/**
+ * The never-list as catalogue §4 names it (brief), plus the old names GitHub still redirects to them (checked with
+ * `gh api repos/<old>` on 2026-10-27) and the same projects' own action repos. Each one is refused.
+ */
+const NEVER = [
+  'checkmarx/kics-github-action', 'checkmarx/kics', 'checkmarx/kics-action',
+  'aquasecurity/trivy-action', 'aquasecurity/setup-trivy',
+  'gitleaks/gitleaks-action', 'zricethezav/gitleaks-action',
+  'reviewdog/*',
+  'slsa-framework/slsa-github-generator',
+  'tenable/terrascan', 'accurics/terrascan', 'tenable/terrascan-action', 'accurics/terrascan-action',
+  'aquasecurity/tfsec', 'tfsec/tfsec', 'liamg/tfsec', 'aquasecurity/tfsec-action', 'aquasecurity/tfsec-sarif-action', 'aquasecurity/tfsec-pr-commenter-action',
+  'tfsec/tfsec-sarif-action', 'tfsec/tfsec-pr-commenter-action',
+  'zizmorcore/zizmor-action',
+  'portswigger/dastardly-github-action', 'portswigger/dastardly',
+];
+const NEVER_MSG = /never adds/;
+
+describe('loader rules (Plan P Task 5)', () => {
+  it('reviewed: never-list repos refused (kics, trivy-action, setup-trivy, gitleaks-action, reviewdog/*, dastardly, slsa-github-generator, terrascan, tfsec, zizmor-action)', () => {
+    for (const key of NEVER) expect(NEVER_REPOS, key).toHaveProperty([key]);
+    for (const [key, reason] of Object.entries(NEVER_REPOS)) {
+      expect(key, key).toBe(key.toLowerCase());
+      expect(reason.length, key).toBeGreaterThan(10);
+    }
+    expect(neverListed('aquasecurity/trivy')).toBeNull();
+    expect(neverListed('gitleaks/gitleaks')).toBeNull();
+    expect(neverListed('zizmorcore/zizmor')).toBeNull();
+    expect(neverListed('reviewdog')).not.toBeNull(); // the owner alone
+  });
+
+  it.each(NEVER)('reviewed: never-list %s refused as candidate.repo, in uses: (any case, any sub-path), as an image and in a download URL', (key) => {
+    const repo = key.replace('/*', '/action-setup');
+    const upper = repo.toUpperCase();
+    const mixed = repo.split('/').map((p) => p.charAt(0).toUpperCase() + p.slice(1)).join('/');
+    // as the reviewed repo of an action, in any letter case
+    for (const r of [repo, upper, mixed]) rejects([actionEntry({ id: 'x', repo: r })], NEVER_MSG);
+    // in uses:, with a sub-path, even when candidate.repo names another repo
+    for (const uses of [`${repo}/sub@${SHA}`, `${mixed}/a/b@${SHA}`, `${upper}@${SHA}`]) {
+      const a = actionEntry({ id: 'x', repo: 'fine/tool' });
+      a.step.action.uses = uses;
+      rejects([a], NEVER_MSG);
+    }
+    // as a cli entry's repo (its release download URL is github.com/<repo>/releases/…)
+    rejects([binEntry(repo)], NEVER_MSG);
+    rejects([binEntry(mixed)], NEVER_MSG);
+    // as an image, on any registry host
+    const image = repo.toLowerCase();
+    for (const pkg of [image, `docker.io/${image}`, `ghcr.io/${image}`, `ghcr.io/${image}/sub`]) rejects([imageEntry(pkg)], NEVER_MSG);
+    // in a download URL anywhere in the step (env, args)
+    const url = `https://github.com/${mixed}/releases/download/v1.0.0/x.tar.gz`;
+    rejects([binEntry('fine/tool', { env: { TOOL_URL: url } })], NEVER_MSG);
+    rejects([binEntry('fine/tool', { command: ['tool', '--from', `https://raw.githubusercontent.com/${repo}/main/x.sh`], args: [] })], NEVER_MSG);
+    // and neverListed says so for each spelling
+    for (const r of [repo, upper, `${repo}/sub/path`, `${repo}@v1`, `docker://${image}:latest`, `ghcr.io/${image}:1.0`]) expect(neverListed(r), r).not.toBeNull();
+  });
+
+  it('reviewed: never-list look-alikes refused (within distance 2 of a never-list name, or a never-listed owner)', () => {
+    for (const r of ['aquasecurity/trivy-actions', 'aquasecurlty/trivy-action', 'checkmarx/kicss', 'zizmorcore/zizmor-acton', 'reviewdoq/action-setup', 'portswiger/dastardly']) {
+      expect(neverListed(r), r).not.toBeNull();
+      rejects([actionEntry({ id: 'x', repo: r })], NEVER_MSG);
+    }
+    rejects([imageEntry('checkmarx/klcs')], NEVER_MSG);
+    // far enough away: fine
+    for (const r of ['aquasecurity/trivy', 'fine/tool', 'reviewers/tool', 'checkmarx/other-tool']) expect(neverListed(r), r).toBeNull();
+  });
+
+  it('reviewed: trivy entry without --disable-telemetry, --skip-version-check or --skip-check-update refused', () => {
+    expect(load([trivyEntry()])).toHaveLength(1);
+    for (const flag of TRIVY_FLAGS) {
+      const without = (xs: string[]) => xs.filter((x) => x !== flag);
+      const base = trivyEntry();
+      // missing from the command (and so from the fixed args too)
+      rejects([trivyEntry({ command: without(base.step.cli.command), args: without(base.fixedInputs.args) })], new RegExp(flag));
+      // in the command but not a fixed arg (the AI-proof part of the template)
+      rejects([trivyEntry({ args: without(base.fixedInputs.args) })], new RegExp(flag));
+      // switched off again later in the command: trivy keeps the last value
+      rejects([trivyEntry({ command: [...base.step.cli.command, `${flag}=false`] })], new RegExp(flag));
+    }
+    // any trivy: found by its repo in any case, its image or its command, not only aquasecurity/trivy
+    rejects([trivyEntry({ repo: 'AquaSecurity/Trivy', args: ['--format', 'sarif'], command: ['trivy', 'config', '--format', 'sarif', '--output', 'tool.sarif'] })], /--disable-telemetry/);
+    const img = imageEntry('aquasec/trivy');
+    img.step.cli.command = ['trivy', 'image', '--format', 'sarif'];
+    img.fixedInputs.args = ['--format', 'sarif'];
+    rejects([img], /--disable-telemetry/);
+  });
+
+  it('reviewed: the real trivy-config and trivy-image pass with the three flags and a cosign verifiedWith; without any one flag they fail (PB2)', () => {
+    const list = real();
+    for (const id of ['trivy-config', 'trivy-image']) {
+      const t = byId(list, id)[0];
+      for (const flag of TRIVY_FLAGS) {
+        expect(t?.step.cli?.command, `${id} ${flag}`).toContain(flag);
+        expect(t?.fixedInputs.args, `${id} ${flag}`).toContain(flag);
+      }
+      expect(t?.verifiedWith).toEqual({
+        method: 'cosign-bundle', asset: 'trivy_0.76.0_checksums.txt', identity: TRIVY_IDENTITY, issuer: ISSUER, verifiedOn: '2026-10-27',
+      });
+      const raw = rawFile().tools.find((x) => x.id === id) as Entry;
+      for (const flag of TRIVY_FLAGS) {
+        const without = structuredClone(raw);
+        without.step.cli.command = without.step.cli.command.filter((x: string) => x !== flag);
+        without.fixedInputs.args = without.fixedInputs.args.filter((x: string) => x !== flag);
+        rejects([without], new RegExp(flag));
+      }
+      const unsigned = structuredClone(raw);
+      delete unsigned.verifiedWith;
+      rejects([unsigned], /verifiedWith/);
+    }
+  });
+
+  it('reviewed: jscpd with --semantic anywhere refused', () => {
+    expect(load([jscpdEntry()])).toHaveLength(1);
+    const SEMANTIC = /--semantic/;
+    const cmd = ['jscpd', '--reporters', 'sarif', '--output', '.'];
+    rejects([jscpdEntry({ command: [...cmd, '--semantic'] })], SEMANTIC);
+    rejects([jscpdEntry({ command: [...cmd, '--semantic=true'] })], SEMANTIC);
+    rejects([jscpdEntry({ command: [...cmd, '--Semantic'] })], SEMANTIC);
+    rejects([jscpdEntry({ command: [...cmd, '--semantic'], args: ['--reporters', 'sarif', '--semantic'] })], SEMANTIC);
+    rejects([jscpdEntry({ env: { JSCPD_SEMANTIC: 'true' } })], SEMANTIC);
+    rejects([jscpdEntry({ env: { JSCPD_ARGS: '--semantic' } })], SEMANTIC);
+    rejects([jscpdEntry({ choices: { mode: ['--semantic'] } })], SEMANTIC);
+    rejects([jscpdEntry({ choices: { semantic: ['true'] } })], SEMANTIC);
+    rejects([jscpdEntry({ config: { content: '{ "semantic": true }\n', passAs: { flag: '--config' } } })], SEMANTIC);
+    // a jscpd step under another repo or package name is still jscpd
+    rejects([binEntry('fine/tool', { command: ['npx', 'jscpd', '--semantic'], args: [] })], SEMANTIC);
+    const npm = pkgEntry('npm', undefined, 'jscpd');
+    npm.step.cli.command = ['jscpd', '--format', 'sarif', '--semantic'];
+    rejects([npm], SEMANTIC);
+  });
+
+  it('reviewed: betterleaks with --validate, --analyze or --unsafe-auto-load-config refused; without a pinned --config refused', () => {
+    expect([...BETTERLEAKS_FORBIDDEN_FLAGS]).toEqual(['--validate', '--analyze', '--unsafe-auto-load-config']);
+    expect(load([betterleaksEntry()])).toHaveLength(1);
+    const cmd = ['betterleaks', 'git', '--report-format', 'sarif', '--report-path', 'tool.sarif'];
+    for (const flag of BETTERLEAKS_FORBIDDEN_FLAGS) {
+      const re = new RegExp(flag);
+      rejects([betterleaksEntry({ command: [...cmd, flag] })], re);
+      rejects([betterleaksEntry({ command: [...cmd, `${flag}=true`] })], re);
+      rejects([betterleaksEntry({ command: [...cmd, flag.slice(1)] })], re); // one dash
+      rejects([betterleaksEntry({ command: [...cmd, flag], args: ['--report-format', 'sarif', flag] })], re);
+      rejects([betterleaksEntry({ choices: { [flag.replace(/^--/, '')]: ['true'] } })], re);
+      rejects([betterleaksEntry({ choices: { extra: [flag] } })], re);
+    }
+    rejects([betterleaksEntry({ config: null })], /pinned --config/);
+    rejects([betterleaksEntry({ config: { content: 'x\n', passAs: { flag: '--baseline-path' } } })], /pinned --config/);
+    rejects([betterleaksEntry({ command: [...cmd, '--config', 'repo.toml'] })], /pinned --config/); // a second config
+    rejects([betterleaksEntry({ command: [...cmd, '-c=repo.toml'] })], /pinned --config/);
+    rejects([betterleaksEntry({ env: { BETTERLEAKS_CONFIG: 'repo.toml' } })], /pinned --config/);
+  });
+
+  it('reviewed: nuclei without -duc or with -dashboard refused; templates only from the pinned archive', () => {
+    expect(load([nucleiEntry()])).toHaveLength(1);
+    // -duc in the command and the fixed args
+    rejects([nucleiEntry({ command: nucleiCmd().filter((x) => x !== '-duc'), args: ['-t', NUCLEI_DIR] })], /-duc/);
+    rejects([nucleiEntry({ args: ['-t', NUCLEI_DIR] })], /-duc/);
+    rejects([nucleiEntry({ command: nucleiCmd('-duc=false') })], /-duc/);
+    // no upload to ProjectDiscovery's cloud
+    for (const f of ['-dashboard', '--dashboard', '-dashboard=true', '-cloud', '-pd', '-pdu', '-dashboard-upload']) rejects([nucleiEntry({ command: nucleiCmd(f) })], /-dashboard|-cloud|-pd/);
+    rejects([nucleiEntry({ choices: { dashboard: ['true'] } })], /-dashboard/);
+    rejects([nucleiEntry({ env: { ...NUCLEI_ENV, ['PDCP_API_' + 'KEY']: 'x' } })], /PDCP_/);
+    // templates: -t names the verified directory only; no template URLs or updates
+    rejects([nucleiEntry({ command: nucleiCmd('-t', '/tmp/other') })], /-t/);
+    rejects([nucleiEntry({ command: nucleiCmd(`-t=${NUCLEI_DIR}/../x`) })], /-t/);
+    rejects([nucleiEntry({ command: nucleiCmd('-tu', 'https://example.com/t.yaml') })], /-t/);
+    rejects([nucleiEntry({ command: nucleiCmd('-w', '/tmp/w') })], /-t/);
+    rejects([nucleiEntry({ command: nucleiCmd('-ut') })], /update/);
+    rejects([nucleiEntry({ command: ['nuclei', '-duc', '-severity', 'high'], args: ['-duc'] })], /-t/);
+    rejects([nucleiEntry({ args: ['-duc'] })], /-t/);
+    // the pinned archive: an official nuclei-templates release tarball and its sha256
+    rejects([nucleiEntry({ env: { [NUCLEI_SUM_ENV]: SUM } })], new RegExp(NUCLEI_URL_ENV));
+    rejects([nucleiEntry({ env: { ...NUCLEI_ENV, [NUCLEI_URL_ENV]: 'https://github.com/evil/nuclei-templates/archive/refs/tags/v10.5.0.tar.gz' } })], new RegExp(NUCLEI_URL_ENV));
+    rejects([nucleiEntry({ env: { ...NUCLEI_ENV, [NUCLEI_URL_ENV]: 'https://github.com/projectdiscovery/nuclei-templates/archive/refs/heads/main.tar.gz' } })], new RegExp(NUCLEI_URL_ENV));
+    rejects([nucleiEntry({ env: { [NUCLEI_URL_ENV]: NUCLEI_URL, [NUCLEI_SUM_ENV]: 'abc' } })], new RegExp(NUCLEI_SUM_ENV));
+    expect(load([nucleiEntry({ env: { ...NUCLEI_ENV, [NUCLEI_URL_ENV]: 'https://github.com/projectdiscovery/nuclei-templates/releases/download/v10.5.0/nuclei-templates-10.5.0.tar.gz' } })])).toHaveLength(1);
+  });
+
+  it('reviewed: plugins must be exact, hashed npm/pip packages; at most 4', () => {
+    const ok = load([pkgEntry('npm', [npmPlugin('typescript-eslint'), npmPlugin('@eslint/js')])])[0];
+    expect(ok?.step.cli?.plugins?.map((p) => p.package)).toEqual(['typescript-eslint', '@eslint/js']);
+    expect(load([pkgEntry('pip', [pipPlugin('hypothesis')])])).toHaveLength(1);
+    // the wrapper's own platform package is a different name, so it is allowed (PS26)
+    expect(load([pkgEntry('npm', [npmPlugin('@biomejs/cli-linux-x64')], '@biomejs/biome')])).toHaveLength(1);
+    const P = /plugin/;
+    rejects([pkgEntry('npm', ['a', 'b', 'c', 'd', 'e'].map((n) => npmPlugin(n)))], /at most 4/);
+    rejects([pkgEntry('npm', [npmPlugin('x', { version: '^8.0.0' })])], P);
+    rejects([pkgEntry('npm', [npmPlugin('x', { version: '8' })])], P);
+    rejects([pkgEntry('npm', [npmPlugin('x', { version: 'latest' })])], P);
+    rejects([pkgEntry('npm', [npmPlugin('x', { checksum: SUM })])], P); // npm needs the sha512 integrity
+    rejects([pkgEntry('npm', [npmPlugin('x', { checksum: undefined })])], P);
+    rejects([pkgEntry('pip', [pipPlugin('x', { checksum: SRI })])], P); // pip needs a sha256
+    rejects([pkgEntry('pip', [pipPlugin('x', { version: '>=1.0' })])], P);
+    rejects([pkgEntry('npm', [npmPlugin('x', { method: 'github-release' })])], P);
+    rejects([pkgEntry('npm', [npmPlugin('x', { method: 'docker' })])], P);
+    rejects([pkgEntry('npm', [pipPlugin('x')])], P); // a pip plugin for an npm tool
+    rejects([pkgEntry('npm', [npmPlugin('x', { digest: DIGEST })])], P);
+    rejects([pkgEntry('npm', [npmPlugin('Bad Name')])], P);
+    rejects([pkgEntry('npm', [npmPlugin('x'), npmPlugin('x')])], /twice/);
+    // never the entry's own package
+    rejects([pkgEntry('npm', [npmPlugin('eslint')])], /own package/);
+    rejects([pkgEntry('pip', [pipPlugin('Schemathesis')])], /own package/); // PyPI names compare normalised
+    // only npm and pip entries take plugins
+    const bin = binEntry('fine/tool');
+    bin.step.cli.plugins = [npmPlugin('x')];
+    rejects([bin], P);
+    // eslint-config-prettier and eslint-plugin-prettier are never added (PS25, CVE-2025-54313): as a plugin, the package, or in any command or arg
+    for (const name of ['eslint-config-prettier', 'eslint-plugin-prettier']) {
+      const re = new RegExp(name);
+      rejects([pkgEntry('npm', [npmPlugin(name)])], re);
+      rejects([pkgEntry('npm', undefined, name)], re);
+      const inCmd = pkgEntry('npm', undefined);
+      inCmd.step.cli.command = ['eslint', '--format', 'sarif', '--plugin', name];
+      rejects([inCmd], re);
+      const inArg = pkgEntry('npm', undefined);
+      inArg.step.cli.command = ['eslint', '--format', 'sarif', `--resolve-plugins-relative-to=${name}`];
+      inArg.fixedInputs.args = ['--format', 'sarif', `--resolve-plugins-relative-to=${name}`];
+      rejects([inArg], re);
+      rejects([binEntry('fine/tool', { choices: { plugin: [name] } })], re);
+    }
+  });
+
+  it('reviewed: MUST_VERIFY repo without verifiedWith refused', () => {
+    expect([...MUST_VERIFY].sort()).toEqual(['aquasecurity/trivy', 'betterleaks/betterleaks', 'hadolint/hadolint', 'kucherenko/jscpd', 'securego/gosec', 'stackrox/kube-linter']);
+    const entries: Record<string, (v: Entry | null) => Entry> = {
+      'aquasecurity/trivy': (v) => trivyEntry({ verifiedWith: v }),
+      'betterleaks/betterleaks': (v) => betterleaksEntry({ verifiedWith: v }),
+      'kucherenko/jscpd': (v) => jscpdEntry({ verifiedWith: v }),
+      'hadolint/hadolint': (v) => binEntry('hadolint/hadolint', { verifiedWith: v }),
+      'stackrox/kube-linter': (v) => binEntry('stackrox/kube-linter', { verifiedWith: v }),
+      'securego/gosec': (v) => binEntry('securego/gosec', { verifiedWith: v }),
+    };
+    for (const repo of MUST_VERIFY) {
+      const make = entries[repo] as (v: Entry | null) => Entry;
+      rejects([make(null)], /verifiedWith/);
+      const upper = make(null);
+      upper.candidate.repo = repo.toUpperCase();
+      upper.candidate.name = repo.toUpperCase();
+      rejects([upper], /verifiedWith/);
+      const v = verified({ identity: `https://github.com/${repo}/.github/workflows/release.yml@refs/tags/v1.0.0` });
+      expect(load([make(v)])[0]?.verifiedWith, repo).toEqual(v); // it stays on the ReviewedTool (PS24)
+    }
+    // any entry may record one; it is checked the same way
+    expect(load([binEntry('fine/tool', { verifiedWith: verified() })])[0]?.verifiedWith?.method).toBe('cosign-bundle');
+    const hado = (over: Entry) => binEntry('hadolint/hadolint', { verifiedWith: verified({ identity: 'https://github.com/hadolint/hadolint/.github/workflows/haskell.yml@refs/tags/v1.0.0', ...over }) });
+    expect(load([hado({ method: 'github-attestation', asset: 'hadolint-linux-x86_64' })])).toHaveLength(1);
+    expect(load([hado({ method: 'cosign-signature' })])).toHaveLength(1);
+    rejects([hado({ method: 'gpg' })]);
+    rejects([hado({ issuer: 'https://accounts.google.com' })]);
+    rejects([hado({ verifiedOn: '2026-10-25' })], /pinnedOn/); // the fixture list is pinned on 2026-10-26
+    rejects([hado({ verifiedOn: '2026-02-30' })], /verifiedOn/);
+    rejects([hado({ asset: '../checksums.txt' })]);
+    rejects([hado({ identity: '^https://github.com/hadolint/.*$' })], /identity/); // exact identity, never a regex
+    rejects([hado({ identity: 'https://github.com/hadolint/hadolint/.github/workflows/.*' })], /identity/);
+    rejects([hado({ identity: 'https://example.com/hadolint/hadolint/.github/workflows/haskell.yml@refs/tags/v1.0.0' })], /identity/);
+    rejects([hado({ identity: 'https://github.com/hadolint/hadolint/.github/workflows/haskell.yml@refs/tags/v0.9.0' })], /identity/); // another release's tag
+    const extra = hado({});
+    extra.verifiedWith.note = 'x';
+    rejects([extra]);
+    expect(load([hado({ identity: 'https://github.com/o/shared/.github/workflows/release.yaml@1cf29d7b17983b901021799b87a55d357cfff790' })])).toHaveLength(1);
+    expect(load([hado({ identity: 'https://github.com/hadolint/hadolint/.github/workflows/haskell.yml@refs/heads/master' })])).toHaveLength(1);
+  });
+
+  it('reviewed: scorecard publish_results and dependency-review comment-summary-in-pr fixed', () => {
+    const act = (repo: string, key: string, value: string | undefined) => {
+      const a = actionEntry({ id: 'x', repo, categories: ['scorecard'] });
+      a.step.action.with = value === undefined ? {} : { [key]: value };
+      a.fixedInputs = value === undefined ? {} : { with: { [key]: value } };
+      a.choices = {};
+      return a;
+    };
+    expect(load([act('ossf/scorecard-action', 'publish_results', 'false')])).toHaveLength(1);
+    expect(load([act('actions/dependency-review-action', 'comment-summary-in-pr', 'never')])).toHaveLength(1);
+    for (const repo of ['ossf/scorecard-action', 'OSSF/Scorecard-Action']) {
+      rejects([act(repo, 'publish_results', 'true')], /publish_results/);
+      rejects([act(repo, 'publish_results', undefined)], /publish_results/);
+      const stepOnly = act(repo, 'publish_results', 'false');
+      stepOnly.fixedInputs = {};
+      rejects([stepOnly], /publish_results/); // set, but not fixed: the AI could change it
+    }
+    for (const repo of ['actions/dependency-review-action', 'Actions/Dependency-Review-Action']) {
+      for (const v of ['always', 'on-failure', undefined]) rejects([act(repo, 'comment-summary-in-pr', v)], /comment-summary-in-pr/);
+    }
   });
 });
 

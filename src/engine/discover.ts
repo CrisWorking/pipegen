@@ -13,7 +13,8 @@
 //   ids only, an id no longer on the reviewed list is ignored, and in full mode only entries with a proof count),
 //   the AI (up to MAX_AI_CANDIDATES), GitHub search (actions, then CLIs in the language) and npm search (Node lint,
 //   format and test tools; a hit counts only with a GitHub repo link, S36).
-// - Every unreviewed candidate is checked in order: a valid GitHub owner/name (S14), not a repo already on the
+// - Every unreviewed candidate is checked in order: a valid GitHub owner/name (S14), not on the never-list
+//   (neverListed, Plan P Task 5), not a repo already on the
 //   reviewed list (for another check), not a look-alike of ANY reviewed tool (nearDuplicate on the full list,
 //   S17/S31), the repo exists under that exact name. suggestTools then confirms that an "action" really is one
 //   (action.yml at the repo root; else it is checked as a CLI), reads its stats (fetchStats) and applies the quality
@@ -41,7 +42,7 @@ import type { MemoryStore } from './memory.js';
 import { githubRepoFromUrl, isFullSemver, isGitHubRepo, isNpmName, repoSegments } from './names.js';
 import { cleanAiText, NEED_ID_CATEGORY } from './needs.js';
 import { checkQualityBar, type QualityBar } from './quality-bar.js';
-import { nearDuplicate, reviewedFor } from './reviewed.js';
+import { nearDuplicate, neverListed, reviewedFor } from './reviewed.js';
 import { fetchStats, StatsError } from './stats.js';
 
 /** Candidates returned per need (brief). */
@@ -262,6 +263,12 @@ async function gather(need: Need, p: RepoProfile, deps: DiscoverDeps, opts: Gath
     const repo = r.repo;
     if (seen.has(repo.toLowerCase())) continue;
     seen.add(repo.toLowerCase());
+    // Plan P Task 5: catalogue §4's never-list (any case, old names, look-alikes), before any request
+    const never = neverListed(repo);
+    if (never !== null) {
+      note(`pipegen left out ${repo}: pipegen never adds ${never.key} (${never.reason}).`);
+      continue;
+    }
     if (reviewedRepos.has(repo.toLowerCase())) {
       note(`pipegen left out ${repo}: it is on pipegen's reviewed list for other checks, not this one.`);
       continue;

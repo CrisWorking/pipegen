@@ -252,6 +252,25 @@ describe('discover', () => {
     expect(s.notes.some((n) => n.includes('gitIeaks/gitleaks') && n.includes('gitleaks/gitleaks'))).toBe(true);
   });
 
+  it('discover: never-list repos are never suggested', async () => {
+    // Plan P Task 5: catalogue §4's never-list, in any letter case, under a known old name, or a look-alike of one
+    const never = ['aquasecurity/trivy-action', 'Reviewdog/action-eslint', 'Checkmarx/KICS-github-action', 'zricethezav/gitleaks-action', 'aquasecurlty/setup-trivy'];
+    const searched = ['zizmorcore/zizmor-action', 'PortSwigger/dastardly-github-action', 'tenable/terrascan'];
+    const s = setup({
+      ai: { candidates: [...never.map((r) => aiCand(r)), aiCand('fine/tool')] },
+      gh: { ...search(searched.slice(0, 2), searched.slice(2)), ...exists(...never, ...searched, 'fine/tool') },
+    });
+    const out = await discover(need('lint'), profile(), s.deps);
+    expect(repos(out)).toEqual(['fine/tool']);
+    expect(repoGets(s.ghCalls)).toEqual(['fine/tool']); // dropped before any existence request
+    for (const r of [...never, ...searched]) expect(s.notes.some((n) => n.includes(r) && /never adds/.test(n)), r).toBe(true);
+    // and so never reach the mention-only suggestions either
+    const s2 = setup({ ai: { candidates: [aiCand('aquasecurity/trivy-action')] }, gh: { ...search([], []), ...exists('aquasecurity/trivy-action') } });
+    expect(await suggestTools([need('lint')], profile(), s2.deps)).toEqual([]);
+    expect(repoGets(s2.ghCalls)).toEqual([]);
+    expect(s2.notes.some((n) => n.includes('aquasecurity/trivy-action') && /never adds/.test(n))).toBe(true);
+  });
+
   it('discover: a repo name that is not plain ASCII owner/name is refused as "not a valid GitHub repo", with no request', async () => {
     const kelvin = 'K'; // KELVIN SIGN, folds to K
     const s = setup({ ai: { candidates: [aiCand(`${kelvin}ubernetes/kubeval`), aiCand('https://github.com/a/b'), aiCand('a/b/c'), aiCand('../..'), aiCand('fine/tool')] }, gh: exists('fine/tool') });
