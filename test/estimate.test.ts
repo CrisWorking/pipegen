@@ -3,7 +3,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, it, vi } from 'vitest';
 import { GitHubRateLimitError, newRateBudget } from '../src/engine/github-rate.js';
-import { MAX_DISCOVERY_NEEDS } from '../src/engine/discover.js';
+import { MAX_DISCOVERY_NEEDS } from '../src/engine/discovery-limits.js';
 import { floorNeeds, jobCategories, jobCounts } from '../src/engine/needs.js';
 import {
   activity30d, estimate, estimateAuditAi, HARNESS_MINUTES_PER_VARIANT, jobMinutes, loadAiPrices, loadGitHubPlans,

@@ -34,6 +34,7 @@ import { safeText } from '../util/safe-text.js';
 import type {
   AiProvider, AiUsage, Candidate, InstallSpec, Language, Need, NeedCategory, PackageManager, PipelineDraft, RepoProfile, ReviewedTool,
 } from '../types.js';
+import { MAX_DISCOVERY_NEEDS } from './discovery-limits.js';
 import { GitHubRateLimitError, isRateStop, withRateLimit, type RateClock } from './github-rate.js';
 import { fetchAllowed, readJson } from './http.js';
 import type { MemoryStore } from './memory.js';
@@ -49,8 +50,7 @@ export const MAX_CANDIDATES = 10;
 export const MAX_AI_CANDIDATES = 6;
 /** Results taken from each search (brief: top 5). */
 export const SEARCH_RESULTS = 5;
-/** Needs discovery runs for in one run (distinct need id + language). */
-export const MAX_DISCOVERY_NEEDS = 5;
+export { MAX_DISCOVERY_NEEDS } from './discovery-limits.js';
 /** Candidates per need whose stats are read (each costs several GitHub calls). */
 export const MAX_CHECKED_PER_NEED = 5;
 /** Suggestions kept per need. */

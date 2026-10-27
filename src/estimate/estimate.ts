@@ -13,7 +13,7 @@ import { readFileSync } from 'node:fs';
 import type { Octokit } from '@octokit/rest';
 import { parse } from 'yaml';
 import { z } from 'zod';
-import { MAX_DISCOVERY_NEEDS } from '../engine/discover.js';
+import { MAX_DISCOVERY_NEEDS } from '../engine/discovery-limits.js';
 import { withRateLimit, type RateClock } from '../engine/github-rate.js';
 import { DEFAULT_MODEL, type Layer, type Plan, type RepoProfile } from '../types.js';
 import { packageDataPath } from '../util/package-data.js';

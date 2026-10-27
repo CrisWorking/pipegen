@@ -27,4 +27,14 @@ describe('module graph (final review M6)', () => {
   it('module graph: need-ids.ts is a leaf (only the import-free types.ts)', async () => {
     expect(await graph('src/engine/need-ids.ts')).toEqual(['src/engine/need-ids.ts', 'src/types.ts']);
   });
+
+  it('module graph: the estimator pulls in no AI, GitHub client or network code (final review batch 2, M5)', async () => {
+    const files = await graph('src/estimate/estimate.ts');
+    expect(files.filter((f) => f.startsWith('src/ai/') || f.startsWith('src/github/'))).toEqual([]);
+    for (const net of ['src/engine/discover.ts', 'src/engine/http.ts', 'src/engine/stats.ts']) expect(files).not.toContain(net);
+    expect(files).toEqual([
+      'src/engine/discovery-limits.ts', 'src/engine/github-rate.ts', 'src/estimate/estimate.ts', 'src/types.ts',
+      'src/util/package-data.ts', 'src/util/safe-text.ts',
+    ]);
+  });
 });
