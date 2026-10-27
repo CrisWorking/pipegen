@@ -137,6 +137,20 @@ secrets_note${':'} hunter2
     for (const n of notes) expect(n).not.toMatch(/[\u001b\u202e]/);
   });
 
+  it('workflows: a file name with a zero-width space or a tag character is skipped with the same note', async () => {
+    const dir = makeTempDir();
+    wf(dir, 'a\u200bb.yml', 'on: push\njobs: {}\n');
+    wf(dir, 'c\u{e0041}d.yml', 'on: push\njobs: {}\n');
+    wf(dir, 'ok.yml', 'on: push\njobs: {}\n');
+    const notes: string[] = [];
+    const out = await readWorkflows(dir, undefined, notes);
+    expect(out.map((w) => w.path)).toEqual(['.github/workflows/ok.yml']);
+    expect(notes).toEqual([
+      'Skipped .github/workflows/ab.yml: its file name has control or invisible characters, or is too long.',
+      'Skipped .github/workflows/cd.yml: its file name has control or invisible characters, or is too long.',
+    ]);
+  });
+
   it('workflows: skip notes use the shared plain-English reasons and are never repeated', async () => {
     const dir = makeTempDir();
     writeIn(dir, '.github/workflows/bin.yml', 'on: push\u0000\n');

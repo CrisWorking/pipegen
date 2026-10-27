@@ -307,6 +307,31 @@ jobs:
     expect(r2.why).toMatch(/couldn't read/);
   });
 
+  it('coverage: S2 a workflow path with a zero-width space or a tag character is skipped, never silently', async () => {
+    for (const bad of ['.github/workflows/a\u200bb.yml', '.github/workflows/a\u{e0041}b.yml']) {
+      const dir = makeTempDir();
+      writeIn(dir, bad, `on: push\n${job(run('gitleaks detect'))}`);
+      const rows = await coverage(dir, { existingWorkflows: [listedWorkflow(bad)] });
+      expect(row(rows, 'push', 'secrets').status).toBe('unknown');
+    }
+  });
+
+  it('coverage: S2 a local action path with an invisible character is not read', async () => {
+    const action = 'runs:\n  using: composite\n  steps:\n    - run: gitleaks detect\n      shell: bash\n';
+    const okDir = makeTempDir();
+    wf(okDir, 'ci.yml', `on: push\n${job('      - uses: ./tools/scan\n')}`);
+    writeIn(okDir, 'tools/scan/action.yml', action);
+    expect(row(await coverage(okDir), 'push', 'secrets').status).toBe('covered'); // control: the plain path works
+    for (const name of ['sc\u200ban', 'sc\u{e0041}an']) {
+      const dir = makeTempDir();
+      wf(dir, 'ci.yml', `on: push\n${job(`      - uses: ./tools/${name}\n`)}`);
+      writeIn(dir, `tools/${name}/action.yml`, action);
+      const r = row(await coverage(dir), 'push', 'secrets');
+      expect(r.status).toBe('unknown');
+      expect(r.why).toMatch(/couldn't read/);
+    }
+  });
+
   it('coverage: S2 a local call outside the repo (./../x) is refused', async () => {
     const base = makeTempDir();
     const dir = join(base, 'repo');

@@ -26,10 +26,6 @@ function cut(s: string, max: number): string {
   return chars.slice(0, max - 1).join('') + '…';
 }
 
-export function safeText(s: string, max: number = DEFAULT_MAX): string {
-  return cut(clean(s), max);
-}
-
 // Invisible characters that can hide text or make two different names look the same: every Unicode
 // default-ignorable code point (zero-width space, joiners, word joiner, BOM, soft hyphen, variation selectors
 // incl. U+E0100-E01EF, Hangul fillers, the tag block used for "ASCII smuggling", ...) and the interlinear
@@ -37,6 +33,12 @@ export function safeText(s: string, max: number = DEFAULT_MAX): string {
 const INVISIBLE = /[\p{Default_Ignorable_Code_Point}\ufff9-\ufffb]/gu;
 // Unicode line and paragraph separators: some editors break the line there.
 const LINE_SEP = /[\u2028\u2029]/g;
+
+/** Makes a repo-, GitHub- or AI-derived string safe to print to a terminal: one line of visible text, cut to `max` code points. */
+export function safeText(s: string, max: number = DEFAULT_MAX): string {
+  return cut(clean(s).replace(INVISIBLE, '').replace(LINE_SEP, ' '), max);
+}
+
 const ZWSP = '\u200b';
 
 /**

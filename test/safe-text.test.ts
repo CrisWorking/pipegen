@@ -26,6 +26,39 @@ describe('safeText', () => {
     expect(safeText('abcd', 4)).toBe('abcd');
   });
 
+  it('invisible characters removed: zero-width space, joiner, BOM, soft hyphen', () => {
+    expect(safeText('pay\u200bpal')).toBe('paypal');
+    expect(safeText('a\u200db\u200cc\u2060d')).toBe('abcd');
+    expect(safeText('\ufeffname')).toBe('name');
+    expect(safeText('con\u00adfig')).toBe('config');
+    expect(safeText('a\u3164b\ufe0fc\u{e0100}d\ufff9e')).toBe('abcde');
+  });
+
+  it('tag characters ("ASCII smuggling") are removed, so hidden instructions never reach the terminal', () => {
+    const hidden = String.fromCodePoint(0xe0041, 0xe0042, 0xe0043);
+    expect(safeText(`ok${hidden}`)).toBe('ok');
+    expect(safeText('ok\u{e0049}\u{e0067}\u{e006e}\u{e006f}\u{e0072}\u{e0065}')).toBe('ok');
+  });
+
+  it('U+2028 and U+2029 become a space', () => {
+    expect(safeText('a\u2028b\u2029c')).toBe('a b c');
+  });
+
+  it('an emoji with a variation selector loses the VS16 (accepted for terminal output)', () => {
+    expect(safeText('\u2764\ufe0f')).toBe('\u2764');
+    expect(safeText('ok \u{1f44d}\u{1f3fd}')).toBe('ok \u{1f44d}\u{1f3fd}'); // skin-tone modifiers are not default-ignorable
+  });
+
+  it('a mixed hostile string: ANSI, bidi, zero-width space and tag characters all go', () => {
+    const s = `\u001b[31mad\u202emin\u202c\u001b[0m\u200b-\u{e0041}\u{e0042}ok\u2028x`;
+    expect(safeText(s)).toBe('admin-ok x');
+  });
+
+  it('cut counts code points after the invisible ones are removed', () => {
+    expect(safeText('a\u200bb\u200bc\u200bd', 4)).toBe('abcd');
+    expect(safeText('a\u200bb\u200bc\u200bd', 3)).toBe('ab…');
+  });
+
   it('hostile-names fixture cleaned', () => {
     for (const [name, value] of Object.entries(hostileNames)) {
       for (const out of [safeText(value), safeMarkdown(value)]) {
