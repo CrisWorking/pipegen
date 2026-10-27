@@ -560,7 +560,11 @@ const capFor = (key: string) => (PROSE_KEYS.has(key) ? OUTPUT_CAP.text : PATH_KE
 /** A wouldAdd tool as `{ kind, id, name, repo, version }` (only the fields it has). */
 function slimTool(t: WouldAddTool): Record<string, string> | null {
   if (t === null) return null;
-  if ('kind' in t) return t.kind === 'built-in' ? { kind: 'built-in' } : { kind: 'project-script', id: t.needId, name: t.script };
+  if ('kind' in t) {
+    if (t.kind === 'built-in') return { kind: 'built-in' };
+    if (t.kind === 'repo-tool') return { kind: 'repo-tool', id: t.needId, name: t.tool, ...(t.version === null ? {} : { version: t.version }) };
+    return { kind: 'project-script', id: t.needId, name: t.script };
+  }
   return { kind: 'reviewed', id: t.id, name: t.candidate.name, repo: t.candidate.repo, version: t.candidate.version };
 }
 

@@ -296,7 +296,7 @@ describe('rulings', () => {
     const starter = 'No tests found for shop-api: pipegen would create starter tests.';
     const withStarter = {
       ...r,
-      wouldAdd: [...r.wouldAdd, { need: need('push', 'unit-tests', 'shop-api'), status: 'missing' as const, tool: null, note: starter }],
+      wouldAdd: [...r.wouldAdd, { need: need('push', 'unit-tests', 'shop-api'), status: 'missing' as const, tool: null, also: [], note: starter }],
       wouldCreate: [...r.wouldCreate, { what: 'tests' as const, why: starter }],
     };
     expect(term(withStarter)).toContain(starter);
@@ -328,7 +328,7 @@ describe('rulings', () => {
     expect(tools).toContainEqual(null);
     for (const t of tools) if (t !== null) for (const k of Object.keys(t)) expect(['kind', 'id', 'name', 'repo', 'version']).toContain(k);
     // a project script slims too
-    const script = { ...r, wouldAdd: [{ need: need('push', 'unit-tests', 'shop-api'), status: 'missing' as const, tool: { kind: 'project-script' as const, needId: 'unit-tests', service: 'shop-api', script: 'test' as const }, note: 'your own `test` script would run here' }] };
+    const script = { ...r, wouldAdd: [{ need: need('push', 'unit-tests', 'shop-api'), status: 'missing' as const, tool: { kind: 'project-script' as const, needId: 'unit-tests', service: 'shop-api', script: 'test' as const }, also: [], note: 'your own `test` script would run here' }] };
     expect(JSON.parse(json(script)).wouldAdd[0].tool).toEqual({ kind: 'project-script', id: 'unit-tests', name: 'test' });
     // the permission table is pipegen's own: not masked by redact (the row is built from parts, so this committed
     // file stays clear of the secret-literal check)
@@ -461,7 +461,7 @@ describe('rulings', () => {
 
   it('what pipegen would add: reviewed tools, your own scripts, built-in checks and suggestion-only rows', () => {
     const r = report();
-    const script = { need: need('push', 'unit-tests', 'shop-api'), status: 'partial' as const, tool: { kind: 'project-script' as const, needId: 'unit-tests', service: 'shop-api', script: 'test' as const }, note: 'your own `test` script would run here' };
+    const script = { need: need('push', 'unit-tests', 'shop-api'), status: 'partial' as const, tool: { kind: 'project-script' as const, needId: 'unit-tests', service: 'shop-api', script: 'test' as const }, also: [], note: 'your own `test` script would run here' };
     const t = tflat({ ...r, wouldAdd: [...r.wouldAdd, script] });
     expect(t).toContain('gitleaks v2.3.9 (gitleaks/gitleaks-action), reviewed tool');
     expect(t).toContain("pipegen's own check");
@@ -496,7 +496,7 @@ describe('rulings', () => {
 
   it('reviewed tool with hostile fields is cleaned in every output', () => {
     const evil = reviewedTool(`x${hostileNames.ansiColour}`, `acme/${hostileNames.bidiOverride}`, hostileNames.osc8Link, ['secrets']);
-    const r = { ...report(), wouldAdd: [{ need: need('push', 'secrets'), status: 'missing' as const, tool: evil, note: 'reviewed tool' }] };
+    const r = { ...report(), wouldAdd: [{ need: need('push', 'secrets'), status: 'missing' as const, tool: evil, also: [], note: 'reviewed tool' }] };
     for (const text of [term(r), md(r), json(r)]) {
       expect(text).not.toContain(ESC);
       expect(text).not.toMatch(BIDI);
@@ -513,7 +513,7 @@ describe('fix round 1', () => {
       profile: { ...r.profile, services: names.map((name) => service({ name, path: `apps/${name}` })) },
       // every realistic row for every service: 80,000 rows, about 200,000 terminal lines (the review's crash case)
       coverage: names.flatMap((n) => r.coverage.map((c) => ({ ...c, need: { ...c.need, service: n } }))),
-      wouldAdd: names.map((n) => ({ need: need('push', 'sast', n), status: 'missing' as const, tool: null, note: SUGGESTION_NOTE })),
+      wouldAdd: names.map((n) => ({ need: need('push', 'sast', n), status: 'missing' as const, tool: null, also: [], note: SUGGESTION_NOTE })),
       wouldCreate: names.map((n) => ({ what: 'tests' as const, why: `No tests found for ${n}: pipegen would create starter tests.` })),
       aiBundle: { ...r.aiBundle, topFolders: names },
       notes: names.map((n) => `Skipped ${n}/package.json: not valid JSON.`),

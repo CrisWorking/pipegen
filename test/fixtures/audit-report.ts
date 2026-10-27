@@ -66,7 +66,7 @@ const coverage = (): Coverage[] => [
 
 export const SUGGESTION_NOTE = 'no reviewed tool yet; pipegen would only mention one, never run it as a check';
 
-const row = (c: Coverage, tool: WouldAddRow['tool'], note: string): WouldAddRow => ({ need: c.need, status: c.status as WouldAddRow['status'], tool, note });
+const row = (c: Coverage, tool: WouldAddRow['tool'], note: string): WouldAddRow => ({ need: c.need, status: c.status as WouldAddRow['status'], tool, also: [], note });
 
 const gitleaks = reviewedTool('gitleaks', 'gitleaks/gitleaks-action', 'v2.3.9', ['secrets']);
 const semgrep = reviewedTool('semgrep', 'semgrep/semgrep', '1.95.0', ['sast']);
@@ -117,6 +117,8 @@ export function freePrivateReport(excludedPatterns: readonly string[]): AuditRep
     },
     coverage: c,
     wouldAdd: wouldAdd(c),
+    skipped: [],
+    wouldSet: [],
     wouldCreate: [
       { what: 'docker', why: 'shop-api runs but has no Dockerfile: pipegen would create one, so the image can be built and scanned.' },
       { what: 'compose', why: 'The app uses postgres: pipegen would create a Compose file that starts them for the tests.' },

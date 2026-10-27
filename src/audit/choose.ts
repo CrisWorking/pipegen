@@ -1,0 +1,283 @@
+// Choosing what pipegen would add (Plan P Task 8): the catalogue's "choose X when ..." rules (catalogue §2, §3), applied
+// to each missing check of the audit. Deterministic: the same repo facts and the same reviewed list always give the
+// same pick, and every pick carries a one-line plain-English reason.
+//
+// What it never does:
+// - pick a tool for another language (reviewedFor filters by the need's language);
+// - pick a tool on the never-lists (NEVER_REPOS, NEVER_IMAGES: neverListed, neverImage), even if a list contains it;
+// - invent an entry: a rule names a reviewed id, and an id the list doesn't have gives tool null (the row says
+//   "suggestion only"), never a crash and never a different tool.
+// A repo's own tool (its ESLint, its tsc, its Jest...) is a RepoToolStep at the lockfile version (DECISIONS #95); it
+// needs no reviewed entry. Whether that tool actually runs in CI is the coverage mapper's call (Task 3, Task 4), not
+// this file's: the chooser only says what pipegen would add for a row that is missing or partial.
+//
+// Also here: `skippedGroups` (the checks that don't apply, one line per reason) and `wouldSetSettings` (the GitHub
+// settings `finish` would turn on).
+import { codeSecurityAvailable } from '../github/availability.js';
+import { needLanguage } from '../engine/discover.js';
+import { skippedChecks, type SkippedCheck } from '../engine/needs.js';
+import { neverImage, neverListed, reviewedFor, type RepoToolStep, type WouldAddTool } from '../engine/reviewed.js';
+import { emptyServiceQuality } from '../read/quality.js';
+import type { Capabilities, Need, NeedCategory, RepoProfile, ReviewedTool, Service } from '../types.js';
+import { safeText } from '../util/safe-text.js';
+import type { Coverage } from './coverage.js';
+
+export interface Choice { tool: WouldAddTool; also: WouldAddTool[]; note: string }
+
+/** Every reviewed id a rule can name. Rules refer to ids only through this table, so the list can't drift from the rules. */
+const T = {
+  biome: 'biome', eslint: 'eslint', eslintTs: 'eslint-typescript', oxlintTypeaware: 'oxlint-typeaware', prettier: 'prettier',
+  ruff: 'ruff', ruffFormat: 'ruff-format', mypy: 'mypy', vitestCoverage: 'vitest-coverage', c8: 'c8', coveragePy: 'coverage-py',
+  knip: 'knip', creosote: 'creosote', vulture: 'vulture', jscpd: 'jscpd', hadolint: 'hadolint', actionlint: 'actionlint', zizmor: 'zizmor',
+  poutine: 'poutine', pinact: 'pinact', osvScanner: 'osv-scanner', dependencyReviewAction: 'dependency-review-action', trivyLicence: 'trivy-licence',
+  schemathesis: 'schemathesis', trivyConfig: 'trivy-config', kubeLinter: 'kube-linter', betterleaks: 'betterleaks', bullfrog: 'bullfrog',
+  scorecardAction: 'scorecard-action',
+} as const;
+export const CHOOSER_IDS: readonly string[] = Object.freeze(Object.values(T));
+
+const NO_ENTRY = 'it is not on the reviewed list yet, so pipegen would only mention it';
+
+interface Ctx {
+  need: Need; s: Service | undefined; p: RepoProfile; caps: Capabilities;
+  q: Service['quality']; lang: ReturnType<typeof needLanguage>;
+  /** The reviewed entries that cover this need and may be picked: right category and language, never on a never-list. */
+  usable: ReviewedTool[];
+}
+
+// ---------- building a choice ----------
+
+const none = (note: string): Choice => ({ tool: null, also: [], note });
+const builtIn = (note: string): Choice => ({ tool: { kind: 'built-in' }, also: [], note });
+
+/** A reviewed id from the usable entries, or null. */
+const entry = (c: Ctx, id: string): ReviewedTool | null => c.usable.find((t) => t.id === id) ?? null;
+
+/** The reviewed tool `id` with its reason; missing from the list → tool null and a note that says so. `also` ids that are missing are left out. */
+function reviewed(c: Ctx, id: string, reason: string, alsoIds: readonly string[] = [], extra = ''): Choice {
+  const tool = entry(c, id);
+  if (tool === null) return none(`${reason}; ${NO_ENTRY}`);
+  const also = alsoIds.map((a) => entry(c, a)).filter((t): t is ReviewedTool => t !== null);
+  return { tool, also, note: `${reason}${extra}` };
+}
+
+/** The repo's own tool at its lockfile version. */
+function own(c: Ctx, tool: string, version: string | null, reason: string): Choice {
+  const step: RepoToolStep = { kind: 'repo-tool', needId: c.need.id, service: c.s?.name ?? c.need.service ?? '', tool, version };
+  if (c.s !== undefined && c.s.path !== '' && c.s.path !== '.') step.workingDir = c.s.path;
+  return { tool: step, also: [], note: reason };
+}
+
+const major = (v: string | undefined): number | null => {
+  const n = Number((v ?? '').split('.')[0]);
+  return v !== undefined && Number.isInteger(n) ? n : null;
+};
+
+// ---------- node lint and format ----------
+
+type NodeLint = { engine: 'eslint' | 'biome' | 'oxlint'; own: boolean };
+/** The repo's own linter if it configured one (ESLint first, then Biome, then Oxlint), else the framework rule, else Biome. */
+function nodeLint(q: Service['quality']): NodeLint {
+  if (q.eslintConfig !== 'none') return { engine: 'eslint', own: true };
+  if (q.configs.includes('biome')) return { engine: 'biome', own: true };
+  if (q.configs.includes('oxlint')) return { engine: 'oxlint', own: true };
+  return q.uiFrameworks.length > 0 ? { engine: 'eslint', own: false } : { engine: 'biome', own: false };
+}
+const isTypeScript = (q: Service['quality']) => q.tsconfig || q.versions.typescript !== undefined;
+const PACKAGE_OF = { eslint: 'eslint', biome: '@biomejs/biome', oxlint: 'oxlint' } as const;
+const FRAMEWORK_NAMES = { next: 'Next', nuxt: 'Nuxt', vue: 'Vue', svelte: 'Svelte', astro: 'Astro', 'react-native': 'React Native' } as const;
+
+function lintRule(c: Ctx): Choice {
+  const { q } = c;
+  if (c.lang === 'python') {
+    const configured = q.configs.find((x) => x === 'flake8' || x === 'pylint');
+    return configured !== undefined ? own(c, configured, null, `${configured} is already configured`) : reviewed(c, T.ruff, 'Ruff: no Python linter configured');
+  }
+  if (c.lang !== 'node') return generic(c);
+  const l = nodeLint(q);
+  if (l.own) {
+    const version = q.versions[PACKAGE_OF[l.engine]] ?? null;
+    if (l.engine === 'eslint' && (major(version ?? undefined) ?? 0) >= 10 && q.eslintConfig === 'eslintrc') {
+      return own(c, 'eslint', version, "the repo's ESLint config: error, ESLint 10 doesn't read .eslintrc; migrate it with ESLint's migration tool (@eslint/migrate-config)");
+    }
+    const names = { eslint: 'ESLint', biome: 'Biome', oxlint: 'Oxlint' } as const;
+    return own(c, l.engine, version, `${names[l.engine]} is already configured`);
+  }
+  if (l.engine === 'biome') {
+    return reviewed(c, T.biome, `Biome: no linter configured; ${isTypeScript(q) ? 'TypeScript' : 'JavaScript'} repo without a framework plugin`);
+  }
+  const framework = q.uiFrameworks.map((f) => FRAMEWORK_NAMES[f]).join(' and ');
+  const why = `no linter configured; ${framework} needs ESLint plugins`;
+  if (!isTypeScript(q)) return reviewed(c, T.eslint, `ESLint: ${why}`);
+  if ((major(q.versions.typescript) ?? 0) >= 7) {
+    return reviewed(c, T.eslint, `ESLint with Oxlint's type-aware rules: ${why}, and typescript-eslint doesn't support TypeScript 7`, [T.oxlintTypeaware]);
+  }
+  return reviewed(c, T.eslintTs, `ESLint with typescript-eslint: ${why}`);
+}
+
+function formatRule(c: Ctx): Choice {
+  const { q } = c;
+  if (c.lang === 'python') {
+    return q.configs.includes('black') ? own(c, 'black', null, 'Black is already configured') : reviewed(c, T.ruffFormat, 'Ruff format: no Python formatter configured');
+  }
+  if (c.lang !== 'node') return generic(c);
+  if (q.configs.includes('prettier')) {
+    return q.versions.prettier !== undefined ? own(c, 'prettier', q.versions.prettier, 'Prettier is already configured') : reviewed(c, T.prettier, 'Prettier: a Prettier config is already in the repo');
+  }
+  const l = nodeLint(q);
+  if (l.engine === 'biome') {
+    return l.own ? own(c, 'biome', q.versions['@biomejs/biome'] ?? null, 'Biome is already configured') : reviewed(c, T.biome, 'Biome: it lints here, so it formats too');
+  }
+  return reviewed(c, T.prettier, 'Prettier: ESLint lints here, and it does not format');
+}
+
+// ---------- type-check and coverage ----------
+
+function typeCheckRule(c: Ctx): Choice {
+  const { q } = c;
+  if (c.lang === 'python') {
+    const checker = q.configs.find((x) => x === 'mypy' || x === 'pyright' || x === 'basedpyright');
+    return checker !== undefined ? own(c, checker, null, `${checker} is already configured`) : reviewed(c, T.mypy, 'mypy: no Python type checker configured');
+  }
+  if (c.lang !== 'node') return generic(c);
+  const pick = q.uiFrameworks.includes('vue') ? { tool: 'vue-tsc', pkg: 'vue-tsc' as const }
+    : q.uiFrameworks.includes('svelte') ? { tool: 'svelte-check', pkg: 'svelte-check' as const }
+      : q.uiFrameworks.includes('astro') ? { tool: 'astro check', pkg: '@astrojs/check' as const }
+        : { tool: 'tsc', pkg: 'typescript' as const };
+  const version = q.versions[pick.pkg];
+  if (version === undefined) {
+    return none(`${pick.tool}: ${pick.pkg} is not in the lockfile, so pipegen can only suggest it (add ${pick.pkg} as a dev dependency)`);
+  }
+  return own(c, pick.tool, version, `${pick.tool} is in the lockfile`);
+}
+
+const COVERAGE_NOTE = '`floor(current) - 1`; 60% of lines for repos with few tests; an existing minimum is kept';
+
+function coverageRule(c: Ctx): Choice {
+  const { q, s } = c;
+  const withNote = (ch: Choice): Choice => ({ ...ch, note: `${ch.note}; minimum: ${COVERAGE_NOTE}` });
+  if (c.lang === 'python') return withNote(reviewed(c, T.coveragePy, 'coverage.py: pytest and unittest both run under it'));
+  if (c.lang !== 'node') return generic(c);
+  const runner = q.versions.vitest !== undefined || s?.testFramework === 'vitest' ? 'vitest'
+    : q.versions.jest !== undefined || s?.testFramework === 'jest' ? 'jest' : 'other';
+  if (runner === 'vitest') return withNote(reviewed(c, T.vitestCoverage, 'Vitest coverage: Vitest is the test runner'));
+  if (runner === 'jest') return withNote(own(c, 'jest', q.versions.jest ?? null, "Jest's own coverage (coverageThreshold): Jest is the test runner"));
+  return withNote(reviewed(c, T.c8, `c8: ${s?.testFramework === 'node:test' ? 'node:test' : 'the test runner'} has no coverage of its own`));
+}
+
+// ---------- the rest ----------
+
+function deadCodeRule(c: Ctx): Choice {
+  if (c.lang === 'node') {
+    return reviewed(c, T.knip, 'Knip: finds unused files, exports and dependencies', [], c.q.configs.includes('knip') ? '; blocking because `knip.json` exists' : '; report-only on the first run');
+  }
+  if (c.lang === 'python') return reviewed(c, T.creosote, 'Creosote: finds unused dependencies', [T.vulture]);
+  if (c.lang === 'go') return none('`go mod tidy -diff`, report only');
+  return generic(c);
+}
+
+const RISKY_TRIGGERS: readonly string[] = ['pull_request_target', 'workflow_run', 'issue_comment'];
+
+function dependencyReviewRule(c: Ctx): Choice {
+  const available = codeSecurityAvailable(c.p, c.caps);
+  return reviewed(c, T.osvScanner, `OSV-Scanner: checks new dependencies against known vulnerabilities${available ? ', plus GitHub dependency review' : ''}`, available ? [T.dependencyReviewAction] : []);
+}
+
+function licencesRule(c: Ctx): Choice {
+  const config = c.p.repoFiles.licenceConfig;
+  if (config === 'deny.toml') return none('cargo-deny: a deny.toml is already in the repo (suggestion only)');
+  if (config === '.grant.yaml') return none('grant: a .grant.yaml is already in the repo (suggestion only)');
+  if (config === '.fossa.yml') return none('keep FOSSA: a .fossa.yml is already in the repo, so pipegen adds no licence check');
+  return reviewed(c, T.trivyLicence, 'Trivy licence scan: no licence tool configured');
+}
+
+function apiDastRule(c: Ctx): Choice {
+  const spec = c.q.apiSpec;
+  const where = spec === null ? 'the API spec' : spec.kind === 'file' ? safeText(spec.path) : `served by ${spec.by === 'fastapi' ? 'FastAPI' : 'NestJS'}`;
+  return reviewed(c, T.schemathesis, `Schemathesis: tests the API from its spec (${where})`);
+}
+
+function updateConfigRule(c: Ctx): Choice {
+  if (c.p.repoFiles.renovate !== null) return builtIn('keep Renovate; set `minimumReleaseAge: "7 days"`');
+  if (c.p.repoFiles.dependabot !== null) return builtIn('keep your Dependabot config; set `cooldown.default-days: 7`');
+  return builtIn('pipegen would write `.github/dependabot.yml`: weekly, grouped, `cooldown.default-days: 7`');
+}
+
+/** Categories without a choose rule keep the first reviewed entry for the need (PS35). */
+function generic(c: Ctx): Choice {
+  const first = c.usable[0];
+  return first === undefined ? none('') : { tool: first, also: [], note: 'reviewed tool' };
+}
+
+type Rule = (c: Ctx) => Choice;
+const RULES: Readonly<Record<string, Rule>> = {
+  lint: lintRule, format: formatRule, 'type-check': typeCheckRule, coverage: coverageRule, 'dead-code': deadCodeRule,
+  duplication: (c) => reviewed(c, T.jscpd, 'jscpd: finds copy-pasted code', [], '; warning only; new copy-paste in the pull request only'),
+  'dockerfile-lint': (c) => reviewed(c, T.hadolint, 'Hadolint: lints the Dockerfile', [], "; Trivy config's Dockerfile checks stay on"),
+  'workflow-lint': (c) => {
+    const risky = c.p.existingWorkflows.some((w) => w.triggers.some((t) => RISKY_TRIGGERS.includes(t)));
+    return reviewed(c, T.actionlint, `actionlint and zizmor: check the workflows for mistakes and risky patterns${risky ? '; poutine too, because a workflow runs on untrusted pull request input' : ''}`, risky ? [T.zizmor, T.poutine] : [T.zizmor]);
+  },
+  'workflow-pin-check': (c) => reviewed(c, T.pinact, 'pinact: checks that every action is pinned to a commit', [], c.p.repoFiles.actionsLock ? "; an actions.lock exists, so pinact won't rewrite its pins" : ''),
+  'dependency-review': dependencyReviewRule,
+  licences: licencesRule,
+  'api-dast': apiDastRule,
+  iac: (c) => reviewed(c, T.trivyConfig, c.p.repoFiles.kubernetes ? 'Trivy config: scans Terraform and Kubernetes files, plus kube-linter' : 'Trivy config: scans Terraform files', c.p.repoFiles.kubernetes ? [T.kubeLinter] : []),
+  secrets: (c) => reviewed(c, T.betterleaks, 'Betterleaks: scans for committed secrets', [], c.p.repoFiles.secretsBaseline ? '; a .secrets.baseline exists, so detect-secrets also runs' : ''),
+  'update-config': updateConfigRule,
+  publishing: () => builtIn('trusted publishing (OIDC); no long-lived token'),
+  egress: (c) => reviewed(c, T.bullfrog, 'Bullfrog: blocks unexpected network traffic in release jobs'),
+  scorecard: (c) => reviewed(c, T.scorecardAction, 'OpenSSF Scorecard: scores the repo weekly'),
+  fuzzing: () => none('pipegen builds fuzzing in v0.3'),
+};
+
+/**
+ * What pipegen would add for `need`: the rule for its category, else the first reviewed entry that covers it.
+ * Pure and deterministic. `s` is the need's service (absent for repo-wide needs).
+ */
+export function chooseTools(need: Need, s: Service | undefined, p: RepoProfile, caps: Capabilities, reviewedList: ReviewedTool[]): Choice {
+  const usable = reviewedFor(need, needLanguage(need, p), reviewedList, 'audit')
+    .filter((t) => neverListed(t.candidate.repo) === null && (t.candidate.kind !== 'docker' || neverImage(t.candidate.repo) === null));
+  const c: Ctx = { need, s, p, caps, q: s?.quality ?? emptyServiceQuality(), lang: needLanguage(need, p), usable };
+  const rule = Object.hasOwn(RULES, need.category) ? (RULES[need.category] as Rule) : generic;
+  return rule(c);
+}
+
+// ---------- skipped checks, one line per reason ----------
+
+/** Checks left out for the same reason, on one line. */
+export interface SkippedGroup { why: string; categories: NeedCategory[]; services: string[] }
+
+/** The checks that don't apply to this repo, grouped by reason in first-seen order ("no services found" once, not 20 times). */
+export function skippedGroups(p: RepoProfile, caps: Capabilities): SkippedGroup[] {
+  const groups = new Map<string, SkippedGroup>();
+  for (const k of skippedChecks(p, caps) as SkippedCheck[]) {
+    const g = groups.get(k.why) ?? { why: k.why, categories: [], services: [] };
+    groups.set(k.why, g);
+    if (!g.categories.includes(k.category)) g.categories.push(k.category);
+    if (k.service !== undefined && !g.services.includes(k.service)) g.services.push(k.service);
+  }
+  return [...groups.values()];
+}
+
+// ---------- the settings `finish` would turn on ----------
+
+export interface WouldSet { setting: 'sha-pinning' | 'dependabot-alerts' | 'secret-scanning'; why: string }
+
+const CANT_SEE = "pipegen can't see this setting with read access, so it can't say whether it is already on";
+
+/** ST1-ST3 (DEC #27, #14). Set by `finish` after the merge. Private repos never get public wording. */
+export function wouldSetSettings(p: RepoProfile, coverage: readonly Coverage[]): WouldSet[] {
+  const pin = coverage.find((c) => c.need.category === 'workflow-pin-check');
+  const pinned = pin !== undefined && pin.status === 'covered';
+  const out: WouldSet[] = [
+    {
+      setting: 'sha-pinning',
+      why: `Makes GitHub refuse any action that is not pinned to a commit. pipegen turns it on only after your other workflows pin their actions${pinned ? ' (the action pin check passes today)' : ' (the action pin check row says they do not all do that yet, and those workflows would stop running)'}; ${CANT_SEE}.`,
+    },
+    { setting: 'dependabot-alerts', why: `Tells you when a dependency has a known vulnerability; free on every repo. ${CANT_SEE}.` },
+  ];
+  out.push(p.private
+    ? { setting: 'secret-scanning', why: `A paid add-on (GitHub Secret Protection); pipegen can't turn it on here.` }
+    : { setting: 'secret-scanning', why: `Blocks pushes that contain a known secret format (push protection). ${CANT_SEE}.` });
+  return out;
+}

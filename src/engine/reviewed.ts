@@ -41,6 +41,17 @@ import { BETTERLEAKS_GRAMMAR, NUCLEI_GRAMMAR, TRIVY_GRAMMAR } from './tool-gramm
 export interface ProjectScriptStep { kind: 'project-script'; needId: string; service: string; script: 'test' | 'lint'; workingDir?: string }
 
 /** Categories a reviewed entry may carry (ruling S23): every need category, plus `platform`, which isn't a need (egress and workflow-lint became needs in Plan P Task 2). */
+/**
+ * A tool the repo already has, at the version its lockfile pins (DECISIONS #95: tsc and Jest count as repo built-ins;
+ * so do the linters and checkers the repo configured itself). Not a reviewed entry: pipegen adds no pin for it.
+ * `version` is null when pipegen can't read one (Python tools, or a package not in the lockfile).
+ */
+export interface RepoToolStep { kind: 'repo-tool'; needId: string; service: string; tool: string; version: string | null; workingDir?: string }
+/** pipegen's own check (the merge gate, the deploy-time verify, the Dependabot file): nothing to pick. */
+export interface BuiltInCheck { kind: 'built-in' }
+/** What would run for a need: a reviewed tool, the service's own script, the repo's own tool, pipegen's own check, or nothing yet. */
+export type WouldAddTool = ReviewedTool | ProjectScriptStep | RepoToolStep | BuiltInCheck | null;
+
 export const TOOL_CATEGORIES = [...NEED_CATEGORIES, 'platform'] as const;
 const LANGUAGES = ['node', 'python', 'go', 'java', 'dotnet', 'ruby', 'php', 'other', 'any'] as const satisfies readonly (Language | 'any')[];
 

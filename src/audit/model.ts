@@ -39,7 +39,7 @@ import { ensurePinnedBinary, PinnedBinaryError } from '../engine/linters.js';
 import type { MemoryStore } from '../engine/memory.js';
 import { CHECK_LABELS, floorNeeds, isRunnable, jobCategories, needKey, needsPromptBytes, planNeeds, type NeedsPlan } from '../engine/needs.js';
 import type { QualityBar } from '../engine/quality-bar.js';
-import { projectScriptFor, reviewedFor, type ProjectScriptStep } from '../engine/reviewed.js';
+import { projectScriptFor, type WouldAddTool } from '../engine/reviewed.js';
 import {
   activity30d, aiRequestBytes, estimate, requestCeilingUsd, unpricedModel, usageCeilingUsd, usageCostUsd, type Activity, type Estimates,
 } from '../estimate/estimate.js';
@@ -57,6 +57,7 @@ import { usd } from '../util/format.js';
 import { packageVersion } from '../util/package-data.js';
 import { safeText } from '../util/safe-text.js';
 import { ConsentToken, CountingSummary, isSpent, spend } from './consent-token.js';
+import { chooseTools, skippedGroups, wouldSetSettings, type SkippedGroup, type WouldSet } from './choose.js';
 import { mapCoverage, type Coverage } from './coverage.js';
 
 // ---------- types ----------
@@ -65,15 +66,15 @@ import { mapCoverage, type Coverage } from './coverage.js';
 export const CURRENT_MILESTONE = 'v0.1' as const;
 export type Milestone = typeof CURRENT_MILESTONE;
 
-/** pipegen's own check (the merge gate, the deploy-time verify): nothing to pick. */
-export interface BuiltInCheck { kind: 'built-in' }
-/** What would run for a need: a reviewed tool, the service's own script, pipegen's own check, or nothing yet. */
-export type WouldAddTool = ReviewedTool | ProjectScriptStep | BuiltInCheck | null;
+// Plan P Task 8: the type lives in engine/reviewed.ts (the chooser needs it); re-exported so importers don't change.
+export type { BuiltInCheck, WouldAddTool } from '../engine/reviewed.js';
 export interface WouldAddRow {
   need: Need;
   /** The need's coverage status (never `covered`: covered needs get no row). */
   status: Exclude<Coverage['status'], 'covered'>;
   tool: WouldAddTool;
+  /** Plan P Task 8: further tools the same pick adds (workflow-lint: zizmor; python dead-code: vulture). Empty when none. */
+  also: WouldAddTool[];
   /** pipegen's own label for the row (fixed words, plus a validated service name for starter tests). */
   note: string;
 }
@@ -100,6 +101,10 @@ export interface AuditWarning { text: string; command?: string }
 export interface AuditReport {
   profile: RepoProfile; capabilities: Capabilities; support: AuditSupport;
   coverage: Coverage[]; wouldAdd: WouldAddRow[];
+  /** Plan P Task 8: the checks that don't apply to this repo, one line per reason. */
+  skipped: SkippedGroup[];
+  /** Plan P Task 8 (ST1-ST3): the GitHub settings `finish` would turn on after the merge. */
+  wouldSet: WouldSet[];
   wouldCreate: { what: Part; why: string }[];
   /** Ruling S27: "No service found to test." when the repo has no service (the tests rows are absent on purpose), else null. */
   testsNote: string | null;
@@ -359,7 +364,7 @@ export async function buildAudit(dir: string, deps: AuditDeps): Promise<AuditRep
   const needs = floorNeeds(profile, caps);
 
   const coverage = await coverageOf(profile, needs, dir, skippedWorkflowCount(readerNotes), notes, caps);
-  const wouldAdd = wouldAddRows(profile, coverage, deps);
+  const wouldAdd = wouldAddRows(profile, coverage, deps, caps);
 
   const activity = await activityOf(deps, profile);
   const estimates = estimate(profile, jobCategories(needs), 2, activity ?? { pushes: 0, prs: 0, capped: false }, { name: 'claude', model: DEFAULT_MODEL });
@@ -382,6 +387,8 @@ export async function buildAudit(dir: string, deps: AuditDeps): Promise<AuditRep
     support: supportOf(profile),
     coverage,
     wouldAdd,
+    skipped: skippedGroups(profile, caps),
+    wouldSet: wouldSetSettings(profile, coverage),
     wouldCreate: wouldCreateOf(profile),
     testsNote: profile.services.length === 0 ? NO_SERVICE_TO_TEST : null,
     estimates,
@@ -471,7 +478,7 @@ async function coverageOf(p: RepoProfile, needs: Need[], dir: string, skippedWor
   }
 }
 
-function wouldAddRows(p: RepoProfile, coverage: Coverage[], deps: AuditDeps): WouldAddRow[] {
+function wouldAddRows(p: RepoProfile, coverage: Coverage[], deps: AuditDeps, caps: Capabilities): WouldAddRow[] {
   const rows: WouldAddRow[] = [];
   for (const c of coverage) {
     if (c.status === 'covered') continue;
@@ -480,20 +487,25 @@ function wouldAddRows(p: RepoProfile, coverage: Coverage[], deps: AuditDeps): Wo
     // S27: a service without tests gets starter tests; its own `test` script (npm's default "no test specified") is
     // then not offered as the tool, so the row's tool and note agree (fix round 1, M2).
     const starter = (need.category === 'unit-tests' || need.category === 'full-tests') && service !== undefined && !service.hasTests;
-    const { tool, note } = pick(need, starter ? undefined : service, p, deps);
-    rows.push({ need, status: c.status, tool, note: starter ? starterTests(service.name) : note });
+    const { tool, also, note } = pick(need, starter ? undefined : service, p, deps, caps);
+    rows.push({ need, status: c.status, tool, also, note: starter ? starterTests(service.name) : note });
   }
   return rows;
 }
 
-/** Ruling S7: pipegen's own check → the service's own script → the first reviewed tool → nothing. */
-function pick(need: Need, service: Service | undefined, p: RepoProfile, deps: AuditDeps): { tool: WouldAddTool; note: string } {
-  if (isBuiltInNeed(need)) return { tool: { kind: 'built-in' }, note: ROW_NOTE.builtIn };
+/**
+ * Ruling S7, extended by Plan P Task 8: pipegen's own check → the service's own script → chooseTools (the catalogue's
+ * choose-rules; the first reviewed entry for a check without a rule, PS35) → nothing. The list unavailable (B3/U11)
+ * keeps its own note on a row that ends with no tool.
+ */
+function pick(need: Need, service: Service | undefined, p: RepoProfile, deps: AuditDeps, caps: Capabilities): { tool: WouldAddTool; also: WouldAddTool[]; note: string } {
+  if (isBuiltInNeed(need)) return { tool: { kind: 'built-in' }, also: [], note: ROW_NOTE.builtIn };
   const script = service === undefined ? null : projectScriptFor(need, service);
-  if (script !== null) return { tool: script, note: ROW_NOTE.script(script.script) };
-  const reviewed = reviewedFor(need, needLanguage(need, p), deps.reviewed, 'audit')[0];
-  if (reviewed !== undefined) return { tool: reviewed, note: ROW_NOTE.reviewed };
-  return { tool: null, note: deps.reviewedUnavailable === true ? ROW_NOTE.unavailable : ROW_NOTE.suggestion };
+  if (script !== null) return { tool: script, also: [], note: ROW_NOTE.script(script.script) };
+  const choice = chooseTools(need, service, p, caps, deps.reviewed);
+  if (choice.tool !== null) return { tool: choice.tool, also: choice.also, note: choice.note };
+  if (deps.reviewedUnavailable === true) return { tool: null, also: [], note: ROW_NOTE.unavailable };
+  return { tool: null, also: [], note: choice.note === '' ? ROW_NOTE.suggestion : choice.note };
 }
 
 function wouldCreateOf(p: RepoProfile): { what: Part; why: string }[] {

@@ -114,14 +114,14 @@ const anyContains = (r: AuditReport, value: string) => JSON.stringify(r).include
 
 describe('buildAudit (brief, Task 2a)', () => {
   it('audit: wouldAdd uses reviewed tools for missing needs', async () => {
-    const gitleaks = tool('gitleaks', ['secrets']);
+    const gitleaks = tool('betterleaks', ['secrets']); // Plan P Task 8: the secrets rule names betterleaks
     const r = await buildAudit(repo(nodeApp()), deps({ reviewed: [gitleaks, tool('pip-audit', ['deps'], ['python'])] }));
     const leakRows = rowsOf(r, 'secrets');
     expect(leakRows.map((w) => w.need.layer)).toEqual(['pre-commit', 'push', 'merge']);
     for (const w of leakRows) {
       expect(w.status).toBe('missing');
       expect(w.tool).toBe(gitleaks);
-      expect(w.note).toBe('reviewed tool');
+      expect(w.note).toBe('Betterleaks: scans for committed secrets');
     }
     // a reviewed tool for another language is never picked
     for (const w of rowsOf(r, 'deps')) expect(w.tool).toBeNull();
@@ -693,3 +693,82 @@ describe('buildAudit (Plan U final review)', () => {
     for (const p of ['\\*\\*/.env\\*', '\\*\\*/\\*.tfstate', '\\*\\*/.npmrc']) expect(section(md), p).toContain(p);
   });
 });
+
+describe('buildAudit: Plan P Task 8 (choosing, skipped checks, settings)', () => {
+  // A fixture list: Task 6 adds the real entries later (ruling P14), so these tests build their own.
+  const LIST = [
+    tool('biome', ['lint', 'format'], ['node']), tool('prettier', ['format'], ['node']), tool('ruff', ['lint'], ['python']),
+    tool('ruff-format', ['format'], ['python']), tool('mypy', ['type-check'], ['python']), tool('betterleaks', ['secrets']),
+    tool('vitest-coverage', ['coverage'], ['node']), tool('jscpd', ['duplication']),
+  ];
+  const monorepo = () => repo({
+    'web/package.json': JSON.stringify({ name: 'web', scripts: { start: 'node index.js' }, devDependencies: { typescript: '5.4.5' } }),
+    'web/package-lock.json': '{}\n', 'web/index.js': 'console.log(1);\n', 'web/tsconfig.json': '{}\n',
+    'web/Dockerfile': 'FROM node:20\n',
+    'py/pyproject.toml': '[project]\nname = "py"\n', 'py/app.py': 'print(1)\n', 'py/Dockerfile': 'FROM python:3.12\n',
+  });
+
+  it('audit: node + python monorepo → per-service rows and picks; ruff in py/ doesn\'t cover web', async () => {
+    const r = await buildAudit(monorepo(), deps({ reviewed: LIST }));
+    const lint = r.wouldAdd.filter((w) => w.need.id === 'lint' && w.need.layer === 'push');
+    const toolOf = (service: string) => lint.find((w) => w.need.service === service)?.tool as { id?: string } | null | undefined;
+    const services = r.profile.services.map((s) => `${s.name}:${s.language}`).sort();
+    expect(services).toEqual(['py:python', 'web:node']);
+    expect(toolOf('py')?.id).toBe('ruff');
+    expect(toolOf('web')?.id).toBe('biome');
+    const format = r.wouldAdd.filter((w) => w.need.id === 'format' && w.need.layer === 'push');
+    expect((format.find((w) => w.need.service === 'py')?.tool as { id?: string } | null)?.id).toBe('ruff-format');
+    expect((format.find((w) => w.need.service === 'web')?.tool as { id?: string } | null)?.id).toBe('biome');
+    // the Python type checker is for py only: web has no mypy row
+    expect(r.wouldAdd.filter((w) => w.need.id === 'type-check' && w.need.service === 'web').every((w) => w.tool === null || (w.tool as { kind?: string }).kind === 'repo-tool')).toBe(true);
+    // the Python picks never reach the Node service
+    for (const w of r.wouldAdd.filter((x) => x.need.service === 'web')) {
+      expect(JSON.stringify(w.tool ?? null)).not.toMatch(/"id":"(ruff|ruff-format|mypy)"/);
+    }
+  });
+
+  it('audit: a pick with an unavailable reviewed list keeps the "list unavailable" note', async () => {
+    const r = await buildAudit(monorepo(), deps({ reviewed: [], reviewedUnavailable: true }));
+    const lint = r.wouldAdd.find((w) => w.need.id === 'lint');
+    expect(lint?.tool).toBeNull();
+    expect(lint?.note).toBe("pipegen's reviewed tool list couldn't be loaded, so it has no tool to add here");
+  });
+
+  it('audit: a missing reviewed entry gives suggestion only with the rule\'s reason', async () => {
+    const r = await buildAudit(repo(nodeApp()), deps({ reviewed: [] }));
+    const found = r.wouldAdd.find((w) => w.need.id === 'secrets');
+    expect(found?.tool).toBeNull();
+    expect(found?.note).toContain('not on the reviewed list');
+    expect(found?.also).toEqual([]);
+  });
+
+  it('audit: skipped lists every Plan P check that doesn\'t apply, with its why', async () => {
+    const r = await buildAudit(repo(nodeApp()), deps());
+    const flat = r.skipped.flatMap((g) => g.categories.map((c) => `${c}|${g.why}`));
+    expect(flat).toContain('fuzzing|no fuzz targets found');
+    expect(flat).toContain('dockerfile-lint|no Dockerfile found');
+    expect(flat).toContain('publishing|no workflow publishes a package');
+    expect(new Set(r.skipped.map((g) => g.why)).size).toBe(r.skipped.length);
+  });
+
+  it('audit: wouldSet has sha-pinning and Dependabot alerts on every repo; secret scanning public only; private gets the paid note, no public wording', async () => {
+    const pub = await buildAudit(repo(nodeApp()), deps());
+    expect(pub.wouldSet.map((x) => x.setting)).toEqual(['sha-pinning', 'dependabot-alerts', 'secret-scanning']);
+    expect(pub.wouldSet[2]?.why).toContain('push protection');
+    const priv = await buildAudit(repo(nodeApp()), deps({ context: { private: true, ownerType: 'User', plan: 'free', defaultBranch: 'main' }, capabilities: bareCaps }));
+    expect(priv.wouldSet.map((x) => x.setting)).toEqual(['sha-pinning', 'dependabot-alerts', 'secret-scanning']);
+    expect(priv.wouldSet[2]?.why).toContain('paid add-on (GitHub Secret Protection)');
+    expect(priv.wouldSet[2]?.why).not.toMatch(/push protection|public/i);
+  });
+
+  it('audit: estimates use jobCategories with JOB_GROUP (no job for update-config, publishing, egress, fuzzing)', async () => {
+    const r = await buildAudit(repo(nodeApp()), deps({ reviewed: LIST }));
+    const jobs = vi.mocked(estimate).mock.calls.at(-1)?.[1] as Record<string, string[]>;
+    expect(jobs).toEqual(jobCategories(floorNeeds(r.profile, allCaps)));
+    const all = Object.values(jobs).flat();
+    for (const id of ['update-config', 'publishing', 'egress', 'fuzzing']) expect(all, id).not.toContain(id);
+    // the Task 8 rows don't add jobs: picking a tool never changes the estimate
+    expect(r.wouldAdd.some((w) => w.need.id === 'update-config')).toBe(true);
+  });
+});
+
