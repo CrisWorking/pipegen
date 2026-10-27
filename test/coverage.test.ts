@@ -150,7 +150,7 @@ describe('mapCoverage (rulings)', () => {
     const rows = await coverage(dir);
     expect(row(rows, 'pre-commit', 'secrets')).toMatchObject({ status: 'covered', by: 'gitleaks', where: '.pre-commit-config.yaml' });
     expect(row(rows, 'pre-commit', 'hooks')).toMatchObject({ status: 'covered', by: 'pre-commit' });
-    expect(row(rows, 'pre-commit', 'format-lint', 'app').status).toBe('missing'); // manual stage only: not a pre-commit hook
+    expect(row(rows, 'pre-commit', 'format-lint', 'app').status).toBe('partial'); // manual stage only: set up, but not run before a commit (fix round 1, I2)
     const dir2 = makeTempDir();
     writeIn(dir2, 'lefthook.yml', 'pre-commit:\n  commands:\n    leaks:\n      run: trufflehog git file://. --since-commit HEAD --fail\n');
     expect(row(await coverage(dir2), 'pre-commit', 'secrets')).toMatchObject({ status: 'covered', by: 'trufflehog', where: 'lefthook.yml' });
@@ -1071,18 +1071,19 @@ describe('mapCoverage (Task 5, item 3: pre-commit hook contents)', () => {
   });
 
   it('pre-commit hooks (adversarial): a manual stage, a local hook named like a tool, a look-alike repo, an overridden entry → not covered', async () => {
-    for (const config of [
-      hookConfig('      - id: ruff-check\n        stages: [manual]\n'),
-      `default_stages: [pre-push]\n${hookConfig('      - id: ruff-format\n')}`,
-      'repos:\n  - repo: local\n    hooks:\n      - id: ruff\n        name: ruff\n        entry: echo ruff\n        language: system\n',
-      'repos:\n  - repo: local\n    hooks:\n      - id: gitleaks\n        name: gitleaks\n        entry: "true"\n        language: system\n',
-      hookConfig('      - id: ruff-check\n', 'https://github.com/someone/ruff-pre-commit'),
-      hookConfig('      - id: ruff-check\n        entry: echo skipped\n'),
-    ]) {
+    // fix round 1 (I2): a hook set up for another stage is partial (set up, but not run before a commit), never covered
+    for (const [config, expected] of [
+      [hookConfig('      - id: ruff-check\n        stages: [manual]\n'), 'partial'],
+      [`default_stages: [pre-push]\n${hookConfig('      - id: ruff-format\n')}`, 'partial'],
+      ['repos:\n  - repo: local\n    hooks:\n      - id: ruff\n        name: ruff\n        entry: echo ruff\n        language: system\n', 'missing'],
+      ['repos:\n  - repo: local\n    hooks:\n      - id: gitleaks\n        name: gitleaks\n        entry: "true"\n        language: system\n', 'missing'],
+      [hookConfig('      - id: ruff-check\n', 'https://github.com/someone/ruff-pre-commit'), 'missing'],
+      [hookConfig('      - id: ruff-check\n        entry: echo skipped\n'), 'missing'],
+    ] as const) {
       const dir = makeTempDir();
       writeIn(dir, '.pre-commit-config.yaml', config);
       const rows = await coverage(dir);
-      expect(row(rows, 'pre-commit', 'format-lint', 'app').status, config).toBe('missing');
+      expect(row(rows, 'pre-commit', 'format-lint', 'app').status, config).toBe(expected);
       expect(row(rows, 'pre-commit', 'secrets').status, config).toBe('missing');
     }
   });
@@ -1150,6 +1151,183 @@ describe('mapCoverage (Task 5, item 4: package publishing at the deploy layer)',
       const dir = makeTempDir();
       wf(dir, 'npm-publish.yml', `on:\n  release:\n    types: [published]\n${job(run(cmd))}`);
       expect(row(await coverage(dir, pkgService), 'deploy', 'attestation', 'app').status, cmd).toBe('missing');
+    }
+  });
+});
+
+// ---------- Task 5 fix round 1: the review's probes (task-5-review.md C1, C2, I1–I4, M1–M3) ----------
+
+describe('mapCoverage (Task 5 fix round 1)', () => {
+  const py = { services: [svc('.', { language: 'python', packageManager: 'uv', scripts: [] })] };
+  const PR = (steps: string) => `on:\n  pull_request:\n${job(steps)}`;
+
+  it('C1: pypi-publish counts only at v1.11.0 or later; an older version is missing with its own why, an unknown ref partial', async () => {
+    const pub = (ref: string, w = '') => `on:\n  release:\n    types: [published]\n${job(`      - uses: pypa/gh-action-pypi-publish@${ref}\n${w}`)}`;
+    const pkgService = { services: [svc('.', { scripts: ['test'] })] };
+    const OLD = 'The PyPI publish action runs at a version before v1.11.0, which makes no attestation unless told to.';
+    const UNKNOWN = "The PyPI publish action makes attestations by default only from v1.11.0, and pipegen can't tell which version this ref is.";
+    for (const [ref, status, why] of [
+      ['v1.8.14', 'missing', OLD], ['v1.10.3', 'missing', OLD], ['release/v1.10', 'missing', OLD], ['release/v1.4', 'missing', OLD],
+      ['dc37677b2e1c63e2034f94d8a5b11f265b73ba33', 'covered', null], // flask's pin: v1.14.2
+      ['fb13cb306901256ace3dab689990e13a5550ffaa', 'covered', null], // v1.11.0
+      ['release/v1', 'covered', null], ['unstable/v1', 'covered', null], ['v1.12.4', 'covered', null], ['v1.11', 'covered', null], ['release/v1.11', 'covered', null],
+      ['0123456789abcdef0123456789abcdef01234567', 'partial', UNKNOWN], ['main', 'partial', UNKNOWN], ['v2.0.0', 'partial', UNKNOWN],
+      ['release/v1.12.1', 'partial', UNKNOWN], ['${{ inputs.ref }}', 'partial', UNKNOWN],
+    ] as const) {
+      const dir = makeTempDir();
+      wf(dir, 'publish.yml', pub(ref));
+      const r = row(await coverage(dir, pkgService), 'deploy', 'attestation', 'app');
+      expect(r.status, ref).toBe(status);
+      if (why !== null) expect(r.why, ref).toBe(why);
+      if (status === 'missing') expect(r).toMatchObject({ by: 'pypi-publish', where: '.github/workflows/publish.yml (job scan)' });
+    }
+    for (const value of ['false', '"False"', '"FALSE"']) {
+      const dir = makeTempDir();
+      wf(dir, 'publish.yml', pub('release/v1', `        with:\n          attestations: ${value}\n`));
+      expect(row(await coverage(dir, pkgService), 'deploy', 'attestation', 'app').status, value).toBe('missing');
+    }
+  });
+
+  it('C2/I1/I2: where a hook comes from, what it formats, and file filters decide the pre-commit and CI rows', async () => {
+    const RUFF_OLD = 'https://github.com/charliermarsh/ruff-pre-commit';
+    const local = (body: string) => `repos:\n  - repo: local\n    hooks:\n      - id: x\n        name: x\n${body}`;
+    // [config, format-lint hook, pre-commit secret scan, CI lint with `pre-commit run --all-files`]
+    const cases: [string, string, string | undefined, string, string][] = [
+      ['look-alike repo, id ruff', hookConfig('      - id: ruff\n', 'https://github.com/evil/ruff-pre-commit'), 'partial', 'missing', 'partial'],
+      ['look-alike repo, id gitleaks', hookConfig('      - id: gitleaks\n', 'https://github.com/evil/x'), 'missing', 'partial', 'missing'],
+      ['look-alike repo, id eslint', hookConfig('      - id: eslint\n', 'https://github.com/evil/x'), 'partial', 'missing', 'partial'],
+      ['look-alike repo, entry ruff check', hookConfig('      - id: x\n        entry: ruff check\n', 'https://github.com/evil/x'), 'partial', 'missing', 'partial'],
+      ['ruff-format only', hookConfig('      - id: ruff-format\n'), 'covered', 'missing', 'missing'],
+      ['biome-format only', hookConfig('      - id: biome-format\n', 'https://github.com/biomejs/pre-commit'), 'covered', 'missing', 'missing'],
+      ['files: ^$', hookConfig("      - id: ruff-check\n        files: '^$'\n"), 'partial', 'missing', 'partial'],
+      ['exclude: .*', hookConfig("      - id: ruff-check\n        exclude: '.*'\n"), 'partial', 'missing', 'partial'],
+      ['types: [jupyter]', hookConfig('      - id: ruff-check\n        types: [jupyter]\n'), 'partial', 'missing', 'partial'],
+      ['types_or', hookConfig('      - id: ruff-check\n        types_or: [python]\n'), 'partial', 'missing', 'partial'],
+      ['exclude_types', hookConfig('      - id: ruff-check\n        exclude_types: [markdown]\n'), 'partial', 'missing', 'partial'],
+      ['top-level exclude', `exclude: '.*'\n${hookConfig('      - id: ruff-check\n')}`, 'partial', 'missing', 'partial'],
+      ['top-level files', `files: '^$'\n${hookConfig('      - id: ruff-check\n')}`, 'partial', 'missing', 'partial'],
+      ['stages: [manual]', hookConfig('      - id: ruff-check\n        stages: [manual]\n'), 'partial', 'missing', 'missing'],
+      ['local language: fail', local('        entry: ruff is banned here\n        language: fail\n'), 'missing', 'missing', 'missing'],
+      ['local language: pygrep', local('        entry: gitleaks\n        language: pygrep\n'), 'missing', 'missing', 'missing'],
+      ['local language: system', local('        entry: ruff check\n        language: system\n'), 'covered', 'missing', 'covered'],
+      ['meta with an entry', 'repos:\n  - repo: meta\n    hooks:\n      - id: identity\n        entry: ruff check\n', 'missing', 'missing', 'missing'],
+      ['old gitleaks URL', hookConfig('      - id: gitleaks\n', 'https://github.com/zricethezav/gitleaks'), 'missing', 'covered', 'missing'],
+      ['old ruff URL', hookConfig('      - id: ruff\n', RUFF_OLD), 'covered', 'missing', 'covered'],
+      ['psf/black', hookConfig('      - id: black\n', 'https://github.com/psf/black'), 'covered', 'missing', 'missing'],
+      ['ruff-check (control)', hookConfig('      - id: ruff-check\n'), 'covered', 'missing', 'covered'],
+    ];
+    for (const [name, config, fmt, secrets, ciLint] of cases) {
+      const dir = makeTempDir();
+      writeIn(dir, '.pre-commit-config.yaml', config);
+      const hooks = await coverage(dir, py);
+      expect(row(hooks, 'pre-commit', 'format-lint', 'app').status, `${name}: hook`).toBe(fmt);
+      expect(row(hooks, 'pre-commit', 'secrets').status, `${name}: secrets`).toBe(secrets);
+      wf(dir, 'ci.yml', PR(run('pre-commit run --all-files')));
+      const withCi = await coverage(dir, py);
+      expect(row(withCi, 'merge', 'lint', 'app').status, `${name}: CI lint`).toBe(ciLint);
+      expect(row(withCi, 'merge', 'secrets').status, `${name}: CI secrets`).toBe('missing');
+    }
+    // a look-alike hook's why says so
+    const dir = makeTempDir();
+    writeIn(dir, '.pre-commit-config.yaml', hookConfig('      - id: ruff\n', 'https://github.com/evil/ruff-pre-commit'));
+    expect(row(await coverage(dir, py), 'pre-commit', 'format-lint', 'app').why)
+      .toBe("The ruff check comes from a pre-commit hook repo pipegen doesn't know, so pipegen can't tell what it really runs.");
+  });
+
+  it('I1: `ruff format --check` and `biome format` in CI are formatting, not lint', async () => {
+    for (const [cmd, lint] of [['ruff format --check .', 'missing'], ['biome format .', 'missing'], ['ruff check .', 'covered'], ['biome ci .', 'covered'], ['biome lint .', 'covered']]) {
+      const dir = makeTempDir();
+      wf(dir, 'ci.yml', PR(run(cmd as string)));
+      expect(row(await coverage(dir), 'merge', 'lint', 'app').status, cmd).toBe(lint);
+    }
+  });
+
+  it('I2: hooks carry into CI only when `pre-commit run` runs at the repo root', async () => {
+    for (const steps of ['      - run: pre-commit run --all-files\n        working-directory: sub\n', run('cd sub && pre-commit run --all-files'), run('cd "$X" && pre-commit run --all-files')]) {
+      const dir = makeTempDir();
+      writeIn(dir, '.pre-commit-config.yaml', hookConfig('      - id: ruff-check\n'));
+      writeIn(dir, 'sub/.pre-commit-config.yaml', 'repos: []\n');
+      wf(dir, 'ci.yml', PR(steps));
+      expect(row(await coverage(dir, py), 'merge', 'lint', 'app').status, steps).toBe('missing');
+    }
+  });
+
+  it('I3: SKIP in the job, the step or inline makes "Git hooks re-run in CI" partial, and nothing carries over', async () => {
+    for (const steps of [
+      '      - uses: pre-commit/action@v3.0.1\n        env:\n          SKIP: ruff-check,gitleaks\n', run('SKIP=ruff-check pre-commit run --all-files'),
+      '      - run: pre-commit run --all-files\n        env:\n          skip: ruff-check\n',
+    ]) {
+      const dir = makeTempDir();
+      writeIn(dir, '.pre-commit-config.yaml', hookConfig('      - id: ruff-check\n'));
+      wf(dir, 'ci.yml', PR(steps));
+      const rows = await coverage(dir, py);
+      const hooksCi = row(rows, 'merge', 'hooks-ci');
+      expect(hooksCi.status, steps).toBe('partial');
+      expect(hooksCi.why).toBe("The pre-commit check runs, but SKIP is set in this job, so some pre-commit hooks don't run here.");
+      expect(row(rows, 'merge', 'lint', 'app').status, steps).toBe('missing');
+    }
+    const dir = makeTempDir();
+    writeIn(dir, '.pre-commit-config.yaml', hookConfig('      - id: ruff-check\n'));
+    wf(dir, 'ci.yml', `on:\n  pull_request:\njobs:\n  scan:\n    runs-on: x\n    env:\n      SKIP: ruff-check\n    steps:\n${run('pre-commit run --all-files')}`);
+    expect(row(await coverage(dir, py), 'merge', 'hooks-ci').status).toBe('partial');
+  });
+
+  it('I4 (ruling U23): a script counted by name is lowered by its text (soft → partial, only no-ops → missing), never raised', async () => {
+    for (const [cmd, scripts, status] of [
+      ['npm run test:x', { 'test:x': 'echo ok' }, 'missing'],
+      ['npm run test:x', { 'test:x': 'true' }, 'missing'],
+      ['npm run test:x', { 'test:x': ':; exit 0' }, 'missing'],
+      ['npm run test:x', { 'test:x': '' }, 'missing'],
+      ['npm run test:x', { 'test:x': 'jest || true' }, 'partial'],
+      ['npm test', { test: 'jest || true' }, 'partial'],
+      ['npm test', { test: 'eslint . && jest --passWithNoTests' }, 'covered'],
+      ['pnpm test', { test: 'vitest run; echo done' }, 'partial'],
+      ['npm test', { test: 'node test.js' }, 'covered'], // an unknown runner keeps its by-name count (left-pad)
+      ['npm test', { test: 'tape test/*.js' }, 'covered'],
+      ['npm test', { other: 'jest' }, 'covered'], // no such script: by name, as S5
+      ['npm test', { test: 'echo $(jest)' }, 'partial'],
+    ] as [string, Record<string, string>, string][]) {
+      const dir = makeTempDir();
+      pkg(dir, scripts);
+      wf(dir, 'ci.yml', PR(run(cmd)));
+      expect(row(await coverage(dir), 'merge', 'unit-tests', 'app').status, `${cmd} ${JSON.stringify(scripts)}`).toBe(status);
+    }
+    const lint = makeTempDir();
+    pkg(lint, { lint: 'eslint . --max-warnings=0 || echo failed' });
+    wf(lint, 'ci.yml', PR(run('npm run lint')));
+    expect(row(await coverage(lint), 'merge', 'lint', 'app').status).toBe('partial');
+  });
+
+  it('M2/M3/collect-only: modes that run no tests, commands after a top-level exit, and npm flags on by-name scripts', async () => {
+    for (const [steps, scripts] of [
+      [run('uv run tox r -- --collect-only'), null], [run('nox -- --co'), null], [run('uv run pytest --co'), null], [run('pytest --collect-only -q'), null],
+      [run('python -m pytest --fixtures'), null], [run('jest --listTests'), null], [run('npx jest --showConfig'), null],
+      [run('npm run ci'), { ci: 'jest --listTests' }], [run('npm run ci'), { ci: 'npm run test --workspace=none' }],
+      [run('npm run test --workspace=none'), null], [run('npm test --workspaces'), null], [run('pnpm test --filter x'), null],
+      ['      - run: |\n          exit 0\n          jest\n', null], [run('exit 0; jest'), null], [run('npm run ci'), { ci: 'exit 0; jest' }],
+    ] as [string, Record<string, string> | null][]) {
+      const dir = makeTempDir();
+      if (scripts !== null) pkg(dir, scripts);
+      wf(dir, 'ci.yml', PR(steps));
+      expect(row(await coverage(dir, steps.includes('tox') || steps.includes('nox') || steps.includes('pytest') ? py : {}), 'merge', 'unit-tests', 'app').status, steps).toBe('missing');
+    }
+    // an exit that only runs on a condition, or inside a group or subshell, ends nothing
+    for (const steps of [run('test -f x || exit 0; jest'), run('if [ -n "$X" ]; then exit 0; fi; jest'), run('(exit 0); jest'), run('jest; exit 0')]) {
+      const dir = makeTempDir();
+      wf(dir, 'ci.yml', PR(steps));
+      expect(row(await coverage(dir), 'merge', 'unit-tests', 'app').status, steps).toBe('covered');
+    }
+  });
+
+  it('M1: NPM_CONFIG_DRY_RUN in the env turns npm publish --provenance into a dry run', async () => {
+    const rel = (env: string, steps: string) => `on:\n  release:\n    types: [published]\n${env}${job(steps)}`;
+    for (const body of [
+      rel('env:\n  NPM_CONFIG_DRY_RUN: "true"\n', run('npm publish --provenance')), rel('env:\n  npm_config_dry_run: "true"\n', run('npm publish --provenance')),
+      rel('', run('npm_config_dry_run=true npm publish --provenance')), rel('', '      - run: npm publish --provenance\n        env:\n          NPM_CONFIG_DRY_RUN: "1"\n'),
+    ]) {
+      const dir = makeTempDir();
+      wf(dir, 'release.yml', body);
+      expect(row(await coverage(dir, { services: [svc('.', { scripts: ['test'] })] }), 'deploy', 'attestation', 'app').status, body).toBe('missing');
     }
   });
 });

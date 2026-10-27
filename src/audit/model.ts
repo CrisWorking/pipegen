@@ -320,6 +320,7 @@ export async function buildAudit(dir: string, deps: AuditDeps): Promise<AuditRep
   };
   for (const n of readerNotes) notes.add(n);
   for (const n of deps.notes ?? []) notes.add(n);
+  for (const n of libraryNotes(profile)) notes.add(n);
 
   const caps = deps.capabilities;
   const needs = floorNeeds(profile, caps);
@@ -406,6 +407,15 @@ export async function buildLocalAudit(dir: string, deps: { notes?: string[] } = 
 }
 
 // ---------- parts ----------
+
+/**
+ * Task 5 fix round 1 (I5): a service with a port that pipegen reads as a published library gets no image or running-app
+ * checks; say so, so a real server that looks like a package isn't a silent gap.
+ */
+export function libraryNotes(p: Pick<RepoProfile, 'services'>): string[] {
+  return p.services.filter((s) => s.port !== undefined && s.publishedPackage === true && !isRunnable(s)).map((s) =>
+    `${s.name} listens on a port but looks like a published package, so pipegen didn't add container image or running-app (web) scan checks. If ${s.name} is an app, add a start script or a Dockerfile and pipegen will treat it as one.`);
+}
 
 /** supportLevel for v0.2, without the "You can run `pipegen audit` today." tail (this is that audit), plus the next step. */
 function supportOf(p: RepoProfile): AuditSupport {

@@ -31,7 +31,11 @@
 #                 action doesn't do this check at all (pypi-publish with a password makes no attestation).
 #   skipUnless    `with:` inputs set (non-empty) to anything but these values (or an expression) mean the same.
 #   precommitHooks pre-commit hooks that run this tool: `repo` is the hook repo's exact URL, `ids` its hook ids (from
-#                 the repo's .pre-commit-hooks.yaml). A hook of another repo with the same id doesn't count.
+#                 the repo's .pre-commit-hooks.yaml). These repos are the ones pipegen knows: a hook from any other
+#                 repo (a look-alike or a mirror) counts only as partial, since pipegen can't see what it runs.
+#   actionRef     the action does the check only from a version on: `moving` branches, tags vX.Y[.Z] and release/vX.Y
+#                 at or above `minVersion`, and the commit SHAs in `shas` count; a lower version is missing (`oldWhy`);
+#                 any other ref is partial (`unknownWhy`).
 # Every entry has actions, commands or both. Where an entry sets commandFails, actionFails, failFlags, softFlags,
 # failInputs, softInputs or softUnless, that behaviour was checked on 2026-10-27 against the source or docs named in
 # the comment above it (fetched with curl). An entry with no such comment uses the plain default (a run fails on
@@ -44,8 +48,12 @@ tools:
   - id: gitleaks
     categories: [secrets]
     actions: [gitleaks/gitleaks-action]
+    # the old URL https://github.com/zricethezav/gitleaks redirects to gitleaks/gitleaks and serves the same
+    # .pre-commit-hooks.yaml (checked 2026-10-27)
     precommitHooks:
       - repo: https://github.com/gitleaks/gitleaks
+        ids: [gitleaks, gitleaks-docker, gitleaks-system]
+      - repo: https://github.com/zricethezav/gitleaks
         ids: [gitleaks, gitleaks-docker, gitleaks-system]
     commands: [gitleaks]
     excludes: [gitleaks version, gitleaks help, gitleaks completion]
@@ -251,9 +259,11 @@ tools:
     failInputs:
       fail_action: ['true']
   # ---------- tests ----------
+  # --listTests, --showConfig and --collectTests print or collect and exit without running tests (https://jestjs.io/docs/cli)
   - id: jest
     categories: [unit-tests, full-tests]
     commands: [jest]
+    notWithFlags: [--listTests, --showConfig, --collectTests]
   - id: vitest
     categories: [unit-tests, full-tests]
     commands: [vitest]
@@ -272,23 +282,44 @@ tools:
       - repo: https://github.com/pre-commit/mirrors-eslint
         ids: [eslint]
   # hooks: https://github.com/biomejs/pre-commit/blob/main/.pre-commit-hooks.yaml (biome ci / check / format / lint)
+  # `biome format` only formats: it is the biome-format entry below, never lint (fix round 1, I1)
   - id: biome
     categories: [lint, format-lint]
     commands: [biome]
+    excludes: [biome format]
     precommitHooks:
       - repo: https://github.com/biomejs/pre-commit
-        ids: [biome-ci, biome-check, biome-format, biome-lint]
+        ids: [biome-ci, biome-check, biome-lint]
+  - id: biome-format
+    categories: [format-lint]
+    commands: [biome format]
+    precommitHooks:
+      - repo: https://github.com/biomejs/pre-commit
+        ids: [biome-format]
   # https://github.com/astral-sh/ruff/blob/main/docs/linter.md (--exit-zero)
   # hooks: https://github.com/astral-sh/ruff-pre-commit/blob/main/.pre-commit-hooks.yaml (ruff-check and the legacy
   # alias ruff: `ruff check --force-exclude`; ruff-format: `ruff format --force-exclude`)
+  # The old URL https://github.com/charliermarsh/ruff-pre-commit redirects to astral-sh and serves the same hooks
+  # (checked 2026-10-27). `ruff format` only formats: it is the ruff-format entry below, never lint (fix round 1, I1).
   - id: ruff
     categories: [lint, format-lint]
     actions: [astral-sh/ruff-action]
     commands: [ruff]
+    excludes: [ruff format]
     softFlags: [--exit-zero]
     precommitHooks:
       - repo: https://github.com/astral-sh/ruff-pre-commit
-        ids: [ruff, ruff-check, ruff-format]
+        ids: [ruff, ruff-check]
+      - repo: https://github.com/charliermarsh/ruff-pre-commit
+        ids: [ruff, ruff-check]
+  - id: ruff-format
+    categories: [format-lint]
+    commands: [ruff format]
+    precommitHooks:
+      - repo: https://github.com/astral-sh/ruff-pre-commit
+        ids: [ruff-format]
+      - repo: https://github.com/charliermarsh/ruff-pre-commit
+        ids: [ruff-format]
   # https://github.com/PyCQA/flake8/blob/main/src/flake8/main/options.py (--exit-zero)
   # hook: https://github.com/PyCQA/flake8/blob/main/.pre-commit-hooks.yaml (id flake8, entry flake8)
   - id: flake8
@@ -312,12 +343,15 @@ tools:
   - id: prettier
     categories: [format-lint]
     commands: [prettier]
-  # hooks: https://github.com/psf/black-pre-commit-mirror/blob/main/.pre-commit-hooks.yaml (black, black-jupyter: entry black)
+  # hooks: https://github.com/psf/black-pre-commit-mirror/blob/main/.pre-commit-hooks.yaml (black, black-jupyter: entry
+  # black); https://github.com/psf/black/blob/main/.pre-commit-hooks.yaml has the same two (checked 2026-10-27)
   - id: black
     categories: [format-lint]
     commands: [black]
     precommitHooks:
       - repo: https://github.com/psf/black-pre-commit-mirror
+        ids: [black, black-jupyter]
+      - repo: https://github.com/psf/black
         ids: [black, black-jupyter]
   - id: lint-staged
     categories: [format-lint]
@@ -358,9 +392,31 @@ tools:
   # https://github.com/pypa/gh-action-pypi-publish/blob/unstable/v1/action.yml (attestations: default 'true', "Only
   # works with PyPI and TestPyPI via Trusted Publishing"); the README: attestations are "limited to Trusted Publishing
   # flows using PyPI or TestPyPI". A password (an API token) means no trusted publishing, so no attestation.
+  # Fix round 1 (C1): attestations are on by default only from v1.11.0. Each tag's action.yml, fetched 2026-10-27
+  # (https://raw.githubusercontent.com/pypa/gh-action-pypi-publish/<tag>/action.yml): v1.8.14 has no `attestations`
+  # input, v1.10.x has default 'false', v1.11.0 and later default 'true'. `shas` are the peeled commits of the tags
+  # v1.11.0 … v1.14.3 from `git ls-remote --tags https://github.com/pypa/gh-action-pypi-publish` (2026-10-27).
+  # release/v1 and unstable/v1 follow the newest release (v1.14.x on 2026-10-27).
   - id: pypi-publish
     categories: [attestation]
     actions: [pypa/gh-action-pypi-publish]
+    actionRef:
+      moving: [release/v1, unstable/v1]
+      minVersion: [1, 11]
+      shas:
+        - fb13cb306901256ace3dab689990e13a5550ffaa # v1.11.0
+        - 61da13deb5f5124fb1536194f82ed3d9bbc7e8f3 # v1.12.0
+        - 1f5d4ec244f65dce93685ee3e98e77123f090866 # v1.12.1
+        - 15c56dba361d8335944d31a2ecd17d700fc7bcbc # v1.12.2
+        - 67339c736fd9354cd4f8cb0b744f2b82a74b5c70 # v1.12.3
+        - 76f52bc884231f62b9a034ebfe128415bbaabdfc # v1.12.4
+        - ed0c53931b1dc9bd32cbe73a98c7f6766f8a527e # v1.13.0
+        - cef221092ed1bacb1cc03d23a2d87d1d172e277b # v1.14.0
+        - ba38be9e461d3875417946c167d0b5f3d385a247 # v1.14.1
+        - dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2
+        - 7245906fb61fa33a13554f9d5fb856fe61758086 # v1.14.3
+      oldWhy: The PyPI publish action runs at a version before v1.11.0, which makes no attestation unless told to.
+      unknownWhy: The PyPI publish action makes attestations by default only from v1.11.0, and pipegen can't tell which version this ref is.
     skipInputs:
       password: ['*']
     skipUnless:

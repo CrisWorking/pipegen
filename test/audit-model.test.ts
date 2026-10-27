@@ -581,6 +581,20 @@ describe('buildAudit (fix round 1)', () => {
     }
   });
 
+  it('Task 5 fix round 1 (I5): a service with a port read as a published library gets a plain note', async () => {
+    const files = {
+      'pyproject.toml': '[project]\nname = "Flask"\ndependencies = ["werkzeug>=3"]\n',
+      'app.py': 'def run(port=5000):\n    pass\n',
+      '.github/workflows/publish.yaml': "on:\n  push:\n    tags: ['*']\njobs:\n  p:\n    runs-on: x\n    steps:\n      - uses: pypa/gh-action-pypi-publish@release/v1\n",
+    };
+    const r = await buildAudit(repo(files), deps());
+    expect(r.notes).toContain("Flask listens on a port but looks like a published package, so pipegen didn't add container image or running-app (web) scan checks. If Flask is an app, add a start script or a Dockerfile and pipegen will treat it as one.");
+    expect(r.wouldCreate.some((w) => w.what === 'docker')).toBe(false);
+    // an app with a start script gets no such note
+    const app = await buildAudit(repo(nodeApp()), deps());
+    expect(app.notes.some((n) => n.includes('looks like a published package'))).toBe(false);
+  });
+
   it('U11: the report says whether the reviewed list was unavailable', async () => {
     expect((await buildAudit(repo(nodeApp()), deps())).reviewedUnavailable).toBe(false);
     expect((await buildAudit(repo(nodeApp()), deps({ reviewedUnavailable: true }))).reviewedUnavailable).toBe(true);

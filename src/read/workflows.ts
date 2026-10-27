@@ -70,18 +70,31 @@ function deploysOf(doc: Record<string, unknown>, path: string): boolean {
   return false;
 }
 
-/** Registries a workflow's steps publish to (top-level job steps only; a called workflow or action isn't looked into). */
+/**
+ * Registries a workflow's steps publish to (top-level job steps only; a called workflow or action isn't looked into).
+ * Fix round 1 (I5): it counts only real publishing, since "published package" removes the image and running-app
+ * checks: never a workflow that runs only on pull requests, never a line with --dry-run, and no npm publish where an
+ * `env:` sets NPM_CONFIG_DRY_RUN (any letter case, or an `env:` given as one expression) or the step's text names it.
+ */
 const publishesField = (p: ('npm' | 'pypi')[]) => (p.length > 0 ? { publishes: p } : {});
+const PR_ONLY = new Set(['pull_request', 'pull_request_target']);
+const DRY_RUN_WORD = /(?:^|\s)--dry-run(?:[=\s]|$)/;
+const dryRunEnv = (env: unknown) => env !== undefined && env !== null
+  && (typeof env !== 'object' || Array.isArray(env) || Object.keys(asObj(env)).some((k) => k.toUpperCase() === 'NPM_CONFIG_DRY_RUN'));
 
 function publishesOf(doc: Record<string, unknown>): ('npm' | 'pypi')[] {
+  const triggers = triggersOf(doc.on ?? doc.true);
+  if (triggers.length > 0 && triggers.every((t) => PR_ONLY.has(t))) return [];
   const out = new Set<'npm' | 'pypi'>();
   for (const job of Object.values(asObj(doc.jobs))) {
     for (const step of Array.isArray(asObj(job).steps) ? asObj(job).steps as unknown[] : []) {
       const s = asObj(step);
+      const npmDry = [doc.env, asObj(job).env, s.env].some(dryRunEnv);
       for (const u of strings(s.uses)) if (regexSafe(u) && PYPI_ACTION.test(u.trim())) out.add('pypi');
       for (const r of strings(s.run)) {
-        if (looksLikeDeploy(r, NPM_PUBLISH_LINE)) out.add('npm');
-        if (looksLikeDeploy(r, PYPI_PUBLISH_LINE)) out.add('pypi');
+        const lines = regexLines(r).filter((l) => !DRY_RUN_WORD.test(l));
+        if (!npmDry && !r.toLowerCase().includes('npm_config_dry_run') && lines.some((l) => NPM_PUBLISH_LINE.test(l))) out.add('npm');
+        if (lines.some((l) => PYPI_PUBLISH_LINE.test(l))) out.add('pypi');
       }
     }
   }

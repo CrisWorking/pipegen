@@ -17,7 +17,12 @@ const NPM_DEFAULT_TEST = 'echo "Error: no test specified" && exit 1';
 const NODE_LOCKS: [string, PackageManager][] = [['pnpm-lock.yaml', 'pnpm'], ['yarn.lock', 'yarn'], ['bun.lockb', 'bun'], ['bun.lock', 'bun'], ['package-lock.json', 'npm']];
 const PYTHON_LOCKS: [string, PackageManager][] = [['poetry.lock', 'poetry'], ['uv.lock', 'uv']];
 const NODE_FRAMEWORKS: [string, string][] = [['express', 'express'], ['fastify', 'fastify'], ['@nestjs/core', '@nestjs/core'], ['next', 'next'], ['koa', 'koa'], ['@hapi/hapi', 'hapi'], ['hapi', 'hapi']];
-const PYTHON_FRAMEWORKS = ['flask', 'fastapi', 'django'];
+/**
+ * Python server frameworks, by their PyPI distribution names (what dependencies list; pythonNames lowercases them). Fix
+ * round 1 (I5) adds aiohttp, tornado, starlette, sanic, quart, litestar and falcon (each project's PyPI name is its
+ * import name too). Not werkzeug: Flask itself depends on it, and a library would look like an app.
+ */
+const PYTHON_FRAMEWORKS = ['flask', 'fastapi', 'django', 'aiohttp', 'tornado', 'starlette', 'sanic', 'quart', 'litestar', 'falcon'];
 /** Every name readProject can put in Service.frameworks. */
 export const SERVER_FRAMEWORKS: readonly string[] = [...new Set([...NODE_FRAMEWORKS.map(([, name]) => name), ...PYTHON_FRAMEWORKS])];
 const NODE_TEST_FRAMEWORKS = ['jest', 'vitest', 'mocha', 'ava'];

@@ -435,3 +435,41 @@ describe('read (Task 5: packages vs apps)', () => {
     expect(isRunnable((await readProject(echo)).services[0]!)).toBe(true);
   });
 });
+
+// Task 5 fix round 1 (I5): a real server must not look like a published package.
+describe('read (Task 5 fix round 1: packages vs apps)', () => {
+  it('I5: npm publish --dry-run, a publish only on pull requests, or NPM_CONFIG_DRY_RUN is not publishing', async () => {
+    const wfOf = (on: string, steps: string) => `on:\n${on}jobs:\n  a:\n    runs-on: x\n    steps:\n${steps}`;
+    for (const workflow of [
+      wfOf('  pull_request:\n', '      - run: npm publish --dry-run\n'),
+      wfOf('  release:\n    types: [published]\n', '      - run: npm publish --dry-run --provenance\n'),
+      wfOf('  pull_request:\n', '      - run: npm publish --provenance\n'),
+      wfOf('  - pull_request\n  - pull_request_target\n', '      - run: npm publish\n'),
+      wfOf('  release:\n    types: [published]\n', '      - run: npm publish\n        env:\n          NPM_CONFIG_DRY_RUN: "true"\n'),
+      wfOf('  release:\n    types: [published]\n', '      - run: npm_config_dry_run=true npm publish\n'),
+    ]) {
+      const dir = repo('node-library');
+      writeIn(dir, 'index.js', 'require("http").createServer(h).listen(process.env.PORT || 8080);\n');
+      writeIn(dir, 'package.json', JSON.stringify({ name: 'my-server', bin: { 'my-server': 'index.js' } }));
+      writeIn(dir, '.github/workflows/ci.yml', workflow);
+      const s = (await readProject(dir)).services[0]!;
+      expect(s.publishedPackage, workflow).toBeUndefined();
+      expect(isRunnable(s), workflow).toBe(true);
+    }
+  });
+
+  it('I5: aiohttp, tornado, starlette, sanic, quart, litestar and falcon are server frameworks (a published server stays runnable)', async () => {
+    for (const fw of ['aiohttp', 'tornado', 'starlette', 'sanic', 'quart', 'litestar', 'falcon']) {
+      const dir = repo('python-uv');
+      writeIn(dir, 'pyproject.toml', `[project]\nname = "mysrv"\ndependencies = ["${fw}>=1"]\n`);
+      writeIn(dir, '.github/workflows/publish.yaml', "on:\n  push:\n    tags: ['*']\njobs:\n  p:\n    runs-on: x\n    steps:\n      - uses: pypa/gh-action-pypi-publish@release/v1\n");
+      const s = (await readProject(dir)).services[0]!;
+      expect(s.frameworks, fw).toEqual([fw]);
+      expect(isRunnable(s), fw).toBe(true);
+    }
+    // each framework's own repo is still not an app of itself
+    const own = repo('python-uv');
+    writeIn(own, 'pyproject.toml', '[project]\nname = "aiohttp"\ndependencies = ["aiohttp"]\n');
+    expect((await readProject(own)).services[0]?.frameworks).toEqual([]);
+  });
+});
