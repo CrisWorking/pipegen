@@ -26,9 +26,10 @@ import { lstat } from 'node:fs/promises';
 import { join } from 'node:path';
 import type { Octokit } from '@octokit/rest';
 import { count, outputLimit } from '../ai/errors.js';
+import { ollamaHostOf } from '../ai/ollama.js';
 import { AiError, COST_CAP_MESSAGE, refusalFallbackNoteFor, type AiErrorKind } from '../ai/provider.js';
 import {
-  bundleCode, COUNTING_ONLY_NOTE, EXCLUDED_PATTERNS, findSecretLike, GitleaksError, isExcludedPath, redact, scrubKnownValues, type CodeBundle,
+  BundleSummary, bundleCode, COUNTING_ONLY_NOTE, CountingSummary, EXCLUDED_PATTERNS, findSecretLike, GitleaksError, isExcludedPath, redact, scrubKnownValues, type CodeBundle,
 } from '../ai/redact.js';
 import { needLanguage, suggestTools } from '../engine/discover.js';
 import type { RateBudget } from '../engine/github-rate.js';
@@ -40,6 +41,7 @@ import { projectScriptFor, reviewedFor, type ProjectScriptStep } from '../engine
 import {
   activity30d, aiRequestBytes, estimate, requestCeilingUsd, unpricedModel, usageCeilingUsd, usageCostUsd, type Activity, type Estimates,
 } from '../estimate/estimate.js';
+import { ConsentToken } from '../cli/consent.js';
 import { signingMode } from '../github/signing-mode.js';
 import { IGNORED_DIRS, listFiles, READ_LIMITS, readTextLimited, readTextLimitedWithReason } from '../read/limits.js';
 import { readProject } from '../read/project.js';
@@ -341,6 +343,47 @@ export async function buildAudit(dir: string, deps: AuditDeps): Promise<AuditRep
   };
 }
 
+// ---------- the local-only audit (GitHub not read) ----------
+
+/** readProject's answer: the repo as found on disk, without its GitHub context. */
+export type LocalProfile = Awaited<ReturnType<typeof readProject>>;
+
+/**
+ * What the audit can honestly say when GitHub couldn't be read (the `inspect` R10 rule): only what is on disk. No
+ * coverage (it depends on the default branch), no plan limits, no estimates and no permissions, so nothing about
+ * GitHub is guessed.
+ */
+export interface LocalAudit {
+  profile: LocalProfile;
+  secretsInTree: SecretInTree[];
+  aiBundle: AuditReport['aiBundle'];
+  /** The `.npmrc` / node_modules/.bin/pipegen warning (no anonymous-access warning: pipegen doesn't know the access). */
+  warnings: AuditWarning[];
+  notes: string[];
+}
+
+/** The local-only audit of `dir`: reads files only (no GitHub, no AI, no child process). Throws NotGitHubRepoError like buildAudit. */
+export async function buildLocalAudit(dir: string, deps: { notes?: string[] } = {}): Promise<LocalAudit> {
+  const notes = new Notes();
+  const readerNotes: string[] = [];
+  const profile = await readProject(dir, { notes: readerNotes });
+  for (const n of readerNotes) notes.add(n);
+  for (const n of deps.notes ?? []) notes.add(n);
+  const secretsInTree = await scanTree(dir, notes);
+  const bundle = await bundleCode(dir);
+  for (const n of bundle.notes) if (n !== COUNTING_ONLY_NOTE) notes.add(n);
+  return {
+    profile,
+    secretsInTree,
+    aiBundle: {
+      files: bundle.files.length, bytes: bundle.bytes, truncated: bundle.truncated,
+      excludedPatterns: [...EXCLUDED_PATTERNS], topFolders: topFolders(bundle.files.map((f) => f.path)),
+    },
+    warnings: await warningsOf(dir, false),
+    notes: notes.all(),
+  };
+}
+
 // ---------- parts ----------
 
 /** supportLevel for v0.2, without the "You can run `pipegen audit` today." tail (this is that audit), plus the next step. */
@@ -558,6 +601,11 @@ export interface AiSuggestDeps {
    * it: a hard cap on this step's AI spend (rulings B2, U13). null only for a local model (no cap): for a paid provider null counts as 0, so every AI call is refused (review H1).
    */
   capUsd: number | null;
+  /**
+   * The user's yes to the `audit --ai` consent screen (askConsent; Plan U T4b): no AI step without it. Its terms must
+   * match `ai` (provider, model, Ollama host) and `capUsd`, and only files it counted may be sent.
+   */
+  consent: ConsentToken;
 }
 
 const AI_NOTE = {
@@ -566,6 +614,7 @@ const AI_NOTE = {
   anonymous: 'Without a GitHub token, GitHub allows 60 requests an hour, so tool suggestions may stop early. Set GITHUB_TOKEN (read-only) for a full search.',
   lookAlike: "pipegen's reviewed tool list isn't usable in this build, so it couldn't check suggested tools for look-alike names; it shows no tool suggestions.",
   noGitleaks: (why: string) => `The AI step was skipped and nothing was sent to the AI: the required gitleaks check couldn't run. ${why}`,
+  notConsented: "Nothing was sent to the AI: after the gitleaks check, the code held files that weren't on the consent screen (the repo changed?). Run the audit again.",
   stopped: (why: string) => `The AI step stopped: ${why}.`,
   searchStopped: (why: string) => `The tool search stopped: ${why}.`,
   fallbackTried: "Claude's refusal fallback had already run the request again on another Claude model, and it was declined there too.",
@@ -684,6 +733,29 @@ export function needsRequestBytes(r: AuditReport, knownValues: string[]): number
   return r.aiBundle.bytes + needsPromptBytes(r.profile, r.capabilities, { knownValues });
 }
 
+/**
+ * T4b: the AI step runs only on a ConsentToken from askConsent for the audit --ai screen, given for this provider,
+ * model (and Ollama host) and this cap. Anything else is a programming error: thrown before anything runs.
+ */
+function checkConsent(deps: AiSuggestDeps): void {
+  const c: unknown = deps.consent;
+  if (!ConsentToken.isToken(c) || c.terms.mode !== 'audit-ai') {
+    throw new Error('addAiSuggestions needs the consent token askConsent() gives for the audit --ai screen; nothing was sent.');
+  }
+  const t = c.terms;
+  const host = deps.ai.name === 'ollama' ? ollamaHostOf(deps.ai) ?? undefined : undefined;
+  if (t.pricedFor.provider !== deps.ai.name || t.pricedFor.model !== deps.ai.model || t.pricedFor.host !== host || t.capUsd !== deps.capUsd) {
+    throw new Error('addAiSuggestions was given another AI provider, model or cost cap than the user agreed to; nothing was sent.');
+  }
+}
+
+/** Every file of the checked bundle is one the consent screen counted (a counted summary), or within its counts (a checked one). */
+function consentCovers(consent: ConsentToken, bundle: CodeBundle): boolean {
+  const f = consent.terms.files;
+  if (CountingSummary.isSummary(f)) return f.covers(bundle);
+  return BundleSummary.isSummary(f) && bundle.files.length <= f.files && bundle.bytes <= f.bytes;
+}
+
 /** The service's own test/lint script would run for this need (S27: a service without tests has none for tests). */
 function hasProjectScript(need: Need, p: RepoProfile): boolean {
   const service = need.service === undefined ? undefined : p.services.find((s) => s.name === need.service);
@@ -695,6 +767,9 @@ function hasProjectScript(need: Need, p: RepoProfile): boolean {
 /**
  * `audit --ai`, after consent: the needs the AI adds and mention-only tool suggestions, in `ai` of a copy of `r`
  * (the rest of the report is unchanged).
+ * 0. `deps.consent` must be the ConsentToken askConsent gave for the audit --ai screen, for this provider, model and cap
+ *    (Plan U T4b: no AI call without consent, by type); anything else is thrown before anything runs. Only files the
+ *    screen counted may be sent: a checked bundle with another file is not sent (a note).
  * 1. gitleaks is made ready right before the bundle is built with it (the path stays a local variable). No binary, or
  *    a gitleaks failure: no AI call, a note.
  * 2. planNeeds(…, writers 0, knownValues): the needs it adds become `extraNeeds`; floor needs are never changed.
@@ -705,6 +780,7 @@ function hasProjectScript(need: Need, p: RepoProfile): boolean {
  * An AiError never escapes (S16): it becomes a note, and its billed usage still counts. Other errors are thrown.
  */
 export async function addAiSuggestions(r: AuditReport, dir: string, deps: AiSuggestDeps): Promise<AuditReport> {
+  checkConsent(deps);
   const notes = new Set<string>();
   // every AI attempt goes through the meter: the one record of usage and the hard cap (ruling U13, review M1)
   const meter = new AiSpendMeter(deps.ai, deps.capUsd);
@@ -745,6 +821,11 @@ export async function addAiSuggestions(r: AuditReport, dir: string, deps: AiSugg
   } catch (e) {
     if (!(e instanceof PinnedBinaryError || e instanceof GitleaksError)) throw e;
     notes.add(AI_NOTE.noGitleaks(e.message));
+    return done();
+  }
+  // only files the user agreed to (the consent screen counted them before the gitleaks pass, ruling S21)
+  if (!consentCovers(deps.consent, bundle)) {
+    notes.add(AI_NOTE.notConsented);
     return done();
   }
   const reportNotes = new Set(r.notes);

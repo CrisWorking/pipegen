@@ -301,11 +301,23 @@ export function tokenKind(token: string): Exclude<Auth['kind'], 'anonymous'> | n
 
 const FG_PAGE = 'GitHub → Settings → Developer settings → Personal access tokens → Fine-grained tokens → Generate new token';
 
-function readSetup(owner: string, repo: string): string {
+/**
+ * How to give pipegen read access to one repo (spike S1): a fine-grained token for that repo only, with the read-only
+ * permissions, or pipegen's GitHub App. Never `gh auth login` (its token reaches every repo of the account).
+ */
+export function readAccessSteps(owner: string, repo: string): string {
   const perms = permissionsTable('read').map((p) => p.permission).join(', ');
   return `pipegen needs read access to ${repoName(owner, repo)}. Create a fine-grained token for this one repo (${FG_PAGE}; `
     + `Repository access: Only select repositories → ${safeText(repo, 100)}) with ${perms}, and set it as GITHUB_TOKEN `
     + '(or install the pipegen GitHub App on this repo). pipegen refuses broad classic tokens.';
+}
+
+/**
+ * No token, and GitHub doesn't show the repo to anonymous callers (Plan U ruling S22): a 404 can't tell a private repo
+ * from a missing one, so the message says both, then how to give read access.
+ */
+function anonymousCantSee(owner: string, repo: string): string {
+  return `pipegen can't see ${repoName(owner, repo)}: it's private or doesn't exist. If it's private, ${readAccessSteps(owner, repo)}`;
 }
 
 function writeSetup(owner: string, repos: string[]): string {
@@ -503,7 +515,7 @@ export async function getAuth(opts: AuthOpts & { mode: 'read' | 'write' }, deps:
         throw new GitHubAccessError(`pipegen couldn't reach ${GITHUB_API} to check ${repoName(owner, repo)} (${said(e)}).`);
       }
     }
-    if (!isPublic) throw new GitHubAccessError(readSetup(owner, repo));
+    if (!isPublic) throw new GitHubAccessError(anonymousCantSee(owner, repo));
     return { kind: 'anonymous', token: null, repos: [repo], canCreateRepos: false, canDeleteRepos: false };
   }
 

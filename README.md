@@ -9,7 +9,7 @@ It opens one pull request. You review it. It never touches your app code or your
 ## What the audit will show you *(example, not real yet)*
 
 ```text
-$ npx pipegen@0.1.0 audit
+$ npx --registry=https://registry.npmjs.org pipegen@0.1.0 audit --dir ./my-repo
 
 Verdict: 4 of 4 layers have gaps · 2 are serious · 1 secret found in your files
 
@@ -51,13 +51,21 @@ It protects four stages: **pre-commit → push → merge → deploy**.
 ## Commands *(planned)*
 
 ```bash
-npx --registry=https://registry.npmjs.org pipegen@x.y.z audit --dir ./my-repo
+npx --registry=https://registry.npmjs.org pipegen@0.1.0 audit --dir ./my-repo
                           # read-only report; run it from OUTSIDE the repo, exact version, explicit registry
-npx pipegen               # the full job → one PR
-npx pipegen finish        # after you merge: applies the merge rules, signing key and dates
-npx pipegen verify        # read-only: checks nobody weakened the pipeline files
-npx pipegen uninstall     # removes everything pipegen added
+npx --registry=https://registry.npmjs.org pipegen@0.1.0 audit --dir ./my-repo --out report.md
+                          # also save the report as Markdown (outside the repo; --json prints JSON instead)
+npx --registry=https://registry.npmjs.org pipegen@0.1.0 audit --dir ./my-repo --ai
+                          # also ask an AI for extra checks and tools to mention, after it shows what it would send
+                          # and asks you (default No)
 ```
+
+`audit --ai` needs Linux or macOS for now (WSL works): it checks your code with a pinned gitleaks binary before
+anything is sent, and that binary exists for those systems only.
+
+Later versions add the full job (one PR), then `finish` (after you merge: merge rules, signing key and dates), `verify`
+(read-only: checks nobody weakened the pipeline files) and `uninstall`. Their exact commands will be shown here when
+they exist; until then no other pipegen command is safe to copy, because the npm name isn't published yet.
 
 ## Read more
 

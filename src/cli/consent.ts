@@ -18,16 +18,22 @@
 // Two facts are tied to their real sources by construction (final review batch 2, I1): the file facts are a
 // BundleSummary, which only bundleSummary() of a gitleaks-checked bundle makes, and the estimate must say it was
 // priced for the provider and model shown (Estimates.pricedFor), or the screen is refused.
+// 'audit-ai' alone may take a CountingSummary instead (Plan U T4b, ruling S21: the gitleaks download happens only after
+// consent, so the screen counts the bundle before the gitleaks pass, says so, and calls the counts "at most"; the AI
+// step then sends only files from that counted list, CountingSummary.covers()).
+// "No AI call without consent" is a type rule (Plan U T4b): consentScreen() makes the screen (its text plus the terms a
+// yes agrees to), askConsent() turns a yes into a ConsentToken, and only askConsent can make one. addAiSuggestions
+// requires the token and checks its terms against the provider and cap it is given.
 import { ollamaHostOf } from '../ai/ollama.js';
 import { refusalFallbackNoteFor } from '../ai/provider.js';
-import { BundleSummary, excludedSummaryLines } from '../ai/redact.js';
+import { BundleSummary, CountingSummary, excludedSummaryLines } from '../ai/redact.js';
 import type { AiCost, AuditAiEstimate, Estimates, PricedFor } from '../estimate/estimate.js';
 import type { AiProvider, RepoProfile } from '../types.js';
 import { hostPlace } from '../util/local-host.js';
 import { safeText } from '../util/safe-text.js';
 import { PromptCancelledError, type Prompter } from './io.js';
 
-export { bundleSummary, BundleSummary } from '../ai/redact.js';
+export { bundleSummary, BundleSummary, countingSummary, CountingSummary } from '../ai/redact.js';
 /** A private helper repo pipegen uses (`pipelines`, `pipegen-proof-<repo>`), checked before consent. */
 export interface HelperRepo { name: string; exists: boolean }
 export type PermissionRows = { permission: string; why: string }[];
@@ -78,17 +84,21 @@ function whereItRuns(provider: AiProvider, place: Place): string {
   return `Ollama (${model}), experimental: the files are sent to an Ollama server whose address pipegen couldn't confirm; it may not be this computer.`;
 }
 
-function filesSection(p: RepoProfile, bundle: BundleSummary, gitleaksVersion: string): string[] {
+function filesSection(p: RepoProfile, bundle: BundleSummary | CountingSummary, gitleaksVersion: string): string[] {
   const shown = bundle.topFolders.slice(0, MAX_TOP_FOLDERS).map((f) => safeText(f, 60));
   const more = bundle.topFolders.length - shown.length;
   const folders = shown.length === 0 ? '(all at the top level)' : `${shown.join(', ')}${more > 0 ? ` and ${more} more` : ''}`;
+  const counted = CountingSummary.isSummary(bundle);
   return [
     'Your code',
-    `${INDENT}pipegen sends ${plural(bundle.files, 'file', 'files')} (${size(bundle.bytes)}) from ${safeText(`${p.owner}/${p.repo}`, 200)} to the AI.`,
+    `${INDENT}pipegen sends ${counted ? 'at most ' : ''}${plural(bundle.files, 'file', 'files')} (${size(bundle.bytes)}) from ${safeText(`${p.owner}/${p.repo}`, 200)} to the AI.`,
     `${INDENT}Top folders: ${folders}`,
     `${INDENT}Never sent:`,
     ...excludedSummaryLines().map((l) => `${INDENT}${INDENT}${l}`),
     `${INDENT}Before anything is sent, every file is checked for secrets with gitleaks ${safeText(gitleaksVersion, 20)}, which pipegen downloads (checksum-verified) into its cache, and secret-looking values are hidden.`,
+    ...(counted
+      ? [`${INDENT}These counts were made before the gitleaks check, which runs only after you say yes. It may leave out a few more files; pipegen never sends a file that isn't counted here.`]
+      : []),
   ];
 }
 
@@ -171,24 +181,85 @@ function permissionsSection(title: string, perms: PermissionRows): string[] {
 /** Words a token-mode screen must never use about repos (DECISIONS #87). */
 const CREATES_OR_DELETES = /create the private helper repos|delete the scratch repo/i;
 
+/** What a yes agrees to: the mode, the provider and model the estimate was priced for, the AI cost cap, and the files. */
+export interface ConsentTerms {
+  readonly mode: ConsentMode;
+  readonly pricedFor: PricedFor;
+  /** The hard AI cost cap the screen showed (null: none, a local model). */
+  readonly capUsd: number | null;
+  /** The file facts the screen showed: the checked bundle's summary, or ('audit-ai' only) the counted bundle's. */
+  readonly files: BundleSummary | CountingSummary;
+}
+
+let makeScreen: (text: string, terms: ConsentTerms) => ConsentScreen;
+let mintToken: (terms: ConsentTerms) => ConsentToken;
+
+/** The consent screen: its text and the terms a yes agrees to. Only consentScreen() makes one. */
+export class ConsentScreen {
+  readonly #made = true;
+  private constructor(readonly text: string, readonly terms: ConsentTerms) {
+    Object.freeze(this);
+  }
+  /** True only for an object consentScreen() made. */
+  static isScreen(x: unknown): x is ConsentScreen {
+    return typeof x === 'object' && x !== null && #made in x;
+  }
+  static {
+    makeScreen = (text, terms) => new ConsentScreen(text, Object.freeze({ ...terms }));
+  }
+}
+
+/**
+ * The user said yes to a consent screen (T4b). Only askConsent() makes one: the constructor is private and a private
+ * field makes the type nominal, so an object literal doesn't type-check and isToken() refuses a copy. The AI step
+ * (addAiSuggestions) requires one, so no AI call can happen without consent.
+ */
+export class ConsentToken {
+  readonly #granted = true;
+  private constructor(readonly terms: ConsentTerms) {
+    Object.freeze(this);
+  }
+  /** True only for a token askConsent() made. */
+  static isToken(x: unknown): x is ConsentToken {
+    return typeof x === 'object' && x !== null && #granted in x;
+  }
+  static {
+    mintToken = (terms) => new ConsentToken(terms);
+  }
+}
+
 /**
  * The consent text. `est`: estimate() for 'full', estimateAuditAi() for 'audit-ai', both given `provider` itself, so
- * `est.pricedFor` matches it. `bundle`: bundleSummary() of the gitleaks-checked bundle that will be sent.
+ * `est.pricedFor` matches it. `bundle`: bundleSummary() of the gitleaks-checked bundle that will be sent, or, for
+ * 'audit-ai' only, countingSummary() of the counted bundle (consent before the gitleaks download, ruling S21).
  * `perms`: permissionsTable('write', { appCreatesRepos }) for 'full', permissionsTable('read') for 'audit-ai'.
  * `repos`: `pipelines` and `pipegen-proof-<repo>` with whether each exists ('full' only; 'audit-ai' shows none).
- * Refused (programming errors): a bundle summary bundleSummary() didn't make; an estimate priced for another provider,
- * model or Ollama host (or for none); a write permission in 'audit-ai'; in token mode, a permission saying pipegen
- * creates or deletes a repo (a table built for the App).
+ * Refused (programming errors): a bundle summary bundleSummary()/countingSummary() didn't make (or a counted one for
+ * 'full'); an estimate priced for another provider, model or Ollama host (or for none); a write permission in
+ * 'audit-ai'; in token mode, a permission saying pipegen creates or deletes a repo (a table built for the App).
  */
 export function consentText(p: RepoProfile, provider: AiProvider, est: Estimates, bundle: BundleSummary, perms: PermissionRows, repos: HelperRepo[], mode: 'full', facts: FullConsentFacts): string;
-export function consentText(p: RepoProfile, provider: AiProvider, est: AuditAiEstimate, bundle: BundleSummary, perms: PermissionRows, repos: HelperRepo[], mode: 'audit-ai', facts: AuditConsentFacts): string;
-export function consentText(p: RepoProfile, provider: AiProvider, est: Estimates | AuditAiEstimate, bundle: BundleSummary, perms: PermissionRows, repos: HelperRepo[], mode: ConsentMode, facts: AuditConsentFacts | FullConsentFacts): string {
-  if (!BundleSummary.isSummary(bundle)) {
+export function consentText(p: RepoProfile, provider: AiProvider, est: AuditAiEstimate, bundle: BundleSummary | CountingSummary, perms: PermissionRows, repos: HelperRepo[], mode: 'audit-ai', facts: AuditConsentFacts): string;
+export function consentText(p: RepoProfile, provider: AiProvider, est: Estimates | AuditAiEstimate, bundle: BundleSummary | CountingSummary, perms: PermissionRows, repos: HelperRepo[], mode: ConsentMode, facts: AuditConsentFacts | FullConsentFacts): string {
+  return screenFor(p, provider, est, bundle, perms, repos, mode, facts).text;
+}
+
+/** consentText's screen with the terms a yes agrees to, for askConsent (same arguments, same refusals). */
+export function consentScreen(p: RepoProfile, provider: AiProvider, est: Estimates, bundle: BundleSummary, perms: PermissionRows, repos: HelperRepo[], mode: 'full', facts: FullConsentFacts): ConsentScreen;
+export function consentScreen(p: RepoProfile, provider: AiProvider, est: AuditAiEstimate, bundle: BundleSummary | CountingSummary, perms: PermissionRows, repos: HelperRepo[], mode: 'audit-ai', facts: AuditConsentFacts): ConsentScreen;
+export function consentScreen(p: RepoProfile, provider: AiProvider, est: Estimates | AuditAiEstimate, bundle: BundleSummary | CountingSummary, perms: PermissionRows, repos: HelperRepo[], mode: ConsentMode, facts: AuditConsentFacts | FullConsentFacts): ConsentScreen {
+  return screenFor(p, provider, est, bundle, perms, repos, mode, facts);
+}
+
+function screenFor(p: RepoProfile, provider: AiProvider, est: Estimates | AuditAiEstimate, bundle: BundleSummary | CountingSummary, perms: PermissionRows, repos: HelperRepo[], mode: ConsentMode, facts: AuditConsentFacts | FullConsentFacts): ConsentScreen {
+  const counted = mode === 'audit-ai' && CountingSummary.isSummary(bundle);
+  if (!counted && !BundleSummary.isSummary(bundle)) {
     throw new Error('The consent screen needs the file facts from bundleSummary() of the gitleaks-checked code bundle.');
   }
   checkPricedFor(provider, est.pricedFor);
   const place = placeOf(provider);
   const sections: string[][] = [];
+  let capUsd: number | null;
   if (mode === 'audit-ai') {
     if (perms.some((r) => /\bwrite\b/i.test(r.permission))) {
       throw new Error('The audit --ai consent lists read-only permissions; it was given a write permission.');
@@ -196,6 +267,7 @@ export function consentText(p: RepoProfile, provider: AiProvider, est: Estimates
     const a = est as AuditAiEstimate;
     // A model with no price can't keep the hard cost limit this screen would promise (ruling U14): the CLI stops first.
     if (a.unpriced !== null && a.unpriced !== undefined) throw new Error(a.unpriced.message);
+    capUsd = a.capUsd;
     sections.push(
       ['pipegen audit --ai is about to send part of your code to an AI. Nothing has left this computer yet.', 'This audit only reads: it changes nothing on GitHub.'],
       filesSection(p, bundle, facts.gitleaksVersion),
@@ -210,6 +282,7 @@ export function consentText(p: RepoProfile, provider: AiProvider, est: Estimates
     if (!app && perms.some((r) => CREATES_OR_DELETES.test(r.why))) {
       throw new Error('In token mode pipegen never creates or deletes repos; pass permissionsTable(\'write\', { appCreatesRepos: false }).');
     }
+    capUsd = e.aiCostCapUsd;
     sections.push(
       ['pipegen is about to start. Nothing has left this computer yet. This is what it will do:'],
       filesSection(p, bundle, facts.gitleaksVersion),
@@ -222,20 +295,25 @@ export function consentText(p: RepoProfile, provider: AiProvider, est: Estimates
       permissionsSection('GitHub permissions pipegen asks for', perms),
     );
   }
-  return sections.filter((s) => s.length > 0).map((s) => s.join('\n')).join('\n\n');
+  const text = sections.filter((s) => s.length > 0).map((s) => s.join('\n')).join('\n\n');
+  // checkPricedFor above proved est.pricedFor is set and matches the provider shown
+  return makeScreen(text, { mode, pricedFor: { ...(est.pricedFor as PricedFor) }, capUsd, files: bundle });
 }
 
 /**
- * Shows the consent text and asks. The default answer is No. A cancel (or no terminal) is No. Any other failure is No
- * too, but it is reported through `err`, so a broken prompt never reads as "the user declined".
+ * Shows the consent screen and asks. A yes gives a ConsentToken for the screen's terms; anything else gives null. The
+ * default answer is No. A cancel (or no terminal) is No. Any other failure is No too, but it is reported through
+ * `err`, so a broken prompt never reads as "the user declined". A screen consentScreen() didn't make is refused
+ * (thrown) before anything is asked.
  */
-export async function askConsent(io: Prompter, text: string, err: (s: string) => void): Promise<boolean> {
+export async function askConsent(io: Prompter, screen: ConsentScreen, err: (s: string) => void): Promise<ConsentToken | null> {
+  if (!ConsentScreen.isScreen(screen)) throw new Error('askConsent needs the screen from consentScreen().');
   try {
-    return (await io.confirm(`${text}\n\nGo ahead?`, false)) === true;
+    return (await io.confirm(`${screen.text}\n\nGo ahead?`, false)) === true ? mintToken(screen.terms) : null;
   } catch (e) {
     if (!(e instanceof PromptCancelledError)) {
       err(`pipegen couldn't ask for your consent (${safeText(e instanceof Error ? e.message : String(e), 300)}), so it takes the answer as No.`);
     }
-    return false;
+    return null;
   }
 }

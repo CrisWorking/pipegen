@@ -1268,6 +1268,7 @@ export async function bundleCode(dir: string, opts: BundleOptions = {}): Promise
   Object.freeze(bundle.notes);
   Object.freeze(bundle);
   if (gitleaksChecked) CHECKED.add(bundle);
+  else COUNTED.add(bundle);
   return bundle;
 }
 
@@ -1493,6 +1494,8 @@ async function gitleaksPass(files: FileEntry[], bin: string, timeoutMs: number, 
 // Bundles that passed bundleCode's gitleaks check. They are frozen, so they cannot change afterwards;
 // a copy or a hand-made object is not in the set and is refused.
 const CHECKED = new WeakSet<object>();
+// Bundles bundleCode built without gitleaks (counting only); only countingSummary() reads them.
+const COUNTED = new WeakSet<object>();
 
 /** Breaks any `<code-bundle` / `</code-bundle` in repo text so it cannot open or close the block. */
 function neutralizeTags(s: string): string {
@@ -1579,11 +1582,60 @@ export function bundleSummary(bundle: CodeBundle): BundleSummary {
   if (!isChecked(bundle)) {
     throw new GitleaksRequiredError('This code bundle has not passed the required gitleaks check, so pipegen can\'t ask to send it.');
   }
+  return makeSummary(bundle.files.length, bundle.bytes, topFoldersOf(bundle));
+}
+
+/** The raw first path segments of a bundle's files, most files first (files at the top level have none). */
+function topFoldersOf(bundle: CodeBundle): string[] {
   const counts = new Map<string, number>();
   for (const f of bundle.files) {
     const cut = f.path.indexOf('/');
     if (cut > 0) counts.set(f.path.slice(0, cut), (counts.get(f.path.slice(0, cut)) ?? 0) + 1);
   }
-  const top = [...counts].sort((a, b) => b[1] - a[1] || (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0)).map(([name]) => name);
-  return makeSummary(bundle.files.length, bundle.bytes, top);
+  return [...counts].sort((a, b) => b[1] - a[1] || (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0)).map(([name]) => name);
+}
+
+// ---------- counting summary (`audit --ai`: consent before gitleaks) ----------
+
+let makeCounting: (bundle: CodeBundle, topFolders: readonly string[]) => CountingSummary;
+
+/**
+ * What a COUNTING-ONLY bundle (bundleCode without gitleaks) holds, for the `audit --ai` consent screen (Plan U ruling
+ * S21: gitleaks is downloaded and run only after consent, so the screen can't count the checked bundle). It is an upper
+ * bound of what is sent: the gitleaks pass only hides values and leaves files out, and the files that will really be
+ * sent must all be among the ones counted here (covers()), or nothing is sent. Only countingSummary() makes one, from
+ * bundleCode's own counting result (a copy or a hand-made object is refused), like BundleSummary.
+ */
+export class CountingSummary {
+  readonly #paths: ReadonlySet<string>;
+
+  private constructor(readonly files: number, readonly bytes: number, readonly topFolders: readonly string[], paths: ReadonlySet<string>) {
+    this.#paths = paths;
+    Object.freeze(this);
+  }
+
+  /** True only for an object countingSummary() made. */
+  static isSummary(x: unknown): x is CountingSummary {
+    return typeof x === 'object' && x !== null && #paths in x;
+  }
+
+  /** True when every file of `bundle` is one of the files counted here (the user agreed to send at most these). */
+  covers(bundle: CodeBundle): boolean {
+    return bundle.files.every((f) => this.#paths.has(f.path));
+  }
+
+  static {
+    makeCounting = (bundle, topFolders) => new CountingSummary(bundle.files.length, bundle.bytes, Object.freeze([...topFolders]), new Set(bundle.files.map((f) => f.path)));
+  }
+}
+
+/**
+ * The consent facts of a counting-only bundle (bundleCode without gitleaks). Throws unless `bundle` is bundleCode's own
+ * counting result. A checked bundle gets bundleSummary() instead.
+ */
+export function countingSummary(bundle: CodeBundle): CountingSummary {
+  if (bundle === null || typeof bundle !== 'object' || bundle.gitleaksChecked !== false || !COUNTED.has(bundle)) {
+    throw new Error('countingSummary needs bundleCode\'s own counting-only bundle (built without gitleaks).');
+  }
+  return makeCounting(bundle, topFoldersOf(bundle));
 }

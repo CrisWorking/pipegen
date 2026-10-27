@@ -8,6 +8,9 @@ export const tsupOptions = {
   platform: 'node',
   target: 'node24',
   clean: true,
+  // one file: the Anthropic SDK (bundled since `audit --ai`) has dynamic import()s, which ESM code splitting would put in
+  // chunk files next to main.js; without splitting esbuild inlines them, so dist/cli/main.js stays a single file
+  splitting: false,
   // ESM output; the CommonJS libraries bundled in (fast-glob, picomatch, ...) call require() for Node built-ins,
   // which esbuild's shim refuses in ESM unless a real `require` exists, so the banner creates one.
   banner: { js: "#!/usr/bin/env node\nimport { createRequire as __pipegenCreateRequire } from 'node:module';\nconst require = __pipegenCreateRequire(import.meta.url);" },

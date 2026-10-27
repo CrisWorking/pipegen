@@ -17,6 +17,7 @@ import { fallbackEnabled } from '../src/ai/claude.js';
 import { CANDIDATES_MAX_OUTPUT_TOKENS, CANDIDATES_REQUEST_MAX_BYTES, NEEDS_MAX_OUTPUT_TOKENS } from '../src/engine/discovery-limits.js';
 import { DEFAULT_MODEL, type AiProvider, type AiRequest, type AiUsage, type Capabilities, type ReviewedTool } from '../src/types.js';
 import { fakeFetch, fakeOctokit, type Routes } from './helpers/fake-http.js';
+import { grantAuditAi } from './helpers/consent.js';
 import { CLEAN, makeStub } from './helpers/gitleaks-stub.js';
 import { cleanupRepos, makeTempDir, writeIn } from './helpers/make-repo.js';
 
@@ -167,15 +168,18 @@ async function setup(o: SetupOpts = {}) {
     permissions: [], reviewed, reviewedUnavailable: o.reviewedUnavailable, now: () => NOW, budget: newRateBudget(),
   });
   o.edit?.(r);
-  vi.clearAllMocks(); // only what addAiSuggestions does counts below
   const stub = makeStub(CLEAN);
   const ensure = vi.fn(async () => stub.bin);
   const ai = fakeAi(o.ai);
-  const deps: AiSuggestDeps = {
+  const base = {
     ai: ai.p, gh: gh.gh, memory: fakeMemory(), fetch: web.fetch, reviewed, bar: BAR, budget: newRateBudget(), now: () => NOW,
-    sleep: vi.fn(async () => {}), knownValues: [], ensureGitleaks: ensure, anonymous: false, capUsd: 1e9, ...o.deps,
+    sleep: vi.fn(async () => {}), knownValues: [] as string[], ensureGitleaks: ensure, anonymous: false, capUsd: 1e9 as number | null, ...o.deps,
   };
-  return { dir, r, deps, ai, stub, ensure, ghCalls: gh.calls };
+  // the user's yes to the audit --ai screen for this provider, cap and folder (T4b: no AI call without a consent token)
+  const grant = () => grantAuditAi(r.profile, dir, deps.ai, deps.capUsd, deps.knownValues);
+  const deps: AiSuggestDeps = { consent: await grantAuditAi(r.profile, dir, base.ai, base.capUsd, base.knownValues), ...base };
+  vi.clearAllMocks(); // only what addAiSuggestions does counts below
+  return { dir, r, deps, ai, stub, ensure, grant, ghCalls: gh.calls };
 }
 
 const searched = () => (vi.mocked(suggestTools).mock.calls[0]?.[0] ?? []).map((n) => n.id);
@@ -384,6 +388,8 @@ describe('addAiSuggestions (controller rulings)', () => {
     const s = await setup();
     const needsWorst = requestCeilingUsd(DEFAULT_PROVIDER, needsRequestBytes(s.r, []), NEEDS_MAX_OUTPUT_TOKENS) as number;
     s.deps.capUsd = needsWorst * 0.99;
+    s.deps.consent = await s.grant(); // the user agreed to this cap
+    vi.clearAllMocks();
     const out = await addAiSuggestions(s.r, s.dir, s.deps);
     expect(s.ai.complete).not.toHaveBeenCalled();
     expect(suggestTools).not.toHaveBeenCalled();
@@ -643,10 +649,46 @@ describe('addAiSuggestions (controller rulings)', () => {
     const f = await setup({ ai: { worstCase: true } });
     const needsWorst = requestCeilingUsd(DEFAULT_PROVIDER, needsRequestBytes(f.r, []), NEEDS_MAX_OUTPUT_TOKENS) as number;
     f.deps.capUsd = needsWorst * 1.01; // the needs call fits, no discovery call does
+    f.deps.consent = await f.grant();
     collect(await addAiSuggestions(f.r, f.dir, f.deps));
     expect(notes).toContain(COST_CAP_STOP_NOTE);
     expect(notes.size).toBeGreaterThan(6);
     for (const n of notes) expect(redact(n), n).toBe(n);
+  });
+});
+
+describe('consent token (T4b: no AI call without consent, by type)', () => {
+  it('consent: without a token from askConsent nothing is sent: no gitleaks, no bundle, no AI call (thrown)', async () => {
+    const s = await setup();
+    const { consent: _given, ...rest } = s.deps;
+    // @ts-expect-error the consent token is required
+    await expect(addAiSuggestions(s.r, s.dir, rest)).rejects.toThrow(/consent/);
+    const forged = { ...s.deps, consent: { terms: s.deps.consent.terms } } as unknown as AiSuggestDeps;
+    await expect(addAiSuggestions(s.r, s.dir, forged)).rejects.toThrow(/consent/);
+    expect(s.ensure).not.toHaveBeenCalled();
+    expect(bundleCode).not.toHaveBeenCalled();
+    expect(s.ai.complete).not.toHaveBeenCalled();
+  });
+
+  it('consent: a token for another provider, model or cap is refused before anything runs', async () => {
+    const s = await setup();
+    const other = fakeAi({ model: 'claude-fable-5-1' });
+    await expect(addAiSuggestions(s.r, s.dir, { ...s.deps, ai: other.p })).rejects.toThrow(/agreed/);
+    await expect(addAiSuggestions(s.r, s.dir, { ...s.deps, ai: fakeAi({ name: 'openai', model: DEFAULT_MODEL }).p })).rejects.toThrow(/agreed/);
+    await expect(addAiSuggestions(s.r, s.dir, { ...s.deps, capUsd: 2e9 })).rejects.toThrow(/agreed/);
+    expect(s.ensure).not.toHaveBeenCalled();
+    expect(s.ai.complete).not.toHaveBeenCalled();
+    expect(other.complete).not.toHaveBeenCalled();
+  });
+
+  it('consent: the checked bundle may only hold files the user agreed to (counted before gitleaks); else nothing is sent, with a note', async () => {
+    const s = await setup();
+    writeIn(s.dir, 'src/added-after-consent.js', 'export const late = 1;\n'); // a file that wasn't on the consent screen
+    const out = await addAiSuggestions(s.r, s.dir, s.deps);
+    expect(s.ensure).toHaveBeenCalledTimes(1);
+    expect(s.ai.complete).not.toHaveBeenCalled();
+    expect(out.ai?.notes).toContain("Nothing was sent to the AI: after the gitleaks check, the code held files that weren't on the consent screen (the repo changed?). Run the audit again.");
+    for (const n of out.ai?.notes ?? []) expect(redact(n), n).toBe(n);
   });
 });
 

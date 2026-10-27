@@ -124,7 +124,7 @@ function githubLines(t: Clean, p: RepoProfile, auth: Auth, caps: Capabilities): 
  * anonymous access and the Actions token (no user), and when GitHub won't say (with a note). A 401 means the token
  * was rejected; a rate stop is thrown.
  */
-async function tokenLogin(gh: Octokit, auth: Auth, clock: RateClock, notes: string[]): Promise<string | null> {
+export async function tokenLogin(gh: Octokit, auth: Auth, clock: RateClock, notes: string[]): Promise<string | null> {
   if (auth.kind === 'anonymous' || auth.kind === 'installation') return null;
   try {
     const login = (await withRateLimit(() => gh.rest.users.getAuthenticated(), clock)).data.login;

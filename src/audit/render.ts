@@ -28,7 +28,7 @@ import type { Layer, Part } from '../types.js';
 import { makeSafeOutput, OUTPUT_CAP, type OutputTarget } from '../util/safe-output.js';
 import { safeMarkdown } from '../util/safe-text.js';
 import type { Coverage } from './coverage.js';
-import { isBuiltInNeed, isOwnCommand, needLabel, type AuditAi, type AuditReport, type WouldAddRow, type WouldAddTool } from './model.js';
+import { isBuiltInNeed, isOwnCommand, needLabel, type AuditAi, type AuditReport, type LocalAudit, type WouldAddRow, type WouldAddTool } from './model.js';
 
 export interface RenderOptions {
   /**
@@ -95,7 +95,7 @@ type Block =
   /** One of pipegen's own fixed commands, under the block before it (depth: that item's depth, or -1 under text). */
   | { kind: 'command'; command: string; depth: number };
 interface Section { title: string; blocks: Block[] }
-interface Doc { title: string; intro: string[]; verdict: string; sections: Section[] }
+interface Doc { title: string; intro: string[]; verdict: string | null; sections: Section[] }
 
 /** How values are cleaned and amounts written for one target. */
 interface Ctx {
@@ -109,11 +109,11 @@ interface Ctx {
   mergeLock: boolean;
 }
 
-function ctxFor(target: OutputTarget, knownValues: readonly string[], r: AuditReport): Ctx {
+function ctxFor(target: OutputTarget, knownValues: readonly string[], mergeLock: boolean): Ctx {
   const clean = makeSafeOutput(knownValues);
   return {
     target,
-    mergeLock: r.capabilities.branchProtection === true,
+    mergeLock,
     v: (s, max = OUTPUT_CAP.name) => clean(s, { target, max }),
     own: (s, max = OUTPUT_CAP.text) => clean(s, { target, max, redact: false }),
     // Markdown: safeMarkdown puts U+200B and a backslash before the $, so GitHub math can't start
@@ -200,7 +200,7 @@ function row(c: Ctx, cov: Coverage): Row {
 
 // ---------- sections ----------
 
-function warningsSection(r: AuditReport, c: Ctx): Section | null {
+function warningsSection(r: Pick<AuditReport, 'secretsInTree' | 'warnings'>, c: Ctx): Section | null {
   const blocks: Block[] = [];
   if (r.secretsInTree.length > 0) {
     blocks.push(item('Secret-like text in the files on disk now (pipegen never shows the values):', 0, true));
@@ -351,7 +351,7 @@ function costsSection(r: AuditReport, c: Ctx): Section {
   return { title: 'Costs of the full setup (estimates)', blocks };
 }
 
-function bundleSection(r: AuditReport, c: Ctx): Section {
+function bundleSection(r: Pick<AuditReport, 'aiBundle'>, c: Ctx): Section {
   const b = r.aiBundle;
   const blocks: Block[] = [text(`pipegen would send ${plural(b.files, 'file', 'files')} (${size(b.bytes)}) to the AI.`)];
   if (b.truncated) blocks.push(text('That is as much as fits: the code reached its size limit, so the rest would not be sent.'));
@@ -376,7 +376,7 @@ function permissionsSection(r: AuditReport, c: Ctx): Section {
   return { title: 'Permissions the full setup needs', blocks: blocks.length === 0 ? [text('None listed.')] : blocks };
 }
 
-function notesSection(r: AuditReport, c: Ctx): Section | null {
+function notesSection(r: Pick<AuditReport, 'notes'>, c: Ctx): Section | null {
   const notes = dedupe(r.notes.map((n) => c.v(n, OUTPUT_CAP.text)));
   return notes.length === 0 ? null : { title: 'Notes', blocks: notes.map((n) => item(n)) };
 }
@@ -461,12 +461,17 @@ function terminalBlocks(blocks: Block[], out: string[]): void {
 
 /** The report for the terminal: plain text, no colours, lines wrapped at 100 characters. */
 export function renderTerminal(r: AuditReport, opts: RenderOptions): string {
-  const doc = buildDoc(r, ctxFor('terminal', opts.knownValues, r));
+  return terminalDoc(buildDoc(r, ctxFor('terminal', opts.knownValues, r.capabilities.branchProtection === true)));
+}
+
+function terminalDoc(doc: Doc): string {
   const lines: string[] = [];
   append(lines, wrap(doc.title, ''));
   for (const l of doc.intro) append(lines, wrap(l, ''));
-  lines.push('');
-  append(lines, wrap(`Verdict: ${doc.verdict}`, ''));
+  if (doc.verdict !== null) {
+    lines.push('');
+    append(lines, wrap(`Verdict: ${doc.verdict}`, ''));
+  }
   for (const s of doc.sections) {
     lines.push('', s.title);
     terminalBlocks(s.blocks, lines);
@@ -508,10 +513,10 @@ function markdownBlocks(blocks: Block[], out: string[]): void {
 
 /** The report as a Markdown file (`--out`): every value through safeMarkdown, every excluded pattern listed. */
 export function renderMarkdown(r: AuditReport, opts: RenderOptions): string {
-  const doc = buildDoc(r, ctxFor('markdown', opts.knownValues, r));
+  const doc = buildDoc(r, ctxFor('markdown', opts.knownValues, r.capabilities.branchProtection === true));
   const at = (opts.now ?? Date.now)();
   const date = Number.isFinite(at) ? `Audited on ${new Date(at).toISOString().slice(0, 10)}. ` : '';
-  const lines = [`# ${doc.title}`, '', `${date}${doc.intro.join(' ')}`, '', `**Verdict:** ${doc.verdict}`];
+  const lines = [`# ${doc.title}`, '', `${date}${doc.intro.join(' ')}`, '', `**Verdict:** ${doc.verdict ?? ''}`];
   for (const s of doc.sections) {
     lines.push('', `## ${s.title}`, '');
     markdownBlocks(s.blocks, lines);
@@ -576,4 +581,39 @@ function deepClean(v: unknown, key: string, depth: number, own: boolean, clean: 
 export function renderJson(r: AuditReport, opts: RenderOptions): string {
   const slim = { ...r, wouldAdd: r.wouldAdd.map((w) => ({ ...w, tool: slimTool(w.tool) })) };
   return JSON.stringify(deepClean(slim, '', 0, false, makeSafeOutput(opts.knownValues), new Set()), null, 2);
+}
+
+// ---------- the local-only report (GitHub not read; the `inspect` R10 rule) ----------
+
+/** The one line that says GitHub wasn't read, and what is therefore left out (never guessed). */
+export const GITHUB_NOT_READ = 'GitHub: not read (the error is on stderr). Without GitHub, pipegen can\'t tell which checks your workflows run on '
+  + 'the right branches, what your GitHub plan allows, or what the full setup would cost, so this report shows only what it found on disk.';
+
+function localDoc(l: LocalAudit, c: Ctx): Doc {
+  const p = l.profile;
+  const found: Block[] = [];
+  found.push(text(p.services.length === 0 ? 'Services: none found.' : `Services (${num(p.services.length)}):`));
+  for (const s of p.services) found.push(item(`${c.v(s.name)} (${c.v(s.language)}, in ${c.v(s.path, OUTPUT_CAP.path)})`));
+  found.push(text(p.existingWorkflows.length === 0 ? 'Workflows: none found.' : `Workflows (${num(p.existingWorkflows.length)}):`));
+  for (const w of p.existingWorkflows) found.push(item(c.v(w.path, OUTPUT_CAP.path)));
+  const sections = [
+    warningsSection(l, c), { title: 'What pipegen found in the repo', blocks: found }, bundleSection(l, c), notesSection(l, c),
+  ].filter((s): s is Section => s !== null);
+  return {
+    title: `pipegen audit: ${c.v(`${p.owner}/${p.repo}`, OUTPUT_CAP.path)}`,
+    intro: ['pipegen changed nothing in the repo or on GitHub.', 'Nothing was sent to an AI.', '', GITHUB_NOT_READ],
+    verdict: null,
+    sections,
+  };
+}
+
+/** The local-only report for the terminal (GitHub couldn't be read): same cleaning as renderTerminal. */
+export function renderLocalTerminal(l: LocalAudit, opts: RenderOptions): string {
+  return terminalDoc(localDoc(l, ctxFor('terminal', opts.knownValues, false)));
+}
+
+/** The local-only report as JSON (`--json`): `github: "not read"` and the parts read from disk, every string cleaned. */
+export function renderLocalJson(l: LocalAudit, opts: RenderOptions): string {
+  const doc = { github: 'not read', profile: l.profile, secretsInTree: l.secretsInTree, aiBundle: l.aiBundle, warnings: l.warnings, notes: l.notes };
+  return JSON.stringify(deepClean(doc, '', 0, false, makeSafeOutput(opts.knownValues), new Set()), null, 2);
 }

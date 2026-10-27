@@ -3,11 +3,11 @@
 // files, provider, refusal note, the audit's own AI cost and cap, read-only permissions; no minutes, no repos).
 // Repos are described per DECISIONS #87: pipegen's App creates them; with a token the user does (gh repo create).
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
-import { askConsent, consentText } from '../src/cli/consent.js';
+import { askConsent, consentScreen, consentText, ConsentScreen, ConsentToken } from '../src/cli/consent.js';
 import { clackPrompter, PromptCancelledError, type Prompter } from '../src/cli/io.js';
 import { REFUSAL_FALLBACK_NOTE } from '../src/ai/provider.js';
 import { ollamaProvider } from '../src/ai/ollama.js';
-import { BundleSummary, bundleCode, bundleSummary, EXCLUDED_KEPT, EXCLUDED_PATTERN_GROUPS, EXCLUDED_PATTERNS, GitleaksRequiredError, type CodeBundle } from '../src/ai/redact.js';
+import { BundleSummary, bundleCode, bundleSummary, countingSummary, CountingSummary, EXCLUDED_KEPT, EXCLUDED_PATTERN_GROUPS, EXCLUDED_PATTERNS, GitleaksRequiredError, type CodeBundle } from '../src/ai/redact.js';
 import { floorNeeds, jobCategories } from '../src/engine/needs.js';
 import { estimate, estimateAuditAi, type Estimates } from '../src/estimate/estimate.js';
 import { permissionsTable } from '../src/github/client.js';
@@ -374,20 +374,24 @@ describe('consent shows how the estimates were made (final review batch 2, M3)',
 });
 
 describe('askConsent', () => {
+  /** The audit --ai screen for the shared checked bundle. */
+  const screen = () => consentScreen(profile(), claude, estimateAuditAi(claude, 3, 50_000), bundle, permissionsTable('read'), [], 'audit-ai', { gitleaksVersion: '8.30.1' });
+
   it('consent: default answer is No', async () => {
     const io = scripted(async (_m, def) => def); // the user just presses Enter
-    expect(await askConsent(io, 'the consent text', noErr)).toBe(false);
+    const s = screen();
+    expect(await askConsent(io, s, noErr)).toBeNull();
     expect(io.asked).toHaveLength(1);
     expect(io.asked[0]?.def).toBe(false);
-    expect(io.asked[0]?.msg).toContain('the consent text');
-    expect(await askConsent(scripted(async () => true), 'x', noErr)).toBe(true);
+    expect(io.asked[0]?.msg).toContain(s.text);
+    expect(await askConsent(scripted(async () => true), screen(), noErr)).toBeInstanceOf(ConsentToken);
   });
 
   it('askConsent: a cancelled or failed prompt counts as No; only a real failure is reported (review M5)', async () => {
     const errs: string[] = [];
-    expect(await askConsent(scripted(async () => { throw new PromptCancelledError(); }), 'x', (s) => { errs.push(s); })).toBe(false);
+    expect(await askConsent(scripted(async () => { throw new PromptCancelledError(); }), screen(), (s) => { errs.push(s); })).toBeNull();
     expect(errs).toEqual([]); // the user cancelled: nothing to report
-    expect(await askConsent(scripted(async () => { throw new Error(`broken prompt ${hostileNames.ansiColour}`); }), 'x', (s) => { errs.push(s); })).toBe(false);
+    expect(await askConsent(scripted(async () => { throw new Error(`broken prompt ${hostileNames.ansiColour}`); }), screen(), (s) => { errs.push(s); })).toBeNull();
     expect(errs).toHaveLength(1);
     expect(errs[0]).toContain("couldn't ask for your consent");
     expect(errs[0]).toContain('broken prompt red-app');
@@ -400,6 +404,75 @@ describe('askConsent', () => {
     await expect(prompter.confirm('ok?', true)).rejects.toBeInstanceOf(PromptCancelledError);
     await expect(prompter.select('which?', [{ value: 'a', label: 'A' }], 'a')).rejects.toBeInstanceOf(PromptCancelledError);
     await expect(prompter.text('name?')).rejects.toBeInstanceOf(PromptCancelledError);
-    expect(await askConsent(prompter, 'the consent text', noErr)).toBe(false);
+    expect(await askConsent(prompter, screen(), noErr)).toBeNull();
+  });
+});
+
+describe('consent token (T4b: no AI call without consent, by type)', () => {
+  it('consent grant (yes) gives a ConsentToken that carries what the screen showed (mode, provider, cap, files)', async () => {
+    const est = estimateAuditAi(claude, 3, 50_000);
+    const s = consentScreen(profile(), claude, est, bundle, permissionsTable('read'), [], 'audit-ai', { gitleaksVersion: '8.30.1' });
+    expect(s).toBeInstanceOf(ConsentScreen);
+    expect(Object.isFrozen(s)).toBe(true);
+    expect(s.text).toBe(consentText(profile(), claude, est, bundle, permissionsTable('read'), [], 'audit-ai', { gitleaksVersion: '8.30.1' }));
+    const granted = await askConsent(scripted(async () => true), s, noErr);
+    if (granted === null) throw new Error('expected a yes');
+    expect(ConsentToken.isToken(granted)).toBe(true);
+    expect(Object.isFrozen(granted)).toBe(true);
+    expect(granted.terms).toEqual({ mode: 'audit-ai', pricedFor: est.pricedFor, capUsd: est.capUsd, files: bundle });
+    const f = full();
+    const fullScreen = consentScreen(f.p, claude, f.est, bundle, permissionsTable('write', { appCreatesRepos: false }), repos(f.p, [true, true]), 'full', { appCreatesRepos: false, gitleaksVersion: '8.30.1' });
+    expect(fullScreen.terms).toMatchObject({ mode: 'full', capUsd: f.est.aiCostCapUsd });
+  });
+
+  it('consent grant (ConsentToken) only from askConsent, and only from a screen consentScreen() made', async () => {
+    // @ts-expect-error the constructor is private: only askConsent makes a token
+    expect(() => new ConsentToken({ mode: 'audit-ai' })).toBeDefined();
+    expect(ConsentToken.isToken({ terms: { mode: 'audit-ai' } })).toBe(false);
+    expect(ConsentToken.isToken(Object.create(ConsentToken.prototype))).toBe(false);
+    const yes = scripted(async () => true);
+    // @ts-expect-error a string is not a ConsentScreen
+    await expect(askConsent(yes, 'the consent text', noErr)).rejects.toThrow(/consentScreen/);
+    const hand = { text: 'x', terms: { mode: 'audit-ai' } } as unknown as ConsentScreen;
+    await expect(askConsent(yes, hand, noErr)).rejects.toThrow(/consentScreen/);
+    expect(yes.asked).toEqual([]); // nothing was asked
+  });
+});
+
+describe('counting summary (audit --ai: consent comes before the gitleaks download, ruling S21)', () => {
+  it('countingSummary: only from bundleCode\'s own counting-only bundle; a checked bundle or a copy is refused', async () => {
+    const dir = makeTempDir();
+    for (const f of FILES) writeIn(dir, f, `// ${f.length}\n`);
+    const counted = await bundleCode(dir);
+    const c = countingSummary(counted);
+    expect(CountingSummary.isSummary(c)).toBe(true);
+    expect(c.files).toBe(7);
+    expect(c.bytes).toBe(counted.bytes);
+    expect(c.topFolders).toEqual(['src', 'test', '.github']);
+    expect(Object.isFrozen(c)).toBe(true);
+    expect(() => countingSummary(checked)).toThrow(/counting-only/);
+    expect(() => countingSummary({ ...counted })).toThrow(/counting-only/);
+    expect(CountingSummary.isSummary({ files: 1, bytes: 1, topFolders: [] })).toBe(false);
+    // covers(): the checked bundle of the same files is inside what was counted; a bundle with another file is not
+    expect(c.covers(await bundleCode(dir, { gitleaks: makeStub(CLEAN).bin }))).toBe(true);
+    writeIn(dir, 'src/new.ts', '// new\n');
+    expect(c.covers(await bundleCode(dir, { gitleaks: makeStub(CLEAN).bin }))).toBe(false);
+  });
+
+  it('consent (audit-ai): a counting summary says "at most" and that gitleaks runs after the yes; the full screen refuses it', async () => {
+    const dir = makeTempDir();
+    for (const f of FILES) writeIn(dir, f, `// ${f.length}\n`);
+    const c = countingSummary(await bundleCode(dir));
+    const p = profile();
+    const est = estimateAuditAi(claude, 3, 50_000);
+    const text = consentText(p, claude, est, c, permissionsTable('read'), [], 'audit-ai', { gitleaksVersion: '8.30.1' });
+    expect(text).toContain('pipegen sends at most 7 files');
+    expect(text).toContain('Top folders: src, test, .github');
+    expect(text).toContain('These counts were made before the gitleaks check');
+    expect(text).toContain('gitleaks 8.30.1, which pipegen downloads (checksum-verified) into its cache');
+    expect(text).not.toMatch(/gitleaks was not run|counting only/);
+    const f = full();
+    // @ts-expect-error the full run's screen takes only the checked bundle's summary
+    expect(() => consentText(f.p, claude, f.est, c, permissionsTable('write', { appCreatesRepos: false }), repos(f.p, [true, true]), 'full', { appCreatesRepos: false, gitleaksVersion: '8.30.1' })).toThrow(/bundleSummary/);
   });
 });

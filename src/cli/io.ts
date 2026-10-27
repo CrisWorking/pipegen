@@ -60,10 +60,14 @@ export function clackPrompter(stdin: NodeJS.ReadStream = process.stdin, stdout: 
   };
 }
 
-/** The CliIO a real run uses: clack prompts, stdout and stderr, the process environment and folder, the global fetch. */
+/**
+ * The CliIO a real run uses: clack prompts, stdout and stderr, the process environment and folder, the global fetch.
+ * Questions are drawn on stderr (like errors), so stdout holds only the command's output (`audit --json > report.json`
+ * can still ask for consent).
+ */
 export function processIO(): CliIO {
   return {
-    prompt: clackPrompter(),
+    prompt: clackPrompter(process.stdin, process.stderr),
     out: (s) => { process.stdout.write(`${s}\n`); },
     err: (s) => { process.stderr.write(`${s}\n`); },
     env: process.env,

@@ -1,5 +1,5 @@
 import { execFileSync } from 'node:child_process';
-import { readFileSync } from 'node:fs';
+import { readdirSync, readFileSync } from 'node:fs';
 import { isBuiltin } from 'node:module';
 import { join, resolve } from 'node:path';
 import { build } from 'tsup';
@@ -35,16 +35,39 @@ describe('package', () => {
   });
 });
 
+describe('dev build (ruling B3: internal runs before the reviewed list is reviewed)', () => {
+  it('dev build: tsup.dev.config.ts = the release options without the release define, into .dev-dist/, which is gitignored, not in files and never packed', async () => {
+    const dev = (await import('../tsup.dev.config.js')).devTsupOptions;
+    const { define: _define, outDir: _outDir, ...release } = tsupOptions;
+    expect(dev).toEqual({ ...release, outDir: '.dev-dist' });
+    expect('define' in dev).toBe(false);
+    expect(tsupOptions.define).toEqual({ 'process.env.PIPEGEN_RELEASE': '"1"' }); // the release build still refuses PENDING entries
+    const ignored = readFileSync(resolve(root, '.gitignore'), 'utf8').split('\n').map((l) => l.trim());
+    expect(ignored).toContain('.dev-dist/');
+    expect(pkg.files).toEqual(['dist', 'data']);
+    const packed = JSON.parse(execFileSync('npm', ['pack', '--dry-run', '--json', '--ignore-scripts'], { cwd: root, stdio: 'pipe' }).toString('utf8')) as { files: { path: string }[] }[];
+    const paths = packed[0]?.files.map((f) => f.path) ?? [];
+    expect(paths.length).toBeGreaterThan(0);
+    expect(paths.filter((f) => f.startsWith('.dev-dist'))).toEqual([]);
+    expect(paths.filter((f) => !f.startsWith('dist/') && !f.startsWith('data/'))).toEqual(expect.arrayContaining(['package.json']));
+  });
+});
+
 describe('build', () => {
   it('dist/cli/main.js starts with the node shebang and imports only node: built-ins', () => {
     execFileSync('npx', ['tsup'], { cwd: root, stdio: 'pipe' });
-    const out = readFileSync(resolve(root, 'dist/cli/main.js'), 'utf8');
-    expect(out.startsWith('#!/usr/bin/env node\n')).toBe(true);
+    const raw = readFileSync(resolve(root, 'dist/cli/main.js'), 'utf8');
+    expect(raw.startsWith('#!/usr/bin/env node\n')).toBe(true);
+    // comment lines left out: the bundled Anthropic SDK's doc comments say things like "from 'queued' to 'starting'"
+    const out = raw.split('\n').filter((l) => !/^\s*(?:\*|\/\*|\/\/)/.test(l)).join('\n');
+    expect(readdirSync(resolve(root, 'dist'))).toEqual(['cli']); // one file: no chunk next to main.js
+    expect(readdirSync(resolve(root, 'dist/cli'))).toEqual(['main.js']);
     const specs = [
-      ...out.matchAll(/\bfrom\s*["']([^"']+)["']/g),
-      ...out.matchAll(/\bimport\s*["']([^"']+)["']/g),
-      ...out.matchAll(/\bimport\(\s*["']([^"']+)["']\s*\)/g),
-      ...out.matchAll(/\brequire\(\s*["']([^"']+)["']\s*\)/g),
+      // a module specifier has no whitespace or comma (so a string list like "--volumes-from", "--stop-signal" isn't one)
+      ...out.matchAll(/\bfrom\s*["']([^"'\s,]+)["']/g),
+      ...out.matchAll(/\bimport\s*["']([^"'\s,]+)["']/g),
+      ...out.matchAll(/\bimport\(\s*["']([^"'\s,]+)["']\s*\)/g),
+      ...out.matchAll(/\brequire\(\s*["']([^"'\s,]+)["']\s*\)/g),
     ].map((m) => m[1]);
     for (const s of specs) expect(s.startsWith('node:'), `non-builtin import: ${s}`).toBe(true);
     for (const name of shimRequires(out)) expect(isBuiltin(name), `non-builtin require: ${name}`).toBe(true);

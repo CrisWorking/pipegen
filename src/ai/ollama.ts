@@ -1,5 +1,6 @@
 // Ollama adapter (experimental). Plain fetch to {OLLAMA_HOST}/api/chat. No API key is ever sent here. Redirects are
 // refused: the consent screen names the host the code goes to, and a 307/308 would re-send it somewhere else.
+import { HttpError, readBytes } from '../engine/http.js';
 import type { AiProvider, AiRequest, AiUsage } from '../types.js';
 import { safeText } from '../util/safe-text.js';
 import { AiError, count, outputLimit, withTimeout } from './errors.js';
@@ -111,4 +112,45 @@ export function ollamaProvider(opts: OllamaOptions = {}): OllamaProvider {
       }
     },
   };
+}
+
+/** Ollama's own cloud: a model there runs on ollama.com, not on a machine the user controls (Plan U ruling U15/H2). */
+const OLLAMA_CLOUD_HOST = /(?:^|\.)ollama\.com\.?$/i;
+const SHOW_TIMEOUT_MS = 15_000;
+/** /api/show answers with the model's metadata (licence text included); more than this is refused. */
+const MAX_SHOW_BYTES = 8 * 1024 * 1024;
+
+export const OLLAMA_COM_HOST_MESSAGE = 'OLLAMA_HOST points at ollama.com, which runs models in Ollama\'s cloud; pipegen v0.1 only uses Ollama models that run on a machine you control.';
+
+/**
+ * Before consent (`audit --ai ollama`, Plan U ruling U15/H2): refuses an OLLAMA_HOST on ollama.com, then asks the
+ * server about the model (POST /api/show) and refuses a model the server says runs elsewhere (`remote_host` or
+ * `remote_model` in the answer: a cloud model behind a local name). Fails closed: a server that doesn't answer, an
+ * error or an answer pipegen can't read is refused too. Only the model name is sent; redirects are refused.
+ * Throws AiError('invalid') with a plain message; returns nothing when the model runs on that server.
+ */
+export async function checkOllamaModelRunsThere(host: string | undefined, model: string, fetchFn: typeof fetch = globalThis.fetch): Promise<void> {
+  const url = ollamaChatUrl(host);
+  if (OLLAMA_CLOUD_HOST.test(url.hostname)) throw new AiError('invalid', OLLAMA_COM_HOST_MESSAGE);
+  url.pathname = url.pathname.replace(/\/api\/chat$/, '/api/show');
+  const where = url.host;
+  const refuse = (why: string) => new AiError('invalid', `pipegen couldn't confirm that the Ollama model "${safeText(model, 100)}" runs on ${where} (${why}), so it won't send your code to it.`);
+  let answer: unknown;
+  try {
+    answer = await withTimeout(SHOW_TIMEOUT_MS, 'Ollama', async (signal) => {
+      const res = await fetchFn(url, { method: 'POST', signal, redirect: 'error', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ model }) });
+      if (!res.ok) {
+        await res.body?.cancel().catch(() => {});
+        throw refuse(`it answered HTTP ${res.status}; is the model pulled?`);
+      }
+      // read with a byte cap: the answer comes from a server pipegen doesn't control
+      return JSON.parse((await readBytes(res, MAX_SHOW_BYTES, 'Ollama\'s model description')).toString('utf8')) as unknown;
+    });
+  } catch (e) {
+    if (e instanceof AiError && e.kind === 'invalid') throw e;
+    throw refuse(e instanceof SyntaxError ? 'its answer was not JSON' : e instanceof HttpError ? 'its answer was too large or broken' : 'it did not answer; is Ollama running?');
+  }
+  if (answer === null || typeof answer !== 'object' || Array.isArray(answer)) throw refuse('its answer was not a model description');
+  const a = answer as Record<string, unknown>;
+  if (Object.hasOwn(a, 'remote_host') || Object.hasOwn(a, 'remote_model')) throw new AiError('invalid', OLLAMA_CLOUD_MESSAGE);
 }
