@@ -11,13 +11,17 @@
 // - "inside the repo" uses the same identity check, and needs `--force` ("don't write the report into the repo
 //   you're auditing");
 // - POSIX: a target that doesn't exist is created exclusively (`O_WRONLY|O_CREAT|O_EXCL|O_NOFOLLOW|O_NONBLOCK`,
-//   mode 0600), so a symlink or any existing file is refused, and a parent folder swapped after the checks can at
-//   worst create a NEW file elsewhere, never overwrite one. `--force` on an existing REGULAR, single-link file
+//   mode 0600), so a symlink or any existing file is refused. `--force` on an existing REGULAR, single-link file
 //   opens it with `O_WRONLY|O_NOFOLLOW|O_NONBLOCK` (no O_CREAT, no O_TRUNC), checks fstat = the lstat dev/ino,
 //   then sets mode 0600 and only then empties it. A symlink, FIFO, device, folder or hard-linked file is refused;
 //   `O_NONBLOCK` makes a FIFO swapped in fail at once (ENXIO) instead of hanging;
-// - Linux: after the open, /proc/self/fd/<fd> tells which folder the file really is in; when it isn't the folder
-//   that was checked (a parent swapped after the checks), nothing is written;
+// - a folder on the path swapped for a link AFTER the walk is not seen by the walk: swapped before the target's
+//   lstat, `--force` would lstat, open and dev/ino-match the other folder's same-named file and replace it;
+//   swapped before the open, a new file would be created there. So, after the open, /proc/self/fd/<fd> tells
+//   which folder the file really is in; when it isn't the folder that was checked, nothing is written (Linux).
+//   Where that check can't run (macOS and other systems, Linux without /proc), a target inside the repo is
+//   refused (ruling U20): only the repo's folders can be swapped by repo content, and the folders outside it are
+//   the user's own. Outside the repo the race needs a local process that can write one of your own folders;
 // - Windows (no O_NOFOLLOW in fs.constants): the same folder walk, lstat and refuse a symlink/junction, then `wx`
 //   (exclusive create, which also refuses any other existing reparse point); `--force` is refused there.
 import { constants as fsConstants, type BigIntStats } from 'node:fs';
@@ -53,6 +57,10 @@ export interface WriteOutFileOptions {
   constants?: OutFileConstants;
   /** fs.promises.open (tests). */
   open?: OpenFn;
+  /** Where the open files' paths are read (tests: a missing folder simulates a system without /proc). */
+  procFdDir?: string;
+  /** Called just before the target's lstat (tests: a race between the folder walk and the lstat). */
+  beforeTargetLstat?: () => Promise<void>;
 }
 
 const MODE = 0o600;
@@ -145,13 +153,21 @@ export async function writeOutFile(path: string, content: string, opts: WriteOut
       repo = await stat(resolve(cwd, opts.dir), { bigint: true }); // --dir may be your own link: its real folder
     } catch (e) {
       if (!isSystemError(e)) throw e;
-      throw new OutFileError(`pipegen can't read the repo folder ${show(resolve(cwd, opts.dir))}: ${reason(e)}.`);
+      const why = errCode(e) === 'ENOENT' ? "it doesn't exist" : reason(e);
+      throw new OutFileError(`pipegen can't read the repo folder ${show(resolve(cwd, opts.dir))}: ${why}.`);
     }
     if (!repo.isDirectory()) throw new OutFileError(`The repo folder ${show(resolve(cwd, opts.dir))} is not a folder.`);
 
     const where = await resolveFolder(dirname(target), repo, refuse);
     const final = join(where.folder, basename(target));
 
+    const procFdDir = opts.procFdDir ?? '/proc/self/fd';
+    const UNSAFE_IN_REPO =
+      "pipegen can't safely write inside the repo on this system (it can't confirm which folder the file is " +
+      'opened in). Choose a path outside the repo';
+    if (where.inRepo && !(await canReadOpenPaths(procFdDir))) refuse(UNSAFE_IN_REPO);
+
+    if (opts.beforeTargetLstat) await opts.beforeTargetLstat();
     const pre = await lstatOrNull(final);
     if (pre?.isSymbolicLink()) refuse(SYMLINK);
     if (where.inRepo && !opts.force) {
@@ -196,7 +212,8 @@ export async function writeOutFile(path: string, content: string, opts: WriteOut
       if (!st.isFile()) refuse(NOT_REGULAR);
       if (st.nlink > 1n) refuse(HARD_LINKS);
       if (pre !== null && !sameFile(st, pre)) refuse(CHANGED);
-      await checkOpenedFolder(fh, where.id, refuse, pre === null);
+      const confirmed = await checkOpenedFolder(fh, procFdDir, where.id, refuse, pre === null);
+      if (!confirmed && where.inRepo) refuse(UNSAFE_IN_REPO + (pre === null ? '. An empty file may have been left there' : ''));
       await fh.chmod(MODE);
       writing = true;
       if (pre !== null) await fh.truncate(0);
@@ -265,21 +282,36 @@ async function resolveFolder(lexical: string, repo: BigIntStats, refuse: (why: s
   return { folder: resolved, id: await lstat(resolved, { bigint: true }), inRepo: await isRepoOrBelow(resolved) };
 }
 
+/** Whether this system can tell which path an open file is at (/proc/self/fd on Linux). */
+async function canReadOpenPaths(procFdDir: string): Promise<boolean> {
+  try {
+    return (await stat(procFdDir)).isDirectory();
+  } catch {
+    return false;
+  }
+}
+
 /**
  * Linux: the folder the opened file is really in must be the folder that was checked (the same dev/ino). A parent
- * swapped for a link after the checks fails here, before anything is written. Where /proc can't tell (other
- * systems, no /proc), the exclusive create and the dev/ino match already keep any existing file safe.
+ * swapped for a link after the walk fails here, before anything is written. Returns false when it can't tell (no
+ * /proc, other systems): the caller then refuses a target inside the repo.
  */
-async function checkOpenedFolder(fh: FileHandle, folder: BigIntStats, refuse: (why: string) => never, created: boolean): Promise<void> {
+async function checkOpenedFolder(
+  fh: FileHandle,
+  procFdDir: string,
+  folder: BigIntStats,
+  refuse: (why: string) => never,
+  created: boolean,
+): Promise<boolean> {
   let actual: string;
   try {
-    actual = await readlink(`/proc/self/fd/${fh.fd}`);
+    actual = await readlink(join(procFdDir, String(fh.fd)));
   } catch {
-    return;
+    return false;
   }
-  if (!isAbsolute(actual)) return; // not a path (e.g. "anon_inode:..."): nothing to compare
+  if (!isAbsolute(actual)) return false; // not a path (e.g. "anon_inode:..."): can't tell
   const real = await lstat(dirname(actual), { bigint: true }).catch(() => null);
-  if (real !== null && sameFile(real, folder)) return;
+  if (real !== null && sameFile(real, folder)) return true;
   refuse(
     'a folder on its path changed while pipegen was writing the report. Nothing was written' +
       (created ? `; an empty file may have been left at ${show(actual)}` : ''),

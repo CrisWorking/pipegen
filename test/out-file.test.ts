@@ -424,6 +424,71 @@ describe.runIf(POSIX)('writeOutFile (POSIX)', () => {
     expect(await readFile(join(victimDir, 'report.md'), 'utf8')).toBe('');
   });
 
+  describe('N1/N3/U20: a repo folder swapped between the folder walk and the target lstat', () => {
+    let victimDir: string;
+    let swap: () => Promise<void>;
+    let swapBack: OpenFn;
+    beforeEach(async () => {
+      victimDir = join(root, 'home');
+      await mkdir(victimDir);
+      await writeFile(join(victimDir, 'report.md'), 'precious');
+      await mkdir(join(repo, 'sub'));
+      await writeFile(join(repo, 'sub', 'report.md'), 'old');
+      swap = async () => {
+        await rename(join(repo, 'sub'), join(repo, 'sub-real'));
+        await symlink(victimDir, join(repo, 'sub'));
+      };
+      // After the open, put the real folder back, so only the open file can tell where it really is.
+      swapBack = async (p, flags, mode) => {
+        const fh = await fsOpen(p, flags, mode);
+        await rm(join(repo, 'sub'));
+        await rename(join(repo, 'sub-real'), join(repo, 'sub'));
+        return fh;
+      };
+    });
+
+    it.runIf(process.platform === 'linux')('Linux: the /proc check refuses, the other file is unchanged', async () => {
+      const e = await refusal(
+        writeOutFile(join(repo, 'sub', 'report.md'), 'PIPEGEN', { force: true, dir: repo, cwd: work, beforeTargetLstat: swap, open: swapBack }),
+      );
+      expect(e.message).toMatch(/a folder on its path changed while pipegen was writing the report\. Nothing was written\./);
+      expect(await readFile(join(victimDir, 'report.md'), 'utf8')).toBe('precious');
+      expect(await readFile(join(repo, 'sub', 'report.md'), 'utf8')).toBe('old');
+    });
+
+    it('without /proc (macOS-like): a target inside the repo is refused before anything is opened', async () => {
+      const spy = spyOpen();
+      const e = await refusal(
+        writeOutFile(join(repo, 'sub', 'report.md'), 'PIPEGEN', {
+          force: true, dir: repo, cwd: work, beforeTargetLstat: swap, open: spy.open, procFdDir: join(root, 'no-proc'),
+        }),
+      );
+      expect(e.message).toMatch(/pipegen can't safely write inside the repo on this system .*Choose a path outside the repo\./);
+      expect(spy.calls).toHaveLength(0);
+      expect(await readFile(join(victimDir, 'report.md'), 'utf8')).toBe('precious');
+    });
+
+    it('without /proc: inside the repo is refused even with no race; outside the repo still works', async () => {
+      const noProc = join(root, 'no-proc');
+      await refusal(writeOutFile(join(repo, 'new.md'), 'x', { force: true, dir: repo, cwd: work, procFdDir: noProc }));
+      expect(await exists(join(repo, 'new.md'))).toBe(false);
+      await writeOutFile(join(outside, 'r.md'), 'x', { force: false, dir: repo, cwd: work, procFdDir: noProc });
+      await writeFile(join(outside, 'old.md'), 'old');
+      await writeOutFile(join(outside, 'old.md'), 'new', { force: true, dir: repo, cwd: work, procFdDir: noProc });
+      expect(await readFile(join(outside, 'r.md'), 'utf8')).toBe('x');
+      expect(await readFile(join(outside, 'old.md'), 'utf8')).toBe('new');
+    });
+
+    it('when the open file can\'t be located after the open, a target inside the repo is refused', async () => {
+      // /proc exists but has no entry for the fd (a stand-in folder): the post-open check can't confirm.
+      const fakeProc = join(root, 'fake-proc');
+      await mkdir(fakeProc);
+      const e = await refusal(writeOutFile(join(repo, 'sub', 'report.md'), 'x', { force: true, dir: repo, cwd: work, procFdDir: fakeProc }));
+      expect(e.message).toMatch(/can't safely write inside the repo/);
+      expect(await readFile(join(repo, 'sub', 'report.md'), 'utf8')).toBe('old');
+    });
+  });
+
   it('M1: --force over a 0666 file leaves it 0600', async () => {
     const target = join(outside, 'report.md');
     await writeFile(target, 'old');
@@ -491,7 +556,7 @@ describe.runIf(POSIX)('writeOutFile (POSIX)', () => {
 
   it('an unreadable --dir refuses', async () => {
     const e = await refusal(writeOutFile(join(outside, 'r.md'), 'x', { force: false, dir: join(root, 'missing'), cwd: work }));
-    expect(e.message).toMatch(/can't read the repo folder/);
+    expect(e.message).toMatch(/can't read the repo folder .*: it doesn't exist\./);
     expect(await exists(join(outside, 'r.md'))).toBe(false);
   });
 });
