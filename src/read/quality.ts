@@ -54,6 +54,8 @@ export interface QualityRun {
   locks: Map<string, LockState>;
   present: Map<string, 'file' | 'link' | 'other' | null>;
   parsed: Map<string, Obj | null>;
+  /** INI section names (setup.cfg, tox.ini), read once per run: a root file is shared by every Python service. */
+  ini: Map<string, string[]>;
   lockBudget: number;
   goTestFiles: number;
 }
@@ -61,7 +63,7 @@ export interface QualityRun {
 export function newQualityRun(root: string, files: readonly string[], serviceDirs: readonly string[], workspaceDirs: Iterable<string> = []): QualityRun {
   return {
     root, files, fileSet: new Set(files), serviceDirs, workspaceDirs: new Set(workspaceDirs),
-    locks: new Map(), present: new Map(), parsed: new Map(), lockBudget: LOCKFILE_RUN_BUDGET_BYTES, goTestFiles: MAX_GO_TEST_FILES,
+    locks: new Map(), present: new Map(), parsed: new Map(), ini: new Map(), lockBudget: LOCKFILE_RUN_BUDGET_BYTES, goTestFiles: MAX_GO_TEST_FILES,
   };
 }
 
@@ -427,8 +429,12 @@ const CONFIG_RULES: readonly ConfigRule[] = [
 /** Section names of an INI file (setup.cfg, tox.ini), line by line. */
 async function iniSections(run: QualityRun, rel: string, notes: string[]): Promise<string[]> {
   if (!run.fileSet.has(rel)) return [];
+  const cached = run.ini.get(rel);
+  if (cached !== undefined) return cached;
   const text = await readRel(run, rel, notes);
-  return text === null ? [] : regexLines(text).flatMap((l) => /^\s*\[([^\]]{1,200})\]\s*$/.exec(l)?.[1]?.trim() ?? []);
+  const sections = text === null ? [] : regexLines(text).flatMap((l) => /^\s*\[([^\]]{1,200})\]\s*$/.exec(l)?.[1]?.trim() ?? []);
+  run.ini.set(rel, sections);
+  return sections;
 }
 
 async function configsOf(run: QualityRun, s: Pick<Service, 'path' | 'language'>, notes: string[]): Promise<QualityConfig[]> {

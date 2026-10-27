@@ -5,7 +5,7 @@ import { join, resolve } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import * as limits from '../src/read/limits.js';
 import { readProject } from '../src/read/project.js';
-import { emptyRepoFiles, emptyServiceQuality, lockfileVersions, QUALITY_PACKAGES, readRepoFiles, readServiceQuality } from '../src/read/quality.js';
+import { emptyRepoFiles, emptyServiceQuality, lockfileVersions, newQualityRun, QUALITY_PACKAGES, readRepoFiles, readServiceQuality } from '../src/read/quality.js';
 import type { Service } from '../src/types.js';
 import { hostileNames } from './fixtures/hostile-names.js';
 import { cleanupRepos, makeRepo, makeTempDir, writeIn } from './helpers/make-repo.js';
@@ -14,7 +14,7 @@ import { fake } from './helpers/secret-repo.js';
 // Wrap the bounded line reader so a test can count how often each lockfile is read (PS4: once per run).
 vi.mock('../src/read/limits.js', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../src/read/limits.js')>();
-  return { ...actual, readLinesLimited: vi.fn(actual.readLinesLimited) };
+  return { ...actual, readLinesLimited: vi.fn(actual.readLinesLimited), readTextLimitedWithReason: vi.fn(actual.readTextLimitedWithReason) };
 });
 
 const GH = 'https://github.com/o/r.git';
@@ -161,6 +161,21 @@ describe('quality: configs and frameworks', () => {
     expect(await kind({ 'package.json': pkg({ eslintConfig: { root: true } }) })).toBe('eslintrc');
     expect(await kind({ 'eslint.config.js': 'export default [];\n', '.eslintrc.yml': 'root: true\n' })).toBe('both');
     expect(await kind({})).toBe('none');
+  });
+
+  it('quality (T1 review I1): a root setup.cfg/tox.ini is read once per run, not once per Python service', async () => {
+    const files: Record<string, string> = { 'setup.cfg': '[mypy]\nstrict = true\n', 'tox.ini': '[tox]\nenv_list = py\n' };
+    for (let i = 0; i < 30; i++) files[`svc${i}/pyproject.toml`] = `[project]\nname = "svc${i}"\n`;
+    const dir = repo(files);
+    const dirs = Array.from({ length: 30 }, (_, i) => `svc${i}`);
+    const run = newQualityRun(dir, Object.keys(files), dirs);
+    vi.mocked(limits.readTextLimitedWithReason).mockClear();
+    const out = [];
+    for (const d of dirs) out.push(await readServiceQuality(dir, pySvc(d), [], run));
+    const reads = vi.mocked(limits.readTextLimitedWithReason).mock.calls.map((c) => String(c[0]));
+    expect(reads.filter((f) => f.endsWith('setup.cfg'))).toHaveLength(1);
+    expect(reads.filter((f) => f.endsWith('tox.ini'))).toHaveLength(1);
+    expect(out.every((q) => q.configs.includes('mypy'))).toBe(true);
   });
 
   it('quality: tool configs found in the service or a folder above it, per language; tsconfig in the service only', async () => {
