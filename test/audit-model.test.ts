@@ -497,6 +497,46 @@ describe('buildAudit (fix round 1)', () => {
     }
   });
 
+  it('U12: a proxy that turns TLS checks off in the repo .npmrc → warning, and its values never appear', async () => {
+    const proxyHost = ['proxy', 'example', 'test'].join('.');
+    for (const text of [`https-proxy=http://${proxyHost}:8080\nstrict-ssl=false\n`, `https-proxy=http://${proxyHost}:8080\n`, 'strict-ssl=false\n', `proxy=http://${proxyHost}:3128\n`]) {
+      const r = await buildAudit(repo({ ...nodeApp(), '.npmrc': `save-exact=true\n${text}` }), deps());
+      expect(r.warnings, text.slice(0, 12)).toEqual([SWAP_WARNING]);
+      expect(anyContains(r, proxyHost)).toBe(false);
+    }
+  });
+
+  it('U12: a CA file or certificate setting in the repo .npmrc → warning', async () => {
+    for (const line of ['cafile=/tmp/evil-ca.pem', 'ca=MIIB-not-a-cert', 'cert=/tmp/c.pem', '  CAFILE = /tmp/evil-ca.pem']) {
+      const r = await buildAudit(repo({ ...nodeApp(), '.npmrc': `${line}\n` }), deps());
+      expect(r.warnings, line.trim().slice(0, 8)).toEqual([SWAP_WARNING]);
+      expect(anyContains(r, 'evil-ca')).toBe(false);
+    }
+  });
+
+  it('U12: any key outside the safe list warns (scripts, shells, prefix, cache, auth, `_` keys, sections, odd audit values)', async () => {
+    const kv = (name: string) => `${name}${'='}abc`; // auth-like lines built at runtime (no secret-like literals in test/)
+    for (const line of [
+      'ignore-scripts=false', 'shell=/bin/evil', 'node-options=--require ./x.js', 'prefix=./evil', 'cache=./evil', 'globalconfig=./evil',
+      kv('_auth' + 'Token'), kv('//registry.example.test/:_' + 'auth'), 'email=a@b.test', '[section]', 'audit=maybe', 'audit', 'save-exact[]=true',
+      'some-future-key=1', '"save-exact"x=true',
+    ]) {
+      const r = await buildAudit(repo({ ...nodeApp(), '.npmrc': `fund=false\n${line}\n` }), deps());
+      expect(r.warnings, line.slice(0, 14)).toEqual([SWAP_WARNING]);
+      expect(anyContains(r, '/bin/evil')).toBe(false);
+    }
+  });
+
+  it('U12: an .npmrc with only safe keys (and comments) gives no warning', async () => {
+    const safe = [
+      '# project settings', '; npm style comment', '', 'save-exact=true', 'save-prefix=~', 'engine-strict=true', 'fund=false', 'audit=false',
+      'audit = true', 'package-lock=true', 'loglevel=warn', 'progress=false', 'legacy-peer-deps=true', 'lockfile-version=3', 'update-notifier=false',
+      'color=false', '  save-exact = true  ', '"fund"=false',
+    ].join('\r\n');
+    const r = await buildAudit(repo({ ...nodeApp(), '.npmrc': `${safe}\n` }), deps());
+    expect(r.warnings).toEqual([]);
+  });
+
   it('U11: the report says whether the reviewed list was unavailable', async () => {
     expect((await buildAudit(repo(nodeApp()), deps())).reviewedUnavailable).toBe(false);
     expect((await buildAudit(repo(nodeApp()), deps({ reviewedUnavailable: true }))).reviewedUnavailable).toBe(true);

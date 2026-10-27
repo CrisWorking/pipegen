@@ -6,7 +6,7 @@ import { GitHubRateLimitError, newRateBudget } from '../src/engine/github-rate.j
 import { MAX_DISCOVERY_NEEDS } from '../src/engine/discovery-limits.js';
 import { floorNeeds, jobCategories, jobCounts } from '../src/engine/needs.js';
 import {
-  activity30d, estimate, estimateAuditAi, HARNESS_MINUTES_PER_VARIANT, jobMinutes, loadAiPrices, loadGitHubPlans,
+  activity30d, auditCallHighUsd, estimate, estimateAuditAi, HARNESS_MINUTES_PER_VARIANT, jobMinutes, loadAiPrices, loadGitHubPlans, usageCostUsd,
   type Activity, type JobCategories,
 } from '../src/estimate/estimate.js';
 import { DEFAULT_MODEL, type Capabilities, type ExistingWorkflow, type RepoProfile, type Service } from '../src/types.js';
@@ -298,6 +298,23 @@ describe('estimate: basis', () => {
 });
 
 describe('estimateAuditAi (ruling B2)', () => {
+  it('usageCostUsd and auditCallHighUsd: the same price table as the estimate; cache tokens never priced low; local is free', () => {
+    // opus 5.5: $4 / $20 per million (data/ai-prices.yml)
+    const used = (i: number, o: number, cr = 0, cw = 0) => Object.fromEntries([['input' + 'Tokens', i], ['output' + 'Tokens', o], ['cacheRead' + 'Tokens', cr], ['cacheWrite' + 'Tokens', cw]]) as never;
+    expect(usageCostUsd(OPUS, used(1_000_000, 0))).toBeCloseTo(4, 10);
+    expect(usageCostUsd(OPUS, used(0, 1_000_000))).toBeCloseTo(20, 10);
+    expect(usageCostUsd(OPUS, used(0, 0, 1_000_000, 0))).toBeCloseTo(4, 10); // a cache read at the full input price
+    expect(usageCostUsd(OPUS, used(0, 0, 0, 1_000_000))).toBeCloseTo(5, 10); // a cache write at 1.25×
+    expect(usageCostUsd({ name: 'claude', model: 'claude-future-9' }, used(1_000_000, 0))).toBeCloseTo(10, 10); // the provider's top price
+    expect(usageCostUsd({ name: 'ollama', model: 'm' }, used(1_000_000, 1_000_000))).toBe('local');
+    // one more call, at the high end of estimateAuditAi's per-call size
+    const one = estimateAuditAi(OPUS, 1).costUsd as { high: number };
+    const none = estimateAuditAi(OPUS, 0).costUsd as { high: number };
+    expect(auditCallHighUsd(OPUS, 'candidates')).toBeCloseTo(one.high - none.high, 10);
+    expect(auditCallHighUsd(OPUS, 'needs')).toBeCloseTo(none.high, 10);
+    expect(auditCallHighUsd({ name: 'ollama', model: 'm' }, 'candidates')).toBe('local');
+  });
+
   it('estimateAuditAi: basis says the calls, the range and the model in plain English', () => {
     const text = estimateAuditAi(OPUS, 5).basis.join('\n');
     expect(text).toMatch(/1 needs call/);

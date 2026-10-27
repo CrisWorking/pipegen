@@ -7,7 +7,8 @@
 // - The setup estimate also counts the proof harness (Plan E Task 2) and the compat copies of the repo's own
 //   workflow jobs, per proof variant.
 // - AI input and output tokens are priced separately with data/ai-prices.yml, for the chosen provider and model.
-// - estimateAuditAi (Plan U ruling B2) prices `audit --ai` alone: one needs call plus the discovery calls.
+// - estimateAuditAi (Plan U ruling B2) prices `audit --ai` alone: one needs call plus the discovery calls. usageCostUsd and
+//   auditCallHighUsd price what was used and the next call with the same table, for the audit's cost cap.
 // - activity30d reads the last 30 days of pushes and pull requests through the caller's Octokit and rate budget.
 import { readFileSync } from 'node:fs';
 import type { Octokit } from '@octokit/rest';
@@ -15,7 +16,7 @@ import { parse } from 'yaml';
 import { z } from 'zod';
 import { MAX_DISCOVERY_NEEDS } from '../engine/discovery-limits.js';
 import { withRateLimit, type RateClock } from '../engine/github-rate.js';
-import { DEFAULT_MODEL, type Layer, type Plan, type RepoProfile } from '../types.js';
+import { DEFAULT_MODEL, type AiUsage, type Layer, type Plan, type RepoProfile } from '../types.js';
 import { hostPlace } from '../util/local-host.js';
 import { packageDataPath } from '../util/package-data.js';
 import { safeText } from '../util/safe-text.js';
@@ -367,6 +368,35 @@ export function estimateAuditAi(provider: AiProviderChoice, needCount: number): 
   if (pr.local) return { tokens, costUsd: 'local', capUsd: null, basis: [...basis, noCostLine(provider)], pricedFor: pricedFor(provider) };
   const c = cost(tokens, pr);
   return { tokens, costUsd: c, capUsd: CAP_FACTOR * c.high, basis: [...basis, `Priced with the model ${pr.model}.`, ...pr.notes], pricedFor: pricedFor(provider) };
+}
+
+/**
+ * Cache tokens have no price in data/ai-prices.yml. So that the cost meter never reads low, a cache read is priced as a
+ * full input token (Anthropic bills 0.1×, OpenAI 0.5× and already counts it in its input tokens), and a cache write at
+ * 1.25× an input token (Anthropic's price for the 5-minute cache that pipegen's Claude requests use).
+ */
+const CACHE_WRITE_FACTOR = 1.25;
+
+/**
+ * What tokens already used cost (USD), priced with estimate()'s price list for this provider and model (an unknown
+ * model at its provider's most expensive price); 'local' for a local model. For `audit --ai`'s cost cap (ruling B2).
+ */
+export function usageCostUsd(provider: AiProviderChoice, usage: AiUsage): number | 'local' {
+  const pr = priceFor(provider);
+  if (pr.local) return 'local';
+  const input = count(usage.inputTokens) + count(usage.cacheReadTokens ?? 0) + CACHE_WRITE_FACTOR * count(usage.cacheWriteTokens ?? 0);
+  return (input / 1e6) * pr.input + (count(usage.outputTokens) / 1e6) * pr.output;
+}
+
+/**
+ * The high end (USD) of one more `audit --ai` call, the size estimateAuditAi counts it at: the needs call, or one
+ * discovery (candidates) call. 'local' for a local model. addAiSuggestions makes no discovery call when this, added to
+ * what was already spent, could pass the cap.
+ */
+export function auditCallHighUsd(provider: AiProviderChoice, call: 'needs' | 'candidates'): number | 'local' {
+  const pr = priceFor(provider);
+  if (pr.local) return 'local';
+  return cost(call === 'needs' ? (STAGE_TOKENS[0] as { input: number; output: number }) : CANDIDATE_CALL, pr).high;
 }
 
 // ---------- activity30d ----------

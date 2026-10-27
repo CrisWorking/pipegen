@@ -15,27 +15,37 @@
 // - secretsInTree: a local scan of the files on disk (no git, no child process, symlinks never followed), rule names
 //   and file names only, never a value (S10).
 // - aiBundle: what the full run would send to the AI, counted from bundleCode without gitleaks (counting only).
-// - warnings: a repo `.npmrc` that sets a registry or a local node_modules/.bin/pipegen could change which pipegen
-//   runs (the `.npmrc` is read for that one fact; no value is kept); anonymous access.
+// - warnings: a repo `.npmrc` with any key outside a small safe list (U12) or a local node_modules/.bin/pipegen could
+//   change which pipegen runs (the `.npmrc` is read for that one fact; no value is kept); anonymous access.
+// - ai (Task 2b, addAiSuggestions, `audit --ai` after consent): the needs the AI adds and MENTION-ONLY tool suggestions,
+//   from a gitleaks-checked bundle, with the run's AI usage and cost cap (rulings B2, B3, B4, S11, S16-S19, U11).
 //
 // Output rule (src/types.ts): repo-derived strings are kept RAW (validated by the readers) and cleaned only where
 // Task 3 prints them. Nothing here escapes a value, and no file content or secret value is ever stored.
 import { lstat } from 'node:fs/promises';
 import { join } from 'node:path';
 import type { Octokit } from '@octokit/rest';
-import { bundleCode, COUNTING_ONLY_NOTE, EXCLUDED_PATTERNS, findSecretLike, isExcludedPath, redact } from '../ai/redact.js';
-import { needLanguage } from '../engine/discover.js';
+import { count } from '../ai/errors.js';
+import { AiError, refusalFallbackNoteFor, type AiErrorKind } from '../ai/provider.js';
+import {
+  bundleCode, COUNTING_ONLY_NOTE, EXCLUDED_PATTERNS, findSecretLike, GitleaksError, isExcludedPath, redact, scrubKnownValues, type CodeBundle,
+} from '../ai/redact.js';
+import { needLanguage, suggestTools } from '../engine/discover.js';
 import type { RateBudget } from '../engine/github-rate.js';
-import { floorNeeds, isRunnable, jobCategories } from '../engine/needs.js';
+import { ensurePinnedBinary, PinnedBinaryError } from '../engine/linters.js';
+import type { MemoryStore } from '../engine/memory.js';
+import { floorNeeds, isRunnable, jobCategories, planNeeds, type NeedsPlan } from '../engine/needs.js';
+import type { QualityBar } from '../engine/quality-bar.js';
 import { projectScriptFor, reviewedFor, type ProjectScriptStep } from '../engine/reviewed.js';
-import { activity30d, estimate, type Activity, type Estimates } from '../estimate/estimate.js';
+import { activity30d, auditCallHighUsd, estimate, usageCostUsd, type Activity, type Estimates } from '../estimate/estimate.js';
 import { signingMode } from '../github/signing-mode.js';
 import { IGNORED_DIRS, listFiles, READ_LIMITS, readTextLimited, readTextLimitedWithReason } from '../read/limits.js';
 import { readProject } from '../read/project.js';
 import { supportLevel } from '../read/support.js';
 import { skippedWorkflowCount } from '../read/workflows.js';
 import {
-  DEFAULT_MODEL, type Capabilities, type Need, type Part, type PipelineDraft, type RepoProfile, type ReviewedTool, type Service,
+  DEFAULT_MODEL, type AiProvider, type AiRequest, type AiUsage, type Capabilities, type Need, type Part, type PipelineDraft, type RepoProfile,
+  type ReviewedTool, type Service,
 } from '../types.js';
 import { packageVersion } from '../util/package-data.js';
 import { safeText } from '../util/safe-text.js';
@@ -85,8 +95,23 @@ export interface AuditReport {
   notes: string[];
   /** Ruling U11: the caller couldn't use the reviewed list (B3). Task 2b drops every discovery suggestion when true. */
   reviewedUnavailable: boolean;
-  /** Only with --ai, after consent (Task 2b); mention-only. */
-  ai?: { extraNeeds: Need[]; suggestions: PipelineDraft['suggestions']; notes: string[] };
+  /** Only with --ai, after consent (Task 2b, addAiSuggestions); mention-only. */
+  ai?: AuditAi;
+}
+
+/**
+ * What `audit --ai` adds (ruling S11). Every string is kept raw (no escaping): Task 3 cleans it at output (ruling U10).
+ * Known values (the token, the AI key) are scrubbed from it all the same (ruling S19).
+ */
+export interface AuditAi {
+  /** Needs the AI adds on top of the floor ("the AI also suggests checking …"). Floor needs are never changed. */
+  extraNeeds: Need[];
+  /** MENTION-ONLY tools ({ name, repo, why }): never run, never turned into a step. */
+  suggestions: PipelineDraft['suggestions'];
+  /** Planner, discovery and AI-step notes; deduped. */
+  notes: string[];
+  /** Every AI call of this step, summed (the needs call and every discovery call, failed ones included; ruling B2). */
+  usage: Required<AiUsage>;
 }
 
 export interface AuditDeps {
@@ -150,13 +175,18 @@ const UNTRACKED_NOTE = "pipegen reads the files on disk without git, so files th
 
 const NO_TOKEN = 'No token: public data only, rate-limited.';
 /**
- * `.npmrc` keys that change which package npx runs or how it starts it (any scope: `@acme:registry`): the registry,
- * node's options, and the shell `npm exec` uses.
+ * Ruling U12: the `.npmrc` keys that can't change which pipegen npx fetches or how it starts it (npm's config docs):
+ * saving, lockfile, engine and output settings. Any other key warns: registries (any scope), proxies, TLS (`strict-ssl`,
+ * `ca`, `cafile`, `cert`), scripts and shells, `node-options`, `prefix`, `cache`, auth, `_`-prefixed and per-registry
+ * (`//host/:…`) keys, sections, and every key npm adds later. `audit` is safe only as `audit=true` or `audit=false`.
  */
-const NPMRC_KEY_RE = /^["']?(?:@[^\s:="']*:)?(?:registry|node-options|script-shell)["']?\s*=/i;
+const NPMRC_SAFE_KEYS: ReadonlySet<string> = new Set([
+  'save-exact', 'save-prefix', 'engine-strict', 'fund', 'package-lock', 'loglevel', 'progress', 'legacy-peer-deps', 'lockfile-version',
+  'update-notifier', 'color',
+]);
 /**
- * Only the start of a line (after its leading whitespace, which npm's ini parser trims too) is matched, so a huge line
- * can't stall the pattern and padding can't push the key out of view.
+ * Only the start of a line (after its leading whitespace, which npm's ini parser trims too) is read for the key, so a
+ * huge line can't stall the check and padding can't push the key out of view (a key that doesn't fit counts as unsafe).
  */
 const NPMRC_KEY_WINDOW = 300;
 
@@ -383,15 +413,16 @@ async function scanTree(dir: string, notes: Notes): Promise<SecretInTree[]> {
 // ---------- how pipegen was started ----------
 
 /**
- * Ruling S30 / Review Focus 9: a repo `.npmrc` with a registry, node-options or script-shell line, or a local
+ * Ruling S30 / Review Focus 9 / U12: a repo `.npmrc` with any key outside NPMRC_SAFE_KEYS, or a local
  * node_modules/.bin/pipegen, could change which pipegen runs when started from inside the repo. The `.npmrc` is read
- * only for that yes/no (no value is kept); one that can't be read safely (a symbolic link, too large) counts as yes.
+ * only for that yes/no (key names, and the value of `audit` compared with true/false; no value is kept); one that
+ * can't be read safely (a symbolic link, too large) counts as yes.
  * node_modules/.bin/pipegen is an existence check with lstat: the last part is never followed (a dangling link
  * counts), while a symlinked node_modules or .bin folder on the way is followed, as npx would follow it too.
  */
 async function warningsOf(dir: string, anonymous: boolean): Promise<string[]> {
   const out: string[] = [];
-  if (await npmrcSetsRegistry(dir) || (await lstat(join(dir, 'node_modules', '.bin', 'pipegen')).catch(() => null)) !== null) {
+  if (await npmrcHasUnsafeKey(dir) || (await lstat(join(dir, 'node_modules', '.bin', 'pipegen')).catch(() => null)) !== null) {
     const v = packageVersion();
     const pkg = v === null ? 'pipegen' : `pipegen@${v}`;
     out.push(`This repo could change which pipegen runs. Run it from outside the repo: \`npx --registry=https://registry.npmjs.org ${pkg} audit --dir ./repo\`.`);
@@ -400,12 +431,225 @@ async function warningsOf(dir: string, anonymous: boolean): Promise<string[]> {
   return out;
 }
 
-async function npmrcSetsRegistry(dir: string): Promise<boolean> {
+async function npmrcHasUnsafeKey(dir: string): Promise<boolean> {
   const path = join(dir, '.npmrc');
   const info = await lstat(path).catch(() => null);
   if (info === null) return false;
   if (info.isSymbolicLink() || !info.isFile()) return true; // npm would follow it; pipegen won't, so it can't say no
   const text = await readTextLimited(path);
   if (text === null) return true;
-  return text.split(/\r\n|\r|\n/).some((line) => NPMRC_KEY_RE.test(line.trimStart().slice(0, NPMRC_KEY_WINDOW)));
+  return text.split(/\r\n|\r|\n/).some((line) => !npmrcLineIsSafe(line));
+}
+
+/**
+ * One `.npmrc` line: blank, a comment (`#` or `;`), or `key = value` with a key on the safe list (quotes around the
+ * key allowed, any letter case). A bare key (npm reads it as `key=true`), a section header or anything else is unsafe.
+ */
+function npmrcLineIsSafe(raw: string): boolean {
+  const line = raw.trimStart();
+  if (line === '' || line.startsWith('#') || line.startsWith(';')) return true;
+  const eq = line.slice(0, NPMRC_KEY_WINDOW).indexOf('=');
+  if (eq < 0) return false;
+  const written = line.slice(0, eq).trim();
+  const key = (/^(["'])(.*)\1$/.exec(written)?.[2] ?? written).toLowerCase();
+  if (key === 'audit') return /^(?:true|false)$/.test(line.slice(eq + 1, eq + 1 + NPMRC_KEY_WINDOW).trim());
+  return NPMRC_SAFE_KEYS.has(key);
+}
+
+// ---------- addAiSuggestions (`audit --ai`, Task 2b) ----------
+
+export interface AiSuggestDeps {
+  ai: AiProvider; gh: Octokit; memory: MemoryStore; fetch: typeof fetch;
+  /** The FULL reviewed list (discovery's look-alike check uses all of it); [] when the caller couldn't load it (B3). */
+  reviewed: ReviewedTool[];
+  /** loadQualityBar(), loaded once per run by the CLI. */
+  bar: QualityBar;
+  /** The run's one newRateBudget(), shared with every GitHub call (ruling S18). */
+  budget: RateBudget;
+  now: () => number;
+  sleep?: (ms: number) => Promise<void>;
+  /** The GitHub token (when set) and the AI key in use: never sent to the AI, never in the report (ruling S19). */
+  knownValues: string[];
+  /** Where the checked gitleaks binary is; default ensurePinnedBinary('gitleaks'). Called right before the bundle is built. */
+  ensureGitleaks?: () => Promise<string>;
+  /** No GitHub token: the search may stop early (ruling S17). */
+  anonymous: boolean;
+  /** estimateAuditAi(provider, needCount).capUsd: the AI cost cap of this step; null for a local model (no cap; ruling B2). */
+  capUsd: number | null;
+}
+
+const AI_NOTE = {
+  onlyActionsNpm: "In this version only GitHub Actions and npm packages can become suggestions (other tools can't be checked for known vulnerabilities yet).",
+  // Ruling S17's text reworded: "No token: …" would be cut by redact() at output (notes are never "<secret-like word>: …").
+  anonymous: 'Without a GitHub token, GitHub allows 60 requests an hour, so tool suggestions may stop early. Set GITHUB_TOKEN (read-only) for a full search.',
+  lookAlike: "pipegen's reviewed tool list isn't usable in this build, so it couldn't check suggested tools for look-alike names; it shows no tool suggestions.",
+  noGitleaks: (why: string) => `The AI step was skipped and nothing was sent to the AI: the required gitleaks check couldn't run. ${why}`,
+  stopped: (why: string) => `The AI step stopped: ${why}.`,
+  searchStopped: (why: string) => `The tool search stopped: ${why}.`,
+  fallbackTried: "Claude's refusal fallback had already run the request again on another Claude model, and it was declined there too.",
+  capSkip: (cap: number) => `pipegen skipped the tool search: one more AI call could pass this run's AI cost cap (${usd(cap)}).`,
+  capStop: (cap: number) => `pipegen stopped asking the AI for tool suggestions: one more call could pass this run's AI cost cap (${usd(cap)}). The search went on without the AI.`,
+} as const;
+/** Ruling S16: what each AI failure means, in plain words (pipegen's own text, never the provider's). */
+const AI_KIND_TEXT: Readonly<Record<AiErrorKind, string>> = {
+  timeout: "the AI didn't answer in time",
+  invalid: "the AI's answer didn't match the expected format",
+  http: 'the AI provider refused the request (check the key, the quota and the model name)',
+  missing: 'no AI provider is set up',
+  refusal: 'the AI declined the request',
+  truncated: "the AI's answer was cut off",
+};
+/** The message of the AiError the cost meter raises; discovery then asks the AI nothing more (an http-kind stop). */
+const CAP_MESSAGE = "one more AI call could pass this run's AI cost cap";
+const usd = (n: number) => `$${n.toFixed(2)}`;
+
+/** Need identity (layer, id, service), as the needs planner keys it. */
+const needKey = (n: Pick<Need, 'layer' | 'id' | 'service'>) => `${n.layer}\u0000${n.id}\u0000${n.service ?? ''}`;
+
+/**
+ * The provider every AI call of this step goes through: it prices each answered attempt (failed ones too) with the
+ * estimate's price list, and refuses a discovery call when its estimated high end could take the spend past the cap
+ * (AiError 'http', which makes discovery stop asking the AI and go on with search results). The needs call is never
+ * refused: the cap is sized for it (ruling B2).
+ */
+class CostMeter {
+  spentUsd = 0;
+  capHit = false;
+  /** What planNeeds and suggestTools are given: the same name and model, every call metered (no other field is copied). */
+  readonly provider: AiProvider;
+  readonly #inner: AiProvider;
+  constructor(inner: AiProvider, readonly capUsd: number | null) {
+    this.#inner = inner;
+    this.provider = { name: inner.name, model: inner.model, complete: (req) => this.#complete(req) };
+  }
+  /** True when one more discovery call could take the spend past the cap. */
+  nextCallCouldPassCap(): boolean {
+    if (this.capUsd === null) return false;
+    const next = auditCallHighUsd(this.#inner, 'candidates');
+    return next !== 'local' && this.spentUsd + next > this.capUsd;
+  }
+  async #complete(req: AiRequest): Promise<{ data: unknown; usage: AiUsage }> {
+    if (req.schemaName !== 'needs' && this.nextCallCouldPassCap()) {
+      this.capHit = true;
+      throw new AiError('http', CAP_MESSAGE);
+    }
+    try {
+      const r = await this.#inner.complete(req);
+      this.#add(r.usage);
+      return r;
+    } catch (e) {
+      if (e instanceof AiError && e.usage !== undefined) this.#add(e.usage);
+      throw e;
+    }
+  }
+  #add(u: AiUsage): void {
+    const c = usageCostUsd(this.#inner, u);
+    if (c !== 'local') this.spentUsd += c;
+  }
+}
+
+/** The service's own test/lint script would run for this need (S27: a service without tests has none for tests). */
+function hasProjectScript(need: Need, p: RepoProfile): boolean {
+  const service = need.service === undefined ? undefined : p.services.find((s) => s.name === need.service);
+  if (service === undefined) return false;
+  if ((need.category === 'unit-tests' || need.category === 'full-tests') && !service.hasTests) return false;
+  return projectScriptFor(need, service) !== null;
+}
+
+/**
+ * `audit --ai`, after consent: the needs the AI adds and mention-only tool suggestions, in `ai` of a copy of `r`
+ * (the rest of the report is unchanged).
+ * 1. gitleaks is made ready right before the bundle is built with it (the path stays a local variable). No binary, or
+ *    a gitleaks failure: no AI call, a note.
+ * 2. planNeeds(…, writers 0, knownValues): the needs it adds become `extraNeeds`; floor needs are never changed.
+ * 3. suggestTools for every floor need that isn't covered, and every added need, that has no project script (it skips
+ *    needs a reviewed tool covers). Skipped when the reviewed list is unavailable (look-alike checks need it; B3/U11)
+ *    or when one more discovery call could pass the cost cap (B2).
+ * An AiError never escapes (S16): it becomes a note, and its billed usage still counts. Other errors are thrown.
+ */
+export async function addAiSuggestions(r: AuditReport, dir: string, deps: AiSuggestDeps): Promise<AuditReport> {
+  const notes = new Set<string>();
+  const usage: Required<AiUsage> = { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0 };
+  const addUsage = (u: AiUsage | undefined) => {
+    if (u === undefined) return;
+    usage.inputTokens += count(u.inputTokens);
+    usage.outputTokens += count(u.outputTokens);
+    usage.cacheReadTokens += count(u.cacheReadTokens);
+    usage.cacheWriteTokens += count(u.cacheWriteTokens);
+  };
+  let extraNeeds: Need[] = [];
+  let suggestions: PipelineDraft['suggestions'] = [];
+  const known = deps.knownValues.filter((v) => typeof v === 'string' && v.trim() !== '');
+  const scrub = (t: string) => (known.length > 0 ? scrubKnownValues(t, known) : t);
+  const done = (): AuditReport => {
+    if (deps.anonymous) notes.add(AI_NOTE.anonymous);
+    notes.add(AI_NOTE.onlyActionsNpm);
+    return {
+      ...r,
+      ai: {
+        extraNeeds: extraNeeds.map((n) => ({ ...n, why: scrub(n.why) })),
+        // fail closed: no suggestion without the full reviewed list (B3/U11)
+        suggestions: r.reviewedUnavailable ? [] : suggestions.map((x) => ({ name: scrub(x.name), repo: scrub(x.repo), why: scrub(x.why) })),
+        notes: [...new Set([...notes].map(scrub))],
+        usage,
+      },
+    };
+  };
+
+  // 1. The gitleaks-checked bundle: the binary is made ready right before it runs, and its path is never kept.
+  let bundle: CodeBundle;
+  try {
+    const bin = await (deps.ensureGitleaks ?? (() => ensurePinnedBinary('gitleaks')))();
+    bundle = await bundleCode(dir, { gitleaks: bin, knownValues: deps.knownValues });
+  } catch (e) {
+    if (!(e instanceof PinnedBinaryError || e instanceof GitleaksError)) throw e;
+    notes.add(AI_NOTE.noGitleaks(e.message));
+    return done();
+  }
+  const reportNotes = new Set(r.notes);
+  for (const n of bundle.notes) if (!reportNotes.has(redact(n))) notes.add(n);
+
+  // 2. The needs the AI adds.
+  const meter = new CostMeter(deps.ai, deps.capUsd);
+  let plan: NeedsPlan;
+  try {
+    plan = await planNeeds(r.profile, r.capabilities, bundle, meter.provider, 0, { knownValues: deps.knownValues });
+  } catch (e) {
+    if (!(e instanceof AiError)) throw e;
+    addUsage(e.usage);
+    notes.add(AI_NOTE.stopped(AI_KIND_TEXT[e.kind]));
+    if (e.kind === 'refusal' && refusalFallbackNoteFor(deps.ai) !== null) notes.add(AI_NOTE.fallbackTried);
+    return done();
+  }
+  addUsage(plan.usage);
+  for (const n of plan.notes) notes.add(n);
+  const floor = new Set(floorNeeds(r.profile, r.capabilities).map(needKey));
+  extraNeeds = plan.needs.filter((n) => !floor.has(needKey(n)));
+
+  // 3. Mention-only tool suggestions.
+  if (r.reviewedUnavailable) {
+    notes.add(AI_NOTE.lookAlike);
+    return done();
+  }
+  // Extra needs have no coverage row: they count as not covered.
+  const search = [...r.coverage.filter((c) => c.status !== 'covered').map((c) => c.need), ...extraNeeds].filter((n) => !hasProjectScript(n, r.profile));
+  if (search.length === 0) return done();
+  if (meter.nextCallCouldPassCap()) {
+    notes.add(AI_NOTE.capSkip(deps.capUsd as number));
+    return done();
+  }
+  const found: string[] = [];
+  try {
+    suggestions = await suggestTools(search, r.profile, {
+      ai: meter.provider, gh: deps.gh, memory: deps.memory, fetch: deps.fetch, reviewed: deps.reviewed, mode: 'audit', bar: deps.bar,
+      budget: deps.budget, now: deps.now, ...(deps.sleep === undefined ? {} : { sleep: deps.sleep }), notes: found, onUsage: addUsage,
+    });
+  } catch (e) {
+    if (!(e instanceof AiError)) throw e;
+    addUsage(e.usage);
+    notes.add(AI_NOTE.searchStopped(AI_KIND_TEXT[e.kind]));
+  }
+  for (const n of found) notes.add(n);
+  if (meter.capHit) notes.add(AI_NOTE.capStop(deps.capUsd as number));
+  return done();
 }
