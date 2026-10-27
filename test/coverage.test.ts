@@ -792,6 +792,67 @@ describe('mapCoverage (fix round 4)', () => {
   });
 });
 
+describe('mapCoverage (fix round 5)', () => {
+  const TOO_MANY = "There are too many services or workflow steps to check in full, so pipegen can't tell.";
+  const services = (n: number) => Array.from({ length: n }, (_, i) => svc(`apps/s${i}`));
+  /** A tool run in its own subshell, so every hit keeps a concrete dir. */
+  const inDir = (d: string, cmd = 'semgrep ci') => `(cd ${d} && ${cmd})`;
+  /** One workflow file per `perFile` lines, each file one step. */
+  function cdWorkflows(dir: string, cmds: string[], perFile: number): void {
+    for (let f = 0; f * perFile < cmds.length; f++) {
+      const lines = cmds.slice(f * perFile, (f + 1) * perFile).map((c) => `          ${c}`).join('\n');
+      wf(dir, `w${f}.yml`, `${both}jobs:\n  j:\n    runs-on: x\n    steps:\n      - run: |\n${lines}\n`);
+    }
+  }
+  async function cdCoverage(cmds: string[], svcs: Service[], perFile = 20_000) {
+    const dir = makeTempDir();
+    cdWorkflows(dir, cmds, perFile);
+    const p = await profileOf(dir, { services: svcs, monorepo: 'npm-workspaces' });
+    expect(p.existingWorkflows).toHaveLength(Math.ceil(cmds.length / perFile)); // each file is under the 1 MB read limit
+    const t = performance.now();
+    const rows = await mapCoverage(p, floorNeeds(p, caps), dir);
+    return { rows, ms: performance.now() - t };
+  }
+
+  it('coverage: round 5: 2,000 services and 100,000 hits in 8,000 dirs finish in under 5 s', async () => {
+    const svcs = [...services(2000), svc('other/lonely')];
+    const cmds = Array.from({ length: 100_000 }, (_, k) => inDir(`apps/s${k % 2000}/d${Math.floor(k / 2000) % 4}`));
+    const { rows, ms } = await cdCoverage(cmds, svcs);
+    expect(ms).toBeLessThan(5000);
+    expect(row(rows, 'push', 'sast', 's0')).toMatchObject({ status: 'covered', by: 'semgrep', where: '.github/workflows/w0.yml (job j)' });
+    expect(row(rows, 'merge', 'sast', 's1999')).toMatchObject({ status: 'covered', by: 'semgrep' });
+    expect(row(rows, 'push', 'sast', 'lonely').status).toBe('missing'); // under the caps, a gap is still a gap
+  }, 60_000);
+
+  it('coverage: round 5: more step dirs than pipegen checks → unknown, never covered or missing', async () => {
+    const svcs = [svc('apps/a'), svc('apps/b')];
+    const filler = (n: number) => Array.from({ length: n }, (_, i) => inDir(`x/${i}`));
+    // at the cap, the run in apps/a still counts
+    const under = (await cdCoverage([...filler(9_999), inDir('apps/a')], svcs)).rows;
+    expect(row(under, 'push', 'sast', 'a').status).toBe('covered');
+    expect(row(under, 'push', 'sast', 'b').status).toBe('missing');
+    // one dir over: the run in apps/a is not checked, so neither service can be called covered or missing
+    const over = (await cdCoverage([...filler(10_000), inDir('apps/a')], svcs)).rows;
+    for (const s of ['a', 'b']) expect(row(over, 'push', 'sast', s)).toEqual(expect.objectContaining({ status: 'unknown', why: TOO_MANY }));
+    expect(over.some((r) => r.need.service !== undefined && r.status === 'missing' && r.need.layer !== 'pre-commit')).toBe(false);
+    // repo-wide rows don't depend on where a step ran: every run still counts for them
+    expect(row(over, 'push', 'secrets').status).toBe('missing');
+  }, 60_000);
+
+  it('coverage: round 5: more services than pipegen checks → unknown, never covered or missing', async () => {
+    // eslint runs in apps/s0 only; semgrep runs at the repo root
+    const run = (n: number) => cdCoverage([inDir('apps/s0', 'npx eslint .'), inDir('.')], services(n));
+    const under = (await run(5_000)).rows;
+    expect(row(under, 'push', 'lint', 's0').status).toBe('covered');
+    expect(row(under, 'push', 'lint', 's1').status).toBe('missing');
+    const { rows: over, ms } = await run(5_001);
+    expect(ms).toBeLessThan(5000);
+    for (const s of ['s0', 's1', 's5000']) expect(row(over, 'push', 'lint', s)).toEqual(expect.objectContaining({ status: 'unknown', why: TOO_MANY }));
+    // a run at the repo root covers every service whatever their number
+    for (const s of ['s0', 's1', 's5000']) expect(row(over, 'push', 'sast', s).status).toBe('covered');
+  }, 120_000);
+});
+
 describe('loadToolSignatures (S1)', () => {
   it('signatures: the bundled list loads and every entry names actions or commands', () => {
     const list = loadToolSignatures();

@@ -27,7 +27,9 @@
 //   A need that is not blocking (format-lint) only cares whether the tool runs.
 // - unknown: a remote reusable workflow, an action from the repo owner's own account (likely a composite action), a
 //   second-level local call, a local call pipegen refused or couldn't read, a listed workflow that couldn't be read
-//   again (or that readWorkflows skipped: opts.skippedWorkflows), or more workflow text than the budget.
+//   again (or that readWorkflows skipped: opts.skippedWorkflows), or more workflow text than the budget. A per-service
+//   row that would be missing is unknown when the repo has more services (MAX_SERVICES) or more distinct run dirs
+//   (MAX_HIT_DIRS) than pipegen matches; a cap only drops runs, so it never makes a row covered.
 // - missing: nothing matches. `gate` and `deploy-verify` are always missing: they are pipegen's own checks.
 // A tool counts only where a command starts: at the start, after ; && || | & ( $( { a newline, a shell keyword or a
 // wrapper (npx, sudo, env, time, command without -v, pnpm/yarn dlx, uv run, pipx run, python -m, sh/bash, …), as the
@@ -41,9 +43,10 @@
 // Hostile input: workflow, action and hook files are attacker-controlled. They are read only by path from the list
 // readProject made (p.existingWorkflows) plus local `uses: ./…` targets, every path level checked for symbolic links,
 // the real path checked to stay inside the repo, through the read limits (1 MB, binary refused, YAML alias cap), with
-// jobs, steps, files, findings and scanned bytes capped. Shell text is read by a hand-written, quote-aware tokenizer
-// (one pass, no regex) and one right-to-left pass; words over 4 KB are kept opaque. The few regexes left are linear and
-// run only on short values (lines or words of 4 KB or less).
+// jobs, steps, files, findings, scanned bytes, run dirs and services capped. Each need is answered from tables built in
+// one pass over the runs, so the cost grows with runs + needs + services, not with their product (review C1). Shell
+// text is read by a hand-written, quote-aware tokenizer (one pass, no regex) and one right-to-left pass; words over
+// 4 KB are kept opaque. The few regexes left are linear and run only on short values (lines or words of 4 KB or less).
 // Output follows the src/types.ts rule, RAW but VALIDATED, cleaned at output: `why` is pipegen's own text only
 // (including a signature's `partialWhy`, from pipegen's data file); `by` is a tool-signature id from
 // data/tool-signatures.yml, an own-script phrase built from fixed words (plus a script name matching OWN_NAME_RE), a
@@ -193,6 +196,10 @@ const MAX_HITS = 100_000;          // tool and opaque findings kept per mapCover
 const MAX_FLAG_WORDS = 64;         // words after a command read for its flags
 const MAX_INPUT_KEYS = 256;        // `with:` keys read per step; a step with more is partial
 const MAX_SPELLINGS = 8;           // spellings kept per input name (they differ only in case); more counts as soft
+const MAX_HIT_DIRS = 10_000;       // distinct dirs (besides the root) that runs are matched to services in; a run in a
+                                   // further dir counts only for repo-wide needs, and per-service rows can't be missing
+const MAX_SERVICES = 5_000;        // services matched against run dirs; with more, per-service needs count only runs at
+                                   // the root, and their rows can't be missing (review C1)
 
 // ---------- why (pipegen's own text only) ----------
 
@@ -229,6 +236,7 @@ const OPAQUE_WHY = {
   truncated: "The workflows are too large to read in full, so pipegen can't tell.",
   workflowsUnreadable: "Some workflow files couldn't be read, so pipegen can't tell.",
   hookUnreadable: "The git hook file couldn't be read (a symbolic link, too large or not valid), so pipegen can't tell.",
+  tooMany: "There are too many services or workflow steps to check in full, so pipegen can't tell.",
 } as const;
 
 const LAYER_DONE: Readonly<Record<Exclude<Layer, 'pre-commit'>, string>> = {
@@ -1556,25 +1564,178 @@ async function readHooks(ctx: Ctx): Promise<Hooks> {
   return none;
 }
 
-// ---------- per need ----------
+// ---------- which runs count for which need (ruling S26, review C1) ----------
+//
+// A run in `dir` counts for a service when the service owns `dir` (the longest service path at or above it, '.' always
+// at or above; on a tie the service listed first) or when the service sits below `dir` (a job run above several
+// services covers each). A run at the root counts for every need, and a run whose dir can't be known only for
+// repo-wide needs. The repo is hostile, so the work is linear, not needs × runs × services: each distinct dir is
+// matched against the services once, through trees of path segments; one pass over the runs keeps, per (dir,
+// category, layer), only the first run of each kind (the run the per-run loop used to pick, so `by` and `where` are
+// unchanged); each need then reads those first runs for the dirs that count for it.
 
 const normalPath = (s: string) => {
   const n = posix.normalize(s).replace(/\/+$/, '');
   return n === '' ? '.' : n;
 };
 
-/** Whether a tool that ran in `dir` counts for the need's service (ruling S26). */
-function appliesTo(dir: string | null, serviceName: string | undefined, services: Service[]): boolean {
-  if (serviceName === undefined || dir === '.') return true;
-  if (dir === null) return false;
-  const paths = services.map((s) => ({ name: s.name, path: normalPath(s.path) }));
-  const target = paths.find((s) => s.name === serviceName);
-  if (!target) return false;
-  const owner = paths
-    .filter((s) => s.path === '.' || dir === s.path || dir.startsWith(`${s.path}/`))
-    .sort((a, b) => b.path.length - a.path.length)[0];
-  if (owner?.name === serviceName) return true;
-  return target.path !== '.' && target.path.startsWith(`${dir}/`); // a job run above several services covers each
+const ALL = 0;  // every run, whatever its dir: what a repo-wide need reads
+const ROOT = 1; // '.'
+
+/** Distinct dirs that runs were found in, by id. Past MAX_HIT_DIRS a new dir gets no id (its runs count only in ALL). */
+class Dirs {
+  readonly names: string[] = ['', '.'];
+  private readonly ids = new Map<string, number>([['.', ROOT]]);
+  capped = false;
+  /** The dir's id, or -1: the dir can't be known (null) or is over the cap. */
+  idOf(dir: string | null): number {
+    if (dir === null) return -1;
+    const known = this.ids.get(dir);
+    if (known !== undefined) return known;
+    if (this.names.length - 2 >= MAX_HIT_DIRS) {
+      this.capped = true;
+      return -1;
+    }
+    this.ids.set(dir, this.names.length);
+    this.names.push(dir);
+    return this.names.length - 1;
+  }
+}
+
+// What a run is, for one layer: on the layer's trigger and nothing stops it blocking (FN), on the trigger under an
+// `if:` (FC), on the trigger for another reason it can't block (FO), or on another trigger (NF).
+const FN = 0;
+const FC = 1;
+const FO = 2;
+const NF = 3;
+const LAYER_SLOT: Readonly<Record<CiLayer, number>> = { push: 0, merge: 4, deploy: 8 };
+const CI_LAYERS: readonly CiLayer[] = ['push', 'merge', 'deploy'];
+const OPAQUE_KEY = '\0opaque'; // not a category: the opaque runs (they have none)
+
+/** Per (category, dir): the index of the first run of each kind, for each layer (-1 = none). */
+class Firsts {
+  private readonly byKey = new Map<string, Map<number, Int32Array>>();
+
+  constructor(readonly hits: readonly Hit[], dirs: Dirs) {
+    for (let i = 0; i < hits.length; i++) {
+      const h = hits[i] as Hit;
+      const d = dirs.idOf(h.dir);
+      for (const key of h.opaque ? [OPAQUE_KEY] : h.categories) {
+        this.put(key, ALL, h, i);
+        if (d >= 0) this.put(key, d, h, i);
+      }
+    }
+  }
+
+  private put(key: string, dir: number, h: Hit, i: number): void {
+    let byDir = this.byKey.get(key);
+    if (!byDir) this.byKey.set(key, (byDir = new Map()));
+    let at = byDir.get(dir);
+    if (!at) byDir.set(dir, (at = new Int32Array(12).fill(-1)));
+    for (const layer of CI_LAYERS) {
+      const slot = LAYER_SLOT[layer] + (!h.fit[layer] ? NF : h.reason === null ? FN : h.reason === 'condition' ? FC : FO);
+      if ((at[slot] as number) < 0) at[slot] = i;
+    }
+  }
+
+  /** The first run in these dirs of one of these kinds on the layer. */
+  first(key: string, dirs: readonly number[], layer: CiLayer, kinds: readonly number[]): Hit | undefined {
+    const byDir = this.byKey.get(key);
+    if (!byDir) return undefined;
+    let best = -1;
+    for (const d of dirs) {
+      const at = byDir.get(d);
+      if (!at) continue;
+      for (const k of kinds) {
+        const i = at[LAYER_SLOT[layer] + k] as number;
+        if (i >= 0 && (best < 0 || i < best)) best = i;
+      }
+    }
+    return best < 0 ? undefined : this.hits[best];
+  }
+}
+
+interface SegNode { kids: Map<string, SegNode>; id: number }
+const segNode = (): SegNode => ({ kids: new Map(), id: -1 });
+function segInsert(tree: SegNode, path: string, id: number): void {
+  let n = tree;
+  for (const seg of path.split('/')) {
+    let next = n.kids.get(seg);
+    if (!next) n.kids.set(seg, (next = segNode()));
+    n = next;
+  }
+  if (n.id < 0) n.id = id;
+}
+
+/** Which dirs count for each service. Built once per mapCoverage call, after every run's dir is known. */
+class Scope {
+  /** More services than MAX_SERVICES: per-service needs read only the runs at the root. */
+  readonly capped: boolean;
+  private readonly target = new Map<string, string>(); // service name → path of the first service with that name
+  private readonly owned = new Map<string, number[]>(); // service name → the dirs it owns
+  private readonly dirTree = segNode();
+  private readonly memo = new Map<string, readonly number[]>();
+
+  constructor(services: readonly Service[], dirs: Dirs) {
+    this.capped = services.length > MAX_SERVICES;
+    if (this.capped) return;
+    const tree = segNode();
+    let root = -1;
+    services.forEach((s, i) => {
+      const path = normalPath(s.path);
+      if (!this.target.has(s.name)) this.target.set(s.name, path);
+      if (path !== '.') segInsert(tree, path, i);
+      else if (root < 0) root = i;
+    });
+    for (let d = ROOT + 1; d < dirs.names.length; d++) {
+      const dir = dirs.names[d] as string;
+      segInsert(this.dirTree, dir, d);
+      // the owner: the deepest service path at or above dir; '.' (length 1) wins a tie on length by coming first
+      let n: SegNode | undefined = tree;
+      let best = -1;
+      let bestLen = 0;
+      let len = -1;
+      for (const seg of dir.split('/')) {
+        n = n.kids.get(seg);
+        if (!n) break;
+        len += seg.length + 1;
+        if (n.id >= 0) {
+          best = n.id;
+          bestLen = len;
+        }
+      }
+      if (root >= 0 && (best < 0 || bestLen < 1 || (bestLen === 1 && root < best))) best = root;
+      if (best < 0) continue;
+      const name = (services[best] as Service).name;
+      const list = this.owned.get(name);
+      if (list) list.push(d);
+      else this.owned.set(name, [d]);
+    }
+  }
+
+  /** The dirs whose runs count for a need of this service (ALL for a repo-wide need). */
+  dirsOf(service: string | undefined): readonly number[] {
+    if (service === undefined) return [ALL];
+    if (this.capped) return [ROOT];
+    const known = this.memo.get(service);
+    if (known) return known;
+    const out = [ROOT];
+    const path = this.target.get(service);
+    if (path !== undefined) {
+      out.push(...(this.owned.get(service) ?? []));
+      if (path !== '.') {
+        // the dirs above the service's path: a run there covers each service below it
+        const segs = path.split('/');
+        let n: SegNode | undefined = this.dirTree;
+        for (let k = 0; k < segs.length - 1 && n; k++) {
+          n = n.kids.get(segs[k] as string);
+          if (n && n.id >= 0) out.push(n.id);
+        }
+      }
+    }
+    this.memo.set(service, out);
+    return out;
+  }
 }
 
 function missingWhy(need: Need): string {
@@ -1586,40 +1747,40 @@ const located = (h: { by?: string; where: string }) => ({ ...(h.by === undefined
 
 /** The reason that counts for this need: a need that doesn't block (format-lint) only cares whether the tool runs. */
 const effectiveReason = (need: Need, reason: Reason | null): Reason | null => (need.blocking || reason === 'condition' ? reason : null);
+/** The kinds of run that cover a need, and the kinds that run on its trigger but can't block it. */
+const coverKinds = (need: Need) => (need.blocking ? [FN] : [FN, FO]);
+const partialKinds = (need: Need) => (need.blocking ? [FC, FO] : [FC]);
 
 function reasonWhy(h: { subject: string; partialWhy?: string }, reason: Reason, when: string): string {
   return reason === 'never' && h.partialWhy !== undefined ? h.partialWhy : REASON_WHY[reason](h.subject, when);
 }
 
-function ciCoverage(need: Need, layer: CiLayer, hits: Hit[], services: Service[], ctx: { truncated: boolean; unreadable: boolean }): Coverage {
-  let partialRight: { h: Hit; reason: Reason } | undefined;
-  let partialTrigger: Hit | undefined;
-  let strongOpaque: Hit | undefined;
-  let weakOpaque: Hit | undefined;
-  for (const h of hits) {
-    if (!appliesTo(h.dir, need.service, services)) continue;
-    const right = h.fit[layer];
-    if (h.opaque) {
-      if (right) strongOpaque ??= h;
-      else weakOpaque ??= h;
-      continue;
-    }
-    if (!h.categories.includes(need.category)) continue;
-    const reason = effectiveReason(need, h.reason);
-    if (right && reason === null) return { need, status: 'covered', ...located(h), why: `${h.subject} runs ${LAYER_DONE[layer]}.` };
-    if (right) partialRight ??= { h, reason: reason as Reason };
-    else partialTrigger ??= h;
-  }
+interface Decide { ci: Firsts; hooks: Firsts; scope: Scope; dirsCapped: boolean; truncated: boolean; unreadable: boolean }
+
+/** A per-service need that a cap kept pipegen from checking in full: never missing, never covered by the cap. */
+const capped = (need: Need, d: Decide) => need.service !== undefined && (d.scope.capped || d.dirsCapped);
+
+function ciCoverage(need: Need, layer: CiLayer, d: Decide): Coverage {
+  const dirs = d.scope.dirsOf(need.service);
+  const cover = d.ci.first(need.category, dirs, layer, coverKinds(need));
+  if (cover) return { need, status: 'covered', ...located(cover), why: `${cover.subject} runs ${LAYER_DONE[layer]}.` };
+  const strongOpaque = d.ci.first(OPAQUE_KEY, dirs, layer, [FN]);
   if (strongOpaque) return { need, status: 'unknown', ...located(strongOpaque), why: strongOpaque.why as string };
-  if (ctx.truncated) return { need, status: 'unknown', why: OPAQUE_WHY.truncated };
-  if (partialRight) return { need, status: 'partial', ...located(partialRight.h), why: reasonWhy(partialRight.h, partialRight.reason, LAYER_DONE[layer]) };
+  if (d.truncated) return { need, status: 'unknown', why: OPAQUE_WHY.truncated };
+  const partialRight = d.ci.first(need.category, dirs, layer, partialKinds(need));
+  if (partialRight) {
+    return { need, status: 'partial', ...located(partialRight), why: reasonWhy(partialRight, effectiveReason(need, partialRight.reason) as Reason, LAYER_DONE[layer]) };
+  }
+  const partialTrigger = d.ci.first(need.category, dirs, layer, [NF]);
   if (partialTrigger) return { need, status: 'partial', ...located(partialTrigger), why: `${partialTrigger.subject} runs, but not ${LAYER_DONE[layer]}.` };
+  const weakOpaque = d.ci.first(OPAQUE_KEY, dirs, layer, [NF]);
   if (weakOpaque) return { need, status: 'unknown', ...located(weakOpaque), why: weakOpaque.why as string };
-  if (ctx.unreadable) return { need, status: 'unknown', why: OPAQUE_WHY.workflowsUnreadable };
+  if (d.unreadable) return { need, status: 'unknown', why: OPAQUE_WHY.workflowsUnreadable };
+  if (capped(need, d)) return { need, status: 'unknown', why: OPAQUE_WHY.tooMany };
   return { need, status: 'missing', why: missingWhy(need) };
 }
 
-function hookCoverage(need: Need, hooks: Hooks, services: Service[]): Coverage {
+function hookCoverage(need: Need, hooks: Hooks, d: Decide): Coverage {
   const m = hooks.manager;
   if (need.category === 'hooks') {
     return m === null
@@ -1627,18 +1788,19 @@ function hookCoverage(need: Need, hooks: Hooks, services: Service[]): Coverage {
       : { need, status: 'covered', by: m, where: m === 'lefthook' && hooks.where !== '' ? hooks.where : HOOK_FILE[m], why: `The repo uses ${HOOK_NAME[m]} to run git hooks.` };
   }
   if (m !== null) {
-    let partial: { f: Found; reason: Reason } | undefined;
-    for (const f of hooks.found) {
-      if (!f.categories.includes(need.category) || !appliesTo(f.dir, need.service, services)) continue;
-      const reason = effectiveReason(need, f.reason);
-      if (reason === null) return { need, status: 'covered', by: f.by, where: hooks.where, why: `${f.subject} runs in ${HOOK_PLACE[m]} before each commit.` };
-      partial ??= { f, reason };
-    }
-    if (partial) return { need, status: 'partial', by: partial.f.by, where: hooks.where, why: reasonWhy(partial.f, partial.reason, 'before each commit') };
+    // the hook's runs sit in their own table, every one on the "push" layer's trigger
+    const dirs = d.scope.dirsOf(need.service);
+    const cover = d.hooks.first(need.category, dirs, 'push', coverKinds(need));
+    if (cover) return { need, status: 'covered', by: cover.by as string, where: hooks.where, why: `${cover.subject} runs in ${HOOK_PLACE[m]} before each commit.` };
+    const partial = d.hooks.first(need.category, dirs, 'push', partialKinds(need));
+    if (partial) return { need, status: 'partial', by: partial.by as string, where: hooks.where, why: reasonWhy(partial, effectiveReason(need, partial.reason) as Reason, 'before each commit') };
     if (!hooks.readable) return { need, status: 'unknown', where: hooks.where, why: OPAQUE_WHY.hookUnreadable };
+    if (capped(need, d)) return { need, status: 'unknown', why: OPAQUE_WHY.tooMany };
   }
   return { need, status: 'missing', why: missingWhy(need) };
 }
+
+const HOOK_FIT: Fit = { push: true, merge: true, deploy: true };
 
 /**
  * One Coverage per need, in order. Reads only the workflows in p.existingWorkflows (the list readProject made), the
@@ -1670,11 +1832,21 @@ export async function mapCoverage(p: RepoProfile, needs: Need[], dir: string, op
     await walkWorkflow(ctx, doc.ok, w.path, fitOf(events, p.defaultBranch, w.deploys), 0, '', false);
   }
   const hooks = await readHooks(ctx);
-  const state = { truncated: ctx.budget.truncated, unreadable: ctx.unreadable };
+  // Each need is answered from tables built once, not by a pass over every run (review C1).
+  const dirs = new Dirs();
+  const ci = new Firsts(ctx.hits, dirs);
+  const hookRuns = new Firsts(hooks.found.map((f): Hit => ({
+    opaque: false, categories: f.categories, by: f.by, subject: f.subject, dir: f.dir, reason: f.reason,
+    ...(f.partialWhy === undefined ? {} : { partialWhy: f.partialWhy }), fit: HOOK_FIT, where: hooks.where,
+  })), dirs);
+  const d: Decide = {
+    ci, hooks: hookRuns, scope: new Scope(p.services, dirs), dirsCapped: dirs.capped,
+    truncated: ctx.budget.truncated, unreadable: ctx.unreadable,
+  };
   return needs.map((need) => {
-    if (need.layer === 'pre-commit') return hookCoverage(need, hooks, p.services);
+    if (need.layer === 'pre-commit') return hookCoverage(need, hooks, d);
     if (need.category === 'gate') return { need, status: 'missing', why: GATE_WHY };
     if (need.category === 'deploy-verify') return { need, status: 'missing', why: DEPLOY_VERIFY_WHY };
-    return ciCoverage(need, need.layer, ctx.hits, p.services, state);
+    return ciCoverage(need, need.layer, d);
   });
 }
