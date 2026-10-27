@@ -62,6 +62,20 @@ function deploysOf(doc: Record<string, unknown>, path: string): boolean {
   return false;
 }
 
+const LINKED_NOTE = 'Skipped .github/workflows: it is reached through a symbolic link.';
+const OVER_CAP_NOTE = `Only the first ${MAX_WORKFLOWS} workflow files were read.`;
+const SKIPPED_PREFIX = 'Skipped .github/workflows/';
+
+/**
+ * How many workflow files readWorkflows skipped, counted from its notes (the audit passes this to mapCoverage, so a
+ * check in a skipped file is never reported as missing). A per-file skip counts once; a symbolic-linked workflows
+ * folder and the over-the-cap note count as one each (the exact number isn't known, only that some were skipped).
+ * Another reader's note about a file under .github/workflows/ also counts, which only ever makes rows unknown.
+ */
+export function skippedWorkflowCount(notes: readonly string[]): number {
+  return notes.filter((n) => n.startsWith(SKIPPED_PREFIX) || n === LINKED_NOTE || n === OVER_CAP_NOTE).length;
+}
+
 /**
  * Reads .github/workflows/*.yml and *.yaml (top level only).
  * `files` is the repo's file list when the caller already walked the repo; otherwise this lists the folder itself.
@@ -73,12 +87,12 @@ export async function readWorkflows(dir: string, files?: string[], notes: string
   };
   // A symlinked .github or .github/workflows would lead outside the repo; list and read nothing from it.
   if (isLink(join(dir, '.github')) || isLink(join(dir, '.github/workflows'))) {
-    note('Skipped .github/workflows: it is reached through a symbolic link.');
+    note(LINKED_NOTE);
     return [];
   }
   const listed = files ?? (await listFiles(dir, ['.github/workflows/*.{yml,yaml}'], [])).files;
   const all = listed.filter((f) => WORKFLOW_FILE.test(f)).sort();
-  if (all.length > MAX_WORKFLOWS) note(`Only the first ${MAX_WORKFLOWS} workflow files were read.`);
+  if (all.length > MAX_WORKFLOWS) note(OVER_CAP_NOTE);
   const out: ExistingWorkflow[] = [];
   for (const path of all.slice(0, MAX_WORKFLOWS)) {
     if (safeText(path) !== path) {

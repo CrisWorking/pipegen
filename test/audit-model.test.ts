@@ -1,0 +1,463 @@
+// Plan U Task 2a: the audit model (buildAudit). Controller rulings B1, B3, S7-S12, S27, S29, S30 and the Plan U
+// carry-forwards (estimates by jobCategories, coverage skipped count and signature errors, no child processes).
+import { mkdirSync, readFileSync, symlinkSync } from 'node:fs';
+import { join, resolve } from 'node:path';
+import type { Octokit } from '@octokit/rest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import * as childProcess from 'node:child_process';
+import { EXCLUDED_PATTERNS } from '../src/ai/redact.js';
+import { mapCoverage } from '../src/audit/coverage.js';
+import { buildAudit, CURRENT_MILESTONE, type AuditDeps, type AuditReport } from '../src/audit/model.js';
+import { floorNeeds, jobCategories } from '../src/engine/needs.js';
+import { estimate } from '../src/estimate/estimate.js';
+import { readProject } from '../src/read/project.js';
+import { skippedWorkflowCount } from '../src/read/workflows.js';
+import { DEFAULT_MODEL, type Capabilities, type ReviewedTool } from '../src/types.js';
+import { cleanupRepos, makeTempDir, writeIn } from './helpers/make-repo.js';
+import { fake } from './helpers/secret-repo.js';
+
+vi.mock('node:child_process', async (importOriginal) => {
+  const a = await importOriginal<typeof import('node:child_process')>();
+  const spies = {
+    exec: vi.fn(a.exec), execFile: vi.fn(a.execFile), execFileSync: vi.fn(a.execFileSync), execSync: vi.fn(a.execSync),
+    fork: vi.fn(a.fork), spawn: vi.fn(a.spawn), spawnSync: vi.fn(a.spawnSync),
+  };
+  return { ...a, ...spies, default: { ...a, ...spies } };
+});
+vi.mock('../src/audit/coverage.js', async (importOriginal) => {
+  const a = await importOriginal<typeof import('../src/audit/coverage.js')>();
+  return { ...a, mapCoverage: vi.fn(a.mapCoverage) };
+});
+vi.mock('../src/estimate/estimate.js', async (importOriginal) => {
+  const a = await importOriginal<typeof import('../src/estimate/estimate.js')>();
+  return { ...a, estimate: vi.fn(a.estimate) };
+});
+vi.mock('../src/read/project.js', async (importOriginal) => {
+  const a = await importOriginal<typeof import('../src/read/project.js')>();
+  return { ...a, readProject: vi.fn(a.readProject) };
+});
+
+beforeEach(() => vi.clearAllMocks());
+afterEach(cleanupRepos);
+
+const NOW = Date.parse('2026-10-27T12:00:00Z');
+const VERSION = (JSON.parse(readFileSync(resolve(import.meta.dirname, '../package.json'), 'utf8')) as { version: string }).version;
+const SWAP_WARNING = `This repo could change which pipegen runs. Run it from outside the repo: \`npx --registry=https://registry.npmjs.org pipegen@${VERSION} audit --dir ./repo\`.`;
+const ANON_NOTE = ['No token', 'public data only, rate-limited.'].join(': '); // joined, so the no-secret-literals guard doesn't read it as an assignment
+const NAME_HIDDEN = '(a file whose name looks like a secret)';
+const EXCLUDED_NOTE = "(never sent to the AI; check it isn't committed)";
+
+// Public repo, every capability: no limits.
+const allCaps: Capabilities = {
+  branchProtection: true, environments: true, envRequiredReviewers: true, deploymentBranchPolicies: true,
+  attestations: true, codeScanning: true, keylessSigningAllowed: true,
+};
+// What a Free private repo probes as.
+const bareCaps: Capabilities = {
+  branchProtection: false, environments: true, envRequiredReviewers: false, deploymentBranchPolicies: false,
+  attestations: false, codeScanning: false, keylessSigningAllowed: false,
+};
+
+interface FakeGh { gh: Octokit; events: ReturnType<typeof vi.fn>; pulls: ReturnType<typeof vi.fn> }
+function fakeGh(opts: { fail?: boolean; pushesPerPage?: number } = {}): FakeGh {
+  const at = new Date(NOW - 60_000).toISOString();
+  const events = vi.fn(async () => {
+    if (opts.fail) throw Object.assign(new Error('GitHub answered 500'), { status: 500 });
+    return { data: Array.from({ length: opts.pushesPerPage ?? 1 }, () => ({ type: 'PushEvent', created_at: at })) };
+  });
+  const pulls = vi.fn(async () => ({ data: [] }));
+  return { gh: { rest: { activity: { listRepoEvents: events }, pulls: { list: pulls } } } as unknown as Octokit, events, pulls };
+}
+
+function deps(over: Partial<AuditDeps> = {}): AuditDeps {
+  return {
+    gh: fakeGh().gh, anonymous: false,
+    context: { private: false, ownerType: 'User', plan: 'free', defaultBranch: 'main' },
+    capabilities: allCaps, permissions: [{ permission: 'Contents: read and write', why: 'to open the pull request' }],
+    reviewed: [], now: () => NOW, ...over,
+  };
+}
+
+/** A temp folder readProject accepts: .git/config with a GitHub origin (written by hand: no git process). */
+function repo(files: Record<string, string> = {}): string {
+  const dir = makeTempDir();
+  writeIn(dir, '.git/config', '[remote "origin"]\n\turl = https://github.com/o/r.git\n');
+  for (const [rel, body] of Object.entries(files)) writeIn(dir, rel, body);
+  return dir;
+}
+
+/** A single-package Node app: test and lint scripts, a start script (runnable), no Dockerfile, no hooks. */
+const nodeApp = (over: Record<string, unknown> = {}): Record<string, string> => ({
+  'package.json': JSON.stringify({ name: 'app', scripts: { test: 'vitest run', lint: 'eslint .', start: 'node index.js' }, devDependencies: { vitest: '1.0.0' }, ...over }),
+  'package-lock.json': '{}\n',
+  'index.js': 'console.log("hi");\n',
+});
+
+const tool = (id: string, categories: string[], languages: ReviewedTool['languages'] = ['any']): ReviewedTool => ({
+  id, categories, languages,
+  candidate: { id, name: id, kind: 'action', repo: `acme/${id}`, version: 'v1.0.0', pin: { sha: '1'.repeat(40) }, source: 'reviewed', reviewed: true, categories },
+  step: { output: { path: '', format: 'none' } }, fixedInputs: {}, choices: {}, configFiles: [], reviewedBy: 'maintainer', reviewedAt: '2026-09-01', proofs: 0,
+});
+
+const rowsOf = (r: AuditReport, id: string) => r.wouldAdd.filter((w) => w.need.id === id);
+const anyContains = (r: AuditReport, value: string) => JSON.stringify(r).includes(value) || JSON.stringify(r).includes(JSON.stringify(value).slice(1, -1));
+
+describe('buildAudit (brief, Task 2a)', () => {
+  it('audit: wouldAdd uses reviewed tools for missing needs', async () => {
+    const gitleaks = tool('gitleaks', ['secrets']);
+    const r = await buildAudit(repo(nodeApp()), deps({ reviewed: [gitleaks, tool('pip-audit', ['deps'], ['python'])] }));
+    const leakRows = rowsOf(r, 'secrets');
+    expect(leakRows.map((w) => w.need.layer)).toEqual(['pre-commit', 'push', 'merge']);
+    for (const w of leakRows) {
+      expect(w.status).toBe('missing');
+      expect(w.tool).toBe(gitleaks);
+      expect(w.note).toBe('reviewed tool');
+    }
+    // a reviewed tool for another language is never picked
+    for (const w of rowsOf(r, 'deps')) expect(w.tool).toBeNull();
+  });
+
+  it('audit: no reviewed tool → suggestion only', async () => {
+    const r = await buildAudit(repo(nodeApp()), deps());
+    const sast = rowsOf(r, 'sast');
+    expect(sast.length).toBeGreaterThan(0);
+    for (const w of sast) {
+      expect(w.tool).toBeNull();
+      expect(w.note).toBe('suggestion only');
+    }
+  });
+
+  it('audit: secrets in tree listed without values', async () => {
+    const gh = fake.githubClassic();
+    const stripe = fake.stripeKey();
+    const npmName = fake.npmPublish();
+    const dir = repo({
+      ...nodeApp(),
+      'src/config.ts': `export const t = '${gh}';\n`,
+      '.env': `STRIPE=${stripe}\n`,
+      [`keys/${npmName}.txt`]: 'nothing here\n',
+    });
+    const r = await buildAudit(dir, deps());
+    expect(r.secretsInTree).toEqual(expect.arrayContaining([
+      { file: 'src/config.ts', rule: 'github-token' },
+      { file: '.env', rule: 'stripe-key', note: EXCLUDED_NOTE },
+      { file: NAME_HIDDEN, rule: 'secret-like-name' },
+    ]));
+    for (const v of [gh, stripe, npmName]) expect(anyContains(r, v), v.slice(0, 4)).toBe(false);
+  });
+
+  it('audit: unsupported stack → support audit-only with reason', async () => {
+    const r = await buildAudit(repo({ 'pyproject.toml': '[project]\nname = "svc"\n', 'app.py': 'print(1)\n' }), deps());
+    expect(r.support.level).toBe('audit-only');
+    expect(r.support.reasons).toEqual(['Python support arrives in v0.4.']); // S8: without "You can run `pipegen audit` today."
+    expect(r.support.nextStep).toBe('The full setup (`npx pipegen`) arrives in v0.4 for Python and monorepos.');
+  });
+
+  it('audit: wouldCreate uses Part precommit when there is no hook manager', async () => {
+    const r = await buildAudit(repo(nodeApp()), deps());
+    expect(r.wouldCreate).toContainEqual({ what: 'precommit', why: expect.stringMatching(/hook manager/) });
+    const withHooks = await buildAudit(repo({ ...nodeApp(), '.pre-commit-config.yaml': 'repos: []\n' }), deps());
+    expect(withHooks.wouldCreate.map((c) => c.what)).not.toContain('precommit');
+  });
+
+  it('audit: aiBundle counts files, lists excluded patterns, no contents', async () => {
+    const marker = 'UNIQUE_CONTENT_MARKER_42';
+    const r = await buildAudit(repo({ ...nodeApp(), 'src/a.js': `// ${marker}\n`, 'src/b.js': '1\n', '.env': 'A=1\n' }), deps());
+    // package.json, index.js, src/a.js, src/b.js (package-lock.json and .env are excluded)
+    expect(r.aiBundle.files).toBe(4);
+    expect(r.aiBundle.bytes).toBeGreaterThan(0);
+    expect(r.aiBundle.truncated).toBe(false);
+    expect(r.aiBundle.excludedPatterns).toEqual([...EXCLUDED_PATTERNS]);
+    expect(r.aiBundle.topFolders).toEqual(['src']);
+    expect(Object.keys(r.aiBundle).sort()).toEqual(['bytes', 'excludedPatterns', 'files', 'topFolders', 'truncated']);
+    expect(anyContains(r, marker)).toBe(false);
+  });
+
+  it('audit: estimates use DEFAULT_MODEL, AI cost split into input and output', async () => {
+    const r = await buildAudit(repo(nodeApp()), deps());
+    expect(r.estimates.pricedFor).toEqual({ provider: 'claude', model: DEFAULT_MODEL });
+    expect(r.estimates.aiCostUsd).not.toBe('local');
+    const cost = r.estimates.aiCostUsd as Exclude<AuditReport['estimates']['aiCostUsd'], 'local'>;
+    expect(cost.input.high).toBeGreaterThan(0);
+    expect(cost.output.high).toBeGreaterThan(0);
+  });
+
+  it('audit: estimate called with jobCategories(floorNeeds) incl. nightly and 2 variants', async () => {
+    const r = await buildAudit(repo(nodeApp()), deps());
+    expect(estimate).toHaveBeenCalledTimes(1);
+    const [p, jobs, variants, activity, provider] = vi.mocked(estimate).mock.calls[0];
+    expect(p).toEqual(r.profile);
+    expect(jobs).toEqual(jobCategories(floorNeeds(r.profile, allCaps)));
+    expect(jobs.nightly[0]).toBe('nightly');
+    expect(jobs.nightly.length).toBeGreaterThan(1);
+    expect(variants).toBe(2);
+    expect(activity).toEqual({ pushes: 1, prs: 0, capped: false });
+    expect(provider).toEqual({ name: 'claude', model: DEFAULT_MODEL });
+  });
+
+  it('audit: excludedPatterns equals EXCLUDED_PATTERNS', async () => {
+    const r = await buildAudit(repo(nodeApp()), deps());
+    expect(r.aiBundle.excludedPatterns).toEqual([...EXCLUDED_PATTERNS]);
+  });
+
+  it('audit: buildAudit always gets an Octokit; anonymous client on a public repo adds the no-token note', async () => {
+    const g = fakeGh();
+    const r = await buildAudit(repo(nodeApp()), deps({ gh: g.gh, anonymous: true }));
+    expect(g.events).toHaveBeenCalled(); // the activity comes through the given client
+    expect(r.warnings).toContain(ANON_NOTE);
+    const named = await buildAudit(repo(nodeApp()), deps());
+    expect(named.warnings).not.toContain(ANON_NOTE);
+  });
+
+  it('audit: wouldAdd uses projectScriptFor for tests and lint when the script exists', async () => {
+    const r = await buildAudit(repo(nodeApp()), deps({ reviewed: [tool('eslint-x', ['lint', 'unit-tests'])] }));
+    for (const id of ['unit-tests', 'full-tests', 'lint', 'format-lint']) {
+      const rows = rowsOf(r, id);
+      expect(rows.length, id).toBeGreaterThan(0);
+      for (const w of rows) {
+        expect(w.tool, id).toMatchObject({ kind: 'project-script', service: 'app', script: id.endsWith('tests') ? 'test' : 'lint' });
+        expect(w.note).toBe(`your own \`${id.endsWith('tests') ? 'test' : 'lint'}\` script would run here`);
+      }
+    }
+  });
+
+  it('audit: repo .npmrc with a registry → warning', async () => {
+    for (const line of ['registry=https://registry.example.test/', '@acme:registry = https://npm.example.test/', '  "registry"=https://x.example.test/']) {
+      const r = await buildAudit(repo({ ...nodeApp(), '.npmrc': `${line}\n` }), deps());
+      expect(r.warnings, line).toEqual([SWAP_WARNING]);
+    }
+    const plain = await buildAudit(repo({ ...nodeApp(), '.npmrc': 'save-exact=true\n' }), deps());
+    expect(plain.warnings).toEqual([]);
+  });
+
+  it('audit: local node_modules/.bin/pipegen → warning', async () => {
+    const dir = repo({ ...nodeApp(), 'node_modules/.bin/pipegen': '#!/bin/sh\n' });
+    expect((await buildAudit(dir, deps())).warnings).toEqual([SWAP_WARNING]);
+    // a symbolic link counts as present and is never followed (here it points nowhere)
+    const linked = repo(nodeApp());
+    mkdirSync(join(linked, 'node_modules/.bin'), { recursive: true });
+    symlinkSync('/nonexistent/pipegen-target', join(linked, 'node_modules/.bin/pipegen'));
+    expect((await buildAudit(linked, deps())).warnings).toEqual([SWAP_WARNING]);
+  });
+
+  it('audit: .npmrc values never appear in the report', async () => {
+    const npmValue = fake.npmPublish();
+    const pass = 'npmrc' + 'hidden' + 'value9';
+    const registry = 'https://user:' + pass + '@registry.example.test/';
+    const dir = repo({ ...nodeApp(), '.npmrc': `registry=${registry}\n//registry.example.test/:_auth${'Tok'}en=${npmValue}\n` });
+    const r = await buildAudit(dir, deps());
+    expect(r.warnings).toEqual([SWAP_WARNING]);
+    for (const v of [npmValue, pass, registry, 'registry.example.test']) expect(anyContains(r, v), v.slice(0, 6)).toBe(false);
+  });
+});
+
+describe('buildAudit (controller rulings)', () => {
+  it('B1: re-reads the project itself and overlays the GitHub context', async () => {
+    const dir = repo(nodeApp());
+    const r = await buildAudit(dir, deps({ context: { private: true, ownerType: 'Organization', plan: 'team', defaultBranch: 'trunk' } }));
+    expect(readProject).toHaveBeenCalledWith(dir, expect.anything());
+    expect(r.profile).toMatchObject({ owner: 'o', repo: 'r', private: true, ownerType: 'Organization', plan: 'team', defaultBranch: 'trunk' });
+    expect(r.capabilities).toEqual(allCaps);
+    expect(r.permissions).toEqual([{ permission: 'Contents: read and write', why: 'to open the pull request' }]);
+  });
+
+  it('B3: an unusable reviewed list marks tool-less rows "reviewed list unavailable", not "suggestion only"', async () => {
+    const r = await buildAudit(repo(nodeApp()), deps({ reviewed: [], reviewedUnavailable: true }));
+    const nulls = r.wouldAdd.filter((w) => w.tool === null);
+    expect(nulls.length).toBeGreaterThan(0);
+    for (const w of nulls) expect(w.note).toBe('reviewed list unavailable');
+    expect(r.wouldAdd.some((w) => w.note === 'suggestion only')).toBe(false);
+    // project scripts and pipegen's own checks don't come from the list, so they stay
+    expect(rowsOf(r, 'unit-tests')[0].tool).toMatchObject({ kind: 'project-script' });
+    expect(rowsOf(r, 'gate')[0].tool).toEqual({ kind: 'built-in' });
+  });
+
+  it('S7: one row per floor need not covered; gate and deploy-verify are built-in; covered needs get no row', async () => {
+    const dir = repo({
+      ...nodeApp(),
+      '.github/workflows/ci.yml': 'on:\n  push:\n  pull_request:\njobs:\n  test:\n    runs-on: ubuntu-latest\n    steps:\n      - run: npm test\n      - run: npm run lint\n        continue-on-error: true\n',
+    });
+    const r = await buildAudit(dir, deps({ reviewed: [tool('gitleaks', ['secrets', 'gate'])] }));
+    const notCovered = r.coverage.filter((c) => c.status !== 'covered');
+    expect(r.wouldAdd.map((w) => w.need)).toEqual(notCovered.map((c) => c.need));
+    expect(r.wouldAdd.map((w) => w.status)).toEqual(notCovered.map((c) => c.status));
+    expect(r.coverage.find((c) => c.need.layer === 'push' && c.need.id === 'unit-tests')?.status).toBe('covered');
+    expect(r.wouldAdd.some((w) => w.need.layer === 'push' && w.need.id === 'unit-tests')).toBe(false);
+    expect(r.wouldAdd.find((w) => w.need.layer === 'push' && w.need.id === 'lint')?.status).toBe('partial');
+    for (const id of ['gate', 'deploy-verify']) {
+      const rows = rowsOf(r, id);
+      expect(rows.length, id).toBeGreaterThan(0);
+      for (const w of rows) {
+        expect(w.tool).toEqual({ kind: 'built-in' }); // never a reviewed tool, even one listing the category
+        expect(w.note).toBe("pipegen's own check");
+      }
+    }
+  });
+
+  it('S8: the next step is a fixed table keyed by CURRENT_MILESTONE; no command that does not exist', async () => {
+    expect(CURRENT_MILESTONE).toBe('v0.1');
+    const node = await buildAudit(repo(nodeApp()), deps());
+    expect(node.support).toEqual({ level: 'full', reasons: [], nextStep: 'The full setup (`npx pipegen`) arrives in v0.2 for single-package Node/TypeScript repos.' });
+    const bare = await buildAudit(repo({ 'main.go': 'package main\n' }), deps());
+    expect(bare.support.level).toBe('audit-only');
+    expect(bare.support.reasons).toEqual(['This language is not supported yet.']);
+    expect(bare.support.nextStep).toBe('The full setup (`npx pipegen`) is not planned yet for this repo.');
+    for (const r of [node, bare]) expect(JSON.stringify(r.support)).not.toMatch(/pipegen audit|today/);
+  });
+
+  it('S9: limits come only from the capabilities and the signing mode, never the plan name; never "make it public"', async () => {
+    const ctx = { private: true, ownerType: 'User' as const, plan: 'enterprise' as const, defaultBranch: 'main' };
+    const r = await buildAudit(repo(nodeApp()), deps({ capabilities: bareCaps, context: ctx }));
+    expect(r.limits).toEqual([
+      'No merge lock: anyone with write access can merge without checks (GitHub Pro for personal accounts, GitHub Team for organisations, adds it).',
+      'Without a merge lock, a pull request could replace the gate with a fake one; only code-owner review stops it.',
+      'No deploy approvals: GitHub does not let this repo require a reviewer before a deploy.',
+      'No image signing: this private repo has no artifact attestations, and no environment rule was proven to keep a signing key to the default branch.',
+      'No artifact attestations: GitHub does not offer them for this repo.',
+      'No code scanning: GitHub does not show scan results in the Security tab for this repo.',
+    ]);
+    for (const line of r.limits) expect(line).not.toMatch(/public/i);
+    // a 'free' plan with every capability has no limits: the plan name decides nothing
+    const full = await buildAudit(repo(nodeApp()), deps({ capabilities: allCaps, context: { ...ctx, plan: 'free' } }));
+    expect(full.limits).toEqual([]);
+  });
+
+  it('S10: excluded files are scanned and flagged; untracked files count; at most 200 rows plus "and N more"', async () => {
+    const files: Record<string, string> = { ...nodeApp() };
+    for (let i = 0; i < 205; i++) files[`src/f${String(i).padStart(3, '0')}.ts`] = `export const k = '${fake.awsKey()}';\n`;
+    const r = await buildAudit(repo(files), deps());
+    expect(r.secretsInTree).toHaveLength(200);
+    expect(r.notes).toContain('…and 5 more secret-like findings not listed.');
+    expect(r.notes).toContain("pipegen reads the files on disk without git, so files that aren't committed (for example a local .env) are in this list too.");
+  });
+
+  it('S10: symbolic links are never followed', async () => {
+    const outside = makeTempDir();
+    writeIn(outside, 'secret.ts', `export const t = '${fake.githubClassic()}';\n`);
+    const dir = repo(nodeApp());
+    symlinkSync(join(outside, 'secret.ts'), join(dir, 'linked.ts'));
+    symlinkSync(outside, join(dir, 'linkdir'));
+    const r = await buildAudit(dir, deps());
+    expect(r.secretsInTree).toEqual([]);
+  });
+
+  it('S11: notes are deduped and gather reader, caller (capability probe) and bundle notes', async () => {
+    const dir = repo({ ...nodeApp(), '.github/workflows/bad.yml': 'on: [\n' });
+    const r = await buildAudit(dir, deps({ notes: ['Probe note.', 'Probe note.'] }));
+    expect(r.notes.filter((n) => n === 'Probe note.')).toHaveLength(1);
+    expect(r.notes).toContain('Skipped .github/workflows/bad.yml: it could not be parsed.');
+    expect(new Set(r.notes).size).toBe(r.notes.length);
+    // a counting-only bundle's "cannot be sent" note is about pipegen's internals, not this report
+    expect(r.notes.some((n) => n.startsWith('gitleaks was not run'))).toBe(false);
+  });
+
+  it('S12: includedMinutes and a capped activity reach the estimates', async () => {
+    const g = fakeGh({ pushesPerPage: 100 });
+    const ctx = { private: true, ownerType: 'User' as const, plan: 'free' as const, defaultBranch: 'main' };
+    const r = await buildAudit(repo(nodeApp()), deps({ gh: g.gh, context: ctx, capabilities: bareCaps }));
+    expect(typeof r.estimates.includedMinutes).toBe('number');
+    expect(vi.mocked(estimate).mock.calls[0][3]).toMatchObject({ capped: true });
+    expect(r.estimates.basis.some((b) => b.startsWith('Activity: at least'))).toBe(true);
+    const pub = await buildAudit(repo(nodeApp()), deps());
+    expect(pub.estimates.includedMinutes).toBeNull();
+  });
+
+  it('S12: activity that cannot be read → 0 pushes and 0 pull requests, said in the basis', async () => {
+    const r = await buildAudit(repo(nodeApp()), deps({ gh: fakeGh({ fail: true }).gh }));
+    expect(vi.mocked(estimate).mock.calls[0][3]).toEqual({ pushes: 0, prs: 0, capped: false });
+    expect(r.estimates.basis.filter((b) => b.startsWith('Activity:'))).toEqual([
+      "Activity: pipegen couldn't read this repo's pushes and pull requests for the last 30 days, so monthly minutes assume 0 of each (the real number is likely higher).",
+    ]);
+  });
+
+  it('S27: a service without tests says pipegen would create starter tests (with wouldCreate tests)', async () => {
+    const r = await buildAudit(repo({ 'package.json': JSON.stringify({ name: 'app', scripts: { start: 'node index.js', lint: 'eslint .' } }), 'index.js': '1\n' }), deps());
+    for (const id of ['unit-tests', 'full-tests']) {
+      for (const w of rowsOf(r, id)) expect(w.note).toBe('No tests found for app: pipegen would create starter tests.');
+    }
+    expect(r.wouldCreate).toContainEqual({ what: 'tests', why: 'No tests found for app: pipegen would create starter tests.' });
+    expect(r.testsNote).toBeNull();
+  });
+
+  it('S27: a bare repo (root service, language other) gets starter tests', async () => {
+    const r = await buildAudit(repo({ 'README.md': '# hi\n' }), deps());
+    expect(r.profile.services).toHaveLength(1);
+    expect(r.profile.services[0].language).toBe('other');
+    expect(rowsOf(r, 'unit-tests').map((w) => w.note)).toEqual(['No tests found for r: pipegen would create starter tests.', 'No tests found for r: pipegen would create starter tests.']);
+    expect(r.wouldCreate.map((c) => c.what)).toContain('tests');
+  });
+
+  it('S27: with 0 services the tests rows say "No service found to test" instead of a gap', async () => {
+    const real = (await vi.importActual<typeof import('../src/read/project.js')>('../src/read/project.js')).readProject;
+    vi.mocked(readProject).mockImplementationOnce(async (d, o) => ({ ...(await real(d, o)), services: [] }));
+    const r = await buildAudit(repo(nodeApp()), deps());
+    expect(r.profile.services).toEqual([]);
+    expect(r.testsNote).toBe('No service found to test.');
+    expect(rowsOf(r, 'unit-tests')).toEqual([]);
+    expect(rowsOf(r, 'full-tests')).toEqual([]);
+    expect(r.wouldCreate.map((c) => c.what)).not.toContain('tests');
+  });
+
+  it('S29: aiBundle gains topFolders (most files first) and keeps every excluded pattern', async () => {
+    const r = await buildAudit(repo({ ...nodeApp(), 'lib/a.js': '1\n', 'src/a.js': '1\n', 'src/b.js': '1\n' }), deps());
+    expect(r.aiBundle.topFolders).toEqual(['src', 'lib']);
+    expect(r.aiBundle.excludedPatterns).toEqual([...EXCLUDED_PATTERNS]);
+  });
+
+  it('S30: the warning names the running version from package.json, never x.y.z', async () => {
+    const r = await buildAudit(repo({ ...nodeApp(), '.npmrc': 'registry=https://r.example.test/\n' }), deps());
+    expect(r.warnings[0]).toContain(`pipegen@${VERSION} audit`);
+    expect(r.warnings[0]).not.toContain('x.y.z');
+  });
+
+  it('B3/S7 note texts never point at a command that does not exist', async () => {
+    const r = await buildAudit(repo(nodeApp()), deps());
+    expect(JSON.stringify({ s: r.support, w: r.wouldAdd.map((w) => w.note), c: r.wouldCreate, l: r.limits })).not.toMatch(/pipegen (init|setup|install|fix)\b/);
+  });
+});
+
+describe('buildAudit (carry-forwards)', () => {
+  it('coverage: the number of workflow files readWorkflows skipped reaches mapCoverage', async () => {
+    const dir = repo({ ...nodeApp(), '.github/workflows/bad.yml': 'on: [\n', '.github/workflows/ok.yml': 'on: push\njobs:\n  a:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n' });
+    const r = await buildAudit(dir, deps());
+    expect(mapCoverage).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(mapCoverage).mock.calls[0][3]).toEqual({ skippedWorkflows: 1 });
+    expect(vi.mocked(mapCoverage).mock.calls[0][1]).toEqual(floorNeeds(r.profile, allCaps));
+    // the skipped file makes would-be-missing rows unknown, not missing
+    expect(r.coverage.find((c) => c.need.layer === 'push' && c.need.id === 'sast')?.status).toBe('unknown');
+  });
+
+  it('coverage: skippedWorkflowCount counts per-file, linked-folder and over-the-cap notes', () => {
+    expect(skippedWorkflowCount([])).toBe(0);
+    expect(skippedWorkflowCount([
+      'Skipped .github/workflows/a.yml: it could not be parsed.',
+      'Skipped .github/workflows/b.yml: it is larger than 1 MB.',
+      'Skipped package.json: it could not be parsed.',
+    ])).toBe(2);
+    expect(skippedWorkflowCount(['Skipped .github/workflows: it is reached through a symbolic link.'])).toBe(1);
+    expect(skippedWorkflowCount(['Only the first 200 workflow files were read.'])).toBe(1);
+  });
+
+  it('coverage: tool signatures that cannot be loaded → a plain note and unknown rows, never missing, never a crash', async () => {
+    vi.mocked(mapCoverage).mockRejectedValueOnce(new Error("pipegen's tool signatures (/x/data/tool-signatures.yml) could not be read: ENOENT"));
+    const r = await buildAudit(repo(nodeApp()), deps());
+    expect(r.coverage.length).toBe(floorNeeds(r.profile, allCaps).length);
+    for (const c of r.coverage) expect(c.status).toBe('unknown');
+    expect(r.wouldAdd).toHaveLength(r.coverage.length);
+    expect(r.notes).toContain("pipegen couldn't load its list of tool signatures, so it can't tell which checks your workflows already run (pipegen's tool signatures (/x/data/tool-signatures.yml) could not be read: ENOENT).");
+  });
+
+  it('aiBundle: a file name with a line break is still counted (bundleCode keeps it)', async () => {
+    const r = await buildAudit(repo({ ...nodeApp(), 'src/a\nb.js': '1\n', 'src/c\rd.js': '1\n' }), deps());
+    expect(r.aiBundle.files).toBe(4);
+  });
+
+  it('no child processes during the audit', async () => {
+    const dir = repo({ ...nodeApp(), '.npmrc': 'registry=https://r.example.test/\n', 'src/x.ts': `const t = '${fake.githubClassic()}';\n` });
+    vi.clearAllMocks();
+    await buildAudit(dir, deps());
+    for (const name of ['exec', 'execFile', 'execFileSync', 'execSync', 'fork', 'spawn', 'spawnSync'] as const) {
+      expect(vi.mocked(childProcess[name]), name).not.toHaveBeenCalled();
+    }
+  });
+});
