@@ -111,14 +111,14 @@
 // checks that there is no runtime import cycle among them.
 import { regexSafe } from '../read/limits.js';
 import { MAX_WORKFLOWS, WORKFLOW_FILE } from '../read/workflows.js';
-import type { Capabilities, Need, RepoProfile } from '../types.js';
+import type { Capabilities, ExistingWorkflow, Need, RepoProfile } from '../types.js';
 import { safeText } from '../util/safe-text.js';
 import { DEPLOY_VERIFY_WHY, Dirs, Firsts, GATE_WHY, Scope, ciCoverage, hookCoverage, type Decide } from './coverage/decide.js';
 import { hookRunHits, readHooks } from './coverage/hooks.js';
 import { compile, loadToolSignatures } from './coverage/signatures.js';
 import { fitOf, parseOn, scheduleFires } from './coverage/triggers.js';
 import type { Compiled, Ctx, Fit, Hit } from './coverage/types.js';
-import { Reader, configFilesPass, releaseEgress, walkWorkflow } from './coverage/walk.js';
+import { Reader, configFilesPass, releaseEgress, releaseSigns, walkWorkflow } from './coverage/walk.js';
 
 export { COVERAGE_LIMITS } from './coverage/bounds.js';
 export { loadToolSignatures, type ToolSignature } from './coverage/signatures.js';
@@ -160,9 +160,13 @@ export async function mapCoverage(p: RepoProfile, needs: Need[], dir: string, op
     releaseJobs: [], releaseUnread: (opts.skippedWorkflows ?? 0) > 0,
   };
   if (p.existingWorkflows.length > MAX_WORKFLOWS) ctx.budget.truncated = true;
+  const listed = new Map(p.existingWorkflows.slice(0, MAX_WORKFLOWS).map((w) => [w.path, w]));
+  const releases = (w: ExistingWorkflow | undefined) => w !== undefined && (w.deploys || (w.publishes?.length ?? 0) > 0);
+  const calleeSigns = new Map<string, boolean>(); // each called workflow's own signs, worked out once
+  const usesSecrets = (w: ExistingWorkflow | undefined) => w !== undefined && w.secretsUsed.some((n) => n.toUpperCase() !== 'GITHUB_TOKEN');
   for (const w of [...p.existingWorkflows].sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0)).slice(0, MAX_WORKFLOWS)) {
-    // fix round 1 (P8, concern 2): a workflow that deploys or publishes is a release workflow
-    const release = w.deploys || (w.publishes?.length ?? 0) > 0;
+    // fix round 1 (P8, concern 2): a workflow that deploys or publishes is a release workflow (refined below, round 2)
+    let release = releases(w);
     // A listed workflow that fails the path check or can't be read again is never skipped silently (review M1).
     if (!regexSafe(w.path) || safeText(w.path) !== w.path || !WORKFLOW_FILE.test(w.path)) {
       ctx.unreadable = true;
@@ -179,7 +183,31 @@ export async function mapCoverage(p: RepoProfile, needs: Need[], dir: string, op
     const events = parseOn(on);
     events.delete('workflow_call'); // a reusable workflow runs when it is called; its callers carry it
     if (events.size === 0) continue;
-    await walkWorkflow(ctx, doc.ok, w.path, fitOf(events, p.defaultBranch, w.deploys, scheduleFires(on)), 0, '', false, release);
+    const fit = fitOf(events, p.defaultBranch, w.deploys, scheduleFires(on));
+    // fix round 2 (ruling P9): it is also a release workflow when it calls a local workflow that deploys or publishes
+    // (one level), or when it runs on a deploy trigger and uses a secret other than GITHUB_TOKEN, grants id-token,
+    // packages or contents write, or pushes an image (its own signs, or those of the local workflows it calls)
+    if (!release) {
+      const signs = releaseSigns(doc.ok);
+      const callees = signs.calls.map((c) => listed.get(c));
+      release = callees.some(releases);
+      if (!release && fit.deploy) {
+        let callSigns = false;
+        for (const c of new Set(signs.calls)) {
+          if (callSigns || !listed.has(c)) continue;
+          let known = calleeSigns.get(c);
+          if (known === undefined) {
+            const cd = await ctx.read.yaml(c);
+            const cs = 'fail' in cd ? null : releaseSigns(cd.ok);
+            known = cs === null || cs.grants || cs.pushes; // unreadable: can't tell, so lean towards checking it
+            calleeSigns.set(c, known);
+          }
+          callSigns = known;
+        }
+        release = usesSecrets(w) || callees.some(usesSecrets) || signs.grants || signs.pushes || signs.passesSecrets || callSigns;
+      }
+    }
+    await walkWorkflow(ctx, doc.ok, w.path, fit, 0, '', false, release);
   }
   releaseEgress(ctx);
   await hookRunHits(ctx);

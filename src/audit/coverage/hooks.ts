@@ -129,7 +129,7 @@ export async function readHooks(ctx: Ctx): Promise<Hooks> {
   const none: Hooks = { manager, where: '', readable: true, found: [] };
   if (manager === null) return none;
   const scan = async (text: string, base: string | null, mode: ShellMode) =>
-    gated(await resolveScripts(ctx, scanShell(text, base, ctx.sigs, ctx.budget, mode)), gateOf([text], [], undefined, ctx.sigs.softEnv));
+    gated(await resolveScripts(ctx, scanShell(text, base, ctx.sigs, ctx.budget, mode)), gateOf([text], [], undefined, ctx.sigs.softEnv, ctx.sigs.configFiles));
   if (manager === 'husky') {
     const where = '.husky/pre-commit';
     const r = await ctx.read.text(where);

@@ -150,7 +150,9 @@ function valueListed(v: unknown, values: string[], exprCounts: boolean): boolean
   const s = inputText(v);
   if (s === null) return false;
   if (s.includes('${{')) return exprCounts;
-  return values.includes(s) || (values.includes('*') && s !== '') || (values.includes('+') && nonZeroExit(s));
+  // fix round 2 (R4): `+` reads the raw value, as trivy does: cast.ToInt doesn't trim, so ' 1' is a parse error, which is 0
+  const raw = typeof v === 'string' ? v : String(v);
+  return values.includes(s) || (values.includes('*') && s !== '') || (values.includes('+') && nonZeroExit(raw));
 }
 
 /** Soft check: some spelling of a listed input has a listed value (an expression counts: errs to "can't block"). */
@@ -295,7 +297,8 @@ export function refVerdict(tool: ToolSignature, uses: string): 'ok' | 'old' | 'u
 }
 
 /** Plan P Task 3 (PS12): a flag value that a CLI reads as off (npm's nopt: false, null, any number equal to 0). */
-const FALSE_WORDS: ReadonlySet<string> = new Set(['false', 'null', 'no', 'off', '']);
+// fix round 2 (R7): Go's strconv.ParseBool also reads f and F as false
+const FALSE_WORDS: ReadonlySet<string> = new Set(['false', 'f', 'null', 'no', 'off', '']);
 const readsFalse = (v: string) => FALSE_WORDS.has(v.trim().toLowerCase()) || (v.trim() !== '' && Number(v) === 0);
 
 /**
@@ -363,30 +366,42 @@ export function configTurnedOff(tool: ToolSignature, args: readonly string[]): b
  * (https://pre-commit.com/#temporarily-disabling-hooks). An action that sets one through GITHUB_ENV isn't seen.
  */
 export interface EnvGate { tox: boolean; nox: boolean; skip: boolean; npm: boolean; env: JobEnv }
-const NO_ENV: JobEnv = { all: false, names: new Set() };
+const NO_ENV: JobEnv = { all: false, names: new Set(), files: new Set() };
 export const NO_GATE: EnvGate = { tox: false, nox: false, skip: false, npm: false, env: NO_ENV };
-export const ALL_GATE: EnvGate = { tox: true, nox: true, skip: true, npm: true, env: { all: true, names: new Set() } };
+export const ALL_GATE: EnvGate = { tox: true, nox: true, skip: true, npm: true, env: { all: true, names: new Set(), files: new Set() } };
+/**
+ * Fix round 2 (ruling P9): a job with a step pipegen can't see into (an action from the owner's own account, a
+ * `docker://` step, a local action that isn't composite) may set any variable through GITHUB_ENV: every softEnv name and
+ * SKIP count as set.
+ */
+export const OPAQUE_GATE: EnvGate = { tox: false, nox: false, skip: true, npm: false, env: { all: true, names: new Set(), files: new Set() } };
+const emptyEnv = (e: JobEnv) => !e.all && e.names.size === 0 && e.files.size === 0;
 const orEnv = (a: JobEnv, b: JobEnv): JobEnv =>
-  (b.names.size === 0 && !b.all ? a : a.names.size === 0 && !a.all ? b : { all: a.all || b.all, names: new Set([...a.names, ...b.names]) });
+  (emptyEnv(b) ? a : emptyEnv(a) ? b : { all: a.all || b.all, names: new Set([...a.names, ...b.names]), files: new Set([...a.files, ...b.files]) });
 export const orGate = (a: EnvGate, b: EnvGate): EnvGate =>
   ({ tox: a.tox || b.tox, nox: a.nox || b.nox, skip: a.skip || b.skip, npm: a.npm || b.npm, env: orEnv(a.env, b.env) });
 /**
  * Fix round 1 (P8): `softNames` (every signature's softEnv) are looked for too: as an `env:` key (any letter case) or
- * as `NAME=` in the run text (inline, export, or `>> $GITHUB_ENV`).
+ * in the run text. Fix round 2 (N1b, N1c): the bare name, as SKIP is, so a GITHUB_ENV heredoc (`NAME<<EOF`) or a
+ * quote-split `"NAME"=x` counts. `configNames` (every signature's configFiles) named in the run text, in any letter case,
+ * mean an earlier step may write that file (N2c, N2d).
  */
-export function gateOf(texts: readonly string[], envs: readonly unknown[], base: EnvGate = NO_GATE, softNames: readonly string[] = []): EnvGate {
+export function gateOf(texts: readonly string[], envs: readonly unknown[], base: EnvGate = NO_GATE, softNames: readonly string[] = [],
+  configNames: readonly string[] = []): EnvGate {
   // an `env:` given as one expression could set anything
   if (envs.some((e) => e !== undefined && e !== null && (typeof e !== 'object' || Array.isArray(e)))) return ALL_GATE;
   const keys = envs.flatMap((e) => Object.keys(asObj(e)).slice(0, MAX_INPUT_KEYS)).map((k) => k.toUpperCase());
   const inText = (needle: string) => texts.some((t) => t.includes(needle));
-  const names = softNames.filter((n) => keys.includes(n) || inText(`${n}=`));
+  const names = softNames.filter((n) => keys.includes(n) || inText(n));
+  const lower = configNames.length === 0 ? [] : texts.map((t) => t.toLowerCase());
+  const files = configNames.filter((f) => lower.some((t) => t.includes(f.toLowerCase())));
   return {
     tox: base.tox || keys.some((k) => k.startsWith('TOX')) || inText('TOX'),
     nox: base.nox || keys.some((k) => k.startsWith('NOX')) || inText('NOX'),
     skip: base.skip || keys.includes('SKIP') || inText('SKIP'),
     // npm reads npm_config_* in any letter case
     npm: base.npm || keys.includes('NPM_CONFIG_DRY_RUN') || texts.some((t) => t.toLowerCase().includes('npm_config_dry_run')),
-    env: names.length === 0 ? base.env : orEnv(base.env, { all: false, names: new Set(names) }),
+    env: names.length === 0 && files.length === 0 ? base.env : orEnv(base.env, { all: false, names: new Set(names), files: new Set(files) }),
   };
 }
 
@@ -395,6 +410,11 @@ export function softEnvSet(softEnv: readonly string[] | undefined, env: JobEnv |
   if (softEnv === undefined || env === undefined) return null;
   if (env.all) return '*';
   return softEnv.find((n) => env.names.has(n)) ?? null;
+}
+/** Fix round 2 (N2c, N2d): a config file the tool loads that the job's run text names (an earlier step may write it). */
+export function configFileNamed(configFiles: readonly string[] | undefined, env: JobEnv | undefined): string | null {
+  if (configFiles === undefined || env === undefined) return null;
+  return configFiles.find((f) => env.files.has(f)) ?? null;
 }
 /** pipegen's own why for a run whose softEnv name or config file is set (the name and file come from pipegen's data). */
 export const configWhy = (subject: string, what: string) => (what === '*'
@@ -415,7 +435,9 @@ export const gated = (found: Found[], g: EnvGate): Found[] => found
     if (g.skip && f.by === PRE_COMMIT_ID) return { ...f, hookRun: false, reason: f.reason ?? 'skip' };
     // fix round 1 (P8): a softEnv name set in the job; a CI pre-commit run keeps the job env for the hooks it carries
     const set = softEnvSet(f.softEnv, g.env);
-    if (set !== null && (f.reason === null || !MAY_NOT_RUN.has(f.reason))) return { ...f, reason: 'config' as const, partialWhy: configWhy(f.subject, set) };
-    if (f.hookRun === true && (g.env.all || g.env.names.size > 0)) return { ...f, jobEnv: g.env };
+    const file = configFileNamed(f.configFiles, g.env);
+    const what = set ?? (file === null ? null : `a ${file} file written in this job`);
+    if (what !== null && (f.reason === null || !MAY_NOT_RUN.has(f.reason))) return { ...f, reason: 'config' as const, partialWhy: configWhy(f.subject, what) };
+    if (f.hookRun === true && !emptyEnv(g.env)) return { ...f, jobEnv: g.env };
     return f;
   });

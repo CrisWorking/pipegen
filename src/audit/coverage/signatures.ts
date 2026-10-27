@@ -238,7 +238,8 @@ export function compile(tools: ToolSignature[]): Compiled {
     }
   }
   const softEnv = [...new Set(tools.flatMap((t) => t.softEnv ?? []))];
-  return { byFirstWord, byPath, actions, hooks, hookRepos, reusable, softEnv };
+  const configFiles = [...new Set(tools.flatMap((t) => t.configFiles ?? []))];
+  return { byFirstWord, byPath, actions, hooks, hookRepos, reusable, softEnv, configFiles };
 }
 
 export const PRE_COMMIT_ID = 'pre-commit';

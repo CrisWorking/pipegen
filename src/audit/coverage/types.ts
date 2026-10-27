@@ -14,8 +14,9 @@ export interface Compiled {
   byFirstWord: Map<string, CommandRule[]>; byPath: Map<string, CommandRule[]>; actions: ActionRule[];
   /** Plan P Task 3: `owner/repo/.github/workflows/<file>` (lowercase) → the tools a job-level `uses:` of it runs. */
   reusable: Map<string, ToolSignature[]>;
-  /** Fix round 1 (P8): every signature's softEnv names, looked for once per job. */
+  /** Fix round 1 (P8): every signature's softEnv names, looked for once per job; fix round 2: and their configFiles names. */
   softEnv: readonly string[];
+  configFiles: readonly string[];
   /** `hookRepoKey(repo, id)` → the tools a pre-commit hook of that repo and id runs (Task 5). */
   hooks: Map<string, ToolSignature[]>;
   /** The hook repos listed in `precommitHooks` (normalised by hookRepo): pipegen knows what their hooks run. */
@@ -64,7 +65,7 @@ export interface Found {
   jobEnv?: JobEnv;
 }
 /** Fix round 1 (P8): the softEnv names set in a job (`all`: an `env:` given as one expression could set any). */
-export interface JobEnv { all: boolean; names: ReadonlySet<string> }
+export interface JobEnv { all: boolean; names: ReadonlySet<string>; files: ReadonlySet<string> }
 export interface Hit {
   opaque: boolean;
   categories: readonly string[];
@@ -82,6 +83,8 @@ export interface Hit {
   /** Fix round 1: config files the tool loads by itself (checked for after the walk), and a CI pre-commit run's job env. */
   configFiles?: readonly string[];
   jobEnv?: JobEnv;
+  /** Fix round 2: the run's job may be on macOS or Windows, where config file names match in any letter case. */
+  foldCase?: boolean;
 }
 
 export interface Budget { visits: number; bytes: number; truncated: boolean }

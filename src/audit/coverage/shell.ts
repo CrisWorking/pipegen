@@ -167,7 +167,7 @@ export function preCommitAllFiles(words: readonly string[]): boolean {
 const basename = (w: string) => w.slice(w.lastIndexOf('/') + 1);
 const NPM_PROVENANCE_ID = 'npm-provenance';
 /** The image's name: no registry or owner, no :tag or @digest (ghcr.io/zricethezav/gitleaks:v8 → gitleaks). */
-function imageName(image: string): string {
+export function imageName(image: string): string {
   const at = image.indexOf('@');
   const noDigest = at < 0 ? image : image.slice(0, at);
   const name = basename(noDigest);

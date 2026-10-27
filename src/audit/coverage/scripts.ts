@@ -51,7 +51,7 @@ async function scriptRuns(ctx: Ctx, dir: string, name: string): Promise<Found[]>
   ctx.scriptMemo.set(key, []); // being worked out: a script that calls itself (directly or not) adds nothing
   const text = (await packageScripts(ctx, dir))?.get(name);
   if (text === undefined) return [];
-  const inner = gated(await resolveScripts(ctx, scanShell(text, dir, ctx.sigs, ctx.budget, NPM_SCRIPT_SHELL)), gateOf([text], [], undefined, ctx.sigs.softEnv));
+  const inner = gated(await resolveScripts(ctx, scanShell(text, dir, ctx.sigs, ctx.budget, NPM_SCRIPT_SHELL)), gateOf([text], [], undefined, ctx.sigs.softEnv, ctx.sigs.configFiles));
   const out = inner.flatMap((g) => {
     const categories = g.categories.filter((x) => SCRIPT_CATEGORIES.has(x.startsWith(UNKNOWN_PREFIX) ? x.slice(UNKNOWN_PREFIX.length) : x));
     return categories.length === 0 ? [] : [{ ...g, categories, hookRun: false }];

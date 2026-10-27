@@ -1721,14 +1721,14 @@ describe('mapCoverage (Task 5 fix round 4)', () => {
     expect([hooks, lint]).toEqual(['unknown', 'unknown']);
   });
 
-  it('N9: a missing or non-composite local action still adds no gate', async () => {
+  it('N9: a missing local action adds no gate; a non-composite one may set SKIP (Plan P Task 3 ruling P9)', async () => {
     const [missingHooks] = await hidden(() => '      - uses: ./nope\n');
     expect(missingHooks).toBe('covered');
     const [nodeHooks] = await hidden((dir) => {
       writeIn(dir, 'n/action.yml', "runs:\n  using: node20\n  main: index.js\n");
       return '      - uses: ./n\n';
     });
-    expect(nodeHooks).toBe('covered');
+    expect(nodeHooks).toBe('unknown'); // its own code can write SKIP to GITHUB_ENV, so the run isn't covered, and the action is opaque
   });
 });
 
@@ -2443,6 +2443,64 @@ describe('mapCoverage (Plan P Task 3 fix round 1)', () => {
     const cli = (cmd: string) => wfile(`on:\n  schedule:\n    - cron: '1 1 * * 1'\njobs:\n${jobOf(run(cmd))}`);
     expect(await st(cli('scorecard --repo=github.com/kubernetes/kubernetes'), 'merge', 'scorecard')).toBe('missing');
     expect(await st(cli('scorecard --local .'), 'merge', 'scorecard')).toBe('covered scorecard-cli');
+  });
+
+  it('fix round 2 (N1b, N1c, N1f, N2, N2c, N2d): soft env and config files set where pipegen can only see the name', async () => {
+    const t = run('trivy image --exit-code 1 app:1');
+    expect(await st(ci1("      - run: |\n          {\n            echo 'TRIVY_SCANNERS<<EOF'\n            echo secret\n            echo EOF\n          } >> \"$GITHUB_ENV\"\n" + t), 'merge', 'image-scan'))
+      .toBe('partial trivy-image'); // N1b: a GITHUB_ENV heredoc
+    expect(await st(ci1(run('echo "TRIVY_SCANNERS"=secret >> $GITHUB_ENV') + t), 'merge', 'image-scan')).toBe('partial trivy-image'); // N1c
+    expect(await st(ci1('      - uses: o/setenv@v1\n' + t), 'merge', 'image-scan')).toBe('unknown o/setenv@v1'); // N1f: the owner's own action (opaque)
+    expect(await st(ci1('      - uses: docker://alpine:3.20\n' + t), 'merge', 'image-scan')).toBe('partial trivy-image'); // an image pipegen can't see into
+    expect(await st(ci1('      - uses: docker://aquasec/trivy:0.67.2\n        with:\n          args: image --exit-code 1 app:1\n'), 'merge', 'image-scan'))
+      .toBe('covered trivy-image'); // an image a signature names is that tool, not an opaque step
+    expect(await st(ci1('      - uses: actions/checkout@v4\n' + t), 'merge', 'image-scan')).toBe('covered trivy-image'); // a third-party action: the SKIP limit
+    expect(await st(ci1("      - run: |\n          printf 'scan:\\n  scanners: [secret]\\n' > trivy.yaml\n" + t), 'merge', 'image-scan')).toBe('partial trivy-image'); // N2c
+    expect(await st({ ...ci1(run('cp ci/hl.yaml .hadolint.yaml') + run('hadolint Dockerfile')), Dockerfile: 'FROM alpine\n', 'ci/hl.yaml': 'no-fail: true\n' },
+      'merge', 'dockerfile-lint')).toBe('partial hadolint'); // N2d
+    // N2: another letter case counts only where the file system ignores it (macOS, Windows)
+    expect(await st({ ...ci1(t), 'Trivy.yaml': 'x: 1\n' }, 'merge', 'image-scan')).toBe('covered trivy-image');
+    expect(await st({ ...wfile(`${both2}jobs:\n${jobOf(t, 'j', '', 'macos-latest')}`), 'Trivy.yaml': 'x: 1\n' }, 'merge', 'image-scan')).toBe('partial trivy-image');
+    expect(await st({ ...wfile(`${both2}jobs:\n${jobOf(run('hadolint Dockerfile'), 'j', '', 'windows-latest')}`), Dockerfile: 'FROM alpine\n', '.HADOLINT.yaml': 'no-fail: true\n' },
+      'merge', 'dockerfile-lint')).toBe('partial hadolint');
+    expect(await st({ ...wfile(`${both2}jobs:\n${jobOf(t, 'j', '', 'macos-latest')}`) }, 'merge', 'image-scan')).toBe('covered trivy-image');
+  });
+
+  it('fix round 2 (R4, R7): a padded exit code is a parse error (0); Go reads f as false', async () => {
+    for (const code of ["' 1'", "'1 '", "'1.0'"]) {
+      expect(await st(ci1(`      - uses: aquasecurity/trivy-action@0.33.1\n        with:\n          image-ref: app:1\n          exit-code: ${code}\n`), 'merge', 'image-scan'), code).toBe('partial trivy-image');
+    }
+    expect(await st(ci1('      - uses: aquasecurity/trivy-action@0.33.1\n        with:\n          image-ref: app:1\n          exit-code: 1\n'), 'merge', 'image-scan')).toBe('covered trivy-image');
+    for (const v of ['f', 'F']) expect(await st(ci1(run(`poutine analyze_local . --fail-on-violation=${v}`)), 'merge', 'workflow-lint'), v).toBe('partial poutine');
+  });
+
+  it('fix round 2 (N4b–N4d, ruling P9): release workflows pipegen\'s readers miss still need egress', async () => {
+    // flag and key names are built at runtime, so no redact rule matches this file
+    const credFlagWord = `--${['tok', 'en'].join('')}`;
+    const storeRef = (name: string) => `\${{ ${['secrets', name].join('.')} }}`;
+    const idWrite = `${['id', 'token'].join('-')}: write`;
+    const guarded = { '.github/workflows/release.yml': `${relOn}jobs:\n${jobOf(bfStep() + run('npm publish'))}` };
+    const files = (more: Record<string, string>) => ({ ...guarded, ...more });
+    expect(await st(guarded, 'deploy', 'egress')).toBe('covered bullfrog');
+    // N4b: a caller of a local workflow that publishes
+    expect(await st(files({ '.github/workflows/ci.yml': "on:\n  push:\n    tags: ['v*']\njobs:\n  p:\n    uses: ./.github/workflows/pub.yml\n",
+      '.github/workflows/pub.yml': `on: workflow_call\njobs:\n${jobOf(run('npm publish'))}` }), 'deploy', 'egress')).toBe('partial bullfrog');
+    // N4c: a deploy trigger and a secret other than GITHUB_TOKEN
+    expect(await st(files({ '.github/workflows/ci.yml': `on:\n  push:\n    tags: ['v*']\njobs:\n${jobOf(run(`cargo publish ${credFlagWord} ${storeRef('CARGO_TOKEN')}`))}` }),
+      'deploy', 'egress')).toBe('partial bullfrog');
+    // N4d: a deploy trigger and an image push
+    expect(await st(files({ '.github/workflows/build.yml': `on:\n  push:\n    branches: [main]\njobs:\n${jobOf('      - uses: docker/build-push-action@v6\n        with:\n          push: true\n          tags: ghcr.io/o/r:latest\n')}` }),
+      'deploy', 'egress')).toBe('partial bullfrog');
+    // a deploy trigger and a job that grants a write permission
+    expect(await st(files({ '.github/workflows/b.yml': `on:\n  push:\n    branches: [main]\njobs:\n${jobOf(run('make release'), 'j', `    permissions:\n      ${idWrite}\n`)}` }),
+      'deploy', 'egress')).toBe('partial bullfrog');
+    // not a release: GITHUB_TOKEN only, no write grant, no push, or no deploy trigger
+    expect(await st(files({ '.github/workflows/ci.yml': `on:\n  push:\n    branches: [main]\njobs:\n${jobOf(run(`gh api x ${credFlagWord} ${storeRef('GITHUB_TOKEN')}`))}` }),
+      'deploy', 'egress')).toBe('covered bullfrog');
+    expect(await st(files({ '.github/workflows/ci.yml': `on: pull_request\njobs:\n${jobOf(run('make x ${{ secrets.NPM_TOKEN }}'), 'j', '    permissions:\n      contents: write\n')}` }),
+      'deploy', 'egress')).toBe('covered bullfrog');
+    expect(await st(files({ '.github/workflows/build.yml': `on:\n  push:\n    branches: [main]\njobs:\n${jobOf('      - uses: docker/build-push-action@v6\n        with:\n          push: false\n')}` }),
+      'deploy', 'egress')).toBe('covered bullfrog');
   });
 
   it('fix round 1 (perf): the release-wide egress pass and the config-file pass stay linear', async () => {
