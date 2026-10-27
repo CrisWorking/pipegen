@@ -351,7 +351,7 @@ describe('mapCoverage (fix round 1)', () => {
     for (const cmd of ['gitleaks detect || true', 'gitleaks detect || :', 'gitleaks detect || exit 0', 'gitleaks detect && echo ok || true']) {
       const r = await one(`${both}${job(run(JSON.stringify(cmd)))}`, 'push', 'secrets'); // quoted: a bare `|| :` would be a YAML key
       expect(r.status, cmd).toBe('partial');
-      expect(r.why).toBe("The gitleaks check runs, but its exit code is ignored (by ||, a pipe, an if, set +e or the step's shell), so it can't block anything.");
+      expect(r.why).toBe("The gitleaks check runs, but its exit code is ignored (by ||, a pipe, an if, set +e, the background & or the step's shell), so it can't block anything.");
     }
     // with errexit off, a tool that isn't the step's last command can't fail the step (the last one still can)
     expect((await one(`${both}${job('      - run: |\n          set +e\n          gitleaks detect\n          echo done\n')}`, 'push', 'secrets')).status).toBe('partial');
@@ -648,6 +648,76 @@ describe('mapCoverage (fix round 2)', () => {
     const lefthook = makeTempDir();
     writeIn(lefthook, 'lefthook.yml', 'pre-commit:\n  commands:\n    leaks:\n      run: gitleaks protect --staged; echo done\n');
     expect(row(await coverage(lefthook), 'pre-commit', 'secrets').status).toBe('partial');
+  });
+});
+
+describe('mapCoverage (fix round 3)', () => {
+  const step = (script: string) => `${both}${job(`      - run: |\n${script.split('\n').map((l) => `          ${l}`).join('\n')}\n`)}`;
+  const cases: [string, string, Layer, string, Coverage['status']][] = [
+    // N1: `&` inside a redirection is part of the word, not a list end
+    ['2>&1 || true', step('gitleaks detect 2>&1 || true'), 'push', 'secrets', 'partial'],
+    ['2>&1 | tee (default shell)', step('gitleaks detect 2>&1 | tee report.txt'), 'push', 'secrets', 'partial'],
+    ['&>/dev/null || true', step('gitleaks detect &>/dev/null || true'), 'push', 'secrets', 'partial'],
+    ['> out.txt 2>&1 || echo', step('gitleaks detect > out.txt 2>&1 || echo "leaks"'), 'push', 'secrets', 'partial'],
+    ['set +e, then tool 2>&1 as the last command', step('set +e\ngitleaks detect 2>&1'), 'push', 'secrets', 'covered'],
+    ['tool 2>&1 alone', step('gitleaks detect 2>&1'), 'push', 'secrets', 'covered'],
+    ['>&2 and &>> keep the run blocking', step('gitleaks detect >&2\ngitleaks detect &>> log.txt\necho done'), 'push', 'secrets', 'covered'],
+    ['|& is a pipe', step('gitleaks detect |& tee out.txt'), 'push', 'secrets', 'partial'],
+    ['a redirection before the command', step('> out.txt gitleaks detect'), 'push', 'secrets', 'covered'],
+    // U8: background &
+    ['background &, then wait', step('gitleaks detect &\nwait'), 'push', 'secrets', 'partial'],
+    ['a && b & in the background', step('echo start && gitleaks detect &\nwait'), 'push', 'secrets', 'partial'],
+    // U8: a { in argument position is not a group
+    ['stray { in an argument inside a group', step('{ gitleaks detect; echo {a; } || true'), 'push', 'secrets', 'partial'],
+    ['xargs -I {} keeps {} as a word (xargs, the last stage, fails when the tool does)', step('ls | xargs -I {} gitleaks detect --source {} ; echo done'), 'push', 'secrets', 'covered'],
+    ['a { … } group as a command still groups', step('{ gitleaks detect; echo x; } || true'), 'push', 'secrets', 'partial'],
+    // U8: backticks
+    ['backtick substitution', step('echo `gitleaks detect`'), 'push', 'secrets', 'partial'],
+    ['VAR=`tool` keeps its status', step('out=`gitleaks detect`\necho "$out"'), 'push', 'secrets', 'covered'],
+    // U8: here-documents are data
+    ["here-doc body (<<'EOF')", step("cat > scan.sh <<'EOF'\ngitleaks detect\nEOF\necho written"), 'push', 'secrets', 'missing'],
+    ['here-doc body (<<-EOF, tabs)', step('cat <<-EOF\n\tgitleaks detect\n\tEOF\necho written'), 'push', 'secrets', 'missing'],
+    ['here-doc body (<< "EOF", spaced)', step('cat << "EOF" > x\ngitleaks detect\nEOF'), 'push', 'secrets', 'missing'],
+    ["here-doc with an apostrophe, then tool || true", step("cat <<EOF\nDon't panic\nEOF\ngitleaks detect || true"), 'push', 'secrets', 'partial'],
+    ['here-doc, then a blocking tool', step('cat <<EOF > notes.txt\nhello\nEOF\ngitleaks detect'), 'push', 'secrets', 'covered'],
+    ['unterminated here-doc hides the rest', step('cat <<EOF\ngitleaks detect'), 'push', 'secrets', 'missing'],
+    ['here-string <<< is not a here-doc', step('cat <<< "x"\ngitleaks detect'), 'push', 'secrets', 'covered'],
+    // U8: function bodies
+    ['function defined, called with || echo', step('scan() { gitleaks detect --redact; }\nscan || echo "leaks"'), 'push', 'secrets', 'partial'],
+    ['function keyword', step('function scan {\n  gitleaks detect\n}\nscan'), 'push', 'secrets', 'partial'],
+    ['a tool after a function definition still counts', step('log() { echo "$@"; }\ngitleaks detect'), 'push', 'secrets', 'covered'],
+    // U8: ( set -e ) and ( cd ) stay in their subshell
+    ['( set -e ) does not restore errexit outside', step('set +e\n( set -e )\ngitleaks detect\necho done'), 'push', 'secrets', 'partial'],
+    ['set -e in a { } group does apply after it', step('set +e\n{ set -e; }\ngitleaks detect\necho done'), 'push', 'secrets', 'covered'],
+  ];
+  for (const [label, body, layer, id, want] of cases) {
+    it(`coverage: round 3: ${label} → ${want}`, async () => {
+      expect((await one(body, layer, id)).status).toBe(want);
+    });
+  }
+
+  it('coverage: round 3: ( cd x ) stays in its subshell', async () => {
+    const services = [svc('apps/api'), svc('apps/web')];
+    const r = await one(step('(cd apps/web && npm run lint)\nnpm test'), 'push', 'unit-tests', { services, monorepo: 'npm-workspaces' }, 'api');
+    expect(r.status).toBe('covered'); // npm test ran at the root, which covers every service
+  });
+
+  it('coverage: round 3: input spellings that differ only in case: a soft one wins', async () => {
+    const st = async (lines: string) => (await one(`${both}${job(`      - uses: aquasecurity/trivy-action@0.28.0\n        with:\n${lines}`)}`, 'push', 'deps', {}, 'app')).status;
+    expect(await st("          exit-code: '1'\n          EXIT-CODE: '0'\n")).toBe('partial');
+    expect(await st("          EXIT-CODE: '0'\n          exit-code: '1'\n")).toBe('partial');
+    expect(await st("          exit-code: '1'\n          Exit-Code: '2'\n")).toBe('covered');
+  });
+
+  it('coverage: round 3: Windows runners default to pwsh (the tool must be the last command)', async () => {
+    const win = (runsOn: string, extra = '', steps = '      - run: |\n          gitleaks detect\n          git status\n') =>
+      `${both}jobs:\n  scan:\n    runs-on: ${runsOn}\n${extra}    steps:\n${steps}`;
+    expect((await one(win('windows-latest'), 'push', 'secrets')).status).toBe('partial');
+    expect((await one(win('[self-hosted, Windows]'), 'push', 'secrets')).status).toBe('partial');
+    expect((await one(win('${{ matrix.os }}', '    strategy:\n      matrix:\n        os: [ubuntu-latest, windows-latest]\n'), 'push', 'secrets')).status).toBe('partial');
+    expect((await one(win('ubuntu-latest'), 'push', 'secrets')).status).toBe('covered');
+    // an explicit shell: bash on Windows keeps bash's rules
+    expect((await one(win('windows-latest', '', '      - shell: bash\n        run: |\n          gitleaks detect\n          git status\n'), 'push', 'secrets')).status).toBe('covered');
   });
 });
 
