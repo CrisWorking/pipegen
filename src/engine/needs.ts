@@ -6,7 +6,7 @@
 import { z } from 'zod';
 import { needsInstructions, NEEDS_SYSTEM } from '../ai/prompts/needs.js';
 import { completeValidated, formatAiText } from '../ai/provider.js';
-import { bundleText, type CodeBundle } from '../ai/redact.js';
+import { bundleText, redact, scrubKnownValues, type CodeBundle } from '../ai/redact.js';
 import { aiSchema, type AiSchema } from '../ai/schema.js';
 import { signingMode } from '../github/signing-mode.js';
 import { SERVER_FRAMEWORKS, SERVICE_NAME_RE } from '../read/project.js';
@@ -169,8 +169,27 @@ export function floorNeeds(p: RepoProfile, caps: Capabilities): Need[] {
   return out;
 }
 
-/** Profile service names safe to show the AI and use as the schema enum: valid names, each once. */
-const promptServices = (p: RepoProfile) => [...new Set(p.services.map((s) => s.name).filter((n) => SERVICE_NAME_RE.test(n)))];
+export interface PlanNeedsOptions {
+  /** Values the user typed (tokens, passwords): never sent to the AI, in any form scrubKnownValues knows. */
+  knownValues?: string[];
+}
+
+/**
+ * Text for an AI prompt the way bundleCode cleans file content: known values, then redact() (no path hint, so every
+ * rule is on), then known values again.
+ */
+function scrubForPrompt(text: string, knownValues: readonly string[]): string {
+  const scrub = (t: string) => (knownValues.length > 0 ? scrubKnownValues(t, [...knownValues]) : t);
+  return scrub(redact(scrub(text)));
+}
+
+/**
+ * Profile service names safe to show the AI and use as the schema enum: valid names, each once, left out when
+ * scrubForPrompt would change them (a name that looks like a token, or holds a known value), since the schema is
+ * sent to the AI too.
+ */
+const promptServices = (p: RepoProfile, knownValues: readonly string[] = []) => [...new Set(p.services.map((s) => s.name)
+  .filter((n) => SERVICE_NAME_RE.test(n) && scrubForPrompt(n, knownValues) === n))];
 
 type AiNeedsAnswer = {
   add: { id: NeedId; layer: Layer; category: NeedCategory; service: string | null; why: string; blocking: boolean }[];
@@ -179,8 +198,8 @@ type AiNeedsAnswer = {
 };
 
 /** The answer schema for this profile: ids, layers, categories and services are enums; every object is closed. */
-export function needsSchema(p: RepoProfile): AiSchema<AiNeedsAnswer> {
-  const names = promptServices(p);
+export function needsSchema(p: RepoProfile, opts: PlanNeedsOptions = {}): AiSchema<AiNeedsAnswer> {
+  const names = promptServices(p, opts.knownValues);
   const service = names.length > 0 ? z.enum(names as [string, ...string[]]).nullable() : z.null();
   return aiSchema<AiNeedsAnswer>(z.strictObject({
     add: z.array(z.strictObject({
@@ -191,9 +210,12 @@ export function needsSchema(p: RepoProfile): AiSchema<AiNeedsAnswer> {
   }));
 }
 
-/** The profile as the AI sees it (ruling S29): enum fields, booleans, counts and validated names only, never raw repo text. */
-function profileSummary(p: RepoProfile, floor: Need[]): string {
-  const names = new Set(promptServices(p));
+/**
+ * The profile as the AI sees it (ruling S29): enum fields, booleans, counts and validated names only, never raw repo
+ * text. The whole summary then goes through scrubForPrompt, like the code bundle.
+ */
+function profileSummary(p: RepoProfile, floor: Need[], knownValues: readonly string[]): string {
+  const names = new Set(promptServices(p, knownValues));
   const services = p.services.filter((s) => names.has(s.name)).map((s) => ({
     name: s.name,
     language: s.language,
@@ -220,21 +242,23 @@ function profileSummary(p: RepoProfile, floor: Need[]): string {
       .filter((n) => n.service === undefined || names.has(n.service))
       .map((n) => ({ layer: n.layer, id: n.id, service: n.service ?? null })),
   };
-  return `<repo-profile>\n${JSON.stringify(summary)}\n</repo-profile>`;
+  return scrubForPrompt(`<repo-profile>\n${JSON.stringify(summary)}\n</repo-profile>`, knownValues);
 }
 
 /**
  * The floor plus what the AI adds. The bundle goes into the prompt only through bundleText(), which refuses a
  * bundle that skipped the gitleaks pass, so nothing is sent then. `writers` is listWriters(...).length (the audit
- * passes 0). AiError (with its usage) passes through.
+ * passes 0). `opts.knownValues` (what the user typed) are scrubbed from the profile summary, and a service name holding
+ * one is left out of the prompt and the schema. AiError (with its usage) passes through.
  */
-export async function planNeeds(p: RepoProfile, caps: Capabilities, bundle: CodeBundle, ai: AiProvider, writers: number): Promise<NeedsPlan> {
+export async function planNeeds(p: RepoProfile, caps: Capabilities, bundle: CodeBundle, ai: AiProvider, writers: number, opts: PlanNeedsOptions = {}): Promise<NeedsPlan> {
   const code = bundleText(bundle); // first: throws GitleaksRequiredError before anything else happens
+  const knownValues = opts.knownValues ?? [];
   const floor = floorNeeds(p, caps);
-  const schema = needsSchema(p);
+  const schema = needsSchema(p, { knownValues });
   const { data, usage } = await completeValidated(ai, {
     system: NEEDS_SYSTEM,
-    user: `${code}\n${profileSummary(p, floor)}\n\n${needsInstructions(NEED_ID_CATEGORY)}`,
+    user: `${code}\n${profileSummary(p, floor, knownValues)}\n\n${needsInstructions(NEED_ID_CATEGORY)}`,
     schemaName: 'needs',
     jsonSchema: schema.jsonSchema,
     timeoutMs: NEEDS_TIMEOUT_MS,

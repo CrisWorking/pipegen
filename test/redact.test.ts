@@ -1085,3 +1085,201 @@ describe('closing patch', () => {
     }
   });
 });
+
+// Plan U T0b: in GitHub workflow files (.github/workflows/*.yml|yaml) and action.yml|yaml, a value that is exactly one
+// plain context reference, `id-token` set to write|read|none and `secrets` set to inherit stay readable. Everything else is hidden
+// as before. Secret-like words are joined at runtime so this file passes its own redact check.
+describe('workflow allow-list (T0b)', () => {
+  const TOK = 'tok' + 'en';
+  const SECS = 'sec' + 'rets';
+  const NPM = `NPM_${TOK.toUpperCase()}`;
+  const ID = `id-${TOK}`;
+  const ref = (name = NPM, ctx = SECS) => '${{ ' + `${ctx}.${name}` + ' }}';
+  const line = (key: string, value: string) => `          ${key}: ${value}`;
+  const WF = '.github/workflows/release.yml';
+  const hidden = (key: string) => line(key, R);
+
+  it('redact: NPM key = one secrets reference stays in a workflow, is hidden in a .ts file', () => {
+    const text = line(NPM, ref());
+    expect(redact(text, { path: WF })).toBe(text);
+    expect(redact(text, { path: 'src/release.ts' })).toBe(hidden(NPM));
+    expect(redact(text)).toBe(hidden(NPM)); // no path: hidden
+    expect(redact(text, { path: 'README.md' })).toBe(hidden(NPM));
+    for (const path of ['.github/workflows/ci.yaml', 'action.yml', 'action.yaml', 'tools/setup/action.yml', '/abs/repo/.github/workflows/ci.yml', 'pkg/.github/workflows/ci.yml']) {
+      expect(redact(text, { path }), path).toBe(text);
+    }
+  });
+
+  it('redact: id-token write|read|none and secrets inherit stay in a workflow', () => {
+    for (const v of ['write', 'read', 'none', '"write"', "'read'"]) {
+      const text = `  ${ID}: ${v}`;
+      expect(redact(text, { path: WF }), v).toBe(text);
+      const q = v.startsWith('"') || v.startsWith("'") ? v[0] : '';
+      expect(redact(text, { path: 'src/a.ts' }), v).toBe(`  ${ID}: ${q}${R}${q}`);
+    }
+    for (const v of ['inherit', '"inherit"']) {
+      const text = `    ${SECS}: ${v}`;
+      expect(redact(text, { path: WF }), v).toBe(text);
+      expect(redact(text, { path: 'action.yml' }), v).toBe(text);
+      expect(redact(text), v).toBe(`    ${SECS}: ${v.startsWith('"') ? `"${R}"` : R}`);
+    }
+  });
+
+  it('redact: a whole workflow keeps its plain references, hides the rest (exact output)', () => {
+    const pw = 'DB_PASS' + 'WORD';
+    const AK = 'API' + '_KEY';
+    const lines = [
+      'name: release',
+      'on: push',
+      'permissions:',
+      '  contents: read',
+      `  ${ID}: write`,
+      'jobs:',
+      '  publish:',
+      '    runs-on: ubuntu-latest',
+      '    steps:',
+      '      - run: npm publish',
+      '        env:',
+      `          ${NPM}: ${ref()}`,
+      `          GH_${TOK.toUpperCase()}: "${ref(TOK, 'github')}"`,
+      `          ${pw}: '` + '${{' + `${SECS}.${pw}` + "}}'",
+      `          ${AK}: ${ref(AK, 'vars')}`,
+      `          ${pw}_2: hunter2`,
+      '  call:',
+      '    uses: ./.github/workflows/x.yml',
+      `    ${SECS}: inherit`,
+      '',
+    ];
+    const expected = [...lines];
+    expected[15] = `          ${pw}_2: ${R}`;
+    expect(redact(lines.join('\n'), { path: WF })).toBe(expected.join('\n'));
+  });
+
+  it('redact: every allowed context, optional spaces, trailing blanks; other contexts and shapes hidden', () => {
+    for (const ctx of [SECS, 'vars', 'github', 'env', 'inputs', 'steps', 'needs', 'matrix']) {
+      const text = line(NPM, ref('a.B-c_9', ctx));
+      expect(redact(text, { path: WF }), ctx).toBe(text);
+    }
+    for (const v of ['${{' + SECS + '.X}}', '${{   ' + SECS + '.X   }}', `${ref()}  `, `${ref()}\t`]) {
+      const text = line(NPM, v);
+      expect(redact(text, { path: WF }), v).toBe(text);
+    }
+    for (const v of [
+      ref('X', 'runner'), ref('X', 'job'), ref('X', 'secret'), ref('X', 'Secrets'), ref('X', 'foo'), ref('', SECS),
+      ref('a b'), ref("a'b"), ref('a[0]'), '${{\t' + SECS + '.X }}', '${{ ' + SECS + ' }}', '${ ' + SECS + '.X }', '{{ ' + SECS + '.X }}',
+    ]) {
+      expect(redact(line(NPM, v), { path: WF }), v).toBe(hidden(NPM));
+    }
+    expect(redact(line(NPM, `\`${ref()}\``), { path: WF })).toBe(line(NPM, `\`${R}\``)); // backticks are not YAML quotes
+  });
+
+  it('redact: hostile values next to or around a reference stay hidden in a workflow', () => {
+    const X = ref('X');
+    for (const v of [
+      `${X}extra`, `prefix${X}`, `${X}${X}`, `${X} ${X}`, `${X} # note`, `${X}}`, `$${X}`,
+      '${{ ' + SECS + ".X || 'hunter2' }}", "${{ format('{0}', 'pw') }}", '${{ ' + SECS + '.X }} || hunter2',
+    ]) {
+      expect(redact(line(NPM, v), { path: WF }), v).toBe(hidden(NPM));
+    }
+    // quoted: the inside is hidden, the quotes stay
+    expect(redact(line(NPM, `"${X} x"`), { path: WF })).toBe(line(NPM, `"${R}"`));
+    expect(redact(line(NPM, `'${X}"`), { path: WF })).toBe(line(NPM, `'${R}`));
+    expect(redact(line(NPM, `"${X}`), { path: WF })).toBe(line(NPM, `"${R}`));
+    expect(redact(line(NPM, `"${X}" x`), { path: WF })).toBe(line(NPM, `"${R}" x`));
+    // a flow mapping is not a plain value
+    expect(redact(`permissions: { ${ID}: write }`, { path: WF })).toBe(`permissions: { ${ID}: ${R}`);
+  });
+
+  it('redact: id-token and secrets keep only their exact values, under their exact keys', () => {
+    for (const v of ['writeX', 'write extra', 'admin', 'inherit', '"write', "'write\"", 'write # c', 'Write']) {
+      expect(redact(`  ${ID}: ${v}`, { path: WF }), v).not.toContain(v);
+    }
+    for (const v of ['inherited', 'write', 'inherit x', 'Inherit']) {
+      expect(redact(`  ${SECS}: ${v}`, { path: WF }), v).toBe(`  ${SECS}: ${R}`);
+    }
+    for (const k of [`ID-${TOK.toUpperCase()}`, `x-${ID}`, `${ID}s`, `my_${SECS}`, 'Sec' + 'rets', `${SECS}.x`]) {
+      expect(redact(`  ${k}: ${k.toLowerCase().includes('id') ? 'write' : 'inherit'}`, { path: WF }), k).toBe(`  ${k}: ${R}`);
+    }
+  });
+
+  it('redact: a real token next to an allowed reference is still hidden', () => {
+    const gh = fake.githubClassic();
+    expect(redact(line(NPM, `${ref()} ${gh}`), { path: WF })).toBe(hidden(NPM));
+    expect(redact(line(NPM, ref(gh)), { path: WF })).toBe(hidden(NPM)); // a token as the reference name
+    expect(redact(`        run: echo ${ref()} ${fake.npmPublish()}`, { path: WF })).toBe(`        run: echo ${ref()} ${R}`);
+    expect(redact(`${line(NPM, ref())}\n          OTHER: ${gh}`, { path: WF })).toBe(`${line(NPM, ref())}\n          OTHER: ${R}`);
+    expect(redact(`  ${ID}: ${fake.jwt()}`, { path: WF })).toBe(`  ${ID}: ${R}`);
+  });
+
+  it('redact: a multi-line value under a key stays hidden, also after an allowed reference', () => {
+    const X = ref('X');
+    expect(redact(`${line(NPM, '|')}\n            ${X}\n            hunter2\n          next: 1`, { path: WF }))
+      .toBe(`${line(NPM, '|')}\n            ${R}\n            ${R}\n          next: 1`);
+    expect(redact(`${line(NPM, '>-')}\n            ${X}`, { path: WF })).toBe(`${line(NPM, '>-')}\n            ${R}`);
+    expect(redact(`${line(NPM, '')}\n            ${X}`, { path: WF })).toBe(`${line(NPM, '')}\n            ${R}`);
+    // a plain YAML value may go on over more-indented lines: those are hidden after a kept reference
+    expect(redact(`${line(NPM, X)}\n              hunter2\n          next: 1`, { path: WF }))
+      .toBe(`${line(NPM, X)}\n              ${R}\n          next: 1`);
+    expect(redact(`  ${ID}: write\n    hunter2\n  contents: read`, { path: WF })).toBe(`  ${ID}: write\n    ${R}\n  contents: read`);
+    // the nested `secrets` mapping of a reusable-workflow call is still hidden whole (over-redaction, documented)
+    expect(redact(`    ${SECS}:\n      ${NPM}: ${X}`, { path: WF })).toBe(`    ${SECS}:\n      ${R}`);
+  });
+
+  it('redact: the allow-list holds only for workflow and action paths', () => {
+    const text = `${line(NPM, ref())}\n  ${ID}: write\n    ${SECS}: inherit`;
+    const all = `${hidden(NPM)}\n  ${ID}: ${R}\n    ${SECS}: ${R}`;
+    for (const path of [
+      'workflows.yml.txt', '.github/workflows.yml.txt', '.github/workflows/ci.yml.txt', '.github/workflows/ci.yml.bak', '.github/workflows/ci.json',
+      '.github/workflows/../../x.yml', '.github/workflows/./ci.yml', 'x/../.github/workflows/ci.yml', '.github/workflows//ci.yml',
+      '.github/workflows/sub/ci.yml', '.github/ci.yml', 'workflows/ci.yml', '.GITHUB/WORKFLOWS/CI.YML', '.github/workflows/ci.YML',
+      '.github\\workflows\\ci.yml', '.github/workflows/.yml', 'action.yml.txt', 'myaction.yml', 'action.json', 'dir/action.yml/x.yml', 'action.ymlx',
+      '.github/workflows/ci.ym', '.github/workflows/ci.yaaml',
+    ]) {
+      expect(redact(text, { path }), path).toBe(all);
+    }
+  });
+
+  it('redact: CRLF workflow keeps the allowed lines (with their CRs) and hides the hostile ones', () => {
+    const X = ref('X');
+    const text = [line(NPM, X), line(ID, 'write'), line(SECS, 'inherit'), line(NPM, `${X}extra`), line(NPM, `prefix${X}`), line(ID, 'writeX'), line(NPM, '|'), `            ${X}`, ''].join('\r\n');
+    const expected = [line(NPM, X), line(ID, 'write'), line(SECS, 'inherit'), hidden(NPM), hidden(NPM), hidden(ID), line(NPM, '|'), `            ${R}`, ''].join('\r\n');
+    expect(redact(text, { path: WF })).toBe(expected);
+    // a lone CR inside the line is not a line end: the value is not exactly one reference
+    expect(redact(line(NPM, `${X}\rhunter2`), { path: WF })).toBe(hidden(NPM));
+  });
+
+  it('bundle: known values and gitleaks still apply to workflow files', async () => {
+    const known = 'tenant' + '-wf-' + 'q77';
+    const found = 'GlFound' + 'Val' + '99';
+    const dir = makeTempDir();
+    const [A, B] = ['A_', 'B_'].map((p) => p + TOK.toUpperCase());
+    writeIn(dir, '.github/workflows/ci.yml', [line(NPM, ref()), line(A, ref(known)), line(ID, 'write'), line(B, `${ref()} ${found}`), line('C', found), ''].join('\n'));
+    const b = await bundleCode(dir, { knownValues: [known], gitleaks: makeStub(reportValue(found)).bin });
+    expect(b.files.map((f) => f.content)).toEqual([[line(NPM, ref()), hidden(A), line(ID, 'write'), hidden(B), line('C', R), ''].join('\n')]);
+  });
+
+  it('redact: workflow-path scanning stays linear', () => {
+    const shapes = [
+      `${TOK}: "${ref()}" `, `${TOK}: "` + '${{ ' + SECS + '.' + 'a'.repeat(60) + '" ', `${TOK}:'` + '${{' + ' '.repeat(40) + "' ", `${ID}: "write" `,
+      `${TOK}: '${ref()}'` + ' '.repeat(30) + 'x ', `"${TOK}": "write" `,
+    ];
+    const fromLines = (u: string, L: number, bytes: number) => {
+      const l = u.repeat(Math.max(1, Math.floor(L / u.length))) + '\n';
+      return l.repeat(Math.max(1, Math.round(bytes / l.length)));
+    };
+    const best = (t: string) => Math.min(...[0, 1, 2].map(() => {
+      const s = performance.now();
+      redact(t, { path: WF });
+      return performance.now() - s;
+    }));
+    const failures: string[] = [];
+    for (const u of shapes) {
+      const long = fromLines(u, 4000, 256 * 1024);
+      const short = fromLines(u, 512, 256 * 1024);
+      redact(long, { path: WF }); // warm-up
+      const ratio = best(long) / Math.max(best(short), 3);
+      if (ratio >= 3) failures.push(`${u}: ${ratio.toFixed(2)}`);
+    }
+    expect(failures).toEqual([]);
+  }, 60_000);
+});

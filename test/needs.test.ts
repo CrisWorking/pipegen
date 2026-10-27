@@ -12,6 +12,7 @@ import {
 } from '../src/types.js';
 import { hostileNames } from './fixtures/hostile-names.js';
 import { CLEAN, makeStub } from './helpers/gitleaks-stub.js';
+import { fake } from './helpers/secret-repo.js';
 import { cleanupRepos, makeRepo, makeTempDir, writeIn } from './helpers/make-repo.js';
 import { strictProblems } from './helpers/strict-schema.js';
 
@@ -622,5 +623,36 @@ describe('planNeeds', () => {
       expect(find(r.needs, 'merge', 'dast', name)).toHaveLength(1);
     }
     expect((needsSchema(p).jsonSchema as any).properties.add.items.properties.service.anyOf[0].enum).toEqual(['web', 'web-2']);
+  });
+  // Plan U T0b: the profile summary goes through scrubKnownValues → redact → scrubKnownValues like the bundle, and a
+  // service name that redaction or a known value would change is never shown to the AI (summary or schema enum).
+  it('planNeeds: a key-like service name and a known value never reach the AI request', async () => {
+    const keyName = fake.openaiKey(); // passes SERVICE_NAME_RE
+    const known = 'acme' + '-q7';
+    const p = profile({ services: [web(), web({ name: keyName }), lib({ name: `${known}-lib` })] });
+    const ai = mockAi(quiet);
+    const r = await planNeeds(p, PUBLIC, bundle, ai.p, 0, { knownValues: [known] });
+    expect(ai.calls).toHaveLength(1);
+    const sent = JSON.stringify(ai.calls[0]);
+    expect(sent).not.toContain(keyName);
+    expect(sent).not.toContain(known);
+    const user = ai.calls[0]!.user;
+    const summary = user.slice(user.indexOf('<repo-profile>'), user.indexOf('</repo-profile>'));
+    expect(summary).toContain('"name":"web"'); // ordinary names still shown
+    // the floor still covers every service; only the prompt leaves them out
+    for (const name of [keyName, `${known}-lib`]) expect(find(r.needs, 'push', 'sast', name)).toHaveLength(1);
+    // without known values the token-like name is still kept out
+    const ai2 = mockAi(quiet);
+    await planNeeds(p, PUBLIC, bundle, ai2.p, 0);
+    expect(JSON.stringify(ai2.calls[0])).not.toContain(keyName);
+  });
+
+  it('planNeeds: the profile summary itself is scrubbed with the known values', async () => {
+    const ai = mockAi(quiet);
+    await planNeeds(profile({ services: [web()] }), PUBLIC, bundle, ai.p, 0, { knownValues: ['express'] });
+    const user = ai.calls[0]!.user;
+    const summary = user.slice(user.indexOf('<repo-profile>'), user.indexOf('</repo-profile>'));
+    expect(summary).not.toContain('express');
+    expect(summary).toContain('"frameworks":["[REDACTED]"]');
   });
 });

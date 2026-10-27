@@ -324,8 +324,10 @@ const skipBlanks = (s: string, i: number) => {
  * a value whose block is not more indented than its key (`"Passwords":` then `{` at the same indent, an unindented `<setting>`/`<value>` pair);
  * only name="..."/key="..." (or the element's own name) start a block; other attributes (`id="DbPassword"`) do not;
  * Over-redacting is the safe direction: type annotations such as `token: string` lose their type too.
+ * With `workflow` (a GitHub workflow or action file, see isWorkflowPath), a `name SEP value` whose value is
+ * exactly one allowed expression is kept (see isAllowedWorkflowValue); every other rule is unchanged.
  */
-function assignmentSpans(s: string): { spans: Span[]; block: boolean } {
+function assignmentSpans(s: string, workflow = false): { spans: Span[]; block: boolean } {
   const spans: Span[] = [];
   const n = s.length;
   let block = false;
@@ -457,6 +459,10 @@ function assignmentSpans(s: string): { spans: Span[]; block: boolean } {
       if (header.comment >= 0) spans.push([header.comment, n]);
       break;
     }
+    // Workflow and action files only: a value that is exactly one plain context reference (or id-token's
+    // write|read|none, or secrets' inherit) holds no secret and stays. It runs to the end of the line, so nothing
+    // is left to scan; the more-indented lines after it (where a plain YAML value can go on) are hidden as a block.
+    if (workflow && isAllowedWorkflowValue(name, s, v)) { block = true; break; }
     const c = code(s, v);
     // Authorization: <scheme> <credentials>
     if (name.toLowerCase().includes('authorization')) {
@@ -635,13 +641,58 @@ function findKeyMarker(line: string, kind: 'BEGIN' | 'END', from: number): { sta
   return null;
 }
 
+// ----- workflow allow-list -----
+
+/**
+ * True for a GitHub Actions workflow (`.github/workflows/<name>.yml` or `.yaml`, directly in that folder; any
+ * folder above it) or an action metadata file (`action.yml` or `action.yaml`, in any folder). Exact,
+ * case-sensitive names; a path with a backslash or with an empty, `.` or `..` segment never counts, so
+ * `.github/workflows/../../x.yml` is not a workflow.
+ */
+function isWorkflowPath(path: string): boolean {
+  if (path.includes('\\')) return false;
+  const parts = path.split('/');
+  if (parts[0] === '') parts.shift(); // an absolute path
+  if (parts.some((p) => p === '' || p === '.' || p === '..')) return false;
+  const base = parts[parts.length - 1];
+  if (base === 'action.yml' || base === 'action.yaml') return true;
+  const yaml = (base.endsWith('.yml') && base.length > 4) || (base.endsWith('.yaml') && base.length > 5);
+  return yaml && parts.length >= 3 && parts[parts.length - 2] === 'workflows' && parts[parts.length - 3] === '.github';
+}
+
+// Sticky, anchored at the value's start and at the end of the piece, so each test looks only at the value. The
+// character classes around each repeat don't overlap, so a failed test costs at most the length of what it read.
+// A value may be wrapped in one pair of matching quotes, and followed by blanks only (no comment, nothing else).
+const WORKFLOW_REF = /(["']?)\$\{\{ *(?:secrets|vars|github|env|inputs|steps|needs|matrix)\.[A-Za-z0-9_.-]+ *\}\}\1[ \t]*$/y;
+const ID_TOKEN_VALUE = /(["']?)(?:write|read|none)\1[ \t]*$/y;
+const INHERIT_VALUE = /(["']?)inherit\1[ \t]*$/y;
+
+const stickyTest = (re: RegExp, s: string, at: number) => {
+  re.lastIndex = at;
+  return re.test(s);
+};
+
+/**
+ * True when the value starting at `v` (running to the end of `s`) is one of the harmless workflow values: exactly
+ * one `${{ <context>.<name> }}` reference (context secrets, vars, github, env, inputs, steps, needs or matrix; name
+ * [A-Za-z0-9_.-]+; spaces allowed inside the braces), `write`, `read` or `none` under the key `id-token`, or
+ * `inherit` under the key `secrets`. Anything else on the value (a second reference, an operator, a default, a
+ * function call, text before or after, a comment) makes it an ordinary value, hidden as before.
+ */
+function isAllowedWorkflowValue(name: string, s: string, v: number): boolean {
+  if (stickyTest(WORKFLOW_REF, s, v)) return true;
+  if (name === 'id-token') return stickyTest(ID_TOKEN_VALUE, s, v);
+  if (name === 'secrets') return stickyTest(INHERIT_VALUE, s, v);
+  return false;
+}
+
 /** One plain piece of a line (no key markers, at most 4 KB) with every rule applied, in order. */
-function redactSegment(s: string): { text: string; block: boolean } {
+function redactSegment(s: string, workflow = false): { text: string; block: boolean } {
   let out = s;
   for (const [, re] of TOKEN_RULES) out = replaceSpans(out, regexSpans(out, re));
   out = replaceSpans(out, jwtSpans(out));
   out = replaceSpans(out, connectionSpans(out));
-  const a = assignmentSpans(out);
+  const a = assignmentSpans(out, workflow);
   return { text: replaceSpans(out, a.spans), block: a.block };
 }
 
@@ -727,10 +778,17 @@ function hideSectionValue(line: string): string {
  *   call without a path keep it. The same files also hide every value under a TOML/INI section header named
  *   after a secret (`[secrets]`, `[database.password]`), up to the next section header;
  * - a line over 4 KB is replaced whole (it is too long to scan safely), and so are the more-indented
- *   lines right after it, since it may have opened such a block (in every kind of file).
+ *   lines right after it, since it may have opened such a block (in every kind of file);
+ * - in a GitHub workflow or action file (`hint.path` is `.github/workflows/<name>.yml|yaml` or
+ *   `action.yml|yaml`), a key whose whole value is one plain `${{ secrets|vars|github|env|inputs|steps|needs|matrix.<name> }}`
+ *   reference keeps it, and so do `id-token` with write/read/none and `secrets` with inherit. The token
+ *   formats, JWTs and connection strings are replaced first, so a token on such a line is still hidden (and the
+ *   value is then no longer one plain reference). The more-indented lines after a kept value are hidden. A
+ *   nested `secrets:` mapping is still hidden whole (its key has an empty value).
  */
 export function redact(text: string, hint?: { path?: string }): string {
   const blockRule = hint?.path === undefined || !isCodePath(hint.path);
+  const workflow = hint?.path !== undefined && isWorkflowPath(hint.path);
   const out: string[] = [];
   let inKey = false;
   let blockCols = -1; // >= 0 while hiding an indented value block
@@ -796,7 +854,7 @@ export function redact(text: string, hint?: { path?: string }): string {
     let block = false;
     out.push(pieces.map((p) => {
       if (p === R) return R;
-      const r = redactSegment(p);
+      const r = redactSegment(p, workflow);
       block ||= r.block;
       return r.text;
     }).join('') + cr);
