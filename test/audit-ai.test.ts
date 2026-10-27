@@ -173,7 +173,7 @@ async function setup(o: SetupOpts = {}) {
   const ai = fakeAi(o.ai);
   const deps: AiSuggestDeps = {
     ai: ai.p, gh: gh.gh, memory: fakeMemory(), fetch: web.fetch, reviewed, bar: BAR, budget: newRateBudget(), now: () => NOW,
-    sleep: vi.fn(async () => {}), knownValues: [], ensureGitleaks: ensure, anonymous: false, capUsd: null, ...o.deps,
+    sleep: vi.fn(async () => {}), knownValues: [], ensureGitleaks: ensure, anonymous: false, capUsd: 1e9, ...o.deps,
   };
   return { dir, r, deps, ai, stub, ensure, ghCalls: gh.calls };
 }
@@ -300,7 +300,7 @@ describe('addAiSuggestions (controller rulings)', () => {
   it('S11: ai holds extraNeeds, suggestions, notes and usage', async () => {
     const s = await setup();
     const out = await addAiSuggestions(s.r, s.dir, s.deps);
-    expect(Object.keys(out.ai ?? {}).sort()).toEqual(['extraNeeds', 'notes', 'suggestions', 'usage']);
+    expect(Object.keys(out.ai ?? {}).sort()).toEqual(['attempts', 'costUsd', 'extraNeeds', 'notes', 'suggestions', 'usage']);
     expect(new Set(out.ai?.notes).size).toBe(out.ai?.notes.length); // deduped
     expect(out.ai?.notes).toContain(ONLY_ACTIONS_NPM);
     // the rest of the report is buildAudit's
@@ -423,8 +423,33 @@ describe('addAiSuggestions (controller rulings)', () => {
 
     // a request without an output limit has no bound: refused under any cap; no cap (local model): never refused
     await expect(new AiSpendMeter(inner, 1_000).provider.complete(withLimit(req, undefined))).rejects.toMatchObject({ kind: 'cost-cap' });
-    await new AiSpendMeter(inner, null).provider.complete(withLimit(req, undefined));
+    await new AiSpendMeter({ ...inner, name: 'ollama' }, null).provider.complete(withLimit(req, undefined));
     expect(sent).toHaveLength(4);
+  });
+
+  it('H1: capUsd null is a cap of 0 for a paid provider (every call refused, cost-cap note) and no cap for Ollama', async () => {
+    const paid = await setup({ deps: { capUsd: null } });
+    const out = await addAiSuggestions(paid.r, paid.dir, paid.deps);
+    expect(paid.ai.reqs).toHaveLength(0);
+    expect(out.ai?.usage).toEqual(usageOf(0, 0));
+    expect(out.ai?.notes.some((n) => n.includes('AI cost limit'))).toBe(true);
+    const local = await setup({ ai: { name: 'ollama', model: 'llama3' }, deps: { capUsd: null } });
+    await addAiSuggestions(local.r, local.dir, local.deps);
+    expect(local.ai.reqs.length).toBeGreaterThan(0);
+  });
+
+  it('C3: each attempt is priced in the tier of its own prompt, not of the sum', async () => {
+    const req = withLimit({ system: 's', user: 'u', schemaName: 'candidates', jsonSchema: { type: 'object' }, timeoutMs: 1_000 }, 100);
+    const inner: AiProvider = { name: 'claude', model: 'claude-haiku-5-5', complete: async () => ({ data: {}, usage: use(60_000, 1_000) }) };
+    const meter = new AiSpendMeter(inner, 1e9);
+    await meter.provider.complete(req);
+    await meter.provider.complete(req); // 120,000 input tokens together, over the 100,000 tier; each alone is under it
+    const each = (60_000 / 1e6) * 0.1 + (1_000 / 1e6) * 0.5;
+    expect(meter.attempts).toEqual([
+      { model: 'claude-haiku-5-5', input: 60_000, output: 1_000, cacheRead: 0, cacheWrite: 0, listUsd: expect.closeTo(each, 10) },
+      { model: 'claude-haiku-5-5', input: 60_000, output: 1_000, cacheRead: 0, cacheWrite: 0, listUsd: expect.closeTo(each, 10) },
+    ]);
+    expect(meter.costUsd).toBeCloseTo(2 * each, 10);
   });
 
   it('N1 (U14): a model with no price is refused before any AI call (no hard cap can be kept), with the priced choices', async () => {

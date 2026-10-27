@@ -38,7 +38,7 @@ import { floorNeeds, isRunnable, jobCategories, needsPromptBytes, planNeeds, typ
 import type { QualityBar } from '../engine/quality-bar.js';
 import { projectScriptFor, reviewedFor, type ProjectScriptStep } from '../engine/reviewed.js';
 import {
-  activity30d, aiRequestBytes, estimate, requestCeilingUsd, unpricedModel, usageCeilingUsd, type Activity, type Estimates,
+  activity30d, aiRequestBytes, estimate, requestCeilingUsd, unpricedModel, usageCeilingUsd, usageCostUsd, type Activity, type Estimates,
 } from '../estimate/estimate.js';
 import { signingMode } from '../github/signing-mode.js';
 import { IGNORED_DIRS, listFiles, READ_LIMITS, readTextLimited, readTextLimitedWithReason } from '../read/limits.js';
@@ -114,6 +114,24 @@ export interface AuditAi {
   notes: string[];
   /** Every AI attempt of this step, summed by the spend meter (the needs call, its retry and every discovery attempt, failed ones included; rulings B2, U13). */
   usage: Required<AiUsage>;
+  /**
+   * ABOUT what the AI step cost at list price (USD): the sum of `attempts[].listUsd`. It is an approximation: cache reads
+   * are priced as full input (no cache discount), and a run the refusal fallback sent to another model is priced at the
+   * primary model's list price. Each attempt is priced in the tier its own prompt length falls in. 0 for a local model.
+   */
+  costUsd: number;
+  /** One record per attempt that reported usage (failed ones included), in the order they settled. */
+  attempts: AiAttempt[];
+}
+
+/** One settled AI attempt and its list cost (see AuditAi.costUsd for why the cost is "about"). */
+export interface AiAttempt {
+  model: string;
+  input: number;
+  output: number;
+  cacheRead: number;
+  cacheWrite: number;
+  listUsd: number;
 }
 
 export interface AuditDeps {
@@ -479,7 +497,7 @@ export interface AiSuggestDeps {
   anonymous: boolean;
   /**
    * estimateAuditAi(provider, needCount, needsRequestBytes(r, knownValues)).capUsd, exactly as the consent screen showed
-   * it: a hard cap on this step's AI spend (rulings B2, U13). null for a local model (no cap).
+   * it: a hard cap on this step's AI spend (rulings B2, U13). null only for a local model (no cap): for a paid provider null counts as 0, so every AI call is refused (review H1).
    */
   capUsd: number | null;
 }
@@ -518,7 +536,7 @@ const needKey = (n: Pick<Need, 'layer' | 'id' | 'service'>) => `${n.layer}\u0000
  * limit, the highest price it could bill at). An attempt that doesn't fit (spent + reserved + its worst case > cap) is
  * refused with AiError('cost-cap') and never sent, the needs call included. After the attempt, the reservation is swapped
  * for the cost of its usage at the same prices; an error without usage (a timeout, a dropped connection) keeps the full
- * reservation, since the provider may still bill what it produced. capUsd null (a local model): nothing is refused.
+ * reservation, since the provider may still bill what it produced. capUsd null: nothing is refused for a local model (Ollama); for a paid provider null counts as 0, so everything is refused (review H1).
  */
 export class AiSpendMeter {
   /** USD settled so far (usage priced at the ceiling rates, plus the reservations of attempts that ended without usage). */
@@ -527,21 +545,27 @@ export class AiSpendMeter {
   reservedUsd = 0;
   /** Every attempt's usage, summed (failed attempts that reported usage included). */
   readonly usage: Required<AiUsage> = { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0 };
+  /** Each settled attempt with its own list cost (tier by its own prompt length); costUsd is their sum. */
+  readonly attempts: AiAttempt[] = [];
+  /** The cap in force: capUsd, except that null means 0 for a paid provider. null only for Ollama (no cap). */
+  readonly effectiveCapUsd: number | null;
   /** What planNeeds and suggestTools are given: the same name and model, every call metered (no other field is copied). */
   readonly provider: AiProvider;
   readonly #inner: AiProvider;
   constructor(inner: AiProvider, readonly capUsd: number | null) {
     this.#inner = inner;
+    this.effectiveCapUsd = capUsd === null && inner.name !== 'ollama' ? 0 : capUsd;
     this.provider = { name: inner.name, model: inner.model, complete: (req) => this.#complete(req) };
   }
   async #complete(req: AiRequest): Promise<{ data: unknown; usage: AiUsage }> {
     let reserved = 0;
-    if (this.capUsd !== null) {
+    const cap = this.effectiveCapUsd;
+    if (cap !== null) {
       // one validator for the output limit (review N3): anything set but not a whole number above 0 is refused here;
       // no limit at all means no bound (Infinity), so the attempt can't fit any cap
       const worst = requestCeilingUsd(this.#inner, aiRequestBytes(req), outputLimit(req.maxOutputTokens) ?? Number.POSITIVE_INFINITY);
       if (worst !== 'local') {
-        if (!(this.spentUsd + this.reservedUsd + worst <= this.capUsd)) throw new AiError('cost-cap', COST_CAP_MESSAGE);
+        if (!(this.spentUsd + this.reservedUsd + worst <= cap)) throw new AiError('cost-cap', COST_CAP_MESSAGE);
         reserved = worst;
         this.reservedUsd += worst;
       }
@@ -569,7 +593,16 @@ export class AiSpendMeter {
     const c = usageCeilingUsd(this.#inner, u);
     if (c !== 'local') this.spentUsd += c;
   }
+  /** Total list cost of the attempts (USD). */
+  get costUsd(): number {
+    return this.attempts.reduce((sum, a) => sum + a.listUsd, 0);
+  }
   #addUsage(u: AiUsage): void {
+    const listUsd = usageCostUsd(this.#inner, u);
+    this.attempts.push({
+      model: this.#inner.model, input: count(u.inputTokens), output: count(u.outputTokens),
+      cacheRead: count(u.cacheReadTokens), cacheWrite: count(u.cacheWriteTokens), listUsd: listUsd === 'local' ? 0 : listUsd,
+    });
     this.usage.inputTokens += count(u.inputTokens);
     this.usage.outputTokens += count(u.outputTokens);
     this.usage.cacheReadTokens += count(u.cacheReadTokens);
@@ -618,7 +651,7 @@ export async function addAiSuggestions(r: AuditReport, dir: string, deps: AiSugg
   // every AI attempt goes through the meter: the one record of usage and the hard cap (ruling U13, review M1)
   const meter = new AiSpendMeter(deps.ai, deps.capUsd);
   // a model with no price can't keep a hard cap: nothing is sent (ruling U14; the CLI already stops before consent)
-  const unpriced = deps.capUsd === null ? null : unpricedModel(deps.ai);
+  const unpriced = meter.effectiveCapUsd === null ? null : unpricedModel(deps.ai);
   let extraNeeds: Need[] = [];
   let suggestions: PipelineDraft['suggestions'] = [];
   const known = deps.knownValues.filter((v) => typeof v === 'string' && v.trim() !== '');
@@ -634,6 +667,8 @@ export async function addAiSuggestions(r: AuditReport, dir: string, deps: AiSugg
         suggestions: r.reviewedUnavailable ? [] : suggestions.map((x) => ({ name: scrub(x.name), repo: scrub(x.repo), why: scrub(x.why) })),
         notes: [...new Set([...notes].map(scrub))],
         usage: { ...meter.usage },
+        costUsd: meter.costUsd,
+        attempts: meter.attempts.map((a) => ({ ...a })),
       },
     };
   };
@@ -662,7 +697,7 @@ export async function addAiSuggestions(r: AuditReport, dir: string, deps: AiSugg
     plan = await planNeeds(r.profile, r.capabilities, bundle, meter.provider, 0, { knownValues: deps.knownValues });
   } catch (e) {
     if (!(e instanceof AiError)) throw e;
-    notes.add(e.kind === 'cost-cap' && deps.capUsd !== null ? AI_NOTE.needsCapped(deps.capUsd) : AI_NOTE.stopped(AI_KIND_TEXT[e.kind]));
+    notes.add(e.kind === 'cost-cap' && meter.effectiveCapUsd !== null ? AI_NOTE.needsCapped(meter.effectiveCapUsd) : AI_NOTE.stopped(AI_KIND_TEXT[e.kind]));
     if (e.kind === 'refusal' && refusalFallbackNoteFor(deps.ai) !== null) notes.add(AI_NOTE.fallbackTried);
     return done();
   }

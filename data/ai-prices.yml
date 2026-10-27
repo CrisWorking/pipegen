@@ -11,7 +11,8 @@ providers:
     # checked against https://platform.claude.com/docs/en/about-claude/pricing.md on 2026-10-27 (same numbers).
     # claude-haiku-5-5: $0.10 / $0.50 for prompts up to 100,000 tokens, $0.50 / $2.50 above (pricing page, "Long context
     # pricing"; skill shared/models.md). Claude 4.6 and later models other than Haiku 5.5 have no long-context tier.
-    # claude-mythos-5-1 / claude-mythos-5: $10 / $50 (pricing page); they are refusal-fallback models, so they need a price.
+    # claude-mythos-5-1 / claude-mythos-5: $10 / $50 (pricing page); they are priced so they can be chosen directly and so the refusal-fallback charge can use them (the actual fallback
+    # targets are claude-opus-5 and claude-opus-4-8).
     source: 'https://platform.claude.com/docs/en/about-claude/pricing.md (read 2026-10-27); claude-api skill model table (cached 2026-10-06)'
     local: false
     models:
