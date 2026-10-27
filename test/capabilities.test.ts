@@ -46,6 +46,23 @@ const profile = (over: Partial<RepoProfile>): RepoProfile => ({
 const ALL: Capabilities = { branchProtection: true, environments: true, deploymentBranchPolicies: true, envRequiredReviewers: true, attestations: true, codeScanning: true, keylessSigningAllowed: true };
 
 describe('probeCapabilities', () => {
+  it('probe: no answer from GitHub (network) is never blamed on the token (final review batch 2, M1)', async () => {
+    const offline = (async () => { throw new TypeError('fetch failed'); }) as typeof fetch;
+    const gh = makeOctokit(fake.githubPat(), { fetch: offline });
+    const notes: string[] = [];
+    const caps = await probeCapabilities(gh, 'o', 'r', { private: true, plan: 'pro', ownerType: 'User', defaultBranch: 'main' }, notes, clock());
+    expect(notes.join('\n')).not.toContain('with this token');
+    expect(notes).toEqual([
+      "GitHub didn't answer when pipegen checked branch protection (a network problem); used the plan table.",
+      "GitHub didn't answer when pipegen checked environments (a network problem); treated as not available.",
+      "GitHub didn't answer when pipegen checked code scanning (a network problem); treated as not available.",
+      POLICY_NOTE,
+    ]);
+    // the fallbacks are the same as for any other inconclusive probe (fail closed)
+    expect(caps).toMatchObject({ branchProtection: true, environments: false, codeScanning: false, deploymentBranchPolicies: false });
+    expect(classifyProbe(await gh.rest.repos.get({ owner: 'o', repo: 'r' }).catch((e: unknown) => e))).toEqual({ result: 'inconclusive', why: 'network' });
+  });
+
   it('probe: public repo → all true', async () => {
     const { caps, notes, calls } = await probe({ [RULESETS]: ok, [ENVS]: noEnvs, [SCAN]: err(404, 'no analysis found') }, { private: false, plan: 'free', ownerType: 'User' });
     expect(caps).toEqual(ALL);

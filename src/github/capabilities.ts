@@ -10,7 +10,9 @@
 //   permission, which says nothing about the plan.
 // - Code scanning (S3): 404 "no analysis found" → available (enabled, nothing uploaded yet); 403 "Code scanning is
 //   not enabled…" or "Advanced Security must be enabled…" → not available (S3 maps these explicitly).
-// - Anything else (another 403, 404, 422, 5xx, network) → inconclusive.
+// - No HTTP answer at all (DNS, connection, TLS, timeout: Octokit's status 500 without a response) → inconclusive, and
+//   the note says GitHub didn't answer (a network problem), never that the token couldn't check it.
+// - Anything else (another 403, 404, 422, 5xx) → inconclusive.
 // - 401 → a hard "GitHub rejected the token" error. A rate limit stops the probe (GitHubRateLimitError is thrown).
 //
 // What an inconclusive probe becomes (fix round 1, R2/R4: fail closed where pipegen would rely on it):
@@ -44,7 +46,7 @@
 import type { Octokit } from '@octokit/rest';
 import type { Capabilities, RepoProfile } from '../types.js';
 import { isRateStop, withRateLimit, type RateClock } from '../engine/github-rate.js';
-import { checkRepoNames, clockOf, githubTokenRejected, isAnonymousClient } from './client.js';
+import { checkRepoNames, clockOf, githubTokenRejected, isAnonymousClient, isNoAnswer } from './client.js';
 
 /** Plan B Task 1's pure signingMode, re-exported (not written again). key-env needs environments AND proven deployment branch policies (DECISIONS #86, fix round 1 R4). */
 export { signingMode, type SigningMode } from './signing-mode.js';
@@ -72,7 +74,7 @@ export function capabilityTable(p: ProfileBits): Capabilities {
   };
 }
 
-export type ProbeClass = { result: 'unavailable' } | { result: 'inconclusive'; why: 'permission' | 'other' };
+export type ProbeClass = { result: 'unavailable' } | { result: 'inconclusive'; why: 'permission' | 'network' | 'other' };
 
 const messageOf = (e: unknown): string => {
   const err = e as { message?: unknown; response?: { data?: { message?: unknown } } } | null;
@@ -86,6 +88,7 @@ const statusOf = (e: unknown): number | undefined => {
 
 /** How to read a failed probe (the rules in the header). Plan G uses it for its write calls too (422 "billing plan"). */
 export function classifyProbe(e: unknown): ProbeClass {
+  if (isNoAnswer(e)) return { result: 'inconclusive', why: 'network' };
   const status = statusOf(e);
   const msg = messageOf(e);
   if ((status === 403 || status === 422) && /\bupgrade\b|billing plan/i.test(msg)) return { result: 'unavailable' };
@@ -93,7 +96,8 @@ export function classifyProbe(e: unknown): ProbeClass {
   return { result: 'inconclusive', why: 'other' };
 }
 
-type Answer<T> = { ok: true; data: T } | { ok: false; settled?: boolean };
+/** `network`: GitHub never answered (not settled; the note must not blame the token). */
+type Answer<T> = { ok: true; data: T } | { ok: false; settled?: boolean; network?: boolean };
 
 /**
  * One GET probe: its data, or a settled false, or nothing settled. Rate stops are thrown, and so is a 401 on a client
@@ -108,7 +112,8 @@ async function ask<T>(gh: Octokit, call: () => Promise<{ data: T }>, clock: Rate
     const s = special?.(e);
     if (s === true) return { ok: true, data: undefined as T };
     if (s === false) return { ok: false, settled: true };
-    return { ok: false, settled: classifyProbe(e).result === 'unavailable' ? true : undefined };
+    const c = classifyProbe(e);
+    return { ok: false, settled: c.result === 'unavailable' ? true : undefined, network: c.result === 'inconclusive' && c.why === 'network' };
   }
 }
 /** true / false when the probe settled it, undefined when it didn't. */
@@ -147,27 +152,30 @@ function onlyDefaultBranch(data: unknown, branch: string): boolean {
 export async function probeCapabilities(gh: Octokit, owner: string, repo: string, p: ProfileBits & Pick<RepoProfile, 'defaultBranch'>, notes: string[] = [], clock: RateClock = clockOf(gh)): Promise<Capabilities> {
   checkRepoNames(owner, [repo]);
   const table = capabilityTable(p);
-  const couldnt = (what: string, then: string) => notes.push(`Couldn't check ${what} with this token; ${then}.`);
+  const couldnt = (what: string, then: string, a: Answer<unknown>) => notes.push(!a.ok && a.network
+    ? `GitHub didn't answer when pipegen checked ${what} (a network problem); ${then}.`
+    : `Couldn't check ${what} with this token; ${then}.`);
 
-  let branchProtection = verdict(await ask(gh, () => gh.rest.repos.getRepoRulesets({ owner, repo, per_page: 1 }), clock));
+  const rulesets = await ask(gh, () => gh.rest.repos.getRepoRulesets({ owner, repo, per_page: 1 }), clock);
+  let branchProtection = verdict(rulesets);
   if (branchProtection === undefined) {
-    couldnt('branch protection', 'used the plan table');
+    couldnt('branch protection', 'used the plan table', rulesets);
     branchProtection = table.branchProtection;
   }
 
   const envs = await ask(gh, () => gh.rest.repos.getAllEnvironments({ owner, repo, per_page: 100 }), clock);
   let environments = verdict(envs);
   if (environments === undefined) {
-    if (p.private) couldnt('environments', 'treated as not available');
-    else couldnt('environments', 'used the plan table');
+    if (p.private) couldnt('environments', 'treated as not available', envs);
+    else couldnt('environments', 'used the plan table', envs);
     environments = p.private ? false : table.environments;
   }
 
   const scan = await ask(gh, () => gh.rest.codeScanning.listRecentAnalyses({ owner, repo, per_page: 1 }), clock, codeScanningAnswer);
   let codeScanning = verdict(scan);
   if (codeScanning === undefined) {
-    if (p.private) couldnt('code scanning', 'treated as not available');
-    else couldnt('code scanning', 'GitHub offers it on every public repo');
+    if (p.private) couldnt('code scanning', 'treated as not available', scan);
+    else couldnt('code scanning', 'GitHub offers it on every public repo', scan);
     codeScanning = !p.private;
   }
 

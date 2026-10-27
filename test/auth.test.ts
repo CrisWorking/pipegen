@@ -589,6 +589,34 @@ describe('listWriters', () => {
   });
 });
 
+describe('no answer from GitHub (final review batch 2, M1)', () => {
+  /** A fetch that never gets an HTTP answer, as when DNS, the connection or TLS fails. */
+  const offline = (async () => {
+    throw new TypeError('fetch failed', { cause: Object.assign(new Error('getaddrinfo ENOTFOUND api.github.com'), { code: 'ENOTFOUND' }) });
+  }) as typeof fetch;
+
+  it('network: a request with no HTTP answer is "no answer from GitHub (network problem)", never HTTP 500', async () => {
+    const ctx = await caught(readGitHubContext(makeOctokit(fgCred(), { fetch: offline }), 'o', 'r', 'me', clock()));
+    expect(ctx).toBeInstanceOf(GitHubAccessError);
+    expect((ctx as Error).message).toContain("pipegen couldn't read o/r from GitHub (no answer from GitHub (network problem)");
+    expect((ctx as Error).message).toContain('ENOTFOUND');
+    expect((ctx as Error).message).not.toMatch(/HTTP 500/);
+    expect((ctx as GitHubAccessError).status).toBeUndefined();
+
+    const anon = await caught(getAuth({ owner: 'o', repos: ['r'], allowBroad: false, mode: 'read' }, { env: {}, fetch: offline, clock: clock() } as GhDeps));
+    expect((anon as Error).message).toContain("couldn't reach https://api.github.com to check o/r (no answer from GitHub (network problem)");
+    expect((anon as Error).message).not.toMatch(/HTTP 500/);
+  });
+
+  it('network: a real HTTP 500 from GitHub is still reported as HTTP 500', async () => {
+    const { gh: client } = gh({ [`GET ${API}/repos/o/r`]: { status: 500, body: { message: 'Server Error' } } });
+    const e = await caught(readGitHubContext(client, 'o', 'r', 'me', clock()));
+    expect((e as Error).message).toContain('HTTP 500: Server Error');
+    expect((e as Error).message).not.toContain('network problem');
+    expect((e as GitHubAccessError).status).toBe(500);
+  });
+});
+
 describe('probePermissions', () => {
   const repoOk: Reply = { body: { private: true, permissions: { admin: true, maintain: true, push: true, pull: true } } };
 

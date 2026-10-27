@@ -75,20 +75,32 @@ export class GitHubAccessError extends Error {
   }
 }
 
-/** Status and GitHub's message of a failed Octokit call (both may be missing). */
-function failure(e: unknown): { status?: number; message: string; accepted?: string } {
+/**
+ * True when a request got no HTTP answer at all: a DNS, connection or TLS failure, a timeout, or pipegen's own fetch
+ * refusing the request. @octokit/request reports all of these as status 500 with no `response`, which must never be
+ * shown as GitHub answering HTTP 500 (final review batch 2, M1).
+ */
+export function isNoAnswer(e: unknown): boolean {
+  const err = e as { status?: unknown; response?: unknown } | null;
+  return typeof err === 'object' && err !== null && err.status === 500 && err.response === undefined;
+}
+
+/** Status and GitHub's message of a failed Octokit call (both may be missing; no status when GitHub never answered). */
+function failure(e: unknown): { status?: number; message: string; accepted?: string; noAnswer: boolean } {
   const err = e as { status?: unknown; message?: unknown; response?: { data?: unknown; headers?: Record<string, unknown> } } | null;
-  const status = typeof err?.status === 'number' ? err.status : undefined;
+  const noAnswer = isNoAnswer(e);
+  const status = !noAnswer && typeof err?.status === 'number' ? err.status : undefined;
   const data = err?.response?.data as { message?: unknown } | undefined;
   const message = typeof data?.message === 'string' ? data.message : typeof err?.message === 'string' ? err.message : '';
   const acc = err?.response?.headers?.['x-accepted-github-permissions'];
-  return { status, message, accepted: typeof acc === 'string' ? acc : undefined };
+  return { status, message, accepted: typeof acc === 'string' ? acc : undefined, noAnswer };
 }
-/** GitHub's answer in a form safe to show: no token, no control characters, short. */
+/** GitHub's answer (or that there was none) in a form safe to show: no token, no control characters, short. */
 const said = (e: unknown) => {
   const f = failure(e);
   const msg = safeText(hideToken(f.message), 160);
-  return `HTTP ${f.status ?? 'error'}${msg === '' ? '' : `: ${msg}`}`;
+  const head = f.noAnswer ? 'no answer from GitHub (network problem)' : `HTTP ${f.status ?? 'error'}`;
+  return `${head}${msg === '' ? '' : `: ${msg}`}`;
 };
 const repoName = (owner: string, repo: string) => safeText(`${owner}/${repo}`, 200);
 
