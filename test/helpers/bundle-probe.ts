@@ -24,7 +24,7 @@ const providers = [
 ].map((p) => p.name);
 // The GitHub fields (filled by Plan A Task 6 in a real run) and capabilities of a private Free repo.
 const full: RepoProfile = { ...profile, private: true, ownerType: 'User', plan: 'free' };
-const capNames = ['branchProtection', 'environments', 'envRequiredReviewers', 'attestations', 'codeScanning', 'keylessSigningAllowed'];
+const capNames = ['branchProtection', 'environments', 'deploymentBranchPolicies', 'envRequiredReviewers', 'attestations', 'codeScanning', 'keylessSigningAllowed'];
 const caps = Object.fromEntries(capNames.map((n) => [n, false])) as unknown as Capabilities;
 // data/quality-bar.yml is found through packageDataPath from the bundled file (the probe sits in <pkg>/dist/cli/)
 const qualityBar = loadQualityBar();

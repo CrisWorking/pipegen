@@ -10,7 +10,7 @@ describe('types', () => {
     };
     const draft: PipelineDraft = {
       profile,
-      capabilities: { branchProtection: false, environments: false, envRequiredReviewers: false, attestations: false, codeScanning: false, keylessSigningAllowed: false },
+      capabilities: { branchProtection: false, environments: false, deploymentBranchPolicies: false, envRequiredReviewers: false, attestations: false, codeScanning: false, keylessSigningAllowed: false },
       needs: [], steps: [], created: [], notProven: [], testDecisions: [], layersSkipped: [], scoreboard: [],
       requireDeployApproval: false, skipped: [], suggestions: [],
     };

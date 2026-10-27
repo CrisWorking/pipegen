@@ -6,7 +6,7 @@ import {
   GITHUB_API, GitHubAccessError, getAuth, hideToken, listWriters, makeOctokit, permissionsTable, probePermissions,
   readGitHubContext, refreshAppToken, tokenKind, type AppLogin, type AuthDeps as GhDeps,
 } from '../src/github/client.js';
-import { newRateBudget } from '../src/engine/github-rate.js';
+import { isRateStop, newRateBudget } from '../src/engine/github-rate.js';
 import { fakeFetch, type Call, type Reply, type Routes } from './helpers/fake-http.js';
 import { fake } from './helpers/secret-repo.js';
 
@@ -28,6 +28,7 @@ const refreshCred = () => 'gh' + 'r_' + 'W'.repeat(36);
 const fgCred = () => fake.githubPat();
 const classicCred = () => fake.githubClassic();
 const oauthCred = () => 'gh' + 'o_' + 'R'.repeat(36);
+const installCred = () => 'gh' + 's_' + 'Z'.repeat(36);
 
 const clock = () => ({ budget: newRateBudget(), sleep: async () => {} });
 const gh = (routes: Routes, cred: string | null = fgCred()) => {
@@ -113,7 +114,8 @@ describe('getAuth', () => {
     expect(tokenKind(classicCred())).toBe('classic');
     expect(tokenKind(oauthCred())).toBe('classic');
     expect(tokenKind('0f'.repeat(20))).toBe('classic');   // classic tokens made before 2021 are 40 hex characters
-    for (const other of [refreshCred(), 'gh' + 's_' + 'Z'.repeat(36), 'xyz', `ghu_short\n${HDR}: x`]) {
+    expect(tokenKind(installCred())).toBe('installation');
+    for (const other of [refreshCred(), 'xyz', `ghu_short\n${HDR}: x`]) {
       expect(tokenKind(other)).toBe(null);
       const { deps: d, calls } = deps(other);
       const e = await caught(getAuth({ owner: 'o', repos: ['r'], allowBroad: true, mode: 'read' }, d));
@@ -139,29 +141,34 @@ describe('getAuth', () => {
     for (const r of permissionsTable('read')) expect(msg).toContain(r.permission);
     expect(msg).not.toMatch(/write/i);
     expect(calls.every((c) => c.method === 'GET')).toBe(true);
-    // an App token in read mode: no installation probe, no create or delete rights
-    const app = deps(appCred(), { [`GET ${API}/user/installations`]: { body: { installations: [] } } });
+    // an App token in read mode: only its installation is looked up (the scope check), no create or delete rights
+    const app = deps(appCred(), { [`GET ${API}/user/installations`]: { body: { installations: [] } } }, { appLogin: async () => appCred() });
     const got = await getAuth({ owner: 'o', repos: ['r'], allowBroad: false, mode: 'read' }, app.deps);
     expect(got).toMatchObject({ kind: 'app', canCreateRepos: false, canDeleteRepos: false });
-    expect(app.calls).toEqual([]);
+    expect(app.calls.map((c) => `${c.method} ${c.url.pathname}`)).toEqual(['GET /user/installations']);
   });
 
   it(title(AU, 'canCreateRepos and canDeleteRepos follow the S1/S9 strategy and the probe'), async () => {
     const installs = (login: string, administration?: string): Routes => ({
       [`GET ${API}/user/installations`]: { body: { total_count: 9, installations: [
         { id: 1, account: { login: 'someone-else' }, permissions: { administration: 'write' } },
-        { id: 2, account: { login }, permissions: { metadata: 'read', ...(administration ? { administration } : {}) } },
+        { id: 2, account: { login }, repository_selection: 'selected', permissions: { metadata: 'read', ...(administration ? { administration } : {}) } },
       ] } },
     });
     // App user token with Administration write on the owner's installation → pipegen may create and delete (S9)
-    let r = deps(appCred(), installs('o', 'write'));
+    const login = { appLogin: async () => appCred() };
+    let r = deps(undefined, installs('o', 'write'), login);
     let got = await getAuth({ owner: 'o', repos: ['r'], allowBroad: false, mode: 'write' }, r.deps);
     expect(got).toMatchObject({ kind: 'app', repos: ['r'], canCreateRepos: true, canDeleteRepos: true });
     expect(r.calls.map((c) => `${c.method} ${c.url.pathname}`)).toEqual(['GET /user/installations']);
+    // a ghu_ token from GITHUB_TOKEN may belong to another App: never create or delete with it
+    r = deps(appCred(), installs('o', 'write'));
+    got = await getAuth({ owner: 'o', repos: ['r'], allowBroad: false, mode: 'write' }, r.deps);
+    expect(got).toMatchObject({ kind: 'app', canCreateRepos: false, canDeleteRepos: false });
     // the probe says otherwise → no
     for (const routes of [installs('o', 'read'), installs('o'), installs('another-owner', 'write'),
       { [`GET ${API}/user/installations`]: refused(integration) }, { [`GET ${API}/user/installations`]: { status: 500, body: {} } }]) {
-      r = deps(appCred(), routes);
+      r = deps(undefined, routes, login);
       got = await getAuth({ owner: 'o', repos: ['r'], allowBroad: false, mode: 'write' }, r.deps);
       expect(got).toMatchObject({ kind: 'app', canCreateRepos: false, canDeleteRepos: false });
     }
@@ -171,6 +178,62 @@ describe('getAuth', () => {
     got = await getAuth({ owner: 'o', repos: ['r'], allowBroad: false, mode: 'write' }, r.deps);
     expect(got).toMatchObject({ kind: 'fine-grained', canCreateRepos: false, canDeleteRepos: false });
     expect(r.calls).toEqual([]);
+  });
+
+  it(title(AU, 'ghs_ read → installation'), async () => {
+    const { deps: d, calls } = deps(installCred());
+    const got = await getAuth({ owner: 'o', repos: ['r'], allowBroad: false, mode: 'read' }, d);
+    expect(got).toMatchObject({ kind: 'installation', repos: ['r'], canCreateRepos: false, canDeleteRepos: false });
+    expect(got.token).toBe(installCred());
+    expect(calls).toEqual([]);
+  });
+
+  it(title(AU, 'ghs_ write → refused, no network call'), async () => {
+    const { deps: d, calls } = deps(installCred());
+    const e = await caught(getAuth({ owner: 'o', repos: ['r'], allowBroad: true, mode: 'write' }, d));
+    expect(e).toBeInstanceOf(GitHubAccessError);
+    expect((e as Error).message).toMatch(/only accepted for read-only audit/);
+    expect(allText(e)).not.toContain(installCred());
+    expect(calls).toEqual([]);
+  });
+
+  it(title(AU, 'App installed on "All repositories" → refused unless allowBroad (T25)'), async () => {
+    const routes: Routes = { [`GET ${API}/user/installations`]: { body: { installations: [
+      { id: 3, account: { login: 'o' }, repository_selection: 'all', permissions: { administration: 'write' } },
+    ] } } };
+    for (const mode of ['read', 'write'] as const) {
+      const r = deps(undefined, routes, { appLogin: async () => appCred() });
+      const e = await caught(getAuth({ owner: 'o', repos: ['r'], allowBroad: false, mode }, r.deps));
+      expect(e).toBeInstanceOf(GitHubAccessError);
+      expect((e as Error).message).toMatch(/All repositories/);
+      expect((e as Error).message).toMatch(/Only select repositories/);
+      expect((e as Error).message).toMatch(/--allow-broad-token/);
+    }
+    const r = deps(undefined, routes, { appLogin: async () => appCred() });
+    const got = await getAuth({ owner: 'o', repos: ['r'], allowBroad: true, mode: 'write' }, r.deps);
+    expect(got).toMatchObject({ kind: 'app', repos: 'all' });
+  });
+
+  it(title(AU, 'anonymous check that fails with 401, 502 or 503 → couldn\'t reach GitHub, not the setup steps'), async () => {
+    for (const status of [401, 502, 503]) {
+      const { deps: d } = deps(undefined, { [`GET ${API}/repos/o/r`]: { status, body: { message: 'x' } } });
+      const e = await caught(getAuth({ owner: 'o', repos: ['r'], allowBroad: false, mode: 'read' }, d));
+      expect(e).toBeInstanceOf(GitHubAccessError);
+      expect((e as Error).message).toMatch(/couldn't reach/);
+      expect((e as Error).message).not.toMatch(/fine-grained token/);
+    }
+  });
+
+  it(title(AU, 'owner and repo names are checked before any call'), async () => {
+    for (const [owner, repo] of [['o/../x', 'r'], ['o', '..'], ['bad owner', 'r'], ['o', 'r?x=1'], ['-o', 'r']]) {
+      const { deps: d, calls } = deps(fgCred());
+      expect(await caught(getAuth({ owner, repos: [repo], allowBroad: false, mode: 'read' }, d))).toBeInstanceOf(GitHubAccessError);
+      const c = gh({});
+      expect(await caught(readGitHubContext(c.gh, owner, repo, null))).toBeInstanceOf(GitHubAccessError);
+      expect(await caught(listWriters(c.gh, owner, repo))).toBeInstanceOf(GitHubAccessError);
+      expect(await caught(probePermissions(c.gh, owner, [repo]))).toBeInstanceOf(GitHubAccessError);
+      expect([...calls, ...c.calls]).toEqual([]);
+    }
   });
 
   it(title(AU, 'no token, read mode, public repo → kind anonymous, token null'), async () => {
@@ -327,6 +390,33 @@ describe('makeOctokit', () => {
   });
 });
 
+describe('makeOctokit logging and rate budget', () => {
+  it('makeOctokit: a failed request prints nothing unless debug is on', async () => {
+    const lines: string[] = [];
+    const f = fakeFetch({ [`GET ${API}/repos/o/r`]: { status: 404, body: { message: 'Not Found' } } });
+    const client = makeOctokit(fgCred(), { fetch: f.fetch, log: (l) => lines.push(l) });
+    await caught(client.rest.repos.get({ owner: 'o', repo: 'r' }));
+    expect(lines).toEqual([]);
+    const loud = makeOctokit(fgCred(), { fetch: f.fetch, debug: true, log: (l) => lines.push(l) });
+    await caught(loud.rest.repos.get({ owner: 'o', repo: 'r' }));
+    expect(lines.length).toBeGreaterThan(0);
+  });
+
+  it('makeOctokit: calls on one client share one rate budget', async () => {
+    let n = 0;
+    const reset = String(Math.floor(Date.now() / 1000) + 30);
+    const f = fakeFetch({
+      [`GET ${API}/repos/o/r`]: () => (++n % 2 === 1
+        ? { status: 403, body: { message: 'API rate limit exceeded' }, headers: { 'x-ratelimit-remaining': '0', 'x-ratelimit-reset': reset } }
+        : { body: { private: true, default_branch: 'main', owner: { type: 'Organization' } } }),
+    });
+    const client = makeOctokit(fgCred(), { fetch: f.fetch, clock: { budget: newRateBudget(40_000), sleep: async () => {} } });
+    await readGitHubContext(client, 'o', 'r', null);   // waits about 31 s of the 40 s budget
+    const e = await caught(readGitHubContext(client, 'o', 'r', null));   // the next wait no longer fits
+    expect(isRateStop(e)).toBe(true);
+  });
+});
+
 describe('token safety', () => {
   it(title(TOK, 'never printed in error messages, --json output or debug logs'), async () => {
     for (const cred of [appCred(), fgCred()]) {
@@ -363,6 +453,21 @@ describe('token safety', () => {
       const probed = await probePermissions(client, 'o', ['r'], { kind: got.kind, clock: clock() });
       expect(JSON.stringify(probed)).not.toContain(cred);
     }
+  });
+
+  it(title('hide' + 'Token', 'an empty or short token never rewrites the text'), () => {
+    expect(hideToken('a cat sat', '')).toBe('a cat sat');
+    expect(hideToken('a cat sat', 'a')).toBe('a cat sat');
+    expect(hideToken('a cat sat', null)).toBe('a cat sat');
+  });
+
+  it(title('hide' + 'Token', 'applied before a log line is cut, so no piece of a token is left'), () => {
+    const cred = appCred();
+    const lines: string[] = [];
+    const client = makeOctokit(cred, { fetch: fakeFetch({}).fetch, log: (l) => lines.push(l) });
+    client.log.warn('context', new Error('x'.repeat(385) + cred));
+    expect(lines).toHaveLength(1);
+    expect(lines[0]).not.toContain(cred.slice(0, 6));
   });
 
   it(title('hide' + 'Token', 'the exact token, Authorization values and any GitHub token shape become ***'), () => {
@@ -453,7 +558,8 @@ describe('probePermissions', () => {
     const full = { metadata: 'read', contents: 'write', workflows: 'write', pull_requests: 'write', actions: 'write', [S_NAME.toLowerCase()]: 'read', actions_variables: 'write', environments: 'write', administration: 'write', checks: 'read' };
     const app = gh({
       [`GET ${API}/repos/o/r`]: repoOk,
-      [`GET ${API}/user/installations`]: { body: { installations: [{ id: 1, account: { login: 'o' }, permissions: full }] } },
+      [`GET ${API}/user/installations`]: { body: { installations: [{ id: 1, account: { login: 'o' }, repository_selection: 'selected', permissions: full }] } },
+      [`GET ${API}/user/installations/1/repositories`]: { body: { total_count: 1, repositories: [{ full_name: 'o/r' }] } },
     }, appCred());
     const res = await probePermissions(app.gh, 'o', ['r'], { kind: 'app', clock: clock() });
     const wanted = permissionsTable('write').find((p) => p.permission.startsWith(S_NAME));
@@ -468,6 +574,43 @@ describe('probePermissions', () => {
     const res2 = await probePermissions(fg.gh, 'o', ['r'], { kind: 'fine-grained', clock: clock() });
     expect(res2.missing).toContainEqual(wanted);
     expect(fg.calls.every((c) => c.method === 'GET')).toBe(true);   // probing never writes
+  });
+
+  it('probePermissions: App repo access comes from the installation\'s repo list, not GET /repos', async () => {
+    const full = { metadata: 'read', contents: 'write', workflows: 'write', pull_requests: 'write', actions: 'write', [S_NAME.toLowerCase()]: 'write', actions_variables: 'write', environments: 'write', administration: 'write', checks: 'read' };
+    const app = gh({
+      [`GET ${API}/repos/o/r`]: repoOk,
+      [`GET ${API}/repos/o/public-elsewhere`]: repoOk,   // any public repo answers 200 to anyone
+      [`GET ${API}/user/installations`]: { body: { installations: [{ id: 7, account: { login: 'o' }, repository_selection: 'selected', permissions: full }] } },
+      [`GET ${API}/user/installations/7/repositories`]: (c) => c.url.searchParams.get('page') === '2'
+        ? { body: { total_count: 3, repositories: [{ full_name: 'o/pipelines' }] } }
+        : { body: { total_count: 3, repositories: [{ full_name: 'o/r' }] }, headers: { link: `<${API}/user/installations/7/repositories?page=2>; rel="next"` } },
+    }, appCred());
+    const res = await probePermissions(app.gh, 'o', ['r', 'pipelines', 'public-elsewhere'], { kind: 'app', clock: clock() });
+    expect(res.missing.map((m) => m.permission)).toEqual(['Access to o/public-elsewhere']);
+    expect(res.unchecked).toEqual([]);
+    expect(app.calls.some((c) => c.url.pathname.startsWith('/repos/'))).toBe(false);
+  });
+
+  it('probePermissions: an installation token (ghs_) is probed like a fine-grained token, never through /user/installations', async () => {
+    const r = gh({
+      [`GET ${API}/repos/o/r`]: repoOk,
+      [`GET ${API}/repos/o/r/actions/secrets/public-key`]: refused(integration, `${S_NAME.toLowerCase()}=read`),
+    }, installCred());
+    const res = await probePermissions(r.gh, 'o', ['r'], { kind: 'installation', mode: 'read', clock: clock() });
+    expect(res.missing.map((m) => m.permission)).toEqual([P(S_NAME, 'read')]);
+    expect(r.calls.some((c) => c.url.pathname.startsWith('/user/installations'))).toBe(false);
+  });
+
+  it('probes: a 401 is a hard "token rejected" error, never a missing permission', async () => {
+    const r401: Reply = { status: 401, body: { message: 'Bad credentials' } };
+    const r = gh({ [`GET ${API}/repos/o/r`]: r401, [`GET ${API}/repos/o/r/collaborators`]: r401, [`GET ${API}/user/installations`]: r401 });
+    for (const p of [probePermissions(r.gh, 'o', ['r'], { kind: 'fine-grained' }), probePermissions(r.gh, 'o', ['r'], { kind: 'app' }),
+      readGitHubContext(r.gh, 'o', 'r', null), listWriters(r.gh, 'o', 'r')]) {
+      const e = await caught(p);
+      expect(e).toBeInstanceOf(GitHubAccessError);
+      expect((e as Error).message).toMatch(/rejected the token/);
+    }
   });
 
   it('probePermissions: GET /repos permissions field never used to judge the token', async () => {

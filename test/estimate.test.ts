@@ -26,7 +26,7 @@ const profile = (over: Partial<RepoProfile> = {}): RepoProfile => ({
 const WORKFLOW_FIELDS = ['path', 'triggers', 'deploys', 'secretsUsed', 'jobs'] as const;
 const workflow = (path: string, jobs: string[]) =>
   Object.fromEntries(WORKFLOW_FIELDS.map((n, i) => [n, [path, ['push'], false, [], jobs][i]])) as unknown as ExistingWorkflow;
-const CAP_NAMES = ['branchProtection', 'environments', 'envRequiredReviewers', 'attestations', 'codeScanning', 'keylessSigningAllowed'] as const;
+const CAP_NAMES = ['branchProtection', 'environments', 'deploymentBranchPolicies', 'envRequiredReviewers', 'attestations', 'codeScanning', 'keylessSigningAllowed'] as const;
 const NO_CAPS = Object.fromEntries(CAP_NAMES.map((n) => [n, false])) as unknown as Capabilities;
 
 /**

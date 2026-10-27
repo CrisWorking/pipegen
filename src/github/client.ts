@@ -4,19 +4,27 @@
 // - Strategy (S1, #87): pipegen's own GitHub App first (device flow, user-to-server token `ghu_`, installed on
 //   "Only select repositories"). Fallback: a fine-grained token (`github_pat_`) on exactly the involved repos.
 //   Classic tokens (`ghp_`, `gho_`, or the old 40-hex form) reach every repo of the user and are refused unless
-//   --allow-broad-token. The kind comes from the prefix; nothing else is trusted to say what a token is.
+//   --allow-broad-token. An Actions GITHUB_TOKEN (`ghs_`, an installation token) is accepted for the read-only
+//   audit only (kind 'installation'). The kind comes from the prefix; nothing else is trusted to say what a token is.
+// - An App installed on "All repositories" is refused like a classic token, unless --allow-broad-token (T25). Which
+//   repos an App may touch comes from the installation's own repo list, never from GET /repos (a public repo answers
+//   200 to anyone).
 // - Where the token comes from: the App login (AuthDeps.appLogin) when there is one, else GITHUB_TOKEN. v0.1 ships
 //   no login command, so the App path is an interface only (see AppLoginStore / refreshAppToken). GH_TOKEN,
 //   GH_ENTERPRISE_TOKEN, GH_HOST and GITHUB_API_URL are never read.
 // - Repo creation (S9): only the App may create and delete pipegen's helper repos (a repo it creates joins the
 //   installation at once). A fine-grained token can create a repo too, but then can't reach it (404), so in token
-//   mode pipegen never creates or deletes repos (canCreateRepos/canDeleteRepos false).
+//   mode pipegen never creates or deletes repos (canCreateRepos/canDeleteRepos false). A `ghu_` token from
+//   GITHUB_TOKEN may belong to another App, so only pipegen's own App login may create or delete.
 // - What a token may do is found by real calls or GitHub's x-accepted-github-permissions header, never by the
 //   `permissions` field of GET /repos: that is the USER's role (S1 saw admin: true for a read-only token).
 // - The token only ever goes to https://api.github.com (hard-coded): makeOctokit's fetch refuses any other origin,
 //   follows redirects only on that origin, and gives every request its own timeout. It is never printed: errors
 //   pipegen raises, debug lines and error bodies GitHub sends back pass through hideToken(), and Auth keeps its
 //   token in a non-enumerable property, so JSON.stringify and util.inspect leave it out.
+// - Every call on one client draws from one rate budget: makeOctokit takes the run's RateClock (or makes one), and
+//   every function here uses it unless it is given another. A 401 is never read as a missing permission: it is a
+//   hard "GitHub rejected the token" error.
 import { Octokit } from '@octokit/rest';
 import type { Auth, Plan, RepoProfile } from '../types.js';
 import { isRateStop, newRateBudget, withRateLimit, type RateClock } from '../engine/github-rate.js';
@@ -36,7 +44,9 @@ const MAX_ERROR_BODY_BYTES = 1_000_000;
 
 /** Tokens seen by makeOctokit / getAuth in this process, so hideToken can find them anywhere. */
 const knownTokens = new Set<string>();
-const remember = (t: string) => { if (/^[A-Za-z0-9_]{20,255}$/.test(t)) knownTokens.add(t); };
+/** Only token-shaped values are hidden by value (an empty or short string would rewrite ordinary text). */
+const tokenLike = (t: string) => /^[A-Za-z0-9_]{20,255}$/.test(t);
+const remember = (t: string) => { if (tokenLike(t)) knownTokens.add(t); };
 
 // Any GitHub token shape, and the value after an Authorization header or a token/Bearer scheme.
 const TOKEN_SHAPES = /\b(?:gh[pousr]_[A-Za-z0-9]{16,}|github_pat_[A-Za-z0-9_]{16,})/g;
@@ -49,7 +59,7 @@ const SCHEME_VALUES = /\b((?:token|bearer)\s+)[A-Za-z0-9_.~+/=-]{16,}/gi;
  */
 export function hideToken(text: string, token?: string | null): string {
   let out = text;
-  for (const t of token ? [token, ...knownTokens] : knownTokens) out = out.split(t).join('***');
+  for (const t of token && tokenLike(token) ? [token, ...knownTokens] : knownTokens) out = out.split(t).join('***');
   return out.replace(TOKEN_SHAPES, '***').replace(AUTH_VALUES, '$1***').replace(SCHEME_VALUES, '$1***');
 }
 
@@ -82,6 +92,20 @@ const said = (e: unknown) => {
 };
 const repoName = (owner: string, repo: string) => safeText(`${owner}/${repo}`, 200);
 
+/** GitHub said 401: the token is wrong, expired or revoked. Never read as a missing permission. */
+const isRejected = (e: unknown) => failure(e).status === 401;
+const tokenRejected = () => new GitHubAccessError('GitHub rejected the token (HTTP 401): it is wrong, expired or revoked. Make a new one, or log in again.', { status: 401 });
+export { tokenRejected as githubTokenRejected };
+
+// Defence in depth: owner and repo are checked here too, before they go into any API path.
+const OWNER_RE = /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})$/;
+const REPO_RE = /^[A-Za-z0-9._-]{1,100}$/;
+/** Throws unless every name is a valid GitHub owner / repo name. */
+export function checkRepoNames(owner: string, repos: readonly string[]): void {
+  const bad = !OWNER_RE.test(owner) ? owner : repos.find((r) => !REPO_RE.test(r) || r === '.' || r === '..');
+  if (bad !== undefined) throw new GitHubAccessError(`"${safeText(bad, 100)}" isn't a valid GitHub owner or repo name.`);
+}
+
 // ---------- the client ----------
 
 export interface MakeOctokitOptions {
@@ -93,6 +117,19 @@ export interface MakeOctokitOptions {
   debug?: boolean;
   /** Where log lines go, already passed through hideToken. Default: stderr. */
   log?: (line: string) => void;
+  /** The run's rate budget, shared by every call made through this client (default: a fresh newRateBudget()). */
+  clock?: RateClock;
+}
+
+const clocks = new WeakMap<Octokit, RateClock>();
+/** The rate clock of a client: the one given to makeOctokit, else one made on first use and kept for that client. */
+export function clockOf(gh: Octokit): RateClock {
+  let c = clocks.get(gh);
+  if (c === undefined) {
+    c = { budget: newRateBudget() };
+    clocks.set(gh, c);
+  }
+  return c;
 }
 
 /**
@@ -133,17 +170,22 @@ function guardedFetch(base: typeof fetch, timeoutMs: number, token: string | nul
 export function makeOctokit(token: string | null, opts: MakeOctokitOptions = {}): Octokit {
   if (token !== null) remember(token);
   const sink = opts.log ?? ((line: string) => { process.stderr.write(line + '\n'); });
+  // the token is hidden BEFORE the line is cut, so a cut can never leave part of a token behind
   const write = (level: string) => (message: unknown, ...rest: unknown[]) => {
-    sink(hideToken([`[github ${level}]`, message, ...rest].map((x) => (typeof x === 'string' ? x : safeText(String(x), 400))).join(' '), token));
+    sink(safeText(hideToken([`[github ${level}]`, message, ...rest].map((x) => String(x)).join(' '), token), 1000));
   };
   const quiet = () => {};
-  return new Octokit({
+  // Octokit's request log reports every failed request through log.error; pipegen explains failures itself, so
+  // that line is printed only with debug on.
+  const gh = new Octokit({
     ...(token === null ? {} : { auth: token }),
     baseUrl: GITHUB_API,
     userAgent: 'pipegen',
     request: { fetch: guardedFetch(opts.fetch ?? globalThis.fetch, opts.timeoutMs ?? GITHUB_TIMEOUT_MS, token) },
-    log: { debug: opts.debug ? write('debug') : quiet, info: opts.debug ? write('info') : quiet, warn: write('warn'), error: write('error') },
+    log: { debug: opts.debug ? write('debug') : quiet, info: opts.debug ? write('info') : quiet, warn: write('warn'), error: opts.debug ? write('error') : quiet },
   });
+  clocks.set(gh, opts.clock ?? { budget: newRateBudget() });
+  return gh;
 }
 
 // ---------- permissions (spike S1, DECISIONS #88) ----------
@@ -209,10 +251,14 @@ function acceptedNames(header: string | undefined): string[] {
 
 const TOKEN_CHARS = /^[A-Za-z0-9_]{20,255}$/;
 
-/** What a token is, by its prefix (S1): ghu_ App user token, github_pat_ fine-grained, ghp_/gho_/40-hex classic. Else null. */
+/**
+ * What a token is, by its prefix (S1): ghu_ App user token, github_pat_ fine-grained, ghp_/gho_/40-hex classic,
+ * ghs_ installation token (the Actions GITHUB_TOKEN). Else null.
+ */
 export function tokenKind(token: string): Exclude<Auth['kind'], 'anonymous'> | null {
   if (!TOKEN_CHARS.test(token)) return null;
   if (token.startsWith('ghu_')) return 'app';
+  if (token.startsWith('ghs_')) return 'installation';
   if (token.startsWith('github_pat_')) return 'fine-grained';
   if (token.startsWith('ghp_') || token.startsWith('gho_') || /^[0-9a-f]{40}$/.test(token)) return 'classic';
   return null;
@@ -239,6 +285,11 @@ function writeSetup(owner: string, repos: string[]): string {
 const CLASSIC_REFUSED = 'pipegen won\'t use this token: it is a classic token, which reaches every repo you have. '
   + 'Use a fine-grained token limited to the repos pipegen works on, or pipegen\'s GitHub App installed on "Only select repositories". '
   + 'To use the classic token anyway, run again with --allow-broad-token.';
+const INSTALLATION_WRITE = 'The Actions GITHUB_TOKEN is only accepted for read-only audit. To change a repo, use pipegen\'s GitHub App '
+  + 'or a fine-grained token limited to the repos pipegen works on.';
+const ALL_REPOS = 'pipegen won\'t use this GitHub App login: the App is installed on "All repositories", so it reaches every repo of '
+  + 'the account. Change the installation to "Only select repositories" (GitHub → Settings → Applications → Installed GitHub Apps → '
+  + 'Configure), or run again with --allow-broad-token.';
 const UNKNOWN_TOKEN = 'pipegen doesn\'t recognise this kind of GitHub token. Use a fine-grained token (it starts with github_pat_) '
   + 'limited to the repos pipegen works on, or pipegen\'s GitHub App.';
 
@@ -303,13 +354,7 @@ function authWith(token: string, rest: Omit<Auth, 'token'>): Auth & { token: str
   return auth;
 }
 
-/** Does the App installation on `owner` hold Administration write? (S9: then pipegen may create and delete repos.) */
-async function appAdministers(gh: Octokit, owner: string, clock: RateClock): Promise<boolean> {
-  const inst = await installationFor(gh, owner, clock);
-  return inst?.permissions.administration === 'write';
-}
-
-interface Installation { login: string; permissions: Record<string, string> }
+interface Installation { id: number; login: string; selection: 'all' | 'selected' | 'unknown'; permissions: Record<string, string> }
 /** The App installation on `owner` (case-insensitive), null when there is none or GitHub won't say. Rate stops are thrown. */
 async function installationFor(gh: Octokit, owner: string, clock: RateClock): Promise<Installation | null> {
   for (let page = 1; page <= 10; page++) {
@@ -318,16 +363,21 @@ async function installationFor(gh: Octokit, owner: string, clock: RateClock): Pr
       data = (await withRateLimit(() => gh.request('GET /user/installations', { per_page: 100, page }), clock)).data;
     } catch (e) {
       if (isRateStop(e)) throw e;
+      if (isRejected(e)) throw tokenRejected();
       return null;
     }
     // S9: count the list, never total_count (it lagged behind after a delete)
     const list = (data as { installations?: unknown } | null)?.installations;
     if (!Array.isArray(list)) return null;
-    for (const i of list as { account?: { login?: unknown }; permissions?: unknown }[]) {
+    for (const i of list as { id?: unknown; account?: { login?: unknown }; repository_selection?: unknown; permissions?: unknown }[]) {
       const login = i?.account?.login;
       if (typeof login === 'string' && login.toLowerCase() === owner.toLowerCase()) {
         const perms = i.permissions !== null && typeof i.permissions === 'object' ? i.permissions as Record<string, unknown> : {};
-        return { login, permissions: Object.fromEntries(Object.entries(perms).filter(([, v]) => typeof v === 'string')) as Record<string, string> };
+        const selection = i.repository_selection === 'all' || i.repository_selection === 'selected' ? i.repository_selection : 'unknown';
+        return {
+          id: typeof i.id === 'number' ? i.id : -1, login, selection,
+          permissions: Object.fromEntries(Object.entries(perms).filter(([, v]) => typeof v === 'string')) as Record<string, string>,
+        };
       }
     }
     if (list.length < 100) return null;
@@ -335,18 +385,45 @@ async function installationFor(gh: Octokit, owner: string, clock: RateClock): Pr
   return null;
 }
 
+const INSTALLATION_REPO_PAGES = 50;
+/**
+ * The repos (lower-case "owner/name") an App installation may touch: GET /user/installations/{id}/repositories, paged
+ * by its Link header, counting the items (S9: total_count lagged). null when GitHub won't say. Rate stops are thrown.
+ */
+async function installationRepos(gh: Octokit, id: number, clock: RateClock): Promise<Set<string> | null> {
+  const names = new Set<string>();
+  for (let page = 1; page <= INSTALLATION_REPO_PAGES; page++) {
+    let res: { data: unknown; headers: Record<string, unknown> };
+    try {
+      res = await withRateLimit(() => gh.request('GET /user/installations/{installation_id}/repositories', { installation_id: id, per_page: 100, page }), clock);
+    } catch (e) {
+      if (isRateStop(e)) throw e;
+      if (isRejected(e)) throw tokenRejected();
+      return null;
+    }
+    const list = (res.data as { repositories?: unknown } | null)?.repositories;
+    if (!Array.isArray(list)) return null;
+    for (const r of list as { full_name?: unknown }[]) if (typeof r?.full_name === 'string') names.add(r.full_name.toLowerCase());
+    if (!/rel="next"/.test(String(res.headers.link ?? ''))) return names;
+  }
+  return null;   // more pages than pipegen reads: it won't claim to know
+}
+
 /**
  * How pipegen logs in to GitHub (S1 strategy). `repos`: the repo names (under `owner`) pipegen works on.
  * - write mode needs a token (no token → the setup steps); read mode without a token works for a public repo only
  *   (checked with an anonymous GET /repos/{owner}/{repos[0]}) and gives kind 'anonymous';
- * - classic tokens are refused unless allowBroad; unknown token kinds are refused;
- * - canCreateRepos/canDeleteRepos: write mode, App token, and the installation on `owner` holds Administration write.
+ * - classic tokens, and an App installed on "All repositories", are refused unless allowBroad; unknown kinds are refused;
+ * - an Actions GITHUB_TOKEN (ghs_) works in read mode only (kind 'installation');
+ * - canCreateRepos/canDeleteRepos: write mode, pipegen's own App login (not a ghu_ token from GITHUB_TOKEN), and the
+ *   installation on `owner` holds Administration write.
  */
 export function getAuth(opts: AuthOpts & { mode: 'write' }, deps?: AuthDeps): Promise<Auth & { token: string }>;
 export function getAuth(opts: AuthOpts & { mode: 'read' }, deps?: AuthDeps): Promise<Auth>;
 export function getAuth(opts: AuthOpts & { mode: 'read' | 'write' }, deps?: AuthDeps): Promise<Auth>;
 export async function getAuth(opts: AuthOpts & { mode: 'read' | 'write' }, deps: AuthDeps = {}): Promise<Auth> {
   const { owner, repos, allowBroad, mode } = opts;
+  checkRepoNames(owner, repos);
   const clock = deps.clock ?? { budget: newRateBudget() };
   const env = deps.env ?? process.env;
 
@@ -377,7 +454,9 @@ export async function getAuth(opts: AuthOpts & { mode: 'read' | 'write' }, deps:
       isPublic = (res.data as { private?: unknown }).private === false;
     } catch (e) {
       if (isRateStop(e)) throw e;
-      if (failure(e).status === undefined || failure(e).status === 500) {
+      const status = failure(e).status;
+      // no answer, a server error or a 401 on an anonymous call: GitHub itself is the problem, not the user's access
+      if (status === undefined || status === 401 || status >= 500) {
         throw new GitHubAccessError(`pipegen couldn't reach ${GITHUB_API} to check ${repoName(owner, repo)} (${said(e)}).`);
       }
     }
@@ -389,10 +468,22 @@ export async function getAuth(opts: AuthOpts & { mode: 'read' | 'write' }, deps:
   const kind = tokenKind(token);
   if (kind === null || (fromApp && kind !== 'app')) throw new GitHubAccessError(UNKNOWN_TOKEN);
   if (kind === 'classic' && !allowBroad) throw new GitHubAccessError(CLASSIC_REFUSED);
+  if (kind === 'installation') {
+    if (mode === 'write') throw new GitHubAccessError(INSTALLATION_WRITE);
+    return authWith(token, { kind, repos: [...repos], canCreateRepos: false, canDeleteRepos: false });
+  }
 
   let manage = false;
-  if (mode === 'write' && kind === 'app') manage = await appAdministers(makeOctokit(token, { fetch: deps.fetch }), owner, clock);
-  return authWith(token, { kind, repos: kind === 'classic' ? 'all' : [...repos], canCreateRepos: manage, canDeleteRepos: manage });
+  let broad = kind === 'classic';
+  if (kind === 'app') {
+    const inst = await installationFor(makeOctokit(token, { fetch: deps.fetch, clock }), owner, clock);
+    if (inst?.selection === 'all') {
+      if (!allowBroad) throw new GitHubAccessError(ALL_REPOS);
+      broad = true;
+    }
+    manage = mode === 'write' && fromApp && inst?.permissions.administration === 'write';
+  }
+  return authWith(token, { kind, repos: broad ? 'all' : [...repos], canCreateRepos: manage, canDeleteRepos: manage });
 }
 
 // ---------- the repo's GitHub context ----------
@@ -407,13 +498,16 @@ const planOf = (data: unknown): Plan => {
  * Visibility, owner type, plan and default branch. Plan: GET /orgs/{org} for orgs; GET /user only when the token's own
  * `login` is the owner (else it would describe the wrong account); anything else, or any failure → 'unknown'.
  * The `permissions` field of GET /repos is never read (it is the user's role, not the token's rights).
+ * `login` is null for anonymous access and for an installation token (ghs_, which has no user).
  */
-export async function readGitHubContext(gh: Octokit, owner: string, repo: string, login: string | null, clock: RateClock = { budget: newRateBudget() }): Promise<Pick<RepoProfile, 'private' | 'ownerType' | 'plan' | 'defaultBranch'>> {
+export async function readGitHubContext(gh: Octokit, owner: string, repo: string, login: string | null, clock: RateClock = clockOf(gh)): Promise<Pick<RepoProfile, 'private' | 'ownerType' | 'plan' | 'defaultBranch'>> {
+  checkRepoNames(owner, [repo]);
   let data: { private?: unknown; default_branch?: unknown; owner?: { type?: unknown } };
   try {
     data = (await withRateLimit(() => gh.rest.repos.get({ owner, repo }), clock)).data as typeof data;
   } catch (e) {
     if (isRateStop(e)) throw new GitHubAccessError(`GitHub's rate limit stopped pipegen reading ${repoName(owner, repo)}.`, { cause: e });
+    if (isRejected(e)) throw tokenRejected();
     const { status } = failure(e);
     if (status === 404 || status === 403) {
       throw new GitHubAccessError(`pipegen can't see ${repoName(owner, repo)} with this token (${said(e)}). Check the repo name and that the token (or the App installation) includes this repo.`, { status });
@@ -430,6 +524,7 @@ export async function readGitHubContext(gh: Octokit, owner: string, repo: string
       plan = planOf((await withRateLimit(call, clock)).data);
     } catch (e) {
       if (isRateStop(e)) throw e;
+      if (isRejected(e)) throw tokenRejected();
       plan = 'unknown';
     }
   };
@@ -445,19 +540,48 @@ const PERMISSION_REFUSAL = /resource not accessible by (?:integration|personal a
 
 /**
  * What the token can't do on `repos` (under `owner`), found by real calls (never by GET /repos `permissions`).
- * - App token (`kind: 'app'`): the installation on `owner` lists its exact permissions (GET /user/installations).
- * - Other tokens: one read-only GET per permission that has one (S1's header evidence). A 403 "Resource not
- *   accessible…" is a missing permission (named by GitHub's x-accepted-github-permissions header when it sends one).
- *   GitHub can't show a write level without a write, so in write mode those are listed as `unchecked`, never assumed.
- * A repo the token can't see (403/404 on GET /repos) is missing as "Access to owner/repo". Probing never writes.
+ * - App token (`kind: 'app'`): the installation on `owner` lists its exact permissions (GET /user/installations), and
+ *   which repos it may touch comes from the installation's repo list (GET /user/installations/{id}/repositories),
+ *   not from GET /repos, which answers 200 for any public repo.
+ * - Other tokens (fine-grained, classic, an installation token `ghs_`): GET /repos for each repo, then one read-only
+ *   GET per permission that has one (S1's header evidence). A 403 "Resource not accessible…" is a missing permission
+ *   (named by GitHub's x-accepted-github-permissions header when it sends one). GitHub can't show a write level without
+ *   a write, so in write mode those are listed as `unchecked`, never assumed. (A fine-grained token answers 200 for a
+ *   public repo outside its selection too; there the per-permission probes are what find the gap.)
+ * A repo the token can't reach is missing as "Access to owner/repo". A 401 is a GitHubAccessError ("token rejected").
+ * Probing never writes.
  */
 export async function probePermissions(gh: Octokit, owner: string, repos: string[], opts: { kind?: Auth['kind']; mode?: 'read' | 'write'; clock?: RateClock } = {}): Promise<{ missing: Row[]; unchecked: Row[] }> {
+  checkRepoNames(owner, repos);
   const mode = opts.mode ?? 'write';
-  const clock = opts.clock ?? { budget: newRateBudget() };
+  const clock = opts.clock ?? clockOf(gh);
   const missing: Row[] = [];
   const unchecked: Row[] = [];
   const add = (list: Row[], r: Row) => { if (!list.some((x) => x.permission === r.permission)) list.push(r); };
   const rows = rowsFor(mode).filter((p) => opts.kind === 'app' || !p.appOnly);
+  const access = (repo: string) => `Access to ${repoName(owner, repo)}`;
+  const NO_ACCESS = 'pipegen can\'t reach this repo with this token: it doesn\'t exist yet, or it isn\'t in the token\'s (or the App installation\'s) repository list.';
+  const done = () => ({ missing, unchecked: unchecked.filter((u) => !missing.some((m) => m.permission === u.permission)) });
+
+  if (opts.kind === 'app') {
+    const inst = await installationFor(gh, owner, clock);
+    if (inst === null) {
+      for (const repo of repos) add(unchecked, { permission: access(repo), why: 'GitHub didn\'t list pipegen\'s App installation on this account, so pipegen couldn\'t check it.' });
+      for (const p of rows) add(unchecked, entry(p, mode));
+      return done();
+    }
+    const reach = await installationRepos(gh, inst.id, clock);
+    for (const repo of repos) {
+      if (reach === null) add(unchecked, { permission: access(repo), why: 'GitHub didn\'t list the App installation\'s repos, so pipegen couldn\'t check this one.' });
+      else if (!reach.has(`${owner}/${repo}`.toLowerCase())) add(missing, { permission: access(repo), why: NO_ACCESS });
+    }
+    for (const p of rows) {
+      const need = mode === 'write' ? p.write : (p.read as Level);
+      const have = inst.permissions[p.key];
+      if (!(have === 'write' || (have === 'read' && need === 'read'))) add(missing, entry(p, mode));
+    }
+    return done();
+  }
 
   const visible: string[] = [];
   for (const repo of repos) {
@@ -466,31 +590,11 @@ export async function probePermissions(gh: Octokit, owner: string, repos: string
       visible.push(repo);
     } catch (e) {
       if (isRateStop(e)) throw e;
+      if (isRejected(e)) throw tokenRejected();
       const { status } = failure(e);
-      const access = `Access to ${repoName(owner, repo)}`;
-      if (status === 403 || status === 404) add(missing, { permission: access, why: 'pipegen can\'t see this repo with this token: it doesn\'t exist yet, or it isn\'t in the token\'s (or the App installation\'s) repository list.' });
-      else add(unchecked, { permission: access, why: `GitHub didn't answer (${said(e)}), so pipegen couldn't check this repo.` });
+      if (status === 403 || status === 404) add(missing, { permission: access(repo), why: NO_ACCESS });
+      else add(unchecked, { permission: access(repo), why: `GitHub didn't answer (${said(e)}), so pipegen couldn't check this repo.` });
     }
-  }
-
-  if (opts.kind === 'app') {
-    let inst: Installation | null;
-    try {
-      inst = await installationFor(gh, owner, clock);
-    } catch (e) {
-      if (isRateStop(e)) throw e;
-      inst = null;
-    }
-    if (inst === null) {
-      for (const p of rows) add(unchecked, entry(p, mode));
-      return { missing, unchecked };
-    }
-    for (const p of rows) {
-      const need = mode === 'write' ? p.write : (p.read as Level);
-      const have = inst.permissions[p.key];
-      if (!(have === 'write' || (have === 'read' && need === 'read'))) add(missing, entry(p, mode));
-    }
-    return { missing, unchecked };
   }
 
   for (const p of rows) {
@@ -503,6 +607,7 @@ export async function probePermissions(gh: Octokit, owner: string, repos: string
           await withRateLimit(() => gh.request(`GET /repos/{owner}/{repo}${p.probe}`, { owner, repo }), clock);
         } catch (e) {
           if (isRateStop(e)) throw e;
+          if (isRejected(e)) throw tokenRejected();
           confirmed = false;
           const f = failure(e);
           if (f.status === 403 && PERMISSION_REFUSAL.test(f.message)) {
@@ -518,8 +623,7 @@ export async function probePermissions(gh: Octokit, owner: string, repos: string
     if (refused) add(missing, entry(p, mode));
     else if (!confirmed || (mode === 'write' && p.write === 'write')) add(unchecked, entry(p, mode));
   }
-  // keep `unchecked` free of what is already known to be missing
-  return { missing, unchecked: unchecked.filter((u) => !missing.some((m) => m.permission === u.permission)) };
+  return done();
 }
 
 // ---------- writers ----------
@@ -532,7 +636,8 @@ const WRITERS_PAGES = 50;
  * logins that aren't valid GitHub logins are left out. A refused call is an error naming the permission GitHub asked
  * for (its x-accepted-github-permissions header); pipegen doesn't guess one when GitHub doesn't say.
  */
-export async function listWriters(gh: Octokit, owner: string, repo: string, clock: RateClock = { budget: newRateBudget() }): Promise<string[]> {
+export async function listWriters(gh: Octokit, owner: string, repo: string, clock: RateClock = clockOf(gh)): Promise<string[]> {
+  checkRepoNames(owner, [repo]);
   const writers: string[] = [];
   for (let page = 1; page <= WRITERS_PAGES; page++) {
     let data: unknown;
@@ -543,6 +648,7 @@ export async function listWriters(gh: Octokit, owner: string, repo: string, cloc
       more = /rel="next"/.test(String(res.headers.link ?? ''));
     } catch (e) {
       if (isRateStop(e)) throw new GitHubAccessError(`GitHub's rate limit stopped pipegen listing who can write to ${repoName(owner, repo)}.`, { cause: e });
+      if (isRejected(e)) throw tokenRejected();
       const f = failure(e);
       const named = acceptedNames(f.accepted);
       const which = named.length > 0

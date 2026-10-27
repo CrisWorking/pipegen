@@ -46,7 +46,7 @@ It protects four stages: **pre-commit → push → merge → deploy**.
 
 - **Access:** a GitHub App or fine-grained token limited to the repos involved. Broad classic tokens are refused by default.
 - **Shown before anything runs:** setup Actions minutes (hard limit 2× the estimate), **monthly** minutes afterwards, approximate AI cost (or "free" with a local model), and approximate time.
-- **GitHub Free + private repos:** some protections (merge locks, required deploy reviewers) need GitHub Pro (personal) or Team (organisation). pipegen checks what your repo really allows, sets up everything else and tells you exactly what's missing. Image signing works there too: it uses a deploy environment, which GitHub allows on Free private repos.
+- **GitHub Free + private repos:** merge locks need GitHub Pro (personal) or Team (organisation), and required deploy reviewers on private repos need GitHub Enterprise. pipegen checks what your repo really allows, sets up everything else and tells you exactly what's missing. Image signing works on Free private repos too, when pipegen can confirm the signing environment's branch rule (only your default branch may use the key).
 
 ## Commands *(planned)*
 

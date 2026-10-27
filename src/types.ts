@@ -34,11 +34,12 @@ export interface RepoProfile {
 // ---------- GitHub access (moved here from Plan A Task 6 in round 4: Plan U uses it too) ----------
 export interface Auth {
   token: string | null;   // null only when kind is 'anonymous'. Sent only to https://api.github.com, never printed
-  kind: 'app' | 'fine-grained' | 'classic' | 'anonymous';   // anonymous = public repo, no token (read mode only, rate-limited)
+  kind: 'app' | 'fine-grained' | 'classic' | 'installation' | 'anonymous';   // anonymous = public repo, no token (read mode only, rate-limited); installation = an Actions GITHUB_TOKEN (ghs_), read mode only
   repos: string[] | 'all'; canCreateRepos: boolean; canDeleteRepos: boolean;
 }
 export interface Capabilities {            // what GitHub allows for this repo + plan
   branchProtection: boolean; environments: boolean; envRequiredReviewers: boolean;
+  deploymentBranchPolicies: boolean;   // the `pipegen-signing` environment is PROVEN (read back) to allow only the default branch; key-env signing needs it
   attestations: boolean; codeScanning: boolean; keylessSigningAllowed: boolean;   // false for private repos (no public logs)
 }
 

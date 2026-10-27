@@ -31,9 +31,9 @@ const profile = (over: Partial<RepoProfile> = {}): RepoProfile => ({
 });
 
 // Capability field names are built from a list (one holds "key", which the repo's own secret-literal check watches).
-const CAP_NAMES = ['branchProtection', 'environments', 'envRequiredReviewers', 'attestations', 'codeScanning', 'keylessSigningAllowed'] as const;
+const CAP_NAMES = ['branchProtection', 'environments', 'deploymentBranchPolicies', 'envRequiredReviewers', 'attestations', 'codeScanning', 'keylessSigningAllowed'] as const;
 const capsFor = (row: 'public' | 'free' | 'team' | 'enterprise'): Capabilities => Object.fromEntries(CAP_NAMES.map((n) => [n, {
-  branchProtection: row !== 'free', environments: row !== 'free', envRequiredReviewers: row === 'public' || row === 'enterprise',
+  branchProtection: row !== 'free', environments: row !== 'free', deploymentBranchPolicies: row !== 'free', envRequiredReviewers: row === 'public' || row === 'enterprise',
   attestations: row === 'public' || row === 'enterprise', codeScanning: row === 'public', keylessSigningAllowed: row === 'public',
 }[n]])) as unknown as Capabilities;
 const PUBLIC = capsFor('public');
