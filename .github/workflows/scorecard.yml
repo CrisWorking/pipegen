@@ -1,0 +1,44 @@
+name: scorecard
+
+# OpenSSF Scorecard for pipegen's own repo (preflight rulings B1, S11). It runs only in the real, public repository:
+# results are published to the OpenSSF API and the SARIF upload to code scanning needs a public repo (or GHAS), so in
+# the private repo (DECISIONS #83) every job is skipped. There is no pull_request or pull_request_target trigger.
+# Expected: a solo repo scores low on Code-Review, Contributors, Fuzzing, CII-Best-Practices and part of
+# Branch-Protection; docs/release.md records the real score and the list at release time.
+
+on:
+  schedule:
+    - cron: '23 4 * * 1' # weekly, Monday
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: scorecard
+  cancel-in-progress: false
+
+jobs:
+  analysis:
+    name: scorecard analysis
+    if: github.repository == 'CrisWorking/pipegen' && github.event.repository.private == false
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      actions: read
+      security-events: write # uploads the SARIF result to code scanning
+      id-token: write # lets the action publish its result and sign it with this workflow's identity
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ossf/scorecard-action@fa7117db83c52d787ae5a89f350999701505d78e # v2.5.0
+        with:
+          results_file: results.sarif
+          results_format: sarif
+          publish_results: true
+      - uses: github/codeql-action/upload-sarif@6f2ac81f5cd81fe351a197ba0b00d91d03cd2aee # v4.39.0
+        with:
+          sarif_file: results.sarif
