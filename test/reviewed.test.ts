@@ -7,11 +7,11 @@ import { NEED_ID_CATEGORY } from '../src/engine/needs.js';
 import { newRateBudget } from '../src/engine/github-rate.js';
 import { COOLDOWN_DAYS, PinError, PLATFORM_ACTION_IDS, resolvePin } from '../src/engine/pin.js';
 import {
-  effectiveProtectedPaths, loadReviewed, MUST_VERIFY, nearDuplicate, NEVER_IMAGES, NEVER_NAME_ALLOW, NEVER_REPOS, neverImage, neverListed, packageExists, projectScriptFor,
+  BETTERLEAKS_ALLOWED_FLAGS, effectiveProtectedPaths, loadReviewed, MUST_VERIFY, nearDuplicate, NUCLEI_ALLOWED_FLAGS, TRIVY_ALLOWED_FLAGS, NEVER_IMAGES, NEVER_NAME_ALLOW, NEVER_REPOS, neverImage, neverListed, packageExists, projectScriptFor,
   ReviewedListError, reviewedFor, TOOL_CATEGORIES,
 } from '../src/engine/reviewed.js';
 import { BETTERLEAKS_FORBIDDEN_FLAGS, BETTERLEAKS_FORBIDDEN_SUBCOMMANDS } from '../src/engine/tool-flags.js';
-import { NUCLEI_GRAMMAR } from '../src/engine/tool-grammar.js';
+import { BETTERLEAKS_GRAMMAR, NUCLEI_GRAMMAR, TRIVY_GRAMMAR, type FlagGrammar } from '../src/engine/tool-grammar.js';
 import { NEED_CATEGORIES, PROTECTED_PATHS_BASE, type Need, type ReviewedTool, type Service } from '../src/types.js';
 import { fakeFetch } from './helpers/fake-http.js';
 import { cleanupRepos, makeTempDir, writeIn } from './helpers/make-repo.js';
@@ -622,7 +622,7 @@ describe('loader rules (Plan P Task 5)', () => {
     rejects([trivyEntry({ command: [...TRIVY_FLAGS, 'trivy', 'image', ...tail] })], /trivy config\|image\|fs/);
     rejects([trivyEntry({ command: ['trivy', 'plugin', 'install', 'x'], args: [] })], /trivy config\|image\|fs/);
     // shorthands read as pflag does: combined bools and glued values
-    expect(load([trivyEntry({ command: ['trivy', 'image', ...TRIVY_FLAGS, '-q', '-fsarif', '-o=tool.sarif', '.'], args: TRIVY_FLAGS })])).toHaveLength(1);
+    expect(load([trivyEntry({ command: ['trivy', 'image', ...TRIVY_FLAGS, '-fsarif', '-o=tool.sarif', '.'], args: TRIVY_FLAGS })])).toHaveLength(1);
     expect(load([trivyEntry({ command: ['trivy', 'fs', ...TRIVY_FLAGS, '--scanners', 'license', '--severity', 'HIGH,CRITICAL', '--exit-code', '1', '.'], args: TRIVY_FLAGS })])).toHaveLength(1);
     // the environment can set any flag: no TRIVY_* env at all
     const env = trivyEntry();
@@ -684,9 +684,7 @@ describe('loader rules (Plan P Task 5)', () => {
     rejects([npm], SEMANTIC);
     const scoped = pkgEntry('npm', undefined, '@jscpd/cli');
     scoped.step.cli.command = ['cpd', '--format', 'sarif', '--compare'];
-    rejects([scoped], /verifiedWith is required/); // the @jscpd scope is jscpd: a MUST_VERIFY tool
-    scoped.verifiedWith = verified('eslint/eslint', {}, '10.13.0');
-    rejects([scoped], /--compare/);
+    rejects([scoped], /--compare/); // the @jscpd scope is jscpd
   });
 
   it('reviewed: jscpd modes that run the embedding model and a semantic config are refused, whatever the spelling (fix round 1)', () => {
@@ -737,8 +735,8 @@ describe('loader rules (Plan P Task 5)', () => {
     rejects([betterleaksEntry({ command: blCmd('-crepo.toml') })], PINNED);
     for (const k of ['BETTERLEAKS_CONFIG', 'GITLEAKS_CONFIG_TOML']) rejects([betterleaksEntry({ env: { [k]: 'x' } })], PINNED);
     rejects([betterleaksEntry({ env: { HUGGINGFACE_REGION: 'x' } })], /gets no env/); // any env at all
-    // -dr / -ir are expanded as cmd/rule_flags.go does
-    expect(load([betterleaksEntry({ command: blCmd('-dr', 'generic-api-key') })])).toHaveLength(1);
+    // -dr / -ir are expanded as cmd/rule_flags.go does, and --disable-rule is not on the allowlist (P13)
+    rejects([betterleaksEntry({ command: blCmd('-dr', 'generic-api-key') })], /not --disable-rule/);
   });
 
   it('reviewed: nuclei without -duc or with -dashboard refused; templates only from the pinned archive', () => {
@@ -785,7 +783,8 @@ describe('loader rules (Plan P Task 5)', () => {
     // only pipegen's two template env variables
     for (const k of ['ENABLE_CLOUD_UPLOAD', 'GITHUB_TEMPLATE_REPO', 'AWS_TEMPLATE_BUCKET', 'NUCLEI_SIGNATURE_PUBLIC_KEY']) rejects([nucleiEntry({ env: { ...NUCLEI_ENV, [k]: 'x' } })], new RegExp(`not ${k}`));
     // choices: a known flag only, no forbidden one, no value that is a flag
-    expect(load([nucleiEntry({ choices: { 'rate-limit': ['50', '150'] } })])).toHaveLength(1);
+    expect(load([nucleiEntry({ choices: { tags: ['cve', 'cve,misconfig'] } })])).toHaveLength(1);
+    rejects([nucleiEntry({ choices: { 'rate-limit': ['50'] } })], /no flag --rate-limit that pipegen may pass/);
     rejects([nucleiEntry({ choices: { cup: ['true'] } })], /never upload/);
     rejects([nucleiEntry({ choices: { t: ['/tmp/x'] } })], /may not choose/);
     rejects([nucleiEntry({ choices: { severity: ['high', '-cup'] } })], /choice value may not be a flag/);
@@ -836,11 +835,12 @@ describe('loader rules (Plan P Task 5)', () => {
   });
 
   it('reviewed: MUST_VERIFY repo without verifiedWith refused', () => {
-    expect([...MUST_VERIFY].sort()).toEqual(['aquasecurity/trivy', 'betterleaks/betterleaks', 'hadolint/hadolint', 'kucherenko/jscpd', 'securego/gosec', 'stackrox/kube-linter']);
+    // ruling P12: jscpd is pinned by sha256 only (branch-signed release, advisory check, DEC #93)
+    expect([...MUST_VERIFY].sort()).toEqual(['aquasecurity/trivy', 'betterleaks/betterleaks', 'hadolint/hadolint', 'securego/gosec', 'stackrox/kube-linter']);
+    expect(load([jscpdEntry({ verifiedWith: null })])).toHaveLength(1);
     const entries: Record<string, (v: Entry | null, repo?: string) => Entry> = {
       'aquasecurity/trivy': (v, repo) => trivyEntry({ verifiedWith: v, ...(repo === undefined ? {} : { repo }) }),
       'betterleaks/betterleaks': (v, repo) => (repo === undefined ? betterleaksEntry({ verifiedWith: v }) : { ...betterleaksEntry({ verifiedWith: v }), candidate: { ...betterleaksEntry().candidate, repo, name: repo } }),
-      'kucherenko/jscpd': (v, repo) => (repo === undefined ? jscpdEntry({ verifiedWith: v }) : { ...jscpdEntry({ verifiedWith: v }), candidate: { ...jscpdEntry().candidate, repo, name: repo } }),
       'hadolint/hadolint': (v, repo) => binEntry(repo ?? 'hadolint/hadolint', { verifiedWith: v }),
       'stackrox/kube-linter': (v, repo) => binEntry(repo ?? 'stackrox/kube-linter', { verifiedWith: v }),
       'securego/gosec': (v, repo) => binEntry(repo ?? 'securego/gosec', { verifiedWith: v }),
@@ -942,6 +942,66 @@ describe('loader rules (Plan P Task 5)', () => {
       rejects([{ ...actionEntry(), reviewedBy: name, reviewedAt: '2026-11-01' }], /PENDING exactly/);
     }
     expect(load([{ ...actionEntry(), reviewedBy: 'Pendleton Smith', reviewedAt: '2026-11-01' }])).toHaveLength(1);
+  });
+
+  it('reviewed: trivy, betterleaks and nuclei take only allowlisted flags, checked on the parsed argv and the fixed args (ruling P13)', () => {
+    const grammars: [ReadonlySet<string>, FlagGrammar[]][] = [
+      [TRIVY_ALLOWED_FLAGS, Object.values(TRIVY_GRAMMAR)], [BETTERLEAKS_ALLOWED_FLAGS, Object.values(BETTERLEAKS_GRAMMAR)], [NUCLEI_ALLOWED_FLAGS, [NUCLEI_GRAMMAR]],
+    ];
+    // every allowlisted flag is a real flag of the pinned version (in at least one subcommand)
+    for (const [allowed, gs] of grammars) for (const f of allowed) expect(gs.some((g) => g.value.has(f) || g.bool.has(f) || g.optional.has(f)), f).toBe(true);
+    // none of the forbidden ones is allowlisted
+    for (const f of BETTERLEAKS_FORBIDDEN_FLAGS) expect(BETTERLEAKS_ALLOWED_FLAGS.has(f.replace(/^-+/, ''))).toBe(false);
+    const tail = ['--format', 'sarif', '--output', 'tool.sarif', '--exit-code', '1', '.'];
+    for (const f of ['--help', '-h', '--version', '-v', '--quiet', '-q', '--debug', '--no-progress', '--skip-db-update', '--list-all-pkgs', '-qv']) {
+      rejects([trivyEntry({ command: ['trivy', 'image', ...TRIVY_FLAGS, f, ...tail] })], /allowlist, ruling P13/);
+    }
+    for (const f of ['--help', '-h', '-hv', '--log-level=debug', '--max-target-megabytes=1', '--baseline-path=x', '--enable-rule=x', '-ir', '--no-color']) {
+      rejects([betterleaksEntry({ command: blCmd(f, ...(f === '-ir' ? ['x'] : [])) })], /allowlist, ruling P13|never use --verbose/);
+    }
+    for (const f of ['-version', '-tl', '-h', '-V', '-headless', '-code', '-l', '-o', '-silent', '-stats']) {
+      rejects([nucleiEntry({ command: nucleiCmd(f, ...(['-V', '-l', '-o'].includes(f) ? ['x=y'] : [])) })], /allowlist, ruling P13|unknown flag/); // goflags' -h is built in: unknown
+    }
+    // the fixed args are read with the same grammar
+    rejects([betterleaksEntry({ command: blCmd('--no-color'), args: ['--report-format', 'sarif', '--no-color'] })], /allowlist, ruling P13/);
+    rejects([trivyEntry({ command: ['trivy', 'image', ...TRIVY_FLAGS, '--no-such', ...tail], args: [...TRIVY_FLAGS, '--no-such'] })], /unknown flag --no-such/);
+    // allowlisted flags load (the Task 6 trivy-licence, image and betterleaks shapes)
+    expect(load([trivyEntry({ command: ['trivy', 'fs', ...TRIVY_FLAGS, '--scanners', 'license', '--severity', 'HIGH,CRITICAL', '--exit-code', '1', '.'], args: TRIVY_FLAGS })])).toHaveLength(1);
+    expect(load([betterleaksEntry({ command: blCmd('--no-banner', '--redact', '--ignore-gitleaks-allow', '--exit-code', '1') })])).toHaveLength(1);
+    expect(load([nucleiEntry({ command: nucleiCmd('-u', 'http://localhost:8080', '-ni', '-as') })])).toHaveLength(1);
+  });
+
+  it('reviewed: betterleaks --redact takes an optional value, as pflag reads it (NoOptDefVal "100", v1.9.0 cmd/root.go:95)', () => {
+    expect(BETTERLEAKS_GRAMMAR.git.optional.has('redact')).toBe(true);
+    expect(BETTERLEAKS_GRAMMAR.git.value.has('redact')).toBe(false);
+    // alone it doesn't swallow the next word, so a following --config is a second config
+    rejects([betterleaksEntry({ command: blCmd('--redact', '--config=/tmp/evil.toml') })], /pinned --config/);
+    rejects([betterleaksEntry({ command: blCmd('--redact', '-c/tmp/evil.toml') })], /pinned --config/);
+    rejects([betterleaksEntry({ command: blCmd('--redact', '--verbose') })], /never use --verbose/);
+    expect(load([betterleaksEntry({ command: blCmd('--redact=50') })])).toHaveLength(1);
+    expect(load([betterleaksEntry({ command: blCmd('--redact') })])).toHaveLength(1);
+  });
+
+  it('reviewed: trivy\'s pinned config is YAML with only cache.backend: memory (ruling P13)', () => {
+    const conf = (content: string | null, passAs: Entry = { flag: '--config' }) => {
+      const e = trivyEntry();
+      if (content === null) delete e.fixedInputs.config;
+      else e.fixedInputs.config = { content, passAs };
+      return e;
+    };
+    expect(load([conf('# pinned\ncache:\n  backend: memory\n')])).toHaveLength(1);
+    for (const extra of ['db:\n  repository: ghcr.io/evil/db\n', 'server:\n  addr: http://x\n', 'misconfiguration:\n  checks-bundle-repository: x\n',
+      'disable-telemetry: false\n', 'cache:\n  dir: /tmp\n', 'severity: [LOW]\n']) {
+      rejects([conf(`cache:\n  backend: memory\n${extra}`)], /may set only cache.backend: memory|plain YAML/); // a second `cache:` key is invalid YAML
+    }
+    rejects([conf('cache:\n  backend: fs\n')], /may set only cache.backend: memory, not cache.backend/);
+    rejects([conf('cache: &a\n  backend: memory\nother: *a\n')], /plain YAML|may set only/);
+    rejects([conf('cache:\n  backend: memory\ncache:\n  backend: memory\n')], /plain YAML/);
+    rejects([conf('[1, 2]\n')], /may set only/);
+    rejects([conf(null)], /pinned config, passed as --config/);
+    rejects([conf('cache:\n  backend: memory\n', { flag: '--secret-config' })], /pinned config, passed as --config/);
+    // the real entries load with exactly that
+    for (const id of ['trivy-config', 'trivy-image']) expect(byId(real(), id)[0]?.fixedInputs.config?.passAs).toEqual({ flag: '--config' });
   });
 });
 
@@ -1119,6 +1179,61 @@ describe('Task 5 review probes (fix round 1)', () => {
       e.reviewedAt = '2026-10-27';
     }, /PENDING exactly/],
   ];
+  // fix round 2: every case of the re-review's parser probes (scratchpad adv-p5/probe-r1.mjs); null = loads
+  const ALLOW = /allowlist, ruling P13/;
+  const blAt = (...words: string[]) => withAdded(pbetterleaks, (e) => e.step.cli.command.splice(2, 0, ...words));
+  const nucAt = (...words: string[]) => withAdded(pnuclei, (e) => e.step.cli.command.push(...words));
+  const trivyConf = (id: string, more: string) => (d: Doc) => { find(d, id).fixedInputs.config.content += more; };
+  const probesR1: [number, string, (d: Doc) => void, RegExp | null][] = [
+    [1, 'control: real file loads', () => {}, ACCEPT],
+    [2, 'control: betterleaks base', add(pbetterleaks()), ACCEPT],
+    [3, 'control: nuclei base', add(pnuclei()), ACCEPT],
+    [4, 'control: jscpd base signed at its tag', add(pjscpd()), ACCEPT],
+    [5, 'jscpd \\u0073emantic config', withAdded(pjscpd, (e) => { e.fixedInputs.config.content = '{"\\u0073emantic": {"enabled": true}}\n'; }), /semantic/],
+    [6, 'jscpd --compare', withAdded(pjscpd, (e) => e.step.cli.command.push('--compare')), /--compare/],
+    [7, 'future pinnedOn alone', (d) => { d.pinnedOn = '2099-01-01T00:00:00Z'; }, /pinnedOn is in the future/],
+    [8, 'betterleaks -vfsarif bundles --verbose', blAt('-vfsarif'), /never use --verbose \(given as -vfsarif/],
+    [9, 'betterleaks -hv (help + verbose)', blAt('-hv'), /never use --verbose|allowlist/],
+    [10, 'betterleaks --redact then --config=/x (optional value: nothing swallowed)', blAt('--redact', '--config=/tmp/evil.toml'), /pinned --config/],
+    [11, 'betterleaks --redact then -c/x', blAt('--redact', '-c/tmp/evil.toml'), /pinned --config/],
+    [12, 'betterleaks --verbose=true', withAdded(pbetterleaks, (e) => e.step.cli.command.push('--verbose=true')), /never use --verbose/],
+    [13, 'betterleaks -dr=x (expanded to --disable-rule: not allowlisted)', blAt('-dr=generic-api-key'), ALLOW],
+    [14, 'betterleaks --help', withAdded(pbetterleaks, (e) => e.step.cli.command.push('--help')), ALLOW],
+    [15, 'trivy -qv (quiet + version)', (d) => { trivy(d).step.cli.command.splice(2, 0, '-qv'); }, ALLOW],
+    [16, 'trivy --help', (d) => { trivy(d).step.cli.command.push('--help'); }, ALLOW],
+    [17, 'trivy --disable-telemetry= (empty)', (d) => { trivy(d).step.cli.command.push('--disable-telemetry='); }, /is a switch/],
+    [18, 'trivy --disable-telemetry=0 later', (d) => { trivy(d).step.cli.command.push('--disable-telemetry=0'); }, /--disable-telemetry in effect/],
+    [19, 'trivy -o swallows --skip-version-check', (d) => {
+      const c = trivy(d).step.cli.command;
+      c.splice(c.indexOf('--skip-version-check'), 0, '-o');
+    }, /--skip-version-check in effect/],
+    [20, 'trivy -qfsarif (bundled shorthands)', (d) => { trivy(d).step.cli.command.push('-qfsarif'); }, ALLOW],
+    [21, 'trivy config YAML db.repository', trivyConf('trivy-image', 'db:\n  repository: ghcr.io/evil/trivy-db\n'), /may set only cache.backend: memory, not db.repository/],
+    [22, 'trivy config YAML server.addr', trivyConf('trivy-image', 'server:\n  addr: http://evil.example\n'), /not server.addr/],
+    [23, 'trivy config YAML checks-bundle-repository', trivyConf('trivy-config', 'misconfiguration:\n  checks-bundle-repository: ghcr.io/evil/checks\n'), /not misconfiguration.checks-bundle-repository/],
+    [24, 'trivy config YAML disable-telemetry: false', trivyConf('trivy-image', 'disable-telemetry: false\n'), /not disable-telemetry/],
+    [25, 'nuclei -cup', nucAt('-cup'), /never upload/],
+    [26, 'nuclei --cup=true', withAdded(pnuclei, (e) => e.step.cli.command.splice(1, 0, '--cup=true')), /never upload/],
+    [27, 'nuclei -duc=false later', withAdded(pnuclei, (e) => e.step.cli.command.splice(2, 0, '-duc=false')), /-duc \(no update check\) in effect/],
+    [28, 'nuclei target before -duc', withAdded(pnuclei, (e) => { e.step.cli.command = ['nuclei', 'http://x', '-duc', '-t', NUCLEI_DIR]; }), /-duc \(no update check\) in effect/],
+    [29, 'nuclei -- then -duc', withAdded(pnuclei, (e) => { e.step.cli.command = ['nuclei', '-t', NUCLEI_DIR, '--', '-duc']; }), /fixed arg|-duc/],
+    [30, 'nuclei second -t elsewhere', nucAt('-t', '/tmp/x'), /pinned archive/],
+    [31, 'nuclei -t= empty', nucAt('-t='), /pinned archive/],
+    [32, 'nuclei -version', nucAt('-version'), ALLOW],
+    [33, 'nuclei -tl (list templates)', nucAt('-tl'), ALLOW],
+    [34, 'nuclei -V key=value (not allowlisted)', withAdded(pnuclei, (e) => e.step.cli.command.splice(1, 0, '-V', 'a=b')), ALLOW],
+    [35, 'P12: jscpd with no verifiedWith loads', withAdded(pjscpd, (e) => { delete e.verifiedWith; }), ACCEPT],
+  ];
+  it.each(probesR1)('re-review probe #%i: %s', (_n, _name, mutate, refusal) => {
+    const doc = structuredClone(rawFile()) as Doc;
+    mutate(doc);
+    const dir = makeTempDir();
+    writeIn(dir, 'reviewed-tools.yml', stringify(doc));
+    const path = `${dir}/reviewed-tools.yml`;
+    if (refusal === null) expect(loadReviewed(path).length).toBeGreaterThan(20);
+    else expect(() => loadReviewed(path)).toThrow(refusal);
+  });
+
   it.each(probes)('probe #%i: %s', (_n, _name, mutate, refusal) => {
     const doc = structuredClone(rawFile()) as Doc;
     mutate(doc);

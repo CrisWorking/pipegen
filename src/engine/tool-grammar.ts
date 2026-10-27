@@ -4,9 +4,17 @@
 // the way the tool does (a value-taking flag swallows the next word, `--` ends the flags) and refuse any flag it
 // doesn't know. Leaf module: no imports.
 
-/** A tool's flags: long name → takes a value; short name → long name. */
-export interface FlagGrammar { readonly value: ReadonlySet<string>; readonly bool: ReadonlySet<string>; readonly shorts: Readonly<Record<string, string>> }
-const grammar = (value: readonly string[], bool: readonly string[], shorts: Record<string, string>): FlagGrammar => ({ value: new Set(value), bool: new Set(bool), shorts: Object.freeze(shorts) });
+/**
+ * A tool's flags: `value` flags take a value (the next word, or `=v`); `bool` flags take none (`=v` sets a bool);
+ * `optional` flags take a value only as `--flag=v` (pflag NoOptDefVal: alone they use their default, and never
+ * swallow the next word); `shorts` maps a short name to its long name.
+ */
+export interface FlagGrammar {
+  readonly value: ReadonlySet<string>; readonly bool: ReadonlySet<string>; readonly optional: ReadonlySet<string>; readonly shorts: Readonly<Record<string, string>>;
+}
+const grammar = (value: readonly string[], bool: readonly string[], shorts: Record<string, string>, optional: readonly string[] = []): FlagGrammar => ({
+  value: new Set(value.filter((v) => !optional.includes(v))), bool: new Set(bool), optional: new Set(optional), shorts: Object.freeze(shorts),
+});
 
 /**
  * Trivy v0.76.0, by subcommand (pflag: `--long`, `-s`, glued `-svalue`, combined bool shorthands). Source: the
@@ -111,7 +119,8 @@ export const NUCLEI_GRAMMAR: FlagGrammar = grammar([
 /**
  * betterleaks v1.9.0 (cobra/pflag). Source at tag v1.9.0: the root's persistent flags in cmd/root.go (lines 81-127),
  * and the scan subcommands pipegen may run: `git` (cmd/git.go), `dir` (cmd/directory.go), `stdin` (cmd/stdin.go).
- * cmd/rule_flags.go expands `-dr` and `-ir` to --disable-rule and --isolate-rule before parsing.
+ * cmd/rule_flags.go expands `-dr` and `-ir` to --disable-rule and --isolate-rule before parsing. `--redact` takes an
+ * optional value: cmd/root.go:95 sets its NoOptDefVal to "100", so `--redact` alone never swallows the next word.
  */
 export const BETTERLEAKS_GRAMMAR: Readonly<Record<'git' | 'dir' | 'stdin', FlagGrammar>> = {
   git: grammar([
@@ -124,7 +133,7 @@ export const BETTERLEAKS_GRAMMAR: Readonly<Record<'git' | 'dir' | 'stdin', FlagG
   ], [
     'help', 'ignore-gitleaks-allow', 'legacy-print', 'no-banner', 'no-color', 'pre-commit', 'staged', 'validation',
     'validation-debug', 'validation-extract-empty', 'verbose',
-  ], {'c': 'config', 'r': 'report-path', 'f': 'report-format', 'b': 'baseline-path', 'l': 'log-level', 'v': 'verbose', 'i': 'gitleaks-ignore-path', 'h': 'help'}),
+  ], {'c': 'config', 'r': 'report-path', 'f': 'report-format', 'b': 'baseline-path', 'l': 'log-level', 'v': 'verbose', 'i': 'gitleaks-ignore-path', 'h': 'help'}, ['redact']),
   dir: grammar([
     'baseline-path', 'confidence', 'config', 'diagnostics', 'diagnostics-dir', 'disable-rule', 'enable-rule',
     'exit-code', 'experiments', 'gitleaks-ignore-path', 'isolate-rule', 'log-level', 'match-context',
@@ -135,7 +144,7 @@ export const BETTERLEAKS_GRAMMAR: Readonly<Record<'git' | 'dir' | 'stdin', FlagG
   ], [
     'follow-symlinks', 'help', 'ignore-gitleaks-allow', 'legacy-print', 'no-banner', 'no-color', 'validation',
     'validation-debug', 'validation-extract-empty', 'verbose',
-  ], {'c': 'config', 'r': 'report-path', 'f': 'report-format', 'b': 'baseline-path', 'l': 'log-level', 'v': 'verbose', 'i': 'gitleaks-ignore-path', 'h': 'help'}),
+  ], {'c': 'config', 'r': 'report-path', 'f': 'report-format', 'b': 'baseline-path', 'l': 'log-level', 'v': 'verbose', 'i': 'gitleaks-ignore-path', 'h': 'help'}, ['redact']),
   stdin: grammar([
     'baseline-path', 'confidence', 'config', 'diagnostics', 'diagnostics-dir', 'disable-rule', 'enable-rule',
     'exit-code', 'experiments', 'gitleaks-ignore-path', 'isolate-rule', 'log-level', 'match-context',
@@ -146,5 +155,5 @@ export const BETTERLEAKS_GRAMMAR: Readonly<Record<'git' | 'dir' | 'stdin', FlagG
   ], [
     'help', 'ignore-gitleaks-allow', 'legacy-print', 'no-banner', 'no-color', 'validation', 'validation-debug',
     'validation-extract-empty', 'verbose',
-  ], {'c': 'config', 'r': 'report-path', 'f': 'report-format', 'b': 'baseline-path', 'l': 'log-level', 'v': 'verbose', 'i': 'gitleaks-ignore-path', 'h': 'help'}),
+  ], {'c': 'config', 'r': 'report-path', 'f': 'report-format', 'b': 'baseline-path', 'l': 'log-level', 'v': 'verbose', 'i': 'gitleaks-ignore-path', 'h': 'help'}, ['redact']),
 };

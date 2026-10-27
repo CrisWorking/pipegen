@@ -33,7 +33,7 @@ import { NEED_ID_CATEGORY } from './need-ids.js';
 import { fetchAllowed, HttpError } from './http.js';
 import { COOLDOWN_DAYS } from './pin.js';
 import { isRealDate, isReleaseBuild, listPending, PENDING, REVIEWER_RE, reviewMarkerProblems } from './review-marker.js';
-import { lastValue, parseArgv } from './argv.js';
+import { lastValue, parseArgv, type ParsedArgv } from './argv.js';
 import { BETTERLEAKS_FORBIDDEN_FLAGS, BETTERLEAKS_FORBIDDEN_SUBCOMMANDS, BETTERLEAKS_SUBCOMMANDS } from './tool-flags.js';
 import { BETTERLEAKS_GRAMMAR, NUCLEI_GRAMMAR, TRIVY_GRAMMAR } from './tool-grammar.js';
 
@@ -174,12 +174,14 @@ export const NEVER_IMAGES: Readonly<Record<string, string>> = Object.freeze({
 
 /**
  * Tools whose releases pipegen pins only with a recorded signature or attestation check (verifiedWith), by their
- * repo: catalogue §4 ("+ cosign", "+ GitHub attestation", "+ sigstore") and DECISIONS #95 (jscpd as a signed binary,
- * ruling PS27). The check goes by the tool, not the exact repo (fix round 1): any entry whose repo has one of these
- * names (under any owner) or that runs one of these tools (runsTool) needs verifiedWith.
+ * repo: catalogue §4 ("+ cosign", "+ GitHub attestation", "+ sigstore"). The check goes by the tool, not the exact
+ * repo (fix round 1): any entry whose repo has one of these names (under any owner) or that runs one of these tools
+ * (runsTool) needs verifiedWith. jscpd is not on it (ruling P12): its releases are signed from a branch
+ * (refs/heads/master), which verifiedWith's tag-only identity refuses; it is an advisory, warning-only check
+ * (DECISIONS #93), pinned by the sha256 of the reviewed release asset, and its bundle is recorded as information only.
  */
 export const MUST_VERIFY: ReadonlySet<string> = new Set([
-  'betterleaks/betterleaks', 'aquasecurity/trivy', 'hadolint/hadolint', 'stackrox/kube-linter', 'securego/gosec', 'kucherenko/jscpd',
+  'betterleaks/betterleaks', 'aquasecurity/trivy', 'hadolint/hadolint', 'stackrox/kube-linter', 'securego/gosec',
 ]);
 
 /**
@@ -587,11 +589,70 @@ function verifiedWithProblems(e: Entry): Problem[] {
 function choiceProblems(tool: string, e: Entry, known: (name: string) => boolean, refused: (name: string) => string | null): Problem[] {
   const out: Problem[] = [];
   for (const [k, vs] of Object.entries(e.choices)) {
-    const why = known(k) ? refused(k) : `${tool} has no flag --${k}: a choice names a flag of the pinned version`;
+    const why = refused(k) ?? (known(k) ? null : `${tool} has no flag --${k} that pipegen may pass: a choice names a flag of the pinned version on the allowlist (ruling P13)`);
     if (why !== null) out.push({ message: why, path: ['choices', k] });
     for (const v of vs) if (v.startsWith('-')) out.push({ message: `a ${tool} choice value may not be a flag (${v})`, path: ['choices', k] });
   }
   return out;
+}
+
+/**
+ * Ruling P13: the only flags (long names) pipegen may pass each tool at its pinned version, the smallest set its own
+ * planned steps use (catalogue §3 PU11, MG2, MG4, PC2, MG5 and the Task 6 table). Any parsed flag outside its list is
+ * refused, aliases and shorthands included (`-v`, `--help`, `-version`, `-tl`, …); the forbidden lists stay as a
+ * second check. A flag added here needs a review of what it does at the pinned version.
+ */
+export const TRIVY_ALLOWED_FLAGS: ReadonlySet<string> = new Set([
+  'disable-telemetry', 'skip-version-check', 'skip-check-update', 'format', 'output', 'exit-code', 'severity', 'scanners', 'ignore-unfixed',
+]);
+export const BETTERLEAKS_ALLOWED_FLAGS: ReadonlySet<string> = new Set(['report-format', 'report-path', 'no-banner', 'ignore-gitleaks-allow', 'redact', 'exit-code']);
+export const NUCLEI_ALLOWED_FLAGS: ReadonlySet<string> = new Set([
+  'disable-update-check', 'templates', 'severity', 'sarif-export', 'target', 'automatic-scan', 'tags', 'no-interactsh',
+]);
+
+/** P13: every parsed flag is on the tool's allowlist (skip: names another rule already refused with its own reason). */
+function allowlistProblems(tool: string, parsed: readonly ParsedArgv[], allowed: ReadonlySet<string>, dash: string, skip: (name: string) => boolean = () => false): Problem[] {
+  const out: Problem[] = [];
+  for (const p of parsed) {
+    for (const f of p.flags) {
+      if (allowed.has(f.name) || skip(f.name)) continue;
+      const shown = f.raw === `${dash}${f.name}` || f.raw.startsWith(`${dash}${f.name}=`) ? f.raw : `${f.raw} (${dash}${f.name})`;
+      out.push({ message: `${tool} may use only ${[...allowed].map((n) => `${dash}${n}`).join(', ')} (allowlist, ruling P13), not ${shown}`, path: ['step', 'cli', 'command'] });
+      return out;
+    }
+  }
+  return out;
+}
+
+/** Keys pipegen's pinned trivy config may set, with their only value (P13): today, the in-memory cache. */
+const TRIVY_CONFIG_ALLOWED: Readonly<Record<string, string>> = { 'cache.backend': 'memory' };
+
+/**
+ * Trivy's pinned config (P13): passed as --config (so the repo's trivy.yaml is never loaded), YAML (bounded: 64 KiB,
+ * no aliases) whose every key is in TRIVY_CONFIG_ALLOWED with its value. The config can set every flag (db.repository,
+ * server.addr, misconfiguration.checks-bundle-repository, …), so nothing else is allowed.
+ */
+function trivyConfigProblems(e: Entry): Problem[] {
+  const bad = (message: string): Problem[] => [{ message, path: ['fixedInputs', 'config'] }];
+  const cfg = e.fixedInputs.config;
+  if (cfg === undefined || !('flag' in cfg.passAs) || cfg.passAs.flag !== '--config') return bad("trivy runs with pipegen's pinned config, passed as --config (else it loads the repo's trivy.yaml)");
+  let doc: unknown;
+  try {
+    doc = parse(cfg.content, { maxAliasCount: 0, uniqueKeys: true });
+  } catch {
+    return bad("trivy's pinned config must be plain YAML (no aliases, no repeated keys)");
+  }
+  const leavesOf = (v: unknown, at: string, out: [string, unknown][]) => {
+    if (v !== null && typeof v === 'object' && !Array.isArray(v)) for (const [k, x] of Object.entries(v)) leavesOf(x, at === '' ? k : `${at}.${k}`, out);
+    else out.push([at, v]);
+    return out;
+  };
+  const found = leavesOf(doc, '', []);
+  const allowed = Object.entries(TRIVY_CONFIG_ALLOWED).map(([k, v]) => `${k}: ${v}`).join(', ');
+  for (const [k, v] of found) {
+    if (TRIVY_CONFIG_ALLOWED[k] === undefined || TRIVY_CONFIG_ALLOWED[k] !== v) return bad(`trivy's pinned config may set only ${allowed}, not ${k || '(a non-mapping document)'}`);
+  }
+  return [];
 }
 
 /** Trivy flags pipegen never passes: other servers, registries, check or DB sources, modules, credentials, or a second config. */
@@ -620,16 +681,20 @@ function trivyProblems(e: Entry): Problem[] {
   const p = parseArgv(command.slice(2), g, 'pflag');
   if (p.errors.length > 0) bad(`trivy ${sub}: ${p.errors[0]} (pipegen reads the command with trivy v0.76.0's flags and refuses any it doesn't know)`, 'step', 'cli', 'command');
   const args = e.fixedInputs.args ?? [];
+  const pa = parseArgv(args, g, 'pflag');
+  if (pa.errors.length > 0) bad(`trivy ${sub} fixedInputs.args: ${pa.errors[0]}`, 'fixedInputs', 'args');
   for (const flag of TRIVY_REQUIRED_FLAGS) {
     if (lastValue(p, flag.slice(2)) !== 'true' || !args.includes(flag)) {
       bad(`trivy must run with ${flag} in effect, in the command and fixedInputs.args (not another flag's value, not after --, never ${flag}=false; catalogue §4)`, 'step', 'cli', 'command');
     }
   }
-  for (const f of p.flags) if (TRIVY_FORBIDDEN.has(f.name)) bad(`trivy must not use --${f.name} (another server, source, credential or config than pipegen's)`, 'step', 'cli', 'command');
+  for (const f of [...p.flags, ...pa.flags]) if (TRIVY_FORBIDDEN.has(f.name)) bad(`trivy must not use --${f.name} (another server, source, credential or config than pipegen's)`, 'step', 'cli', 'command');
+  out.push(...allowlistProblems('trivy', [p, pa], TRIVY_ALLOWED_FLAGS, '--', (n) => TRIVY_FORBIDDEN.has(n)));
+  out.push(...trivyConfigProblems(e));
   for (const k of [...Object.keys(e.step.cli?.env ?? {}), ...Object.keys(e.fixedInputs.env ?? {})]) {
     if (/^trivy_/i.test(k)) bad(`trivy gets no ${k}: a TRIVY_* variable sets a flag outside the command pipegen checks`, 'step', 'cli', 'env');
   }
-  out.push(...choiceProblems('trivy', e, (k) => g.value.has(k) || g.bool.has(k),
+  out.push(...choiceProblems('trivy', e, (k) => (g.value.has(k) || g.bool.has(k)) && TRIVY_ALLOWED_FLAGS.has(k),
     (k) => (TRIVY_FORBIDDEN.has(k) || (TRIVY_REQUIRED_FLAGS as readonly string[]).includes(`--${k}`) ? `the AI may not choose trivy's --${k}` : null)));
   return out;
 }
@@ -693,11 +758,17 @@ function betterleaksProblems(e: Entry): Problem[] {
   else {
     const g = BETTERLEAKS_GRAMMAR[sub as 'git' | 'dir' | 'stdin'];
     // cmd/rule_flags.go expands -dr and -ir before cobra parses
-    const expanded = command.slice(2).map((a) => a.replace(/^-dr(?==|$)/, '--disable-rule').replace(/^-ir(?==|$)/, '--isolate-rule'));
-    const p = parseArgv(expanded, g, 'pflag');
+    const expand = (xs: readonly string[]) => xs.map((a) => a.replace(/^-dr(?==|$)/, '--disable-rule').replace(/^-ir(?==|$)/, '--isolate-rule'));
+    const p = parseArgv(expand(command.slice(2)), g, 'pflag');
+    const pa = parseArgv(expand(fx.args ?? []), g, 'pflag');
+    // the forbidden flags as betterleaks reads them: `-vfsarif` is --verbose plus -f sarif (re-review A)
+    const parsedHit = [...p.flags, ...pa.flags].find((f) => forbidden.has(`--${f.name}`) || f.name.startsWith('validation'));
+    if (hit === undefined && parsedHit !== undefined) bad(`betterleaks must never use --${parsedHit.name} (given as ${parsedHit.raw}; it sends candidate secrets to provider APIs, prints them, or runs unreviewed features; betterleaks v1.9.0 cmd/root.go:89, 109-127)`, 'step', 'cli', 'command');
     if (hit === undefined && p.errors.length > 0) bad(`betterleaks ${sub}: ${p.errors[0]} (pipegen reads the command with betterleaks v1.9.0's flags and refuses any it doesn't know)`, 'step', 'cli', 'command');
-    if (p.flags.some((f) => f.name === 'config')) bad(pinnedMsg, 'step', 'cli', 'command');
-    out.push(...choiceProblems('betterleaks', e, (k) => g.value.has(k) || g.bool.has(k),
+    if (hit === undefined && pa.errors.length > 0) bad(`betterleaks ${sub} fixedInputs.args: ${pa.errors[0]}`, 'fixedInputs', 'args');
+    if ([...p.flags, ...pa.flags].some((f) => f.name === 'config')) bad(pinnedMsg, 'step', 'cli', 'command');
+    out.push(...allowlistProblems('betterleaks', [p, pa], BETTERLEAKS_ALLOWED_FLAGS, '--', (n) => n === 'config' || forbidden.has(`--${n}`) || n.startsWith('validation')));
+    out.push(...choiceProblems('betterleaks', e, (k) => (g.value.has(k) || g.bool.has(k) || g.optional.has(k)) && BETTERLEAKS_ALLOWED_FLAGS.has(k),
       (k) => (k === 'config' ? pinnedMsg : forbidden.has(`--${k}`) || k.startsWith('validation') ? `betterleaks must never use --${k}` : null)));
   }
   const pinned = fx.config !== undefined && 'flag' in fx.config.passAs && fx.config.passAs.flag === '--config';
@@ -744,6 +815,7 @@ function nucleiProblems(e: Entry): Problem[] {
   }
   for (const why of reasons) bad(why, 'step', 'cli', 'command');
   if (p.errors.length > 0) bad(`nuclei: ${p.errors[0]} (pipegen reads the command with nuclei v3.11.1's flags and refuses any it doesn't know)`, 'step', 'cli', 'command');
+  if (a.errors.length > 0) bad(`nuclei fixedInputs.args: ${a.errors[0]}`, 'fixedInputs', 'args');
   if (lastValue(p, 'disable-update-check') !== 'true' || lastValue(a, 'disable-update-check') !== 'true') {
     bad('nuclei must run with -duc (no update check) in effect, in the command and fixedInputs.args (not another flag\'s value, not after a target, never -duc=false)', 'step', 'cli', 'command');
   }
@@ -761,8 +833,10 @@ function nucleiProblems(e: Entry): Problem[] {
     bad(`nuclei needs fixedInputs.env.${NUCLEI_TEMPLATES_URL_ENV}: an official projectdiscovery/nuclei-templates release tarball (a vX.Y.Z tag)`, 'fixedInputs', 'env');
   }
   if (!SHA256_RE.test(env[NUCLEI_TEMPLATES_SHA256_ENV] ?? '')) bad(`nuclei needs fixedInputs.env.${NUCLEI_TEMPLATES_SHA256_ENV}: the templates archive's sha256`, 'fixedInputs', 'env');
+  // the allowlist last, so a more specific refusal (-duc swallowed, templates) is the one reported first
+  out.push(...allowlistProblems('nuclei', [p, a], NUCLEI_ALLOWED_FLAGS, '-', (n) => NUCLEI_FORBIDDEN[n] !== undefined));
   const long = (k: string) => NUCLEI_GRAMMAR.shorts[k] ?? k;
-  out.push(...choiceProblems('nuclei', e, (k) => NUCLEI_GRAMMAR.value.has(long(k)) || NUCLEI_GRAMMAR.bool.has(long(k)),
+  out.push(...choiceProblems('nuclei', e, (k) => (NUCLEI_GRAMMAR.value.has(long(k)) || NUCLEI_GRAMMAR.bool.has(long(k))) && NUCLEI_ALLOWED_FLAGS.has(long(k)),
     (k) => NUCLEI_FORBIDDEN[long(k)] ?? (['templates', 'disable-update-check'].includes(long(k)) ? `the AI may not choose nuclei's -${k}` : null)));
   return out;
 }

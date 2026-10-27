@@ -3,13 +3,14 @@
 // flag), `--` ends the flags, `--flag=false` turns a bool off, and a flag the grammar doesn't know is an error (fail
 // closed). Two dialects:
 // - pflag (cobra: Trivy, betterleaks): `--long[=v]`, `-s v`, `-sv`, `-s=v`, combined bool shorthands (`-dq`); words
-//   that aren't flags may sit between flags.
+//   that aren't flags may sit between flags. An optional-value flag (NoOptDefVal) takes a value only as `--flag=v`;
+//   alone it never swallows the next word.
 // - goflags (Go's flag package: Nuclei): `-name[=v]` or `--name[=v]`, short names are just other names; parsing stops
 //   at the first word that isn't a flag.
 import type { FlagGrammar } from './tool-grammar.js';
 
 export interface ParsedArgv {
-  /** Every flag in order, by long name; `value` is the bool as 'true'/'false' or the flag's value. */
+  /** Every flag in order, by long name; `value` is the bool as 'true'/'false', the flag's value, or '' for an optional-value flag given alone. */
   flags: { name: string; value: string; raw: string }[];
   positionals: string[];
   /** Why the argv can't be read (unknown flag, a value missing, a bad bool); empty when it reads cleanly. */
@@ -27,7 +28,8 @@ function boolValue(v: string): string | null {
 export function parseArgv(argv: readonly string[], g: FlagGrammar, dialect: 'pflag' | 'goflags'): ParsedArgv {
   const out: ParsedArgv = { flags: [], positionals: [], errors: [] };
   const take = (name: string, raw: string, inline: string | undefined, i: number): number => {
-    if (g.value.has(name)) {
+    if (g.optional.has(name)) out.flags.push({ name, value: inline ?? '', raw });
+    else if (g.value.has(name)) {
       if (inline !== undefined) out.flags.push({ name, value: inline, raw });
       else if (i + 1 < argv.length) {
         out.flags.push({ name, value: argv[i + 1] as string, raw });
@@ -60,7 +62,7 @@ export function parseArgv(argv: readonly string[], g: FlagGrammar, dialect: 'pfl
       const key = eq < 0 ? body : body.slice(0, eq);
       const inline = eq < 0 ? undefined : body.slice(eq + 1);
       const name = dialect === 'goflags' ? (g.shorts[key] ?? key) : key;
-      if (key === '' || key.startsWith('-') || !(g.value.has(name) || g.bool.has(name)) || (dialect === 'pflag' && key.length === 1)) {
+      if (key === '' || key.startsWith('-') || !(g.value.has(name) || g.bool.has(name) || g.optional.has(name)) || (dialect === 'pflag' && key.length === 1)) {
         out.errors.push(`unknown flag ${a}`);
         continue;
       }
@@ -75,7 +77,7 @@ export function parseArgv(argv: readonly string[], g: FlagGrammar, dialect: 'pfl
         break;
       }
       const rest = a.slice(j + 1);
-      if (g.value.has(name)) {
+      if (g.value.has(name) || g.optional.has(name)) {
         i = take(name, a, rest === '' ? undefined : rest.replace(/^=/, ''), i);
         break;
       }
