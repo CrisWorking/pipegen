@@ -1,0 +1,6 @@
+{
+  "standardwebhooks@1.1.1": {
+    "reason": "The npm package ships no licence file. package.json declares MIT. The upstream repository's LICENSE file is Apache-2.0 (https://github.com/standard-webhooks/standard-webhooks), so the two disagree; the owner should confirm which applies. Keyed to this exact version: a version bump fails the notices build until it is reviewed again.",
+    "text": "No licence file is shipped in the standardwebhooks@1.1.1 npm package.\nIts package.json declares the licence MIT, author \"Standard Webhooks\".\nUpstream source: https://github.com/standard-webhooks/standard-webhooks (its repository LICENSE file is Apache-2.0)."
+  }
+}

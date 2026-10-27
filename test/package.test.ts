@@ -47,8 +47,27 @@ describe('package', () => {
   });
 
   it('prepack builds the release dist (M4): npm pack never ships a stale dist', () => {
-    expect(pkg.scripts.prepack).toBe('npm run build');
+    expect(pkg.scripts.prepack).toBe('npm run build && npm run notices'); // the notices are rebuilt from the fresh bundle (B4)
     expect(pkg.scripts.build).toBe('tsup');
+    expect(pkg.scripts.notices).toBe('node scripts/notices.ts');
+  });
+
+  it('files = dist, data, THIRD_PARTY_NOTICES (S16), and the packed list holds a non-empty THIRD_PARTY_NOTICES but no metafile', () => {
+    expect(pkg.files).toEqual(['dist', 'data', 'THIRD_PARTY_NOTICES']);
+    const packed = JSON.parse(execFileSync('npm', ['pack', '--dry-run', '--json', '--ignore-scripts'], { cwd: root, stdio: 'pipe' }).toString('utf8')) as { files: { path: string; size: number }[] }[];
+    const files = packed[0]?.files ?? [];
+    const notices = files.find((f) => f.path === 'THIRD_PARTY_NOTICES');
+    expect(notices, 'THIRD_PARTY_NOTICES is in the packed file list').toBeDefined();
+    expect(notices?.size).toBeGreaterThan(0);
+    expect(files.filter((f) => f.path.includes('meta.json') || f.path.startsWith('.build'))).toEqual([]);
+    expect(readFileSync(resolve(root, '.gitignore'), 'utf8').split('\n').map((l) => l.trim())).toContain('.build/');
+  });
+
+  it('the release build writes the esbuild metafile to .build/meta.json, not into dist; the dev build does not', async () => {
+    const cfg = (await import('../tsup.config.js')) as { default: { esbuildPlugins?: unknown[] }; METAFILE_PATH: string };
+    expect(cfg.METAFILE_PATH).toBe('.build/meta.json');
+    expect(cfg.default.esbuildPlugins).toHaveLength(1);
+    expect('esbuildPlugins' in tsupOptions).toBe(false); // the shared options (dev build, probe) carry no metafile writer
   });
 
   it('license Apache-2.0, bin dist/cli/main.js, repository url set, no dependencies field', () => {
@@ -70,12 +89,12 @@ describe('dev build (ruling B3: internal runs before the reviewed list is review
     expect(tsupOptions.define).toEqual({ 'process.env.PIPEGEN_RELEASE': '"1"' }); // the release build still refuses PENDING entries
     const ignored = readFileSync(resolve(root, '.gitignore'), 'utf8').split('\n').map((l) => l.trim());
     expect(ignored).toContain('.dev-dist/');
-    expect(pkg.files).toEqual(['dist', 'data']);
+    expect(pkg.files).toEqual(['dist', 'data', 'THIRD_PARTY_NOTICES']);
     const packed = JSON.parse(execFileSync('npm', ['pack', '--dry-run', '--json', '--ignore-scripts'], { cwd: root, stdio: 'pipe' }).toString('utf8')) as { files: { path: string }[] }[];
     const paths = packed[0]?.files.map((f) => f.path) ?? [];
     expect(paths.length).toBeGreaterThan(0);
     expect(paths.filter((f) => f.startsWith('.dev-dist'))).toEqual([]);
-    expect(paths.filter((f) => !f.startsWith('dist/') && !f.startsWith('data/'))).toEqual(expect.arrayContaining(['package.json']));
+    expect(paths.filter((f) => !f.startsWith('dist/') && !f.startsWith('data/'))).toEqual(expect.arrayContaining(['package.json', 'THIRD_PARTY_NOTICES']));
   });
 });
 

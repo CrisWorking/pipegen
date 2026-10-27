@@ -16,11 +16,13 @@
   },
   "files": [
     "dist",
-    "data"
+    "data",
+    "THIRD_PARTY_NOTICES"
   ],
   "scripts": {
     "build": "tsup",
-    "prepack": "npm run build",
+    "notices": "node scripts/notices.ts",
+    "prepack": "npm run build && npm run notices",
     "test": "vitest run",
     "typecheck": "tsc --noEmit"
   },
