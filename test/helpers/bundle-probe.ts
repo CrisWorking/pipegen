@@ -2,11 +2,12 @@
 // the bundled readers (and the CommonJS libraries they pull in) really work as a single ESM file.
 import { makeProvider } from '../../src/ai/provider.js';
 import { bundleCode } from '../../src/ai/redact.js';
-import { floorNeeds, jobCounts, needsSchema } from '../../src/engine/needs.js';
+import { floorNeeds, jobCategories, jobCounts, needsSchema } from '../../src/engine/needs.js';
 import { loadPinnedBinaries } from '../../src/engine/linters.js';
 import { loadBundledMemory } from '../../src/engine/memory.js';
 import { checkQualityBar, loadQualityBar } from '../../src/engine/quality-bar.js';
 import { loadReviewed } from '../../src/engine/reviewed.js';
+import { estimate, loadAiPrices, loadGitHubPlans } from '../../src/estimate/estimate.js';
 import { readProject } from '../../src/read/project.js';
 import type { Capabilities, RepoProfile } from '../../src/types.js';
 
@@ -54,4 +55,10 @@ console.log(JSON.stringify({
   // data/memory.json, read and validated by the bundled loader
   bundledMemory: await loadBundledMemory(),
   reviewed,
+  // data/ai-prices.yml and data/github-plans.yml, read and validated by the bundled loaders, and used by estimate()
+  aiPrices: loadAiPrices(),
+  githubPlans: loadGitHubPlans(),
+  estimate: (({ setupMinutes, includedMinutes, aiCostCapUsd }) => ({ setupMinutes, includedMinutes, aiCostCapUsd }))(
+    estimate(full, jobCategories(floorNeeds(full, caps)), 2, { pushes: 10, prs: 2, capped: false }, { name: 'claude', model: 'claude-opus-5-5' }),
+  ),
 }));

@@ -336,3 +336,22 @@ export function jobCounts(needs: Need[]): Record<Layer | 'nightly', number> {
   }
   return counts;
 }
+
+/**
+ * The same CI jobs as jobCounts (same rules: one job per (layer, id, service), pre-commit none, one gate job, nightly =
+ * the nightly job + merge-layer scanners), listed by need category, so Plan A's estimate() can price each job by its
+ * category (S5, DECISIONS #81). `jobCategories(n)[layer].length === jobCounts(n)[layer]` for every layer.
+ */
+export function jobCategories(needs: Need[]): Record<Layer | 'nightly', string[]> {
+  const out: Record<Layer | 'nightly', string[]> = { 'pre-commit': [], push: [], merge: [], deploy: [], nightly: ['nightly'] };
+  const seen = new Set<string>();
+  for (const n of needs) {
+    if (n.layer === 'pre-commit') continue;
+    const k = n.id === 'gate' ? needKey({ layer: n.layer, id: 'gate' }) : needKey(n);
+    if (seen.has(k)) continue;
+    seen.add(k);
+    out[n.layer].push(n.category);
+    if (n.layer === 'merge' && SCANNERS.has(n.category)) out.nightly.push(n.category);
+  }
+  return out;
+}
