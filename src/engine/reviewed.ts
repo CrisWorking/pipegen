@@ -18,7 +18,10 @@ import { z } from 'zod';
 import { packageDataPath } from '../util/package-data.js';
 import { safeText } from '../util/safe-text.js';
 import { NEED_CATEGORIES, PROTECTED_PATHS_BASE, type Language, type Need, type ReviewedTool, type Service } from '../types.js';
-import { advisoryVersion, COMMIT_SHA_RE, isFullSemver, isGitHubRepo, isNpmName, isPypiName, npmEscapedName, pep503 } from './names.js';
+import {
+  advisoryVersion, ASSET_RE, COMMIT_SHA_RE, DIGEST_RE, IMAGE_TAG_RE, isFullSemver, isGitHubRepo, isNpmName, isPypiName, npmEscapedName, parseImageRef, pep503,
+  SHA256_RE, SRI_SHA512_RE, TAG_RE,
+} from './names.js';
 import { NEED_ID_CATEGORY } from './needs.js';
 import { COOLDOWN_DAYS } from './pin.js';
 
@@ -50,12 +53,6 @@ export class PackageCheckError extends Error {
 export const ID_RE = /^[a-z0-9][a-z0-9-]{0,63}$/;
 const INPUT_RE = /^[A-Za-z_][A-Za-z0-9_-]{0,63}$/;
 const ENV_RE = /^[A-Za-z_][A-Za-z0-9_]{0,127}$/;
-const TAG_RE = /^[A-Za-z0-9][A-Za-z0-9._+-]{0,127}$/;
-const ASSET_RE = /^[A-Za-z0-9][A-Za-z0-9._+-]{0,254}$/;
-const SHA256_RE = /^[0-9a-f]{64}$/;
-const SRI_SHA512_RE = /^sha512-[A-Za-z0-9+/]{86}==$/;
-const DIGEST_RE = /^sha256:[0-9a-f]{64}$/;
-const IMAGE_RE = /^(?:(?:docker\.io|ghcr\.io)\/)?[a-z0-9]+(?:(?:[._]|__|-+)[a-z0-9]+)*(?:\/[a-z0-9]+(?:(?:[._]|__|-+)[a-z0-9]+)*){0,2}$/;
 const FLAG_RE = /^-{1,2}[A-Za-z][A-Za-z0-9-]{0,63}$/;
 const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
 /** A reviewer's name: printable letters and digits, spaces, `.`, `'` and `-` only (no zero-width or control characters). */
@@ -213,7 +210,9 @@ function entryProblems(e: Entry): { message: string; path: (string | number)[] }
       if (inst.digest !== undefined && inst.digest !== digest) bad('step.cli.install.digest must equal candidate.pin.digest', 'step', 'cli', 'install', 'digest');
       if (c.kind === 'docker') {
         if (digest === undefined || pinKeys.length !== 1) bad('an image is pinned by its sha256 index digest only', 'candidate', 'pin');
-        if (inst.method !== 'docker' || !IMAGE_RE.test(inst.package)) bad('an image entry installs with method docker and an image name', 'step', 'cli', 'install');
+        // the image grammar pinning uses (names.ts parseImageRef): Docker Hub or GHCR, lower case, no tag
+        if (inst.method !== 'docker' || parseImageRef(inst.package) === null) bad('an image entry installs with method docker and an image name pipegen can pin (Docker Hub or GHCR, lower case, no tag)', 'step', 'cli', 'install');
+        if (!IMAGE_TAG_RE.test(inst.version)) bad('an image entry names an image tag pipegen can look up', 'step', 'cli', 'install', 'version');
       } else {
         if (checksum === undefined || pinKeys.length !== 1) bad('a cli tool is pinned by its checksum only', 'candidate', 'pin');
         if (cli.command.length === 0) bad('a cli entry has a command', 'step', 'cli', 'command');

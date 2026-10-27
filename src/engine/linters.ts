@@ -32,7 +32,7 @@ import { safeText } from '../util/safe-text.js';
 import { prepareTrustedDir, type TrustedDirKind } from '../util/trusted-dir.js';
 import { TarError, readTarMember } from '../util/tar.js';
 import { downloadRelease } from './pin.js';
-import { isGitHubRepo } from './names.js';
+import { ASSET_RE, isGitHubRepo, SHA256_RE } from './names.js';
 
 export type PinnedName = 'actionlint' | 'cosign' | 'gitleaks';
 export const PINNED_NAMES: readonly PinnedName[] = ['actionlint', 'cosign', 'gitleaks'];
@@ -44,8 +44,6 @@ const MAX_ARCHIVE_BYTES = 512 * 1024 * 1024;
 const MAX_BINARY_BYTES = 512 * 1024 * 1024;
 /** How much more than the binary itself a tar may unpack to (licence, readme, docs). Bounds a gzip bomb. */
 export const TAR_SLACK_BYTES = 16 * 1024 * 1024;
-const HEX64 = /^[0-9a-f]{64}$/;
-const ASSET_RE = /^[A-Za-z0-9][A-Za-z0-9._+-]{0,254}$/;
 const ISO_DATE_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?Z$/;
 const READ_CHUNK = 1024 * 1024;
 
@@ -53,9 +51,9 @@ const assetSchema = z.object({
   url: z.string(),
   archive: z.enum(['tar.gz', 'none']),
   archiveSize: z.number().int().positive().max(MAX_ARCHIVE_BYTES),
-  archiveSha256: z.string().regex(HEX64),
+  archiveSha256: z.string().regex(SHA256_RE),
   binarySize: z.number().int().positive().max(MAX_BINARY_BYTES),
-  binarySha256: z.string().regex(HEX64),
+  binarySha256: z.string().regex(SHA256_RE),
 }).strict().refine((a) => a.archive !== 'none' || (a.archiveSha256 === a.binarySha256 && a.archiveSize === a.binarySize), {
   message: 'a raw binary (archive: none) has one hash and one size: archiveSha256 = binarySha256, archiveSize = binarySize',
 });

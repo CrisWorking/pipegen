@@ -4,7 +4,8 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { parse, stringify } from 'yaml';
 import { checkPinnedAgainstReviewed, loadPinnedBinaries } from '../src/engine/linters.js';
 import { NEED_ID_CATEGORY } from '../src/engine/needs.js';
-import { COOLDOWN_DAYS, PLATFORM_ACTION_IDS } from '../src/engine/pin.js';
+import { newRateBudget } from '../src/engine/github-rate.js';
+import { COOLDOWN_DAYS, PinError, PLATFORM_ACTION_IDS, resolvePin } from '../src/engine/pin.js';
 import {
   effectiveProtectedPaths, loadReviewed, nearDuplicate, packageExists, projectScriptFor, ReviewedListError, reviewedFor, TOOL_CATEGORIES,
 } from '../src/engine/reviewed.js';
@@ -227,6 +228,37 @@ describe('loadReviewed', () => {
     const real = byId(loadReviewed(), 'semgrep')[0];
     expect(real?.step.cli?.command.join(' ')).toContain(`--config ${RULES_DIR}`);
     expect(real?.fixedInputs.env?.[RULES_TREE_ENV]).toBe('dd3179667faf14717e05c33b1916b0d2c349673d');
+  });
+
+  it('reviewed: an image name is checked with the same grammar pinning uses (one image grammar, final review M2)', async () => {
+    const withImage = (pkg: string) => {
+      const e = semgrepEntry();
+      e.step.cli.install.package = pkg;
+      return e;
+    };
+    // what resolvePin says about the name: refused before any request, or accepted (then it asks the registry)
+    const pinAccepts = async (pkg: string) => {
+      const deps = { gh: {} as never, fetch: fakeFetch({}).fetch, alert: () => {}, notes: [], budget: newRateBudget() };
+      const c = { id: 'x', name: 'x', kind: 'docker' as const, repo: 'o/r', version: '1.0', pin: {}, source: 'discovery' as const, reviewed: false, categories: [] };
+      const err = await resolvePin(c, deps, { method: 'docker', package: pkg, version: '1.0' }).catch((e: unknown) => e);
+      return !(err instanceof PinError && /isn't an image name/.test(err.message));
+    };
+    const cases: [string, boolean][] = [
+      ['semgrep/semgrep', true], ['docker.io/semgrep/semgrep', true], ['index.docker.io/semgrep/semgrep', true],
+      ['registry-1.docker.io/semgrep/semgrep', true], ['registry', true], ['ghcr.io/zaproxy/zaproxy', true], ['ghcr.io/a/b/c', true],
+      ['quay.io/x/y', false], ['localhost/x', false], ['docker.io/a/b/c', false], ['index.docker.io/a/b/c', false],
+      ['example.com:5000/x/y', false], ['Semgrep/semgrep', false], ['semgrep/semgrep:1.0', false],
+    ];
+    for (const [pkg, ok] of cases) {
+      expect(await pinAccepts(pkg), `pin: ${pkg}`).toBe(ok);
+      if (ok) expect(load([withImage(pkg)]), `reviewed: ${pkg}`).toHaveLength(1);
+      else expect(() => load([withImage(pkg)]), `reviewed: ${pkg}`).toThrow(/image name/);
+    }
+    // the image tag follows the same grammar too ('+' is no image tag character)
+    const plus = semgrepEntry();
+    plus.candidate.version = '1.181.0+build';
+    plus.step.cli.install.version = '1.181.0+build';
+    expect(() => load([plus])).toThrow(/image tag/);
   });
 
   it('reviewed: categories limited to need categories plus platform, egress and workflow-lint (S23)', () => {

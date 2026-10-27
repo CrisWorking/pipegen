@@ -36,7 +36,10 @@ import { z } from 'zod';
 import { safeText } from '../util/safe-text.js';
 import type { Candidate, InstallSpec, ReviewedTool } from '../types.js';
 import { BUDGET_SPENT_MESSAGE, GitHubRateLimitError, withRateLimit, type RateClock } from './github-rate.js';
-import { advisoryVersion, COMMIT_SHA_RE, isFullSemver, isGitHubRepo, isNpmName, isPypiName, npmEscapedName, pep503, repoSegments } from './names.js';
+import {
+  advisoryVersion, ASSET_RE, COMMIT_SHA_RE, DIGEST_RE, isFullSemver, isGitHubRepo, isNpmName, isPypiName, npmEscapedName, parseImageRef, pep503,
+  IMAGE_TAG_RE, repoSegments, SHA256_RE, SRI_SHA512_RE, TAG_RE, type ImageRef, type ImageRegistry,
+} from './names.js';
 
 /** A new pin needs a release at least this old (spec §6 cooldown, T27, T40). */
 export const COOLDOWN_DAYS = 7;
@@ -115,18 +118,8 @@ const INDEX_TYPES = ['application/vnd.oci.image.index.v1+json', 'application/vnd
 const REGISTRIES = {
   'docker.io': { api: 'https://registry-1.docker.io/v2/', token: 'https://auth.docker.io/token', service: 'registry.docker.io' },
   'ghcr.io': { api: 'https://ghcr.io/v2/', token: 'https://ghcr.io/token', service: 'ghcr.io' },
-} as const;
-type Registry = keyof typeof REGISTRIES;
-const DOCKER_HUB_ALIASES = new Set(['docker.io', 'index.docker.io', 'registry-1.docker.io']);
+} as const satisfies Record<ImageRegistry, unknown>;
 
-/** A git tag pipegen will look up: no `/`, no leading `-` or `.`, nothing a URL treats specially. */
-const TAG_RE = /^[A-Za-z0-9][A-Za-z0-9._+-]{0,127}$/;
-const ASSET_RE = /^[A-Za-z0-9][A-Za-z0-9._+-]{0,254}$/;
-const SHA256_RE = /^[0-9a-f]{64}$/;
-const DIGEST_RE = /^sha256:[0-9a-f]{64}$/;
-const SRI_SHA512_RE = /^sha512-[A-Za-z0-9+/]{86}==$/;
-const IMAGE_COMPONENT_RE = /^[a-z0-9]+(?:(?:[._]|__|-+)[a-z0-9]+)*$/;
-const IMAGE_TAG_RE = /^[A-Za-z0-9_][A-Za-z0-9._-]{0,127}$/;
 const REGISTRY_TOKEN_RE = /^[A-Za-z0-9._~+/=-]{1,8192}$/;
 const ISO_DATE_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2}(?:\.\d{1,9})?)?(?:Z|[+-]\d{2}:?\d{2})$/;
 /** A linux amd64 release asset (Go and Rust naming). */
@@ -162,7 +155,6 @@ type TagTarget = { kind: 'commit'; sha: string } | { kind: 'missing' } | { kind:
 /** Stands in for the live value in a PinMovedWarning when the tag no longer leads to a commit or an image index. */
 const NOT_A_COMMIT = '<not a commit>';
 const NOT_AN_INDEX = '<not an index>';
-interface Image { registry: Registry; path: string; display: string }
 interface FetchOptions { method: 'GET' | 'HEAD'; timeoutMs: number; hosts: readonly string[]; headers?: Record<string, string> }
 
 /** A pin pipegen keeps as is: only one from the reviewed list (both markers). Everything else is pinned afresh. */
@@ -622,24 +614,11 @@ function isPy3AnyWheel(filename: string): boolean {
   return py.split('.').includes('py3') && abi === 'none' && platform === 'any';
 }
 
-/** `[registry/]path` → a checked image on Docker Hub or GHCR (Docker Hub official images get `library/`). */
-function parseImage(ref: unknown): Image {
-  const bad = () => new PinError(`"${safeText(String(ref), 120)}" isn't an image name pipegen can pin (Docker Hub or GHCR, lower case, no tag).`);
-  if (typeof ref !== 'string' || ref.length > 255) throw bad();
-  const parts = ref.split('/');
-  let registry: Registry = 'docker.io';
-  const first = parts[0] ?? '';
-  if (parts.length > 1 && (first.includes('.') || first.includes(':') || first === 'localhost')) {
-    if (DOCKER_HUB_ALIASES.has(first)) registry = 'docker.io';
-    else if (first === 'ghcr.io') registry = 'ghcr.io';
-    else throw bad();
-    parts.shift();
-  }
-  if (parts.length === 0 || !parts.every((p) => IMAGE_COMPONENT_RE.test(p))) throw bad();
-  if (registry === 'docker.io' && parts.length === 1) parts.unshift('library');
-  if (parts.length < 2 || (registry === 'docker.io' && parts.length !== 2)) throw bad();
-  const path = parts.join('/');
-  return { registry, path, display: `${registry}/${path}` };
+/** `[registry/]path` → a checked image on Docker Hub or GHCR (the one grammar: names.ts parseImageRef). */
+function parseImage(ref: unknown): ImageRef {
+  const image = parseImageRef(ref);
+  if (image === null) throw new PinError(`"${safeText(String(ref), 120)}" isn't an image name pipegen can pin (Docker Hub or GHCR, lower case, no tag).`);
+  return image;
 }
 
 /**

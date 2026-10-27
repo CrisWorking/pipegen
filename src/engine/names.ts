@@ -13,6 +13,49 @@ const SEMVER_RE = /^\d{1,9}(?:\.\d{1,9}){0,2}(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+
 const PEP440_RE = /^(?:\d{1,9}!)?\d{1,9}(?:\.\d{1,9})*(?:(?:a|b|rc)\d{1,9})?(?:\.post\d{1,9})?(?:\.dev\d{1,9})?$/;
 /** A full git commit SHA. */
 export const COMMIT_SHA_RE = /^[0-9a-f]{40}$/;
+/** A git tag pipegen will look up: no `/`, no leading `-` or `.`, nothing a URL treats specially. */
+export const TAG_RE = /^[A-Za-z0-9][A-Za-z0-9._+-]{0,127}$/;
+/** A GitHub release asset name pipegen will download (a plain file name). */
+export const ASSET_RE = /^[A-Za-z0-9][A-Za-z0-9._+-]{0,254}$/;
+/** A sha256 as lower-case hex. */
+export const SHA256_RE = /^[0-9a-f]{64}$/;
+/** A sha256 image digest. */
+export const DIGEST_RE = /^sha256:[0-9a-f]{64}$/;
+/** An npm `dist.integrity` sha512 (SRI form). */
+export const SRI_SHA512_RE = /^sha512-[A-Za-z0-9+/]{86}==$/;
+
+/** An image tag (the registry's tag grammar). */
+export const IMAGE_TAG_RE = /^[A-Za-z0-9_][A-Za-z0-9._-]{0,127}$/;
+
+/** The registries pipegen can pin images from. */
+export type ImageRegistry = 'docker.io' | 'ghcr.io';
+/** A checked image name: its registry, its path there (Docker Hub official images get `library/`), and how it is shown. */
+export interface ImageRef { registry: ImageRegistry; path: string; display: string }
+const IMAGE_COMPONENT_RE = /^[a-z0-9]+(?:(?:[._]|__|-+)[a-z0-9]+)*$/;
+const DOCKER_HUB_ALIASES: ReadonlySet<string> = new Set(['docker.io', 'index.docker.io', 'registry-1.docker.io']);
+
+/**
+ * The one image-name grammar (pinning and the reviewed list both use it): `[registry/]path`, lower case, no tag or
+ * digest. The registry is Docker Hub (docker.io, index.docker.io, registry-1.docker.io, or none) with exactly
+ * `namespace/name` (`name` alone → `library/name`), or GHCR (ghcr.io) with two or more parts. Anything else → null.
+ */
+export function parseImageRef(ref: unknown): ImageRef | null {
+  if (typeof ref !== 'string' || ref.length > 255) return null;
+  const parts = ref.split('/');
+  let registry: ImageRegistry = 'docker.io';
+  const first = parts[0] ?? '';
+  if (parts.length > 1 && (first.includes('.') || first.includes(':') || first === 'localhost')) {
+    if (DOCKER_HUB_ALIASES.has(first)) registry = 'docker.io';
+    else if (first === 'ghcr.io') registry = 'ghcr.io';
+    else return null;
+    parts.shift();
+  }
+  if (parts.length === 0 || !parts.every((p) => IMAGE_COMPONENT_RE.test(p))) return null;
+  if (registry === 'docker.io' && parts.length === 1) parts.unshift('library');
+  if (parts.length < 2 || (registry === 'docker.io' && parts.length !== 2)) return null;
+  const path = parts.join('/');
+  return { registry, path, display: `${registry}/${path}` };
+}
 
 export function isGitHubRepo(s: unknown): s is string {
   if (typeof s !== 'string' || !GITHUB_REPO_RE.test(s)) return false;
