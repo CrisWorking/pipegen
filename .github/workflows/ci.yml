@@ -119,3 +119,42 @@ jobs:
         run: '"$RUNNER_TEMP/zizmor" --format plain .github/workflows/'
         env:
           GH_TOKEN: ${{ github.token }}
+
+  cooldown:
+    # 7-day cooldown for new or changed dependency and tool versions (DECISIONS #92, docs/cooldown.md).
+    # The BASE commit's script judges the PR's files, so a PR can't weaken the check that checks it.
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    concurrency:
+      group: ci-cooldown-${{ github.ref }}
+      cancel-in-progress: true
+    permissions:
+      contents: read
+    steps:
+      - name: "Check out the base commit (trusted, holds the script)"
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          path: base
+          persist-credentials: false
+      - name: "Check out the PR (data only, its files are read and never run)"
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: head
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+      - name: Install the base's dependencies (base lockfile, no install scripts)
+        working-directory: base
+        run: npm ci --ignore-scripts
+      - name: Run the base's cooldown script on the PR's files
+        run: |
+          if [ ! -f base/scripts/cooldown.ts ]; then
+            echo "::notice::base has no scripts/cooldown.ts yet (this PR introduces it); nothing to run"
+            exit 0
+          fi
+          node base/scripts/cooldown.ts --base-dir base --head-dir head
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
