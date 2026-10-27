@@ -1500,10 +1500,60 @@ function fileBlock(f: FileEntry): string {
 }
 const blockBytes = (f: FileEntry) => Buffer.byteLength(fileBlock(f));
 
+/** bundleCode's own result after a gitleaks pass (a copy, a hand-made object or a counting-only bundle is not). */
+const isChecked = (bundle: CodeBundle): boolean =>
+  bundle !== null && typeof bundle === 'object' && bundle.gitleaksChecked === true && CHECKED.has(bundle);
+
 export function bundleText(bundle: CodeBundle): string {
-  if (bundle === null || typeof bundle !== 'object' || bundle.gitleaksChecked !== true || !CHECKED.has(bundle)) {
+  if (!isChecked(bundle)) {
     throw new GitleaksRequiredError('This code bundle has not passed the required gitleaks check, so it cannot be sent to the AI.');
   }
   const files = [...bundle.files].sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
   return OPEN_TAG + files.map(fileBlock).join('') + CLOSE_TAG;
+}
+
+// ---------- bundle summary (the consent screen's file facts) ----------
+
+let makeSummary: (files: number, bytes: number, topFolders: readonly string[]) => BundleSummary;
+
+/**
+ * What a gitleaks-checked code bundle holds, for the consent screen: the number of files, `bytes` (the exact size of
+ * bundleText) and the top-level folders, most files first. Only bundleSummary() makes one: the constructor is private
+ * and a private field makes the type nominal, so an object literal doesn't type-check, and consentText also refuses
+ * anything isSummary() rejects (a cast or a copy). So the screen always counts the bundle that will be sent
+ * (final review batch 2, I1).
+ */
+export class BundleSummary {
+  readonly #fromCheckedBundle = true;
+
+  private constructor(readonly files: number, readonly bytes: number, readonly topFolders: readonly string[]) {
+    Object.freeze(this);
+  }
+
+  /** True only for an object bundleSummary() made. */
+  static isSummary(x: unknown): x is BundleSummary {
+    return typeof x === 'object' && x !== null && #fromCheckedBundle in x;
+  }
+
+  static {
+    makeSummary = (files, bytes, topFolders) => new BundleSummary(files, bytes, Object.freeze([...topFolders]));
+  }
+}
+
+/**
+ * The consent facts of `bundle`. Throws GitleaksRequiredError unless it is bundleCode's own result after a gitleaks
+ * pass (as bundleText does), so the screen never describes code that can't be sent or wasn't checked. Top folders
+ * are the raw first path segments (consentText cleans them for the terminal); files at the top level have none.
+ */
+export function bundleSummary(bundle: CodeBundle): BundleSummary {
+  if (!isChecked(bundle)) {
+    throw new GitleaksRequiredError('This code bundle has not passed the required gitleaks check, so pipegen can\'t ask to send it.');
+  }
+  const counts = new Map<string, number>();
+  for (const f of bundle.files) {
+    const cut = f.path.indexOf('/');
+    if (cut > 0) counts.set(f.path.slice(0, cut), (counts.get(f.path.slice(0, cut)) ?? 0) + 1);
+  }
+  const top = [...counts].sort((a, b) => b[1] - a[1] || (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0)).map(([name]) => name);
+  return makeSummary(bundle.files.length, bundle.bytes, top);
 }

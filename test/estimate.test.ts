@@ -220,11 +220,47 @@ describe('estimate: AI', () => {
   });
 
   it('estimate: ollama → aiCost local, no cap', () => {
-    const e = estimate(profile(), JOBS, 2, ACTIVITY, { name: 'ollama', model: 'llama3.1' });
+    const e = estimate(profile(), JOBS, 2, ACTIVITY, { name: 'ollama', model: 'llama3.1', host: '127.0.0.1:11434' });
     expect(e.aiCostUsd).toBe('local');
     expect(e.aiCostCapUsd).toBeNull();
     expect(e.aiTokens).toHaveLength(4); // the tokens are still shown
-    expect(e.basis.join('\n')).toMatch(/Ollama.*your machine/);
+    expect(e.basis.join('\n')).toMatch(/Ollama runs on your machine/);
+  });
+
+  it('estimate: the Ollama basis says "your machine" only for a local host; otherwise it names the host (final review batch 2, M3)', () => {
+    for (const host of ['127.0.0.1:11434', 'localhost:11434', '0.0.0.0:11434', '[::1]:11434']) {
+      expect(estimate(profile(), JOBS, 2, ACTIVITY, { name: 'ollama', model: 'llama3.1', host }).basis.join('\n'), host).toContain('Ollama runs on your machine');
+      expect(estimateAuditAi({ name: 'ollama', model: 'llama3.1', host }, 3).basis.join('\n'), host).toContain('Ollama runs on your machine');
+    }
+    const remote = [
+      estimate(profile(), JOBS, 2, ACTIVITY, { name: 'ollama', model: 'llama3.1', host: 'gpu.example.net:8443' }).basis.join('\n'),
+      estimateAuditAi({ name: 'ollama', model: 'llama3.1', host: 'gpu.example.net:8443' }, 3).basis.join('\n'),
+    ];
+    for (const text of remote) {
+      expect(text).not.toContain('your machine');
+      expect(text).toContain('gpu.example.net:8443');
+      expect(text).toContain('no AI cost and no cost cap');
+    }
+    // no host (a provider not built by ollamaProvider): never claimed to be this machine
+    for (const text of [estimate(profile(), JOBS, 2, ACTIVITY, { name: 'ollama', model: 'llama3.1' }).basis.join('\n'), estimateAuditAi({ name: 'ollama', model: 'm' }, 3).basis.join('\n')]) {
+      expect(text).not.toContain('your machine');
+      expect(text).toContain("couldn't confirm");
+    }
+    // a hostile host string is cleaned for the terminal
+    const hostile = estimate(profile(), JOBS, 2, ACTIVITY, { name: 'ollama', model: 'm', host: 'evil\u001b[2J\u202e:1' }).basis.join('\n');
+    expect(hostile).not.toMatch(/[\u001b\u202e]/);
+  });
+
+  it('estimate: records the provider and model it was priced for (final review batch 2, I1)', () => {
+    expect(estimate(profile(), JOBS, 2, ACTIVITY, OPUS).pricedFor).toEqual({ provider: 'claude', model: DEFAULT_MODEL });
+    expect(estimate(profile(), JOBS, 2, ACTIVITY, { name: 'claude', model: 'claude-future-9' }).pricedFor).toEqual({ provider: 'claude', model: 'claude-future-9' });
+    expect(estimate(profile(), JOBS, 2, ACTIVITY, null).pricedFor).toBeNull();
+    expect(estimate(profile(), JOBS, 2, ACTIVITY, { name: 'ollama', model: 'm', host: 'h:1' }).pricedFor).toEqual({ provider: 'ollama', model: 'm', host: 'h:1' });
+    expect(estimateAuditAi({ name: 'openai', model: 'gpt-5' }, 2).pricedFor).toEqual({ provider: 'openai', model: 'gpt-5' });
+    expect(estimateAuditAi({ name: 'ollama', model: 'm' }, 2).pricedFor).toEqual({ provider: 'ollama', model: 'm' });
+    // only these fields are copied: a whole provider object (with its key and complete()) is never kept
+    const fakeProvider = { name: 'claude', model: DEFAULT_MODEL, complete: async () => ({}), extra: 'x' };
+    expect(estimateAuditAi(fakeProvider, 1).pricedFor).toEqual({ provider: 'claude', model: DEFAULT_MODEL });
   });
 
   it('estimate: no provider → no AI tokens, no cost, no cap', () => {

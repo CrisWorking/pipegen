@@ -10,20 +10,24 @@
 // Helper repos (DECISIONS #87): with pipegen's GitHub App, pipegen creates the missing ones itself and deletes the
 // scratch repo after the proof; with a token, the user creates them (the exact `gh repo create … --private` commands
 // are shown) and pipegen never creates or deletes a repo.
-// Every repo-derived string (owner, repo and folder names) passes safeText; so does the model name (from a flag).
+// Every repo-derived string (owner, repo and folder names) passes safeText; so do the model name (from a flag) and
+// the estimate's basis lines, shown under the cost lines.
 // The facts the rulings require are required arguments, so a caller can't leave them out: the gitleaks version (S21)
 // and, for 'full', whether pipegen's App creates the repos (#87). Where an Ollama provider sends comes from the
 // provider itself (ollamaHostOf); when it isn't known, the screen never claims the code stays on this computer.
-import { ollamaChatUrl, ollamaHostOf } from '../ai/ollama.js';
+// Two facts are tied to their real sources by construction (final review batch 2, I1): the file facts are a
+// BundleSummary, which only bundleSummary() of a gitleaks-checked bundle makes, and the estimate must say it was
+// priced for the provider and model shown (Estimates.pricedFor), or the screen is refused.
+import { ollamaHostOf } from '../ai/ollama.js';
 import { refusalFallbackNoteFor } from '../ai/provider.js';
-import { EXCLUDED_KEPT, EXCLUDED_PATTERN_GROUPS } from '../ai/redact.js';
-import type { AiCost, AuditAiEstimate, Estimates } from '../estimate/estimate.js';
+import { BundleSummary, EXCLUDED_KEPT, EXCLUDED_PATTERN_GROUPS } from '../ai/redact.js';
+import type { AiCost, AuditAiEstimate, Estimates, PricedFor } from '../estimate/estimate.js';
 import type { AiProvider, RepoProfile } from '../types.js';
+import { hostPlace } from '../util/local-host.js';
 import { safeText } from '../util/safe-text.js';
 import { PromptCancelledError, type Prompter } from './io.js';
 
-/** What the code bundle holds, counted before consent (not the bundle itself). */
-export interface BundleSummary { files: number; bytes: number; topFolders: string[] }
+export { bundleSummary, BundleSummary } from '../ai/redact.js';
 /** A private helper repo pipegen uses (`pipelines`, `pipegen-proof-<repo>`), checked before consent. */
 export interface HelperRepo { name: string; exists: boolean }
 export type PermissionRows = { permission: string; why: string }[];
@@ -51,21 +55,15 @@ const range = (r: { low: number; high: number }) => `${usd(r.low)}–${usd(r.hig
 const plural = (n: number, one: string, many: string) => `${n.toLocaleString('en-US')} ${n === 1 ? one : many}`;
 const size = (bytes: number) => (bytes >= 1024 * 1024 ? `about ${(bytes / (1024 * 1024)).toFixed(1)} MB` : `about ${Math.max(1, Math.round(bytes / 1024))} KB`);
 
-/** Hosts that are this computer: loopback, and the any-address that Ollama's own client treats as local. */
-const LOCAL_HOSTS = /^(?:localhost|127(?:\.\d{1,3}){3}|0\.0\.0\.0|\[::1\]|\[::\])$/i;
-
 /** Where the AI runs. For Ollama: local, a named remote host, or unknown (host null), which is never shown as local. */
 type Place = { kind: 'vendor' } | { kind: 'local' } | { kind: 'remote'; host: string | null };
 
 function placeOf(provider: AiProvider): Place {
   if (provider.name !== 'ollama') return { kind: 'vendor' };
   const host = ollamaHostOf(provider);
-  if (host === null) return { kind: 'remote', host: null };
-  try {
-    return LOCAL_HOSTS.test(ollamaChatUrl(host).hostname) ? { kind: 'local' } : { kind: 'remote', host };
-  } catch {
-    return { kind: 'remote', host: null };
-  }
+  const where = hostPlace(host);
+  if (where === 'local') return { kind: 'local' };
+  return { kind: 'remote', host: where === 'remote' ? host : null };
 }
 
 /** Where the provider runs, in one sentence. */
@@ -150,6 +148,24 @@ function minutesSection(p: RepoProfile, est: Estimates): string[] {
   ];
 }
 
+/** Every assumption behind the estimates (estimate's `basis`), cleaned for the terminal, shown under the cost lines. */
+function basisSection(title: string, basis: readonly string[]): string[] {
+  if (basis.length === 0) return [];
+  return [title, ...basis.map((b) => `${INDENT}- ${safeText(b, 1000)}`)];
+}
+
+const choiceText = (c: PricedFor | null) => (c === null ? 'no AI provider' : `${c.provider} / ${c.model}${c.host === undefined ? '' : ` at ${c.host}`}`);
+
+/** Refuses an estimate priced for another provider, model or (Ollama) host than the one the screen shows. */
+function checkPricedFor(provider: AiProvider, pricedFor: PricedFor | null): void {
+  const host = provider.name === 'ollama' ? ollamaHostOf(provider) ?? undefined : undefined;
+  if (pricedFor === null || pricedFor.provider !== provider.name || pricedFor.model !== provider.model || pricedFor.host !== host) {
+    const shown: PricedFor = { provider: provider.name, model: provider.model, ...(host === undefined ? {} : { host }) };
+    throw new Error(`The estimate was priced for ${safeText(choiceText(pricedFor), 300)}, but the consent screen shows ${safeText(choiceText(shown), 300)}; `
+      + 'estimate it for the provider that will be used (pass the provider itself).');
+  }
+}
+
 function permissionsSection(title: string, perms: PermissionRows): string[] {
   return [title, ...perms.map((r) => `${INDENT}- ${r.permission}: ${r.why}`)];
 }
@@ -158,15 +174,21 @@ function permissionsSection(title: string, perms: PermissionRows): string[] {
 const CREATES_OR_DELETES = /create the private helper repos|delete the scratch repo/i;
 
 /**
- * The consent text. `est`: estimate() for 'full', estimateAuditAi() for 'audit-ai' (both for the chosen provider and
- * model). `perms`: permissionsTable('write', { appCreatesRepos }) for 'full', permissionsTable('read') for 'audit-ai'.
+ * The consent text. `est`: estimate() for 'full', estimateAuditAi() for 'audit-ai', both given `provider` itself, so
+ * `est.pricedFor` matches it. `bundle`: bundleSummary() of the gitleaks-checked bundle that will be sent.
+ * `perms`: permissionsTable('write', { appCreatesRepos }) for 'full', permissionsTable('read') for 'audit-ai'.
  * `repos`: `pipelines` and `pipegen-proof-<repo>` with whether each exists ('full' only; 'audit-ai' shows none).
- * Refused (programming errors): a write permission in 'audit-ai'; in token mode, a permission saying pipegen creates
- * or deletes a repo (a table built for the App).
+ * Refused (programming errors): a bundle summary bundleSummary() didn't make; an estimate priced for another provider,
+ * model or Ollama host (or for none); a write permission in 'audit-ai'; in token mode, a permission saying pipegen
+ * creates or deletes a repo (a table built for the App).
  */
 export function consentText(p: RepoProfile, provider: AiProvider, est: Estimates, bundle: BundleSummary, perms: PermissionRows, repos: HelperRepo[], mode: 'full', facts: FullConsentFacts): string;
 export function consentText(p: RepoProfile, provider: AiProvider, est: AuditAiEstimate, bundle: BundleSummary, perms: PermissionRows, repos: HelperRepo[], mode: 'audit-ai', facts: AuditConsentFacts): string;
 export function consentText(p: RepoProfile, provider: AiProvider, est: Estimates | AuditAiEstimate, bundle: BundleSummary, perms: PermissionRows, repos: HelperRepo[], mode: ConsentMode, facts: AuditConsentFacts | FullConsentFacts): string {
+  if (!BundleSummary.isSummary(bundle)) {
+    throw new Error('The consent screen needs the file facts from bundleSummary() of the gitleaks-checked code bundle.');
+  }
+  checkPricedFor(provider, est.pricedFor);
   const place = placeOf(provider);
   const sections: string[][] = [];
   if (mode === 'audit-ai') {
@@ -179,6 +201,7 @@ export function consentText(p: RepoProfile, provider: AiProvider, est: Estimates
       filesSection(p, bundle, facts.gitleaksVersion),
       providerSection(provider, place),
       costSection('AI cost of this audit (estimate)', a.costUsd, a.capUsd, place),
+      basisSection('How this estimate was made', a.basis),
       permissionsSection('GitHub permissions (read-only)', perms),
     );
   } else {
@@ -194,6 +217,7 @@ export function consentText(p: RepoProfile, provider: AiProvider, est: Estimates
       reposSection(p, repos, app),
       minutesSection(p, e),
       costSection('AI cost (estimate)', e.aiCostUsd, e.aiCostCapUsd, place),
+      basisSection('How these estimates were made', e.basis),
       ['Time', `${INDENT}About ${e.durationMinutes.low}–${e.durationMinutes.high} minutes.`],
       permissionsSection('GitHub permissions pipegen asks for', perms),
     );

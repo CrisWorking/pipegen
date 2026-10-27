@@ -24,6 +24,11 @@ describe('module graph (final review M6)', () => {
     }
   });
 
+  it('module graph: local-host.ts and discovery-limits.ts are leaves (no imports)', async () => {
+    expect(await graph('src/util/local-host.ts')).toEqual(['src/util/local-host.ts']);
+    expect(await graph('src/engine/discovery-limits.ts')).toEqual(['src/engine/discovery-limits.ts']);
+  });
+
   it('module graph: need-ids.ts is a leaf (only the import-free types.ts)', async () => {
     expect(await graph('src/engine/need-ids.ts')).toEqual(['src/engine/need-ids.ts', 'src/types.ts']);
   });
@@ -34,7 +39,7 @@ describe('module graph (final review M6)', () => {
     for (const net of ['src/engine/discover.ts', 'src/engine/http.ts', 'src/engine/stats.ts']) expect(files).not.toContain(net);
     expect(files).toEqual([
       'src/engine/discovery-limits.ts', 'src/engine/github-rate.ts', 'src/estimate/estimate.ts', 'src/types.ts',
-      'src/util/package-data.ts', 'src/util/safe-text.ts',
+      'src/util/local-host.ts', 'src/util/package-data.ts', 'src/util/safe-text.ts',
     ]);
   });
 });

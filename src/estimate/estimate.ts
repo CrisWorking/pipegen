@@ -16,6 +16,7 @@ import { z } from 'zod';
 import { MAX_DISCOVERY_NEEDS } from '../engine/discovery-limits.js';
 import { withRateLimit, type RateClock } from '../engine/github-rate.js';
 import { DEFAULT_MODEL, type Layer, type Plan, type RepoProfile } from '../types.js';
+import { hostPlace } from '../util/local-host.js';
 import { packageDataPath } from '../util/package-data.js';
 import { safeText } from '../util/safe-text.js';
 
@@ -25,7 +26,16 @@ export interface Activity { pushes: number; prs: number; capped: boolean }
 /** The CI jobs of each layer (plus nightly), each named by its need category. Build it with jobCategories() (src/engine/needs.ts). */
 export type JobCategories = Record<Layer | 'nightly', string[]>;
 export interface AiCost { input: { low: number; high: number }; output: { low: number; high: number }; low: number; high: number }
-export interface AiProviderChoice { name: string; model: string }
+/**
+ * The chosen AI provider and model. Pass the provider itself (makeProvider's result): an Ollama provider carries its
+ * `host` (host:port), which says whether Ollama runs on this machine. Without it the basis never claims it does.
+ */
+export interface AiProviderChoice { name: string; model: string; host?: string }
+/**
+ * Which provider and model an estimate was priced for (and, for Ollama, its host). consentText refuses an estimate
+ * whose pricedFor differs from the provider it shows (final review batch 2, I1).
+ */
+export interface PricedFor { provider: string; model: string; host?: string }
 
 export interface Estimates {
   setupMinutes: number; setupMinutesCap: number; monthlyMinutes: number;
@@ -35,9 +45,11 @@ export interface Estimates {
   aiCostUsd: AiCost | 'local';
   aiCostCapUsd: number | null;                                       // 2 × aiCostUsd.high; null for Ollama (local) or no provider
   durationMinutes: { low: number; high: number }; basis: string[];
+  /** The provider and model the AI cost was priced for; null when there is no provider. */
+  pricedFor: PricedFor | null;
 }
 
-export interface AuditAiEstimate { tokens: { input: number; output: number }; costUsd: AiCost | 'local'; capUsd: number | null; basis: string[] }
+export interface AuditAiEstimate { tokens: { input: number; output: number }; costUsd: AiCost | 'local'; capUsd: number | null; basis: string[]; pricedFor: PricedFor }
 
 // ---------- minutes ----------
 
@@ -223,12 +235,29 @@ function cost(tokens: { input: number; output: number }, p: PriceChoice): AiCost
 
 const ZERO_COST: AiCost = { input: { low: 0, high: 0 }, output: { low: 0, high: 0 }, low: 0, high: 0 };
 
+/** Only the fields that identify the choice are kept (never a provider object with its key and complete()). */
+function pricedFor(provider: AiProviderChoice): PricedFor {
+  const host = provider.name === 'ollama' && typeof provider.host === 'string' && provider.host !== '' ? provider.host : undefined;
+  return { provider: provider.name, model: provider.model, ...(host === undefined ? {} : { host }) };
+}
+
+/** The basis line for a local-model provider: "your machine" only when its host is this computer (hostPlace). */
+function noCostLine(provider: AiProviderChoice): string {
+  const where = hostPlace(provider.host);
+  if (where === 'local') return 'Ollama runs on your machine: no AI cost and no cost cap.';
+  if (where === 'remote') {
+    return `Ollama runs on the Ollama server at ${safeText(provider.host ?? '', 120)}, which may be another computer. It has no per-token price: no AI cost and no cost cap.`;
+  }
+  return "pipegen couldn't confirm where the Ollama server runs. Ollama has no per-token price: no AI cost and no cost cap.";
+}
+
 // ---------- estimate ----------
 
 /**
  * The estimates for a full run. `jobs`: the CI jobs per layer by need category (jobCategories(floorNeeds(p, caps))).
  * `variants`: proof variants (at least 1; callers pass 2: `main` and `planted`). `activity`: activity30d's answer.
- * `provider`: the chosen AI provider and model, or null when there is none.
+ * `provider`: the chosen AI provider and model (pass the provider itself, see AiProviderChoice), or null when there is
+ * none. The result's `pricedFor` records it.
  */
 export function estimate(p: RepoProfile, jobs: JobCategories, variants: number, activity: Activity, provider: AiProviderChoice | null): Estimates {
   const basis: string[] = [];
@@ -297,7 +326,7 @@ export function estimate(p: RepoProfile, jobs: JobCategories, variants: number, 
     const pr = priceFor(provider);
     if (pr.local) {
       aiCostUsd = 'local';
-      basis.push('Ollama runs on your machine: no AI cost and no cost cap.');
+      basis.push(noCostLine(provider));
     } else {
       const total = aiTokens.reduce((t, s) => ({ input: t.input + s.input, output: t.output + s.output }), { input: 0, output: 0 });
       aiCostUsd = cost(total, pr);
@@ -310,7 +339,10 @@ export function estimate(p: RepoProfile, jobs: JobCategories, variants: number, 
     }
   }
 
-  return { setupMinutes, setupMinutesCap, monthlyMinutes, includedMinutes: included, aiTokens, aiCostUsd, aiCostCapUsd, durationMinutes: { low, high: 2 * low }, basis };
+  return {
+    setupMinutes, setupMinutesCap, monthlyMinutes, includedMinutes: included, aiTokens, aiCostUsd, aiCostCapUsd, durationMinutes: { low, high: 2 * low }, basis,
+    pricedFor: provider === null ? null : pricedFor(provider),
+  };
 }
 
 function includedMinutesFor(isPrivate: boolean, plan: Plan): number | null {
@@ -321,7 +353,7 @@ function includedMinutesFor(isPrivate: boolean, plan: Plan): number | null {
 /**
  * The AI cost of `audit --ai` alone (Plan U ruling B2): one needs call plus one candidates call for each need that goes
  * to discovery, at most MAX_DISCOVERY_NEEDS. `needCount`: the needs with no reviewed tool. Priced like estimate() for
- * the chosen provider and model; cap = 2 × high; Ollama → 'local', no cap.
+ * the chosen provider and model (recorded in `pricedFor`); cap = 2 × high; Ollama → 'local', no cap.
  */
 export function estimateAuditAi(provider: AiProviderChoice, needCount: number): AuditAiEstimate {
   const calls = Math.min(count(needCount), MAX_DISCOVERY_NEEDS);
@@ -332,9 +364,9 @@ export function estimateAuditAi(provider: AiProviderChoice, needCount: number): 
     `The AI part of the audit is 1 needs call plus up to ${MAX_DISCOVERY_NEEDS} discovery calls, one for each need with no reviewed tool (${calls} here), at about ${thousands(CANDIDATE_CALL.input)} input / ${thousands(CANDIDATE_CALL.output)} output tokens for each discovery call.`,
     `The cost range is ×${LOW} to ×${HIGH} of the token estimate, and the cap is twice the high end.`,
   ];
-  if (pr.local) return { tokens, costUsd: 'local', capUsd: null, basis: [...basis, 'Ollama runs on your machine: no AI cost and no cost cap.'] };
+  if (pr.local) return { tokens, costUsd: 'local', capUsd: null, basis: [...basis, noCostLine(provider)], pricedFor: pricedFor(provider) };
   const c = cost(tokens, pr);
-  return { tokens, costUsd: c, capUsd: CAP_FACTOR * c.high, basis: [...basis, `Priced with the model ${pr.model}.`, ...pr.notes] };
+  return { tokens, costUsd: c, capUsd: CAP_FACTOR * c.high, basis: [...basis, `Priced with the model ${pr.model}.`, ...pr.notes], pricedFor: pricedFor(provider) };
 }
 
 // ---------- activity30d ----------

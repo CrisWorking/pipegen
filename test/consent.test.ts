@@ -2,17 +2,19 @@
 // (the whole run: repos, Actions minutes, AI cost and cap, time, write permissions) and 'audit-ai' (`audit --ai`:
 // files, provider, refusal note, the audit's own AI cost and cap, read-only permissions; no minutes, no repos).
 // Repos are described per DECISIONS #87: pipegen's App creates them; with a token the user does (gh repo create).
-import { describe, expect, it } from 'vitest';
-import { askConsent, consentText, type BundleSummary } from '../src/cli/consent.js';
+import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { askConsent, consentText } from '../src/cli/consent.js';
 import { clackPrompter, PromptCancelledError, type Prompter } from '../src/cli/io.js';
 import { REFUSAL_FALLBACK_NOTE } from '../src/ai/provider.js';
 import { ollamaProvider } from '../src/ai/ollama.js';
-import { EXCLUDED_KEPT, EXCLUDED_PATTERN_GROUPS, EXCLUDED_PATTERNS } from '../src/ai/redact.js';
+import { BundleSummary, bundleCode, bundleSummary, EXCLUDED_KEPT, EXCLUDED_PATTERN_GROUPS, EXCLUDED_PATTERNS, GitleaksRequiredError, type CodeBundle } from '../src/ai/redact.js';
 import { floorNeeds, jobCategories } from '../src/engine/needs.js';
 import { estimate, estimateAuditAi, type Estimates } from '../src/estimate/estimate.js';
 import { permissionsTable } from '../src/github/client.js';
 import { DEFAULT_MODEL, type AiProvider, type Capabilities, type RepoProfile, type Service } from '../src/types.js';
 import { hostileNames } from './fixtures/hostile-names.js';
+import { CLEAN, makeStub } from './helpers/gitleaks-stub.js';
+import { cleanupRepos, makeTempDir, writeIn } from './helpers/make-repo.js';
 
 const svc = (over: Partial<Service> = {}): Service => ({
   name: 'web', path: '.', language: 'node', packageManager: 'npm', hasTests: true, envVars: [], dependsOn: [], scripts: ['test'], frameworks: ['express'], ...over,
@@ -29,9 +31,26 @@ const ollamaAt = (host?: string) => ollamaProvider({ host, model: 'llama3.1' });
 const ollama = ollamaAt();
 const openai = provider('openai', 'gpt-5');
 
+/** The estimate for this provider: the provider itself is passed, so an Ollama estimate knows its host. */
 const fullEst = (p: RepoProfile, ai: AiProvider): Estimates =>
-  estimate(p, jobCategories(floorNeeds(p, CAPS)), 2, { pushes: 40, prs: 6, capped: false }, { name: ai.name, model: ai.model });
-const bundle: BundleSummary = { files: 42, bytes: 123_456, topFolders: ['src', 'test', '.github'] };
+  estimate(p, jobCategories(floorNeeds(p, CAPS)), 2, { pushes: 40, prs: 6, capped: false }, ai);
+
+/** A real code bundle of `files` (each a small text file), checked by the gitleaks stub. */
+async function checkedBundle(files: string[]): Promise<CodeBundle> {
+  const dir = makeTempDir();
+  for (const f of files) writeIn(dir, f, `// ${f.length}\n`);
+  return bundleCode(dir, { gitleaks: makeStub(CLEAN).bin });
+}
+/** The consent facts of that bundle: only bundleSummary() makes a BundleSummary (final review batch 2, I1). */
+const summaryOf = async (files: string[]) => bundleSummary(await checkedBundle(files));
+const FILES = ['src/a.ts', 'src/b.ts', 'src/c.ts', 'test/a.test.ts', 'test/b.test.ts', '.github/workflows/ci.yml', 'README.md'];
+let checked: CodeBundle;
+let bundle: BundleSummary;
+beforeAll(async () => {
+  checked = await checkedBundle(FILES);
+  bundle = bundleSummary(checked);
+});
+afterAll(() => { cleanupRepos(); });
 const usd = (n: number) => `$${n.toFixed(2)}`;
 const n = (x: number) => x.toLocaleString('en-US');
 const repos = (p: RepoProfile, exists: [boolean, boolean]) => [{ name: 'pipelines', exists: exists[0] }, { name: `pipegen-proof-${p.repo}`, exists: exists[1] }];
@@ -46,7 +65,7 @@ const full = (over: { p?: RepoProfile; ai?: AiProvider; exists?: [boolean, boole
 };
 const audit = (ai: AiProvider = claude, extra: { p?: RepoProfile; bundle?: BundleSummary } = {}) => {
   const p = extra.p ?? profile();
-  const est = estimateAuditAi({ name: ai.name, model: ai.model }, 3);
+  const est = estimateAuditAi(ai, 3);
   const text = consentText(p, ai, est, extra.bundle ?? bundle, permissionsTable('read'), [], 'audit-ai', { gitleaksVersion: '8.30.1' });
   return { p, est, text };
 };
@@ -79,8 +98,8 @@ describe('consentText (full)', () => {
     expect(text).toMatch(/Total: \$\d+\.\d\d–\$\d+\.\d\d/);
     expect(text).toContain(`About ${est.durationMinutes.low}–${est.durationMinutes.high} minutes`);
     for (const row of permissionsTable('write', { appCreatesRepos: false })) expect(text).toContain(`${row.permission}: ${row.why}`);
-    // the files that will be read
-    expect(text).toContain('42 files');
+    // the files that will be read: counted from the checked bundle itself
+    expect(text).toContain('7 files');
     expect(text).toContain('Top folders: src, test, .github');
   });
 
@@ -214,14 +233,17 @@ describe('consentText (full)', () => {
     }
   });
 
-  it('consent: repo-derived names pass through safeText', () => {
-    const hostile = [hostileNames.ansiColour, hostileNames.osc8Link, hostileNames.bidiOverride, hostileNames.nulAndCr, hostileNames.newlines];
-    const { text } = audit(claude, { bundle: { files: 3, bytes: 10, topFolders: hostile } });
+  it('consent: repo-derived names pass through safeText', async () => {
+    // real folders with hostile names (one path segment each; bundleCode itself leaves out paths with CR or LF)
+    const hostile = [hostileNames.ansiColour, `\x1b]8;;evil.example\x1b\\click me\x1b]8;;\x1b\\`, hostileNames.bidiOverride];
+    const hostileBundle = await summaryOf(hostile.map((h) => `${h}/f.ts`));
+    expect([...hostileBundle.topFolders].sort()).toEqual([...hostile].sort());
+    const { text } = audit(claude, { bundle: hostileBundle });
     expect(text).not.toMatch(/[\u0000-\u0009\u000b-\u001f\u007f-\u009f\u202a-\u202e\u2066-\u2069]/);
     expect(text).toContain('red-app');
     expect(text).toContain('appfdp.exe');
     // a very long folder name is cut
-    const long = audit(claude, { bundle: { files: 1, bytes: 1, topFolders: [hostileNames.veryLong] } }).text;
+    const long = audit(claude, { bundle: await summaryOf([`${'a'.repeat(250)}/x.ts`]) }).text;
     expect(long).not.toContain('a'.repeat(200));
     // the repo name in the helper repo lines too
     const fullText = consentText(profile({ repo: 'shop' }), claude, fullEst(profile(), claude), bundle, permissionsTable('write', { appCreatesRepos: false }),
@@ -234,7 +256,7 @@ describe('consentText (audit-ai, ruling B2)', () => {
   it('consent: audit-ai mode (B2) → files, provider, refusal note, audit AI cost + cap, read-only permissions; no Actions minutes, no repos', () => {
     const { est, text } = audit();
     if (est.costUsd === 'local' || est.capUsd === null) throw new Error('expected a priced estimate');
-    expect(text).toContain('42 files');
+    expect(text).toContain('7 files');
     expect(text).toContain('Top folders: src, test, .github');
     expect(text).toContain(`Claude (${DEFAULT_MODEL})`);
     expect(text).toContain(REFUSAL_FALLBACK_NOTE);
@@ -249,10 +271,93 @@ describe('consentText (audit-ai, ruling B2)', () => {
 
   it('consent: audit-ai mode ignores repos and refuses write permissions', () => {
     const p = profile();
-    const est = estimateAuditAi({ name: 'claude', model: DEFAULT_MODEL }, 3);
+    const est = estimateAuditAi(claude, 3);
     const text = consentText(p, claude, est, bundle, permissionsTable('read'), repos(p, [false, false]), 'audit-ai', { gitleaksVersion: '8.30.1' });
     expect(text).not.toMatch(/pipelines|pipegen-proof|gh repo create/);
     expect(() => consentText(p, claude, est, bundle, permissionsTable('write', { appCreatesRepos: false }), [], 'audit-ai', { gitleaksVersion: '8.30.1' })).toThrow(/read-only/);
+  });
+});
+
+describe('consent facts tied to their sources (final review batch 2, I1)', () => {
+  it('bundleSummary: counted from a gitleaks-checked bundle; an unchecked bundle is refused', async () => {
+    expect(bundle.files).toBe(checked.files.length);
+    expect(bundle.files).toBe(7);
+    expect(bundle.bytes).toBe(checked.bytes);
+    expect(bundle.topFolders).toEqual(['src', 'test', '.github']); // most files first; README.md is at the top level
+    expect(Object.isFrozen(bundle)).toBe(true);
+    expect(Object.isFrozen(bundle.topFolders)).toBe(true);
+    const dir = makeTempDir();
+    writeIn(dir, 'src/a.ts', 'x\n');
+    const unchecked = await bundleCode(dir); // no gitleaks: for counting only
+    expect(() => bundleSummary(unchecked)).toThrow(GitleaksRequiredError);
+    expect(() => bundleSummary({ ...checked })).toThrow(GitleaksRequiredError); // a copy is not the checked bundle
+  });
+
+  it('consent: only a BundleSummary made by bundleSummary() is accepted', () => {
+    const p = profile();
+    const est = estimateAuditAi(claude, 3);
+    const fake = { files: 1, bytes: 1, topFolders: [] };
+    // @ts-expect-error a plain object is not a BundleSummary (it has no private brand)
+    expect(() => consentText(p, claude, est, fake, permissionsTable('read'), [], 'audit-ai', { gitleaksVersion: '8.30.1' })).toThrow(/bundleSummary/);
+    const cast = fake as unknown as BundleSummary;
+    expect(() => consentText(p, claude, est, cast, permissionsTable('read'), [], 'audit-ai', { gitleaksVersion: '8.30.1' })).toThrow(/bundleSummary/);
+    const copy = Object.assign(Object.create(BundleSummary.prototype) as BundleSummary, { files: 1, bytes: 1, topFolders: [] });
+    expect(() => consentText(p, claude, est, copy, permissionsTable('read'), [], 'audit-ai', { gitleaksVersion: '8.30.1' })).toThrow(/bundleSummary/);
+    // @ts-expect-error the constructor is private: only bundleSummary() makes one
+    expect(() => new BundleSummary(1, 1, [])).toBeDefined();
+  });
+
+  it('consent: refuses an estimate priced for another provider or model', () => {
+    const p = profile();
+    const fable = provider('claude', 'claude-fable-5-1');
+    const opusFull = fullEst(p, claude);
+    expect(() => consentText(p, fable, opusFull, bundle, permissionsTable('write', { appCreatesRepos: false }), repos(p, [true, true]), 'full', { appCreatesRepos: false, gitleaksVersion: '8.30.1' }))
+      .toThrow(/priced for claude \/ claude-opus-5-5.*claude \/ claude-fable-5-1/);
+    expect(() => consentText(p, openai, estimateAuditAi(claude, 3), bundle, permissionsTable('read'), [], 'audit-ai', { gitleaksVersion: '8.30.1' })).toThrow(/priced for/);
+    // an estimate with no provider can't back a consent screen that sends code to one
+    const none = estimate(p, jobCategories(floorNeeds(p, CAPS)), 2, { pushes: 1, prs: 1, capped: false }, null);
+    expect(() => consentText(p, claude, none, bundle, permissionsTable('write', { appCreatesRepos: false }), repos(p, [true, true]), 'full', { appCreatesRepos: false, gitleaksVersion: '8.30.1' })).toThrow(/priced for no AI provider/);
+    // Ollama: the estimate must be for the same host (its basis says where the model runs)
+    const remote = ollamaAt('gpu.example.net:11434');
+    expect(() => consentText(p, remote, estimateAuditAi({ name: 'ollama', model: 'llama3.1' }, 3), bundle, permissionsTable('read'), [], 'audit-ai', { gitleaksVersion: '8.30.1' })).toThrow(/priced for/);
+    expect(() => consentText(p, remote, estimateAuditAi(ollama, 3), bundle, permissionsTable('read'), [], 'audit-ai', { gitleaksVersion: '8.30.1' })).toThrow(/priced for/);
+    expect(consentText(p, remote, estimateAuditAi(remote, 3), bundle, permissionsTable('read'), [], 'audit-ai', { gitleaksVersion: '8.30.1' })).toContain('gpu.example.net:11434');
+  });
+});
+
+describe('consent shows how the estimates were made (final review batch 2, M3)', () => {
+  it('consent: every basis line is shown under the cost lines', () => {
+    for (const { est, text } of [full(), audit()]) {
+      const basis = 'basis' in est ? est.basis : [];
+      expect(basis.length).toBeGreaterThan(0);
+      const lines = text.split('\n');
+      const cost = lines.findIndex((l) => l.startsWith('  Total: '));
+      for (const b of basis) {
+        const at = lines.indexOf(`  - ${b}`);
+        expect(at, b).toBeGreaterThan(cost);
+      }
+    }
+    // the assumptions a user should see at the decision point
+    const capped = consentText(profile(), claude, estimate(profile(), jobCategories(floorNeeds(profile(), CAPS)), 2, { pushes: 300, prs: 2, capped: true }, claude), bundle,
+      permissionsTable('write', { appCreatesRepos: false }), repos(profile(), [true, true]), 'full', { appCreatesRepos: false, gitleaksVersion: '8.30.1' });
+    expect(capped).toContain('at least 300 pushes');
+    expect(capped).toMatch(/disputes/);
+    const unknownModel = provider('claude', 'claude-future-9');
+    expect(full({ ai: unknownModel }).text).toMatch(/has no price for the model "claude-future-9".*most expensive/);
+  });
+
+  it('consent: basis lines pass through safeText', () => {
+    const hostile = provider('openai', `gpt\x1b[2J\u202e-x`);
+    const text = full({ ai: hostile }).text + audit(hostile).text;
+    expect(text).not.toMatch(/[\u001b\u202e]/);
+    expect(text).toContain('has no price for the model');
+  });
+
+  it('consent: the Ollama basis matches where it runs', () => {
+    expect(full({ ai: ollama }).text).toContain('Ollama runs on your machine');
+    const remote = full({ ai: ollamaAt('gpu.example.net:8443') }).text;
+    expect(remote).not.toContain('Ollama runs on your machine');
+    expect(remote).toMatch(/Ollama server at gpu\.example\.net:8443.*no AI cost and no cost cap/);
   });
 });
 
