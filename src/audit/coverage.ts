@@ -116,9 +116,9 @@ import { safeText } from '../util/safe-text.js';
 import { DEPLOY_VERIFY_WHY, Dirs, Firsts, GATE_WHY, Scope, ciCoverage, hookCoverage, type Decide } from './coverage/decide.js';
 import { hookRunHits, readHooks } from './coverage/hooks.js';
 import { compile, loadToolSignatures } from './coverage/signatures.js';
-import { fitOf, parseOn } from './coverage/triggers.js';
+import { fitOf, parseOn, scheduleFires } from './coverage/triggers.js';
 import type { Compiled, Ctx, Fit, Hit } from './coverage/types.js';
-import { Reader, walkWorkflow } from './coverage/walk.js';
+import { Reader, configFilesPass, releaseEgress, walkWorkflow } from './coverage/walk.js';
 
 export { COVERAGE_LIMITS } from './coverage/bounds.js';
 export { loadToolSignatures, type ToolSignature } from './coverage/signatures.js';
@@ -156,25 +156,34 @@ export async function mapCoverage(p: RepoProfile, needs: Need[], dir: string, op
     p, sigs, read: new Reader(dir), budget: { visits: 0, bytes: 0, truncated: false }, hits: [], localFiles: new Set(),
     unreadable: (opts.skippedWorkflows ?? 0) > 0, pkgRead: new Reader(dir), pkgScripts: new Map(), scriptMemo: new Map(), scriptClass: new Map(), compositeGates: new Map(),
     globMemo: new Map(), globWork: 0, ...(opts.capabilities === undefined ? {} : { caps: opts.capabilities }),
+    // fix round 1 (P8): a workflow readWorkflows skipped may be a release workflow
+    releaseJobs: [], releaseUnread: (opts.skippedWorkflows ?? 0) > 0,
   };
   if (p.existingWorkflows.length > MAX_WORKFLOWS) ctx.budget.truncated = true;
   for (const w of [...p.existingWorkflows].sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0)).slice(0, MAX_WORKFLOWS)) {
+    // fix round 1 (P8, concern 2): a workflow that deploys or publishes is a release workflow
+    const release = w.deploys || (w.publishes?.length ?? 0) > 0;
     // A listed workflow that fails the path check or can't be read again is never skipped silently (review M1).
     if (!regexSafe(w.path) || safeText(w.path) !== w.path || !WORKFLOW_FILE.test(w.path)) {
       ctx.unreadable = true;
+      ctx.releaseUnread ||= release;
       continue;
     }
     const doc = await ctx.read.yaml(w.path);
     if ('fail' in doc) {
       ctx.unreadable = true;
+      ctx.releaseUnread ||= release;
       continue;
     }
-    const events = parseOn(doc.ok.on ?? doc.ok.true);
+    const on = doc.ok.on ?? doc.ok.true;
+    const events = parseOn(on);
     events.delete('workflow_call'); // a reusable workflow runs when it is called; its callers carry it
     if (events.size === 0) continue;
-    await walkWorkflow(ctx, doc.ok, w.path, fitOf(events, p.defaultBranch, w.deploys), 0, '', false);
+    await walkWorkflow(ctx, doc.ok, w.path, fitOf(events, p.defaultBranch, w.deploys, scheduleFires(on)), 0, '', false, release);
   }
+  releaseEgress(ctx);
   await hookRunHits(ctx);
+  await configFilesPass(ctx);
   const hooks = await readHooks(ctx);
   // Each need is answered from tables built once, not by a pass over every run (review C1).
   const dirs = new Dirs();

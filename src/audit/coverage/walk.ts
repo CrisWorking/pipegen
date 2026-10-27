@@ -13,7 +13,7 @@ import { allowedToFail, cut, defaultsDir, firstSet, list, strs, validRef, workin
 import { resolveScripts } from './scripts.js';
 import {
   ALL_GATE, NO_GATE, OLD_PREFIX, actionReason, actionSkipped, condition, foundOf, gateOf, gated, lowerInputs, orGate, refVerdict, requiredInputsHeld,
-  type EnvGate, type Inputs, type RepoId,
+  configWhy, type EnvGate, type Inputs, type RepoId,
 } from './settings.js';
 import { preCommitAllFiles, scanImage, scanShell, shellMode } from './shell.js';
 import { PART_RE, PRE_COMMIT_ID, type ToolSignature } from './signatures.js';
@@ -43,6 +43,21 @@ export class Reader {
     }
     return r;
   }
+
+  /**
+   * Fix round 1 (P8): whether `rel` exists (a file, a folder or a link: the tool would find it there), without reading
+   * it. Worked out once per path; past MAX_CONFIG_CHECKS paths the answer is true (rows lean partial).
+   */
+  exists(rel: string): Promise<boolean> {
+    let r = this.seen.get(rel);
+    if (r === undefined) {
+      const ok = regexSafe(rel) && !rel.startsWith('/') && !rel.split('/').some((x) => x === '..' || x === '');
+      r = !ok || this.seen.size >= MAX_CONFIG_CHECKS ? Promise.resolve(true) : lstat(join(this.dir, rel)).then(() => true, () => false);
+      this.seen.set(rel, r);
+    }
+    return r;
+  }
+  private seen = new Map<string, Promise<boolean>>();
 
   async yaml(rel: string): Promise<Read<Obj>> {
     const r = await this.text(rel);
@@ -94,6 +109,11 @@ interface StepCtx {
   gate: EnvGate;
   /** Plan P Task 3 (PB5): a step of a local composite action other than its first one: other steps ran before it. */
   laterStep?: boolean;
+  /** Fix round 1 (P8, concern 2): the top-level workflow releases (deploys or publishes); egress counts only there. */
+  release: boolean;
+  /** Fix round 1: the job's runner, when `runs-on` is one literal label (lowercased), and whether it runs in a container. */
+  runner: string | null;
+  container: boolean;
 }
 
 function spend(ctx: Ctx): boolean {
@@ -119,7 +139,10 @@ function addFound(ctx: Ctx, found: Found[], c: StepCtx): void {
     ctx.budget.truncated = true;
     return;
   }
-  for (const f of found) {
+  for (const found1 of found) {
+    // fix round 1 (P8, concern 2): egress control in a workflow that doesn't release never counts
+    const f = !c.release && found1.categories.includes('egress') ? { ...found1, categories: found1.categories.filter((x) => x !== 'egress') } : found1;
+    if (f.categories.length === 0) continue;
     let reason: Reason | null = c.continueOnError ? 'continue' : (f.reason ?? (c.inputsUnread ? 'inputs' : null));
     // Plan P Task 3: an `if:` says the run may not happen at all, which matters more than a reason it can't block (a
     // check that doesn't block, such as scorecard or the copy-paste check, only cares whether it runs)
@@ -127,7 +150,8 @@ function addFound(ctx: Ctx, found: Found[], c: StepCtx): void {
     ctx.hits.push({
       opaque: false, categories: f.categories, by: f.by, subject: f.subject, dir: f.dir, reason,
       ...(f.partialWhy === undefined ? {} : { partialWhy: f.partialWhy }), fit: c.fit, where: c.where, ...(f.hookRun === true ? { hookRun: true } : {}),
-      ...(c.laterStep === true ? { laterStep: true } : {}),
+      ...(c.laterStep === true ? { laterStep: true } : {}), ...(f.configFiles === undefined ? {} : { configFiles: f.configFiles }),
+      ...(f.jobEnv === undefined ? {} : { jobEnv: f.jobEnv }),
     });
   }
 }
@@ -166,15 +190,20 @@ const pinnedRef = (uses: string) => {
  * a check that never fails or fails only when told to (actionReason); a version pipegen can't place (actionRef; for a
  * called workflow any ref but a SHA or a tag); inputs that don't set the action up for the check (requireInputs).
  */
-function actionFinds(ctx: Ctx, tools: readonly ToolSignature[], uses: string, w: Inputs, reusable: boolean): Found[] {
+function actionFinds(ctx: Ctx, tools: readonly ToolSignature[], uses: string, w: Inputs, reusable: boolean, c: StepCtx): Found[] {
   return tools.filter((t) => !actionSkipped(t, w)).map((t) => {
     const verdict = refVerdict(t, uses);
     const available = t.availability === undefined || (t.availability === 'public' ? !ctx.p.private : codeSecurityAvailable(ctx.p, ctx.caps));
+    // fix round 1: an action that works only on some GitHub-hosted runners, outside a container
+    const runnerOk = t.runners === undefined || (!c.container && c.runner !== null && t.runners.includes(c.runner));
     const required = requiredInputsHeld(t, w);
     const ref = verdict === 'unknown' || (reusable && !pinnedRef(uses));
-    const reason: Reason | null = !available ? 'unavailable' : actionReason(t, w) ?? (ref ? 'ref' : !required ? 'needs-inputs' : null);
+    const reason: Reason | null = !available ? 'unavailable' : !runnerOk ? 'runner' : actionReason(t, w) ?? (ref ? 'ref' : !required ? 'needs-inputs' : null);
     const f = foundOf(t, '.', reason);
     if (reason === 'unavailable' && t.unavailableWhy !== undefined) f.partialWhy = t.unavailableWhy;
+    if (reason === 'runner') {
+      f.partialWhy = `${f.subject} runs, but ${c.container ? 'in a container job' : c.runner === null ? "on a runner pipegen can't place" : `on ${c.runner}`}, where it doesn't block traffic.`;
+    }
     if (reason === 'needs-inputs' && t.requireInputs !== undefined) f.partialWhy = t.requireInputs.why;
     if (reason === 'ref' && verdict === 'unknown' && t.actionRef !== undefined) f.partialWhy = t.actionRef.unknownWhy;
     if (verdict === 'old' && t.actionRef !== undefined) {
@@ -205,7 +234,7 @@ async function walkStep(ctx: Ctx, step: Obj, c: StepCtx): Promise<void> {
   const withInputs = lowerInputs(asObj(step.with));
   const sc: StepCtx = {
     ...c, continueOnError: c.continueOnError || allowedToFail(step['continue-on-error']), conditional: c.conditional || cond === 'partial',
-    inputsUnread: c.inputsUnread || withInputs.unread, gate: gateOf(typeof step.run === 'string' ? [step.run] : [], [step.env], c.gate),
+    inputsUnread: c.inputsUnread || withInputs.unread, gate: gateOf(typeof step.run === 'string' ? [step.run] : [], [step.env], c.gate, ctx.sigs.softEnv),
   };
   if (typeof step.uses === 'string' && regexSafe(step.uses)) {
     const uses = step.uses.trim();
@@ -215,7 +244,7 @@ async function walkStep(ctx: Ctx, step: Obj, c: StepCtx): Promise<void> {
       addFound(ctx, scanImage(uses, withInputs, ctx.sigs), sc);
     } else {
       const tools = actionMatches(ctx.sigs, uses);
-      addFound(ctx, gated(actionFinds(ctx, tools, uses, withInputs, false), sc.gate), sc);
+      addFound(ctx, gated(actionFinds(ctx, tools, uses, withInputs, false, sc), sc.gate), sc);
       const owner = uses.split('/')[0]?.toLowerCase();
       if (tools.length === 0 && owner !== undefined && owner === ctx.p.owner.toLowerCase()) opaque(ctx, OPAQUE_WHY.ownerAction, validRef(uses), sc);
     }
@@ -286,7 +315,7 @@ function compositeGate(ctx: Ctx, uses: string): Promise<EnvGate> {
         if (list(runs.steps).length > MAX_STEPS) return ALL_GATE;
         const steps = list(runs.steps).map(asObj);
         if (steps.some((st) => typeof st.uses === 'string' && (st.uses.trim() === '.' || st.uses.trim().startsWith('./')))) return ALL_GATE;
-        return gateOf(steps.flatMap((st) => (typeof st.run === 'string' ? [st.run] : [])), steps.map((st) => st.env));
+        return gateOf(steps.flatMap((st) => (typeof st.run === 'string' ? [st.run] : [])), steps.map((st) => st.env), NO_GATE, ctx.sigs.softEnv);
       }
       return NO_GATE;
     })();
@@ -325,16 +354,19 @@ function onWindows(job: Obj): boolean {
   return mentionsWindows(values);
 }
 
-/** Plan P Task 3 (PB5): the hits of one job's first step, [start, first). */
-interface JobRange { start: number; first: number }
+/** Fix round 1: `runs-on` as one literal label (a string, or a list of one), lowercased; null for anything else. */
+function literalRunner(job: Obj): string | null {
+  const ro = job['runs-on'];
+  const labels = typeof ro === 'string' ? [ro] : Array.isArray(ro) ? ro : [];
+  const only = labels.length === 1 ? labels[0] : undefined;
+  return typeof only === 'string' && regexSafe(only) && /^[A-Za-z0-9.-]{1,64}$/.test(only.trim()) ? only.trim().toLowerCase() : null;
+}
 
 /**
- * Walks a workflow's jobs. `jobs` collects each job's hit range for the egress rule; the top-level call (no `jobs`)
- * checks that rule once its jobs, and the jobs of the local workflows they call, are walked.
+ * Walks a workflow's jobs. Fix round 1 (P8, concern 2): in a release workflow (`release`, passed on to the local
+ * workflows it calls) each job's first-step hit range goes to ctx.releaseJobs, for releaseEgress.
  */
-export async function walkWorkflow(ctx: Ctx, doc: Obj, path: string, fit: Fit, depth: number, prefix: string, conditional: boolean, jobs?: JobRange[]): Promise<void> {
-  const own = jobs ?? [];
-  const from = ctx.hits.length;
+export async function walkWorkflow(ctx: Ctx, doc: Obj, path: string, fit: Fit, depth: number, prefix: string, conditional: boolean, release: boolean): Promise<void> {
   const wfDir = defaultsDir(doc);
   const wfShell = defaultsShell(doc);
   const entries = Object.entries(asObj(doc.jobs));
@@ -348,11 +380,13 @@ export async function walkWorkflow(ctx: Ctx, doc: Obj, path: string, fit: Fit, d
     const jobConditional = conditional || cond === 'partial';
     const start = ctx.hits.length;
     if (typeof job.uses === 'string' && regexSafe(job.uses)) {
-      const before = own.length;
-      await callWorkflow(ctx, job.uses.trim(), { fit, where, runDir: '.', shell: undefined, continueOnError: false, conditional: jobConditional, inputsUnread: false, depth, gate: NO_GATE },
-        asObj(job.with), own);
+      const before = ctx.releaseJobs.length;
+      await callWorkflow(ctx, job.uses.trim(), {
+        fit, where, runDir: '.', shell: undefined, continueOnError: false, conditional: jobConditional, inputsUnread: false, depth, gate: NO_GATE, release,
+        runner: null, container: false,
+      }, asObj(job.with));
       // a called workflow pipegen followed added its own jobs; anything else is one job (with no egress step of its own)
-      if (own.length === before) own.push({ start, first: start });
+      if (release && ctx.releaseJobs.length === before) ctx.releaseJobs.push({ start, first: start, where });
       continue;
     }
     const steps = list(job.steps);
@@ -368,41 +402,70 @@ export async function walkWorkflow(ctx: Ctx, doc: Obj, path: string, fit: Fit, d
     const c: StepCtx = {
       fit, where, runDir: firstSet(defaultsDir(job), wfDir), shell: defaultsShell(job) ?? wfShell ?? (onWindows(job) ? 'pwsh' : undefined),
       continueOnError: allowedToFail(job['continue-on-error']), conditional: jobConditional, inputsUnread: false, depth,
-      gate: gateOf(kept.flatMap((st) => (typeof st.run === 'string' ? [st.run] : [])), [doc.env, job.env, ...kept.map((st) => st.env)], compositeGates),
+      gate: gateOf(kept.flatMap((st) => (typeof st.run === 'string' ? [st.run] : [])), [doc.env, job.env, ...kept.map((st) => st.env)], compositeGates, ctx.sigs.softEnv),
+      release, runner: literalRunner(job), container: job.container !== undefined && job.container !== null,
     };
     let first = start;
     for (const [k, step] of kept.entries()) {
       await walkStep(ctx, step, c);
       if (k === 0) first = ctx.hits.length;
     }
-    own.push({ start, first });
+    if (release) ctx.releaseJobs.push({ start, first, where });
   }
-  if (jobs === undefined) egressInEveryJob(ctx, from, own);
+}
+
+/** Fix round 1 (P8): config files looked for per mapCoverage call; past it every run with configFiles leans partial. */
+const MAX_CONFIG_CHECKS = 2_000;
+
+/**
+ * Fix round 1 (P8): a run of a tool that loads a config file by itself (configFiles) is partial ('config') when such a
+ * file sits in the run's folder or at the repo root: pipegen never reads it, and it can turn the check or the failure
+ * off. A run whose folder can't be known leans partial too. One existence check per distinct (folder, file).
+ */
+export async function configFilesPass(ctx: Ctx): Promise<void> {
+  for (let i = 0; i < ctx.hits.length; i++) {
+    const h = ctx.hits[i] as Hit;
+    if (h.configFiles === undefined || (h.reason !== null && MAY_NOT_RUN.has(h.reason))) continue;
+    let found: string | null = null;
+    for (const file of h.configFiles) {
+      const places = h.dir === null ? [] : h.dir === '.' ? [file] : [`${h.dir}/${file}`, file];
+      if (h.dir === null || (await Promise.all(places.map((x) => ctx.read.exists(x)))).some(Boolean)) {
+        found = file;
+        break;
+      }
+    }
+    if (found !== null) ctx.hits[i] = { ...h, reason: 'config', partialWhy: configWhy(h.subject, `a ${found} file`) };
+  }
 }
 
 const isEgress = (h: Hit) => !h.opaque && h.categories.includes('egress');
 /**
- * Plan P Task 3 (ruling PB5): egress control counts only when it is the first step of every job of the workflow that
- * has it (the jobs of the local workflows it calls included; a job calling a remote workflow has none; in a local
- * composite action, only its own first step). Otherwise each
- * of the workflow's egress runs that would count gets the reason 'some-jobs' (partial). Egress signatures count for
- * egress only, so the reason changes nothing else. One pass over the workflow's hits.
+ * Plan P Task 3 (ruling PB5), fix round 1 (P8, concern 2): egress control counts only when it is the first step of
+ * every job of every release workflow (the jobs of the local workflows they call included; a job calling a remote
+ * workflow has none; in a local composite action, only its own first step), and every release workflow was read in
+ * full. Otherwise each egress run that would count gets the reason 'some-jobs' (partial), naming the first release job
+ * without it. Egress hits come from release workflows only (addFound), and egress signatures count for egress only, so
+ * the reason changes nothing else. One pass over the hits and one over the release jobs, after every workflow is walked.
  */
-function egressInEveryJob(ctx: Ctx, from: number, ranges: readonly JobRange[]): void {
+export function releaseEgress(ctx: Ctx): void {
   let any = false;
-  for (let i = from; i < ctx.hits.length && !any; i++) any = isEgress(ctx.hits[i] as Hit);
+  for (let i = 0; i < ctx.hits.length && !any; i++) any = isEgress(ctx.hits[i] as Hit);
   if (!any) return;
-  const guarded = (r: JobRange) => {
+  const guarded = (r: { start: number; first: number }) => {
     for (let i = r.start; i < r.first; i++) {
       const h = ctx.hits[i] as Hit;
       if (isEgress(h) && h.reason === null && h.laterStep !== true) return true;
     }
     return false;
   };
-  if (ranges.every(guarded)) return;
-  for (let i = from; i < ctx.hits.length; i++) {
+  const open = ctx.releaseJobs.find((r) => !guarded(r));
+  if (open === undefined && !ctx.releaseUnread && !ctx.budget.truncated) return;
+  const why = open !== undefined
+    ? `Egress control runs in some release jobs only: ${open.where} doesn't start with it, so its steps can reach any site.`
+    : "Egress control runs in the release jobs pipegen could read, but some release workflows couldn't be read in full, so pipegen can't tell about the rest.";
+  for (let i = 0; i < ctx.hits.length; i++) {
     const h = ctx.hits[i] as Hit;
-    if (isEgress(h) && h.reason === null) ctx.hits[i] = { ...h, reason: 'some-jobs' };
+    if (isEgress(h) && h.reason === null) ctx.hits[i] = { ...h, reason: 'some-jobs', partialWhy: why };
   }
 }
 
@@ -411,14 +474,14 @@ function egressInEveryJob(ctx: Ctx, from: number, ranges: readonly JobRange[]): 
  * reusableWorkflows (Plan P Task 3) counts like that action, with the job's `with:` inputs; any other remote one can't
  * be seen into.
  */
-async function callWorkflow(ctx: Ctx, uses: string, c: StepCtx, withObj: Obj, jobs: JobRange[]): Promise<void> {
+async function callWorkflow(ctx: Ctx, uses: string, c: StepCtx, withObj: Obj): Promise<void> {
   if (!spend(ctx)) return;
   const by = validRef(uses);
   if (!uses.startsWith('./')) {
     const tools = reusableMatches(ctx.sigs, uses);
     if (tools.length === 0) return opaque(ctx, OPAQUE_WHY.remoteWorkflow, by, c);
     const w = lowerInputs(withObj);
-    return addFound(ctx, actionFinds(ctx, tools, uses, w, true), { ...c, inputsUnread: c.inputsUnread || w.unread });
+    return addFound(ctx, actionFinds(ctx, tools, uses, w, true, c), { ...c, inputsUnread: c.inputsUnread || w.unread });
   }
   if (c.depth > 0) return opaque(ctx, OPAQUE_WHY.secondLevel, by, c);
   const rel = localPath(uses);
@@ -427,5 +490,5 @@ async function callWorkflow(ctx: Ctx, uses: string, c: StepCtx, withObj: Obj, jo
   const doc = await readLocal(ctx, rel);
   if ('fail' in doc) return opaque(ctx, doc.fail === 'outside' ? OPAQUE_WHY.outside : OPAQUE_WHY.unreadable, by, c);
   // The called workflow runs on the caller's event (and only when the calling job's `if:` holds).
-  await walkWorkflow(ctx, doc.ok, rel, c.fit, 1, `${c.where} → `, c.conditional, jobs);
+  await walkWorkflow(ctx, doc.ok, rel, c.fit, 1, `${c.where} → `, c.conditional, c.release);
 }

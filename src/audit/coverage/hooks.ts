@@ -5,7 +5,7 @@ import { MAX_FLAG_WORDS, MAX_HITS, MAX_HOOKS } from './bounds.js';
 import { HOOK_FILE } from './decide.js';
 import { cut, firstSet, list, strs, workingDir } from './helpers.js';
 import { resolveScripts } from './scripts.js';
-import { commandReason, flagGiven, flagsAllow, foundOf, gateOf, gated } from './settings.js';
+import { MAY_NOT_RUN, commandReason, configWhy, flagGiven, flagsAllow, foundOf, gateOf, gated, softEnvSet } from './settings.js';
 import { DEFAULT_SHELL, scanShell, type ShellMode } from './shell.js';
 import { hookRepo, hookRepoKey } from './signatures.js';
 import { tokenize, type Tk } from './tokenize.js';
@@ -129,7 +129,7 @@ export async function readHooks(ctx: Ctx): Promise<Hooks> {
   const none: Hooks = { manager, where: '', readable: true, found: [] };
   if (manager === null) return none;
   const scan = async (text: string, base: string | null, mode: ShellMode) =>
-    gated(await resolveScripts(ctx, scanShell(text, base, ctx.sigs, ctx.budget, mode)), gateOf([text], []));
+    gated(await resolveScripts(ctx, scanShell(text, base, ctx.sigs, ctx.budget, mode)), gateOf([text], [], undefined, ctx.sigs.softEnv));
   if (manager === 'husky') {
     const where = '.husky/pre-commit';
     const r = await ctx.read.text(where);
@@ -195,9 +195,15 @@ export async function hookRunHits(ctx: Ctx): Promise<void> {
         ctx.budget.truncated = true;
         return;
       }
+      const subject = `${t.subject} in the pre-commit hooks`;
+      // fix round 1 (P8): a softEnv name set in the CI job reaches the hook's tool; its config files are looked for later
+      const set = softEnvSet(t.softEnv, rep.jobEnv);
+      const reason = rep.reason ?? t.reason;
+      const configured = set !== null && (reason === null || !MAY_NOT_RUN.has(reason));
       ctx.hits.push({
-        opaque: false, categories, by: t.by, subject: `${t.subject} in the pre-commit hooks`, dir: '.', reason: rep.reason ?? t.reason,
-        fit: rep.fit, where: cut(`${rep.where} → ${HOOK_FILE['pre-commit']}`),
+        opaque: false, categories, by: t.by, subject, dir: '.', reason: configured ? 'config' : reason,
+        ...(configured ? { partialWhy: configWhy(subject, set) } : {}), fit: rep.fit, where: cut(`${rep.where} → ${HOOK_FILE['pre-commit']}`),
+        ...(t.configFiles === undefined ? {} : { configFiles: t.configFiles }),
       });
     }
   }

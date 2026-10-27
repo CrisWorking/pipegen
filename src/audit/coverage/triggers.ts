@@ -127,7 +127,33 @@ const FEATURE_BRANCHES = ['pipegen-feature', 'feature/pipegen-feature'];
 /** A `paths` or `paths-ignore` filter: the event doesn't run on every change, so it isn't the right trigger (review I2). */
 const pathFiltered = (cfg: Obj) => isSet(cfg, 'paths') || isSet(cfg, 'paths-ignore');
 
-export function fitOf(events: Map<string, Obj>, defaultBranch: string, deploys: boolean): Fit {
+const MONTH_DAYS = [31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+const MONTHS = ['jan', 'feb', 'mar', 'apr', 'may', 'jun', 'jul', 'aug', 'sep', 'oct', 'nov', 'dec'];
+/**
+ * Fix round 1 (review SC2): whether some `schedule:` cron of `on` can fire. A cron whose day of the month is a list of
+ * plain numbers that no listed month has (`0 0 31 2 *`, day-of-week `*`) never fires; anything pipegen doesn't read
+ * this way is taken to fire. Bounded: at most MAX_FILTER_PATTERNS crons, fields of up to 64 characters.
+ */
+export function scheduleFires(on: unknown): boolean {
+  const crons = asObj(on).schedule;
+  if (!Array.isArray(crons)) return true;
+  if (crons.length === 0) return false;
+  return crons.slice(0, MAX_FILTER_PATTERNS).some((e) => {
+    const cron = asObj(e).cron;
+    if (typeof cron !== 'string' || cron.length > 256) return true;
+    const f = cron.trim().split(/\s+/);
+    if (f.length !== 5 || f[4] !== '*') return true;
+    const days = (f[2] as string).split(',');
+    const months = (f[3] as string).split(',');
+    if (![...days, ...months].every((x) => x.length <= 64)) return true;
+    if (!days.every((d) => /^[0-9]{1,2}$/.test(d))) return true;
+    const monthNums = months.map((m) => (/^[0-9]{1,2}$/.test(m) ? Number(m) : MONTHS.indexOf(m.toLowerCase()) + 1));
+    if (!monthNums.every((m) => m >= 1 && m <= 12)) return true;
+    return days.some((d) => monthNums.some((m) => Number(d) >= 1 && Number(d) <= (MONTH_DAYS[m - 1] as number)));
+  });
+}
+
+export function fitOf(events: Map<string, Obj>, defaultBranch: string, deploys: boolean, scheduleLive = true): Fit {
   let everyPush = false;
   let pushDefault = false;
   let pushTags = false;
@@ -144,5 +170,5 @@ export function fitOf(events: Map<string, Obj>, defaultBranch: string, deploys: 
   const types = pr ? strs(pr.types) : [];
   const merge = pr !== undefined && !pathFiltered(pr) && branchFilter(pr)(defaultBranch) && (types.length === 0 || types.includes('synchronize'));
   // Plan P Task 3: a scheduled check runs on `schedule`, or on every push to the default branch (no paths filter)
-  return { push: everyPush, merge, deploy: deploys || pushDefault || pushTags || events.has('release'), scheduled: events.has('schedule') || pushDefault };
+  return { push: everyPush, merge, deploy: deploys || pushDefault || pushTags || events.has('release'), scheduled: (events.has('schedule') && scheduleLive) || pushDefault };
 }

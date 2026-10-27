@@ -5,7 +5,7 @@ import type { Layer, Need, Service } from '../../types.js';
 import type { Coverage } from '../coverage.js';
 import { MAX_HIT_DIRS, MAX_SERVICES } from './bounds.js';
 import type { Hooks } from './hooks.js';
-import { OLD_PREFIX, UNKNOWN_PREFIX } from './settings.js';
+import { MAY_NOT_RUN, OLD_PREFIX, UNKNOWN_PREFIX } from './settings.js';
 import type { CiLayer, Hit, Reason, Slot } from './types.js';
 
 // ---------- why (pipegen's own text only) ----------
@@ -57,15 +57,7 @@ const LAYER_DONE: Readonly<Record<Slot, string>> = {
   deploy: 'when the code is deployed or released',
   scheduled: 'on a schedule or on every push to the default branch',
 };
-/**
- * Reasons that say the tool may not run at all (not just "can't block"): they make even a need that doesn't block
- * (format-lint) partial. Task 5 fix round 1 adds the pre-commit ones (hook-repo, files, stage) and SKIP; the Plan U
- * final review (I2) adds a TOX… or NOX… variable that picks what tox or nox runs.
- */
-export const MAY_NOT_RUN: ReadonlySet<Reason> = new Set<Reason>(['condition', 'hook-repo', 'files', 'stage', 'skip', 'ref', 'tox-env', 'nox-env',
-  // Plan P Task 3: it may not do the check at all (an action this repo can't use, one not set up for it, egress control
-  // missing from some release jobs, a scan target pipegen can't place)
-  'unavailable', 'needs-inputs', 'some-jobs', 'target']);
+export { MAY_NOT_RUN };
 const REASON_WHY: Readonly<Record<Reason, (subject: string, when: string) => string>> = {
   continue: (s) => `${s} runs, but is allowed to fail (continue-on-error), so it can't block anything.`,
   suppressed: (s) => `${s} runs, but its exit code is ignored (by ||, a pipe, an if, set +e, the background & or the step's shell), so it can't block anything.`,
@@ -88,9 +80,12 @@ const REASON_WHY: Readonly<Record<Reason, (subject: string, when: string) => str
   'some-jobs': (s) => `${s} runs, but pipegen found egress control in some release jobs only (or not as their first step), so the other release steps can reach any site.`,
   target: (s) => `${s} runs, but pipegen can't tell whether it scans a container image or a folder here.`,
   long: (s) => `${s} runs with more words than pipegen reads, so pipegen can't tell how it is set up.`,
+  // fix round 1 (the run's own why names the variable or file, or the runner)
+  config: (s) => `${s} runs, but a config file or variable here can turn it off, and pipegen doesn't follow it.`,
+  runner: (s) => `${s} runs, but not on a GitHub-hosted runner it supports, outside a container, so it may not block anything.`,
 };
 /** Reasons whose run carries pipegen's own why from the signature (partialWhy, actionRef, unavailableWhy, requireInputs). */
-const OWN_WHY: ReadonlySet<Reason> = new Set<Reason>(['never', 'ref', 'unavailable', 'needs-inputs']);
+const OWN_WHY: ReadonlySet<Reason> = new Set<Reason>(['never', 'ref', 'unavailable', 'needs-inputs', 'config', 'some-jobs', 'runner']);
 
 const HOOK_PLACE = { 'pre-commit': 'the pre-commit framework', husky: 'the husky pre-commit hook', lefthook: 'the lefthook pre-commit hook' } as const;
 const HOOK_NAME = { 'pre-commit': 'the pre-commit framework', husky: 'husky', lefthook: 'lefthook' } as const;

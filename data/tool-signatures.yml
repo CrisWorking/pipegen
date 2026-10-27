@@ -219,7 +219,8 @@ tools:
   # Plan P Task 3 (rulings PB5, R4): one entry for deps and dependency-review. The README: it runs only on public repos
   # and organisation-owned private repos with GitHub Advanced Security; vulnerability-check: false skips the check;
   # fail-on-scopes (default runtime) leaves runtime dependencies out when it doesn't name them; a config-file can set
-  # all of these. Inputs: https://github.com/actions/dependency-review-action/blob/main/action.yml
+  # all of these. Inputs: https://github.com/actions/dependency-review-action/blob/main/action.yml (fix round 1:
+  # base-ref and head-ref set in the workflow can make it compare a branch with itself)
   - id: dependency-review
     categories: [deps, dependency-review]
     actions: [actions/dependency-review-action]
@@ -229,8 +230,8 @@ tools:
       vulnerability-check: ['false']
     onlyWithFlagValue: { input: fail-on-scopes, contains: runtime, ifGiven: true }
     requireInputs:
-      unset: [config-file]
-      why: The dependency review action reads a config file here that can make it warn only or turn its checks off, and pipegen doesn't read that file.
+      unset: [config-file, base-ref, head-ref]
+      why: The dependency review action here reads a config file or compares refs set in the workflow, which pipegen can't check, so it may warn only or compare nothing.
     availability: public-or-code-security
     unavailableWhy: Dependency review works only on public repos and on organisation-owned private repos with GitHub Advanced Security, so here it checks nothing.
   # Plan P Task 3: https://github.com/google/osv-scanner-action/blob/main/.github/workflows/osv-scanner-reusable-pr.yml
@@ -257,6 +258,12 @@ tools:
   # licence findings)
   # Action: https://github.com/aquasecurity/trivy-action/blob/master/action.yaml (exit-code has no default and is
   # passed on only when non-empty: set_env_var_if_provided "TRIVY_EXIT_CODE")
+  # Fix round 1: an exit code is any value that isn't a plain 1-255 (pflag reads base prefixes:
+  # https://github.com/spf13/pflag/blob/master/int.go; the action through cast: https://github.com/spf13/cast), so
+  # failInputs take `+` (a non-zero exit code). --download-db-only and --download-java-db-only download and scan nothing
+  # (https://github.com/aquasecurity/trivy/blob/main/pkg/flag/db_flags.go). Ruling P8: TRIVY_* variables set the same
+  # options, and trivy loads ./trivy.yaml by default (https://github.com/aquasecurity/trivy/blob/main/pkg/flag/global_flags.go,
+  # `--config` default "trivy.yaml"; `--config ''` loads none).
   # Plan P Task 3 (ruling PB3): one entry per subcommand, so `trivy config` never counts as an image scan. Subcommands
   # and aliases: https://github.com/aquasecurity/trivy/blob/main/pkg/commands/app.go (image|i, filesystem|fs, rootfs,
   # repository|repo, sbom, config|conf). --scanners picks what is scanned (image and fs scan vuln,secret by default),
@@ -267,12 +274,16 @@ tools:
     actions: [aquasecurity/trivy-action]
     commands: [trivy image, trivy i]
     commandFails: flag
+    notWithFlags: [--download-db-only, --download-java-db-only]
+    softEnv: [TRIVY_EXIT_CODE, TRIVY_SCANNERS, TRIVY_DOWNLOAD_DB_ONLY, TRIVY_DOWNLOAD_JAVA_DB_ONLY, TRIVY_CONFIG]
+    configFiles: [trivy.yaml]
+    configFlag: --config
     failFlags: [--exit-code]
     softFlags: [--exit-code=0]
     onlyWithFlagValue: { flag: --scanners, input: scanners, contains: vuln, ifGiven: true }
     actionFails: input
     failInputs:
-      exit-code: ['*']
+      exit-code: ['+']
     softInputs:
       exit-code: ['0']
     skipUnless:
@@ -287,12 +298,16 @@ tools:
     actions: [aquasecurity/trivy-action]
     commands: [trivy fs, trivy filesystem, trivy repo, trivy repository, trivy rootfs, trivy sbom]
     commandFails: flag
+    notWithFlags: [--download-db-only, --download-java-db-only]
+    softEnv: [TRIVY_EXIT_CODE, TRIVY_SCANNERS, TRIVY_DOWNLOAD_DB_ONLY, TRIVY_DOWNLOAD_JAVA_DB_ONLY, TRIVY_CONFIG]
+    configFiles: [trivy.yaml]
+    configFlag: --config
     failFlags: [--exit-code]
     softFlags: [--exit-code=0]
     onlyWithFlagValue: { flag: --scanners, input: scanners, contains: vuln, ifGiven: true }
     actionFails: input
     failInputs:
-      exit-code: ['*']
+      exit-code: ['+']
     softInputs:
       exit-code: ['0']
     onlyWithInputs:
@@ -307,11 +322,15 @@ tools:
     actions: [aquasecurity/trivy-action]
     commands: [trivy config, trivy conf]
     commandFails: flag
+    notWithFlags: [--download-db-only, --download-java-db-only]
+    softEnv: [TRIVY_EXIT_CODE, TRIVY_SCANNERS, TRIVY_DOWNLOAD_DB_ONLY, TRIVY_DOWNLOAD_JAVA_DB_ONLY, TRIVY_CONFIG]
+    configFiles: [trivy.yaml]
+    configFlag: --config
     failFlags: [--exit-code]
     softFlags: [--exit-code=0]
     actionFails: input
     failInputs:
-      exit-code: ['*']
+      exit-code: ['+']
     softInputs:
       exit-code: ['0']
     onlyWithInputs:
@@ -340,11 +359,15 @@ tools:
     commands: [trivy fs, trivy filesystem, trivy repo, trivy repository, trivy rootfs, trivy image, trivy i]
     onlyWithFlagValue: { flag: --scanners, input: scanners, contains: license }
     commandFails: flag
+    notWithFlags: [--download-db-only, --download-java-db-only]
+    softEnv: [TRIVY_EXIT_CODE, TRIVY_SCANNERS, TRIVY_DOWNLOAD_DB_ONLY, TRIVY_DOWNLOAD_JAVA_DB_ONLY, TRIVY_CONFIG]
+    configFiles: [trivy.yaml]
+    configFlag: --config
     failFlags: [--exit-code]
     softFlags: [--exit-code=0]
     actionFails: input
     failInputs:
-      exit-code: ['*']
+      exit-code: ['+']
     softInputs:
       exit-code: ['0']
     skipUnless:
@@ -486,16 +509,19 @@ tools:
   - id: mocha
     categories: [unit-tests, full-tests]
     commands: [mocha]
+  # Fix round 1: -list prints the matching tests and runs none
+  # (https://github.com/golang/go/blob/master/src/cmd/go/internal/test/test.go)
   - id: go-test
     categories: [unit-tests, full-tests]
     commands: [go test]
+    notWithFlags: [-list, --list]
   # ---------- test coverage (Plan P Task 3, ruling PS17: partial until Plan P Task 4 checks for a minimum) ----------
   # https://vitest.dev/guide/coverage (--coverage, or --coverage.enabled; false turns it off)
   - id: vitest-cov
     categories: [coverage]
     commands: [vitest]
     onlyWithFlags: [--coverage, --coverage.enabled]
-    notWithFlags: [--coverage=false, --coverage.enabled=false]
+    notWithFlags: [--coverage=false, --coverage.enabled=false, --no-coverage]
     commandFails: never
     partialWhy: This run measures test coverage, but pipegen hasn't checked for a minimum, so a drop in coverage may not fail it.
   # https://jestjs.io/docs/cli (--coverage, alias --collectCoverage; --listTests, --showConfig and --collectTests run no tests)
@@ -503,7 +529,7 @@ tools:
     categories: [coverage]
     commands: [jest]
     onlyWithFlags: [--coverage, --collectCoverage]
-    notWithFlags: [--coverage=false, --collectCoverage=false, --listTests, --showConfig, --collectTests]
+    notWithFlags: [--coverage=false, --collectCoverage=false, --no-coverage, --listTests, --showConfig, --collectTests]
     commandFails: never
     partialWhy: This run measures test coverage, but pipegen hasn't checked for a minimum, so a drop in coverage may not fail it.
   # https://github.com/bcoe/c8/blob/main/README.md (c8 runs a command and measures its coverage)
@@ -539,6 +565,7 @@ tools:
     categories: [coverage]
     commands: [go test]
     onlyWithFlags: [-cover, -covermode, -coverpkg, -coverprofile, --cover, --covermode, --coverpkg, --coverprofile]
+    notWithFlags: [-list, --list]
     commandFails: never
     partialWhy: This run measures test coverage, but pipegen hasn't checked for a minimum, so a drop in coverage may not fail it.
   # ---------- lint and format ----------
@@ -672,19 +699,21 @@ tools:
     commands: [lint-staged]
   # ---------- format checks (Plan P Task 3) ----------
   # https://github.com/prettier/prettier/blob/main/docs/cli.md (--check / -c and --list-different / -l exit 1 when a
-  # file isn't formatted; without them prettier prints or writes)
+  # file isn't formatted; without them prettier prints or writes). Fix round 1: --support-info, --find-config-path and
+  # --file-info print information and check nothing (same page).
   - id: prettier-check
     categories: [format]
     commands: [prettier]
     onlyWithFlags: [--check, -c, --list-different, -l]
-    notWithFlags: [--write, -w]
+    notWithFlags: [--write, -w, --support-info, --find-config-path, --file-info]
   # https://github.com/astral-sh/ruff/blob/main/docs/formatter.md ("Exit codes": ruff format --check exits 1 when a file
   # would be formatted) and https://github.com/astral-sh/ruff/blob/main/crates/ruff/src/args.rs (--diff: "exit with a
-  # non-zero status code and the difference")
+  # non-zero status code and the difference"); --stdin-filename formats standard input, not the files (fix round 1)
   - id: ruff-format-check
     categories: [format]
     commands: [ruff format]
     onlyWithFlags: [--check, --diff]
+    notWithFlags: [--stdin-filename]
   # https://github.com/psf/black/blob/main/docs/usage_and_configuration/the_basics.md (--check: "code 1 if some files
   # would be reformatted"; --diff alone only prints)
   - id: black-check
@@ -713,11 +742,14 @@ tools:
   # (https://www.typescriptlang.org/docs/handbook/compiler-options.html). vue-tsc and tsgo take tsc's flags.
   # svelte-check: https://github.com/sveltejs/language-tools/blob/master/packages/svelte-check/README.md (errors exit
   # with an error code; --fail-on-warnings adds warnings). astro check: https://docs.astro.build/en/reference/cli-reference/
-  # ("If any errors are found the process will exit with a code of 1").
+  # ("If any errors are found the process will exit with a code of 1"). Fix round 1: TypeScript reads option names in
+  # any letter case and with one or two dashes (https://github.com/microsoft/TypeScript/blob/main/src/compiler/commandLineParser.ts:
+  # names are looked up lowercased; `-noCheck`, `--nocheck` and `-NOCHECK` are --noCheck), so flagsAnyCase.
   - id: tsc
     categories: [type-check]
     commands: [tsc, tsgo, vue-tsc, svelte-check, astro check]
-    notWithFlags: [--init, --showConfig, --listFilesOnly, --all, --watch, -w, --noCheck, --clean]
+    notWithFlags: [--init, --showConfig, --listFilesOnly, --all, --watch, -w, --noCheck, --clean, --version, -v, --help, -h]
+    flagsAnyCase: true
   # https://github.com/python/mypy/blob/master/mypy/main.py (exit code 1 when it reports errors, 2 on a blocking one)
   # hook: https://github.com/pre-commit/mirrors-mypy/blob/main/.pre-commit-hooks.yaml (id mypy, entry mypy)
   - id: mypy
@@ -784,14 +816,19 @@ tools:
   # https://github.com/hadolint/hadolint-action/blob/master/action.yml (no-fail default 'false'; failure-threshold
   # default 'info'; config names a config file, which can set no-fail). hooks:
   # https://github.com/hadolint/hadolint/blob/master/.pre-commit-hooks.yaml (hadolint, hadolint-docker)
+  # Fix round 1: optparse-applicative takes a short option's value attached (-tnone), and the README's environment
+  # variables (HADOLINT_NOFAIL, HADOLINT_FAILURE_THRESHOLD) and ./.hadolint.yaml (read first; it can set no-fail and
+  # failure-threshold) can turn failure off (ruling P8)
   - id: hadolint
     categories: [dockerfile-lint]
     actions: [hadolint/hadolint-action]
     commands: [hadolint]
-    softFlags: [--no-fail, --failure-threshold=none, --failure-threshold=ignore, -t=none, -t=ignore]
+    softFlags: [--no-fail, --failure-threshold=none, --failure-threshold=ignore, -t=none, -t=ignore, -tnone, -tignore]
     softInputs:
       no-fail: ['true']
       failure-threshold: [none, ignore]
+    softEnv: [HADOLINT_NOFAIL, HADOLINT_FAILURE_THRESHOLD]
+    configFiles: [.hadolint.yaml, .hadolint.yml]
     requireInputs:
       unset: [config]
       why: The hadolint action reads a config file here that can turn failures off, and pipegen doesn't read that file.
@@ -800,11 +837,13 @@ tools:
         ids: [hadolint, hadolint-docker]
   # https://github.com/rhysd/actionlint/blob/main/docs/usage.md ("Exit status": 1 when a problem is found). Action:
   # https://github.com/raven-actions/actionlint/blob/main/action.yml (fails only when fail-on-error is 'true', its
-  # default). hooks: https://github.com/rhysd/actionlint/blob/main/.pre-commit-hooks.yaml
+  # default). hooks: https://github.com/rhysd/actionlint/blob/main/.pre-commit-hooks.yaml. Fix round 1: -init-config
+  # writes a config and checks nothing (docs/usage.md)
   - id: actionlint
     categories: [workflow-lint]
     actions: [raven-actions/actionlint]
     commands: [actionlint]
+    notWithFlags: [-init-config]
     softUnless:
       fail-on-error: ['true']
     precommitHooks:
@@ -872,8 +911,8 @@ tools:
     skipInputs:
       license-check: ['false']
     requireInputs:
-      unset: [config-file]
-      why: The dependency review action reads its licence list from a config file here, and pipegen doesn't read that file.
+      unset: [config-file, base-ref, head-ref]
+      why: The dependency review action here reads its licence list from a config file or compares refs set in the workflow, which pipegen can't check.
     availability: public-or-code-security
     unavailableWhy: Dependency review works only on public repos and on organisation-owned private repos with GitHub Advanced Security, so here it checks nothing.
   # https://github.com/EmbarkStudios/cargo-deny/blob/main/docs/src/cli/check.md ("By default, all checks will be
@@ -920,6 +959,10 @@ tools:
   # enable-sudo default true) and README ("Why enable-sudo: false matters": root can bypass the filter; it "should be
   # the first step of your job, and should be loaded on every separate job"); with api-token, the control plane's
   # policy replaces egress-policy and enable-sudo: https://github.com/bullfrogsec/bullfrog/blob/main/action/src/policy.ts
+  # Fix round 1: `_dry-run-print-config: true` returns before the agent starts
+  # (https://github.com/bullfrogsec/bullfrog/blob/main/action/src/main.ts); dns-policy `any` lets any DNS request out
+  # (action.yml); README "Limitations": GitHub-hosted Ubuntu runners only (ubuntu-latest, -22.04, -24.04, the arm ones,
+  # ubuntu-slim), and jobs in containers are not supported.
   - id: bullfrog
     categories: [egress]
     actions: [bullfrogsec/bullfrog]
@@ -927,11 +970,17 @@ tools:
       all:
         egress-policy: [block]
         enable-sudo: ['false']
-      unset: [api-token]
-      why: Bullfrog blocks traffic only with egress-policy set to block and enable-sudo set to false in the workflow, with no control-plane policy (api-token) to replace them.
+      unset: [api-token, _dry-run-print-config]
+      ifSet:
+        dns-policy: [allowed-domains-only]
+      why: Bullfrog blocks traffic only with egress-policy set to block, enable-sudo set to false and DNS kept to the allowed domains, with no control-plane policy (api-token) or dry run.
+    runners: [ubuntu-latest, ubuntu-22.04, ubuntu-24.04, ubuntu-22.04-arm, ubuntu-24.04-arm, ubuntu-arm-22.04, ubuntu-arm-24.04, ubuntu-slim]
   # https://github.com/step-security/harden-runner/blob/main/action.yml (egress-policy "audit or block"; disable-sudo and
   # disable-sudo-and-containers default "false"; policy, api-key and use-policy-store fetch a stored policy). DEC #80
   # (spike S8): its free tier blocked nothing on a private repo, and sudo undid it on a public one.
+  # Fix round 1: disable-sudo alone leaves docker, which is root-equivalent, and action.yml says it will be deprecated
+  # for disable-sudo-and-containers. https://github.com/step-security/harden-runner/blob/main/src/setup.ts skips a
+  # container job (CONTAINER_MESSAGE), ubuntu-slim (UBUNTU_SLIM_MESSAGE) and, without its agent, a self-hosted runner.
   - id: harden-runner
     categories: [egress]
     actions: [step-security/harden-runner]
@@ -940,11 +989,10 @@ tools:
     requireInputs:
       all:
         egress-policy: [block]
-      any:
-        disable-sudo: ['true']
         disable-sudo-and-containers: ['true']
       unset: [policy, api-key, use-policy-store]
-      why: Harden-Runner blocks traffic only with egress-policy set to block and sudo turned off (disable-sudo) in the workflow, with no stored policy to replace them.
+      why: Harden-Runner blocks traffic only with egress-policy set to block and sudo and containers turned off (disable-sudo-and-containers) in the workflow, with no stored policy to replace them.
+    runners: [ubuntu-latest, ubuntu-22.04, ubuntu-24.04, ubuntu-22.04-arm, ubuntu-24.04-arm]
   # ---------- scheduled checks (Plan P Task 3): right on `schedule` or a push to the default branch ----------
   # https://github.com/ossf/scorecard-action/blob/main/action.yaml (writes results; nothing fails on a low score) and
   # README ("free for all public repositories. Private repositories are supported if they have GitHub Advanced
@@ -956,10 +1004,12 @@ tools:
     availability: public-or-code-security
     unavailableWhy: The Scorecard action works only on public repos and on private repos with GitHub Advanced Security, so here it checks nothing.
     partialWhy: Scorecard scores the repo's security practices and doesn't fail the job on a low score.
-  # https://github.com/ossf/scorecard/blob/main/README.md (the scorecard command line, which runs on any repo it can read)
+  # https://github.com/ossf/scorecard/blob/main/README.md (the scorecard command line, which runs on any repo it can read).
+  # Fix round 1: --repo can name another repo, so only `--local <path>` (this checkout) counts
   - id: scorecard-cli
     categories: [scorecard]
     commands: [scorecard]
+    onlyWithFlagValue: { flag: --local }
     commandFails: never
     partialWhy: Scorecard scores the repo's security practices and doesn't fail the job on a low score.
   # https://github.com/golang/go/blob/master/src/cmd/go/internal/test/test.go ("-fuzz regexp: Run the fuzz test
@@ -968,6 +1018,7 @@ tools:
     categories: [fuzzing]
     commands: [go test]
     onlyWithFlagValue: { flag: -fuzz }
+    notWithFlags: [-list, --list]
   # https://github.com/google/clusterfuzzlite/blob/main/actions/run_fuzzers/action.yml and
   # https://github.com/google/oss-fuzz/blob/master/infra/cifuzz/actions/run_fuzzers/action.yml (mode coverage and prune
   # don't fuzz)

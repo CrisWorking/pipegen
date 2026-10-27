@@ -5,7 +5,18 @@ import { asObj } from '../../read/manifest.js';
 import { MAX_FLAG_WORDS, MAX_INPUT_KEYS, MAX_SPELLINGS } from './bounds.js';
 import { PRE_COMMIT_ID, type ToolSignature } from './signatures.js';
 import { tokenize } from './tokenize.js';
-import type { Found, Obj, Reason } from './types.js';
+import type { Found, JobEnv, Obj, Reason } from './types.js';
+
+/**
+ * Reasons that say the tool may not run at all (not just "can't block"): they make even a need that doesn't block
+ * partial. Task 5 fix round 1 adds the pre-commit ones (hook-repo, files, stage) and SKIP; the Plan U final review (I2)
+ * adds a TOX… or NOX… variable that picks what tox or nox runs; Plan P Task 3 adds an action this repo can't use, one
+ * not set up for the check, egress control missing from some release jobs, a scan target pipegen can't place, a config
+ * file or env var that can turn the check off, and an egress step on a runner it can't guard. (Here, not in decide.ts,
+ * so the env gate can read it without an import cycle.)
+ */
+export const MAY_NOT_RUN: ReadonlySet<Reason> = new Set<Reason>(['condition', 'hook-repo', 'files', 'stage', 'skip', 'ref', 'tox-env', 'nox-env',
+  'unavailable', 'needs-inputs', 'some-jobs', 'target', 'config', 'runner']);
 
 // ---------- if: conditions (review I3) ----------
 
@@ -64,19 +75,46 @@ export function condition(v: unknown, self: RepoId): Cond {
 
 // ---------- soft-fail settings (review I1) ----------
 
-/** "--fail" matches --fail and --fail=x; "--exit-code=0" matches --exit-code=0 and --exit-code 0. */
+/**
+ * Fix round 1: an exit code the shell sees as non-zero: 1–255 written plainly. Everything else counts as zero: the
+ * tools parse with base prefixes (pflag `ParseInt(s, 0, 64)`, https://github.com/spf13/pflag/blob/master/int.go; the
+ * trivy action through cast, `ParseInt(trimDecimal(s), 0, 0)`), so 00, 0x0, +0 and 0o0 are 0, and 256 exits 0.
+ */
+export const nonZeroExit = (v: string) => /^[1-9][0-9]{0,2}$/.test(v) && Number(v) % 256 !== 0;
+
+/**
+ * "--fail" matches --fail and --fail=x; "--exit-code=0" matches --exit-code=0 and --exit-code 0. Fix round 1: a spec
+ * whose value is 0 is an exit code, so it matches any value that isn't a plain non-zero one (nonZeroExit).
+ */
 export function flagGiven(spec: string, words: readonly string[]): boolean {
   const eq = spec.indexOf('=');
   if (eq < 0) return words.some((w) => w === spec || w.startsWith(`${spec}=`));
   const name = spec.slice(0, eq);
   const value = spec.slice(eq + 1);
+  if (value === '0') {
+    return words.some((w, i) => (w.startsWith(`${name}=`) && !nonZeroExit(w.slice(name.length + 1)))
+      || (w === name && i + 1 < words.length && !nonZeroExit(words[i + 1] as string)));
+  }
   return words.some((w, i) => w === spec || (w === name && words[i + 1] === value));
 }
 
+/**
+ * Fix round 1: TypeScript reads option names in any letter case and with one or two dashes
+ * (https://github.com/microsoft/TypeScript/blob/main/src/compiler/commandLineParser.ts: names are looked up lowercased,
+ * and `-x` and `--x` are the same). A flag word becomes `--` + its lowercased name; other words stay.
+ */
+const anyCaseFlag = (w: string) => (w.startsWith('-') && w.length > 1 ? `--${w.replace(/^-+/, '').toLowerCase()}` : w);
+/** The words and a spec normaliser for a tool: as they are, or any-case for flagsAnyCase tools. */
+function flagView(tool: ToolSignature, words: readonly string[]): { ws: readonly string[]; spec: (f: string) => string } {
+  return tool.flagsAnyCase === true ? { ws: words.map(anyCaseFlag), spec: anyCaseFlag } : { ws: words, spec: (f) => f };
+}
+
 export function commandReason(tool: ToolSignature, words: readonly string[]): Reason | null {
-  if ((tool.softFlags ?? []).some((f) => flagGiven(f, words))) return 'soft';
+  const { ws, spec } = flagView(tool, words);
+  if ((tool.softFlags ?? []).some((f) => flagGiven(spec(f), ws))) return 'soft';
   if (tool.commandFails === 'never') return 'never';
-  if (tool.commandFails === 'flag' && !(tool.failFlags ?? []).some((f) => flagGiven(f, words))) return 'no-fail';
+  // fix round 1: a fail flag set to a false value (--fail-on-violation=false, --fail=false) doesn't make it fail
+  if (tool.commandFails === 'flag' && !(tool.failFlags ?? []).some((f) => onlyFlagGiven(spec(f), ws))) return 'no-fail';
   return null;
 }
 
@@ -112,7 +150,7 @@ function valueListed(v: unknown, values: string[], exprCounts: boolean): boolean
   const s = inputText(v);
   if (s === null) return false;
   if (s.includes('${{')) return exprCounts;
-  return values.includes(s) || (values.includes('*') && s !== '');
+  return values.includes(s) || (values.includes('*') && s !== '') || (values.includes('+') && nonZeroExit(s));
 }
 
 /** Soft check: some spelling of a listed input has a listed value (an expression counts: errs to "can't block"). */
@@ -217,6 +255,13 @@ export function requiredInputsHeld(tool: ToolSignature, w: Inputs): boolean {
   };
   if (r.all !== undefined && !Object.entries(r.all).every(([name, values]) => holds(name, values))) return false;
   if (r.any !== undefined && !Object.entries(r.any).some(([name, values]) => holds(name, values))) return false;
+  // ifSet: a set (non-empty) spelling must be a listed value; an expression never is
+  if (r.ifSet !== undefined && Object.entries(r.ifSet).some(([name, values]) => w.crowded.has(name.toLowerCase())
+    || (w.byName.get(name.toLowerCase()) ?? []).some((v) => {
+      const t = inputText(v);
+      if (t === null) return v !== null && v !== undefined;
+      return t !== '' && !valueListed(v, values, false);
+    }))) return false;
   if (r.unset !== undefined && r.unset.some((name) => w.crowded.has(name.toLowerCase())
     || (w.byName.get(name.toLowerCase()) ?? []).some((v) => {
       const t = inputText(v);
@@ -288,15 +333,26 @@ function flagValueAllows(rule: NonNullable<ToolSignature['onlyWithFlagValue']>, 
  * Task 5: a command signature that counts only with (onlyWithFlags) or without (notWithFlags) some flags. Plan P Task 3:
  * and with onlyWithFlagValue; `complete` = every word of the command line was read (an ifGiven rule needs that).
  */
-export const flagsAllow = (tool: ToolSignature, args: readonly string[], complete = true) =>
-  (tool.onlyWithFlags === undefined || tool.onlyWithFlags.some((f) => onlyFlagGiven(f, args)))
-  && !(tool.notWithFlags ?? []).some((f) => flagGiven(f, args))
-  && (tool.onlyWithFlagValue?.flag === undefined || flagValueAllows(tool.onlyWithFlagValue, lastFlagValue(tool.onlyWithFlagValue.flag, args), complete));
+export function flagsAllow(tool: ToolSignature, args: readonly string[], complete = true): boolean {
+  const { ws, spec } = flagView(tool, args);
+  return (tool.onlyWithFlags === undefined || tool.onlyWithFlags.some((f) => onlyFlagGiven(spec(f), ws)))
+    && !(tool.notWithFlags ?? []).some((f) => flagGiven(spec(f), ws))
+    && (tool.onlyWithFlagValue?.flag === undefined || flagValueAllows(tool.onlyWithFlagValue, lastFlagValue(spec(tool.onlyWithFlagValue.flag), ws), complete));
+}
 
-export const foundOf = (tool: ToolSignature, dir: string | null, reason: Reason | null): Found => ({
+export const foundOf = (tool: ToolSignature, dir: string | null, reason: Reason | null, configOff = false): Found => ({
   categories: tool.categories, by: tool.id, subject: `The ${tool.id} check`, dir, reason,
   ...(tool.partialWhy === undefined ? {} : { partialWhy: tool.partialWhy }),
+  ...(tool.softEnv === undefined ? {} : { softEnv: tool.softEnv }),
+  ...(tool.configFiles === undefined || configOff ? {} : { configFiles: tool.configFiles }),
 });
+
+/** Fix round 1 (P8): a command line that turns the tool's config file loading off (`trivy --config ''`). */
+export function configTurnedOff(tool: ToolSignature, args: readonly string[]): boolean {
+  const flag = tool.configFlag;
+  if (flag === undefined) return false;
+  return lastFlagValue(flag, args) === '';
+}
 
 // ---------- env gate (Task 5) ----------
 
@@ -306,23 +362,44 @@ export const foundOf = (tool: ToolSignature, dir: string | null, reason: Reason 
  * NOX… pick envs or sessions (tox 4 reads TOX_<option>; TOXENV; NOXSESSION), SKIP skips pre-commit hooks
  * (https://pre-commit.com/#temporarily-disabling-hooks). An action that sets one through GITHUB_ENV isn't seen.
  */
-export interface EnvGate { tox: boolean; nox: boolean; skip: boolean; npm: boolean }
-export const NO_GATE: EnvGate = { tox: false, nox: false, skip: false, npm: false };
-export const ALL_GATE: EnvGate = { tox: true, nox: true, skip: true, npm: true };
-export const orGate = (a: EnvGate, b: EnvGate): EnvGate => ({ tox: a.tox || b.tox, nox: a.nox || b.nox, skip: a.skip || b.skip, npm: a.npm || b.npm });
-export function gateOf(texts: readonly string[], envs: readonly unknown[], base: EnvGate = NO_GATE): EnvGate {
+export interface EnvGate { tox: boolean; nox: boolean; skip: boolean; npm: boolean; env: JobEnv }
+const NO_ENV: JobEnv = { all: false, names: new Set() };
+export const NO_GATE: EnvGate = { tox: false, nox: false, skip: false, npm: false, env: NO_ENV };
+export const ALL_GATE: EnvGate = { tox: true, nox: true, skip: true, npm: true, env: { all: true, names: new Set() } };
+const orEnv = (a: JobEnv, b: JobEnv): JobEnv =>
+  (b.names.size === 0 && !b.all ? a : a.names.size === 0 && !a.all ? b : { all: a.all || b.all, names: new Set([...a.names, ...b.names]) });
+export const orGate = (a: EnvGate, b: EnvGate): EnvGate =>
+  ({ tox: a.tox || b.tox, nox: a.nox || b.nox, skip: a.skip || b.skip, npm: a.npm || b.npm, env: orEnv(a.env, b.env) });
+/**
+ * Fix round 1 (P8): `softNames` (every signature's softEnv) are looked for too: as an `env:` key (any letter case) or
+ * as `NAME=` in the run text (inline, export, or `>> $GITHUB_ENV`).
+ */
+export function gateOf(texts: readonly string[], envs: readonly unknown[], base: EnvGate = NO_GATE, softNames: readonly string[] = []): EnvGate {
   // an `env:` given as one expression could set anything
   if (envs.some((e) => e !== undefined && e !== null && (typeof e !== 'object' || Array.isArray(e)))) return ALL_GATE;
   const keys = envs.flatMap((e) => Object.keys(asObj(e)).slice(0, MAX_INPUT_KEYS)).map((k) => k.toUpperCase());
   const inText = (needle: string) => texts.some((t) => t.includes(needle));
+  const names = softNames.filter((n) => keys.includes(n) || inText(`${n}=`));
   return {
     tox: base.tox || keys.some((k) => k.startsWith('TOX')) || inText('TOX'),
     nox: base.nox || keys.some((k) => k.startsWith('NOX')) || inText('NOX'),
     skip: base.skip || keys.includes('SKIP') || inText('SKIP'),
     // npm reads npm_config_* in any letter case
     npm: base.npm || keys.includes('NPM_CONFIG_DRY_RUN') || texts.some((t) => t.toLowerCase().includes('npm_config_dry_run')),
+    env: names.length === 0 ? base.env : orEnv(base.env, { all: false, names: new Set(names) }),
   };
 }
+
+/** Fix round 1 (P8): the softEnv name this job sets for a run, '*' when an `env:` expression could set any, or null. */
+export function softEnvSet(softEnv: readonly string[] | undefined, env: JobEnv | undefined): string | null {
+  if (softEnv === undefined || env === undefined) return null;
+  if (env.all) return '*';
+  return softEnv.find((n) => env.names.has(n)) ?? null;
+}
+/** pipegen's own why for a run whose softEnv name or config file is set (the name and file come from pipegen's data). */
+export const configWhy = (subject: string, what: string) => (what === '*'
+  ? `${subject} runs, but an env: given as an expression could set a variable that turns it off, and pipegen can't tell.`
+  : `${subject} runs, but ${what} is set here, which can turn its check or its failure off, and pipegen doesn't follow it.`);
 /**
  * Applies the job's env gate. A tox / nox run whose envs or sessions a TOX… / NOX… variable may pick is kept as
  * partial (Plan U final review I2: pipegen can't tell what it runs, so it is never covered, and never missing either);
@@ -335,5 +412,10 @@ export const gated = (found: Found[], g: EnvGate): Found[] => found
   .map((f) => {
     if (f.envGate === 'tox' && g.tox) return { ...f, reason: 'tox-env' as const };
     if (f.envGate === 'nox' && g.nox) return { ...f, reason: 'nox-env' as const };
-    return g.skip && f.by === PRE_COMMIT_ID ? { ...f, hookRun: false, reason: f.reason ?? 'skip' } : f;
+    if (g.skip && f.by === PRE_COMMIT_ID) return { ...f, hookRun: false, reason: f.reason ?? 'skip' };
+    // fix round 1 (P8): a softEnv name set in the job; a CI pre-commit run keeps the job env for the hooks it carries
+    const set = softEnvSet(f.softEnv, g.env);
+    if (set !== null && (f.reason === null || !MAY_NOT_RUN.has(f.reason))) return { ...f, reason: 'config' as const, partialWhy: configWhy(f.subject, set) };
+    if (f.hookRun === true && (g.env.all || g.env.names.size > 0)) return { ...f, jobEnv: g.env };
+    return f;
   });

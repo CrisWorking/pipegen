@@ -18,7 +18,12 @@ const FLAG_NAME_RE = /^-{1,2}[A-Za-z0-9][A-Za-z0-9.-]*$/;
 /** Plan P Task 3: a called workflow, exactly owner/repo/.github/workflows/<file>.yml (or .yaml). */
 const REUSABLE_RE = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+\/\.github\/workflows\/[A-Za-z0-9_.-]+\.ya?ml$/;
 const INPUT_RE = /^[A-Za-z0-9_-]{1,64}$/;
-const INPUT_VALUE_RE = /^(?:\*|[a-z0-9._ :/-]{1,64})$/; // ':' and '/' for URL values (repository-url)
+// ':' and '/' for URL values (repository-url); fix round 1: `+` = an exit code that isn't zero (1–255, as the shell sees it)
+const INPUT_VALUE_RE = /^(?:\*|\+|[a-z0-9._ :/-]{1,64})$/;
+const ENV_RE = /^[A-Z_][A-Z0-9_]{0,63}$/;
+/** Fix round 1: a config file a tool loads by itself, by name, from the folder it runs in (or the repo root). */
+const CONFIG_FILE_RE = /^[A-Za-z0-9_.-]{1,64}$/;
+const RUNNER_RE = /^[a-z0-9][a-z0-9.-]{0,63}$/;
 /** A pre-commit hook repo, exactly as its README gives it (https://github.com/owner/name). */
 const HOOK_REPO_RE = /^https:\/\/github\.com\/[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/;
 const HOOK_ID_RE = /^[a-z0-9][a-z0-9_.-]{0,63}$/;
@@ -127,8 +132,10 @@ const signatureSchema = z.strictObject({
     all: inputs.optional(),
     any: inputs.optional(),
     unset: z.array(z.string().regex(INPUT_RE)).min(1).optional(),
+    /** Fix round 1: inputs that, when set (non-empty), must be one of these values (Bullfrog's dns-policy). */
+    ifSet: inputs.optional(),
     why,
-  }).refine((r) => r.all !== undefined || r.any !== undefined || r.unset !== undefined, 'needs all, any or unset').optional(),
+  }).refine((r) => r.all !== undefined || r.any !== undefined || r.unset !== undefined || r.ifSet !== undefined, 'needs all, any, unset or ifSet').optional(),
   /**
    * Plan P Task 3 (ruling PB3): what the command must scan to count. `image`: its arguments name a container image
    * (an image scheme such as registry: or docker:, or a name with a :tag or @sha256 digest) and no folder; `folder`:
@@ -136,6 +143,29 @@ const signatureSchema = z.strictObject({
    * ('target').
    */
   scanTarget: z.enum(['image', 'folder']).optional(),
+  /**
+   * Plan P Task 3 fix round 1 (ruling P8): environment variables the tool reads that can turn its failure or its scan
+   * off. One set anywhere in the job (any `env:`, `NAME=` in run text, an `env:` given as an expression) makes the run
+   * partial ('config').
+   */
+  softEnv: z.array(z.string().regex(ENV_RE)).min(1).optional(),
+  /**
+   * Fix round 1 (P8): config files the tool loads by itself from the folder it runs in that can turn its failure or its
+   * scan off. One in the run's folder or at the repo root makes the run partial ('config'); pipegen never reads it.
+   * `configFlag` given an empty value (`trivy --config ''`) turns that loading off.
+   */
+  configFiles: z.array(z.string().regex(CONFIG_FILE_RE)).min(1).optional(),
+  configFlag: z.string().regex(FLAG_NAME_RE).optional(),
+  /**
+   * Fix round 1 (P8): the action works only in jobs on one of these GitHub-hosted runner labels, outside a `container:`;
+   * anywhere else (another label, an expression, a self-hosted runner) a run is partial ('runner').
+   */
+  runners: z.array(z.string().regex(RUNNER_RE)).min(1).optional(),
+  /**
+   * Fix round 1: the tool reads option names in any letter case and with one or two dashes (TypeScript's tsc), so its
+   * flags are compared that way.
+   */
+  flagsAnyCase: z.literal(true).optional(),
 })
   .refine((t) => t.commandFails !== 'flag' || t.failFlags !== undefined, { message: 'commandFails: flag needs failFlags' })
   .refine((t) => t.actionFails !== 'input' || t.failInputs !== undefined, { message: 'actionFails: input needs failInputs' })
@@ -149,7 +179,9 @@ const signatureSchema = z.strictObject({
   .refine((t) => (t.onlyWithInputs === undefined && t.requireInputs === undefined && t.availability === undefined) || t.actions !== undefined || t.reusableWorkflows !== undefined,
     { message: 'onlyWithInputs, requireInputs and availability need actions or reusableWorkflows' })
   .refine((t) => (t.availability === undefined) === (t.unavailableWhy === undefined), { message: 'availability and unavailableWhy go together' })
-  .refine((t) => t.scanTarget === undefined || t.commands !== undefined, { message: 'scanTarget needs commands' });
+  .refine((t) => t.scanTarget === undefined || t.commands !== undefined, { message: 'scanTarget needs commands' })
+  .refine((t) => t.configFlag === undefined || t.configFiles !== undefined, { message: 'configFlag needs configFiles' })
+  .refine((t) => t.runners === undefined || t.actions !== undefined, { message: 'runners needs actions' });
 
 const signaturesSchema = z.strictObject({ tools: z.array(signatureSchema).min(1) })
   .refine((f) => new Set(f.tools.map((t) => t.id)).size === f.tools.length, { message: 'ids must be unique' });
@@ -205,7 +237,8 @@ export function compile(tools: ToolSignature[]): Compiled {
       actions.push({ tool, parts, prefixLast });
     }
   }
-  return { byFirstWord, byPath, actions, hooks, hookRepos, reusable };
+  const softEnv = [...new Set(tools.flatMap((t) => t.softEnv ?? []))];
+  return { byFirstWord, byPath, actions, hooks, hookRepos, reusable, softEnv };
 }
 
 export const PRE_COMMIT_ID = 'pre-commit';

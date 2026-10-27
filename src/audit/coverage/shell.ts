@@ -2,7 +2,7 @@
 import { regexSafe } from '../../read/limits.js';
 import { MAX_FLAG_WORDS, MAX_SCAN_BYTES, MAX_SCRIPT_PATTERNS, MAX_SCRIPT_TARGETS } from './bounds.js';
 import { resolveDir } from './helpers.js';
-import { UNKNOWN_PREFIX, commandReason, flagsAllow, foundOf, inputWords, inputWordsCapped, inputsCrowded, type Inputs } from './settings.js';
+import { UNKNOWN_PREFIX, commandReason, configTurnedOff, flagsAllow, foundOf, inputWords, inputWordsCapped, inputsCrowded, type Inputs } from './settings.js';
 import { PRE_COMMIT_ID } from './signatures.js';
 import { tokenize } from './tokenize.js';
 import type { Budget, CommandRule, Compiled, Found, Reason } from './types.js';
@@ -89,9 +89,13 @@ const DOCKER_VALUE_FLAGS = new Set(['-v', '--volume', '-e', '--env', '--env-file
 const COND_KEYWORDS = new Set(['if', 'elif', 'while', 'until']);
 const BODY_KEYWORDS = new Set(['then', 'do', 'else']);
 const END_KEYWORDS = new Set(['fi', 'done', 'esac']);
-/** A call that only prints the version or help, not a run. */
+/**
+ * A call that only prints the version or help, not a run. Fix round 1: also Go's one-dash `-version` and `-help`
+ * (actionlint) and `-?` (TypeScript).
+ */
+const PROBE_WORDS: ReadonlySet<string> = new Set(['--version', '--help', '-version', '-help', '-?']);
 export const probeCall = (args: readonly string[]) =>
-  args.includes('--version') || args.includes('--help') || (args.length === 1 && ['-v', '-V', '-h'].includes(args[0] as string));
+  args.some((a) => PROBE_WORDS.has(a)) || (args.length === 1 && ['-v', '-V', '-h'].includes(args[0] as string));
 /** Script names after `npm run` etc. (ruling S5): test, lint, or test:… / lint:…, counted by name. */
 const OWN_NAME_RE = /^(?:test|lint)(?::[A-Za-z0-9_.-]{1,64})?$/;
 /** Task 5: any other script name, counted only when the script's own text runs a known test or lint tool. */
@@ -356,7 +360,8 @@ export function scanShell(text: string, base: string | null, sigs: Compiled, bud
         if (!followedBy(k, r.rest) || r.excludes.some((x) => followedBy(k, x)) || !flagsAllow(r.tool, args, complete)) continue;
         const target = r.tool.scanTarget === undefined ? null : imageTarget(args.slice(r.rest.length));
         if (target !== null && target !== 'unknown' && target !== r.tool.scanTarget) continue;
-        const f = foundOf(r.tool, cwd, shellReason(k) ?? (target === 'unknown' ? 'target' : null) ?? commandReason(r.tool, args) ?? (complete ? null : 'long'));
+        const f = foundOf(r.tool, cwd, shellReason(k) ?? (target === 'unknown' ? 'target' : null) ?? commandReason(r.tool, args) ?? (complete ? null : 'long'),
+          configTurnedOff(r.tool, args));
         // `pre-commit run --all-files` at the repo root (the whole list of words read: none past MAX_FLAG_WORDS); in
         // another folder pre-commit reads that folder's .pre-commit-config.yaml (fix round 1, I2)
         if (r.tool.id === PRE_COMMIT_ID && r.rest.length === 1 && r.rest[0] === 'run' && segEnd[k]! - k - 1 <= MAX_FLAG_WORDS
@@ -674,7 +679,8 @@ export function scanImage(uses: string, w: Inputs, sigs: Compiled): Found[] {
     .flatMap((r) => {
       const target = r.tool.scanTarget === undefined ? null : imageTarget(args.slice(r.rest.length));
       if (target !== null && target !== 'unknown' && target !== r.tool.scanTarget) return [];
-      return [foundOf(r.tool, '.', inputsCrowded(r.tool, w, ['args']) || capped ? 'inputs' : (target === 'unknown' ? 'target' : commandReason(r.tool, args)))];
+      return [foundOf(r.tool, '.', inputsCrowded(r.tool, w, ['args']) || capped ? 'inputs' : (target === 'unknown' ? 'target' : commandReason(r.tool, args)),
+        configTurnedOff(r.tool, args))];
     });
 }
 
@@ -703,9 +709,21 @@ function imageRef(w: string): boolean {
  */
 function imageTarget(args: readonly string[]): 'image' | 'folder' | 'unknown' {
   let image = false;
-  for (const [i, w] of args.entries()) {
+  let unsure = false;
+  for (let i = 0; i < args.length; i++) {
+    const w = args[i] as string;
     const from = w === '--from' ? args[i + 1] : w.startsWith('--from=') ? w.slice('--from='.length) : undefined;
     if (from !== undefined && from.toLowerCase().split(',').some((x) => FOLDER_SOURCES.has(x.trim()))) return 'folder';
+    // fix round 1 (review G1, G2): a flag's value is never the target (`--distro alpine:3.19`, `--file ./r.json`). A
+    // flag pipegen doesn't know may take the next word as its value: an image or a path there can't be placed.
+    if (w.startsWith('-') && !w.includes('=') && w.length > 1) {
+      if (SCAN_VALUE_FLAGS.has(w)) i++;
+      else if (!SCAN_BOOLEAN_FLAGS.has(w) && i + 1 < args.length && !(args[i + 1] as string).startsWith('-') && targetLike(args[i + 1] as string)) {
+        unsure = true;
+        i++;
+      }
+      continue;
+    }
     if (w.startsWith('-') || w.length > 512 || !regexSafe(w)) continue;
     const lower = w.toLowerCase();
     if (FOLDER_SCHEMES.some((x) => lower.startsWith(x)) || w === '.' || w === '..' || w.startsWith('./') || w.startsWith('../') || w.startsWith('/')
@@ -713,7 +731,23 @@ function imageTarget(args: readonly string[]): 'image' | 'folder' | 'unknown' {
     if (w.includes('$') || w.includes('`')) continue;
     if (IMAGE_SCHEMES.some((x) => lower.startsWith(x)) || imageRef(w)) image = true;
   }
-  return image ? 'image' : 'unknown';
+  return image && !unsure ? 'image' : 'unknown';
+}
+/**
+ * grype's flags that take a value, and its flags that don't
+ * (https://github.com/anchore/grype/blob/main/cmd/grype/cli/options/grype.go and the root flags -c/--config, --profile,
+ * -v, -q).
+ */
+const SCAN_VALUE_FLAGS: ReadonlySet<string> = new Set(['-s', '--scope', '-o', '--output', '--file', '--name', '--distro', '-t', '--template', '-f', '--fail-on',
+  '--ignore-states', '--exclude', '--platform', '--from', '--vex', '-c', '--config', '--profile', '--sort-by']);
+const SCAN_BOOLEAN_FLAGS: ReadonlySet<string> = new Set(['--add-cpes-if-none', '--only-fixed', '--only-notfixed', '--by-cve', '--show-suppressed', '-v', '-vv',
+  '-vvv', '--verbose', '-q', '--quiet']);
+/** A word that could be a scan target: an image reference or scheme, a folder scheme, or a path. */
+function targetLike(w: string): boolean {
+  if (w.length > 512 || !regexSafe(w)) return false;
+  const lower = w.toLowerCase();
+  return IMAGE_SCHEMES.some((x) => lower.startsWith(x)) || FOLDER_SCHEMES.some((x) => lower.startsWith(x)) || imageRef(w) || w.startsWith('.') || w.startsWith('/')
+    || w.startsWith('~') || w.includes('\\');
 }
 
 // ---------- own scripts read from package.json (Task 5) ----------

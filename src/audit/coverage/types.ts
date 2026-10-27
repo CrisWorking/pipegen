@@ -14,6 +14,8 @@ export interface Compiled {
   byFirstWord: Map<string, CommandRule[]>; byPath: Map<string, CommandRule[]>; actions: ActionRule[];
   /** Plan P Task 3: `owner/repo/.github/workflows/<file>` (lowercase) → the tools a job-level `uses:` of it runs. */
   reusable: Map<string, ToolSignature[]>;
+  /** Fix round 1 (P8): every signature's softEnv names, looked for once per job. */
+  softEnv: readonly string[];
   /** `hookRepoKey(repo, id)` → the tools a pre-commit hook of that repo and id runs (Task 5). */
   hooks: Map<string, ToolSignature[]>;
   /** The hook repos listed in `precommitHooks` (normalised by hookRepo): pipegen knows what their hooks run. */
@@ -26,7 +28,9 @@ export type Reason = 'continue' | 'suppressed' | 'function' | 'soft' | 'inputs' 
   // Plan P Task 3: an action this repo can't use (availability), an action not set up for the check (requireInputs),
   // egress control missing from some release jobs (PB5), a scan target pipegen can't place (imageArg), a command with
   // more words than pipegen reads
-  | 'unavailable' | 'needs-inputs' | 'some-jobs' | 'target' | 'long';
+  | 'unavailable' | 'needs-inputs' | 'some-jobs' | 'target' | 'long'
+  // fix round 1: a config file or env var that can turn the check off (P8); an egress step on a runner it can't guard
+  | 'config' | 'runner';
 
 export type Manager = NonNullable<RepoProfile['precommit']>;
 export type CiLayer = Exclude<Layer, 'pre-commit'>;
@@ -53,7 +57,14 @@ export interface Found {
   hookRun?: boolean;
   /** Plan P Task 3 (PS14): a pre-commit formatter hook that writes files or checks them, so a CI `pre-commit run` fails on a change. */
   formats?: boolean;
+  /** Fix round 1 (P8): the tool's softEnv names and the config files it loads (none when its config flag turned them off). */
+  softEnv?: readonly string[];
+  configFiles?: readonly string[];
+  /** Fix round 1: the job env a CI `pre-commit run` sees, so the hooks' tools carried there check their softEnv against it. */
+  jobEnv?: JobEnv;
 }
+/** Fix round 1 (P8): the softEnv names set in a job (`all`: an `env:` given as one expression could set any). */
+export interface JobEnv { all: boolean; names: ReadonlySet<string> }
 export interface Hit {
   opaque: boolean;
   categories: readonly string[];
@@ -68,6 +79,9 @@ export interface Hit {
   hookRun?: boolean;
   /** Plan P Task 3 (PB5): found in a local composite action's later step, so not the first step of its job. */
   laterStep?: boolean;
+  /** Fix round 1: config files the tool loads by itself (checked for after the walk), and a CI pre-commit run's job env. */
+  configFiles?: readonly string[];
+  jobEnv?: JobEnv;
 }
 
 export interface Budget { visits: number; bytes: number; truncated: boolean }
@@ -88,5 +102,11 @@ export interface Ctx {
   globWork: number;
   /** Plan P Task 3: what GitHub allows here (MapCoverageOptions.capabilities); absent = no code scanning. */
   caps?: Capabilities;
+  /**
+   * Fix round 1 (P8, concern 2): every job of every release workflow (its first-step hit range and `where`), and whether
+   * some release workflow couldn't be walked in full. Egress is decided over all of them.
+   */
+  releaseJobs: { start: number; first: number; where: string }[];
+  releaseUnread: boolean;
   precommitConfig?: Promise<{ readable: boolean; found: Found[] }>;
 }

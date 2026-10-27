@@ -11,6 +11,9 @@ import type { Compiled, Ctx, Found, Reason } from './types.js';
 
 // ---------- own scripts read from package.json (Task 5) ----------
 
+/** Fix round 1 (P8): a script's tool keeps its softEnv names and config files, so the job's env and files reach it. */
+const carriedConfig = (g: Found) => ({ ...(g.softEnv === undefined ? {} : { softEnv: g.softEnv }), ...(g.configFiles === undefined ? {} : { configFiles: g.configFiles }) });
+
 /** Plan P Task 3 (PS11): the own-script categories a by-name script (test, lint) also counts for through its text. */
 const PLAN_P_SCRIPT_CATEGORIES: ReadonlySet<string> = new Set(['format', 'type-check', 'coverage', 'dead-code', 'duplication']);
 
@@ -48,7 +51,7 @@ async function scriptRuns(ctx: Ctx, dir: string, name: string): Promise<Found[]>
   ctx.scriptMemo.set(key, []); // being worked out: a script that calls itself (directly or not) adds nothing
   const text = (await packageScripts(ctx, dir))?.get(name);
   if (text === undefined) return [];
-  const inner = gated(await resolveScripts(ctx, scanShell(text, dir, ctx.sigs, ctx.budget, NPM_SCRIPT_SHELL)), gateOf([text], []));
+  const inner = gated(await resolveScripts(ctx, scanShell(text, dir, ctx.sigs, ctx.budget, NPM_SCRIPT_SHELL)), gateOf([text], [], undefined, ctx.sigs.softEnv));
   const out = inner.flatMap((g) => {
     const categories = g.categories.filter((x) => SCRIPT_CATEGORIES.has(x.startsWith(UNKNOWN_PREFIX) ? x.slice(UNKNOWN_PREFIX.length) : x));
     return categories.length === 0 ? [] : [{ ...g, categories, hookRun: false }];
@@ -77,7 +80,7 @@ export async function resolveScripts(ctx: Ctx, found: Found[]): Promise<Found[]>
           if (extra.length > 0) {
             out.push({
               categories: extra, by: f.by, subject: f.subject, dir: g.dir, reason: f.reason ?? g.reason,
-              ...(f.reason === null && g.partialWhy !== undefined ? { partialWhy: g.partialWhy } : {}),
+              ...(f.reason === null && g.partialWhy !== undefined ? { partialWhy: g.partialWhy } : {}), ...carriedConfig(g),
             });
           }
         }
@@ -98,7 +101,7 @@ export async function resolveScripts(ctx: Ctx, found: Found[]): Promise<Found[]>
       out.push({ // the script's own `cd` counts: `cd api && jest` tests the api service only
         categories: g.categories, by: f.by, subject: f.subject, dir: g.dir, reason: f.reason ?? g.reason,
         ...(f.reason === null && g.partialWhy !== undefined ? { partialWhy: g.partialWhy } : {}),
-        ...(g.envGate === undefined ? {} : { envGate: g.envGate }),
+        ...(g.envGate === undefined ? {} : { envGate: g.envGate }), ...carriedConfig(g),
       });
     }
   }
