@@ -144,11 +144,35 @@ describe('cooldown: npm lockfile', () => {
     await expect(run(base, { 'package-lock.json': '{ nope SECRET' }, router({}))).rejects.toThrow(/not valid JSON/);
   });
 
-  it('skips workspace links and local paths without a lookup', async () => {
+  it('skips a declared workspace and its link without a lookup', async () => {
     const calls: string[] = [];
     const text = JSON.stringify({ lockfileVersion: 3, packages: { '': {}, 'packages/app': { version: '1.0.0' }, 'node_modules/app': { resolved: 'packages/app', link: true } } });
-    expect((await run({}, { 'package-lock.json': text }, router({}, calls))).ok).toBe(true);
+    const pkg = JSON.stringify({ workspaces: ['packages/*'] });
+    expect((await run({}, { 'package-lock.json': text, 'package.json': pkg }, router({}, calls))).ok).toBe(true);
+    expect((await run({}, { 'package-lock.json': text, 'package.json': JSON.stringify({ workspaces: { packages: ['packages/app'] } }) }, router({}, calls))).ok).toBe(true);
     expect(calls).toEqual([]);
+  });
+
+  it('R-P2: a path key or link that is not a declared workspace, or has a remote resolved or integrity, fails', async () => {
+    const mk = (packages: Record<string, unknown>) => JSON.stringify({ lockfileVersion: 3, packages: { '': {}, ...packages } });
+    const pkg = JSON.stringify({ workspaces: ['packages/*'] });
+    const cases: Record<string, unknown>[] = [
+      { 'packages/app': { version: '1.0.0' } }, // declared by pkg, so this one passes
+      { 'evil/app': { version: '1.0.0' } },
+      { 'node_modules/app': { resolved: 'evil/dir', link: true } },
+      { 'node_modules/app': { resolved: '../outside', link: true } },
+      { 'packages/app': { version: '1.0.0', resolved: 'https://evil.example/x.tgz', integrity: 'sha512-X' } },
+      { 'packages/app': { version: '1.0.0', integrity: 'sha512-X' } },
+      { 'node_modules/app': { resolved: 'https://evil.example/x.tgz', link: true } },
+    ];
+    expect((await run({}, { 'package-lock.json': mk(cases[0] as Record<string, unknown>), 'package.json': pkg }, router({}))).ok).toBe(true);
+    for (const c of cases.slice(1)) {
+      const r = await run({}, { 'package-lock.json': mk(c), 'package.json': pkg }, router({}));
+      expect(r.ok, JSON.stringify(c)).toBe(false);
+      expect(problems(r)).toContain('workspace');
+    }
+    // with no workspaces declared at all, even packages/app fails
+    expect((await run({}, { 'package-lock.json': mk(cases[0] as Record<string, unknown>), 'package.json': '{}' }, router({}))).ok).toBe(false);
   });
 });
 
@@ -159,9 +183,10 @@ const action = (version: string, sha: string, extra = ''): string => `  - id: a
     step: { action: { uses: "o/r@${sha}", with: {} } }
 ${extra}`;
 const gh = (path: string): string => `https://api.github.com/repos/${path}`;
-const actionRoutes = (tag: string, sha: string, published: string, type = 'commit'): Routes => ({
-  [gh(`o/r/git/ref/tags/${tag}`)]: { object: { type, sha } },
-  [gh(`o/r/releases/tags/${tag}`)]: { published_at: published },
+const actionRoutes = (tag: string, sha: string, published: string, committed = daysAgo(900)): Routes => ({
+  [gh(`o/r/git/ref/tags/${tag}`)]: { object: { type: 'commit', sha } },
+  [gh(`o/r/releases/tags/${tag}`)]: { published_at: published, tag_name: tag, target_commitish: 'main' },
+  [gh(`o/r/git/commits/${sha}`)]: { committer: { date: committed } },
 });
 
 describe('cooldown: reviewed tools', () => {
@@ -191,9 +216,29 @@ describe('cooldown: reviewed tools', () => {
     const routes: Routes = {
       [gh('o/r/git/ref/tags/v2')]: { object: { type: 'tag', sha: 'f'.repeat(40) } },
       [gh(`o/r/git/tags/${'f'.repeat(40)}`)]: { object: { type: 'commit', sha: SHA2 } },
-      [gh('o/r/releases/tags/v2')]: { published_at: daysAgo(30) },
+      [gh('o/r/releases/tags/v2')]: { published_at: daysAgo(30), tag_name: 'v2' },
+      [gh(`o/r/git/commits/${SHA2}`)]: { committer: { date: daysAgo(40) } },
     };
-    expect((await run({}, { 'data/reviewed-tools.yml': rtFile(action('v2', SHA2)) }, router(routes))).ok).toBe(true);
+    const head = { 'data/reviewed-tools.yml': rtFile(action('v2', SHA2)) };
+    expect((await run({}, head, router(routes))).ok).toBe(false); // the annotated tag has no tagger date
+    routes[gh(`o/r/git/tags/${'f'.repeat(40)}`)] = { object: { type: 'commit', sha: SHA2 }, tagger: { date: daysAgo(35) } };
+    expect((await run({}, head, router(routes))).ok).toBe(true);
+    routes[gh(`o/r/git/tags/${'f'.repeat(40)}`)] = { object: { type: 'commit', sha: SHA2 }, tagger: { date: daysAgo(1) } };
+    expect(problems(await run({}, head, router(routes)))).toContain('days old');
+  });
+
+  it('R-P2: an action is dated by the youngest of release, commit and tag dates; a missing date or a mismatching release fails', async () => {
+    const head = { 'data/reviewed-tools.yml': rtFile(action('v2', SHA2)) };
+    expect(problems(await run({}, head, router(actionRoutes('v2', SHA2, daysAgo(30), daysAgo(2)))))).toContain('days old'); // young commit, old release
+    expect((await run({}, head, router(actionRoutes('v2', SHA2, daysAgo(30), daysAgo(20))))).ok).toBe(true);
+    const noCommitDate = { ...actionRoutes('v2', SHA2, daysAgo(30)), [gh(`o/r/git/commits/${SHA2}`)]: { committer: {} } };
+    expect(problems(await run({}, head, router(noCommitDate)))).toContain('missing');
+    const wrongTag = actionRoutes('v2', SHA2, daysAgo(30));
+    wrongTag[gh('o/r/releases/tags/v2')] = { published_at: daysAgo(30), tag_name: 'v3' };
+    expect(problems(await run({}, head, router(wrongTag)))).toContain('not for this tag');
+    const moved = actionRoutes('v2', SHA2, daysAgo(30));
+    moved[gh('o/r/releases/tags/v2')] = { published_at: daysAgo(30), tag_name: 'v2', target_commitish: SHA };
+    expect(problems(await run({}, head, router(moved)))).toContain('target commit');
   });
 
   it('no upstream date fails: a missing release is a 404, never a fallback to the recorded date', async () => {
@@ -219,10 +264,10 @@ describe('cooldown: reviewed tools', () => {
     candidate: { id: t, kind: cli, repo: o/r, version: "${version}", pin: { checksum: "${checksum}" } }
     step: { cli: { install: { method: github-release, package: "${pkg}", version: "${version}" }, command: [] } }
 ${extra}`;
-  const rel = (tag: string, published: string, digest: string | undefined, name = 'tool.tar.gz') => ({
+  const rel = (tag: string, published: string, digest: string | undefined, name = 'tool.tar.gz', created = daysAgo(900), updated = daysAgo(900)) => ({
     [gh(`o/r/releases/tags/${tag}`)]: {
       published_at: published,
-      assets: [{ name, ...(digest ? { digest: `sha256:${digest}` } : {}), browser_download_url: `https://github.com/o/r/releases/download/${tag}/${name}` }],
+      assets: [{ name, created_at: created, updated_at: updated, ...(digest ? { digest: `sha256:${digest}` } : {}), browser_download_url: `https://github.com/o/r/releases/download/${tag}/${name}` }],
     },
   });
 
@@ -233,6 +278,16 @@ ${extra}`;
     expect(problems(await run({}, head, router(rel('v1', daysAgo(30), HEX2))))).toContain('differs');
     expect(problems(await run({}, head, router(rel('v1', daysAgo(30), undefined))))).toContain('needs owner review');
     expect(problems(await run({}, head, router(rel('v1', daysAgo(30), HEX, 'other.tar.gz'))))).toContain('not in the GitHub release');
+  });
+
+  it('R-P2: a release binary is dated by the youngest of published_at and the asset created_at/updated_at; a missing one fails', async () => {
+    const head = { 'data/reviewed-tools.yml': rtFile(cli(HEX)) };
+    expect(problems(await run({}, head, router(rel('v1', daysAgo(30), HEX, 'tool.tar.gz', daysAgo(2)))))).toContain('days old');
+    expect(problems(await run({}, head, router(rel('v1', daysAgo(30), HEX, 'tool.tar.gz', daysAgo(40), daysAgo(1)))))).toContain('days old');
+    expect((await run({}, head, router(rel('v1', daysAgo(30), HEX, 'tool.tar.gz', daysAgo(40), daysAgo(20))))).ok).toBe(true);
+    const r = rel('v1', daysAgo(30), HEX);
+    delete ((r[gh('o/r/releases/tags/v1')].assets as Array<Record<string, unknown>>)[0] as Record<string, unknown>).updated_at;
+    expect(problems(await run({}, head, router(r)))).toContain('missing');
   });
 
   const docker = (digest: string): string => `  - id: z
@@ -291,7 +346,7 @@ describe('cooldown: pinned binaries', () => {
       archiveSha256: ${over.sha ?? HEX}
 `;
   const rel = (published: string, digest = HEX) => ({
-    [gh('o/r/releases/tags/v1')]: { published_at: published, assets: [{ name: 'g.tgz', digest: `sha256:${digest}`, browser_download_url: 'https://github.com/o/r/releases/download/v1/g.tgz' }] },
+    [gh('o/r/releases/tags/v1')]: { published_at: published, assets: [{ name: 'g.tgz', created_at: daysAgo(900), updated_at: daysAgo(900), digest: `sha256:${digest}`, browser_download_url: 'https://github.com/o/r/releases/download/v1/g.tgz' }] },
   });
 
   it('checks a changed pinned binary against its GitHub release; a review-only edit is ignored', async () => {

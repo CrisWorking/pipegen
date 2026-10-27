@@ -27,7 +27,7 @@ export const MAX_BODY_BYTES = 32 * 1024 * 1024;
 const DAY_MS = 86_400_000;
 const CONCURRENCY = 6;
 
-export const WATCHED_FILES = ['package-lock.json', 'data/reviewed-tools.yml', 'data/pinned-binaries.yml'] as const;
+export const WATCHED_FILES = ['package.json', 'package-lock.json', 'data/reviewed-tools.yml', 'data/pinned-binaries.yml'] as const;
 /** File contents by repo-relative path; a missing file is absent or null. */
 export type Files = Partial<Record<string, string | null>>;
 
@@ -122,15 +122,51 @@ export function lockfileProblem(text: string | null | undefined): string | undef
   return undefined;
 }
 
-/** Entries of a package-lock.json. Workspace links and local paths are skipped. */
-export function lockEntries(text: string | null | undefined): LockEntry[] {
+/** The `workspaces` globs of a root package.json (array form or `{ packages }`). */
+export function workspaceGlobs(pkgJson: string | null | undefined): string[] {
+  if (!pkgJson) return [];
+  let v: unknown;
+  try {
+    v = JSON.parse(pkgJson);
+  } catch {
+    throw new FileError('package.json is not valid JSON');
+  }
+  const w = isObj(v) ? v.workspaces : undefined;
+  const list = Array.isArray(w) ? w : isObj(w) && Array.isArray(w.packages) ? w.packages : [];
+  return list.filter((x): x is string => typeof x === 'string').map((g) => g.replace(/^\.\//, '').replace(/\/+$/, ''));
+}
+
+function isWorkspacePath(path: string, globs: readonly string[]): boolean {
+  const p = path.replace(/^\.\//, '').replace(/\/+$/, '');
+  if (p === '' || p.startsWith('/') || p.split('/').includes('..')) return false;
+  return globs.some((g) => {
+    const re = g.split('**').map((part) => part.split('*').map((x) => x.replace(/[.+?^${}()|[\]\\]/g, '\\$&')).join('[^/]+')).join('.+');
+    return new RegExp(`^${re}$`).test(p);
+  });
+}
+
+const REMOTE = /^[a-z][a-z0-9+.-]*:\/\//i;
+
+/**
+ * Entries of a package-lock.json. A key outside node_modules/, or a `link: true` entry, is skipped only when it is
+ * a workspace declared in the root package.json and has no remote `resolved` and no `integrity`; any other such
+ * entry is returned with `bad` set, so it fails.
+ */
+export function lockEntries(text: string | null | undefined, workspaces: readonly string[] = []): LockEntry[] {
   if (!text || lockfileProblem(text)) return [];
   const packages = (parseLock(text).packages ?? {}) as Obj;
   const out: LockEntry[] = [];
   for (const [path, entry] of Object.entries(packages)) {
-    if (path === '' || !isObj(entry) || entry.link === true) continue;
+    if (path === '' || !isObj(entry)) continue;
     const idx = path.lastIndexOf('node_modules/');
-    if (idx < 0) continue; // a workspace member by path
+    if (idx < 0 || entry.link === true) {
+      // A workspace member (by path), or a link to one.
+      const target = entry.link === true ? str(entry.resolved) : path;
+      const remote = REMOTE.test(str(entry.resolved) ?? '') || entry.integrity !== undefined;
+      if (target !== undefined && !remote && isWorkspacePath(target, workspaces)) continue;
+      out.push({ name: path, version: str(entry.version) ?? '', resolved: str(entry.resolved), integrity: str(entry.integrity), bad: 'a lockfile key outside node_modules/ or a link that is not a declared workspace (root package.json `workspaces`) with a local path' });
+      continue;
+    }
     const pathName = path.slice(idx + 'node_modules/'.length);
     const version = str(entry.version) ?? '';
     const resolved = str(entry.resolved);
@@ -151,11 +187,11 @@ export function lockEntries(text: string | null | undefined): LockEntry[] {
 const entryKey = (e: LockEntry): string => [e.name, e.version, e.resolved ?? '', e.integrity ?? ''].join('\0');
 
 /** Entries in head that base didn't have: a new version, or the same version with another tarball or integrity. */
-export function changedLockEntries(base: string | null | undefined, head: string | null | undefined): LockEntry[] {
-  const before = new Set(lockEntries(base).map(entryKey));
+export function changedLockEntries(base: string | null | undefined, head: string | null | undefined, baseWs: readonly string[] = [], headWs: readonly string[] = []): LockEntry[] {
+  const before = new Set(lockEntries(base, baseWs).map(entryKey));
   const seen = new Set<string>();
   const out: LockEntry[] = [];
-  for (const e of lockEntries(head).sort((a, b) => a.name.localeCompare(b.name) || a.version.localeCompare(b.version))) {
+  for (const e of lockEntries(head, headWs).sort((a, b) => a.name.localeCompare(b.name) || a.version.localeCompare(b.version))) {
     const k = entryKey(e);
     if (before.has(k) || seen.has(k)) continue;
     seen.add(k);
@@ -338,9 +374,16 @@ async function assetOutcome(ctx: Ctx, repo: string, tag: string, asset: string, 
     const theirs = sha256Of(hit.digest);
     if (!theirs) return fail('GitHub records no digest for this asset; needs owner review');
     if (theirs !== want) return fail('pinned sha256 differs from the digest of the release asset');
-    const date = str(rel.published_at);
-    return date ? { date } : fail('release has no published_at');
+    // The youngest of the release date and the asset's own created_at / updated_at counts; any one missing fails.
+    return youngest([rel.published_at, hit.created_at, hit.updated_at], 'release published_at, asset created_at and updated_at');
   });
+}
+
+/** The youngest of the dates (all must be readable ISO strings), or a failure. */
+function youngest(dates: unknown[], what: string): Outcome {
+  const ok = dates.map(str).filter((d): d is string => d !== undefined && ISO.test(d) && !Number.isNaN(Date.parse(d)));
+  if (ok.length !== dates.length) return fail(`a date is missing or unreadable (needs ${what})`);
+  return { date: ok.reduce((a, b) => (Date.parse(b) > Date.parse(a) ? b : a)) };
 }
 
 /** An action: the pinned SHA must be the commit its tag points to; date = the tag's release published_at. */
@@ -354,15 +397,25 @@ async function actionOutcome(ctx: Ctx, uses: string | undefined, repo: string | 
     if (!r || !t) return fail('repo or tag name is not a plain name');
     let ref = await ctx.get(`https://api.github.com/repos/${r}/git/ref/tags/${t}`, ctx.gh);
     let obj = isObj(ref) && isObj(ref.object) ? ref.object : {};
+    let taggerDate: unknown = 'none';
     for (let hops = 0; obj.type === 'tag' && hops < 3; hops++) {
       ref = await ctx.get(`https://api.github.com/repos/${r}/git/tags/${encodeURIComponent(String(obj.sha))}`, ctx.gh);
+      const tagger = isObj(ref) && isObj(ref.tagger) ? ref.tagger.date : undefined;
+      if (taggerDate === 'none' || (str(tagger) && Date.parse(String(tagger)) > Date.parse(String(taggerDate)))) taggerDate = tagger;
       obj = isObj(ref) && isObj(ref.object) ? ref.object : {};
     }
     if (obj.type !== 'commit' || obj.sha !== sha) return fail('the pinned sha is not the commit of this tag');
     const got = await releaseOf(ctx, repo, tag);
     if ('problem' in got) return got;
-    const date = str(got.rel.published_at);
-    return date ? { date } : fail('release has no published_at');
+    const release = got.rel;
+    if (release.tag_name !== tag) return fail('the release is not for this tag');
+    const target = str(release.target_commitish);
+    if (target && /^[0-9a-f]{40}$/.test(target) && target !== sha) return fail('the release target commit is not the pinned sha');
+    const commit = await ctx.get(`https://api.github.com/repos/${r}/git/commits/${sha}`, ctx.gh);
+    const committed = isObj(commit) && isObj(commit.committer) ? commit.committer.date : undefined;
+    const dates: unknown[] = [release.published_at, committed];
+    if (taggerDate !== 'none') dates.push(taggerDate);
+    return youngest(dates, 'release published_at, commit committer date and (annotated tags) tagger date');
   });
 }
 
@@ -513,7 +566,7 @@ export async function runCooldown(opts: CooldownOptions): Promise<CooldownResult
 
   type Job = { kind: Finding['kind']; name: string; version: string; run: () => Promise<Outcome> };
   const jobs: Job[] = [];
-  for (const e of changedLockEntries(baseLock, headLock)) {
+  for (const e of changedLockEntries(baseLock, headLock, workspaceGlobs(base['package.json']), workspaceGlobs(head['package.json']))) {
     jobs.push({
       kind: 'npm', name: e.name, version: e.version,
       run: async () => (e.bad ? fail(e.bad) : !e.resolved ? fail('entry has no resolved tarball') : npmOutcome(ctx, e.name, e.version, e.integrity, e.resolved)),
