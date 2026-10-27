@@ -64,6 +64,17 @@ describe('limits', () => {
     expect(() => parseYamlLimited('base: &a [1]\nlist:\n' + refs(60))).toThrow(/alias/i);
   });
 
+  it('yaml duplicate keys are still refused, and a map with many keys parses in linear time', () => {
+    expect(() => parseYamlLimited('a: 1\nb: 2\na: 3\n')).toThrow(/unique|duplicate/i);
+    expect(() => parseYamlLimited('x: {a: 1, a: 2}\n')).toThrow(/unique|duplicate/i);
+    expect(parseYamlLimited('a: 1\nA: 2\n')).toEqual({ a: 1, A: 2 });
+    // 30,000 distinct keys in one map (about 0.9 MB): yaml's own duplicate check compares every pair (minutes of work)
+    const keys = Array.from({ length: 30_000 }, (_, i) => `k${i}: 1`).join('\n');
+    const t = performance.now();
+    expect(Object.keys(parseYamlLimited(`m:\n${keys.replace(/^/gm, '  ')}\n`) as { m: object }).length).toBe(1);
+    expect(performance.now() - t).toBeLessThan(2000);
+  });
+
   it('regex rules skip lines longer than 4 KB', () => {
     const long = 'x'.repeat(READ_LIMITS.maxRegexLineBytes + 1);
     const exact = 'y'.repeat(READ_LIMITS.maxRegexLineBytes);

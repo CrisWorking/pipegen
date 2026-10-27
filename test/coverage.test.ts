@@ -721,6 +721,77 @@ describe('mapCoverage (fix round 3)', () => {
   });
 });
 
+describe('mapCoverage (fix round 4)', () => {
+  const step = (script: string) => `${both}${job(`      - run: |\n${script.split('\n').map((l) => `          ${l}`).join('\n')}\n`)}`;
+  const cases: [string, string, Coverage['status']][] = [
+    // R1: a `}` straight after done / fi / esac closes the group
+    ['{ for …; done } || true', '{ for x in a; do gitleaks detect; done } || true', 'partial'],
+    ['{ if …; fi } || true', '{ if true; then gitleaks detect; fi } || true', 'partial'],
+    ['{ case …; esac } || true', '{ case x in x) gitleaks detect;; esac } || true', 'partial'],
+    // A compound command takes on what follows it, as a group does
+    ['for …; done || true', 'for x in a; do gitleaks detect; done || true', 'partial'],
+    ['if …; fi || true', 'if true; then gitleaks detect; fi || true', 'partial'],
+    ['case …; esac || true', 'case x in (x|y) gitleaks detect;; esac || true', 'partial'],
+    ['for …; done | tee (no pipefail)', 'for x in a; do gitleaks detect; done | tee out', 'partial'],
+    ['for …; done & (background)', 'for x in a; do gitleaks detect; done &\nwait', 'partial'],
+    ['if …; fi && echo, not the last list', 'if true; then gitleaks detect; fi && echo ok\necho next', 'partial'],
+    ['a multi-line if body still blocks', 'if true; then\n  gitleaks detect\nfi\necho next', 'covered'],
+    ['a for body still blocks', 'for x in a; do gitleaks detect; done\necho next', 'covered'],
+    // case arms: a pattern is not a command; the arm's body is
+    ['a case arm body blocks', 'case "$E" in\n  push) gitleaks detect ;;\nesac\necho done', 'covered'],
+    ['a case pattern is not a command', 'case "$1" in\n  a) echo ;;\n  gitleaks) echo hi ;;\nesac', 'missing'],
+    ['a reserved word in argument position is a plain word', 'if x; then gitleaks detect; echo then if; fi || true', 'partial'],
+    ['a function whose body is a for loop', 'f() for x in a; do gitleaks detect; done\necho next', 'partial'],
+    // bash reads this `}` as an argument of echo, so the group ends on the next line and the tool's failure stops the step
+    ['a } after $( … ) is an argument', '{ gitleaks detect; echo $(date) } || true\n}', 'covered'],
+    // R3: << inside $(( … )) or (( … )) is a shift, not a here-document
+    ['$(( 1 << 2 )) inside a group || true', '{\n  gitleaks detect\n  echo $((1 << 2))\n} || true', 'partial'],
+    ['(( x <<= 1 )), then tool || true', '(( x <<= 1 ))\ngitleaks detect || true', 'partial'],
+    ['for (( … << … )), then tool || true', 'for ((i = 1 << 2; i < 9; i++)); do :; done\ngitleaks detect || true', 'partial'],
+    ['$(( ( … ) << … )), then tool || true', 'x=$(( (1 + 2) << 3 ))\ngitleaks detect || true', 'partial'],
+    ['a here-doc after arithmetic is still a here-doc', 'echo $((1 << 2))\ncat <<EOF\ngitleaks detect\nEOF', 'missing'],
+    ['a $( … ) inside arithmetic is a command again', 'echo $(( $(echo ")") ))\ngitleaks detect || true', 'partial'],
+  ];
+  for (const [label, script, want] of cases) {
+    it(`coverage: round 4: ${label} → ${want}`, async () => {
+      expect((await one(step(script), 'push', 'secrets')).status).toBe(want);
+    });
+  }
+
+  const trivy = (lines: string[]) => `${both}${job(`      - uses: aquasecurity/trivy-action@0.28.0\n        with:\n${lines.map((l) => `          ${l}\n`).join('')}`)}`;
+  /** n distinct spellings of a 16-letter name that differ only in case. */
+  const spellings = (n: number) => Array.from({ length: n }, (_, i) => Array.from('abcdefghijklmnop', (ch, b) => ((i >> b) & 1 ? ch.toUpperCase() : ch)).join(''));
+
+  it('coverage: round 4: more spellings of one input than pipegen keeps → partial, never covered', async () => {
+    // exit-code has 9 letters: 2^9 case spellings; each sets the failing value '1'
+    const variants = (n: number) => Array.from({ length: n }, (_, i) => Array.from('exit-code', (ch, b) => ((i >> b) & 1 ? ch.toUpperCase() : ch)).join(''));
+    expect((await one(trivy(variants(8).map((k) => `${k}: '1'`)), 'push', 'deps', {}, 'app')).status).toBe('covered');
+    const r = await one(trivy(variants(9).map((k) => `${k}: '1'`)), 'push', 'deps', {}, 'app');
+    expect(r.status).toBe('partial');
+    expect(r.why).toBe('The trivy check runs, but its step sets more inputs than pipegen reads, so pipegen can\'t tell whether it blocks anything.');
+  });
+
+  it('coverage: round 4: a step with more inputs than pipegen reads → partial, never covered', async () => {
+    const filler = (n: number) => spellings(n).map((k) => `${k}: x`);
+    expect((await one(trivy(["exit-code: '1'", ...filler(255)]), 'push', 'deps', {}, 'app')).status).toBe('covered');
+    const r = await one(trivy(["exit-code: '1'", ...filler(256)]), 'push', 'deps', {}, 'app');
+    expect(r.status).toBe('partial');
+    expect(r.why).toMatch(/sets more inputs than pipegen reads/);
+  });
+
+  it('coverage: round 4: a 30,000-key with: map is read in linear time', async () => {
+    const dir = makeTempDir();
+    wf(dir, 'ci.yml', trivy(["exit-code: '1'", ...spellings(30_000).map((k) => `${k}: 1`)]));
+    const t = performance.now();
+    const p = await profileOf(dir);
+    expect(p.existingWorkflows).toHaveLength(1); // under the 1 MB read limit, so it really is read
+    const r = row(await mapCoverage(p, floorNeeds(p, caps), dir), 'push', 'deps', 'app');
+    const ms = performance.now() - t;
+    expect(r.status).toBe('partial');
+    expect(ms).toBeLessThan(5000);
+  });
+});
+
 describe('loadToolSignatures (S1)', () => {
   it('signatures: the bundled list loads and every entry names actions or commands', () => {
     const list = loadToolSignatures();

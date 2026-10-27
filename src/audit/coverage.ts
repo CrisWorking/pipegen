@@ -10,15 +10,19 @@
 //   leaves out feature branches, a paths filter), or a run whose failure can't fail the step:
 //   - continue-on-error;
 //   - shell: a `||` after it (unless the right side is `exit <non-zero>` or `false`), also for a `{ …; }` or `( … )`
-//     group before the `||`; a `&&` after it outside the step's last list (bash -e ignores those); a pipe stage other
-//     than the last without pipefail (the default shell and `shell: sh` have none; `shell: bash` and `set -o pipefail`
-//     do); a background `&`; an `if`/`while`/`until` condition or `!`; `$( … )` or backticks other than `VAR=$( … )`;
-//     a shell function body (it runs only where called); errexit off (`set +e`, or a custom `shell:` without -e such as
-//     `bash {0}`, pwsh or python; a Windows `runs-on` without `shell:` means pwsh) unless it is in the step's last list.
-//     `set` and `cd` inside `( … )` end with the subshell;
+//     group or a compound command (if … fi, for/while/until/select … done, case … esac) before the `||`: a group and a
+//     compound command take on what follows them; a `&&` after it outside the step's last list (bash -e ignores
+//     those); a pipe stage other than the last without pipefail (the default shell and `shell: sh` have none;
+//     `shell: bash` and `set -o pipefail` do); a background `&`; an `if`/`while`/`until` condition or `!`; `$( … )` or
+//     backticks other than `VAR=$( … )`; a shell function body, whatever compound command it is (it runs only where
+//     called); errexit off (`set +e`, or a custom `shell:` without -e such as `bash {0}`, pwsh or python; a Windows
+//     `runs-on` without `shell:` means pwsh) unless it is in the step's last list. `set` and `cd` inside `( … )` end
+//     with the subshell;
 //   - a soft-fail flag or input (also inside `args` / `cmd_options` / `options` inputs), a tool that only fails when
 //     told to (trivy, grype, semgrep scan, the trufflehog CLI, the ZAP actions) or never fails (CodeQL U5, the bandit
 //     action);
+//   - more `with:` inputs than pipegen reads: over MAX_INPUT_KEYS keys in the step, or over MAX_SPELLINGS spellings
+//     (differing only in case) of an input the tool reads;
 //   - a job or step `if:` other than always(), success(), !cancelled() and a guard naming this repo.
 //   A need that is not blocking (format-lint) only cares whether the tool runs.
 // - unknown: a remote reusable workflow, an action from the repo owner's own account (likely a composite action), a
@@ -27,8 +31,9 @@
 // - missing: nothing matches. `gate` and `deploy-verify` are always missing: they are pipegen's own checks.
 // A tool counts only where a command starts: at the start, after ; && || | & ( $( { a newline, a shell keyword or a
 // wrapper (npx, sudo, env, time, command without -v, pnpm/yarn dlx, uv run, pipx run, python -m, sh/bash, …), as the
-// basename of a path, or as the image after `docker run [flags]`. Quoted text and here-document bodies never start a
-// command; `2>&1`, `&>` and other redirections are words, not list ends. A version, help or completion call is not a
+// basename of a path, or as the image after `docker run [flags]`. Quoted text, here-document bodies and case patterns
+// never start a command (a case arm's commands do); `2>&1`, `&>` and other redirections are words, not list ends; a
+// `<<` inside `$(( … ))` or `(( … ))` is a shift, not a here-document. A version, help or completion call is not a
 // run. A `run:` step's directory is its working-directory, else the job's or workflow's
 // defaults.run working-directory, then `cd <dir>`; the tool covers only the service under that directory (S26).
 // `uses:` steps, composite actions and called workflows start at the repo root (U3).
@@ -186,6 +191,8 @@ const MAX_WHERE = 300;
 const MAX_DIR = 512;               // a tracked directory longer than this is unknown (a chain of cd's can't grow it)
 const MAX_HITS = 100_000;          // tool and opaque findings kept per mapCoverage call
 const MAX_FLAG_WORDS = 64;         // words after a command read for its flags
+const MAX_INPUT_KEYS = 256;        // `with:` keys read per step; a step with more is partial
+const MAX_SPELLINGS = 8;           // spellings kept per input name (they differ only in case); more counts as soft
 
 // ---------- why (pipegen's own text only) ----------
 
@@ -231,12 +238,13 @@ const LAYER_DONE: Readonly<Record<Exclude<Layer, 'pre-commit'>, string>> = {
 };
 
 /** Why a run that is found can't block anything (or might not run). */
-type Reason = 'continue' | 'suppressed' | 'function' | 'soft' | 'no-fail' | 'never' | 'condition';
+type Reason = 'continue' | 'suppressed' | 'function' | 'soft' | 'inputs' | 'no-fail' | 'never' | 'condition';
 const REASON_WHY: Readonly<Record<Reason, (subject: string, when: string) => string>> = {
   continue: (s) => `${s} runs, but is allowed to fail (continue-on-error), so it can't block anything.`,
   suppressed: (s) => `${s} runs, but its exit code is ignored (by ||, a pipe, an if, set +e, the background & or the step's shell), so it can't block anything.`,
   function: (s) => `${s} runs inside a shell function, so pipegen can't tell whether its failure fails the step.`,
   soft: (s) => `${s} runs, but is set not to fail on findings, so it can't block anything.`,
+  inputs: (s) => `${s} runs, but its step sets more inputs than pipegen reads, so pipegen can't tell whether it blocks anything.`,
   'no-fail': (s) => `${s} runs, but doesn't fail on findings unless told to, so it can't block anything.`,
   never: (s) => `${s} reports findings but doesn't fail the job, so it can't block anything.`,
   condition: (s, when) => `${s} runs only when a condition holds, so it may not run ${when}.`,
@@ -391,12 +399,24 @@ function inputText(v: unknown): string | null {
   return typeof v === 'string' && regexSafe(v) ? v.trim().toLowerCase() : null;
 }
 
-/** Inputs a step sets, by lowercase name. GitHub reads input names case-insensitively and keeps the last spelling; pipegen
- *  keeps every spelling, and a soft value in any of them counts (a failing value must hold in all of them). */
-type Inputs = Map<string, unknown[]>;
+/**
+ * Inputs a step sets, by lowercase name. GitHub reads input names case-insensitively and keeps the last spelling; pipegen
+ * keeps up to MAX_SPELLINGS spellings, and a soft value in any of them counts (a failing value must hold in all of them).
+ * A name with more spellings is `crowded` (it counts as soft for a tool that reads it); a step with more than
+ * MAX_INPUT_KEYS keys is `unread` past them (every tool the step runs is partial). One pass, appending in place.
+ */
+interface Inputs { byName: Map<string, unknown[]>; crowded: Set<string>; unread: boolean }
 function lowerInputs(w: Obj): Inputs {
-  const out: Inputs = new Map();
-  for (const [k, v] of Object.entries(w)) out.set(k.toLowerCase(), [...(out.get(k.toLowerCase()) ?? []), v]);
+  const out: Inputs = { byName: new Map(), crowded: new Set(), unread: false };
+  const keys = Object.keys(w);
+  if (keys.length > MAX_INPUT_KEYS) out.unread = true;
+  for (const k of keys.slice(0, MAX_INPUT_KEYS)) {
+    const name = k.toLowerCase();
+    const all = out.byName.get(name);
+    if (all === undefined) out.byName.set(name, [w[k]]);
+    else if (all.length < MAX_SPELLINGS) all.push(w[k]);
+    else out.crowded.add(name);
+  }
   return out;
 }
 
@@ -410,33 +430,41 @@ function valueListed(v: unknown, values: string[], exprCounts: boolean): boolean
 
 /** Soft check: some spelling of a listed input has a listed value (an expression counts: errs to "can't block"). */
 function softInputGiven(spec: Record<string, string[]> | undefined, w: Inputs): boolean {
-  return Object.entries(spec ?? {}).some(([name, values]) => (w.get(name.toLowerCase()) ?? []).some((v) => valueListed(v, values, true)));
+  return Object.entries(spec ?? {}).some(([name, values]) => (w.byName.get(name.toLowerCase()) ?? []).some((v) => valueListed(v, values, true)));
 }
 
 /** Fail check: a listed input is set, and every spelling of it has a listed value (an expression doesn't count). */
 function failInputGiven(spec: Record<string, string[]> | undefined, w: Inputs): boolean {
   return Object.entries(spec ?? {}).some(([name, values]) => {
-    const all = w.get(name.toLowerCase()) ?? [];
+    const all = w.byName.get(name.toLowerCase()) ?? [];
     return all.length > 0 && all.every((v) => valueListed(v, values, false));
   });
 }
 
 /** Whether some spelling of an input is set (non-empty) to anything but the listed values; an expression counts. */
 function inputSetOtherwise(spec: Record<string, string[]> | undefined, w: Inputs): boolean {
-  return Object.entries(spec ?? {}).some(([name, values]) => (w.get(name.toLowerCase()) ?? []).some((v) => {
+  return Object.entries(spec ?? {}).some(([name, values]) => (w.byName.get(name.toLowerCase()) ?? []).some((v) => {
     const s = inputText(v);
     return s !== null && s !== '' && (s.includes('${{') || !values.includes(s));
   }));
 }
 
 /** Every string value of an input, split into words (bounded). */
-const inputWords = (w: Inputs, name: string) => (w.get(name) ?? []).flatMap((v) =>
+const inputWords = (w: Inputs, name: string) => (w.byName.get(name) ?? []).flatMap((v) =>
   (typeof v === 'string' && regexSafe(v) ? tokenize(v).filter((t) => t.op === null).map((t) => t.w) : [])).slice(0, MAX_FLAG_WORDS);
 
 /** Inputs many actions pass straight to the tool's command line; read for the tool's soft flags. */
 const ARGS_INPUTS = ['args', 'cmd_options', 'options'];
 
+/** Whether an input the tool is read by (its listed inputs, or `names`) has more spellings than pipegen keeps. */
+function inputsCrowded(tool: ToolSignature, w: Inputs, names: readonly string[]): boolean {
+  if (w.crowded.size === 0) return false;
+  const listed = [tool.softInputs, tool.softUnless, tool.failInputs].flatMap((spec) => Object.keys(spec ?? {}));
+  return [...listed, ...names].some((name) => w.crowded.has(name.toLowerCase()));
+}
+
 function actionReason(tool: ToolSignature, w: Inputs): Reason | null {
+  if (inputsCrowded(tool, w, ARGS_INPUTS)) return 'inputs';
   const args = ARGS_INPUTS.flatMap((name) => inputWords(w, name));
   if (softInputGiven(tool.softInputs, w) || inputSetOtherwise(tool.softUnless, w) || (tool.softFlags ?? []).some((f) => flagGiven(f, args))) return 'soft';
   if (tool.actionFails === 'never') return 'never';
@@ -469,16 +497,32 @@ function shellMode(v: unknown): ShellMode {
   return { errexit: e, pipefail: prog === 'bash' && parts.includes('pipefail') };
 }
 
-/** One shell token: an operator (incl. '\n' between commands) or a word (`w`: quotes and escapes removed). */
-interface Tk { op: string | null; w: string }
+/**
+ * One shell token: an operator (incl. '\n' between commands) or a word (`w`: quotes and escapes removed). `kw` marks a
+ * reserved word that opens (if, while, until, for, select, case) or closes (fi, done, esac) a compound command.
+ */
+interface Tk { op: string | null; w: string; kw: 'open' | 'close' | null } // every token has all three (one object shape)
 /** Characters that end a word and are operators of their own (`&` only when not part of a redirection). */
 const BREAK_CHARS = ';|&()`';
 /** After these, a newline doesn't end the command list (`a ||⏎ b`, `{⏎`). */
 const JOINERS = new Set(['&&', '||', '|', '(', '{', '$(', '\n']);
-/** Reserved words after which a `{` still opens a group. */
-const GROUP_AFTER = new Set(['then', 'do', 'else', '!', 'time', 'if', 'elif', 'while', 'until']);
+/** Reserved words bash reads only where a command starts, and where the next word starts a command again ('any'). */
+const LEAD_WORDS: ReadonlyMap<string, Pos> = new Map([['if', 'any'], ['while', 'any'], ['until', 'any'], ['!', 'any'], ['time', 'any'], ['for', 'none'], ['select', 'none'], ['case', 'none']]);
+/** Reserved words bash also reads right after a compound command ends (`} fi`, `done }`). */
+const FOLLOW_WORDS: ReadonlyMap<string, Pos> = new Map([['then', 'any'], ['do', 'any'], ['else', 'any'], ['elif', 'any'], ['fi', 'close'], ['done', 'close'], ['esac', 'close']]);
+const OPEN_KW = new Set(['if', 'while', 'until', 'for', 'select', 'case']);
+const CLOSE_KW = new Set(['fi', 'done', 'esac']);
 const MAX_WORD = READ_LIMITS.maxRegexLineBytes;
 const isBlank = (ch: string | undefined) => ch === undefined || ch === ' ' || ch === '\t' || ch === '\n' || ch === '\r';
+/**
+ * Where the tokenizer is: 'any' = a command can start (every reserved word, `{` and `}` count); 'close' = right after a
+ * compound command or a subshell ended (only `}`, `)` and the FOLLOW_WORDS count); 'none' = inside a command.
+ */
+type Pos = 'any' | 'close' | 'none';
+/** An open parenthesis: a subshell, a `$(` substitution, `$((` / `((` arithmetic, or a parenthesis inside arithmetic. */
+type Paren = 'sub' | 'cmd' | 'arith$' | 'arithcmd' | 'arith';
+/** Inside `case WORD in … esac`: before `in`, at a pattern, or in an arm's commands. */
+type CaseState = 'subject' | 'pattern' | 'body';
 
 /**
  * Shell text → tokens, in one linear pass.
@@ -487,24 +531,30 @@ const isBlank = (ch: string | undefined) => ch === undefined || ch === ' ' || ch
  * - `&` is part of a redirection word after `>`/`<` or before `>` (`2>&1`, `>&2`, `<&0`, `&>`, `&>>`); `|&` is a pipe;
  *   any other single `&` runs the command in the background.
  * - `{` opens a group only where a command starts and when a blank follows it; `}` closes one only where a command
- *   starts (bash reserved words). Elsewhere both are plain characters (`echo {a`, `xargs -I {}`).
+ *   starts or right after a compound command (`done }`, `fi }`, `esac }`, `) }`, `} }`). Elsewhere both are plain
+ *   characters (`echo {a`, `xargs -I {}`). Unquoted reserved words count only where bash reads them.
  * - A backtick substitution `` `…` `` becomes `$(` … `)`.
  * - Here-document bodies (`<<WORD`, `<<-WORD`, quoted or not) are skipped up to the line holding WORD alone; an
- *   unterminated one skips the rest of the text.
+ *   unterminated one skips the rest of the text. Inside `$(( … ))` and `(( … ))` a `<<` is a shift and `#` is not a
+ *   comment.
+ * - In `case … in`, each pattern up to its `)` is skipped and becomes a `;` (the arm's commands follow); `;;`, `;&` and
+ *   `;;&` end an arm.
  * A word longer than MAX_WORD keeps an empty value (it can't name a tool).
  */
 function tokenize(text: string): Tk[] {
   const toks: Tk[] = [];
   const n = text.length;
   let i = 0;
-  let atCmd = true; // where a command could start: `{` / `}` are group brackets here
+  let pos: Pos = 'any';
   let afterFunction = false; // `function name {`: the `{` after the name opens the body
   let inBacktick = false;
   const heredocs: { delim: string; tabs: boolean }[] = [];
   let delimNext: boolean | null = null; // `<< WORD`: the next word is the delimiter (value: strip tabs)
-  const pushOp = (op: string) => {
-    toks.push({ op, w: '' });
-    atCmd = true;
+  const parens: Paren[] = [];
+  const cases: CaseState[] = [];
+  const pushOp = (op: string, after: Pos = 'any') => {
+    toks.push({ op, w: '', kw: null });
+    pos = after;
     afterFunction = false;
   };
   /** Skips the bodies of the here-documents opened on the line that just ended; returns where the text goes on. */
@@ -525,25 +575,71 @@ function tokenize(text: string): Tk[] {
     heredocs.length = 0;
     return at;
   };
+  /** Skips a case pattern (`a|b)`, `(a)`, `@(x|y))`) up to the `)` that ends it; returns the index after that `)`. */
+  const skipPattern = (from: number) => {
+    let j = text[from] === '(' ? from + 1 : from;
+    let depth = 0;
+    while (j < n) {
+      const ch = text[j] as string;
+      if (ch === '\\') j += 2;
+      else if (ch === "'") {
+        const e = text.indexOf("'", j + 1);
+        j = e < 0 ? n : e + 1;
+      } else if (ch === '"') {
+        j++;
+        while (j < n && text[j] !== '"') j += text[j] === '\\' ? 2 : 1;
+        j++;
+      } else if (ch === '(') {
+        depth++;
+        j++;
+      } else if (ch === ')') {
+        if (depth === 0) return j + 1;
+        depth--;
+        j++;
+      } else j++;
+    }
+    return n;
+  };
   while (i < n) {
     const c = text[i] as string;
     const next = text[i + 1];
+    // (length checks first: reading index -1 of an empty array is a slow lookup in V8)
+    const top = parens.length > 0 ? parens[parens.length - 1] : undefined;
+    const arith = top === 'arith$' || top === 'arithcmd' || top === 'arith';
+    const inCase = arith || cases.length === 0 ? undefined : cases[cases.length - 1];
     if (c === '\n') {
       const last = toks[toks.length - 1];
-      if (last !== undefined && !(last.op !== null && JOINERS.has(last.op))) toks.push({ op: '\n', w: '' });
-      atCmd = true;
+      if (last !== undefined && !(last.op !== null && JOINERS.has(last.op))) toks.push({ op: '\n', w: '', kw: null });
+      pos = 'any';
       i = heredocs.length > 0 ? skipHeredocs(i + 1) : i + 1;
     } else if (c === ' ' || c === '\t' || c === '\r') {
       i++;
     } else if (c === '\\' && (next === '\n' || (next === '\r' && text[i + 2] === '\n'))) {
       i += next === '\n' ? 2 : 3;
-    } else if (c === '#') {
+    } else if (c === '#' && !arith) {
       while (i < n && text[i] !== '\n') i++;
+    } else if (inCase === 'pattern') {
+      if (text.startsWith('esac', i) && (isBlank(text[i + 4]) || BREAK_CHARS.includes(text[i + 4] as string))) {
+        cases.pop();
+        toks.push({ op: null, w: 'esac', kw: 'close' });
+        pos = 'close';
+        afterFunction = false;
+        i += 4;
+      } else {
+        i = skipPattern(i);
+        cases[cases.length - 1] = 'body';
+        pushOp(';');
+      }
+    } else if (c === ';' && inCase === 'body' && (next === ';' || next === '&')) { // ;; ;& ;;& end a case arm
+      i += next === ';' && text[i + 2] === '&' ? 3 : 2;
+      cases[cases.length - 1] = 'pattern';
+      pushOp(';');
     } else if (c === '$' && next === '(') {
+      parens.push(text[i + 2] === '(' ? 'arith$' : 'cmd'); // a $( … ) inside arithmetic is a command again
       pushOp('$(');
       i += 2;
     } else if (c === '`') {
-      pushOp(inBacktick ? ')' : '$(');
+      pushOp(inBacktick ? ')' : '$(', inBacktick ? 'none' : 'any');
       inBacktick = !inBacktick;
       i++;
     } else if ((c === '&' || c === '|') && next === c) {
@@ -555,19 +651,31 @@ function tokenize(text: string): Tk[] {
     } else if (c === '&' && next !== '>') {
       pushOp('&');
       i++;
-    } else if (c === ';' || c === '|' || c === '(' || c === ')') {
+    } else if (c === ';' || c === '|') {
       pushOp(c);
       i++;
-    } else if (c === '{' && (atCmd || afterFunction) && isBlank(next)) {
-      pushOp('{');
-      afterFunction = false;
+    } else if (c === '(') {
+      // `((` where a command starts, or after `for`, is arithmetic (bash reads it so first)
+      const prev = toks[toks.length - 1];
+      const arithCmd = next === '(' && (pos === 'any' || (prev !== undefined && prev.kw === 'open' && prev.w === 'for'));
+      parens.push(arith ? 'arith' : arithCmd ? 'arithcmd' : 'sub');
+      pushOp('(');
       i++;
-    } else if (c === '}' && atCmd) {
-      pushOp('}');
+    } else if (c === ')') {
+      const p = parens.pop();
+      const fnParens = toks[toks.length - 1]?.op === '('; // `name()`: a function body (a compound command) follows
+      pushOp(')', fnParens ? 'any' : p === 'cmd' || p === 'arith$' || p === 'arith' ? 'none' : 'close');
+      i++;
+    } else if (c === '{' && (pos === 'any' || afterFunction) && isBlank(next)) {
+      pushOp('{');
+      i++;
+    } else if (c === '}' && pos !== 'none') {
+      pushOp('}', 'close');
       i++;
     } else {
       let w = '';
       let quote = '';
+      let quoted = false;
       let brace = ''; // '}' or '}}' while inside ${…} / ${{ … }}
       const add = (ch: string) => {
         if (w.length <= MAX_WORD) w += ch;
@@ -592,12 +700,14 @@ function tokenize(text: string): Tk[] {
         }
         if (ch === '"' || ch === "'") {
           quote = ch;
+          quoted = true;
           i++;
           continue;
         }
         if (ch === '\\' && i + 1 < n) {
           if (text[i + 1] === '\n') break;
           add(text[i + 1] as string);
+          quoted = true;
           i += 2;
           continue;
         }
@@ -618,14 +728,28 @@ function tokenize(text: string): Tk[] {
         i++;
       }
       const value = w.length > MAX_WORD ? '' : w;
-      toks.push({ op: null, w: value });
-      atCmd = GROUP_AFTER.has(value);
+      const tk: Tk = { op: null, w: value, kw: null };
+      toks.push(tk);
+      // A reserved word counts only unquoted, outside arithmetic, and where bash reads it.
+      const reserved = !quoted && !arith;
+      const at = pos as Pos; // pushOp (a closure) also sets pos, so TypeScript's narrowing doesn't apply here
+      const lead = reserved && at === 'any' ? LEAD_WORDS.get(value) : undefined;
+      const follow = reserved && at !== 'none' ? FOLLOW_WORDS.get(value) : undefined;
+      if (lead !== undefined || follow !== undefined) {
+        if (OPEN_KW.has(value)) tk.kw = 'open';
+        if (CLOSE_KW.has(value)) tk.kw = 'close';
+        if (value === 'case') cases.push('subject');
+        if (value === 'esac' && inCase !== undefined) cases.pop();
+      } else if (reserved && value === 'in' && inCase === 'subject') {
+        cases[cases.length - 1] = 'pattern';
+      }
+      pos = lead ?? follow ?? 'none';
       const prev = toks[toks.length - 2];
       afterFunction = prev !== undefined && prev.op === null && prev.w === 'function'; // this word names the function
       if (delimNext !== null) {
         heredocs.push({ delim: value, tabs: delimNext });
         delimNext = null;
-      } else if (value.startsWith('<<') && !value.startsWith('<<<')) {
+      } else if (!arith && value.startsWith('<<') && !value.startsWith('<<<')) {
         const tabs = value[2] === '-';
         const delim = value.slice(tabs ? 3 : 2);
         if (delim === '') delimNext = tabs;
@@ -712,19 +836,29 @@ function scanShell(text: string, base: string | null, sigs: Compiled, budget: Bu
   const isWord = (k: number) => k >= 0 && k < n && toks[k]!.op === null;
   const word = (k: number) => (isWord(k) ? toks[k]!.w : null);
 
-  // Matching group brackets (forward pass with a stack), so the right-to-left pass knows what a ')' closes.
+  // Matching group brackets (forward pass with a stack), so the right-to-left pass knows what a ')' closes. A compound
+  // command (if … fi, for/while/until/select … done, case … esac) is a group too: fi/done/esac close only a compound
+  // command, and one still open when a ')' or '}' comes stays unmatched (a plain word).
   const opener = new Int32Array(n).fill(-1);
   const closer = new Int32Array(n).fill(-1);
   const open: number[] = [];
+  const pair = (k: number) => {
+    const o = open.pop() as number;
+    opener[k] = o;
+    closer[o] = k;
+  };
   for (let k = 0; k < n; k++) {
-    const op = toks[k]!.op;
-    if (op === '(' || op === '{' || op === '$(') open.push(k);
-    else if ((op === ')' || op === '}') && open.length > 0) {
-      const o = open.pop() as number;
-      opener[k] = o;
-      closer[o] = k;
+    const t = toks[k]!;
+    if (t.op === '(' || t.op === '{' || t.op === '$(' || t.kw === 'open') open.push(k);
+    else if (t.kw === 'close') {
+      if (open.length > 0 && toks[open[open.length - 1]!]!.kw === 'open') pair(k);
+    } else if (t.op === ')' || t.op === '}') {
+      while (open.length > 0 && toks[open[open.length - 1]!]!.kw === 'open') open.pop();
+      if (open.length > 0) pair(k);
     }
   }
+  const closes = (k: number) => toks[k]!.op === ')' || toks[k]!.op === '}' || (toks[k]!.kw === 'close' && opener[k]! >= 0);
+  const opens = (k: number) => toks[k]!.op === '(' || toks[k]!.op === '{' || toks[k]!.op === '$(' || (toks[k]!.kw === 'open' && closer[k]! >= 0);
   /** Whether the right side of the `||` at k lets the list succeed (anything but exit <non-zero>, return <non-zero>, false). */
   const rightSwallows = (k: number) => {
     let j = k + 1;
@@ -739,8 +873,8 @@ function scanShell(text: string, base: string | null, sigs: Compiled, budget: Bu
   };
 
   // Right to left: where each simple command ends, and whether its failure is swallowed by a later `||`, hidden by a
-  // later pipe stage, exempt from errexit by a later `&&`, or run in the background by a later `&`. A group takes on the
-  // state of what follows it.
+  // later pipe stage, exempt from errexit by a later `&&`, or run in the background by a later `&`. A group (and a
+  // compound command) takes on the state of what follows it.
   const segEnd = new Int32Array(n);
   const swallowed = new Uint8Array(n);
   const piped = new Uint8Array(n);
@@ -755,14 +889,14 @@ function scanShell(text: string, base: string | null, sigs: Compiled, budget: Bu
     const op = toks[k]!.op;
     if (op !== null) end = k;
     segEnd[k] = end;
-    if (op === ')' || op === '}') {
+    if (closes(k)) {
       stack.push({ outer, cur });
       // `VAR=$( … )` keeps the substitution's status; in any other command `$( … )` can't fail the step.
       const o = opener[k]!;
       const subst = o >= 0 && toks[o]!.op === '$(' && !(isWord(o - 1) && (toks[o - 1]!.w.endsWith('=')) && !isWord(o - 2));
       outer = { ...cur, sw: subst ? 1 : cur.sw };
       cur = { ...outer };
-    } else if (op === '(' || op === '{' || op === '$(') {
+    } else if (opens(k)) {
       const f = stack.pop();
       if (f) {
         outer = f.outer;
@@ -868,7 +1002,7 @@ function scanShell(text: string, base: string | null, sigs: Compiled, budget: Bu
       j = k + 3;
     } else return -1;
     while (toks[j]?.op === '\n') j++;
-    return toks[j]?.op === '{' || toks[j]?.op === '(' ? j : -1;
+    return toks[j]?.op === '{' || toks[j]?.op === '(' || toks[j]?.kw === 'open' ? j : -1; // any compound command
   };
   const skipFlags = (k: number, wrapper: string) => {
     const valued = WRAPPER_VALUE_FLAGS[wrapper];
@@ -994,7 +1128,8 @@ function scanImage(uses: string, w: Inputs, sigs: Compiled): Found[] {
   const name = imageName(uses.slice('docker://'.length));
   const args = inputWords(w, 'args');
   if (probeCall(args)) return [];
-  return (sigs.byFirstWord.get(name) ?? []).filter((r) => r.rest.length === 0).map((r) => foundOf(r.tool, '.', commandReason(r.tool, args)));
+  return (sigs.byFirstWord.get(name) ?? []).filter((r) => r.rest.length === 0)
+    .map((r) => foundOf(r.tool, '.', inputsCrowded(r.tool, w, ['args']) ? 'inputs' : commandReason(r.tool, args)));
 }
 
 // ---------- triggers (ruling S6) ----------
@@ -1196,6 +1331,8 @@ interface StepCtx {
   shell: unknown;
   continueOnError: boolean;
   conditional: boolean;
+  /** The step (or the local action step that led here) sets more `with:` inputs than pipegen reads. */
+  inputsUnread: boolean;
   depth: number;
 }
 
@@ -1223,7 +1360,7 @@ function addFound(ctx: Ctx, found: Found[], c: StepCtx): void {
     return;
   }
   for (const f of found) {
-    const reason: Reason | null = c.continueOnError ? 'continue' : (f.reason ?? (c.conditional ? 'condition' : null));
+    const reason: Reason | null = c.continueOnError ? 'continue' : (f.reason ?? (c.inputsUnread ? 'inputs' : c.conditional ? 'condition' : null));
     ctx.hits.push({
       opaque: false, categories: f.categories, by: f.by, subject: f.subject, dir: f.dir, reason,
       ...(f.partialWhy === undefined ? {} : { partialWhy: f.partialWhy }), fit: c.fit, where: c.where,
@@ -1251,8 +1388,11 @@ async function walkStep(ctx: Ctx, step: Obj, c: StepCtx): Promise<void> {
   if (!spend(ctx)) return;
   const cond = condition(step.if, repoId(ctx));
   if (cond === 'never') return;
-  const sc: StepCtx = { ...c, continueOnError: c.continueOnError || allowedToFail(step['continue-on-error']), conditional: c.conditional || cond === 'partial' };
   const withInputs = lowerInputs(asObj(step.with));
+  const sc: StepCtx = {
+    ...c, continueOnError: c.continueOnError || allowedToFail(step['continue-on-error']), conditional: c.conditional || cond === 'partial',
+    inputsUnread: c.inputsUnread || withInputs.unread,
+  };
   if (typeof step.uses === 'string' && regexSafe(step.uses)) {
     const uses = step.uses.trim();
     if (uses === '.' || uses.startsWith('./')) {
@@ -1339,14 +1479,14 @@ async function walkWorkflow(ctx: Ctx, doc: Obj, path: string, fit: Fit, depth: n
     const where = cut(`${prefix}${path} (job ${label})`);
     const jobConditional = conditional || cond === 'partial';
     if (typeof job.uses === 'string' && regexSafe(job.uses)) {
-      await callWorkflow(ctx, job.uses.trim(), { fit, where, runDir: '.', shell: undefined, continueOnError: false, conditional: jobConditional, depth });
+      await callWorkflow(ctx, job.uses.trim(), { fit, where, runDir: '.', shell: undefined, continueOnError: false, conditional: jobConditional, inputsUnread: false, depth });
       continue;
     }
     const steps = list(job.steps);
     if (steps.length > MAX_STEPS) ctx.budget.truncated = true;
     const c: StepCtx = {
       fit, where, runDir: firstSet(defaultsDir(job), wfDir), shell: defaultsShell(job) ?? wfShell ?? (onWindows(job) ? 'pwsh' : undefined),
-      continueOnError: allowedToFail(job['continue-on-error']), conditional: jobConditional, depth,
+      continueOnError: allowedToFail(job['continue-on-error']), conditional: jobConditional, inputsUnread: false, depth,
     };
     for (const step of steps.slice(0, MAX_STEPS)) await walkStep(ctx, asObj(step), c);
   }

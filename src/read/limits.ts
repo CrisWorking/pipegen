@@ -1,7 +1,7 @@
 import { lstat, readFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import fg from 'fast-glob';
-import { parse as parseYaml } from 'yaml';
+import { isMap, isPair, isScalar, isSeq, parseDocument } from 'yaml';
 
 /** Read limits that protect the user's machine from hostile repos. Every reader goes through this file. */
 export const READ_LIMITS = { maxFileBytes: 1_000_000, maxFiles: 20_000, maxAliasCount: 50, maxRegexLineBytes: 4096 } as const;
@@ -111,9 +111,51 @@ export async function readTextLimited(path: string): Promise<string | null> {
   return 'text' in result ? result.text : null;
 }
 
-/** YAML with at most 50 aliases (guards against alias-bomb files). Throws when the limit is exceeded. */
+/**
+ * YAML with at most 50 aliases (guards against alias-bomb files). Throws when the limit is exceeded, on a syntax error,
+ * or when a map repeats a key. yaml's own repeated-key check compares each key with every earlier key of its map, which
+ * takes minutes on a hostile 1 MB map, so it is turned off and the same check runs in assertUniqueKeys, in one pass.
+ * Warnings are passed on as yaml's parse() does.
+ */
 export function parseYamlLimited(text: string): unknown {
-  return parseYaml(text, { maxAliasCount: READ_LIMITS.maxAliasCount });
+  const doc = parseDocument(text, { uniqueKeys: false });
+  for (const warning of doc.warnings) process.emitWarning(warning);
+  if (doc.errors.length > 0) throw doc.errors[0];
+  assertUniqueKeys(doc.contents);
+  return doc.toJS({ maxAliasCount: READ_LIMITS.maxAliasCount });
+}
+
+/**
+ * yaml's rule for a repeated key (its default `uniqueKeys`): two keys are the same when they are the same node, or both
+ * are scalars with the same value. Checked with a Set per map and an explicit stack, so the work is linear in the
+ * number of nodes; aliases are not followed (each node is visited once).
+ */
+function assertUniqueKeys(root: unknown): void {
+  const stack: unknown[] = [root];
+  while (stack.length > 0) {
+    const node = stack.pop();
+    if (isMap(node)) {
+      const seen = new Set<unknown>();
+      let emptyKey = false;
+      for (const pair of node.items) {
+        const key: unknown = pair.key;
+        let repeated = false;
+        if (key === null || key === undefined) {
+          repeated = emptyKey;
+          emptyKey = true;
+        } else if (isScalar(key) && !(typeof key.value === 'number' && Number.isNaN(key.value))) {
+          repeated = seen.has(key.value);
+          seen.add(key.value);
+        }
+        if (repeated) throw new Error('Map keys must be unique');
+        stack.push(key, pair.value);
+      }
+    } else if (isSeq(node)) {
+      for (const item of node.items) stack.push(item);
+    } else if (isPair(node)) {
+      stack.push(node.key, node.value);
+    }
+  }
 }
 
 /** Only the lines of 4 KB or less; regex rules run on these so a huge line cannot stall a pattern. */
