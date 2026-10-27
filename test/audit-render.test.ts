@@ -426,6 +426,10 @@ describe('rulings', () => {
     expect(CANT_SEE.join(' ')).toMatch(/Windows/);
     expect(CANT_SEE.join(' ')).toMatch(/unknown/);
     expect(CANT_SEE.join(' ')).toMatch(/reusable workflows/i);
+    // Task 5 fix round 2 (M4)
+    for (const part of ["doesn't read tox's env_list", 'SKIP for pre-commit', 'pinned to a commit SHA', 'up to v1.14.3', 'trusted by its name']) {
+      expect(CANT_SEE.join(' '), part).toContain(part);
+    }
     const cantSee = t.indexOf("What this audit can't see");
     expect(cantSee).toBeGreaterThan(t.indexOf('\nNotes'));
     expect(cantSee).toBeLessThan(t.indexOf('Next step'));

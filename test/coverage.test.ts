@@ -1331,3 +1331,103 @@ describe('mapCoverage (Task 5 fix round 1)', () => {
     }
   });
 });
+
+// ---------- Task 5 fix round 2: the re-review's probes (task-5-rereview-1.md N1–N5) ----------
+
+describe('mapCoverage (Task 5 fix round 2)', () => {
+  const py = { services: [svc('.', { language: 'python', packageManager: 'uv', scripts: [] })] };
+  const PR = (steps: string) => `on:\n  pull_request:\n${job(steps)}`;
+
+  it('N1/N3 (U23): a by-name script that runs nothing is missing; one whose real runs all can\'t fail it is partial', async () => {
+    for (const [cmd, scripts, status] of [
+      // (d) an own-script call that does nothing, followed
+      ['npm test', { test: 'npm run a', a: 'echo ok' }, 'missing'],
+      ['npm test', { test: 'npm run test:unit', 'test:unit': 'echo ok' }, 'missing'],
+      ['npm test', { test: 'yarn test:unit', 'test:unit': 'true' }, 'missing'],
+      ['npm test', { test: 'npm run a', a: 'npm run b', b: 'npm run c', c: ':' }, 'missing'],
+      ['npm test', { test: 'npm run a', a: 'npm run test' }, 'missing'], // a cycle does nothing
+      // (b) dead code
+      ['npm test', { test: 'exit 0; jest' }, 'missing'],
+      ['npm test', { test: 'true || jest' }, 'missing'],
+      ['npm test', { test: 'echo skip || { jest; }' }, 'missing'],
+      ['npm test', { test: 'false && jest' }, 'missing'],
+      // (c) a mode that runs no tests
+      ['npm test', { test: 'jest --listTests' }, 'missing'],
+      ['npm test', { test: 'pytest --co' }, 'missing'],
+      ['npm test', { test: 'vitest --version' }, 'missing'],
+      // cross-env is a wrapper
+      ['npm test', { test: 'cross-env CI=1 echo hi' }, 'missing'],
+      ['npm test', { test: 'cross-env CI=1 jest || true' }, 'partial'],
+      ['npm test', { test: 'cross-env CI=1 NODE_ENV=test jest' }, 'covered'],
+      // the last command can't fail the script (sh -c, no -e)
+      ['npm test', { test: 'node script.js || true' }, 'partial'],
+      ['npm test', { test: 'node script.js; exit 0' }, 'partial'],
+      ['npm test', { test: 'node script.js; true' }, 'partial'],
+      ['npm test', { test: 'npm run a || true', a: 'jest' }, 'partial'],
+      ['npm test', { test: 'npm run a', a: 'node x.js || true' }, 'partial'],
+      // stays counted by name
+      ['npm test', { test: 'node script.js' }, 'covered'],
+      ['npm test', { test: 'jest && echo done' }, 'covered'],
+      ['npm test', { test: 'npm run a && jest', a: 'echo ok' }, 'covered'],
+      ['npm test', { test: 'npm run a', a: 'tape test.js' }, 'covered'],
+      ['npm test', { test: 'test -f x || exit 0; node t.js' }, 'covered'],
+    ] as [string, Record<string, string>, string][]) {
+      const dir = makeTempDir();
+      pkg(dir, scripts);
+      wf(dir, 'ci.yml', PR(run(cmd)));
+      expect(row(await coverage(dir), 'merge', 'unit-tests', 'app').status, JSON.stringify(scripts)).toBe(status);
+    }
+    for (const [scripts, status] of [
+      [{ lint: 'npm run lint:js', 'lint:js': 'echo' }, 'missing'], [{ lint: 'eslint . || true' }, 'partial'],
+      [{ lint: 'cross-env TIMING=1 eslint .' }, 'covered'], [{ lint: 'eslint --version' }, 'missing'],
+    ] as [Record<string, string>, string][]) {
+      const dir = makeTempDir();
+      pkg(dir, scripts);
+      wf(dir, 'ci.yml', PR(run('npm run lint')));
+      expect(row(await coverage(dir), 'merge', 'lint', 'app').status, JSON.stringify(scripts)).toBe(status);
+    }
+  });
+
+  it('N3: cross-env is a wrapper (`npm run ci` → `cross-env CI=1 jest` counts)', async () => {
+    const dir = makeTempDir();
+    pkg(dir, { ci: 'cross-env CI=1 jest' });
+    wf(dir, 'ci.yml', PR(run('npm run ci')));
+    expect(row(await coverage(dir), 'merge', 'unit-tests', 'app')).toMatchObject({ status: 'covered', by: 'your own `npm run ci`' });
+    const dir2 = makeTempDir();
+    wf(dir2, 'ci.yml', PR(run('npx cross-env NODE_ENV=test jest --ci')));
+    expect(row(await coverage(dir2), 'merge', 'unit-tests', 'app')).toMatchObject({ status: 'covered', by: 'jest' });
+  });
+
+  it('dead code in CI text too: right of `true ||` / `false &&` never runs', async () => {
+    for (const [cmd, status] of [['true || jest', 'missing'], ['false && jest', 'missing'], ['echo x || (jest)', 'missing'], ['true || jest || exit 1', 'missing'],
+      ['true && jest', 'covered'], ['false || jest', 'covered'], ['true || jest; jest', 'covered']]) {
+      const dir = makeTempDir();
+      wf(dir, 'ci.yml', PR(run(cmd as string)));
+      expect(row(await coverage(dir), 'merge', 'unit-tests', 'app').status, cmd).toBe(status);
+    }
+  });
+
+  it('N2: local hooks with language script, unsupported_script or docker_image never count by tool name', async () => {
+    for (const language of ['script', 'unsupported_script', 'docker_image', 'fail', 'pygrep']) {
+      const dir = makeTempDir();
+      writeIn(dir, '.pre-commit-config.yaml', `repos:\n  - repo: local\n    hooks:\n      - id: x\n        name: x\n        entry: ruff check\n        language: ${language}\n`);
+      expect(row(await coverage(dir, py), 'pre-commit', 'format-lint', 'app').status, language).toBe('missing');
+    }
+  });
+
+  it('N4: SKIP set inside a local composite action the job uses makes hooks-in-CI partial', async () => {
+    const dir = makeTempDir();
+    writeIn(dir, '.pre-commit-config.yaml', hookConfig('      - id: ruff-check\n'));
+    writeIn(dir, '.github/actions/setskip/action.yml', 'runs:\n  using: composite\n  steps:\n    - run: echo "SKIP=ruff-check" >> "$GITHUB_ENV"\n      shell: bash\n');
+    wf(dir, 'ci.yml', PR('      - uses: ./.github/actions/setskip\n' + run('pre-commit run --all-files')));
+    const rows = await coverage(dir, py);
+    expect(row(rows, 'merge', 'hooks-ci').status).toBe('partial');
+    expect(row(rows, 'merge', 'lint', 'app').status).toBe('missing');
+    // the same composite action with an env key
+    const dir2 = makeTempDir();
+    writeIn(dir2, '.pre-commit-config.yaml', hookConfig('      - id: ruff-check\n'));
+    writeIn(dir2, '.github/actions/a/action.yaml', 'runs:\n  using: composite\n  steps:\n    - run: pre-commit run --all-files\n      shell: bash\n      env:\n        SKIP: ruff-check\n');
+    wf(dir2, 'ci.yml', PR('      - uses: ./.github/actions/a\n'));
+    expect(row(await coverage(dir2, py), 'merge', 'hooks-ci').status).toBe('partial');
+  });
+});

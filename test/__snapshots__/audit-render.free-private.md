@@ -203,6 +203,11 @@ These are counts only, never file contents. They were made without the gitleaks 
 - Tools inside shell functions, and jobs whose matrix includes Windows, show as partial.
 - Very large repos (over 10,000 folders with runs, or 5,000 services) show some checks as unknown.
 - Reusable workflows from other repos, and actions from your own account, can't be looked inside: those checks show as unknown.
+- `tox` counts as your own test run whatever environments its config lists: pipegen doesn't read tox's env_list.
+- Variables that change what runs (SKIP for pre-commit, TOX… and NOX… for tox and nox, NPM_CONFIG_DRY_RUN) aren't seen when an action from another repo sets them, or when a step writes them under a name built while it runs.
+- A pre-commit hook pinned to a commit SHA (`rev:`) isn't checked to be a commit of the hook's own repo, so it could come from a fork.
+- pipegen knows the PyPI publish action up to v1.14.3: a newer release pinned by its commit SHA shows as partial until pipegen is updated.
+- A test or lint script whose runner pipegen doesn't know (like `node test.js`) is trusted by its name: pipegen only lowers it when the script clearly does nothing or can't fail.
 
 ## Next step
 
