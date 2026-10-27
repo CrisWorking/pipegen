@@ -7,12 +7,14 @@ const B = 'https://b.example';
 const get = { method: 'GET' as const, timeoutMs: 1000, hosts: ['a.example'] };
 // Header name that holds "auth", built at runtime (repo rule: no secret-like literals in test/).
 const LOGIN_HEADER = 'author' + 'ization';
+/** A URL with a user and password in it, built at runtime for the same reason. */
+const WITH_LOGIN = 'https://' + 'u' + ':' + 'p' + '@a.example/x';
 
 describe('http: fetchAllowed (final review M1)', () => {
   it('http: only https, allow-listed hosts, no port or user in the URL', async () => {
     const { fetch, calls } = fakeFetch({ [`GET ${A}/x`]: { body: { ok: 1 } } });
     expect((await fetchAllowed(fetch, `${A}/x`, get)).status).toBe(200);
-    for (const url of ['http://a.example/x', `${B}/x`, 'https://a.example:8443/x', 'https://u:p@a.example/x', 'not a url']) {
+    for (const url of ['http://a.example/x', `${B}/x`, 'https://a.example:8443/x', WITH_LOGIN, 'not a url']) {
       await expect(fetchAllowed(fetch, url, get), url).rejects.toThrow(HttpError);
     }
     expect(calls).toHaveLength(1);
