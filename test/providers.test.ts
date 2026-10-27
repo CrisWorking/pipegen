@@ -1,4 +1,6 @@
 import { randomBytes } from 'node:crypto';
+import { createServer, type Server } from 'node:http';
+import type { AddressInfo } from 'node:net';
 import { inspect } from 'node:util';
 import { trace, type Span, type Tracer, type TracerProvider } from '@opentelemetry/api';
 import { afterEach, describe, expect, it, vi } from 'vitest';
@@ -475,6 +477,56 @@ describe('ollama', () => {
     const f = fakeFetch(() => ollamaAnswer());
     await ollamaProvider({ fetch: f.fetch }).complete(request({ timeoutMs: 60_000 }));
     expect(vi.getTimerCount()).toBe(0);
+  });
+});
+
+describe('redirects (final review batch 2, M4)', () => {
+  /** A local HTTP server; `hits` lists the paths it was asked for. */
+  async function server(handle: (path: string, res: import('node:http').ServerResponse) => void): Promise<{ origin: string; hits: string[]; close: () => Promise<void> }> {
+    const hits: string[] = [];
+    const s: Server = createServer((req, res) => {
+      hits.push(req.url ?? '');
+      req.resume();
+      req.on('end', () => handle(req.url ?? '', res));
+    });
+    await new Promise<void>((r) => s.listen(0, '127.0.0.1', r));
+    const { port } = s.address() as AddressInfo;
+    return { origin: `http://127.0.0.1:${port}`, hits, close: () => new Promise((r) => { s.closeAllConnections(); s.close(() => r()); }) };
+  }
+
+  it('openai and ollama: a 307 is never followed, so the code bundle is never sent to the Location host', async () => {
+    const elsewhere = await server((_p, res) => { res.writeHead(200, { 'content-type': 'application/json' }); res.end('{}'); });
+    const redirector = await server((_p, res) => { res.writeHead(307, { location: `${elsewhere.origin}/steal` }); res.end(); });
+    try {
+      // OpenAI's URL is fixed, so a fetch stand-in sends its request to the redirecting server, with the adapter's own init
+      const inits: RequestInit[] = [];
+      const toRedirector = (async (_input: string | URL | Request, init?: RequestInit) => {
+        inits.push(init ?? {});
+        return globalThis.fetch(`${redirector.origin}/v1/chat/completions`, init);
+      }) as typeof fetch;
+      const o = await caught(openaiProvider({ key: runtimeKey('ok'), model: 'gpt-5', fetch: toRedirector }).complete(request({ user: 'the code bundle' })));
+      expect(o.kind).toBe('http');
+      expect(inits[0]?.redirect).toBe('error');
+
+      // Ollama with the real fetch, at a host that redirects
+      const l = await caught(ollamaProvider({ host: redirector.origin }).complete(request({ user: 'the code bundle' })));
+      expect(l.kind).toBe('http');
+
+      expect(redirector.hits).toEqual(['/v1/chat/completions', '/api/chat']);
+      expect(elsewhere.hits).toEqual([]); // nothing reached the Location host
+    } finally {
+      await redirector.close();
+      await elsewhere.close();
+    }
+  });
+
+  it('openai and ollama: every request is made with redirect: "error"', async () => {
+    const f = fakeFetch(() => json({}));
+    const seen: RequestInit[] = [];
+    const spy = (async (input: string | URL | Request, init?: RequestInit) => { seen.push(init ?? {}); return f.fetch(input, init); }) as typeof fetch;
+    await openaiProvider({ key: runtimeKey('ok'), model: 'gpt-5', fetch: spy }).complete(request()).catch(() => {});
+    await ollamaProvider({ fetch: spy }).complete(request()).catch(() => {});
+    expect(seen.map((i) => i.redirect)).toEqual(['error', 'error']);
   });
 });
 

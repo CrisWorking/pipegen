@@ -1,4 +1,5 @@
-// Ollama adapter (experimental). Plain fetch to {OLLAMA_HOST}/api/chat. No API key is ever sent here.
+// Ollama adapter (experimental). Plain fetch to {OLLAMA_HOST}/api/chat. No API key is ever sent here. Redirects are
+// refused: the consent screen names the host the code goes to, and a 307/308 would re-send it somewhere else.
 import type { AiProvider, AiRequest, AiUsage } from '../types.js';
 import { safeText } from '../util/safe-text.js';
 import { AiError, count, withTimeout } from './errors.js';
@@ -63,6 +64,7 @@ export function ollamaProvider(opts: OllamaOptions = {}): OllamaProvider {
           res = await doFetch(url, {
             method: 'POST',
             signal,
+            redirect: 'error', // a 3xx must never re-send the code bundle to a host the consent screen didn't name
             headers: { 'content-type': 'application/json' },
             body: JSON.stringify({
               model,

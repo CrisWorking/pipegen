@@ -1,4 +1,4 @@
-// OpenAI adapter (experimental). Plain fetch to the fixed Chat Completions URL; no SDK.
+// OpenAI adapter (experimental). Plain fetch to the fixed Chat Completions URL; no SDK. Redirects are refused.
 import type { AiProvider, AiRequest, AiUsage } from '../types.js';
 import { AiError, count, safeCode, withTimeout } from './errors.js';
 
@@ -33,6 +33,7 @@ export function openaiProvider(opts: OpenAiOptions): AiProvider {
           res = await doFetch(OPENAI_URL, {
             method: 'POST',
             signal,
+            redirect: 'error', // a 3xx must never re-send the code bundle (and the key) to another host
             headers: { 'content-type': 'application/json', authorization: `Bearer ${opts.key}` },
             body: JSON.stringify({
               model: opts.model,
