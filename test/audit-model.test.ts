@@ -564,6 +564,23 @@ describe('buildAudit (fix round 1)', () => {
     expect(r.warnings).toEqual([]);
   });
 
+  it('Task 5 (item 5): keys that only make npm stricter give no warning (express .npmrc shape)', async () => {
+    // express's .npmrc, written by hand
+    const express = ['package-lock=false', 'min-release-age=7', 'ignore-scripts=true', 'allow-git=none'].join('\n');
+    expect((await buildAudit(repo({ ...nodeApp(), '.npmrc': `${express}\n` }), deps())).warnings).toEqual([]);
+    const stricter = ['ignore-scripts = true', 'IGNORE-SCRIPTS=TRUE', 'min-release-age=0', 'min-release-age = 30', 'allow-git=root', 'allow-git=all', 'allow-git = NONE',
+      'strict-peer-deps=true', 'engine-strict=true'].join('\n');
+    expect((await buildAudit(repo({ ...nodeApp(), '.npmrc': `${stricter}\n` }), deps())).warnings).toEqual([]);
+  });
+
+  it('Task 5 (item 5, adversarial): the same keys with values that are not stricter, and audit-level, still warn', async () => {
+    for (const line of ['ignore-scripts=false', 'ignore-scripts=1', 'ignore-scripts', 'min-release-age=-1', 'min-release-age=7d', 'min-release-age=', 'allow-git=some',
+      'strict-peer-deps=false', 'audit-level=none', 'audit-level=critical', 'before=2020-01-01']) {
+      const r = await buildAudit(repo({ ...nodeApp(), '.npmrc': `ignore-scripts=true\n${line}\n` }), deps());
+      expect(r.warnings, line).toEqual([SWAP_WARNING]);
+    }
+  });
+
   it('U11: the report says whether the reviewed list was unavailable', async () => {
     expect((await buildAudit(repo(nodeApp()), deps())).reviewedUnavailable).toBe(false);
     expect((await buildAudit(repo(nodeApp()), deps({ reviewedUnavailable: true }))).reviewedUnavailable).toBe(true);

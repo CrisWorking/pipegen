@@ -604,6 +604,55 @@ async function reviewedUnavailable(dir: string, msg: string) {
   expect(t.out.indexOf(B3_PREFIX)).toBeLessThan(t.out.indexOf('What your GitHub plan allows'));
 }
 
+describe('pipegen audit (Task 5: real-repo fixes)', () => {
+  it('requests (M6): an anonymous audit of an organisation repo reads GET /repos once, skips /orgs and makes at most 8 GitHub requests', async () => {
+    const dir = repo();
+    const at = new Date().toISOString();
+    const page = Array.from({ length: 100 }, () => ({ type: 'PushEvent', created_at: at })); // a busy repo: every event page is read
+    const routes = publicRoutes({
+      [`GET ${R}`]: { body: { private: false, default_branch: 'main', full_name: 'o/r', owner: { type: 'Organization', login: 'o' } } },
+      [`GET ${API}/orgs/o`]: { body: { login: 'o' } },
+      [`GET ${R}/events`]: { body: page },
+    });
+    const r = await audit(['audit', '--json'], { cwd: dir, routes });
+    expect(r.code).toBe(0);
+    const gh = r.calls.filter((c) => c.url.origin === API);
+    expect(gh.filter((c) => c.url.pathname === '/repos/o/r')).toHaveLength(1);
+    expect(gh.some((c) => c.url.pathname.startsWith('/orgs/'))).toBe(false);
+    expect(gh.length).toBeLessThanOrEqual(8);
+    const j = JSON.parse(r.out) as { profile: { ownerType: string; plan: string; defaultBranch: string; private: boolean } };
+    expect(j.profile).toMatchObject({ ownerType: 'Organization', plan: 'unknown', defaultBranch: 'main', private: false });
+  });
+
+  it('requests (M6): with a token, GET /repos is still read once (getAuth makes no anonymous check)', async () => {
+    const dir = repo();
+    const r = await audit(['audit', '--json'], { cwd: dir, routes: privateRoutes(), env: { [GH_VAR]: fake.githubPat() } });
+    expect(r.code).toBe(0);
+    expect(r.calls.filter((c) => c.url.origin === API && c.url.pathname === '/repos/o/r')).toHaveLength(1);
+  });
+
+  it('wording (M7): the B3 warning gives the loader\'s short reason once, without the install-time sentence', async () => {
+    const dir = repo();
+    const reason = '23 entries still wait for human review (a, b and 21 more)';
+    vi.mocked(loadReviewed).mockImplementation(() => { throw new ReviewedListError(`This pipegen release refuses its reviewed tool list: ${reason}. Nothing unreviewed may run in your CI.`, { reason }); });
+    try {
+      const r = await audit(['audit', '--json'], { cwd: dir });
+      expect(r.code).toBe(0);
+      const j = JSON.parse(r.out) as { warnings: { text: string }[] };
+      expect(j.warnings[0]?.text).toBe(`${B3_PREFIX}${reason}${B3_SUFFIX}`);
+      expect(j.warnings[0]?.text).not.toMatch(/refuses|Nothing unreviewed/);
+    } finally {
+      vi.mocked(loadReviewed).mockReset();
+    }
+  });
+
+  it('README (item 7): the status line no longer says "design only, no code yet"', () => {
+    const readme = readFileSync(resolve(import.meta.dirname, '../README.md'), 'utf8');
+    expect(readme).not.toMatch(/design only|no code yet/i);
+    expect(readme).toMatch(/> \*\*Status: .*`pipegen audit`/);
+  });
+});
+
 describe('pipegen audit --ai (checks before consent)', () => {
   it('platform: an unsupported platform stops --ai before consent (S21)', async () => {
     const dir = repo();

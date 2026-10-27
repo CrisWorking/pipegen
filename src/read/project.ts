@@ -162,9 +162,13 @@ async function readService(ctx: Ctx, dir: string, shared: Shared): Promise<Servi
   const devDeps = asObj(pkg?.devDependencies);
   const pkgScripts = asObj(pkg?.scripts);
   const scripts = [...new Set([...Object.keys(pkgScripts), ...py.scripts])];
+  // Plan U Task 5: the service's own package is never a framework it uses (the express package isn't an express app;
+  // Flask's own pyproject is named Flask).
+  const ownNode = asString(pkg?.name);
+  const ownPython = py.name === undefined ? undefined : pythonNames([py.name])[0];
   const frameworks = language === 'node'
-    ? NODE_FRAMEWORKS.filter(([dep]) => dep in deps).map(([, name]) => name).filter((n, i, a) => a.indexOf(n) === i)
-    : [...new Set(PYTHON_FRAMEWORKS.filter((f) => [...py.main, ...requirementNames].includes(f)))];
+    ? NODE_FRAMEWORKS.filter(([dep]) => dep in deps && dep !== ownNode).map(([, name]) => name).filter((n, i, a) => a.indexOf(n) === i)
+    : [...new Set(PYTHON_FRAMEWORKS.filter((f) => f !== ownPython && [...py.main, ...requirementNames].includes(f)))];
 
   const realTestScript = asString(pkgScripts.test) !== undefined && asString(pkgScripts.test) !== NPM_DEFAULT_TEST;
   const hasTests = testFiles.length > 0 || realTestScript;
@@ -287,10 +291,15 @@ export async function readProject(dir: string, opts?: { notes?: string[] }): Pro
   uniqueServiceNames(ctx, services);
 
   const files = [...ctx.fileSet];
+  const existingWorkflows = await readWorkflows(dir, files, ctx.notes);
+  // Plan U Task 5: the repo's only service, at the root, published to its own registry by a workflow, is a package.
+  const only = services.length === 1 ? services[0] : undefined;
+  const registry = only?.language === 'node' ? 'npm' : only?.language === 'python' ? 'pypi' : undefined;
+  if (only !== undefined && only.path === '.' && registry !== undefined && existingWorkflows.some((w) => w.publishes?.includes(registry))) only.publishedPackage = true;
   return {
     owner, repo, defaultBranch: 'main', monorepo, services,
     terraformDirs: [...new Set(files.filter((f) => f.endsWith('.tf')).map(dirOf))].sort(),
     hasCompose: files.some((f) => /^(docker-)?compose\.ya?ml$/.test(baseOf(f))),
-    existingWorkflows: await readWorkflows(dir, files, ctx.notes), precommit: readPrecommit(dir),
+    existingWorkflows, precommit: readPrecommit(dir),
   };
 }

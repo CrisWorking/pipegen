@@ -3,6 +3,7 @@ import { mkdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import fg from 'fast-glob';
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import { isRunnable } from '../src/engine/needs.js';
 import { NotGitHubRepoError, readProject } from '../src/read/project.js';
 import { cleanupRepos, makeRepo, writeIn } from './helpers/make-repo.js';
 import { fake } from './helpers/secret-repo.js';
@@ -376,5 +377,61 @@ describe('read', () => {
     await readProject(dir, { notes });
     expect(notes).toContain('Skipped package.json: it is larger than 1 MB.');
     expect(notes).toContain('Skipped pyproject.toml: it could not be parsed.');
+  });
+});
+
+// Task 5, item 4: packages vs apps (express and flask shapes, minimal hand-written files).
+describe('read (Task 5: packages vs apps)', () => {
+  const PYPI_PUBLISH = "on:\n  push:\n    tags: ['*']\njobs:\n  publish:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: pypa/gh-action-pypi-publish@v1.14.2\n";
+  const NPM_PUBLISH = 'on:\n  release:\n    types: [published]\njobs:\n  publish:\n    runs-on: ubuntu-latest\n    steps:\n      - run: npm publish --provenance\n';
+
+  it('packages: a repo whose own package is a framework does not count as using it (express, flask)', async () => {
+    const node = repo('node-library');
+    writeIn(node, 'package.json', JSON.stringify({ name: 'express', version: '5.0.0', dependencies: { express: 'file:.', debug: '4.0.0' } }));
+    expect((await readProject(node)).services[0]?.frameworks).toEqual([]);
+    const py = repo('python-uv');
+    writeIn(py, 'pyproject.toml', '[project]\nname = "Flask"\ndependencies = ["flask", "werkzeug>=3"]\n');
+    expect((await readProject(py)).services[0]?.frameworks).toEqual([]);
+  });
+
+  it('packages: a published package whose only server sign is a port in its code is not runnable (flask shape, npm too)', async () => {
+    const py = repo('python-uv');
+    writeIn(py, 'pyproject.toml', '[project]\nname = "Flask"\ndependencies = ["werkzeug>=3"]\n[project.scripts]\nflask = "flask.cli:main"\n');
+    writeIn(py, 'app.py', 'def run(port=5000):\n    pass\n');
+    writeIn(py, '.github/workflows/publish.yaml', PYPI_PUBLISH);
+    const flask = (await readProject(py)).services[0];
+    expect(flask?.port).toBe(5000);
+    expect(isRunnable(flask!)).toBe(false);
+    const node = repo('node-library');
+    writeIn(node, 'index.js', 'module.exports = (port = 3000) => port;\nconst PORT = process.env.PORT || 3000;\n');
+    writeIn(node, '.github/workflows/npm-publish.yml', NPM_PUBLISH);
+    expect(isRunnable((await readProject(node)).services[0]!)).toBe(false);
+  });
+
+  it('packages (adversarial): a package named like a framework that also has a real server entry stays runnable', async () => {
+    const withStart = repo('node-library');
+    writeIn(withStart, 'package.json', JSON.stringify({ name: 'express', scripts: { start: 'node server.js' }, dependencies: { express: 'file:.' } }));
+    writeIn(withStart, '.github/workflows/npm-publish.yml', NPM_PUBLISH);
+    expect(isRunnable((await readProject(withStart)).services[0]!)).toBe(true);
+    const withFramework = repo('node-library');
+    writeIn(withFramework, 'package.json', JSON.stringify({ name: 'express', dependencies: { express: 'file:.', fastify: '5.0.0' } }));
+    writeIn(withFramework, '.github/workflows/npm-publish.yml', NPM_PUBLISH);
+    const s = (await readProject(withFramework)).services[0]!;
+    expect(s.frameworks).toEqual(['fastify']);
+    expect(isRunnable(s)).toBe(true);
+    const withDocker = repo('python-uv');
+    writeIn(withDocker, 'pyproject.toml', '[project]\nname = "Flask"\ndependencies = ["flask"]\n');
+    writeIn(withDocker, 'Dockerfile', 'FROM python:3.12\n');
+    writeIn(withDocker, '.github/workflows/publish.yaml', PYPI_PUBLISH);
+    expect(isRunnable((await readProject(withDocker)).services[0]!)).toBe(true);
+    // a port with no publishing workflow: still an app, as before
+    const app = repo('node-library');
+    writeIn(app, 'index.js', 'const PORT = process.env.PORT || 3000;\n');
+    expect(isRunnable((await readProject(app)).services[0]!)).toBe(true);
+    // publishing words only in an echo or a comment are not publishing
+    const echo = repo('node-library');
+    writeIn(echo, 'index.js', 'const PORT = process.env.PORT || 3000;\n');
+    writeIn(echo, '.github/workflows/ci.yml', 'on: push\njobs:\n  a:\n    runs-on: x\n    steps:\n      - run: echo "npm publish later"  # npm publish\n');
+    expect(isRunnable((await readProject(echo)).services[0]!)).toBe(true);
   });
 });

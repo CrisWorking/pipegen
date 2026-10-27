@@ -1,5 +1,5 @@
 import { readFileSync } from 'node:fs';
-import { resolve } from 'node:path';
+import { join, resolve } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { parse, stringify } from 'yaml';
 import { checkPinnedAgainstReviewed, loadPinnedBinaries } from '../src/engine/linters.js';
@@ -192,6 +192,25 @@ describe('loadReviewed', () => {
     vi.unstubAllEnvs();
     rejects([{ ...actionEntry(), reviewedBy: 'Cristiano Pereira', reviewedAt: 'PENDING' }]);
     rejects([{ ...actionEntry(), reviewedBy: 'PENDING', reviewedAt: '2026-11-01' }]);
+  });
+
+  it('reviewed (Task 5, M7): the PENDING refusal carries a short reason for the audit warning; the message is unchanged', () => {
+    const path = writeList([actionEntry(), cliEntry()]);
+    vi.stubEnv('PIPEGEN_RELEASE', '1');
+    let e: unknown;
+    try {
+      loadReviewed(path);
+    } catch (caught) {
+      e = caught;
+    } finally {
+      vi.unstubAllEnvs();
+    }
+    expect(e).toBeInstanceOf(ReviewedListError);
+    const err = e as ReviewedListError;
+    expect(err.reason).toMatch(/^2 entries still wait for human review \(.+\)$/);
+    expect(err.message).toBe(`This pipegen release refuses its reviewed tool list: ${err.reason}. Nothing unreviewed may run in your CI.`);
+    // the other refusals keep their message and have a reason too
+    expect(() => loadReviewed(join(makeTempDir(), 'missing.yml'))).toThrow(expect.objectContaining({ reason: 'it could not be read' }));
   });
 
   it('reviewed: semgrep entry with a registry rule pack (p/…) or auto rejected; sha-pinned pack accepted', () => {

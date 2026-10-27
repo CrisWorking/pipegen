@@ -31,6 +31,21 @@
 //   row that would be missing is unknown when the repo has more services (MAX_SERVICES) or more distinct run dirs
 //   (MAX_HIT_DIRS) than pipegen matches; a cap only drops runs, so it never makes a row covered.
 // - missing: nothing matches. `gate` and `deploy-verify` are always missing: they are pipegen's own checks.
+// Task 5 (accuracy from real repos):
+// - own scripts: `npm|pnpm|yarn|bun run <name>` for a name other than test/lint[:x] counts only through the script's
+//   own text in <dir>/package.json (the run's directory), read as npm runs it (sh -c, no -e), following the own
+//   scripts it calls (each worked out once; a cycle adds nothing): what it runs for tests, lint or format-lint counts,
+//   under "your own `npm run <name>`". A name only fixes (a :fix/-fix/:write part) never counts, also for lint:fix.
+//   Flags after the name other than --silent, -s and --if-present (npm's --workspace, pnpm's --filter) stop it.
+// - tox / tox run and nox are the project's own test runner unless the command line or an env var (TOX…, NOX…, in
+//   the job's env or run text) picks other envs or sessions. `uv run` and `nyc` flags are matched against their full
+//   lists (a flag pipegen doesn't know: no command); pipenv run is a wrapper.
+// - .pre-commit-config.yaml: a local hook's `entry` only; another repo's hook by its exact repo URL and id (tool
+//   signatures `precommitHooks`), else its id; `args` are read for soft flags; an entry is one command (no shell).
+//   CI's `pre-commit run --all-files` (pre-commit/action by default) also covers lint with the hooks' lint tools,
+//   unless SKIP is set in the job. Not modelled: hook `files`/`exclude`/`types`.
+// - a signature can need a flag (`npm publish --provenance`) or be switched off by `with:` inputs (pypi-publish with a
+//   password or attestations off), so a publish without an attestation is never counted.
 // A tool counts only where a command starts: at the start, after ; && || | & ( $( { a newline, a shell keyword or a
 // wrapper (npx, sudo, env, time, command without -v, pnpm/yarn dlx, uv run, pipx run, python -m, sh/bash, …), as the
 // basename of a path, or as the image after `docker run [flags]`. Quoted text, here-document bodies and case patterns
@@ -49,8 +64,8 @@
 // 4 KB are kept opaque. The few regexes left are linear and run only on short values (lines or words of 4 KB or less).
 // Output follows the src/types.ts rule, RAW but VALIDATED, cleaned at output: `why` is pipegen's own text only
 // (including a signature's `partialWhy`, from pipegen's data file); `by` is a tool-signature id from
-// data/tool-signatures.yml, an own-script phrase built from fixed words (plus a script name matching OWN_NAME_RE), a
-// hook manager name, or a repo `uses:` value kept only when it matches REF_RE (ASCII letters, digits and . _ - / @; at
+// data/tool-signatures.yml, an own-script phrase built from fixed words (plus a script name matching OWN_NAME_RE or
+// SCRIPT_NAME_RE), a hook manager name, or a repo `uses:` value kept only when it matches REF_RE (ASCII letters, digits and . _ - / @; at
 // most 200 characters; unchanged by safeText); `where` joins workflow and action paths that are unchanged by safeText
 // with job ids that pass JOB_ID_RE (else "#n"), cut to MAX_WHERE code points. Task 3 still cleans `by` and `where` with
 // safeText / safeMarkdown when it prints them.
@@ -83,7 +98,10 @@ const PART_RE = /^[A-Za-z0-9_.-]+$/;
 const LAST_PART_RE = /^[A-Za-z0-9_.-]+\*?$/;
 const FLAG_RE = /^-{1,2}[A-Za-z0-9][A-Za-z0-9-]*(?:=[A-Za-z0-9._-]+)?$/;
 const INPUT_RE = /^[A-Za-z0-9_-]{1,64}$/;
-const INPUT_VALUE_RE = /^(?:\*|[a-z0-9._ -]{1,64})$/;
+const INPUT_VALUE_RE = /^(?:\*|[a-z0-9._ :/-]{1,64})$/; // ':' and '/' for URL values (repository-url)
+/** A pre-commit hook repo, exactly as its README gives it (https://github.com/owner/name). */
+const HOOK_REPO_RE = /^https:\/\/github\.com\/[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/;
+const HOOK_ID_RE = /^[a-z0-9][a-z0-9_.-]{0,63}$/;
 const WHY_RE = /^[A-Z][^\n\r]{0,299}\.$/;
 
 /** owner/name, optionally with a sub-path; the last part may end with * (a prefix: snyk/actions/python*). */
@@ -122,11 +140,23 @@ const signatureSchema = z.strictObject({
   softUnless: inputs.optional(),
   /** pipegen's own sentence for a check that never fails the job (commandFails or actionFails never). */
   partialWhy: z.string().regex(WHY_RE).refine((s) => safeText(s, 300) === s, 'must be plain text').optional(),
+  /** Task 5: a command counts only when one of these words is given exactly (npm publish --provenance). */
+  onlyWithFlags: z.array(z.string().regex(FLAG_RE)).min(1).optional(),
+  /** Task 5: a command doesn't count when one of these flags is given (same matching as softFlags). */
+  notWithFlags: z.array(z.string().regex(FLAG_RE)).min(1).optional(),
+  /** Task 5: `with:` inputs set to one of these values (or an expression) mean the action doesn't do this check. */
+  skipInputs: inputs.optional(),
+  /** Task 5: `with:` inputs set (non-empty) to anything but these values (or an expression) mean the same. */
+  skipUnless: inputs.optional(),
+  /** Task 5: pre-commit hooks that run this tool: the hook repo (exact URL) and its hook ids. */
+  precommitHooks: z.array(z.strictObject({ repo: z.string().regex(HOOK_REPO_RE), ids: z.array(z.string().regex(HOOK_ID_RE)).min(1) })).min(1).optional(),
 })
   .refine((t) => t.actions !== undefined || t.commands !== undefined, { message: 'needs actions or commands' })
   .refine((t) => t.commandFails !== 'flag' || t.failFlags !== undefined, { message: 'commandFails: flag needs failFlags' })
   .refine((t) => t.actionFails !== 'input' || t.failInputs !== undefined, { message: 'actionFails: input needs failInputs' })
-  .refine((t) => t.excludes === undefined || t.commands !== undefined, { message: 'excludes needs commands' });
+  .refine((t) => t.excludes === undefined || t.commands !== undefined, { message: 'excludes needs commands' })
+  .refine((t) => (t.onlyWithFlags === undefined && t.notWithFlags === undefined) || t.commands !== undefined, { message: 'onlyWithFlags and notWithFlags need commands' })
+  .refine((t) => (t.skipInputs === undefined && t.skipUnless === undefined) || t.actions !== undefined, { message: 'skipInputs and skipUnless need actions' });
 
 const signaturesSchema = z.strictObject({ tools: z.array(signatureSchema).min(1) })
   .refine((f) => new Set(f.tools.map((t) => t.id)).size === f.tools.length, { message: 'ids must be unique' });
@@ -152,13 +182,24 @@ export function loadToolSignatures(path: string = packageDataPath('tool-signatur
 /** One way to recognise a command: the first word (or a whole path), then the following words exactly. */
 interface CommandRule { tool: ToolSignature; rest: string[]; excludes: string[][] }
 interface ActionRule { tool: ToolSignature; parts: string[]; prefixLast: boolean }
-interface Compiled { byFirstWord: Map<string, CommandRule[]>; byPath: Map<string, CommandRule[]>; actions: ActionRule[] }
+interface Compiled {
+  byFirstWord: Map<string, CommandRule[]>; byPath: Map<string, CommandRule[]>; actions: ActionRule[];
+  /** `hookRepoKey(repo, id)` → the tools a pre-commit hook of that repo and id runs (Task 5). */
+  hooks: Map<string, ToolSignature[]>;
+}
+
+/** A pre-commit `repo:` URL compared exactly, ignoring letter case, a trailing slash and a trailing .git. */
+const hookRepoKey = (repo: string, id: string) => `${repo.trim().toLowerCase().replace(/\/+$/, '').replace(/\.git$/, '')}\u0000${id}`;
 
 function compile(tools: ToolSignature[]): Compiled {
   const byFirstWord = new Map<string, CommandRule[]>();
   const byPath = new Map<string, CommandRule[]>();
   const actions: ActionRule[] = [];
+  const hooks = new Map<string, ToolSignature[]>();
   for (const tool of tools) {
+    for (const h of tool.precommitHooks ?? []) {
+      for (const id of h.ids) hooks.set(hookRepoKey(h.repo, id), [...(hooks.get(hookRepoKey(h.repo, id)) ?? []), tool]);
+    }
     for (const cmd of tool.commands ?? []) {
       const [first, ...rest] = cmd.split(' ') as [string, ...string[]];
       const excludes = (tool.excludes ?? []).map((e) => e.split(' ')).filter((e) => e[0] === first && e.length > 1).map((e) => e.slice(1));
@@ -175,7 +216,7 @@ function compile(tools: ToolSignature[]): Compiled {
       actions.push({ tool, parts, prefixLast });
     }
   }
-  return { byFirstWord, byPath, actions };
+  return { byFirstWord, byPath, actions, hooks };
 }
 
 let defaultCompiled: Compiled | undefined;
@@ -269,7 +310,15 @@ type CiLayer = Exclude<Layer, 'pre-commit'>;
 type Fit = Record<CiLayer, boolean>;
 
 /** A tool found in shell text or a step. `reason` null = it runs and can fail the run. */
-interface Found { categories: readonly string[]; by: string; subject: string; dir: string | null; reason: Reason | null; partialWhy?: string }
+interface Found {
+  categories: readonly string[]; by: string; subject: string; dir: string | null; reason: Reason | null; partialWhy?: string;
+  /** Task 5: `npm|pnpm|yarn|bun run <script>`, counted only once the script's own text is read (resolveScripts). */
+  script?: string;
+  /** Task 5: a tox or nox run; an environment variable that picks other envs or sessions (TOX*, NOX*) drops it. */
+  envGate?: 'tox' | 'nox';
+  /** Task 5: `pre-commit run` over all files at the pre-commit stage: the hooks' lint tools run here too (SKIP drops it). */
+  hookRun?: boolean;
+}
 interface Hit {
   opaque: boolean;
   categories: readonly string[];
@@ -281,6 +330,7 @@ interface Hit {
   fit: Fit;
   where: string;
   why?: string;
+  hookRun?: boolean;
 }
 
 const list = (v: unknown): unknown[] => (Array.isArray(v) ? v : []);
@@ -467,7 +517,7 @@ const ARGS_INPUTS = ['args', 'cmd_options', 'options'];
 /** Whether an input the tool is read by (its listed inputs, or `names`) has more spellings than pipegen keeps. */
 function inputsCrowded(tool: ToolSignature, w: Inputs, names: readonly string[]): boolean {
   if (w.crowded.size === 0) return false;
-  const listed = [tool.softInputs, tool.softUnless, tool.failInputs].flatMap((spec) => Object.keys(spec ?? {}));
+  const listed = [tool.softInputs, tool.softUnless, tool.failInputs, tool.skipInputs, tool.skipUnless].flatMap((spec) => Object.keys(spec ?? {}));
   return [...listed, ...names].some((name) => w.crowded.has(name.toLowerCase()));
 }
 
@@ -479,6 +529,19 @@ function actionReason(tool: ToolSignature, w: Inputs): Reason | null {
   if (tool.actionFails === 'input' && !failInputGiven(tool.failInputs, w)) return 'no-fail';
   return null;
 }
+
+/** Task 5: the step's inputs mean the action doesn't do this check at all (pypi-publish with a password: no attestation). */
+function actionSkipped(tool: ToolSignature, w: Inputs): boolean {
+  if (tool.skipInputs === undefined && tool.skipUnless === undefined) return false;
+  const names = [tool.skipInputs, tool.skipUnless].flatMap((spec) => Object.keys(spec ?? {}));
+  if (names.some((name) => w.crowded.has(name.toLowerCase()))) return true; // can't tell: it doesn't count
+  return softInputGiven(tool.skipInputs, w) || inputSetOtherwise(tool.skipUnless, w);
+}
+
+/** Task 5: a command signature that counts only with (onlyWithFlags) or without (notWithFlags) some flags. */
+const flagsAllow = (tool: ToolSignature, args: readonly string[]) =>
+  (tool.onlyWithFlags === undefined || tool.onlyWithFlags.some((f) => args.includes(f)))
+  && !(tool.notWithFlags ?? []).some((f) => flagGiven(f, args));
 
 const foundOf = (tool: ToolSignature, dir: string | null, reason: Reason | null): Found => ({
   categories: tool.categories, by: tool.id, subject: `The ${tool.id} check`, dir, reason,
@@ -770,7 +833,7 @@ function tokenize(text: string): Tk[] {
 
 const ASSIGN = /^[A-Za-z_][A-Za-z0-9_]*=/;
 /** Words after which the next non-flag word is a command. */
-const WRAPPERS = new Set(['sudo', 'time', 'npx', 'bunx', 'uvx', 'env', 'nohup', 'exec', 'command', 'xargs', 'sh', 'bash', 'zsh', 'dash']);
+const WRAPPERS = new Set(['sudo', 'time', 'npx', 'bunx', 'uvx', 'env', 'nohup', 'exec', 'command', 'xargs', 'sh', 'bash', 'zsh', 'dash', 'nyc']);
 /** Flags of a wrapper that take the next word as their value. */
 const WRAPPER_VALUE_FLAGS: Readonly<Record<string, ReadonlySet<string>>> = {
   sudo: new Set(['-u', '-g', '-C', '-D', '-h', '-p', '-r', '-t', '-T', '-U', '--user', '--group', '--chdir', '--host', '--prompt']),
@@ -780,7 +843,42 @@ const WRAPPER_VALUE_FLAGS: Readonly<Record<string, ReadonlySet<string>>> = {
 /** Two-word wrappers: pnpm dlx, uv run, python -m, … */
 const SUB_WRAPPERS: Readonly<Record<string, readonly string[]>> = {
   pnpm: ['dlx', 'exec'], yarn: ['dlx', 'exec'], npm: ['exec'], bun: ['x'], uv: ['run'], pipx: ['run'], poetry: ['run'],
-  pdm: ['run'], hatch: ['run'], python: ['-m'], python3: ['-m'],
+  pdm: ['run'], hatch: ['run'], pipenv: ['run'], python: ['-m'], python3: ['-m'],
+};
+/**
+ * Task 5: wrappers whose flags pipegen knows in full. A flag outside these lists ends the match (no command at all), so
+ * the value of a flag pipegen doesn't know (`uv run --with ruff python …`) can never be read as the command.
+ * - uv run: https://docs.astral.sh/uv/reference/cli/#uv-run (checked 2026-10-27; `-m`/`--module` is a plain flag).
+ * - nyc: its options are the nyc entries of https://github.com/istanbuljs/schema/blob/master/index.js (array, string and
+ *   number options take a value); nyc exits with the wrapped command's exit code
+ *   (https://github.com/istanbuljs/nyc/blob/main/bin/nyc.js: `let exitCode = process.exitCode || code`).
+ */
+interface StrictFlags { valued: ReadonlySet<string>; boolean: ReadonlySet<string> }
+const STRICT_WRAPPER_FLAGS: Readonly<Record<string, StrictFlags>> = {
+  uv: {
+    valued: new Set(['--allow-insecure-host', '--trusted-host', '--cache-dir', '--color', '--config-file', '--config-setting', '--config-settings', '-C',
+      '--config-settings-package', '--default-index', '--directory', '--env-file', '--exclude-newer', '--exclude-newer-package', '--extra',
+      '--extra-index-url', '--find-links', '-f', '--fork-strategy', '--group', '--index', '--index-strategy', '--index-url', '-i', '--keyring-provider',
+      '--link-mode', '--no-binary-package', '--no-build-isolation-package', '--no-build-package', '--no-editable-package', '--no-extra', '--no-group',
+      '--no-sources-package', '--only-group', '--package', '--prerelease', '--prerelease-package', '--project', '--python', '-p', '--python-platform',
+      '--refresh-package', '--reinstall-package', '--resolution', '--upgrade-group', '--upgrade-package', '-P', '--with', '-w', '--with-editable',
+      '--with-requirements']),
+    boolean: new Set(['--active', '--all-extras', '--all-groups', '--all-packages', '--compile-bytecode', '--compile', '--exact', '--frozen', '--gui-script',
+      '--isolated', '--locked', '--managed-python', '--module', '-m', '--no-binary', '--no-build', '--no-build-isolation', '--no-cache', '--no-cache-dir',
+      '-n', '--no-config', '--no-default-groups', '--no-dev', '--no-editable', '--no-env-file', '--no-index', '--no-managed-python', '--no-progress',
+      '--no-project', '--no_workspace', '--no-python-downloads', '--no-require-build-hashes', '--no-sources', '--no-sync', '--offline', '--only-dev',
+      '--quiet', '-q', '--refresh', '--reinstall', '--force-reinstall', '--require-build-hashes', '--script', '-s', '--system-certs', '--upgrade', '-U',
+      '--verbose', '-v']),
+  },
+  nyc: {
+    valued: new Set(['--cwd', '--nycrc-path', '--temp-dir', '-t', '--temp-directory', '--exclude', '-x', '--include', '-n', '--extension', '-e',
+      '--ignore-class-methods', '--parser-plugins', '--require', '-i', '--branches', '--functions', '--lines', '--statements', '--reporter', '-r',
+      '--report-dir', '--cache-dir']),
+    boolean: new Set(['--exclude-node-modules', '--auto-wrap', '--es-modules', '--compact', '--preserve-comments', '--produce-source-map', '--source-map',
+      '--instrument', '--exclude-after-remap', '--per-file', '--check-coverage', '--show-process-tree', '--skip-empty', '--skip-full', '--silent', '-s',
+      '--all', '-a', '--eager', '--cache', '-c', '--babel-cache', '--use-spawn-wrap', '--hook-require', '--hook-run-in-context',
+      '--hook-run-in-this-context', '--clean', '--in-place', '--exit-on-error', '--delete', '--complete-copy']),
+  },
 };
 /** `yarn eslint .` and `pnpm eslint .` run a package binary: the next word is a command too. */
 const BIN_RUNNERS = new Set(['yarn', 'pnpm']);
@@ -796,11 +894,68 @@ const END_KEYWORDS = new Set(['fi', 'done', 'esac']);
 /** A call that only prints the version or help, not a run. */
 const probeCall = (args: readonly string[]) =>
   args.includes('--version') || args.includes('--help') || (args.length === 1 && ['-v', '-V', '-h'].includes(args[0] as string));
-/** Script names after `npm run` etc. (ruling S5): test, lint, or test:… / lint:… */
+/** Script names after `npm run` etc. (ruling S5): test, lint, or test:… / lint:…, counted by name. */
 const OWN_NAME_RE = /^(?:test|lint)(?::[A-Za-z0-9_.-]{1,64})?$/;
+/** Task 5: any other script name, counted only when the script's own text runs a known test or lint tool. */
+const SCRIPT_NAME_RE = /^[A-Za-z0-9_.][A-Za-z0-9_.:-]{0,63}$/;
+const PACKAGE_MANAGERS = ['npm', 'pnpm', 'yarn', 'bun'];
+/** Task 5: a script that only fixes (lint:fix, lint-fix, format:write) is not a check. */
+const fixOnly = (name: string) => name.toLowerCase().split(/[:_-]/).some((seg) => seg === 'fix' || seg === 'write');
+const ownName = (name: string) => OWN_NAME_RE.test(name) && !fixOnly(name);
 const TEST_CATEGORIES = ['unit-tests', 'full-tests'] as const;
+/** What an own script can count for, from what its text runs (Task 5). */
+const SCRIPT_CATEGORIES: ReadonlySet<string> = new Set(['unit-tests', 'full-tests', 'lint', 'format-lint']);
+
+/**
+ * Task 5: tox and nox count as the project's own test runner (like `npm test`) only when the command line picks no
+ * other envs or sessions. A long flag also matches by an abbreviation (argparse's default); short flags may be grouped.
+ * tox 4 (https://tox.wiki/en/latest/reference/config.html: "Set a CLI option's default with TOX_<option>", so TOX_ENV
+ * picks envs like -e); TOXENV and every other variable named TOX… or NOX… is handled where the step's environment is read.
+ */
+const TOX_RUN_SUBS: ReadonlySet<string> = new Set(['run', 'r', 'run-parallel', 'p']);
+const TOX_LONG = ['--env', '--labels', '--factors', '--notest', '--skip-env', '--override', '--listenvs', '--listenvs-all', '--showconfig', '--help-ini', '--devenv'];
+const TOX_SHORT = 'emfnxla';
+const NOX_LONG = ['--session', '--sessions', '--keywords', '--tags', '--list', '--list-sessions', '--json', '--install-only', '--usage'];
+const NOX_SHORT = 'sektl';
+function picksOther(flag: string, long: readonly string[], short: string): boolean {
+  if (flag.startsWith('--')) {
+    const name = flag.split('=')[0] as string;
+    return name.length > 2 && long.some((f) => f.startsWith(name));
+  }
+  return [...(flag.slice(1).split('=')[0] as string)].some((c) => short.includes(c));
+}
+
+/**
+ * Task 5: `pre-commit run` words (after `run`) that run every pre-commit-stage hook on every file: `--all-files`/`-a`,
+ * no hook id, no other stage, no other config, no file list (https://pre-commit.com/#pre-commit-run). Without
+ * --all-files, `pre-commit run` checks the staged files, and a CI checkout has none.
+ */
+function preCommitAllFiles(words: readonly string[]): boolean {
+  let all = false;
+  for (let i = 0; i < words.length; i++) {
+    const w = words[i] as string;
+    const r = redirection(w);
+    if (r !== null) {
+      if (!r) i++;
+      continue;
+    }
+    if (!w.startsWith('-')) return false; // a hook id, or the value of a flag pipegen doesn't know
+    const eq = w.indexOf('=');
+    const name = eq < 0 ? w : w.slice(0, eq);
+    const value = eq < 0 ? undefined : w.slice(eq + 1);
+    if ((name === '-a' || name === '--all-files') && value === undefined) all = true;
+    else if (value === undefined && ['--show-diff-on-failure', '-v', '--verbose', '--fail-fast'].includes(name)) continue;
+    else if (name === '--color') i += value === undefined ? 1 : 0;
+    else if (name === '--hook-stage') {
+      const stage = value ?? words[++i];
+      if (stage !== 'pre-commit' && stage !== 'commit') return false;
+    } else return false;
+  }
+  return all;
+}
 
 const basename = (w: string) => w.slice(w.lastIndexOf('/') + 1);
+const PRE_COMMIT_ID = 'pre-commit';
 /** The image's name: no registry or owner, no :tag or @digest (ghcr.io/zricethezav/gitleaks:v8 → gitleaks). */
 function imageName(image: string): string {
   const at = image.indexOf('@');
@@ -941,7 +1096,7 @@ function scanShell(text: string, base: string | null, sigs: Compiled, budget: Bu
   const found: Found[] = [];
   const seen = new Set<string>(); // one finding per tool, directory and reason per text
   const add = (f: Found) => {
-    const key = `${f.by}\u0000${f.dir ?? ''}\u0000${f.reason ?? ''}`;
+    const key = `${f.by}\u0000${f.dir ?? ''}\u0000${f.reason ?? ''}\u0000${f.hookRun === true ? 1 : 0}`;
     if (!seen.has(key)) {
       seen.add(key);
       found.push(f);
@@ -977,28 +1132,96 @@ function scanShell(text: string, base: string | null, sigs: Compiled, budget: Bu
     if (probeCall(args)) return;
     const tryRules = (rules: CommandRule[] | undefined) => {
       for (const r of rules ?? []) {
-        if (!followedBy(k, r.rest) || r.excludes.some((x) => followedBy(k, x))) continue;
-        add(foundOf(r.tool, cwd, shellReason(k) ?? commandReason(r.tool, args)));
+        if (!followedBy(k, r.rest) || r.excludes.some((x) => followedBy(k, x)) || !flagsAllow(r.tool, args)) continue;
+        const f = foundOf(r.tool, cwd, shellReason(k) ?? commandReason(r.tool, args));
+        // `pre-commit run --all-files` (the whole list of words read: none past MAX_FLAG_WORDS)
+        if (r.tool.id === PRE_COMMIT_ID && r.rest.length === 1 && r.rest[0] === 'run' && segEnd[k]! - k - 1 <= MAX_FLAG_WORDS
+          && preCommitAllFiles(args.slice(1))) f.hookRun = true;
+        add(f);
       }
     };
     if (w.includes('/')) tryRules(sigs.byPath.get(stripDotSlash(w)));
     tryRules(sigs.byFirstWord.get(name));
     if (w !== name) return;
     // The service's own scripts (ruling S5): npm test, npm run test|lint, pnpm|yarn|bun [run] test|lint, pytest,
-    // python -m pytest. Only fixed words and a script name matching OWN_NAME_RE go into the phrase.
+    // python -m pytest; never a script that only fixes. Task 5: `npm|pnpm|yarn|bun run <other name>` (counted once
+    // resolveScripts has read the script's text) and the tox / nox runners. Only fixed words and a script name
+    // matching OWN_NAME_RE or SCRIPT_NAME_RE go into the phrase.
     let words: string[] | null = null;
+    let script: string | undefined;
+    let envGate: Found['envGate'];
     const a = word(k + 1);
     const b = word(k + 2);
     if (name === 'pytest') words = ['pytest'];
     else if ((name === 'python' || name === 'python3') && a === '-m' && b === 'pytest') words = [name, '-m', 'pytest'];
     else if (name === 'npm' && a === 'test') words = ['npm', 'test'];
-    else if (['npm', 'pnpm', 'yarn', 'bun'].includes(name) && a === 'run' && b !== null && OWN_NAME_RE.test(b)) words = [name, 'run', b];
-    else if (['pnpm', 'yarn', 'bun'].includes(name) && a !== null && OWN_NAME_RE.test(a)) words = [name, a];
+    else if (PACKAGE_MANAGERS.includes(name) && a === 'run' && b !== null && ownName(b)) words = [name, 'run', b];
+    else if (['pnpm', 'yarn', 'bun'].includes(name) && a !== null && ownName(a)) words = [name, a];
+    else if (PACKAGE_MANAGERS.includes(name) && a === 'run' && b !== null && SCRIPT_NAME_RE.test(b) && !fixOnly(b) && !OWN_NAME_RE.test(b)
+      && scriptFlagsOk(k + 2)) {
+      words = [name, 'run', b];
+      script = b;
+    } else if (name === 'tox') {
+      const sub = toxRun(k);
+      if (sub !== null) [words, envGate] = [sub === '' ? ['tox'] : ['tox', sub], 'tox'];
+    } else if (name === 'nox' && noxRun(k)) [words, envGate] = [['nox'], 'nox'];
     if (words === null) return;
     const cmd = words.join(' ');
-    const categories = (words[words.length - 1] as string).startsWith('lint') ? ['lint'] : TEST_CATEGORIES;
-    add({ categories, by: `your own \`${cmd}\``, subject: `Your own \`${cmd}\``, dir: cwd, reason: shellReason(k) });
+    const categories = script !== undefined ? [] : (words[words.length - 1] as string).startsWith('lint') ? ['lint'] : TEST_CATEGORIES;
+    add({
+      categories, by: `your own \`${cmd}\``, subject: `Your own \`${cmd}\``, dir: cwd, reason: shellReason(k),
+      ...(script === undefined ? {} : { script }), ...(envGate === undefined ? {} : { envGate }),
+    });
   };
+  /**
+   * The words of the simple command at k, past redirections (more than MAX_FLAG_WORDS: false). `onWord` sees each
+   * other word with the one before it, and returns false to refuse the command line.
+   */
+  const commandWords = (k: number, onWord: (w: string, prev: string) => boolean): boolean => {
+    if (segEnd[k]! - k - 1 > MAX_FLAG_WORDS) return false;
+    let prev = '';
+    for (let j = k + 1; j < segEnd[k]!; j++) {
+      const w = toks[j]!.w;
+      const r = redirection(w);
+      if (r !== null) {
+        if (!r) j++;
+        continue;
+      }
+      if (w === '--') return true; // the rest goes to the tests themselves
+      if (!onWord(w, prev)) return false;
+      prev = w;
+    }
+    return true;
+  };
+  /**
+   * After `<pm> run <script>`: no flag before `--` other than --silent, -s or --if-present. npm reads such flags as its
+   * own settings (`--workspace=x` runs another package's script; pnpm has --filter and -r), so the script read from
+   * this directory's package.json might not be the one that runs.
+   */
+  const scriptFlagsOk = (k: number): boolean => {
+    for (let j = k + 1; j < Math.min(segEnd[k]!, k + 1 + MAX_FLAG_WORDS); j++) {
+      const w = toks[j]!.w;
+      if (w === '--') return true;
+      if (w.startsWith('-') && redirection(w) === null && !['--silent', '-s', '--if-present'].includes(w)) return false;
+    }
+    return segEnd[k]! - k - 1 <= MAX_FLAG_WORDS;
+  };
+  /** `tox` / `tox run|r|run-parallel|p` picking no other envs: the subcommand ('' for none), or null. */
+  const toxRun = (k: number): string | null => {
+    let sub = '';
+    const ok = commandWords(k, (w, prev) => {
+      if (w.startsWith('-')) return !picksOther(w, TOX_LONG, TOX_SHORT);
+      if ((prev === '-p' || prev === '--parallel') && /^(?:auto|all|\d{1,4})$/.test(w)) return true;
+      if (sub === '' && TOX_RUN_SUBS.has(w)) {
+        sub = w;
+        return true;
+      }
+      return false; // a positional word: another subcommand (list, exec, …) or a flag value pipegen doesn't know
+    });
+    return ok ? sub : null;
+  };
+  /** `nox` picking no sessions, with no positional word. */
+  const noxRun = (k: number): boolean => commandWords(k, (w) => w.startsWith('-') && !picksOther(w, NOX_LONG, NOX_SHORT));
   /** If the command word at k starts a function definition, the index of its body's opening bracket, else -1. */
   const functionBody = (k: number) => {
     let j = k;
@@ -1012,7 +1235,22 @@ function scanShell(text: string, base: string | null, sigs: Compiled, budget: Bu
     while (toks[j]?.op === '\n') j++;
     return toks[j]?.op === '{' || toks[j]?.op === '(' || toks[j]?.kw === 'open' ? j : -1; // any compound command
   };
+  /** Past a strict wrapper's flags (STRICT_WRAPPER_FLAGS): the index of its command, or -1 for a flag it doesn't know. */
+  const skipStrictFlags = (k: number, f: StrictFlags) => {
+    let j = k;
+    for (let w = word(j); w !== null && w.startsWith('-'); w = word(j)) {
+      if (w === '--') return j + 1;
+      const eq = w.indexOf('=');
+      const name = eq < 0 ? w : w.slice(0, eq);
+      if (f.valued.has(name)) j += eq < 0 ? 2 : 1;
+      else if (eq < 0 && (f.boolean.has(name) || (name.startsWith('--no-') && f.boolean.has(`--${name.slice(5)}`)))) j += 1;
+      else return -1;
+    }
+    return j;
+  };
   const skipFlags = (k: number, wrapper: string) => {
+    const strict = STRICT_WRAPPER_FLAGS[wrapper];
+    if (strict !== undefined) return skipStrictFlags(k, strict);
     const valued = WRAPPER_VALUE_FLAGS[wrapper];
     let j = k;
     for (let w = word(j); w !== null && (w.startsWith('-') || (wrapper === 'env' && ASSIGN.test(w))); w = word(j)) j += valued?.has(w) ? 2 : 1;
@@ -1116,13 +1354,15 @@ function scanShell(text: string, base: string | null, sigs: Compiled, budget: Bu
       continue;
     }
     if (next !== null && SUB_WRAPPERS[name]?.includes(next)) {
-      k = skipFlags(k + 2, name);
-      cmd = true;
+      const j = skipFlags(k + 2, name);
+      cmd = j >= 0; // a flag a strict wrapper doesn't know: no command follows
+      k = j >= 0 ? j : k + 2;
       continue;
     }
     if (WRAPPERS.has(name)) {
-      k = skipFlags(k + 1, name);
-      cmd = true;
+      const j = skipFlags(k + 1, name);
+      cmd = j >= 0;
+      k = j >= 0 ? j : k + 1;
       continue;
     }
     cmd = BIN_RUNNERS.has(name);
@@ -1329,7 +1569,39 @@ function localPath(uses: string): string | 'outside' | null {
 
 // ---------- walking workflows (rulings S3, S26, U3) ----------
 
-interface Ctx { p: RepoProfile; sigs: Compiled; read: Reader; budget: Budget; hits: Hit[]; localFiles: Set<string>; unreadable: boolean }
+interface Ctx {
+  p: RepoProfile; sigs: Compiled; read: Reader; budget: Budget; hits: Hit[]; localFiles: Set<string>; unreadable: boolean;
+  /** Task 5: package.json files, read through their own Reader so they never use up the workflow reads. */
+  pkgRead: Reader;
+  pkgScripts: Map<string, Promise<ReadonlyMap<string, string> | null>>;
+  /** Task 5: what each (dir, script) runs, worked out once; an entry being worked out is [] (a cycle ends there). */
+  scriptMemo: Map<string, Found[]>;
+  precommitConfig?: Promise<{ readable: boolean; found: Found[] }>;
+}
+/**
+ * Task 5: environment variables that change what a run does, seen anywhere in the job (the workflow's, the job's or a
+ * step's `env:` keys, any letter case, or any step's run text, where `echo X=… >> $GITHUB_ENV` would set one): TOX… and
+ * NOX… pick envs or sessions (tox 4 reads TOX_<option>; TOXENV; NOXSESSION), SKIP skips pre-commit hooks
+ * (https://pre-commit.com/#temporarily-disabling-hooks). An action that sets one through GITHUB_ENV isn't seen.
+ */
+interface EnvGate { tox: boolean; nox: boolean; skip: boolean }
+const NO_GATE: EnvGate = { tox: false, nox: false, skip: false };
+function gateOf(texts: readonly string[], envs: readonly unknown[], base: EnvGate = NO_GATE): EnvGate {
+  // an `env:` given as one expression could set anything
+  if (envs.some((e) => e !== undefined && e !== null && (typeof e !== 'object' || Array.isArray(e)))) return { tox: true, nox: true, skip: true };
+  const keys = envs.flatMap((e) => Object.keys(asObj(e)).slice(0, MAX_INPUT_KEYS)).map((k) => k.toUpperCase());
+  const inText = (needle: string) => texts.some((t) => t.includes(needle));
+  return {
+    tox: base.tox || keys.some((k) => k.startsWith('TOX')) || inText('TOX'),
+    nox: base.nox || keys.some((k) => k.startsWith('NOX')) || inText('NOX'),
+    skip: base.skip || keys.includes('SKIP') || inText('SKIP'),
+  };
+}
+/** Drops the tox / nox runs an env var may point elsewhere, and the hook runs SKIP may thin out. */
+const gated = (found: Found[], g: EnvGate): Found[] => found
+  .filter((f) => !((f.envGate === 'tox' && g.tox) || (f.envGate === 'nox' && g.nox)))
+  .map((f) => (f.hookRun === true && g.skip ? { ...f, hookRun: false } : f));
+
 interface StepCtx {
   fit: Fit;
   where: string;
@@ -1342,6 +1614,8 @@ interface StepCtx {
   /** The step (or the local action step that led here) sets more `with:` inputs than pipegen reads. */
   inputsUnread: boolean;
   depth: number;
+  /** Task 5: env vars seen in the job that change what tox, nox or pre-commit run. */
+  gate: EnvGate;
 }
 
 function spend(ctx: Ctx): boolean {
@@ -1371,7 +1645,7 @@ function addFound(ctx: Ctx, found: Found[], c: StepCtx): void {
     const reason: Reason | null = c.continueOnError ? 'continue' : (f.reason ?? (c.inputsUnread ? 'inputs' : c.conditional ? 'condition' : null));
     ctx.hits.push({
       opaque: false, categories: f.categories, by: f.by, subject: f.subject, dir: f.dir, reason,
-      ...(f.partialWhy === undefined ? {} : { partialWhy: f.partialWhy }), fit: c.fit, where: c.where,
+      ...(f.partialWhy === undefined ? {} : { partialWhy: f.partialWhy }), fit: c.fit, where: c.where, ...(f.hookRun === true ? { hookRun: true } : {}),
     });
   }
 }
@@ -1392,6 +1666,90 @@ function actionMatches(sigs: Compiled, uses: string): ToolSignature[] {
 
 const repoId = (ctx: Ctx): RepoId => ({ owner: ctx.p.owner, repo: ctx.p.repo });
 
+// ---------- own scripts read from package.json (Task 5) ----------
+
+/** How npm runs a script: `/bin/sh -c` on POSIX (https://docs.npmjs.com/cli/v11/using-npm/scripts), so no -e. */
+const NPM_SCRIPT_SHELL: ShellMode = { errexit: false, pipefail: false };
+const MAX_PACKAGE_FILES = 50; // distinct package.json files read for scripts
+const MAX_SCRIPTS = 200;      // distinct (dir, script) pairs worked out
+
+/** The `scripts` of `<dir>/package.json` (string values only), or null when it can't be read. */
+function packageScripts(ctx: Ctx, dir: string): Promise<ReadonlyMap<string, string> | null> {
+  let r = ctx.pkgScripts.get(dir);
+  if (r === undefined) {
+    r = ctx.pkgScripts.size >= MAX_PACKAGE_FILES ? Promise.resolve(null) : ctx.pkgRead.text(dir === '.' ? 'package.json' : `${dir}/package.json`).then((t) => {
+      if (!('ok' in t)) return null;
+      try {
+        const scripts = asObj(asObj(JSON.parse(t.ok)).scripts);
+        return new Map(Object.entries(scripts).filter((e): e is [string, string] => typeof e[1] === 'string'));
+      } catch {
+        return null;
+      }
+    });
+    ctx.pkgScripts.set(dir, r);
+  }
+  return r;
+}
+
+/**
+ * What the script `name` of `<dir>/package.json` runs that counts for an own script (tests, lint, format-lint): its
+ * text is read as npm runs it (sh -c, no -e), and the own scripts it calls in turn are read the same way. Worked out
+ * once per (dir, name); a cycle, an unreadable package.json or a missing script gives [].
+ */
+async function scriptRuns(ctx: Ctx, dir: string, name: string): Promise<Found[]> {
+  const key = `${dir}\u0000${name}`;
+  const known = ctx.scriptMemo.get(key);
+  if (known !== undefined) return known;
+  if (ctx.scriptMemo.size >= MAX_SCRIPTS) return [];
+  ctx.scriptMemo.set(key, []); // being worked out: a script that calls itself (directly or not) adds nothing
+  const text = (await packageScripts(ctx, dir))?.get(name);
+  if (text === undefined) return [];
+  const inner = gated(await resolveScripts(ctx, scanShell(text, dir, ctx.sigs, ctx.budget, NPM_SCRIPT_SHELL)), gateOf([text], []));
+  const out = inner.flatMap((g) => {
+    const categories = g.categories.filter((x) => SCRIPT_CATEGORIES.has(x));
+    return categories.length === 0 ? [] : [{ ...g, categories, hookRun: false }];
+  });
+  ctx.scriptMemo.set(key, out);
+  return out;
+}
+
+/**
+ * Own-script candidates (`npm run <name>` for a name not counted by name) become what their script runs, under the
+ * caller's phrase, in the directory the script's tool runs in; the caller's reason (an `||`, a pipe, …) comes first. A candidate whose script runs
+ * nothing that counts is dropped.
+ */
+async function resolveScripts(ctx: Ctx, found: Found[]): Promise<Found[]> {
+  if (!found.some((f) => f.script !== undefined)) return found;
+  const out: Found[] = [];
+  for (const f of found) {
+    if (f.script === undefined) {
+      out.push(f);
+      continue;
+    }
+    if (f.dir === null) continue;
+    for (const g of await scriptRuns(ctx, f.dir, f.script)) {
+      out.push({ // the script's own `cd` counts: `cd api && jest` tests the api service only
+        categories: g.categories, by: f.by, subject: f.subject, dir: g.dir, reason: f.reason ?? g.reason,
+        ...(g.envGate === undefined ? {} : { envGate: g.envGate }),
+      });
+    }
+  }
+  return out;
+}
+
+/** Task 5: pre-commit/action runs `pre-commit run … ${extra_args}`, `--all-files` by default (https://github.com/pre-commit/action/blob/main/action.yml). */
+function preCommitActionAllFiles(w: Inputs): boolean {
+  if (w.crowded.has('extra_args')) return false;
+  const all = w.byName.get('extra_args') ?? [];
+  if (all.length === 0) return true;
+  return all.every((v) => {
+    if (v === null || v === undefined) return true; // `extra_args:` with no value: the default
+    if (typeof v !== 'string' || !regexSafe(v) || v.includes('${{')) return false;
+    const toks = tokenize(v);
+    return toks.every((t) => t.op === null) && preCommitAllFiles(toks.map((t) => t.w));
+  });
+}
+
 async function walkStep(ctx: Ctx, step: Obj, c: StepCtx): Promise<void> {
   if (!spend(ctx)) return;
   const cond = condition(step.if, repoId(ctx));
@@ -1399,7 +1757,7 @@ async function walkStep(ctx: Ctx, step: Obj, c: StepCtx): Promise<void> {
   const withInputs = lowerInputs(asObj(step.with));
   const sc: StepCtx = {
     ...c, continueOnError: c.continueOnError || allowedToFail(step['continue-on-error']), conditional: c.conditional || cond === 'partial',
-    inputsUnread: c.inputsUnread || withInputs.unread,
+    inputsUnread: c.inputsUnread || withInputs.unread, gate: gateOf(typeof step.run === 'string' ? [step.run] : [], [step.env], c.gate),
   };
   if (typeof step.uses === 'string' && regexSafe(step.uses)) {
     const uses = step.uses.trim();
@@ -1409,14 +1767,19 @@ async function walkStep(ctx: Ctx, step: Obj, c: StepCtx): Promise<void> {
       addFound(ctx, scanImage(uses, withInputs, ctx.sigs), sc);
     } else {
       const tools = actionMatches(ctx.sigs, uses);
-      addFound(ctx, tools.map((t) => foundOf(t, '.', actionReason(t, withInputs))), sc);
+      addFound(ctx, gated(tools.filter((t) => !actionSkipped(t, withInputs)).map((t) => {
+        const f = foundOf(t, '.', actionReason(t, withInputs));
+        if (t.id === PRE_COMMIT_ID && preCommitActionAllFiles(withInputs)) f.hookRun = true;
+        return f;
+      }), sc.gate), sc);
       const owner = uses.split('/')[0]?.toLowerCase();
       if (tools.length === 0 && owner !== undefined && owner === ctx.p.owner.toLowerCase()) opaque(ctx, OPAQUE_WHY.ownerAction, validRef(uses), sc);
     }
   }
   if (typeof step.run === 'string') {
     const base = firstSet(workingDir(step['working-directory']), c.runDir);
-    addFound(ctx, scanShell(step.run, base, ctx.sigs, ctx.budget, shellMode(step.shell ?? c.shell)), sc);
+    const found = await resolveScripts(ctx, scanShell(step.run, base, ctx.sigs, ctx.budget, shellMode(step.shell ?? c.shell)));
+    addFound(ctx, gated(found, sc.gate), sc);
   }
 }
 
@@ -1487,14 +1850,16 @@ async function walkWorkflow(ctx: Ctx, doc: Obj, path: string, fit: Fit, depth: n
     const where = cut(`${prefix}${path} (job ${label})`);
     const jobConditional = conditional || cond === 'partial';
     if (typeof job.uses === 'string' && regexSafe(job.uses)) {
-      await callWorkflow(ctx, job.uses.trim(), { fit, where, runDir: '.', shell: undefined, continueOnError: false, conditional: jobConditional, inputsUnread: false, depth });
+      await callWorkflow(ctx, job.uses.trim(), { fit, where, runDir: '.', shell: undefined, continueOnError: false, conditional: jobConditional, inputsUnread: false, depth, gate: NO_GATE });
       continue;
     }
     const steps = list(job.steps);
     if (steps.length > MAX_STEPS) ctx.budget.truncated = true;
+    const kept = steps.slice(0, MAX_STEPS).map(asObj);
     const c: StepCtx = {
       fit, where, runDir: firstSet(defaultsDir(job), wfDir), shell: defaultsShell(job) ?? wfShell ?? (onWindows(job) ? 'pwsh' : undefined),
       continueOnError: allowedToFail(job['continue-on-error']), conditional: jobConditional, inputsUnread: false, depth,
+      gate: gateOf(kept.flatMap((st) => (typeof st.run === 'string' ? [st.run] : [])), [doc.env, job.env, ...kept.map((st) => st.env)]),
     };
     for (const step of steps.slice(0, MAX_STEPS)) await walkStep(ctx, asObj(step), c);
   }
@@ -1523,33 +1888,76 @@ interface Hooks { manager: Manager | null; where: string; readable: boolean; fou
 const HUSKY_SHELL: ShellMode = { errexit: true, pipefail: false };
 const LEFTHOOK_SHELL: ShellMode = { errexit: false, pipefail: false };
 
+/**
+ * Task 5: a pre-commit `entry` (or a hook id) and its `args` as ONE command: pre-commit runs the entry without a
+ * shell (https://pre-commit.com/#new-hooks), so `;`, `&&` or `|` in it are plain words, never a second command. The
+ * words before the first operator are kept, up to the first word with a character outside [A-Za-z0-9_./:=@+,%-]
+ * (a word with spaces or quotes, like `bash -c '…'`, isn't read into).
+ */
+function hookCommand(entry: string, args: readonly string[]): string {
+  const out: string[] = [];
+  for (const t of [...tokenize(entry), ...args.flatMap((a) => (regexSafe(a) ? [{ op: null, w: a, kw: null } as Tk] : []))]) {
+    if (t.op !== null || !/^[A-Za-z0-9_./:=@+,%-]+$/.test(t.w) || out.length > MAX_FLAG_WORDS) break;
+    out.push(t.w);
+  }
+  return out.join(' ');
+}
+
+/**
+ * The tools `.pre-commit-config.yaml` runs at the pre-commit stage (`stages`, else `default_stages`, must include
+ * pre-commit or the legacy commit). Read once per mapCoverage call.
+ * - `repo: local` (and `meta`): only the hook's `entry` runs; its id is just a name (Task 5).
+ * - another repo: an `entry` set in the config replaces the hook's own; else a hook listed in tool-signatures.yml
+ *   (`precommitHooks`: the exact repo URL and id) runs that tool, with the hook's `args` read for soft flags; else the
+ *   id is read as a command (the hook's own entry isn't in this repo), with its args.
+ * Not modelled: `files`, `exclude`, `types` (a hook limited to no files still counts), `always_run`, `fail_fast`.
+ */
+function readPrecommitConfig(ctx: Ctx): Promise<{ readable: boolean; found: Found[] }> {
+  ctx.precommitConfig ??= (async () => {
+    const r = await ctx.read.yaml(HOOK_FILE['pre-commit']);
+    if ('fail' in r) return { readable: r.fail === 'missing', found: [] };
+    const defaultStages = strs(r.ok.default_stages);
+    const found: Found[] = [];
+    const scan = (text: string) => scanShell(text, '.', ctx.sigs, ctx.budget, DEFAULT_SHELL);
+    for (const rawRepo of list(r.ok.repos).slice(0, MAX_HOOKS)) {
+      const repo = asObj(rawRepo);
+      const url = typeof repo.repo === 'string' && regexSafe(repo.repo) ? repo.repo : '';
+      const local = url === 'local' || url === 'meta';
+      for (const raw of list(repo.hooks).slice(0, MAX_HOOKS)) {
+        const hook = asObj(raw);
+        const stages = 'stages' in hook ? strs(hook.stages) : defaultStages;
+        if (stages.length > 0 && !stages.some((st) => st === 'pre-commit' || st === 'commit')) continue;
+        const args = strs(hook.args).slice(0, MAX_FLAG_WORDS);
+        const id = typeof hook.id === 'string' && regexSafe(hook.id) ? hook.id : '';
+        if (typeof hook.entry === 'string' && regexSafe(hook.entry)) {
+          found.push(...scan(hookCommand(hook.entry, args)));
+        } else if (!local && id !== '') {
+          const tools = ctx.sigs.hooks.get(hookRepoKey(url, id));
+          if (tools !== undefined) found.push(...tools.map((t) => foundOf(t, '.', commandReason(t, args))));
+          else found.push(...scan(hookCommand(id, args)));
+        }
+      }
+    }
+    return { readable: true, found: await resolveScripts(ctx, found) };
+  })();
+  return ctx.precommitConfig;
+}
+
 async function readHooks(ctx: Ctx): Promise<Hooks> {
   const manager = ctx.p.precommit;
   const none: Hooks = { manager, where: '', readable: true, found: [] };
   if (manager === null) return none;
-  const scan = (text: string, base: string | null, mode: ShellMode) => scanShell(text, base, ctx.sigs, ctx.budget, mode);
+  const scan = async (text: string, base: string | null, mode: ShellMode) =>
+    gated(await resolveScripts(ctx, scanShell(text, base, ctx.sigs, ctx.budget, mode)), gateOf([text], []));
   if (manager === 'husky') {
     const where = '.husky/pre-commit';
     const r = await ctx.read.text(where);
     if ('fail' in r) return { ...none, where: '.husky', readable: r.fail === 'missing' };
-    return { manager, where, readable: true, found: scan(r.ok, '.', HUSKY_SHELL) };
+    return { manager, where, readable: true, found: await scan(r.ok, '.', HUSKY_SHELL) };
   }
   if (manager === 'pre-commit') {
-    const where = '.pre-commit-config.yaml';
-    const r = await ctx.read.yaml(where);
-    if ('fail' in r) return { ...none, where, readable: r.fail === 'missing' };
-    const defaultStages = strs(r.ok.default_stages);
-    const found: Found[] = [];
-    for (const repo of list(r.ok.repos).slice(0, MAX_HOOKS)) {
-      for (const raw of list(asObj(repo).hooks).slice(0, MAX_HOOKS)) {
-        const hook = asObj(raw);
-        const stages = 'stages' in hook ? strs(hook.stages) : defaultStages;
-        if (stages.length > 0 && !stages.some((s) => s === 'pre-commit' || s === 'commit')) continue;
-        // the hook id and its entry are each read as a command of their own (pre-commit runs the entry directly)
-        for (const text of [hook.id, hook.entry]) if (typeof text === 'string') found.push(...scan(text, '.', DEFAULT_SHELL));
-      }
-    }
-    return { manager, where, readable: true, found };
+    const config = await readPrecommitConfig(ctx);
+    return { manager, where: HOOK_FILE['pre-commit'], readable: config.readable, found: config.found };
   }
   // lefthook: the first of lefthook.yml / lefthook.yaml that exists (readPrecommit's order)
   for (const where of ['lefthook.yml', 'lefthook.yaml']) {
@@ -1558,10 +1966,43 @@ async function readHooks(ctx: Ctx): Promise<Hooks> {
     if ('fail' in r) return { ...none, where, readable: false };
     const hook = asObj(r.ok['pre-commit']);
     const entries = [...Object.values(asObj(hook.commands)), ...list(hook.jobs)].slice(0, MAX_HOOKS).map(asObj);
-    const found = entries.flatMap((e) => (typeof e.run === 'string' ? scan(e.run, firstSet(workingDir(e.root)), LEFTHOOK_SHELL) : []));
+    const found: Found[] = [];
+    for (const e of entries) if (typeof e.run === 'string') found.push(...(await scan(e.run, firstSet(workingDir(e.root)), LEFTHOOK_SHELL)));
     return { manager, where, readable: true, found };
   }
   return none;
+}
+
+/**
+ * Task 5: a CI run of `pre-commit run --all-files` (hookRun) runs the hooks' lint tools there too. Only `lint` is
+ * carried over: a secret-scan hook such as gitleaks' scans the staged changes (`--staged`, pass_filenames: false,
+ * https://github.com/gitleaks/gitleaks/blob/master/.pre-commit-hooks.yaml), and a CI checkout has none staged. One run
+ * per (trigger fit, reason) is enough (the first run of each kind is what a need reads), so this stays small.
+ */
+async function hookRunHits(ctx: Ctx): Promise<void> {
+  const reps = new Map<string, Hit>();
+  for (const h of ctx.hits) {
+    const key = `${h.fit.push ? 1 : 0}${h.fit.merge ? 1 : 0}${h.fit.deploy ? 1 : 0}\u0000${h.reason ?? ''}`;
+    if (h.hookRun === true && !reps.has(key)) reps.set(key, h);
+  }
+  if (reps.size === 0) return;
+  const tools = new Map<string, Found>();
+  for (const f of (await readPrecommitConfig(ctx)).found) {
+    const key = `${f.by}\u0000${f.reason ?? ''}`;
+    if (f.categories.includes('lint') && !tools.has(key)) tools.set(key, f);
+  }
+  for (const rep of reps.values()) {
+    for (const t of tools.values()) {
+      if (ctx.hits.length >= MAX_HITS) {
+        ctx.budget.truncated = true;
+        return;
+      }
+      ctx.hits.push({
+        opaque: false, categories: ['lint'], by: t.by, subject: `${t.subject} in the pre-commit hooks`, dir: '.', reason: rep.reason ?? t.reason,
+        fit: rep.fit, where: cut(`${rep.where} → ${HOOK_FILE['pre-commit']}`),
+      });
+    }
+  }
 }
 
 // ---------- which runs count for which need (ruling S26, review C1) ----------
@@ -1812,7 +2253,7 @@ export async function mapCoverage(p: RepoProfile, needs: Need[], dir: string, op
   const sigs = (defaultCompiled ??= compile(loadToolSignatures()));
   const ctx: Ctx = {
     p, sigs, read: new Reader(dir), budget: { visits: 0, bytes: 0, truncated: false }, hits: [], localFiles: new Set(),
-    unreadable: (opts.skippedWorkflows ?? 0) > 0,
+    unreadable: (opts.skippedWorkflows ?? 0) > 0, pkgRead: new Reader(dir), pkgScripts: new Map(), scriptMemo: new Map(),
   };
   if (p.existingWorkflows.length > MAX_WORKFLOWS) ctx.budget.truncated = true;
   for (const w of [...p.existingWorkflows].sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0)).slice(0, MAX_WORKFLOWS)) {
@@ -1831,6 +2272,7 @@ export async function mapCoverage(p: RepoProfile, needs: Need[], dir: string, op
     if (events.size === 0) continue;
     await walkWorkflow(ctx, doc.ok, w.path, fitOf(events, p.defaultBranch, w.deploys), 0, '', false);
   }
+  await hookRunHits(ctx);
   const hooks = await readHooks(ctx);
   // Each need is answered from tables built once, not by a pass over every run (review C1).
   const dirs = new Dirs();

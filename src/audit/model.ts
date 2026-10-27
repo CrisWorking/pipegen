@@ -15,8 +15,9 @@
 // - secretsInTree: a local scan of the files on disk (no git, no child process, symlinks never followed), rule names
 //   and file names only, never a value (S10).
 // - aiBundle: what the full run would send to the AI, counted from bundleCode without gitleaks (counting only).
-// - warnings: a repo `.npmrc` with any key outside a small safe list (U12) or a local node_modules/.bin/pipegen could
-//   change which pipegen runs (the `.npmrc` is read for that one fact; no value is kept); anonymous access.
+// - warnings: a repo `.npmrc` with any key outside a small safe list (U12; Task 5 adds keys whose value only makes npm
+//   stricter) or a local node_modules/.bin/pipegen could change which pipegen runs (the `.npmrc` is read for that one
+//   fact; no value is kept); anonymous access.
 // - ai (Task 2b, addAiSuggestions, `audit --ai` after consent): the needs the AI adds and MENTION-ONLY tool suggestions,
 //   from a gitleaks-checked bundle, with the run's AI usage and cost cap (rulings B2, B3, B4, S11, S16-S19, U11).
 //
@@ -264,6 +265,26 @@ const SWAP_TEXT_NO_COMMAND = 'This repo could change which pipegen runs. Run pip
 const NPMRC_SAFE_KEYS: ReadonlySet<string> = new Set([
   'save-exact', 'save-prefix', 'engine-strict', 'fund', 'package-lock', 'loglevel', 'progress', 'legacy-peer-deps', 'lockfile-version',
   'update-notifier', 'color',
+]);
+/**
+ * Task 5 (item 5): keys that are safe only with values that make npm stricter than its default, each checked against
+ * npm's config docs (https://docs.npmjs.com/cli/v11/using-npm/config, 2026-10-27). The value (trimmed, any letter case)
+ * must match; any other value of these keys warns, like any unknown key.
+ * - ignore-scripts (default false): `true` only; npm then runs no package scripts. `false` is the default but stays on the
+ *   warning side, as U12 decided for every script setting.
+ * - min-release-age (default null; days): a whole number of days; npm then installs only versions older than that, so with
+ *   pipegen's exact-version command it can refuse to start pipegen, never pick another one. (Not `before`: a date in
+ *   the future means "no limit", and npm lets it win over min-release-age.)
+ * - allow-git (default `all`, the most open value): `all`, `root` or `none`, each no wider than the default.
+ * - strict-peer-deps (default false): `true` only; npm then fails on a peer-dependency conflict instead of warning.
+ * Not added: audit-level. Its values `high`, `critical` and `none` make `npm audit` pass on findings it fails by default,
+ * so not every value is as strict as the default.
+ */
+const NPMRC_STRICT_VALUES: ReadonlyMap<string, RegExp> = new Map([
+  ['ignore-scripts', /^true$/i],
+  ['min-release-age', /^\d{1,6}$/],
+  ['allow-git', /^(?:all|root|none)$/i],
+  ['strict-peer-deps', /^true$/i],
 ]);
 /**
  * Only the start of a line (after its leading whitespace, which npm's ini parser trims too) is read for the key, so a
@@ -575,6 +596,8 @@ function npmrcLineIsSafe(raw: string): boolean {
   const written = line.slice(0, eq).trim();
   const key = (/^(["'])(.*)\1$/.exec(written)?.[2] ?? written).toLowerCase();
   if (key === 'audit') return /^(?:true|false)$/.test(line.slice(eq + 1, eq + 1 + NPMRC_KEY_WINDOW).trim());
+  const strict = NPMRC_STRICT_VALUES.get(key);
+  if (strict !== undefined) return strict.test(line.slice(eq + 1, eq + 1 + NPMRC_KEY_WINDOW).trim());
   return NPMRC_SAFE_KEYS.has(key);
 }
 

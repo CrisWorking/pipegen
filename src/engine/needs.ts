@@ -99,9 +99,14 @@ export interface NeedsPlan {
   usage: AiUsage;
 }
 
-/** A start, dev or serve script, a server framework, a port, or a Dockerfile. A library with only build/test scripts isn't. */
+/**
+ * A start, dev or serve script, a server framework, a port, or a Dockerfile. A library with only build/test scripts isn't.
+ * Plan U Task 5: a package the repo publishes (Service.publishedPackage) needs a real server entry (a script, a
+ * framework or a Dockerfile); a port number in its code alone (Flask's `app.run(port=5000)` default) doesn't make it one.
+ */
 export function isRunnable(s: Service): boolean {
-  return s.scripts.some((n) => RUN_SCRIPTS.includes(n)) || s.frameworks.length > 0 || s.port !== undefined || (s.dockerfile ?? '') !== '';
+  return s.scripts.some((n) => RUN_SCRIPTS.includes(n)) || s.frameworks.length > 0 || (s.port !== undefined && s.publishedPackage !== true)
+    || (s.dockerfile ?? '') !== '';
 }
 
 const deploysExist = (p: RepoProfile) => p.existingWorkflows.some((w) => w.deploys);

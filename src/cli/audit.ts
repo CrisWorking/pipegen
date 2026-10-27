@@ -3,7 +3,7 @@
 // GitHub, and no file is written unless --out names one (outside the repo, unless --force).
 //
 // Flow (ruling B1): readProject (owner/repo) → getAuth({ mode: 'read' }) → makeOctokit(token or null, per-request
-// timeout) → GET /user only with a token → readGitHubContext → probeCapabilities → buildAudit with the full run's
+// timeout) → GET /user only with a token → readGitHubContext (reusing getAuth's anonymous GET /repos, M6) → probeCapabilities → buildAudit with the full run's
 // permissions (permissionsTable('write', …)), ONE rate budget for every GitHub call of the run (S18).
 // - GitHub can't be read (no access, a refused token, no answer, a rate stop): only what is on disk is reported, with
 //   "GitHub: not read", and the exit code is 1 (the inspect R10 rule). No GitHub fact is guessed.
@@ -64,7 +64,10 @@ export interface AuditFlags {
 export const AUDIT_AI_MISSING = 'audit --ai needs an AI provider: set ANTHROPIC_API_KEY or OPENAI_API_KEY, or use --ai ollama.';
 /** Ruling S21 (Plan B S27): the pinned gitleaks exists for these platforms only. */
 export const AUDIT_AI_PLATFORM = 'audit --ai needs Linux or macOS for now (WSL works).';
-/** Ruling B3: the top warning when the reviewed tool list can't be used in this build. */
+/**
+ * Ruling B3: the top warning when the reviewed tool list can't be used in this build. `why` is the loader's short
+ * reason when it gave one (review M7: "23 entries still wait for human review (…)"), else its whole message.
+ */
 export const reviewedUnavailableWarning = (why: string) =>
   `pipegen's reviewed tool list isn't usable in this build: ${why.trim().replace(/\.+$/, '')}. The 'would add' section shows no tools.`;
 /** The environment variables whose values are never printed nor sent to the AI (ruling S19: the token and the AI keys). */
@@ -127,12 +130,13 @@ export async function audit(io: CliIO, flags: AuditFlags): Promise<number> {
     const clock: RateClock = { budget: newRateBudget() };
     let github: GitHubRead;
     try {
-      const auth = await getAuth({ owner, repos: [repo], allowBroad: flags.allowBroad, mode: 'read' }, { env: io.env, fetch: io.fetch, clock, notes });
+      const repoAnswer: { data?: unknown } = {}; // getAuth's anonymous GET /repos, reused below (review M6)
+      const auth = await getAuth({ owner, repos: [repo], allowBroad: flags.allowBroad, mode: 'read' }, { env: io.env, fetch: io.fetch, clock, notes, repoAnswer });
       token = auth.token;
       if (auth.token !== null) knownValues.push(auth.token);
       const gh = makeOctokit(auth.token, { fetch: io.fetch, clock, timeoutMs: GITHUB_TIMEOUT_MS, log: fail });
       const login = await tokenLogin(gh, auth, clock, notes);
-      const context = await readGitHubContext(gh, owner, repo, login, clock, notes);
+      const context = await readGitHubContext(gh, owner, repo, login, clock, notes, { known: repoAnswer.data });
       const caps = await probeCapabilities(gh, owner, repo, { ...local, ...context }, notes, clock);
       github = { auth, gh, context, caps };
     } catch (e) {
@@ -149,7 +153,7 @@ export async function audit(io: CliIO, flags: AuditFlags): Promise<number> {
       reviewed = loadReviewed();
     } catch (e) {
       if (!(e instanceof ReviewedListError)) throw e;
-      reviewedProblem = e.message;
+      reviewedProblem = e.reason ?? e.message;
     }
 
     // 5. the plain audit

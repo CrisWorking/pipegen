@@ -396,6 +396,11 @@ export interface AuthDeps {
   clock?: RateClock;
   /** Plain-English lines about choices getAuth made (for example a scope it couldn't confirm, allowed by --allow-broad-token). */
   notes?: string[];
+  /**
+   * Filled with the body of the anonymous GET /repos/{owner}/{repos[0]} getAuth makes without a token, so the caller can
+   * hand it to readGitHubContext (`opts.known`) instead of asking GitHub again (review M6: one request less per run).
+   */
+  repoAnswer?: { data?: unknown };
 }
 type AuthOpts = { owner: string; repos: string[]; allowBroad: boolean };
 
@@ -507,6 +512,7 @@ export async function getAuth(opts: AuthOpts & { mode: 'read' | 'write' }, deps:
     try {
       const res = await withRateLimit(() => anon.rest.repos.get({ owner, repo }), clock);
       isPublic = (res.data as { private?: unknown }).private === false;
+      if (deps.repoAnswer !== undefined) deps.repoAnswer.data = res.data;
     } catch (e) {
       if (isRateStop(e)) throw e;
       const status = failure(e).status;
@@ -560,12 +566,18 @@ const planOf = (data: unknown): Plan => {
  * `login` is null for anonymous access and for an installation token (ghs_, which has no user).
  * `notes`: when given, gets a line when GitHub's full_name isn't owner/repo (any letter case): the repo was renamed or
  * transferred and GitHub answered for the new one.
+ * `opts.known`: the body of a GET /repos/{owner}/{repo} already made in this run (getAuth's `repoAnswer`), read with the
+ * same checks instead of asking again (review M6). An anonymous client never asks GET /orgs: GitHub shows an
+ * organisation's plan only to its members, so the answer would be 'unknown' anyway (one request less per run).
  */
-export async function readGitHubContext(gh: Octokit, owner: string, repo: string, login: string | null, clock: RateClock = clockOf(gh), notes?: string[]): Promise<Pick<RepoProfile, 'private' | 'ownerType' | 'plan' | 'defaultBranch'>> {
+export async function readGitHubContext(
+  gh: Octokit, owner: string, repo: string, login: string | null, clock: RateClock = clockOf(gh), notes?: string[], opts: { known?: unknown } = {},
+): Promise<Pick<RepoProfile, 'private' | 'ownerType' | 'plan' | 'defaultBranch'>> {
   checkRepoNames(owner, [repo]);
   let data: { private?: unknown; default_branch?: unknown; owner?: { type?: unknown }; full_name?: unknown };
   try {
-    data = (await withRateLimit(() => gh.rest.repos.get({ owner, repo }), clock)).data as typeof data;
+    data = (opts.known !== undefined && opts.known !== null && typeof opts.known === 'object' ? opts.known
+      : (await withRateLimit(() => gh.rest.repos.get({ owner, repo }), clock)).data) as typeof data;
   } catch (e) {
     if (isRateStop(e)) throw new GitHubAccessError(`GitHub's rate limit stopped pipegen reading ${repoName(owner, repo)}.`, { cause: e });
     if (rejectedOn(gh, e)) throw tokenRejected();
@@ -595,7 +607,7 @@ export async function readGitHubContext(gh: Octokit, owner: string, repo: string
       plan = 'unknown';
     }
   };
-  if (ownerType === 'Organization') await readPlan(() => gh.rest.orgs.get({ org: owner }));
+  if (ownerType === 'Organization' && !anonymousClients.has(gh)) await readPlan(() => gh.rest.orgs.get({ org: owner }));
   else if (login !== null && login.toLowerCase() === owner.toLowerCase()) await readPlan(() => gh.rest.users.getAuthenticated());
   return { private: data.private, ownerType, plan, defaultBranch: data.default_branch };
 }

@@ -21,9 +21,13 @@ export interface Service {
   dockerfile?: string; port?: number; hasTests: boolean; testFramework?: string;
   envVars: string[]; dependsOn: Dependency[];
   scripts: string[];      // script names from package.json `scripts` / pyproject `[project.scripts]` + `[tool.poetry.scripts]` (names only, never the commands)
-  frameworks: string[];   // detected server frameworks: express, fastify, @nestjs/core, next, koa, hapi; flask, fastapi, django. Used by isRunnable (Plan B Task 1)
+  frameworks: string[];   // detected server frameworks: express, fastify, @nestjs/core, next, koa, hapi; flask, fastapi, django (never the service's own package name: the express repo doesn't USE express). Used by isRunnable (Plan B Task 1)
+  publishedPackage?: boolean;   // Plan U Task 5: the repo's only service, and a workflow publishes it to its registry (npm for node, PyPI for python). Set only when true. isRunnable then ignores a port found in its code (a library's default port isn't a server)
 }
-export interface ExistingWorkflow { path: string; triggers: string[]; deploys: boolean; secretsUsed: string[]; jobs: string[] }
+export interface ExistingWorkflow {
+  path: string; triggers: string[]; deploys: boolean; secretsUsed: string[]; jobs: string[];
+  publishes?: ('npm' | 'pypi')[];   // Plan U Task 5: registries a step publishes to (a run line that starts with a publish command, or the PyPI publish action). Absent = none
+}
 export type Plan = 'free' | 'pro' | 'team' | 'enterprise' | 'unknown';
 export interface RepoProfile {
   owner: string; repo: string; defaultBranch: string; private: boolean;

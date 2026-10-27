@@ -884,3 +884,272 @@ describe('loadToolSignatures (S1)', () => {
     expect(load('tools:\n  - id: a\n    categories: [secrets]\n    commands: [a]\n  - id: a\n    categories: [sast]\n    commands: [b]\n')).toThrow(/not valid/);
   });
 });
+
+// ---------- Task 5: accuracy from real repos (express, flask, left-pad shapes; minimal hand-written fixtures) ----------
+
+const pkg = (dir: string, scripts: Record<string, string>, at = 'package.json') => writeIn(dir, at, JSON.stringify({ name: 'app', scripts }));
+const ci = (dir: string, steps: string, extra = '') => wf(dir, 'ci.yml', `${both}${job(steps, extra)}`);
+
+describe('mapCoverage (Task 5, item 1: own scripts by name and content)', () => {
+  it('own scripts: npm run test-ci → covered "your own `npm run test-ci`" (express shape: nyc wraps npm test, which runs mocha)', async () => {
+    const dir = makeTempDir();
+    pkg(dir, {
+      test: 'mocha --require test/support/env --reporter spec --check-leaks test/ test/acceptance/',
+      'test-ci': 'nyc --exclude examples --exclude test --exclude benchmarks --reporter=lcovonly --reporter=text npm test',
+      lint: 'eslint .', 'lint:fix': 'eslint . --fix',
+    });
+    ci(dir, '      - shell: bash\n        run: npm run test-ci\n');
+    const rows = await coverage(dir);
+    expect(row(rows, 'push', 'unit-tests', 'app')).toMatchObject({ status: 'covered', by: 'your own `npm run test-ci`', where: '.github/workflows/ci.yml (job scan)' });
+    expect(row(rows, 'merge', 'full-tests', 'app')).toMatchObject({ status: 'covered', by: 'your own `npm run test-ci`' });
+    expect(row(rows, 'push', 'unit-tests', 'app').why).toBe('Your own `npm run test-ci` runs on every push.');
+  });
+
+  it('own scripts: any script name counts when its content runs a known test or lint tool (yarn, pnpm and bun too)', async () => {
+    const dir = makeTempDir();
+    pkg(dir, { ci: 'vitest run --coverage', check: 'eslint . && prettier --check .' });
+    ci(dir, run('yarn run ci --silent -- --coverage') + run('pnpm run check'));
+    const rows = await coverage(dir);
+    expect(row(rows, 'push', 'unit-tests', 'app')).toMatchObject({ status: 'covered', by: 'your own `yarn run ci`' });
+    expect(row(rows, 'push', 'lint', 'app')).toMatchObject({ status: 'covered', by: 'your own `pnpm run check`' });
+  });
+
+  it('own scripts: the script is read where the command runs (working-directory)', async () => {
+    const dir = makeTempDir();
+    pkg(dir, { 'test-unit': 'jest' }, 'api/package.json');
+    ci(dir, '      - run: bun run test-unit\n        working-directory: api\n');
+    const rows = await coverage(dir, { services: [svc('api'), svc('web')] });
+    expect(row(rows, 'push', 'unit-tests', 'api')).toMatchObject({ status: 'covered', by: 'your own `bun run test-unit`' });
+    expect(row(rows, 'push', 'unit-tests', 'web').status).toBe('missing');
+    // a root script that changes into one service tests that service only
+    const dir2 = makeTempDir();
+    pkg(dir2, { 'test-api': 'cd api && jest' });
+    ci(dir2, run('npm run test-api'));
+    const rows2 = await coverage(dir2, { services: [svc('api'), svc('web')] });
+    expect(row(rows2, 'push', 'unit-tests', 'api')).toMatchObject({ status: 'covered', by: 'your own `npm run test-api`' });
+    expect(row(rows2, 'push', 'unit-tests', 'web').status).toBe('missing');
+  });
+
+  it('own scripts (adversarial): a test- script that runs echo, mentions a tool in quotes, is missing, or has no package.json → missing', async () => {
+    for (const [scripts, cmd] of [
+      [{ 'test-ci': 'echo skip' }, 'npm run test-ci'],
+      [{ 'test-ci': 'echo mocha && echo "jest"' }, 'npm run test-ci'],
+      [{ 'test-ci': 'echo "$(mocha)"' }, 'npm run test-ci'],
+      [{ other: 'mocha' }, 'npm run test-ci'],
+      [{ 'test-ci': 'mocha' }, 'npm run test-cj --if-present'],
+      [null, 'npm run test-ci'],
+      [{ ci: 'node build.js' }, 'npm run ci'],
+      [{ 'test-ci': 'mocha' }, 'npm run test-ci --workspace=other'],
+      [{ 'test-ci': 'mocha' }, 'pnpm run test-ci --filter other'],
+    ] as [Record<string, string> | null, string][]) {
+      const dir = makeTempDir();
+      if (scripts !== null) pkg(dir, scripts);
+      ci(dir, run(cmd));
+      const rows = await coverage(dir);
+      expect(row(rows, 'push', 'unit-tests', 'app').status, `${cmd} ${JSON.stringify(scripts)}`).toBe('missing');
+      expect(row(rows, 'push', 'lint', 'app').status).toBe('missing');
+    }
+  });
+
+  it("own scripts (adversarial): a script whose tool can't fail the step → partial (npm runs scripts with sh -c, no -e)", async () => {
+    for (const body of ['vitest run || true', 'vitest run; echo done', 'vitest run | tee out.txt', 'nyc --zzz vitest echo hi']) {
+      const dir = makeTempDir();
+      pkg(dir, { 'test-ci': body });
+      ci(dir, run('npm run test-ci'));
+      const status = row(await coverage(dir), 'push', 'unit-tests', 'app').status;
+      expect(status, body).toBe(body.startsWith('nyc') ? 'missing' : 'partial'); // an nyc flag pipegen doesn't know: no command
+    }
+    // the step's own suppression applies on top
+    const dir = makeTempDir();
+    pkg(dir, { 'test-ci': 'vitest run' });
+    ci(dir, run('npm run test-ci || true'));
+    expect(row(await coverage(dir), 'push', 'unit-tests', 'app').status).toBe('partial');
+  });
+
+  it('own scripts (adversarial): scripts that only fix (lint:fix, lint-fix, format:write) are not checks; a script cycle ends', async () => {
+    const dir = makeTempDir();
+    pkg(dir, { 'lint:fix': 'eslint . --fix', 'lint-fix': 'eslint . --fix', 'format:write': 'prettier --write .', a: 'npm run b', b: 'npm run a' });
+    ci(dir, run('npm run lint:fix') + run('npm run lint-fix') + run('pnpm lint:fix') + run('npm run format:write') + run('npm run a'));
+    const rows = await coverage(dir);
+    expect(row(rows, 'push', 'lint', 'app').status).toBe('missing');
+    expect(row(rows, 'push', 'unit-tests', 'app').status).toBe('missing');
+  });
+
+  it('own scripts (adversarial): a chain of scripts that each call the next one twice is read in linear time, capped', async () => {
+    const dir = makeTempDir();
+    const scripts: Record<string, string> = {};
+    for (let i = 0; i < 1000; i++) scripts[`s${i}`] = `npm run s${i + 1} && npm run s${i + 1} || npm run s${i + 1}`;
+    scripts.s1000 = 'vitest run';
+    pkg(dir, scripts);
+    ci(dir, run('npm run s0'));
+    const started = Date.now();
+    const status = row(await coverage(dir), 'push', 'unit-tests', 'app').status;
+    expect(Date.now() - started).toBeLessThan(3000);
+    expect(status).toBe('missing'); // past the script cap nothing is counted
+  });
+
+  it('own scripts: a husky hook running an own script is read the same way', async () => {
+    const dir = makeTempDir();
+    pkg(dir, { 'lint-staged-check': 'lint-staged' });
+    writeIn(dir, '.husky/pre-commit', 'npm run lint-staged-check\n');
+    expect(row(await coverage(dir), 'pre-commit', 'format-lint', 'app')).toMatchObject({ status: 'covered', by: 'your own `npm run lint-staged-check`' });
+  });
+});
+
+describe('mapCoverage (Task 5, item 2: Python runners)', () => {
+  it('python runners: flask shape `uv run --locked --no-default-groups --group dev tox run` → covered "your own `tox run`"', async () => {
+    const dir = makeTempDir();
+    ci(dir, run('uv run --locked --no-default-groups --group dev tox run'));
+    const rows = await coverage(dir);
+    expect(row(rows, 'push', 'unit-tests', 'app')).toMatchObject({ status: 'covered', by: 'your own `tox run`' });
+    expect(row(rows, 'merge', 'full-tests', 'app')).toMatchObject({ status: 'covered', by: 'your own `tox run`' });
+  });
+
+  it('python runners: tox, tox -p, nox, and pytest through poetry, pipenv, hatch, pdm and uv', async () => {
+    for (const [cmd, by] of [
+      ['tox', 'your own `tox`'], ['tox -p', 'your own `tox`'], ['tox r', 'your own `tox r`'], ['python -m tox', 'your own `tox`'], ['nox', 'your own `nox`'],
+      ['poetry run pytest -q', 'your own `pytest`'], ['pipenv run pytest', 'your own `pytest`'], ['hatch run pytest', 'your own `pytest`'],
+      ['pdm run pytest', 'your own `pytest`'], ['uv run -p 3.12 --with pytest-cov pytest', 'your own `pytest`'], ['uv run -- pytest', 'your own `pytest`'],
+    ]) {
+      const dir = makeTempDir();
+      ci(dir, run(cmd as string));
+      expect(row(await coverage(dir), 'push', 'unit-tests', 'app'), cmd).toMatchObject({ status: 'covered', by });
+    }
+  });
+
+  it('python runners (adversarial): uv run wrapping something that is not a test runner, and tox or nox runs that pick other envs → missing', async () => {
+    for (const steps of [
+      run('uv run --group dev python scripts/build.py'), run('uv run --with ruff python -c pass'), run('uv run --with pytest python -c pass'),
+      run('uv run --some-new-flag pytest'), run('uv run -qx pytest'), run('tox run -e typing'), run('tox -e py312'), run('tox list'), run('tox run --notest'),
+      run('tox -re lint'), run('tox --override testenv.commands=true'), run('nox -s lint'), run('nox --list'), run('nox -k lint'), run('TOXENV=lint tox'),
+      '      - run: tox run\n        env:\n          TOX_ENV: lint\n', '      - run: tox run\n        env:\n          TOXENV: lint\n',
+      '      - run: nox\n        env:\n          NOXSESSION: lint\n', run('echo "TOXENV=lint" >> "$GITHUB_ENV"') + run('tox run'),
+    ]) {
+      const dir = makeTempDir();
+      ci(dir, steps);
+      expect(row(await coverage(dir), 'push', 'unit-tests', 'app').status, steps).toBe('missing');
+    }
+    // an env set for the whole job or workflow picks the envs too
+    const dir = makeTempDir();
+    wf(dir, 'ci.yml', `${both}env:\n  TOX_ENV: lint\n${job(run('tox run'))}`);
+    expect(row(await coverage(dir), 'push', 'unit-tests', 'app').status).toBe('missing');
+    const dir2 = makeTempDir();
+    ci(dir2, run('tox run'), '    env:\n      TOX_ENV: lint\n');
+    expect(row(await coverage(dir2), 'push', 'unit-tests', 'app').status).toBe('missing');
+  });
+});
+
+const RUFF_REPO = 'https://github.com/astral-sh/ruff-pre-commit';
+const hookConfig = (hooks: string, repo = RUFF_REPO) => `repos:\n  - repo: ${repo}\n    rev: v0.16.0\n    hooks:\n${hooks}`;
+const FLASK_PRECOMMIT = 'uv run --locked --no-default-groups --group pre-commit pre-commit run --show-diff-on-failure --color=always --all-files';
+
+describe('mapCoverage (Task 5, item 3: pre-commit hook contents)', () => {
+  it('pre-commit hooks: ruff-check and ruff-format hooks → the format and lint hook is covered', async () => {
+    const dir = makeTempDir();
+    writeIn(dir, '.pre-commit-config.yaml', hookConfig('      - id: ruff-check\n      - id: ruff-format\n'));
+    const rows = await coverage(dir);
+    expect(row(rows, 'pre-commit', 'format-lint', 'app')).toMatchObject({ status: 'covered', by: 'ruff', where: '.pre-commit-config.yaml' });
+    expect(row(rows, 'pre-commit', 'hooks')).toMatchObject({ status: 'covered', by: 'pre-commit' });
+  });
+
+  it('pre-commit hooks: CI running `pre-commit run --all-files` (also through uv run) covers lint with the hooks\' tools (flask shape)', async () => {
+    const dir = makeTempDir();
+    writeIn(dir, '.pre-commit-config.yaml', hookConfig('      - id: ruff-check\n      - id: ruff-format\n'));
+    wf(dir, 'pre-commit.yaml', `on:\n  pull_request:\n  push:\n    branches: [main, stable]\n${job(run(FLASK_PRECOMMIT))}`);
+    const rows = await coverage(dir);
+    expect(row(rows, 'merge', 'hooks-ci')).toMatchObject({ status: 'covered', by: 'pre-commit' });
+    expect(row(rows, 'push', 'hooks-ci').status).toBe('partial'); // feature-branch pushes don't run it
+    const lint = row(rows, 'merge', 'lint', 'app');
+    expect(lint).toMatchObject({ status: 'covered', by: 'ruff', where: '.github/workflows/pre-commit.yaml (job scan) → .pre-commit-config.yaml' });
+    expect(lint.why).toBe('The ruff check in the pre-commit hooks runs on every pull request.');
+    expect(row(rows, 'push', 'lint', 'app').status).toBe('partial');
+    // the pre-commit/action runs `pre-commit run --all-files` by default
+    const dir2 = makeTempDir();
+    writeIn(dir2, '.pre-commit-config.yaml', hookConfig('      - id: ruff\n'));
+    ci(dir2, '      - uses: pre-commit/action@v3.0.1\n');
+    expect(row(await coverage(dir2), 'merge', 'lint', 'app')).toMatchObject({ status: 'covered', by: 'ruff' });
+  });
+
+  it('pre-commit hooks (adversarial): a manual stage, a local hook named like a tool, a look-alike repo, an overridden entry → not covered', async () => {
+    for (const config of [
+      hookConfig('      - id: ruff-check\n        stages: [manual]\n'),
+      `default_stages: [pre-push]\n${hookConfig('      - id: ruff-format\n')}`,
+      'repos:\n  - repo: local\n    hooks:\n      - id: ruff\n        name: ruff\n        entry: echo ruff\n        language: system\n',
+      'repos:\n  - repo: local\n    hooks:\n      - id: gitleaks\n        name: gitleaks\n        entry: "true"\n        language: system\n',
+      hookConfig('      - id: ruff-check\n', 'https://github.com/someone/ruff-pre-commit'),
+      hookConfig('      - id: ruff-check\n        entry: echo skipped\n'),
+    ]) {
+      const dir = makeTempDir();
+      writeIn(dir, '.pre-commit-config.yaml', config);
+      const rows = await coverage(dir);
+      expect(row(rows, 'pre-commit', 'format-lint', 'app').status, config).toBe('missing');
+      expect(row(rows, 'pre-commit', 'secrets').status, config).toBe('missing');
+    }
+  });
+
+  it('pre-commit hooks (adversarial): CI runs that check no files, one hook, another stage or skip hooks don\'t cover lint', async () => {
+    const config = hookConfig('      - id: ruff-check\n');
+    for (const steps of [
+      run('pre-commit run'), run('pre-commit run ruff-check --all-files'), run('pre-commit run --hook-stage manual --all-files'),
+      run('pre-commit run --files a.py'), run('pre-commit run -c other.yaml --all-files'), run('SKIP=ruff-check pre-commit run --all-files'),
+      '      - run: pre-commit run --all-files\n        env:\n          SKIP: ruff-check\n', run('echo "SKIP=ruff-check" >> "$GITHUB_ENV"') + run('pre-commit run --all-files'),
+      "      - uses: pre-commit/action@v3.0.1\n        with:\n          extra_args: ruff-check --all-files\n",
+      "      - uses: pre-commit/action@v3.0.1\n        with:\n          extra_args: ${{ inputs.args }}\n",
+    ]) {
+      const dir = makeTempDir();
+      writeIn(dir, '.pre-commit-config.yaml', config);
+      ci(dir, steps);
+      expect(row(await coverage(dir), 'merge', 'lint', 'app').status, steps).toBe('missing');
+    }
+  });
+
+  it('pre-commit hooks (adversarial): a secret-scan hook run in CI is not a CI secret scan (it scans staged changes); soft hook args → partial', async () => {
+    const dir = makeTempDir();
+    writeIn(dir, '.pre-commit-config.yaml', hookConfig('      - id: gitleaks\n', 'https://github.com/gitleaks/gitleaks'));
+    ci(dir, run('pre-commit run --all-files'));
+    const rows = await coverage(dir);
+    expect(row(rows, 'pre-commit', 'secrets')).toMatchObject({ status: 'covered', by: 'gitleaks' });
+    expect(row(rows, 'merge', 'secrets').status).toBe('missing');
+    const dir2 = makeTempDir();
+    writeIn(dir2, '.pre-commit-config.yaml', hookConfig('      - id: ruff-check\n        args: [--exit-zero]\n'));
+    ci(dir2, run('pre-commit run --all-files'));
+    expect(row(await coverage(dir2), 'merge', 'lint', 'app').status).toBe('partial');
+  });
+});
+
+describe('mapCoverage (Task 5, item 4: package publishing at the deploy layer)', () => {
+  const pkgService = { services: [svc('.', { scripts: ['test'] })] };
+  const tagPush = 'on:\n  push:\n    tags: [\'*\']\n';
+
+  it('deploy: pypa/gh-action-pypi-publish with trusted publishing → attestation covered (flask shape)', async () => {
+    const dir = makeTempDir();
+    wf(dir, 'publish.yaml', `${tagPush}${job('      - uses: pypa/gh-action-pypi-publish@v1.14.2\n        with:\n          packages-dir: "dist/"\n', `    permissions:\n      ${'id-' + 'token'}: write\n`)}`); // built at runtime (secret-literal guard)
+    expect(row(await coverage(dir, pkgService), 'deploy', 'attestation', 'app')).toMatchObject({ status: 'covered', by: 'pypi-publish' });
+  });
+
+  it('deploy (adversarial): pypi-publish with a password, attestations off or another index makes no attestation → missing', async () => {
+    for (const w of [`${'pass' + 'word'}: \${{ secrets.${'PYPI_' + 'TOKEN'} }}`, 'attestations: false', 'Attestations: "false"', 'attestations: ${{ inputs.attest }}', 'repository-url: https://pypi.example.test/legacy/', 'repository_url: https://pypi.example.test/legacy/']) {
+      const dir = makeTempDir();
+      wf(dir, 'publish.yaml', `${tagPush}${job(`      - uses: pypa/gh-action-pypi-publish@release/v1\n        with:\n          ${w}\n`)}`);
+      expect(row(await coverage(dir, pkgService), 'deploy', 'attestation', 'app').status, w).toBe('missing');
+    }
+    const ok = makeTempDir();
+    wf(ok, 'publish.yaml', `${tagPush}${job('      - uses: pypa/gh-action-pypi-publish@release/v1\n        with:\n          repository-url: https://test.pypi.org/legacy/\n')}`);
+    expect(row(await coverage(ok, pkgService), 'deploy', 'attestation', 'app').status).toBe('covered');
+  });
+
+  it('deploy: `npm publish --provenance` on release → attestation covered', async () => {
+    const dir = makeTempDir();
+    wf(dir, 'npm-publish.yml', `on:\n  release:\n    types: [published]\n${job(run('npm publish --provenance --access public'))}`);
+    expect(row(await coverage(dir, pkgService), 'deploy', 'attestation', 'app')).toMatchObject({ status: 'covered', by: 'npm-provenance' });
+  });
+
+  it('deploy (adversarial): --provenance inside an echo, off, in a dry run, or plain npm publish → missing', async () => {
+    for (const cmd of ['echo npm publish --provenance', 'echo "npm publish --provenance"', 'npm publish', 'npm publish --provenance=false', 'npm publish --provenance false',
+      'npm publish --no-provenance', 'npm publish --provenance --dry-run', 'npm stage publish --tag latest', 'npm publish --provenance --help']) {
+      const dir = makeTempDir();
+      wf(dir, 'npm-publish.yml', `on:\n  release:\n    types: [published]\n${job(run(cmd))}`);
+      expect(row(await coverage(dir, pkgService), 'deploy', 'attestation', 'app').status, cmd).toBe('missing');
+    }
+  });
+});

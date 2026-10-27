@@ -38,9 +38,12 @@ const LANGUAGES = ['node', 'python', 'go', 'java', 'dotnet', 'ruby', 'php', 'oth
 export { PENDING } from './review-marker.js';
 
 export class ReviewedListError extends Error {
-  constructor(message: string, options?: { cause?: unknown }) {
-    super(safeText(message, 800), options);
+  /** Why, in a few words, without the "reviewed tool list" subject (for the audit's top warning, review M7); absent when the thrower gave none. */
+  readonly reason?: string;
+  constructor(message: string, options?: { cause?: unknown; reason?: string }) {
+    super(safeText(message, 800), options?.cause === undefined ? undefined : { cause: options.cause });
     this.name = 'ReviewedListError';
+    if (options?.reason !== undefined) this.reason = safeText(options.reason, 600);
   }
 }
 
@@ -351,7 +354,7 @@ export function loadReviewed(path: string = packageDataPath('reviewed-tools.yml'
   try {
     raw = parse(readFileSync(path, 'utf8'));
   } catch (e) {
-    throw new ReviewedListError("pipegen's reviewed tool list could not be read.", { cause: e });
+    throw new ReviewedListError("pipegen's reviewed tool list could not be read.", { cause: e, reason: 'it could not be read' });
   }
   const parsed = fileSchema.safeParse(raw);
   if (!parsed.success) {
@@ -359,17 +362,19 @@ export function loadReviewed(path: string = packageDataPath('reviewed-tools.yml'
     const tools = (raw as { tools?: { id?: unknown }[] } | null)?.tools;
     const index = issue?.path[1];
     const id = issue?.path[0] === 'tools' && typeof index === 'number' && typeof tools?.[index]?.id === 'string' ? ` (entry ${tools[index].id})` : '';
-    throw new ReviewedListError(`pipegen's reviewed tool list is invalid${id} at ${issue?.path.join('.') || 'the top'}: ${issue?.message ?? 'invalid'}`);
+    const where = `${id} at ${issue?.path.join('.') || 'the top'}: ${issue?.message ?? 'invalid'}`;
+    throw new ReviewedListError(`pipegen's reviewed tool list is invalid${where}`, { reason: `it is invalid${where}` });
   }
   const entries = parsed.data.tools;
   const ids = entries.map((t) => t.id);
   const dup = ids.find((id, i) => ids.indexOf(id) !== i);
-  if (dup !== undefined) throw new ReviewedListError(`pipegen's reviewed tool list has the entry ${dup} more than once.`);
+  if (dup !== undefined) throw new ReviewedListError(`pipegen's reviewed tool list has the entry ${dup} more than once.`, { reason: `it has the entry ${dup} more than once` });
 
   if (isReleaseBuild()) {
     const pending = entries.filter((t) => t.reviewedBy === PENDING).map((t) => t.id);
     if (pending.length > 0) {
-      throw new ReviewedListError(`This pipegen release refuses its reviewed tool list: ${pending.length} entries still wait for human review (${listPending(pending)}). Nothing unreviewed may run in your CI.`);
+      const reason = `${pending.length} entries still wait for human review (${listPending(pending)})`;
+      throw new ReviewedListError(`This pipegen release refuses its reviewed tool list: ${reason}. Nothing unreviewed may run in your CI.`, { reason });
     }
   }
   return entries.map(toReviewedTool);

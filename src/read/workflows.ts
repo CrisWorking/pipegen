@@ -17,6 +17,14 @@ export const TRIGGER_RE = /^[a-z_]+$/;
 // "butterfly" and "overwhelm" do not count while "deployment.sh" and "npm_deploy" still do. (helmfile is a known miss.)
 const DEPLOY_RE = /(?<![A-Za-z])(deploy|vercel|netlify|fly(?:ctl)?(?![A-Za-z])|heroku|aws (?:ecs|s3|lambda)|kubectl|helm(?![A-Za-z])|gcloud (?:run|app)|az (?:webapp|containerapp)|docker push|npm publish|twine upload)/i;
 const NAME_OR_FILE_RE = /deploy|release|publish/i;
+/**
+ * Plan U Task 5: a run line that STARTS with a command publishing to npm or PyPI (after optional spaces), so an
+ * echo, a comment or a quoted mention never counts. Linear; lines over 4 KB are skipped by regexLines.
+ */
+const NPM_PUBLISH_LINE = /^\s*(?:npx\s+)?(?:npm(?:\s+stage)?|pnpm|bun|yarn(?:\s+npm)?)\s+publish(?:\s|$)/;
+const PYPI_PUBLISH_LINE = /^\s*(?:(?:python3?\s+-m\s+)?twine\s+upload|(?:uv|poetry|flit|hatch|pdm)\s+publish)(?:\s|$)/;
+/** The PyPI publish action (any ref): https://github.com/pypa/gh-action-pypi-publish */
+const PYPI_ACTION = /^pypa\/gh-action-pypi-publish(?:@|$)/i;
 const EXPRESSION_RE = /\$\{\{([^}]*)\}\}/g;
 const SECRET_REF_RE = /\bsecrets(?:\.([A-Za-z_][A-Za-z0-9_]*)(?![\w-])|\[\s*['"]([^'"]*)['"]\s*\])/g;
 
@@ -60,6 +68,24 @@ function deploysOf(doc: Record<string, unknown>, path: string): boolean {
     }
   }
   return false;
+}
+
+/** Registries a workflow's steps publish to (top-level job steps only; a called workflow or action isn't looked into). */
+const publishesField = (p: ('npm' | 'pypi')[]) => (p.length > 0 ? { publishes: p } : {});
+
+function publishesOf(doc: Record<string, unknown>): ('npm' | 'pypi')[] {
+  const out = new Set<'npm' | 'pypi'>();
+  for (const job of Object.values(asObj(doc.jobs))) {
+    for (const step of Array.isArray(asObj(job).steps) ? asObj(job).steps as unknown[] : []) {
+      const s = asObj(step);
+      for (const u of strings(s.uses)) if (regexSafe(u) && PYPI_ACTION.test(u.trim())) out.add('pypi');
+      for (const r of strings(s.run)) {
+        if (looksLikeDeploy(r, NPM_PUBLISH_LINE)) out.add('npm');
+        if (looksLikeDeploy(r, PYPI_PUBLISH_LINE)) out.add('pypi');
+      }
+    }
+  }
+  return [...out].sort();
 }
 
 const LINKED_NOTE = 'Skipped .github/workflows: it is reached through a symbolic link.';
@@ -117,6 +143,7 @@ export async function readWorkflows(dir: string, files?: string[], notes: string
       deploys: deploysOf(doc, path),
       secretsUsed: secretsOf(read.text),
       jobs: Object.keys(asObj(doc.jobs)).filter((j) => regexSafe(j) && JOB_ID_RE.test(j)),
+      ...publishesField(publishesOf(doc)),
     });
   }
   return out;

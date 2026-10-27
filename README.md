@@ -4,7 +4,7 @@
 For small teams with nobody dedicated to security, DevOps or code quality.
 It opens one pull request. You review it. It never touches your app code or your `main` branch.
 
-> **Status: early. Design only, no code yet.** The first release is `pipegen audit` (read-only). See the [roadmap](docs/roadmap.md).
+> **Status: early, not published yet.** `pipegen audit` (read-only) is built and tested on real public repos; it is not on npm yet, so the commands below don't work until the first release. The full run (one PR) comes later. See the [roadmap](docs/roadmap.md).
 
 ## What the audit will show you *(example, not real yet)*
 

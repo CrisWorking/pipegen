@@ -161,7 +161,8 @@ export async function inspect(dir: string, io: CliIO, opts: { allowBroad: boolea
   const clock: RateClock = { budget: newRateBudget() };
   let github: { auth: Auth; p: RepoProfile; caps: Capabilities } | { error: string };
   try {
-    const auth = await getAuth({ owner, repos: [repo], allowBroad: opts.allowBroad, mode: 'read' }, { env: io.env, fetch: io.fetch, clock, notes });
+    const repoAnswer: { data?: unknown } = {}; // getAuth's anonymous GET /repos, reused below (review M6)
+    const auth = await getAuth({ owner, repos: [repo], allowBroad: opts.allowBroad, mode: 'read' }, { env: io.env, fetch: io.fetch, clock, notes, repoAnswer });
     token = auth.token;
     if (auth.token !== null) {
       knownValues.push(auth.token);
@@ -169,7 +170,7 @@ export async function inspect(dir: string, io: CliIO, opts: { allowBroad: boolea
     }
     const gh = makeOctokit(auth.token, { fetch: io.fetch, clock, log: fail });
     const login = await tokenLogin(gh, auth, clock, notes);
-    const ctx: GitHubContext = await readGitHubContext(gh, owner, repo, login, clock, notes);
+    const ctx: GitHubContext = await readGitHubContext(gh, owner, repo, login, clock, notes, { known: repoAnswer.data });
     const p: RepoProfile = { ...local, ...ctx };   // GitHub's default branch replaces the reader's 'main' stub
     const caps = await probeCapabilities(gh, owner, repo, p, notes, clock);
     if (auth.kind === 'anonymous') {
