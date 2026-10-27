@@ -160,8 +160,8 @@ Work through it in order. Tick a step only after Cristiano said go and the resul
 ### D. Decisions left open
 
 - [x] **D1. The emergency path for urgent security fixes.** Decided (DECISIONS #103: "yes, owner approval each time") and
-      built: the `security-fix` label applied by a code owner plus a `Security-fix-reason:` line, and two code-owner
-      approvals once CODEOWNERS lists two owners. The README says so; see [cooldown.md](cooldown.md#the-emergency-path-for-urgent-security-fixes).
+      built: the `security-fix` label applied by a code owner, a `Security-fix-reason:` line, and the owner's
+      `Security-fix-approved` review on the head commit (code-owner approvals once CODEOWNERS lists two owners). The README says so; see [cooldown.md](cooldown.md#the-emergency-path-for-urgent-security-fixes).
 
 ## Notes
 

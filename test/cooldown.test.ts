@@ -407,20 +407,17 @@ const OWNERS2 = '/data/ @CrisWorking @Second\n/scripts/ @CrisWorking @Second\n';
 const REASON = 'Security-fix-reason: CVE-2026-0001 in rollup, fixed upstream yesterday';
 const young = { 'package-lock.json': lock({ rollup: '4.64.12' }) };
 const youngDocs = npmDoc('rollup', { '4.64.12': daysAgo(1) });
-// The head commit arrived 12 hours ago (its earliest pull_request run); the default label came 2 hours ago.
-const HEAD_AT = daysAgo(0.5);
-const labeled = (login: string, event = 'labeled', name = 'security-fix', at = daysAgo(2 / 24)) => ({ event, actor: { login }, label: { name }, created_at: at });
-const RUNS = gh(`o/p/actions/runs?head_sha=${SHA}&event=pull_request&per_page=100&page=1`);
-const review = (login: string, state: string, commit = SHA) => ({ user: { login }, state, commit_id: commit });
-const prRoutes = (o: { body?: string | null; labels?: string[]; author?: string; head?: string; events?: unknown; reviews?: unknown; runs?: unknown } = {}): Routes => ({
+const labeled = (login: string, event = 'labeled', name = 'security-fix') => ({ event, actor: { login }, label: { name } });
+const review = (login: string, state: string, commit = SHA, body = '') => ({ user: { login }, state, commit_id: commit, body });
+/** One-owner mode (R-E5): the owner's review on the head with the `Security-fix-approved` line. */
+const confirm = (login = 'CrisWorking', commit = SHA, state = 'COMMENTED') => review(login, state, commit, 'Checked the diff.\r\n  Security-fix-approved  \n');
+const prRoutes = (o: { body?: string | null; labels?: string[]; author?: string; head?: string; events?: unknown; reviews?: unknown } = {}): Routes => ({
   [gh('o/p/pulls/7')]: {
     number: 7, head: { sha: o.head ?? SHA }, user: { login: o.author ?? 'contributor' },
     body: o.body === undefined ? `Fixes the CVE.\n\n${REASON}\n` : o.body, labels: (o.labels ?? ['security-fix']).map((name) => ({ name })),
   },
   [gh('o/p/issues/7/events?per_page=100&page=1')]: o.events ?? [labeled('someone', 'labeled', 'bug'), labeled('CrisWorking')],
-  [gh('o/p/pulls/7/reviews?per_page=100&page=1')]: o.reviews ?? [],
-  // newest first, as the API lists them; the earliest one dates the head's arrival
-  [RUNS]: o.runs ?? { total_count: 2, workflow_runs: [{ created_at: daysAgo(0.1) }, { created_at: HEAD_AT }] },
+  [gh('o/p/pulls/7/reviews?per_page=100&page=1')]: o.reviews ?? [confirm()],
 });
 const emergency = (owners: string | null, routes: Routes, head: Files = young, calls: string[] = []) =>
   run(owners === null ? {} : { '.github/CODEOWNERS': owners }, head, router({ ...youngDocs, ...routes }, calls), { pr: PR });
@@ -527,10 +524,12 @@ describe('cooldown: security-fix emergency path', () => {
   });
 
   it('an API error reading the PR, events or reviews fails closed (not "no label")', async () => {
-    for (const path of ['o/p/pulls/7', 'o/p/issues/7/events?per_page=100&page=1', 'o/p/pulls/7/reviews?per_page=100&page=1', `o/p/actions/runs?head_sha=${SHA}&event=pull_request&per_page=100&page=1`]) {
+    for (const path of ['o/p/pulls/7', 'o/p/issues/7/events?per_page=100&page=1', 'o/p/pulls/7/reviews?per_page=100&page=1']) {
       const r = await emergency(OWNERS2, { ...prRoutes({ reviews: [review('CrisWorking', 'APPROVED'), review('Second', 'APPROVED')] }), [gh(path)]: 502 });
       expect(r.ok, path).toBe(false);
       expect(r.findings.some((f) => f.kind === 'security-fix' && f.lookupFailed), path).toBe(true);
+      const one = await emergency(OWNERS1, { ...prRoutes(), [gh(path)]: 502 });
+      expect(one.findings.some((f) => f.kind === 'security-fix' && f.lookupFailed), `one owner: ${path}`).toBe(true);
     }
     // an unreadable answer (not a list, no labels) fails too
     expect((await emergency(OWNERS1, { ...prRoutes(), [gh('o/p/issues/7/events?per_page=100&page=1')]: { message: 'odd' } })).ok).toBe(false);
@@ -599,33 +598,44 @@ describe('cooldown: security-fix emergency path', () => {
     }
   });
 
-  it('R-E2: a label applied before the current head arrived does not count; a re-label after the push does', async () => {
-    const before = [labeled('CrisWorking', 'labeled', 'security-fix', daysAgo(1))];
-    const r = await emergency(OWNERS1, prRoutes({ events: before }));
-    expect(r.ok).toBe(false);
-    expect(problems(r)).toContain('re-apply');
-    const relabeled = [...before, labeled('CrisWorking', 'unlabeled', 'security-fix', daysAgo(0.3)), labeled('CrisWorking', 'labeled', 'security-fix', daysAgo(0.2))];
-    expect((await emergency(OWNERS1, prRoutes({ events: relabeled }))).ok).toBe(true);
-    // two owners too: approvals on the new head do not replace a fresh label
-    const ok2 = [review('CrisWorking', 'APPROVED'), review('Second', 'APPROVED')];
-    expect((await emergency(OWNERS2, prRoutes({ events: before, reviews: ok2 }))).ok).toBe(false);
-    // a label with no readable time does not count
-    expect((await emergency(OWNERS1, prRoutes({ events: [{ event: 'labeled', actor: { login: 'CrisWorking' }, label: { name: 'security-fix' } }] }))).ok).toBe(false);
+  it('R-E5: one owner: an owner COMMENTED review with the Security-fix-approved line on the head → pass', async () => {
+    // the owner may confirm on their own PR; an APPROVED review with the line counts too
+    const own = await emergency(OWNERS1, prRoutes({ author: 'CrisWorking', reviews: [confirm()] }));
+    expect(own.ok).toBe(true);
+    expect(formatReport(own)).toContain('Security-fix-approved');
+    expect((await emergency(OWNERS1, prRoutes({ reviews: [confirm('crisworking', SHA, 'APPROVED')] }))).ok).toBe(true);
   });
 
-  it('R-E2: the runs API failing, or no run or no readable run date for the head, fails closed', async () => {
-    const err = await emergency(OWNERS1, prRoutes({ runs: 500 }));
-    expect(err.ok).toBe(false);
-    expect(err.findings.some((f) => f.kind === 'security-fix' && f.lookupFailed)).toBe(true);
-    for (const runs of [{ total_count: 0, workflow_runs: [] }, { workflow_runs: [{ created_at: 'yesterday' }] }, { message: 'odd' }, []]) {
-      const r = await emergency(OWNERS1, prRoutes({ runs }));
-      expect(r.ok, JSON.stringify(runs)).toBe(false);
+  it('R-E5: one owner: the confirming review on an older commit, from a non-owner, without the line, or missing → fail', async () => {
+    const cases: Record<string, unknown[]> = {
+      olderCommit: [confirm('CrisWorking', SHA2)],
+      nonOwner: [confirm('contributor')],
+      noLine: [review('CrisWorking', 'COMMENTED', SHA, 'looks fine'), review('CrisWorking', 'APPROVED', SHA, '')],
+      lineNotAlone: [review('CrisWorking', 'COMMENTED', SHA, 'Security-fix-approved, I think'), review('CrisWorking', 'COMMENTED', SHA, '> Security-fix-approved')],
+      wrongState: [confirm('CrisWorking', SHA, 'CHANGES_REQUESTED'), confirm('CrisWorking', SHA, 'PENDING')],
+      noReview: [],
+      dismissedItself: [confirm('CrisWorking', SHA, 'DISMISSED')],
+      laterDismissal: [confirm(), review('CrisWorking', 'DISMISSED', SHA)],
+      laterChangeRequest: [confirm(), review('CrisWorking', 'CHANGES_REQUESTED', SHA)],
+    };
+    for (const [name, reviews] of Object.entries(cases)) {
+      const r = await emergency(OWNERS1, prRoutes({ reviews }));
+      expect(r.ok, name).toBe(false);
+      expect(problems(r), name).toContain('Security-fix-approved');
     }
-    // the earliest run counts, wherever it is in the list, and every page is read
-    const page1 = { total_count: 101, workflow_runs: Array.from({ length: 100 }, () => ({ created_at: daysAgo(0.05) })) };
-    const routes = { ...prRoutes(), [RUNS]: page1, [RUNS.replace('&page=1', '&page=2')]: { total_count: 101, workflow_runs: [{ created_at: HEAD_AT }] } };
-    // page 1 alone would date the head after the label (1.2 h ago); page 2 holds the real arrival (12 h ago)
-    expect((await emergency(OWNERS1, routes)).ok).toBe(true);
+    // a confirmation after a dismissal counts again; a later plain comment does not cancel one
+    expect((await emergency(OWNERS1, prRoutes({ reviews: [confirm(), review('CrisWorking', 'DISMISSED', SHA), confirm()] }))).ok).toBe(true);
+    expect((await emergency(OWNERS1, prRoutes({ reviews: [confirm(), review('CrisWorking', 'COMMENTED', SHA, 'thanks')] }))).ok).toBe(true);
+  });
+
+  it('R-E5 regression: a label and confirmation given for commit B do not carry over to a commit C pushed later', async () => {
+    // The owner labelled the PR and confirmed B (SHA2). C (SHA) was pushed afterwards; C may even be an old commit
+    // with its own earlier CI runs. Nothing ties the owner to C, so it fails, until the owner confirms C itself.
+    const reviews = [confirm('CrisWorking', SHA2)];
+    const r = await emergency(OWNERS1, prRoutes({ head: SHA, reviews }));
+    expect(r.ok).toBe(false);
+    expect(problems(r)).toContain(SHA.slice(0, 12));
+    expect((await emergency(OWNERS1, prRoutes({ head: SHA, reviews: [...reviews, confirm('CrisWorking', SHA)] }))).ok).toBe(true);
   });
 
   it('R-E3: approvals needed = min(2, owners other than the author), at least 1', async () => {

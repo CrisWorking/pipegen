@@ -15,12 +15,12 @@
 //
 // Emergency path (DECISIONS #103): when the only problem left is age, a PR labelled `security-fix` by a code owner
 // passes anyway. Code owners are the users on the BASE commit's `.github/CODEOWNERS` `/data/` and `/scripts/` lines.
-// The label must have been applied after the current head commit arrived (its earliest `pull_request` workflow run),
-// so the owner re-labels after every push. With one owner the label plus a `Security-fix-reason:` line in the PR body
-// is enough; with two or more, owners other than the PR author must also approve the current head commit (two, or
-// one when the author is one of only two owners). The label is read from the API (PR labels and the latest `labeled`
-// event), never from the event payload, and any API error fails closed. The young items and the reason are printed,
-// so the exception stays visible.
+// The PR body needs a `Security-fix-reason:` line, and the grant is tied to the current head commit by a review, whose
+// commit_id GitHub sets: with one owner, that owner's review on the head (APPROVED or COMMENTED, so it works on their
+// own PR) with a line `Security-fix-approved`; with two or more, approvals on the head from owners other than the PR
+// author (two, or one when the author is one of only two owners). So every new push needs a new review. The label is
+// read from the API (PR labels and the latest `labeled` event), never from the event payload, and any API error fails
+// closed. The young items and the reason are printed, so the exception stays visible.
 //
 // The CI job runs the BASE commit's copy of this file against the PR's files, so a PR can't weaken the check that
 // judges it. Keep it dependency-free apart from `yaml`, and keep to syntax Node's type stripping can run
@@ -56,11 +56,13 @@ export interface Finding {
   young: boolean;
 }
 
-/** How the emergency path was granted: by whom, why, and (two or more owners) who approved. */
+/** How the emergency path was granted: by whom, why, and who confirmed or approved the head commit. */
 export interface Emergency {
   labelledBy: string;
   reason: string;
+  /** One owner: the owner whose `Security-fix-approved` review is on the head. Two or more: the approving owners. */
   approvers: string[];
+  oneOwner: boolean;
 }
 
 export interface CooldownResult {
@@ -644,6 +646,10 @@ export function emergencyOwners(text: string | null | undefined): { owners: stri
 
 const loginOf = (v: unknown): string | undefined => (isObj(v) ? str(v.login) : undefined);
 
+export const APPROVED_LINE = 'Security-fix-approved';
+/** True when a review body has a line that is exactly `Security-fix-approved` after trimming. */
+const confirmsHead = (body: unknown): boolean => typeof body === 'string' && body.split(/\r\n|\r|\n/).some((l) => l.trim() === APPROVED_LINE);
+
 /** Every page of a GitHub list, or undefined when it is longer than the page cap. */
 async function allPages(ctx: Ctx, url: string): Promise<unknown[] | undefined> {
   const out: unknown[] = [];
@@ -654,25 +660,6 @@ async function allPages(ctx: Ctx, url: string): Promise<unknown[] | undefined> {
     if (got.length < PAGE_SIZE) return out;
   }
   return undefined;
-}
-
-/** When the head commit arrived on the PR: the created_at of its earliest `pull_request` workflow run, or a problem. */
-async function headArrival(ctx: Ctx, api: string, headSha: string): Promise<{ at: number } | { problem: string }> {
-  let earliest: number | undefined;
-  for (let page = 1; page <= MAX_PAGES; page++) {
-    const got = await ctx.get(`${api}/actions/runs?head_sha=${headSha}&event=pull_request&per_page=${PAGE_SIZE}&page=${page}`, ctx.gh);
-    const runs = isObj(got) && Array.isArray(got.workflow_runs) ? got.workflow_runs : undefined;
-    if (!runs) throw new LookupError('unreadable workflow runs answer');
-    for (const run of runs) {
-      const at = isObj(run) ? str(run.created_at) : undefined;
-      if (!at || !ISO.test(at) || Number.isNaN(Date.parse(at))) return { problem: 'a workflow run for the head commit has no readable created_at' };
-      if (earliest === undefined || Date.parse(at) < earliest) earliest = Date.parse(at);
-    }
-    if (runs.length < PAGE_SIZE) {
-      return earliest === undefined ? { problem: 'no pull_request workflow run found for the head commit, so its arrival time is unknown' } : { at: earliest };
-    }
-  }
-  return { problem: `the head commit has more than ${MAX_PAGES * PAGE_SIZE} workflow runs` };
 }
 
 type EmergencyOutcome = { granted: Emergency } | { absent: true } | { problem: string; lookupFailed?: boolean };
@@ -706,36 +693,45 @@ async function emergencyOutcome(ctx: Ctx, pr: PrContext, codeowners: string | nu
     if (!by || !owners.includes(by.toLowerCase())) {
       return { problem: `the security-fix label was applied by ${plainText(by ?? 'an unknown user', 60)}, who is not a code owner in the base ${CODEOWNERS_FILE}; a code owner has to apply it` };
     }
-    // The grant covers only the commit it was given for: the label must be newer than the head's arrival.
-    const labelAt = str(last.created_at);
-    if (!labelAt || !ISO.test(labelAt) || Number.isNaN(Date.parse(labelAt))) return { problem: 'the security-fix labeled event has no readable time' };
-    const arrived = await headArrival(ctx, api, pr.headSha);
-    if ('problem' in arrived) return arrived;
-    if (Date.parse(labelAt) <= arrived.at) {
-      return { problem: `the security-fix label was applied before the head commit ${pr.headSha.slice(0, 12)} arrived; a code owner has to re-apply it after every push` };
-    }
 
     const reason = securityFixReason(doc.body);
     if (!reason) return { problem: `the PR body has no non-empty "${REASON_PREFIX}" line (the first such line counts)` };
-    if (owners.length < 2) return { granted: { labelledBy: by, reason, approvers: [] } };
+
+    const reviews = await allPages(ctx, `${api}/pulls/${pr.number}/reviews`);
+    if (!reviews) return { problem: `the PR has more than ${MAX_PAGES * PAGE_SIZE} reviews` };
+    const named: Array<[string, Obj]> = [];
+    for (const rv of reviews) {
+      const who = isObj(rv) ? loginOf(rv.user)?.toLowerCase() : undefined;
+      if (!isObj(rv) || !who) return { problem: 'unreadable review answer' };
+      if (rv.state !== 'PENDING') named.push([who, rv]);
+    }
+
+    if (owners.length < 2) {
+      // One owner (R-E5): the label alone is not tied to a commit, so the owner confirms the head itself with a review
+      // on it (APPROVED or COMMENTED; an owner can comment on their own PR) holding a line `Security-fix-approved`.
+      // The latest such review per owner counts; a later dismissal or change request from that owner cancels it.
+      const confirmed = new Map<string, string>();
+      for (const [who, rv] of named) {
+        if (!owners.includes(who)) continue;
+        if (rv.state === 'DISMISSED' || rv.state === 'CHANGES_REQUESTED') confirmed.delete(who);
+        else if ((rv.state === 'APPROVED' || rv.state === 'COMMENTED') && rv.commit_id === pr.headSha && confirmsHead(rv.body)) confirmed.set(who, loginOf(rv.user) ?? who);
+      }
+      if (confirmed.size === 0) {
+        return { problem: `a code owner has to confirm the head commit ${pr.headSha.slice(0, 12)} with a review on it (approve or comment) holding a line "${APPROVED_LINE}"; needed again after every push` };
+      }
+      return { granted: { labelledBy: by, reason, approvers: [...confirmed.values()], oneOwner: true } };
+    }
 
     // Two or more owners: the latest review of each user counts (a later comment, change request or dismissal
     // cancels an approval); it must approve the current head, by an owner who is not the PR author. Two such
     // approvals are needed, or one when only one owner other than the author exists (R-E3).
-    const reviews = await allPages(ctx, `${api}/pulls/${pr.number}/reviews`);
-    if (!reviews) return { problem: `the PR has more than ${MAX_PAGES * PAGE_SIZE} reviews` };
-    const latest = new Map<string, Obj>();
-    for (const rv of reviews) {
-      const who = isObj(rv) ? loginOf(rv.user)?.toLowerCase() : undefined;
-      if (!isObj(rv) || !who) return { problem: 'unreadable review answer' };
-      if (rv.state !== 'PENDING') latest.set(who, rv);
-    }
+    const latest = new Map<string, Obj>(named);
     const approvers = [...latest].filter(([who, rv]) => rv.state === 'APPROVED' && rv.commit_id === pr.headSha && owners.includes(who) && who !== author).map(([who]) => who).sort();
     const needed = Math.max(1, Math.min(2, owners.filter((o) => o !== author).length));
     if (approvers.length < needed) {
       return { problem: `with ${owners.length} code owners the path needs ${needed} approving review(s) from code owners other than the PR author on the head commit ${pr.headSha.slice(0, 12)}; found ${approvers.length}` };
     }
-    return { granted: { labelledBy: by, reason, approvers: approvers.map((a) => loginOf(latest.get(a)?.user) ?? a) } };
+    return { granted: { labelledBy: by, reason, approvers: approvers.map((a) => loginOf(latest.get(a)?.user) ?? a), oneOwner: false } };
   } catch (e) {
     if (e instanceof LookupError) return { problem: `GitHub lookup for the security-fix path failed: ${e.message}`, lookupFailed: !e.notFound };
     throw e;
@@ -830,9 +826,10 @@ export function formatReport(r: CooldownResult): string {
   if (r.ok && e && r.waived.length > 0) {
     lines.push(`cooldown: ok ONLY through the security-fix emergency path. ${r.checked} new or changed version(s) checked; these are younger than ${COOLDOWN_DAYS} days and pass only because of the label:`);
     for (const f of r.waived) lines.push(itemLine(f));
-    lines.push(e.approvers.length > 0
-      ? `Label applied by code owner ${plainText(e.labelledBy, 60)}; approved on the head commit by code owners ${e.approvers.map((a) => plainText(a, 60)).join(', ')}.`
-      : `Label applied by code owner ${plainText(e.labelledBy, 60)}. CODEOWNERS lists one owner, so the label and a written reason are enough.`);
+    const who = e.approvers.map((a) => plainText(a, 60)).join(', ');
+    lines.push(e.oneOwner
+      ? `Label applied by code owner ${plainText(e.labelledBy, 60)}; head commit confirmed by code owner ${who} with a ${APPROVED_LINE} review (CODEOWNERS lists one owner).`
+      : `Label applied by code owner ${plainText(e.labelledBy, 60)}; approved on the head commit by code owners ${who}.`);
     lines.push(`${REASON_PREFIX} ${e.reason}`);
   } else if (r.ok) {
     lines.push(`cooldown: ok. ${r.checked} new or changed version(s) checked, none younger than ${COOLDOWN_DAYS} days.`);
