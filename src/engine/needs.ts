@@ -10,6 +10,7 @@ import { bundleText, type CodeBundle } from '../ai/redact.js';
 import { aiSchema, type AiSchema } from '../ai/schema.js';
 import { signingMode } from '../github/signing-mode.js';
 import { SERVER_FRAMEWORKS, SERVICE_NAME_RE } from '../read/project.js';
+import { NEED_ID_CATEGORY, NEED_IDS, type NeedId } from './need-ids.js';
 import {
   FLOOR_NEEDS, NEED_CATEGORIES, type AiProvider, type AiUsage, type Capabilities, type Layer, type Need, type NeedCategory,
   type RepoProfile, type Service,
@@ -17,25 +18,7 @@ import {
 
 export const LAYERS = ['pre-commit', 'push', 'merge', 'deploy'] as const satisfies readonly Layer[];
 
-/** Ids only the AI adds (never in the floor). */
-const AI_ONLY_IDS = ['type-check', 'license-scan', 'dockerfile-lint', 'migration-check'] as const;
-
-/** Every floor id (each equal to its category) plus the ids the AI may add; the AI schema's id enum. */
-export const NEED_IDS = [...NEED_CATEGORIES, ...AI_ONLY_IDS] as const;
-export type NeedId = typeof NEED_IDS[number];
-
-/**
- * The category of every need id (Plan B ruling S6). Floor ids map to themselves. The AI must give exactly this
- * category, so it can never change which blocking rules apply to a need. Tool lookup (`reviewedFor`) and memory
- * entries derive the category from this table too.
- */
-export const NEED_ID_CATEGORY: Readonly<Record<NeedId, NeedCategory>> = Object.freeze({
-  ...(Object.fromEntries(NEED_CATEGORIES.map((c) => [c, c])) as Record<NeedCategory, NeedCategory>),
-  'type-check': 'lint',
-  'dockerfile-lint': 'lint',
-  'license-scan': 'deps',
-  'migration-check': 'full-tests',
-});
+export { NEED_ID_CATEGORY, NEED_IDS, type NeedId } from './need-ids.js';
 
 /** Scanner categories (ruling S10): their merge-layer jobs also run in the nightly job. */
 const SCANNERS: ReadonlySet<string> = new Set(['secrets', 'sast', 'deps', 'iac', 'image-scan', 'dast']);

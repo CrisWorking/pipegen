@@ -22,7 +22,7 @@ import { NEED_CATEGORIES, type Language, type ReviewedTool } from '../types.js';
 import { packageDataPath } from '../util/package-data.js';
 import { safeText } from '../util/safe-text.js';
 import { checkChain, checkDir, prepareTrustedDir, type TrustedDirKind } from '../util/trusted-dir.js';
-import { NEED_ID_CATEGORY } from './needs.js';
+import { NEED_ID_CATEGORY } from './need-ids.js';
 import { ID_RE, loadReviewed } from './reviewed.js';
 
 /** Everything memory remembers about a tool. `toolId` is a ReviewedTool id: callers re-render the step from the reviewed list. */

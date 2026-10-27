@@ -23,7 +23,7 @@ import {
   advisoryVersion, ASSET_RE, COMMIT_SHA_RE, DIGEST_RE, IMAGE_TAG_RE, isFullSemver, isGitHubRepo, isNpmName, isPypiName, npmEscapedName, parseImageRef, pep503,
   SHA256_RE, SRI_SHA512_RE, TAG_RE,
 } from './names.js';
-import { NEED_ID_CATEGORY } from './needs.js';
+import { NEED_ID_CATEGORY } from './need-ids.js';
 import { fetchAllowed, HttpError } from './http.js';
 import { COOLDOWN_DAYS } from './pin.js';
 
