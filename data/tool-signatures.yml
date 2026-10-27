@@ -9,19 +9,26 @@
 #                 (case-insensitive, @ref ignored), so snyk/actions/setup or anchore/sbom-action/download-syft, which
 #                 only install, never count. A last part ending in * is a prefix (snyk/actions/python* matches
 #                 snyk/actions/python-3.10).
-#   commands      command names, matched only where a command starts (line start, after ; && || | $( or a wrapper
-#                 such as npx, sudo, env, uv run, python -m; a path's basename; the image after docker run).
-#                 Words are separated by one space ("npm audit"); a first word with a slash is a path (.husky/pre-commit).
-#   excludes      longer commands that start like one of `commands` but are not this check.
+#   commands      command names, matched only where a command starts (start, after ; && || | $( ( { a newline, a
+#                 shell keyword or a wrapper such as npx, sudo, env, uv run, python -m; a path's basename; the image
+#                 after docker run), never inside quotes. Words are separated by one space ("npm audit"); a first word
+#                 with a slash is a path (.husky/pre-commit). A call with --version or --help (or only -v, -V or -h)
+#                 is never a run.
+#   excludes      longer commands that start like one of `commands` but are not this check (gitleaks version).
 #   commandFails  default (fails on findings), flag (only with one of failFlags), never (only reports).
 #   failFlags     flags that make a `flag` command fail on findings.
-#   softFlags     flags that stop a command from failing ("--exit-code=0" also matches "--exit-code 0").
+#   softFlags     flags that stop a command from failing ("--exit-code=0" also matches "--exit-code 0"). They are
+#                 also read inside an action's args, cmd_options and options inputs.
 #   actionFails   default, input (only with one of failInputs) or never, for the actions.
-#   failInputs    `with:` inputs (name: lowercase values, * = any value) that make an `input` action fail.
-#   softInputs    `with:` inputs (name: lowercase values) that stop the action from failing.
+#   failInputs    `with:` inputs (name: lowercase values, * = any non-empty value) that make an `input` action fail.
+#   softInputs    `with:` inputs (name: lowercase values, * = any non-empty value) that stop the action from failing.
+#   softUnless    `with:` inputs set (non-empty) to anything except these values stop the action from failing.
+#                 Input names are compared case-insensitively, as GitHub does.
 #   partialWhy    pipegen's own sentence for a check that never fails the job.
-# Every entry has actions, commands or both. Each fail default below was checked against the tool's own source or
-# docs (the URL above the entry) on 2026-10-27.
+# Every entry has actions, commands or both. Where an entry sets commandFails, actionFails, failFlags, softFlags,
+# failInputs, softInputs or softUnless, that behaviour was checked on 2026-10-27 against the source or docs named in
+# the comment above it (fetched with curl). An entry with no such comment uses the plain default (a run fails on
+# findings), which pipegen has not checked tool by tool.
 tools:
   # ---------- secrets ----------
   # https://github.com/gitleaks/gitleaks/blob/master/README.md ("--exit-code int ... (default 1)")
@@ -29,6 +36,7 @@ tools:
     categories: [secrets]
     actions: [gitleaks/gitleaks-action]
     commands: [gitleaks]
+    excludes: [gitleaks version, gitleaks help, gitleaks completion]
     softFlags: [--exit-code=0]
   # CLI: https://github.com/trufflesecurity/trufflehog/blob/main/README.md ("183 ... only returned if --fail is used")
   # Action: https://github.com/trufflesecurity/trufflehog/blob/main/action.yml (always passes --fail)
@@ -73,18 +81,23 @@ tools:
     commandFails: never
     actionFails: never
     partialWhy: CodeQL reports findings but does not fail the job; they block only if code scanning merge protection is on.
-  # https://github.com/PyCQA/bandit/blob/main/bandit/cli/main.py (--exit-zero)
+  # CLI: https://github.com/PyCQA/bandit/blob/main/bandit/cli/main.py (--exit-zero)
+  # Action: https://github.com/PyCQA/bandit-action/blob/main/action.yml (runs bandit ... -f sarif -o results.sarif || true)
   - id: bandit
     categories: [sast]
     actions: [PyCQA/bandit-action]
     commands: [bandit]
     softFlags: [--exit-zero]
-  # https://github.com/securego/gosec/blob/master/README.md ("Use -no-fail to always return 0")
+    actionFails: never
+    partialWhy: The official bandit action ignores bandit's exit code, so it never fails the job.
+  # https://github.com/securego/gosec/blob/master/README.md ("Use -no-fail to always return 0"); Go's flag package
+  # also takes --no-fail. The action passes its `args` input straight to gosec
+  # (https://github.com/securego/gosec/blob/master/action.yml), so -no-fail there counts too.
   - id: gosec
     categories: [sast]
     actions: [securego/gosec]
     commands: [gosec]
-    softFlags: [-no-fail]
+    softFlags: [-no-fail, --no-fail]
   # ---------- dependencies ----------
   # https://github.com/snyk/actions/blob/master/action.yml (input command, default test); only the scanning
   # sub-actions are listed, never snyk/actions/setup (install only)
@@ -126,32 +139,47 @@ tools:
     actions: [google/osv-scanner-action, google/osv-scanner-action/osv-scanner-action]
     commands: [osv-scanner]
   # npm audit signatures checks registry signatures, not vulnerabilities
+  # --audit-level=none: https://github.com/npm/cli/blob/latest/lib/utils/reify-output.js uses 'none' as the level
+  # for commands that must not fail on an audit
   - id: npm-audit
     categories: [deps]
     commands: [npm audit, pnpm audit, yarn audit]
     excludes: [npm audit signatures]
+    softFlags: [--audit-level=none]
+  # Action: https://github.com/pypa/gh-action-pip-audit/blob/main/action.py (exits 0 when
+  # internal-be-careful-allow-failure is anything but "false")
   - id: pip-audit
     categories: [deps]
     actions: [pypa/gh-action-pip-audit]
     commands: [pip-audit]
+    softUnless:
+      internal-be-careful-allow-failure: ['false']
   # https://github.com/actions/dependency-review-action/blob/main/README.md (fail-on-severity default low; warn-only)
   - id: dependency-review
     categories: [deps]
     actions: [actions/dependency-review-action]
     softInputs:
       warn-only: ['true']
+  # CLI: https://github.com/golang/vuln/blob/master/cmd/govulncheck/doc.go ("Exit codes": exits 0 with -json,
+  # -format sarif or -format openvex, whatever it finds)
+  # Action: https://github.com/golang/govulncheck-action/blob/master/action.yml (output-format goes to -format)
   - id: govulncheck
     categories: [deps]
     actions: [golang/govulncheck-action]
     commands: [govulncheck]
+    softFlags: [-json, --json, -format=json, -format=sarif, -format=openvex, --format=json, --format=sarif, --format=openvex]
+    softInputs:
+      output-format: [json, sarif, openvex]
   # ---------- containers and infrastructure ----------
   # CLI: https://github.com/aquasecurity/trivy/blob/main/docs/guide/configuration/others.md ("By default, Trivy exits
   # with code 0 even when security issues are detected")
-  # Action: https://github.com/aquasecurity/trivy-action/blob/master/action.yaml (exit-code has no default)
+  # Action: https://github.com/aquasecurity/trivy-action/blob/master/action.yaml (exit-code has no default and is
+  # passed on only when non-empty: set_env_var_if_provided "TRIVY_EXIT_CODE")
   - id: trivy
     categories: [deps, image-scan, iac]
     actions: [aquasecurity/trivy-action]
     commands: [trivy]
+    excludes: [trivy version]
     commandFails: flag
     failFlags: [--exit-code]
     softFlags: [--exit-code=0]
@@ -161,37 +189,41 @@ tools:
     softInputs:
       exit-code: ['0']
   # CLI: https://github.com/anchore/grype/blob/main/cmd/grype/cli/options/grype.go (--fail-on / -f, empty by default)
-  # Action: https://github.com/anchore/scan-action/blob/main/action.yml (fail-build default "true")
+  # Action: https://github.com/anchore/scan-action/blob/main/action.yml (fail-build default "true") and its bundled
+  # code (`failBuild = failBuild.toLowerCase() === "true"`, an empty value means "true"): anything else is soft
   - id: grype
     categories: [deps, image-scan]
     actions: [anchore/scan-action]
     commands: [grype]
+    excludes: [grype version]
     commandFails: flag
     failFlags: [--fail-on, -f]
-    softInputs:
-      fail-build: ['false']
+    softUnless:
+      fail-build: ['true']
   - id: docker-build
     categories: [image-build]
     actions: [docker/build-push-action]
     commands: [docker build, docker buildx build]
-  # CLI: https://github.com/bridgecrewio/checkov/blob/main/README.md (--soft-fail)
-  # Action: https://github.com/bridgecrewio/checkov-action/blob/master/action.yml (soft_fail)
+  # CLI: https://github.com/bridgecrewio/checkov/blob/main/docs/2.Basics/CLI%20Command%20Reference.md (-s, --soft-fail)
+  # Action: https://github.com/bridgecrewio/checkov/blob/main/github_action_resources/entrypoint.sh (adds --soft-fail
+  # only when soft_fail is "true")
   - id: checkov
     categories: [iac]
     actions: [bridgecrewio/checkov-action]
     commands: [checkov]
-    softFlags: [--soft-fail]
+    softFlags: [--soft-fail, -s]
     softInputs:
       soft_fail: ['true']
   # CLI: https://github.com/aquasecurity/tfsec/blob/master/internal/app/tfsec/cmd/flags.go (--soft-fail, -s)
-  # Action: https://github.com/aquasecurity/tfsec-action/blob/master/action.yml (soft_fail)
+  # Action: https://github.com/aquasecurity/tfsec-action/blob/master/entrypoint.sh (`if [ -n "${INPUT_SOFT_FAIL}" ]`:
+  # any non-empty soft_fail, even "false", adds --soft-fail)
   - id: tfsec
     categories: [iac]
     actions: [aquasecurity/tfsec-action]
     commands: [tfsec]
     softFlags: [--soft-fail, -s]
     softInputs:
-      soft_fail: ['true']
+      soft_fail: ['*']
   # ---------- running app (DAST) ----------
   # https://github.com/zaproxy/action-baseline/blob/master/action.yml (fail_action default false; same in
   # action-full-scan and action-api-scan)
@@ -270,6 +302,7 @@ tools:
     categories: [sbom]
     actions: [anchore/sbom-action]
     commands: [syft]
+    excludes: [syft version]
   - id: cosign
     categories: [signing]
     commands: [cosign sign, cosign sign-blob]

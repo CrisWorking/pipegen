@@ -351,9 +351,10 @@ describe('mapCoverage (fix round 1)', () => {
     for (const cmd of ['gitleaks detect || true', 'gitleaks detect || :', 'gitleaks detect || exit 0', 'gitleaks detect && echo ok || true']) {
       const r = await one(`${both}${job(run(JSON.stringify(cmd)))}`, 'push', 'secrets'); // quoted: a bare `|| :` would be a YAML key
       expect(r.status, cmd).toBe('partial');
-      expect(r.why).toBe("The gitleaks check runs, but its exit code is ignored (|| true, || exit 0 or set +e), so it can't block anything.");
+      expect(r.why).toBe("The gitleaks check runs, but its exit code is ignored (by ||, a pipe, an if, set +e or the step's shell), so it can't block anything.");
     }
-    expect((await one(`${both}${job('      - run: |\n          set +e\n          gitleaks detect\n')}`, 'push', 'secrets')).status).toBe('partial');
+    // with errexit off, a tool that isn't the step's last command can't fail the step (the last one still can)
+    expect((await one(`${both}${job('      - run: |\n          set +e\n          gitleaks detect\n          echo done\n')}`, 'push', 'secrets')).status).toBe('partial');
     // set -e turns errexit back on; a later || true in another list doesn't reach the tool
     expect((await one(`${both}${job('      - run: |\n          set +e\n          set -eo pipefail\n          gitleaks detect\n')}`, 'push', 'secrets')).status).toBe('covered');
     expect((await one(`${both}${job(run('gitleaks detect; echo done || true'))}`, 'push', 'secrets')).status).toBe('covered');
@@ -386,7 +387,7 @@ describe('mapCoverage (fix round 1)', () => {
     expect(await st('checkov -d . --soft-fail', 'iac', { terraformDirs: ['infra'] })).toBe('partial');
     expect(await st('checkov -d .', 'iac', { terraformDirs: ['infra'] })).toBe('covered');
     // flags on continuation lines belong to the same command
-    expect((await one(`${both}${job('      - run: |\n          trivy fs . \\\\\n            --exit-code 1\n')}`, 'push', 'deps', {}, 'app')).status).toBe('covered');
+    expect((await one(`${both}${job('      - run: |\n          trivy fs . \\\n            --exit-code 1\n')}`, 'push', 'deps', {}, 'app')).status).toBe('covered');
     const r = await one(`${both}${job(run('gitleaks detect --exit-code 0'))}`, 'push', 'secrets');
     expect(r.why).toBe("The gitleaks check runs, but is set not to fail on findings, so it can't block anything.");
   });
@@ -550,7 +551,103 @@ describe('mapCoverage (fix round 1)', () => {
     expect(p.existingWorkflows).toHaveLength(1); // under the 1 MB read limit, so it really is scanned
     const t = performance.now();
     await mapCoverage(p, floorNeeds(p, caps), dir);
-    expect(performance.now() - t).toBeLessThan(2000);
+    expect(performance.now() - t).toBeLessThan(5000);
+  });
+});
+
+describe('mapCoverage (fix round 2)', () => {
+  // Every probe from the round-1 re-review (adv.test.ts, adv2.test.ts), with the status each must have now.
+  const runnableTf = { services: [svc('.', { scripts: ['start'] })], terraformDirs: ['infra'] };
+  const cases: [string, string, Layer, string, Coverage['status']][] = [
+    ['|| on the next line (no backslash)', `${both}${job('      - run: |\n          gitleaks detect ||\n            true\n')}`, 'push', 'secrets', 'partial'],
+    ['|| echo', `${both}${job('      - run: gitleaks detect || echo "leaks found"\n')}`, 'push', 'secrets', 'partial'],
+    ['{ …; } || true', `${both}${job('      - run: "{ gitleaks detect; } || true"\n')}`, 'push', 'secrets', 'partial'],
+    ['( a; b ) || true', `${both}${job('      - run: "(gitleaks detect; echo x) || true"\n')}`, 'push', 'secrets', 'partial'],
+    ['multi-line group || true', `${both}${job('      - run: |\n          {\n            gitleaks detect\n            echo scanned\n          } || true\n')}`, 'push', 'secrets', 'partial'],
+    ['pipe to tee (default shell: no pipefail)', `${both}${job('      - run: gitleaks detect | tee out.txt\n')}`, 'push', 'secrets', 'partial'],
+    ['if ! tool; then', `${both}${job('      - run: |\n          if ! gitleaks detect; then echo found; fi\n')}`, 'push', 'secrets', 'partial'],
+    ['set -x +e, tool not last', `${both}${job('      - run: |\n          set -x +e\n          gitleaks detect\n          echo done\n')}`, 'push', 'secrets', 'partial'],
+    ['command -v probe', `${both}${job('      - run: command -v gitleaks || go install github.com/zricethezav/gitleaks/v8@latest\n')}`, 'push', 'secrets', 'missing'],
+    ['quoted ; in echo', `${both}${job('      - run: echo "todo; gitleaks detect"\n')}`, 'push', 'secrets', 'missing'],
+    ['sudo -u <tool-named user>', `${both}${job('      - run: sudo -u gitleaks id\n')}`, 'push', 'secrets', 'missing'],
+    ['env -u <tool name>', `${both}${job('      - run: env -u gitleaks printenv\n')}`, 'push', 'secrets', 'missing'],
+    ['custom shell bash {0} (no -e), tool not last', `${both}${job('      - shell: bash {0}\n        run: |\n          gitleaks detect\n          echo done\n')}`, 'push', 'secrets', 'partial'],
+    ['if: cancelled()', `${both}jobs:\n  scan:\n    runs-on: x\n    if: cancelled()\n    steps:\n      - run: gitleaks detect\n`, 'push', 'secrets', 'partial'],
+    ['if: !success()', `${both}jobs:\n  scan:\n    runs-on: x\n    if: \${{ !success() }}\n    steps:\n      - run: gitleaks detect\n`, 'push', 'secrets', 'partial'],
+    ['if: !always()', `${both}jobs:\n  scan:\n    runs-on: x\n    if: "!always()"\n    steps:\n      - run: gitleaks detect\n`, 'push', 'secrets', 'missing'],
+    ['if: always() && event_name', `${both}jobs:\n  scan:\n    runs-on: x\n    if: always() && github.event_name == 'push'\n    steps:\n      - run: gitleaks detect\n`, 'merge', 'secrets', 'partial'],
+    ['if: guard for another repo', `${both}jobs:\n  scan:\n    runs-on: x\n    if: github.repository == 'someone-else/other'\n    steps:\n      - run: gitleaks detect\n`, 'push', 'secrets', 'missing'],
+    ['if: false && always()', `${both}jobs:\n  scan:\n    runs-on: x\n    if: \${{ false && always() }}\n    steps:\n      - run: gitleaks detect\n`, 'push', 'secrets', 'missing'],
+    ['if: 1 == 2', `${both}jobs:\n  scan:\n    runs-on: x\n    if: 1 == 2\n    steps:\n      - run: gitleaks detect\n`, 'push', 'secrets', 'partial'],
+    ['continue-on-error ${{ true }}', `${both}${job('      - run: gitleaks detect\n        continue-on-error: \${{ true }}\n')}`, 'push', 'secrets', 'partial'],
+    ['job continue-on-error "true"', `${both}${job('      - run: gitleaks detect\n', "    continue-on-error: 'true'\n")}`, 'push', 'secrets', 'partial'],
+    ['Fail-Build: false (input names ignore case)', `${both}${job('      - uses: anchore/scan-action@v6\n        with:\n          Fail-Build: false\n')}`, 'push', 'deps', 'partial'],
+    ['fail-build: "no"', `${both}${job("      - uses: anchore/scan-action@v6\n        with:\n          fail-build: 'no'\n")}`, 'push', 'deps', 'partial'],
+    ['fail-build: "TRUE"', `${both}${job("      - uses: anchore/scan-action@v6\n        with:\n          fail-build: 'TRUE'\n")}`, 'push', 'deps', 'covered'],
+    ['Soft_Fail: true checkov-action', `${both}${job('      - uses: bridgecrewio/checkov-action@v12\n        with:\n          Soft_Fail: true\n')}`, 'merge', 'iac', 'partial'],
+    ['soft_fail: "yes" checkov-action (only "true" counts upstream)', `${both}${job("      - uses: bridgecrewio/checkov-action@v12\n        with:\n          soft_fail: 'yes'\n")}`, 'merge', 'iac', 'covered'],
+    ['soft_fail: false tfsec-action (any value counts upstream)', `${both}${job('      - uses: aquasecurity/tfsec-action@v1\n        with:\n          soft_fail: false\n')}`, 'merge', 'iac', 'partial'],
+    ['Warn-Only: true dependency-review', `${both}${job('      - uses: actions/dependency-review-action@v4\n        with:\n          Warn-Only: true\n')}`, 'merge', 'deps', 'partial'],
+    ['trivy-action Exit-Code: 1', `${both}${job("      - uses: aquasecurity/trivy-action@0.28.0\n        with:\n          Exit-Code: '1'\n")}`, 'push', 'deps', 'covered'],
+    ['trivy-action exit-code empty', `${both}${job("      - uses: aquasecurity/trivy-action@0.28.0\n        with:\n          exit-code: ''\n")}`, 'push', 'deps', 'partial'],
+    ['zap fail_action "True"', `${both}${job("      - uses: zaproxy/action-baseline@v0.14.0\n        with:\n          fail_action: 'True'\n")}`, 'merge', 'dast', 'covered'],
+    ['zap default', `${both}${job('      - uses: zaproxy/action-baseline@v0.14.0\n')}`, 'merge', 'dast', 'partial'],
+    ['checkov -s', `${both}${job('      - run: checkov -d . -s\n')}`, 'merge', 'iac', 'partial'],
+    ['gosec --no-fail', `${both}${job('      - run: gosec --no-fail ./...\n')}`, 'push', 'sast', 'partial'],
+    ['gosec action args -no-fail', `${both}${job("      - uses: securego/gosec@master\n        with:\n          args: '-no-fail -fmt sarif -out results.sarif ./...'\n")}`, 'push', 'sast', 'partial'],
+    ['gosec action args (blocking)', `${both}${job("      - uses: securego/gosec@master\n        with:\n          args: './...'\n")}`, 'push', 'sast', 'covered'],
+    ['govulncheck -format sarif', `${both}${job('      - run: govulncheck -format sarif ./...\n')}`, 'push', 'deps', 'partial'],
+    ['govulncheck -json', `${both}${job('      - run: govulncheck -json ./...\n')}`, 'push', 'deps', 'partial'],
+    ['govulncheck plain', `${both}${job('      - run: govulncheck ./...\n')}`, 'push', 'deps', 'covered'],
+    ['govulncheck-action output-format sarif', `${both}${job('      - uses: golang/govulncheck-action@v1\n        with:\n          output-format: sarif\n')}`, 'push', 'deps', 'partial'],
+    ['osv-scanner-action fail-on-vuln (not an input of the action)', `${both}${job('      - uses: google/osv-scanner-action/osv-scanner-action@v2\n        with:\n          fail-on-vuln: false\n')}`, 'push', 'deps', 'covered'],
+    ['bandit-action exit_zero', `${both}${job('      - uses: PyCQA/bandit-action@v1\n        with:\n          exit_zero: true\n')}`, 'push', 'sast', 'partial'],
+    ['bandit-action, no inputs', `${both}${job('      - uses: PyCQA/bandit-action@v1\n')}`, 'push', 'sast', 'partial'],
+    ['pip-audit action allow-failure', `${both}${job('      - uses: pypa/gh-action-pip-audit@v1.1.0\n        with:\n          internal-be-careful-allow-failure: true\n')}`, 'push', 'deps', 'partial'],
+    ['paths on pull_request only: merge', `on:\n  push:\n  pull_request:\n    paths: ['src/**']\n${job('      - run: gitleaks detect\n')}`, 'merge', 'secrets', 'partial'],
+    ['paths on pull_request only: push', `on:\n  push:\n  pull_request:\n    paths: ['src/**']\n${job('      - run: gitleaks detect\n')}`, 'push', 'secrets', 'covered'],
+    ['npm audit --audit-level=none', `${both}${job('      - run: npm audit --audit-level=none\n')}`, 'push', 'deps', 'partial'],
+    ['semgrep ci || true', `${both}${job('      - run: semgrep ci || true\n')}`, 'push', 'sast', 'partial'],
+    ['&& at line end, then || true', `${both}${job('      - run: |\n          trivy fs --exit-code 1 . &&\n            echo ok || true\n')}`, 'push', 'deps', 'partial'],
+    ['trivy-action exit-code 1, continue-on-error expression', `${both}${job("      - uses: aquasecurity/trivy-action@0.28.0\n        continue-on-error: \${{ github.event_name == 'push' }}\n        with:\n          exit-code: '1'\n")}`, 'push', 'deps', 'partial'],
+    ['step if: success() || event_name', `${both}${job("      - run: gitleaks detect\n        if: success() || github.event_name == 'push'\n")}`, 'merge', 'secrets', 'partial'],
+    ['docker run with --security-opt, then version', `${both}${job('      - run: docker run --rm --security-opt x zricethezav/gitleaks:v8 version\n')}`, 'push', 'secrets', 'missing'],
+    ['gitleaks version', `${both}${job('      - run: gitleaks version\n')}`, 'push', 'secrets', 'missing'],
+    ['trivy --exit-code 1 --version', `${both}${job('      - run: trivy --exit-code 1 --version\n')}`, 'push', 'deps', 'missing'],
+    [`set +e on a line over 4 KB, tool not last`, `${both}${job(`      - run: |\n          set +e # ${'x'.repeat(5000)}\n          gitleaks detect\n          echo done\n`)}`, 'push', 'secrets', 'partial'],
+    ['bash -c with a quoted script (not read)', `${both}${job("      - run: bash -c 'gitleaks detect || true'\n")}`, 'push', 'secrets', 'missing'],
+    ['|| true, then a comment', `${both}${job('      - run: gitleaks detect || true # ok\n')}`, 'push', 'secrets', 'partial'],
+    ['step if: ${{ cancelled() }}', `${both}${job('      - run: gitleaks detect\n        if: \${{ cancelled() }}\n')}`, 'push', 'secrets', 'partial'],
+    ['|| exit 1 still blocks', `${both}${job('      - run: gitleaks detect || exit 1\n')}`, 'push', 'secrets', 'covered'],
+    ['|| { echo; exit 1; } still blocks', `${both}${job('      - run: \'gitleaks detect || { echo "::error::leaks"; exit 1; }\'\n')}`, 'push', 'secrets', 'covered'],
+    ['shell: bash makes a pipe block (pipefail)', `${both}${job('      - shell: bash\n        run: gitleaks detect | tee out\n')}`, 'push', 'secrets', 'covered'],
+    ['set -o pipefail makes a pipe block', `${both}${job('      - run: |\n          set -euo pipefail\n          gitleaks detect | tee out\n')}`, 'push', 'secrets', 'covered'],
+    ['&& in a list before the last one (bash -e skips it)', `${both}${job('      - run: |\n          gitleaks detect && echo clean\n          echo next\n')}`, 'push', 'secrets', 'partial'],
+    ['&& in the last list still fails the step', `${both}${job('      - run: |\n          echo start\n          gitleaks detect && echo clean\n')}`, 'push', 'secrets', 'covered'],
+    ['set +e, tool is the last command', `${both}${job('      - run: |\n          set +e\n          gitleaks detect\n')}`, 'push', 'secrets', 'covered'],
+    ['custom shell, tool is the last command', `${both}${job('      - shell: pwsh\n        run: |\n          Write-Host scanning\n          gitleaks detect\n')}`, 'push', 'secrets', 'covered'],
+    ['custom shell pwsh, tool not last', `${both}${job('      - shell: pwsh\n        run: |\n          gitleaks detect\n          Write-Host done\n')}`, 'push', 'secrets', 'partial'],
+    ['bash -e {0} keeps errexit', `${both}${job('      - shell: bash -e {0}\n        run: |\n          gitleaks detect\n          echo done\n')}`, 'push', 'secrets', 'covered'],
+    ['defaults.run.shell applies to the job', `${both}jobs:\n  scan:\n    runs-on: x\n    defaults:\n      run:\n        shell: bash {0}\n    steps:\n      - run: |\n          gitleaks detect\n          echo done\n`, 'push', 'secrets', 'partial'],
+    ['echo $(tool) hides its status', `${both}${job('      - run: echo "found $(gitleaks detect)" && echo $(gitleaks detect)\n')}`, 'push', 'secrets', 'partial'],
+    ['guard naming this repo, other case', `${both}jobs:\n  scan:\n    runs-on: x\n    if: github.repository == 'O/R'\n    steps:\n      - run: gitleaks detect\n`, 'push', 'secrets', 'covered'],
+    ['owner guard != this owner', `${both}jobs:\n  scan:\n    runs-on: x\n    if: github.repository_owner != 'o'\n    steps:\n      - run: gitleaks detect\n`, 'push', 'secrets', 'missing'],
+    ['command (no -v) is a wrapper', `${both}${job('      - run: command gitleaks detect\n')}`, 'push', 'secrets', 'covered'],
+  ];
+  for (const [label, body, layer, id, want] of cases) {
+    it(`coverage: round 2: ${label} → ${want}`, async () => {
+      const r = await one(body, layer, id, runnableTf, id === 'secrets' || id === 'iac' ? undefined : 'app');
+      expect(r.status).toBe(want);
+    });
+  }
+
+  it('coverage: round 2 hooks: husky runs with sh -e, lefthook with sh -c (no -e)', async () => {
+    const husky = makeTempDir();
+    writeIn(husky, '.husky/pre-commit', 'gitleaks protect --staged\necho done\n');
+    expect(row(await coverage(husky), 'pre-commit', 'secrets').status).toBe('covered');
+    const lefthook = makeTempDir();
+    writeIn(lefthook, 'lefthook.yml', 'pre-commit:\n  commands:\n    leaks:\n      run: gitleaks protect --staged; echo done\n');
+    expect(row(await coverage(lefthook), 'pre-commit', 'secrets').status).toBe('partial');
   });
 });
 

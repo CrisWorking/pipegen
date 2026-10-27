@@ -1,37 +1,48 @@
 // Coverage mapper (Plan U Task 1): which floor needs a repo's existing workflows and git hooks already cover.
 //
-// Rules (plan + pre-flight rulings S1-S6, S26; review rulings U1-U5):
-// - covered: a matching tool runs on the right trigger for the layer, unconditionally, and fails the run when it finds
-//   something. Push layer = every push to any branch; merge layer = pull_request to the default branch; deploy layer =
-//   a workflow that deploys, or runs on push to the default branch, on a tag push or on release. A `paths` or
-//   `paths-ignore` filter makes the event the wrong trigger. Pre-commit = the active hook manager's pre-commit hook
-//   runs a matching tool; `hooks` = a hook manager exists (p.precommit).
+// Rules (plan + pre-flight rulings S1-S6, S26; review rulings U1-U6):
+// - covered: a matching tool runs on the right trigger for the layer, unconditionally, and its failure fails the run.
+//   Push layer = every push to any branch; merge layer = pull_request to the default branch; deploy layer = a workflow
+//   that deploys, or runs on push to the default branch, on a tag push or on release. A `paths` or `paths-ignore`
+//   filter makes the event the wrong trigger. Pre-commit = the active hook manager's pre-commit hook runs a matching
+//   tool; `hooks` = a hook manager exists (p.precommit).
 // - partial: the right tool on the wrong trigger (pull_request_target, workflow_dispatch, schedule, a push filter that
-//   leaves out feature branches, a paths filter), or a run that can't block: continue-on-error, `|| true` / `|| :` /
-//   `|| exit 0` / `set +e`, a soft-fail flag or input, a tool that only fails when told to (trivy, grype, semgrep scan,
-//   the trufflehog CLI, the ZAP actions) or never fails (CodeQL, ruling U5), or a job or step `if:` other than status
-//   functions and a fork guard. A need that is not blocking (format-lint) only cares whether the tool runs.
+//   leaves out feature branches, a paths filter), or a run whose failure can't fail the step:
+//   - continue-on-error;
+//   - shell: a `||` after it (unless the right side is `exit <non-zero>` or `false`), also for a `{ …; }` or `( … )`
+//     group before the `||`; a `&&` after it outside the step's last list (bash -e ignores those); a pipe stage other
+//     than the last without pipefail (the default shell and `shell: sh` have none; `shell: bash` and `set -o pipefail`
+//     do); an `if`/`while`/`until` condition or `!`; `$( … )` other than `VAR=$( … )`; errexit off (`set +e`, or a
+//     custom `shell:` without -e such as `bash {0}`, pwsh or python) unless it is in the step's last list;
+//   - a soft-fail flag or input (also inside `args` / `cmd_options` / `options` inputs), a tool that only fails when
+//     told to (trivy, grype, semgrep scan, the trufflehog CLI, the ZAP actions) or never fails (CodeQL U5, the bandit
+//     action);
+//   - a job or step `if:` other than always(), success(), !cancelled() and a guard naming this repo.
+//   A need that is not blocking (format-lint) only cares whether the tool runs.
 // - unknown: a remote reusable workflow, an action from the repo owner's own account (likely a composite action), a
 //   second-level local call, a local call pipegen refused or couldn't read, a listed workflow that couldn't be read
 //   again (or that readWorkflows skipped: opts.skippedWorkflows), or more workflow text than the budget.
 // - missing: nothing matches. `gate` and `deploy-verify` are always missing: they are pipegen's own checks.
-// A tool counts only where a command starts: at the line start, after ; && || | & ( $( { or a wrapper (npx, sudo, env
-// VAR=…, time, pnpm/yarn dlx, uv run, pipx run, python -m, sh/bash, …), as the basename of a path, or as the image
-// after `docker run [flags]`. A `run:` step's directory is its working-directory, else the job's or workflow's
+// A tool counts only where a command starts: at the start, after ; && || | & ( $( { a newline, a shell keyword or a
+// wrapper (npx, sudo, env, time, command without -v, pnpm/yarn dlx, uv run, pipx run, python -m, sh/bash, …), as the
+// basename of a path, or as the image after `docker run [flags]`. Quoted text never starts a command. A version, help
+// or completion call is not a run. A `run:` step's directory is its working-directory, else the job's or workflow's
 // defaults.run working-directory, then `cd <dir>`; the tool covers only the service under that directory (S26).
 // `uses:` steps, composite actions and called workflows start at the repo root (U3).
 //
 // Hostile input: workflow, action and hook files are attacker-controlled. They are read only by path from the list
 // readProject made (p.existingWorkflows) plus local `uses: ./…` targets, every path level checked for symbolic links,
 // the real path checked to stay inside the repo, through the read limits (1 MB, binary refused, YAML alias cap), with
-// jobs, steps, files, findings and scanned bytes capped. Regexes are linear and only run on lines of 4 KB or less; the
-// shell scan is one tokenising pass per line plus bounded look-ahead.
+// jobs, steps, files, findings and scanned bytes capped. Shell text is read by a hand-written, quote-aware tokenizer
+// (one pass, no regex) and one right-to-left pass; words over 4 KB are kept opaque. The few regexes left are linear and
+// run only on short values (lines or words of 4 KB or less).
 // Output follows the src/types.ts rule, RAW but VALIDATED, cleaned at output: `why` is pipegen's own text only
 // (including a signature's `partialWhy`, from pipegen's data file); `by` is a tool-signature id from
-// data/tool-signatures.yml, an own-script phrase built from fixed words, a hook manager name, or a repo `uses:` value
-// kept only when it matches REF_RE (ASCII letters, digits and . _ - / @; at most 200 characters; unchanged by safeText);
-// `where` joins workflow and action paths that are unchanged by safeText with job ids that pass JOB_ID_RE (else "#n"),
-// cut to MAX_WHERE code points. Task 3 still cleans `by` and `where` with safeText / safeMarkdown when it prints them.
+// data/tool-signatures.yml, an own-script phrase built from fixed words (plus a script name matching OWN_NAME_RE), a
+// hook manager name, or a repo `uses:` value kept only when it matches REF_RE (ASCII letters, digits and . _ - / @; at
+// most 200 characters; unchanged by safeText); `where` joins workflow and action paths that are unchanged by safeText
+// with job ids that pass JOB_ID_RE (else "#n"), cut to MAX_WHERE code points. Task 3 still cleans `by` and `where` with
+// safeText / safeMarkdown when it prints them.
 //
 // mapCoverage throws when data/tool-signatures.yml is missing or invalid (loadToolSignatures); the caller (Plan U
 // Task 2) must catch that and say so plainly.
@@ -70,11 +81,13 @@ function isActionRef(s: string): boolean {
   return s.length <= 200 && parts.length >= 2
     && parts.every((x, i) => (i === parts.length - 1 ? LAST_PART_RE : PART_RE).test(x) && x !== '.' && x !== '..');
 }
-/** Words of [A-Za-z0-9_.-] joined by one space or one slash, e.g. "gitleaks", "npm audit", ".husky/pre-commit". */
+/** Words of [A-Za-z0-9_.-] separated by one space; the first may be a path ("npm audit", ".husky/pre-commit"). */
 function isCommand(s: string): boolean {
-  return s.length <= 64 && s.split(/[ /]/).every((x) => PART_RE.test(x));
+  const words = s.split(' ');
+  return s.length <= 64 && words.every((x, i) => (i === 0 ? x.split('/').every((p) => PART_RE.test(p)) : PART_RE.test(x)));
 }
 
+/** `with:` inputs: name → lowercase values; `*` = any non-empty value. */
 const inputs = z.record(z.string().regex(INPUT_RE), z.array(z.string().regex(INPUT_VALUE_RE)).min(1));
 
 const signatureSchema = z.strictObject({
@@ -82,19 +95,21 @@ const signatureSchema = z.strictObject({
   categories: z.array(z.enum(NEED_CATEGORIES)).min(1),
   actions: z.array(z.string().refine(isActionRef, 'must be owner/name[/sub]')).min(1).optional(),
   commands: z.array(z.string().refine(isCommand, 'must be whole-word command names')).min(1).optional(),
-  /** Longer commands that start like one of `commands` but are not this check (npm audit signatures). */
+  /** Longer commands that start like one of `commands` but are not this check (npm audit signatures, gitleaks version). */
   excludes: z.array(z.string().refine(isCommand, 'must be whole-word command names')).min(1).optional(),
   /** default: a run fails on findings; flag: only with one of failFlags; never: it only reports. */
   commandFails: z.enum(['default', 'flag', 'never']).optional(),
   failFlags: z.array(z.string().regex(FLAG_RE)).min(1).optional(),
-  /** Flags that stop a run from failing ("--exit-code=0" also matches "--exit-code 0"). */
+  /** Flags that stop a run from failing ("--exit-code=0" also matches "--exit-code 0"); also read in action args inputs. */
   softFlags: z.array(z.string().regex(FLAG_RE)).min(1).optional(),
   /** default: the action fails on findings; input: only with one of failInputs; never: it only reports. */
   actionFails: z.enum(['default', 'input', 'never']).optional(),
   failInputs: inputs.optional(),
-  /** `with:` inputs (name → lowercase values) that stop the action from failing. */
+  /** `with:` inputs set to one of these values stop the action from failing. */
   softInputs: inputs.optional(),
-  /** pipegen's own sentence for a run that can never block (commandFails or actionFails never). */
+  /** `with:` inputs set to anything (non-empty) except these values stop the action from failing. */
+  softUnless: inputs.optional(),
+  /** pipegen's own sentence for a check that never fails the job (commandFails or actionFails never). */
   partialWhy: z.string().regex(WHY_RE).refine((s) => safeText(s, 300) === s, 'must be plain text').optional(),
 })
   .refine((t) => t.actions !== undefined || t.commands !== undefined, { message: 'needs actions or commands' })
@@ -123,14 +138,8 @@ export function loadToolSignatures(path: string = packageDataPath('tool-signatur
   return parsed.data.tools;
 }
 
-const WORD_CHARS = 'A-Za-z0-9_.-';
-const NOT_WORD = `(?![${WORD_CHARS}])`;
-const escapeRe = (s: string) => s.replace(/[.*+?^${}()|[\]\\/-]/g, '\\$&');
-/** " audit" → /\s+audit(?!word char)/y, matched right after the first word. */
-const restRegex = (tail: string) => new RegExp(`${tail.split(' ').map(escapeRe).join('\\s+')}${NOT_WORD}`, 'y');
-
-/** One way to recognise a command: the first word (or a whole path), then the rest anchored after it. */
-interface CommandRule { tool: ToolSignature; rest: RegExp | null; excludes: RegExp[] }
+/** One way to recognise a command: the first word (or a whole path), then the following words exactly. */
+interface CommandRule { tool: ToolSignature; rest: string[]; excludes: string[][] }
 interface ActionRule { tool: ToolSignature; parts: string[]; prefixLast: boolean }
 interface Compiled { byFirstWord: Map<string, CommandRule[]>; byPath: Map<string, CommandRule[]>; actions: ActionRule[] }
 
@@ -138,13 +147,11 @@ function compile(tools: ToolSignature[]): Compiled {
   const byFirstWord = new Map<string, CommandRule[]>();
   const byPath = new Map<string, CommandRule[]>();
   const actions: ActionRule[] = [];
-  const firstOf = (cmd: string) => cmd.split(' ')[0] as string;
   for (const tool of tools) {
     for (const cmd of tool.commands ?? []) {
-      const first = firstOf(cmd);
-      const tail = cmd.slice(first.length);
-      const excludes = (tool.excludes ?? []).filter((e) => firstOf(e) === first && e.length > first.length).map((e) => restRegex(e.slice(first.length)));
-      const rule: CommandRule = { tool, rest: tail === '' ? null : restRegex(tail), excludes };
+      const [first, ...rest] = cmd.split(' ') as [string, ...string[]];
+      const excludes = (tool.excludes ?? []).map((e) => e.split(' ')).filter((e) => e[0] === first && e.length > 1).map((e) => e.slice(1));
+      const rule: CommandRule = { tool, rest, excludes };
       // A command whose first word is a path (.husky/pre-commit) matches the whole path; any other its basename.
       const map = first.includes('/') ? byPath : byFirstWord;
       map.set(first, [...(map.get(first) ?? []), rule]);
@@ -167,7 +174,7 @@ let defaultCompiled: Compiled | undefined;
 const MAX_JOBS = 100;              // per workflow
 const MAX_STEPS = 200;             // per job or composite action
 const MAX_STEP_VISITS = 50_000;    // per mapCoverage call, followed files included
-const MAX_SCAN_BYTES = 16_000_000; // run text scanned per mapCoverage call (worst case about 2 s of adversarial text)
+const MAX_SCAN_BYTES = 16_000_000; // run text scanned per mapCoverage call (worst case about 3 s of adversarial text)
 const MAX_LOCAL_FILES = 100;       // distinct local workflows and actions followed
 const MAX_HOOKS = 200;             // pre-commit repos, hooks per repo, lefthook commands
 const MAX_FILTER_PATTERNS = 100;
@@ -224,7 +231,7 @@ const LAYER_DONE: Readonly<Record<Exclude<Layer, 'pre-commit'>, string>> = {
 type Reason = 'continue' | 'suppressed' | 'soft' | 'no-fail' | 'never' | 'condition';
 const REASON_WHY: Readonly<Record<Reason, (subject: string, when: string) => string>> = {
   continue: (s) => `${s} runs, but is allowed to fail (continue-on-error), so it can't block anything.`,
-  suppressed: (s) => `${s} runs, but its exit code is ignored (|| true, || exit 0 or set +e), so it can't block anything.`,
+  suppressed: (s) => `${s} runs, but its exit code is ignored (by ||, a pipe, an if, set +e or the step's shell), so it can't block anything.`,
   soft: (s) => `${s} runs, but is set not to fail on findings, so it can't block anything.`,
   'no-fail': (s) => `${s} runs, but doesn't fail on findings unless told to, so it can't block anything.`,
   never: (s) => `${s} reports findings but doesn't fail the job, so it can't block anything.`,
@@ -304,8 +311,12 @@ const firstSet = (...dirs: (string | null | undefined)[]): string | null => {
 // ---------- if: conditions (review I3) ----------
 
 type Cond = 'none' | 'never' | 'partial';
-const STATUS_FN = /^!?\s*(?:always|success|cancelled)\(\s*\)$/;
-const FORK_GUARD = /^github\.repository(?:_owner)?\s*==\s*(?:'[^']*'|"[^"]*")$/;
+interface RepoId { owner: string; repo: string }
+/** Conditions that hold on every normal run: always(), success(), !cancelled(). */
+const STATUS_RUNS = /^(?:always|success)\(\s*\)$|^!\s*cancelled\(\s*\)$/;
+/** A condition that never holds. */
+const STATUS_NEVER = /^!\s*always\(\s*\)$/;
+const REPO_GUARD = /^github\.repository(_owner)?\s*(==|!=)\s*(?:'([^']*)'|"([^"]*)")$/;
 
 /** Trims spaces and outer parentheses with a loop (no regex backtracking on long runs of parentheses). */
 function stripParens(s: string): string {
@@ -321,32 +332,38 @@ function stripParens(s: string): string {
   }
 }
 
+function atomCond(a: string, self: RepoId): Cond {
+  if (a === 'true' || STATUS_RUNS.test(a)) return 'none';
+  if (a === 'false' || STATUS_NEVER.test(a)) return 'never';
+  const m = REPO_GUARD.exec(a);
+  if (m) {
+    // A guard naming this repo (or its owner) holds here; one naming another repo never does.
+    const want = m[1] === undefined ? `${self.owner}/${self.repo}` : self.owner;
+    const same = (m[3] ?? m[4] ?? '').toLowerCase() === want.toLowerCase();
+    return same === (m[2] === '==') ? 'none' : 'never';
+  }
+  return 'partial'; // cancelled(), !success(), failure(), github.event_name == …, anything else
+}
+
 /**
- * A job or step `if:`: false drops the run; status functions (always(), success(), !cancelled()) and a fork guard
- * (github.repository[_owner] == '…') are ignored; anything else (including failure(), which runs only after a failure)
- * means the run may not happen on every event.
+ * A job or step `if:`: 'never' drops the run, 'none' ignores the condition, 'partial' means it may not run on every
+ * event. `a && b` holds only if both do; `a || b` is treated as 'none' only when every side is, 'never' when every side is.
  */
-function condition(v: unknown): Cond {
+function condition(v: unknown, self: RepoId): Cond {
   if (v === undefined || v === null || v === true) return 'none';
   if (v === false || v === 0) return 'never';
   if (typeof v !== 'string' || !regexSafe(v)) return 'partial';
   let s = v.trim();
   if (s.startsWith('${{') && s.endsWith('}}') && s.indexOf('${{', 3) < 0) s = s.slice(3, -2).trim();
-  if (s === 'false') return 'never';
-  if (s === 'true' || s === '') return 'none';
-  const parts = s.split(/&&|\|\|/).map(stripParens);
-  return parts.every((x) => STATUS_FN.test(x) || FORK_GUARD.test(x)) ? 'none' : 'partial';
+  if (s === '') return 'none';
+  const ors = s.split('||').map((side) => {
+    const ands = side.split('&&').map((x) => atomCond(stripParens(x), self));
+    return ands.includes('never') ? 'never' : ands.every((x) => x === 'none') ? 'none' : 'partial';
+  });
+  return ors.every((x) => x === 'none') ? 'none' : ors.every((x) => x === 'never') ? 'never' : 'partial';
 }
 
 // ---------- soft-fail settings (review I1) ----------
-
-const unquote = (w: string) => {
-  let a = 0;
-  let b = w.length;
-  while (a < b && (w[a] === '"' || w[a] === "'")) a++;
-  while (b > a && (w[b - 1] === '"' || w[b - 1] === "'")) b--;
-  return w.slice(a, b);
-};
 
 /** "--fail" matches --fail and --fail=x; "--exit-code=0" matches --exit-code=0 and --exit-code 0. */
 function flagGiven(spec: string, words: readonly string[]): boolean {
@@ -364,29 +381,51 @@ function commandReason(tool: ToolSignature, words: readonly string[]): Reason | 
   return null;
 }
 
-/** A `with:` value as lowercase text; an expression (`${{ }}`) can't be known. */
+/** A `with:` value as lowercase text, or null when it isn't a scalar. */
 function inputText(v: unknown): string | null {
   if (typeof v === 'boolean' || typeof v === 'number') return String(v);
   return typeof v === 'string' && regexSafe(v) ? v.trim().toLowerCase() : null;
 }
 
-/** Whether `with:` sets one of the inputs to a listed value. `exprCounts`: an expression counts (errs to "can't block"). */
-function inputGiven(spec: Record<string, string[]> | undefined, w: Obj, exprCounts: boolean): boolean {
+/** `with:` with lowercase names: GitHub reads action input names case-insensitively. The first spelling wins. */
+function lowerInputs(w: Obj): Map<string, unknown> {
+  const out = new Map<string, unknown>();
+  for (const [k, v] of Object.entries(w)) if (!out.has(k.toLowerCase())) out.set(k.toLowerCase(), v);
+  return out;
+}
+
+/** Whether an input is set to a listed value (`*` = any non-empty). `exprCounts`: an expression counts (errs to "can't block"). */
+function inputGiven(spec: Record<string, string[]> | undefined, w: Map<string, unknown>, exprCounts: boolean): boolean {
   for (const [name, values] of Object.entries(spec ?? {})) {
-    if (!Object.hasOwn(w, name)) continue;
-    const s = inputText(w[name]);
+    const s = inputText(w.get(name.toLowerCase()));
     if (s === null) continue;
     if (s.includes('${{')) {
       if (exprCounts) return true;
       continue;
     }
-    if (values.includes(s) || values.includes('*')) return true;
+    if (values.includes(s) || (values.includes('*') && s !== '')) return true;
   }
   return false;
 }
 
-function actionReason(tool: ToolSignature, w: Obj): Reason | null {
-  if (inputGiven(tool.softInputs, w, true)) return 'soft';
+/** Whether an input is set (non-empty) to anything but the listed values; an expression counts. */
+function inputSetOtherwise(spec: Record<string, string[]> | undefined, w: Map<string, unknown>): boolean {
+  for (const [name, values] of Object.entries(spec ?? {})) {
+    const s = inputText(w.get(name.toLowerCase()));
+    if (s !== null && s !== '' && (s.includes('${{') || !values.includes(s))) return true;
+  }
+  return false;
+}
+
+/** Inputs many actions pass straight to the tool's command line; read for the tool's soft flags. */
+const ARGS_INPUTS = ['args', 'cmd_options', 'options'];
+
+function actionReason(tool: ToolSignature, w: Map<string, unknown>): Reason | null {
+  const args = ARGS_INPUTS.flatMap((name) => {
+    const v = w.get(name);
+    return typeof v === 'string' && regexSafe(v) ? v.trim().split(/\s+/).slice(0, MAX_FLAG_WORDS) : [];
+  });
+  if (inputGiven(tool.softInputs, w, true) || inputSetOtherwise(tool.softUnless, w) || (tool.softFlags ?? []).some((f) => flagGiven(f, args))) return 'soft';
   if (tool.actionFails === 'never') return 'never';
   if (tool.actionFails === 'input' && !inputGiven(tool.failInputs, w, false)) return 'no-fail';
   return null;
@@ -397,17 +436,123 @@ const foundOf = (tool: ToolSignature, dir: string | null, reason: Reason | null)
   ...(tool.partialWhy === undefined ? {} : { partialWhy: tool.partialWhy }),
 });
 
-// ---------- reading shell text (review M2: command position only) ----------
+// ---------- reading shell text (review M2: command position only; round 2: quotes, lists, groups, pipes) ----------
 
-// Shell tokens: $( && || and single separators, else a run of anything that isn't space or a separator.
-const SHELL_TOKEN = /\$\(|&&|\|\||[;|&(){}`]|[^\s;|&(){}`]+/g;
-const STARTS = new Set(['$(', '&&', '||', ';', '|', '&', '(', '{', '`']);
-const ENDS = new Set([')', '}']);
-/** Tokens that end an and-or list: a later `|| true` doesn't reach a command before them. */
-const LIST_END = new Set([';', '&', '`']);
+/** How a step's shell treats failures. GitHub: default `bash -e {0}`; `bash` adds -o pipefail; `sh` is `sh -e {0}`. */
+interface ShellMode { errexit: boolean; pipefail: boolean }
+const DEFAULT_SHELL: ShellMode = { errexit: true, pipefail: false };
+
+/** The mode of a step's `shell:` (or defaults.run.shell). A custom shell without -e (bash {0}, pwsh, python) has no errexit. */
+function shellMode(v: unknown): ShellMode {
+  if (v === undefined || v === null) return DEFAULT_SHELL;
+  if (typeof v !== 'string' || !regexSafe(v)) return { errexit: false, pipefail: false };
+  const s = v.trim();
+  if (s === 'bash') return { errexit: true, pipefail: true };
+  if (s === 'sh') return { errexit: true, pipefail: false };
+  const parts = s.split(/\s+/).slice(0, 16);
+  const prog = basename(parts[0] ?? '');
+  if (prog !== 'bash' && prog !== 'sh') return { errexit: false, pipefail: false };
+  const e = parts.some((x) => x.startsWith('-') && !x.startsWith('--') && /^-[a-z]+$/.test(x) && x.includes('e'));
+  return { errexit: e, pipefail: prog === 'bash' && parts.includes('pipefail') };
+}
+
+/** One shell token: an operator (incl. '\n' between commands) or a word (`w`: quotes and escapes removed). */
+interface Tk { op: string | null; w: string }
+const OP_CHARS = ';|&(){}`';
+/** After these, a newline doesn't end the command list (`a ||⏎ b`, `{⏎`). */
+const JOINERS = new Set(['&&', '||', '|', '(', '{', '$(', '\n']);
+const MAX_WORD = READ_LIMITS.maxRegexLineBytes;
+
+/**
+ * Shell text → tokens, in one linear pass. Quoted text ('…', "…") stays inside its word, so a separator in quotes never
+ * starts a command; `${…}` / `${{ … }}` stay inside the word too; `#` at a word start comments out the rest of the line;
+ * `\` + newline joins lines. A word longer than MAX_WORD keeps an empty value (it can't name a tool).
+ */
+function tokenize(text: string): Tk[] {
+  const toks: Tk[] = [];
+  const n = text.length;
+  let i = 0;
+  while (i < n) {
+    const c = text[i] as string;
+    if (c === '\n') {
+      const last = toks[toks.length - 1];
+      if (last !== undefined && !(last.op !== null && JOINERS.has(last.op))) toks.push({ op: '\n', w: '' });
+      i++;
+    } else if (c === ' ' || c === '\t' || c === '\r') {
+      i++;
+    } else if (c === '\\' && (text[i + 1] === '\n' || (text[i + 1] === '\r' && text[i + 2] === '\n'))) {
+      i += text[i + 1] === '\n' ? 2 : 3;
+    } else if (c === '#') {
+      while (i < n && text[i] !== '\n') i++;
+    } else if (c === '$' && text[i + 1] === '(') {
+      toks.push({ op: '$(', w: '' });
+      i += 2;
+    } else if ((c === '&' || c === '|') && text[i + 1] === c) {
+      toks.push({ op: c + c, w: '' });
+      i += 2;
+    } else if (OP_CHARS.includes(c)) {
+      toks.push({ op: c, w: '' });
+      i++;
+    } else {
+      let w = '';
+      let quote = '';
+      let brace = ''; // '}' or '}}' while inside ${…} / ${{ … }}
+      const add = (ch: string) => {
+        if (w.length <= MAX_WORD) w += ch;
+      };
+      while (i < n) {
+        const ch = text[i] as string;
+        if (brace !== '') {
+          if (text.startsWith(brace, i)) {
+            i += brace.length;
+            brace = '';
+          } else i++;
+          add(ch);
+          continue;
+        }
+        if (quote !== '') {
+          if (ch === quote) quote = '';
+          else if (ch === '\\' && quote === '"' && i + 1 < n) add(text[++i] as string);
+          else add(ch);
+          i++;
+          continue;
+        }
+        if (ch === '"' || ch === "'") {
+          quote = ch;
+          i++;
+          continue;
+        }
+        if (ch === '\\' && i + 1 < n) {
+          if (text[i + 1] === '\n') break;
+          add(text[i + 1] as string);
+          i += 2;
+          continue;
+        }
+        if (ch === '$' && text[i + 1] === '{') {
+          brace = text[i + 2] === '{' ? '}}' : '}';
+          add(ch);
+          i++;
+          continue;
+        }
+        if (ch === ' ' || ch === '\t' || ch === '\n' || ch === '\r' || OP_CHARS.includes(ch) || (ch === '$' && text[i + 1] === '(')) break;
+        add(ch);
+        i++;
+      }
+      toks.push({ op: null, w: w.length > MAX_WORD ? '' : w });
+    }
+  }
+  return toks;
+}
+
 const ASSIGN = /^[A-Za-z_][A-Za-z0-9_]*=/;
-/** Words after which the next non-flag word is a command. `env` also skips VAR=value words. */
+/** Words after which the next non-flag word is a command. */
 const WRAPPERS = new Set(['sudo', 'time', 'npx', 'bunx', 'uvx', 'env', 'nohup', 'exec', 'command', 'xargs', 'sh', 'bash', 'zsh', 'dash']);
+/** Flags of a wrapper that take the next word as their value. */
+const WRAPPER_VALUE_FLAGS: Readonly<Record<string, ReadonlySet<string>>> = {
+  sudo: new Set(['-u', '-g', '-C', '-D', '-h', '-p', '-r', '-t', '-T', '-U', '--user', '--group', '--chdir', '--host', '--prompt']),
+  env: new Set(['-u', '--unset', '-C', '--chdir', '-S', '--split-string']),
+  xargs: new Set(['-I', '-L', '-n', '-P', '-s', '-d', '-E', '-a']),
+};
 /** Two-word wrappers: pnpm dlx, uv run, python -m, … */
 const SUB_WRAPPERS: Readonly<Record<string, readonly string[]>> = {
   pnpm: ['dlx', 'exec'], yarn: ['dlx', 'exec'], npm: ['exec'], bun: ['x'], uv: ['run'], pipx: ['run'], poetry: ['run'],
@@ -416,17 +561,19 @@ const SUB_WRAPPERS: Readonly<Record<string, readonly string[]>> = {
 /** `yarn eslint .` and `pnpm eslint .` run a package binary: the next word is a command too. */
 const BIN_RUNNERS = new Set(['yarn', 'pnpm']);
 const DOCKER_VALUE_FLAGS = new Set(['-v', '--volume', '-e', '--env', '--env-file', '-w', '--workdir', '-u', '--user', '-p', '--publish', '--name',
-  '--entrypoint', '--network', '--platform', '--mount', '-l', '--label', '--add-host', '--pull', '-m', '--memory', '--cpus', '--cidfile', '-h', '--hostname']);
-// The service's own scripts (ruling S5), keyed by first word; the rest is matched right after it.
-const OWN_SCRIPT: Readonly<Record<string, RegExp | null>> = {
-  npm: new RegExp(`\\s+(?:test|run\\s+(?:test|lint))${NOT_WORD}`, 'y'),
-  pnpm: new RegExp(`\\s+(?:run\\s+)?(?:test|lint)${NOT_WORD}`, 'y'),
-  yarn: new RegExp(`\\s+(?:run\\s+)?(?:test|lint)${NOT_WORD}`, 'y'),
-  bun: new RegExp(`\\s+(?:run\\s+)?(?:test|lint)${NOT_WORD}`, 'y'),
-  python: new RegExp(`\\s+-m\\s+pytest${NOT_WORD}`, 'y'),
-  python3: new RegExp(`\\s+-m\\s+pytest${NOT_WORD}`, 'y'),
-  pytest: null,
-};
+  '--entrypoint', '--network', '--platform', '--mount', '-l', '--label', '--label-file', '--add-host', '--pull', '-m', '--memory', '--cpus',
+  '--cidfile', '-h', '--hostname', '--security-opt', '--cap-add', '--cap-drop', '--device', '--dns', '--log-driver', '--log-opt',
+  '--restart', '--runtime', '--tmpfs', '--ulimit', '--group-add', '--shm-size', '--ipc', '--pid', '--gpus', '--expose', '--link',
+  '--volumes-from', '--stop-signal', '-a', '--attach', '-c', '--cpu-shares', '--ip', '--mac-address', '--userns', '--uts']);
+/** Shell keywords: the next word is a command; in a condition its exit status is consumed. */
+const COND_KEYWORDS = new Set(['if', 'elif', 'while', 'until']);
+const BODY_KEYWORDS = new Set(['then', 'do', 'else']);
+const END_KEYWORDS = new Set(['fi', 'done', 'esac']);
+/** A call that only prints the version or help, not a run. */
+const probeCall = (args: readonly string[]) =>
+  args.includes('--version') || args.includes('--help') || (args.length === 1 && ['-v', '-V', '-h'].includes(args[0] as string));
+/** Script names after `npm run` etc. (ruling S5): test, lint, or test:… / lint:… */
+const OWN_NAME_RE = /^(?:test|lint)(?::[A-Za-z0-9_.-]{1,64})?$/;
 const TEST_CATEGORIES = ['unit-tests', 'full-tests'] as const;
 
 const basename = (w: string) => w.slice(w.lastIndexOf('/') + 1);
@@ -438,41 +585,108 @@ function imageName(image: string): string {
   const colon = name.indexOf(':');
   return colon < 0 ? name : name.slice(0, colon);
 }
-
-/** Lines with `\` continuations joined; a logical line over 4 KB is skipped. */
-function logicalLines(text: string): string[] {
-  const out: string[] = [];
-  let parts: string[] = [];
-  let size = 0;
-  const flush = () => {
-    const line = parts.join(' ');
-    if (size <= READ_LIMITS.maxRegexLineBytes && regexSafe(line)) out.push(line);
-    parts = [];
-    size = 0;
-  };
-  for (const raw of text.split(/\r?\n/)) {
-    const cont = raw.endsWith('\\');
-    const piece = cont ? raw.slice(0, -1) : raw;
-    size += piece.length + 1;
-    if (size <= READ_LIMITS.maxRegexLineBytes) parts.push(piece);
-    if (!cont) flush();
-  }
-  if (parts.length > 0) flush();
-  return out;
-}
+const stripDotSlash = (w: string) => {
+  let i = 0;
+  while (w.startsWith('./', i)) i += 2;
+  return w.slice(i);
+};
 
 interface Budget { visits: number; bytes: number; truncated: boolean }
 
 /**
- * Tools found in shell text (a run step, a hook script, a hook entry). A tool counts only in command position (see the
- * module header). `cd <dir>` moves the directory for the rest of the text; `set +e` turns off errexit for the rest.
+ * Tools found in shell text (a run step, a hook script, a hook entry). See the module header for what counts as a
+ * command and when its failure can't fail the step. `cd <dir>` moves the directory for the rest of the text.
  */
-function scanShell(text: string, base: string | null, sigs: Compiled, budget: Budget): Found[] {
+function scanShell(text: string, base: string | null, sigs: Compiled, budget: Budget, mode: ShellMode = DEFAULT_SHELL): Found[] {
   budget.bytes += text.length;
   if (budget.bytes > MAX_SCAN_BYTES) {
     budget.truncated = true;
     return [];
   }
+  const toks = tokenize(text);
+  const n = toks.length;
+  const isWord = (k: number) => k >= 0 && k < n && toks[k]!.op === null;
+  const word = (k: number) => (isWord(k) ? toks[k]!.w : null);
+
+  // Matching group brackets (forward pass with a stack), so the right-to-left pass knows what a ')' closes.
+  const opener = new Int32Array(n).fill(-1);
+  const closer = new Int32Array(n).fill(-1);
+  const open: number[] = [];
+  for (let k = 0; k < n; k++) {
+    const op = toks[k]!.op;
+    if (op === '(' || op === '{' || op === '$(') open.push(k);
+    else if ((op === ')' || op === '}') && open.length > 0) {
+      const o = open.pop() as number;
+      opener[k] = o;
+      closer[o] = k;
+    }
+  }
+  /** Whether the right side of the `||` at k lets the list succeed (anything but exit <non-zero>, return <non-zero>, false). */
+  const rightSwallows = (k: number) => {
+    let j = k + 1;
+    const end = toks[j]?.op === '{' || toks[j]?.op === '(' ? Math.min(closer[j]! < 0 ? n : closer[j]!, j + MAX_FLAG_WORDS) : j + 1;
+    for (; j <= end && j < n; j++) {
+      const w = word(j);
+      if (w === null || (j > k + 1 && isWord(j - 1))) continue; // only words in command position
+      if (w === 'false') return false;
+      if ((w === 'exit' || w === 'return') && word(j + 1) !== '0') return false;
+    }
+    return true;
+  };
+
+  // Right to left: where each simple command ends, and whether its failure is swallowed by a later `||`, hidden by a
+  // later pipe stage, or exempt from errexit by a later `&&`. A group takes on the state of what follows it.
+  const segEnd = new Int32Array(n);
+  const swallowed = new Uint8Array(n);
+  const piped = new Uint8Array(n);
+  const andAfter = new Uint8Array(n);
+  type State = { sw: number; pp: number; aa: number };
+  let cur: State = { sw: 0, pp: 0, aa: 0 };
+  let outer: State = { sw: 0, pp: 0, aa: 0 }; // what a list end inside the current group goes back to
+  const stack: { outer: State; cur: State }[] = [];
+  let end = n;
+  for (let k = n - 1; k >= 0; k--) {
+    const op = toks[k]!.op;
+    if (op !== null) end = k;
+    segEnd[k] = end;
+    if (op === ')' || op === '}') {
+      stack.push({ outer, cur });
+      // `VAR=$( … )` keeps the substitution's status; in any other command `$( … )` can't fail the step.
+      const o = opener[k]!;
+      const subst = o >= 0 && toks[o]!.op === '$(' && !(isWord(o - 1) && (toks[o - 1]!.w.endsWith('=')) && !isWord(o - 2));
+      outer = { ...cur, sw: subst ? 1 : cur.sw };
+      cur = { ...outer };
+    } else if (op === '(' || op === '{' || op === '$(') {
+      const f = stack.pop();
+      if (f) {
+        outer = f.outer;
+        cur = f.cur;
+      }
+    } else if (op === ';' || op === '&' || op === '\n' || op === '`') {
+      cur = { ...outer };
+    } else if (op === '&&') {
+      cur = { sw: cur.sw, pp: outer.pp, aa: 1 };
+    } else if (op === '||') {
+      cur = { sw: rightSwallows(k) ? 1 : outer.sw, pp: outer.pp, aa: 0 };
+    } else if (op === '|') {
+      cur = { ...cur, pp: 1 };
+    }
+    swallowed[k] = cur.sw;
+    piped[k] = cur.pp;
+    andAfter[k] = cur.aa;
+  }
+  // The step's last command list starts after the last list end that has a word after it.
+  let lastWord = n - 1;
+  while (lastWord >= 0 && !isWord(lastWord)) lastWord--;
+  let lastList = -1;
+  for (let k = lastWord; k >= 0; k--) {
+    const op = toks[k]!.op;
+    if (op === ';' || op === '&' || op === '\n') {
+      lastList = k;
+      break;
+    }
+  }
+
   const found: Found[] = [];
   const seen = new Set<string>(); // one finding per tool, directory and reason per text
   const add = (f: Found) => {
@@ -483,141 +697,161 @@ function scanShell(text: string, base: string | null, sigs: Compiled, budget: Bu
     }
   };
   let cwd = base;
-  let errexitOff = false;
-  for (const line of logicalLines(text)) {
-    const toks: { t: string; i: number }[] = [];
-    for (const m of line.matchAll(SHELL_TOKEN)) {
-      if (m[0].startsWith('#')) break; // a comment runs to the end of the line
-      toks.push({ t: m[0], i: m.index });
-    }
-    const n = toks.length;
-    const word = (k: number) => (k < n && !STARTS.has(toks[k]!.t) && !ENDS.has(toks[k]!.t) ? unquote(toks[k]!.t) : null);
-    // Right to left: where each command's words end, and whether a later `|| true` / `|| :` / `|| exit 0` in the same
-    // and-or list swallows its exit code.
-    const segEnd = new Int32Array(n);
-    const swallowed = new Uint8Array(n);
-    let end = n;
-    let swallow = 0;
-    for (let k = n - 1; k >= 0; k--) {
-      const t = toks[k]!.t;
-      if (LIST_END.has(t)) swallow = 0;
-      if (t === '||') {
-        const a = word(k + 1);
-        if (a === 'true' || a === ':' || (a === 'exit' && word(k + 2) === '0')) swallow = 1;
-      }
-      if (STARTS.has(t) || ENDS.has(t)) end = k;
-      segEnd[k] = end;
-      swallowed[k] = swallow;
-    }
-    const argsAfter = (k: number) => {
-      const out: string[] = [];
-      for (let j = k + 1; j < Math.min(segEnd[k]!, k + 1 + MAX_FLAG_WORDS); j++) out.push(unquote(toks[j]!.t));
-      return out;
-    };
-    const ruleReason = (k: number, tool: ToolSignature): Reason | null => (swallowed[k] || errexitOff ? 'suppressed' : commandReason(tool, argsAfter(k)));
-    /** Signatures and own scripts for the command word at k (`name` = its basename, or an image name). */
-    const match = (k: number, w: string, name: string) => {
-      const at = toks[k]!.i + toks[k]!.t.length;
-      const tryRules = (rules: CommandRule[] | undefined) => {
-        for (const r of rules ?? []) {
-          if (r.rest !== null) {
-            r.rest.lastIndex = at;
-            if (!r.rest.test(line)) continue;
-          }
-          if (r.excludes.some((x) => ((x.lastIndex = at), x.test(line)))) continue;
-          add(foundOf(r.tool, cwd, ruleReason(k, r.tool)));
-        }
-      };
-      if (w.includes('/')) tryRules(sigs.byPath.get(w.replace(/^(?:\.\/)+/, '')));
-      tryRules(sigs.byFirstWord.get(name));
-      if (w === name && Object.hasOwn(OWN_SCRIPT, name)) {
-        const rest = OWN_SCRIPT[name] as RegExp | null;
-        let stop = at;
-        if (rest !== null) {
-          rest.lastIndex = at;
-          if (!rest.test(line)) return;
-          stop = rest.lastIndex;
-        }
-        // Only fixed words and whitespace were matched, so the phrase is safe to show; whitespace becomes one space.
-        const cmd = line.slice(toks[k]!.i, stop).split(/\s+/).join(' ');
-        const categories = cmd.endsWith('lint') ? ['lint'] : TEST_CATEGORIES;
-        add({ categories, by: `your own \`${cmd}\``, subject: `Your own \`${cmd}\``, dir: cwd, reason: swallowed[k] || errexitOff ? 'suppressed' : null });
-      }
-    };
-    const skipFlags = (k: number, assigns: boolean) => {
-      let j = k;
-      for (let w = word(j); w !== null && (w.startsWith('-') || (assigns && ASSIGN.test(w))); w = word(j)) j++;
-      return j;
-    };
+  let errexit = mode.errexit;
+  let pipefail = mode.pipefail;
+  let inCondition = false;
+  let negateEnd = -1;
 
-    let cmd = true;
-    let k = 0;
-    while (k < n) {
-      const t = toks[k]!.t;
-      if (STARTS.has(t)) {
-        cmd = true;
-        k++;
-        continue;
+  /** Why the failure of the command at k can't fail the step, or null. */
+  const shellReason = (k: number): Reason | null => {
+    const inLast = k > lastList;
+    const exempt = swallowed[k] === 1 || (piped[k] === 1 && !pipefail) || inCondition || k < negateEnd
+      || (!errexit && !inLast) || (errexit && andAfter[k] === 1 && !inLast);
+    return exempt ? 'suppressed' : null;
+  };
+  const argsAfter = (k: number) => {
+    const out: string[] = [];
+    for (let j = k + 1; j < Math.min(segEnd[k]!, k + 1 + MAX_FLAG_WORDS); j++) out.push(toks[j]!.w);
+    return out;
+  };
+  /** The words right after k equal `rest`. */
+  const followedBy = (k: number, rest: readonly string[]) => rest.every((x, i) => word(k + 1 + i) === x);
+  /** Signatures and own scripts for the command word at k (`name` = its basename, or an image name). */
+  const match = (k: number, w: string, name: string) => {
+    const args = argsAfter(k);
+    if (probeCall(args)) return;
+    const tryRules = (rules: CommandRule[] | undefined) => {
+      for (const r of rules ?? []) {
+        if (!followedBy(k, r.rest) || r.excludes.some((x) => followedBy(k, x))) continue;
+        add(foundOf(r.tool, cwd, shellReason(k) ?? commandReason(r.tool, args)));
       }
-      if (ENDS.has(t) || !cmd) {
-        cmd = false;
-        k++;
-        continue;
-      }
-      const w = unquote(t);
-      if (ASSIGN.test(w)) { // VAR=value before a command
-        k++;
-        continue;
-      }
-      const name = basename(w);
-      if (w === 'cd') {
-        const target = word(k + 1);
-        cwd = target === null || target === '' || target === '-' || /[$`~\\]/.test(target) || target.startsWith('/') ? null : resolveDir(cwd, target);
-        cmd = false;
-        k += target === null ? 1 : 2;
-        continue;
-      }
-      if (w === 'set') {
-        const opt = word(k + 1) ?? '';
-        if (/^\+[a-z]*e/.test(opt) || (opt === '+o' && word(k + 2) === 'errexit')) errexitOff = true;
-        else if (/^-[a-z]*e/.test(opt) || (opt === '-o' && word(k + 2) === 'errexit')) errexitOff = false;
-        cmd = false;
-        k++;
-        continue;
-      }
-      match(k, w, name);
-      const next = word(k + 1);
-      if (name === 'docker' && next === 'run') {
-        let j = k + 2;
-        for (let f = word(j); f !== null && f.startsWith('-'); f = word(j)) j += !f.includes('=') && DOCKER_VALUE_FLAGS.has(f) ? 2 : 1;
-        const image = word(j);
-        if (image !== null) match(j, image, imageName(image));
-        k = j + 1; // the container's command follows the image
-        cmd = true;
-        continue;
-      }
-      if (next !== null && SUB_WRAPPERS[name]?.includes(next)) {
-        k = skipFlags(k + 2, false);
-        cmd = true;
-        continue;
-      }
-      if (WRAPPERS.has(name)) {
-        k = skipFlags(k + 1, name === 'env');
-        cmd = true;
-        continue;
-      }
-      cmd = BIN_RUNNERS.has(name);
+    };
+    if (w.includes('/')) tryRules(sigs.byPath.get(stripDotSlash(w)));
+    tryRules(sigs.byFirstWord.get(name));
+    if (w !== name) return;
+    // The service's own scripts (ruling S5): npm test, npm run test|lint, pnpm|yarn|bun [run] test|lint, pytest,
+    // python -m pytest. Only fixed words and a script name matching OWN_NAME_RE go into the phrase.
+    let words: string[] | null = null;
+    const a = word(k + 1);
+    const b = word(k + 2);
+    if (name === 'pytest') words = ['pytest'];
+    else if ((name === 'python' || name === 'python3') && a === '-m' && b === 'pytest') words = [name, '-m', 'pytest'];
+    else if (name === 'npm' && a === 'test') words = ['npm', 'test'];
+    else if (['npm', 'pnpm', 'yarn', 'bun'].includes(name) && a === 'run' && b !== null && OWN_NAME_RE.test(b)) words = [name, 'run', b];
+    else if (['pnpm', 'yarn', 'bun'].includes(name) && a !== null && OWN_NAME_RE.test(a)) words = [name, a];
+    if (words === null) return;
+    const cmd = words.join(' ');
+    const categories = (words[words.length - 1] as string).startsWith('lint') ? ['lint'] : TEST_CATEGORIES;
+    add({ categories, by: `your own \`${cmd}\``, subject: `Your own \`${cmd}\``, dir: cwd, reason: shellReason(k) });
+  };
+  const skipFlags = (k: number, wrapper: string) => {
+    const valued = WRAPPER_VALUE_FLAGS[wrapper];
+    let j = k;
+    for (let w = word(j); w !== null && (w.startsWith('-') || (wrapper === 'env' && ASSIGN.test(w))); w = word(j)) j += valued?.has(w) ? 2 : 1;
+    return j;
+  };
+
+  let cmd = true;
+  let k = 0;
+  while (k < n) {
+    const op = toks[k]!.op;
+    if (op !== null) {
+      cmd = op !== ')' && op !== '}';
       k++;
+      continue;
     }
+    if (!cmd) {
+      k++;
+      continue;
+    }
+    const w = toks[k]!.w;
+    if (ASSIGN.test(w)) { // VAR=value before a command
+      k++;
+      continue;
+    }
+    if (COND_KEYWORDS.has(w)) {
+      inCondition = true;
+      k++;
+      continue;
+    }
+    if (BODY_KEYWORDS.has(w)) {
+      inCondition = false;
+      k++;
+      continue;
+    }
+    if (END_KEYWORDS.has(w)) {
+      cmd = false;
+      k++;
+      continue;
+    }
+    if (w === '!') {
+      negateEnd = segEnd[k]!;
+      k++;
+      continue;
+    }
+    const name = basename(w);
+    if (w === 'cd') {
+      const target = word(k + 1);
+      cwd = target === null || target === '' || target === '-' || /[$`~\\]/.test(target) || target.startsWith('/') ? null : resolveDir(cwd, target);
+      cmd = false;
+      k += target === null ? 1 : 2;
+      continue;
+    }
+    if (w === 'set') {
+      for (let j = k + 1; j < segEnd[k]!; j++) {
+        const f = toks[j]!.w;
+        if (!(f.startsWith('-') || f.startsWith('+')) || f.startsWith('--') || f.length < 2) continue;
+        const on = f[0] === '-';
+        if (f.includes('e')) errexit = on;
+        if (f.endsWith('o')) {
+          const opt = word(j + 1);
+          if (opt === 'errexit') errexit = on;
+          if (opt === 'pipefail') pipefail = on;
+        }
+      }
+      cmd = false;
+      k++;
+      continue;
+    }
+    if (name === 'command' && /^-[a-zA-Z]*[vV]/.test(word(k + 1) ?? '')) { // command -v X: only checks that X exists
+      cmd = false;
+      k++;
+      continue;
+    }
+    match(k, w, name);
+    const next = word(k + 1);
+    if (name === 'docker' && next === 'run') {
+      let j = k + 2;
+      for (let f = word(j); f !== null && f.startsWith('-'); f = word(j)) j += !f.includes('=') && DOCKER_VALUE_FLAGS.has(f) ? 2 : 1;
+      const image = word(j);
+      if (image !== null) match(j, image, imageName(image));
+      k = j + 1; // the container's command follows the image
+      cmd = true;
+      continue;
+    }
+    if (next !== null && SUB_WRAPPERS[name]?.includes(next)) {
+      k = skipFlags(k + 2, name);
+      cmd = true;
+      continue;
+    }
+    if (WRAPPERS.has(name)) {
+      k = skipFlags(k + 1, name);
+      cmd = true;
+      continue;
+    }
+    cmd = BIN_RUNNERS.has(name);
+    k++;
   }
   return found;
 }
 
 /** A `uses: docker://image` step: the image name as a command, with `with.args` as its flags. */
-function scanImage(uses: string, w: Obj, sigs: Compiled): Found[] {
+function scanImage(uses: string, w: Map<string, unknown>, sigs: Compiled): Found[] {
   const name = imageName(uses.slice('docker://'.length));
-  const args = typeof w.args === 'string' && regexSafe(w.args) ? w.args.split(/\s+/).slice(0, MAX_FLAG_WORDS).map(unquote) : [];
-  return (sigs.byFirstWord.get(name) ?? []).filter((r) => r.rest === null).map((r) => foundOf(r.tool, '.', commandReason(r.tool, args)));
+  const raw = w.get('args');
+  const args = typeof raw === 'string' && regexSafe(raw) ? tokenize(raw).filter((t) => t.op === null).slice(0, MAX_FLAG_WORDS).map((t) => t.w) : [];
+  if (probeCall(args)) return [];
+  return (sigs.byFirstWord.get(name) ?? []).filter((r) => r.rest.length === 0).map((r) => foundOf(r.tool, '.', commandReason(r.tool, args)));
 }
 
 // ---------- triggers (ruling S6) ----------
@@ -815,6 +1049,8 @@ interface StepCtx {
   where: string;
   /** Where `run:` steps start: defaults.run.working-directory of the job or workflow, else the root. */
   runDir: string | null;
+  /** defaults.run.shell of the job or workflow (a step's own `shell:` wins). */
+  shell: unknown;
   continueOnError: boolean;
   conditional: boolean;
   depth: number;
@@ -866,12 +1102,14 @@ function actionMatches(sigs: Compiled, uses: string): ToolSignature[] {
   return out;
 }
 
+const repoId = (ctx: Ctx): RepoId => ({ owner: ctx.p.owner, repo: ctx.p.repo });
+
 async function walkStep(ctx: Ctx, step: Obj, c: StepCtx): Promise<void> {
   if (!spend(ctx)) return;
-  const cond = condition(step.if);
+  const cond = condition(step.if, repoId(ctx));
   if (cond === 'never') return;
   const sc: StepCtx = { ...c, continueOnError: c.continueOnError || allowedToFail(step['continue-on-error']), conditional: c.conditional || cond === 'partial' };
-  const withInputs = asObj(step.with);
+  const withInputs = lowerInputs(asObj(step.with));
   if (typeof step.uses === 'string' && regexSafe(step.uses)) {
     const uses = step.uses.trim();
     if (uses === '.' || uses.startsWith('./')) {
@@ -887,7 +1125,7 @@ async function walkStep(ctx: Ctx, step: Obj, c: StepCtx): Promise<void> {
   }
   if (typeof step.run === 'string') {
     const base = firstSet(workingDir(step['working-directory']), c.runDir);
-    addFound(ctx, scanShell(step.run, base, ctx.sigs, ctx.budget), sc);
+    addFound(ctx, scanShell(step.run, base, ctx.sigs, ctx.budget, shellMode(step.shell ?? c.shell)), sc);
   }
 }
 
@@ -909,8 +1147,9 @@ async function followAction(ctx: Ctx, uses: string, c: StepCtx): Promise<void> {
   const runs = asObj(doc.ok.runs);
   if (runs.using !== 'composite') return opaque(ctx, OPAQUE_WHY.localCode, by, c);
   const where = cut(`${c.where} → ${file}`);
-  // A composite action's run steps start at the repo root (plus their own working-directory), not at the job's default.
-  for (const step of list(runs.steps).slice(0, MAX_STEPS)) await walkStep(ctx, asObj(step), { ...c, where, runDir: '.', depth: 1 });
+  // A composite action's run steps start at the repo root (plus their own working-directory and shell), not at the
+  // job's defaults.
+  for (const step of list(runs.steps).slice(0, MAX_STEPS)) await walkStep(ctx, asObj(step), { ...c, where, runDir: '.', shell: undefined, depth: 1 });
   if (list(runs.steps).length > MAX_STEPS) ctx.budget.truncated = true;
 }
 
@@ -926,24 +1165,30 @@ async function readLocal(ctx: Ctx, rel: string): Promise<Read<Obj>> {
   return ctx.read.yaml(rel);
 }
 
+const defaultsShell = (doc: Obj): unknown => asObj(asObj(doc.defaults).run).shell;
+
 async function walkWorkflow(ctx: Ctx, doc: Obj, path: string, fit: Fit, depth: number, prefix: string, conditional: boolean): Promise<void> {
   const wfDir = defaultsDir(doc);
+  const wfShell = defaultsShell(doc);
   const jobs = Object.entries(asObj(doc.jobs));
   if (jobs.length > MAX_JOBS) ctx.budget.truncated = true;
   for (const [i, [id, raw]] of jobs.slice(0, MAX_JOBS).entries()) {
     const job = asObj(raw);
-    const cond = condition(job.if);
+    const cond = condition(job.if, repoId(ctx));
     if (cond === 'never') continue;
     const label = regexSafe(id) && JOB_ID_RE.test(id) ? id : `#${i + 1}`;
     const where = cut(`${prefix}${path} (job ${label})`);
     const jobConditional = conditional || cond === 'partial';
     if (typeof job.uses === 'string' && regexSafe(job.uses)) {
-      await callWorkflow(ctx, job.uses.trim(), { fit, where, runDir: '.', continueOnError: false, conditional: jobConditional, depth });
+      await callWorkflow(ctx, job.uses.trim(), { fit, where, runDir: '.', shell: undefined, continueOnError: false, conditional: jobConditional, depth });
       continue;
     }
     const steps = list(job.steps);
     if (steps.length > MAX_STEPS) ctx.budget.truncated = true;
-    const c: StepCtx = { fit, where, runDir: firstSet(defaultsDir(job), wfDir), continueOnError: allowedToFail(job['continue-on-error']), conditional: jobConditional, depth };
+    const c: StepCtx = {
+      fit, where, runDir: firstSet(defaultsDir(job), wfDir), shell: defaultsShell(job) ?? wfShell,
+      continueOnError: allowedToFail(job['continue-on-error']), conditional: jobConditional, depth,
+    };
     for (const step of steps.slice(0, MAX_STEPS)) await walkStep(ctx, asObj(step), c);
   }
 }
@@ -966,17 +1211,21 @@ async function callWorkflow(ctx: Ctx, uses: string, c: StepCtx): Promise<void> {
 // ---------- hooks ----------
 
 interface Hooks { manager: Manager | null; where: string; readable: boolean; found: Found[] }
+/** husky runs a hook with `sh -e` (https://github.com/typicode/husky/blob/main/husky); lefthook runs each command
+ *  with `sh -c`, without -e (internal/run/controller/exec/exec_unix.go). */
+const HUSKY_SHELL: ShellMode = { errexit: true, pipefail: false };
+const LEFTHOOK_SHELL: ShellMode = { errexit: false, pipefail: false };
 
 async function readHooks(ctx: Ctx): Promise<Hooks> {
   const manager = ctx.p.precommit;
   const none: Hooks = { manager, where: '', readable: true, found: [] };
   if (manager === null) return none;
-  const scan = (text: string, base: string | null = '.') => scanShell(text, base, ctx.sigs, ctx.budget);
+  const scan = (text: string, base: string | null, mode: ShellMode) => scanShell(text, base, ctx.sigs, ctx.budget, mode);
   if (manager === 'husky') {
     const where = '.husky/pre-commit';
     const r = await ctx.read.text(where);
     if ('fail' in r) return { ...none, where: '.husky', readable: r.fail === 'missing' };
-    return { manager, where, readable: true, found: scan(r.ok) };
+    return { manager, where, readable: true, found: scan(r.ok, '.', HUSKY_SHELL) };
   }
   if (manager === 'pre-commit') {
     const where = '.pre-commit-config.yaml';
@@ -989,8 +1238,8 @@ async function readHooks(ctx: Ctx): Promise<Hooks> {
         const hook = asObj(raw);
         const stages = 'stages' in hook ? strs(hook.stages) : defaultStages;
         if (stages.length > 0 && !stages.some((s) => s === 'pre-commit' || s === 'commit')) continue;
-        // the hook id and its entry are each read as a command line of their own
-        found.push(...scan([hook.id, hook.entry].filter((x): x is string => typeof x === 'string').join('\n')));
+        // the hook id and its entry are each read as a command of their own (pre-commit runs the entry directly)
+        for (const text of [hook.id, hook.entry]) if (typeof text === 'string') found.push(...scan(text, '.', DEFAULT_SHELL));
       }
     }
     return { manager, where, readable: true, found };
@@ -1002,7 +1251,7 @@ async function readHooks(ctx: Ctx): Promise<Hooks> {
     if ('fail' in r) return { ...none, where, readable: false };
     const hook = asObj(r.ok['pre-commit']);
     const entries = [...Object.values(asObj(hook.commands)), ...list(hook.jobs)].slice(0, MAX_HOOKS).map(asObj);
-    const found = entries.flatMap((e) => (typeof e.run === 'string' ? scan(e.run, firstSet(workingDir(e.root))) : []));
+    const found = entries.flatMap((e) => (typeof e.run === 'string' ? scan(e.run, firstSet(workingDir(e.root)), LEFTHOOK_SHELL) : []));
     return { manager, where, readable: true, found };
   }
   return none;
