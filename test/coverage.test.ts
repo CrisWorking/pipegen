@@ -1543,3 +1543,151 @@ describe('mapCoverage (Task 5 fix round 3)', () => {
     expect(r.why).toBe("There are more package scripts than pipegen follows (1,000), so it can't tell what your own `npm test` runs.");
   });
 });
+
+// ---------- Task 5 fix round 4: the re-review's probes (task-5-rereview-3.md N8, N9) ----------
+
+describe('mapCoverage (Task 5 fix round 4)', () => {
+  const py = { services: [svc('.', { language: 'python', packageManager: 'uv', scripts: [] })] };
+  const PR = (steps: string) => `on:\n  pull_request:\n${job(steps)}`;
+  /** Keys of 200 characters, each matched in vain by the patterns below (the re-review's glob-cost shapes). */
+  const longKeys = (n: number) => Object.fromEntries(Array.from({ length: n }, (_, i) => ['a'.repeat(194) + String(i).padStart(6, '0'), 'echo']));
+  const timed = async (dir: string, over: Partial<RepoProfile> = {}) => {
+    const started = Date.now();
+    const rows = await coverage(dir, over);
+    return { rows, ms: Date.now() - started };
+  };
+
+  it('N8: `run-s "t:*"` over 5,000 scripts, only the last running jest, is unknown, never missing (no truncated list decides the row)', async () => {
+    const scripts: Record<string, string> = { test: 'run-s "t:*"' };
+    for (let i = 0; i < 5000; i++) scripts[`t:${i}`] = i === 4999 ? 'jest' : 'echo';
+    const byName = makeTempDir();
+    pkg(byName, scripts);
+    wf(byName, 'ci.yml', PR(run('npm test')));
+    expect(row(await coverage(byName), 'merge', 'unit-tests', 'app').status).toBe('unknown');
+    // the same glob on a CI line (content path)
+    const content = makeTempDir();
+    pkg(content, scripts);
+    wf(content, 'ci.yml', PR(run('npx run-s "t:*"')));
+    expect(row(await coverage(content), 'merge', 'unit-tests', 'app').status).toBe('unknown');
+  }, 30_000);
+
+  it('N8: more than 16 patterns, or a pattern pipegen does not read, makes the call unknown', async () => {
+    const names = Array.from({ length: 17 }, (_, i) => `s${i}`);
+    const scripts = Object.fromEntries(names.map((n) => [n, 'echo']));
+    for (const [line, status] of [
+      [`run-s ${names.slice(0, 16).join(' ')}`, 'missing'],
+      [`run-s ${names.join(' ')}`, 'unknown'],
+      ['run-s "s{0,1}"', 'unknown'],
+      ['run-s "s?"', 'unknown'],
+      [`run-s "${'s'.repeat(65)}*"`, 'unknown'],
+    ] as const) {
+      const dir = makeTempDir();
+      pkg(dir, { ...scripts, test: line });
+      wf(dir, 'ci.yml', PR(run('npm test')));
+      expect(row(await coverage(dir), 'merge', 'unit-tests', 'app').status, line).toBe(status);
+      const content = makeTempDir();
+      pkg(content, scripts);
+      wf(content, 'ci.yml', PR(run(`npx ${line}`)));
+      expect(row(await coverage(content), 'merge', 'unit-tests', 'app').status, `CI: ${line}`).toBe(status === 'missing' ? 'missing' : 'unknown');
+    }
+  });
+
+  it('N8: a script name longer than 64 characters never matches a glob', async () => {
+    const dir = makeTempDir();
+    pkg(dir, { test: 'run-s "t:*"', [`t:${'x'.repeat(70)}`]: 'jest' });
+    wf(dir, 'ci.yml', PR(run('npx run-s "t:*"')));
+    expect(row(await coverage(dir), 'merge', 'unit-tests', 'app').status).toBe('missing');
+  });
+
+  it('N8: one `npm test` whose script runs 60 glob patterns over 3,000 keys takes under 2 s and is never covered', async () => {
+    const dir = makeTempDir();
+    const P = '*a'.repeat(120) + 'b';
+    pkg(dir, { test: 'run-s ' + Array.from({ length: 60 }, () => `"${P}"`).join(' '), ...longKeys(3000) });
+    wf(dir, 'ci.yml', PR(run('npm test')));
+    const { rows, ms } = await timed(dir);
+    expect(ms).toBeLessThan(2000);
+    expect(row(rows, 'merge', 'unit-tests', 'app').status).toBe('unknown');
+  }, 30_000);
+
+  for (const lines of [1, 5]) {
+    it(`N8: ${lines} CI line(s) of \`npx run-s\` with 60 patterns of 63 characters over 3,000 keys take under 2 s`, async () => {
+      const dir = makeTempDir();
+      pkg(dir, longKeys(3000));
+      const P = '*a'.repeat(31) + 'b';
+      const line = 'npx run-s ' + Array.from({ length: 60 }, (_, j) => P.slice(0, 61) + String(j).padStart(2, '0')).join(' ');
+      wf(dir, 'ci.yml', PR(run(line).repeat(lines)));
+      const { rows, ms } = await timed(dir);
+      expect(ms).toBeLessThan(2000);
+      expect(row(rows, 'merge', 'unit-tests', 'app').status).toBe('unknown');
+    }, 30_000);
+  }
+
+  it('N8: glob work past the budget is capped: 60 scripts × 16 distinct 64-character globs over 3,000 64-character names take under 2 s and are unknown', async () => {
+    const dir = makeTempDir();
+    const scripts: Record<string, string> = { test: Array.from({ length: 60 }, (_, i) => `npm run g${i}`).join(' && ') };
+    for (let i = 0; i < 60; i++) scripts[`g${i}`] = 'run-p ' + Array.from({ length: 16 }, (_, j) => `"${'*a'.repeat(29)}${String(i * 16 + j).padStart(5, '0')}*"`).join(' ');
+    for (let i = 0; i < 3000; i++) scripts['a'.repeat(58) + String(i).padStart(6, '0')] = 'echo';
+    pkg(dir, scripts);
+    wf(dir, 'ci.yml', PR(run('npm test')));
+    const { rows, ms } = await timed(dir);
+    expect(ms).toBeLessThan(2000);
+    expect(row(rows, 'merge', 'unit-tests', 'app').status).toBe('unknown');
+  }, 30_000);
+
+  // N9: SKIP written to GITHUB_ENV inside a local action pipegen can't fully read (the runner does read it)
+  const SET_SKIP = 'runs:\n  using: composite\n  steps:\n    - run: echo "SKIP=ruff-check" >> "$GITHUB_ENV"\n      shell: bash\n';
+  const hidden = async (setup: (dir: string) => string) => {
+    const dir = makeTempDir();
+    writeIn(dir, '.pre-commit-config.yaml', hookConfig('      - id: ruff-check\n'));
+    const uses = setup(dir);
+    wf(dir, 'ci.yml', PR(uses + run('pre-commit run --all-files')));
+    const rows = await coverage(dir, py);
+    return [row(rows, 'merge', 'hooks-ci').status, row(rows, 'merge', 'lint', 'app').status];
+  };
+  // The gate turns `pre-commit run` partial (SKIP may be set) and carries no lint over; the step pipegen couldn't read
+  // into is opaque, and an opaque run outranks a partial one, so both rows are unknown (at ae4ab8c both were covered).
+
+  it('N9: a local action reached through a symbolic link gets the can\'t-tell gate', async () => {
+    const [hooks, lint] = await hidden((dir) => {
+      writeIn(dir, 'a/action.yml', SET_SKIP);
+      symlinkSync(join(dir, 'a'), join(dir, 'ln'));
+      return '      - uses: ./ln\n';
+    });
+    expect([hooks, lint]).toEqual(['unknown', 'unknown']);
+  });
+
+  it('N9: a composite action that calls another local action gets the can\'t-tell gate', async () => {
+    const [hooks, lint] = await hidden((dir) => {
+      writeIn(dir, 'a/action.yml', SET_SKIP);
+      writeIn(dir, 'outer/action.yml', 'runs:\n  using: composite\n  steps:\n    - uses: ./a\n');
+      return '      - uses: ./outer\n';
+    });
+    expect([hooks, lint]).toEqual(['unknown', 'unknown']);
+  });
+
+  it('N9: a local action past the local-file cap gets the can\'t-tell gate', async () => {
+    const [hooks, lint] = await hidden((dir) => {
+      for (let i = 0; i < 150; i++) writeIn(dir, `acts/a${i}/action.yml`, i === 149 ? SET_SKIP : 'runs:\n  using: composite\n  steps:\n    - run: echo hi\n      shell: bash\n');
+      return Array.from({ length: 150 }, (_, i) => `      - uses: ./acts/a${i}\n`).join('');
+    });
+    expect([hooks, lint]).toEqual(['unknown', 'unknown']);
+  });
+
+  it('N9: a local action that can\'t be read (not valid YAML) gets the can\'t-tell gate', async () => {
+    const [hooks, lint] = await hidden((dir) => {
+      writeIn(dir, 'a/action.yml', `${SET_SKIP}  : [\n`);
+      return '      - uses: ./a\n';
+    });
+    expect([hooks, lint]).toEqual(['unknown', 'unknown']);
+  });
+
+  it('N9: a missing or non-composite local action still adds no gate', async () => {
+    const [missingHooks] = await hidden(() => '      - uses: ./nope\n');
+    expect(missingHooks).toBe('covered');
+    const [nodeHooks] = await hidden((dir) => {
+      writeIn(dir, 'n/action.yml', "runs:\n  using: node20\n  main: index.js\n");
+      return '      - uses: ./n\n';
+    });
+    expect(nodeHooks).toBe('covered');
+  });
+});
