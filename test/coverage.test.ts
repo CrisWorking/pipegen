@@ -1431,3 +1431,115 @@ describe('mapCoverage (Task 5 fix round 2)', () => {
     expect(row(await coverage(dir2, py), 'merge', 'hooks-ci').status).toBe('partial');
   });
 });
+
+// ---------- Task 5 fix round 3: the re-review's probes (task-5-rereview-2.md N6, N7) ----------
+
+describe('mapCoverage (Task 5 fix round 3)', () => {
+  const PR = (steps: string) => `on:\n  pull_request:\n${job(steps)}`;
+
+  it('N6: a local composite action used 20,000 times is read once for the job gate (100 jobs × 200 uses of a 100 KB action)', async () => {
+    const dir = makeTempDir();
+    const line = '    - run: echo hello world this is padding text for the composite action body\n      shell: bash\n';
+    writeIn(dir, '.github/actions/a/action.yml', `runs:\n  using: composite\n  steps:\n    - run: echo "SKIP=ruff-check" >> "$GITHUB_ENV"\n      shell: bash\n${line.repeat(Math.floor(100 * 1024 / line.length))}`);
+    const stepsTxt = '      - uses: ./.github/actions/a\n'.repeat(200);
+    const jobs = Array.from({ length: 100 }, (_, i) => `  j${i}:\n    runs-on: x\n    steps:\n${stepsTxt}`).join('');
+    wf(dir, 'w.yml', `on: [pull_request]\njobs:\n${jobs}`);
+    const started = Date.now();
+    const rows = await coverage(dir);
+    expect(Date.now() - started).toBeLessThan(10_000);
+    expect(rows.filter((r) => r.need.layer !== 'pre-commit').every((r) => r.status !== 'covered')).toBe(true);
+  }, 30_000);
+
+  it('N6: the cached composite gate applies to every job that uses the action (SKIP → hooks-in-CI partial)', async () => {
+    const dir = makeTempDir();
+    writeIn(dir, '.pre-commit-config.yaml', hookConfig('      - id: ruff-check\n'));
+    writeIn(dir, '.github/actions/a/action.yml', 'runs:\n  using: composite\n  steps:\n    - run: echo "SKIP=ruff-check" >> "$GITHUB_ENV"\n      shell: bash\n');
+    const one = `    runs-on: x\n    steps:\n      - uses: ./.github/actions/a\n      - uses: ./.github/actions/a/\n${run('pre-commit run --all-files')}`;
+    wf(dir, 'w.yml', `on: [pull_request]\njobs:\n  a:\n${one}  b:\n${one}`);
+    wf(dir, 'x.yml', `on: [pull_request]\njobs:\n  c:\n${one}`);
+    const rows = await coverage(dir, { services: [svc('.', { language: 'python', packageManager: 'uv', scripts: [] })] });
+    expect(row(rows, 'merge', 'hooks-ci').status).toBe('partial');
+    expect(row(rows, 'merge', 'lint', 'app').status).toBe('missing');
+  });
+
+  it('N7: own-script calls are followed with no depth limit, through npm aliases, yarn <script>, run-s / run-p / npm-run-all and concurrently', async () => {
+    const chain = (n: number, last: string) => Object.fromEntries([['test', 'npm run c1'], ...Array.from({ length: n }, (_, i) => [`c${i + 1}`, i + 1 === n ? last : `npm run c${i + 2}`])]);
+    for (const [cmd, scripts, status] of [
+      ['npm test', { test: 'npm-run-all a', a: 'echo' }, 'missing'],
+      ['npm test', { test: 'run-s a b', a: 'echo', b: 'true' }, 'missing'],
+      ['npm test', { test: 'run-p "test:*"', 'test:x': 'echo', 'test:y': ':' }, 'missing'],
+      ['npm test', { test: 'run-p "test:*"', 'test:x': 'echo', 'test:y': 'jest' }, 'covered'],
+      ['npm test', { test: 'run-s "test:**"', 'test:a:b': 'jest' }, 'covered'],
+      ['npm test', { test: 'run-s "test:*" && echo', 'test:a:b': 'echo' }, 'covered'], // * stays inside one `:` part: no script matches, run-s fails, kept by name
+      ['npm test', { test: 'run-s -c jestrun', jestrun: 'jest' }, 'partial'],
+      ['npm test', { test: 'concurrently "npm:a"', a: 'echo' }, 'missing'],
+      ['npm test', { test: 'concurrently --success first "npm:a" "npm:b"', a: 'jest', b: 'echo' }, 'partial'],
+      ['npm test', { test: 'concurrently "npm:a" "node server.js"', a: 'echo' }, 'covered'], // a plain command isn't followed: by name
+      ['yarn test', { test: 'echo ok' }, 'missing'],
+      ['yarn test', { test: 'yarn a', a: 'echo' }, 'missing'],
+      ['yarn test', { test: 'yarn a', a: 'jest' }, 'covered'],
+      ['npm test', { test: 'npm run-script a', a: 'echo' }, 'missing'],
+      ['npm test', { test: 'npm rum a', a: 'echo' }, 'missing'],
+      ['npm test', { test: 'npm run-script a', a: 'jest' }, 'covered'],
+      ['npm test', { test: 'npm run "my test"', 'my test': 'echo' }, 'missing'],
+      ['npm test', { test: 'npm run a\\"b', 'a"b': 'echo' }, 'missing'],
+      ['npm test', chain(5, 'echo'), 'missing'],
+      ['npm test', chain(40, 'echo'), 'missing'],
+      ['npm test', chain(40, 'jest'), 'covered'],
+      ['npm test', { test: '(true) || jest' }, 'missing'],
+      ['npm test', { test: '{ true; } || jest' }, 'missing'],
+      ['npm test', { test: 'exit 00' }, 'missing'],
+      ['npm test', { test: 'jest; exit 000' }, 'partial'],
+      ['npm t', { test: 'jest' }, 'covered'],
+      ['npm tst', { test: 'echo' }, 'missing'],
+      ['npm run-script test', { test: 'jest' }, 'covered'],
+      ['npm urn test', { test: 'jest' }, 'covered'],
+    ] as [string, Record<string, string>, string][]) {
+      const dir = makeTempDir();
+      pkg(dir, scripts);
+      wf(dir, 'ci.yml', PR(run(cmd)));
+      expect(row(await coverage(dir), 'merge', 'unit-tests', 'app').status, `${cmd} ${JSON.stringify(scripts).slice(0, 120)}`).toBe(status);
+    }
+    const lint = makeTempDir();
+    pkg(lint, { lint: 'run-s "lint:*"', 'lint:a': 'echo' });
+    wf(lint, 'ci.yml', PR(run('npm run lint')));
+    expect(row(await coverage(lint), 'merge', 'lint', 'app').status).toBe('missing');
+  });
+
+  it('N7: `npm run ci` → `run-s lint test` and `npm t` in CI are no longer false missing (content path)', async () => {
+    const dir = makeTempDir();
+    pkg(dir, { ci: 'run-s lint:js test:unit', 'lint:js': 'eslint .', 'test:unit': 'jest' });
+    wf(dir, 'ci.yml', PR(run('npm run ci')));
+    const rows = await coverage(dir);
+    expect(row(rows, 'merge', 'unit-tests', 'app')).toMatchObject({ status: 'covered', by: 'your own `npm run ci`' });
+    expect(row(rows, 'merge', 'lint', 'app')).toMatchObject({ status: 'covered', by: 'your own `npm run ci`' });
+    const direct = makeTempDir();
+    pkg(direct, { 'lint:js': 'eslint .', 'test:unit': 'vitest run' });
+    wf(direct, 'ci.yml', PR(run('npx run-p "lint:*" "test:*"')));
+    const rows2 = await coverage(direct);
+    expect(row(rows2, 'merge', 'unit-tests', 'app')).toMatchObject({ status: 'covered', by: 'your own `run-p test:*`' });
+    expect(row(rows2, 'merge', 'lint', 'app')).toMatchObject({ status: 'covered', by: 'your own `run-p lint:*`' });
+    const yarnScript = makeTempDir();
+    pkg(yarnScript, { ci: 'jest' });
+    wf(yarnScript, 'ci.yml', PR(run('yarn ci')));
+    expect(row(await coverage(yarnScript), 'merge', 'unit-tests', 'app')).toMatchObject({ status: 'covered', by: 'your own `yarn ci`' });
+    const t = makeTempDir();
+    pkg(t, { test: 'jest' });
+    wf(t, 'ci.yml', PR(run('npm t')));
+    expect(row(await coverage(t), 'merge', 'unit-tests', 'app')).toMatchObject({ status: 'covered', by: 'your own `npm t`' });
+  });
+
+  it('N7: past the script cap (1,000) a by-name script is unknown, never covered', async () => {
+    const dir = makeTempDir();
+    const scripts: Record<string, string> = { test: 'npm run c0' };
+    for (let i = 0; i < 1200; i++) scripts[`c${i}`] = `npm run c${i + 1}`;
+    scripts.c1200 = 'echo';
+    pkg(dir, scripts);
+    wf(dir, 'ci.yml', PR(run('npm test')));
+    const started = Date.now();
+    const r = row(await coverage(dir), 'merge', 'unit-tests', 'app');
+    expect(Date.now() - started).toBeLessThan(5000);
+    expect(r.status).toBe('unknown');
+    expect(r.why).toBe("There are more package scripts than pipegen follows (1,000), so it can't tell what your own `npm test` runs.");
+  });
+});

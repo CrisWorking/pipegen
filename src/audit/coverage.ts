@@ -53,6 +53,10 @@
 //   why, an unknown ref partial), so a publish without an attestation is never counted.
 // - Fix round 1: a script counted by name (S5) whose text is readable may only be lowered by it (ruling U23); commands
 //   after a top-level `exit` don't run; pytest/jest modes that only list or collect tests don't count.
+// - Fix rounds 2–3: classifyScript sorts every command of a by-name script (no-op, dead, runs nothing, a call to own
+//   scripts that do nothing, real); own-script calls (npm aliases, yarn <script>, run-s/run-p/npm-run-all and
+//   concurrently `npm:` globs) are followed with no depth limit, each (dir, script) once, at most MAX_SCRIPTS (then
+//   the row is unknown). A local composite action's env gate is worked out once per action path (compositeGate).
 // A tool counts only where a command starts: at the start, after ; && || | & ( $( { a newline, a shell keyword or a
 // wrapper (npx, sudo, env, time, command without -v, pnpm/yarn dlx, uv run, pipx run, python -m, sh/bash, …), as the
 // basename of a path, or as the image after `docker run [flags]`. Quoted text, here-document bodies and case patterns
@@ -582,6 +586,8 @@ function actionSkipped(tool: ToolSignature, w: Inputs): boolean {
 
 /** Pseudo-category prefix for runs of a version known not to do the check (actionRef, Task 5 fix round 1). */
 const OLD_PREFIX = '\u0000old:';
+/** Pseudo-category prefix for runs pipegen couldn't follow to the end (more scripts than MAX_SCRIPTS; fix round 3). */
+const UNKNOWN_PREFIX = '\u0000unknown:';
 /**
  * Where an action's `uses:` ref stands against the signature's actionRef: 'ok' (it does the check), 'old' (a version
  * known not to), 'unknown' (pipegen can't place it). A signature without actionRef is always 'ok'.
@@ -964,6 +970,8 @@ const probeCall = (args: readonly string[]) =>
 const OWN_NAME_RE = /^(?:test|lint)(?::[A-Za-z0-9_.-]{1,64})?$/;
 /** Task 5: any other script name, counted only when the script's own text runs a known test or lint tool. */
 const SCRIPT_NAME_RE = /^[A-Za-z0-9_.][A-Za-z0-9_.:-]{0,63}$/;
+/** Fix round 3: a script name or an npm-run-all glob, as it may appear in the `by` phrase. */
+const SCRIPT_PATTERN_RE = /^[A-Za-z0-9_.*][A-Za-z0-9_.:*-]{0,63}$/;
 const PACKAGE_MANAGERS = ['npm', 'pnpm', 'yarn', 'bun'];
 /** Task 5: a script that only fixes (lint:fix, lint-fix, format:write) is not a check. */
 const fixOnly = (name: string) => name.toLowerCase().split(/[:_-]/).some((seg) => seg === 'fix' || seg === 'write');
@@ -1062,7 +1070,7 @@ interface Budget { visits: number; bytes: number; truncated: boolean }
  * `wrapper`: the word only starts another command (npx, env, cross-env, uv run, yarn <bin>…), which is reported too.
  * `dead`: it never runs (after a top-level `exit`, or right of `true ||` / `false &&`).
  */
-interface CmdInfo { name: string; args: readonly string[]; dir: string | null; reason: Reason | null; dead: boolean; wrapper: boolean }
+interface CmdInfo { name: string; args: readonly string[]; dir: string | null; reason: Reason | null; dead: boolean; wrapper: boolean; afterBin: boolean }
 
 function scanShell(text: string, base: string | null, sigs: Compiled, budget: Budget, mode: ShellMode = DEFAULT_SHELL, onCmd?: (c: CmdInfo) => void): Found[] {
   budget.bytes += text.length;
@@ -1188,8 +1196,9 @@ function scanShell(text: string, base: string | null, sigs: Compiled, budget: Bu
   let functionEnd = -1; // tokens before this index are inside a function body
   let deadAfter = n; // fix round 1 (M3): commands after an unconditional top-level `exit` never run
   let deadTo = -1;   // fix round 2 (N1): commands up to here are the right side of `true ||` or `false &&`
-  let lastCmd: { kind: 'ok' | 'fail' | 'other'; end: number } | null = null; // the last command run, and its list end
+  let lastCmd: { kind: 'ok' | 'fail' | 'other'; start: number; end: number } | null = null; // the last command run, where it starts and its list end
   const isDead = (k: number) => k > deadAfter || k <= deadTo;
+  let binNext = -1; // the word after `yarn` / `pnpm` that may be a binary (or a script: classifyScript decides)
   // `( … )` and `$( … )` run in a subshell: `set` and `cd` inside them end at the closing bracket.
   const subshells: { close: number; errexit: boolean; pipefail: boolean; cwd: string | null }[] = [];
 
@@ -1240,13 +1249,32 @@ function scanShell(text: string, base: string | null, sigs: Compiled, budget: Bu
     const b = word(k + 2);
     if (name === 'pytest') words = args.some((x) => PYTEST_NO_RUN.has(x)) ? null : ['pytest'];
     else if ((name === 'python' || name === 'python3') && a === '-m' && b === 'pytest') words = args.some((x) => PYTEST_NO_RUN.has(x)) ? null : [name, '-m', 'pytest'];
-    else if (name === 'npm' && a === 'test' && scriptFlagsOk(k + 1)) [words, byName] = [['npm', 'test'], 'test'];
-    else if (PACKAGE_MANAGERS.includes(name) && a === 'run' && b !== null && ownName(b) && scriptFlagsOk(k + 2)) [words, byName] = [[name, 'run', b], b];
+    else if (name === 'npm' && a !== null && NPM_TEST.has(a) && scriptFlagsOk(k + 1)) [words, byName] = [['npm', a], 'test'];
+    else if (PACKAGE_MANAGERS.includes(name) && a !== null && (a === 'run' || (name === 'npm' && NPM_RUN.has(a))) && b !== null && ownName(b)
+      && scriptFlagsOk(k + 2)) [words, byName] = [[name, a, b], b];
     else if (['pnpm', 'yarn', 'bun'].includes(name) && a !== null && ownName(a) && scriptFlagsOk(k + 1)) [words, byName] = [[name, a], a];
-    else if (PACKAGE_MANAGERS.includes(name) && a === 'run' && b !== null && SCRIPT_NAME_RE.test(b) && !fixOnly(b) && !OWN_NAME_RE.test(b)
-      && scriptFlagsOk(k + 2)) {
-      words = [name, 'run', b];
+    else if (PACKAGE_MANAGERS.includes(name) && a !== null && (a === 'run' || (name === 'npm' && NPM_RUN.has(a))) && b !== null && SCRIPT_NAME_RE.test(b)
+      && !fixOnly(b) && !OWN_NAME_RE.test(b) && scriptFlagsOk(k + 2)) {
+      words = [name, a, b];
       script = b;
+    } else if ((name === 'yarn' || name === 'pnpm') && a !== null && a !== 'run' && SCRIPT_NAME_RE.test(a) && !fixOnly(a) && !OWN_NAME_RE.test(a)
+      && scriptFlagsOk(k + 1)) {
+      // fix round 3: `yarn <script>` runs that script when package.json has it (resolveScripts drops it otherwise)
+      words = [name, a];
+      script = a;
+    } else if (RUN_ALL.has(name) || name === 'concurrently') {
+      // fix round 3: npm-run-all / run-s / run-p and concurrently `npm:` arguments run own scripts (followed when every
+      // part is understood; a soft runner flag makes each partial)
+      const call = scriptCall(name, args);
+      if (call === null || call.unknown) return;
+      for (const p of call.patterns) {
+        if (!SCRIPT_PATTERN_RE.test(p) || fixOnly(p)) continue;
+        add({
+          categories: [], by: `your own \`${name} ${p}\``, subject: `Your own \`${name} ${p}\``, dir: cwd,
+          reason: shellReason(k) ?? (call.soft ? 'soft' : null), script: p,
+        });
+      }
+      return;
     } else if (name === 'tox') {
       const sub = toxRun(k);
       if (sub !== null) [words, envGate] = [sub === '' ? ['tox'] : ['tox', sub], 'tox'];
@@ -1362,13 +1390,21 @@ function scanShell(text: string, base: string | null, sigs: Compiled, budget: Bu
         if (s.close === k) ({ errexit, pipefail, cwd } = s);
       }
       cmd = op !== ')' && op !== '}';
+      // fix round 3: a `( … )` / `{ …; }` group holding only that command (and list ends) takes on its kind: `(true) || x`
+      if ((op === ')' || op === '}') && lastCmd !== null && opener[k]! >= 0 && (toks[opener[k]!]!.op === '(' || toks[opener[k]!]!.op === '{')) {
+        let j: number = lastCmd.end;
+        while (j < k && (toks[j]!.op === ';' || toks[j]!.op === '\n')) j++;
+        let i: number = opener[k]! + 1;
+        while (i < lastCmd.start && toks[i]!.op === '\n') i++;
+        if (j === k && i === lastCmd.start) lastCmd = { kind: lastCmd.kind, start: opener[k]!, end: k + 1 };
+      }
       // `true || x`, `: || x`, `echo … || x`, `false && x`: x never runs (a bracketed x as a whole)
       if ((op === '||' || op === '&&') && lastCmd !== null && lastCmd.end === k && lastCmd.kind === (op === '||' ? 'ok' : 'fail') && k + 1 < n) {
         const after: number = k + 1;
         const group: boolean = (toks[after]!.op === '(' || toks[after]!.op === '{') && closer[after]! >= 0;
         const until: number = group ? closer[after]! : segEnd[after]!;
         deadTo = Math.max(deadTo, until);
-        lastCmd = { kind: lastCmd.kind, end: group ? until + 1 : until };
+        lastCmd = { kind: lastCmd.kind, start: lastCmd.start, end: group ? until + 1 : until };
       }
       k++;
       continue;
@@ -1453,8 +1489,8 @@ function scanShell(text: string, base: string | null, sigs: Compiled, budget: Bu
     const next = word(k + 1);
     const visit = (wrapper: boolean) => {
       const dead = isDead(k);
-      onCmd?.({ name, args: argsAfter(k), dir: cwd, reason: shellReason(k), dead, wrapper });
-      if (!dead && !wrapper) lastCmd = { kind: OK_COMMANDS.has(name) ? 'ok' : name === 'false' ? 'fail' : 'other', end: segEnd[k]! };
+      onCmd?.({ name, args: argsAfter(k), dir: cwd, reason: shellReason(k), dead, wrapper, afterBin: binNext === k });
+      if (!dead && !wrapper) lastCmd = { kind: OK_COMMANDS.has(name) ? 'ok' : name === 'false' ? 'fail' : 'other', start: k, end: segEnd[k]! };
     };
     if (name === 'docker' && next === 'run') {
       visit(false);
@@ -1483,6 +1519,7 @@ function scanShell(text: string, base: string | null, sigs: Compiled, budget: Bu
     // `yarn eslint .` runs a package binary; `yarn run x` and `yarn test` run a script (no command word follows)
     const bin = BIN_RUNNERS.has(name) && next !== null && next !== 'run' && !(next === 'test' || OWN_NAME_RE.test(next));
     visit(bin);
+    if (bin) binNext = k + 1;
     cmd = bin;
     k++;
   }
@@ -1696,6 +1733,8 @@ interface Ctx {
   scriptMemo: Map<string, Found[]>;
   /** Fix round 2: classifyScript's answer per (dir, script). */
   scriptClass: Map<string, ScriptClass>;
+  /** Fix round 3 (N6): the env gate of each local composite action path, worked out once. */
+  compositeGates: Map<string, Promise<EnvGate>>;
   precommitConfig?: Promise<{ readable: boolean; found: Found[] }>;
 }
 /**
@@ -1706,9 +1745,11 @@ interface Ctx {
  */
 interface EnvGate { tox: boolean; nox: boolean; skip: boolean; npm: boolean }
 const NO_GATE: EnvGate = { tox: false, nox: false, skip: false, npm: false };
+const ALL_GATE: EnvGate = { tox: true, nox: true, skip: true, npm: true };
+const orGate = (a: EnvGate, b: EnvGate): EnvGate => ({ tox: a.tox || b.tox, nox: a.nox || b.nox, skip: a.skip || b.skip, npm: a.npm || b.npm });
 function gateOf(texts: readonly string[], envs: readonly unknown[], base: EnvGate = NO_GATE): EnvGate {
   // an `env:` given as one expression could set anything
-  if (envs.some((e) => e !== undefined && e !== null && (typeof e !== 'object' || Array.isArray(e)))) return { tox: true, nox: true, skip: true, npm: true };
+  if (envs.some((e) => e !== undefined && e !== null && (typeof e !== 'object' || Array.isArray(e)))) return ALL_GATE;
   const keys = envs.flatMap((e) => Object.keys(asObj(e)).slice(0, MAX_INPUT_KEYS)).map((k) => k.toUpperCase());
   const inText = (needle: string) => texts.some((t) => t.includes(needle));
   return {
@@ -1797,7 +1838,7 @@ const repoId = (ctx: Ctx): RepoId => ({ owner: ctx.p.owner, repo: ctx.p.repo });
 /** How npm runs a script: `/bin/sh -c` on POSIX (https://docs.npmjs.com/cli/v11/using-npm/scripts), so no -e. */
 const NPM_SCRIPT_SHELL: ShellMode = { errexit: false, pipefail: false };
 const MAX_PACKAGE_FILES = 50; // distinct package.json files read for scripts
-const MAX_SCRIPTS = 200;      // distinct (dir, script) pairs worked out
+const MAX_SCRIPTS = 1_000;    // distinct (dir, script) pairs worked out (fix round 3: was 200, with a depth limit of 4)
 
 /** The `scripts` of `<dir>/package.json` (string values only), or null when it can't be read. */
 function packageScripts(ctx: Ctx, dir: string): Promise<ReadonlyMap<string, string> | null> {
@@ -1858,7 +1899,7 @@ async function resolveScripts(ctx: Ctx, found: Found[]): Promise<Found[]> {
       continue;
     }
     if (f.dir === null) continue;
-    for (const g of await scriptRuns(ctx, f.dir, f.script)) {
+    for (const name of expandScripts([f.script], await packageScripts(ctx, f.dir))) for (const g of await scriptRuns(ctx, f.dir, name)) {
       out.push({ // the script's own `cd` counts: `cd api && jest` tests the api service only
         categories: g.categories, by: f.by, subject: f.subject, dir: g.dir, reason: f.reason ?? g.reason,
         ...(f.reason === null && g.partialWhy !== undefined ? { partialWhy: g.partialWhy } : {}),
@@ -1869,10 +1910,102 @@ async function resolveScripts(ctx: Ctx, found: Found[]): Promise<Found[]> {
   return out;
 }
 
-const MAX_SCRIPT_DEPTH = 4; // own-script calls followed when classing a script (fix round 2, N1)
+/**
+ * Fix round 3 (N7): a command that runs package scripts. `patterns`: script names or globs; `soft`: the runner can't fail
+ * on them (npm-run-all -c, concurrently --success other than all); `unknown`: part of it is something pipegen can't
+ * follow (an unknown flag, a plain command given to concurrently, a flag before the script name).
+ * - npm: run, run-script, rum, urn <name>; test, t, tst (https://github.com/npm/cli/blob/latest/lib/utils/cmd-list.js).
+ * - yarn | pnpm | bun: run <name>; test; lint[:x]; and `yarn|pnpm <name>` when that script exists (`scripts` given).
+ * - npm-run-all, run-s, run-p: every non-flag argument is a script pattern; `*` stays inside one `:` part, `**`
+ *   crosses them (https://github.com/mysticatea/npm-run-all/blob/master/docs/npm-run-all.md).
+ * - concurrently: `npm:`, `yarn:`, `pnpm:` and `bun:` arguments name scripts (globs allowed).
+ * After the name(s), a flag other than --silent, -s or --if-present (npm's --workspace, pnpm's --filter) is unknown.
+ */
+interface ScriptCall { patterns: string[]; soft: boolean; unknown: boolean }
+const NPM_RUN: ReadonlySet<string> = new Set(['run', 'run-script', 'rum', 'urn']);
+const NPM_TEST: ReadonlySet<string> = new Set(['test', 't', 'tst']);
+const RUN_ALL: ReadonlySet<string> = new Set(['npm-run-all', 'run-s', 'run-p']);
+const RUN_ALL_FLAGS: ReadonlySet<string> = new Set(['-s', '--serial', '--sequential', '-p', '--parallel', '-l', '--print-label', '-n', '--print-name', '-r', '--race',
+  '--silent', '--aggregate-output']);
+const CONCURRENTLY_VALUED: ReadonlySet<string> = new Set(['-n', '--names', '--name-separator', '-c', '--prefix-colors', '-p', '--prefix', '-l', '--prefix-length',
+  '-t', '--timestamp-format', '--default-input-target', '--restart-tries', '--restart-after', '-m', '--max-processes', '--kill-signal', '--hide']);
+const CONCURRENTLY_BOOLEAN: ReadonlySet<string> = new Set(['-k', '--kill-others', '--kill-others-on-fail', '-r', '--raw', '--no-color', '-g', '--group', '-i',
+  '--handle-input', '--pad-prefix', '-P', '--passthrough-arguments', '--timings']);
+const SCRIPT_FLAGS_OK: ReadonlySet<string> = new Set(['--silent', '-s', '--if-present']);
+const MAX_SCRIPT_TARGETS = 200;
 
-/** What a script really runs, for ruling U23 (fix round 2): `real` = something other than no-ops; `soft` = a reason when none of those runs can fail it. */
-interface ScriptClass { real: boolean; soft: Reason | null }
+function scriptCall(name: string, args: readonly string[], scripts?: ReadonlyMap<string, string> | null): ScriptCall | null {
+  const after = (from: number): boolean => { // unknown flags after the name(s), before `--`
+    for (const w of args.slice(from)) {
+      if (w === '--') return false;
+      if (w.startsWith('-') && redirection(w) === null && !SCRIPT_FLAGS_OK.has(w)) return true;
+    }
+    return false;
+  };
+  const one = (pattern: string, from: number): ScriptCall => ({ patterns: [pattern], soft: false, unknown: after(from) });
+  const [a, b] = args;
+  if (a === undefined) return null;
+  if (name === 'npm') {
+    if (NPM_TEST.has(a)) return one('test', 1);
+    if (NPM_RUN.has(a) && b !== undefined && b !== '' && !b.startsWith('-')) return one(b, 2);
+    return null;
+  }
+  if (PACKAGE_MANAGERS.includes(name)) {
+    if (a === 'run' && b !== undefined && b !== '' && !b.startsWith('-')) return one(b, 2);
+    if (a === 'test' || ownName(a)) return one(a, 1);
+    if ((name === 'yarn' || name === 'pnpm') && scripts?.has(a) === true && !a.startsWith('-')) return one(a, 1);
+    return null;
+  }
+  if (RUN_ALL.has(name)) {
+    const out: ScriptCall = { patterns: [], soft: false, unknown: false };
+    for (let i = 0; i < args.length; i++) {
+      const w = args[i] as string;
+      if (w === '--') break;
+      if (w === '-c' || w === '--continue-on-error') out.soft = true;
+      else if (w === '--max-parallel' || w === '--npm-path') i++;
+      else if (w.startsWith('--max-parallel=') || w.startsWith('--npm-path=') || RUN_ALL_FLAGS.has(w)) continue;
+      else if (w.startsWith('-')) out.unknown = true;
+      else out.patterns.push(w.trim().split(/\s+/)[0] as string); // "build:* -- --watch": the task is the first word
+    }
+    return out;
+  }
+  if (name === 'concurrently') {
+    const out: ScriptCall = { patterns: [], soft: false, unknown: false };
+    for (let i = 0; i < args.length; i++) {
+      const w = args[i] as string;
+      const eq = w.indexOf('=');
+      const flag = eq > 0 ? w.slice(0, eq) : w;
+      if (flag === '-s' || flag === '--success') {
+        const v = eq > 0 ? w.slice(eq + 1) : args[++i];
+        if (v !== 'all') out.soft = true;
+      } else if (CONCURRENTLY_VALUED.has(flag)) i += eq > 0 ? 0 : 1;
+      else if (CONCURRENTLY_BOOLEAN.has(w)) continue;
+      else if (w.startsWith('-')) out.unknown = true;
+      else {
+        const m = /^(?:npm|yarn|pnpm|bun):(.+)$/.exec(w.trim());
+        if (m) out.patterns.push((m[1] as string).split(/\s+/)[0] as string);
+        else out.unknown = true; // a plain command: not followed
+      }
+    }
+    return out;
+  }
+  return null;
+}
+
+/** Script names a call's patterns name: a plain name as is, a glob (* ? [) against this package.json's scripts (capped). */
+function expandScripts(patterns: readonly string[], scripts: ReadonlyMap<string, string> | null | undefined): string[] {
+  const out: string[] = [];
+  for (const p of patterns) {
+    if (!/[*?[]/.test(p)) out.push(p);
+    else for (const name of scripts?.keys() ?? []) if (scriptGlob(p, name)) out.push(name);
+  }
+  return [...new Set(out)].slice(0, MAX_SCRIPT_TARGETS);
+}
+/** npm-run-all's script globs: `:` separates parts like `/` in a path (globMatch: linear, capped at MAX_GLOB). */
+const scriptGlob = (pattern: string, name: string) => globMatch(pattern.replace(/\//g, '\u0001').replace(/:/g, '/'), name.replace(/\//g, '\u0001').replace(/:/g, '/'));
+
+/** What a script really runs, for ruling U23: `real` = something other than no-ops; `soft` = a reason when none of those runs can fail it; `capped` = more scripts than pipegen follows. */
+interface ScriptClass { real: boolean; soft: Reason | null; capped?: boolean }
 
 /** A known tool called in a mode that runs nothing: a version/help probe, a `notWithFlags` flag, or a pytest collect-only flag. */
 function runsNothing(c: CmdInfo, sigs: Compiled): boolean {
@@ -1883,34 +2016,31 @@ function runsNothing(c: CmdInfo, sigs: Compiled): boolean {
   return (sigs.byFirstWord.get(c.name) ?? []).some((r) => r.rest.every((x, i) => c.args[i] === x) && (r.tool.notWithFlags ?? []).some((f) => flagGiven(f, c.args)));
 }
 
-/** The script an own-script call names (`npm test`, `npm|pnpm|yarn|bun run X`, `pnpm|yarn|bun test|lint[:x]`), or null. */
-function ownCall(c: CmdInfo): string | null {
-  const [a, b] = c.args;
-  if (c.name === 'npm' && a === 'test') return 'test';
-  if (PACKAGE_MANAGERS.includes(c.name) && a === 'run' && b !== undefined && SCRIPT_NAME_RE.test(b)) return b;
-  if (['pnpm', 'yarn', 'bun'].includes(c.name) && a !== undefined && ownName(a)) return a;
-  return null;
-}
-
 /**
- * Fix round 2 (N1, N3; ruling U23): every top-level command of a package script, read as npm runs it (sh -c, no -e),
- * is (a) a no-op (echo, printf, true, :, false, exit 0 or a bare exit), (b) dead (after a top-level exit, right of `true ||` /
- * `false &&`), (c) a known tool in a mode that runs nothing (--version, --help, jest --listTests, pytest --co…), (d) a
- * call to another own script that does nothing by this same rule (followed up to MAX_SCRIPT_DEPTH, a cycle doing
- * nothing), or (e) anything else. `real` when some command is (e); `soft` when every (e) has a reason that keeps it
- * from failing the script (`x || true`, `x; exit 0`: under sh -c only the last list can fail it). Worked out once per
- * (dir, script); an unreadable script is unknown and counts as real.
+ * Fix round 2 (N1, N3) and 3 (N7; ruling U23): every top-level command of a package script, read as npm runs it (sh -c,
+ * no -e), is (a) a no-op (echo, printf, true, :, false, an exit or return of 0, a bare exit), (b) dead (after a
+ * top-level exit, right of `true ||` / `false &&`, also with the no-op in a `( … )` / `{ …; }` group), (c) a known tool
+ * in a mode that runs nothing (--version, --help, jest --listTests, pytest --co…), (d) a call to other own scripts
+ * (scriptCall: npm run/run-script/rum/urn, npm test/t/tst, yarn|pnpm|bun run X, yarn|pnpm X for a script that exists,
+ * npm-run-all/run-s/run-p and concurrently `npm:` arguments, globs matched) that all do nothing by this same rule
+ * (followed with no depth limit; each (dir, script) worked out once, a cycle doing nothing, at most MAX_SCRIPTS), or
+ * (e) anything else. `real` when some command is (e); `soft` when every (e) has a reason that keeps it from failing
+ * the script (`x || true`, `x; exit 0`: under sh -c only the last list can fail it). An unreadable script is unknown
+ * and counts as real; past MAX_SCRIPTS the answer is `capped` (the row becomes unknown).
  */
-async function classifyScript(ctx: Ctx, dir: string, name: string, depth: number): Promise<ScriptClass> {
+async function classifyScript(ctx: Ctx, dir: string, name: string): Promise<ScriptClass> {
   const key = `${dir}\u0000${name}`;
   const known = ctx.scriptClass.get(key);
   if (known !== undefined) return known;
-  const text = (await packageScripts(ctx, dir))?.get(name);
-  if (text === undefined || ctx.scriptClass.size >= MAX_SCRIPTS) return { real: true, soft: null };
+  const scripts = await packageScripts(ctx, dir);
+  const text = scripts?.get(name);
+  if (text === undefined || scripts === null || scripts === undefined) return { real: true, soft: null };
+  if (ctx.scriptClass.size >= MAX_SCRIPTS) return { real: true, soft: null, capped: true };
   ctx.scriptClass.set(key, { real: false, soft: null }); // being worked out: a cycle does nothing
   const cmds: CmdInfo[] = [];
   scanShell(text, dir, ctx.sigs, ctx.budget, NPM_SCRIPT_SHELL, (c) => { cmds.push(c); });
   let real = false;
+  let capped = false;
   let soft: Reason | null = null;
   let allSoft = true;
   const realRun = (reason: Reason | null) => {
@@ -1918,24 +2048,35 @@ async function classifyScript(ctx: Ctx, dir: string, name: string, depth: number
     if (reason === null) allSoft = false;
     else soft ??= reason;
   };
+  let scriptBin = false; // the previous command was `yarn|pnpm <script>`: its next word is that script, not a binary
   for (const c of cmds) {
-    if (c.dead || (c.wrapper && ownCall(c) === null)) continue;
+    const call = scriptCall(c.name, c.args, scripts);
+    const skip = scriptBin && c.afterBin;
+    scriptBin = call !== null && c.wrapper;
+    if (skip || c.dead || (c.wrapper && call === null)) continue;
     // no-ops: they run no check (`false` only fails the script, it tests nothing)
-    if (OK_COMMANDS.has(c.name) || c.name === 'false' || ((c.name === 'exit' || c.name === 'return') && (c.args.length === 0 || c.args[0] === '0'))) continue;
+    if (OK_COMMANDS.has(c.name) || c.name === 'false' || ((c.name === 'exit' || c.name === 'return') && (c.args.length === 0 || /^0+$/.test(c.args[0] as string)))) continue;
     if (runsNothing(c, ctx.sigs)) continue;
-    const target = ownCall(c);
-    if (target !== null) {
-      if (c.dir === null || depth + 1 > MAX_SCRIPT_DEPTH) {
-        realRun(c.reason);
-        continue;
+    if (call !== null && c.dir !== null && !call.unknown) {
+      const targets = expandScripts(call.patterns, c.dir === dir ? scripts : await packageScripts(ctx, c.dir));
+      let innerReal = false;
+      let innerAllSoft = true;
+      let innerSoft: Reason | null = null;
+      for (const t of targets) {
+        const inner = await classifyScript(ctx, c.dir, t);
+        if (inner.capped === true) capped = true;
+        if (!inner.real) continue;
+        innerReal = true;
+        if (inner.soft === null) innerAllSoft = false;
+        else innerSoft ??= inner.soft;
       }
-      const inner = await classifyScript(ctx, c.dir, target, depth + 1);
-      if (inner.real) realRun(c.reason ?? inner.soft);
+      if (targets.length === 0) realRun(c.reason); // nothing matched: the runner fails, pipegen can't tell more
+      else if (innerReal) realRun(c.reason ?? (call.soft ? 'soft' : innerAllSoft ? innerSoft : null));
       continue;
     }
     realRun(c.reason);
   }
-  const out: ScriptClass = { real, soft: real && allSoft ? soft : null };
+  const out: ScriptClass = { real, soft: real && allSoft ? soft : null, ...(capped ? { capped } : {}) };
   ctx.scriptClass.set(key, out);
   return out;
 }
@@ -1950,7 +2091,10 @@ async function byNameRun(ctx: Ctx, f: Found): Promise<Found | null> {
   if (f.dir === null || f.byName === undefined) return f;
   const text = (await packageScripts(ctx, f.dir))?.get(f.byName);
   if (text === undefined) return f;
-  const cls = await classifyScript(ctx, f.dir, f.byName, 0);
+  const cls = await classifyScript(ctx, f.dir, f.byName);
+  if (cls.capped === true) {
+    return { ...f, categories: f.categories.map((c) => `${UNKNOWN_PREFIX}${c}`), reason: null, partialWhy: `There are more package scripts than pipegen follows (${MAX_SCRIPTS.toLocaleString('en-US')}), so it can't tell what ${f.subject.charAt(0).toLowerCase()}${f.subject.slice(1)} runs.` };
+  }
   if (!cls.real) return null;
   if (cls.soft !== null) return { ...f, reason: f.reason ?? cls.soft };
   const runs = (await scriptRuns(ctx, f.dir, f.byName)).filter((g) => g.categories.some((c) => f.categories.includes(c)));
@@ -2034,19 +2178,40 @@ async function followAction(ctx: Ctx, uses: string, c: StepCtx): Promise<void> {
   if (list(runs.steps).length > MAX_STEPS) ctx.budget.truncated = true;
 }
 
-/** The steps of a local composite action (`uses: ./dir`), read like followAction reads it; [] for anything else. */
-async function compositeSteps(ctx: Ctx, uses: string): Promise<Obj[]> {
-  if (!(uses === '.' || uses.startsWith('./'))) return [];
+/**
+ * Fix round 3 (N6): the env gate a local composite action (`uses: ./dir`) adds to the job that uses it: its steps' run
+ * text and `env:`. Worked out once per action path per mapCoverage call (one read, one parse, its text counted
+ * against the scan-byte budget). Anything that isn't a readable composite action adds nothing; past the budget pipegen
+ * can't tell, so the gate is all on (rows lean partial, and the truncated budget makes would-be-missing rows unknown).
+ */
+function compositeGate(ctx: Ctx, uses: string): Promise<EnvGate> {
+  if (!(uses === '.' || uses.startsWith('./'))) return Promise.resolve(NO_GATE);
   const rel = localPath(uses);
-  if (rel === null || rel === 'outside') return [];
-  for (const name of ['action.yml', 'action.yaml']) {
-    const doc = await readLocal(ctx, rel === '.' ? name : `${rel}/${name}`);
-    if ('fail' in doc && doc.fail === 'missing') continue;
-    if ('fail' in doc) return [];
-    const runs = asObj(doc.ok.runs);
-    return runs.using === 'composite' ? list(runs.steps).slice(0, MAX_STEPS).map(asObj) : [];
+  if (rel === null || rel === 'outside') return Promise.resolve(NO_GATE);
+  let gate = ctx.compositeGates.get(rel);
+  if (gate === undefined) {
+    gate = (async () => {
+      for (const name of ['action.yml', 'action.yaml']) {
+        const file = rel === '.' ? name : `${rel}/${name}`;
+        const doc = await readLocal(ctx, file);
+        if ('fail' in doc && doc.fail === 'missing') continue;
+        if ('fail' in doc) return NO_GATE;
+        const text = await ctx.read.text(file);
+        ctx.budget.bytes += 'ok' in text ? text.ok.length : 0;
+        if (ctx.budget.bytes > MAX_SCAN_BYTES) {
+          ctx.budget.truncated = true;
+          return ALL_GATE;
+        }
+        const runs = asObj(doc.ok.runs);
+        if (runs.using !== 'composite') return NO_GATE;
+        const steps = list(runs.steps).slice(0, MAX_STEPS).map(asObj);
+        return gateOf(steps.flatMap((st) => (typeof st.run === 'string' ? [st.run] : [])), steps.map((st) => st.env));
+      }
+      return NO_GATE;
+    })();
+    ctx.compositeGates.set(rel, gate);
   }
-  return [];
+  return gate;
 }
 
 /** A local workflow or action file, counted against MAX_LOCAL_FILES. */
@@ -2100,13 +2265,15 @@ async function walkWorkflow(ctx: Ctx, doc: Obj, path: string, fit: Fit, depth: n
     const kept = steps.slice(0, MAX_STEPS).map(asObj);
     // fix round 2 (N4): a local composite action the job uses runs in the same job, so its steps' env and run text
     // (`echo SKIP=… >> $GITHUB_ENV`) count for the whole job too
-    const composite: Obj[] = [];
-    for (const st of kept) if (typeof st.uses === 'string' && regexSafe(st.uses)) composite.push(...(await compositeSteps(ctx, st.uses.trim())));
-    const all = [...kept, ...composite];
+    // each distinct `uses:` once per job; each action read once per call (compositeGate caches it)
+    let compositeGates = NO_GATE;
+    for (const uses of new Set(kept.flatMap((st) => (typeof st.uses === 'string' && regexSafe(st.uses) ? [st.uses.trim()] : [])))) {
+      compositeGates = orGate(compositeGates, await compositeGate(ctx, uses));
+    }
     const c: StepCtx = {
       fit, where, runDir: firstSet(defaultsDir(job), wfDir), shell: defaultsShell(job) ?? wfShell ?? (onWindows(job) ? 'pwsh' : undefined),
       continueOnError: allowedToFail(job['continue-on-error']), conditional: jobConditional, inputsUnread: false, depth,
-      gate: gateOf(all.flatMap((st) => (typeof st.run === 'string' ? [st.run] : [])), [doc.env, job.env, ...all.map((st) => st.env)]),
+      gate: gateOf(kept.flatMap((st) => (typeof st.run === 'string' ? [st.run] : [])), [doc.env, job.env, ...kept.map((st) => st.env)], compositeGates),
     };
     for (const step of steps.slice(0, MAX_STEPS)) await walkStep(ctx, asObj(step), c);
   }
@@ -2472,6 +2639,8 @@ function ciCoverage(need: Need, layer: CiLayer, d: Decide): Coverage {
   const dirs = d.scope.dirsOf(need.service);
   const cover = d.ci.first(need.category, dirs, layer, coverKinds(need));
   if (cover) return { need, status: 'covered', ...located(cover), why: `${cover.subject} runs ${LAYER_DONE[layer]}.` };
+  const unknownRun = d.ci.first(`${UNKNOWN_PREFIX}${need.category}`, dirs, layer, [FN, FC, FO]);
+  if (unknownRun?.partialWhy !== undefined) return { need, status: 'unknown', ...located(unknownRun), why: unknownRun.partialWhy };
   const strongOpaque = d.ci.first(OPAQUE_KEY, dirs, layer, [FN]);
   if (strongOpaque) return { need, status: 'unknown', ...located(strongOpaque), why: strongOpaque.why as string };
   if (d.truncated) return { need, status: 'unknown', why: OPAQUE_WHY.truncated };
@@ -2503,6 +2672,8 @@ function hookCoverage(need: Need, hooks: Hooks, d: Decide): Coverage {
     const dirs = d.scope.dirsOf(need.service);
     const cover = d.hooks.first(need.category, dirs, 'push', coverKinds(need));
     if (cover) return { need, status: 'covered', by: cover.by as string, where: hooks.where, why: `${cover.subject} runs in ${HOOK_PLACE[m]} before each commit.` };
+    const unknownRun = d.hooks.first(`${UNKNOWN_PREFIX}${need.category}`, dirs, 'push', [FN, FC, FO]);
+    if (unknownRun?.partialWhy !== undefined) return { need, status: 'unknown', by: unknownRun.by as string, where: hooks.where, why: unknownRun.partialWhy };
     const partial = d.hooks.first(need.category, dirs, 'push', partialKinds(need));
     if (partial) return { need, status: 'partial', by: partial.by as string, where: hooks.where, why: reasonWhy(partial, effectiveReason(need, partial.reason) as Reason, 'before each commit') };
     if (!hooks.readable) return { need, status: 'unknown', where: hooks.where, why: OPAQUE_WHY.hookUnreadable };
@@ -2523,7 +2694,7 @@ export async function mapCoverage(p: RepoProfile, needs: Need[], dir: string, op
   const sigs = (defaultCompiled ??= compile(loadToolSignatures()));
   const ctx: Ctx = {
     p, sigs, read: new Reader(dir), budget: { visits: 0, bytes: 0, truncated: false }, hits: [], localFiles: new Set(),
-    unreadable: (opts.skippedWorkflows ?? 0) > 0, pkgRead: new Reader(dir), pkgScripts: new Map(), scriptMemo: new Map(), scriptClass: new Map(),
+    unreadable: (opts.skippedWorkflows ?? 0) > 0, pkgRead: new Reader(dir), pkgScripts: new Map(), scriptMemo: new Map(), scriptClass: new Map(), compositeGates: new Map(),
   };
   if (p.existingWorkflows.length > MAX_WORKFLOWS) ctx.budget.truncated = true;
   for (const w of [...p.existingWorkflows].sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0)).slice(0, MAX_WORKFLOWS)) {
