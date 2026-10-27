@@ -28,7 +28,8 @@
 // `deps.gh` (api.github.com) carries the user's credential (ruling S15). `deps.fetch` never gets it; the one
 // header it gets is the anonymous pull token a registry hands out, sent back to that same registry only. Fetches
 // follow redirects by hand, to allow-listed https hosts only, with size-bounded bodies. GitHub calls go through
-// the shared rate-limit helper with the run's budget (ruling S16).
+// the shared rate-limit helper with the run's budget (ruling S16): a rate limit is the GitHubRateLimitError itself, a
+// spent budget a PinError whose cause is that error; isRateStop (github-rate.ts) recognises both.
 import { createHash } from 'node:crypto';
 import type { Octokit } from '@octokit/rest';
 import { z } from 'zod';

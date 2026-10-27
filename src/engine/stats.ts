@@ -13,13 +13,14 @@
 // - Advisories (ruling S12): a version that can't be resolved or checked gives `advisories: null`, never 0, so the
 //   quality bar fails closed. The reason is added to `deps.notes`. With a pinned commit, the versions checked are
 //   the full version tags on that commit, and the highest count is kept.
-// - GitHub calls go through the shared rate-limit helper (ruling S16); a spent wait budget is a StatsError.
+// - GitHub calls go through the shared rate-limit helper (ruling S16); a spent wait budget is a StatsError whose cause
+//   is the GitHubRateLimitError (isRateStop in github-rate.ts recognises it).
 import type { Octokit } from '@octokit/rest';
 import { parse as parseToml } from 'smol-toml';
 import { z } from 'zod';
 import { safeText } from '../util/safe-text.js';
 import type { Candidate, InstallSpec, ToolStats } from '../types.js';
-import { BUDGET_SPENT_MESSAGE, GitHubRateLimitError, withRateLimit, type RateClock } from './github-rate.js';
+import { BUDGET_SPENT_MESSAGE, GitHubRateLimitError, isRateStop, withRateLimit, type RateClock } from './github-rate.js';
 import {
   advisoryVersion, COMMIT_SHA_RE, compareSemver, githubRepoFromUrl, isFullSemver, isGitHubRepo, isNpmName, isPypiName, npmEscapedName, pep503,
   repoSegments,
@@ -282,7 +283,7 @@ export async function fetchStats(c: Candidate, deps: StatsDeps, install?: Instal
     const content = await github(`the root ${file}`, () => deps.gh.rest.repos.getContent({ owner, repo: name, path: file }), contentSchema, 'null')
       .catch((e: unknown) => {
         // rate limits still stop the run; any other failure to read the manifest is simply no proof
-        if (e instanceof GitHubRateLimitError || (e instanceof StatsError && e.cause instanceof GitHubRateLimitError)) throw e;
+        if (isRateStop(e)) throw e;
         return null;
       });
     if (content === null) return false;

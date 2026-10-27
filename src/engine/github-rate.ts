@@ -33,6 +33,19 @@ export class GitHubRateLimitError extends Error {
   }
 }
 
+/**
+ * Is a failure GitHub's rate limit or the run's spent wait budget? True for a GitHubRateLimitError and for any error
+ * whose cause chain holds one (a StatsError or PinError raised for a spent budget keeps the GitHubRateLimitError as
+ * its cause). Callers stop all further GitHub work then (discovery, pinning, Plan D/U).
+ */
+export function isRateStop(e: unknown): boolean {
+  let cur: unknown = e;
+  for (let depth = 0; depth < 8 && cur !== null && cur !== undefined; depth++) {
+    if (cur instanceof GitHubRateLimitError) return true;
+    cur = (cur as { cause?: unknown }).cause;
+  }
+  return false;
+}
 
 const realSleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
 

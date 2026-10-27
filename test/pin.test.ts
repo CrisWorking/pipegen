@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto';
 import { describe, expect, it, vi } from 'vitest';
-import { newRateBudget } from '../src/engine/github-rate.js';
+import { GitHubRateLimitError, isRateStop, newRateBudget } from '../src/engine/github-rate.js';
 import {
   COOLDOWN_DAYS, PinError, PinMovedWarning, PLATFORM_ACTION_IDS, platformActions, resolvePin, type PinDeps, type PlatformActions,
 } from '../src/engine/pin.js';
@@ -728,6 +728,30 @@ describe('pin: inputs, credentials, rate limits', () => {
     first = true;
     const spent = setup(limited, {}, { budget: newRateBudget(0) });
     await expect(resolvePin(cand(), spent.deps)).rejects.toThrow(/stopped waiting/);
+  });
+
+  it('pin: a spent budget or a rate limit stays recognisable (isRateStop), like stats; other pin failures are not rate stops (final review M7)', async () => {
+    const limitedRoutes = () => github({
+      [`GET ${GH}/repos/o/r/git/ref/tags/v1.2.3`]: { status: 403, body: { message: 'rate limited' }, headers: { 'x-ratelimit-remaining': '0', 'x-ratelimit-reset': String(Math.floor(NOW / 1000) + 10) } },
+    });
+    // the run's budget is spent: a PinError whose cause is the GitHubRateLimitError (budgetSpent)
+    const spent = await resolvePin(cand(), setup(limitedRoutes(), {}, { budget: newRateBudget(0) }).deps).catch((e: unknown) => e);
+    expect(spent).toBeInstanceOf(PinError);
+    expect((spent as PinError).cause).toBeInstanceOf(GitHubRateLimitError);
+    expect(((spent as PinError).cause as GitHubRateLimitError).budgetSpent).toBe(true);
+    expect(isRateStop(spent)).toBe(true);
+    // a reset too far away: the GitHubRateLimitError itself
+    const far = await resolvePin(cand(), setup(github({
+      [`GET ${GH}/repos/o/r/git/ref/tags/v1.2.3`]: { status: 403, body: {}, headers: { 'x-ratelimit-remaining': '0', 'x-ratelimit-reset': String(Math.floor(NOW / 1000) + 3600) } },
+    })).deps).catch((e: unknown) => e);
+    expect(far).toBeInstanceOf(GitHubRateLimitError);
+    expect(isRateStop(far)).toBe(true);
+    // any other failure is not a rate stop
+    const missing = await resolvePin(cand(), setup(github({ [`GET ${GH}/repos/o/r/git/ref/tags/v1.2.3`]: { status: 404, body: {} } })).deps).catch((e: unknown) => e);
+    expect(missing).toBeInstanceOf(PinError);
+    expect(isRateStop(missing)).toBe(false);
+    expect(isRateStop(new PinError('x', { cause: new Error('boom') }))).toBe(false);
+    expect(isRateStop(undefined)).toBe(false);
   });
 });
 

@@ -34,7 +34,7 @@ import { safeText } from '../util/safe-text.js';
 import type {
   AiProvider, AiUsage, Candidate, InstallSpec, Language, Need, NeedCategory, PackageManager, PipelineDraft, RepoProfile, ReviewedTool,
 } from '../types.js';
-import { BUDGET_SPENT_MESSAGE, GitHubRateLimitError, withRateLimit, type RateClock } from './github-rate.js';
+import { GitHubRateLimitError, isRateStop, withRateLimit, type RateClock } from './github-rate.js';
 import type { MemoryStore } from './memory.js';
 import { githubRepoFromUrl, isFullSemver, isGitHubRepo, isNpmName, repoSegments } from './names.js';
 import { cleanAiText, NEED_ID_CATEGORY } from './needs.js';
@@ -200,12 +200,6 @@ function candidatesSchema(needId: string, category: NeedCategory, language: Lang
       why: z.string(),
     })),
   }));
-}
-
-/** Is a failure GitHub's rate limit (or the run's spent wait budget)? Then no more GitHub work is worth trying. */
-function isRateStop(e: unknown): boolean {
-  return e instanceof GitHubRateLimitError
-    || (e instanceof StatsError && (e.message === BUDGET_SPENT_MESSAGE || e.cause instanceof GitHubRateLimitError));
 }
 
 /** The sources, merged and checked: reviewed candidates first, then checked discovery candidates. */
