@@ -135,7 +135,7 @@ The steps for making a release are in [docs/release.md](docs/release.md).
   acknowledgement within 7 days and a fix or a written plan within 30 days.
 - **Dependencies and tools:** pipegen ships with no runtime dependencies, and every pinned dependency or tool version waits
   7 days after its release before it is used (see [the cooldown](docs/cooldown.md)). There is no exception for urgent fixes yet; that path is still to be decided.
-- **Releases:** every release is built in GitHub Actions from an annotated tag whose signature GitHub must verify (the workflow fails otherwise), with a provenance attestation you can verify as above.
+- **Releases:** every release is built in GitHub Actions from an annotated tag signed by the maintainer's key listed in `.github/release-signers` (the workflow fails otherwise), with a provenance attestation you can verify as above.
 - **Side project:** pipegen is open source and maintained by one person; replies may be slow, and the promise above is the
   part that is not.
 

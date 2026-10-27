@@ -55,19 +55,27 @@ jobs:
           [ "$REF_TYPE" = tag ] || { echo "::error::not a tag"; exit 1; }
           printf '%s' "$TAG" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z][0-9A-Za-z.-]*)?$' || { echo "::error::tag is not vMAJOR.MINOR.PATCH"; exit 1; }
           git merge-base --is-ancestor "$GITHUB_SHA" origin/main || { echo "::error::the tagged commit is not on main"; exit 1; }
-      - name: The tag must be an annotated tag whose signature GitHub verifies (fails closed)
+      - name: The tag must be an annotated tag signed by a key in .github/release-signers (fails closed)
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
           TAG: ${{ github.ref_name }}
         run: |
           set -euo pipefail
-          # needs the signing key to be registered on the tagger's GitHub account (docs/release.md C1); a lightweight tag has no signature
-          type=$(gh api "repos/$REPO/git/ref/tags/$TAG" --jq '.object.type')
+          # read the tag ref once and keep the answer; everything below uses these two values
+          ref=$(gh api "repos/$REPO/git/ref/tags/$TAG" --jq '[.object.type, .object.sha] | @tsv')
+          type=${ref%%$'\t'*}
+          sha=${ref##*$'\t'}
           [ "$type" = tag ] || { echo "::error::$TAG is a lightweight tag; a signed annotated tag (git tag -s) is required"; exit 1; }
-          sha=$(gh api "repos/$REPO/git/ref/tags/$TAG" --jq '.object.sha')
-          verified=$(gh api "repos/$REPO/git/tags/$sha" --jq '.verification.verified')
-          [ "$verified" = true ] || { echo "::error::GitHub does not verify the signature of tag $TAG"; exit 1; }
+          # the annotated tag must point at a commit, and at the commit this run was started for
+          obj=$(gh api "repos/$REPO/git/tags/$sha" --jq '[.object.type, .object.sha] | @tsv')
+          [ "${obj%%$'\t'*}" = commit ] || { echo "::error::tag $TAG does not point at a commit"; exit 1; }
+          [ "${obj##*$'\t'}" = "$GITHUB_SHA" ] || { echo "::error::tag $TAG points at a different commit than this run"; exit 1; }
+          # the local tag object must be the one just read, so what is verified below is what was checked above
+          [ "$(git rev-parse "refs/tags/$TAG")" = "$sha" ] || { echo "::error::the checked-out tag object differs from the tag ref"; exit 1; }
+          # the signer is pinned: only a key listed in the committed allowed-signers file counts (a comment-only file fails closed)
+          grep -Evq '^[[:space:]]*(#|$)' .github/release-signers || { echo "::error::.github/release-signers lists no key (docs/release.md C1)"; exit 1; }
+          git -c gpg.format=ssh -c gpg.ssh.allowedSignersFile=.github/release-signers verify-tag "$TAG"
       - name: The tagged commit must have a green ci run (the live-network tests are not re-run here)
         env:
           GH_TOKEN: ${{ github.token }}

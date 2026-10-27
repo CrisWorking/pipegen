@@ -5,6 +5,7 @@
 /gate/                 @CrisWorking
 /watcher/              @CrisWorking
 /.github/              @CrisWorking
+/.github/release-signers @CrisWorking
 /scripts/              @CrisWorking
 /src/engine/           @CrisWorking
 /tsup.config.ts        @CrisWorking

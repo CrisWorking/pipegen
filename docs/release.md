@@ -23,7 +23,7 @@ the signed tags happen only when v0.4 is done). This page has two parts: what is
 
 How `release.yml` works, in order:
 
-1. **verify**: the tag must be `vMAJOR.MINOR.PATCH`, annotated with a signature GitHub verifies, and point at a commit on `main`; that commit must have a green `ci` run
+1. **verify**: the tag must be `vMAJOR.MINOR.PATCH`, annotated and signed by a key in `.github/release-signers` (`git verify-tag`; the tag must point at the run's commit), and point at a commit on `main`; that commit must have a green `ci` run
    (the live-network gitleaks test is not re-run, S13); exact Node 26.12.0 and npm >= 11.5.1 are asserted (S10); then
    `npm ci --ignore-scripts`, tests, `tsc --noEmit`, build, the release check, **one** `npm pack`, a CycloneDX SBOM of the bundled
    packages (the same list as `THIRD_PARTY_NOTICES`; `node scripts/notices.ts --sbom-only`), a test of the packed `.tgz`, and `SHA256SUMS`. What is tested is what ships (S1).
@@ -116,6 +116,11 @@ Work through it in order. Tick a step only after Cristiano said go and the resul
 
 - [ ] **C1. Signing key** (ask Cristiano first). Once: GPG, or SSH with `git config gpg.format ssh` and
       `git config user.signingkey <key>`; add it to GitHub as a **signing key**.
+- [ ] **C1b. Pin the tag signer** (ask Cristiano first). Cristiano adds his tag-signing public key to
+      `.github/release-signers` (ssh allowed_signers format, `namespaces="git"`) in a PR. The file ships with only a comment,
+      so `release.yml` fails closed on every tag until he does. The `verify` job runs `git verify-tag` against this file.
+      Together with the B4 ruleset (it must block **updates and deletions** of `v*` tags, so a verified tag cannot be moved),
+      this makes "built from a signed tag" true.
 - [ ] **C2. Check before tagging** (ask Cristiano first): on a clean checkout of `main` at the release commit, `npm ci`,
       `npm test`, `npx tsc --noEmit`, `npm run build`, `node scripts/release-check.ts --tag vX.Y.Z` (it must be clean), and
       `package.json` `version` = X.Y.Z with `repository.url` exactly `git+https://github.com/CrisWorking/pipegen.git`.
@@ -132,7 +137,7 @@ Work through it in order. Tick a step only after Cristiano said go and the resul
       repository `CrisWorking/pipegen`, workflow `release.yml` **and** environment `npm-release`. Record it here.
 - [ ] **C4. Signed tag and the release run** (ask Cristiano first). The run publishes the real version X.Y.Z (a pre-release
       tag such as `v1.0.0-rc.1` goes under the `next` dist-tag, never `latest`). The `verify` job fails unless the tag is
-      annotated and GitHub shows its signature as verified (so the signing key of C1 must be on his GitHub account). `git tag -s vX.Y.Z -m "vX.Y.Z"`, check with
+      annotated and signed by a key listed in `.github/release-signers` (C1b). `git tag -s vX.Y.Z -m "vX.Y.Z"`, check with
       `git tag -v vX.Y.Z`, then `git push origin vX.Y.Z` (this is the public step and starts `release.yml`). Watch the
       run; approve the `npm-release` environment when asked.
 - [ ] **C5. Verify the provenance** (ask Cristiano first; S17, DEC #99). No earlier than this publish:

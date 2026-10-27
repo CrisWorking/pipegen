@@ -1,0 +1,4 @@
+# Allowed signers for release tags (ssh-keygen "allowed_signers" format, one key per line):
+#   <principal> namespaces="git" ssh-ed25519 AAAA... 
+# release.yml verifies every v* tag against this file with `git verify-tag` and fails when no key is listed.
+# Cristiano adds his tag-signing public key here (docs/release.md C1). Empty on purpose until he does.
