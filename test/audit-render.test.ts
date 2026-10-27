@@ -3,7 +3,7 @@
 // no backticks around repo values, escaped exactly once) and Review Focus 3 (never suggest making the repo public).
 import { describe, expect, it } from 'vitest';
 import { EXCLUDED_KEPT, EXCLUDED_PATTERN_GROUPS, EXCLUDED_PATTERNS, excludedSummaryLines, redact } from '../src/ai/redact.js';
-import { FULL_SETUP_COMMAND, isBuiltInNeed, isOwnCommand, needLabel, safeRunCommand, type AuditReport } from '../src/audit/model.js';
+import { isBuiltInNeed, isOwnCommand, needLabel, safeRunCommand, type AuditReport } from '../src/audit/model.js';
 import { CANT_SEE, renderJson, renderMarkdown, renderTerminal, type RenderOptions } from '../src/audit/render.js';
 import { safeMarkdown } from '../src/util/safe-text.js';
 import { EMPTY_PLACEHOLDER, safeOutput, TOO_LONG } from '../src/util/safe-output.js';
@@ -283,7 +283,7 @@ describe('rulings', () => {
     }
     const other = {
       ...r,
-      support: { level: 'audit-only' as const, reasons: ['Python support arrives in v0.4.'], nextStep: 'The full setup arrives in v0.4 for Python and monorepos.', nextCommand: FULL_SETUP_COMMAND },
+      support: { level: 'audit-only' as const, reasons: ['Python support arrives in v0.4.'], nextStep: 'The full setup arrives in v0.4 for Python and monorepos.', nextCommand: null },
     };
     const t = term(other);
     expect(t).toContain('Python support arrives in v0.4.');
@@ -534,13 +534,11 @@ describe('fix round 1', () => {
     const r = { ...report(), warnings: [SWAP] };
     const tLines = term(r).split('\n');
     expect(tLines).toContain(`    ${cmd}`); // on its own line, whole
-    expect(tLines).toContain(`    ${FULL_SETUP_COMMAND}`);
     const mLines = md(r).split('\n');
     const at = mLines.indexOf(`  ${cmd}`);
     expect(at).toBeGreaterThan(0);
     expect(mLines[at - 1]).toBe('  ```sh');
     expect(mLines[at + 1]).toBe('  ```');
-    expect(mLines).toContain(FULL_SETUP_COMMAND);
     expect(md(r)).not.toContain('\\`npx');
     // a long version is still one line in the terminal
     const long = safeRunCommand('123456789.123456789.123456789');
@@ -550,12 +548,26 @@ describe('fix round 1', () => {
     // JSON keeps the commands as they are
     const j = JSON.parse(json(r));
     expect(j.warnings[0].command).toBe(cmd);
-    expect(j.support.nextCommand).toBe(FULL_SETUP_COMMAND);
+    expect(j.support.nextCommand).toBeNull(); // ruling U18: none in v0.1
+    // a next-step command, once there is one, is a block under the next-step text in every output
+    const withNext = { ...r, support: { ...r.support, nextCommand: cmd } };
+    expect(term(withNext).split('\n').slice(-1)[0]).toBe(`    ${cmd}`);
+    expect(md(withNext).trimEnd().split('\n').slice(-3)).toEqual(['```sh', cmd, '```']);
     // anything that isn't exactly a command pipegen builds is cleaned like any other value
     expect(isOwnCommand('npx --registry=https://registry.npmjs.org pipegen@0.1.0 audit --dir ./repo`; x')).toBe(false);
     const odd = { ...r, warnings: [{ text: 'x', command: '`npx evil` @someone' }] };
     expect(md(odd)).not.toContain('`npx evil`');
     expect(md(odd)).not.toContain('```sh\n`npx');
+  });
+
+  it('U18: no output contains a runnable `npx pipegen` (the npm name is not pipegen\'s yet), only the exact-version audit command', () => {
+    const r = { ...report(), warnings: [SWAP], ai: aiPart() };
+    for (const text of [term(r), md(r), json(r)]) {
+      expect(text).not.toMatch(/npx\s+pipegen/);
+      expect(text).toContain(safeRunCommand('0.1.0')); // `npx --registry=… pipegen@0.1.0 audit …` stays
+      expect(text).toContain('The full setup arrives in v0.2 for single-package Node/TypeScript repos.');
+    }
+    expect(isOwnCommand('npx pipegen')).toBe(false);
   });
 
   it('M1: only the report\'s own top-level permission table skips redact in JSON', () => {

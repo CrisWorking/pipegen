@@ -8,6 +8,7 @@ import * as childProcess from 'node:child_process';
 import { COUNTING_ONLY_NOTE, EXCLUDED_PATTERNS, redact } from '../src/ai/redact.js';
 import { mapCoverage } from '../src/audit/coverage.js';
 import { buildAudit, CURRENT_MILESTONE, type AuditDeps, type AuditReport } from '../src/audit/model.js';
+import { renderJson, renderMarkdown, renderTerminal } from '../src/audit/render.js';
 import { newRateBudget } from '../src/engine/github-rate.js';
 import { floorNeeds, jobCategories } from '../src/engine/needs.js';
 import { estimate } from '../src/estimate/estimate.js';
@@ -154,8 +155,8 @@ describe('buildAudit (brief, Task 2a)', () => {
     const r = await buildAudit(repo({ 'pyproject.toml': '[project]\nname = "svc"\n', 'app.py': 'print(1)\n' }), deps());
     expect(r.support.level).toBe('audit-only');
     expect(r.support.reasons).toEqual(['Python support arrives in v0.4.']); // S8: without "You can run `pipegen audit` today."
-    expect(r.support.nextStep).toBe('The full setup arrives in v0.4 for Python and monorepos. It is not in this version; once v0.4 is out, it starts with:');
-    expect(r.support.nextCommand).toBe('npx pipegen');
+    expect(r.support.nextStep).toBe('The full setup arrives in v0.4 for Python and monorepos.');
+    expect(r.support.nextCommand).toBeNull(); // ruling U18
   });
 
   it('audit: wouldCreate uses Part precommit when there is no hook manager', async () => {
@@ -236,6 +237,22 @@ describe('buildAudit (brief, Task 2a)', () => {
     expect(plain.warnings).toEqual([]);
   });
 
+  it('U18: in a v0.1 build no output has a runnable `npx pipegen`; the .npmrc warning keeps its exact-version command', async () => {
+    const reports = [
+      await buildAudit(repo({ ...nodeApp(), '.npmrc': 'registry=https://registry.example.test/\n' }), deps()),
+      await buildAudit(repo({ 'pyproject.toml': '[project]\nname = "svc"\n', 'app.py': 'print(1)\n' }), deps()),
+      await buildAudit(repo({ 'main.go': 'package main\n' }), deps()),
+    ];
+    for (const r of reports) {
+      expect(r.support.nextCommand).toBeNull();
+      for (const text of [renderTerminal(r, { knownValues: [] }), renderMarkdown(r, { knownValues: [] }), renderJson(r, { knownValues: [] })]) {
+        expect(text).not.toMatch(/npx\s+pipegen/);
+      }
+    }
+    const t = renderTerminal(reports[0] as AuditReport, { knownValues: [] });
+    expect(t.split('\n')).toContain(`    ${SWAP_WARNING.command}`);
+  });
+
   it('audit: local node_modules/.bin/pipegen → warning', async () => {
     const dir = repo({ ...nodeApp(), 'node_modules/.bin/pipegen': '#!/bin/sh\n' });
     expect((await buildAudit(dir, deps())).warnings).toEqual([SWAP_WARNING]);
@@ -305,8 +322,8 @@ describe('buildAudit (controller rulings)', () => {
     const node = await buildAudit(repo(nodeApp()), deps());
     expect(node.support).toEqual({
       level: 'full', reasons: [],
-      nextStep: 'The full setup arrives in v0.2 for single-package Node/TypeScript repos. It is not in this version; once v0.2 is out, it starts with:',
-      nextCommand: 'npx pipegen',
+      nextStep: 'The full setup arrives in v0.2 for single-package Node/TypeScript repos.',
+      nextCommand: null,
     });
     const bare = await buildAudit(repo({ 'main.go': 'package main\n' }), deps());
     expect(bare.support.level).toBe('audit-only');

@@ -206,8 +206,4 @@ These are counts only, never file contents. They were made without the gitleaks 
 
 ## Next step
 
-The full setup arrives in v0.2 for single-package Node/TypeScript repos. It is not in this version; once v0.2 is out, it starts with:
-
-```sh
-npx pipegen
-```
+The full setup arrives in v0.2 for single-package Node/TypeScript repos.

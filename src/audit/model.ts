@@ -169,12 +169,15 @@ export interface AuditDeps {
 // ---------- fixed texts ----------
 
 const AUDIT_TODAY = ' You can run `pipegen audit` today.';
-/** The full setup's command, once it ships (ruling U17: pipegen's own fixed text, printed unescaped). */
-export const FULL_SETUP_COMMAND = 'npx pipegen';
+/**
+ * Ruling U18: no runnable full-setup command in v0.1 output. The npm name `pipegen` isn't pipegen's yet (it was published
+ * in 2019 and unpublished, so anyone can claim it), so `npx pipegen` could run someone else's package. `command` stays
+ * null until the package is published; then fill it here and accept it in isOwnCommand.
+ */
 const NEXT_STEP: Readonly<Record<Milestone, Readonly<Record<'v0.2' | 'v0.4' | 'none', { text: string; command: string | null }>>>> = {
   'v0.1': {
-    'v0.2': { text: 'The full setup arrives in v0.2 for single-package Node/TypeScript repos. It is not in this version; once v0.2 is out, it starts with:', command: FULL_SETUP_COMMAND },
-    'v0.4': { text: 'The full setup arrives in v0.4 for Python and monorepos. It is not in this version; once v0.4 is out, it starts with:', command: FULL_SETUP_COMMAND },
+    'v0.2': { text: 'The full setup arrives in v0.2 for single-package Node/TypeScript repos.', command: null },
+    'v0.4': { text: 'The full setup arrives in v0.4 for Python and monorepos.', command: null },
     none: { text: 'The full setup is not planned yet for this repo.', command: null },
   },
 };
@@ -190,12 +193,12 @@ export function safeRunCommand(version: string | null): string {
   return `npx --registry=${NPM_REGISTRY} ${pkg} audit --dir ./repo`;
 }
 /**
- * True for a command pipegen itself builds (safeRunCommand, FULL_SETUP_COMMAND) and nothing else: the renderers print a
+ * True for a command pipegen itself builds (safeRunCommand) and nothing else: the renderers print a
  * command unescaped only when this holds (no backtick, no space-separated repo text, nothing to break out of a code span).
  */
 export function isOwnCommand(s: unknown): s is string {
   return typeof s === 'string'
-    && (s === FULL_SETUP_COMMAND || /^npx --registry=https:\/\/registry\.npmjs\.org pipegen(?:@\d{1,9}\.\d{1,9}\.\d{1,9})? audit --dir \.\/repo$/.test(s));
+    && /^npx --registry=https:\/\/registry\.npmjs\.org pipegen(?:@\d{1,9}\.\d{1,9}\.\d{1,9})? audit --dir \.\/repo$/.test(s);
 }
 
 /** pipegen's own checks (the merge gate, the deploy-time verify): pipegen adds them itself, so no tool is picked for them and they never make a layer "serious" (ruling U16). */

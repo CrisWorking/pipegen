@@ -111,8 +111,8 @@ export function freePrivateReport(excludedPatterns: readonly string[]): AuditRep
     },
     support: {
       level: 'full', reasons: [],
-      nextStep: 'The full setup arrives in v0.2 for single-package Node/TypeScript repos. It is not in this version; once v0.2 is out, it starts with:',
-      nextCommand: 'npx pipegen',
+      nextStep: 'The full setup arrives in v0.2 for single-package Node/TypeScript repos.',
+      nextCommand: null,
     },
     coverage: c,
     wouldAdd: wouldAdd(c),
