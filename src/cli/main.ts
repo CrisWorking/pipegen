@@ -6,7 +6,7 @@ import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { parseArgs } from 'node:util';
 import { safeRunCommand } from '../audit/model.js';
-import { hideToken } from '../github/client.js';
+import { hideToken, permissionsTable } from '../github/client.js';
 import { packageVersion } from '../util/package-data.js';
 import { safeText } from '../util/safe-text.js';
 import { AI_CHOICES, audit, normalizeAiFlag, type AiChoice } from './audit.js';
@@ -45,7 +45,9 @@ function usage(): string[] {
     '  -h, --help            Show this help.',
     '  -v, --version         Show the version.',
     '',
-    'GitHub access: set GITHUB_TOKEN to a fine-grained, read-only token for the repo. A public repo also works without one.',
+    'GitHub access: set GITHUB_TOKEN to a fine-grained, read-only token for the repo, with',
+    `  ${permissionsTable('read').map((p) => p.permission).join(', ')}.`,
+    'A public repo also works without one.',
   ];
 }
 

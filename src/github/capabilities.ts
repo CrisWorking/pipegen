@@ -154,7 +154,7 @@ export async function probeCapabilities(gh: Octokit, owner: string, repo: string
   const table = capabilityTable(p);
   const couldnt = (what: string, then: string, a: Answer<unknown>) => notes.push(!a.ok && a.network
     ? `GitHub didn't answer when pipegen checked ${what} (a network problem); ${then}.`
-    : `Couldn't check ${what} with this token; ${then}.`);
+    : `Couldn't check ${what} ${isAnonymousClient(gh) ? 'without a token' : 'with this token'}; ${then}.`);
 
   const rulesets = await ask(gh, () => gh.rest.repos.getRepoRulesets({ owner, repo, per_page: 1 }), clock);
   let branchProtection = verdict(rulesets);

@@ -165,5 +165,6 @@ export const aiPart = (over: Partial<AuditAi> = {}): AuditAi => ({
     { model: 'claude-opus-5-5', input: 5_200, output: 700, cacheRead: 0, cacheWrite: 0, listUsd: 0.0435 },
   ],
   local: false,
+  capUsd: 5.5,
   ...over,
-});
+} as AuditAi);

@@ -24,11 +24,14 @@
 // overflows the stack).
 import { excludedSummaryLines } from '../ai/redact.js';
 import { ACTIVITY_CAPPED_PREFIX } from '../estimate/estimate.js';
-import type { Layer, Part } from '../types.js';
+import type { Layer, Need, Part } from '../types.js';
+import { num, plural, size, usd as money } from '../util/format.js';
 import { makeSafeOutput, OUTPUT_CAP, type OutputTarget } from '../util/safe-output.js';
 import { safeMarkdown } from '../util/safe-text.js';
-import type { Coverage } from './coverage.js';
-import { isBuiltInNeed, isOwnCommand, needLabel, type AuditAi, type AuditReport, type LocalAudit, type WouldAddRow, type WouldAddTool } from './model.js';
+import { COVERAGE_LIMITS, type Coverage } from './coverage.js';
+import {
+  buildsNoImage, isBuiltInNeed, isOwnCommand, needLabel, type AuditAi, type AuditReport, type LocalAudit, type WouldAddRow, type WouldAddTool,
+} from './model.js';
 
 export interface RenderOptions {
   /**
@@ -40,17 +43,28 @@ export interface RenderOptions {
   now?: () => number;
 }
 
-/** What this audit can't see (the Plan U Task 1 parked limits), in plain words. Shown in every report. */
+const L = COVERAGE_LIMITS;
+/**
+ * What this audit can't see (the Plan U Task 1 parked limits), in plain words. Shown in every report, and in `--json`
+ * as `cantSee`. The Plan U final review (M3) lined it up with the code: paths filters and `if:` conditions read partial,
+ * the per-run budgets (numbers from COVERAGE_LIMITS, the ones mapCoverage uses) and nested local actions read unknown,
+ * and a visible TOX… / NOX… variable reads partial.
+ */
 export const CANT_SEE: readonly string[] = Object.freeze([
   "pipegen checks that a tool runs on the right trigger and can fail the build; it doesn't check the tool's other settings.",
+  "Workflows limited by `paths:` or `paths-ignore:`, and jobs or steps with an `if:` condition, show as partial: pipegen can't tell when they run.",
   'A tool and a test joined on one line, like `{ tool; [[ … ]] } || true`, can hide a failing tool, and pipegen may still count it as covered (rare).',
   "Commands inside `bash -c '…'` or a quoted `\"$(…)\"` aren't read, so a tool run there shows as partial or missing.",
   "A `runs-on` set by an expression is read as Linux.",
   'Tools inside shell functions, and jobs whose matrix includes Windows, show as partial.',
-  'Very large repos (over 10,000 folders with runs, or 5,000 services) show some checks as unknown.',
+  `Very large repos show some checks as unknown: past ${num(L.workflows)} workflow files, ${num(L.jobs)} jobs in a workflow, ${num(L.steps)} steps in a job or action, `
+    + `${num(L.localFiles)} local workflows and actions followed, ${num(L.runTextMb)} MB of run text, ${num(L.stepVisits)} steps visited in all, `
+    + `${num(L.hits)} tool findings, ${num(L.hitDirs)} folders with runs, or ${num(L.services)} services.`,
   "Reusable workflows from other repos, and actions from your own account, can't be looked inside: those checks show as unknown.",
+  "A local action or reusable workflow that calls another local one isn't followed past the first level, so those checks show as unknown.",
   // Plan U Task 5 fix round 2 (review M4): limits of the checks Task 5 added, each erring toward covered
   "`tox` counts as your own test run whatever environments its config lists: pipegen doesn't read tox's env_list.",
+  "A tox or nox run whose environments a TOX… or NOX… variable in the job picks (like TOXENV from a matrix) shows as partial: pipegen doesn't read the variable's value, so it can't tell if the tests run.",
   "Variables that change what runs (SKIP for pre-commit, TOX… and NOX… for tox and nox, NPM_CONFIG_DRY_RUN) aren't seen when an action from another repo sets them, or when a step writes them under a name built while it runs.",
   "A pre-commit hook pinned to a commit SHA (`rev:`) isn't checked to be a commit of the hook's own repo, so it could come from a fork.",
   'pipegen knows the PyPI publish action up to v1.14.3: a newer release pinned by its commit SHA shows as partial until pipegen is updated.',
@@ -113,13 +127,16 @@ interface Ctx {
   usd(n: number): string;
   /** The capabilities, for the merge gate's note on a plan without a merge lock. */
   mergeLock: boolean;
+  /** The check's service builds no image (buildsNoImage): signing is named "Release signing" (final review M4). */
+  noImage(need: Pick<Need, 'service'>): boolean;
 }
 
-function ctxFor(target: OutputTarget, knownValues: readonly string[], mergeLock: boolean): Ctx {
+function ctxFor(target: OutputTarget, knownValues: readonly string[], mergeLock: boolean, services: AuditReport['profile']['services'] = []): Ctx {
   const clean = makeSafeOutput(knownValues);
   return {
     target,
     mergeLock,
+    noImage: (need) => buildsNoImage(need, { services }),
     v: (s, max = OUTPUT_CAP.name) => clean(s, { target, max }),
     own: (s, max = OUTPUT_CAP.text) => clean(s, { target, max, redact: false }),
     // Markdown: safeMarkdown puts U+200B and a backslash before the $, so GitHub math can't start
@@ -127,10 +144,6 @@ function ctxFor(target: OutputTarget, knownValues: readonly string[], mergeLock:
   };
 }
 
-const money = (n: number) => `$${(Number.isFinite(n) ? n : 0).toFixed(2)}`;
-const num = (n: number) => (Number.isFinite(n) ? n : 0).toLocaleString('en-US');
-const plural = (n: number, one: string, many: string) => `${num(n)} ${n === 1 ? one : many}`;
-const size = (bytes: number) => (bytes >= 1024 * 1024 ? `about ${(bytes / (1024 * 1024)).toFixed(1)} MB` : `about ${Math.max(1, Math.round(bytes / 1024))} KB`);
 const text = (t: string): Block => ({ kind: 'text', text: t });
 const item = (t: string, depth = 0, warn = false): Block => ({ kind: 'item', text: t, depth, warn });
 /** Appends without spreading into a call: `xs` can be as long as the repo makes it. */
@@ -192,14 +205,15 @@ function layerStatus(v: LayerView): string {
 }
 
 /** A check's plain-English name (needLabel), or its cleaned id when pipegen doesn't know it, with the service. */
-const checkLabel = (c: Ctx, id: string, service: string | undefined) => `${needLabel(id) ?? c.v(id)}${service === undefined ? '' : ` for ${c.v(service)}`}`;
+const checkLabel = (c: Ctx, need: Pick<Need, 'id' | 'service'>) =>
+  `${needLabel(need.id, { noImage: c.noImage(need) }) ?? c.v(need.id)}${need.service === undefined ? '' : ` for ${c.v(need.service)}`}`;
 const lowerFirst = (s: string) => (/^[A-Z][a-z]/.test(s) ? `${s[0]?.toLowerCase()}${s.slice(1)}` : s);
 
 function row(c: Ctx, cov: Coverage): Row {
   const by = cov.by === undefined ? null : c.v(cov.by, OUTPUT_CAP.path);
   const where = cov.where === undefined ? null : c.v(cov.where, OUTPUT_CAP.path);
   return {
-    serious: isSerious(cov), status: cov.status, check: checkLabel(c, cov.need.id, cov.need.service), why: c.v(cov.why, OUTPUT_CAP.text),
+    serious: isSerious(cov), status: cov.status, check: checkLabel(c, cov.need), why: c.v(cov.why, OUTPUT_CAP.text),
     found: by !== null && where !== null ? `${by} in ${where}` : by ?? where,
   };
 }
@@ -274,7 +288,7 @@ function aiBlocks(ai: AuditAi, reviewedUnavailable: boolean, c: Ctx): Block[] {
   if (ai.extraNeeds.length === 0) blocks.push(text('The AI suggests no extra checks.'));
   for (const n of ai.extraNeeds) {
     const when = LAYER_WHEN[n.layer] ?? c.v(n.layer);
-    blocks.push(item(`the AI also suggests checking ${lowerFirst(checkLabel(c, n.id, n.service))}, ${when}: ${c.v(n.why, OUTPUT_CAP.text)}`));
+    blocks.push(item(`the AI also suggests checking ${lowerFirst(checkLabel(c, n))}, ${when}: ${c.v(n.why, OUTPUT_CAP.text)}`));
   }
   if (ai.suggestions.length > 0) {
     blocks.push(text('Tools the AI mentions (not reviewed, never run by pipegen):'));
@@ -298,13 +312,16 @@ function aiCostText(ai: AuditAi, c: Ctx): string {
     return `no cost counted: Ollama runs the model itself, not a paid API (${plural(calls, 'AI call', 'AI calls')}).`;
   }
   if (calls === 0 && !(ai.costUsd > 0)) {
-    return "No AI usage was recorded. (A call that ended without reporting its usage, such as a timeout, isn't counted.)";
+    const cap = typeof ai.capUsd === 'number' && Number.isFinite(ai.capUsd) ? ` The limit you agreed to: ${c.usd(ai.capUsd)}.` : '';
+    return `No AI usage was recorded. (A call that ended without reporting its usage, such as a timeout, isn't counted.)${cap}`;
   }
   const cost = ai.costUsd > 0 && ai.costUsd < 0.005 ? `less than ${c.usd(0.01)}` : `about ${c.usd(ai.costUsd)}`;
   const u = ai.usage;
   const cached = u.cacheReadTokens + u.cacheWriteTokens;
   const tokens = `${num(u.inputTokens)} input${cached > 0 ? ` (plus ${num(cached)} cached)` : ''} and ${num(u.outputTokens)} output tokens`;
-  return `${cost} at list price (${plural(calls, 'AI call', 'AI calls')}; ${tokens}).`;
+  // final review M6: the limit the user agreed to on the consent screen (the full setup's cap below is another number)
+  const cap = typeof ai.capUsd === 'number' && Number.isFinite(ai.capUsd) ? `; the limit you agreed to: ${c.usd(ai.capUsd)}` : '';
+  return `${cost} at list price (${plural(calls, 'AI call', 'AI calls')}; ${tokens})${cap}.`;
 }
 
 function addSection(r: AuditReport, c: Ctx): Section {
@@ -312,7 +329,7 @@ function addSection(r: AuditReport, c: Ctx): Section {
   if (r.wouldAdd.length > 0) {
     blocks.push(text("For each check that isn't covered:"));
     for (const w of r.wouldAdd) {
-      blocks.push(item(`${checkLabel(c, w.need.id, w.need.service)}, ${LAYER_WHEN[w.need.layer]} (now ${w.status}): ${toolText(c, w)}`));
+      blocks.push(item(`${checkLabel(c, w.need)}, ${LAYER_WHEN[w.need.layer]} (now ${w.status}): ${toolText(c, w)}`));
     }
   }
   if (r.testsNote !== null) blocks.push(text(c.v(r.testsNote, OUTPUT_CAP.text)));
@@ -467,7 +484,7 @@ function terminalBlocks(blocks: Block[], out: string[]): void {
 
 /** The report for the terminal: plain text, no colours, lines wrapped at 100 characters. */
 export function renderTerminal(r: AuditReport, opts: RenderOptions): string {
-  return terminalDoc(buildDoc(r, ctxFor('terminal', opts.knownValues, r.capabilities.branchProtection === true)));
+  return terminalDoc(buildDoc(r, ctxFor('terminal', opts.knownValues, r.capabilities.branchProtection === true, r.profile.services)));
 }
 
 function terminalDoc(doc: Doc): string {
@@ -519,7 +536,7 @@ function markdownBlocks(blocks: Block[], out: string[]): void {
 
 /** The report as a Markdown file (`--out`): every value through safeMarkdown, every excluded pattern listed. */
 export function renderMarkdown(r: AuditReport, opts: RenderOptions): string {
-  const doc = buildDoc(r, ctxFor('markdown', opts.knownValues, r.capabilities.branchProtection === true));
+  const doc = buildDoc(r, ctxFor('markdown', opts.knownValues, r.capabilities.branchProtection === true, r.profile.services));
   const at = (opts.now ?? Date.now)();
   const date = Number.isFinite(at) ? `Audited on ${new Date(at).toISOString().slice(0, 10)}. ` : '';
   const lines = [`# ${doc.title}`, '', `${date}${doc.intro.join(' ')}`, '', `**Verdict:** ${doc.verdict ?? ''}`];
@@ -533,7 +550,7 @@ export function renderMarkdown(r: AuditReport, opts: RenderOptions): string {
 // ---------- JSON (ruling S13) ----------
 
 /** Keys whose strings are prose (why texts, notes, basis lines): the long cap. */
-const PROSE_KEYS: ReadonlySet<string> = new Set(['why', 'note', 'notes', 'basis', 'reasons', 'text', 'limits', 'nextStep', 'testsNote', 'message']);
+const PROSE_KEYS: ReadonlySet<string> = new Set(['why', 'note', 'notes', 'basis', 'reasons', 'text', 'limits', 'nextStep', 'testsNote', 'message', 'cantSee']);
 /** Keys that hold one of pipegen's own fixed commands: written as they are when isOwnCommand holds (U17). */
 const COMMAND_KEYS: ReadonlySet<string> = new Set(['command', 'nextCommand']);
 /** Keys whose strings are paths (or lists of paths): a larger cap than names. */
@@ -583,9 +600,12 @@ function deepClean(v: unknown, key: string, depth: number, own: boolean, clean: 
   }
 }
 
-/** The report as JSON (`--json`): JSON.stringify(deepClean(r), null, 2), with wouldAdd tools slimmed. */
+/**
+ * The report as JSON (`--json`): JSON.stringify(deepClean(r), null, 2), with wouldAdd tools slimmed, plus `cantSee`
+ * (CANT_SEE: the limits the human report always shows; final review M7).
+ */
 export function renderJson(r: AuditReport, opts: RenderOptions): string {
-  const slim = { ...r, wouldAdd: r.wouldAdd.map((w) => ({ ...w, tool: slimTool(w.tool) })) };
+  const slim = { ...r, wouldAdd: r.wouldAdd.map((w) => ({ ...w, tool: slimTool(w.tool) })), cantSee: CANT_SEE };
   return JSON.stringify(deepClean(slim, '', 0, false, makeSafeOutput(opts.knownValues), new Set()), null, 2);
 }
 

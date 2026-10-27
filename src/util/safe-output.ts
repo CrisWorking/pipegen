@@ -1,8 +1,8 @@
 // The one output helper (Plan U ruling U10, with the T2b known-value carry-forward): every repo-, GitHub- or
 // AI-derived string that `pipegen audit` (terminal, Markdown, JSON) or `pipegen inspect` prints goes through
 // safeOutput(), and nothing else cleans those strings. In order:
-// 1. the cleaning safeText does (ANSI/OSC, control and bidi characters), plus every invisible (default-ignorable)
-//    character and line separator, so a value split by one of them is seen whole by the next two steps;
+// 1. the cleaning safeText does (ANSI/OSC, control and bidi characters, every invisible (default-ignorable) character
+//    and line separator), so a value split by one of them is seen whole by the next two steps;
 // 2. scrubKnownValues(knownValues): the GitHub token and the AI key in use, which redact() may not recognise;
 // 3. redact(): secret-like text (a token or key used as a file, folder or service name);
 // 4. safeText() for the terminal and JSON, or safeMarkdown() for Markdown, with the length cap;
@@ -31,8 +31,6 @@ export const TOO_LONG = '(value too long to show)';
  */
 export const MIN_KNOWN_VALUE = 8;
 
-const INVISIBLE = /[\p{Default_Ignorable_Code_Point}\ufff9-\ufffb]/gu;
-const LINE_SEP = /[\u2028\u2029]/g;
 const NO_CUT = Number.MAX_SAFE_INTEGER;
 
 /** Options for one value; `knownValues` is given to makeSafeOutput instead. */
@@ -53,6 +51,19 @@ export interface SafeOutputOptions extends CleanOptions {
   knownValues?: readonly string[];
 }
 
+/** The environment variables whose values pipegen never prints nor sends to an AI (ruling S19): the GitHub token and the AI keys. */
+export const KNOWN_VALUE_VARS = Object.freeze(['GITHUB_TOKEN', 'ANTHROPIC_API_KEY', 'OPENAI_API_KEY'] as const);
+
+/** The values of KNOWN_VALUE_VARS set in `env`, each as given and trimmed (one list for audit and inspect). */
+export function knownValuesFrom(env: Readonly<Record<string, string | undefined>>): string[] {
+  const out: string[] = [];
+  for (const name of KNOWN_VALUE_VARS) {
+    const value = env[name];
+    if (typeof value === 'string' && value.trim() !== '') out.push(value, value.trim());
+  }
+  return out;
+}
+
 /** The known values worth scrubbing: strings of at least MIN_KNOWN_VALUE characters once trimmed. */
 export function usableKnownValues(values: readonly unknown[] | undefined): string[] {
   return (values ?? []).filter((v): v is string => typeof v === 'string' && v.trim().length >= MIN_KNOWN_VALUE);
@@ -63,7 +74,7 @@ export function makeSafeOutput(knownValues: readonly unknown[] | undefined): (s:
   const known = usableKnownValues(knownValues);
   const scrub = known.length > 0 ? knownValueScrubber(known) : null;
   return (s, opts) => {
-    let v = safeText(String(s), NO_CUT).replace(INVISIBLE, '').replace(LINE_SEP, ' ');
+    let v = safeText(String(s), NO_CUT); // safeText strips the invisible characters and line separators too (T6)
     if (scrub !== null) v = scrub(v);
     if (opts.redact !== false) v = redact(v);
     if (v === LONG_LINE) v = TOO_LONG;

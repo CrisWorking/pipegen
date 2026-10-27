@@ -19,7 +19,7 @@ import { z } from 'zod';
 import {
   CANDIDATES_MAX_OUTPUT_TOKENS, CANDIDATES_REQUEST_MAX_BYTES, MAX_DISCOVERY_NEEDS, NEEDS_MAX_OUTPUT_TOKENS,
 } from '../engine/discovery-limits.js';
-import { withRateLimit, type RateClock } from '../engine/github-rate.js';
+import { isRateStop, withRateLimit, type RateClock } from '../engine/github-rate.js';
 import { DEFAULT_MODEL, type AiRequest, type AiUsage, type Layer, type Plan, type RepoProfile } from '../types.js';
 import { fallbackEnabled } from '../util/claude-fallback.js';
 import { isOutputLimit } from '../util/output-limit.js';
@@ -30,7 +30,11 @@ import { safeText } from '../util/safe-text.js';
 /** How the basis line starts when the activity count is a lower bound (Activity.capped); the audit report reads it. */
 export const ACTIVITY_CAPPED_PREFIX = 'Activity: at least';
 export type AiStage = 'needs' | 'debate' | 'creators' | 'fix-loop';
-/** Pushes and pull requests opened in the last 30 days. `capped`: the event list (300 events) or the pull request pages (1,000) ended inside the window, so the counts are lower bounds. */
+/**
+ * Pushes and pull requests opened in the last 30 days. `capped`: a list stopped before the start of the 30 days (the
+ * event list's 300-event limit, the 1,000 pull requests pipegen reads, or a rate stop on a later page), so the counts
+ * are lower bounds.
+ */
 export interface Activity { pushes: number; prs: number; capped: boolean }
 /** The CI jobs of each layer (plus nightly), each named by its need category. Build it with jobCategories() (src/engine/needs.ts). */
 export type JobCategories = Record<Layer | 'nightly', string[]>;
@@ -310,7 +314,8 @@ export function estimate(p: RepoProfile, jobs: JobCategories, variants: number, 
   basis.push(
     activity.capped
       ? `${ACTIVITY_CAPPED_PREFIX} ${plural(pushes, 'push', 'pushes')} and at least ${plural(prs, 'pull request', 'pull requests')} in the last 30 days `
-        + `(GitHub lists only the last ${EVENT_PAGES * PER_PAGE} events and pipegen reads at most ${(PR_PAGES * PER_PAGE).toLocaleString('en-US')} pull requests).`
+        + `(pipegen couldn't read back to the start of the 30 days: GitHub lists only the last ${EVENT_PAGES * PER_PAGE} events, pipegen reads at most `
+        + `${(PR_PAGES * PER_PAGE).toLocaleString('en-US')} pull requests, and it stops at GitHub's rate limit).`
       : `Activity: ${plural(pushes, 'push', 'pushes')} and ${plural(prs, 'pull request', 'pull requests')} in the last 30 days.`,
     `Monthly minutes: every push runs the push layer; every push to a branch with an open pull request also runs the merge layer; every merged pull request runs the deploy layer; the nightly scan runs ${NIGHTS_PER_MONTH} times.`,
     "GitHub's event list doesn't say which pushes went to a branch with an open pull request, so pipegen approximates them: every push except one per pull request (its merge into the default branch), "
@@ -514,18 +519,37 @@ export function usageCeilingUsd(provider: AiProviderChoice, usage: AiUsage): num
 
 const WINDOW_MS = 30 * 86_400_000;
 const PER_PAGE = 100;
-/** GitHub's repo event list holds at most 300 events (3 pages of 100). */
+/**
+ * GitHub's repo event list holds at most 300 events from the last 30 days (3 pages of 100), and a page can hold fewer
+ * than 100 events while more follow: only the `Link: rel="next"` header says another page exists (Plan U final review
+ * I1; https://docs.github.com/en/rest/activity/events, "About GitHub events", checked 2026-10-27).
+ */
 const EVENT_PAGES = 3;
 /** Pull request pages read at most (1,000 pull requests in 30 days). */
 const PR_PAGES = 10;
 const eventsSchema = z.array(z.object({ type: z.string().nullable(), created_at: z.string().nullable() }));
 const pullsSchema = z.array(z.object({ created_at: z.string() }));
 
+/** True when GitHub's Link header (any letter case of the name) points to a next page. */
+function hasNextPage(res: unknown): boolean {
+  const headers = (res as { headers?: Record<string, unknown> } | null)?.headers;
+  if (headers === undefined || headers === null || typeof headers !== 'object') return false;
+  const link = Object.entries(headers).find(([k]) => k.toLowerCase() === 'link')?.[1];
+  return typeof link === 'string' && /<[^>]*>\s*;\s*rel="?next"?/i.test(link.slice(0, 4096));
+}
+
 /**
  * Pushes (PushEvent in GET /repos/{o}/{r}/events) and pull requests opened (GET /repos/{o}/{r}/pulls?state=all, newest
  * first) in the last 30 days. Every call goes through withRateLimit with the caller's clock and run budget (one
- * newRateBudget() per run); `clock.now` also sets the window. A rate limit (GitHubRateLimitError) or an unreadable
- * answer is thrown, never turned into a zero count.
+ * newRateBudget() per run); `clock.now` also sets the window. Each list is paged by GitHub's `Link: rel="next"` header
+ * (never by a full page: GitHub serves short pages that aren't the last), up to its page cap.
+ * The counts are lower bounds (`capped`) when a list stopped before the start of the 30 days because:
+ * - the event list ended at GitHub's 300-event limit (its last page read; GitHub keeps no more), or the pull request
+ *   pages hit pipegen's cap with a next page left;
+ * - a rate stop (GitHub's limit or the run's spent wait budget) on a later page: what was counted is kept.
+ * A list that ends earlier, without a next page, holds every event or pull request of the 30 days: exact.
+ * A rate limit (GitHubRateLimitError) or an unreadable answer on the FIRST page of either list is thrown, never turned
+ * into a zero count.
  */
 export async function activity30d(gh: Octokit, p: RepoProfile, clock: RateClock): Promise<Activity> {
   const since = (clock.now ?? Date.now)() - WINDOW_MS;
@@ -539,39 +563,51 @@ export async function activity30d(gh: Octokit, p: RepoProfile, clock: RateClock)
     const t = Date.parse(at ?? '');
     return Number.isFinite(t) ? t >= since : undefined;
   };
+  /**
+   * Reads pages 1..maxPages while GitHub says a next page exists and `onPage` hasn't reached the window start. Returns
+   * whether the count is a lower bound: the start wasn't reached and the list was cut (a next page left unread, the
+   * event list's own limit reached, or a rate stop on a later page).
+   */
+  const pagesOf = async <T>(call: (page: number) => Promise<unknown>, schema: z.ZodType<T[]>, what: string, maxPages: number,
+    endsAtLimit: boolean, onPage: (list: T[]) => boolean): Promise<boolean> => {
+    for (let page = 1; page <= maxPages; page++) {
+      let res: unknown;
+      try {
+        res = await withRateLimit(() => call(page), clock);
+      } catch (e) {
+        if (page > 1 && isRateStop(e)) return true; // keep what was counted, as a lower bound
+        throw e;
+      }
+      const reachedStart = onPage(read(schema, (res as { data?: unknown } | null)?.data, what));
+      if (reachedStart) return false;
+      if (!hasNextPage(res)) return endsAtLimit && page === maxPages;
+    }
+    return true; // the page cap, with a next page left
+  };
 
   let pushes = 0;
-  let events = 0;
-  let older = false;
-  for (let page = 1; page <= EVENT_PAGES && !older; page++) {
-    const res = await withRateLimit(() => gh.rest.activity.listRepoEvents({ owner, repo, per_page: PER_PAGE, page }), clock);
-    const list = read(eventsSchema, res.data, 'event list');
-    events += list.length;
-    for (const e of list) {
-      const inside = inWindow(e.created_at);
-      if (inside === false) older = true;
-      else if (inside && e.type === 'PushEvent') pushes++;
-    }
-    if (list.length < PER_PAGE) break;
-  }
+  const eventsCapped = await pagesOf((page) => gh.rest.activity.listRepoEvents({ owner, repo, per_page: PER_PAGE, page }), eventsSchema, 'event list',
+    EVENT_PAGES, true, (list) => {
+      let older = false;
+      for (const e of list) {
+        const inside = inWindow(e.created_at);
+        if (inside === false) older = true;
+        else if (inside && e.type === 'PushEvent') pushes++;
+      }
+      return older;
+    });
 
   let prs = 0;
-  let olderPr = false;
-  let prPagesFull = 0;
-  for (let page = 1; page <= PR_PAGES && !olderPr; page++) {
-    const res = await withRateLimit(() => gh.rest.pulls.list({ owner, repo, state: 'all', sort: 'created', direction: 'desc', per_page: PER_PAGE, page }), clock);
-    const list = read(pullsSchema, res.data, 'pull request list');
-    for (const pr of list) {
-      const inside = inWindow(pr.created_at);
-      if (inside === false) olderPr = true;
-      else if (inside) prs++;
-    }
-    if (list.length < PER_PAGE) break;
-    prPagesFull++;
-  }
+  const prsCapped = await pagesOf((page) => gh.rest.pulls.list({ owner, repo, state: 'all', sort: 'created', direction: 'desc', per_page: PER_PAGE, page }),
+    pullsSchema, 'pull request list', PR_PAGES, false, (list) => {
+      let older = false;
+      for (const pr of list) {
+        const inside = inWindow(pr.created_at);
+        if (inside === false) older = true;
+        else if (inside) prs++;
+      }
+      return older;
+    });
 
-  // Capped: a list that ran out of pages (not of data) while everything was still inside the window; the counts are lower bounds.
-  const eventsCapped = !older && events >= EVENT_PAGES * PER_PAGE;
-  const prsCapped = !olderPr && prPagesFull >= PR_PAGES;
   return { pushes, prs, capped: eventsCapped || prsCapped };
 }

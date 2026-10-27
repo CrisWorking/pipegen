@@ -1042,25 +1042,34 @@ describe('mapCoverage (Task 5, item 2: Python runners)', () => {
     }
   });
 
-  it('python runners (adversarial): uv run wrapping something that is not a test runner, and tox or nox runs that pick other envs → missing', async () => {
+  it('python runners (adversarial): uv run wrapping something that is not a test runner, and tox or nox runs that pick other envs on the command line → missing', async () => {
     for (const steps of [
       run('uv run --group dev python scripts/build.py'), run('uv run --with ruff python -c pass'), run('uv run --with pytest python -c pass'),
       run('uv run --some-new-flag pytest'), run('uv run -qx pytest'), run('tox run -e typing'), run('tox -e py312'), run('tox list'), run('tox run --notest'),
-      run('tox -re lint'), run('tox --override testenv.commands=true'), run('nox -s lint'), run('nox --list'), run('nox -k lint'), run('TOXENV=lint tox'),
-      '      - run: tox run\n        env:\n          TOX_ENV: lint\n', '      - run: tox run\n        env:\n          TOXENV: lint\n',
-      '      - run: nox\n        env:\n          NOXSESSION: lint\n', run('echo "TOXENV=lint" >> "$GITHUB_ENV"') + run('tox run'),
+      run('tox -re lint'), run('tox --override testenv.commands=true'), run('nox -s lint'), run('nox --list'), run('nox -k lint'),
     ]) {
       const dir = makeTempDir();
       ci(dir, steps);
       expect(row(await coverage(dir), 'push', 'unit-tests', 'app').status, steps).toBe('missing');
     }
+  });
+
+  it('python runners (adversarial): a TOX… or NOX… variable that may pick other envs → partial, never covered (Plan U final review I2)', async () => {
+    for (const steps of [
+      run('TOXENV=lint tox'), '      - run: tox run\n        env:\n          TOX_ENV: lint\n', '      - run: tox run\n        env:\n          TOXENV: lint\n',
+      '      - run: nox\n        env:\n          NOXSESSION: lint\n', run('echo "TOXENV=lint" >> "$GITHUB_ENV"') + run('tox run'),
+    ]) {
+      const dir = makeTempDir();
+      ci(dir, steps);
+      expect(row(await coverage(dir), 'push', 'unit-tests', 'app').status, steps).toBe('partial');
+    }
     // an env set for the whole job or workflow picks the envs too
     const dir = makeTempDir();
     wf(dir, 'ci.yml', `${both}env:\n  TOX_ENV: lint\n${job(run('tox run'))}`);
-    expect(row(await coverage(dir), 'push', 'unit-tests', 'app').status).toBe('missing');
+    expect(row(await coverage(dir), 'push', 'unit-tests', 'app').status).toBe('partial');
     const dir2 = makeTempDir();
     ci(dir2, run('tox run'), '    env:\n      TOX_ENV: lint\n');
-    expect(row(await coverage(dir2), 'push', 'unit-tests', 'app').status).toBe('missing');
+    expect(row(await coverage(dir2), 'push', 'unit-tests', 'app').status).toBe('partial');
   });
 });
 
@@ -1714,5 +1723,55 @@ describe('mapCoverage (Task 5 fix round 4)', () => {
       return '      - uses: ./n\n';
     });
     expect(nodeHooks).toBe('covered');
+  });
+});
+
+// ---------- Plan U final review I2: a visible TOX… / NOX… variable makes the run partial, never missing ----------
+
+describe('mapCoverage (Plan U final review I2)', () => {
+  const TOX_WHY = "Your own `tox run` runs, but a TOX… variable in this job (like TOXENV) picks which tox environments run, so pipegen can't tell if it runs the tests.";
+  const testRows = (rows: Coverage[]) => [row(rows, 'push', 'unit-tests', 'app'), row(rows, 'merge', 'unit-tests', 'app'), row(rows, 'merge', 'full-tests', 'app')];
+
+  it('I2: the flask shape (TOX_ENV from the matrix on `uv run … tox run`) → partial with a plain why, never covered or missing', async () => {
+    const dir = makeTempDir();
+    const matrix = "    strategy:\n      matrix:\n        include:\n          - {python: '3.14'}\n          - {name: Minimum Versions, python: '3.14', tox: tests-min}\n";
+    const steps = '      - uses: actions/checkout@v4\n      - run: uv run --locked --no-default-groups --group dev tox run\n'
+      + "        env:\n          TOX_ENV: ${{ matrix.tox || format('py{0}', matrix.python) }}\n";
+    ci(dir, steps, matrix);
+    for (const r of testRows(await coverage(dir))) expect(r, `${r.need.layer} ${r.need.id}`).toMatchObject({ status: 'partial', by: 'your own `tox run`', why: TOX_WHY });
+  });
+
+  it('I2: TOXENV from a matrix value, set for the step, the job or the workflow, inline or through GITHUB_ENV → partial', async () => {
+    const matrix = '    strategy:\n      matrix:\n        toxenv: [py312, py313]\n';
+    for (const [body, by] of [
+      [`${both}${job('      - run: tox run\n        env:\n          TOXENV: ${{ matrix.toxenv }}\n', matrix)}`, 'your own `tox run`'],
+      [`${both}${job(run('tox'), `${matrix}    env:\n      TOXENV: \${{ matrix.toxenv }}\n`)}`, 'your own `tox`'],
+      [`${both}env:\n  TOXENV: lint\n${job(run('tox'))}`, 'your own `tox`'],
+      [`${both}${job(run('TOXENV=lint tox'))}`, 'your own `tox`'],
+      [`${both}${job(run('echo "TOXENV=lint" >> "$GITHUB_ENV"') + run('tox run'))}`, 'your own `tox run`'],
+    ]) {
+      const dir = makeTempDir();
+      wf(dir, 'ci.yml', body as string);
+      for (const r of testRows(await coverage(dir))) {
+        expect(r.status, body).toBe('partial');
+        expect(r.by, body).toBe(by);
+        expect(r.why, body).toMatch(/a TOX… variable in this job \(like TOXENV\) picks which tox environments run, so pipegen can't tell if it runs the tests\.$/);
+      }
+    }
+  });
+
+  it('I2: a NOX… variable (NOXSESSION) makes a nox run partial the same way', async () => {
+    const dir = makeTempDir();
+    ci(dir, '      - run: nox\n        env:\n          NOXSESSION: ${{ matrix.session }}\n');
+    for (const r of testRows(await coverage(dir))) {
+      expect(r).toMatchObject({ status: 'partial', by: 'your own `nox`' });
+      expect(r.why).toBe("Your own `nox` runs, but a NOX… variable in this job (like NOXSESSION) picks which nox sessions run, so pipegen can't tell if it runs the tests.");
+    }
+  });
+
+  it('I2: another run that covers the tests still wins over the partial tox run', async () => {
+    const dir = makeTempDir();
+    ci(dir, '      - run: tox run\n        env:\n          TOXENV: ${{ matrix.toxenv }}\n' + run('pytest'));
+    expect(row(await coverage(dir), 'push', 'unit-tests', 'app')).toMatchObject({ status: 'covered', by: 'your own `pytest`' });
   });
 });

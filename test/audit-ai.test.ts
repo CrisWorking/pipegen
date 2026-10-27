@@ -305,7 +305,8 @@ describe('addAiSuggestions (controller rulings)', () => {
   it('S11: ai holds extraNeeds, suggestions, notes and usage', async () => {
     const s = await setup();
     const out = await addAiSuggestions(s.r, s.dir, s.deps);
-    expect(Object.keys(out.ai ?? {}).sort()).toEqual(['attempts', 'costUsd', 'extraNeeds', 'local', 'notes', 'suggestions', 'usage']);
+    expect(Object.keys(out.ai ?? {}).sort()).toEqual(['attempts', 'capUsd', 'costUsd', 'extraNeeds', 'local', 'notes', 'suggestions', 'usage']);
+    expect(out.ai?.capUsd).toBe(s.deps.capUsd); // final review M6: the limit the user agreed to
     expect(new Set(out.ai?.notes).size).toBe(out.ai?.notes.length); // deduped
     expect(out.ai?.notes).toContain(ONLY_ACTIONS_NPM);
     // the rest of the report is buildAudit's

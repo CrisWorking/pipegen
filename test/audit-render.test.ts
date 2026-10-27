@@ -435,6 +435,20 @@ describe('rulings', () => {
     expect(cantSee).toBeLessThan(t.indexOf('Next step'));
   });
 
+  it('M3 (Plan U final review): the "can\'t see" list names every case the code reads as unknown or partial', () => {
+    const all = CANT_SEE.join(' ');
+    // a local action or reusable workflow that calls another local one: unknown (U24, N9)
+    expect(all).toContain('A local action or reusable workflow that calls another local one');
+    // the per-run budgets, with the numbers the coverage code uses
+    for (const part of ['200 workflow files', '100 jobs in a workflow', '200 steps in a job or action', '100 local workflows and actions',
+      '16 MB of run text', '50,000 steps', '10,000 folders with runs', '5,000 services']) expect(all, part).toContain(part);
+    // a visible TOX… or NOX… variable: partial (final review I2)
+    expect(all).toContain('A tox or nox run whose environments a TOX… or NOX… variable in the job picks (like TOXENV from a matrix) shows as partial');
+    // paths filters and if: conditions: partial
+    expect(all).toContain('`paths:` or `paths-ignore:`');
+    expect(all).toContain('`if:` condition');
+  });
+
   it('permissions: every row of the full run\'s table, permission and why', () => {
     const r = report();
     for (const text of [term(r), md(r)]) {

@@ -37,9 +37,10 @@
 //   scripts it calls (each worked out once; a cycle adds nothing): what it runs for tests, lint or format-lint counts,
 //   under "your own `npm run <name>`". A name only fixes (a :fix/-fix/:write part) never counts, also for lint:fix.
 //   Flags after the name other than --silent, -s and --if-present (npm's --workspace, pnpm's --filter) stop it.
-// - tox / tox run and nox are the project's own test runner unless the command line or an env var (TOX…, NOX…, in
-//   the job's env or run text) picks other envs or sessions. `uv run` and `nyc` flags are matched against their full
-//   lists (a flag pipegen doesn't know: no command); pipenv run is a wrapper.
+// - tox / tox run and nox are the project's own test runner unless the command line picks other envs or sessions
+//   (then no run). An env var that may pick them (TOX…, NOX…, in the job's env or run text, a matrix value included)
+//   makes the run partial (Plan U final review I2): never covered, never missing. `uv run` and `nyc` flags are
+//   matched against their full lists (a flag pipegen doesn't know: no command); pipenv run is a wrapper.
 // - .pre-commit-config.yaml: `meta` hooks never count; a local hook only by its `entry` (never `language: fail` or
 //   `pygrep`); a hook of a repo listed in tool signatures (`precommitHooks`) by its id or its `entry`; a hook of any
 //   other repo is partial (`hook-repo`). `args` are read for soft flags; an entry is one command (no shell). A hook
@@ -103,6 +104,11 @@ export interface Coverage { need: Need; status: 'covered' | 'partial' | 'missing
 export interface MapCoverageOptions {
   /** How many workflow files readWorkflows skipped (unreadable, over the cap): rows that would be missing say unknown. */
   skippedWorkflows?: number;
+  /**
+   * Plan U final review M4: true for a need whose service builds no image (a package that is released, not run), so the
+   * signing and attestation whys talk about the release, not an image. Default: always false.
+   */
+  noImage?: (need: Need) => boolean;
 }
 
 // ---------- tool signatures (ruling S1) ----------
@@ -275,6 +281,15 @@ const MAX_HIT_DIRS = 10_000;       // distinct dirs (besides the root) that runs
 const MAX_SERVICES = 5_000;        // services matched against run dirs; with more, per-service needs count only runs at
                                    // the root, and their rows can't be missing (review C1)
 
+/**
+ * The per-run budgets past which rows read unknown (never covered, never missing), for the report's "what this audit
+ * can't see" list (Plan U final review M3), so the numbers it prints are the ones the code uses.
+ */
+export const COVERAGE_LIMITS = Object.freeze({
+  workflows: MAX_WORKFLOWS, jobs: MAX_JOBS, steps: MAX_STEPS, localFiles: MAX_LOCAL_FILES, runTextMb: MAX_SCAN_BYTES / 1_000_000,
+  stepVisits: MAX_STEP_VISITS, hits: MAX_HITS, hitDirs: MAX_HIT_DIRS, services: MAX_SERVICES,
+});
+
 // ---------- why (pipegen's own text only) ----------
 
 const MISSING_WHY: Readonly<Record<string, string>> = {
@@ -294,6 +309,11 @@ const MISSING_WHY: Readonly<Record<string, string>> = {
   sbom: 'Without an SBOM, nobody can tell later which components went into a build.',
   signing: 'Without image signing, nothing proves that a deployed image came from this pipeline.',
   attestation: 'Without an attestation, nothing records how and where the image was built.',
+};
+/** Plan U final review M4: the same, for a package that is released and builds no image. */
+const RELEASE_MISSING_WHY: Readonly<Record<string, string>> = {
+  signing: 'Without release signing, nothing proves that a published release came from this pipeline.',
+  attestation: 'Without an attestation, nothing records how and where the release was built.',
 };
 const PRECOMMIT_SECRETS_WHY = 'Without a secret scan before commit, a leaked key is in git history forever.';
 const GATE_WHY = 'No single required check sums up every scan, so a pull request with a failing scan can still be merged.';
@@ -321,12 +341,13 @@ const LAYER_DONE: Readonly<Record<Exclude<Layer, 'pre-commit'>, string>> = {
 
 /** Why a run that is found can't block anything (or might not run). */
 type Reason = 'continue' | 'suppressed' | 'function' | 'soft' | 'inputs' | 'no-fail' | 'never' | 'condition'
-  | 'hook-repo' | 'files' | 'stage' | 'skip' | 'ref';
+  | 'hook-repo' | 'files' | 'stage' | 'skip' | 'ref' | 'tox-env' | 'nox-env';
 /**
  * Reasons that say the tool may not run at all (not just "can't block"): they make even a need that doesn't block
- * (format-lint) partial. Task 5 fix round 1 adds the pre-commit ones (hook-repo, files, stage) and SKIP.
+ * (format-lint) partial. Task 5 fix round 1 adds the pre-commit ones (hook-repo, files, stage) and SKIP; the Plan U
+ * final review (I2) adds a TOX… or NOX… variable that picks what tox or nox runs.
  */
-const MAY_NOT_RUN: ReadonlySet<Reason> = new Set<Reason>(['condition', 'hook-repo', 'files', 'stage', 'skip', 'ref']);
+const MAY_NOT_RUN: ReadonlySet<Reason> = new Set<Reason>(['condition', 'hook-repo', 'files', 'stage', 'skip', 'ref', 'tox-env', 'nox-env']);
 const REASON_WHY: Readonly<Record<Reason, (subject: string, when: string) => string>> = {
   continue: (s) => `${s} runs, but is allowed to fail (continue-on-error), so it can't block anything.`,
   suppressed: (s) => `${s} runs, but its exit code is ignored (by ||, a pipe, an if, set +e, the background & or the step's shell), so it can't block anything.`,
@@ -341,6 +362,8 @@ const REASON_WHY: Readonly<Record<Reason, (subject: string, when: string) => str
   stage: (s) => `${s} is set up for another pre-commit stage, so it doesn't run before each commit.`,
   skip: (s) => `${s} runs, but SKIP is set in this job, so some pre-commit hooks don't run here.`,
   ref: (s) => `${s} runs at a version pipegen can't place, so pipegen can't tell whether it does this check.`,
+  'tox-env': (s) => `${s} runs, but a TOX… variable in this job (like TOXENV) picks which tox environments run, so pipegen can't tell if it runs the tests.`,
+  'nox-env': (s) => `${s} runs, but a NOX… variable in this job (like NOXSESSION) picks which nox sessions run, so pipegen can't tell if it runs the tests.`,
 };
 
 const HOOK_PLACE = { 'pre-commit': 'the pre-commit framework', husky: 'the husky pre-commit hook', lefthook: 'the lefthook pre-commit hook' } as const;
@@ -1781,13 +1804,19 @@ function gateOf(texts: readonly string[], envs: readonly unknown[], base: EnvGat
   };
 }
 /**
- * Drops the tox / nox runs an env var may point elsewhere and an npm publish NPM_CONFIG_DRY_RUN makes a dry run. With
- * SKIP set (fix round 1, I3), `pre-commit run` itself is partial (some hooks don't run) and its hooks' tools aren't
- * carried over.
+ * Applies the job's env gate. A tox / nox run whose envs or sessions a TOX… / NOX… variable may pick is kept as
+ * partial (Plan U final review I2: pipegen can't tell what it runs, so it is never covered, and never missing either);
+ * that reason comes first, since it says the tests may not run at all. An npm publish NPM_CONFIG_DRY_RUN makes a dry
+ * run is dropped (it publishes nothing, so no attestation). With SKIP set (fix round 1, I3), `pre-commit run` itself is
+ * partial (some hooks don't run) and its hooks' tools aren't carried over.
  */
 const gated = (found: Found[], g: EnvGate): Found[] => found
-  .filter((f) => !((f.envGate === 'tox' && g.tox) || (f.envGate === 'nox' && g.nox) || (f.envGate === 'npm' && g.npm)))
-  .map((f) => (g.skip && f.by === PRE_COMMIT_ID ? { ...f, hookRun: false, reason: f.reason ?? 'skip' } : f));
+  .filter((f) => !(f.envGate === 'npm' && g.npm))
+  .map((f) => {
+    if (f.envGate === 'tox' && g.tox) return { ...f, reason: 'tox-env' as const };
+    if (f.envGate === 'nox' && g.nox) return { ...f, reason: 'nox-env' as const };
+    return g.skip && f.by === PRE_COMMIT_ID ? { ...f, hookRun: false, reason: f.reason ?? 'skip' } : f;
+  });
 
 interface StepCtx {
   fit: Fit;
@@ -2707,9 +2736,10 @@ class Scope {
   }
 }
 
-function missingWhy(need: Need): string {
+function missingWhy(need: Need, d?: Pick<Decide, 'noImage'>): string {
   if (need.layer === 'pre-commit' && need.category === 'secrets') return PRECOMMIT_SECRETS_WHY;
-  return MISSING_WHY[need.category] ?? FALLBACK_MISSING_WHY;
+  const release = d !== undefined && Object.hasOwn(RELEASE_MISSING_WHY, need.category) && d.noImage(need) ? RELEASE_MISSING_WHY[need.category] : undefined;
+  return release ?? MISSING_WHY[need.category] ?? FALLBACK_MISSING_WHY;
 }
 
 const located = (h: { by?: string; where: string }) => ({ ...(h.by === undefined ? {} : { by: h.by }), where: h.where });
@@ -2724,7 +2754,7 @@ function reasonWhy(h: { subject: string; partialWhy?: string }, reason: Reason, 
   return (reason === 'never' || reason === 'ref') && h.partialWhy !== undefined ? h.partialWhy : REASON_WHY[reason](h.subject, when);
 }
 
-interface Decide { ci: Firsts; hooks: Firsts; scope: Scope; dirsCapped: boolean; truncated: boolean; unreadable: boolean }
+interface Decide { ci: Firsts; hooks: Firsts; scope: Scope; dirsCapped: boolean; truncated: boolean; unreadable: boolean; noImage: (need: Need) => boolean }
 
 /** A per-service need that a cap kept pipegen from checking in full: never missing, never covered by the cap. */
 const capped = (need: Need, d: Decide) => need.service !== undefined && (d.scope.capped || d.dirsCapped);
@@ -2751,7 +2781,7 @@ function ciCoverage(need: Need, layer: CiLayer, d: Decide): Coverage {
   // Task 5 fix round 1 (C1): a version known not to do this check (pypi-publish before v1.11.0): missing, saying why
   const old = d.ci.first(`${OLD_PREFIX}${need.category}`, dirs, layer, [FN, FC, FO, NF]);
   if (old && old.partialWhy !== undefined) return { need, status: 'missing', ...located(old), why: old.partialWhy };
-  return { need, status: 'missing', why: missingWhy(need) };
+  return { need, status: 'missing', why: missingWhy(need, d) };
 }
 
 function hookCoverage(need: Need, hooks: Hooks, d: Decide): Coverage {
@@ -2819,7 +2849,7 @@ export async function mapCoverage(p: RepoProfile, needs: Need[], dir: string, op
   })), dirs);
   const d: Decide = {
     ci, hooks: hookRuns, scope: new Scope(p.services, dirs), dirsCapped: dirs.capped,
-    truncated: ctx.budget.truncated, unreadable: ctx.unreadable,
+    truncated: ctx.budget.truncated, unreadable: ctx.unreadable, noImage: opts.noImage ?? (() => false),
   };
   return needs.map((need) => {
     if (need.layer === 'pre-commit') return hookCoverage(need, hooks, d);

@@ -662,10 +662,10 @@ describe('probePermissions', () => {
   it('probePermissions: an installation token (ghs_) is probed like a fine-grained token, never through /user/installations', async () => {
     const r = gh({
       [`GET ${API}/repos/o/r`]: repoOk,
-      [`GET ${API}/repos/o/r/actions/secrets/public-key`]: refused(integration, `${S_NAME.toLowerCase()}=read`),
+      [`GET ${API}/repos/o/r/environments`]: refused(integration, 'actions=read'),
     }, installCred());
     const res = await probePermissions(r.gh, 'o', ['r'], { kind: 'installation', mode: 'read', clock: clock() });
-    expect(res.missing.map((m) => m.permission)).toEqual([P(S_NAME, 'read')]);
+    expect(res.missing.map((m) => m.permission)).toEqual(['Actions: read']);
     expect(r.calls.some((c) => c.url.pathname.startsWith('/user/installations'))).toBe(false);
   });
 
@@ -701,12 +701,12 @@ describe('probePermissions', () => {
   it('probePermissions: GET /repos permissions field never used to judge the token', async () => {
     // GET /repos says admin: true (that's the user's role, S1), but every probe is refused → everything missing
     const routes: Routes = { [`GET ${API}/repos/o/r`]: repoOk };
-    for (const p of ['commits', 'pulls', 'actions/workflows', 'actions/secrets/public-key', 'actions/variables', 'actions/permissions']) {
+    for (const p of ['pulls', 'environments', 'code-scanning/analyses']) {
       routes[`GET ${API}/repos/o/r/${p}`] = refused(byPat);
     }
     const { gh: client } = gh(routes);
     const res = await probePermissions(client, 'o', ['r'], { kind: 'fine-grained', mode: 'read', clock: clock() });
-    expect(res.missing.map((m) => m.permission)).toEqual(['Contents: read', 'Pull requests: read', 'Actions: read', P(S_NAME, 'read'), 'Variables: read', 'Administration: read']);
+    expect(res.missing.map((m) => m.permission)).toEqual(['Pull requests: read', 'Actions: read', 'Code scanning alerts: read']);
   });
 
   it('probePermissions: a repo the token can\'t see is reported; write levels a token can\'t show are unchecked, never assumed', async () => {

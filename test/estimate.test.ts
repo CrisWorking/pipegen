@@ -146,7 +146,7 @@ describe('estimate: included minutes (S12)', () => {
 
   it('estimate: capped activity → basis says "at least N pushes"', () => {
     const e = estimate(profile(), JOBS, 2, { pushes: 287, prs: 9, capped: true }, OPUS);
-    expect(e.basis).toContain('Activity: at least 287 pushes and at least 9 pull requests in the last 30 days (GitHub lists only the last 300 events and pipegen reads at most 1,000 pull requests).');
+    expect(e.basis).toContain("Activity: at least 287 pushes and at least 9 pull requests in the last 30 days (pipegen couldn't read back to the start of the 30 days: GitHub lists only the last 300 events, pipegen reads at most 1,000 pull requests, and it stops at GitHub's rate limit).");
     const plain = estimate(profile(), JOBS, 2, ACTIVITY, OPUS);
     expect(plain.basis.join('\n')).not.toMatch(/at least \d+ push/);
     expect(plain.basis).toContain('Activity: 40 pushes and 10 pull requests in the last 30 days.');
@@ -561,8 +561,18 @@ const EVENTS = 'GET https://api.github.com/repos/o/r/events';
 const PULLS = 'GET https://api.github.com/repos/o/r/pulls';
 const page = (c: Call) => Number(c.url.searchParams.get('page') ?? '1');
 
-/** Event pages of 100 from a flat list. */
-const pages = (items: unknown[]) => (c: Call): Reply => ({ body: items.slice((page(c) - 1) * 100, page(c) * 100) });
+/** Pages of 100 from a flat list, with GitHub's `Link: rel="next"` header while more items follow. */
+const pages = (items: unknown[]) => (c: Call): Reply => ({
+  body: items.slice((page(c) - 1) * 100, page(c) * 100),
+  headers: items.length > page(c) * 100 ? { link: nextLink(c, page(c) + 1) } : {},
+});
+/** GitHub's Link header pointing at page `n` of the same list. */
+const nextLink = (c: Call, n: number) => `<${c.url.origin}${c.url.pathname}?per_page=100&page=${n}>; rel="next"`;
+/** Event pages given one by one (GitHub often serves fewer than per_page items on a page that isn't the last). */
+const givenPages = (list: unknown[][]) => (c: Call): Reply => ({
+  body: list[page(c) - 1] ?? [],
+  headers: page(c) < list.length ? { link: nextLink(c, page(c) + 1) } : {},
+});
 
 describe('activity30d', () => {
   it('activity30d: counts pushes and pull requests of the last 30 days', async () => {
@@ -590,7 +600,8 @@ describe('activity30d', () => {
   });
 
   it('activity30d: pull request page limit reached with every PR inside the window → capped', async () => {
-    const prs = Array.from({ length: 1000 }, (_, i) => ({ created_at: iso(i / 40) })); // 25 days spread
+    // 25 days spread; a next page is left after the 10th (final review I1: GitHub's Link header says so)
+    const prs = Array.from({ length: 1001 }, (_, i) => ({ created_at: iso(i / 40) }));
     const { gh, calls } = fakeOctokit({ [EVENTS]: pages([]), [PULLS]: pages(prs) });
     const a = await activity30d(gh, profile(), { budget: newRateBudget(), now: () => NOW });
     expect(a).toEqual({ pushes: 0, prs: 1000, capped: true });
@@ -637,6 +648,49 @@ describe('activity30d', () => {
     const { gh } = fakeOctokit({ [EVENTS]: limited, [PULLS]: pages([]) });
     await expect(activity30d(gh, profile(), { budget: newRateBudget(1_000), now: () => NOW, sleep: async () => {} }))
       .rejects.toBeInstanceOf(GitHubRateLimitError);
+  });
+
+  // ---- Plan U final review I1: GitHub's Link header, not a full page, says whether another page exists ----
+
+  it('activity30d (final review I1): a 97-item page with Link rel="next" is followed; the pushes on page 2 count', async () => {
+    const first = Array.from({ length: 97 }, (_, i) => ({ type: 'WatchEvent', created_at: iso(i / 40) }));
+    const second = [{ type: 'PushEvent', created_at: iso(5) }, { type: 'PushEvent', created_at: iso(6) }, { type: 'WatchEvent', created_at: iso(31) }];
+    const { gh, calls } = fakeOctokit({ [EVENTS]: givenPages([first, second]), [PULLS]: pages([]) });
+    const a = await activity30d(gh, profile(), { budget: newRateBudget(), now: () => NOW });
+    expect(a).toEqual({ pushes: 2, prs: 0, capped: false }); // the event older than 30 days ends the count: exact
+    expect(calls.filter((c) => c.url.pathname.endsWith('/events'))).toHaveLength(2);
+  });
+
+  it('activity30d (final review I1): GitHub\'s event list ends at its 300-event limit inside the 30 days → capped, even with short pages', async () => {
+    const short = (from: number) => Array.from({ length: 97 }, (_, i) => ({ type: i % 2 === 0 ? 'PushEvent' : 'WatchEvent', created_at: iso(from + i / 100) }));
+    const { gh, calls } = fakeOctokit({ [EVENTS]: givenPages([short(0), short(1), short(2)]), [PULLS]: pages([]) });
+    const a = await activity30d(gh, profile(), { budget: newRateBudget(), now: () => NOW });
+    expect(a).toEqual({ pushes: 3 * 49, prs: 0, capped: true });
+    expect(calls.filter((c) => c.url.pathname.endsWith('/events'))).toHaveLength(3);
+    expect(estimate(profile(), JOBS, 2, a, OPUS).basis.join('\n')).toContain('Activity: at least 147 pushes');
+  });
+
+  it('activity30d (final review I1): a list that ends before the limit, with no Link rel="next", is the whole 30 days (exact)', async () => {
+    const first = Array.from({ length: 97 }, () => ({ type: 'PushEvent', created_at: iso(2) }));
+    const { gh, calls } = fakeOctokit({ [EVENTS]: givenPages([first, [{ type: 'PushEvent', created_at: iso(3) }]]), [PULLS]: pages([]) });
+    const a = await activity30d(gh, profile(), { budget: newRateBudget(), now: () => NOW });
+    expect(a).toEqual({ pushes: 98, prs: 0, capped: false });
+    expect(calls.filter((c) => c.url.pathname.endsWith('/events'))).toHaveLength(2);
+  });
+
+  it('activity30d (final review I1): a rate stop on a later page keeps what was counted, as a lower bound (capped)', async () => {
+    const first = Array.from({ length: 97 }, () => ({ type: 'PushEvent', created_at: iso(1) }));
+    const events = (c: Call): Reply => (page(c) === 1
+      ? givenPages([first, []])(c)
+      : { status: 429, body: { message: 'slow down' }, headers: { 'retry-after': '30' } });
+    const prs = Array.from({ length: 100 }, () => ({ created_at: iso(1) }));
+    const pulls = (c: Call): Reply => (page(c) === 1 ? pages([...prs, ...prs])(c) : { status: 429, body: { message: 'slow down' }, headers: { 'retry-after': '30' } });
+    const { gh } = fakeOctokit({ [EVENTS]: events, [PULLS]: pulls });
+    const a = await activity30d(gh, profile(), { budget: newRateBudget(1_000), now: () => NOW, sleep: async () => {} });
+    expect(a).toEqual({ pushes: 97, prs: 100, capped: true });
+    // the first page of a list still has to answer: a rate stop there is thrown, never a zero count
+    const { gh: gh2 } = fakeOctokit({ [EVENTS]: givenPages([first]), [PULLS]: () => ({ status: 429, body: { message: 'slow down' }, headers: { 'retry-after': '30' } }) });
+    await expect(activity30d(gh2, profile(), { budget: newRateBudget(1_000), now: () => NOW, sleep: async () => {} })).rejects.toBeInstanceOf(GitHubRateLimitError);
   });
 
   it('activity30d: an unreadable answer is an error, not a zero count', async () => {

@@ -97,7 +97,7 @@ Notes from the AI step:
 
 - In this version only GitHub Actions and npm packages can become suggestions.
 
-AI cost of this audit: about <U+200B>\$0.42 at list price (2 AI calls; 41,200 input and 3,100 output tokens).
+AI cost of this audit: about <U+200B>\$0.42 at list price (2 AI calls; 41,200 input and 3,100 output tokens); the limit you agreed to: <U+200B>\$5.50.
 
 ## Costs of the full setup (estimates)
 
@@ -197,13 +197,16 @@ These are counts only, never file contents. They were made without the gitleaks 
 ## What this audit can't see
 
 - pipegen checks that a tool runs on the right trigger and can fail the build; it doesn't check the tool's other settings.
+- Workflows limited by `paths:` or `paths-ignore:`, and jobs or steps with an `if:` condition, show as partial: pipegen can't tell when they run.
 - A tool and a test joined on one line, like `{ tool; [[ … ]] } || true`, can hide a failing tool, and pipegen may still count it as covered (rare).
 - Commands inside `bash -c '…'` or a quoted `"$(…)"` aren't read, so a tool run there shows as partial or missing.
 - A `runs-on` set by an expression is read as Linux.
 - Tools inside shell functions, and jobs whose matrix includes Windows, show as partial.
-- Very large repos (over 10,000 folders with runs, or 5,000 services) show some checks as unknown.
+- Very large repos show some checks as unknown: past 200 workflow files, 100 jobs in a workflow, 200 steps in a job or action, 100 local workflows and actions followed, 16 MB of run text, 50,000 steps visited in all, 100,000 tool findings, 10,000 folders with runs, or 5,000 services.
 - Reusable workflows from other repos, and actions from your own account, can't be looked inside: those checks show as unknown.
+- A local action or reusable workflow that calls another local one isn't followed past the first level, so those checks show as unknown.
 - `tox` counts as your own test run whatever environments its config lists: pipegen doesn't read tox's env_list.
+- A tox or nox run whose environments a TOX… or NOX… variable in the job picks (like TOXENV from a matrix) shows as partial: pipegen doesn't read the variable's value, so it can't tell if the tests run.
 - Variables that change what runs (SKIP for pre-commit, TOX… and NOX… for tox and nox, NPM_CONFIG_DRY_RUN) aren't seen when an action from another repo sets them, or when a step writes them under a name built while it runs.
 - A pre-commit hook pinned to a commit SHA (`rev:`) isn't checked to be a commit of the hook's own repo, so it could come from a fork.
 - pipegen knows the PyPI publish action up to v1.14.3: a newer release pinned by its commit SHA shows as partial until pipegen is updated.

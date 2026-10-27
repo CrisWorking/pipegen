@@ -10,7 +10,7 @@ import { probeCapabilities, signingMode, SIGNING_ENVIRONMENT } from '../github/c
 import { getAuth, githubTokenRejected, GitHubAccessError, hideToken, makeOctokit, permissionsTable, readGitHubContext } from '../github/client.js';
 import { NotGitHubRepoError, readProject } from '../read/project.js';
 import type { Auth, Capabilities, RepoProfile, Service } from '../types.js';
-import { makeSafeOutput, OUTPUT_CAP } from '../util/safe-output.js';
+import { knownValuesFrom, makeSafeOutput, OUTPUT_CAP } from '../util/safe-output.js';
 import type { CliIO } from './io.js';
 
 type LocalProfile = Awaited<ReturnType<typeof readProject>>;
@@ -22,8 +22,6 @@ const LOGIN_RE = /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})$/;
 
 /** Cleans one repo- or GitHub-derived string for the terminal (safeOutput with this run's known values). */
 type Clean = (s: string, max?: number) => string;
-/** The environment variables whose values inspect never prints: the GitHub token and the AI keys. */
-const KNOWN_VALUE_VARS = ['GITHUB_TOKEN', 'ANTHROPIC_API_KEY', 'OPENAI_API_KEY'] as const;
 
 const yesNo = (b: boolean) => (b ? 'yes' : 'no');
 /** Cleaned items joined with ", ", at most MAX_LIST, or `none`. */
@@ -143,7 +141,7 @@ export async function inspect(dir: string, io: CliIO, opts: { allowBroad: boolea
   const say = (s: string) => { io.out(hideToken(s, token)); };
   const fail = (s: string) => { io.err(hideToken(s, token)); };
   const notes: string[] = [];
-  const knownValues: string[] = KNOWN_VALUE_VARS.map((v) => io.env[v]).filter((v): v is string => typeof v === 'string');
+  const knownValues: string[] = knownValuesFrom(io.env);
   let clean = makeSafeOutput(knownValues);
   const t: Clean = (s, max = OUTPUT_CAP.name) => clean(s, { target: 'terminal', max });
 

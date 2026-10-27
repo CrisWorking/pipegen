@@ -17,6 +17,7 @@ import { DEFAULT_MODEL, type AiProvider, type Capabilities, type RepoProfile, ty
 import { hostileNames } from './fixtures/hostile-names.js';
 import { CLEAN, makeStub } from './helpers/gitleaks-stub.js';
 import { cleanupRepos, makeTempDir, writeIn } from './helpers/make-repo.js';
+import { fake } from './helpers/secret-repo.js';
 
 const svc = (over: Partial<Service> = {}): Service => ({
   name: 'web', path: '.', language: 'node', packageManager: 'npm', hasTests: true, envVars: [], dependsOn: [], scripts: ['test'], frameworks: ['express'], ...over,
@@ -154,9 +155,8 @@ describe('consentText (full)', () => {
       expect(lines).toHaveLength(1);
       expect(lines[0]).toMatch(/^ {2}- Administration: read and write: Apply the merge rules \(rulesets\), create the deploy and signing environments/);
     }
-    // read-only runs never ask for write: one read row only
-    const read = audit().text.split('\n').filter((l) => /Administration/.test(l));
-    expect(read).toEqual([expect.stringMatching(/^ {2}- Administration: read: /)]);
+    // read-only runs never ask for Administration at all (Plan U final review I3: the audit makes no such call)
+    expect(audit().text).not.toMatch(/Administration/);
   });
 
   it('consent: claude shows the refusal fallback note', () => {
@@ -507,5 +507,14 @@ describe('counting summary (audit --ai: consent comes before the gitleaks downlo
     const f = full();
     // @ts-expect-error the full run's screen takes only the checked bundle's summary
     expect(() => consentText(f.p, claude, f.est, c, permissionsTable('write', { appCreatesRepos: false }), repos(f.p, [true, true]), 'full', { appCreatesRepos: false, gitleaksVersion: '8.30.1' })).toThrow(/bundleSummary/);
+  });
+});
+
+describe('consent screen (Plan U final review M2)', () => {
+  it('M2: the audit --ai screen passes the repo name through the one output helper, so a token-shaped name is hidden', () => {
+    const leaked = fake.githubClassic();
+    const { text } = audit(claude, { p: profile({ repo: leaked }) });
+    expect(text).not.toContain(leaked);
+    expect(text).toMatch(/pipegen sends \d+ files? \(about \d+ KB\) from acme\//);
   });
 });

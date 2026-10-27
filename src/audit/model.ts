@@ -30,13 +30,14 @@ import { count, outputLimit } from '../ai/errors.js';
 import { ollamaHostOf } from '../ai/ollama.js';
 import { AiError, COST_CAP_MESSAGE, refusalFallbackNoteFor, type AiErrorKind } from '../ai/provider.js';
 import {
-  bundleCode, COUNTING_ONLY_NOTE, EXCLUDED_PATTERNS, findSecretLike, GitleaksError, isExcludedPath, redact, scrubKnownValues, type CodeBundle,
+  bundleCode, bundleTopFolders, COUNTING_ONLY_NOTE, countedBundleRoot, EXCLUDED_PATTERNS, findSecretLike, GitleaksError, isExcludedPath, redact,
+  scrubKnownValues, type CodeBundle,
 } from '../ai/redact.js';
 import { needLanguage, suggestTools } from '../engine/discover.js';
 import type { RateBudget } from '../engine/github-rate.js';
 import { ensurePinnedBinary, PinnedBinaryError } from '../engine/linters.js';
 import type { MemoryStore } from '../engine/memory.js';
-import { floorNeeds, isRunnable, jobCategories, needsPromptBytes, planNeeds, type NeedsPlan } from '../engine/needs.js';
+import { floorNeeds, isRunnable, jobCategories, needKey, needsPromptBytes, planNeeds, type NeedsPlan } from '../engine/needs.js';
 import type { QualityBar } from '../engine/quality-bar.js';
 import { projectScriptFor, reviewedFor, type ProjectScriptStep } from '../engine/reviewed.js';
 import {
@@ -51,6 +52,7 @@ import {
   DEFAULT_MODEL, type AiProvider, type AiRequest, type AiUsage, type Capabilities, type Need, type Part, type PipelineDraft, type RepoProfile,
   type ReviewedTool, type Service,
 } from '../types.js';
+import { usd } from '../util/format.js';
 import { packageVersion } from '../util/package-data.js';
 import { safeText } from '../util/safe-text.js';
 import { ConsentToken, CountingSummary, isSpent, spend } from './consent-token.js';
@@ -137,6 +139,11 @@ export interface AuditAi {
   attempts: AiAttempt[];
   /** The provider is Ollama: no cost is counted (it isn't a paid API). */
   local: boolean;
+  /**
+   * The hard limit on this step's AI spend the user agreed to on the consent screen (USD; AiSpendMeter.effectiveCapUsd).
+   * null for a local model (no limit). Plan U final review M6: the report repeats it next to what was spent.
+   */
+  capUsd: number | null;
 }
 
 /** One settled AI attempt and its list cost (see AuditAi.costUsd for why the cost is "about"). */
@@ -167,6 +174,12 @@ export interface AuditDeps {
   /** The run's GitHub wait budget: the one newRateBudget() the CLI makes per run, shared by every GitHub call. */
   budget: RateBudget;
   sleep?: (ms: number) => Promise<void>;
+  /**
+   * Plan U final review M9: the counting-only bundle the caller already built for `dir` (bundleCode(dir, { knownValues }),
+   * no gitleaks), so a run builds it once and the report and the consent screen show the same count. Without it (or for
+   * another folder, or a bundle that isn't a counting one), buildAudit builds its own.
+   */
+  bundle?: CodeBundle;
 }
 
 // ---------- fixed texts ----------
@@ -219,9 +232,26 @@ const NEED_LABELS: Readonly<Record<string, string>> = {
   attestation: 'Build attestation', 'deploy-verify': 'Deploy check (pipegen)', gate: 'Merge gate (pipegen)',
   'type-check': 'Type check', 'license-scan': 'Licence check', 'dockerfile-lint': 'Dockerfile lint', 'migration-check': 'Database migration check',
 };
-/** The plain-English name of a check, or null for an id pipegen doesn't know (the caller shows the cleaned id). */
-export function needLabel(id: string): string | null {
+/** Plan U final review M4: the names that change for a package that is released and builds no image. */
+const RELEASE_LABELS: Readonly<Record<string, string>> = { signing: 'Release signing' };
+/**
+ * The plain-English name of a check, or null for an id pipegen doesn't know (the caller shows the cleaned id).
+ * `noImage`: the check's service builds no image (buildsNoImage), so signing is "Release signing".
+ */
+export function needLabel(id: string, opts: { noImage?: boolean } = {}): string | null {
+  if (opts.noImage === true && Object.hasOwn(RELEASE_LABELS, id)) return RELEASE_LABELS[id] as string;
   return Object.hasOwn(NEED_LABELS, id) ? (NEED_LABELS[id] as string) : null;
+}
+
+/**
+ * Plan U final review M4: true when the need's service builds no image, so its deploy checks protect a release, not an
+ * image: the service isn't runnable (a package), or the need has no service and none of the repo's services runs.
+ * The same split floorNeeds makes when it targets signing at the runnable services first (src/engine/needs.ts).
+ */
+export function buildsNoImage(need: Pick<Need, 'service'>, p: Pick<RepoProfile, 'services'>): boolean {
+  if (need.service === undefined) return !p.services.some(isRunnable);
+  const s = p.services.find((x) => x.name === need.service);
+  return s !== undefined && !isRunnable(s);
 }
 
 const ROW_NOTE = {
@@ -239,6 +269,7 @@ const LIMIT = {
   fakeGate: 'Without a merge lock, a pull request could replace the gate with a fake one; only code-owner review stops it.',
   noApprovals: 'No deploy approvals: GitHub does not let this repo require a reviewer before a deploy.',
   noSigning: 'No image signing: this private repo has no artifact attestations, and no environment rule was proven to keep a signing key to the default branch.',
+  noReleaseSigning: 'No release signing: this private repo has no artifact attestations, and no environment rule was proven to keep a signing key to the default branch.',
   noAttestations: 'No artifact attestations: GitHub does not offer them for this repo.',
   noCodeScanning: 'No code scanning: GitHub does not show scan results in the Security tab for this repo.',
 } as const;
@@ -339,7 +370,7 @@ export async function buildAudit(dir: string, deps: AuditDeps): Promise<AuditRep
 
   const secretsInTree = await scanTree(dir, notes);
 
-  const bundle = await bundleCode(dir);
+  const bundle = await countingBundle(dir, deps.bundle);
   // A counting-only bundle says it "cannot be sent to the AI"; nothing is sent here, so that note would only confuse.
   for (const n of bundle.notes) if (n !== COUNTING_ONLY_NOTE) notes.add(n);
 
@@ -357,7 +388,7 @@ export async function buildAudit(dir: string, deps: AuditDeps): Promise<AuditRep
     secretsInTree,
     aiBundle: {
       files: bundle.files.length, bytes: bundle.bytes, truncated: bundle.truncated,
-      excludedPatterns: [...EXCLUDED_PATTERNS], topFolders: topFolders(bundle.files.map((f) => f.path)),
+      excludedPatterns: [...EXCLUDED_PATTERNS], topFolders: bundleTopFolders(bundle),
     },
     warnings: await warningsOf(dir, deps.anonymous),
     notes: notes.all(),
@@ -399,7 +430,7 @@ export async function buildLocalAudit(dir: string, deps: { notes?: string[] } = 
     secretsInTree,
     aiBundle: {
       files: bundle.files.length, bytes: bundle.bytes, truncated: bundle.truncated,
-      excludedPatterns: [...EXCLUDED_PATTERNS], topFolders: topFolders(bundle.files.map((f) => f.path)),
+      excludedPatterns: [...EXCLUDED_PATTERNS], topFolders: bundleTopFolders(bundle),
     },
     warnings: await warningsOf(dir, false),
     notes: notes.all(),
@@ -429,7 +460,7 @@ function supportOf(p: RepoProfile): AuditSupport {
 /** mapCoverage, or every need `unknown` with a plain note when it fails (the tool signatures can't be loaded). */
 async function coverageOf(p: RepoProfile, needs: Need[], dir: string, skippedWorkflows: number, notes: Notes): Promise<Coverage[]> {
   try {
-    return await mapCoverage(p, needs, dir, { skippedWorkflows });
+    return await mapCoverage(p, needs, dir, { skippedWorkflows, noImage: (need) => buildsNoImage(need, p) });
   } catch (e) {
     const why = e instanceof Error ? e.message.split('\n')[0] : 'unknown error';
     notes.add(`pipegen couldn't load its list of tool signatures, so it can't tell which checks your workflows already run (${why}).`);
@@ -479,7 +510,7 @@ function limitsOf(p: RepoProfile, caps: Capabilities): string[] {
   const out: string[] = [];
   if (!caps.branchProtection) out.push(LIMIT.noLock, LIMIT.fakeGate);
   if (!caps.envRequiredReviewers) out.push(LIMIT.noApprovals);
-  if (signingMode(p, caps) === 'none') out.push(LIMIT.noSigning);
+  if (signingMode(p, caps) === 'none') out.push(p.services.some(isRunnable) ? LIMIT.noSigning : LIMIT.noReleaseSigning);
   if (!caps.attestations) out.push(LIMIT.noAttestations);
   if (!caps.codeScanning) out.push(LIMIT.noCodeScanning);
   return out;
@@ -494,14 +525,16 @@ async function activityOf(deps: AuditDeps, p: RepoProfile): Promise<Activity | n
   }
 }
 
-/** Top-level folders of the bundled files, most files first (like bundleSummary, which needs a gitleaks-checked bundle). */
-function topFolders(paths: string[]): string[] {
-  const counts = new Map<string, number>();
-  for (const path of paths) {
-    const cut = path.indexOf('/');
-    if (cut > 0) counts.set(path.slice(0, cut), (counts.get(path.slice(0, cut)) ?? 0) + 1);
+/**
+ * The counting-only bundle of `dir`: `given` when it is one bundleCode built without gitleaks for this same folder
+ * (Plan U final review M9: the CLI's, built once with the run's known values), else a new one.
+ */
+async function countingBundle(dir: string, given: CodeBundle | undefined): Promise<CodeBundle> {
+  if (given !== undefined) {
+    const root = countedBundleRoot(given);
+    if (root !== null && root === await realpath(dir).catch(() => null)) return given;
   }
-  return [...counts].sort((a, b) => b[1] - a[1] || (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0)).map(([name]) => name);
+  return bundleCode(dir);
 }
 
 // ---------- secrets in the current files (ruling S10) ----------
@@ -665,10 +698,6 @@ const AI_KIND_TEXT: Readonly<Record<AiErrorKind, string>> = {
   truncated: "the AI's answer was cut off",
   'cost-cap': 'one more AI call could pass the AI cost limit you agreed to',
 };
-const usd = (n: number) => `$${n.toFixed(2)}`;
-
-/** Need identity (layer, id, service), as the needs planner keys it. */
-const needKey = (n: Pick<Need, 'layer' | 'id' | 'service'>) => `${n.layer}\u0000${n.id}\u0000${n.service ?? ''}`;
 
 /**
  * The audit's AI spend meter (ruling U13), the single record of what the AI calls of this step used (review M1). Every
@@ -844,6 +873,7 @@ export async function addAiSuggestions(r: AuditReport, dir: string, deps: AiSugg
         costUsd: meter.costUsd,
         attempts: meter.attempts.map((a) => ({ ...a })),
         local: deps.ai.name === 'ollama',
+        capUsd: meter.effectiveCapUsd,
       },
     };
   };

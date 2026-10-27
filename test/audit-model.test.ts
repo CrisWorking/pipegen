@@ -66,9 +66,14 @@ const bareCaps: Capabilities = {
 interface FakeGh { gh: Octokit; events: ReturnType<typeof vi.fn>; pulls: ReturnType<typeof vi.fn> }
 function fakeGh(opts: { fail?: boolean; pushesPerPage?: number } = {}): FakeGh {
   const at = new Date(NOW - 60_000).toISOString();
-  const events = vi.fn(async () => {
+  // a busy repo (100 a page) has more pages: GitHub says so in its Link header (final review I1)
+  const events = vi.fn(async ({ page }: { page: number }) => {
     if (opts.fail) throw Object.assign(new Error('GitHub answered 500'), { status: 500 });
-    return { data: Array.from({ length: opts.pushesPerPage ?? 1 }, () => ({ type: 'PushEvent', created_at: at })) };
+    const busy = (opts.pushesPerPage ?? 1) >= 100;
+    return {
+      data: Array.from({ length: opts.pushesPerPage ?? 1 }, () => ({ type: 'PushEvent', created_at: at })),
+      headers: busy ? { link: `<https://api.github.com/repos/o/r/events?per_page=100&page=${page + 1}>; rel="next"` } : {},
+    };
   });
   const pulls = vi.fn(async () => ({ data: [] }));
   return { gh: { rest: { activity: { listRepoEvents: events }, pulls: { list: pulls } } } as unknown as Octokit, events, pulls };
@@ -449,7 +454,7 @@ describe('buildAudit (carry-forwards)', () => {
     const dir = repo({ ...nodeApp(), '.github/workflows/bad.yml': 'on: [\n', '.github/workflows/ok.yml': 'on: push\njobs:\n  a:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n' });
     const r = await buildAudit(dir, deps());
     expect(mapCoverage).toHaveBeenCalledTimes(1);
-    expect(vi.mocked(mapCoverage).mock.calls[0][3]).toEqual({ skippedWorkflows: 1 });
+    expect(vi.mocked(mapCoverage).mock.calls[0][3]).toMatchObject({ skippedWorkflows: 1 });
     expect(vi.mocked(mapCoverage).mock.calls[0][1]).toEqual(floorNeeds(r.profile, allCaps));
     // the skipped file makes would-be-missing rows unknown, not missing
     expect(r.coverage.find((c) => c.need.layer === 'push' && c.need.id === 'sast')?.status).toBe('unknown');
@@ -634,5 +639,57 @@ describe('buildAudit (fix round 1)', () => {
     } finally {
       chmodSync(join(dir, 'src/locked.ts'), 0o644);
     }
+  });
+});
+
+// ---------- Plan U final review: M4 (image wording on packages), M10 (Review Focus 6's fixture) ----------
+
+describe('buildAudit (Plan U final review)', () => {
+  const RELEASE = 'on:\n  release:\n    types: [published]\njobs:\n  publish:\n    runs-on: ubuntu-latest\n    steps:\n      - run: npm publish\n';
+  const pkgFiles = (): Record<string, string> => ({
+    'package.json': JSON.stringify({ name: 'lib', version: '1.0.0', scripts: { test: 'vitest run' }, devDependencies: { vitest: '1.0.0' } }),
+    'package-lock.json': '{}\n', 'index.js': 'module.exports = 1;\n', '.github/workflows/release.yml': RELEASE,
+  });
+  const flatTerm = (r: AuditReport) => renderTerminal(r, { knownValues: [] }).replace(/\s+/g, ' ');
+
+  it('M4: a package with nothing runnable gets release wording for signing and attestation, never image wording', async () => {
+    const r = await buildAudit(repo(pkgFiles()), deps());
+    const signing = r.coverage.find((c) => c.need.id === 'signing');
+    const attestation = r.coverage.find((c) => c.need.id === 'attestation');
+    expect(signing?.why).toBe('Without release signing, nothing proves that a published release came from this pipeline.');
+    expect(attestation?.why).toBe('Without an attestation, nothing records how and where the release was built.');
+    const t = flatTerm(r);
+    expect(t).toContain('Release signing for lib');
+    expect(t).not.toMatch(/image signing|deployed image|the image was built/i);
+    // a runnable app keeps the image wording
+    const app = await buildAudit(repo({ ...nodeApp(), '.github/workflows/release.yml': RELEASE }), deps());
+    expect(app.coverage.find((c) => c.need.id === 'signing')?.why).toBe('Without image signing, nothing proves that a deployed image came from this pipeline.');
+    expect(flatTerm(app)).toContain('Image signing for app');
+  });
+
+  it('M10 / Review Focus 6: .env, *.tfstate and .npmrc (built at runtime) are never counted or shown; every output lists the patterns', async () => {
+    const mark = (k: string) => ['RF6', k, 'CONTENT', 'MARK'].join('_');
+    const files: Record<string, string> = {
+      ...nodeApp(), 'src/a.js': `// ${mark('SRC')}\n`,
+      ['.e' + 'nv']: `${['DB', 'HOST'].join('_')}=${mark('ENV')}\n`,
+      ['infra/prod.tf' + 'state']: JSON.stringify({ outputs: { db: { value: mark('TFSTATE') } } }) + '\n',
+      ['.np' + 'mrc']: `# ${mark('NPMRC')}\n`,
+    };
+    const r = await buildAudit(repo(files), deps());
+    // package.json, index.js and src/a.js only: the lockfile and the three secret files are left out
+    expect(r.aiBundle.files).toBe(3);
+    expect(r.aiBundle.topFolders).toEqual(['src']);
+    for (const p of ['**/.env*', '**/*.tfstate', '**/.npmrc']) expect(r.aiBundle.excludedPatterns).toContain(p);
+    const term = renderTerminal(r, { knownValues: [] });
+    const md = renderMarkdown(r, { knownValues: [] });
+    const json = renderJson(r, { knownValues: [] });
+    for (const out of [term, md, json]) {
+      for (const k of ['SRC', 'ENV', 'TFSTATE', 'NPMRC']) expect(out, k).not.toContain(mark(k));
+    }
+    const section = (t: string) => t.slice(t.indexOf('What the full setup would send to the AI'), t.indexOf('Permissions the full setup needs'));
+    expect(section(term).replace(/\s+/g, ' ')).toContain('pipegen would send 3 files');
+    for (const name of ['.env files', '.npmrc', '*.tfstate']) expect(section(term), name).toContain(name);
+    expect(section(md)).toContain('pipegen would send 3 files');
+    for (const p of ['\\*\\*/.env\\*', '\\*\\*/\\*.tfstate', '\\*\\*/.npmrc']) expect(section(md), p).toContain(p);
   });
 });

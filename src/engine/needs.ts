@@ -116,7 +116,8 @@ export function deployApprovalRule(p: RepoProfile, writers: number): boolean {
   return deploysExist(p) && writers >= 2;
 }
 
-const needKey = (n: Pick<Need, 'layer' | 'id' | 'service'>) => `${n.layer}\u0000${n.id}\u0000${n.service ?? ''}`;
+/** Need identity (layer, id, service): the key the planner, and the audit's AI step, dedupe needs by. */
+export const needKey = (n: Pick<Need, 'layer' | 'id' | 'service'>) => `${n.layer}\u0000${n.id}\u0000${n.service ?? ''}`;
 
 function makeNeed(layer: Layer, id: NeedCategory, service?: string): Need {
   return {

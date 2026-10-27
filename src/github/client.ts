@@ -225,8 +225,9 @@ interface PermissionRow {
   probe?: string;
 }
 
-// The order is the consent screen's order. Not requested: Repository creation (Administration write already allows
-// POST /user/repos, S9), Commit statuses (no pipegen call reads them), and every account or organization permission.
+// The FULL RUN's table (write mode; spike S1, DECISIONS #88). The order is the consent screen's order. Not requested:
+// Repository creation (Administration write already allows POST /user/repos, S9), Commit statuses (no pipegen call
+// reads them), and every account or organization permission. Read mode uses READ_PERMISSIONS below, not these rows.
 const PERMISSIONS: readonly PermissionRow[] = [
   { key: 'metadata', name: 'Metadata', write: 'read', read: 'read', why: 'Always required. Read repo details and rulesets.', readWhy: 'Repo details, the rulesets list and collaborators.', probe: '' },
   { key: 'contents', name: 'Contents', write: 'write', read: 'read', why: 'Read your code, push the setup branch and the proof branches.', readWhy: 'Read the code and the workflow files.', probe: '/commits?per_page=1' },
@@ -245,10 +246,44 @@ const PERMISSIONS: readonly PermissionRow[] = [
   { key: 'checks', name: 'Checks', write: 'read', why: 'Read the gate check result. A fine-grained token can\'t have it, so in token mode pipegen reads workflow runs and jobs instead.', appOnly: true },
 ];
 
+/**
+ * The READ-ONLY table: exactly what `pipegen audit` and `pipegen inspect` call on the audited repo (Plan U final review
+ * I3; spec §7 "only read access to the one repo", §12 least privilege). Every GitHub call those two commands make on
+ * it, and the fine-grained token permission GitHub's docs list for it
+ * (https://docs.github.com/en/rest/authentication/permissions-required-for-fine-grained-personal-access-tokens and
+ * https://docs.github.com/en/rest/authentication/endpoints-available-for-fine-grained-personal-access-tokens, both
+ * checked 2026-10-27):
+ * - GET /repos/{o}/{r} (visibility, owner, default branch)            → Metadata: read
+ * - GET /repos/{o}/{r}/rulesets (is a merge lock possible)            → Metadata: read
+ * - GET /repos/{o}/{r}/events (pushes, last 30 days)                   → Metadata: read
+ * - GET /repos/{o}/{r}/pulls?state=all (pull requests, last 30 days)  → Pull requests: read
+ * - GET /repos/{o}/{r}/environments                                    → Actions: read
+ * - GET /repos/{o}/{r}/environments/{env}/deployment-branch-policies  → Actions: read
+ * - GET /repos/{o}/{r}/code-scanning/analyses                          → Code scanning alerts: read (without it, code
+ *   scanning on a private repo reads "not available", with a note that pipegen couldn't check)
+ * - GET /user (the token's login, for a personal account's plan), GET /orgs/{org} (an organisation's plan),
+ *   GET /user/installations and /user/installations/{id}/repositories (pipegen's App: which repos it reaches): no
+ *   repository permission.
+ * `audit --ai` also reads OTHER public repos for its tool search (search, releases, contents, advisories): a
+ * fine-grained token can always read public repos, so that needs nothing here. The audit reads the code from the clone
+ * on disk, never through the API, so Contents isn't asked for. No Secrets, Variables, Environments or Administration
+ * call is made. `key`: the GitHub App permission name; `probe`: a GET probePermissions uses to confirm it.
+ */
+const READ_PERMISSIONS: readonly PermissionRow[] = [
+  { key: 'metadata', name: 'Metadata', write: 'read', read: 'read', why: '', readWhy: 'Repo details (visibility, default branch), the rulesets list and recent pushes.', probe: '' },
+  { key: 'pull_requests', name: 'Pull requests', write: 'read', read: 'read', why: '', readWhy: 'Count the pull requests opened in the last 30 days.', probe: '/pulls?per_page=1' },
+  { key: 'actions', name: 'Actions', write: 'read', read: 'read', why: '', readWhy: 'The environments list and the signing environment\'s branch rule.', probe: '/environments?per_page=1' },
+  {
+    key: 'security_events', name: 'Code scanning alerts', write: 'read', read: 'read', why: '',
+    readWhy: 'Whether code scanning has run here (optional: without it pipegen can\'t confirm code scanning on a private repo). pipegen reads no alerts.',
+    probe: '/code-scanning/analyses?per_page=1',
+  },
+];
+
 const levelText = (l: Level) => (l === 'write' ? 'read and write' : 'read');
 const label = (p: PermissionRow, mode: Level): string =>
   `${p.name}: ${levelText(mode === 'write' ? p.write : (p.read as Level))}${p.appOnly ? ' (GitHub App only)' : ''}`;
-const rowsFor = (mode: Level) => PERMISSIONS.filter((p) => mode === 'write' || p.read !== undefined);
+const rowsFor = (mode: Level) => (mode === 'write' ? PERMISSIONS : READ_PERMISSIONS);
 /** `app`: pipegen's own GitHub App login, which creates and deletes the helper repos (#87); else token mode, which never does. */
 const entry = (p: PermissionRow, mode: Level, app: boolean) => ({
   permission: label(p, mode),
@@ -256,7 +291,8 @@ const entry = (p: PermissionRow, mode: Level, app: boolean) => ({
 });
 
 /**
- * The permissions pipegen asks for, each with a one-line reason (README and consent screen). Write mode needs to know
+ * The permissions pipegen asks for, each with a one-line reason (README, --help, the access steps and the consent
+ * screen). Read mode is READ_PERMISSIONS: what the audit and inspect call, nothing more. Write mode needs to know
  * whether pipegen's App creates and deletes the helper repos (Auth.canCreateRepos, DECISIONS #87): in token mode no
  * row says pipegen creates or deletes a repo.
  */
@@ -273,7 +309,7 @@ function acceptedNames(header: string | undefined): string[] {
   for (const alt of header.split(';')) {
     for (const pair of alt.split(',')) {
       const [key, level] = pair.trim().split('=');
-      const row = PERMISSIONS.find((p) => p.key === key);
+      const row = PERMISSIONS.find((p) => p.key === key) ?? READ_PERMISSIONS.find((p) => p.key === key);
       const lvl = level === 'write' ? 'write' : level === 'read' ? 'read' : undefined;
       const name = row !== undefined && lvl !== undefined ? `${row.name}: ${levelText(lvl)}` : safeText(pair.trim(), 60);
       if (name !== '' && !names.includes(name)) names.push(name);

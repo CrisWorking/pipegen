@@ -10,8 +10,12 @@
 // Helper repos (DECISIONS #87): with pipegen's GitHub App, pipegen creates the missing ones itself and deletes the
 // scratch repo after the proof; with a token, the user creates them (the exact `gh repo create … --private` commands
 // are shown) and pipegen never creates or deletes a repo.
-// Every repo-derived string (owner, repo and folder names) passes safeText; so do the model name (from a flag) and
-// the estimate's basis lines, shown under the cost lines.
+// The files section's repo-derived strings (the repo name and the top folders, on both screens) pass the one output
+// helper (safe-output.ts, ruling U10: redact, then safeText), so a token-shaped name is hidden as in the report (Plan U
+// final review M2); the audit CLI's confirm wrapper also scrubs the run's known values from the whole screen. The
+// 'full' screen's helper repo names stay on safeText alone: they go into the copyable `gh repo create` commands, which
+// redact would break (the full run is Plan E; its own review decides). The model name (from a flag) and the estimate's
+// basis lines pass safeText.
 // The facts the rulings require are required arguments, so a caller can't leave them out: the gitleaks version (S21)
 // and, for 'full', whether pipegen's App creates the repos (#87). Where an Ollama provider sends comes from the
 // provider itself (ollamaHostOf); when it isn't known, the screen never claims the code stays on this computer.
@@ -31,7 +35,9 @@ import { BundleSummary, excludedSummaryLines } from '../ai/redact.js';
 import { claimTokenMinter, CountingSummary, type ConsentMode, type ConsentTerms, type ConsentToken } from '../audit/consent-token.js';
 import type { AiCost, AuditAiEstimate, Estimates, PricedFor } from '../estimate/estimate.js';
 import type { AiProvider, RepoProfile } from '../types.js';
+import { plural, size, usd } from '../util/format.js';
 import { hostPlace } from '../util/local-host.js';
+import { makeSafeOutput } from '../util/safe-output.js';
 import { safeText } from '../util/safe-text.js';
 import { PromptCancelledError, type Prompter } from './io.js';
 
@@ -58,10 +64,9 @@ const SCRATCH_PREFIX = 'pipegen-proof-';
 /** What the App does with the scratch repo; the same words as the Administration permission (permissionsTable). */
 const APP_DELETES = 'after the proof if you allow it';
 
-const usd = (n: number) => `$${n.toFixed(2)}`;
 const range = (r: { low: number; high: number }) => `${usd(r.low)}–${usd(r.high)}`;
-const plural = (n: number, one: string, many: string) => `${n.toLocaleString('en-US')} ${n === 1 ? one : many}`;
-const size = (bytes: number) => (bytes >= 1024 * 1024 ? `about ${(bytes / (1024 * 1024)).toFixed(1)} MB` : `about ${Math.max(1, Math.round(bytes / 1024))} KB`);
+/** A repo-derived name on the screen: the one output helper (redact, then safeText). Known values: the CLI's wrapper. */
+const shownName = (s: string, max: number) => makeSafeOutput([])(s, { target: 'terminal', max });
 
 /** Where the AI runs. For Ollama: local, a named remote host, or unknown (host null), which is never shown as local. */
 type Place = { kind: 'vendor' } | { kind: 'local' } | { kind: 'remote'; host: string | null };
@@ -87,13 +92,13 @@ function whereItRuns(provider: AiProvider, place: Place): string {
 }
 
 function filesSection(p: RepoProfile, bundle: BundleSummary | CountingSummary, gitleaksVersion: string): string[] {
-  const shown = bundle.topFolders.slice(0, MAX_TOP_FOLDERS).map((f) => safeText(f, 60));
+  const shown = bundle.topFolders.slice(0, MAX_TOP_FOLDERS).map((f) => shownName(f, 60));
   const more = bundle.topFolders.length - shown.length;
   const folders = shown.length === 0 ? '(all at the top level)' : `${shown.join(', ')}${more > 0 ? ` and ${more} more` : ''}`;
   const counted = CountingSummary.isSummary(bundle);
   return [
     'Your code',
-    `${INDENT}pipegen sends ${counted ? 'at most ' : ''}${plural(bundle.files, 'file', 'files')} (${size(bundle.bytes)}) from ${safeText(`${p.owner}/${p.repo}`, 200)} to the AI.`,
+    `${INDENT}pipegen sends ${counted ? 'at most ' : ''}${plural(bundle.files, 'file', 'files')} (${size(bundle.bytes)}) from ${shownName(`${p.owner}/${p.repo}`, 200)} to the AI.`,
     `${INDENT}Top folders: ${folders}`,
     `${INDENT}Never sent:`,
     ...excludedSummaryLines().map((l) => `${INDENT}${INDENT}${l}`),

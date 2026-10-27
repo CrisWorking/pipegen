@@ -10,8 +10,9 @@
 // - The reviewed tool list can't be used (B3: the release build refuses it while entries wait for review): the audit
 //   runs with no reviewed tools and a warning at the top, exit 0.
 // - `--ai`: everything that can refuse it is checked first, before any GitHub call (S21 platform, S15 provider, the
-//   Ollama checks of U15/H2, the gitleaks pin). After the plain audit: the counting bundle (no gitleaks, no child
-//   process) and the estimate (an unpriced model stops here, U14), then the consent screen (default No). Only a yes
+//   Ollama checks of U15/H2, the gitleaks pin). After the plain audit: the estimate (an unpriced model stops here,
+//   U14), from the counting bundle (no gitleaks, no child process) the plain audit already counted with, built once
+//   per run (final review M9), then the consent screen (default No). Only a yes
 //   gives the ConsentToken addAiSuggestions requires; it then downloads gitleaks, builds the checked bundle and asks the AI.
 // - Output: the terminal report (default) or JSON (--json) on stdout; --out writes the Markdown report through
 //   writeOutFile; errors and status lines on stderr. Every output gets the run's known values (the GitHub token and
@@ -37,7 +38,7 @@ import {
 } from '../github/client.js';
 import { NotGitHubRepoError, readProject } from '../read/project.js';
 import type { AiProvider, Auth, Capabilities, RepoProfile, ReviewedTool } from '../types.js';
-import { makeSafeOutput, OUTPUT_CAP, usableKnownValues } from '../util/safe-output.js';
+import { knownValuesFrom, makeSafeOutput, OUTPUT_CAP, usableKnownValues } from '../util/safe-output.js';
 import { askConsent, consentScreen } from './consent.js';
 import { tokenLogin } from './inspect.js';
 import type { CliIO } from './io.js';
@@ -70,8 +71,6 @@ export const AUDIT_AI_PLATFORM = 'audit --ai needs Linux or macOS for now (WSL w
  */
 export const reviewedUnavailableWarning = (why: string) =>
   `pipegen's reviewed tool list isn't usable in this build: ${why.trim().replace(/\.+$/, '')}. The 'would add' section shows no tools.`;
-/** The environment variables whose values are never printed nor sent to the AI (ruling S19: the token and the AI keys). */
-const KNOWN_VALUE_VARS = ['GITHUB_TOKEN', 'ANTHROPIC_API_KEY', 'OPENAI_API_KEY'] as const;
 /** Needs the AI may add on top of the floor, for the consent estimate (estimateAuditAi caps the discovery calls itself). */
 const EXTRA_NEEDS_MARGIN = 2;
 
@@ -82,20 +81,19 @@ interface AiReady { provider: AiProvider; gitleaksVersion: string; bar: QualityB
 /** Runs `pipegen audit`. 0: a report was printed (also with the reviewed list unusable); 1: a refusal or an error. */
 export async function audit(io: CliIO, flags: AuditFlags): Promise<number> {
   const cwd = io.cwd ?? process.cwd();
-  const knownValues: string[] = [];
-  for (const v of KNOWN_VALUE_VARS) {
-    const value = io.env[v];
-    if (typeof value === 'string' && value.trim() !== '') knownValues.push(value, value.trim());
-  }
+  const knownValues: string[] = knownValuesFrom(io.env); // the token and the AI keys (S19), never printed nor sent
   let token: string | null = null;
+  /** pipegen's own wording around a value: every step of the output helper but redact (it would cut "this token: …"). */
   const clean = (s: string, max: number = OUTPUT_CAP.text) => makeSafeOutput(knownValues)(s, { target: 'terminal', max, redact: false });
+  /** Text pipegen didn't write (an unexpected error's message): the whole helper, redact included (final review M1). */
+  const cleanForeign = (s: string, max: number) => makeSafeOutput(knownValues)(s, { target: 'terminal', max });
   const say = (s: string) => { io.out(hideToken(s, token)); };
   const fail = (s: string) => { io.err(hideToken(s, token)); };
   try {
     return await run();
   } catch (e) {
     // anything unexpected: one cleaned line, never a token or key, never a stack trace
-    fail(`pipegen audit failed: ${clean(e instanceof Error ? e.message : String(e), 500)}`);
+    fail(`pipegen audit failed: ${cleanForeign(e instanceof Error ? e.message : String(e), 500)}`);
     return 1;
   }
 
@@ -156,18 +154,19 @@ export async function audit(io: CliIO, flags: AuditFlags): Promise<number> {
       reviewedProblem = e.reason ?? e.message;
     }
 
-    // 5. the plain audit
+    // 5. the plain audit, with the code bundle counted once (no gitleaks, no child process): the report's count and,
+    //    with --ai, the consent screen's count are this one count (final review M9)
     const anonymous = github.auth.kind === 'anonymous';
+    const counted = await bundleCode(dir, { knownValues });
     let r: AuditReport = await buildAudit(dir, {
       gh: github.gh, anonymous, context: github.context, capabilities: github.caps,
       permissions: permissionsTable('write', { appCreatesRepos: github.auth.canCreateRepos }),
-      reviewed, reviewedUnavailable: reviewedProblem !== null, now: Date.now, notes, budget: clock.budget,
+      reviewed, reviewedUnavailable: reviewedProblem !== null, now: Date.now, notes, budget: clock.budget, bundle: counted,
     });
     if (reviewedProblem !== null) r = { ...r, warnings: [{ text: reviewedUnavailableWarning(reviewedProblem) }, ...r.warnings] };
 
     // 6. --ai: consent first (default No); only a yes gives the token the AI step requires
     if (ai !== null) {
-      const counted = await bundleCode(dir, { knownValues }); // counting only: no gitleaks, no child process
       const nullRows = r.wouldAdd.filter((w) => w.tool === null).length;
       const est = estimateAuditAi(ai.provider, nullRows + EXTRA_NEEDS_MARGIN, needsRequestBytes({ ...r, aiBundle: { ...r.aiBundle, bytes: counted.bytes } }, knownValues));
       if (est.unpriced !== null) {

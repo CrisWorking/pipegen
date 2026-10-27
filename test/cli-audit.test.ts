@@ -8,7 +8,9 @@ import { join, resolve } from 'node:path';
 import * as execa from 'execa';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { makeProvider } from '../src/ai/provider.js';
+import { bundleCode } from '../src/ai/redact.js';
 import { addAiSuggestions, buildAudit, safeRunCommand } from '../src/audit/model.js';
+import { CANT_SEE } from '../src/audit/render.js';
 import { run } from '../src/cli/main.js';
 import type { CliIO, Prompter } from '../src/cli/io.js';
 import { withRateLimit, type RateBudget, type RateClock } from '../src/engine/github-rate.js';
@@ -59,6 +61,10 @@ vi.mock('../src/audit/model.js', async (importOriginal) => {
 vi.mock('../src/engine/github-rate.js', async (importOriginal) => {
   const a = await importOriginal<typeof import('../src/engine/github-rate.js')>();
   return { ...a, withRateLimit: vi.fn(a.withRateLimit) };
+});
+vi.mock('../src/ai/redact.js', async (importOriginal) => {
+  const a = await importOriginal<typeof import('../src/ai/redact.js')>();
+  return { ...a, bundleCode: vi.fn(a.bundleCode) };
 });
 vi.mock('../src/engine/stats.js', async (importOriginal) => {
   const a = await importOriginal<typeof import('../src/engine/stats.js')>();
@@ -778,5 +784,110 @@ describe('pipegen audit (output)', () => {
 
   it('safeRunCommand is what --help prints (one source for the command)', () => {
     expect(safeRunCommand(VERSION)).toBe(RUN_COMMAND);
+  });
+});
+
+// ---------- Plan U final review fixes (final-review.md I1, I3, M1, M5, M6, M7, M9) ----------
+
+/** GitHub's repo events, served page by page with its `Link: rel="next"` header (pages can hold fewer than 100). */
+const eventPages = (list: unknown[][]) => (c: Call): Reply => {
+  const n = Number(c.url.searchParams.get('page') ?? '1');
+  return {
+    body: list[n - 1] ?? [],
+    headers: n < list.length ? { link: `<${R}/events?per_page=100&page=${n + 1}>; rel="next", <${R}/events?per_page=100&page=${list.length}>; rel="last"` } : {},
+  };
+};
+const daysAgo = (d: number) => new Date(Date.now() - d * 86_400_000).toISOString();
+const oneLine = (s: string) => s.replace(/\s+/g, ' ');
+
+describe('pipegen audit (Plan U final review)', () => {
+  it('I1 / Review Focus 5: fake GitHub pages → buildAudit → report: pushes on page 2 count, monthly minutes follow, "at least" when the 30 days aren\'t reached', async () => {
+    const dir = repo();
+    // page 1: 97 events and no push (what GitHub served for express), with Link rel="next"
+    const first = Array.from({ length: 97 }, (_, i) => ({ type: 'WatchEvent', created_at: daysAgo(i / 40) }));
+    const pushes = [3, 4, 5].map((d) => ({ type: 'PushEvent', created_at: daysAgo(d) }));
+    const json = async (pages: unknown[][]) => {
+      const r = await audit(['audit', '--json'], { cwd: dir, routes: publicRoutes({ [`GET ${R}/events`]: eventPages(pages) }) });
+      expect(r.code).toBe(0);
+      return (JSON.parse(r.out) as { estimates: { monthlyMinutes: number; basis: string[] } }).estimates;
+    };
+    // page 2 holds the pushes and an event older than 30 days: an exact count
+    const exact = await json([first, [...pushes, { type: 'WatchEvent', created_at: daysAgo(40) }]]);
+    expect(exact.basis).toContain('Activity: 3 pushes and 0 pull requests in the last 30 days.');
+    const none = await json([first]);
+    expect(none.basis).toContain('Activity: 0 pushes and 0 pull requests in the last 30 days.');
+    expect(exact.monthlyMinutes).toBeGreaterThan(none.monthlyMinutes);
+    // three pages, all inside the 30 days: GitHub's list ended at its limit, so the count is a lower bound
+    const short = (from: number) => Array.from({ length: 97 }, (_, i) => ({ type: 'WatchEvent', created_at: daysAgo(from + i / 100) }));
+    const pages = [short(0), [...pushes, ...short(6)], short(8)];
+    const capped = await json(pages);
+    expect(capped.basis.some((b) => b.startsWith('Activity: at least 3 pushes and at least 0 pull requests in the last 30 days'))).toBe(true);
+    expect(capped.monthlyMinutes).toBe(exact.monthlyMinutes);
+    const t = await audit(['audit'], { cwd: dir, routes: publicRoutes({ [`GET ${R}/events`]: eventPages(pages) }) });
+    expect(oneLine(t.out)).toContain(`After setup: about ${capped.monthlyMinutes.toLocaleString('en-US')} minutes a month, or more (pipegen could count only part of the activity).`);
+    expect(oneLine(t.out)).toContain('Activity: at least 3 pushes');
+  });
+
+  it('I3: the private-repo access steps ask for exactly Metadata, Pull requests, Actions and Code scanning alerts, all read', async () => {
+    const dir = repo();
+    const r = await audit(['audit'], { cwd: dir, routes: publicRoutes({ [`GET ${R}`]: err(404, 'Not Found') }) });
+    expect(r.code).toBe(1);
+    expect(r.err).toContain('with Metadata: read, Pull requests: read, Actions: read, Code scanning alerts: read,');
+    expect(r.err).not.toMatch(/Secrets|Variables|Environments|Administration|Contents|Workflows|write/);
+    expect(permissionsTable('read').map((p) => p.permission)).toEqual(['Metadata: read', 'Pull requests: read', 'Actions: read', 'Code scanning alerts: read']);
+    // --help names the same list
+    const help = await audit(['--help'], { cwd: makeTempDir() });
+    expect(oneLine(help.out)).toContain('Metadata: read, Pull requests: read, Actions: read, Code scanning alerts: read');
+    // the README too
+    const readme = readFileSync(resolve(import.meta.dirname, '../README.md'), 'utf8');
+    for (const p of permissionsTable('read')) expect(readme).toContain(p.permission);
+  });
+
+  it('M1: the catch-all error line hides secret-like text it didn\'t write', async () => {
+    const dir = repo();
+    const leaked = fake.githubClassic(); // not a known value: only redact() can hide it
+    vi.mocked(buildAudit).mockRejectedValueOnce(new Error(`unexpected failure near ${leaked}`));
+    const r = await audit(['audit'], { cwd: dir });
+    expect(r.code).toBe(1);
+    expect(r.err).toContain('pipegen audit failed: unexpected failure near');
+    expect(r.all).not.toContain(leaked);
+  });
+
+  it('M5: an anonymous run says "without a token", never "with this token"', async () => {
+    const dir = repo();
+    const r = await audit(['audit', '--json'], { cwd: dir });
+    expect(r.code).toBe(0);
+    const notes = (JSON.parse(r.out) as { notes: string[] }).notes;
+    expect(notes.some((n) => n.startsWith("Couldn't check code scanning without a token"))).toBe(true);
+    expect(notes.join('\n')).not.toContain('with this token');
+  });
+
+  it('M6 / M9: after --ai the report repeats the agreed limit; the code bundle is built once to count and once to check', async () => {
+    const dir = repo();
+    const { env } = aiSetup();
+    const ask = prompter(true);
+    const r = await audit(['audit', '--ai'], { cwd: dir, env, prompt: ask });
+    expect(r.code).toBe(0);
+    const cap = /pipegen stops if the AI cost reaches (\$\d+\.\d\d)\./.exec(ask.asked[0] as string)?.[1];
+    expect(cap).toBeDefined();
+    expect(oneLine(r.out)).toMatch(/AI cost of this audit: about \$\d+\.\d\d at list price \(/);
+    expect(oneLine(r.out)).toContain(`the limit you agreed to: ${cap as string}.`);
+    expect(vi.mocked(bundleCode)).toHaveBeenCalledTimes(2);
+    const [counting, checked] = vi.mocked(bundleCode).mock.calls;
+    expect(counting?.[1]?.gitleaks).toBeUndefined();
+    expect(checked?.[1]?.gitleaks).toBeDefined();
+    // the report's count and the consent screen's count are the same count
+    const files = /pipegen sends at most (\d+) files?/.exec(ask.asked[0] as string)?.[1];
+    expect(oneLine(r.out)).toContain(`pipegen would send ${files} file`);
+    // a plain run builds it once
+    vi.mocked(bundleCode).mockClear();
+    expect((await audit(['audit'], { cwd: dir })).code).toBe(0);
+    expect(vi.mocked(bundleCode)).toHaveBeenCalledTimes(1);
+  });
+
+  it('M7: --json carries the "what this audit can\'t see" list', async () => {
+    const dir = repo();
+    const r = await audit(['audit', '--json'], { cwd: dir });
+    expect((JSON.parse(r.out) as { cantSee: string[] }).cantSee).toEqual([...CANT_SEE]);
   });
 });
