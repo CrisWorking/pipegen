@@ -1,16 +1,22 @@
 // 7-day cooldown check (DECISIONS #92), run by the `cooldown` job in .github/workflows/ci.yml on pull requests.
 //
 // It compares the BASE and HEAD copies of package-lock.json, data/reviewed-tools.yml and data/pinned-binaries.yml and
-// fails when something new or changed is younger than 7 days:
-//   - every npm package version that is new in the lockfile (transitive ones too): npm registry `time[version]`;
-//   - every added or changed reviewed tool or pinned binary: the recorded date (releasedAt, else pinnedOn), and,
-//     for GitHub-hosted tools, the release's `published_at` from api.github.com. The younger of the two counts.
-// Anything that can't be dated (registry down, no date, unreadable date, date in the future) fails closed.
+// fails when something new or changed is younger than 7 days. The date always comes from upstream, never from a
+// date written in the file, and the pin must be tied to that upstream release:
+//   - npm lockfile entries that are new or whose version/resolved/integrity changed (transitive ones too): the
+//     name comes from the node_modules path, the version must exist in the registry, `resolved` must be the
+//     registry tarball and `integrity` must equal the registry's dist.integrity; date = registry `time[version]`;
+//   - reviewed tools (whole entry diffed): an action's SHA must be the commit of its tag, a release binary's asset
+//     digest must belong to that GitHub release, a docker digest must be the tag's digest on Docker Hub, npm/pip
+//     tools and plugins are checked on their registries; date = release published_at / registry time;
+//   - pinned binaries: every platform url and sha256 must belong to the GitHub release of that version.
+// Anything that can't be tied and dated (lookup failed, 404, no digest, unreadable date, date in the future,
+// a kind this script doesn't know) fails closed. A docker pin it can't date says "needs owner review".
 //
 // The CI job runs the BASE commit's copy of this file against the PR's files, so a PR can't weaken the check that
 // judges it. Keep it dependency-free apart from `yaml`, and keep to syntax Node's type stripping can run
 // (no enums, no parameter properties, no namespaces): `node scripts/cooldown.ts`.
-import { readFile } from 'node:fs/promises';
+import { lstat, readFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { parse as parseYaml } from 'yaml';
 
@@ -26,7 +32,7 @@ export const WATCHED_FILES = ['package-lock.json', 'data/reviewed-tools.yml', 'd
 export type Files = Partial<Record<string, string | null>>;
 
 export interface Finding {
-  kind: 'npm' | 'reviewed-tool' | 'pinned-binary';
+  kind: 'npm' | 'pypi' | 'reviewed-tool' | 'pinned-binary' | 'lockfile';
   name: string;
   version: string;
   /** ISO publish date used for the decision, or null when none could be found. */
@@ -58,100 +64,102 @@ type Obj = Record<string, unknown>;
 const isObj = (v: unknown): v is Obj => typeof v === 'object' && v !== null && !Array.isArray(v);
 const str = (v: unknown): string | undefined => (typeof v === 'string' && v !== '' ? v : undefined);
 
-// --- what changed -------------------------------------------------------------------------------------------------
-
-/** name -> versions, from a package-lock.json (v2/v3 `packages`). Links and entries with no version are skipped. */
-export function lockfileVersions(text: string | null | undefined): Map<string, Set<string>> {
-  const out = new Map<string, Set<string>>();
-  if (!text) return out;
-  const lock: unknown = JSON.parse(text);
-  const packages = isObj(lock) && isObj(lock.packages) ? lock.packages : {};
-  for (const [path, entry] of Object.entries(packages)) {
-    if (path === '' || !isObj(entry) || entry.link === true) continue;
-    const version = str(entry.version);
-    if (!version) continue;
-    const idx = path.lastIndexOf('node_modules/');
-    const name = str(entry.name) ?? (idx >= 0 ? path.slice(idx + 'node_modules/'.length) : path);
-    let set = out.get(name);
-    if (!set) out.set(name, (set = new Set()));
-    set.add(version);
-  }
-  return out;
+/** A stable text for a value (keys sorted), minus the named keys at any depth. */
+function canon(v: unknown, skip: ReadonlySet<string> = new Set()): string {
+  const walk = (x: unknown): unknown => {
+    if (Array.isArray(x)) return x.map(walk);
+    if (isObj(x)) return Object.fromEntries(Object.keys(x).filter((k) => !skip.has(k)).sort().map((k) => [k, walk(x[k])]));
+    return x;
+  };
+  return JSON.stringify(walk(v)) ?? 'null';
 }
 
-/** Versions in head that base didn't have. A removed package or an unchanged version is not listed. */
-export function newNpmVersions(base: string | null | undefined, head: string | null | undefined): Array<{ name: string; version: string }> {
-  const before = lockfileVersions(base);
-  const out: Array<{ name: string; version: string }> = [];
-  for (const [name, versions] of [...lockfileVersions(head)].sort(([a], [b]) => a.localeCompare(b))) {
-    for (const version of [...versions].sort()) {
-      if (!before.get(name)?.has(version)) out.push({ name, version });
-    }
-  }
-  return out;
-}
+class FileError extends Error {}
 
-export interface PinChange {
-  kind: 'reviewed-tool' | 'pinned-binary';
-  name: string;
-  version: string;
-  repo: string | undefined;
-  /** Whether a GitHub release can be looked up for it (not for container images). */
-  github: boolean;
-  recordedDate: string | undefined;
-}
-
-function yamlObj(text: string | null | undefined): Obj {
+function yamlObj(file: string, text: string | null | undefined): Obj {
   if (!text) return {};
-  const v: unknown = parseYaml(text);
+  let v: unknown;
+  try {
+    v = parseYaml(text);
+  } catch {
+    throw new FileError(`${file} is not valid YAML`);
+  }
   return isObj(v) ? v : {};
 }
 
-/** Added or changed entries of data/reviewed-tools.yml (compared by the `candidate`, the pin itself). */
-export function changedReviewedTools(base: string | null | undefined, head: string | null | undefined): PinChange[] {
-  const index = (doc: Obj): Map<string, Obj> => {
-    const m = new Map<string, Obj>();
-    if (Array.isArray(doc.tools)) for (const t of doc.tools) if (isObj(t) && str(t.id)) m.set(t.id as string, t);
-    return m;
-  };
-  const before = index(yamlObj(base));
-  const headDoc = yamlObj(head);
-  const fileDate = str(headDoc.pinnedOn);
-  const out: PinChange[] = [];
-  for (const [id, tool] of index(headDoc)) {
-    const cand = isObj(tool.candidate) ? tool.candidate : {};
-    const old = before.get(id);
-    if (old && JSON.stringify(old.candidate ?? null) === JSON.stringify(cand) && str(old.releasedAt) === str(tool.releasedAt)) continue;
-    out.push({
-      kind: 'reviewed-tool',
-      name: id,
-      version: str(cand.version) ?? '(no version)',
-      repo: str(cand.repo),
-      github: str(cand.kind) !== 'docker',
-      recordedDate: str(tool.releasedAt) ?? fileDate,
-    });
+// --- npm lockfile -------------------------------------------------------------------------------------------------
+
+const SEMVER = /^\d+\.\d+\.\d+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$/;
+const NPM_NAME = /^(@[a-z0-9~._-]+\/)?[a-z0-9~._-]+$/i;
+export const REGISTRY = 'https://registry.npmjs.org/';
+
+export interface LockEntry {
+  /** The real package name (from the node_modules path; an alias resolves to the name in `resolved`). */
+  name: string;
+  version: string;
+  resolved: string | undefined;
+  integrity: string | undefined;
+  /** Why this entry can't be trusted, if so. */
+  bad?: string;
+}
+
+function parseLock(text: string): Obj {
+  try {
+    const v: unknown = JSON.parse(text);
+    if (isObj(v)) return v;
+  } catch {
+    /* falls through */
+  }
+  throw new FileError('package-lock.json is not valid JSON');
+}
+
+/** Why a lockfile can't be read at all (old format, no `packages`), or undefined. */
+export function lockfileProblem(text: string | null | undefined): string | undefined {
+  if (!text) return undefined;
+  const lock = parseLock(text);
+  if (typeof lock.lockfileVersion !== 'number' || lock.lockfileVersion < 2) return 'lockfileVersion is below 2, so entries can not be verified';
+  if (!isObj(lock.packages)) return 'the lockfile has no `packages` section, so entries can not be verified';
+  return undefined;
+}
+
+/** Entries of a package-lock.json. Workspace links and local paths are skipped. */
+export function lockEntries(text: string | null | undefined): LockEntry[] {
+  if (!text || lockfileProblem(text)) return [];
+  const packages = (parseLock(text).packages ?? {}) as Obj;
+  const out: LockEntry[] = [];
+  for (const [path, entry] of Object.entries(packages)) {
+    if (path === '' || !isObj(entry) || entry.link === true) continue;
+    const idx = path.lastIndexOf('node_modules/');
+    if (idx < 0) continue; // a workspace member by path
+    const pathName = path.slice(idx + 'node_modules/'.length);
+    const version = str(entry.version) ?? '';
+    const resolved = str(entry.resolved);
+    const integrity = str(entry.integrity);
+    let name = pathName;
+    let bad: string | undefined;
+    const claimed = str(entry.name);
+    if (claimed !== undefined && claimed !== pathName) {
+      // Only an npm: alias may differ, and then the tarball must be the claimed package's.
+      if (resolved?.startsWith(`${REGISTRY}${claimed}/-/`)) name = claimed;
+      else bad = `entry name "${claimed}" differs from its path name "${pathName}" and its tarball does not match`;
+    }
+    out.push({ name, version, resolved, integrity, ...(bad ? { bad } : {}) });
   }
   return out;
 }
 
-const REVIEW_ONLY_FIELDS = new Set(['reviewedBy', 'reviewedAt', 'pinnedOn']);
+const entryKey = (e: LockEntry): string => [e.name, e.version, e.resolved ?? '', e.integrity ?? ''].join('\0');
 
-/** Added or changed tools of data/pinned-binaries.yml (a review-only edit is not a change). */
-export function changedPinnedBinaries(base: string | null | undefined, head: string | null | undefined): PinChange[] {
-  const strip = (v: unknown): string => JSON.stringify(v, (k, x: unknown) => (REVIEW_ONLY_FIELDS.has(k) ? undefined : x));
-  const before = yamlObj(base);
-  const out: PinChange[] = [];
-  for (const [name, tool] of Object.entries(yamlObj(head))) {
-    if (!isObj(tool)) continue;
-    if (name in before && strip(before[name]) === strip(tool)) continue;
-    out.push({
-      kind: 'pinned-binary',
-      name,
-      version: str(tool.version) ?? '(no version)',
-      repo: str(tool.repo),
-      github: true,
-      recordedDate: str(tool.releasedAt) ?? str(tool.pinnedOn),
-    });
+/** Entries in head that base didn't have: a new version, or the same version with another tarball or integrity. */
+export function changedLockEntries(base: string | null | undefined, head: string | null | undefined): LockEntry[] {
+  const before = new Set(lockEntries(base).map(entryKey));
+  const seen = new Set<string>();
+  const out: LockEntry[] = [];
+  for (const e of lockEntries(head).sort((a, b) => a.name.localeCompare(b.name) || a.version.localeCompare(b.version))) {
+    const k = entryKey(e);
+    if (before.has(k) || seen.has(k)) continue;
+    seen.add(k);
+    out.push(e);
   }
   return out;
 }
@@ -166,6 +174,27 @@ class LookupError extends Error {
   }
 }
 
+/** Reads a body up to the byte cap, cancelling the stream past it. */
+async function readCapped(res: Response): Promise<string> {
+  const declared = Number(res.headers.get('content-length') ?? '0');
+  if (declared > MAX_BODY_BYTES) throw new LookupError('response too large');
+  if (!res.body) return '';
+  const reader = res.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    total += value.byteLength;
+    if (total > MAX_BODY_BYTES) {
+      await reader.cancel().catch(() => undefined);
+      throw new LookupError('response too large');
+    }
+    chunks.push(value);
+  }
+  return Buffer.concat(chunks).toString('utf8');
+}
+
 async function getJson(f: typeof fetch, url: string, headers: Record<string, string>, timeoutMs: number): Promise<unknown> {
   let res: Response;
   try {
@@ -175,19 +204,52 @@ async function getJson(f: typeof fetch, url: string, headers: Record<string, str
   }
   if (res.status === 404) throw new LookupError('not found (404)', true);
   if (!res.ok) throw new LookupError(`HTTP ${res.status}`);
-  const declared = Number(res.headers.get('content-length') ?? '0');
-  if (declared > MAX_BODY_BYTES) throw new LookupError('response too large');
   try {
-    const text = await res.text();
-    if (text.length > MAX_BODY_BYTES) throw new LookupError('response too large');
-    return JSON.parse(text);
+    return JSON.parse(await readCapped(res));
   } catch (e) {
     if (e instanceof LookupError) throw e;
     throw new LookupError('unreadable response');
   }
 }
 
-export const npmUrl = (name: string): string => `https://registry.npmjs.org/${name.replace('/', '%2f')}`;
+/** Every request goes through here: counted against the cap, and one answer per URL. */
+interface Ctx {
+  get: (url: string, headers?: Record<string, string>) => Promise<unknown>;
+  gh: Record<string, string>;
+  notes: string[];
+}
+
+function makeCtx(opts: CooldownOptions, notes: string[]): Ctx {
+  const cap = opts.maxLookups ?? MAX_LOOKUPS;
+  const cache = new Map<string, Promise<unknown>>();
+  return {
+    notes,
+    gh: opts.githubToken ? { authorization: `Bearer ${opts.githubToken}` } : {},
+    get(url, headers = {}) {
+      let p = cache.get(url);
+      if (!p) {
+        p = cache.size >= cap
+          ? Promise.reject(new LookupError(`lookup cap of ${cap} reached; split the PR`))
+          : getJson(opts.fetch, url, headers, opts.timeoutMs ?? LOOKUP_TIMEOUT_MS);
+        cache.set(url, p);
+        p.catch(() => undefined);
+      }
+      return p;
+    },
+  };
+}
+
+export const npmUrl = (name: string): string => `${REGISTRY}${name.replace('/', '%2f')}`;
+
+const SEGMENT = /^[A-Za-z0-9_.-]+$/;
+/** `owner/name` as an encoded URL path, or undefined when a segment is odd or is `.` or `..`. */
+export function repoPath(repo: string): string | undefined {
+  const parts = repo.split('/');
+  if (parts.length !== 2 || parts.some((p) => !SEGMENT.test(p) || p === '.' || p === '..')) return undefined;
+  return parts.map(encodeURIComponent).join('/');
+}
+const TAG = /^[A-Za-z0-9][A-Za-z0-9._+-]*$/;
+const tagPath = (tag: string): string | undefined => (TAG.test(tag) && !tag.includes('..') ? encodeURIComponent(tag) : undefined);
 
 async function pool<T>(items: T[], limit: number, fn: (item: T) => Promise<void>): Promise<void> {
   let next = 0;
@@ -197,9 +259,233 @@ async function pool<T>(items: T[], limit: number, fn: (item: T) => Promise<void>
   await Promise.all(workers);
 }
 
+// --- tying a pin to an upstream date ------------------------------------------------------------------------------
+
+/** A date (upstream, trusted) or a reason the pin can't be tied to one. */
+type Outcome = { date: string } | { problem: string; lookupFailed?: boolean };
+const fail = (problem: string): Outcome => ({ problem });
+
+async function guard(fn: () => Promise<Outcome>): Promise<Outcome> {
+  try {
+    return await fn();
+  } catch (e) {
+    if (e instanceof LookupError) return { problem: `lookup failed: ${e.message}`, lookupFailed: !e.notFound };
+    throw e;
+  }
+}
+
+const sha256Of = (v: unknown): string | undefined => {
+  const s = typeof v === 'string' ? v.toLowerCase().replace(/^sha256:/, '') : '';
+  return /^[0-9a-f]{64}$/.test(s) ? s : undefined;
+};
+
+/** An npm package version: must exist in the registry; integrity must match; date = time[version]. */
+async function npmOutcome(ctx: Ctx, name: string, version: string, integrity: string | undefined, resolved?: string): Promise<Outcome> {
+  if (!NPM_NAME.test(name)) return fail('unusual package name');
+  if (!SEMVER.test(version)) return fail('version is not valid semver');
+  if (resolved !== undefined) {
+    const base = name.includes('/') ? name.slice(name.indexOf('/') + 1) : name;
+    if (resolved !== `${REGISTRY}${name}/-/${base}-${version}.tgz`) return fail(`resolved is not the registry tarball of ${name}@${version}`);
+  }
+  return guard(async () => {
+    const doc = await ctx.get(npmUrl(name));
+    const versions = isObj(doc) && isObj(doc.versions) ? doc.versions : undefined;
+    const meta = versions?.[version];
+    if (!isObj(meta)) return fail('this version does not exist in the registry');
+    const dist = isObj(meta.dist) ? meta.dist : {};
+    if (!integrity || integrity !== str(dist.integrity)) return fail('integrity does not match the registry dist.integrity');
+    const time = isObj(doc) && isObj(doc.time) ? doc.time : {};
+    const date = str(time[version]);
+    return date ? { date } : fail('registry has no publish time for this version');
+  });
+}
+
+/** A PyPI release: the file with this sha256 must exist; date = its upload time. */
+async function pypiOutcome(ctx: Ctx, name: string, version: string, checksum: string | undefined): Promise<Outcome> {
+  if (!/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(name) || !/^[A-Za-z0-9.!+_-]+$/.test(version)) return fail('unusual package name or version');
+  const want = sha256Of(checksum);
+  if (!want) return fail('no sha256 checksum to tie the pin to');
+  return guard(async () => {
+    const doc = await ctx.get(`https://pypi.org/pypi/${encodeURIComponent(name)}/${encodeURIComponent(version)}/json`);
+    const files = isObj(doc) && Array.isArray(doc.urls) ? doc.urls : [];
+    const hit = files.find((f) => isObj(f) && isObj(f.digests) && sha256Of(f.digests.sha256) === want);
+    const date = isObj(hit) ? str(hit.upload_time_iso_8601) : undefined;
+    if (!hit) return fail('no file of this PyPI release has the pinned sha256');
+    return date ? { date } : fail('PyPI has no upload time for this file');
+  });
+}
+
+async function releaseOf(ctx: Ctx, repo: string, tag: string): Promise<{ rel: Obj } | { problem: string }> {
+  const r = repoPath(repo);
+  const t = tagPath(tag);
+  if (!r || !t) return { problem: 'repo or tag name is not a plain name' };
+  const rel = await ctx.get(`https://api.github.com/repos/${r}/releases/tags/${t}`, ctx.gh);
+  return isObj(rel) ? { rel } : { problem: 'unreadable release answer' };
+}
+
+/** Finds the asset by name in a GitHub release and ties it to the sha256; date = release published_at. */
+async function assetOutcome(ctx: Ctx, repo: string, tag: string, asset: string, sha: string | undefined): Promise<Outcome> {
+  const want = sha256Of(sha);
+  if (!want) return fail('no sha256 to tie the asset to');
+  return guard(async () => {
+    const got = await releaseOf(ctx, repo, tag);
+    if ('problem' in got) return got;
+    const rel = got.rel;
+    const assets = Array.isArray(rel.assets) ? rel.assets : [];
+    const hit = assets.find((a) => isObj(a) && a.name === asset);
+    if (!isObj(hit)) return fail(`asset ${asset} is not in the GitHub release ${tag}`);
+    if (hit.browser_download_url !== `https://github.com/${repo}/releases/download/${tag}/${asset}`) return fail('asset url does not belong to this release');
+    const theirs = sha256Of(hit.digest);
+    if (!theirs) return fail('GitHub records no digest for this asset; needs owner review');
+    if (theirs !== want) return fail('pinned sha256 differs from the digest of the release asset');
+    const date = str(rel.published_at);
+    return date ? { date } : fail('release has no published_at');
+  });
+}
+
+/** An action: the pinned SHA must be the commit its tag points to; date = the tag's release published_at. */
+async function actionOutcome(ctx: Ctx, uses: string | undefined, repo: string | undefined, tag: string, sha: string | undefined): Promise<Outcome> {
+  const m = /^([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)(?:\/[^@]*)?@([0-9a-f]{40})$/.exec(uses ?? '');
+  if (!m || !repo || !sha) return fail('action needs `uses: owner/repo@<40-hex sha>`, a repo and a pin sha');
+  if (m[1] !== repo || m[2] !== sha) return fail('uses: does not match the candidate repo and pin sha');
+  return guard(async () => {
+    const r = repoPath(repo);
+    const t = tagPath(tag);
+    if (!r || !t) return fail('repo or tag name is not a plain name');
+    let ref = await ctx.get(`https://api.github.com/repos/${r}/git/ref/tags/${t}`, ctx.gh);
+    let obj = isObj(ref) && isObj(ref.object) ? ref.object : {};
+    for (let hops = 0; obj.type === 'tag' && hops < 3; hops++) {
+      ref = await ctx.get(`https://api.github.com/repos/${r}/git/tags/${encodeURIComponent(String(obj.sha))}`, ctx.gh);
+      obj = isObj(ref) && isObj(ref.object) ? ref.object : {};
+    }
+    if (obj.type !== 'commit' || obj.sha !== sha) return fail('the pinned sha is not the commit of this tag');
+    const got = await releaseOf(ctx, repo, tag);
+    if ('problem' in got) return got;
+    const date = str(got.rel.published_at);
+    return date ? { date } : fail('release has no published_at');
+  });
+}
+
+/** A Docker Hub image: the pinned digest must be the tag's digest; date = the tag's last push. */
+async function dockerOutcome(ctx: Ctx, image: string, tag: string, digest: string | undefined): Promise<Outcome> {
+  const parts = image.split('/');
+  const hubOk = parts.length <= 2 && parts.every((p) => /^[a-z0-9][a-z0-9._-]*$/.test(p)) && !(parts.length === 2 && /[.:]/.test(parts[0] as string));
+  if (!hubOk || !/^[A-Za-z0-9_][A-Za-z0-9_.-]*$/.test(tag) || !/^sha256:[0-9a-f]{64}$/.test(digest ?? '')) {
+    return fail('image is not a Docker Hub tag with a sha256 digest; needs owner review');
+  }
+  const [ns, name] = parts.length === 1 ? ['library', parts[0] as string] : (parts as [string, string]);
+  return guard(async () => {
+    const doc = await ctx.get(`https://hub.docker.com/v2/repositories/${encodeURIComponent(ns)}/${encodeURIComponent(name)}/tags/${encodeURIComponent(tag)}`);
+    if (!isObj(doc) || doc.digest !== digest) return fail('the tag on Docker Hub does not point to the pinned digest; needs owner review');
+    const date = str(doc.tag_last_pushed) ?? str(doc.last_updated);
+    return date ? { date } : fail('Docker Hub gives no push date; needs owner review');
+  });
+}
+
+// --- reviewed tools and pinned binaries -----------------------------------------------------------------------------
+
+interface Item {
+  kind: Finding['kind'];
+  name: string;
+  version: string;
+  run: (ctx: Ctx) => Promise<Outcome>;
+}
+
+const REVIEWED_SKIP = new Set(['reviewedBy', 'reviewedAt', 'proofs']);
+const BINARY_SKIP = new Set(['reviewedBy', 'reviewedAt']);
+
+function installItems(tool: string, inst: unknown, label: string): Item[] {
+  if (!isObj(inst)) return [];
+  const method = str(inst.method);
+  const pkg = str(inst.package) ?? '';
+  const version = str(inst.version) ?? '';
+  const checksum = str(inst.checksum);
+  const mk = (kind: Finding['kind'], run: Item['run']): Item[] => [{ kind, name: `${tool} (${label} ${pkg})`, version, run }];
+  if (method === 'npm') return mk('npm', (ctx) => npmOutcome(ctx, pkg, version, checksum));
+  if (method === 'pip') return mk('pypi', (ctx) => pypiOutcome(ctx, pkg, version, checksum));
+  return [];
+}
+
+/** Everything to check for the added or changed entries of data/reviewed-tools.yml. */
+export function reviewedItems(base: string | null | undefined, head: string | null | undefined): Item[] {
+  const index = (doc: Obj): Map<string, Obj> => {
+    const m = new Map<string, Obj>();
+    if (Array.isArray(doc.tools)) for (const t of doc.tools) if (isObj(t) && str(t.id)) m.set(t.id as string, t);
+    return m;
+  };
+  const before = index(yamlObj('data/reviewed-tools.yml', base));
+  const items: Item[] = [];
+  for (const [id, tool] of index(yamlObj('data/reviewed-tools.yml', head))) {
+    const old = before.get(id);
+    if (old && canon(old, REVIEWED_SKIP) === canon(tool, REVIEWED_SKIP)) continue;
+    const cand = isObj(tool.candidate) ? tool.candidate : {};
+    const step = isObj(tool.step) ? tool.step : {};
+    const cli = isObj(step.cli) ? step.cli : undefined;
+    const action = isObj(step.action) ? step.action : undefined;
+    const pin = isObj(cand.pin) ? cand.pin : {};
+    const kind = str(cand.kind);
+    const repo = str(cand.repo);
+    const version = str(cand.version) ?? '';
+    const inst = cli && isObj(cli.install) ? cli.install : undefined;
+    const label = (run: Item['run']): Item => ({ kind: 'reviewed-tool', name: id, version, run });
+    if (kind === 'action' && action) {
+      items.push(label((ctx) => actionOutcome(ctx, str(action.uses), repo, version, str(pin.sha))));
+    } else if (kind === 'cli' && inst && inst.method === 'github-release') {
+      const tag = str(inst.version) ?? '';
+      items.push(label(async (ctx) => {
+        if (tag !== version || !repo) return fail('install version differs from the candidate version, or there is no repo');
+        return assetOutcome(ctx, repo, tag, str(inst.package) ?? '', str(pin.checksum));
+      }));
+    } else if (kind === 'cli' && inst && (inst.method === 'npm' || inst.method === 'pip')) {
+      items.push(...installItems(id, inst, 'tool'));
+    } else if (kind === 'docker' && inst && inst.method === 'docker') {
+      items.push(label(async (ctx) => {
+        if (str(inst.version) !== version) return fail('install version differs from the candidate version');
+        return dockerOutcome(ctx, str(inst.package) ?? '', version, str(pin.digest));
+      }));
+    } else {
+      items.push(label(async () => fail(`kind "${kind ?? '?'}" is not one this check can tie to an upstream date; needs owner review`)));
+    }
+    if (cli && Array.isArray(cli.plugins)) cli.plugins.forEach((p, i) => items.push(...installItems(id, p, `plugin ${i + 1}`)));
+  }
+  return items;
+}
+
+const ASSET_URL = /^https:\/\/github\.com\/([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)\/releases\/download\/([^/]+)\/([^/]+)$/;
+
+/** Everything to check for the added or changed tools of data/pinned-binaries.yml. */
+export function binaryItems(base: string | null | undefined, head: string | null | undefined): Item[] {
+  const before = yamlObj('data/pinned-binaries.yml', base);
+  const items: Item[] = [];
+  for (const [name, tool] of Object.entries(yamlObj('data/pinned-binaries.yml', head))) {
+    if (!isObj(tool)) continue;
+    if (name in before && canon(before[name], BINARY_SKIP) === canon(tool, BINARY_SKIP)) continue;
+    const version = str(tool.version) ?? '';
+    const repo = str(tool.repo);
+    const platforms = isObj(tool.platforms) ? Object.entries(tool.platforms) : [];
+    items.push({
+      kind: 'pinned-binary', name, version,
+      run: async (ctx) => {
+        if (!repo || platforms.length === 0) return fail('no repo or no platforms');
+        let newest: string | undefined;
+        for (const [plat, p] of platforms) {
+          const m = ASSET_URL.exec(isObj(p) ? (str(p.url) ?? '') : '');
+          if (!m || m[1] !== repo) return fail(`${plat}: asset url is not a release asset of ${repo}`);
+          if (m[2] !== `v${version}` && m[2] !== version) return fail(`${plat}: asset url is for tag ${m[2]}, not version ${version}`);
+          const o = await assetOutcome(ctx, repo, m[2] as string, m[3] as string, isObj(p) ? str(p.archiveSha256) : undefined);
+          if ('problem' in o) return { ...o, problem: `${plat}: ${o.problem}` };
+          if (!newest || Date.parse(o.date) > Date.parse(newest)) newest = o.date;
+        }
+        return newest ? { date: newest } : fail('no date');
+      },
+    });
+  }
+  return items;
+}
+
 // --- the check ----------------------------------------------------------------------------------------------------
 
-const ISO = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?Z$/;
+const ISO = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:\d{2})$/;
 
 /** Returns a problem text when the date is too young, unreadable or in the future; otherwise undefined. */
 function judge(date: string | undefined, now: Date): string | undefined {
@@ -212,94 +498,43 @@ function judge(date: string | undefined, now: Date): string | undefined {
 
 export async function runCooldown(opts: CooldownOptions): Promise<CooldownResult> {
   const { base, head, now } = opts;
-  const maxLookups = opts.maxLookups ?? MAX_LOOKUPS;
-  const timeoutMs = opts.timeoutMs ?? LOOKUP_TIMEOUT_MS;
   const findings: Finding[] = [];
   const notes: string[] = [];
+  const ctx = makeCtx(opts, notes);
   let checked = 0;
 
-  const npmNew = newNpmVersions(base['package-lock.json'], head['package-lock.json']);
-  const pins = [
-    ...changedReviewedTools(base['data/reviewed-tools.yml'], head['data/reviewed-tools.yml']),
-    ...changedPinnedBinaries(base['data/pinned-binaries.yml'], head['data/pinned-binaries.yml']),
-  ];
-  const npmNames = [...new Set(npmNew.map((p) => p.name))];
-  const githubPins = pins.filter((p) => p.github && p.repo);
+  const baseLock = base['package-lock.json'];
+  const headLock = head['package-lock.json'];
+  if (!headLock && baseLock) {
+    findings.push({ kind: 'lockfile', name: 'package-lock.json', version: '', date: null, lookupFailed: false, problem: 'the lockfile was removed; it can not be checked' });
+  }
+  const lockProblem = lockfileProblem(headLock);
+  if (lockProblem) findings.push({ kind: 'lockfile', name: 'package-lock.json', version: '', date: null, lookupFailed: false, problem: lockProblem });
 
-  if (npmNames.length + githubPins.length > maxLookups) {
-    findings.push({
-      kind: 'npm', name: '(too many changes)', version: '', date: null, lookupFailed: false,
-      problem: `${npmNames.length + githubPins.length} lookups needed, the cap is ${maxLookups}; split the PR`,
+  type Job = { kind: Finding['kind']; name: string; version: string; run: () => Promise<Outcome> };
+  const jobs: Job[] = [];
+  for (const e of changedLockEntries(baseLock, headLock)) {
+    jobs.push({
+      kind: 'npm', name: e.name, version: e.version,
+      run: async () => (e.bad ? fail(e.bad) : !e.resolved ? fail('entry has no resolved tarball') : npmOutcome(ctx, e.name, e.version, e.integrity, e.resolved)),
     });
-    return { ok: false, checked, findings, notes };
+  }
+  for (const i of [...reviewedItems(base['data/reviewed-tools.yml'], head['data/reviewed-tools.yml']), ...binaryItems(base['data/pinned-binaries.yml'], head['data/pinned-binaries.yml'])]) {
+    jobs.push({ kind: i.kind, name: i.name, version: i.version, run: () => i.run(ctx) });
   }
 
-  // npm: one registry request per package name, then every new version of it is checked against the time map.
-  const times = new Map<string, Obj | LookupError>();
-  await pool(npmNames, CONCURRENCY, async (name) => {
-    try {
-      const doc = await getJson(opts.fetch, npmUrl(name), {}, timeoutMs);
-      times.set(name, isObj(doc) && isObj(doc.time) ? doc.time : new LookupError('no `time` map in the registry answer'));
-    } catch (e) {
-      times.set(name, e as LookupError);
+  await pool(jobs, CONCURRENCY, async (job) => {
+    checked++;
+    const o = await job.run();
+    const problem = 'problem' in o ? o.problem : judge(o.date, now);
+    if (problem) {
+      findings.push({
+        kind: job.kind, name: job.name, version: job.version, date: 'date' in o ? o.date : null,
+        problem, lookupFailed: 'problem' in o && o.lookupFailed === true,
+      });
     }
   });
-  for (const { name, version } of npmNew) {
-    checked++;
-    const t = times.get(name);
-    if (t instanceof LookupError) {
-      findings.push({ kind: 'npm', name, version, date: null, lookupFailed: true, problem: `registry lookup failed: ${t.message}` });
-      continue;
-    }
-    const date = str(t?.[version]);
-    const problem = date === undefined ? 'registry has no publish time for this version' : judge(date, now);
-    if (problem) findings.push({ kind: 'npm', name, version, date: date ?? null, lookupFailed: false, problem });
-  }
-
-  // Pins: the recorded date, plus the GitHub release date where it can be read. The younger date counts.
-  const gh: Record<string, string> = opts.githubToken ? { authorization: `Bearer ${opts.githubToken}` } : {};
-  const upstream = new Map<PinChange, string | LookupError | null>();
-  await pool(githubPins, CONCURRENCY, async (pin) => {
-    const repo = pin.repo as string;
-    if (!/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(repo)) {
-      upstream.set(pin, new LookupError('repo name is not a plain owner/name'));
-      return;
-    }
-    const tags = pin.version.startsWith('v') ? [pin.version] : [`v${pin.version}`, pin.version];
-    let last: LookupError | undefined;
-    for (const tag of tags) {
-      try {
-        const rel = await getJson(opts.fetch, `https://api.github.com/repos/${repo}/releases/tags/${encodeURIComponent(tag)}`, gh, timeoutMs);
-        const when = isObj(rel) ? str(rel.published_at) : undefined;
-        upstream.set(pin, when ?? new LookupError('release has no published_at'));
-        return;
-      } catch (e) {
-        last = e as LookupError;
-        if (!last.notFound) break;
-      }
-    }
-    // No GitHub release for the tag (a plain tag): only the recorded date can be used.
-    upstream.set(pin, last?.notFound ? null : (last as LookupError));
-  });
-  for (const pin of pins) {
-    checked++;
-    const label = `${pin.name} ${pin.version}`;
-    const up = upstream.get(pin);
-    if (up instanceof LookupError) {
-      findings.push({ kind: pin.kind, name: pin.name, version: pin.version, date: pin.recordedDate ?? null, lookupFailed: true, problem: `GitHub release lookup failed: ${up.message}` });
-      continue;
-    }
-    if (pin.github && pin.repo && up === null) notes.push(`${label}: no GitHub release found, only the recorded date was used`);
-    // The recorded date must be readable and old enough; so must the upstream date when there is one.
-    const candidates: Array<string | undefined> = up === null || up === undefined ? [pin.recordedDate] : [pin.recordedDate, up];
-    for (const d of candidates) {
-      const problem = judge(d, now);
-      if (problem) {
-        findings.push({ kind: pin.kind, name: pin.name, version: pin.version, date: d ?? null, lookupFailed: false, problem });
-        break;
-      }
-    }
-  }
+  findings.sort((a, b) => a.kind.localeCompare(b.kind) || a.name.localeCompare(b.name) || a.version.localeCompare(b.version));
 
   return { ok: findings.length === 0, checked, findings, notes };
 }
@@ -324,12 +559,16 @@ export function formatReport(r: CooldownResult): string {
 }
 
 async function readIf(dir: string, rel: string): Promise<string | null> {
+  const path = join(dir, rel);
+  let info;
   try {
-    return await readFile(join(dir, rel), 'utf8');
+    info = await lstat(path);
   } catch (e) {
     if ((e as NodeJS.ErrnoException).code === 'ENOENT') return null;
-    throw e;
+    throw new FileError(`${rel} can not be read`);
   }
+  if (!info.isFile() || info.size > MAX_BODY_BYTES) throw new FileError(`${rel} is not a regular file of a sane size`);
+  return readFile(path, 'utf8');
 }
 
 async function main(argv: string[]): Promise<number> {
@@ -359,7 +598,8 @@ if (import.meta.main) {
   main(process.argv.slice(2)).then(
     (code) => process.exit(code),
     (e: unknown) => {
-      console.error(`cooldown: error, failing closed: ${e instanceof Error ? e.message : String(e)}`);
+      // Only our own fixed messages are printed, never parser output that could echo file content.
+      console.error(`cooldown: error, failing closed: ${e instanceof FileError ? e.message : 'unexpected error'}`);
       process.exit(1);
     },
   );

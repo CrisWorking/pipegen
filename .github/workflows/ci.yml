@@ -122,7 +122,8 @@ jobs:
 
   cooldown:
     # 7-day cooldown for new or changed dependency and tool versions (DECISIONS #92, docs/cooldown.md).
-    # The BASE commit's script judges the PR's files, so a PR can't weaken the check that checks it.
+    # The BASE commit's script judges the PR's files. This protects the script file only: a PR can still edit this
+    # job, so the check is as strong as enforced code-owner review of /.github/ and /scripts/ (docs/cooldown.md).
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -132,15 +133,17 @@ jobs:
     permissions:
       contents: read
     steps:
+      # Both commits come from the same event payload, so base and head stay consistent for the whole run.
       - name: "Check out the base commit (trusted, holds the script)"
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.event.pull_request.base.sha }}
           path: base
           persist-credentials: false
-      - name: "Check out the PR (data only, its files are read and never run)"
+      - name: "Check out the PR head commit (data only, its files are read and never run)"
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ github.event.pull_request.head.sha }}
           path: head
           persist-credentials: false
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
@@ -152,9 +155,15 @@ jobs:
       - name: Run the base's cooldown script on the PR's files
         run: |
           if [ ! -f base/scripts/cooldown.ts ]; then
-            echo "::notice::base has no scripts/cooldown.ts yet (this PR introduces it); nothing to run"
-            exit 0
+            # Bootstrap: skip only when the base has no script AND this PR adds it. Anything else fails.
+            if [ -f head/scripts/cooldown.ts ]; then
+              echo "::notice::base has no scripts/cooldown.ts and this PR adds it; nothing to run yet"
+              exit 0
+            fi
+            echo "::error::scripts/cooldown.ts is missing in the base and not added by this PR"
+            exit 1
           fi
           node base/scripts/cooldown.ts --base-dir base --head-dir head
         env:
+          # Read-only job token (contents: read), given to this step only.
           GITHUB_TOKEN: ${{ github.token }}
