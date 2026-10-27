@@ -85,15 +85,20 @@ describe('mapCoverage (brief)', () => {
     }
     // job-level continue-on-error, and an expression (it may be true), count the same
     const dir2 = makeTempDir();
-    wf(dir2, 'ci.yml', `on: [push, pull_request]\n${job(run('semgrep scan'), '    continue-on-error: true\n')}`);
+    wf(dir2, 'ci.yml', `on: [push, pull_request]\n${job(run('semgrep scan --error'), '    continue-on-error: true\n')}`);
     expect(row(await coverage(dir2), 'push', 'sast', 'app').status).toBe('partial');
     const dir3 = makeTempDir();
-    wf(dir3, 'ci.yml', `on: [push, pull_request]\n${job('      - run: semgrep scan\n        continue-on-error: \${{ matrix.experimental }}\n')}`);
+    wf(dir3, 'ci.yml', `on: [push, pull_request]\n${job('      - run: semgrep scan --error\n        continue-on-error: \${{ matrix.experimental }}\n')}`);
     expect(row(await coverage(dir3), 'push', 'sast', 'app').status).toBe('partial');
-    // continue-on-error: false is blocking
+    // continue-on-error: false is blocking, but only when the run itself fails on findings: semgrep scan needs --error
     const dir4 = makeTempDir();
-    wf(dir4, 'ci.yml', `on: [push, pull_request]\n${job('      - run: semgrep scan\n        continue-on-error: false\n')}`);
+    wf(dir4, 'ci.yml', `on: [push, pull_request]\n${job('      - run: semgrep scan --error\n        continue-on-error: false\n')}`);
     expect(row(await coverage(dir4), 'push', 'sast', 'app').status).toBe('covered');
+    const dir5 = makeTempDir();
+    wf(dir5, 'ci.yml', `on: [push, pull_request]\n${job('      - run: semgrep scan\n        continue-on-error: false\n')}`);
+    const r5 = row(await coverage(dir5), 'push', 'sast', 'app');
+    expect(r5).toMatchObject({ status: 'partial', by: 'semgrep-scan' });
+    expect(r5.why).toBe("The semgrep-scan check runs, but doesn't fail on findings unless told to, so it can't block anything.");
   });
 
   it('coverage: local reusable workflow followed one level', async () => {
@@ -147,7 +152,7 @@ describe('mapCoverage (rulings)', () => {
     expect(row(rows, 'pre-commit', 'hooks')).toMatchObject({ status: 'covered', by: 'pre-commit' });
     expect(row(rows, 'pre-commit', 'format-lint', 'app').status).toBe('missing'); // manual stage only: not a pre-commit hook
     const dir2 = makeTempDir();
-    writeIn(dir2, 'lefthook.yml', 'pre-commit:\n  commands:\n    leaks:\n      run: trufflehog git file://. --since-commit HEAD\n');
+    writeIn(dir2, 'lefthook.yml', 'pre-commit:\n  commands:\n    leaks:\n      run: trufflehog git file://. --since-commit HEAD --fail\n');
     expect(row(await coverage(dir2), 'pre-commit', 'secrets')).toMatchObject({ status: 'covered', by: 'trufflehog', where: 'lefthook.yml' });
   });
 
@@ -248,7 +253,7 @@ jobs:
       - run: |
           cd apps/web
           npx vitest run
-      - run: semgrep scan
+      - run: semgrep ci
 `);
     const services = [svc('apps/api'), svc('apps/web')];
     const rows = await coverage(dir, { services, monorepo: 'npm-workspaces' });
@@ -290,7 +295,7 @@ jobs:
     symlinkSync(join(outside, 'husky'), join(dir, '.husky'));
     const listed = listedWorkflow('.github/workflows/ci.yml');
     const rows = await coverage(dir, { existingWorkflows: [listed], precommit: 'husky' });
-    expect(row(rows, 'push', 'secrets').status).toBe('missing');
+    expect(row(rows, 'push', 'secrets')).toMatchObject({ status: 'unknown', why: "Some workflow files couldn't be read, so pipegen can't tell." });
     expect(row(rows, 'pre-commit', 'secrets').status).not.toBe('covered');
     // a local action reached through a symbolic link
     const dir2 = makeTempDir();
@@ -319,7 +324,7 @@ jobs:
     const bad = '.github/workflows/a‮b.yml';
     writeIn(dir, bad, `on: push\n${job(run('gitleaks detect'))}`);
     const listed = listedWorkflow(bad);
-    expect(row(await coverage(dir, { existingWorkflows: [listed] }), 'push', 'secrets').status).toBe('missing');
+    expect(row(await coverage(dir, { existingWorkflows: [listed] }), 'push', 'secrets').status).toBe('unknown'); // never a silent skip
     // a very long job id: where is capped; a job id that fails the pattern is shown by number
     const dir2 = makeTempDir();
     const long = `j${'x'.repeat(1000)}`; // YAML keys stay under 1024 characters
@@ -329,6 +334,223 @@ jobs:
     expect(Array.from(where).length).toBeLessThanOrEqual(300);
     expect(where.startsWith('.github/workflows/ci.yml (job j')).toBe(true);
     expect(row(rows, 'push', 'sast', 'app').where).toBe('.github/workflows/ci.yml (job #2)');
+  });
+});
+
+/** The status (and row) of one need for a single workflow body, with optional profile overrides. */
+async function one(body: string, layer: Layer, id: string, over: Partial<RepoProfile> = {}, service?: string): Promise<Coverage> {
+  const dir = makeTempDir();
+  wf(dir, 'ci.yml', body);
+  return row(await coverage(dir, over), layer, id, service);
+}
+const both = 'on: [push, pull_request]\n';
+const runnable = { services: [svc('.', { scripts: ['start'] })] };
+
+describe('mapCoverage (fix round 1)', () => {
+  it('coverage: I1 shell suppression (|| true, || :, || exit 0, set +e) → partial', async () => {
+    for (const cmd of ['gitleaks detect || true', 'gitleaks detect || :', 'gitleaks detect || exit 0', 'gitleaks detect && echo ok || true']) {
+      const r = await one(`${both}${job(run(JSON.stringify(cmd)))}`, 'push', 'secrets'); // quoted: a bare `|| :` would be a YAML key
+      expect(r.status, cmd).toBe('partial');
+      expect(r.why).toBe("The gitleaks check runs, but its exit code is ignored (|| true, || exit 0 or set +e), so it can't block anything.");
+    }
+    expect((await one(`${both}${job('      - run: |\n          set +e\n          gitleaks detect\n')}`, 'push', 'secrets')).status).toBe('partial');
+    // set -e turns errexit back on; a later || true in another list doesn't reach the tool
+    expect((await one(`${both}${job('      - run: |\n          set +e\n          set -eo pipefail\n          gitleaks detect\n')}`, 'push', 'secrets')).status).toBe('covered');
+    expect((await one(`${both}${job(run('gitleaks detect; echo done || true'))}`, 'push', 'secrets')).status).toBe('covered');
+    // a hook that swallows the exit code is partial too; a non-blocking need (format-lint) only needs the tool to run
+    const dir = makeTempDir();
+    writeIn(dir, '.husky/pre-commit', 'gitleaks protect --staged || true\nnpx lint-staged || true\n');
+    const rows = await coverage(dir);
+    expect(row(rows, 'pre-commit', 'secrets').status).toBe('partial');
+    expect(row(rows, 'pre-commit', 'format-lint', 'app').status).toBe('covered');
+  });
+
+  it('coverage: I1 soft-fail flags and tools that fail only with a flag', async () => {
+    const st = async (cmd: string, id = 'secrets', over: Partial<RepoProfile> = {}) =>
+      (await one(`${both}${job(run(cmd))}`, id === 'iac' ? 'merge' : 'push', id, over, id === 'secrets' || id === 'iac' ? undefined : 'app')).status;
+    expect(await st('gitleaks detect --exit-code 0')).toBe('partial');
+    expect(await st('gitleaks detect --exit-code=0')).toBe('partial');
+    expect(await st('gitleaks detect --exit-code 1')).toBe('covered');
+    expect(await st('trufflehog git file://.')).toBe('partial'); // the CLI fails only with --fail
+    expect(await st('trufflehog git file://. --fail')).toBe('covered');
+    expect(await st('trivy fs .', 'deps')).toBe('partial'); // trivy exits 0 on findings unless --exit-code
+    expect(await st('trivy fs --exit-code 1 .', 'deps')).toBe('covered');
+    expect(await st('trivy fs --exit-code 0 .', 'deps')).toBe('partial');
+    expect(await st('grype dir:.', 'deps')).toBe('partial');
+    expect(await st('grype dir:. --fail-on high', 'deps')).toBe('covered');
+    expect(await st('semgrep ci', 'sast')).toBe('covered');
+    expect(await st('semgrep --config auto --error', 'sast')).toBe('covered');
+    expect(await st('semgrep --config auto', 'sast')).toBe('partial');
+    expect(await st('detect-secrets-hook --baseline .secrets.baseline')).toBe('covered');
+    expect(await st('detect-secrets scan > .secrets.baseline')).toBe('partial');
+    expect(await st('checkov -d . --soft-fail', 'iac', { terraformDirs: ['infra'] })).toBe('partial');
+    expect(await st('checkov -d .', 'iac', { terraformDirs: ['infra'] })).toBe('covered');
+    // flags on continuation lines belong to the same command
+    expect((await one(`${both}${job('      - run: |\n          trivy fs . \\\\\n            --exit-code 1\n')}`, 'push', 'deps', {}, 'app')).status).toBe('covered');
+    const r = await one(`${both}${job(run('gitleaks detect --exit-code 0'))}`, 'push', 'secrets');
+    expect(r.why).toBe("The gitleaks check runs, but is set not to fail on findings, so it can't block anything.");
+  });
+
+  it('coverage: I1 action inputs: exit-code, fail-build, fail_action, soft_fail, warn-only', async () => {
+    const st = async (uses: string, withLines: string, id: string, over: Partial<RepoProfile> = {}, service?: string) =>
+      (await one(`${both}${job(`      - uses: ${uses}\n${withLines === '' ? '' : `        with:\n${withLines}`}`)}`, id === 'iac' ? 'merge' : 'push', id, over, service)).status;
+    expect(await st('aquasecurity/trivy-action@0.28.0', '', 'deps', {}, 'app')).toBe('partial');
+    expect(await st('aquasecurity/trivy-action@0.28.0', "          exit-code: '1'\n", 'deps', {}, 'app')).toBe('covered');
+    expect(await st('aquasecurity/trivy-action@0.28.0', "          exit-code: '0'\n", 'deps', {}, 'app')).toBe('partial');
+    expect(await st('aquasecurity/trivy-action@0.28.0', '          exit-code: ${{ inputs.code }}\n', 'deps', {}, 'app')).toBe('partial');
+    expect(await st('anchore/scan-action@v6', '', 'deps', {}, 'app')).toBe('covered');
+    expect(await st('anchore/scan-action@v6', '          fail-build: false\n', 'deps', {}, 'app')).toBe('partial');
+    expect(await st('trufflesecurity/trufflehog@v3', '', 'secrets')).toBe('covered'); // the action always passes --fail
+    expect(await st('bridgecrewio/checkov-action@v12', '          soft_fail: true\n', 'iac', { terraformDirs: ['infra'] })).toBe('partial');
+    expect(await st('actions/dependency-review-action@v4', '          warn-only: true\n', 'deps', {}, 'app')).toBe('partial');
+    expect(await st('actions/dependency-review-action@v4', '', 'deps', {}, 'app')).toBe('covered');
+    const dast = async (withLines: string) => (await one(`${both}${job(`      - uses: zaproxy/action-baseline@v0.14.0\n${withLines}`)}`, 'merge', 'dast', runnable, 'app')).status;
+    expect(await dast('')).toBe('partial'); // fail_action defaults to false
+    expect(await dast("        with:\n          fail_action: true\n")).toBe('covered');
+  });
+
+  it('coverage: U5 CodeQL analyze is partial with its own why', async () => {
+    const r = await one(`${both}${job('      - uses: github/codeql-action/init@v3\n      - uses: github/codeql-action/analyze@v3\n')}`, 'merge', 'sast', {}, 'app');
+    expect(r).toMatchObject({ status: 'partial', by: 'codeql' });
+    expect(r.why).toBe('CodeQL reports findings but does not fail the job; they block only if code scanning merge protection is on.');
+    // upload-sarif alone is not CodeQL
+    expect((await one(`${both}${job('      - uses: github/codeql-action/upload-sarif@v3\n')}`, 'merge', 'sast', {}, 'app')).status).toBe('missing');
+  });
+
+  it('coverage: I2 a paths or paths-ignore filter is the wrong trigger', async () => {
+    const on = "on:\n  push:\n    paths: ['src/**']\n  pull_request:\n    paths-ignore: ['docs/**']\n";
+    const push = await one(`${on}${job(run('gitleaks detect'))}`, 'push', 'secrets');
+    expect(push.status).toBe('partial');
+    expect(push.why).toBe('The gitleaks check runs, but not on every push.');
+    expect((await one(`${on}${job(run('gitleaks detect'))}`, 'merge', 'secrets')).status).toBe('partial');
+    expect((await one(`on:\n  push:\n    branches: [main]\n    paths: ['src/**']\n${job(run('syft .'))}`, 'deploy', 'sbom', runnable, 'app')).status).toBe('partial');
+  });
+
+  it('coverage: I3 job and step if: conditions', async () => {
+    const st = async (cond: string, layer: Layer, where: 'job' | 'step' = 'job') => {
+      const body = where === 'job'
+        ? `${both}jobs:\n  scan:\n    runs-on: x\n    if: ${cond}\n    steps:\n${run('gitleaks detect')}`
+        : `${both}${job(`      - run: gitleaks detect\n        if: ${cond}\n`)}`;
+      return one(body, layer, 'secrets');
+    };
+    const merge = await st("github.event_name == 'push'", 'merge');
+    expect(merge.status).toBe('partial');
+    expect(merge.why).toBe('The gitleaks check runs only when a condition holds, so it may not run on every pull request.');
+    expect((await st("github.ref == 'refs/heads/main'", 'push')).status).toBe('partial');
+    expect((await st("${{ github.ref == 'refs/heads/main' }}", 'push', 'step')).status).toBe('partial');
+    expect((await st('false', 'push')).status).toBe('missing'); // a disabled job runs nothing
+    expect((await st('${{ false }}', 'push', 'step')).status).toBe('missing');
+    expect((await st('always()', 'push')).status).toBe('covered');
+    expect((await st('${{ !cancelled() }}', 'push', 'step')).status).toBe('covered');
+    expect((await st("github.repository == 'o/r'", 'push')).status).toBe('covered'); // a fork guard
+    expect((await st("success() && (github.repository_owner == 'o')", 'push')).status).toBe('covered');
+    expect((await st('failure()', 'push')).status).toBe('partial'); // runs only after something failed
+    // a calling job's if: applies to the called workflow
+    const dir = makeTempDir();
+    wf(dir, 'ci.yml', `${both}jobs:\n  sec:\n    if: github.event_name == 'push'\n    uses: ./.github/workflows/sec.yml\n`);
+    wf(dir, 'sec.yml', `on: workflow_call\n${job(run('gitleaks detect'))}`);
+    expect(row(await coverage(dir), 'merge', 'secrets').status).toBe('partial');
+  });
+
+  it('coverage: I4 exact action paths; setup-only actions and npm audit signatures never count', async () => {
+    const st = async (steps: string, layer: Layer, id: string, over: Partial<RepoProfile> = {}) => (await one(`${both}${job(steps)}`, layer, id, over, 'app')).status;
+    expect(await st('      - uses: snyk/actions/setup@master\n', 'push', 'deps')).toBe('missing');
+    expect(await st('      - uses: snyk/actions/node@master\n', 'push', 'deps')).toBe('covered');
+    expect(await st('      - uses: snyk/actions/python-3.10@master\n', 'push', 'deps')).toBe('covered');
+    expect(await st('      - uses: anchore/sbom-action/download-syft@v0\n', 'deploy', 'sbom', runnable)).toBe('missing');
+    expect(await st('      - uses: biomejs/setup-biome@v2\n', 'push', 'lint')).toBe('missing');
+    expect(await st(run('npm audit signatures'), 'push', 'deps')).toBe('missing');
+    expect(await st(run('npm audit --audit-level=high'), 'push', 'deps')).toBe('covered');
+  });
+
+  it('coverage: I5 uses: steps run from the root even when the job has a run default', async () => {
+    const services = [svc('apps/api'), svc('apps/web')];
+    const dir = makeTempDir();
+    wf(dir, 'ci.yml', `${both}jobs:\n  sast:\n    runs-on: x\n    defaults:\n      run:\n        working-directory: apps/api\n    steps:\n      - uses: github/codeql-action/analyze@v3\n      - uses: ./.github/actions/scan\n`);
+    writeIn(dir, '.github/actions/scan/action.yml', 'runs:\n  using: composite\n  steps:\n    - run: gitleaks detect\n      shell: bash\n    - run: osv-scanner -r .\n      shell: bash\n');
+    const rows = await coverage(dir, { services, monorepo: 'npm-workspaces' });
+    for (const s of ['api', 'web']) {
+      expect(row(rows, 'push', 'sast', s).status).toBe('partial'); // reached every service (CodeQL is partial, U5)
+      expect(row(rows, 'push', 'deps', s).status).toBe('covered'); // a composite action's run steps start at the root
+    }
+  });
+
+  it('coverage: M1 workflows readWorkflows skipped make would-be-missing rows unknown', async () => {
+    const dir = makeTempDir();
+    const p = await profileOf(dir);
+    const rows = await mapCoverage(p, floorNeeds(p, caps), dir, { skippedWorkflows: 1 });
+    const r = row(rows, 'push', 'secrets');
+    expect(r).toMatchObject({ status: 'unknown', why: "Some workflow files couldn't be read, so pipegen can't tell." });
+    expect(row(rows, 'pre-commit', 'secrets').status).toBe('missing'); // hooks are read directly
+    expect(row(rows, 'merge', 'gate').status).toBe('missing');
+  });
+
+  it('coverage: M2 a tool counts only where a command starts', async () => {
+    const st = async (cmd: string, id = 'secrets') => (await one(`${both}${job(run(cmd))}`, 'push', id, {}, id === 'secrets' ? undefined : 'app')).status;
+    expect(await st('pip install semgrep', 'sast')).toBe('missing');
+    expect(await st('echo "TODO gitleaks"')).toBe('missing');
+    expect(await st('some-tool --format semgrep', 'sast')).toBe('missing');
+    expect(await st('curl -sL https://github.com/gitleaks/gitleaks/releases/download/v8/gitleaks.tgz | tar xz')).toBe('missing');
+    expect(await st('./bin/gitleaks detect')).toBe('covered');
+    expect(await st('env CI=1 GITLEAKS_CONFIG=x gitleaks detect')).toBe('covered');
+    expect(await st('sudo -E gitleaks detect')).toBe('covered');
+    expect(await st('time gitleaks detect')).toBe('covered');
+    expect(await st('npx --yes eslint .', 'lint')).toBe('covered');
+    expect(await st('pnpm dlx eslint .', 'lint')).toBe('covered');
+    expect(await st('uv run pytest', 'unit-tests')).toBe('covered');
+    expect(await st('pipx run pip-audit', 'deps')).toBe('covered');
+    expect(await st('python -m semgrep ci', 'sast')).toBe('covered');
+    expect(await st('echo start && gitleaks detect')).toBe('covered');
+    expect(await st('result=$(gitleaks detect)')).toBe('covered');
+    expect(await st('docker run --rm -v "$GITHUB_WORKSPACE:/repo" zricethezav/gitleaks:v8.18.0 detect --source /repo')).toBe('covered');
+    expect(await st('docker run --rm -v "$GITHUB_WORKSPACE:/src" aquasec/trivy:0.50.0 fs /src', 'deps')).toBe('partial'); // no --exit-code
+  });
+
+  it('coverage: M5 docker:// steps, unknown cd targets, symlinked .github, types and branch filter edge cases', async () => {
+    const r = await one(`${both}${job('      - uses: docker://zricethezav/gitleaks:v8.18.0\n        with:\n          args: detect --exit-code 0\n')}`, 'push', 'secrets');
+    expect(r).toMatchObject({ status: 'partial', by: 'gitleaks' });
+    expect((await one(`${both}${job('      - uses: docker://ghcr.io/gitleaks/gitleaks:latest\n')}`, 'push', 'secrets')).status).toBe('covered');
+    // cd to a directory that can't be known: repo-wide needs still count, per-service needs don't
+    expect((await one(`${both}${job(run('cd "$APP_DIR" && gitleaks detect'))}`, 'push', 'secrets')).status).toBe('covered');
+    expect((await one(`${both}${job(run('cd "$APP_DIR" && npm test'))}`, 'push', 'unit-tests', {}, 'app')).status).toBe('missing');
+    // types without synchronize: not every pull request update
+    expect((await one(`on:\n  pull_request:\n    types: [opened]\n${job(run('gitleaks detect'))}`, 'merge', 'secrets')).status).toBe('partial');
+    // branches and branches-ignore together are invalid: never the right trigger
+    expect((await one(`on:\n  push:\n    branches: ['**']\n    branches-ignore: [main]\n${job(run('gitleaks detect'))}`, 'push', 'secrets')).status).toBe('partial');
+    // glob features: [class], ? (zero or one of the previous character), + (one or more), \ escapes
+    const push = async (patterns: string) => (await one(`on:\n  push:\n    branches: [${patterns}, 'feature/**']\n${job(run('gitleaks detect'))}`, 'push', 'secrets')).status;
+    expect(await push("'[p]ipegen-feature'")).toBe('covered');
+    expect(await push("'[q-z]ipegen-feature'")).toBe('partial');
+    expect(await push("'pipegen-featurex?'")).toBe('covered');
+    expect(await push("'pipegen-featur+e'")).toBe('covered');
+    expect(await push("'pipegen-featurx+e'")).toBe('partial');
+    expect(await push("'pipegen\\-feature'")).toBe('covered');
+    // a symlinked whole .github: nothing behind it is read
+    const outside = makeTempDir();
+    writeIn(outside, 'workflows/ci.yml', `on: push\n${job(run('gitleaks detect'))}`);
+    const dir = makeTempDir();
+    symlinkSync(outside, join(dir, '.github'));
+    const rows = await coverage(dir, { existingWorkflows: [listedWorkflow('.github/workflows/ci.yml')] });
+    expect(row(rows, 'push', 'secrets').status).toBe('unknown');
+  });
+
+  it('coverage: M5 a workflow over the job cap gives unknown, never missing', async () => {
+    const jobs = Array.from({ length: 101 }, (_, i) => `  j${i}:\n    runs-on: x\n    steps:\n${run('echo hi')}`).join('');
+    const r = await one(`${both}jobs:\n${jobs}`, 'push', 'secrets');
+    expect(r).toMatchObject({ status: 'unknown', why: "The workflows are too large to read in full, so pipegen can't tell." });
+  });
+
+  it('coverage: M5 hostile 4 KB lines across a 1 MB workflow finish quickly (linear scan)', async () => {
+    const kinds = ['cd a && ', 'npm ', '|| ', 'docker run -v x ', 'sudo env A=1 ', '$(', 'trivy ', '"\'', 'set +e; '];
+    const lines = kinds.map((k) => k.repeat(Math.floor(3900 / k.length)));
+    const body = Array.from({ length: 240 }, (_, i) => `          ${lines[i % lines.length]}`).join('\n');
+    const dir = makeTempDir();
+    wf(dir, 'ci.yml', `${both}jobs:\n  j:\n    runs-on: x\n    if: ${'('.repeat(3000)}always()${')'.repeat(3000)}\n    steps:\n      - run: |\n${body}\n`);
+    const p = await profileOf(dir);
+    expect(p.existingWorkflows).toHaveLength(1); // under the 1 MB read limit, so it really is scanned
+    const t = performance.now();
+    await mapCoverage(p, floorNeeds(p, caps), dir);
+    expect(performance.now() - t).toBeLessThan(2000);
   });
 });
 
@@ -355,6 +577,11 @@ describe('loadToolSignatures (S1)', () => {
     expect(load('tools:\n  - id: a\n    categories: [secrets]\n    actions: [noslash]\n')).toThrow(/not valid/);
     expect(load('tools:\n  - id: a\n    categories: [secrets]\n    commands: ["a(b|c)*"]\n')).toThrow(/not valid/);
     expect(load('tools:\n  - id: a\n    categories: [secrets]\n')).toThrow(/not valid/);
+    expect(load('tools:\n  - id: a\n    categories: [secrets]\n    commands: [a]\n    commandFails: flag\n')).toThrow(/not valid/); // flag needs failFlags
+    expect(load('tools:\n  - id: a\n    categories: [secrets]\n    actions: [o/a]\n    actionFails: input\n')).toThrow(/not valid/); // input needs failInputs
+    expect(load('tools:\n  - id: a\n    categories: [secrets]\n    commands: [a]\n    softFlags: [exit-zero]\n')).toThrow(/not valid/); // not a flag
+    expect(load('tools:\n  - id: a\n    categories: [secrets]\n    commands: [a]\n    partialWhy: lower case and no stop\n')).toThrow(/not valid/);
+    expect(load('tools:\n  - id: a\n    categories: [secrets]\n    actions: [o/a*/b]\n')).toThrow(/not valid/); // * only on the last part
     expect(load('tools:\n  - id: a\n    categories: [secrets]\n    commands: [a]\n  - id: a\n    categories: [sast]\n    commands: [b]\n')).toThrow(/not valid/);
   });
 });

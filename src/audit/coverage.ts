@@ -1,34 +1,46 @@
 // Coverage mapper (Plan U Task 1): which floor needs a repo's existing workflows and git hooks already cover.
 //
-// Rules (plan + pre-flight rulings S1-S6, S26):
-// - covered: a matching tool runs on the right trigger for the layer and can fail the run. Push layer = every push
-//   to any branch; merge layer = pull_request to the default branch; deploy layer = a workflow that deploys, or runs on
-//   push to the default branch, on a tag push or on release. Pre-commit = the active hook manager's pre-commit hook
+// Rules (plan + pre-flight rulings S1-S6, S26; review rulings U1-U5):
+// - covered: a matching tool runs on the right trigger for the layer, unconditionally, and fails the run when it finds
+//   something. Push layer = every push to any branch; merge layer = pull_request to the default branch; deploy layer =
+//   a workflow that deploys, or runs on push to the default branch, on a tag push or on release. A `paths` or
+//   `paths-ignore` filter makes the event the wrong trigger. Pre-commit = the active hook manager's pre-commit hook
 //   runs a matching tool; `hooks` = a hook manager exists (p.precommit).
-// - partial: the right tool on the wrong trigger (incl. pull_request_target, workflow_dispatch, schedule, a push filter
-//   that leaves out feature branches), or allowed to fail (continue-on-error true or an expression).
+// - partial: the right tool on the wrong trigger (pull_request_target, workflow_dispatch, schedule, a push filter that
+//   leaves out feature branches, a paths filter), or a run that can't block: continue-on-error, `|| true` / `|| :` /
+//   `|| exit 0` / `set +e`, a soft-fail flag or input, a tool that only fails when told to (trivy, grype, semgrep scan,
+//   the trufflehog CLI, the ZAP actions) or never fails (CodeQL, ruling U5), or a job or step `if:` other than status
+//   functions and a fork guard. A need that is not blocking (format-lint) only cares whether the tool runs.
 // - unknown: a remote reusable workflow, an action from the repo owner's own account (likely a composite action), a
-//   second-level local call, a local call pipegen refused or couldn't read, or more workflow text than the budget.
+//   second-level local call, a local call pipegen refused or couldn't read, a listed workflow that couldn't be read
+//   again (or that readWorkflows skipped: opts.skippedWorkflows), or more workflow text than the budget.
 // - missing: nothing matches. `gate` and `deploy-verify` are always missing: they are pipegen's own checks.
-// A job with a working directory (workflow or job default, step working-directory, or `cd <dir>` in a run line)
-// covers only the service under that directory; any other job covers every service (S26).
+// A tool counts only where a command starts: at the line start, after ; && || | & ( $( { or a wrapper (npx, sudo, env
+// VAR=…, time, pnpm/yarn dlx, uv run, pipx run, python -m, sh/bash, …), as the basename of a path, or as the image
+// after `docker run [flags]`. A `run:` step's directory is its working-directory, else the job's or workflow's
+// defaults.run working-directory, then `cd <dir>`; the tool covers only the service under that directory (S26).
+// `uses:` steps, composite actions and called workflows start at the repo root (U3).
 //
 // Hostile input: workflow, action and hook files are attacker-controlled. They are read only by path from the list
 // readProject made (p.existingWorkflows) plus local `uses: ./…` targets, every path level checked for symbolic links,
 // the real path checked to stay inside the repo, through the read limits (1 MB, binary refused, YAML alias cap), with
-// jobs, steps, files and scanned bytes capped. Regexes are linear and only run on lines of 4 KB or less.
-// Output follows the src/types.ts rule, RAW but VALIDATED, cleaned at output: `why` is pipegen's own text only;
-// `by` is a tool-signature id from data/tool-signatures.yml, an own-script phrase built from fixed words, a hook manager
-// name, or a repo `uses:` value kept only when it matches REF_RE (ASCII letters, digits and . _ - / @; at most 200
-// characters; unchanged by safeText); `where` joins workflow and action paths that are unchanged by safeText with job
-// ids that pass JOB_ID_RE (else "#n"), cut to MAX_WHERE code points. Task 3 still cleans `by` and `where` with
-// safeText / safeMarkdown when it prints them.
+// jobs, steps, files, findings and scanned bytes capped. Regexes are linear and only run on lines of 4 KB or less; the
+// shell scan is one tokenising pass per line plus bounded look-ahead.
+// Output follows the src/types.ts rule, RAW but VALIDATED, cleaned at output: `why` is pipegen's own text only
+// (including a signature's `partialWhy`, from pipegen's data file); `by` is a tool-signature id from
+// data/tool-signatures.yml, an own-script phrase built from fixed words, a hook manager name, or a repo `uses:` value
+// kept only when it matches REF_RE (ASCII letters, digits and . _ - / @; at most 200 characters; unchanged by safeText);
+// `where` joins workflow and action paths that are unchanged by safeText with job ids that pass JOB_ID_RE (else "#n"),
+// cut to MAX_WHERE code points. Task 3 still cleans `by` and `where` with safeText / safeMarkdown when it prints them.
+//
+// mapCoverage throws when data/tool-signatures.yml is missing or invalid (loadToolSignatures); the caller (Plan U
+// Task 2) must catch that and say so plainly.
 import { readFileSync } from 'node:fs';
 import { lstat, realpath } from 'node:fs/promises';
 import { join, posix, sep } from 'node:path';
 import { parse } from 'yaml';
 import { z } from 'zod';
-import { linkedLevel, parseYamlLimited, readTextLimitedWithReason, regexLines, regexSafe } from '../read/limits.js';
+import { READ_LIMITS, linkedLevel, parseYamlLimited, readTextLimitedWithReason, regexSafe } from '../read/limits.js';
 import { asObj, type Obj } from '../read/manifest.js';
 import { JOB_ID_RE, MAX_WORKFLOWS, TRIGGER_RE, WORKFLOW_FILE } from '../read/workflows.js';
 import { NEED_CATEGORIES, type Layer, type Need, type RepoProfile, type Service } from '../types.js';
@@ -37,27 +49,58 @@ import { safeText } from '../util/safe-text.js';
 
 export interface Coverage { need: Need; status: 'covered' | 'partial' | 'missing' | 'unknown'; by?: string; where?: string; why: string }
 
+export interface MapCoverageOptions {
+  /** How many workflow files readWorkflows skipped (unreadable, over the cap): rows that would be missing say unknown. */
+  skippedWorkflows?: number;
+}
+
 // ---------- tool signatures (ruling S1) ----------
 
 const ID_RE = /^[a-z0-9][a-z0-9-]{0,63}$/;
 const PART_RE = /^[A-Za-z0-9_.-]+$/;
+const LAST_PART_RE = /^[A-Za-z0-9_.-]+\*?$/;
+const FLAG_RE = /^-{1,2}[A-Za-z0-9][A-Za-z0-9-]*(?:=[A-Za-z0-9._-]+)?$/;
+const INPUT_RE = /^[A-Za-z0-9_-]{1,64}$/;
+const INPUT_VALUE_RE = /^(?:\*|[a-z0-9._ -]{1,64})$/;
+const WHY_RE = /^[A-Z][^\n\r]{0,299}\.$/;
 
-/** owner/name, optionally with a sub-path (owner/name/sub): parts split on "/", each a plain name. */
+/** owner/name, optionally with a sub-path; the last part may end with * (a prefix: snyk/actions/python*). */
 function isActionRef(s: string): boolean {
   const parts = s.split('/');
-  return s.length <= 200 && parts.length >= 2 && parts.every((x) => PART_RE.test(x) && x !== '.' && x !== '..');
+  return s.length <= 200 && parts.length >= 2
+    && parts.every((x, i) => (i === parts.length - 1 ? LAST_PART_RE : PART_RE).test(x) && x !== '.' && x !== '..');
 }
 /** Words of [A-Za-z0-9_.-] joined by one space or one slash, e.g. "gitleaks", "npm audit", ".husky/pre-commit". */
 function isCommand(s: string): boolean {
   return s.length <= 64 && s.split(/[ /]/).every((x) => PART_RE.test(x));
 }
 
+const inputs = z.record(z.string().regex(INPUT_RE), z.array(z.string().regex(INPUT_VALUE_RE)).min(1));
+
 const signatureSchema = z.strictObject({
   id: z.string().regex(ID_RE),
   categories: z.array(z.enum(NEED_CATEGORIES)).min(1),
-  actions: z.array(z.string().refine(isActionRef, 'must be owner/name')).min(1).optional(),
+  actions: z.array(z.string().refine(isActionRef, 'must be owner/name[/sub]')).min(1).optional(),
   commands: z.array(z.string().refine(isCommand, 'must be whole-word command names')).min(1).optional(),
-}).refine((t) => t.actions !== undefined || t.commands !== undefined, { message: 'needs actions or commands' });
+  /** Longer commands that start like one of `commands` but are not this check (npm audit signatures). */
+  excludes: z.array(z.string().refine(isCommand, 'must be whole-word command names')).min(1).optional(),
+  /** default: a run fails on findings; flag: only with one of failFlags; never: it only reports. */
+  commandFails: z.enum(['default', 'flag', 'never']).optional(),
+  failFlags: z.array(z.string().regex(FLAG_RE)).min(1).optional(),
+  /** Flags that stop a run from failing ("--exit-code=0" also matches "--exit-code 0"). */
+  softFlags: z.array(z.string().regex(FLAG_RE)).min(1).optional(),
+  /** default: the action fails on findings; input: only with one of failInputs; never: it only reports. */
+  actionFails: z.enum(['default', 'input', 'never']).optional(),
+  failInputs: inputs.optional(),
+  /** `with:` inputs (name → lowercase values) that stop the action from failing. */
+  softInputs: inputs.optional(),
+  /** pipegen's own sentence for a run that can never block (commandFails or actionFails never). */
+  partialWhy: z.string().regex(WHY_RE).refine((s) => safeText(s, 300) === s, 'must be plain text').optional(),
+})
+  .refine((t) => t.actions !== undefined || t.commands !== undefined, { message: 'needs actions or commands' })
+  .refine((t) => t.commandFails !== 'flag' || t.failFlags !== undefined, { message: 'commandFails: flag needs failFlags' })
+  .refine((t) => t.actionFails !== 'input' || t.failInputs !== undefined, { message: 'actionFails: input needs failInputs' })
+  .refine((t) => t.excludes === undefined || t.commands !== undefined, { message: 'excludes needs commands' });
 
 const signaturesSchema = z.strictObject({ tools: z.array(signatureSchema).min(1) })
   .refine((f) => new Set(f.tools.map((t) => t.id)).size === f.tools.length, { message: 'ids must be unique' });
@@ -80,27 +123,41 @@ export function loadToolSignatures(path: string = packageDataPath('tool-signatur
   return parsed.data.tools;
 }
 
-/** One way to recognise a tool in a line: the first word, then (for multi-word commands) the rest, anchored after it. */
-interface CommandMatcher { tool: ToolSignature; rest: RegExp | null }
-interface Compiled { byFirstWord: Map<string, CommandMatcher[]>; actions: { tool: ToolSignature; parts: string[] }[] }
-
 const WORD_CHARS = 'A-Za-z0-9_.-';
+const NOT_WORD = `(?![${WORD_CHARS}])`;
 const escapeRe = (s: string) => s.replace(/[.*+?^${}()|[\]\\/-]/g, '\\$&');
+/** " audit" → /\s+audit(?!word char)/y, matched right after the first word. */
+const restRegex = (tail: string) => new RegExp(`${tail.split(' ').map(escapeRe).join('\\s+')}${NOT_WORD}`, 'y');
+
+/** One way to recognise a command: the first word (or a whole path), then the rest anchored after it. */
+interface CommandRule { tool: ToolSignature; rest: RegExp | null; excludes: RegExp[] }
+interface ActionRule { tool: ToolSignature; parts: string[]; prefixLast: boolean }
+interface Compiled { byFirstWord: Map<string, CommandRule[]>; byPath: Map<string, CommandRule[]>; actions: ActionRule[] }
 
 function compile(tools: ToolSignature[]): Compiled {
-  const byFirstWord = new Map<string, CommandMatcher[]>();
-  const actions: Compiled['actions'] = [];
+  const byFirstWord = new Map<string, CommandRule[]>();
+  const byPath = new Map<string, CommandRule[]>();
+  const actions: ActionRule[] = [];
+  const firstOf = (cmd: string) => cmd.split(' ')[0] as string;
   for (const tool of tools) {
     for (const cmd of tool.commands ?? []) {
-      const first = cmd.split(/[ /]/)[0] as string;
+      const first = firstOf(cmd);
       const tail = cmd.slice(first.length);
-      // " audit" → /\s+audit(?![A-Za-z0-9_.-])/y: the separator is one space (any whitespace in a line) or a slash.
-      const rest = tail === '' ? null : new RegExp(`${tail.split(' ').map(escapeRe).join('\\s+')}(?![${WORD_CHARS}])`, 'y');
-      byFirstWord.set(first, [...(byFirstWord.get(first) ?? []), { tool, rest }]);
+      const excludes = (tool.excludes ?? []).filter((e) => firstOf(e) === first && e.length > first.length).map((e) => restRegex(e.slice(first.length)));
+      const rule: CommandRule = { tool, rest: tail === '' ? null : restRegex(tail), excludes };
+      // A command whose first word is a path (.husky/pre-commit) matches the whole path; any other its basename.
+      const map = first.includes('/') ? byPath : byFirstWord;
+      map.set(first, [...(map.get(first) ?? []), rule]);
     }
-    for (const a of tool.actions ?? []) actions.push({ tool, parts: a.toLowerCase().split('/') });
+    for (const a of tool.actions ?? []) {
+      const parts = a.toLowerCase().split('/');
+      const last = parts[parts.length - 1] as string;
+      const prefixLast = last.endsWith('*');
+      if (prefixLast) parts[parts.length - 1] = last.slice(0, -1);
+      actions.push({ tool, parts, prefixLast });
+    }
   }
-  return { byFirstWord, actions };
+  return { byFirstWord, byPath, actions };
 }
 
 let defaultCompiled: Compiled | undefined;
@@ -110,7 +167,7 @@ let defaultCompiled: Compiled | undefined;
 const MAX_JOBS = 100;              // per workflow
 const MAX_STEPS = 200;             // per job or composite action
 const MAX_STEP_VISITS = 50_000;    // per mapCoverage call, followed files included
-const MAX_SCAN_BYTES = 32_000_000; // run text scanned per mapCoverage call
+const MAX_SCAN_BYTES = 16_000_000; // run text scanned per mapCoverage call (worst case about 2 s of adversarial text)
 const MAX_LOCAL_FILES = 100;       // distinct local workflows and actions followed
 const MAX_HOOKS = 200;             // pre-commit repos, hooks per repo, lefthook commands
 const MAX_FILTER_PATTERNS = 100;
@@ -118,6 +175,7 @@ const MAX_GLOB = 256;
 const MAX_WHERE = 300;
 const MAX_DIR = 512;               // a tracked directory longer than this is unknown (a chain of cd's can't grow it)
 const MAX_HITS = 100_000;          // tool and opaque findings kept per mapCoverage call
+const MAX_FLAG_WORDS = 64;         // words after a command read for its flags
 
 // ---------- why (pipegen's own text only) ----------
 
@@ -152,6 +210,7 @@ const OPAQUE_WHY = {
   unreadable: "A job or step calls a local workflow or action that pipegen couldn't read (missing, a symbolic link, too large or not valid YAML), so it can't tell.",
   outside: "A job or step calls a local workflow or action that points outside the repo, so pipegen didn't read it.",
   truncated: "The workflows are too large to read in full, so pipegen can't tell.",
+  workflowsUnreadable: "Some workflow files couldn't be read, so pipegen can't tell.",
   hookUnreadable: "The git hook file couldn't be read (a symbolic link, too large or not valid), so pipegen can't tell.",
 } as const;
 
@@ -161,8 +220,20 @@ const LAYER_DONE: Readonly<Record<Exclude<Layer, 'pre-commit'>, string>> = {
   deploy: 'when the code is deployed or released',
 };
 
+/** Why a run that is found can't block anything (or might not run). */
+type Reason = 'continue' | 'suppressed' | 'soft' | 'no-fail' | 'never' | 'condition';
+const REASON_WHY: Readonly<Record<Reason, (subject: string, when: string) => string>> = {
+  continue: (s) => `${s} runs, but is allowed to fail (continue-on-error), so it can't block anything.`,
+  suppressed: (s) => `${s} runs, but its exit code is ignored (|| true, || exit 0 or set +e), so it can't block anything.`,
+  soft: (s) => `${s} runs, but is set not to fail on findings, so it can't block anything.`,
+  'no-fail': (s) => `${s} runs, but doesn't fail on findings unless told to, so it can't block anything.`,
+  never: (s) => `${s} reports findings but doesn't fail the job, so it can't block anything.`,
+  condition: (s, when) => `${s} runs only when a condition holds, so it may not run ${when}.`,
+};
+
 const HOOK_PLACE = { 'pre-commit': 'the pre-commit framework', husky: 'the husky pre-commit hook', lefthook: 'the lefthook pre-commit hook' } as const;
 const HOOK_NAME = { 'pre-commit': 'the pre-commit framework', husky: 'husky', lefthook: 'lefthook' } as const;
+const HOOK_FILE = { 'pre-commit': '.pre-commit-config.yaml', husky: '.husky', lefthook: 'lefthook.yml' } as const;
 
 // ---------- small helpers ----------
 
@@ -170,14 +241,16 @@ type Manager = NonNullable<RepoProfile['precommit']>;
 type CiLayer = Exclude<Layer, 'pre-commit'>;
 type Fit = Record<CiLayer, boolean>;
 
-interface Found { categories: readonly string[]; by: string; subject: string; dir: string | null }
+/** A tool found in shell text or a step. `reason` null = it runs and can fail the run. */
+interface Found { categories: readonly string[]; by: string; subject: string; dir: string | null; reason: Reason | null; partialWhy?: string }
 interface Hit {
   opaque: boolean;
   categories: readonly string[];
   by?: string;
   subject: string;
   dir: string | null;
-  nonBlocking: boolean;
+  reason: Reason | null;
+  partialWhy?: string;
   fit: Fit;
   where: string;
   why?: string;
@@ -196,7 +269,7 @@ const REF_RE = /^[A-Za-z0-9_./-]+(?:@[A-Za-z0-9_./-]+)?$/;
 const validRef = (u: string): string | undefined => (u.length <= 200 && REF_RE.test(u) && safeText(u) === u ? u : undefined);
 
 /** True for continue-on-error values that let the step or job fail without failing the run (true, or an expression). */
-function nonBlocking(v: unknown): boolean {
+function allowedToFail(v: unknown): boolean {
   if (v === true) return true;
   if (typeof v !== 'string') return false;
   const t = v.trim();
@@ -228,41 +301,171 @@ const firstSet = (...dirs: (string | null | undefined)[]): string | null => {
   return '.';
 };
 
-// ---------- reading run lines ----------
+// ---------- if: conditions (review I3) ----------
 
-const WORD = /[A-Za-z0-9_.-]+/g;
-const CD_ARG = /[ \t]+([^\s;&|()]+)/y;
-const COMMENT = /^\s*#/;
+type Cond = 'none' | 'never' | 'partial';
+const STATUS_FN = /^!?\s*(?:always|success|cancelled)\(\s*\)$/;
+const FORK_GUARD = /^github\.repository(?:_owner)?\s*==\s*(?:'[^']*'|"[^"]*")$/;
+
+/** Trims spaces and outer parentheses with a loop (no regex backtracking on long runs of parentheses). */
+function stripParens(s: string): string {
+  let a = 0;
+  let b = s.length;
+  for (;;) {
+    while (a < b && /\s/.test(s[a] as string)) a++;
+    while (b > a && /\s/.test(s[b - 1] as string)) b--;
+    if (a < b && s[a] === '(' && s[b - 1] === ')') {
+      a++;
+      b--;
+    } else return s.slice(a, b);
+  }
+}
+
+/**
+ * A job or step `if:`: false drops the run; status functions (always(), success(), !cancelled()) and a fork guard
+ * (github.repository[_owner] == '…') are ignored; anything else (including failure(), which runs only after a failure)
+ * means the run may not happen on every event.
+ */
+function condition(v: unknown): Cond {
+  if (v === undefined || v === null || v === true) return 'none';
+  if (v === false || v === 0) return 'never';
+  if (typeof v !== 'string' || !regexSafe(v)) return 'partial';
+  let s = v.trim();
+  if (s.startsWith('${{') && s.endsWith('}}') && s.indexOf('${{', 3) < 0) s = s.slice(3, -2).trim();
+  if (s === 'false') return 'never';
+  if (s === 'true' || s === '') return 'none';
+  const parts = s.split(/&&|\|\|/).map(stripParens);
+  return parts.every((x) => STATUS_FN.test(x) || FORK_GUARD.test(x)) ? 'none' : 'partial';
+}
+
+// ---------- soft-fail settings (review I1) ----------
+
+const unquote = (w: string) => {
+  let a = 0;
+  let b = w.length;
+  while (a < b && (w[a] === '"' || w[a] === "'")) a++;
+  while (b > a && (w[b - 1] === '"' || w[b - 1] === "'")) b--;
+  return w.slice(a, b);
+};
+
+/** "--fail" matches --fail and --fail=x; "--exit-code=0" matches --exit-code=0 and --exit-code 0. */
+function flagGiven(spec: string, words: readonly string[]): boolean {
+  const eq = spec.indexOf('=');
+  if (eq < 0) return words.some((w) => w === spec || w.startsWith(`${spec}=`));
+  const name = spec.slice(0, eq);
+  const value = spec.slice(eq + 1);
+  return words.some((w, i) => w === spec || (w === name && words[i + 1] === value));
+}
+
+function commandReason(tool: ToolSignature, words: readonly string[]): Reason | null {
+  if ((tool.softFlags ?? []).some((f) => flagGiven(f, words))) return 'soft';
+  if (tool.commandFails === 'never') return 'never';
+  if (tool.commandFails === 'flag' && !(tool.failFlags ?? []).some((f) => flagGiven(f, words))) return 'no-fail';
+  return null;
+}
+
+/** A `with:` value as lowercase text; an expression (`${{ }}`) can't be known. */
+function inputText(v: unknown): string | null {
+  if (typeof v === 'boolean' || typeof v === 'number') return String(v);
+  return typeof v === 'string' && regexSafe(v) ? v.trim().toLowerCase() : null;
+}
+
+/** Whether `with:` sets one of the inputs to a listed value. `exprCounts`: an expression counts (errs to "can't block"). */
+function inputGiven(spec: Record<string, string[]> | undefined, w: Obj, exprCounts: boolean): boolean {
+  for (const [name, values] of Object.entries(spec ?? {})) {
+    if (!Object.hasOwn(w, name)) continue;
+    const s = inputText(w[name]);
+    if (s === null) continue;
+    if (s.includes('${{')) {
+      if (exprCounts) return true;
+      continue;
+    }
+    if (values.includes(s) || values.includes('*')) return true;
+  }
+  return false;
+}
+
+function actionReason(tool: ToolSignature, w: Obj): Reason | null {
+  if (inputGiven(tool.softInputs, w, true)) return 'soft';
+  if (tool.actionFails === 'never') return 'never';
+  if (tool.actionFails === 'input' && !inputGiven(tool.failInputs, w, false)) return 'no-fail';
+  return null;
+}
+
+const foundOf = (tool: ToolSignature, dir: string | null, reason: Reason | null): Found => ({
+  categories: tool.categories, by: tool.id, subject: `The ${tool.id} check`, dir, reason,
+  ...(tool.partialWhy === undefined ? {} : { partialWhy: tool.partialWhy }),
+});
+
+// ---------- reading shell text (review M2: command position only) ----------
+
+// Shell tokens: $( && || and single separators, else a run of anything that isn't space or a separator.
+const SHELL_TOKEN = /\$\(|&&|\|\||[;|&(){}`]|[^\s;|&(){}`]+/g;
+const STARTS = new Set(['$(', '&&', '||', ';', '|', '&', '(', '{', '`']);
+const ENDS = new Set([')', '}']);
+/** Tokens that end an and-or list: a later `|| true` doesn't reach a command before them. */
+const LIST_END = new Set([';', '&', '`']);
+const ASSIGN = /^[A-Za-z_][A-Za-z0-9_]*=/;
+/** Words after which the next non-flag word is a command. `env` also skips VAR=value words. */
+const WRAPPERS = new Set(['sudo', 'time', 'npx', 'bunx', 'uvx', 'env', 'nohup', 'exec', 'command', 'xargs', 'sh', 'bash', 'zsh', 'dash']);
+/** Two-word wrappers: pnpm dlx, uv run, python -m, … */
+const SUB_WRAPPERS: Readonly<Record<string, readonly string[]>> = {
+  pnpm: ['dlx', 'exec'], yarn: ['dlx', 'exec'], npm: ['exec'], bun: ['x'], uv: ['run'], pipx: ['run'], poetry: ['run'],
+  pdm: ['run'], hatch: ['run'], python: ['-m'], python3: ['-m'],
+};
+/** `yarn eslint .` and `pnpm eslint .` run a package binary: the next word is a command too. */
+const BIN_RUNNERS = new Set(['yarn', 'pnpm']);
+const DOCKER_VALUE_FLAGS = new Set(['-v', '--volume', '-e', '--env', '--env-file', '-w', '--workdir', '-u', '--user', '-p', '--publish', '--name',
+  '--entrypoint', '--network', '--platform', '--mount', '-l', '--label', '--add-host', '--pull', '-m', '--memory', '--cpus', '--cidfile', '-h', '--hostname']);
 // The service's own scripts (ruling S5), keyed by first word; the rest is matched right after it.
 const OWN_SCRIPT: Readonly<Record<string, RegExp | null>> = {
-  npm: /\s+(?:test|run\s+(?:test|lint))(?![A-Za-z0-9_.-])/y,
-  pnpm: /\s+(?:run\s+)?(?:test|lint)(?![A-Za-z0-9_.-])/y,
-  yarn: /\s+(?:run\s+)?(?:test|lint)(?![A-Za-z0-9_.-])/y,
-  bun: /\s+(?:run\s+)?(?:test|lint)(?![A-Za-z0-9_.-])/y,
-  python: /\s+-m\s+pytest(?![A-Za-z0-9_.-])/y,
-  python3: /\s+-m\s+pytest(?![A-Za-z0-9_.-])/y,
+  npm: new RegExp(`\\s+(?:test|run\\s+(?:test|lint))${NOT_WORD}`, 'y'),
+  pnpm: new RegExp(`\\s+(?:run\\s+)?(?:test|lint)${NOT_WORD}`, 'y'),
+  yarn: new RegExp(`\\s+(?:run\\s+)?(?:test|lint)${NOT_WORD}`, 'y'),
+  bun: new RegExp(`\\s+(?:run\\s+)?(?:test|lint)${NOT_WORD}`, 'y'),
+  python: new RegExp(`\\s+-m\\s+pytest${NOT_WORD}`, 'y'),
+  python3: new RegExp(`\\s+-m\\s+pytest${NOT_WORD}`, 'y'),
   pytest: null,
 };
 const TEST_CATEGORIES = ['unit-tests', 'full-tests'] as const;
 
-/** True when a `cd` word at `at` starts a command: at the line start or after ; & | ( { (spaces allowed between). */
-function startsCommand(line: string, at: number): boolean {
-  let i = at - 1;
-  while (i >= 0 && (line[i] === ' ' || line[i] === '\t')) i--;
-  return i < 0 || ';&|({'.includes(line[i] as string);
+const basename = (w: string) => w.slice(w.lastIndexOf('/') + 1);
+/** The image's name: no registry or owner, no :tag or @digest (ghcr.io/zricethezav/gitleaks:v8 → gitleaks). */
+function imageName(image: string): string {
+  const at = image.indexOf('@');
+  const noDigest = at < 0 ? image : image.slice(0, at);
+  const name = basename(noDigest);
+  const colon = name.indexOf(':');
+  return colon < 0 ? name : name.slice(0, colon);
 }
 
-function cdTarget(raw: string): string | null {
-  const s = raw.replace(/^["']/, '').replace(/["']$/, '');
-  if (s === '' || s === '-' || /[$`~\\]/.test(s) || s.startsWith('/')) return null;
-  return s;
+/** Lines with `\` continuations joined; a logical line over 4 KB is skipped. */
+function logicalLines(text: string): string[] {
+  const out: string[] = [];
+  let parts: string[] = [];
+  let size = 0;
+  const flush = () => {
+    const line = parts.join(' ');
+    if (size <= READ_LIMITS.maxRegexLineBytes && regexSafe(line)) out.push(line);
+    parts = [];
+    size = 0;
+  };
+  for (const raw of text.split(/\r?\n/)) {
+    const cont = raw.endsWith('\\');
+    const piece = cont ? raw.slice(0, -1) : raw;
+    size += piece.length + 1;
+    if (size <= READ_LIMITS.maxRegexLineBytes) parts.push(piece);
+    if (!cont) flush();
+  }
+  if (parts.length > 0) flush();
+  return out;
 }
 
 interface Budget { visits: number; bytes: number; truncated: boolean }
 
 /**
- * Tools found in shell text (a run step, a hook script, a hook entry). Whole words only; `#` comment lines skipped.
- * `cd <dir>` moves the directory for the rest of the text; a tool's `dir` is where it ran (null = unknown).
+ * Tools found in shell text (a run step, a hook script, a hook entry). A tool counts only in command position (see the
+ * module header). `cd <dir>` moves the directory for the rest of the text; `set +e` turns off errexit for the rest.
  */
 function scanShell(text: string, base: string | null, sigs: Compiled, budget: Budget): Found[] {
   budget.bytes += text.length;
@@ -271,50 +474,150 @@ function scanShell(text: string, base: string | null, sigs: Compiled, budget: Bu
     return [];
   }
   const found: Found[] = [];
-  const seen = new Set<string>(); // one finding per tool and directory per text
+  const seen = new Set<string>(); // one finding per tool, directory and reason per text
   const add = (f: Found) => {
-    const key = `${f.by}\u0000${f.dir ?? ''}`;
+    const key = `${f.by}\u0000${f.dir ?? ''}\u0000${f.reason ?? ''}`;
     if (!seen.has(key)) {
       seen.add(key);
       found.push(f);
     }
   };
   let cwd = base;
-  for (const line of regexLines(text)) {
-    if (COMMENT.test(line)) continue;
-    for (const m of line.matchAll(WORD)) {
-      const word = m[0];
-      const end = m.index + word.length;
-      if (word === 'cd' && startsCommand(line, m.index)) {
-        CD_ARG.lastIndex = end;
-        const arg = CD_ARG.exec(line);
-        const target = arg ? cdTarget(arg[1] as string) : null;
-        cwd = target === null ? null : resolveDir(cwd, target);
-        continue;
+  let errexitOff = false;
+  for (const line of logicalLines(text)) {
+    const toks: { t: string; i: number }[] = [];
+    for (const m of line.matchAll(SHELL_TOKEN)) {
+      if (m[0].startsWith('#')) break; // a comment runs to the end of the line
+      toks.push({ t: m[0], i: m.index });
+    }
+    const n = toks.length;
+    const word = (k: number) => (k < n && !STARTS.has(toks[k]!.t) && !ENDS.has(toks[k]!.t) ? unquote(toks[k]!.t) : null);
+    // Right to left: where each command's words end, and whether a later `|| true` / `|| :` / `|| exit 0` in the same
+    // and-or list swallows its exit code.
+    const segEnd = new Int32Array(n);
+    const swallowed = new Uint8Array(n);
+    let end = n;
+    let swallow = 0;
+    for (let k = n - 1; k >= 0; k--) {
+      const t = toks[k]!.t;
+      if (LIST_END.has(t)) swallow = 0;
+      if (t === '||') {
+        const a = word(k + 1);
+        if (a === 'true' || a === ':' || (a === 'exit' && word(k + 2) === '0')) swallow = 1;
       }
-      for (const c of sigs.byFirstWord.get(word) ?? []) {
-        if (c.rest !== null) {
-          c.rest.lastIndex = end;
-          if (!c.rest.test(line)) continue;
+      if (STARTS.has(t) || ENDS.has(t)) end = k;
+      segEnd[k] = end;
+      swallowed[k] = swallow;
+    }
+    const argsAfter = (k: number) => {
+      const out: string[] = [];
+      for (let j = k + 1; j < Math.min(segEnd[k]!, k + 1 + MAX_FLAG_WORDS); j++) out.push(unquote(toks[j]!.t));
+      return out;
+    };
+    const ruleReason = (k: number, tool: ToolSignature): Reason | null => (swallowed[k] || errexitOff ? 'suppressed' : commandReason(tool, argsAfter(k)));
+    /** Signatures and own scripts for the command word at k (`name` = its basename, or an image name). */
+    const match = (k: number, w: string, name: string) => {
+      const at = toks[k]!.i + toks[k]!.t.length;
+      const tryRules = (rules: CommandRule[] | undefined) => {
+        for (const r of rules ?? []) {
+          if (r.rest !== null) {
+            r.rest.lastIndex = at;
+            if (!r.rest.test(line)) continue;
+          }
+          if (r.excludes.some((x) => ((x.lastIndex = at), x.test(line)))) continue;
+          add(foundOf(r.tool, cwd, ruleReason(k, r.tool)));
         }
-        add({ categories: c.tool.categories, by: c.tool.id, subject: `The ${c.tool.id} check`, dir: cwd });
-      }
-      if (Object.hasOwn(OWN_SCRIPT, word)) {
-        const rest = OWN_SCRIPT[word] as RegExp | null;
-        let stop = end;
+      };
+      if (w.includes('/')) tryRules(sigs.byPath.get(w.replace(/^(?:\.\/)+/, '')));
+      tryRules(sigs.byFirstWord.get(name));
+      if (w === name && Object.hasOwn(OWN_SCRIPT, name)) {
+        const rest = OWN_SCRIPT[name] as RegExp | null;
+        let stop = at;
         if (rest !== null) {
-          rest.lastIndex = end;
-          if (!rest.test(line)) continue;
+          rest.lastIndex = at;
+          if (!rest.test(line)) return;
           stop = rest.lastIndex;
         }
         // Only fixed words and whitespace were matched, so the phrase is safe to show; whitespace becomes one space.
-        const cmd = line.slice(m.index, stop).split(/\s+/).join(' ');
+        const cmd = line.slice(toks[k]!.i, stop).split(/\s+/).join(' ');
         const categories = cmd.endsWith('lint') ? ['lint'] : TEST_CATEGORIES;
-        add({ categories, by: `your own \`${cmd}\``, subject: `Your own \`${cmd}\``, dir: cwd });
+        add({ categories, by: `your own \`${cmd}\``, subject: `Your own \`${cmd}\``, dir: cwd, reason: swallowed[k] || errexitOff ? 'suppressed' : null });
       }
+    };
+    const skipFlags = (k: number, assigns: boolean) => {
+      let j = k;
+      for (let w = word(j); w !== null && (w.startsWith('-') || (assigns && ASSIGN.test(w))); w = word(j)) j++;
+      return j;
+    };
+
+    let cmd = true;
+    let k = 0;
+    while (k < n) {
+      const t = toks[k]!.t;
+      if (STARTS.has(t)) {
+        cmd = true;
+        k++;
+        continue;
+      }
+      if (ENDS.has(t) || !cmd) {
+        cmd = false;
+        k++;
+        continue;
+      }
+      const w = unquote(t);
+      if (ASSIGN.test(w)) { // VAR=value before a command
+        k++;
+        continue;
+      }
+      const name = basename(w);
+      if (w === 'cd') {
+        const target = word(k + 1);
+        cwd = target === null || target === '' || target === '-' || /[$`~\\]/.test(target) || target.startsWith('/') ? null : resolveDir(cwd, target);
+        cmd = false;
+        k += target === null ? 1 : 2;
+        continue;
+      }
+      if (w === 'set') {
+        const opt = word(k + 1) ?? '';
+        if (/^\+[a-z]*e/.test(opt) || (opt === '+o' && word(k + 2) === 'errexit')) errexitOff = true;
+        else if (/^-[a-z]*e/.test(opt) || (opt === '-o' && word(k + 2) === 'errexit')) errexitOff = false;
+        cmd = false;
+        k++;
+        continue;
+      }
+      match(k, w, name);
+      const next = word(k + 1);
+      if (name === 'docker' && next === 'run') {
+        let j = k + 2;
+        for (let f = word(j); f !== null && f.startsWith('-'); f = word(j)) j += !f.includes('=') && DOCKER_VALUE_FLAGS.has(f) ? 2 : 1;
+        const image = word(j);
+        if (image !== null) match(j, image, imageName(image));
+        k = j + 1; // the container's command follows the image
+        cmd = true;
+        continue;
+      }
+      if (next !== null && SUB_WRAPPERS[name]?.includes(next)) {
+        k = skipFlags(k + 2, false);
+        cmd = true;
+        continue;
+      }
+      if (WRAPPERS.has(name)) {
+        k = skipFlags(k + 1, name === 'env');
+        cmd = true;
+        continue;
+      }
+      cmd = BIN_RUNNERS.has(name);
+      k++;
     }
   }
   return found;
+}
+
+/** A `uses: docker://image` step: the image name as a command, with `with.args` as its flags. */
+function scanImage(uses: string, w: Obj, sigs: Compiled): Found[] {
+  const name = imageName(uses.slice('docker://'.length));
+  const args = typeof w.args === 'string' && regexSafe(w.args) ? w.args.split(/\s+/).slice(0, MAX_FLAG_WORDS).map(unquote) : [];
+  return (sigs.byFirstWord.get(name) ?? []).filter((r) => r.rest === null).map((r) => foundOf(r.tool, '.', commandReason(r.tool, args)));
 }
 
 // ---------- triggers (ruling S6) ----------
@@ -396,10 +699,12 @@ function branchesInclude(patterns: string[], name: string): boolean {
   return included;
 }
 
+const isSet = (cfg: Obj, key: string) => key in cfg && cfg[key] !== null;
+
 /** Whether a push or pull_request filter lets `name` through (`branches` and `branches-ignore` together are invalid). */
 function branchFilter(cfg: Obj): (name: string) => boolean {
-  const hasB = 'branches' in cfg && cfg.branches !== null;
-  const hasBi = 'branches-ignore' in cfg && cfg['branches-ignore'] !== null;
+  const hasB = isSet(cfg, 'branches');
+  const hasBi = isSet(cfg, 'branches-ignore');
   if (hasB && hasBi) return () => false;
   if (hasB) return (n) => branchesInclude(strs(cfg.branches), n);
   if (hasBi) return (n) => !strs(cfg['branches-ignore']).slice(0, MAX_FILTER_PATTERNS).some((p) => globMatch(p, n));
@@ -424,15 +729,17 @@ function parseOn(on: unknown): Map<string, Obj> {
 
 /** Branch names a developer's push would use; a push trigger must let both through to count for the push layer. */
 const FEATURE_BRANCHES = ['pipegen-feature', 'feature/pipegen-feature'];
+/** A `paths` or `paths-ignore` filter: the event doesn't run on every change, so it isn't the right trigger (review I2). */
+const pathFiltered = (cfg: Obj) => isSet(cfg, 'paths') || isSet(cfg, 'paths-ignore');
 
 function fitOf(events: Map<string, Obj>, defaultBranch: string, deploys: boolean): Fit {
   let everyPush = false;
   let pushDefault = false;
   let pushTags = false;
   const push = events.get('push');
-  if (push) {
-    const branchesSet = ['branches', 'branches-ignore'].some((k) => k in push && push[k] !== null);
-    pushTags = ['tags', 'tags-ignore'].some((k) => k in push && push[k] !== null);
+  if (push && !pathFiltered(push)) {
+    const branchesSet = isSet(push, 'branches') || isSet(push, 'branches-ignore');
+    pushTags = isSet(push, 'tags') || isSet(push, 'tags-ignore');
     // A push trigger with only a tag filter never runs for branch pushes.
     const includes = !branchesSet && pushTags ? () => false : branchFilter(push);
     everyPush = FEATURE_BRANCHES.every(includes);
@@ -440,7 +747,7 @@ function fitOf(events: Map<string, Obj>, defaultBranch: string, deploys: boolean
   }
   const pr = events.get('pull_request');
   const types = pr ? strs(pr.types) : [];
-  const merge = pr !== undefined && branchFilter(pr)(defaultBranch) && (types.length === 0 || types.includes('synchronize'));
+  const merge = pr !== undefined && !pathFiltered(pr) && branchFilter(pr)(defaultBranch) && (types.length === 0 || types.includes('synchronize'));
   return { push: everyPush, merge, deploy: deploys || pushDefault || pushTags || events.has('release') };
 }
 
@@ -500,10 +807,18 @@ function localPath(uses: string): string | 'outside' | null {
   return rel;
 }
 
-// ---------- walking workflows (rulings S3, S26) ----------
+// ---------- walking workflows (rulings S3, S26, U3) ----------
 
-interface Ctx { p: RepoProfile; sigs: Compiled; read: Reader; budget: Budget; hits: Hit[]; localFiles: Set<string> }
-interface StepCtx { fit: Fit; where: string; dir: string | null; nonBlocking: boolean; depth: number }
+interface Ctx { p: RepoProfile; sigs: Compiled; read: Reader; budget: Budget; hits: Hit[]; localFiles: Set<string>; unreadable: boolean }
+interface StepCtx {
+  fit: Fit;
+  where: string;
+  /** Where `run:` steps start: defaults.run.working-directory of the job or workflow, else the root. */
+  runDir: string | null;
+  continueOnError: boolean;
+  conditional: boolean;
+  depth: number;
+}
 
 function spend(ctx: Ctx): boolean {
   if (ctx.budget.visits >= MAX_STEP_VISITS) {
@@ -514,12 +829,13 @@ function spend(ctx: Ctx): boolean {
   return true;
 }
 
-function opaque(ctx: Ctx, why: string, by: string | undefined, c: { fit: Fit; where: string; dir: string | null }): void {
+/** Something pipegen can't see inside. It runs from the repo root, so it may cover any service. */
+function opaque(ctx: Ctx, why: string, by: string | undefined, c: { fit: Fit; where: string }): void {
   if (ctx.hits.length >= MAX_HITS) {
     ctx.budget.truncated = true;
     return;
   }
-  ctx.hits.push({ opaque: true, categories: [], ...(by === undefined ? {} : { by }), subject: '', dir: c.dir, nonBlocking: false, fit: c.fit, where: c.where, why });
+  ctx.hits.push({ opaque: true, categories: [], ...(by === undefined ? {} : { by }), subject: '', dir: '.', reason: null, fit: c.fit, where: c.where, why });
 }
 
 function addFound(ctx: Ctx, found: Found[], c: StepCtx): void {
@@ -527,39 +843,50 @@ function addFound(ctx: Ctx, found: Found[], c: StepCtx): void {
     ctx.budget.truncated = true;
     return;
   }
-  for (const f of found) ctx.hits.push({ opaque: false, categories: f.categories, by: f.by, subject: f.subject, dir: f.dir, nonBlocking: c.nonBlocking, fit: c.fit, where: c.where });
+  for (const f of found) {
+    const reason: Reason | null = c.continueOnError ? 'continue' : (f.reason ?? (c.conditional ? 'condition' : null));
+    ctx.hits.push({
+      opaque: false, categories: f.categories, by: f.by, subject: f.subject, dir: f.dir, reason,
+      ...(f.partialWhy === undefined ? {} : { partialWhy: f.partialWhy }), fit: c.fit, where: c.where,
+    });
+  }
 }
 
-/** Signatures whose action parts are a prefix of `uses` (owner/name[/sub]@ref), case-insensitively. */
+/** Signatures listing exactly this `uses:` path (owner/name[/sub], case-insensitive, @ref ignored); `x*` is a prefix. */
 function actionMatches(sigs: Compiled, uses: string): ToolSignature[] {
   const at = uses.indexOf('@');
   const parts = (at < 0 ? uses : uses.slice(0, at)).toLowerCase().split('/');
   if (parts.length < 2 || !parts.every((x) => PART_RE.test(x))) return [];
   const out: ToolSignature[] = [];
   for (const a of sigs.actions) {
-    if (a.parts.length <= parts.length && a.parts.every((x, i) => parts[i] === x) && !out.includes(a.tool)) out.push(a.tool);
+    if (a.parts.length !== parts.length || out.includes(a.tool)) continue;
+    const last = a.parts.length - 1;
+    if (a.parts.every((x, i) => (i === last && a.prefixLast ? (parts[i] as string).startsWith(x) : parts[i] === x))) out.push(a.tool);
   }
   return out;
 }
 
 async function walkStep(ctx: Ctx, step: Obj, c: StepCtx): Promise<void> {
   if (!spend(ctx)) return;
-  const sc: StepCtx = { ...c, nonBlocking: c.nonBlocking || nonBlocking(step['continue-on-error']) };
+  const cond = condition(step.if);
+  if (cond === 'never') return;
+  const sc: StepCtx = { ...c, continueOnError: c.continueOnError || allowedToFail(step['continue-on-error']), conditional: c.conditional || cond === 'partial' };
+  const withInputs = asObj(step.with);
   if (typeof step.uses === 'string' && regexSafe(step.uses)) {
     const uses = step.uses.trim();
     if (uses === '.' || uses.startsWith('./')) {
       await followAction(ctx, uses, sc);
     } else if (uses.startsWith('docker://')) {
-      addFound(ctx, scanShell(uses, c.dir, ctx.sigs, ctx.budget), sc);
+      addFound(ctx, scanImage(uses, withInputs, ctx.sigs), sc);
     } else {
       const tools = actionMatches(ctx.sigs, uses);
-      for (const t of tools) addFound(ctx, [{ categories: t.categories, by: t.id, subject: `The ${t.id} check`, dir: c.dir }], sc);
+      addFound(ctx, tools.map((t) => foundOf(t, '.', actionReason(t, withInputs))), sc);
       const owner = uses.split('/')[0]?.toLowerCase();
       if (tools.length === 0 && owner !== undefined && owner === ctx.p.owner.toLowerCase()) opaque(ctx, OPAQUE_WHY.ownerAction, validRef(uses), sc);
     }
   }
   if (typeof step.run === 'string') {
-    const base = firstSet(workingDir(step['working-directory']), c.dir);
+    const base = firstSet(workingDir(step['working-directory']), c.runDir);
     addFound(ctx, scanShell(step.run, base, ctx.sigs, ctx.budget), sc);
   }
 }
@@ -582,7 +909,8 @@ async function followAction(ctx: Ctx, uses: string, c: StepCtx): Promise<void> {
   const runs = asObj(doc.ok.runs);
   if (runs.using !== 'composite') return opaque(ctx, OPAQUE_WHY.localCode, by, c);
   const where = cut(`${c.where} → ${file}`);
-  for (const step of list(runs.steps).slice(0, MAX_STEPS)) await walkStep(ctx, asObj(step), { ...c, where, depth: 1 });
+  // A composite action's run steps start at the repo root (plus their own working-directory), not at the job's default.
+  for (const step of list(runs.steps).slice(0, MAX_STEPS)) await walkStep(ctx, asObj(step), { ...c, where, runDir: '.', depth: 1 });
   if (list(runs.steps).length > MAX_STEPS) ctx.budget.truncated = true;
 }
 
@@ -598,22 +926,24 @@ async function readLocal(ctx: Ctx, rel: string): Promise<Read<Obj>> {
   return ctx.read.yaml(rel);
 }
 
-async function walkWorkflow(ctx: Ctx, doc: Obj, path: string, fit: Fit, depth: number, prefix: string): Promise<void> {
+async function walkWorkflow(ctx: Ctx, doc: Obj, path: string, fit: Fit, depth: number, prefix: string, conditional: boolean): Promise<void> {
   const wfDir = defaultsDir(doc);
   const jobs = Object.entries(asObj(doc.jobs));
   if (jobs.length > MAX_JOBS) ctx.budget.truncated = true;
   for (const [i, [id, raw]] of jobs.slice(0, MAX_JOBS).entries()) {
     const job = asObj(raw);
+    const cond = condition(job.if);
+    if (cond === 'never') continue;
     const label = regexSafe(id) && JOB_ID_RE.test(id) ? id : `#${i + 1}`;
     const where = cut(`${prefix}${path} (job ${label})`);
-    const dir = firstSet(defaultsDir(job), wfDir);
+    const jobConditional = conditional || cond === 'partial';
     if (typeof job.uses === 'string' && regexSafe(job.uses)) {
-      await callWorkflow(ctx, job.uses.trim(), { fit, where, dir, nonBlocking: false, depth });
+      await callWorkflow(ctx, job.uses.trim(), { fit, where, runDir: '.', continueOnError: false, conditional: jobConditional, depth });
       continue;
     }
     const steps = list(job.steps);
     if (steps.length > MAX_STEPS) ctx.budget.truncated = true;
-    const c: StepCtx = { fit, where, dir, nonBlocking: nonBlocking(job['continue-on-error']), depth };
+    const c: StepCtx = { fit, where, runDir: firstSet(defaultsDir(job), wfDir), continueOnError: allowedToFail(job['continue-on-error']), conditional: jobConditional, depth };
     for (const step of steps.slice(0, MAX_STEPS)) await walkStep(ctx, asObj(step), c);
   }
 }
@@ -629,8 +959,8 @@ async function callWorkflow(ctx: Ctx, uses: string, c: StepCtx): Promise<void> {
   if (rel === null || !WORKFLOW_FILE.test(rel)) return opaque(ctx, OPAQUE_WHY.unreadable, by, c);
   const doc = await readLocal(ctx, rel);
   if ('fail' in doc) return opaque(ctx, doc.fail === 'outside' ? OPAQUE_WHY.outside : OPAQUE_WHY.unreadable, by, c);
-  // The called workflow runs on the caller's event, so the caller's trigger fit applies.
-  await walkWorkflow(ctx, doc.ok, rel, c.fit, 1, `${c.where} → `);
+  // The called workflow runs on the caller's event (and only when the calling job's `if:` holds).
+  await walkWorkflow(ctx, doc.ok, rel, c.fit, 1, `${c.where} → `, c.conditional);
 }
 
 // ---------- hooks ----------
@@ -659,7 +989,8 @@ async function readHooks(ctx: Ctx): Promise<Hooks> {
         const hook = asObj(raw);
         const stages = 'stages' in hook ? strs(hook.stages) : defaultStages;
         if (stages.length > 0 && !stages.some((s) => s === 'pre-commit' || s === 'commit')) continue;
-        found.push(...scan([hook.id, hook.entry].filter((x): x is string => typeof x === 'string').join(' ')));
+        // the hook id and its entry are each read as a command line of their own
+        found.push(...scan([hook.id, hook.entry].filter((x): x is string => typeof x === 'string').join('\n')));
       }
     }
     return { manager, where, readable: true, found };
@@ -705,8 +1036,15 @@ function missingWhy(need: Need): string {
 
 const located = (h: { by?: string; where: string }) => ({ ...(h.by === undefined ? {} : { by: h.by }), where: h.where });
 
-function ciCoverage(need: Need, layer: CiLayer, hits: Hit[], services: Service[], truncated: boolean): Coverage {
-  let partialFailOk: Hit | undefined;
+/** The reason that counts for this need: a need that doesn't block (format-lint) only cares whether the tool runs. */
+const effectiveReason = (need: Need, reason: Reason | null): Reason | null => (need.blocking || reason === 'condition' ? reason : null);
+
+function reasonWhy(h: { subject: string; partialWhy?: string }, reason: Reason, when: string): string {
+  return reason === 'never' && h.partialWhy !== undefined ? h.partialWhy : REASON_WHY[reason](h.subject, when);
+}
+
+function ciCoverage(need: Need, layer: CiLayer, hits: Hit[], services: Service[], ctx: { truncated: boolean; unreadable: boolean }): Coverage {
+  let partialRight: { h: Hit; reason: Reason } | undefined;
   let partialTrigger: Hit | undefined;
   let strongOpaque: Hit | undefined;
   let weakOpaque: Hit | undefined;
@@ -719,17 +1057,17 @@ function ciCoverage(need: Need, layer: CiLayer, hits: Hit[], services: Service[]
       continue;
     }
     if (!h.categories.includes(need.category)) continue;
-    if (right && !h.nonBlocking) return { need, status: 'covered', ...located(h), why: `${h.subject} runs ${LAYER_DONE[layer]}.` };
-    if (right) partialFailOk ??= h;
+    const reason = effectiveReason(need, h.reason);
+    if (right && reason === null) return { need, status: 'covered', ...located(h), why: `${h.subject} runs ${LAYER_DONE[layer]}.` };
+    if (right) partialRight ??= { h, reason: reason as Reason };
     else partialTrigger ??= h;
   }
   if (strongOpaque) return { need, status: 'unknown', ...located(strongOpaque), why: strongOpaque.why as string };
-  if (truncated) return { need, status: 'unknown', why: OPAQUE_WHY.truncated };
-  if (partialFailOk) {
-    return { need, status: 'partial', ...located(partialFailOk), why: `${partialFailOk.subject} runs, but is allowed to fail (continue-on-error), so it can't block anything.` };
-  }
+  if (ctx.truncated) return { need, status: 'unknown', why: OPAQUE_WHY.truncated };
+  if (partialRight) return { need, status: 'partial', ...located(partialRight.h), why: reasonWhy(partialRight.h, partialRight.reason, LAYER_DONE[layer]) };
   if (partialTrigger) return { need, status: 'partial', ...located(partialTrigger), why: `${partialTrigger.subject} runs, but not ${LAYER_DONE[layer]}.` };
   if (weakOpaque) return { need, status: 'unknown', ...located(weakOpaque), why: weakOpaque.why as string };
+  if (ctx.unreadable) return { need, status: 'unknown', why: OPAQUE_WHY.workflowsUnreadable };
   return { need, status: 'missing', why: missingWhy(need) };
 }
 
@@ -741,36 +1079,54 @@ function hookCoverage(need: Need, hooks: Hooks, services: Service[]): Coverage {
       : { need, status: 'covered', by: m, where: m === 'lefthook' && hooks.where !== '' ? hooks.where : HOOK_FILE[m], why: `The repo uses ${HOOK_NAME[m]} to run git hooks.` };
   }
   if (m !== null) {
-    const f = hooks.found.find((x) => x.categories.includes(need.category) && appliesTo(x.dir, need.service, services));
-    if (f) return { need, status: 'covered', by: f.by, where: hooks.where, why: `${f.subject} runs in ${HOOK_PLACE[m]} before each commit.` };
+    let partial: { f: Found; reason: Reason } | undefined;
+    for (const f of hooks.found) {
+      if (!f.categories.includes(need.category) || !appliesTo(f.dir, need.service, services)) continue;
+      const reason = effectiveReason(need, f.reason);
+      if (reason === null) return { need, status: 'covered', by: f.by, where: hooks.where, why: `${f.subject} runs in ${HOOK_PLACE[m]} before each commit.` };
+      partial ??= { f, reason };
+    }
+    if (partial) return { need, status: 'partial', by: partial.f.by, where: hooks.where, why: reasonWhy(partial.f, partial.reason, 'before each commit') };
     if (!hooks.readable) return { need, status: 'unknown', where: hooks.where, why: OPAQUE_WHY.hookUnreadable };
   }
   return { need, status: 'missing', why: missingWhy(need) };
 }
 
-const HOOK_FILE = { 'pre-commit': '.pre-commit-config.yaml', husky: '.husky', lefthook: 'lefthook.yml' } as const;
-
 /**
  * One Coverage per need, in order. Reads only the workflows in p.existingWorkflows (the list readProject made), the
- * local workflows and actions they call (one level), and the active hook manager's pre-commit hook.
+ * local workflows and actions they call (one level), and the active hook manager's pre-commit hook. Pass the number
+ * of workflow files readWorkflows skipped (its notes) as `opts.skippedWorkflows`. Throws when pipegen's tool
+ * signatures can't be loaded.
  */
-export async function mapCoverage(p: RepoProfile, needs: Need[], dir: string): Promise<Coverage[]> {
+export async function mapCoverage(p: RepoProfile, needs: Need[], dir: string, opts: MapCoverageOptions = {}): Promise<Coverage[]> {
   const sigs = (defaultCompiled ??= compile(loadToolSignatures()));
-  const ctx: Ctx = { p, sigs, read: new Reader(dir), budget: { visits: 0, bytes: 0, truncated: false }, hits: [], localFiles: new Set() };
+  const ctx: Ctx = {
+    p, sigs, read: new Reader(dir), budget: { visits: 0, bytes: 0, truncated: false }, hits: [], localFiles: new Set(),
+    unreadable: (opts.skippedWorkflows ?? 0) > 0,
+  };
+  if (p.existingWorkflows.length > MAX_WORKFLOWS) ctx.budget.truncated = true;
   for (const w of [...p.existingWorkflows].sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0)).slice(0, MAX_WORKFLOWS)) {
-    if (!regexSafe(w.path) || safeText(w.path) !== w.path || !WORKFLOW_FILE.test(w.path)) continue;
+    // A listed workflow that fails the path check or can't be read again is never skipped silently (review M1).
+    if (!regexSafe(w.path) || safeText(w.path) !== w.path || !WORKFLOW_FILE.test(w.path)) {
+      ctx.unreadable = true;
+      continue;
+    }
     const doc = await ctx.read.yaml(w.path);
-    if ('fail' in doc) continue;
+    if ('fail' in doc) {
+      ctx.unreadable = true;
+      continue;
+    }
     const events = parseOn(doc.ok.on ?? doc.ok.true);
     events.delete('workflow_call'); // a reusable workflow runs when it is called; its callers carry it
     if (events.size === 0) continue;
-    await walkWorkflow(ctx, doc.ok, w.path, fitOf(events, p.defaultBranch, w.deploys), 0, '');
+    await walkWorkflow(ctx, doc.ok, w.path, fitOf(events, p.defaultBranch, w.deploys), 0, '', false);
   }
   const hooks = await readHooks(ctx);
+  const state = { truncated: ctx.budget.truncated, unreadable: ctx.unreadable };
   return needs.map((need) => {
     if (need.layer === 'pre-commit') return hookCoverage(need, hooks, p.services);
     if (need.category === 'gate') return { need, status: 'missing', why: GATE_WHY };
     if (need.category === 'deploy-verify') return { need, status: 'missing', why: DEPLOY_VERIFY_WHY };
-    return ciCoverage(need, need.layer, ctx.hits, p.services, ctx.budget.truncated);
+    return ciCoverage(need, need.layer, ctx.hits, p.services, state);
   });
 }

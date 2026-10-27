@@ -3,94 +3,206 @@
 # it only names what to look for.
 #
 # Entry fields:
-#   id          pipegen's label for the tool (lowercase letters, digits, dashes); shown as "by" in the audit.
-#   categories  the need categories (src/types.ts NEED_CATEGORIES) a run of this tool counts for.
-#   actions     GitHub Actions, as owner/name. A `uses:` value matches case-insensitively, ignoring its @ref and any
-#               sub-path (github/foo/sub@v1 is github/foo). An entry may add a sub-path to match only that part of a
-#               repo (github/codeql-action/analyze matches analyze but not upload-sarif, which other tools use).
-#   commands    command names, matched as whole words in `run:` lines and hook commands (gitleaks never matches
-#               nogitleaksx or gitleaks.toml). Words are separated by one space ("npm audit") or a slash.
-# Every entry has actions, commands or both.
+#   id            pipegen's label for the tool (lowercase letters, digits, dashes); shown as "by" in the audit.
+#   categories    the need categories (src/types.ts NEED_CATEGORIES) a run of this tool counts for.
+#   actions       GitHub Actions, as owner/name or owner/name/sub-path. A `uses:` value matches only that exact path
+#                 (case-insensitive, @ref ignored), so snyk/actions/setup or anchore/sbom-action/download-syft, which
+#                 only install, never count. A last part ending in * is a prefix (snyk/actions/python* matches
+#                 snyk/actions/python-3.10).
+#   commands      command names, matched only where a command starts (line start, after ; && || | $( or a wrapper
+#                 such as npx, sudo, env, uv run, python -m; a path's basename; the image after docker run).
+#                 Words are separated by one space ("npm audit"); a first word with a slash is a path (.husky/pre-commit).
+#   excludes      longer commands that start like one of `commands` but are not this check.
+#   commandFails  default (fails on findings), flag (only with one of failFlags), never (only reports).
+#   failFlags     flags that make a `flag` command fail on findings.
+#   softFlags     flags that stop a command from failing ("--exit-code=0" also matches "--exit-code 0").
+#   actionFails   default, input (only with one of failInputs) or never, for the actions.
+#   failInputs    `with:` inputs (name: lowercase values, * = any value) that make an `input` action fail.
+#   softInputs    `with:` inputs (name: lowercase values) that stop the action from failing.
+#   partialWhy    pipegen's own sentence for a check that never fails the job.
+# Every entry has actions, commands or both. Each fail default below was checked against the tool's own source or
+# docs (the URL above the entry) on 2026-10-27.
 tools:
-  # secrets
+  # ---------- secrets ----------
+  # https://github.com/gitleaks/gitleaks/blob/master/README.md ("--exit-code int ... (default 1)")
   - id: gitleaks
     categories: [secrets]
     actions: [gitleaks/gitleaks-action]
     commands: [gitleaks]
+    softFlags: [--exit-code=0]
+  # CLI: https://github.com/trufflesecurity/trufflehog/blob/main/README.md ("183 ... only returned if --fail is used")
+  # Action: https://github.com/trufflesecurity/trufflehog/blob/main/action.yml (always passes --fail)
   - id: trufflehog
     categories: [secrets]
     actions: [trufflesecurity/trufflehog]
     commands: [trufflehog]
+    commandFails: flag
+    failFlags: [--fail]
+  # https://github.com/Yelp/detect-secrets/blob/master/README.md ("detect-secrets scan" builds a baseline;
+  # "detect-secrets-hook" alerts on new secrets)
   - id: detect-secrets
     categories: [secrets]
-    commands: [detect-secrets, detect-secrets-hook]
-  # code scanning (SAST)
+    commands: [detect-secrets-hook]
+  - id: detect-secrets-scan
+    categories: [secrets]
+    commands: [detect-secrets scan]
+    commandFails: never
+    partialWhy: The detect-secrets scan command only writes a baseline file; it doesn't fail when it finds a secret.
+  # ---------- code scanning (SAST) ----------
+  # semgrep ci: https://semgrep.dev/docs/semgrep-ci/configuring-blocking-and-errors-in-ci ("blocking findings ... exit code 1")
+  # semgrep-action is the deprecated wrapper around semgrep ci: https://github.com/returntocorp/semgrep-action
   - id: semgrep
     categories: [sast]
     actions: [semgrep/semgrep-action, returntocorp/semgrep-action]
+    commands: [semgrep ci]
+  # semgrep scan / semgrep --config: https://github.com/semgrep/semgrep/blob/develop/cli/src/semgrep/commands/scan.py
+  # (--error/--no-error, off by default: findings exit 0)
+  - id: semgrep-scan
+    categories: [sast]
     commands: [semgrep]
+    excludes: [semgrep ci, semgrep login, semgrep logout, semgrep install-semgrep-pro, semgrep publish, semgrep lsp, semgrep mcp]
+    commandFails: flag
+    failFlags: [--error]
+    softFlags: [--no-error]
+  # Ruling U5: CodeQL uploads results; it blocks only through code scanning merge protection
+  # (https://docs.github.com/en/code-security/code-scanning/managing-your-code-scanning-configuration/set-code-scanning-merge-protection)
   - id: codeql
     categories: [sast]
     actions: [github/codeql-action/analyze]
     commands: [codeql database analyze]
+    commandFails: never
+    actionFails: never
+    partialWhy: CodeQL reports findings but does not fail the job; they block only if code scanning merge protection is on.
+  # https://github.com/PyCQA/bandit/blob/main/bandit/cli/main.py (--exit-zero)
   - id: bandit
     categories: [sast]
     actions: [PyCQA/bandit-action]
     commands: [bandit]
+    softFlags: [--exit-zero]
+  # https://github.com/securego/gosec/blob/master/README.md ("Use -no-fail to always return 0")
   - id: gosec
     categories: [sast]
     actions: [securego/gosec]
     commands: [gosec]
-  # dependencies
+    softFlags: [-no-fail]
+  # ---------- dependencies ----------
+  # https://github.com/snyk/actions/blob/master/action.yml (input command, default test); only the scanning
+  # sub-actions are listed, never snyk/actions/setup (install only)
   - id: snyk
     categories: [deps]
-    actions: [snyk/actions]
+    actions:
+      - snyk/actions
+      - snyk/actions/node
+      - snyk/actions/python*
+      - snyk/actions/golang
+      - snyk/actions/ruby
+      - snyk/actions/php
+      - snyk/actions/dotnet
+      - snyk/actions/gradle*
+      - snyk/actions/maven*
+      - snyk/actions/scala
+      - snyk/actions/sbt*
+      - snyk/actions/cocoapods
+      - snyk/actions/elixir*
     commands: [snyk test]
+    softInputs:
+      command: [monitor]
+  - id: snyk-code
+    categories: [sast]
+    commands: [snyk code test]
+  - id: snyk-container
+    categories: [image-scan]
+    actions: [snyk/actions/docker]
+    commands: [snyk container test]
+    softInputs:
+      command: [monitor, container monitor]
+  - id: snyk-iac
+    categories: [iac]
+    actions: [snyk/actions/iac]
+    commands: [snyk iac test]
+  # https://github.com/google/osv-scanner/blob/main/docs/output.md ("non-zero exit code (1) if any vulnerabilities are found")
   - id: osv-scanner
     categories: [deps]
-    actions: [google/osv-scanner-action]
+    actions: [google/osv-scanner-action, google/osv-scanner-action/osv-scanner-action]
     commands: [osv-scanner]
+  # npm audit signatures checks registry signatures, not vulnerabilities
   - id: npm-audit
     categories: [deps]
     commands: [npm audit, pnpm audit, yarn audit]
+    excludes: [npm audit signatures]
   - id: pip-audit
     categories: [deps]
     actions: [pypa/gh-action-pip-audit]
     commands: [pip-audit]
+  # https://github.com/actions/dependency-review-action/blob/main/README.md (fail-on-severity default low; warn-only)
   - id: dependency-review
     categories: [deps]
     actions: [actions/dependency-review-action]
+    softInputs:
+      warn-only: ['true']
   - id: govulncheck
     categories: [deps]
     actions: [golang/govulncheck-action]
     commands: [govulncheck]
-  # containers and infrastructure
+  # ---------- containers and infrastructure ----------
+  # CLI: https://github.com/aquasecurity/trivy/blob/main/docs/guide/configuration/others.md ("By default, Trivy exits
+  # with code 0 even when security issues are detected")
+  # Action: https://github.com/aquasecurity/trivy-action/blob/master/action.yaml (exit-code has no default)
   - id: trivy
     categories: [deps, image-scan, iac]
     actions: [aquasecurity/trivy-action]
     commands: [trivy]
+    commandFails: flag
+    failFlags: [--exit-code]
+    softFlags: [--exit-code=0]
+    actionFails: input
+    failInputs:
+      exit-code: ['*']
+    softInputs:
+      exit-code: ['0']
+  # CLI: https://github.com/anchore/grype/blob/main/cmd/grype/cli/options/grype.go (--fail-on / -f, empty by default)
+  # Action: https://github.com/anchore/scan-action/blob/main/action.yml (fail-build default "true")
   - id: grype
     categories: [deps, image-scan]
     actions: [anchore/scan-action]
     commands: [grype]
+    commandFails: flag
+    failFlags: [--fail-on, -f]
+    softInputs:
+      fail-build: ['false']
   - id: docker-build
     categories: [image-build]
     actions: [docker/build-push-action]
     commands: [docker build, docker buildx build]
+  # CLI: https://github.com/bridgecrewio/checkov/blob/main/README.md (--soft-fail)
+  # Action: https://github.com/bridgecrewio/checkov-action/blob/master/action.yml (soft_fail)
   - id: checkov
     categories: [iac]
     actions: [bridgecrewio/checkov-action]
     commands: [checkov]
+    softFlags: [--soft-fail]
+    softInputs:
+      soft_fail: ['true']
+  # CLI: https://github.com/aquasecurity/tfsec/blob/master/internal/app/tfsec/cmd/flags.go (--soft-fail, -s)
+  # Action: https://github.com/aquasecurity/tfsec-action/blob/master/action.yml (soft_fail)
   - id: tfsec
     categories: [iac]
     actions: [aquasecurity/tfsec-action]
     commands: [tfsec]
-  # running app (DAST)
+    softFlags: [--soft-fail, -s]
+    softInputs:
+      soft_fail: ['true']
+  # ---------- running app (DAST) ----------
+  # https://github.com/zaproxy/action-baseline/blob/master/action.yml (fail_action default false; same in
+  # action-full-scan and action-api-scan)
   - id: zap
     categories: [dast]
     actions: [zaproxy/action-baseline, zaproxy/action-full-scan, zaproxy/action-api-scan]
     commands: [zap-baseline.py, zap-full-scan.py, zap-api-scan.py]
-  # tests
+    actionFails: input
+    failInputs:
+      fail_action: ['true']
+  # ---------- tests ----------
   - id: jest
     categories: [unit-tests, full-tests]
     commands: [jest]
@@ -103,28 +215,35 @@ tools:
   - id: go-test
     categories: [unit-tests, full-tests]
     commands: [go test]
-  # lint and format
+  # ---------- lint and format ----------
   - id: eslint
     categories: [lint, format-lint]
     commands: [eslint]
   - id: biome
     categories: [lint, format-lint]
-    actions: [biomejs/setup-biome]
     commands: [biome]
+  # https://github.com/astral-sh/ruff/blob/main/docs/linter.md (--exit-zero)
   - id: ruff
     categories: [lint, format-lint]
     actions: [astral-sh/ruff-action]
     commands: [ruff]
+    softFlags: [--exit-zero]
+  # https://github.com/PyCQA/flake8/blob/main/src/flake8/main/options.py (--exit-zero)
   - id: flake8
     categories: [lint, format-lint]
     commands: [flake8]
+    softFlags: [--exit-zero]
+  # https://github.com/pylint-dev/pylint/blob/main/pylint/lint/run.py (exit_zero)
   - id: pylint
     categories: [lint]
     commands: [pylint]
+    softFlags: [--exit-zero]
+  # https://github.com/golangci/golangci-lint/blob/main/pkg/commands/flagsets.go (issues-exit-code)
   - id: golangci-lint
     categories: [lint, format-lint]
     actions: [golangci/golangci-lint-action]
     commands: [golangci-lint]
+    softFlags: [--issues-exit-code=0]
   - id: prettier
     categories: [format-lint]
     commands: [prettier]
@@ -134,7 +253,7 @@ tools:
   - id: lint-staged
     categories: [format-lint]
     commands: [lint-staged]
-  # git hooks run in CI
+  # ---------- git hooks run in CI ----------
   - id: pre-commit
     categories: [hooks-ci]
     actions: [pre-commit/action]
@@ -145,7 +264,8 @@ tools:
   - id: husky-hooks
     categories: [hooks-ci]
     commands: [.husky/pre-commit]
-  # deploy: SBOM, signing, attestation
+  # ---------- deploy: SBOM, signing, attestation ----------
+  # anchore/sbom-action only (never anchore/sbom-action/download-syft, which only downloads syft)
   - id: syft
     categories: [sbom]
     actions: [anchore/sbom-action]
