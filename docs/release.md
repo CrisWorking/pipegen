@@ -105,7 +105,9 @@ Work through it in order. Tick a step only after Cristiano said go and the resul
       more than advisory, see [cooldown.md](cooldown.md)). A solo owner cannot approve their own PRs, so the owner needs a
       bypass on the PR rules (DEC #74). Record the ruleset ids here.
 - [ ] **B7. GitHub private vulnerability reporting on** (ask Cristiano first; S9).
-- [ ] **B8. The `security-fix` label** (ask Cristiano first). Nothing uses it today: the cooldown has no emergency path (S5 was not built; see [cooldown.md](cooldown.md)). Create the label only if step D1 decides to build that path.
+- [ ] **B8. The `security-fix` label** (ask Cristiano first). Create it on the real repo: the cooldown's emergency path
+      reads it (D1, [cooldown.md](cooldown.md#the-emergency-path-for-urgent-security-fixes)). Only a code owner should
+      apply it; the check fails when anyone else did.
 - [ ] **B9. Scorecard** (ask Cristiano first; S11). Run `scorecard.yml` once (`workflow_dispatch`); results are published to
       the OpenSSF API. Record the score here. Show Cristiano a **list** of every check under 9 (name, score, meaning,
       suggested fix). Checks that need a second maintainer (Code-Review, Contributors, part of Branch-Protection) are marked
@@ -157,15 +159,16 @@ Work through it in order. Tick a step only after Cristiano said go and the resul
 
 ### D. Decisions left open
 
-- [ ] **D1. Decide the emergency path for urgent security fixes** (ask Cristiano first). The cooldown has none today (S5 was
-      not built). Decide whether to build one (for example the `security-fix` label plus a `Security-fix-reason:` line,
-      with owner review) and what the README and the PR template then say.
+- [x] **D1. The emergency path for urgent security fixes.** Decided (DECISIONS #103: "yes, owner approval each time") and
+      built: the `security-fix` label applied by a code owner plus a `Security-fix-reason:` line, and two code-owner
+      approvals once CODEOWNERS lists two owners. The README says so; see [cooldown.md](cooldown.md#the-emergency-path-for-urgent-security-fixes).
 
 ## Notes
 
 - **Pins in this workflow** (Node, actions) follow the 7-day cooldown like every other pin. Bump them in a PR; the
   `cooldown` job does not read workflow files, so check the release dates by hand.
-- **When a second maintainer exists:** enable "required reviewers" and "prevent self-review" on `npm-release`, require two
-  approvals for emergency-path PRs, if D1 builds one.
+- **When a second maintainer exists:** enable "required reviewers" and "prevent self-review" on `npm-release`, and add them
+  to the `/data/` and `/scripts/` lines of `.github/CODEOWNERS`: from then on the cooldown's emergency path needs two
+  code-owner approvals on its own.
 - **Recorded results** (filled in during R-publish): tag ruleset id: none yet. Main ruleset id: none yet. Immutable releases:
   not on yet. Scorecard score: not run yet. Trusted publisher: not configured yet. Disallow tokens: not set yet.

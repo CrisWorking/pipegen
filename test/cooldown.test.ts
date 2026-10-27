@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { binaryItems, changedLockEntries, formatReport, repoPath, runCooldown, type Files } from '../scripts/cooldown.js';
+import { binaryItems, changedLockEntries, formatReport, prFromEnv, repoPath, runCooldown, type Files } from '../scripts/cooldown.js';
 
 const NOW = new Date('2026-10-27T12:00:00Z');
 const daysAgo = (d: number): string => new Date(NOW.getTime() - d * 86_400_000).toISOString().replace('.000Z', 'Z');
@@ -396,5 +396,208 @@ describe('cooldown: general', () => {
     const big = (async () => new Response(new ReadableStream({ start(c) { c.enqueue(new Uint8Array(40 * 1024 * 1024)); c.close(); } }), { status: 200 })) as unknown as typeof fetch;
     const r = await run({}, { 'package-lock.json': lock({ a: '1.0.0' }) }, big);
     expect(problems(r)).toContain('too large');
+  });
+});
+
+// --- the security-fix emergency path (DECISIONS #103, Plan R Task 4 / ruling R-E1) ---------------------------------
+
+const PR = { repo: 'o/p', number: 7, headSha: SHA };
+const OWNERS1 = '# owners\n/data/ @CrisWorking\n/gate/ @CrisWorking\n/scripts/ @CrisWorking\n';
+const OWNERS2 = '/data/ @CrisWorking @Second\n/scripts/ @CrisWorking @Second\n';
+const REASON = 'Security-fix-reason: CVE-2026-0001 in rollup, fixed upstream yesterday';
+const young = { 'package-lock.json': lock({ rollup: '4.64.12' }) };
+const youngDocs = npmDoc('rollup', { '4.64.12': daysAgo(1) });
+const labeled = (login: string, event = 'labeled', name = 'security-fix') => ({ event, actor: { login }, label: { name } });
+const review = (login: string, state: string, commit = SHA) => ({ user: { login }, state, commit_id: commit });
+const prRoutes = (o: { body?: string | null; labels?: string[]; author?: string; head?: string; events?: unknown; reviews?: unknown } = {}): Routes => ({
+  [gh('o/p/pulls/7')]: {
+    number: 7, head: { sha: o.head ?? SHA }, user: { login: o.author ?? 'contributor' },
+    body: o.body === undefined ? `Fixes the CVE.\n\n${REASON}\n` : o.body, labels: (o.labels ?? ['security-fix']).map((name) => ({ name })),
+  },
+  [gh('o/p/issues/7/events?per_page=100&page=1')]: o.events ?? [labeled('someone', 'labeled', 'bug'), labeled('CrisWorking')],
+  [gh('o/p/pulls/7/reviews?per_page=100&page=1')]: o.reviews ?? [],
+});
+const emergency = (owners: string | null, routes: Routes, head: Files = young, calls: string[] = []) =>
+  run(owners === null ? {} : { '.github/CODEOWNERS': owners }, head, router({ ...youngDocs, ...routes }, calls), { pr: PR });
+
+describe('cooldown: security-fix emergency path', () => {
+  it('cooldown: security-fix label with 2 approvals → pass', async () => {
+    const reviews = [review('CrisWorking', 'APPROVED'), review('Second', 'APPROVED')];
+    const r = await emergency(OWNERS2, prRoutes({ reviews }));
+    expect(r.ok).toBe(true);
+    expect(r.findings).toEqual([]);
+    expect(r.waived.map((f) => f.name)).toEqual(['rollup']);
+    const out = formatReport(r);
+    expect(out).toContain('security-fix');
+    expect(out).toContain('rollup 4.64.12');
+    expect(out).toContain('CrisWorking, Second');
+  });
+
+  it('cooldown: security-fix label, one maintainer, reason given → pass and reason in summary', async () => {
+    const r = await emergency(OWNERS1, prRoutes());
+    expect(r.ok).toBe(true);
+    const out = formatReport(r);
+    expect(out).toContain('CVE-2026-0001 in rollup, fixed upstream yesterday');
+    expect(out).toContain('rollup 4.64.12'); // the young item stays visible
+    expect(out).toContain('CrisWorking');
+  });
+
+  it('cooldown: security-fix label without reason or approvals → fail', async () => {
+    for (const body of [null, 'no reason line here', 'Security-fix-reason:   ', `Security-fix-reason:\n${REASON}`]) {
+      const r = await emergency(OWNERS1, prRoutes({ body }));
+      expect(r.ok, String(body)).toBe(false);
+      expect(problems(r)).toContain('Security-fix-reason');
+    }
+    // two owners: a reason alone is not enough, and approvals do not replace the reason
+    const noApprovals = await emergency(OWNERS2, prRoutes());
+    expect(noApprovals.ok).toBe(false);
+    expect(problems(noApprovals)).toContain('2 code owners');
+    const approvedNoReason = await emergency(OWNERS2, prRoutes({ body: '', reviews: [review('CrisWorking', 'APPROVED'), review('Second', 'APPROVED')] }));
+    expect(approvedNoReason.ok).toBe(false);
+    // and the young item is still listed
+    expect(noApprovals.findings.map((f) => f.name)).toContain('rollup');
+  });
+
+  it('a label applied by a non-owner fails, and the latest labeled event counts', async () => {
+    const r = await emergency(OWNERS1, prRoutes({ events: [labeled('contributor')] }));
+    expect(r.ok).toBe(false);
+    expect(problems(r)).toContain('not a code owner');
+    const relabeled = [labeled('CrisWorking'), labeled('contributor', 'unlabeled'), labeled('contributor')];
+    expect(problems(await emergency(OWNERS1, prRoutes({ events: relabeled })))).toContain('not a code owner');
+    const bot = [labeled('github-actions[bot]')];
+    expect((await emergency(OWNERS1, prRoutes({ events: bot }))).ok).toBe(false);
+  });
+
+  it('the label must really be on the PR (API labels and events agree)', async () => {
+    // not in the PR's labels: no emergency, the young item fails as usual, no event lookup
+    const calls: string[] = [];
+    const r = await emergency(OWNERS1, prRoutes({ labels: ['bug'] }), young, calls);
+    expect(r.ok).toBe(false);
+    expect(calls.some((c) => c.includes('/events'))).toBe(false);
+    // on the PR but the latest event removed it, or no event at all
+    expect((await emergency(OWNERS1, prRoutes({ events: [labeled('CrisWorking'), labeled('CrisWorking', 'unlabeled')] }))).ok).toBe(false);
+    expect((await emergency(OWNERS1, prRoutes({ events: [] }))).ok).toBe(false);
+  });
+
+  it('owners come from the BASE CODEOWNERS, never the PR copy', async () => {
+    const hostile = '/data/ @contributor\n/scripts/ @contributor\n';
+    const head = { ...young, '.github/CODEOWNERS': hostile };
+    const r = await run({ '.github/CODEOWNERS': OWNERS1 }, head, router({ ...youngDocs, ...prRoutes({ events: [labeled('contributor')] }) }), { pr: PR });
+    expect(r.ok).toBe(false);
+    expect(problems(r)).toContain('not a code owner');
+    // no base CODEOWNERS at all: fails even if the PR adds one
+    expect((await run({}, head, router({ ...youngDocs, ...prRoutes({ events: [labeled('contributor')] }) }), { pr: PR })).ok).toBe(false);
+  });
+
+  it('an unusable base CODEOWNERS fails closed', async () => {
+    for (const owners of [null, '/data/ @CrisWorking\n', '/data/ @CrisWorking\n/scripts/ @Other\n', '/data/ @org/team\n/scripts/ @org/team\n', '/data/ a@b.com\n/scripts/ a@b.com\n', '/data/\n/scripts/\n']) {
+      const r = await emergency(owners, prRoutes());
+      expect(r.ok, String(owners)).toBe(false);
+      expect(problems(r)).toContain('CODEOWNERS');
+    }
+    // the last line for a pattern wins (as on GitHub), and logins compare without case
+    expect((await emergency('/data/ @Old\n/scripts/ @crisworking\n/data/ @CRISWORKING\n', prRoutes())).ok).toBe(true);
+  });
+
+  it('two owners: one approval, self-approval, an old head SHA, a later change request or comment, a non-owner all fail', async () => {
+    const ok = [review('CrisWorking', 'APPROVED'), review('Second', 'APPROVED')];
+    expect((await emergency(OWNERS2, prRoutes({ reviews: ok }))).ok).toBe(true);
+    const cases: Record<string, { reviews: unknown[]; author?: string }> = {
+      one: { reviews: [review('CrisWorking', 'APPROVED')] },
+      self: { reviews: ok, author: 'Second' },
+      oldSha: { reviews: [review('CrisWorking', 'APPROVED'), review('Second', 'APPROVED', SHA2)] },
+      changes: { reviews: [...ok, review('Second', 'CHANGES_REQUESTED')] },
+      dismissed: { reviews: [review('CrisWorking', 'APPROVED'), review('Second', 'DISMISSED')] },
+      comment: { reviews: [...ok, review('Second', 'COMMENTED')] },
+      nonOwner: { reviews: [review('CrisWorking', 'APPROVED'), review('contributor', 'APPROVED')] },
+      sameTwice: { reviews: [review('CrisWorking', 'APPROVED'), review('crisworking', 'APPROVED')] },
+    };
+    for (const [name, c] of Object.entries(cases)) {
+      const r = await emergency(OWNERS2, prRoutes({ reviews: c.reviews, ...(c.author ? { author: c.author } : {}) }));
+      expect(r.ok, name).toBe(false);
+      expect(problems(r), name).toContain('2 code owners');
+    }
+    // a later approval after a change request counts again
+    expect((await emergency(OWNERS2, prRoutes({ reviews: [review('CrisWorking', 'APPROVED'), review('Second', 'CHANGES_REQUESTED'), review('Second', 'APPROVED')] }))).ok).toBe(true);
+  });
+
+  it('an API error reading the PR, events or reviews fails closed (not "no label")', async () => {
+    for (const path of ['o/p/pulls/7', 'o/p/issues/7/events?per_page=100&page=1', 'o/p/pulls/7/reviews?per_page=100&page=1']) {
+      const r = await emergency(OWNERS2, { ...prRoutes({ reviews: [review('CrisWorking', 'APPROVED'), review('Second', 'APPROVED')] }), [gh(path)]: 502 });
+      expect(r.ok, path).toBe(false);
+      expect(r.findings.some((f) => f.kind === 'security-fix' && f.lookupFailed), path).toBe(true);
+    }
+    // an unreadable answer (not a list, no labels) fails too
+    expect((await emergency(OWNERS1, { ...prRoutes(), [gh('o/p/issues/7/events?per_page=100&page=1')]: { message: 'odd' } })).ok).toBe(false);
+    expect((await emergency(OWNERS1, { ...prRoutes(), [gh('o/p/pulls/7')]: { head: { sha: SHA }, body: REASON } })).ok).toBe(false);
+  });
+
+  it('a PR head that moved since the run started fails', async () => {
+    const r = await emergency(OWNERS1, prRoutes({ head: SHA2 }));
+    expect(r.ok).toBe(false);
+    expect(problems(r)).toContain('head');
+  });
+
+  it('reads every page of events', async () => {
+    const filler = Array.from({ length: 100 }, () => labeled('someone', 'labeled', 'bug'));
+    const routes = { ...prRoutes(), [gh('o/p/issues/7/events?per_page=100&page=1')]: filler, [gh('o/p/issues/7/events?per_page=100&page=2')]: [labeled('CrisWorking')] };
+    expect((await emergency(OWNERS1, routes)).ok).toBe(true);
+    const unlabeledLater = { ...routes, [gh('o/p/issues/7/events?per_page=100&page=2')]: [labeled('CrisWorking'), labeled('x', 'unlabeled')] };
+    expect((await emergency(OWNERS1, unlabeledLater)).ok).toBe(false);
+  });
+
+  it('a hostile reason is printed as one inert line', async () => {
+    const evil = 'Security-fix-reason: \u001b[31mred\u001b[0m \u202eevil\u2066 \u200b@everyone see https://evil.example/x and [click](http://y.example) www.z.example ::error::boom' + ' long'.repeat(2000);
+    const r = await emergency(OWNERS1, prRoutes({ body: `${evil}\r\n::warning::second line` }));
+    expect(r.ok).toBe(true);
+    const out = formatReport(r);
+    const line = out.split('\n').find((l) => l.startsWith('Security-fix-reason:')) ?? '';
+    expect(line).toContain('red');
+    expect(out).not.toMatch(/[\u001b\u202e\u2066\u200b]/);
+    expect(line).not.toContain('@');
+    expect(line).not.toContain('://');
+    expect(line).not.toContain('](');
+    expect(line).not.toContain('www.');
+    expect(out).not.toContain('second line');
+    expect(out.split('\n').some((l) => l.trimStart().startsWith('::'))).toBe(false);
+    expect(line).not.toContain('::');
+    expect([...line.slice('Security-fix-reason: '.length)].length).toBeLessThanOrEqual(301);
+  });
+
+  it('the label only lifts the age rule: a bad integrity, a future date or a wrong sha still fails', async () => {
+    const head = { 'package-lock.json': lock({ rollup: '4.64.12', lodash: { v: '4.17.21', integrity: 'sha512-WRONG' } }) };
+    const calls: string[] = [];
+    const r = await run({ '.github/CODEOWNERS': OWNERS1 }, head, router({ ...youngDocs, ...npmDoc('lodash', { '4.17.21': daysAgo(1) }), ...prRoutes() }, calls), { pr: PR });
+    expect(r.ok).toBe(false);
+    expect(problems(r)).toContain('integrity');
+    expect(formatReport(r)).toContain('only lifts the age rule');
+    const future = await emergency(OWNERS1, { ...prRoutes(), ...npmDoc('rollup', { '4.64.12': daysAgo(-2) }) });
+    expect(future.ok).toBe(false);
+    expect(problems(future)).toContain('future');
+    const sha = await run({ '.github/CODEOWNERS': OWNERS1 }, { 'data/reviewed-tools.yml': rtFile(action('v2', SHA2)) }, router({ ...actionRoutes('v2', SHA, daysAgo(1)), ...prRoutes() }), { pr: PR });
+    expect(problems(sha)).toContain('not the commit of this tag');
+  });
+
+  it('nothing young: no GitHub PR lookups; no PR context: young still fails', async () => {
+    const calls: string[] = [];
+    const old = { 'package-lock.json': lock({ ms: '2.1.3' }) };
+    expect((await run({ '.github/CODEOWNERS': OWNERS1 }, old, router({ ...npmDoc('ms', { '2.1.3': daysAgo(400) }), ...prRoutes() }, calls), { pr: PR })).ok).toBe(true);
+    expect(calls.some((c) => c.includes('/repos/o/p/'))).toBe(false);
+    expect((await run({ '.github/CODEOWNERS': OWNERS1 }, young, router({ ...youngDocs, ...prRoutes() }))).ok).toBe(false);
+  });
+
+  it('reads the PR context from env and refuses a malformed one', () => {
+    expect(prFromEnv({})).toBeUndefined();
+    expect(prFromEnv({ PR_REPO: 'o/p', PR_NUMBER: '7', PR_HEAD_SHA: SHA })).toEqual(PR);
+    for (const env of [{ PR_REPO: 'o/p' }, { PR_REPO: '../x', PR_NUMBER: '7', PR_HEAD_SHA: SHA }, { PR_REPO: 'o/p', PR_NUMBER: '7a', PR_HEAD_SHA: SHA }, { PR_REPO: 'o/p', PR_NUMBER: '7', PR_HEAD_SHA: 'main' }]) {
+      expect(() => prFromEnv(env), JSON.stringify(env)).toThrow(/PR_/);
+    }
+  });
+
+  it('plain text output strips escapes from file-supplied names too', async () => {
+    const head = { 'package-lock.json': lock({ 'x\u001b[2J\n::error::y': '1.0.0' }) };
+    const out = formatReport(await run({}, head, router({})));
+    expect(out).not.toContain('\u001b');
+    expect(out.split('\n').some((l) => l.trimStart().startsWith('::'))).toBe(false);
   });
 });

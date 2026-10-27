@@ -4,6 +4,9 @@ on:
   push:
     branches: [main]
   pull_request:
+    # labeled, unlabeled and edited re-run the `cooldown` job when the security-fix label or the PR body changes
+    # (docs/cooldown.md). The other jobs re-run too: skipping them would report a required check as passed.
+    types: [opened, synchronize, reopened, labeled, unlabeled, edited]
 
 permissions: {}
 
@@ -154,6 +157,7 @@ jobs:
       cancel-in-progress: true
     permissions:
       contents: read
+      pull-requests: read # the PR, its label events and reviews, for the security-fix path (read-only)
     steps:
       # Both commits come from the same event payload, so base and head stay consistent for the whole run.
       - name: "Check out the base commit (trusted, holds the script)"
@@ -187,5 +191,10 @@ jobs:
           fi
           node base/scripts/cooldown.ts --base-dir base --head-dir head
         env:
-          # Read-only job token (contents: read), given to this step only.
+          # Read-only job token (contents and pull-requests: read), given to this step only.
           GITHUB_TOKEN: ${{ github.token }}
+          # Identify the PR for the security-fix path. The label, the body and the reviews are read from the API by
+          # the script, never from the event payload, and nothing from the PR is put into the shell command.
+          PR_REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}

@@ -13,6 +13,13 @@
 // Anything that can't be tied and dated (lookup failed, 404, no digest, unreadable date, date in the future,
 // a kind this script doesn't know) fails closed. A docker pin it can't date says "needs owner review".
 //
+// Emergency path (DECISIONS #103): when the only problem left is age, a PR labelled `security-fix` by a code owner
+// passes anyway. Code owners are the users on the BASE commit's `.github/CODEOWNERS` `/data/` and `/scripts/` lines.
+// With one owner the label plus a `Security-fix-reason:` line in the PR body is enough; with two or more, two owners
+// other than the PR author must also approve the current head commit. The label is read from the API (PR labels and
+// the latest `labeled` event), never from the event payload, and any API error fails closed. The young items and the
+// reason are printed, so the exception stays visible.
+//
 // The CI job runs the BASE commit's copy of this file against the PR's files, so a PR can't weaken the check that
 // judges it. Keep it dependency-free apart from `yaml`, and keep to syntax Node's type stripping can run
 // (no enums, no parameter properties, no namespaces): `node scripts/cooldown.ts`.
@@ -28,11 +35,13 @@ const DAY_MS = 86_400_000;
 const CONCURRENCY = 6;
 
 export const WATCHED_FILES = ['package.json', 'package-lock.json', 'data/reviewed-tools.yml', 'data/pinned-binaries.yml'] as const;
+/** Read from the base checkout only: it names who may grant the emergency path. */
+export const CODEOWNERS_FILE = '.github/CODEOWNERS';
 /** File contents by repo-relative path; a missing file is absent or null. */
 export type Files = Partial<Record<string, string | null>>;
 
 export interface Finding {
-  kind: 'npm' | 'pypi' | 'reviewed-tool' | 'pinned-binary' | 'lockfile';
+  kind: 'npm' | 'pypi' | 'reviewed-tool' | 'pinned-binary' | 'lockfile' | 'security-fix';
   name: string;
   version: string;
   /** ISO publish date used for the decision, or null when none could be found. */
@@ -41,13 +50,32 @@ export interface Finding {
   problem: string;
   /** True when the problem is a failed lookup (retrying may help). */
   lookupFailed: boolean;
+  /** True when the only problem is age (a readable upstream date under 7 days): the one thing `security-fix` lifts. */
+  young: boolean;
+}
+
+/** How the emergency path was granted: by whom, why, and (two or more owners) who approved. */
+export interface Emergency {
+  labelledBy: string;
+  reason: string;
+  approvers: string[];
 }
 
 export interface CooldownResult {
   ok: boolean;
   checked: number;
   findings: Finding[];
+  /** Young items that passed only because of the `security-fix` label. */
+  waived: Finding[];
+  emergency?: Emergency;
   notes: string[];
+}
+
+/** The pull request being checked; without it there is no emergency path (local runs). */
+export interface PrContext {
+  repo: string;
+  number: number;
+  headSha: string;
 }
 
 export interface CooldownOptions {
@@ -56,6 +84,7 @@ export interface CooldownOptions {
   fetch: typeof fetch;
   now: Date;
   githubToken?: string;
+  pr?: PrContext;
   maxLookups?: number;
   timeoutMs?: number;
 }
@@ -536,16 +565,172 @@ export function binaryItems(base: string | null | undefined, head: string | null
   return items;
 }
 
+// --- the security-fix emergency path ------------------------------------------------------------------------------
+
+export const SECURITY_FIX_LABEL = 'security-fix';
+export const REASON_PREFIX = 'Security-fix-reason:';
+export const MAX_REASON_CHARS = 300;
+const MAX_TEXT_CHARS = 300;
+const MAX_PAGES = 10;
+const PAGE_SIZE = 100;
+const LOGIN = /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})$/;
+
+// CSI and OSC escape sequences, and two-character escapes.
+const ESCAPES = /\u001b(?:\[[0-?]*[ -/]*[@-~]|\][^\u0007\u001b]*(?:\u0007|\u001b\\)?|[@-_])/g;
+
+/** Text on one line with no escape sequences, control, bidi, zero-width or line-separator characters. */
+function oneLine(s: string): string {
+  return s.replace(ESCAPES, '').replace(/[\p{Cc}\p{Cf}\p{Cs}\p{Zl}\p{Zp}]/gu, ' ').replace(/\s+/g, ' ').trim();
+}
+
+/** Caps by code point, and splits `::` so a printed line can never be a workflow command. */
+function capped(s: string, max: number): string {
+  const t = s.replace(/:{2,}/g, (m) => m.split('').join(' '));
+  const cps = [...t];
+  return cps.length > max ? `${cps.slice(0, max).join('')}…` : t;
+}
+
+/** Text from a file or an API, safe to print as part of one log line. */
+export function plainText(s: string, max = MAX_TEXT_CHARS): string {
+  return capped(oneLine(s), max);
+}
+
+/** Text a PR author wrote: plainText, and no @mention, link or markdown link left that could notify or render. */
+export function inertText(s: string, max = MAX_TEXT_CHARS): string {
+  const t = oneLine(s).replace(/@/g, '(at)').replace(/:\/\//g, '[:]//').replace(/\bwww\./gi, 'www[.]').replace(/\]\(/g, '] (').replace(/[<>`]/g, '');
+  return capped(t, max);
+}
+
+/** The first `Security-fix-reason:` line of a PR body, made inert and capped; undefined when missing or empty. */
+export function securityFixReason(body: unknown): string | undefined {
+  if (typeof body !== 'string') return undefined;
+  for (const line of body.split(/\r\n|\r|\n/)) {
+    const m = /^\s*Security-fix-reason:(.*)$/.exec(line);
+    if (!m) continue;
+    // Only the first such line counts, even when it is empty.
+    const reason = inertText((m[1] ?? '').slice(0, MAX_REASON_CHARS * 8), MAX_REASON_CHARS);
+    return reason === '' ? undefined : reason;
+  }
+  return undefined;
+}
+
+/**
+ * Who may grant the emergency path: the user logins on the `/data/` and `/scripts/` lines of the base CODEOWNERS
+ * (the last line for a pattern wins, as on GitHub). Both lines must exist, hold only `@login` entries and agree.
+ */
+export function emergencyOwners(text: string | null | undefined): { owners: string[] } | { problem: string } {
+  if (!text) return { problem: `the base commit has no ${CODEOWNERS_FILE}, so no code owner can grant the security-fix path` };
+  const rules = new Map<string, string[]>();
+  for (const raw of text.split(/\r?\n/)) {
+    const line = raw.replace(/(^|\s)#.*$/, '').trim();
+    if (line === '') continue;
+    const [pattern, ...who] = line.split(/\s+/);
+    rules.set(pattern as string, who);
+  }
+  const sets: string[][] = [];
+  for (const pattern of ['/data/', '/scripts/']) {
+    const who = rules.get(pattern);
+    if (!who || who.length === 0) return { problem: `the base ${CODEOWNERS_FILE} has no owners on its ${pattern} line` };
+    if (!who.every((w) => w.startsWith('@') && LOGIN.test(w.slice(1)))) {
+      return { problem: `the base ${CODEOWNERS_FILE} ${pattern} line holds something other than user logins (teams and emails are not accepted here)` };
+    }
+    sets.push([...new Set(who.map((w) => w.slice(1).toLowerCase()))].sort());
+  }
+  if (canon(sets[0]) !== canon(sets[1])) return { problem: `the /data/ and /scripts/ lines of the base ${CODEOWNERS_FILE} list different users` };
+  return { owners: sets[0] as string[] };
+}
+
+const loginOf = (v: unknown): string | undefined => (isObj(v) ? str(v.login) : undefined);
+
+/** Every page of a GitHub list, or undefined when it is longer than the page cap. */
+async function allPages(ctx: Ctx, url: string): Promise<unknown[] | undefined> {
+  const out: unknown[] = [];
+  for (let page = 1; page <= MAX_PAGES; page++) {
+    const got = await ctx.get(`${url}?per_page=${PAGE_SIZE}&page=${page}`, ctx.gh);
+    if (!Array.isArray(got)) throw new LookupError('unreadable list answer');
+    out.push(...got);
+    if (got.length < PAGE_SIZE) return out;
+  }
+  return undefined;
+}
+
+type EmergencyOutcome = { granted: Emergency } | { absent: true } | { problem: string; lookupFailed?: boolean };
+
+/** Whether the PR holds a valid `security-fix` grant. `absent` = the label is not on the PR. */
+async function emergencyOutcome(ctx: Ctx, pr: PrContext, codeowners: string | null | undefined): Promise<EmergencyOutcome> {
+  const r = repoPath(pr.repo);
+  if (!r || !Number.isSafeInteger(pr.number) || pr.number < 1 || !/^[0-9a-f]{40}$/.test(pr.headSha)) return { problem: 'the PR context is malformed' };
+  const api = `https://api.github.com/repos/${r}`;
+  try {
+    const doc = await ctx.get(`${api}/pulls/${pr.number}`, ctx.gh);
+    if (!isObj(doc) || !Array.isArray(doc.labels)) return { problem: 'unreadable pull request answer' };
+    if (!doc.labels.some((l) => isObj(l) && l.name === SECURITY_FIX_LABEL)) return { absent: true };
+    if (!isObj(doc.head) || doc.head.sha !== pr.headSha) return { problem: 'the PR head moved since this run started; the run for the new head decides' };
+    const author = loginOf(doc.user)?.toLowerCase();
+    if (!author) return { problem: 'the PR author can not be read' };
+
+    const found = emergencyOwners(codeowners);
+    if ('problem' in found) return found;
+    const { owners } = found;
+
+    // The latest labeled/unlabeled event for the label counts; it must be `labeled`, by a code owner.
+    const events = await allPages(ctx, `${api}/issues/${pr.number}/events`);
+    if (!events) return { problem: `the PR has more than ${MAX_PAGES * PAGE_SIZE} events; can not tell who applied the label` };
+    let last: Obj | undefined;
+    for (const e of events) {
+      if (isObj(e) && (e.event === 'labeled' || e.event === 'unlabeled') && isObj(e.label) && e.label.name === SECURITY_FIX_LABEL) last = e;
+    }
+    if (!last || last.event !== 'labeled') return { problem: 'no `labeled` event matches the security-fix label on the PR' };
+    const by = loginOf(last.actor);
+    if (!by || !owners.includes(by.toLowerCase())) {
+      return { problem: `the security-fix label was applied by ${plainText(by ?? 'an unknown user', 60)}, who is not a code owner in the base ${CODEOWNERS_FILE}; a code owner has to apply it` };
+    }
+
+    const reason = securityFixReason(doc.body);
+    if (!reason) return { problem: `the PR body has no non-empty "${REASON_PREFIX}" line (the first such line counts)` };
+    if (owners.length < 2) return { granted: { labelledBy: by, reason, approvers: [] } };
+
+    // Two or more owners: the latest review of each user counts (a later comment, change request or dismissal
+    // cancels an approval); it must approve the current head, by an owner who is not the PR author.
+    const reviews = await allPages(ctx, `${api}/pulls/${pr.number}/reviews`);
+    if (!reviews) return { problem: `the PR has more than ${MAX_PAGES * PAGE_SIZE} reviews` };
+    const latest = new Map<string, Obj>();
+    for (const rv of reviews) {
+      const who = isObj(rv) ? loginOf(rv.user)?.toLowerCase() : undefined;
+      if (!isObj(rv) || !who) return { problem: 'unreadable review answer' };
+      if (rv.state !== 'PENDING') latest.set(who, rv);
+    }
+    const approvers = [...latest].filter(([who, rv]) => rv.state === 'APPROVED' && rv.commit_id === pr.headSha && owners.includes(who) && who !== author).map(([who]) => who).sort();
+    if (approvers.length < 2) {
+      return { problem: `with ${owners.length} code owners the path needs approving reviews from 2 code owners other than the PR author on the head commit ${pr.headSha.slice(0, 12)}; found ${approvers.length}` };
+    }
+    return { granted: { labelledBy: by, reason, approvers: approvers.map((a) => loginOf(latest.get(a)?.user) ?? a) } };
+  } catch (e) {
+    if (e instanceof LookupError) return { problem: `GitHub lookup for the security-fix path failed: ${e.message}`, lookupFailed: !e.notFound };
+    throw e;
+  }
+}
+
+/** The PR context from the CI env (PR_REPO, PR_NUMBER, PR_HEAD_SHA): undefined when none is set, an error when malformed. */
+export function prFromEnv(env: Record<string, string | undefined>): PrContext | undefined {
+  const { PR_REPO: repo, PR_NUMBER: num, PR_HEAD_SHA: sha } = env;
+  if (repo === undefined && num === undefined && sha === undefined) return undefined;
+  if (!repo || !repoPath(repo) || !num || !/^[1-9][0-9]{0,9}$/.test(num) || !sha || !/^[0-9a-f]{40}$/.test(sha)) {
+    throw new FileError('PR_REPO, PR_NUMBER or PR_HEAD_SHA is missing or malformed');
+  }
+  return { repo, number: Number(num), headSha: sha };
+}
+
 // --- the check ----------------------------------------------------------------------------------------------------
 
 const ISO = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:\d{2})$/;
 
-/** Returns a problem text when the date is too young, unreadable or in the future; otherwise undefined. */
-function judge(date: string | undefined, now: Date): string | undefined {
-  if (!date || !ISO.test(date) || Number.isNaN(Date.parse(date))) return 'no readable publish date';
+/** A problem when the date is too young (`young`), unreadable or in the future; otherwise undefined. */
+function judge(date: string | undefined, now: Date): { problem: string; young: boolean } | undefined {
+  if (!date || !ISO.test(date) || Number.isNaN(Date.parse(date))) return { problem: 'no readable publish date', young: false };
   const age = (now.getTime() - Date.parse(date)) / DAY_MS;
-  if (age < 0) return 'publish date is in the future';
-  if (age < COOLDOWN_DAYS) return `only ${age.toFixed(1)} days old (needs ${COOLDOWN_DAYS})`;
+  if (age < 0) return { problem: 'publish date is in the future', young: false };
+  if (age < COOLDOWN_DAYS) return { problem: `only ${age.toFixed(1)} days old (needs ${COOLDOWN_DAYS})`, young: true };
   return undefined;
 }
 
@@ -559,10 +744,10 @@ export async function runCooldown(opts: CooldownOptions): Promise<CooldownResult
   const baseLock = base['package-lock.json'];
   const headLock = head['package-lock.json'];
   if (!headLock && baseLock) {
-    findings.push({ kind: 'lockfile', name: 'package-lock.json', version: '', date: null, lookupFailed: false, problem: 'the lockfile was removed; it can not be checked' });
+    findings.push({ kind: 'lockfile', name: 'package-lock.json', version: '', date: null, lookupFailed: false, problem: 'the lockfile was removed; it can not be checked', young: false });
   }
   const lockProblem = lockfileProblem(headLock);
-  if (lockProblem) findings.push({ kind: 'lockfile', name: 'package-lock.json', version: '', date: null, lookupFailed: false, problem: lockProblem });
+  if (lockProblem) findings.push({ kind: 'lockfile', name: 'package-lock.json', version: '', date: null, lookupFailed: false, problem: lockProblem, young: false });
 
   type Job = { kind: Finding['kind']; name: string; version: string; run: () => Promise<Outcome> };
   const jobs: Job[] = [];
@@ -579,35 +764,59 @@ export async function runCooldown(opts: CooldownOptions): Promise<CooldownResult
   await pool(jobs, CONCURRENCY, async (job) => {
     checked++;
     const o = await job.run();
-    const problem = 'problem' in o ? o.problem : judge(o.date, now);
-    if (problem) {
+    const verdict = 'problem' in o ? { problem: o.problem, young: false } : judge(o.date, now);
+    if (verdict) {
       findings.push({
         kind: job.kind, name: job.name, version: job.version, date: 'date' in o ? o.date : null,
-        problem, lookupFailed: 'problem' in o && o.lookupFailed === true,
+        problem: verdict.problem, lookupFailed: 'problem' in o && o.lookupFailed === true, young: verdict.young,
       });
     }
   });
   findings.sort((a, b) => a.kind.localeCompare(b.kind) || a.name.localeCompare(b.name) || a.version.localeCompare(b.version));
 
-  return { ok: findings.length === 0, checked, findings, notes };
+  // The emergency path is asked only when age is the sole problem; it never lifts any other check.
+  if (opts.pr && findings.length > 0 && findings.every((f) => f.young)) {
+    const e = await emergencyOutcome(ctx, opts.pr, base[CODEOWNERS_FILE]);
+    if ('granted' in e) {
+      return { ok: true, checked, findings: [], waived: findings, emergency: e.granted, notes };
+    }
+    if ('problem' in e) {
+      findings.push({ kind: 'security-fix', name: 'security-fix label', version: '', date: null, problem: e.problem, lookupFailed: e.lookupFailed === true, young: false });
+    }
+  }
+
+  return { ok: findings.length === 0, checked, findings, waived: [], notes };
 }
+
+/** One finding as a log line; everything that came from a file or an API goes through plainText. */
+const itemLine = (f: Finding): string =>
+  `  - [${f.kind}] ${plainText(f.name)}${f.version ? ' ' + plainText(f.version, 80) : ''}: ${plainText(f.problem, 400)}${f.date ? ` (published ${plainText(f.date, 40)})` : ''}`;
 
 /** Plain-text report for the job log. */
 export function formatReport(r: CooldownResult): string {
   const lines: string[] = [];
-  if (r.ok) {
+  const e = r.emergency;
+  if (r.ok && e && r.waived.length > 0) {
+    lines.push(`cooldown: ok ONLY through the security-fix emergency path. ${r.checked} new or changed version(s) checked; these are younger than ${COOLDOWN_DAYS} days and pass only because of the label:`);
+    for (const f of r.waived) lines.push(itemLine(f));
+    lines.push(e.approvers.length > 0
+      ? `Label applied by code owner ${plainText(e.labelledBy, 60)}; approved on the head commit by code owners ${e.approvers.map((a) => plainText(a, 60)).join(', ')}.`
+      : `Label applied by code owner ${plainText(e.labelledBy, 60)}. CODEOWNERS lists one owner, so the label and a written reason are enough.`);
+    lines.push(`${REASON_PREFIX} ${e.reason}`);
+  } else if (r.ok) {
     lines.push(`cooldown: ok. ${r.checked} new or changed version(s) checked, none younger than ${COOLDOWN_DAYS} days.`);
   } else {
     lines.push(`cooldown: FAILED. These new or changed versions are not at least ${COOLDOWN_DAYS} days old (or could not be dated):`);
-    for (const f of r.findings) {
-      lines.push(`  - [${f.kind}] ${f.name}${f.version ? ' ' + f.version : ''}: ${f.problem}${f.date ? ` (published ${f.date})` : ''}`);
-    }
+    for (const f of r.findings) lines.push(itemLine(f));
     if (r.findings.some((f) => f.lookupFailed)) {
       lines.push('Some lookups failed. The check fails closed. Re-run the failed job once the registry or GitHub is reachable again.');
     }
-    lines.push(`To fix: wait until the version is ${COOLDOWN_DAYS} days old, or pin an older release. See docs/cooldown.md.`);
+    if (r.findings.some((f) => f.young) && r.findings.some((f) => !f.young)) {
+      lines.push('The security-fix emergency path only lifts the age rule; it is not considered while other problems remain.');
+    }
+    lines.push(`To fix: wait until the version is ${COOLDOWN_DAYS} days old, or pin an older release. An urgent security fix can use the security-fix emergency path. See docs/cooldown.md.`);
   }
-  for (const n of r.notes) lines.push(`note: ${n}`);
+  for (const n of r.notes) lines.push(`note: ${plainText(n, 400)}`);
   return lines.join('\n');
 }
 
@@ -641,7 +850,9 @@ async function main(argv: string[]): Promise<number> {
     base[f] = await readIf(baseDir, f);
     head[f] = await readIf(headDir, f);
   }
-  const result = await runCooldown({ base, head, fetch, now: new Date(), githubToken: process.env.GITHUB_TOKEN });
+  base[CODEOWNERS_FILE] = await readIf(baseDir, CODEOWNERS_FILE);
+  const pr = prFromEnv(process.env);
+  const result = await runCooldown({ base, head, fetch, now: new Date(), githubToken: process.env.GITHUB_TOKEN, ...(pr ? { pr } : {}) });
   const report = formatReport(result);
   console.log(report);
   return result.ok ? 0 : 1;
