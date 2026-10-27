@@ -64,7 +64,7 @@ afterEach(() => { vi.unstubAllEnvs(); });
 describe('permissionsTable', () => {
   it('permissionsTable: every permission has a why', () => {
     for (const mode of ['read', 'write'] as const) {
-      const rows = permissionsTable(mode);
+      const rows = mode === 'read' ? permissionsTable('read') : permissionsTable('write', { appCreatesRepos: false });
       expect(rows.length).toBeGreaterThan(0);
       for (const r of rows) {
         expect(r.permission.trim().length, r.permission).toBeGreaterThan(0);
@@ -74,14 +74,24 @@ describe('permissionsTable', () => {
     }
   });
 
+  it('permissionsTable: in token mode no row says pipegen creates or deletes a repo (DECISIONS #87); the App rows do', () => {
+    const whys = permissionsTable('write', { appCreatesRepos: false }).map((r) => r.why).join('\n');
+    expect(whys).not.toMatch(/creates? the private helper repos|create the private helper repos|delete the scratch repo/i);
+    expect(whys).toContain('With a token pipegen never creates or deletes repos');
+    const app = permissionsTable('write', { appCreatesRepos: true }).find((r) => r.permission.startsWith('Administration'));
+    expect(app?.why).toContain('create the private helper repos');
+    expect(app?.why).toContain('delete the scratch repo after the proof if you allow it');
+  });
+
   it('permissionsTable: the measured S1 write table (DECISIONS #88), nothing more', () => {
-    const write = permissionsTable('write').map((r) => r.permission);
+    const write = permissionsTable('write', { appCreatesRepos: true }).map((r) => r.permission);
+    expect(permissionsTable('write', { appCreatesRepos: false }).map((r) => r.permission)).toEqual(write); // the same rows in token mode
     expect(write).toEqual([
       'Metadata: read', 'Contents: read and write', 'Workflows: read and write', 'Pull requests: read and write',
       'Actions: read and write', P(S_NAME, 'read and write'), 'Variables: read and write', 'Environments: read and write',
       'Administration: read and write', 'Checks: read (GitHub App only)',
     ]);
-    const all = JSON.stringify(permissionsTable('write')) + JSON.stringify(permissionsTable('read'));
+    const all = JSON.stringify(permissionsTable('write', { appCreatesRepos: true })) + JSON.stringify(permissionsTable('write', { appCreatesRepos: false })) + JSON.stringify(permissionsTable('read'));
     expect(all).not.toMatch(/Repository creation|Commit statuses/);
   });
 });
@@ -591,7 +601,7 @@ describe('probePermissions', () => {
       [`GET ${API}/user/installations/1/repositories`]: { body: { total_count: 1, repositories: [{ full_name: 'o/r' }] } },
     }, appCred());
     const res = await probePermissions(app.gh, 'o', ['r'], { kind: 'app', clock: clock() });
-    const wanted = permissionsTable('write').find((p) => p.permission.startsWith(S_NAME));
+    const wanted = permissionsTable('write', { appCreatesRepos: true }).find((p) => p.permission.startsWith(S_NAME));
     expect(res.missing).toEqual([wanted]);
     expect(res.missing[0].why.length).toBeGreaterThan(10);
     expect(res.unchecked).toEqual([]);
@@ -676,6 +686,6 @@ describe('probePermissions', () => {
     const res = await probePermissions(client, 'o', ['r', 'pipelines'], { kind: 'fine-grained', clock: clock() });
     expect(res.missing.map((m) => m.permission)).toEqual(['Access to o/pipelines']);
     // every write level is unchecked for a fine-grained token (GitHub can't show it without writing), Checks is App only
-    expect(res.unchecked.map((m) => m.permission)).toEqual(permissionsTable('write').map((p) => p.permission).filter((p) => /write/.test(p)));
+    expect(res.unchecked.map((m) => m.permission)).toEqual(permissionsTable('write', { appCreatesRepos: false }).map((p) => p.permission).filter((p) => /write/.test(p)));
   });
 });

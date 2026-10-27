@@ -61,6 +61,38 @@ export const EXCLUDED_PATTERNS: readonly string[] = Object.freeze([
   ...IGNORED_DIRS.map((d) => `**/${d}/**`),
 ]);
 
+/** One group of EXCLUDED_PATTERNS for the terminal (Plan U ruling S29): a label, a short plain-English list, the globs. */
+export interface ExcludedGroup { label: string; summary: string; patterns: readonly string[] }
+
+/**
+ * EXCLUDED_PATTERNS grouped for the terminal (consent screen, audit summary; ruling S29): about 60 globs are unreadable
+ * there. Markdown and JSON still list every pattern. Every non-negated pattern is in exactly one group (a test checks).
+ */
+export const EXCLUDED_PATTERN_GROUPS: readonly ExcludedGroup[] = Object.freeze([
+  {
+    label: 'secret files',
+    summary: '.env files, anything named *secret*, .npmrc, .netrc, .git-credentials, credentials.json, .pgpass, .pypirc, .htpasswd',
+    patterns: ['**/.env*', '**/.env*/**', '**/*.env', '**/*secret*', '**/*secret*/**', '**/.npmrc', '**/.netrc', '**/.git-credentials', '**/credentials.json', '**/.pgpass', '**/.pypirc', '**/.htpasswd'],
+  },
+  {
+    label: 'keys',
+    summary: '*.pem, *.key, SSH keys (id_rsa, id_ed25519…), *.p12, *.pfx, *.jks, *.keystore, *.ppk, *.p8',
+    patterns: ['**/*.pem', '**/*.key', '**/id_rsa*', '**/id_dsa*', '**/id_ecdsa*', '**/id_ed25519*', '**/*.p12', '**/*.pfx', '**/*.jks', '**/*.keystore', '**/*.ppk', '**/*.p8'],
+  },
+  {
+    label: 'cloud and Terraform state',
+    summary: 'Terraform state and variables (*.tfstate, *.tfvars), kubeconfig, AWS and Docker credentials, service-account*.json',
+    patterns: ['**/*.tfstate', '**/*.tfstate.backup', '**/*.tfvars', '**/*.tfvars.json', '**/kubeconfig', '**/kubeconfig.*', '**/*.kubeconfig', '**/.kube/config', '**/.kube/**', '**/.aws/credentials', '**/.aws/config', '**/.docker/config.json', '**/service-account*.json'],
+  },
+  { label: 'lockfiles', summary: LOCKFILES.join(', '), patterns: LOCKFILES.map((f) => `**/${f}`) },
+  { label: 'dependency/build folders', summary: IGNORED_DIRS.map((d) => `${d}/`).join(', '), patterns: IGNORED_DIRS.map((d) => `**/${d}/**`) },
+].map((g) => Object.freeze({ ...g, patterns: Object.freeze([...g.patterns]) })));
+
+/** Files EXCLUDED_PATTERNS keeps although an earlier pattern excludes them (its `!` patterns): `.env.example`, `.env.sample`. */
+export const EXCLUDED_KEPT: readonly string[] = Object.freeze(
+  EXCLUDED_PATTERNS.filter((p) => p.startsWith('!')).map((p) => p.slice(1).replace(/^\*\*\//, '')),
+);
+
 const EXCLUDE_MATCHERS = EXCLUDED_PATTERNS.map((p) => {
   const negated = p.startsWith('!');
   return { negated, match: picomatch(negated ? p.slice(1) : p, { dot: true, nocase: true }) };

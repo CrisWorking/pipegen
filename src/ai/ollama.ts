@@ -35,7 +35,16 @@ function usageOf(a: { prompt_eval_count?: unknown; eval_count?: unknown }): AiUs
   return { inputTokens: count(a.prompt_eval_count), outputTokens: count(a.eval_count) };
 }
 
-export function ollamaProvider(opts: OllamaOptions = {}): AiProvider {
+/** An Ollama provider, with the host:port its requests go to (shown at consent; never userinfo or a path). */
+export type OllamaProvider = AiProvider & { readonly name: 'ollama'; readonly host: string };
+
+/** The host:port an Ollama provider sends to, or null when `p` isn't one built by ollamaProvider (unknown: never assume local). */
+export function ollamaHostOf(p: AiProvider): string | null {
+  const host = (p as { host?: unknown }).host;
+  return p.name === 'ollama' && typeof host === 'string' && host !== '' ? host : null;
+}
+
+export function ollamaProvider(opts: OllamaOptions = {}): OllamaProvider {
   const url = ollamaChatUrl(opts.host);
   const where = url.host; // shown in errors: host and port only, never userinfo or a path
   const model = opts.model ?? OLLAMA_DEFAULT_MODEL;
@@ -46,6 +55,7 @@ export function ollamaProvider(opts: OllamaOptions = {}): AiProvider {
   return {
     name: 'ollama',
     model,
+    host: where,
     async complete(req: AiRequest) {
       const answer = await withTimeout(req.timeoutMs, 'Ollama', async (signal) => {
         let res: Response;

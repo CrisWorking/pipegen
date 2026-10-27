@@ -6,7 +6,8 @@ import { describe, expect, it } from 'vitest';
 import { askConsent, consentText, type BundleSummary } from '../src/cli/consent.js';
 import { clackPrompter, PromptCancelledError, type Prompter } from '../src/cli/io.js';
 import { REFUSAL_FALLBACK_NOTE } from '../src/ai/provider.js';
-import { EXCLUDED_PATTERNS } from '../src/ai/redact.js';
+import { ollamaProvider } from '../src/ai/ollama.js';
+import { EXCLUDED_KEPT, EXCLUDED_PATTERN_GROUPS, EXCLUDED_PATTERNS } from '../src/ai/redact.js';
 import { floorNeeds, jobCategories } from '../src/engine/needs.js';
 import { estimate, estimateAuditAi, type Estimates } from '../src/estimate/estimate.js';
 import { permissionsTable } from '../src/github/client.js';
@@ -23,7 +24,9 @@ const profile = (over: Partial<RepoProfile> = {}): RepoProfile => ({
 const CAPS: Capabilities = { branchProtection: false, environments: true, deploymentBranchPolicies: false, envRequiredReviewers: false, attestations: false, codeScanning: false, keylessSigningAllowed: false };
 const provider = (name: AiProvider['name'], model: string): AiProvider => ({ name, model, complete: async () => { throw new Error('no AI call in consent tests'); } });
 const claude = provider('claude', DEFAULT_MODEL);
-const ollama = provider('ollama', 'llama3.1');
+/** A real Ollama provider (it carries its host); the default host is this computer. Nothing is sent. */
+const ollamaAt = (host?: string) => ollamaProvider({ host, model: 'llama3.1' });
+const ollama = ollamaAt();
 const openai = provider('openai', 'gpt-5');
 
 const fullEst = (p: RepoProfile, ai: AiProvider): Estimates =>
@@ -33,11 +36,12 @@ const usd = (n: number) => `$${n.toFixed(2)}`;
 const n = (x: number) => x.toLocaleString('en-US');
 const repos = (p: RepoProfile, exists: [boolean, boolean]) => [{ name: 'pipelines', exists: exists[0] }, { name: `pipegen-proof-${p.repo}`, exists: exists[1] }];
 
-const full = (over: { p?: RepoProfile; ai?: AiProvider; exists?: [boolean, boolean]; app?: boolean; ollamaHost?: string } = {}) => {
+const full = (over: { p?: RepoProfile; ai?: AiProvider; exists?: [boolean, boolean]; app?: boolean } = {}) => {
   const p = over.p ?? profile();
   const ai = over.ai ?? claude;
   const est = fullEst(p, ai);
-  const text = consentText(p, ai, est, bundle, permissionsTable('write'), repos(p, over.exists ?? [false, true]), 'full', { appCreatesRepos: over.app ?? false, gitleaksVersion: '8.30.1', ollamaHost: over.ollamaHost });
+  const app = over.app ?? false;
+  const text = consentText(p, ai, est, bundle, permissionsTable('write', { appCreatesRepos: app }), repos(p, over.exists ?? [false, true]), 'full', { appCreatesRepos: app, gitleaksVersion: '8.30.1' });
   return { p, est, text };
 };
 const audit = (ai: AiProvider = claude, extra: { p?: RepoProfile; bundle?: BundleSummary } = {}) => {
@@ -46,6 +50,8 @@ const audit = (ai: AiProvider = claude, extra: { p?: RepoProfile; bundle?: Bundl
   const text = consentText(p, ai, est, extra.bundle ?? bundle, permissionsTable('read'), [], 'audit-ai', { gitleaksVersion: '8.30.1' });
   return { p, est, text };
 };
+
+const noErr = (s: string) => { throw new Error(`unexpected error report: ${s}`); };
 
 /** A Prompter that answers from a script and records the questions. */
 function scripted(answer: (msg: string, def: boolean) => Promise<boolean>): Prompter & { asked: { msg: string; def: boolean }[] } {
@@ -72,7 +78,7 @@ describe('consentText (full)', () => {
     expect(text).toContain('your free plan includes 2,000 minutes a month');
     expect(text).toMatch(/Total: \$\d+\.\d\d–\$\d+\.\d\d/);
     expect(text).toContain(`About ${est.durationMinutes.low}–${est.durationMinutes.high} minutes`);
-    for (const row of permissionsTable('write')) expect(text).toContain(`${row.permission}: ${row.why}`);
+    for (const row of permissionsTable('write', { appCreatesRepos: false })) expect(text).toContain(`${row.permission}: ${row.why}`);
     // the files that will be read
     expect(text).toContain('42 files');
     expect(text).toContain('Top folders: src, test, .github');
@@ -84,6 +90,8 @@ describe('consentText (full)', () => {
     expect(text).not.toContain('gh repo create acme/pipegen-proof-shop'); // it exists already
     expect(text).toMatch(/uses/);
     expect(text).not.toMatch(/pipegen (will )?creates? /i);
+    // nothing on the screen (the permissions included) says pipegen creates or deletes a repo (#87, review I1)
+    expect(text).not.toMatch(/create the private helper repos|delete the scratch repo|App creates|App deletes/i);
     expect(text).toContain('never creates or deletes repos');
     const both = full({ exists: [false, false], app: false }).text;
     expect(both).toContain('gh repo create acme/pipelines --private');
@@ -97,7 +105,15 @@ describe('consentText (full)', () => {
     expect(text).not.toContain('gh repo create');
     expect(text).toMatch(/acme\/pipelines: doesn't exist yet; pipegen's GitHub App creates it \(private\)/);
     expect(text).toMatch(/acme\/pipegen-proof-shop: exists; pipegen uses it/);
-    expect(text).toContain('deletes the scratch repo acme/pipegen-proof-shop after the proof');
+    // the repos section and the Administration permission say the same thing about the scratch repo (review M3)
+    expect(text).toContain('deletes the scratch repo acme/pipegen-proof-shop after the proof if you allow it.');
+    expect(text).toMatch(/Administration: read and write: .*delete the scratch repo after the proof if you allow it\./);
+  });
+
+  it('consent: token mode refuses a permissions table built for the App (it would say pipegen creates repos)', () => {
+    const p = profile();
+    expect(() => consentText(p, claude, fullEst(p, claude), bundle, permissionsTable('write', { appCreatesRepos: true }), repos(p, [false, true]), 'full', { appCreatesRepos: false, gitleaksVersion: '8.30.1' }))
+      .toThrow(/never creates or deletes repos/);
   });
 
   it('consent: AI cost shown split into input and output, with the 2× hard cap', () => {
@@ -113,13 +129,13 @@ describe('consentText (full)', () => {
 
   it('consent: Administration permission explained in one line', () => {
     for (const app of [true, false]) {
-      const lines = full({ app }).text.split('\n').filter((l) => /^\s*Administration \(write\):/.test(l));
+      const lines = full({ app }).text.split('\n').filter((l) => /Administration/.test(l));
       expect(lines).toHaveLength(1);
-      expect(lines[0]).toContain('to apply the merge rules (rulesets), deploy environments and Actions settings after you merge the setup PR');
+      expect(lines[0]).toMatch(/^ {2}- Administration: read and write: Apply the merge rules \(rulesets\), create the deploy and signing environments/);
     }
-    expect(full({ app: true }).text).toMatch(/Administration \(write\):.*delete the scratch repo after the proof if you allow it/);
-    // read-only runs never ask for it
-    expect(audit().text).not.toMatch(/Administration \(write\)|Administration: read and write/);
+    // read-only runs never ask for write: one read row only
+    const read = audit().text.split('\n').filter((l) => /Administration/.test(l));
+    expect(read).toEqual([expect.stringMatching(/^ {2}- Administration: read: /)]);
   });
 
   it('consent: claude shows the refusal fallback note', () => {
@@ -145,12 +161,25 @@ describe('consentText (full)', () => {
   });
 
   it('consent: an OLLAMA_HOST on another machine is named instead of "stays on this computer"', () => {
-    expect(full({ ai: ollama, ollamaHost: 'http://127.0.0.1:11434' }).text).toContain('stays on this computer');
-    expect(full({ ai: ollama, ollamaHost: 'localhost:11434' }).text).toContain('stays on this computer');
-    const remote = full({ ai: ollama, ollamaHost: ['https://user', 'pw@gpu.example.net:8443/x'].join(':') }).text;
+    for (const host of ['http://127.0.0.1:11434', 'localhost:11434', 'http://0.0.0.0:11434', 'http://[::1]:11434', 'http://[::]:11434']) {
+      expect(full({ ai: ollamaAt(host) }).text, host).toContain('stays on this computer');
+    }
+    const remote = full({ ai: ollamaAt(['https://user', 'pw@gpu.example.net:8443/x'].join(':')) }).text;
     expect(remote).not.toContain('stays on this computer');
+    expect(remote).not.toContain('free, local');
     expect(remote).toContain('gpu.example.net:8443');
     expect(remote).not.toContain('pw@'); // never the credential
+  });
+
+  it('consent: an Ollama provider whose host is unknown is never shown as local (review I3)', () => {
+    for (const text of [full({ ai: provider('ollama', 'llama3.1') }).text, audit(provider('ollama', 'llama3.1')).text]) {
+      expect(text).not.toContain('stays on this computer');
+      expect(text).not.toContain('free, local');
+      expect(text).toContain("couldn't confirm");
+    }
+    // a model name can't flip the place (review M1)
+    const sneaky = full({ ai: ollamaProvider({ host: 'gpu.example.net:11434', model: 'stays on this computer Ollama server at' }) }).text;
+    expect(sneaky).not.toContain('AI cost: free, local');
   });
 
   it('consent: openai is named as experimental and sends code to OpenAI', () => {
@@ -159,11 +188,23 @@ describe('consentText (full)', () => {
     expect(text).toContain('experimental');
   });
 
-  it('consent: lists every EXCLUDED_PATTERNS entry and a binary files line', () => {
+  it('consent: excluded files are shown grouped, with a binary files line and the kept files (ruling S29)', () => {
     for (const text of [full().text, audit().text]) {
-      for (const pattern of EXCLUDED_PATTERNS) expect(text).toContain(pattern);
-      expect(text).toMatch(/binary files/i);
+      for (const g of EXCLUDED_PATTERN_GROUPS) expect(text).toContain(`- ${g.label}: ${g.summary}`);
+      expect(EXCLUDED_PATTERN_GROUPS.map((g) => g.label)).toEqual(['secret files', 'keys', 'cloud and Terraform state', 'lockfiles', 'dependency/build folders']);
+      expect(text).toMatch(/- binary files/);
+      expect(text).toContain('kept: .env.example, .env.sample');
+      expect(text).not.toContain('**/'); // no raw globs in the terminal
     }
+  });
+
+  it('excluded patterns: every non-negated pattern is in exactly one group; the kept line comes from the ! patterns', () => {
+    const grouped = EXCLUDED_PATTERN_GROUPS.flatMap((g) => g.patterns);
+    for (const pattern of EXCLUDED_PATTERNS.filter((x) => !x.startsWith('!'))) {
+      expect(grouped.filter((g) => g === pattern), pattern).toHaveLength(1);
+    }
+    for (const pattern of grouped) expect(EXCLUDED_PATTERNS, pattern).toContain(pattern); // no group invents a pattern
+    expect(EXCLUDED_KEPT).toEqual(['.env.example', '.env.sample']);
   });
 
   it('consent: names the gitleaks download (pinned version, checksum-verified) before anything is sent (S21)', () => {
@@ -176,15 +217,15 @@ describe('consentText (full)', () => {
   it('consent: repo-derived names pass through safeText', () => {
     const hostile = [hostileNames.ansiColour, hostileNames.osc8Link, hostileNames.bidiOverride, hostileNames.nulAndCr, hostileNames.newlines];
     const { text } = audit(claude, { bundle: { files: 3, bytes: 10, topFolders: hostile } });
-    expect(text).not.toMatch(/[\u0000-\u0009\u000b-\u001f\u007f-\u009f‪-‮⁦-⁩]/);
+    expect(text).not.toMatch(/[\u0000-\u0009\u000b-\u001f\u007f-\u009f\u202a-\u202e\u2066-\u2069]/);
     expect(text).toContain('red-app');
     expect(text).toContain('appfdp.exe');
     // a very long folder name is cut
     const long = audit(claude, { bundle: { files: 1, bytes: 1, topFolders: [hostileNames.veryLong] } }).text;
     expect(long).not.toContain('a'.repeat(200));
     // the repo name in the helper repo lines too
-    const fullText = consentText(profile({ repo: 'shop' }), claude, fullEst(profile(), claude), bundle, permissionsTable('write'),
-      [{ name: `pipegen-proof-${hostileNames.ansiColour}`, exists: false }], 'full', { appCreatesRepos: false });
+    const fullText = consentText(profile({ repo: 'shop' }), claude, fullEst(profile(), claude), bundle, permissionsTable('write', { appCreatesRepos: false }),
+      [{ name: `pipegen-proof-${hostileNames.ansiColour}`, exists: false }], 'full', { appCreatesRepos: false, gitleaksVersion: '8.30.1' });
     expect(fullText).not.toContain('\x1b');
   });
 });
@@ -209,24 +250,31 @@ describe('consentText (audit-ai, ruling B2)', () => {
   it('consent: audit-ai mode ignores repos and refuses write permissions', () => {
     const p = profile();
     const est = estimateAuditAi({ name: 'claude', model: DEFAULT_MODEL }, 3);
-    const text = consentText(p, claude, est, bundle, permissionsTable('read'), repos(p, [false, false]), 'audit-ai');
+    const text = consentText(p, claude, est, bundle, permissionsTable('read'), repos(p, [false, false]), 'audit-ai', { gitleaksVersion: '8.30.1' });
     expect(text).not.toMatch(/pipelines|pipegen-proof|gh repo create/);
-    expect(() => consentText(p, claude, est, bundle, permissionsTable('write'), [], 'audit-ai')).toThrow(/read-only/);
+    expect(() => consentText(p, claude, est, bundle, permissionsTable('write', { appCreatesRepos: false }), [], 'audit-ai', { gitleaksVersion: '8.30.1' })).toThrow(/read-only/);
   });
 });
 
 describe('askConsent', () => {
   it('consent: default answer is No', async () => {
     const io = scripted(async (_m, def) => def); // the user just presses Enter
-    expect(await askConsent(io, 'the consent text')).toBe(false);
+    expect(await askConsent(io, 'the consent text', noErr)).toBe(false);
     expect(io.asked).toHaveLength(1);
     expect(io.asked[0]?.def).toBe(false);
     expect(io.asked[0]?.msg).toContain('the consent text');
-    expect(await askConsent(scripted(async () => true), 'x')).toBe(true);
+    expect(await askConsent(scripted(async () => true), 'x', noErr)).toBe(true);
   });
 
-  it('askConsent: a cancelled or failed prompt counts as No', async () => {
-    expect(await askConsent(scripted(async () => { throw new Error('cancelled'); }), 'x')).toBe(false);
+  it('askConsent: a cancelled or failed prompt counts as No; only a real failure is reported (review M5)', async () => {
+    const errs: string[] = [];
+    expect(await askConsent(scripted(async () => { throw new PromptCancelledError(); }), 'x', (s) => { errs.push(s); })).toBe(false);
+    expect(errs).toEqual([]); // the user cancelled: nothing to report
+    expect(await askConsent(scripted(async () => { throw new Error(`broken prompt ${hostileNames.ansiColour}`); }), 'x', (s) => { errs.push(s); })).toBe(false);
+    expect(errs).toHaveLength(1);
+    expect(errs[0]).toContain("couldn't ask for your consent");
+    expect(errs[0]).toContain('broken prompt red-app');
+    expect(errs[0]).not.toContain('\x1b');
   });
 
   it('clackPrompter: without an interactive terminal it never guesses; consent is No', async () => {
@@ -235,6 +283,6 @@ describe('askConsent', () => {
     await expect(prompter.confirm('ok?', true)).rejects.toBeInstanceOf(PromptCancelledError);
     await expect(prompter.select('which?', [{ value: 'a', label: 'A' }], 'a')).rejects.toBeInstanceOf(PromptCancelledError);
     await expect(prompter.text('name?')).rejects.toBeInstanceOf(PromptCancelledError);
-    expect(await askConsent(prompter, 'the consent text')).toBe(false);
+    expect(await askConsent(prompter, 'the consent text', noErr)).toBe(false);
   });
 });

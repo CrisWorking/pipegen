@@ -57,9 +57,12 @@ const noPrompts: Prompter = {
 async function inspect(dir: string, routes: Routes, env: NodeJS.ProcessEnv = {}, argv: string[] = ['inspect']) {
   const f = fakeFetch(routes);
   const lines: string[] = [];
-  const io: CliIO = { prompt: noPrompts, out: (s) => { lines.push(s); }, env, cwd: dir, fetch: f.fetch };
+  const errs: string[] = [];
+  const io: CliIO = { prompt: noPrompts, out: (s) => { lines.push(s); }, err: (s) => { errs.push(s); }, env, cwd: dir, fetch: f.fetch };
   const code = await run(argv, io);
-  return { code, out: lines.join('\n'), calls: f.calls };
+  const out = lines.join('\n');
+  const err = errs.join('\n');
+  return { code, out, err, all: `${out}\n${err}`, calls: f.calls };
 }
 
 let globalFetch: ReturnType<typeof vi.fn>;
@@ -133,14 +136,15 @@ describe('pipegen inspect', () => {
     const noRemote = makeRepo('node-express');
     const r1 = await inspect(noRemote, publicRoutes());
     expect(r1.code).toBe(1);
-    expect(r1.out).toContain('pipegen inspect needs a GitHub repository');
-    expect(r1.out).toContain('no "origin" remote');
+    expect(r1.err).toContain('pipegen inspect needs a GitHub repository');
+    expect(r1.err).toContain('no "origin" remote');
+    expect(r1.out).toBe(''); // errors go to stderr (review M4)
     expect(r1.calls).toHaveLength(0);
     const notGit = makeTempDir();
     const r2 = await inspect(notGit, publicRoutes());
     expect(r2.code).toBe(1);
-    expect(r2.out).toContain('not a git repository');
-    expect(r2.out).not.toMatch(/\bat \S+:\d+:\d+/); // no stack trace
+    expect(r2.err).toContain('not a git repository');
+    expect(r2.all).not.toMatch(/\bat \S+:\d+:\d+/); // no stack trace
   });
 
   it('cli: inspect output passes repo strings through safeText (hostile-names fixture)', async () => {
@@ -149,11 +153,24 @@ describe('pipegen inspect', () => {
     writeIn(dir, 'Dockerfile', 'FROM node:20\n');
     writeIn(dir, `svc${hostileNames.ansiColour}${hostileNames.bidiIsolates}/Dockerfile`, 'FROM node:20\nEXPOSE 8080\n');
     writeIn(dir, `.github/workflows/ci${hostileNames.bidiOverride}.yml`, 'on: push\njobs:\n  a:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n');
-    const { code, out } = await inspect(dir, publicRoutes());
+    const { code, out, all } = await inspect(dir, publicRoutes());
     expect(code).toBe(0);
-    expect(out).not.toMatch(UNSAFE);
+    expect(all).not.toMatch(UNSAFE);
     expect(out).toContain('red-app'); // the hostile folder, cleaned
     expect(out).toContain('appfdp.exe'); // the .nvmrc runtime, cleaned
+  });
+
+  it('cli: hostile values from GitHub (default branch) are cleaned too (review M6)', async () => {
+    const branch = `${hostileNames.osc8Link}${hostileNames.screenClear}${hostileNames.bidiOverride}${hostileNames.newlines}${hostileNames.veryLong}`;
+    const routes = publicRoutes({ [`GET ${R}`]: { body: { private: false, default_branch: branch, owner: { type: 'User', login: 'o' } } } });
+    const { code, out, all } = await inspect(richRepo(), routes);
+    expect(code).toBe(0);
+    expect(all).not.toMatch(UNSAFE);
+    expect(out).toMatch(/Default branch: click meapp/);
+    expect(out).not.toContain('evil.example');
+    expect(out).not.toContain('a'.repeat(200)); // cut
+    // no injected line: every line of the summary is one printed line
+    expect(out.split('\n').filter((l) => l.startsWith('  Default branch:'))).toHaveLength(1);
   });
 
   it('cli: without any token a public repo is read anonymously, and inspect says what it could not check', async () => {
@@ -167,11 +184,12 @@ describe('pipegen inspect', () => {
   });
 
   it('cli: a private repo without a token → the local summary, the read-only token steps, exit 1', async () => {
-    const { code, out } = await inspect(richRepo(), { [`GET ${R}`]: err(404, 'Not Found') });
-    expect(code).toBe(1);
-    expect(out).toContain('express-app'); // the local part still prints
-    expect(out).toContain('fine-grained token');
-    expect(out).toMatch(/GitHub: not read/);
+    const r = await inspect(richRepo(), { [`GET ${R}`]: err(404, 'Not Found') });
+    expect(r.code).toBe(1);
+    expect(r.out).toContain('express-app'); // the local part still prints
+    expect(r.out).toMatch(/GitHub: not read/);
+    expect(r.err).toContain('fine-grained token'); // the steps are an error message: stderr
+    expect(r.out).not.toContain('fine-grained token');
   });
 
   it('cli: private Free repo, deployment branch policies unproven → Signing: decided at setup (DECISIONS #86)', async () => {
@@ -193,28 +211,29 @@ describe('pipegen inspect', () => {
     const echo = (c: { headers: Record<string, string> }): Reply => ({ status: 404, body: { message: `Not Found for ${c.headers.authorization ?? ''} ${cred}` } });
     const failing = await inspect(richRepo(), privateRoutes({ [`GET ${R}`]: echo }), { [ENV_VAR]: cred });
     expect(failing.code).toBe(1);
-    expect(failing.out).not.toContain(cred);
-    expect(failing.out).not.toContain(cred.slice(0, 20));
+    expect(failing.err).toMatch(/GitHub: not read/);
+    expect(failing.all).not.toContain(cred);
+    expect(failing.all).not.toContain(cred.slice(0, 20));
     const ok = await inspect(richRepo(), privateRoutes({ [`GET ${R}/rulesets`]: echo }), { [ENV_VAR]: cred });
-    expect(ok.out).not.toContain(cred);
+    expect(ok.all).not.toContain(cred);
   });
 
   it('cli: a classic token is refused without --allow-broad-token, and accepted with it', async () => {
     const cred = fake.githubClassic();
     const refused = await inspect(richRepo(), privateRoutes(), { [ENV_VAR]: cred });
     expect(refused.code).toBe(1);
-    expect(refused.out).toContain('classic token');
-    expect(refused.out).not.toContain(cred);
+    expect(refused.err).toContain('classic token');
+    expect(refused.all).not.toContain(cred);
     const allowed = await inspect(richRepo(), privateRoutes(), { [ENV_VAR]: cred }, ['inspect', '--allow-broad-token']);
     expect(allowed.code).toBe(0);
-    expect(allowed.out).not.toContain(cred);
+    expect(allowed.all).not.toContain(cred);
   });
 
   it('cli: --dir points inspect at another folder', async () => {
     const dir = richRepo();
     const f = fakeFetch(publicRoutes());
     const lines: string[] = [];
-    const code = await run(['inspect', '--dir', dir], { prompt: noPrompts, out: (s) => { lines.push(s); }, env: {}, cwd: makeTempDir(), fetch: f.fetch });
+    const code = await run(['inspect', '--dir', dir], { prompt: noPrompts, out: (s) => { lines.push(s); }, err: () => {}, env: {}, cwd: makeTempDir(), fetch: f.fetch });
     expect(code).toBe(0);
     expect(lines.join('\n')).toContain('express-app');
   });
@@ -227,8 +246,14 @@ describe('pipegen inspect', () => {
     }
     const bad = await inspect(makeTempDir(), {}, {}, ['frobnicate\x1b[2J']);
     expect(bad.code).toBe(1);
-    expect(bad.out).toContain('Unknown command');
-    expect(bad.out).not.toMatch(UNSAFE);
+    expect(bad.err).toContain('Unknown command');
+    expect(bad.err).toContain('Usage: pipegen'); // usage-on-error goes to stderr too
+    expect(bad.out).toBe('');
+    expect(bad.all).not.toMatch(UNSAFE);
+    const flag = await inspect(makeTempDir(), {}, {}, ['inspect', '--nope']);
+    expect(flag.code).toBe(1);
+    expect(flag.err).toContain('--nope');
+    expect(flag.out).toBe('');
   });
 });
 

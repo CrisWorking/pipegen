@@ -10,11 +10,12 @@ export interface Prompter {
 }
 
 /**
- * Everything a command touches outside pipegen. `prompt`, `out` and `env` are the brief's seams; `cwd` (the folder
+ * Everything a command touches outside pipegen. `prompt`, `out` and `env` are the brief's seams; `err` takes errors,
+ * warnings and usage-on-error (stderr), so a script reading `out` gets only the command's output; `cwd` (the folder
  * commands run in, default process.cwd()) and `fetch` (the transport for GitHub calls, default the global fetch) let
  * tests run a command on a temp repo against a fake GitHub. Nothing else in the CLI reads process.env or the network.
  */
-export interface CliIO { prompt: Prompter; out: (s: string) => void; env: NodeJS.ProcessEnv; cwd?: string; fetch?: typeof fetch }
+export interface CliIO { prompt: Prompter; out: (s: string) => void; err: (s: string) => void; env: NodeJS.ProcessEnv; cwd?: string; fetch?: typeof fetch }
 
 /** The user cancelled a question (Ctrl+C / Esc), or there is no terminal to ask in. */
 export class PromptCancelledError extends Error {
@@ -59,7 +60,12 @@ export function clackPrompter(stdin: NodeJS.ReadStream = process.stdin, stdout: 
   };
 }
 
-/** The CliIO a real run uses: clack prompts, stdout, the process environment and folder, the global fetch. */
+/** The CliIO a real run uses: clack prompts, stdout and stderr, the process environment and folder, the global fetch. */
 export function processIO(): CliIO {
-  return { prompt: clackPrompter(), out: (s) => { process.stdout.write(`${s}\n`); }, env: process.env };
+  return {
+    prompt: clackPrompter(),
+    out: (s) => { process.stdout.write(`${s}\n`); },
+    err: (s) => { process.stderr.write(`${s}\n`); },
+    env: process.env,
+  };
 }

@@ -135,6 +135,7 @@ async function tokenLogin(gh: Octokit, auth: Auth, clock: RateClock, notes: stri
 export async function inspect(dir: string, io: CliIO, opts: { allowBroad: boolean }): Promise<number> {
   let token: string | null = null;
   const say = (s: string) => { io.out(hideToken(s, token)); };
+  const fail = (s: string) => { io.err(hideToken(s, token)); };
   const notes: string[] = [];
 
   let local: LocalProfile;
@@ -142,8 +143,8 @@ export async function inspect(dir: string, io: CliIO, opts: { allowBroad: boolea
     local = await readProject(dir, { notes });
   } catch (e) {
     if (!(e instanceof NotGitHubRepoError)) throw e;
-    say(`pipegen inspect needs a GitHub repository: ${t(e.message, 400)}`);
-    say('Run it inside a clone of a GitHub repo, or pass --dir <folder>.');
+    fail(`pipegen inspect needs a GitHub repository: ${t(e.message, 400)}`);
+    fail('Run it inside a clone of a GitHub repo, or pass --dir <folder>.');
     return 1;
   }
   const { owner, repo } = local;
@@ -153,7 +154,7 @@ export async function inspect(dir: string, io: CliIO, opts: { allowBroad: boolea
   try {
     const auth = await getAuth({ owner, repos: [repo], allowBroad: opts.allowBroad, mode: 'read' }, { env: io.env, fetch: io.fetch, clock, notes });
     token = auth.token;
-    const gh = makeOctokit(auth.token, { fetch: io.fetch, clock, log: say });
+    const gh = makeOctokit(auth.token, { fetch: io.fetch, clock, log: fail });
     const login = await tokenLogin(gh, auth, clock, notes);
     const ctx: GitHubContext = await readGitHubContext(gh, owner, repo, login, clock);
     const p: RepoProfile = { ...local, ...ctx };   // GitHub's default branch replaces the reader's 'main' stub
@@ -174,9 +175,9 @@ export async function inspect(dir: string, io: CliIO, opts: { allowBroad: boolea
   for (const line of projectLines(local)) say(line);
   say('');
   if ('error' in github) {
-    say('GitHub: not read');
-    say(`${I}${t(github.error, 1200)}`);
-    say(`${I}Not checked: visibility, plan, default branch, and what GitHub allows here.`);
+    say('GitHub: not read (the error is on stderr)');
+    fail(`GitHub: not read: ${t(github.error, 1200)}`);
+    fail('Not checked: visibility, plan, default branch, and what GitHub allows here.');
   } else {
     for (const line of githubLines(github.p, github.auth, github.caps)) say(line);
     say('');

@@ -35,9 +35,10 @@ const USAGE = [
   'GitHub access: set GITHUB_TOKEN to a fine-grained, read-only token for the repo. A public repo also works without one.',
 ];
 
-/** Runs one pipegen command. Returns the exit code; every line goes through io.out. */
+/** Runs one pipegen command. Returns the exit code; output goes through io.out, errors and usage-on-error through io.err. */
 export async function run(argv: string[], io: CliIO): Promise<number> {
   const say = (s: string) => { io.out(s); };
+  const fail = (s: string) => { io.err(s); };
   let values: { dir?: string; 'allow-broad-token'?: boolean; help?: boolean; version?: boolean };
   let positionals: string[];
   try {
@@ -53,8 +54,8 @@ export async function run(argv: string[], io: CliIO): Promise<number> {
       },
     }));
   } catch (e) {
-    say(safeText(e instanceof Error ? e.message : String(e), 300));
-    say('Run pipegen --help to see the options.');
+    fail(safeText(e instanceof Error ? e.message : String(e), 300));
+    fail('Run pipegen --help to see the options.');
     return 1;
   }
   if (values.version) {
@@ -67,12 +68,12 @@ export async function run(argv: string[], io: CliIO): Promise<number> {
     return 0;
   }
   if (command !== 'inspect') {
-    say(`Unknown command "${safeText(command, 60)}".`);
-    for (const line of USAGE) say(line);
+    fail(`Unknown command "${safeText(command, 60)}".`);
+    for (const line of USAGE) fail(line);
     return 1;
   }
   if (rest.length > 0) {
-    say(`pipegen inspect takes no arguments (got "${safeText(rest.join(' '), 60)}"). Use --dir <folder> for another folder.`);
+    fail(`pipegen inspect takes no arguments (got "${safeText(rest.join(' '), 60)}"). Use --dir <folder> for another folder.`);
     return 1;
   }
   const dir = resolve(io.cwd ?? process.cwd(), values.dir ?? '.');
@@ -80,7 +81,7 @@ export async function run(argv: string[], io: CliIO): Promise<number> {
     return await inspect(dir, io, { allowBroad: values['allow-broad-token'] === true });
   } catch (e) {
     // Anything unexpected: one cleaned line, never a token, never a stack trace.
-    say(`pipegen inspect failed: ${safeText(hideToken(e instanceof Error ? e.message : String(e)), 500)}`);
+    fail(`pipegen inspect failed: ${safeText(hideToken(e instanceof Error ? e.message : String(e)), 500)}`);
     return 1;
   }
 }

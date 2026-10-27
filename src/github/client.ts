@@ -205,6 +205,8 @@ interface PermissionRow {
   read?: Level;
   why: string;
   readWhy?: string;
+  /** The write-mode why in token mode, when it differs (DECISIONS #87: with a token pipegen never creates or deletes repos). */
+  tokenWhy?: string;
   /** Only a GitHub App can hold it (a fine-grained token has no Checks permission). */
   appOnly?: boolean;
   /** A GET that needs this permission at read level (S1's header evidence), `{r}` = /repos/{owner}/{repo}. */
@@ -222,7 +224,12 @@ const PERMISSIONS: readonly PermissionRow[] = [
   { key: 'secrets', name: 'Secrets', write: 'write', read: 'read', why: 'Set the repo secrets the pipeline needs (values encrypted on your machine).', readWhy: 'Secret names only (values can never be read).', probe: '/actions/secrets/public-key' },
   { key: 'actions_variables', name: 'Variables', write: 'write', read: 'read', why: 'Set Actions variables such as PIPEGEN_BLOCK_FROM.', readWhy: 'Actions variable names and values.', probe: '/actions/variables?per_page=1' },
   { key: 'environments', name: 'Environments', write: 'write', read: 'read', why: 'Set environment secrets and variables (for example the signing key).', readWhy: 'Environment secret names and variables.' },
-  { key: 'administration', name: 'Administration', write: 'write', read: 'read', why: 'Apply the merge rules (rulesets), create environments and their branch rules, change Actions settings, create the private helper repos and delete the scratch repo.', readWhy: 'Actions settings (access level, SHA pinning).', probe: '/actions/permissions' },
+  {
+    key: 'administration', name: 'Administration', write: 'write', read: 'read',
+    why: 'Apply the merge rules (rulesets), create the deploy and signing environments and their branch rules, change Actions settings, create the private helper repos, and delete the scratch repo after the proof if you allow it.',
+    tokenWhy: 'Apply the merge rules (rulesets), create the deploy and signing environments and their branch rules, and change Actions settings. With a token pipegen never creates or deletes repos; it empties the scratch repo instead.',
+    readWhy: 'Actions settings (access level, SHA pinning).', probe: '/actions/permissions',
+  },
   { key: 'checks', name: 'Checks', write: 'read', why: 'Read the gate check result. A fine-grained token can\'t have it, so in token mode pipegen reads workflow runs and jobs instead.', appOnly: true },
 ];
 
@@ -230,11 +237,21 @@ const levelText = (l: Level) => (l === 'write' ? 'read and write' : 'read');
 const label = (p: PermissionRow, mode: Level): string =>
   `${p.name}: ${levelText(mode === 'write' ? p.write : (p.read as Level))}${p.appOnly ? ' (GitHub App only)' : ''}`;
 const rowsFor = (mode: Level) => PERMISSIONS.filter((p) => mode === 'write' || p.read !== undefined);
-const entry = (p: PermissionRow, mode: Level) => ({ permission: label(p, mode), why: mode === 'write' ? p.why : (p.readWhy as string) });
+/** `app`: pipegen's own GitHub App login, which creates and deletes the helper repos (#87); else token mode, which never does. */
+const entry = (p: PermissionRow, mode: Level, app: boolean) => ({
+  permission: label(p, mode),
+  why: mode === 'read' ? (p.readWhy as string) : app ? p.why : p.tokenWhy ?? p.why,
+});
 
-/** The permissions pipegen asks for, each with a one-line reason (README and consent screen). */
-export function permissionsTable(mode: 'read' | 'write'): { permission: string; why: string }[] {
-  return rowsFor(mode).map((p) => entry(p, mode));
+/**
+ * The permissions pipegen asks for, each with a one-line reason (README and consent screen). Write mode needs to know
+ * whether pipegen's App creates and deletes the helper repos (Auth.canCreateRepos, DECISIONS #87): in token mode no
+ * row says pipegen creates or deletes a repo.
+ */
+export function permissionsTable(mode: 'read'): { permission: string; why: string }[];
+export function permissionsTable(mode: 'write', opts: { appCreatesRepos: boolean }): { permission: string; why: string }[];
+export function permissionsTable(mode: 'read' | 'write', opts?: { appCreatesRepos: boolean }): { permission: string; why: string }[] {
+  return rowsFor(mode).map((p) => entry(p, mode, opts?.appCreatesRepos === true));
 }
 
 /** "metadata=read; contents=write,workflows=write" → the table's names, e.g. "Metadata: read". */
@@ -585,7 +602,7 @@ export async function probePermissions(gh: Octokit, owner: string, repos: string
     const inst = await installationFor(gh, owner, clock);
     if (inst === 'none' || inst === 'error') {
       for (const repo of repos) add(unchecked, { permission: access(repo), why: 'GitHub didn\'t list pipegen\'s App installation on this account, so pipegen couldn\'t check it.' });
-      for (const p of rows) add(unchecked, entry(p, mode));
+      for (const p of rows) add(unchecked, entry(p, mode, opts.kind === 'app'));
       return done();
     }
     const reach = await installationRepos(gh, inst.id, clock);
@@ -596,7 +613,7 @@ export async function probePermissions(gh: Octokit, owner: string, repos: string
     for (const p of rows) {
       const need = mode === 'write' ? p.write : (p.read as Level);
       const have = inst.permissions[p.key];
-      if (!(have === 'write' || (have === 'read' && need === 'read'))) add(missing, entry(p, mode));
+      if (!(have === 'write' || (have === 'read' && need === 'read'))) add(missing, entry(p, mode, opts.kind === 'app'));
     }
     return done();
   }
@@ -638,8 +655,8 @@ export async function probePermissions(gh: Octokit, owner: string, repos: string
         }
       }
     }
-    if (refused) add(missing, entry(p, mode));
-    else if (!confirmed || (mode === 'write' && p.write === 'write')) add(unchecked, entry(p, mode));
+    if (refused) add(missing, entry(p, mode, false));
+    else if (!confirmed || (mode === 'write' && p.write === 'write')) add(unchecked, entry(p, mode, false));
   }
   return done();
 }
