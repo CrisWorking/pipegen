@@ -262,7 +262,7 @@ describe('built bundle (ruling R9)', () => {
     // Built with the release options into an installed-package layout (a temp dir, so it can't race the package
     // test's own build of dist/). GitHub is a fetch stub preloaded with --import: the bundle itself is unchanged.
     const pkgDir = makeTempDir();
-    writeIn(pkgDir, 'package.json', JSON.stringify({ name: 'pipegen', version: '0.1.0' }));
+    writeIn(pkgDir, 'package.json', JSON.stringify({ name: 'pipegen', version: '0.1.0', type: 'module' }));
     await build({ ...tsupOptions, entry: { 'cli/main': 'src/cli/main.ts' }, outDir: join(pkgDir, 'dist'), config: false, silent: true });
     const main = join(pkgDir, 'dist', 'cli', 'main.js');
     expect(readFileSync(main, 'utf8').startsWith('#!/usr/bin/env node\n')).toBe(true);

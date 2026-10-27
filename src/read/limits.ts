@@ -9,8 +9,11 @@ export const READ_LIMITS = { maxFileBytes: 1_000_000, maxFiles: 20_000, maxAlias
 /** Folders never read: dependencies, VCS data, virtualenvs and build output. */
 export const IGNORED_DIRS: readonly string[] = Object.freeze(['node_modules', '.git', '.venv', 'dist', 'build', 'vendor', 'target']);
 
-/** The first level of `rel` (a fixed folder path inside `dir`) that is a symbolic link, or null. A missing level ends the check. */
-async function linkedLevel(dir: string, rel: string): Promise<string | null> {
+/**
+ * The first level of `rel` (a fixed path inside `dir`) that is a symbolic link, or null. A missing level ends the check.
+ * Exported for the coverage mapper, which checks every level of a file it reads by path.
+ */
+export async function linkedLevel(dir: string, rel: string): Promise<string | null> {
   const parts = rel.split('/').filter((p) => p !== '' && p !== '.');
   for (let i = 0; i < parts.length; i++) {
     const info = await lstat(join(dir, ...parts.slice(0, i + 1))).catch(() => null);

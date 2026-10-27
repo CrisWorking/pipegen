@@ -8,10 +8,11 @@ import { NAME_RE, asObj } from './manifest.js';
 // Only names are kept: event names, job ids and secret NAMES. No step, command or secret value leaves this file.
 // Every kept name is raw but validated (see src/types.ts): a name that fails its pattern is dropped, never cleaned.
 
-const MAX_WORKFLOWS = 200;
-const WORKFLOW_FILE = /^\.github\/workflows\/[^/]+\.ya?ml$/;
-const JOB_ID_RE = /^[A-Za-z_][A-Za-z0-9_-]*$/;
-const TRIGGER_RE = /^[a-z_]+$/;
+// Exported for the audit's coverage mapper (src/audit/coverage.ts), which re-reads these workflows with the same rules.
+export const MAX_WORKFLOWS = 200;
+export const WORKFLOW_FILE = /^\.github\/workflows\/[^/]+\.ya?ml$/;
+export const JOB_ID_RE = /^[A-Za-z_][A-Za-z0-9_-]*$/;
+export const TRIGGER_RE = /^[a-z_]+$/;
 // Plan regex with whole-word guards: a leading guard on every token and a trailing guard on the short ones, so
 // "butterfly" and "overwhelm" do not count while "deployment.sh" and "npm_deploy" still do. (helmfile is a known miss.)
 const DEPLOY_RE = /(?<![A-Za-z])(deploy|vercel|netlify|fly(?:ctl)?(?![A-Za-z])|heroku|aws (?:ecs|s3|lambda)|kubectl|helm(?![A-Za-z])|gcloud (?:run|app)|az (?:webapp|containerapp)|docker push|npm publish|twine upload)/i;

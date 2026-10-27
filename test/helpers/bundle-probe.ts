@@ -1,6 +1,7 @@
 // Built by the package test with the same tsup options as dist/cli/main.js, then run with plain `node`, to prove
 // the bundled readers (and the CommonJS libraries they pull in) really work as a single ESM file.
 import { makeProvider } from '../../src/ai/provider.js';
+import { loadToolSignatures, mapCoverage } from '../../src/audit/coverage.js';
 import { bundleCode } from '../../src/ai/redact.js';
 import { floorNeeds, jobCategories, jobCounts, needsSchema } from '../../src/engine/needs.js';
 import { loadPinnedBinaries } from '../../src/engine/linters.js';
@@ -66,6 +67,10 @@ console.log(JSON.stringify({
   // data/ai-prices.yml and data/github-plans.yml, read and validated by the bundled loaders, and used by estimate()
   aiPrices: loadAiPrices(),
   githubPlans: loadGitHubPlans(),
+  // data/tool-signatures.yml through the bundled loader, and the coverage mapper run on the repo with it (Plan U ruling S1)
+  toolSignatures: loadToolSignatures(),
+  coverage: (await mapCoverage(full, floorNeeds(full, caps), dir)).map((c) => c.status),
+  floorNeeds: floorNeeds(full, caps).length,
   estimate: (({ setupMinutes, includedMinutes, aiCostCapUsd }) => ({ setupMinutes, includedMinutes, aiCostCapUsd }))(
     estimate(full, jobCategories(floorNeeds(full, caps)), 2, { pushes: 10, prs: 2, capped: false }, { name: 'claude', model: 'claude-opus-5-5' }),
   ),

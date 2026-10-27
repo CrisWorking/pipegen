@@ -1,0 +1,158 @@
+# Tool signatures (Plan U Task 1), read by loadToolSignatures (src/audit/coverage.ts). The audit uses them to
+# recognise checks a repo's existing workflows and git hooks already run. Nothing here is ever run or installed:
+# it only names what to look for.
+#
+# Entry fields:
+#   id          pipegen's label for the tool (lowercase letters, digits, dashes); shown as "by" in the audit.
+#   categories  the need categories (src/types.ts NEED_CATEGORIES) a run of this tool counts for.
+#   actions     GitHub Actions, as owner/name. A `uses:` value matches case-insensitively, ignoring its @ref and any
+#               sub-path (github/foo/sub@v1 is github/foo). An entry may add a sub-path to match only that part of a
+#               repo (github/codeql-action/analyze matches analyze but not upload-sarif, which other tools use).
+#   commands    command names, matched as whole words in `run:` lines and hook commands (gitleaks never matches
+#               nogitleaksx or gitleaks.toml). Words are separated by one space ("npm audit") or a slash.
+# Every entry has actions, commands or both.
+tools:
+  # secrets
+  - id: gitleaks
+    categories: [secrets]
+    actions: [gitleaks/gitleaks-action]
+    commands: [gitleaks]
+  - id: trufflehog
+    categories: [secrets]
+    actions: [trufflesecurity/trufflehog]
+    commands: [trufflehog]
+  - id: detect-secrets
+    categories: [secrets]
+    commands: [detect-secrets, detect-secrets-hook]
+  # code scanning (SAST)
+  - id: semgrep
+    categories: [sast]
+    actions: [semgrep/semgrep-action, returntocorp/semgrep-action]
+    commands: [semgrep]
+  - id: codeql
+    categories: [sast]
+    actions: [github/codeql-action/analyze]
+    commands: [codeql database analyze]
+  - id: bandit
+    categories: [sast]
+    actions: [PyCQA/bandit-action]
+    commands: [bandit]
+  - id: gosec
+    categories: [sast]
+    actions: [securego/gosec]
+    commands: [gosec]
+  # dependencies
+  - id: snyk
+    categories: [deps]
+    actions: [snyk/actions]
+    commands: [snyk test]
+  - id: osv-scanner
+    categories: [deps]
+    actions: [google/osv-scanner-action]
+    commands: [osv-scanner]
+  - id: npm-audit
+    categories: [deps]
+    commands: [npm audit, pnpm audit, yarn audit]
+  - id: pip-audit
+    categories: [deps]
+    actions: [pypa/gh-action-pip-audit]
+    commands: [pip-audit]
+  - id: dependency-review
+    categories: [deps]
+    actions: [actions/dependency-review-action]
+  - id: govulncheck
+    categories: [deps]
+    actions: [golang/govulncheck-action]
+    commands: [govulncheck]
+  # containers and infrastructure
+  - id: trivy
+    categories: [deps, image-scan, iac]
+    actions: [aquasecurity/trivy-action]
+    commands: [trivy]
+  - id: grype
+    categories: [deps, image-scan]
+    actions: [anchore/scan-action]
+    commands: [grype]
+  - id: docker-build
+    categories: [image-build]
+    actions: [docker/build-push-action]
+    commands: [docker build, docker buildx build]
+  - id: checkov
+    categories: [iac]
+    actions: [bridgecrewio/checkov-action]
+    commands: [checkov]
+  - id: tfsec
+    categories: [iac]
+    actions: [aquasecurity/tfsec-action]
+    commands: [tfsec]
+  # running app (DAST)
+  - id: zap
+    categories: [dast]
+    actions: [zaproxy/action-baseline, zaproxy/action-full-scan, zaproxy/action-api-scan]
+    commands: [zap-baseline.py, zap-full-scan.py, zap-api-scan.py]
+  # tests
+  - id: jest
+    categories: [unit-tests, full-tests]
+    commands: [jest]
+  - id: vitest
+    categories: [unit-tests, full-tests]
+    commands: [vitest]
+  - id: mocha
+    categories: [unit-tests, full-tests]
+    commands: [mocha]
+  - id: go-test
+    categories: [unit-tests, full-tests]
+    commands: [go test]
+  # lint and format
+  - id: eslint
+    categories: [lint, format-lint]
+    commands: [eslint]
+  - id: biome
+    categories: [lint, format-lint]
+    actions: [biomejs/setup-biome]
+    commands: [biome]
+  - id: ruff
+    categories: [lint, format-lint]
+    actions: [astral-sh/ruff-action]
+    commands: [ruff]
+  - id: flake8
+    categories: [lint, format-lint]
+    commands: [flake8]
+  - id: pylint
+    categories: [lint]
+    commands: [pylint]
+  - id: golangci-lint
+    categories: [lint, format-lint]
+    actions: [golangci/golangci-lint-action]
+    commands: [golangci-lint]
+  - id: prettier
+    categories: [format-lint]
+    commands: [prettier]
+  - id: black
+    categories: [format-lint]
+    commands: [black]
+  - id: lint-staged
+    categories: [format-lint]
+    commands: [lint-staged]
+  # git hooks run in CI
+  - id: pre-commit
+    categories: [hooks-ci]
+    actions: [pre-commit/action]
+    commands: [pre-commit run]
+  - id: lefthook
+    categories: [hooks-ci]
+    commands: [lefthook run]
+  - id: husky-hooks
+    categories: [hooks-ci]
+    commands: [.husky/pre-commit]
+  # deploy: SBOM, signing, attestation
+  - id: syft
+    categories: [sbom]
+    actions: [anchore/sbom-action]
+    commands: [syft]
+  - id: cosign
+    categories: [signing]
+    commands: [cosign sign, cosign sign-blob]
+  - id: attest-build-provenance
+    categories: [attestation]
+    actions: [actions/attest-build-provenance, actions/attest, actions/attest-sbom]
