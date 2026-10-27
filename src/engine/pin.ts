@@ -27,7 +27,8 @@
 // Requests: every name is checked before any request and each path segment is encoded (ruling S14). Only
 // `deps.gh` (api.github.com) carries the user's credential (ruling S15). `deps.fetch` never gets it; the one
 // header it gets is the anonymous pull token a registry hands out, sent back to that same registry only. Fetches
-// follow redirects by hand, to allow-listed https hosts only, with size-bounded bodies. GitHub calls go through
+// go through the shared http.ts (fetchAllowed, readBody): redirects followed by hand, to allow-listed https hosts
+// only, with size-bounded bodies. GitHub calls go through
 // the shared rate-limit helper with the run's budget (ruling S16): a rate limit is the GitHubRateLimitError itself, a
 // spent budget a PinError whose cause is that error; isRateStop (github-rate.ts) recognises both.
 import { createHash } from 'node:crypto';
@@ -36,6 +37,7 @@ import { z } from 'zod';
 import { safeText } from '../util/safe-text.js';
 import type { Candidate, InstallSpec, ReviewedTool } from '../types.js';
 import { BUDGET_SPENT_MESSAGE, GitHubRateLimitError, withRateLimit, type RateClock } from './github-rate.js';
+import { fetchAllowed, HttpError, readBody, readJson } from './http.js';
 import {
   advisoryVersion, ASSET_RE, COMMIT_SHA_RE, DIGEST_RE, isFullSemver, isGitHubRepo, isNpmName, isPypiName, npmEscapedName, parseImageRef, pep503,
   IMAGE_TAG_RE, repoSegments, SHA256_RE, SRI_SHA512_RE, TAG_RE, type ImageRef, type ImageRegistry,
@@ -104,7 +106,6 @@ const MAX_PACKUMENT_BYTES = 64 * 1024 * 1024;
 const MAX_CHECKSUMS_BYTES = 1024 * 1024;
 /** At most this many checksums files are read for one asset (they must all agree). */
 const MAX_CHECKSUM_FILES = 4;
-const MAX_REDIRECTS = 3;
 /** Nested annotated tags followed before giving up. */
 const MAX_TAG_DEPTH = 3;
 /** Where GitHub serves release downloads (github.com redirects to its asset hosts). */
@@ -155,7 +156,6 @@ type TagTarget = { kind: 'commit'; sha: string } | { kind: 'missing' } | { kind:
 /** Stands in for the live value in a PinMovedWarning when the tag no longer leads to a commit or an image index. */
 const NOT_A_COMMIT = '<not a commit>';
 const NOT_AN_INDEX = '<not an index>';
-interface FetchOptions { method: 'GET' | 'HEAD'; timeoutMs: number; hosts: readonly string[]; headers?: Record<string, string> }
 
 /** A pin pipegen keeps as is: only one from the reviewed list (both markers). Everything else is pinned afresh. */
 const isStored = (c: Candidate) => c.source === 'reviewed' && c.reviewed === true;
@@ -389,11 +389,11 @@ export async function resolvePin(c: Candidate, deps: PinDeps, install?: InstallS
     const tokens = tokenSchema.safeParse(await getJson(`a pull token for ${image.display}`, tokenUrl, MAX_JSON_BYTES));
     const token = tokens.success ? (tokens.data.token ?? tokens.data.access_token) : undefined;
     if (token === undefined || !REGISTRY_TOKEN_RE.test(token)) throw new PinError(`The registry gave no usable anonymous pull token for ${image.display}.`);
-    const res = await fetchAllowed(deps.fetch, `${reg.api}${image.path.split('/').map(encodeURIComponent).join('/')}/manifests/${encodeURIComponent(tag)}`, {
+    const res = await asPinError(() => fetchAllowed(deps.fetch, `${reg.api}${image.path.split('/').map(encodeURIComponent).join('/')}/manifests/${encodeURIComponent(tag)}`, {
       method: 'HEAD', timeoutMs: REQUEST_TIMEOUT_MS, hosts: [new URL(reg.api).hostname], notFound: 'null',
       // the registry's own anonymous token, sent only to that registry; never the user's credential
       headers: { accept: INDEX_TYPES.join(', '), authorization: `Bearer ${token}` },
-    });
+    }));
     if (res === null) {
       if (stored === undefined) throw new PinError(`The tag ${tag} of ${image.display} doesn't exist.`);
       note(`The tag ${tag} of ${image.display} no longer exists; pipegen keeps the reviewed image ${stored}.`);
@@ -484,14 +484,7 @@ export async function resolvePin(c: Candidate, deps: PinDeps, install?: InstallS
 
   /** A JSON document from the URL's own host (redirects only within that host), size-bounded. */
   async function getJson(what: string, url: string, maxBytes: number): Promise<unknown> {
-    const res = await fetchAllowed(deps.fetch, url, { method: 'GET', timeoutMs: REQUEST_TIMEOUT_MS, hosts: [new URL(url).hostname] });
-    const chunks: Uint8Array[] = [];
-    await readBody(res, maxBytes, (b) => chunks.push(b), what);
-    try {
-      return JSON.parse(Buffer.concat(chunks).toString('utf8'));
-    } catch (e) {
-      throw new PinError(`Couldn't read ${what}: not JSON.`, { cause: e });
-    }
+    return asPinError(async () => readJson(await fetchAllowed(deps.fetch, url, { method: 'GET', timeoutMs: REQUEST_TIMEOUT_MS, hosts: [new URL(url).hostname] }), maxBytes, what));
   }
 
   function download(url: string, maxBytes: number, onChunk?: (b: Uint8Array) => void): Promise<Uint8Array> {
@@ -500,72 +493,25 @@ export async function resolvePin(c: Candidate, deps: PinDeps, install?: InstallS
 }
 
 /**
- * A fetch with no credential (the caller's headers only), following redirects by hand to the allowed https hosts
- * only (used by pinning and by downloadRelease).
- */
-async function fetchAllowed(fetchFn: typeof fetch, url: string, opts: FetchOptions & { notFound: 'null' }): Promise<Response | null>;
-async function fetchAllowed(fetchFn: typeof fetch, url: string, opts: FetchOptions): Promise<Response>;
-async function fetchAllowed(fetchFn: typeof fetch, url: string, opts: FetchOptions & { notFound?: 'null' }): Promise<Response | null> {
-  let current = new URL(url);
-  for (let hop = 0; ; hop++) {
-    if (current.protocol !== 'https:' || !opts.hosts.includes(current.hostname) || current.port !== '' || current.username !== '' || current.password !== '') {
-      throw new PinError(`pipegen won't fetch from ${current.protocol}//${current.host}: not an allowed https host.`);
-    }
-    let res: Response;
-    try {
-      res = await fetchFn(current.href, {
-        method: opts.method, redirect: 'manual', headers: { accept: 'application/json', ...opts.headers }, signal: AbortSignal.timeout(opts.timeoutMs),
-      });
-    } catch (e) {
-      throw new PinError(`Couldn't reach ${current.host}.`, { cause: e });
-    }
-    if ([301, 302, 303, 307, 308].includes(res.status)) {
-      const location = res.headers.get('location');
-      await res.body?.cancel().catch(() => {});
-      if (location === null || hop >= MAX_REDIRECTS) throw new PinError(`${current.host} redirected too often or nowhere.`);
-      current = new URL(location, current);
-      continue;
-    }
-    if (!res.ok) {
-      await res.body?.cancel().catch(() => {});
-      if (res.status === 404 && opts.notFound === 'null') return null;
-      throw new PinError(`${current.host} answered HTTP ${res.status} for ${current.pathname}.`);
-    }
-    return res;
-  }
-}
-
-/**
  * A GitHub release download (github.com and its release-asset hosts, https, no credential), size-bounded; with
  * `onChunk` the bytes are streamed to it instead of returned. Shared by pinning and ensurePinnedBinary (Task 7).
  */
 export async function downloadRelease(fetchFn: typeof fetch, url: string, maxBytes: number, onChunk?: (b: Uint8Array) => void): Promise<Uint8Array> {
-  const res = await fetchAllowed(fetchFn, url, { method: 'GET', timeoutMs: DOWNLOAD_TIMEOUT_MS, hosts: DOWNLOAD_HOSTS, headers: { accept: 'application/octet-stream' } });
-  const chunks: Uint8Array[] = [];
-  await readBody(res, maxBytes, onChunk ?? ((b) => chunks.push(b)), decodeURIComponent(new URL(url).pathname.split('/').pop() ?? 'the download'));
-  return Buffer.concat(chunks);
+  return asPinError(async () => {
+    const res = await fetchAllowed(fetchFn, url, { method: 'GET', timeoutMs: DOWNLOAD_TIMEOUT_MS, hosts: DOWNLOAD_HOSTS, headers: { accept: 'application/octet-stream' } });
+    const chunks: Uint8Array[] = [];
+    await readBody(res, maxBytes, onChunk ?? ((b) => chunks.push(b)), decodeURIComponent(new URL(url).pathname.split('/').pop() ?? 'the download'));
+    return Buffer.concat(chunks);
+  });
 }
 
-/** Reads a body up to `maxBytes`; anything larger is refused (the declared length and the bytes actually sent). */
-async function readBody(res: Response, maxBytes: number, onChunk: (b: Uint8Array) => void, what: string): Promise<void> {
-  const tooLarge = () => new PinError(`${what} is too large (more than ${maxBytes} bytes).`);
-  const declared = res.headers.get('content-length');
-  if (declared !== null && Number(declared) > maxBytes) {
-    await res.body?.cancel().catch(() => {});
-    throw tooLarge();
-  }
-  if (res.body === null) return;
-  const reader = res.body.getReader();
-  let total = 0;
-  for (;;) {
-    const { done, value } = await reader.read();
-    if (done) return;
-    total += value.byteLength;
-    if (total > maxBytes) {
-      await reader.cancel().catch(() => {});
-      throw tooLarge();
-    }
-    onChunk(value);
+/** Runs shared-HTTP work (http.ts), turning its HttpError into a PinError with the same message. */
+async function asPinError<T>(work: () => Promise<T>): Promise<T> {
+  try {
+    return await work();
+  } catch (e) {
+    if (e instanceof HttpError) throw new PinError(e.message, { cause: e });
+    throw e;
   }
 }
 

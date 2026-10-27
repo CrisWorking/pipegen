@@ -10,7 +10,7 @@ import {
   DEFAULT_MODEL, type AiProvider, type AiRequest, type AiUsage, type Candidate, type Language, type Need, type PipelineDraft, type RepoProfile, type ReviewedTool,
   type Service, type StepSpec, type ToolStats,
 } from '../src/types.js';
-import { fakeFetch, fakeOctokit, type Call, type Reply, type Routes } from './helpers/fake-http.js';
+import { countingStream, fakeFetch, fakeOctokit, type Call, type Reply, type Routes } from './helpers/fake-http.js';
 import { strictProblems } from './helpers/strict-schema.js';
 
 const GH = 'https://api.github.com';
@@ -282,6 +282,20 @@ describe('discover', () => {
     const out = await discover(need('lint'), profile(), s.deps);
     expect(out.map((c) => [c.repo, c.name])).toEqual([['good/pkg', 'good-pkg']]);
     expect(s.notes.some((n) => /npm/.test(n) && /GitHub repo/.test(n))).toBe(true);
+  });
+
+  it('discover: npm search reads a bounded answer (refused while it streams) and follows no redirect (final review M1)', async () => {
+    const big = countingStream(32 * 1024 * 1024);
+    const s = setup({ gh: search([], []), net: { [NPM_SEARCH]: () => ({ stream: big.stream }) } });
+    expect(await discover(need('lint'), profile(), s.deps)).toEqual([]);
+    expect(s.notes.some((n) => /npm search failed/.test(n))).toBe(true);
+    expect(big.pulled()).toBeLessThanOrEqual(2 * 1024 * 1024 + 128 * 1024);
+    const moved = setup({
+      gh: { ...search([], []), ...exists('good/pkg') },
+      net: { [NPM_SEARCH]: { status: 302, headers: { location: 'https://evil.example/search' } }, 'GET https://evil.example/search': { body: { objects: [npmHit('good-pkg', 'github:good/pkg')] } } },
+    });
+    expect(await discover(need('lint'), profile(), moved.deps)).toEqual([]);
+    expect(moved.netCalls.map((c) => c.url.host)).not.toContain('evil.example');
   });
 
   it('discover: no authorization header is ever passed to deps.fetch (ruling S15)', async () => {

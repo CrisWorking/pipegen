@@ -2,7 +2,7 @@ import { describe, expect, it, vi } from 'vitest';
 import { GitHubRateLimitError, newRateBudget } from '../src/engine/github-rate.js';
 import { fetchStats, StatsError, type StatsDeps } from '../src/engine/stats.js';
 import type { Candidate, InstallSpec } from '../src/types.js';
-import { fakeFetch, fakeOctokit, type Call, type Reply, type Routes } from './helpers/fake-http.js';
+import { countingStream, fakeFetch, fakeOctokit, type Call, type Reply, type Routes } from './helpers/fake-http.js';
 import { fake } from './helpers/secret-repo.js';
 
 const GH = 'https://api.github.com';
@@ -480,5 +480,38 @@ describe('stats', () => {
     const small = setup(github({ [`GET ${GH}/repos/o/r`]: { status: 403, headers: { 'x-ratelimit-remaining': '0', 'x-ratelimit-reset': reset } } }), web(), { budget: { remainingMs: 5_000 } });
     await expect(fetchStats(cand(), small.deps)).rejects.toThrow('GitHub rate limit: stopped waiting.');
     expect(small.deps.sleep).not.toHaveBeenCalled();
+  });
+});
+
+describe('stats: bounded fetches to allow-listed hosts (final review M1)', () => {
+  const EVIL = 'https://evil.example';
+  const evilScore: Routes = { [`GET ${EVIL}/score`]: { body: { date: '2026-10-01', score: 10 } }, [`POST ${EVIL}/osv`]: { body: {} }, [`GET ${EVIL}/npm`]: npmVersion('github:o/r') };
+  const hosts = (calls: Call[]) => calls.map((c) => c.url.host);
+
+  it('stats: a Scorecard redirect to another host is never followed (an error, never its score); one on the same host is', async () => {
+    const away = setup(github(), web({ ...evilScore, [`GET ${SCORECARD}/o/r`]: { status: 302, headers: { location: `${EVIL}/score` } } }));
+    await expect(fetchStats(cand(), away.deps)).rejects.toThrow(StatsError);
+    expect(hosts(away.netCalls)).not.toContain('evil.example');
+    const same = setup(github(), web({
+      [`GET ${SCORECARD}/o/r`]: { status: 301, headers: { location: `${SCORECARD}/O/R` } },
+      [`GET ${SCORECARD}/O/R`]: { body: { date: '2026-10-01', score: 6 } },
+    }));
+    expect((await fetchStats(cand(), same.deps)).scorecard).toBe(6);
+  });
+
+  it('stats: an OSV or npm metadata redirect is never followed off its host (advisories unknown, no proof)', async () => {
+    const osv = setup(github(), web({ ...evilScore, [`POST ${OSV}`]: { status: 307, headers: { location: `${EVIL}/osv` } } }));
+    expect((await fetchStats(pkgCand(), osv.deps, npm())).advisories).toBeNull();
+    expect(hosts(osv.netCalls)).not.toContain('evil.example');
+    const meta = setup(github(), web({ ...evilScore, [`GET ${NPM}/tool/2.0.1`]: { status: 302, headers: { location: `${EVIL}/npm` } } }));
+    await expect(fetchStats(pkgCand(), meta.deps, npm())).rejects.toThrow(/published from/);
+    expect(hosts(meta.netCalls)).not.toContain('evil.example');
+  });
+
+  it('stats: a huge answer is refused while it streams, not after reading it all', async () => {
+    const big = countingStream(32 * 1024 * 1024);
+    const { deps } = setup(github(), web({ [`GET ${SCORECARD}/o/r`]: () => ({ stream: big.stream }) }));
+    await expect(fetchStats(cand(), deps)).rejects.toThrow(StatsError);
+    expect(big.pulled()).toBeLessThanOrEqual(4 * 1024 * 1024 + 128 * 1024);
   });
 });

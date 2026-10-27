@@ -23,7 +23,7 @@
 //   wall-clock bound (DISCOVERY_DEADLINE_MS, on the injected clock). GitHub's rate limit (or the spent budget) stops
 //   the whole run, so no later need makes a billed AI call for nothing.
 // - Only `deps.gh` (Octokit, api.github.com) carries the user's credential; `deps.fetch` (npm search) never gets an
-//   auth header (S15). AI usage goes to deps.onUsage, also when the call fails (S4). AI text is cleaned (links
+//   auth header (S15) and goes through the shared http.ts (no redirect, a bounded read). AI usage goes to deps.onUsage, also when the call fails (S4). AI text is cleaned (links
 //   removed, safeText) before anyone sees it; toSuggestions passes name and why through safeText again.
 import type { Octokit } from '@octokit/rest';
 import { z } from 'zod';
@@ -35,6 +35,7 @@ import type {
   AiProvider, AiUsage, Candidate, InstallSpec, Language, Need, NeedCategory, PackageManager, PipelineDraft, RepoProfile, ReviewedTool,
 } from '../types.js';
 import { GitHubRateLimitError, isRateStop, withRateLimit, type RateClock } from './github-rate.js';
+import { fetchAllowed, readJson } from './http.js';
 import type { MemoryStore } from './memory.js';
 import { githubRepoFromUrl, isFullSemver, isGitHubRepo, isNpmName, repoSegments } from './names.js';
 import { cleanAiText, NEED_ID_CATEGORY } from './needs.js';
@@ -60,7 +61,8 @@ export const DISCOVERY_DEADLINE_MS = 120_000;
 const CANDIDATES_TIMEOUT_MS = 60_000;
 const NPM_SEARCH_URL = 'https://registry.npmjs.org/-/v1/search';
 const REQUEST_TIMEOUT_MS = 20_000;
-const MAX_BODY_CHARS = 2_000_000;
+/** Cap on the npm search answer (bytes, enforced while it streams). */
+const MAX_BODY_BYTES = 2 * 1024 * 1024;
 const KINDS = ['action', 'cli', 'docker'] as const satisfies readonly Candidate['kind'][];
 const LANGUAGES = ['node', 'python', 'go', 'java', 'dotnet', 'ruby', 'php', 'other'] as const satisfies readonly Language[];
 const PACKAGE_MANAGERS = ['npm', 'pnpm', 'yarn', 'bun', 'pip', 'poetry', 'uv', 'other'] as const satisfies readonly PackageManager[];
@@ -392,12 +394,10 @@ const npmSearchSchema = z.object({
 async function searchNpm(keywords: string, category: string, deps: DiscoverDeps, note: (t: string) => void): Promise<Raw[]> {
   let body: unknown;
   try {
+    // shared http.ts: registry.npmjs.org only, no redirect at all, the answer read up to MAX_BODY_BYTES as it streams
     const url = `${NPM_SEARCH_URL}?text=${encodeURIComponent(keywords)}&size=${SEARCH_RESULTS}`;
-    const res = await deps.fetch(url, { method: 'GET', redirect: 'error', headers: { accept: 'application/json' }, signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS) });
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    const text = await res.text();
-    if (text.length > MAX_BODY_CHARS) throw new Error('answer too large');
-    body = JSON.parse(text);
+    const res = await fetchAllowed(deps.fetch, url, { method: 'GET', timeoutMs: REQUEST_TIMEOUT_MS, hosts: [new URL(NPM_SEARCH_URL).hostname], maxRedirects: 0 });
+    body = await readJson(res, MAX_BODY_BYTES, 'the npm search answer');
   } catch {
     note('npm search failed, so pipegen continued without its results.');
     return [];

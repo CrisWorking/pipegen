@@ -9,7 +9,8 @@
 //   package (and not marked private) while the registry's own metadata points back at the repo. A provenance naming
 //   another repo, or from a publisher that isn't GitHub, is a refusal.
 // - Only `deps.gh` (Octokit, api.github.com) carries the user's credential. `deps.fetch` (Scorecard, OSV, npm,
-//   PyPI) is called with no auth header (ruling S15).
+//   PyPI) is called with no auth header (ruling S15), through the shared http.ts: redirects only within the URL's
+//   own host (a POST follows none), every answer read up to MAX_BODY_BYTES while it streams.
 // - Advisories (ruling S12): a version that can't be resolved or checked gives `advisories: null`, never 0, so the
 //   quality bar fails closed. The reason is added to `deps.notes`. With a pinned commit, the versions checked are
 //   the full version tags on that commit, and the highest count is kept.
@@ -21,6 +22,7 @@ import { z } from 'zod';
 import { safeText } from '../util/safe-text.js';
 import type { Candidate, InstallSpec, ToolStats } from '../types.js';
 import { BUDGET_SPENT_MESSAGE, GitHubRateLimitError, isRateStop, withRateLimit, type RateClock } from './github-rate.js';
+import { fetchAllowed, readJson } from './http.js';
 import {
   advisoryVersion, COMMIT_SHA_RE, compareSemver, githubRepoFromUrl, isFullSemver, isGitHubRepo, isNpmName, isPypiName, npmEscapedName, pep503,
   repoSegments,
@@ -46,7 +48,10 @@ const NPM_REGISTRY = 'https://registry.npmjs.org/';
 const NPM_ATTESTATIONS = `${NPM_REGISTRY}-/npm/v1/attestations/`;
 const PYPI = 'https://pypi.org';
 const REQUEST_TIMEOUT_MS = 20_000;
-const MAX_BODY_CHARS = 4_000_000;
+/** Cap on any answer read from Scorecard, OSV, npm or PyPI (bytes, enforced while it streams). */
+const MAX_BODY_BYTES = 4 * 1024 * 1024;
+/** Cap on one provenance payload (base64 text). */
+const MAX_PAYLOAD_CHARS = 4_000_000;
 const MAX_MANIFEST_CHARS = 1_500_000;
 /** Pages of 100 tags searched (tags on a pinned commit, the highest version tag). */
 const TAG_PAGES = 3;
@@ -145,14 +150,22 @@ export async function fetchStats(c: Candidate, deps: StatsDeps, install?: Instal
     return parsed.data;
   }
 
-  /** GET or POST with deps.fetch (never an auth header); null on 404 or any failure. */
-  async function getJson(url: string, init: { method?: string; accept?: string; body?: string } = {}): Promise<{ status: number; body: unknown } | null> {
+  /**
+   * GET or POST with deps.fetch through the shared http.ts (never an auth header; redirects only within the URL's
+   * own host, a POST follows none; the body read up to MAX_BODY_BYTES). A non-2xx answer → its status and no body;
+   * null on any failure.
+   */
+  async function getJson(url: string, init: { method?: 'GET' | 'POST'; accept?: string; body?: string } = {}): Promise<{ status: number; body: unknown } | null> {
     try {
-      const headers: Record<string, string> = { accept: init.accept ?? 'application/json' };
-      if (init.body !== undefined) headers['content-type'] = 'application/json';
-      const res = await deps.fetch(url, { method: init.method ?? 'GET', headers, body: init.body, signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS) });
-      if (!res.ok) return { status: res.status, body: undefined };
-      return { status: res.status, body: await readJson(res) };
+      const res = await fetchAllowed(deps.fetch, url, {
+        method: init.method ?? 'GET', timeoutMs: REQUEST_TIMEOUT_MS, hosts: [new URL(url).hostname], headers: { accept: init.accept ?? 'application/json' },
+        body: init.body, status: 'any',
+      });
+      if (!res.ok) {
+        await res.body?.cancel().catch(() => {});
+        return { status: res.status, body: undefined };
+      }
+      return { status: res.status, body: await readJson(res, MAX_BODY_BYTES, url) };
     } catch {
       return null;
     }
@@ -322,10 +335,10 @@ export async function fetchStats(c: Candidate, deps: StatsDeps, install?: Instal
   async function fetchScorecard(): Promise<{ scorecard: number | null; scorecardAt: string | null }> {
     let body: unknown;
     try {
-      const res = await deps.fetch(SCORECARD_BASE + path, { method: 'GET', headers: { accept: 'application/json' }, signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS) });
-      if (res.status === 404) return { scorecard: null, scorecardAt: null };
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      body = await readJson(res);
+      const url = SCORECARD_BASE + path;
+      const res = await fetchAllowed(deps.fetch, url, { method: 'GET', timeoutMs: REQUEST_TIMEOUT_MS, hosts: [new URL(url).hostname], notFound: 'null' });
+      if (res === null) return { scorecard: null, scorecardAt: null };
+      body = await readJson(res, MAX_BODY_BYTES, 'the OpenSSF Scorecard answer');
     } catch (e) {
       throw new StatsError(`Couldn't read the OpenSSF Scorecard score of ${repo}.`, { cause: e });
     }
@@ -451,7 +464,7 @@ export async function fetchStats(c: Candidate, deps: StatsDeps, install?: Instal
 /** The repo an SLSA provenance statement (base64 DSSE payload) was built from, as `owner/name`; UNREADABLE_REPO when it can't be read (fails closed). */
 function slsaRepo(payload: string): string {
   try {
-    if (payload.length > MAX_BODY_CHARS) return UNREADABLE_REPO;
+    if (payload.length > MAX_PAYLOAD_CHARS) return UNREADABLE_REPO;
     const stmt = JSON.parse(Buffer.from(payload, 'base64').toString('utf8')) as {
       predicate?: { buildDefinition?: { externalParameters?: { workflow?: { repository?: unknown } } }; invocation?: { configSource?: { uri?: unknown } } };
     };
@@ -461,11 +474,4 @@ function slsaRepo(payload: string): string {
   } catch {
     return UNREADABLE_REPO;
   }
-}
-
-/** The JSON body of a response, refusing very large bodies. */
-async function readJson(res: Response): Promise<unknown> {
-  const text = await res.text();
-  if (text.length > MAX_BODY_CHARS) throw new Error('answer too large');
-  return JSON.parse(text);
 }

@@ -9,7 +9,8 @@
 //   built and reviewed.
 // - nearDuplicate is the typosquat check: any reviewed `owner/name` within Levenshtein distance 2 (lowercased, whole
 //   name, any owner: ruling S31) that isn't the same repo → the reviewed entry it imitates. Discovery drops it.
-// - packageExists asks npm or PyPI whether an exact version exists, with no credential (rulings S14, S15).
+// - packageExists asks npm or PyPI whether an exact version exists, with no credential and no redirect (rulings
+//   S14, S15; shared http.ts).
 // - Project scripts (`npm test`, `npm run lint`) are a built-in step kind, not reviewed entries: no third-party code,
 //   so nothing to pin or review.
 import { readFileSync } from 'node:fs';
@@ -23,6 +24,7 @@ import {
   SHA256_RE, SRI_SHA512_RE, TAG_RE,
 } from './names.js';
 import { NEED_ID_CATEGORY } from './needs.js';
+import { fetchAllowed, HttpError } from './http.js';
 import { COOLDOWN_DAYS } from './pin.js';
 
 /** A built-in step that runs the project's own script. Not a reviewed third-party entry, so it has no pin. */
@@ -495,8 +497,12 @@ export async function packageExists(registry: 'npm' | 'pypi', name: string, vers
   const [where, Where] = registry === 'npm' ? ['the npm registry', 'The npm registry'] : ['PyPI', 'PyPI'];
   let res: Response;
   try {
-    res = await f(url, { method: 'GET', redirect: 'manual', headers: { accept: 'application/json' }, signal: AbortSignal.timeout(PACKAGE_TIMEOUT_MS) });
+    // shared http.ts: the registry's own host only, and no redirect at all (a redirect is an error, never a yes)
+    res = await fetchAllowed(f, url, { method: 'GET', timeoutMs: PACKAGE_TIMEOUT_MS, hosts: [new URL(url).hostname], maxRedirects: 0, status: 'any' });
   } catch (e) {
+    if (e instanceof HttpError && e.kind === 'redirect') {
+      throw new PackageCheckError(`${Where} redirected the check of ${name} ${version}; pipegen follows no redirect there, so it couldn't tell whether it exists.`, { cause: e });
+    }
     throw new PackageCheckError(`Couldn't reach ${where} to check ${name} ${version}.`, { cause: e });
   }
   await res.body?.cancel().catch(() => {});

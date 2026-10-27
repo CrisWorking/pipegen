@@ -3,8 +3,25 @@
 import { Octokit } from '@octokit/rest';
 
 export interface Call { method: string; url: URL; headers: Record<string, string>; body?: string }
-/** `raw`: the body sent as is (text or bytes) instead of `body` as JSON. */
-export interface Reply { status?: number; body?: unknown; raw?: string | Uint8Array; headers?: Record<string, string> }
+/** `raw`: the body sent as is (text or bytes) instead of `body` as JSON; `stream`: a streamed body (see countingStream). */
+export interface Reply { status?: number; body?: unknown; raw?: string | Uint8Array; stream?: ReadableStream<Uint8Array>; headers?: Record<string, string> }
+
+/**
+ * A body of `total` bytes (spaces) sent in `chunk`-sized pieces, counting how many bytes the reader actually pulled,
+ * so a test can prove a read stopped at its cap instead of reading everything first.
+ */
+export function countingStream(total: number, chunk = 64 * 1024): { stream: ReadableStream<Uint8Array>; pulled: () => number } {
+  let sent = 0;
+  const stream = new ReadableStream<Uint8Array>({
+    pull(ctrl) {
+      if (sent >= total) { ctrl.close(); return; }
+      const n = Math.min(chunk, total - sent);
+      sent += n;
+      ctrl.enqueue(new Uint8Array(n).fill(0x20));
+    },
+  }, { highWaterMark: 0 });
+  return { stream, pulled: () => sent };
+}
 /** Keyed by `METHOD origin+pathname` (no query); a handler sees the whole call, query included. */
 export type Routes = Record<string, Reply | ((c: Call) => Reply)>;
 
@@ -31,7 +48,7 @@ export function fakeFetch(routes: Routes): { fetch: typeof fetch; calls: Call[] 
         url = new URL(location, url);
         continue;
       }
-      const payload = reply.raw !== undefined ? reply.raw : JSON.stringify(reply.body ?? {});
+      const payload = reply.stream ?? (reply.raw !== undefined ? reply.raw : JSON.stringify(reply.body ?? {}));
       return new Response(payload as BodyInit, { status, headers: { 'content-type': 'application/json', ...reply.headers } });
     }
   };
