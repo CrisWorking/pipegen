@@ -17,7 +17,7 @@ After the first release, the latest minor version is supported.
 
 Please do not open a public issue for a security problem.
 
-- Security contact: TBD by the owner before release
+- Email: pipegen.security@gmail.com
 - Once the repository is public, use GitHub private vulnerability reporting
   (the "Report a vulnerability" button on the Security tab). It will be turned
   on at release time.
@@ -26,8 +26,7 @@ Include what you found, the pipegen version, and steps to reproduce.
 
 ## What to expect
 
-Response times (draft, the owner must confirm before release): acknowledgement
-within 7 days, and a fix or an advisory plan within 30 days.
+Response times: acknowledgement within 7 days, and a fix or an advisory plan within 30 days.
 
 ## Scope
 

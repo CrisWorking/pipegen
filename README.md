@@ -127,7 +127,7 @@ provenance link to the GitHub Actions run, and check that it is a run of `releas
 You can also verify the downloaded release file with `gh attestation verify <file>.tgz --repo CrisWorking/pipegen`.
 The steps for making a release are in [docs/release.md](docs/release.md).
 
-## Maintenance promise *(draft for Cristiano to approve; not a commitment yet)*
+## Maintenance promise
 
 - **Updates:** the latest minor version is maintained. Fixes ship as new patch versions; nothing is changed in an existing
   version after release.
