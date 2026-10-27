@@ -255,10 +255,11 @@ describe('discover', () => {
   it('discover: never-list repos are never suggested', async () => {
     // Plan P Task 5: catalogue §4's never-list, in any letter case, under a known old name, or a look-alike of one
     const never = ['aquasecurity/trivy-action', 'Reviewdog/action-eslint', 'Checkmarx/KICS-github-action', 'zricethezav/gitleaks-action', 'aquasecurlty/setup-trivy'];
-    const searched = ['zizmorcore/zizmor-action', 'PortSwigger/dastardly-github-action', 'tenable/terrascan'];
+    // fix round 1: the same name under any owner (a fork), and sibling names
+    const searched = ['zizmorcore/zizmor-action', 'PortSwigger/dastardly-github-action', 'dajiaohuang/trivy-action', 'tenable/terrascan', 'someone/tfsec', 'slsa-framework/slsa-github-generator-go'];
     const s = setup({
       ai: { candidates: [...never.map((r) => aiCand(r)), aiCand('fine/tool')] },
-      gh: { ...search(searched.slice(0, 2), searched.slice(2)), ...exists(...never, ...searched, 'fine/tool') },
+      gh: { ...search(searched.slice(0, 3), searched.slice(3)), ...exists(...never, ...searched, 'fine/tool') },
     });
     const out = await discover(need('lint'), profile(), s.deps);
     expect(repos(out)).toEqual(['fine/tool']);

@@ -153,9 +153,11 @@ export interface ReviewedTool {
   reviewedBy: string; reviewedAt: string; proofs: number;  // proofs = passed Plan E runs; full runs need proofs >= 1
   verifiedWith?: VerifiedWith;                             // Plan P Task 5: the signature or attestation check made when pinning (required for MUST_VERIFY repos)
 }
-// How a pinned release was verified when it was pinned (Plan P Task 5, ruling PS24). identity is the exact certificate
-// identity (workflow URL @ ref), never a regex; asset names the file whose signature was checked (e.g. checksums.txt).
-export interface VerifiedWith {
-  method: 'cosign-bundle' | 'cosign-signature' | 'github-attestation'; asset: string; identity: string;
-  issuer: 'https://token.actions.githubusercontent.com'; verifiedOn: string;   // verifiedOn: YYYY-MM-DD, not before the list's pinnedOn day
-}
+// How a pinned release was verified when it was pinned (Plan P Task 5, ruling PS24, fix round 1). Keyless: identity is
+// the exact certificate identity, the entry's own repo's workflow at the entry's version tag (never a regex or a
+// branch); asset names the file whose signature was checked (e.g. checksums.txt). cosign-key (P10): a public key file
+// in the entry's own repo at its version tag, with its sha256. verifiedOn: YYYY-MM-DD, not before the release or the
+// list's pinnedOn day, not in the future.
+export type VerifiedWith =
+  | { method: 'cosign-bundle' | 'cosign-signature' | 'github-attestation'; asset: string; identity: string; issuer: 'https://token.actions.githubusercontent.com'; verifiedOn: string }
+  | { kind: 'cosign-key'; keyUrl: string; keySha256: string; verifiedOn: string };

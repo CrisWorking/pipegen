@@ -32,7 +32,7 @@ export function isRealDate(s: string): boolean {
  */
 export function reviewMarkerProblems(reviewedBy: string, reviewedAt: string, pinnedDay: string | null): { message: string; field: 'reviewedBy' | 'reviewedAt' }[] {
   const out: { message: string; field: 'reviewedBy' | 'reviewedAt' }[] = [];
-  if (reviewedBy !== PENDING && reviewedBy.trim().toUpperCase() === PENDING) out.push({ field: 'reviewedBy', message: 'reviewedBy must be PENDING exactly (upper case, no spaces) or a name' });
+  if (reviewedBy !== PENDING && (reviewedBy.trim().toUpperCase() === PENDING || pendingLookAlike(reviewedBy))) out.push({ field: 'reviewedBy', message: 'reviewedBy must be PENDING exactly (upper case, no spaces) or a name' });
   else if (reviewedBy !== PENDING && !(REVIEWER_RE.test(reviewedBy) && reviewedBy.trim().length >= 2)) {
     out.push({ field: 'reviewedBy', message: 'reviewedBy must be PENDING or a printable name (letters, digits, spaces, . \' -; 2 to 80 characters)' });
   }
@@ -42,6 +42,15 @@ export function reviewMarkerProblems(reviewedBy: string, reviewedAt: string, pin
     else if (pinnedDay !== null && reviewedAt < pinnedDay) out.push({ field: 'reviewedAt', message: `reviewedAt is before pinnedOn (${pinnedDay}): the review must cover the pins as they are` });
   }
   return out;
+}
+
+/**
+ * A name that reads as PENDING but isn't (`PENDlNG`, `PEND1NG`, `Pend ing`, `PENDING.`): NFKC-folded, lower case,
+ * only letters and digits kept, and l, 1, | and ! read as i, 0 as o. Such a marker must not count as a reviewer.
+ */
+function pendingLookAlike(s: string): boolean {
+  const folded = s.normalize('NFKC').toLowerCase().replace(/[l1|!]/g, 'i').replace(/0/g, 'o').replace(/[^a-z0-9]/g, '');
+  return folded === 'pending';
 }
 
 /** "a, b and 3 more" for an error message. */

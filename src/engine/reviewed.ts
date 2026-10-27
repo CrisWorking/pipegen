@@ -33,7 +33,9 @@ import { NEED_ID_CATEGORY } from './need-ids.js';
 import { fetchAllowed, HttpError } from './http.js';
 import { COOLDOWN_DAYS } from './pin.js';
 import { isRealDate, isReleaseBuild, listPending, PENDING, REVIEWER_RE, reviewMarkerProblems } from './review-marker.js';
-import { BETTERLEAKS_FORBIDDEN_FLAGS } from './tool-flags.js';
+import { lastValue, parseArgv } from './argv.js';
+import { BETTERLEAKS_FORBIDDEN_FLAGS, BETTERLEAKS_FORBIDDEN_SUBCOMMANDS, BETTERLEAKS_SUBCOMMANDS } from './tool-flags.js';
+import { BETTERLEAKS_GRAMMAR, NUCLEI_GRAMMAR, TRIVY_GRAMMAR } from './tool-grammar.js';
 
 /** A built-in step that runs the project's own script. Not a reviewed third-party entry, so it has no pin. */
 export interface ProjectScriptStep { kind: 'project-script'; needId: string; service: string; script: 'test' | 'lint'; workingDir?: string }
@@ -98,10 +100,13 @@ export const MAX_PLUGINS = 4;
 /** The only OIDC issuer a recorded keyless signature may have: GitHub Actions. */
 export const OIDC_ISSUER = 'https://token.actions.githubusercontent.com';
 /**
- * The exact certificate identity of a keyless signature (ruling PS24): a GitHub workflow URL at a tag, a branch or a
- * commit. Never a regex: none of `^ $ * ( ) [ ] | \ ? +` outside the ref, and no `..`.
+ * The exact certificate identity of a keyless signature (ruling PS24, fix round 1): the entry's own repo's workflow
+ * at a tag. Never a regex, a branch or a commit: entryProblems also checks that owner/repo is the entry's repo and the
+ * tag its version.
  */
-const IDENTITY_RE = /^https:\/\/github\.com\/[A-Za-z0-9-]{1,39}\/[A-Za-z0-9._-]{1,100}\/\.github\/workflows\/[A-Za-z0-9._-]{1,100}\.ya?ml@(?:refs\/(?:tags|heads)\/[A-Za-z0-9._/-]{1,128}|[0-9a-f]{40})$/;
+const IDENTITY_RE = /^https:\/\/github\.com\/([A-Za-z0-9-]{1,39})\/([A-Za-z0-9._-]{1,100})\/\.github\/workflows\/[A-Za-z0-9._-]{1,100}\.ya?ml@refs\/tags\/([A-Za-z0-9._+-]{1,128})$/;
+/** A cosign public key in the entry's own repo at its version tag (P10: kube-linter and gosec sign with a repo-held key). */
+const KEY_URL_RE = /^https:\/\/raw\.githubusercontent\.com\/([A-Za-z0-9-]{1,39})\/([A-Za-z0-9._-]{1,100})\/([A-Za-z0-9._+-]{1,128})\/((?:[A-Za-z0-9._-]{1,100}\/){0,8}[A-Za-z0-9._-]{1,100})$/;
 
 /**
  * Catalogue §4's never-list ("Remove / never add"), lowercased `owner/name` (or `owner/*` for every repo of an owner)
@@ -136,8 +141,42 @@ export const NEVER_REPOS: Readonly<Record<string, string>> = Object.freeze({
 });
 
 /**
- * Repos whose releases pipegen pins only with a recorded signature or attestation check (verifiedWith): catalogue §4
- * ("+ cosign", "+ GitHub attestation", "+ sigstore") and DECISIONS #95 (jscpd as a signed binary, ruling PS27).
+ * Repo names refused under ANY owner (fix round 1): a fork or a copy shares the code and often the commit network of
+ * the tool it copies. Every non-wildcard NEVER_REPOS name, plus `reviewdog`; a name that starts with one of them and
+ * a `-` (`slsa-github-generator-go`, `tfsec-action`) is refused too. NEVER_NAME_ALLOW lists `owner/name` exceptions.
+ */
+const NEVER_NAMES: ReadonlyMap<string, string> = (() => {
+  const m = new Map<string, string>([['reviewdog', 'reviewdog/*']]);
+  // the first key with a name (the current repo, listed before its old names) is the one a hit reports
+  for (const k of Object.keys(NEVER_REPOS)) if (!k.endsWith('/*') && !m.has(k.slice(k.indexOf('/') + 1))) m.set(k.slice(k.indexOf('/') + 1), k);
+  return m;
+})();
+/** `owner/name` repos allowed although their name is in a never-list family (none needed today). */
+export const NEVER_NAME_ALLOW: ReadonlySet<string> = new Set<string>();
+
+/**
+ * Images pipegen never runs (P11), by image name (the last part of the path), on any registry and under any
+ * namespace: `aquasec/trivy`, `ghcr.io/aquasecurity/trivy` and `public.ecr.aws/aquasecurity/trivy` all end in
+ * `trivy`. Kept apart from NEVER_REPOS so the reviewed binary's repo, aquasecurity/trivy, still loads. Docker Hub
+ * checked on 2026-10-27: aquasec/trivy, aquasec/tfsec, aquasec/tfsec-ci, aquasec/tfsec-alpine, aquasec/tfsec-scratch,
+ * tfsec/tfsec, liamg/tfsec, checkmarx/kics, tenable/terrascan and accurics/terrascan exist.
+ */
+export const NEVER_IMAGES: Readonly<Record<string, string>> = Object.freeze({
+  trivy: 'Trivy runs only as the release binary checked by sha256 and cosign: its Docker Hub images 0.69.5 and 0.69.6 were malicious in March 2026 (catalogue §4, §5)',
+  tfsec: 'tfsec is superseded by Trivy (catalogue §4)',
+  'tfsec-ci': 'tfsec is superseded by Trivy (catalogue §4)',
+  'tfsec-alpine': 'tfsec is superseded by Trivy (catalogue §4)',
+  'tfsec-scratch': 'tfsec is superseded by Trivy (catalogue §4)',
+  kics: 'KICS: its Docker Hub tags were overwritten with a data-stealing binary in 2026 (catalogue §4, §5)',
+  dastardly: 'Dastardly: a mutable :latest image from an unmaintained product (catalogue §4, ruling PS21)',
+  terrascan: 'Terrascan is archived (catalogue §4)',
+});
+
+/**
+ * Tools whose releases pipegen pins only with a recorded signature or attestation check (verifiedWith), by their
+ * repo: catalogue §4 ("+ cosign", "+ GitHub attestation", "+ sigstore") and DECISIONS #95 (jscpd as a signed binary,
+ * ruling PS27). The check goes by the tool, not the exact repo (fix round 1): any entry whose repo has one of these
+ * names (under any owner) or that runs one of these tools (runsTool) needs verifiedWith.
  */
 export const MUST_VERIFY: ReadonlySet<string> = new Set([
   'betterleaks/betterleaks', 'aquasecurity/trivy', 'hadolint/hadolint', 'stackrox/kube-linter', 'securego/gosec', 'kucherenko/jscpd',
@@ -200,14 +239,22 @@ const fixedSchema = z.strictObject({
   }).optional(),
 });
 
-const verifiedWithSchema = z.strictObject({
+/** A keyless signature or attestation check (PS24); its format and binding to the entry are checked in verifiedWithProblems. */
+const keylessSchema = z.strictObject({
   method: z.enum(['cosign-bundle', 'cosign-signature', 'github-attestation']),
-  asset: z.string().regex(ASSET_RE),
-  identity: z.string().max(400).regex(IDENTITY_RE, 'identity must be the exact certificate identity, https://github.com/<owner>/<repo>/.github/workflows/<file>@<ref> (never a regex)')
-    .refine((s) => !s.includes('..'), 'identity must not contain ..'),
+  asset: z.string().max(255),
+  identity: z.string().max(400),
   issuer: z.literal(OIDC_ISSUER),
-  verifiedOn: z.string().refine(isRealDate, 'verifiedOn must be a real date (YYYY-MM-DD)'),
+  verifiedOn: z.string().max(10),
 });
+/** A check with a cosign key held in the entry's own repo (P10: kube-linter, gosec). */
+const keySchema = z.strictObject({
+  kind: z.literal('cosign-key'),
+  keyUrl: z.string().max(400),
+  keySha256: z.string().max(64),
+  verifiedOn: z.string().max(10),
+});
+const verifiedWithSchema = z.union([keylessSchema, keySchema]);
 
 const entrySchema = z.strictObject({
   id: z.string().regex(ID_RE),
@@ -236,6 +283,8 @@ const fileSchema = z.strictObject({
 }).superRefine((f, ctx) => {
   const pinnedOn = Date.parse(f.pinnedOn);
   const pinnedDay = f.pinnedOn.slice(0, 10);
+  // a pinnedOn in the future would let a release younger than the cooldown through
+  if (!(pinnedOn <= Date.now())) ctx.addIssue({ code: 'custom', path: ['pinnedOn'], message: 'pinnedOn is in the future: the cooldown is measured from it' });
   f.tools.forEach((t, i) => {
     if (t.reviewedAt !== PENDING && DATE_RE.test(t.reviewedAt) && t.reviewedAt < pinnedDay) {
       ctx.addIssue({ code: 'custom', path: ['tools', i, 'reviewedAt'], message: `reviewedAt is before pinnedOn (${pinnedDay}): the review must cover the pins as they are` });
@@ -266,15 +315,17 @@ function entryProblems(e: Entry): { message: string; path: (string | number)[] }
   const fx = e.fixedInputs;
 
   // ---- Plan P Task 5: never-listed tools, anywhere in the entry (first, so the refusal names the reason) ----
-  const refs: [string, (string | number)[]][] = [[c.repo, ['candidate', 'repo']], [c.name, ['candidate', 'name']]];
-  if (action !== undefined) refs.push([action.uses, ['step', 'action', 'uses']]);
-  if (cli !== undefined) refs.push([cli.install.package, ['step', 'cli', 'install', 'package']]);
-  // download URLs, images and repo names in any value of the step, the fixed inputs or the choices
+  // [reference, path, may be an image]
+  const refs: [string, (string | number)[], boolean][] = [[c.repo, ['candidate', 'repo'], false], [c.name, ['candidate', 'name'], false]];
+  if (action !== undefined) refs.push([action.uses, ['step', 'action', 'uses'], false]);
+  if (cli !== undefined) refs.push([cli.install.package, ['step', 'cli', 'install', 'package'], cli.install.method === 'docker']);
+  // download URLs, images and repo names in any value of the step (plugins included), the fixed inputs or the choices
   for (const text of [...leaves(e.step), ...leaves(fx), ...leaves(e.choices)]) {
-    for (const token of text.split(/[\s=,;"'`()[\]{}<>|]+/)) if (token.includes('/')) refs.push([token, ['step']]);
+    // a word may be an image unless it is a URL or a file path (`/usr/local/bin/trivy`, `./x`)
+    for (const token of refTokens(text)) refs.push([token, ['step'], (!/^[a-z][a-z0-9+.-]*:\/\//i.test(token) || /^docker:\/\//i.test(token)) && !/^\.{0,2}\//.test(token)]);
   }
-  for (const [ref, path] of refs) {
-    const hit = neverListed(ref);
+  for (const [ref, path, image] of refs) {
+    const hit = neverListed(ref) ?? (image ? neverImage(ref) : null);
     if (hit !== null) {
       bad(`pipegen never adds ${hit.key === hit.ref ? hit.key : `${hit.ref} (${hit.key})`}: ${hit.reason}`, ...path);
       break;
@@ -288,14 +339,12 @@ function entryProblems(e: Entry): { message: string; path: (string | number)[] }
       break;
     }
   }
-  // MUST_VERIFY repos are pinned only with a recorded signature or attestation check
-  if (MUST_VERIFY.has(repo) && e.verifiedWith === undefined) bad(`${c.repo} is pinned only with a signature or attestation check: verifiedWith is required (MUST_VERIFY)`, 'verifiedWith');
-  if (e.verifiedWith !== undefined) {
-    const tag = /@refs\/tags\/(.+)$/.exec(e.verifiedWith.identity)?.[1];
-    if (tag !== undefined && tag.replace(/^v/, '') !== c.version.replace(/^v/, '')) {
-      bad(`verifiedWith.identity is the signature of tag ${tag}, not of this entry's version ${c.version}`, 'verifiedWith', 'identity');
-    }
-  }
+  // jscpd's AI mode by any tool name (a renamed jscpd binary is still jscpd): no --semantic* flag in any entry
+  if (flagWords(e).some((n) => n.startsWith('semantic'))) bad(`no entry may pass --semantic (jscpd's AI mode: ${JSCPD_AI_WHY})`, 'step', 'cli', 'command');
+  // MUST_VERIFY tools, by repo name under any owner or by what the entry runs, are pinned only with a recorded check
+  const verify = mustVerifyRepo(e);
+  if (verify !== null && e.verifiedWith === undefined) bad(`${c.repo} is ${verify}'s tool, which pipegen pins only with a signature or attestation check: verifiedWith is required (MUST_VERIFY)`, 'verifiedWith');
+  if (e.verifiedWith !== undefined) out.push(...verifiedWithProblems(e));
 
   if (c.id !== e.id) bad('candidate.id must equal the entry id', 'candidate', 'id');
   if (c.categories.length !== e.categories.length || c.categories.some((x, i) => x !== e.categories[i])) bad('candidate.categories must equal the entry categories', 'candidate', 'categories');
@@ -411,22 +460,9 @@ function entryProblems(e: Entry): { message: string; path: (string | number)[] }
   }
   if (repo === 'semgrep/semgrep' || /(^|\/)semgrep$/.test(cli?.install.package ?? '')) out.push(...semgrepProblems(e));
 
-  // ---- Plan P Task 5: the catalogue's tool locks ----
-  const command = cli?.command ?? [];
-  const args = fx.args ?? [];
-  // Trivy (catalogue §4, D10): no telemetry, no version-check call, checks from the verified binary only; trivy keeps
-  // the last value of a flag, so `--flag=false` later in the command is refused too
-  if (runsTool(e, 'aquasecurity/trivy', 'trivy')) {
-    for (const flag of TRIVY_REQUIRED_FLAGS) {
-      if (!command.includes(flag) || !args.includes(flag) || [...command, ...args].some((a) => lower(a).startsWith(`${flag}=`))) {
-        bad(`trivy must run with ${flag} in the command and fixedInputs.args, and never ${flag}=… (catalogue §4: no telemetry or update calls)`, 'step', 'cli', 'command');
-      }
-    }
-  }
-  // jscpd (catalogue D6): --semantic can call any OpenAI-compatible API, so not anywhere in its step
-  if (runsTool(e, 'kucherenko/jscpd', 'jscpd') && [...leaves(e.step), ...leaves(fx), ...leaves(e.choices)].some((t) => /semantic/i.test(t))) {
-    bad('jscpd must never use --semantic (it can send code to an AI API; catalogue D6): not in the command, args, env, config or choices', 'step', 'cli', 'command');
-  }
+  // ---- Plan P Task 5: the catalogue's tool locks (argv read with each tool's own grammar, fix round 1) ----
+  if (runsTool(e, 'aquasecurity/trivy', 'trivy')) out.push(...trivyProblems(e));
+  if (runsTool(e, 'kucherenko/jscpd', 'jscpd')) out.push(...jscpdProblems(e));
   if (runsTool(e, 'betterleaks/betterleaks', 'betterleaks')) out.push(...betterleaksProblems(e));
   if (runsTool(e, 'projectdiscovery/nuclei', 'nuclei')) out.push(...nucleiProblems(e));
   // catalogue §3 SD5 / MG1: no results upload from Scorecard, no PR comments (a write) from dependency-review
@@ -436,6 +472,8 @@ function entryProblems(e: Entry): { message: string; path: (string | number)[] }
   }
   return out;
 }
+
+type Problem = { message: string; path: (string | number)[] };
 
 /** Action inputs some entries must fix (catalogue §3 SD5, MG1), by lowercased repo. */
 const FIXED_ACTION_INPUTS: Readonly<Record<string, Readonly<Record<string, string>>>> = {
@@ -459,21 +497,274 @@ function leaves(v: unknown, out: string[] = []): string[] {
   return out;
 }
 
+/**
+ * The words of a value that may name a repo or an image: split at spaces, quotes, brackets, `=`, `,` and `;`, each
+ * with a `/`, and again at `:` (so `uses:owner/name` or `x:owner/name` glued in config text is read too).
+ */
+function refTokens(text: string): string[] {
+  const out: string[] = [];
+  for (const token of text.split(/[\s=,;"'`()[\]{}<>|]+/)) {
+    if (!token.includes('/')) continue;
+    out.push(token);
+    if (token.includes(':')) out.push(...token.split(':').filter((p) => p.includes('/')));
+  }
+  return out;
+}
+
 /** A flag's name: without its leading dashes or `=value`, lower case (`--Validate=true` → `validate`). */
 const flagName = (a: string) => lower(a.replace(/^-+/, '').split('=')[0] as string);
 
+/** The flag names an entry passes anywhere: dash words of the command, the fixed args and the choice values, and the choice names. */
+function flagWords(e: Entry): string[] {
+  const words = [...(e.step.cli?.command ?? []), ...(e.fixedInputs.args ?? []), ...Object.values(e.choices).flat()];
+  return [...words.filter((a) => a.startsWith('-')).map(flagName), ...Object.keys(e.choices).map(flagName)];
+}
+
+/** The last part of a path, lower case (`/usr/bin/trivy` → `trivy`). */
+const basename = (s: string) => lower(s.split('/').pop() ?? '');
+
 /**
  * Whether an entry runs this tool: its repo (any letter case), its install package or asset (`trivy`, `aquasec/trivy`,
- * `trivy_0.76.0_Linux-64bit.tar.gz`, `jscpd-linux-x64-gnu.tar.gz`), or a command word (`npx jscpd`, `/usr/bin/trivy`).
+ * `trivy_0.76.0_Linux-64bit.tar.gz`, `jscpd-linux-x64-gnu.tar.gz`, the npm scope `@jscpd/cli`), or a command word
+ * (`npx jscpd`, `/usr/bin/trivy`).
  */
 function runsTool(e: Entry, repo: string, tool: string): boolean {
   if (lower(e.candidate.repo) === repo) return true;
   const cli = e.step.cli;
   if (cli === undefined) return false;
-  const base = (s: string) => lower(s.split('/').pop() ?? '');
-  const pkg = base(cli.install.package);
-  if (pkg === tool || pkg.startsWith(`${tool}_`) || pkg.startsWith(`${tool}-`)) return true;
-  return cli.command.some((w) => base(w) === tool);
+  const pkg = basename(cli.install.package);
+  if (pkg === tool || pkg.startsWith(`${tool}_`) || pkg.startsWith(`${tool}-`) || lower(cli.install.package).startsWith(`@${tool}/`)) return true;
+  return cli.command.some((w) => basename(w) === tool);
+}
+
+/** The MUST_VERIFY repo whose tool this entry is: by its repo's name under any owner, or by what it runs; else null. */
+function mustVerifyRepo(e: Entry): string | null {
+  const name = lower(e.candidate.repo).split('/')[1];
+  for (const r of MUST_VERIFY) {
+    const tool = r.slice(r.indexOf('/') + 1);
+    if (lower(e.candidate.repo) === r || name === tool || runsTool(e, r, tool)) return r;
+  }
+  return null;
+}
+
+/**
+ * verifiedWith is bound to the entry (fix round 1): a keyless identity is the entry's own repo's workflow at the
+ * entry's version tag (no branch, no commit, no other repo); a cosign key is a file in the entry's own repo at that
+ * tag, with its sha256; the asset names no other version; verifiedOn is a real day, not before the release and not
+ * in the future.
+ */
+function verifiedWithProblems(e: Entry): Problem[] {
+  const out: Problem[] = [];
+  const bad = (message: string, ...path: (string | number)[]) => out.push({ message, path: ['verifiedWith', ...path] });
+  const v = e.verifiedWith;
+  if (v === undefined) return out;
+  const c = e.candidate;
+  const repo = lower(c.repo);
+  const isVersion = (tag: string) => tag === c.version || tag === `v${c.version}`;
+  if (!isRealDate(v.verifiedOn)) bad('verifiedWith.verifiedOn must be a real date (YYYY-MM-DD)', 'verifiedOn');
+  else if (v.verifiedOn > new Date().toISOString().slice(0, 10)) bad('verifiedWith.verifiedOn is in the future', 'verifiedOn');
+  else if (v.verifiedOn < e.releasedAt.slice(0, 10)) bad(`verifiedWith.verifiedOn is before the release (${e.releasedAt.slice(0, 10)})`, 'verifiedOn');
+  if ('kind' in v) {
+    const m = KEY_URL_RE.exec(v.keyUrl);
+    if (m === null || lower(`${m[1]}/${m[2]}`) !== repo || !isVersion(m[3] as string) || (m[4] as string).split('/').some((s) => s === '.' || s === '..')) {
+      bad(`verifiedWith.keyUrl must be the key file in ${c.repo} at ${c.version}: https://raw.githubusercontent.com/${c.repo}/${c.version}/<path>`, 'keyUrl');
+    }
+    if (!SHA256_RE.test(v.keySha256)) bad("verifiedWith.keySha256 must be the key file's sha256 (64 hex characters)", 'keySha256');
+    return out;
+  }
+  const m = IDENTITY_RE.exec(v.identity);
+  if (m === null) bad(`verifiedWith.identity must be the exact certificate identity https://github.com/${c.repo}/.github/workflows/<file>@refs/tags/${c.version} (never a regex, a branch or a commit)`, 'identity');
+  else if (lower(`${m[1]}/${m[2]}`) !== repo) bad(`verifiedWith.identity is a workflow of ${m[1]}/${m[2]}, not of ${c.repo}`, 'identity');
+  else if (!isVersion(m[3] as string)) bad(`verifiedWith.identity is the signature of tag ${m[3]}, not of this entry's version ${c.version}`, 'identity');
+  if (!ASSET_RE.test(v.asset)) bad('verifiedWith.asset names the signed file (a plain file name)', 'asset');
+  for (const x of v.asset.match(/\d+\.\d+\.\d+/g) ?? []) {
+    if (x !== c.version.replace(/^v/, '')) bad(`verifiedWith.asset is the file of version ${x}, not of this entry's ${c.version}`, 'asset');
+  }
+  return out;
+}
+
+/** Problems with a tool's choices: each names a flag the tool has and pipegen allows, and no value is a flag. */
+function choiceProblems(tool: string, e: Entry, known: (name: string) => boolean, refused: (name: string) => string | null): Problem[] {
+  const out: Problem[] = [];
+  for (const [k, vs] of Object.entries(e.choices)) {
+    const why = known(k) ? refused(k) : `${tool} has no flag --${k}: a choice names a flag of the pinned version`;
+    if (why !== null) out.push({ message: why, path: ['choices', k] });
+    for (const v of vs) if (v.startsWith('-')) out.push({ message: `a ${tool} choice value may not be a flag (${v})`, path: ['choices', k] });
+  }
+  return out;
+}
+
+/** Trivy flags pipegen never passes: other servers, registries, check or DB sources, modules, credentials, or a second config. */
+const TRIVY_FORBIDDEN: ReadonlySet<string> = new Set([
+  'server', 'token', 'token-header', 'custom-headers', 'cache-backend', 'cache-ttl', 'redis-ca', 'redis-cert', 'redis-key', 'redis-tls',
+  'db-repository', 'java-db-repository', 'checks-bundle-repository', 'config-check', 'config-data', 'module-dir', 'enable-modules',
+  'rekor-url', 'sbom-sources', 'vex', 'output-plugin-arg', 'password', 'password-stdin', 'username', 'registry-token',
+  'download-db-only', 'download-java-db-only', 'generate-default-config', 'config', 'cacert', 'insecure', 'docker-host', 'podman-host',
+]);
+
+/**
+ * Trivy (catalogue §4, D10): `trivy config|image|fs …`, read with v0.76.0's grammar (tool-grammar.ts). The three
+ * hardening flags must be in effect (not swallowed as another flag's value, not after `--`, not set false later) and
+ * be fixed args; no flag v0.76.0 doesn't have, none of TRIVY_FORBIDDEN, no TRIVY_* env (it sets any flag).
+ */
+function trivyProblems(e: Entry): Problem[] {
+  const out: Problem[] = [];
+  const bad = (message: string, ...path: (string | number)[]) => out.push({ message, path });
+  const command = e.step.cli?.command ?? [];
+  const sub = command[1] === 'filesystem' ? 'fs' : command[1];
+  if (basename(command[0] ?? '') !== 'trivy' || (sub !== 'config' && sub !== 'image' && sub !== 'fs')) {
+    bad('trivy runs as `trivy config|image|fs …` (the pinned binary, its subcommand first)', 'step', 'cli', 'command');
+    return out;
+  }
+  const g = TRIVY_GRAMMAR[sub];
+  const p = parseArgv(command.slice(2), g, 'pflag');
+  if (p.errors.length > 0) bad(`trivy ${sub}: ${p.errors[0]} (pipegen reads the command with trivy v0.76.0's flags and refuses any it doesn't know)`, 'step', 'cli', 'command');
+  const args = e.fixedInputs.args ?? [];
+  for (const flag of TRIVY_REQUIRED_FLAGS) {
+    if (lastValue(p, flag.slice(2)) !== 'true' || !args.includes(flag)) {
+      bad(`trivy must run with ${flag} in effect, in the command and fixedInputs.args (not another flag's value, not after --, never ${flag}=false; catalogue §4)`, 'step', 'cli', 'command');
+    }
+  }
+  for (const f of p.flags) if (TRIVY_FORBIDDEN.has(f.name)) bad(`trivy must not use --${f.name} (another server, source, credential or config than pipegen's)`, 'step', 'cli', 'command');
+  for (const k of [...Object.keys(e.step.cli?.env ?? {}), ...Object.keys(e.fixedInputs.env ?? {})]) {
+    if (/^trivy_/i.test(k)) bad(`trivy gets no ${k}: a TRIVY_* variable sets a flag outside the command pipegen checks`, 'step', 'cli', 'env');
+  }
+  out.push(...choiceProblems('trivy', e, (k) => g.value.has(k) || g.bool.has(k),
+    (k) => (TRIVY_FORBIDDEN.has(k) || (TRIVY_REQUIRED_FLAGS as readonly string[]).includes(`--${k}`) ? `the AI may not choose trivy's --${k}` : null)));
+  return out;
+}
+
+const JSCPD_AI_WHY = 'it runs an embedding model that can send code to an AI API; jscpd 5.4.2 rust/crates/cpd/src/options.rs:178-222 and cli.rs:269-333, 534, 602, 613; catalogue D6';
+/** jscpd 5.4.2 flags that run the embedding model or serve it: --compare, --mcp, --dashboard, and every --semantic*. */
+const JSCPD_AI_FLAGS: ReadonlySet<string> = new Set(['compare', 'mcp', 'dashboard']);
+
+/**
+ * jscpd (catalogue D6): no semantic mode anywhere. Flags: --semantic* and the modes that run the model without it
+ * (--compare, --mcp) or serve results (--dashboard). The pinned config must be JSON (jscpd reads it with serde_json)
+ * and, decoded, has no `semantic` key (`semantic.enabled` turns the mode on) and none of those modes.
+ */
+function jscpdProblems(e: Entry): Problem[] {
+  const out: Problem[] = [];
+  const bad = (message: string, ...path: (string | number)[]) => out.push({ message, path });
+  const ai = `jscpd must never use --semantic, --compare, --mcp or --dashboard (${JSCPD_AI_WHY})`;
+  if (flagWords(e).some((n) => n.startsWith('semantic') || JSCPD_AI_FLAGS.has(n))) bad(ai, 'step', 'cli', 'command');
+  else if ([...leaves(e.step), ...leaves(e.fixedInputs), ...leaves(e.choices)].some((t) => /semantic/i.test(t))) bad(ai, 'step', 'cli');
+  const content = e.fixedInputs.config?.content;
+  if (content !== undefined) {
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(content);
+    } catch {
+      bad("jscpd's pinned config must be JSON (jscpd reads it with serde_json), so pipegen can check every key", 'fixedInputs', 'config');
+      return out;
+    }
+    const keys: string[] = [];
+    const walk = (v: unknown) => {
+      if (Array.isArray(v)) v.forEach(walk);
+      else if (v !== null && typeof v === 'object') for (const [k, x] of Object.entries(v)) { keys.push(lower(k)); walk(x); }
+    };
+    walk(parsed);
+    if (keys.some((k) => k.includes('semantic') || JSCPD_AI_FLAGS.has(k))) bad(`jscpd's pinned config must not turn on semantic mode (${JSCPD_AI_WHY})`, 'fixedInputs', 'config');
+  }
+  return out;
+}
+
+/**
+ * betterleaks (catalogue §3 PC2, ruling PS34): `betterleaks git|dir|stdin …`, read with v1.9.0's grammar
+ * (tool-grammar.ts): none of BETTERLEAKS_FORBIDDEN_FLAGS, no subcommand that validates or scans a remote service, no
+ * flag v1.9.0 doesn't have, no env (it can carry a config), and pipegen's pinned --config as the only config.
+ */
+function betterleaksProblems(e: Entry): Problem[] {
+  const out: Problem[] = [];
+  const bad = (message: string, ...path: (string | number)[]) => out.push({ message, path });
+  const fx = e.fixedInputs;
+  const command = e.step.cli?.command ?? [];
+  const forbidden = new Set<string>(BETTERLEAKS_FORBIDDEN_FLAGS);
+  const pinnedMsg = "betterleaks runs with pipegen's pinned --config (fixedInputs.config passed as --config) and no other config";
+  // the forbidden flags by name, in any spelling (one or two dashes, =value), wherever a flag can be
+  const words = [...command, ...(fx.args ?? []), ...Object.values(e.choices).flat()].filter((a) => a.startsWith('-'));
+  const named = [...words.map((a) => (/^--?[a-z]$/i.test(a.split('=')[0] as string) ? (a.split('=')[0] as string) : `--${flagName(a)}`)), ...Object.keys(e.choices).map((k) => `--${flagName(k)}`)];
+  const hit = named.find((n) => forbidden.has(n) || n.startsWith('--validation'));
+  if (hit !== undefined) bad(`betterleaks must never use ${hit} (it sends candidate secrets to provider APIs, prints them, or runs unreviewed features; betterleaks v1.9.0 cmd/root.go:89, 109-127)`, 'step', 'cli', 'command');
+  const sub = command[1] ?? '';
+  if (basename(command[0] ?? '') !== 'betterleaks') bad('betterleaks runs as `betterleaks git|dir|stdin …`', 'step', 'cli', 'command');
+  else if ((BETTERLEAKS_FORBIDDEN_SUBCOMMANDS as readonly string[]).includes(lower(sub))) bad(`betterleaks must never run ${sub} (it calls provider APIs or a remote service with a token; v1.9.0 cmd/${lower(sub)}.go)`, 'step', 'cli', 'command');
+  else if (!(BETTERLEAKS_SUBCOMMANDS as readonly string[]).includes(sub)) bad(`betterleaks runs only ${BETTERLEAKS_SUBCOMMANDS.join(', ')} (local scans), not ${sub || 'nothing'}`, 'step', 'cli', 'command');
+  else {
+    const g = BETTERLEAKS_GRAMMAR[sub as 'git' | 'dir' | 'stdin'];
+    // cmd/rule_flags.go expands -dr and -ir before cobra parses
+    const expanded = command.slice(2).map((a) => a.replace(/^-dr(?==|$)/, '--disable-rule').replace(/^-ir(?==|$)/, '--isolate-rule'));
+    const p = parseArgv(expanded, g, 'pflag');
+    if (hit === undefined && p.errors.length > 0) bad(`betterleaks ${sub}: ${p.errors[0]} (pipegen reads the command with betterleaks v1.9.0's flags and refuses any it doesn't know)`, 'step', 'cli', 'command');
+    if (p.flags.some((f) => f.name === 'config')) bad(pinnedMsg, 'step', 'cli', 'command');
+    out.push(...choiceProblems('betterleaks', e, (k) => g.value.has(k) || g.bool.has(k),
+      (k) => (k === 'config' ? pinnedMsg : forbidden.has(`--${k}`) || k.startsWith('validation') ? `betterleaks must never use --${k}` : null)));
+  }
+  const pinned = fx.config !== undefined && 'flag' in fx.config.passAs && fx.config.passAs.flag === '--config';
+  if (!pinned || (fx.args ?? []).some((a) => a === '-c' || /^-c./.test(a) || flagName(a) === 'config')) bad(pinnedMsg, 'fixedInputs', 'config');
+  for (const k of [...Object.keys(e.step.cli?.env ?? {}), ...Object.keys(fx.env ?? {})]) {
+    bad(/config/i.test(k) ? `${pinnedMsg} (not ${k})` : `betterleaks gets no env (${k}): v1.9.0 reads its config and tokens from it`, 'step', 'cli', 'env');
+  }
+  return out;
+}
+
+/** Nuclei v3.11.1 flags pipegen never passes, by long name → why (cmd/nuclei/main.go at tag v3.11.1). */
+const NUCLEI_UPLOAD = 'nuclei must never upload results or log in to ProjectDiscovery: no -cloud-upload (-cup), -dashboard (-pd), -dashboard-upload (-pdu), -team-id or -auth (catalogue §3)';
+const NUCLEI_TEMPLATES = `nuclei templates come only from the pinned archive: -t ${NUCLEI_TEMPLATES_DIR} and nothing else, in the command and fixedInputs.args (no -w, -turl, -wurl, -config, -tp or -ai)`;
+const NUCLEI_UPDATE = 'nuclei must not update itself or its templates at run time (no -up, -ut, -ud or -reset)';
+const NUCLEI_FORBIDDEN: Readonly<Record<string, string>> = {
+  'cloud-upload': NUCLEI_UPLOAD, dashboard: NUCLEI_UPLOAD, 'dashboard-upload': NUCLEI_UPLOAD, 'team-id': NUCLEI_UPLOAD, auth: NUCLEI_UPLOAD,
+  prompt: NUCLEI_TEMPLATES, config: NUCLEI_TEMPLATES, profile: NUCLEI_TEMPLATES, workflows: NUCLEI_TEMPLATES, 'template-url': NUCLEI_TEMPLATES, 'workflow-url': NUCLEI_TEMPLATES,
+  update: NUCLEI_UPDATE, 'update-templates': NUCLEI_UPDATE, 'update-template-dir': NUCLEI_UPDATE, reset: NUCLEI_UPDATE,
+  'env-vars': 'nuclei must not pass the runner environment into templates (-ev)',
+};
+
+/**
+ * Nuclei (catalogue §3 MG5, §5): `nuclei …` read with v3.11.1's grammar (goflags: parsing stops at the first word
+ * that isn't a flag). -duc (-disable-update-check) in effect, in the command and the fixed args; templates only from
+ * the pinned archive (-t naming its directory only); none of NUCLEI_FORBIDDEN; no flag v3.11.1 doesn't have; and
+ * only pipegen's two template env variables (nuclei reads PDCP_*, ENABLE_CLOUD_UPLOAD, GITHUB_TEMPLATE_REPO,
+ * AWS_TEMPLATE_BUCKET and more from its env: internal/runner/options.go:458-502, runner.go:1129-1130).
+ */
+function nucleiProblems(e: Entry): Problem[] {
+  const out: Problem[] = [];
+  const bad = (message: string, ...path: (string | number)[]) => out.push({ message, path });
+  const fx = e.fixedInputs;
+  const command = e.step.cli?.command ?? [];
+  if (basename(command[0] ?? '') !== 'nuclei') {
+    bad('nuclei runs as `nuclei …` (the pinned binary)', 'step', 'cli', 'command');
+    return out;
+  }
+  const p = parseArgv(command.slice(1), NUCLEI_GRAMMAR, 'goflags');
+  const a = parseArgv(fx.args ?? [], NUCLEI_GRAMMAR, 'goflags');
+  const reasons = new Set<string>();
+  for (const f of [...p.flags, ...a.flags]) {
+    const why = NUCLEI_FORBIDDEN[f.name];
+    if (why !== undefined) reasons.add(why);
+  }
+  for (const why of reasons) bad(why, 'step', 'cli', 'command');
+  if (p.errors.length > 0) bad(`nuclei: ${p.errors[0]} (pipegen reads the command with nuclei v3.11.1's flags and refuses any it doesn't know)`, 'step', 'cli', 'command');
+  if (lastValue(p, 'disable-update-check') !== 'true' || lastValue(a, 'disable-update-check') !== 'true') {
+    bad('nuclei must run with -duc (no update check) in effect, in the command and fixedInputs.args (not another flag\'s value, not after a target, never -duc=false)', 'step', 'cli', 'command');
+  }
+  const dirs = (x: typeof p) => x.flags.filter((f) => f.name === 'templates').flatMap((f) => f.value.split(','));
+  const inCommand = dirs(p);
+  if (!reasons.has(NUCLEI_TEMPLATES) && (inCommand.length === 0 || inCommand.some((d) => d !== NUCLEI_TEMPLATES_DIR) || !dirs(a).includes(NUCLEI_TEMPLATES_DIR))) {
+    bad(NUCLEI_TEMPLATES, 'step', 'cli', 'command');
+  }
+  const allowedEnv = new Set([NUCLEI_TEMPLATES_URL_ENV, NUCLEI_TEMPLATES_SHA256_ENV]);
+  for (const k of new Set([...Object.keys(e.step.cli?.env ?? {}), ...Object.keys(fx.env ?? {})])) {
+    if (!allowedEnv.has(k)) bad(`nuclei gets only ${NUCLEI_TEMPLATES_URL_ENV} and ${NUCLEI_TEMPLATES_SHA256_ENV} in its env, not ${k} (nuclei reads PDCP_*, ENABLE_CLOUD_UPLOAD and template sources from it)`, 'step', 'cli', 'env');
+  }
+  const env = fx.env ?? {};
+  if (!NUCLEI_TEMPLATES_URL_RE.test(env[NUCLEI_TEMPLATES_URL_ENV] ?? '')) {
+    bad(`nuclei needs fixedInputs.env.${NUCLEI_TEMPLATES_URL_ENV}: an official projectdiscovery/nuclei-templates release tarball (a vX.Y.Z tag)`, 'fixedInputs', 'env');
+  }
+  if (!SHA256_RE.test(env[NUCLEI_TEMPLATES_SHA256_ENV] ?? '')) bad(`nuclei needs fixedInputs.env.${NUCLEI_TEMPLATES_SHA256_ENV}: the templates archive's sha256`, 'fixedInputs', 'env');
+  const long = (k: string) => NUCLEI_GRAMMAR.shorts[k] ?? k;
+  out.push(...choiceProblems('nuclei', e, (k) => NUCLEI_GRAMMAR.value.has(long(k)) || NUCLEI_GRAMMAR.bool.has(long(k)),
+    (k) => NUCLEI_FORBIDDEN[long(k)] ?? (['templates', 'disable-update-check'].includes(long(k)) ? `the AI may not choose nuclei's -${k}` : null)));
+  return out;
 }
 
 /** Plugins: npm or pip packages next to an npm or pip tool, each exact and hashed, at most MAX_PLUGINS, never the tool itself. */
@@ -501,76 +792,6 @@ function pluginProblems(kind: string, inst: Install, plugins: readonly Install[]
     if (seen.has(name)) out.push({ message: `the plugin ${p.package} is listed twice`, path: at(i, 'package') });
     seen.add(name);
   });
-  return out;
-}
-
-/** betterleaks (catalogue §3 PC2, ruling PS34): pipegen's pinned --config only, and none of BETTERLEAKS_FORBIDDEN_FLAGS. */
-function betterleaksProblems(e: Entry): { message: string; path: (string | number)[] }[] {
-  const out: { message: string; path: (string | number)[] }[] = [];
-  const fx = e.fixedInputs;
-  const flags = [...(e.step.cli?.command ?? []), ...(fx.args ?? []), ...Object.values(e.choices).flat()].filter((a) => a.startsWith('-')).map(flagName);
-  const names = [...flags, ...Object.keys(e.choices).map(flagName)];
-  const envKeys = [...Object.keys(e.step.cli?.env ?? {}), ...Object.keys(fx.env ?? {})];
-  for (const f of BETTERLEAKS_FORBIDDEN_FLAGS) {
-    const name = flagName(f);
-    if (names.includes(name) || envKeys.some((k) => lower(k).includes(name.replace(/-/g, '_')))) {
-      out.push({ message: `betterleaks must never use ${f} (it sends candidate secrets out or loads the repo's config; catalogue §3)`, path: ['step', 'cli', 'command'] });
-    }
-  }
-  const pinned = fx.config !== undefined && 'flag' in fx.config.passAs && fx.config.passAs.flag === '--config';
-  const other = [...(e.step.cli?.command ?? []), ...(fx.args ?? [])].some((a) => a === '-c' || /^-c./.test(a) || flagName(a) === 'config')
-    || envKeys.some((k) => /^(?:better|git)leaks_config/i.test(k));
-  if (!pinned || other) out.push({ message: "betterleaks runs with pipegen's pinned --config (fixedInputs.config passed as --config) and no other config", path: ['fixedInputs', 'config'] });
-  return out;
-}
-
-/**
- * Nuclei (catalogue §3 MG5, §5): -duc fixed; templates only from the pinned archive, with -t naming its directory only;
- * no upload to ProjectDiscovery's cloud (-dashboard, -cloud, -pd, PDCP_* settings) and no update at run time.
- */
-function nucleiProblems(e: Entry): { message: string; path: (string | number)[] }[] {
-  const out: { message: string; path: (string | number)[] }[] = [];
-  const bad = (message: string, ...path: (string | number)[]) => out.push({ message, path });
-  const fx = e.fixedInputs;
-  const command = e.step.cli?.command ?? [];
-  const args = fx.args ?? [];
-  const env = fx.env ?? {};
-  const all = [...command, ...args, ...Object.values(e.choices).flat()];
-  const names = [...all.filter((a) => a.startsWith('-')).map(flagName), ...Object.keys(e.choices).map(flagName)];
-
-  if (!command.includes('-duc') || !args.includes('-duc') || all.some((a) => a.includes('=') && ['duc', 'disable-update-check'].includes(flagName(a)))) {
-    bad('nuclei must run with -duc (no update check) in the command and fixedInputs.args, and never -duc=…', 'step', 'cli', 'command');
-  }
-  if (names.some((n) => ['dashboard', 'cloud', 'pd', 'pdu', 'dashboard-upload', 'cloud-upload'].includes(n))) {
-    bad('nuclei must never upload results: no -dashboard, -cloud or -pd (catalogue §3)', 'step', 'cli', 'command');
-  }
-  if ([...Object.keys(e.step.cli?.env ?? {}), ...Object.keys(env)].some((k) => /^pdcp_/i.test(k))) {
-    bad('nuclei gets no PDCP_ settings (they turn on the ProjectDiscovery cloud upload)', 'step', 'cli', 'env');
-  }
-  if (names.some((n) => ['ut', 'update-templates', 'up', 'update', 'ud', 'update-template-dir'].includes(n))) {
-    bad('nuclei must not update itself or its templates at run time (no -ut, -up or -ud)', 'step', 'cli', 'command');
-  }
-  // every template or workflow location is the verified directory, in the command and the fixed args
-  const locations = (xs: readonly string[]) => {
-    const found: string[] = [];
-    xs.forEach((a, i) => {
-      if (!a.startsWith('-')) return;
-      const n = flagName(a);
-      if (!['t', 'templates', 'w', 'workflows', 'tu', 'template-url', 'wu', 'workflow-url'].includes(n)) return;
-      const v = a.includes('=') ? a.slice(a.indexOf('=') + 1) : xs[i + 1] ?? '';
-      found.push(['t', 'templates'].includes(n) ? v : `${n}:${v}`); // anything but -t <dir> fails the check below
-    });
-    return found;
-  };
-  const inCommand = locations(command);
-  const inChoices = Object.keys(e.choices).map(flagName).filter((n) => ['t', 'templates', 'w', 'workflows', 'tu', 'template-url', 'wu', 'workflow-url'].includes(n));
-  if (inCommand.length === 0 || inCommand.some((v) => v !== NUCLEI_TEMPLATES_DIR) || !locations(args).includes(NUCLEI_TEMPLATES_DIR) || inChoices.length > 0) {
-    bad(`nuclei templates come only from the pinned archive: -t ${NUCLEI_TEMPLATES_DIR} and nothing else, in the command and fixedInputs.args (no -tu, -w or -wu)`, 'step', 'cli', 'command');
-  }
-  if (!NUCLEI_TEMPLATES_URL_RE.test(env[NUCLEI_TEMPLATES_URL_ENV] ?? '')) {
-    bad(`nuclei needs fixedInputs.env.${NUCLEI_TEMPLATES_URL_ENV}: an official projectdiscovery/nuclei-templates release tarball (a vX.Y.Z tag)`, 'fixedInputs', 'env');
-  }
-  if (!SHA256_RE.test(env[NUCLEI_TEMPLATES_SHA256_ENV] ?? '')) bad(`nuclei needs fixedInputs.env.${NUCLEI_TEMPLATES_SHA256_ENV}: the templates archive's sha256`, 'fixedInputs', 'env');
   return out;
 }
 
@@ -708,47 +929,107 @@ export function nearDuplicate(repo: string, list: ReviewedTool[]): ReviewedTool 
   }) ?? null;
 }
 
+/** A never-list hit: the key it matched, why, and the `owner/name` (or image name) read from the reference. */
+export type NeverHit = { key: string; reason: string; ref: string };
+
 /**
- * The never-list check (Plan P Task 5): whether a reference names a NEVER_REPOS entry → that entry, its reason and the
- * `owner/name` read from the reference; else null. A reference is a repo (`owner/name`), a `uses:` value (any sub-path,
- * `@ref`), an image (`[registry/]owner/name[:tag][@digest]`, `docker://…`, any registry host) or a URL
- * (`https://github.com/owner/name/…`, raw.githubusercontent.com, api.github.com/repos/…). Letter case doesn't matter,
- * and look-alike letters fold first (NFKC). A look-alike is refused too: within Levenshtein distance 2 of a listed
- * `owner/name`, or an owner within distance 2 of a listed `owner/*`.
+ * The never-list check (Plan P Task 5, fix round 1): whether a reference names a NEVER_REPOS repo → the hit; else
+ * null. A reference is a repo (`owner/name`), a `uses:` value (any sub-path, `@ref`), an npm `@scope/name`, an image
+ * (`[registry/]owner/name[:tag][@digest]`, `docker://…`) or a URL (`https://github.com/owner/name/…`,
+ * raw.githubusercontent.com, api.github.com/repos/…). It is read the way the server would: NFKC-folded, lower case,
+ * percent-decoded (a broken escape is refused), dot segments resolved. Refused:
+ * - a listed `owner/name`, or any repo of a listed `owner/*`;
+ * - a never-list name under any owner, or that name followed by `-…` (NEVER_NAMES), unless NEVER_NAME_ALLOW has it;
+ * - look-alikes: a full name within Levenshtein distance 2 of a listed one, an owner within 2 of a listed `owner/*`,
+ *   or a name of 10 or more characters within 2 of a never-list name;
+ * - a repo named by its numeric id (api.github.com/repositories/<id>): pipegen can't tell which repo that is.
  */
-export function neverListed(ref: unknown): { key: string; reason: string; ref: string } | null {
-  const parts = ownerName(ref);
+export function neverListed(ref: unknown): NeverHit | null {
+  const parts = refParts(ref);
   if (parts === null) return null;
+  if (parts === 'bad-escape') return { key: '(unreadable)', reason: "it has a broken %-escape, so pipegen can't tell which repo it names", ref: String(ref).slice(0, 100) };
+  if (parts === 'repo-id') return { key: '(repo by id)', reason: "it names a GitHub repo by its numeric id, so pipegen can't tell which repo it is", ref: String(ref).slice(0, 100) };
   const [owner, name] = parts;
   const full = name === undefined ? owner : `${owner}/${name}`;
   const found = (key: string) => ({ key, reason: NEVER_REPOS[key] as string, ref: full });
   if (name !== undefined && NEVER_REPOS[full] !== undefined) return found(full);
   if (NEVER_REPOS[`${owner}/*`] !== undefined) return found(`${owner}/*`);
+  if (name !== undefined && !NEVER_NAME_ALLOW.has(full)) {
+    for (const [family, key] of NEVER_NAMES) if (name === family || name.startsWith(`${family}-`)) return found(key);
+  }
   for (const key of Object.keys(NEVER_REPOS)) {
     const [keyOwner, keyName] = key.split('/') as [string, string];
     if (keyName === '*' ? levenshtein(owner, keyOwner) <= 2 : name !== undefined && Math.abs(full.length - key.length) <= 2 && levenshtein(full, key) <= 2) return found(key);
   }
+  if (name !== undefined && !NEVER_NAME_ALLOW.has(full)) {
+    for (const [family, key] of NEVER_NAMES) if (family.length >= 10 && Math.abs(name.length - family.length) <= 2 && levenshtein(name, family) <= 2) return found(key);
+  }
   return null;
 }
 
-/** The `owner` and `name` a reference points at (see neverListed), lower case; null when there is no owner. */
-function ownerName(ref: unknown): [string, string | undefined] | null {
+/**
+ * The image check (P11): whether an image reference's name (the last part of its path, any registry, any namespace)
+ * is in NEVER_IMAGES → the hit; else null. `aquasec/tfsec-ci:latest`, `ghcr.io/aquasecurity/trivy@sha256:…` and
+ * `docker://checkmarx/kics` are all refused.
+ */
+export function neverImage(ref: unknown): NeverHit | null {
   if (typeof ref !== 'string' || ref.length > 2048) return null;
-  let s = lower(ref.normalize('NFKC').trim()).replace(/^docker:\/\//, '');
+  const s = decodeRef(ref);
+  if (s === null) return { key: '(unreadable)', reason: "it has a broken %-escape, so pipegen can't tell which image it names", ref: ref.slice(0, 100) };
+  const path = s.replace(/^docker:\/\//, '').replace(/@sha256:[0-9a-f]*$/, '');
+  const last = (path.split('/').pop() ?? '').replace(/[:@].*$/, '');
+  const reason = NEVER_IMAGES[last];
+  return reason === undefined ? null : { key: last, reason, ref: path.slice(0, 100) };
+}
+
+/** NFKC-folded, trimmed, lower case and percent-decoded (until stable); null when an escape is broken. */
+function decodeRef(ref: string): string | null {
+  let s = lower(ref.normalize('NFKC').trim());
+  for (let i = 0; i < 3 && s.includes('%'); i++) {
+    try {
+      const d = decodeURIComponent(s);
+      if (d === s) break;
+      s = lower(d.normalize('NFKC'));
+    } catch {
+      return null;
+    }
+  }
+  return s;
+}
+
+/** Path segments with `.` and `..` resolved (a `..` above the start is dropped, as a URL resolver does) and empty ones removed. */
+function resolveDots(segs: readonly string[]): string[] {
+  const out: string[] = [];
+  for (const s of segs) {
+    if (s === '' || s === '.') continue;
+    if (s === '..') out.pop();
+    else out.push(s);
+  }
+  return out;
+}
+
+/** The `owner` and `name` a reference points at (see neverListed), lower case; null when there is no owner. */
+function refParts(ref: unknown): [string, string | undefined] | 'bad-escape' | 'repo-id' | null {
+  if (typeof ref !== 'string' || ref.length > 2048) return null;
+  const decoded = decodeRef(ref);
+  if (decoded === null) return 'bad-escape';
+  const s = decoded.replace(/^docker:\/\//, '');
   let segs: string[];
-  const url = /^[a-z][a-z0-9+.-]*:\/\/(?:[^@/]*@)?([^/?#]+)\/?([^?#]*)/.exec(s);
+  const url = /^[a-z][a-z0-9+.-]*:\/\/(?:[^@/]*@)?([^/?#]+)([^?#]*)/.exec(s);
   if (url !== null) {
-    segs = (url[2] ?? '').split('/');
-    if (url[1] === 'api.github.com' && segs[0] === 'repos') segs.shift();
+    const host = (url[1] ?? '').replace(/:\d+$/, '');
+    segs = resolveDots((url[2] ?? '').split('/'));
+    if (host === 'api.github.com' && segs[0] === 'repositories') return 'repo-id';
+    if (host === 'api.github.com' && segs[0] === 'repos') segs.shift();
     if (segs[0] === 'v2') segs.shift(); // a registry API path (ghcr.io/v2/owner/name/…)
   } else {
-    s = s.replace(/^git@[^:/]+:/, '');
-    segs = s.split('/');
-    // an image's registry host (docker.io, ghcr.io, quay.io, localhost:5000, …)
+    segs = resolveDots(s.replace(/^git@[^:/]+:/, '').split('/'));
+    // an image's registry host (docker.io, ghcr.io, quay.io, localhost:5000, …) or a URL host without its scheme
     if (segs.length > 2 && /[.:]|^localhost$/.test(segs[0] ?? '')) segs.shift();
+    if (segs[0] === 'repos') segs.shift();
+    if (segs[0] === 'repositories' && /^\d+$/.test(segs[1] ?? '')) return 'repo-id';
   }
-  segs = segs.filter((x) => x !== '' && x !== '.');
-  const owner = segs[0]?.replace(/[@:#?].*$/, '');
+  const owner = segs[0]?.replace(/^@/, '').replace(/[@:#?].*$/, ''); // an npm @scope is its owner
   if (owner === undefined || owner === '') return null;
   const name = segs[1]?.replace(/[@:#?].*$/, '').replace(/\.git$/, '');
   return [owner, name === '' ? undefined : name];

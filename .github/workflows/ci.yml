@@ -82,7 +82,7 @@ jobs:
         run: |
           set -euo pipefail
           script_url=https://raw.githubusercontent.com/rhysd/actionlint/914e7df21a07ef503a81201c76d2b11c789d3fca/scripts/download-actionlint.bash
-          curl -fsSL "$script_url" -o "$RUNNER_TEMP/download-actionlint.bash"
+          curl --proto '=https' --proto-redir '=https' -fsSL "$script_url" -o "$RUNNER_TEMP/download-actionlint.bash"
           echo "72fa3e45ac20f3c3a512d6747b4fcf719e21f890e8c43e78d48a41fdfb900c4e  $RUNNER_TEMP/download-actionlint.bash" | sha256sum -c -
           bash "$RUNNER_TEMP/download-actionlint.bash" 1.7.12 "$RUNNER_TEMP"
           echo "c872d6db8c6bf83a8eaa704fc93999f027d55dffbc63b8a6abdccb47df5f4cd4  $RUNNER_TEMP/actionlint" | sha256sum -c -
@@ -94,7 +94,7 @@ jobs:
         run: |
           set -euo pipefail
           url=https://github.com/zizmorcore/zizmor/releases/download/v1.31.1/zizmor-x86_64-unknown-linux-gnu.tar.gz
-          curl -fsSL "$url" -o "$RUNNER_TEMP/zizmor.tar.gz"
+          curl --proto '=https' --proto-redir '=https' -fsSL "$url" -o "$RUNNER_TEMP/zizmor.tar.gz"
           echo "d185f726bdaf92df78273217dfdd24ebcd6b0ef48cf3ce776ff5762b6e138c99  $RUNNER_TEMP/zizmor.tar.gz" | sha256sum -c -
           tar -xzf "$RUNNER_TEMP/zizmor.tar.gz" -C "$RUNNER_TEMP" zizmor
           echo "dc3bb05237ddd11c62ac19cf5ac1c633acd228e386b7e18f9adb3498873d271f  $RUNNER_TEMP/zizmor" | sha256sum -c -
