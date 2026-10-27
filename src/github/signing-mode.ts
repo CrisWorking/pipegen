@@ -6,8 +6,9 @@ export type SigningMode = 'keyless' | 'attest' | 'key-env' | 'none';
 
 /**
  * public → keyless (public logs are fine); private + attestations (Enterprise) → GitHub artifact attestations;
- * private + environments (Pro/Team) → a cosign key kept in a protected environment; else (private Free) → none,
- * because a repo secret could be read from any branch and the signature would prove little.
+ * private + environments → a cosign key kept in a protected environment; else → none, because a repo secret could be
+ * read from any branch and the signature would prove little. `caps.environments` is probed (Plan A Task 6), and spike
+ * S3 found environments on Free private repos too, so key-env can be the answer there (DECISIONS #86).
  */
 export function signingMode(p: RepoProfile, caps: Capabilities): SigningMode {
   if (!p.private) return 'keyless';
