@@ -26,7 +26,7 @@ import { lstat } from 'node:fs/promises';
 import { join } from 'node:path';
 import type { Octokit } from '@octokit/rest';
 import { count } from '../ai/errors.js';
-import { AiError, refusalFallbackNoteFor, type AiErrorKind } from '../ai/provider.js';
+import { AiError, COST_CAP_MESSAGE, refusalFallbackNoteFor, type AiErrorKind } from '../ai/provider.js';
 import {
   bundleCode, COUNTING_ONLY_NOTE, EXCLUDED_PATTERNS, findSecretLike, GitleaksError, isExcludedPath, redact, scrubKnownValues, type CodeBundle,
 } from '../ai/redact.js';
@@ -34,10 +34,12 @@ import { needLanguage, suggestTools } from '../engine/discover.js';
 import type { RateBudget } from '../engine/github-rate.js';
 import { ensurePinnedBinary, PinnedBinaryError } from '../engine/linters.js';
 import type { MemoryStore } from '../engine/memory.js';
-import { floorNeeds, isRunnable, jobCategories, planNeeds, type NeedsPlan } from '../engine/needs.js';
+import { floorNeeds, isRunnable, jobCategories, needsPromptBytes, planNeeds, type NeedsPlan } from '../engine/needs.js';
 import type { QualityBar } from '../engine/quality-bar.js';
 import { projectScriptFor, reviewedFor, type ProjectScriptStep } from '../engine/reviewed.js';
-import { activity30d, auditCallHighUsd, estimate, usageCostUsd, type Activity, type Estimates } from '../estimate/estimate.js';
+import {
+  activity30d, aiRequestBytes, estimate, requestCeilingUsd, usageCeilingUsd, type Activity, type Estimates,
+} from '../estimate/estimate.js';
 import { signingMode } from '../github/signing-mode.js';
 import { IGNORED_DIRS, listFiles, READ_LIMITS, readTextLimited, readTextLimitedWithReason } from '../read/limits.js';
 import { readProject } from '../read/project.js';
@@ -110,7 +112,7 @@ export interface AuditAi {
   suggestions: PipelineDraft['suggestions'];
   /** Planner, discovery and AI-step notes; deduped. */
   notes: string[];
-  /** Every AI call of this step, summed (the needs call and every discovery call, failed ones included; ruling B2). */
+  /** Every AI attempt of this step, summed by the spend meter (the needs call, its retry and every discovery attempt, failed ones included; rulings B2, U13). */
   usage: Required<AiUsage>;
 }
 
@@ -173,7 +175,8 @@ const MAX_SCAN_BYTES = 200_000_000;
 const SKIPPED_DIRS_NOTE = `The secrets scan did not check dependency and build folders (${IGNORED_DIRS.filter((d) => d !== '.git').join(', ')}) or .git, so committed build output was not checked either.`;
 const UNTRACKED_NOTE = "pipegen reads the files on disk without git, so files that aren't committed (for example a local .env) are in this list too.";
 
-const NO_TOKEN = 'No token: public data only, rate-limited.';
+// Worded so redact() leaves it whole at output ("No token: …" would be cut; review M3).
+const NO_TOKEN = 'Without a GitHub token, pipegen reads public data only and is rate-limited.';
 /**
  * Ruling U12: the `.npmrc` keys that can't change which pipegen npx fetches or how it starts it (npm's config docs):
  * saving, lockfile, engine and output settings. Any other key warns: registries (any scope), proxies, TLS (`strict-ssl`,
@@ -474,7 +477,10 @@ export interface AiSuggestDeps {
   ensureGitleaks?: () => Promise<string>;
   /** No GitHub token: the search may stop early (ruling S17). */
   anonymous: boolean;
-  /** estimateAuditAi(provider, needCount).capUsd: the AI cost cap of this step; null for a local model (no cap; ruling B2). */
+  /**
+   * estimateAuditAi(provider, needCount, needsRequestBytes(r, knownValues)).capUsd, exactly as the consent screen showed
+   * it: a hard cap on this step's AI spend (rulings B2, U13). null for a local model (no cap).
+   */
   capUsd: number | null;
 }
 
@@ -487,8 +493,8 @@ const AI_NOTE = {
   stopped: (why: string) => `The AI step stopped: ${why}.`,
   searchStopped: (why: string) => `The tool search stopped: ${why}.`,
   fallbackTried: "Claude's refusal fallback had already run the request again on another Claude model, and it was declined there too.",
-  capSkip: (cap: number) => `pipegen skipped the tool search: one more AI call could pass this run's AI cost cap (${usd(cap)}).`,
-  capStop: (cap: number) => `pipegen stopped asking the AI for tool suggestions: one more call could pass this run's AI cost cap (${usd(cap)}). The search went on without the AI.`,
+  /** The needs call (or its retry) didn't fit the cap: no AI call was made for it (ruling U13). */
+  needsCapped: (cap: number) => `The AI step stopped: ${AI_KIND_TEXT['cost-cap']} (${usd(cap)}).`,
 } as const;
 /** Ruling S16: what each AI failure means, in plain words (pipegen's own text, never the provider's). */
 const AI_KIND_TEXT: Readonly<Record<AiErrorKind, string>> = {
@@ -498,23 +504,29 @@ const AI_KIND_TEXT: Readonly<Record<AiErrorKind, string>> = {
   missing: 'no AI provider is set up',
   refusal: 'the AI declined the request',
   truncated: "the AI's answer was cut off",
+  'cost-cap': 'one more AI call could pass the AI cost limit you agreed to',
 };
-/** The message of the AiError the cost meter raises; discovery then asks the AI nothing more (an http-kind stop). */
-const CAP_MESSAGE = "one more AI call could pass this run's AI cost cap";
 const usd = (n: number) => `$${n.toFixed(2)}`;
 
 /** Need identity (layer, id, service), as the needs planner keys it. */
 const needKey = (n: Pick<Need, 'layer' | 'id' | 'service'>) => `${n.layer}\u0000${n.id}\u0000${n.service ?? ''}`;
 
 /**
- * The provider every AI call of this step goes through: it prices each answered attempt (failed ones too) with the
- * estimate's price list, and refuses a discovery call when its estimated high end could take the spend past the cap
- * (AiError 'http', which makes discovery stop asking the AI and go on with search results). The needs call is never
- * refused: the cap is sized for it (ruling B2).
+ * The audit's AI spend meter (ruling U13), the single record of what the AI calls of this step used (review M1). Every
+ * attempt goes through `provider` (planNeeds and suggestTools get it; completeValidated's retries are attempts of their
+ * own), and before one is sent the meter reserves its worst case (requestCeilingUsd: every byte a token, the full output
+ * limit, the highest price it could bill at). An attempt that doesn't fit (spent + reserved + its worst case > cap) is
+ * refused with AiError('cost-cap') and never sent, the needs call included. After the attempt, the reservation is swapped
+ * for the cost of its usage at the same prices; an error without usage (a timeout, a dropped connection) keeps the full
+ * reservation, since the provider may still bill what it produced. capUsd null (a local model): nothing is refused.
  */
-class CostMeter {
+export class AiSpendMeter {
+  /** USD settled so far (usage priced at the ceiling rates, plus the reservations of attempts that ended without usage). */
   spentUsd = 0;
-  capHit = false;
+  /** USD reserved for attempts in flight. */
+  reservedUsd = 0;
+  /** Every attempt's usage, summed (failed attempts that reported usage included). */
+  readonly usage: Required<AiUsage> = { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0 };
   /** What planNeeds and suggestTools are given: the same name and model, every call metered (no other field is copied). */
   readonly provider: AiProvider;
   readonly #inner: AiProvider;
@@ -522,30 +534,49 @@ class CostMeter {
     this.#inner = inner;
     this.provider = { name: inner.name, model: inner.model, complete: (req) => this.#complete(req) };
   }
-  /** True when one more discovery call could take the spend past the cap. */
-  nextCallCouldPassCap(): boolean {
-    if (this.capUsd === null) return false;
-    const next = auditCallHighUsd(this.#inner, 'candidates');
-    return next !== 'local' && this.spentUsd + next > this.capUsd;
-  }
   async #complete(req: AiRequest): Promise<{ data: unknown; usage: AiUsage }> {
-    if (req.schemaName !== 'needs' && this.nextCallCouldPassCap()) {
-      this.capHit = true;
-      throw new AiError('http', CAP_MESSAGE);
+    let reserved = 0;
+    if (this.capUsd !== null) {
+      const worst = requestCeilingUsd(this.#inner, aiRequestBytes(req), req.maxOutputTokens ?? Number.NaN);
+      if (worst !== 'local') {
+        if (!(this.spentUsd + this.reservedUsd + worst <= this.capUsd)) throw new AiError('cost-cap', COST_CAP_MESSAGE);
+        reserved = worst;
+        this.reservedUsd += worst;
+      }
     }
+    let r: { data: unknown; usage: AiUsage };
     try {
-      const r = await this.#inner.complete(req);
-      this.#add(r.usage);
-      return r;
+      r = await this.#inner.complete(req);
     } catch (e) {
-      if (e instanceof AiError && e.usage !== undefined) this.#add(e.usage);
+      if (e instanceof AiError && e.usage !== undefined) this.#settle(reserved, e.usage);
+      else this.#keep(reserved);
       throw e;
     }
+    this.#settle(reserved, r.usage);
+    return r;
   }
-  #add(u: AiUsage): void {
-    const c = usageCostUsd(this.#inner, u);
+  #settle(reserved: number, u: AiUsage): void {
+    this.reservedUsd -= reserved;
+    this.usage.inputTokens += count(u.inputTokens);
+    this.usage.outputTokens += count(u.outputTokens);
+    this.usage.cacheReadTokens += count(u.cacheReadTokens);
+    this.usage.cacheWriteTokens += count(u.cacheWriteTokens);
+    const c = usageCeilingUsd(this.#inner, u);
     if (c !== 'local') this.spentUsd += c;
   }
+  #keep(reserved: number): void {
+    this.reservedUsd -= reserved;
+    this.spentUsd += reserved;
+  }
+}
+
+/**
+ * The needs request's size (UTF-8 bytes) for estimateAuditAi, before consent: the counting bundle's bytes (aiBundle)
+ * plus the rest of the needs prompt. The gitleaks-checked bundle sent after consent is the same files, so the needs
+ * call fits the agreed cap; if it came out larger, the meter refuses the call with a note (nothing is sent).
+ */
+export function needsRequestBytes(r: AuditReport, knownValues: string[]): number {
+  return r.aiBundle.bytes + needsPromptBytes(r.profile, r.capabilities, { knownValues });
 }
 
 /** The service's own test/lint script would run for this need (S27: a service without tests has none for tests). */
@@ -563,20 +594,15 @@ function hasProjectScript(need: Need, p: RepoProfile): boolean {
  *    a gitleaks failure: no AI call, a note.
  * 2. planNeeds(…, writers 0, knownValues): the needs it adds become `extraNeeds`; floor needs are never changed.
  * 3. suggestTools for every floor need that isn't covered, and every added need, that has no project script (it skips
- *    needs a reviewed tool covers). Skipped when the reviewed list is unavailable (look-alike checks need it; B3/U11)
- *    or when one more discovery call could pass the cost cap (B2).
+ *    needs a reviewed tool covers). Skipped when the reviewed list is unavailable (look-alike checks need it; B3/U11).
+ * Every AI attempt goes through an AiSpendMeter: a hard cap at `deps.capUsd` (ruling U13). An attempt that could pass it
+ * is never sent: the needs call then stops the AI step with a note; a discovery call stops asking the AI (one note).
  * An AiError never escapes (S16): it becomes a note, and its billed usage still counts. Other errors are thrown.
  */
 export async function addAiSuggestions(r: AuditReport, dir: string, deps: AiSuggestDeps): Promise<AuditReport> {
   const notes = new Set<string>();
-  const usage: Required<AiUsage> = { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0 };
-  const addUsage = (u: AiUsage | undefined) => {
-    if (u === undefined) return;
-    usage.inputTokens += count(u.inputTokens);
-    usage.outputTokens += count(u.outputTokens);
-    usage.cacheReadTokens += count(u.cacheReadTokens);
-    usage.cacheWriteTokens += count(u.cacheWriteTokens);
-  };
+  // every AI attempt goes through the meter: the one record of usage and the hard cap (ruling U13, review M1)
+  const meter = new AiSpendMeter(deps.ai, deps.capUsd);
   let extraNeeds: Need[] = [];
   let suggestions: PipelineDraft['suggestions'] = [];
   const known = deps.knownValues.filter((v) => typeof v === 'string' && v.trim() !== '');
@@ -591,7 +617,7 @@ export async function addAiSuggestions(r: AuditReport, dir: string, deps: AiSugg
         // fail closed: no suggestion without the full reviewed list (B3/U11)
         suggestions: r.reviewedUnavailable ? [] : suggestions.map((x) => ({ name: scrub(x.name), repo: scrub(x.repo), why: scrub(x.why) })),
         notes: [...new Set([...notes].map(scrub))],
-        usage,
+        usage: { ...meter.usage },
       },
     };
   };
@@ -610,18 +636,15 @@ export async function addAiSuggestions(r: AuditReport, dir: string, deps: AiSugg
   for (const n of bundle.notes) if (!reportNotes.has(redact(n))) notes.add(n);
 
   // 2. The needs the AI adds.
-  const meter = new CostMeter(deps.ai, deps.capUsd);
   let plan: NeedsPlan;
   try {
     plan = await planNeeds(r.profile, r.capabilities, bundle, meter.provider, 0, { knownValues: deps.knownValues });
   } catch (e) {
     if (!(e instanceof AiError)) throw e;
-    addUsage(e.usage);
-    notes.add(AI_NOTE.stopped(AI_KIND_TEXT[e.kind]));
+    notes.add(e.kind === 'cost-cap' && deps.capUsd !== null ? AI_NOTE.needsCapped(deps.capUsd) : AI_NOTE.stopped(AI_KIND_TEXT[e.kind]));
     if (e.kind === 'refusal' && refusalFallbackNoteFor(deps.ai) !== null) notes.add(AI_NOTE.fallbackTried);
     return done();
   }
-  addUsage(plan.usage);
   for (const n of plan.notes) notes.add(n);
   const floor = new Set(floorNeeds(r.profile, r.capabilities).map(needKey));
   extraNeeds = plan.needs.filter((n) => !floor.has(needKey(n)));
@@ -634,22 +657,19 @@ export async function addAiSuggestions(r: AuditReport, dir: string, deps: AiSugg
   // Extra needs have no coverage row: they count as not covered.
   const search = [...r.coverage.filter((c) => c.status !== 'covered').map((c) => c.need), ...extraNeeds].filter((n) => !hasProjectScript(n, r.profile));
   if (search.length === 0) return done();
-  if (meter.nextCallCouldPassCap()) {
-    notes.add(AI_NOTE.capSkip(deps.capUsd as number));
-    return done();
-  }
+  // A discovery call that doesn't fit the cap is refused by the meter (AiError 'cost-cap'); discovery then asks the AI
+  // nothing more, gives one note, and goes on with search results only.
   const found: string[] = [];
   try {
     suggestions = await suggestTools(search, r.profile, {
       ai: meter.provider, gh: deps.gh, memory: deps.memory, fetch: deps.fetch, reviewed: deps.reviewed, mode: 'audit', bar: deps.bar,
-      budget: deps.budget, now: deps.now, ...(deps.sleep === undefined ? {} : { sleep: deps.sleep }), notes: found, onUsage: addUsage,
+      budget: deps.budget, now: deps.now, ...(deps.sleep === undefined ? {} : { sleep: deps.sleep }), notes: found,
     });
   } catch (e) {
+    // defensive: discovery handles AI errors per need. Its usage was already recorded by the meter, attempt by attempt.
     if (!(e instanceof AiError)) throw e;
-    addUsage(e.usage);
     notes.add(AI_NOTE.searchStopped(AI_KIND_TEXT[e.kind]));
   }
   for (const n of found) notes.add(n);
-  if (meter.capHit) notes.add(AI_NOTE.capStop(deps.capUsd as number));
   return done();
 }

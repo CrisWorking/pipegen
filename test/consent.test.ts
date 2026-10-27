@@ -65,7 +65,7 @@ const full = (over: { p?: RepoProfile; ai?: AiProvider; exists?: [boolean, boole
 };
 const audit = (ai: AiProvider = claude, extra: { p?: RepoProfile; bundle?: BundleSummary } = {}) => {
   const p = extra.p ?? profile();
-  const est = estimateAuditAi(ai, 3);
+  const est = estimateAuditAi(ai, 3, 50_000);
   const text = consentText(p, ai, est, extra.bundle ?? bundle, permissionsTable('read'), [], 'audit-ai', { gitleaksVersion: '8.30.1' });
   return { p, est, text };
 };
@@ -271,7 +271,7 @@ describe('consentText (audit-ai, ruling B2)', () => {
 
   it('consent: audit-ai mode ignores repos and refuses write permissions', () => {
     const p = profile();
-    const est = estimateAuditAi(claude, 3);
+    const est = estimateAuditAi(claude, 3, 50_000);
     const text = consentText(p, claude, est, bundle, permissionsTable('read'), repos(p, [false, false]), 'audit-ai', { gitleaksVersion: '8.30.1' });
     expect(text).not.toMatch(/pipelines|pipegen-proof|gh repo create/);
     expect(() => consentText(p, claude, est, bundle, permissionsTable('write', { appCreatesRepos: false }), [], 'audit-ai', { gitleaksVersion: '8.30.1' })).toThrow(/read-only/);
@@ -295,7 +295,7 @@ describe('consent facts tied to their sources (final review batch 2, I1)', () =>
 
   it('consent: only a BundleSummary made by bundleSummary() is accepted', () => {
     const p = profile();
-    const est = estimateAuditAi(claude, 3);
+    const est = estimateAuditAi(claude, 3, 50_000);
     const fake = { files: 1, bytes: 1, topFolders: [] };
     // @ts-expect-error a plain object is not a BundleSummary (it has no private brand)
     expect(() => consentText(p, claude, est, fake, permissionsTable('read'), [], 'audit-ai', { gitleaksVersion: '8.30.1' })).toThrow(/bundleSummary/);
@@ -313,15 +313,15 @@ describe('consent facts tied to their sources (final review batch 2, I1)', () =>
     const opusFull = fullEst(p, claude);
     expect(() => consentText(p, fable, opusFull, bundle, permissionsTable('write', { appCreatesRepos: false }), repos(p, [true, true]), 'full', { appCreatesRepos: false, gitleaksVersion: '8.30.1' }))
       .toThrow(/priced for claude \/ claude-opus-5-5.*claude \/ claude-fable-5-1/);
-    expect(() => consentText(p, openai, estimateAuditAi(claude, 3), bundle, permissionsTable('read'), [], 'audit-ai', { gitleaksVersion: '8.30.1' })).toThrow(/priced for/);
+    expect(() => consentText(p, openai, estimateAuditAi(claude, 3, 50_000), bundle, permissionsTable('read'), [], 'audit-ai', { gitleaksVersion: '8.30.1' })).toThrow(/priced for/);
     // an estimate with no provider can't back a consent screen that sends code to one
     const none = estimate(p, jobCategories(floorNeeds(p, CAPS)), 2, { pushes: 1, prs: 1, capped: false }, null);
     expect(() => consentText(p, claude, none, bundle, permissionsTable('write', { appCreatesRepos: false }), repos(p, [true, true]), 'full', { appCreatesRepos: false, gitleaksVersion: '8.30.1' })).toThrow(/priced for no AI provider/);
     // Ollama: the estimate must be for the same host (its basis says where the model runs)
     const remote = ollamaAt('gpu.example.net:11434');
-    expect(() => consentText(p, remote, estimateAuditAi({ name: 'ollama', model: 'llama3.1' }, 3), bundle, permissionsTable('read'), [], 'audit-ai', { gitleaksVersion: '8.30.1' })).toThrow(/priced for/);
-    expect(() => consentText(p, remote, estimateAuditAi(ollama, 3), bundle, permissionsTable('read'), [], 'audit-ai', { gitleaksVersion: '8.30.1' })).toThrow(/priced for/);
-    expect(consentText(p, remote, estimateAuditAi(remote, 3), bundle, permissionsTable('read'), [], 'audit-ai', { gitleaksVersion: '8.30.1' })).toContain('gpu.example.net:11434');
+    expect(() => consentText(p, remote, estimateAuditAi({ name: 'ollama', model: 'llama3.1' }, 3, 50_000), bundle, permissionsTable('read'), [], 'audit-ai', { gitleaksVersion: '8.30.1' })).toThrow(/priced for/);
+    expect(() => consentText(p, remote, estimateAuditAi(ollama, 3, 50_000), bundle, permissionsTable('read'), [], 'audit-ai', { gitleaksVersion: '8.30.1' })).toThrow(/priced for/);
+    expect(consentText(p, remote, estimateAuditAi(remote, 3, 50_000), bundle, permissionsTable('read'), [], 'audit-ai', { gitleaksVersion: '8.30.1' })).toContain('gpu.example.net:11434');
   });
 });
 

@@ -1,6 +1,6 @@
 // OpenAI adapter (experimental). Plain fetch to the fixed Chat Completions URL; no SDK. Redirects are refused.
 import type { AiProvider, AiRequest, AiUsage } from '../types.js';
-import { AiError, count, safeCode, withTimeout } from './errors.js';
+import { AiError, count, outputLimit, safeCode, withTimeout } from './errors.js';
 
 /** Fixed: the key is only ever sent here. */
 export const OPENAI_URL = 'https://api.openai.com/v1/chat/completions';
@@ -27,6 +27,7 @@ export function openaiProvider(opts: OpenAiOptions): AiProvider {
     name: 'openai',
     model: opts.model,
     async complete(req: AiRequest) {
+      const limit = outputLimit(req.maxOutputTokens); // reasoning tokens count toward it too
       const answer = await withTimeout(req.timeoutMs, 'OpenAI', async (signal) => {
         let res: Response;
         try {
@@ -39,6 +40,7 @@ export function openaiProvider(opts: OpenAiOptions): AiProvider {
               model: opts.model,
               messages: [{ role: 'system', content: req.system }, { role: 'user', content: req.user }],
               response_format: { type: 'json_schema', json_schema: { name: req.schemaName, schema: req.jsonSchema, strict: true } },
+              ...(limit === undefined ? {} : { max_completion_tokens: limit }),
             }),
           });
         } catch (e) {

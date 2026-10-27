@@ -2,7 +2,7 @@
 // refused: the consent screen names the host the code goes to, and a 307/308 would re-send it somewhere else.
 import type { AiProvider, AiRequest, AiUsage } from '../types.js';
 import { safeText } from '../util/safe-text.js';
-import { AiError, count, withTimeout } from './errors.js';
+import { AiError, count, outputLimit, withTimeout } from './errors.js';
 
 export const OLLAMA_DEFAULT_HOST = 'http://127.0.0.1:11434';
 export const OLLAMA_DEFAULT_MODEL = 'llama3.1';
@@ -58,6 +58,7 @@ export function ollamaProvider(opts: OllamaOptions = {}): OllamaProvider {
     model,
     host: where,
     async complete(req: AiRequest) {
+      const limit = outputLimit(req.maxOutputTokens); // free locally, but it bounds the time
       const answer = await withTimeout(req.timeoutMs, 'Ollama', async (signal) => {
         let res: Response;
         try {
@@ -71,7 +72,7 @@ export function ollamaProvider(opts: OllamaOptions = {}): OllamaProvider {
               messages: [{ role: 'system', content: req.system }, { role: 'user', content: req.user }],
               format: req.jsonSchema,
               stream: false,
-              options: { num_ctx: numCtx },
+              options: { num_ctx: numCtx, ...(limit === undefined ? {} : { num_predict: limit }) },
             }),
           });
         } catch (e) {

@@ -24,8 +24,9 @@ describe('module graph (final review M6)', () => {
     }
   });
 
-  it('module graph: local-host.ts and discovery-limits.ts are leaves (no imports)', async () => {
+  it('module graph: local-host.ts, claude-fallback.ts and discovery-limits.ts are leaves (no imports)', async () => {
     expect(await graph('src/util/local-host.ts')).toEqual(['src/util/local-host.ts']);
+    expect(await graph('src/util/claude-fallback.ts')).toEqual(['src/util/claude-fallback.ts']);
     expect(await graph('src/engine/discovery-limits.ts')).toEqual(['src/engine/discovery-limits.ts']);
   });
 
@@ -39,7 +40,7 @@ describe('module graph (final review M6)', () => {
     for (const net of ['src/engine/discover.ts', 'src/engine/http.ts', 'src/engine/stats.ts']) expect(files).not.toContain(net);
     expect(files).toEqual([
       'src/engine/discovery-limits.ts', 'src/engine/github-rate.ts', 'src/estimate/estimate.ts', 'src/types.ts',
-      'src/util/local-host.ts', 'src/util/package-data.ts', 'src/util/safe-text.ts',
+      'src/util/claude-fallback.ts', 'src/util/local-host.ts', 'src/util/package-data.ts', 'src/util/safe-text.ts',
     ]);
   });
 });

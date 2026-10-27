@@ -7,7 +7,7 @@ import { AiError, count } from './errors.js';
 import { ollamaProvider } from './ollama.js';
 import { openaiProvider } from './openai.js';
 
-export { AiError, type AiErrorKind } from './errors.js';
+export { AiError, COST_CAP_MESSAGE, type AiErrorKind } from './errors.js';
 export { fallbackEnabled } from './claude.js';
 
 export const MISSING_AI_MESSAGE = 'pipegen needs an AI to do the full job. Set ANTHROPIC_API_KEY, OPENAI_API_KEY, or run a local model with --ai ollama.';

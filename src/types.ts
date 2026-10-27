@@ -112,7 +112,7 @@ export interface PartResult { part: Part; needId?: string; status: 'proven' | 'f
 export interface ProofResult { ok: boolean; parts: PartResult[]; findings: Finding[]; minutesUsed: number; runUrls: string[] }
 
 // ---------- AI ----------
-export interface AiRequest { system: string; user: string; schemaName: string; jsonSchema: object; timeoutMs: number }
+export interface AiRequest { system: string; user: string; schemaName: string; jsonSchema: object; timeoutMs: number; maxOutputTokens?: number }   // maxOutputTokens: the most output (thinking included) the provider may produce; Claude's CLAUDE_MAX_TOKENS when unset
 export interface AiUsage { inputTokens: number; outputTokens: number; cacheReadTokens?: number; cacheWriteTokens?: number }
 export interface AiProvider { name: 'claude' | 'openai' | 'ollama'; model: string; complete(req: AiRequest): Promise<{ data: unknown; usage: AiUsage }> }   // usage feeds the AI cost meter (Plan E)
 

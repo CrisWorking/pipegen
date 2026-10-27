@@ -34,7 +34,7 @@ import { safeText } from '../util/safe-text.js';
 import type {
   AiProvider, AiUsage, Candidate, InstallSpec, Language, Need, NeedCategory, PackageManager, PipelineDraft, RepoProfile, ReviewedTool,
 } from '../types.js';
-import { MAX_DISCOVERY_NEEDS } from './discovery-limits.js';
+import { CANDIDATES_MAX_OUTPUT_TOKENS, MAX_DISCOVERY_NEEDS } from './discovery-limits.js';
 import { GitHubRateLimitError, isRateStop, withRateLimit, type RateClock } from './github-rate.js';
 import { fetchAllowed, readJson } from './http.js';
 import type { MemoryStore } from './memory.js';
@@ -70,10 +70,12 @@ const PACKAGE_MANAGERS = ['npm', 'pnpm', 'yarn', 'bun', 'pip', 'poetry', 'uv', '
 const ACTION_FILES: ReadonlySet<string> = new Set(['action.yml', 'action.yaml']);
 /**
  * AI failures after which suggestTools asks the AI nothing more in this run: the provider rejected the request
- * itself (an HTTP error such as a bad key or a spent quota) or isn't set up. A cost-cap error (Plan E) joins this
- * set when it exists. Other failures (refusal, invalid, truncated, timeout) only skip the AI for that need.
+ * itself (an HTTP error such as a bad key or a spent quota), isn't set up, or the next call could pass the agreed AI
+ * cost cap (Plan U ruling U13). Other failures (refusal, invalid, truncated, timeout) only skip the AI for that need.
  */
-const STOP_AI_KINDS: ReadonlySet<AiErrorKind> = new Set<AiErrorKind>(['http', 'missing']);
+const STOP_AI_KINDS: ReadonlySet<AiErrorKind> = new Set<AiErrorKind>(['http', 'missing', 'cost-cap']);
+/** The one note a cost-cap stop gives (review M2). */
+export const COST_CAP_STOP_NOTE = 'pipegen stopped asking the AI for tool suggestions before the AI cost limit you agreed to; the search went on without the AI.';
 
 /**
  * Search keywords per need category: a fixed table in code, never repo text. A category that isn't here (pipegen's
@@ -334,6 +336,7 @@ async function askAi(needId: string, category: NeedCategory, language: Language,
       schemaName: 'candidates',
       jsonSchema: schema.jsonSchema,
       timeoutMs: CANDIDATES_TIMEOUT_MS,
+      maxOutputTokens: CANDIDATES_MAX_OUTPUT_TOKENS,
     }, schema.zod);
     deps.onUsage?.(r.usage);
     data = r.data;
@@ -503,7 +506,10 @@ export async function suggestTools(needs: Need[], p: RepoProfile, deps: SuggestD
   search: for (const need of picked) {
     if (timeUp()) break;
     const g = await gather(need, p, deps, { useAi, continueWithoutAi: true });
-    if (g.aiError !== undefined) {
+    if (g.aiError?.kind === 'cost-cap') {
+      useAi = false;
+      note(COST_CAP_STOP_NOTE); // one note for the stop, not one per need
+    } else if (g.aiError !== undefined) {
       note(`The AI couldn't suggest tools for the ${need.id} need (${g.aiError.message}); pipegen went on with search results for it.`);
       if (STOP_AI_KINDS.has(g.aiError.kind)) {
         useAi = false;

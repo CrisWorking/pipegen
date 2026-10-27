@@ -7,16 +7,21 @@
 // - The setup estimate also counts the proof harness (Plan E Task 2) and the compat copies of the repo's own
 //   workflow jobs, per proof variant.
 // - AI input and output tokens are priced separately with data/ai-prices.yml, for the chosen provider and model.
-// - estimateAuditAi (Plan U ruling B2) prices `audit --ai` alone: one needs call plus the discovery calls. usageCostUsd and
-//   auditCallHighUsd price what was used and the next call with the same table, for the audit's cost cap.
+// - estimateAuditAi (Plan U ruling B2) prices `audit --ai` alone: one needs call plus the discovery calls. Its cap always
+//   has room for the needs call and one discovery call at their worst (ruling U13). requestCeilingUsd and
+//   usageCeilingUsd are that worst case and what was used, at the highest price a request could bill at: the audit's
+//   spend meter reserves the one before each call and settles with the other. usageCostUsd is the list price.
 // - activity30d reads the last 30 days of pushes and pull requests through the caller's Octokit and rate budget.
 import { readFileSync } from 'node:fs';
 import type { Octokit } from '@octokit/rest';
 import { parse } from 'yaml';
 import { z } from 'zod';
-import { MAX_DISCOVERY_NEEDS } from '../engine/discovery-limits.js';
+import {
+  CANDIDATES_MAX_OUTPUT_TOKENS, CANDIDATES_REQUEST_MAX_BYTES, MAX_DISCOVERY_NEEDS, NEEDS_MAX_OUTPUT_TOKENS,
+} from '../engine/discovery-limits.js';
 import { withRateLimit, type RateClock } from '../engine/github-rate.js';
-import { DEFAULT_MODEL, type AiUsage, type Layer, type Plan, type RepoProfile } from '../types.js';
+import { DEFAULT_MODEL, type AiRequest, type AiUsage, type Layer, type Plan, type RepoProfile } from '../types.js';
+import { fallbackEnabled } from '../util/claude-fallback.js';
 import { hostPlace } from '../util/local-host.js';
 import { packageDataPath } from '../util/package-data.js';
 import { safeText } from '../util/safe-text.js';
@@ -353,21 +358,32 @@ function includedMinutesFor(isPrivate: boolean, plan: Plan): number | null {
 
 /**
  * The AI cost of `audit --ai` alone (Plan U ruling B2): one needs call plus one candidates call for each need that goes
- * to discovery, at most MAX_DISCOVERY_NEEDS. `needCount`: the needs with no reviewed tool. Priced like estimate() for
- * the chosen provider and model (recorded in `pricedFor`); cap = 2 × high; Ollama → 'local', no cap.
+ * to discovery, at most MAX_DISCOVERY_NEEDS. `needCount`: the needs with no reviewed tool. `needsRequestBytes`: the
+ * needs request's size (UTF-8 bytes; the audit model's needsRequestBytes). Priced like estimate() for the chosen
+ * provider and model (recorded in `pricedFor`). The cap is 2 × high, and never less than the needs call's and one
+ * discovery call's worst case together (requestCeilingUsd, ruling U13), so the needs call always fits the agreed cap.
+ * Ollama → 'local', no cap.
  */
-export function estimateAuditAi(provider: AiProviderChoice, needCount: number): AuditAiEstimate {
+export function estimateAuditAi(provider: AiProviderChoice, needCount: number, needsRequestBytes: number): AuditAiEstimate {
   const calls = Math.min(count(needCount), MAX_DISCOVERY_NEEDS);
   const needs = STAGE_TOKENS[0] as { input: number; output: number };
   const tokens = { input: needs.input + calls * CANDIDATE_CALL.input, output: needs.output + calls * CANDIDATE_CALL.output };
   const pr = priceFor(provider);
   const basis = [
     `The AI part of the audit is 1 needs call plus up to ${MAX_DISCOVERY_NEEDS} discovery calls, one for each need with no reviewed tool (${calls} here), at about ${thousands(CANDIDATE_CALL.input)} input / ${thousands(CANDIDATE_CALL.output)} output tokens for each discovery call.`,
-    `The cost range is ×${LOW} to ×${HIGH} of the token estimate, and the cap is twice the high end.`,
+    `The cost range is ×${LOW} to ×${HIGH} of the token estimate.`,
   ];
   if (pr.local) return { tokens, costUsd: 'local', capUsd: null, basis: [...basis, noCostLine(provider)], pricedFor: pricedFor(provider) };
   const c = cost(tokens, pr);
-  return { tokens, costUsd: c, capUsd: CAP_FACTOR * c.high, basis: [...basis, `Priced with the model ${pr.model}.`, ...pr.notes], pricedFor: pricedFor(provider) };
+  const worst = (requestCeilingUsd(provider, count(needsRequestBytes), NEEDS_MAX_OUTPUT_TOKENS) as number)
+    + (requestCeilingUsd(provider, CANDIDATES_REQUEST_MAX_BYTES, CANDIDATES_MAX_OUTPUT_TOKENS) as number);
+  const capUsd = Math.max(CAP_FACTOR * c.high, worst);
+  const fallback = provider.name === 'claude' && fallbackEnabled(provider.model);
+  const capLine = `The cap is ${money2(capUsd)}: twice the high end, and never less than the most the needs call and one discovery call could cost together `
+    + `(every byte sent counted as a token, the full output limit of ${thousands(NEEDS_MAX_OUTPUT_TOKENS)} and ${thousands(CANDIDATES_MAX_OUTPUT_TOKENS)} tokens, at the highest price the call could be billed at`
+    + `${fallback ? ', including a second run on another Claude model if Claude declines and its refusal fallback runs the request again' : ''}). `
+    + 'Before each AI call pipegen reserves the most that call could cost, and it makes no call that could take the total past the cap.';
+  return { tokens, costUsd: c, capUsd, basis: [...basis, capLine, `Priced with the model ${pr.model}.`, ...pr.notes], pricedFor: pricedFor(provider) };
 }
 
 /**
@@ -376,27 +392,66 @@ export function estimateAuditAi(provider: AiProviderChoice, needCount: number): 
  * 1.25× an input token (Anthropic's price for the 5-minute cache that pipegen's Claude requests use).
  */
 const CACHE_WRITE_FACTOR = 1.25;
+/** Tokens a provider adds around a request (roles, structured-output scaffolding) on top of its bytes (ruling U13). */
+export const FRAMING_MARGIN_TOKENS = 2_000;
+
+const money2 = (n: number) => `$${n.toFixed(2)}`;
 
 /**
- * What tokens already used cost (USD), priced with estimate()'s price list for this provider and model (an unknown
- * model at its provider's most expensive price); 'local' for a local model. For `audit --ai`'s cost cap (ruling B2).
+ * What tokens already used cost (USD) at the list price for this provider and model (an unknown model at its
+ * provider's most expensive price); 'local' for a local model. For showing a cost, not for the cap.
  */
 export function usageCostUsd(provider: AiProviderChoice, usage: AiUsage): number | 'local' {
   const pr = priceFor(provider);
   if (pr.local) return 'local';
+  return priceUsage(usage, pr);
+}
+
+function priceUsage(usage: AiUsage, rate: { input: number; output: number }): number {
   const input = count(usage.inputTokens) + count(usage.cacheReadTokens ?? 0) + CACHE_WRITE_FACTOR * count(usage.cacheWriteTokens ?? 0);
-  return (input / 1e6) * pr.input + (count(usage.outputTokens) / 1e6) * pr.output;
+  return (input / 1e6) * rate.input + (count(usage.outputTokens) / 1e6) * rate.output;
 }
 
 /**
- * The high end (USD) of one more `audit --ai` call, the size estimateAuditAi counts it at: the needs call, or one
- * discovery (candidates) call. 'local' for a local model. addAiSuggestions makes no discovery call when this, added to
- * what was already spent, could pass the cap.
+ * The highest per-token prices a request to this provider and model could be billed at, and how many runs of it one
+ * request can bill. A Claude model with the server-side refusal fallback can bill twice (it declines mid-answer, then
+ * another Claude model of Anthropic's choice runs the request again, each run at its own model's price), so both runs
+ * are priced at the top input and output price of any Claude model. Otherwise the model's own price (an unknown model
+ * at its provider's most expensive), one run. null for a local model.
  */
-export function auditCallHighUsd(provider: AiProviderChoice, call: 'needs' | 'candidates'): number | 'local' {
+function ceilingRates(provider: AiProviderChoice): { input: number; output: number; runs: number } | null {
   const pr = priceFor(provider);
-  if (pr.local) return 'local';
-  return cost(call === 'needs' ? (STAGE_TOKENS[0] as { input: number; output: number }) : CANDIDATE_CALL, pr).high;
+  if (pr.local) return null;
+  if (provider.name === 'claude' && fallbackEnabled(provider.model)) {
+    const models = Object.values(prices().providers.claude.models);
+    return { input: Math.max(...models.map((m) => m.input)), output: Math.max(...models.map((m) => m.output)), runs: 2 };
+  }
+  return { input: pr.input, output: pr.output, runs: 1 };
+}
+
+/** A request's size in UTF-8 bytes: system + user + the schema as JSON (byte-level tokenizers give at most 1 token per byte). */
+export function aiRequestBytes(req: AiRequest): number {
+  return Buffer.byteLength(req.system) + Buffer.byteLength(req.user) + Buffer.byteLength(JSON.stringify(req.jsonSchema));
+}
+
+/**
+ * The most one request can cost (USD), before it is sent (ruling U13): every byte a token plus FRAMING_MARGIN_TOKENS as
+ * input (priced as a cache write, the dearest input), the full `maxOutputTokens` as output, at ceilingRates, times the
+ * runs it can bill. Infinity when the request sets no output limit (nothing bounds it). 'local' for a local model.
+ * A retry is a request of its own.
+ */
+export function requestCeilingUsd(provider: AiProviderChoice, requestBytes: number, maxOutputTokens: number): number | 'local' {
+  const rate = ceilingRates(provider);
+  if (rate === null) return 'local';
+  if (!(Number.isFinite(maxOutputTokens) && maxOutputTokens > 0)) return Number.POSITIVE_INFINITY;
+  const input = (Math.ceil(Math.max(0, requestBytes)) + FRAMING_MARGIN_TOKENS) * CACHE_WRITE_FACTOR;
+  return rate.runs * ((input / 1e6) * rate.input + (maxOutputTokens / 1e6) * rate.output);
+}
+
+/** What tokens already used cost at ceilingRates (usage already holds every run, so no multiplying). 'local' for a local model. */
+export function usageCeilingUsd(provider: AiProviderChoice, usage: AiUsage): number | 'local' {
+  const rate = ceilingRates(provider);
+  return rate === null ? 'local' : priceUsage(usage, rate);
 }
 
 // ---------- activity30d ----------

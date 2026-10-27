@@ -5,7 +5,7 @@ import { join, resolve } from 'node:path';
 import type { Octokit } from '@octokit/rest';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import * as childProcess from 'node:child_process';
-import { COUNTING_ONLY_NOTE, EXCLUDED_PATTERNS } from '../src/ai/redact.js';
+import { COUNTING_ONLY_NOTE, EXCLUDED_PATTERNS, redact } from '../src/ai/redact.js';
 import { mapCoverage } from '../src/audit/coverage.js';
 import { buildAudit, CURRENT_MILESTONE, type AuditDeps, type AuditReport } from '../src/audit/model.js';
 import { newRateBudget } from '../src/engine/github-rate.js';
@@ -44,7 +44,7 @@ afterEach(cleanupRepos);
 const NOW = Date.parse('2026-10-27T12:00:00Z');
 const VERSION = (JSON.parse(readFileSync(resolve(import.meta.dirname, '../package.json'), 'utf8')) as { version: string }).version;
 const SWAP_WARNING = `This repo could change which pipegen runs. Run it from outside the repo: \`npx --registry=https://registry.npmjs.org pipegen@${VERSION} audit --dir ./repo\`.`;
-const ANON_NOTE = ['No token', 'public data only, rate-limited.'].join(': '); // joined, so the no-secret-literals guard doesn't read it as an assignment
+const ANON_NOTE = 'Without a GitHub token, pipegen reads public data only and is rate-limited.';
 const NAME_HIDDEN = '(a file whose name looks like a secret)';
 const EXCLUDED_NOTE = "(never sent to the AI; check it isn't committed)";
 
@@ -206,6 +206,7 @@ describe('buildAudit (brief, Task 2a)', () => {
     const r = await buildAudit(repo(nodeApp()), deps({ gh: g.gh, anonymous: true }));
     expect(g.events).toHaveBeenCalled(); // the activity comes through the given client
     expect(r.warnings).toContain(ANON_NOTE);
+    expect(redact(ANON_NOTE)).toBe(ANON_NOTE); // Task 3 runs redact() over every string at output (U10; review M3)
     const named = await buildAudit(repo(nodeApp()), deps());
     expect(named.warnings).not.toContain(ANON_NOTE);
   });

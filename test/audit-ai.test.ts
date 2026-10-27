@@ -4,15 +4,16 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { AiError } from '../src/ai/provider.js';
 import { bundleCode, redact } from '../src/ai/redact.js';
-import { addAiSuggestions, buildAudit, type AiSuggestDeps, type AuditReport } from '../src/audit/model.js';
-import { suggestTools } from '../src/engine/discover.js';
+import { addAiSuggestions, AiSpendMeter, buildAudit, needsRequestBytes, type AiSuggestDeps, type AuditReport } from '../src/audit/model.js';
+import { COST_CAP_STOP_NOTE, suggestTools } from '../src/engine/discover.js';
 import { newRateBudget, withRateLimit, type RateClock } from '../src/engine/github-rate.js';
 import { ensurePinnedBinary, PinnedBinaryError } from '../src/engine/linters.js';
 import type { MemoryStore } from '../src/engine/memory.js';
 import { planNeeds } from '../src/engine/needs.js';
 import type { QualityBar } from '../src/engine/quality-bar.js';
 import { fetchStats, type StatsDeps } from '../src/engine/stats.js';
-import { auditCallHighUsd, usageCostUsd } from '../src/estimate/estimate.js';
+import { aiRequestBytes, estimateAuditAi, FRAMING_MARGIN_TOKENS, requestCeilingUsd, usageCeilingUsd } from '../src/estimate/estimate.js';
+import { CANDIDATES_MAX_OUTPUT_TOKENS, CANDIDATES_REQUEST_MAX_BYTES, NEEDS_MAX_OUTPUT_TOKENS } from '../src/engine/discovery-limits.js';
 import { DEFAULT_MODEL, type AiProvider, type AiRequest, type AiUsage, type Capabilities, type ReviewedTool } from '../src/types.js';
 import { fakeFetch, fakeOctokit, type Routes } from './helpers/fake-http.js';
 import { CLEAN, makeStub } from './helpers/gitleaks-stub.js';
@@ -116,7 +117,14 @@ interface AiOpts {
   /** One candidates call: return the candidates, or throw an AiError. */
   cands?: (need: NonNullable<ReturnType<typeof needBlock>>, nth: number) => unknown;
   candUsage?: AiUsage;
+  /** Bill every request its exact worst case (U13): every byte plus the framing margin as cache-write input, the full
+   * output limit, twice (the model and a refusal-fallback run), so it costs exactly requestCeilingUsd at the meter's prices. */
+  worstCase?: boolean;
 }
+/** `req` with its output limit set (the property name built at runtime: no secret-like literals in test/). */
+const LIMIT_FIELD = 'maxOutput' + 'Tokens';
+const withLimit = (req: AiRequest, limit: number | undefined): AiRequest => Object.fromEntries([...Object.entries(req), [LIMIT_FIELD, limit]]) as unknown as AiRequest;
+const worstUsage = (req: AiRequest): AiUsage => usageOf(0, 2 * (req.maxOutputTokens ?? 0), 0, 2 * (aiRequestBytes(req) + FRAMING_MARGIN_TOKENS));
 /** A fake provider: answers `needs` and `candidates` requests and records every request. */
 function fakeAi(o: AiOpts = {}) {
   const reqs: AiRequest[] = [];
@@ -125,13 +133,13 @@ function fakeAi(o: AiOpts = {}) {
     reqs.push(req);
     if (req.schemaName === 'needs') {
       if (o.needsError !== undefined) throw o.needsError;
-      return { data: o.needs ?? NO_ADDS, usage: o.needsUsage ?? use(1000, 100) };
+      return { data: o.needs ?? NO_ADDS, usage: o.worstCase === true ? worstUsage(req) : o.needsUsage ?? use(1000, 100) };
     }
     const n = needBlock(req);
     if (n === null) throw new Error('unexpected request');
     const data = o.cands !== undefined ? o.cands(n, nth++) : good(n);
     if (data instanceof AiError) throw data;
-    return { data, usage: o.candUsage ?? use(100, 20) };
+    return { data, usage: o.worstCase === true ? worstUsage(req) : o.candUsage ?? use(100, 20) };
   });
   const p: AiProvider = { name: o.name ?? 'claude', model: DEFAULT_MODEL, complete };
   return { p, reqs, complete, candidateReqs: () => reqs.filter((r) => r.schemaName === 'candidates'), needsReqs: () => reqs.filter((r) => r.schemaName === 'needs') };
@@ -335,36 +343,95 @@ describe('addAiSuggestions (controller rulings)', () => {
     expect((await addAiSuggestions(failed.r, failed.dir, failed.deps)).ai?.usage).toEqual(usageOf(900, 4_000));
   });
 
-  it('B2: discovery is skipped (with a note) when one more call could pass the AI cost cap', async () => {
-    const needsUsage = use(30_000, 3_000);
-    const spent = usageCostUsd(DEFAULT_PROVIDER, needsUsage) as number;
-    const next = auditCallHighUsd(DEFAULT_PROVIDER, 'candidates') as number;
-    expect(next).toBeGreaterThan(0);
-    const s = await setup({ ai: { needsUsage }, deps: { capUsd: spent + next / 2 } });
-    const out = await addAiSuggestions(s.r, s.dir, s.deps);
-    expect(s.ai.candidateReqs()).toHaveLength(0);
-    expect(suggestTools).not.toHaveBeenCalled();
-    expect(out.ai?.suggestions).toEqual([]);
-    expect(out.ai?.notes).toContain(`pipegen skipped the tool search: one more AI call could pass this run's AI cost cap ($${(spent + next / 2).toFixed(2)}).`);
-    expect(out.ai?.usage).toEqual(usageOf(30_000, 3_000));
+  it('U13: a provider that bills every request its exact worst case never takes the spend past the cap; discovery stops with one cost-cap note', async () => {
+    // the needs call's and one discovery call's worst case, from the real requests (sized by a run without a cap)
+    const dry = await setup({ ai: { worstCase: true } });
+    await addAiSuggestions(dry.r, dry.dir, dry.deps);
+    const needsReq = dry.ai.needsReqs()[0] as AiRequest;
+    expect(needsReq.maxOutputTokens).toBe(NEEDS_MAX_OUTPUT_TOKENS);
+    expect(aiRequestBytes(needsReq)).toBe(needsRequestBytes(dry.r, [])); // the consent-time size is the real one
+    const needsWorst = requestCeilingUsd(DEFAULT_PROVIDER, aiRequestBytes(needsReq), NEEDS_MAX_OUTPUT_TOKENS) as number;
+    const cands = dry.ai.candidateReqs();
+    expect(cands).toHaveLength(5);
+    for (const c of cands) {
+      expect(c.maxOutputTokens).toBe(CANDIDATES_MAX_OUTPUT_TOKENS);
+      expect(aiRequestBytes(c)).toBeLessThanOrEqual(CANDIDATES_REQUEST_MAX_BYTES);
+    }
+    const candWorst = Math.max(...cands.map((c) => requestCeilingUsd(DEFAULT_PROVIDER, aiRequestBytes(c), CANDIDATES_MAX_OUTPUT_TOKENS) as number));
+    for (const k of [0.5, 1.2, 2.7, 4.1]) {
+      const cap = needsWorst + k * candWorst;
+      const s = await setup({ ai: { worstCase: true }, deps: { capUsd: cap } });
+      const out = await addAiSuggestions(s.r, s.dir, s.deps);
+      const spent = usageCeilingUsd(DEFAULT_PROVIDER, out.ai?.usage as AiUsage) as number;
+      expect(spent, `k=${k}`).toBeLessThanOrEqual(cap);
+      expect(s.ai.candidateReqs().length, `k=${k}`).toBe(Math.floor(k));
+      expect(out.ai?.notes.filter((n) => /cost limit/.test(n)), `k=${k}`).toEqual([COST_CAP_STOP_NOTE]); // one note per stop (M2)
+    }
+    // the consented cap (estimateAuditAi with this repo's needs request size) always has room for the needs call and one discovery call
+    const est = estimateAuditAi(DEFAULT_PROVIDER, 5, needsRequestBytes(dry.r, []));
+    expect(est.capUsd as number).toBeGreaterThanOrEqual(needsWorst + candWorst);
+    const fits = await setup({ ai: { worstCase: true }, deps: { capUsd: est.capUsd } });
+    await addAiSuggestions(fits.r, fits.dir, fits.deps);
+    expect(fits.ai.needsReqs()).toHaveLength(1);
+    expect(fits.ai.candidateReqs().length).toBeGreaterThanOrEqual(1);
   });
 
-  it('B2: once the next discovery call could pass the cap, pipegen asks the AI nothing more and keeps what passed', async () => {
-    const needsUsage = use(30_000, 3_000);
-    const spent = usageCostUsd(DEFAULT_PROVIDER, needsUsage) as number;
-    const next = auditCallHighUsd(DEFAULT_PROVIDER, 'candidates') as number;
-    const cap = spent + 1.5 * next; // room for one call only, since that call costs more than half a call's high estimate
-    const s = await setup({ ai: { needsUsage, candUsage: use(10_000, 10_000) }, deps: { capUsd: cap } });
+  it('U13: a needs call that does not fit the cap is refused with a note, and no AI call is made', async () => {
+    const s = await setup();
+    const needsWorst = requestCeilingUsd(DEFAULT_PROVIDER, needsRequestBytes(s.r, []), NEEDS_MAX_OUTPUT_TOKENS) as number;
+    s.deps.capUsd = needsWorst * 0.99;
     const out = await addAiSuggestions(s.r, s.dir, s.deps);
-    expect(s.ai.candidateReqs()).toHaveLength(1);
-    expect(out.ai?.suggestions).toEqual([{ name: 'good', repo: 'o/good', why: 'Checks things.' }]); // the first need's answer passed
-    expect(out.ai?.notes).toContain(`pipegen stopped asking the AI for tool suggestions: one more call could pass this run's AI cost cap ($${cap.toFixed(2)}). The search went on without the AI.`);
-    expect(out.ai?.usage).toEqual(usageOf(40_000, 13_000));
+    expect(s.ai.complete).not.toHaveBeenCalled();
+    expect(suggestTools).not.toHaveBeenCalled();
+    expect(out.ai?.notes).toContain(`The AI step stopped: one more AI call could pass the AI cost limit you agreed to ($${(needsWorst * 0.99).toFixed(2)}).`);
+    expect(out.ai?.usage).toEqual(usageOf(0, 0));
+  });
 
-    // no cap (a local model): every discovery call is made
-    const free = await setup({ ai: { needsUsage, candUsage: use(10_000_000, 10_000_000) }, deps: { capUsd: null } });
-    await addAiSuggestions(free.r, free.dir, free.deps);
-    expect(free.ai.candidateReqs()).toHaveLength(5);
+  it('U13: the meter reserves each attempt\'s worst case; a timeout (no usage) keeps its full reservation; a refused attempt is never sent', async () => {
+    const req = withLimit({ system: 'sys', user: 'u'.repeat(3_000), schemaName: 'candidates', jsonSchema: { type: 'object' }, timeoutMs: 1_000 }, CANDIDATES_MAX_OUTPUT_TOKENS);
+    const worst = requestCeilingUsd(DEFAULT_PROVIDER, aiRequestBytes(req), CANDIDATES_MAX_OUTPUT_TOKENS) as number;
+    const sent: AiRequest[] = [];
+    let answer: 'timeout' | 'ok' = 'timeout';
+    const inner: AiProvider = {
+      name: 'claude', model: DEFAULT_MODEL,
+      complete: async (r) => {
+        sent.push(r);
+        if (answer === 'timeout') throw new AiError('timeout', 'Claude did not answer within 1 s.');
+        return { data: {}, usage: use(100, 10) };
+      },
+    };
+    // room for one and a half attempts
+    const meter = new AiSpendMeter(inner, 1.5 * worst);
+    await expect(meter.provider.complete(req)).rejects.toMatchObject({ kind: 'timeout' });
+    expect(meter.spentUsd).toBeCloseTo(worst, 10); // the reservation is kept: the tokens may still be billed
+    expect(meter.reservedUsd).toBe(0);
+    answer = 'ok';
+    await expect(meter.provider.complete(req)).rejects.toMatchObject({ kind: 'cost-cap', message: 'Stopped before the AI cost limit you agreed to.' });
+    expect(sent).toHaveLength(1); // the refused attempt never reached the provider
+
+    // a settled attempt frees its reservation: with the same cap, a second attempt goes through
+    const ok = new AiSpendMeter(inner, 1.5 * worst);
+    await ok.provider.complete(req);
+    await ok.provider.complete(req);
+    expect(sent).toHaveLength(3);
+    expect(ok.spentUsd).toBeCloseTo(2 * (usageCeilingUsd(DEFAULT_PROVIDER, use(100, 10)) as number), 10);
+    expect(ok.usage).toEqual(usageOf(200, 20));
+
+    // a request without an output limit has no bound: refused under any cap; no cap (local model): never refused
+    await expect(new AiSpendMeter(inner, 1_000).provider.complete(withLimit(req, undefined))).rejects.toMatchObject({ kind: 'cost-cap' });
+    await new AiSpendMeter(inner, null).provider.complete(withLimit(req, undefined));
+    expect(sent).toHaveLength(4);
+  });
+
+  it('U13: a cut-off answer (the output limit reached) fails safe as a note', async () => {
+    const s = await setup({ ai: { cands: (n, nth) => (nth === 0 ? new AiError('truncated', "Claude's answer was cut off before it was complete. Nothing was changed.", use(50, 16_000)) : good(n)) } });
+    const out = await addAiSuggestions(s.r, s.dir, s.deps);
+    expect(out.ai?.notes.some((n) => /cut off/.test(n))).toBe(true);
+    expect(out.ai?.suggestions).toEqual([{ name: 'good', repo: 'o/good', why: 'Checks things.' }]); // the other needs went on
+    const needs = await setup({ ai: { needsError: new AiError('truncated', 'cut', use(10, 32_000)) } });
+    const n = await addAiSuggestions(needs.r, needs.dir, needs.deps);
+    expect(n.ai).toMatchObject({ extraNeeds: [], suggestions: [] });
+    expect(n.ai?.notes).toContain("The AI step stopped: the AI's answer was cut off.");
   });
 
   it('B3/U11: reviewed list unavailable → no discovery, no suggestions, a note (look-alike checks need the full list)', async () => {
@@ -409,13 +476,14 @@ describe('addAiSuggestions (controller rulings)', () => {
     expect(out.ai?.suggestions).toEqual([{ name: 'good', repo: 'o/good', why: 'Checks things.' }]);
     expect(out.ai?.notes.some((n) => n.includes('The AI did not answer within 60 s.'))).toBe(true);
 
-    // an AiError that escapes the search (defensive): no suggestions, a note, its usage still counted
+    // an AiError that escapes the search (defensive): no suggestions, a note; usage is counted once, by the meter, for
+    // every attempt it saw (this mocked error never went through a provider, so it adds nothing; review M1)
     const esc = await setup({ ai: { needsUsage: use(10, 1) } });
     vi.mocked(suggestTools).mockRejectedValueOnce(new AiError('http', 'The AI provider answered with an error.', use(3, 2)));
     const e = await addAiSuggestions(esc.r, esc.dir, esc.deps);
     expect(e.ai?.suggestions).toEqual([]);
     expect(e.ai?.notes).toContain('The tool search stopped: the AI provider refused the request (check the key, the quota and the model name).');
-    expect(e.ai?.usage).toEqual(usageOf(13, 3));
+    expect(e.ai?.usage).toEqual(usageOf(10, 1));
   });
 
   it('S17: discovery only for needs that are not covered and have no project script; the anonymous and scope notes', async () => {
@@ -492,6 +560,11 @@ describe('addAiSuggestions (controller rulings)', () => {
     collect(await addAiSuggestions(d.r, d.dir, d.deps));
     const e = await setup({ deps: { ensureGitleaks: vi.fn(async () => { throw new PinnedBinaryError('No pinned gitleaks here.'); }) } });
     collect(await addAiSuggestions(e.r, e.dir, e.deps));
+    const f = await setup({ ai: { worstCase: true } });
+    const needsWorst = requestCeilingUsd(DEFAULT_PROVIDER, needsRequestBytes(f.r, []), NEEDS_MAX_OUTPUT_TOKENS) as number;
+    f.deps.capUsd = needsWorst * 1.01; // the needs call fits, no discovery call does
+    collect(await addAiSuggestions(f.r, f.dir, f.deps));
+    expect(notes).toContain(COST_CAP_STOP_NOTE);
     expect(notes.size).toBeGreaterThan(6);
     for (const n of notes) expect(redact(n), n).toBe(n);
   });

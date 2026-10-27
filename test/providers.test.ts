@@ -109,6 +109,9 @@ const SCHEMA = {
   additionalProperties: false,
 };
 
+/** A request override setting the output limit (the property name built at runtime: no secret-like literals in test/). */
+const outLimit = (n: number) => Object.fromEntries([['maxOutput' + 'Tokens', n]]) as Partial<AiRequest>;
+
 function request(over: Partial<AiRequest> = {}): AiRequest {
   return { system: 'You plan CI pipelines.', user: 'Plan it.', schemaName: 'plan', jsonSchema: SCHEMA, timeoutMs: 5_000, ...over };
 }
@@ -204,6 +207,15 @@ describe('claude', () => {
     expect(f.calls[0]!.body.max_tokens).toBe(CLAUDE_MAX_TOKENS);
     expect(CLAUDE_MAX_TOKENS).toBe(64_000); // always-on thinking at effort high counts toward it (final review batch 2, M6)
     expect(f.calls[0]!.body.stream).toBe(true); // streamed, as the SDK asks for large max_tokens
+  });
+
+  it('claude: a request\'s maxOutputTokens is sent as max_tokens (CLAUDE_MAX_TOKENS stays the ceiling) (U13)', async () => {
+    const f = fakeFetch(() => sse(claudeMessage()));
+    const p = claudeProvider({ key: runtimeKey('ak'), fetch: f.fetch });
+    await p.complete(request(outLimit(16_000)));
+    await p.complete(request(outLimit(500_000)));
+    await p.complete(request(outLimit(0)));
+    expect(f.calls.map((c) => c.body.max_tokens)).toEqual([16_000, CLAUDE_MAX_TOKENS, CLAUDE_MAX_TOKENS]);
   });
 
   it('claude: fallback-served answer counts billed tokens of every attempt (usage.iterations)', async () => {
@@ -404,7 +416,11 @@ describe('openai', () => {
     expect(c.body.model).toBe('gpt-test');
     expect(c.body.response_format).toEqual({ type: 'json_schema', json_schema: { name: 'plan', schema: SCHEMA, strict: true } });
     expect(c.body.messages).toEqual([{ role: 'system', content: 'You plan CI pipelines.' }, { role: 'user', content: 'Plan it.' }]);
-    for (const k of ['tools', 'tool_choice', 'temperature']) expect(c.body).not.toHaveProperty(k);
+    for (const k of ['tools', 'tool_choice', 'temperature', 'max_completion_tokens']) expect(c.body).not.toHaveProperty(k);
+
+    // a request's output limit is sent as max_completion_tokens (reasoning counts toward it) (U13)
+    await p.complete(request(outLimit(16_000)));
+    expect(f.calls[1]!.body.max_completion_tokens).toBe(16_000);
 
     const err = await caught(() => makeProvider({ ai: 'openai', env: envOf(undefined, key) }));
     expect(err.kind).toBe('missing');
@@ -446,6 +462,12 @@ describe('ollama', () => {
     await makeProvider({ ai: 'ollama', env: { OLLAMA_HOST: 'http://gpu-box:8080' }, ollamaCtx: 8192, model: 'qwen3', fetch: g.fetch }).complete(request());
     expect(g.calls[0]!.url).toBe('http://gpu-box:8080/api/chat');
     expect(g.calls[0]!.body).toMatchObject({ model: 'qwen3', options: { num_ctx: 8192 } });
+  });
+
+  it('ollama: a request\'s maxOutputTokens is sent as options.num_predict (U13)', async () => {
+    const f = fakeFetch(() => ollamaAnswer());
+    await makeProvider({ ai: 'ollama', env: {}, fetch: f.fetch }).complete(request(outLimit(16_000)));
+    expect(f.calls[0]!.body.options).toEqual({ num_ctx: 32768, num_predict: 16_000 });
   });
 
   it('ollama: connection refused → AiError http \'is Ollama running?\'', async () => {

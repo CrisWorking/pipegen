@@ -8,26 +8,21 @@
 import Anthropic from '@anthropic-ai/sdk';
 import { betaJSONSchemaOutputFormat } from '@anthropic-ai/sdk/helpers/beta/json-schema';
 import { DEFAULT_MODEL, type AiProvider, type AiRequest, type AiUsage } from '../types.js';
+import { fallbackEnabled } from '../util/claude-fallback.js';
 import { safeText } from '../util/safe-text.js';
-import { AiError, count, safeCode, withTimeout } from './errors.js';
+import { AiError, count, outputLimit, safeCode, withTimeout } from './errors.js';
+
+export { FALLBACK_MODELS, fallbackEnabled } from '../util/claude-fallback.js';
 
 /** Fixed: the key is never sent anywhere else, whatever ANTHROPIC_BASE_URL or the repo says. */
 export const CLAUDE_BASE_URL = 'https://api.anthropic.com';
 /** Server-side refusal fallback (the `"default"` form needs this exact header). */
 export const FALLBACK_BETA = 'server-side-fallback-2026-07-01';
 /**
- * Models the claude-api skill lists for server-side `fallbacks` (SKILL.md: Claude Fable 5.1 / Mythos 5.1, Opus 5.5,
- * Opus 5, Sonnet 5.5; model-migration.md: "work as on Claude Fable 5"). Not Claude Haiku 5.5 ("no server-side
- * fallback"), and not older models. Any other --model gets neither the parameter nor the beta header.
- */
-export const FALLBACK_MODELS: readonly string[] = Object.freeze([
-  'claude-fable-5-1', 'claude-mythos-5-1', 'claude-fable-5', 'claude-opus-5-5', 'claude-opus-5', 'claude-sonnet-5-5',
-]);
-/**
  * Room for adaptive thinking plus the biggest schema answer pipegen asks for. On models whose thinking can't be
  * turned off, thinking counts toward this at effort `high`, and a max_tokens stop is never retried, so the ceiling
- * is the ~64k the claude-api skill recommends for streamed requests (final review batch 2, M6). Only the tokens
- * produced are billed; Plan E's cost meter, not this ceiling, guards spend. Requests are streamed
+ * is the ~64k the claude-api skill recommends for streamed requests (final review batch 2, M6). A request's own
+ * `maxOutputTokens` (lower) replaces it, and the cost meter of `audit --ai` (Plan U ruling U13) prices that limit. Requests are streamed
  * (`.stream(...).finalMessage()`), so this size is safe from HTTP timeouts; the total time is still bounded by
  * req.timeoutMs.
  */
@@ -50,11 +45,6 @@ export interface ClaudeOptions { key: string; model?: string; effort?: string; f
 
 export function isClaudeEffort(e: string): e is ClaudeEffort {
   return (CLAUDE_EFFORTS as readonly string[]).includes(e);
-}
-
-/** True when requests for this model turn on the server-side refusal fallback (and REFUSAL_FALLBACK_NOTE applies). */
-export function fallbackEnabled(model: string): boolean {
-  return FALLBACK_MODELS.includes(model);
 }
 
 /**
@@ -169,7 +159,7 @@ export function claudeProvider(opts: ClaudeOptions): AiProvider {
         try {
           return await client.beta.messages.stream({
             model,
-            max_tokens: CLAUDE_MAX_TOKENS,
+            max_tokens: Math.min(outputLimit(req.maxOutputTokens) ?? CLAUDE_MAX_TOKENS, CLAUDE_MAX_TOKENS),
             ...(withFallback ? { betas: [FALLBACK_BETA], fallbacks: 'default' as const } : {}),
             output_config: { effort, format },
             system: req.system,

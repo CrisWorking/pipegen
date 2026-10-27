@@ -10,9 +10,10 @@ import { bundleText, redact, scrubKnownValues, type CodeBundle } from '../ai/red
 import { aiSchema, type AiSchema } from '../ai/schema.js';
 import { signingMode } from '../github/signing-mode.js';
 import { SERVER_FRAMEWORKS, SERVICE_NAME_RE } from '../read/project.js';
+import { NEEDS_MAX_OUTPUT_TOKENS } from './discovery-limits.js';
 import { NEED_ID_CATEGORY, NEED_IDS, type NeedId } from './need-ids.js';
 import {
-  FLOOR_NEEDS, NEED_CATEGORIES, type AiProvider, type AiUsage, type Capabilities, type Layer, type Need, type NeedCategory,
+  FLOOR_NEEDS, NEED_CATEGORIES, type AiProvider, type AiRequest, type AiUsage, type Capabilities, type Layer, type Need, type NeedCategory,
   type RepoProfile, type Service,
 } from '../types.js';
 
@@ -247,6 +248,31 @@ function profileSummary(p: RepoProfile, floor: Need[], knownValues: readonly str
   return scrubForPrompt(`<repo-profile>\n${JSON.stringify(summary, null, 1)}\n</repo-profile>`, knownValues);
 }
 
+/** The needs request around `code` (bundleText's output; '' to size the rest of the request). */
+function needsRequest(code: string, p: RepoProfile, caps: Capabilities, knownValues: readonly string[]): { req: AiRequest; schema: AiSchema<AiNeedsAnswer> } {
+  const schema = needsSchema(p, { knownValues: [...knownValues] });
+  return {
+    schema,
+    req: {
+      system: NEEDS_SYSTEM,
+      user: `${code}\n${profileSummary(p, floorNeeds(p, caps), knownValues)}\n\n${needsInstructions(NEED_ID_CATEGORY)}`,
+      schemaName: 'needs',
+      jsonSchema: schema.jsonSchema,
+      timeoutMs: NEEDS_TIMEOUT_MS,
+      maxOutputTokens: NEEDS_MAX_OUTPUT_TOKENS,
+    },
+  };
+}
+
+/**
+ * The needs request's size without the code bundle (UTF-8 bytes of system + user + schema): the needs request is
+ * exactly this plus the bundle's `bytes` (bundleText's size). For the `audit --ai` cost cap, before consent (ruling U13).
+ */
+export function needsPromptBytes(p: RepoProfile, caps: Capabilities, opts: PlanNeedsOptions = {}): number {
+  const { req } = needsRequest('', p, caps, opts.knownValues ?? []);
+  return Buffer.byteLength(req.system) + Buffer.byteLength(req.user) + Buffer.byteLength(JSON.stringify(req.jsonSchema));
+}
+
 /**
  * The floor plus what the AI adds. The bundle goes into the prompt only through bundleText(), which refuses a
  * bundle that skipped the gitleaks pass, so nothing is sent then. `writers` is listWriters(...).length (the audit
@@ -257,14 +283,8 @@ export async function planNeeds(p: RepoProfile, caps: Capabilities, bundle: Code
   const code = bundleText(bundle); // first: throws GitleaksRequiredError before anything else happens
   const knownValues = opts.knownValues ?? [];
   const floor = floorNeeds(p, caps);
-  const schema = needsSchema(p, { knownValues });
-  const { data, usage } = await completeValidated(ai, {
-    system: NEEDS_SYSTEM,
-    user: `${code}\n${profileSummary(p, floor, knownValues)}\n\n${needsInstructions(NEED_ID_CATEGORY)}`,
-    schemaName: 'needs',
-    jsonSchema: schema.jsonSchema,
-    timeoutMs: NEEDS_TIMEOUT_MS,
-  }, schema.zod);
+  const { req, schema } = needsRequest(code, p, caps, knownValues);
+  const { data, usage } = await completeValidated(ai, req, schema.zod);
 
   const notes = new Set<string>(); // deduped
   const layersSkipped: { layer: Layer; reason: string }[] = [];

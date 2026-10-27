@@ -3,10 +3,11 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, it, vi } from 'vitest';
 import { GitHubRateLimitError, newRateBudget } from '../src/engine/github-rate.js';
-import { MAX_DISCOVERY_NEEDS } from '../src/engine/discovery-limits.js';
+import { CANDIDATES_MAX_OUTPUT_TOKENS, CANDIDATES_REQUEST_MAX_BYTES, MAX_DISCOVERY_NEEDS, NEEDS_MAX_OUTPUT_TOKENS } from '../src/engine/discovery-limits.js';
 import { floorNeeds, jobCategories, jobCounts } from '../src/engine/needs.js';
 import {
-  activity30d, auditCallHighUsd, estimate, estimateAuditAi, HARNESS_MINUTES_PER_VARIANT, jobMinutes, loadAiPrices, loadGitHubPlans, usageCostUsd,
+  activity30d, aiRequestBytes, estimate, estimateAuditAi, FRAMING_MARGIN_TOKENS, HARNESS_MINUTES_PER_VARIANT, jobMinutes, loadAiPrices, loadGitHubPlans,
+  requestCeilingUsd, usageCeilingUsd, usageCostUsd,
   type Activity, type JobCategories,
 } from '../src/estimate/estimate.js';
 import { DEFAULT_MODEL, type Capabilities, type ExistingWorkflow, type RepoProfile, type Service } from '../src/types.js';
@@ -46,6 +47,8 @@ const JOBS: JobCategories = {
 const PER_VARIANT = 44 + HARNESS_MINUTES_PER_VARIANT; // 44 + 8 = 52
 const ACTIVITY: Activity = { pushes: 40, prs: 10, capped: false };
 const OPUS = { name: 'claude', model: DEFAULT_MODEL };
+/** The needs request's size (UTF-8 bytes) estimateAuditAi is given: a 50 KB bundle and the rest of the prompt. */
+const NEEDS_BYTES = 60_000;
 
 // Token totals for a full run (fixed table): needs 30k/3k, debate 3 × 40k/6k, creators 60k/20k, fix loop 2 parts × 5 × 15k/4k.
 const IN = 30_000 + 120_000 + 60_000 + 150_000; // 360k
@@ -230,11 +233,11 @@ describe('estimate: AI', () => {
   it('estimate: the Ollama basis says "your machine" only for a local host; otherwise it names the host (final review batch 2, M3)', () => {
     for (const host of ['127.0.0.1:11434', 'localhost:11434', '0.0.0.0:11434', '[::1]:11434']) {
       expect(estimate(profile(), JOBS, 2, ACTIVITY, { name: 'ollama', model: 'llama3.1', host }).basis.join('\n'), host).toContain('Ollama runs on your machine');
-      expect(estimateAuditAi({ name: 'ollama', model: 'llama3.1', host }, 3).basis.join('\n'), host).toContain('Ollama runs on your machine');
+      expect(estimateAuditAi({ name: 'ollama', model: 'llama3.1', host }, 3, NEEDS_BYTES).basis.join('\n'), host).toContain('Ollama runs on your machine');
     }
     const remote = [
       estimate(profile(), JOBS, 2, ACTIVITY, { name: 'ollama', model: 'llama3.1', host: 'gpu.example.net:8443' }).basis.join('\n'),
-      estimateAuditAi({ name: 'ollama', model: 'llama3.1', host: 'gpu.example.net:8443' }, 3).basis.join('\n'),
+      estimateAuditAi({ name: 'ollama', model: 'llama3.1', host: 'gpu.example.net:8443' }, 3, NEEDS_BYTES).basis.join('\n'),
     ];
     for (const text of remote) {
       expect(text).not.toContain('your machine');
@@ -242,7 +245,7 @@ describe('estimate: AI', () => {
       expect(text).toContain('no AI cost and no cost cap');
     }
     // no host (a provider not built by ollamaProvider): never claimed to be this machine
-    for (const text of [estimate(profile(), JOBS, 2, ACTIVITY, { name: 'ollama', model: 'llama3.1' }).basis.join('\n'), estimateAuditAi({ name: 'ollama', model: 'm' }, 3).basis.join('\n')]) {
+    for (const text of [estimate(profile(), JOBS, 2, ACTIVITY, { name: 'ollama', model: 'llama3.1' }).basis.join('\n'), estimateAuditAi({ name: 'ollama', model: 'm' }, 3, NEEDS_BYTES).basis.join('\n')]) {
       expect(text).not.toContain('your machine');
       expect(text).toContain("couldn't confirm");
     }
@@ -256,11 +259,11 @@ describe('estimate: AI', () => {
     expect(estimate(profile(), JOBS, 2, ACTIVITY, { name: 'claude', model: 'claude-future-9' }).pricedFor).toEqual({ provider: 'claude', model: 'claude-future-9' });
     expect(estimate(profile(), JOBS, 2, ACTIVITY, null).pricedFor).toBeNull();
     expect(estimate(profile(), JOBS, 2, ACTIVITY, { name: 'ollama', model: 'm', host: 'h:1' }).pricedFor).toEqual({ provider: 'ollama', model: 'm', host: 'h:1' });
-    expect(estimateAuditAi({ name: 'openai', model: 'gpt-5' }, 2).pricedFor).toEqual({ provider: 'openai', model: 'gpt-5' });
-    expect(estimateAuditAi({ name: 'ollama', model: 'm' }, 2).pricedFor).toEqual({ provider: 'ollama', model: 'm' });
+    expect(estimateAuditAi({ name: 'openai', model: 'gpt-5' }, 2, NEEDS_BYTES).pricedFor).toEqual({ provider: 'openai', model: 'gpt-5' });
+    expect(estimateAuditAi({ name: 'ollama', model: 'm' }, 2, NEEDS_BYTES).pricedFor).toEqual({ provider: 'ollama', model: 'm' });
     // only these fields are copied: a whole provider object (with its key and complete()) is never kept
     const fakeProvider = { name: 'claude', model: DEFAULT_MODEL, complete: async () => ({}), extra: 'x' };
-    expect(estimateAuditAi(fakeProvider, 1).pricedFor).toEqual({ provider: 'claude', model: DEFAULT_MODEL });
+    expect(estimateAuditAi(fakeProvider, 1, NEEDS_BYTES).pricedFor).toEqual({ provider: 'claude', model: DEFAULT_MODEL });
   });
 
   it('estimate: no provider → no AI tokens, no cost, no cap', () => {
@@ -297,26 +300,61 @@ describe('estimate: basis', () => {
   });
 });
 
+/** Usage with all four counts (property names built at runtime: no secret-like literals in test/). */
+const used = (i: number, o: number, cr = 0, cw = 0) => Object.fromEntries([['input' + 'Tokens', i], ['output' + 'Tokens', o], ['cacheRead' + 'Tokens', cr], ['cacheWrite' + 'Tokens', cw]]) as never;
+
+/** The needs call's and one discovery call's worst case together (what the cap must always hold, U13). */
+const worstOf = (provider: { name: string; model: string }, bytes: number) =>
+  (requestCeilingUsd(provider, bytes, NEEDS_MAX_OUTPUT_TOKENS) as number) + (requestCeilingUsd(provider, CANDIDATES_REQUEST_MAX_BYTES, CANDIDATES_MAX_OUTPUT_TOKENS) as number);
+
 describe('estimateAuditAi (ruling B2)', () => {
-  it('usageCostUsd and auditCallHighUsd: the same price table as the estimate; cache tokens never priced low; local is free', () => {
+  it('usageCostUsd: the estimate price table; cache tokens never priced low; local is free', () => {
     // opus 5.5: $4 / $20 per million (data/ai-prices.yml)
-    const used = (i: number, o: number, cr = 0, cw = 0) => Object.fromEntries([['input' + 'Tokens', i], ['output' + 'Tokens', o], ['cacheRead' + 'Tokens', cr], ['cacheWrite' + 'Tokens', cw]]) as never;
     expect(usageCostUsd(OPUS, used(1_000_000, 0))).toBeCloseTo(4, 10);
     expect(usageCostUsd(OPUS, used(0, 1_000_000))).toBeCloseTo(20, 10);
     expect(usageCostUsd(OPUS, used(0, 0, 1_000_000, 0))).toBeCloseTo(4, 10); // a cache read at the full input price
     expect(usageCostUsd(OPUS, used(0, 0, 0, 1_000_000))).toBeCloseTo(5, 10); // a cache write at 1.25×
     expect(usageCostUsd({ name: 'claude', model: 'claude-future-9' }, used(1_000_000, 0))).toBeCloseTo(10, 10); // the provider's top price
     expect(usageCostUsd({ name: 'ollama', model: 'm' }, used(1_000_000, 1_000_000))).toBe('local');
-    // one more call, at the high end of estimateAuditAi's per-call size
-    const one = estimateAuditAi(OPUS, 1).costUsd as { high: number };
-    const none = estimateAuditAi(OPUS, 0).costUsd as { high: number };
-    expect(auditCallHighUsd(OPUS, 'candidates')).toBeCloseTo(one.high - none.high, 10);
-    expect(auditCallHighUsd(OPUS, 'needs')).toBeCloseTo(none.high, 10);
-    expect(auditCallHighUsd({ name: 'ollama', model: 'm' }, 'candidates')).toBe('local');
+  });
+
+  it('requestCeilingUsd (U13): every byte a token plus the framing margin, the full output limit, the highest price it could bill at', () => {
+    // opus 5.5 has the refusal fallback: two runs (it, then another Claude model), each at the top Claude price ($10 / $50, Fable 5.1)
+    const perRun = ((10_000 + FRAMING_MARGIN_TOKENS) * 1.25 * 10 + 16_000 * 50) / 1e6;
+    expect(FRAMING_MARGIN_TOKENS).toBe(2_000);
+    expect(requestCeilingUsd(OPUS, 10_000, 16_000)).toBeCloseTo(2 * perRun, 10);
+    // no fallback (Haiku 5.5): one run at its own price
+    expect(requestCeilingUsd({ name: 'claude', model: 'claude-haiku-5-5' }, 10_000, 16_000)).toBeCloseTo(((12_000 * 1.25 * 0.1) + 16_000 * 0.5) / 1e6, 10);
+    expect(requestCeilingUsd({ name: 'openai', model: 'gpt-5' }, 10_000, 16_000)).toBeCloseTo(((12_000 * 1.25 * 1.25) + 16_000 * 10) / 1e6, 10);
+    // no output limit: no bound at all; local: no cost
+    for (const bad of [undefined, 0, Number.NaN, -5]) expect(requestCeilingUsd(OPUS, 10_000, bad as number)).toBe(Number.POSITIVE_INFINITY);
+    expect(requestCeilingUsd({ name: 'ollama', model: 'm' }, 10_000, 16_000)).toBe('local');
+    // what was used, priced the same way (usage already holds every run, so no doubling)
+    expect(usageCeilingUsd(OPUS, used(1_000_000, 1_000_000, 0, 0))).toBeCloseTo(60, 10);
+    expect(usageCeilingUsd({ name: 'claude', model: 'claude-haiku-5-5' }, used(1_000_000, 1_000_000))).toBeCloseTo(0.6, 10);
+    expect(usageCeilingUsd({ name: 'ollama', model: 'm' }, used(1, 1))).toBe('local');
+    // bytes of a request: system + user + schema
+    expect(aiRequestBytes({ system: 'ab', user: 'é', schemaName: 'x', jsonSchema: { a: 1 }, timeoutMs: 1 })).toBe(2 + 2 + 7);
+  });
+
+  it('estimateAuditAi (U13): the cap always has room for the needs call and one discovery call at their worst', () => {
+    for (const provider of [OPUS, { name: 'claude', model: 'claude-haiku-5-5' }, { name: 'openai', model: 'gpt-5' }]) {
+      for (const bytes of [5_000, NEEDS_BYTES, 150_000]) {
+        const e = estimateAuditAi(provider, 5, bytes);
+        const worst = (requestCeilingUsd(provider, bytes, NEEDS_MAX_OUTPUT_TOKENS) as number) + (requestCeilingUsd(provider, CANDIDATES_REQUEST_MAX_BYTES, CANDIDATES_MAX_OUTPUT_TOKENS) as number);
+        const high = (e.costUsd as { high: number }).high;
+        expect(e.capUsd, `${provider.model} ${bytes}`).toBeCloseTo(Math.max(2 * high, worst), 10);
+        expect(e.capUsd as number).toBeGreaterThanOrEqual(worst);
+      }
+    }
+    const text = estimateAuditAi(OPUS, 5, NEEDS_BYTES).basis.join('\n');
+    expect(text).toMatch(/reserves/);
+    expect(text).toMatch(/fallback/);
+    expect(estimateAuditAi({ name: 'ollama', model: 'm' }, 5, NEEDS_BYTES).capUsd).toBeNull();
   });
 
   it('estimateAuditAi: basis says the calls, the range and the model in plain English', () => {
-    const text = estimateAuditAi(OPUS, 5).basis.join('\n');
+    const text = estimateAuditAi(OPUS, 5, NEEDS_BYTES).basis.join('\n');
     expect(text).toMatch(/1 needs call/);
     expect(text).toMatch(new RegExp(`up to ${MAX_DISCOVERY_NEEDS} discovery calls`));
     expect(text).toMatch(/2k input.*2k output tokens/s);
@@ -326,44 +364,47 @@ describe('estimateAuditAi (ruling B2)', () => {
   });
 
   it('estimateAuditAi: unknown model is priced at the provider\'s most expensive model, and basis says so', () => {
-    const a = estimateAuditAi({ name: 'claude', model: 'claude-future-9' }, 5);
-    const fable = estimateAuditAi({ name: 'claude', model: 'claude-fable-5-1' }, 5);
+    const a = estimateAuditAi({ name: 'claude', model: 'claude-future-9' }, 5, NEEDS_BYTES);
+    const fable = estimateAuditAi({ name: 'claude', model: 'claude-fable-5-1' }, 5, NEEDS_BYTES);
     expect(a.costUsd).toEqual(fable.costUsd);
-    expect(a.capUsd).toEqual(fable.capUsd);
+    // its worst case uses the same top price, but one run: the adapter turns the refusal fallback on only for known models
+    const future = { name: 'claude', model: 'claude-future-9' };
+    expect(worstOf(future, NEEDS_BYTES)).toBeCloseTo(worstOf({ name: 'claude', model: 'claude-fable-5-1' }, NEEDS_BYTES) / 2, 10);
+    expect(a.capUsd).toBeCloseTo(worstOf(future, NEEDS_BYTES), 10);
     expect(a.basis.join('\n')).toMatch(/"claude-future-9".*claude-fable-5.*highest price.*real cost is likely lower/is);
-    const any = estimateAuditAi({ name: 'mystery', model: 'm1' }, 5);
+    const any = estimateAuditAi({ name: 'mystery', model: 'm1' }, 5, NEEDS_BYTES);
     expect(any.costUsd).toEqual(fable.costUsd);
   });
 
   it('estimateAuditAi: one needs call plus at most MAX_DISCOVERY_NEEDS candidate calls', () => {
     expect(MAX_DISCOVERY_NEEDS).toBe(5);
-    expect(estimateAuditAi(OPUS, 0).tokens).toEqual({ input: 30_000, output: 3_000 });
-    expect(estimateAuditAi(OPUS, 2).tokens).toEqual({ input: 30_000 + 2 * 2_000, output: 3_000 + 2 * 2_000 });
-    expect(estimateAuditAi(OPUS, 5).tokens).toEqual(estimateAuditAi(OPUS, 50).tokens);
-    expect(estimateAuditAi(OPUS, 50).tokens).toEqual({ input: 40_000, output: 13_000 });
-    expect(estimateAuditAi(OPUS, -3).tokens).toEqual(estimateAuditAi(OPUS, 0).tokens);
-    expect(estimateAuditAi(OPUS, Number.NaN).tokens).toEqual(estimateAuditAi(OPUS, 0).tokens);
+    expect(estimateAuditAi(OPUS, 0, NEEDS_BYTES).tokens).toEqual({ input: 30_000, output: 3_000 });
+    expect(estimateAuditAi(OPUS, 2, NEEDS_BYTES).tokens).toEqual({ input: 30_000 + 2 * 2_000, output: 3_000 + 2 * 2_000 });
+    expect(estimateAuditAi(OPUS, 5, NEEDS_BYTES).tokens).toEqual(estimateAuditAi(OPUS, 50, NEEDS_BYTES).tokens);
+    expect(estimateAuditAi(OPUS, 50, NEEDS_BYTES).tokens).toEqual({ input: 40_000, output: 13_000 });
+    expect(estimateAuditAi(OPUS, -3, NEEDS_BYTES).tokens).toEqual(estimateAuditAi(OPUS, 0, NEEDS_BYTES).tokens);
+    expect(estimateAuditAi(OPUS, Number.NaN, NEEDS_BYTES).tokens).toEqual(estimateAuditAi(OPUS, 0, NEEDS_BYTES).tokens);
   });
 
-  it('estimateAuditAi: priced like estimate, cap = 2 × high', () => {
-    const a = estimateAuditAi(OPUS, 5);
+  it('estimateAuditAi: priced like estimate, cap = 2 × high or the two worst calls, whichever is higher', () => {
+    const a = estimateAuditAi(OPUS, 5, NEEDS_BYTES);
     if (a.costUsd === 'local') throw new Error('expected a priced estimate');
     // 40k in × $4 + 13k out × $20 = 0.16 + 0.26 = 0.42
     expect(a.costUsd.input.high).toBeCloseTo(0.16 * 1.5, 6);
     expect(a.costUsd.output.low).toBeCloseTo(0.26 * 0.5, 6);
     expect(a.costUsd.low).toBeCloseTo(0.21, 6);
     expect(a.costUsd.high).toBeCloseTo(0.63, 6);
-    expect(a.capUsd).toBeCloseTo(1.26, 6);
+    expect(a.capUsd).toBeCloseTo(Math.max(1.26, worstOf(OPUS, NEEDS_BYTES)), 6);
   });
 
   it('estimateAuditAi: computed for the chosen provider and model, not always Claude', () => {
-    const opus = estimateAuditAi(OPUS, 5);
-    const gpt = estimateAuditAi({ name: 'openai', model: 'gpt-5-mini' }, 5);
+    const opus = estimateAuditAi(OPUS, 5, NEEDS_BYTES);
+    const gpt = estimateAuditAi({ name: 'openai', model: 'gpt-5-mini' }, 5, NEEDS_BYTES);
     if (gpt.costUsd === 'local' || opus.costUsd === 'local') throw new Error('expected priced estimates');
     expect(gpt.costUsd.high).toBeCloseTo((0.04 * 0.25 + 0.013 * 2) * 1.5, 6);
-    expect(gpt.capUsd).toBeCloseTo(2 * gpt.costUsd.high, 6);
+    expect(gpt.capUsd).toBeCloseTo(Math.max(2 * gpt.costUsd.high, worstOf({ name: 'openai', model: 'gpt-5-mini' }, NEEDS_BYTES)), 6);
     expect(gpt.capUsd).not.toBeCloseTo(opus.capUsd ?? 0, 3);
-    const local = estimateAuditAi({ name: 'ollama', model: 'qwen3' }, 5);
+    const local = estimateAuditAi({ name: 'ollama', model: 'qwen3' }, 5, NEEDS_BYTES);
     expect(local.costUsd).toBe('local');
     expect(local.capUsd).toBeNull();
     expect(local.tokens).toEqual(opus.tokens);
