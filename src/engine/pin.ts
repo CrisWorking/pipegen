@@ -22,7 +22,8 @@
 // be read, or is in the future, refuses the pin (fail closed). Pre-releases are never newly pinned, and a release
 // whose target_commitish is another commit than its tag's means the tag moved: refused. Every new pin adds a note
 // asking for human review (reviewed-tools Step 6). A stored pin whose tag now leads somewhere odd (not a commit,
-// not an image index) is still a moved tag: alert, stored pin kept; a deleted tag is a note, stored pin kept.
+// not an image index, an index with no readable digest) is still a moved tag: alert, stored pin kept; a deleted
+// tag is a note, stored pin kept.
 //
 // Requests: every name is checked before any request and each path segment is encoded (ruling S14). Only
 // `deps.gh` (api.github.com) carries the user's credential (ruling S15). `deps.fetch` never gets it; the one
@@ -407,7 +408,12 @@ export async function resolvePin(c: Candidate, deps: PinDeps, install?: InstallS
       return c; // the stored, reviewed digest: never replaced
     }
     const digest = res.headers.get('docker-content-digest') ?? '';
-    if (!DIGEST_RE.test(digest)) throw new PinError(`The registry gave no readable digest for ${image.display}:${tag}.`);
+    if (!DIGEST_RE.test(digest)) {
+      if (stored === undefined) throw new PinError(`The registry gave no readable digest for ${image.display}:${tag}.`);
+      // the tag no longer leads to a readable index digest: odd, so it is treated like a moved tag (alert, keep)
+      deps.alert(new PinMovedWarning(image.display, tag, stored, NOT_AN_INDEX, 'image'));
+      return c; // the stored, reviewed digest: never replaced
+    }
     if (stored !== undefined) {
       if (digest !== stored) deps.alert(new PinMovedWarning(image.display, tag, stored, digest, 'image'));
       return c; // the stored, reviewed digest: never replaced

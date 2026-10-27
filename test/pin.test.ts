@@ -571,6 +571,36 @@ describe('pin: fix round 1', () => {
     expect(alert.mock.calls[0][0]).toMatchObject({ storedSha: DIGEST, liveSha: '<not an index>' });
   });
 
+  it('pin: a stored image whose index answer has no readable digest → alert, stored digest kept; a new pin is refused (final review, optional)', async () => {
+    for (const bad of ['', 'sha256:abc', 'md5:' + 'f'.repeat(32), `sha256:${'F'.repeat(64)}`]) {
+      const headers: Record<string, string> = { 'content-type': INDEX };
+      if (bad !== '') headers['docker-content-digest'] = bad;
+      const routes = hubRoutes({ [`HEAD https://registry-1.docker.io/v2/library/alpine/manifests/3.20`]: { headers } });
+      const { deps, alert } = setup({}, routes);
+      const c = storedImage();
+      expect(await resolvePin(c, deps, docker()), bad).toEqual(c);
+      expect(alert).toHaveBeenCalledTimes(1);
+      expect(alert.mock.calls[0][0]).toMatchObject({ storedSha: DIGEST, liveSha: '<not an index>' });
+      const fresh = setup({}, routes);
+      await expect(resolvePin(dockerCand(), fresh.deps, docker()), bad).rejects.toThrow(/no readable digest/);
+    }
+  });
+
+  it('pin: a new pin is refused when the tag leads to a tree, a blob or a deep tag chain, or the image is no index (final review, optional)', async () => {
+    const tree: Routes = { [`GET ${GH}/repos/o/r/git/ref/tags/v1.2.3`]: ref('v1.2.3', 'tree' as 'commit', LIVE_SHA) };
+    for (const routes of [tree, blobRef, deepChain]) {
+      const { deps, alert, notes } = setup(github(routes));
+      await expect(resolvePin(cand(), deps)).rejects.toThrow(/doesn't lead to a commit/);
+      expect(alert).not.toHaveBeenCalled();
+      expect(notes.join(' ')).not.toMatch(/needs human review/);
+    }
+    for (const type of ['application/vnd.oci.image.manifest.v1+json', 'application/vnd.docker.distribution.manifest.v2+json', 'text/html', '']) {
+      const { deps, notes } = setup({}, hubRoutes({ [`HEAD https://registry-1.docker.io/v2/library/alpine/manifests/3.20`]: manifest(DIGEST, type) }));
+      await expect(resolvePin(dockerCand(), deps, docker()), type).rejects.toThrow(/isn't a multi-platform image index/);
+      expect(notes).toEqual([]);
+    }
+  });
+
   it('pin: a stored image tag that is gone (404) → note, stored digest kept', async () => {
     const { deps, alert, notes } = setup({}, hubRoutes({ [`HEAD https://registry-1.docker.io/v2/library/alpine/manifests/3.20`]: { status: 404 } }));
     const c = storedImage();
