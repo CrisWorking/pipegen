@@ -515,7 +515,16 @@ tools:
     categories: [unit-tests, full-tests]
     commands: [go test]
     notWithFlags: [-list, --list]
-  # ---------- test coverage (Plan P Task 3, ruling PS17: partial until Plan P Task 4 checks for a minimum) ----------
+  # ---------- test coverage (Plan P Task 3, ruling PS17: partial until a minimum is found) ----------
+  # Plan P Task 4 (PB4 b), checked 2026-10-27: a run is covered only with a minimum above 0, from a flag (minimumFlags,
+  # minimumSwitches here) or from a config file mapCoverage reads (src/audit/config-checks.ts). Flags:
+  # vitest https://vitest.dev/config/coverage (--coverage.thresholds.lines|functions|branches|statements=<number>);
+  # jest https://jestjs.io/docs/configuration (coverageThreshold; a positive number is a minimum percentage; the CLI flag
+  # takes the same object as JSON); pytest-cov https://pytest-cov.readthedocs.io/en/latest/config.html ("--cov-fail-under:
+  # Fail if the total coverage is less than MIN"); coverage.py https://coverage.readthedocs.io/en/latest/config.html
+  # ([report] fail_under; the config file can be swapped with --rcfile or COVERAGE_RCFILE, so that env var is a softEnv);
+  # c8 https://github.com/bcoe/c8/blob/main/README.md (`c8 --check-coverage --lines 100 npm test`; its default
+  # thresholds aren't documented there, so --check-coverage counts only with a threshold flag).
   # https://vitest.dev/guide/coverage (--coverage, or --coverage.enabled; false turns it off)
   - id: vitest-cov
     categories: [coverage]
@@ -524,6 +533,7 @@ tools:
     notWithFlags: [--coverage=false, --coverage.enabled=false, --no-coverage]
     commandFails: never
     partialWhy: This run measures test coverage, but pipegen hasn't checked for a minimum, so a drop in coverage may not fail it.
+    minimumFlags: [--coverage.thresholds.lines, --coverage.thresholds.functions, --coverage.thresholds.branches, --coverage.thresholds.statements]
   # https://jestjs.io/docs/cli (--coverage, alias --collectCoverage; --listTests, --showConfig and --collectTests run no tests)
   - id: jest-cov
     categories: [coverage]
@@ -532,12 +542,14 @@ tools:
     notWithFlags: [--coverage=false, --collectCoverage=false, --no-coverage, --listTests, --showConfig, --collectTests]
     commandFails: never
     partialWhy: This run measures test coverage, but pipegen hasn't checked for a minimum, so a drop in coverage may not fail it.
+    minimumFlags: [--coverageThreshold]
   # https://github.com/bcoe/c8/blob/main/README.md (c8 runs a command and measures its coverage)
   - id: c8
     categories: [coverage]
     commands: [c8]
     commandFails: never
     partialWhy: This run measures test coverage, but pipegen hasn't checked for a minimum, so a drop in coverage may not fail it.
+    minimumSwitches: [--check-coverage]
   # https://github.com/istanbuljs/nyc/blob/main/README.md (nyc runs a command and measures its coverage; it is also a
   # wrapper, so the command it runs is read too)
   - id: nyc
@@ -545,6 +557,7 @@ tools:
     commands: [nyc]
     commandFails: never
     partialWhy: This run measures test coverage, but pipegen hasn't checked for a minimum, so a drop in coverage may not fail it.
+    minimumSwitches: [--check-coverage]
   # https://pytest-cov.readthedocs.io/en/latest/config.html (--cov[=SOURCE]; --no-cov turns it off)
   - id: pytest-cov
     categories: [coverage]
@@ -553,12 +566,16 @@ tools:
     notWithFlags: [--no-cov]
     commandFails: never
     partialWhy: This run measures test coverage, but pipegen hasn't checked for a minimum, so a drop in coverage may not fail it.
+    minimumFlags: [--cov-fail-under]
+    softEnv: [COVERAGE_RCFILE]
   # https://coverage.readthedocs.io/en/latest/cmd.html (coverage run measures, coverage report reports)
   - id: coverage-py
     categories: [coverage]
     commands: [coverage run, coverage report]
     commandFails: never
     partialWhy: This run measures test coverage, but pipegen hasn't checked for a minimum, so a drop in coverage may not fail it.
+    minimumFlags: [--fail-under]
+    softEnv: [COVERAGE_RCFILE]
   # https://github.com/golang/go/blob/master/src/cmd/go/internal/test/test.go (-cover; -covermode, -coverpkg and
   # -coverprofile each set -cover)
   - id: go-cover
@@ -568,6 +585,19 @@ tools:
     notWithFlags: [-list, --list]
     commandFails: never
     partialWhy: This run measures test coverage, but pipegen hasn't checked for a minimum, so a drop in coverage may not fail it.
+  # ---------- dependency updates (Plan P Task 4) ----------
+  # Renovate run by the repo itself: the sign that the Renovate config is used (the hosted app can't be seen with read
+  # access). It covers no need by itself: mapCoverage's update-config check (src/audit/config-checks.ts) reads the repo's
+  # config and uses a clean run of this tool as the sign that Renovate is in use. https://github.com/renovatebot/github-action/blob/main/action.yml (input `configurationFile` swaps the config
+  # file); https://docs.renovatebot.com/self-hosted-configuration/ (env RENOVATE_CONFIG_FILE swaps it too)
+  - id: renovate
+    categories: [update-config]
+    actions: [renovatebot/github-action]
+    commands: [renovate]
+    requireInputs:
+      unset: [configurationFile]
+      why: This Renovate run uses a config file named in the workflow, which pipegen doesn't read.
+    softEnv: [RENOVATE_CONFIG_FILE]
   # ---------- lint and format ----------
   # hook: https://github.com/pre-commit/mirrors-eslint/blob/main/.pre-commit-hooks.yaml (id eslint, entry eslint)
   - id: eslint

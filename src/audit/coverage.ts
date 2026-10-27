@@ -78,6 +78,12 @@
 //   script counted by name (`npm run test:coverage` → coverage).
 // - a command with more words than pipegen reads (MAX_FLAG_WORDS) is partial ('long'): a soft flag could hide past them.
 // - a step or job `if:` wins over a reason a run can't block, so a check that doesn't block is partial under it.
+// Plan P Task 4 (src/audit/config-checks.ts; rulings PB4, PS17, PS22): update-config is read from the Dependabot or
+// Renovate file (covered only with a 7-day cooldown on every ecosystem and folder; Renovate only with a scheduled run of
+// Renovate itself, since the app can't be seen); publishing is never covered from the profile alone; a coverage run that
+// only measures (PS17) is covered only when a minimum above 0 is found (a flag, or a config file in the folder it runs
+// in; a threshold only found in JS config text stays partial); versionAdjust is the last step (ESLint 10 with only
+// .eslintrc is partial; end-of-life notes).
 // A tool counts only where a command starts: at the start, after ; && || | & ( $( { a newline, a shell keyword or a
 // wrapper (npx, sudo, env, time, command without -v, pnpm/yarn dlx, uv run, pipx run, python -m, sh/bash, …), as the
 // basename of a path, or as the image after `docker run [flags]`. Quoted text, here-document bodies and case patterns
@@ -113,7 +119,8 @@ import { regexSafe } from '../read/limits.js';
 import { MAX_WORKFLOWS, WORKFLOW_FILE } from '../read/workflows.js';
 import type { Capabilities, ExistingWorkflow, Need, RepoProfile } from '../types.js';
 import { safeText } from '../util/safe-text.js';
-import { DEPLOY_VERIFY_WHY, Dirs, Firsts, GATE_WHY, Scope, ciCoverage, hookCoverage, type Decide } from './coverage/decide.js';
+import { coverageMinimumRow, publishingCoverage, updateConfigCoverage, versionAdjust } from './config-checks.js';
+import { DEPLOY_VERIFY_WHY, Dirs, Firsts, GATE_WHY, Scope, ciCoverage, firstPartialHit, hookCoverage, type Decide } from './coverage/decide.js';
 import { hookRunHits, readHooks } from './coverage/hooks.js';
 import { compile, loadToolSignatures } from './coverage/signatures.js';
 import { fitOf, parseOn, scheduleFires } from './coverage/triggers.js';
@@ -224,10 +231,19 @@ export async function mapCoverage(p: RepoProfile, needs: Need[], dir: string, op
     ci, hooks: hookRuns, scope: new Scope(p.services, dirs), dirsCapped: dirs.capped,
     truncated: ctx.budget.truncated, unreadable: ctx.unreadable, noImage: opts.noImage ?? (() => false),
   };
-  return needs.map((need) => {
-    if (need.layer === 'pre-commit') return hookCoverage(need, hooks, d);
-    if (need.category === 'gate') return { need, status: 'missing', why: GATE_WHY };
-    if (need.category === 'deploy-verify') return { need, status: 'missing', why: DEPLOY_VERIFY_WHY };
-    return ciCoverage(need, need.layer, d);
-  });
+  // Plan P Task 4: a scheduled run of Renovate by the repo itself is the only sign pipegen can see that Renovate is in use
+  const renovateRuns = ctx.hits.some((h) => h.by === 'renovate' && !h.opaque && h.fit.scheduled && h.reason === null);
+  const rows: Coverage[] = [];
+  for (const need of needs) {
+    if (need.layer === 'pre-commit') rows.push(hookCoverage(need, hooks, d));
+    else if (need.category === 'gate') rows.push({ need, status: 'missing', why: GATE_WHY });
+    else if (need.category === 'deploy-verify') rows.push({ need, status: 'missing', why: DEPLOY_VERIFY_WHY });
+    else if (need.category === 'update-config') rows.push(await updateConfigCoverage(p, need, dir, renovateRuns));
+    else if (need.category === 'publishing') rows.push(publishingCoverage(p, need));
+    else if (need.category === 'coverage') {
+      const row = ciCoverage(need, need.layer, d);
+      rows.push(row.status === 'partial' ? await coverageMinimumRow(row, firstPartialHit(need, need.layer, d), dir) : row);
+    } else rows.push(ciCoverage(need, need.layer, d));
+  }
+  return versionAdjust(rows, p); // PS22: the last step, so the chooser reads the adjusted row
 }

@@ -316,6 +316,11 @@ export function ciCoverage(need: Need, ciLayer: CiLayer, d: Decide): Coverage {
   return { need, status: 'missing', why: missingWhy(need, d) };
 }
 
+/** Plan P Task 4: the run behind a CI row that is partial (the first of its kind ciCoverage picks), for the coverage minimum check. */
+export function firstPartialHit(need: Need, ciLayer: CiLayer, d: Decide): Hit | undefined {
+  return d.ci.first(need.category, d.scope.dirsOf(need.service), ciLayer, partialKinds(need));
+}
+
 export function hookCoverage(need: Need, hooks: Hooks, d: Decide): Coverage {
   const m = hooks.manager;
   if (need.category === 'hooks') {

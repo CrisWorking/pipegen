@@ -2206,7 +2206,8 @@ describe('mapCoverage (Plan P Task 3)', () => {
       ['nyc mocha', 'nyc'], ['pytest --cov=pkg', 'pytest-cov'], ['coverage report', 'coverage-py'], ['go test -coverprofile=c.out ./...', 'go-cover']]) {
       const r = await rowOf(ciRun(cmd), 'merge', 'coverage', {}, 'app');
       expect(r, cmd).toMatchObject({ status: 'partial', by });
-      expect(r.why, cmd).toMatch(/hasn't checked for a minimum/);
+      // Plan P Task 4: vitest, jest and pytest runs are checked for a minimum (config-checks.test.ts); the others still aren't
+      expect(r.why, cmd).toMatch(['vitest-cov', 'jest-cov', 'pytest-cov'].includes(by) ? /sets no minimum, so a drop can't fail the build/ : /hasn't checked for a minimum/);
     }
     for (const cmd of ['vitest run', 'vitest --coverage=false', 'vitest --coverage.enabled=false', 'jest', 'pytest --no-cov --cov=x', 'go test ./...']) {
       expect((await rowOf(ciRun(cmd), 'merge', 'coverage', {}, 'app')).status, cmd).toBe('missing');

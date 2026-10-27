@@ -166,7 +166,16 @@ const signatureSchema = z.strictObject({
    * flags are compared that way.
    */
   flagsAnyCase: z.literal(true).optional(),
+  /**
+   * Plan P Task 4 (PB4 b): flags that set a coverage minimum. `minimumFlags` take a number: the last `--f v` or `--f=v`
+   * must read as a number above 0 (or, for jest's --coverageThreshold, a JSON object holding one). `minimumSwitches`
+   * (--check-coverage) count only together with a threshold flag (--lines, --functions, --branches, --statements) above 0.
+   * A run with such a flag is not "never" failing any more.
+   */
+  minimumFlags: z.array(z.string().regex(FLAG_NAME_RE)).min(1).optional(),
+  minimumSwitches: z.array(z.string().regex(FLAG_NAME_RE)).min(1).optional(),
 })
+  .refine((t) => (t.minimumFlags === undefined && t.minimumSwitches === undefined) || t.commands !== undefined, { message: 'minimumFlags and minimumSwitches need commands' })
   .refine((t) => t.commandFails !== 'flag' || t.failFlags !== undefined, { message: 'commandFails: flag needs failFlags' })
   .refine((t) => t.actionFails !== 'input' || t.failInputs !== undefined, { message: 'actionFails: input needs failInputs' })
   .refine((t) => t.excludes === undefined || t.commands !== undefined, { message: 'excludes needs commands' })

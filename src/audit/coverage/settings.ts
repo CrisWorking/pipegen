@@ -109,10 +109,43 @@ function flagView(tool: ToolSignature, words: readonly string[]): { ws: readonly
   return tool.flagsAnyCase === true ? { ws: words.map(anyCaseFlag), spec: anyCaseFlag } : { ws: words, spec: (f) => f };
 }
 
+/** Plan P Task 4 (PB4 b): a plain decimal above 0 ("80", "79.5"); "0", "0.0", "-5", "abc" and "" are not. */
+const positiveNumber = (v: string) => /^\d{1,6}(\.\d{1,6})?$/.test(v) && Number(v) > 0;
+/** jest's --coverageThreshold takes JSON; a number above 0 anywhere in it (depth and size bounded) is a minimum. */
+function jsonHoldsPositive(v: string): boolean {
+  if (v.length > 4096) return false;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(v);
+  } catch {
+    return false;
+  }
+  const stack: unknown[] = [parsed];
+  for (let n = 0; stack.length > 0 && n < 1000; n++) {
+    const x = stack.pop();
+    if (typeof x === 'number') {
+      if (Number.isFinite(x) && x > 0) return true;
+    } else if (x !== null && typeof x === 'object') stack.push(...Object.values(x as object));
+  }
+  return false;
+}
+const THRESHOLD_FLAGS = ['--lines', '--functions', '--branches', '--statements'];
+/** Plan P Task 4: the command line sets a coverage minimum (the signature's minimumFlags or minimumSwitches). */
+export function minimumGiven(tool: ToolSignature, words: readonly string[]): boolean {
+  for (const f of tool.minimumFlags ?? []) {
+    const v = lastFlagValue(f, words);
+    if (typeof v === 'string' && (positiveNumber(v) || jsonHoldsPositive(v))) return true;
+  }
+  if ((tool.minimumSwitches ?? []).some((f) => onlyFlagGiven(f, words))) {
+    return THRESHOLD_FLAGS.some((f) => { const v = lastFlagValue(f, words); return typeof v === 'string' && positiveNumber(v); });
+  }
+  return false;
+}
+
 export function commandReason(tool: ToolSignature, words: readonly string[]): Reason | null {
   const { ws, spec } = flagView(tool, words);
   if ((tool.softFlags ?? []).some((f) => flagGiven(spec(f), ws))) return 'soft';
-  if (tool.commandFails === 'never') return 'never';
+  if (tool.commandFails === 'never') return minimumGiven(tool, ws) ? null : 'never';
   // fix round 1: a fail flag set to a false value (--fail-on-violation=false, --fail=false) doesn't make it fail
   if (tool.commandFails === 'flag' && !(tool.failFlags ?? []).some((f) => onlyFlagGiven(spec(f), ws))) return 'no-fail';
   return null;
