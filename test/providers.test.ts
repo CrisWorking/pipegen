@@ -600,7 +600,7 @@ describe('completeValidated', () => {
 
 describe('ai output', () => {
   it('ai: AI text shown in the terminal passes through safeText (an answer with ANSI and bidi characters prints clean)', () => {
-    const answer = 'Use \x1b[31mgitleaks\x1b[0m‮ here \x1b]8;;https://evil.example\x07link\x1b]8;;\x07⁦!';
+    const answer = 'Use \x1b[31mgitleaks\x1b[0m\u202e here \x1b]8;;https://evil.example\x07link\x1b]8;;\x07\u2066!';
     expect(formatAiText(answer)).toBe('Use gitleaks here link!');
   });
 });

@@ -1,30 +1,10 @@
-import { execFileSync } from 'node:child_process';
-import { readdirSync, readFileSync } from 'node:fs';
-import { join, relative, resolve } from 'node:path';
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { findSecretLike, redact } from '../src/ai/redact.js';
 import { isBinary } from '../src/read/limits.js';
+import { repoFiles, root, walkFiles } from './helpers/repo-files.js';
 import { fake } from './helpers/secret-repo.js';
-
-const root = resolve(import.meta.dirname, '..');
-
-/** Every regular file under `dir` (repo-relative, forward slashes), for when git is not available (a tarball, no git). */
-function walkFiles(dir: string): string[] {
-  return readdirSync(join(root, dir), { recursive: true, withFileTypes: true })
-    .filter((e) => e.isFile())
-    .map((e) => relative(root, join(e.parentPath, e.name)).split('\\').join('/'))
-    .sort();
-}
-
-/** Committed files plus new files not yet committed (not ignored), so the check also covers the working tree. Without git, a walk. */
-function repoFiles(dir: string): string[] {
-  try {
-    const out = execFileSync('git', ['ls-files', '--cached', '--others', '--exclude-standard', '-z', '--', dir], { cwd: root, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] });
-    return out.split('\0').filter(Boolean);
-  } catch {
-    return walkFiles(dir);
-  }
-}
 
 describe('fixtures', () => {
   it('fixtures: without git (not installed, or no .git) the file list falls back to a walk of the folder', () => {

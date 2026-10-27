@@ -206,10 +206,10 @@ describe('estimate: AI', () => {
   });
 
   it('estimate: a model name in basis is cleaned for the terminal', () => {
-    const e = estimate(profile(), JOBS, 2, ACTIVITY, { name: 'openai', model: 'x\u001b[2Jy‮' });
+    const e = estimate(profile(), JOBS, 2, ACTIVITY, { name: 'openai', model: 'x\u001b[2Jy\u202e' });
     const text = e.basis.join('\n');
     expect(text).not.toContain('\u001b');
-    expect(text).not.toContain('‮');
+    expect(text).not.toContain('\u202e');
   });
 
   it('estimate: aiCostCapUsd is twice the high AI cost', () => {

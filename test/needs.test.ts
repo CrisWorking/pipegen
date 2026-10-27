@@ -463,7 +463,7 @@ describe('planNeeds', () => {
     const added = r.needs.filter((n) => !n.floor && (n.id === 'type-check' || n.id === 'dockerfile-lint'));
     expect(added).toHaveLength(2);
     // eslint-disable-next-line no-control-regex
-    const unsafe = /[\u0000-\u001f\u007f-\u009f‪-‮⁦-⁩‎‏؜]/;
+    const unsafe = /[\u0000-\u001f\u007f-\u009f\u202a-\u202e\u2066-\u2069\u200e\u200f\u061c]/;
     for (const s of [...added.map((n) => n.why), ...r.notes]) {
       expect(unsafe.test(s), JSON.stringify(s)).toBe(false);
       expect(s.length).toBeLessThanOrEqual(400);

@@ -350,7 +350,7 @@ describe('discover', () => {
     const esc = '\u001b';
     const items = [
       { full_name: `o/${esc}[31mred`, name: 'red' },
-      { full_name: 'o/ab‮cd', name: 'abcd' },
+      { full_name: 'o/ab\u202ecd', name: 'abcd' },
       { full_name: 'gitleaks/gitleak', name: 'gitleak' }, // look-alike of a reviewed tool
       { full_name: 'ok/tool', name: `nice${esc}]8;;https://x${esc}\\ name` },
     ];
@@ -360,7 +360,7 @@ describe('discover', () => {
     expect(repoGets(s.ghCalls)).toEqual(['ok/tool']);
     expect(s.notes.some((n) => /not a valid GitHub repo/.test(n))).toBe(true);
     expect(s.notes.some((n) => n.includes('gitleaks/gitleak') && /look-alike/.test(n))).toBe(true);
-    for (const n of s.notes) expect(n).not.toMatch(/[\u001b‮]/);
+    for (const n of s.notes) expect(n).not.toMatch(/[\u001b\u202e]/);
   });
 
   it('discover: a repo on the reviewed list for another check is skipped, never offered as an unreviewed tool', async () => {
@@ -416,7 +416,7 @@ describe('toSuggestions', () => {
   it('toSuggestions: why text passed through safeText', () => {
     const esc = '\u001b';
     const long = 'w'.repeat(500);
-    const out = toSuggestions([disc('a/one', { name: `one${esc}]8;;https://x${esc}\\` }), disc('b/two')], new Map([['a/one', `Red ${esc}[31malert${esc}[0m‮txt`], ['b/two', long]]), BAR, AT);
+    const out = toSuggestions([disc('a/one', { name: `one${esc}]8;;https://x${esc}\\` }), disc('b/two')], new Map([['a/one', `Red ${esc}[31malert${esc}[0m\u202etxt`], ['b/two', long]]), BAR, AT);
     expect(out[0]).toEqual({ name: 'one', repo: 'a/one', why: 'Red alerttxt' });
     expect(Array.from(out[1]?.why ?? '').length).toBe(200);
     expect(out[1]?.why.endsWith('…')).toBe(true);

@@ -321,14 +321,14 @@ jobs:
 
   it('coverage: S2 a workflow path with control characters is skipped; where is validated and capped', async () => {
     const dir = makeTempDir();
-    const bad = '.github/workflows/a‮b.yml';
+    const bad = '.github/workflows/a\u202eb.yml';
     writeIn(dir, bad, `on: push\n${job(run('gitleaks detect'))}`);
     const listed = listedWorkflow(bad);
     expect(row(await coverage(dir, { existingWorkflows: [listed] }), 'push', 'secrets').status).toBe('unknown'); // never a silent skip
     // a very long job id: where is capped; a job id that fails the pattern is shown by number
     const dir2 = makeTempDir();
     const long = `j${'x'.repeat(1000)}`; // YAML keys stay under 1024 characters
-    wf(dir2, 'ci.yml', `on: push\njobs:\n  ${long}:\n    runs-on: x\n    steps:\n${run('gitleaks detect')}  "bad job‮":\n    runs-on: x\n    steps:\n${run('semgrep scan')}`);
+    wf(dir2, 'ci.yml', `on: push\njobs:\n  ${long}:\n    runs-on: x\n    steps:\n${run('gitleaks detect')}  "bad job\u202e":\n    runs-on: x\n    steps:\n${run('semgrep scan')}`);
     const rows = await coverage(dir2);
     const where = row(rows, 'push', 'secrets').where ?? '';
     expect(Array.from(where).length).toBeLessThanOrEqual(300);
