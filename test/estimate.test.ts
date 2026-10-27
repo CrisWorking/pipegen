@@ -617,6 +617,20 @@ describe('activity30d', () => {
     expect(a).toEqual({ pushes: 0, prs: 999, capped: false });
   });
 
+  it('activity30d: a stray old event in the middle of a page does not end the count (final re-review I1)', async () => {
+    // GitHub's event list isn't strictly by date: older events show up mid-list. Only the page's last event says the
+    // 30-day start was reached. Here 3 pages reach back 6 days only, so the count is a lower bound.
+    const mk = (n: number, startDay: number) => Array.from({ length: n }, (_, i) => ({ type: 'PushEvent', created_at: iso(startDay + i / 100) }));
+    const p1 = [...mk(48, 0), { type: 'PullRequestEvent', created_at: iso(290) }, ...mk(48, 1)];
+    const p2 = [...mk(50, 2), { type: 'PullRequestEvent', created_at: iso(95) }, ...mk(49, 3)];
+    const p3 = mk(100, 4);
+    const { gh, calls } = fakeOctokit({ [EVENTS]: givenPages([p1, p2, p3]), [PULLS]: pages([]) });
+    const a = await activity30d(gh, profile(), { budget: newRateBudget(), now: () => NOW });
+    expect(a).toEqual({ pushes: 295, prs: 0, capped: true });
+    expect(calls.filter((c) => c.url.pathname.endsWith('/events'))).toHaveLength(3);
+    expect(estimate(profile(), JOBS, 2, a, OPUS).basis.join('\n')).toContain('at least 295 pushes');
+  });
+
   it('activity30d: stops paging at the first event older than 30 days (not capped)', async () => {
     const events = [...Array.from({ length: 150 }, () => ({ type: 'PushEvent', created_at: iso(1) })), ...Array.from({ length: 150 }, () => ({ type: 'PushEvent', created_at: iso(40) }))];
     const { gh, calls } = fakeOctokit({ [EVENTS]: pages(events), [PULLS]: pages([]) });

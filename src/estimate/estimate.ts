@@ -588,13 +588,15 @@ export async function activity30d(gh: Octokit, p: RepoProfile, clock: RateClock)
   let pushes = 0;
   const eventsCapped = await pagesOf((page) => gh.rest.activity.listRepoEvents({ owner, repo, per_page: PER_PAGE, page }), eventsSchema, 'event list',
     EVENT_PAGES, true, (list) => {
-      let older = false;
+      // GitHub's event list isn't strictly by date (older events show up mid-list), so only the page's last dated
+      // event says the 30-day start was reached (final re-review I1); stray old events are just not counted.
+      let lastInside: boolean | undefined;
       for (const e of list) {
         const inside = inWindow(e.created_at);
-        if (inside === false) older = true;
-        else if (inside && e.type === 'PushEvent') pushes++;
+        if (inside !== undefined) lastInside = inside;
+        if (inside && e.type === 'PushEvent') pushes++;
       }
-      return older;
+      return lastInside === false;
     });
 
   let prs = 0;
