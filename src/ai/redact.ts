@@ -34,7 +34,8 @@ export interface BundleOptions {
 export const COUNTING_ONLY_NOTE = 'gitleaks was not run: this bundle is for counting only and cannot be sent to the AI.';
 
 const R = '[REDACTED]';
-const LONG_LINE = '[REDACTED: line too long]';
+/** What redact() puts in place of a line too long to scan (over 4 KB): the whole line is hidden. */
+export const LONG_LINE = '[REDACTED: line too long]';
 const DEFAULT_MAX_BYTES = 150_000;
 const GITLEAKS_TIMEOUT_MS = 60_000;
 const MAX_REPORT_BYTES = 64 * 1024 * 1024;
@@ -1024,14 +1025,28 @@ function knownForms(values: string[]): string[] {
  * changed case; HTML-entity or language-specific escapes (Python `\xe9`).
  */
 export function scrubKnownValues(text: string, values: string[]): string {
+  return knownValueScrubber(values)(text);
+}
+
+/**
+ * scrubKnownValues with the forms of `values` worked out once: the returned function scrubs any number of texts
+ * (the audit renderers clean thousands of short strings with the same values).
+ */
+export function knownValueScrubber(values: readonly string[]): (text: string) => string {
+  const forms = knownForms([...values]);
+  const upperForms = new Set(forms.map(upperPercent));
+  const anyPercent = forms.some((f) => f.includes('%'));
+  return (text) => scrubWith(text, forms, upperForms, anyPercent);
+}
+
+function scrubWith(text: string, forms: string[], upperForms: Set<string>, anyPercent: boolean): string {
   const spans: [number, number][] = [];
   // Spans are found twice and united: on the text as it is (forms as they are), and on a copy with every
   // %xx in upper case (same length, so the spans apply to the original) against forms normalised the same
   // way, so percent escapes match in any hex case and a value right after a literal '%' is still found.
-  const forms = knownForms(values);
   const hay = upperPercent(text);
   const searches: [string, Iterable<string>][] = [[text, forms]];
-  if (hay !== text || forms.some((f) => f.includes('%'))) searches.push([hay, new Set(forms.map(upperPercent))]);
+  if (hay !== text || anyPercent) searches.push([hay, upperForms]);
   for (const [h, fs] of searches) {
     for (const f of fs) {
       for (let i = h.indexOf(f); i >= 0; i = h.indexOf(f, i + 1)) spans.push([i, i + f.length]);

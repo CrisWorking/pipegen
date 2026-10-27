@@ -3,15 +3,17 @@
 // no backticks around repo values, escaped exactly once) and Review Focus 3 (never suggest making the repo public).
 import { describe, expect, it } from 'vitest';
 import { EXCLUDED_KEPT, EXCLUDED_PATTERN_GROUPS, EXCLUDED_PATTERNS, excludedSummaryLines, redact } from '../src/ai/redact.js';
-import type { AuditReport } from '../src/audit/model.js';
+import { FULL_SETUP_COMMAND, isBuiltInNeed, isOwnCommand, needLabel, safeRunCommand, type AuditReport } from '../src/audit/model.js';
 import { CANT_SEE, renderJson, renderMarkdown, renderTerminal, type RenderOptions } from '../src/audit/render.js';
 import { safeMarkdown } from '../src/util/safe-text.js';
-import { EMPTY_PLACEHOLDER, safeOutput } from '../src/util/safe-output.js';
-import { aiPart, FREE_PRIVATE_LIMITS, freePrivateReport, need, reviewedTool, service, TREE, usageOf } from './fixtures/audit-report.js';
+import { EMPTY_PLACEHOLDER, safeOutput, TOO_LONG } from '../src/util/safe-output.js';
+import { aiPart, FREE_PRIVATE_LIMITS, freePrivateReport, need, reviewedTool, service, SUGGESTION_NOTE, TREE, usageOf } from './fixtures/audit-report.js';
 import { hostileNames } from './fixtures/hostile-names.js';
 import { fake } from './helpers/secret-repo.js';
 
 const NOW = Date.UTC(2026, 9, 27, 9, 30);
+const ANON = { text: 'Without a GitHub token, pipegen reads public data only and is rate-limited.' };
+const SWAP = { text: 'This repo could change which pipegen runs. Run pipegen from outside the repo, from the npm registry, with:', command: safeRunCommand('0.1.0') };
 const OPTS: RenderOptions = { knownValues: [], now: () => NOW };
 const report = (): AuditReport => freePrivateReport(EXCLUDED_PATTERNS);
 const term = (r: AuditReport, o: RenderOptions = OPTS) => renderTerminal(r, o);
@@ -53,7 +55,7 @@ const lineOf = (text: string, needle: string) => text.split('\n').findIndex((l) 
 
 describe('renderTerminal / renderMarkdown (brief)', () => {
   it('report: section order as specified', () => {
-    const r = { ...report(), warnings: ['Without a GitHub token, pipegen reads public data only and is rate-limited.'], ai: aiPart() };
+    const r = { ...report(), warnings: [ANON], ai: aiPart() };
     for (const text of [term(r), md(r)]) {
       const verdict = lineOf(text, '4 of 4 layers have gaps');
       const warn = lineOf(text, 'Warnings');
@@ -139,8 +141,7 @@ describe('renderTerminal / renderMarkdown (brief)', () => {
   });
 
   it('report: warnings shown first, right after the verdict (secrets in the files first)', () => {
-    const w = 'This repo could change which pipegen runs. Run it from outside the repo: `npx --registry=https://registry.npmjs.org pipegen@0.1.0 audit --dir ./repo`.';
-    const r = { ...report(), warnings: [w, 'Without a GitHub token, pipegen reads public data only and is rate-limited.'] };
+    const r = { ...report(), warnings: [SWAP, ANON] };
     const t = term(r);
     const lines = t.split('\n');
     const verdictLine = lines.findIndex((l) => l.startsWith('Verdict:'));
@@ -167,7 +168,7 @@ describe('renderTerminal / renderMarkdown (brief)', () => {
       expect(text).toContain('zizmor');
       expect(text).toContain('woodruffw/zizmor');
       expect(text).toContain('Finds risky settings in GitHub Actions workflows.');
-      expect(text).toContain('the AI also suggests checking type-check (shop-api)');
+      expect(text).toContain('the AI also suggests checking type check for shop-api');
       expect(text).toContain('In this version only GitHub Actions and npm packages can become suggestions.');
       // never a step or a command
       const line = text.split('\n').find((l) => l.includes('woodruffw/zizmor')) as string;
@@ -226,20 +227,21 @@ describe('renderTerminal / renderMarkdown (brief)', () => {
 
 describe('snapshots', () => {
   it('report: markdown snapshot (realistic free private report with --ai)', async () => {
-    const r = { ...report(), ai: aiPart() };
+    const r = { ...report(), ai: aiPart(), warnings: [SWAP] };
     await expect(visible(md(r))).toMatchFileSnapshot('./__snapshots__/audit-render.free-private.md');
   });
 
   it('report: terminal snapshot (realistic free private report with --ai)', async () => {
-    const r = { ...report(), ai: aiPart() };
+    const r = { ...report(), ai: aiPart(), warnings: [SWAP] };
     const t = term(r);
     expect(t).not.toContain(ESC); // no colours
     await expect(visible(t)).toMatchFileSnapshot('./__snapshots__/audit-render.free-private.txt');
   });
 
   it('report: terminal lines stay within 100 characters', () => {
-    const r = { ...report(), ai: aiPart(), warnings: ['This repo could change which pipegen runs. Run it from outside the repo: `npx --registry=https://registry.npmjs.org pipegen@0.1.0 audit --dir ./repo`.'] };
-    for (const line of term(r).split('\n')) expect([...line].length, line).toBeLessThanOrEqual(100);
+    const r = { ...report(), ai: aiPart(), warnings: [SWAP, ANON] };
+    // pipegen's own commands are never wrapped (U17); everything else fits
+    for (const line of term(r).split('\n')) if (!isOwnCommand(line.trim())) expect([...line].length, line).toBeLessThanOrEqual(100);
   });
 });
 
@@ -279,7 +281,10 @@ describe('rulings', () => {
       expect(text).not.toMatch(/\brun `?npx pipegen\b/i);
       expect(text).not.toMatch(/\bnpx pipegen init\b/);
     }
-    const other = { ...r, support: { level: 'audit-only' as const, reasons: ['Python support arrives in v0.4.'], nextStep: 'The full setup (`npx pipegen`) arrives in v0.4 for Python and monorepos.' } };
+    const other = {
+      ...r,
+      support: { level: 'audit-only' as const, reasons: ['Python support arrives in v0.4.'], nextStep: 'The full setup arrives in v0.4 for Python and monorepos.', nextCommand: FULL_SETUP_COMMAND },
+    };
     const t = term(other);
     expect(t).toContain('Python support arrives in v0.4.');
     expect(t).toContain('arrives in v0.4 for Python and monorepos.');
@@ -330,8 +335,8 @@ describe('rulings', () => {
     const permRow = ['Secrets', 'read and write'].join(': ');
     const withPerm = { ...r, permissions: [...r.permissions, { permission: permRow, why: 'Stores the signing key the pipeline uses.' }] };
     expect(JSON.parse(json(withPerm)).permissions.map((p: { permission: string }) => p.permission)).toContain(permRow);
-    expect(term(withPerm)).toContain(`${permRow}: Stores the signing key`);
-    expect(md(withPerm)).toContain(`${permRow}: Stores the signing key`);
+    expect(term(withPerm)).toContain(`${permRow} — Stores the signing key`);
+    expect(md(withPerm)).toContain(`${permRow} — Stores the signing key`);
     // pretty-printed
     expect(json(r)).toContain('\n  "profile": {');
   });
@@ -354,7 +359,7 @@ describe('rulings', () => {
       aiBundle: { ...r.aiBundle, topFolders: [known, cred, 'src'] },
       [TREE]: [{ file: `${known}/x.txt`, rule: 'generic-api-' + 'key' }],
       notes: [`Skipped ${known}/package.json: not valid JSON.`],
-      warnings: [`Planted ${known}.`],
+      warnings: [{ text: `Planted ${known}.`, command: `npx ${known}` }],
       ai: aiPart({ suggestions: [{ name: known, repo: `acme/${known}`, why: `Found ${cred}.` }], notes: [`AI saw ${known}.`] }),
     };
     const o: RenderOptions = { knownValues: [known], now: () => NOW };
@@ -439,10 +444,10 @@ describe('rulings', () => {
   it('what pipegen would add: reviewed tools, your own scripts, built-in checks and suggestion-only rows', () => {
     const r = report();
     const script = { need: need('push', 'unit-tests', 'shop-api'), status: 'partial' as const, tool: { kind: 'project-script' as const, needId: 'unit-tests', service: 'shop-api', script: 'test' as const }, note: 'your own `test` script would run here' };
-    const t = term({ ...r, wouldAdd: [...r.wouldAdd, script] });
+    const t = tflat({ ...r, wouldAdd: [...r.wouldAdd, script] });
     expect(t).toContain('gitleaks v2.3.9 (gitleaks/gitleaks-action), reviewed tool');
     expect(t).toContain("pipegen's own check");
-    expect(t).toContain('no reviewed tool yet (suggestion only)');
+    expect(t).toContain(SUGGESTION_NOTE);
     expect(t).toContain('your own `test` script would run here');
     expect(t).toContain('Dockerfile');
     const unavailable = { ...r, wouldAdd: r.wouldAdd.map((w) => (w.tool === null ? { ...w, note: 'reviewed list unavailable' } : w)) };
@@ -481,6 +486,131 @@ describe('rulings', () => {
   });
 });
 
+describe('fix round 1', () => {
+  it('I1: about 5,000 services render in the terminal, Markdown and JSON without a stack overflow', () => {
+    const r = report();
+    const names = Array.from({ length: 5000 }, (_, i) => `svc-${i}`);
+    const big: AuditReport = {
+      ...r,
+      profile: { ...r.profile, services: names.map((name) => service({ name, path: `apps/${name}` })) },
+      // every realistic row for every service: 80,000 rows, about 200,000 terminal lines (the review's crash case)
+      coverage: names.flatMap((n) => r.coverage.map((c) => ({ ...c, need: { ...c.need, service: n } }))),
+      wouldAdd: names.map((n) => ({ need: need('push', 'sast', n), status: 'missing' as const, tool: null, note: SUGGESTION_NOTE })),
+      wouldCreate: names.map((n) => ({ what: 'tests' as const, why: `No tests found for ${n}: pipegen would create starter tests.` })),
+      aiBundle: { ...r.aiBundle, topFolders: names },
+      notes: names.map((n) => `Skipped ${n}/package.json: not valid JSON.`),
+    };
+    const t = term(big);
+    const m = md(big);
+    const j = json(big);
+    expect(t).toContain('svc-4999');
+    expect(m).toContain('svc-4999');
+    expect(JSON.parse(j).coverage).toHaveLength(names.length * r.coverage.length);
+  }, 120_000);
+
+  it('I2 (U16): pipegen\'s own checks are gaps pipegen fills, never serious', () => {
+    expect(isBuiltInNeed({ category: 'gate' })).toBe(true);
+    expect(isBuiltInNeed({ category: 'deploy-verify' })).toBe(true);
+    expect(isBuiltInNeed({ category: 'secrets' })).toBe(false);
+    const r = report();
+    // a well-covered repo: everything covered except the merge gate and the deploy check
+    const builtInsOnly = { ...r, coverage: r.coverage.map((c) => (isBuiltInNeed(c.need) ? { ...c, status: 'missing' as const } : { ...c, status: 'covered' as const })) };
+    const t = term(builtInsOnly);
+    expect(t).toContain('Verdict: 2 of 4 layers have gaps; none is serious.');
+    expect(t).not.toContain('serious gaps');
+    expect(t).not.toMatch(/⚠ missing/); // no row marker on pipegen's own checks
+    expect(t).toMatch(/ {6}missing {2}Merge gate \(pipegen\)/);
+    expect(flat(t)).toContain("Merge gate (pipegen), on every pull request (now missing): pipegen's own check"); // still a gap pipegen fills
+    expect(md(builtInsOnly)).toContain('2 of 4 layers have gaps; none is serious.');
+    // the realistic report still has a third-party gap in every layer
+    expect(term(r)).toContain('Verdict: 4 of 4 layers have gaps; 4 are serious.');
+  });
+
+  it('I3 (U17): pipegen\'s own commands appear byte for byte, unwrapped in the terminal and unescaped in Markdown', () => {
+    const cmd = safeRunCommand('0.1.0');
+    expect(cmd).toBe('npx --registry=https://registry.npmjs.org pipegen@0.1.0 audit --dir ./repo');
+    expect(safeRunCommand('1.2.3-evil; rm -rf /')).toBe('npx --registry=https://registry.npmjs.org pipegen audit --dir ./repo');
+    expect(safeRunCommand(null)).toBe('npx --registry=https://registry.npmjs.org pipegen audit --dir ./repo');
+    const r = { ...report(), warnings: [SWAP] };
+    const tLines = term(r).split('\n');
+    expect(tLines).toContain(`    ${cmd}`); // on its own line, whole
+    expect(tLines).toContain(`    ${FULL_SETUP_COMMAND}`);
+    const mLines = md(r).split('\n');
+    const at = mLines.indexOf(`  ${cmd}`);
+    expect(at).toBeGreaterThan(0);
+    expect(mLines[at - 1]).toBe('  ```sh');
+    expect(mLines[at + 1]).toBe('  ```');
+    expect(mLines).toContain(FULL_SETUP_COMMAND);
+    expect(md(r)).not.toContain('\\`npx');
+    // a long version is still one line in the terminal
+    const long = safeRunCommand('123456789.123456789.123456789');
+    expect(long.length).toBeGreaterThan(90);
+    const longLines = term({ ...r, warnings: [{ ...SWAP, command: long }] }).split('\n');
+    expect(longLines).toContain(`    ${long}`);
+    // JSON keeps the commands as they are
+    const j = JSON.parse(json(r));
+    expect(j.warnings[0].command).toBe(cmd);
+    expect(j.support.nextCommand).toBe(FULL_SETUP_COMMAND);
+    // anything that isn't exactly a command pipegen builds is cleaned like any other value
+    expect(isOwnCommand('npx --registry=https://registry.npmjs.org pipegen@0.1.0 audit --dir ./repo`; x')).toBe(false);
+    const odd = { ...r, warnings: [{ text: 'x', command: '`npx evil` @someone' }] };
+    expect(md(odd)).not.toContain('`npx evil`');
+    expect(md(odd)).not.toContain('```sh\n`npx');
+  });
+
+  it('M1: only the report\'s own top-level permission table skips redact in JSON', () => {
+    const cred = fake.awsKey();
+    const r = report();
+    const nested = { ...r, profile: { ...r.profile, permissions: `uses ${cred}` } } as unknown as AuditReport;
+    expect(json(nested)).not.toContain(cred);
+  });
+
+  it('M2: a value over 4 KB reads "(value too long to show)", not as a secret', () => {
+    const r = { ...report(), notes: [`${'word '.repeat(1000)}end`] };
+    for (const text of [term(r), md(r), json(r)]) {
+      expect(text).toContain(TOO_LONG);
+      expect(text).not.toContain('line too long');
+    }
+  });
+
+  it('M3: a local model reads "no cost counted", never "$0.00"', () => {
+    const t = tflat({ ...report(), ai: aiPart({ local: true, costUsd: 0, attempts: [{ model: 'llama3', input: 9, output: 9, cacheRead: 0, cacheWrite: 0, listUsd: 0 }] }) });
+    expect(t).toContain('AI cost of this audit: no cost counted: Ollama runs the model itself, not a paid API (1 AI call).');
+    expect(t).not.toContain('$0.00');
+  });
+
+  it('M4: plain-English check names, suggestion wording, no "proof", and the gate\'s limit on a plan without a merge lock', () => {
+    expect(needLabel('sast')).toBe('Code scan (SAST)');
+    expect(needLabel('sbom')).toBe('Software bill of materials (SBOM)');
+    expect(needLabel('nope')).toBeNull();
+    const t = tflat(report());
+    expect(t).toContain('Code scan (SAST) for shop-api');
+    expect(t).toContain('Software bill of materials (SBOM) for shop-api');
+    expect(t).not.toMatch(/\bsast\b/);
+    expect(t).toContain(SUGGESTION_NOTE);
+    expect(t).not.toContain('the proof stops');
+    expect(t).toContain("On this plan GitHub can't make it a required check");
+    const locked = { ...report(), capabilities: { ...report().capabilities, branchProtection: true } };
+    expect(tflat(locked)).not.toContain("can't make it a required check");
+    // an id pipegen doesn't know is shown cleaned
+    expect(tflat({ ...report(), ai: aiPart({ extraNeeds: [{ ...need('push', 'odd-check'), why: 'x' }] }) })).toContain('checking odd-check');
+  });
+
+  it('M6: JSON keys that clean to the same text both stay; a __proto__ key is a plain key', () => {
+    const r = report();
+    const odd = { ...r, profile: { ...r.profile, extra: JSON.parse('{"__proto__": "p", "a\\u001b": 1, "a": 2}') } } as unknown as AuditReport;
+    const j = JSON.parse(json(odd));
+    expect(Object.keys(j.profile.extra).sort()).toEqual(['__proto__', 'a', 'a (2)']);
+  });
+
+  it('M8: JSON keeps a real empty string; human output shows the placeholder', () => {
+    const r = { ...report(), profile: { ...report().profile, defaultBranch: '' }, notes: [''] };
+    expect(JSON.parse(json(r)).profile.defaultBranch).toBe('');
+    expect(JSON.parse(json(r)).notes).toEqual(['']);
+    expect(term(r)).toContain(EMPTY_PLACEHOLDER);
+  });
+});
+
 /** Every hostile name in every field a renderer prints: names, paths, workflow ids, why texts, notes, AI text. */
 function hostileReport(): AuditReport {
   const r = freePrivateReport(EXCLUDED_PATTERNS);
@@ -505,10 +635,10 @@ function hostileReport(): AuditReport {
     limits: [...r.limits, hostileNames.htmlTag],
     [TREE]: all.map((h) => ({ file: h, rule: h, note: h })),
     aiBundle: { ...r.aiBundle, topFolders: all },
-    warnings: [joined],
+    warnings: [{ text: joined, command: joined }],
     notes: all,
     estimates: { ...r.estimates, basis: [...r.estimates.basis, joined] },
-    support: { level: 'audit-only', reasons: all, nextStep: hostileNames.mention },
+    support: { level: 'audit-only', reasons: all, nextStep: hostileNames.mention, nextCommand: joined },
     ai: aiPart({
       extraNeeds: all.map((h) => ({ ...need('push', h, h), why: h })),
       suggestions: all.map((h) => ({ name: h, repo: h, why: h })),

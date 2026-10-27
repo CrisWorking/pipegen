@@ -300,7 +300,7 @@ describe('addAiSuggestions (controller rulings)', () => {
   it('S11: ai holds extraNeeds, suggestions, notes and usage', async () => {
     const s = await setup();
     const out = await addAiSuggestions(s.r, s.dir, s.deps);
-    expect(Object.keys(out.ai ?? {}).sort()).toEqual(['attempts', 'costUsd', 'extraNeeds', 'notes', 'suggestions', 'usage']);
+    expect(Object.keys(out.ai ?? {}).sort()).toEqual(['attempts', 'costUsd', 'extraNeeds', 'local', 'notes', 'suggestions', 'usage']);
     expect(new Set(out.ai?.notes).size).toBe(out.ai?.notes.length); // deduped
     expect(out.ai?.notes).toContain(ONLY_ACTIONS_NPM);
     // the rest of the report is buildAudit's
@@ -433,9 +433,11 @@ describe('addAiSuggestions (controller rulings)', () => {
     expect(paid.ai.reqs).toHaveLength(0);
     expect(out.ai?.usage).toEqual(usageOf(0, 0));
     expect(out.ai?.notes.some((n) => n.includes('AI cost limit'))).toBe(true);
+    expect(out.ai?.local).toBe(false);
     const local = await setup({ ai: { name: 'ollama', model: 'llama3' }, deps: { capUsd: null } });
-    await addAiSuggestions(local.r, local.dir, local.deps);
+    const localOut = await addAiSuggestions(local.r, local.dir, local.deps);
     expect(local.ai.reqs.length).toBeGreaterThan(0);
+    expect(localOut.ai?.local).toBe(true); // the report then says no cost is counted, never a zero dollar figure
   });
 
   it('C3: each attempt is priced in the tier of its own prompt, not of the sum', async () => {

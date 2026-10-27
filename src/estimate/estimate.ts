@@ -27,6 +27,8 @@ import { hostPlace } from '../util/local-host.js';
 import { packageDataPath } from '../util/package-data.js';
 import { safeText } from '../util/safe-text.js';
 
+/** How the basis line starts when the activity count is a lower bound (Activity.capped); the audit report reads it. */
+export const ACTIVITY_CAPPED_PREFIX = 'Activity: at least';
 export type AiStage = 'needs' | 'debate' | 'creators' | 'fix-loop';
 /** Pushes and pull requests opened in the last 30 days. `capped`: the event list (300 events) or the pull request pages (1,000) ended inside the window, so the counts are lower bounds. */
 export interface Activity { pushes: number; prs: number; capped: boolean }
@@ -307,7 +309,7 @@ export function estimate(p: RepoProfile, jobs: JobCategories, variants: number, 
   );
   basis.push(
     activity.capped
-      ? `Activity: at least ${plural(pushes, 'push', 'pushes')} and at least ${plural(prs, 'pull request', 'pull requests')} in the last 30 days `
+      ? `${ACTIVITY_CAPPED_PREFIX} ${plural(pushes, 'push', 'pushes')} and at least ${plural(prs, 'pull request', 'pull requests')} in the last 30 days `
         + `(GitHub lists only the last ${EVENT_PAGES * PER_PAGE} events and pipegen reads at most ${(PR_PAGES * PER_PAGE).toLocaleString('en-US')} pull requests).`
       : `Activity: ${plural(pushes, 'push', 'pushes')} and ${plural(prs, 'pull request', 'pull requests')} in the last 30 days.`,
     `Monthly minutes: every push runs the push layer; every push to a branch with an open pull request also runs the merge layer; every merged pull request runs the deploy layer; the nightly scan runs ${NIGHTS_PER_MONTH} times.`,

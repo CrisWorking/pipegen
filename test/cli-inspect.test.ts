@@ -173,7 +173,7 @@ describe('pipegen inspect', () => {
     // no injected line: every line of the summary is one printed line
     expect(out.split('\n').filter((l) => l.startsWith('  Default branch:'))).toHaveLength(1);
     const huge = await inspect(richRepo(), publicRoutes({ [`GET ${R}`]: { body: { private: false, default_branch: `${branch}${hostileNames.veryLong}`, owner: { type: 'User', login: 'o' } } } }));
-    expect(huge.out).toContain('Default branch: [REDACTED: line too long]');
+    expect(huge.out).toContain('Default branch: (value too long to show)');
     expect(huge.all).not.toMatch(UNSAFE);
   });
 

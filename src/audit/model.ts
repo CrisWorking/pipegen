@@ -79,7 +79,17 @@ export interface SecretInTree {
   /** EXCLUDED_NOTE when the file matches EXCLUDED_PATTERNS (never sent to the AI, but on disk all the same). */
   note?: string;
 }
-export type AuditSupport = ReturnType<typeof supportLevel> & { nextStep: string };
+/**
+ * supportLevel for v0.2 plus the next step (ruling S8): `nextStep` is prose; `nextCommand` is pipegen's own fixed command
+ * for it (ruling U17), or null. The renderers print the command on its own, unescaped, so it copies exactly.
+ */
+export type AuditSupport = ReturnType<typeof supportLevel> & { nextStep: string; nextCommand: string | null };
+/**
+ * A warning shown at the top of the report. `text` is prose (cleaned at output like every other string). `command`, when
+ * set, is one of pipegen's own fixed commands (ruling U17): built only from constants and pipegen's own version, never
+ * from repo data, so the renderers print it unescaped (after checking it with isOwnCommand).
+ */
+export interface AuditWarning { text: string; command?: string }
 
 export interface AuditReport {
   profile: RepoProfile; capabilities: Capabilities; support: AuditSupport;
@@ -92,7 +102,7 @@ export interface AuditReport {
   /** What the full run would send to the AI (counts and folder names, never contents). */
   aiBundle: { files: number; bytes: number; truncated: boolean; excludedPatterns: string[]; topFolders: string[] };
   /** How pipegen was started (a repo .npmrc with a registry, a local node_modules/.bin/pipegen) and anonymous access. */
-  warnings: string[];
+  warnings: AuditWarning[];
   /** Reader, workflow, capability-probe, bundle, coverage and secrets-scan notes; deduped (ruling S11), each passed through redact() (a secret-like file name in a reader note is masked). */
   notes: string[];
   /** Ruling U11: the caller couldn't use the reviewed list (B3). Task 2b drops every discovery suggestion when true. */
@@ -122,6 +132,8 @@ export interface AuditAi {
   costUsd: number;
   /** One record per attempt that reported usage (failed ones included), in the order they settled. */
   attempts: AiAttempt[];
+  /** The provider is Ollama: no cost is counted (it isn't a paid API). */
+  local: boolean;
 }
 
 /** One settled AI attempt and its list cost (see AuditAi.costUsd for why the cost is "about"). */
@@ -157,19 +169,59 @@ export interface AuditDeps {
 // ---------- fixed texts ----------
 
 const AUDIT_TODAY = ' You can run `pipegen audit` today.';
-const NEXT_STEP: Readonly<Record<Milestone, Readonly<Record<'v0.2' | 'v0.4' | 'none', string>>>> = {
+/** The full setup's command, once it ships (ruling U17: pipegen's own fixed text, printed unescaped). */
+export const FULL_SETUP_COMMAND = 'npx pipegen';
+const NEXT_STEP: Readonly<Record<Milestone, Readonly<Record<'v0.2' | 'v0.4' | 'none', { text: string; command: string | null }>>>> = {
   'v0.1': {
-    'v0.2': 'The full setup (`npx pipegen`) arrives in v0.2 for single-package Node/TypeScript repos.',
-    'v0.4': 'The full setup (`npx pipegen`) arrives in v0.4 for Python and monorepos.',
-    none: 'The full setup (`npx pipegen`) is not planned yet for this repo.',
+    'v0.2': { text: 'The full setup arrives in v0.2 for single-package Node/TypeScript repos. It is not in this version; once v0.2 is out, it starts with:', command: FULL_SETUP_COMMAND },
+    'v0.4': { text: 'The full setup arrives in v0.4 for Python and monorepos. It is not in this version; once v0.4 is out, it starts with:', command: FULL_SETUP_COMMAND },
+    none: { text: 'The full setup is not planned yet for this repo.', command: null },
   },
 };
+
+const NPM_REGISTRY = 'https://registry.npmjs.org';
+const SEMVER = /^\d{1,9}\.\d{1,9}\.\d{1,9}$/;
+/**
+ * The command that runs this pipegen from outside the repo, from npm's own registry (ruling S30/U17). Built only from
+ * constants and `version` (pipegen's own package.json), which must be a plain x.y.z, else it is left out.
+ */
+export function safeRunCommand(version: string | null): string {
+  const pkg = version !== null && SEMVER.test(version) ? `pipegen@${version}` : 'pipegen';
+  return `npx --registry=${NPM_REGISTRY} ${pkg} audit --dir ./repo`;
+}
+/**
+ * True for a command pipegen itself builds (safeRunCommand, FULL_SETUP_COMMAND) and nothing else: the renderers print a
+ * command unescaped only when this holds (no backtick, no space-separated repo text, nothing to break out of a code span).
+ */
+export function isOwnCommand(s: unknown): s is string {
+  return typeof s === 'string'
+    && (s === FULL_SETUP_COMMAND || /^npx --registry=https:\/\/registry\.npmjs\.org pipegen(?:@\d{1,9}\.\d{1,9}\.\d{1,9})? audit --dir \.\/repo$/.test(s));
+}
+
+/** pipegen's own checks (the merge gate, the deploy-time verify): pipegen adds them itself, so no tool is picked for them and they never make a layer "serious" (ruling U16). */
+export function isBuiltInNeed(need: Pick<Need, 'category'>): boolean {
+  return need.category === 'gate' || need.category === 'deploy-verify';
+}
+
+/** A plain-English name for each check, for the report (one map, shared by every output that names a check). */
+const NEED_LABELS: Readonly<Record<string, string>> = {
+  secrets: 'Secret scan', sast: 'Code scan (SAST)', deps: 'Dependency check', 'unit-tests': 'Unit tests', 'full-tests': 'Full test suite',
+  lint: 'Lint', 'format-lint': 'Format and lint hook', hooks: 'Git hook manager', 'hooks-ci': 'Git hooks re-run in CI',
+  'image-build': 'Container image build', 'image-scan': 'Container image scan', dast: 'Running-app scan (DAST)',
+  iac: 'Infrastructure code scan (IaC)', sbom: 'Software bill of materials (SBOM)', signing: 'Image signing',
+  attestation: 'Build attestation', 'deploy-verify': 'Deploy check (pipegen)', gate: 'Merge gate (pipegen)',
+  'type-check': 'Type check', 'license-scan': 'Licence check', 'dockerfile-lint': 'Dockerfile lint', 'migration-check': 'Database migration check',
+};
+/** The plain-English name of a check, or null for an id pipegen doesn't know (the caller shows the cleaned id). */
+export function needLabel(id: string): string | null {
+  return Object.hasOwn(NEED_LABELS, id) ? (NEED_LABELS[id] as string) : null;
+}
 
 const ROW_NOTE = {
   builtIn: "pipegen's own check",
   reviewed: 'reviewed tool',
-  suggestion: 'suggestion only',
-  unavailable: 'reviewed list unavailable',
+  suggestion: 'no reviewed tool yet; pipegen would only mention one, never run it as a check',
+  unavailable: "pipegen's reviewed tool list couldn't be loaded, so it has no tool to add here",
   script: (script: 'test' | 'lint') => `your own \`${script}\` script would run here`,
 } as const;
 const starterTests = (service: string) => `No tests found for ${service}: pipegen would create starter tests.`;
@@ -195,6 +247,7 @@ const UNTRACKED_NOTE = "pipegen reads the files on disk without git, so files th
 
 // Worded so redact() leaves it whole at output ("No token: …" would be cut; review M3).
 const NO_TOKEN = 'Without a GitHub token, pipegen reads public data only and is rate-limited.';
+const SWAP_TEXT = 'This repo could change which pipegen runs. Run pipegen from outside the repo, from the npm registry, with:';
 /**
  * Ruling U12: the `.npmrc` keys that can't change which pipegen npx fetches or how it starts it (npm's config docs):
  * saving, lockfile, engine and output settings. Any other key warns: registries (any scope), proxies, TLS (`strict-ssl`,
@@ -290,7 +343,8 @@ function supportOf(p: RepoProfile): AuditSupport {
   const v02 = supportLevel(p, 'v0.2');
   const reasons = v02.reasons.map((r) => (r.endsWith(AUDIT_TODAY) ? r.slice(0, -AUDIT_TODAY.length) : r));
   const next = v02.level === 'full' ? 'v0.2' : supportLevel(p, 'v0.4').level === 'full' ? 'v0.4' : 'none';
-  return { level: v02.level, reasons, nextStep: NEXT_STEP[CURRENT_MILESTONE][next] };
+  const step = NEXT_STEP[CURRENT_MILESTONE][next];
+  return { level: v02.level, reasons, nextStep: step.text, nextCommand: step.command };
 }
 
 /** mapCoverage, or every need `unknown` with a plain note when it fails (the tool signatures can't be loaded). */
@@ -321,7 +375,7 @@ function wouldAddRows(p: RepoProfile, coverage: Coverage[], deps: AuditDeps): Wo
 
 /** Ruling S7: pipegen's own check → the service's own script → the first reviewed tool → nothing. */
 function pick(need: Need, service: Service | undefined, p: RepoProfile, deps: AuditDeps): { tool: WouldAddTool; note: string } {
-  if (need.category === 'gate' || need.category === 'deploy-verify') return { tool: { kind: 'built-in' }, note: ROW_NOTE.builtIn };
+  if (isBuiltInNeed(need)) return { tool: { kind: 'built-in' }, note: ROW_NOTE.builtIn };
   const script = service === undefined ? null : projectScriptFor(need, service);
   if (script !== null) return { tool: script, note: ROW_NOTE.script(script.script) };
   const reviewed = reviewedFor(need, needLanguage(need, p), deps.reviewed, 'audit')[0];
@@ -441,14 +495,12 @@ async function scanTree(dir: string, notes: Notes): Promise<SecretInTree[]> {
  * node_modules/.bin/pipegen is an existence check with lstat: the last part is never followed (a dangling link
  * counts), while a symlinked node_modules or .bin folder on the way is followed, as npx would follow it too.
  */
-async function warningsOf(dir: string, anonymous: boolean): Promise<string[]> {
-  const out: string[] = [];
+async function warningsOf(dir: string, anonymous: boolean): Promise<AuditWarning[]> {
+  const out: AuditWarning[] = [];
   if (await npmrcHasUnsafeKey(dir) || (await lstat(join(dir, 'node_modules', '.bin', 'pipegen')).catch(() => null)) !== null) {
-    const v = packageVersion();
-    const pkg = v === null ? 'pipegen' : `pipegen@${v}`;
-    out.push(`This repo could change which pipegen runs. Run it from outside the repo: \`npx --registry=https://registry.npmjs.org ${pkg} audit --dir ./repo\`.`);
+    out.push({ text: SWAP_TEXT, command: safeRunCommand(packageVersion()) });
   }
-  if (anonymous) out.push(NO_TOKEN);
+  if (anonymous) out.push({ text: NO_TOKEN });
   return out;
 }
 
@@ -669,6 +721,7 @@ export async function addAiSuggestions(r: AuditReport, dir: string, deps: AiSugg
         usage: { ...meter.usage },
         costUsd: meter.costUsd,
         attempts: meter.attempts.map((a) => ({ ...a })),
+        local: deps.ai.name === 'ollama',
       },
     };
   };

@@ -8,6 +8,9 @@ Verdict: 4 of 4 layers have gaps; 4 are serious. pipegen couldn't check everythi
   ⚠ Secret-like text in the files on disk now (pipegen never shows the values):
     - .env: generic-api-key (never sent to the AI; check it isn't committed)
     - config/dev.json: aws-access-key, private-key
+  ⚠ This repo could change which pipegen runs. Run pipegen from outside the repo, from the npm
+    registry, with:
+    npx --registry=https://registry.npmjs.org pipegen@0.1.0 audit --dir ./repo
 
 What your GitHub plan allows
   ⚠ No merge lock: anyone with write access can merge without checks (GitHub Pro for personal
@@ -23,73 +26,81 @@ What your GitHub plan allows
 Checks by layer
 
   Before each commit (git hooks on the developer's machine): serious gaps (1 of 3 checks covered)
-      covered  hooks
+      covered  Git hook manager
                The repo uses husky to run git hooks.
                Found: husky in .husky/pre-commit
-    ⚠ missing  secrets
+    ⚠ missing  Secret scan
                Without a secret scan before each commit, a key can be committed without anyone
                noticing.
-      missing  format-lint (shop-api)
+      missing  Format and lint hook for shop-api
                Without a format and lint hook, style problems are only found later, in CI or in
                review.
 
   On every push: serious gaps (2 of 6 checks covered)
-    ⚠ missing  hooks-ci
+    ⚠ missing  Git hooks re-run in CI
                Without running the hooks in CI, anyone who skips them locally is never caught.
-    ⚠ missing  secrets
+    ⚠ missing  Secret scan
                Without a secret scan in CI, a key committed without the local hook is only found
                after it leaks.
-    ⚠ missing  sast (shop-api)
+    ⚠ missing  Code scan (SAST) for shop-api
                Without a code scan, common security bugs reach the main branch unnoticed.
-    ⚠ partial  deps (shop-api)
+    ⚠ partial  Dependency check for shop-api
                npm-audit runs, but its failure is ignored (continue-on-error), so it can never fail
                the build.
                Found: npm-audit in .github/workflows/ci.yml (job audit)
-      covered  unit-tests (shop-api)
+      covered  Unit tests for shop-api
                Your own `npm test` runs on every push.
                Found: your own `npm test` in .github/workflows/ci.yml (job test)
-      covered  lint (shop-api)
+      covered  Lint for shop-api
                Your own `npm run lint` runs on every push.
                Found: your own `npm run lint` in .github/workflows/ci.yml (job test)
 
   On every pull request, before merge: serious gaps (2 of 5 checks covered)
-    ⚠ missing  secrets
+    ⚠ missing  Secret scan
                Without a secret scan in CI, a key committed without the local hook is only found
                after it leaks.
-      covered  unit-tests (shop-api)
+      covered  Unit tests for shop-api
                Your own `npm test` runs on every pull request.
                Found: your own `npm test` in .github/workflows/ci.yml (job test)
-      covered  full-tests (shop-api)
+      covered  Full test suite for shop-api
                Your own `npm test` runs on every pull request.
                Found: your own `npm test` in .github/workflows/ci.yml (job test)
-    ⚠ missing  gate
+      missing  Merge gate (pipegen)
                No single required check sums up every scan, so a failing scan does not stop a merge.
-      unknown  dast (shop-api)
+      unknown  Running-app scan (DAST) for shop-api
                A job calls a reusable workflow from another repo, and pipegen can't see inside it.
                Found: acme/security/.github/workflows/zap.yml@v2 in .github/workflows/ci.yml (job
                zap)
 
   When the code is deployed or released: serious gaps (0 of 2 checks covered)
-    ⚠ missing  sbom (shop-api)
+    ⚠ missing  Software bill of materials (SBOM) for shop-api
                Without an SBOM, nobody can tell later which components a release shipped.
-    ⚠ missing  deploy-verify (shop-api)
+      missing  Deploy check (pipegen) for shop-api
                Deploys don't check that the commit passed the pipeline.
 
 What pipegen would add
   For each check that isn't covered:
-  - secrets, before each commit (now missing): gitleaks v2.3.9 (gitleaks/gitleaks-action), reviewed
-    tool
-  - format-lint (shop-api), before each commit (now missing): no reviewed tool yet (suggestion only)
-  - hooks-ci, on every push (now missing): no reviewed tool yet (suggestion only)
-  - secrets, on every push (now missing): gitleaks v2.3.9 (gitleaks/gitleaks-action), reviewed tool
-  - sast (shop-api), on every push (now missing): semgrep 1.95.0 (semgrep/semgrep), reviewed tool
-  - deps (shop-api), on every push (now partial): no reviewed tool yet (suggestion only)
-  - secrets, on every pull request (now missing): gitleaks v2.3.9 (gitleaks/gitleaks-action),
+  - Secret scan, before each commit (now missing): gitleaks v2.3.9 (gitleaks/gitleaks-action),
     reviewed tool
-  - gate, on every pull request (now missing): pipegen's own check
-  - dast (shop-api), on every pull request (now unknown): no reviewed tool yet (suggestion only)
-  - sbom (shop-api), at deploy (now missing): no reviewed tool yet (suggestion only)
-  - deploy-verify (shop-api), at deploy (now missing): pipegen's own check
+  - Format and lint hook for shop-api, before each commit (now missing): no reviewed tool yet;
+    pipegen would only mention one, never run it as a check
+  - Git hooks re-run in CI, on every push (now missing): no reviewed tool yet; pipegen would only
+    mention one, never run it as a check
+  - Secret scan, on every push (now missing): gitleaks v2.3.9 (gitleaks/gitleaks-action), reviewed
+    tool
+  - Code scan (SAST) for shop-api, on every push (now missing): semgrep 1.95.0 (semgrep/semgrep),
+    reviewed tool
+  - Dependency check for shop-api, on every push (now partial): no reviewed tool yet; pipegen would
+    only mention one, never run it as a check
+  - Secret scan, on every pull request (now missing): gitleaks v2.3.9 (gitleaks/gitleaks-action),
+    reviewed tool
+  - Merge gate (pipegen), on every pull request (now missing): pipegen's own check. On this plan
+    GitHub can't make it a required check, so it reports but can't block a merge
+  - Running-app scan (DAST) for shop-api, on every pull request (now unknown): no reviewed tool yet;
+    pipegen would only mention one, never run it as a check
+  - Software bill of materials (SBOM) for shop-api, at deploy (now missing): no reviewed tool yet;
+    pipegen would only mention one, never run it as a check
+  - Deploy check (pipegen) for shop-api, at deploy (now missing): pipegen's own check
   pipegen would also create:
   - Dockerfile: shop-api runs but has no Dockerfile: pipegen would create one, so the image can be
     built and scanned.
@@ -97,7 +108,7 @@ What pipegen would add
     the tests.
 
   What the AI suggests (--ai)
-  - the AI also suggests checking type-check (shop-api), on every push: The code is TypeScript; a
+  - the AI also suggests checking type check for shop-api, on every push: The code is TypeScript; a
     type check catches mistakes the tests miss.
   Tools the AI mentions (not reviewed, never run by pipegen):
   - zizmor (woodruffw/zizmor): Finds risky settings in GitHub Actions workflows.
@@ -107,7 +118,7 @@ What pipegen would add
   tokens).
 
 Costs of the full setup (estimates)
-  - Setup: about 70 GitHub Actions minutes, with a hard limit of 140 (the proof stops there).
+  - Setup: about 70 GitHub Actions minutes, with a hard limit of 140 (the setup stops there).
   - After setup: about 1,240 minutes a month, or more (pipegen could count only part of the
     activity).
     ⚠ That is more than half of the 2,000 minutes your plan includes each month (62%).
@@ -142,8 +153,8 @@ What the full setup would send to the AI
   the real bundle can differ slightly.
 
 Permissions the full setup needs
-  - Contents: read and write: Opens the pull request with the pipeline files.
-  - Workflows: read and write: Adds the pipeline workflow files.
+  - Contents: read and write — Opens the pull request with the pipeline files.
+  - Workflows: read and write — Adds the pipeline workflow files.
 
 Notes
   - The secrets scan did not check dependency and build folders (node_modules, .venv, dist, build,
@@ -165,4 +176,6 @@ What this audit can't see
     those checks show as unknown.
 
 Next step
-  The full setup (`npx pipegen`) arrives in v0.2 for single-package Node/TypeScript repos.
+  The full setup arrives in v0.2 for single-package Node/TypeScript repos. It is not in this
+  version; once v0.2 is out, it starts with:
+    npx pipegen

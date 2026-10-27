@@ -10,7 +10,7 @@ import { probeCapabilities, signingMode, SIGNING_ENVIRONMENT } from '../github/c
 import { getAuth, githubTokenRejected, GitHubAccessError, hideToken, makeOctokit, permissionsTable, readGitHubContext } from '../github/client.js';
 import { NotGitHubRepoError, readProject } from '../read/project.js';
 import type { Auth, Capabilities, RepoProfile, Service } from '../types.js';
-import { OUTPUT_CAP, safeOutput } from '../util/safe-output.js';
+import { makeSafeOutput, OUTPUT_CAP } from '../util/safe-output.js';
 import type { CliIO } from './io.js';
 
 type LocalProfile = Awaited<ReturnType<typeof readProject>>;
@@ -144,7 +144,8 @@ export async function inspect(dir: string, io: CliIO, opts: { allowBroad: boolea
   const fail = (s: string) => { io.err(hideToken(s, token)); };
   const notes: string[] = [];
   const knownValues: string[] = KNOWN_VALUE_VARS.map((v) => io.env[v]).filter((v): v is string => typeof v === 'string');
-  const t: Clean = (s, max = OUTPUT_CAP.name) => safeOutput(s, { target: 'terminal', knownValues, max });
+  let clean = makeSafeOutput(knownValues);
+  const t: Clean = (s, max = OUTPUT_CAP.name) => clean(s, { target: 'terminal', max });
 
   let local: LocalProfile;
   try {
@@ -162,7 +163,10 @@ export async function inspect(dir: string, io: CliIO, opts: { allowBroad: boolea
   try {
     const auth = await getAuth({ owner, repos: [repo], allowBroad: opts.allowBroad, mode: 'read' }, { env: io.env, fetch: io.fetch, clock, notes });
     token = auth.token;
-    if (auth.token !== null) knownValues.push(auth.token);
+    if (auth.token !== null) {
+      knownValues.push(auth.token);
+      clean = makeSafeOutput(knownValues);
+    }
     const gh = makeOctokit(auth.token, { fetch: io.fetch, clock, log: fail });
     const login = await tokenLogin(gh, auth, clock, notes);
     const ctx: GitHubContext = await readGitHubContext(gh, owner, repo, login, clock);
@@ -188,7 +192,7 @@ export async function inspect(dir: string, io: CliIO, opts: { allowBroad: boolea
     say('GitHub: not read (the error is on stderr)');
     // pipegen's own access message (already through hideToken): redact would cut its wording ("this token: …"), so it
     // gets every step of safeOutput but redact, and hideToken again on the way out
-    fail(`GitHub: not read: ${safeOutput(github.error, { target: 'terminal', knownValues, max: 1200, redact: false })}`);
+    fail(`GitHub: not read: ${clean(github.error, { target: 'terminal', max: 1200, redact: false })}`);
     fail('Not checked: visibility, plan, default branch, and what GitHub allows here.');
   } else {
     for (const line of githubLines(t, github.p, github.auth, github.caps)) say(line);

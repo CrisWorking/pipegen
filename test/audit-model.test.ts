@@ -43,7 +43,10 @@ afterEach(cleanupRepos);
 
 const NOW = Date.parse('2026-10-27T12:00:00Z');
 const VERSION = (JSON.parse(readFileSync(resolve(import.meta.dirname, '../package.json'), 'utf8')) as { version: string }).version;
-const SWAP_WARNING = `This repo could change which pipegen runs. Run it from outside the repo: \`npx --registry=https://registry.npmjs.org pipegen@${VERSION} audit --dir ./repo\`.`;
+const SWAP_WARNING = {
+  text: 'This repo could change which pipegen runs. Run pipegen from outside the repo, from the npm registry, with:',
+  command: `npx --registry=https://registry.npmjs.org pipegen@${VERSION} audit --dir ./repo`,
+};
 const ANON_NOTE = 'Without a GitHub token, pipegen reads public data only and is rate-limited.';
 const NAME_HIDDEN = '(a file whose name looks like a secret)';
 const EXCLUDED_NOTE = "(never sent to the AI; check it isn't committed)";
@@ -124,7 +127,7 @@ describe('buildAudit (brief, Task 2a)', () => {
     expect(sast.length).toBeGreaterThan(0);
     for (const w of sast) {
       expect(w.tool).toBeNull();
-      expect(w.note).toBe('suggestion only');
+      expect(w.note).toBe('no reviewed tool yet; pipegen would only mention one, never run it as a check');
     }
   });
 
@@ -151,7 +154,8 @@ describe('buildAudit (brief, Task 2a)', () => {
     const r = await buildAudit(repo({ 'pyproject.toml': '[project]\nname = "svc"\n', 'app.py': 'print(1)\n' }), deps());
     expect(r.support.level).toBe('audit-only');
     expect(r.support.reasons).toEqual(['Python support arrives in v0.4.']); // S8: without "You can run `pipegen audit` today."
-    expect(r.support.nextStep).toBe('The full setup (`npx pipegen`) arrives in v0.4 for Python and monorepos.');
+    expect(r.support.nextStep).toBe('The full setup arrives in v0.4 for Python and monorepos. It is not in this version; once v0.4 is out, it starts with:');
+    expect(r.support.nextCommand).toBe('npx pipegen');
   });
 
   it('audit: wouldCreate uses Part precommit when there is no hook manager', async () => {
@@ -205,10 +209,10 @@ describe('buildAudit (brief, Task 2a)', () => {
     const g = fakeGh();
     const r = await buildAudit(repo(nodeApp()), deps({ gh: g.gh, anonymous: true }));
     expect(g.events).toHaveBeenCalled(); // the activity comes through the given client
-    expect(r.warnings).toContain(ANON_NOTE);
+    expect(r.warnings).toContainEqual({ text: ANON_NOTE });
     expect(redact(ANON_NOTE)).toBe(ANON_NOTE); // Task 3 runs redact() over every string at output (U10; review M3)
     const named = await buildAudit(repo(nodeApp()), deps());
-    expect(named.warnings).not.toContain(ANON_NOTE);
+    expect(named.warnings).not.toContainEqual({ text: ANON_NOTE });
   });
 
   it('audit: wouldAdd uses projectScriptFor for tests and lint when the script exists', async () => {
@@ -267,8 +271,8 @@ describe('buildAudit (controller rulings)', () => {
     const r = await buildAudit(repo(nodeApp()), deps({ reviewed: [], reviewedUnavailable: true }));
     const nulls = r.wouldAdd.filter((w) => w.tool === null);
     expect(nulls.length).toBeGreaterThan(0);
-    for (const w of nulls) expect(w.note).toBe('reviewed list unavailable');
-    expect(r.wouldAdd.some((w) => w.note === 'suggestion only')).toBe(false);
+    for (const w of nulls) expect(w.note).toBe("pipegen's reviewed tool list couldn't be loaded, so it has no tool to add here");
+    expect(r.wouldAdd.some((w) => w.note.startsWith('no reviewed tool yet'))).toBe(false);
     // project scripts and pipegen's own checks don't come from the list, so they stay
     expect(rowsOf(r, 'unit-tests')[0].tool).toMatchObject({ kind: 'project-script' });
     expect(rowsOf(r, 'gate')[0].tool).toEqual({ kind: 'built-in' });
@@ -299,11 +303,16 @@ describe('buildAudit (controller rulings)', () => {
   it('S8: the next step is a fixed table keyed by CURRENT_MILESTONE; no command that does not exist', async () => {
     expect(CURRENT_MILESTONE).toBe('v0.1');
     const node = await buildAudit(repo(nodeApp()), deps());
-    expect(node.support).toEqual({ level: 'full', reasons: [], nextStep: 'The full setup (`npx pipegen`) arrives in v0.2 for single-package Node/TypeScript repos.' });
+    expect(node.support).toEqual({
+      level: 'full', reasons: [],
+      nextStep: 'The full setup arrives in v0.2 for single-package Node/TypeScript repos. It is not in this version; once v0.2 is out, it starts with:',
+      nextCommand: 'npx pipegen',
+    });
     const bare = await buildAudit(repo({ 'main.go': 'package main\n' }), deps());
     expect(bare.support.level).toBe('audit-only');
     expect(bare.support.reasons).toEqual(['This language is not supported yet.']);
-    expect(bare.support.nextStep).toBe('The full setup (`npx pipegen`) is not planned yet for this repo.');
+    expect(bare.support.nextStep).toBe('The full setup is not planned yet for this repo.');
+    expect(bare.support.nextCommand).toBeNull();
     for (const r of [node, bare]) expect(JSON.stringify(r.support)).not.toMatch(/pipegen audit|today/);
   });
 
@@ -408,8 +417,8 @@ describe('buildAudit (controller rulings)', () => {
 
   it('S30: the warning names the running version from package.json, never x.y.z', async () => {
     const r = await buildAudit(repo({ ...nodeApp(), '.npmrc': 'registry=https://r.example.test/\n' }), deps());
-    expect(r.warnings[0]).toContain(`pipegen@${VERSION} audit`);
-    expect(r.warnings[0]).not.toContain('x.y.z');
+    expect(r.warnings[0]?.command).toContain(`pipegen@${VERSION} audit`);
+    expect(r.warnings[0]?.command).not.toContain('x.y.z');
   });
 
   it('B3/S7 note texts never point at a command that does not exist', async () => {

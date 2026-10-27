@@ -1722,7 +1722,7 @@ class Scope {
     const out = [ROOT];
     const path = this.target.get(service);
     if (path !== undefined) {
-      out.push(...(this.owned.get(service) ?? []));
+      for (const d of this.owned.get(service) ?? []) out.push(d); // a loop, not a spread: up to MAX_HIT_DIRS entries
       if (path !== '.') {
         // the dirs above the service's path: a run there covers each service below it
         const segs = path.split('/');

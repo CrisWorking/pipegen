@@ -17,12 +17,18 @@
 //
 // Every value from the report goes through safeOutput() exactly once, here; pipegen's own sentences are written
 // Markdown-safe by hand. Repo values are never put inside backticks. No colours: plain text, ⚠ and simple markers.
+// U16: pipegen's own checks (gate, deploy-verify) are gaps pipegen fills, never "serious". U17: pipegen's own fixed
+// commands (AuditWarning.command, support.nextCommand) are printed unescaped on a line of their own, never wrapped, and
+// in a Markdown code block, after isOwnCommand() confirms they are exactly what the model builds (no repo data).
+// Arrays whose size depends on the repo are appended with loops, never spread into a call (a spread of ~100k lines
+// overflows the stack).
 import { excludedSummaryLines } from '../ai/redact.js';
+import { ACTIVITY_CAPPED_PREFIX } from '../estimate/estimate.js';
 import type { Layer, Part } from '../types.js';
-import { OUTPUT_CAP, safeOutput, type OutputTarget } from '../util/safe-output.js';
+import { makeSafeOutput, OUTPUT_CAP, type OutputTarget } from '../util/safe-output.js';
 import { safeMarkdown } from '../util/safe-text.js';
 import type { Coverage } from './coverage.js';
-import type { AuditAi, AuditReport, WouldAddRow, WouldAddTool } from './model.js';
+import { isBuiltInNeed, isOwnCommand, needLabel, type AuditAi, type AuditReport, type WouldAddRow, type WouldAddTool } from './model.js';
 
 export interface RenderOptions {
   /**
@@ -85,7 +91,9 @@ type Block =
   | { kind: 'text'; text: string }
   | { kind: 'item'; text: string; depth: number; warn: boolean }
   | { kind: 'sub'; title: string }
-  | { kind: 'rows'; rows: Row[] };
+  | { kind: 'rows'; rows: Row[] }
+  /** One of pipegen's own fixed commands, under the block before it (depth: that item's depth, or -1 under text). */
+  | { kind: 'command'; command: string; depth: number };
 interface Section { title: string; blocks: Block[] }
 interface Doc { title: string; intro: string[]; verdict: string; sections: Section[] }
 
@@ -97,13 +105,17 @@ interface Ctx {
   /** pipegen's own fixed table (the permissions): every step but redact (see safeOutput). */
   own(s: string, max?: number): string;
   usd(n: number): string;
+  /** The capabilities, for the merge gate's note on a plan without a merge lock. */
+  mergeLock: boolean;
 }
 
-function ctxFor(target: OutputTarget, knownValues: readonly string[]): Ctx {
+function ctxFor(target: OutputTarget, knownValues: readonly string[], r: AuditReport): Ctx {
+  const clean = makeSafeOutput(knownValues);
   return {
     target,
-    v: (s, max = OUTPUT_CAP.name) => safeOutput(s, { target, knownValues, max }),
-    own: (s, max = OUTPUT_CAP.text) => safeOutput(s, { target, knownValues, max, redact: false }),
+    mergeLock: r.capabilities.branchProtection === true,
+    v: (s, max = OUTPUT_CAP.name) => clean(s, { target, max }),
+    own: (s, max = OUTPUT_CAP.text) => clean(s, { target, max, redact: false }),
     // Markdown: safeMarkdown puts U+200B and a backslash before the $, so GitHub math can't start
     usd: (n) => (target === 'markdown' ? safeMarkdown(money(n)) : money(n)),
   };
@@ -115,13 +127,27 @@ const plural = (n: number, one: string, many: string) => `${num(n)} ${n === 1 ? 
 const size = (bytes: number) => (bytes >= 1024 * 1024 ? `about ${(bytes / (1024 * 1024)).toFixed(1)} MB` : `about ${Math.max(1, Math.round(bytes / 1024))} KB`);
 const text = (t: string): Block => ({ kind: 'text', text: t });
 const item = (t: string, depth = 0, warn = false): Block => ({ kind: 'item', text: t, depth, warn });
+/** Appends without spreading into a call: `xs` can be as long as the repo makes it. */
+function append<T>(out: T[], xs: readonly T[]): void {
+  for (const x of xs) out.push(x);
+}
+/**
+ * A command block, or the command cleaned as ordinary text when it isn't exactly one pipegen builds (defence in depth:
+ * the model never puts anything else there).
+ */
+function command(c: Ctx, cmd: string, depth: number): Block {
+  return isOwnCommand(cmd) ? { kind: 'command', command: cmd, depth } : (depth < 0 ? text(c.v(cmd, OUTPUT_CAP.text)) : item(c.v(cmd, OUTPUT_CAP.text), depth + 1));
+}
 
 // ---------- layers and the verdict (ruling S14) ----------
 
 interface LayerView { layer: Layer; rows: Coverage[]; needed: boolean; gaps: boolean; serious: boolean; unknown: boolean; covered: number }
 
-/** A blocking floor need (every coverage row is a floor need) that is missing or partial. */
-const isSerious = (c: Coverage) => c.need.blocking === true && (c.status === 'missing' || c.status === 'partial');
+/**
+ * A blocking floor need (every coverage row is a floor need) that is missing or partial, and that a tool or the
+ * project's own script should cover: pipegen's own checks are gaps pipegen fills, never serious (ruling U16).
+ */
+const isSerious = (c: Coverage) => c.need.blocking === true && !isBuiltInNeed(c.need) && (c.status === 'missing' || c.status === 'partial');
 
 function layerViews(r: AuditReport): LayerView[] {
   return LAYERS.map((layer) => {
@@ -159,7 +185,9 @@ function layerStatus(v: LayerView): string {
   return `covered (${of})`;
 }
 
-const checkLabel = (c: Ctx, id: string, service: string | undefined) => `${c.v(id)}${service === undefined ? '' : ` (${c.v(service)})`}`;
+/** A check's plain-English name (needLabel), or its cleaned id when pipegen doesn't know it, with the service. */
+const checkLabel = (c: Ctx, id: string, service: string | undefined) => `${needLabel(id) ?? c.v(id)}${service === undefined ? '' : ` for ${c.v(service)}`}`;
+const lowerFirst = (s: string) => (/^[A-Z][a-z]/.test(s) ? `${s[0]?.toLowerCase()}${s.slice(1)}` : s);
 
 function row(c: Ctx, cov: Coverage): Row {
   const by = cov.by === undefined ? null : c.v(cov.by, OUTPUT_CAP.path);
@@ -191,7 +219,10 @@ function warningsSection(r: AuditReport, c: Ctx): Section | null {
     for (const [file, e] of shown) blocks.push(item(`${file}: ${e.rules.join(', ')}${e.note === null ? '' : ` ${e.note}`}`, 1));
     if (shown.length < all.length) blocks.push(item(`…and ${plural(all.length - shown.length, 'more file', 'more files')}.`, 1));
   }
-  for (const w of r.warnings) blocks.push(item(c.v(w, OUTPUT_CAP.text), 0, true));
+  for (const w of r.warnings) {
+    blocks.push(item(c.v(w.text, OUTPUT_CAP.text), 0, true));
+    if (w.command !== undefined) blocks.push(command(c, w.command, 0));
+  }
   return blocks.length === 0 ? null : { title: '⚠ Warnings', blocks };
 }
 
@@ -221,8 +252,14 @@ function layersSection(c: Ctx, views: LayerView[]): Section {
 function toolText(c: Ctx, w: WouldAddRow): string {
   const note = c.v(w.note, OUTPUT_CAP.text);
   const t: WouldAddTool = w.tool;
-  if (t === null) return `no reviewed tool yet (${note})`;
-  if ('kind' in t) return note; // pipegen's own check, or the service's own script
+  if (t === null) return note; // the model's note says what happens without a tool
+  if ('kind' in t) {
+    // pipegen's own check, or the service's own script; without a merge lock the gate can't be made required
+    const gateNote = t.kind === 'built-in' && w.need.category === 'gate' && !c.mergeLock
+      ? ". On this plan GitHub can't make it a required check, so it reports but can't block a merge"
+      : '';
+    return `${note}${gateNote}`;
+  }
   return `${c.v(t.candidate.name)} ${c.v(t.candidate.version)} (${c.v(t.candidate.repo)}), ${note}`;
 }
 
@@ -231,7 +268,7 @@ function aiBlocks(ai: AuditAi, reviewedUnavailable: boolean, c: Ctx): Block[] {
   if (ai.extraNeeds.length === 0) blocks.push(text('The AI suggests no extra checks.'));
   for (const n of ai.extraNeeds) {
     const when = LAYER_WHEN[n.layer] ?? c.v(n.layer);
-    blocks.push(item(`the AI also suggests checking ${checkLabel(c, n.id, n.service)}, ${when}: ${c.v(n.why, OUTPUT_CAP.text)}`));
+    blocks.push(item(`the AI also suggests checking ${lowerFirst(checkLabel(c, n.id, n.service))}, ${when}: ${c.v(n.why, OUTPUT_CAP.text)}`));
   }
   if (ai.suggestions.length > 0) {
     blocks.push(text('Tools the AI mentions (not reviewed, never run by pipegen):'));
@@ -251,6 +288,9 @@ function aiBlocks(ai: AuditAi, reviewedUnavailable: boolean, c: Ctx): Block[] {
 /** About what the AI step cost: the meter's per-attempt list costs, summed (AuditAi.costUsd). */
 function aiCostText(ai: AuditAi, c: Ctx): string {
   const calls = ai.attempts.length;
+  if (ai.local === true) {
+    return `no cost counted: Ollama runs the model itself, not a paid API (${plural(calls, 'AI call', 'AI calls')}).`;
+  }
   if (calls === 0 && !(ai.costUsd > 0)) {
     return "No AI usage was recorded. (A call that ended without reporting its usage, such as a timeout, isn't counted.)";
   }
@@ -275,16 +315,16 @@ function addSection(r: AuditReport, c: Ctx): Section {
     for (const w of r.wouldCreate) blocks.push(item(`${PART_LABEL[w.what] ?? c.v(w.what)}: ${c.v(w.why, OUTPUT_CAP.text)}`));
   }
   if (blocks.length === 0) blocks.push(text('Nothing: every check is already covered.'));
-  if (r.ai !== undefined) blocks.push(...aiBlocks(r.ai, r.reviewedUnavailable, c));
+  if (r.ai !== undefined) append(blocks, aiBlocks(r.ai, r.reviewedUnavailable, c));
   return { title: 'What pipegen would add', blocks };
 }
 
 function costsSection(r: AuditReport, c: Ctx): Section {
   const e = r.estimates;
   const blocks: Block[] = [];
-  blocks.push(item(`Setup: about ${num(e.setupMinutes)} GitHub Actions minutes, with a hard limit of ${num(e.setupMinutesCap)} (the proof stops there).`));
+  blocks.push(item(`Setup: about ${num(e.setupMinutes)} GitHub Actions minutes, with a hard limit of ${num(e.setupMinutesCap)} (the setup stops there).`));
   // a capped activity count (ruling S12) makes the monthly figure a lower bound
-  const atLeast = e.basis.some((b) => b.startsWith('Activity: at least'));
+  const atLeast = e.basis.some((b) => b.startsWith(ACTIVITY_CAPPED_PREFIX));
   blocks.push(item(`After setup: about ${num(e.monthlyMinutes)} minutes a month${atLeast ? ', or more (pipegen could count only part of the activity)' : ''}.`));
   const included = e.includedMinutes;
   if (typeof included === 'number' && Number.isFinite(included) && included > 0) {
@@ -332,7 +372,7 @@ function bundleSection(r: AuditReport, c: Ctx): Section {
 }
 
 function permissionsSection(r: AuditReport, c: Ctx): Section {
-  const blocks = r.permissions.map((p) => item(`${c.own(p.permission, OUTPUT_CAP.name)}: ${c.own(p.why)}`));
+  const blocks = r.permissions.map((p) => item(`${c.own(p.permission, OUTPUT_CAP.name)} — ${c.own(p.why)}`));
   return { title: 'Permissions the full setup needs', blocks: blocks.length === 0 ? [text('None listed.')] : blocks };
 }
 
@@ -344,6 +384,7 @@ function notesSection(r: AuditReport, c: Ctx): Section | null {
 function nextSection(r: AuditReport, c: Ctx): Section {
   const blocks: Block[] = r.support.reasons.map((x) => item(c.v(x, OUTPUT_CAP.text)));
   blocks.push(text(c.v(r.support.nextStep, OUTPUT_CAP.text)));
+  if (r.support.nextCommand !== null && r.support.nextCommand !== undefined) blocks.push(command(c, r.support.nextCommand, -1));
   return { title: 'Next step', blocks };
 }
 
@@ -396,66 +437,94 @@ function wrap(s: string, first: string, rest: string = ' '.repeat([...first].len
 
 const STATUS_WIDTH = 8;
 
-function terminalBlocks(blocks: Block[]): string[] {
-  const out: string[] = [];
+function terminalBlocks(blocks: Block[], out: string[]): void {
   for (const b of blocks) {
-    if (b.kind === 'text') out.push(...wrap(b.text, '  '));
-    else if (b.kind === 'item') out.push(...wrap(b.text, `${'  '.repeat(b.depth + 1)}${b.warn ? '⚠ ' : '- '}`));
-    else if (b.kind === 'sub') out.push('', ...wrap(b.title, '  '));
-    else {
+    if (b.kind === 'text') append(out, wrap(b.text, '  '));
+    else if (b.kind === 'item') append(out, wrap(b.text, `${'  '.repeat(b.depth + 1)}${b.warn ? '⚠ ' : '- '}`));
+    else if (b.kind === 'sub') {
+      out.push('');
+      append(out, wrap(b.title, '  '));
+    } else if (b.kind === 'command') {
+      // U17: on a line of its own, never wrapped (a line over 100 characters is fine), so it pastes as one command
+      out.push(`${'  '.repeat(Math.max(b.depth, 0) + 2)}${b.command}`);
+    } else {
       for (const r of b.rows) {
         const lead = `    ${r.serious ? '⚠' : ' '} ${r.status.padEnd(STATUS_WIDTH)} `;
         const pad = ' '.repeat(lead.length);
-        out.push(...wrap(r.check, lead, pad), ...wrap(r.why, pad));
-        if (r.found !== null) out.push(...wrap(`Found: ${r.found}`, pad));
+        append(out, wrap(r.check, lead, pad));
+        append(out, wrap(r.why, pad));
+        if (r.found !== null) append(out, wrap(`Found: ${r.found}`, pad));
       }
     }
   }
-  return out;
 }
 
 /** The report for the terminal: plain text, no colours, lines wrapped at 100 characters. */
 export function renderTerminal(r: AuditReport, opts: RenderOptions): string {
-  const doc = buildDoc(r, ctxFor('terminal', opts.knownValues));
-  const lines = [...wrap(doc.title, ''), ...doc.intro.flatMap((l) => wrap(l, '')), '', ...wrap(`Verdict: ${doc.verdict}`, '')];
-  for (const s of doc.sections) lines.push('', s.title, ...terminalBlocks(s.blocks));
+  const doc = buildDoc(r, ctxFor('terminal', opts.knownValues, r));
+  const lines: string[] = [];
+  append(lines, wrap(doc.title, ''));
+  for (const l of doc.intro) append(lines, wrap(l, ''));
+  lines.push('');
+  append(lines, wrap(`Verdict: ${doc.verdict}`, ''));
+  for (const s of doc.sections) {
+    lines.push('', s.title);
+    terminalBlocks(s.blocks, lines);
+  }
   return lines.join('\n');
 }
 
 // ---------- Markdown ----------
 
-function markdownBlocks(blocks: Block[]): string[] {
-  const out: string[] = [];
+/** A fence longer than any backtick run in `s`, so the content can't close it. */
+function fenceFor(s: string): string {
+  let longest = 0;
+  for (const m of s.matchAll(/`+/g)) longest = Math.max(longest, m[0].length);
+  return '`'.repeat(Math.max(3, longest + 1));
+}
+
+function markdownBlocks(blocks: Block[], out: string[]): void {
   let last: Block['kind'] | null = null;
   for (const b of blocks) {
-    // items run together as one list; anything else is its own paragraph
-    if (last !== null && !(b.kind === 'item' && last === 'item')) out.push('');
+    // items run together as one list, and a command stays inside the item above it; anything else is its own paragraph
+    const joins = (b.kind === 'item' && (last === 'item' || last === 'command')) || (b.kind === 'command' && last === 'item' && b.depth >= 0);
+    if (last !== null && !joins) out.push('');
     if (b.kind === 'text') out.push(b.text);
     else if (b.kind === 'item') out.push(`${'  '.repeat(b.depth)}- ${b.warn ? '⚠ ' : ''}${b.text}`);
     else if (b.kind === 'sub') out.push(`### ${b.title}`);
-    else {
+    else if (b.kind === 'command') {
+      // U17: pipegen's own fixed command (isOwnCommand checked when the block was made: constants and pipegen's own
+      // version only, no repo data), so it goes unescaped in a fenced block: GitHub shows a copy button and copies it exactly
+      const indent = b.depth < 0 ? '' : '  '.repeat(b.depth + 1);
+      const fence = fenceFor(b.command);
+      out.push(`${indent}${fence}sh`, `${indent}${b.command}`, `${indent}${fence}`);
+    } else {
       out.push('| | Status | Check | Why | Found |', '|---|---|---|---|---|');
       for (const r of b.rows) out.push(`| ${r.serious ? '⚠' : ' '} | ${r.status} | ${r.check} | ${r.why} | ${r.found ?? '—'} |`);
     }
     last = b.kind;
   }
-  return out;
 }
 
 /** The report as a Markdown file (`--out`): every value through safeMarkdown, every excluded pattern listed. */
 export function renderMarkdown(r: AuditReport, opts: RenderOptions): string {
-  const doc = buildDoc(r, ctxFor('markdown', opts.knownValues));
+  const doc = buildDoc(r, ctxFor('markdown', opts.knownValues, r));
   const at = (opts.now ?? Date.now)();
   const date = Number.isFinite(at) ? `Audited on ${new Date(at).toISOString().slice(0, 10)}. ` : '';
   const lines = [`# ${doc.title}`, '', `${date}${doc.intro.join(' ')}`, '', `**Verdict:** ${doc.verdict}`];
-  for (const s of doc.sections) lines.push('', `## ${s.title}`, '', ...markdownBlocks(s.blocks));
+  for (const s of doc.sections) {
+    lines.push('', `## ${s.title}`, '');
+    markdownBlocks(s.blocks, lines);
+  }
   return `${lines.join('\n')}\n`;
 }
 
 // ---------- JSON (ruling S13) ----------
 
 /** Keys whose strings are prose (why texts, notes, basis lines): the long cap. */
-const PROSE_KEYS: ReadonlySet<string> = new Set(['why', 'note', 'notes', 'basis', 'reasons', 'warnings', 'limits', 'nextStep', 'testsNote', 'message']);
+const PROSE_KEYS: ReadonlySet<string> = new Set(['why', 'note', 'notes', 'basis', 'reasons', 'text', 'limits', 'nextStep', 'testsNote', 'message']);
+/** Keys that hold one of pipegen's own fixed commands: written as they are when isOwnCommand holds (U17). */
+const COMMAND_KEYS: ReadonlySet<string> = new Set(['command', 'nextCommand']);
 /** Keys whose strings are paths (or lists of paths): a larger cap than names. */
 const PATH_KEYS: ReadonlySet<string> = new Set(['path', 'file', 'where', 'by', 'dockerfile', 'evidence', 'topFolders', 'excludedPatterns', 'terraformDirs', 'repo']);
 const capFor = (key: string) => (PROSE_KEYS.has(key) ? OUTPUT_CAP.text : PATH_KEYS.has(key) ? OUTPUT_CAP.path : OUTPUT_CAP.name);
@@ -467,20 +536,35 @@ function slimTool(t: WouldAddTool): Record<string, string> | null {
   return { kind: 'reviewed', id: t.id, name: t.candidate.name, repo: t.candidate.repo, version: t.candidate.version };
 }
 
-/** Every string (keys too) through safeOutput; numbers, booleans and null kept; anything else dropped. */
-function deepClean(v: unknown, key: string, own: boolean, knownValues: readonly string[], ancestors: Set<object>): unknown {
-  if (typeof v === 'string') return safeOutput(v, { target: 'terminal', knownValues, max: capFor(key), redact: !own });
+type Clean = ReturnType<typeof makeSafeOutput>;
+
+/**
+ * Every string (keys too) through the helper; numbers, booleans and null kept; anything else dropped. JSON keeps empty
+ * strings (no placeholder). Only the report's own top-level `permissions` table skips redact (pipegen's own wording,
+ * "Secrets: read and write"); a `permissions` key anywhere deeper is cleaned like any other.
+ */
+function deepClean(v: unknown, key: string, depth: number, own: boolean, clean: Clean, ancestors: Set<object>): unknown {
+  if (typeof v === 'string') {
+    if (COMMAND_KEYS.has(key) && isOwnCommand(v)) return v;
+    return clean(v, { target: 'terminal', max: capFor(key), redact: !own, placeholder: false });
+  }
   if (typeof v === 'number' || typeof v === 'boolean' || v === null) return v;
   // `ancestors`: only a cycle is dropped; an object shared by two rows (a row's need) is written in both
   if (typeof v !== 'object' || ancestors.has(v)) return null;
   ancestors.add(v);
   try {
-    if (Array.isArray(v)) return v.map((x) => deepClean(x, key, own, knownValues, ancestors));
-    const out: Record<string, unknown> = {};
+    if (Array.isArray(v)) {
+      const arr: unknown[] = [];
+      for (const x of v) arr.push(deepClean(x, key, depth + 1, own, clean, ancestors));
+      return arr;
+    }
+    // no prototype, so a key cleaned to "__proto__" is a plain key; two keys that clean to the same text both stay
+    const out: Record<string, unknown> = Object.create(null) as Record<string, unknown>;
     for (const [k, x] of Object.entries(v)) {
       if (x === undefined || typeof x === 'function' || typeof x === 'symbol' || typeof x === 'bigint') continue;
-      // the permission table is pipegen's own: redact would cut "Secrets: read and write"
-      out[safeOutput(k, { target: 'terminal', knownValues })] = deepClean(x, k, own || k === 'permissions', knownValues, ancestors);
+      let name = clean(k, { target: 'terminal' });
+      for (let n = 2; Object.hasOwn(out, name); n++) name = `${clean(k, { target: 'terminal' })} (${n})`;
+      out[name] = deepClean(x, k, depth + 1, own || (depth === 0 && k === 'permissions'), clean, ancestors);
     }
     return out;
   } finally {
@@ -491,5 +575,5 @@ function deepClean(v: unknown, key: string, own: boolean, knownValues: readonly 
 /** The report as JSON (`--json`): JSON.stringify(deepClean(r), null, 2), with wouldAdd tools slimmed. */
 export function renderJson(r: AuditReport, opts: RenderOptions): string {
   const slim = { ...r, wouldAdd: r.wouldAdd.map((w) => ({ ...w, tool: slimTool(w.tool) })) };
-  return JSON.stringify(deepClean(slim, '', false, opts.knownValues, new Set()), null, 2);
+  return JSON.stringify(deepClean(slim, '', 0, false, makeSafeOutput(opts.knownValues), new Set()), null, 2);
 }

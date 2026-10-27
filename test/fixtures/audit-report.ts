@@ -63,6 +63,8 @@ const coverage = (): Coverage[] => [
   cov('deploy', 'deploy-verify', 'missing', "Deploys don't check that the commit passed the pipeline.", { service: SVC }),
 ];
 
+export const SUGGESTION_NOTE = 'no reviewed tool yet; pipegen would only mention one, never run it as a check';
+
 const row = (c: Coverage, tool: WouldAddRow['tool'], note: string): WouldAddRow => ({ need: c.need, status: c.status as WouldAddRow['status'], tool, note });
 
 const gitleaks = reviewedTool('gitleaks', 'gitleaks/gitleaks-action', 'v2.3.9', ['secrets']);
@@ -72,15 +74,15 @@ function wouldAdd(c: Coverage[]): WouldAddRow[] {
   const at = (layer: Layer, id: string) => c.find((x) => x.need.layer === layer && x.need.id === id) as Coverage;
   return [
     row(at('pre-commit', 'secrets'), gitleaks, 'reviewed tool'),
-    row(at('pre-commit', 'format-lint'), null, 'suggestion only'),
-    row(at('push', 'hooks-ci'), null, 'suggestion only'),
+    row(at('pre-commit', 'format-lint'), null, SUGGESTION_NOTE),
+    row(at('push', 'hooks-ci'), null, SUGGESTION_NOTE),
     row(at('push', 'secrets'), gitleaks, 'reviewed tool'),
     row(at('push', 'sast'), semgrep, 'reviewed tool'),
-    row(at('push', 'deps'), null, 'suggestion only'),
+    row(at('push', 'deps'), null, SUGGESTION_NOTE),
     row(at('merge', 'secrets'), gitleaks, 'reviewed tool'),
     row(at('merge', 'gate'), { kind: 'built-in' }, "pipegen's own check"),
-    row(at('merge', 'dast'), null, 'suggestion only'),
-    row(at('deploy', 'sbom'), null, 'suggestion only'),
+    row(at('merge', 'dast'), null, SUGGESTION_NOTE),
+    row(at('deploy', 'sbom'), null, SUGGESTION_NOTE),
     row(at('deploy', 'deploy-verify'), { kind: 'built-in' }, "pipegen's own check"),
   ];
 }
@@ -107,7 +109,11 @@ export function freePrivateReport(excludedPatterns: readonly string[]): AuditRep
       branchProtection: false, environments: true, envRequiredReviewers: false, deploymentBranchPolicies: true,
       attestations: false, codeScanning: false, keylessSigningAllowed: false,
     },
-    support: { level: 'full', reasons: [], nextStep: 'The full setup (`npx pipegen`) arrives in v0.2 for single-package Node/TypeScript repos.' },
+    support: {
+      level: 'full', reasons: [],
+      nextStep: 'The full setup arrives in v0.2 for single-package Node/TypeScript repos. It is not in this version; once v0.2 is out, it starts with:',
+      nextCommand: 'npx pipegen',
+    },
     coverage: c,
     wouldAdd: wouldAdd(c),
     wouldCreate: [
@@ -158,5 +164,6 @@ export const aiPart = (over: Partial<AuditAi> = {}): AuditAi => ({
     { model: 'claude-opus-5-5', input: 36_000, output: 2_400, cacheRead: 0, cacheWrite: 0, listUsd: 0.38 },
     { model: 'claude-opus-5-5', input: 5_200, output: 700, cacheRead: 0, cacheWrite: 0, listUsd: 0.0435 },
   ],
+  local: false,
   ...over,
 });
