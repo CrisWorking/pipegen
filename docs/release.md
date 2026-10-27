@@ -168,7 +168,7 @@ Work through it in order. Tick a step only after Cristiano said go and the resul
 - **Pins in this workflow** (Node, actions) follow the 7-day cooldown like every other pin. Bump them in a PR; the
   `cooldown` job does not read workflow files, so check the release dates by hand.
 - **When a second maintainer exists:** enable "required reviewers" and "prevent self-review" on `npm-release`, and add them
-  to the `/data/` and `/scripts/` lines of `.github/CODEOWNERS`: from then on the cooldown's emergency path needs two
-  code-owner approvals on its own.
+  to the `/data/` and `/scripts/` lines of `.github/CODEOWNERS`: from then on the cooldown's emergency path also needs
+  code-owner approvals on its own (two, or one from the other owner when the author is one of only two).
 - **Recorded results** (filled in during R-publish): tag ruleset id: none yet. Main ruleset id: none yet. Immutable releases:
   not on yet. Scorecard score: not run yet. Trusted publisher: not configured yet. Disallow tokens: not set yet.

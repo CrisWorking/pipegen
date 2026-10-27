@@ -407,15 +407,20 @@ const OWNERS2 = '/data/ @CrisWorking @Second\n/scripts/ @CrisWorking @Second\n';
 const REASON = 'Security-fix-reason: CVE-2026-0001 in rollup, fixed upstream yesterday';
 const young = { 'package-lock.json': lock({ rollup: '4.64.12' }) };
 const youngDocs = npmDoc('rollup', { '4.64.12': daysAgo(1) });
-const labeled = (login: string, event = 'labeled', name = 'security-fix') => ({ event, actor: { login }, label: { name } });
+// The head commit arrived 12 hours ago (its earliest pull_request run); the default label came 2 hours ago.
+const HEAD_AT = daysAgo(0.5);
+const labeled = (login: string, event = 'labeled', name = 'security-fix', at = daysAgo(2 / 24)) => ({ event, actor: { login }, label: { name }, created_at: at });
+const RUNS = gh(`o/p/actions/runs?head_sha=${SHA}&event=pull_request&per_page=100&page=1`);
 const review = (login: string, state: string, commit = SHA) => ({ user: { login }, state, commit_id: commit });
-const prRoutes = (o: { body?: string | null; labels?: string[]; author?: string; head?: string; events?: unknown; reviews?: unknown } = {}): Routes => ({
+const prRoutes = (o: { body?: string | null; labels?: string[]; author?: string; head?: string; events?: unknown; reviews?: unknown; runs?: unknown } = {}): Routes => ({
   [gh('o/p/pulls/7')]: {
     number: 7, head: { sha: o.head ?? SHA }, user: { login: o.author ?? 'contributor' },
     body: o.body === undefined ? `Fixes the CVE.\n\n${REASON}\n` : o.body, labels: (o.labels ?? ['security-fix']).map((name) => ({ name })),
   },
   [gh('o/p/issues/7/events?per_page=100&page=1')]: o.events ?? [labeled('someone', 'labeled', 'bug'), labeled('CrisWorking')],
   [gh('o/p/pulls/7/reviews?per_page=100&page=1')]: o.reviews ?? [],
+  // newest first, as the API lists them; the earliest one dates the head's arrival
+  [RUNS]: o.runs ?? { total_count: 2, workflow_runs: [{ created_at: daysAgo(0.1) }, { created_at: HEAD_AT }] },
 });
 const emergency = (owners: string | null, routes: Routes, head: Files = young, calls: string[] = []) =>
   run(owners === null ? {} : { '.github/CODEOWNERS': owners }, head, router({ ...youngDocs, ...routes }, calls), { pr: PR });
@@ -451,7 +456,7 @@ describe('cooldown: security-fix emergency path', () => {
     // two owners: a reason alone is not enough, and approvals do not replace the reason
     const noApprovals = await emergency(OWNERS2, prRoutes());
     expect(noApprovals.ok).toBe(false);
-    expect(problems(noApprovals)).toContain('2 code owners');
+    expect(problems(noApprovals)).toContain('approving review');
     const approvedNoReason = await emergency(OWNERS2, prRoutes({ body: '', reviews: [review('CrisWorking', 'APPROVED'), review('Second', 'APPROVED')] }));
     expect(approvedNoReason.ok).toBe(false);
     // and the young item is still listed
@@ -504,7 +509,7 @@ describe('cooldown: security-fix emergency path', () => {
     expect((await emergency(OWNERS2, prRoutes({ reviews: ok }))).ok).toBe(true);
     const cases: Record<string, { reviews: unknown[]; author?: string }> = {
       one: { reviews: [review('CrisWorking', 'APPROVED')] },
-      self: { reviews: ok, author: 'Second' },
+      self: { reviews: [review('Second', 'APPROVED')], author: 'Second' },
       oldSha: { reviews: [review('CrisWorking', 'APPROVED'), review('Second', 'APPROVED', SHA2)] },
       changes: { reviews: [...ok, review('Second', 'CHANGES_REQUESTED')] },
       dismissed: { reviews: [review('CrisWorking', 'APPROVED'), review('Second', 'DISMISSED')] },
@@ -515,14 +520,14 @@ describe('cooldown: security-fix emergency path', () => {
     for (const [name, c] of Object.entries(cases)) {
       const r = await emergency(OWNERS2, prRoutes({ reviews: c.reviews, ...(c.author ? { author: c.author } : {}) }));
       expect(r.ok, name).toBe(false);
-      expect(problems(r), name).toContain('2 code owners');
+      expect(problems(r), name).toContain('approving review');
     }
     // a later approval after a change request counts again
     expect((await emergency(OWNERS2, prRoutes({ reviews: [review('CrisWorking', 'APPROVED'), review('Second', 'CHANGES_REQUESTED'), review('Second', 'APPROVED')] }))).ok).toBe(true);
   });
 
   it('an API error reading the PR, events or reviews fails closed (not "no label")', async () => {
-    for (const path of ['o/p/pulls/7', 'o/p/issues/7/events?per_page=100&page=1', 'o/p/pulls/7/reviews?per_page=100&page=1']) {
+    for (const path of ['o/p/pulls/7', 'o/p/issues/7/events?per_page=100&page=1', 'o/p/pulls/7/reviews?per_page=100&page=1', `o/p/actions/runs?head_sha=${SHA}&event=pull_request&per_page=100&page=1`]) {
       const r = await emergency(OWNERS2, { ...prRoutes({ reviews: [review('CrisWorking', 'APPROVED'), review('Second', 'APPROVED')] }), [gh(path)]: 502 });
       expect(r.ok, path).toBe(false);
       expect(r.findings.some((f) => f.kind === 'security-fix' && f.lookupFailed), path).toBe(true);
@@ -592,6 +597,48 @@ describe('cooldown: security-fix emergency path', () => {
     for (const env of [{ PR_REPO: 'o/p' }, { PR_REPO: '../x', PR_NUMBER: '7', PR_HEAD_SHA: SHA }, { PR_REPO: 'o/p', PR_NUMBER: '7a', PR_HEAD_SHA: SHA }, { PR_REPO: 'o/p', PR_NUMBER: '7', PR_HEAD_SHA: 'main' }]) {
       expect(() => prFromEnv(env), JSON.stringify(env)).toThrow(/PR_/);
     }
+  });
+
+  it('R-E2: a label applied before the current head arrived does not count; a re-label after the push does', async () => {
+    const before = [labeled('CrisWorking', 'labeled', 'security-fix', daysAgo(1))];
+    const r = await emergency(OWNERS1, prRoutes({ events: before }));
+    expect(r.ok).toBe(false);
+    expect(problems(r)).toContain('re-apply');
+    const relabeled = [...before, labeled('CrisWorking', 'unlabeled', 'security-fix', daysAgo(0.3)), labeled('CrisWorking', 'labeled', 'security-fix', daysAgo(0.2))];
+    expect((await emergency(OWNERS1, prRoutes({ events: relabeled }))).ok).toBe(true);
+    // two owners too: approvals on the new head do not replace a fresh label
+    const ok2 = [review('CrisWorking', 'APPROVED'), review('Second', 'APPROVED')];
+    expect((await emergency(OWNERS2, prRoutes({ events: before, reviews: ok2 }))).ok).toBe(false);
+    // a label with no readable time does not count
+    expect((await emergency(OWNERS1, prRoutes({ events: [{ event: 'labeled', actor: { login: 'CrisWorking' }, label: { name: 'security-fix' } }] }))).ok).toBe(false);
+  });
+
+  it('R-E2: the runs API failing, or no run or no readable run date for the head, fails closed', async () => {
+    const err = await emergency(OWNERS1, prRoutes({ runs: 500 }));
+    expect(err.ok).toBe(false);
+    expect(err.findings.some((f) => f.kind === 'security-fix' && f.lookupFailed)).toBe(true);
+    for (const runs of [{ total_count: 0, workflow_runs: [] }, { workflow_runs: [{ created_at: 'yesterday' }] }, { message: 'odd' }, []]) {
+      const r = await emergency(OWNERS1, prRoutes({ runs }));
+      expect(r.ok, JSON.stringify(runs)).toBe(false);
+    }
+    // the earliest run counts, wherever it is in the list, and every page is read
+    const page1 = { total_count: 101, workflow_runs: Array.from({ length: 100 }, () => ({ created_at: daysAgo(0.05) })) };
+    const routes = { ...prRoutes(), [RUNS]: page1, [RUNS.replace('&page=1', '&page=2')]: { total_count: 101, workflow_runs: [{ created_at: HEAD_AT }] } };
+    // page 1 alone would date the head after the label (1.2 h ago); page 2 holds the real arrival (12 h ago)
+    expect((await emergency(OWNERS1, routes)).ok).toBe(true);
+  });
+
+  it('R-E3: approvals needed = min(2, owners other than the author), at least 1', async () => {
+    // 2 owners, the author is one of them: one approval from the other owner is enough
+    expect((await emergency(OWNERS2, prRoutes({ author: 'Second', reviews: [review('CrisWorking', 'APPROVED')] }))).ok).toBe(true);
+    expect((await emergency(OWNERS2, prRoutes({ author: 'Second', reviews: [review('Second', 'APPROVED')] }))).ok).toBe(false);
+    expect((await emergency(OWNERS2, prRoutes({ author: 'Second', reviews: [review('CrisWorking', 'APPROVED', SHA2)] }))).ok).toBe(false);
+    // 3 owners: 2 needed, whether or not the author is an owner
+    const OWNERS3 = '/data/ @CrisWorking @Second @Third\n/scripts/ @CrisWorking @Second @Third\n';
+    expect((await emergency(OWNERS3, prRoutes({ author: 'Third', reviews: [review('CrisWorking', 'APPROVED')] }))).ok).toBe(false);
+    expect((await emergency(OWNERS3, prRoutes({ author: 'Third', reviews: [review('CrisWorking', 'APPROVED'), review('Second', 'APPROVED')] }))).ok).toBe(true);
+    expect((await emergency(OWNERS3, prRoutes({ reviews: [review('Third', 'APPROVED')] }))).ok).toBe(false);
+    expect((await emergency(OWNERS3, prRoutes({ reviews: [review('Third', 'APPROVED'), review('Second', 'APPROVED')] }))).ok).toBe(true);
   });
 
   it('plain text output strips escapes from file-supplied names too', async () => {

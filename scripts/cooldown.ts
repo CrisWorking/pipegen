@@ -15,10 +15,12 @@
 //
 // Emergency path (DECISIONS #103): when the only problem left is age, a PR labelled `security-fix` by a code owner
 // passes anyway. Code owners are the users on the BASE commit's `.github/CODEOWNERS` `/data/` and `/scripts/` lines.
-// With one owner the label plus a `Security-fix-reason:` line in the PR body is enough; with two or more, two owners
-// other than the PR author must also approve the current head commit. The label is read from the API (PR labels and
-// the latest `labeled` event), never from the event payload, and any API error fails closed. The young items and the
-// reason are printed, so the exception stays visible.
+// The label must have been applied after the current head commit arrived (its earliest `pull_request` workflow run),
+// so the owner re-labels after every push. With one owner the label plus a `Security-fix-reason:` line in the PR body
+// is enough; with two or more, owners other than the PR author must also approve the current head commit (two, or
+// one when the author is one of only two owners). The label is read from the API (PR labels and the latest `labeled`
+// event), never from the event payload, and any API error fails closed. The young items and the reason are printed,
+// so the exception stays visible.
 //
 // The CI job runs the BASE commit's copy of this file against the PR's files, so a PR can't weaken the check that
 // judges it. Keep it dependency-free apart from `yaml`, and keep to syntax Node's type stripping can run
@@ -654,6 +656,25 @@ async function allPages(ctx: Ctx, url: string): Promise<unknown[] | undefined> {
   return undefined;
 }
 
+/** When the head commit arrived on the PR: the created_at of its earliest `pull_request` workflow run, or a problem. */
+async function headArrival(ctx: Ctx, api: string, headSha: string): Promise<{ at: number } | { problem: string }> {
+  let earliest: number | undefined;
+  for (let page = 1; page <= MAX_PAGES; page++) {
+    const got = await ctx.get(`${api}/actions/runs?head_sha=${headSha}&event=pull_request&per_page=${PAGE_SIZE}&page=${page}`, ctx.gh);
+    const runs = isObj(got) && Array.isArray(got.workflow_runs) ? got.workflow_runs : undefined;
+    if (!runs) throw new LookupError('unreadable workflow runs answer');
+    for (const run of runs) {
+      const at = isObj(run) ? str(run.created_at) : undefined;
+      if (!at || !ISO.test(at) || Number.isNaN(Date.parse(at))) return { problem: 'a workflow run for the head commit has no readable created_at' };
+      if (earliest === undefined || Date.parse(at) < earliest) earliest = Date.parse(at);
+    }
+    if (runs.length < PAGE_SIZE) {
+      return earliest === undefined ? { problem: 'no pull_request workflow run found for the head commit, so its arrival time is unknown' } : { at: earliest };
+    }
+  }
+  return { problem: `the head commit has more than ${MAX_PAGES * PAGE_SIZE} workflow runs` };
+}
+
 type EmergencyOutcome = { granted: Emergency } | { absent: true } | { problem: string; lookupFailed?: boolean };
 
 /** Whether the PR holds a valid `security-fix` grant. `absent` = the label is not on the PR. */
@@ -685,13 +706,22 @@ async function emergencyOutcome(ctx: Ctx, pr: PrContext, codeowners: string | nu
     if (!by || !owners.includes(by.toLowerCase())) {
       return { problem: `the security-fix label was applied by ${plainText(by ?? 'an unknown user', 60)}, who is not a code owner in the base ${CODEOWNERS_FILE}; a code owner has to apply it` };
     }
+    // The grant covers only the commit it was given for: the label must be newer than the head's arrival.
+    const labelAt = str(last.created_at);
+    if (!labelAt || !ISO.test(labelAt) || Number.isNaN(Date.parse(labelAt))) return { problem: 'the security-fix labeled event has no readable time' };
+    const arrived = await headArrival(ctx, api, pr.headSha);
+    if ('problem' in arrived) return arrived;
+    if (Date.parse(labelAt) <= arrived.at) {
+      return { problem: `the security-fix label was applied before the head commit ${pr.headSha.slice(0, 12)} arrived; a code owner has to re-apply it after every push` };
+    }
 
     const reason = securityFixReason(doc.body);
     if (!reason) return { problem: `the PR body has no non-empty "${REASON_PREFIX}" line (the first such line counts)` };
     if (owners.length < 2) return { granted: { labelledBy: by, reason, approvers: [] } };
 
     // Two or more owners: the latest review of each user counts (a later comment, change request or dismissal
-    // cancels an approval); it must approve the current head, by an owner who is not the PR author.
+    // cancels an approval); it must approve the current head, by an owner who is not the PR author. Two such
+    // approvals are needed, or one when only one owner other than the author exists (R-E3).
     const reviews = await allPages(ctx, `${api}/pulls/${pr.number}/reviews`);
     if (!reviews) return { problem: `the PR has more than ${MAX_PAGES * PAGE_SIZE} reviews` };
     const latest = new Map<string, Obj>();
@@ -701,8 +731,9 @@ async function emergencyOutcome(ctx: Ctx, pr: PrContext, codeowners: string | nu
       if (rv.state !== 'PENDING') latest.set(who, rv);
     }
     const approvers = [...latest].filter(([who, rv]) => rv.state === 'APPROVED' && rv.commit_id === pr.headSha && owners.includes(who) && who !== author).map(([who]) => who).sort();
-    if (approvers.length < 2) {
-      return { problem: `with ${owners.length} code owners the path needs approving reviews from 2 code owners other than the PR author on the head commit ${pr.headSha.slice(0, 12)}; found ${approvers.length}` };
+    const needed = Math.max(1, Math.min(2, owners.filter((o) => o !== author).length));
+    if (approvers.length < needed) {
+      return { problem: `with ${owners.length} code owners the path needs ${needed} approving review(s) from code owners other than the PR author on the head commit ${pr.headSha.slice(0, 12)}; found ${approvers.length}` };
     }
     return { granted: { labelledBy: by, reason, approvers: approvers.map((a) => loginOf(latest.get(a)?.user) ?? a) } };
   } catch (e) {
