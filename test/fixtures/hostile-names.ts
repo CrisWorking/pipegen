@@ -30,4 +30,15 @@ export const hostileNames: Record<string, string> = {
   setext: '=====',
   zeroWidth: 'ma\u200bin\u200d\u2060\ufeff',
   veryLongEscapes: '['.repeat(300),
+  // GitHub-specific (fix round 1).
+  math: '$x^2$',
+  issueRef: '#123',
+  ghRef: 'GH-1',
+  crossRepoRef: 'cli/cli#1',
+  tableDelimiter: ':---:',
+  trailingHash: 'foo #',
+  taskBox: '[ ] x',
+  nbspWrapped: '\u00a0a\u00a0',
+  variationSelectors: 'a\ufe0f\u{e0100}\u3164b',
+  email: 'me@example.com',
 };

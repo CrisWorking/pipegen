@@ -109,8 +109,8 @@ describe('safeMarkdown exact output', () => {
       ['see www.a.com and https://b.com', `see www${Z}.a.com and https:/${Z}/b.com`],
       ['//evil.com/x', `/${Z}/evil.com/x`],
       ['a///b', `a/${Z}/${Z}/b`],
-      ['@someone', `@${Z}someone`],
-      ['me@example.com', `me@${Z}example.com`],
+      ['@someone', `${Z}@${Z}someone`],
+      ['me@example.com', `me${Z}@${Z}example.com`], // ZWSP on both sides: linkify-it needs it before the @
     ];
     for (const [input, out] of cases) expect(safeMarkdown(input), input).toBe(out);
   });
@@ -120,7 +120,7 @@ describe('safeMarkdown exact output', () => {
     expect(safeMarkdown('a\u200cb\u200dc\u2060d\ufeffe\u00adf\u180eg')).toBe('abcdefg');
     expect(safeMarkdown('a\u{e0041}\u{e007f}b')).toBe('ab');
     expect(safeMarkdown('a\u2028b\u2029c')).toBe('a b c');
-    expect(safeMarkdown('a\u200b@b')).toBe(`a@${Z}b`); // only the space safeMarkdown itself inserts remains
+    expect(safeMarkdown('a\u200b@b')).toBe(`a${Z}@${Z}b`); // only the space safeMarkdown itself inserts remains
   });
 
   it('a dangling backslash stays data and never escapes what the caller adds next', () => {
@@ -130,6 +130,7 @@ describe('safeMarkdown exact output', () => {
     // Cut right after an escape backslash: the half escape is dropped, not left before the ellipsis.
     expect(safeMarkdown('ab\\cd', 4)).toBe('ab…');
     expect(safeMarkdown('a[b', 3)).toBe('a…');
+    expect(safeMarkdown('xx' + '['.repeat(300))).toBe('xx' + '\\['.repeat(98) + '…');
     expect(safeMarkdown('ab\\\\', 5)).toBe('ab\\\\…');
   });
 
@@ -158,17 +159,17 @@ describe('safeMarkdown exact output', () => {
       bidiIsolates: 'app',
       nulAndCr: 'appnameOVERWRITTEN',
       newlines: 'line1line2line3tab',
-      mention: `thanks @${Z}octocat and @${Z}org/team`,
+      mention: `thanks ${Z}@${Z}octocat and ${Z}@${Z}org/team`,
       htmlTag: '&lt;script&gt;alert(1)&lt;/script&gt;&lt;img src=x onerror=alert(1)&gt;',
-      markdownLink: `\\[click\\](https:/${Z}/evil.example) \\!\\[img\\](https:/${Z}/evil.example/a.png)`,
+      markdownLink: `${Z}\\[click\\](https:/${Z}/evil.example) \\!\\[img\\](https:/${Z}/evil.example/a.png)`,
       veryLong: 'a'.repeat(199) + '…',
-      entityBidi: 'app&amp;#8238;fdp.exe',
+      entityBidi: `app&amp;#${Z}8238;fdp.exe`, // and no #8238 issue link
       codeSpan: '\\`code\\`',
       bold: '\\*\\*bold\\*\\*',
-      link: `\\[x\\](http:/${Z}/evil)`,
+      link: `${Z}\\[x\\](http:/${Z}/evil)`,
       image: '\\!\\[img\\](x)',
       scriptTag: '&lt;script&gt;',
-      someone: `@${Z}someone`,
+      someone: `${Z}@${Z}someone`,
       wwwLink: `www${Z}.evil.com`,
       httpsLink: `https:/${Z}/evil.com`,
       heading: '\\# heading',
@@ -176,9 +177,83 @@ describe('safeMarkdown exact output', () => {
       quote: '&gt; quote',
       setext: '\\=====',
       zeroWidth: 'main',
-      veryLongEscapes: '\\['.repeat(99) + '…',
+      veryLongEscapes: Z + '\\['.repeat(99) + '…', // the ZWSP makes the 199-char cut land after a whole \[
+      math: `${Z}\\$x^2${Z}\\$`,
+      issueRef: `\\#${Z}123`,
+      ghRef: `GH${Z}-1`,
+      crossRepoRef: `cli/cli#${Z}1`,
+      tableDelimiter: '\\:---:',
+      trailingHash: 'foo \\#',
+      taskBox: `${Z}\\[ \\] x`,
+      nbspWrapped: 'a',
+      variationSelectors: 'ab',
+      email: `me${Z}@${Z}example.com`,
     };
     expect(Object.keys(expected).sort()).toEqual(Object.keys(hostileNames).sort());
     for (const [name, value] of Object.entries(hostileNames)) expect(safeMarkdown(value), name).toBe(expected[name]);
+  });
+});
+
+// Fix round 1: what the real GitHub renderer still did after T0 (rendered with `gh api /markdown`).
+describe('safeMarkdown exact output: GitHub-specific syntax (fix round 1)', () => {
+  it('$ math can not render: a zero-width space and a backslash go before every $', () => {
+    expect(safeMarkdown('$x^2$')).toBe(`${Z}\\$x^2${Z}\\$`);
+    expect(safeMarkdown('a $$b$$')).toBe(`a ${Z}\\$${Z}\\$b${Z}\\$${Z}\\$`);
+  });
+
+  it('issue and pull request references are not linked', () => {
+    const cases: [string, string][] = [
+      ['see #123', `see #${Z}123`],
+      ['#123', `\\#${Z}123`],
+      ['cli/cli#1', `cli/cli#${Z}1`],
+      ['GH-1', `GH${Z}-1`],
+      ['fix gh-12', `fix gh${Z}-12`],
+      ['GH-x and #x', 'GH-x and #x'],
+      ['&#8238;', `&amp;#${Z}8238;`],
+      ['&#x202E;', '&amp;#x202E;'],
+    ];
+    for (const [input, out] of cases) expect(safeMarkdown(input), input).toBe(out);
+  });
+
+  it('a leading : (table delimiter row), a trailing # (heading closer) and a leading [ (task box) are neutralised', () => {
+    const cases: [string, string][] = [
+      [':---:', '\\:---:'],
+      [':--', '\\:--'],
+      ['a:b', 'a:b'],
+      ['foo #', 'foo \\#'],
+      ['#', '\\#'],
+      ['# a #', '\\# a \\#'],
+      ['a#b', 'a#b'],
+      ['[ ] x', `${Z}\\[ \\] x`],
+      ['[x] done', `${Z}\\[x\\] done`],
+      ['a [ ] b', 'a \\[ \\] b'],
+    ];
+    for (const [input, out] of cases) expect(safeMarkdown(input), input).toBe(out);
+  });
+
+  it('^ before a [ or at the end is escaped (inline footnotes)', () => {
+    expect(safeMarkdown('^[note]')).toBe('\\^\\[note\\]');
+    expect(safeMarkdown('a^')).toBe('a\\^');
+    expect(safeMarkdown('a^b')).toBe('a^b');
+  });
+
+  it('trims every kind of whitespace, so the caller\'s emphasis still closes', () => {
+    expect(safeMarkdown('\u00a0a\u00a0')).toBe('a');
+    expect(safeMarkdown('\u3000a b\u3000')).toBe('a b');
+    expect(safeMarkdown(' \u00a0 # x')).toBe('\\# x');
+  });
+
+  it('removes every default-ignorable code point (variation selectors, Hangul fillers, ...)', () => {
+    expect(safeMarkdown('a\ufe0fb')).toBe('ab');
+    expect(safeMarkdown('a\u{e0100}b\u{e01ef}c')).toBe('abc');
+    expect(safeMarkdown('a\u3164b\u115fc\uffa0d')).toBe('abcd');
+    expect(safeMarkdown('a\u034fb\u17b4c\ufff9d\ufffbe')).toBe('abcde');
+  });
+
+  it('runs in linear time on long runs of spaces and backslashes', () => {
+    const t0 = performance.now();
+    expect(safeMarkdown('a' + ' '.repeat(80000) + 'x')).toBe('a' + ' '.repeat(198) + '…');
+    expect(safeMarkdown('\\'.repeat(80000), 80000)).toBe('\\'.repeat(79998) + '…');
+    expect(performance.now() - t0).toBeLessThan(50);
   });
 });
