@@ -1,27 +1,34 @@
 // Live tool discovery (Plan B Task 2). For a need with no reviewed tool, pipegen looks for well-known tools and shows
 // the good ones as MENTION-ONLY suggestions: listed in the audit report, never run, never turned into a step.
+// suggestTools is the supported path (Plan U, `audit --ai`); discover and toSuggestions are its parts.
 //
 // - Tool names never come from repo text. The AI prompt holds only the need id, its category, the language and the
 //   package manager, all enum values (src/ai/prompts/candidates.ts); never the code bundle, README or manifests
-//   (brief; ruling F6). Search keywords come from CATEGORY_KEYWORDS (a fixed table), the language qualifier from a
-//   fixed table too. The repo being audited, the AI's answers and search results are all untrusted.
-// - Sources, in order, merged and deduped by repo (any letter case): reviewed tools for the need (reviewedFor with
-//   the run's mode, ruling S17; ordered by proofs in memory), memory entries (reviewed tool ids only; an id no longer
-//   on the reviewed list is ignored), the AI (up to MAX_AI_CANDIDATES), GitHub search (actions, then CLIs in the
-//   language) and npm search (Node lint, format and test tools; a hit counts only with a GitHub repo link, S36).
-// - Every unreviewed candidate is checked in order: a valid GitHub owner/name (S14), not a look-alike of ANY
-//   reviewed tool (nearDuplicate on the full list, S17/S31), the repo exists under that exact name. suggestTools
-//   then reads its stats (fetchStats) and applies the quality bar. Anything that fails is dropped with one note.
+//   (brief; ruling F6; controller ruling in fix round 1). Search keywords come from CATEGORY_KEYWORDS (a fixed
+//   table), the language qualifier from a fixed table too. The repo being audited, the AI's answers and search
+//   results are all untrusted. A suggestion is shown under its checked repo's name (npm: its checked package name),
+//   never a name the AI or a search gave.
+// - Sources, in order, merged and deduped by repo (any letter case): reviewed tools for the need (reviewedForNeed:
+//   reviewedFor with the run's mode, ruling S17, the ones memory has proven most first; memory holds reviewed tool
+//   ids only, an id no longer on the reviewed list is ignored, and in full mode only entries with a proof count),
+//   the AI (up to MAX_AI_CANDIDATES), GitHub search (actions, then CLIs in the language) and npm search (Node lint,
+//   format and test tools; a hit counts only with a GitHub repo link, S36).
+// - Every unreviewed candidate is checked in order: a valid GitHub owner/name (S14), not a repo already on the
+//   reviewed list (for another check), not a look-alike of ANY reviewed tool (nearDuplicate on the full list,
+//   S17/S31), the repo exists under that exact name. suggestTools then confirms that an "action" really is one
+//   (action.yml at the repo root; else it is checked as a CLI), reads its stats (fetchStats) and applies the quality
+//   bar. Anything that fails is dropped with one note.
 // - Bounds: MAX_CANDIDATES per need (brief), MAX_DISCOVERY_NEEDS per run, MAX_CHECKED_PER_NEED stats lookups and
 //   MAX_SUGGESTIONS_PER_NEED suggestions per need, one shared rate budget (the caller's newRateBudget(), S16) and a
-//   wall-clock bound (DISCOVERY_DEADLINE_MS, on the injected clock).
+//   wall-clock bound (DISCOVERY_DEADLINE_MS, on the injected clock). GitHub's rate limit (or the spent budget) stops
+//   the whole run, so no later need makes a billed AI call for nothing.
 // - Only `deps.gh` (Octokit, api.github.com) carries the user's credential; `deps.fetch` (npm search) never gets an
 //   auth header (S15). AI usage goes to deps.onUsage, also when the call fails (S4). AI text is cleaned (links
 //   removed, safeText) before anyone sees it; toSuggestions passes name and why through safeText again.
 import type { Octokit } from '@octokit/rest';
 import { z } from 'zod';
 import { CANDIDATES_SYSTEM, candidatesUser } from '../ai/prompts/candidates.js';
-import { AiError, completeValidated } from '../ai/provider.js';
+import { AiError, completeValidated, type AiErrorKind } from '../ai/provider.js';
 import { aiSchema, type AiSchema } from '../ai/schema.js';
 import { safeText } from '../util/safe-text.js';
 import type {
@@ -57,8 +64,14 @@ const MAX_BODY_CHARS = 2_000_000;
 const KINDS = ['action', 'cli', 'docker'] as const satisfies readonly Candidate['kind'][];
 const LANGUAGES = ['node', 'python', 'go', 'java', 'dotnet', 'ruby', 'php', 'other'] as const satisfies readonly Language[];
 const PACKAGE_MANAGERS = ['npm', 'pnpm', 'yarn', 'bun', 'pip', 'poetry', 'uv', 'other'] as const satisfies readonly PackageManager[];
-/** A tool's display name as the AI or a search gives it; anything else falls back to the repo's name. */
-const TOOL_NAME_RE = /^[A-Za-z0-9@][A-Za-z0-9 ._@/+-]{0,63}$/;
+/** The files that make a repo a GitHub Action (at its root). */
+const ACTION_FILES: ReadonlySet<string> = new Set(['action.yml', 'action.yaml']);
+/**
+ * AI failures after which suggestTools asks the AI nothing more in this run: the provider rejected the request
+ * itself (an HTTP error such as a bad key or a spent quota) or isn't set up. A cost-cap error (Plan E) joins this
+ * set when it exists. Other failures (refusal, invalid, truncated, timeout) only skip the AI for that need.
+ */
+const STOP_AI_KINDS: ReadonlySet<AiErrorKind> = new Set<AiErrorKind>(['http', 'missing']);
 
 /**
  * Search keywords per need category: a fixed table in code, never repo text. A category that isn't here (pipegen's
@@ -87,6 +100,7 @@ const NPM_CATEGORIES: ReadonlySet<string> = new Set(['lint', 'format-lint', 'uni
 
 const FALLBACK_WHY = 'Found by pipegen\'s discovery; pipegen has not reviewed it.';
 const searchWhy = (where: string, category: string) => `Found by ${where} for ${category} checks (most used first); pipegen has not reviewed it.`;
+const RATE_STOP_NOTE = 'pipegen stopped looking for tool suggestions: GitHub\'s rate limit was reached.';
 
 export interface DiscoverDeps extends RateClock {
   ai: AiProvider; gh: Octokit; memory: MemoryStore; fetch: typeof fetch;
@@ -103,9 +117,16 @@ export interface DiscoverDeps extends RateClock {
 }
 export interface SuggestDeps extends DiscoverDeps { bar: QualityBar }
 
-/** A candidate before its checks: where it came from and what it would need for stats. */
-interface Raw { repo: unknown; name: string; kind: Candidate['kind']; why: string; install?: InstallSpec; version?: string }
-interface Gathered { candidates: Candidate[]; installs: Map<Candidate, InstallSpec>; why: Map<string, string> }
+/** A candidate before its checks. `name` only for npm hits (a checked package name); everything else shows its repo's name. */
+interface Raw { repo: unknown; name?: string; kind: Candidate['kind']; why: string; install?: InstallSpec; version?: string }
+interface Gathered {
+  candidates: Candidate[]; installs: Map<Candidate, InstallSpec>; why: Map<string, string>;
+  /** GitHub's rate limit stopped the existence checks, or the run's wait budget is spent: no more GitHub work is worth trying. */
+  rateLimited: boolean;
+  /** The AI call failed (only when gather was told to go on without it). */
+  aiError?: AiError;
+}
+interface GatherOptions { useAi: boolean; continueWithoutAi: boolean }
 
 type AiCandidates = { candidates: { needId: string; category: string; language: string; kind: Candidate['kind']; name: string; repo: string; why: string }[] };
 
@@ -140,6 +161,32 @@ function needPackageManager(need: Need, p: RepoProfile): PackageManager {
   return shared(services.map((s) => s.packageManager), PACKAGE_MANAGERS);
 }
 
+/** A repo's own name (the part after the slash): what a discovered candidate is shown as. */
+const repoName = (repo: string) => repo.slice(repo.indexOf('/') + 1);
+
+/**
+ * The reviewed tools that cover a need, the rule both discover and suggestTools use: reviewedFor with the run's mode
+ * (S17), ordered so the ones memory has proven most first (an entry with no proof adds nothing to the order).
+ * Memory holds reviewed tool ids only, and an id no longer on the reviewed list is ignored with a note. Memory only
+ * orders: it never adds a tool reviewedFor doesn't give, so in full mode a tool still needs a proof on the reviewed
+ * list itself (fix round 1, M1).
+ */
+function reviewedForNeed(need: Need, category: NeedCategory, language: Language, deps: DiscoverDeps, note: (t: string) => void): ReviewedTool[] {
+  const known = new Set(deps.reviewed.map((t) => t.id));
+  const proofs = new Map<string, number>();
+  for (const e of deps.memory.lookup(category, language)) {
+    if (!known.has(e.toolId)) {
+      note('pipegen ignored a tool it remembered that is no longer on its reviewed list.');
+      continue;
+    }
+    proofs.set(e.toolId, Math.max(proofs.get(e.toolId) ?? 0, e.proofs));
+  }
+  return reviewedFor(need, language, deps.reviewed, deps.mode)
+    .map((t, i) => ({ t, i }))
+    .sort((a, b) => (proofs.get(b.t.id) ?? 0) - (proofs.get(a.t.id) ?? 0) || a.i - b.i)
+    .map((x) => x.t);
+}
+
 /** The AI's answer schema: need id, category and language fixed to the asked need (one-value enums), kind an enum. */
 function candidatesSchema(needId: string, category: NeedCategory, language: Language): AiSchema<AiCandidates> {
   return aiSchema<AiCandidates>(z.strictObject({
@@ -155,21 +202,16 @@ function candidatesSchema(needId: string, category: NeedCategory, language: Lang
   }));
 }
 
-/** The name shown for a candidate: the given one when it looks like a tool name, else the repo's name. */
-function displayName(given: unknown, repo: string): string {
-  return typeof given === 'string' && TOOL_NAME_RE.test(given) ? given : repo.slice(repo.indexOf('/') + 1);
-}
-
 /** Is a failure GitHub's rate limit (or the run's spent wait budget)? Then no more GitHub work is worth trying. */
 function isRateStop(e: unknown): boolean {
   return e instanceof GitHubRateLimitError
     || (e instanceof StatsError && (e.message === BUDGET_SPENT_MESSAGE || e.cause instanceof GitHubRateLimitError));
 }
 
-/** The sources, merged and checked: reviewed and memory candidates first, then checked discovery candidates. */
-async function gather(need: Need, p: RepoProfile, deps: DiscoverDeps): Promise<Gathered> {
+/** The sources, merged and checked: reviewed candidates first, then checked discovery candidates. */
+async function gather(need: Need, p: RepoProfile, deps: DiscoverDeps, opts: GatherOptions): Promise<Gathered> {
   const note = noter(deps.notes);
-  const result: Gathered = { candidates: [], installs: new Map(), why: new Map() };
+  const result: Gathered = { candidates: [], installs: new Map(), why: new Map(), rateLimited: false };
   const category = categoryOf(need);
   if (category === undefined) {
     note(`pipegen can't look for tools for the need "${safeText(String(need.id), 40)}": it isn't a need pipegen knows.`);
@@ -183,28 +225,9 @@ async function gather(need: Need, p: RepoProfile, deps: DiscoverDeps): Promise<G
     out.push(c);
   };
 
-  // 1. Reviewed tools for the need (this run's mode), the ones memory has proven most first.
-  const remembered = deps.memory.lookup(category, language);
-  const proofs = new Map<string, number>();
-  for (const e of remembered) proofs.set(e.toolId, Math.max(proofs.get(e.toolId) ?? 0, e.proofs));
-  const reviewed = reviewedFor(need, language, deps.reviewed, deps.mode)
-    .map((t, i) => ({ t, i }))
-    .sort((a, b) => (proofs.get(b.t.id) ?? 0) - (proofs.get(a.t.id) ?? 0) || a.i - b.i)
-    .map((x) => x.t);
-  for (const t of reviewed) {
+  // 1-2. Reviewed tools for the need (this run's mode), the ones memory has proven most first.
+  for (const t of reviewedForNeed(need, category, language, deps, note)) {
     if (!seen.has(t.candidate.repo.toLowerCase())) add({ ...t.candidate, pin: { ...t.candidate.pin }, categories: [...t.candidate.categories], source: 'reviewed', reviewed: true });
-  }
-
-  // 2. Memory: reviewed tool ids only, re-read from the reviewed list (memory stores no step, no repo, no name).
-  const byId = new Map(deps.reviewed.map((t) => [t.id, t]));
-  for (const e of remembered) {
-    const t = byId.get(e.toolId);
-    if (t === undefined) {
-      note('pipegen ignored a tool it remembered that is no longer on its reviewed list.');
-      continue;
-    }
-    if (!t.categories.includes(category) || !(t.languages.includes(language) || t.languages.includes('any'))) continue;
-    if (!seen.has(t.candidate.repo.toLowerCase())) add({ ...t.candidate, pin: { ...t.candidate.pin }, categories: [...t.candidate.categories], source: 'memory', reviewed: true });
   }
 
   const keywords = CATEGORY_KEYWORDS[category];
@@ -213,15 +236,25 @@ async function gather(need: Need, p: RepoProfile, deps: DiscoverDeps): Promise<G
     return result;
   }
 
-  // 3-5. The AI (enum fields only), GitHub search and npm search (fixed keywords).
-  const raw: Raw[] = [
-    ...(await askAi(need.id, category, language, needPackageManager(need, p), deps, note)),
-    ...(await searchGitHub(keywords, category, language, deps, note)),
-    ...(language === 'node' && NPM_CATEGORIES.has(category) ? await searchNpm(keywords, category, deps, note) : []),
-  ];
+  // 3. The AI (enum fields only).
+  const raw: Raw[] = [];
+  if (opts.useAi) {
+    try {
+      raw.push(...(await askAi(need.id, category, language, needPackageManager(need, p), deps, note)));
+    } catch (e) {
+      if (!(opts.continueWithoutAi && e instanceof AiError)) throw e;
+      result.aiError = e;
+    }
+  }
+  // 4-5. GitHub search and npm search (fixed keywords).
+  const gh = await searchGitHub(keywords, category, language, deps, note);
+  raw.push(...gh.raw);
+  if (gh.budgetSpent) result.rateLimited = true;
+  if (language === 'node' && NPM_CATEGORIES.has(category)) raw.push(...(await searchNpm(keywords, category, deps, note)));
 
-  // Checks, in order: a valid repo name, not a look-alike of any reviewed tool, the repo exists under that name.
-  let rateLimited = false;
+  // Checks, in order: a valid repo name, not already reviewed, not a look-alike of any reviewed tool, the repo exists.
+  const reviewedRepos = new Map(deps.reviewed.map((t) => [t.candidate.repo.toLowerCase(), t]));
+  const unchecked = 'pipegen left out some suggested tools: GitHub\'s rate limit stopped it checking that they exist.';
   for (const r of raw) {
     if (out.length >= MAX_CANDIDATES) break;
     if (!isGitHubRepo(r.repo)) {
@@ -231,26 +264,30 @@ async function gather(need: Need, p: RepoProfile, deps: DiscoverDeps): Promise<G
     const repo = r.repo;
     if (seen.has(repo.toLowerCase())) continue;
     seen.add(repo.toLowerCase());
+    if (reviewedRepos.has(repo.toLowerCase())) {
+      note(`pipegen left out ${repo}: it is on pipegen's reviewed list for other checks, not this one.`);
+      continue;
+    }
     const twin = nearDuplicate(repo, deps.reviewed);
     if (twin !== null) {
       note(`pipegen left out ${repo}: its name is very close to the reviewed tool ${twin.candidate.repo}, so it may be a look-alike.`);
       continue;
     }
-    if (rateLimited) {
-      note('pipegen left out some suggested tools: GitHub\'s rate limit stopped it checking that they exist.');
+    if (result.rateLimited) {
+      note(unchecked);
       continue;
     }
     const found = await repoExists(repo, deps);
     if (found === 'rate-limited') {
-      rateLimited = true;
-      note('pipegen left out some suggested tools: GitHub\'s rate limit stopped it checking that they exist.');
+      result.rateLimited = true;
+      note(unchecked);
       continue;
     }
     if (found === 'missing') { note(`pipegen left out ${repo}: that GitHub repo doesn't exist (or isn't public).`); continue; }
     if (found === 'moved') { note(`pipegen left out ${repo}: the repo has moved to another name, and pipegen checks the exact name only.`); continue; }
     if (found === 'unknown') { note(`pipegen left out ${repo}: it couldn't check that the repo exists.`); continue; }
     const c: Candidate = {
-      id: repo.toLowerCase(), name: displayName(r.name, repo), kind: r.kind, repo, version: r.version ?? '', pin: {},
+      id: repo.toLowerCase(), name: r.name ?? repoName(repo), kind: r.kind, repo, version: r.version ?? '', pin: {},
       source: 'discovery', reviewed: false, categories: [category],
     };
     add(c);
@@ -273,6 +310,23 @@ async function repoExists(repo: string, deps: DiscoverDeps): Promise<'ok' | 'mis
   }
 }
 
+/**
+ * Is the repo a GitHub Action: an action.yml or action.yaml file at the root of its default branch (one listing of
+ * the root, through the rate-limit helper). Discovery candidates carry no version, so the stats use the latest
+ * release; the default branch is the one place to look without guessing a ref. Anything that isn't a clear yes is a no.
+ */
+async function isAction(repo: string, deps: DiscoverDeps): Promise<'yes' | 'no' | 'unknown' | 'rate-limited'> {
+  const { owner, name } = repoSegments(repo);
+  try {
+    const res = await withRateLimit(() => deps.gh.rest.repos.getContent({ owner, repo: name, path: '' }), deps);
+    const list = Array.isArray(res.data) ? (res.data as { name?: unknown; type?: unknown }[]) : [];
+    return list.some((f) => f.type === 'file' && typeof f.name === 'string' && ACTION_FILES.has(f.name)) ? 'yes' : 'no';
+  } catch (e) {
+    if (e instanceof GitHubRateLimitError) return 'rate-limited';
+    return (e as { status?: unknown } | null)?.status === 404 ? 'no' : 'unknown';
+  }
+}
+
 /** The AI's candidates (prompt: enum fields only). AiError passes through after its usage is reported. */
 async function askAi(needId: string, category: NeedCategory, language: Language, packageManager: PackageManager, deps: DiscoverDeps, note: (t: string) => void): Promise<Raw[]> {
   const schema = candidatesSchema(needId, category, language);
@@ -292,19 +346,22 @@ async function askAi(needId: string, category: NeedCategory, language: Language,
     throw e;
   }
   if (data.candidates.length > MAX_AI_CANDIDATES) note(`pipegen read only the first ${MAX_AI_CANDIDATES} of the ${data.candidates.length} tools the AI suggested.`);
-  return data.candidates.slice(0, MAX_AI_CANDIDATES).map((a) => ({
-    repo: a.repo, name: a.name, kind: a.kind, why: cleanAiText(a.why) || FALLBACK_WHY,
-  }));
+  // The AI's `name` is never used: a suggestion is shown under its checked repo's name, so the AI can't present an
+  // unknown repo under a reviewed tool's name.
+  return data.candidates.slice(0, MAX_AI_CANDIDATES).map((a) => ({ repo: a.repo, kind: a.kind, why: cleanAiText(a.why) || FALLBACK_WHY }));
 }
 
-const searchSchema = z.object({ items: z.array(z.object({ full_name: z.string(), name: z.string().optional(), archived: z.boolean().optional() })) });
+const searchSchema = z.object({ items: z.array(z.object({ full_name: z.string(), archived: z.boolean().optional() })) });
 
-/** GitHub search, sorted by stars: actions (topic:github-action), then CLIs in the need's language. Never fails the run. */
-async function searchGitHub(keywords: string, category: string, language: Language, deps: DiscoverDeps, note: (t: string) => void): Promise<Raw[]> {
+/**
+ * GitHub search, sorted by stars: actions (topic:github-action), then CLIs in the need's language. Never fails the
+ * run. `budgetSpent`: the run's wait budget ran out here (search has its own rate limit, which only skips search).
+ */
+async function searchGitHub(keywords: string, category: string, language: Language, deps: DiscoverDeps, note: (t: string) => void): Promise<{ raw: Raw[]; budgetSpent: boolean }> {
   const queries: { q: string; kind: Candidate['kind'] }[] = [{ q: `${keywords} topic:github-action`, kind: 'action' }];
   const lang = SEARCH_LANGUAGE[language];
   if (lang !== null) queries.push({ q: `${keywords} language:${lang}`, kind: 'cli' });
-  const out: Raw[] = [];
+  const raw: Raw[] = [];
   for (const { q, kind } of queries) {
     let items: z.infer<typeof searchSchema>['items'];
     try {
@@ -318,17 +375,17 @@ async function searchGitHub(keywords: string, category: string, language: Langua
     } catch (e) {
       if (e instanceof GitHubRateLimitError) {
         note('GitHub search hit its rate limit, so pipegen continued without search results.');
-        break; // the next search would hit it too
+        return { raw, budgetSpent: e.budgetSpent }; // the next search would hit it too
       }
       note('GitHub search failed, so pipegen continued without its results.');
       continue;
     }
     for (const item of items.slice(0, SEARCH_RESULTS)) {
       if (item.archived === true) continue;
-      out.push({ repo: item.full_name, name: item.name ?? '', kind, why: searchWhy('GitHub search', category) });
+      raw.push({ repo: item.full_name, kind, why: searchWhy('GitHub search', category) });
     }
   }
-  return out;
+  return { raw, budgetSpent: false };
 }
 
 const npmSearchSchema = z.object({
@@ -375,44 +432,53 @@ async function searchNpm(keywords: string, category: string, deps: DiscoverDeps,
 
 /**
  * Candidates for one need (unverified for quality: suggestTools reads stats and applies the bar), at most
- * MAX_CANDIDATES, deduped by repo. Reviewed tools first, then memory, then discovery candidates that passed the
- * name, typosquat and existence checks. AiError passes through (after deps.onUsage).
+ * MAX_CANDIDATES, deduped by repo. Reviewed tools first (the ones memory has proven most first), then discovery
+ * candidates that passed the name, reviewed-list, typosquat and existence checks. AiError passes through (after
+ * deps.onUsage).
  */
 export async function discover(need: Need, p: RepoProfile, deps: DiscoverDeps): Promise<Candidate[]> {
-  const g = await gather(need, p, deps);
+  const g = await gather(need, p, deps, { useAi: true, continueWithoutAi: false });
   if (deps.why !== undefined) for (const [repo, why] of g.why) deps.why.set(repo, why);
   return g.candidates;
 }
 
 /**
- * The mention-only list (PipelineDraft.suggestions): unreviewed discovery candidates only (the caller passes the
- * ones that passed the quality bar), each once, as exactly { name, repo, why }. Never a step. name and why go
- * through safeText; the report's Markdown output uses safeMarkdown on top (Plan G/U).
+ * The mention-only list (PipelineDraft.suggestions): unreviewed discovery candidates whose stats (read for that
+ * same repo) pass the quality bar at `now`, each once, as exactly { name, repo, why }. A candidate without stats,
+ * or whose stats fail the bar, is skipped. Never a step. name and why go through safeText; the report's Markdown
+ * output uses safeMarkdown on top (Plan G/U). suggestTools is the supported way to get here.
  */
-export function toSuggestions(cands: Candidate[], why: Map<string, string>): PipelineDraft['suggestions'] {
+export function toSuggestions(cands: Candidate[], why: Map<string, string>, bar: QualityBar, now: Date): PipelineDraft['suggestions'] {
   const out: PipelineDraft['suggestions'] = [];
   const seen = new Set<string>();
   for (const c of cands) {
     if (c.reviewed !== false || c.source !== 'discovery' || !isGitHubRepo(c.repo)) continue;
+    if (c.stats === undefined || c.stats.repo.toLowerCase() !== c.repo.toLowerCase() || !checkQualityBar(c.stats, bar, now).pass) continue;
     const key = c.repo.toLowerCase();
     if (seen.has(key)) continue;
     seen.add(key);
-    const name = safeText(String(c.name ?? ''), 64) || c.repo.slice(c.repo.indexOf('/') + 1);
+    const name = safeText(String(c.name ?? ''), 64) || repoName(c.repo);
     out.push({ name, repo: c.repo, why: safeText(why.get(c.repo) ?? '', 200) || FALLBACK_WHY });
   }
   return out;
 }
 
 /**
- * The audit chain (Plan U, `audit --ai`): for each need with no reviewed tool (one discovery per need id and
- * language, at most MAX_DISCOVERY_NEEDS), discover → fetchStats → checkQualityBar → toSuggestions. A StatsError drops
- * that candidate with a note and never fails the run; GitHub's rate limit (or the run's spent wait budget) and the
- * wall-clock bound stop the search and keep what passed so far. AiError passes through.
+ * The audit chain (Plan U, `audit --ai`), the supported path: for each need no reviewed tool covers (the same rule
+ * discover uses; one discovery per need id and language, at most MAX_DISCOVERY_NEEDS), discover → (action check) →
+ * fetchStats → checkQualityBar → toSuggestions.
+ * - A StatsError drops that candidate with a note and never fails the run.
+ * - GitHub's rate limit or the run's spent wait budget (in existence checks, search or stats) and the wall-clock
+ *   bound stop the whole search; what passed so far is kept.
+ * - An AI failure for one need is noted and that need goes on with search results only; an http or missing-provider
+ *   failure stops asking the AI for the rest of the run (STOP_AI_KINDS). Usage is still reported (S4).
  */
 export async function suggestTools(needs: Need[], p: RepoProfile, deps: SuggestDeps): Promise<PipelineDraft['suggestions']> {
   const note = noter(deps.notes);
   const now = deps.now ?? Date.now;
-  const deadline = now() + DISCOVERY_DEADLINE_MS;
+  const started = now();
+  const deadline = started + DISCOVERY_DEADLINE_MS;
+  const at = new Date(started); // the quality bar is judged at one moment for the whole run
   const timeUp = () => {
     if (now() <= deadline) return false;
     note(`pipegen stopped looking for tool suggestions: it ran out of time (${Math.round(DISCOVERY_DEADLINE_MS / 60_000)} minutes).`);
@@ -426,7 +492,7 @@ export async function suggestTools(needs: Need[], p: RepoProfile, deps: SuggestD
     const category = categoryOf(n);
     if (category === undefined || CATEGORY_KEYWORDS[category] === undefined) continue;
     const language = needLanguage(n, p);
-    if (reviewedFor(n, language, deps.reviewed, deps.mode).length > 0) continue;
+    if (reviewedForNeed(n, category, language, deps, note).length > 0) continue;
     const key = `${n.id}|${language}`;
     if (keys.has(key)) continue;
     keys.add(key);
@@ -439,32 +505,60 @@ export async function suggestTools(needs: Need[], p: RepoProfile, deps: SuggestD
   const why = new Map<string, string>();
   const passed: Candidate[] = [];
   const judged = new Set<string>(); // repos already checked for an earlier need
+  let useAi = true;
   search: for (const need of picked) {
     if (timeUp()) break;
-    const g = await gather(need, p, deps);
+    const g = await gather(need, p, deps, { useAi, continueWithoutAi: true });
+    if (g.aiError !== undefined) {
+      note(`The AI couldn't suggest tools for the ${need.id} need (${g.aiError.message}); pipegen went on with search results for it.`);
+      if (STOP_AI_KINDS.has(g.aiError.kind)) {
+        useAi = false;
+        note(`pipegen stopped asking the AI for tool suggestions (${g.aiError.message}) and continued without the AI.`);
+      }
+    }
+    if (g.rateLimited) {
+      note(RATE_STOP_NOTE);
+      break;
+    }
     let checked = 0;
     let kept = 0;
-    for (const c of g.candidates) {
-      if (c.reviewed || c.source !== 'discovery') continue;
+    for (const found of g.candidates) {
+      if (found.reviewed || found.source !== 'discovery') continue;
       if (kept >= MAX_SUGGESTIONS_PER_NEED || checked >= MAX_CHECKED_PER_NEED) break;
-      const key = c.repo.toLowerCase();
+      const key = found.repo.toLowerCase();
       if (judged.has(key)) continue;
       if (timeUp()) break search;
       judged.add(key);
       checked++;
+      let c = found;
+      if (c.kind === 'action') {
+        // Advisories for an action come from GitHub's Actions database, which says nothing about other repos: a repo
+        // that only claims to be an action is checked as a CLI (no advisory lookup → unchecked → the bar refuses).
+        const action = await isAction(c.repo, deps);
+        if (action === 'rate-limited') {
+          note(RATE_STOP_NOTE);
+          break search;
+        }
+        if (action !== 'yes') {
+          note(action === 'no'
+            ? `${c.repo} is not a GitHub Action (no action.yml at the root of its default branch), so pipegen checked it as a command-line tool.`
+            : `pipegen couldn't confirm that ${c.repo} is a GitHub Action, so it checked it as a command-line tool.`);
+          c = { ...c, kind: 'cli' };
+        }
+      }
       let s;
       try {
-        s = await fetchStats(c, stats, g.installs.get(c));
+        s = await fetchStats(c, stats, g.installs.get(found));
       } catch (e) {
         if (!(e instanceof StatsError || e instanceof GitHubRateLimitError)) throw e;
         note(`pipegen didn't suggest ${c.repo}: ${e.message}`);
         if (isRateStop(e)) {
-          note('pipegen stopped looking for tool suggestions: GitHub\'s rate limit was reached.');
+          note(RATE_STOP_NOTE);
           break search;
         }
         continue;
       }
-      const verdict = checkQualityBar(s, deps.bar, new Date(now()));
+      const verdict = checkQualityBar(s, deps.bar, at);
       if (!verdict.pass) {
         note(`pipegen didn't suggest ${c.repo}: it doesn't meet the quality bar (${verdict.reasons.join(' ')})`);
         continue;
@@ -474,5 +568,5 @@ export async function suggestTools(needs: Need[], p: RepoProfile, deps: SuggestD
       why.set(c.repo, g.why.get(c.repo) ?? FALLBACK_WHY);
     }
   }
-  return toSuggestions(passed, why);
+  return toSuggestions(passed, why, deps.bar, at);
 }

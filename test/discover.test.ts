@@ -7,7 +7,8 @@ import { newRateBudget } from '../src/engine/github-rate.js';
 import type { MemoryEntry, MemoryStore } from '../src/engine/memory.js';
 import type { QualityBar } from '../src/engine/quality-bar.js';
 import {
-  DEFAULT_MODEL, type AiProvider, type AiRequest, type AiUsage, type Candidate, type Language, type Need, type RepoProfile, type ReviewedTool, type Service,
+  DEFAULT_MODEL, type AiProvider, type AiRequest, type AiUsage, type Candidate, type Language, type Need, type PipelineDraft, type RepoProfile, type ReviewedTool,
+  type Service, type StepSpec, type ToolStats,
 } from '../src/types.js';
 import { fakeFetch, fakeOctokit, type Call, type Reply, type Routes } from './helpers/fake-http.js';
 import { strictProblems } from './helpers/strict-schema.js';
@@ -162,17 +163,19 @@ describe('discover', () => {
   });
 
   it('discover: merges memory, ai and search, dedupes by repo', async () => {
-    const reviewed = [...REVIEWED, tool('eslint-r', 'eslint/eslint', { categories: ['lint'], languages: ['node'], proofs: 0 })];
+    const lint = (id: string, repo: string) => tool(id, repo, { categories: ['lint'], languages: ['node'], proofs: 1 });
+    const reviewed = [...REVIEWED, lint('eslint-r', 'eslint/eslint'), lint('lint-two', 'rev/two')];
     const s = setup({
-      reviewed, mode: 'full', memory: [entry('eslint-r', 3, 'lint')],
+      // memory: rev/two is the proven one, so it leads the reviewed tools
+      reviewed, mode: 'full', memory: [entry('lint-two', 3, 'lint')],
       ai: { candidates: [aiCand('Ai/One'), aiCand('eslint/eslint'), aiCand('shared/tool')] },
       gh: { ...search(['act/one', 'Shared/Tool'], ['cli/one', 'ai/one']), ...exists('Ai/One', 'shared/tool', 'act/one', 'cli/one', 'npm/one') },
       net: { [NPM_SEARCH]: { body: { objects: [npmHit('npm-one', 'git+https://github.com/npm/one.git'), npmHit('dup', 'https://github.com/act/one')] } } },
     });
     const out = await discover(need('lint'), profile(), s.deps);
-    expect(repos(out)).toEqual(['eslint/eslint', 'Ai/One', 'shared/tool', 'act/one', 'cli/one', 'npm/one']);
-    expect(out[0]).toMatchObject({ source: 'memory', reviewed: true });
-    expect(out.slice(1).every((c) => c.source === 'discovery' && c.reviewed === false)).toBe(true);
+    expect(repos(out)).toEqual(['rev/two', 'eslint/eslint', 'Ai/One', 'shared/tool', 'act/one', 'cli/one', 'npm/one']);
+    expect(out.slice(0, 2).every((c) => c.source === 'reviewed' && c.reviewed === true)).toBe(true);
+    expect(out.slice(2).every((c) => c.source === 'discovery' && c.reviewed === false)).toBe(true);
     expect(out.find((c) => c.repo === 'act/one')?.kind).toBe('action');
     expect(out.find((c) => c.repo === 'npm/one')).toMatchObject({ kind: 'cli', name: 'npm-one', version: '3.1.4' });
     expect(s.lookup).toHaveBeenCalledWith('lint', 'node');
@@ -189,7 +192,7 @@ describe('discover', () => {
   });
 
   it('discover: rate limited search falls back to ai+memory candidates', async () => {
-    const reviewed = [...REVIEWED, tool('eslint-r', 'eslint/eslint', { categories: ['lint'], languages: ['node'] })];
+    const reviewed = [...REVIEWED, tool('eslint-r', 'eslint/eslint', { categories: ['lint'], languages: ['node'], proofs: 1 })];
     const limited: Reply = { status: 403, body: { message: 'API rate limit exceeded' }, headers: { 'x-ratelimit-remaining': '0', 'x-ratelimit-reset': String(NOW / 1000 + 3600) } };
     const s = setup({
       reviewed, mode: 'full', memory: [entry('eslint-r', 2, 'lint')],
@@ -224,17 +227,19 @@ describe('discover', () => {
     const acts = Array.from({ length: 5 }, (_, i) => `act/t${i}`);
     const s = setup({
       reviewed, mode: 'full',
-      // memory: b is proven most (so it leads the reviewed tools); c is proven only in memory; py is for another language
+      // memory: b is proven most (so it leads the reviewed tools); c is proven only in memory, but has no proof on the
+      // reviewed list, so a full run never offers it (ruling S17); py is for another language
       memory: [entry('lint-b', 5, 'lint'), entry('lint-c', 2, 'lint'), entry('gone-py', 9, 'lint')],
       ai: { candidates: ai }, gh: { ...search(acts, []), ...exists(...ai.map((a) => a.repo), ...acts) }, net: { [NPM_SEARCH]: { body: { objects: [] } } },
     });
     const out = await discover(need('lint'), profile(), s.deps);
     expect(out).toHaveLength(MAX_CANDIDATES);
     expect(MAX_CANDIDATES).toBe(10);
-    expect(out.slice(0, 3).map((c) => [c.repo, c.source, c.reviewed])).toEqual([['rev/b', 'reviewed', true], ['rev/a', 'reviewed', true], ['rev/c', 'memory', true]]);
-    expect(repos(out.slice(3))).toEqual(['ai/t0', 'ai/t1', 'ai/t2', 'ai/t3', 'ai/t4', 'ai/t5', 'act/t0']); // AI answers read: the first 6
+    expect(out.slice(0, 2).map((c) => [c.repo, c.source, c.reviewed])).toEqual([['rev/b', 'reviewed', true], ['rev/a', 'reviewed', true]]);
+    expect(repos(out.slice(2))).toEqual(['ai/t0', 'ai/t1', 'ai/t2', 'ai/t3', 'ai/t4', 'ai/t5', 'act/t0', 'act/t1']); // AI answers read: the first 6
     expect(repos(out)).not.toContain('rev/py');
-    expect(repoGets(s.ghCalls)).not.toContain('act/t1'); // full: nothing more is checked
+    expect(repos(out)).not.toContain('rev/c');
+    expect(repoGets(s.ghCalls)).not.toContain('act/t2'); // full: nothing more is checked
   });
 
   it('discover: near-duplicate of reviewed tool dropped', async () => {
@@ -319,59 +324,120 @@ describe('discover', () => {
     expect(why.get('ai/tool')).toBe('Great tool, see (link removed) now');
     expect(why.get('act/one')).toMatch(/GitHub search/);
   });
+
+  it('discover: an AI candidate is shown under its repo\'s name, never the AI\'s name', async () => {
+    // the AI calls an unknown repo by a reviewed tool's name: the suggestion must not borrow that name
+    const s = setup({ ai: { candidates: [aiCand('evil/scanner', { name: 'gitleaks' }), aiCand('ok/thing', { name: 'Totally Safe' })] }, gh: exists('evil/scanner', 'ok/thing') });
+    const out = await discover(need('lint'), profile(), s.deps);
+    expect(out.map((c) => [c.repo, c.name])).toEqual([['evil/scanner', 'scanner'], ['ok/thing', 'thing']]);
+  });
+
+  it('discover: hostile GitHub search items (control characters, bidi, look-alikes) are dropped or shown under the checked repo name', async () => {
+    const esc = '\u001b';
+    const items = [
+      { full_name: `o/${esc}[31mred`, name: 'red' },
+      { full_name: 'o/ab‮cd', name: 'abcd' },
+      { full_name: 'gitleaks/gitleak', name: 'gitleak' }, // look-alike of a reviewed tool
+      { full_name: 'ok/tool', name: `nice${esc}]8;;https://x${esc}\\ name` },
+    ];
+    const s = setup({ gh: { [SEARCH]: { body: { items } }, ...exists('ok/tool', 'gitleaks/gitleak') }, net: { [NPM_SEARCH]: { body: { objects: [] } } } });
+    const out = await discover(need('lint'), profile(), s.deps);
+    expect(out.map((c) => [c.repo, c.name])).toEqual([['ok/tool', 'tool']]);
+    expect(repoGets(s.ghCalls)).toEqual(['ok/tool']);
+    expect(s.notes.some((n) => /not a valid GitHub repo/.test(n))).toBe(true);
+    expect(s.notes.some((n) => n.includes('gitleaks/gitleak') && /look-alike/.test(n))).toBe(true);
+    for (const n of s.notes) expect(n).not.toMatch(/[\u001b‮]/);
+  });
+
+  it('discover: a repo on the reviewed list for another check is skipped, never offered as an unreviewed tool', async () => {
+    // gitleaks is reviewed for secrets; the AI offers it for lint
+    const s = setup({ ai: { candidates: [aiCand('GitLeaks/GitLeaks'), aiCand('fine/tool')] }, gh: exists('GitLeaks/GitLeaks', 'fine/tool') });
+    const out = await discover(need('lint'), profile(), s.deps);
+    expect(repos(out)).toEqual(['fine/tool']);
+    expect(repoGets(s.ghCalls)).toEqual(['fine/tool']);
+    expect(s.notes.some((n) => n.includes('GitLeaks/GitLeaks') && /reviewed list/.test(n))).toBe(true);
+  });
 });
 
 // ---------- toSuggestions ----------
 
+const BAR: QualityBar = { minStars: 500, minScorecard: 5, strongScorecard: 7, scorecardMaxAgeDays: 180, maxMonthsSinceRelease: 12 };
+const AT = new Date(NOW);
+/** Stats that pass BAR. */
+const goodStats = (repo: string, over: Partial<ToolStats> = {}): ToolStats => ({
+  repo, stars: 2000, archived: false, lastReleaseAt: '2026-09-01T00:00:00.000Z', scorecard: 7.5, scorecardAt: '2026-10-01T00:00:00.000Z',
+  verifiedPublisher: false, license: 'MIT', advisories: 0, ...over,
+});
+/** A discovery candidate whose stats pass the bar. */
 const disc = (repo: string, over: Partial<Candidate> = {}): Candidate => ({
-  id: repo.replace('/', '-'), name: repo.split('/')[1] as string, kind: 'action', repo, version: '', pin: {}, source: 'discovery', reviewed: false, categories: ['lint'], ...over,
+  id: repo.replace('/', '-'), name: repo.split('/')[1] as string, kind: 'action', repo, version: '', pin: {}, source: 'discovery', reviewed: false, categories: ['lint'],
+  stats: goodStats(repo), ...over,
 });
 
 describe('toSuggestions', () => {
   it('toSuggestions: unreviewed candidates become mention-only suggestions; reviewed ones never listed', () => {
     const cands = [
-      tool('semgrep', 'semgrep/semgrep').candidate,
+      { ...tool('semgrep', 'semgrep/semgrep').candidate, stats: goodStats('semgrep/semgrep') },
       disc('mem/tool', { source: 'memory', reviewed: true }),
       disc('a/one'),
       disc('b/two', { kind: 'cli' }),
       disc('a/one'), // same repo again
       disc('c/three', { reviewed: true }), // marked reviewed: never a suggestion
     ];
-    const out = toSuggestions(cands, new Map([['a/one', 'Lints things.'], ['b/two', 'Formats things.']]));
+    const out = toSuggestions(cands, new Map([['a/one', 'Lints things.'], ['b/two', 'Formats things.']]), BAR, AT);
     expect(out).toEqual([{ name: 'one', repo: 'a/one', why: 'Lints things.' }, { name: 'two', repo: 'b/two', why: 'Formats things.' }]);
+  });
+
+  it('toSuggestions: a candidate without stats, or whose stats fail the quality bar, is never listed', () => {
+    const cands = [
+      disc('no/stats', { stats: undefined }),
+      disc('old/one', { stats: goodStats('old/one', { archived: true }) }),
+      disc('unchecked/one', { stats: goodStats('unchecked/one', { advisories: null }) }),
+      disc('other/stats', { stats: goodStats('someone/else') }), // stats read for another repo
+      disc('ok/one'),
+    ];
+    expect(toSuggestions(cands, new Map(), BAR, AT).map((s) => s.repo)).toEqual(['ok/one']);
   });
 
   it('toSuggestions: why text passed through safeText', () => {
     const esc = '\u001b';
     const long = 'w'.repeat(500);
-    const out = toSuggestions([disc('a/one', { name: `one${esc}]8;;https://x${esc}\\` }), disc('b/two')], new Map([['a/one', `Red ${esc}[31malert${esc}[0m‮txt`], ['b/two', long]]));
+    const out = toSuggestions([disc('a/one', { name: `one${esc}]8;;https://x${esc}\\` }), disc('b/two')], new Map([['a/one', `Red ${esc}[31malert${esc}[0m‮txt`], ['b/two', long]]), BAR, AT);
     expect(out[0]).toEqual({ name: 'one', repo: 'a/one', why: 'Red alerttxt' });
     expect(Array.from(out[1]?.why ?? '').length).toBe(200);
     expect(out[1]?.why.endsWith('…')).toBe(true);
     // no why → pipegen's own fallback text, never empty
-    expect(toSuggestions([disc('c/three')], new Map())[0]?.why).not.toBe('');
+    expect(toSuggestions([disc('c/three')], new Map(), BAR, AT)[0]?.why).not.toBe('');
   });
 
   it('toSuggestions: never returns a step or a StepSpec, only { name, repo, why }', () => {
-    const c = disc('a/one', { pin: { sha: SHA }, stats: { repo: 'a/one', stars: 1, archived: false, lastReleaseAt: null, scorecard: null, scorecardAt: null, verifiedPublisher: false, license: null, advisories: 0 } });
-    const out = toSuggestions([c, disc('b/two', { kind: 'docker' })], new Map());
+    const c = disc('a/one', { pin: { sha: SHA } });
+    const out: PipelineDraft['suggestions'] = toSuggestions([c, disc('b/two', { kind: 'docker' })], new Map(), BAR, AT);
     expect(out).toHaveLength(2);
     for (const s of out) {
+      // exactly three string fields: nothing a renderer could turn into a step (no needId, tool, action, cli, output)
       expect(Object.keys(s).sort()).toEqual(['name', 'repo', 'why']);
-      expect(Object.values(s).every((v) => typeof v === 'string')).toBe(true);
+      expect(Object.values(s).map((v) => typeof v)).toEqual(['string', 'string', 'string']);
+      expect(Object.getPrototypeOf(s)).toBe(Object.prototype);
+      expect(s).not.toBe(c);
     }
-    expect(JSON.stringify(out)).not.toMatch(/needId|uses|command|install|tool|pin|sha/);
+    // the type says so too: a suggestion can't be used where a StepSpec is expected
+    // @ts-expect-error a suggestion is not a StepSpec
+    const asStep: StepSpec = out[0] as PipelineDraft['suggestions'][number];
+    expect(asStep).toBeDefined();
   });
 });
 
 // ---------- suggestTools: the audit chain ----------
 
 /** GitHub and web answers that let `o/<name>` pass the quality bar (an action with a release and no advisories). */
-function healthy(name: string, over: { stars?: number; archived?: boolean } = {}): { gh: Routes; net: Routes } {
+function healthy(name: string, over: { stars?: number; archived?: boolean; action?: boolean } = {}): { gh: Routes; net: Routes } {
+  const root = over.action === false ? [{ name: 'README.md', type: 'file' }, { name: 'action.yml', type: 'dir' }] : [{ name: 'README.md', type: 'file' }, { name: 'action.yml', type: 'file' }];
   return {
     gh: {
       [`GET ${GH}/repos/o/${name}`]: { body: { full_name: `o/${name}`, stargazers_count: over.stars ?? 2000, archived: over.archived ?? false, license: { spdx_id: 'MIT' }, owner: { login: 'o', type: 'User' } } },
       [`GET ${GH}/repos/o/${name}/releases/latest`]: { body: { tag_name: 'v1.2.3', published_at: '2026-09-01T10:00:00Z' } },
+      [`GET ${GH}/repos/o/${name}/contents`]: { body: root },
     },
     net: { [`GET ${SCORECARD}/o/${name}`]: { body: { date: '2026-10-01', score: 7.5 } } },
   };
@@ -379,6 +445,11 @@ function healthy(name: string, over: { stars?: number; archived?: boolean } = {}
 const merge = (...parts: { gh: Routes; net: Routes }[]) => ({ gh: Object.assign({}, ...parts.map((p) => p.gh)) as Routes, net: Object.assign({}, ...parts.map((p) => p.net)) as Routes });
 const quietSearch = (): { gh: Routes; net: Routes } => ({ gh: { ...search([], []), [`GET ${GH}/advisories`]: { body: [] } }, net: { [NPM_SEARCH]: { body: { objects: [] } } } });
 const actionCand = (name: string) => aiCand(`o/${name}`, { kind: 'action' });
+/** An AI that answers every need with these actions (need id and category set to the asked need). */
+const answerFor = (...names: string[]) => (req: AiRequest) => {
+  const id = JSON.parse(/<need>\n(.*)\n<\/need>/.exec(req.user)?.[1] ?? '{}').needId as string;
+  return { candidates: names.map((n) => ({ ...actionCand(n), needId: id, category: id })) };
+};
 
 describe('suggestTools', () => {
   it('suggestTools: every candidate checked in order: typosquat, existence, stats, quality bar', async () => {
@@ -464,5 +535,65 @@ describe('suggestTools', () => {
     const out = await suggestTools([need('lint'), need('format-lint')], profile(), s.deps);
     expect(out).toEqual([{ name: 'good', repo: 'o/good', why: 'Lints with o/good.' }]);
     for (const x of out) expect(Object.keys(x).sort()).toEqual(['name', 'repo', 'why']);
+  });
+
+  it('suggestTools: an "action" with no action.yml at the repo root is checked as a CLI (so it is not suggested)', async () => {
+    // o/plain is a healthy repo, but not a GitHub Action: the Actions advisory database says nothing about it
+    const w = merge(quietSearch(), healthy('plain', { action: false }), healthy('good'));
+    const s = setup({ ai: { candidates: [actionCand('plain'), actionCand('good')] }, gh: w.gh, net: w.net });
+    const out = await suggestTools([need('lint')], profile(), s.deps);
+    expect(out.map((x) => x.repo)).toEqual(['o/good']);
+    expect(s.notes.some((n) => /o\/plain is not a GitHub Action/.test(n))).toBe(true);
+    expect(s.notes.some((n) => n.includes('o/plain') && /known vulnerabilities/.test(n))).toBe(true); // the bar refused it as unchecked
+    // one root listing per action; the advisory database was asked only about the real action
+    expect(s.ghCalls.filter((c) => c.url.pathname === '/repos/o/plain/contents')).toHaveLength(1);
+    const asked = s.ghCalls.filter((c) => c.url.pathname === '/advisories').map((c) => c.url.searchParams.get('affects'));
+    expect(asked).toEqual(['o/good@1.2.3']);
+  });
+
+  it('suggestTools: a rate limit during existence checks stops the run (no more AI calls)', async () => {
+    const limited: Reply = { status: 403, body: {}, headers: { 'x-ratelimit-remaining': '0', 'x-ratelimit-reset': String(NOW / 1000 + 3600) } };
+    const w = merge(quietSearch(), healthy('good'));
+    const s = setup({ ai: answerFor('good'), gh: { ...w.gh, [`GET ${GH}/repos/o/good`]: limited }, net: w.net });
+    const out = await suggestTools([need('lint'), need('format-lint'), need('dast')], profile(), s.deps);
+    expect(out).toEqual([]);
+    expect(s.ai.complete).toHaveBeenCalledTimes(1);
+    expect(s.notes.some((n) => /stopped looking for tool suggestions/.test(n) && /rate limit/.test(n))).toBe(true);
+  });
+
+  it('suggestTools: a need counts as covered by the same rule discover uses (mode-aware)', async () => {
+    // the only lint tool is reviewed but has no proof: covered in the audit, not in a full run
+    const reviewed = [...REVIEWED, tool('lint-u', 'rev/unproven', { categories: ['lint'], proofs: 0 })];
+    const audit = setup({ reviewed, mode: 'audit', ...quietSearch() });
+    await suggestTools([need('lint')], profile(), audit.deps);
+    expect(audit.ai.complete).not.toHaveBeenCalled();
+    expect(await discover(need('lint'), profile(), audit.deps)).toHaveLength(1);
+    const full = setup({ reviewed, mode: 'full', ...quietSearch() });
+    await suggestTools([need('lint')], profile(), full.deps);
+    expect(full.ai.complete).toHaveBeenCalledTimes(1);
+    expect((await discover(need('lint'), profile(), full.deps)).filter((c) => c.reviewed)).toEqual([]);
+  });
+
+  it('suggestTools: an AI failure for one need is noted and the other needs still run; an http failure stops further AI calls', async () => {
+    const w = merge(quietSearch(), healthy('good'));
+    // a refusal for lint: noted, then format-lint is still asked and its suggestion kept
+    const s = setup({ gh: w.gh, net: w.net });
+    s.ai.complete.mockImplementationOnce(async () => { throw new AiError('refusal', 'The AI declined to answer.', usage(5, 1)); });
+    s.ai.complete.mockImplementationOnce(async () => ({ data: { candidates: [{ ...actionCand('good'), needId: 'format-lint', category: 'format-lint' }] }, usage: usage(1, 1) }));
+    const run = suggestTools([need('lint'), need('format-lint')], profile(), s.deps);
+    await expect(run).resolves.toBeDefined(); // the refusal never fails the run
+    expect((await run).map((x) => x.repo)).toEqual(['o/good']);
+    expect(s.ai.complete).toHaveBeenCalledTimes(2);
+    expect(s.notes.some((n) => /AI/.test(n) && /lint/.test(n) && /declined/.test(n))).toBe(true);
+    expect(s.onUsage).toHaveBeenCalledWith(expect.objectContaining(usage(5, 1)));
+
+    // an http failure (for example a bad API key): no more AI calls, but search results still count
+    const h = setup({ gh: { ...w.gh, ...search(['o/good'], []) }, net: w.net });
+    h.ai.complete.mockImplementation(async () => { throw new AiError('http', 'The AI provider answered with an error.'); });
+    const run2 = suggestTools([need('lint'), need('format-lint')], profile(), h.deps);
+    await expect(run2).resolves.toBeDefined();
+    expect(h.ai.complete).toHaveBeenCalledTimes(1);
+    expect((await run2).map((x) => x.repo)).toEqual(['o/good']);
+    expect(h.notes.some((n) => /without the AI/.test(n))).toBe(true);
   });
 });
