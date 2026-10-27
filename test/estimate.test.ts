@@ -32,7 +32,8 @@ const NO_CAPS = Object.fromEntries(CAP_NAMES.map((n) => [n, false])) as unknown 
 /**
  * The S5 app's jobs (a runnable Node + Postgres service) plus a deploy layer, by need category.
  * Minutes (S5 table): push 1+1+2+1+2+1 = 8; merge 8 + full-tests 2 + gate 1 + image-build 2 + image-scan 2 + dast 3 = 18;
- * deploy sbom 2 + signing 2 + deploy-verify 2 = 6; nightly 1 + 1 + 2 + 1 + 2 + 3 = 10. Total 42.
+ * deploy sbom 2 + signing 2 + deploy-verify 2 = 6; nightly 1 + 1 + 2 + 1 + 2 + 2 + 3 = 12 (the nightly builds the image
+ * it scans, as S5's real nightly did: final review M8). Total 44.
  */
 const PUSH = ['hooks-ci', 'secrets', 'sast', 'deps', 'unit-tests', 'lint'];
 const JOBS: JobCategories = {
@@ -40,9 +41,9 @@ const JOBS: JobCategories = {
   push: PUSH,
   merge: [...PUSH, 'full-tests', 'gate', 'image-build', 'image-scan', 'dast'],
   deploy: ['sbom', 'signing', 'deploy-verify'],
-  nightly: ['nightly', 'secrets', 'sast', 'deps', 'image-scan', 'dast'],
+  nightly: ['nightly', 'secrets', 'sast', 'deps', 'image-build', 'image-scan', 'dast'],
 };
-const PER_VARIANT = 42 + HARNESS_MINUTES_PER_VARIANT; // 42 + 8 = 50
+const PER_VARIANT = 44 + HARNESS_MINUTES_PER_VARIANT; // 44 + 8 = 52
 const ACTIVITY: Activity = { pushes: 40, prs: 10, capped: false };
 const OPUS = { name: 'claude', model: DEFAULT_MODEL };
 
@@ -53,16 +54,16 @@ const OUT = 3_000 + 18_000 + 20_000 + 40_000;    // 81k
 describe('estimate: minutes', () => {
   it('estimate: cap is twice setup', () => {
     const e = estimate(profile(), JOBS, 2, ACTIVITY, OPUS);
-    expect(e.setupMinutes).toBe(130); // 50 × 2 variants × 1.3
-    expect(e.setupMinutesCap).toBe(260);
+    expect(e.setupMinutes).toBe(136); // 52 × 2 variants × 1.3 = 135.2, rounded up
+    expect(e.setupMinutesCap).toBe(272);
   });
 
   it('estimate: setup counts every layer plus nightly, times variants', () => {
-    // (push 8 + merge 18 + deploy 6 + nightly 10 + harness 8) × variants × 1.3
-    expect(estimate(profile(), JOBS, 1, ACTIVITY, OPUS).setupMinutes).toBe(65);
-    expect(estimate(profile(), JOBS, 3, ACTIVITY, OPUS).setupMinutes).toBe(195);
+    // (push 8 + merge 18 + deploy 6 + nightly 12 + harness 8) × variants × 1.3, rounded up
+    expect(estimate(profile(), JOBS, 1, ACTIVITY, OPUS).setupMinutes).toBe(68);
+    expect(estimate(profile(), JOBS, 3, ACTIVITY, OPUS).setupMinutes).toBe(203);
     const noNightly = { ...JOBS, nightly: [] };
-    expect(estimate(profile(), noNightly, 1, ACTIVITY, OPUS).setupMinutes).toBe(Math.ceil((PER_VARIANT - 10) * 1.3));
+    expect(estimate(profile(), noNightly, 1, ACTIVITY, OPUS).setupMinutes).toBe(Math.ceil((PER_VARIANT - 12) * 1.3));
     const noDeploy = { ...JOBS, deploy: [] };
     expect(estimate(profile(), noDeploy, 1, ACTIVITY, OPUS).setupMinutes).toBe(Math.ceil((PER_VARIANT - 6) * 1.3));
   });
@@ -77,10 +78,10 @@ describe('estimate: minutes', () => {
   });
 
   it('estimate: monthly uses 30-day activity, including deploy and nightly', () => {
-    // pushes 40 × push 8 + PR pushes max(10, 40 − 10) = 30 × merge 18 + merged PRs 10 × deploy 6 + 30 nights × nightly 10
-    expect(estimate(profile(), JOBS, 2, ACTIVITY, OPUS).monthlyMinutes).toBe(320 + 540 + 60 + 300);
+    // pushes 40 × push 8 + PR pushes max(10, 40 − 10) = 30 × merge 18 + merged PRs 10 × deploy 6 + 30 nights × nightly 12
+    expect(estimate(profile(), JOBS, 2, ACTIVITY, OPUS).monthlyMinutes).toBe(320 + 540 + 60 + 360);
     // no activity: only the nightly runs
-    expect(estimate(profile(), JOBS, 2, { pushes: 0, prs: 0, capped: false }, OPUS).monthlyMinutes).toBe(300);
+    expect(estimate(profile(), JOBS, 2, { pushes: 0, prs: 0, capped: false }, OPUS).monthlyMinutes).toBe(360);
   });
 
   it('estimate: per-job minutes come from the S5 table by need category; unknown need = 2', () => {
@@ -115,11 +116,11 @@ describe('estimate: minutes', () => {
 
   it('estimate: duration = setup ÷ 4 parallel jobs + 10 min queueing (low), twice that (high)', () => {
     const e = estimate(profile(), JOBS, 2, ACTIVITY, OPUS);
-    expect(e.durationMinutes).toEqual({ low: Math.ceil(130 / 4) + 10, high: 2 * (Math.ceil(130 / 4) + 10) });
+    expect(e.durationMinutes).toEqual({ low: Math.ceil(136 / 4) + 10, high: 2 * (Math.ceil(136 / 4) + 10) });
   });
 
   it('estimate: variants below 1 count as 1', () => {
-    expect(estimate(profile(), JOBS, 0, ACTIVITY, OPUS).setupMinutes).toBe(65);
+    expect(estimate(profile(), JOBS, 0, ACTIVITY, OPUS).setupMinutes).toBe(68);
   });
 });
 
@@ -293,6 +294,7 @@ describe('jobCategories', () => {
     expect(cats.nightly).toContain('nightly');
     expect(cats.nightly).toContain('dast');
     expect(cats.nightly).toContain('iac');
+    expect(cats.nightly).toContain('image-build'); // the image the nightly scans is built there too (final review M8)
   });
 });
 

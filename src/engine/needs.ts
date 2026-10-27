@@ -20,8 +20,12 @@ export const LAYERS = ['pre-commit', 'push', 'merge', 'deploy'] as const satisfi
 
 export { NEED_ID_CATEGORY, NEED_IDS, type NeedId } from './need-ids.js';
 
-/** Scanner categories (ruling S10): their merge-layer jobs also run in the nightly job. */
-const SCANNERS: ReadonlySet<string> = new Set(['secrets', 'sast', 'deps', 'iac', 'image-scan', 'dast']);
+/**
+ * Categories whose merge-layer jobs also run in the nightly (ruling S10): the scanners, plus the image build the image
+ * scan and DAST need (spike S5's real nightly built the image; final review M8). A merge-layer image build only
+ * exists for a runnable service, so the nightly builds an image exactly when the merge layer does.
+ */
+const NIGHTLY: ReadonlySet<string> = new Set(['secrets', 'sast', 'deps', 'iac', 'image-scan', 'dast', 'image-build']);
 const FLOOR: ReadonlySet<string> = new Set(FLOOR_NEEDS);
 const RUN_SCRIPTS = ['start', 'dev', 'serve'];
 const NEEDS_TIMEOUT_MS = 120_000;
@@ -304,7 +308,8 @@ export async function planNeeds(p: RepoProfile, caps: Capabilities, bundle: Code
 
 /**
  * CI jobs per layer, for Plan A's estimate() (ruling S10): one job per (layer, id, service); pre-commit runs on the
- * developer's machine, so 0; the gate is one job in merge; nightly = merge-layer scanner jobs + 1 (the nightly job).
+ * developer's machine, so 0; the gate is one job in merge; nightly = merge-layer scanner and image-build jobs + 1
+ * (the nightly job).
  */
 export function jobCounts(needs: Need[]): Record<Layer | 'nightly', number> {
   const counts: Record<Layer | 'nightly', number> = { 'pre-commit': 0, push: 0, merge: 0, deploy: 0, nightly: 1 };
@@ -315,14 +320,14 @@ export function jobCounts(needs: Need[]): Record<Layer | 'nightly', number> {
     if (seen.has(k)) continue;
     seen.add(k);
     counts[n.layer]++;
-    if (n.layer === 'merge' && SCANNERS.has(n.category)) counts.nightly++;
+    if (n.layer === 'merge' && NIGHTLY.has(n.category)) counts.nightly++;
   }
   return counts;
 }
 
 /**
  * The same CI jobs as jobCounts (same rules: one job per (layer, id, service), pre-commit none, one gate job, nightly =
- * the nightly job + merge-layer scanners), listed by need category, so Plan A's estimate() can price each job by its
+ * the nightly job + merge-layer scanners and image builds), listed by need category, so Plan A's estimate() can price each job by its
  * category (S5, DECISIONS #81). `jobCategories(n)[layer].length === jobCounts(n)[layer]` for every layer.
  */
 export function jobCategories(needs: Need[]): Record<Layer | 'nightly', string[]> {
@@ -334,7 +339,7 @@ export function jobCategories(needs: Need[]): Record<Layer | 'nightly', string[]
     if (seen.has(k)) continue;
     seen.add(k);
     out[n.layer].push(n.category);
-    if (n.layer === 'merge' && SCANNERS.has(n.category)) out.nightly.push(n.category);
+    if (n.layer === 'merge' && NIGHTLY.has(n.category)) out.nightly.push(n.category);
   }
   return out;
 }

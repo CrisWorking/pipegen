@@ -3,7 +3,7 @@ import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { AiError } from '../src/ai/provider.js';
 import { bundleCode, bundleText, GitleaksRequiredError, type CodeBundle } from '../src/ai/redact.js';
 import {
-  deployApprovalRule, floorNeeds, isRunnable, jobCounts, NEED_ID_CATEGORY, NEED_IDS, needsSchema, planNeeds,
+  deployApprovalRule, floorNeeds, isRunnable, jobCategories, jobCounts, NEED_ID_CATEGORY, NEED_IDS, needsSchema, planNeeds,
 } from '../src/engine/needs.js';
 import { readProject } from '../src/read/project.js';
 import {
@@ -252,7 +252,7 @@ describe('floor', () => {
 });
 
 describe('jobCounts', () => {
-  it('jobCounts: pre-commit 0; nightly = merge-layer scanners + 1; counts per layer', () => {
+  it('jobCounts: pre-commit 0; nightly = merge-layer scanners + their image builds + 1; counts per layer', () => {
     // one runnable service, public, terraform: per-layer jobs are one per (layer, need, service)
     const needs = floorNeeds(profile({ terraformDirs: ['infra'] }), PUBLIC);
     const c = jobCounts(needs);
@@ -260,14 +260,31 @@ describe('jobCounts', () => {
     expect(c.push).toBe(6);    // hooks-ci, secrets, sast, deps, unit-tests, lint
     expect(c.merge).toBe(12);  // push 6 + full-tests + gate + image-build, image-scan, dast + iac
     expect(c.deploy).toBe(4);  // sbom, deploy-verify, signing, attestation
-    // merge-layer scanners: secrets, sast, deps, image-scan, dast, iac = 6, + the nightly job itself
-    expect(c.nightly).toBe(7);
+    // merge-layer scanners: secrets, sast, deps, image-scan, dast, iac = 6, + the image build the image scan and
+    // DAST need (S5's real nightly built it, final review M8), + the nightly job itself
+    expect(c.nightly).toBe(8);
     expect(Object.keys(c).sort()).toEqual(['deploy', 'merge', 'nightly', 'pre-commit', 'push']);
     // two services: per-service needs count twice, repo-wide ones once
     const two = jobCounts(floorNeeds(profile({ services: [web(), lib()] }), PUBLIC));
     expect(two.push).toBe(2 + 4 * 2);   // hooks-ci, secrets + (sast, deps, unit-tests, lint) × 2
-    expect(two.nightly).toBe(1 + 2 * 2 + 2 + 1); // secrets + (sast, deps) × 2 + web's image-scan and dast + nightly
+    expect(two.nightly).toBe(1 + 2 * 2 + 3 + 1); // secrets + (sast, deps) × 2 + web's image-build, image-scan and dast + nightly
     expect(jobCounts([]).nightly).toBe(1);
+  });
+
+  it('jobCounts and jobCategories: the nightly builds an image exactly when the merge layer does, per service (final review M8)', () => {
+    const p = profile({ services: [web(), lib(), svc({ name: 'api', port: 3000 })] });
+    const needs = floorNeeds(p, PUBLIC);
+    const cats = jobCategories(needs);
+    const mergeBuilds = needs.filter((n) => n.layer === 'merge' && n.id === 'image-build').length;
+    expect(mergeBuilds).toBe(2); // web and api run; lib doesn't
+    expect(cats.nightly.filter((c) => c === 'image-build')).toHaveLength(mergeBuilds);
+    expect(jobCounts(needs).nightly).toBe(cats.nightly.length);
+    // nothing runnable: no image build in merge, none in the nightly
+    const libOnly = floorNeeds(profile({ services: [lib()] }), PUBLIC);
+    expect(jobCategories(libOnly).nightly).not.toContain('image-build');
+    // an image build outside the merge layer does not add a nightly build
+    const pushBuild: Need = { id: 'image-build', layer: 'push', category: 'image-build', service: 'web', why: 'x.', blocking: true, floor: false };
+    expect(jobCategories([pushBuild]).nightly).toEqual(['nightly']);
   });
 
   it('jobCounts: gate job counted once in the merge layer', () => {
