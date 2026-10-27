@@ -95,8 +95,11 @@ export function safeMarkdown(s: string, max: number = DEFAULT_MAX): string {
     .replace(/@/g, `${ZWSP}@${ZWSP}`) // nobody is notified, no email autolinks
     .replace(/#(?=\d)/g, `#${ZWSP}`) // no `#123` / `owner/repo#1` references
     .replace(/\b(GH)-(?=\d)/gi, `$1${ZWSP}-`); // no `GH-123` references
+  // Accepted: GitHub still links a bare commit SHA, but only to a commit in the repo the text is pasted into
+  // (no notification, no cross-repo reference); breaking hex runs would spoil the pins the audit prints.
   const cutText = cut(escaped, max);
   if (cutText === escaped) return cutText;
+  if (cutText === '') return ''; // max <= 0: nothing fits, not even the ellipsis
   return `${dropHalfEscape(cutText.slice(0, -1))}…`;
 }
 

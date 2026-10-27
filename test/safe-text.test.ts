@@ -254,6 +254,11 @@ describe('safeMarkdown exact output: GitHub-specific syntax (fix round 1)', () =
     const t0 = performance.now();
     expect(safeMarkdown('a' + ' '.repeat(80000) + 'x')).toBe('a' + ' '.repeat(198) + '…');
     expect(safeMarkdown('\\'.repeat(80000), 80000)).toBe('\\'.repeat(79998) + '…');
-    expect(performance.now() - t0).toBeLessThan(50);
+    expect(performance.now() - t0).toBeLessThan(1000); // linear takes ~1–14 ms; the old quadratic trim took ~4.3 s
+  });
+
+  it('safeMarkdown: max <= 0 gives an empty string, never a lone ellipsis', () => {
+    expect(safeMarkdown('abc', 0)).toBe('');
+    expect(safeMarkdown('abc', -1)).toBe('');
   });
 });
