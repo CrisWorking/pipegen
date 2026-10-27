@@ -9,10 +9,12 @@
 // - a pip package → the exact version plus the sha256 of the py3-none-any wheel, else the sdist (ruling S20);
 // - a container image → the digest of its multi-platform index (OCI index or Docker manifest list, ruling S20).
 //
-// A moved tag is an alert, never an update. A reviewed or remembered pin is verified, never replaced: when its tag
-// now points somewhere else, `deps.alert(new PinMovedWarning(...))` is called and the stored pin is returned. The
-// new SHA or digest is never adopted (the tj-actions and Trivy attacks rewrote version tags; SHA-pinned users
-// stayed safe).
+// A moved tag is an alert, never an update. A reviewed pin (a candidate with `source: 'reviewed'` AND `reviewed:
+// true`, which only the reviewed list gives) is verified, never replaced: when its tag now points somewhere else,
+// `deps.alert(new PinMovedWarning(...))` is called and the stored pin is returned. The new SHA or digest is never
+// adopted (the tj-actions and Trivy attacks rewrote version tags; SHA-pinned users stayed safe). Any other pin a
+// candidate carries (memory, discovery, the AI, `reviewed: false`) is never trusted: it gets a fresh pin, with the
+// cooldown and the human-review note (final review I1; memory stores reviewed tool ids only, never pins).
 //
 // Cooldown (ruling S26): a new pin is only made for a release published at least 7 days ago, by a date the server
 // records (GitHub release and asset dates, npm publish time, PyPI upload time, Docker Hub push time). Dates set
@@ -162,7 +164,8 @@ const NOT_AN_INDEX = '<not an index>';
 interface Image { registry: Registry; path: string; display: string }
 interface FetchOptions { method: 'GET' | 'HEAD'; timeoutMs: number; hosts: readonly string[]; headers?: Record<string, string> }
 
-const isStored = (c: Candidate) => c.source === 'reviewed' || c.source === 'memory';
+/** A pin pipegen keeps as is: only one from the reviewed list (both markers). Everything else is pinned afresh. */
+const isStored = (c: Candidate) => c.source === 'reviewed' && c.reviewed === true;
 const isNotFound = (e: unknown) => (e as { status?: unknown } | null)?.status === 404;
 
 function checkTag(tag: unknown, what: string): string {
@@ -186,7 +189,8 @@ function readDate(s: unknown): number | null {
 /**
  * Resolves the exact pin for a candidate. `install` says how a `kind: 'cli'` tool is installed (ruling B2): npm,
  * pip or docker; none (or github-release) → a GitHub release binary. Images need `install` with the image name.
- * Reviewed and memory pins are verified, never replaced; discovery candidates get a new pin (cooldown applies).
+ * A reviewed pin (`source: 'reviewed'` and `reviewed: true`) is verified, never replaced; every other candidate
+ * (discovery, memory, `reviewed: false`) gets a new pin, whatever pin it carries (cooldown applies).
  * Throws PinError (or GitHubRateLimitError) when the pin can't be made safely.
  */
 export async function resolvePin(c: Candidate, deps: PinDeps, install?: InstallSpec): Promise<Candidate> {

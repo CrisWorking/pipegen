@@ -36,7 +36,7 @@ const cand = (over: Partial<Candidate> = {}): Candidate => ({
   id: 'tool', name: 'tool', kind: 'action', repo: 'o/r', version: 'v1.2.3', pin: {},
   source: 'discovery', reviewed: false, categories: ['sast'], ...over,
 });
-/** A reviewed (or remembered) action with its stored, reviewed commit. */
+/** A reviewed action (source reviewed, reviewed: true) with its stored, reviewed commit. */
 const stored = (over: Partial<Candidate> = {}) => cand({ source: 'reviewed', reviewed: true, pin: { sha: SHA }, ...over });
 
 const ref = (tag: string, type: 'commit' | 'tag', sha: string): Reply => ({ body: { ref: `refs/tags/${tag}`, object: { type, sha } } });
@@ -191,11 +191,31 @@ describe('pin: moved tags', () => {
     expect(out.pin.sha).toBe(SHA);
   });
 
-  it('pin: memory pins are verified the same way', async () => {
-    const { deps, alert } = setup(github({ [`GET ${GH}/repos/o/r/git/ref/tags/v1.2.3`]: ref('v1.2.3', 'commit', LIVE_SHA) }));
-    const out = await resolvePin(stored({ source: 'memory', reviewed: false }), deps);
-    expect(alert).toHaveBeenCalledTimes(1);
-    expect(out.pin.sha).toBe(SHA);
+  it('pin: only a reviewed candidate (source reviewed AND reviewed: true) keeps its stored pin; memory or reviewed: false gets a fresh pin, never trusted (final review I1)', async () => {
+    const untrusted = [stored({ source: 'memory', reviewed: false }), stored({ source: 'memory', reviewed: true }), stored({ source: 'reviewed', reviewed: false })];
+    // the tag moved: a stored pin would be kept with an alert; an untrusted one is replaced by the upstream commit
+    for (const c of untrusted) {
+      const { deps, alert, notes } = setup(github({ [`GET ${GH}/repos/o/r/git/ref/tags/v1.2.3`]: ref('v1.2.3', 'commit', LIVE_SHA) }));
+      const out = await resolvePin(c, deps);
+      expect(out.pin, `${c.source}/${c.reviewed}`).toEqual({ sha: LIVE_SHA });
+      expect(alert).not.toHaveBeenCalled();
+      expect(notes.join(' ')).toMatch(/needs human review/);
+    }
+    // the cooldown applies to them like any new pin
+    for (const c of untrusted) {
+      const { deps } = setup(github({ [`GET ${GH}/repos/o/r/releases/tags/v1.2.3`]: release('v1.2.3', RECENT) }));
+      await expect(resolvePin(c, deps), `${c.source}/${c.reviewed}`).rejects.toThrow(/7 days/);
+    }
+    // a stored checksum or digest on an untrusted candidate is not kept either: the registry is asked
+    const hex = '4'.repeat(64);
+    for (const reviewed of [false, true]) {
+      const n = setup(github(), npmRoutes());
+      const npmOut = await resolvePin(stored({ source: 'memory', reviewed, kind: 'cli', version: '2.0.1', pin: { checksum: hex } }), n.deps, npm());
+      expect(npmOut.pin).toEqual({ checksum: INTEGRITY });
+      const d = setup(github(), hubRoutes());
+      const imgOut = await resolvePin({ ...dockerCand(), source: 'memory', reviewed, version: '3.20', pin: { digest: LIVE_DIGEST } }, d.deps, docker());
+      expect(imgOut.pin).toEqual({ digest: DIGEST });
+    }
   });
 
   it('pin: an unmoved stored pin is returned as is, with no alert and no cooldown lookup', async () => {
