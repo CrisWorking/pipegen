@@ -1,0 +1,193 @@
+name: release
+
+# A release is a pushed `v*` tag, and nothing else. DECISIONS #83: no tag is pushed, and nothing is published, before v0.4.
+# Guards (preflight rulings B1, S1, S2, S10, S13):
+#   - every job runs only when this is the real repo AND it is public (`github.event.repository.private == false`), so a
+#     `v*` tag pushed in the private repo (or in a fork) starts nothing;
+#   - the tag must point at a commit on main, and that commit must have a green `ci` run (S13);
+#   - build once, pack once, test that exact .tgz, then publish that .tgz and nothing rebuilt (S1);
+#   - the publish job is the only one with the npm credential path (`id-token: write`, an OIDC token for trusted
+#     publishing; there is no npm token anywhere) and it runs in the `npm-release` environment (tags only);
+#   - the GitHub release is created as a draft, gets every asset, and is published last, because immutable releases
+#     lock their assets at publish (S2).
+# Steps for the owner (trusted publisher on npmjs.com, environment, rulesets, signed tags): docs/release.md.
+
+on:
+  push:
+    tags: ['v*']
+
+permissions: {}
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+env:
+  # Exact Node for every release job (S10): 26.12.0 ships npm 11.20.0 (trusted publishing needs npm >= 11.5.1).
+  RELEASE_NODE: 26.12.0
+
+jobs:
+  verify:
+    name: verify, build and pack
+    if: github.repository == 'CrisWorking/pipegen' && github.event.repository.private == false
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      actions: read # only to ask whether the ci run of this commit is green
+    outputs:
+      version: ${{ steps.pack.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0 # the tag history: the previous release is the cooldown's base, main must contain the tag
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: ${{ env.RELEASE_NODE }}
+          package-manager-cache: false # a release never restores a cache
+      - name: Tag must be a plain version tag on a commit of main
+        env:
+          TAG: ${{ github.ref_name }}
+          REF_TYPE: ${{ github.ref_type }}
+        run: |
+          set -euo pipefail
+          [ "$REF_TYPE" = tag ] || { echo "::error::not a tag"; exit 1; }
+          printf '%s' "$TAG" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z][0-9A-Za-z.-]*)?$' || { echo "::error::tag is not vMAJOR.MINOR.PATCH"; exit 1; }
+          git merge-base --is-ancestor "$GITHUB_SHA" origin/main || { echo "::error::the tagged commit is not on main"; exit 1; }
+      - name: The tagged commit must have a green ci run (the live-network tests are not re-run here)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          n=$(gh api "repos/$REPO/actions/workflows/ci.yml/runs?head_sha=$GITHUB_SHA&status=success&per_page=1" --jq '.total_count')
+          [ "$n" -ge 1 ] || { echo "::error::no successful ci run for $GITHUB_SHA"; exit 1; }
+      - name: Assert Node and npm versions (trusted publishing needs npm >= 11.5.1)
+        run: |
+          set -euo pipefail
+          echo "node $(node --version), npm $(npm --version)"
+          [ "$(node --version)" = "v$RELEASE_NODE" ] || { echo "::error::unexpected node version"; exit 1; }
+          printf '%s\n11.5.1\n' "$(npm --version)" | sort -V -C -r || { echo "::error::npm is older than 11.5.1"; exit 1; }
+      - run: npm ci --ignore-scripts
+      - run: npm test
+      - run: npx tsc --noEmit
+      - run: npm run build
+      - name: Release check (no PENDING reviews, no dependencies, fresh notices, version = tag, cooldown, fresh data)
+        run: node scripts/release-check.ts --tag "$TAG"
+        env:
+          TAG: ${{ github.ref_name }}
+          GITHUB_TOKEN: ${{ github.token }}
+      - name: Pack once (scripts skipped, so the bundle just built and checked is the one packed)
+        id: pack
+        run: |
+          set -euo pipefail
+          mkdir out
+          npm pack --ignore-scripts --pack-destination out
+          tgz=$(ls out/*.tgz)
+          [ "$(ls out/*.tgz | wc -l)" = 1 ] || { echo "::error::expected exactly one tarball"; exit 1; }
+          echo "version=$(node -p 'require("./package.json").version')" >> "$GITHUB_OUTPUT"
+          # SBOM of the bundled build inputs (every bundled package is a devDependency; the package has no runtime deps)
+          npm sbom --sbom-format cyclonedx --sbom-type application > out/pipegen-sbom.cdx.json
+          (cd out && sha256sum "$(basename "$tgz")" pipegen-sbom.cdx.json > SHA256SUMS)
+      - name: Test the tarball that will ship
+        run: |
+          set -euo pipefail
+          mkdir unpacked
+          tar -xzf out/*.tgz -C unpacked
+          node -e '
+            const fs = require("fs");
+            const p = JSON.parse(fs.readFileSync("unpacked/package/package.json", "utf8"));
+            if (p.dependencies && Object.keys(p.dependencies).length > 0) { console.error("packed package.json has dependencies"); process.exit(1); }
+            if (p.version !== process.env.EXPECTED) { console.error("packed version differs from package.json"); process.exit(1); }
+            for (const f of ["dist/cli/main.js", "THIRD_PARTY_NOTICES", "data/reviewed-tools.yml"]) {
+              if (!fs.existsSync("unpacked/package/" + f)) { console.error("missing in tarball: " + f); process.exit(1); }
+            }
+            if (fs.readFileSync("unpacked/package/THIRD_PARTY_NOTICES", "utf8") !== fs.readFileSync("THIRD_PARTY_NOTICES", "utf8")) { console.error("tarball notices differ from the committed file"); process.exit(1); }
+          '
+          node unpacked/package/dist/cli/main.js --version
+        env:
+          EXPECTED: ${{ steps.pack.outputs.version }}
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-files
+          path: out/
+          if-no-files-found: error
+          retention-days: 14
+
+  attest:
+    name: build provenance attestation
+    needs: verify
+    if: github.repository == 'CrisWorking/pipegen' && github.event.repository.private == false
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      id-token: write # signs the attestation with the workflow's OIDC identity
+      attestations: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release-files
+          path: out
+      - name: Check the files against SHA256SUMS
+        run: cd out && sha256sum -c SHA256SUMS
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: |
+            out/*.tgz
+            out/pipegen-sbom.cdx.json
+
+  publish:
+    name: npm publish (trusted publishing, provenance)
+    needs: [verify, attest]
+    if: github.repository == 'CrisWorking/pipegen' && github.event.repository.private == false
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # The environment only allows `v*` tags (docs/release.md). The npm trusted publisher is bound to this workflow file
+    # AND this environment, so a run from a branch or another workflow cannot publish.
+    environment: npm-release
+    permissions:
+      contents: read
+      id-token: write # the OIDC token npm exchanges for a short-lived publish credential; no npm token exists
+    steps:
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: ${{ env.RELEASE_NODE }}
+          package-manager-cache: false # a release never restores a cache
+          # no registry-url: that would write an .npmrc that expects NODE_AUTH_TOKEN
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release-files
+          path: out
+      - name: Check the files against SHA256SUMS, and refuse to run with any npm token present
+        run: |
+          set -euo pipefail
+          (cd out && sha256sum -c SHA256SUMS)
+          if [ -n "${NODE_AUTH_TOKEN:-}${NPM_TOKEN:-}" ]; then echo "::error::an npm token is set; this job publishes with trusted publishing only"; exit 1; fi
+          printf '%s\n11.5.1\n' "$(npm --version)" | sort -V -C -r || { echo "::error::npm is older than 11.5.1"; exit 1; }
+      - name: Publish the tarball that was tested and attested (provenance is generated from the OIDC identity)
+        run: npm publish ./out/*.tgz --provenance --access public --registry=https://registry.npmjs.org
+
+  github-release:
+    name: GitHub release (draft, assets, then publish)
+    needs: [verify, attest, publish]
+    if: github.repository == 'CrisWorking/pipegen' && github.event.repository.private == false
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write # create and publish the release; this is the only job that can
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release-files
+          path: out
+      - name: Create the draft, upload every asset, then publish (immutable releases lock assets at publish)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          gh release create "$TAG" --repo "$REPO" --draft --verify-tag --title "$TAG" --notes "Release $TAG. Verify it with npm audit signatures and gh attestation verify (docs/release.md)." out/*
+          gh release edit "$TAG" --repo "$REPO" --draft=false
