@@ -1,5 +1,6 @@
 // The reviewed list loader is the trust root's reader: it must not pull in the AI code (prompts, providers, the
 // code bundle). The module graph is read from esbuild's metafile, the same bundler tsup uses.
+import { readdirSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { build } from 'esbuild';
 import { describe, expect, it } from 'vitest';
@@ -50,5 +51,33 @@ describe('module graph (final review M6)', () => {
       const files = await graph(entry);
       expect(files.filter((f) => f.startsWith('src/cli/')), entry).toEqual([]);
     }
+  });
+
+  it('module graph (Plan P Task 0, ruling PB1): no runtime import cycle among src/audit/coverage*; tokenize.ts is a leaf, types.ts types only', async () => {
+    const isCoverage = (f: string) => f === 'src/audit/coverage.ts' || f.startsWith('src/audit/coverage/');
+    const r = await build({
+      entryPoints: [resolve(root, 'src/audit/coverage.ts')], bundle: true, write: false, metafile: true, platform: 'node', format: 'esm', packages: 'external', logLevel: 'silent',
+    });
+    // esbuild drops `import type`, so these edges are the runtime imports only
+    const edges = new Map(Object.entries(r.metafile.inputs).filter(([f]) => isCoverage(f))
+      .map(([f, input]) => [f, [...new Set(input.imports.map((i) => i.path).filter(isCoverage))]]));
+    const onDisk = readdirSync(resolve(root, 'src/audit/coverage')).filter((f) => f !== 'types.ts').map((f) => `src/audit/coverage/${f}`);
+    expect([...edges.keys()].sort()).toEqual(['src/audit/coverage.ts', ...onDisk].sort());
+
+    const cycles: string[] = [];
+    const state = new Map<string, 'open' | 'done'>();
+    const visit = (f: string, path: string[]): void => {
+      state.set(f, 'open');
+      for (const next of edges.get(f) ?? []) {
+        if (state.get(next) === 'open') cycles.push([...path, f, next].join(' → '));
+        else if (!state.has(next)) visit(next, [...path, f]);
+      }
+      state.set(f, 'done');
+    };
+    for (const f of edges.keys()) if (!state.has(f)) visit(f, []);
+    expect(cycles).toEqual([]);
+
+    expect(edges.get('src/audit/coverage/tokenize.ts')).toEqual([]);
+    expect(await graph('src/audit/coverage/types.ts')).toEqual(['src/audit/coverage/types.ts']);
   });
 });

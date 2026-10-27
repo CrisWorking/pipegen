@@ -1,0 +1,245 @@
+// Coverage mapper (see ../coverage.ts for the rules): own package.json scripts, read and followed per (dir, script).
+import { asObj } from '../../read/manifest.js';
+import { MAX_GLOB_NAME, MAX_GLOB_WORK, MAX_PACKAGE_FILES, MAX_SCRIPTS, MAX_SCRIPT_TARGETS } from './bounds.js';
+import { UNKNOWN_PREFIX, flagGiven, gateOf, gated } from './settings.js';
+import {
+  OK_COMMANDS, PYTEST_NO_RUN, SCRIPT_CATEGORIES, UNKNOWN_SCRIPT_CATEGORIES, globCappedWhy, probeCall, scanShell, scriptCall, type CmdInfo,
+  type ShellMode,
+} from './shell.js';
+import { compileGlob } from './triggers.js';
+import type { Compiled, Ctx, Found, Reason } from './types.js';
+
+// ---------- own scripts read from package.json (Task 5) ----------
+
+/** How npm runs a script: `/bin/sh -c` on POSIX (https://docs.npmjs.com/cli/v11/using-npm/scripts), so no -e. */
+const NPM_SCRIPT_SHELL: ShellMode = { errexit: false, pipefail: false };
+
+/** The `scripts` of `<dir>/package.json` (string values only), or null when it can't be read. */
+function packageScripts(ctx: Ctx, dir: string): Promise<ReadonlyMap<string, string> | null> {
+  let r = ctx.pkgScripts.get(dir);
+  if (r === undefined) {
+    r = ctx.pkgScripts.size >= MAX_PACKAGE_FILES ? Promise.resolve(null) : ctx.pkgRead.text(dir === '.' ? 'package.json' : `${dir}/package.json`).then((t) => {
+      if (!('ok' in t)) return null;
+      try {
+        const scripts = asObj(asObj(JSON.parse(t.ok)).scripts);
+        return new Map(Object.entries(scripts).filter((e): e is [string, string] => typeof e[1] === 'string'));
+      } catch {
+        return null;
+      }
+    });
+    ctx.pkgScripts.set(dir, r);
+  }
+  return r;
+}
+
+/**
+ * What the script `name` of `<dir>/package.json` runs that counts for an own script (tests, lint, format-lint): its
+ * text is read as npm runs it (sh -c, no -e), and the own scripts it calls in turn are read the same way. Worked out
+ * once per (dir, name); a cycle, an unreadable package.json or a missing script gives [].
+ */
+async function scriptRuns(ctx: Ctx, dir: string, name: string): Promise<Found[]> {
+  const key = `${dir}\u0000${name}`;
+  const known = ctx.scriptMemo.get(key);
+  if (known !== undefined) return known;
+  if (ctx.scriptMemo.size >= MAX_SCRIPTS) return [];
+  ctx.scriptMemo.set(key, []); // being worked out: a script that calls itself (directly or not) adds nothing
+  const text = (await packageScripts(ctx, dir))?.get(name);
+  if (text === undefined) return [];
+  const inner = gated(await resolveScripts(ctx, scanShell(text, dir, ctx.sigs, ctx.budget, NPM_SCRIPT_SHELL)), gateOf([text], []));
+  const out = inner.flatMap((g) => {
+    const categories = g.categories.filter((x) => SCRIPT_CATEGORIES.has(x.startsWith(UNKNOWN_PREFIX) ? x.slice(UNKNOWN_PREFIX.length) : x));
+    return categories.length === 0 ? [] : [{ ...g, categories, hookRun: false }];
+  });
+  ctx.scriptMemo.set(key, out);
+  return out;
+}
+
+/**
+ * Own-script candidates (`npm run <name>` for a name not counted by name) become what their script runs, under the
+ * caller's phrase, in the directory the script's tool runs in; the caller's reason (an `||`, a pipe, …) comes first. A candidate whose script runs
+ * nothing that counts is dropped.
+ */
+export async function resolveScripts(ctx: Ctx, found: Found[]): Promise<Found[]> {
+  if (!found.some((f) => f.script !== undefined || f.byName !== undefined)) return found;
+  const out: Found[] = [];
+  for (const f of found) {
+    if (f.byName !== undefined) {
+      const lowered = await byNameRun(ctx, f);
+      if (lowered !== null) out.push(lowered);
+      continue;
+    }
+    if (f.script === undefined) {
+      out.push(f);
+      continue;
+    }
+    if (f.dir === null) continue;
+    const names = expandScripts(ctx, f.dir, [f.script], true, await packageScripts(ctx, f.dir));
+    if (names === 'capped') { // fix round 4 (N8): never covered, never missing
+      out.push({ categories: UNKNOWN_SCRIPT_CATEGORIES, by: f.by, subject: f.subject, dir: f.dir, reason: null, partialWhy: globCappedWhy(f.subject) });
+      continue;
+    }
+    for (const name of names) for (const g of await scriptRuns(ctx, f.dir, name)) {
+      out.push({ // the script's own `cd` counts: `cd api && jest` tests the api service only
+        categories: g.categories, by: f.by, subject: f.subject, dir: g.dir, reason: f.reason ?? g.reason,
+        ...(f.reason === null && g.partialWhy !== undefined ? { partialWhy: g.partialWhy } : {}),
+        ...(g.envGate === undefined ? {} : { envGate: g.envGate }),
+      });
+    }
+  }
+  return out;
+}
+
+export type Targets = string[] | 'capped';
+
+/**
+ * Script names a call's patterns name: a plain name as is; with `glob`, a pattern with `*` against this package.json's
+ * scripts (globScripts). The names of all the patterns together are at most MAX_SCRIPT_TARGETS - 1, else 'capped'.
+ */
+function expandScripts(ctx: Ctx, dir: string, patterns: readonly string[], glob: boolean, scripts: ReadonlyMap<string, string> | null | undefined): Targets {
+  const out = new Set<string>();
+  for (const p of patterns) {
+    const names = glob && p.includes('*') ? globScripts(ctx, dir, p, scripts) : [p];
+    if (names === 'capped') return 'capped';
+    for (const name of names) {
+      out.add(name);
+      if (out.size >= MAX_SCRIPT_TARGETS) return 'capped';
+    }
+  }
+  return [...out];
+}
+
+/** The script names one glob matches in `<dir>/package.json` (npm-run-all: `:` separates parts like `/`), worked out once per (dir, glob). */
+function globScripts(ctx: Ctx, dir: string, pattern: string, scripts: ReadonlyMap<string, string> | null | undefined): Targets {
+  const key = `${dir}\u0000${pattern}`;
+  const known = ctx.globMemo.get(key);
+  if (known !== undefined) return known;
+  const result = ((): Targets => {
+    if (scripts === null || scripts === undefined) return [];
+    const match = compileGlob(asPath(pattern));
+    const out: string[] = [];
+    for (const name of scripts.keys()) {
+      ctx.globWork += pattern.length * Math.max(1, Math.min(name.length, MAX_GLOB_NAME));
+      if (ctx.globWork > MAX_GLOB_WORK) {
+        ctx.budget.truncated = true;
+        return 'capped';
+      }
+      if (name.length > MAX_GLOB_NAME || !match(asPath(name))) continue;
+      out.push(name);
+      if (out.length >= MAX_SCRIPT_TARGETS) return 'capped';
+    }
+    return out;
+  })();
+  ctx.globMemo.set(key, result);
+  return result;
+}
+const asPath = (s: string) => s.replace(/\//g, '\u0001').replace(/:/g, '/');
+
+/** What a script really runs, for ruling U23: `real` = something other than no-ops; `soft` = a reason when none of those runs can fail it; `capped` = more scripts than pipegen follows ('scripts'), or globs past their bounds ('globs', fix round 4). */
+export interface ScriptClass { real: boolean; soft: Reason | null; capped?: 'scripts' | 'globs' }
+
+/** A known tool called in a mode that runs nothing: a version/help probe, a `notWithFlags` flag, or a pytest collect-only flag. */
+function runsNothing(c: CmdInfo, sigs: Compiled): boolean {
+  if (probeCall(c.args)) return true;
+  const afterDash = c.args.indexOf('--');
+  if ((c.name === 'tox' || c.name === 'nox') && afterDash >= 0 && c.args.slice(afterDash + 1).some((a) => PYTEST_NO_RUN.has(a))) return true;
+  if ((c.name === 'pytest' || ((c.name === 'python' || c.name === 'python3') && c.args[0] === '-m' && c.args[1] === 'pytest')) && c.args.some((a) => PYTEST_NO_RUN.has(a))) return true;
+  return (sigs.byFirstWord.get(c.name) ?? []).some((r) => r.rest.every((x, i) => c.args[i] === x) && (r.tool.notWithFlags ?? []).some((f) => flagGiven(f, c.args)));
+}
+
+/**
+ * Fix round 2 (N1, N3) and 3 (N7; ruling U23): every top-level command of a package script, read as npm runs it (sh -c,
+ * no -e), is (a) a no-op (echo, printf, true, :, false, an exit or return of 0, a bare exit), (b) dead (after a
+ * top-level exit, right of `true ||` / `false &&`, also with the no-op in a `( … )` / `{ …; }` group), (c) a known tool
+ * in a mode that runs nothing (--version, --help, jest --listTests, pytest --co…), (d) a call to other own scripts
+ * (scriptCall: npm run/run-script/rum/urn, npm test/t/tst, yarn|pnpm|bun run X, yarn|pnpm X for a script that exists,
+ * npm-run-all/run-s/run-p and concurrently `npm:` arguments, globs matched) that all do nothing by this same rule
+ * (followed with no depth limit; each (dir, script) worked out once, a cycle doing nothing, at most MAX_SCRIPTS), or
+ * (e) anything else. `real` when some command is (e); `soft` when every (e) has a reason that keeps it from failing
+ * the script (`x || true`, `x; exit 0`: under sh -c only the last list can fail it). An unreadable script is unknown
+ * and counts as real; past MAX_SCRIPTS the answer is `capped` (the row becomes unknown).
+ */
+async function classifyScript(ctx: Ctx, dir: string, name: string): Promise<ScriptClass> {
+  const key = `${dir}\u0000${name}`;
+  const known = ctx.scriptClass.get(key);
+  if (known !== undefined) return known;
+  const scripts = await packageScripts(ctx, dir);
+  const text = scripts?.get(name);
+  if (text === undefined || scripts === null || scripts === undefined) return { real: true, soft: null };
+  if (ctx.scriptClass.size >= MAX_SCRIPTS) return { real: true, soft: null, capped: 'scripts' };
+  ctx.scriptClass.set(key, { real: false, soft: null }); // being worked out: a cycle does nothing
+  const cmds: CmdInfo[] = [];
+  scanShell(text, dir, ctx.sigs, ctx.budget, NPM_SCRIPT_SHELL, (c) => { cmds.push(c); });
+  let real = false;
+  let capped: ScriptClass['capped'] | false = false;
+  let soft: Reason | null = null;
+  let allSoft = true;
+  const realRun = (reason: Reason | null) => {
+    real = true;
+    if (reason === null) allSoft = false;
+    else soft ??= reason;
+  };
+  let scriptBin = false; // the previous command was `yarn|pnpm <script>`: its next word is that script, not a binary
+  for (const c of cmds) {
+    const call = scriptCall(c.name, c.args, scripts);
+    const skip = scriptBin && c.afterBin;
+    scriptBin = call !== null && c.wrapper;
+    if (skip || c.dead || (c.wrapper && call === null)) continue;
+    // no-ops: they run no check (`false` only fails the script, it tests nothing)
+    if (OK_COMMANDS.has(c.name) || c.name === 'false' || ((c.name === 'exit' || c.name === 'return') && (c.args.length === 0 || /^0+$/.test(c.args[0] as string)))) continue;
+    if (runsNothing(c, ctx.sigs)) continue;
+    if (call?.capped === true) { // fix round 4 (N8): globs pipegen doesn't follow; the row is unknown
+      capped ||= 'globs';
+      realRun(c.reason);
+      continue;
+    }
+    if (call !== null && c.dir !== null && !call.unknown) {
+      const targets = expandScripts(ctx, c.dir, call.patterns, call.glob, c.dir === dir ? scripts : await packageScripts(ctx, c.dir));
+      if (targets === 'capped') {
+        capped ||= 'globs';
+        realRun(c.reason);
+        continue;
+      }
+      let innerReal = false;
+      let innerAllSoft = true;
+      let innerSoft: Reason | null = null;
+      for (const t of targets) {
+        const inner = await classifyScript(ctx, c.dir, t);
+        if (inner.capped !== undefined) capped ||= inner.capped;
+        if (!inner.real) continue;
+        innerReal = true;
+        if (inner.soft === null) innerAllSoft = false;
+        else innerSoft ??= inner.soft;
+      }
+      if (targets.length === 0) realRun(c.reason); // nothing matched: the runner fails, pipegen can't tell more
+      else if (innerReal) realRun(c.reason ?? (call.soft ? 'soft' : innerAllSoft ? innerSoft : null));
+      continue;
+    }
+    realRun(c.reason);
+  }
+  const out: ScriptClass = { real, soft: real && allSoft ? soft : null, ...(capped ? { capped } : {}) };
+  ctx.scriptClass.set(key, out);
+  return out;
+}
+
+/**
+ * Ruling U23: a script counted by name (S5) whose text can be read may only be LOWERED by it: no text (no package.json,
+ * no such script) keeps it; a script that runs nothing (classifyScript) drops it (missing); one whose real runs all
+ * can't fail it is partial; one whose runs of a known tool for this need all have a reason (|| true, a soft flag, …) is
+ * partial with that reason; anything else keeps it (an unknown runner such as `node test.js` or tape stays counted).
+ */
+async function byNameRun(ctx: Ctx, f: Found): Promise<Found | null> {
+  if (f.dir === null || f.byName === undefined) return f;
+  const text = (await packageScripts(ctx, f.dir))?.get(f.byName);
+  if (text === undefined) return f;
+  const cls = await classifyScript(ctx, f.dir, f.byName);
+  if (cls.capped === 'globs') return { ...f, categories: f.categories.map((c) => `${UNKNOWN_PREFIX}${c}`), reason: null, partialWhy: globCappedWhy(f.subject) };
+  if (cls.capped === 'scripts') {
+    return { ...f, categories: f.categories.map((c) => `${UNKNOWN_PREFIX}${c}`), reason: null, partialWhy: `There are more package scripts than pipegen follows (${MAX_SCRIPTS.toLocaleString('en-US')}), so it can't tell what ${f.subject.charAt(0).toLowerCase()}${f.subject.slice(1)} runs.` };
+  }
+  if (!cls.real) return null;
+  if (cls.soft !== null) return { ...f, reason: f.reason ?? cls.soft };
+  const runs = (await scriptRuns(ctx, f.dir, f.byName)).filter((g) => g.categories.some((c) => f.categories.includes(c)));
+  const first = runs[0];
+  if (first !== undefined && runs.every((g) => g.reason !== null)) return { ...f, reason: f.reason ?? first.reason };
+  return f;
+}
