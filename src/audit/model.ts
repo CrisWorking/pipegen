@@ -25,7 +25,7 @@
 import { lstat } from 'node:fs/promises';
 import { join } from 'node:path';
 import type { Octokit } from '@octokit/rest';
-import { count } from '../ai/errors.js';
+import { count, outputLimit } from '../ai/errors.js';
 import { AiError, COST_CAP_MESSAGE, refusalFallbackNoteFor, type AiErrorKind } from '../ai/provider.js';
 import {
   bundleCode, COUNTING_ONLY_NOTE, EXCLUDED_PATTERNS, findSecretLike, GitleaksError, isExcludedPath, redact, scrubKnownValues, type CodeBundle,
@@ -38,7 +38,7 @@ import { floorNeeds, isRunnable, jobCategories, needsPromptBytes, planNeeds, typ
 import type { QualityBar } from '../engine/quality-bar.js';
 import { projectScriptFor, reviewedFor, type ProjectScriptStep } from '../engine/reviewed.js';
 import {
-  activity30d, aiRequestBytes, estimate, requestCeilingUsd, usageCeilingUsd, type Activity, type Estimates,
+  activity30d, aiRequestBytes, estimate, requestCeilingUsd, unpricedModel, usageCeilingUsd, type Activity, type Estimates,
 } from '../estimate/estimate.js';
 import { signingMode } from '../github/signing-mode.js';
 import { IGNORED_DIRS, listFiles, READ_LIMITS, readTextLimited, readTextLimitedWithReason } from '../read/limits.js';
@@ -537,7 +537,9 @@ export class AiSpendMeter {
   async #complete(req: AiRequest): Promise<{ data: unknown; usage: AiUsage }> {
     let reserved = 0;
     if (this.capUsd !== null) {
-      const worst = requestCeilingUsd(this.#inner, aiRequestBytes(req), req.maxOutputTokens ?? Number.NaN);
+      // one validator for the output limit (review N3): anything set but not a whole number above 0 is refused here;
+      // no limit at all means no bound (Infinity), so the attempt can't fit any cap
+      const worst = requestCeilingUsd(this.#inner, aiRequestBytes(req), outputLimit(req.maxOutputTokens) ?? Number.POSITIVE_INFINITY);
       if (worst !== 'local') {
         if (!(this.spentUsd + this.reservedUsd + worst <= this.capUsd)) throw new AiError('cost-cap', COST_CAP_MESSAGE);
         reserved = worst;
@@ -555,14 +557,23 @@ export class AiSpendMeter {
     this.#settle(reserved, r.usage);
     return r;
   }
-  #settle(reserved: number, u: AiUsage): void {
+  #settle(reserved: number, u: AiUsage | undefined): void {
+    // An answer that reports no prompt tokens can't be priced: keep the full reservation (review N5).
+    if (u === undefined || u === null || count(u.inputTokens) + count(u.cacheReadTokens) + count(u.cacheWriteTokens) === 0) {
+      if (u !== undefined && u !== null) this.#addUsage(u);
+      this.#keep(reserved);
+      return;
+    }
     this.reservedUsd -= reserved;
+    this.#addUsage(u);
+    const c = usageCeilingUsd(this.#inner, u);
+    if (c !== 'local') this.spentUsd += c;
+  }
+  #addUsage(u: AiUsage): void {
     this.usage.inputTokens += count(u.inputTokens);
     this.usage.outputTokens += count(u.outputTokens);
     this.usage.cacheReadTokens += count(u.cacheReadTokens);
     this.usage.cacheWriteTokens += count(u.cacheWriteTokens);
-    const c = usageCeilingUsd(this.#inner, u);
-    if (c !== 'local') this.spentUsd += c;
   }
   #keep(reserved: number): void {
     this.reservedUsd -= reserved;
@@ -572,8 +583,11 @@ export class AiSpendMeter {
 
 /**
  * The needs request's size (UTF-8 bytes) for estimateAuditAi, before consent: the counting bundle's bytes (aiBundle)
- * plus the rest of the needs prompt. The gitleaks-checked bundle sent after consent is the same files, so the needs
- * call fits the agreed cap; if it came out larger, the meter refuses the call with a note (nothing is sent).
+ * plus the rest of the needs prompt. The gitleaks-checked bundle sent after consent is normally the same files and the
+ * same size. It can come out larger (replacements shrink files, so the cut to maxBytes keeps more of them): that extra
+ * is paid out of the DISCOVERY share of the cap (the cap holds the needs call's worst case PLUS one discovery call's;
+ * the framing margin is on both sides of the comparison, so it absorbs nothing). Past that share, the meter refuses
+ * the needs call with a note and nothing is sent (review N6). Don't drop the discovery term from the cap.
  */
 export function needsRequestBytes(r: AuditReport, knownValues: string[]): number {
   return r.aiBundle.bytes + needsPromptBytes(r.profile, r.capabilities, { knownValues });
@@ -603,6 +617,8 @@ export async function addAiSuggestions(r: AuditReport, dir: string, deps: AiSugg
   const notes = new Set<string>();
   // every AI attempt goes through the meter: the one record of usage and the hard cap (ruling U13, review M1)
   const meter = new AiSpendMeter(deps.ai, deps.capUsd);
+  // a model with no price can't keep a hard cap: nothing is sent (ruling U14; the CLI already stops before consent)
+  const unpriced = deps.capUsd === null ? null : unpricedModel(deps.ai);
   let extraNeeds: Need[] = [];
   let suggestions: PipelineDraft['suggestions'] = [];
   const known = deps.knownValues.filter((v) => typeof v === 'string' && v.trim() !== '');
@@ -621,6 +637,11 @@ export async function addAiSuggestions(r: AuditReport, dir: string, deps: AiSugg
       },
     };
   };
+
+  if (unpriced !== null) {
+    notes.add(unpriced.message);
+    return done();
+  }
 
   // 1. The gitleaks-checked bundle: the binary is made ready right before it runs, and its path is never kept.
   let bundle: CodeBundle;

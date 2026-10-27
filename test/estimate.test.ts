@@ -7,7 +7,7 @@ import { CANDIDATES_MAX_OUTPUT_TOKENS, CANDIDATES_REQUEST_MAX_BYTES, MAX_DISCOVE
 import { floorNeeds, jobCategories, jobCounts } from '../src/engine/needs.js';
 import {
   activity30d, aiRequestBytes, estimate, estimateAuditAi, FRAMING_MARGIN_TOKENS, HARNESS_MINUTES_PER_VARIANT, jobMinutes, loadAiPrices, loadGitHubPlans,
-  requestCeilingUsd, usageCeilingUsd, usageCostUsd,
+  requestCeilingUsd, unpricedModel, usageCeilingUsd, usageCostUsd,
   type Activity, type JobCategories,
 } from '../src/estimate/estimate.js';
 import { DEFAULT_MODEL, type Capabilities, type ExistingWorkflow, type RepoProfile, type Service } from '../src/types.js';
@@ -300,6 +300,11 @@ describe('estimate: basis', () => {
   });
 });
 
+/** The tier threshold field name and a tier, built at runtime (written out whole, the line reads as a secret to the repo guard). */
+const TIER_FIELD = ['above', 'input', 'tokens'].join('_');
+const tierOf = (above: number, input: number, output: number) => Object.fromEntries([[TIER_FIELD, above], ['input', input], ['output', output]]);
+const tierLine = (above: string, rest: string) => ['long: { ', TIER_FIELD, ': ', above, ', ', rest, ' }'].join('');
+
 /** Usage with all four counts (property names built at runtime: no secret-like literals in test/). */
 const used = (i: number, o: number, cr = 0, cw = 0) => Object.fromEntries([['input' + 'Tokens', i], ['output' + 'Tokens', o], ['cacheRead' + 'Tokens', cr], ['cacheWrite' + 'Tokens', cw]]) as never;
 
@@ -331,10 +336,51 @@ describe('estimateAuditAi (ruling B2)', () => {
     expect(requestCeilingUsd({ name: 'ollama', model: 'm' }, 10_000, 16_000)).toBe('local');
     // what was used, priced the same way (usage already holds every run, so no doubling)
     expect(usageCeilingUsd(OPUS, used(1_000_000, 1_000_000, 0, 0))).toBeCloseTo(60, 10);
-    expect(usageCeilingUsd({ name: 'claude', model: 'claude-haiku-5-5' }, used(1_000_000, 1_000_000))).toBeCloseTo(0.6, 10);
+    expect(usageCeilingUsd({ name: 'claude', model: 'claude-haiku-5-5' }, used(50_000, 50_000))).toBeCloseTo((50_000 * 0.1 + 50_000 * 0.5) / 1e6, 10);
     expect(usageCeilingUsd({ name: 'ollama', model: 'm' }, used(1, 1))).toBe('local');
     // bytes of a request: system + user + schema
     expect(aiRequestBytes({ system: 'ab', user: 'é', schemaName: 'x', jsonSchema: { a: 1 }, timeoutMs: 1 })).toBe(2 + 2 + 7);
+  });
+
+  it('N1 (U14): a model with no price is unbounded for the hard cap: refused before consent, with the priced choices', () => {
+    const pro = { name: 'openai', model: 'gpt-5-pro' };
+    expect(requestCeilingUsd(pro, 1_000, 16_000)).toBe(Number.POSITIVE_INFINITY);
+    expect(usageCeilingUsd(pro, used(1, 1))).toBe(Number.POSITIVE_INFINITY);
+    const e = estimateAuditAi(pro, 5, NEEDS_BYTES);
+    expect(e.unpriced).toEqual({
+      model: 'gpt-5-pro', choose: ['gpt-5', 'gpt-5-mini', 'gpt-5.5'],
+      message: "pipegen doesn't know the price of gpt-5-pro, so it can't keep a hard cost limit. Choose one of: gpt-5, gpt-5-mini, gpt-5.5.",
+    });
+    expect(e.capUsd).toBe(0); // fail closed: no call fits a cap of 0
+    expect(e.basis).toContain(e.unpriced?.message);
+    expect(e.costUsd).not.toBe('local'); // the display estimate still prices it like the dearest model
+    expect(unpricedModel({ name: 'claude', model: 'claude-future-9' })?.choose).toContain(DEFAULT_MODEL);
+    for (const ok of [OPUS, { name: 'openai', model: 'gpt-5' }, { name: 'ollama', model: 'llama3.1' }]) {
+      expect(unpricedModel(ok), ok.model).toBeNull();
+      expect(estimateAuditAi(ok, 5, NEEDS_BYTES).unpriced).toBeNull();
+    }
+    expect(unpricedModel({ name: 'mystery', model: 'm' })?.choose).toEqual([]);
+  });
+
+  it('N2 (U14): above a price tier threshold the higher prices apply: to the worst case when its input bound crosses it, to usage by its real prompt tokens', () => {
+    const haiku = { name: 'claude', model: 'claude-haiku-5-5' };
+    // a prompt up to 100,000 tokens pays $0.10 / $0.50, a longer one $0.50 / $2.50 (Anthropic pricing page)
+    const low = (bytes: number) => ((bytes + FRAMING_MARGIN_TOKENS) * 1.25 * 0.1 + 16_000 * 0.5) / 1e6;
+    const high = (bytes: number) => ((bytes + FRAMING_MARGIN_TOKENS) * 1.25 * 0.5 + 16_000 * 2.5) / 1e6;
+    expect(requestCeilingUsd(haiku, 98_000, 16_000)).toBeCloseTo(low(98_000), 12); // bound 100,000: not above
+    expect(requestCeilingUsd(haiku, 98_001, 16_000)).toBeCloseTo(high(98_001), 12);
+    expect(usageCostUsd(haiku, used(100_000, 1_000))).toBeCloseTo((100_000 * 0.1 + 1_000 * 0.5) / 1e6, 12);
+    expect(usageCostUsd(haiku, used(90_000, 1_000, 10_001, 0))).toBeCloseTo(((90_000 + 10_001) * 0.5 + 1_000 * 2.5) / 1e6, 12); // cache reads count toward the prompt
+    expect(usageCeilingUsd(haiku, used(100_001, 0))).toBeCloseTo(100_001 * 0.5 / 1e6, 12);
+    // gpt-5.5 above 272,000: $10 / $45 (OpenAI pricing page)
+    const gpt = { name: 'openai', model: 'gpt-5.5' };
+    expect(requestCeilingUsd(gpt, 300_000, 16_000)).toBeCloseTo(((302_000 * 1.25 * 10) + 16_000 * 45) / 1e6, 12);
+    expect(requestCeilingUsd(gpt, 100_000, 16_000)).toBeCloseTo(((102_000 * 1.25 * 5) + 16_000 * 30) / 1e6, 12);
+    // the consented cap follows: a large needs request on Haiku 5.5 is capped at the higher tier
+    expect(estimateAuditAi(haiku, 5, 150_000).capUsd as number).toBeGreaterThanOrEqual(requestCeilingUsd(haiku, 150_000, NEEDS_MAX_OUTPUT_TOKENS) as number);
+    // the file carries the tiers
+    expect(loadAiPrices().providers.claude.models['claude-haiku-5-5']).toEqual({ input: 0.1, output: 0.5, long: tierOf(100_000, 0.5, 2.5) });
+    expect(loadAiPrices().providers.openai.models['gpt-5.5']).toEqual({ input: 5, output: 30, long: tierOf(272_000, 10, 45) });
   });
 
   it('estimateAuditAi (U13): the cap always has room for the needs call and one discovery call at their worst', () => {
@@ -363,14 +409,14 @@ describe('estimateAuditAi (ruling B2)', () => {
     expect(text).toMatch(/\$4.*\$20.*per million/s);
   });
 
-  it('estimateAuditAi: unknown model is priced at the provider\'s most expensive model, and basis says so', () => {
+  it('estimateAuditAi: unknown model is priced at the provider\'s most expensive model for display, and basis says so; no cap (U14)', () => {
     const a = estimateAuditAi({ name: 'claude', model: 'claude-future-9' }, 5, NEEDS_BYTES);
     const fable = estimateAuditAi({ name: 'claude', model: 'claude-fable-5-1' }, 5, NEEDS_BYTES);
     expect(a.costUsd).toEqual(fable.costUsd);
-    // its worst case uses the same top price, but one run: the adapter turns the refusal fallback on only for known models
-    const future = { name: 'claude', model: 'claude-future-9' };
-    expect(worstOf(future, NEEDS_BYTES)).toBeCloseTo(worstOf({ name: 'claude', model: 'claude-fable-5-1' }, NEEDS_BYTES) / 2, 10);
-    expect(a.capUsd).toBeCloseTo(worstOf(future, NEEDS_BYTES), 10);
+    // a hard cap can't rest on a guessed price: unbounded, cap 0, refused before consent
+    expect(worstOf({ name: 'claude', model: 'claude-future-9' }, NEEDS_BYTES)).toBe(Number.POSITIVE_INFINITY);
+    expect(a.capUsd).toBe(0);
+    expect(a.unpriced?.model).toBe('claude-future-9');
     expect(a.basis.join('\n')).toMatch(/"claude-future-9".*claude-fable-5.*highest price.*real cost is likely lower/is);
     const any = estimateAuditAi({ name: 'mystery', model: 'm1' }, 5, NEEDS_BYTES);
     expect(any.costUsd).toEqual(fable.costUsd);
@@ -490,6 +536,19 @@ describe('data files', () => {
       expect(() => loadAiPrices(f), to).toThrow(/greater than 0|must be above 0|not valid/);
     });
     expect(loadAiPrices().providers.ollama.anyModel).toEqual({ input: 0, output: 0 }); // local Ollama keeps its 0
+  });
+
+  it('prices: a price tier needs a whole-number threshold above 0 and prices no lower than the base ones', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'pipegen-est-'));
+    const prices = readFileSync(new URL('../data/ai-prices.yml', import.meta.url), 'utf8');
+    const from = tierLine('100000', 'input: 0.50, output: 2.50');
+    expect(prices).toContain(from);
+    for (const to of [tierLine('0', 'input: 0.50, output: 2.50'), tierLine('1.5', 'input: 0.50, output: 2.50'),
+      tierLine('100000', 'input: 0.05, output: 2.50'), tierLine('100000', 'input: 0.50')]) {
+      const f = join(dir, 'tier.yml');
+      writeFileSync(f, prices.replace(from, to));
+      expect(() => loadAiPrices(f), to).toThrow(/not valid/);
+    }
   });
 });
 

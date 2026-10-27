@@ -13,6 +13,7 @@ import { planNeeds } from '../src/engine/needs.js';
 import type { QualityBar } from '../src/engine/quality-bar.js';
 import { fetchStats, type StatsDeps } from '../src/engine/stats.js';
 import { aiRequestBytes, estimateAuditAi, FRAMING_MARGIN_TOKENS, requestCeilingUsd, usageCeilingUsd } from '../src/estimate/estimate.js';
+import { fallbackEnabled } from '../src/ai/claude.js';
 import { CANDIDATES_MAX_OUTPUT_TOKENS, CANDIDATES_REQUEST_MAX_BYTES, NEEDS_MAX_OUTPUT_TOKENS } from '../src/engine/discovery-limits.js';
 import { DEFAULT_MODEL, type AiProvider, type AiRequest, type AiUsage, type Capabilities, type ReviewedTool } from '../src/types.js';
 import { fakeFetch, fakeOctokit, type Routes } from './helpers/fake-http.js';
@@ -110,6 +111,7 @@ const good = (n: { needId: string; category: string; language: string }) =>
 
 interface AiOpts {
   name?: AiProvider['name'];
+  model?: string;
   /** The needs call's answer, or an error to throw. */
   needs?: unknown;
   needsError?: AiError;
@@ -124,24 +126,26 @@ interface AiOpts {
 /** `req` with its output limit set (the property name built at runtime: no secret-like literals in test/). */
 const LIMIT_FIELD = 'maxOutput' + 'Tokens';
 const withLimit = (req: AiRequest, limit: number | undefined): AiRequest => Object.fromEntries([...Object.entries(req), [LIMIT_FIELD, limit]]) as unknown as AiRequest;
-const worstUsage = (req: AiRequest): AiUsage => usageOf(0, 2 * (req.maxOutputTokens ?? 0), 0, 2 * (aiRequestBytes(req) + FRAMING_MARGIN_TOKENS));
+const worstUsage = (req: AiRequest, runs: number): AiUsage => usageOf(0, runs * (req.maxOutputTokens ?? 0), 0, runs * (aiRequestBytes(req) + FRAMING_MARGIN_TOKENS));
 /** A fake provider: answers `needs` and `candidates` requests and records every request. */
 function fakeAi(o: AiOpts = {}) {
   const reqs: AiRequest[] = [];
   let nth = 0;
+  const model = o.model ?? DEFAULT_MODEL;
+  const runs = (o.name ?? 'claude') === 'claude' && fallbackEnabled(model) ? 2 : 1; // a refusal-fallback run bills a second time
   const complete = vi.fn(async (req: AiRequest) => {
     reqs.push(req);
     if (req.schemaName === 'needs') {
       if (o.needsError !== undefined) throw o.needsError;
-      return { data: o.needs ?? NO_ADDS, usage: o.worstCase === true ? worstUsage(req) : o.needsUsage ?? use(1000, 100) };
+      return { data: o.needs ?? NO_ADDS, usage: o.worstCase === true ? worstUsage(req, runs) : o.needsUsage ?? use(1000, 100) };
     }
     const n = needBlock(req);
     if (n === null) throw new Error('unexpected request');
     const data = o.cands !== undefined ? o.cands(n, nth++) : good(n);
     if (data instanceof AiError) throw data;
-    return { data, usage: o.worstCase === true ? worstUsage(req) : o.candUsage ?? use(100, 20) };
+    return { data, usage: o.worstCase === true ? worstUsage(req, runs) : o.candUsage ?? use(100, 20) };
   });
-  const p: AiProvider = { name: o.name ?? 'claude', model: DEFAULT_MODEL, complete };
+  const p: AiProvider = { name: o.name ?? 'claude', model, complete };
   return { p, reqs, complete, candidateReqs: () => reqs.filter((r) => r.schemaName === 'candidates'), needsReqs: () => reqs.filter((r) => r.schemaName === 'needs') };
 }
 
@@ -421,6 +425,55 @@ describe('addAiSuggestions (controller rulings)', () => {
     await expect(new AiSpendMeter(inner, 1_000).provider.complete(withLimit(req, undefined))).rejects.toMatchObject({ kind: 'cost-cap' });
     await new AiSpendMeter(inner, null).provider.complete(withLimit(req, undefined));
     expect(sent).toHaveLength(4);
+  });
+
+  it('N1 (U14): a model with no price is refused before any AI call (no hard cap can be kept), with the priced choices', async () => {
+    const s = await setup({ ai: { name: 'openai', model: 'gpt-5-pro' }, deps: { capUsd: 50 } });
+    const out = await addAiSuggestions(s.r, s.dir, s.deps);
+    expect(s.ai.complete).not.toHaveBeenCalled();
+    expect(suggestTools).not.toHaveBeenCalled();
+    expect(out.ai?.notes).toContain("pipegen doesn't know the price of gpt-5-pro, so it can't keep a hard cost limit. Choose one of: gpt-5, gpt-5-mini, gpt-5.5.");
+    expect(out.ai?.usage).toEqual(usageOf(0, 0));
+    // the meter on its own refuses it too, under any cap
+    const meter = new AiSpendMeter(s.ai.p, 1e9);
+    await expect(meter.provider.complete(withLimit({ system: 's', user: 'u', schemaName: 'candidates', jsonSchema: {}, timeoutMs: 1 }, 10))).rejects.toMatchObject({ kind: 'cost-cap' });
+    expect(s.ai.complete).not.toHaveBeenCalled();
+  });
+
+  it('N2 (U14): a bundle large enough to cross a price tier is priced at the higher tier, and the cap is never passed', async () => {
+    // five ~25 KB files (the bundle keeps whole files up to its 150 KB cut)
+    const big: Record<string, string> = {};
+    for (let f = 0; f < 5; f++) big[`src/part${f}.js`] = `${Array.from({ length: 700 }, (_, i) => `export const value${f}_${i} = ${i} * 2; // item ${i}`).join('\n')}\n`;
+    const haiku: AiOpts = { model: 'claude-haiku-5-5', worstCase: true };
+    const dry = await setup({ files: big, ai: haiku });
+    const bytes = needsRequestBytes(dry.r, []);
+    expect(bytes + FRAMING_MARGIN_TOKENS).toBeGreaterThan(100_000); // above Haiku 5.5's 100,000-token threshold
+    const provider = { name: 'claude', model: 'claude-haiku-5-5' };
+    const worst = requestCeilingUsd(provider, bytes, NEEDS_MAX_OUTPUT_TOKENS) as number;
+    const lowTier = ((bytes + FRAMING_MARGIN_TOKENS) * 1.25 * 0.1 + NEEDS_MAX_OUTPUT_TOKENS * 0.5) / 1e6;
+    expect(worst).toBeCloseTo(((bytes + FRAMING_MARGIN_TOKENS) * 1.25 * 0.5 + NEEDS_MAX_OUTPUT_TOKENS * 2.5) / 1e6, 10);
+    expect(worst).toBeGreaterThan(4 * lowTier);
+    const est = estimateAuditAi(provider, 5, bytes);
+    const s = await setup({ files: big, ai: haiku, deps: { capUsd: est.capUsd } });
+    const out = await addAiSuggestions(s.r, s.dir, s.deps);
+    expect(aiRequestBytes(s.ai.needsReqs()[0] as AiRequest)).toBe(bytes);
+    expect(s.ai.candidateReqs().length).toBeGreaterThanOrEqual(1); // the needs call and discovery ran
+    // tiers apply per request: each request billed its own worst case (the needs call above the threshold, discovery below)
+    const billed = s.ai.reqs.reduce((sum, q) => sum + (usageCeilingUsd(provider, worstUsage(q, 1)) as number), 0);
+    expect(billed).toBeLessThanOrEqual(est.capUsd as number);
+    expect(out.ai?.usage).toEqual(s.ai.reqs.map((q) => worstUsage(q, 1)).reduce((a, b) => usageOf(0, a.outputTokens + b.outputTokens, 0, (a.cacheWriteTokens ?? 0) + (b.cacheWriteTokens ?? 0)), usageOf(0, 0)));
+  });
+
+  it('N5: a successful answer that reports no usage keeps its full reservation', async () => {
+    const req = withLimit({ system: 'sys', user: 'u'.repeat(3_000), schemaName: 'candidates', jsonSchema: { type: 'object' }, timeoutMs: 1_000 }, CANDIDATES_MAX_OUTPUT_TOKENS);
+    const worst = requestCeilingUsd(DEFAULT_PROVIDER, aiRequestBytes(req), CANDIDATES_MAX_OUTPUT_TOKENS) as number;
+    for (const usage of [undefined, {}, use(0, 0), use(0, 50)]) {
+      const inner: AiProvider = { name: 'claude', model: DEFAULT_MODEL, complete: async () => ({ data: {}, usage: usage as AiUsage }) };
+      const meter = new AiSpendMeter(inner, 10 * worst);
+      await meter.provider.complete(req);
+      expect(meter.spentUsd, JSON.stringify(usage)).toBeCloseTo(worst, 10);
+      expect(meter.reservedUsd).toBe(0);
+    }
   });
 
   it('U13: a cut-off answer (the output limit reached) fails safe as a note', async () => {

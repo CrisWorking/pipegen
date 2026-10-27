@@ -145,6 +145,10 @@ export function claudeProvider(opts: ClaudeOptions): AiProvider {
     // A 3xx must never re-send the code bundle (and the x-api-key header, which fetch keeps across origins) to
     // another host, so every request refuses redirects, as the Ollama and OpenAI adapters do.
     fetch: noRedirectFetch(opts.fetch ?? globalThis.fetch),
+    // maxRetries stays at the SDK default (2), on purpose (ruling U14, review N4). The claude-api skill (SKILL.md, "Client
+    // config") says the SDK retries 408/409/429/5xx answers and connection errors. Those are requests that failed with no
+    // message produced; pipegen ASSUMES they are not billed (the skill doesn't say so). A failure after the answer has
+    // started streaming is not retried by the SDK. So one metered attempt bills at most one answer.
   });
 
   return {
@@ -154,12 +158,13 @@ export function claudeProvider(opts: ClaudeOptions): AiProvider {
       // The helper adapts the schema for the API (the wire format) and gives the parser. The parser is left out of
       // the request, so the SDK does not parse on its own; it is called only after stop_reason is checked, so
       // half-finished JSON is never parsed.
+      const limit = outputLimit(req.maxOutputTokens); // refused up front when it isn't a whole number above 0
       const { parse, ...format } = outputFormat(req.jsonSchema);
       const msg = await withTimeout(req.timeoutMs, 'Claude', async (signal) => {
         try {
           return await client.beta.messages.stream({
             model,
-            max_tokens: Math.min(outputLimit(req.maxOutputTokens) ?? CLAUDE_MAX_TOKENS, CLAUDE_MAX_TOKENS),
+            max_tokens: Math.min(limit ?? CLAUDE_MAX_TOKENS, CLAUDE_MAX_TOKENS),
             ...(withFallback ? { betas: [FALLBACK_BETA], fallbacks: 'default' as const } : {}),
             output_config: { effort, format },
             system: req.system,

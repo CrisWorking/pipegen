@@ -269,6 +269,14 @@ describe('consentText (audit-ai, ruling B2)', () => {
     expect(text).not.toMatch(/read and write/);
   });
 
+  it('consent: audit-ai refuses an estimate for a model with no price (no hard cost limit can be kept; U14)', () => {
+    const p = profile();
+    const pro = provider('openai', 'gpt-5-pro');
+    const est = estimateAuditAi(pro, 3, 50_000);
+    expect(est.unpriced?.message).toBe("pipegen doesn't know the price of gpt-5-pro, so it can't keep a hard cost limit. Choose one of: gpt-5, gpt-5-mini, gpt-5.5.");
+    expect(() => consentText(p, pro, est, bundle, permissionsTable('read'), [], 'audit-ai', { gitleaksVersion: '8.30.1' })).toThrow(est.unpriced?.message);
+  });
+
   it('consent: audit-ai mode ignores repos and refuses write permissions', () => {
     const p = profile();
     const est = estimateAuditAi(claude, 3, 50_000);
@@ -348,9 +356,13 @@ describe('consent shows how the estimates were made (final review batch 2, M3)',
 
   it('consent: basis lines pass through safeText', () => {
     const hostile = provider('openai', `gpt\x1b[2J\u202e-x`);
-    const text = full({ ai: hostile }).text + audit(hostile).text;
+    const text = full({ ai: hostile }).text;
     expect(text).not.toMatch(/[\u001b\u202e]/);
     expect(text).toContain('has no price for the model');
+    // audit --ai refuses a model with no price (ruling U14); the refusal text is cleaned too
+    const est = estimateAuditAi(hostile, 3, 50_000);
+    expect(est.unpriced?.message).not.toMatch(/[\u001b\u202e]/);
+    expect(() => audit(hostile)).toThrow(/doesn't know the price of/);
   });
 
   it('consent: the Ollama basis matches where it runs', () => {

@@ -22,6 +22,7 @@ import {
 import { withRateLimit, type RateClock } from '../engine/github-rate.js';
 import { DEFAULT_MODEL, type AiRequest, type AiUsage, type Layer, type Plan, type RepoProfile } from '../types.js';
 import { fallbackEnabled } from '../util/claude-fallback.js';
+import { isOutputLimit } from '../util/output-limit.js';
 import { hostPlace } from '../util/local-host.js';
 import { packageDataPath } from '../util/package-data.js';
 import { safeText } from '../util/safe-text.js';
@@ -55,7 +56,8 @@ export interface Estimates {
   pricedFor: PricedFor | null;
 }
 
-export interface AuditAiEstimate { tokens: { input: number; output: number }; costUsd: AiCost | 'local'; capUsd: number | null; basis: string[]; pricedFor: PricedFor }
+/** `unpriced`: the model has no price, so no hard cap can be kept (ruling U14); capUsd is then 0 and the CLI stops before consent. */
+export interface AuditAiEstimate { tokens: { input: number; output: number }; costUsd: AiCost | 'local'; capUsd: number | null; basis: string[]; pricedFor: PricedFor; unpriced: UnpricedModel | null }
 
 // ---------- minutes ----------
 
@@ -120,8 +122,14 @@ const isoDate = z.string().regex(/^\d{4}-\d{2}-\d{2}$/, 'must be a date (YYYY-MM
   const t = new Date(Date.UTC(y, m - 1, d));
   return t.getUTCFullYear() === y && t.getUTCMonth() === m - 1 && t.getUTCDate() === d;
 }, 'must be a date (YYYY-MM-DD)');
-const price = z.strictObject({ input: z.number().finite().nonnegative(), output: z.number().finite().nonnegative() });
-const paidPrice = z.strictObject({ input: z.number().finite().positive(), output: z.number().finite().positive() });
+const rates = { input: z.number().finite().nonnegative(), output: z.number().finite().nonnegative() };
+/** A price tier (ruling U14): above `above_input_tokens` prompt tokens, these prices apply to the whole request. */
+const tier = z.strictObject({ above_input_tokens: z.number().int().positive(), ...rates });
+const price = z.strictObject({ ...rates, long: tier.optional() }).refine(
+  (p) => p.long === undefined || (p.long.input >= p.input && p.long.output >= p.output),
+  'a price tier must not be cheaper than the base prices',
+);
+const paidPrice = z.object({ input: z.number().finite().positive(), output: z.number().finite().positive() });
 const providerPrices = z.strictObject({
   source: z.string().min(1),
   local: z.boolean(),
@@ -192,7 +200,9 @@ const plans = () => (defaultPlans ??= loadGitHubPlans());
 const money = (n: number) => `$${Number.isInteger(n) ? String(n) : n.toFixed(2)}`;
 const thousands = (n: number) => `${n / 1000}k`;
 
-interface PriceChoice { local: boolean; input: number; output: number; model: string; notes: string[] }
+type PriceTier = { above_input_tokens: number; input: number; output: number };
+/** `known`: the model has its own price in the file (or the provider is local); false when priced like the dearest. */
+interface PriceChoice { local: boolean; input: number; output: number; long?: PriceTier; model: string; notes: string[]; known: boolean }
 
 const perMillion = (p: { input: number; output: number }) => `${money(p.input)} per million input tokens and ${money(p.output)} per million output tokens`;
 
@@ -205,22 +215,23 @@ function priceFor(provider: AiProviderChoice): PriceChoice {
   const list = prices();
   const shown = safeText(provider.model, 80);
   const table = provider.name === 'claude' || provider.name === 'openai' || provider.name === 'ollama' ? list.providers[provider.name] : undefined;
-  if (table?.local) return { local: true, input: 0, output: 0, model: shown, notes: [] };
+  if (table?.local) return { local: true, input: 0, output: 0, model: shown, notes: [], known: true };
   const found = table !== undefined && Object.hasOwn(table.models, provider.model) ? table.models[provider.model] : undefined;
   if (found) {
-    return { local: false, ...found, model: shown, notes: [`Prices for ${shown}: ${perMillion(found)} (checked ${list.checkedAt}).`] };
+    const above = found.long === undefined ? '' : `; above ${found.long.above_input_tokens.toLocaleString('en-US')} prompt tokens, ${perMillion(found.long)}`;
+    return { local: false, ...found, model: shown, known: true, notes: [`Prices for ${shown}: ${perMillion(found)}${above} (checked ${list.checkedAt}).`] };
   }
   const pool = table ? [table] : [list.providers.claude, list.providers.openai];
-  let top: { name: string; input: number; output: number } | undefined;
+  let top: { name: string; input: number; output: number; long?: PriceTier } | undefined;
   for (const t of pool) {
     for (const [name, m] of Object.entries(t.models)) {
-      if (!top || m.input + m.output > top.input + top.output) top = { name, input: m.input, output: m.output };
+      if (!top || m.input + m.output > top.input + top.output) top = { name, ...m };
     }
   }
-  const t = top as { name: string; input: number; output: number }; // the schema guarantees claude has models
+  const t = top as { name: string; input: number; output: number; long?: PriceTier }; // the schema guarantees claude has models
   const whose = table ? `the same provider (${safeText(provider.name, 40)})` : 'any provider in its price list';
   return {
-    local: false, input: t.input, output: t.output, model: t.name,
+    local: false, input: t.input, output: t.output, ...(t.long === undefined ? {} : { long: t.long }), model: t.name, known: false,
     notes: [
       `pipegen has no price for the model "${shown}", so it prices it like ${t.name}, the most expensive model it knows from ${whose}: ${perMillion(t)} (checked ${list.checkedAt}). `
         + "This is the provider's highest price, so the real cost is likely lower.",
@@ -356,13 +367,31 @@ function includedMinutesFor(isPrivate: boolean, plan: Plan): number | null {
   return plans().includedMinutes[plan];
 }
 
+/** A model `audit --ai` can't keep a hard cost limit for: it has no price of its own in data/ai-prices.yml (ruling U14). */
+export interface UnpricedModel { model: string; choose: string[]; message: string }
+
+/**
+ * The model when it has no price of its own in data/ai-prices.yml, with the priced models of its provider to choose
+ * from; null when it is priced (or local: Ollama has no per-token price). The full-run estimate still shows such a
+ * model priced like the dearest one, but a hard cap can't rest on a guessed price (ruling U14, review N1).
+ */
+export function unpricedModel(provider: AiProviderChoice): UnpricedModel | null {
+  if (priceFor(provider).known) return null;
+  const table = provider.name === 'claude' || provider.name === 'openai' ? prices().providers[provider.name] : undefined;
+  const choose = table === undefined ? [] : Object.keys(table.models);
+  const model = safeText(provider.model, 80);
+  const message = `pipegen doesn't know the price of ${model}, so it can't keep a hard cost limit.${choose.length > 0 ? ` Choose one of: ${choose.join(', ')}.` : ''}`;
+  return { model, choose, message };
+}
+
 /**
  * The AI cost of `audit --ai` alone (Plan U ruling B2): one needs call plus one candidates call for each need that goes
  * to discovery, at most MAX_DISCOVERY_NEEDS. `needCount`: the needs with no reviewed tool. `needsRequestBytes`: the
  * needs request's size (UTF-8 bytes; the audit model's needsRequestBytes). Priced like estimate() for the chosen
  * provider and model (recorded in `pricedFor`). The cap is 2 × high, and never less than the needs call's and one
  * discovery call's worst case together (requestCeilingUsd, ruling U13), so the needs call always fits the agreed cap.
- * Ollama → 'local', no cap.
+ * Ollama → 'local', no cap. A model with no price (`unpriced`, ruling U14): capUsd 0, so no call fits; the CLI and the
+ * consent screen stop before asking.
  */
 export function estimateAuditAi(provider: AiProviderChoice, needCount: number, needsRequestBytes: number): AuditAiEstimate {
   const calls = Math.min(count(needCount), MAX_DISCOVERY_NEEDS);
@@ -373,8 +402,12 @@ export function estimateAuditAi(provider: AiProviderChoice, needCount: number, n
     `The AI part of the audit is 1 needs call plus up to ${MAX_DISCOVERY_NEEDS} discovery calls, one for each need with no reviewed tool (${calls} here), at about ${thousands(CANDIDATE_CALL.input)} input / ${thousands(CANDIDATE_CALL.output)} output tokens for each discovery call.`,
     `The cost range is ×${LOW} to ×${HIGH} of the token estimate.`,
   ];
-  if (pr.local) return { tokens, costUsd: 'local', capUsd: null, basis: [...basis, noCostLine(provider)], pricedFor: pricedFor(provider) };
+  if (pr.local) return { tokens, costUsd: 'local', capUsd: null, basis: [...basis, noCostLine(provider)], pricedFor: pricedFor(provider), unpriced: null };
   const c = cost(tokens, pr);
+  const unpriced = unpricedModel(provider);
+  if (unpriced !== null) {
+    return { tokens, costUsd: c, capUsd: 0, basis: [unpriced.message, ...basis, ...pr.notes], pricedFor: pricedFor(provider), unpriced };
+  }
   const worst = (requestCeilingUsd(provider, count(needsRequestBytes), NEEDS_MAX_OUTPUT_TOKENS) as number)
     + (requestCeilingUsd(provider, CANDIDATES_REQUEST_MAX_BYTES, CANDIDATES_MAX_OUTPUT_TOKENS) as number);
   const capUsd = Math.max(CAP_FACTOR * c.high, worst);
@@ -383,7 +416,7 @@ export function estimateAuditAi(provider: AiProviderChoice, needCount: number, n
     + `(every byte sent counted as a token, the full output limit of ${thousands(NEEDS_MAX_OUTPUT_TOKENS)} and ${thousands(CANDIDATES_MAX_OUTPUT_TOKENS)} tokens, at the highest price the call could be billed at`
     + `${fallback ? ', including a second run on another Claude model if Claude declines and its refusal fallback runs the request again' : ''}). `
     + 'Before each AI call pipegen reserves the most that call could cost, and it makes no call that could take the total past the cap.';
-  return { tokens, costUsd: c, capUsd, basis: [...basis, capLine, `Priced with the model ${pr.model}.`, ...pr.notes], pricedFor: pricedFor(provider) };
+  return { tokens, costUsd: c, capUsd, basis: [...basis, capLine, `Priced with the model ${pr.model}.`, ...pr.notes], pricedFor: pricedFor(provider), unpriced: null };
 }
 
 /**
@@ -397,14 +430,23 @@ export const FRAMING_MARGIN_TOKENS = 2_000;
 
 const money2 = (n: number) => `$${n.toFixed(2)}`;
 
+/** All the input tokens a request was billed for: its prompt length, which picks the price tier (cache reads and writes count). */
+const promptTokens = (usage: AiUsage) => count(usage.inputTokens) + count(usage.cacheReadTokens ?? 0) + count(usage.cacheWriteTokens ?? 0);
+
+/** The prices for a prompt of this many tokens: the `long` tier above its threshold, else the base prices. */
+function ratesAt(p: { input: number; output: number; long?: PriceTier }, prompt: number): { input: number; output: number } {
+  return p.long !== undefined && prompt > p.long.above_input_tokens ? p.long : p;
+}
+
 /**
- * What tokens already used cost (USD) at the list price for this provider and model (an unknown model at its
- * provider's most expensive price); 'local' for a local model. For showing a cost, not for the cap.
+ * What tokens already used cost (USD) at the list price for this provider and model, in the tier its prompt length
+ * falls in (an unknown model at its provider's most expensive price); 'local' for a local model. For showing a cost,
+ * not for the cap.
  */
 export function usageCostUsd(provider: AiProviderChoice, usage: AiUsage): number | 'local' {
   const pr = priceFor(provider);
   if (pr.local) return 'local';
-  return priceUsage(usage, pr);
+  return priceUsage(usage, ratesAt(pr, promptTokens(usage)));
 }
 
 function priceUsage(usage: AiUsage, rate: { input: number; output: number }): number {
@@ -413,20 +455,27 @@ function priceUsage(usage: AiUsage, rate: { input: number; output: number }): nu
 }
 
 /**
- * The highest per-token prices a request to this provider and model could be billed at, and how many runs of it one
- * request can bill. A Claude model with the server-side refusal fallback can bill twice (it declines mid-answer, then
- * another Claude model of Anthropic's choice runs the request again, each run at its own model's price), so both runs
- * are priced at the top input and output price of any Claude model. Otherwise the model's own price (an unknown model
- * at its provider's most expensive), one run. null for a local model.
+ * The highest per-token prices a request with a prompt of `prompt` tokens could be billed at, and how many runs of it
+ * one request can bill. null for a local model; 'unpriced' for a model with no price of its own (ruling U14: a hard
+ * cap can't rest on a guess, so its requests are unbounded).
+ *
+ * A Claude model with the server-side refusal fallback (`fallbacks: "default"`) can bill twice: the claude-api skill
+ * (shared/model-migration.md, refusal section, "Billing") says an attempt that declines mid-stream bills at normal rates
+ * and "fallback attempts bill at the fallback model's rates"; the "default" form "picks Anthropic's recommended
+ * fallback" (Migrating to Claude Opus 5, "New API features"), one model, and the hop inherits the top-level max_tokens.
+ * The docs don't state "at most one hop" in so many words (review N7); pipegen reads it as one fallback run. Both runs
+ * are priced at the top input and output price of any Claude model, any tier. Otherwise: the model's own prices in the
+ * tier the prompt falls in, one run.
  */
-function ceilingRates(provider: AiProviderChoice): { input: number; output: number; runs: number } | null {
+function ceilingRates(provider: AiProviderChoice, prompt: number): { input: number; output: number; runs: number } | null | 'unpriced' {
   const pr = priceFor(provider);
   if (pr.local) return null;
+  if (!pr.known) return 'unpriced';
   if (provider.name === 'claude' && fallbackEnabled(provider.model)) {
-    const models = Object.values(prices().providers.claude.models);
-    return { input: Math.max(...models.map((m) => m.input)), output: Math.max(...models.map((m) => m.output)), runs: 2 };
+    const all = Object.values(prices().providers.claude.models).flatMap((m) => (m.long === undefined ? [m] : [m, m.long]));
+    return { input: Math.max(...all.map((m) => m.input)), output: Math.max(...all.map((m) => m.output)), runs: 2 };
   }
-  return { input: pr.input, output: pr.output, runs: 1 };
+  return { ...ratesAt(pr, prompt), runs: 1 };
 }
 
 /** A request's size in UTF-8 bytes: system + user + the schema as JSON (byte-level tokenizers give at most 1 token per byte). */
@@ -435,23 +484,28 @@ export function aiRequestBytes(req: AiRequest): number {
 }
 
 /**
- * The most one request can cost (USD), before it is sent (ruling U13): every byte a token plus FRAMING_MARGIN_TOKENS as
- * input (priced as a cache write, the dearest input), the full `maxOutputTokens` as output, at ceilingRates, times the
- * runs it can bill. Infinity when the request sets no output limit (nothing bounds it). 'local' for a local model.
- * A retry is a request of its own.
+ * The most one request can cost (USD), before it is sent (rulings U13, U14): every byte a token plus
+ * FRAMING_MARGIN_TOKENS as input (priced as a cache write, the dearest input), the full `maxOutputTokens` as output, at
+ * ceilingRates for that input bound (the higher tier once the bound crosses its threshold), times the runs it can
+ * bill. Infinity when the output limit isn't a whole number above 0 (isOutputLimit: nothing bounds it) or the model
+ * has no price. 'local' for a local model. A retry is a request of its own.
  */
 export function requestCeilingUsd(provider: AiProviderChoice, requestBytes: number, maxOutputTokens: number): number | 'local' {
-  const rate = ceilingRates(provider);
+  const bound = Math.ceil(Math.max(0, requestBytes)) + FRAMING_MARGIN_TOKENS;
+  const rate = ceilingRates(provider, bound);
   if (rate === null) return 'local';
-  if (!(Number.isFinite(maxOutputTokens) && maxOutputTokens > 0)) return Number.POSITIVE_INFINITY;
-  const input = (Math.ceil(Math.max(0, requestBytes)) + FRAMING_MARGIN_TOKENS) * CACHE_WRITE_FACTOR;
-  return rate.runs * ((input / 1e6) * rate.input + (maxOutputTokens / 1e6) * rate.output);
+  if (rate === 'unpriced' || !isOutputLimit(maxOutputTokens)) return Number.POSITIVE_INFINITY;
+  return rate.runs * (((bound * CACHE_WRITE_FACTOR) / 1e6) * rate.input + (maxOutputTokens / 1e6) * rate.output);
 }
 
-/** What tokens already used cost at ceilingRates (usage already holds every run, so no multiplying). 'local' for a local model. */
+/**
+ * What tokens already used cost at ceilingRates for their real prompt length (usage already holds every run, so no
+ * multiplying). Infinity for a model with no price; 'local' for a local model.
+ */
 export function usageCeilingUsd(provider: AiProviderChoice, usage: AiUsage): number | 'local' {
-  const rate = ceilingRates(provider);
-  return rate === null ? 'local' : priceUsage(usage, rate);
+  const rate = ceilingRates(provider, promptTokens(usage));
+  if (rate === null) return 'local';
+  return rate === 'unpriced' ? Number.POSITIVE_INFINITY : priceUsage(usage, rate);
 }
 
 // ---------- activity30d ----------

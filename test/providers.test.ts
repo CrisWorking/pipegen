@@ -214,8 +214,26 @@ describe('claude', () => {
     const p = claudeProvider({ key: runtimeKey('ak'), fetch: f.fetch });
     await p.complete(request(outLimit(16_000)));
     await p.complete(request(outLimit(500_000)));
-    await p.complete(request(outLimit(0)));
-    expect(f.calls.map((c) => c.body.max_tokens)).toEqual([16_000, CLAUDE_MAX_TOKENS, CLAUDE_MAX_TOKENS]);
+    expect(f.calls.map((c) => c.body.max_tokens)).toEqual([16_000, CLAUDE_MAX_TOKENS]);
+  });
+
+  it('every provider refuses an output limit that is not a whole number above 0, before any request (review N3)', async () => {
+    const claude = fakeFetch(() => sse(claudeMessage()));
+    const openai = fakeFetch(() => json({}));
+    const ollama = fakeFetch(() => json({}));
+    const providers = [
+      claudeProvider({ key: runtimeKey('ak'), fetch: claude.fetch }),
+      openaiProvider({ key: runtimeKey('ok'), model: 'gpt-5', fetch: openai.fetch }),
+      ollamaProvider({ fetch: ollama.fetch }),
+    ];
+    for (const prov of providers) {
+      for (const bad of [0, -1, 16_000.5, Number.NaN, Number.POSITIVE_INFINITY, '16000' as unknown as number]) {
+        const err = await caught(prov.complete(request(outLimit(bad))));
+        expect(err.kind, `${prov.name} ${String(bad)}`).toBe('invalid');
+        expect(err.message).toBe('The AI request\'s output limit must be a whole number above 0.');
+      }
+    }
+    expect([...claude.calls, ...openai.calls, ...ollama.calls]).toEqual([]);
   });
 
   it('claude: fallback-served answer counts billed tokens of every attempt (usage.iterations)', async () => {
@@ -462,6 +480,18 @@ describe('ollama', () => {
     await makeProvider({ ai: 'ollama', env: { OLLAMA_HOST: 'http://gpu-box:8080' }, ollamaCtx: 8192, model: 'qwen3', fetch: g.fetch }).complete(request());
     expect(g.calls[0]!.url).toBe('http://gpu-box:8080/api/chat');
     expect(g.calls[0]!.body).toMatchObject({ model: 'qwen3', options: { num_ctx: 8192 } });
+  });
+
+  it('ollama: cloud models (a :cloud tag or a -cloud name) are refused: they send the code to ollama.com (U14)', async () => {
+    const f = fakeFetch(() => ollamaAnswer());
+    for (const model of ['gemma4:cloud', 'gpt-oss:120b-cloud', 'qwen3-coder:480B-Cloud', 'deepseek-v3.1-cloud', 'kimi-k2:cloud ']) {
+      const err = await caught(() => makeProvider({ ai: 'ollama', model, env: {}, fetch: f.fetch }));
+      expect(err.kind, model).toBe('invalid');
+      expect(err.message).toBe('Ollama cloud models send your code to ollama.com; pipegen v0.1 only uses local Ollama models.');
+      expect(() => ollamaProvider({ model, fetch: f.fetch })).toThrow(/ollama\.com/);
+    }
+    for (const model of ['llama3.1', 'qwen3:8b', 'mycloud', 'cloudy:7b']) expect(makeProvider({ ai: 'ollama', model, env: {}, fetch: f.fetch }).model).toBe(model);
+    expect(f.calls).toEqual([]);
   });
 
   it('ollama: a request\'s maxOutputTokens is sent as options.num_predict (U13)', async () => {

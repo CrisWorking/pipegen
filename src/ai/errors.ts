@@ -2,6 +2,7 @@
 // Error messages here and in the adapters are pipegen's own fixed text: never an API response body, an SDK error
 // message or the AI's words, so neither a key echoed by a server nor hostile AI text can end up in one.
 import type { AiUsage } from '../types.js';
+import { isOutputLimit } from '../util/output-limit.js';
 
 /** `cost-cap`: pipegen itself refused to send the request, since it could take the spend past the agreed AI cost cap. */
 export type AiErrorKind = 'timeout' | 'invalid' | 'http' | 'missing' | 'refusal' | 'truncated' | 'cost-cap';
@@ -44,9 +45,17 @@ export async function withTimeout<T>(ms: number, label: string, run: (signal: Ab
   }
 }
 
-/** A request's output limit (AiRequest.maxOutputTokens) when it is a whole number above 0, else undefined (no limit set). */
+export const OUTPUT_LIMIT_MESSAGE = "The AI request's output limit must be a whole number above 0.";
+
+/**
+ * A request's output limit (AiRequest.maxOutputTokens): undefined when it isn't set, the number when it is a whole
+ * number above 0 (isOutputLimit, the one rule the meter and the estimator use too), and AiError('invalid') for anything
+ * else, before any request is made (review N3).
+ */
 export function outputLimit(n: unknown): number | undefined {
-  return typeof n === 'number' && Number.isSafeInteger(n) && n > 0 ? n : undefined;
+  if (n === undefined) return undefined;
+  if (!isOutputLimit(n)) throw new AiError('invalid', OUTPUT_LIMIT_MESSAGE);
+  return n;
 }
 
 /** An enumerated error code from a provider body (e.g. `invalid_api_key`) when it is a plain identifier, else ''. */

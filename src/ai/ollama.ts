@@ -39,6 +39,17 @@ function usageOf(a: { prompt_eval_count?: unknown; eval_count?: unknown }): AiUs
 /** An Ollama provider, with the host:port its requests go to (shown at consent; never userinfo or a path). */
 export type OllamaProvider = AiProvider & { readonly name: 'ollama'; readonly host: string };
 
+export const OLLAMA_CLOUD_MESSAGE = 'Ollama cloud models send your code to ollama.com; pipegen v0.1 only uses local Ollama models.';
+/**
+ * An Ollama cloud model: the local daemon forwards the prompt to ollama.com, so the code leaves this machine while
+ * consent says it runs locally (ruling U14). Ollama's docs (docs.ollama.com/cloud, read 2026-10-27) name them with a
+ * `:cloud` tag in the app and CLI (`gemma4:cloud`); earlier releases used a `-cloud` suffix (`gpt-oss:120b-cloud`).
+ * Both forms are refused, in any letter case (fail closed).
+ */
+export function isOllamaCloudModel(model: string): boolean {
+  return /(?:^|[:-])cloud$/i.test(model.trim());
+}
+
 /** The host:port an Ollama provider sends to, or null when `p` isn't one built by ollamaProvider (unknown: never assume local). */
 export function ollamaHostOf(p: AiProvider): string | null {
   const host = (p as { host?: unknown }).host;
@@ -49,6 +60,7 @@ export function ollamaProvider(opts: OllamaOptions = {}): OllamaProvider {
   const url = ollamaChatUrl(opts.host);
   const where = url.host; // shown in errors: host and port only, never userinfo or a path
   const model = opts.model ?? OLLAMA_DEFAULT_MODEL;
+  if (isOllamaCloudModel(model)) throw new AiError('invalid', OLLAMA_CLOUD_MESSAGE);
   const numCtx = opts.numCtx ?? OLLAMA_DEFAULT_CTX;
   if (!Number.isInteger(numCtx) || numCtx < 1) throw new AiError('invalid', '--ollama-ctx must be a whole number above 0.');
   const doFetch = opts.fetch ?? globalThis.fetch;

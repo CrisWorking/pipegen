@@ -196,6 +196,8 @@ export function consentText(p: RepoProfile, provider: AiProvider, est: Estimates
       throw new Error('The audit --ai consent lists read-only permissions; it was given a write permission.');
     }
     const a = est as AuditAiEstimate;
+    // A model with no price can't keep the hard cost limit this screen would promise (ruling U14): the CLI stops first.
+    if (a.unpriced !== null && a.unpriced !== undefined) throw new Error(a.unpriced.message);
     sections.push(
       ['pipegen audit --ai is about to send part of your code to an AI. Nothing has left this computer yet.', 'This audit only reads: it changes nothing on GitHub.'],
       filesSection(p, bundle, facts.gitleaksVersion),
