@@ -10,6 +10,7 @@
 /tsup.config.ts        @CrisWorking
 /tsup.dev.config.ts    @CrisWorking
 /tsconfig.json         @CrisWorking
+/vitest.config.ts      @CrisWorking
 /package.json          @CrisWorking
 /package-lock.json     @CrisWorking
 /.npmrc                @CrisWorking

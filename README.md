@@ -118,7 +118,7 @@ To check a release, in an empty folder:
 ```bash
 npm init -y
 npm install --registry=https://registry.npmjs.org pipegen@x.y.z
-npm audit signatures
+npm audit signatures --registry=https://registry.npmjs.org
 ```
 
 `npm audit signatures` verifies the registry signature and the provenance attestation of every installed package: it
@@ -134,8 +134,8 @@ The steps for making a release are in [docs/release.md](docs/release.md).
 - **Security fixes:** report a problem privately (see [SECURITY.md](SECURITY.md)), not in a public issue. A report gets an
   acknowledgement within 7 days and a fix or a written plan within 30 days.
 - **Dependencies and tools:** pipegen ships with no runtime dependencies, and every pinned dependency or tool version waits
-  7 days after its release before it is used (see [the cooldown](docs/cooldown.md)); an urgent security fix can skip the wait.
-- **Releases:** every release is built in GitHub Actions from a signed tag, with a provenance attestation you can verify as above.
+  7 days after its release before it is used (see [the cooldown](docs/cooldown.md)). There is no exception for urgent fixes yet; that path is still to be decided.
+- **Releases:** every release is built in GitHub Actions from an annotated tag whose signature GitHub must verify (the workflow fails otherwise), with a provenance attestation you can verify as above.
 - **Side project:** pipegen is open source and maintained by one person; replies may be slow, and the promise above is the
   part that is not.
 

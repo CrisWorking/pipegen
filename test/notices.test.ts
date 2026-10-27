@@ -2,7 +2,7 @@ import { execFileSync } from 'node:child_process';
 import { existsSync, readFileSync, symlinkSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
-import { ALLOWED_LICENSES, bundledPackageDirs, buildNotices, licenseIds, MAX_FILE_BYTES } from '../scripts/notices.js';
+import { ALLOWED_LICENSES, bundledPackageDirs, buildNotices, buildSbom, licenseIds, MAX_FILE_BYTES } from '../scripts/notices.js';
 import { cleanupRepos, makeTempDir, writeIn } from './helpers/make-repo.js';
 
 afterEach(cleanupRepos);
@@ -141,5 +141,36 @@ describe('the committed bundle', () => {
     expect(count).toBeGreaterThan(40);
     expect(text).toContain('@opentelemetry/api@'); // Plan A: the Apache-2.0 API package must be listed
     expect(readFileSync(resolve(root, 'THIRD_PARTY_NOTICES'), 'utf8')).toBe(text);
+  });
+});
+
+describe('buildSbom', () => {
+  const app = { name: 'pipegen', version: '1.2.3' };
+  it('lists exactly the bundled packages (not devDependencies that are not bundled), as CycloneDX JSON', () => {
+    const dir = makeTempDir();
+    pkg(dir, 'node_modules/zod', 'zod', '4.0.0', 'MIT', { LICENSE: 'zod licence' });
+    pkg(dir, 'node_modules/@scope/pkg', '@scope/pkg', '2.0.0', '(MIT OR Apache-2.0)', { LICENSE: 'scoped licence' });
+    pkg(dir, 'node_modules/vitest', 'vitest', '9.9.9', 'MIT', { LICENSE: 'dev only' }); // installed, never bundled
+    const { text, count } = buildSbom(dir, meta('src/a.ts', 'node_modules/zod/i.js', 'node_modules/@scope/pkg/i.js'), app);
+    const bom = JSON.parse(text);
+    expect(count).toBe(2);
+    expect(bom.bomFormat).toBe('CycloneDX');
+    expect(bom.specVersion).toBe('1.5');
+    expect(bom.metadata.component).toMatchObject({ name: 'pipegen', version: '1.2.3' });
+    expect(bom.components.map((c: { purl: string }) => c.purl)).toEqual(['pkg:npm/%40scope/pkg@2.0.0', 'pkg:npm/zod@4.0.0']);
+    expect(bom.components[0].licenses).toEqual([{ license: { id: 'MIT' } }, { license: { id: 'Apache-2.0' } }]);
+    expect(text).not.toContain('vitest');
+  });
+  it('uses the same package list as the notices for the real build', () => {
+    const metaPath = resolve(root, '.build/meta.json');
+    if (!existsSync(metaPath)) execFileSync('npx', ['tsup'], { cwd: root, stdio: 'pipe' });
+    const m = JSON.parse(readFileSync(metaPath, 'utf8'));
+    const overrides = JSON.parse(readFileSync(resolve(root, 'scripts/notices-overrides.json'), 'utf8'));
+    const sbom = buildSbom(root, m, app, overrides);
+    expect(sbom.count).toBe(buildNotices(root, m, overrides).count);
+    const names: string[] = JSON.parse(sbom.text).components.map((c: { name: string }) => c.name);
+    expect(names).not.toContain('vitest');
+    expect(names).not.toContain('typescript');
+    expect(names).not.toContain('tsup');
   });
 });

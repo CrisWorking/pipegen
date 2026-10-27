@@ -9,6 +9,9 @@ updates:
     schedule:
       interval: "weekly"
     open-pull-requests-limit: 5
+    ignore:
+      - dependency-name: "@anthropic-ai/sdk"
+      - dependency-name: "@opentelemetry/api"
     cooldown:
       default-days: 7
     groups:

@@ -16,19 +16,19 @@ the signed tags happen only when v0.4 is done). This page has two parts: what is
 
 | Piece | File | Guard |
 |---|---|---|
-| Release workflow | `.github/workflows/release.yml` | Runs only on pushed `v*` tags **and** only when `github.event.repository.private == false` **and** the repository is `CrisWorking/pipegen`. In the private repo a `v*` tag starts nothing. |
+| Release workflow | `.github/workflows/release.yml` | Runs only on pushed `v*` tags **and** only when `github.event.repository.visibility == 'public'` **and** the repository is `CrisWorking/pipegen`. In the private repo a `v*` tag starts nothing. |
 | Release check | `scripts/release-check.ts` | Run by `release.yml` (and by hand, below). Not part of pull-request CI: it is expected to fail until the owner has reviewed the lists. |
 | Scorecard | `.github/workflows/scorecard.yml` | Runs only when the repo is public. |
 | Cooldown | `scripts/cooldown.ts` | Pull requests; see [cooldown.md](cooldown.md). |
 
 How `release.yml` works, in order:
 
-1. **verify**: the tag must be `vMAJOR.MINOR.PATCH` and point at a commit on `main`; that commit must have a green `ci` run
+1. **verify**: the tag must be `vMAJOR.MINOR.PATCH`, annotated with a signature GitHub verifies, and point at a commit on `main`; that commit must have a green `ci` run
    (the live-network gitleaks test is not re-run, S13); exact Node 26.12.0 and npm >= 11.5.1 are asserted (S10); then
-   `npm ci --ignore-scripts`, tests, `tsc --noEmit`, build, the release check, **one** `npm pack`, an SBOM of the bundled
-   build inputs, a test of the packed `.tgz`, and `SHA256SUMS`. What is tested is what ships (S1).
+   `npm ci --ignore-scripts`, tests, `tsc --noEmit`, build, the release check, **one** `npm pack`, a CycloneDX SBOM of the bundled
+   packages (the same list as `THIRD_PARTY_NOTICES`; `node scripts/notices.ts --sbom-only`), a test of the packed `.tgz`, and `SHA256SUMS`. What is tested is what ships (S1).
 2. **attest**: a build provenance attestation (`actions/attest-build-provenance`) for the `.tgz` and the SBOM.
-3. **publish**: environment `npm-release`; `npm publish ./pipegen-X.Y.Z.tgz --provenance`, with **trusted publishing only**
+3. **publish**: environment `npm-release`; `npm publish ./pipegen-X.Y.Z.tgz --provenance` (pre-releases use `--tag next`), with **trusted publishing only**
    (an OIDC token; no npm token is stored anywhere, and the job refuses to run if one is set). `id-token: write` exists
    only in the attest and publish jobs.
 4. **github-release**: creates a **draft** release, uploads the `.tgz`, SBOM and `SHA256SUMS`, then publishes it. Immutable
@@ -81,7 +81,8 @@ Work through it in order. Tick a step only after Cristiano said go and the resul
       public before any step below. Rulesets, immutable releases and Scorecard need a public repo on GitHub Free (a 403
       proves it).
 - [ ] **B2. Throwaway proofs in `pipegen-spike-release`** (ask Cristiano first; creating this repo is itself a public act, as
-      rulesets need a public one; S4). Copy `release.yml`, create the `npm-release` environment (deployment rule: `v*` tags
+      rulesets need a public one; S4). Copy `release.yml` and change its repository-name guard to the spike repo (as copied, every job is skipped), and
+      stub out the publish step and the release check (which fails on `PENDING` entries there). Create the `npm-release` environment (deployment rule: `v*` tags
       only), the tag ruleset, and turn on immutable releases. Prove **only the GitHub side**:
       - a run from a branch cannot enter `npm-release`;
       - an unsigned `v*` tag: record whether the tag ruleset refuses it, or that GitHub offers no signature rule for tags
@@ -104,7 +105,7 @@ Work through it in order. Tick a step only after Cristiano said go and the resul
       more than advisory, see [cooldown.md](cooldown.md)). A solo owner cannot approve their own PRs, so the owner needs a
       bypass on the PR rules (DEC #74). Record the ruleset ids here.
 - [ ] **B7. GitHub private vulnerability reporting on** (ask Cristiano first; S9).
-- [ ] **B8. Create the `security-fix` label** (ask Cristiano first; used by the cooldown's emergency path).
+- [ ] **B8. The `security-fix` label** (ask Cristiano first). Nothing uses it today: the cooldown has no emergency path (S5 was not built; see [cooldown.md](cooldown.md)). Create the label only if step D1 decides to build that path.
 - [ ] **B9. Scorecard** (ask Cristiano first; S11). Run `scorecard.yml` once (`workflow_dispatch`); results are published to
       the OpenSSF API. Record the score here. Show Cristiano a **list** of every check under 9 (name, score, meaning,
       suggested fix). Checks that need a second maintainer (Code-Review, Contributors, part of Branch-Protection) are marked
@@ -118,12 +119,20 @@ Work through it in order. Tick a step only after Cristiano said go and the resul
 - [ ] **C2. Check before tagging** (ask Cristiano first): on a clean checkout of `main` at the release commit, `npm ci`,
       `npm test`, `npx tsc --noEmit`, `npm run build`, `node scripts/release-check.ts --tag vX.Y.Z` (it must be clean), and
       `package.json` `version` = X.Y.Z with `repository.url` exactly `git+https://github.com/CrisWorking/pipegen.git`.
-- [ ] **C3. First publish and the trusted publisher** (ask Cristiano first; the name claim is public and irreversible, S4).
-      The package does not exist on npm yet, so: one guarded manual first `npm publish` with 2FA (this first version has no
-      provenance, so say so in the release notes, or skip it if npm lets a trusted publisher be configured before the first
-      publish). Then, on npmjs.com in the package settings (an npm-account action by Cristiano): add the trusted publisher
-      bound to repository `CrisWorking/pipegen`, workflow `release.yml` **and** environment `npm-release`. Record it here.
-- [ ] **C4. Signed tag and the release run** (ask Cristiano first). `git tag -s vX.Y.Z -m "vX.Y.Z"`, check with
+- [ ] **C3. Reserve the npm name, then add the trusted publisher** (ask Cristiano first; **whether to reserve the name at
+      all is still his open decision**, and the claim is public and irreversible, S4). A trusted publisher can only be added
+      to a package that exists, so if he decides to reserve: publish a placeholder pre-release by hand with 2FA, under a
+      non-`latest` dist-tag, from a scratch folder that holds only a minimal `package.json` (not the real tarball):
+      ```bash
+      npm publish --registry=https://registry.npmjs.org --access public --tag reserve    # version 0.0.0-reserve.0
+      npm deprecate --registry=https://registry.npmjs.org "pipegen@0.0.0-reserve.0" "name reservation only, not a release"
+      ```
+      The real version is **never** published by hand: only the tag run (C4) publishes it, with provenance. Then, on
+      npmjs.com in the package settings (an npm-account action by Cristiano): add the trusted publisher bound to
+      repository `CrisWorking/pipegen`, workflow `release.yml` **and** environment `npm-release`. Record it here.
+- [ ] **C4. Signed tag and the release run** (ask Cristiano first). The run publishes the real version X.Y.Z (a pre-release
+      tag such as `v1.0.0-rc.1` goes under the `next` dist-tag, never `latest`). The `verify` job fails unless the tag is
+      annotated and GitHub shows its signature as verified (so the signing key of C1 must be on his GitHub account). `git tag -s vX.Y.Z -m "vX.Y.Z"`, check with
       `git tag -v vX.Y.Z`, then `git push origin vX.Y.Z` (this is the public step and starts `release.yml`). Watch the
       run; approve the `npm-release` environment when asked.
 - [ ] **C5. Verify the provenance** (ask Cristiano first; S17, DEC #99). No earlier than this publish:
@@ -141,11 +150,17 @@ Work through it in order. Tick a step only after Cristiano said go and the resul
       through a staged publish that needs a human approval on npm.
 - [ ] **C8. Announcements** are Cristiano's alone (DEC #85). Nothing is posted by Claude.
 
+### D. Decisions left open
+
+- [ ] **D1. Decide the emergency path for urgent security fixes** (ask Cristiano first). The cooldown has none today (S5 was
+      not built). Decide whether to build one (for example the `security-fix` label plus a `Security-fix-reason:` line,
+      with owner review) and what the README and the PR template then say.
+
 ## Notes
 
 - **Pins in this workflow** (Node, actions) follow the 7-day cooldown like every other pin. Bump them in a PR; the
   `cooldown` job does not read workflow files, so check the release dates by hand.
 - **When a second maintainer exists:** enable "required reviewers" and "prevent self-review" on `npm-release`, require two
-  approvals for `security-fix` PRs.
+  approvals for emergency-path PRs, if D1 builds one.
 - **Recorded results** (filled in during R-publish): tag ruleset id: none yet. Main ruleset id: none yet. Immutable releases:
   not on yet. Scorecard score: not run yet. Trusted publisher: not configured yet. Disallow tokens: not set yet.

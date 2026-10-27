@@ -22,12 +22,12 @@ concurrency:
 jobs:
   analysis:
     name: scorecard analysis
-    if: github.repository == 'CrisWorking/pipegen' && github.event.repository.private == false
+    if: github.repository == 'CrisWorking/pipegen' && github.event.repository.visibility == 'public'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
       contents: read
-      actions: read
+      actions: read # the action reads this repository's workflow runs for its checks
       security-events: write # uploads the SARIF result to code scanning
       id-token: write # lets the action publish its result and sign it with this workflow's identity
     steps:

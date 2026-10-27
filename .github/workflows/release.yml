@@ -2,7 +2,7 @@ name: release
 
 # A release is a pushed `v*` tag, and nothing else. DECISIONS #83: no tag is pushed, and nothing is published, before v0.4.
 # Guards (preflight rulings B1, S1, S2, S10, S13):
-#   - every job runs only when this is the real repo AND it is public (`github.event.repository.private == false`), so a
+#   - every job runs only when this is the real repo AND it is public (`github.event.repository.visibility == 'public'`), so a
 #     `v*` tag pushed in the private repo (or in a fork) starts nothing;
 #   - the tag must point at a commit on main, and that commit must have a green `ci` run (S13);
 #   - build once, pack once, test that exact .tgz, then publish that .tgz and nothing rebuilt (S1);
@@ -29,7 +29,7 @@ env:
 jobs:
   verify:
     name: verify, build and pack
-    if: github.repository == 'CrisWorking/pipegen' && github.event.repository.private == false
+    if: github.repository == 'CrisWorking/pipegen' && github.event.repository.visibility == 'public'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:
@@ -55,6 +55,19 @@ jobs:
           [ "$REF_TYPE" = tag ] || { echo "::error::not a tag"; exit 1; }
           printf '%s' "$TAG" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z][0-9A-Za-z.-]*)?$' || { echo "::error::tag is not vMAJOR.MINOR.PATCH"; exit 1; }
           git merge-base --is-ancestor "$GITHUB_SHA" origin/main || { echo "::error::the tagged commit is not on main"; exit 1; }
+      - name: The tag must be an annotated tag whose signature GitHub verifies (fails closed)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          # needs the signing key to be registered on the tagger's GitHub account (docs/release.md C1); a lightweight tag has no signature
+          type=$(gh api "repos/$REPO/git/ref/tags/$TAG" --jq '.object.type')
+          [ "$type" = tag ] || { echo "::error::$TAG is a lightweight tag; a signed annotated tag (git tag -s) is required"; exit 1; }
+          sha=$(gh api "repos/$REPO/git/ref/tags/$TAG" --jq '.object.sha')
+          verified=$(gh api "repos/$REPO/git/tags/$sha" --jq '.verification.verified')
+          [ "$verified" = true ] || { echo "::error::GitHub does not verify the signature of tag $TAG"; exit 1; }
       - name: The tagged commit must have a green ci run (the live-network tests are not re-run here)
         env:
           GH_TOKEN: ${{ github.token }}
@@ -87,8 +100,9 @@ jobs:
           tgz=$(ls out/*.tgz)
           [ "$(ls out/*.tgz | wc -l)" = 1 ] || { echo "::error::expected exactly one tarball"; exit 1; }
           echo "version=$(node -p 'require("./package.json").version')" >> "$GITHUB_OUTPUT"
-          # SBOM of the bundled build inputs (every bundled package is a devDependency; the package has no runtime deps)
-          npm sbom --sbom-format cyclonedx --sbom-type application > out/pipegen-sbom.cdx.json
+          # CycloneDX SBOM of exactly the bundled packages (the same list as THIRD_PARTY_NOTICES, from the build metafile);
+          # devDependencies that are not bundled (vitest, typescript, tsup...) are not listed
+          node scripts/notices.ts --sbom-only out/pipegen-sbom.cdx.json
           (cd out && sha256sum "$(basename "$tgz")" pipegen-sbom.cdx.json > SHA256SUMS)
       - name: Test the tarball that will ship
         run: |
@@ -106,6 +120,27 @@ jobs:
             if (fs.readFileSync("unpacked/package/THIRD_PARTY_NOTICES", "utf8") !== fs.readFileSync("THIRD_PARTY_NOTICES", "utf8")) { console.error("tarball notices differ from the committed file"); process.exit(1); }
           '
           node unpacked/package/dist/cli/main.js --version
+          # Release mode reads the packed data/reviewed-tools.yml. While entries are PENDING the audit must refuse the
+          # list with this exact warning (no network: fetch is stubbed). After the owner's review this assertion changes.
+          cat > "$RUNNER_TEMP/stub-fetch.mjs" <<'EOF'
+          const repo = { private: false, default_branch: 'main', full_name: 'example/fixture', owner: { type: 'User' } };
+          globalThis.fetch = async (input) => {
+            const u = new URL(typeof input === 'string' ? input : (input.url ?? String(input)));
+            const ok = u.pathname === '/repos/example/fixture';
+            return new Response(JSON.stringify(ok ? repo : { message: 'Not Found' }), { status: ok ? 200 : 404, headers: { 'content-type': 'application/json' } });
+          };
+          EOF
+          fx="$RUNNER_TEMP/fixture"
+          mkdir -p "$fx/.github/workflows"
+          git -C "$fx" init -q
+          git -C "$fx" remote add origin https://github.com/example/fixture.git
+          printf 'on: push\njobs:\n  a:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n' > "$fx/.github/workflows/a.yml"
+          node --import "$RUNNER_TEMP/stub-fetch.mjs" unpacked/package/dist/cli/main.js audit --json --dir "$fx" > "$RUNNER_TEMP/audit.json"
+          node -e '
+            const j = JSON.parse(require("fs").readFileSync(process.env.RUNNER_TEMP + "/audit.json", "utf8"));
+            const w = (j.warnings || []).map((x) => x.text).join("\n");
+            if (!/^pipegen.s reviewed tool list isn.t usable in this build: [0-9]+ entries still wait for human review/m.test(w)) { console.error("expected the PENDING refusal of the reviewed tool list, got: " + w); process.exit(1); }
+          '
         env:
           EXPECTED: ${{ steps.pack.outputs.version }}
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
@@ -118,13 +153,13 @@ jobs:
   attest:
     name: build provenance attestation
     needs: verify
-    if: github.repository == 'CrisWorking/pipegen' && github.event.repository.private == false
+    if: github.repository == 'CrisWorking/pipegen' && github.event.repository.visibility == 'public'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
       contents: read
       id-token: write # signs the attestation with the workflow's OIDC identity
-      attestations: write
+      attestations: write # stores the attestation with the repository (actions/attest-build-provenance)
     steps:
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
@@ -141,7 +176,7 @@ jobs:
   publish:
     name: npm publish (trusted publishing, provenance)
     needs: [verify, attest]
-    if: github.repository == 'CrisWorking/pipegen' && github.event.repository.private == false
+    if: github.repository == 'CrisWorking/pipegen' && github.event.repository.visibility == 'public'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     # The environment only allows `v*` tags (docs/release.md). The npm trusted publisher is bound to this workflow file
@@ -167,12 +202,19 @@ jobs:
           if [ -n "${NODE_AUTH_TOKEN:-}${NPM_TOKEN:-}" ]; then echo "::error::an npm token is set; this job publishes with trusted publishing only"; exit 1; fi
           printf '%s\n11.5.1\n' "$(npm --version)" | sort -V -C -r || { echo "::error::npm is older than 11.5.1"; exit 1; }
       - name: Publish the tarball that was tested and attested (provenance is generated from the OIDC identity)
-        run: npm publish ./out/*.tgz --provenance --access public --registry=https://registry.npmjs.org
+        env:
+          VERSION: ${{ needs.verify.outputs.version }}
+        run: |
+          set -euo pipefail
+          # a pre-release (1.0.0-rc.1) must never become `latest`
+          tag=latest
+          case "$VERSION" in *-*) tag=next ;; esac
+          npm publish ./out/*.tgz --provenance --access public --tag "$tag" --registry=https://registry.npmjs.org
 
   github-release:
     name: GitHub release (draft, assets, then publish)
     needs: [verify, attest, publish]
-    if: github.repository == 'CrisWorking/pipegen' && github.event.repository.private == false
+    if: github.repository == 'CrisWorking/pipegen' && github.event.repository.visibility == 'public'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:

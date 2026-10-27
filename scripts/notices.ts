@@ -3,6 +3,8 @@
 // esbuild metafile that the release build writes to .build/meta.json (outside dist/, never packed).
 //
 //   node scripts/notices.ts            write THIRD_PARTY_NOTICES (run `npm run build` first; `npm pack` does both)
+//   node scripts/notices.ts --sbom-only <file>   write only a CycloneDX 1.5 JSON SBOM of the same bundled packages
+//                                      (the release workflow's SBOM; never lists devDependencies that are not bundled)
 //
 // For every package that has an input file under node_modules/ (scoped and nested copies included) it reads package.json
 // `name`, `version` and `license`, plus the LICENSE / COPYING / NOTICE files in the package folder, and writes them in a
@@ -157,18 +159,69 @@ export function buildNotices(root: string, meta: Metafile, overrides: Overrides 
   return { text: renderNotices(entries), count: dirs.length };
 }
 
+/** purl for an npm package: the scope's `@` is percent-encoded. */
+const purl = (name: string, version: string): string => `pkg:npm/${name.replace(/^@/, '%40')}@${version}`;
+
+/** CycloneDX 1.5 JSON of exactly the bundled packages (the NoticeEntry list). No timestamp or serial number, so it is reproducible. */
+export function renderSbom(entries: NoticeEntry[], app: { name: string; version: string }): string {
+  const seen = new Set<string>();
+  const components: unknown[] = [];
+  for (const e of [...entries].sort((a, b) => byCodeUnit(`${a.name}@${a.version}`, `${b.name}@${b.version}`))) {
+    const ref = purl(e.name, e.version);
+    if (seen.has(ref)) continue;
+    seen.add(ref);
+    const ids = licenseIds(e.license);
+    components.push({
+      type: 'library', 'bom-ref': ref, name: e.name, version: e.version, purl: ref,
+      licenses: ids.map((id) => ({ license: { id } })),
+    });
+  }
+  const bom = {
+    bomFormat: 'CycloneDX',
+    specVersion: '1.5',
+    version: 1,
+    metadata: { component: { type: 'application', 'bom-ref': 'pipegen', name: app.name, version: app.version } },
+    components,
+  };
+  return `${JSON.stringify(bom, null, 2)}\n`;
+}
+
+export function buildSbom(root: string, meta: Metafile, app: { name: string; version: string }, overrides: Overrides = {}, allowed: readonly string[] = ALLOWED_LICENSES): { text: string; count: number } {
+  const dirs = bundledPackageDirs(meta);
+  if (dirs.length === 0) throw new Error('the metafile lists no node_modules packages; wrong or empty build?');
+  const entries = dirs.map((d) => readPackage(root, d, overrides, allowed));
+  return { text: renderSbom(entries, app), count: dirs.length };
+}
+
 function main(argv: string[]): number {
   const root = process.cwd();
-  const metaPath = argv[0] ?? '.build/meta.json';
-  const outPath = argv[1] ?? 'THIRD_PARTY_NOTICES';
+  const pos: string[] = [];
+  let sbomOnly: string | null = null;
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i] as string;
+    if (a === '--sbom-only') {
+      const v = argv[++i];
+      if (v === undefined) throw new Error('--sbom-only needs a file');
+      sbomOnly = v;
+    } else pos.push(a);
+  }
+  const metaPath = pos[0] ?? '.build/meta.json';
+  const outPath = pos[1] ?? 'THIRD_PARTY_NOTICES';
   let meta: Metafile;
   try {
-    meta = JSON.parse(readFileSync(join(root, metaPath), 'utf8')) as Metafile // our own build output, larger than a licence file may be;
+    meta = JSON.parse(readFileSync(join(root, metaPath), 'utf8')) as Metafile; // our own build output, larger than a licence file may be
   } catch (e) {
     console.error(`notices: cannot read ${metaPath} (run \`npm run build\` first): ${(e as Error).message}`);
     return 1;
   }
   const overrides = JSON.parse(readFileSync(join(import.meta.dirname, 'notices-overrides.json'), 'utf8')) as Overrides;
+  if (sbomOnly !== null) {
+    const app = JSON.parse(readFileSync(join(root, 'package.json'), 'utf8')) as { name: string; version: string };
+    const { text, count } = buildSbom(root, meta, app, overrides);
+    writeFileSync(join(root, sbomOnly), text);
+    console.log(`sbom: ${count} bundled packages written to ${sbomOnly}`);
+    return 0;
+  }
   const { text, count } = buildNotices(root, meta, overrides);
   writeFileSync(join(root, outPath), text);
   console.log(`notices: ${count} bundled packages written to ${outPath}`);
