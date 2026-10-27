@@ -1,4 +1,4 @@
-// No raw control, bidi or invisible character in pipegen's own sources and tests (final review batch 2, M2). These
+// No raw control, bidi or invisible character in pipegen's own sources, tests, data, docs and workflows (final review batch 2, M2). These
 // are the "trojan source" shape: they can make a line read differently from what it does, and GitHub flags the file.
 // Hostile strings are built in code with \u escapes instead (test/fixtures/hostile-names.ts).
 import { readFileSync } from 'node:fs';
@@ -32,10 +32,11 @@ describe('sources', () => {
     expect(hits('x\ny\u202ez')).toEqual(['2:2 U+202E']);
   });
 
-  it('no raw control, bidi or invisible character in any file under src/ or test/ (write a \\u escape instead)', () => {
-    const files = [...repoFiles('src'), ...repoFiles('test')];
+  it('no raw control, bidi or invisible character in any file under src/, test/, data/, docs/ or .github/ (write a \\u escape instead)', () => {
+    const files = [...repoFiles('src'), ...repoFiles('test'), ...repoFiles('data'), ...repoFiles('docs'), ...repoFiles('.github')];
     expect(files).toContain('src/util/safe-text.ts');
     expect(files).toContain('test/fixtures/hostile-names.ts');
+    expect(files).toContain('data/reviewed-tools.yml');
     const found: Record<string, string[]> = {};
     for (const f of files) {
       const h = hits(readFileSync(join(root, f), 'utf8'));

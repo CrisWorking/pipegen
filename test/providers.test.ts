@@ -147,6 +147,15 @@ describe('claude', () => {
     expect(body.system).toBe('You plan CI pipelines.');
   });
 
+  it('claude: every request refuses redirects (a 3xx must not carry the key and code to another host)', async () => {
+    const inits: (RequestInit | undefined)[] = [];
+    const f = fakeFetch(() => sse(claudeMessage()));
+    const spy = ((input: Parameters<typeof fetch>[0], init?: RequestInit) => { inits.push(init); return f.fetch(input, init); }) as typeof fetch;
+    await claudeProvider({ key: runtimeKey('ak'), fetch: spy }).complete(request());
+    expect(inits.length).toBeGreaterThan(0);
+    for (const i of inits) expect(i?.redirect).toBe('error');
+  });
+
   it('claude: parsed JSON returned from a structured-output answer, with usage (input, output, cache read, cache write tokens)', async () => {
     const f = fakeFetch(() => sse(claudeMessage({
       content: [{ type: 'thinking', thinking: '', signature: 'sig' }, { type: 'text', text: '{"answer":"yes","count":2}' }],

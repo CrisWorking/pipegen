@@ -41,6 +41,11 @@ export const CLAUDE_REFUSAL_MESSAGE = 'Claude declined this request. Nothing was
 const OPEN_TAG = '<code-bundle>';
 const CLOSE_TAG = '</code-bundle>';
 
+/** `base` with every request forced to `redirect: 'error'`. */
+function noRedirectFetch(base: typeof fetch): typeof fetch {
+  return ((input: Parameters<typeof fetch>[0], init?: RequestInit) => base(input, { ...init, redirect: 'error' })) as typeof fetch;
+}
+
 export interface ClaudeOptions { key: string; model?: string; effort?: string; fetch?: typeof fetch }
 
 export function isClaudeEffort(e: string): e is ClaudeEffort {
@@ -147,7 +152,9 @@ export function claudeProvider(opts: ClaudeOptions): AiProvider {
     // prompts, which hold repo code, in content mode) and no trace-context headers. Given explicitly, so the
     // ANTHROPIC_OPEN_TELEMETRY* environment variables are not read.
     openTelemetry: { traces: false, propagation: false },
-    ...(opts.fetch ? { fetch: opts.fetch } : {}),
+    // A 3xx must never re-send the code bundle (and the x-api-key header, which fetch keeps across origins) to
+    // another host, so every request refuses redirects, as the Ollama and OpenAI adapters do.
+    fetch: noRedirectFetch(opts.fetch ?? globalThis.fetch),
   });
 
   return {
