@@ -20,7 +20,7 @@
 // priced for the provider and model shown (Estimates.pricedFor), or the screen is refused.
 import { ollamaHostOf } from '../ai/ollama.js';
 import { refusalFallbackNoteFor } from '../ai/provider.js';
-import { BundleSummary, EXCLUDED_KEPT, EXCLUDED_PATTERN_GROUPS } from '../ai/redact.js';
+import { BundleSummary, excludedSummaryLines } from '../ai/redact.js';
 import type { AiCost, AuditAiEstimate, Estimates, PricedFor } from '../estimate/estimate.js';
 import type { AiProvider, RepoProfile } from '../types.js';
 import { hostPlace } from '../util/local-host.js';
@@ -87,9 +87,7 @@ function filesSection(p: RepoProfile, bundle: BundleSummary, gitleaksVersion: st
     `${INDENT}pipegen sends ${plural(bundle.files, 'file', 'files')} (${size(bundle.bytes)}) from ${safeText(`${p.owner}/${p.repo}`, 200)} to the AI.`,
     `${INDENT}Top folders: ${folders}`,
     `${INDENT}Never sent:`,
-    ...EXCLUDED_PATTERN_GROUPS.map((g) => `${INDENT}${INDENT}- ${g.label}: ${g.summary}`),
-    `${INDENT}${INDENT}- binary files (images, archives, compiled programs), found by their content`,
-    `${INDENT}${INDENT}kept: ${EXCLUDED_KEPT.join(', ')}`,
+    ...excludedSummaryLines().map((l) => `${INDENT}${INDENT}${l}`),
     `${INDENT}Before anything is sent, every file is checked for secrets with gitleaks ${safeText(gitleaksVersion, 20)}, which pipegen downloads (checksum-verified) into its cache, and secret-looking values are hidden.`,
   ];
 }

@@ -96,6 +96,18 @@ export const EXCLUDED_KEPT: readonly string[] = Object.freeze(
   EXCLUDED_PATTERNS.filter((p) => p.startsWith('!')).map((p) => p.slice(1).replace(/^\*\*\//, '')),
 );
 
+/**
+ * What is never sent to the AI, in plain words for the terminal (ruling S29): one `- label: summary` line per group,
+ * binary files, then the files kept. Shared by the consent screen and the audit report, which indent it themselves.
+ */
+export function excludedSummaryLines(): string[] {
+  return [
+    ...EXCLUDED_PATTERN_GROUPS.map((g) => `- ${g.label}: ${g.summary}`),
+    '- binary files (images, archives, compiled programs), found by their content',
+    `kept: ${EXCLUDED_KEPT.join(', ')}`,
+  ];
+}
+
 const EXCLUDE_MATCHERS = EXCLUDED_PATTERNS.map((p) => {
   const negated = p.startsWith('!');
   return { negated, match: picomatch(negated ? p.slice(1) : p, { dot: true, nocase: true }) };

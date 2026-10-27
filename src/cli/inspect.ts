@@ -1,14 +1,16 @@
 // `pipegen inspect` (Plan A Task 8): reads the project, then the repo's GitHub context and what GitHub allows there,
 // and prints a readable summary. Read-only: no AI call (so no consent), nothing written, only GET requests to
 // https://api.github.com. Works without a token on a public repo (anonymous) and says what it couldn't check.
-// Every repo-derived string passes safeText, and every line passes hideToken, so no token is ever printed.
+// Every repo- or GitHub-derived string passes safeOutput (ruling U10: the GitHub token and AI keys from the environment
+// scrubbed, then redact, then safeText; the same helper as the audit report), and every line passes hideToken, so no
+// token is ever printed, and a secret-like file, folder or service name is masked.
 import type { Octokit } from '@octokit/rest';
 import { isRateStop, newRateBudget, withRateLimit, type RateClock } from '../engine/github-rate.js';
 import { probeCapabilities, signingMode, SIGNING_ENVIRONMENT } from '../github/capabilities.js';
 import { getAuth, githubTokenRejected, GitHubAccessError, hideToken, makeOctokit, permissionsTable, readGitHubContext } from '../github/client.js';
 import { NotGitHubRepoError, readProject } from '../read/project.js';
 import type { Auth, Capabilities, RepoProfile, Service } from '../types.js';
-import { safeText } from '../util/safe-text.js';
+import { OUTPUT_CAP, safeOutput } from '../util/safe-output.js';
 import type { CliIO } from './io.js';
 
 type LocalProfile = Awaited<ReturnType<typeof readProject>>;
@@ -18,53 +20,57 @@ const I = '  ';
 const MAX_LIST = 30;
 const LOGIN_RE = /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})$/;
 
-const t = (s: string, max = 200) => safeText(s, max);
+/** Cleans one repo- or GitHub-derived string for the terminal (safeOutput with this run's known values). */
+type Clean = (s: string, max?: number) => string;
+/** The environment variables whose values inspect never prints: the GitHub token and the AI keys. */
+const KNOWN_VALUE_VARS = ['GITHUB_TOKEN', 'ANTHROPIC_API_KEY', 'OPENAI_API_KEY'] as const;
+
 const yesNo = (b: boolean) => (b ? 'yes' : 'no');
 /** Cleaned items joined with ", ", at most MAX_LIST, or `none`. */
-function list(items: readonly string[], none = 'none', max = 100): string {
+function list(t: Clean, items: readonly string[], none = 'none', max = 100): string {
   if (items.length === 0) return none;
   const shown = items.slice(0, MAX_LIST).map((s) => t(s, max));
   return items.length > MAX_LIST ? `${shown.join(', ')} and ${items.length - MAX_LIST} more` : shown.join(', ');
 }
 
-function serviceLines(s: Service): string[] {
+function serviceLines(t: Clean, s: Service): string[] {
   const deps = s.dependsOn.map((d) => `${d.kind}${d.name !== d.kind ? ` ${d.name}` : ''} (${d.evidence})`);
   return [
-    `${I}${t(s.name, 100)} (${t(s.path)})`,
+    `${I}${t(s.name, 100)} (${t(s.path, OUTPUT_CAP.path)})`,
     `${I}${I}Language: ${s.language}`,
     `${I}${I}Package manager: ${s.packageManager ?? 'unknown'}`,
     `${I}${I}Runtime: ${s.runtimeVersion === undefined ? 'not pinned' : t(s.runtimeVersion, 60)}`,
-    `${I}${I}Frameworks: ${list(s.frameworks)}`,
+    `${I}${I}Frameworks: ${list(t, s.frameworks)}`,
     ...(s.port === undefined ? [] : [`${I}${I}Port: ${s.port}`]),
     `${I}${I}Tests: ${s.hasTests ? `yes${s.testFramework === undefined ? '' : ` (${t(s.testFramework, 60)})`}` : 'none found'}`,
-    `${I}${I}Scripts: ${list(s.scripts)}`,
-    ...(s.dockerfile === undefined ? [] : [`${I}${I}Dockerfile: ${t(s.dockerfile)}`]),
-    `${I}${I}Env var names: ${list(s.envVars)}`,
-    `${I}${I}Dependencies: ${list(deps, 'none found', 200)}`,
+    `${I}${I}Scripts: ${list(t, s.scripts)}`,
+    ...(s.dockerfile === undefined ? [] : [`${I}${I}Dockerfile: ${t(s.dockerfile, OUTPUT_CAP.path)}`]),
+    `${I}${I}Env var names: ${list(t, s.envVars)}`,
+    `${I}${I}Dependencies: ${list(t, deps, 'none found', 200)}`,
   ];
 }
 
-function projectLines(p: LocalProfile): string[] {
+function projectLines(t: Clean, p: LocalProfile): string[] {
   const out = [
     'Project',
     `${I}Monorepo: ${p.monorepo}`,
     `${I}Docker Compose: ${yesNo(p.hasCompose)}`,
-    `${I}Terraform folders: ${list(p.terraformDirs)}`,
+    `${I}Terraform folders: ${list(t, p.terraformDirs, 'none', OUTPUT_CAP.path)}`,
     `${I}Hooks: ${p.precommit ?? 'none'}`,
     '',
     `Services (${p.services.length})`,
-    ...p.services.flatMap(serviceLines),
+    ...p.services.flatMap((s) => serviceLines(t, s)),
     '',
     `Workflows (${p.existingWorkflows.length})`,
   ];
   if (p.existingWorkflows.length === 0) out.push(`${I}none found`);
   for (const w of p.existingWorkflows) {
     out.push(
-      `${I}${t(w.path)}`,
-      `${I}${I}Triggers: ${list(w.triggers)}`,
-      `${I}${I}Jobs: ${list(w.jobs)}`,
+      `${I}${t(w.path, OUTPUT_CAP.path)}`,
+      `${I}${I}Triggers: ${list(t, w.triggers)}`,
+      `${I}${I}Jobs: ${list(t, w.jobs)}`,
       `${I}${I}Deploys: ${yesNo(w.deploys)}`,
-      `${I}${I}Secrets used: ${list(w.secretsUsed)}`,
+      `${I}${I}Secrets used: ${list(t, w.secretsUsed)}`,
     );
   }
   return out;
@@ -90,7 +96,7 @@ function signingText(p: RepoProfile, caps: Capabilities): string {
   }
 }
 
-function githubLines(p: RepoProfile, auth: Auth, caps: Capabilities): string[] {
+function githubLines(t: Clean, p: RepoProfile, auth: Auth, caps: Capabilities): string[] {
   const plan = p.plan === 'unknown' ? "unknown (GitHub shows an account's plan only to that account's own token, or to an organization member)" : p.plan;
   return [
     'GitHub',
@@ -137,6 +143,8 @@ export async function inspect(dir: string, io: CliIO, opts: { allowBroad: boolea
   const say = (s: string) => { io.out(hideToken(s, token)); };
   const fail = (s: string) => { io.err(hideToken(s, token)); };
   const notes: string[] = [];
+  const knownValues: string[] = KNOWN_VALUE_VARS.map((v) => io.env[v]).filter((v): v is string => typeof v === 'string');
+  const t: Clean = (s, max = OUTPUT_CAP.name) => safeOutput(s, { target: 'terminal', knownValues, max });
 
   let local: LocalProfile;
   try {
@@ -154,13 +162,15 @@ export async function inspect(dir: string, io: CliIO, opts: { allowBroad: boolea
   try {
     const auth = await getAuth({ owner, repos: [repo], allowBroad: opts.allowBroad, mode: 'read' }, { env: io.env, fetch: io.fetch, clock, notes });
     token = auth.token;
+    if (auth.token !== null) knownValues.push(auth.token);
     const gh = makeOctokit(auth.token, { fetch: io.fetch, clock, log: fail });
     const login = await tokenLogin(gh, auth, clock, notes);
     const ctx: GitHubContext = await readGitHubContext(gh, owner, repo, login, clock);
     const p: RepoProfile = { ...local, ...ctx };   // GitHub's default branch replaces the reader's 'main' stub
     const caps = await probeCapabilities(gh, owner, repo, p, notes, clock);
     if (auth.kind === 'anonymous') {
-      notes.unshift('Not checked without a token: the account\'s GitHub plan, and anything GitHub answers only to a token (see the other notes). '
+      // worded so redact() leaves it whole ("… token: …" would be cut at output)
+      notes.unshift('Without a token, pipegen couldn\'t check the account\'s GitHub plan, or anything GitHub answers only to a token (see the other notes). '
         + 'Set GITHUB_TOKEN to a read-only fine-grained token for this repo for a full check.');
     }
     github = { auth, p, caps };
@@ -172,14 +182,16 @@ export async function inspect(dir: string, io: CliIO, opts: { allowBroad: boolea
   say(`pipegen inspect: ${t(`${owner}/${repo}`)}`);
   say('Read-only: nothing was sent to an AI, and nothing was changed.');
   say('');
-  for (const line of projectLines(local)) say(line);
+  for (const line of projectLines(t, local)) say(line);
   say('');
   if ('error' in github) {
     say('GitHub: not read (the error is on stderr)');
-    fail(`GitHub: not read: ${t(github.error, 1200)}`);
+    // pipegen's own access message (already through hideToken): redact would cut its wording ("this token: …"), so it
+    // gets every step of safeOutput but redact, and hideToken again on the way out
+    fail(`GitHub: not read: ${safeOutput(github.error, { target: 'terminal', knownValues, max: 1200, redact: false })}`);
     fail('Not checked: visibility, plan, default branch, and what GitHub allows here.');
   } else {
-    for (const line of githubLines(github.p, github.auth, github.caps)) say(line);
+    for (const line of githubLines(t, github.p, github.auth, github.caps)) say(line);
     say('');
     say('Read-only permissions pipegen needs here (for a token or its GitHub App)');
     for (const r of permissionsTable('read')) say(`${I}- ${r.permission}: ${r.why}`);

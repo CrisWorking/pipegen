@@ -161,7 +161,8 @@ describe('pipegen inspect', () => {
   });
 
   it('cli: hostile values from GitHub (default branch) are cleaned too (review M6)', async () => {
-    const branch = `${hostileNames.osc8Link}${hostileNames.screenClear}${hostileNames.bidiOverride}${hostileNames.newlines}${hostileNames.veryLong}`;
+    // 1,000 characters: cut to the cap (a value over 4 KB is hidden whole by redact, checked below)
+    const branch = `${hostileNames.osc8Link}${hostileNames.screenClear}${hostileNames.bidiOverride}${hostileNames.newlines}${'a'.repeat(1000)}`;
     const routes = publicRoutes({ [`GET ${R}`]: { body: { private: false, default_branch: branch, owner: { type: 'User', login: 'o' } } } });
     const { code, out, all } = await inspect(richRepo(), routes);
     expect(code).toBe(0);
@@ -171,6 +172,9 @@ describe('pipegen inspect', () => {
     expect(out).not.toContain('a'.repeat(200)); // cut
     // no injected line: every line of the summary is one printed line
     expect(out.split('\n').filter((l) => l.startsWith('  Default branch:'))).toHaveLength(1);
+    const huge = await inspect(richRepo(), publicRoutes({ [`GET ${R}`]: { body: { private: false, default_branch: `${branch}${hostileNames.veryLong}`, owner: { type: 'User', login: 'o' } } } }));
+    expect(huge.out).toContain('Default branch: [REDACTED: line too long]');
+    expect(huge.all).not.toMatch(UNSAFE);
   });
 
   it('cli: without any token a public repo is read anonymously, and inspect says what it could not check', async () => {
@@ -179,7 +183,7 @@ describe('pipegen inspect', () => {
     expect(out).toMatch(/Access: no token/);
     expect(out).toMatch(/Plan: unknown/);
     expect(out).toContain("Couldn't check code scanning");
-    expect(out).toMatch(/Not checked without a token/);
+    expect(out).toMatch(/Without a token, pipegen couldn't check the account's GitHub plan/);
     expect(calls.every((c) => !('authorization' in c.headers))).toBe(true);
   });
 
@@ -204,6 +208,24 @@ describe('pipegen inspect', () => {
     expect(out).toMatch(/Access: fine-grained token/);
     expect(calls.some((c) => c.url.pathname === '/user')).toBe(true);
     expect(out).not.toContain(cred);
+  });
+
+  it('cli: inspect masks secret-like and known values in names, like the audit report (ruling U10)', async () => {
+    const cred = fake.awsKey();
+    const known = `kv${'Q7'.repeat(12)}z`; // an AI key redact doesn't recognise: only the known-value scrub catches it
+    const dir = richRepo();
+    writeIn(dir, `svc-${cred}/package.json`, JSON.stringify({ name: `svc-${cred}`, scripts: { start: 'node .' } }));
+    writeIn(dir, `${known}/package.json`, JSON.stringify({ name: `${known}-api`, scripts: { start: 'node .' } }));
+    writeIn(dir, `.github/workflows/${known}.yml`, 'on: push\njobs:\n  a:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n');
+    const plain = await inspect(dir, publicRoutes());
+    expect(plain.code).toBe(0);
+    expect(plain.out).toContain(known); // planted: without the known value it shows
+    const { code, all } = await inspect(dir, publicRoutes(), { [ANTHROPIC_VAR]: known });
+    expect(code).toBe(0);
+    expect(all).not.toContain(cred);
+    expect(all).not.toContain(known);
+    expect(all).toContain('REDACTED');
+    expect(all).toContain('express-app'); // the rest still prints
   });
 
   it('cli: inspect never prints the token, even when GitHub echoes it back', async () => {
