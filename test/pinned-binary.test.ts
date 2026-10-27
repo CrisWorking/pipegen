@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto';
 import { chmodSync, existsSync, lutimesSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
+import { parse } from 'yaml';
 import { dirname, join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
@@ -28,9 +29,11 @@ vi.mock('node:child_process', async (importOriginal) => {
 afterEach(() => {
   cleanupRepos();
   spawned.length = 0;
+  vi.unstubAllEnvs();
 });
 
 const NOW = Date.parse('2026-10-26T12:00:00Z');
+const PINS_FILE = join(import.meta.dirname, '..', 'data', 'pinned-binaries.yml');
 const DAY = 86_400_000;
 const OLD = '2026-09-01T10:00:00Z';
 const DL = 'https://github.com';
@@ -82,7 +85,10 @@ function setup(opts: {
   };
   const asset = { ...base, ...opts.asset?.(base, archive, binary) };
   const platforms = { 'linux-x64': asset, 'linux-arm64': asset, 'darwin-x64': asset, 'darwin-arm64': asset };
-  const entry = { version: VERSION, repo: 'gitleaks/gitleaks', releasedAt: opts.releasedAt ?? OLD, member: 'gitleaks', platforms };
+  const releasedAt = opts.releasedAt ?? OLD;
+  // pinned the cooldown after its release; still waiting for review (dev and test builds load it)
+  const pinnedOn = new Date(Date.parse(releasedAt) + COOLDOWN_DAYS * DAY).toISOString();
+  const entry = { version: VERSION, repo: 'gitleaks/gitleaks', releasedAt, pinnedOn, reviewedBy: 'PENDING', reviewedAt: 'PENDING', member: 'gitleaks', platforms };
   const pins = {
     gitleaks: entry,
     actionlint: { ...entry, repo: 'rhysd/actionlint', member: 'actionlint', platforms: rehost(platforms, 'rhysd/actionlint', 'actionlint') },
@@ -494,11 +500,59 @@ describe('pinned-binaries.yml', () => {
     }
   });
 
-  it(`pinned-binaries.yml: every release was at least ${COOLDOWN_DAYS} days old when pinned (ruling S26)`, () => {
-    const pinnedOn = Date.parse('2026-10-26T00:00:00Z');
-    for (const [name, entry] of Object.entries(loadPinnedBinaries())) {
-      expect(pinnedOn - Date.parse(entry.releasedAt), name).toBeGreaterThanOrEqual(COOLDOWN_DAYS * DAY);
+  it(`pinned-binaries.yml: every release was at least ${COOLDOWN_DAYS} days old when pinned, by the pinnedOn the file records (ruling S26, M5)`, () => {
+    // read raw from the file, so the test checks what the file says rather than a date written into the test
+    const raw = parse(readFileSync(PINS_FILE, 'utf8')) as Record<string, { pinnedOn?: unknown; releasedAt: string }>;
+    for (const [name, entry] of Object.entries(raw)) {
+      expect(typeof entry.pinnedOn, name).toBe('string');
+      expect(Date.parse(entry.pinnedOn as string) - Date.parse(entry.releasedAt), name).toBeGreaterThanOrEqual(COOLDOWN_DAYS * DAY);
     }
+  });
+
+  it('pinned-binaries.yml: every entry carries pinnedOn and a review marker, PENDING until reviewed (final review I2)', () => {
+    for (const [name, entry] of Object.entries(loadPinnedBinaries())) {
+      expect(entry.pinnedOn, name).toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$/);
+      const pending = entry.reviewedBy === 'PENDING';
+      expect(entry.reviewedAt === 'PENDING', name).toBe(pending);
+      if (!pending) expect(entry.reviewedAt >= entry.pinnedOn.slice(0, 10), name).toBe(true);
+    }
+    const good = loadPinnedBinaries();
+    const g = good.gitleaks;
+    const bad: [string, unknown][] = [
+      ['no reviewedBy', { ...good, gitleaks: (({ reviewedBy: _r, ...rest }) => rest)(g) }],
+      ['no reviewedAt', { ...good, gitleaks: (({ reviewedAt: _r, ...rest }) => rest)(g) }],
+      ['no pinnedOn', { ...good, gitleaks: (({ pinnedOn: _r, ...rest }) => rest)(g) }],
+      ['lower-case pending', { ...good, gitleaks: { ...g, reviewedBy: 'pending', reviewedAt: 'PENDING' } }],
+      ['name without a date', { ...good, gitleaks: { ...g, reviewedBy: 'Cristiano Pereira', reviewedAt: 'PENDING' } }],
+      ['date without a name', { ...good, gitleaks: { ...g, reviewedBy: 'PENDING', reviewedAt: '2026-11-01' } }],
+      ['zero-width name', { ...good, gitleaks: { ...g, reviewedBy: 'Cris\u200btiano', reviewedAt: '2026-11-01' } }],
+      ['not a real date', { ...good, gitleaks: { ...g, reviewedBy: 'Cristiano Pereira', reviewedAt: '2026-02-30' } }],
+      ['review before the pin', { ...good, gitleaks: { ...g, reviewedBy: 'Cristiano Pereira', reviewedAt: '2026-01-01' } }],
+      ['pinned inside the cooldown', { ...good, gitleaks: { ...g, pinnedOn: new Date(Date.parse(g.releasedAt) + DAY).toISOString().replace(/\.\d+Z$/, 'Z') } }],
+    ];
+    for (const [what, value] of bad) expect(pinnedBinariesSchema.safeParse(value).success, what).toBe(false);
+    const reviewed = { ...good, gitleaks: { ...g, reviewedBy: 'Cristiano Pereira', reviewedAt: '2026-11-01' } };
+    expect(pinnedBinariesSchema.safeParse(reviewed).success).toBe(true);
+  });
+
+  it('pinned-binaries.yml: a release build refuses PENDING entries, like loadReviewed (PIPEGEN_RELEASE or NODE_ENV=production); dev and test builds load them (final review I2)', async () => {
+    expect(loadPinnedBinaries().gitleaks.version).toMatch(/^\d+\.\d+\.\d+$/); // dev/test: allowed, so the live gitleaks test still runs
+    const s = setup(); // its entries are PENDING
+    for (const [k, v] of [['NODE_ENV', 'production'], ['PIPEGEN_RELEASE', '1']] as const) {
+      vi.stubEnv(k, v);
+      expect(() => loadPinnedBinaries(), k).toThrow(/wait for human review/);
+      const d = s.deps();
+      await expect(ensurePinnedBinary('gitleaks', s.cache, d), k).rejects.toThrow(/wait for human review/);
+      expect(d.calls, k).toHaveLength(0); // refused before any download
+      vi.unstubAllEnvs();
+    }
+    // once every entry is reviewed, a release build uses them
+    vi.stubEnv('NODE_ENV', 'production');
+    const done = Object.fromEntries(Object.entries(s.pins).map(([n, e]) => [n, { ...e, reviewedBy: 'Cristiano Pereira', reviewedAt: '2026-11-01' }])) as PinnedBinaries;
+    await expect(ensurePinnedBinary('gitleaks', s.cache, s.deps({ pins: done }))).resolves.toContain('gitleaks');
+    // one PENDING entry is enough to refuse, even for another tool
+    const oneLeft = { ...done, cosign: { ...done.cosign, reviewedBy: 'PENDING', reviewedAt: 'PENDING' } } as PinnedBinaries;
+    await expect(ensurePinnedBinary('gitleaks', s.cache, s.deps({ pins: oneLeft }))).rejects.toThrow(/cosign/);
   });
 
   it('pinned-binaries.yml: the loader refuses non-https, non-GitHub, mismatched or malformed entries', () => {

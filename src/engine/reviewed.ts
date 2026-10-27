@@ -6,7 +6,7 @@
 // - Until the owner reviews an entry it says `reviewedBy: PENDING`. A release build refuses the list while any entry
 //   is PENDING (ruling S21): the bundled dist defines process.env.PIPEGEN_RELEASE (tsup `define`), and
 //   NODE_ENV=production counts too. Tests and dev runs (src, no define) load PENDING entries so the list can be
-//   built and reviewed.
+//   built and reviewed. The marker rules live in review-marker.ts, shared with pinned-binaries.yml.
 // - nearDuplicate is the typosquat check: any reviewed `owner/name` within Levenshtein distance 2 (lowercased, whole
 //   name, any owner: ruling S31) that isn't the same repo → the reviewed entry it imitates. Discovery drops it.
 // - packageExists asks npm or PyPI whether an exact version exists, with no credential and no redirect (rulings
@@ -26,6 +26,7 @@ import {
 import { NEED_ID_CATEGORY } from './need-ids.js';
 import { fetchAllowed, HttpError } from './http.js';
 import { COOLDOWN_DAYS } from './pin.js';
+import { isReleaseBuild, listPending, PENDING, REVIEWER_RE, reviewMarkerProblems } from './review-marker.js';
 
 /** A built-in step that runs the project's own script. Not a reviewed third-party entry, so it has no pin. */
 export interface ProjectScriptStep { kind: 'project-script'; needId: string; service: string; script: 'test' | 'lint'; workingDir?: string }
@@ -34,7 +35,7 @@ export interface ProjectScriptStep { kind: 'project-script'; needId: string; ser
 export const TOOL_CATEGORIES = [...NEED_CATEGORIES, 'platform', 'egress', 'workflow-lint'] as const;
 const LANGUAGES = ['node', 'python', 'go', 'java', 'dotnet', 'ruby', 'php', 'other', 'any'] as const satisfies readonly (Language | 'any')[];
 
-export const PENDING = 'PENDING';
+export { PENDING } from './review-marker.js';
 
 export class ReviewedListError extends Error {
   constructor(message: string, options?: { cause?: unknown }) {
@@ -57,8 +58,6 @@ const INPUT_RE = /^[A-Za-z_][A-Za-z0-9_-]{0,63}$/;
 const ENV_RE = /^[A-Za-z_][A-Za-z0-9_]{0,127}$/;
 const FLAG_RE = /^-{1,2}[A-Za-z][A-Za-z0-9-]{0,63}$/;
 const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
-/** A reviewer's name: printable letters and digits, spaces, `.`, `'` and `-` only (no zero-width or control characters). */
-const REVIEWER_RE = /^[\p{L}\p{N} .'-]{2,80}$/u;
 const DAY_MS = 86_400_000;
 const ISO_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?Z$/;
 /** A repo-relative path or glob: no absolute path, no `..`, no backslash. */
@@ -183,10 +182,9 @@ function entryProblems(e: Entry): { message: string; path: (string | number)[] }
   if (!unique(e.categories)) bad('a category is listed twice', 'categories');
   if (!unique(e.languages)) bad('a language is listed twice', 'languages');
 
-  // reviewedBy and reviewedAt go together: both exactly PENDING, or a name and a real review date
-  if (e.reviewedBy !== PENDING && e.reviewedBy.trim().toUpperCase() === PENDING) bad('reviewedBy must be PENDING exactly (upper case, no spaces) or a name', 'reviewedBy');
-  if ((e.reviewedBy === PENDING) !== (e.reviewedAt === PENDING)) bad('reviewedBy and reviewedAt must both be PENDING, or a name and a date', 'reviewedAt');
-  if (e.reviewedAt !== PENDING && !isRealDate(e.reviewedAt)) bad('reviewedAt must be a real date (YYYY-MM-DD)', 'reviewedAt');
+  // reviewedBy and reviewedAt go together: both exactly PENDING, or a name and a real review date (the rule
+  // pinned-binaries.yml uses too; the file-level check adds "not before pinnedOn")
+  for (const p of reviewMarkerProblems(e.reviewedBy, e.reviewedAt, null)) bad(p.message, p.field);
 
   // ---- the exact pin, and a step that runs exactly the pinned tool ----
   const { sha, checksum, digest } = c.pin;
@@ -296,13 +294,6 @@ function entryProblems(e: Entry): { message: string; path: (string | number)[] }
   return out;
 }
 
-/** A YYYY-MM-DD date that exists in the calendar. */
-function isRealDate(s: string): boolean {
-  if (!DATE_RE.test(s)) return false;
-  const d = new Date(`${s}T00:00:00Z`);
-  return Number.isFinite(d.getTime()) && d.toISOString().slice(0, 10) === s;
-}
-
 /** Ruling S22: Semgrep rules come from a pinned archive (40-hex commit SHA + sha256), never the registry or auto. */
 function semgrepProblems(e: Entry): { message: string; path: (string | number)[] }[] {
   const out: { message: string; path: (string | number)[] }[] = [];
@@ -350,12 +341,6 @@ function isSubsequence(needle: readonly string[], hay: readonly string[]): boole
 
 // ---------- loading ----------
 
-/** True in a release build: the bundled dist (tsup defines PIPEGEN_RELEASE, ruling S21) or NODE_ENV=production. */
-function isReleaseBuild(): boolean {
-  // written out in full so tsup's `define` replaces it in the bundle
-  return process.env.PIPEGEN_RELEASE === '1' || process.env.NODE_ENV === 'production';
-}
-
 /**
  * Reads and checks the reviewed tool list (default: pipegen's own data/reviewed-tools.yml). Every candidate is
  * exactly pinned and `reviewed: true`; every entry declares configFiles and fixedInputs. Throws ReviewedListError on
@@ -384,8 +369,7 @@ export function loadReviewed(path: string = packageDataPath('reviewed-tools.yml'
   if (isReleaseBuild()) {
     const pending = entries.filter((t) => t.reviewedBy === PENDING).map((t) => t.id);
     if (pending.length > 0) {
-      const shown = pending.length > 6 ? `${pending.slice(0, 6).join(', ')} and ${pending.length - 6} more` : pending.join(', ');
-      throw new ReviewedListError(`This pipegen release refuses its reviewed tool list: ${pending.length} entries still wait for human review (${shown}). Nothing unreviewed may run in your CI.`);
+      throw new ReviewedListError(`This pipegen release refuses its reviewed tool list: ${pending.length} entries still wait for human review (${listPending(pending)}). Nothing unreviewed may run in your CI.`);
     }
   }
   return entries.map(toReviewedTool);

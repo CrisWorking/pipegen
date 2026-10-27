@@ -70,14 +70,24 @@ describe('build', () => {
       const err = e as { status?: number; stderr?: string };
       throw new Error(`probe exited with ${err.status}: ${String(err.stderr).split('\n').slice(0, 8).join('\n')}`);
     }
-    const result = JSON.parse(stdout.trim()) as { owner: string; repo: string; services: string[]; files: number; bytes: number; gitleaksChecked: boolean; providers: string[]; pushJobs: number; needsSchemaKeys: string[]; qualityBar: unknown; qualityReasons: number; pinnedBinaries: unknown; bundledMemory: unknown; reviewed: { loaded?: number; refused?: string }; aiPrices: unknown; githubPlans: unknown; estimate: { setupMinutes: number; includedMinutes: number | null; aiCostCapUsd: number | null } };
+    const result = JSON.parse(stdout.trim()) as { owner: string; repo: string; services: string[]; files: number; bytes: number; gitleaksChecked: boolean; providers: string[]; pushJobs: number; needsSchemaKeys: string[]; qualityBar: unknown; qualityReasons: number; pinnedBinaries: { loaded?: unknown; refused?: string }; bundledMemory: unknown; reviewed: { loaded?: number; refused?: string }; aiPrices: unknown; githubPlans: unknown; estimate: { setupMinutes: number; includedMinutes: number | null; aiCostCapUsd: number | null } };
     expect(result).toMatchObject({ owner: 'o', repo: 'r', services: ['.'], gitleaksChecked: false, providers: ['claude', 'openai', 'ollama'] });
     expect(result.pushJobs).toBe(6); // hooks-ci, secrets + sast, deps, unit-tests, lint for the one service
     expect(result.needsSchemaKeys).toEqual(['add', 'skipLayers', 'requireDeployApproval']);
     expect(result.qualityBar).toEqual(loadQualityBar()); // read from <pkg>/data/quality-bar.yml by the bundled loader
     expect(result.qualityReasons).toBe(3); // few stars, no releases, advisories unknown
     expect(result.bundledMemory).toEqual([]); // data/memory.json, read by the bundled loader
-    expect(result.pinnedBinaries).toEqual(loadPinnedBinaries()); // read from <pkg>/data/pinned-binaries.yml by the bundled loader
+    // read from <pkg>/data/pinned-binaries.yml by the bundled loader: like the reviewed list, the release build refuses
+    // it while any entry is still PENDING review (final review I2), and loads it once every entry is reviewed
+    const pins = parse(readFileSync(resolve(root, 'data/pinned-binaries.yml'), 'utf8')) as Record<string, { reviewedBy: string }>;
+    const pendingPins = Object.entries(pins).filter(([, e]) => e.reviewedBy === 'PENDING').map(([n]) => n);
+    if (pendingPins.length > 0) {
+      expect(result.pinnedBinaries).toEqual({ refused: expect.stringMatching(/wait for human review/) });
+      for (const n of pendingPins) expect(result.pinnedBinaries.refused).toContain(n);
+    } else {
+      expect(result.pinnedBinaries).toEqual({ loaded: loadPinnedBinaries() });
+    }
+    expect(Object.keys(loadPinnedBinaries()).sort()).toEqual(['actionlint', 'cosign', 'gitleaks']); // from src (dev build): loads
     expect(result.aiPrices).toEqual(loadAiPrices()); // read from <pkg>/data/ai-prices.yml by the bundled loader
     expect(result.githubPlans).toEqual(loadGitHubPlans()); // read from <pkg>/data/github-plans.yml by the bundled loader
     expect(result.estimate.includedMinutes).toBe(2000); // private Free repo

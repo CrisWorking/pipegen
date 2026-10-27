@@ -36,6 +36,14 @@ try {
 } catch (e) {
   reviewed = { refused: e instanceof Error ? e.message : String(e) };
 }
+// data/pinned-binaries.yml through the bundled loader: the release build refuses it the same way while any entry is
+// still PENDING review (final review I2)
+let pinnedBinaries: { loaded: unknown } | { refused: string };
+try {
+  pinnedBinaries = { loaded: loadPinnedBinaries() };
+} catch (e) {
+  pinnedBinaries = { refused: e instanceof Error ? e.message : String(e) };
+}
 const verdict = checkQualityBar({ repo: 'o/r', stars: 1, archived: false, lastReleaseAt: null, scorecard: null, scorecardAt: null, verifiedPublisher: false, license: 'MIT', advisories: null }, qualityBar, new Date());
 console.log(JSON.stringify({
   owner: profile.owner,
@@ -50,8 +58,8 @@ console.log(JSON.stringify({
   needsSchemaKeys: Object.keys((needsSchema(full).jsonSchema as { properties: object }).properties),
   qualityBar,
   qualityReasons: verdict.reasons.length,
-  // data/pinned-binaries.yml, read and validated by the bundled loader
-  pinnedBinaries: loadPinnedBinaries(),
+  // data/pinned-binaries.yml, read and validated by the bundled loader (refused while any entry is PENDING)
+  pinnedBinaries,
   // data/memory.json, read and validated by the bundled loader
   bundledMemory: await loadBundledMemory(),
   reviewed,

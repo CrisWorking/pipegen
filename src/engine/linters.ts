@@ -16,8 +16,11 @@
 //   as /tmp is fine), so nobody else can swap the binary between its check and its use.
 // - Before EVERY return (a fresh download or a cached copy) the file is hashed again through one descriptor. On a
 //   hash mismatch it is deleted and an error is raised: it is never run. Parallel runs are safe.
-// - v0.1 supports linux and darwin on x64 and arm64 (ruling S27). The 7-day cooldown (S26) is checked on the data
-//   file by a test, not at run time.
+// - v0.1 supports linux and darwin on x64 and arm64 (ruling S27). The 7-day cooldown (S26) is checked against each
+//   entry's own pinnedOn when the file is read (and by a data-file test), not against today's date.
+// - Like reviewed-tools.yml, every entry carries a human-review marker (reviewedBy / reviewedAt, PENDING until the
+//   owner reviews it; review-marker.ts). A release build (PIPEGEN_RELEASE or NODE_ENV=production) refuses the
+//   file while any entry is PENDING, before anything is downloaded; dev and test builds load it (final review I2).
 import { createHash, randomBytes } from 'node:crypto';
 import { constants, readFileSync } from 'node:fs';
 import { lstat, open, readdir, rename, rm, unlink } from 'node:fs/promises';
@@ -31,7 +34,8 @@ import { packageDataPath } from '../util/package-data.js';
 import { safeText } from '../util/safe-text.js';
 import { prepareTrustedDir, type TrustedDirKind } from '../util/trusted-dir.js';
 import { TarError, readTarMember } from '../util/tar.js';
-import { downloadRelease } from './pin.js';
+import { COOLDOWN_DAYS, downloadRelease } from './pin.js';
+import { isReleaseBuild, listPending, PENDING, reviewMarkerProblems } from './review-marker.js';
 import { ASSET_RE, isGitHubRepo, SHA256_RE } from './names.js';
 
 export type PinnedName = 'actionlint' | 'cosign' | 'gitleaks';
@@ -46,6 +50,7 @@ const MAX_BINARY_BYTES = 512 * 1024 * 1024;
 export const TAR_SLACK_BYTES = 16 * 1024 * 1024;
 const ISO_DATE_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?Z$/;
 const READ_CHUNK = 1024 * 1024;
+const DAY_MS = 86_400_000;
 
 const assetSchema = z.object({
   url: z.string(),
@@ -62,10 +67,19 @@ const entrySchema = z.object({
   version: z.string().regex(/^\d+\.\d+\.\d+$/),
   repo: z.string().refine(isGitHubRepo, 'not a GitHub owner/name'),
   releasedAt: z.string().regex(ISO_DATE_RE),
+  /** When this entry was pinned; releasedAt must be at least the cooldown before it (ruling S26). */
+  pinnedOn: z.string().regex(ISO_DATE_RE),
+  /** The human review (review-marker.ts): PENDING until the owner reviews the entry, then a name and a date. */
+  reviewedBy: z.string().max(100),
+  reviewedAt: z.string().max(20),
   /** The file to take out of the archive (a plain name, no directory). */
   member: z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/),
   platforms: z.object(Object.fromEntries(PLATFORM_KEYS.map((k) => [k, assetSchema])) as Record<PlatformKey, typeof assetSchema>).strict(),
 }).strict().superRefine((e, ctx) => {
+  for (const p of reviewMarkerProblems(e.reviewedBy, e.reviewedAt, e.pinnedOn.slice(0, 10))) ctx.addIssue({ code: 'custom', path: [p.field], message: p.message });
+  if (!(Date.parse(e.pinnedOn) - Date.parse(e.releasedAt) >= COOLDOWN_DAYS * DAY_MS)) {
+    ctx.addIssue({ code: 'custom', path: ['pinnedOn'], message: `the release must be at least ${COOLDOWN_DAYS} days older than pinnedOn (cooldown, ruling S26)` });
+  }
   for (const key of PLATFORM_KEYS) {
     if (!isReleaseUrl(e.platforms[key].url, e.repo, e.version)) {
       ctx.addIssue({ code: 'custom', path: ['platforms', key, 'url'], message: `must be https://github.com/${e.repo}/releases/download/v${e.version}/<asset>` });
@@ -111,11 +125,18 @@ export function loadPinnedBinaries(path: string = packageDataPath('pinned-binari
   return checkPins(raw);
 }
 
+/** Validates the pins; a release build also refuses them while any entry is PENDING review (like loadReviewed). */
 function checkPins(raw: unknown): PinnedBinaries {
   const parsed = pinnedBinariesSchema.safeParse(raw);
   if (!parsed.success) {
     const where = parsed.error.issues[0]?.path.join('.') ?? '';
     throw new PinnedBinaryError(`pipegen's pinned-binaries data is invalid${where === '' ? '' : ` (at ${where})`}.`);
+  }
+  if (isReleaseBuild()) {
+    const pending = PINNED_NAMES.filter((n) => parsed.data[n].reviewedBy === PENDING);
+    if (pending.length > 0) {
+      throw new PinnedBinaryError(`This pipegen release refuses its pinned binaries: ${pending.length} of them still wait for human review (${listPending([...pending])}). pipegen runs nothing unreviewed on your machine.`);
+    }
   }
   return parsed.data;
 }
