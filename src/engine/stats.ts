@@ -82,9 +82,9 @@ const advisoriesSchema = z.array(z.object({ withdrawn_at: z.string().nullish() }
 const npmAttestationsSchema = z.object({
   attestations: z.array(z.object({ predicateType: z.string(), bundle: z.object({ dsseEnvelope: z.object({ payload: z.string() }) }) })),
 });
-const npmVersionSchema = z.object({ repository: z.union([z.string(), z.object({ url: z.unknown() })]).nullish() });
+const npmVersionSchema = z.object({ version: z.string().nullish(), repository: z.union([z.string(), z.object({ url: z.unknown() })]).nullish() });
 const pypiReleaseSchema = z.object({
-  info: z.object({ home_page: z.unknown(), project_urls: z.record(z.string(), z.unknown()).nullish() }).nullish(),
+  info: z.object({ version: z.string().nullish(), home_page: z.unknown(), project_urls: z.record(z.string(), z.unknown()).nullish() }).nullish(),
   urls: z.array(z.object({ filename: z.string() })).nullish(),
 });
 const pypiProvenanceSchema = z.object({ attestation_bundles: z.array(z.object({ publisher: z.object({ kind: z.string(), repository: z.string().nullish() }) })) });
@@ -248,6 +248,15 @@ export async function fetchStats(c: Candidate, deps: StatsDeps, install?: Instal
     return [info?.home_page, ...Object.values(info?.project_urls ?? {})].some(same);
   }
 
+  /** The registry's latest version of the package (npm `/latest`, PyPI's project JSON), checked; null when unreadable. */
+  async function registryLatestVersion(t: { ecosystem: 'npm' | 'PyPI'; package: string }): Promise<string | null> {
+    const body = await registryMetadata(t); // no version label → the latest document
+    const raw = t.ecosystem === 'npm' ? npmVersionSchema.safeParse(body).data?.version : pypiReleaseSchema.safeParse(body).data?.info?.version;
+    if (typeof raw !== 'string') return null;
+    const v = advisoryVersion(raw, shape);
+    return v !== null && v === raw && isFull(v, shape) ? v : null;
+  }
+
   /** The full version label (install spec's or candidate's), for the registry's per-version provenance. */
   function exactVersion(): string | null {
     if (typeof label !== 'string' || label === '') return null;
@@ -400,7 +409,9 @@ export async function fetchStats(c: Candidate, deps: StatsDeps, install?: Instal
    * - Pinned commit: the full version tags on that commit (advisory databases take versions, not SHAs). A label
    *   (install spec's or candidate's version) must be one of the tags there, or a partial label (4, 4.2) fitting a
    *   full one; else null.
-   * - No pinned commit: the label, else the latest release's tag (ruling S19). It must be a full x.y.z version.
+   * - No pinned commit: the label; else, for an npm or PyPI package, the registry's latest version (final review M4:
+ *   never the GitHub release tag, which can differ from the package's version); else (an action) the latest
+ *   release's tag (ruling S19). It must be a full x.y.z version.
    * null + a note when there is none.
    */
   async function versionsToCheck(): Promise<string[] | null> {
@@ -442,6 +453,14 @@ export async function fetchStats(c: Candidate, deps: StatsDeps, install?: Instal
       return full;
     }
     let v = labelV;
+    if (v === null && target.db === 'osv') {
+      // final review M4: a package's version is the registry's, never the GitHub release tag (they can differ)
+      v = await registryLatestVersion(target);
+      if (v === null) {
+        note(`The registry gives no latest version of ${target.package} that pipegen can look up, ${unchecked}`);
+        return null;
+      }
+    }
     if (v === null) {
       if (latest === null) {
         note(`${repo} has no published release to check for known vulnerabilities.`);

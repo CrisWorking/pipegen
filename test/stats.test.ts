@@ -207,6 +207,25 @@ describe('stats', () => {
     expect(affects(ghCalls)).toEqual(['o/r@1.2.3']);
   });
 
+  it('stats: an npm or PyPI package with no version label → the registry\'s latest version is checked, never the GitHub release tag (final review M4)', async () => {
+    const osvVersions = (calls: Call[]) => calls.filter((c) => c.url.href === OSV).map((c) => JSON.parse(c.body ?? '{}').version as string);
+    // npm: /latest says 2.0.1; the GitHub release tag is v1.2.3
+    const n = setup();
+    expect((await fetchStats(pkgCand(), n.deps, npm('tool', ''))).advisories).toBe(0);
+    expect(osvVersions(n.netCalls)).toEqual(['2.0.1']);
+    // PyPI: the project's JSON says 1.4.0rc1
+    const p = setup(github(), web({ [`GET ${PYPI}/pypi/some-tool/json`]: { body: { info: { version: '1.4.0rc1', home_page: null, project_urls: { Source: 'https://github.com/o/r' } }, urls: [] } } }));
+    expect((await fetchStats(pkgCand(), p.deps, pip('some_tool', ''))).advisories).toBe(0);
+    expect(osvVersions(p.netCalls)).toEqual(['1.4.0rc1']);
+    // the registry gives no usable latest version → advisories null with a note, still never the release tag
+    for (const latest of [{ ...npmVersion('github:o/r'), body: { name: 'tool', repository: 'github:o/r' } }, { body: { name: 'tool', version: '2', repository: 'github:o/r' } }]) {
+      const bad = setup(github(), web({ [`GET ${NPM}/tool/latest`]: latest }));
+      expect((await fetchStats(pkgCand(), bad.deps, npm('tool', ''))).advisories).toBeNull();
+      expect(osvVersions(bad.netCalls)).toEqual([]);
+      expect(bad.notes.join('\n')).toMatch(/latest version/i);
+    }
+  });
+
   it('stats: npm version "4" (partial, no SHA) → advisories null', async () => {
     for (const version of ['4', '4.2', 'v4']) {
       const { deps, netCalls, notes } = setup();
