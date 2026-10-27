@@ -69,8 +69,8 @@ function listItems(items: string[]): string {
 }
 
 const LINK = /https?:\/\/\S*/gi;
-/** AI text for display: links removed (before and after cleaning, so a control character can't hide one), then safeText. */
-function cleanAiText(s: string): string {
+/** AI text for display: links removed (before and after cleaning, so a control character can't hide one), then safeText. Also used by discovery. */
+export function cleanAiText(s: string): string {
   const noLinks = (t: string) => t.replace(LINK, '(link removed)');
   return formatAiText(noLinks(formatAiText(noLinks(s), 4000)));
 }
