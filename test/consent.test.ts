@@ -18,13 +18,14 @@ import { hostileNames } from './fixtures/hostile-names.js';
 import { CLEAN, makeStub } from './helpers/gitleaks-stub.js';
 import { cleanupRepos, makeTempDir, writeIn } from './helpers/make-repo.js';
 import { fake } from './helpers/secret-repo.js';
+import { emptyRepoFiles, emptyServiceQuality } from '../src/read/quality.js';
 
 const svc = (over: Partial<Service> = {}): Service => ({
-  name: 'web', path: '.', language: 'node', packageManager: 'npm', hasTests: true, envVars: [], dependsOn: [], scripts: ['test'], frameworks: ['express'], ...over,
+  name: 'web', path: '.', language: 'node', packageManager: 'npm', hasTests: true, envVars: [], dependsOn: [], scripts: ['test'], frameworks: ['express'], quality: emptyServiceQuality(), ...over,
 });
 const profile = (over: Partial<RepoProfile> = {}): RepoProfile => ({
   owner: 'acme', repo: 'shop', defaultBranch: 'main', private: true, ownerType: 'User', plan: 'free',
-  monorepo: 'none', services: [svc()], terraformDirs: [], hasCompose: false, existingWorkflows: [], precommit: null, ...over,
+  monorepo: 'none', services: [svc()], terraformDirs: [], hasCompose: false, existingWorkflows: [], precommit: null, repoFiles: emptyRepoFiles(), ...over,
 });
 const CAPS: Capabilities = { branchProtection: false, environments: true, deploymentBranchPolicies: false, envRequiredReviewers: false, attestations: false, codeScanning: false, keylessSigningAllowed: false };
 const provider = (name: AiProvider['name'], model: string): AiProvider => ({ name, model, complete: async () => { throw new Error('no AI call in consent tests'); } });

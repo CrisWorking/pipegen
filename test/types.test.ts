@@ -1,12 +1,13 @@
 import { describe, expect, it } from 'vitest';
 import type { PipelineDraft, RepoProfile } from '../src/types.js';
 import { GATE_CHECK_NAME, NEED_CATEGORIES } from '../src/types.js';
+import { emptyRepoFiles } from '../src/read/quality.js';
 
 describe('types', () => {
   it('contracts compile', () => {
     const profile: RepoProfile = {
       owner: 'o', repo: 'x', defaultBranch: 'main', private: false, ownerType: 'User', plan: 'free',
-      monorepo: 'none', services: [], terraformDirs: [], hasCompose: false, existingWorkflows: [], precommit: null,
+      monorepo: 'none', services: [], terraformDirs: [], hasCompose: false, existingWorkflows: [], precommit: null, repoFiles: emptyRepoFiles(),
     };
     const draft: PipelineDraft = {
       profile,

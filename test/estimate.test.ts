@@ -12,16 +12,17 @@ import {
 } from '../src/estimate/estimate.js';
 import { DEFAULT_MODEL, type Capabilities, type ExistingWorkflow, type RepoProfile, type Service } from '../src/types.js';
 import { fakeOctokit, type Call, type Reply } from './helpers/fake-http.js';
+import { emptyRepoFiles, emptyServiceQuality } from '../src/read/quality.js';
 
 // ---------- builders ----------
 
 const svc = (over: Partial<Service> = {}): Service => ({
   name: 'web', path: '.', language: 'node', packageManager: 'npm', hasTests: true, envVars: [], dependsOn: [],
-  scripts: ['start', 'test'], frameworks: ['express'], ...over,
+  scripts: ['start', 'test'], frameworks: ['express'], quality: emptyServiceQuality(), ...over,
 });
 const profile = (over: Partial<RepoProfile> = {}): RepoProfile => ({
   owner: 'o', repo: 'r', defaultBranch: 'main', private: true, ownerType: 'User', plan: 'free',
-  monorepo: 'none', services: [svc()], terraformDirs: [], hasCompose: false, existingWorkflows: [], precommit: null, ...over,
+  monorepo: 'none', services: [svc()], terraformDirs: [], hasCompose: false, existingWorkflows: [], precommit: null, repoFiles: emptyRepoFiles(), ...over,
 });
 // ExistingWorkflow is built from a field list (one field name holds "secret", which the secret-literal check watches).
 const WORKFLOW_FIELDS = ['path', 'triggers', 'deploys', 'secretsUsed', 'jobs'] as const;

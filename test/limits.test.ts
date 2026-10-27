@@ -2,7 +2,7 @@ import { chmodSync, mkdirSync, symlinkSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import fg from 'fast-glob';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { READ_LIMITS, isBinary, listFiles, parseYamlLimited, readTextLimited, readTextLimitedWithReason, regexLines, regexSafe } from '../src/read/limits.js';
+import { READ_LIMITS, isBinary, listFiles, parseYamlLimited, readLinesLimited, readTextLimited, readTextLimitedWithReason, regexLines, regexSafe } from '../src/read/limits.js';
 import { cleanupRepos, makeTempDir } from './helpers/make-repo.js';
 
 afterEach(() => {
@@ -147,5 +147,38 @@ describe('limits', () => {
     chmodSync(file, 0o000);
     expect(await readTextLimitedWithReason(file)).toEqual({ skipped: 'unreadable' });
     expect(await readTextLimited(file)).toBeNull();
+  });
+
+  it('readLinesLimited (Plan P Task 1, PS4): lines across chunks, CRLF, a last line without a newline; long lines skipped whole', async () => {
+    const dir = makeTempDir();
+    const file = join(dir, 'lock');
+    const long = 'x'.repeat(READ_LIMITS.maxRegexLineBytes + 1);
+    const across = 'y'.repeat(70 * 1024 - 3); // longer than one 64 KB chunk, so it spans two reads
+    writeFileSync(file, `first\r\n${long}\nsecond\n${'z'.repeat(READ_LIMITS.maxRegexLineBytes)}\n\nlast`);
+    const lines: string[] = [];
+    expect(await readLinesLimited(file, { maxBytes: 1_000_000, maxLineBytes: READ_LIMITS.maxRegexLineBytes }, (l) => lines.push(l))).toEqual({ bytes: expect.any(Number) });
+    expect(lines).toEqual(['first', 'second', 'z'.repeat(READ_LIMITS.maxRegexLineBytes), '', 'last']);
+
+    writeFileSync(file, `a\n${across}\nb\n`);
+    const kept: string[] = [];
+    await readLinesLimited(file, { maxBytes: 1_000_000, maxLineBytes: 80 * 1024 }, (l) => kept.push(l));
+    expect(kept).toEqual(['a', across, 'b']);
+  });
+
+  it('readLinesLimited refuses a symbolic link, a folder, a binary file and a file over maxBytes', async () => {
+    const dir = makeTempDir();
+    const none = () => undefined;
+    const opts = { maxBytes: 100, maxLineBytes: 50 };
+    writeFileSync(join(dir, 'real'), 'ok\n');
+    symlinkSync(join(dir, 'real'), join(dir, 'link'));
+    mkdirSync(join(dir, 'folder'));
+    writeFileSync(join(dir, 'bin'), Buffer.from([0x61, 0x00, 0x0a]));
+    writeFileSync(join(dir, 'big'), 'a\n'.repeat(51));
+    expect(await readLinesLimited(join(dir, 'link'), opts, none)).toEqual({ skipped: 'link' });
+    expect(await readLinesLimited(join(dir, 'folder'), opts, none)).toEqual({ skipped: 'not-a-file' });
+    expect(await readLinesLimited(join(dir, 'bin'), opts, none)).toEqual({ skipped: 'binary' });
+    expect(await readLinesLimited(join(dir, 'big'), opts, none)).toEqual({ skipped: 'too-large' });
+    expect(await readLinesLimited(join(dir, 'missing'), opts, none)).toEqual({ skipped: 'unreadable' });
+    expect(await readLinesLimited(join(dir, 'real'), opts, none)).toEqual({ bytes: 3 });
   });
 });

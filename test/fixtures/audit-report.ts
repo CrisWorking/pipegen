@@ -4,6 +4,7 @@
 import type { AuditAi, AuditReport, WouldAddRow } from '../../src/audit/model.js';
 import type { Coverage } from '../../src/audit/coverage.js';
 import type { Layer, Need, ReviewedTool, Service } from '../../src/types.js';
+import { emptyRepoFiles, emptyServiceQuality } from '../../src/read/quality.js';
 
 export const need = (layer: Layer, id: string, service?: string, blocking = id !== 'format-lint'): Need => ({
   id, layer, category: id, ...(service === undefined ? {} : { service }), why: `Why ${id}.`, blocking,
@@ -34,7 +35,7 @@ const CI = '.github/workflows/ci.yml';
 export const service = (over: Partial<Service> = {}): Service => ({
   name: SVC, path: '.', language: 'node', packageManager: 'npm', runtimeVersion: '20', hasTests: true, testFramework: 'jest',
   envVars: ['DATABASE_URL'], dependsOn: [{ kind: 'postgres', name: 'postgres', evidence: 'package.json: pg', envVars: ['DATABASE_URL'] }],
-  scripts: ['start', 'test', 'lint'], frameworks: ['express'], ...over,
+  scripts: ['start', 'test', 'lint'], frameworks: ['express'], quality: emptyServiceQuality(), ...over,
 });
 
 const cov = (layer: Layer, id: string, status: Coverage['status'], why: string, extra: { service?: string; by?: string; where?: string } = {}): Coverage => ({
@@ -103,7 +104,7 @@ export function freePrivateReport(excludedPatterns: readonly string[]): AuditRep
       owner: 'acme', repo: 'shop-api', defaultBranch: 'main', private: true, ownerType: 'User', plan: 'free',
       monorepo: 'none', services: [service()], terraformDirs: [], hasCompose: false,
       existingWorkflows: [{ path: CI, triggers: ['push', 'pull_request'], deploys: false, [USED]: [], jobs: ['test', 'audit', 'zap'] }],
-      precommit: 'husky',
+      precommit: 'husky', repoFiles: emptyRepoFiles(),
     },
     capabilities: {
       branchProtection: false, environments: true, envRequiredReviewers: false, deploymentBranchPolicies: true,

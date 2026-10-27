@@ -6,6 +6,7 @@ import { floorNeeds } from '../src/engine/needs.js';
 import { readPrecommit, readWorkflows } from '../src/read/workflows.js';
 import type { Capabilities, ExistingWorkflow, Layer, RepoProfile, Service } from '../src/types.js';
 import { cleanupRepos, makeTempDir, writeIn } from './helpers/make-repo.js';
+import { emptyRepoFiles, emptyServiceQuality } from '../src/read/quality.js';
 
 afterEach(cleanupRepos);
 
@@ -17,7 +18,7 @@ const caps: Capabilities = {
 
 const svc = (path: string, over: Partial<Service> = {}): Service => ({
   name: path === '.' ? 'app' : path.split('/').pop() as string, path, language: 'node', packageManager: 'npm', hasTests: true,
-  envVars: [], dependsOn: [], scripts: ['test', 'lint'], frameworks: [], ...over,
+  envVars: [], dependsOn: [], scripts: ['test', 'lint'], frameworks: [], quality: emptyServiceQuality(), ...over,
 });
 
 /** A profile for `dir` the way readProject would build it: workflows and the hook manager read from disk. */
@@ -25,7 +26,7 @@ async function profileOf(dir: string, over: Partial<RepoProfile> = {}): Promise<
   return {
     owner: 'o', repo: 'r', defaultBranch: 'main', private: false, ownerType: 'User', plan: 'free', monorepo: 'none',
     services: [svc('.')], terraformDirs: [], hasCompose: false,
-    existingWorkflows: await readWorkflows(dir), precommit: readPrecommit(dir), ...over,
+    existingWorkflows: await readWorkflows(dir), precommit: readPrecommit(dir), repoFiles: emptyRepoFiles(), ...over,
   };
 }
 

@@ -7,6 +7,7 @@ import { REQUIREMENTS_FILE_RE, asObj, baseOf, dirOf, inDir, pythonNames, readPyp
 import { readProject } from '../src/read/project.js';
 import type { Service } from '../src/types.js';
 import { cleanupRepos, makeRepo, makeTempDir, writeIn } from './helpers/make-repo.js';
+import { emptyServiceQuality } from '../src/read/quality.js';
 
 afterEach(cleanupRepos);
 
@@ -31,7 +32,7 @@ async function readEnv(dir: string, service: Service, deeper: string[] = []) {
   return readEnvOwned(dir, service, owned, await manifests(dir, service.path, owned));
 }
 
-const svc = (path = '.', name = 'app'): Service => ({ name, path, language: 'node', hasTests: false, envVars: [], dependsOn: [], scripts: [], frameworks: [] });
+const svc = (path = '.', name = 'app'): Service => ({ name, path, language: 'node', hasTests: false, envVars: [], dependsOn: [], scripts: [], frameworks: [], quality: emptyServiceQuality() });
 const pkg = (deps: Record<string, string>) => JSON.stringify({ name: 'app', dependencies: deps });
 
 describe('readEnv', () => {

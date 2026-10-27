@@ -1,4 +1,5 @@
-import { lstat, readFile } from 'node:fs/promises';
+import { constants } from 'node:fs';
+import { lstat, open, readFile, type FileHandle } from 'node:fs/promises';
 import { join } from 'node:path';
 import fg from 'fast-glob';
 import { isMap, isPair, isScalar, isSeq, parseDocument } from 'yaml';
@@ -166,4 +167,74 @@ export function regexLines(text: string): string[] {
 /** True when a repo-derived string is short enough (4 KB) to run a regex on. */
 export function regexSafe(s: string): boolean {
   return Buffer.byteLength(s) <= READ_LIMITS.maxRegexLineBytes;
+}
+
+const LINE_CHUNK_BYTES = 64 * 1024;
+
+/**
+ * Plan P Task 1 (ruling PS4): reads a regular file line by line, for files that may be larger than maxFileBytes
+ * (lockfiles). Never follows a symbolic link (lstat first, then O_NOFOLLOW, then the opened file is checked again), never
+ * holds more than one chunk plus one line in memory, and stops at `maxBytes` (the size is checked before reading, and
+ * the bytes read are counted, so a file that grows is still cut off). A NUL byte in the first chunk means binary. A line
+ * longer than `maxLineBytes` is skipped whole and never built, so a regex never runs on it. `onLine` gets each line
+ * without its line ending. A skipped file may already have passed some lines to `onLine` (when it grows past `maxBytes`
+ * while being read): callers must drop what they collected when a file is skipped.
+ */
+export async function readLinesLimited(path: string, opts: { maxBytes: number; maxLineBytes: number }, onLine: (line: string) => void): Promise<{ bytes: number } | { skipped: Skipped }> {
+  let handle: FileHandle | undefined;
+  try {
+    const info = await lstat(path);
+    if (info.isSymbolicLink()) return { skipped: 'link' };
+    if (!info.isFile()) return { skipped: 'not-a-file' };
+    if (info.size > opts.maxBytes) return { skipped: 'too-large' };
+    handle = await open(path, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
+    const opened = await handle.stat();
+    if (!opened.isFile()) return { skipped: 'not-a-file' };
+    if (opened.size > opts.maxBytes) return { skipped: 'too-large' };
+    const buf = Buffer.alloc(LINE_CHUNK_BYTES);
+    let parts: Buffer[] = [];
+    let length = 0;
+    let tooLong = false;
+    let total = 0;
+    const add = (piece: Buffer) => {
+      if (tooLong || piece.length === 0) return;
+      if (length + piece.length > opts.maxLineBytes) {
+        tooLong = true;
+        parts = [];
+        return;
+      }
+      parts.push(Buffer.from(piece)); // a copy: buf is reused for the next chunk
+      length += piece.length;
+    };
+    const end = () => {
+      if (!tooLong) {
+        const line = Buffer.concat(parts, length).toString('utf8');
+        onLine(line.endsWith('\r') ? line.slice(0, -1) : line);
+      }
+      parts = [];
+      length = 0;
+      tooLong = false;
+    };
+    for (;;) {
+      const { bytesRead } = await handle.read(buf, 0, buf.length, null);
+      if (bytesRead === 0) break;
+      const chunk = buf.subarray(0, bytesRead);
+      if (total === 0 && isBinary(chunk)) return { skipped: 'binary' };
+      total += bytesRead;
+      if (total > opts.maxBytes) return { skipped: 'too-large' };
+      let start = 0;
+      for (let nl = chunk.indexOf(10, start); nl !== -1; nl = chunk.indexOf(10, start)) {
+        add(chunk.subarray(start, nl));
+        end();
+        start = nl + 1;
+      }
+      add(chunk.subarray(start));
+    }
+    if (length > 0 || tooLong) end();
+    return { bytes: total };
+  } catch {
+    return { skipped: 'unreadable' };
+  } finally {
+    await handle?.close().catch(() => undefined);
+  }
 }

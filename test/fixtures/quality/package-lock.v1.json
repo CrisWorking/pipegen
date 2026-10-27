@@ -1,0 +1,29 @@
+{
+  "name": "app",
+  "version": "1.0.0",
+  "lockfileVersion": 1,
+  "requires": true,
+  "dependencies": {
+    "a-plugin": {
+      "version": "1.0.0",
+      "dev": true,
+      "requires": {
+        "eslint": "^8.0.0"
+      },
+      "dependencies": {
+        "eslint": {
+          "version": "8.57.0",
+          "dev": true
+        }
+      }
+    },
+    "eslint": {
+      "version": "9.1.1",
+      "dev": true
+    },
+    "typescript": {
+      "version": "5.4.5",
+      "dev": true
+    }
+  }
+}

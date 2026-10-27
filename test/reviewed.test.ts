@@ -12,6 +12,7 @@ import {
 import { NEED_CATEGORIES, PROTECTED_PATHS_BASE, type Need, type ReviewedTool, type Service } from '../src/types.js';
 import { fakeFetch } from './helpers/fake-http.js';
 import { cleanupRepos, makeTempDir, writeIn } from './helpers/make-repo.js';
+import { emptyServiceQuality } from '../src/read/quality.js';
 
 const root = resolve(import.meta.dirname, '..');
 const DATA = resolve(root, 'data/reviewed-tools.yml');
@@ -112,7 +113,7 @@ const need = (id: string, over: Partial<Need> = {}): Need => ({
   id, layer: 'push', category: (NEED_ID_CATEGORY as Record<string, string>)[id] ?? id, why: 'x', blocking: true, floor: false, ...over,
 });
 const svc = (over: Partial<Service> = {}): Service => ({
-  name: 'web', path: 'apps/web', language: 'node', hasTests: true, envVars: [], dependsOn: [], scripts: ['test', 'lint'], frameworks: [], ...over,
+  name: 'web', path: 'apps/web', language: 'node', hasTests: true, envVars: [], dependsOn: [], scripts: ['test', 'lint'], frameworks: [], quality: emptyServiceQuality(), ...over,
 });
 
 /** The real list, read raw (for releasedAt and pinnedOn, which loadReviewed doesn't return). */

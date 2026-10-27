@@ -1,7 +1,7 @@
 // The reviewed list loader is the trust root's reader: it must not pull in the AI code (prompts, providers, the
 // code bundle). The module graph is read from esbuild's metafile, the same bundler tsup uses.
-import { readdirSync } from 'node:fs';
-import { resolve } from 'node:path';
+import { readdirSync, readFileSync } from 'node:fs';
+import { dirname, resolve } from 'node:path';
 import { build } from 'esbuild';
 import { describe, expect, it } from 'vitest';
 
@@ -79,5 +79,23 @@ describe('module graph (final review M6)', () => {
 
     expect(edges.get('src/audit/coverage/tokenize.ts')).toEqual([]);
     expect(await graph('src/audit/coverage/types.ts')).toEqual(['src/audit/coverage/types.ts']);
+  });
+
+  it('module graph (Plan P Task 0 review, minor): every import of src/audit/coverage/types.ts in the source text is `import type`', () => {
+    // esbuild drops an unused plain import, so the bundle check above can't see one; this reads the source instead
+    const target = resolve(root, 'src/audit/coverage/types.ts');
+    const sources = readdirSync(resolve(root, 'src'), { recursive: true, encoding: 'utf8' }).filter((f) => f.endsWith('.ts')).map((f) => resolve(root, 'src', f));
+    const STATIC = /^[ \t]*(import|export)[ \t]+(type[ \t]+)?(?:[^;'"]*?[ \t\n]from[ \t]+)?['"]([^'"\n]+)['"]/gm;
+    const DYNAMIC = /\bimport\(\s*['"]([^'"\n]+)['"]\s*\)/g;
+    const toTarget = (file: string, spec: string) => spec.startsWith('.') && resolve(dirname(file), spec.replace(/\.js$/, '.ts')) === target;
+    const typeOnly: string[] = [];
+    const plain: string[] = [];
+    for (const file of sources) {
+      const text = readFileSync(file, 'utf8');
+      for (const m of text.matchAll(STATIC)) if (toTarget(file, m[3] ?? '')) (m[2] === undefined ? plain : typeOnly).push(file);
+      for (const m of text.matchAll(DYNAMIC)) if (toTarget(file, m[1] ?? '')) plain.push(file);
+    }
+    expect(typeOnly.length).toBeGreaterThanOrEqual(9); // coverage.ts and the coverage/ modules that use its types
+    expect(plain).toEqual([]);
   });
 });

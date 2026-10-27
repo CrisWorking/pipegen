@@ -12,6 +12,7 @@ import {
 } from '../src/types.js';
 import { countingStream, fakeFetch, fakeOctokit, type Call, type Reply, type Routes } from './helpers/fake-http.js';
 import { strictProblems } from './helpers/strict-schema.js';
+import { emptyRepoFiles, emptyServiceQuality } from '../src/read/quality.js';
 
 const GH = 'https://api.github.com';
 const SEARCH = `GET ${GH}/search/repositories`;
@@ -27,11 +28,11 @@ const usage = (input: number, output: number) => Object.fromEntries([['input' + 
 // ---------- builders ----------
 
 const svc = (over: Partial<Service> = {}): Service => ({
-  name: 'web', path: '.', language: 'node', packageManager: 'npm', hasTests: true, envVars: [], dependsOn: [], scripts: [], frameworks: [], ...over,
+  name: 'web', path: '.', language: 'node', packageManager: 'npm', hasTests: true, envVars: [], dependsOn: [], scripts: [], frameworks: [], quality: emptyServiceQuality(), ...over,
 });
 const profile = (over: Partial<RepoProfile> = {}): RepoProfile => ({
   owner: 'o', repo: 'r', defaultBranch: 'main', private: false, ownerType: 'User', plan: 'free',
-  monorepo: 'none', services: [svc()], terraformDirs: [], hasCompose: false, existingWorkflows: [], precommit: null, ...over,
+  monorepo: 'none', services: [svc()], terraformDirs: [], hasCompose: false, existingWorkflows: [], precommit: null, repoFiles: emptyRepoFiles(), ...over,
 });
 const need = (id: string, over: Partial<Need> = {}): Need => ({
   id, layer: 'merge', category: id, service: 'web', why: 'x', blocking: true, floor: false, ...over,

@@ -1,0 +1,38 @@
+lockfileVersion: '9.0'
+
+settings:
+  autoInstallPeers: true
+  excludeLinksFromLockfile: false
+
+importers:
+
+  .:
+    devDependencies:
+      eslint:
+        specifier: ^9.0.0
+        version: 9.1.1(jiti@1.21.0)
+      a-plugin:
+        specifier: ^1.0.0
+        version: 1.0.0
+      typescript:
+        specifier: ^5.4.0
+        version: 5.4.5
+
+packages:
+
+  eslint@8.57.0:
+    engines: {node: '>=18'}
+
+  eslint@9.1.1:
+    engines: {node: '>=18'}
+
+  typescript@5.4.5:
+    engines: {node: '>=14.17'}
+
+snapshots:
+
+  eslint@8.57.0: {}
+
+  eslint@9.1.1(jiti@1.21.0): {}
+
+  typescript@5.4.5: {}

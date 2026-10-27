@@ -23,6 +23,21 @@ export interface Service {
   scripts: string[];      // script names from package.json `scripts` / pyproject `[project.scripts]` + `[tool.poetry.scripts]` (names only, never the commands)
   frameworks: string[];   // detected server frameworks: express, fastify, @nestjs/core, next, koa, hapi; flask, fastapi, django (never the service's own package name: the express repo doesn't USE express). Used by isRunnable (Plan B Task 1)
   publishedPackage?: boolean;   // Plan U Task 5: the repo's only service, and a workflow publishes it to its registry (npm for node, PyPI for python). Set only when true. isRunnable then ignores a port found in its code (a library's default port isn't a server)
+  quality: ServiceQuality;      // Plan P Task 1 (src/read/quality.ts): the facts the quality and supply-chain checks read. Always set; emptyServiceQuality() when nothing is known
+}
+// Plan P Task 1. Ruling PS5 left out what no task reads: QualityPackage 'jscpd', QualityConfig 'jscpd'/'hadolint', RepoFiles.rego.
+export type UiFramework = 'next' | 'nuxt' | 'vue' | 'svelte' | 'astro' | 'react-native';
+export type QualityPackage = 'typescript' | 'eslint' | 'prettier' | '@biomejs/biome' | 'oxlint' | 'vitest' | 'jest' | 'c8' | 'knip' | 'vue-tsc' | 'svelte-check' | '@astrojs/check';
+export type QualityConfig = 'biome' | 'prettier' | 'knip' | 'oxlint' | 'ruff' | 'black' | 'flake8' | 'pylint' | 'mypy' | 'pyright' | 'basedpyright';
+export interface ServiceQuality {
+  tsconfig: boolean; versions: Partial<Record<QualityPackage, string>>; fromRange: QualityPackage[];   // versions: each matches /^\d+\.\d+\.\d+(-[0-9A-Za-z.-]{1,40})?$/. fromRange: version from a package.json range (its lower bound), not the lockfile
+  eslintConfig: 'flat' | 'eslintrc' | 'both' | 'none'; configs: QualityConfig[]; uiFrameworks: UiFramework[];
+  pythonTyped: boolean; fuzzTargets: boolean;
+  apiSpec: { kind: 'file'; path: string } | { kind: 'served'; by: 'fastapi' | '@nestjs/swagger' } | null;   // path: repo-relative, raw (unchanged by safeText, else not kept); clean it at output
+}
+export interface RepoFiles {
+  dependabot: string | null; renovate: string | null; actionsLock: boolean; kubernetes: boolean;   // dependabot, renovate: the repo-relative path of the config file found ('package.json' for its `renovate` key)
+  licenceConfig: 'deny.toml' | '.grant.yaml' | '.fossa.yml' | null; secretsBaseline: boolean;
 }
 export interface ExistingWorkflow {
   path: string; triggers: string[]; deploys: boolean; secretsUsed: string[]; jobs: string[];
@@ -34,6 +49,7 @@ export interface RepoProfile {
   ownerType: 'User' | 'Organization'; plan: Plan;
   monorepo: Monorepo; services: Service[]; terraformDirs: string[]; hasCompose: boolean;
   existingWorkflows: ExistingWorkflow[]; precommit: 'pre-commit' | 'husky' | 'lefthook' | null;
+  repoFiles: RepoFiles;   // Plan P Task 1: repo-level config files, read once
 }
 // ---------- GitHub access (moved here from Plan A Task 6 in round 4: Plan U uses it too) ----------
 export interface Auth {

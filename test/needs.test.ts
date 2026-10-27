@@ -15,11 +15,12 @@ import { CLEAN, makeStub } from './helpers/gitleaks-stub.js';
 import { fake } from './helpers/secret-repo.js';
 import { cleanupRepos, makeRepo, makeTempDir, writeIn } from './helpers/make-repo.js';
 import { strictProblems } from './helpers/strict-schema.js';
+import { emptyRepoFiles, emptyServiceQuality } from '../src/read/quality.js';
 
 // ---------- builders ----------
 
 const svc = (over: Partial<Service> = {}): Service => ({
-  name: 'app', path: '.', language: 'node', packageManager: 'npm', hasTests: true, envVars: [], dependsOn: [], scripts: [], frameworks: [], ...over,
+  name: 'app', path: '.', language: 'node', packageManager: 'npm', hasTests: true, envVars: [], dependsOn: [], scripts: [], frameworks: [], quality: emptyServiceQuality(), ...over,
 });
 /** A runnable Node service (start script + express). */
 const web = (over: Partial<Service> = {}) => svc({ name: 'web', scripts: ['start', 'test'], frameworks: ['express'], ...over });
@@ -28,7 +29,7 @@ const lib = (over: Partial<Service> = {}) => svc({ name: 'lib', scripts: ['build
 
 const profile = (over: Partial<RepoProfile> = {}): RepoProfile => ({
   owner: 'o', repo: 'r', defaultBranch: 'main', private: false, ownerType: 'User', plan: 'free',
-  monorepo: 'none', services: [web()], terraformDirs: [], hasCompose: false, existingWorkflows: [], precommit: null, ...over,
+  monorepo: 'none', services: [web()], terraformDirs: [], hasCompose: false, existingWorkflows: [], precommit: null, repoFiles: emptyRepoFiles(), ...over,
 });
 
 // Capability field names are built from a list (one holds "key", which the repo's own secret-literal check watches).

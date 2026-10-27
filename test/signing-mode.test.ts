@@ -1,10 +1,11 @@
 import { describe, expect, it } from 'vitest';
 import { signingMode } from '../src/github/signing-mode.js';
 import type { Capabilities, RepoProfile } from '../src/types.js';
+import { emptyRepoFiles } from '../src/read/quality.js';
 
 const profile = (over: Partial<RepoProfile>): RepoProfile => ({
   owner: 'o', repo: 'r', defaultBranch: 'main', private: true, ownerType: 'Organization', plan: 'free',
-  monorepo: 'none', services: [], terraformDirs: [], hasCompose: false, existingWorkflows: [], precommit: null, ...over,
+  monorepo: 'none', services: [], terraformDirs: [], hasCompose: false, existingWorkflows: [], precommit: null, repoFiles: emptyRepoFiles(), ...over,
 });
 
 // The capability table from Plan A Task 6 (public, private free, private team, private enterprise).

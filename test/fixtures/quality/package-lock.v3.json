@@ -1,0 +1,34 @@
+{
+  "name": "app",
+  "version": "1.0.0",
+  "lockfileVersion": 3,
+  "requires": true,
+  "packages": {
+    "": {
+      "name": "app",
+      "version": "1.0.0",
+      "devDependencies": {
+        "eslint": "^9.0.0",
+        "typescript": "^5.4.0"
+      }
+    },
+    "node_modules/a-plugin": {
+      "version": "1.0.0",
+      "dev": true
+    },
+    "node_modules/a-plugin/node_modules/eslint": {
+      "version": "8.57.0",
+      "dev": true
+    },
+    "node_modules/eslint": {
+      "version": "9.1.1",
+      "dev": true,
+      "license": "MIT"
+    },
+    "node_modules/typescript": {
+      "version": "5.4.5",
+      "dev": true,
+      "license": "Apache-2.0"
+    }
+  }
+}

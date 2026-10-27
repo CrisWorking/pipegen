@@ -6,6 +6,7 @@ import type { Language, Monorepo, PackageManager, RepoProfile, Service } from '.
 import { safeText } from '../util/safe-text.js';
 import { CODE_FILE_RE, REQUIREMENTS_FILE_RE, asObj, asString, asStrings, baseOf, dirOf, inDir, isTestFile, pythonNames, readPyproject, requirementLines, type Obj } from './manifest.js';
 import { readEnv } from './env.js';
+import { newQualityRun, readRepoFiles, readServiceQuality, type QualityRun } from './quality.js';
 import { readPrecommit, readWorkflows } from './workflows.js';
 import { IGNORED_DIRS, MAX_FILES_TEXT, SKIP_REASON, listFiles, parseYamlLimited, readTextLimitedWithReason, regexLines, regexSafe } from './limits.js';
 
@@ -124,7 +125,7 @@ async function readOrigin(root: string): Promise<{ owner: string; repo: string }
   return { owner, repo };
 }
 
-interface Shared { repo: string; serviceDirs: string[] }
+interface Shared { repo: string; serviceDirs: string[]; quality: QualityRun }
 
 async function readService(ctx: Ctx, dir: string, shared: Shared): Promise<Service> {
   const files = [...ctx.fileSet];
@@ -194,7 +195,9 @@ async function readService(ctx: Ctx, dir: string, shared: Shared): Promise<Servi
   const declared = asString(pkg?.name) ?? py.name;
   const folder = dir === '.' ? shared.repo : basename(dir);
   const name = [declared, folder].find((n): n is string => n !== undefined && SERVICE_NAME_RE.test(n)) ?? 'app';
-  return { name, path: dir, language, packageManager, runtimeVersion, dockerfile, port, hasTests, testFramework, ...(await readEnv(ctx.root, { path: dir, name }, owned, { pkg, py, requirements })), scripts, frameworks };
+  const env = await readEnv(ctx.root, { path: dir, name }, owned, { pkg, py, requirements });
+  const quality = await readServiceQuality(ctx.root, { path: dir, language, frameworks }, ctx.notes, shared.quality);
+  return { name, path: dir, language, packageManager, runtimeVersion, dockerfile, port, hasTests, testFramework, ...env, scripts, frameworks, quality };
 }
 
 async function anyFileHasLine(ctx: Ctx, files: string[], re: RegExp): Promise<boolean> {
@@ -279,6 +282,7 @@ export async function readProject(dir: string, opts?: { notes?: string[] }): Pro
     const scripts = asObj((await readJson(ctx, inDir(pkgDir, 'package.json')))?.scripts);
     if ('start' in scripts || 'dev' in scripts || ctx.fileSet.has(inDir(pkgDir, 'Dockerfile'))) dirs.push(pkgDir);
   }
+  const workspaceMembers = [...dirs];
   const isAppDockerfile = (f: string) => baseOf(f) === 'Dockerfile' && !dirOf(f).split('/').some((s) => NOT_SERVICE_DIRS.includes(s));
   const dockerDirs = [...new Set([...ctx.fileSet].filter(isAppDockerfile).map(dirOf))].sort();
   if (dirs.length === 0) dirs = dockerDirs.length > 0 ? dockerDirs : ['.'];
@@ -290,7 +294,8 @@ export async function readProject(dir: string, opts?: { notes?: string[] }): Pro
   else if (ctx.fileSet.has('nx.json')) monorepo = 'nx';
   else if (dirs.length > 1) monorepo = 'folders';
 
-  const shared: Shared = { repo, serviceDirs: dirs };
+  // Plan P Task 1: one run for the quality facts, so each lockfile is read once and the read budgets hold for the repo.
+  const shared: Shared = { repo, serviceDirs: dirs, quality: newQualityRun(dir, [...ctx.fileSet], dirs, workspaceMembers) };
   const services: Service[] = [];
   for (const d of dirs) services.push(await readService(ctx, d, shared));
   uniqueServiceNames(ctx, services);
@@ -305,6 +310,6 @@ export async function readProject(dir: string, opts?: { notes?: string[] }): Pro
     owner, repo, defaultBranch: 'main', monorepo, services,
     terraformDirs: [...new Set(files.filter((f) => f.endsWith('.tf')).map(dirOf))].sort(),
     hasCompose: files.some((f) => /^(docker-)?compose\.ya?ml$/.test(baseOf(f))),
-    existingWorkflows, precommit: readPrecommit(dir),
+    existingWorkflows, precommit: readPrecommit(dir), repoFiles: await readRepoFiles(dir, ctx.notes, shared.quality),
   };
 }

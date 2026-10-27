@@ -9,6 +9,7 @@ import { GitHubRateLimitError, newRateBudget } from '../src/engine/github-rate.j
 import type { Capabilities, Plan, RepoProfile } from '../src/types.js';
 import { fakeFetch, type Reply, type Routes } from './helpers/fake-http.js';
 import { fake } from './helpers/secret-repo.js';
+import { emptyRepoFiles } from '../src/read/quality.js';
 
 const API = 'https://api.github.com';
 const R = `${API}/repos/o/r`;
@@ -41,7 +42,7 @@ const probe = async (routes: Routes, p: { private: boolean; plan: Plan; ownerTyp
 };
 const profile = (over: Partial<RepoProfile>): RepoProfile => ({
   owner: 'o', repo: 'r', defaultBranch: 'main', private: true, ownerType: 'Organization', plan: 'free',
-  monorepo: 'none', services: [], terraformDirs: [], hasCompose: false, existingWorkflows: [], precommit: null, ...over,
+  monorepo: 'none', services: [], terraformDirs: [], hasCompose: false, existingWorkflows: [], precommit: null, repoFiles: emptyRepoFiles(), ...over,
 });
 const ALL: Capabilities = { branchProtection: true, environments: true, deploymentBranchPolicies: true, envRequiredReviewers: true, attestations: true, codeScanning: true, keylessSigningAllowed: true };
 

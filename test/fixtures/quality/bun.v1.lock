@@ -1,0 +1,21 @@
+{
+  "lockfileVersion": 1,
+  "workspaces": {
+    "": {
+      "name": "app",
+      "devDependencies": {
+        "eslint": "^9.0.0",
+        "typescript": "^5.4.0",
+      },
+    },
+  },
+  "packages": {
+    "a-plugin": ["a-plugin@1.0.0", "", { "dependencies": { "eslint": "^8.0.0" } }, ""],
+
+    "a-plugin/eslint": ["eslint@8.57.0", "", {}, ""],
+
+    "eslint": ["eslint@9.1.1", "", { "bin": { "eslint": "bin/eslint.js" } }, ""],
+
+    "typescript": ["typescript@5.4.5", "", { "bin": { "tsc": "bin/tsc" } }, ""],
+  }
+}
