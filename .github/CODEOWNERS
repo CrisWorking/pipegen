@@ -1,0 +1,19 @@
+# Plan R owns this file. User logins only, no teams.
+# Everything that decides what runs or what ships needs owner review.
+
+/data/                 @CrisWorking
+/gate/                 @CrisWorking
+/watcher/              @CrisWorking
+/.github/              @CrisWorking
+/scripts/              @CrisWorking
+/src/engine/           @CrisWorking
+/tsup.config.ts        @CrisWorking
+/tsup.dev.config.ts    @CrisWorking
+/tsconfig.json         @CrisWorking
+/package.json          @CrisWorking
+/package-lock.json     @CrisWorking
+/.npmrc                @CrisWorking
+/.nvmrc                @CrisWorking
+/LICENSE               @CrisWorking
+/THIRD_PARTY_NOTICES   @CrisWorking
+/SECURITY.md           @CrisWorking

@@ -1,0 +1,29 @@
+# Options reference (cooldown, groups, open-pull-requests-limit):
+# https://docs.github.com/en/code-security/dependabot/working-with-dependabot/dependabot-options-reference
+# cooldown applies to version updates only; security updates ignore it.
+# No automerge. Exact-pinned deps (@anthropic-ai/sdk, @opentelemetry/api) are bumped by hand.
+version: 2
+updates:
+  - package-ecosystem: "npm"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+    cooldown:
+      default-days: 7
+    groups:
+      npm-minor-patch:
+        update-types:
+          - "minor"
+          - "patch"
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+    cooldown:
+      default-days: 7
+    groups:
+      actions:
+        patterns:
+          - "*"
