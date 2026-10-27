@@ -541,7 +541,7 @@ describe('pipegen audit (flags and help)', () => {
     expect(readme).toContain(RUN_COMMAND.replace('./repo', './my-repo'));
     const npx = [...readme.matchAll(/npx[^\n`]*/g)].map((m) => m[0]);
     expect(npx.length).toBeGreaterThan(0);
-    for (const line of npx) expect(line, line).toMatch(new RegExp(`^npx --registry=https://registry\\.npmjs\\.org pipegen@${VERSION.replace(/\./g, '\\.')} audit `));
+    for (const line of npx) expect(line, line).toMatch(new RegExp(`^npx --registry=https://registry\\.npmjs\\.org pipegen@(?:${VERSION.replace(/\./g, '\\.')}|x\\.y\\.z) audit `));
     expect(readme).toContain('`audit --ai` needs Linux or macOS for now (WSL works)');
   });
 });

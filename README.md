@@ -4,7 +4,7 @@
 For small teams with nobody dedicated to security, DevOps or code quality.
 It opens one pull request. You review it. It never touches your app code or your `main` branch.
 
-> **Status: early, not published yet.** `pipegen audit` (read-only) is built and tested on real public repos; it is not on npm yet, so the commands below don't work until the first release. The full run (one PR) comes later. See the [roadmap](docs/roadmap.md).
+> **Status: early, not published yet.** `pipegen audit` (read-only) is built and tested on real public repos; it is not on npm yet, so the install commands below don't work until the first release. The full run (one PR) comes later. See the [roadmap](docs/roadmap.md).
 
 ## What the audit shows you *(excerpt of a real run on a public repo, expressjs/express; "..." marks cut parts)*
 
@@ -101,6 +101,43 @@ binaries exist for those systems only.
 Later versions add the full job (one PR), then `finish` (after you merge: merge rules, signing key and dates), `verify`
 (read-only: checks nobody weakened the pipeline files) and `uninstall`. Their exact commands will be shown here when
 they exist; until then no other pipegen command is safe to copy, because the npm name isn't published yet.
+
+## Install safely, and check what you installed
+
+pipegen is not published yet. Once it is, install an exact version, from the official registry. An unversioned run takes whatever the registry serves at that
+moment, so always give the version and the registry:
+
+```bash
+npx --registry=https://registry.npmjs.org pipegen@x.y.z audit --dir ./my-repo
+```
+
+Replace `x.y.z` with the version from the release page; do not copy a version from anywhere else. Run it from outside the repo you audit.
+
+To check a release, in an empty folder:
+
+```bash
+npm init -y
+npm install --registry=https://registry.npmjs.org pipegen@x.y.z
+npm audit signatures
+```
+
+`npm audit signatures` verifies the registry signature and the provenance attestation of every installed package: it
+should report the package as having a verified attestation. Then open the version's page on npmjs.com, follow the
+provenance link to the GitHub Actions run, and check that it is a run of `release.yml` in this repository for the matching tag.
+You can also verify the downloaded release file with `gh attestation verify <file>.tgz --repo CrisWorking/pipegen`.
+The steps for making a release are in [docs/release.md](docs/release.md).
+
+## Maintenance promise *(draft for Cristiano to approve; not a commitment yet)*
+
+- **Updates:** the latest minor version is maintained. Fixes ship as new patch versions; nothing is changed in an existing
+  version after release.
+- **Security fixes:** report a problem privately (see [SECURITY.md](SECURITY.md)), not in a public issue. A report gets an
+  acknowledgement within 7 days and a fix or a written plan within 30 days.
+- **Dependencies and tools:** pipegen ships with no runtime dependencies, and every pinned dependency or tool version waits
+  7 days after its release before it is used (see [the cooldown](docs/cooldown.md)); an urgent security fix can skip the wait.
+- **Releases:** every release is built in GitHub Actions from a signed tag, with a provenance attestation you can verify as above.
+- **Side project:** pipegen is open source and maintained by one person; replies may be slow, and the promise above is the
+  part that is not.
 
 ## Read more
 
