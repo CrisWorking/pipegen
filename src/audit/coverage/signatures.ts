@@ -174,8 +174,10 @@ const signatureSchema = z.strictObject({
    */
   minimumFlags: z.array(z.string().regex(FLAG_NAME_RE)).min(1).optional(),
   minimumSwitches: z.array(z.string().regex(FLAG_NAME_RE)).min(1).optional(),
+  /** Fix round 1: the tool wraps another command (c8, nyc, coverage run): its minimum flags are read only before that command. */
+  minimumLeading: z.literal(true).optional(),
 })
-  .refine((t) => (t.minimumFlags === undefined && t.minimumSwitches === undefined) || t.commands !== undefined, { message: 'minimumFlags and minimumSwitches need commands' })
+  .refine((t) => (t.minimumFlags === undefined && t.minimumSwitches === undefined && t.minimumLeading === undefined) || t.commands !== undefined, { message: 'minimumFlags and minimumSwitches need commands' })
   .refine((t) => t.commandFails !== 'flag' || t.failFlags !== undefined, { message: 'commandFails: flag needs failFlags' })
   .refine((t) => t.actionFails !== 'input' || t.failInputs !== undefined, { message: 'actionFails: input needs failInputs' })
   .refine((t) => t.excludes === undefined || t.commands !== undefined, { message: 'excludes needs commands' })

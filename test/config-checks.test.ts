@@ -45,7 +45,8 @@ const runStep = (cmd: string) => `      - run: ${cmd}\n`;
 const onBoth = 'on: [push, pull_request]\n';
 const DEP = '.github/dependabot.yml';
 const dep = (dir: string, body: string) => writeIn(dir, DEP, body);
-const upd = (eco: string, directory: string, extra = '    cooldown:\n      default-days: 7\n') => `  - package-ecosystem: ${eco}\n    directory: ${directory}\n${extra}`;
+const SCHED = '    schedule:\n      interval: weekly\n';
+const upd = (eco: string, directory: string, extra = '    cooldown:\n      default-days: 7\n') => `  - package-ecosystem: ${eco}\n    directory: ${directory}\n${SCHED}${extra}`;
 const depFile = (...entries: string[]) => `version: 2\nupdates:\n${entries.join('')}`;
 async function update(dir: string, over: Partial<RepoProfile> = {}, running = false): Promise<Coverage> {
   const p = await profileOf(dir, over);
@@ -176,11 +177,11 @@ describe('dependabot (PB4 d)', () => {
     const services = [svc('.'), svc('packages/a'), svc('packages/b')];
     dep(dir, depFile(upd('npm', '/')));
     expect((await update(dir, { services })).status).toBe('partial');
-    dep(dir, depFile(upd('npm', '/'), '  - package-ecosystem: npm\n    directories: ["/packages/*"]\n    cooldown:\n      default-days: 7\n'));
+    dep(dir, depFile(upd('npm', '/'), '  - package-ecosystem: npm\n    directories: ["/packages/*"]\n    schedule:\n      interval: weekly\n    cooldown:\n      default-days: 7\n'));
     expect((await update(dir, { services })).status).toBe('covered');
-    dep(dir, depFile(upd('npm', '/'), '  - package-ecosystem: npm\n    directories: ["!/packages/zzz", "/packages/a"]\n    cooldown:\n      default-days: 7\n'));
+    dep(dir, depFile(upd('npm', '/'), '  - package-ecosystem: npm\n    directories: ["!/packages/zzz", "/packages/a"]\n    schedule:\n      interval: weekly\n    cooldown:\n      default-days: 7\n'));
     expect((await update(dir, { services })).status).toBe('partial');
-    dep(dir, depFile(upd('npm', '/'), '  - package-ecosystem: npm\n    directories: ["/{packages}/*"]\n    cooldown:\n      default-days: 7\n'));
+    dep(dir, depFile(upd('npm', '/'), '  - package-ecosystem: npm\n    directories: ["/{packages}/*"]\n    schedule:\n      interval: weekly\n    cooldown:\n      default-days: 7\n'));
     expect((await update(dir, { services })).status).toBe('partial'); // unusual glob characters are not trusted
   });
 
@@ -701,5 +702,156 @@ describe('config-checks: module graph (PB1)', () => {
     const files = Object.keys(r.metafile.inputs);
     for (const banned of ['walk', 'decide', 'hooks', 'shell', 'scripts', 'settings', 'signatures']) expect(files, banned).not.toContain(`src/audit/coverage/${banned}.ts`);
     expect(files).not.toContain('src/audit/coverage.ts');
+  });
+});
+
+// ---------- fix round 1: the review's probes ----------
+
+describe('fix round 1 (review of Task 4)', () => {
+  const ci = (dir: string, cmd: string, extra = '') => wf(dir, 'ci.yml', `${onBoth}jobs:\n  t:\n    runs-on: ubuntu-latest\n${extra}    steps:\n      - run: ${cmd}\n`);
+  const py = svc('.', { language: 'python', packageManager: 'pip' });
+  const PYT = '[tool.coverage.report]\nfail_under = 80\n';
+  const JESTPKG = JSON.stringify({ name: 'x', jest: { coverageThreshold: { global: { lines: 80 } } } });
+  const VITEST_JS = 'export default {test:{coverage:{thresholds:{lines:80}}}}';
+  async function covOf(dir: string, services: Service[] = [svc('.')]): Promise<Coverage> {
+    return pick(await rows(dir, { services }), 'merge', 'coverage', services[0]?.name);
+  }
+
+  it('1. a symlinked working folder is never followed: the minimum there is unknown, not covered', async () => {
+    const other = makeTempDir();
+    writeIn(other, 'package.json', JESTPKG);
+    const dir = makeTempDir();
+    symlinkSync(other, join(dir, 'sub'));
+    writeIn(dir, 'package.json', '{"name":"x"}');
+    ci(dir, 'npx jest --coverage', '    defaults:\n      run:\n        working-directory: sub\n');
+    expect((await covOf(dir)).status).toBe('unknown');
+    const ok = makeTempDir();
+    writeIn(ok, 'package.json', JESTPKG);
+    ci(ok, 'npx jest --coverage');
+    expect((await covOf(ok)).status).toBe('covered'); // the control: no link
+    expect(await coverageMinimum(dir, svc('sub'))).toBe('unknown');
+  });
+
+  it('2. a flag that swaps the config file keeps the run partial', async () => {
+    const cases: [string, Service[], () => [string, string][]][] = [
+      ['pytest --cov --cov-config=other.ini', [py], () => [['pyproject.toml', PYT]]],
+      ['pytest --cov -c other.ini', [py], () => [['pyproject.toml', PYT]]],
+      ['coverage report --rcfile=other.ini', [py], () => [['pyproject.toml', PYT]]],
+      ['npx jest --coverage --config o.json', [svc('.')], () => [['package.json', JESTPKG]]],
+      ['npx jest --coverage -c o.json', [svc('.')], () => [['package.json', JESTPKG]]],
+      ['npx jest --coverage --rootDir other', [svc('.')], () => [['package.json', JESTPKG]]],
+      ['npx vitest run --coverage --config other.ts --coverage.thresholds.lines=80', [svc('.')], () => [['vitest.config.ts', VITEST_JS]]],
+    ];
+    for (const [cmd, services, files] of cases) {
+      const dir = makeTempDir();
+      for (const [f, t] of files()) writeIn(dir, f, t);
+      ci(dir, cmd);
+      expect((await covOf(dir, services)).status, cmd).toBe('partial');
+    }
+  });
+
+  it('3. wrapper tools read minimum flags only before the command they wrap', async () => {
+    for (const [cmd, expected] of [
+      ['npx c8 npm test -- --check-coverage --lines 90', 'partial'],
+      ['npx nyc mocha --check-coverage --lines 90', 'partial'],
+      ['npx c8 node x.js --coverage.thresholds.lines=90', 'partial'],
+      ['coverage run -m pytest --fail-under=90', 'partial'],
+      ['npx c8 --check-coverage --lines 90 npm test', 'covered'],
+      ['npx c8 --check-coverage --reporter lcov --lines 90 npm test', 'covered'],
+      ['npx c8 --check-coverage --lines 0 npm test', 'partial'],
+      ['nyc --check-coverage --lines 90 mocha', 'covered'],
+    ] as const) {
+      const dir = makeTempDir();
+      ci(dir, cmd);
+      expect((await covOf(dir)).status, cmd).toBe(expected);
+    }
+  });
+
+  it('4. a minimum flag set to 0 or empty means no minimum; the config file is then ignored', async () => {
+    for (const [cmd, services, file, text] of [
+      ['pytest --cov --cov-fail-under=0', [py], 'pyproject.toml', PYT],
+      ['pytest --cov --cov-fail-under 0', [py], 'pyproject.toml', PYT],
+      ['npx jest --coverage --coverageThreshold=\'{}\'', [svc('.')], 'package.json', JESTPKG],
+      ['npx jest --coverage --coverageThreshold={"global":{"lines":0}}', [svc('.')], 'package.json', JESTPKG],
+      ['npx vitest run --coverage --coverage.thresholds.lines=0', [svc('.')], 'vitest.config.ts', VITEST_JS],
+    ] as const) {
+      const dir = makeTempDir();
+      writeIn(dir, file, text);
+      ci(dir, cmd);
+      const r = await covOf(dir, [...services]);
+      expect(r.status, cmd).toBe('partial');
+    }
+    const env = makeTempDir();
+    writeIn(env, 'pyproject.toml', PYT);
+    ci(env, 'pytest --cov', '    env:\n      COVERAGE_RCFILE: other.ini\n');
+    expect((await covOf(env, [py])).status).toBe('partial');
+  });
+
+  it('5. a Dependabot allow list that limits updates, or an entry with no schedule interval, is not covered', async () => {
+    const cd = '    cooldown:\n      default-days: 7\n';
+    for (const allow of ['    allow:\n      - dependency-name: "left-pad"\n', '    allow:\n      - dependency-type: "development"\n', '    allow: left-pad\n']) {
+      const dir = makeTempDir();
+      dep(dir, depFile(upd('npm', '/', allow + cd)));
+      expect((await update(dir)).status, allow).toBe('partial');
+    }
+    const all = makeTempDir();
+    dep(all, depFile(upd('npm', '/', '    allow:\n      - dependency-name: "*"\n' + cd)));
+    expect((await update(all)).status).toBe('covered');
+    const noSchedule = makeTempDir();
+    dep(noSchedule, `version: 2\nupdates:\n  - package-ecosystem: npm\n    directory: /\n${cd}`);
+    const r = await update(noSchedule);
+    expect(r.status).toBe('partial');
+    expect(r.why).toMatch(/schedule\.interval/);
+  });
+
+  it('6. Renovate: rules that disable updates, ignorePaths, a schedule, or a preset that may override the age are not covered', async () => {
+    const base = { minimumReleaseAge: '7 days' };
+    const cases: unknown[] = [
+      { ...base, packageRules: [{ matchPackageNames: ['*'], enabled: false }] },
+      { ...base, packageRules: [{ matchPaths: ['**'], enabled: false }] },
+      { ...base, packageRules: [{ matchPackageNames: ['*'], ignoreDeps: ['x'] }] },
+      { ...base, ignorePaths: ['**'] },
+      { ...base, ignoreDeps: ['react'] },
+      { ...base, schedule: ['* * 30 2 *'] },
+      { ...base, extends: ['config:best-practices'] },
+      { ...base, extends: ['config:best-practices'], packageRules: [{ matchPackageNames: ['react'], minimumReleaseAge: '14 days' }] },
+    ];
+    for (const c of cases) {
+      const dir = makeTempDir();
+      writeIn(dir, 'renovate.json', JSON.stringify(c));
+      expect((await update(dir, {}, true)).status, JSON.stringify(c)).toBe('partial');
+    }
+    for (const rule of [{ minimumReleaseAge: '7 days' }, { matchPackageNames: ['*'], minimumReleaseAge: '7 days' }]) {
+      const dir = makeTempDir();
+      writeIn(dir, 'renovate.json', JSON.stringify({ extends: ['config:best-practices'], packageRules: [rule] }));
+      expect((await update(dir, {}, true)).status, JSON.stringify(rule)).toBe('covered');
+    }
+  });
+
+  it('7. ESLint: a range whose lower bound is 9 with only .eslintrc may resolve to 10 and is never covered', () => {
+    const lint: Coverage = { need: need('lint', 'merge', 'app'), status: 'covered', by: 'eslint', why: 'The eslint check runs on every pull request.' };
+    const profile = (v: string, cfg: Service['quality']['eslintConfig'], fromRange: Service['quality']['fromRange']): RepoProfile => ({
+      owner: 'o', repo: 'r', defaultBranch: 'main', private: false, ownerType: 'User', plan: 'free', monorepo: 'none',
+      services: [svc('.', { quality: { ...emptyServiceQuality(), versions: { eslint: v }, eslintConfig: cfg, fromRange } })], terraformDirs: [], hasCompose: false,
+      existingWorkflows: [], precommit: null, repoFiles: emptyRepoFiles(),
+    });
+    const r = versionAdjust([lint], profile('9.0.0', 'eslintrc', ['eslint']))[0];
+    expect(r?.status).toBe('partial');
+    expect(r?.why).toMatch(/ESLint 10 doesn't read \.eslintrc/);
+    expect(versionAdjust([lint], profile('9.1.0', 'eslintrc', []))[0]?.status).toBe('covered'); // an exact lockfile version
+  });
+
+  it('8. a package.json in a subfolder no service owns still needs a Dependabot entry (found by a bounded glob)', async () => {
+    const dir = makeTempDir();
+    writeIn(dir, 'package.json', '{"name":"root"}');
+    writeIn(dir, 'web/package.json', '{"name":"web"}');
+    writeIn(dir, 'node_modules/dep/package.json', '{}');
+    writeIn(dir, 'tools/pyproject.toml', '[project]\nname = "t"\n');
+    dep(dir, depFile(upd('npm', '/')));
+    expect((await update(dir)).status).toBe('partial');
+    dep(dir, depFile(upd('npm', '/'), upd('npm', '/web'), upd('pip', '/tools')));
+    expect((await update(dir)).status).toBe('covered');
+    dep(dir, depFile(upd('npm', '/'), upd('npm', '/web')));
+    expect((await update(dir)).status).toBe('partial'); // the Python folder has no entry
   });
 });

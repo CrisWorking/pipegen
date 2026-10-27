@@ -130,22 +130,49 @@ function jsonHoldsPositive(v: string): boolean {
   return false;
 }
 const THRESHOLD_FLAGS = ['--lines', '--functions', '--branches', '--statements'];
-/** Plan P Task 4: the command line sets a coverage minimum (the signature's minimumFlags or minimumSwitches). */
-export function minimumGiven(tool: ToolSignature, words: readonly string[]): boolean {
+/** Flags of the wrapper tools (c8, nyc, coverage) that take the next word as their value. */
+const WRAPPER_VALUE_FLAGS: ReadonlySet<string> = new Set([...THRESHOLD_FLAGS, '--reporter', '-r', '--include', '-n', '--exclude', '-x', '--temp-directory', '--report-dir', '--reports-dir', '--src', '--rcfile', '--data-file', '--cwd', '--branch-limit']);
+/**
+ * The words before the wrapped command: stops at the first word that is not an option or an option's value. A word
+ * after a flag pipegen doesn't know could be its value or the command, so it counts as the command (the rest is not read).
+ */
+function leadingWords(words: readonly string[]): readonly string[] {
+  if (words[0] === 'run') return []; // `coverage run` takes no minimum; what follows is the wrapped command
+  let i = words[0] === 'report' ? 1 : 0; // `coverage report` / `c8 report`: the subcommand is not the wrapped command
+  while (i < words.length) {
+    const w = words[i] as string;
+    if (!w.startsWith('-')) break;
+    i += !w.includes('=') && WRAPPER_VALUE_FLAGS.has(w) ? 2 : 1;
+  }
+  return words.slice(0, i);
+}
+/**
+ * Plan P Task 4 (PB4 b): what the command line says about a coverage minimum. 'set': a number above 0 from a minimum
+ * flag (or --check-coverage with a threshold flag above 0); 'off': a minimum flag given with 0, an empty object or a value
+ * that isn't a number (the flag wins over any config file, so the minimum is off); 'none': nothing about it.
+ */
+export function minimumState(tool: ToolSignature, all: readonly string[]): 'set' | 'off' | 'none' {
+  const words = tool.minimumLeading === true ? leadingWords(all) : all;
+  let off = false;
   for (const f of tool.minimumFlags ?? []) {
     const v = lastFlagValue(f, words);
-    if (typeof v === 'string' && (positiveNumber(v) || jsonHoldsPositive(v))) return true;
+    if (v === undefined) continue;
+    if (typeof v === 'string' && (positiveNumber(v) || jsonHoldsPositive(v))) return 'set';
+    off = true;
   }
   if ((tool.minimumSwitches ?? []).some((f) => onlyFlagGiven(f, words))) {
-    return THRESHOLD_FLAGS.some((f) => { const v = lastFlagValue(f, words); return typeof v === 'string' && positiveNumber(v); });
+    if (THRESHOLD_FLAGS.some((f) => { const v = lastFlagValue(f, words); return typeof v === 'string' && positiveNumber(v); })) return 'set';
   }
-  return false;
+  return off ? 'off' : 'none';
 }
 
 export function commandReason(tool: ToolSignature, words: readonly string[]): Reason | null {
   const { ws, spec } = flagView(tool, words);
   if ((tool.softFlags ?? []).some((f) => flagGiven(spec(f), ws))) return 'soft';
-  if (tool.commandFails === 'never') return minimumGiven(tool, ws) ? null : 'never';
+  if (tool.commandFails === 'never') {
+    const m = minimumState(tool, ws);
+    return m === 'set' ? null : m === 'off' ? 'soft' : 'never';
+  }
   // fix round 1: a fail flag set to a false value (--fail-on-violation=false, --fail=false) doesn't make it fail
   if (tool.commandFails === 'flag' && !(tool.failFlags ?? []).some((f) => onlyFlagGiven(spec(f), ws))) return 'no-fail';
   return null;

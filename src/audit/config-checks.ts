@@ -51,6 +51,8 @@ const rank: Record<Status, number> = { covered: 3, partial: 2, unknown: 1, missi
 
 type Read = { text: string } | { skipped: Skipped } | null;
 
+const inRepo = (folder: string, name: string) => (folder === '.' ? name : `${folder}/${name}`);
+
 /** A file at a fixed path under dir: null when absent; a symbolic link at any level, a big, binary or unreadable file → skipped. */
 async function readAt(dir: string, rel: string): Promise<Read> {
   if ((await linkedLevel(dir, rel)) !== null) return { skipped: 'link' };
@@ -123,6 +125,12 @@ function entryOn(entry: Record<string, unknown>): boolean {
     const v = entry['open-pull-requests-limit'];
     if (typeof v !== 'number' || !Number.isInteger(v) || v < 1) return false;
   }
+  // an `allow` list limits which dependencies are updated; only one that allows every dependency is no limit
+  if (Object.hasOwn(entry, 'allow')) {
+    const al = entry.allow;
+    const everything = (r: unknown) => r !== null && typeof r === 'object' && Object.keys(r).length === 1 && (r as Record<string, unknown>)['dependency-name'] === '*';
+    if (!Array.isArray(al) || !al.some(everything)) return false;
+  }
   if (Object.hasOwn(entry, 'ignore')) {
     const ig = entry.ignore;
     if (!Array.isArray(ig)) return false;
@@ -134,13 +142,16 @@ function entryOn(entry: Record<string, unknown>): boolean {
 interface Requirement { ecos: readonly string[]; dir: string }
 
 /** Where a Go module, or a Dockerfile, sits: found here because no reader sets language 'go' (ruling P2). */
-async function listedFolders(dir: string): Promise<{ go: string[]; docker: string[]; truncated: boolean }> {
+async function listedFolders(dir: string): Promise<{ go: string[]; docker: string[]; node: string[]; python: string[]; truncated: boolean }> {
   const ignore = IGNORED_DIRS.map((d) => `**/${d}/**`);
-  const found = await listFiles(dir, ['**/go.mod', '**/Dockerfile', '**/Dockerfile.*'], ignore);
-  const go = new Set<string>();
-  const docker = new Set<string>();
-  for (const f of found.files) (f.endsWith('go.mod') && (f === 'go.mod' || f.endsWith('/go.mod')) ? go : docker).add(dirOf(f));
-  return { go: [...go].sort(), docker: [...docker].sort(), truncated: found.truncated };
+  const found = await listFiles(dir, ['**/go.mod', '**/Dockerfile', '**/Dockerfile.*', '**/package.json', '**/pyproject.toml', '**/requirements*.txt'], ignore);
+  const sets = { go: new Set<string>(), docker: new Set<string>(), node: new Set<string>(), python: new Set<string>() };
+  for (const f of found.files) {
+    const base = f.slice(f.lastIndexOf('/') + 1);
+    const kind = base === 'go.mod' ? 'go' : base === 'package.json' ? 'node' : base === 'pyproject.toml' || base.startsWith('requirements') ? 'python' : 'docker';
+    sets[kind].add(dirOf(f));
+  }
+  return { go: [...sets.go].sort(), docker: [...sets.docker].sort(), node: [...sets.node].sort(), python: [...sets.python].sort(), truncated: found.truncated };
 }
 
 async function dependabotVerdict(p: RepoProfile, dir: string): Promise<Verdict | null> {
@@ -174,7 +185,11 @@ async function dependabotVerdict(p: RepoProfile, dir: string): Promise<Verdict |
   for (const raw of root.updates as unknown[]) {
     if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) continue;
     const e = raw as Record<string, unknown>;
-    if (typeof e['package-ecosystem'] !== 'string' || !entryOn(e)) continue;
+    if (typeof e['package-ecosystem'] !== 'string') continue;
+    // GitHub rejects the whole file when an entry has no schedule interval
+    const interval = asObj(e.schedule).interval;
+    if (typeof interval !== 'string' || interval === '') return mk('partial', "A Dependabot entry has no schedule.interval, so GitHub rejects the config file.");
+    if (!entryOn(e)) continue;
     const m: Matcher = { literals: new Set(), globs: [], cooldownOk: cooldownOk(e) };
     let usable = true;
     const take = (v: unknown, glob: boolean) => {
@@ -217,6 +232,9 @@ async function dependabotVerdict(p: RepoProfile, dir: string): Promise<Verdict |
   const listed = await listedFolders(dir);
   for (const d of listed.go) reqs.push({ ecos: ['gomod'], dir: d });
   for (const d of listed.docker) reqs.push({ ecos: ['docker'], dir: d });
+  // a manifest in a folder no service owns (the service reader skips it) still needs an entry
+  for (const d of listed.node) reqs.push({ ecos: ['npm', 'bun'], dir: d });
+  for (const d of listed.python) reqs.push({ ecos: ['pip', 'uv'], dir: d });
   if (reqs.length > MAX_REQUIREMENTS) return mk('unknown', 'There are more ecosystems and folders than pipegen checks against the Dependabot file.');
   if (reqs.length === 0) return mk('unknown', 'pipegen found no ecosystem it can check against the Dependabot file.');
 
@@ -304,22 +322,38 @@ async function renovateVerdict(dir: string, running: boolean): Promise<Verdict |
   if (Object.hasOwn(c, 'internalChecksFilter') && c.internalChecksFilter !== 'strict') {
     return part(`Renovate's internalChecksFilter isn't "strict", so it can still open update pull requests before ${COOLDOWN_DAYS} days have passed.`);
   }
-  if (!Object.hasOwn(c, 'minimumReleaseAge')) {
+  for (const k of ['ignorePaths', 'ignoreDeps', 'schedule']) {
+    if (Object.hasOwn(c, k)) return part(`Renovate's config sets ${k}, which can keep it from updating some or all dependencies, so pipegen can't tell that the wait covers them.`);
+  }
+  const matchAllRule = Array.isArray(c.packageRules) && (c.packageRules as unknown[]).some((r) => {
+    if (r === null || typeof r !== 'object' || Array.isArray(r)) return false;
+    const o = r as Record<string, unknown>;
+    const d = renovateDays(o.minimumReleaseAge);
+    const keys = Object.keys(o).filter((k) => k !== 'minimumReleaseAge');
+    const names = o.matchPackageNames;
+    const all = keys.length === 0 || (keys.length === 1 && keys[0] === 'matchPackageNames' && Array.isArray(names) && names.length === 1 && (names[0] === '*' || names[0] === '/.*/'));
+    return d !== null && d >= COOLDOWN_DAYS && all;
+  });
+  if (!Object.hasOwn(c, 'minimumReleaseAge') && !(extendsList.length > 0 && matchAllRule)) {
     return part(extendsList.length > 0
       ? "Renovate's minimumReleaseAge is set by a preset pipegen can't read, if at all."
       : `Renovate's config sets no minimumReleaseAge, so new releases are updated at once; pipegen uses ${COOLDOWN_DAYS} days.`);
   }
-  const days = renovateDays(c.minimumReleaseAge);
+  const days = Object.hasOwn(c, 'minimumReleaseAge') ? renovateDays(c.minimumReleaseAge) : COOLDOWN_DAYS; // absent only with a match-all rule
   if (days === null || days < COOLDOWN_DAYS) return part(`Renovate's minimumReleaseAge is shorter than ${COOLDOWN_DAYS} days, or pipegen can't read it.`);
   if (Object.hasOwn(c, 'packageRules')) {
     if (!Array.isArray(c.packageRules)) return part("Renovate's packageRules isn't a list that pipegen can read.");
     if (c.packageRules.length > 1000) return part("Renovate's packageRules is longer than pipegen reads.");
     for (const rule of c.packageRules as unknown[]) {
+      if (rule !== null && typeof rule === 'object' && !Array.isArray(rule) && ((rule as Record<string, unknown>).enabled === false
+        || ['ignorePaths', 'ignoreDeps', 'schedule'].some((k) => Object.hasOwn(rule, k)))) return part('A Renovate packageRules entry turns updates off or limits them, so pipegen can\'t tell that the wait covers every dependency.');
       if (rule === null || typeof rule !== 'object' || Array.isArray(rule) || !Object.hasOwn(rule, 'minimumReleaseAge')) continue;
       const d = renovateDays((rule as Record<string, unknown>).minimumReleaseAge);
       if (d === null || d < COOLDOWN_DAYS) return part(`A Renovate packageRules entry sets a minimumReleaseAge under ${COOLDOWN_DAYS} days, or pipegen can't read it.`);
     }
   }
+  // a preset in `extends` can carry its own packageRules with a shorter age; only a match-all rule of the repo's own wins over it
+  if (extendsList.length > 0 && !matchAllRule) return part("Renovate's config extends a preset, which may set a shorter minimumReleaseAge for some packages, and pipegen can't read presets.");
   if (!running) return part("Renovate's config waits at least 7 days, but pipegen can't see whether the Renovate app is installed (read access doesn't show GitHub Apps), and no workflow runs Renovate.");
   return { status: 'covered', by: 'renovate', where, why: `Renovate waits at least ${COOLDOWN_DAYS} days (minimumReleaseAge) before updating, and a workflow runs Renovate on a schedule.` };
 }
@@ -393,25 +427,25 @@ function thresholdSet(v: unknown): boolean {
 const positive = (v: unknown): boolean => typeof v === 'number' && Number.isFinite(v) && v > 0;
 const positiveText = (s: string) => /^\d{1,6}(\.\d{1,6})?$/.test(s) && Number(s) > 0;
 
-async function jsonConfig(dir: string, rel: string, pick: (o: Record<string, unknown>) => unknown): Promise<Found> {
-  const r = await readAt(dir, rel);
+async function jsonConfig(dir: string, folder: string, name: string, pick: (o: Record<string, unknown>) => unknown): Promise<Found> {
+  const r = await readAt(dir, inRepo(folder, name));
   if (r === null) return { kind: 'none' };
   if ('skipped' in r) return { kind: 'unreadable' };
   try {
     const o = asObj(JSON.parse(r.text));
     const v = pick(o);
-    return v !== undefined && thresholdSet(v) ? { kind: 'set', file: rel.split('/').pop() as string } : { kind: 'none' };
+    return v !== undefined && thresholdSet(v) ? { kind: 'set', file: name } : { kind: 'none' };
   } catch {
     return { kind: 'unreadable' };
   }
 }
 
-async function jsText(dir: string, names: readonly string[]): Promise<Found> {
+async function jsText(dir: string, folder: string, names: readonly string[]): Promise<Found> {
   let unreadable = false;
   let js: Found = { kind: 'none' };
   for (const name of names) {
     for (const ext of JS_EXTS) {
-      const r = await readAt(dir, `${name}.${ext}`);
+      const r = await readAt(dir, inRepo(folder, `${name}.${ext}`));
       if (r === null) continue;
       if ('skipped' in r) {
         unreadable = true;
@@ -442,22 +476,22 @@ function iniFailUnder(text: string, section: string): string | null | undefined 
   return value;
 }
 
-async function pythonMinimum(dir: string): Promise<Found> {
+async function pythonMinimum(dir: string, folder: string): Promise<Found> {
   // coverage.py reads the first of these that exists (and, for setup.cfg, tox.ini and pyproject.toml, has coverage settings)
-  const rc = await readAt(dir, '.coveragerc');
+  const rc = await readAt(dir, inRepo(folder, '.coveragerc'));
   if (rc !== null) {
     if ('skipped' in rc) return { kind: 'unreadable' };
     return positiveText(iniFailUnder(rc.text, 'report') ?? '') ? { kind: 'set', file: '.coveragerc' } : { kind: 'none' };
   }
-  if ((await readAt(dir, '.coveragerc.toml')) !== null) return { kind: 'unreadable' }; // not read yet
+  if ((await readAt(dir, inRepo(folder, '.coveragerc.toml'))) !== null) return { kind: 'unreadable' }; // not read yet
   for (const name of ['setup.cfg', 'tox.ini']) {
-    const r = await readAt(dir, name);
+    const r = await readAt(dir, inRepo(folder, name));
     if (r === null) continue;
     if ('skipped' in r) return { kind: 'unreadable' };
     if (!regexLines(r.text).some((l) => /^\[coverage:[^\]]*\]\s*$/.test(l.trim()))) continue;
     return positiveText(iniFailUnder(r.text, 'coverage:report') ?? '') ? { kind: 'set', file: name } : { kind: 'none' };
   }
-  const py = await readAt(dir, 'pyproject.toml');
+  const py = await readAt(dir, inRepo(folder, 'pyproject.toml'));
   if (py === null) return { kind: 'none' };
   if ('skipped' in py) return { kind: 'unreadable' };
   try {
@@ -469,16 +503,16 @@ async function pythonMinimum(dir: string): Promise<Found> {
   }
 }
 
-async function minimumIn(folderDir: string, family: Family | undefined): Promise<Found> {
+async function minimumIn(dir: string, folder: string, family: Family | undefined): Promise<Found> {
   const all: Found[] = [];
   const want = (f: Family) => family === undefined || family === f;
   if (want('jest')) {
-    all.push(await jsonConfig(folderDir, 'package.json', (o) => asObj(o.jest).coverageThreshold));
-    all.push(await jsonConfig(folderDir, 'jest.config.json', (o) => o.coverageThreshold));
-    all.push(await jsText(folderDir, ['jest.config']));
+    all.push(await jsonConfig(dir, folder, 'package.json', (o) => asObj(o.jest).coverageThreshold));
+    all.push(await jsonConfig(dir, folder, 'jest.config.json', (o) => o.coverageThreshold));
+    all.push(await jsText(dir, folder, ['jest.config']));
   }
-  if (want('vitest')) all.push(await jsText(folderDir, ['vitest.config', 'vite.config']));
-  if (want('python')) all.push(await pythonMinimum(folderDir));
+  if (want('vitest')) all.push(await jsText(dir, folder, ['vitest.config', 'vite.config']));
+  if (want('python')) all.push(await pythonMinimum(dir, folder));
   return all.find((f) => f.kind === 'set') ?? all.find((f) => f.kind === 'unreadable') ?? all.find((f) => f.kind === 'js') ?? { kind: 'none' };
 }
 
@@ -491,7 +525,7 @@ async function minimumIn(folderDir: string, family: Family | undefined): Promise
 export async function coverageMinimum(dir: string, s: Service, runDir?: string): Promise<'set' | 'none' | 'unknown'> {
   const folder = cleanFolder(runDir ?? s.path);
   if (folder === null) return 'unknown';
-  const f = await minimumIn(folder === '.' ? dir : join(dir, folder), undefined);
+  const f = await minimumIn(dir, folder, undefined);
   return f.kind === 'set' ? 'set' : f.kind === 'none' ? 'none' : 'unknown';
 }
 
@@ -505,7 +539,7 @@ export async function coverageMinimumRow(row: Coverage, hit: Pick<Hit, 'by' | 'r
   if (family === undefined || hit.dir === null) return row;
   const folder = cleanFolder(hit.dir);
   if (folder === null) return row;
-  const f = await minimumIn(folder === '.' ? dir : join(dir, folder), family);
+  const f = await minimumIn(dir, folder, family);
   switch (f.kind) {
     case 'set':
       return { ...row, status: 'covered', why: `${hit.subject} measures coverage and a minimum is set in ${f.file}, so a drop below it fails the run.` };
@@ -562,6 +596,12 @@ export function versionAdjust(rows: Coverage[], p: RepoProfile): Coverage[] {
     const major = Number(version.split('.')[0]);
     if (!Number.isInteger(major)) return r;
     const range = s.quality.fromRange.includes('eslint');
+    if (range && major >= 9 && major < 10 && s.quality.eslintConfig === 'eslintrc') {
+      return {
+        ...r, status: 'partial',
+        why: `package.json asks for at least ESLint ${major}, which can resolve to ESLint 10, and ESLint 10 doesn't read .eslintrc, so this run may check nothing until the config is migrated (${MIGRATE_HINT} does it).`,
+      };
+    }
     if (major >= 10 && s.quality.eslintConfig === 'eslintrc') {
       return {
         ...r, status: 'partial',

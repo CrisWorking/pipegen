@@ -524,7 +524,11 @@ tools:
   # Fail if the total coverage is less than MIN"); coverage.py https://coverage.readthedocs.io/en/latest/config.html
   # ([report] fail_under; the config file can be swapped with --rcfile or COVERAGE_RCFILE, so that env var is a softEnv);
   # c8 https://github.com/bcoe/c8/blob/main/README.md (`c8 --check-coverage --lines 100 npm test`; its default
-  # thresholds aren't documented there, so --check-coverage counts only with a threshold flag).
+  # thresholds aren't documented there, so --check-coverage counts only with a threshold flag). Fix round 1: a flag that
+  # swaps the config file (jest --config/-c/--rootDir/--projects; vitest --config/-c/--root/-r; pytest --cov-config, -c and
+  # --rootdir; coverage --rcfile) is a softFlag, so the run stays partial; a minimum flag set to 0 is "off" (the CLI value wins
+  # over config, as in pytest-cov's `if self.options.cov_fail_under is None`); c8, nyc and coverage run read flags only
+  # before the command they wrap.
   # https://vitest.dev/guide/coverage (--coverage, or --coverage.enabled; false turns it off)
   - id: vitest-cov
     categories: [coverage]
@@ -533,6 +537,7 @@ tools:
     notWithFlags: [--coverage=false, --coverage.enabled=false, --no-coverage]
     commandFails: never
     partialWhy: This run measures test coverage, but pipegen hasn't checked for a minimum, so a drop in coverage may not fail it.
+    softFlags: [--config, -c, --root, -r]
     minimumFlags: [--coverage.thresholds.lines, --coverage.thresholds.functions, --coverage.thresholds.branches, --coverage.thresholds.statements]
   # https://jestjs.io/docs/cli (--coverage, alias --collectCoverage; --listTests, --showConfig and --collectTests run no tests)
   - id: jest-cov
@@ -542,6 +547,7 @@ tools:
     notWithFlags: [--coverage=false, --collectCoverage=false, --no-coverage, --listTests, --showConfig, --collectTests]
     commandFails: never
     partialWhy: This run measures test coverage, but pipegen hasn't checked for a minimum, so a drop in coverage may not fail it.
+    softFlags: [--config, -c, --rootDir, --projects]
     minimumFlags: [--coverageThreshold]
   # https://github.com/bcoe/c8/blob/main/README.md (c8 runs a command and measures its coverage)
   - id: c8
@@ -549,6 +555,7 @@ tools:
     commands: [c8]
     commandFails: never
     partialWhy: This run measures test coverage, but pipegen hasn't checked for a minimum, so a drop in coverage may not fail it.
+    minimumLeading: true
     minimumSwitches: [--check-coverage]
   # https://github.com/istanbuljs/nyc/blob/main/README.md (nyc runs a command and measures its coverage; it is also a
   # wrapper, so the command it runs is read too)
@@ -557,6 +564,7 @@ tools:
     commands: [nyc]
     commandFails: never
     partialWhy: This run measures test coverage, but pipegen hasn't checked for a minimum, so a drop in coverage may not fail it.
+    minimumLeading: true
     minimumSwitches: [--check-coverage]
   # https://pytest-cov.readthedocs.io/en/latest/config.html (--cov[=SOURCE]; --no-cov turns it off)
   - id: pytest-cov
@@ -566,6 +574,7 @@ tools:
     notWithFlags: [--no-cov]
     commandFails: never
     partialWhy: This run measures test coverage, but pipegen hasn't checked for a minimum, so a drop in coverage may not fail it.
+    softFlags: [--cov-config, -c, --rootdir]
     minimumFlags: [--cov-fail-under]
     softEnv: [COVERAGE_RCFILE]
   # https://coverage.readthedocs.io/en/latest/cmd.html (coverage run measures, coverage report reports)
@@ -574,6 +583,8 @@ tools:
     commands: [coverage run, coverage report]
     commandFails: never
     partialWhy: This run measures test coverage, but pipegen hasn't checked for a minimum, so a drop in coverage may not fail it.
+    softFlags: [--rcfile]
+    minimumLeading: true
     minimumFlags: [--fail-under]
     softEnv: [COVERAGE_RCFILE]
   # https://github.com/golang/go/blob/master/src/cmd/go/internal/test/test.go (-cover; -covermode, -coverpkg and
