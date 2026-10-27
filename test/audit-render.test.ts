@@ -13,7 +13,7 @@ import { fake } from './helpers/secret-repo.js';
 
 const NOW = Date.UTC(2026, 9, 27, 9, 30);
 const ANON = { text: 'Without a GitHub token, pipegen reads public data only and is rate-limited.' };
-const SWAP = { text: 'This repo could change which pipegen runs. Run pipegen from outside the repo, from the npm registry, with:', command: safeRunCommand('0.1.0') };
+const SWAP = { text: 'This repo could change which pipegen runs. Run pipegen from outside the repo, from the npm registry, with:', command: safeRunCommand('0.1.0')! };
 const OPTS: RenderOptions = { knownValues: [], now: () => NOW };
 const report = (): AuditReport => freePrivateReport(EXCLUDED_PATTERNS);
 const term = (r: AuditReport, o: RenderOptions = OPTS) => renderTerminal(r, o);
@@ -527,10 +527,13 @@ describe('fix round 1', () => {
   });
 
   it('I3 (U17): pipegen\'s own commands appear byte for byte, unwrapped in the terminal and unescaped in Markdown', () => {
-    const cmd = safeRunCommand('0.1.0');
+    const cmd = safeRunCommand('0.1.0')!;
     expect(cmd).toBe('npx --registry=https://registry.npmjs.org pipegen@0.1.0 audit --dir ./repo');
-    expect(safeRunCommand('1.2.3-evil; rm -rf /')).toBe('npx --registry=https://registry.npmjs.org pipegen audit --dir ./repo');
-    expect(safeRunCommand(null)).toBe('npx --registry=https://registry.npmjs.org pipegen audit --dir ./repo');
+    // no exact version → no command at all: an unpinned npx pipegen would run whatever owns the npm name (U18)
+    expect(safeRunCommand('1.2.3-evil; rm -rf /')).toBeNull();
+    expect(safeRunCommand('0.1.0-rc.1')).toBeNull();
+    expect(safeRunCommand(null)).toBeNull();
+    expect(isOwnCommand('npx --registry=https://registry.npmjs.org pipegen audit --dir ./repo')).toBe(false);
     const r = { ...report(), warnings: [SWAP] };
     const tLines = term(r).split('\n');
     expect(tLines).toContain(`    ${cmd}`); // on its own line, whole
@@ -541,7 +544,7 @@ describe('fix round 1', () => {
     expect(mLines[at + 1]).toBe('  ```');
     expect(md(r)).not.toContain('\\`npx');
     // a long version is still one line in the terminal
-    const long = safeRunCommand('123456789.123456789.123456789');
+    const long = safeRunCommand('123456789.123456789.123456789')!;
     expect(long.length).toBeGreaterThan(90);
     const longLines = term({ ...r, warnings: [{ ...SWAP, command: long }] }).split('\n');
     expect(longLines).toContain(`    ${long}`);
@@ -564,7 +567,7 @@ describe('fix round 1', () => {
     const r = { ...report(), warnings: [SWAP], ai: aiPart() };
     for (const text of [term(r), md(r), json(r)]) {
       expect(text).not.toMatch(/npx\s+pipegen/);
-      expect(text).toContain(safeRunCommand('0.1.0')); // `npx --registry=… pipegen@0.1.0 audit …` stays
+      expect(text).toContain(safeRunCommand('0.1.0')!); // `npx --registry=… pipegen@0.1.0 audit …` stays
       expect(text).toContain('The full setup arrives in v0.2 for single-package Node/TypeScript repos.');
     }
     expect(isOwnCommand('npx pipegen')).toBe(false);

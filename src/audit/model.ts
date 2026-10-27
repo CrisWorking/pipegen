@@ -188,9 +188,10 @@ const SEMVER = /^\d{1,9}\.\d{1,9}\.\d{1,9}$/;
  * The command that runs this pipegen from outside the repo, from npm's own registry (ruling S30/U17). Built only from
  * constants and `version` (pipegen's own package.json), which must be a plain x.y.z, else it is left out.
  */
-export function safeRunCommand(version: string | null): string {
-  const pkg = version !== null && SEMVER.test(version) ? `pipegen@${version}` : 'pipegen';
-  return `npx --registry=${NPM_REGISTRY} ${pkg} audit --dir ./repo`;
+export function safeRunCommand(version: string | null): string | null {
+  // No exact version, no command: an unpinned `npx pipegen` runs whatever owns the npm name today (ruling U18).
+  if (version === null || !SEMVER.test(version)) return null;
+  return `npx --registry=${NPM_REGISTRY} pipegen@${version} audit --dir ./repo`;
 }
 /**
  * True for a command pipegen itself builds (safeRunCommand) and nothing else: the renderers print a
@@ -198,7 +199,7 @@ export function safeRunCommand(version: string | null): string {
  */
 export function isOwnCommand(s: unknown): s is string {
   return typeof s === 'string'
-    && /^npx --registry=https:\/\/registry\.npmjs\.org pipegen(?:@\d{1,9}\.\d{1,9}\.\d{1,9})? audit --dir \.\/repo$/.test(s);
+    && /^npx --registry=https:\/\/registry\.npmjs\.org pipegen@\d{1,9}\.\d{1,9}\.\d{1,9} audit --dir \.\/repo$/.test(s);
 }
 
 /** pipegen's own checks (the merge gate, the deploy-time verify): pipegen adds them itself, so no tool is picked for them and they never make a layer "serious" (ruling U16). */
@@ -251,6 +252,7 @@ const UNTRACKED_NOTE = "pipegen reads the files on disk without git, so files th
 // Worded so redact() leaves it whole at output ("No token: …" would be cut; review M3).
 const NO_TOKEN = 'Without a GitHub token, pipegen reads public data only and is rate-limited.';
 const SWAP_TEXT = 'This repo could change which pipegen runs. Run pipegen from outside the repo, from the npm registry, with:';
+const SWAP_TEXT_NO_COMMAND = 'This repo could change which pipegen runs. Run pipegen from outside the repo, from the npm registry, with an exact version (pipegen@x.y.z).';
 /**
  * Ruling U12: the `.npmrc` keys that can't change which pipegen npx fetches or how it starts it (npm's config docs):
  * saving, lockfile, engine and output settings. Any other key warns: registries (any scope), proxies, TLS (`strict-ssl`,
@@ -501,7 +503,8 @@ async function scanTree(dir: string, notes: Notes): Promise<SecretInTree[]> {
 async function warningsOf(dir: string, anonymous: boolean): Promise<AuditWarning[]> {
   const out: AuditWarning[] = [];
   if (await npmrcHasUnsafeKey(dir) || (await lstat(join(dir, 'node_modules', '.bin', 'pipegen')).catch(() => null)) !== null) {
-    out.push({ text: SWAP_TEXT, command: safeRunCommand(packageVersion()) });
+    const command = safeRunCommand(packageVersion());
+    out.push(command !== null ? { text: SWAP_TEXT, command } : { text: SWAP_TEXT_NO_COMMAND });
   }
   if (anonymous) out.push({ text: NO_TOKEN });
   return out;
