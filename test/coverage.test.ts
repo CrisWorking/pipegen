@@ -1,4 +1,4 @@
-import { mkdirSync, symlinkSync } from 'node:fs';
+import { mkdirSync, readFileSync, symlinkSync } from 'node:fs';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { loadToolSignatures, mapCoverage, type Coverage } from '../src/audit/coverage.js';
@@ -420,11 +420,12 @@ describe('mapCoverage (fix round 1)', () => {
 
   it('coverage: I1 action inputs: exit-code, fail-build, fail_action, soft_fail, warn-only', async () => {
     const st = async (uses: string, withLines: string, id: string, over: Partial<RepoProfile> = {}, service?: string) =>
-      (await one(`${both}${job(`      - uses: ${uses}\n${withLines === '' ? '' : `        with:\n${withLines}`}`)}`, id === 'iac' ? 'merge' : 'push', id, over, service)).status;
-    expect(await st('aquasecurity/trivy-action@0.28.0', '', 'deps', {}, 'app')).toBe('partial');
-    expect(await st('aquasecurity/trivy-action@0.28.0', "          exit-code: '1'\n", 'deps', {}, 'app')).toBe('covered');
-    expect(await st('aquasecurity/trivy-action@0.28.0', "          exit-code: '0'\n", 'deps', {}, 'app')).toBe('partial');
-    expect(await st('aquasecurity/trivy-action@0.28.0', '          exit-code: ${{ inputs.code }}\n', 'deps', {}, 'app')).toBe('partial');
+      (await one(`${both}${job(`      - uses: ${uses}\n${withLines === '' ? '' : `        with:\n${withLines}`}`)}`, id === 'iac' || id === 'image-scan' ? 'merge' : 'push', id, over, service)).status;
+    // Plan P Task 3 (PB3): trivy-action's default scan-type is image, so these are image scans, not dependency scans
+    expect(await st('aquasecurity/trivy-action@0.28.0', '', 'image-scan', runnable, 'app')).toBe('partial');
+    expect(await st('aquasecurity/trivy-action@0.28.0', "          exit-code: '1'\n", 'image-scan', runnable, 'app')).toBe('covered');
+    expect(await st('aquasecurity/trivy-action@0.28.0', "          exit-code: '0'\n", 'image-scan', runnable, 'app')).toBe('partial');
+    expect(await st('aquasecurity/trivy-action@0.28.0', '          exit-code: ${{ inputs.code }}\n', 'image-scan', runnable, 'app')).toBe('partial');
     expect(await st('anchore/scan-action@v6', '', 'deps', {}, 'app')).toBe('covered');
     expect(await st('anchore/scan-action@v6', '          fail-build: false\n', 'deps', {}, 'app')).toBe('partial');
     expect(await st('trufflesecurity/trufflehog@v3', '', 'secrets')).toBe('covered'); // the action always passes --fail
@@ -614,8 +615,9 @@ describe('mapCoverage (fix round 2)', () => {
     ['soft_fail: "yes" checkov-action (only "true" counts upstream)', `${both}${job("      - uses: bridgecrewio/checkov-action@v12\n        with:\n          soft_fail: 'yes'\n")}`, 'merge', 'iac', 'covered'],
     ['soft_fail: false tfsec-action (any value counts upstream)', `${both}${job('      - uses: aquasecurity/tfsec-action@v1\n        with:\n          soft_fail: false\n')}`, 'merge', 'iac', 'partial'],
     ['Warn-Only: true dependency-review', `${both}${job('      - uses: actions/dependency-review-action@v4\n        with:\n          Warn-Only: true\n')}`, 'merge', 'deps', 'partial'],
-    ['trivy-action Exit-Code: 1', `${both}${job("      - uses: aquasecurity/trivy-action@0.28.0\n        with:\n          Exit-Code: '1'\n")}`, 'push', 'deps', 'covered'],
-    ['trivy-action exit-code empty', `${both}${job("      - uses: aquasecurity/trivy-action@0.28.0\n        with:\n          exit-code: ''\n")}`, 'push', 'deps', 'partial'],
+    // Plan P Task 3 (PB3): trivy-action scans an image by default (image-scan, not deps)
+    ['trivy-action Exit-Code: 1', `${both}${job("      - uses: aquasecurity/trivy-action@0.28.0\n        with:\n          Exit-Code: '1'\n")}`, 'merge', 'image-scan', 'covered'],
+    ['trivy-action exit-code empty', `${both}${job("      - uses: aquasecurity/trivy-action@0.28.0\n        with:\n          exit-code: ''\n")}`, 'merge', 'image-scan', 'partial'],
     ['zap fail_action "True"', `${both}${job("      - uses: zaproxy/action-baseline@v0.14.0\n        with:\n          fail_action: 'True'\n")}`, 'merge', 'dast', 'covered'],
     ['zap default', `${both}${job('      - uses: zaproxy/action-baseline@v0.14.0\n')}`, 'merge', 'dast', 'partial'],
     ['checkov -s', `${both}${job('      - run: checkov -d . -s\n')}`, 'merge', 'iac', 'partial'],
@@ -635,7 +637,7 @@ describe('mapCoverage (fix round 2)', () => {
     ['npm audit --audit-level=none', `${both}${job('      - run: npm audit --audit-level=none\n')}`, 'push', 'deps', 'partial'],
     ['semgrep ci || true', `${both}${job('      - run: semgrep ci || true\n')}`, 'push', 'sast', 'partial'],
     ['&& at line end, then || true', `${both}${job('      - run: |\n          trivy fs --exit-code 1 . &&\n            echo ok || true\n')}`, 'push', 'deps', 'partial'],
-    ['trivy-action exit-code 1, continue-on-error expression', `${both}${job("      - uses: aquasecurity/trivy-action@0.28.0\n        continue-on-error: \${{ github.event_name == 'push' }}\n        with:\n          exit-code: '1'\n")}`, 'push', 'deps', 'partial'],
+    ['trivy-action exit-code 1, continue-on-error expression', `${both}${job("      - uses: aquasecurity/trivy-action@0.28.0\n        continue-on-error: \${{ github.event_name == 'push' }}\n        with:\n          exit-code: '1'\n")}`, 'merge', 'image-scan', 'partial'],
     ['step if: success() || event_name', `${both}${job("      - run: gitleaks detect\n        if: success() || github.event_name == 'push'\n")}`, 'merge', 'secrets', 'partial'],
     ['docker run with --security-opt, then version', `${both}${job('      - run: docker run --rm --security-opt x zricethezav/gitleaks:v8 version\n')}`, 'push', 'secrets', 'missing'],
     ['gitleaks version', `${both}${job('      - run: gitleaks version\n')}`, 'push', 'secrets', 'missing'],
@@ -729,7 +731,8 @@ describe('mapCoverage (fix round 3)', () => {
   });
 
   it('coverage: round 3: input spellings that differ only in case: a soft one wins', async () => {
-    const st = async (lines: string) => (await one(`${both}${job(`      - uses: aquasecurity/trivy-action@0.28.0\n        with:\n${lines}`)}`, 'push', 'deps', {}, 'app')).status;
+    // Plan P Task 3 (PB3): trivy-action's default scan-type is image
+    const st = async (lines: string) => (await one(`${both}${job(`      - uses: aquasecurity/trivy-action@0.28.0\n        with:\n${lines}`)}`, 'merge', 'image-scan', runnable, 'app')).status;
     expect(await st("          exit-code: '1'\n          EXIT-CODE: '0'\n")).toBe('partial');
     expect(await st("          EXIT-CODE: '0'\n          exit-code: '1'\n")).toBe('partial');
     expect(await st("          exit-code: '1'\n          Exit-Code: '2'\n")).toBe('covered');
@@ -791,16 +794,17 @@ describe('mapCoverage (fix round 4)', () => {
   it('coverage: round 4: more spellings of one input than pipegen keeps → partial, never covered', async () => {
     // exit-code has 9 letters: 2^9 case spellings; each sets the failing value '1'
     const variants = (n: number) => Array.from({ length: n }, (_, i) => Array.from('exit-code', (ch, b) => ((i >> b) & 1 ? ch.toUpperCase() : ch)).join(''));
-    expect((await one(trivy(variants(8).map((k) => `${k}: '1'`)), 'push', 'deps', {}, 'app')).status).toBe('covered');
-    const r = await one(trivy(variants(9).map((k) => `${k}: '1'`)), 'push', 'deps', {}, 'app');
+    // Plan P Task 3 (PB3): trivy-action's default scan-type is image, and the entry is trivy-image
+    expect((await one(trivy(variants(8).map((k) => `${k}: '1'`)), 'merge', 'image-scan', runnable, 'app')).status).toBe('covered');
+    const r = await one(trivy(variants(9).map((k) => `${k}: '1'`)), 'merge', 'image-scan', runnable, 'app');
     expect(r.status).toBe('partial');
-    expect(r.why).toBe('The trivy check runs, but its step sets more inputs than pipegen reads, so pipegen can\'t tell whether it blocks anything.');
+    expect(r.why).toBe('The trivy-image check runs, but its step sets more inputs than pipegen reads, so pipegen can\'t tell whether it blocks anything.');
   });
 
   it('coverage: round 4: a step with more inputs than pipegen reads → partial, never covered', async () => {
     const filler = (n: number) => spellings(n).map((k) => `${k}: x`);
-    expect((await one(trivy(["exit-code: '1'", ...filler(255)]), 'push', 'deps', {}, 'app')).status).toBe('covered');
-    const r = await one(trivy(["exit-code: '1'", ...filler(256)]), 'push', 'deps', {}, 'app');
+    expect((await one(trivy(["exit-code: '1'", ...filler(255)]), 'merge', 'image-scan', runnable, 'app')).status).toBe('covered');
+    const r = await one(trivy(["exit-code: '1'", ...filler(256)]), 'merge', 'image-scan', runnable, 'app');
     expect(r.status).toBe('partial');
     expect(r.why).toMatch(/sets more inputs than pipegen reads/);
   });
@@ -809,9 +813,9 @@ describe('mapCoverage (fix round 4)', () => {
     const dir = makeTempDir();
     wf(dir, 'ci.yml', trivy(["exit-code: '1'", ...spellings(30_000).map((k) => `${k}: 1`)]));
     const t = performance.now();
-    const p = await profileOf(dir);
+    const p = await profileOf(dir, runnable);
     expect(p.existingWorkflows).toHaveLength(1); // under the 1 MB read limit, so it really is read
-    const r = row(await mapCoverage(p, floorNeeds(p, caps), dir), 'push', 'deps', 'app');
+    const r = row(await mapCoverage(p, floorNeeds(p, caps), dir), 'merge', 'image-scan', 'app');
     const ms = performance.now() - t;
     expect(r.status).toBe('partial');
     expect(ms).toBeLessThan(5000);
@@ -883,11 +887,12 @@ describe('loadToolSignatures (S1)', () => {
   it('signatures: the bundled list loads and every entry names actions or commands', () => {
     const list = loadToolSignatures();
     const ids = list.map((t) => t.id);
-    for (const id of ['gitleaks', 'trufflehog', 'semgrep', 'codeql', 'snyk', 'trivy', 'grype', 'osv-scanner', 'npm-audit', 'zap', 'eslint', 'jest', 'vitest', 'cosign', 'syft', 'attest-build-provenance']) {
+    // Plan P Task 3 (PB3): trivy is split by subcommand (trivy-image, trivy-fs, trivy-config, …)
+    for (const id of ['gitleaks', 'trufflehog', 'semgrep', 'codeql', 'snyk', 'trivy-image', 'trivy-fs', 'trivy-config', 'grype', 'osv-scanner', 'npm-audit', 'zap', 'eslint', 'jest', 'vitest', 'cosign', 'syft', 'attest-build-provenance']) {
       expect(ids).toContain(id);
     }
     expect(new Set(ids).size).toBe(ids.length);
-    for (const t of list) expect((t.actions?.length ?? 0) + (t.commands?.length ?? 0)).toBeGreaterThan(0);
+    for (const t of list) expect((t.actions?.length ?? 0) + (t.commands?.length ?? 0) + (t.reusableWorkflows?.length ?? 0)).toBeGreaterThan(0);
   });
 
   it('signatures: unknown keys, unknown categories and bad patterns are refused', () => {
@@ -1774,5 +1779,524 @@ describe('mapCoverage (Plan U final review I2)', () => {
     const dir = makeTempDir();
     ci(dir, '      - run: tox run\n        env:\n          TOXENV: ${{ matrix.toxenv }}\n' + run('pytest'));
     expect(row(await coverage(dir), 'push', 'unit-tests', 'app')).toMatchObject({ status: 'covered', by: 'your own `pytest`' });
+  });
+});
+
+// ---------- Plan P Task 3: the catalogue's tools in workflows and hooks ----------
+
+describe('mapCoverage (Plan P Task 3)', () => {
+  const q = emptyServiceQuality();
+  const tsSvc = (over: Partial<Service> = {}) => svc('.', { quality: { ...q, tsconfig: true }, ...over });
+  const dockerSvc = svc('.', { scripts: ['start'], dockerfile: 'Dockerfile' });
+  const pySvc = svc('.', { language: 'python', packageManager: 'uv', scripts: [], quality: { ...q, pythonTyped: true } });
+  /** mapCoverage with options (capabilities), over a profile read from `dir`. */
+  async function cov(dir: string, over: Partial<RepoProfile> = {}, opts: Parameters<typeof mapCoverage>[3] = {}): Promise<Coverage[]> {
+    const p = await profileOf(dir, over);
+    return mapCoverage(p, floorNeeds(p, caps), dir, opts);
+  }
+  async function rowOf(body: string, layer: Layer, id: string, over: Partial<RepoProfile> = {}, service?: string, opts: Parameters<typeof mapCoverage>[3] = {}, file = 'ci.yml'): Promise<Coverage> {
+    const dir = makeTempDir();
+    wf(dir, file, body);
+    return row(await cov(dir, over, opts), layer, id, service);
+  }
+  const ciRun = (cmd: string) => `${both}${job(run(cmd))}`;
+  const ciUses = (uses: string, withLines = '') => `${both}${job(`      - uses: ${uses}\n${withLines === '' ? '' : `        with:\n${withLines}`}`)}`;
+
+  it('coverage: Dockerfile without an image build → hadolint covers dockerfile-lint only; trivy config alone is partial', async () => {
+    const over = { services: [dockerSvc] };
+    const dir = makeTempDir();
+    wf(dir, 'ci.yml', ciRun('hadolint Dockerfile'));
+    const rows = await cov(dir, over);
+    expect(row(rows, 'merge', 'dockerfile-lint', 'app')).toMatchObject({ status: 'covered', by: 'hadolint' });
+    expect(row(rows, 'push', 'dockerfile-lint', 'app')).toMatchObject({ status: 'covered', by: 'hadolint' });
+    expect(row(rows, 'merge', 'image-scan', 'app').status).toBe('missing');
+    expect(row(rows, 'merge', 'image-build', 'app').status).toBe('missing');
+    const t = await rowOf(ciRun('trivy config --exit-code 1 .'), 'merge', 'dockerfile-lint', over, 'app');
+    expect(t).toMatchObject({ status: 'partial', by: 'trivy-dockerfile' });
+    expect(t.why).toBe('Trivy config checks Dockerfile security settings, not the shell in RUN lines; hadolint adds that.');
+  });
+
+  it('coverage: trivy config --exit-code 1 with a Dockerfile → image-scan missing (PB3)', async () => {
+    expect((await rowOf(ciRun('trivy config --exit-code 1 .'), 'merge', 'image-scan', { services: [dockerSvc] }, 'app')).status).toBe('missing');
+  });
+
+  it('coverage: PB3 trivy and grype count by subcommand and target', async () => {
+    const over = { services: [dockerSvc] };
+    const st = async (body: string, id: string, layer: Layer = 'merge') => {
+      const r = await rowOf(body, layer, id, over, 'app');
+      return `${r.status}${r.by === undefined ? '' : ` ${r.by}`}`;
+    };
+    expect(await st(ciRun('trivy image --exit-code 1 app:1'), 'image-scan')).toBe('covered trivy-image');
+    expect(await st(ciRun('trivy image --exit-code 1 app:1'), 'deps')).toBe('missing');
+    expect(await st(ciRun('trivy i --exit-code 1 app:1'), 'image-scan')).toBe('covered trivy-image');
+    expect(await st(ciRun('trivy image app:1'), 'image-scan')).toBe('partial trivy-image'); // exits 0 without --exit-code
+    expect(await st(ciRun('trivy image --scanners misconfig --exit-code 1 app:1'), 'image-scan')).toBe('missing'); // no vulnerability scan
+    expect(await st(ciRun('trivy image --scanners vuln,secret --exit-code 1 app:1'), 'image-scan')).toBe('covered trivy-image');
+    expect(await st(ciRun('trivy fs --exit-code 1 .'), 'deps')).toBe('covered trivy-fs');
+    expect(await st(ciRun('trivy fs --exit-code 1 .'), 'image-scan')).toBe('missing');
+    expect(await st(ciRun('trivy repo --exit-code 1 .'), 'deps')).toBe('covered trivy-fs');
+    expect(await st(ciRun('trivy clean --all'), 'deps')).toBe('missing');
+    expect(await st(ciRun('trivy --exit-code 1 app:1'), 'image-scan')).toBe('missing'); // no subcommand: not a run pipegen knows
+    // trivy-action by scan-type (default image)
+    expect(await st(ciUses('aquasecurity/trivy-action@0.33.1', "          exit-code: '1'\n"), 'image-scan')).toBe('covered trivy-image');
+    expect(await st(ciUses('aquasecurity/trivy-action@0.33.1', "          exit-code: '1'\n"), 'deps')).toBe('missing');
+    expect(await st(ciUses('aquasecurity/trivy-action@0.33.1', "          scan-type: fs\n          exit-code: '1'\n"), 'deps')).toBe('covered trivy-fs');
+    expect(await st(ciUses('aquasecurity/trivy-action@0.33.1', "          scan-type: fs\n          exit-code: '1'\n"), 'image-scan')).toBe('missing');
+    expect(await st(ciUses('aquasecurity/trivy-action@0.33.1', "          scan-type: config\n          exit-code: '1'\n"), 'image-scan')).toBe('missing');
+    expect(await st(ciUses('aquasecurity/trivy-action@0.33.1', "          scan-type: ${{ matrix.t }}\n          exit-code: '1'\n"), 'image-scan')).toBe('missing');
+    expect(await st(ciUses('aquasecurity/trivy-action@0.33.1', "          exit-code: '1'\n          trivy-config: trivy.yaml\n"), 'image-scan')).toBe('partial trivy-image');
+    // grype: a folder or SBOM is a dependency scan, an image reference an image scan, anything else can't be placed
+    expect(await st(ciRun('grype dir:. --fail-on high'), 'deps', 'push')).toBe('covered grype');
+    expect(await st(ciRun('grype dir:. --fail-on high'), 'image-scan')).toBe('missing');
+    expect(await st(ciRun('grype . --fail-on high'), 'image-scan')).toBe('missing');
+    expect(await st(ciRun('grype sbom:./sbom.json --fail-on high'), 'image-scan')).toBe('missing');
+    expect(await st(ciRun('grype ghcr.io/o/app:1.2 --fail-on high'), 'image-scan')).toBe('covered grype-image');
+    expect(await st(ciRun('grype registry:o/app --fail-on high'), 'image-scan')).toBe('covered grype-image');
+    expect(await st(ciRun('grype "$IMAGE" --fail-on high'), 'image-scan')).toBe('partial grype-image');
+    expect(await st(ciRun('grype app --fail-on high'), 'image-scan')).toBe('partial grype-image');
+    expect(await st(ciRun('grype app:1 dir:. --fail-on high'), 'image-scan')).toBe('missing'); // a folder named too: not counted
+    expect(await st(ciUses('anchore/scan-action@v7', '          image: app:1\n'), 'image-scan')).toBe('covered grype-image');
+    expect(await st(ciUses('anchore/scan-action@v7', '          path: .\n'), 'image-scan')).toBe('missing');
+    expect(await st(ciUses('anchore/scan-action@v7', '          path: .\n'), 'deps', 'push')).toBe('covered grype');
+    expect(await st(ciUses('anchore/scan-action@v7', '          image: app:1\n          config: .grype.yaml\n'), 'image-scan')).toBe('partial grype-image');
+  });
+
+  it('coverage: prettier without --check → format missing; prettier --check → covered', async () => {
+    expect((await rowOf(ciRun('prettier --write .'), 'merge', 'format', {}, 'app')).status).toBe('missing');
+    expect((await rowOf(ciRun('npx prettier .'), 'merge', 'format', {}, 'app')).status).toBe('missing');
+    for (const cmd of ['npx prettier --check .', 'prettier -c .', 'prettier --list-different .', 'prettier -l .']) {
+      expect(await rowOf(ciRun(cmd), 'merge', 'format', {}, 'app'), cmd).toMatchObject({ status: 'covered', by: 'prettier-check' });
+    }
+    expect((await rowOf(ciRun('prettier --check --write .'), 'merge', 'format', {}, 'app')).status).toBe('missing');
+    expect((await rowOf(ciRun('prettier --check=false .'), 'merge', 'format', {}, 'app')).status).toBe('missing');
+  });
+
+  it('coverage: biome ci covers lint and format; biome check --write covers lint only', async () => {
+    const dir = makeTempDir();
+    wf(dir, 'ci.yml', ciRun('npx @biomejs/biome ci .'));
+    let rows = await cov(dir);
+    expect(row(rows, 'merge', 'lint', 'app')).toMatchObject({ status: 'covered', by: 'biome' });
+    expect(row(rows, 'merge', 'format', 'app')).toMatchObject({ status: 'covered', by: 'biome-ci' });
+    const dir2 = makeTempDir();
+    wf(dir2, 'ci.yml', ciRun('biome check --write .'));
+    rows = await cov(dir2);
+    expect(row(rows, 'merge', 'lint', 'app')).toMatchObject({ status: 'covered', by: 'biome' });
+    expect(row(rows, 'merge', 'format', 'app').status).toBe('missing');
+    for (const cmd of ['biome ci --formatter-enabled=false .', 'biome check --fix .', 'biome format --write .', 'biome format --staged']) {
+      expect((await rowOf(ciRun(cmd), 'merge', 'format', {}, 'app')).status, cmd).toBe('missing');
+    }
+    expect(await rowOf(ciRun('biome format .'), 'merge', 'format', {}, 'app')).toMatchObject({ status: 'covered', by: 'biome-format-check' });
+    expect((await rowOf(ciRun('biome migrate --write'), 'merge', 'lint', {}, 'app')).status).toBe('missing'); // not a lint run
+  });
+
+  it('coverage: ruff format --check covers format; ruff format alone doesn\'t', async () => {
+    const over = { services: [pySvc] };
+    expect(await rowOf(ciRun('ruff format --check .'), 'merge', 'format', over, 'app')).toMatchObject({ status: 'covered', by: 'ruff-format-check' });
+    expect(await rowOf(ciRun('uv run ruff format --diff'), 'merge', 'format', over, 'app')).toMatchObject({ status: 'covered', by: 'ruff-format-check' });
+    expect((await rowOf(ciRun('ruff format .'), 'merge', 'format', over, 'app')).status).toBe('missing');
+    expect(await rowOf(ciRun('black --check .'), 'merge', 'format', over, 'app')).toMatchObject({ status: 'covered', by: 'black-check' });
+    expect((await rowOf(ciRun('black --diff .'), 'merge', 'format', over, 'app')).status).toBe('missing'); // --diff alone exits 0
+    expect((await rowOf(ciRun('black .'), 'merge', 'format', over, 'app')).status).toBe('missing');
+  });
+
+  it('coverage: tsc --noEmit on push covers type-check; tsc --watch doesn\'t', async () => {
+    const over = { services: [tsSvc()] };
+    expect(await rowOf(`on: push\n${job(run('npx tsc --noEmit'))}`, 'push', 'type-check', over, 'app')).toMatchObject({ status: 'covered', by: 'tsc' });
+    for (const cmd of ['tsc --watch', 'tsc -w', 'tsc --noCheck', 'tsc --init', 'tsc --showConfig', 'tsc --listFilesOnly', 'tsc --build --clean']) {
+      expect((await rowOf(`on: push\n${job(run(cmd))}`, 'push', 'type-check', over, 'app')).status, cmd).toBe('missing');
+    }
+    for (const cmd of ['vue-tsc --noEmit', 'svelte-check', 'astro check', 'tsgo --noEmit']) {
+      expect((await rowOf(`on: push\n${job(run(cmd))}`, 'push', 'type-check', over, 'app')).status, cmd).toBe('covered');
+    }
+    expect(await rowOf(`on: push\n${job(run('oxlint --type-aware --type-check'))}`, 'push', 'type-check', over, 'app')).toMatchObject({ status: 'covered', by: 'oxlint-type-check' });
+    expect((await rowOf(`on: push\n${job(run('oxlint --type-aware'))}`, 'push', 'type-check', over, 'app')).status).toBe('missing');
+    // oxlint fails only on errors: warnings (its default) need --deny-warnings
+    expect(await rowOf(`on: push\n${job(run('oxlint'))}`, 'push', 'lint', over, 'app')).toMatchObject({ status: 'partial', by: 'oxlint' });
+    expect(await rowOf(`on: push\n${job(run('oxlint --deny-warnings'))}`, 'push', 'lint', over, 'app')).toMatchObject({ status: 'covered', by: 'oxlint' });
+    // mypy and pyright for Python
+    const py = { services: [pySvc] };
+    expect(await rowOf(`on: push\n${job(run('uv run mypy src'))}`, 'push', 'type-check', py, 'app')).toMatchObject({ status: 'covered', by: 'mypy' });
+    expect(await rowOf(`on: push\n${job(run('pyright'))}`, 'push', 'type-check', py, 'app')).toMatchObject({ status: 'covered', by: 'pyright' });
+    expect((await rowOf(`on: push\n${job(run('pyright --watch'))}`, 'push', 'type-check', py, 'app')).status).toBe('missing');
+    expect((await rowOf(`on: push\n${job(run('basedpyright --writebaseline'))}`, 'push', 'type-check', py, 'app')).status).toBe('missing');
+  });
+
+  it('coverage: knip --no-exit-code → dead-code partial for a knip-config service, covered when not blocking', async () => {
+    const knip = { services: [svc('.', { quality: { ...q, configs: ['knip'] } })] };
+    const r = await rowOf(ciRun('npx knip --no-exit-code'), 'merge', 'dead-code', knip, 'app');
+    expect(r).toMatchObject({ status: 'partial', by: 'knip' });
+    expect(r.need.blocking).toBe(true);
+    expect(await rowOf(ciRun('npx knip'), 'merge', 'dead-code', knip, 'app')).toMatchObject({ status: 'covered', by: 'knip' });
+    expect((await rowOf(ciRun('npx knip --max-issues 5'), 'merge', 'dead-code', knip, 'app')).status).toBe('partial');
+    const plain = await rowOf(ciRun('npx knip --no-exit-code'), 'merge', 'dead-code', {}, 'app');
+    expect(plain.need.blocking).toBe(false);
+    expect(plain).toMatchObject({ status: 'covered', by: 'knip' });
+    expect((await rowOf(ciRun('npx knip --watch'), 'merge', 'dead-code', {}, 'app')).status).toBe('missing');
+    const py = { services: [pySvc] };
+    for (const [cmd, by] of [['vulture src', 'vulture'], ['deptry .', 'deptry'], ['creosote --venv .venv', 'creosote']]) {
+      expect(await rowOf(ciRun(cmd), 'merge', 'dead-code', py, 'app'), cmd).toMatchObject({ status: 'covered', by });
+    }
+    expect(await rowOf(ciRun('go mod tidy -diff'), 'merge', 'dead-code', {}, 'app')).toMatchObject({ status: 'covered', by: 'go-mod-tidy' });
+    expect((await rowOf(ciRun('go mod tidy'), 'merge', 'dead-code', {}, 'app')).status).toBe('missing');
+  });
+
+  it('coverage: pinact run without --check → workflow-pin-check missing', async () => {
+    expect((await rowOf(ciRun('pinact run'), 'merge', 'workflow-pin-check')).status).toBe('missing');
+    expect((await rowOf(ciRun('pinact run --check=false'), 'merge', 'workflow-pin-check')).status).toBe('missing');
+    expect(await rowOf(ciRun('pinact run --check'), 'merge', 'workflow-pin-check')).toMatchObject({ status: 'covered', by: 'pinact' });
+    expect(await rowOf(ciRun('pinact run --fix=false'), 'merge', 'workflow-pin-check')).toMatchObject({ status: 'covered', by: 'pinact' });
+    expect(await rowOf(ciRun('ratchet lint .github/workflows/ci.yml'), 'merge', 'workflow-pin-check')).toMatchObject({ status: 'covered', by: 'ratchet' });
+    const z = await rowOf(ciRun('zizmor .'), 'merge', 'workflow-pin-check');
+    expect(z).toMatchObject({ status: 'partial', by: 'zizmor-pins' });
+    expect(z.why).toMatch(/^Zizmor checks action pins, but a zizmor config or a version before v1\.20\.0 can allow tag pins/); // the source moved on from the brief's text
+  });
+
+  it('coverage: workflow lint: actionlint, zizmor, poutine, ghalint and their soft modes', async () => {
+    const st = async (body: string) => {
+      const r = await rowOf(body, 'merge', 'workflow-lint');
+      return `${r.status}${r.by === undefined ? '' : ` ${r.by}`}`;
+    };
+    expect(await st(ciRun('actionlint'))).toBe('covered actionlint');
+    expect(await st(ciUses('raven-actions/actionlint@v2'))).toBe('covered actionlint');
+    expect(await st(ciUses('raven-actions/actionlint@v2', '          fail-on-error: false\n'))).toBe('partial actionlint');
+    expect(await st(ciRun('zizmor .'))).toBe('covered zizmor');
+    expect(await st(ciRun('zizmor --no-exit-codes .'))).toBe('partial zizmor');
+    expect(await st(ciRun('zizmor --format=sarif .'))).toBe('partial zizmor');
+    expect(await st(ciUses('zizmorcore/zizmor-action@v0.2.0'))).toBe('partial zizmor'); // advanced-security defaults to true: SARIF, no exit code
+    expect(await st(ciUses('zizmorcore/zizmor-action@v0.2.0', '          advanced-security: false\n'))).toBe('covered zizmor');
+    expect(await st(ciRun('poutine analyze_local .'))).toBe('partial poutine');
+    expect(await st(ciRun('poutine analyze_local . --fail-on-violation'))).toBe('covered poutine');
+    expect(await st(ciRun('ghalint run'))).toBe('covered ghalint');
+  });
+
+  it('coverage: osv reusable PR workflow → dependency-review covered, not unknown', async () => {
+    const call = (ref: string, withLines = '') => `on:\n  pull_request:\njobs:\n  osv:\n    uses: google/osv-scanner-action/.github/workflows/osv-scanner-reusable-pr.yml@${ref}\n${withLines}`;
+    const r = await rowOf(call('v2.3.0'), 'merge', 'dependency-review');
+    expect(r).toMatchObject({ status: 'covered', by: 'osv-pr-diff', where: '.github/workflows/ci.yml (job osv)' });
+    expect((await rowOf(call('1f1242919d8a60496dd1874b24b62b2370ed4c78'), 'merge', 'dependency-review')).status).toBe('covered');
+    expect(await rowOf(call('main'), 'merge', 'dependency-review')).toMatchObject({ status: 'partial', by: 'osv-pr-diff' }); // a moving ref
+    expect((await rowOf(call('v2.3.0', '    with:\n      fail-on-vuln: false\n'), 'merge', 'dependency-review')).status).toBe('partial');
+    expect((await rowOf(call('v2.3.0', '    with:\n      fail-on-vuln: ${{ inputs.f }}\n'), 'merge', 'dependency-review')).status).toBe('partial');
+    expect((await rowOf(call('v2.3.0', "    if: github.event_name == 'push'\n"), 'merge', 'dependency-review')).status).toBe('partial');
+    // the other rows know what it runs (osv-scanner on the diff only), so they aren't unknown
+    expect((await rowOf(call('v2.3.0'), 'merge', 'sast', {}, 'app')).status).toBe('missing');
+  });
+
+  it('coverage: reusableWorkflows (adversarial): look-alike paths stay unknown', async () => {
+    for (const uses of [
+      'google/osv-scanner-action/.github/workflows/osv-scanner-reusable.yml@v2.3.0', // the full scan, not the PR diff
+      'g00gle/osv-scanner-action/.github/workflows/osv-scanner-reusable-pr.yml@v2.3.0',
+      'google/osv-scanner-action/.github/workflows/osv-scanner-reusable-pr.yaml@v2.3.0',
+      'google/osv-scanner-action/.github/workflows/sub/osv-scanner-reusable-pr.yml@v2.3.0',
+      'google/osv-scanner-action/osv-scanner-reusable-pr.yml@v2.3.0',
+    ]) {
+      const r = await rowOf(`on:\n  pull_request:\njobs:\n  osv:\n    uses: ${uses}\n`, 'merge', 'dependency-review');
+      expect(r.status, uses).toBe('unknown');
+    }
+    // letter case of owner and name doesn't matter on GitHub
+    expect((await rowOf('on:\n  pull_request:\njobs:\n  osv:\n    uses: Google/OSV-Scanner-Action/.github/workflows/osv-scanner-reusable-pr.yml@v2.3.0\n', 'merge', 'dependency-review')).status).toBe('covered');
+  });
+
+  it('coverage: dependency-review-action on a user-owned private repo → partial with the availability why', async () => {
+    const body = ciUses('actions/dependency-review-action@v5');
+    const userPrivate = { private: true, ownerType: 'User' as const };
+    const r = await rowOf(body, 'merge', 'dependency-review', userPrivate);
+    expect(r).toMatchObject({ status: 'partial', by: 'dependency-review' });
+    expect(r.why).toMatch(/^Dependency review works only on public repos and on organisation-owned private repos with GitHub Advanced Security/);
+    expect((await rowOf(body, 'merge', 'deps', userPrivate, 'app')).status).toBe('partial');
+    // user-owned private stays partial even when the capabilities say code scanning (R4)
+    expect((await rowOf(body, 'merge', 'dependency-review', userPrivate, undefined, { capabilities: caps })).status).toBe('partial');
+    // org-owned private: only with code scanning; without capabilities pipegen assumes none
+    const orgPrivate = { private: true, ownerType: 'Organization' as const };
+    expect((await rowOf(body, 'merge', 'dependency-review', orgPrivate)).status).toBe('partial');
+    expect((await rowOf(body, 'merge', 'dependency-review', orgPrivate, undefined, { capabilities: { ...caps, codeScanning: false } })).status).toBe('partial');
+    expect((await rowOf(body, 'merge', 'dependency-review', orgPrivate, undefined, { capabilities: caps })).status).toBe('covered');
+    expect(await rowOf(body, 'merge', 'dependency-review')).toMatchObject({ status: 'covered', by: 'dependency-review' }); // public
+    expect((await rowOf(ciUses('actions/dependency-review-action@v5', '          vulnerability-check: false\n'), 'merge', 'dependency-review')).status).toBe('missing');
+    expect((await rowOf(ciUses('actions/dependency-review-action@v5', '          config-file: ./.github/dr.yml\n'), 'merge', 'dependency-review')).status).toBe('partial');
+  });
+
+  it('coverage: trivy fs --scanners vuln,license --exit-code 1 on pull_request → licences covered; without license → missing', async () => {
+    const pr = (cmd: string) => `on: pull_request\n${job(run(cmd))}`;
+    expect(await rowOf(pr('trivy fs --scanners vuln,license --exit-code 1 .'), 'merge', 'licences')).toMatchObject({ status: 'covered', by: 'trivy-license' });
+    expect(await rowOf(pr('trivy fs --scanners=license --exit-code 1 .'), 'merge', 'licences')).toMatchObject({ status: 'covered', by: 'trivy-license' });
+    expect((await rowOf(pr('trivy fs --scanners vuln --exit-code 1 .'), 'merge', 'licences')).status).toBe('missing');
+    expect((await rowOf(pr('trivy fs --exit-code 1 .'), 'merge', 'licences')).status).toBe('missing');
+    expect((await rowOf(pr('trivy fs --scanners license .'), 'merge', 'licences')).status).toBe('partial'); // no --exit-code
+    expect((await rowOf(pr('trivy fs --scanners license --scanners vuln --exit-code 1 .'), 'merge', 'licences')).status).toBe('missing'); // the last one wins
+    expect((await rowOf(pr('echo trivy fs --scanners license --exit-code 1 .'), 'merge', 'licences')).status).toBe('missing');
+    expect((await rowOf(pr('trivy config --scanners license --exit-code 1 .'), 'merge', 'licences')).status).toBe('missing');
+    const action = (lines: string) => `on: pull_request\n${job(`      - uses: aquasecurity/trivy-action@0.33.1\n        with:\n${lines}`)}`;
+    expect((await rowOf(action("          scan-type: fs\n          scanners: vuln,license\n          exit-code: '1'\n"), 'merge', 'licences')).status).toBe('covered');
+    expect((await rowOf(action("          scan-type: fs\n          scanners: vuln\n          exit-code: '1'\n"), 'merge', 'licences')).status).toBe('missing');
+    expect((await rowOf(action("          scanners: ${{ inputs.s }}\n          exit-code: '1'\n"), 'merge', 'licences')).status).toBe('missing');
+  });
+
+  it('coverage: dependency-review-action without allow/deny-licenses → licences missing', async () => {
+    expect((await rowOf(ciUses('actions/dependency-review-action@v5'), 'merge', 'licences')).status).toBe('missing');
+    expect((await rowOf(ciUses('actions/dependency-review-action@v5', "          allow-licenses: ''\n"), 'merge', 'licences')).status).toBe('missing');
+    expect(await rowOf(ciUses('actions/dependency-review-action@v5', '          allow-licenses: MIT, Apache-2.0\n'), 'merge', 'licences')).toMatchObject({ status: 'covered', by: 'dependency-review-licences' });
+    expect((await rowOf(ciUses('actions/dependency-review-action@v5', '          deny-licenses: GPL-3.0\n          license-check: false\n'), 'merge', 'licences')).status).toBe('missing');
+    expect((await rowOf(ciUses('actions/dependency-review-action@v5', '          config-file: ./.github/dr.yml\n'), 'merge', 'licences')).status).toBe('partial');
+    expect((await rowOf(ciUses('actions/dependency-review-action@v5', '          allow-licenses: MIT\n'), 'merge', 'licences', { private: true, ownerType: 'User' })).status).toBe('partial');
+    for (const [cmd, want] of [['cargo deny check licenses', 'covered'], ['cargo deny check', 'partial'], ['cargo deny check advisories', 'missing'], ['grant check dir:.', 'covered'],
+      ['grant check --dry-run dir:.', 'partial'], ['fossa test', 'partial']]) {
+      expect((await rowOf(ciRun(cmd), 'merge', 'licences')).status, cmd).toBe(want);
+    }
+  });
+
+  it('coverage: scorecard-action on schedule → covered; workflow_dispatch only → partial', async () => {
+    const steps = job('      - uses: ossf/scorecard-action@v2.5.0\n        with:\n          results_file: r.sarif\n          results_format: sarif\n');
+    expect(await rowOf(`on:\n  schedule:\n    - cron: '0 3 * * 1'\n${steps}`, 'merge', 'scorecard')).toMatchObject({ status: 'covered', by: 'scorecard' });
+    expect((await rowOf(`on:\n  push:\n    branches: [main]\n${steps}`, 'merge', 'scorecard')).status).toBe('covered');
+    const d = await rowOf(`on: workflow_dispatch\n${steps}`, 'merge', 'scorecard');
+    expect(d).toMatchObject({ status: 'partial', by: 'scorecard' });
+    expect(d.why).toMatch(/not on a schedule or on every push to the default branch/);
+    expect((await rowOf(`on: pull_request\n${steps}`, 'merge', 'scorecard')).status).toBe('partial');
+    expect((await rowOf(`on:\n  push:\n    branches: [main]\n    paths: [src/**]\n${steps}`, 'merge', 'scorecard')).status).toBe('partial');
+    expect((await rowOf(`on:\n  push:\n    branches: [dev]\n${steps}`, 'merge', 'scorecard')).status).toBe('partial');
+  });
+
+  it('coverage: harden-runner block mode on a private repo → egress partial (DEC #80)', async () => {
+    const rel = (withLines: string) => `on:\n  release:\n    types: [published]\njobs:\n  publish:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: step-security/harden-runner@v2\n        with:\n${withLines}      - run: npm publish\n`;
+    const over = { services: [svc('.', { scripts: ['start'] })] };
+    const block = '          egress-policy: block\n          disable-sudo: true\n';
+    const r = await rowOf(rel(block), 'deploy', 'egress', { ...over, private: true }, 'app');
+    expect(r).toMatchObject({ status: 'partial', by: 'harden-runner' });
+    expect(r.why).toMatch(/private repo/);
+    expect(await rowOf(rel(block), 'deploy', 'egress', over, 'app')).toMatchObject({ status: 'covered', by: 'harden-runner' }); // public
+    expect((await rowOf(rel('          egress-policy: block\n          disable-sudo-and-containers: true\n'), 'deploy', 'egress', over, 'app')).status).toBe('covered');
+    expect((await rowOf(rel('          egress-policy: block\n'), 'deploy', 'egress', over, 'app')).status).toBe('partial'); // sudo can undo it
+    expect((await rowOf(rel('          disable-sudo: true\n'), 'deploy', 'egress', over, 'app')).status).toBe('partial'); // block must be explicit
+    expect((await rowOf(rel(`${block}          policy: my-policy\n`), 'deploy', 'egress', over, 'app')).status).toBe('partial'); // a stored policy replaces the inputs
+  });
+
+  it('coverage: bullfrog counts only with egress-policy block AND enable-sudo false (PB5)', async () => {
+    const rel = (withLines: string, more = '') => `on:\n  release:\n    types: [published]\njobs:\n  publish:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: bullfrogsec/bullfrog@v0.9.0\n        with:\n${withLines}      - run: npm publish\n${more}`;
+    const over = { services: [svc('.', { scripts: ['start'] })] };
+    const st = async (body: string, o: Partial<RepoProfile> = over) => (await rowOf(body, 'deploy', 'egress', o, 'app')).status;
+    const good = '          egress-policy: block\n          enable-sudo: false\n';
+    expect(await rowOf(rel(good), 'deploy', 'egress', over, 'app')).toMatchObject({ status: 'covered', by: 'bullfrog' });
+    expect(await st(rel(good), { ...over, private: true })).toBe('covered'); // Bullfrog blocks on private repos too
+    const partial = await rowOf(rel('          egress-policy: block\n'), 'deploy', 'egress', over, 'app');
+    expect(partial).toMatchObject({ status: 'partial', by: 'bullfrog' });
+    expect(partial.why).toMatch(/egress-policy set to block and enable-sudo set to false/);
+    expect(await st(rel('          enable-sudo: false\n'))).toBe('partial'); // audit mode by default
+    expect(await st(rel('          egress-policy: audit\n          enable-sudo: false\n'))).toBe('partial');
+    expect(await st(rel('          egress-policy: ${{ inputs.p }}\n          enable-sudo: false\n'))).toBe('partial');
+    expect(await st(rel(`${good}          EGRESS-POLICY: audit\n`))).toBe('partial'); // every spelling must hold
+    // the control plane's policy replaces the inputs (the key name is built, so no redact rule matches this file)
+    expect(await st(rel(`${good}          ${['api', 'token'].join('-')}: \${{ inputs.bf }}\n`))).toBe('partial');
+    expect(await st(rel(good).replace('      - uses: bullfrogsec', '      - continue-on-error: true\n        uses: bullfrogsec'))).toBe('partial');
+  });
+
+  it('coverage: egress is covered only when every job of the release workflow starts with it (PB5)', async () => {
+    const over = { services: [svc('.', { scripts: ['start'] })] };
+    const bf = '      - uses: bullfrogsec/bullfrog@v0.9.0\n        with:\n          egress-policy: block\n          enable-sudo: false\n';
+    const jobOf = (name: string, steps: string) => `  ${name}:\n    runs-on: ubuntu-latest\n    steps:\n${steps}`;
+    const wfOf = (...jobs: string[]) => `on:\n  release:\n    types: [published]\njobs:\n${jobs.join('')}`;
+    const st = async (body: string) => {
+      const r = await rowOf(body, 'deploy', 'egress', over, 'app');
+      return r.status;
+    };
+    expect(await st(wfOf(jobOf('build', `${bf}${run('npm ci')}`), jobOf('publish', `${bf}${run('npm publish')}`)))).toBe('covered');
+    const some = await rowOf(wfOf(jobOf('build', `${bf}${run('npm ci')}`), jobOf('publish', run('npm publish'))), 'deploy', 'egress', over, 'app');
+    expect(some.status).toBe('partial');
+    expect(some.why).toMatch(/pipegen found egress control in some release jobs only/);
+    expect(await st(wfOf(jobOf('publish', `${run('npm ci')}${bf}${run('npm publish')}`)))).toBe('partial'); // not the first step
+    expect(await st(wfOf(jobOf('build', `${bf}${run('npm ci')}`), '  call:\n    uses: o/other/.github/workflows/x.yml@v1\n'))).toBe('unknown'); // never covered
+    expect(await st(wfOf(jobOf('build', `${bf}${run('npm ci')}`), `  skipped:\n    if: false\n    runs-on: x\n    steps:\n${run('npm publish')}`))).toBe('covered'); // a job that never runs
+    // a local composite action counts only when bullfrog is its own first step
+    const dir = makeTempDir();
+    writeIn(dir, '.github/actions/lock/action.yml', `runs:\n  using: composite\n  steps:\n    - run: echo setup\n      shell: bash\n${bf.replace(/^ {6}/gm, '    ')}`);
+    writeIn(dir, '.github/actions/lock2/action.yml', `runs:\n  using: composite\n  steps:\n${bf.replace(/^ {6}/gm, '    ')}`);
+    wf(dir, 'rel.yml', wfOf(jobOf('publish', `      - uses: ./.github/actions/lock\n${run('npm publish')}`)));
+    expect(row(await cov(dir, over), 'deploy', 'egress', 'app').status).toBe('partial');
+    const dir2 = makeTempDir();
+    writeIn(dir2, '.github/actions/lock2/action.yml', `runs:\n  using: composite\n  steps:\n${bf.replace(/^ {6}/gm, '    ')}`);
+    wf(dir2, 'rel.yml', wfOf(jobOf('publish', `      - uses: ./.github/actions/lock2\n${run('npm publish')}`)));
+    expect(row(await cov(dir2, over), 'deploy', 'egress', 'app').status).toBe('covered');
+    // a job whose egress step only holds under a condition doesn't count for the others
+    expect(await st(wfOf(jobOf('build', `${bf}${run('npm ci')}`), jobOf('publish', `${bf.replace('      - uses:', "      - if: github.event_name == 'release'\n        uses:")}${run('npm publish')}`)))).toBe('partial');
+  });
+
+  it('coverage: pre-commit run --all-files with ruff-format and mypy hooks → format and type-check covered', async () => {
+    const dir = makeTempDir();
+    writeIn(dir, '.pre-commit-config.yaml', [
+      'repos:',
+      '  - repo: https://github.com/astral-sh/ruff-pre-commit', '    rev: v0.6.0', '    hooks:', '      - id: ruff-format',
+      '  - repo: https://github.com/pre-commit/mirrors-mypy', '    rev: v1.11.0', '    hooks:', '      - id: mypy',
+      '  - repo: https://github.com/hadolint/hadolint', '    rev: v2.12.0', '    hooks:', '      - id: hadolint',
+      '  - repo: https://github.com/rhysd/actionlint', '    rev: v1.7.1', '    hooks:', '      - id: actionlint',
+    ].join('\n'));
+    ci(dir, '      - uses: pre-commit/action@v3.0.1\n');
+    const rows = await cov(dir, { services: [svc('.', { language: 'python', packageManager: 'uv', scripts: [], dockerfile: 'Dockerfile', quality: { ...q, pythonTyped: true } })] });
+    expect(row(rows, 'merge', 'format', 'app')).toMatchObject({ status: 'covered', by: 'ruff-format' });
+    expect(row(rows, 'merge', 'type-check', 'app')).toMatchObject({ status: 'covered', by: 'mypy' });
+    expect(row(rows, 'merge', 'dockerfile-lint', 'app')).toMatchObject({ status: 'covered', by: 'hadolint' });
+    expect(row(rows, 'merge', 'workflow-lint')).toMatchObject({ status: 'covered', by: 'actionlint' });
+    expect(row(rows, 'merge', 'format', 'app').why).toMatch(/in the pre-commit hooks/);
+  });
+
+  it('coverage: formatter hooks carry format only into CI pre-commit runs, with their reasons (PS14)', async () => {
+    const dir = makeTempDir();
+    writeIn(dir, '.pre-commit-config.yaml', 'repos:\n  - repo: https://github.com/psf/black-pre-commit-mirror\n    rev: 24.8.0\n    hooks:\n      - id: black\n        files: ^src/\n');
+    ci(dir, run('pre-commit run --all-files'));
+    expect(row(await cov(dir, { services: [pySvc] }), 'merge', 'format', 'app')).toMatchObject({ status: 'partial', by: 'black' });
+    // SKIP drops the carry; a hook-stage run on staged files carries nothing
+    const dir2 = makeTempDir();
+    writeIn(dir2, '.pre-commit-config.yaml', 'repos:\n  - repo: https://github.com/psf/black-pre-commit-mirror\n    rev: 24.8.0\n    hooks:\n      - id: black\n');
+    ci(dir2, run('SKIP=black pre-commit run --all-files'));
+    expect(row(await cov(dir2, { services: [pySvc] }), 'merge', 'format', 'app').status).toBe('missing');
+    const dir3 = makeTempDir();
+    writeIn(dir3, '.pre-commit-config.yaml', 'repos:\n  - repo: https://github.com/psf/black-pre-commit-mirror\n    rev: 24.8.0\n    hooks:\n      - id: black\n');
+    ci(dir3, run('pre-commit run'));
+    expect(row(await cov(dir3, { services: [pySvc] }), 'merge', 'format', 'app').status).toBe('missing');
+    // a lefthook formatter (stage_fixed re-stages) never covers format
+    const dir4 = makeTempDir();
+    writeIn(dir4, 'lefthook.yml', 'pre-commit:\n  commands:\n    fmt:\n      run: npx prettier --write {staged_files}\n      stage_fixed: true\n');
+    ci(dir4, run('npx lefthook run pre-commit --all-files'));
+    expect(row(await cov(dir4, { precommit: 'lefthook' }), 'merge', 'format', 'app').status).toBe('missing');
+  });
+
+  it('coverage: formatter hooks (adversarial): one that neither writes nor checks never carries format', async () => {
+    const st = async (hooks: string) => {
+      const dir = makeTempDir();
+      writeIn(dir, '.pre-commit-config.yaml', `repos:\n${hooks}`);
+      ci(dir, run('pre-commit run --all-files'));
+      const r = row(await cov(dir, { services: [pySvc] }), 'merge', 'format', 'app');
+      return `${r.status}${r.by === undefined ? '' : ` ${r.by}`}`;
+    };
+    const local = (entry: string) => `  - repo: local\n    hooks:\n      - id: fmt\n        name: fmt\n        language: system\n        entry: ${entry}\n`;
+    expect(await st(local('prettier'))).toBe('missing'); // prints the formatted text, writes nothing, exits 0
+    expect(await st(local('npx prettier --write'))).toBe('covered prettier');
+    expect(await st(local('prettier --check'))).toMatch(/^covered prettier/);
+    const black = (args: string) => `  - repo: https://github.com/psf/black-pre-commit-mirror\n    rev: 24.8.0\n    hooks:\n      - id: black\n        args: ${args}\n`;
+    expect(await st(black('[--diff]'))).toBe('missing'); // --diff alone only prints
+    expect(await st(black('[--diff, --check]'))).toBe('covered black');
+    expect(await st(black('[--line-length=100]'))).toBe('covered black');
+    // a hook repo pipegen doesn't know stays partial (it may write), never covered
+    expect(await st('  - repo: https://github.com/rbubley/mirrors-prettier\n    rev: v3.3.3\n    hooks:\n      - id: prettier\n')).toBe('partial prettier');
+    expect(await st('  - repo: https://github.com/biomejs/pre-commit\n    rev: v2.0.0\n    hooks:\n      - id: biome-format\n        args: [--staged]\n')).toBe('missing');
+  });
+
+  it('coverage: docker:// steps match multi-word signatures by their args (trivy image)', async () => {
+    const over = { services: [dockerSvc] };
+    const img = (args: string) => ciUses('docker://aquasec/trivy:0.67.2', `          args: ${args}\n`);
+    expect(await rowOf(img('image --exit-code 1 app:1'), 'merge', 'image-scan', over, 'app')).toMatchObject({ status: 'covered', by: 'trivy-image' });
+    expect((await rowOf(img('config --exit-code 1 .'), 'merge', 'image-scan', over, 'app')).status).toBe('missing');
+    expect((await rowOf(ciUses('docker://zricethezav/gitleaks:v8', '          args: version\n'), 'push', 'secrets')).status).toBe('missing');
+  });
+
+  it('coverage: go test -fuzz=FuzzX on schedule → fuzzing covered; go test alone doesn\'t', async () => {
+    const over = { services: [svc('.', { quality: { ...q, fuzzTargets: true } })] };
+    const sched = (cmd: string) => `on:\n  schedule:\n    - cron: '0 2 * * *'\n${job(run(cmd))}`;
+    expect(await rowOf(sched('go test ./pkg -fuzz=FuzzX -fuzztime=10m'), 'merge', 'fuzzing', over, 'app')).toMatchObject({ status: 'covered', by: 'go-fuzz' });
+    expect(await rowOf(sched('go test ./pkg -fuzz FuzzX'), 'merge', 'fuzzing', over, 'app')).toMatchObject({ status: 'covered', by: 'go-fuzz' });
+    expect((await rowOf(sched('go test ./...'), 'merge', 'fuzzing', over, 'app')).status).toBe('missing');
+    expect((await rowOf(sched('go test ./... -fuzz='), 'merge', 'fuzzing', over, 'app')).status).toBe('missing');
+    expect((await rowOf(`on: pull_request\n${job(run('go test ./pkg -fuzz=FuzzX'))}`, 'merge', 'fuzzing', over, 'app')).status).toBe('partial');
+    expect((await rowOf(`on:\n  schedule:\n    - cron: '0 2 * * *'\n${job('      - uses: google/clusterfuzzlite/actions/run_fuzzers@v1\n        with:\n          mode: batch\n')}`, 'merge', 'fuzzing', over, 'app')).status).toBe('covered');
+    expect((await rowOf(`on:\n  schedule:\n    - cron: '0 2 * * *'\n${job('      - uses: google/clusterfuzzlite/actions/run_fuzzers@v1\n        with:\n          mode: coverage\n')}`, 'merge', 'fuzzing', over, 'app')).status).toBe('missing');
+  });
+
+  it('coverage: coverage runs are partial until a minimum is checked (PS17)', async () => {
+    for (const [cmd, by] of [['npx vitest run --coverage', 'vitest-cov'], ['vitest --coverage.enabled', 'vitest-cov'], ['jest --coverage', 'jest-cov'], ['npx c8 mocha', 'c8'],
+      ['nyc mocha', 'nyc'], ['pytest --cov=pkg', 'pytest-cov'], ['coverage report', 'coverage-py'], ['go test -coverprofile=c.out ./...', 'go-cover']]) {
+      const r = await rowOf(ciRun(cmd), 'merge', 'coverage', {}, 'app');
+      expect(r, cmd).toMatchObject({ status: 'partial', by });
+      expect(r.why, cmd).toMatch(/hasn't checked for a minimum/);
+    }
+    for (const cmd of ['vitest run', 'vitest --coverage=false', 'vitest --coverage.enabled=false', 'jest', 'pytest --no-cov --cov=x', 'go test ./...']) {
+      expect((await rowOf(ciRun(cmd), 'merge', 'coverage', {}, 'app')).status, cmd).toBe('missing');
+    }
+  });
+
+  it('coverage: own scripts count for the new categories through their text (PS11)', async () => {
+    const dir = makeTempDir();
+    pkg(dir, { typecheck: 'tsc --noEmit', 'format:check': 'prettier --check .', 'test:coverage': 'vitest run --coverage', knip: 'knip' });
+    ci(dir, run('npm run typecheck') + run('npm run format:check') + run('npm run test:coverage') + run('npm run knip'));
+    const rows = await cov(dir, { services: [tsSvc()] });
+    expect(row(rows, 'merge', 'type-check', 'app')).toMatchObject({ status: 'covered', by: 'your own `npm run typecheck`' });
+    expect(row(rows, 'merge', 'format', 'app')).toMatchObject({ status: 'covered', by: 'your own `npm run format:check`' });
+    expect(row(rows, 'merge', 'coverage', 'app')).toMatchObject({ status: 'partial', by: 'your own `npm run test:coverage`' });
+    expect(row(rows, 'merge', 'unit-tests', 'app')).toMatchObject({ status: 'covered', by: 'your own `npm run test:coverage`' });
+    expect(row(rows, 'merge', 'dead-code', 'app')).toMatchObject({ status: 'covered', by: 'your own `npm run knip`' });
+    const dir2 = makeTempDir();
+    pkg(dir2, { typecheck: 'tsc --noEmit || true', format: 'prettier --write .' });
+    ci(dir2, run('npm run typecheck') + run('npm run format'));
+    const rows2 = await cov(dir2, { services: [tsSvc()] });
+    expect(row(rows2, 'merge', 'type-check', 'app').status).toBe('partial');
+    expect(row(rows2, 'merge', 'format', 'app').status).toBe('missing');
+  });
+
+  it('coverage: the other new tools: betterleaks, hadolint, kube-linter, conftest, schemathesis, zap-api, nuclei, jscpd', async () => {
+    const st = async (body: string, layer: Layer, id: string, over: Partial<RepoProfile> = {}, service?: string) => {
+      const r = await rowOf(body, layer, id, over, service);
+      return `${r.status}${r.by === undefined ? '' : ` ${r.by}`}`;
+    };
+    expect(await st(ciRun('betterleaks git .'), 'merge', 'secrets')).toBe('covered betterleaks');
+    expect(await st(ciRun('betterleaks dir . --exit-code=0'), 'merge', 'secrets')).toBe('partial betterleaks');
+    expect(await st(ciRun('betterleaks version'), 'merge', 'secrets')).toBe('missing');
+    const docker = { services: [dockerSvc] };
+    expect(await st(ciRun('hadolint --no-fail Dockerfile'), 'merge', 'dockerfile-lint', docker, 'app')).toBe('partial hadolint');
+    expect(await st(ciRun('hadolint -t none Dockerfile'), 'merge', 'dockerfile-lint', docker, 'app')).toBe('partial hadolint');
+    expect(await st(ciRun('hadolint --failure-threshold=none Dockerfile'), 'merge', 'dockerfile-lint', docker, 'app')).toBe('partial hadolint');
+    expect(await st(ciUses('hadolint/hadolint-action@v3.1.0'), 'merge', 'dockerfile-lint', docker, 'app')).toBe('covered hadolint');
+    expect(await st(ciUses('hadolint/hadolint-action@v3.1.0', '          no-fail: true\n'), 'merge', 'dockerfile-lint', docker, 'app')).toBe('partial hadolint');
+    expect(await st(ciUses('hadolint/hadolint-action@v3.1.0', '          failure-threshold: ignore\n'), 'merge', 'dockerfile-lint', docker, 'app')).toBe('partial hadolint');
+    expect(await st(ciRun('docker run --rm -i hadolint/hadolint < Dockerfile'), 'merge', 'dockerfile-lint', docker, 'app')).toBe('covered hadolint');
+    const k8s = { repoFiles: { ...emptyRepoFiles(), kubernetes: true } };
+    expect(await st(ciRun('kube-linter lint k8s/'), 'merge', 'iac', k8s)).toBe('covered kube-linter');
+    expect(await st(ciUses('stackrox/kube-linter-action@v1', '          directory: k8s\n'), 'merge', 'iac', k8s)).toBe('covered kube-linter');
+    expect(await st(ciRun('conftest test k8s/'), 'merge', 'iac', k8s)).toBe('covered conftest');
+    expect(await st(ciRun('conftest test --no-fail k8s/'), 'merge', 'iac', k8s)).toBe('partial conftest');
+    expect(await st(ciRun('trivy config --exit-code 1 k8s/'), 'merge', 'iac', k8s)).toBe('covered trivy-config');
+    const api = { services: [svc('.', { scripts: ['start'], quality: { ...q, apiSpec: { kind: 'file', path: 'openapi.yaml' } } })] };
+    expect(await st(ciRun('st run openapi.yaml --url http://localhost:3000'), 'merge', 'api-dast', api, 'app')).toBe('covered schemathesis');
+    expect(await st(ciUses('schemathesis/action@v2', '          schema: openapi.yaml\n'), 'merge', 'api-dast', api, 'app')).toBe('covered schemathesis');
+    expect(await st(ciUses('zaproxy/action-api-scan@v0.10.0', '          target: openapi.yaml\n'), 'merge', 'api-dast', api, 'app')).toBe('partial zap-api');
+    expect(await st(ciUses('zaproxy/action-api-scan@v0.10.0', '          target: openapi.yaml\n          fail_action: true\n'), 'merge', 'api-dast', api, 'app')).toBe('covered zap-api');
+    expect(await st(ciRun('zap-api-scan.py -t openapi.yaml -f openapi -I'), 'merge', 'api-dast', api, 'app')).toBe('partial zap-api');
+    expect(await st(ciRun('nuclei -u http://localhost:3000'), 'merge', 'dast', runnable, 'app')).toBe('partial nuclei');
+    expect(await st(ciUses('projectdiscovery/nuclei-action@v3', '          args: -u http://localhost:3000\n'), 'merge', 'dast', runnable, 'app')).toBe('partial nuclei');
+    expect(await st(ciRun('npx jscpd src'), 'merge', 'duplication')).toBe('covered jscpd'); // a warning check: running is enough
+  });
+
+  it('coverage: onlyWithFlags now uses the flag prefix rule, and a false value never counts (PS12)', async () => {
+    const pkgService = { services: [svc('.', { publishedPackage: true })] };
+    const st = async (cmd: string) => (await rowOf(`on:\n  release:\n    types: [published]\n${job(run(cmd))}`, 'deploy', 'attestation', pkgService, 'app')).status;
+    expect(await st('npm publish --provenance')).toBe('covered');
+    expect(await st('npm publish --provenance=true')).toBe('covered');
+    for (const cmd of ['npm publish --provenance=0', 'npm publish --provenance=null', 'npm publish --provenance=false', 'npm publish --provenance=FALSE', 'npm publish --provenance=']) {
+      expect(await st(cmd), cmd).toBe('missing');
+    }
+  });
+
+  it('coverage: a command with more words than pipegen reads is partial, never covered (soft flags past the cap)', async () => {
+    const files = Array.from({ length: 70 }, (_, i) => `f${i}.env`).join(' ');
+    expect((await rowOf(ciRun(`gitleaks dir ${files} --exit-code=0`), 'push', 'secrets')).status).toBe('partial');
+    expect((await rowOf(ciRun(`gitleaks dir ${files}`), 'push', 'secrets')).status).toBe('partial');
+    expect((await rowOf(ciRun('gitleaks dir a b c'), 'push', 'secrets')).status).toBe('covered');
+  });
+
+  it('signatures: every entry that sets a fail field has a source comment (PS18: every entry Plan P adds or extends)', () => {
+    const PLAN_P_IDS = [
+      'betterleaks', 'biome', 'biome-ci', 'biome-format-check', 'prettier-check', 'ruff-format-check', 'black-check', 'gofmt-diff', 'gofmt-list', 'golangci-lint',
+      'golangci-lint-fmt', 'oxlint', 'oxlint-type-check', 'tsc', 'mypy', 'pyright', 'basedpyright', 'vitest-cov', 'jest-cov', 'c8', 'nyc', 'pytest-cov', 'coverage-py',
+      'go-cover', 'knip', 'creosote', 'deptry', 'vulture', 'go-mod-tidy', 'jscpd', 'hadolint', 'trivy-dockerfile', 'actionlint', 'zizmor', 'poutine', 'ghalint',
+      'pinact', 'ratchet', 'zizmor-pins', 'dependency-review', 'dependency-review-licences', 'osv-pr-diff', 'trivy-license', 'cargo-deny-licences', 'cargo-deny',
+      'grant', 'fossa', 'schemathesis', 'zap', 'zap-api', 'nuclei', 'kube-linter', 'conftest', 'bullfrog', 'harden-runner', 'scorecard', 'go-fuzz', 'fuzz-actions',
+      'trivy-image', 'trivy-fs', 'trivy-config', 'grype', 'grype-image', 'scorecard-cli',
+    ];
+    const text = readFileSync(join(import.meta.dirname, '..', 'data', 'tool-signatures.yml'), 'utf8').split('\n');
+    const ids = loadToolSignatures().map((t) => t.id);
+    for (const id of PLAN_P_IDS) {
+      expect(ids, id).toContain(id);
+      const at = text.findIndex((l) => l === `  - id: ${id}`);
+      const above: string[] = [];
+      for (let i = at - 1; i >= 0 && (text[i] as string).trimStart().startsWith('#'); i--) above.push(text[i] as string);
+      expect(above.some((l) => /https:\/\/\S+/.test(l)), `${id} has no source URL comment above it`).toBe(true);
+    }
   });
 });

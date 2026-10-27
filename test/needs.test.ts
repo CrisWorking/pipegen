@@ -753,8 +753,11 @@ describe('floor: Plan P checks', () => {
     const priv = profile({ private: true });
     expect(floorNeeds(priv, capsFor('team')).some((n) => n.id === 'scorecard')).toBe(false);
     expect(skipFor(priv, capsFor('team'), 'scorecard')).toEqual([{ category: 'scorecard', why: 'Scorecard needs GitHub code scanning on private repos' }]);
-    expect(find(floorNeeds(priv, PRIVATE_SCANNING), 'merge', 'scorecard')).toHaveLength(1);
-    expect(skipFor(priv, PRIVATE_SCANNING, 'scorecard')).toEqual([]);
+    // Plan P Task 3 (PS16, R4): code scanning on a private repo needs an organisation-owned repo
+    expect(floorNeeds(priv, PRIVATE_SCANNING).some((n) => n.id === 'scorecard')).toBe(false);
+    const orgPriv = profile({ private: true, ownerType: 'Organization' });
+    expect(find(floorNeeds(orgPriv, PRIVATE_SCANNING), 'merge', 'scorecard')).toHaveLength(1);
+    expect(skipFor(orgPriv, PRIVATE_SCANNING, 'scorecard')).toEqual([]);
   });
 
   it('floor: no API spec → api-dast skipped with the export hint; fastapi → api-dast for the runnable service', () => {

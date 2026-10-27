@@ -143,5 +143,6 @@ export function fitOf(events: Map<string, Obj>, defaultBranch: string, deploys: 
   const pr = events.get('pull_request');
   const types = pr ? strs(pr.types) : [];
   const merge = pr !== undefined && !pathFiltered(pr) && branchFilter(pr)(defaultBranch) && (types.length === 0 || types.includes('synchronize'));
-  return { push: everyPush, merge, deploy: deploys || pushDefault || pushTags || events.has('release') };
+  // Plan P Task 3: a scheduled check runs on `schedule`, or on every push to the default branch (no paths filter)
+  return { push: everyPush, merge, deploy: deploys || pushDefault || pushTags || events.has('release'), scheduled: events.has('schedule') || pushDefault };
 }

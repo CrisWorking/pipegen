@@ -5,7 +5,7 @@ import { MAX_FLAG_WORDS, MAX_HITS, MAX_HOOKS } from './bounds.js';
 import { HOOK_FILE } from './decide.js';
 import { cut, firstSet, list, strs, workingDir } from './helpers.js';
 import { resolveScripts } from './scripts.js';
-import { commandReason, foundOf, gateOf, gated } from './settings.js';
+import { commandReason, flagGiven, flagsAllow, foundOf, gateOf, gated } from './settings.js';
 import { DEFAULT_SHELL, scanShell, type ShellMode } from './shell.js';
 import { hookRepo, hookRepoKey } from './signatures.js';
 import { tokenize, type Tk } from './tokenize.js';
@@ -47,6 +47,24 @@ function hookCommand(entry: string, args: readonly string[]): string {
  */
 const NOT_A_COMMAND_LANGUAGES: ReadonlySet<string> = new Set(['fail', 'pygrep', 'script', 'unsupported_script', 'docker_image']);
 
+/** Plan P Task 3 (PS14): the formatter hooks (signature ids) whose run in CI `pre-commit run --all-files` checks format. */
+const FORMATTER_HOOKS: ReadonlySet<string> = new Set(['prettier', 'ruff-format', 'black', 'biome-format']);
+/**
+ * Whether a formatter hook run with these words fails `pre-commit run` on a file that isn't formatted: it rewrites the
+ * file (pre-commit then fails the hook) or it checks and fails. prettier only prints without --write or a check flag
+ * (https://github.com/prettier/prettier/blob/main/docs/cli.md); black and ruff format rewrite unless told otherwise,
+ * and black's --diff alone only prints (https://github.com/psf/black/blob/main/docs/usage_and_configuration/the_basics.md);
+ * biome format with --staged, --changed, --watch or --stdin-file-path doesn't format the files pre-commit passes.
+ */
+function formatterFails(by: string, words: readonly string[]): boolean {
+  const has = (f: string) => flagGiven(f, words);
+  if (by === 'prettier') return ['--write', '-w', '--check', '-c', '--list-different', '-l'].some(has);
+  if (by === 'black') return !has('--diff') || has('--check');
+  if (by === 'ruff-format') return !has('--stdin-filename');
+  if (by === 'biome-format') return !['--staged', '--changed', '--watch', '--stdin-file-path'].some(has);
+  return false;
+}
+
 function readPrecommitConfig(ctx: Ctx): Promise<{ readable: boolean; found: Found[] }> {
   ctx.precommitConfig ??= (async () => {
     const r = await ctx.read.yaml(HOOK_FILE['pre-commit']);
@@ -65,21 +83,34 @@ function readPrecommitConfig(ctx: Ctx): Promise<{ readable: boolean; found: Foun
       const known = !local && ctx.sigs.hookRepos.has(hookRepo(url));
       for (const raw of list(repo.hooks).slice(0, MAX_HOOKS)) {
         const hook = asObj(raw);
-        const args = strs(hook.args).slice(0, MAX_FLAG_WORDS);
+        const allArgs = strs(hook.args);
+        const args = allArgs.slice(0, MAX_FLAG_WORDS);
+        // Plan P Task 3: more args than pipegen reads may hide a soft flag past them
+        const complete = allArgs.length <= MAX_FLAG_WORDS;
         const id = typeof hook.id === 'string' && regexSafe(hook.id) ? hook.id : '';
         const entry = typeof hook.entry === 'string' && regexSafe(hook.entry) ? hook.entry : undefined;
         let hookFound: Found[] = [];
+        // the words the hook runs with, for the formatter rule (PS14): the entry and args, or the args of a known hook
+        let words: string[] = [];
         if (local) {
           // `language: fail` prints its entry as a message and `pygrep` reads it as a regex; `script` and
           // `unsupported_script` run the entry as a file in the repo, and `docker_image` starts with an image name
           // (https://pre-commit.com/#supported-languages): none of them runs the named tool (fix round 2, N2)
-          if (entry !== undefined && !(typeof hook.language === 'string' && NOT_A_COMMAND_LANGUAGES.has(hook.language))) hookFound = scan(hookCommand(entry, args));
+          if (entry !== undefined && !(typeof hook.language === 'string' && NOT_A_COMMAND_LANGUAGES.has(hook.language))) {
+            words = hookCommand(entry, args).split(' ');
+            hookFound = scan(hookCommand(entry, args));
+          }
         } else if (entry !== undefined) {
+          words = hookCommand(entry, args).split(' ');
           hookFound = known ? scan(hookCommand(entry, args)) : tag(scan(hookCommand(entry, args)), 'hook-repo');
         } else if (id !== '') {
           const tools = known ? ctx.sigs.hooks.get(hookRepoKey(url, id)) : undefined;
-          hookFound = tools !== undefined ? tools.map((t) => foundOf(t, '.', commandReason(t, args))) : tag(scan(hookCommand(id, args)), 'hook-repo');
+          words = tools !== undefined ? args : hookCommand(id, args).split(' ');
+          hookFound = tools !== undefined
+            ? tools.filter((t) => flagsAllow(t, args, complete)).map((t) => foundOf(t, '.', commandReason(t, args) ?? (complete ? null : 'long')))
+            : tag(scan(hookCommand(id, args)), 'hook-repo');
         }
+        hookFound = hookFound.map((f) => (FORMATTER_HOOKS.has(f.by) ? { ...f, formats: formatterFails(f.by, words) } : f));
         // a file filter pipegen doesn't evaluate (they are Python regexes from the repo), or another stage
         const filtered = topFiltered || ['files', 'exclude', 'types', 'types_or', 'exclude_types'].some((k) => isSet(hook, k));
         if (filtered) hookFound = tag(hookFound, 'files');
@@ -128,7 +159,22 @@ export async function readHooks(ctx: Ctx): Promise<Hooks> {
  * carried over: a secret-scan hook such as gitleaks' scans the staged changes (`--staged`, pass_filenames: false,
  * https://github.com/gitleaks/gitleaks/blob/master/.pre-commit-hooks.yaml), and a CI checkout has none staged. One run
  * per (trigger fit, reason) is enough (the first run of each kind is what a need reads), so this stays small.
+ * Plan P Task 3: also the hooks' type-check, dockerfile-lint, workflow-lint and format categories; and a known
+ * formatter hook (prettier, ruff-format, black, biome-format, matched by id or entry) counts for format without a
+ * check flag, because pre-commit fails a hook that changes files ("files were modified by this hook",
+ * https://github.com/pre-commit/pre-commit/blob/main/pre_commit/commands/run.py; ruling PS14). lefthook and husky
+ * never carry anything here.
  */
+const CARRIED: ReadonlySet<string> = new Set(['lint', 'type-check', 'dockerfile-lint', 'workflow-lint', 'format']);
+/**
+ * A formatter hook carries format when it writes files or checks them (formatterFails), or when a reason already keeps
+ * it partial (a hook repo pipegen doesn't know, a file filter): it never makes the row covered then.
+ */
+const carried = (f: Found): string[] => {
+  const out = f.categories.filter((c) => CARRIED.has(c));
+  if (FORMATTER_HOOKS.has(f.by) && (f.formats === true || f.reason !== null) && !out.includes('format')) out.push('format');
+  return out;
+};
 export async function hookRunHits(ctx: Ctx): Promise<void> {
   const reps = new Map<string, Hit>();
   for (const h of ctx.hits) {
@@ -136,20 +182,21 @@ export async function hookRunHits(ctx: Ctx): Promise<void> {
     if (h.hookRun === true && !reps.has(key)) reps.set(key, h);
   }
   if (reps.size === 0) return;
-  const tools = new Map<string, Found>();
+  const tools = new Map<string, { f: Found; categories: string[] }>();
   for (const f of (await readPrecommitConfig(ctx)).found) {
     const key = `${f.by}\u0000${f.reason ?? ''}`;
+    const categories = carried(f);
     // a hook set up for another stage doesn't run in `pre-commit run` (its default stage is pre-commit)
-    if (f.categories.includes('lint') && f.reason !== 'stage' && !tools.has(key)) tools.set(key, f);
+    if (categories.length > 0 && f.reason !== 'stage' && !tools.has(key)) tools.set(key, { f, categories });
   }
   for (const rep of reps.values()) {
-    for (const t of tools.values()) {
+    for (const { f: t, categories } of tools.values()) {
       if (ctx.hits.length >= MAX_HITS) {
         ctx.budget.truncated = true;
         return;
       }
       ctx.hits.push({
-        opaque: false, categories: ['lint'], by: t.by, subject: `${t.subject} in the pre-commit hooks`, dir: '.', reason: rep.reason ?? t.reason,
+        opaque: false, categories, by: t.by, subject: `${t.subject} in the pre-commit hooks`, dir: '.', reason: rep.reason ?? t.reason,
         fit: rep.fit, where: cut(`${rep.where} → ${HOOK_FILE['pre-commit']}`),
       });
     }

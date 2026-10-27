@@ -8,6 +8,7 @@ import { needsInstructions, NEEDS_SYSTEM } from '../ai/prompts/needs.js';
 import { completeValidated, formatAiText } from '../ai/provider.js';
 import { bundleText, redact, scrubKnownValues, type CodeBundle } from '../ai/redact.js';
 import { aiSchema, type AiSchema } from '../ai/schema.js';
+import { codeSecurityAvailable } from '../github/availability.js';
 import { signingMode } from '../github/signing-mode.js';
 import { SERVER_FRAMEWORKS, SERVICE_NAME_RE } from '../read/project.js';
 import { NEEDS_MAX_OUTPUT_TOKENS } from './discovery-limits.js';
@@ -186,7 +187,7 @@ export const CHECKS: readonly CheckRule[] = [
   { category: 'update-config', layers: ['merge'], scope: 'repo', blocking: false, skip: () => null,
     label: 'Dependency update config', why: 'Opens update pull requests for dependencies, waiting 7 days so brand-new releases are skipped.' },
   { category: 'scorecard', layers: ['merge'], scope: 'repo', blocking: false,
-    skip: (p, c) => (!p.private || c.codeScanning ? null : 'Scorecard needs GitHub code scanning on private repos'),
+    skip: (p, c) => (codeSecurityAvailable(p, c) ? null : 'Scorecard needs GitHub code scanning on private repos'), // PS16: one helper with the coverage mapper
     label: 'OpenSSF Scorecard', why: "Scores the repo's security practices every week, so a weakened setting shows up." },
   { category: 'fuzzing', layers: ['merge'], scope: 'service', blocking: false, skip: (_p, _c, s) => (s?.quality.fuzzTargets === true ? null : 'no fuzz targets found'),
     label: 'Fuzzing (built in v0.3)', why: "Feeds random input to the code's fuzz targets to find crashes." },

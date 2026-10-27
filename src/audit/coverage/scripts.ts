@@ -11,6 +11,9 @@ import type { Compiled, Ctx, Found, Reason } from './types.js';
 
 // ---------- own scripts read from package.json (Task 5) ----------
 
+/** Plan P Task 3 (PS11): the own-script categories a by-name script (test, lint) also counts for through its text. */
+const PLAN_P_SCRIPT_CATEGORIES: ReadonlySet<string> = new Set(['format', 'type-check', 'coverage', 'dead-code', 'duplication']);
+
 /** How npm runs a script: `/bin/sh -c` on POSIX (https://docs.npmjs.com/cli/v11/using-npm/scripts), so no -e. */
 const NPM_SCRIPT_SHELL: ShellMode = { errexit: false, pipefail: false };
 
@@ -66,6 +69,19 @@ export async function resolveScripts(ctx: Ctx, found: Found[]): Promise<Found[]>
     if (f.byName !== undefined) {
       const lowered = await byNameRun(ctx, f);
       if (lowered !== null) out.push(lowered);
+      // Plan P Task 3 (PS11): what the script's text runs for the Plan P categories (`npm run test:coverage` →
+      // coverage) counts through that text only, as for any other own script (the older ones keep the by-name rule)
+      if (f.dir !== null && lowered !== null && !lowered.categories.some((c) => c.startsWith(UNKNOWN_PREFIX))) {
+        for (const g of await scriptRuns(ctx, f.dir, f.byName)) {
+          const extra = g.categories.filter((c) => PLAN_P_SCRIPT_CATEGORIES.has(c.startsWith(UNKNOWN_PREFIX) ? c.slice(UNKNOWN_PREFIX.length) : c));
+          if (extra.length > 0) {
+            out.push({
+              categories: extra, by: f.by, subject: f.subject, dir: g.dir, reason: f.reason ?? g.reason,
+              ...(f.reason === null && g.partialWhy !== undefined ? { partialWhy: g.partialWhy } : {}),
+            });
+          }
+        }
+      }
       continue;
     }
     if (f.script === undefined) {

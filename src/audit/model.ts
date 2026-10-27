@@ -358,7 +358,7 @@ export async function buildAudit(dir: string, deps: AuditDeps): Promise<AuditRep
   const caps = deps.capabilities;
   const needs = floorNeeds(profile, caps);
 
-  const coverage = await coverageOf(profile, needs, dir, skippedWorkflowCount(readerNotes), notes);
+  const coverage = await coverageOf(profile, needs, dir, skippedWorkflowCount(readerNotes), notes, caps);
   const wouldAdd = wouldAddRows(profile, coverage, deps);
 
   const activity = await activityOf(deps, profile);
@@ -460,9 +460,10 @@ function supportOf(p: RepoProfile): AuditSupport {
 }
 
 /** mapCoverage, or every need `unknown` with a plain note when it fails (the tool signatures can't be loaded). */
-async function coverageOf(p: RepoProfile, needs: Need[], dir: string, skippedWorkflows: number, notes: Notes): Promise<Coverage[]> {
+async function coverageOf(p: RepoProfile, needs: Need[], dir: string, skippedWorkflows: number, notes: Notes, capabilities: Capabilities): Promise<Coverage[]> {
   try {
-    return await mapCoverage(p, needs, dir, { skippedWorkflows, noImage: (need) => buildsNoImage(need, p) });
+    // Plan P Task 3 (PS16): the capabilities too, so an action this repo can't use is never read as covered
+    return await mapCoverage(p, needs, dir, { skippedWorkflows, noImage: (need) => buildsNoImage(need, p), capabilities });
   } catch (e) {
     const why = e instanceof Error ? e.message.split('\n')[0] : 'unknown error';
     notes.add(`pipegen couldn't load its list of tool signatures, so it can't tell which checks your workflows already run (${why}).`);

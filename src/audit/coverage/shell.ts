@@ -2,7 +2,7 @@
 import { regexSafe } from '../../read/limits.js';
 import { MAX_FLAG_WORDS, MAX_SCAN_BYTES, MAX_SCRIPT_PATTERNS, MAX_SCRIPT_TARGETS } from './bounds.js';
 import { resolveDir } from './helpers.js';
-import { UNKNOWN_PREFIX, commandReason, flagsAllow, foundOf, inputWords, inputsCrowded, type Inputs } from './settings.js';
+import { UNKNOWN_PREFIX, commandReason, flagsAllow, foundOf, inputWords, inputWordsCapped, inputsCrowded, type Inputs } from './settings.js';
 import { PRE_COMMIT_ID } from './signatures.js';
 import { tokenize } from './tokenize.js';
 import type { Budget, CommandRule, Compiled, Found, Reason } from './types.js';
@@ -105,8 +105,12 @@ const ownName = (name: string) => OWN_NAME_RE.test(name) && !fixOnly(name);
 const TEST_CATEGORIES = ['unit-tests', 'full-tests'] as const;
 /** pytest modes that collect or list tests without running them (https://docs.pytest.org/en/stable/reference/reference.html#command-line-flags). */
 export const PYTEST_NO_RUN: ReadonlySet<string> = new Set(['--co', '--collect-only', '--setup-plan', '--fixtures', '--fixtures-per-test', '--markers']);
-/** What an own script can count for, from what its text runs (Task 5). */
-export const SCRIPT_CATEGORIES: ReadonlySet<string> = new Set(['unit-tests', 'full-tests', 'lint', 'format-lint']);
+/**
+ * What an own script can count for, from what its text runs (Task 5). Plan P Task 3 (PS11): also format, type-check,
+ * coverage, dead-code and duplication (`npm run typecheck`, `format:check`, `test:coverage`, `knip`).
+ */
+export const SCRIPT_CATEGORIES: ReadonlySet<string> = new Set(['unit-tests', 'full-tests', 'lint', 'format-lint', 'format', 'type-check', 'coverage', 'dead-code',
+  'duplication']);
 
 /**
  * Task 5: tox and nox count as the project's own test runner (like `npm test`) only when the command line picks no
@@ -345,10 +349,14 @@ export function scanShell(text: string, base: string | null, sigs: Compiled, bud
     if (isDead(k)) return;
     const args = argsAfter(k);
     if (probeCall(args)) return;
+    // Plan P Task 3: a command line with more words than pipegen reads may hide a soft flag past them
+    const complete = segEnd[k]! - k - 1 <= MAX_FLAG_WORDS;
     const tryRules = (rules: CommandRule[] | undefined) => {
       for (const r of rules ?? []) {
-        if (!followedBy(k, r.rest) || r.excludes.some((x) => followedBy(k, x)) || !flagsAllow(r.tool, args)) continue;
-        const f = foundOf(r.tool, cwd, shellReason(k) ?? commandReason(r.tool, args));
+        if (!followedBy(k, r.rest) || r.excludes.some((x) => followedBy(k, x)) || !flagsAllow(r.tool, args, complete)) continue;
+        const target = r.tool.scanTarget === undefined ? null : imageTarget(args.slice(r.rest.length));
+        if (target !== null && target !== 'unknown' && target !== r.tool.scanTarget) continue;
+        const f = foundOf(r.tool, cwd, shellReason(k) ?? (target === 'unknown' ? 'target' : null) ?? commandReason(r.tool, args) ?? (complete ? null : 'long'));
         // `pre-commit run --all-files` at the repo root (the whole list of words read: none past MAX_FLAG_WORDS); in
         // another folder pre-commit reads that folder's .pre-commit-config.yaml (fix round 1, I2)
         if (r.tool.id === PRE_COMMIT_ID && r.rest.length === 1 && r.rest[0] === 'run' && segEnd[k]! - k - 1 <= MAX_FLAG_WORDS
@@ -659,8 +667,53 @@ export function scanImage(uses: string, w: Inputs, sigs: Compiled): Found[] {
   const name = imageName(uses.slice('docker://'.length));
   const args = inputWords(w, 'args');
   if (probeCall(args)) return [];
-  return (sigs.byFirstWord.get(name) ?? []).filter((r) => r.rest.length === 0)
-    .map((r) => foundOf(r.tool, '.', inputsCrowded(r.tool, w, ['args']) ? 'inputs' : commandReason(r.tool, args)));
+  const capped = inputWordsCapped(w, 'args');
+  // Plan P Task 3: a signature's later command words come first in the args (`docker://aquasec/trivy` with `image …`)
+  const starts = (words: readonly string[]) => words.every((x, i) => args[i] === x);
+  return (sigs.byFirstWord.get(name) ?? []).filter((r) => starts(r.rest) && !r.excludes.some(starts) && flagsAllow(r.tool, args, !capped))
+    .flatMap((r) => {
+      const target = r.tool.scanTarget === undefined ? null : imageTarget(args.slice(r.rest.length));
+      if (target !== null && target !== 'unknown' && target !== r.tool.scanTarget) return [];
+      return [foundOf(r.tool, '.', inputsCrowded(r.tool, w, ['args']) || capped ? 'inputs' : (target === 'unknown' ? 'target' : commandReason(r.tool, args)))];
+    });
+}
+
+/**
+ * Plan P Task 3 (PB3): grype's sources (https://oss.anchore.com/docs/reference/grype/cli/): image schemes, and the
+ * schemes that read a folder, a file, an SBOM or package lists. `--from` picks the source behaviour too.
+ */
+const IMAGE_SCHEMES = ['docker:', 'podman:', 'docker-archive:', 'oci-archive:', 'oci-dir:', 'singularity:', 'registry:'];
+const FOLDER_SCHEMES = ['dir:', 'file:', 'sbom:', 'purl:', 'cpes:', 'cpe:', 'pkg:', 'zarf:'];
+const FOLDER_SOURCES: ReadonlySet<string> = new Set(['dir', 'file', 'sbom', 'purl', 'cpes', 'cpe', 'zarf']);
+const REPO_PART_RE = /^[a-z0-9][a-z0-9._\/:-]{0,254}$/;
+const TAG_RE = /^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$/;
+/** An image reference with a :tag or an @sha256 digest (a registry host and port may come first). Single-class regexes only. */
+function imageRef(w: string): boolean {
+  const at = w.indexOf('@sha256:');
+  if (at >= 0) return REPO_PART_RE.test(w.slice(0, at)) && /^[0-9a-f]{64}$/.test(w.slice(at + 8));
+  const slash = w.lastIndexOf('/');
+  const colon = w.indexOf(':', slash + 1);
+  return colon > slash + 1 && REPO_PART_RE.test(w.slice(0, colon)) && TAG_RE.test(w.slice(colon + 1));
+}
+/**
+ * Plan P Task 3 (PB3, `scanTarget`): what a scanner's arguments name. 'folder' when any word is a folder, file or SBOM
+ * source (dir:, sbom:, `--from dir`, a path); else 'image' when one names an image (a scheme, or a reference with a
+ * tag or digest); else 'unknown' (a variable, a bare name, nothing). A flag's value word is read like the others: it
+ * can only make the answer 'folder' or leave it 'unknown', unless it looks like an image reference.
+ */
+function imageTarget(args: readonly string[]): 'image' | 'folder' | 'unknown' {
+  let image = false;
+  for (const [i, w] of args.entries()) {
+    const from = w === '--from' ? args[i + 1] : w.startsWith('--from=') ? w.slice('--from='.length) : undefined;
+    if (from !== undefined && from.toLowerCase().split(',').some((x) => FOLDER_SOURCES.has(x.trim()))) return 'folder';
+    if (w.startsWith('-') || w.length > 512 || !regexSafe(w)) continue;
+    const lower = w.toLowerCase();
+    if (FOLDER_SCHEMES.some((x) => lower.startsWith(x)) || w === '.' || w === '..' || w.startsWith('./') || w.startsWith('../') || w.startsWith('/')
+      || w.startsWith('~') || w.includes('\\')) return 'folder';
+    if (w.includes('$') || w.includes('`')) continue;
+    if (IMAGE_SCHEMES.some((x) => lower.startsWith(x)) || imageRef(w)) image = true;
+  }
+  return image ? 'image' : 'unknown';
 }
 
 // ---------- own scripts read from package.json (Task 5) ----------

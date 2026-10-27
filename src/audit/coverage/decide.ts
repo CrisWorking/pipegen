@@ -1,11 +1,12 @@
 // Coverage mapper (see ../coverage.ts for the rules): which runs count for which need, and pipegen's own why texts.
 import { posix } from 'node:path';
+import { SCHEDULED_CATEGORIES } from '../../engine/need-ids.js';
 import type { Layer, Need, Service } from '../../types.js';
 import type { Coverage } from '../coverage.js';
 import { MAX_HIT_DIRS, MAX_SERVICES } from './bounds.js';
 import type { Hooks } from './hooks.js';
 import { OLD_PREFIX, UNKNOWN_PREFIX } from './settings.js';
-import type { CiLayer, Hit, Reason } from './types.js';
+import type { CiLayer, Hit, Reason, Slot } from './types.js';
 
 // ---------- why (pipegen's own text only) ----------
 
@@ -50,17 +51,21 @@ export const OPAQUE_WHY = {
   tooMany: "There are too many services or workflow steps to check in full, so pipegen can't tell.",
 } as const;
 
-const LAYER_DONE: Readonly<Record<Exclude<Layer, 'pre-commit'>, string>> = {
+const LAYER_DONE: Readonly<Record<Slot, string>> = {
   push: 'on every push',
   merge: 'on every pull request',
   deploy: 'when the code is deployed or released',
+  scheduled: 'on a schedule or on every push to the default branch',
 };
 /**
  * Reasons that say the tool may not run at all (not just "can't block"): they make even a need that doesn't block
  * (format-lint) partial. Task 5 fix round 1 adds the pre-commit ones (hook-repo, files, stage) and SKIP; the Plan U
  * final review (I2) adds a TOX… or NOX… variable that picks what tox or nox runs.
  */
-const MAY_NOT_RUN: ReadonlySet<Reason> = new Set<Reason>(['condition', 'hook-repo', 'files', 'stage', 'skip', 'ref', 'tox-env', 'nox-env']);
+export const MAY_NOT_RUN: ReadonlySet<Reason> = new Set<Reason>(['condition', 'hook-repo', 'files', 'stage', 'skip', 'ref', 'tox-env', 'nox-env',
+  // Plan P Task 3: it may not do the check at all (an action this repo can't use, one not set up for it, egress control
+  // missing from some release jobs, a scan target pipegen can't place)
+  'unavailable', 'needs-inputs', 'some-jobs', 'target']);
 const REASON_WHY: Readonly<Record<Reason, (subject: string, when: string) => string>> = {
   continue: (s) => `${s} runs, but is allowed to fail (continue-on-error), so it can't block anything.`,
   suppressed: (s) => `${s} runs, but its exit code is ignored (by ||, a pipe, an if, set +e, the background & or the step's shell), so it can't block anything.`,
@@ -77,7 +82,15 @@ const REASON_WHY: Readonly<Record<Reason, (subject: string, when: string) => str
   ref: (s) => `${s} runs at a version pipegen can't place, so pipegen can't tell whether it does this check.`,
   'tox-env': (s) => `${s} runs, but a TOX… variable in this job (like TOXENV) picks which tox environments run, so pipegen can't tell if it runs the tests.`,
   'nox-env': (s) => `${s} runs, but a NOX… variable in this job (like NOXSESSION) picks which nox sessions run, so pipegen can't tell if it runs the tests.`,
+  // Plan P Task 3 (a signature's own why, when it has one, is used for unavailable and needs-inputs)
+  unavailable: (s) => `${s} runs, but this repo can't use it, so it checks nothing here.`,
+  'needs-inputs': (s) => `${s} runs, but isn't set up to do this check, so it can't block anything.`,
+  'some-jobs': (s) => `${s} runs, but pipegen found egress control in some release jobs only (or not as their first step), so the other release steps can reach any site.`,
+  target: (s) => `${s} runs, but pipegen can't tell whether it scans a container image or a folder here.`,
+  long: (s) => `${s} runs with more words than pipegen reads, so pipegen can't tell how it is set up.`,
 };
+/** Reasons whose run carries pipegen's own why from the signature (partialWhy, actionRef, unavailableWhy, requireInputs). */
+const OWN_WHY: ReadonlySet<Reason> = new Set<Reason>(['never', 'ref', 'unavailable', 'needs-inputs']);
 
 const HOOK_PLACE = { 'pre-commit': 'the pre-commit framework', husky: 'the husky pre-commit hook', lefthook: 'the lefthook pre-commit hook' } as const;
 const HOOK_NAME = { 'pre-commit': 'the pre-commit framework', husky: 'husky', lefthook: 'lefthook' } as const;
@@ -128,8 +141,8 @@ const FN = 0;
 const FC = 1;
 const FO = 2;
 const NF = 3;
-const LAYER_SLOT: Readonly<Record<CiLayer, number>> = { push: 0, merge: 4, deploy: 8 };
-const CI_LAYERS: readonly CiLayer[] = ['push', 'merge', 'deploy'];
+const LAYER_SLOT: Readonly<Record<Slot, number>> = { push: 0, merge: 4, deploy: 8, scheduled: 12 };
+const SLOTS: readonly Slot[] = ['push', 'merge', 'deploy', 'scheduled'];
 const OPAQUE_KEY = '\0opaque'; // not a category: the opaque runs (they have none)
 
 /** Per (category, dir): the index of the first run of each kind, for each layer (-1 = none). */
@@ -151,15 +164,15 @@ export class Firsts {
     let byDir = this.byKey.get(key);
     if (!byDir) this.byKey.set(key, (byDir = new Map()));
     let at = byDir.get(dir);
-    if (!at) byDir.set(dir, (at = new Int32Array(12).fill(-1)));
-    for (const layer of CI_LAYERS) {
+    if (!at) byDir.set(dir, (at = new Int32Array(16).fill(-1)));
+    for (const layer of SLOTS) {
       const slot = LAYER_SLOT[layer] + (!h.fit[layer] ? NF : h.reason === null ? FN : MAY_NOT_RUN.has(h.reason) ? FC : FO);
       if ((at[slot] as number) < 0) at[slot] = i;
     }
   }
 
   /** The first run in these dirs of one of these kinds on the layer. */
-  first(key: string, dirs: readonly number[], layer: CiLayer, kinds: readonly number[]): Hit | undefined {
+  first(key: string, dirs: readonly number[], layer: Slot, kinds: readonly number[]): Hit | undefined {
     const byDir = this.byKey.get(key);
     if (!byDir) return undefined;
     let best = -1;
@@ -273,7 +286,7 @@ const coverKinds = (need: Need) => (need.blocking ? [FN] : [FN, FO]);
 const partialKinds = (need: Need) => (need.blocking ? [FC, FO] : [FC]);
 
 function reasonWhy(h: { subject: string; partialWhy?: string }, reason: Reason, when: string): string {
-  return (reason === 'never' || reason === 'ref') && h.partialWhy !== undefined ? h.partialWhy : REASON_WHY[reason](h.subject, when);
+  return OWN_WHY.has(reason) && h.partialWhy !== undefined ? h.partialWhy : REASON_WHY[reason](h.subject, when);
 }
 
 export interface Decide { ci: Firsts; hooks: Firsts; scope: Scope; dirsCapped: boolean; truncated: boolean; unreadable: boolean; noImage: (need: Need) => boolean }
@@ -281,7 +294,9 @@ export interface Decide { ci: Firsts; hooks: Firsts; scope: Scope; dirsCapped: b
 /** A per-service need that a cap kept pipegen from checking in full: never missing, never covered by the cap. */
 const capped = (need: Need, d: Decide) => need.service !== undefined && (d.scope.capped || d.dirsCapped);
 
-export function ciCoverage(need: Need, layer: CiLayer, d: Decide): Coverage {
+export function ciCoverage(need: Need, ciLayer: CiLayer, d: Decide): Coverage {
+  // Plan P Task 3: a scheduled check (merge-layer need) is read on the scheduled trigger, not on pull requests
+  const layer: Slot = (SCHEDULED_CATEGORIES as ReadonlySet<string>).has(need.category) ? 'scheduled' : ciLayer;
   const dirs = d.scope.dirsOf(need.service);
   const cover = d.ci.first(need.category, dirs, layer, coverKinds(need));
   if (cover) return { need, status: 'covered', ...located(cover), why: `${cover.subject} runs ${LAYER_DONE[layer]}.` };

@@ -1,6 +1,6 @@
 // Coverage mapper (see ../coverage.ts for the rules): the types the coverage modules share. Types only: import it with
 // `import type`.
-import type { Layer, RepoProfile } from '../../types.js';
+import type { Capabilities, Layer, RepoProfile } from '../../types.js';
 import type { ScriptClass, Targets } from './scripts.js';
 import type { EnvGate } from './settings.js';
 import type { ToolSignature } from './signatures.js';
@@ -12,6 +12,8 @@ export interface CommandRule { tool: ToolSignature; rest: string[]; excludes: st
 export interface ActionRule { tool: ToolSignature; parts: string[]; prefixLast: boolean }
 export interface Compiled {
   byFirstWord: Map<string, CommandRule[]>; byPath: Map<string, CommandRule[]>; actions: ActionRule[];
+  /** Plan P Task 3: `owner/repo/.github/workflows/<file>` (lowercase) → the tools a job-level `uses:` of it runs. */
+  reusable: Map<string, ToolSignature[]>;
   /** `hookRepoKey(repo, id)` → the tools a pre-commit hook of that repo and id runs (Task 5). */
   hooks: Map<string, ToolSignature[]>;
   /** The hook repos listed in `precommitHooks` (normalised by hookRepo): pipegen knows what their hooks run. */
@@ -20,11 +22,20 @@ export interface Compiled {
 
 /** Why a run that is found can't block anything (or might not run). */
 export type Reason = 'continue' | 'suppressed' | 'function' | 'soft' | 'inputs' | 'no-fail' | 'never' | 'condition'
-  | 'hook-repo' | 'files' | 'stage' | 'skip' | 'ref' | 'tox-env' | 'nox-env';
+  | 'hook-repo' | 'files' | 'stage' | 'skip' | 'ref' | 'tox-env' | 'nox-env'
+  // Plan P Task 3: an action this repo can't use (availability), an action not set up for the check (requireInputs),
+  // egress control missing from some release jobs (PB5), a scan target pipegen can't place (imageArg), a command with
+  // more words than pipegen reads
+  | 'unavailable' | 'needs-inputs' | 'some-jobs' | 'target' | 'long';
 
 export type Manager = NonNullable<RepoProfile['precommit']>;
 export type CiLayer = Exclude<Layer, 'pre-commit'>;
-export type Fit = Record<CiLayer, boolean>;
+/**
+ * The triggers a run is on. `scheduled` (Plan P Task 3): a `schedule` event or a push to the default branch, the right
+ * trigger for the scheduled checks (SCHEDULED_CATEGORIES), which are merge-layer needs.
+ */
+export type Slot = CiLayer | 'scheduled';
+export type Fit = Record<Slot, boolean>;
 
 /** A tool found in shell text or a step. `reason` null = it runs and can fail the run. */
 export interface Found {
@@ -40,6 +51,8 @@ export interface Found {
   byName?: string;
   /** Task 5: `pre-commit run` over all files at the pre-commit stage: the hooks' lint tools run here too (SKIP drops it). */
   hookRun?: boolean;
+  /** Plan P Task 3 (PS14): a pre-commit formatter hook that writes files or checks them, so a CI `pre-commit run` fails on a change. */
+  formats?: boolean;
 }
 export interface Hit {
   opaque: boolean;
@@ -53,6 +66,8 @@ export interface Hit {
   where: string;
   why?: string;
   hookRun?: boolean;
+  /** Plan P Task 3 (PB5): found in a local composite action's later step, so not the first step of its job. */
+  laterStep?: boolean;
 }
 
 export interface Budget { visits: number; bytes: number; truncated: boolean }
@@ -71,5 +86,7 @@ export interface Ctx {
   /** Fix round 4 (N8): each (dir, script glob)'s matching script names, or 'capped'; and the glob work spent so far. */
   globMemo: Map<string, Targets>;
   globWork: number;
+  /** Plan P Task 3: what GitHub allows here (MapCoverageOptions.capabilities); absent = no code scanning. */
+  caps?: Capabilities;
   precommitConfig?: Promise<{ readable: boolean; found: Found[] }>;
 }

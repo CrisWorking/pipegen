@@ -136,9 +136,25 @@ function inputSetOtherwise(spec: Record<string, string[]> | undefined, w: Inputs
   }));
 }
 
+/**
+ * Every string value of an input, split into words, worked out once per step's inputs (a step can match several
+ * signatures: trivy-action has five), with whether there were more than MAX_FLAG_WORDS of them.
+ */
+const wordsMemo = new WeakMap<Inputs, Map<string, { words: string[]; capped: boolean }>>();
+function inputWordsOf(w: Inputs, name: string): { words: string[]; capped: boolean } {
+  let byName = wordsMemo.get(w);
+  if (byName === undefined) wordsMemo.set(w, (byName = new Map()));
+  let r = byName.get(name);
+  if (r === undefined) {
+    const all = (w.byName.get(name) ?? []).flatMap((v) => (typeof v === 'string' && regexSafe(v) ? tokenize(v).filter((t) => t.op === null).map((t) => t.w) : []));
+    byName.set(name, (r = { words: all.slice(0, MAX_FLAG_WORDS), capped: all.length > MAX_FLAG_WORDS }));
+  }
+  return r;
+}
 /** Every string value of an input, split into words (bounded). */
-export const inputWords = (w: Inputs, name: string) => (w.byName.get(name) ?? []).flatMap((v) =>
-  (typeof v === 'string' && regexSafe(v) ? tokenize(v).filter((t) => t.op === null).map((t) => t.w) : [])).slice(0, MAX_FLAG_WORDS);
+export const inputWords = (w: Inputs, name: string) => inputWordsOf(w, name).words;
+/** Plan P Task 3: an input with more words than pipegen reads (a soft flag past them would go unseen). */
+export const inputWordsCapped = (w: Inputs, name: string) => inputWordsOf(w, name).capped;
 
 /** Inputs many actions pass straight to the tool's command line; read for the tool's soft flags. */
 const ARGS_INPUTS = ['args', 'cmd_options', 'options'];
@@ -146,12 +162,15 @@ const ARGS_INPUTS = ['args', 'cmd_options', 'options'];
 /** Whether an input the tool is read by (its listed inputs, or `names`) has more spellings than pipegen keeps. */
 export function inputsCrowded(tool: ToolSignature, w: Inputs, names: readonly string[]): boolean {
   if (w.crowded.size === 0) return false;
-  const listed = [tool.softInputs, tool.softUnless, tool.failInputs, tool.skipInputs, tool.skipUnless].flatMap((spec) => Object.keys(spec ?? {}));
+  const listed = [tool.softInputs, tool.softUnless, tool.failInputs, tool.skipInputs, tool.skipUnless, tool.onlyWithInputs, tool.requireInputs?.all, tool.requireInputs?.any]
+    .flatMap((spec) => Object.keys(spec ?? {}));
+  if (tool.requireInputs?.unset !== undefined) listed.push(...tool.requireInputs.unset);
+  if (tool.onlyWithFlagValue?.input !== undefined) listed.push(tool.onlyWithFlagValue.input);
   return [...listed, ...names].some((name) => w.crowded.has(name.toLowerCase()));
 }
 
 export function actionReason(tool: ToolSignature, w: Inputs): Reason | null {
-  if (inputsCrowded(tool, w, ARGS_INPUTS)) return 'inputs';
+  if (inputsCrowded(tool, w, ARGS_INPUTS) || ARGS_INPUTS.some((name) => inputWordsCapped(w, name))) return 'inputs';
   const args = ARGS_INPUTS.flatMap((name) => inputWords(w, name));
   if (softInputGiven(tool.softInputs, w) || inputSetOtherwise(tool.softUnless, w) || (tool.softFlags ?? []).some((f) => flagGiven(f, args))) return 'soft';
   if (tool.actionFails === 'never') return 'never';
@@ -159,12 +178,51 @@ export function actionReason(tool: ToolSignature, w: Inputs): Reason | null {
   return null;
 }
 
-/** Task 5: the step's inputs mean the action doesn't do this check at all (pypi-publish with a password: no attestation). */
+/**
+ * Task 5: the step's inputs mean the action doesn't do this check at all (pypi-publish with a password: no attestation).
+ * Plan P Task 3: also when an onlyWithInputs input isn't set to a listed value, or the onlyWithFlagValue input doesn't
+ * hold the word (trivy-action `scanners`).
+ */
 export function actionSkipped(tool: ToolSignature, w: Inputs): boolean {
+  if (tool.onlyWithInputs !== undefined) {
+    if (Object.keys(tool.onlyWithInputs).some((name) => w.crowded.has(name.toLowerCase()))) return true;
+    if (!failInputGiven(tool.onlyWithInputs, w)) return true;
+  }
+  const rule = tool.onlyWithFlagValue;
+  if (rule?.input !== undefined) {
+    const name = rule.input.toLowerCase();
+    if (w.crowded.has(name)) return true;
+    // every spelling must hold the word (GitHub keeps one of them); an empty value is the action's default
+    const given = (w.byName.get(name) ?? []).filter((v) => !(v === null || v === undefined || inputText(v) === ''));
+    const holds = given.length === 0 ? flagValueAllows(rule, undefined, true) : given.every((v) => flagValueAllows(rule, inputText(v), true));
+    if (!holds) return true;
+  }
   if (tool.skipInputs === undefined && tool.skipUnless === undefined) return false;
   const names = [tool.skipInputs, tool.skipUnless].flatMap((spec) => Object.keys(spec ?? {}));
   if (names.some((name) => w.crowded.has(name.toLowerCase()))) return true; // can't tell: it doesn't count
   return softInputGiven(tool.skipInputs, w) || inputSetOtherwise(tool.skipUnless, w);
+}
+
+/**
+ * Plan P Task 3 (ruling PB5): whether the step's inputs meet the signature's requireInputs. `all`: each input set, in
+ * every spelling, to a listed value; `any`: at least one such input; `unset`: none of these set to anything but
+ * "false". An expression never meets a rule.
+ */
+export function requiredInputsHeld(tool: ToolSignature, w: Inputs): boolean {
+  const r = tool.requireInputs;
+  if (r === undefined) return true;
+  const holds = (name: string, values: string[]) => {
+    const all = w.byName.get(name.toLowerCase()) ?? [];
+    return !w.crowded.has(name.toLowerCase()) && all.length > 0 && all.every((v) => valueListed(v, values, false));
+  };
+  if (r.all !== undefined && !Object.entries(r.all).every(([name, values]) => holds(name, values))) return false;
+  if (r.any !== undefined && !Object.entries(r.any).some(([name, values]) => holds(name, values))) return false;
+  if (r.unset !== undefined && r.unset.some((name) => w.crowded.has(name.toLowerCase())
+    || (w.byName.get(name.toLowerCase()) ?? []).some((v) => {
+      const t = inputText(v);
+      return t === null ? v !== null && v !== undefined : t !== '' && t !== 'false';
+    }))) return false;
+  return true;
 }
 
 /** Pseudo-category prefix for runs of a version known not to do the check (actionRef, Task 5 fix round 1). */
@@ -191,10 +249,49 @@ export function refVerdict(tool: ToolSignature, uses: string): 'ok' | 'old' | 'u
   return x === mx ? 'ok' : 'unknown'; // a later major version: not checked upstream, so not counted as covered
 }
 
-/** Task 5: a command signature that counts only with (onlyWithFlags) or without (notWithFlags) some flags. */
-export const flagsAllow = (tool: ToolSignature, args: readonly string[]) =>
-  (tool.onlyWithFlags === undefined || tool.onlyWithFlags.some((f) => args.includes(f)))
-  && !(tool.notWithFlags ?? []).some((f) => flagGiven(f, args));
+/** Plan P Task 3 (PS12): a flag value that a CLI reads as off (npm's nopt: false, null, any number equal to 0). */
+const FALSE_WORDS: ReadonlySet<string> = new Set(['false', 'null', 'no', 'off', '']);
+const readsFalse = (v: string) => FALSE_WORDS.has(v.trim().toLowerCase()) || (v.trim() !== '' && Number(v) === 0);
+
+/**
+ * Plan P Task 3 (PS12): an onlyWithFlags spec is given. Matched like flagGiven (`--cov` also matches `--cov=pkg`), but
+ * for a spec without a value, a word `--x=v` whose value reads as false never counts.
+ */
+function onlyFlagGiven(spec: string, words: readonly string[]): boolean {
+  if (spec.includes('=')) return flagGiven(spec, words); // the data names the value (pinact's --fix=false)
+  return words.some((w) => w === spec || (w.startsWith(`${spec}=`) && !readsFalse(w.slice(spec.length + 1))));
+}
+
+/**
+ * Plan P Task 3: the value the last `flag` occurrence gives (`--f v` or `--f=v`): undefined when the flag isn't given,
+ * null when it has no value word after it.
+ */
+function lastFlagValue(flag: string, words: readonly string[]): string | null | undefined {
+  let out: string | null | undefined;
+  for (let i = 0; i < words.length; i++) {
+    const w = words[i] as string;
+    if (w === flag) out = i + 1 < words.length ? (words[i + 1] as string) : null;
+    else if (w.startsWith(`${flag}=`)) out = w.slice(flag.length + 1);
+  }
+  return out;
+}
+
+/** Plan P Task 3: whether a value (undefined = not given) passes an onlyWithFlagValue rule. */
+function flagValueAllows(rule: NonNullable<ToolSignature['onlyWithFlagValue']>, value: string | null | undefined, complete: boolean): boolean {
+  if (value === undefined) return rule.ifGiven === true && complete;
+  if (value === null || value.trim() === '' || value.includes('${{') || value.startsWith('-')) return false;
+  if (rule.contains === undefined) return true;
+  return value.toLowerCase().split(',').some((x) => x.trim() === rule.contains);
+}
+
+/**
+ * Task 5: a command signature that counts only with (onlyWithFlags) or without (notWithFlags) some flags. Plan P Task 3:
+ * and with onlyWithFlagValue; `complete` = every word of the command line was read (an ifGiven rule needs that).
+ */
+export const flagsAllow = (tool: ToolSignature, args: readonly string[], complete = true) =>
+  (tool.onlyWithFlags === undefined || tool.onlyWithFlags.some((f) => onlyFlagGiven(f, args)))
+  && !(tool.notWithFlags ?? []).some((f) => flagGiven(f, args))
+  && (tool.onlyWithFlagValue?.flag === undefined || flagValueAllows(tool.onlyWithFlagValue, lastFlagValue(tool.onlyWithFlagValue.flag, args), complete));
 
 export const foundOf = (tool: ToolSignature, dir: string | null, reason: Reason | null): Found => ({
   categories: tool.categories, by: tool.id, subject: `The ${tool.id} check`, dir, reason,

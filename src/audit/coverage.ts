@@ -61,6 +61,23 @@
 // - Fix round 4: script globs are bounded (at most 16 patterns a call, 64 characters each, fewer than
 //   MAX_SCRIPT_TARGETS matches, names over 64 characters never matched, a shared work budget, one walk per
 //   (dir, glob)); past a bound the row is unknown. A local action pipegen can't fully read gives the all-on env gate.
+// Plan P Task 3 (the catalogue's tools; rulings PB3, PB5, PS11-PS19):
+// - new signature fields (data/tool-signatures.yml header): reusableWorkflows (a listed called workflow counts like an
+//   action, before U2's "remote reusable workflow → unknown"; a ref that isn't a SHA or a vX tag is partial),
+//   onlyWithFlagValue, onlyWithInputs, availability (+ unavailableWhy; MapCoverageOptions.capabilities, read through
+//   codeSecurityAvailable), requireInputs (all-of, any-of, unset; partial with its why) and scanTarget (grype: an image
+//   or a folder). onlyWithFlags now matches like notWithFlags, and a value that reads as false never counts.
+// - trivy and grype count by subcommand and target, so `trivy config` never counts as an image scan (PB3).
+// - egress: an egress step counts only when it is the first step of every job of its workflow (the jobs of the local
+//   workflows it calls included); otherwise every egress run there is partial (PB5).
+// - scheduled checks (SCHEDULED_CATEGORIES, merge-layer needs) are read on their own trigger: `schedule` or a push to
+//   the default branch; workflow_dispatch or a pull request alone is partial.
+// - CI `pre-commit run --all-files` also carries the hooks' format, type-check, dockerfile-lint and workflow-lint runs;
+//   a known formatter hook that writes or checks counts for format (PS14). lefthook and husky carry nothing.
+// - own scripts count for format, type-check, coverage, dead-code and duplication through their text (PS11), also a
+//   script counted by name (`npm run test:coverage` → coverage).
+// - a command with more words than pipegen reads (MAX_FLAG_WORDS) is partial ('long'): a soft flag could hide past them.
+// - a step or job `if:` wins over a reason a run can't block, so a check that doesn't block is partial under it.
 // A tool counts only where a command starts: at the start, after ; && || | & ( $( { a newline, a shell keyword or a
 // wrapper (npx, sudo, env, time, command without -v, pnpm/yarn dlx, uv run, pipx run, python -m, sh/bash, …), as the
 // basename of a path, or as the image after `docker run [flags]`. Quoted text, here-document bodies and case patterns
@@ -94,7 +111,7 @@
 // checks that there is no runtime import cycle among them.
 import { regexSafe } from '../read/limits.js';
 import { MAX_WORKFLOWS, WORKFLOW_FILE } from '../read/workflows.js';
-import type { Need, RepoProfile } from '../types.js';
+import type { Capabilities, Need, RepoProfile } from '../types.js';
 import { safeText } from '../util/safe-text.js';
 import { DEPLOY_VERIFY_WHY, Dirs, Firsts, GATE_WHY, Scope, ciCoverage, hookCoverage, type Decide } from './coverage/decide.js';
 import { hookRunHits, readHooks } from './coverage/hooks.js';
@@ -116,11 +133,16 @@ export interface MapCoverageOptions {
    * signing and attestation whys talk about the release, not an image. Default: always false.
    */
   noImage?: (need: Need) => boolean;
+  /**
+   * Plan P Task 3 (ruling PS16): what GitHub allows here. Only `codeScanning` is read (with the repo's visibility and
+   * owner type from the profile) for actions some repos can't use; absent = no code scanning.
+   */
+  capabilities?: Capabilities;
 }
 
 let defaultCompiled: Compiled | undefined;
 
-const HOOK_FIT: Fit = { push: true, merge: true, deploy: true };
+const HOOK_FIT: Fit = { push: true, merge: true, deploy: true, scheduled: false };
 
 /**
  * One Coverage per need, in order. Reads only the workflows in p.existingWorkflows (the list readProject made), the
@@ -133,7 +155,7 @@ export async function mapCoverage(p: RepoProfile, needs: Need[], dir: string, op
   const ctx: Ctx = {
     p, sigs, read: new Reader(dir), budget: { visits: 0, bytes: 0, truncated: false }, hits: [], localFiles: new Set(),
     unreadable: (opts.skippedWorkflows ?? 0) > 0, pkgRead: new Reader(dir), pkgScripts: new Map(), scriptMemo: new Map(), scriptClass: new Map(), compositeGates: new Map(),
-    globMemo: new Map(), globWork: 0,
+    globMemo: new Map(), globWork: 0, ...(opts.capabilities === undefined ? {} : { caps: opts.capabilities }),
   };
   if (p.existingWorkflows.length > MAX_WORKFLOWS) ctx.budget.truncated = true;
   for (const w of [...p.existingWorkflows].sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0)).slice(0, MAX_WORKFLOWS)) {
