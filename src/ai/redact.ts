@@ -275,13 +275,20 @@ function isSecretName(name: string): boolean {
 
 const isQuote = (c: number) => c === 34 || c === 39 || c === 96; // " ' `
 
-/** Index of the quote closing the one at `open` (backslash escapes honoured), looked for before `limit`, or -1. */
-function closingQuote(s: string, open: number, limit = s.length): number {
+/**
+ * Index of the quote closing the one at `open` (backslash escapes honoured), looked for before `limit`, or -1. With
+ * `doubled`, a doubled quote is an escape too (`'it''s'` in YAML single quotes and SQL, `"a""b"` in CSV): two quotes
+ * in a row do not close the value, except right after the opening quote (`''` is an empty value). Linear.
+ */
+function closingQuote(s: string, open: number, limit = s.length, doubled = false): number {
   const q = code(s, open);
   for (let j = open + 1; j < limit; j++) {
     const c = code(s, j);
     if (c === 92) j++; // backslash
-    else if (c === q) return j;
+    else if (c === q) {
+      if (doubled && j > open + 1 && j + 1 < limit && code(s, j + 1) === q) j++; // a doubled quote: an escaped quote
+      else return j;
+    }
   }
   return -1;
 }
@@ -474,7 +481,8 @@ function assignmentSpans(s: string, workflow = false): { spans: Span[]; block: b
         const close = isQuote(c) ? closingQuote(s, v) : -1;
         const end = close < 0 ? n : close;
         if (end > credStart) spans.push([credStart, end]);
-        i = close < 0 ? n : close + 1;
+        if (close < 0) { block = true; break; } // unquoted (or unclosed): the rest of the line, and it may go on like a plain value
+        i = close + 1;
         continue;
       }
     }
@@ -484,17 +492,27 @@ function assignmentSpans(s: string, workflow = false): { spans: Span[]; block: b
         const close = s.indexOf(s[v].repeat(3), v + 3);
         const end = close < 0 ? n : close;
         if (end > v + 3) spans.push([v + 3, end]);
-        i = close < 0 ? n : close + 3;
+        if (close < 0) { block = true; break; } // the string goes on over the next lines
+        i = close + 3;
         continue;
       }
+      // Two readings of the closing quote, both hidden: the first quote (a backslash escape only), and, for ' and ", the
+      // first quote that is not doubled ('it''s', "a""b"). The scan goes on after the first reading, so whatever that
+      // reading finds after it (another secret name) is still hidden: the doubled reading only ever adds hiding.
       const close = closingQuote(s, v);
-      const end = close < 0 ? n : close;
+      const far = close < 0 || c === 96 ? close : closingQuote(s, v, n, true);
+      const end = far < 0 ? n : far;
       if (end > v + 1) spans.push([v + 1, end]);
-      i = close < 0 ? n : close + 1;
+      // Unclosed: a YAML double- (or single-) quoted value goes on over the next lines; hide the more-indented ones.
+      if (far < 0) { block = true; break; }
+      i = close + 1;
       continue;
     }
     spans.push([v, n]); // unquoted: the rest of the line
-    i = n;
+    // A plain (unquoted) YAML scalar, or an INI value, goes on over the more-indented lines after it: start a block,
+    // which redact() hides line by line (config-like files only).
+    block = true;
+    break;
   }
   return { spans, block };
 }
@@ -749,6 +767,10 @@ function isPlainKey(s: string): boolean {
   return b > a && skipBlanks(s, b) >= s.length;
 }
 
+/** True for a TOML/INI section name holding a secret name ([secrets], [database.password], [auth]) or "credential". */
+const isSecretSection = (section: string) =>
+  section.split(/[^A-Za-z0-9_.-]+/).some((part) => part !== '' && (isSecretName(part) || part.toLowerCase().includes('credential')));
+
 /**
  * A line inside a secret section: when the text before its first `=` or `:` is a plain key name, the key is
  * kept (through the same rules as any other text) and what follows the separator is hidden; any other line
@@ -770,8 +792,10 @@ function hideSectionValue(line: string): string {
  * Replaces secret-like text with [REDACTED]. Works line by line (the `\r`s at the end of a line count as
  * part of the line end, so CRLF text behaves like LF text), with a little state:
  * - a private key block is replaced whole, up to its END line, or to the end of the text when it has none;
- * - after a password-like name with an empty value or a YAML block header, every following line that is
- *   more indented than that line is hidden (blank lines stay blank). This block rule is off only when
+ * - after a password-like name with an empty value, a YAML block header, an unquoted value (a plain YAML scalar
+ *   or an INI value can go on over the next lines) or an unclosed quoted value, every following line that is
+ *   more indented than that line is hidden (blank lines stay blank). A TOML/INI section header among those
+ *   hidden lines still starts a secret section (see below), but never ends one. This block rule is off only when
  *   `hint.path` is a known code file (.py, .js, .ts, .go, .java, … after removing template and backup
  *   suffixes such as .example, .j2, .bak), where it would hide ordinary code (`class TokenStore:`); same-line
  *   values are still hidden there. Every other file (YAML, JSON, Markdown, unknown or no extension) and a
@@ -829,6 +853,12 @@ export function redact(text: string, hint?: { path?: string }): string {
       }
       const ind = indentOf(line);
       if (ind.cols > blockCols) {
+        // A TOML/INI section header hidden here still starts a secret section, as below. It never ends one: the
+        // header may as well be part of the hidden value, and ending a section would show lines it hides.
+        if (blockRule && !startedInKey && !startsBlock && !secretSection) {
+          const section = sectionName(line);
+          if (section !== null) secretSection = isSecretSection(section);
+        }
         out.push(line.slice(0, ind.chars) + R + cr);
         continue;
       }
@@ -839,9 +869,12 @@ export function redact(text: string, hint?: { path?: string }): string {
     // up to the next section header.
     if (blockRule && !startedInKey && !startsBlock) {
       const section = sectionName(line);
-      if (section !== null) secretSection = section.split(/[^A-Za-z0-9_.-]+/).some((part) => part !== '' && (isSecretName(part) || part.toLowerCase().includes('credential')));
+      if (section !== null) secretSection = isSecretSection(section);
       else if (secretSection && line.trim() !== '') {
         out.push(hideSectionValue(line) + cr);
+        // A block the line would start outside a section (after a plain or empty value, or a line over 4 KB) starts here
+        // too, so a section never shows a line that the same text outside a section would hide.
+        if (!regexSafe(line) || redactSegment(line, workflow).block) blockCols = indentOf(line).cols;
         continue;
       }
     }

@@ -242,7 +242,9 @@ function profileSummary(p: RepoProfile, floor: Need[], knownValues: readonly str
       .filter((n) => n.service === undefined || names.has(n.service))
       .map((n) => ({ layer: n.layer, id: n.id, service: n.service ?? null })),
   };
-  return scrubForPrompt(`<repo-profile>\n${JSON.stringify(summary)}\n</repo-profile>`, knownValues);
+  // One value per line: redact() replaces any line over 4 KB whole, and a compact summary of five or more services is
+  // one such line, so the AI would get nothing.
+  return scrubForPrompt(`<repo-profile>\n${JSON.stringify(summary, null, 1)}\n</repo-profile>`, knownValues);
 }
 
 /**

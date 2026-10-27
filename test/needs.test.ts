@@ -638,7 +638,7 @@ describe('planNeeds', () => {
     expect(sent).not.toContain(known);
     const user = ai.calls[0]!.user;
     const summary = user.slice(user.indexOf('<repo-profile>'), user.indexOf('</repo-profile>'));
-    expect(summary).toContain('"name":"web"'); // ordinary names still shown
+    expect(summary).toContain('"name": "web"'); // ordinary names still shown
     // the floor still covers every service; only the prompt leaves them out
     for (const name of [keyName, `${known}-lib`]) expect(find(r.needs, 'push', 'sast', name)).toHaveLength(1);
     // without known values the token-like name is still kept out
@@ -653,6 +653,22 @@ describe('planNeeds', () => {
     const user = ai.calls[0]!.user;
     const summary = user.slice(user.indexOf('<repo-profile>'), user.indexOf('</repo-profile>'));
     expect(summary).not.toContain('express');
-    expect(summary).toContain('"frameworks":["[REDACTED]"]');
+    expect(summary).toContain('"[REDACTED]"');
+  });
+
+  it('planNeeds: a large profile summary (13 services) reaches the AI whole, as JSON, with every name', async () => {
+    const names = ['web', 'api', 'auth-service', 'tok' + 'en-svc', 'sec' + 'rets-manager', 'pwd-reset', 'key-vault', '@acme/pass' + 'word-ui', 'api' + 'key', 'author', 'oauth', 'x.tok' + 'en', 'tok' + 'ens'];
+    const kinds = ['postgres', 'mysql', 'redis', 'mongodb', 'rabbitmq', 'external'] as const;
+    const services = names.map((name, i) => web({ name, path: name, hasTests: i % 2 === 0, dependsOn: kinds.slice(0, i % kinds.length).map((kind) => ({ kind, name: kind, evidence: 'package.json', envVars: [] })), dockerfile: i % 3 ? 'Dockerfile' : undefined, port: i % 2 ? 80 : undefined }));
+    const p = profile({ services, terraformDirs: ['infra'], hasCompose: true, precommit: 'husky', monorepo: 'npm-workspaces' });
+    const ai = mockAi(quiet);
+    await planNeeds(p, PUBLIC, bundle, ai.p, 0);
+    const user = ai.calls[0]!.user;
+    const inner = user.slice(user.indexOf('<repo-profile>') + '<repo-profile>'.length, user.indexOf('</repo-profile>'));
+    expect(inner.length).toBeGreaterThan(4096); // compact, this would be one line over 4 KB
+    expect(inner).not.toContain('[REDACTED');
+    const summary = JSON.parse(inner);
+    expect(summary.services.map((s: { name: string }) => s.name)).toEqual(names);
+    expect(summary.floorNeeds.length).toBeGreaterThan(100);
   });
 });

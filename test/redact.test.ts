@@ -614,6 +614,8 @@ describe('redact: speed', () => {
       'a b:c/d tok' + 'en ', ' tok' + 'en', '<a:b:tok' + 'en ', '<x:tok' + 'en value="', '<add key="Smtp:Pass' + 'word" value="x"/>',
       // round 5: unclosed secret elements, JSON blocks, section headers
       '<tok' + 'en>a', '<tok' + 'en>', '"tok' + 'en": {', '[sec' + 'rets]', 'a'.repeat(30) + 'tok' + 'en ',
+      // T0b fix round 1: doubled quotes, unclosed quotes
+      "tok" + "en: 'a''", "tok" + "en: ''''", 'tok' + 'en: "a""',
     ].map((u): [string, (L: number) => string] => [u, unit(u)]);
     lineShapes.push(
       ['url with a long password', (L) => 'a:/' + '/b:' + 'c'.repeat(L - 6)],
@@ -635,6 +637,7 @@ describe('redact: speed', () => {
       ['indented block', (b) => 'pass' + 'word: |\n' + '  x\n'.repeat(Math.round(b / 4))],
       ['secret section', (b) => '[sec' + 'rets]\n' + 'a = b\n'.repeat(Math.round(b / 6))],
       ['alternating section headers', (b) => ('[sec' + 'rets]\nkey: x\n').repeat(Math.round(b / 17))],
+      ['plain value then a continuation', (b) => ('pass' + 'word: a\n  b\n').repeat(Math.round(b / 16))],
     ];
 
     const median = (text: string) => {
@@ -1227,7 +1230,7 @@ describe('workflow allow-list (T0b)', () => {
 
   it('redact: the allow-list holds only for workflow and action paths', () => {
     const text = `${line(NPM, ref())}\n  ${ID}: write\n    ${SECS}: inherit`;
-    const all = `${hidden(NPM)}\n  ${ID}: ${R}\n    ${SECS}: ${R}`;
+    const all = `${hidden(NPM)}\n  ${ID}: ${R}\n    ${R}`; // the last line is more indented than a hidden plain value
     for (const path of [
       'workflows.yml.txt', '.github/workflows.yml.txt', '.github/workflows/ci.yml.txt', '.github/workflows/ci.yml.bak', '.github/workflows/ci.json',
       '.github/workflows/../../x.yml', '.github/workflows/./ci.yml', 'x/../.github/workflows/ci.yml', '.github/workflows//ci.yml',
@@ -1282,4 +1285,82 @@ describe('workflow allow-list (T0b)', () => {
     }
     expect(failures).toEqual([]);
   }, 60_000);
+});
+
+// Plan U T0b fix round 1: a plain (unquoted) value can go on over the more-indented lines after it (YAML plain
+// scalars, INI continuation lines), so those lines are hidden too; a section header hidden that way still counts;
+// doubled quotes ('it''s', "a""b") are an escape; an unclosed double-quoted value goes on over the next lines.
+describe('T0b fix round 1: continuation lines and quotes', () => {
+  const X = 'Zq' + 'Sek9' + 'rt';
+  const P = 'pass' + 'word';
+  const T = 'TOK' + 'EN';
+  const t = 'tok' + 'en';
+
+  it('redact: the more-indented lines after a hidden plain value are hidden (YAML, INI, .env, no path)', () => {
+    expect(redact(`db:\n  ${P}: abc\n    ${X}\n  host: h`, { path: 'config/app.yml' })).toBe(`db:\n  ${P}: ${R}\n    ${R}\n  host: h`);
+    expect(redact(`${P}: abc\n  ${X}`)).toBe(`${P}: ${R}\n  ${R}`);
+    expect(redact(`[db]\n${P} = abc\n  ${X}\nhost = h`, { path: 'setup.cfg' })).toBe(`[db]\n${P} = ${R}\n  ${R}\nhost = h`);
+    expect(redact(`${T}=abc\n  ${X}`, { path: '.env.example' })).toBe(`${T}=${R}\n  ${R}`);
+    expect(redact(`- ${P}: abc\n    ${X}`, { path: 'a.yaml' })).toBe(`- ${P}: ${R}\n    ${R}`);
+    expect(redact(`  ${t}: abc\n    ${X}`, { path: '.github/workflows/c.yml' })).toBe(`  ${t}: ${R}\n    ${R}`);
+  });
+
+  it('redact: a sibling key in a YAML sequence entry is hidden too (over-redaction, accepted)', () => {
+    expect(redact(`- ${P}: abc\n  host: h\n- name: n`, { path: 'a.yaml' })).toBe(`- ${P}: ${R}\n  ${R}\n- name: n`);
+  });
+
+  it('redact: continuation hiding holds across CRLF, tabs, blank lines and nested continuations', () => {
+    expect(redact(`${P}: abc\r\n  ${X}\r\n`, { path: 'a.yml' })).toBe(`${P}: ${R}\r\n  ${R}\r\n`);
+    expect(redact(`${P}: abc\n\t${X}`, { path: 'a.yml' })).toBe(`${P}: ${R}\n\t${R}`);
+    expect(redact(`${P}: abc\n\n  ${X}`, { path: 'a.yml' })).toBe(`${P}: ${R}\n\n  ${R}`);
+    expect(redact(`${P}: abc\n  def\n      ${X}\nnext: 1`, { path: 'a.yml' })).toBe(`${P}: ${R}\n  ${R}\n      ${R}\nnext: 1`);
+  });
+
+  it('redact: an unquoted Authorization value goes on over more-indented lines too', () => {
+    const A = 'Author' + 'ization: Bearer';
+    expect(redact(`${A} abc\n   ${X}`, { path: 'h.yml' })).toBe(`${A} ${R}\n   ${R}`);
+  });
+
+  it('redact: controls: code files, closed quoted values and same-indent lines are unchanged', () => {
+    expect(redact(`${P} = abc\n    ${X}`, { path: 'a.py' })).toBe(`${P} = ${R}\n    ${X}`); // no block rule in code
+    expect(redact(`${P}: "abc"\n  ${X}`, { path: 'a.yml' })).toBe(`${P}: "${R}"\n  ${X}`); // a closed quote can't go on
+    expect(redact(`db:\n  ${P}: abc\n  host: ${X}`, { path: 'config/app.yml' })).toBe(`db:\n  ${P}: ${R}\n  host: ${X}`);
+  });
+
+  it('redact: a section header inside a hidden block still starts a secret section', () => {
+    const C = '[credentials]';
+    expect(redact(`${t}_ttl = 3600\n  ${C}\nuser = ${X}`, { path: 'a.toml' })).toBe(`${t}_ttl = ${R}\n  ${R}\nuser = ${R}`);
+    expect(redact(`${P} =\n  ${C}\nuser = ${X}`, { path: 'a.toml' })).toBe(`${P} =\n  ${R}\nuser = ${R}`);
+    expect(redact(`x = ${'a'.repeat(5000)}\n  ${C}\nuser = ${X}`, { path: 'a.toml' })).toBe(`[REDACTED: line too long]\n  ${R}\nuser = ${R}`);
+    // a header hidden in a block never ends a secret section (it may be part of the hidden value)
+    expect(redact(`[sec${'rets'}]\na = b\n${P} = x\n  [pub]\nname = v`, { path: 'a.toml' })).toBe(`[sec${'rets'}]\na = ${R}\n${P} = ${R}\n  ${R}\nname = ${R}`);
+    expect(redact(`[credentials]\n${P}=\n    [db]\n-x\nk = ${X}`, { path: 'a.ini' })).toBe(`[credentials]\n${P}=\n    ${R}\n${R}\nk = ${R}`);
+  });
+
+  it('redact: a line in a secret section still starts the block it would start outside one', () => {
+    // without this, a header hidden in a block turns the next lines into section lines, which show their keys
+    const az = 'Author' + 'ization=';
+    expect(redact(`${t}: x\n    [sec${'rets'}]\n- ${az}\n    name=v\nnext = 1`, { path: 'setup.cfg' }))
+      .toBe(`${t}: ${R}\n    ${R}\n${R}\n    ${R}\nnext = ${R}`);
+    expect(redact(`${t}: x\n  [sec${'rets'}]\n${P}: {\n  [db]\nm = 1`, { path: '.env' })).toBe(`${t}: ${R}\n  ${R}\n${P}: ${R}\n  ${R}\nm = ${R}`);
+  });
+
+  it('redact: a section header after a kept workflow value is still tracked', () => {
+    expect(redact(`  id-${t}: write\n    [credentials]\n  user = ${X}`, { path: '.github/workflows/c.yml' }))
+      .toBe(`  id-${t}: write\n    ${R}\n  user = ${R}`);
+  });
+
+  it('redact: doubled quotes are an escape inside a quoted value (YAML single quotes, SQL, CSV)', () => {
+    expect(redact(`${P}: 'it''s${X}'`, { path: 'a.yml' })).toBe(`${P}: '${R}'`);
+    expect(redact(`${P} = 'a''${X}' and more`, { path: 'q.sql' })).toBe(`${P} = '${R}' and more`);
+    expect(redact(`"${P}": "a""${X}"`, { path: 'a.csv' })).toBe(`"${P}": "${R}"`);
+    expect(redact(`${P}: ''\nuser: u`, { path: 'a.yml' })).toBe(`${P}: ''\nuser: u`); // an empty value is still empty
+    // the doubled reading only adds hiding: a secret name after a plain closing quote is still found
+    expect(redact(`${P}: 'x'' ${t}: 'hunter2'`, { path: 'a.yml' })).toBe(`${P}: '${R}'${R}'`);
+    expect(redact(`${P}='abc'' ${T}='hunter2'`, { path: 'run.sh' })).toBe(`${P}='${R}'${R}'`);
+  });
+
+  it('redact: an unclosed double-quoted value goes on over the next, more-indented lines', () => {
+    expect(redact(`${P}: "abc\n  ${X}"\nuser: u`, { path: 'a.yml' })).toBe(`${P}: "${R}\n  ${R}\nuser: u`);
+  });
 });
