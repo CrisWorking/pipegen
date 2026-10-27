@@ -94,6 +94,11 @@ const repoName = (owner: string, repo: string) => safeText(`${owner}/${repo}`, 2
 
 /** GitHub said 401: the token is wrong, expired or revoked. Never read as a missing permission. */
 const isRejected = (e: unknown) => failure(e).status === 401;
+/** Clients made without a token (makeOctokit(null)). On them a 401 only means "this needs a token": inconclusive. */
+const anonymousClients = new WeakSet<Octokit>();
+export const isAnonymousClient = (gh: Octokit): boolean => anonymousClients.has(gh);
+/** A 401 on a client that sent a token: that token was rejected. */
+const rejectedOn = (gh: Octokit, e: unknown) => isRejected(e) && !anonymousClients.has(gh);
 const tokenRejected = () => new GitHubAccessError('GitHub rejected the token (HTTP 401): it is wrong, expired or revoked. Make a new one, or log in again.', { status: 401 });
 export { tokenRejected as githubTokenRejected };
 
@@ -185,6 +190,7 @@ export function makeOctokit(token: string | null, opts: MakeOctokitOptions = {})
     log: { debug: opts.debug ? write('debug') : quiet, info: opts.debug ? write('info') : quiet, warn: write('warn'), error: opts.debug ? write('error') : quiet },
   });
   clocks.set(gh, opts.clock ?? { budget: newRateBudget() });
+  if (token === null) anonymousClients.add(gh);
   return gh;
 }
 
@@ -290,6 +296,9 @@ const INSTALLATION_WRITE = 'The Actions GITHUB_TOKEN is only accepted for read-o
 const ALL_REPOS = 'pipegen won\'t use this GitHub App login: the App is installed on "All repositories", so it reaches every repo of '
   + 'the account. Change the installation to "Only select repositories" (GitHub → Settings → Applications → Installed GitHub Apps → '
   + 'Configure), or run again with --allow-broad-token.';
+const SCOPE_UNCONFIRMED = 'pipegen couldn\'t confirm which repos its GitHub App installation reaches, so it treats it as "All repositories" '
+  + 'and won\'t use it. Check the installation is on "Only select repositories" (GitHub → Settings → Applications → Installed GitHub Apps → '
+  + 'Configure) and try again, or run again with --allow-broad-token.';
 const UNKNOWN_TOKEN = 'pipegen doesn\'t recognise this kind of GitHub token. Use a fine-grained token (it starts with github_pat_) '
   + 'limited to the repos pipegen works on, or pipegen\'s GitHub App.';
 
@@ -344,6 +353,8 @@ export interface AuthDeps {
   /** The fetch for every call getAuth makes (tests pass a fake). */
   fetch?: typeof fetch;
   clock?: RateClock;
+  /** Plain-English lines about choices getAuth made (for example a scope it couldn't confirm, allowed by --allow-broad-token). */
+  notes?: string[];
 }
 type AuthOpts = { owner: string; repos: string[]; allowBroad: boolean };
 
@@ -355,20 +366,23 @@ function authWith(token: string, rest: Omit<Auth, 'token'>): Auth & { token: str
 }
 
 interface Installation { id: number; login: string; selection: 'all' | 'selected' | 'unknown'; permissions: Record<string, string> }
-/** The App installation on `owner` (case-insensitive), null when there is none or GitHub won't say. Rate stops are thrown. */
-async function installationFor(gh: Octokit, owner: string, clock: RateClock): Promise<Installation | null> {
+/**
+ * The App installation on `owner` (case-insensitive); 'none' when GitHub's list has none for `owner`; 'error' when
+ * GitHub wouldn't say (a refusal, an error, an unreadable answer, too many pages). Rate stops and 401s are thrown.
+ */
+async function installationFor(gh: Octokit, owner: string, clock: RateClock): Promise<Installation | 'none' | 'error'> {
   for (let page = 1; page <= 10; page++) {
     let data: unknown;
     try {
       data = (await withRateLimit(() => gh.request('GET /user/installations', { per_page: 100, page }), clock)).data;
     } catch (e) {
       if (isRateStop(e)) throw e;
-      if (isRejected(e)) throw tokenRejected();
-      return null;
+      if (rejectedOn(gh, e)) throw tokenRejected();
+      return 'error';
     }
     // S9: count the list, never total_count (it lagged behind after a delete)
     const list = (data as { installations?: unknown } | null)?.installations;
-    if (!Array.isArray(list)) return null;
+    if (!Array.isArray(list)) return 'error';
     for (const i of list as { id?: unknown; account?: { login?: unknown }; repository_selection?: unknown; permissions?: unknown }[]) {
       const login = i?.account?.login;
       if (typeof login === 'string' && login.toLowerCase() === owner.toLowerCase()) {
@@ -380,9 +394,9 @@ async function installationFor(gh: Octokit, owner: string, clock: RateClock): Pr
         };
       }
     }
-    if (list.length < 100) return null;
+    if (list.length < 100) return 'none';
   }
-  return null;
+  return 'error';
 }
 
 const INSTALLATION_REPO_PAGES = 50;
@@ -398,7 +412,7 @@ async function installationRepos(gh: Octokit, id: number, clock: RateClock): Pro
       res = await withRateLimit(() => gh.request('GET /user/installations/{installation_id}/repositories', { installation_id: id, per_page: 100, page }), clock);
     } catch (e) {
       if (isRateStop(e)) throw e;
-      if (isRejected(e)) throw tokenRejected();
+      if (rejectedOn(gh, e)) throw tokenRejected();
       return null;
     }
     const list = (res.data as { repositories?: unknown } | null)?.repositories;
@@ -477,11 +491,15 @@ export async function getAuth(opts: AuthOpts & { mode: 'read' | 'write' }, deps:
   let broad = kind === 'classic';
   if (kind === 'app') {
     const inst = await installationFor(makeOctokit(token, { fetch: deps.fetch, clock }), owner, clock);
-    if (inst?.selection === 'all') {
-      if (!allowBroad) throw new GitHubAccessError(ALL_REPOS);
+    // fail closed (fix round 2, N2): a lookup GitHub wouldn't answer, or a scope it didn't state, counts as "All repositories"
+    const unconfirmed = inst === 'error' || (typeof inst === 'object' && inst.selection === 'unknown');
+    if (unconfirmed || (typeof inst === 'object' && inst.selection === 'all')) {
+      if (!allowBroad) throw new GitHubAccessError(unconfirmed ? SCOPE_UNCONFIRMED : ALL_REPOS);
+      if (unconfirmed) deps.notes?.push('pipegen couldn\'t confirm which repos the GitHub App installation reaches; treated it as "All repositories" (--allow-broad-token).');
       broad = true;
     }
-    manage = mode === 'write' && fromApp && inst?.permissions.administration === 'write';
+    // never create or delete through an installation whose scope pipegen couldn't confirm
+    manage = mode === 'write' && fromApp && !unconfirmed && typeof inst === 'object' && inst.permissions.administration === 'write';
   }
   return authWith(token, { kind, repos: broad ? 'all' : [...repos], canCreateRepos: manage, canDeleteRepos: manage });
 }
@@ -507,7 +525,7 @@ export async function readGitHubContext(gh: Octokit, owner: string, repo: string
     data = (await withRateLimit(() => gh.rest.repos.get({ owner, repo }), clock)).data as typeof data;
   } catch (e) {
     if (isRateStop(e)) throw new GitHubAccessError(`GitHub's rate limit stopped pipegen reading ${repoName(owner, repo)}.`, { cause: e });
-    if (isRejected(e)) throw tokenRejected();
+    if (rejectedOn(gh, e)) throw tokenRejected();
     const { status } = failure(e);
     if (status === 404 || status === 403) {
       throw new GitHubAccessError(`pipegen can't see ${repoName(owner, repo)} with this token (${said(e)}). Check the repo name and that the token (or the App installation) includes this repo.`, { status });
@@ -524,7 +542,7 @@ export async function readGitHubContext(gh: Octokit, owner: string, repo: string
       plan = planOf((await withRateLimit(call, clock)).data);
     } catch (e) {
       if (isRateStop(e)) throw e;
-      if (isRejected(e)) throw tokenRejected();
+      if (rejectedOn(gh, e)) throw tokenRejected();
       plan = 'unknown';
     }
   };
@@ -565,7 +583,7 @@ export async function probePermissions(gh: Octokit, owner: string, repos: string
 
   if (opts.kind === 'app') {
     const inst = await installationFor(gh, owner, clock);
-    if (inst === null) {
+    if (inst === 'none' || inst === 'error') {
       for (const repo of repos) add(unchecked, { permission: access(repo), why: 'GitHub didn\'t list pipegen\'s App installation on this account, so pipegen couldn\'t check it.' });
       for (const p of rows) add(unchecked, entry(p, mode));
       return done();
@@ -590,7 +608,7 @@ export async function probePermissions(gh: Octokit, owner: string, repos: string
       visible.push(repo);
     } catch (e) {
       if (isRateStop(e)) throw e;
-      if (isRejected(e)) throw tokenRejected();
+      if (rejectedOn(gh, e)) throw tokenRejected();
       const { status } = failure(e);
       if (status === 403 || status === 404) add(missing, { permission: access(repo), why: NO_ACCESS });
       else add(unchecked, { permission: access(repo), why: `GitHub didn't answer (${said(e)}), so pipegen couldn't check this repo.` });
@@ -607,7 +625,7 @@ export async function probePermissions(gh: Octokit, owner: string, repos: string
           await withRateLimit(() => gh.request(`GET /repos/{owner}/{repo}${p.probe}`, { owner, repo }), clock);
         } catch (e) {
           if (isRateStop(e)) throw e;
-          if (isRejected(e)) throw tokenRejected();
+          if (rejectedOn(gh, e)) throw tokenRejected();
           confirmed = false;
           const f = failure(e);
           if (f.status === 403 && PERMISSION_REFUSAL.test(f.message)) {
@@ -648,8 +666,11 @@ export async function listWriters(gh: Octokit, owner: string, repo: string, cloc
       more = /rel="next"/.test(String(res.headers.link ?? ''));
     } catch (e) {
       if (isRateStop(e)) throw new GitHubAccessError(`GitHub's rate limit stopped pipegen listing who can write to ${repoName(owner, repo)}.`, { cause: e });
-      if (isRejected(e)) throw tokenRejected();
+      if (rejectedOn(gh, e)) throw tokenRejected();
       const f = failure(e);
+      if (anonymousClients.has(gh) && (f.status === 401 || f.status === 403)) {
+        throw new GitHubAccessError(`pipegen needs a token to list who can write to ${repoName(owner, repo)} (${said(e)}).`, { status: f.status });
+      }
       const named = acceptedNames(f.accepted);
       const which = named.length > 0
         ? `the token lacks ${named.join(' or ')}`

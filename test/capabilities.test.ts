@@ -188,6 +188,15 @@ describe('probeCapabilities', () => {
     await expect(probe({ [RULESETS]: ok, [ENVS]: signingEnv(), [POLICIES]: limited, [SCAN]: ok }, { private: true, plan: 'free' })).rejects.toBeInstanceOf(GitHubRateLimitError);
   });
 
+  it('probe: anonymous client, 401 → inconclusive, not token rejected', async () => {
+    const f = fakeFetch({ [RULESETS]: err(401, 'Requires authentication'), [ENVS]: err(401, 'Requires authentication'), [SCAN]: err(401, 'Requires authentication') });
+    const notes: string[] = [];
+    const caps = await probeCapabilities(makeOctokit(null, { fetch: f.fetch }), 'o', 'r', { private: false, plan: 'unknown', ownerType: 'User', defaultBranch: 'main' }, notes, clock());
+    expect(caps).toEqual(ALL);   // public: the table / GitHub policy
+    expect(notes).toHaveLength(3);
+    expect(notes.join('\n')).not.toMatch(/rejected/);
+  });
+
   it('probe: a 401 is a hard "token rejected" error', async () => {
     const e = await probe({ [RULESETS]: err(401, 'Bad credentials'), [ENVS]: ok, [SCAN]: ok }, { private: true, plan: 'free' }).catch((x: unknown) => x);
     expect(e).toBeInstanceOf(GitHubAccessError);

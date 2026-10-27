@@ -44,7 +44,7 @@
 import type { Octokit } from '@octokit/rest';
 import type { Capabilities, RepoProfile } from '../types.js';
 import { isRateStop, withRateLimit, type RateClock } from '../engine/github-rate.js';
-import { checkRepoNames, clockOf, githubTokenRejected } from './client.js';
+import { checkRepoNames, clockOf, githubTokenRejected, isAnonymousClient } from './client.js';
 
 /** Plan B Task 1's pure signingMode, re-exported (not written again). key-env needs environments AND proven deployment branch policies (DECISIONS #86, fix round 1 R4). */
 export { signingMode, type SigningMode } from './signing-mode.js';
@@ -95,13 +95,16 @@ export function classifyProbe(e: unknown): ProbeClass {
 
 type Answer<T> = { ok: true; data: T } | { ok: false; settled?: boolean };
 
-/** One GET probe: its data, or a settled false, or nothing settled. 401 and rate stops are thrown. */
-async function ask<T>(call: () => Promise<{ data: T }>, clock: RateClock, special?: (e: unknown) => boolean | undefined): Promise<Answer<T>> {
+/**
+ * One GET probe: its data, or a settled false, or nothing settled. Rate stops are thrown, and so is a 401 on a client
+ * that sent a token (the token was rejected). On an anonymous client a 401 only means "needs a token": inconclusive.
+ */
+async function ask<T>(gh: Octokit, call: () => Promise<{ data: T }>, clock: RateClock, special?: (e: unknown) => boolean | undefined): Promise<Answer<T>> {
   try {
     return { ok: true, data: (await withRateLimit(call, clock)).data };
   } catch (e) {
     if (isRateStop(e)) throw e;
-    if (statusOf(e) === 401) throw githubTokenRejected();
+    if (statusOf(e) === 401 && !isAnonymousClient(gh)) throw githubTokenRejected();
     const s = special?.(e);
     if (s === true) return { ok: true, data: undefined as T };
     if (s === false) return { ok: false, settled: true };
@@ -146,13 +149,13 @@ export async function probeCapabilities(gh: Octokit, owner: string, repo: string
   const table = capabilityTable(p);
   const couldnt = (what: string, then: string) => notes.push(`Couldn't check ${what} with this token; ${then}.`);
 
-  let branchProtection = verdict(await ask(() => gh.rest.repos.getRepoRulesets({ owner, repo, per_page: 1 }), clock));
+  let branchProtection = verdict(await ask(gh, () => gh.rest.repos.getRepoRulesets({ owner, repo, per_page: 1 }), clock));
   if (branchProtection === undefined) {
     couldnt('branch protection', 'used the plan table');
     branchProtection = table.branchProtection;
   }
 
-  const envs = await ask(() => gh.rest.repos.getAllEnvironments({ owner, repo, per_page: 100 }), clock);
+  const envs = await ask(gh, () => gh.rest.repos.getAllEnvironments({ owner, repo, per_page: 100 }), clock);
   let environments = verdict(envs);
   if (environments === undefined) {
     if (p.private) couldnt('environments', 'treated as not available');
@@ -160,7 +163,7 @@ export async function probeCapabilities(gh: Octokit, owner: string, repo: string
     environments = p.private ? false : table.environments;
   }
 
-  const scan = await ask(() => gh.rest.codeScanning.listRecentAnalyses({ owner, repo, per_page: 1 }), clock, codeScanningAnswer);
+  const scan = await ask(gh, () => gh.rest.codeScanning.listRecentAnalyses({ owner, repo, per_page: 1 }), clock, codeScanningAnswer);
   let codeScanning = verdict(scan);
   if (codeScanning === undefined) {
     if (p.private) couldnt('code scanning', 'treated as not available');
@@ -171,7 +174,7 @@ export async function probeCapabilities(gh: Octokit, owner: string, repo: string
   let deploymentBranchPolicies = !p.private;
   if (p.private) {
     if (environments && envs.ok && signingEnvIsCustom(envs.data)) {
-      const rules = await ask(() => gh.request('GET /repos/{owner}/{repo}/environments/{environment_name}/deployment-branch-policies', {
+      const rules = await ask(gh, () => gh.request('GET /repos/{owner}/{repo}/environments/{environment_name}/deployment-branch-policies', {
         owner, repo, environment_name: SIGNING_ENVIRONMENT, per_page: 100,
       }), clock);
       deploymentBranchPolicies = rules.ok && onlyDefaultBranch(rules.data, p.defaultBranch);

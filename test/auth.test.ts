@@ -169,7 +169,8 @@ describe('getAuth', () => {
     for (const routes of [installs('o', 'read'), installs('o'), installs('another-owner', 'write'),
       { [`GET ${API}/user/installations`]: refused(integration) }, { [`GET ${API}/user/installations`]: { status: 500, body: {} } }]) {
       r = deps(undefined, routes, login);
-      got = await getAuth({ owner: 'o', repos: ['r'], allowBroad: false, mode: 'write' }, r.deps);
+      // allowBroad: a failed lookup is treated as "All repositories" (fix round 2, N2)
+      got = await getAuth({ owner: 'o', repos: ['r'], allowBroad: true, mode: 'write' }, r.deps);
       expect(got).toMatchObject({ kind: 'app', canCreateRepos: false, canDeleteRepos: false });
     }
     // a fine-grained token never creates or deletes, even with Administration write: a repo it creates is out of its
@@ -212,6 +213,33 @@ describe('getAuth', () => {
     const r = deps(undefined, routes, { appLogin: async () => appCred() });
     const got = await getAuth({ owner: 'o', repos: ['r'], allowBroad: true, mode: 'write' }, r.deps);
     expect(got).toMatchObject({ kind: 'app', repos: 'all' });
+  });
+
+  it(title(AU, 'App installation lookup fails or its scope is unknown → treated as all repositories (refused unless allowBroad)'), async () => {
+    const cases: Routes[] = [
+      { [`GET ${API}/user/installations`]: { status: 500, body: { message: 'oops' } } },
+      { [`GET ${API}/user/installations`]: refused(integration) },
+      { [`GET ${API}/user/installations`]: { body: { not: 'a list' } } },
+      { [`GET ${API}/user/installations`]: { body: { installations: [{ id: 4, account: { login: 'o' }, permissions: { administration: 'write' } }] } } },
+      { [`GET ${API}/user/installations`]: { body: { installations: [{ id: 4, account: { login: 'o' }, repository_selection: 'some', permissions: {} }] } } },
+    ];
+    for (const routes of cases) {
+      for (const mode of ['read', 'write'] as const) {
+        const r = deps(undefined, routes, { appLogin: async () => appCred() });
+        const e = await caught(getAuth({ owner: 'o', repos: ['r'], allowBroad: false, mode }, r.deps));
+        expect(e).toBeInstanceOf(GitHubAccessError);
+        expect((e as Error).message).toMatch(/couldn't confirm/);
+        expect((e as Error).message).toMatch(/--allow-broad-token/);
+      }
+      const notes: string[] = [];
+      const r = deps(undefined, routes, { appLogin: async () => appCred(), notes });
+      const got = await getAuth({ owner: 'o', repos: ['r'], allowBroad: true, mode: 'write' }, r.deps);
+      expect(got).toMatchObject({ kind: 'app', repos: 'all', canCreateRepos: false, canDeleteRepos: false });
+      expect(notes).toEqual([expect.stringMatching(/couldn't confirm .*treated it as "All repositories"/)]);
+    }
+    // no installation on this owner at all is not "broad": the App simply reaches nothing there
+    const none = deps(undefined, { [`GET ${API}/user/installations`]: { body: { installations: [] } } }, { appLogin: async () => appCred() });
+    expect(await getAuth({ owner: 'o', repos: ['r'], allowBroad: false, mode: 'read' }, none.deps)).toMatchObject({ kind: 'app', repos: ['r'] });
   });
 
   it(title(AU, 'anonymous check that fails with 401, 502 or 503 → couldn\'t reach GitHub, not the setup steps'), async () => {
@@ -275,7 +303,8 @@ describe('getAuth', () => {
   });
 
   it(title(AU, 'the token from pipegen\'s own App login is used before GITHUB_TOKEN'), async () => {
-    const { deps: d } = deps(fgCred(), {}, { appLogin: async () => appCred() });
+    const selected: Routes = { [`GET ${API}/user/installations`]: { body: { installations: [{ id: 5, account: { login: 'o' }, repository_selection: 'selected', permissions: {} }] } } };
+    const { deps: d } = deps(fgCred(), selected, { appLogin: async () => appCred() });
     const got = await getAuth({ owner: 'o', repos: ['r'], allowBroad: false, mode: 'read' }, d);
     expect(got.kind).toBe('app');
     expect(got.token).toBe(appCred());
@@ -444,7 +473,7 @@ describe('token safety', () => {
       expect(lines.join('\n')).not.toContain(cred);
       // the Auth object can be printed or dumped as --json without its token
       const { deps: d } = deps(cred, routes);
-      const got = await getAuth({ owner: 'o', repos: ['r'], allowBroad: false, mode: 'write' }, d);
+      const got = await getAuth({ owner: 'o', repos: ['r'], allowBroad: true, mode: 'write' }, d);
       expect(got.token).toBe(cred);
       expect(JSON.stringify(got)).not.toContain(cred);
       expect(inspect(got, { depth: 5 })).not.toContain(cred);
@@ -600,6 +629,24 @@ describe('probePermissions', () => {
     const res = await probePermissions(r.gh, 'o', ['r'], { kind: 'installation', mode: 'read', clock: clock() });
     expect(res.missing.map((m) => m.permission)).toEqual([P(S_NAME, 'read')]);
     expect(r.calls.some((c) => c.url.pathname.startsWith('/user/installations'))).toBe(false);
+  });
+
+  it('probe: anonymous client, 401 → inconclusive, not token rejected', async () => {
+    const r401: Reply = { status: 401, body: { message: 'Requires authentication' } };
+    const anon = gh({ [`GET ${API}/repos/o/r`]: r401, [`GET ${API}/repos/o/r/collaborators`]: r401, [`GET ${API}/repos/o/r/pulls`]: r401 }, null);
+    const res = await probePermissions(anon.gh, 'o', ['r'], { kind: 'anonymous', mode: 'read' });
+    expect(JSON.stringify(res)).not.toMatch(/rejected/);
+    expect(res.unchecked.map((u) => u.permission)).toContain('Access to o/r');
+    const ctx = await caught(readGitHubContext(anon.gh, 'o', 'r', null));
+    expect(ctx).toBeInstanceOf(GitHubAccessError);
+    expect((ctx as Error).message).not.toMatch(/rejected the token/);
+    // listWriters, anonymous: it needs a token (a 401 or 403 there is not a missing permission of a token)
+    for (const reply of [r401, refused('Must have push access to view repository collaborators.')]) {
+      const a = gh({ [`GET ${API}/repos/o/r/collaborators`]: reply }, null);
+      const e = await caught(listWriters(a.gh, 'o', 'r'));
+      expect((e as Error).message).toMatch(/needs a token/);
+      expect((e as Error).message).not.toMatch(/rejected the token/);
+    }
   });
 
   it('probes: a 401 is a hard "token rejected" error, never a missing permission', async () => {
