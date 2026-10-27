@@ -674,9 +674,14 @@ describe('consent token (T4b: no AI call without consent, by type)', () => {
   it('consent: a token for another provider, model or cap is refused before anything runs', async () => {
     const s = await setup();
     const other = fakeAi({ model: 'claude-fable-5-1' });
-    await expect(addAiSuggestions(s.r, s.dir, { ...s.deps, ai: other.p })).rejects.toThrow(/agreed/);
-    await expect(addAiSuggestions(s.r, s.dir, { ...s.deps, ai: fakeAi({ name: 'openai', model: DEFAULT_MODEL }).p })).rejects.toThrow(/agreed/);
-    await expect(addAiSuggestions(s.r, s.dir, { ...s.deps, capUsd: 2e9 })).rejects.toThrow(/agreed/);
+    // each case gets a fresh yes: a refused token is spent too (review N1, safe side)
+    await expect(addAiSuggestions(s.r, s.dir, { ...s.deps, consent: await s.grant(), ai: other.p })).rejects.toThrow(/agreed/);
+    await expect(addAiSuggestions(s.r, s.dir, { ...s.deps, consent: await s.grant(), ai: fakeAi({ name: 'openai', model: DEFAULT_MODEL }).p })).rejects.toThrow(/agreed/);
+    await expect(addAiSuggestions(s.r, s.dir, { ...s.deps, consent: await s.grant(), capUsd: 2e9 })).rejects.toThrow(/agreed/);
+    // and the refused token can't be used afterwards either
+    const refused = await s.grant();
+    await expect(addAiSuggestions(s.r, s.dir, { ...s.deps, consent: refused, capUsd: 2e9 })).rejects.toThrow(/agreed/);
+    await expect(addAiSuggestions(s.r, s.dir, { ...s.deps, consent: refused })).rejects.toThrow(/already used/);
     expect(s.ensure).not.toHaveBeenCalled();
     expect(s.ai.complete).not.toHaveBeenCalled();
     expect(other.complete).not.toHaveBeenCalled();
@@ -743,6 +748,17 @@ describe('consent token (T4b: no AI call without consent, by type)', () => {
     await expect(addAiSuggestions(other.r, other.dir, { ...other.deps, consent: t })).rejects.toThrow(/folder/);
     expect(other.ensure).not.toHaveBeenCalled();
     expect(other.ai.complete).not.toHaveBeenCalled();
+  });
+
+  it('consent (N1): one token used by two AI steps at the same time: only one runs', async () => {
+    const s = await setup();
+    const results = await Promise.allSettled([addAiSuggestions(s.r, s.dir, s.deps), addAiSuggestions(s.r, s.dir, s.deps)]);
+    expect(results.filter((x) => x.status === 'fulfilled')).toHaveLength(1);
+    const rejected = results.filter((x): x is PromiseRejectedResult => x.status === 'rejected');
+    expect(rejected).toHaveLength(1);
+    expect(String(rejected[0]!.reason)).toMatch(/already used/);
+    expect(s.ensure).toHaveBeenCalledTimes(1);
+    expect(s.ai.needsReqs()).toHaveLength(1);
   });
 
   it('consent (M1): a forged or subclassed token, or one made from a forged counting summary, is refused at runtime', async () => {

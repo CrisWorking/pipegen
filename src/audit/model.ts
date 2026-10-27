@@ -746,6 +746,9 @@ async function checkConsent(dir: string, deps: AiSuggestDeps): Promise<CountingS
     throw new Error('addAiSuggestions needs the consent token askConsent() gives for the audit --ai screen; nothing was sent.');
   }
   if (isSpent(c)) throw new Error('This consent was already used for an AI step; each AI step needs its own yes. Nothing was sent.');
+  // Spent here, before the first await, so two steps started at once can't both pass (review N1). A token refused by a
+  // check below is spent too: the safe side, since the next AI step then needs a new yes.
+  spend(c);
   const t = c.terms;
   const host = deps.ai.name === 'ollama' ? ollamaHostOf(deps.ai) ?? undefined : undefined;
   if (t.pricedFor.provider !== deps.ai.name || t.pricedFor.model !== deps.ai.model || t.pricedFor.host !== host || t.capUsd !== deps.capUsd) {
@@ -756,7 +759,6 @@ async function checkConsent(dir: string, deps: AiSuggestDeps): Promise<CountingS
   if (!CountingSummary.isSummary(files) || t.dir === null || files.dir !== t.dir || here !== t.dir) {
     throw new Error('This consent was given for the files counted in another folder; nothing was sent.');
   }
-  spend(c);
   return files;
 }
 
