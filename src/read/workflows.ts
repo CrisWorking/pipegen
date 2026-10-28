@@ -77,6 +77,7 @@ function deploysOf(doc: Record<string, unknown>, path: string): boolean {
  * `env:` sets NPM_CONFIG_DRY_RUN (any letter case, or an `env:` given as one expression) or the step's text names it.
  */
 const publishesField = (p: ('npm' | 'pypi')[]) => (p.length > 0 ? { publishes: p } : {});
+const tagPinnedField = (n: number) => (n > 0 ? { tagPinned: n } : {});
 const PR_ONLY = new Set(['pull_request', 'pull_request_target']);
 const DRY_RUN_WORD = /(?:^|\s)--dry-run(?:[=\s]|$)/;
 const dryRunEnv = (env: unknown) => env !== undefined && env !== null
@@ -99,6 +100,29 @@ function publishesOf(doc: Record<string, unknown>): ('npm' | 'pypi')[] {
     }
   }
   return [...out].sort();
+}
+
+/**
+ * Task 9 (PS36): how many `uses:` lines (a step's, or a job calling a reusable workflow) name an action or workflow by
+ * a tag or branch instead of a 40-character commit. A local path (./...) and a docker:// image aren't counted; the
+ * count covers only the file's own top-level jobs. Only a number leaves this file.
+ */
+const COMMIT_REF = /^[0-9a-f]{40}$/;
+function tagPinnedOf(doc: Record<string, unknown>): number {
+  let n = 0;
+  const check = (u: string) => {
+    if (!regexSafe(u)) return;
+    const t = u.trim();
+    if (t.startsWith('./') || t.startsWith('docker://')) return;
+    const at = t.lastIndexOf('@');
+    if (at < 0 || !COMMIT_REF.test(t.slice(at + 1))) n++;
+  };
+  for (const job of Object.values(asObj(doc.jobs))) {
+    const j = asObj(job);
+    for (const u of strings(j.uses)) check(u);
+    for (const step of Array.isArray(j.steps) ? j.steps : []) for (const u of strings(asObj(step).uses)) check(u);
+  }
+  return n;
 }
 
 const LINKED_NOTE = 'Skipped .github/workflows: it is reached through a symbolic link.';
@@ -157,6 +181,7 @@ export async function readWorkflows(dir: string, files?: string[], notes: string
       secretsUsed: secretsOf(read.text),
       jobs: Object.keys(asObj(doc.jobs)).filter((j) => regexSafe(j) && JOB_ID_RE.test(j)),
       ...publishesField(publishesOf(doc)),
+      ...tagPinnedField(tagPinnedOf(doc)),
     });
   }
   return out;

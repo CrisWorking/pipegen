@@ -504,7 +504,8 @@ function pick(need: Need, service: Service | undefined, p: RepoProfile, deps: Au
   if (script !== null) return { tool: script, also: [], note: ROW_NOTE.script(script.script) };
   const choice = chooseTools(need, service, p, caps, deps.reviewed);
   if (choice.tool !== null) return { tool: choice.tool, also: choice.also, note: choice.note };
-  if (deps.reviewedUnavailable === true) return { tool: null, also: [], note: ROW_NOTE.unavailable };
+  // Task 9: an unavailable list explains a pick that is null only for lack of its entry (or has no note at all); a null pick with a reason of its own keeps it
+  if (deps.reviewedUnavailable === true && (choice.unlisted === true || choice.note === '')) return { tool: null, also: [], note: ROW_NOTE.unavailable };
   return { tool: null, also: [], note: choice.note === '' ? ROW_NOTE.suggestion : choice.note };
 }
 

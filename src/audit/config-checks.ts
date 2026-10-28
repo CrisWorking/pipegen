@@ -608,8 +608,36 @@ export function versionAdjust(rows: Coverage[], p: RepoProfile): Coverage[] {
         why: `ESLint 10 doesn't read .eslintrc, so this run can't check anything until the config is migrated (${MIGRATE_HINT} does it).${range ? ' The ESLint version comes from package.json.' : ''}`,
       };
     }
+    if (!range && major === 9 && s.quality.eslintConfig === 'eslintrc') {
+      return {
+        ...r, status: 'partial',
+        why: `ESLint 9 reads eslint.config.js, not .eslintrc, so this will fail with "couldn't find an eslint.config file" unless ESLINT_USE_FLAT_CONFIG=false is set (pipegen can't see that variable); ${MIGRATE_HINT} does the migration. ESLint 9 reached end of life on ${ESLINT_EOL[9]}.`,
+      }
+    }
     const eol = Object.hasOwn(ESLINT_EOL, major) ? ESLINT_EOL[major] : undefined;
     if (eol === undefined) return r;
     return { ...r, why: `${r.why} ${range ? `package.json asks for at least ESLint ${major}, and ESLint ${major}` : `ESLint ${major}`} reached end of life on ${eol}.` };
+  });
+}
+
+// ---------- ESLint on Vue, Svelte and Astro files (DECISIONS #104) ----------
+
+const UI_FILES = new Set(['vue', 'nuxt', 'svelte', 'astro']);
+const UI_FILES_WHY = 'ESLint on .vue, .svelte and .astro files is not supported yet (the plugins that read them come in v0.2), so pipegen cannot say those files are linted.';
+
+/**
+ * A lint row that pipegen found as the repo's own ESLint, for a Vue, Nuxt, Svelte or Astro service: those files need an
+ * ESLint plugin pipegen does not read yet, so the row is never a clean pass. Covered → partial with a note; a row that is
+ * already partial, missing or unknown keeps its status and its own why.
+ */
+export function frameworkAdjust(rows: Coverage[], p: RepoProfile): Coverage[] {
+  const byName = new Map<string, Service>();
+  for (const s of p.services) if (!byName.has(s.name)) byName.set(s.name, s);
+  return rows.map((r) => {
+    if ((r.need.category !== 'lint' && r.need.category !== 'format-lint') || r.need.service === undefined || r.status !== 'covered') return r;
+    if (r.by !== 'eslint' && !(r.by ?? '').startsWith('your own ')) return r;
+    const s = byName.get(r.need.service);
+    if (s === undefined || s.quality.eslintConfig === 'none' || !s.quality.uiFrameworks.some((f) => UI_FILES.has(f))) return r;
+    return { ...r, status: 'partial', why: `${r.why} ${UI_FILES_WHY}` };
   });
 }

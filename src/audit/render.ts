@@ -3,9 +3,11 @@
 // doesn't say.
 //
 // Order (the brief, 1-9): the verdict; ⚠ warnings (secrets in the files on disk, then `warnings`); what the GitHub plan
-// allows (its limits first); the four layers; what pipegen would add and create (with `--ai`: the AI's extra checks
+// allows (its limits first); the four layers and the scheduled group (Plan P Task 9); the checks that don't apply
+// here; what pipegen would add and create (with `--ai`: the AI's extra checks
 // and its mention-only tools); the full setup's costs with their basis; what the full setup would send to the AI; the
-// permissions it needs; the notes and what this audit can't see; the next step.
+// permissions it needs (after the settings `finish` would turn on); the notes and what this audit can't see; the next
+// step.
 //
 // Rulings: S8 (the next step is the model's text, keyed by CURRENT_MILESTONE; no command that doesn't exist in v0.1),
 // S12 (monthly minutes highlighted only when the plan's included minutes are known and the estimate is over half of
@@ -23,8 +25,11 @@
 // Arrays whose size depends on the repo are appended with loops, never spread into a call (a spread of ~100k lines
 // overflows the stack).
 import { excludedSummaryLines } from '../ai/redact.js';
+import { SCHEDULED_CATEGORIES } from '../engine/need-ids.js';
 import { ACTIVITY_CAPPED_PREFIX } from '../estimate/estimate.js';
-import type { Layer, Need, Part } from '../types.js';
+import type { RepoToolStep } from '../engine/reviewed.js';
+import type { Layer, Need, Part, ReviewedTool } from '../types.js';
+import type { SkippedGroup, WouldSet } from './choose.js';
 import { num, plural, size, usd as money } from '../util/format.js';
 import { makeSafeOutput, OUTPUT_CAP, type OutputTarget } from '../util/safe-output.js';
 import { safeMarkdown } from '../util/safe-text.js';
@@ -69,26 +74,41 @@ export const CANT_SEE: readonly string[] = Object.freeze([
   "A pre-commit hook pinned to a commit SHA (`rev:`) isn't checked to be a commit of the hook's own repo, so it could come from a fork.",
   'pipegen knows the PyPI publish action up to v1.14.3: a newer release pinned by its commit SHA shows as partial until pipegen is updated.',
   "A test or lint script whose runner pipegen doesn't know (like `node test.js`) is trusted by its name: pipegen only lowers it when the script clearly does nothing or can't fail.",
+  // Plan P Task 9
+  "Coverage minimums in JS or TS config files (like jest.config.js or vitest.config.ts) are read as text: pipegen finds the setting but can't run the file, so it can't confirm the minimum.",
+  "Renovate presets (`extends`) aren't followed, so a setting that comes from a shared preset isn't seen.",
+  "Repo settings on GitHub (required checks, secret scanning, the default token permissions) aren't read, so pipegen can't say whether they are already on.",
+  "A workflow without a `permissions:` block gets the repo's default token permissions, a setting pipegen can't see.",
+  "A deploy workflow that uses no secret and no write grant isn't seen as a release.",
+  'Network egress control (blocking unexpected traffic from release jobs) is only partly read on larger runners.',
+  "Environment variables set by third-party actions aren't seen, so a check one of them turns off can show as covered.",
+  'ESLint on .vue, .svelte and .astro files is not supported yet (the plugins that read them come in v0.2): such a repo never shows a clean pass for ESLint.',
 ]);
 
-const LAYERS: readonly Layer[] = ['pre-commit', 'push', 'merge', 'deploy'];
-const LAYER_TITLE: Readonly<Record<Layer, string>> = {
+/** Plan P Task 9: the four layers, and a fifth group for the SCHEDULED_CATEGORIES rows (merge-layer needs read on their own trigger). */
+type Group = Layer | 'scheduled';
+const GROUPS: readonly Group[] = ['pre-commit', 'push', 'merge', 'deploy', 'scheduled'];
+const GROUP_TITLE: Readonly<Record<Group, string>> = {
   'pre-commit': "Before each commit (git hooks on the developer's machine)",
   push: 'On every push',
   merge: 'On every pull request, before merge',
   deploy: 'When the code is deployed or released',
+  scheduled: 'On a schedule and in repo files',
 };
+const WARNING_ONLY = 'warning only';
+const isScheduled = (n: Pick<Need, 'category'>) => (SCHEDULED_CATEGORIES as ReadonlySet<string>).has(n.category);
 const LAYER_WHEN: Readonly<Record<Layer, string>> = {
   'pre-commit': 'before each commit',
   push: 'on every push',
   merge: 'on every pull request',
   deploy: 'at deploy',
 };
-const NOT_NEEDED: Readonly<Record<Layer, string>> = {
+const NOT_NEEDED: Readonly<Record<Group, string>> = {
   'pre-commit': 'not needed: no checks apply here',
   push: 'not needed: no checks apply here',
   merge: 'not needed: no checks apply here',
   deploy: 'not needed: nothing here runs or deploys',
+  scheduled: 'not needed: no checks apply here',
 };
 const PART_LABEL: Readonly<Record<Part, string>> = {
   pipeline: 'Pipeline', precommit: 'Pre-commit hooks', docker: 'Dockerfile', compose: 'Compose file', tests: 'Starter tests',
@@ -160,7 +180,7 @@ function command(c: Ctx, cmd: string, depth: number): Block {
 
 // ---------- layers and the verdict (ruling S14) ----------
 
-interface LayerView { layer: Layer; rows: Coverage[]; needed: boolean; gaps: boolean; serious: boolean; unknown: boolean; covered: number }
+interface LayerView { layer: Group; rows: Coverage[]; needed: boolean; gaps: boolean; serious: boolean; unknown: boolean; covered: number }
 
 /**
  * A blocking floor need (every coverage row is a floor need) that is missing or partial, and that a tool or the
@@ -169,8 +189,9 @@ interface LayerView { layer: Layer; rows: Coverage[]; needed: boolean; gaps: boo
 const isSerious = (c: Coverage) => c.need.blocking === true && !isBuiltInNeed(c.need) && (c.status === 'missing' || c.status === 'partial');
 
 function layerViews(r: AuditReport): LayerView[] {
-  return LAYERS.map((layer) => {
-    const rows = r.coverage.filter((c) => c.need.layer === layer);
+  return GROUPS.map((layer) => {
+    // a scheduled row (a merge-layer need) is counted in its own group only, so nothing is counted twice
+    const rows = r.coverage.filter((c) => (layer === 'scheduled' ? isScheduled(c.need) : c.need.layer === layer && !isScheduled(c.need)));
     return {
       layer, rows, needed: rows.length > 0,
       gaps: rows.some((c) => c.status === 'missing' || c.status === 'partial'),
@@ -213,7 +234,7 @@ function row(c: Ctx, cov: Coverage): Row {
   const by = cov.by === undefined ? null : c.v(cov.by, OUTPUT_CAP.path);
   const where = cov.where === undefined ? null : c.v(cov.where, OUTPUT_CAP.path);
   return {
-    serious: isSerious(cov), status: cov.status, check: checkLabel(c, cov.need), why: c.v(cov.why, OUTPUT_CAP.text),
+    serious: isSerious(cov), status: cov.status, check: `${checkLabel(c, cov.need)}${cov.need.blocking ? '' : ` (${WARNING_ONLY})`}`, why: c.v(cov.why, OUTPUT_CAP.text),
     found: by !== null && where !== null ? `${by} in ${where}` : by ?? where,
   };
 }
@@ -263,10 +284,51 @@ function planSection(r: AuditReport, c: Ctx): Section {
 function layersSection(c: Ctx, views: LayerView[]): Section {
   const blocks: Block[] = [];
   for (const v of views) {
-    blocks.push({ kind: 'sub', title: `${LAYER_TITLE[v.layer]}: ${layerStatus(v)}` });
+    if (v.layer === 'scheduled' && !v.needed) continue; // a group with no checks is left out, not counted
+    blocks.push({ kind: 'sub', title: `${GROUP_TITLE[v.layer]}: ${layerStatus(v)}` });
     if (v.needed) blocks.push({ kind: 'rows', rows: v.rows.map((cov) => row(c, cov)) });
   }
   return { title: 'Checks by layer', blocks };
+}
+
+/** Services named in the terminal's skipped lines before "and N more" (Markdown and JSON list them all). */
+const MAX_SKIPPED_SERVICES_TERMINAL = 10;
+
+/**
+ * Plan P Task 9: the checks that don't apply here, each with its why. The terminal groups checks that share a reason on
+ * one line; Markdown lists every check (with its services) under its reason, and JSON carries every entry.
+ */
+function skippedSection(r: Pick<AuditReport, 'skipped'>, c: Ctx): Section | null {
+  if (r.skipped.length === 0) return null;
+  const blocks: Block[] = [];
+  const label = (category: string) => needLabel(category) ?? c.v(category);
+  const services = (g: SkippedGroup, all: boolean) => {
+    const names = g.services.map((x) => c.v(x));
+    const shown = all ? names : names.slice(0, MAX_SKIPPED_SERVICES_TERMINAL);
+    const more = names.length - shown.length;
+    return names.length === 0 ? '' : ` (for ${shown.join(', ')}${more > 0 ? ` and ${num(more)} more` : ''})`;
+  };
+  for (const g of r.skipped) {
+    const why = c.v(g.why, OUTPUT_CAP.text);
+    if (c.target === 'terminal') {
+      blocks.push(item(`${g.categories.map(label).join(', ')}${services(g, false)}: ${why}`));
+    } else {
+      blocks.push(item(why));
+      for (const category of g.categories) blocks.push(item(`${label(category)}${services(g, true)}`, 1));
+    }
+  }
+  return { title: "Checks that don't apply here", blocks };
+}
+
+const SETTING_LABEL: Readonly<Record<WouldSet['setting'], string>> = {
+  'sha-pinning': 'Require actions pinned to a commit', 'dependabot-alerts': 'Dependabot alerts', 'secret-scanning': 'Secret scanning',
+};
+
+/** Plan P Task 9: the GitHub settings `finish` would turn on after the setup pull request is merged (ST1-ST3). */
+function wouldSetSection(r: Pick<AuditReport, 'wouldSet'>, c: Ctx): Section | null {
+  if (r.wouldSet.length === 0) return null;
+  const blocks = r.wouldSet.map((w) => item(`${SETTING_LABEL[w.setting] ?? c.v(w.setting)}: ${c.v(w.why, OUTPUT_CAP.text)}`));
+  return { title: 'After the setup PR is merged, pipegen would turn on:', blocks };
 }
 
 function toolText(c: Ctx, w: WouldAddRow): string {
@@ -274,13 +336,26 @@ function toolText(c: Ctx, w: WouldAddRow): string {
   const t: WouldAddTool = w.tool;
   if (t === null) return note; // the model's note says what happens without a tool
   if ('kind' in t) {
+    // the repo's own tool: the version it would run at, then the chooser's reason
+    if (t.kind === 'repo-tool') return `${ownToolText(c, t)}${note === '' ? '' : `; ${note}`}`;
     // pipegen's own check, or the service's own script; without a merge lock the gate can't be made required
     const gateNote = t.kind === 'built-in' && w.need.category === 'gate' && !c.mergeLock
       ? ". On this plan GitHub can't make it a required check, so it reports but can't block a merge"
       : '';
     return `${note}${gateNote}`;
   }
-  return `${c.v(t.candidate.name)} ${c.v(t.candidate.version)} (${c.v(t.candidate.repo)}), ${note}`;
+  let out = reviewedText(c, t);
+  for (const a of w.also) if (a !== null && 'candidate' in a) out += `, plus ${reviewedText(c, a)}`;
+  return `${out}, ${note}`;
+}
+
+const reviewedText = (c: Ctx, t: ReviewedTool) => `${c.v(t.candidate.name)} ${c.v(t.candidate.version)} (${c.v(t.candidate.repo)})`;
+/** "your own `tsc` 7.0.2 (from your lockfile) would run here": a tool name that is plain words goes in backticks, any other value is cleaned plain. */
+function ownToolText(c: Ctx, t: RepoToolStep): string {
+  const name = c.v(t.tool);
+  const plain = name === t.tool && /^[a-z][a-z0-9 -]{0,30}$/.test(name);
+  const version = t.version === null ? '' : ` ${c.v(t.version)} ${t.fromRange === true ? '(version from package.json)' : '(from your lockfile)'}`;
+  return `your own ${plain ? `\`${name}\`` : name}${version} would run here`;
 }
 
 function aiBlocks(ai: AuditAi, reviewedUnavailable: boolean, c: Ctx): Block[] {
@@ -329,7 +404,7 @@ function addSection(r: AuditReport, c: Ctx): Section {
   if (r.wouldAdd.length > 0) {
     blocks.push(text("For each check that isn't covered:"));
     for (const w of r.wouldAdd) {
-      blocks.push(item(`${checkLabel(c, w.need)}, ${LAYER_WHEN[w.need.layer]} (now ${w.status}): ${toolText(c, w)}`));
+      blocks.push(item(`${checkLabel(c, w.need)}, ${isScheduled(w.need) ? 'on a schedule' : LAYER_WHEN[w.need.layer]} (now ${w.status}): ${toolText(c, w)}`));
     }
   }
   if (r.testsNote !== null) blocks.push(text(c.v(r.testsNote, OUTPUT_CAP.text)));
@@ -419,8 +494,8 @@ function buildDoc(r: AuditReport, c: Ctx): Doc {
   const intro = ['pipegen changed nothing in the repo or on GitHub.'];
   intro.push(r.ai === undefined ? 'Nothing was sent to an AI.' : 'You ran it with --ai: the AI part below says what the AI step found.');
   const sections = [
-    warningsSection(r, c), planSection(r, c), layersSection(c, views), addSection(r, c), costsSection(r, c), bundleSection(r, c),
-    permissionsSection(r, c), notesSection(r, c), { title: "What this audit can't see", blocks: CANT_SEE.map((l) => item(l)) }, nextSection(r, c),
+    warningsSection(r, c), planSection(r, c), layersSection(c, views), skippedSection(r, c), addSection(r, c), wouldSetSection(r, c),
+    costsSection(r, c), bundleSection(r, c), permissionsSection(r, c), notesSection(r, c), { title: "What this audit can't see", blocks: CANT_SEE.map((l) => item(l)) }, nextSection(r, c),
   ].filter((s): s is Section => s !== null);
   return { title: `pipegen audit: ${c.v(`${r.profile.owner}/${r.profile.repo}`, OUTPUT_CAP.path)}`, intro, verdict: verdictOf(views), sections };
 }
@@ -559,11 +634,11 @@ const PATH_KEYS: ReadonlySet<string> = new Set(['path', 'file', 'where', 'by', '
 const capFor = (key: string) => (PROSE_KEYS.has(key) ? OUTPUT_CAP.text : PATH_KEYS.has(key) ? OUTPUT_CAP.path : OUTPUT_CAP.name);
 
 /** A wouldAdd tool as `{ kind, id, name, repo, version }` (only the fields it has). */
-function slimTool(t: WouldAddTool): Record<string, string> | null {
+function slimTool(t: WouldAddTool): Record<string, string | boolean> | null {
   if (t === null) return null;
   if ('kind' in t) {
     if (t.kind === 'built-in') return { kind: 'built-in' };
-    if (t.kind === 'repo-tool') return { kind: 'repo-tool', id: t.needId, name: t.tool, ...(t.version === null ? {} : { version: t.version }) };
+    if (t.kind === 'repo-tool') return { kind: 'repo-tool', id: t.needId, name: t.tool, ...(t.version === null ? {} : { version: t.version }), ...(t.fromRange === true ? { fromRange: true } : {}) };
     return { kind: 'project-script', id: t.needId, name: t.script };
   }
   return { kind: 'reviewed', id: t.id, name: t.candidate.name, repo: t.candidate.repo, version: t.candidate.version };
@@ -610,7 +685,7 @@ function deepClean(v: unknown, key: string, depth: number, own: boolean, clean: 
  * (CANT_SEE: the limits the human report always shows; final review M7).
  */
 export function renderJson(r: AuditReport, opts: RenderOptions): string {
-  const slim = { ...r, wouldAdd: r.wouldAdd.map((w) => ({ ...w, tool: slimTool(w.tool) })), cantSee: CANT_SEE };
+  const slim = { ...r, wouldAdd: r.wouldAdd.map((w) => ({ ...w, tool: slimTool(w.tool), also: w.also.map(slimTool) })), cantSee: CANT_SEE };
   return JSON.stringify(deepClean(slim, '', 0, false, makeSafeOutput(opts.knownValues), new Set()), null, 2);
 }
 

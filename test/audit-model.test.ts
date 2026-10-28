@@ -734,6 +734,16 @@ describe('buildAudit: Plan P Task 8 (choosing, skipped checks, settings)', () =>
     expect(lint?.note).toBe("pipegen's reviewed tool list couldn't be loaded, so it has no tool to add here");
   });
 
+  it('audit: a null pick keeps its own note when the reviewed list is unavailable (Task 9)', async () => {
+    const r = await buildAudit(repo({ ...nodeApp(), 'deny.toml': '' }), deps({ reviewed: [], reviewedUnavailable: true }));
+    const licences = r.wouldAdd.find((w) => w.need.id === 'licences');
+    expect(licences?.tool).toBeNull();
+    expect(licences?.note).toBe('cargo-deny: a deny.toml is already in the repo (suggestion only)');
+    // a null pick that only lacks its entry still reads "list unavailable"
+    const scan = r.wouldAdd.find((w) => w.need.id === 'secrets');
+    expect(scan?.note).toBe("pipegen's reviewed tool list couldn't be loaded, so it has no tool to add here");
+  });
+
   it('audit: a missing reviewed entry gives suggestion only with the rule\'s reason', async () => {
     const r = await buildAudit(repo(nodeApp()), deps({ reviewed: [] }));
     const found = r.wouldAdd.find((w) => w.need.id === 'secrets');

@@ -34,7 +34,7 @@ Repo: private, owned by a user account, GitHub plan: free.
 |---|---|---|---|---|
 |   | covered | Git hook manager | The repo uses husky to run git hooks. | husky in .husky/pre-commit |
 | ⚠ | missing | Secret scan | Without a secret scan before each commit, a key can be committed without anyone noticing. | — |
-|   | missing | Format and lint hook for shop-api | Without a format and lint hook, style problems are only found later, in CI or in review. | — |
+|   | missing | Format and lint hook for shop-api (warning only) | Without a format and lint hook, style problems are only found later, in CI or in review. | — |
 
 ### On every push: serious gaps (2 of 6 checks covered)
 
@@ -211,6 +211,14 @@ These are counts only, never file contents. They were made without the secret sc
 - A pre-commit hook pinned to a commit SHA (`rev:`) isn't checked to be a commit of the hook's own repo, so it could come from a fork.
 - pipegen knows the PyPI publish action up to v1.14.3: a newer release pinned by its commit SHA shows as partial until pipegen is updated.
 - A test or lint script whose runner pipegen doesn't know (like `node test.js`) is trusted by its name: pipegen only lowers it when the script clearly does nothing or can't fail.
+- Coverage minimums in JS or TS config files (like jest.config.js or vitest.config.ts) are read as text: pipegen finds the setting but can't run the file, so it can't confirm the minimum.
+- Renovate presets (`extends`) aren't followed, so a setting that comes from a shared preset isn't seen.
+- Repo settings on GitHub (required checks, secret scanning, the default token permissions) aren't read, so pipegen can't say whether they are already on.
+- A workflow without a `permissions:` block gets the repo's default token permissions, a setting pipegen can't see.
+- A deploy workflow that uses no secret and no write grant isn't seen as a release.
+- Network egress control (blocking unexpected traffic from release jobs) is only partly read on larger runners.
+- Environment variables set by third-party actions aren't seen, so a check one of them turns off can show as covered.
+- ESLint on .vue, .svelte and .astro files is not supported yet (the plugins that read them come in v0.2): such a repo never shows a clean pass for ESLint.
 
 ## Next step
 

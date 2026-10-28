@@ -36,6 +36,25 @@ jobs:
     expect(w).toEqual({ path: '.github/workflows/ci.yml', triggers: ['push', 'pull_request'], deploys: false, ['secrets' + 'Used']: ['NPM_TOKEN', 'SLACK_HOOK'], jobs: ['build', 'lint'] });
   });
 
+  it('workflows: tagPinned counts the uses: lines pinned by a tag or branch (Task 9, PS36); a commit, a local path and an image are not counted', async () => {
+    const w = await one(`on: push
+jobs:
+  a:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@${'a'.repeat(40)}
+      - uses: ./.github/actions/local
+      - uses: docker://alpine:3
+      - uses: owner/repo/sub@main
+  b:
+    uses: org/shared/.github/workflows/x.yml@v2
+`);
+    expect(w?.tagPinned).toBe(3);
+    // a workflow with none leaves the field out
+    expect((await one('on: push\njobs:\n  a:\n    runs-on: x\n    steps:\n      - run: echo\n', 'b.yml'))?.tagPinned).toBeUndefined();
+  });
+
   it('workflows: environment key marks deploy', async () => {
     const w = await one('name: CI\non: push\njobs:\n  ship:\n    runs-on: x\n    environment: production\n    steps:\n      - run: echo hi\n');
     expect(w?.deploys).toBe(true);

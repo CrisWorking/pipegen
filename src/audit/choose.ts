@@ -22,7 +22,11 @@ import type { Capabilities, Need, NeedCategory, RepoProfile, ReviewedTool, Servi
 import { safeText } from '../util/safe-text.js';
 import type { Coverage } from './coverage.js';
 
-export interface Choice { tool: WouldAddTool; also: WouldAddTool[]; note: string }
+export interface Choice {
+  tool: WouldAddTool; also: WouldAddTool[]; note: string;
+  /** Task 9: the pick is null only because the rule's reviewed entry is not in the list (so an unavailable list is the better reason). */
+  unlisted?: true;
+}
 
 /** Every reviewed id a rule can name. Rules refer to ids only through this table, so the list can't drift from the rules. */
 const T = {
@@ -55,14 +59,15 @@ const entry = (c: Ctx, id: string): ReviewedTool | null => c.usable.find((t) => 
 /** The reviewed tool `id` with its reason; missing from the list → tool null and a note that says so. `also` ids that are missing are left out. */
 function reviewed(c: Ctx, id: string, reason: string, alsoIds: readonly string[] = [], extra = ''): Choice {
   const tool = entry(c, id);
-  if (tool === null) return none(`${reason}; ${NO_ENTRY}`);
+  if (tool === null) return { ...none(`${reason}; ${NO_ENTRY}`), unlisted: true };
   const also = alsoIds.map((a) => entry(c, a)).filter((t): t is ReviewedTool => t !== null);
   return { tool, also, note: `${reason}${extra}` };
 }
 
 /** The repo's own tool at its lockfile version. */
-function own(c: Ctx, tool: string, version: string | null, reason: string): Choice {
+function own(c: Ctx, tool: string, version: string | null, reason: string, pkg?: string): Choice {
   const step: RepoToolStep = { kind: 'repo-tool', needId: c.need.id, service: c.s?.name ?? c.need.service ?? '', tool, version };
+  if (version !== null && pkg !== undefined && (c.q.fromRange as readonly string[]).includes(pkg)) step.fromRange = true;
   if (c.s !== undefined && c.s.path !== '' && c.s.path !== '.') step.workingDir = c.s.path;
   return { tool: step, also: [], note: reason };
 }
@@ -86,6 +91,11 @@ const isTypeScript = (q: Service['quality']) => q.tsconfig || q.versions.typescr
 const PACKAGE_OF = { eslint: 'eslint', biome: '@biomejs/biome', oxlint: 'oxlint' } as const;
 const FRAMEWORK_NAMES = { next: 'Next', nuxt: 'Nuxt', vue: 'Vue', svelte: 'Svelte', astro: 'Astro', 'react-native': 'React Native' } as const;
 
+/** Task 9 (DECISIONS #104): ESLint's Vue, Svelte and Astro plugins are not set up by pipegen yet (v0.2), so those files are not linted. */
+export const ESLINT_UI_NOTE = 'ESLint on .vue, .svelte and .astro files is not supported yet, so those files would not be linted';
+const UI_FILE_FRAMEWORKS: readonly string[] = ['vue', 'nuxt', 'svelte', 'astro'];
+const eslintUiNote = (q: Service['quality']): string => (q.uiFrameworks.some((f) => UI_FILE_FRAMEWORKS.includes(f)) ? `; ${ESLINT_UI_NOTE}` : '');
+
 function lintRule(c: Ctx): Choice {
   const { q } = c;
   if (c.lang === 'python') {
@@ -97,16 +107,16 @@ function lintRule(c: Ctx): Choice {
   if (l.own) {
     const version = q.versions[PACKAGE_OF[l.engine]] ?? null;
     if (l.engine === 'eslint' && (major(version ?? undefined) ?? 0) >= 10 && q.eslintConfig === 'eslintrc') {
-      return own(c, 'eslint', version, "the repo's ESLint config: error, ESLint 10 doesn't read .eslintrc; migrate it with ESLint's migration tool (@eslint/migrate-config)");
+      return own(c, 'eslint', version, "the repo's ESLint config: error, ESLint 10 doesn't read .eslintrc; migrate it with ESLint's migration tool (@eslint/migrate-config)", 'eslint');
     }
     const names = { eslint: 'ESLint', biome: 'Biome', oxlint: 'Oxlint' } as const;
-    return own(c, l.engine, version, `${names[l.engine]} is already configured`);
+    return own(c, l.engine, version, `${names[l.engine]} is already configured${l.engine === 'eslint' ? eslintUiNote(q) : ''}`, PACKAGE_OF[l.engine]);
   }
   if (l.engine === 'biome') {
     return reviewed(c, T.biome, `Biome: no linter configured; ${isTypeScript(q) ? 'TypeScript' : 'JavaScript'} repo without a framework plugin`);
   }
   const framework = q.uiFrameworks.map((f) => FRAMEWORK_NAMES[f]).join(' and ');
-  const why = `no linter configured; ${framework} needs ESLint plugins`;
+  const why = `no linter configured; ${framework} needs ESLint plugins${eslintUiNote(q) === '' ? '' : ` (${ESLINT_UI_NOTE})`}`;
   if (!isTypeScript(q)) return reviewed(c, T.eslint, `ESLint: ${why}`);
   if ((major(q.versions.typescript) ?? 0) >= 7) {
     return reviewed(c, T.eslint, `ESLint with Oxlint's type-aware rules: ${why}, and typescript-eslint doesn't support TypeScript 7`, [T.oxlintTypeaware]);
@@ -121,11 +131,11 @@ function formatRule(c: Ctx): Choice {
   }
   if (c.lang !== 'node') return generic(c);
   if (q.configs.includes('prettier')) {
-    return q.versions.prettier !== undefined ? own(c, 'prettier', q.versions.prettier, 'Prettier is already configured') : reviewed(c, T.prettier, 'Prettier: a Prettier config is already in the repo');
+    return q.versions.prettier !== undefined ? own(c, 'prettier', q.versions.prettier, 'Prettier is already configured', 'prettier') : reviewed(c, T.prettier, 'Prettier: a Prettier config is already in the repo');
   }
   const l = nodeLint(q);
   if (l.engine === 'biome') {
-    return l.own ? own(c, 'biome', q.versions['@biomejs/biome'] ?? null, 'Biome is already configured') : reviewed(c, T.biome, 'Biome: it lints here, so it formats too');
+    return l.own ? own(c, 'biome', q.versions['@biomejs/biome'] ?? null, 'Biome is already configured', '@biomejs/biome') : reviewed(c, T.biome, 'Biome: it lints here, so it formats too');
   }
   return reviewed(c, T.prettier, 'Prettier: ESLint lints here, and it does not format');
 }
@@ -147,7 +157,7 @@ function typeCheckRule(c: Ctx): Choice {
   if (version === undefined) {
     return none(`${pick.tool}: ${pick.pkg} is not in the lockfile, so pipegen can only suggest it (add ${pick.pkg} as a dev dependency)`);
   }
-  return own(c, pick.tool, version, `${pick.tool} is in the lockfile`);
+  return own(c, pick.tool, version, `${pick.tool} is in the ${q.fromRange.includes(pick.pkg) ? 'package.json' : 'lockfile'}`, pick.pkg);
 }
 
 const COVERAGE_NOTE = '`floor(current) - 1`; 60% of lines for repos with few tests; an existing minimum is kept';
@@ -160,7 +170,7 @@ function coverageRule(c: Ctx): Choice {
   const runner = q.versions.vitest !== undefined || s?.testFramework === 'vitest' ? 'vitest'
     : q.versions.jest !== undefined || s?.testFramework === 'jest' ? 'jest' : 'other';
   if (runner === 'vitest') return withNote(reviewed(c, T.vitestCoverage, 'Vitest coverage: Vitest is the test runner'));
-  if (runner === 'jest') return withNote(own(c, 'jest', q.versions.jest ?? null, "Jest's own coverage (coverageThreshold): Jest is the test runner"));
+  if (runner === 'jest') return withNote(own(c, 'jest', q.versions.jest ?? null, "Jest's own coverage (coverageThreshold): Jest is the test runner", 'jest'));
   return withNote(reviewed(c, T.c8, `c8: ${s?.testFramework === 'node:test' ? 'node:test' : 'the test runner'} has no coverage of its own`));
 }
 
@@ -269,10 +279,17 @@ const CANT_SEE = "pipegen can't see this setting with read access, so it can't s
 export function wouldSetSettings(p: RepoProfile, coverage: readonly Coverage[]): WouldSet[] {
   const pin = coverage.find((c) => c.need.category === 'workflow-pin-check');
   const pinned = pin !== undefined && pin.status === 'covered';
+  // PS36: the setting breaks every workflow whose actions are pinned by tag, so the why names that precondition and counts them
+  const tagged = p.existingWorkflows.filter((w) => (w.tagPinned ?? 0) > 0).length;
+  const total = p.existingWorkflows.length;
+  const today = tagged > 0
+    ? `Today ${tagged} of your ${total} ${total === 1 ? 'workflow uses' : 'workflows use'} actions pinned by tag or branch, and ${tagged === 1 && total === 1 ? 'it would' : 'they would'} stop running`
+    : total === 0 ? 'Today no workflow uses tag pins'
+      : `Today none of your ${total} ${total === 1 ? 'workflow uses' : 'workflows use'} tag pins${pinned ? ' (the action pin check passes today)' : ''}`;
   const out: WouldSet[] = [
     {
       setting: 'sha-pinning',
-      why: `Makes GitHub refuse any action that is not pinned to a commit. pipegen turns it on only after your other workflows pin their actions${pinned ? ' (the action pin check passes today)' : ' (the action pin check row says they do not all do that yet, and those workflows would stop running)'}; ${CANT_SEE}.`,
+      why: `Makes GitHub refuse any action that is not pinned to a commit. pipegen turns it on only after your other workflows pin their actions to a commit. ${today}; ${CANT_SEE}.`,
     },
     { setting: 'dependabot-alerts', why: `Tells you when a dependency has a known vulnerability; free on every repo. ${CANT_SEE}.` },
   ];

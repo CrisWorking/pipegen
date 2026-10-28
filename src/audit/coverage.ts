@@ -119,7 +119,7 @@ import { regexSafe } from '../read/limits.js';
 import { MAX_WORKFLOWS, WORKFLOW_FILE } from '../read/workflows.js';
 import type { Capabilities, ExistingWorkflow, Need, RepoProfile } from '../types.js';
 import { safeText } from '../util/safe-text.js';
-import { coverageMinimumRow, publishingCoverage, updateConfigCoverage, versionAdjust } from './config-checks.js';
+import { coverageMinimumRow, frameworkAdjust, publishingCoverage, updateConfigCoverage, versionAdjust } from './config-checks.js';
 import { DEPLOY_VERIFY_WHY, Dirs, Firsts, GATE_WHY, Scope, ciCoverage, firstPartialHit, hookCoverage, type Decide } from './coverage/decide.js';
 import { hookRunHits, readHooks } from './coverage/hooks.js';
 import { compile, loadToolSignatures } from './coverage/signatures.js';
@@ -245,5 +245,5 @@ export async function mapCoverage(p: RepoProfile, needs: Need[], dir: string, op
       rows.push(row.status === 'partial' ? await coverageMinimumRow(row, firstPartialHit(need, need.layer, d), dir) : row);
     } else rows.push(ciCoverage(need, need.layer, d));
   }
-  return versionAdjust(rows, p); // PS22: the last step, so the chooser reads the adjusted row
+  return frameworkAdjust(versionAdjust(rows, p), p); // PS22: the last steps, so the chooser reads the adjusted row
 }

@@ -5,7 +5,7 @@ import { join } from 'node:path';
 import { build } from 'esbuild';
 import { afterEach, describe, expect, it } from 'vitest';
 import { mapCoverage, type Coverage } from '../src/audit/coverage.js';
-import { coverageMinimum, publishingCoverage, updateConfigCoverage, versionAdjust } from '../src/audit/config-checks.js';
+import { coverageMinimum, frameworkAdjust, publishingCoverage, updateConfigCoverage, versionAdjust } from '../src/audit/config-checks.js';
 import { floorNeeds } from '../src/engine/needs.js';
 import { readPrecommit, readWorkflows } from '../src/read/workflows.js';
 import { emptyRepoFiles, emptyServiceQuality } from '../src/read/quality.js';
@@ -838,7 +838,8 @@ describe('fix round 1 (review of Task 4)', () => {
     const r = versionAdjust([lint], profile('9.0.0', 'eslintrc', ['eslint']))[0];
     expect(r?.status).toBe('partial');
     expect(r?.why).toMatch(/ESLint 10 doesn't read \.eslintrc/);
-    expect(versionAdjust([lint], profile('9.1.0', 'eslintrc', []))[0]?.status).toBe('covered'); // an exact lockfile version
+    // an exact lockfile version of 9: ESLint 9 itself reads only eslint.config.js (Task 9), so it is partial with its own wording
+    expect(versionAdjust([lint], profile('9.1.0', 'eslintrc', []))[0]?.why).toMatch(/this will fail/);
   });
 
   it('8. a package.json in a subfolder no service owns still needs a Dependabot entry (found by a bounded glob)', async () => {
@@ -853,5 +854,75 @@ describe('fix round 1 (review of Task 4)', () => {
     expect((await update(dir)).status).toBe('covered');
     dep(dir, depFile(upd('npm', '/'), upd('npm', '/web')));
     expect((await update(dir)).status).toBe('partial'); // the Python folder has no entry
+  });
+});
+
+// ---------- Plan P Task 9 carry-forwards ----------
+
+describe('Task 9: wording of rows the earlier tasks left rough', () => {
+  const ci = (dir: string, cmd: string) => wf(dir, 'ci.yml', `${onBoth}${job(runStep(cmd))}`);
+  const lint: Coverage = { need: need('lint', 'merge', 'app'), status: 'covered', by: 'eslint', where: '.github/workflows/ci.yml (job t)', why: 'The eslint check runs on every pull request.' };
+  const profileWith = (quality: Partial<Service['quality']>): RepoProfile => ({
+    owner: 'o', repo: 'r', defaultBranch: 'main', private: false, ownerType: 'User', plan: 'free', monorepo: 'none',
+    services: [svc('.', { quality: { ...emptyServiceQuality(), ...quality } })], terraformDirs: [], hasCompose: false,
+    existingWorkflows: [], precommit: null, repoFiles: emptyRepoFiles(),
+  });
+
+  it('coverage override: a minimum turned off by the command line has its own wording, not "set not to fail on findings"', async () => {
+    const py = svc('.', { language: 'python', packageManager: 'pip' });
+    for (const cmd of ['pytest --cov=pkg --cov-fail-under=0', 'coverage report --fail-under=0', 'npx vitest run --coverage --coverage.thresholds.lines=0']) {
+      const dir = makeTempDir();
+      ci(dir, cmd);
+      const r = pick(await rows(dir, { services: [cmd.startsWith('npx') ? svc('.') : py] }), 'merge', 'coverage');
+      expect(r.status, cmd).toBe('partial');
+      expect(r.why, cmd).not.toMatch(/set not to fail on findings/);
+      expect(r.why, cmd).toMatch(/a flag on its command line turns the minimum off \(0, or not a number\) or swaps the coverage config file, so a drop in coverage can't be counted on to fail it\.$/);
+    }
+    // a flag that swaps the config file gets the same coverage-specific sentence
+    const dir = makeTempDir();
+    ci(dir, 'pytest --cov=pkg --cov-config=other.cfg');
+    const swapped = pick(await rows(dir, { services: [svc('.', { language: 'python', packageManager: 'pip' })] }), 'merge', 'coverage');
+    expect(swapped.status).toBe('partial');
+    expect(swapped.why).not.toMatch(/set not to fail on findings/);
+    expect(swapped.why).toMatch(/swaps the coverage config file/);
+  });
+
+  it('versions: ESLint 9 (exact) with only .eslintrc says this run will fail, and is partial', () => {
+    const r = versionAdjust([lint], profileWith({ versions: { eslint: '9.39.5' }, eslintConfig: 'eslintrc' }))[0];
+    expect(r?.status).toBe('partial');
+    expect(r?.why).toMatch(/ESLint 9 reads eslint\.config\.js, not \.eslintrc, so this will fail with "couldn't find an eslint\.config file" unless ESLINT_USE_FLAT_CONFIG=false is set/);
+    expect(r?.why).toMatch(/pipegen can't see that variable/);
+    // a flat config, or both, or ESLint 8 (which still reads .eslintrc) stay as they were
+    for (const cfg of ['flat', 'both'] as const) expect(versionAdjust([lint], profileWith({ versions: { eslint: '9.39.5' }, eslintConfig: cfg }))[0]?.status).toBe('covered');
+    expect(versionAdjust([lint], profileWith({ versions: { eslint: '8.57.1' }, eslintConfig: 'eslintrc' }))[0]?.status).toBe('covered');
+    // the range case keeps its own wording (can resolve to 10)
+    expect(versionAdjust([lint], profileWith({ versions: { eslint: '9.0.0' }, eslintConfig: 'eslintrc', fromRange: ['eslint'] }))[0]?.why).toMatch(/ESLint 10 doesn't read \.eslintrc/);
+  });
+
+  it('frameworks: ESLint on a Vue, Svelte, Astro or Nuxt repo is never a clean pass: "not supported yet"', () => {
+    for (const ui of ['vue', 'svelte', 'astro', 'nuxt'] as const) {
+      const p = profileWith({ versions: { eslint: '9.39.5' }, eslintConfig: 'flat', uiFrameworks: [ui] });
+      const r = frameworkAdjust([lint], p)[0];
+      expect(r?.status, ui).toBe('partial');
+      expect(r?.by).toBe('eslint');
+      expect(r?.why, ui).toMatch(/ESLint on \.vue, \.svelte and \.astro files is not supported yet/);
+      expect(r?.why, ui).toContain(lint.why);
+    }
+    // not a UI framework of those, or no ESLint config at all, or a missing row: unchanged
+    expect(frameworkAdjust([lint], profileWith({ eslintConfig: 'flat', uiFrameworks: ['next'] }))[0]).toEqual(lint);
+    expect(frameworkAdjust([lint], profileWith({ eslintConfig: 'none', uiFrameworks: ['vue'] }))[0]).toEqual(lint);
+    const missing: Coverage = { ...lint, status: 'missing' };
+    expect(frameworkAdjust([missing], profileWith({ eslintConfig: 'flat', uiFrameworks: ['vue'] }))[0]).toEqual(missing);
+    // a Biome or other lint tool is not touched
+    expect(frameworkAdjust([{ ...lint, by: 'biome' }], profileWith({ eslintConfig: 'flat', uiFrameworks: ['vue'] }))[0]?.status).toBe('covered');
+  });
+
+  it('frameworks: through mapCoverage, a Vue repo whose CI runs ESLint reads partial', async () => {
+    const dir = makeTempDir();
+    wf(dir, 'ci.yml', `${onBoth}${job(runStep('npx eslint .'))}`);
+    const s = svc('.', { quality: { ...emptyServiceQuality(), versions: { eslint: '9.39.5' }, eslintConfig: 'flat', uiFrameworks: ['vue'] } });
+    const r = pick(await rows(dir, { services: [s] }), 'merge', 'lint', 'app');
+    expect(r.status).toBe('partial');
+    expect(r.why).toMatch(/not supported yet/);
   });
 });

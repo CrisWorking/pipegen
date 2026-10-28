@@ -11,20 +11,49 @@ It opens one pull request. You review it. It never touches your app code or your
 ```text
 $ npx --registry=https://registry.npmjs.org pipegen@0.1.0 audit --dir ./my-repo
 
-Verdict: 4 of 4 layers have gaps · 2 are serious · 1 secret found in your files
+Verdict: 5 of 5 layers have gaps; 3 are serious.
 
-FOUR LAYERS
-  Layer         Status       What covers it today       Missing
-  1 Pre-commit  ✗ missing    —                          secret scan before commit
-  2 Push        ⚠ partial    npm test (on push)         secret scan, code scan, dependency scan
-  3 Merge       ⚠ partial    npm test (on PR)           image scan, attack test, gate, merge lock
-  4 Deploy      ✗ missing    deploy.yml (Vercel)        verify-first before deploy, SBOM
+Checks by layer
+  Before each commit: serious gaps (0 of 3 checks covered)
+    ⚠ missing  Secret scan
+  On every push: serious gaps (2 of 11 checks covered)
+    ⚠ partial  Unit tests for app
+               Your own `npm test` runs, but not on every push.
+      missing  Dead code and unused dependencies for app (warning only)
+  On every pull request, before merge: serious gaps (4 of 16 checks covered)
+    ⚠ missing  Merge gate (pipegen)
+  When the code is deployed or released: gaps (0 of 2 checks covered)
+      missing  Deploy check (pipegen)
+  On a schedule and in repo files: gaps (0 of 2 checks covered)
+      missing  Dependency update config (warning only)
 
-COSTS
-  After setup, monthly    ~610 GitHub Actions minutes (31% of your free 2,000)
+Checks that don't apply here
+  Type check, Test coverage minimum: no tsconfig.json or typescript dependency found
+
+What pipegen would add
+  Type check for app: your own `tsc` 7.0.2 (from your lockfile) would run here
+
+After the setup PR is merged, pipegen would turn on:
+  Require actions pinned to a commit: ... Today 2 of your 3 workflows use actions pinned by tag or branch ...
+
+Costs of the full setup (estimates)
+  After setup: about 610 minutes a month.
 ```
 
 [See the full example report →](examples/audit-example.md)
+
+## What the audit checks
+
+Every check below is a row in the report: covered, partial, missing or unknown. A check that blocks a merge when it is missing is marked serious; the ones that only warn say **warning only**.
+
+- **Before each commit:** a git hook manager, a secret scan, a format and lint hook.
+- **On every push and pull request:** secret scan, code scan (SAST), dependency check, unit and full tests, lint, format, type check, test coverage minimum, dead code and unused dependencies, copy-paste check, Dockerfile lint, workflow lint, action pin check, new-dependency review, licence check, running-app scan (DAST), API scan against the spec, infrastructure code scan, container image build and scan, and the merge gate.
+- **At deploy or release:** SBOM, image signing, build attestation, trusted publishing, a network lock for release jobs and the deploy check.
+- **On a schedule and in repo files:** dependency update config (Dependabot or Renovate with a 7-day wait), OpenSSF Scorecard and fuzzing.
+
+Checks that do not apply to a repo (no Dockerfile, no tests, no API spec) are listed with the reason, in "Checks that don't apply here". The report also lists the GitHub settings the setup would turn on after the pull request is merged, and what it can't see.
+
+The code scan can use Semgrep CE with rules that pipegen pins to one reviewed commit of `semgrep/semgrep-rules`. Those rules are under the Semgrep Rules License v1.0, which is not an open-source licence: using them to scan your own code is allowed; reselling them or offering them as a service is not.
 
 ## What the full run does (v0.2)
 

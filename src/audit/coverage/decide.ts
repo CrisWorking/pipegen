@@ -280,7 +280,11 @@ const effectiveReason = (need: Need, reason: Reason | null): Reason | null => (n
 const coverKinds = (need: Need) => (need.blocking ? [FN] : [FN, FO]);
 const partialKinds = (need: Need) => (need.blocking ? [FC, FO] : [FC]);
 
-function reasonWhy(h: { subject: string; partialWhy?: string }, reason: Reason, when: string): string {
+/** Task 9: a coverage run that is "soft" has its minimum turned off on the command line, or its config swapped; it isn't about findings. */
+const COVERAGE_SOFT_WHY = (s: string) => `${s} measures coverage, but a flag on its command line turns the minimum off (0, or not a number) or swaps the coverage config file, so a drop in coverage can't be counted on to fail it.`;
+
+function reasonWhy(h: { subject: string; partialWhy?: string }, reason: Reason, when: string, category?: string): string {
+  if (reason === 'soft' && category === 'coverage') return COVERAGE_SOFT_WHY(h.subject);
   return OWN_WHY.has(reason) && h.partialWhy !== undefined ? h.partialWhy : REASON_WHY[reason](h.subject, when);
 }
 
@@ -302,7 +306,7 @@ export function ciCoverage(need: Need, ciLayer: CiLayer, d: Decide): Coverage {
   if (d.truncated) return { need, status: 'unknown', why: OPAQUE_WHY.truncated };
   const partialRight = d.ci.first(need.category, dirs, layer, partialKinds(need));
   if (partialRight) {
-    return { need, status: 'partial', ...located(partialRight), why: reasonWhy(partialRight, effectiveReason(need, partialRight.reason) as Reason, LAYER_DONE[layer]) };
+    return { need, status: 'partial', ...located(partialRight), why: reasonWhy(partialRight, effectiveReason(need, partialRight.reason) as Reason, LAYER_DONE[layer], need.category) };
   }
   const partialTrigger = d.ci.first(need.category, dirs, layer, [NF]);
   if (partialTrigger) return { need, status: 'partial', ...located(partialTrigger), why: `${partialTrigger.subject} runs, but not ${LAYER_DONE[layer]}.` };
@@ -336,7 +340,7 @@ export function hookCoverage(need: Need, hooks: Hooks, d: Decide): Coverage {
     const unknownRun = d.hooks.first(`${UNKNOWN_PREFIX}${need.category}`, dirs, 'push', [FN, FC, FO]);
     if (unknownRun?.partialWhy !== undefined) return { need, status: 'unknown', by: unknownRun.by as string, where: hooks.where, why: unknownRun.partialWhy };
     const partial = d.hooks.first(need.category, dirs, 'push', partialKinds(need));
-    if (partial) return { need, status: 'partial', by: partial.by as string, where: hooks.where, why: reasonWhy(partial, effectiveReason(need, partial.reason) as Reason, 'before each commit') };
+    if (partial) return { need, status: 'partial', by: partial.by as string, where: hooks.where, why: reasonWhy(partial, effectiveReason(need, partial.reason) as Reason, 'before each commit', need.category) };
     if (!hooks.readable) return { need, status: 'unknown', where: hooks.where, why: OPAQUE_WHY.hookUnreadable };
     if (capped(need, d)) return { need, status: 'unknown', why: OPAQUE_WHY.tooMany };
   }

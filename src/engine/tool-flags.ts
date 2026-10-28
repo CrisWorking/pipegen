@@ -253,7 +253,7 @@ export const ACTION_POLICIES: Readonly<Record<string, Readonly<Record<string, In
     'package-manager-cache': { values: ['false'], as: 'fixed', required: true },
     'node-version': { values: ['24', '26'], as: 'choice' },
   },
-  'actions/setup-python': { 'python-version': { values: ['3.10', '3.11', '3.12', '3.13', '3.14'], as: 'choice' } },
+  'actions/setup-python': { 'python-version': { values: ['3.11', '3.12', '3.13', '3.14'], as: 'choice' } },
   // hidden files (.env and the like) are never uploaded; a missing file is an error. `path` is set by the renderer
   // from the scanning entries' own output paths, never by the template
   'actions/upload-artifact': {

@@ -126,7 +126,7 @@ tools:
       output: { path: "", format: none }
     fixedInputs: {}
     choices:
-      python-version: ["3.10", "3.11", "3.12", "3.13", "3.14"]
+      python-version: ["3.11", "3.12", "3.13", "3.14"]
     configFiles: []
     reviewedBy: Cristiano
     reviewedAt: "2026-10-28"

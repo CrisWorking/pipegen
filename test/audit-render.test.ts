@@ -3,7 +3,11 @@
 // no backticks around repo values, escaped exactly once) and Review Focus 3 (never suggest making the repo public).
 import { describe, expect, it } from 'vitest';
 import { EXCLUDED_KEPT, EXCLUDED_PATTERN_GROUPS, EXCLUDED_PATTERNS, excludedSummaryLines, redact } from '../src/ai/redact.js';
-import { isBuiltInNeed, isOwnCommand, needLabel, safeRunCommand, type AuditReport } from '../src/audit/model.js';
+import { isBuiltInNeed, isOwnCommand, needLabel, safeRunCommand, type AuditReport, type WouldAddRow } from '../src/audit/model.js';
+import type { Coverage } from '../src/audit/coverage.js';
+import { CHECKS } from '../src/engine/needs.js';
+import type { RepoToolStep } from '../src/engine/reviewed.js';
+import type { Layer } from '../src/types.js';
 import { CANT_SEE, renderJson, renderMarkdown, renderTerminal, type RenderOptions } from '../src/audit/render.js';
 import { safeMarkdown } from '../src/util/safe-text.js';
 import { EMPTY_PLACEHOLDER, safeOutput, TOO_LONG } from '../src/util/safe-output.js';
@@ -679,3 +683,228 @@ function hostileReport(): AuditReport {
     }),
   };
 }
+
+// ---------- Plan P Task 9: every catalogue check in the report ----------
+
+const repoTool = (over: Partial<RepoToolStep> = {}): RepoToolStep => ({ kind: 'repo-tool', needId: 'type-check', service: 'shop-api', tool: 'tsc', version: '7.0.2', ...over });
+
+/** The free private report plus Plan P rows: a scheduled group, non-blocking rows, an own tool, `also` tools, skipped and wouldSet. */
+function planPReport(): AuditReport {
+  const base = report();
+  const cov = (layer: Layer, id: string, status: Coverage['status'], blocking = true, service?: string): Coverage => ({
+    need: need(layer, id, service, blocking), status, why: `Why ${id}.`,
+  });
+  const rows: Coverage[] = [
+    cov('push', 'type-check', 'missing', true, 'shop-api'),
+    cov('merge', 'duplication', 'missing', false),
+    cov('merge', 'dead-code', 'missing', false, 'shop-api'),
+    cov('merge', 'update-config', 'missing', false),
+    cov('merge', 'scorecard', 'missing', false),
+    cov('merge', 'fuzzing', 'missing', false, 'shop-api'),
+    cov('merge', 'workflow-lint', 'missing'),
+  ];
+  const zizmor = reviewedTool('zizmor', 'zizmorcore/zizmor', '1.31.1', ['workflow-lint']);
+  const actionlint = reviewedTool('actionlint', 'rhysd/actionlint', '1.7.12', ['workflow-lint']);
+  const add = (c: Coverage, tool: WouldAddRow['tool'], also: WouldAddRow['also'], note: string): WouldAddRow => ({ need: c.need, status: 'missing', tool, also, note });
+  const [tc, dup, dead, upd, sc, fz, wl] = rows as [Coverage, Coverage, Coverage, Coverage, Coverage, Coverage, Coverage];
+  return {
+    ...base,
+    coverage: [...base.coverage, ...rows],
+    wouldAdd: [
+      ...base.wouldAdd,
+      add(tc, repoTool(), [], 'tsc is in the lockfile'),
+      add(dup, reviewedTool('jscpd', 'kucherenko/jscpd', '5.4.2', ['duplication']), [], 'jscpd: finds copy-pasted code; warning only'),
+      add(dead, reviewedTool('knip', 'webpro-nl/knip', '5.50.0', ['dead-code']), [], 'Knip: finds unused files'),
+      add(upd, { kind: 'built-in' }, [], 'pipegen would write `.github/dependabot.yml`'),
+      add(sc, null, [], 'OpenSSF Scorecard: scores the repo weekly'),
+      add(fz, null, [], 'pipegen builds fuzzing in v0.3'),
+      add(wl, actionlint, [zizmor], 'actionlint and zizmor: check the workflows'),
+    ],
+    skipped: [
+      { why: 'no services found', categories: ['format', 'coverage'], services: [] },
+      { why: 'no Dockerfile found', categories: ['dockerfile-lint'], services: ['shop-api', 'worker'] },
+    ] as AuditReport['skipped'],
+    wouldSet: [
+      { setting: 'sha-pinning', why: 'Makes GitHub refuse any action that is not pinned to a commit.' },
+      { setting: 'dependabot-alerts', why: 'Tells you when a dependency has a known vulnerability.' },
+      { setting: 'secret-scanning', why: "A paid add-on (GitHub Secret Protection); pipegen can't turn it on here." },
+    ],
+  };
+}
+const GROUP = 'On a schedule and in repo files';
+
+describe('Plan P Task 9: the report shows every catalogue check', () => {
+  it('report: scheduled group after deploy, counted in the verdict', () => {
+    const r = planPReport();
+    for (const text of [term(r), md(r)]) {
+      const deploy = lineOf(text, 'When the code is deployed or released');
+      const sched = lineOf(text, GROUP);
+      expect(sched).toBeGreaterThan(deploy);
+      expect(lineOf(text, 'Dependency update config')).toBeGreaterThan(sched);
+      expect(lineOf(text, 'OpenSSF Scorecard')).toBeGreaterThan(sched);
+      // the merge view doesn't list a scheduled row, so nothing is counted twice
+      const merge = lineOf(text, 'On every pull request, before merge');
+      const mergeRows = text.split('\n').slice(merge, deploy).join('\n');
+      expect(mergeRows).not.toContain('Dependency update config');
+      expect(mergeRows).not.toContain('Fuzzing');
+    }
+    // what pipegen would add says when a scheduled check runs
+    expect(tflat(r)).toContain('OpenSSF Scorecard, on a schedule (now missing)');
+    expect(tflat(r)).not.toContain('OpenSSF Scorecard, on every pull request');
+    // 5 layers (the four and the scheduled group), all with gaps; the scheduled rows are warning only, so not serious
+    expect(term(r)).toContain('Verdict: 5 of 5 layers have gaps; 4 are serious.');
+    expect(term(r)).toMatch(new RegExp(`${GROUP}: gaps \\(0 of 3 checks covered\\)`));
+    // a group with no rows is left out and not counted
+    expect(term(report())).not.toContain(GROUP);
+    expect(term(report())).toContain('Verdict: 4 of 4 layers have gaps; 4 are serious.');
+    // all scheduled rows covered: the group reads covered and adds no gap
+    const covered = { ...r, coverage: r.coverage.map((c) => (['update-config', 'scorecard', 'fuzzing'].includes(c.need.id) ? { ...c, status: 'covered' as const } : c)) };
+    expect(term(covered)).toMatch(new RegExp(`${GROUP}: covered \\(3 of 3 checks covered\\)`));
+    expect(term(covered)).toContain('Verdict: 4 of 5 layers have gaps; 4 are serious.');
+  });
+
+  it('report: duplication row marked warning only, never serious', () => {
+    const r = planPReport();
+    const t = term(r);
+    for (const label of ['Copy-paste check', 'Dead code and unused dependencies', 'Dependency update config', 'OpenSSF Scorecard', 'Fuzzing', 'Format and lint hook']) {
+      const line = t.split('\n').find((l) => l.includes(label) && /missing/.test(l));
+      expect(line, label).toBeDefined();
+      expect(line, label).toContain('(warning only)');
+      expect(line, label).not.toContain('⚠');
+    }
+    // a blocking row is neither marked nor lowered
+    const blocking = t.split('\n').find((l) => l.includes('Workflow lint') && /missing/.test(l));
+    expect(blocking).toContain('⚠');
+    expect(blocking).not.toContain('warning only');
+    expect(md(r)).toMatch(/\| missing \| Copy-paste check \(warning only\) \|/);
+    // a dead-code check that blocks (a knip config) is not marked
+    const blockingDead = { ...r, coverage: r.coverage.map((c) => (c.need.id === 'dead-code' ? { ...c, need: { ...c.need, blocking: true } } : c)) };
+    const dead = term(blockingDead).split('\n').find((l) => l.includes('Dead code and unused dependencies') && /missing/.test(l));
+    expect(dead).toContain('⚠');
+    expect(dead).not.toContain('warning only');
+  });
+
+  it('report: also tools and repo-tool versions shown; fromRange marked', () => {
+    const r = planPReport();
+    // Markdown escapes `1.` (an ordered-list start) with a backslash: compare the words
+    for (const text of [tflat(r), md(r).replace(/\\/g, '')]) {
+      expect(text).toContain('actionlint 1.7.12 (rhysd/actionlint), plus zizmor 1.31.1 (zizmorcore/zizmor), actionlint and zizmor: check the workflows');
+      expect(text).toContain('your own `tsc` 7.0.2 (from your lockfile) would run here');
+      expect(text).not.toContain('version from package.json');
+    }
+    const ranged = { ...r, wouldAdd: r.wouldAdd.map((w) => (w.tool !== null && 'kind' in w.tool && w.tool.kind === 'repo-tool' ? { ...w, tool: repoTool({ fromRange: true }) } : w)) };
+    for (const text of [tflat(ranged), md(ranged).replace(/\\/g, '')]) {
+      expect(text).toContain('your own `tsc` 7.0.2 (version from package.json) would run here');
+      expect(text).not.toContain('(from your lockfile)');
+    }
+    // an own tool with no readable version names no version
+    const nov = { ...r, wouldAdd: r.wouldAdd.map((w) => (w.tool !== null && 'kind' in w.tool && w.tool.kind === 'repo-tool' ? { ...w, tool: repoTool({ version: null, tool: 'flake8' }) } : w)) };
+    expect(tflat(nov)).toContain('your own `flake8` would run here');
+    // JSON: the tool is slimmed, `also` too, with fromRange kept
+    const j = JSON.parse(json(ranged)) as { wouldAdd: { tool: Record<string, unknown> | null; also: Record<string, unknown>[] }[] };
+    const own = j.wouldAdd.find((w) => w.tool?.kind === 'repo-tool');
+    expect(own?.tool).toEqual({ kind: 'repo-tool', id: 'type-check', name: 'tsc', version: '7.0.2', fromRange: true });
+    const lint = j.wouldAdd.find((w) => w.tool?.name === 'actionlint');
+    expect(lint?.also).toEqual([{ kind: 'reviewed', id: 'zizmor', name: 'zizmor', repo: 'zizmorcore/zizmor', version: '1.31.1' }]);
+  });
+
+  it('report: skipped section lists each check with its why (terminal grouped, markdown full)', () => {
+    const r = planPReport();
+    const t = tflat(r);
+    const title = "Checks that don't apply here";
+    const section = t.slice(t.indexOf(title), t.indexOf('What pipegen would add'));
+    expect(t.indexOf(title)).toBeGreaterThan(t.indexOf('Checks by layer'));
+    // terminal: one line per reason, the checks together
+    expect(section).toContain('Format check, Test coverage minimum: no services found');
+    expect(section).toContain('Dockerfile lint (for shop-api, worker): no Dockerfile found');
+    // markdown: every check on its own line, with its services
+    const m = md(r);
+    const mdSection = m.slice(m.indexOf(`## ${title}`), m.indexOf('## What pipegen would add'));
+    expect(mdSection).toContain('- no services found');
+    expect(mdSection).toMatch(/\n {2}- Format check\n {2}- Test coverage minimum\n/);
+    expect(mdSection).toContain('  - Dockerfile lint (for shop-api, worker)');
+    // JSON: every entry
+    expect(JSON.parse(json(r)).skipped).toEqual(r.skipped);
+    // nothing skipped: no section
+    expect(term({ ...r, skipped: [] })).not.toContain(title);
+  });
+
+  it('report: wouldSet section; private repo shows the paid note and no public wording', () => {
+    const r = planPReport();
+    const heading = 'After the setup PR is merged, pipegen would turn on:';
+    const t = tflat(r);
+    expect(t).toContain(heading);
+    expect(t.indexOf(heading)).toBeGreaterThan(t.indexOf('What pipegen would add'));
+    expect(t.indexOf(heading)).toBeLessThan(t.indexOf('Costs of the full setup'));
+    expect(t).toContain('Require actions pinned to a commit: Makes GitHub refuse any action');
+    expect(t).toContain('Dependabot alerts: Tells you');
+    expect(t).toContain("Secret scanning: A paid add-on (GitHub Secret Protection); pipegen can't turn it on here.");
+    expect(md(r)).toContain(`## ${heading}`);
+    // the free private report: no public wording anywhere, the Plan P parts included
+    for (const text of [term(r), md(r), json(r)]) expect(text).not.toMatch(/public/i);
+    expect(term({ ...r, wouldSet: [] })).not.toContain(heading);
+  });
+
+  it('report: markdown snapshot with every Plan P category', async () => {
+    // one row per catalogue category (CHECKS), so a new check shows up here
+    const base = planPReport();
+    const have = new Set(base.coverage.map((c) => c.need.id));
+    const extra: Coverage[] = [];
+    for (const rule of CHECKS) {
+      if (have.has(rule.category)) continue;
+      for (const layer of rule.layers) {
+        extra.push({ need: need(layer, rule.category, rule.scope === 'service' ? 'shop-api' : undefined, rule.blocking !== false), status: layer === 'deploy' ? 'unknown' : 'partial', why: `Why ${rule.category}.` });
+      }
+    }
+    const r = { ...base, coverage: [...base.coverage, ...extra], warnings: [SWAP] };
+    for (const rule of CHECKS) expect(r.coverage.some((c) => c.need.id === rule.category), rule.category).toBe(true);
+    await expect(visible(md(r))).toMatchFileSnapshot('./__snapshots__/audit-render.plan-p.md');
+  });
+
+  it('report: hostile spec path and tool version cleaned in terminal, json and markdown', () => {
+    const r = planPReport();
+    const evilTool = repoTool({ version: `7.0.2${hostileNames.ansiColour}`, tool: `tsc${hostileNames.bidiOverride}` });
+    const evil = {
+      ...r,
+      wouldAdd: [
+        ...r.wouldAdd.filter((w) => w.tool === null || !('kind' in w.tool) || w.tool.kind !== 'repo-tool'),
+        { need: need('merge', 'api-dast', 'shop-api'), status: 'missing' as const, tool: evilTool, also: [reviewedTool('z', `acme/${hostileNames.osc8Link}`, hostileNames.bidiIsolates, ['api-dast'])],
+          note: `Schemathesis: tests the API from its spec (${hostileNames.markdownLink} ${hostileNames.nulAndCr})` },
+      ],
+      skipped: [{ why: hostileNames.htmlTag as string, categories: ['format'], services: [hostileNames.mention as string] }] as AuditReport['skipped'],
+      wouldSet: [{ setting: 'sha-pinning' as const, why: `${hostileNames.osc8Link} ${hostileNames.link}` }],
+    };
+    for (const text of [term(evil), md(evil)]) {
+      expect(text).not.toContain(ESC);
+      expect(text).not.toMatch(C1);
+      expect(text).not.toMatch(BIDI);
+      expect(text).not.toMatch(CONTROL);
+      expect(text).not.toContain('evil.example/x');
+    }
+    const m = md(evil);
+    expect(m).not.toContain('<script>');
+    expect(m).not.toMatch(/(?<!\\)\[click\]/);
+    expect(m).not.toMatch(/(?<!\u200b)@octocat/);
+    for (const s of strings(JSON.parse(json(evil)))) {
+      expect(s).not.toContain(ESC);
+      expect(s).not.toMatch(BIDI);
+      expect(s).not.toMatch(/[\u0000-\u001f\u007f]/);
+    }
+    // a token in a tool version is hidden by the one helper
+    const leak = fake.githubClassic();
+    const leaky = { ...r, wouldAdd: r.wouldAdd.map((w) => (w.tool !== null && 'kind' in w.tool && w.tool.kind === 'repo-tool' ? { ...w, tool: repoTool({ version: leak }) } : w)) };
+    for (const text of [term(leaky, { knownValues: [leak] }), md(leaky, { knownValues: [leak] }), json(leaky, { knownValues: [leak] })]) expect(text).not.toContain(leak);
+  });
+
+  it("report: what pipegen can't see names the Plan P limits", () => {
+    const all = CANT_SEE.join(' ');
+    for (const part of [
+      'JS or TS config files', 'Renovate presets', 'Repo settings',
+      'without a `permissions:` block', "deploy workflow that uses no secret and no write grant isn't seen as a release",
+      'only partly read on larger runners', 'set by third-party actions',
+      'ESLint on .vue, .svelte and .astro files is not supported yet',
+    ]) expect(all, part).toContain(part);
+    expect(all).not.toMatch(/public/i);
+    for (const text of [term(report()), md(report())]) expect(flat(text)).toContain('Renovate presets');
+  });
+});

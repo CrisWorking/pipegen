@@ -271,6 +271,23 @@ describe('choose: the reviewed list', () => {
     expect(idOf(choose('format', py, list).tool)).toBe('ruff-format');
     expect(idOf(choose('secrets', ts, list).tool)).toBe('betterleaks');
   });
+  it('choose: the real list gives the picks the rules name, "also" tools included (re-checked at Task 9)', () => {
+    const list = loadReviewed();
+    const ts = profile([svc({}, { tsconfig: true })]);
+    const py = profile([svc({ language: 'python' })]);
+    const picks: [string, RepoProfile, string, string[]][] = [
+      ['workflow-lint', ts, 'actionlint', ['zizmor']], ['workflow-pin-check', ts, 'pinact', []], ['duplication', ts, 'jscpd', []],
+      ['dead-code', ts, 'knip', []], ['dead-code', py, 'creosote', ['vulture']], ['coverage', py, 'coverage-py', []],
+      ['type-check', py, 'mypy', []], ['dependency-review', ts, 'osv-scanner', ['dependency-review-action']],
+      ['licences', ts, 'trivy-licence', []], ['egress', ts, 'bullfrog', []], ['scorecard', ts, 'scorecard-action', []],
+    ];
+    for (const [category, p, id, also] of picks) {
+      const c = choose(category, p, list);
+      expect(idOf(c.tool), `${category} ${p.services[0]?.language}`).toBe(id);
+      expect(alsoIds(c), `${category} also`).toEqual(also);
+      expect(c.unlisted).toBeUndefined();
+    }
+  });
   it('choose: CHOOSER_IDS lists every id the fixture list needs, once each', () => {
     expect(new Set(CHOOSER_IDS).size).toBe(CHOOSER_IDS.length);
     expect([...CHOOSER_IDS].sort()).toEqual(LIST.map((t) => t.id).sort());
@@ -328,9 +345,29 @@ describe('wouldSet', () => {
     expect(priv[2]?.why).not.toMatch(/public|push protection/i);
     expect(pub[0]?.why).toContain("can't see this setting with read access");
   });
+  it('wouldSet: sha-pinning names its precondition and counts the workflows that use tag pins (PS36)', () => {
+    const wfs = (...tagPinned: number[]): ExistingWorkflow[] => tagPinned.map((n, i) => ({ path: `.github/workflows/w${i}.yml`, triggers: ['push'], deploys: false, [USED]: [], jobs: ['a'], ...(n > 0 ? { tagPinned: n } : {}) }) as unknown as ExistingWorkflow);
+    const why = (workflows: ExistingWorkflow[], covered = false) =>
+      wouldSetSettings(profile([svc()], { existingWorkflows: workflows }), covered ? [{ need: needOf('workflow-pin-check'), status: 'covered', why: '' }] as never : [])[0]?.why ?? '';
+    const some = why(wfs(2, 0, 1));
+    expect(some).toContain('only after your other workflows pin their actions to a commit');
+    expect(some).toContain('Today 2 of your 3 workflows use actions pinned by tag or branch, and they would stop running');
+    expect(why(wfs(1))).toContain('Today 1 of your 1 workflow uses actions pinned by tag or branch, and it would stop running');
+    // a pin check that passes, with nothing pinned by tag: the precondition holds
+    const ok = why(wfs(0, 0), true);
+    expect(ok).toContain('Today none of your 2 workflows use tag pins (the action pin check passes today)');
+    expect(ok).not.toContain('would stop running');
+    // no workflows at all
+    expect(why([])).toContain('Today no workflow uses tag pins');
+    // the count wins over a passing pin-check row
+    expect(why(wfs(3), true)).toContain('Today 1 of your 1 workflow uses actions pinned by tag or branch');
+  });
   it('wouldSet: the sha-pinning why follows the pin check row (PS36)', () => {
     const covered = [{ need: needOf('workflow-pin-check'), status: 'covered', why: '' }] as never;
-    expect(wouldSetSettings(profile(), covered)[0]?.why).toContain('passes today');
-    expect(wouldSetSettings(profile(), [])[0]?.why).toContain('would stop running');
+    const one = [{ path: '.github/workflows/a.yml', triggers: ['push'], deploys: false, [USED]: [], jobs: ['a'] }] as unknown as ExistingWorkflow[];
+    expect(wouldSetSettings(profile([svc()], { existingWorkflows: one }), covered)[0]?.why).toContain('passes today');
+    expect(wouldSetSettings(profile([svc()], { existingWorkflows: one }), [])[0]?.why).not.toContain('passes today');
+    // Task 9: with no workflow at all nothing would stop running
+    expect(wouldSetSettings(profile(), [])[0]?.why).toContain('Today no workflow uses tag pins');
   });
 });

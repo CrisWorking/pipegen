@@ -2245,3 +2245,12 @@ describe('packageExists', () => {
     expect(Date.parse(rawFile().pinnedOn), 'pinnedOn is not in the future').toBeLessThanOrEqual(Date.now());
   });
 });
+
+describe('Task 9 (DECISIONS #104): actions/setup-python offers no Python 3.10', () => {
+  it('data: the python-version choices are 3.11 to 3.14, in the data file and in the loader policy', () => {
+    const entry = loadReviewed().find((t) => t.id === 'actions-setup-python');
+    expect(entry?.choices['python-version']).toEqual(['3.11', '3.12', '3.13', '3.14']);
+    expect(ACTION_POLICIES['actions/setup-python']?.['python-version']?.values).toEqual(['3.11', '3.12', '3.13', '3.14']);
+    // the loader's policies still pass with the shorter list (loadReviewed above did not throw)
+  });
+});

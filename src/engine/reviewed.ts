@@ -58,7 +58,9 @@ export interface ProjectScriptStep { kind: 'project-script'; needId: string; ser
  * so do the linters and checkers the repo configured itself). Not a reviewed entry: pipegen adds no pin for it.
  * `version` is null when pipegen can't read one (Python tools, or a package not in the lockfile).
  */
-export interface RepoToolStep { kind: 'repo-tool'; needId: string; service: string; tool: string; version: string | null; workingDir?: string }
+export interface RepoToolStep { kind: 'repo-tool'; needId: string; service: string; tool: string; version: string | null; workingDir?: string;
+  /** Task 9: the version is the lower bound of a package.json range, not a lockfile version. */
+  fromRange?: true }
 /** pipegen's own check (the merge gate, the deploy-time verify, the Dependabot file): nothing to pick. */
 export interface BuiltInCheck { kind: 'built-in' }
 /** What would run for a need: a reviewed tool, the service's own script, the repo's own tool, pipegen's own check, or nothing yet. */
