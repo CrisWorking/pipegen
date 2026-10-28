@@ -407,14 +407,26 @@ describe('bundle: gitleaks pass', () => {
       expect(bundleText(b), tags).not.toContain(S);
       expect(b.notes.join('\n'), tags).toMatch(/could not locate to redact/);
     }
-    // without usable lines the whole-file search stays (nothing better is known): the value is replaced everywhere
-    const noLines = makeStub(`const f = [{ RuleID: 'x', File: path.join(src, 'f000001.txt'), Match: ${JSON.stringify(S)}, ['Sec' + 'ret']: ${JSON.stringify(S)}, Tags: [] }];
-      fs.writeFileSync(report, JSON.stringify(f)); process.exit(1);`);
-    const kept = await bundleCode(dir, scanWith(betterleaksAt(noLines.bin), { priority: (p) => (p === 'src/k.ts' ? 9 : 0) }));
-    expect(kept.files.find((f) => f.path === 'src/k.ts')?.content).toBe(`export const blob = "${blob}";\nexport const sample = "${R}";\n`);
     // a Tags field that is not a list of strings is refused (the report is type-checked)
     const badTags = makeStub(decoded("'decoded:base64'"));
     await expect(bundleCode(dir, scanWith(betterleaksAt(badTags.bin)))).rejects.toBeInstanceOf(SecretScanError);
+  });
+
+  it('bundle: a finding with no or invalid line numbers leaves the whole file out (no path searches the whole file)', async () => {
+    // ruling P32: without lines pipegen can't tell which occurrence the scanner meant, so it never guesses
+    const S = 'Qm4' + 'Tz8Rw2Yv6Np1Hs5Kd9';
+    const dir = makeTempDir();
+    writeIn(dir, 'src/k.ts', `export const one = "${S}";\nexport const two = "${S}";\n`);
+    writeIn(dir, 'src/ok.ts', 'export const ok = 1;\n');
+    const lineFields = ['', 'StartLine: 2,', 'EndLine: 2,', 'StartLine: 0, EndLine: 0,', "StartLine: '2', EndLine: '2',", 'StartLine: 3, EndLine: 2,', 'StartLine: 2.5, EndLine: 2.5,', 'StartLine: 9, EndLine: 9,'];
+    for (const lines of lineFields) {
+      const stub = makeStub(`const f = [{ RuleID: 'x', File: path.join(src, 'f000001.txt'), ${lines} Match: ${JSON.stringify(S)}, ['Sec' + 'ret']: ${JSON.stringify(S)}, Tags: [] }];
+        fs.writeFileSync(report, JSON.stringify(f)); process.exit(1);`);
+      const b = await bundleCode(dir, scanWith(betterleaksAt(stub.bin), { priority: (p) => (p === 'src/k.ts' ? 9 : 0) }));
+      expect(paths(b), lines || 'no lines').toEqual(['src/ok.ts']);
+      expect(bundleText(b), lines || 'no lines').not.toContain(S);
+      expect(b.notes.join('\n'), lines || 'no lines').toMatch(/could not locate to redact/);
+    }
   });
 
   it('bundle: a clean exit (0) with findings in the report still redacts them', async () => {

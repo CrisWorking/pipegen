@@ -1397,26 +1397,23 @@ async function readReport(name: string, path: string): Promise<Finding[]> {
 }
 
 /**
- * Replaces one finding in `content`; null (the file is left out) when it cannot be located. Ruling P31 (Task 7 review
- * I1): a finding with line numbers is replaced on those lines only. When the value isn't there, or the finding is
- * decoded (base64/hex: the reported text is by definition not in the file), or it sits on pipegen's prefix, the
- * file is left out: a search of the whole file could hit an unflagged plain copy elsewhere and leave the real
- * (encoded) secret in place. Only a finding without line numbers is searched for in the whole file.
+ * Replaces one finding in `content`, on its reported lines only; null (the file is left out) when it cannot be
+ * located there. Rulings P31 and P32 (Task 7 review I1): no path searches the whole file, since a whole-file search
+ * could hit an unflagged plain copy elsewhere and leave the real (for example encoded) secret in place. So the file
+ * is left out when the finding has no or invalid line numbers, when the value isn't on its lines, when it is decoded
+ * (base64/hex: the reported text is by definition not in the file), or when it sits on pipegen's prefix. The found
+ * value is still removed from every file afterwards (secretScanPass), so a plain copy elsewhere doesn't survive.
  */
 function applyFinding(content: string, f: Finding): string | null {
   const wanted = [f.secret, f.match].filter((s) => s !== '');
   if (wanted.length === 0 || f.decoded || f.onPrefix) return null;
   const lines = content.split('\n');
   const { startLine: s, endLine: e } = f;
-  if (s !== undefined && e !== undefined) {
-    if (!(s <= e && e <= lines.length)) return null;
-    const seg = lines.slice(s - 1, e).join('\n');
-    for (const w of wanted) {
-      if (seg.includes(w)) return [...lines.slice(0, s - 1), seg.split(w).join(R), ...lines.slice(e)].join('\n');
-    }
-    return null;
+  if (s === undefined || e === undefined || !(s <= e && e <= lines.length)) return null;
+  const seg = lines.slice(s - 1, e).join('\n');
+  for (const w of wanted) {
+    if (seg.includes(w)) return [...lines.slice(0, s - 1), seg.split(w).join(R), ...lines.slice(e)].join('\n');
   }
-  for (const w of wanted) if (content.includes(w)) return content.split(w).join(R);
   return null;
 }
 
