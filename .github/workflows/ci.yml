@@ -39,6 +39,10 @@ jobs:
         run: npx vitest run test/gitleaks-live.test.ts
         env:
           PIPEGEN_LIVE_TESTS: '1'
+      - name: Live test that a file either scanner skips never reaches the AI unscanned (ruling P34, both pinned scanners)
+        run: npx vitest run test/secret-scan-skip-live.test.ts
+        env:
+          PIPEGEN_LIVE_TESTS: '1'
       # The reviewed list's signature checks, re-verified with the pinned cosign (an edited keySha256 or identity still
       # loads offline; only this catches it).
       - name: Live test of the reviewed list's cosign checks (downloads the pinned cosign and the signed release files)

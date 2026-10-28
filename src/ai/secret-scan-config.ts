@@ -63,3 +63,30 @@ export function secretScanArgv(name: SecretScannerName, dir: string, config: str
   }
   return argv;
 }
+
+/**
+ * Ruling P34 (belt): the folder-level patterns of the default config's global path allowlist (betterleaks 1.9.0 and
+ * gitleaks 8.30.1, inherited through `[extend] useDefault = true`). Both scanners match it against the absolute path of
+ * each file they walk and skip a match with a clean exit, so a temp folder under node_modules/ (a TMPDIR some tool
+ * setups use) would hide every file from the scan. The other default patterns are anchored to the end of a file name
+ * (extensions, lockfiles, go.mod, …) and never match the neutral names pipegen writes (f000001.txt, paths.txt). The real
+ * guarantee is the per-file canary in redact.ts; this check only gives a clear error for the known cause.
+ */
+const DEFAULT_SKIPPED_PATHS: readonly RegExp[] = [
+  /gitleaks\.toml/,
+  /(?:^|\/)vendor\/(?:github\.com|golang\.org\/x|google\.golang\.org|gopkg\.in|istio\.io|k8s\.io|sigs\.k8s\.io)(?:\/.*)?$/,
+  /(?:^|\/)node_modules(?:\/.*)?$/,
+  /(?:^|\/)bower_components(?:\/.*)?$/,
+  /(?:^|\/)(?:v?env|virtualenv)\/lib(?:64)?(?:\/.*)?$/i,
+  /(?:^|\/)(?:lib(?:64)?\/python[23](?:\.\d{1,2})+|python\/[23](?:\.\d{1,2})+\/lib(?:64)?)(?:\/.*)?$/i,
+  /(?:^|\/)[a-z0-9_.]+-[0-9.]+\.dist-info(?:\/.+)?$/i,
+  /(?:^|\/)vendor\/(?:bundle|ruby)(?:\/.*?)?$/,
+  /verification-metadata\.xml/,
+  /Database.refactorlog/,
+];
+
+/** True when the scanners' default path allowlist would skip the file at absolute `path` (\ read as /). */
+export function skippedByDefaultPaths(path: string): boolean {
+  const p = path.replaceAll('\\', '/');
+  return DEFAULT_SKIPPED_PATHS.some((re) => re.test(p));
+}

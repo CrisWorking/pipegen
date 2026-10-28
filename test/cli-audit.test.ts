@@ -465,7 +465,7 @@ describe('pipegen audit (brief)', () => {
   it('bundle: scanner exit code other than clean/found → no AI call, note names the gitleaks fallback', async () => {
     for (const code of [2, 126, 255]) {
       const dir = repo();
-      const s = aiSetup(undefined, undefined, `fs.writeFileSync(report, '[]'); process.exit(${code});`);
+      const s = aiSetup(undefined, undefined, `writeReport('[]'); process.exit(${code});`);
       const r = await audit(['audit', '--ai'], { cwd: dir, env: s.env, prompt: prompter(true) });
       expect(r.code, String(code)).toBe(0); // the plain audit is still reported
       expect(s.ai.complete, String(code)).not.toHaveBeenCalled();

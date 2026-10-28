@@ -1,4 +1,5 @@
 import { execFile, type ChildProcess, type ExecFileException } from 'node:child_process';
+import { randomBytes } from 'node:crypto';
 import { rmSync } from 'node:fs';
 import { chmod, lstat, mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -6,7 +7,7 @@ import { isAbsolute, join, relative, resolve, sep } from 'node:path';
 import picomatch from 'picomatch';
 import { IGNORED_DIRS, MAX_FILES_TEXT, listFiles, readTextLimitedWithReason, regexSafe, type Skipped } from '../read/limits.js';
 import { safeText } from '../util/safe-text.js';
-import { SECRET_SCAN_EXIT, SecretScanError, secretScanArgv, secretScanConfigPath, type SecretScanner } from './secret-scan-config.js';
+import { SECRET_SCAN_EXIT, SecretScanError, secretScanArgv, secretScanConfigPath, skippedByDefaultPaths, type SecretScanner } from './secret-scan-config.js';
 
 export { isBinary } from '../read/limits.js';
 export {
@@ -1286,9 +1287,10 @@ export async function bundleCode(dir: string, opts: BundleOptions = {}): Promise
 /**
  * One reported finding, lines already mapped to the content (see SCAN_PREFIX). `decoded`: the scanner found it in a
  * decoded form (a `decoded:*` tag, base64 or hex), so the reported text is not in the file. `onPrefix`: it was
- * reported on pipegen's own empty first line, so it can't be placed.
+ * reported on pipegen's own empty first line, so it can't be placed. `rule`: the RuleID ('' when absent), used only to
+ * tell pipegen's canary findings (P34) apart.
  */
-interface Finding { file: string; startLine?: number; endLine?: number; secret: string; match: string; decoded: boolean; onPrefix: boolean }
+interface Finding { file: string; rule: string; startLine?: number; endLine?: number; secret: string; match: string; decoded: boolean; onPrefix: boolean }
 
 /**
  * Ruling P30 (Task 7 review C1): both pinned scanners sniff a file's first bytes and silently skip one that looks like
@@ -1310,6 +1312,19 @@ function scannersWouldSkip(written: string): boolean {
   const buf = Buffer.from(written, 'utf8');
   return LATE_MAGIC.some(([at, magic]) => buf.subarray(at, at + magic.length).toString('latin1') === magic);
 }
+
+/**
+ * Ruling P34 (final review I2): a scanner can skip a file and still exit clean, and the causes keep coming (magic bytes
+ * at offset 0 (P30) or later (R1), and a scan path under node_modules/ that the default path allowlist matches). So
+ * pipegen ends every scanned file, and paths.txt, with one line holding a fresh random canary that data/gitleaks-bundle.toml's
+ * `pipegen-canary` rule reports, and accepts a file only when that file's own canary came back reported against it,
+ * exactly once. The canary goes AFTER the content, behind a blank line (so it never joins the content's last line), so
+ * the reported lines of real findings don't move. Canary findings are removed before any real finding is applied.
+ */
+const CANARY_RULE = 'pipegen-canary';
+const newCanary = () => `${CANARY_RULE}-${randomBytes(16).toString('hex')}`;
+/** A file as the scanner sees it: the prefix, the content, a blank line, the canary on its own line. */
+const asScanned = (content: string, canary: string) => `${SCAN_PREFIX}${content}${content === '' || content.endsWith('\n') ? '' : '\n'}\n${canary}\n`;
 
 /** Maps a finding's lines from the file as written to its content; a finding on the prefix can't be placed. */
 function unprefixed(f: Finding): Finding {
@@ -1397,6 +1412,7 @@ async function readReport(name: string, path: string): Promise<Finding[]> {
     const tags = Array.isArray(o.Tags) ? (o.Tags as string[]) : [];
     return {
       file: o.File,
+      rule: typeof o.RuleID === 'string' ? o.RuleID : '',
       startLine: intOrUndefined(o.StartLine),
       endLine: intOrUndefined(o.EndLine),
       secret: typeof o.Secret === 'string' ? o.Secret : '',
@@ -1464,6 +1480,8 @@ const MIN_GLOBAL_SECRET = 6;
  * in all its forms, so a secret reported on one line cannot survive on another line or in another file.
  * The bundle paths are scanned too (paths.txt, one per line, as bundleText shows them); a file whose path
  * the scanner flags, or whose path holds a found secret, is left out. Found secrets are added to `flagged`.
+ * Ruling P34: every scanned file and paths.txt carry a canary. A file whose canary did not come back is left out; a
+ * scan that does not confirm paths.txt, or confirms none of the files, throws SecretScanError (it may have read nothing).
  */
 async function secretScanPass(files: FileEntry[], scanner: SecretScanner, timeoutMs: number, known: string[], flagged: { long: string[]; short: string[] }, notes: Notes, show: (p: string) => string): Promise<FileEntry[]> {
   // An absolute path only: a bare name would be looked up on PATH.
@@ -1475,10 +1493,15 @@ async function secretScanPass(files: FileEntry[], scanner: SecretScanner, timeou
   } catch (e) {
     throw new SecretScanError(e instanceof Error ? e.message : `pipegen's ${name} config could not be found.`);
   }
-  const sniffed = files.filter((f) => scannersWouldSkip(SCAN_PREFIX + neutralizeAllow(f.content)));
+  const canaried = files.map((f) => {
+    const content = neutralizeAllow(f.content);
+    const canary = newCanary();
+    return { path: f.path, content, canary, written: asScanned(content, canary) };
+  });
+  const sniffed = canaried.filter((f) => scannersWouldSkip(f.written));
   notes.addPaths('Left out because the secret scanners skip files shaped like this (a binary-format marker at a fixed byte):', sniffed.map((f) => f.path), show);
-  files = files.filter((f) => !sniffed.includes(f));
-  const scanned = files.map((f) => ({ path: f.path, content: neutralizeAllow(f.content) }));
+  const kept = canaried.filter((f) => !sniffed.includes(f));
+  const scanned: FileEntry[] = kept.map((f) => ({ path: f.path, content: f.content }));
   const shownPaths = scanned.map((f) => displayPath(f.path));
   const made = await mkdtemp(join(tmpdir(), 'pipegen-secret-scan-'));
   const guard = guardTempDir(made);
@@ -1487,17 +1510,45 @@ async function secretScanPass(files: FileEntry[], scanner: SecretScanner, timeou
     await chmod(tmp, 0o700);
     // Neutral names: no repo file name (.gitleaksignore, .gitleaks.toml, allowlisted paths) reaches the scanner.
     const names = scanned.map((_, i) => `f${String(i + 1).padStart(6, '0')}.txt`);
-    for (let i = 0; i < scanned.length; i++) await writeFile(join(tmp, names[i]), SCAN_PREFIX + scanned[i].content, { flag: 'wx', mode: 0o600 });
-    const pathsText = SCAN_PREFIX + neutralizeAllow(shownPaths.join('\n'));
+    // P34 belt: the default path allowlist matches the absolute path, so a temp folder under node_modules/ (or another
+    // folder it lists) would hide every file. Refused before anything is written; the canaries below are the guarantee.
+    if ([...names, PATHS_FILE].some((n) => skippedByDefaultPaths(join(tmp, n)))) {
+      throw new SecretScanError(`The secret scan's temp folder ${safeText(tmp)} is under a folder the ${name} scanner skips (such as node_modules); set TMPDIR to another folder and run again. Nothing was sent.`);
+    }
+    for (let i = 0; i < scanned.length; i++) await writeFile(join(tmp, names[i]), kept[i].written, { flag: 'wx', mode: 0o600 });
+    const pathsCanary = newCanary();
+    const pathsText = asScanned(neutralizeAllow(shownPaths.join('\n')), pathsCanary);
     // R1 for the paths too: the scanners would skip paths.txt, and so never check the file names. Fail closed.
     if (scannersWouldSkip(pathsText)) throw new SecretScanError(`The bundle's file list has a binary-format marker at a byte the ${name} scanner sniffs, so it would not be scanned; nothing was sent.`);
     await writeFile(join(tmp, PATHS_FILE), pathsText, { flag: 'wx', mode: 0o600 });
     const reportPath = join(tmp, 'report.json');
     const code = await runScanner(name, bin, secretScanArgv(name, tmp, config, reportPath), tmp, timeoutMs, (c) => { guard.child = c; });
     if (code !== SECRET_SCAN_EXIT.clean && code !== SECRET_SCAN_EXIT.found) throw new SecretScanError(`${name} failed (exit code ${code}).`);
-    const findings = (await readReport(name, reportPath)).map(unprefixed);
+    const reported = (await readReport(name, reportPath)).map(unprefixed);
     // "found" with nothing listed is a scan that went wrong (betterleaks exits 1 on a config error, with no report)
-    if (code === SECRET_SCAN_EXIT.found && findings.length === 0) throw new SecretScanError(`${name} reported findings but listed none.`);
+    if (code === SECRET_SCAN_EXIT.found && reported.length === 0) throw new SecretScanError(`${name} reported findings but listed none.`);
+
+    const relOf = (file: string) => {
+      const abs = isAbsolute(file) ? resolve(file) : resolve(tmp, file);
+      return insideDir(tmp, abs) ? relative(tmp, abs) : undefined;
+    };
+    // P34: take the canary findings out. One counts only when its token is the one written to the file it is reported
+    // against; a canary-rule finding with any other text (canary-shaped text in a repo file) is not a secret, and dropped.
+    const canaryOf = new Map<string, string>([...names.map((n, i): [string, string] => [n, kept[i].canary]), [PATHS_FILE, pathsCanary]]);
+    const confirmed = new Map<string, number>();
+    const findings: Finding[] = [];
+    for (const f of reported) {
+      if (f.rule !== CANARY_RULE) {
+        findings.push(f);
+        continue;
+      }
+      const rel = relOf(f.file);
+      if (rel !== undefined && canaryOf.has(rel) && f.secret === canaryOf.get(rel)) confirmed.set(rel, (confirmed.get(rel) ?? 0) + 1);
+    }
+    const read = (n: string) => confirmed.get(n) === 1;
+    if (!read(PATHS_FILE)) throw new SecretScanError(`${name} did not confirm it read the bundle's file list, so the file names may not have been checked; nothing was sent.`);
+    const unread = new Set(names.flatMap((n, i) => (read(n) ? [] : [i])));
+    if (scanned.length > 0 && unread.size === scanned.length) throw new SecretScanError(`${name} did not confirm it read the bundle's files, so they may not have been checked; nothing was sent.`);
 
     const index = new Map(names.map((n, i) => [n, i]));
     const perFile = new Map<number, Finding[]>();
@@ -1515,8 +1566,7 @@ async function secretScanPass(files: FileEntry[], scanner: SecretScanner, timeou
       const short = found.length < MIN_GLOBAL_SECRET;
       if (found.trim() !== '' && found !== R) (short ? shortSecrets : secrets).add(found);
       const texts = [f.secret, f.match].filter((t) => t.length >= MIN_GLOBAL_SECRET);
-      const abs = isAbsolute(f.file) ? resolve(f.file) : resolve(tmp, f.file);
-      const rel = insideDir(tmp, abs) ? relative(tmp, abs) : undefined;
+      const rel = relOf(f.file);
       if (rel === PATHS_FILE) {
         // A finding in a file name: leave out the files on the reported lines, and any whose path holds the text.
         const { startLine: s, endLine: e } = f;
@@ -1581,6 +1631,7 @@ async function secretScanPass(files: FileEntry[], scanner: SecretScanner, timeou
 
     const pathsOf = (set: Set<number>) => [...set].sort((a, b) => a - b).map((i) => scanned[i].path);
     notes.add(`${name} checked the bundle: ${plural(redacted, 'finding', 'findings')} redacted.`);
+    notes.addPaths(`Left out because ${name} did not confirm it read them:`, pathsOf(unread), show);
     notes.addPaths(`Left out because ${name} found something pipegen could not locate to redact:`, pathsOf(drop), show);
     notes.addPaths('Left out because a found secret was still in them after redaction:', pathsOf(leftover), show);
     if (shortHit.size > 0) notes.add(`Left out ${plural(shortHit.size, 'file', 'files')} where ${name} found a short value (under ${MIN_GLOBAL_SECRET} characters); elsewhere it is removed only where it stands as a whole word.`);
@@ -1589,7 +1640,7 @@ async function secretScanPass(files: FileEntry[], scanner: SecretScanner, timeou
       notes.add(`Ignored ${plural(strays, `${name} finding`, `${name} findings`)} for a file outside the scanned folder.`);
       notes.addPaths(`Left out because a ${name} finding outside the scanned folder may relate to them:`, pathsOf(unplaced), show);
     }
-    return scanned.filter((_, i) => !drop.has(i) && !unplaced.has(i) && !leftover.has(i) && !badPath.has(i) && !shortHit.has(i));
+    return scanned.filter((_, i) => !unread.has(i) && !drop.has(i) && !unplaced.has(i) && !leftover.has(i) && !badPath.has(i) && !shortHit.has(i));
   } finally {
     // every way out (a result, any error): the copies and the raw report go; the signal hooks go after
     try {

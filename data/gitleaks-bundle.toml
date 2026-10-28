@@ -27,3 +27,14 @@ secretGroup = 1
 id = "pipegen-sk-key"
 description = "API key of the sk- form"
 regex = '''sk-[A-Za-z0-9_-]{20,}'''
+
+# Ruling P34: pipegen's scan marker. Before each scan, redact.ts ends every scanned file (and paths.txt) with one line
+# holding a fresh random `pipegen-canary-<32 hex>` token, and accepts a file only when this rule reported that file's
+# own token, exactly once. A file the scanner skipped without saying so (a path on the default allowlist, a format it
+# sniffs, a size limit, …) is then left out, and a scan that read none of them stops the AI call. Not a secret: these
+# findings are removed before any real finding is applied.
+[[rules]]
+id = "pipegen-canary"
+description = "pipegen scan marker (proves the file was read)"
+regex = '''pipegen-canary-[0-9a-f]{32}'''
+keywords = ["pipegen-canary-"]

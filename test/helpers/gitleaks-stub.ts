@@ -36,14 +36,40 @@ function findingsFor(value, match, tags) {
   }
   return out;
 }
+// Ruling P34: pipegen ends every scanned file (and paths.txt) with a line holding its own random canary, and the real
+// scanners report each one under pipegen's \`pipegen-canary\` rule. canaryFindings() lists them the same way. writeReport()
+// writes the report with every canary added (when it is a JSON array), so a body only lists its real findings; a body
+// sets \`canary = 'none'\` to add none (then it may write its own, e.g. from canaryFindings()).
+let canary = 'each';
+function canaryFindings() {
+  const out = [];
+  for (const [f, text] of Object.entries(files)) {
+    text.split('\\n').forEach((l, i) => {
+      const m = /pipegen-canary-[0-9a-f]{32}/.exec(l);
+      if (!m) return;
+      const file = path.join(src, f);
+      out.push({ RuleID: 'pipegen-canary', File: file, StartLine: i + 1, EndLine: i + 1, Match: m[0], ['Sec' + 'ret']: m[0], Tags: [], Fingerprint: file + ':pipegen-canary:' + (i + 1) });
+    });
+  }
+  return out;
+}
+function writeReport(data) {
+  let out = data;
+  if (canary === 'each') {
+    let list = null;
+    try { list = JSON.parse(data); } catch {}
+    if (Array.isArray(list)) out = JSON.stringify([...list, ...canaryFindings()]);
+  }
+  fs.writeFileSync(report, out);
+}
 ${body}
 `);
   chmodSync(bin, 0o755);
   return { bin, record: () => JSON.parse(readFileSync(rec, 'utf8')) as StubRecord };
 }
 
-/** Stub body: an empty report, exit 0 (gitleaks found nothing). */
-export const CLEAN = `fs.writeFileSync(report, '[]'); process.exit(0);`;
+/** Stub body: nothing found but pipegen's canaries, exit 1 (the "found" code, as the real scanners exit then). */
+export const CLEAN = `writeReport('[]'); process.exit(1);`;
 
 /** A gitleaks scanner for bundleCode (a stub, or the real pinned one). */
 export function gitleaksAt(path: string, version = '8.30.1'): SecretScanner {

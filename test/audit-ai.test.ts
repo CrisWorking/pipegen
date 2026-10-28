@@ -757,7 +757,7 @@ describe('consent token (T4b: no AI call without consent, by type)', () => {
     const files: Record<string, string> = {};
     for (let i = 0; i < 80; i++) files[`src/f${String(i).padStart(2, '0')}.js`] = `// file ${i}\n${'export const v = 1;\n'.repeat(150)}${i === 0 ? 'const q = "zZ9";\n' : ''}`;
     const s = await setup({ files });
-    const flagShort = makeStub(`fs.writeFileSync(report, JSON.stringify(findingsFor('zZ9'))); process.exit(1);`);
+    const flagShort = makeStub(`writeReport(JSON.stringify(findingsFor('zZ9'))); process.exit(1);`);
     Object.assign(s.deps, ensureWith(vi.fn(async () => gitleaksAt(flagShort.bin))));
     const counted = s.deps.consent.terms.files as CountingSummary;
     // the repro is real: without the counted list, the checked bundle takes in a file that wasn't counted

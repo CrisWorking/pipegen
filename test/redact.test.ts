@@ -9,6 +9,7 @@ import {
   bundleCode, bundleText, EXCLUDED_PATTERNS, SecretScanError, SecretScanRequiredError, secretScanArgv, secretScanConfigPath,
   isBinary, redact, scrubKnownValues, type CodeBundle,
 } from '../src/ai/redact.js';
+import { skippedByDefaultPaths } from '../src/ai/secret-scan-config.js';
 import { isBinary as limitsIsBinary } from '../src/read/limits.js';
 import { BETTERLEAKS_FORBIDDEN_FLAGS, BETTERLEAKS_SUBCOMMANDS } from '../src/engine/tool-flags.js';
 import { betterleaksAt, CHECKED_KEY, CLEAN, gitleaksAt, makeStub, scanWith } from './helpers/gitleaks-stub.js';
@@ -20,7 +21,7 @@ const R = '[REDACTED]';
 
 afterEach(() => cleanupRepos());
 
-const reportValue = (value: string) => `const f = findingsFor(${JSON.stringify(value)}); fs.writeFileSync(report, JSON.stringify(f)); process.exit(f.length ? 1 : 0);`;
+const reportValue = (value: string) => `const f = findingsFor(${JSON.stringify(value)}); writeReport(JSON.stringify(f)); process.exit(f.length ? 1 : 0);`;
 
 // Byte length of bundleText(b), computed independently (works for count-only bundles too).
 const textBytes = (b: CodeBundle) => Buffer.byteLength('<code-bundle>\n</code-bundle>')
@@ -282,9 +283,11 @@ describe('bundle: gitleaks pass', () => {
     const scannedNames = Object.keys(rec.files).filter((f) => f !== 'paths.txt');
     expect(scannedNames.every((f) => /^f\d+\.txt$/.test(f))).toBe(true);
     expect(scannedNames).toHaveLength(b.files.length);
-    // each written after one leading newline (ruling P30: no binary-format magic at offset 0)
-    expect(scannedNames.map((f) => rec.files[f]).sort()).toEqual(b.files.map((f) => `\n${f.content}`).sort());
-    expect(rec.files['paths.txt'].split('\n').slice(1).sort()).toEqual(paths(b));
+    // each written after one leading newline (ruling P30: no binary-format magic at offset 0), and ending with a blank
+    // line and its canary (ruling P34)
+    const unCanaried = (t: string) => t.replace(/\n\npipegen-canary-[0-9a-f]{32}\n$/, '');
+    expect(scannedNames.map((f) => unCanaried(rec.files[f])).sort()).toEqual(b.files.map((f) => `\n${f.content.replace(/\n$/, '')}`).sort());
+    expect(unCanaried(rec.files['paths.txt']).split('\n').slice(1).sort()).toEqual(paths(b));
     // what gitleaks scanned was already redacted
     const scanned = Object.values(rec.files).join('\n');
     for (const v of values) expect(scanned).not.toContain(v);
@@ -340,7 +343,7 @@ describe('bundle: gitleaks pass', () => {
       const scanned = Object.values(rec.files).join('\n'); // the files and paths.txt
       expect(scanned.toLowerCase(), at.name).not.toContain(gl);
       expect(scanned.toLowerCase(), at.name).not.toContain(bl);
-      expect(rec.files['paths.txt'].split('\n').length, at.name).toBe(4); // the leading newline, then 3 paths
+      expect(rec.files['paths.txt'].split('\n').length, at.name).toBe(7); // the leading newline, 3 paths, a blank line, the canary, ''
       expect(b.files.map((f) => f.content).join('\n').toLowerCase(), at.name).not.toMatch(/(?:gitleaks|betterleaks):allow/);
     }
   });
@@ -350,8 +353,8 @@ describe('bundle: gitleaks pass', () => {
     writeIn(dir, 'src/a.ts', 'export const a = 1;\n');
     for (const at of [betterleaksAt, gitleaksAt]) {
       await expect(bundleCode(dir, scanWith(at(makeStub('process.exit(1);').bin))), at.name).rejects.toThrow(/wrote no report/);
-      await expect(bundleCode(dir, scanWith(at(makeStub(`fs.writeFileSync(report, '[]'); process.exit(1);`).bin))), at.name).rejects.toThrow(/reported findings but listed none/);
-      await expect(bundleCode(dir, scanWith(at(makeStub(`fs.writeFileSync(report, '[]'); process.exit(2);`).bin))), at.name).rejects.toBeInstanceOf(SecretScanError);
+      await expect(bundleCode(dir, scanWith(at(makeStub(`canary = 'none'; writeReport('[]'); process.exit(1);`).bin))), at.name).rejects.toThrow(/reported findings but listed none/);
+      await expect(bundleCode(dir, scanWith(at(makeStub(`writeReport('[]'); process.exit(2);`).bin))), at.name).rejects.toBeInstanceOf(SecretScanError);
     }
   });
 
@@ -414,7 +417,7 @@ describe('bundle: gitleaks pass', () => {
     writeIn(dir, 'src/a.ts', `const a = '${found}';\n`);
     writeIn(dir, 'src/b.ts', 'const b = 2;\n');
     // line 1 is pipegen's empty prefix: a finding there can't be mapped to the content
-    const stub = makeStub(`const f = findingsFor(${JSON.stringify(found)}).map((x) => ({ ...x, StartLine: 1, EndLine: 1 })); fs.writeFileSync(report, JSON.stringify(f)); process.exit(1);`);
+    const stub = makeStub(`const f = findingsFor(${JSON.stringify(found)}).map((x) => ({ ...x, StartLine: 1, EndLine: 1 })); writeReport(JSON.stringify(f)); process.exit(1);`);
     const b = await bundleCode(dir, scanWith(betterleaksAt(stub.bin)));
     expect(paths(b)).toEqual(['src/b.ts']);
     expect(b.notes.join('\n')).toMatch(/could not locate to redact/);
@@ -429,7 +432,7 @@ describe('bundle: gitleaks pass', () => {
     writeIn(dir, 'src/k.ts', `export const blob = "${blob}";\nexport const sample = "${S}";\n`);
     writeIn(dir, 'src/ok.ts', 'export const ok = 1;\n');
     const decoded = (tags: string) => `const f = [{ RuleID: 'generic-api-key', File: path.join(src, 'f000001.txt'), StartLine: 2, EndLine: 2, Match: ${JSON.stringify(S)}, ['Sec' + 'ret']: ${JSON.stringify(S)}, Tags: ${tags}, Fingerprint: 'x' }];
-      fs.writeFileSync(report, JSON.stringify(f)); process.exit(1);`;
+      writeReport(JSON.stringify(f)); process.exit(1);`;
     for (const tags of ["['decoded:base64', 'decode-depth:1']", "['decoded:hex']", '[]']) {
       const stub = makeStub(decoded(tags));
       const b = await bundleCode(dir, scanWith(betterleaksAt(stub.bin), { priority: (p) => (p === 'src/k.ts' ? 9 : 0) }));
@@ -452,7 +455,7 @@ describe('bundle: gitleaks pass', () => {
     const lineFields = ['', 'StartLine: 2,', 'EndLine: 2,', 'StartLine: 0, EndLine: 0,', "StartLine: '2', EndLine: '2',", 'StartLine: 3, EndLine: 2,', 'StartLine: 2.5, EndLine: 2.5,', 'StartLine: 9, EndLine: 9,'];
     for (const lines of lineFields) {
       const stub = makeStub(`const f = [{ RuleID: 'x', File: path.join(src, 'f000001.txt'), ${lines} Match: ${JSON.stringify(S)}, ['Sec' + 'ret']: ${JSON.stringify(S)}, Tags: [] }];
-        fs.writeFileSync(report, JSON.stringify(f)); process.exit(1);`);
+        writeReport(JSON.stringify(f)); process.exit(1);`);
       const b = await bundleCode(dir, scanWith(betterleaksAt(stub.bin), { priority: (p) => (p === 'src/k.ts' ? 9 : 0) }));
       expect(paths(b), lines || 'no lines').toEqual(['src/ok.ts']);
       expect(bundleText(b), lines || 'no lines').not.toContain(S);
@@ -465,7 +468,7 @@ describe('bundle: gitleaks pass', () => {
     const dir = makeTempDir();
     writeIn(dir, 'src/a.ts', `const a = '${found}';\n`);
     for (const at of [betterleaksAt, gitleaksAt]) {
-      const stub = makeStub(`fs.writeFileSync(report, JSON.stringify(findingsFor(${JSON.stringify(found)}))); process.exit(0);`);
+      const stub = makeStub(`writeReport(JSON.stringify(findingsFor(${JSON.stringify(found)}))); process.exit(0);`);
       const b = await bundleCode(dir, scanWith(at(stub.bin)));
       expect(b.files.find((f) => f.path === 'src/a.ts')?.content, at.name).toBe(`const a = '${R}';\n`);
       expect(bundleText(b), at.name).not.toContain(found);
@@ -486,7 +489,7 @@ describe('bundle: gitleaks pass', () => {
       const tmp = makeTempDir(); // the probe's TMPDIR: only its own temp folders land here
       const started = join(makeTempDir(), 'started');
       // the stub writes a report (so the folder holds one), says it started, then waits far past the test
-      const stub = makeStub(`fs.writeFileSync(report, '[]'); fs.writeFileSync(${JSON.stringify(started)}, 'x'); setTimeout(() => process.exit(0), 15000);`);
+      const stub = makeStub(`writeReport('[]'); fs.writeFileSync(${JSON.stringify(started)}, 'x'); setTimeout(() => process.exit(0), 15000);`);
       const child = spawn('node', [probe, repo, stub.bin], { env: { PATH: process.env.PATH ?? '', HOME: process.env.HOME ?? '', TMPDIR: tmp }, stdio: 'ignore' });
       const exited = new Promise<NodeJS.Signals | null>((done) => child.on('exit', (_code, signal) => done(signal)));
       for (let i = 0; i < 200 && !existsSync(started); i++) await new Promise((r) => setTimeout(r, 50));
@@ -512,7 +515,7 @@ describe('bundle: gitleaks pass', () => {
     writeIn(dir, 'src/b.ts', `const c = '${lost}';\n`);
     const stub2 = makeStub(`
       const f = findingsFor(${JSON.stringify(lost)}).map((x) => ({ ...x, ['Sec' + 'ret']: 'not-in-the-file', Match: 'nope' }));
-      fs.writeFileSync(report, JSON.stringify(f)); process.exit(1);`);
+      writeReport(JSON.stringify(f)); process.exit(1);`);
     const b2 = await bundleCode(dir, scanWith(gitleaksAt(stub2.bin)));
     expect(paths(b2)).toEqual(['src/a.ts']);
     expect(allText(b2)).not.toContain(lost);
@@ -541,9 +544,9 @@ describe('bundle: gitleaks pass', () => {
       `process.exit(3);`,
       `process.kill(process.pid, 'SIGKILL');`,
       `process.exit(1);`, // leaks reported but no report file
-      `fs.writeFileSync(report, '{"not":"an array"}'); process.exit(1);`,
-      `fs.writeFileSync(report, 'not json'); process.exit(1);`,
-      `fs.writeFileSync(report, '[{"File": 7}]'); process.exit(1);`,
+      `writeReport('{"not":"an array"}'); process.exit(1);`,
+      `writeReport('not json'); process.exit(1);`,
+      `writeReport('[{"File": 7}]'); process.exit(1);`,
       `process.exit(0);`, // clean exit but no report
     ]) {
       const stub = makeStub(body);
@@ -560,7 +563,7 @@ describe('bundle: gitleaks pass', () => {
     writeIn(dir, 'src/b.ts', 'const b = 2;\n');
     const stub = makeStub(`
       const f = findingsFor(${JSON.stringify(v)}).map((x) => ({ ...x, File: src + '/../' + path.basename(x.File) }));
-      fs.writeFileSync(report, JSON.stringify(f)); process.exit(1);`);
+      writeReport(JSON.stringify(f)); process.exit(1);`);
     const b = await bundleCode(dir, scanWith(gitleaksAt(stub.bin)));
     expect(paths(b)).toEqual(['src/b.ts']);
     expect(allText(b)).not.toContain(v);
@@ -625,6 +628,165 @@ describe('bundle: gitleaks pass', () => {
     }
     const packed = JSON.parse(raw) as { files: { path: string }[] }[];
     expect(packed[0].files.map((f) => f.path)).toContain('data/gitleaks-bundle.toml');
+  });
+});
+
+describe('bundle: scan canaries (ruling P34)', () => {
+  // A scanner can skip a file and still exit clean (a path on its default allowlist, a format it sniffs, …). pipegen
+  // ends every scanned file and paths.txt with a line holding a random canary that its `pipegen-canary` rule reports,
+  // and accepts a file only when its own canary came back from it, exactly once.
+  const CANARY = /pipegen-canary-[0-9a-f]{32}/g;
+  const canaryRepo = () => {
+    const dir = makeTempDir();
+    writeIn(dir, 'src/a.ts', 'export const a = 1;\n');
+    writeIn(dir, 'src/b.ts', 'export const b = 2;'); // no trailing newline
+    writeIn(dir, 'src/c.ts', 'export const c = 3;\n');
+    return dir;
+  };
+  // the scanned file name that holds `text` (from the stub's record)
+  const nameOf = (files: Record<string, string>, text: string) => Object.keys(files).find((n) => n !== 'paths.txt' && files[n].includes(text)) as string;
+
+  it('every scanned file and paths.txt end with their own canary line, after the content; none reaches the bundle or its notes', async () => {
+    const dir = canaryRepo();
+    for (const at of [betterleaksAt, gitleaksAt]) {
+      const stub = makeStub(CLEAN);
+      const b = await bundleCode(dir, scanWith(at(stub.bin)));
+      const rec = stub.record();
+      const marks = Object.values(rec.files).map((t) => t.match(CANARY) ?? []);
+      expect(marks.every((t) => t.length === 1), at.name).toBe(true);
+      expect(new Set(marks.flat()).size, at.name).toBe(Object.keys(rec.files).length); // unique per file
+      for (const [name, text] of Object.entries(rec.files)) {
+        // the prefix, the content as it was, one blank line, then the canary on a line of its own
+        expect(text, `${at.name} ${name}`).toMatch(/^\n[\s\S]*\n\npipegen-canary-[0-9a-f]{32}\n$/);
+      }
+      expect(rec.files[nameOf(rec.files, 'const b')], at.name).toMatch(/^\nexport const b = 2;\n\npipegen-canary-[0-9a-f]{32}\n$/);
+      expect(paths(b), at.name).toEqual(['src/a.ts', 'src/b.ts', 'src/c.ts']);
+      expect(b.files.find((f) => f.path === 'src/b.ts')?.content, at.name).toBe('export const b = 2;');
+      expect(bundleText(b), at.name).not.toContain('pipegen-canary');
+      expect(b.notes.join('\n'), at.name).not.toContain('pipegen-canary');
+      expect(b.notes.join('\n'), at.name).toContain(`${at('/x').name} checked the bundle: 0 findings redacted.`);
+    }
+  });
+
+  it('a real finding keeps its line numbers (the canary goes after the content), on a file with and without a final newline', async () => {
+    const found = 'plain' + '-looking-' + 'value-4409';
+    const dir = makeTempDir();
+    writeIn(dir, 'src/a.ts', `const a = 1;\nconst b = '${found}';\nconst c = 3;\n`);
+    writeIn(dir, 'src/z.ts', `const y = 1;\nconst z = '${found}';`);
+    for (const at of [betterleaksAt, gitleaksAt]) {
+      const b = await bundleCode(dir, scanWith(at(makeStub(reportValue(found)).bin)));
+      expect(b.files.find((f) => f.path === 'src/a.ts')?.content, at.name).toBe(`const a = 1;\nconst b = '${R}';\nconst c = 3;\n`);
+      expect(b.files.find((f) => f.path === 'src/z.ts')?.content, at.name).toBe(`const y = 1;\nconst z = '${R}';`);
+      expect(b.notes.join('\n'), at.name).toContain(`${at('/x').name} checked the bundle: 2 findings redacted.`);
+    }
+  });
+
+  it('a file whose canary was not reported is left out (a neutral note); the others stay', async () => {
+    const dir = canaryRepo();
+    for (const at of [betterleaksAt, gitleaksAt]) {
+      // the scanner "skipped" the file holding src/b.ts
+      const stub = makeStub(`canary = 'none'; const c = canaryFindings().filter((x) => !files[path.basename(x.File)].includes('const b')); writeReport(JSON.stringify(c)); process.exit(1);`);
+      const b = await bundleCode(dir, scanWith(at(stub.bin)));
+      expect(paths(b), at.name).toEqual(['src/a.ts', 'src/c.ts']);
+      expect(bundleText(b), at.name).not.toContain('const b');
+      expect(b.notes.join('\n'), at.name).toContain(`Left out because ${at('/x').name} did not confirm it read them: src/b.ts.`);
+      expect(b.notes.join('\n'), at.name).not.toContain('pipegen-canary');
+    }
+  });
+
+  it('no file canary back (the scanner read none of them), or none for paths.txt → SecretScanError, nothing sent', async () => {
+    const dir = canaryRepo();
+    for (const at of [betterleaksAt, gitleaksAt]) {
+      // the TMPDIR-under-node_modules case: a clean exit and an empty report
+      await expect(bundleCode(dir, scanWith(at(makeStub(`canary = 'none'; writeReport('[]'); process.exit(0);`).bin))), at.name).rejects.toThrow(SecretScanError);
+      await expect(bundleCode(dir, scanWith(at(makeStub(`canary = 'none'; writeReport('[]'); process.exit(0);`).bin))), at.name).rejects.toThrow(/did not confirm it read the bundle/);
+      // only paths.txt's canary came back
+      const onlyPaths = `canary = 'none'; writeReport(JSON.stringify(canaryFindings().filter((x) => x.File.endsWith('paths.txt')))); process.exit(1);`;
+      await expect(bundleCode(dir, scanWith(at(makeStub(onlyPaths).bin))), at.name).rejects.toThrow(/did not confirm it read the bundle/);
+      // every file's canary but not paths.txt's: the file names were not checked
+      const noPaths = `canary = 'none'; writeReport(JSON.stringify(canaryFindings().filter((x) => !x.File.endsWith('paths.txt')))); process.exit(1);`;
+      await expect(bundleCode(dir, scanWith(at(makeStub(noPaths).bin))), at.name).rejects.toThrow(/did not confirm it read the bundle's file list/);
+    }
+  });
+
+  it('a canary reported for the wrong file is not accepted, nor one reported twice', async () => {
+    const dir = canaryRepo();
+    for (const at of [betterleaksAt, gitleaksAt]) {
+      // the canaries of the files holding src/a.ts and src/b.ts are reported against each other's file
+      const swapped = `canary = 'none';
+        const c = canaryFindings();
+        const fa = c.find((x) => files[path.basename(x.File)].includes('const a'));
+        const fb = c.find((x) => files[path.basename(x.File)].includes('const b'));
+        const t = fa.File; fa.File = fb.File; fb.File = t;
+        writeReport(JSON.stringify(c)); process.exit(1);`;
+      const b = await bundleCode(dir, scanWith(at(makeStub(swapped).bin)));
+      expect(paths(b), at.name).toEqual(['src/c.ts']);
+      expect(b.notes.join('\n'), at.name).toContain(`Left out because ${at('/x').name} did not confirm it read them: src/a.ts, src/b.ts.`);
+      // the canary of src/c.ts reported twice: not "exactly one"
+      const twice = `canary = 'none';
+        const c = canaryFindings();
+        writeReport(JSON.stringify([...c, c.find((x) => files[path.basename(x.File)].includes('const c'))])); process.exit(1);`;
+      const b2 = await bundleCode(dir, scanWith(at(makeStub(twice).bin)));
+      expect(paths(b2), at.name).toEqual(['src/a.ts', 'src/b.ts']);
+      // every canary moved to another file: none accepted → SecretScanError
+      const rotated = `canary = 'none';
+        const c = canaryFindings(); const names = c.map((x) => x.File);
+        c.forEach((x, i) => { x.File = names[(i + 1) % names.length]; });
+        writeReport(JSON.stringify(c)); process.exit(1);`;
+      await expect(bundleCode(dir, scanWith(at(makeStub(rotated).bin))), at.name).rejects.toThrow(SecretScanError);
+    }
+  });
+
+  it('canary-shaped text in a repo file is neither counted for it nor treated as a secret', async () => {
+    const dir = canaryRepo();
+    const fake = 'pipegen-canary-' + '0123456789abcdef'.repeat(2);
+    writeIn(dir, 'src/d.ts', `// ${fake}\nexport const d = 4;\n`);
+    for (const at of [betterleaksAt, gitleaksAt]) {
+      const stub = makeStub(CLEAN); // reports the fake line under the canary rule too
+      const b = await bundleCode(dir, scanWith(at(stub.bin)));
+      expect(paths(b), at.name).toEqual(['src/a.ts', 'src/b.ts', 'src/c.ts', 'src/d.ts']);
+      expect(b.files.find((f) => f.path === 'src/d.ts')?.content, at.name).toBe(`// ${fake}\nexport const d = 4;\n`);
+      // src/d.ts's own canary missing, only its fake line reported: not this run's canary for it, so it is left out
+      const onlyFake = `canary = 'none';
+        const own = (x) => { const t = files[path.basename(x.File)]; return t.includes('const d') && x.StartLine === t.split('\\n').length - 1; };
+        writeReport(JSON.stringify(canaryFindings().filter((x) => !own(x)))); process.exit(1);`;
+      const b2 = await bundleCode(dir, scanWith(at(makeStub(onlyFake).bin)));
+      expect(paths(b2), at.name).toEqual(['src/a.ts', 'src/b.ts', 'src/c.ts']);
+    }
+  });
+
+  it('belt: a temp folder under a path the default allowlist skips (node_modules, …) is refused before the scan', async () => {
+    const dir = canaryRepo();
+    const base = makeTempDir();
+    const old = process.env.TMPDIR;
+    try {
+      for (const sub of ['node_modules/.cache/tmp', 'vendor/bundle/tmp', 'venv/lib/tmp', 'pkg-1.2.dist-info/tmp']) {
+        const tmp = join(base, sub);
+        mkdirSync(tmp, { recursive: true });
+        process.env.TMPDIR = tmp;
+        const stub = makeStub(CLEAN);
+        await expect(bundleCode(dir, scanWith(gitleaksAt(stub.bin))), sub).rejects.toThrow(/skip.*TMPDIR/);
+        expect(() => stub.record(), sub).toThrow(); // the scanner never ran
+        expect(readdirSync(tmp).filter((n) => n.startsWith('pipegen-secret-scan-')), sub).toEqual([]); // nothing left behind
+      }
+    } finally {
+      if (old === undefined) delete process.env.TMPDIR;
+      else process.env.TMPDIR = old;
+    }
+  });
+
+  it('belt: skippedByDefaultPaths mirrors the folder patterns of the scanners\' default path allowlist', () => {
+    for (const p of [
+      '/x/node_modules/.cache/tmp/pipegen-secret-scan-a/f000001.txt', '/node_modules/f.txt', '/x/bower_components/y/paths.txt',
+      '/x/vendor/bundle/f.txt', '/x/vendor/ruby/f.txt', '/x/vendor/golang.org/x/f.txt', '/x/venv/lib/f.txt', '/x/ENV/lib64/f.txt',
+      '/x/virtualenv/lib/f.txt', '/x/lib/python3.12/f.txt', '/x/python/3.11/lib/f.txt', '/x/foo-1.2.dist-info/f.txt',
+      '/x/gitleaks.toml/f.txt', '/x/a-gitleaks.toml-b/f.txt', '/x/verification-metadata.xml/f.txt', '/x/Database.refactorlog/f.txt',
+      'C:\\x\\node_modules\\f.txt',
+    ]) expect(skippedByDefaultPaths(p), p).toBe(true);
+    for (const p of [
+      '/tmp/pipegen-secret-scan-a/f000001.txt', '/tmp/pipegen-secret-scan-a/paths.txt', '/home/u/node_modulesX/f.txt',
+      '/x/vendor/f.txt', '/x/env/f.txt', '/x/my_node_modules/f.txt',
+    ]) expect(skippedByDefaultPaths(p), p).toBe(false);
   });
 });
 
@@ -700,7 +862,7 @@ describe('fix round 1', () => {
     writeIn(dir, 'src/b.ts', `export const b = "${v}";\n`);
     writeIn(dir, 'src/c.ts', `export const c = "${Buffer.from(v).toString('base64')}";\n`);
     // gitleaks reports only the first occurrence
-    const stub = makeStub(`const f = findingsFor(${JSON.stringify(v)}).slice(0, 1); fs.writeFileSync(report, JSON.stringify(f)); process.exit(1);`);
+    const stub = makeStub(`const f = findingsFor(${JSON.stringify(v)}).slice(0, 1); writeReport(JSON.stringify(f)); process.exit(1);`);
     const b = await bundleCode(dir, scanWith(gitleaksAt(stub.bin)));
     expect(paths(b)).toEqual(['src/a.ts', 'src/b.ts', 'src/c.ts']);
     const text = bundleText(b);
@@ -944,7 +1106,7 @@ describe('fix round 2', () => {
     writeIn(dir, 'src/b.ts', `const other = "${short}"; const x = "${short}x"; const y = "x${short}"; const z = ${short}_1;\n`);
     writeIn(dir, `src/${short}.ts`, 'export {};\n');
     writeIn(dir, 'src/c.ts', 'export {};\n');
-    const stub = makeStub(`const f = findingsFor(${JSON.stringify(short)}).slice(0, 1); fs.writeFileSync(report, JSON.stringify(f)); process.exit(1);`);
+    const stub = makeStub(`const f = findingsFor(${JSON.stringify(short)}).slice(0, 1); writeReport(JSON.stringify(f)); process.exit(1);`);
     const b = await bundleCode(dir, scanWith(gitleaksAt(stub.bin)));
     expect(paths(b)).toEqual(['src/b.ts', 'src/c.ts']); // the reported file and the file named after the value are left out
     expect(b.files.find((f) => f.path === 'src/b.ts')?.content).toBe(`const other = "${R}"; const x = "${short}x"; const y = "x${short}"; const z = ${short}_1;\n`);
