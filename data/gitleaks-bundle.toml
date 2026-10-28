@@ -33,8 +33,13 @@ regex = '''sk-[A-Za-z0-9_-]{20,}'''
 # own token, exactly once. A file the scanner skipped without saying so (a path on the default allowlist, a format it
 # sniffs, a size limit, …) is then left out, and a scan that read none of them stops the AI call. Not a secret: these
 # findings are removed before any real finding is applied.
+# Ruling P35: the regex matches only a WHOLE line that is exactly one token, and redact.ts neutralises any
+# `pipegen-canary-` in repo text and file names first, so the rule can never match repo content. That matters: both
+# scanners drop a generic-api-key finding whose value overlaps another rule's finding (live probe), so a canary rule
+# that could match inside real content could hide a real secret. A canary-rule finding that is not the file's own
+# token is treated as a real finding (its file is left out).
 [[rules]]
 id = "pipegen-canary"
 description = "pipegen scan marker (proves the file was read)"
-regex = '''pipegen-canary-[0-9a-f]{32}'''
+regex = '''(?m)^pipegen-canary-[0-9a-f]{32}$'''
 keywords = ["pipegen-canary-"]

@@ -1323,6 +1323,14 @@ function scannersWouldSkip(written: string): boolean {
  */
 const CANARY_RULE = 'pipegen-canary';
 const newCanary = () => `${CANARY_RULE}-${randomBytes(16).toString('hex')}`;
+/**
+ * Ruling P35: repo text (content and file names) can't hold the canary's prefix in any case: `pipegen-canary-` becomes
+ * `pipegen-canary_`, so the rule (a whole line of exactly one token) can only match the line pipegen adds. The scanners
+ * drop a generic-api-key finding that overlaps another rule's finding, so a canary match inside real content could
+ * otherwise hide a real secret. Like neutralizeAllow, the neutralised text is also what is sent.
+ */
+const CANARY_TEXT = /(pipegen-canary)-/gi;
+const neutralizeCanary = (s: string) => s.replace(CANARY_TEXT, '$1_');
 /** A file as the scanner sees it: the prefix, the content, a blank line, the canary on its own line. */
 const asScanned = (content: string, canary: string) => `${SCAN_PREFIX}${content}${content === '' || content.endsWith('\n') ? '' : '\n'}\n${canary}\n`;
 
@@ -1494,7 +1502,7 @@ async function secretScanPass(files: FileEntry[], scanner: SecretScanner, timeou
     throw new SecretScanError(e instanceof Error ? e.message : `pipegen's ${name} config could not be found.`);
   }
   const canaried = files.map((f) => {
-    const content = neutralizeAllow(f.content);
+    const content = neutralizeCanary(neutralizeAllow(f.content));
     const canary = newCanary();
     return { path: f.path, content, canary, written: asScanned(content, canary) };
   });
@@ -1517,7 +1525,7 @@ async function secretScanPass(files: FileEntry[], scanner: SecretScanner, timeou
     }
     for (let i = 0; i < scanned.length; i++) await writeFile(join(tmp, names[i]), kept[i].written, { flag: 'wx', mode: 0o600 });
     const pathsCanary = newCanary();
-    const pathsText = asScanned(neutralizeAllow(shownPaths.join('\n')), pathsCanary);
+    const pathsText = asScanned(neutralizeCanary(neutralizeAllow(shownPaths.join('\n'))), pathsCanary);
     // R1 for the paths too: the scanners would skip paths.txt, and so never check the file names. Fail closed.
     if (scannersWouldSkip(pathsText)) throw new SecretScanError(`The bundle's file list has a binary-format marker at a byte the ${name} scanner sniffs, so it would not be scanned; nothing was sent.`);
     await writeFile(join(tmp, PATHS_FILE), pathsText, { flag: 'wx', mode: 0o600 });
@@ -1532,25 +1540,30 @@ async function secretScanPass(files: FileEntry[], scanner: SecretScanner, timeou
       const abs = isAbsolute(file) ? resolve(file) : resolve(tmp, file);
       return insideDir(tmp, abs) ? relative(tmp, abs) : undefined;
     };
-    // P34: take the canary findings out. One counts only when its token is the one written to the file it is reported
-    // against; a canary-rule finding with any other text (canary-shaped text in a repo file) is not a secret, and dropped.
+    const index = new Map(names.map((n, i) => [n, i]));
+    // P34: take the canary findings out. One counts only when its value is exactly the token written to the file it is
+    // reported against. P35: any other canary-rule finding (another file's token, an unknown value, a file outside the
+    // folder) is never dropped: it stays a real finding, and the scanned file it names is left out.
     const canaryOf = new Map<string, string>([...names.map((n, i): [string, string] => [n, kept[i].canary]), [PATHS_FILE, pathsCanary]]);
     const confirmed = new Map<string, number>();
+    const foreign = new Set<number>();
     const findings: Finding[] = [];
     for (const f of reported) {
-      if (f.rule !== CANARY_RULE) {
-        findings.push(f);
+      const rel = f.rule === CANARY_RULE ? relOf(f.file) : undefined;
+      if (rel !== undefined && canaryOf.get(rel) === f.secret) {
+        confirmed.set(rel, (confirmed.get(rel) ?? 0) + 1);
         continue;
       }
-      const rel = relOf(f.file);
-      if (rel !== undefined && canaryOf.has(rel) && f.secret === canaryOf.get(rel)) confirmed.set(rel, (confirmed.get(rel) ?? 0) + 1);
+      findings.push(f);
+      const i = rel === undefined ? undefined : index.get(rel);
+      if (i !== undefined) foreign.add(i);
     }
+    // exactly one: a second report of a file's own canary is as unexplained as none
     const read = (n: string) => confirmed.get(n) === 1;
     if (!read(PATHS_FILE)) throw new SecretScanError(`${name} did not confirm it read the bundle's file list, so the file names may not have been checked; nothing was sent.`);
     const unread = new Set(names.flatMap((n, i) => (read(n) ? [] : [i])));
     if (scanned.length > 0 && unread.size === scanned.length) throw new SecretScanError(`${name} did not confirm it read the bundle's files, so they may not have been checked; nothing was sent.`);
 
-    const index = new Map(names.map((n, i) => [n, i]));
     const perFile = new Map<number, Finding[]>();
     const drop = new Set<number>();
     const unplaced = new Set<number>();
@@ -1632,6 +1645,7 @@ async function secretScanPass(files: FileEntry[], scanner: SecretScanner, timeou
     const pathsOf = (set: Set<number>) => [...set].sort((a, b) => a - b).map((i) => scanned[i].path);
     notes.add(`${name} checked the bundle: ${plural(redacted, 'finding', 'findings')} redacted.`);
     notes.addPaths(`Left out because ${name} did not confirm it read them:`, pathsOf(unread), show);
+    notes.addPaths(`Left out because ${name} reported a check marker in them that pipegen did not write there:`, pathsOf(foreign), show);
     notes.addPaths(`Left out because ${name} found something pipegen could not locate to redact:`, pathsOf(drop), show);
     notes.addPaths('Left out because a found secret was still in them after redaction:', pathsOf(leftover), show);
     if (shortHit.size > 0) notes.add(`Left out ${plural(shortHit.size, 'file', 'files')} where ${name} found a short value (under ${MIN_GLOBAL_SECRET} characters); elsewhere it is removed only where it stands as a whole word.`);
@@ -1640,7 +1654,7 @@ async function secretScanPass(files: FileEntry[], scanner: SecretScanner, timeou
       notes.add(`Ignored ${plural(strays, `${name} finding`, `${name} findings`)} for a file outside the scanned folder.`);
       notes.addPaths(`Left out because a ${name} finding outside the scanned folder may relate to them:`, pathsOf(unplaced), show);
     }
-    return scanned.filter((_, i) => !unread.has(i) && !drop.has(i) && !unplaced.has(i) && !leftover.has(i) && !badPath.has(i) && !shortHit.has(i));
+    return scanned.filter((_, i) => !unread.has(i) && !foreign.has(i) && !drop.has(i) && !unplaced.has(i) && !leftover.has(i) && !badPath.has(i) && !shortHit.has(i));
   } finally {
     // every way out (a result, any error): the copies and the raw report go; the signal hooks go after
     try {

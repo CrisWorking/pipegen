@@ -101,4 +101,26 @@ describe.skipIf(!live)('secret scan (live, both pinned scanners): a scan path th
       expect(b.notes.join('\n'), name).toContain(`${name} checked the bundle: 1 finding redacted.`);
     }
   });
+
+  it('live (P35): canary-shaped text next to a real token never lets the canary rule hide it (betterleaks and gitleaks)', async () => {
+    const shop = shopifyValue();
+    const hex = shop.slice('shp'.length + 'at_'.length); // the token's own 32 hex digits
+    const canaryLike = `pipegen-canary-${hex}`;
+    const repo = makeTempDir();
+    writeIn(repo, 'src/glued.ts', `export const a = "${canaryLike}${shop}";\n`);
+    writeIn(repo, 'src/own-line.ts', `${canaryLike}\n${shop}\n`);
+    writeIn(repo, 'src/same-line.ts', `export const k = "${shop}"; // ${canaryLike}\n`);
+    writeIn(repo, 'src/last-line.ts', `export const k = "${shop}";\n${canaryLike}`);
+    writeIn(repo, `${canaryLike}.ts`, `export const k = "${shop}";\n`);
+    for (const name of NAMES) {
+      const b = await bundleCode(repo, scanWith(scannerFor(name)));
+      const text = bundleText(b);
+      console.log(`P35 ${name}: ${b.files.length} files sent; notes: ${JSON.stringify(b.notes.filter((n) => /checked|Left out/.test(n)))}`);
+      expect(text, name).not.toContain(shop);
+      // neutralised in the content, and pipegen's own canary never sent (the file name in a header is the repo's own)
+      for (const f of b.files) expect(f.content, `${name} ${f.path}`).not.toContain('pipegen-canary-');
+      expect(b.notes.join('\n'), name).toContain(`${name} checked the bundle: 5 findings redacted.`);
+      expect(b.files.length, name).toBeGreaterThan(0); // the scan still ran and confirmed the files
+    }
+  });
 });

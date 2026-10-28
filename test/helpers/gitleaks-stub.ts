@@ -45,7 +45,7 @@ function canaryFindings() {
   const out = [];
   for (const [f, text] of Object.entries(files)) {
     text.split('\\n').forEach((l, i) => {
-      const m = /pipegen-canary-[0-9a-f]{32}/.exec(l);
+      const m = /^pipegen-canary-[0-9a-f]{32}$/.exec(l); // the real rule: a whole line, nothing else
       if (!m) return;
       const file = path.join(src, f);
       out.push({ RuleID: 'pipegen-canary', File: file, StartLine: i + 1, EndLine: i + 1, Match: m[0], ['Sec' + 'ret']: m[0], Tags: [], Fingerprint: file + ':pipegen-canary:' + (i + 1) });

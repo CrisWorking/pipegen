@@ -737,21 +737,53 @@ describe('bundle: scan canaries (ruling P34)', () => {
     }
   });
 
-  it('canary-shaped text in a repo file is neither counted for it nor treated as a secret', async () => {
+  it('P35: canary-shaped text in the repo (content or a file name) is neutralised before the scan, so only pipegen\'s own line can match the rule', async () => {
     const dir = canaryRepo();
-    const fake = 'pipegen-canary-' + '0123456789abcdef'.repeat(2);
-    writeIn(dir, 'src/d.ts', `// ${fake}\nexport const d = 4;\n`);
+    const hex = '0123456789abcdef'.repeat(2);
+    writeIn(dir, 'src/d.ts', `pipegen-canary-${hex}\n// PIPEGEN-CANARY-${hex}\nexport const d = 4;\n`);
+    writeIn(dir, `pipegen-canary-${hex}`, 'x\n'); // a file named like a canary (a whole line of paths.txt)
     for (const at of [betterleaksAt, gitleaksAt]) {
-      const stub = makeStub(CLEAN); // reports the fake line under the canary rule too
+      const stub = makeStub(CLEAN);
       const b = await bundleCode(dir, scanWith(at(stub.bin)));
-      expect(paths(b), at.name).toEqual(['src/a.ts', 'src/b.ts', 'src/c.ts', 'src/d.ts']);
-      expect(b.files.find((f) => f.path === 'src/d.ts')?.content, at.name).toBe(`// ${fake}\nexport const d = 4;\n`);
-      // src/d.ts's own canary missing, only its fake line reported: not this run's canary for it, so it is left out
-      const onlyFake = `canary = 'none';
-        const own = (x) => { const t = files[path.basename(x.File)]; return t.includes('const d') && x.StartLine === t.split('\\n').length - 1; };
-        writeReport(JSON.stringify(canaryFindings().filter((x) => !own(x)))); process.exit(1);`;
-      const b2 = await bundleCode(dir, scanWith(at(makeStub(onlyFake).bin)));
-      expect(paths(b2), at.name).toEqual(['src/a.ts', 'src/b.ts', 'src/c.ts']);
+      const rec = stub.record();
+      // what was scanned holds one canary-shaped line per file: pipegen's own, last
+      for (const [name, text] of Object.entries(rec.files)) {
+        expect(text.match(/pipegen-canary-/gi), `${at.name} ${name}`).toHaveLength(1);
+        expect(text, `${at.name} ${name}`).toMatch(/\n\npipegen-canary-[0-9a-f]{32}\n$/);
+      }
+      expect(rec.files['paths.txt'], at.name).toContain(`pipegen-canary_${hex}`);
+      // the repo's text is sent neutralised, and every file is kept (no foreign marker was reported)
+      expect(b.files.find((f) => f.path === 'src/d.ts')?.content, at.name).toBe(`pipegen-canary_${hex}\n// PIPEGEN-CANARY_${hex}\nexport const d = 4;\n`);
+      expect(paths(b), at.name).toEqual([`pipegen-canary-${hex}`, 'src/a.ts', 'src/b.ts', 'src/c.ts', 'src/d.ts']);
+    }
+  });
+
+  it('P35: a canary-rule finding that is not the file\'s own token is a real finding: its file is left out, its value removed everywhere', async () => {
+    const found = 'plain' + '-looking-' + 'value-6617';
+    const dir = canaryRepo();
+    writeIn(dir, 'src/e.ts', `const e = '${found}';\n`);
+    writeIn(dir, 'src/f.ts', `const f = '${found}';\n`);
+    for (const at of [betterleaksAt, gitleaksAt]) {
+      // the canary rule "wins" on real content in src/e.ts (what the scanners' overlap de-dup could do): reported with
+      // a value that is not this run's canary
+      const foreign = `const fe = Object.keys(files).find((n) => files[n].includes('const e'));
+        const extra = { RuleID: 'pipegen-canary', File: path.join(src, fe), StartLine: 2, EndLine: 2, Match: ${JSON.stringify(found)}, ['Sec' + 'ret']: ${JSON.stringify(found)}, Tags: [] };
+        writeReport(JSON.stringify([extra])); process.exit(1);`;
+      const b = await bundleCode(dir, scanWith(at(makeStub(foreign).bin)));
+      expect(paths(b), at.name).toEqual(['src/a.ts', 'src/b.ts', 'src/c.ts', 'src/f.ts']);
+      expect(b.notes.join('\n'), at.name).toContain(`Left out because ${at('/x').name} reported a check marker in them that pipegen did not write there: src/e.ts.`);
+      expect(b.files.find((f) => f.path === 'src/f.ts')?.content, at.name).toBe(`const f = '${R}';\n`);
+      expect(bundleText(b), at.name).not.toContain(found);
+      // this run's own canary of src/a.ts reported against src/c.ts: c.ts is left out too (a and c both unconfirmed)
+      const moved = `canary = 'none'; const c = canaryFindings();
+        const fa = c.find((x) => files[path.basename(x.File)].includes('const a'));
+        const fc = c.find((x) => files[path.basename(x.File)].includes('const c'));
+        fa.File = fc.File;
+        writeReport(JSON.stringify(c)); process.exit(1);`;
+      const b2 = await bundleCode(dir, scanWith(at(makeStub(moved).bin)));
+      expect(paths(b2), at.name).toEqual(['src/b.ts', 'src/e.ts', 'src/f.ts']);
+      expect(b2.notes.join('\n'), at.name).toContain(`Left out because ${at('/x').name} reported a check marker in them that pipegen did not write there: src/c.ts.`);
+      expect(bundleText(b2), at.name).not.toContain('pipegen-canary');
     }
   });
 
