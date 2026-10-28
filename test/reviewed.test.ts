@@ -1610,12 +1610,12 @@ describe('data/reviewed-tools.yml', () => {
     });
   });
 
-  it('data: every new entry is PENDING with proofs 0', () => {
+  it('data: every catalogue entry is reviewed by the owner (2026-10-28, DECISIONS #104) with proofs 0', () => {
     const list = real();
     for (const id of Object.keys(CATALOGUE)) {
       const t = byId(list, id)[0];
-      expect(t?.reviewedBy, id).toBe('PENDING');
-      expect(t?.reviewedAt, id).toBe('PENDING');
+      expect(t?.reviewedBy, id).toBe('Cristiano');
+      expect(t?.reviewedAt, id).toBe('2026-10-28');
       expect(t?.proofs, id).toBe(0);
     }
   });

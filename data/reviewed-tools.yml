@@ -67,8 +67,8 @@ tools:
     choices:
       fetch-depth: ["1", "0"]
     configFiles: []
-    reviewedBy: PENDING
-    reviewedAt: PENDING
+    reviewedBy: Cristiano
+    reviewedAt: "2026-10-28"
     proofs: 0
 
   # Installs Node.js. Its automatic package-manager cache is off (pipegen uses no caches, spec §19). Node 24 and 26 only (DECISIONS #92).
@@ -99,8 +99,8 @@ tools:
     choices:
       node-version: ["24", "26"]
     configFiles: []
-    reviewedBy: PENDING
-    reviewedAt: PENDING
+    reviewedBy: Cristiano
+    reviewedAt: "2026-10-28"
     proofs: 0
 
   # Installs Python. No cache input is set or offered (pipegen uses no caches, spec §19).
@@ -128,8 +128,8 @@ tools:
     choices:
       python-version: ["3.10", "3.11", "3.12", "3.13", "3.14"]
     configFiles: []
-    reviewedBy: PENDING
-    reviewedAt: PENDING
+    reviewedBy: Cristiano
+    reviewedAt: "2026-10-28"
     proofs: 0
 
   # Uploads scan results for the gate. Hidden files (.env and the like) are never included.
@@ -161,8 +161,8 @@ tools:
         if-no-files-found: "error"
     choices: {}
     configFiles: []
-    reviewedBy: PENDING
-    reviewedAt: PENDING
+    reviewedBy: Cristiano
+    reviewedAt: "2026-10-28"
     proofs: 0
 
   # Downloads scan results in the gate job (exact artifact names are set by the renderer).
@@ -189,8 +189,8 @@ tools:
     fixedInputs: {}
     choices: {}
     configFiles: []
-    reviewedBy: PENDING
-    reviewedAt: PENDING
+    reviewedBy: Cristiano
+    reviewedAt: "2026-10-28"
     proofs: 0
 
   # Logs in to a container registry for image builds; logs out at the end of the job.
@@ -221,8 +221,8 @@ tools:
     choices:
       registry: ["ghcr.io", "docker.io"]
     configFiles: []
-    reviewedBy: PENDING
-    reviewedAt: PENDING
+    reviewedBy: Cristiano
+    reviewedAt: "2026-10-28"
     proofs: 0
 
   # Sets up Docker Buildx. Its binary cache is off (pipegen uses no caches, spec §19).
@@ -252,8 +252,8 @@ tools:
         cache-binary: "false"
     choices: {}
     configFiles: []
-    reviewedBy: PENDING
-    reviewedAt: PENDING
+    reviewedBy: Cristiano
+    reviewedAt: "2026-10-28"
     proofs: 0
 
   # Builds the container image once (no build cache), so the same image is scanned and deployed. Context "." and an empty github-token: the job credential is never a build secret.
@@ -288,8 +288,8 @@ tools:
     choices:
       push: ["false", "true"]
     configFiles: []
-    reviewedBy: PENDING
-    reviewedAt: PENDING
+    reviewedBy: Cristiano
+    reviewedAt: "2026-10-28"
     proofs: 0
 
   # Uploads SARIF results to GitHub code scanning (only where code scanning is available).
@@ -316,8 +316,8 @@ tools:
     fixedInputs: {}
     choices: {}
     configFiles: []
-    reviewedBy: PENDING
-    reviewedAt: PENDING
+    reviewedBy: Cristiano
+    reviewedAt: "2026-10-28"
     proofs: 0
 
   # Records a GitHub build attestation for the image (v4, ruling S24: checked live).
@@ -344,8 +344,8 @@ tools:
     fixedInputs: {}
     choices: {}
     configFiles: []
-    reviewedBy: PENDING
-    reviewedAt: PENDING
+    reviewedBy: Cristiano
+    reviewedAt: "2026-10-28"
     proofs: 0
 
   # Egress control for proof and CI jobs (spike S8): Bullfrog in block mode, sudo off, so no later step can undo it.
@@ -382,8 +382,8 @@ tools:
       allowed-domains: ["github-core", "npm", "pypi", "dockerhub", "ghcr"]
       allowed-ips: ["172.16.0.0/12"]
     configFiles: []
-    reviewedBy: PENDING
-    reviewedAt: PENDING
+    reviewedBy: Cristiano
+    reviewedAt: "2026-10-28"
     proofs: 0
 
   # The registry:2 image, a local registry service for image builds in proof jobs (no scan output).
@@ -410,8 +410,8 @@ tools:
     fixedInputs: {}
     choices: {}
     configFiles: []
-    reviewedBy: PENDING
-    reviewedAt: PENDING
+    reviewedBy: Cristiano
+    reviewedAt: "2026-10-28"
     proofs: 0
 
   # OWASP ZAP baseline scan of the running app. zap-json output, converted by pipegen's parser.
@@ -444,8 +444,8 @@ tools:
         passAs: { flag: "-c" }
     choices: {}
     configFiles: [".zap/**"]
-    reviewedBy: PENDING
-    reviewedAt: PENDING
+    reviewedBy: Cristiano
+    reviewedAt: "2026-10-28"
     proofs: 0
 
   # Trivy config scan of Terraform and other infrastructure code. Release binary, no cache, only the checks built into the pinned binary.
@@ -484,8 +484,8 @@ tools:
     choices:
       severity: ["CRITICAL", "HIGH,CRITICAL", "MEDIUM,HIGH,CRITICAL"]
     configFiles: ["trivy.yaml", ".trivyignore", ".trivyignore.yaml"]
-    reviewedBy: PENDING
-    reviewedAt: PENDING
+    reviewedBy: Cristiano
+    reviewedAt: "2026-10-28"
     proofs: 0
     verifiedWith:
       method: cosign-bundle
@@ -531,8 +531,8 @@ tools:
       severity: ["CRITICAL", "HIGH,CRITICAL", "MEDIUM,HIGH,CRITICAL"]
       ignore-unfixed: ["false", "true"]
     configFiles: ["trivy.yaml", ".trivyignore", ".trivyignore.yaml"]
-    reviewedBy: PENDING
-    reviewedAt: PENDING
+    reviewedBy: Cristiano
+    reviewedAt: "2026-10-28"
     proofs: 0
     verifiedWith:
       method: cosign-bundle
@@ -576,8 +576,8 @@ tools:
         passAs: { flag: "--config" }
     choices: {}
     configFiles: [".betterleaks.toml", ".gitleaks.toml", ".gitleaksignore", ".betterleaksignore"]
-    reviewedBy: PENDING
-    reviewedAt: PENDING
+    reviewedBy: Cristiano
+    reviewedAt: "2026-10-28"
     proofs: 0
     verifiedWith:
       method: cosign-bundle
@@ -615,8 +615,8 @@ tools:
         passAs: { flag: "--config" }
     choices: {}
     configFiles: [".gitleaks.toml", ".gitleaksignore"]
-    reviewedBy: PENDING
-    reviewedAt: PENDING
+    reviewedBy: Cristiano
+    reviewedAt: "2026-10-28"
     proofs: 0
 
   # Semgrep CE (image). Rules come only from a pinned semgrep-rules archive, never the registry (ruling S22).
@@ -657,8 +657,8 @@ tools:
     choices:
       rules: ["javascript", "typescript", "python"]
     configFiles: [".semgrepignore"]
-    reviewedBy: PENDING
-    reviewedAt: PENDING
+    reviewedBy: Cristiano
+    reviewedAt: "2026-10-28"
     proofs: 0
 
   # Dependency scan against the OSV database. Release binary. Also the dependency-review check (Plan P Task 6): comparing
@@ -690,8 +690,8 @@ tools:
         passAs: { flag: "--config" }
     choices: {}
     configFiles: ["**/osv-scanner.toml"]
-    reviewedBy: PENDING
-    reviewedAt: PENDING
+    reviewedBy: Cristiano
+    reviewedAt: "2026-10-28"
     proofs: 0
 
   # Git hook manager: sets up the pre-commit hooks, and runs them in CI on all files.
@@ -719,8 +719,8 @@ tools:
       args: ["--all-files"]
     choices: {}
     configFiles: ["lefthook.yml", "lefthook.yaml", ".lefthook.yml", ".lefthook.yaml", "lefthook-local.yml", "lefthook-local.yaml", ".lefthook-local.yml", ".lefthook-local.yaml", ".lefthook/**", ".lefthook-local/**"]
-    reviewedBy: PENDING
-    reviewedAt: PENDING
+    reviewedBy: Cristiano
+    reviewedAt: "2026-10-28"
     proofs: 0
 
   # Lists every component of the built image (SBOM, SPDX JSON). Release binary.
@@ -751,8 +751,8 @@ tools:
         passAs: { flag: "--config" }
     choices: {}
     configFiles: [".syft.yaml", ".syft.yml", ".syft/**", "syft.yaml"]
-    reviewedBy: PENDING
-    reviewedAt: PENDING
+    reviewedBy: Cristiano
+    reviewedAt: "2026-10-28"
     proofs: 0
 
   # Signs the built image. Same release as data/pinned-binaries.yml (ruling S25).
@@ -780,8 +780,8 @@ tools:
       args: ["--yes"]
     choices: {}
     configFiles: []
-    reviewedBy: PENDING
-    reviewedAt: PENDING
+    reviewedBy: Cristiano
+    reviewedAt: "2026-10-28"
     proofs: 0
 
   # Lints GitHub workflow files. Same release as data/pinned-binaries.yml (ruling S25). No shellcheck or pyflakes from the runner's PATH.
@@ -813,8 +813,8 @@ tools:
         passAs: { flag: "-config-file" }
     choices: {}
     configFiles: [".github/actionlint.yaml", ".github/actionlint.yml"]
-    reviewedBy: PENDING
-    reviewedAt: PENDING
+    reviewedBy: Cristiano
+    reviewedAt: "2026-10-28"
     proofs: 0
 
   # Security audit of GitHub workflow files, offline. Release binary.
@@ -846,8 +846,8 @@ tools:
         passAs: { flag: "--config" }
     choices: {}
     configFiles: ["zizmor.yml", "zizmor.yaml", ".github/zizmor.yml", ".github/zizmor.yaml"]
-    reviewedBy: PENDING
-    reviewedAt: PENDING
+    reviewedBy: Cristiano
+    reviewedAt: "2026-10-28"
     proofs: 0
 
   # ---------- Plan P Task 6 (pin day): the catalogue's tools (catalogue §4, verification.md R1) ----------
@@ -887,8 +887,8 @@ tools:
         passAs: { flag: "--config-path" }
     choices: {}
     configFiles: ["biome.json", "biome.jsonc", ".biome.json", ".biome.jsonc", "**/biome.json", "**/biome.jsonc", ".editorconfig"]
-    reviewedBy: PENDING
-    reviewedAt: PENDING
+    reviewedBy: Cristiano
+    reviewedAt: "2026-10-28"
     proofs: 0
 
   # ESLint for JavaScript repos whose framework needs ESLint plugins (catalogue §2). Flat config only.
@@ -922,8 +922,8 @@ tools:
         passAs: { flag: "--config" }
     choices: {}
     configFiles: ["eslint.config.js", "eslint.config.mjs", "eslint.config.cjs", "eslint.config.ts", "eslint.config.mts", "eslint.config.cts"]
-    reviewedBy: PENDING
-    reviewedAt: PENDING
+    reviewedBy: Cristiano
+    reviewedAt: "2026-10-28"
     proofs: 0
 
   # ESLint with typescript-eslint, for TypeScript before 7 (typescript-eslint 8.72.0 peers: typescript >=4.8.4 <6.1.0).
@@ -957,8 +957,8 @@ tools:
         passAs: { flag: "--config" }
     choices: {}
     configFiles: ["eslint.config.js", "eslint.config.mjs", "eslint.config.cjs", "eslint.config.ts", "eslint.config.mts", "eslint.config.cts"]
-    reviewedBy: PENDING
-    reviewedAt: PENDING
+    reviewedBy: Cristiano
+    reviewedAt: "2026-10-28"
     proofs: 0
 
   # Oxlint's type-aware rules (tsgolint), next to ESLint for TypeScript 7 and later (typescript-eslint doesn't support it).
@@ -997,8 +997,8 @@ tools:
         passAs: { flag: "--config" }
     choices: {}
     configFiles: [".oxlintrc.json", "oxlint.config.ts", "**/.oxlintrc.json", ".eslintignore", ".gitignore"]
-    reviewedBy: PENDING
-    reviewedAt: PENDING
+    reviewedBy: Cristiano
+    reviewedAt: "2026-10-28"
     proofs: 0
 
   # Prettier format check (no writes). A Prettier config already in the repo is used (catalogue §2), so it is protected.
@@ -1027,8 +1027,8 @@ tools:
     choices: {}
     configFiles: [".prettierrc", ".prettierrc.*", "prettier.config.*", ".prettierignore", "**/.prettierrc", "**/.prettierrc.*", ".editorconfig", ".gitignore"]
     configSections: ["package.json:prettier"]
-    reviewedBy: PENDING
-    reviewedAt: PENDING
+    reviewedBy: Cristiano
+    reviewedAt: "2026-10-28"
     proofs: 0
 
   # Vitest coverage (v8), when Vitest is the test runner. The minimum of lines is a fixed flag whose value the AI chooses
@@ -1061,8 +1061,8 @@ tools:
     choices:
       coverage-thresholds-lines: ["60", "70", "80", "90"]
     configFiles: ["vitest.config.*", "vite.config.*", "vitest.workspace.*", "**/vitest.config.*"]
-    reviewedBy: PENDING
-    reviewedAt: PENDING
+    reviewedBy: Cristiano
+    reviewedAt: "2026-10-28"
     proofs: 0
 
   # c8 coverage for test runners without their own (node:test and others; catalogue D7). The minimum goes into .c8rc.json (Plan D).
@@ -1091,8 +1091,8 @@ tools:
     choices: {}
     configFiles: [".c8rc", ".c8rc.*", ".nycrc", ".nycrc.*"]
     configSections: ["package.json:c8"]
-    reviewedBy: PENDING
-    reviewedAt: PENDING
+    reviewedBy: Cristiano
+    reviewedAt: "2026-10-28"
     proofs: 0
 
   # Knip: unused files, exports and dependencies. Report-only on the first run; blocking only with the repo's own knip config (pipegen never writes one).
@@ -1120,8 +1120,8 @@ tools:
     choices: {}
     configFiles: ["knip.json", "knip.jsonc", ".knip.json", ".knip.jsonc", "knip.config.*", "knip.ts", "knip.js"]
     configSections: ["package.json:knip"]
-    reviewedBy: PENDING
-    reviewedAt: PENDING
+    reviewedBy: Cristiano
+    reviewedAt: "2026-10-28"
     proofs: 0
 
   # jscpd: copy-paste detection, warning only (DECISIONS #93); new copy-paste in the pull request only.
@@ -1158,8 +1158,8 @@ tools:
     choices: {}
     configFiles: [".jscpd.json"]
     configSections: ["package.json:jscpd"]
-    reviewedBy: PENDING
-    reviewedAt: PENDING
+    reviewedBy: Cristiano
+    reviewedAt: "2026-10-28"
     proofs: 0
 
   # Trivy licence scan of the dependencies (catalogue §3): blocks on HIGH and CRITICAL licence findings. Same binary as trivy-config.
@@ -1194,8 +1194,8 @@ tools:
         passAs: { flag: "--config" }
     choices: {}
     configFiles: ["trivy.yaml", ".trivyignore", ".trivyignore.yaml"]
-    reviewedBy: PENDING
-    reviewedAt: PENDING
+    reviewedBy: Cristiano
+    reviewedAt: "2026-10-28"
     proofs: 0
     verifiedWith:
       method: cosign-bundle
@@ -1231,8 +1231,8 @@ tools:
         comment-summary-in-pr: "never"
     choices: {}
     configFiles: [".github/dependency-review-config.yml"]
-    reviewedBy: PENDING
-    reviewedAt: PENDING
+    reviewedBy: Cristiano
+    reviewedAt: "2026-10-28"
     proofs: 0
 
   # Hadolint: lints Dockerfiles; fails on warnings and errors. pipegen's pinned config, so the repo's .hadolint.yaml is never read.
@@ -1270,8 +1270,8 @@ tools:
         passAs: { flag: "--config" }
     choices: {}
     configFiles: [".hadolint.yaml", ".hadolint.yml"]
-    reviewedBy: PENDING
-    reviewedAt: PENDING
+    reviewedBy: Cristiano
+    reviewedAt: "2026-10-28"
     proofs: 0
 
   # kube-linter: lints Kubernetes manifests and Helm charts, next to Trivy config. pipegen's pinned config (the default checks).
@@ -1309,8 +1309,8 @@ tools:
         passAs: { flag: "--config" }
     choices: {}
     configFiles: [".kube-linter.yaml", ".kube-linter.yml"]
-    reviewedBy: PENDING
-    reviewedAt: PENDING
+    reviewedBy: Cristiano
+    reviewedAt: "2026-10-28"
     proofs: 0
     verifiedWith:
       kind: cosign-key
@@ -1343,8 +1343,8 @@ tools:
       args: ["--max-examples", "25", "--report", "junit", "--report-junit-path", "schemathesis.xml"]
     choices: {}
     configFiles: ["schemathesis.toml"]
-    reviewedBy: PENDING
-    reviewedAt: PENDING
+    reviewedBy: Cristiano
+    reviewedAt: "2026-10-28"
     proofs: 0
 
   # Nuclei: DAST templates against the running app, on the schedule and on main; warning only (catalogue §3 MG5).
@@ -1383,8 +1383,8 @@ tools:
         PIPEGEN_NUCLEI_TEMPLATES_SHA256: "80fbabceca095fac40afecc7f023748df22b9576b9ff10a4422bd2fbf81f9a41"
     choices: {}
     configFiles: []
-    reviewedBy: PENDING
-    reviewedAt: PENDING
+    reviewedBy: Cristiano
+    reviewedAt: "2026-10-28"
     proofs: 0
 
   # OpenSSF Scorecard, weekly; reported, never gated. Results are never published (publish_results false; catalogue §3 SD5).
@@ -1425,8 +1425,8 @@ tools:
     wrappedImage:
       ref: "ghcr.io/ossf/scorecard-action:v2.5.0"
       digest: "sha256:1e1481c65fc2407d3fd6ab18a23c741eb4d1c0d9359ebafc4b3ab13aa61d8627"
-    reviewedBy: PENDING
-    reviewedAt: PENDING
+    reviewedBy: Cristiano
+    reviewedAt: "2026-10-28"
     proofs: 0
 
   # pinact: every action pinned to a full commit SHA, and each version comment matches its SHA (--verify-comment calls the
@@ -1458,8 +1458,8 @@ tools:
       args: ["--check", "--verify-comment"]
     choices: {}
     configFiles: [".pinact.yaml", ".pinact.yml", ".github/pinact.yaml", ".github/pinact.yml"]
-    reviewedBy: PENDING
-    reviewedAt: PENDING
+    reviewedBy: Cristiano
+    reviewedAt: "2026-10-28"
     proofs: 0
 
   # poutine: supply-chain checks of the workflows, offline on the local checkout (analyze_local; no version check).
@@ -1492,8 +1492,8 @@ tools:
         passAs: { flag: "--config" }
     choices: {}
     configFiles: [".poutine.yml", ".poutine.yaml", ".github/poutine.yml", ".github/poutine.yaml"]
-    reviewedBy: PENDING
-    reviewedAt: PENDING
+    reviewedBy: Cristiano
+    reviewedAt: "2026-10-28"
     proofs: 0
 
   # gosec: Go security checks (SARIF). No AI flags (-ai-*) and no config from the repo. #nosec comments stay allowed (they
@@ -1525,8 +1525,8 @@ tools:
       args: ["-fmt", "sarif", "-out", "gosec.sarif", "-track-suppressions"]
     choices: {}
     configFiles: []
-    reviewedBy: PENDING
-    reviewedAt: PENDING
+    reviewedBy: Cristiano
+    reviewedAt: "2026-10-28"
     proofs: 0
     verifiedWith:
       kind: cosign-key
@@ -1566,8 +1566,8 @@ tools:
     choices: {}
     configFiles: ["ruff.toml", ".ruff.toml", ".gitignore", ".ignore"]
     configSections: ["pyproject.toml:tool.ruff"]
-    reviewedBy: PENDING
-    reviewedAt: PENDING
+    reviewedBy: Cristiano
+    reviewedAt: "2026-10-28"
     proofs: 0
 
   # Ruff format check for Python (no writes). Same binary and pin as ruff.
@@ -1598,8 +1598,8 @@ tools:
     choices: {}
     configFiles: ["ruff.toml", ".ruff.toml", ".gitignore", ".ignore"]
     configSections: ["pyproject.toml:tool.ruff"]
-    reviewedBy: PENDING
-    reviewedAt: PENDING
+    reviewedBy: Cristiano
+    reviewedAt: "2026-10-28"
     proofs: 0
 
   # mypy for Python repos that configured type checking (DECISIONS #95: no config and no py.typed → skipped).
@@ -1628,8 +1628,8 @@ tools:
     choices: {}
     configFiles: ["mypy.ini", ".mypy.ini"]
     configSections: ["pyproject.toml:tool.mypy", "setup.cfg:mypy", "setup.cfg:mypy-*"]
-    reviewedBy: PENDING
-    reviewedAt: PENDING
+    reviewedBy: Cristiano
+    reviewedAt: "2026-10-28"
     proofs: 0
 
   # coverage.py: runs pytest under coverage, then `coverage report --fail-under=<minimum>` (ruling P24: step.cli.then;
@@ -1662,8 +1662,8 @@ tools:
       fail-under: ["60", "70", "80", "90"]
     configFiles: [".coveragerc"]
     configSections: ["pyproject.toml:tool.coverage", "setup.cfg:coverage:*", "tox.ini:coverage:*"]
-    reviewedBy: PENDING
-    reviewedAt: PENDING
+    reviewedBy: Cristiano
+    reviewedAt: "2026-10-28"
     proofs: 0
 
   # Creosote: unused Python dependencies (catalogue D8: not deptry).
@@ -1691,8 +1691,8 @@ tools:
     choices: {}
     configFiles: []
     configSections: ["pyproject.toml:tool.creosote"]
-    reviewedBy: PENDING
-    reviewedAt: PENDING
+    reviewedBy: Cristiano
+    reviewedAt: "2026-10-28"
     proofs: 0
 
   # Vulture: unused Python code at 80% confidence or more; non-blocking.
@@ -1721,8 +1721,8 @@ tools:
     choices: {}
     configFiles: []
     configSections: ["pyproject.toml:tool.vulture"]
-    reviewedBy: PENDING
-    reviewedAt: PENDING
+    reviewedBy: Cristiano
+    reviewedAt: "2026-10-28"
     proofs: 0
 
   # Bandit: Python security checks (SARIF). Listed after Semgrep, so Semgrep stays the first sast pick for Python.
@@ -1756,8 +1756,8 @@ tools:
     choices: {}
     configFiles: [".bandit"]
     configSections: ["pyproject.toml:tool.bandit"]
-    reviewedBy: PENDING
-    reviewedAt: PENDING
+    reviewedBy: Cristiano
+    reviewedAt: "2026-10-28"
     proofs: 0
 
   # PyPI trusted publishing (OIDC) with attestations; never a password input (no long-lived token).
@@ -1787,6 +1787,6 @@ tools:
         attestations: "true"
     choices: {}
     configFiles: []
-    reviewedBy: PENDING
-    reviewedAt: PENDING
+    reviewedBy: Cristiano
+    reviewedAt: "2026-10-28"
     proofs: 0

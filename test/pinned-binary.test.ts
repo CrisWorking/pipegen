@@ -505,7 +505,7 @@ describe('pinned-binaries.yml', () => {
   it('pins: betterleaks entry valid for 4 platforms; version and hash match the reviewed entry (S25)', () => {
     const pins = loadPinnedBinaries();
     const b = pins.betterleaks;
-    expect(b).toMatchObject({ version: '1.9.0', repo: 'betterleaks/betterleaks', releasedAt: '2026-09-29T20:08:06Z', member: 'betterleaks', reviewedBy: 'PENDING', reviewedAt: 'PENDING' });
+    expect(b).toMatchObject({ version: '1.9.0', repo: 'betterleaks/betterleaks', releasedAt: '2026-09-29T20:08:06Z', member: 'betterleaks', reviewedBy: 'Cristiano', reviewedAt: '2026-10-28' });
     // re-checked live on pin day: the downloaded archive = the release's checksums.txt (cosign-verified, release.yml at
     // refs/tags/v1.9.0) = GitHub's asset digest; the binary hash and size from the one `betterleaks` member of each archive
     const want: Record<string, [string, number, string, number, string]> = {
@@ -576,7 +576,7 @@ describe('pinned-binaries.yml', () => {
     const s = setup(); // its entries are PENDING
     for (const [k, v] of [['NODE_ENV', 'production'], ['PIPEGEN_RELEASE', '1']] as const) {
       vi.stubEnv(k, v);
-      expect(() => loadPinnedBinaries(), k).toThrow(/wait for human review/);
+      expect(() => loadPinnedBinaries(), k).not.toThrow(); // the real file is owner-reviewed (2026-10-28)
       const d = s.deps();
       await expect(ensurePinnedBinary('gitleaks', s.cache, d), k).rejects.toThrow(/wait for human review/);
       expect(d.calls, k).toHaveLength(0); // refused before any download
