@@ -734,7 +734,7 @@ function planPReport(): AuditReport {
 const GROUP = 'On a schedule and in repo files';
 
 describe('Plan P Task 9: the report shows every catalogue check', () => {
-  it('report: scheduled group after deploy, counted in the verdict', () => {
+  it('report: scheduled group after deploy, with its own status line (PS37)', () => {
     const r = planPReport();
     for (const text of [term(r), md(r)]) {
       const deploy = lineOf(text, 'When the code is deployed or released');
@@ -751,16 +751,19 @@ describe('Plan P Task 9: the report shows every catalogue check', () => {
     // what pipegen would add says when a scheduled check runs
     expect(tflat(r)).toContain('OpenSSF Scorecard, on a schedule (now missing)');
     expect(tflat(r)).not.toContain('OpenSSF Scorecard, on every pull request');
-    // 5 layers (the four and the scheduled group), all with gaps; the scheduled rows are warning only, so not serious
-    expect(term(r)).toContain('Verdict: 5 of 5 layers have gaps; 4 are serious.');
+    // PS37: the verdict stays over the four layers; the scheduled group has its own status line
+    expect(term(r)).toContain('Verdict: 4 of 4 layers have gaps; 4 are serious.');
     expect(term(r)).toMatch(new RegExp(`${GROUP}: gaps \\(0 of 3 checks covered\\)`));
-    // a group with no rows is left out and not counted
+    expect(term(r)).not.toMatch(/of 5 layers/);
+    for (const text of [term(r), md(r)]) expect(text).toContain('Scheduled and repo-file checks: gaps (0 of 3 checks covered).');
+    expect(term(report())).not.toContain('Scheduled and repo-file checks');
+    // a group with no rows is left out
     expect(term(report())).not.toContain(GROUP);
     expect(term(report())).toContain('Verdict: 4 of 4 layers have gaps; 4 are serious.');
-    // all scheduled rows covered: the group reads covered and adds no gap
+    // all scheduled rows covered: the group reads covered and the verdict doesn't change
     const covered = { ...r, coverage: r.coverage.map((c) => (['update-config', 'scorecard', 'fuzzing'].includes(c.need.id) ? { ...c, status: 'covered' as const } : c)) };
     expect(term(covered)).toMatch(new RegExp(`${GROUP}: covered \\(3 of 3 checks covered\\)`));
-    expect(term(covered)).toContain('Verdict: 4 of 5 layers have gaps; 4 are serious.');
+    expect(term(covered)).toContain('Verdict: 4 of 4 layers have gaps; 4 are serious.');
   });
 
   it('report: duplication row marked warning only, never serious', () => {

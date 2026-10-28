@@ -135,7 +135,7 @@ type Block =
   /** One of pipegen's own fixed commands, under the block before it (depth: that item's depth, or -1 under text). */
   | { kind: 'command'; command: string; depth: number };
 interface Section { title: string; blocks: Block[] }
-interface Doc { title: string; intro: string[]; verdict: string | null; sections: Section[] }
+interface Doc { title: string; intro: string[]; verdict: string | null; /** PS37: the scheduled group's own status line (not part of the verdict). */ scheduled?: string; sections: Section[] }
 
 /** How values are cleaned and amounts written for one target. */
 interface Ctx {
@@ -491,13 +491,15 @@ const dedupe = (xs: string[]) => [...new Set(xs)];
 
 function buildDoc(r: AuditReport, c: Ctx): Doc {
   const views = layerViews(r);
+  const sched = views.find((v) => v.layer === 'scheduled');
   const intro = ['pipegen changed nothing in the repo or on GitHub.'];
   intro.push(r.ai === undefined ? 'Nothing was sent to an AI.' : 'You ran it with --ai: the AI part below says what the AI step found.');
   const sections = [
     warningsSection(r, c), planSection(r, c), layersSection(c, views), skippedSection(r, c), addSection(r, c), wouldSetSection(r, c),
     costsSection(r, c), bundleSection(r, c), permissionsSection(r, c), notesSection(r, c), { title: "What this audit can't see", blocks: CANT_SEE.map((l) => item(l)) }, nextSection(r, c),
   ].filter((s): s is Section => s !== null);
-  return { title: `pipegen audit: ${c.v(`${r.profile.owner}/${r.profile.repo}`, OUTPUT_CAP.path)}`, intro, verdict: verdictOf(views), sections };
+  return { title: `pipegen audit: ${c.v(`${r.profile.owner}/${r.profile.repo}`, OUTPUT_CAP.path)}`, intro, verdict: verdictOf(views.filter((v) => v.layer !== 'scheduled')),
+    ...(sched === undefined || !sched.needed ? {} : { scheduled: `Scheduled and repo-file checks: ${layerStatus(sched)}.` }), sections };
 }
 
 // ---------- terminal ----------
@@ -570,6 +572,7 @@ function terminalDoc(doc: Doc): string {
   if (doc.verdict !== null) {
     lines.push('');
     append(lines, wrap(`Verdict: ${doc.verdict}`, ''));
+    if (doc.scheduled !== undefined) append(lines, wrap(doc.scheduled, ''));
   }
   for (const s of doc.sections) {
     lines.push('', s.title);
@@ -616,6 +619,7 @@ export function renderMarkdown(r: AuditReport, opts: RenderOptions): string {
   const at = (opts.now ?? Date.now)();
   const date = Number.isFinite(at) ? `Audited on ${new Date(at).toISOString().slice(0, 10)}. ` : '';
   const lines = [`# ${doc.title}`, '', `${date}${doc.intro.join(' ')}`, '', `**Verdict:** ${doc.verdict ?? ''}`];
+  if (doc.scheduled !== undefined) lines.push('', doc.scheduled);
   for (const s of doc.sections) {
     lines.push('', `## ${s.title}`, '');
     markdownBlocks(s.blocks, lines);

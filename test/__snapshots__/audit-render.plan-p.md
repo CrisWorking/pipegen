@@ -2,7 +2,9 @@
 
 Audited on 2026-10-27. pipegen changed nothing in the repo or on GitHub. Nothing was sent to an AI.
 
-**Verdict:** 5 of 5 layers have gaps; 4 are serious. pipegen couldn't check everything in 2 layers.
+**Verdict:** 4 of 4 layers have gaps; 4 are serious. pipegen couldn't check everything in 2 layers.
+
+Scheduled and repo-file checks: gaps (0 of 3 checks covered).
 
 ## ⚠ Warnings
 

@@ -926,3 +926,22 @@ describe('Task 9: wording of rows the earlier tasks left rough', () => {
     expect(r.why).toMatch(/not supported yet/);
   });
 });
+
+describe('Task 9: a missing lockfile is not "not applicable"', () => {
+  it('lockfile: a Node service with a package.json but no lockfile keeps new-dependency review and licence checks, missing, with the lockfile reason', async () => {
+    const dir = makeTempDir();
+    const s = svc('.', { language: 'node', packageManager: undefined });
+    const all = await rows(dir, { services: [s] });
+    for (const id of ['dependency-review', 'licences']) {
+      const r = pick(all, 'merge', id);
+      expect(r.status, id).toBe('missing');
+      expect(r.why, id).toBe("No lockfile is committed, so new-dependency review and licence checks can't run until one is.");
+    }
+    // with a lockfile the usual missing text stays
+    const withLock = await rows(dir, { services: [svc('.', { packageManager: 'npm' })] });
+    expect(pick(withLock, 'merge', 'licences').why).not.toMatch(/No lockfile/);
+    // no service with a manifest at all: still not applicable (skipped, no row)
+    const none = await rows(dir, { services: [] });
+    expect(none.some((r) => r.need.id === 'licences')).toBe(false);
+  });
+});

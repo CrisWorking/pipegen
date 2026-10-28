@@ -815,7 +815,11 @@ describe('floor: Plan P checks', () => {
     const needs = floorNeeds(profile({ services: [web(), lib({ packageManager: undefined, language: 'other' })] }), PUBLIC);
     for (const id of ['workflow-lint', 'workflow-pin-check']) for (const layer of ['push', 'merge'] as const) expect(find(needs, layer, id), `${id} ${layer}`).toHaveLength(1);
     for (const id of ['dependency-review', 'licences']) expect(needs.filter((n) => n.id === id).map(key), id).toEqual([`merge|${id}|`]);
-    const noPm = profile({ services: [lib({ packageManager: undefined })] });
+    // Task 9: a node service without a lockfile still has dependencies, so the checks stay (the report says why they are missing)
+    const noLock = profile({ services: [lib({ packageManager: undefined })] });
+    expect(floorNeeds(noLock, PUBLIC).some((n) => n.id === 'licences')).toBe(true);
+    expect(skipFor(noLock, PUBLIC, 'licences')).toHaveLength(0);
+    const noPm = profile({ services: [lib({ packageManager: undefined, language: 'other' })] });
     expect(floorNeeds(noPm, PUBLIC).some((n) => n.id === 'licences')).toBe(false);
     expect(skipFor(noPm, PUBLIC, 'licences')).toHaveLength(1);
     expect(find(needs, 'merge', 'update-config')).toHaveLength(1);

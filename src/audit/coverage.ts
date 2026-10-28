@@ -245,5 +245,12 @@ export async function mapCoverage(p: RepoProfile, needs: Need[], dir: string, op
       rows.push(row.status === 'partial' ? await coverageMinimumRow(row, firstPartialHit(need, need.layer, d), dir) : row);
     } else rows.push(ciCoverage(need, need.layer, d));
   }
-  return frameworkAdjust(versionAdjust(rows, p), p); // PS22: the last steps, so the chooser reads the adjusted row
+  return noLockfile(frameworkAdjust(versionAdjust(rows, p), p), p); // PS22: the last steps, so the chooser reads the adjusted row
+}
+
+const NO_LOCKFILE_WHY = "No lockfile is committed, so new-dependency review and licence checks can't run until one is.";
+/** Task 9: a repo with a manifest but no lockfile: these two checks can't run yet, which is a gap, never "not applicable". */
+function noLockfile(rows: Coverage[], p: RepoProfile): Coverage[] {
+  if (p.services.some((s) => s.packageManager !== undefined)) return rows;
+  return rows.map((r) => ((r.need.category === 'dependency-review' || r.need.category === 'licences') && r.status === 'missing' ? { ...r, why: NO_LOCKFILE_WHY } : r));
 }

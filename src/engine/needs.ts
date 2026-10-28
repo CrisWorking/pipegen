@@ -138,6 +138,8 @@ export interface CheckRule {
 
 const NO_SERVICES = 'no services found';
 const hasPackageManager = (p: RepoProfile) => p.services.some((s) => s.packageManager !== undefined);
+/** A service with a package.json or Python project has dependencies to review whether or not a lockfile is committed. */
+const hasManifest = (p: RepoProfile) => hasPackageManager(p) || p.services.some((s) => s.language === 'node' || s.language === 'python');
 const publishes = (p: RepoProfile) => p.existingWorkflows.some((w) => (w.publishes?.length ?? 0) > 0);
 const FORMAT_LANGUAGES: readonly string[] = ['node', 'python', 'go'];
 const languageSkip = (s?: Service) => (s !== undefined && FORMAT_LANGUAGES.includes(s.language) ? null : 'only Node, Python and Go code is covered');
@@ -170,9 +172,9 @@ export const CHECKS: readonly CheckRule[] = [
     label: 'Workflow lint', why: 'Checks the GitHub Actions workflows for mistakes and risky patterns such as script injection.' },
   { category: 'workflow-pin-check', layers: ['push', 'merge'], scope: 'repo', blocking: true, skip: () => null,
     label: 'Action pin check', why: "Checks that every action is pinned to an exact commit, so a moved tag can't change what runs." },
-  { category: 'dependency-review', layers: ['merge'], scope: 'repo', blocking: true, skip: (p) => (hasPackageManager(p) ? null : 'no service with a package manager found'),
+  { category: 'dependency-review', layers: ['merge'], scope: 'repo', blocking: true, skip: (p) => (hasManifest(p) ? null : 'no service with a package manager found'),
     label: 'New-dependency review', why: 'Checks the packages a pull request adds, so a known-vulnerable or malicious package is stopped before merge.' },
-  { category: 'licences', layers: ['merge'], scope: 'repo', blocking: true, skip: (p) => (hasPackageManager(p) ? null : 'no service with a package manager found'),
+  { category: 'licences', layers: ['merge'], scope: 'repo', blocking: true, skip: (p) => (hasManifest(p) ? null : 'no service with a package manager found'),
     label: 'Licence check', why: 'Checks dependency licences, so a package the project may not use is caught before merge.' },
   { category: 'api-dast', layers: ['merge'], scope: 'runnable', blocking: true,
     skip: (_p, _c, s) => {
