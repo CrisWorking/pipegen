@@ -9,6 +9,7 @@ import { CHECKS } from '../src/engine/needs.js';
 import type { RepoToolStep } from '../src/engine/reviewed.js';
 import type { Layer } from '../src/types.js';
 import { CANT_SEE, renderJson, renderMarkdown, renderTerminal, type RenderOptions } from '../src/audit/render.js';
+import { K8S_FOLDERS } from '../src/read/quality.js';
 import { safeMarkdown } from '../src/util/safe-text.js';
 import { EMPTY_PLACEHOLDER, safeOutput, TOO_LONG } from '../src/util/safe-output.js';
 import { aiPart, FREE_PRIVATE_LIMITS, freePrivateReport, need, reviewedTool, service, SUGGESTION_NOTE, TREE, usageOf } from './fixtures/audit-report.js';
@@ -434,6 +435,10 @@ describe('rulings', () => {
     for (const part of ["doesn't read tox's env_list", 'SKIP for pre-commit', 'pinned to a commit SHA', 'up to v1.14.3', 'trusted by its name']) {
       expect(CANT_SEE.join(' '), part).toContain(part);
     }
+    // final review m1: Kubernetes is looked for only in the folders quality.ts reads
+    const k8sLine = CANT_SEE.find((l) => l.includes('Kubernetes'));
+    expect(k8sLine).toBeDefined();
+    for (const folder of K8S_FOLDERS) expect(k8sLine, folder).toContain(folder);
     const cantSee = t.indexOf("What this audit can't see");
     expect(cantSee).toBeGreaterThan(t.indexOf('\nNotes'));
     expect(cantSee).toBeLessThan(t.indexOf('Next step'));

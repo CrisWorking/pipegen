@@ -543,7 +543,9 @@ export async function readServiceQuality(dir: string, s: Pick<Service, 'path' | 
 const DEPENDABOT = ['.github/dependabot.yml', '.github/dependabot.yaml'];
 const RENOVATE = ['renovate.json', 'renovate.json5', '.github/renovate.json', '.github/renovate.json5', '.gitlab/renovate.json', '.gitlab/renovate.json5', '.renovaterc', '.renovaterc.json', '.renovaterc.json5'];
 const LICENCE_CONFIGS = ['deny.toml', '.grant.yaml', '.fossa.yml'] as const;
-const K8S_DIRS = new Set(['k8s', 'kubernetes', 'manifests', 'deploy', 'helm', 'charts']);
+/** The only folders whose YAML is read for Kubernetes manifests (also named in the report's "can't see" list). */
+export const K8S_FOLDERS: readonly string[] = Object.freeze(['k8s', 'kubernetes', 'manifests', 'deploy', 'helm', 'charts']);
+const K8S_DIRS = new Set(K8S_FOLDERS);
 
 /** A regular file at a fixed path; a symbolic link at any level of it is noted and never followed. */
 async function realFile(run: QualityRun, rel: string, notes: string[]): Promise<boolean> {
@@ -559,11 +561,15 @@ async function firstReal<T extends string>(run: QualityRun, rels: readonly T[], 
 
 async function kubernetesOf(run: QualityRun, notes: string[]): Promise<boolean> {
   if (run.files.some((f) => baseOf(f) === 'Chart.yaml')) return true;
-  const yaml = run.files.filter((f) => /\.ya?ml$/.test(f) && dirOf(f).split('/').some((seg) => K8S_DIRS.has(seg))).sort().slice(0, MAX_K8S_YAML_FILES);
-  for (const f of yaml) {
+  const yaml = run.files.filter((f) => /\.ya?ml$/.test(f) && dirOf(f).split('/').some((seg) => K8S_DIRS.has(seg))).sort();
+  for (const f of yaml.slice(0, MAX_K8S_YAML_FILES)) {
     const text = await readRel(run, f, notes);
     const lines = text === null ? [] : regexLines(text);
     if (lines.some((l) => /^apiVersion:\s*\S/.test(l)) && lines.some((l) => /^kind:\s*\S/.test(l))) return true;
+  }
+  // final review m1: a "not found" past the cap may be a manifest pipegen didn't read
+  if (yaml.length > MAX_K8S_YAML_FILES) {
+    note(notes, `Only the first ${MAX_K8S_YAML_FILES.toLocaleString('en-US')} YAML files in Kubernetes folders (${K8S_FOLDERS.join(', ')}) were checked for Kubernetes manifests.`);
   }
   return false;
 }

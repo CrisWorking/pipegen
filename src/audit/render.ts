@@ -33,6 +33,7 @@ import type { SkippedGroup, WouldSet } from './choose.js';
 import { num, plural, size, usd as money } from '../util/format.js';
 import { makeSafeOutput, OUTPUT_CAP, type OutputTarget } from '../util/safe-output.js';
 import { safeMarkdown } from '../util/safe-text.js';
+import { K8S_FOLDERS } from '../read/quality.js';
 import { COVERAGE_LIMITS, type Coverage } from './coverage.js';
 import {
   buildsNoImage, isBuiltInNeed, isOwnCommand, needLabel, type AuditAi, type AuditReport, type LocalAudit, type WouldAddRow, type WouldAddTool,
@@ -83,6 +84,8 @@ export const CANT_SEE: readonly string[] = Object.freeze([
   'Network egress control (blocking unexpected traffic from release jobs) is only partly read on larger runners.',
   "Environment variables set by third-party actions aren't seen, so a check one of them turns off can show as covered.",
   'ESLint on .vue, .svelte and .astro files is not supported yet (the plugins that read them come in v0.2): such a repo never shows a clean pass for ESLint.',
+  // final review m1
+  `Kubernetes manifests are looked for only in YAML under folders named ${K8S_FOLDERS.slice(0, -1).join(', ')} or ${K8S_FOLDERS.at(-1)} (and a Chart.yaml anywhere), so manifests kept elsewhere, like infra/, aren't seen.`,
 ]);
 
 /** Plan P Task 9: the four layers, and a fifth group for the SCHEDULED_CATEGORIES rows (merge-layer needs read on their own trigger). */

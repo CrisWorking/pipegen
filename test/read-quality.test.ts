@@ -5,7 +5,7 @@ import { join, resolve } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import * as limits from '../src/read/limits.js';
 import { readProject } from '../src/read/project.js';
-import { emptyRepoFiles, emptyServiceQuality, lockfileVersions, newQualityRun, QUALITY_PACKAGES, readRepoFiles, readServiceQuality } from '../src/read/quality.js';
+import { emptyRepoFiles, emptyServiceQuality, K8S_FOLDERS, lockfileVersions, MAX_K8S_YAML_FILES, newQualityRun, QUALITY_PACKAGES, readRepoFiles, readServiceQuality } from '../src/read/quality.js';
 import type { Service } from '../src/types.js';
 import { hostileNames } from './fixtures/hostile-names.js';
 import { cleanupRepos, makeRepo, makeTempDir, writeIn } from './helpers/make-repo.js';
@@ -295,6 +295,24 @@ describe('repoFiles', () => {
     expect(await k8s({ 'config/app.yaml': manifest })).toBe(false); // not a manifests folder
     expect(await k8s({ 'k8s/values.yaml': 'replicas: 2\n  apiVersion: v1\n  kind: x\n' })).toBe(false); // indented: not top-level
     expect(await k8s({ 'k8s/notes.txt': manifest })).toBe(false);
+  });
+
+  it('repoFiles: past the cap of YAML files read for Kubernetes, a "not found" says so in a note (final review m1)', async () => {
+    const manifest = 'apiVersion: apps/v1\nkind: Deployment\n';
+    const filler = (n: number) => Object.fromEntries(Array.from({ length: n }, (_, i) => [`k8s/a${String(i).padStart(4, '0')}.yaml`, 'replicas: 2\n']));
+    const capNote = `Only the first ${MAX_K8S_YAML_FILES} YAML files in Kubernetes folders (${K8S_FOLDERS.join(', ')}) were checked for Kubernetes manifests.`;
+    // the manifest sorts after the cap: not seen, and the note says why
+    const notes: string[] = [];
+    expect((await readRepoFiles(repo({ ...filler(MAX_K8S_YAML_FILES), 'k8s/z.yaml': manifest }), notes)).kubernetes).toBe(false);
+    expect(notes).toContain(capNote);
+    // exactly at the cap: everything was read, no note
+    const atCap: string[] = [];
+    expect((await readRepoFiles(repo(filler(MAX_K8S_YAML_FILES)), atCap)).kubernetes).toBe(false);
+    expect(atCap.join('\n')).not.toContain('Kubernetes');
+    // found within the cap: no note either
+    const found: string[] = [];
+    expect((await readRepoFiles(repo({ ...filler(MAX_K8S_YAML_FILES), 'k8s/0.yaml': manifest }), found)).kubernetes).toBe(true);
+    expect(found.join('\n')).not.toContain('Kubernetes');
   });
 });
 

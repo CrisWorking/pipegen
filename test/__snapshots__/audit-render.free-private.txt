@@ -209,6 +209,9 @@ What this audit can't see
     can show as covered.
   - ESLint on .vue, .svelte and .astro files is not supported yet (the plugins that read them come
     in v0.2): such a repo never shows a clean pass for ESLint.
+  - Kubernetes manifests are looked for only in YAML under folders named k8s, kubernetes, manifests,
+    deploy, helm or charts (and a Chart.yaml anywhere), so manifests kept elsewhere, like infra/,
+    aren't seen.
 
 Next step
   The full setup arrives in v0.2 for single-package Node/TypeScript repos.
