@@ -9,6 +9,7 @@ import {
   type PinnedBinaries, type PinnedBinaryDeps,
 } from '../src/engine/linters.js';
 import { COOLDOWN_DAYS } from '../src/engine/pin.js';
+import { loadReviewed } from '../src/engine/reviewed.js';
 import type { Candidate, ReviewedTool } from '../src/types.js';
 import { fakeFetch, type Routes } from './helpers/fake-http.js';
 import { makeTarGz, type TarEntry } from './helpers/fake-tar.js';
@@ -93,6 +94,7 @@ function setup(opts: {
     gitleaks: entry,
     actionlint: { ...entry, repo: 'rhysd/actionlint', member: 'actionlint', platforms: rehost(platforms, 'rhysd/actionlint', 'actionlint') },
     cosign: { ...entry, repo: 'sigstore/cosign', member: 'cosign', platforms: rehost(platforms, 'sigstore/cosign', 'cosign') },
+    betterleaks: { ...entry, repo: 'betterleaks/betterleaks', member: 'betterleaks', platforms: rehost(platforms, 'betterleaks/betterleaks', 'betterleaks') },
   } as PinnedBinaries;
   const routes: Routes = {
     [`GET ${DL}${URL_PATH}`]: { status: 302, headers: { location: `${ASSETS}${ASSET_PATH}?sig=x` } },
@@ -480,9 +482,9 @@ describe('ensurePinnedBinary: platforms', () => {
 describe('pinned-binaries.yml', () => {
   const HEX = /^[0-9a-f]{64}$/;
 
-  it('pinned-binaries.yml: gitleaks, actionlint and cosign pinned for linux and darwin, x64 and arm64, with both hashes', () => {
+  it('pinned-binaries.yml: betterleaks, gitleaks, actionlint and cosign pinned for linux and darwin, x64 and arm64, with both hashes', () => {
     const pins = loadPinnedBinaries();
-    expect(Object.keys(pins).sort()).toEqual(['actionlint', 'cosign', 'gitleaks']);
+    expect(Object.keys(pins).sort()).toEqual(['actionlint', 'betterleaks', 'cosign', 'gitleaks']);
     for (const [name, entry] of Object.entries(pins)) {
       expect(Object.keys(entry.platforms).sort(), name).toEqual(['darwin-arm64', 'darwin-x64', 'linux-arm64', 'linux-x64']);
       for (const [key, a] of Object.entries(entry.platforms)) {
@@ -498,6 +500,39 @@ describe('pinned-binaries.yml', () => {
         }
       }
     }
+  });
+
+  it('pins: betterleaks entry valid for 4 platforms; version and hash match the reviewed entry (S25)', () => {
+    const pins = loadPinnedBinaries();
+    const b = pins.betterleaks;
+    expect(b).toMatchObject({ version: '1.9.0', repo: 'betterleaks/betterleaks', releasedAt: '2026-09-29T20:08:06Z', member: 'betterleaks', reviewedBy: 'PENDING', reviewedAt: 'PENDING' });
+    // re-checked live on pin day: the downloaded archive = the release's checksums.txt (cosign-verified, release.yml at
+    // refs/tags/v1.9.0) = GitHub's asset digest; the binary hash and size from the one `betterleaks` member of each archive
+    const want: Record<string, [string, number, string, number, string]> = {
+      'linux-x64': ['linux_x64', 9888483, 'f8b185a39ffcece2a1ca82bf3a4e7435cd81963ffd16b7a9128daf75f35f6de7', 24174776, '0ace40b41652344608f89967fe93c6caf4faae9a4df20423632c7efb02a4d4e1'],
+      'linux-arm64': ['linux_arm64', 9058332, '1d39116e0a58dc94574715e2aa12a2dbd5062f193eee3fec011fef6ba06bd13b', 22544568, '488e0aa9f34e4144c70ba58ab83f1cda11fb4a5f84897b513e55b2afe71b7e8a'],
+      'darwin-x64': ['darwin_x64', 10040581, '68dfd83458d9e7f90663daa7a81c7f944083b170dae82e4f5f8d0581ed519ef1', 24717648, '1581b1ad0d7d640459c728344c9d431339c8855cd2b5ccd35a9a56a7260b071a'],
+      'darwin-arm64': ['darwin_arm64', 9389819, '83dd7eaab13d44a1e8e347a17064cdef153a1478db473276d41b38d55613d3f2', 23209410, '70d2103c2915aababa0e1eea121bd3db0ff0da86bee40ddc6f5982181acaf6d0'],
+    };
+    expect(Object.keys(b.platforms).sort()).toEqual(Object.keys(want).sort());
+    for (const [key, [plat, archiveSize, archiveSha256, binarySize, binarySha256]] of Object.entries(want)) {
+      expect(b.platforms[key as keyof typeof b.platforms], key).toEqual({
+        url: `https://github.com/betterleaks/betterleaks/releases/download/v1.9.0/betterleaks_1.9.0_${plat}.tar.gz`,
+        archive: 'tar.gz', archiveSize, archiveSha256, binarySize, binarySha256,
+      });
+    }
+    // S25: the reviewed entry (user CI) is the same release, and its hash is the pinned linux-x64 archive's
+    const reviewed = loadReviewed();
+    const entry = reviewed.find((t) => t.id === 'betterleaks') as ReviewedTool;
+    expect(entry.candidate.version).toBe(`v${b.version}`);
+    expect(entry.candidate.pin.checksum).toBe(b.platforms['linux-x64'].archiveSha256);
+    expect(b.platforms['linux-x64'].url.endsWith(`/${entry.step.cli?.install.package as string}`)).toBe(true);
+    expect(checkPinnedAgainstReviewed(pins, reviewed)).toEqual([]);
+    // and the S25 check really covers betterleaks: another version or hash is reported, naming it
+    const bumped = { ...pins, betterleaks: { ...b, version: '1.8.0' } };
+    expect(checkPinnedAgainstReviewed(bumped, [entry]).join('\n')).toMatch(/^betterleaks: the reviewed entry betterleaks is version v1\.9\.0/m);
+    const rehashed = { ...pins, betterleaks: { ...b, platforms: { ...b.platforms, 'linux-x64': { ...b.platforms['linux-x64'], archiveSha256: 'a'.repeat(64) } } } };
+    expect(checkPinnedAgainstReviewed(rehashed, [entry]).join('\n')).toMatch(/^betterleaks: the reviewed entry betterleaks has a hash/m);
   });
 
   it(`pinned-binaries.yml: every release was at least ${COOLDOWN_DAYS} days old when pinned, by the pinnedOn the file records (ruling S26, M5)`, () => {

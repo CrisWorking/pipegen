@@ -139,7 +139,7 @@ describe('build', () => {
     } else {
       expect(result.pinnedBinaries).toEqual({ loaded: loadPinnedBinaries() });
     }
-    expect(Object.keys(loadPinnedBinaries()).sort()).toEqual(['actionlint', 'cosign', 'gitleaks']); // from src (dev build): loads
+    expect(Object.keys(loadPinnedBinaries()).sort()).toEqual(['actionlint', 'betterleaks', 'cosign', 'gitleaks']); // from src (dev build): loads
     expect(result.aiPrices).toEqual(loadAiPrices()); // read from <pkg>/data/ai-prices.yml by the bundled loader
     expect(result.githubPlans).toEqual(loadGitHubPlans()); // read from <pkg>/data/github-plans.yml by the bundled loader
     expect(result.toolSignatures).toEqual(loadToolSignatures()); // read from <pkg>/data/tool-signatures.yml by the bundled loader

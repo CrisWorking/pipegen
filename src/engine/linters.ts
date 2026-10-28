@@ -1,5 +1,6 @@
-// Pinned tool binaries pipegen runs on the user's machine (Plan B Task 7 Part 1): gitleaks for the required code
-// bundle pass (Plan A Task 5, `audit --ai`), actionlint, and cosign. A wrong or tampered binary must never run.
+// Pinned tool binaries pipegen runs on the user's machine (Plan B Task 7 Part 1): betterleaks for the required code
+// bundle secret scan (Plan A Task 5, `audit --ai`; Plan P Task 7), gitleaks as its fallback, actionlint, and cosign. A
+// wrong or tampered binary must never run.
 //
 // ensurePinnedBinary (ruling B3):
 // - data/pinned-binaries.yml holds, per platform, the download URL, the archive's sha256 (as upstream's checksums
@@ -38,8 +39,8 @@ import { COOLDOWN_DAYS, downloadRelease } from './pin.js';
 import { isReleaseBuild, listPending, PENDING, reviewMarkerProblems } from './review-marker.js';
 import { ASSET_RE, isGitHubRepo, SHA256_RE } from './names.js';
 
-export type PinnedName = 'actionlint' | 'cosign' | 'gitleaks';
-export const PINNED_NAMES: readonly PinnedName[] = ['actionlint', 'cosign', 'gitleaks'];
+export type PinnedName = 'actionlint' | 'betterleaks' | 'cosign' | 'gitleaks';
+export const PINNED_NAMES: readonly PinnedName[] = ['actionlint', 'betterleaks', 'cosign', 'gitleaks'];
 export const PLATFORM_KEYS = ['linux-x64', 'linux-arm64', 'darwin-x64', 'darwin-arm64'] as const;
 export type PlatformKey = (typeof PLATFORM_KEYS)[number];
 
@@ -87,8 +88,8 @@ const entrySchema = z.object({
   }
 });
 
-/** data/pinned-binaries.yml: exactly gitleaks, actionlint and cosign. */
-export const pinnedBinariesSchema = z.object({ gitleaks: entrySchema, actionlint: entrySchema, cosign: entrySchema }).strict();
+/** data/pinned-binaries.yml: exactly betterleaks, gitleaks, actionlint and cosign. */
+export const pinnedBinariesSchema = z.object({ betterleaks: entrySchema, gitleaks: entrySchema, actionlint: entrySchema, cosign: entrySchema }).strict();
 export type PinnedBinaries = z.infer<typeof pinnedBinariesSchema>;
 export type PinnedBinary = PinnedBinaries[PinnedName];
 export type PinnedAsset = PinnedBinary['platforms'][PlatformKey];
