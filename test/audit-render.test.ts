@@ -899,6 +899,24 @@ describe('Plan P Task 9: the report shows every catalogue check', () => {
     for (const text of [term(leaky, { knownValues: [leak] }), md(leaky, { knownValues: [leak] }), json(leaky, { knownValues: [leak] })]) expect(text).not.toContain(leak);
   });
 
+  it('report: the new fields keep their cleaned text and are capped when very long (review M3)', () => {
+    const r = planPReport();
+    const long = 'a'.repeat(5000);
+    const evil = {
+      ...r,
+      wouldAdd: r.wouldAdd.map((w) => (w.tool !== null && 'kind' in w.tool && w.tool.kind === 'repo-tool' ? { ...w, tool: repoTool({ version: long, tool: long }) } : w)),
+      skipped: [{ why: `no ${hostileNames.ansiColour} here`, categories: ['format'], services: [`svc${hostileNames.bidiOverride}`, long] }] as AuditReport['skipped'],
+      wouldSet: [{ setting: 'sha-pinning' as const, why: `x${hostileNames.ansiColour} ${long}` }],
+    };
+    const t = tflat(evil);
+    expect(t).toContain('no red-app here');
+    expect(t).toContain('svcapp');
+    for (const text of [term(evil), md(evil), json(evil)]) {
+      expect(text).not.toContain('a'.repeat(2001));
+      expect(text).toMatch(/\(value too long to show\)|a{100}/);
+    }
+  });
+
   it("report: what pipegen can't see names the Plan P limits", () => {
     const all = CANT_SEE.join(' ');
     for (const part of [

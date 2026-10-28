@@ -388,7 +388,7 @@ export async function buildAudit(dir: string, deps: AuditDeps): Promise<AuditRep
     coverage,
     wouldAdd,
     skipped: skippedGroups(profile, caps),
-    wouldSet: wouldSetSettings(profile, coverage),
+    wouldSet: wouldSetSettings(profile, coverage, skippedWorkflowCount(readerNotes)),
     wouldCreate: wouldCreateOf(profile),
     testsNote: profile.services.length === 0 ? NO_SERVICE_TO_TEST : null,
     estimates,

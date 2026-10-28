@@ -6,38 +6,40 @@ It opens one pull request. You review it. It never touches your app code or your
 
 > **Status: early, not published yet.** `pipegen audit` (read-only) is built and tested on real public repos; it is not on npm yet, so the commands below don't work until the first release. The full run (one PR) comes later. See the [roadmap](docs/roadmap.md).
 
-## What the audit will show you *(example, not real yet)*
+## What the audit shows you *(excerpt of a real run on a public repo, expressjs/express; "..." marks cut parts)*
 
 ```text
 $ npx --registry=https://registry.npmjs.org pipegen@0.1.0 audit --dir ./my-repo
 
-Verdict: 5 of 5 layers have gaps; 3 are serious.
+pipegen audit: expressjs/express
 
-Checks by layer
-  Before each commit: serious gaps (0 of 3 checks covered)
-    ⚠ missing  Secret scan
-  On every push: serious gaps (2 of 11 checks covered)
-    ⚠ partial  Unit tests for app
-               Your own `npm test` runs, but not on every push.
-      missing  Dead code and unused dependencies for app (warning only)
-  On every pull request, before merge: serious gaps (4 of 16 checks covered)
-    ⚠ missing  Merge gate (pipegen)
-  When the code is deployed or released: gaps (0 of 2 checks covered)
-      missing  Deploy check (pipegen)
-  On a schedule and in repo files: gaps (0 of 2 checks covered)
-      missing  Dependency update config (warning only)
+Verdict: 4 of 4 layers have gaps; 4 are serious. pipegen couldn't check everything in 1 layer.
+Scheduled and repo-file checks: gaps (1 of 2 checks covered).
+
+...
+
+  On a schedule and in repo files: gaps (1 of 2 checks covered)
+      partial  Dependency update config (warning only)
+               Dependabot's default wait is 3 days; pipegen uses 7. Set cooldown default-days to at
+               least 7 (with no lower per-type days, include or exclude) on every entry.
+               Found: dependabot in .github/dependabot.yml
+      covered  OpenSSF Scorecard (warning only)
+               The scorecard check runs on a schedule or on every push to the default branch.
+               Found: scorecard in .github/workflows/scorecard.yml (job analysis)
+
+...
 
 Checks that don't apply here
-  Type check, Test coverage minimum: no tsconfig.json or typescript dependency found
-
-What pipegen would add
-  Type check for app: your own `tsc` 7.0.2 (from your lockfile) would run here
+  - Type check (for express): no tsconfig.json or typescript dependency found
+  - Dockerfile lint (for express): no Dockerfile found
+  ...
 
 After the setup PR is merged, pipegen would turn on:
-  Require actions pinned to a commit: ... Today 2 of your 3 workflows use actions pinned by tag or branch ...
-
-Costs of the full setup (estimates)
-  After setup: about 610 minutes a month.
+  - Require actions pinned to a commit: Makes GitHub refuse any action that is not pinned to a
+    commit. pipegen turns it on only after your other workflows pin their actions to a commit. Today
+    none of your 5 workflows use tag pins; pipegen can't see this setting with read access, so it
+    can't say whether it is already on.
+  ...
 ```
 
 [See the full example report →](examples/audit-example.md)

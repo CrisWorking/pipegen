@@ -341,7 +341,7 @@ describe('wouldSet', () => {
     expect(pub[2]?.why).toContain('push protection');
     const priv = wouldSetSettings(profile([svc()], { private: true }), []);
     expect(priv.map((x) => x.setting)).toEqual(['sha-pinning', 'dependabot-alerts', 'secret-scanning']);
-    expect(priv[2]?.why).toBe("A paid add-on (GitHub Secret Protection); pipegen can't turn it on here.");
+    expect(priv[2]?.why).toBe("Needs GitHub Secret Protection (a paid add-on); pipegen can't turn it on without it.");
     expect(priv[2]?.why).not.toMatch(/public|push protection/i);
     expect(pub[0]?.why).toContain("can't see this setting with read access");
   });
@@ -361,6 +361,23 @@ describe('wouldSet', () => {
     expect(why([])).toContain('Today no workflow uses tag pins');
     // the count wins over a passing pin-check row
     expect(why(wfs(3), true)).toContain('Today 1 of your 1 workflow uses actions pinned by tag or branch');
+  });
+  it('wouldSet: never says "none" when a workflow was not read or a uses: line was not checked (review I2)', () => {
+    const wf = (extra: object = {}) => ({ path: '.github/workflows/a.yml', triggers: ['push'], deploys: false, [USED]: [], jobs: ['a'], ...extra }) as unknown as ExistingWorkflow;
+    const why = (workflows: ExistingWorkflow[], skipped?: number) => wouldSetSettings(profile([svc()], { existingWorkflows: workflows }), [], skipped)[0]?.why ?? '';
+    // some workflows were skipped (a cap, a link, a parse error): no "none", and no "no workflow" either
+    const skipped = why([wf(), wf()], 3);
+    expect(skipped).not.toMatch(/none of your|no workflow uses/i);
+    expect(skipped).toContain("pipegen could not read all your workflows");
+    expect(why([], 2)).not.toContain('Today no workflow uses tag pins');
+    // with some tag pins found and some workflows unread, the count is a lower bound
+    expect(why([wf({ tagPinned: 2 }), wf()], 1)).toContain('Today at least 1 of your 2 workflows use actions pinned by tag or branch');
+    // a uses: line pipegen could not check
+    const partial = why([wf({ usesUnchecked: true }), wf()]);
+    expect(partial).not.toMatch(/none of your/i);
+    expect(partial).toContain('pipegen could not read all your workflows');
+    // everything read and checked: "none" is allowed
+    expect(why([wf(), wf()], 0)).toContain('Today none of your 2 workflows use tag pins');
   });
   it('wouldSet: the sha-pinning why follows the pin check row (PS36)', () => {
     const covered = [{ need: needOf('workflow-pin-check'), status: 'covered', why: '' }] as never;

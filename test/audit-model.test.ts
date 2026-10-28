@@ -767,7 +767,7 @@ describe('buildAudit: Plan P Task 8 (choosing, skipped checks, settings)', () =>
     expect(pub.wouldSet[2]?.why).toContain('push protection');
     const priv = await buildAudit(repo(nodeApp()), deps({ context: { private: true, ownerType: 'User', plan: 'free', defaultBranch: 'main' }, capabilities: bareCaps }));
     expect(priv.wouldSet.map((x) => x.setting)).toEqual(['sha-pinning', 'dependabot-alerts', 'secret-scanning']);
-    expect(priv.wouldSet[2]?.why).toContain('paid add-on (GitHub Secret Protection)');
+    expect(priv.wouldSet[2]?.why).toContain('Needs GitHub Secret Protection (a paid add-on)');
     expect(priv.wouldSet[2]?.why).not.toMatch(/push protection|public/i);
   });
 

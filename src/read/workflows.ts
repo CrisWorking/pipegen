@@ -77,7 +77,7 @@ function deploysOf(doc: Record<string, unknown>, path: string): boolean {
  * `env:` sets NPM_CONFIG_DRY_RUN (any letter case, or an `env:` given as one expression) or the step's text names it.
  */
 const publishesField = (p: ('npm' | 'pypi')[]) => (p.length > 0 ? { publishes: p } : {});
-const tagPinnedField = (n: number) => (n > 0 ? { tagPinned: n } : {});
+const tagPinnedField = (t: { n: number; unchecked: boolean }) => ({ ...(t.n > 0 ? { tagPinned: t.n } : {}), ...(t.unchecked ? { usesUnchecked: true as const } : {}) });
 const PR_ONLY = new Set(['pull_request', 'pull_request_target']);
 const DRY_RUN_WORD = /(?:^|\s)--dry-run(?:[=\s]|$)/;
 const dryRunEnv = (env: unknown) => env !== undefined && env !== null
@@ -107,11 +107,15 @@ function publishesOf(doc: Record<string, unknown>): ('npm' | 'pypi')[] {
  * a tag or branch instead of a 40-character commit. A local path (./...) and a docker:// image aren't counted; the
  * count covers only the file's own top-level jobs. Only a number leaves this file.
  */
-const COMMIT_REF = /^[0-9a-f]{40}$/;
-function tagPinnedOf(doc: Record<string, unknown>): number {
+const COMMIT_REF = /^[0-9a-f]{40}$/i;
+function tagPinnedOf(doc: Record<string, unknown>): { n: number; unchecked: boolean } {
   let n = 0;
+  let unchecked = false;
   const check = (u: string) => {
-    if (!regexSafe(u)) return;
+    if (!regexSafe(u)) {
+      unchecked = true; // not counted: the report must not claim "none"
+      return;
+    }
     const t = u.trim();
     if (t.startsWith('./') || t.startsWith('docker://')) return;
     const at = t.lastIndexOf('@');
@@ -122,7 +126,7 @@ function tagPinnedOf(doc: Record<string, unknown>): number {
     for (const u of strings(j.uses)) check(u);
     for (const step of Array.isArray(j.steps) ? j.steps : []) for (const u of strings(asObj(step).uses)) check(u);
   }
-  return n;
+  return { n, unchecked };
 }
 
 const LINKED_NOTE = 'Skipped .github/workflows: it is reached through a symbolic link.';

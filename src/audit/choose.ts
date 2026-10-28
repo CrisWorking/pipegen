@@ -276,16 +276,20 @@ export interface WouldSet { setting: 'sha-pinning' | 'dependabot-alerts' | 'secr
 const CANT_SEE = "pipegen can't see this setting with read access, so it can't say whether it is already on";
 
 /** ST1-ST3 (DEC #27, #14). Set by `finish` after the merge. Private repos never get public wording. */
-export function wouldSetSettings(p: RepoProfile, coverage: readonly Coverage[]): WouldSet[] {
+export function wouldSetSettings(p: RepoProfile, coverage: readonly Coverage[], skippedWorkflows = 0): WouldSet[] {
   const pin = coverage.find((c) => c.need.category === 'workflow-pin-check');
   const pinned = pin !== undefined && pin.status === 'covered';
   // PS36: the setting breaks every workflow whose actions are pinned by tag, so the why names that precondition and counts them
   const tagged = p.existingWorkflows.filter((w) => (w.tagPinned ?? 0) > 0).length;
   const total = p.existingWorkflows.length;
+  // review I2: "none" only when every workflow was read and every uses: line was checked
+  const complete = skippedWorkflows === 0 && !p.existingWorkflows.some((w) => w.usesUnchecked === true);
+  const unread = 'pipegen could not read all your workflows, so it can\'t count them all';
   const today = tagged > 0
-    ? `Today ${tagged} of your ${total} ${total === 1 ? 'workflow uses' : 'workflows use'} actions pinned by tag or branch, and ${tagged === 1 && total === 1 ? 'it would' : 'they would'} stop running`
-    : total === 0 ? 'Today no workflow uses tag pins'
-      : `Today none of your ${total} ${total === 1 ? 'workflow uses' : 'workflows use'} tag pins${pinned ? ' (the action pin check passes today)' : ''}`;
+    ? `Today ${complete ? '' : 'at least '}${tagged} of your ${total} ${total === 1 ? 'workflow uses' : 'workflows use'} actions pinned by tag or branch, and ${tagged === 1 && total === 1 ? 'it would' : 'they would'} stop running${complete ? '' : ` (${unread})`}`
+    : !complete ? `Today ${unread}`
+      : total === 0 ? 'Today no workflow uses tag pins'
+        : `Today none of your ${total} ${total === 1 ? 'workflow uses' : 'workflows use'} tag pins${pinned ? ' (the action pin check passes today)' : ''}`;
   const out: WouldSet[] = [
     {
       setting: 'sha-pinning',
@@ -294,7 +298,7 @@ export function wouldSetSettings(p: RepoProfile, coverage: readonly Coverage[]):
     { setting: 'dependabot-alerts', why: `Tells you when a dependency has a known vulnerability; free on every repo. ${CANT_SEE}.` },
   ];
   out.push(p.private
-    ? { setting: 'secret-scanning', why: `A paid add-on (GitHub Secret Protection); pipegen can't turn it on here.` }
+    ? { setting: 'secret-scanning', why: `Needs GitHub Secret Protection (a paid add-on); pipegen can't turn it on without it.` }
     : { setting: 'secret-scanning', why: `Blocks pushes that contain a known secret format (push protection). ${CANT_SEE}.` });
   return out;
 }

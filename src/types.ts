@@ -42,6 +42,7 @@ export interface RepoFiles {
 export interface ExistingWorkflow {
   path: string; triggers: string[]; deploys: boolean; secretsUsed: string[]; jobs: string[];
   tagPinned?: number;   // Task 9 (PS36): how many `uses:` lines (steps and called workflows) point at an action by tag or branch, not by a 40-character commit. Absent = none
+  usesUnchecked?: true;   // Task 9: a `uses:` line was too odd to check (regexSafe), so tagPinned may be too low
   publishes?: ('npm' | 'pypi')[];   // Plan U Task 5: registries a step publishes to (a run line that starts with a publish command, or the PyPI publish action). Absent = none
 }
 export type Plan = 'free' | 'pro' | 'team' | 'enterprise' | 'unknown';

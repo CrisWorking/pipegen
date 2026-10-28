@@ -55,6 +55,14 @@ jobs:
     expect((await one('on: push\njobs:\n  a:\n    runs-on: x\n    steps:\n      - run: echo\n', 'b.yml'))?.tagPinned).toBeUndefined();
   });
 
+  it('workflows: usesUnchecked marks a workflow with a uses: line pipegen could not check; an uppercase commit counts as pinned (review I2, M1)', async () => {
+    const long = `o/r@v${'1'.repeat(5000)}`;
+    const w = await one(`on: push\njobs:\n  a:\n    runs-on: x\n    steps:\n      - uses: ${long}\n      - uses: actions/checkout@${'A'.repeat(40)}\n`);
+    expect(w?.usesUnchecked).toBe(true);
+    expect(w?.tagPinned).toBeUndefined();
+    expect((await one('on: push\njobs:\n  a:\n    runs-on: x\n    steps:\n      - uses: actions/checkout@v4\n', 'c.yml'))?.usesUnchecked).toBeUndefined();
+  });
+
   it('workflows: environment key marks deploy', async () => {
     const w = await one('name: CI\non: push\njobs:\n  ship:\n    runs-on: x\n    environment: production\n    steps:\n      - run: echo hi\n');
     expect(w?.deploys).toBe(true);
