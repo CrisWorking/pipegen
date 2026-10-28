@@ -377,6 +377,27 @@ describe('bundle: gitleaks pass', () => {
     }
   });
 
+  it('bundle: a file with a binary-format magic at a fixed later byte (tar 257, DICOM 128, ISO 9660 32769…) is left out before the scan', async () => {
+    // Task 7 re-review R1: the leading newline doesn't help when the scanners sniff a magic word at a fixed offset of
+    // the file as written; they skip such a file and exit clean. The offsets below are in the file as written.
+    // Short lines (long ones are redacted before the scan), padded so the magic lands at `offset` once the "\n" is added.
+    const at = (offset: number, magic: string) => {
+      const fill = ('x'.repeat(99) + '\n').repeat(Math.floor((offset - 1) / 100));
+      return fill + 'x'.repeat(offset - 1 - fill.length) + magic + '\nconst k = 1;\n';
+    };
+    const dir = makeTempDir();
+    writeIn(dir, 'src/tar.ts', at(257, 'ustar'));
+    writeIn(dir, 'src/dicom.ts', at(128, 'DICM'));
+    for (const [i, off] of [32769, 34817, 36865].entries()) writeIn(dir, `src/iso${i}.ts`, at(off, 'CD001'));
+    writeIn(dir, 'src/near.ts', at(258, 'ustar')); // one byte off: scanned as usual
+    writeIn(dir, 'src/ok.ts', 'export const ok = 1;\n');
+    for (const scanner of [betterleaksAt, gitleaksAt]) {
+      const b = await bundleCode(dir, scanWith(scanner(makeStub(CLEAN).bin)));
+      expect(paths(b), scanner.name).toEqual(['src/near.ts', 'src/ok.ts']);
+      expect(b.notes.join('\n'), scanner.name).toMatch(/Left out because the secret scanners skip files shaped like this/);
+    }
+  });
+
   it('bundle: a finding reported on the added first line (the empty prefix) → the file is left out', async () => {
     const found = 'plain' + '-looking-' + 'value-5520';
     const dir = makeTempDir();

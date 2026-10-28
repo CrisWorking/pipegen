@@ -243,6 +243,22 @@ describe.skipIf(!live)('secret scan (live, both pinned scanners): files that sta
     }
   });
 
+  it('live: magic words at a fixed later byte (tar 257, DICOM 128, ISO 9660 32769) are skipped even after the leading newline (why redact.ts leaves such files out)', () => {
+    const shop = shopifyValue();
+    const at = (offset: number, magic: string) => {
+      const fill = ('x'.repeat(99) + '\n').repeat(Math.floor((offset - 1) / 100));
+      return '\n' + fill + 'x'.repeat(offset - 1 - fill.length) + magic + `\nconst shop = "${shop}";\n`;
+    };
+    for (const name of ['betterleaks', 'gitleaks'] as const) {
+      const dir = makeTempDir();
+      writeIn(dir, 'f000001.txt', at(257, 'ustar'));
+      writeIn(dir, 'f000002.txt', at(128, 'DICM'));
+      writeIn(dir, 'f000003.txt', at(32769, 'CD001'));
+      writeIn(dir, 'f000004.txt', at(258, 'ustar')); // one byte off: found
+      expect(scanWithArgv(name, dir).map((f) => f.split(':')[0]), name).toEqual(['f000004.txt']);
+    }
+  });
+
   it('live: end to end, a token after any of the 11 heads, or in a file name shown first as MZ…, never reaches the bundle text (betterleaks and gitleaks)', async () => {
     const shop = shopifyValue();
     const lab = gitlabValue();

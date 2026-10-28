@@ -1299,6 +1299,18 @@ interface Finding { file: string; startLine?: number; endLine?: number; secret: 
 const SCAN_PREFIX = '\n';
 const PREFIX_LINES = 1;
 
+/**
+ * Task 7 re-review R1: the prefix only helps for magic numbers at byte 0. Both scanners also sniff a few formats at a
+ * fixed later byte of the file as written (tar's `ustar` at 257, DICOM's `DICM` at 128, ISO 9660's `CD001` at 32769,
+ * 34817 and 36865) and skip such a file with a clean exit. A file matching one is left out before the scan.
+ */
+const LATE_MAGIC: ReadonlyArray<readonly [number, string]> = [[257, 'ustar'], [128, 'DICM'], [32769, 'CD001'], [34817, 'CD001'], [36865, 'CD001']];
+
+function scannersWouldSkip(written: string): boolean {
+  const buf = Buffer.from(written, 'utf8');
+  return LATE_MAGIC.some(([at, magic]) => buf.subarray(at, at + magic.length).toString('latin1') === magic);
+}
+
 /** Maps a finding's lines from the file as written to its content; a finding on the prefix can't be placed. */
 function unprefixed(f: Finding): Finding {
   if (f.startLine === undefined || f.endLine === undefined) return { ...f, startLine: undefined, endLine: undefined };
@@ -1463,6 +1475,9 @@ async function secretScanPass(files: FileEntry[], scanner: SecretScanner, timeou
   } catch (e) {
     throw new SecretScanError(e instanceof Error ? e.message : `pipegen's ${name} config could not be found.`);
   }
+  const sniffed = files.filter((f) => scannersWouldSkip(SCAN_PREFIX + neutralizeAllow(f.content)));
+  notes.addPaths('Left out because the secret scanners skip files shaped like this (a binary-format marker at a fixed byte):', sniffed.map((f) => f.path), show);
+  files = files.filter((f) => !sniffed.includes(f));
   const scanned = files.map((f) => ({ path: f.path, content: neutralizeAllow(f.content) }));
   const shownPaths = scanned.map((f) => displayPath(f.path));
   const made = await mkdtemp(join(tmpdir(), 'pipegen-secret-scan-'));
