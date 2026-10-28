@@ -77,7 +77,21 @@ export class Reader {
   }
   private listed = new Map<string, Promise<ReadonlySet<string> | null>>();
 
-  async yaml(rel: string): Promise<Read<Obj>> {
+  /**
+   * `rel` as a YAML map. Each distinct file is parsed once (a composite action used by 20,000 steps is the same 100 KB
+   * of text each time, and its parsed form is only ever read, never changed).
+   */
+  yaml(rel: string): Promise<Read<Obj>> {
+    let r = this.parsed.get(rel);
+    if (r === undefined) {
+      r = this.parse(rel);
+      this.parsed.set(rel, r);
+    }
+    return r;
+  }
+  private parsed = new Map<string, Promise<Read<Obj>>>();
+
+  private async parse(rel: string): Promise<Read<Obj>> {
     const r = await this.text(rel);
     if (!('ok' in r)) return r;
     try {
