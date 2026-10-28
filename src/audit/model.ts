@@ -852,9 +852,16 @@ function hasProjectScript(need: Need, p: RepoProfile): boolean {
   return projectScriptFor(need, service) !== null;
 }
 
-/** The pinned scanner `name`, downloaded and verified (ensurePinnedBinary), with its pinned version. */
+/**
+ * The pinned scanner `name`, downloaded and verified (ensurePinnedBinary), with its pinned version. The version comes
+ * from the same pins table the binary is checked against (review M3), so the consent check below binds the version the
+ * screen showed to the binarySha256 of the binary that runs. With a caller's ensureSecretScanner, that check guards
+ * against the dependency handing back another scanner or version.
+ */
 async function defaultSecretScanner(name: SecretScannerName): Promise<SecretScanner> {
-  return { name, path: await ensurePinnedBinary(name), version: loadPinnedBinaries()[name].version };
+  const pins = loadPinnedBinaries();
+  const path = await ensurePinnedBinary(name, undefined, { pins });
+  return { name, path, version: pins[name].version };
 }
 
 /**

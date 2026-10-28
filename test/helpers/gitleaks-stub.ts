@@ -22,11 +22,17 @@ const report = argv[argv.indexOf('--report-path') + 1];
 const files = {};
 for (const f of fs.readdirSync(src)) files[f] = fs.readFileSync(path.join(src, f), 'utf8');
 fs.writeFileSync(${JSON.stringify(rec)}, JSON.stringify({ argv, cwd: process.cwd(), envKeys: Object.keys(process.env), files, src }));
-function findingsFor(value, match) {
+// A finding shaped like the real report (betterleaks 1.9.0 / gitleaks 8.30.1 JSON: RuleID, Tags, Fingerprint, …), with
+// lines counted in the file AS WRITTEN (pipegen's leading newline included), as the real scanners count them.
+function findingsFor(value, match, tags) {
   const out = [];
   for (const [f, text] of Object.entries(files)) {
     const lines = text.split('\\n');
-    lines.forEach((l, i) => { if (l.includes(value)) out.push({ File: path.join(src, f), StartLine: i + 1, EndLine: i + 1, Match: match || value, ['Sec' + 'ret']: value }); });
+    lines.forEach((l, i) => {
+      if (!l.includes(value)) return;
+      const file = path.join(src, f);
+      out.push({ RuleID: 'stub-rule', File: file, StartLine: i + 1, EndLine: i + 1, Match: match || value, ['Sec' + 'ret']: value, Tags: tags || [], Fingerprint: file + ':stub-rule:' + (i + 1) });
+    });
   }
   return out;
 }

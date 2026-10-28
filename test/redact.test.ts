@@ -1,7 +1,9 @@
-import { execFileSync } from 'node:child_process';
-import { existsSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { execFileSync, spawn } from 'node:child_process';
+import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { isAbsolute, join, relative, resolve } from 'node:path';
 import picomatch from 'picomatch';
+import { build } from 'tsup';
+import { tsupOptions } from '../tsup.config.js';
 import { afterEach, describe, expect, it } from 'vitest';
 import {
   bundleCode, bundleText, EXCLUDED_PATTERNS, SecretScanError, SecretScanRequiredError, secretScanArgv, secretScanConfigPath,
@@ -280,8 +282,9 @@ describe('bundle: gitleaks pass', () => {
     const scannedNames = Object.keys(rec.files).filter((f) => f !== 'paths.txt');
     expect(scannedNames.every((f) => /^f\d+\.txt$/.test(f))).toBe(true);
     expect(scannedNames).toHaveLength(b.files.length);
-    expect(scannedNames.map((f) => rec.files[f]).sort()).toEqual(b.files.map((f) => f.content).sort());
-    expect(rec.files['paths.txt'].split('\n').sort()).toEqual(paths(b));
+    // each written after one leading newline (ruling P30: no binary-format magic at offset 0)
+    expect(scannedNames.map((f) => rec.files[f]).sort()).toEqual(b.files.map((f) => `\n${f.content}`).sort());
+    expect(rec.files['paths.txt'].split('\n').slice(1).sort()).toEqual(paths(b));
     // what gitleaks scanned was already redacted
     const scanned = Object.values(rec.files).join('\n');
     for (const v of values) expect(scanned).not.toContain(v);
@@ -337,7 +340,7 @@ describe('bundle: gitleaks pass', () => {
       const scanned = Object.values(rec.files).join('\n'); // the files and paths.txt
       expect(scanned.toLowerCase(), at.name).not.toContain(gl);
       expect(scanned.toLowerCase(), at.name).not.toContain(bl);
-      expect(rec.files['paths.txt'].split('\n').length, at.name).toBe(3);
+      expect(rec.files['paths.txt'].split('\n').length, at.name).toBe(4); // the leading newline, then 3 paths
       expect(b.files.map((f) => f.content).join('\n').toLowerCase(), at.name).not.toMatch(/(?:gitleaks|betterleaks):allow/);
     }
   });
@@ -351,6 +354,106 @@ describe('bundle: gitleaks pass', () => {
       await expect(bundleCode(dir, scanWith(at(makeStub(`fs.writeFileSync(report, '[]'); process.exit(2);`).bin))), at.name).rejects.toBeInstanceOf(SecretScanError);
     }
   });
+
+  it('bundle: every scanned file and paths.txt start with a newline (no binary-format magic at offset 0); reported lines map back', async () => {
+    // ruling P30: both scanners skip a file whose first bytes look like a binary format (%PDF-, MZ, %!PS, …) and still
+    // exit clean. pipegen writes one "\n" first, so nothing it scans starts with a magic number, and subtracts 1 from
+    // every reported line.
+    const found = 'plain' + '-looking-' + 'value-7731';
+    const dir = makeTempDir();
+    writeIn(dir, 'src/a.ts', `MZ,Mozambique\nconst b = '${found}';\nconst c = 3;\n`);
+    writeIn(dir, `MZ-${found}.csv`, 'x,y\n'); // a path whose shown name starts with MZ and holds the value
+    for (const at of [betterleaksAt, gitleaksAt]) {
+      const stub = makeStub(reportValue(found));
+      const b = await bundleCode(dir, scanWith(at(stub.bin)));
+      const rec = stub.record();
+      for (const [name, text] of Object.entries(rec.files)) expect(text.startsWith('\n'), `${at.name} ${name}`).toBe(true);
+      // the stub reports line 3 of the file as written (line 2 of the content): mapped back, the value is redacted in
+      // place on line 2, and the file stays (P31 would leave it out if the lines pointed elsewhere)
+      expect(b.files.find((f) => f.path === 'src/a.ts')?.content, at.name).toBe(`MZ,Mozambique\nconst b = '${R}';\nconst c = 3;\n`);
+      // the paths.txt finding (line 2 as written = the first path): that file is left out, its name not shown
+      expect(paths(b), at.name).toEqual(['src/a.ts']);
+      expect(bundleText(b), at.name).not.toContain(found);
+    }
+  });
+
+  it('bundle: a finding reported on the added first line (the empty prefix) → the file is left out', async () => {
+    const found = 'plain' + '-looking-' + 'value-5520';
+    const dir = makeTempDir();
+    writeIn(dir, 'src/a.ts', `const a = '${found}';\n`);
+    writeIn(dir, 'src/b.ts', 'const b = 2;\n');
+    // line 1 is pipegen's empty prefix: a finding there can't be mapped to the content
+    const stub = makeStub(`const f = findingsFor(${JSON.stringify(found)}).map((x) => ({ ...x, StartLine: 1, EndLine: 1 })); fs.writeFileSync(report, JSON.stringify(f)); process.exit(1);`);
+    const b = await bundleCode(dir, scanWith(betterleaksAt(stub.bin)));
+    expect(paths(b)).toEqual(['src/b.ts']);
+    expect(b.notes.join('\n')).toMatch(/could not locate to redact/);
+  });
+
+  it('bundle: a finding whose reported lines do not hold the value, or tagged decoded:*, leaves the whole file out (never a whole-file search)', async () => {
+    // ruling P31, the review's probe: a base64 blob of an api-key assignment holding S on one line, S plain on another.
+    // betterleaks reports the DECODED S on the blob's line; a whole-file search would redact the plain copy and send the blob.
+    const S = 'Zr8' + 'Kp2Wm5Qx9Lt4Vn7Bc3';
+    const blob = Buffer.from(['api', 'key'].join('_') + '=' + S).toString('base64');
+    const dir = makeTempDir();
+    writeIn(dir, 'src/k.ts', `export const blob = "${blob}";\nexport const sample = "${S}";\n`);
+    writeIn(dir, 'src/ok.ts', 'export const ok = 1;\n');
+    const decoded = (tags: string) => `const f = [{ RuleID: 'generic-api-key', File: path.join(src, 'f000001.txt'), StartLine: 2, EndLine: 2, Match: ${JSON.stringify(S)}, ['Sec' + 'ret']: ${JSON.stringify(S)}, Tags: ${tags}, Fingerprint: 'x' }];
+      fs.writeFileSync(report, JSON.stringify(f)); process.exit(1);`;
+    for (const tags of ["['decoded:base64', 'decode-depth:1']", "['decoded:hex']", '[]']) {
+      const stub = makeStub(decoded(tags));
+      const b = await bundleCode(dir, scanWith(betterleaksAt(stub.bin), { priority: (p) => (p === 'src/k.ts' ? 9 : 0) }));
+      expect(paths(b), tags).toEqual(['src/ok.ts']);
+      expect(bundleText(b), tags).not.toContain(blob);
+      expect(bundleText(b), tags).not.toContain(S);
+      expect(b.notes.join('\n'), tags).toMatch(/could not locate to redact/);
+    }
+    // without usable lines the whole-file search stays (nothing better is known): the value is replaced everywhere
+    const noLines = makeStub(`const f = [{ RuleID: 'x', File: path.join(src, 'f000001.txt'), Match: ${JSON.stringify(S)}, ['Sec' + 'ret']: ${JSON.stringify(S)}, Tags: [] }];
+      fs.writeFileSync(report, JSON.stringify(f)); process.exit(1);`);
+    const kept = await bundleCode(dir, scanWith(betterleaksAt(noLines.bin), { priority: (p) => (p === 'src/k.ts' ? 9 : 0) }));
+    expect(kept.files.find((f) => f.path === 'src/k.ts')?.content).toBe(`export const blob = "${blob}";\nexport const sample = "${R}";\n`);
+    // a Tags field that is not a list of strings is refused (the report is type-checked)
+    const badTags = makeStub(decoded("'decoded:base64'"));
+    await expect(bundleCode(dir, scanWith(betterleaksAt(badTags.bin)))).rejects.toBeInstanceOf(SecretScanError);
+  });
+
+  it('bundle: a clean exit (0) with findings in the report still redacts them', async () => {
+    const found = 'plain' + '-looking-' + 'value-8812';
+    const dir = makeTempDir();
+    writeIn(dir, 'src/a.ts', `const a = '${found}';\n`);
+    for (const at of [betterleaksAt, gitleaksAt]) {
+      const stub = makeStub(`fs.writeFileSync(report, JSON.stringify(findingsFor(${JSON.stringify(found)}))); process.exit(0);`);
+      const b = await bundleCode(dir, scanWith(at(stub.bin)));
+      expect(b.files.find((f) => f.path === 'src/a.ts')?.content, at.name).toBe(`const a = '${R}';\n`);
+      expect(bundleText(b), at.name).not.toContain(found);
+    }
+  });
+
+  it('bundle: SIGINT or SIGTERM during the scan removes the temp folder holding the raw report; the process still stops by that signal', async () => {
+    const pkgDir = makeTempDir();
+    writeIn(pkgDir, 'package.json', JSON.stringify({ name: 'pipegen' }));
+    writeIn(pkgDir, 'data/gitleaks-bundle.toml', readFileSync(join(root, 'data', 'gitleaks-bundle.toml'), 'utf8'));
+    // the release build's own settings (one ESM file with a real `require`), as the package test builds its probe
+    const { define: _define, ...opts } = tsupOptions;
+    await build({ ...opts, entry: { 'scan-signal-probe': 'test/helpers/scan-signal-probe.ts' }, outDir: join(pkgDir, 'dist', 'cli'), config: false, silent: true, clean: false });
+    const probe = join(pkgDir, 'dist', 'cli', 'scan-signal-probe.js');
+    const repo = makeTempDir();
+    writeIn(repo, 'src/a.ts', 'export const a = 1;\n');
+    for (const sig of ['SIGTERM', 'SIGINT'] as const) {
+      const tmp = makeTempDir(); // the probe's TMPDIR: only its own temp folders land here
+      const started = join(makeTempDir(), 'started');
+      // the stub writes a report (so the folder holds one), says it started, then waits far past the test
+      const stub = makeStub(`fs.writeFileSync(report, '[]'); fs.writeFileSync(${JSON.stringify(started)}, 'x'); setTimeout(() => process.exit(0), 15000);`);
+      const child = spawn('node', [probe, repo, stub.bin], { env: { PATH: process.env.PATH ?? '', HOME: process.env.HOME ?? '', TMPDIR: tmp }, stdio: 'ignore' });
+      const exited = new Promise<NodeJS.Signals | null>((done) => child.on('exit', (_code, signal) => done(signal)));
+      for (let i = 0; i < 200 && !existsSync(started); i++) await new Promise((r) => setTimeout(r, 50));
+      expect(existsSync(started), sig).toBe(true);
+      expect(readdirSync(tmp).filter((n) => n.startsWith('pipegen-secret-scan-')), sig).toHaveLength(1); // the scan is running
+      child.kill(sig);
+      expect(await exited, sig).toBe(sig); // the signal is not swallowed: the process stops by it
+      expect(readdirSync(tmp).filter((n) => n.startsWith('pipegen-secret-scan-')), sig).toEqual([]);
+    }
+  }, 120_000);
 
   it('bundle: gitleaks finding → value replaced; unlocatable finding → file dropped and noted', async () => {
     const dir = makeTempDir();

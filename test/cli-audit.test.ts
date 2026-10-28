@@ -422,7 +422,8 @@ describe('pipegen audit (brief)', () => {
       }
       expect(execaCalls()).toEqual([]);
       expect(ensurePinnedBinary, name).toHaveBeenCalledTimes(1);
-      expect(ensurePinnedBinary, name).toHaveBeenCalledWith(name);
+      // the version the screen showed is the one of the pins entry the binary is verified against (review M3)
+      expect(ensurePinnedBinary, name).toHaveBeenCalledWith(name, undefined, { pins: expect.objectContaining({ [name]: expect.objectContaining({ version }) }) });
       expect(s.stub.record().argv[0], name).toBe(sub); // the stub really ran as that scanner
       // the screen named the scanner that ran, with its pinned version
       expect(ask.asked[0], name).toContain(`checked for secrets with ${name} ${version}, which pipegen downloads (checksum-verified)`);

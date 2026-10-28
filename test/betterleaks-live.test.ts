@@ -7,7 +7,7 @@ import { execFileSync } from 'node:child_process';
 import { existsSync, readFileSync, statSync } from 'node:fs';
 import { basename, isAbsolute, join } from 'node:path';
 import { afterEach, beforeAll, describe, expect, it } from 'vitest';
-import { bundleCode, bundleText, redact, SECRET_SCAN_EXIT, secretScanArgv, secretScanConfigPath } from '../src/ai/redact.js';
+import { bundleCode, bundleText, redact, SECRET_SCAN_EXIT, secretScanArgv, secretScanConfigPath, type SecretScannerName } from '../src/ai/redact.js';
 import { ensurePinnedBinary, loadPinnedBinaries } from '../src/engine/linters.js';
 import { BETTERLEAKS_FORBIDDEN_FLAGS } from '../src/engine/tool-flags.js';
 import { betterleaksAt, scanWith } from './helpers/gitleaks-stub.js';
@@ -187,5 +187,78 @@ describe.skipIf(!live)('betterleaks (live, real pinned binary)', () => {
     const bundle = await bundleCode(repo, scanWith(betterleaksAt(bin, loadPinnedBinaries().betterleaks.version)));
     expect(bundle.files.map((x) => x.path)).toEqual(['src/app.ts']);
     expect(bundle.notes.join('\n')).toMatch(/Left out because betterleaks found something pipegen could not locate to redact/);
+  });
+
+  it('live: the review probe (P31): a base64 blob of an api-key assignment plus the same value plain elsewhere in the file → the file is left out', async () => {
+    const S = 'Zr8' + 'Kp2Wm5Qx9Lt4Vn7Bc3';
+    const blob = Buffer.from(['api', 'key'].join('_') + '=' + S).toString('base64');
+    const repo = makeTempDir();
+    writeIn(repo, 'src/k.ts', `export const blob = "${blob}";\nexport const sample = "${S}";\n`);
+    writeIn(repo, 'src/app.ts', 'export const a = 1;\n');
+    const bundle = await bundleCode(repo, scanWith(betterleaksAt(bin, loadPinnedBinaries().betterleaks.version)));
+    const text = bundleText(bundle);
+    expect(text).not.toContain(blob);
+    expect(text).not.toContain(S);
+    expect(bundle.files.map((x) => x.path)).toEqual(['src/app.ts']);
+  });
+});
+
+// Ruling P30 (Task 7 review C1): both pinned scanners sniff each file's first bytes and silently skip one that looks
+// like a binary format, with a clean exit. These text heads (the review's list) all do that, so pipegen writes every
+// scanned file, and paths.txt, after one leading newline.
+const BINARY_HEADS = ['%!PS-Adobe-3.0', '%!', 'MZ', '%PDF-1.7', '{\\rtf1', 'SQLite format 3', 'FWS', 'CWS', 'BZh91AY&SY', 'MSCF', '!<arch>'];
+
+describe.skipIf(!live)('secret scan (live, both pinned scanners): files that start like a binary format', () => {
+  const bins: Partial<Record<SecretScannerName, string>> = {};
+  beforeAll(async () => {
+    bins.betterleaks = await ensurePinnedBinary('betterleaks');
+    bins.gitleaks = await ensurePinnedBinary('gitleaks');
+  }, 600_000);
+  afterEach(cleanupRepos);
+
+  /** One scan with redact.ts's argv for `name`; the report's findings by file name and line. */
+  const scanWithArgv = (name: SecretScannerName, dir: string) => {
+    const reportPath = join(dir, 'report.json');
+    try {
+      execFileSync(bins[name] as string, secretScanArgv(name, dir, secretScanConfigPath(), reportPath), { cwd: dir, env: { PATH: process.env.PATH ?? '', HOME: process.env.HOME ?? '' }, stdio: 'pipe' });
+    } catch (e) {
+      if (typeof (e as { status?: unknown }).status !== 'number') throw e;
+    }
+    return (JSON.parse(readFileSync(reportPath, 'utf8')) as Finding[]).map((f) => `${basename(f.File)}:${f.StartLine}`).sort();
+  };
+
+  it('live: all 11 heads are skipped when written raw, and scanned once pipegen adds its leading newline (betterleaks and gitleaks)', () => {
+    const shop = shopifyValue();
+    for (const name of ['betterleaks', 'gitleaks'] as const) {
+      const raw = makeTempDir();
+      const prefixed = makeTempDir();
+      BINARY_HEADS.forEach((head, i) => {
+        const file = `f${String(i + 1).padStart(6, '0')}.txt`;
+        writeIn(raw, file, `${head}\nconst shop = "${shop}";\n`);
+        writeIn(prefixed, file, `\n${head}\nconst shop = "${shop}";\n`);
+      });
+      expect(scanWithArgv(name, raw), `${name} raw`).toEqual([]); // every one skipped: why the prefix is needed
+      const want = BINARY_HEADS.map((_, i) => `f${String(i + 1).padStart(6, '0')}.txt:3`).sort(); // line 3 = content line 2
+      expect(scanWithArgv(name, prefixed), `${name} prefixed`).toEqual(want);
+    }
+  });
+
+  it('live: end to end, a token after any of the 11 heads, or in a file name shown first as MZ…, never reaches the bundle text (betterleaks and gitleaks)', async () => {
+    const shop = shopifyValue();
+    const lab = gitlabValue();
+    const repo = makeTempDir();
+    BINARY_HEADS.forEach((head, i) => writeIn(repo, `assets/h${String(i).padStart(2, '0')}.txt`, `${head}\nconst shop = "${shop}";\n`));
+    writeIn(repo, 'assets/logo.eps', `%!PS-Adobe-3.0 EPSF-3.0\n% key ${shop}\n`);
+    writeIn(repo, 'data/MZ_regions.csv', `MZ,Mozambique\nshop,${shop}\n`);
+    const names = makeTempDir(); // paths.txt: its first line is this file's name, which starts with MZ
+    writeIn(names, `MZ-${lab}.csv`, 'a,b\n');
+    for (const name of ['betterleaks', 'gitleaks'] as const) {
+      const scanner = { name, path: bins[name] as string, version: loadPinnedBinaries()[name].version };
+      const text = bundleText(await bundleCode(repo, scanWith(scanner)));
+      expect(text, name).not.toContain(shop);
+      const n = await bundleCode(names, scanWith(scanner));
+      expect(n.files, name).toEqual([]); // the file whose name holds the token is left out
+      expect(n.notes.join('\n'), name).toMatch(/flagged as secret-like/);
+    }
   });
 });

@@ -1,4 +1,5 @@
-import { execFile, type ExecFileException } from 'node:child_process';
+import { execFile, type ChildProcess, type ExecFileException } from 'node:child_process';
+import { rmSync } from 'node:fs';
 import { chmod, lstat, mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { isAbsolute, join, relative, resolve, sep } from 'node:path';
@@ -1282,15 +1283,73 @@ export async function bundleCode(dir: string, opts: BundleOptions = {}): Promise
 
 // ---------- the secret scan ----------
 
-interface Finding { file: string; startLine?: number; endLine?: number; secret: string; match: string }
+/**
+ * One reported finding, lines already mapped to the content (see SCAN_PREFIX). `decoded`: the scanner found it in a
+ * decoded form (a `decoded:*` tag, base64 or hex), so the reported text is not in the file. `onPrefix`: it was
+ * reported on pipegen's own empty first line, so it can't be placed.
+ */
+interface Finding { file: string; startLine?: number; endLine?: number; secret: string; match: string; decoded: boolean; onPrefix: boolean }
+
+/**
+ * Ruling P30 (Task 7 review C1): both pinned scanners sniff a file's first bytes and silently skip one that looks like
+ * a binary format (%PDF-, MZ, %!PS, {\rtf1, SQLite format 3, FWS, …), with a clean exit. So every scanned file, and
+ * paths.txt, is written after this prefix (nothing pipegen scans starts with a magic number), and every reported line
+ * is moved back by the lines it adds. test/betterleaks-live.test.ts checks the review's 11 heads on both scanners.
+ */
+const SCAN_PREFIX = '\n';
+const PREFIX_LINES = 1;
+
+/** Maps a finding's lines from the file as written to its content; a finding on the prefix can't be placed. */
+function unprefixed(f: Finding): Finding {
+  if (f.startLine === undefined || f.endLine === undefined) return { ...f, startLine: undefined, endLine: undefined };
+  if (f.startLine <= PREFIX_LINES) return { ...f, startLine: undefined, endLine: undefined, onPrefix: true };
+  return { ...f, startLine: f.startLine - PREFIX_LINES, endLine: f.endLine - PREFIX_LINES };
+}
+
+/**
+ * Review M1: while the scan runs, its temp folder (the redacted copies and the raw report) is removed if the process is
+ * stopped by SIGINT or SIGTERM, or exits, before `finally` can run; the scanner is killed first. After cleaning up, a
+ * signal is raised again when no other handler is there, so the process still stops by it. `release` removes the hooks.
+ */
+function guardTempDir(dir: string): { child: ChildProcess | null; release: () => void } {
+  const guard = { child: null as ChildProcess | null, release: () => {} };
+  const clean = () => {
+    try {
+      guard.child?.kill('SIGKILL');
+    } catch { /* already gone */ }
+    rmSync(dir, { recursive: true, force: true });
+  };
+  const onSignal = (sig: NodeJS.Signals) => {
+    try {
+      clean();
+    } finally {
+      guard.release();
+      if (process.listenerCount(sig) === 0) process.kill(process.pid, sig);
+    }
+  };
+  const onExit = () => {
+    try {
+      clean();
+    } catch { /* best effort while exiting */ }
+  };
+  process.once('SIGINT', onSignal);
+  process.once('SIGTERM', onSignal);
+  process.once('exit', onExit);
+  guard.release = () => {
+    process.removeListener('SIGINT', onSignal);
+    process.removeListener('SIGTERM', onSignal);
+    process.removeListener('exit', onExit);
+  };
+  return guard;
+}
 
 /** Runs the scanner; resolves with its exit code, rejects (SecretScanError) on a spawn error, timeout or signal. */
-function runScanner(name: string, bin: string, args: string[], cwd: string, timeoutMs: number): Promise<number> {
+function runScanner(name: string, bin: string, args: string[], cwd: string, timeoutMs: number, started: (c: ChildProcess) => void = () => {}): Promise<number> {
   const env: Record<string, string> = {};
   if (process.env.PATH !== undefined) env.PATH = process.env.PATH;
   if (process.env.HOME !== undefined) env.HOME = process.env.HOME;
   return new Promise((resolvePromise, reject) => {
-    execFile(bin, args, { cwd, env, timeout: timeoutMs, killSignal: 'SIGKILL', maxBuffer: 16 * 1024 * 1024, windowsHide: true }, (err) => {
+    const child = execFile(bin, args, { cwd, env, timeout: timeoutMs, killSignal: 'SIGKILL', maxBuffer: 16 * 1024 * 1024, windowsHide: true }, (err) => {
       if (err === null) return resolvePromise(0);
       const e = err as ExecFileException;
       if (e.killed && e.signal) return reject(new SecretScanError(`${name} did not finish within ${Math.round(timeoutMs / 1000)} s (or produced too much output) and was stopped.`));
@@ -1298,12 +1357,13 @@ function runScanner(name: string, bin: string, args: string[], cwd: string, time
       if (typeof e.code === 'number') return resolvePromise(e.code);
       reject(new SecretScanError(`${name} could not be started (${safeText(String(e.code ?? 'unknown error'))}).`));
     });
+    started(child);
   });
 }
 
 const intOrUndefined = (v: unknown) => (typeof v === 'number' && Number.isInteger(v) && v > 0 ? v : undefined);
 
-/** The report is built from repo-derived content: only File, StartLine/EndLine, Match and Secret are used, all type-checked. */
+/** The report is built from repo-derived content: only File, StartLine/EndLine, Match, Secret and Tags are used, all type-checked. */
 async function readReport(name: string, path: string): Promise<Finding[]> {
   const info = await lstat(path).catch(() => null);
   if (info === null || !info.isFile()) throw new SecretScanError(`${name} wrote no report.`);
@@ -1319,27 +1379,42 @@ async function readReport(name: string, path: string): Promise<Finding[]> {
     if (typeof item !== 'object' || item === null || Array.isArray(item)) throw new SecretScanError(`${name} wrote a report in an unexpected format.`);
     const o = item as Record<string, unknown>;
     if (typeof o.File !== 'string' || o.File === '') throw new SecretScanError(`${name} wrote a finding without a file.`);
+    if (o.Tags !== undefined && o.Tags !== null && !(Array.isArray(o.Tags) && o.Tags.every((t) => typeof t === 'string'))) {
+      throw new SecretScanError(`${name} wrote a finding whose tags are not a list of words.`);
+    }
+    const tags = Array.isArray(o.Tags) ? (o.Tags as string[]) : [];
     return {
       file: o.File,
       startLine: intOrUndefined(o.StartLine),
       endLine: intOrUndefined(o.EndLine),
       secret: typeof o.Secret === 'string' ? o.Secret : '',
       match: typeof o.Match === 'string' ? o.Match : '',
+      // betterleaks decodes base64/hex (up to depth 5) and reports the decoded text, which is not in the file (P31)
+      decoded: tags.some((t) => t.toLowerCase().startsWith('decoded:')),
+      onPrefix: false,
     };
   });
 }
 
-/** Replaces one finding in `content`; null when it cannot be located. Tries the reported lines first. */
+/**
+ * Replaces one finding in `content`; null (the file is left out) when it cannot be located. Ruling P31 (Task 7 review
+ * I1): a finding with line numbers is replaced on those lines only. When the value isn't there, or the finding is
+ * decoded (base64/hex: the reported text is by definition not in the file), or it sits on pipegen's prefix, the
+ * file is left out: a search of the whole file could hit an unflagged plain copy elsewhere and leave the real
+ * (encoded) secret in place. Only a finding without line numbers is searched for in the whole file.
+ */
 function applyFinding(content: string, f: Finding): string | null {
   const wanted = [f.secret, f.match].filter((s) => s !== '');
-  if (wanted.length === 0) return null;
+  if (wanted.length === 0 || f.decoded || f.onPrefix) return null;
   const lines = content.split('\n');
   const { startLine: s, endLine: e } = f;
-  if (s !== undefined && e !== undefined && s <= e && e <= lines.length) {
+  if (s !== undefined && e !== undefined) {
+    if (!(s <= e && e <= lines.length)) return null;
     const seg = lines.slice(s - 1, e).join('\n');
     for (const w of wanted) {
       if (seg.includes(w)) return [...lines.slice(0, s - 1), seg.split(w).join(R), ...lines.slice(e)].join('\n');
     }
+    return null;
   }
   for (const w of wanted) if (content.includes(w)) return content.split(w).join(R);
   return null;
@@ -1393,17 +1468,19 @@ async function secretScanPass(files: FileEntry[], scanner: SecretScanner, timeou
   }
   const scanned = files.map((f) => ({ path: f.path, content: neutralizeAllow(f.content) }));
   const shownPaths = scanned.map((f) => displayPath(f.path));
-  const tmp = await realpath(await mkdtemp(join(tmpdir(), 'pipegen-secret-scan-')));
+  const made = await mkdtemp(join(tmpdir(), 'pipegen-secret-scan-'));
+  const guard = guardTempDir(made);
   try {
+    const tmp = await realpath(made);
     await chmod(tmp, 0o700);
     // Neutral names: no repo file name (.gitleaksignore, .gitleaks.toml, allowlisted paths) reaches the scanner.
     const names = scanned.map((_, i) => `f${String(i + 1).padStart(6, '0')}.txt`);
-    for (let i = 0; i < scanned.length; i++) await writeFile(join(tmp, names[i]), scanned[i].content, { flag: 'wx', mode: 0o600 });
-    await writeFile(join(tmp, PATHS_FILE), neutralizeAllow(shownPaths.join('\n')), { flag: 'wx', mode: 0o600 });
+    for (let i = 0; i < scanned.length; i++) await writeFile(join(tmp, names[i]), SCAN_PREFIX + scanned[i].content, { flag: 'wx', mode: 0o600 });
+    await writeFile(join(tmp, PATHS_FILE), SCAN_PREFIX + neutralizeAllow(shownPaths.join('\n')), { flag: 'wx', mode: 0o600 });
     const reportPath = join(tmp, 'report.json');
-    const code = await runScanner(name, bin, secretScanArgv(name, tmp, config, reportPath), tmp, timeoutMs);
+    const code = await runScanner(name, bin, secretScanArgv(name, tmp, config, reportPath), tmp, timeoutMs, (c) => { guard.child = c; });
     if (code !== SECRET_SCAN_EXIT.clean && code !== SECRET_SCAN_EXIT.found) throw new SecretScanError(`${name} failed (exit code ${code}).`);
-    const findings = await readReport(name, reportPath);
+    const findings = (await readReport(name, reportPath)).map(unprefixed);
     // "found" with nothing listed is a scan that went wrong (betterleaks exits 1 on a config error, with no report)
     if (code === SECRET_SCAN_EXIT.found && findings.length === 0) throw new SecretScanError(`${name} reported findings but listed none.`);
 
@@ -1499,7 +1576,13 @@ async function secretScanPass(files: FileEntry[], scanner: SecretScanner, timeou
     }
     return scanned.filter((_, i) => !drop.has(i) && !unplaced.has(i) && !leftover.has(i) && !badPath.has(i) && !shortHit.has(i));
   } finally {
-    await rm(tmp, { recursive: true, force: true });
+    // every way out (a result, any error): the copies and the raw report go; the signal hooks go after
+    try {
+      guard.child?.kill('SIGKILL'); // a no-op once it exited
+      await rm(made, { recursive: true, force: true });
+    } finally {
+      guard.release();
+    }
   }
 }
 

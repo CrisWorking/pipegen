@@ -7,7 +7,7 @@ import { bundleCode, redact } from '../src/ai/redact.js';
 import { addAiSuggestions, AiSpendMeter, buildAudit, needsRequestBytes, type AiSuggestDeps, type AuditReport } from '../src/audit/model.js';
 import { COST_CAP_STOP_NOTE, suggestTools } from '../src/engine/discover.js';
 import { newRateBudget, withRateLimit, type RateClock } from '../src/engine/github-rate.js';
-import { ensurePinnedBinary, PinnedBinaryError } from '../src/engine/linters.js';
+import { ensurePinnedBinary, loadPinnedBinaries, PinnedBinaryError } from '../src/engine/linters.js';
 import type { MemoryStore } from '../src/engine/memory.js';
 import { planNeeds } from '../src/engine/needs.js';
 import type { QualityBar } from '../src/engine/quality-bar.js';
@@ -222,7 +222,7 @@ describe('addAiSuggestions (brief, Task 2b)', () => {
     const dflt = await setup();
     delete dflt.deps.ensureSecretScanner;
     const d = await addAiSuggestions(dflt.r, dflt.dir, dflt.deps);
-    expect(ensurePinnedBinary).toHaveBeenCalledWith('gitleaks');
+    expect(ensurePinnedBinary).toHaveBeenCalledWith('gitleaks', undefined, { pins: expect.anything() });
     expect(dflt.ai.complete).not.toHaveBeenCalled();
     expect(d.ai?.notes).toContain("The AI step was skipped and nothing was sent to the AI: the required gitleaks check couldn't run. No download in tests.");
   });
@@ -254,8 +254,31 @@ describe('addAiSuggestions (brief, Task 2b)', () => {
     const rest = { ...d.deps };
     delete rest.ensureSecretScanner;
     await addAiSuggestions(d.r, d.dir, { ...rest, consent: await grantAuditAi(d.r.profile, d.dir, d.deps.ai, d.deps.capUsd, [], betterleaksFacts()) });
-    expect(ensurePinnedBinary).toHaveBeenCalledWith('betterleaks');
+    expect(ensurePinnedBinary).toHaveBeenCalledWith('betterleaks', undefined, { pins: expect.anything() });
     expect(d.ai.complete).not.toHaveBeenCalled(); // refused in tests
+  });
+
+  it('addAiSuggestions: on the default path the version shown must be the one of the pinned entry the binary was verified against', async () => {
+    // review M3: the default takes the version from the same pins table it hands ensurePinnedBinary, so the screen's
+    // version is bound to the binarySha256 the binary was just checked against (not to a second read of the file)
+    const pinned = loadPinnedBinaries().betterleaks.version;
+    for (const [shown, runs] of [[pinned, true], ['1.8.0', false]] as const) {
+      const s = await setup();
+      const stub = makeStub(CLEAN);
+      vi.mocked(ensurePinnedBinary).mockResolvedValueOnce(stub.bin);
+      const rest = { ...s.deps };
+      delete rest.ensureSecretScanner;
+      const out = await addAiSuggestions(s.r, s.dir, { ...rest, consent: await grantAuditAi(s.r.profile, s.dir, s.deps.ai, s.deps.capUsd, [], betterleaksFacts(shown)) });
+      expect(ensurePinnedBinary, shown).toHaveBeenCalledWith('betterleaks', undefined, { pins: expect.objectContaining({ betterleaks: expect.objectContaining({ version: pinned }) }) });
+      if (runs) {
+        expect(stub.record().argv[0]).toBe('dir');
+        expect(s.ai.needsReqs()).toHaveLength(1);
+      } else {
+        expect(() => stub.record()).toThrow(); // never started
+        expect(s.ai.complete).not.toHaveBeenCalled();
+        expect(out.ai?.notes.join('\n')).toContain(`not the betterleaks 1.8.0 the consent screen named`);
+      }
+    }
   });
 
   it('addAiSuggestions: AI-added needs listed as extraNeeds; floor needs unchanged', async () => {
