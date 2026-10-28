@@ -1,8 +1,8 @@
 // The consent token and the counting summary (Plan U Task 4b; review M1, M2, M11). They live here, not in src/cli/, so
 // the audit model can require them without depending on the CLI; the CLI's consent screen (src/cli/consent.ts) makes them.
 //
-// - CountingSummary: what a COUNTING-ONLY bundle (bundleCode without gitleaks) holds, for the `audit --ai` consent
-//   screen (ruling S21: gitleaks is downloaded and run only after consent). It keeps the folder it was counted in (its
+// - CountingSummary: what a COUNTING-ONLY bundle (bundleCode without the secret scan) holds, for the `audit --ai` consent
+//   screen (ruling S21: the secret scanner is downloaded and run only after consent). It keeps the folder it was counted in (its
 //   real path) and the exact file list; the AI step reads only those files (bundleCode `onlyPaths`, review I1), and
 //   covers() is the backstop. It binds paths, not content: a file can change between the count and the send (a local
 //   writer, a `git pull` while the question waits); the AI cost cap still holds then, since the meter prices what is
@@ -24,7 +24,7 @@ const ISSUED_SUMMARIES = new WeakSet<object>();
 let makeCounting: (bundle: CodeBundle, dir: string) => CountingSummary;
 
 /**
- * The consent facts of a counting-only bundle: an upper bound of what `audit --ai` sends (the gitleaks pass only hides
+ * The consent facts of a counting-only bundle: an upper bound of what `audit --ai` sends (the secret scan only hides
  * values and leaves files out). Only countingSummary() makes one.
  */
 export class CountingSummary {
@@ -45,7 +45,7 @@ export class CountingSummary {
     return bundle.files.every((f) => this.#paths.has(f.path));
   }
 
-  /** The counted repo paths (a copy): bundleCode's `onlyPaths` for the gitleaks-checked bundle. */
+  /** The counted repo paths (a copy): bundleCode's `onlyPaths` for the secret-scanned bundle. */
   paths(): Set<string> {
     return new Set(this.#paths);
   }
@@ -62,8 +62,8 @@ export class CountingSummary {
 /** The consent facts of bundleCode's own counting-only bundle; anything else (a checked bundle, a copy) is refused. */
 export function countingSummary(bundle: CodeBundle): CountingSummary {
   const dir = countedBundleRoot(bundle);
-  if (dir === null || bundle.gitleaksChecked !== false) {
-    throw new Error('countingSummary needs bundleCode\'s own counting-only bundle (built without gitleaks).');
+  if (dir === null || bundle.secretScanChecked !== false) {
+    throw new Error('countingSummary needs bundleCode\'s own counting-only bundle (built without the secret scan).');
   }
   return makeCounting(bundle, dir);
 }

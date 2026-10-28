@@ -1,7 +1,7 @@
 import { betaJSONSchemaOutputFormat } from '@anthropic-ai/sdk/helpers/beta/json-schema';
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { AiError } from '../src/ai/provider.js';
-import { bundleCode, bundleText, GitleaksRequiredError, type CodeBundle } from '../src/ai/redact.js';
+import { bundleCode, bundleText, SecretScanRequiredError, type CodeBundle } from '../src/ai/redact.js';
 import {
   deployApprovalRule, floorNeeds, isRunnable, jobCategories, jobCounts, JOB_GROUP, NEED_ID_CATEGORY, NEED_IDS, needsSchema, needWhy, planNeeds, skippedChecks,
 } from '../src/engine/needs.js';
@@ -14,7 +14,7 @@ import {
   type Need, type RepoProfile, type Service,
 } from '../src/types.js';
 import { hostileNames } from './fixtures/hostile-names.js';
-import { CLEAN, makeStub } from './helpers/gitleaks-stub.js';
+import { CLEAN, gitleaksAt, makeStub, scanWith } from './helpers/gitleaks-stub.js';
 import { fake } from './helpers/secret-repo.js';
 import { cleanupRepos, makeRepo, makeTempDir, writeIn } from './helpers/make-repo.js';
 import { strictProblems } from './helpers/strict-schema.js';
@@ -78,7 +78,7 @@ beforeAll(async () => {
   const dir = makeTempDir();
   writeIn(dir, 'package.json', JSON.stringify({ name: 'web', scripts: { start: 'node index.js' } }) + '\n');
   writeIn(dir, 'index.js', "console.log('hi');\n");
-  bundle = await bundleCode(dir, { gitleaks: makeStub(CLEAN).bin });
+  bundle = await bundleCode(dir, scanWith(gitleaksAt(makeStub(CLEAN).bin)));
 });
 afterAll(() => cleanupRepos());
 
@@ -313,9 +313,9 @@ describe('planNeeds', () => {
     writeIn(dir, 'index.js', 'export {};\n');
     const countOnly = await bundleCode(dir); // no gitleaks path
     const ai = mockAi(quiet);
-    await expect(planNeeds(profile(), PUBLIC, countOnly, ai.p, 0)).rejects.toBeInstanceOf(GitleaksRequiredError);
+    await expect(planNeeds(profile(), PUBLIC, countOnly, ai.p, 0)).rejects.toBeInstanceOf(SecretScanRequiredError);
     // a forged copy claiming the check is refused too
-    await expect(planNeeds(profile(), PUBLIC, { ...bundle }, ai.p, 0)).rejects.toBeInstanceOf(GitleaksRequiredError);
+    await expect(planNeeds(profile(), PUBLIC, { ...bundle }, ai.p, 0)).rejects.toBeInstanceOf(SecretScanRequiredError);
     expect(ai.complete).not.toHaveBeenCalled();
   });
 

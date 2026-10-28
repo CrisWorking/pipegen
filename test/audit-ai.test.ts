@@ -19,7 +19,7 @@ import { DEFAULT_MODEL, type AiProvider, type AiRequest, type AiUsage, type Capa
 import { fakeFetch, fakeOctokit, type Routes } from './helpers/fake-http.js';
 import { ConsentToken, CountingSummary } from '../src/audit/consent-token.js';
 import { grantAuditAi } from './helpers/consent.js';
-import { CLEAN, makeStub } from './helpers/gitleaks-stub.js';
+import { CLEAN, ensureWith, gitleaksAt, makeStub, scanWith } from './helpers/gitleaks-stub.js';
 import { cleanupRepos, makeTempDir, writeIn } from './helpers/make-repo.js';
 
 vi.mock('../src/ai/redact.js', async (importOriginal) => {
@@ -42,7 +42,7 @@ vi.mock('../src/engine/github-rate.js', async (importOriginal) => {
   const a = await importOriginal<typeof import('../src/engine/github-rate.js')>();
   return { ...a, withRateLimit: vi.fn(a.withRateLimit) };
 });
-// No test downloads gitleaks: the default ensurePinnedBinary refuses, and tests pass the stub through ensureGitleaks.
+// No test downloads gitleaks: the default ensurePinnedBinary refuses, and tests pass the stub through ensureSecretScanner.
 vi.mock('../src/engine/linters.js', async (importOriginal) => {
   const a = await importOriginal<typeof import('../src/engine/linters.js')>();
   return { ...a, ensurePinnedBinary: vi.fn(async () => { throw new a.PinnedBinaryError('No download in tests.'); }) };
@@ -170,11 +170,11 @@ async function setup(o: SetupOpts = {}) {
   });
   o.edit?.(r);
   const stub = makeStub(CLEAN);
-  const ensure = vi.fn(async () => stub.bin);
+  const ensure = vi.fn(async () => gitleaksAt(stub.bin));
   const ai = fakeAi(o.ai);
   const base = {
     ai: ai.p, gh: gh.gh, memory: fakeMemory(), fetch: web.fetch, reviewed, bar: BAR, budget: newRateBudget(), now: () => NOW,
-    sleep: vi.fn(async () => {}), knownValues: [] as string[], ensureGitleaks: ensure, anonymous: false, capUsd: 1e9 as number | null, ...o.deps,
+    sleep: vi.fn(async () => {}), knownValues: [] as string[], ...ensureWith(ensure), anonymous: false, capUsd: 1e9 as number | null, ...o.deps,
   };
   // the user's yes to the audit --ai screen for this provider, cap and folder (T4b: no AI call without a consent token)
   const grant = () => grantAuditAi(r.profile, dir, deps.ai, deps.capUsd, deps.knownValues);
@@ -193,7 +193,7 @@ describe('addAiSuggestions (brief, Task 2b)', () => {
     const out = await addAiSuggestions(s.r, s.dir, s.deps);
     expect(s.ensure).toHaveBeenCalledTimes(1);
     expect(bundleCode).toHaveBeenCalledTimes(1);
-    expect(bundleCode).toHaveBeenCalledWith(s.dir, { gitleaks: s.stub.bin, knownValues: [], onlyPaths: (s.deps.consent.terms.files as CountingSummary).paths() });
+    expect(bundleCode).toHaveBeenCalledWith(s.dir, scanWith(gitleaksAt(s.stub.bin), { knownValues: [], onlyPaths: (s.deps.consent.terms.files as CountingSummary).paths() }));
     expect(s.stub.record().argv).toContain('detect'); // the stub really ran as gitleaks
     expect(s.ai.needsReqs()).toHaveLength(1);
     // the binary path is a local variable: never on the report, never added to deps
@@ -201,26 +201,26 @@ describe('addAiSuggestions (brief, Task 2b)', () => {
     expect(Object.values(s.deps)).not.toContain(s.stub.bin);
 
     // gitleaks missing (the download refused): no bundle, no AI call, a note
-    const missing = await setup({ deps: { ensureGitleaks: vi.fn(async () => { throw new PinnedBinaryError("pipegen's gitleaks download needs Linux or macOS for now (WSL works)."); }) } });
+    const missing = await setup({ deps: ensureWith(vi.fn(async () => { throw new PinnedBinaryError("pipegen's gitleaks download needs Linux or macOS for now (WSL works)."); })) });
     const m = await addAiSuggestions(missing.r, missing.dir, missing.deps);
     expect(missing.ai.complete).not.toHaveBeenCalled();
     expect(bundleCode).not.toHaveBeenCalled(); // (setup cleared the counts after buildAudit's counting bundle)
     expect(m.ai).toMatchObject({ extraNeeds: [], suggestions: [], usage: usageOf(0, 0) });
     expect(m.ai?.notes).toContain("The AI step was skipped and nothing was sent to the AI: the required gitleaks check couldn't run. pipegen's gitleaks download needs Linux or macOS for now (WSL works).");
 
-    // gitleaks failing (exit code 2): GitleaksError from bundleCode, no AI call, a note
+    // gitleaks failing (exit code 2): SecretScanError from bundleCode, no AI call, a note
     const failing = await setup();
     const bad = makeStub('process.exit(2);');
-    failing.deps.ensureGitleaks = vi.fn(async () => bad.bin);
+    Object.assign(failing.deps, ensureWith(vi.fn(async () => gitleaksAt(bad.bin))));
     const f = await addAiSuggestions(failing.r, failing.dir, failing.deps);
     expect(failing.ai.complete).not.toHaveBeenCalled();
     expect(f.ai).toMatchObject({ extraNeeds: [], suggestions: [] });
     expect(f.ai?.notes).toContain("The AI step was skipped and nothing was sent to the AI: the required gitleaks check couldn't run. gitleaks failed (exit code 2).");
     expect(JSON.stringify(f)).not.toContain(bad.bin);
 
-    // without ensureGitleaks, the default is ensurePinnedBinary('gitleaks') (refused in tests)
+    // without ensureSecretScanner, the default is ensurePinnedBinary('gitleaks') (refused in tests)
     const dflt = await setup();
-    delete dflt.deps.ensureGitleaks;
+    delete dflt.deps.ensureSecretScanner;
     const d = await addAiSuggestions(dflt.r, dflt.dir, dflt.deps);
     expect(ensurePinnedBinary).toHaveBeenCalledWith('gitleaks');
     expect(dflt.ai.complete).not.toHaveBeenCalled();
@@ -325,7 +325,7 @@ describe('addAiSuggestions (controller rulings)', () => {
     const [p, caps, bundle, ai, writers, opts] = vi.mocked(planNeeds).mock.calls[0] ?? [];
     expect(p).toBe(s.r.profile);
     expect(caps).toBe(s.r.capabilities);
-    expect(bundle?.gitleaksChecked).toBe(true);
+    expect(bundle?.secretScanChecked).toBe(true);
     expect(ai?.name).toBe('claude');
     expect(writers).toBe(0);
     expect(opts).toEqual({ knownValues: ['zq-known-one'] });
@@ -613,7 +613,7 @@ describe('addAiSuggestions (controller rulings)', () => {
     expect(s.r.profile.services[0]?.name).toBe(ghValue);
     s.deps.knownValues = [ghValue, aiValue];
     const out = await addAiSuggestions(s.r, s.dir, s.deps);
-    expect(bundleCode).toHaveBeenCalledWith(s.dir, { gitleaks: s.stub.bin, knownValues: [ghValue, aiValue], onlyPaths: expect.any(Set) });
+    expect(bundleCode).toHaveBeenCalledWith(s.dir, scanWith(gitleaksAt(s.stub.bin), { knownValues: [ghValue, aiValue], onlyPaths: expect.any(Set) }));
     expect(vi.mocked(planNeeds).mock.calls[0]?.[5]).toEqual({ knownValues: [ghValue, aiValue] });
     expect(s.ai.needsReqs()[0]?.user).toContain('zq-visible-marker'); // the file was sent, with the values scrubbed
     expect(s.ai.reqs.length).toBeGreaterThan(1);
@@ -646,7 +646,7 @@ describe('addAiSuggestions (controller rulings)', () => {
     collect(await addAiSuggestions(c.r, c.dir, c.deps));
     const d = await setup({ deps: { capUsd: 0.000001 } });
     collect(await addAiSuggestions(d.r, d.dir, d.deps));
-    const e = await setup({ deps: { ensureGitleaks: vi.fn(async () => { throw new PinnedBinaryError('No pinned gitleaks here.'); }) } });
+    const e = await setup({ deps: ensureWith(vi.fn(async () => { throw new PinnedBinaryError('No pinned gitleaks here.'); })) });
     collect(await addAiSuggestions(e.r, e.dir, e.deps));
     const f = await setup({ ai: { worstCase: true } });
     const needsWorst = requestCeilingUsd(DEFAULT_PROVIDER, needsRequestBytes(f.r, []), NEEDS_MAX_OUTPUT_TOKENS) as number;
@@ -692,7 +692,7 @@ describe('consent token (T4b: no AI call without consent, by type)', () => {
     const s = await setup();
     writeIn(s.dir, 'src/added-after-consent.js', 'export const lateMarker = 1;\n'); // not on the consent screen
     const out = await addAiSuggestions(s.r, s.dir, s.deps);
-    expect(bundleCode).toHaveBeenCalledWith(s.dir, { gitleaks: s.stub.bin, knownValues: [], onlyPaths: (s.deps.consent.terms.files as CountingSummary).paths() });
+    expect(bundleCode).toHaveBeenCalledWith(s.dir, scanWith(gitleaksAt(s.stub.bin), { knownValues: [], onlyPaths: (s.deps.consent.terms.files as CountingSummary).paths() }));
     expect(s.ai.needsReqs()).toHaveLength(1);
     expect(s.ai.needsReqs()[0]?.user).not.toContain('lateMarker');
     expect(out.ai?.notes.some((n) => /consent screen/.test(n))).toBe(false);
@@ -704,10 +704,10 @@ describe('consent token (T4b: no AI call without consent, by type)', () => {
     for (let i = 0; i < 80; i++) files[`src/f${String(i).padStart(2, '0')}.js`] = `// file ${i}\n${'export const v = 1;\n'.repeat(150)}${i === 0 ? 'const q = "zZ9";\n' : ''}`;
     const s = await setup({ files });
     const flagShort = makeStub(`fs.writeFileSync(report, JSON.stringify(findingsFor('zZ9'))); process.exit(1);`);
-    s.deps.ensureGitleaks = vi.fn(async () => flagShort.bin);
+    Object.assign(s.deps, ensureWith(vi.fn(async () => gitleaksAt(flagShort.bin))));
     const counted = s.deps.consent.terms.files as CountingSummary;
     // the repro is real: without the counted list, the checked bundle takes in a file that wasn't counted
-    const unrestricted = await bundleCode(s.dir, { gitleaks: flagShort.bin, knownValues: [] });
+    const unrestricted = await bundleCode(s.dir, scanWith(gitleaksAt(flagShort.bin), { knownValues: [] }));
     expect(unrestricted.truncated).toBe(true);
     expect(counted.covers(unrestricted)).toBe(false);
     vi.clearAllMocks();
@@ -728,7 +728,7 @@ describe('consent token (T4b: no AI call without consent, by type)', () => {
     vi.mocked(bundleCode).mockImplementationOnce((dir, opts) => real(dir, { ...opts, onlyPaths: null }));
     const out = await addAiSuggestions(s.r, s.dir, s.deps);
     expect(s.ai.complete).not.toHaveBeenCalled();
-    expect(out.ai?.notes).toContain("Nothing was sent to the AI: after the gitleaks check, the code held a file that wasn't on the consent screen, and pipegen sends only files it showed you.");
+    expect(out.ai?.notes).toContain("Nothing was sent to the AI: after the secret scan, the code held a file that wasn't on the consent screen, and pipegen sends only files it showed you.");
     for (const n of out.ai?.notes ?? []) {
       expect(redact(n), n).toBe(n);
       expect(n).not.toMatch(/run (the audit )?again/i);

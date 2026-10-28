@@ -5,6 +5,7 @@ import { countingSummary } from '../../src/audit/consent-token.js';
 import { askConsent, consentScreen } from '../../src/cli/consent.js';
 import type { Prompter } from '../../src/cli/io.js';
 import { estimateAuditAi } from '../../src/estimate/estimate.js';
+import { gitleaksFacts } from './gitleaks-stub.js';
 import { permissionsTable } from '../../src/github/client.js';
 import type { AiProvider, RepoProfile } from '../../src/types.js';
 
@@ -15,7 +16,7 @@ export async function grantAuditAi(p: RepoProfile, dir: string, provider: AiProv
   const counted = countingSummary(await bundleCode(dir, { knownValues }));
   // the estimate's cap is replaced by the one under test (and an unpriced model's refusal is lifted: the AI step's own refusal is what such tests check)
   const est = { ...estimateAuditAi(provider, 1, 1_000), capUsd, unpriced: null };
-  const screen = consentScreen(p, provider, est, counted, permissionsTable('read'), [], 'audit-ai', { gitleaksVersion: 'test' });
+  const screen = consentScreen(p, provider, est, counted, permissionsTable('read'), [], 'audit-ai', gitleaksFacts('test'));
   const granted = await askConsent(sayYes, screen, (s) => { throw new Error(s); });
   if (granted === null) throw new Error('expected a yes');
   return granted;

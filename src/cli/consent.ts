@@ -16,14 +16,14 @@
 // 'full' screen's helper repo names stay on safeText alone: they go into the copyable `gh repo create` commands, which
 // redact would break (the full run is Plan E; its own review decides). The model name (from a flag) and the estimate's
 // basis lines pass safeText.
-// The facts the rulings require are required arguments, so a caller can't leave them out: the gitleaks version (S21)
+// The facts the rulings require are required arguments, so a caller can't leave them out: the secret scanner and its version (S21)
 // and, for 'full', whether pipegen's App creates the repos (#87). Where an Ollama provider sends comes from the
 // provider itself (ollamaHostOf); when it isn't known, the screen never claims the code stays on this computer.
 // Two facts are tied to their real sources by construction (final review batch 2, I1): the file facts are a
-// BundleSummary, which only bundleSummary() of a gitleaks-checked bundle makes, and the estimate must say it was
+// BundleSummary, which only bundleSummary() of a secret-scanned bundle makes, and the estimate must say it was
 // priced for the provider and model shown (Estimates.pricedFor), or the screen is refused.
-// 'audit-ai' alone may take a CountingSummary instead (Plan U T4b, ruling S21: the gitleaks download happens only after
-// consent, so the screen counts the bundle before the gitleaks pass, says so, and calls the counts "at most"; the AI
+// 'audit-ai' alone may take a CountingSummary instead (Plan U T4b, ruling S21: the scanner download happens only after
+// consent, so the screen counts the bundle before the secret scan, says so, and calls the counts "at most"; the AI
 // step reads only the counted files, bundleCode `onlyPaths`, with CountingSummary.covers() as the backstop).
 // "No AI call without consent" is a type rule backed by runtime checks (Plan U T4b, review M1/M2): consentScreen() makes
 // the screen (its text plus the terms a yes agrees to; a module-private set records every screen it made), askConsent()
@@ -31,7 +31,7 @@
 // else can make one. addAiSuggestions requires the token, checks its terms (provider, model, cap, folder) and spends it.
 import { ollamaHostOf } from '../ai/ollama.js';
 import { refusalFallbackNoteFor } from '../ai/provider.js';
-import { BundleSummary, excludedSummaryLines } from '../ai/redact.js';
+import { BundleSummary, excludedSummaryLines, type SecretScanner } from '../ai/redact.js';
 import { claimTokenMinter, CountingSummary, type ConsentMode, type ConsentTerms, type ConsentToken } from '../audit/consent-token.js';
 import type { AiCost, AuditAiEstimate, Estimates, PricedFor } from '../estimate/estimate.js';
 import type { AiProvider, RepoProfile } from '../types.js';
@@ -49,8 +49,8 @@ export type PermissionRows = { permission: string; why: string }[];
 
 /** Facts the 'audit-ai' screen must show (ruling S21). */
 export interface AuditConsentFacts {
-  /** The pinned gitleaks version pipegen downloads, checksum-verified, into its cache before bundling. */
-  gitleaksVersion: string;
+  /** The pinned secret scanner pipegen downloads, checksum-verified, into its cache before bundling, and its version. */
+  secretScanner: Pick<SecretScanner, 'name' | 'version'>;
 }
 /** Facts the 'full' screen must show. */
 export interface FullConsentFacts extends AuditConsentFacts {
@@ -91,7 +91,8 @@ function whereItRuns(provider: AiProvider, place: Place): string {
   return `Ollama (${model}), experimental: the files are sent to an Ollama server whose address pipegen couldn't confirm; it may not be this computer.`;
 }
 
-function filesSection(p: RepoProfile, bundle: BundleSummary | CountingSummary, gitleaksVersion: string): string[] {
+function filesSection(p: RepoProfile, bundle: BundleSummary | CountingSummary, scanner: AuditConsentFacts['secretScanner']): string[] {
+  const name = safeText(scanner.name, 20);
   const shown = bundle.topFolders.slice(0, MAX_TOP_FOLDERS).map((f) => shownName(f, 60));
   const more = bundle.topFolders.length - shown.length;
   const folders = shown.length === 0 ? '(all at the top level)' : `${shown.join(', ')}${more > 0 ? ` and ${more} more` : ''}`;
@@ -102,9 +103,9 @@ function filesSection(p: RepoProfile, bundle: BundleSummary | CountingSummary, g
     `${INDENT}Top folders: ${folders}`,
     `${INDENT}Never sent:`,
     ...excludedSummaryLines().map((l) => `${INDENT}${INDENT}${l}`),
-    `${INDENT}Before anything is sent, every file is checked for secrets with gitleaks ${safeText(gitleaksVersion, 20)}, which pipegen downloads (checksum-verified) into its cache, and secret-looking values are hidden.`,
+    `${INDENT}Before anything is sent, every file is checked for secrets with ${name} ${safeText(scanner.version, 20)}, which pipegen downloads (checksum-verified) into its cache, and secret-looking values are hidden.`,
     ...(counted
-      ? [`${INDENT}These counts were made before the gitleaks check, which runs only after you say yes. It may leave out a few more files; pipegen never sends a file that isn't counted here.`]
+      ? [`${INDENT}These counts were made before the ${name} check, which runs only after you say yes. It may leave out a few more files; pipegen never sends a file that isn't counted here.`]
       : []),
   ];
 }
@@ -215,8 +216,8 @@ export class ConsentScreen {
 
 /**
  * The consent text. `est`: estimate() for 'full', estimateAuditAi() for 'audit-ai', both given `provider` itself, so
- * `est.pricedFor` matches it. `bundle`: bundleSummary() of the gitleaks-checked bundle that will be sent, or, for
- * 'audit-ai' only, countingSummary() of the counted bundle (consent before the gitleaks download, ruling S21).
+ * `est.pricedFor` matches it. `bundle`: bundleSummary() of the secret-scanned bundle that will be sent, or, for
+ * 'audit-ai' only, countingSummary() of the counted bundle (consent before the scanner download, ruling S21).
  * `perms`: permissionsTable('write', { appCreatesRepos }) for 'full', permissionsTable('read') for 'audit-ai'.
  * `repos`: `pipelines` and `pipegen-proof-<repo>` with whether each exists ('full' only; 'audit-ai' shows none).
  * Refused (programming errors): a bundle summary bundleSummary()/countingSummary() didn't make (or a counted one for
@@ -239,7 +240,7 @@ export function consentScreen(p: RepoProfile, provider: AiProvider, est: Estimat
 function screenFor(p: RepoProfile, provider: AiProvider, est: Estimates | AuditAiEstimate, bundle: BundleSummary | CountingSummary, perms: PermissionRows, repos: HelperRepo[], mode: ConsentMode, facts: AuditConsentFacts | FullConsentFacts): ConsentScreen {
   const counted = mode === 'audit-ai' && CountingSummary.isSummary(bundle);
   if (!counted && !BundleSummary.isSummary(bundle)) {
-    throw new Error('The consent screen needs the file facts from bundleSummary() of the gitleaks-checked code bundle.');
+    throw new Error('The consent screen needs the file facts from bundleSummary() of the secret-scanned code bundle.');
   }
   checkPricedFor(provider, est.pricedFor);
   const place = placeOf(provider);
@@ -255,7 +256,7 @@ function screenFor(p: RepoProfile, provider: AiProvider, est: Estimates | AuditA
     capUsd = a.capUsd;
     sections.push(
       ['pipegen audit --ai is about to send part of your code to an AI. Nothing has left this computer yet.', 'This audit only reads: it changes nothing on GitHub.'],
-      filesSection(p, bundle, facts.gitleaksVersion),
+      filesSection(p, bundle, facts.secretScanner),
       providerSection(provider, place),
       costSection('AI cost of this audit (estimate)', a.costUsd, a.capUsd, place),
       basisSection('How this estimate was made', a.basis),
@@ -270,7 +271,7 @@ function screenFor(p: RepoProfile, provider: AiProvider, est: Estimates | AuditA
     capUsd = e.aiCostCapUsd;
     sections.push(
       ['pipegen is about to start. Nothing has left this computer yet. This is what it will do:'],
-      filesSection(p, bundle, facts.gitleaksVersion),
+      filesSection(p, bundle, facts.secretScanner),
       providerSection(provider, place),
       reposSection(p, repos, app),
       minutesSection(p, e),

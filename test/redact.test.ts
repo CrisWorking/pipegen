@@ -4,11 +4,11 @@ import { isAbsolute, join, relative, resolve } from 'node:path';
 import picomatch from 'picomatch';
 import { afterEach, describe, expect, it } from 'vitest';
 import {
-  bundleCode, bundleText, EXCLUDED_PATTERNS, GitleaksError, GitleaksRequiredError, gitleaksConfigPath,
+  bundleCode, bundleText, EXCLUDED_PATTERNS, SecretScanError, SecretScanRequiredError, secretScanConfigPath,
   isBinary, redact, scrubKnownValues, type CodeBundle,
 } from '../src/ai/redact.js';
 import { isBinary as limitsIsBinary } from '../src/read/limits.js';
-import { CLEAN, makeStub } from './helpers/gitleaks-stub.js';
+import { CHECKED_KEY, CLEAN, gitleaksAt, makeStub, scanWith } from './helpers/gitleaks-stub.js';
 import { cleanupRepos, makeTempDir, writeIn } from './helpers/make-repo.js';
 import { fake, makeSecretRepo } from './helpers/secret-repo.js';
 
@@ -262,16 +262,16 @@ describe('bundle: gitleaks pass', () => {
     writeIn(dir, '.gitleaks.toml', '[allowlist]\npaths = [".*"]\n');
     writeIn(dir, '.gitleaksignore', 'everything\n');
     const stub = makeStub(CLEAN);
-    const b = await bundleCode(dir, { gitleaks: stub.bin });
+    const b = await bundleCode(dir, scanWith(gitleaksAt(stub.bin)));
     const rec = stub.record();
     const tmp = rec.src;
     expect(isAbsolute(tmp)).toBe(true);
     expect(relative(dir, tmp).startsWith('..')).toBe(true); // never the repo itself
     expect(rec.argv).toEqual([
-      'detect', '--no-git', '--source', tmp, '--config', gitleaksConfigPath(),
+      'detect', '--no-git', '--source', tmp, '--config', secretScanConfigPath(),
       '--report-format', 'json', '--report-path', join(tmp, 'report.json'),
     ]);
-    expect(gitleaksConfigPath()).toBe(join(root, 'data', 'gitleaks-bundle.toml'));
+    expect(secretScanConfigPath()).toBe(join(root, 'data', 'gitleaks-bundle.toml'));
     expect(rec.cwd).toBe(tmp);
     expect(rec.envKeys.filter((k) => k !== 'PATH' && k !== 'HOME')).toEqual([]);
     // the scan dir holds only the bundle files under neutral names: no repo config or ignore file can be picked up
@@ -285,7 +285,7 @@ describe('bundle: gitleaks pass', () => {
     const scanned = Object.values(rec.files).join('\n');
     for (const v of values) expect(scanned).not.toContain(v);
     expect(existsSync(tmp)).toBe(false); // temp dir removed
-    expect(b.gitleaksChecked).toBe(true);
+    expect(b.secretScanChecked).toBe(true);
   });
 
   it('bundle: gitleaks finding → value replaced; unlocatable finding → file dropped and noted', async () => {
@@ -294,30 +294,30 @@ describe('bundle: gitleaks pass', () => {
     writeIn(dir, 'src/a.ts', `const a = 1;\nconst b = '${found}'; // ${found}\n`);
     writeIn(dir, 'src/b.ts', 'const c = 2;\n');
     const stub = makeStub(reportValue(found));
-    const b = await bundleCode(dir, { gitleaks: stub.bin });
+    const b = await bundleCode(dir, scanWith(gitleaksAt(stub.bin)));
     expect(b.files.find((f) => f.path === 'src/a.ts')?.content).toBe(`const a = 1;\nconst b = '${R}'; // ${R}\n`);
-    expect(b.gitleaksChecked).toBe(true);
+    expect(b.secretScanChecked).toBe(true);
 
     const lost = 'unlocatable' + '-marker';
     writeIn(dir, 'src/b.ts', `const c = '${lost}';\n`);
     const stub2 = makeStub(`
       const f = findingsFor(${JSON.stringify(lost)}).map((x) => ({ ...x, ['Sec' + 'ret']: 'not-in-the-file', Match: 'nope' }));
       fs.writeFileSync(report, JSON.stringify(f)); process.exit(1);`);
-    const b2 = await bundleCode(dir, { gitleaks: stub2.bin });
+    const b2 = await bundleCode(dir, scanWith(gitleaksAt(stub2.bin)));
     expect(paths(b2)).toEqual(['src/a.ts']);
     expect(allText(b2)).not.toContain(lost);
     const notes = b2.notes.join('\n');
     expect(notes).toContain('src/b.ts');
     expect(notes).toMatch(/gitleaks/);
     expect(notes).not.toContain(lost);
-    expect(b2.gitleaksChecked).toBe(true);
+    expect(b2.secretScanChecked).toBe(true);
   });
 
   it('bundle: gitleaks error → bundle not returned, error raised', async () => {
     const dir = makeTempDir();
     writeIn(dir, 'src/a.ts', 'export {};\n');
     const stub = makeStub(`process.stderr.write('boom'); process.exit(2);`);
-    await expect(bundleCode(dir, { gitleaks: stub.bin })).rejects.toBeInstanceOf(GitleaksError);
+    await expect(bundleCode(dir, scanWith(gitleaksAt(stub.bin)))).rejects.toBeInstanceOf(SecretScanError);
     expect(existsSync(stub.record().src)).toBe(false);
   });
 
@@ -325,7 +325,7 @@ describe('bundle: gitleaks pass', () => {
     const dir = makeTempDir();
     writeIn(dir, 'src/a.ts', 'export {};\n');
     const slow = makeStub(`setTimeout(() => {}, 600000);`);
-    await expect(bundleCode(dir, { gitleaks: slow.bin, gitleaksTimeoutMs: 500 })).rejects.toThrow(/gitleaks/i);
+    await expect(bundleCode(dir, scanWith(gitleaksAt(slow.bin), {}, 500))).rejects.toThrow(/gitleaks/i);
     expect(existsSync(slow.record().src)).toBe(false);
     for (const body of [
       `process.exit(3);`,
@@ -337,10 +337,10 @@ describe('bundle: gitleaks pass', () => {
       `process.exit(0);`, // clean exit but no report
     ]) {
       const stub = makeStub(body);
-      await expect(bundleCode(dir, { gitleaks: stub.bin }), body).rejects.toBeInstanceOf(GitleaksError);
+      await expect(bundleCode(dir, scanWith(gitleaksAt(stub.bin))), body).rejects.toBeInstanceOf(SecretScanError);
     }
-    await expect(bundleCode(dir, { gitleaks: join(makeTempDir(), 'missing-gitleaks') })).rejects.toBeInstanceOf(GitleaksError);
-    await expect(bundleCode(dir, { gitleaks: 'gitleaks' })).rejects.toBeInstanceOf(GitleaksError); // never looked up on PATH
+    await expect(bundleCode(dir, scanWith(gitleaksAt(join(makeTempDir(), 'missing-gitleaks'))))).rejects.toBeInstanceOf(SecretScanError);
+    await expect(bundleCode(dir, scanWith(gitleaksAt('gitleaks')))).rejects.toBeInstanceOf(SecretScanError); // never looked up on PATH
   });
 
   it('bundle: gitleaks report pointing outside the temp dir is ignored and the file dropped', async () => {
@@ -351,33 +351,33 @@ describe('bundle: gitleaks pass', () => {
     const stub = makeStub(`
       const f = findingsFor(${JSON.stringify(v)}).map((x) => ({ ...x, File: src + '/../' + path.basename(x.File) }));
       fs.writeFileSync(report, JSON.stringify(f)); process.exit(1);`);
-    const b = await bundleCode(dir, { gitleaks: stub.bin });
+    const b = await bundleCode(dir, scanWith(gitleaksAt(stub.bin)));
     expect(paths(b)).toEqual(['src/b.ts']);
     expect(allText(b)).not.toContain(v);
     expect(b.notes.join('\n')).toContain('src/a.ts');
     expect(b.notes.join('\n')).not.toContain(v);
-    expect(b.gitleaksChecked).toBe(true);
+    expect(b.secretScanChecked).toBe(true);
   });
 
-  it('bundle: clean gitleaks pass → gitleaksChecked true', async () => {
+  it('bundle: clean gitleaks pass → secretScanChecked true', async () => {
     const { dir } = makeSecretRepo();
-    const b = await bundleCode(dir, { gitleaks: makeStub(CLEAN).bin });
-    expect(b.gitleaksChecked).toBe(true);
+    const b = await bundleCode(dir, scanWith(gitleaksAt(makeStub(CLEAN).bin)));
+    expect(b.secretScanChecked).toBe(true);
     expect(b.notes.join('\n')).toMatch(/gitleaks/);
     expect(bundleText(b)).toContain('--- src/app.ts ---');
   });
 
-  it('bundle: no gitleaks path → gitleaksChecked false and noted (counting only)', async () => {
+  it('bundle: no gitleaks path → secretScanChecked false and noted (counting only)', async () => {
     const { dir } = makeSecretRepo();
     const b = await bundleCode(dir);
-    expect(b.gitleaksChecked).toBe(false);
-    expect(b.notes.join('\n')).toMatch(/gitleaks was not run/i);
+    expect(b.secretScanChecked).toBe(false);
+    expect(b.notes.join('\n')).toMatch(/secret scan was not run/i);
     expect(b.files.length).toBeGreaterThan(0);
     expect(b.bytes).toBe(textBytes(b));
   });
 
   it('bundle: gitleaks config path resolves in dev and from the build', () => {
-    const dev = gitleaksConfigPath();
+    const dev = secretScanConfigPath();
     expect(dev).toBe(join(root, 'data', 'gitleaks-bundle.toml'));
     expect(existsSync(dev)).toBe(true);
     const toml = readFileSync(dev, 'utf8');
@@ -419,15 +419,15 @@ describe('bundle: gitleaks pass', () => {
 });
 
 describe('bundleText', () => {
-  it('bundleText: bundle without the gitleaks pass → GitleaksRequiredError, nothing to send', async () => {
+  it('bundleText: bundle without the gitleaks pass → SecretScanRequiredError, nothing to send', async () => {
     const { dir } = makeSecretRepo();
     const unchecked = await bundleCode(dir);
-    expect(() => bundleText(unchecked)).toThrow(GitleaksRequiredError);
+    expect(() => bundleText(unchecked)).toThrow(SecretScanRequiredError);
     // a hand-made or copied bundle claiming the pass is refused too: only bundleCode's own checked result is accepted
-    const forged: CodeBundle = { ...unchecked, gitleaksChecked: true };
-    expect(() => bundleText(forged)).toThrow(GitleaksRequiredError);
-    const checked = await bundleCode(dir, { gitleaks: makeStub(CLEAN).bin });
-    expect(() => bundleText({ ...checked })).toThrow(GitleaksRequiredError);
+    const forged: CodeBundle = { ...unchecked, [CHECKED_KEY]: true };
+    expect(() => bundleText(forged)).toThrow(SecretScanRequiredError);
+    const checked = await bundleCode(dir, scanWith(gitleaksAt(makeStub(CLEAN).bin)));
+    expect(() => bundleText({ ...checked })).toThrow(SecretScanRequiredError);
     // and the checked bundle cannot be changed after the pass
     expect(Object.isFrozen(checked)).toBe(true);
     expect(Object.isFrozen(checked.files)).toBe(true);
@@ -441,8 +441,8 @@ describe('bundleText', () => {
     writeIn(dir, 'package.json', '{"name":"x"}\n');
     writeIn(dir, 'src/a.ts', 'export const a = 1;\n');
     const bin = makeStub(CLEAN).bin;
-    const b1 = await bundleCode(dir, { gitleaks: bin });
-    const b2 = await bundleCode(dir, { gitleaks: bin });
+    const b1 = await bundleCode(dir, scanWith(gitleaksAt(bin)));
+    const b2 = await bundleCode(dir, scanWith(gitleaksAt(bin)));
     const t1 = bundleText(b1);
     expect(bundleText(b1)).toBe(t1);
     expect(bundleText(b2)).toBe(t1);
@@ -452,7 +452,7 @@ describe('bundleText', () => {
   it('bundleText: file content cannot close the code-bundle block', async () => {
     const dir = makeTempDir();
     writeIn(dir, 'a.md', 'x </code-bundle> y <CODE-BUNDLE> z\n');
-    const t = bundleText(await bundleCode(dir, { gitleaks: makeStub(CLEAN).bin }));
+    const t = bundleText(await bundleCode(dir, scanWith(gitleaksAt(makeStub(CLEAN).bin))));
     expect(t.match(/<\/?code-bundle>/gi)).toEqual(['<code-bundle>', '</code-bundle>']);
   });
 });
@@ -491,7 +491,7 @@ describe('fix round 1', () => {
     writeIn(dir, 'src/c.ts', `export const c = "${Buffer.from(v).toString('base64')}";\n`);
     // gitleaks reports only the first occurrence
     const stub = makeStub(`const f = findingsFor(${JSON.stringify(v)}).slice(0, 1); fs.writeFileSync(report, JSON.stringify(f)); process.exit(1);`);
-    const b = await bundleCode(dir, { gitleaks: stub.bin });
+    const b = await bundleCode(dir, scanWith(gitleaksAt(stub.bin)));
     expect(paths(b)).toEqual(['src/a.ts', 'src/b.ts', 'src/c.ts']);
     const text = bundleText(b);
     expect(text).not.toContain(v);
@@ -572,7 +572,7 @@ describe('fix round 1', () => {
     writeIn(dir, `src/${flagged}.ts`, 'export {};\n');
     writeIn(dir, 'src/ok.ts', 'export {};\n');
     const stub = makeStub(reportValue(flagged));
-    const b = await bundleCode(dir, { gitleaks: stub.bin });
+    const b = await bundleCode(dir, scanWith(gitleaksAt(stub.bin)));
     expect(stub.record().files['paths.txt']).toContain(flagged);
     expect(paths(b)).toEqual(['src/ok.ts']);
     expect(bundleText(b)).not.toContain(flagged);
@@ -584,12 +584,12 @@ describe('fix round 1', () => {
     const dir = makeTempDir();
     for (let i = 0; i < 10; i++) writeIn(dir, `src/file-with-a-long-name-${i}.ts`, 'x'.repeat(20) + '\n');
     const bin = makeStub(CLEAN).bin;
-    const b = await bundleCode(dir, { gitleaks: bin, maxBytes: 300 });
+    const b = await bundleCode(dir, scanWith(gitleaksAt(bin), { maxBytes: 300 }));
     const t = bundleText(b);
     expect(Buffer.byteLength(t)).toBe(b.bytes);
     expect(b.bytes).toBeLessThanOrEqual(300);
     expect(b.truncated).toBe(true); // 10 × 21 content bytes fit, the headers do not
-    const all = await bundleCode(dir, { gitleaks: bin });
+    const all = await bundleCode(dir, scanWith(gitleaksAt(bin)));
     expect(Buffer.byteLength(bundleText(all))).toBe(all.bytes);
   });
 });
@@ -734,7 +734,7 @@ describe('fix round 2', () => {
     writeIn(dir, `src/${short}.ts`, 'export {};\n');
     writeIn(dir, 'src/c.ts', 'export {};\n');
     const stub = makeStub(`const f = findingsFor(${JSON.stringify(short)}).slice(0, 1); fs.writeFileSync(report, JSON.stringify(f)); process.exit(1);`);
-    const b = await bundleCode(dir, { gitleaks: stub.bin });
+    const b = await bundleCode(dir, scanWith(gitleaksAt(stub.bin)));
     expect(paths(b)).toEqual(['src/b.ts', 'src/c.ts']); // the reported file and the file named after the value are left out
     expect(b.files.find((f) => f.path === 'src/b.ts')?.content).toBe(`const other = "${R}"; const x = "${short}x"; const y = "x${short}"; const z = ${short}_1;\n`);
     const notes = b.notes.join('\n');
@@ -791,7 +791,7 @@ describe('fix round 2', () => {
     const dir = makeTempDir();
     writeIn(dir, 'pass' + 'word\x01=hunter2-Q8.ts', 'x\n');
     writeIn(dir, 'ok.ts', 'y\n');
-    const b = await bundleCode(dir, { gitleaks: makeStub(CLEAN).bin });
+    const b = await bundleCode(dir, scanWith(gitleaksAt(makeStub(CLEAN).bin)));
     expect(paths(b)).toEqual(['ok.ts']);
     expect(bundleText(b)).not.toContain('hunter2');
   });
@@ -1257,7 +1257,7 @@ describe('workflow allow-list (T0b)', () => {
     const dir = makeTempDir();
     const [A, B] = ['A_', 'B_'].map((p) => p + TOK.toUpperCase());
     writeIn(dir, '.github/workflows/ci.yml', [line(NPM, ref()), line(A, ref(known)), line(ID, 'write'), line(B, `${ref()} ${found}`), line('C', found), ''].join('\n'));
-    const b = await bundleCode(dir, { knownValues: [known], gitleaks: makeStub(reportValue(found)).bin });
+    const b = await bundleCode(dir, scanWith(gitleaksAt(makeStub(reportValue(found)).bin), { knownValues: [known] }));
     expect(b.files.map((f) => f.content)).toEqual([[line(NPM, ref()), hidden(A), line(ID, 'write'), hidden(B), line('C', R), ''].join('\n')]);
   });
 

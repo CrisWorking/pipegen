@@ -472,12 +472,12 @@ export function needsPromptBytes(p: RepoProfile, caps: Capabilities, opts: PlanN
 
 /**
  * The floor plus what the AI adds. The bundle goes into the prompt only through bundleText(), which refuses a
- * bundle that skipped the gitleaks pass, so nothing is sent then. `writers` is listWriters(...).length (the audit
+ * bundle that skipped the secret scan, so nothing is sent then. `writers` is listWriters(...).length (the audit
  * passes 0). `opts.knownValues` (what the user typed) are scrubbed from the profile summary, and a service name holding
  * one is left out of the prompt and the schema. AiError (with its usage) passes through.
  */
 export async function planNeeds(p: RepoProfile, caps: Capabilities, bundle: CodeBundle, ai: AiProvider, writers: number, opts: PlanNeedsOptions = {}): Promise<NeedsPlan> {
-  const code = bundleText(bundle); // first: throws GitleaksRequiredError before anything else happens
+  const code = bundleText(bundle); // first: throws SecretScanRequiredError before anything else happens
   const knownValues = opts.knownValues ?? [];
   const floor = floorNeeds(p, caps);
   const { req, schema } = needsRequest(code, p, caps, knownValues);

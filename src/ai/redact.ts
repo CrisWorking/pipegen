@@ -5,18 +5,21 @@ import { isAbsolute, join, relative, resolve, sep } from 'node:path';
 import picomatch from 'picomatch';
 import { IGNORED_DIRS, MAX_FILES_TEXT, listFiles, readTextLimitedWithReason, regexSafe, type Skipped } from '../read/limits.js';
 import { safeText } from '../util/safe-text.js';
-import { gitleaksConfigPath } from './gitleaks-config.js';
+import { secretScanConfigPath } from './secret-scan-config.js';
 
 export { isBinary } from '../read/limits.js';
-export { gitleaksConfigPath } from './gitleaks-config.js';
+export { secretScanConfigPath } from './secret-scan-config.js';
 
-/** Thrown by bundleText for a bundle that did not pass bundleCode's gitleaks check: nothing may be sent. */
-export class GitleaksRequiredError extends Error {}
-/** gitleaks could not run or gave an unusable result (not a finding): no bundle is returned. */
-export class GitleaksError extends Error {}
+/** Thrown by bundleText for a bundle that did not pass bundleCode's secret scan: nothing may be sent. */
+export class SecretScanRequiredError extends Error {}
+/** The secret scanner could not run or gave an unusable result (not a finding): no bundle is returned. */
+export class SecretScanError extends Error {}
+
+/** The pinned secret scanner bundleCode runs (ensurePinnedBinary's absolute path) and its pinned version. */
+export interface SecretScanner { name: 'gitleaks'; path: string; version: string }
 
 /** `bytes` is the exact UTF-8 size of bundleText(bundle) (wrapper and per-file headers included), never over maxBytes. */
-export interface CodeBundle { files: { path: string; content: string }[]; bytes: number; truncated: boolean; gitleaksChecked: boolean; notes: string[] }
+export interface CodeBundle { files: { path: string; content: string }[]; bytes: number; truncated: boolean; secretScanChecked: boolean; notes: string[] }
 
 export interface BundleOptions {
   roots?: string[];
@@ -24,26 +27,26 @@ export interface BundleOptions {
   /** Higher numbers are kept first when the bundle is cut to maxBytes. Default: manifests and config, then entry points, routes, the rest. */
   priority?: (path: string) => number;
   knownValues?: string[];
-  /** Path to the pinned gitleaks binary (Plan B's ensurePinnedBinary('gitleaks')). Without it the bundle is for counting only. */
-  gitleaks?: string;
-  /** gitleaks timeout; 60 s by default (tests set a short one). */
-  gitleaksTimeoutMs?: number;
+  /** The pinned secret scanner (Plan B's ensurePinnedBinary). Without it the bundle is for counting only. */
+  secretScanner?: SecretScanner;
+  /** The secret scan's timeout; 60 s by default (tests set a short one). */
+  secretScanTimeoutMs?: number;
   /**
    * Only these repo paths may be read (null or absent: every file). `audit --ai` passes the files its consent screen
-   * counted, so the gitleaks-checked bundle can only shrink: the cut to maxBytes runs over that same set and can't take
+   * counted, so the secret-scanned bundle can only shrink: the cut to maxBytes runs over that same set and can't take
    * in a file the user wasn't shown (Plan U T4b review I1).
    */
   onlyPaths?: ReadonlySet<string> | null;
 }
 
-/** The note a bundle built without gitleaks carries (counting only). The audit leaves it out of its report (nothing is sent there). */
-export const COUNTING_ONLY_NOTE = 'gitleaks was not run: this bundle is for counting only and cannot be sent to the AI.';
+/** The note a bundle built without the secret scan carries (counting only). The audit leaves it out of its report (nothing is sent there). */
+export const COUNTING_ONLY_NOTE = 'The secret scan was not run: this bundle is for counting only and cannot be sent to the AI.';
 
 const R = '[REDACTED]';
 /** What redact() puts in place of a line too long to scan (over 4 KB): the whole line is hidden. */
 export const LONG_LINE = '[REDACTED: line too long]';
 const DEFAULT_MAX_BYTES = 150_000;
-const GITLEAKS_TIMEOUT_MS = 60_000;
+const SECRET_SCAN_TIMEOUT_MS = 60_000;
 const MAX_REPORT_BYTES = 64 * 1024 * 1024;
 const MAX_LISTED_IN_NOTE = 10;
 
@@ -214,7 +217,7 @@ function jwtSpans(s: string): Span[] {
  * password, or the user holds an `@`), the whole token is used: from the authority's first `:` to the
  * token's last `@` before a host-like character (hiding too much is the safe side). Each character is
  * visited a bounded number of times: linear time.
- * Known limits (gitleaks' connection-string rule covers them): with user `admin`, password `P@ss#2024` and
+ * Known limits (the secret scan's connection-string rule covers them): with user `admin`, password `P@ss#2024` and
  * host `db`, the `2024` stays (the authority ends at the `#` and already holds user:password@; a later `@`
  * could as well be in a query, `?y=z@w`); and a password with `#` or `?` before a percent-encoded socket
  * host (`@%2Fvar%2Frun/db`), whose `@` is not followed by a host-like character.
@@ -371,7 +374,7 @@ const skipBlanks = (s: string, i: number) => {
  *   name="..."/key="..." attribute) starts an indented block, like an empty value.
  * - A value that is only `{` or `[` (a JSON-style object or array opened at the end of the line) starts an
  *   indented block too.
- * Known limits (gitleaks is the second line there, including its connection-string rule): a quoted value
+ * Known limits (the secret scan is the second line there, including its connection-string rule): a quoted value
  * that continues on the next lines (e.g. Python/TOML triple quotes spanning lines), XML values split across
  * lines in code files (no block rule there), an unescaped `<` inside an attribute value (illegal in XML;
  * HTML/JSX only: the tag is taken to end there, so the tail of that value may be sent), string
@@ -1026,7 +1029,7 @@ function knownForms(values: string[]): string[] {
  * overlapping or touching matches are merged, and each merged span becomes one [REDACTED], so overlapping
  * values cannot leave a piece behind.
  * Percent escapes match in any hex case (`%2f` = `%2F`); encodeURI and ASCII-only JSON (`\u00e9`) forms count too.
- * Known limits (the gitleaks pass is the second line of defence there): the base64 of a value embedded at a
+ * Known limits (the secret scan is the second line of defence there): the base64 of a value embedded at a
  * non-aligned offset inside a longer base64 blob (e.g. base64 of "user:value"); a value whose own letters
  * changed case; HTML-entity or language-specific escapes (Python `\xe9`).
  */
@@ -1142,9 +1145,9 @@ const insideDir = (base: string, target: string) => {
 /**
  * Collects the repo's code for the AI: lists files (symlinks never followed), drops EXCLUDED_PATTERNS
  * matches and binaries, reads within the read limits, then scrubKnownValues → redact() → scrubKnownValues
- * (known values only when given) → the gitleaks pass (if opts.gitleaks; it also removes every secret it
+ * (known values only when given) → the secret scan (if opts.secretScanner; it also removes every secret it
  * found from all files, and the known values again) → cuts to maxBytes by priority (whole files, lowest
- * priority first, sized as the final bundleText). Without opts.gitleaks the result is for counting only:
+ * priority first, sized as the final bundleText). Without opts.secretScanner the result is for counting only:
  * bundleText refuses it.
  */
 export async function bundleCode(dir: string, opts: BundleOptions = {}): Promise<CodeBundle> {
@@ -1157,7 +1160,7 @@ export async function bundleCode(dir: string, opts: BundleOptions = {}): Promise
   // Known values first (so redact() cannot break one up and leave pieces), then redact(), then known values
   // again in case a redaction exposed a new exact match. The same order applies to file names.
   const clean = (s: string, path?: string) => scrub(redact(scrub(s), path === undefined ? undefined : { path }));
-  const flagged: string[] = []; // secrets the gitleaks pass found; a path holding one is never shown
+  const flagged: string[] = []; // secrets the secret scan found; a path holding one is never shown
   const flaggedTokens: string[] = []; // short ones (under 6 characters), matched only as whole tokens
   // Checked on the raw name and on the name as shown (control characters removed), so a control character
   // inside a name cannot split a secret-like pattern.
@@ -1239,10 +1242,10 @@ export async function bundleCode(dir: string, opts: BundleOptions = {}): Promise
   if (excluded > 0) notes.add(`Left out ${plural(excluded, 'file that matches', 'files that match')} the excluded patterns (files that may hold secrets, lockfiles, dependency and build folders).`);
   if (secretNames > 0) notes.add(`Left out ${plural(secretNames, 'file whose name looks', 'files whose names look')} like a secret.`);
 
-  let gitleaksChecked = false;
-  if (opts.gitleaks !== undefined) {
-    collected = await gitleaksPass(collected, opts.gitleaks, opts.gitleaksTimeoutMs ?? GITLEAKS_TIMEOUT_MS, known, { long: flagged, short: flaggedTokens }, notes, show);
-    gitleaksChecked = true;
+  let secretScanChecked = false;
+  if (opts.secretScanner !== undefined) {
+    collected = await secretScanPass(collected, opts.secretScanner, opts.secretScanTimeoutMs ?? SECRET_SCAN_TIMEOUT_MS, known, { long: flagged, short: flaggedTokens }, notes, show);
+    secretScanChecked = true;
   } else {
     notes.add(COUNTING_ONLY_NOTE);
   }
@@ -1269,23 +1272,23 @@ export async function bundleCode(dir: string, opts: BundleOptions = {}): Promise
     files: files.map((f) => Object.freeze({ path: f.path, content: f.content })),
     bytes,
     truncated,
-    gitleaksChecked,
+    secretScanChecked,
     notes: notes.all(),
   };
   Object.freeze(bundle.files);
   Object.freeze(bundle.notes);
   Object.freeze(bundle);
-  if (gitleaksChecked) CHECKED.add(bundle);
+  if (secretScanChecked) CHECKED.add(bundle);
   else COUNTED.set(bundle, realRoot);
   return bundle;
 }
 
-// ---------- gitleaks pass ----------
+// ---------- the secret scan ----------
 
 interface Finding { file: string; startLine?: number; endLine?: number; secret: string; match: string }
 
-/** Runs gitleaks; resolves with its exit code, rejects (GitleaksError) on a spawn error, timeout or signal. */
-function runGitleaks(bin: string, args: string[], cwd: string, timeoutMs: number): Promise<number> {
+/** Runs the scanner; resolves with its exit code, rejects (SecretScanError) on a spawn error, timeout or signal. */
+function runScanner(name: string, bin: string, args: string[], cwd: string, timeoutMs: number): Promise<number> {
   const env: Record<string, string> = {};
   if (process.env.PATH !== undefined) env.PATH = process.env.PATH;
   if (process.env.HOME !== undefined) env.HOME = process.env.HOME;
@@ -1293,10 +1296,10 @@ function runGitleaks(bin: string, args: string[], cwd: string, timeoutMs: number
     execFile(bin, args, { cwd, env, timeout: timeoutMs, killSignal: 'SIGKILL', maxBuffer: 16 * 1024 * 1024, windowsHide: true }, (err) => {
       if (err === null) return resolvePromise(0);
       const e = err as ExecFileException;
-      if (e.killed && e.signal) return reject(new GitleaksError(`gitleaks did not finish within ${Math.round(timeoutMs / 1000)} s (or produced too much output) and was stopped.`));
-      if (e.signal) return reject(new GitleaksError(`gitleaks was stopped by signal ${safeText(String(e.signal))}.`));
+      if (e.killed && e.signal) return reject(new SecretScanError(`${name} did not finish within ${Math.round(timeoutMs / 1000)} s (or produced too much output) and was stopped.`));
+      if (e.signal) return reject(new SecretScanError(`${name} was stopped by signal ${safeText(String(e.signal))}.`));
       if (typeof e.code === 'number') return resolvePromise(e.code);
-      reject(new GitleaksError(`gitleaks could not be started (${safeText(String(e.code ?? 'unknown error'))}).`));
+      reject(new SecretScanError(`${name} could not be started (${safeText(String(e.code ?? 'unknown error'))}).`));
     });
   });
 }
@@ -1304,21 +1307,21 @@ function runGitleaks(bin: string, args: string[], cwd: string, timeoutMs: number
 const intOrUndefined = (v: unknown) => (typeof v === 'number' && Number.isInteger(v) && v > 0 ? v : undefined);
 
 /** The report is built from repo-derived content: only File, StartLine/EndLine, Match and Secret are used, all type-checked. */
-async function readReport(path: string): Promise<Finding[]> {
+async function readReport(name: string, path: string): Promise<Finding[]> {
   const info = await lstat(path).catch(() => null);
-  if (info === null || !info.isFile()) throw new GitleaksError('gitleaks wrote no report.');
-  if (info.size > MAX_REPORT_BYTES) throw new GitleaksError('gitleaks wrote a report that is too large to read.');
+  if (info === null || !info.isFile()) throw new SecretScanError(`${name} wrote no report.`);
+  if (info.size > MAX_REPORT_BYTES) throw new SecretScanError(`${name} wrote a report that is too large to read.`);
   let data: unknown;
   try {
     data = JSON.parse(await readFile(path, 'utf8'));
   } catch {
-    throw new GitleaksError('gitleaks wrote a report pipegen could not read.');
+    throw new SecretScanError(`${name} wrote a report pipegen could not read.`);
   }
-  if (!Array.isArray(data)) throw new GitleaksError('gitleaks wrote a report in an unexpected format.');
+  if (!Array.isArray(data)) throw new SecretScanError(`${name} wrote a report in an unexpected format.`);
   return data.map((item: unknown) => {
-    if (typeof item !== 'object' || item === null || Array.isArray(item)) throw new GitleaksError('gitleaks wrote a report in an unexpected format.');
+    if (typeof item !== 'object' || item === null || Array.isArray(item)) throw new SecretScanError(`${name} wrote a report in an unexpected format.`);
     const o = item as Record<string, unknown>;
-    if (typeof o.File !== 'string' || o.File === '') throw new GitleaksError('gitleaks wrote a finding without a file.');
+    if (typeof o.File !== 'string' || o.File === '') throw new SecretScanError(`${name} wrote a finding without a file.`);
     return {
       file: o.File,
       startLine: intOrUndefined(o.StartLine),
@@ -1345,7 +1348,7 @@ function applyFinding(content: string, f: Finding): string | null {
   return null;
 }
 
-// gitleaks skips any line holding its inline allow comment; the bundle never carries one, so a repo cannot opt a line out.
+// The scanner skips any line holding its inline allow comment; the bundle never carries one, so a repo cannot opt a line out.
 const ALLOW_COMMENT = 'gitleaks' + ':allow';
 
 const PATHS_FILE = 'paths.txt';
@@ -1372,34 +1375,35 @@ function tokenSpans(text: string, v: string): Span[] {
 const MIN_GLOBAL_SECRET = 6;
 
 /**
- * Scans the (already cleaned) files with gitleaks and returns what may be sent. Every finding is replaced
- * where it was reported; then every secret gitleaks found (and the known values) is removed from ALL files
+ * Scans the (already cleaned) files with the secret scanner and returns what may be sent. Every finding is replaced
+ * where it was reported; then every secret the scanner found (and the known values) is removed from ALL files
  * in all its forms, so a secret reported on one line cannot survive on another line or in another file.
  * The bundle paths are scanned too (paths.txt, one per line, as bundleText shows them); a file whose path
- * gitleaks flags, or whose path holds a found secret, is left out. Found secrets are added to `flagged`.
+ * the scanner flags, or whose path holds a found secret, is left out. Found secrets are added to `flagged`.
  */
-async function gitleaksPass(files: FileEntry[], bin: string, timeoutMs: number, known: string[], flagged: { long: string[]; short: string[] }, notes: Notes, show: (p: string) => string): Promise<FileEntry[]> {
+async function secretScanPass(files: FileEntry[], scanner: SecretScanner, timeoutMs: number, known: string[], flagged: { long: string[]; short: string[] }, notes: Notes, show: (p: string) => string): Promise<FileEntry[]> {
   // An absolute path only: a bare name would be looked up on PATH.
-  if (!isAbsolute(bin)) throw new GitleaksError('The gitleaks binary must be given as an absolute path.');
+  const { name, path: bin } = scanner;
+  if (!isAbsolute(bin)) throw new SecretScanError(`The ${name} binary must be given as an absolute path.`);
   let config: string;
   try {
-    config = gitleaksConfigPath();
+    config = secretScanConfigPath();
   } catch (e) {
-    throw new GitleaksError(e instanceof Error ? e.message : "pipegen's gitleaks config could not be found.");
+    throw new SecretScanError(e instanceof Error ? e.message : `pipegen's ${name} config could not be found.`);
   }
   const scanned = files.map((f) => ({ path: f.path, content: f.content.split(ALLOW_COMMENT).join('gitleaks-allow') }));
   const shownPaths = scanned.map((f) => displayPath(f.path));
-  const tmp = await realpath(await mkdtemp(join(tmpdir(), 'pipegen-gitleaks-')));
+  const tmp = await realpath(await mkdtemp(join(tmpdir(), 'pipegen-secret-scan-')));
   try {
     await chmod(tmp, 0o700);
-    // Neutral names: no repo file name (.gitleaksignore, .gitleaks.toml, allowlisted paths) reaches gitleaks.
+    // Neutral names: no repo file name (.gitleaksignore, .gitleaks.toml, allowlisted paths) reaches the scanner.
     const names = scanned.map((_, i) => `f${String(i + 1).padStart(6, '0')}.txt`);
     for (let i = 0; i < scanned.length; i++) await writeFile(join(tmp, names[i]), scanned[i].content, { flag: 'wx', mode: 0o600 });
     await writeFile(join(tmp, PATHS_FILE), shownPaths.join('\n').split(ALLOW_COMMENT).join('gitleaks-allow'), { flag: 'wx', mode: 0o600 });
     const reportPath = join(tmp, 'report.json');
-    const code = await runGitleaks(bin, ['detect', '--no-git', '--source', tmp, '--config', config, '--report-format', 'json', '--report-path', reportPath], tmp, timeoutMs);
-    if (code !== 0 && code !== 1) throw new GitleaksError(`gitleaks failed (exit code ${code}).`);
-    const findings = await readReport(reportPath);
+    const code = await runScanner(name, bin, ['detect', '--no-git', '--source', tmp, '--config', config, '--report-format', 'json', '--report-path', reportPath], tmp, timeoutMs);
+    if (code !== 0 && code !== 1) throw new SecretScanError(`${name} failed (exit code ${code}).`);
+    const findings = await readReport(name, reportPath);
 
     const index = new Map(names.map((n, i) => [n, i]));
     const perFile = new Map<number, Finding[]>();
@@ -1482,14 +1486,14 @@ async function gitleaksPass(files: FileEntry[], bin: string, timeoutMs: number, 
     });
 
     const pathsOf = (set: Set<number>) => [...set].sort((a, b) => a - b).map((i) => scanned[i].path);
-    notes.add(`gitleaks checked the bundle: ${plural(redacted, 'finding', 'findings')} redacted.`);
-    notes.addPaths('Left out because gitleaks found something pipegen could not locate to redact:', pathsOf(drop), show);
+    notes.add(`${name} checked the bundle: ${plural(redacted, 'finding', 'findings')} redacted.`);
+    notes.addPaths(`Left out because ${name} found something pipegen could not locate to redact:`, pathsOf(drop), show);
     notes.addPaths('Left out because a found secret was still in them after redaction:', pathsOf(leftover), show);
-    if (shortHit.size > 0) notes.add(`Left out ${plural(shortHit.size, 'file', 'files')} where gitleaks found a short value (under ${MIN_GLOBAL_SECRET} characters); elsewhere it is removed only where it stands as a whole word.`);
-    if (badPath.size > 0) notes.add(`Left out ${plural(badPath.size, 'file whose path', 'files whose paths')} gitleaks flagged as secret-like (names not shown).`);
+    if (shortHit.size > 0) notes.add(`Left out ${plural(shortHit.size, 'file', 'files')} where ${name} found a short value (under ${MIN_GLOBAL_SECRET} characters); elsewhere it is removed only where it stands as a whole word.`);
+    if (badPath.size > 0) notes.add(`Left out ${plural(badPath.size, 'file whose path', 'files whose paths')} ${name} flagged as secret-like (names not shown).`);
     if (strays > 0) {
-      notes.add(`Ignored ${plural(strays, 'gitleaks finding', 'gitleaks findings')} for a file outside the scanned folder.`);
-      notes.addPaths('Left out because a gitleaks finding outside the scanned folder may relate to them:', pathsOf(unplaced), show);
+      notes.add(`Ignored ${plural(strays, `${name} finding`, `${name} findings`)} for a file outside the scanned folder.`);
+      notes.addPaths(`Left out because a ${name} finding outside the scanned folder may relate to them:`, pathsOf(unplaced), show);
     }
     return scanned.filter((_, i) => !drop.has(i) && !unplaced.has(i) && !leftover.has(i) && !badPath.has(i) && !shortHit.has(i));
   } finally {
@@ -1499,10 +1503,10 @@ async function gitleaksPass(files: FileEntry[], bin: string, timeoutMs: number, 
 
 // ---------- bundle text ----------
 
-// Bundles that passed bundleCode's gitleaks check. They are frozen, so they cannot change afterwards;
+// Bundles that passed bundleCode's secret scan. They are frozen, so they cannot change afterwards;
 // a copy or a hand-made object is not in the set and is refused.
 const CHECKED = new WeakSet<object>();
-// Bundles bundleCode built without gitleaks (counting only), with the real path of the folder they were built from.
+// Bundles bundleCode built without the secret scan (counting only), with the real path of the folder they were built from.
 const COUNTED = new WeakMap<object, string>();
 
 /** Breaks any `<code-bundle` / `</code-bundle` in repo text so it cannot open or close the block. */
@@ -1521,15 +1525,15 @@ function neutralizeTags(s: string): string {
 
 /**
  * The bundle as one text block inside <code-bundle>…</code-bundle>, files sorted by path, each under a
- * `--- path ---` header. Byte-identical for the same bundle. Throws GitleaksRequiredError unless the
- * bundle is bundleCode's own result after a gitleaks pass, so unchecked code can never reach a provider.
+ * `--- path ---` header. Byte-identical for the same bundle. Throws SecretScanRequiredError unless the
+ * bundle is bundleCode's own result after a secret scan, so unchecked code can never reach a provider.
  */
 const OPEN_TAG = '<code-bundle>\n';
 const CLOSE_TAG = '</code-bundle>';
 const WRAPPER_BYTES = Buffer.byteLength(OPEN_TAG + CLOSE_TAG);
 const MIN_MAX_BYTES = 64;
 
-/** A path as bundleText shows it (and as the gitleaks pass scans it). */
+/** A path as bundleText shows it (and as the secret scan scans it). */
 function displayPath(path: string): string {
   return neutralizeTags(safeText(path, 1000));
 }
@@ -1541,13 +1545,13 @@ function fileBlock(f: FileEntry): string {
 }
 const blockBytes = (f: FileEntry) => Buffer.byteLength(fileBlock(f));
 
-/** bundleCode's own result after a gitleaks pass (a copy, a hand-made object or a counting-only bundle is not). */
+/** bundleCode's own result after a secret scan (a copy, a hand-made object or a counting-only bundle is not). */
 const isChecked = (bundle: CodeBundle): boolean =>
-  bundle !== null && typeof bundle === 'object' && bundle.gitleaksChecked === true && CHECKED.has(bundle);
+  bundle !== null && typeof bundle === 'object' && bundle.secretScanChecked === true && CHECKED.has(bundle);
 
 export function bundleText(bundle: CodeBundle): string {
   if (!isChecked(bundle)) {
-    throw new GitleaksRequiredError('This code bundle has not passed the required gitleaks check, so it cannot be sent to the AI.');
+    throw new SecretScanRequiredError('This code bundle has not passed the required secret scan, so it cannot be sent to the AI.');
   }
   const files = [...bundle.files].sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
   return OPEN_TAG + files.map(fileBlock).join('') + CLOSE_TAG;
@@ -1560,7 +1564,7 @@ let makeSummary: (files: number, bytes: number, topFolders: readonly string[]) =
 const ISSUED_SUMMARIES = new WeakSet<object>();
 
 /**
- * What a gitleaks-checked code bundle holds, for the consent screen: the number of files, `bytes` (the exact size of
+ * What a secret-scanned code bundle holds, for the consent screen: the number of files, `bytes` (the exact size of
  * bundleText) and the top-level folders, most files first. Only bundleSummary() makes one: the constructor is private
  * and a private field makes the type nominal, so an object literal doesn't type-check, and consentText also refuses
  * anything isSummary() rejects (a cast or a copy). So the screen always counts the bundle that will be sent
@@ -1588,13 +1592,13 @@ export class BundleSummary {
 }
 
 /**
- * The consent facts of `bundle`. Throws GitleaksRequiredError unless it is bundleCode's own result after a gitleaks
- * pass (as bundleText does), so the screen never describes code that can't be sent or wasn't checked. Top folders
+ * The consent facts of `bundle`. Throws SecretScanRequiredError unless it is bundleCode's own result after a secret
+ * scan (as bundleText does), so the screen never describes code that can't be sent or wasn't checked. Top folders
  * are the raw first path segments (consentText cleans them for the terminal); files at the top level have none.
  */
 export function bundleSummary(bundle: CodeBundle): BundleSummary {
   if (!isChecked(bundle)) {
-    throw new GitleaksRequiredError('This code bundle has not passed the required gitleaks check, so pipegen can\'t ask to send it.');
+    throw new SecretScanRequiredError('This code bundle has not passed the required secret scan, so pipegen can\'t ask to send it.');
   }
   return makeSummary(bundle.files.length, bundle.bytes, bundleTopFolders(bundle));
 }
@@ -1610,7 +1614,7 @@ export function bundleTopFolders(bundle: CodeBundle): string[] {
 }
 
 /**
- * The real path of the folder a COUNTING-ONLY bundle (bundleCode without gitleaks) was built from, or null for any other
+ * The real path of the folder a COUNTING-ONLY bundle (bundleCode without the secret scan) was built from, or null for any other
  * object (a checked bundle, a copy, a hand-made one). The audit's consent summary (src/audit/consent-token.ts) uses it.
  */
 export function countedBundleRoot(bundle: unknown): string | null {

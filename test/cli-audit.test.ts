@@ -874,8 +874,8 @@ describe('pipegen audit (Plan U final review)', () => {
     expect(oneLine(r.out)).toContain(`the limit you agreed to: ${cap as string}.`);
     expect(vi.mocked(bundleCode)).toHaveBeenCalledTimes(2);
     const [counting, checked] = vi.mocked(bundleCode).mock.calls;
-    expect(counting?.[1]?.gitleaks).toBeUndefined();
-    expect(checked?.[1]?.gitleaks).toBeDefined();
+    expect(counting?.[1]?.secretScanner).toBeUndefined();
+    expect(checked?.[1]?.secretScanner).toBeDefined();
     // the report's count and the consent screen's count are the same count
     const files = /pipegen sends at most (\d+) files?/.exec(ask.asked[0] as string)?.[1];
     expect(oneLine(r.out)).toContain(`pipegen would send ${files} file`);

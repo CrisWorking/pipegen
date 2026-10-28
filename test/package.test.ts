@@ -122,8 +122,8 @@ describe('build', () => {
       const err = e as { status?: number; stderr?: string };
       throw new Error(`probe exited with ${err.status}: ${String(err.stderr).split('\n').slice(0, 8).join('\n')}`);
     }
-    const result = JSON.parse(stdout.trim()) as { owner: string; repo: string; services: string[]; files: number; bytes: number; gitleaksChecked: boolean; providers: string[]; pushJobs: number; needsSchemaKeys: string[]; qualityBar: unknown; qualityReasons: number; pinnedBinaries: { loaded?: unknown; refused?: string }; bundledMemory: unknown; reviewed: { loaded?: number; refused?: string }; aiPrices: unknown; githubPlans: unknown; toolSignatures: unknown; coverage: string[]; floorNeeds: number; estimate: { setupMinutes: number; includedMinutes: number | null; aiCostCapUsd: number | null } };
-    expect(result).toMatchObject({ owner: 'o', repo: 'r', services: ['.'], gitleaksChecked: false, providers: ['claude', 'openai', 'ollama'] });
+    const result = JSON.parse(stdout.trim()) as { owner: string; repo: string; services: string[]; files: number; bytes: number; checked: boolean; providers: string[]; pushJobs: number; needsSchemaKeys: string[]; qualityBar: unknown; qualityReasons: number; pinnedBinaries: { loaded?: unknown; refused?: string }; bundledMemory: unknown; reviewed: { loaded?: number; refused?: string }; aiPrices: unknown; githubPlans: unknown; toolSignatures: unknown; coverage: string[]; floorNeeds: number; estimate: { setupMinutes: number; includedMinutes: number | null; aiCostCapUsd: number | null } };
+    expect(result).toMatchObject({ owner: 'o', repo: 'r', services: ['.'], checked: false, providers: ['claude', 'openai', 'ollama'] });
     expect(result.pushJobs).toBe(7); // hooks-ci, secrets + sast, deps, unit-tests, lint for the one service + workflow-lint (Plan P)
     expect(result.needsSchemaKeys).toEqual(['add', 'skipLayers', 'requireDeployApproval']);
     expect(result.qualityBar).toEqual(loadQualityBar()); // read from <pkg>/data/quality-bar.yml by the bundled loader

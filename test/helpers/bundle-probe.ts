@@ -52,7 +52,7 @@ console.log(JSON.stringify({
   services: profile.services.map((s) => s.path),
   files: bundle.files.length,
   bytes: bundle.bytes,
-  gitleaksChecked: bundle.gitleaksChecked,
+  checked: bundle.secretScanChecked,
   providers,
   // the needs planner's rules and its zod → JSON schema step work when bundled
   pushJobs: jobCounts(floorNeeds(full, caps)).push,

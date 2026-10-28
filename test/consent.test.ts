@@ -9,13 +9,13 @@ import { claimTokenMinter, ConsentToken, countingSummary, CountingSummary } from
 import { clackPrompter, PromptCancelledError, type Prompter } from '../src/cli/io.js';
 import { REFUSAL_FALLBACK_NOTE } from '../src/ai/provider.js';
 import { ollamaProvider } from '../src/ai/ollama.js';
-import { BundleSummary, bundleCode, bundleSummary, EXCLUDED_KEPT, EXCLUDED_PATTERN_GROUPS, EXCLUDED_PATTERNS, GitleaksRequiredError, type CodeBundle } from '../src/ai/redact.js';
+import { BundleSummary, bundleCode, bundleSummary, EXCLUDED_KEPT, EXCLUDED_PATTERN_GROUPS, EXCLUDED_PATTERNS, SecretScanRequiredError, type CodeBundle } from '../src/ai/redact.js';
 import { floorNeeds, jobCategories } from '../src/engine/needs.js';
 import { estimate, estimateAuditAi, type Estimates } from '../src/estimate/estimate.js';
 import { permissionsTable } from '../src/github/client.js';
 import { DEFAULT_MODEL, type AiProvider, type Capabilities, type RepoProfile, type Service } from '../src/types.js';
 import { hostileNames } from './fixtures/hostile-names.js';
-import { CLEAN, makeStub } from './helpers/gitleaks-stub.js';
+import { CLEAN, gitleaksAt, gitleaksFacts, makeStub, scanWith } from './helpers/gitleaks-stub.js';
 import { cleanupRepos, makeTempDir, writeIn } from './helpers/make-repo.js';
 import { fake } from './helpers/secret-repo.js';
 import { emptyRepoFiles, emptyServiceQuality } from '../src/read/quality.js';
@@ -43,7 +43,7 @@ const fullEst = (p: RepoProfile, ai: AiProvider): Estimates =>
 async function checkedBundle(files: string[]): Promise<CodeBundle> {
   const dir = makeTempDir();
   for (const f of files) writeIn(dir, f, `// ${f.length}\n`);
-  return bundleCode(dir, { gitleaks: makeStub(CLEAN).bin });
+  return bundleCode(dir, scanWith(gitleaksAt(makeStub(CLEAN).bin)));
 }
 /** The consent facts of that bundle: only bundleSummary() makes a BundleSummary (final review batch 2, I1). */
 const summaryOf = async (files: string[]) => bundleSummary(await checkedBundle(files));
@@ -64,13 +64,13 @@ const full = (over: { p?: RepoProfile; ai?: AiProvider; exists?: [boolean, boole
   const ai = over.ai ?? claude;
   const est = fullEst(p, ai);
   const app = over.app ?? false;
-  const text = consentText(p, ai, est, bundle, permissionsTable('write', { appCreatesRepos: app }), repos(p, over.exists ?? [false, true]), 'full', { appCreatesRepos: app, gitleaksVersion: '8.30.1' });
+  const text = consentText(p, ai, est, bundle, permissionsTable('write', { appCreatesRepos: app }), repos(p, over.exists ?? [false, true]), 'full', { appCreatesRepos: app, ...gitleaksFacts() });
   return { p, est, text };
 };
 const audit = (ai: AiProvider = claude, extra: { p?: RepoProfile; bundle?: BundleSummary } = {}) => {
   const p = extra.p ?? profile();
   const est = estimateAuditAi(ai, 3, 50_000);
-  const text = consentText(p, ai, est, extra.bundle ?? bundle, permissionsTable('read'), [], 'audit-ai', { gitleaksVersion: '8.30.1' });
+  const text = consentText(p, ai, est, extra.bundle ?? bundle, permissionsTable('read'), [], 'audit-ai', gitleaksFacts());
   return { p, est, text };
 };
 
@@ -135,7 +135,7 @@ describe('consentText (full)', () => {
 
   it('consent: token mode refuses a permissions table built for the App (it would say pipegen creates repos)', () => {
     const p = profile();
-    expect(() => consentText(p, claude, fullEst(p, claude), bundle, permissionsTable('write', { appCreatesRepos: true }), repos(p, [false, true]), 'full', { appCreatesRepos: false, gitleaksVersion: '8.30.1' }))
+    expect(() => consentText(p, claude, fullEst(p, claude), bundle, permissionsTable('write', { appCreatesRepos: true }), repos(p, [false, true]), 'full', { appCreatesRepos: false, ...gitleaksFacts() }))
       .toThrow(/never creates or deletes repos/);
   });
 
@@ -250,7 +250,7 @@ describe('consentText (full)', () => {
     expect(long).not.toContain('a'.repeat(200));
     // the repo name in the helper repo lines too
     const fullText = consentText(profile({ repo: 'shop' }), claude, fullEst(profile(), claude), bundle, permissionsTable('write', { appCreatesRepos: false }),
-      [{ name: `pipegen-proof-${hostileNames.ansiColour}`, exists: false }], 'full', { appCreatesRepos: false, gitleaksVersion: '8.30.1' });
+      [{ name: `pipegen-proof-${hostileNames.ansiColour}`, exists: false }], 'full', { appCreatesRepos: false, ...gitleaksFacts() });
     expect(fullText).not.toContain('\x1b');
   });
 });
@@ -277,15 +277,15 @@ describe('consentText (audit-ai, ruling B2)', () => {
     const pro = provider('openai', 'gpt-5-pro');
     const est = estimateAuditAi(pro, 3, 50_000);
     expect(est.unpriced?.message).toBe("pipegen doesn't know the price of gpt-5-pro, so it can't keep a hard cost limit. Choose one of: gpt-5, gpt-5-mini, gpt-5.5.");
-    expect(() => consentText(p, pro, est, bundle, permissionsTable('read'), [], 'audit-ai', { gitleaksVersion: '8.30.1' })).toThrow(est.unpriced?.message);
+    expect(() => consentText(p, pro, est, bundle, permissionsTable('read'), [], 'audit-ai', gitleaksFacts())).toThrow(est.unpriced?.message);
   });
 
   it('consent: audit-ai mode ignores repos and refuses write permissions', () => {
     const p = profile();
     const est = estimateAuditAi(claude, 3, 50_000);
-    const text = consentText(p, claude, est, bundle, permissionsTable('read'), repos(p, [false, false]), 'audit-ai', { gitleaksVersion: '8.30.1' });
+    const text = consentText(p, claude, est, bundle, permissionsTable('read'), repos(p, [false, false]), 'audit-ai', gitleaksFacts());
     expect(text).not.toMatch(/pipelines|pipegen-proof|gh repo create/);
-    expect(() => consentText(p, claude, est, bundle, permissionsTable('write', { appCreatesRepos: false }), [], 'audit-ai', { gitleaksVersion: '8.30.1' })).toThrow(/read-only/);
+    expect(() => consentText(p, claude, est, bundle, permissionsTable('write', { appCreatesRepos: false }), [], 'audit-ai', gitleaksFacts())).toThrow(/read-only/);
   });
 });
 
@@ -300,8 +300,8 @@ describe('consent facts tied to their sources (final review batch 2, I1)', () =>
     const dir = makeTempDir();
     writeIn(dir, 'src/a.ts', 'x\n');
     const unchecked = await bundleCode(dir); // no gitleaks: for counting only
-    expect(() => bundleSummary(unchecked)).toThrow(GitleaksRequiredError);
-    expect(() => bundleSummary({ ...checked })).toThrow(GitleaksRequiredError); // a copy is not the checked bundle
+    expect(() => bundleSummary(unchecked)).toThrow(SecretScanRequiredError);
+    expect(() => bundleSummary({ ...checked })).toThrow(SecretScanRequiredError); // a copy is not the checked bundle
   });
 
   it('consent: only a BundleSummary made by bundleSummary() is accepted', () => {
@@ -309,11 +309,11 @@ describe('consent facts tied to their sources (final review batch 2, I1)', () =>
     const est = estimateAuditAi(claude, 3, 50_000);
     const fake = { files: 1, bytes: 1, topFolders: [] };
     // @ts-expect-error a plain object is not a BundleSummary (it has no private brand)
-    expect(() => consentText(p, claude, est, fake, permissionsTable('read'), [], 'audit-ai', { gitleaksVersion: '8.30.1' })).toThrow(/bundleSummary/);
+    expect(() => consentText(p, claude, est, fake, permissionsTable('read'), [], 'audit-ai', gitleaksFacts())).toThrow(/bundleSummary/);
     const cast = fake as unknown as BundleSummary;
-    expect(() => consentText(p, claude, est, cast, permissionsTable('read'), [], 'audit-ai', { gitleaksVersion: '8.30.1' })).toThrow(/bundleSummary/);
+    expect(() => consentText(p, claude, est, cast, permissionsTable('read'), [], 'audit-ai', gitleaksFacts())).toThrow(/bundleSummary/);
     const copy = Object.assign(Object.create(BundleSummary.prototype) as BundleSummary, { files: 1, bytes: 1, topFolders: [] });
-    expect(() => consentText(p, claude, est, copy, permissionsTable('read'), [], 'audit-ai', { gitleaksVersion: '8.30.1' })).toThrow(/bundleSummary/);
+    expect(() => consentText(p, claude, est, copy, permissionsTable('read'), [], 'audit-ai', gitleaksFacts())).toThrow(/bundleSummary/);
     // @ts-expect-error the constructor is private: only bundleSummary() makes one
     expect(() => new BundleSummary(1, 1, [])).toBeDefined();
   });
@@ -322,17 +322,17 @@ describe('consent facts tied to their sources (final review batch 2, I1)', () =>
     const p = profile();
     const fable = provider('claude', 'claude-fable-5-1');
     const opusFull = fullEst(p, claude);
-    expect(() => consentText(p, fable, opusFull, bundle, permissionsTable('write', { appCreatesRepos: false }), repos(p, [true, true]), 'full', { appCreatesRepos: false, gitleaksVersion: '8.30.1' }))
+    expect(() => consentText(p, fable, opusFull, bundle, permissionsTable('write', { appCreatesRepos: false }), repos(p, [true, true]), 'full', { appCreatesRepos: false, ...gitleaksFacts() }))
       .toThrow(/priced for claude \/ claude-opus-5-5.*claude \/ claude-fable-5-1/);
-    expect(() => consentText(p, openai, estimateAuditAi(claude, 3, 50_000), bundle, permissionsTable('read'), [], 'audit-ai', { gitleaksVersion: '8.30.1' })).toThrow(/priced for/);
+    expect(() => consentText(p, openai, estimateAuditAi(claude, 3, 50_000), bundle, permissionsTable('read'), [], 'audit-ai', gitleaksFacts())).toThrow(/priced for/);
     // an estimate with no provider can't back a consent screen that sends code to one
     const none = estimate(p, jobCategories(floorNeeds(p, CAPS)), 2, { pushes: 1, prs: 1, capped: false }, null);
-    expect(() => consentText(p, claude, none, bundle, permissionsTable('write', { appCreatesRepos: false }), repos(p, [true, true]), 'full', { appCreatesRepos: false, gitleaksVersion: '8.30.1' })).toThrow(/priced for no AI provider/);
+    expect(() => consentText(p, claude, none, bundle, permissionsTable('write', { appCreatesRepos: false }), repos(p, [true, true]), 'full', { appCreatesRepos: false, ...gitleaksFacts() })).toThrow(/priced for no AI provider/);
     // Ollama: the estimate must be for the same host (its basis says where the model runs)
     const remote = ollamaAt('gpu.example.net:11434');
-    expect(() => consentText(p, remote, estimateAuditAi({ name: 'ollama', model: 'llama3.1' }, 3, 50_000), bundle, permissionsTable('read'), [], 'audit-ai', { gitleaksVersion: '8.30.1' })).toThrow(/priced for/);
-    expect(() => consentText(p, remote, estimateAuditAi(ollama, 3, 50_000), bundle, permissionsTable('read'), [], 'audit-ai', { gitleaksVersion: '8.30.1' })).toThrow(/priced for/);
-    expect(consentText(p, remote, estimateAuditAi(remote, 3, 50_000), bundle, permissionsTable('read'), [], 'audit-ai', { gitleaksVersion: '8.30.1' })).toContain('gpu.example.net:11434');
+    expect(() => consentText(p, remote, estimateAuditAi({ name: 'ollama', model: 'llama3.1' }, 3, 50_000), bundle, permissionsTable('read'), [], 'audit-ai', gitleaksFacts())).toThrow(/priced for/);
+    expect(() => consentText(p, remote, estimateAuditAi(ollama, 3, 50_000), bundle, permissionsTable('read'), [], 'audit-ai', gitleaksFacts())).toThrow(/priced for/);
+    expect(consentText(p, remote, estimateAuditAi(remote, 3, 50_000), bundle, permissionsTable('read'), [], 'audit-ai', gitleaksFacts())).toContain('gpu.example.net:11434');
   });
 });
 
@@ -350,7 +350,7 @@ describe('consent shows how the estimates were made (final review batch 2, M3)',
     }
     // the assumptions a user should see at the decision point
     const capped = consentText(profile(), claude, estimate(profile(), jobCategories(floorNeeds(profile(), CAPS)), 2, { pushes: 300, prs: 2, capped: true }, claude), bundle,
-      permissionsTable('write', { appCreatesRepos: false }), repos(profile(), [true, true]), 'full', { appCreatesRepos: false, gitleaksVersion: '8.30.1' });
+      permissionsTable('write', { appCreatesRepos: false }), repos(profile(), [true, true]), 'full', { appCreatesRepos: false, ...gitleaksFacts() });
     expect(capped).toContain('at least 300 pushes');
     expect(capped).toMatch(/disputes/);
     const unknownModel = provider('claude', 'claude-future-9');
@@ -378,7 +378,7 @@ describe('consent shows how the estimates were made (final review batch 2, M3)',
 
 describe('askConsent', () => {
   /** The audit --ai screen for the shared checked bundle. */
-  const screen = () => consentScreen(profile(), claude, estimateAuditAi(claude, 3, 50_000), bundle, permissionsTable('read'), [], 'audit-ai', { gitleaksVersion: '8.30.1' });
+  const screen = () => consentScreen(profile(), claude, estimateAuditAi(claude, 3, 50_000), bundle, permissionsTable('read'), [], 'audit-ai', gitleaksFacts());
 
   it('consent: default answer is No', async () => {
     const io = scripted(async (_m, def) => def); // the user just presses Enter
@@ -414,17 +414,17 @@ describe('askConsent', () => {
 describe('consent token (T4b: no AI call without consent, by type)', () => {
   it('consent grant (yes) gives a ConsentToken that carries what the screen showed (mode, provider, cap, files)', async () => {
     const est = estimateAuditAi(claude, 3, 50_000);
-    const s = consentScreen(profile(), claude, est, bundle, permissionsTable('read'), [], 'audit-ai', { gitleaksVersion: '8.30.1' });
+    const s = consentScreen(profile(), claude, est, bundle, permissionsTable('read'), [], 'audit-ai', gitleaksFacts());
     expect(s).toBeInstanceOf(ConsentScreen);
     expect(Object.isFrozen(s)).toBe(true);
-    expect(s.text).toBe(consentText(profile(), claude, est, bundle, permissionsTable('read'), [], 'audit-ai', { gitleaksVersion: '8.30.1' }));
+    expect(s.text).toBe(consentText(profile(), claude, est, bundle, permissionsTable('read'), [], 'audit-ai', gitleaksFacts()));
     const granted = await askConsent(scripted(async () => true), s, noErr);
     if (granted === null) throw new Error('expected a yes');
     expect(ConsentToken.isToken(granted)).toBe(true);
     expect(Object.isFrozen(granted)).toBe(true);
     expect(granted.terms).toEqual({ mode: 'audit-ai', pricedFor: est.pricedFor, capUsd: est.capUsd, files: bundle, dir: null });
     const f = full();
-    const fullScreen = consentScreen(f.p, claude, f.est, bundle, permissionsTable('write', { appCreatesRepos: false }), repos(f.p, [true, true]), 'full', { appCreatesRepos: false, gitleaksVersion: '8.30.1' });
+    const fullScreen = consentScreen(f.p, claude, f.est, bundle, permissionsTable('write', { appCreatesRepos: false }), repos(f.p, [true, true]), 'full', { appCreatesRepos: false, ...gitleaksFacts() });
     expect(fullScreen.terms).toMatchObject({ mode: 'full', capUsd: f.est.aiCostCapUsd });
   });
 
@@ -439,7 +439,7 @@ describe('consent token (T4b: no AI call without consent, by type)', () => {
     const hand = { text: 'x', terms: { mode: 'audit-ai' } } as unknown as ConsentScreen;
     await expect(askConsent(yes, hand, noErr)).rejects.toThrow(/consentScreen/);
     // runtime forgery (review M1): `new` through a cast, or a subclass, is not a screen pipegen made
-    const real = consentScreen(profile(), claude, estimateAuditAi(claude, 3, 50_000), bundle, permissionsTable('read'), [], 'audit-ai', { gitleaksVersion: '8.30.1' });
+    const real = consentScreen(profile(), claude, estimateAuditAi(claude, 3, 50_000), bundle, permissionsTable('read'), [], 'audit-ai', gitleaksFacts());
     const Screen = ConsentScreen as unknown as new (text: string, terms: unknown) => ConsentScreen;
     class SubScreen extends Screen {}
     for (const forged of [new Screen('x', real.terms), new SubScreen('x', real.terms)]) {
@@ -484,11 +484,11 @@ describe('counting summary (audit --ai: consent comes before the gitleaks downlo
     ps.add('src/evil.ts');
     expect(c.paths().has('src/evil.ts')).toBe(false);
     // covers(): the checked bundle of the same files is inside what was counted; a bundle with another file is not
-    expect(c.covers(await bundleCode(dir, { gitleaks: makeStub(CLEAN).bin }))).toBe(true);
+    expect(c.covers(await bundleCode(dir, scanWith(gitleaksAt(makeStub(CLEAN).bin))))).toBe(true);
     writeIn(dir, 'src/new.ts', '// new\n');
-    expect(c.covers(await bundleCode(dir, { gitleaks: makeStub(CLEAN).bin }))).toBe(false);
+    expect(c.covers(await bundleCode(dir, scanWith(gitleaksAt(makeStub(CLEAN).bin))))).toBe(false);
     // onlyPaths (review I1): the walk reads only the counted files, so the checked bundle stays inside the count
-    const only = await bundleCode(dir, { gitleaks: makeStub(CLEAN).bin, onlyPaths: c.paths() });
+    const only = await bundleCode(dir, scanWith(gitleaksAt(makeStub(CLEAN).bin), { onlyPaths: c.paths() }));
     expect(only.files.map((f) => f.path)).not.toContain('src/new.ts');
     expect(c.covers(only)).toBe(true);
   });
@@ -499,15 +499,15 @@ describe('counting summary (audit --ai: consent comes before the gitleaks downlo
     const c = countingSummary(await bundleCode(dir));
     const p = profile();
     const est = estimateAuditAi(claude, 3, 50_000);
-    const text = consentText(p, claude, est, c, permissionsTable('read'), [], 'audit-ai', { gitleaksVersion: '8.30.1' });
+    const text = consentText(p, claude, est, c, permissionsTable('read'), [], 'audit-ai', gitleaksFacts());
     expect(text).toContain('pipegen sends at most 7 files');
     expect(text).toContain('Top folders: src, test, .github');
     expect(text).toContain('These counts were made before the gitleaks check');
     expect(text).toContain('gitleaks 8.30.1, which pipegen downloads (checksum-verified) into its cache');
-    expect(text).not.toMatch(/gitleaks was not run|counting only/);
+    expect(text).not.toMatch(/secret scan was not run|counting only/);
     const f = full();
     // @ts-expect-error the full run's screen takes only the checked bundle's summary
-    expect(() => consentText(f.p, claude, f.est, c, permissionsTable('write', { appCreatesRepos: false }), repos(f.p, [true, true]), 'full', { appCreatesRepos: false, gitleaksVersion: '8.30.1' })).toThrow(/bundleSummary/);
+    expect(() => consentText(f.p, claude, f.est, c, permissionsTable('write', { appCreatesRepos: false }), repos(f.p, [true, true]), 'full', { appCreatesRepos: false, ...gitleaksFacts() })).toThrow(/bundleSummary/);
   });
 });
 

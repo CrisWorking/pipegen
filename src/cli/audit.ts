@@ -10,10 +10,10 @@
 // - The reviewed tool list can't be used (B3: the release build refuses it while entries wait for review): the audit
 //   runs with no reviewed tools and a warning at the top, exit 0.
 // - `--ai`: everything that can refuse it is checked first, before any GitHub call (S21 platform, S15 provider, the
-//   Ollama checks of U15/H2, the gitleaks pin). After the plain audit: the estimate (an unpriced model stops here,
-//   U14), from the counting bundle (no gitleaks, no child process) the plain audit already counted with, built once
+//   Ollama checks of U15/H2, the secret scanner's pin). After the plain audit: the estimate (an unpriced model stops here,
+//   U14), from the counting bundle (no secret scan, no child process) the plain audit already counted with, built once
 //   per run (final review M9), then the consent screen (default No). Only a yes
-//   gives the ConsentToken addAiSuggestions requires; it then downloads gitleaks, builds the checked bundle and asks the AI.
+//   gives the ConsentToken addAiSuggestions requires; it then downloads the secret scanner, builds the checked bundle and asks the AI.
 // - Output: the terminal report (default) or JSON (--json) on stdout; --out writes the Markdown report through
 //   writeOutFile; errors and status lines on stderr. Every output gets the run's known values (the GitHub token and
 //   the AI keys, S19/U10), so neither is ever printed, and every line passes hideToken.
@@ -21,7 +21,7 @@ import { resolve } from 'node:path';
 import type { Octokit } from '@octokit/rest';
 import { checkOllamaModelRunsThere } from '../ai/ollama.js';
 import { AiError, makeProvider } from '../ai/provider.js';
-import { bundleCode, scrubKnownValues } from '../ai/redact.js';
+import { bundleCode, scrubKnownValues, type SecretScanner } from '../ai/redact.js';
 import { countingSummary } from '../audit/consent-token.js';
 import { writeOutFile, OutFileError } from '../audit/out-file.js';
 import { addAiSuggestions, buildAudit, buildLocalAudit, needsRequestBytes, type AuditReport } from '../audit/model.js';
@@ -63,7 +63,7 @@ export interface AuditFlags {
 
 /** Ruling S15: the audit's own wording (MISSING_AI_MESSAGE talks about the full job). */
 export const AUDIT_AI_MISSING = 'audit --ai needs an AI provider: set ANTHROPIC_API_KEY or OPENAI_API_KEY, or use --ai ollama.';
-/** Ruling S21 (Plan B S27): the pinned gitleaks exists for these platforms only. */
+/** Ruling S21 (Plan B S27): the pinned secret scanners exist for these platforms only. */
 export const AUDIT_AI_PLATFORM = 'audit --ai needs Linux or macOS for now (WSL works).';
 /**
  * Ruling B3: the top warning when the reviewed tool list can't be used in this build. `why` is the loader's short
@@ -76,7 +76,7 @@ const EXTRA_NEEDS_MARGIN = 2;
 
 type GitHubContext = Pick<RepoProfile, 'private' | 'ownerType' | 'plan' | 'defaultBranch'>;
 interface GitHubRead { auth: Auth; gh: Octokit; context: GitHubContext; caps: Capabilities }
-interface AiReady { provider: AiProvider; gitleaksVersion: string; bar: QualityBar }
+interface AiReady { provider: AiProvider; secretScanner: Pick<SecretScanner, 'name' | 'version'>; bar: QualityBar }
 
 /** Runs `pipegen audit`. 0: a report was printed (also with the reviewed list unusable); 1: a refusal or an error. */
 export async function audit(io: CliIO, flags: AuditFlags): Promise<number> {
@@ -154,7 +154,7 @@ export async function audit(io: CliIO, flags: AuditFlags): Promise<number> {
       reviewedProblem = e.reason ?? e.message;
     }
 
-    // 5. the plain audit, with the code bundle counted once (no gitleaks, no child process): the report's count and,
+    // 5. the plain audit, with the code bundle counted once (no secret scan, no child process): the report's count and,
     //    with --ai, the consent screen's count are this one count (final review M9)
     const anonymous = github.auth.kind === 'anonymous';
     const counted = await bundleCode(dir, { knownValues });
@@ -173,7 +173,7 @@ export async function audit(io: CliIO, flags: AuditFlags): Promise<number> {
         fail(clean(est.unpriced.message));
         return 1;
       }
-      const screen = consentScreen(r.profile, ai.provider, est, countingSummary(counted), permissionsTable('read'), [], 'audit-ai', { gitleaksVersion: ai.gitleaksVersion });
+      const screen = consentScreen(r.profile, ai.provider, est, countingSummary(counted), permissionsTable('read'), [], 'audit-ai', { secretScanner: ai.secretScanner });
       // defence in depth: the screen is pipegen's own text with cleaned repo names; known values are hidden all the same
       const scrub = (s: string) => scrubKnownValues(hideToken(s, token), usableKnownValues(knownValues));
       const consent = await askConsent({ ...io.prompt, confirm: (msg, def) => io.prompt.confirm(scrub(msg), def) }, screen, fail);
@@ -219,7 +219,7 @@ export async function audit(io: CliIO, flags: AuditFlags): Promise<number> {
 /**
  * Everything that can refuse `--ai`, before any GitHub call: the platform (S21), the provider and its key (S15), for
  * Ollama the host and the model (U15/H2: never ollama.com, never a cloud model behind a local name; fail closed), and
- * the pinned gitleaks version the consent screen names. A string is the refusal to show.
+ * the pinned secret scanner and version the consent screen names. A string is the refusal to show.
  */
 async function prepareAi(io: CliIO, flags: AuditFlags, notes: string[]): Promise<AiReady | string> {
   if (!(PLATFORM_KEYS as readonly string[]).includes(`${process.platform}-${process.arch}`)) return AUDIT_AI_PLATFORM;
@@ -242,14 +242,14 @@ async function prepareAi(io: CliIO, flags: AuditFlags, notes: string[]): Promise
       return e.message;
     }
   }
-  let gitleaksVersion: string;
+  let secretScanner: AiReady['secretScanner'];
   try {
-    gitleaksVersion = loadPinnedBinaries().gitleaks.version;
+    secretScanner = { name: 'gitleaks', version: loadPinnedBinaries().gitleaks.version };
   } catch (e) {
     if (!(e instanceof PinnedBinaryError)) throw e;
     return `audit --ai can't run in this build: ${e.message}`;
   }
-  return { provider, gitleaksVersion, bar: loadQualityBar() };
+  return { provider, secretScanner, bar: loadQualityBar() };
 }
 
 /**

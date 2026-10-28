@@ -14,12 +14,12 @@
 // - limits: from the capabilities and the signing mode only, never the plan name, never "make the repo public" (S9).
 // - secretsInTree: a local scan of the files on disk (no git, no child process, symlinks never followed), rule names
 //   and file names only, never a value (S10).
-// - aiBundle: what the full run would send to the AI, counted from bundleCode without gitleaks (counting only).
+// - aiBundle: what the full run would send to the AI, counted from bundleCode without the secret scan (counting only).
 // - warnings: a repo `.npmrc` with any key outside a small safe list (U12; Task 5 adds keys whose value only makes npm
 //   stricter) or a local node_modules/.bin/pipegen could change which pipegen runs (the `.npmrc` is read for that one
 //   fact; no value is kept); anonymous access.
 // - ai (Task 2b, addAiSuggestions, `audit --ai` after consent): the needs the AI adds and MENTION-ONLY tool suggestions,
-//   from a gitleaks-checked bundle, with the run's AI usage and cost cap (rulings B2, B3, B4, S11, S16-S19, U11).
+//   from a secret-scanned bundle, with the run's AI usage and cost cap (rulings B2, B3, B4, S11, S16-S19, U11).
 //
 // Output rule (src/types.ts): repo-derived strings are kept RAW (validated by the readers) and cleaned only where
 // Task 3 prints them. Nothing here escapes a value, and no file content or secret value is ever stored.
@@ -30,12 +30,12 @@ import { count, outputLimit } from '../ai/errors.js';
 import { ollamaHostOf } from '../ai/ollama.js';
 import { AiError, COST_CAP_MESSAGE, refusalFallbackNoteFor, type AiErrorKind } from '../ai/provider.js';
 import {
-  bundleCode, bundleTopFolders, COUNTING_ONLY_NOTE, countedBundleRoot, EXCLUDED_PATTERNS, findSecretLike, GitleaksError, isExcludedPath, redact,
+  bundleCode, bundleTopFolders, COUNTING_ONLY_NOTE, countedBundleRoot, EXCLUDED_PATTERNS, findSecretLike, isExcludedPath, redact, SecretScanError, type SecretScanner,
   scrubKnownValues, type CodeBundle,
 } from '../ai/redact.js';
 import { needLanguage, suggestTools } from '../engine/discover.js';
 import type { RateBudget } from '../engine/github-rate.js';
-import { ensurePinnedBinary, PinnedBinaryError } from '../engine/linters.js';
+import { ensurePinnedBinary, loadPinnedBinaries, PinnedBinaryError } from '../engine/linters.js';
 import type { MemoryStore } from '../engine/memory.js';
 import { CHECK_LABELS, floorNeeds, isRunnable, jobCategories, needKey, needsPromptBytes, planNeeds, type NeedsPlan } from '../engine/needs.js';
 import type { QualityBar } from '../engine/quality-bar.js';
@@ -182,7 +182,7 @@ export interface AuditDeps {
   sleep?: (ms: number) => Promise<void>;
   /**
    * Plan U final review M9: the counting-only bundle the caller already built for `dir` (bundleCode(dir, { knownValues }),
-   * no gitleaks), so a run builds it once and the report and the consent screen show the same count. Without it (or for
+   * no secret scan), so a run builds it once and the report and the consent screen show the same count. Without it (or for
    * another folder, or a bundle that isn't a counting one), buildAudit builds its own.
    */
   bundle?: CodeBundle;
@@ -541,7 +541,7 @@ async function activityOf(deps: AuditDeps, p: RepoProfile): Promise<Activity | n
 }
 
 /**
- * The counting-only bundle of `dir`: `given` when it is one bundleCode built without gitleaks for this same folder
+ * The counting-only bundle of `dir`: `given` when it is one bundleCode built without the secret scan for this same folder
  * (Plan U final review M9: the CLI's, built once with the run's known values), else a new one.
  */
 async function countingBundle(dir: string, given: CodeBundle | undefined): Promise<CodeBundle> {
@@ -673,8 +673,8 @@ export interface AiSuggestDeps {
   sleep?: (ms: number) => Promise<void>;
   /** The GitHub token (when set) and the AI key in use: never sent to the AI, never in the report (ruling S19). */
   knownValues: string[];
-  /** Where the checked gitleaks binary is; default ensurePinnedBinary('gitleaks'). Called right before the bundle is built. */
-  ensureGitleaks?: () => Promise<string>;
+  /** The checked secret scanner (its path and version); default ensurePinnedBinary('gitleaks'). Called right before the bundle is built. */
+  ensureSecretScanner?: () => Promise<SecretScanner>;
   /** No GitHub token: the search may stop early (ruling S17). */
   anonymous: boolean;
   /**
@@ -694,9 +694,9 @@ const AI_NOTE = {
   // Ruling S17's text reworded: "No token: …" would be cut by redact() at output (notes are never "<secret-like word>: …").
   anonymous: 'Without a GitHub token, GitHub allows 60 requests an hour, so tool suggestions may stop early. Set GITHUB_TOKEN (read-only) for a full search.',
   lookAlike: "pipegen's reviewed tool list isn't usable in this build, so it couldn't check suggested tools for look-alike names; it shows no tool suggestions.",
-  noGitleaks: (why: string) => `The AI step was skipped and nothing was sent to the AI: the required gitleaks check couldn't run. ${why}`,
+  noSecretScan: (name: string, why: string) => `The AI step was skipped and nothing was sent to the AI: the required ${name} check couldn't run. ${why}`,
   // the backstop (review I1): the walk reads only counted files, so this means a bug, not something the user can fix
-  notConsented: "Nothing was sent to the AI: after the gitleaks check, the code held a file that wasn't on the consent screen, and pipegen sends only files it showed you.",
+  notConsented: "Nothing was sent to the AI: after the secret scan, the code held a file that wasn't on the consent screen, and pipegen sends only files it showed you.",
   stopped: (why: string) => `The AI step stopped: ${why}.`,
   searchStopped: (why: string) => `The tool search stopped: ${why}.`,
   fallbackTried: "Claude's refusal fallback had already run the request again on another Claude model, and it was declined there too.",
@@ -801,7 +801,7 @@ export class AiSpendMeter {
 
 /**
  * The needs request's size (UTF-8 bytes) for estimateAuditAi, before consent: the counting bundle's bytes (aiBundle)
- * plus the rest of the needs prompt. The gitleaks-checked bundle sent after consent is normally the same files and the
+ * plus the rest of the needs prompt. The secret-scanned bundle sent after consent is normally the same files and the
  * same size. It can come out larger (replacements shrink files, so the cut to maxBytes keeps more of them): that extra
  * is paid out of the DISCOVERY share of the cap (the cap holds the needs call's worst case PLUS one discovery call's;
  * the framing margin is on both sides of the comparison, so it absorbs nothing). Past that share, the meter refuses
@@ -852,10 +852,10 @@ function hasProjectScript(need: Need, p: RepoProfile): boolean {
  * (the rest of the report is unchanged).
  * 0. `deps.consent` must be the ConsentToken askConsent gave for the audit --ai screen, for this provider, model, cap
  *    and folder, not used before (Plan U T4b, review M1/M2); anything else is thrown before anything runs, and the token
- *    is spent. The gitleaks walk reads only the files the screen counted (onlyPaths, review I1); covers() is the
+ *    is spent. The secret scan's walk reads only the files the screen counted (onlyPaths, review I1); covers() is the
  *    backstop (a note, nothing sent). File content can change between the count and the send; the cap still holds (M3).
- * 1. gitleaks is made ready right before the bundle is built with it (the path stays a local variable). No binary, or
- *    a gitleaks failure: no AI call, a note.
+ * 1. The secret scanner is made ready right before the bundle is built with it (the path stays a local variable). No
+ *    binary, or a scanner failure: no AI call, a note.
  * 2. planNeeds(…, writers 0, knownValues): the needs it adds become `extraNeeds`; floor needs are never changed.
  * 3. suggestTools for every floor need that isn't covered, and every added need, that has no project script (it skips
  *    needs a reviewed tool covers). Skipped when the reviewed list is unavailable (look-alike checks need it; B3/U11).
@@ -863,6 +863,11 @@ function hasProjectScript(need: Need, p: RepoProfile): boolean {
  * is never sent: the needs call then stops the AI step with a note; a discovery call stops asking the AI (one note).
  * An AiError never escapes (S16): it becomes a note, and its billed usage still counts. Other errors are thrown.
  */
+/** The pinned gitleaks, downloaded and verified (ensurePinnedBinary), with its pinned version. */
+async function defaultSecretScanner(): Promise<SecretScanner> {
+  return { name: 'gitleaks', path: await ensurePinnedBinary('gitleaks'), version: loadPinnedBinaries().gitleaks.version };
+}
+
 export async function addAiSuggestions(r: AuditReport, dir: string, deps: AiSuggestDeps): Promise<AuditReport> {
   const counted = await checkConsent(dir, deps);
   const notes = new Set<string>();
@@ -898,18 +903,18 @@ export async function addAiSuggestions(r: AuditReport, dir: string, deps: AiSugg
     return done();
   }
 
-  // 1. The gitleaks-checked bundle: the binary is made ready right before it runs, and its path is never kept.
+  // 1. The secret-scanned bundle: the binary is made ready right before it runs, and its path is never kept.
   let bundle: CodeBundle;
   try {
-    const bin = await (deps.ensureGitleaks ?? (() => ensurePinnedBinary('gitleaks')))();
+    const scanner = await (deps.ensureSecretScanner ?? defaultSecretScanner)();
     // only the files the consent screen counted (review I1): the checked bundle can only shrink
-    bundle = await bundleCode(dir, { gitleaks: bin, knownValues: deps.knownValues, onlyPaths: counted.paths() });
+    bundle = await bundleCode(dir, { secretScanner: scanner, knownValues: deps.knownValues, onlyPaths: counted.paths() });
   } catch (e) {
-    if (!(e instanceof PinnedBinaryError || e instanceof GitleaksError)) throw e;
-    notes.add(AI_NOTE.noGitleaks(e.message));
+    if (!(e instanceof PinnedBinaryError || e instanceof SecretScanError)) throw e;
+    notes.add(AI_NOTE.noSecretScan('gitleaks', e.message));
     return done();
   }
-  // only files the user agreed to (the consent screen counted them before the gitleaks pass, ruling S21)
+  // only files the user agreed to (the consent screen counted them before the secret scan, ruling S21)
   if (!counted.covers(bundle)) {
     notes.add(AI_NOTE.notConsented);
     return done();

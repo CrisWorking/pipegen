@@ -6,8 +6,9 @@ import { execFileSync } from 'node:child_process';
 import { existsSync, readFileSync, statSync } from 'node:fs';
 import { basename, isAbsolute, join } from 'node:path';
 import { afterEach, beforeAll, describe, expect, it } from 'vitest';
-import { bundleCode, bundleText, gitleaksConfigPath, redact } from '../src/ai/redact.js';
+import { bundleCode, bundleText, redact, secretScanConfigPath } from '../src/ai/redact.js';
 import { ensurePinnedBinary, loadPinnedBinaries } from '../src/engine/linters.js';
+import { gitleaksAt, scanWith } from './helpers/gitleaks-stub.js';
 import { cleanupRepos, makeTempDir, writeIn } from './helpers/make-repo.js';
 
 const live = process.env.PIPEGEN_LIVE_TESTS === '1';
@@ -38,7 +39,7 @@ function scan(args: string[], dir: string): Scan {
   return { code, report: existsSync(reportPath) ? (JSON.parse(readFileSync(reportPath, 'utf8')) as Finding[]) : null };
 }
 
-const detect = (dir: string, config = gitleaksConfigPath()) => scan(['detect', '--no-git', '--source', dir, '--config', config], dir);
+const detect = (dir: string, config = secretScanConfigPath()) => scan(['detect', '--no-git', '--source', dir, '--config', config], dir);
 const key = (f: Finding) => `${basename(f.File)}:${f.StartLine}:${f.RuleID}`;
 
 describe.skipIf(!live)('gitleaks (live, real pinned binary)', () => {
@@ -88,14 +89,14 @@ describe.skipIf(!live)('gitleaks (live, real pinned binary)', () => {
     writeIn(dir, 'f000001.txt', `a\nconst shop = "${shopifyValue()}";\n`);
     writeIn(dir, 'f000002.txt', `const lab = "${gitlabValue()}";\n`);
     const viaDetect = detect(dir);
-    const viaDir = scan(['dir', dir, '--config', gitleaksConfigPath()], dir);
+    const viaDir = scan(['dir', dir, '--config', secretScanConfigPath()], dir);
     expect(viaDetect.code).toBe(1);
     expect(viaDir.code).toBe(1);
     expect(viaDetect.report?.map(key).sort()).toEqual(viaDir.report?.map(key).sort());
     expect(viaDetect.report).toHaveLength(2);
   });
 
-  it('live: a config error exits non-zero and writes no report (redact.ts turns that into GitleaksError)', () => {
+  it('live: a config error exits non-zero and writes no report (redact.ts turns that into SecretScanError)', () => {
     const dir = makeTempDir();
     writeIn(dir, 'f000001.txt', 'hello\n');
     const cfg = makeTempDir();
@@ -104,7 +105,7 @@ describe.skipIf(!live)('gitleaks (live, real pinned binary)', () => {
     for (const name of ['bad.toml', 'bad-regex.toml']) {
       const { code, report } = detect(dir, join(cfg, name));
       expect(code, name).not.toBe(0);
-      // redact.ts: exit code other than 0/1 → GitleaksError; exit 1 without a report → GitleaksError('wrote no report')
+      // redact.ts: exit code other than 0/1 → SecretScanError; exit 1 without a report → SecretScanError('wrote no report')
       expect(report, name).toBeNull();
     }
   });
@@ -126,8 +127,8 @@ describe.skipIf(!live)('gitleaks (live, real pinned binary)', () => {
     writeIn(repo, 'src/config.ts', `${line}\nexport const lab = '${lab}';\n`);
     writeIn(repo, 'docs/notes.md', `# Notes\nThe shop value is ${shop} (copied here by mistake).\n`);
     writeIn(repo, 'src/app.ts', "import { shop } from './config';\nconsole.log(typeof shop);\n");
-    const bundle = await bundleCode(repo, { gitleaks: bin });
-    expect(bundle.gitleaksChecked).toBe(true);
+    const bundle = await bundleCode(repo, scanWith(gitleaksAt(bin, loadPinnedBinaries().gitleaks.version)));
+    expect(bundle.secretScanChecked).toBe(true);
     const text = bundleText(bundle);
     expect(text).not.toContain(shop);
     expect(text).not.toContain(lab);
