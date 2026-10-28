@@ -38,6 +38,8 @@ jobs:
       # The reviewed list's signature checks, re-verified with the pinned cosign (an edited keySha256 or identity still
       # loads offline; only this catches it).
       - name: Live test of the reviewed list's cosign checks (downloads the pinned cosign and the signed release files)
+        # once per run, not once per Node version (review M-R6: fewer unauthenticated downloads)
+        if: matrix.node == 24
         run: npx vitest run test/reviewed-verify-live.test.ts
         env:
           PIPEGEN_LIVE_TESTS: '1'
