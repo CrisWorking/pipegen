@@ -2,6 +2,7 @@
 // adds the real entries later), so the rules are checked whatever the data file holds.
 import { describe, expect, it } from 'vitest';
 import { CHOOSER_IDS, chooseTools, skippedGroups, wouldSetSettings } from '../src/audit/choose.js';
+import { loadReviewed } from '../src/engine/reviewed.js';
 import { emptyRepoFiles, emptyServiceQuality } from '../src/read/quality.js';
 import type { Capabilities, ExistingWorkflow, Need, RepoProfile, ReviewedTool, Service } from '../src/types.js';
 
@@ -247,8 +248,28 @@ describe('choose: iac, secrets, update config, publishing, the scheduled checks'
 });
 
 describe('choose: the reviewed list', () => {
-  it('choose: every CHOOSER_IDS entry is in data/reviewed-tools.yml', { todo: true }, () => {
-    // Enabled by Task 6, which adds the ~28 real entries (ruling P14); until then the fixture list above stands in.
+  it('choose: every CHOOSER_IDS entry is in data/reviewed-tools.yml', () => {
+    // Task 6 added the real entries (ruling P14 kept this off until then)
+    const ids = new Set(loadReviewed().map((t) => t.id));
+    for (const id of CHOOSER_IDS) expect(ids.has(id), id).toBe(true);
+  });
+  it('choose: each real entry carries the categories and languages its rule needs (the fixture list: biome = lint + format, …)', () => {
+    const real = new Map(loadReviewed().map((t) => [t.id, t]));
+    for (const f of LIST) {
+      const t = real.get(f.id);
+      expect(t, f.id).toBeDefined();
+      expect(t?.categories, f.id).toEqual(expect.arrayContaining(f.categories));
+      for (const lang of f.languages) expect(t?.languages.includes(lang) || t?.languages.includes('any'), `${f.id} ${lang}`).toBe(true);
+    }
+    // and the real list gives the rules' picks for a plain TypeScript repo and a plain Python repo
+    const list = loadReviewed();
+    const ts = profile([svc({}, { tsconfig: true })]);
+    expect(idOf(choose('lint', ts, list).tool)).toBe('biome');
+    expect(idOf(choose('format', ts, list).tool)).toBe('biome');
+    const py = profile([svc({ language: 'python' })]);
+    expect(idOf(choose('lint', py, list).tool)).toBe('ruff');
+    expect(idOf(choose('format', py, list).tool)).toBe('ruff-format');
+    expect(idOf(choose('secrets', ts, list).tool)).toBe('betterleaks');
   });
   it('choose: CHOOSER_IDS lists every id the fixture list needs, once each', () => {
     expect(new Set(CHOOSER_IDS).size).toBe(CHOOSER_IDS.length);

@@ -12,7 +12,7 @@ import {
 } from '../src/engine/reviewed.js';
 import { BETTERLEAKS_FORBIDDEN_FLAGS, BETTERLEAKS_FORBIDDEN_SUBCOMMANDS } from '../src/engine/tool-flags.js';
 import { BETTERLEAKS_GRAMMAR, NUCLEI_GRAMMAR, TRIVY_GRAMMAR, type FlagGrammar } from '../src/engine/tool-grammar.js';
-import { NEED_CATEGORIES, PROTECTED_PATHS_BASE, type Need, type ReviewedTool, type Service } from '../src/types.js';
+import { NEED_CATEGORIES, PROTECTED_PATHS_BASE, type Language, type Need, type ReviewedTool, type Service } from '../src/types.js';
 import { fakeFetch } from './helpers/fake-http.js';
 import { cleanupRepos, makeTempDir, writeIn } from './helpers/make-repo.js';
 import { emptyServiceQuality } from '../src/read/quality.js';
@@ -647,7 +647,7 @@ describe('loader rules (Plan P Task 5)', () => {
         expect(t?.fixedInputs.args, `${id} ${flag}`).toContain(flag);
       }
       expect(t?.verifiedWith).toEqual({
-        method: 'cosign-bundle', asset: 'trivy_0.76.0_checksums.txt', identity: TRIVY_IDENTITY, issuer: ISSUER, verifiedOn: '2026-10-27',
+        method: 'cosign-bundle', asset: 'trivy_0.76.0_checksums.txt', identity: TRIVY_IDENTITY, issuer: ISSUER, verifiedOn: '2026-10-28', // re-run on pin day (P17)
       });
       const raw = rawFile().tools.find((x) => x.id === id) as Entry;
       for (const flag of TRIVY_FLAGS) {
@@ -1063,7 +1063,8 @@ describe('loader rules (Plan P Task 5)', () => {
 
 describe('Task 5 review probes (fix round 1)', () => {
   const H = 'b'.repeat(64);
-  const vw = (repo: string, ref: string) => ({ method: 'cosign-bundle', asset: 'checksums.txt', identity: `https://github.com/${repo}/.github/workflows/release.yml@${ref}`, issuer: ISSUER, verifiedOn: '2026-10-27' });
+  // verifiedOn on the real list's pin day (the probes mutate the real list, whose pinnedOn moved to pin day in Task 6)
+  const vw = (repo: string, ref: string) => ({ method: 'cosign-bundle', asset: 'checksums.txt', identity: `https://github.com/${repo}/.github/workflows/release.yml@${ref}`, issuer: ISSUER, verifiedOn: rawFile().pinnedOn.slice(0, 10) });
   const pcli = (id: string, repo: string, version: string, pkg: string, command: string[], extra: Entry = {}): Entry => ({
     id, categories: ['secrets'], languages: ['any'], releasedAt: '2026-09-29T20:08:06Z',
     candidate: { id, name: repo, kind: 'cli', repo, version, pin: { checksum: H }, source: 'reviewed', reviewed: true, categories: ['secrets'] },
@@ -1112,7 +1113,9 @@ describe('Task 5 review probes (fix round 1)', () => {
     e.candidate.name = repo;
     e.step.cli.install.package = image;
   };
-  const add = (e: Entry) => (d: Doc) => { d.tools.push(e); };
+  // the probe's entry replaces a real entry with its id (Task 6 added betterleaks, nuclei, jscpd, biome, … to the real list)
+  const put = (d: Doc, e: Entry) => { d.tools = [...d.tools.filter((t) => t.id !== e.id), e]; };
+  const add = (e: Entry) => (d: Doc) => { put(d, e); };
   const setEnv = (id: string, k: string, v: string) => (d: Doc) => {
     const e = find(d, id);
     e.step.cli.env = { ...(e.step.cli.env ?? {}), [k]: v };
@@ -1122,7 +1125,7 @@ describe('Task 5 review probes (fix round 1)', () => {
   const withAdded = (make: () => Entry, change: (e: Entry) => void) => (d: Doc) => {
     const e = make();
     change(e);
-    d.tools.push(e);
+    put(d, e);
   };
   const ACCEPT = null;
   // [probe number, name, mutation, null = loads | the refusal it must give]
@@ -1372,7 +1375,9 @@ describe('data/reviewed-tools.yml', () => {
 
   it('reviewed: no entry for project scripts; projectScriptFor returns the built-in kind with no pin', () => {
     for (const t of real()) {
-      for (const c of ['unit-tests', 'full-tests', 'lint', 'format-lint']) expect(t.categories, t.id).not.toContain(c);
+      // the project's own test script is a built-in step (no reviewed entry); lint and format-lint have reviewed
+    // entries since Plan P Task 6 (biome, eslint, ruff; ruling P17), and projectScriptFor still comes first for them
+    for (const c of ['unit-tests', 'full-tests']) expect(t.categories, t.id).not.toContain(c);
     }
     const step = projectScriptFor(need('unit-tests', { service: 'web' }), svc());
     expect(step).toEqual({ kind: 'project-script', needId: 'unit-tests', service: 'web', script: 'test', workingDir: 'apps/web' });
@@ -1496,6 +1501,149 @@ describe('data/reviewed-tools.yml', () => {
       'self-hosted-runner': { labels: [] },
       paths: { '.github/workflows/**/*.{yml,yaml}': { ignore: ['unexpected key "cache-mode" for "job" section'] } },
     });
+  });
+
+  // ---- Plan P Task 6 (pin day) ----
+  /**
+   * Catalogue §4 "Add" at the catalogue version (verification.md R1), id → [repo, version, plugins]. Not entries, on
+   * purpose (rulings PS28, PS32): tsc and Jest are the repo's own tools (RepoToolStep, DECISIONS #95), Dependabot and
+   * npm trusted publishing are built-in steps (Plan P Task 8), and the pull request's OSV diff is the extra category
+   * dependency-review on osv-scanner.
+   */
+  const CATALOGUE: Record<string, [string, string, string[]]> = {
+    betterleaks: ['betterleaks/betterleaks', 'v1.9.0', []],
+    biome: ['biomejs/biome', '2.5.15', ['@biomejs/cli-linux-x64@2.5.15']],
+    eslint: ['eslint/eslint', '10.13.0', []],
+    'eslint-typescript': ['eslint/eslint', '10.13.0', ['typescript-eslint@8.72.0']],
+    'oxlint-typeaware': ['oxc-project/oxc', '1.89.0', ['@oxlint/binding-linux-x64-gnu@1.89.0', 'oxlint-tsgolint@7.0.2004', '@oxlint-tsgolint/linux-x64@7.0.2004']],
+    prettier: ['prettier/prettier', '3.9.10', []],
+    'vitest-coverage': ['vitest-dev/vitest', '5.0.5', ['@vitest/coverage-v8@5.0.5']],
+    c8: ['bcoe/c8', '12.0.0', []],
+    knip: ['webpro-nl/knip', '6.42.1', []],
+    jscpd: ['kucherenko/jscpd', 'v5.4.2', []],
+    'trivy-licence': ['aquasecurity/trivy', 'v0.76.0', []],
+    'dependency-review-action': ['actions/dependency-review-action', 'v5.0.0', []],
+    hadolint: ['hadolint/hadolint', 'v2.15.1', []],
+    'kube-linter': ['stackrox/kube-linter', 'v0.8.3', []],
+    schemathesis: ['schemathesis/schemathesis', '4.32.2', []],
+    nuclei: ['projectdiscovery/nuclei', 'v3.11.1', []],
+    'scorecard-action': ['ossf/scorecard-action', 'v2.5.0', []],
+    pinact: ['suzuki-shunsuke/pinact', 'v5.0.0', []],
+    poutine: ['boostsecurityio/poutine', 'v1.1.6', []],
+    gosec: ['securego/gosec', 'v2.29.0', []],
+    ruff: ['astral-sh/ruff', '0.17.1', []],
+    'ruff-format': ['astral-sh/ruff', '0.17.1', []],
+    mypy: ['python/mypy', '2.4.0', []],
+    'coverage-py': ['coveragepy/coveragepy', '7.16.2', []],
+    creosote: ['fredrikaverpil/creosote', '5.2.0', []],
+    vulture: ['jendrikseipp/vulture', '2.16', []],
+    bandit: ['PyCQA/bandit', '1.9.4', ['sarif-om@1.0.4', 'jschema-to-python@1.2.3']],
+    'pypi-publish': ['pypa/gh-action-pypi-publish', 'v1.14.3', []],
+  };
+
+  it('data: every catalogue §4 entry is present at the catalogue version (minus the PS28/PS32 exceptions)', () => {
+    const list = real();
+    for (const [id, [repo, version, plugins]] of Object.entries(CATALOGUE)) {
+      const t = byId(list, id);
+      expect(t, id).toHaveLength(1);
+      expect(t[0]?.candidate.repo, id).toBe(repo);
+      expect(t[0]?.candidate.version, id).toBe(version);
+      expect((t[0]?.step.cli?.plugins ?? []).map((p) => `${p.package}@${p.version}`), id).toEqual(plugins);
+    }
+    // the exceptions are not entries
+    for (const t of list) expect(['typescript', 'jest', 'dependabot', 'tsc'], t.id).not.toContain(t.id);
+    expect(byId(list, 'osv-scanner')[0]?.categories).toEqual(['deps', 'dependency-review']);
+    // npm packages as the brief names them
+    const pkg = (id: string) => byId(list, id)[0]?.step.cli?.install;
+    expect(pkg('biome')).toMatchObject({ method: 'npm', package: '@biomejs/biome' });
+    expect(pkg('oxlint-typeaware')).toMatchObject({ method: 'npm', package: 'oxlint' });
+    expect(pkg('coverage-py')).toMatchObject({ method: 'pip', package: 'coverage' });
+    expect(pkg('jscpd')).toMatchObject({ method: 'github-release', package: 'jscpd-linux-x64-gnu.tar.gz' }); // PS27: the binary
+    expect(pkg('nuclei')).toMatchObject({ method: 'github-release', package: 'nuclei_3.11.1_linux_amd64.zip' }); // P5
+    expect(pkg('kube-linter')).toMatchObject({ method: 'github-release', package: 'kube-linter-linux' }); // PS31
+    expect(pkg('hadolint')).toMatchObject({ method: 'github-release', package: 'hadolint-linux-x86_64' }); // PS31
+    // nuclei-templates v10.5.0, its tag archive and the sha256 its release lists (PS30, P3)
+    expect(byId(list, 'nuclei')[0]?.fixedInputs.env).toEqual({
+      PIPEGEN_NUCLEI_TEMPLATES_URL: 'https://github.com/projectdiscovery/nuclei-templates/archive/refs/tags/v10.5.0.tar.gz',
+      PIPEGEN_NUCLEI_TEMPLATES_SHA256: '80fbabceca095fac40afecc7f023748df22b9576b9ff10a4422bd2fbf81f9a41',
+    });
+  });
+
+  it('data: every new entry is PENDING with proofs 0', () => {
+    const list = real();
+    for (const id of Object.keys(CATALOGUE)) {
+      const t = byId(list, id)[0];
+      expect(t?.reviewedBy, id).toBe('PENDING');
+      expect(t?.reviewedAt, id).toBe('PENDING');
+      expect(t?.proofs, id).toBe(0);
+    }
+  });
+
+  it('data: setup-node offers exactly 24 and 26 (DECISIONS #92)', () => {
+    expect(byId(real(), 'actions-setup-node')[0]?.choices['node-version']).toEqual(['24', '26']);
+  });
+
+  it('data: every trivy entry carries the three flags and a verifiedWith; no entry uses a never-list repo', () => {
+    const list = real();
+    const trivies = list.filter((t) => t.candidate.repo === 'aquasecurity/trivy');
+    expect(trivies.map((t) => t.id).sort()).toEqual(['trivy-config', 'trivy-image', 'trivy-licence']);
+    for (const t of trivies) {
+      for (const f of TRIVY_FLAGS) {
+        expect(t.step.cli?.command, `${t.id} ${f}`).toContain(f);
+        expect(t.fixedInputs.args, `${t.id} ${f}`).toContain(f);
+      }
+      expect(t.verifiedWith, t.id).toMatchObject({ method: 'cosign-bundle', asset: 'trivy_0.76.0_checksums.txt' });
+    }
+    expect(byId(list, 'trivy-image')[0]?.choices['ignore-unfixed']).toEqual(['false', 'true']);
+    expect(byId(list, 'trivy-licence')[0]?.fixedInputs.args).toEqual(expect.arrayContaining(['--scanners', 'license', '--severity', 'HIGH,CRITICAL', '--exit-code', '1']));
+    for (const t of list) {
+      expect(neverListed(t.candidate.repo), t.id).toBeNull();
+      if (t.step.action !== undefined) expect(neverListed(t.step.action.uses), t.id).toBeNull();
+    }
+  });
+
+  it('data: the first pick per category follows file order: betterleaks before gitleaks, zap-baseline before nuclei, semgrep before bandit, ruff for Python lint (PS31)', () => {
+    const list = real();
+    const first = (category: string, language: Language) => reviewedFor(need(category), language, list, 'audit')[0]?.id;
+    const ids = list.map((t) => t.id);
+    expect(ids.indexOf('betterleaks')).toBeLessThan(ids.indexOf('gitleaks'));
+    expect(first('secrets', 'node')).toBe('betterleaks');
+    expect(reviewedFor(need('secrets'), 'node', list, 'audit').map((t) => t.id)).toEqual(['betterleaks', 'gitleaks']);
+    expect(first('dast', 'node')).toBe('zap-baseline');
+    expect(first('sast', 'python')).toBe('semgrep');
+    expect(first('sast', 'go')).toBe('gosec');
+    expect(first('lint', 'python')).toBe('ruff');
+    expect(first('format', 'python')).toBe('ruff-format');
+    expect(first('format-lint', 'node')).toBe('biome');
+    expect(first('attestation', 'python')).toBe('actions-attest');
+    expect(first('dependency-review', 'node')).toBe('osv-scanner');
+  });
+
+  it('data: loadReviewed accepts the file; checkPinnedAgainstReviewed reports no problem; signature checks as ruled (P12, P16)', () => {
+    const list = real();
+    expect(list.length).toBeGreaterThanOrEqual(23 + Object.keys(CATALOGUE).length);
+    expect(checkPinnedAgainstReviewed(loadPinnedBinaries(), list)).toEqual([]);
+    const file = rawFile();
+    const pinnedDay = file.pinnedOn.slice(0, 10);
+    for (const t of list) {
+      const must = [...MUST_VERIFY].some((r) => t.candidate.repo.toLowerCase() === r);
+      expect(t.verifiedWith !== undefined, t.id).toBe(must);
+      if (t.verifiedWith !== undefined) expect(t.verifiedWith.verifiedOn, t.id).toBe(pinnedDay);
+    }
+    // key-based checks (P10): the upstream key file at the entry's tag, pinned by its sha256
+    expect(byId(list, 'kube-linter')[0]?.verifiedWith).toEqual({
+      kind: 'cosign-key', keyUrl: 'https://raw.githubusercontent.com/stackrox/kube-linter/v0.8.3/kubelinter-cosign.pub',
+      keySha256: 'db5fb95bf3e1d432a3e9153abcc75ca4985aad1e44f414b8ebc624a2fac97ba0', verifiedOn: pinnedDay,
+    });
+    expect(byId(list, 'gosec')[0]?.verifiedWith).toEqual({
+      kind: 'cosign-key', keyUrl: 'https://raw.githubusercontent.com/securego/gosec/v2.29.0/cosign.pub',
+      keySha256: '4f9553257dbbb9f07c830da7773e49ae7150962f6d6d187d6243f95002d497fb', verifiedOn: pinnedDay,
+    });
+    // pypi-publish never takes a password; betterleaks reports to its SARIF file with a fixed exit code
+    const pub = byId(list, 'pypi-publish')[0];
+    expect(Object.keys(pub?.step.action?.with ?? {})).toEqual(['attestations']);
+    const bl = byId(list, 'betterleaks')[0];
+    expect(bl?.fixedInputs.args).toEqual(expect.arrayContaining(['--report-path', 'betterleaks.sarif', '--exit-code', '1']));
   });
 
   it(`reviewed-tools.yml: every release was at least ${COOLDOWN_DAYS} days old when pinned (S26)`, () => {
