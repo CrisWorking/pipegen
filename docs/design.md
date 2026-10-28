@@ -88,7 +88,7 @@ It **waits** (up to 30 min) when that run is still in progress. It verifies the 
 - **Counts matter:** if a fingerprint appears more times than in the baseline, the extra ones are new.
 - **Trusted baseline only:** the baseline and the clean-run marker are accepted only from `push` runs of `.github/workflows/pipegen.yml` on the default branch of **this** repo (same repository id, not a fork branch that happens to be called `main`), with the run id recorded inside the artifact.
 - **Trusted results only:** the gate downloads only the exact artifact names it expects, and checks each SARIF's sha256 against the job output of the job that produced it. Unreviewed tools never run, so nothing else can upload results.
-- Secret findings are fingerprinted with the tool's own fingerprint, or `sha256(repo id + matched text)`, so a **second key in the same file is a new finding**. **Secret text is removed from SARIF before upload** (gitleaks runs with `--redact`, and snippets are stripped after hashing).
+- Secret findings are fingerprinted with the tool's own fingerprint, or `sha256(repo id + matched text)`, so a **second key in the same file is a new finding**. **Secret text is removed from SARIF before upload** (the secret scan, betterleaks or the gitleaks fallback, runs with `--redact`, and snippets are stripped after hashing).
 - Not-proven parts report their real result through a step output, so the gate can treat them as warn-only (and they're never in the required list).
 
 **Paid-plan limits:** detected up front by **probing the endpoints** (the plan name isn't always readable). On Free private repos, pipegen sets up everything else and says clearly what's missing, suggesting **GitHub Pro (personal accounts) or GitHub Team (organisations)**. Code scanning upload is used only where it's enabled (it needs the paid Code Security add-on on private repos), and the gate never depends on it. It **never suggests making a repo public**. Merged-while-red alerts cover the gap (v0.3).
@@ -114,6 +114,7 @@ It **waits** (up to 30 min) when that run is still in progress. It verifies the 
   6. **estimates**: setup Actions minutes, **monthly** Actions minutes afterwards (from the repo's last 30 days of pushes and PRs), approximate AI cost, and approximate time;
   7. the permissions the full run would need.
 - Output in the terminal, plus an optional local `pipegen-audit.md` (never committed by pipegen).
+- With `--ai`, nothing leaves the machine until a required local secret scan (betterleaks; gitleaks as the fallback, with `PIPEGEN_SECRET_SCANNER` set to `gitleaks`) has run over the code to send. Both are pinned, checksum-verified binaries, and the consent screen names the one that runs.
 
 ## 8. The full flow (v0.2) and the only questions
 
@@ -273,7 +274,7 @@ These rules take priority over anything earlier in this document.
   - files: `*.tfstate`, `*.tfvars`, `.npmrc`, `.netrc`, `*.p12/.pfx/.jks`, kubeconfig;
   - token types: JWTs, Slack webhook URLs, `AIza…`, `npm_…`.
 
-  A gitleaks pass runs over everything sent, and every value the user typed is removed by exact match, including its base64 and URL-encoded forms.
+  A secret scan (betterleaks; gitleaks as the fallback) runs over everything sent, and every value the user typed is removed by exact match, including its base64 and URL-encoded forms.
 - Logs go to the AI only as a **code-extracted error excerpt** inside a block marked as untrusted.
 - AI text placed in `PIPEGEN.md` is cleaned (no links, HTML or @mentions, and a length cap).
 - Security-relevant step inputs are **fixed by the reviewed templates**, and the AI only chooses from enums.

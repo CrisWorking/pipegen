@@ -4,11 +4,12 @@ import { isAbsolute, join, relative, resolve } from 'node:path';
 import picomatch from 'picomatch';
 import { afterEach, describe, expect, it } from 'vitest';
 import {
-  bundleCode, bundleText, EXCLUDED_PATTERNS, SecretScanError, SecretScanRequiredError, secretScanConfigPath,
+  bundleCode, bundleText, EXCLUDED_PATTERNS, SecretScanError, SecretScanRequiredError, secretScanArgv, secretScanConfigPath,
   isBinary, redact, scrubKnownValues, type CodeBundle,
 } from '../src/ai/redact.js';
 import { isBinary as limitsIsBinary } from '../src/read/limits.js';
-import { CHECKED_KEY, CLEAN, gitleaksAt, makeStub, scanWith } from './helpers/gitleaks-stub.js';
+import { BETTERLEAKS_FORBIDDEN_FLAGS, BETTERLEAKS_SUBCOMMANDS } from '../src/engine/tool-flags.js';
+import { betterleaksAt, CHECKED_KEY, CLEAN, gitleaksAt, makeStub, scanWith } from './helpers/gitleaks-stub.js';
 import { cleanupRepos, makeTempDir, writeIn } from './helpers/make-repo.js';
 import { fake, makeSecretRepo } from './helpers/secret-repo.js';
 
@@ -269,7 +270,7 @@ describe('bundle: gitleaks pass', () => {
     expect(relative(dir, tmp).startsWith('..')).toBe(true); // never the repo itself
     expect(rec.argv).toEqual([
       'detect', '--no-git', '--source', tmp, '--config', secretScanConfigPath(),
-      '--report-format', 'json', '--report-path', join(tmp, 'report.json'),
+      '--report-format', 'json', '--report-path', join(tmp, 'report.json'), '--no-banner', '--ignore-gitleaks-allow', '--exit-code', '1',
     ]);
     expect(secretScanConfigPath()).toBe(join(root, 'data', 'gitleaks-bundle.toml'));
     expect(rec.cwd).toBe(tmp);
@@ -286,6 +287,69 @@ describe('bundle: gitleaks pass', () => {
     for (const v of values) expect(scanned).not.toContain(v);
     expect(existsSync(tmp)).toBe(false); // temp dir removed
     expect(b.secretScanChecked).toBe(true);
+  });
+
+  it('bundle: betterleaks argv fixed, holds --config, never --validate/--analyze/--unsafe-auto-load-config', async () => {
+    const { dir, values } = makeSecretRepo();
+    writeIn(dir, '.betterleaks.toml', '[allowlist]\npaths = [".*"]\n');
+    writeIn(dir, '.gitleaks.toml', '[allowlist]\npaths = [".*"]\n');
+    writeIn(dir, '.betterleaksignore', 'everything\n');
+    const stub = makeStub(CLEAN);
+    const b = await bundleCode(dir, scanWith(betterleaksAt(stub.bin)));
+    const rec = stub.record();
+    const tmp = rec.src;
+    expect(isAbsolute(tmp)).toBe(true);
+    expect(relative(dir, tmp).startsWith('..')).toBe(true); // never the repo itself
+    // the one fixed form: a plain local folder scan, pipegen's config, a JSON report in the private temp dir. No --redact
+    // here: pipegen needs the raw Secret/Match values to remove them from the bundle (the report never leaves the dir)
+    expect(rec.argv).toEqual([
+      'dir', tmp, '--config', secretScanConfigPath(),
+      '--report-format', 'json', '--report-path', join(tmp, 'report.json'), '--no-banner', '--ignore-gitleaks-allow', '--exit-code', '1',
+    ]);
+    expect(rec.argv).toEqual(secretScanArgv('betterleaks', tmp, secretScanConfigPath(), join(tmp, 'report.json')));
+    // PS34: the same forbidden list the reviewed-list loader uses (src/engine/tool-flags.ts), never a copy
+    for (const flag of BETTERLEAKS_FORBIDDEN_FLAGS) expect(rec.argv.some((a) => a === flag || a.startsWith(`${flag}=`)), flag).toBe(false);
+    expect(rec.argv.filter((a) => /^--?(validat|analy|unsafe|redact|verbose|v$|diagnostics|experiments)/.test(a))).toEqual([]);
+    expect(rec.argv).not.toContain('-');
+    expect(BETTERLEAKS_SUBCOMMANDS).toContain(rec.argv[0]);
+    expect(rec.cwd).toBe(tmp);
+    expect(rec.envKeys.filter((k) => k !== 'PATH' && k !== 'HOME')).toEqual([]);
+    // only neutral names in the scanned folder: no repo config or ignore file can be picked up
+    expect(Object.keys(rec.files).every((f) => /^f\d+\.txt$/.test(f) || f === 'paths.txt')).toBe(true);
+    const scanned = Object.values(rec.files).join('\n');
+    for (const v of values) expect(scanned).not.toContain(v);
+    expect(existsSync(tmp)).toBe(false); // temp dir (and the report in it) removed
+    expect(b.secretScanChecked).toBe(true);
+    expect(b.notes.join('\n')).toMatch(/betterleaks checked the bundle/);
+  });
+
+  it('bundle: betterleaks:allow and gitleaks:allow comments neutralised', async () => {
+    const gl = 'gitleaks' + ':allow';
+    const bl = 'betterleaks' + ':allow';
+    const dir = makeTempDir();
+    writeIn(dir, 'src/a.ts', `const a = 1; // ${gl}\nconst b = 2; // ${bl}\n# ${bl.toUpperCase()} ${gl}\n`);
+    writeIn(dir, `src/${bl}.ts`, 'const c = 3;\n');
+    writeIn(dir, `src/${gl}.ts`, 'const d = 4;\n');
+    for (const at of [betterleaksAt, gitleaksAt]) {
+      const stub = makeStub(CLEAN);
+      const b = await bundleCode(dir, scanWith(at(stub.bin)));
+      const rec = stub.record();
+      const scanned = Object.values(rec.files).join('\n'); // the files and paths.txt
+      expect(scanned.toLowerCase(), at.name).not.toContain(gl);
+      expect(scanned.toLowerCase(), at.name).not.toContain(bl);
+      expect(rec.files['paths.txt'].split('\n').length, at.name).toBe(3);
+      expect(b.files.map((f) => f.content).join('\n').toLowerCase(), at.name).not.toMatch(/(?:gitleaks|betterleaks):allow/);
+    }
+  });
+
+  it('bundle: exit code "found" with no report or an empty one → SecretScanError (betterleaks exits 1 on a config error)', async () => {
+    const dir = makeTempDir();
+    writeIn(dir, 'src/a.ts', 'export const a = 1;\n');
+    for (const at of [betterleaksAt, gitleaksAt]) {
+      await expect(bundleCode(dir, scanWith(at(makeStub('process.exit(1);').bin))), at.name).rejects.toThrow(/wrote no report/);
+      await expect(bundleCode(dir, scanWith(at(makeStub(`fs.writeFileSync(report, '[]'); process.exit(1);`).bin))), at.name).rejects.toThrow(/reported findings but listed none/);
+      await expect(bundleCode(dir, scanWith(at(makeStub(`fs.writeFileSync(report, '[]'); process.exit(2);`).bin))), at.name).rejects.toBeInstanceOf(SecretScanError);
+    }
   });
 
   it('bundle: gitleaks finding → value replaced; unlocatable finding → file dropped and noted', async () => {

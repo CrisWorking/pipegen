@@ -283,7 +283,8 @@ function screenFor(p: RepoProfile, provider: AiProvider, est: Estimates | AuditA
   }
   const text = sections.filter((s) => s.length > 0).map((s) => s.join('\n')).join('\n\n');
   // checkPricedFor above proved est.pricedFor is set and matches the provider shown
-  return makeScreen(text, { mode, pricedFor: { ...(est.pricedFor as PricedFor) }, capUsd, files: bundle, dir: counted ? (bundle as CountingSummary).dir : null });
+  const secretScanner = Object.freeze({ name: facts.secretScanner.name, version: facts.secretScanner.version });
+  return makeScreen(text, { mode, pricedFor: { ...(est.pricedFor as PricedFor) }, capUsd, files: bundle, dir: counted ? (bundle as CountingSummary).dir : null, secretScanner });
 }
 
 /**

@@ -1,6 +1,6 @@
 // Plan U Task 4b: `pipegen audit`. The brief's cli tests, adapted to the rulings (B1, B3, S15, S18, S19, S21-S23,
 // S30, U10, U18, R10), plus one test per checklist item. Every network call is a fake fetch (CliIO.fetch), the AI is a
-// fake provider, gitleaks is the shared stub, and no test starts git or any other process of its own (the child
+// fake provider, the secret scanner (betterleaks, or gitleaks with the switch) is the shared stub, and no test starts git or any other process of its own (the child
 // process spy would see it). Secret-like strings are built at runtime.
 import * as childProcess from 'node:child_process';
 import { existsSync, readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
@@ -8,7 +8,7 @@ import { join, resolve } from 'node:path';
 import * as execa from 'execa';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { makeProvider } from '../src/ai/provider.js';
-import { bundleCode } from '../src/ai/redact.js';
+import { bundleCode, chooseSecretScanner, SECRET_SCANNER_ENV as SCANNER_ENV, SecretScanError } from '../src/ai/redact.js';
 import { addAiSuggestions, buildAudit, safeRunCommand } from '../src/audit/model.js';
 import { CANT_SEE } from '../src/audit/render.js';
 import { run } from '../src/cli/main.js';
@@ -25,7 +25,7 @@ import { CLEAN, makeStub } from './helpers/gitleaks-stub.js';
 import { cleanupRepos, makeTempDir, writeIn } from './helpers/make-repo.js';
 import { fake } from './helpers/secret-repo.js';
 
-const hooks = vi.hoisted(() => ({ ai: null as AiProvider | null, gitleaks: null as string | null }));
+const hooks = vi.hoisted(() => ({ ai: null as AiProvider | null, scanner: null as string | null }));
 
 vi.mock('node:child_process', async (importOriginal) => {
   const a = await importOriginal<typeof import('node:child_process')>();
@@ -41,10 +41,10 @@ vi.mock('../src/ai/provider.js', async (importOriginal) => {
   const a = await importOriginal<typeof import('../src/ai/provider.js')>();
   return { ...a, makeProvider: vi.fn((opts: Parameters<typeof a.makeProvider>[0]) => { const real = a.makeProvider(opts); return hooks.ai ?? real; }) };
 });
-// No download: the pinned gitleaks is the stub when a test sets one, else refused.
+// No download: the pinned secret scanner (either name) is the stub when a test sets one, else refused.
 vi.mock('../src/engine/linters.js', async (importOriginal) => {
   const a = await importOriginal<typeof import('../src/engine/linters.js')>();
-  return { ...a, ensurePinnedBinary: vi.fn(async () => { if (hooks.gitleaks === null) throw new a.PinnedBinaryError('No download in tests.'); return hooks.gitleaks; }) };
+  return { ...a, ensurePinnedBinary: vi.fn(async () => { if (hooks.scanner === null) throw new a.PinnedBinaryError('No download in tests.'); return hooks.scanner; }) };
 });
 vi.mock('../src/engine/memory.js', async (importOriginal) => {
   const a = await importOriginal<typeof import('../src/engine/memory.js')>();
@@ -184,7 +184,7 @@ let anthropicVal: string;
 beforeEach(() => {
   vi.clearAllMocks();
   hooks.ai = null;
-  hooks.gitleaks = null;
+  hooks.scanner = null;
   // anything not going through CliIO.fetch would land here
   globalFetch = vi.fn(async () => { throw new Error('unexpected network call'); });
   vi.stubGlobal('fetch', globalFetch);
@@ -196,12 +196,12 @@ afterEach(() => {
   cleanupRepos();
 });
 
-/** --ai with a fake Claude and the gitleaks stub; the env carries the Anthropic key. */
-function aiSetup(why?: string, service?: string) {
+/** --ai with a fake Claude and the scanner stub (`body`: its report and exit); the env carries the Anthropic key. */
+function aiSetup(why?: string, service?: string, body = CLEAN) {
   const ai = fakeAi(why, service);
   hooks.ai = ai.p;
-  const stub = makeStub(CLEAN);
-  hooks.gitleaks = stub.bin;
+  const stub = makeStub(body);
+  hooks.scanner = stub.bin;
   return { ai, stub, env: { [ANTHROPIC_VAR]: anthropicVal } as NodeJS.ProcessEnv };
 }
 
@@ -269,7 +269,7 @@ describe('pipegen audit (brief)', () => {
     expect(withTok.all).not.toContain(fake.githubPat());
   });
 
-  it('cli: --ai asks consent first; declined → report without suggestions (no gitleaks, no AI call)', async () => {
+  it('cli: --ai asks consent first; declined → report without suggestions (no secret scan, no AI call)', async () => {
     const dir = repo();
     const { ai, env } = aiSetup();
     const ask = prompter(false);
@@ -278,7 +278,7 @@ describe('pipegen audit (brief)', () => {
     expect(ask.asked).toHaveLength(1);
     expect(ask.asked[0]).toContain('pipegen audit --ai is about to send part of your code to an AI. Nothing has left this computer yet.');
     expect(ai.complete).not.toHaveBeenCalled();
-    expect(ensurePinnedBinary).not.toHaveBeenCalled(); // no gitleaks download without a yes
+    expect(ensurePinnedBinary).not.toHaveBeenCalled(); // no scanner download without a yes
     expect(addAiSuggestions).not.toHaveBeenCalled();
     expect(r.out).toContain('Nothing was sent to an AI.');
     expect(r.out).not.toContain('What the AI suggests');
@@ -300,8 +300,8 @@ describe('pipegen audit (brief)', () => {
     expect(screen).not.toMatch(/\bwrite\b/);
     expect(screen).toContain('GitHub permissions (read-only)');
     for (const row of permissionsTable('read')) expect(screen).toContain(`${row.permission}: ${row.why}`);
-    expect(screen).toMatch(/pipegen sends at most \d+ files? /); // counted before gitleaks (S21)
-    expect(screen).toContain('gitleaks 8.30.1, which pipegen downloads (checksum-verified) into its cache');
+    expect(screen).toMatch(/pipegen sends at most \d+ files? /); // counted before the secret scan (S21)
+    expect(screen).toContain('betterleaks 1.9.0, which pipegen downloads (checksum-verified) into its cache');
   });
 
   it('cli: --dir reads the given folder; default is the current folder', async () => {
@@ -405,25 +405,81 @@ describe('pipegen audit (brief)', () => {
     expect(ensurePinnedBinary).not.toHaveBeenCalled();
   });
 
-  it('cli: audit --ai starts only the pinned gitleaks binary, right after the yes', async () => {
+  it('cli: audit --ai starts only the pinned betterleaks binary (gitleaks with the switch)', async () => {
+    for (const [env, name, sub, version] of [[{}, 'betterleaks', 'dir', '1.9.0'], [{ [SCANNER_ENV]: 'gitleaks' }, 'gitleaks', 'detect', '8.30.1']] as const) {
+      const dir = repo();
+      const s = aiSetup();
+      const ask = prompter(true);
+      vi.clearAllMocks();
+      const r = await audit(['audit', '--ai'], { cwd: dir, env: { ...s.env, ...env }, prompt: ask });
+      expect(r.code, name).toBe(0);
+      expect(s.ai.complete, name).toHaveBeenCalled();
+      const calls = childCalls();
+      expect(calls.length, name).toBeGreaterThan(0);
+      for (const c of calls) {
+        expect(c.fn).toBe('execFile');
+        expect(c.args[0]).toBe(s.stub.bin);
+      }
+      expect(execaCalls()).toEqual([]);
+      expect(ensurePinnedBinary, name).toHaveBeenCalledTimes(1);
+      expect(ensurePinnedBinary, name).toHaveBeenCalledWith(name);
+      expect(s.stub.record().argv[0], name).toBe(sub); // the stub really ran as that scanner
+      // the screen named the scanner that ran, with its pinned version
+      expect(ask.asked[0], name).toContain(`checked for secrets with ${name} ${version}, which pipegen downloads (checksum-verified)`);
+      expect(r.out, name).toContain(`${name} checked the bundle`);
+      // the download happens after the consent question, never before (S21, B4)
+      const asked = vi.mocked(ask.confirm).mock.invocationCallOrder[0] as number;
+      expect(vi.mocked(ensurePinnedBinary).mock.invocationCallOrder[0], name).toBeGreaterThan(asked);
+    }
+  });
+
+  // the brief's name, with the variable's name from the constant (pipegen's own redact() hides `NAME=value` in test files)
+  it(`scanner: default betterleaks; ${SCANNER_ENV}=gitleaks picks gitleaks; any other value refused with exit 1`, async () => {
+    expect(SCANNER_ENV).toBe('PIPEGEN' + '_SECRET_SCANNER');
+    expect(chooseSecretScanner({})).toBe('betterleaks');
+    expect(chooseSecretScanner({ [SCANNER_ENV]: 'betterleaks' })).toBe('betterleaks');
+    expect(chooseSecretScanner({ [SCANNER_ENV]: 'gitleaks' })).toBe('gitleaks');
+    const odd = 'odd-' + 'Q'.repeat(30); // a value that is never echoed back
+    for (const bad of ['', 'Gitleaks', 'BETTERLEAKS', ' gitleaks', 'gitleaks\n', 'trufflehog', odd]) {
+      expect(() => chooseSecretScanner({ [SCANNER_ENV]: bad }), JSON.stringify(bad)).toThrow(SecretScanError);
+    }
+    // the CLI: refused before any GitHub call and before the consent question, exit 1, the value not shown
     const dir = repo();
-    const { stub, env } = aiSetup();
+    const { ai, env } = aiSetup();
     const ask = prompter(true);
     vi.clearAllMocks();
-    const r = await audit(['audit', '--ai'], { cwd: dir, env, prompt: ask });
-    expect(r.code).toBe(0);
-    const calls = childCalls();
-    expect(calls.length).toBeGreaterThan(0);
-    for (const c of calls) {
-      expect(c.fn).toBe('execFile');
-      expect(c.args[0]).toBe(stub.bin);
+    const r = await audit(['audit', '--ai'], { cwd: dir, env: { ...env, [SCANNER_ENV]: odd }, prompt: ask });
+    expect(r.code).toBe(1);
+    expect(r.err).toContain('PIPEGEN_SECRET_SCANNER must be betterleaks (the default) or gitleaks.');
+    expect(r.all).not.toContain(odd);
+    expect(r.calls).toEqual([]);
+    expect(ask.asked).toEqual([]);
+    expect(ensurePinnedBinary).not.toHaveBeenCalled();
+    expect(ai.complete).not.toHaveBeenCalled();
+    // without --ai nothing is scanned or sent, so the setting is not read
+    const plain = await audit(['audit'], { cwd: dir, env: { [SCANNER_ENV]: odd } });
+    expect(plain.code).toBe(0);
+  });
+
+  it('bundle: scanner exit code other than clean/found → no AI call, note names the gitleaks fallback', async () => {
+    for (const code of [2, 126, 255]) {
+      const dir = repo();
+      const s = aiSetup(undefined, undefined, `fs.writeFileSync(report, '[]'); process.exit(${code});`);
+      const r = await audit(['audit', '--ai'], { cwd: dir, env: s.env, prompt: prompter(true) });
+      expect(r.code, String(code)).toBe(0); // the plain audit is still reported
+      expect(s.ai.complete, String(code)).not.toHaveBeenCalled();
+      const out = oneLine(r.out);
+      expect(out, String(code)).toContain(`the required betterleaks check couldn't run. betterleaks failed (exit code ${code}).`);
+      // the note survives pipegen's own output cleaning (a `NAME=value` form would be hidden by redact())
+      expect(out, String(code)).toContain('To use the gitleaks fallback instead, set PIPEGEN_SECRET_SCANNER to gitleaks and run again.');
     }
-    expect(execaCalls()).toEqual([]);
-    expect(ensurePinnedBinary).toHaveBeenCalledTimes(1);
-    expect(ensurePinnedBinary).toHaveBeenCalledWith('gitleaks');
-    // the download happens after the consent question, never before (S21, B4)
-    const asked = vi.mocked(ask.confirm).mock.invocationCallOrder[0] as number;
-    expect(vi.mocked(ensurePinnedBinary).mock.invocationCallOrder[0]).toBeGreaterThan(asked);
+    // gitleaks is already the fallback: its failure names no other scanner
+    const dir = repo();
+    const s = aiSetup(undefined, undefined, 'process.exit(2);');
+    const r = await audit(['audit', '--ai'], { cwd: dir, env: { ...s.env, [SCANNER_ENV]: 'gitleaks' }, prompt: prompter(true) });
+    expect(s.ai.complete).not.toHaveBeenCalled();
+    expect(oneLine(r.out)).toContain("the required gitleaks check couldn't run. gitleaks failed (exit code 2).");
+    expect(r.out).not.toContain('To use the gitleaks fallback');
   });
 });
 

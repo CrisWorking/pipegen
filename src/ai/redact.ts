@@ -5,18 +5,15 @@ import { isAbsolute, join, relative, resolve, sep } from 'node:path';
 import picomatch from 'picomatch';
 import { IGNORED_DIRS, MAX_FILES_TEXT, listFiles, readTextLimitedWithReason, regexSafe, type Skipped } from '../read/limits.js';
 import { safeText } from '../util/safe-text.js';
-import { secretScanConfigPath } from './secret-scan-config.js';
+import { SECRET_SCAN_EXIT, SecretScanError, secretScanArgv, secretScanConfigPath, type SecretScanner } from './secret-scan-config.js';
 
 export { isBinary } from '../read/limits.js';
-export { secretScanConfigPath } from './secret-scan-config.js';
+export {
+  chooseSecretScanner, SECRET_SCAN_EXIT, SECRET_SCANNER_ENV, secretScanArgv, secretScanConfigPath, SecretScanError, type SecretScanner, type SecretScannerName,
+} from './secret-scan-config.js';
 
 /** Thrown by bundleText for a bundle that did not pass bundleCode's secret scan: nothing may be sent. */
 export class SecretScanRequiredError extends Error {}
-/** The secret scanner could not run or gave an unusable result (not a finding): no bundle is returned. */
-export class SecretScanError extends Error {}
-
-/** The pinned secret scanner bundleCode runs (ensurePinnedBinary's absolute path) and its pinned version. */
-export interface SecretScanner { name: 'gitleaks'; path: string; version: string }
 
 /** `bytes` is the exact UTF-8 size of bundleText(bundle) (wrapper and per-file headers included), never over maxBytes. */
 export interface CodeBundle { files: { path: string; content: string }[]; bytes: number; truncated: boolean; secretScanChecked: boolean; notes: string[] }
@@ -1348,8 +1345,11 @@ function applyFinding(content: string, f: Finding): string | null {
   return null;
 }
 
-// The scanner skips any line holding its inline allow comment; the bundle never carries one, so a repo cannot opt a line out.
-const ALLOW_COMMENT = 'gitleaks' + ':allow';
+// Both scanners skip a line holding `gitleaks:allow` or `betterleaks:allow` (live probe). The bundle never carries one
+// (any case), so a repo cannot opt a line out; the scan also runs with --ignore-gitleaks-allow. Built at runtime, so
+// this file holds neither comment itself.
+const ALLOW_COMMENT = new RegExp('(gitleaks|betterleaks)' + ':allow', 'gi');
+const neutralizeAllow = (s: string) => s.replace(ALLOW_COMMENT, (_m, tool: string) => `${tool}-allow`);
 
 const PATHS_FILE = 'paths.txt';
 
@@ -1391,7 +1391,7 @@ async function secretScanPass(files: FileEntry[], scanner: SecretScanner, timeou
   } catch (e) {
     throw new SecretScanError(e instanceof Error ? e.message : `pipegen's ${name} config could not be found.`);
   }
-  const scanned = files.map((f) => ({ path: f.path, content: f.content.split(ALLOW_COMMENT).join('gitleaks-allow') }));
+  const scanned = files.map((f) => ({ path: f.path, content: neutralizeAllow(f.content) }));
   const shownPaths = scanned.map((f) => displayPath(f.path));
   const tmp = await realpath(await mkdtemp(join(tmpdir(), 'pipegen-secret-scan-')));
   try {
@@ -1399,11 +1399,13 @@ async function secretScanPass(files: FileEntry[], scanner: SecretScanner, timeou
     // Neutral names: no repo file name (.gitleaksignore, .gitleaks.toml, allowlisted paths) reaches the scanner.
     const names = scanned.map((_, i) => `f${String(i + 1).padStart(6, '0')}.txt`);
     for (let i = 0; i < scanned.length; i++) await writeFile(join(tmp, names[i]), scanned[i].content, { flag: 'wx', mode: 0o600 });
-    await writeFile(join(tmp, PATHS_FILE), shownPaths.join('\n').split(ALLOW_COMMENT).join('gitleaks-allow'), { flag: 'wx', mode: 0o600 });
+    await writeFile(join(tmp, PATHS_FILE), neutralizeAllow(shownPaths.join('\n')), { flag: 'wx', mode: 0o600 });
     const reportPath = join(tmp, 'report.json');
-    const code = await runScanner(name, bin, ['detect', '--no-git', '--source', tmp, '--config', config, '--report-format', 'json', '--report-path', reportPath], tmp, timeoutMs);
-    if (code !== 0 && code !== 1) throw new SecretScanError(`${name} failed (exit code ${code}).`);
+    const code = await runScanner(name, bin, secretScanArgv(name, tmp, config, reportPath), tmp, timeoutMs);
+    if (code !== SECRET_SCAN_EXIT.clean && code !== SECRET_SCAN_EXIT.found) throw new SecretScanError(`${name} failed (exit code ${code}).`);
     const findings = await readReport(name, reportPath);
+    // "found" with nothing listed is a scan that went wrong (betterleaks exits 1 on a config error, with no report)
+    if (code === SECRET_SCAN_EXIT.found && findings.length === 0) throw new SecretScanError(`${name} reported findings but listed none.`);
 
     const index = new Map(names.map((n, i) => [n, i]));
     const perFile = new Map<number, Finding[]>();

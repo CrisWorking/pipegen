@@ -63,8 +63,9 @@ npx --registry=https://registry.npmjs.org pipegen@0.1.0 audit --dir ./my-repo --
                           # and asks you (default No)
 ```
 
-`audit --ai` needs Linux or macOS for now (WSL works): it checks your code with a pinned gitleaks binary before
-anything is sent, and that binary exists for those systems only.
+`audit --ai` needs Linux or macOS for now (WSL works): it checks your code for secrets with a pinned betterleaks binary
+before anything is sent (or gitleaks, the fallback, when `PIPEGEN_SECRET_SCANNER` is set to `gitleaks`), and those
+binaries exist for those systems only.
 
 Later versions add the full job (one PR), then `finish` (after you merge: merge rules, signing key and dates), `verify`
 (read-only: checks nobody weakened the pipeline files) and `uninstall`. Their exact commands will be shown here when

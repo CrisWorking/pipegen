@@ -1,5 +1,6 @@
-// A small node script standing in for the pinned gitleaks binary (shared by the redact and needs tests).
-// It records what it was given (argv, cwd, env names, the scanned files) and then runs `body` to write a report and exit.
+// A small node script standing in for the pinned secret scanner, betterleaks or gitleaks (shared by the redact, needs,
+// consent and audit tests). It records what it was given (argv, cwd, env names, the scanned files) and then runs `body`
+// to write a report and exit. The scanned folder is the word after `dir` (betterleaks) or after `--source` (gitleaks).
 import { chmodSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import type { BundleOptions, SecretScanner } from '../../src/ai/redact.js';
@@ -16,7 +17,7 @@ export function makeStub(body: string): { bin: string; record: () => StubRecord 
   writeFileSync(bin, `#!/usr/bin/env node
 const fs = require('fs'), path = require('path');
 const argv = process.argv.slice(2);
-const src = argv[argv.indexOf('--source') + 1];
+const src = argv.includes('--source') ? argv[argv.indexOf('--source') + 1] : argv[argv.indexOf('dir') + 1];
 const report = argv[argv.indexOf('--report-path') + 1];
 const files = {};
 for (const f of fs.readdirSync(src)) files[f] = fs.readFileSync(path.join(src, f), 'utf8');
@@ -42,6 +43,10 @@ export const CLEAN = `fs.writeFileSync(report, '[]'); process.exit(0);`;
 export function gitleaksAt(path: string, version = '8.30.1'): SecretScanner {
   return { name: 'gitleaks', path, version };
 }
+/** A betterleaks scanner for bundleCode (a stub, or the real pinned one). */
+export function betterleaksAt(path: string, version = '1.9.0'): SecretScanner {
+  return { name: 'betterleaks', path, version };
+}
 
 // The keys below hold a secret-like word, and pipegen's own redact() hides whatever follows such a key and a colon
 // or an equals sign (no-secret-literals.test.ts checks every test file with it), so tests never write them that way:
@@ -62,6 +67,7 @@ export function scannerFacts(name: SecretScanner['name'], version: string): Audi
   return { [SCANNER_KEY]: { name, version } };
 }
 export const gitleaksFacts = (version = '8.30.1') => scannerFacts('gitleaks', version);
+export const betterleaksFacts = (version = '1.9.0') => scannerFacts('betterleaks', version);
 
 /** addAiSuggestions' scanner dependency. */
 type EnsureDep = Pick<AiSuggestDeps, typeof ENSURE_KEY>;

@@ -389,8 +389,9 @@ function bundleSection(r: Pick<AuditReport, 'aiBundle'>, c: Ctx): Section {
     blocks.push(text('Never sent (every pattern; one that starts with ! keeps a file):'));
     for (const p of b.excludedPatterns) blocks.push(item(c.v(p, OUTPUT_CAP.path)));
   }
-  blocks.push(text('These are counts only, never file contents. They were made without the gitleaks check; before anything is sent, '
-    + 'gitleaks checks every file for secrets and secret-looking values are hidden, so the real bundle can differ slightly.'));
+  blocks.push(text('These are counts only, never file contents. They were made without the secret scan; before anything is sent, '
+    + 'a secret scan (betterleaks, or gitleaks as the fallback) checks every file and secret-looking values are hidden, so the '
+    + 'real bundle can differ slightly.'));
   return { title: 'What the full setup would send to the AI', blocks };
 }
 

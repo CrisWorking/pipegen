@@ -9,9 +9,9 @@
 //   "GitHub: not read", and the exit code is 1 (the inspect R10 rule). No GitHub fact is guessed.
 // - The reviewed tool list can't be used (B3: the release build refuses it while entries wait for review): the audit
 //   runs with no reviewed tools and a warning at the top, exit 0.
-// - `--ai`: everything that can refuse it is checked first, before any GitHub call (S21 platform, S15 provider, the
-//   Ollama checks of U15/H2, the secret scanner's pin). After the plain audit: the estimate (an unpriced model stops here,
-//   U14), from the counting bundle (no secret scan, no child process) the plain audit already counted with, built once
+// - `--ai`: everything that can refuse it is checked first, before any GitHub call (S21 platform, PIPEGEN_SECRET_SCANNER,
+//   S15 provider, the Ollama checks of U15/H2, the scanner's pin). After the plain audit: the estimate (an unpriced model
+//   stops here, U14), from the counting bundle (no secret scan, no child process) the plain audit already counted with, built once
 //   per run (final review M9), then the consent screen (default No). Only a yes
 //   gives the ConsentToken addAiSuggestions requires; it then downloads the secret scanner, builds the checked bundle and asks the AI.
 // - Output: the terminal report (default) or JSON (--json) on stdout; --out writes the Markdown report through
@@ -21,7 +21,7 @@ import { resolve } from 'node:path';
 import type { Octokit } from '@octokit/rest';
 import { checkOllamaModelRunsThere } from '../ai/ollama.js';
 import { AiError, makeProvider } from '../ai/provider.js';
-import { bundleCode, scrubKnownValues, type SecretScanner } from '../ai/redact.js';
+import { bundleCode, chooseSecretScanner, scrubKnownValues, SecretScanError, type SecretScanner, type SecretScannerName } from '../ai/redact.js';
 import { countingSummary } from '../audit/consent-token.js';
 import { writeOutFile, OutFileError } from '../audit/out-file.js';
 import { addAiSuggestions, buildAudit, buildLocalAudit, needsRequestBytes, type AuditReport } from '../audit/model.js';
@@ -217,12 +217,20 @@ export async function audit(io: CliIO, flags: AuditFlags): Promise<number> {
 }
 
 /**
- * Everything that can refuse `--ai`, before any GitHub call: the platform (S21), the provider and its key (S15), for
- * Ollama the host and the model (U15/H2: never ollama.com, never a cloud model behind a local name; fail closed), and
- * the pinned secret scanner and version the consent screen names. A string is the refusal to show.
+ * Everything that can refuse `--ai`, before any GitHub call: the platform (S21), the secret scanner
+ * (PIPEGEN_SECRET_SCANNER: betterleaks by default, or gitleaks; anything else is refused), the provider and its key
+ * (S15), for Ollama the host and the model (U15/H2: never ollama.com, never a cloud model behind a local name; fail
+ * closed), and the scanner's pinned version the consent screen names. A string is the refusal to show.
  */
 async function prepareAi(io: CliIO, flags: AuditFlags, notes: string[]): Promise<AiReady | string> {
   if (!(PLATFORM_KEYS as readonly string[]).includes(`${process.platform}-${process.arch}`)) return AUDIT_AI_PLATFORM;
+  let scanner: SecretScannerName;
+  try {
+    scanner = chooseSecretScanner(io.env);
+  } catch (e) {
+    if (!(e instanceof SecretScanError)) throw e;
+    return e.message;
+  }
   let provider: AiProvider;
   try {
     provider = makeProvider({
@@ -244,7 +252,7 @@ async function prepareAi(io: CliIO, flags: AuditFlags, notes: string[]): Promise
   }
   let secretScanner: AiReady['secretScanner'];
   try {
-    secretScanner = { name: 'gitleaks', version: loadPinnedBinaries().gitleaks.version };
+    secretScanner = { name: scanner, version: loadPinnedBinaries()[scanner].version };
   } catch (e) {
     if (!(e instanceof PinnedBinaryError)) throw e;
     return `audit --ai can't run in this build: ${e.message}`;

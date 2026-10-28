@@ -19,7 +19,7 @@ import { DEFAULT_MODEL, type AiProvider, type AiRequest, type AiUsage, type Capa
 import { fakeFetch, fakeOctokit, type Routes } from './helpers/fake-http.js';
 import { ConsentToken, CountingSummary } from '../src/audit/consent-token.js';
 import { grantAuditAi } from './helpers/consent.js';
-import { CLEAN, ensureWith, gitleaksAt, makeStub, scanWith } from './helpers/gitleaks-stub.js';
+import { betterleaksAt, betterleaksFacts, CLEAN, ensureWith, gitleaksAt, makeStub, scanWith } from './helpers/gitleaks-stub.js';
 import { cleanupRepos, makeTempDir, writeIn } from './helpers/make-repo.js';
 
 vi.mock('../src/ai/redact.js', async (importOriginal) => {
@@ -225,6 +225,37 @@ describe('addAiSuggestions (brief, Task 2b)', () => {
     expect(ensurePinnedBinary).toHaveBeenCalledWith('gitleaks');
     expect(dflt.ai.complete).not.toHaveBeenCalled();
     expect(d.ai?.notes).toContain("The AI step was skipped and nothing was sent to the AI: the required gitleaks check couldn't run. No download in tests.");
+  });
+
+  it('addAiSuggestions: runs the secret scanner the consent screen named, at the version it showed; any other → no AI call', async () => {
+    const s = await setup();
+    const named = await grantAuditAi(s.r.profile, s.dir, s.deps.ai, s.deps.capUsd, [], betterleaksFacts());
+    const stub = makeStub(CLEAN);
+    const ensure = vi.fn(async () => betterleaksAt(stub.bin));
+    await addAiSuggestions(s.r, s.dir, { ...s.deps, ...ensureWith(ensure), consent: named });
+    expect(ensure).toHaveBeenCalledWith('betterleaks');
+    expect(stub.record().argv[0]).toBe('dir'); // it really ran as betterleaks
+    expect(s.ai.needsReqs()).toHaveLength(1);
+
+    // a scanner the screen didn't name (another one, or another version) is never run, and nothing is sent
+    for (const wrong of [(b: string) => gitleaksAt(b), (b: string) => betterleaksAt(b, '1.8.0')]) {
+      const t = await setup();
+      const other = makeStub(CLEAN);
+      const out = await addAiSuggestions(t.r, t.dir, {
+        ...t.deps, ...ensureWith(vi.fn(async () => wrong(other.bin))), consent: await grantAuditAi(t.r.profile, t.dir, t.deps.ai, t.deps.capUsd, [], betterleaksFacts()),
+      });
+      expect(() => other.record()).toThrow(); // never started
+      expect(t.ai.complete).not.toHaveBeenCalled();
+      expect(out.ai?.notes.join('\n')).toContain("the required betterleaks check couldn't run.");
+    }
+
+    // without the dependency, the default downloads the scanner the screen named
+    const d = await setup();
+    const rest = { ...d.deps };
+    delete rest.ensureSecretScanner;
+    await addAiSuggestions(d.r, d.dir, { ...rest, consent: await grantAuditAi(d.r.profile, d.dir, d.deps.ai, d.deps.capUsd, [], betterleaksFacts()) });
+    expect(ensurePinnedBinary).toHaveBeenCalledWith('betterleaks');
+    expect(d.ai.complete).not.toHaveBeenCalled(); // refused in tests
   });
 
   it('addAiSuggestions: AI-added needs listed as extraNeeds; floor needs unchanged', async () => {

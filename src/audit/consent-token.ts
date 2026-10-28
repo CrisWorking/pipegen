@@ -9,11 +9,11 @@
 //   really sent (review M3, accepted residual).
 // - ConsentToken: the user said yes to a consent screen. askConsent() is the only maker: the minter is claimed once, by
 //   the consent module (claimTokenMinter), and a second claim throws. addAiSuggestions requires a token, checks its terms
-//   (provider, model, Ollama host, cap, folder) and spends it: a token is good for one AI step only.
+//   (provider, model, Ollama host, cap, folder), runs the secret scanner they name and spends it: a token is good for one AI step only.
 // Runtime forgery: `private constructor` is TypeScript only, so `new (X as any)()` or a subclass would make an object
 // with the private brand. Each class therefore also keeps a module-private WeakSet of the objects it really issued, and
 // isSummary()/isToken() check it (the same idea as redact.ts's CHECKED bundles).
-import { bundleTopFolders, countedBundleRoot, type BundleSummary, type CodeBundle } from '../ai/redact.js';
+import { bundleTopFolders, countedBundleRoot, type BundleSummary, type CodeBundle, type SecretScanner } from '../ai/redact.js';
 import type { PricedFor } from '../estimate/estimate.js';
 
 export type ConsentMode = 'full' | 'audit-ai';
@@ -80,6 +80,8 @@ export interface ConsentTerms {
   readonly files: BundleSummary | CountingSummary;
   /** The real path of the folder the counted files are in (a CountingSummary's dir); null for a checked summary. */
   readonly dir: string | null;
+  /** The secret scanner and version the screen named: the AI step runs exactly that one (Plan P Task 7). */
+  readonly secretScanner: Readonly<Pick<SecretScanner, 'name' | 'version'>>;
 }
 
 const ISSUED_TOKENS = new WeakSet<object>();

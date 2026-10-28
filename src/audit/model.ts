@@ -30,7 +30,7 @@ import { count, outputLimit } from '../ai/errors.js';
 import { ollamaHostOf } from '../ai/ollama.js';
 import { AiError, COST_CAP_MESSAGE, refusalFallbackNoteFor, type AiErrorKind } from '../ai/provider.js';
 import {
-  bundleCode, bundleTopFolders, COUNTING_ONLY_NOTE, countedBundleRoot, EXCLUDED_PATTERNS, findSecretLike, isExcludedPath, redact, SecretScanError, type SecretScanner,
+  bundleCode, bundleTopFolders, COUNTING_ONLY_NOTE, countedBundleRoot, EXCLUDED_PATTERNS, findSecretLike, isExcludedPath, redact, SECRET_SCANNER_ENV, SecretScanError, type SecretScanner, type SecretScannerName,
   scrubKnownValues, type CodeBundle,
 } from '../ai/redact.js';
 import { needLanguage, suggestTools } from '../engine/discover.js';
@@ -673,8 +673,11 @@ export interface AiSuggestDeps {
   sleep?: (ms: number) => Promise<void>;
   /** The GitHub token (when set) and the AI key in use: never sent to the AI, never in the report (ruling S19). */
   knownValues: string[];
-  /** The checked secret scanner (its path and version); default ensurePinnedBinary('gitleaks'). Called right before the bundle is built. */
-  ensureSecretScanner?: () => Promise<SecretScanner>;
+  /**
+   * The checked secret scanner `name` (its path and version): the one the consent screen named. Default:
+   * ensurePinnedBinary(name) and its pinned version. Called right before the bundle is built.
+   */
+  ensureSecretScanner?: (name: SecretScannerName) => Promise<SecretScanner>;
   /** No GitHub token: the search may stop early (ruling S17). */
   anonymous: boolean;
   /**
@@ -694,7 +697,9 @@ const AI_NOTE = {
   // Ruling S17's text reworded: "No token: …" would be cut by redact() at output (notes are never "<secret-like word>: …").
   anonymous: 'Without a GitHub token, GitHub allows 60 requests an hour, so tool suggestions may stop early. Set GITHUB_TOKEN (read-only) for a full search.',
   lookAlike: "pipegen's reviewed tool list isn't usable in this build, so it couldn't check suggested tools for look-alike names; it shows no tool suggestions.",
-  noSecretScan: (name: string, why: string) => `The AI step was skipped and nothing was sent to the AI: the required ${name} check couldn't run. ${why}`,
+  noSecretScan: (name: SecretScannerName, why: string) => `The AI step was skipped and nothing was sent to the AI: the required ${name} check couldn't run. ${why}`
+    // the fallback, in words: pipegen's output cleaning (redact) would hide a `NAME=value` form
+    + (name === 'betterleaks' ? ` To use the gitleaks fallback instead, set ${SECRET_SCANNER_ENV} to gitleaks and run again.` : ''),
   // the backstop (review I1): the walk reads only counted files, so this means a bug, not something the user can fix
   notConsented: "Nothing was sent to the AI: after the secret scan, the code held a file that wasn't on the consent screen, and pipegen sends only files it showed you.",
   stopped: (why: string) => `The AI step stopped: ${why}.`,
@@ -847,6 +852,11 @@ function hasProjectScript(need: Need, p: RepoProfile): boolean {
   return projectScriptFor(need, service) !== null;
 }
 
+/** The pinned scanner `name`, downloaded and verified (ensurePinnedBinary), with its pinned version. */
+async function defaultSecretScanner(name: SecretScannerName): Promise<SecretScanner> {
+  return { name, path: await ensurePinnedBinary(name), version: loadPinnedBinaries()[name].version };
+}
+
 /**
  * `audit --ai`, after consent: the needs the AI adds and mention-only tool suggestions, in `ai` of a copy of `r`
  * (the rest of the report is unchanged).
@@ -854,8 +864,10 @@ function hasProjectScript(need: Need, p: RepoProfile): boolean {
  *    and folder, not used before (Plan U T4b, review M1/M2); anything else is thrown before anything runs, and the token
  *    is spent. The secret scan's walk reads only the files the screen counted (onlyPaths, review I1); covers() is the
  *    backstop (a note, nothing sent). File content can change between the count and the send; the cap still holds (M3).
- * 1. The secret scanner is made ready right before the bundle is built with it (the path stays a local variable). No
- *    binary, or a scanner failure: no AI call, a note.
+ * 1. The secret scanner the consent screen named (betterleaks, or gitleaks with PIPEGEN_SECRET_SCANNER) is made ready
+ *    right before the bundle is built with it (the path stays a local variable). No binary, another scanner or version
+ *    than the screen named, or a scanner failure (an exit code other than clean/found): no AI call, a note (for
+ *    betterleaks it names the gitleaks fallback).
  * 2. planNeeds(…, writers 0, knownValues): the needs it adds become `extraNeeds`; floor needs are never changed.
  * 3. suggestTools for every floor need that isn't covered, and every added need, that has no project script (it skips
  *    needs a reviewed tool covers). Skipped when the reviewed list is unavailable (look-alike checks need it; B3/U11).
@@ -863,11 +875,6 @@ function hasProjectScript(need: Need, p: RepoProfile): boolean {
  * is never sent: the needs call then stops the AI step with a note; a discovery call stops asking the AI (one note).
  * An AiError never escapes (S16): it becomes a note, and its billed usage still counts. Other errors are thrown.
  */
-/** The pinned gitleaks, downloaded and verified (ensurePinnedBinary), with its pinned version. */
-async function defaultSecretScanner(): Promise<SecretScanner> {
-  return { name: 'gitleaks', path: await ensurePinnedBinary('gitleaks'), version: loadPinnedBinaries().gitleaks.version };
-}
-
 export async function addAiSuggestions(r: AuditReport, dir: string, deps: AiSuggestDeps): Promise<AuditReport> {
   const counted = await checkConsent(dir, deps);
   const notes = new Set<string>();
@@ -903,15 +910,20 @@ export async function addAiSuggestions(r: AuditReport, dir: string, deps: AiSugg
     return done();
   }
 
-  // 1. The secret-scanned bundle: the binary is made ready right before it runs, and its path is never kept.
+  // 1. The secret-scanned bundle: the scanner the user was shown is made ready right before it runs, and its path is
+  //    never kept.
+  const named = deps.consent.terms.secretScanner;
   let bundle: CodeBundle;
   try {
-    const scanner = await (deps.ensureSecretScanner ?? defaultSecretScanner)();
+    const scanner = await (deps.ensureSecretScanner ?? defaultSecretScanner)(named.name);
+    if (scanner.name !== named.name || scanner.version !== named.version) {
+      throw new SecretScanError(`pipegen was given ${safeText(scanner.name, 20)} ${safeText(scanner.version, 20)}, not the ${named.name} ${named.version} the consent screen named, and ran neither.`);
+    }
     // only the files the consent screen counted (review I1): the checked bundle can only shrink
     bundle = await bundleCode(dir, { secretScanner: scanner, knownValues: deps.knownValues, onlyPaths: counted.paths() });
   } catch (e) {
     if (!(e instanceof PinnedBinaryError || e instanceof SecretScanError)) throw e;
-    notes.add(AI_NOTE.noSecretScan('gitleaks', e.message));
+    notes.add(AI_NOTE.noSecretScan(named.name, e.message));
     return done();
   }
   // only files the user agreed to (the consent screen counted them before the secret scan, ruling S21)

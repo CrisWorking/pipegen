@@ -15,7 +15,7 @@ import { estimate, estimateAuditAi, type Estimates } from '../src/estimate/estim
 import { permissionsTable } from '../src/github/client.js';
 import { DEFAULT_MODEL, type AiProvider, type Capabilities, type RepoProfile, type Service } from '../src/types.js';
 import { hostileNames } from './fixtures/hostile-names.js';
-import { CLEAN, gitleaksAt, gitleaksFacts, makeStub, scanWith } from './helpers/gitleaks-stub.js';
+import { betterleaksFacts, CLEAN, gitleaksAt, gitleaksFacts, makeStub, scanWith } from './helpers/gitleaks-stub.js';
 import { cleanupRepos, makeTempDir, writeIn } from './helpers/make-repo.js';
 import { fake } from './helpers/secret-repo.js';
 import { emptyRepoFiles, emptyServiceQuality } from '../src/read/quality.js';
@@ -236,6 +236,27 @@ describe('consentText (full)', () => {
     }
   });
 
+  it('consent: audit-ai screen names betterleaks 1.9.0', async () => {
+    const p = profile();
+    const est = estimateAuditAi(claude, 3, 50_000);
+    const dir = makeTempDir();
+    writeIn(dir, 'src/a.ts', 'export const a = 1;\n');
+    const counted = countingSummary(await bundleCode(dir));
+    for (const files of [bundle, counted]) {
+      const text = consentText(p, claude, est, files, permissionsTable('read'), [], 'audit-ai', betterleaksFacts());
+      expect(text).toContain('every file is checked for secrets with betterleaks 1.9.0, which pipegen downloads (checksum-verified) into its cache');
+      expect(text).not.toMatch(/gitleaks/i);
+      if (files === counted) expect(text).toContain('These counts were made before the betterleaks check, which runs only after you say yes.');
+    }
+    // the screen's terms carry the scanner it named: the AI step runs that one (and no other)
+    const screen = consentScreen(p, claude, est, bundle, permissionsTable('read'), [], 'audit-ai', betterleaksFacts());
+    expect(screen.terms.secretScanner).toEqual({ name: 'betterleaks', version: '1.9.0' });
+    // the full run's screen names it the same way
+    const f = fullEst(p, claude);
+    const fullText = consentText(p, claude, f, bundle, permissionsTable('write', { appCreatesRepos: false }), repos(p, [true, true]), 'full', { appCreatesRepos: false, ...betterleaksFacts() });
+    expect(fullText).toContain('betterleaks 1.9.0, which pipegen downloads (checksum-verified) into its cache');
+  });
+
   it('consent: repo-derived names pass through safeText', async () => {
     // real folders with hostile names (one path segment each; bundleCode itself leaves out paths with CR or LF)
     const hostile = [hostileNames.ansiColour, `\x1b]8;;evil.example\x1b\\click me\x1b]8;;\x1b\\`, hostileNames.bidiOverride];
@@ -412,7 +433,7 @@ describe('askConsent', () => {
 });
 
 describe('consent token (T4b: no AI call without consent, by type)', () => {
-  it('consent grant (yes) gives a ConsentToken that carries what the screen showed (mode, provider, cap, files)', async () => {
+  it('consent grant (yes) gives a ConsentToken that carries what the screen showed (mode, provider, cap, files, scanner)', async () => {
     const est = estimateAuditAi(claude, 3, 50_000);
     const s = consentScreen(profile(), claude, est, bundle, permissionsTable('read'), [], 'audit-ai', gitleaksFacts());
     expect(s).toBeInstanceOf(ConsentScreen);
@@ -422,7 +443,7 @@ describe('consent token (T4b: no AI call without consent, by type)', () => {
     if (granted === null) throw new Error('expected a yes');
     expect(ConsentToken.isToken(granted)).toBe(true);
     expect(Object.isFrozen(granted)).toBe(true);
-    expect(granted.terms).toEqual({ mode: 'audit-ai', pricedFor: est.pricedFor, capUsd: est.capUsd, files: bundle, dir: null });
+    expect(granted.terms).toEqual({ mode: 'audit-ai', pricedFor: est.pricedFor, capUsd: est.capUsd, files: bundle, dir: null, ...gitleaksFacts() });
     const f = full();
     const fullScreen = consentScreen(f.p, claude, f.est, bundle, permissionsTable('write', { appCreatesRepos: false }), repos(f.p, [true, true]), 'full', { appCreatesRepos: false, ...gitleaksFacts() });
     expect(fullScreen.terms).toMatchObject({ mode: 'full', capUsd: f.est.aiCostCapUsd });
