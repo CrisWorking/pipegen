@@ -1488,7 +1488,10 @@ async function secretScanPass(files: FileEntry[], scanner: SecretScanner, timeou
     // Neutral names: no repo file name (.gitleaksignore, .gitleaks.toml, allowlisted paths) reaches the scanner.
     const names = scanned.map((_, i) => `f${String(i + 1).padStart(6, '0')}.txt`);
     for (let i = 0; i < scanned.length; i++) await writeFile(join(tmp, names[i]), SCAN_PREFIX + scanned[i].content, { flag: 'wx', mode: 0o600 });
-    await writeFile(join(tmp, PATHS_FILE), SCAN_PREFIX + neutralizeAllow(shownPaths.join('\n')), { flag: 'wx', mode: 0o600 });
+    const pathsText = SCAN_PREFIX + neutralizeAllow(shownPaths.join('\n'));
+    // R1 for the paths too: the scanners would skip paths.txt, and so never check the file names. Fail closed.
+    if (scannersWouldSkip(pathsText)) throw new SecretScanError(`The bundle's file list has a binary-format marker at a byte the ${name} scanner sniffs, so it would not be scanned; nothing was sent.`);
+    await writeFile(join(tmp, PATHS_FILE), pathsText, { flag: 'wx', mode: 0o600 });
     const reportPath = join(tmp, 'report.json');
     const code = await runScanner(name, bin, secretScanArgv(name, tmp, config, reportPath), tmp, timeoutMs, (c) => { guard.child = c; });
     if (code !== SECRET_SCAN_EXIT.clean && code !== SECRET_SCAN_EXIT.found) throw new SecretScanError(`${name} failed (exit code ${code}).`);

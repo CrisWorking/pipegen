@@ -398,6 +398,16 @@ describe('bundle: gitleaks pass', () => {
     }
   });
 
+  it('bundle: a file list with a late format marker (paths.txt would be skipped) → SecretScanError, nothing sent', async () => {
+    // "\n" + two shown paths: the second one's "ustar" lands at byte 257 of paths.txt as written
+    const dir = makeTempDir();
+    writeIn(dir, `src/${'a'.repeat(200)}`, 'x\n');
+    writeIn(dir, `src/${'b'.repeat(47)}ustar.ts`, 'y\n');
+    for (const scanner of [betterleaksAt, gitleaksAt]) {
+      await expect(bundleCode(dir, scanWith(scanner(makeStub(CLEAN).bin))), scanner.name).rejects.toThrow(/file list has a binary-format marker/);
+    }
+  });
+
   it('bundle: a finding reported on the added first line (the empty prefix) → the file is left out', async () => {
     const found = 'plain' + '-looking-' + 'value-5520';
     const dir = makeTempDir();
