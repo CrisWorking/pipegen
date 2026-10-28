@@ -26,8 +26,10 @@
 # the tool would load from a repo by itself; added to the protected paths); configSections (`<file>:<section>` of shared
 # files the tool reads, e.g. pyproject.toml:tool.mypy; ruling P23); wrappedImage (the image an action's action.yml runs,
 # with the digest it resolved to when pinned; ruling P26); step.cli.then (follow-up commands of the same tool; a
-# `{choice}` word is the AI's choice, ruling P24); proofs (passed Plan E runs). Every cli entry's argv, pinned config
-# and env must match its allowlist in src/engine/tool-flags.ts (ARGV_POLICIES, ruling P19): change both together.
+# `{choice}` word is the AI's choice, named after the flag it fills, ruling P24); proofs (passed Plan E runs). Every
+# entry with a step.cli (cli or image) must match its allowlist in src/engine/tool-flags.ts (ARGV_POLICIES, by id: its
+# install method and package, executable, flags, pinned config and env; rulings P19, P28), and every action its input
+# policy (ACTION_POLICIES, by exact owner/repo; ruling P29): change the data and the policy together.
 #
 # Not here, on purpose: KICS was never on this list (its action tags and images were hijacked; the loader refuses it,
 # Plan P Task 5). Dependabot (the update-config file) and npm trusted publishing are pipegen's own built-in steps,
@@ -1030,7 +1032,7 @@ tools:
     proofs: 0
 
   # Vitest coverage (v8), when Vitest is the test runner. The minimum of lines is a fixed flag whose value the AI chooses
-  #   (ruling P24: {coverage-lines} is that choice; never 0), so a repo config without thresholds can't pass everything.
+  #   (ruling P24: {coverage-thresholds-lines} is that choice; never 0), so a repo config without thresholds can't pass everything.
   # Source: npm vitest@5.0.5 dist.integrity (tarball hashes to it), published 2026-10-15T14:29:01.396Z; npm provenance: yes.
   # Plugin: @vitest/coverage-v8@5.0.5 (peers on vitest 5.0.5 exactly; G5 closed by PS30), published 2026-10-15T14:27:49.006Z; npm provenance: yes.
   - id: vitest-coverage
@@ -1052,12 +1054,12 @@ tools:
         install: { method: npm, package: "vitest", version: "5.0.5" }
         plugins:
           - { method: npm, package: "@vitest/coverage-v8", version: "5.0.5", checksum: "sha512-4KpkGdIrSqBihx/JyP/e+S+IKB98etg1XDQiLAxksLfcShnwi1VReGeOT9NI43hLHbknosKp/1CCLn9Zgcs8mg==" }
-        command: ["vitest", "run", "--coverage", "--coverage.thresholds.lines={coverage-lines}"]
+        command: ["vitest", "run", "--coverage", "--coverage.thresholds.lines={coverage-thresholds-lines}"]
       output: { path: "", format: none }
     fixedInputs:
-      args: ["--coverage", "--coverage.thresholds.lines={coverage-lines}"]
+      args: ["--coverage", "--coverage.thresholds.lines={coverage-thresholds-lines}"]
     choices:
-      coverage-lines: ["60", "70", "80", "90"]
+      coverage-thresholds-lines: ["60", "70", "80", "90"]
     configFiles: ["vitest.config.*", "vite.config.*", "vitest.workspace.*", "**/vitest.config.*"]
     reviewedBy: PENDING
     reviewedAt: PENDING

@@ -59,7 +59,17 @@ export interface CommandPolicy {
  * full-grammar rules in reviewed.ts (Task 5); only `exe` is checked here.
  */
 export interface ArgvPolicy extends CommandPolicy {
+  /**
+   * How the entry installs its tool and exactly what (ruling P28, review M-R3): the release asset, npm or pip package,
+   * or image. An entry that changes its kind or package under a reviewed id doesn't match the policy.
+   */
+  readonly method: 'npm' | 'pip' | 'github-release' | 'docker';
+  readonly package: string;
   readonly exe: string;
+  /** An image run with its own entrypoint (registry): the command is empty, with no args, config, env or then. */
+  readonly entrypoint?: true;
+  /** Choices that aren't argv placeholders, with their allowed values (semgrep's rule set, picked by the renderer). */
+  readonly extraChoices?: Readonly<Record<string, readonly string[]>>;
   readonly dialect: 'long' | 'goflags';
   readonly config?: { readonly flag: string; readonly content: string };
   readonly env?: readonly string[];
@@ -67,7 +77,10 @@ export interface ArgvPolicy extends CommandPolicy {
   readonly dedicated?: true;
 }
 
-const DEDICATED = (exe: string): ArgvPolicy => ({ exe, dialect: 'long', sub: [], flags: {}, dedicated: true });
+const DEDICATED = (exe: string, pkg: string): ArgvPolicy => ({ method: 'github-release', package: pkg, exe, dialect: 'long', sub: [], flags: {}, dedicated: true });
+const GH = 'github-release' as const;
+const TRIVY_ASSET = 'trivy_0.76.0_Linux-64bit.tar.gz';
+const RUFF_ASSET = 'ruff-x86_64-unknown-linux-gnu.tar.gz';
 /** Coverage minimums the AI may choose (P24): never 0. */
 export const COVERAGE_MINIMUMS = ['60', '70', '80', '90'] as const;
 const ESLINT_FILES = "files: ['**/*.{js,mjs,cjs,jsx,vue,svelte,astro}']";
@@ -80,124 +93,209 @@ const ESLINT_TS_FILES = "files: ['**/*.{js,mjs,cjs,jsx,ts,mts,cts,tsx,vue,svelte
  * on a list (P20).
  */
 export const ARGV_POLICIES: Readonly<Record<string, ArgvPolicy>> = Object.freeze({
-  'trivy-config': DEDICATED('trivy'), 'trivy-image': DEDICATED('trivy'), 'trivy-licence': DEDICATED('trivy'),
-  betterleaks: DEDICATED('betterleaks'), nuclei: DEDICATED('nuclei'),
+  'trivy-config': DEDICATED('trivy', TRIVY_ASSET), 'trivy-image': DEDICATED('trivy', TRIVY_ASSET), 'trivy-licence': DEDICATED('trivy', TRIVY_ASSET),
+  betterleaks: DEDICATED('betterleaks', 'betterleaks_1.9.0_linux_x64.tar.gz'), nuclei: DEDICATED('nuclei', 'nuclei_3.11.1_linux_amd64.zip'),
+  // ruling P28: the image entries too. registry runs the image's own entrypoint, nothing else
+  registry: { method: 'docker', package: 'registry', exe: '', entrypoint: true, dialect: 'long', sub: [], flags: {} },
+  // ZAP baseline (zaproxy/zap-stable): getopt short options, read as Go-style words; no -I (warnings that never fail)
+  'zap-baseline': {
+    method: 'docker', package: 'zaproxy/zap-stable', exe: 'zap-baseline.py', dialect: 'goflags', sub: [], flags: { J: 'output', z: { values: ['-silent'] } },
+    required: { J: null, z: '-silent' }, config: { flag: '-c', content: "# pipegen's pinned ZAP baseline rules: the defaults, nothing ignored\n" },
+  },
+  // Semgrep CE 1.181.0: rules only from the verified archive (semgrepProblems), no metrics, no version check
+  semgrep: {
+    method: 'docker', package: 'semgrep/semgrep', exe: 'semgrep', dialect: 'long', sub: ['scan'],
+    flags: { metrics: { values: ['off'] }, 'disable-version-check': 'bool', config: { values: ['/pipegen-rules'] }, sarif: 'bool', output: 'output' },
+    required: { metrics: 'off', 'disable-version-check': 'true', config: '/pipegen-rules' },
+    env: ['PIPEGEN_RULES_URL', 'PIPEGEN_RULES_SHA256', 'PIPEGEN_RULES_TREE'], extraChoices: { rules: ['javascript', 'typescript', 'python'] },
+  },
   // gitleaks 8.30.1 (`gitleaks git --help`), the secrets fallback (P21): the same locks as betterleaks
-  gitleaks: {
+  gitleaks: { method: GH, package: 'gitleaks_8.30.1_linux_x64.tar.gz',
     exe: 'gitleaks', dialect: 'long', sub: ['git'], positionals: ['.'],
     flags: { 'no-banner': 'bool', 'ignore-gitleaks-allow': 'bool', redact: { values: ['', '100'], optional: true }, 'report-format': { values: ['sarif'] }, 'report-path': 'output', 'exit-code': { values: ['1'] } },
     required: { 'ignore-gitleaks-allow': 'true', redact: '', 'report-format': 'sarif', 'report-path': null, 'exit-code': '1' },
     config: { flag: '--config', content: '[extend]\nuseDefault = true\n' },
   },
   // osv-scanner v2.7.0
-  'osv-scanner': {
+  'osv-scanner': { method: GH, package: 'osv-scanner_linux_amd64',
     exe: 'osv-scanner', dialect: 'long', sub: ['scan', 'source'], positionals: ['.'],
     flags: { recursive: 'bool', format: { values: ['sarif'] }, output: 'output' }, required: { format: 'sarif', output: null },
     config: { flag: '--config', content: "# pipegen's pinned osv-scanner config: no ignored vulnerabilities\n" },
   },
-  lefthook: { exe: 'lefthook', dialect: 'long', sub: ['run', 'pre-commit'], flags: { 'all-files': 'bool' }, required: { 'all-files': 'true' } },
-  syft: {
+  lefthook: { method: GH, package: 'lefthook_2.2.2_Linux_x86_64', exe: 'lefthook', dialect: 'long', sub: ['run', 'pre-commit'], flags: { 'all-files': 'bool' }, required: { 'all-files': 'true' } },
+  syft: { method: GH, package: 'syft_1.55.0_linux_amd64.tar.gz',
     exe: 'syft', dialect: 'long', sub: ['scan'], flags: { output: { values: ['spdx-json=sbom.spdx.json'] } }, required: { output: 'spdx-json=sbom.spdx.json' },
     config: { flag: '--config', content: 'check-for-app-update: false\n' },
   },
-  cosign: { exe: 'cosign', dialect: 'long', sub: ['sign'], flags: { yes: 'bool' }, required: { yes: 'true' } },
-  actionlint: {
+  cosign: { method: GH, package: 'cosign-linux-amd64', exe: 'cosign', dialect: 'long', sub: ['sign'], flags: { yes: 'bool' }, required: { yes: 'true' } },
+  actionlint: { method: GH, package: 'actionlint_1.7.12_linux_amd64.tar.gz',
     exe: 'actionlint', dialect: 'goflags', sub: [], flags: { 'no-color': 'bool', shellcheck: { values: [''] }, pyflakes: { values: [''] } },
     required: { shellcheck: '', pyflakes: '' },
     config: { flag: '-config-file', content: "self-hosted-runner:\n  labels: []\npaths:\n  .github/workflows/**/*.{yml,yaml}:\n    ignore:\n      - 'unexpected key \"cache-mode\" for \"job\" section'\n" },
   },
-  zizmor: { exe: 'zizmor', dialect: 'long', sub: [], positionals: ['.github/workflows'], flags: { offline: 'bool' }, required: { offline: 'true' }, config: { flag: '--config', content: 'rules: {}\n' } },
+  zizmor: { method: GH, package: 'zizmor-x86_64-unknown-linux-gnu.tar.gz', exe: 'zizmor', dialect: 'long', sub: [], positionals: ['.github/workflows'], flags: { offline: 'bool' }, required: { offline: 'true' }, config: { flag: '--config', content: 'rules: {}\n' } },
   // Biome 2.5.15: `biome ci` (lint + format check, never writes)
-  biome: {
+  biome: { method: 'npm', package: '@biomejs/biome',
     exe: 'biome', dialect: 'long', sub: ['ci'], flags: {},
     config: { flag: '--config-path', content: '{\n  "linter": {\n    "rules": {\n      "complexity": {\n        "noExcessiveCognitiveComplexity": { "level": "error", "options": { "maxAllowedComplexity": 15 } }\n      }\n    }\n  }\n}\n' },
   },
   // ESLint 10.13.0: no warnings allowed; the pinned flat config lints the framework files too (P25)
-  eslint: {
+  eslint: { method: 'npm', package: 'eslint',
     exe: 'eslint', dialect: 'long', sub: [], positionals: ['.'], flags: { 'max-warnings': { values: ['0'] } }, required: { 'max-warnings': '0' },
     config: { flag: '--config', content: `export default [{ ${ESLINT_FILES}, languageOptions: { parserOptions: { ecmaFeatures: { jsx: true } } }, rules: { complexity: ['error', 15] } }];\n` },
   },
-  'eslint-typescript': {
+  'eslint-typescript': { method: 'npm', package: 'eslint',
     exe: 'eslint', dialect: 'long', sub: [], positionals: ['.'], flags: { 'max-warnings': { values: ['0'] } }, required: { 'max-warnings': '0' },
     // built in two parts so the bundled CLI holds no import statement of a non-node module (test/package.test.ts)
     config: { flag: '--config', content: [`import tseslint from`, `'typescript-eslint';\nexport default [...tseslint.configs.recommended, { ${ESLINT_TS_FILES}, rules: { complexity: ['error', 15] } }];\n`].join(' ') },
   },
   // Oxlint 1.89.0
-  'oxlint-typeaware': {
+  'oxlint-typeaware': { method: 'npm', package: 'oxlint',
     exe: 'oxlint', dialect: 'long', sub: [], flags: { 'type-aware': 'bool', 'deny-warnings': 'bool' }, required: { 'type-aware': 'true', 'deny-warnings': 'true' },
     config: { flag: '--config', content: '{ "categories": { "correctness": "error" } }\n' },
   },
   // Prettier 3.9.10: check only (never --write); the repo's own Prettier config is used (catalogue §2)
-  prettier: { exe: 'prettier', dialect: 'long', sub: [], positionals: ['.'], flags: { check: 'bool' }, required: { check: 'true' } },
+  prettier: { method: 'npm', package: 'prettier', exe: 'prettier', dialect: 'long', sub: [], positionals: ['.'], flags: { check: 'bool' }, required: { check: 'true' } },
   // Vitest 5.0.5: coverage on, with a minimum the AI chooses (P24)
-  'vitest-coverage': {
+  'vitest-coverage': { method: 'npm', package: 'vitest',
     exe: 'vitest', dialect: 'long', sub: ['run'], flags: { coverage: 'bool', 'coverage.thresholds.lines': { values: COVERAGE_MINIMUMS } },
     required: { coverage: 'true', 'coverage.thresholds.lines': null },
   },
   // c8 12.0.0
-  c8: { exe: 'c8', dialect: 'long', sub: [], flags: { 'check-coverage': 'bool' }, required: { 'check-coverage': 'true' } },
+  c8: { method: 'npm', package: 'c8', exe: 'c8', dialect: 'long', sub: [], flags: { 'check-coverage': 'bool' }, required: { 'check-coverage': 'true' } },
   // Knip 6.42.1
-  knip: { exe: 'knip', dialect: 'long', sub: [], flags: { 'no-progress': 'bool' } },
+  knip: { method: 'npm', package: 'knip', exe: 'knip', dialect: 'long', sub: [], flags: { 'no-progress': 'bool' } },
   // jscpd 5.4.2 (the release binary): new copy-paste against the base only; no semantic mode (jscpdProblems)
-  jscpd: {
+  jscpd: { method: GH, package: 'jscpd-linux-x64-gnu.tar.gz',
     exe: 'jscpd', dialect: 'long', sub: [], positionals: ['.'],
     flags: { 'baseline-from-ref': { values: ['origin/main'] }, 'fail-on-new-clones': { values: [''], optional: true }, reporters: { values: ['sarif'] }, output: { values: ['jscpd-report'] } },
     required: { 'baseline-from-ref': 'origin/main', 'fail-on-new-clones': '' },
     config: { flag: '--config', content: '{}\n' },
   },
   // hadolint 2.15.1: fails on warnings and errors (never --no-fail or a lower threshold)
-  hadolint: {
+  hadolint: { method: GH, package: 'hadolint-linux-x86_64',
     exe: 'hadolint', dialect: 'long', sub: [], flags: { 'no-color': 'bool', 'failure-threshold': { values: ['warning'] }, format: { values: ['sarif'] }, output: 'output' },
     required: { 'failure-threshold': 'warning', format: 'sarif', output: null },
     config: { flag: '--config', content: "# pipegen's pinned hadolint config: every rule at its default level, nothing ignored\nignored: []\n" },
   },
   // kube-linter 0.8.3: an unrenderable chart, a bad path or YAML it can't parse fails the check (P25)
-  'kube-linter': {
+  'kube-linter': { method: GH, package: 'kube-linter-linux',
     exe: 'kube-linter', dialect: 'long', sub: ['lint'],
     flags: { 'fail-if-no-objects-found': 'bool', 'fail-on-invalid-resource': 'bool', format: { values: ['sarif'] }, output: 'output' },
     required: { 'fail-if-no-objects-found': 'true', 'fail-on-invalid-resource': 'true', format: 'sarif', output: null },
     config: { flag: '--config', content: "# pipegen's pinned kube-linter config: the default checks\nchecks:\n  doNotAutoAddDefaults: false\n" },
   },
   // Schemathesis 4.32.2: exactly 25 examples per operation, JUnit report
-  schemathesis: {
+  schemathesis: { method: 'pip', package: 'schemathesis',
     exe: 'schemathesis', dialect: 'long', sub: ['run'], flags: { 'max-examples': { values: ['25'] }, report: { values: ['junit'] }, 'report-junit-path': 'output' },
     required: { 'max-examples': '25', report: 'junit', 'report-junit-path': null },
   },
   // pinact 5.0.0: check only (never rewrites the workflows), and every version comment checked
-  pinact: { exe: 'pinact', dialect: 'long', sub: ['run'], flags: { check: 'bool', 'verify-comment': 'bool' }, required: { check: 'true', 'verify-comment': 'true' } },
+  pinact: { method: GH, package: 'pinact_linux_amd64.tar.gz', exe: 'pinact', dialect: 'long', sub: ['run'], flags: { check: 'bool', 'verify-comment': 'bool' }, required: { check: 'true', 'verify-comment': 'true' } },
   // poutine 1.1.6
-  poutine: {
+  poutine: { method: GH, package: 'poutine_Linux_x86_64.tar.gz',
     exe: 'poutine', dialect: 'long', sub: ['analyze_local'], positionals: ['.'], flags: { 'disable-version-check': 'bool', 'fail-on-violation': 'bool', quiet: 'bool' },
     required: { 'disable-version-check': 'true', 'fail-on-violation': 'true' },
     config: { flag: '--config', content: "# pipegen's pinned poutine config: no skipped rules\nskip: []\n" },
   },
   // gosec 2.29.0 (Go flags): never -no-fail; every #nosec suppression is reported in the SARIF (P27)
-  gosec: {
+  gosec: { method: GH, package: 'gosec_2.29.0_linux_amd64.tar.gz',
     exe: 'gosec', dialect: 'goflags', sub: [], positionals: ['./...'], flags: { fmt: { values: ['sarif'] }, out: 'output', 'track-suppressions': 'bool' },
     required: { fmt: 'sarif', out: null, 'track-suppressions': 'true' },
   },
   // Ruff 0.17.1 (never --exit-zero, --fix or a format without --check)
-  ruff: {
+  ruff: { method: GH, package: RUFF_ASSET,
     exe: 'ruff', dialect: 'long', sub: ['check'], flags: { 'no-cache': 'bool', 'output-format': { values: ['sarif'] }, 'output-file': 'output' },
     required: { 'no-cache': 'true', 'output-format': 'sarif', 'output-file': null },
     config: { flag: '--config', content: '[lint]\nextend-select = ["C901"]\n\n[lint.mccabe]\nmax-complexity = 15\n' },
   },
-  'ruff-format': {
+  'ruff-format': { method: GH, package: RUFF_ASSET,
     exe: 'ruff', dialect: 'long', sub: ['format'], flags: { check: 'bool', 'no-cache': 'bool' }, required: { check: 'true', 'no-cache': 'true' },
     config: { flag: '--config', content: "# pipegen's pinned ruff config: the default format\n" },
   },
   // mypy 2.4.0 (never --install-types: it installs unpinned stub packages)
-  mypy: { exe: 'mypy', dialect: 'long', sub: [], positionals: ['.'], flags: { 'no-incremental': 'bool' } },
+  mypy: { method: 'pip', package: 'mypy', exe: 'mypy', dialect: 'long', sub: [], positionals: ['.'], flags: { 'no-incremental': 'bool' } },
   // coverage.py 7.16.2: pytest under coverage, then the minimum (P24)
-  'coverage-py': {
+  'coverage-py': { method: 'pip', package: 'coverage',
     exe: 'coverage', dialect: 'long', sub: ['run'], positionals: ['pytest'], flags: { module: 'bool' }, required: { module: 'true' },
     then: [{ sub: ['report'], flags: { 'fail-under': { values: COVERAGE_MINIMUMS } }, required: { 'fail-under': null } }],
   },
-  creosote: { exe: 'creosote', dialect: 'long', sub: [], flags: {} },
-  vulture: { exe: 'vulture', dialect: 'long', sub: [], positionals: ['.'], flags: { 'min-confidence': { values: ['80'] } }, required: { 'min-confidence': '80' } },
+  creosote: { method: 'pip', package: 'creosote', exe: 'creosote', dialect: 'long', sub: [], flags: {} },
+  vulture: { method: 'pip', package: 'vulture', exe: 'vulture', dialect: 'long', sub: [], positionals: ['.'], flags: { 'min-confidence': { values: ['80'] } }, required: { 'min-confidence': '80' } },
   // Bandit 1.9.4 (never --exit-zero)
-  bandit: {
+  bandit: { method: 'pip', package: 'bandit',
     exe: 'bandit', dialect: 'long', sub: [], positionals: ['.'], flags: { recursive: 'bool', format: { values: ['sarif'] }, output: 'output' },
     required: { recursive: 'true', format: 'sarif', output: null },
   },
 } satisfies Record<string, ArgvPolicy>);
+
+// ---------- input allowlists for every action entry (Plan P Task 6 fix round 2, ruling P29) ----------
+
+/**
+ * One action input: its allowed values, and whether the template fixes it (in step.action.with and
+ * fixedInputs.with, the same value), the AI chooses it (choices), or either. `required`: it must be fixed.
+ */
+export interface InputSpec { readonly values: readonly string[]; readonly as: 'fixed' | 'choice' | 'either'; readonly required?: true }
+
+/**
+ * Ruling P29: every reviewed action's inputs, by its EXACT `owner/repo` (lowercased). An action whose repo has no
+ * policy fails to load (so a renamed or typo fork never gets the reviewed locks' benefit of the doubt); any input not
+ * listed is refused (default deny). Inputs the renderer fills per run (an artifact's name and path, a SARIF file, the
+ * subject of an attestation) are not template inputs and aren't listed.
+ */
+export const ACTION_POLICIES: Readonly<Record<string, Readonly<Record<string, InputSpec>>>> = Object.freeze({
+  'actions/checkout': {
+    'persist-credentials': { values: ['false'], as: 'fixed', required: true },
+    'allow-unsafe-pr-checkout': { values: ['false'], as: 'fixed', required: true },
+    'fetch-depth': { values: ['1', '0'], as: 'choice' },
+  },
+  'actions/setup-node': {
+    'package-manager-cache': { values: ['false'], as: 'fixed', required: true },
+    'node-version': { values: ['24', '26'], as: 'choice' },
+  },
+  'actions/setup-python': { 'python-version': { values: ['3.10', '3.11', '3.12', '3.13', '3.14'], as: 'choice' } },
+  // hidden files (.env and the like) are never uploaded; a missing file is an error. `path` is set by the renderer
+  // from the scanning entries' own output paths, never by the template
+  'actions/upload-artifact': {
+    'include-hidden-files': { values: ['false'], as: 'fixed' },
+    'if-no-files-found': { values: ['error'], as: 'fixed' },
+  },
+  'actions/download-artifact': {},
+  'docker/login-action': { logout: { values: ['true'], as: 'fixed', required: true }, registry: { values: ['ghcr.io', 'docker.io'], as: 'choice' } },
+  'docker/setup-buildx-action': { 'cache-binary': { values: ['false'], as: 'fixed', required: true } },
+  'docker/build-push-action': {
+    context: { values: ['.'], as: 'fixed', required: true }, 'github-token': { values: [''], as: 'fixed', required: true },
+    'no-cache': { values: ['true'], as: 'fixed', required: true }, push: { values: ['false', 'true'], as: 'choice' },
+  },
+  'github/codeql-action': {},
+  'actions/attest': {},
+  'bullfrogsec/bullfrog': {
+    'egress-policy': { values: ['block'], as: 'fixed', required: true },
+    'dns-policy': { values: ['allowed-domains-only'], as: 'fixed', required: true },
+    'enable-sudo': { values: ['false'], as: 'fixed', required: true },
+    'allowed-domains': { values: ['github-core', 'npm', 'pypi', 'dockerhub', 'ghcr'], as: 'choice' },
+    'allowed-ips': { values: ['172.16.0.0/12'], as: 'choice' },
+  },
+  // dependency review checks vulnerabilities (never off), blocks on low, moderate or high, never only warns, and never
+  // compares a ref pipegen didn't choose (base-ref/head-ref: an empty diff passes; T3)
+  'actions/dependency-review-action': {
+    'comment-summary-in-pr': { values: ['never'], as: 'fixed', required: true },
+    'vulnerability-check': { values: ['true'], as: 'fixed' },
+    'fail-on-severity': { values: ['low', 'moderate', 'high'], as: 'either' },
+    'warn-only': { values: ['false'], as: 'fixed' },
+  },
+  'ossf/scorecard-action': {
+    publish_results: { values: ['false'], as: 'fixed', required: true },
+    results_format: { values: ['sarif'], as: 'fixed' },
+    results_file: { values: ['scorecard.sarif'], as: 'fixed' },
+  },
+  // trusted publishing with attestations, to PyPI or TestPyPI only (P22)
+  'pypa/gh-action-pypi-publish': {
+    attestations: { values: ['true'], as: 'fixed', required: true },
+    'repository-url': { values: ['https://upload.pypi.org/legacy/', 'https://test.pypi.org/legacy/'], as: 'fixed' },
+    'packages-dir': { values: ['dist'], as: 'fixed' },
+    'skip-existing': { values: ['false', 'true'], as: 'fixed' },
+    'print-hash': { values: ['true', 'false'], as: 'fixed' },
+    verbose: { values: ['true', 'false'], as: 'fixed' },
+  },
+} satisfies Record<string, Record<string, InputSpec>>);
