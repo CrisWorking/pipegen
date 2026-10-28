@@ -82,7 +82,7 @@ export interface InstallSpec { method: 'npm' | 'pip' | 'github-release' | 'docke
 export interface StepSpec {
   needId: string; tool: Candidate;
   action?: { uses: string; with: Record<string, string> };
-  cli?: { install: InstallSpec; plugins?: InstallSpec[]; command: string[]; env?: Record<string, string> };   // plugins (Plan P Task 5): npm or pip packages installed next to the tool, each an exact version with its checksum; at most 4
+  cli?: { install: InstallSpec; plugins?: InstallSpec[]; command: string[]; then?: string[][]; env?: Record<string, string> };   // plugins (Plan P Task 5): npm or pip packages installed next to the tool, each an exact version with its checksum; at most 4. then (Task 6, P24): follow-up commands of the same tool; a `{choice}` word is the AI's choice
   output: { path: string; format: OutputFormat };
   workingDir?: string; needsServices?: DependencyKind[]; secrets?: string[];   // names only, never values
 }
@@ -150,6 +150,8 @@ export interface ReviewedTool {
   };
   choices: Record<string, string[]>;                       // the only inputs the AI may set, each limited to these enum values
   configFiles: string[];                                   // config/ignore files the tool auto-loads from a repo (e.g. '.gitleaks.toml', '.trivyignore'); added to the protected paths
+  configSections?: string[];                               // Plan P Task 6 (P23): '<file>:<section>' of shared files the tool reads (e.g. 'pyproject.toml:tool.mypy'); the v0.2 gate protects them
+  wrappedImage?: { ref: string; digest: string };          // Plan P Task 6 (P26): the image an action's action.yml runs, and the digest that ref resolved to when pinned
   reviewedBy: string; reviewedAt: string; proofs: number;  // proofs = passed Plan E runs; full runs need proofs >= 1
   verifiedWith?: VerifiedWith;                             // Plan P Task 5: the signature or attestation check made when pinning (required for MUST_VERIFY repos)
 }

@@ -23,7 +23,11 @@
 # MUST_VERIFY repos in src/engine/reviewed.ts); fixedInputs (set by the
 # template, the AI can never change them; config is pipegen's own pinned config, so repo config files are never
 # picked up silently); choices (the only inputs the AI may set, each limited to these values); configFiles (files
-# the tool would load from a repo by itself; added to the protected paths); proofs (passed Plan E runs).
+# the tool would load from a repo by itself; added to the protected paths); configSections (`<file>:<section>` of shared
+# files the tool reads, e.g. pyproject.toml:tool.mypy; ruling P23); wrappedImage (the image an action's action.yml runs,
+# with the digest it resolved to when pinned; ruling P26); step.cli.then (follow-up commands of the same tool; a
+# `{choice}` word is the AI's choice, ruling P24); proofs (passed Plan E runs). Every cli entry's argv, pinned config
+# and env must match its allowlist in src/engine/tool-flags.ts (ARGV_POLICIES, ruling P19): change both together.
 #
 # Not here, on purpose: KICS was never on this list (its action tags and images were hijacked; the loader refuses it,
 # Plan P Task 5). Dependabot (the update-config file) and npm trusted publishing are pipegen's own built-in steps,
@@ -471,7 +475,7 @@ tools:
         command: ["trivy", "config", "--disable-telemetry", "--skip-version-check", "--skip-check-update", "--format", "sarif", "--output", "trivy-config.sarif", "--exit-code", "1", "."]
       output: { path: "trivy-config.sarif", format: sarif }
     fixedInputs:
-      args: ["--disable-telemetry", "--skip-version-check", "--skip-check-update", "--format", "sarif"]
+      args: ["--disable-telemetry", "--skip-version-check", "--skip-check-update", "--format", "sarif", "--exit-code", "1"]
       config:
         content: "# pipegen's pinned trivy config: no cache kept between runs\ncache:\n  backend: memory\n"
         passAs: { flag: "--config" }
@@ -517,7 +521,7 @@ tools:
         command: ["trivy", "image", "--disable-telemetry", "--skip-version-check", "--skip-check-update", "--format", "sarif", "--output", "trivy-image.sarif", "--exit-code", "1"]
       output: { path: "trivy-image.sarif", format: sarif }
     fixedInputs:
-      args: ["--disable-telemetry", "--skip-version-check", "--skip-check-update", "--format", "sarif"]
+      args: ["--disable-telemetry", "--skip-version-check", "--skip-check-update", "--format", "sarif", "--exit-code", "1"]
       config:
         content: "# pipegen's pinned trivy config: no cache kept between runs\ncache:\n  backend: memory\n"
         passAs: { flag: "--config" }
@@ -541,7 +545,7 @@ tools:
   #   --certificate-identity https://github.com/betterleaks/betterleaks/.github/workflows/release.yml@refs/tags/v1.9.0
   #   --certificate-oidc-issuer https://token.actions.githubusercontent.com checksums.txt`: "Verified OK" (2026-10-28T00:00:14Z; the
   #   same check with @refs/tags/v1.8.0 fails). checksums.txt lists the pinned sha256 above.
-  # Runs unredacted in the job, like gitleaks; the gate scrubs. --ignore-gitleaks-allow: inline allow comments can't hide a secret.
+  # --redact (ruling P21): the secret never reaches the report or the CI log. --ignore-gitleaks-allow: inline allow comments can't hide a secret.
   # Only pipegen's pinned --config (never the repo's .betterleaks.toml or .gitleaks.toml); no validation flags (they send
   #   candidate secrets to provider APIs); --report-path is the SARIF file, never - (the findings would reach the CI log).
   - id: betterleaks
@@ -561,10 +565,10 @@ tools:
     step:
       cli:
         install: { method: github-release, package: "betterleaks_1.9.0_linux_x64.tar.gz", version: "v1.9.0" }
-        command: ["betterleaks", "git", "--no-banner", "--ignore-gitleaks-allow", "--report-format", "sarif", "--report-path", "betterleaks.sarif", "--exit-code", "1", "."]
+        command: ["betterleaks", "git", "--no-banner", "--ignore-gitleaks-allow", "--redact", "--report-format", "sarif", "--report-path", "betterleaks.sarif", "--exit-code", "1", "."]
       output: { path: "betterleaks.sarif", format: sarif }
     fixedInputs:
-      args: ["--ignore-gitleaks-allow", "--report-format", "sarif", "--report-path", "betterleaks.sarif", "--exit-code", "1"]
+      args: ["--ignore-gitleaks-allow", "--redact", "--report-format", "sarif", "--report-path", "betterleaks.sarif", "--exit-code", "1"]
       config:
         content: "[extend]\nuseDefault = true\n"
         passAs: { flag: "--config" }
@@ -580,7 +584,8 @@ tools:
       issuer: "https://token.actions.githubusercontent.com"
       verifiedOn: "2026-10-28"
 
-  # Secret scan, the fallback listed after betterleaks. Same release as data/pinned-binaries.yml (ruling S25). Runs unredacted in the job; the gate scrubs.
+  # Secret scan, the fallback listed after betterleaks. Same release as data/pinned-binaries.yml (ruling S25).
+  # The same locks as betterleaks (ruling P21): --redact, --report-path its own SARIF file only, --exit-code 1, the pinned --config, no verbose output.
   # Source: release v8.30.1 of gitleaks/gitleaks: gitleaks_8.30.1_linux_x64.tar.gz sha256 from the release checksums file. Released 2026-03-21T02:17:58Z.
   - id: gitleaks
     categories: ["secrets"]
@@ -599,10 +604,10 @@ tools:
     step:
       cli:
         install: { method: github-release, package: "gitleaks_8.30.1_linux_x64.tar.gz", version: "v8.30.1" }
-        command: ["gitleaks", "git", "--no-banner", "--ignore-gitleaks-allow", "--report-format", "sarif", "--report-path", "gitleaks.sarif", "."]
+        command: ["gitleaks", "git", "--no-banner", "--ignore-gitleaks-allow", "--redact", "--report-format", "sarif", "--report-path", "gitleaks.sarif", "--exit-code", "1", "."]
       output: { path: "gitleaks.sarif", format: sarif }
     fixedInputs:
-      args: ["--ignore-gitleaks-allow", "--report-format", "sarif", "--report-path", "gitleaks.sarif"]
+      args: ["--ignore-gitleaks-allow", "--redact", "--report-format", "sarif", "--report-path", "gitleaks.sarif", "--exit-code", "1"]
       config:
         content: "[extend]\nuseDefault = true\n"
         passAs: { flag: "--config" }
@@ -677,7 +682,7 @@ tools:
         command: ["osv-scanner", "scan", "source", "--recursive", "--format", "sarif", "--output", "osv.sarif", "."]
       output: { path: "osv.sarif", format: sarif }
     fixedInputs:
-      args: ["--format", "sarif"]
+      args: ["--format", "sarif", "--output", "osv.sarif"]
       config:
         content: "# pipegen's pinned osv-scanner config: no ignored vulnerabilities\n"
         passAs: { flag: "--config" }
@@ -708,7 +713,8 @@ tools:
         install: { method: github-release, package: "lefthook_2.2.2_Linux_x86_64", version: "v2.2.2" }
         command: ["lefthook", "run", "pre-commit", "--all-files"]
       output: { path: "", format: none }
-    fixedInputs: {}
+    fixedInputs:
+      args: ["--all-files"]
     choices: {}
     configFiles: ["lefthook.yml", "lefthook.yaml", ".lefthook.yml", ".lefthook.yaml", "lefthook-local.yml", "lefthook-local.yaml", ".lefthook-local.yml", ".lefthook-local.yaml", ".lefthook/**", ".lefthook-local/**"]
     reviewedBy: PENDING
@@ -737,6 +743,7 @@ tools:
         command: ["syft", "scan", "--output", "spdx-json=sbom.spdx.json"]
       output: { path: "", format: none }
     fixedInputs:
+      args: ["--output", "spdx-json=sbom.spdx.json"]
       config:
         content: "check-for-app-update: false\n"
         passAs: { flag: "--config" }
@@ -877,7 +884,7 @@ tools:
         content: "{\n  \"linter\": {\n    \"rules\": {\n      \"complexity\": {\n        \"noExcessiveCognitiveComplexity\": { \"level\": \"error\", \"options\": { \"maxAllowedComplexity\": 15 } }\n      }\n    }\n  }\n}\n"
         passAs: { flag: "--config-path" }
     choices: {}
-    configFiles: ["biome.json", "biome.jsonc", ".biome.json", ".biome.jsonc"]
+    configFiles: ["biome.json", "biome.jsonc", ".biome.json", ".biome.jsonc", "**/biome.json", "**/biome.jsonc", ".editorconfig"]
     reviewedBy: PENDING
     reviewedAt: PENDING
     proofs: 0
@@ -885,6 +892,8 @@ tools:
   # ESLint for JavaScript repos whose framework needs ESLint plugins (catalogue §2). Flat config only.
   # Source: npm eslint@10.13.0 dist.integrity (the downloaded tarball hashes to it), published 2026-10-16T14:24:10.765Z; npm provenance: no.
   # pipegen's pinned flat config sets complexity 15; never eslint-config-prettier or eslint-plugin-prettier (CVE-2025-54313).
+  # It lints .jsx and the framework files too (ruling P25): without their ESLint parser (not pinned here; owner review), a
+  #   .vue/.svelte/.astro file fails with a parsing error, so the row is never a false pass.
   - id: eslint
     categories: ["lint"]
     languages: ["node"]
@@ -907,7 +916,7 @@ tools:
     fixedInputs:
       args: ["--max-warnings", "0"]
       config:
-        content: "export default [{ rules: { complexity: ['error', 15] } }];\n"
+        content: "export default [{ files: ['**/*.{js,mjs,cjs,jsx,vue,svelte,astro}'], languageOptions: { parserOptions: { ecmaFeatures: { jsx: true } } }, rules: { complexity: ['error', 15] } }];\n"
         passAs: { flag: "--config" }
     choices: {}
     configFiles: ["eslint.config.js", "eslint.config.mjs", "eslint.config.cjs", "eslint.config.ts", "eslint.config.mts", "eslint.config.cts"]
@@ -942,7 +951,7 @@ tools:
     fixedInputs:
       args: ["--max-warnings", "0"]
       config:
-        content: "import tseslint from 'typescript-eslint';\nexport default [...tseslint.configs.recommended, { rules: { complexity: ['error', 15] } }];\n"
+        content: "import tseslint from 'typescript-eslint';\nexport default [...tseslint.configs.recommended, { files: ['**/*.{js,mjs,cjs,jsx,ts,mts,cts,tsx,vue,svelte,astro}'], rules: { complexity: ['error', 15] } }];\n"
         passAs: { flag: "--config" }
     choices: {}
     configFiles: ["eslint.config.js", "eslint.config.mjs", "eslint.config.cjs", "eslint.config.ts", "eslint.config.mts", "eslint.config.cts"]
@@ -985,7 +994,7 @@ tools:
         content: "{ \"categories\": { \"correctness\": \"error\" } }\n"
         passAs: { flag: "--config" }
     choices: {}
-    configFiles: [".oxlintrc.json", "oxlint.config.ts"]
+    configFiles: [".oxlintrc.json", "oxlint.config.ts", "**/.oxlintrc.json", ".eslintignore", ".gitignore"]
     reviewedBy: PENDING
     reviewedAt: PENDING
     proofs: 0
@@ -1014,12 +1023,14 @@ tools:
     fixedInputs:
       args: ["--check"]
     choices: {}
-    configFiles: [".prettierrc", ".prettierrc.*", "prettier.config.*", ".prettierignore"]
+    configFiles: [".prettierrc", ".prettierrc.*", "prettier.config.*", ".prettierignore", "**/.prettierrc", "**/.prettierrc.*", ".editorconfig", ".gitignore"]
+    configSections: ["package.json:prettier"]
     reviewedBy: PENDING
     reviewedAt: PENDING
     proofs: 0
 
-  # Vitest coverage (v8), when Vitest is the test runner. The minimum goes into the repo's Vitest config (Plan D, D7).
+  # Vitest coverage (v8), when Vitest is the test runner. The minimum of lines is a fixed flag whose value the AI chooses
+  #   (ruling P24: {coverage-lines} is that choice; never 0), so a repo config without thresholds can't pass everything.
   # Source: npm vitest@5.0.5 dist.integrity (tarball hashes to it), published 2026-10-15T14:29:01.396Z; npm provenance: yes.
   # Plugin: @vitest/coverage-v8@5.0.5 (peers on vitest 5.0.5 exactly; G5 closed by PS30), published 2026-10-15T14:27:49.006Z; npm provenance: yes.
   - id: vitest-coverage
@@ -1041,12 +1052,13 @@ tools:
         install: { method: npm, package: "vitest", version: "5.0.5" }
         plugins:
           - { method: npm, package: "@vitest/coverage-v8", version: "5.0.5", checksum: "sha512-4KpkGdIrSqBihx/JyP/e+S+IKB98etg1XDQiLAxksLfcShnwi1VReGeOT9NI43hLHbknosKp/1CCLn9Zgcs8mg==" }
-        command: ["vitest", "run", "--coverage"]
+        command: ["vitest", "run", "--coverage", "--coverage.thresholds.lines={coverage-lines}"]
       output: { path: "", format: none }
     fixedInputs:
-      args: ["--coverage"]
-    choices: {}
-    configFiles: ["vitest.config.*", "vite.config.*", "vitest.workspace.*"]
+      args: ["--coverage", "--coverage.thresholds.lines={coverage-lines}"]
+    choices:
+      coverage-lines: ["60", "70", "80", "90"]
+    configFiles: ["vitest.config.*", "vite.config.*", "vitest.workspace.*", "**/vitest.config.*"]
     reviewedBy: PENDING
     reviewedAt: PENDING
     proofs: 0
@@ -1075,7 +1087,8 @@ tools:
     fixedInputs:
       args: ["--check-coverage"]
     choices: {}
-    configFiles: [".c8rc", ".c8rc.json", ".nycrc", ".nycrc.json"]
+    configFiles: [".c8rc", ".c8rc.*", ".nycrc", ".nycrc.*"]
+    configSections: ["package.json:c8"]
     reviewedBy: PENDING
     reviewedAt: PENDING
     proofs: 0
@@ -1103,7 +1116,8 @@ tools:
       output: { path: "", format: none }
     fixedInputs: {}
     choices: {}
-    configFiles: ["knip.json", "knip.jsonc", ".knip.json", ".knip.jsonc", "knip.config.*"]
+    configFiles: ["knip.json", "knip.jsonc", ".knip.json", ".knip.jsonc", "knip.config.*", "knip.ts", "knip.js"]
+    configSections: ["package.json:knip"]
     reviewedBy: PENDING
     reviewedAt: PENDING
     proofs: 0
@@ -1118,7 +1132,7 @@ tools:
   - id: jscpd
     categories: ["duplication"]
     languages: ["any"]
-    releasedAt: "2026-10-20T16:14:54Z"
+    releasedAt: "2026-10-20T16:15:27Z"  # the later of the release and its assets (review M5)
     candidate:
       id: jscpd
       name: "kucherenko/jscpd"
@@ -1141,6 +1155,7 @@ tools:
         passAs: { flag: "--config" }
     choices: {}
     configFiles: [".jscpd.json"]
+    configSections: ["package.json:jscpd"]
     reviewedBy: PENDING
     reviewedAt: PENDING
     proofs: 0
@@ -1247,7 +1262,7 @@ tools:
         command: ["hadolint", "--no-color", "--failure-threshold", "warning", "--format", "sarif", "--output", "hadolint.sarif"]
       output: { path: "hadolint.sarif", format: sarif }
     fixedInputs:
-      args: ["--failure-threshold", "warning", "--format", "sarif"]
+      args: ["--failure-threshold", "warning", "--format", "sarif", "--output", "hadolint.sarif"]
       config:
         content: "# pipegen's pinned hadolint config: every rule at its default level, nothing ignored\nignored: []\n"
         passAs: { flag: "--config" }
@@ -1258,6 +1273,8 @@ tools:
     proofs: 0
 
   # kube-linter: lints Kubernetes manifests and Helm charts, next to Trivy config. pipegen's pinned config (the default checks).
+  # --fail-if-no-objects-found and --fail-on-invalid-resource (ruling P25; the second is a hidden flag of v0.8.3, accepted
+  #   by the pinned binary): a chart that doesn't render, a wrong path or YAML it can't parse fails instead of passing empty.
   # Source: release v0.8.3 of stackrox/kube-linter: the raw binary kube-linter-linux. checksumSource: computed (ruling PS31):
   #   the release has no checksums file; pipegen downloaded the binary and hashed it, and the hash equals GitHub's asset digest.
   #   Released 2026-03-10T13:17:40Z. The release is not immutable.
@@ -1281,10 +1298,10 @@ tools:
     step:
       cli:
         install: { method: github-release, package: "kube-linter-linux", version: "v0.8.3" }
-        command: ["kube-linter", "lint", "--format", "sarif", "--output", "kube-linter.sarif"]
+        command: ["kube-linter", "lint", "--fail-if-no-objects-found", "--fail-on-invalid-resource", "--format", "sarif", "--output", "kube-linter.sarif"]
       output: { path: "kube-linter.sarif", format: sarif }
     fixedInputs:
-      args: ["--format", "sarif"]
+      args: ["--fail-if-no-objects-found", "--fail-on-invalid-resource", "--format", "sarif", "--output", "kube-linter.sarif"]
       config:
         content: "# pipegen's pinned kube-linter config: the default checks\nchecks:\n  doNotAutoAddDefaults: false\n"
         passAs: { flag: "--config" }
@@ -1321,7 +1338,7 @@ tools:
         command: ["schemathesis", "run", "--max-examples", "25", "--report", "junit", "--report-junit-path", "schemathesis.xml"]
       output: { path: "schemathesis.xml", format: junit }
     fixedInputs:
-      args: ["--max-examples", "25"]
+      args: ["--max-examples", "25", "--report", "junit", "--report-junit-path", "schemathesis.xml"]
     choices: {}
     configFiles: ["schemathesis.toml"]
     reviewedBy: PENDING
@@ -1338,7 +1355,7 @@ tools:
   - id: nuclei
     categories: ["dast"]
     languages: ["any"]
-    releasedAt: "2026-08-08T12:21:32Z"
+    releasedAt: "2026-08-08T12:51:42Z"  # the later of the release and its assets (review M5)
     candidate:
       id: nuclei
       name: "projectdiscovery/nuclei"
@@ -1370,7 +1387,10 @@ tools:
 
   # OpenSSF Scorecard, weekly; reported, never gated. Results are never published (publish_results false; catalogue §3 SD5).
   # Source: git ref refs/tags/v2.5.0 of ossf/scorecard-action (GitHub API; annotated tag 46dc3187a971a9febf3aeb7f94ccde489f7bb46a dereferenced), release published_at. Released 2026-10-12T02:54:09Z.
-  # Note for the reviewer: its action.yaml at this commit runs docker://ghcr.io/ossf/scorecard-action:v2.5.0 (an image by tag).
+  # Note for the reviewer (ruling P26, an accepted residual for v0.1): its action.yaml at this commit (line 61) runs
+  #   docker://ghcr.io/ossf/scorecard-action:v2.5.0, an image BY TAG, so whoever controls that tag controls what runs.
+  #   wrappedImage records it and the digest it resolved to on 2026-10-28T00:26Z (GHCR, anonymous read; a single-platform
+  #   docker manifest v2). v0.2 (Plan C) runs it as a digest-pinned docker step instead.
   - id: scorecard-action
     categories: ["scorecard"]
     languages: ["any"]
@@ -1400,6 +1420,9 @@ tools:
         results_file: "scorecard.sarif"
     choices: {}
     configFiles: []
+    wrappedImage:
+      ref: "ghcr.io/ossf/scorecard-action:v2.5.0"
+      digest: "sha256:1e1481c65fc2407d3fd6ab18a23c741eb4d1c0d9359ebafc4b3ab13aa61d8627"
     reviewedBy: PENDING
     reviewedAt: PENDING
     proofs: 0
@@ -1466,12 +1489,13 @@ tools:
         content: "# pipegen's pinned poutine config: no skipped rules\nskip: []\n"
         passAs: { flag: "--config" }
     choices: {}
-    configFiles: [".poutine.yml", ".github/poutine.yml"]
+    configFiles: [".poutine.yml", ".poutine.yaml", ".github/poutine.yml", ".github/poutine.yaml"]
     reviewedBy: PENDING
     reviewedAt: PENDING
     proofs: 0
 
-  # gosec: Go security checks (SARIF). No AI flags (-ai-*) and no config from the repo.
+  # gosec: Go security checks (SARIF). No AI flags (-ai-*) and no config from the repo. #nosec comments stay allowed (they
+  #   show in the diff), and -track-suppressions lists each one in the SARIF (ruling P27).
   # Source: release v2.29.0 of securego/gosec: gosec_2.29.0_linux_amd64.tar.gz sha256 from the release checksums file (also GitHub's asset digest and the sha256 of the downloaded archive). Released 2026-08-26T08:34:58Z. Immutable release.
   # Signature (key-based, ruling P10): pipegen's pinned cosign 3.1.3 ran `cosign verify-blob --key cosign.pub --bundle
   #   gosec_2.29.0_linux_amd64.tar.gz.sigstore.json gosec_2.29.0_linux_amd64.tar.gz` and the same for
@@ -1493,10 +1517,10 @@ tools:
     step:
       cli:
         install: { method: github-release, package: "gosec_2.29.0_linux_amd64.tar.gz", version: "v2.29.0" }
-        command: ["gosec", "-fmt", "sarif", "-out", "gosec.sarif", "./..."]
+        command: ["gosec", "-fmt", "sarif", "-out", "gosec.sarif", "-track-suppressions", "./..."]
       output: { path: "gosec.sarif", format: sarif }
     fixedInputs:
-      args: ["-fmt", "sarif", "-out", "gosec.sarif"]
+      args: ["-fmt", "sarif", "-out", "gosec.sarif", "-track-suppressions"]
     choices: {}
     configFiles: []
     reviewedBy: PENDING
@@ -1509,7 +1533,8 @@ tools:
       verifiedOn: "2026-10-28"
 
   # Ruff lint for Python (C901 complexity at 15), with pipegen's pinned ruff.toml (--config with a file: the repo's ruff
-  #   settings are not read; pyproject.toml is left out of configFiles for that reason). No cache (spec §19).
+  #   settings are not read; the pyproject.toml section is still listed, ruling P23). No cache (spec §19). Ruff skips
+  #   files in .gitignore/.ignore, so those are protected too.
   # Source: release 0.17.1 of astral-sh/ruff (the tag has no v): ruff-x86_64-unknown-linux-gnu.tar.gz sha256 from sha256.sum
   #   (and the asset's own .sha256; also GitHub's asset digest and the sha256 of the downloaded archive). Released 2026-10-15T15:24:28Z. Immutable release.
   - id: ruff
@@ -1532,12 +1557,13 @@ tools:
         command: ["ruff", "check", "--no-cache", "--output-format", "sarif", "--output-file", "ruff.sarif"]
       output: { path: "ruff.sarif", format: sarif }
     fixedInputs:
-      args: ["--no-cache", "--output-format", "sarif"]
+      args: ["--no-cache", "--output-format", "sarif", "--output-file", "ruff.sarif"]
       config:
         content: "[lint]\nextend-select = [\"C901\"]\n\n[lint.mccabe]\nmax-complexity = 15\n"
         passAs: { flag: "--config" }
     choices: {}
-    configFiles: ["ruff.toml", ".ruff.toml"]
+    configFiles: ["ruff.toml", ".ruff.toml", ".gitignore", ".ignore"]
+    configSections: ["pyproject.toml:tool.ruff"]
     reviewedBy: PENDING
     reviewedAt: PENDING
     proofs: 0
@@ -1568,7 +1594,8 @@ tools:
         content: "# pipegen's pinned ruff config: the default format\n"
         passAs: { flag: "--config" }
     choices: {}
-    configFiles: ["ruff.toml", ".ruff.toml"]
+    configFiles: ["ruff.toml", ".ruff.toml", ".gitignore", ".ignore"]
+    configSections: ["pyproject.toml:tool.ruff"]
     reviewedBy: PENDING
     reviewedAt: PENDING
     proofs: 0
@@ -1598,12 +1625,13 @@ tools:
       args: ["--no-incremental"]
     choices: {}
     configFiles: ["mypy.ini", ".mypy.ini"]
+    configSections: ["pyproject.toml:tool.mypy", "setup.cfg:mypy", "setup.cfg:mypy-*"]
     reviewedBy: PENDING
     reviewedAt: PENDING
     proofs: 0
 
-  # coverage.py: runs pytest (or unittest) under coverage. The minimum is `fail_under` in the repo's coverage config
-  #   (Plan D, D7), checked by `coverage report` in the same job (the renderer adds that second command).
+  # coverage.py: runs pytest under coverage, then `coverage report --fail-under=<minimum>` (ruling P24: step.cli.then;
+  #   {fail-under} is the AI's choice, never 0; 60 first, the catalogue's minimum for repos with few tests, D7).
   # Source: PyPI coverage 7.16.2, the py3-none-any wheel's sha256 (no C tracer: slower, same results; the downloaded wheel hashes to it), uploaded 2026-09-27T12:28:59.075376Z; PyPI provenance: yes.
   - id: coverage-py
     categories: ["coverage"]
@@ -1622,11 +1650,16 @@ tools:
     step:
       cli:
         install: { method: pip, package: "coverage", version: "7.16.2" }
-        command: ["coverage", "run", "-m", "pytest"]
+        command: ["coverage", "run", "--module", "pytest"]
+        then:
+          - ["coverage", "report", "--fail-under={fail-under}"]
       output: { path: "", format: none }
-    fixedInputs: {}
-    choices: {}
+    fixedInputs:
+      args: ["--module"]
+    choices:
+      fail-under: ["60", "70", "80", "90"]
     configFiles: [".coveragerc"]
+    configSections: ["pyproject.toml:tool.coverage", "setup.cfg:coverage:*", "tox.ini:coverage:*"]
     reviewedBy: PENDING
     reviewedAt: PENDING
     proofs: 0
@@ -1655,6 +1688,7 @@ tools:
     fixedInputs: {}
     choices: {}
     configFiles: []
+    configSections: ["pyproject.toml:tool.creosote"]
     reviewedBy: PENDING
     reviewedAt: PENDING
     proofs: 0
@@ -1684,6 +1718,7 @@ tools:
       args: ["--min-confidence", "80"]
     choices: {}
     configFiles: []
+    configSections: ["pyproject.toml:tool.vulture"]
     reviewedBy: PENDING
     reviewedAt: PENDING
     proofs: 0
@@ -1712,12 +1747,13 @@ tools:
         plugins:
           - { method: pip, package: "sarif-om", version: "1.0.4", checksum: "539ef47a662329b1c8502388ad92457425e95dc0aaaf995fe46f4984c4771911" }
           - { method: pip, package: "jschema-to-python", version: "1.2.3", checksum: "8a703ca7604d42d74b2815eecf99a33359a8dccbb80806cce386d5e2dd992b05" }
-        command: ["bandit", "-r", "-f", "sarif", "-o", "bandit.sarif", "."]
+        command: ["bandit", "--recursive", "--format", "sarif", "--output", "bandit.sarif", "."]
       output: { path: "bandit.sarif", format: sarif }
     fixedInputs:
-      args: ["-f", "sarif"]
+      args: ["--recursive", "--format", "sarif", "--output", "bandit.sarif"]
     choices: {}
     configFiles: [".bandit"]
+    configSections: ["pyproject.toml:tool.bandit"]
     reviewedBy: PENDING
     reviewedAt: PENDING
     proofs: 0

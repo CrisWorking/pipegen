@@ -21,6 +21,11 @@
 //   eslint-config-prettier / eslint-plugin-prettier. Plugins (npm or pip, exact and hashed, at most 4). Task 6:
 //   betterleaks reports only to its output file with a fixed exit code; pypi-publish with attestations and never a
 //   password; hadolint off MUST_VERIFY (ruling P16).
+// - Task 6 fix round 1: every cli entry's argv is checked against its allowlist (tool-flags.ts ARGV_POLICIES, by entry
+//   id; default deny, P19): its own executable, only reviewed flags and values, the flags that keep failing on (P20),
+//   pipegen's exact pinned config, no env, the policy's follow-up commands (P24). Trivy's --exit-code is exactly 1 and
+//   every severity includes CRITICAL (P20); gitleaks has the betterleaks locks (P21); action locks go by the action's
+//   name under any owner, one spelling per input, and pypi-publish only to PyPI or TestPyPI (P22).
 import { readFileSync } from 'node:fs';
 import { parse } from 'yaml';
 import { z } from 'zod';
@@ -36,8 +41,10 @@ import { fetchAllowed, HttpError } from './http.js';
 import { COOLDOWN_DAYS } from './pin.js';
 import { isRealDate, isReleaseBuild, listPending, PENDING, REVIEWER_RE, reviewMarkerProblems } from './review-marker.js';
 import { lastValue, parseArgv, type ParsedArgv } from './argv.js';
-import { BETTERLEAKS_FORBIDDEN_FLAGS, BETTERLEAKS_FORBIDDEN_SUBCOMMANDS, BETTERLEAKS_SUBCOMMANDS } from './tool-flags.js';
-import { BETTERLEAKS_GRAMMAR, NUCLEI_GRAMMAR, TRIVY_GRAMMAR } from './tool-grammar.js';
+import {
+  ARGV_POLICIES, BETTERLEAKS_FORBIDDEN_FLAGS, BETTERLEAKS_FORBIDDEN_SUBCOMMANDS, BETTERLEAKS_SUBCOMMANDS, type ArgvPolicy, type CommandPolicy, type FlagSpec,
+} from './tool-flags.js';
+import { BETTERLEAKS_GRAMMAR, NUCLEI_GRAMMAR, TRIVY_GRAMMAR, type FlagGrammar } from './tool-grammar.js';
 
 /** A built-in step that runs the project's own script. Not a reviewed third-party entry, so it has no pin. */
 export interface ProjectScriptStep { kind: 'project-script'; needId: string; service: string; script: 'test' | 'lint'; workingDir?: string }
@@ -85,6 +92,8 @@ const FLAG_RE = /^-{1,2}[A-Za-z][A-Za-z0-9-]{0,63}$/;
 const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
 const DAY_MS = 86_400_000;
 const ISO_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?Z$/;
+/** `<file>:<section>`: a repo-relative file (or glob) and the section of it a tool reads. */
+const CONFIG_SECTION_RE = /^(?!\/)(?!.*(?:^|\/)\.\.(?:\/|:))[A-Za-z0-9._*/-]{1,120}:[A-Za-z0-9._*:-]{1,79}$/;
 /** A repo-relative path or glob: no absolute path, no `..`, no backslash. */
 const REL_GLOB_RE = /^(?!\/)(?!.*(?:^|\/)\.\.(?:\/|$))[A-Za-z0-9._*/-]{1,200}$/;
 /** The Semgrep rules archive (ruling S22): a GitHub archive at a 40-character commit SHA. */
@@ -242,6 +251,8 @@ const stepSchema = z.strictObject({
     install: installSchema,
     plugins: z.array(installSchema).max(16).optional(),
     command: z.array(z.string().min(1).pipe(safeValue)).max(64),
+    /** Follow-up commands of the same tool, in order (ruling P24: coverage.py's `coverage report --fail-under=…`). */
+    then: z.array(z.array(z.string().min(1).pipe(safeValue)).min(1).max(64)).max(4).optional(),
     env: z.record(z.string().regex(ENV_RE), safeValue).optional(),
   }).optional(),
   output: z.strictObject({ path: z.union([z.literal(''), z.string().regex(REL_GLOB_RE)]), format: z.enum(['sarif', 'junit', 'zap-json', 'none']) }),
@@ -285,6 +296,16 @@ const entrySchema = z.strictObject({
   fixedInputs: fixedSchema,
   choices: z.record(z.string().regex(INPUT_RE), z.array(z.string().min(1).max(100).pipe(safeValue)).min(1).max(32)),
   configFiles: z.array(z.string().regex(REL_GLOB_RE)).max(32),
+  /**
+   * Sections of shared files the tool reads (ruling P23): `<file>:<section>`, e.g. `pyproject.toml:tool.mypy`,
+   * `setup.cfg:coverage:*`, `package.json:c8`. The v0.2 gate protects these sections without protecting the whole file.
+   */
+  configSections: z.array(z.string().max(200).regex(CONFIG_SECTION_RE, 'a config section is <file>:<section> (e.g. pyproject.toml:tool.mypy)')).max(32).optional(),
+  /**
+   * The container image an action's own action.yml runs (ruling P26), with the digest that ref resolved to when it
+   * was pinned: an action pinned by SHA that runs an image by tag still runs whatever that tag points to.
+   */
+  wrappedImage: z.strictObject({ ref: z.string().max(300).pipe(safeValue), digest: z.string().regex(DIGEST_RE, 'wrappedImage.digest is the sha256 digest the image ref resolved to when pinned') }).optional(),
   reviewedBy: z.string().max(100).pipe(safeValue).refine((s) => REVIEWER_RE.test(s) && s.trim().length >= 2, 'reviewedBy must be PENDING or a printable name (letters, digits, spaces, . \' -; 2 to 80 characters)'),
   reviewedAt: z.string(),
   proofs: z.number().int().nonnegative(),
@@ -318,6 +339,8 @@ const fileSchema = z.strictObject({
 });
 
 type Entry = z.infer<typeof entrySchema>;
+/** One checked entry of the reviewed list, as the loader reads it. */
+export type ReviewedEntry = Entry;
 type Install = z.infer<typeof installSchema>;
 
 const unique = (xs: readonly string[]) => new Set(xs).size === xs.length;
@@ -483,31 +506,88 @@ function entryProblems(e: Entry): { message: string; path: (string | number)[] }
   if (runsTool(e, 'kucherenko/jscpd', 'jscpd')) out.push(...jscpdProblems(e));
   if (runsTool(e, 'betterleaks/betterleaks', 'betterleaks')) out.push(...betterleaksProblems(e));
   if (runsTool(e, 'projectdiscovery/nuclei', 'nuclei')) out.push(...nucleiProblems(e));
-  // catalogue §3 SD5 / MG1: no results upload from Scorecard, no PR comments (a write) from dependency-review
-  const want = FIXED_ACTION_INPUTS[repo];
-  for (const [k, v] of Object.entries(want ?? {})) {
-    if (fx.with?.[k] !== v) bad(`the ${c.repo} entry must fix ${k}: "${v}"`, 'fixedInputs', 'with', k);
+  // catalogue §3 SD5 / MG1: no results upload from Scorecard, no PR comments (a write) from dependency-review. The
+  // locks go by the action's name under any owner, and its sub-path's repo (ruling P22: a fork is the same action)
+  const inputKeys = [...Object.keys(stepWith), ...Object.keys(fx.with ?? {}), ...Object.keys(e.choices)];
+  if (action !== undefined) {
+    // action inputs are case-insensitive: two spellings of one input are refused for every action (P22)
+    const seen = new Map<string, string>();
+    for (const k of inputKeys) {
+      const prev = seen.get(lower(k));
+      if (prev !== undefined && prev !== k) bad(`the ${c.repo} entry sets the input ${lower(k)} twice in different letter case (${prev}, ${k}): action inputs are case-insensitive`, 'step', 'action', 'with', k);
+      seen.set(lower(k), prev ?? k);
+    }
   }
-  for (const [k, why] of Object.entries(FORBIDDEN_ACTION_INPUTS[repo] ?? {})) {
-    if ([...Object.keys(stepWith), ...Object.keys(fx.with ?? {}), ...Object.keys(e.choices)].some((x) => lower(x) === k)) bad(`the ${c.repo} entry may not set ${k}: ${why}`, 'step', 'action', 'with', k);
+  for (const family of actionFamilies(e)) {
+    for (const [k, v] of Object.entries(FIXED_ACTION_INPUTS[family] ?? {})) {
+      if (fx.with?.[k] !== v) bad(`the ${c.repo} entry must fix ${k}: "${v}"`, 'fixedInputs', 'with', k);
+    }
+    for (const [k, why] of Object.entries(FORBIDDEN_ACTION_INPUTS[family] ?? {})) {
+      if (inputKeys.some((x) => lower(x) === k)) bad(`the ${c.repo} entry may not set ${k}: ${why}`, 'step', 'action', 'with', k);
+    }
+    const allowed = ALLOWED_ACTION_INPUTS[family];
+    if (allowed !== undefined) {
+      for (const k of inputKeys) if (!allowed.includes(lower(k))) bad(`the ${c.repo} entry may set only ${allowed.join(', ')} (ruling P22), not ${k}`, 'step', 'action', 'with', k);
+    }
+    // P20: dependency review's warn-only turns it into a warning that never fails: only ever fixed "false"
+    if (family === 'dependency-review-action') {
+      for (const k of inputKeys.filter((x) => lower(x) === 'warn-only')) {
+        if (fx.with?.[k] !== 'false' || stepWith[k] !== 'false' || Object.hasOwn(e.choices, k)) bad(`dependency-review's ${k} is only ever fixed "false": "true" makes the check a warning that never fails (ruling P20)`, 'fixedInputs', 'with', k);
+      }
+    }
+    // P22: trusted publishing to PyPI or TestPyPI only, fixed by the template (another host gets the job's OIDC token)
+    if (family === 'gh-action-pypi-publish') {
+      const url = Object.entries({ ...stepWith, ...(fx.with ?? {}) }).filter(([k]) => lower(k) === 'repository-url' || lower(k) === 'repository_url');
+      if (Object.keys(e.choices).some((k) => lower(k) === 'repository-url' || lower(k) === 'repository_url')) bad('the AI may not choose pypi-publish\'s repository-url: another host would get the job\'s OIDC token (ruling P22)', 'choices');
+      for (const [k, v] of url) {
+        if (!PYPI_UPLOAD_URLS.includes(v) || fx.with?.[k] !== v || stepWith[k] !== v) bad(`pypi-publish's ${k} is fixed to ${PYPI_UPLOAD_URLS.join(' or ')} or not set: another host would get the job's OIDC token and could publish as you (ruling P22)`, 'fixedInputs', 'with', k);
+      }
+    }
+  }
+  if (e.wrappedImage !== undefined) {
+    if (c.kind !== 'action') bad('wrappedImage is for actions (the image their action.yml runs)', 'wrappedImage');
+    const hit = neverImage(e.wrappedImage.ref) ?? neverListed(e.wrappedImage.ref);
+    if (hit !== null) bad(`pipegen never adds ${hit.ref} (${hit.key}): ${hit.reason}`, 'wrappedImage');
   }
   return out;
 }
+
+/** The lock-table names an action entry answers to: its repo's name and its uses: repo's name, under any owner, and their `name-…` look-alikes. */
+function actionFamilies(e: Entry): string[] {
+  const names = [lower(e.candidate.repo).split('/')[1] ?? ''];
+  const uses = e.step.action?.uses;
+  if (uses !== undefined) names.push(lower(uses.split('@')[0] ?? '').split('/')[1] ?? '');
+  const tables = new Set([...Object.keys(FIXED_ACTION_INPUTS), ...Object.keys(FORBIDDEN_ACTION_INPUTS), ...Object.keys(ALLOWED_ACTION_INPUTS)]);
+  return [...tables].filter((t) => names.some((n) => n === t || n.startsWith(`${t}-`)));
+}
+
+/** The upload URLs pypi-publish may be pointed at (P22). */
+const PYPI_UPLOAD_URLS: readonly string[] = ['https://upload.pypi.org/legacy/', 'https://test.pypi.org/legacy/'];
 
 type Problem = { message: string; path: (string | number)[] };
 
 /** Action inputs some entries must fix (catalogue §3 SD5, MG1), by lowercased repo. */
 const FIXED_ACTION_INPUTS: Readonly<Record<string, Readonly<Record<string, string>>>> = {
-  'ossf/scorecard-action': { publish_results: 'false' },
-  'actions/dependency-review-action': { 'comment-summary-in-pr': 'never' },
+  'scorecard-action': { publish_results: 'false' },
+  'dependency-review-action': { 'comment-summary-in-pr': 'never' },
   // PyPI trusted publishing with attestations (Plan P Task 6)
-  'pypa/gh-action-pypi-publish': { attestations: 'true' },
+  'gh-action-pypi-publish': { attestations: 'true' },
 };
 
-/** Action inputs an entry may never set or offer as a choice, by lowercased repo → why. */
+/** The only inputs some actions may set or offer (P22), by action name. */
+const ALLOWED_ACTION_INPUTS: Readonly<Record<string, readonly string[]>> = {
+  'gh-action-pypi-publish': ['attestations', 'repository-url', 'packages-dir', 'skip-existing', 'print-hash', 'verbose'],
+};
+
+/** Action inputs an entry may never set or offer as a choice, by action name (any owner, P22) → why. */
 const FORBIDDEN_ACTION_INPUTS: Readonly<Record<string, Readonly<Record<string, string>>>> = {
+  // P20: dependency review never only warns, and never reads a config from another repo or ref
+  'dependency-review-action': {
+    'config-file': 'a config file (possibly in another repo, at a branch) can turn the check off',
+    'allow-ghsas': 'it lets named advisories through',
+  },
   // a password (or user) means a long-lived PyPI token; pipegen publishes with trusted publishing (OIDC) only
-  'pypa/gh-action-pypi-publish': {
+  'gh-action-pypi-publish': {
     password: 'a long-lived PyPI token; pipegen publishes with trusted publishing (OIDC) only',
     user: 'only used with a password (a long-lived PyPI token); pipegen publishes with trusted publishing (OIDC) only',
   },
@@ -724,10 +804,26 @@ function trivyProblems(e: Entry): Problem[] {
   for (const k of [...Object.keys(e.step.cli?.env ?? {}), ...Object.keys(e.fixedInputs.env ?? {})]) {
     if (/^trivy_/i.test(k)) bad(`trivy gets no ${k}: a TRIVY_* variable sets a flag outside the command pipegen checks`, 'step', 'cli', 'env');
   }
+  // ruling P20 (as P18): --exit-code exactly 1, in the command and the fixed args; 0 (or 256, …) passes any finding
+  const codes = [...p.flags, ...pa.flags].filter((f) => f.name === 'exit-code').map((f) => f.value);
+  if (lastValue(p, 'exit-code') !== '1' || lastValue(pa, 'exit-code') !== '1' || codes.some((v) => v !== '1')) {
+    bad('trivy must run with --exit-code 1, exactly, in the command and fixedInputs.args (trivy exits 0 on findings by default, and 0 or 256 passes them; ruling P20)', 'fixedInputs', 'args');
+  }
+  // P20: every severity list (command, fixed args, choices) includes CRITICAL; UNKNOWN or LOW alone blocks on nothing that matters
+  const severities = [...p.flags, ...pa.flags].filter((f) => f.name === 'severity').map((f) => f.value);
+  for (const [k, vs] of Object.entries(e.choices)) if (lower(k) === 'severity') severities.push(...vs);
+  for (const v of severities) {
+    if (v.startsWith('-')) continue; // a choice value that is a flag: choiceProblems says so
+    const parts = v.split(',');
+    if (!parts.includes('CRITICAL') || parts.some((x) => !TRIVY_SEVERITIES.includes(x))) bad(`trivy's severity ${v} must be a list of ${TRIVY_SEVERITIES.join(', ')} that includes CRITICAL (ruling P20)`, 'step', 'cli', 'command');
+  }
   out.push(...choiceProblems('trivy', e, (k) => (g.value.has(k) || g.bool.has(k)) && TRIVY_ALLOWED_FLAGS.has(k),
-    (k) => (TRIVY_FORBIDDEN.has(k) || (TRIVY_REQUIRED_FLAGS as readonly string[]).includes(`--${k}`) ? `the AI may not choose trivy's --${k}` : null)));
+    (k) => (TRIVY_FORBIDDEN.has(k) || k === 'exit-code' || (TRIVY_REQUIRED_FLAGS as readonly string[]).includes(`--${k}`) ? `the AI may not choose trivy's --${k}` : null)));
   return out;
 }
+
+/** Trivy's severities. */
+const TRIVY_SEVERITIES: readonly string[] = ['UNKNOWN', 'LOW', 'MEDIUM', 'HIGH', 'CRITICAL'];
 
 const JSCPD_AI_WHY = 'it runs an embedding model that can send code to an AI API; jscpd 5.4.2 rust/crates/cpd/src/options.rs:178-222 and cli.rs:269-333, 534, 602, 613; catalogue D6';
 /** jscpd 5.4.2 flags that run the embedding model or serve it: --compare, --mcp, --dashboard, and every --semantic*. */
@@ -808,8 +904,16 @@ function betterleaksProblems(e: Entry): Problem[] {
     // value exactly 1. 0 (or 00, +0, 0x0) passes a scan that found secrets, and so does 256, 512, … (the process exit
     // status is the code modulo 256)
     const codes = [...p.flags, ...pa.flags].filter((f) => f.name === 'exit-code').map((f) => f.value);
-    if (lastValue(p, 'exit-code') !== lastValue(pa, 'exit-code') || codes.some((v) => v !== '1')) {
-      bad('betterleaks --exit-code is a fixed arg: exactly 1, in the command and fixedInputs.args, or in neither (0, or 256 and its multiples, would pass a scan that found secrets; ruling P18)', 'fixedInputs', 'args');
+    if (lastValue(p, 'exit-code') !== '1' || lastValue(pa, 'exit-code') !== '1' || codes.some((v) => v !== '1')) {
+      bad('betterleaks --exit-code is a fixed arg: exactly 1, in the command and fixedInputs.args (0, or 256 and its multiples, would pass a scan that found secrets; ruling P18)', 'fixedInputs', 'args');
+    }
+    // --redact (P21): findings are redacted in the report and the log, in the command and the fixed args
+    if (lastValue(p, 'redact') === undefined || lastValue(pa, 'redact') === undefined) bad('betterleaks runs with --redact, in the command and fixedInputs.args (ruling P21: the secret never reaches the report or the log)', 'step', 'cli', 'command');
+    // the report format is what the gate parses (review M2): the entry's own output format
+    for (const f of [...p.flags, ...pa.flags]) {
+      if (f.name === 'report-format' && f.value !== e.step.output.format) bad(`betterleaks --report-format ${f.value} must be the entry's output format (${e.step.output.format}): the gate parses the report as that`, 'step', 'cli', 'command');
+      // --redact=0 would print secrets unredacted (P21)
+      if (f.name === 'redact' && f.value !== '' && f.value !== '100') bad(`betterleaks --redact is given alone (100%), not ${f.raw}`, 'step', 'cli', 'command');
     }
     out.push(...allowlistProblems('betterleaks', [p, pa], BETTERLEAKS_ALLOWED_FLAGS, '--', (n) => n === 'config' || forbidden.has(`--${n}`) || n.startsWith('validation')));
     out.push(...choiceProblems('betterleaks', e, (k) => (g.value.has(k) || g.bool.has(k) || g.optional.has(k)) && BETTERLEAKS_ALLOWED_FLAGS.has(k),
@@ -883,6 +987,110 @@ function nucleiProblems(e: Entry): Problem[] {
   const long = (k: string) => NUCLEI_GRAMMAR.shorts[k] ?? k;
   out.push(...choiceProblems('nuclei', e, (k) => (NUCLEI_GRAMMAR.value.has(long(k)) || NUCLEI_GRAMMAR.bool.has(long(k))) && NUCLEI_ALLOWED_FLAGS.has(long(k)),
     (k) => NUCLEI_FORBIDDEN[long(k)] ?? (['templates', 'disable-update-check'].includes(long(k)) ? `the AI may not choose nuclei's -${k}` : null)));
+  return out;
+}
+
+/** A `{choice}` placeholder: the whole value of a flag, filled by the renderer with the AI's choice (ruling P24). */
+const PLACEHOLDER_RE = /^\{([A-Za-z_][A-Za-z0-9_-]{0,63})\}$/;
+
+/** The parse grammar of a command policy: its allowlisted flags only, so any other flag is "unknown" (default deny). */
+function policyGrammar(c: CommandPolicy): FlagGrammar {
+  const value: string[] = [];
+  const bool: string[] = [];
+  const optional: string[] = [];
+  for (const [name, spec] of Object.entries(c.flags)) {
+    if (spec === 'bool') bool.push(name);
+    else if (spec !== 'output' && spec.optional === true) optional.push(name);
+    else value.push(name);
+  }
+  return { value: new Set(value), bool: new Set(bool), optional: new Set(optional), shorts: {} };
+}
+
+/**
+ * Rulings P19-P21, P24: a cli entry's argv against its policy (tool-flags.ts ARGV_POLICIES, by entry id). command[0]
+ * is the tool's own executable; then its subcommand, only allowlisted flags (read the way the tool reads them; any
+ * other flag, short form or abbreviation is refused), each value from its list (a switch only ever on), the required
+ * flags in effect in the command and in fixedInputs.args, only the listed other words, pipegen's pinned config with
+ * exactly the reviewed content, only the listed env, and exactly the policy's follow-up commands. Choices are
+ * `{placeholders}` only.
+ */
+export function argvPolicyProblems(e: ReviewedEntry, policies: Readonly<Record<string, ArgvPolicy>> = ARGV_POLICIES): Problem[] {
+  const out: Problem[] = [];
+  const cli = e.step.cli;
+  if (e.candidate.kind !== 'cli' || cli === undefined) return out;
+  const bad = (message: string, ...path: (string | number)[]) => out.push({ message, path });
+  const pol = Object.hasOwn(policies, e.id) ? policies[e.id] : undefined;
+  if (pol === undefined) {
+    bad(`the cli entry ${e.id} has no argv allowlist (tool-flags.ts ARGV_POLICIES): pipegen runs no tool whose every flag wasn't reviewed (default deny, ruling P19)`, 'id');
+    return out;
+  }
+  if (cli.command[0] !== pol.exe) {
+    bad(`${e.id} runs ${pol.exe} itself as command[0], exactly: never a path, a shell, a launcher (npx, pipx, uvx, python -m) or a package manager (ruling P19), not ${cli.command[0] ?? 'nothing'}`, 'step', 'cli', 'command');
+    return out;
+  }
+  if (pol.dedicated === true) {
+    if (cli.then !== undefined) bad(`${e.id} runs one command (no then)`, 'step', 'cli', 'then');
+    return out;
+  }
+  const fx = e.fixedInputs;
+  const used = new Set<string>();
+  const valueOk = (spec: FlagSpec, v: string): boolean => {
+    if (spec === 'bool') return v === 'true';
+    if (spec === 'output') return v === e.step.output.path && v !== '' && v !== '-' && !v.startsWith('/');
+    const m = PLACEHOLDER_RE.exec(v);
+    if (m === null) return spec.values.includes(v);
+    const name = m[1] as string;
+    used.add(name);
+    const vs = Object.hasOwn(e.choices, name) ? e.choices[name] : undefined;
+    return vs !== undefined && vs.every((x) => spec.values.includes(x));
+  };
+  const check = (c: CommandPolicy, words: readonly string[], where: (string | number)[], kind: 'command' | 'fixed'): ParsedArgv => {
+    const p = parseArgv(words, policyGrammar(c), pol.dialect === 'goflags' ? 'goflags' : 'pflag');
+    const allowed = Object.keys(c.flags).map((f) => `${pol.dialect === 'goflags' ? '-' : '--'}${f}`).join(', ') || 'no flags';
+    if (p.errors.length > 0) bad(`${e.id} may use only ${allowed} (allowlist, ruling P19): ${p.errors[0]}`, ...where);
+    for (const f of p.flags) {
+      const spec = c.flags[f.name] as FlagSpec;
+      if (!valueOk(spec, f.value)) {
+        const want = spec === 'bool' ? 'only switched on' : spec === 'output' ? `the entry's output file (${e.step.output.path || 'none'})` : `one of ${spec.values.map((v) => JSON.stringify(v)).join(', ')}`;
+        bad(`${e.id}: ${f.raw}${f.raw.includes('=') || spec === 'bool' ? '' : ` ${f.value}`} is not allowed: ${f.name} is ${want} (ruling P20)`, ...where);
+      }
+    }
+    if (kind === 'command') {
+      const sub = p.positionals.slice(0, c.sub.length);
+      if (sub.length !== c.sub.length || sub.some((w, i) => w !== c.sub[i])) bad(`${e.id} runs \`${[pol.exe, ...c.sub].join(' ')} …\` (its subcommand first)`, ...where);
+      for (const w of p.positionals.slice(c.sub.length)) if (!(c.positionals ?? []).includes(w)) bad(`${e.id} may name only ${(c.positionals ?? []).join(', ') || 'no other words'} after its flags, not ${w}`, ...where);
+    } else if (p.positionals.length > 0) bad(`${e.id} fixedInputs.args holds flags only, not ${p.positionals[0]}`, ...where);
+    for (const [name, want] of Object.entries(c.required ?? {})) {
+      const got = lastValue(p, name);
+      if (got === undefined || (want !== null && got !== want)) {
+        bad(`${e.id} must run with ${pol.dialect === 'goflags' ? '-' : '--'}${name}${want === null || want === '' || want === 'true' ? '' : ` ${want}`} in effect${kind === 'fixed' ? ' in fixedInputs.args too (the template sets it, the AI never can)' : ''} (ruling P20)`, ...where);
+      }
+    }
+    return p;
+  };
+  check(pol, cli.command.slice(1), ['step', 'cli', 'command'], 'command');
+  check(pol, fx.args ?? [], ['fixedInputs', 'args'], 'fixed');
+  const then = cli.then ?? [];
+  const policyThen = pol.then ?? [];
+  if (then.length !== policyThen.length) bad(`${e.id} runs ${policyThen.length === 0 ? 'no follow-up command' : `exactly ${policyThen.length} follow-up command(s) (step.cli.then): ${policyThen.map((t) => [pol.exe, ...t.sub].join(' ')).join('; ')}`} (ruling P24)`, 'step', 'cli', 'then');
+  else {
+    then.forEach((words, i) => {
+      if (words[0] !== pol.exe) bad(`${e.id}'s follow-up command runs ${pol.exe} itself, not ${words[0]}`, 'step', 'cli', 'then', i);
+      else check(policyThen[i] as CommandPolicy, words.slice(1), ['step', 'cli', 'then', i], 'command');
+    });
+  }
+  // choices: placeholders only, each one used
+  for (const k of Object.keys(e.choices)) if (!used.has(k)) bad(`${e.id} offers the choice ${k}, but only a {${k}} placeholder in its argv may take a choice (ruling P19)`, 'choices', k);
+  // pipegen's pinned config, exactly as reviewed
+  const cfg = fx.config;
+  if (pol.config === undefined) {
+    if (cfg !== undefined) bad(`${e.id} takes no pinned config`, 'fixedInputs', 'config');
+  } else if (cfg === undefined || !('flag' in cfg.passAs) || cfg.passAs.flag !== pol.config.flag || cfg.content !== pol.config.content) {
+    bad(`${e.id} runs with pipegen's pinned config, passed as ${pol.config.flag}, with exactly the content reviewed in tool-flags.ts (a config can turn checks off or load code)`, 'fixedInputs', 'config');
+  }
+  for (const k of new Set([...Object.keys(cli.env ?? {}), ...Object.keys(fx.env ?? {})])) {
+    if (!(pol.env ?? []).includes(k)) bad(`${e.id} gets no env ${k} (a variable can turn the check off or load a config)`, 'step', 'cli', 'env');
+  }
   return out;
 }
 
@@ -966,7 +1174,7 @@ function isSubsequence(needle: readonly string[], hay: readonly string[]): boole
  * exactly pinned and `reviewed: true`; every entry declares configFiles and fixedInputs. Throws ReviewedListError on
  * any problem, and, in a release build, while any entry is still PENDING review.
  */
-export function loadReviewed(path: string = packageDataPath('reviewed-tools.yml')): ReviewedTool[] {
+export function loadReviewed(path: string = packageDataPath('reviewed-tools.yml'), opts: { argvPolicies?: Readonly<Record<string, ArgvPolicy>> } = {}): ReviewedTool[] {
   let raw: unknown;
   try {
     raw = parse(readFileSync(path, 'utf8'));
@@ -983,6 +1191,14 @@ export function loadReviewed(path: string = packageDataPath('reviewed-tools.yml'
     throw new ReviewedListError(`pipegen's reviewed tool list is invalid${where}`, { reason: `it is invalid${where}` });
   }
   const entries = parsed.data.tools;
+  // rulings P19-P21: every cli entry's argv against its allowlist (tests may pass their own table for fixture ids)
+  for (const [i, t] of entries.entries()) {
+    const problem = argvPolicyProblems(t, opts.argvPolicies ?? ARGV_POLICIES)[0];
+    if (problem !== undefined) {
+      const where = ` (entry ${t.id}) at ${['tools', i, ...problem.path].join('.')}: ${problem.message}`;
+      throw new ReviewedListError(`pipegen's reviewed tool list is invalid${where}`, { reason: `it is invalid${where}` });
+    }
+  }
   const ids = entries.map((t) => t.id);
   const dup = ids.find((id, i) => ids.indexOf(id) !== i);
   if (dup !== undefined) throw new ReviewedListError(`pipegen's reviewed tool list has the entry ${dup} more than once.`, { reason: `it has the entry ${dup} more than once` });
