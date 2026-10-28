@@ -83,9 +83,11 @@ const REASON_WHY: Readonly<Record<Reason, (subject: string, when: string) => str
   // fix round 1 (the run's own why names the variable or file, or the runner)
   config: (s) => `${s} runs, but a config file or variable here can turn it off, and pipegen doesn't follow it.`,
   runner: (s) => `${s} runs, but not on a GitHub-hosted runner it supports, outside a container, so it may not block anything.`,
+  // ruling P33 (the run's own why names the never-list reason)
+  'never-listed': (s) => `${s} runs, but this action is on pipegen's never-use list; pin a reviewed alternative.`,
 };
 /** Reasons whose run carries pipegen's own why from the signature (partialWhy, actionRef, unavailableWhy, requireInputs). */
-const OWN_WHY: ReadonlySet<Reason> = new Set<Reason>(['never', 'ref', 'unavailable', 'needs-inputs', 'config', 'some-jobs', 'runner']);
+const OWN_WHY: ReadonlySet<Reason> = new Set<Reason>(['never', 'ref', 'unavailable', 'needs-inputs', 'config', 'some-jobs', 'runner', 'never-listed']);
 
 const HOOK_PLACE = { 'pre-commit': 'the pre-commit framework', husky: 'the husky pre-commit hook', lefthook: 'the lefthook pre-commit hook' } as const;
 const HOOK_NAME = { 'pre-commit': 'the pre-commit framework', husky: 'husky', lefthook: 'lefthook' } as const;

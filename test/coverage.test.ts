@@ -1,12 +1,25 @@
 import { mkdirSync, readFileSync, symlinkSync } from 'node:fs';
 import { join } from 'node:path';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { loadToolSignatures, mapCoverage, type Coverage } from '../src/audit/coverage.js';
 import { floorNeeds } from '../src/engine/needs.js';
 import { readPrecommit, readWorkflows } from '../src/read/workflows.js';
 import type { Capabilities, ExistingWorkflow, Layer, RepoProfile, Service } from '../src/types.js';
 import { cleanupRepos, makeTempDir, writeIn } from './helpers/make-repo.js';
 import { emptyRepoFiles, emptyServiceQuality } from '../src/read/quality.js';
+
+// Ruling P33: a never-listed action (trivy-action, zizmor-action, …) is partial whatever its inputs. Older tests use
+// trivy-action as the vehicle for the generic `with:` input rules (spellings, exit codes, crowded inputs); they turn
+// the never-list off (`neverOff.on = true`) so the input rule they check stays visible. The P33 block tests the
+// never-list itself, with it on.
+const neverOff = vi.hoisted(() => ({ on: false }));
+vi.mock('../src/engine/never-list.js', async (importOriginal) => {
+  const a = await importOriginal<typeof import('../src/engine/never-list.js')>();
+  return { ...a, neverListed: (ref: unknown) => (neverOff.on ? null : a.neverListed(ref)) };
+});
+afterEach(() => {
+  neverOff.on = false;
+});
 
 afterEach(cleanupRepos);
 
@@ -423,7 +436,9 @@ describe('mapCoverage (fix round 1)', () => {
       (await one(`${both}${job(`      - uses: ${uses}\n${withLines === '' ? '' : `        with:\n${withLines}`}`)}`, id === 'iac' || id === 'image-scan' ? 'merge' : 'push', id, over, service)).status;
     // Plan P Task 3 (PB3): trivy-action's default scan-type is image, so these are image scans, not dependency scans
     expect(await st('aquasecurity/trivy-action@0.28.0', '', 'image-scan', runnable, 'app')).toBe('partial');
-    expect(await st('aquasecurity/trivy-action@0.28.0', "          exit-code: '1'\n", 'image-scan', runnable, 'app')).toBe('covered');
+    // Ruling P33 (final review I1): trivy-action is on pipegen's never-list (its tags were force-pushed to malicious
+    // code), so even a step set up to fail is partial, never covered. This used to assert 'covered'.
+    expect(await st('aquasecurity/trivy-action@0.28.0', "          exit-code: '1'\n", 'image-scan', runnable, 'app')).toBe('partial');
     expect(await st('aquasecurity/trivy-action@0.28.0', "          exit-code: '0'\n", 'image-scan', runnable, 'app')).toBe('partial');
     expect(await st('aquasecurity/trivy-action@0.28.0', '          exit-code: ${{ inputs.code }}\n', 'image-scan', runnable, 'app')).toBe('partial');
     expect(await st('anchore/scan-action@v6', '', 'deps', {}, 'app')).toBe('covered');
@@ -664,6 +679,7 @@ describe('mapCoverage (fix round 2)', () => {
   ];
   for (const [label, body, layer, id, want] of cases) {
     it(`coverage: round 2: ${label} → ${want}`, async () => {
+      neverOff.on = label.startsWith('trivy-action'); // the input rule, not the never-list (P33)
       const r = await one(body, layer, id, runnableTf, id === 'secrets' || id === 'iac' ? undefined : 'app');
       expect(r.status).toBe(want);
     });
@@ -731,6 +747,7 @@ describe('mapCoverage (fix round 3)', () => {
   });
 
   it('coverage: round 3: input spellings that differ only in case: a soft one wins', async () => {
+    neverOff.on = true; // trivy-action as the vehicle for the input rules (P33)
     // Plan P Task 3 (PB3): trivy-action's default scan-type is image
     const st = async (lines: string) => (await one(`${both}${job(`      - uses: aquasecurity/trivy-action@0.28.0\n        with:\n${lines}`)}`, 'merge', 'image-scan', runnable, 'app')).status;
     expect(await st("          exit-code: '1'\n          EXIT-CODE: '0'\n")).toBe('partial');
@@ -792,6 +809,7 @@ describe('mapCoverage (fix round 4)', () => {
   const spellings = (n: number) => Array.from({ length: n }, (_, i) => Array.from('abcdefghijklmnop', (ch, b) => ((i >> b) & 1 ? ch.toUpperCase() : ch)).join(''));
 
   it('coverage: round 4: more spellings of one input than pipegen keeps → partial, never covered', async () => {
+    neverOff.on = true; // trivy-action as the vehicle for the input rules (P33)
     // exit-code has 9 letters: 2^9 case spellings; each sets the failing value '1'
     const variants = (n: number) => Array.from({ length: n }, (_, i) => Array.from('exit-code', (ch, b) => ((i >> b) & 1 ? ch.toUpperCase() : ch)).join(''));
     // Plan P Task 3 (PB3): trivy-action's default scan-type is image, and the entry is trivy-image
@@ -802,6 +820,7 @@ describe('mapCoverage (fix round 4)', () => {
   });
 
   it('coverage: round 4: a step with more inputs than pipegen reads → partial, never covered', async () => {
+    neverOff.on = true; // trivy-action as the vehicle for the input rules (P33)
     const filler = (n: number) => spellings(n).map((k) => `${k}: x`);
     expect((await one(trivy(["exit-code: '1'", ...filler(255)]), 'merge', 'image-scan', runnable, 'app')).status).toBe('covered');
     const r = await one(trivy(["exit-code: '1'", ...filler(256)]), 'merge', 'image-scan', runnable, 'app');
@@ -1821,6 +1840,7 @@ describe('mapCoverage (Plan P Task 3)', () => {
   });
 
   it('coverage: PB3 trivy and grype count by subcommand and target', async () => {
+    neverOff.on = true; // trivy-action as the vehicle for the input rules (P33)
     const over = { services: [dockerSvc] };
     const st = async (body: string, id: string, layer: Layer = 'merge') => {
       const r = await rowOf(body, layer, id, over, 'app');
@@ -1963,7 +1983,8 @@ describe('mapCoverage (Plan P Task 3)', () => {
     expect(await st(ciRun('zizmor --no-exit-codes .'))).toBe('partial zizmor');
     expect(await st(ciRun('zizmor --format=sarif .'))).toBe('partial zizmor');
     expect(await st(ciUses('zizmorcore/zizmor-action@v0.2.0'))).toBe('partial zizmor'); // advanced-security defaults to true: SARIF, no exit code
-    expect(await st(ciUses('zizmorcore/zizmor-action@v0.2.0', '          advanced-security: false\n'))).toBe('covered zizmor');
+    // Ruling P33: zizmor-action is on pipegen's never-list (beta), so it is never covered, whatever its inputs
+    expect(await st(ciUses('zizmorcore/zizmor-action@v0.2.0', '          advanced-security: false\n'))).toBe('partial zizmor');
     expect(await st(ciRun('poutine analyze_local .'))).toBe('partial poutine');
     expect(await st(ciRun('poutine analyze_local . --fail-on-violation'))).toBe('covered poutine');
     expect(await st(ciRun('ghalint run'))).toBe('covered ghalint');
@@ -2017,6 +2038,7 @@ describe('mapCoverage (Plan P Task 3)', () => {
   });
 
   it('coverage: trivy fs --scanners vuln,license --exit-code 1 on pull_request → licences covered; without license → missing', async () => {
+    neverOff.on = true; // trivy-action as the vehicle for the input rules (P33)
     const pr = (cmd: string) => `on: pull_request\n${job(run(cmd))}`;
     expect(await rowOf(pr('trivy fs --scanners vuln,license --exit-code 1 .'), 'merge', 'licences')).toMatchObject({ status: 'covered', by: 'trivy-license' });
     expect(await rowOf(pr('trivy fs --scanners=license --exit-code 1 .'), 'merge', 'licences')).toMatchObject({ status: 'covered', by: 'trivy-license' });
@@ -2356,6 +2378,7 @@ describe('mapCoverage (Plan P Task 3 fix round 1)', () => {
   });
 
   it('fix round 1 (T1, T8, L1, S1, T1c, W3): exit codes read the way the tools parse them, and a false fail flag never fails', async () => {
+    neverOff.on = true; // trivy-action as the vehicle for the input rules (P33)
     for (const cmd of ['trivy image --exit-code=00 app:1', 'trivy image --exit-code 0x0 app:1', 'trivy image --exit-code=+0 app:1', 'trivy image --exit-code 0o0 app:1',
       'trivy image --exit-code 256 app:1', 'trivy image --exit-code=-0 app:1']) {
       expect(await st(ci1(run(cmd)), 'merge', 'image-scan'), cmd).toBe('partial trivy-image');
@@ -2468,6 +2491,7 @@ describe('mapCoverage (Plan P Task 3 fix round 1)', () => {
   });
 
   it('fix round 2 (R4, R7): a padded exit code is a parse error (0); Go reads f as false', async () => {
+    neverOff.on = true; // trivy-action as the vehicle for the input rules (P33)
     for (const code of ["' 1'", "'1 '", "'1.0'"]) {
       expect(await st(ci1(`      - uses: aquasecurity/trivy-action@0.33.1\n        with:\n          image-ref: app:1\n          exit-code: ${code}\n`), 'merge', 'image-scan'), code).toBe('partial trivy-image');
     }
@@ -2519,5 +2543,50 @@ describe('mapCoverage (Plan P Task 3 fix round 1)', () => {
     expect(performance.now() - t).toBeLessThan(5000);
     expect(row(rows, 'deploy', 'egress', 'app').status).toBe('partial');
     expect(row(rows, 'merge', 'image-scan', 'app').status).toBe('partial');
+  });
+});
+
+describe('mapCoverage (Plan P final review I1, ruling P33)', () => {
+  const NEVER_WHY = /^The trivy-image check runs, but this action is on pipegen's never-use list \(76 of its 77 tags were force-pushed to malicious code in March 2026\); pin a reviewed alternative\.$/;
+  const trivy = (uses: string, extra = '') => `${both}${job(`      - uses: ${uses}\n${extra}        with:\n          exit-code: '1'\n`)}`;
+
+  it('P33: a never-listed action set up to fail is partial with a plain reason, never covered', async () => {
+    const r = await one(trivy('aquasecurity/trivy-action@0.28.0'), 'merge', 'image-scan', runnable, 'app');
+    expect(r.status).toBe('partial');
+    expect(r.why).toMatch(NEVER_WHY);
+    // any letter case and a commit pin: the same never-list match the loader uses
+    const r2 = await one(trivy(`AquaSecurity/Trivy-Action@${'a'.repeat(40)}`), 'merge', 'image-scan', runnable, 'app');
+    expect(r2.status).toBe('partial');
+    expect(r2.why).toMatch(NEVER_WHY);
+  });
+
+  it('P33: the never-list reason wins over continue-on-error and an if: condition', async () => {
+    const coe = await one(trivy('aquasecurity/trivy-action@0.28.0', '        continue-on-error: true\n'), 'merge', 'image-scan', runnable, 'app');
+    expect(coe.status).toBe('partial');
+    expect(coe.why).toMatch(NEVER_WHY);
+    const cond = await one(trivy('aquasecurity/trivy-action@0.28.0', "        if: github.event_name == 'push'\n"), 'merge', 'image-scan', runnable, 'app');
+    expect(cond.status).toBe('partial');
+    expect(cond.why).toMatch(NEVER_WHY);
+  });
+
+  it('P33: gitleaks-action (licence) and zizmor-action (beta) give their own plain reason', async () => {
+    const g = await one(`${both}${job('      - uses: gitleaks/gitleaks-action@v2\n')}`, 'push', 'secrets');
+    expect(g.status).toBe('partial');
+    expect(g.why).toBe("The gitleaks check runs, but this action is on pipegen's never-use list (proprietary licence, needs a licence key and phones home); pin a reviewed alternative.");
+    const z = await one(`${both}${job('      - uses: zizmorcore/zizmor-action@v0.2.0\n        with:\n          advanced-security: false\n')}`, 'merge', 'workflow-lint');
+    expect(z.status).toBe('partial');
+    expect(z.why).toBe("The zizmor check runs, but this action is on pipegen's never-use list (beta); pin a reviewed alternative.");
+    // no internal document references leak into the report
+    for (const w of [g.why, z.why]) expect(w).not.toMatch(/catalogue|DECISIONS|ruling/);
+  });
+
+  it('P33: a reviewed tool next to a never-listed one still covers the row', async () => {
+    const body = `${both}${job("      - uses: gitleaks/gitleaks-action@v2\n      - run: gitleaks detect --exit-code 1\n")}`;
+    expect((await one(body, 'push', 'secrets')).status).toBe('covered');
+  });
+
+  it('P33: an action not on the never-list is unchanged', async () => {
+    const r = await one(`${both}${job("      - uses: anchore/scan-action@v6\n")}`, 'push', 'deps', {}, 'app');
+    expect(r.status).toBe('covered');
   });
 });

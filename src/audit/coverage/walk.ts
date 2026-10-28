@@ -6,6 +6,7 @@ import { linkedLevel, parseYamlLimited, readTextLimitedWithReason, regexSafe } f
 import { asObj } from '../../read/manifest.js';
 import { JOB_ID_RE, MAX_WORKFLOWS, WORKFLOW_FILE } from '../../read/workflows.js';
 import { codeSecurityAvailable } from '../../github/availability.js';
+import { neverListed, plainNeverReason } from '../../engine/never-list.js';
 import { safeText } from '../../util/safe-text.js';
 import { MAX_FILTER_PATTERNS, MAX_HITS, MAX_JOBS, MAX_LOCAL_FILES, MAX_SCAN_BYTES, MAX_STEPS, MAX_STEP_VISITS } from './bounds.js';
 import { MAY_NOT_RUN, OPAQUE_WHY } from './decide.js';
@@ -162,7 +163,8 @@ function addFound(ctx: Ctx, found: Found[], c: StepCtx): void {
     // fix round 1 (P8, concern 2): egress control in a workflow that doesn't release never counts
     const f = !c.release && found1.categories.includes('egress') ? { ...found1, categories: found1.categories.filter((x) => x !== 'egress') } : found1;
     if (f.categories.length === 0) continue;
-    let reason: Reason | null = c.continueOnError ? 'continue' : (f.reason ?? (c.inputsUnread ? 'inputs' : null));
+    // ruling P33: a never-listed action keeps its own reason, whatever else holds for the step
+    let reason: Reason | null = f.reason === 'never-listed' ? f.reason : c.continueOnError ? 'continue' : (f.reason ?? (c.inputsUnread ? 'inputs' : null));
     // Plan P Task 3: an `if:` says the run may not happen at all, which matters more than a reason it can't block (a
     // check that doesn't block, such as scorecard or the copy-paste check, only cares whether it runs)
     if (c.conditional && (reason === null || !MAY_NOT_RUN.has(reason))) reason = 'condition';
@@ -209,9 +211,16 @@ const pinnedRef = (uses: string) => {
  * reason, first that applies: the repo can't use the action (availability, Plan P Task 3); a soft or crowded input,
  * a check that never fails or fails only when told to (actionReason); a version pipegen can't place (actionRef; for a
  * called workflow any ref but a SHA or a tag); inputs that don't set the action up for the check (requireInputs).
+ * Before all of these (ruling P33, final review I1): an action on pipegen's own never-list (neverListed, the loader's
+ * rule: any letter case, a fork's name family under any owner, a look-alike) is partial with that reason, never covered.
  */
 function actionFinds(ctx: Ctx, tools: readonly ToolSignature[], uses: string, w: Inputs, reusable: boolean, c: StepCtx): Found[] {
+  const never = neverListed(uses);
   return tools.filter((t) => !actionSkipped(t, w)).map((t) => {
+    if (never !== null) {
+      const f = foundOf(t, '.', 'never-listed');
+      return { ...f, partialWhy: `${f.subject} runs, but this action is on pipegen's never-use list (${plainNeverReason(never)}); pin a reviewed alternative.` };
+    }
     const verdict = refVerdict(t, uses);
     const available = t.availability === undefined || (t.availability === 'public' ? !ctx.p.private : codeSecurityAvailable(ctx.p, ctx.caps));
     // fix round 1: an action that works only on some GitHub-hosted runners, outside a container

@@ -782,3 +782,18 @@ describe('buildAudit: Plan P Task 8 (choosing, skipped checks, settings)', () =>
   });
 });
 
+
+describe('buildAudit: Plan P final review I1 (ruling P33)', () => {
+  it('P33: a never-listed action is shown as partial with its never-use reason in every output', async () => {
+    const wf = 'on: [push, pull_request]\njobs:\n  scan:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: gitleaks/gitleaks-action@v2\n';
+    const r = await buildAudit(repo({ ...nodeApp(), '.github/workflows/ci.yml': wf }), deps());
+    const rows = r.coverage.filter((c) => c.need.category === 'secrets');
+    expect(rows.length).toBeGreaterThan(0);
+    for (const c of rows) expect(c.status, c.need.layer).not.toBe('covered');
+    const why = "this action is on pipegen's never-use list (proprietary licence, needs a licence key and phones home); pin a reviewed alternative.";
+    expect(rows.some((c) => c.status === 'partial' && c.why?.endsWith(why))).toBe(true);
+    for (const out of [renderTerminal(r, { knownValues: [] }), renderMarkdown(r, { knownValues: [] }), renderJson(r, { knownValues: [] })]) {
+      expect(out.replace(/\s+/g, ' ')).toContain("never-use list (proprietary licence, needs a licence key and phones home); pin a reviewed alternative");
+    }
+  });
+});

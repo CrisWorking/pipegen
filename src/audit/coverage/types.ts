@@ -31,7 +31,9 @@ export type Reason = 'continue' | 'suppressed' | 'function' | 'soft' | 'inputs' 
   // more words than pipegen reads
   | 'unavailable' | 'needs-inputs' | 'some-jobs' | 'target' | 'long'
   // fix round 1: a config file or env var that can turn the check off (P8); an egress step on a runner it can't guard
-  | 'config' | 'runner';
+  | 'config' | 'runner'
+  // Plan P final review I1 (ruling P33): an action on pipegen's own never-list, which never makes a row covered
+  | 'never-listed';
 
 export type Manager = NonNullable<RepoProfile['precommit']>;
 export type CiLayer = Exclude<Layer, 'pre-commit'>;

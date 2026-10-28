@@ -16,7 +16,7 @@ import type { Found, JobEnv, Obj, Reason } from './types.js';
  * so the env gate can read it without an import cycle.)
  */
 export const MAY_NOT_RUN: ReadonlySet<Reason> = new Set<Reason>(['condition', 'hook-repo', 'files', 'stage', 'skip', 'ref', 'tox-env', 'nox-env',
-  'unavailable', 'needs-inputs', 'some-jobs', 'target', 'config', 'runner']);
+  'unavailable', 'needs-inputs', 'some-jobs', 'target', 'config', 'runner', 'never-listed']);
 
 // ---------- if: conditions (review I3) ----------
 
