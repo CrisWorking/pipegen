@@ -8,6 +8,17 @@
 /.github/release-signers @CrisWorking
 /scripts/              @CrisWorking
 /src/engine/           @CrisWorking
+# The audit --ai secret pass and consent (what reaches an AI), and where data/ is loaded from.
+/src/ai/               @CrisWorking
+/src/cli/consent.ts    @CrisWorking
+/src/audit/consent-token.ts @CrisWorking
+/src/util/package-data.ts @CrisWorking
+/src/audit/choose.ts   @CrisWorking
+# Tests that pin the trust root: a PR must not weaken the checks a data change is judged by.
+/test/*-live.test.ts   @CrisWorking
+/test/reviewed.test.ts @CrisWorking
+/test/pinned-binary.test.ts @CrisWorking
+/test/cooldown.test.ts @CrisWorking
 /tsup.config.ts        @CrisWorking
 /tsup.dev.config.ts    @CrisWorking
 /tsconfig.json         @CrisWorking
