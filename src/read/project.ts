@@ -141,7 +141,9 @@ async function readService(ctx: Ctx, dir: string, shared: Shared): Promise<Servi
   }
   const requirementNames = requirements.flatMap((r) => r.names);
   const py = readPyproject(toml);
-  const language: Language = pkg ? 'node' : toml || requirementFiles.length > 0 || ctx.fileSet.has(inDir(dir, 'setup.py')) ? 'python' : 'other';
+  // DoD run (spf13/cobra): a go.mod makes a Go service, so the audit can say plainly that Go isn't supported yet
+  const language: Language = pkg ? 'node' : toml || requirementFiles.length > 0 || ctx.fileSet.has(inDir(dir, 'setup.py')) ? 'python'
+    : ctx.fileSet.has(inDir(dir, 'go.mod')) ? 'go' : 'other';
 
   // Files that belong to this service and not to a deeper one.
   const owned = files.filter((f) => isUnder(f, dir) && !shared.serviceDirs.some((o) => o.length > dir.length && isUnder(f, o)));

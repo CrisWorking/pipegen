@@ -120,6 +120,7 @@
 // (a leaf), settings, shell, triggers, scripts, walk, hooks, decide, helpers, and types (types only). test/module-graph
 // checks that there is no runtime import cycle among them.
 import { regexSafe } from '../read/limits.js';
+import { SUPPORTED_STACKS, unsupportedStackWhy } from '../read/support.js';
 import { MAX_WORKFLOWS, WORKFLOW_FILE } from '../read/workflows.js';
 import type { Capabilities, ExistingWorkflow, Need, RepoProfile } from '../types.js';
 import { safeText } from '../util/safe-text.js';
@@ -249,7 +250,27 @@ export async function mapCoverage(p: RepoProfile, needs: Need[], dir: string, op
       rows.push(row.status === 'partial' ? await coverageMinimumRow(row, firstPartialHit(need, need.layer, d), dir) : row);
     } else rows.push(ciCoverage(need, need.layer, d));
   }
-  return noLockfile(frameworkAdjust(versionAdjust(rows, p), p), p); // PS22: the last steps, so the chooser reads the adjusted row
+  // PS22: the last steps, so the chooser reads the adjusted row
+  return unsupportedStack(noLockfile(frameworkAdjust(versionAdjust(rows, p), p), p), p);
+}
+
+/**
+ * Checks whose tools and commands depend on the service's stack (its test runner, linter, formatter, type checker,
+ * coverage tool, dead-code finder, code scanner and dependency scanner).
+ */
+const STACK_CATEGORIES: ReadonlySet<string> = new Set(['unit-tests', 'full-tests', 'lint', 'format-lint', 'format', 'type-check', 'coverage', 'dead-code', 'sast', 'deps']);
+/**
+ * DoD run (spf13/cobra): for a service in a stack pipegen doesn't support yet (Go, or a language it can't name), a
+ * stack check that would be missing is unknown "not supported yet": pipegen doesn't know that stack's own commands
+ * (`make richtest` running `go test`), so "missing" would be a guess. Covered and partial rows are what pipegen really
+ * found, so they stay; checks that don't depend on the stack (secrets, images, the deploy checks) are answered as usual.
+ */
+function unsupportedStack(rows: Coverage[], p: RepoProfile): Coverage[] {
+  return rows.map((r) => {
+    const s = r.need.service === undefined ? undefined : p.services.find((x) => x.name === r.need.service);
+    if (s === undefined || SUPPORTED_STACKS.includes(s.language) || r.status !== 'missing' || !STACK_CATEGORIES.has(r.need.category)) return r;
+    return { need: r.need, status: 'unknown', why: unsupportedStackWhy(s.language) };
+  });
 }
 
 const NO_LOCKFILE_WHY = "No lockfile is committed, so new-dependency review and licence checks can't run until one is.";

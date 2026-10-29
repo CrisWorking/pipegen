@@ -2646,3 +2646,43 @@ describe('coverage: repo shell script files (DoD fastapi)', () => {
     expect(row(await coverage(odd), 'merge', 'unit-tests').status).toBe('missing');
   });
 });
+
+// DoD run 2026-10-29 (spf13/cobra): Go read as language `other`, and "Unit tests" read "missing" though test.yml runs
+// `make richtest` (go test). pipegen doesn't support Go (or any stack but Node and Python) yet, so a check that depends
+// on the stack can't be called missing: it is unknown, saying why. The fixture is synthetic (test/fixtures/repos/go-module).
+describe('coverage: stacks pipegen does not support yet (DoD cobra)', () => {
+  const goProfile = async () => {
+    const { makeRepo } = await import('./helpers/make-repo.js');
+    const { readProject } = await import('../src/read/project.js');
+    const dir = makeRepo('go-module', 'https://github.com/o/r.git');
+    const p: RepoProfile = { ...(await readProject(dir)), private: false, ownerType: 'User', plan: 'free' };
+    return { dir, p };
+  };
+
+  it('coverage: a Go check that would be missing is unknown "not supported yet"; a check pipegen really saw keeps its status', async () => {
+    const { dir, p } = await goProfile();
+    const rows = await mapCoverage(p, floorNeeds(p, caps), dir);
+    for (const id of ['unit-tests', 'sast', 'deps']) {
+      const r = row(rows, 'merge', id, 'r');
+      expect(r.status, id).toBe('unknown');
+      expect(r.why, id).toMatch(/^pipegen doesn't support Go yet/);
+    }
+    expect(row(rows, 'merge', 'full-tests', 'r').status).toBe('unknown');
+    expect(row(rows, 'pre-commit', 'format-lint', 'r').status).toBe('unknown');
+    expect(row(rows, 'merge', 'lint', 'r')).toMatchObject({ status: 'covered', by: 'golangci-lint' }); // a real check stays covered
+    // checks that don't depend on the stack are answered as usual
+    expect(row(rows, 'merge', 'secrets').status).toBe('missing');
+    expect(rows.some((r) => r.status === 'missing' && r.need.service !== undefined && !['image-build', 'image-scan', 'dast', 'sbom', 'signing', 'attestation', 'deploy-verify', 'dockerfile-lint', 'api-dast', 'egress', 'fuzzing'].includes(r.need.category))).toBe(false);
+  });
+
+  it('coverage: any language pipegen does not support gets the same rule (language other)', async () => {
+    const dir = makeTempDir();
+    wf(dir, 'ci.yml', `on: [push, pull_request]\n${job('      - run: cargo test\n')}`);
+    const rows = await coverage(dir, { services: [svc('.', { language: 'other', packageManager: undefined, scripts: [] })] });
+    expect(row(rows, 'merge', 'unit-tests')).toMatchObject({ status: 'unknown' });
+    expect(row(rows, 'merge', 'unit-tests').why).toMatch(/^pipegen doesn't support this language yet/);
+    // Node keeps "missing"
+    const node = await coverage(makeTempDir());
+    expect(row(node, 'merge', 'unit-tests').status).toBe('missing');
+  });
+});

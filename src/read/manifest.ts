@@ -58,6 +58,6 @@ export const isTestFile = (rel: string): boolean => {
   if (!regexSafe(rel)) return false;
   const segments = rel.split('/');
   const name = segments[segments.length - 1] ?? '';
-  return segments.slice(0, -1).some((s) => ['test', 'tests', '__tests__'].includes(s)) || /^.+\.(test|spec)\..+$/.test(name) || /^test_.+\.py$/.test(name) || /_test\.py$/.test(name);
+  return segments.slice(0, -1).some((s) => ['test', 'tests', '__tests__'].includes(s)) || /^.+\.(test|spec)\..+$/.test(name) || /^test_.+\.py$/.test(name) || /_test\.(?:py|go)$/.test(name);
 };
 

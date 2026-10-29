@@ -303,6 +303,11 @@ describe('read', () => {
     expect(await readProject(makeRepo('node-npm', 'https://github.com/o-1/my.repo_x-y.git'))).toMatchObject({ owner: 'o-1', repo: 'my.repo_x-y' });
   });
 
+  it('read: a go.mod makes a Go service, and *_test.go files are its tests (DoD cobra)', async () => {
+    const p = await readProject(repo('go-module'));
+    expect(p.services.map((s) => [s.path, s.language, s.hasTests])).toEqual([['.', 'go', true]]);
+  });
+
   it('read: a Python folder with a Dockerfile is a service next to Node workspace packages (DoD fastapi)', async () => {
     // fastapi/full-stack-fastapi-template: the root package.json lists Node workspaces (frontend), and backend/ is a
     // Python app with its own Dockerfile. The workspace list names Node packages only, so it must not hide backend/.

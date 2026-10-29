@@ -7,6 +7,19 @@ const LANGUAGE_NAMES: Record<Language, string> = {
   node: 'Node', python: 'Python', go: 'Go', java: 'Java', dotnet: '.NET', ruby: 'Ruby', php: 'PHP', other: 'This language',
 };
 
+/** The stacks pipegen knows (tools, own commands, reviewed choices). Any other language is "not supported yet". */
+export const SUPPORTED_STACKS: readonly Language[] = ['node', 'python'];
+
+/**
+ * DoD run (spf13/cobra): the why of a check that depends on the stack, for a service in a language pipegen doesn't
+ * support yet. Fixed words plus a name from the fixed Language union (never a repo string). No milestone is named:
+ * only Python is planned (v0.4, Plan W); other languages are never promised one (see supportLevel).
+ */
+export function unsupportedStackWhy(language: Language): string {
+  const name = language === 'other' ? 'this language' : LANGUAGE_NAMES[language];
+  return `pipegen doesn't support ${name} yet, so it can't tell whether this check runs here; it isn't counted as missing.`;
+}
+
 /**
  * Decides whether the full run can handle this repo, or only `pipegen audit`.
  * The full run calls this before asking for consent and stops politely on `audit-only`.
