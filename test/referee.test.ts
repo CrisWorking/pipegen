@@ -1054,7 +1054,9 @@ describe('fix round 2: the re-review probes are refused', () => {
     }
     // over-approximated on purpose: a status name in a string literal, a space before '(', a '-' before the name; NEL (U+0085)
     // is whitespace to GitHub's .NET lexer but not to JS \s, and U+017F folds to 'S' in .NET only, so non-ASCII is refused
-    const refused = ["contains(github.ref, 'always()')", 'ALWAYS ()', 'always\t()', 'x-success() || true', 'success\u0085() || true', 'ſuccess() || true', "github.ref == 'é'"];
+    const refused = ["contains(github.ref, 'always()')", 'ALWAYS ()', 'always\t()', 'x-success() || true', 'success\u0085() || true', 'ſuccess() || true', "github.ref == 'é'",
+      // GitHub ends the expression at the first }}; a trailing } makes the whole value a (truthy) string template
+      '${{ x }}}', '${{ success() && x }}}', '${{ {x} }}', "${{ format('{0}', x) }}"];
     for (const cond of refused) {
       const { f, d } = editedWith(cond);
       expect((await run([f], d, { list: LIST })).ok, JSON.stringify(cond)).toBe(false);
