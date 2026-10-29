@@ -173,10 +173,12 @@ describe('renderStep: reviewed entries only', () => {
     expect(() => renderStep(specFor(t, { choices: { 'fetch-depth': '9' } }), t, platform(), ctx)).toThrow(/choices\.fetch-depth/);
   });
 
-  it('renderStep: the CLI kinds are not built yet (6b) and say so', () => {
-    for (const [id, method] of [['gitleaks', 'github-release'], ['semgrep', 'docker'], ['bandit', 'pip']] as const) {
-      const t = entry(id);
-      expect(() => renderStep(specFor(t), t, platform(), ctx), id).toThrow(`not implemented in 6a: ${t.step.cli?.install.method ?? method}`);
+  it('renderStep: a cli entry is rendered by the CLI renderer (6b), and one that cannot be yet says why', () => {
+    const t = entry('gitleaks');
+    expect(renderStep(specFor(t), t, platform(), ctx).steps.length).toBeGreaterThan(1);
+    for (const [id, why] of [['semgrep', /6c/], ['bandit', /not available yet/], ['registry', /service/]] as const) {
+      const u = entry(id);
+      expect(() => renderStep(specFor(u), u, platform(), ctx), id).toThrow(why);
     }
   });
 });

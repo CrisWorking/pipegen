@@ -73,13 +73,28 @@ export interface ArgvPolicy extends CommandPolicy {
   /** Choices that aren't argv placeholders, with their allowed values (semgrep's rule set, picked by the renderer). */
   readonly extraChoices?: Readonly<Record<string, readonly string[]>>;
   readonly dialect: 'long' | 'goflags';
-  readonly config?: { readonly flag: string; readonly content: string };
+  /**
+   * The pinned config. `fileName` (6b, ruling S4) is what the renderer writes it as, under `$RUNNER_TEMP/pipegen-cfg/<artifact>/`:
+   * tools pick the parser by name or extension (biome wants biome.json, the ESLint flat config must be .mjs, ruff .toml,
+   * viper tools read the extension). One plain file name, never a path.
+   */
+  readonly config?: { readonly flag: string; readonly content: string; readonly fileName: string };
+  /**
+   * Docker entries only (6b, ruling S26): where the renderer mounts a folder in the container. `source: 'repo'` is the
+   * service folder (with `workdir` also `-w <at>`); `source: 'work'` is a fresh folder under runner temp that holds the
+   * config and receives the result (ZAP reads `-c` and writes `-J` under /zap/wrk). A docker entry with no mount is not rendered.
+   */
+  readonly mount?: { readonly at: string; readonly source: 'repo' | 'work'; readonly workdir?: true };
+  /** Docker entries only: run with `--network none` (semgrep, whose rules are mounted and which needs no network). */
+  readonly network?: 'none';
   readonly env?: readonly string[];
   readonly then?: readonly CommandPolicy[];
   readonly dedicated?: true;
 }
 
-const DEDICATED = (exe: string, pkg: string): ArgvPolicy => ({ method: 'github-release', package: pkg, exe, dialect: 'long', sub: [], flags: {}, dedicated: true });
+// the dedicated tools (trivy, betterleaks, nuclei) have their own full-grammar rules in reviewed.ts; only the pinned config is listed here, for the renderer
+const DEDICATED = (exe: string, pkg: string, config?: ArgvPolicy['config']): ArgvPolicy => ({ method: 'github-release', package: pkg, exe, dialect: 'long', sub: [], flags: {}, dedicated: true, ...(config === undefined ? {} : { config }) });
+const TRIVY_CONFIG = { flag: '--config', content: "# pipegen's pinned trivy config: no cache kept between runs\ncache:\n  backend: memory\n", fileName: 'trivy.yaml' } as const;
 const GH = 'github-release' as const;
 const TRIVY_ASSET = 'trivy_0.76.0_Linux-64bit.tar.gz';
 const RUFF_ASSET = 'ruff-x86_64-unknown-linux-gnu.tar.gz';
@@ -95,14 +110,15 @@ const ESLINT_TS_FILES = "files: ['**/*.{js,mjs,cjs,jsx,ts,mts,cts,tsx,vue,svelte
  * on a list (P20).
  */
 export const ARGV_POLICIES: Readonly<Record<string, ArgvPolicy>> = Object.freeze({
-  'trivy-config': DEDICATED('trivy', TRIVY_ASSET), 'trivy-image': DEDICATED('trivy', TRIVY_ASSET), 'trivy-licence': DEDICATED('trivy', TRIVY_ASSET),
-  betterleaks: DEDICATED('betterleaks', 'betterleaks_1.9.0_linux_x64.tar.gz'), nuclei: DEDICATED('nuclei', 'nuclei_3.11.1_linux_amd64.zip'),
+  'trivy-config': DEDICATED('trivy', TRIVY_ASSET, TRIVY_CONFIG), 'trivy-image': DEDICATED('trivy', TRIVY_ASSET, TRIVY_CONFIG), 'trivy-licence': DEDICATED('trivy', TRIVY_ASSET, TRIVY_CONFIG),
+  betterleaks: DEDICATED('betterleaks', 'betterleaks_1.9.0_linux_x64.tar.gz', { flag: '--config', content: '[extend]\nuseDefault = true\n', fileName: 'betterleaks.toml' }),
+  nuclei: DEDICATED('nuclei', 'nuclei_3.11.1_linux_amd64.zip'),
   // ruling P28: the image entries too. registry runs the image's own entrypoint, nothing else
   registry: { method: 'docker', package: 'registry', exe: '', entrypoint: true, dialect: 'long', sub: [], flags: {} },
   // ZAP baseline (zaproxy/zap-stable): getopt short options, read as Go-style words; no -I (warnings that never fail)
   'zap-baseline': {
     method: 'docker', package: 'zaproxy/zap-stable', exe: 'zap-baseline.py', dialect: 'goflags', sub: [], flags: { J: 'output', z: { values: ['-silent'] } },
-    required: { J: null, z: '-silent' }, config: { flag: '-c', content: "# pipegen's pinned ZAP baseline rules: the defaults, nothing ignored\n" },
+    required: { J: null, z: '-silent' }, mount: { at: '/zap/wrk', source: 'work' }, config: { flag: '-c', content: "# pipegen's pinned ZAP baseline rules: the defaults, nothing ignored\n", fileName: 'zap-baseline.conf' },
   },
   // Semgrep CE 1.181.0: rules only from the verified archive (semgrepProblems), no metrics, no version check
   semgrep: {
@@ -110,51 +126,52 @@ export const ARGV_POLICIES: Readonly<Record<string, ArgvPolicy>> = Object.freeze
     flags: { metrics: { values: ['off'] }, 'disable-version-check': 'bool', config: { values: ['/pipegen-rules'] }, sarif: 'bool', output: 'output' },
     required: { metrics: 'off', 'disable-version-check': 'true', config: '/pipegen-rules' },
     env: ['PIPEGEN_RULES_URL', 'PIPEGEN_RULES_SHA256', 'PIPEGEN_RULES_TREE'], extraChoices: { rules: ['javascript', 'typescript', 'python'] },
+    mount: { at: '/src', source: 'repo', workdir: true }, network: 'none',
   },
   // gitleaks 8.30.1 (`gitleaks git --help`), the secrets fallback (P21): the same locks as betterleaks
   gitleaks: { method: GH, package: 'gitleaks_8.30.1_linux_x64.tar.gz',
     exe: 'gitleaks', dialect: 'long', sub: ['git'], positionals: ['.'],
     flags: { 'no-banner': 'bool', 'ignore-gitleaks-allow': 'bool', redact: { values: ['', '100'], optional: true }, 'report-format': { values: ['sarif'] }, 'report-path': 'output', 'exit-code': { values: ['1'] } },
     required: { 'ignore-gitleaks-allow': 'true', redact: '', 'report-format': 'sarif', 'report-path': null, 'exit-code': '1' },
-    config: { flag: '--config', content: '[extend]\nuseDefault = true\n' },
+    config: { flag: '--config', content: '[extend]\nuseDefault = true\n', fileName: 'gitleaks.toml' },
   },
   // osv-scanner v2.7.0
   'osv-scanner': { method: GH, package: 'osv-scanner_linux_amd64',
     exe: 'osv-scanner', dialect: 'long', sub: ['scan', 'source'], positionals: ['.'],
     flags: { recursive: 'bool', format: { values: ['sarif'] }, output: 'output' }, required: { format: 'sarif', output: null },
-    config: { flag: '--config', content: "# pipegen's pinned osv-scanner config: no ignored vulnerabilities\n" },
+    config: { flag: '--config', content: "# pipegen's pinned osv-scanner config: no ignored vulnerabilities\n", fileName: 'osv-scanner.toml' },
   },
   lefthook: { method: GH, package: 'lefthook_2.2.2_Linux_x86_64', exe: 'lefthook', dialect: 'long', sub: ['run', 'pre-commit'], flags: { 'all-files': 'bool' }, required: { 'all-files': 'true' } },
   syft: { method: GH, package: 'syft_1.55.0_linux_amd64.tar.gz',
     exe: 'syft', dialect: 'long', sub: ['scan'], flags: { output: { values: ['spdx-json=sbom.spdx.json'] } }, required: { output: 'spdx-json=sbom.spdx.json' },
-    config: { flag: '--config', content: 'check-for-app-update: false\n' },
+    config: { flag: '--config', content: 'check-for-app-update: false\n', fileName: 'syft.yaml' },
   },
   cosign: { method: GH, package: 'cosign-linux-amd64', exe: 'cosign', dialect: 'long', sub: ['sign'], flags: { yes: 'bool' }, required: { yes: 'true' } },
   actionlint: { method: GH, package: 'actionlint_1.7.12_linux_amd64.tar.gz',
     exe: 'actionlint', dialect: 'goflags', sub: [], flags: { 'no-color': 'bool', shellcheck: { values: [''] }, pyflakes: { values: [''] } },
     required: { shellcheck: '', pyflakes: '' },
-    config: { flag: '-config-file', content: "self-hosted-runner:\n  labels: []\npaths:\n  .github/workflows/**/*.{yml,yaml}:\n    ignore:\n      - 'unexpected key \"cache-mode\" for \"job\" section'\n" },
+    config: { flag: '-config-file', content: "self-hosted-runner:\n  labels: []\npaths:\n  .github/workflows/**/*.{yml,yaml}:\n    ignore:\n      - 'unexpected key \"cache-mode\" for \"job\" section'\n", fileName: 'actionlint.yaml' },
   },
-  zizmor: { method: GH, package: 'zizmor-x86_64-unknown-linux-gnu.tar.gz', exe: 'zizmor', dialect: 'long', sub: [], positionals: ['.github/workflows'], flags: { offline: 'bool' }, required: { offline: 'true' }, config: { flag: '--config', content: 'rules: {}\n' } },
+  zizmor: { method: GH, package: 'zizmor-x86_64-unknown-linux-gnu.tar.gz', exe: 'zizmor', dialect: 'long', sub: [], positionals: ['.github/workflows'], flags: { offline: 'bool' }, required: { offline: 'true' }, config: { flag: '--config', content: 'rules: {}\n', fileName: 'zizmor.yml' } },
   // Biome 2.5.15: `biome ci` (lint + format check, never writes)
   biome: { method: 'npm', package: '@biomejs/biome',
     exe: 'biome', dialect: 'long', sub: ['ci'], flags: {},
-    config: { flag: '--config-path', content: '{\n  "linter": {\n    "rules": {\n      "complexity": {\n        "noExcessiveCognitiveComplexity": { "level": "error", "options": { "maxAllowedComplexity": 15 } }\n      }\n    }\n  }\n}\n' },
+    config: { flag: '--config-path', content: '{\n  "linter": {\n    "rules": {\n      "complexity": {\n        "noExcessiveCognitiveComplexity": { "level": "error", "options": { "maxAllowedComplexity": 15 } }\n      }\n    }\n  }\n}\n', fileName: 'biome.json' },
   },
   // ESLint 10.13.0: no warnings allowed; the pinned flat config lints the framework files too (P25)
   eslint: { method: 'npm', package: 'eslint',
     exe: 'eslint', dialect: 'long', sub: [], positionals: ['.'], flags: { 'max-warnings': { values: ['0'] } }, required: { 'max-warnings': '0' },
-    config: { flag: '--config', content: `export default [{ ${ESLINT_FILES}, languageOptions: { parserOptions: { ecmaFeatures: { jsx: true } } }, rules: { complexity: ['error', 15] } }];\n` },
+    config: { flag: '--config', content: `export default [{ ${ESLINT_FILES}, languageOptions: { parserOptions: { ecmaFeatures: { jsx: true } } }, rules: { complexity: ['error', 15] } }];\n`, fileName: 'eslint.config.mjs' },
   },
   'eslint-typescript': { method: 'npm', package: 'eslint',
     exe: 'eslint', dialect: 'long', sub: [], positionals: ['.'], flags: { 'max-warnings': { values: ['0'] } }, required: { 'max-warnings': '0' },
     // built in two parts so the bundled CLI holds no import statement of a non-node module (test/package.test.ts)
-    config: { flag: '--config', content: [`import tseslint from`, `'typescript-eslint';\nexport default [...tseslint.configs.recommended, { ${ESLINT_TS_FILES}, rules: { complexity: ['error', 15] } }];\n`].join(' ') },
+    config: { flag: '--config', content: [`import tseslint from`, `'typescript-eslint';\nexport default [...tseslint.configs.recommended, { ${ESLINT_TS_FILES}, rules: { complexity: ['error', 15] } }];\n`].join(' '), fileName: 'eslint.config.mjs' },
   },
   // Oxlint 1.89.0
   'oxlint-typeaware': { method: 'npm', package: 'oxlint',
     exe: 'oxlint', dialect: 'long', sub: [], flags: { 'type-aware': 'bool', 'deny-warnings': 'bool' }, required: { 'type-aware': 'true', 'deny-warnings': 'true' },
-    config: { flag: '--config', content: '{ "categories": { "correctness": "error" } }\n' },
+    config: { flag: '--config', content: '{ "categories": { "correctness": "error" } }\n', fileName: 'oxlintrc.json' },
   },
   // Prettier 3.9.10: check only (never --write); the repo's own Prettier config is used (catalogue §2)
   prettier: { method: 'npm', package: 'prettier', exe: 'prettier', dialect: 'long', sub: [], positionals: ['.'], flags: { check: 'bool' }, required: { check: 'true' } },
@@ -172,20 +189,20 @@ export const ARGV_POLICIES: Readonly<Record<string, ArgvPolicy>> = Object.freeze
     exe: 'jscpd', dialect: 'long', sub: [], positionals: ['.'],
     flags: { 'baseline-from-ref': { values: ['origin/main'] }, 'fail-on-new-clones': { values: [''], optional: true }, reporters: { values: ['sarif'] }, output: { values: ['jscpd-report'] } },
     required: { 'baseline-from-ref': 'origin/main', 'fail-on-new-clones': '' },
-    config: { flag: '--config', content: '{}\n' },
+    config: { flag: '--config', content: '{}\n', fileName: 'jscpd.json' },
   },
   // hadolint 2.15.1: fails on warnings and errors (never --no-fail or a lower threshold)
   hadolint: { method: GH, package: 'hadolint-linux-x86_64',
     exe: 'hadolint', dialect: 'long', sub: [], flags: { 'no-color': 'bool', 'failure-threshold': { values: ['warning'] }, format: { values: ['sarif'] }, output: 'output' },
     required: { 'failure-threshold': 'warning', format: 'sarif', output: null },
-    config: { flag: '--config', content: "# pipegen's pinned hadolint config: every rule at its default level, nothing ignored\nignored: []\n" },
+    config: { flag: '--config', content: "# pipegen's pinned hadolint config: every rule at its default level, nothing ignored\nignored: []\n", fileName: 'hadolint.yaml' },
   },
   // kube-linter 0.8.3: an unrenderable chart, a bad path or YAML it can't parse fails the check (P25)
   'kube-linter': { method: GH, package: 'kube-linter-linux',
     exe: 'kube-linter', dialect: 'long', sub: ['lint'],
     flags: { 'fail-if-no-objects-found': 'bool', 'fail-on-invalid-resource': 'bool', format: { values: ['sarif'] }, output: 'output' },
     required: { 'fail-if-no-objects-found': 'true', 'fail-on-invalid-resource': 'true', format: 'sarif', output: null },
-    config: { flag: '--config', content: "# pipegen's pinned kube-linter config: the default checks\nchecks:\n  doNotAutoAddDefaults: false\n" },
+    config: { flag: '--config', content: "# pipegen's pinned kube-linter config: the default checks\nchecks:\n  doNotAutoAddDefaults: false\n", fileName: 'kube-linter.yaml' },
   },
   // Schemathesis 4.32.2: exactly 25 examples per operation, JUnit report
   schemathesis: { method: 'pip', package: 'schemathesis',
@@ -198,7 +215,7 @@ export const ARGV_POLICIES: Readonly<Record<string, ArgvPolicy>> = Object.freeze
   poutine: { method: GH, package: 'poutine_Linux_x86_64.tar.gz',
     exe: 'poutine', dialect: 'long', sub: ['analyze_local'], positionals: ['.'], flags: { 'disable-version-check': 'bool', 'fail-on-violation': 'bool', quiet: 'bool' },
     required: { 'disable-version-check': 'true', 'fail-on-violation': 'true' },
-    config: { flag: '--config', content: "# pipegen's pinned poutine config: no skipped rules\nskip: []\n" },
+    config: { flag: '--config', content: "# pipegen's pinned poutine config: no skipped rules\nskip: []\n", fileName: 'poutine.yml' },
   },
   // gosec 2.29.0 (Go flags): never -no-fail; every #nosec suppression is reported in the SARIF (P27)
   gosec: { method: GH, package: 'gosec_2.29.0_linux_amd64.tar.gz',
@@ -209,11 +226,11 @@ export const ARGV_POLICIES: Readonly<Record<string, ArgvPolicy>> = Object.freeze
   ruff: { method: GH, package: RUFF_ASSET,
     exe: 'ruff', dialect: 'long', sub: ['check'], flags: { 'no-cache': 'bool', 'output-format': { values: ['sarif'] }, 'output-file': 'output' },
     required: { 'no-cache': 'true', 'output-format': 'sarif', 'output-file': null },
-    config: { flag: '--config', content: '[lint]\nextend-select = ["C901"]\n\n[lint.mccabe]\nmax-complexity = 15\n' },
+    config: { flag: '--config', content: '[lint]\nextend-select = ["C901"]\n\n[lint.mccabe]\nmax-complexity = 15\n', fileName: 'ruff.toml' },
   },
   'ruff-format': { method: GH, package: RUFF_ASSET,
     exe: 'ruff', dialect: 'long', sub: ['format'], flags: { check: 'bool', 'no-cache': 'bool' }, required: { check: 'true', 'no-cache': 'true' },
-    config: { flag: '--config', content: "# pipegen's pinned ruff config: the default format\n" },
+    config: { flag: '--config', content: "# pipegen's pinned ruff config: the default format\n", fileName: 'ruff.toml' },
   },
   // mypy 2.4.0 (never --install-types: it installs unpinned stub packages)
   mypy: { method: 'pip', package: 'mypy', exe: 'mypy', dialect: 'long', sub: [], positionals: ['.'], flags: { 'no-incremental': 'bool' } },
@@ -230,6 +247,17 @@ export const ARGV_POLICIES: Readonly<Record<string, ArgvPolicy>> = Object.freeze
     required: { recursive: 'true', format: 'sarif', output: null },
   },
 } satisfies Record<string, ArgvPolicy>);
+
+// ---------- pip closures (Plan B 6b, ruling B5) ----------
+
+/**
+ * Reviewed hash-locked requirement closures for the pip entries, by entry id: the exact `requirements.txt` text (one
+ * `name==version --hash=sha256:<hex>` per line, the tool, its plugins and every dependency). pip refuses a requirement
+ * without a hash under `--require-hashes`, and the renderer installs with `--no-deps`, so nothing outside this text is
+ * ever installed. EMPTY today: no pip entry has a reviewed closure yet (v0.4, Plan D), so every pip tool is a
+ * RenderError "not available yet". A closure is added here with its entry, by a code-reviewed change.
+ */
+export const PIP_CLOSURES: Readonly<Record<string, string>> = Object.freeze({});
 
 // ---------- input allowlists for every action entry (Plan P Task 6 fix round 2, ruling P29) ----------
 

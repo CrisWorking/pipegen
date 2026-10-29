@@ -77,7 +77,7 @@ const GITLEAKS_ARGS = ['--ignore-gitleaks-allow', '--redact', '--report-format',
 const FIXTURE_POLICIES: Record<string, ArgvPolicy> = {
   ...ARGV_POLICIES,
   'gitleaks-proven': ARGV_POLICIES.gitleaks as ArgvPolicy,
-  tool: { method: 'github-release', package: 'tool_1.0.0_linux_amd64.tar.gz', exe: 'tool', dialect: 'long', sub: [], flags: { format: { values: ['sarif'] }, output: 'output' }, config: { flag: '--config', content: 'x: 1\n' } },
+  tool: { method: 'github-release', package: 'tool_1.0.0_linux_amd64.tar.gz', exe: 'tool', dialect: 'long', sub: [], flags: { format: { values: ['sarif'] }, output: 'output' }, config: { flag: '--config', content: 'x: 1\n', fileName: 'tool.yaml' } },
   linter: { method: 'npm', package: 'eslint', exe: 'linter', dialect: 'long', sub: [], flags: { format: { values: ['sarif'] } } },
   'linter-pip': { method: 'pip', package: 'schemathesis', exe: 'linter', dialect: 'long', sub: [], flags: { format: { values: ['sarif'] } } },
 };

@@ -1,0 +1,129 @@
+- id: pipegen-setup-node-24
+  name: Set up Node.js
+  uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+  with:
+    package-manager-cache: "false"
+    node-version: "24"
+- id: pipegen-npm-ci-apps-web
+  name: "pipegen: install the project dependencies (npm ci, no scripts)"
+  run: |-
+    set -euo pipefail
+    pg_fail() { echo "pipegen: $1" >&2; exit 1; }
+    node="$(command -v node || true)"
+    [ -n "$node" ] || pg_fail "node was not found; the Node setup step must run first"
+    nodebin="$(dirname -- "$node")"
+    PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+    for d in apps apps/web; do
+      if [ -L "$d" ] || [ ! -d "$d" ]; then pg_fail "the folder $d is not a real folder inside the repository"; fi
+    done
+    cd -- apps/web
+    ws="$(cd "$GITHUB_WORKSPACE" && pwd -P)"
+    case "$(pwd -P)" in "$ws"/*) ;; *) pg_fail "the working folder is outside the repository" ;; esac
+    home="$RUNNER_TEMP/pipegen-home/pipegen-out-lint--web"
+    mkdir -p "$RUNNER_TEMP/pipegen-home" "$home"
+    pg_env=(
+      /usr/bin/env -i
+      "HOME=$home"
+      "PATH=$nodebin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+      "RUNNER_TEMP=$RUNNER_TEMP"
+      "TMPDIR=$RUNNER_TEMP"
+    )
+    "${pg_env[@]}" "$nodebin/npm" ci --ignore-scripts --no-audit --no-fund
+  shell: bash
+  env:
+    BASH_ENV: ""
+    ENV: ""
+- name: "pipegen: check biome against the lockfile"
+  run: |-
+    set -euo pipefail
+    pg_fail() { echo "pipegen: $1" >&2; exit 1; }
+    node="$(command -v node || true)"
+    [ -n "$node" ] || pg_fail "node was not found; the Node setup step must run first"
+    nodebin="$(dirname -- "$node")"
+    PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+    for d in apps apps/web; do
+      if [ -L "$d" ] || [ ! -d "$d" ]; then pg_fail "the folder $d is not a real folder inside the repository"; fi
+    done
+    cd -- apps/web
+    ws="$(cd "$GITHUB_WORKSPACE" && pwd -P)"
+    case "$(pwd -P)" in "$ws"/*) ;; *) pg_fail "the working folder is outside the repository" ;; esac
+    home="$RUNNER_TEMP/pipegen-home/pipegen-out-lint--web"
+    mkdir -p "$RUNNER_TEMP/pipegen-home" "$home"
+    pg_env=(
+      /usr/bin/env -i
+      "HOME=$home"
+      "PATH=$nodebin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+      "RUNNER_TEMP=$RUNNER_TEMP"
+      "TMPDIR=$RUNNER_TEMP"
+    )
+    js='const fs = require("fs");
+    const lock = JSON.parse(fs.readFileSync("package-lock.json", "utf8"));
+    const want = JSON.parse(process.env.PIPEGEN_NPM_EXPECT);
+    let bad = 0;
+    for (const w of want) {
+      const p = (lock.packages || {})["node_modules/" + w.name];
+      let installed = null;
+      try { installed = JSON.parse(fs.readFileSync("node_modules/" + w.name + "/package.json", "utf8")).version; } catch (e) { installed = null; }
+      if (!p || p.version !== w.version || p.integrity !== w.integrity || installed !== w.version) {
+        console.error("pipegen: " + w.name + " is not the reviewed version " + w.version + " (the lockfile or the installed copy differs)");
+        bad = 1;
+      }
+    }
+    process.exit(bad);'
+    "${pg_env[@]}" "PIPEGEN_NPM_EXPECT=$PIPEGEN_NPM_EXPECT" "$nodebin/node" -e "$js"
+  shell: bash
+  env:
+    BASH_ENV: ""
+    ENV: ""
+    PIPEGEN_NPM_EXPECT: "[{\"name\":\"@biomejs/biome\",\"version\":\"2.5.15\",\"integrity\":\"sha512-WZTW4slm/pdkh92K6t/3aEN++44JD1PQ7squ7RCMLI1flHGl43DVOIGXvCjHiZgBMO1V4uYxoFNtqrIA4qGuIQ==\"},{\"name\":\"@biomejs/cli-linux-x64\",\"version\":\"2.5.15\",\"integrity\":\"sha512-xE4iEW/3LqlYj9GFgGrFsFSH51dEEpUbYWBfeOv0q87WkUDxK2o/HhreSb7qMJqck70RVM6Lg96hgedcAYcOkA==\"}]"
+- name: "pipegen: run biome"
+  run: |-
+    set -euo pipefail
+    pg_fail() { echo "pipegen: $1" >&2; exit 1; }
+    node="$(command -v node || true)"
+    [ -n "$node" ] || pg_fail "node was not found; the Node setup step must run first"
+    nodebin="$(dirname -- "$node")"
+    PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+    for d in apps apps/web; do
+      if [ -L "$d" ] || [ ! -d "$d" ]; then pg_fail "the folder $d is not a real folder inside the repository"; fi
+    done
+    cd -- apps/web
+    ws="$(cd "$GITHUB_WORKSPACE" && pwd -P)"
+    case "$(pwd -P)" in "$ws"/*) ;; *) pg_fail "the working folder is outside the repository" ;; esac
+    home="$RUNNER_TEMP/pipegen-home/pipegen-out-lint--web"
+    mkdir -p "$RUNNER_TEMP/pipegen-home" "$home"
+    mkdir -p "$RUNNER_TEMP/pipegen-cfg"
+    cfg="$RUNNER_TEMP/pipegen-cfg/pipegen-out-lint--web"
+    mkdir "$cfg"
+    printf '%s' "$PIPEGEN_CONFIG" > "$cfg/biome.json"
+    pg_env=(
+      /usr/bin/env -i
+      "HOME=$home"
+      "PATH=$nodebin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+      "RUNNER_TEMP=$RUNNER_TEMP"
+      "TMPDIR=$RUNNER_TEMP"
+    )
+    rc=0
+    "${pg_env[@]}" "$nodebin/npx" --no-install biome ci --config-path "$cfg/biome.json" || rc=$?
+    exit "$rc"
+  shell: bash
+  env:
+    BASH_ENV: ""
+    ENV: ""
+    PIPEGEN_CONFIG: "{
+
+      \  \"linter\": {
+
+      \    \"rules\": {
+
+      \      \"complexity\": {
+
+      \        \"noExcessiveCognitiveComplexity\": { \"level\": \"error\", \"options\": { \"maxAllowedComplexity\": 15 } }
+
+      \      }
+
+      \    }
+
+      \  }
+
+      }\n"

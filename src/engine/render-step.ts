@@ -10,8 +10,8 @@
 //   renderUpload is a separate helper. Result artifacts are named by artifact-names.ts (ruling B4).
 // - Repo-derived values (Service.path, runtimeVersion, dockerfile) are validated or mapped, never copied raw (ruling S8).
 //   All YAML is built with the `yaml` Document API (stepsToYaml); no step text is concatenated into YAML.
-// - 6a builds the action kind completely. The CLI kinds (github-release, docker, npm, pip) are 6b and throw a
-//   RenderError until then; rule archives, slots and project scripts are 6c.
+// - 6a builds the action kind completely; 6b the CLI kinds (github-release, docker, npm, pip) in render-cli.ts. Rule
+//   archives, target slots and project scripts are 6c.
 import { isDeepStrictEqual } from 'node:util';
 import { Scalar, YAMLMap, YAMLSeq } from 'yaml';
 import { safeText } from '../util/safe-text.js';
@@ -19,9 +19,12 @@ import { DEPENDENCY_KINDS, type OutputFormat, type RepoProfile, type ReviewedToo
 import { COMMIT_SHA_RE } from './names.js';
 import { NEED_IDS } from './need-ids.js';
 import type { PlatformActions } from './pin.js';
+import { renderCliTool, type CliHooks, type RenderOptions } from './render-cli.js';
+import { RenderError, show } from './render-error.js';
 import { PLAIN_REL_RE, RENDERER_INPUTS, rendererInputProblems } from './tool-flags.js';
 
-export class RenderError extends Error {}
+export { RenderError };
+export type { RenderOptions };
 
 /** What a render needs besides the step: the repo facts (services, folders) and, for steps that need them, run-time targets (ruling S2). */
 export interface RenderContext {
@@ -68,8 +71,6 @@ const DANGEROUS_NAMES: readonly { family: string; match: RegExp }[] = [
 ];
 const isDangerousName = (name: string): boolean => DANGEROUS_NAMES.some((d) => d.match.test(name));
 
-/** A value from outside, shown in a message: one clean line, cut short, quoted when it is a string. */
-const show = (v: unknown): string => (typeof v === 'string' ? JSON.stringify(safeText(v, 60)) : safeText(String(v), 30));
 const same = (a: unknown, b: unknown): boolean => isDeepStrictEqual(a, b);
 const own = <T>(o: Readonly<Record<string, T>>, k: string): T | undefined => (Object.hasOwn(o, k) ? o[k] : undefined);
 
@@ -297,10 +298,11 @@ export function renderPlatformStep(key: keyof PlatformActions, platform: Platfor
 
 /**
  * Renders a reviewed tool's step (never an unreviewed one). Throws a RenderError for a spec with problems, a tool whose
- * id or pin differs from the spec's, or a kind not built yet. It never uploads the output (ruling B3). `platform` is for
- * the CLI kinds (6b), whose steps need the platform actions; an action step doesn't use it.
+ * id or pin differs from the spec's, or a tool that can't be rendered yet (pip without a closure, 6c's rule archives). It
+ * never uploads the output (ruling B3). `platform` supplies the setup actions the npm and pip kinds need. `options` is
+ * for tests and internal callers (the argv policies and pip closures; production passes none).
  */
-export function renderStep(given: StepSpec, tool: ReviewedTool, platform: PlatformActions, ctx: RenderContext): RenderResult {
+export function renderStep(given: StepSpec, tool: ReviewedTool, platform: PlatformActions, ctx: RenderContext, options: RenderOptions = {}): RenderResult {
   // render exactly what is validated: one plain copy (a getter or proxy is read once), not the caller's live object
   let spec: StepSpec;
   try {
@@ -312,7 +314,9 @@ export function renderStep(given: StepSpec, tool: ReviewedTool, platform: Platfo
   const problems = validateSpec(spec, tool, ctx);
   if (problems.length > 0) throw new RenderError(`The step for ${show(spec.needId)} isn't valid: ${problems.join(' ')}`);
   if (tool.candidate.kind !== 'action' || tool.step.action === undefined) {
-    throw new RenderError(`not implemented in 6a: ${tool.step.cli?.install.method ?? tool.candidate.kind}`);
+    if (tool.step.cli === undefined) throw new RenderError(`${show(tool.id)} is neither an action nor a cli entry.`);
+    const service = spec.service === undefined ? undefined : ctx.profile.services.find((s) => s.name === spec.service);
+    return renderCliTool({ spec, tool, service, hooks: cliHooks(platform), options });
   }
   if (CONTAINER_ACTION_USES.has(usesOf(tool).path) || tool.wrappedImage !== undefined) throw new RenderError(`not implemented in 6a: container action ${show(tool.id)} (it runs an image the review has not pinned; 6c, ruling S13)`);
   if (HELPER_ONLY.has(usesOf(tool).path)) throw new RenderError(`${show(tool.id)} is rendered with renderPlatformStep or renderUpload, which supply the inputs it needs.`);
@@ -324,6 +328,38 @@ export function renderStep(given: StepSpec, tool: ReviewedTool, platform: Platfo
   const secrets = spec.secrets ?? [];
   if (secrets.length > 0) step.env = Object.fromEntries(secrets.map((n) => [n, `\${{ secrets.${n} }}`]));
   return { steps: [step], output: null };
+}
+
+/** What the CLI renderer takes from here: the setup actions (version mapped, no cache) and the secret-name rules. */
+function cliHooks(platform: PlatformActions): CliHooks {
+  return {
+    setupNode(runtimeVersion) {
+      const setup = platformEntry(platform, 'setup-node');
+      return actionStep(setup, 'Set up Node.js', { 'node-version': mapNodeVersion(runtimeVersion, setup.choices['node-version'] ?? []).version }, {});
+    },
+    setupPython() {
+      const step = actionStep(platformEntry(platform, 'setup-python'), 'Set up Python', {}, {});
+      // pipegen uses no caches (spec §19): an entry that grew a cache input is refused
+      if (Object.keys(step.with ?? {}).some((k) => k.toLowerCase().startsWith('cache'))) throw new RenderError('The reviewed setup-python entry has a cache input; pipegen uses no caches.');
+      return step;
+    },
+    isDangerousName,
+  };
+}
+
+/**
+ * Keeps the first of every step that has an `id` starting `pipegen-` (the setup-node and `npm ci` steps of the npm tools,
+ * which are the same for every tool of a job) and drops the repeats. Steps without such an id are never dropped. Plan G
+ * runs a job's steps through this once, so a job installs its dependencies once (ruling B5).
+ */
+export function dedupeJobSteps(steps: readonly RenderedStep[]): RenderedStep[] {
+  const seen = new Set<string>();
+  return steps.filter((s) => {
+    if (s.id === undefined || !s.id.startsWith('pipegen-')) return true;
+    if (seen.has(s.id)) return false;
+    seen.add(s.id);
+    return true;
+  });
 }
 
 /** The renderer-filled inputs of an action for this service and context (the others are set by the helpers that own them). */
