@@ -7,6 +7,7 @@ import { UNKNOWN_PREFIX, commandReason, configTurnedOff, flagsAllow, foundOf, in
 import { buildWords, composeBuildServices, composeRunWords, composeWords } from './docker-words.js';
 import { COMPOSE_BUILD_ID, DOCKER_BUILD_ID, isHookRunner } from './signatures.js';
 import { tokenize } from './tokenize.js';
+import { semgrepConfig, toLangs } from './config-langs.js';
 import type { Budget, CommandRule, Compiled, DockerBuild, Found, Reason } from './types.js';
 
 // ---------- reading shell text (review M2: command position only; round 2: quotes, lists, groups, pipes) ----------
@@ -331,6 +332,38 @@ export function unplacedRun(f: Found): Found {
   return { ...f, unplaced: `${f.subject} is given a path pipegen can't place (a variable, an expression, a glob or a path outside the repo), so it can't tell which services it checks.` };
 }
 const NPM_PROVENANCE_ID = 'npm-provenance';
+const SEMGREP_ID = 'semgrep';
+const SEMGREP_SCAN_ID = 'semgrep-scan';
+/** P60 (R2): semgrep's `--config` / `-c` / `-f` values on a command line (null: one pipegen can't read). */
+function semgrepConfigValues(args: readonly string[]): (string | null)[] {
+  const out: (string | null)[] = [];
+  for (let i = 0; i < args.length; i++) {
+    const w = args[i] as string;
+    if (w === '--config' || w === '-c' || w === '-f') out.push(args[++i] ?? null);
+    else if (w.startsWith('--config=')) out.push(w.slice('--config='.length));
+  }
+  return out;
+}
+/**
+ * P60 (R2): Found.langs (and langFiles) for semgrep configs, from the folder the run is in; {} when none is given (the
+ * platform's policy or auto: any language).
+ */
+export function semgrepLangs(values: readonly (string | null)[], cwd: string | null): Pick<Found, 'langs' | 'langFiles'> {
+  if (values.length === 0) return {};
+  const tags: string[] = [];
+  const files: string[] = [];
+  for (const v of values) {
+    const c = semgrepConfig(v);
+    if (Array.isArray(c)) tags.push(...(c as readonly string[]));
+    else {
+      const d = resolveDir(cwd, (c as { file: string }).file);
+      if (d === null) tags.push('?');
+      else files.push(d);
+    }
+  }
+  const langs = toLangs(tags.length === 0 ? ['none'] : tags);
+  return { ...(langs === undefined ? {} : { langs }), ...(files.length === 0 || langs === undefined ? {} : { langFiles: files }) };
+}
 /** The image's name: no registry or owner, no :tag or @digest (ghcr.io/zricethezav/gitleaks:v8 → gitleaks). */
 export function imageName(image: string): string {
   const at = image.indexOf('@');
@@ -620,6 +653,8 @@ export function scanShell(text: string, base: string | null, sigs: Compiled, bud
           if (b !== null) f.dockerBuild = b;
         }
         if (r.tool.id === NPM_PROVENANCE_ID) f.envGate = 'npm';
+        // P60 (R2): semgrep checks the languages of the rules its config names
+        if (r.tool.id === SEMGREP_ID || r.tool.id === SEMGREP_SCAN_ID) Object.assign(f, semgrepLangs(semgrepConfigValues(args.slice(r.rest.length)), cwd));
         // P57 (C1): path arguments scope the run to the services under them (scopeToPaths, once the repo can be checked)
         // a hook runner's words are hook ids, not paths
         const paths = complete && !isHookRunner(r.tool.id) ? pathWords(args.slice(r.rest.length), cwd) : null;

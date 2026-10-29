@@ -145,7 +145,7 @@ import { hookRunHits, readHooks } from './coverage/hooks.js';
 import { compile, loadToolSignatures } from './coverage/signatures.js';
 import { fitOf, parseOn, scheduleFires, type BranchGuess } from './coverage/triggers.js';
 import type { Compiled, Ctx, Fit, Hit } from './coverage/types.js';
-import { Reader, configFilesPass, releaseEgress, releaseSigns, scopeToPaths, walkWorkflow } from './coverage/walk.js';
+import { Reader, configFilesPass, configLangsPass, releaseEgress, releaseSigns, scopeToPaths, walkWorkflow } from './coverage/walk.js';
 
 export { COVERAGE_LIMITS } from './coverage/bounds.js';
 export { loadToolSignatures, type ToolSignature } from './coverage/signatures.js';
@@ -258,6 +258,7 @@ export async function mapCoverage(p: RepoProfile, needs: Need[], dir: string, op
   await hookRunHits(ctx);
   await configFilesPass(ctx);
   await scopeToPaths(ctx);
+  await configLangsPass(ctx);
   const hooks = await readHooks(ctx);
   // Each need is answered from tables built once, not by a pass over every run (review C1).
   const dirs = new Dirs();

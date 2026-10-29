@@ -112,6 +112,8 @@ export interface Found {
   composeSentinel?: true;
   /** P59 (3): the run was given a path pipegen can't place: why (it can't cover a service, only be unknown there). */
   unplaced?: string;
+  /** P60 (R2): local semgrep rules files (repo paths) whose rules' languages add to `langs` (configLangsPass). */
+  langFiles?: readonly string[];
   /** P57 (C4): the pre-commit hook id this run comes from (readPrecommitConfig), so SKIP / PREK_SKIP can name it. */
   hookId?: string;
   /** P57 (C4): the hook's `alias`, which SKIP / PREK_SKIP may name instead of its id. */
@@ -147,6 +149,8 @@ export interface Hit {
   hookSkip?: SkipSet;
   /** P59 (3): Found.unplaced. */
   unplaced?: string;
+  /** P60 (R2): Found.langFiles. */
+  langFiles?: readonly string[];
 }
 
 export interface Budget { visits: number; bytes: number; truncated: boolean }

@@ -3824,4 +3824,39 @@ describe('coverage: closing patch (ruling P60)', () => {
     // directly in a step it still gives no coverage (C2)
     expect(await st(files, run('docker compose run -d app pytest'))).toBe('missing');
   });
+
+  it('R2: semgrep\'s languages come from its config; CodeQL\'s from its init languages (m2)', async () => {
+    const backend = svc('backend', { language: 'python', packageManager: 'uv', scripts: [] });
+    const frontend = svc('frontend', { quality: { ...emptyServiceQuality(), tsconfig: true } });
+    const sast = async (steps: string, files: Record<string, string> = {}, extra = '') => {
+      const dir = makeTempDir();
+      for (const [rel, text] of Object.entries({ 'backend/app.py': 'x = 1\n', 'frontend/a.ts': 'x\n', ...files })) writeIn(dir, rel, text);
+      wf(dir, 'ci.yml', `${both}${job(steps, extra)}`);
+      const rows = await coverage(dir, { services: [backend, frontend] });
+      return ['backend', 'frontend'].map((sv) => row(rows, 'merge', 'sast', sv).status);
+    };
+    expect(await sast(run('semgrep scan --config p/python --error'))).toEqual(['covered', 'missing']);
+    expect(await sast(run('semgrep scan --config=p/django --config p/flask --error .'))).toEqual(['covered', 'missing']);
+    expect(await sast(run('semgrep ci --config p/typescript'))).toEqual(['missing', 'covered']);
+    expect(await sast(run('semgrep scan -c r/python.lang.security.audit.x --error'))).toEqual(['covered', 'missing']);
+    for (const cmd of ['semgrep scan --config auto --error', 'semgrep scan --config p/default --error', 'semgrep ci', 'semgrep scan --config p/python --config p/javascript --error']) {
+      expect(await sast(run(cmd)), cmd).toEqual(['covered', 'covered']);
+    }
+    // a config pipegen can't read: partial for every service
+    for (const cmd of ['semgrep scan --config $RULES --error', 'semgrep scan --config rules/ --error', 'semgrep scan --config https://x.test/r.yml --error', 'semgrep scan --config p/some-new-pack --error']) {
+      expect(await sast(run(cmd), { 'rules/a.yml': 'rules: []\n' }), cmd).toEqual(['partial', 'partial']);
+    }
+    // a local rules file: the languages its rules list
+    const local = { 'semgrep.yml': 'rules:\n  - id: a\n    languages: [python]\n    pattern: eval(...)\n    message: m\n    severity: ERROR\n' };
+    expect(await sast(run('semgrep scan --config semgrep.yml --error'), local)).toEqual(['covered', 'missing']);
+    expect(await sast(run('semgrep scan --config semgrep.yml --error'), { 'semgrep.yml': 'rules: [{id: a, languages: [generic], pattern: x, message: m, severity: ERROR}]\n' })).toEqual(['covered', 'covered']);
+    // the semgrep action's config input
+    expect(await sast('      - uses: semgrep/semgrep-action@v1\n        with:\n          config: p/python\n')).toEqual(['covered', 'missing']);
+    // CodeQL: the init step's languages; a language it isn't set to scan is missing, not partial (m2)
+    const codeql = (langs: string) => `      - uses: github/codeql-action/init@v3\n${langs}      - uses: github/codeql-action/analyze@v3\n`;
+    expect(await sast(codeql('        with:\n          languages: python\n'))).toEqual(['partial', 'missing']);
+    expect(await sast(codeql('        with:\n          languages: ${{ matrix.language }}\n'), {}, '    strategy:\n      matrix:\n        language: [javascript-typescript]\n')).toEqual(['missing', 'partial']);
+    expect(await sast(codeql(''))).toEqual(['partial', 'partial']); // autodetect
+    expect(await sast(codeql('        with:\n          languages: ${{ inputs.l }}\n'))).toEqual(['partial', 'partial']);
+  });
 });

@@ -8,7 +8,7 @@ import { JOB_ID_RE, MAX_WORKFLOWS, WORKFLOW_FILE } from '../../read/workflows.js
 import { codeSecurityAvailable } from '../../github/availability.js';
 import { neverListed, plainNeverReason } from '../../engine/never-list.js';
 import { safeText } from '../../util/safe-text.js';
-import { MAX_FILTER_PATTERNS, MAX_HITS, MAX_JOBS, MAX_LOCAL_FILES, MAX_SCAN_BYTES, MAX_STEPS, MAX_STEP_VISITS } from './bounds.js';
+import { MAX_FILTER_PATTERNS, MAX_HITS, MAX_JOBS, MAX_LOCAL_FILES, MAX_SCAN_BYTES, MAX_SCRIPT_FILES, MAX_STEPS, MAX_STEP_VISITS } from './bounds.js';
 import { MAY_NOT_RUN, OPAQUE_WHY } from './decide.js';
 import { allowedToFail, cut, defaultsDir, firstSet, list, resolveDir, strs, validRef, workingDir } from './helpers.js';
 import { resolveScripts } from './scripts.js';
@@ -16,7 +16,8 @@ import {
   ALL_GATE, NO_GATE, OLD_PREFIX, OPAQUE_GATE, actionReason, actionSkipped, condition, foundOf, gateOf, gated, lowerInputs, orGate, refVerdict, requiredInputsHeld,
   configWhy, type EnvGate, type Inputs, type RepoId,
 } from './settings.js';
-import { imageName, preCommitRunMode, scanImage, scanShell, shellMode } from './shell.js';
+import { imageName, preCommitRunMode, scanImage, scanShell, semgrepLangs, shellMode } from './shell.js';
+import { codeqlLang, ruleFileLangs, toLangs } from './config-langs.js';
 import { composeEnvGated } from './docker.js';
 import { frontendArg, plainPath } from './docker-words.js';
 import { DOCKER_BUILD_ID, PART_RE, PREK_ID, isHookRunner, type ToolSignature } from './signatures.js';
@@ -168,6 +169,8 @@ interface StepCtx {
   foldCase?: boolean;
   /** P55 (batch B): steps of this job whose continue-on-error a later step undoes (rescuedSteps). */
   rescued?: ReadonlySet<Obj>;
+  /** P60 (R2): the languages the job's CodeQL init step sets (undefined: none set, CodeQL detects them). */
+  codeqlLangs?: readonly string[];
   /** Fix round 1: the job's runner, when `runs-on` is one literal label (lowercased), and whether it runs in a container. */
   runner: string | null;
   container: boolean;
@@ -213,6 +216,7 @@ function addFound(ctx: Ctx, found: Found[], c: StepCtx): void {
       ...(f.jobEnv === undefined ? {} : { jobEnv: f.jobEnv }),
       ...(f.langs === undefined ? {} : { langs: f.langs }), ...(f.pathArgs === undefined ? {} : { pathArgs: f.pathArgs }),
       ...(f.hookSkip === undefined ? {} : { hookSkip: f.hookSkip }), ...(f.unplaced === undefined ? {} : { unplaced: f.unplaced }),
+      ...(f.langFiles === undefined ? {} : { langFiles: f.langFiles }),
     });
   }
 }
@@ -281,6 +285,12 @@ function actionFinds(ctx: Ctx, tools: readonly ToolSignature[], uses: string, w:
       const b = buildActionBuild(w);
       if (b !== null) f.dockerBuild = b;
     }
+    // P60 (R2): the semgrep action's `config:`; CodeQL's languages from the job's init step
+    if (t.id === 'semgrep') {
+      const cfg = literalInput(w, 'config');
+      if (cfg !== undefined) Object.assign(f, semgrepLangs(cfg === null ? [null] : cfg.split(/[\s,]+/).filter((x) => x !== ''), '.'));
+    }
+    if (t.id === 'codeql' && c.codeqlLangs !== undefined) f.langs = c.codeqlLangs;
     if (isHookRunner(t.id)) {
       const mode = hookActionMode(t, w);
       if (mode === 'all') f.hookRun = true;
@@ -570,6 +580,8 @@ export async function walkWorkflow(ctx: Ctx, doc: Obj, path: string, fit: Fit, d
       release, runner: literalRunner(job), container: job.container !== undefined && job.container !== null, ...(foldsCase(job) ? { foldCase: true } : {}),
       rescued: rescuedSteps(kept),
     };
+    const ql = codeqlInitLangs(job, kept);
+    if (ql !== undefined) c.codeqlLangs = ql;
     let first = start;
     for (const [k, step] of kept.entries()) {
       await walkStep(ctx, step, c);
@@ -620,6 +632,70 @@ export async function configFilesPass(ctx: Ctx): Promise<void> {
       }
     }
     if (found !== null) ctx.hits[i] = { ...h, reason: 'config', partialWhy: configWhy(h.subject, `a ${found} file`) };
+  }
+}
+
+/**
+ * P60 (R2, m2): the languages a job's CodeQL init step sets (`languages:`, comma or space separated), mapped to service
+ * languages; `${{ matrix.<key> }}` is read from the job's literal matrix. undefined: no init step sets them (CodeQL
+ * detects the repo's languages). A value pipegen can't read is '?'.
+ */
+function codeqlInitLangs(job: Obj, steps: readonly Obj[]): readonly string[] | undefined {
+  const tags: string[] = [];
+  let set = false;
+  for (const st of steps) {
+    if (typeof st.uses !== 'string' || !/^github\/codeql-action\/init(?:@|$)/i.test(st.uses.trim())) continue;
+    const v = asObj(st.with).languages;
+    if (v === undefined || v === null || v === '') return undefined; // this init detects the languages itself
+    set = true;
+    if (typeof v !== 'string' || !regexSafe(v)) {
+      tags.push('?');
+      continue;
+    }
+    const m = /^\$\{\{\s*matrix\.([A-Za-z0-9_-]+)\s*\}\}$/.exec(v.trim());
+    if (m !== null) {
+      const matrix = asObj(asObj(job.strategy).matrix);
+      const listed = matrix[m[1] as string];
+      const inc = list(matrix.include).map((e) => asObj(e)[m[1] as string]);
+      const all = [...(Array.isArray(listed) ? listed : listed === undefined ? [] : [listed]), ...inc.filter((x) => x !== undefined)];
+      if (all.length === 0 || !all.every((x) => typeof x === 'string')) tags.push('?');
+      else for (const x of all as string[]) tags.push(codeqlLang(x));
+      continue;
+    }
+    if (v.includes('${{')) tags.push('?');
+    else for (const x of v.split(/[\s,]+/).filter((y) => y !== '')) tags.push(codeqlLang(x));
+  }
+  return set ? toLangs(tags) : undefined;
+}
+
+/**
+ * P60 (R2): a semgrep run's local rules files (Found.langFiles) add the languages their rules list. A file pipegen can't
+ * read (missing, a folder, a symbolic link, not valid YAML, past the script-file bound) is '?'. Each file is read once.
+ */
+export async function configLangsPass(ctx: Ctx): Promise<void> {
+  if (!ctx.hits.some((h) => h.langFiles !== undefined)) return;
+  const memo = new Map<string, readonly string[]>();
+  const langsOf = async (rel: string): Promise<readonly string[]> => {
+    let known = memo.get(rel);
+    if (known !== undefined) return known;
+    if (ctx.scriptFileReads >= MAX_SCRIPT_FILES) known = ['?'];
+    else {
+      ctx.scriptFileReads++;
+      const r = await ctx.scriptRead.yaml(rel);
+      known = 'ok' in r ? ruleFileLangs(r.ok) : ['?'];
+    }
+    memo.set(rel, known);
+    return known;
+  };
+  for (let i = 0; i < ctx.hits.length; i++) {
+    const h = ctx.hits[i] as Hit;
+    if (h.langFiles === undefined || h.langs === undefined) continue;
+    const tags = [...h.langs];
+    for (const f of h.langFiles) tags.push(...(await langsOf(f)));
+    const langs = toLangs(tags);
+    const { langs: _old, ...rest } = h;
+    void _old;
+    ctx.hits[i] = langs === undefined ? rest : { ...rest, langs };
   }
 }
 
