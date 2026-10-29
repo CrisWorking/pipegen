@@ -81,6 +81,8 @@ export const CANT_SEE: readonly string[] = Object.freeze([
   "Dockerfile RUN lines count only when a `docker build`, docker/build-push-action or `docker compose build` step names the Dockerfile with plain paths, and only for the stages the final stage (or the target) needs. Build arguments and ENV count only as variables the RUN lines see; a Compose `extends`, `include`, `--env-file` or COMPOSE_FILE, and a custom Dockerfile frontend, show as unknown.",
   // P59 (1): a command word that is a variable (`RUN $TEST_CMD`, `$CMD args`) is never credited to any tool
   "Commands given through a variable aren't read.",
+  // P60 (R4), re-review 2: a folder with two languages is one service; a tool of either language covers its row
+  "A folder with more than one language (like a Python app with a package.json for its assets) is one service: a check run in either language counts for it, so pipegen can't tell if each language is checked.",
   // P57 (M4, C1)
   "A Dockerfile `ENTRYPOINT` in shell form, or a compose `entrypoint:`, can ignore the command `docker compose run` or `docker run` passes, so a check run that way may not run at all: pipegen doesn't read the entrypoint.",
   "A tool counts only for services in the languages pipegen lists for it (mypy and Ruff for Python, ESLint and tsc for JavaScript and TypeScript); a tool set up to check other languages as well isn't credited for them.",

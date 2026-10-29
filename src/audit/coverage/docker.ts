@@ -281,9 +281,14 @@ export async function placeComposeRun(ctx: Ctx, f: Found): Promise<Found | null>
       fileEnv = { ...fileEnv, ...names };
     }
   }
+  // an env_file pipegen couldn't place or read could set anything: unknown, with its own reason (re-review 2, n1)
+  if (fileEnv === null) {
+    return { categories: rest.categories.map((c) => (c.startsWith(UNKNOWN_PREFIX) ? c : `${UNKNOWN_PREFIX}${c}`)), by: rest.by, subject: rest.subject, dir: null, reason: null,
+      partialWhy: `${rest.subject} runs through docker compose with an env_file pipegen couldn't place or read, and that file could set a variable that changes what runs, so pipegen can't tell what it checks.` };
+  }
   // P57 (C5): the image's ENV and the service's environment: reach the command like a step's env: (an env given as a
   // plain string is "could be anything" to gateOf)
-  const [placed] = gated([{ ...rest, dir, compose: true }], gateOf([], [...envsOf({ ...imageEnv, ...(fileEnv ?? {}), ...svc.environment }), ...(fileEnv === null ? ['$'] : [])], undefined, ctx.sigs.softEnv, ctx.sigs.configFiles));
+  const [placed] = gated([{ ...rest, dir, compose: true }], gateOf([], envsOf({ ...imageEnv, ...fileEnv, ...svc.environment }), undefined, ctx.sigs.softEnv, ctx.sigs.configFiles));
   return placed ?? null;
 }
 

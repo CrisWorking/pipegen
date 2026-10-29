@@ -208,6 +208,9 @@ What this audit can't see
     a Compose `extends`, `include`, `--env-file` or COMPOSE_FILE, and a custom Dockerfile frontend,
     show as unknown.
   - Commands given through a variable aren't read.
+  - A folder with more than one language (like a Python app with a package.json for its assets) is
+    one service: a check run in either language counts for it, so pipegen can't tell if each
+    language is checked.
   - A Dockerfile `ENTRYPOINT` in shell form, or a compose `entrypoint:`, can ignore the command
     `docker compose run` or `docker run` passes, so a check run that way may not run at all: pipegen
     doesn't read the entrypoint.

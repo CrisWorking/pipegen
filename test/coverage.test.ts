@@ -3692,6 +3692,8 @@ describe('coverage: ruling P59 (round 2)', () => {
     expect(await st({ 'package.json': JSON.stringify({ name: 'a', scripts: { ci: '$X pytest' } }) }, run('npm run ci'))).toBe('missing');
     const { CANT_SEE } = await import('../src/audit/render.js');
     expect(CANT_SEE).toContain("Commands given through a variable aren't read.");
+    // re-review 2: a service with two languages (P60 R4) is covered by a tool of either language
+    expect(CANT_SEE.some((l) => /two languages|more than one language/.test(l))).toBe(true);
   });
 
   it('2. prek --directory / --glob and pre-commit --files run on part of the repo: partial with their own reason', async () => {
@@ -3759,6 +3761,15 @@ describe('coverage: closing patch (ruling P60)', () => {
     // a file pipegen can't read (missing, a variable path) is unsure: never covered
     expect(await st(compose('missing.env'), steps)).not.toBe('covered your own `tox`');
     expect(await st(compose('${ENV_FILE}'), steps)).not.toBe('covered your own `tox`');
+    // re-review 2 (n1): the reason names the env file, not COMPOSE_FILE / COMPOSE_PROFILES
+    for (const envFile of ['missing.env', '${ENV_FILE}']) {
+      const dir = makeTempDir();
+      for (const [rel, text] of Object.entries(compose(envFile))) writeIn(dir, rel, text);
+      ci(dir, steps);
+      const r = row(await coverage(dir, { services: [app] }), 'push', 'unit-tests', 'app');
+      expect(r.why, envFile).toMatch(/env_file/);
+      expect(r.why, envFile).not.toMatch(/COMPOSE_FILE|COMPOSE_PROFILES/);
+    }
   });
 
   it('R3: a build arg whose name pipegen can\'t read (a variable, a quoted expression) is unsure', async () => {
