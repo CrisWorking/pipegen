@@ -3,9 +3,9 @@ import { regexSafe } from '../../read/limits.js';
 import { MAX_FLAG_WORDS, MAX_SCAN_BYTES, MAX_SCRIPT_PATTERNS, MAX_SCRIPT_TARGETS } from './bounds.js';
 import { resolveDir } from './helpers.js';
 import { safeText } from '../../util/safe-text.js';
-import { UNKNOWN_PREFIX, commandReason, configTurnedOff, flagsAllow, foundOf, inputWords, inputWordsCapped, inputsCrowded, type Inputs } from './settings.js';
+import { UNKNOWN_PREFIX, commandReason, configTurnedOff, flagsAllow, foundOf, inputWords, inputWordsCapped, inputsCrowded, orSkip, skipValue, skipsAny, type Inputs, type SkipSet } from './settings.js';
 import { buildWords, composeBuildServices, composeRunWords, composeWords } from './docker-words.js';
-import { COMPOSE_BUILD_ID, DOCKER_BUILD_ID, isHookRunner } from './signatures.js';
+import { COMPOSE_BUILD_ID, DOCKER_BUILD_ID, PREK_ID, isHookRunner } from './signatures.js';
 import { tokenize } from './tokenize.js';
 import { semgrepConfig, toLangs } from './config-langs.js';
 import type { Budget, CommandRule, Compiled, DockerBuild, Found, Reason } from './types.js';
@@ -332,6 +332,22 @@ export function unplacedRun(f: Found): Found {
   return { ...f, unplaced: `${f.subject} is given a path pipegen can't place (a variable, an expression, a glob or a path outside the repo), so it can't tell which services it checks.` };
 }
 const NPM_PROVENANCE_ID = 'npm-provenance';
+/** P60 (m3): prek run's `--skip <hook>` / `--skip=<hook>` words taken out (each value a hook id or alias), and what they skip. */
+function prekSkipArgs(words: readonly string[]): { words: string[]; skip: SkipSet | null } {
+  const out: string[] = [];
+  let skip: SkipSet | null = null;
+  for (let i = 0; i < words.length; i++) {
+    const w = words[i] as string;
+    const v = w === '--skip' ? (words[++i] ?? null) : w.startsWith('--skip=') ? w.slice('--skip='.length) : undefined;
+    if (v === undefined) {
+      out.push(w);
+      continue;
+    }
+    const one = v === null || v === '' ? skipValue('$') : skipValue(v);
+    skip = skip === null ? one : orSkip(skip, one);
+  }
+  return { words: out, skip };
+}
 const SEMGREP_ID = 'semgrep';
 const SEMGREP_SCAN_ID = 'semgrep-scan';
 /** P60 (R2): semgrep's `--config` / `-c` / `-f` values on a command line (null: one pipegen can't read). */
@@ -642,7 +658,13 @@ export function scanShell(text: string, base: string | null, sigs: Compiled, bud
         // another folder pre-commit reads that folder's .pre-commit-config.yaml (fix round 1, I2). P55: prek is read the
         // same way, and a run over the files between two refs is 'changed'
         if (isHookRunner(r.tool.id) && r.rest.length === 1 && r.rest[0] === 'run' && segEnd[k]! - k - 1 <= MAX_FLAG_WORDS && cwd === '.') {
-          const mode = preCommitRunMode(args.slice(1));
+          // P60 (m3): prek's `--skip <hook>` (repeatable) lowers the hooks it names, like SKIP; a value pipegen can't read: unknown
+          const rest = r.tool.id === PREK_ID ? prekSkipArgs(args.slice(1)) : { words: args.slice(1), skip: null };
+          if (rest.skip !== null && skipsAny(rest.skip)) {
+            f.hookSkip = rest.skip;
+            f.reason ??= 'skip';
+          }
+          const mode = preCommitRunMode(rest.words);
           if (mode === 'all') f.hookRun = true;
           else if (mode !== null) f.hookRun = mode;
         }

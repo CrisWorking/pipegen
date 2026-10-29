@@ -3866,4 +3866,16 @@ describe('coverage: closing patch (ruling P60)', () => {
     }
     expect(await st({ Dockerfile: `${IMG}ENV FOO=1\nRUN tox\n`, 'tox.ini': '[tox]\n' }, run('docker build .'))).toBe('covered your own `tox`');
   });
+
+  it('m3: prek run --skip <hook> lowers only the hooks it names; a value pipegen can\'t read is unknown for every hook', async () => {
+    const YAML = 'repos:\n  - repo: https://github.com/pre-commit/mirrors-mypy\n    rev: v1.18.2\n    hooks:\n      - id: mypy\n'
+      + '  - repo: https://github.com/astral-sh/ruff-pre-commit\n    rev: v0.16.0\n    hooks:\n      - id: ruff\n';
+    const two = async (cmd: string) => ['lint', 'type-check'].map(async (id) => st({ '.pre-commit-config.yaml': YAML }, run(cmd), id));
+    const both2 = async (cmd: string) => Promise.all(await two(cmd));
+    expect(await both2('prek run --all-files --skip mypy')).toEqual(['covered ruff', 'partial mypy']);
+    expect(await both2('prek run --all-files --skip=mypy')).toEqual(['covered ruff', 'partial mypy']);
+    expect(await both2('prek run --all-files --skip mypy --skip ruff')).toEqual(['partial ruff', 'partial mypy']);
+    const unknown = await both2('prek run --all-files --skip "$S"');
+    expect(unknown.every((x) => x.startsWith('unknown')), unknown.join()).toBe(true);
+  });
 });

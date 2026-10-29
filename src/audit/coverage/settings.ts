@@ -498,7 +498,7 @@ export const orSkip = (a: SkipSet, b: SkipSet): SkipSet =>
   (b.ids.size === 0 && !b.unknown ? a : a.ids.size === 0 && !a.unknown ? b : { ids: new Set([...a.ids, ...b.ids]), unknown: a.unknown || b.unknown });
 export const skipsAny = (s: SkipSet) => s.unknown || s.ids.size > 0;
 /** A SKIP value from an `env:` map: literal ids, nothing (empty), or unknown. */
-function skipValue(v: unknown): SkipSet {
+export function skipValue(v: unknown): SkipSet {
   if (v === null || v === undefined || v === '') return NO_SKIP;
   if (typeof v !== 'string' || v.length > 64_000 || !/^[A-Za-z0-9_.,\s-]*$/.test(v)) return UNKNOWN_SKIP;
   return { ids: new Set(v.split(',').map((x) => x.trim()).filter((x) => x !== '')), unknown: false };
@@ -638,7 +638,7 @@ export const gated = (found: Found[], g: EnvGate): Found[] => found
     // P57 (C4): the run itself is partial (some hooks may not run); hookRunHits lowers only the hooks SKIP names
     if (isHookRunner(f.by)) {
       const skip = f.by === PREK_ID ? orSkip(g.skip, g.prekSkip) : g.skip;
-      if (skipsAny(skip)) return { ...f, reason: f.reason ?? 'skip', hookSkip: skip };
+      if (skipsAny(skip)) return { ...f, reason: f.reason ?? 'skip', hookSkip: orSkip(f.hookSkip ?? skip, skip) };
     }
     // fix round 1 (P8): a softEnv name set in the job; a CI pre-commit run keeps the job env for the hooks it carries
     const set = softEnvSet(f.softEnv, g.env);
