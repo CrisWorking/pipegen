@@ -75,35 +75,60 @@ const SERVICE_RE = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$/;
 export interface ComposeWords {
   /** The compose files named by -f/--file, in order (plain relative paths); null = none named (the default files). */
   files: string[] | null;
+  /** P57 (C3): the profiles `--profile` turns on (literal names, `*` for all). */
+  profiles: string[];
+  /**
+   * P57 (C3): why pipegen can't tell which compose files or services this command uses (an --env-file, a -f it can't
+   * place, --project-directory, a global flag it doesn't know), or null. The command is still what it is (a build, a run),
+   * but what runs inside it is unknown, never covered and never missing.
+   */
+  unsure: string | null;
   /** The subcommand word (build, run, exec, up, …) and its index, or null when the line ends or a flag isn't known. */
   sub: string | null;
   subAt: number;
 }
 /**
- * The global flags of `docker compose` / `docker-compose` from index `from`, up to the subcommand. Null for a flag
- * pipegen doesn't know, `--project-directory` (it moves where paths are read from), `--dry-run` (nothing runs) and a
- * `-f` that isn't a plain relative path.
+ * The global flags of `docker compose` / `docker-compose` from index `from`, up to the subcommand. Null for `--dry-run`
+ * (nothing runs) or a line that ends early. P57 (C3): an `--env-file` (it may set COMPOSE_FILE or COMPOSE_PROFILES), a
+ * `-f` that isn't a plain relative path, `--project-directory` (it moves where paths are read from) and a flag pipegen
+ * doesn't know give `unsure`: the subcommand is still read, what runs inside it is unknown. A global flag pipegen
+ * doesn't know may take the next word as its value, so the subcommand is looked for past it only when that word is
+ * one compose knows.
  */
+const COMPOSE_SUBCOMMANDS: ReadonlySet<string> = new Set(['build', 'run', 'exec', 'up']);
 export function composeWords(at: At, from: number, end: number): ComposeWords | null {
   const files: string[] = [];
+  const profiles: string[] = [];
+  let unsure: string | null = null;
   let i = from;
   for (; i < end; i++) {
     const w = at(i);
     if (w === null) return null;
-    if (!w.startsWith('-') || w === '-') break;
+    if (!w.startsWith('-') || w === '-') {
+      if (unsure !== null && !COMPOSE_SUBCOMMANDS.has(w) && i + 1 < end) continue; // the value of a flag pipegen doesn't know
+      break;
+    }
     const eq = w.indexOf('=');
     const name = eq < 0 ? w : w.slice(0, eq);
+    if (name === '--dry-run') return null;
     if (COMPOSE_GLOBAL_VALUE.has(name)) {
       const value = eq < 0 ? at(++i) : w.slice(eq + 1);
       if (value === null) return null;
       if (name === '-f' || name === '--file') {
         const p = plainPath(value);
-        if (p === null) return null;
-        files.push(p);
+        if (p === null) unsure ??= "a compose file named by a variable or a path pipegen can't place";
+        else files.push(p);
+      } else if (name === '--env-file') unsure ??= "an --env-file pipegen doesn't read (it may set COMPOSE_FILE or COMPOSE_PROFILES)";
+      else if (name === '--profile') {
+        if (/^[A-Za-z0-9_.*-]{1,64}$/.test(value)) profiles.push(value);
+        else unsure ??= "a profile pipegen can't read";
       }
-    } else if (!(eq < 0 && COMPOSE_GLOBAL_BOOL.has(name))) return null;
+    } else if (name === '--project-directory') {
+      if (eq < 0) i++;
+      unsure ??= 'a --project-directory, which moves where compose reads its files';
+    } else if (!(eq < 0 && COMPOSE_GLOBAL_BOOL.has(name))) unsure ??= "a compose flag pipegen doesn't know";
   }
-  return { files: files.length === 0 ? null : files, sub: i < end ? at(i) : null, subAt: i };
+  return { files: files.length === 0 ? null : files, profiles, unsure, sub: i < end ? at(i) : null, subAt: i };
 }
 
 /** `docker compose build [flags] [service…]`: the service names, or null (unknown flag, `--dry-run`, a word that isn't a service). */

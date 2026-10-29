@@ -35,8 +35,17 @@ type Resolve = (ctx: Ctx, found: Found[]) => Promise<Found[]>;
 
 // ---------- compose files ----------
 
-interface ComposeService { context: string | null; file: string | null; target: string | null; hasBuild: boolean }
-export type ComposeModel = ReadonlyMap<string, ComposeService> | 'unreadable' | 'missing';
+interface ComposeService { context: string | null; file: string | null; target: string | null; hasBuild: boolean; profiles: readonly string[] }
+/** The services, or: no compose file ('missing'), one pipegen couldn't read ('unreadable'), or a set it can't be sure of (`why`, P57 C3). */
+export type ComposeModel = ReadonlyMap<string, ComposeService> | 'unreadable' | 'missing' | { why: string };
+/** P57 (C3): the variables that pick other compose files or services (https://docs.docker.com/compose/how-tos/environment-variables/envvars/). */
+export const COMPOSE_ENV: readonly string[] = ['COMPOSE_FILE', 'COMPOSE_PROFILES', 'COMPOSE_PATH_SEPARATOR'];
+const COMPOSE_ENV_LINE = /^\s*(?:export\s+)?(?:COMPOSE_FILE|COMPOSE_PROFILES|COMPOSE_PATH_SEPARATOR)\s*=/m;
+/** P57 (C3): whether a service runs with these profiles on: no profile of its own, named on the command line, or one of its profiles on (`*`: all). */
+/** The `why` of a compose model pipegen can't be sure of, else null. */
+const unsureModel = (m: ComposeModel): string | null => (typeof m === 'object' && 'why' in m ? m.why : null);
+const active = (svc: ComposeService, name: string, on: readonly string[], named: readonly string[] | null): boolean =>
+  svc.profiles.length === 0 || (named?.includes(name) ?? false) || on.includes('*') || svc.profiles.some((p) => on.includes(p));
 const COMPOSE_FAMILIES: readonly (readonly [string, string])[] = [
   ['compose.yaml', 'compose.override.yaml'], ['compose.yml', 'compose.override.yml'], ['docker-compose.yaml', 'docker-compose.override.yaml'], ['docker-compose.yml', 'docker-compose.override.yml'],
 ];
@@ -66,6 +75,16 @@ async function composeModel(ctx: Ctx, files: readonly string[] | null, cwd: stri
       const r = await ctx.scriptRead.yaml(rel);
       return 'ok' in r ? r.ok : r.fail === 'missing' ? 'missing' : 'unreadable';
     };
+    // P57 (C3): a .env in the folder compose runs in (or the first file's) that sets COMPOSE_FILE or COMPOSE_PROFILES picks
+    // other files or services; one pipegen can't read might
+    const envFolders = new Set([cwd, ...(candidates?.[0] === null || candidates === null ? [] : [posix.dirname(candidates[0] as string) || '.'])]);
+    for (const folder of envFolders) {
+      const rel = resolveDir(folder, '.env');
+      if (rel === null || !spend(ctx)) return { why: "a .env file pipegen couldn't check" };
+      const env = await ctx.scriptRead.text(rel);
+      if ('fail' in env && env.fail !== 'missing') return { why: "a .env file pipegen couldn't read (it may set COMPOSE_FILE or COMPOSE_PROFILES)" };
+      if ('ok' in env && COMPOSE_ENV_LINE.test(env.ok)) return { why: 'a .env file that sets COMPOSE_FILE or COMPOSE_PROFILES' };
+    }
     if (candidates !== null) {
       for (const rel of candidates) {
         const d = await tryRead(rel);
@@ -91,11 +110,18 @@ async function composeModel(ctx: Ctx, files: readonly string[] | null, cwd: stri
     const baseDir = docs[0]!.dir === '' ? '.' : docs[0]!.dir;
     const out = new Map<string, ComposeService>();
     for (const { doc } of docs) {
+      // P57 (C3): other files pipegen doesn't follow can add or change services
+      if ('include' in doc) return { why: 'a compose file with an include: pipegen doesn\'t follow' };
       for (const [name, raw] of Object.entries(asObj(doc.services)).slice(0, MAX_COMPOSE_SERVICES)) {
         const svc = asObj(raw);
         const prev = out.get(name);
+        if ('extends' in svc) return { why: `a compose service (${name}) that extends another, which pipegen doesn't follow` };
+        // a later file's profiles replace an earlier one's; a value pipegen can't read leaves the set unknown
+        const profiles = !('profiles' in svc) ? (prev?.profiles ?? []) : Array.isArray(svc.profiles) && svc.profiles.every((x) => typeof x === 'string') ? svc.profiles as string[] : null;
+        if (profiles === null) return { why: `a compose service (${name}) whose profiles pipegen can't read` };
         if (!('build' in svc) || svc.build === null || svc.build === undefined) {
-          if (prev === undefined) out.set(name, { context: null, file: null, target: null, hasBuild: false });
+          if (prev === undefined) out.set(name, { context: null, file: null, target: null, hasBuild: false, profiles });
+          else out.set(name, { ...prev, profiles });
           continue;
         }
         const b = typeof svc.build === 'string' ? { context: svc.build } : asObj(svc.build);
@@ -107,7 +133,7 @@ async function composeModel(ctx: Ctx, files: readonly string[] | null, cwd: stri
           : dockerfile === undefined ? (typeof b.context === 'string' || prev?.file === null || prev === undefined ? resolveDir(folder, 'Dockerfile') : prev.file)
             : /[$\\]|^\//.test(dockerfile) ? null : resolveDir(folder, dockerfile);
         const target = typeof b.target === 'string' ? (/^[A-Za-z0-9_.-]{1,64}$/.test(b.target) ? b.target : '?') : (prev?.target ?? null);
-        out.set(name, { context: folder, file, target, hasBuild: true });
+        out.set(name, { context: folder, file, target, hasBuild: true, profiles });
       }
     }
     return out;
@@ -130,12 +156,14 @@ function plainContext(baseDir: string, word: string): string | null {
 export async function placeComposeRun(ctx: Ctx, f: Found): Promise<Found | null> {
   const run = f.composeRun;
   if (run === undefined) return f;
-  const model = await composeModel(ctx, run.files, run.cwd);
+  const model = run.unsure !== null ? { why: run.unsure } : await composeModel(ctx, run.files, run.cwd);
   if (model === 'missing') return null; // the runner fails: nothing runs
-  const svc = model === 'unreadable' ? undefined : model.get(run.service);
+  const unsure = unsureModel(model);
+  const svc = typeof model === 'string' || unsure !== null ? undefined : (model as ReadonlyMap<string, ComposeService>).get(run.service);
   if (svc === undefined || !svc.hasBuild || svc.context === null) {
-    const why = model === 'unreadable' ? "a compose file pipegen couldn't read" : svc === undefined ? `a service (${run.service}) that isn't in the compose file`
-      : !svc.hasBuild ? `a service (${run.service}) that uses a ready-made image` : "a service whose build folder pipegen can't place";
+    const why = model === 'unreadable' ? "a compose file pipegen couldn't read" : unsure !== null ? `a compose setup pipegen can't be sure of (${unsure})`
+      : svc === undefined ? `a service (${run.service}) that isn't in the compose file`
+        : !svc.hasBuild ? `a service (${run.service}) that uses a ready-made image` : "a service whose build folder pipegen can't place";
     return { categories: UNKNOWN_SCRIPT_CATEGORIES, by: f.by, subject: f.subject, dir: null, reason: null, partialWhy: `${f.subject} runs in ${why}, so pipegen can't tell which service it checks.` };
   }
   // the command runs in the image's last WORKDIR (the folder COPY put there): the host folder it maps to, else the build folder
@@ -151,7 +179,7 @@ export async function placeComposeRun(ctx: Ctx, f: Found): Promise<Found | null>
   }
   const { composeRun: _placed, ...rest } = f;
   void _placed;
-  return { ...rest, dir };
+  return { ...rest, dir, compose: true };
 }
 
 // ---------- Dockerfiles ----------
@@ -391,14 +419,22 @@ export async function buildRuns(ctx: Ctx, f: Found, resolve: Resolve): Promise<F
   const builds: DockerBuild[] = [];
   if (f.dockerBuild !== undefined) builds.push(f.dockerBuild);
   if (f.composeBuild !== undefined) {
-    const model = await composeModel(ctx, f.composeBuild.files, f.composeBuild.cwd);
+    const cb = f.composeBuild;
+    const model = cb.unsure !== null ? { why: cb.unsure } : await composeModel(ctx, cb.files, cb.cwd);
     if (model === 'unreadable') {
       return [{ categories: UNKNOWN_SCRIPT_CATEGORIES, by: f.by, subject: f.subject, dir: f.dir, reason: null, partialWhy: `${f.subject} uses a compose file pipegen couldn't read, so it can't tell what the Dockerfiles run.` }];
     }
+    const unsure = unsureModel(model);
+    if (unsure !== null) {
+      // P57 (C3): which services compose builds depends on something pipegen can't read: any service's checks may run
+      return [{ categories: UNKNOWN_SCRIPT_CATEGORIES, by: f.by, subject: f.subject, dir: null, reason: null, partialWhy: `${f.subject} uses ${unsure}, so pipegen can't tell which services it builds or what their Dockerfiles run.` }];
+    }
     if (model !== 'missing') {
-      const names = f.composeBuild.services ?? [...model.keys()];
+      const services = model as ReadonlyMap<string, ComposeService>;
+      // P57 (C3): with no service named, only the services whose profiles are on are built
+      const names = cb.services ?? [...services.keys()].filter((n) => active(services.get(n) as ComposeService, n, cb.profiles, null));
       for (const name of names.slice(0, MAX_COMPOSE_SERVICES)) {
-        const svc = model.get(name);
+        const svc = services.get(name);
         if (svc === undefined || !svc.hasBuild) continue;
         if (svc.context === null || svc.file === null || svc.target === '?') {
           return [{ categories: UNKNOWN_SCRIPT_CATEGORIES, by: f.by, subject: f.subject, dir: f.dir, reason: null, partialWhy: `${f.subject} builds a service (${name}) whose Dockerfile pipegen can't place, so it can't tell what it runs.` }];
@@ -411,6 +447,26 @@ export async function buildRuns(ctx: Ctx, f: Found, resolve: Resolve): Promise<F
   // the building command's own reason (an `||`, a pipe, an if); the image build's "partial" for compose is not one
   const outer = f.composeBuild === undefined ? f.reason : f.composeBuild.shellReason;
   for (const b of builds) out.push(...(await dockerfileRuns(ctx, b, f, outer, resolve)));
-  return out;
+  return f.composeBuild === undefined ? out : out.map((g) => ({ ...g, compose: true as const }));
+}
+
+/** P57 (C3): what pipegen says for a compose run or build when a COMPOSE_FILE / COMPOSE_PROFILES variable may be set. */
+const composeEnvWhy = (subject: string) =>
+  `${subject} runs through docker compose, and a COMPOSE_FILE or COMPOSE_PROFILES variable set in this job can change which compose files and services it uses, so pipegen can't tell what it checks.`;
+/**
+ * P57 (C3): a step whose job may set COMPOSE_FILE, COMPOSE_PROFILES or COMPOSE_PATH_SEPARATOR (EnvGate.compose): a
+ * compose run or build there is unknown for every service, whatever the default compose file says (its own services may
+ * hold no tests while the file the variable names does). Applied before the commands are followed; a compose command
+ * reached through a package script is caught later by its `compose` mark (settings.ts, gated).
+ */
+export function composeEnvGated(found: readonly Found[], compose: boolean): Found[] {
+  if (!compose) return [...found];
+  return found.map((f) => {
+    if (f.composeRun !== undefined) return { categories: UNKNOWN_SCRIPT_CATEGORIES, by: f.by, subject: f.subject, dir: null, reason: null, partialWhy: composeEnvWhy(f.subject) };
+    if (f.composeBuild === undefined) return f;
+    const { composeBuild: _cb, ...build } = f;
+    void _cb;
+    return build;
+  }).concat(found.filter((f) => f.composeBuild !== undefined).map((f) => ({ categories: UNKNOWN_SCRIPT_CATEGORIES, by: f.by, subject: f.subject, dir: null, reason: null, partialWhy: composeEnvWhy(f.subject) })));
 }
 

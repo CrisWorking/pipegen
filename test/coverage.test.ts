@@ -1132,10 +1132,11 @@ describe('mapCoverage (P55 batch B: docker compose and Dockerfile RUN)', () => {
 
   it('docker compose build (and docker-compose, -f, up --build) is a partial image build; a dry run or a plain up is not', async () => {
     const image = (steps: string) => statusOf({ 'compose.yml': COMPOSE }, steps, 'image-build');
-    for (const cmd of ['docker compose build', 'docker-compose build', 'docker compose -f compose.yml build web', 'docker compose up --build -d']) {
+    // P57 (C3): --project-directory moves where compose reads its files, but the build still runs (what it runs is unknown)
+    for (const cmd of ['docker compose build', 'docker-compose build', 'docker compose -f compose.yml build web', 'docker compose up --build -d', 'docker compose --project-directory x build']) {
       expect(await image(run(cmd)), cmd).toBe('partial docker-compose-build');
     }
-    for (const cmd of ['docker compose --dry-run build', 'docker compose up -d', 'docker compose --project-directory x build', 'docker compose build --dry-run']) {
+    for (const cmd of ['docker compose --dry-run build', 'docker compose up -d', 'docker compose build --dry-run']) {
       expect(await image(run(cmd)), cmd).toBe('missing');
     }
   });
@@ -3349,5 +3350,54 @@ describe('coverage: a detached compose or docker run gives no coverage (P57 C2)'
     for (const cmd of ['docker run -d img:1 pytest', 'docker run --detach img:1 pytest', 'docker run -dit img:1 pytest', 'docker run --rm -d -e A=b img:1 pytest']) {
       expect(await unitTests(run(cmd)), cmd).toBe('missing');
     }
+  });
+});
+
+describe('coverage: pipegen reads the compose files and services Compose really uses, else unknown (P57 C3)', () => {
+  const app = svc('.', { language: 'python', packageManager: 'uv', scripts: ['start'], frameworks: ['fastapi'] });
+  const TEST_DOCKERFILE = 'FROM python:3.14\nWORKDIR /app\nCOPY . /app\nRUN pytest\n';
+  const PLAIN = 'FROM python:3.14\nWORKDIR /app\nCOPY . /app\n';
+  const PROFILED = 'services:\n  app:\n    build: .\n  tests:\n    profiles: [test]\n    build:\n      context: .\n      dockerfile: Dockerfile.test\n';
+  const TESTS = 'services:\n  app:\n    build: .\n  tests:\n    build:\n      context: .\n      dockerfile: Dockerfile.test\n';
+  const CI_ONLY = 'services:\n  app:\n    build: .\n';
+  const st = async (files: Record<string, string>, steps: string) => {
+    const dir = makeTempDir();
+    for (const [rel, text] of Object.entries({ Dockerfile: PLAIN, 'Dockerfile.test': TEST_DOCKERFILE, ...files })) writeIn(dir, rel, text);
+    ci(dir, steps);
+    const r = row(await coverage(dir, { services: [app] }), 'push', 'unit-tests', 'app');
+    return `${r.status}${r.by === undefined ? '' : ` ${r.by}`}`;
+  };
+
+  it('dk probe: a service under a profile the command doesn\'t enable is not built, so its RUN lines don\'t run', async () => {
+    expect(await st({ 'compose.yml': PROFILED }, run('docker compose build'))).toBe('missing');
+    expect(await st({ 'compose.yml': PROFILED }, run('docker compose --profile other build'))).toBe('missing');
+    // enabled by --profile, or named on the command line: it is built
+    expect(await st({ 'compose.yml': PROFILED }, run('docker compose --profile test build'))).toBe('covered your own `pytest`');
+    expect(await st({ 'compose.yml': PROFILED }, run('docker compose build tests'))).toBe('covered your own `pytest`');
+    expect(await st({ 'compose.yml': PROFILED }, run('docker compose --profile "*" build'))).toBe('covered your own `pytest`');
+    expect(await st({ 'compose.yml': TESTS }, run('docker compose build'))).toBe('covered your own `pytest`'); // control: no profile
+  });
+
+  it('dk probe: COMPOSE_FILE or COMPOSE_PROFILES in the step, job or workflow env, or in the repo .env, makes the compose model unknown', async () => {
+    const files = { 'compose.yml': TESTS, 'compose.ci.yml': CI_ONLY };
+    for (const steps of [
+      '      - run: docker compose build\n        env:\n          COMPOSE_FILE: compose.ci.yml\n',
+      '      - run: docker compose build\n        env:\n          COMPOSE_PROFILES: x\n',
+      run('COMPOSE_FILE=compose.ci.yml docker compose build'),
+      run('echo "COMPOSE_FILE=compose.ci.yml" >> "$GITHUB_ENV"') + run('docker compose build'),
+    ]) expect(await st(files, steps), steps).toMatch(/^unknown/);
+    expect(await st({ ...files, '.env': 'FOO=1\nCOMPOSE_FILE=compose.ci.yml\n' }, run('docker compose build'))).toMatch(/^unknown/);
+    expect(await st({ ...files, '.env': 'export COMPOSE_PROFILES=x\n' }, run('docker compose build'))).toMatch(/^unknown/);
+    // an unrelated .env changes nothing
+    expect(await st({ ...files, '.env': 'FOO=1\n' }, run('docker compose build'))).toBe('covered your own `pytest`');
+    // the same rule for compose run
+    expect(await st({ 'compose.yml': TESTS }, '      - run: docker compose run --rm tests pytest\n        env:\n          COMPOSE_FILE: compose.ci.yml\n')).toMatch(/^unknown/);
+  });
+
+  it('dk probe: an include: or extends: pipegen doesn\'t follow, an --env-file or a -f it can\'t place is unknown, never covered or missing', async () => {
+    expect(await st({ 'compose.yml': `include:\n  - other.yml\n${TESTS}` }, run('docker compose build'))).toMatch(/^unknown/);
+    expect(await st({ 'compose.yml': `${TESTS}  more:\n    extends:\n      file: base.yml\n      service: x\n` }, run('docker compose build'))).toMatch(/^unknown/);
+    expect(await st({ 'compose.yml': TESTS }, run('docker compose --env-file ci.env build'))).toMatch(/^unknown/);
+    expect(await st({ 'compose.yml': TESTS }, run('docker compose -f "$COMPOSE" build'))).toMatch(/^unknown/);
   });
 });

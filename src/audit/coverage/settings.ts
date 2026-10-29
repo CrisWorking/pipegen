@@ -486,21 +486,25 @@ export function configTurnedOff(tool: ToolSignature, args: readonly string[]): b
  * NOX… pick envs or sessions (tox 4 reads TOX_<option>; TOXENV; NOXSESSION), SKIP skips pre-commit hooks
  * (https://pre-commit.com/#temporarily-disabling-hooks). An action that sets one through GITHUB_ENV isn't seen.
  */
-export interface EnvGate { tox: boolean; nox: boolean; skip: boolean; npm: boolean; env: JobEnv }
+export interface EnvGate {
+  tox: boolean; nox: boolean; skip: boolean; npm: boolean; env: JobEnv;
+  /** P57 (C3): COMPOSE_FILE, COMPOSE_PROFILES or COMPOSE_PATH_SEPARATOR may be set, so pipegen can't tell which compose files and services run. */
+  compose: boolean;
+}
 const NO_ENV: JobEnv = { all: false, names: new Set(), files: new Set() };
-export const NO_GATE: EnvGate = { tox: false, nox: false, skip: false, npm: false, env: NO_ENV };
-export const ALL_GATE: EnvGate = { tox: true, nox: true, skip: true, npm: true, env: { all: true, names: new Set(), files: new Set() } };
+export const NO_GATE: EnvGate = { tox: false, nox: false, skip: false, npm: false, env: NO_ENV, compose: false };
+export const ALL_GATE: EnvGate = { tox: true, nox: true, skip: true, npm: true, env: { all: true, names: new Set(), files: new Set() }, compose: true };
 /**
  * Fix round 2 (ruling P9): a job with a step pipegen can't see into (an action from the owner's own account, a
  * `docker://` step, a local action that isn't composite) may set any variable through GITHUB_ENV: every softEnv name and
  * SKIP count as set.
  */
-export const OPAQUE_GATE: EnvGate = { tox: false, nox: false, skip: true, npm: false, env: { all: true, names: new Set(), files: new Set() } };
+export const OPAQUE_GATE: EnvGate = { tox: false, nox: false, skip: true, npm: false, env: { all: true, names: new Set(), files: new Set() }, compose: true };
 const emptyEnv = (e: JobEnv) => !e.all && e.names.size === 0 && e.files.size === 0;
 const orEnv = (a: JobEnv, b: JobEnv): JobEnv =>
   (emptyEnv(b) ? a : emptyEnv(a) ? b : { all: a.all || b.all, names: new Set([...a.names, ...b.names]), files: new Set([...a.files, ...b.files]) });
 export const orGate = (a: EnvGate, b: EnvGate): EnvGate =>
-  ({ tox: a.tox || b.tox, nox: a.nox || b.nox, skip: a.skip || b.skip, npm: a.npm || b.npm, env: orEnv(a.env, b.env) });
+  ({ tox: a.tox || b.tox, nox: a.nox || b.nox, skip: a.skip || b.skip, npm: a.npm || b.npm, env: orEnv(a.env, b.env), compose: a.compose || b.compose });
 /**
  * Fix round 1 (P8): `softNames` (every signature's softEnv) are looked for too: as an `env:` key (any letter case) or
  * in the run text. Fix round 2 (N1b, N1c): the bare name, as SKIP is, so a GITHUB_ENV heredoc (`NAME<<EOF`) or a
@@ -523,6 +527,8 @@ export function gateOf(texts: readonly string[], envs: readonly unknown[], base:
     // npm reads npm_config_* in any letter case
     npm: base.npm || keys.includes('NPM_CONFIG_DRY_RUN') || texts.some((t) => t.toLowerCase().includes('npm_config_dry_run')),
     env: names.length === 0 && files.length === 0 ? base.env : orEnv(base.env, { all: false, names: new Set(names), files: new Set(files) }),
+    // P57 (C3): the variables that pick other compose files or services
+    compose: base.compose || ['COMPOSE_FILE', 'COMPOSE_PROFILES', 'COMPOSE_PATH_SEPARATOR'].some((n) => keys.includes(n) || inText(n)),
   };
 }
 
@@ -550,7 +556,12 @@ export const configWhy = (subject: string, what: string) => (what === '*'
  */
 export const gated = (found: Found[], g: EnvGate): Found[] => found
   .filter((f) => !(f.envGate === 'npm' && g.npm))
-  .map((f) => {
+  .map((f): Found => {
+    // P57 (C3): what a compose service runs, when the job may pick other compose files or services
+    if (f.compose === true && g.compose) {
+      return { categories: f.categories.map((c) => (c.startsWith(UNKNOWN_PREFIX) ? c : `${UNKNOWN_PREFIX}${c}`)), by: f.by, subject: f.subject, dir: null, reason: null,
+        partialWhy: `${f.subject} runs through docker compose, and a COMPOSE_FILE or COMPOSE_PROFILES variable set in this job can change which compose files and services it uses, so pipegen can't tell what it checks.` };
+    }
     if (f.envGate === 'tox' && g.tox) return { ...f, reason: 'tox-env' as const };
     if (f.envGate === 'nox' && g.nox) return { ...f, reason: 'nox-env' as const };
     if (g.skip && isHookRunner(f.by)) return { ...f, hookRun: false, reason: f.reason ?? 'skip' };

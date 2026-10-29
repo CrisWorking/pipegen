@@ -80,9 +80,11 @@ export interface Found {
    * a compose file (all of them when `services` is null), found from the folder `cwd`.
    */
   dockerBuild?: DockerBuild;
-  composeBuild?: { files: readonly string[] | null; cwd: string; services: readonly string[] | null; shellReason: Reason | null };
+  composeBuild?: { files: readonly string[] | null; cwd: string; services: readonly string[] | null; shellReason: Reason | null; profiles: readonly string[]; unsure: string | null };
   /** P55 (batch B): this command runs inside the compose service `service` (`docker compose run|exec`), so its folder is that service's build context. */
-  composeRun?: { files: readonly string[] | null; cwd: string; service: string };
+  composeRun?: { files: readonly string[] | null; cwd: string; service: string; unsure: string | null };
+  /** P57 (C3): found inside a compose service (compose run/exec, or a RUN line of a Dockerfile compose builds), so a COMPOSE_FILE or COMPOSE_PROFILES variable can change it. */
+  compose?: true;
   /** Plan P Task 3 (PS14): a pre-commit formatter hook that writes files or checks them, so a CI `pre-commit run` fails on a change. */
   formats?: boolean;
   /** Fix round 1 (P8): the tool's softEnv names and the config files it loads (none when its config flag turned them off). */

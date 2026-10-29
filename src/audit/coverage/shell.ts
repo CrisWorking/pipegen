@@ -656,13 +656,15 @@ export function scanShell(text: string, base: string | null, sigs: Compiled, bud
       if (tool === undefined || (g.sub === 'up' && !args.includes('--build')) || args.includes('--dry-run')) return null;
       const services = g.sub === 'build' ? composeBuildServices(word, g.subAt + 1, end) : null;
       const f = foundOf(tool, cwd, shellReason(k) ?? commandReason(tool, args));
-      if (g.sub === 'build' && services !== null) f.composeBuild = { files: g.files, cwd, services: services.length === 0 ? null : services, shellReason: shellReason(k) };
+      if (g.sub === 'build' && services !== null) {
+        f.composeBuild = { files: g.files, cwd, services: services.length === 0 ? null : services, shellReason: shellReason(k), profiles: g.profiles, unsure: g.unsure };
+      }
       add(f);
       return null;
     }
     if (g.sub !== 'run' && g.sub !== 'exec') return null;
     const r = composeRunWords(word, g.subAt + 1, end);
-    return r === null ? null : { commandAt: r.commandAt, run: { files: g.files, cwd, service: r.service } };
+    return r === null ? null : { commandAt: r.commandAt, run: { files: g.files, cwd, service: r.service, unsure: g.unsure } };
   };
   /** The Dockerfile and context a `docker build` names, as repo-relative paths from the folder it runs in; null when they leave the repo. */
   const dockerBuildOf = (from: string, b: ReturnType<typeof buildWords>): DockerBuild | null => {

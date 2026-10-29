@@ -17,6 +17,7 @@ import {
   configWhy, type EnvGate, type Inputs, type RepoId,
 } from './settings.js';
 import { imageName, preCommitRunMode, scanImage, scanShell, shellMode } from './shell.js';
+import { composeEnvGated } from './docker.js';
 import { plainPath } from './docker-words.js';
 import { DOCKER_BUILD_ID, PART_RE, PREK_ID, isHookRunner, type ToolSignature } from './signatures.js';
 import { tokenize } from './tokenize.js';
@@ -366,7 +367,8 @@ async function walkStep(ctx: Ctx, step: Obj, c: StepCtx): Promise<void> {
     // P52 (d): a no-exec shell runs nothing; a `shell:` spec pipegen doesn't know makes the step opaque (unknown)
     const mode = shellMode(step.shell ?? c.shell);
     if (mode === null) return opaque(ctx, OPAQUE_WHY.unknownShell, undefined, sc);
-    const found = mode === 'noexec' ? [] : await resolveScripts(ctx, scanShell(step.run, base, ctx.sigs, ctx.budget, mode));
+    // P57 (C3): a compose command in a job that may set COMPOSE_FILE / COMPOSE_PROFILES is unknown before it is followed
+    const found = mode === 'noexec' ? [] : await resolveScripts(ctx, composeEnvGated(scanShell(step.run, base, ctx.sigs, ctx.budget, mode), sc.gate.compose));
     addFound(ctx, gated(found, sc.gate), sc);
   }
 }
