@@ -303,6 +303,23 @@ describe('read', () => {
     expect(await readProject(makeRepo('node-npm', 'https://github.com/o-1/my.repo_x-y.git'))).toMatchObject({ owner: 'o-1', repo: 'my.repo_x-y' });
   });
 
+  it('read: finding Dockerfile services next to Node workspaces is linear (P50 I3: 9,990 Dockerfile folders, about 20k files)', async () => {
+    // the reviewer's probe: before the fix, each Dockerfile folder scanned every file for a requirements file
+    const dir = repo('node-library');
+    writeIn(dir, 'package.json', JSON.stringify({ name: 'root', workspaces: ['frontend'] }));
+    writeIn(dir, 'frontend/package.json', JSON.stringify({ name: 'frontend', scripts: { dev: 'vite' } }));
+    for (let i = 0; i < 9990; i++) {
+      writeIn(dir, `s/d${i}/Dockerfile`, 'FROM nginx\n');
+      writeIn(dir, `s/d${i}/a.txt`, 'x\n');
+    }
+    writeIn(dir, 's/d5/requirements.txt', 'flask\n');
+    const t = performance.now();
+    const p = await readProject(dir);
+    const ms = performance.now() - t;
+    expect(p.services.map((s) => s.path)).toEqual(['frontend', 's/d5']);
+    expect(ms).toBeLessThan(5000);
+  }, 60_000);
+
   it('read: a go.mod makes a Go service, and *_test.go files are its tests (DoD cobra)', async () => {
     const p = await readProject(repo('go-module'));
     expect(p.services.map((s) => [s.path, s.language, s.hasTests])).toEqual([['.', 'go', true]]);

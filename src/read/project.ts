@@ -294,9 +294,18 @@ export async function readProject(dir: string, opts?: { notes?: string[] }): Pro
     // A Node workspace list names Node packages only (DoD run, fastapi/full-stack-fastapi-template: backend/ was lost). A
     // folder with a Dockerfile and a Python or Go manifest beside it is a service the list can't name; a Dockerfile
     // folder without one (an nginx or database image) stays out, as before.
+    // P50 (I3): one pass over the files for the folders holding a requirements file, and a Set of the service folders,
+    // so this stays linear in the number of files (it was a scan of every file per Dockerfile folder)
+    const requirementDirs = new Set<string>();
+    for (const f of ctx.fileSet) if (REQUIREMENTS_FILE_RE.test(baseOf(f))) requirementDirs.add(dirOf(f));
+    const taken = new Set(dirs);
     const otherApp = (d: string) => !ctx.fileSet.has(inDir(d, 'package.json'))
-      && (OTHER_APP_MANIFESTS.some((m) => ctx.fileSet.has(inDir(d, m))) || [...ctx.fileSet].some((f) => dirOf(f) === d && REQUIREMENTS_FILE_RE.test(baseOf(f))));
-    for (const d of dockerDirs) if (d !== '.' && !dirs.includes(d) && otherApp(d)) dirs.push(d);
+      && (OTHER_APP_MANIFESTS.some((m) => ctx.fileSet.has(inDir(d, m))) || requirementDirs.has(d));
+    for (const d of dockerDirs) {
+      if (d === '.' || taken.has(d) || !otherApp(d)) continue;
+      taken.add(d);
+      dirs.push(d);
+    }
   }
 
   let monorepo: Monorepo = 'none';
