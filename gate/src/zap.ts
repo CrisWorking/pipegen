@@ -6,7 +6,7 @@
 // - riskcode 3 → high, 2 → medium, 1 → low, 0 → info; anything else → high with a note;
 // - one finding per instance; an alert with no instance is still one finding; an alert is never dropped.
 import {
-  cutText, fail, getOwn, guarded, isObj, limitsFrom, MAX_MESSAGE_CHARS, optList, readJson, shown,
+  cutText, fail, getOwn, guarded, isObj, limitsFrom, MAX_MESSAGE_CHARS, optList, readJson, shown, uriIdOf,
   type Obj, type ParseLimits, type ParsedFinding, type ParseResult,
 } from './parse-common.js';
 import type { Severity } from '../../src/types.js';
@@ -90,9 +90,9 @@ export function parseZapJson(json: unknown, toolId: string, opts: ZapOptions = {
         }
         const message = cutText(name ?? title ?? '', MAX_MESSAGE_CHARS);
         const instances = optList(alert, 'instances', where) ?? [];
-        const make = (file: string | undefined, method: string | undefined, uriUnmapped: boolean): void => {
+        const make = (file: string | undefined, method: string | undefined, uriUnmapped: boolean, uriId?: string): void => {
           if (findings.length >= limits.maxResults) fail(`the report has more than ${limits.maxResults} findings`);
-          findings.push({ tool: toolId, ruleId: pluginid, severity, file, message, method, uriUnmapped });
+          findings.push({ tool: toolId, ruleId: pluginid, severity, file, message, method, uriUnmapped, secret: false, ...(uriId === undefined ? {} : { uriId }) });
         };
         if (instances.length === 0) make(undefined, undefined, false);
         for (const [n, inst] of instances.entries()) {
@@ -101,7 +101,7 @@ export function parseZapJson(json: unknown, toolId: string, opts: ZapOptions = {
           const uri = optString(inst, 'uri', w, true);
           const method = optString(inst, 'method', w, true);
           const file = uri === undefined ? undefined : urlPath(uri);
-          make(file, method !== undefined && METHOD.test(method) ? method.toUpperCase() : undefined, file === undefined);
+          make(file, method !== undefined && METHOD.test(method) ? method.toUpperCase() : undefined, file === undefined, file === undefined && uri !== undefined ? uriIdOf(uri) : undefined);
         }
       }
     }

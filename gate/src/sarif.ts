@@ -17,7 +17,7 @@ import type { Severity } from '../../src/types.js';
 import { safeText } from '../../src/util/safe-text.js';
 import {
   cutText, fail, getOwn, guarded, isObj, lineOf, limitsFrom, MAX_ID_CHARS, MAX_MESSAGE_CHARS, MAX_RAW_BYTES, MAX_RESULTS_PER_RUN, MAX_RUNS, MAX_URI_CHARS,
-  optList, optObj, optStr, optStrList, readJson, shown,
+  optList, optObj, optStr, optStrList, readJson, shown, uriIdOf,
   type Obj, type ParseLimits, type ParsedFinding, type ParseResult,
 } from './parse-common.js';
 
@@ -292,6 +292,9 @@ function readRun(run: unknown, index: number, toolId: string, info: SarifToolInf
     let uri: string | undefined;
     let baseId: string | undefined;
     let line: number | undefined;
+    let startColumn: number | undefined;
+    let endLine: number | undefined;
+    let endColumn: number | undefined;
     const locations = optList(r, 'locations', at);
     if (locations !== undefined && locations.length > 0) {
       const loc = locations[0];
@@ -302,7 +305,12 @@ function readRun(run: unknown, index: number, toolId: string, info: SarifToolInf
         uri = optStr(artifact, 'uri', `${at} artifactLocation`);
         baseId = optStr(artifact, 'uriBaseId', `${at} artifactLocation`);
         const region = optObj(physical, 'region', `${at} location`);
-        line = region === undefined ? undefined : lineOf(getOwn(region, 'startLine'), `${at} region`);
+        if (region !== undefined) {
+          line = lineOf(getOwn(region, 'startLine'), `${at} region`);
+          startColumn = lineOf(getOwn(region, 'startColumn'), `${at} region`);
+          endLine = lineOf(getOwn(region, 'endLine'), `${at} region`);
+          endColumn = lineOf(getOwn(region, 'endColumn'), `${at} region`);
+        }
       }
     }
     let file: string | undefined;
@@ -347,6 +355,11 @@ function readRun(run: unknown, index: number, toolId: string, info: SarifToolInf
       line,
       message: isSecret ? secretMessage(rawId) : cutText(text ?? '', MAX_MESSAGE_CHARS),
       uriUnmapped,
+      secret: isSecret,
+      ...(startColumn === undefined ? {} : { startColumn }),
+      ...(endLine === undefined ? {} : { endLine }),
+      ...(endColumn === undefined ? {} : { endColumn }),
+      ...(uriUnmapped && uri !== undefined ? { uriId: uriIdOf(uri) } : {}),
     });
   }
   if (unreadable.size > 0) {

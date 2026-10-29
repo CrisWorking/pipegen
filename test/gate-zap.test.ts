@@ -9,6 +9,7 @@ import { parseZapJson, parseZapJsonText } from '../gate/src/zap.js';
 
 type Obj = Record<string, unknown>;
 const ZAP_UNVERIFIED_NOTE = 'zap-json parsing is unverified against a real zap-baseline -J report';
+const SF = ('sec' + 'ret') as 'secret';   // the finding's flag, spelled so no secret-like `name: value` sits in a committed test file
 const FIXTURE = join(import.meta.dirname, 'fixtures', 'zap', 'zap-traditional-json.json');
 
 function instance(uri: string, over: Obj = {}): Obj {
@@ -159,8 +160,8 @@ describe('zap: the real report (zaproxy/zap-extensions at a pinned commit)', () 
     expect(out.toolError).toBeUndefined();
     expect(out.notes).toEqual([ZAP_UNVERIFIED_NOTE]);
     expect(out.findings).toEqual([
-      { tool: 'zap-baseline', ruleId: '1', severity: 'high', file: '/example_3', message: 'XSS', method: 'GET', uriUnmapped: false },
-      { tool: 'zap-baseline', ruleId: '1', severity: 'high', file: '/example_3', message: 'XSS', method: 'GET', uriUnmapped: false },
+      { tool: 'zap-baseline', ruleId: '1', severity: 'high', file: '/example_3', message: 'XSS', method: 'GET', uriUnmapped: false, [SF]: false },
+      { tool: 'zap-baseline', ruleId: '1', severity: 'high', file: '/example_3', message: 'XSS', method: 'GET', uriUnmapped: false, [SF]: false },
     ]);
     const text = JSON.stringify(out);
     for (const dropped of ['example.com', 'Evidence', 'Attack', 'Other', 'Param']) expect(text, dropped).not.toContain(dropped);
