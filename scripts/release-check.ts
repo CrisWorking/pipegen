@@ -8,7 +8,10 @@
 //   4. the version in package.json equals the tag (`v1.2.3` <-> `1.2.3`);
 //   5. the 7-day cooldown passes for everything that changed since the previous release tag (or for everything, on the
 //      first release);
-//   6. data/ai-prices.yml and data/github-plans.yml `checkedAt` is at most 30 days old.
+//   6. data/ai-prices.yml and data/github-plans.yml `checkedAt` is at most 30 days old;
+//   7. the secret-scanner live tests pass on the real pinned scanners (scripts/scanner-live.ts): the canary tests, the
+//      belt drift test and the chunk-size pin test, each present and passed, never skipped (the scanner upgrade
+//      checklist, P34-P38).
 // Claude never fills in `reviewedBy`; that is the owner's job. Keep to syntax Node's type stripping can run:
 // `node scripts/release-check.ts --tag v1.2.3`.
 import { execFileSync } from 'node:child_process';
@@ -17,6 +20,7 @@ import { join } from 'node:path';
 import { parse as parseYaml } from 'yaml';
 import { formatReport, runCooldown, WATCHED_FILES, type Files } from './cooldown.ts';
 import { buildNotices, type Metafile, type Overrides } from './notices.ts';
+import { runScannerLive, type ScannerCheck } from './scanner-live.ts';
 
 export const MAX_DATA_AGE_DAYS = 30;
 /** The first release has no earlier tag, so every pin is new; the normal cap of 150 lookups is too small for that. */
@@ -138,6 +142,16 @@ export async function checkCooldown(base: Files, head: Files, fetchFn: typeof fe
   }
 }
 
+/** Check 7: `run` is runScannerLive for the repo root; anything it throws fails closed. */
+export function checkScannerTests(run: () => ScannerCheck): Check {
+  try {
+    const c = run();
+    return { name: c.name, ok: c.ok, problems: c.problems };
+  } catch {
+    return { name: 'secret-scanner live tests (canary, belt drift, chunk-size pin)', ok: false, problems: ['the secret-scanner live tests could not run (failing closed)'] };
+  }
+}
+
 export function formatChecks(checks: Check[]): string {
   const lines = checks.flatMap((c) => [`${c.ok ? 'ok  ' : 'FAIL'} ${c.name}`, ...c.problems.map((p) => `       ${p}`)]);
   const failed = checks.filter((c) => !c.ok).length;
@@ -199,6 +213,7 @@ async function main(argv: string[]): Promise<number> {
     checkVersion(read('package.json'), tag),
     checkDataFresh({ 'data/ai-prices.yml': read('data/ai-prices.yml'), 'data/github-plans.yml': read('data/github-plans.yml') }, now),
     await checkCooldown(base, head, fetch, now, process.env.GITHUB_TOKEN, prev === ''),
+    checkScannerTests(() => runScannerLive(root)),
   ];
   console.log(prev ? `release-check: cooldown base is ${prev}` : 'release-check: no earlier release tag; the cooldown checks every pin');
   console.log(formatChecks(checks));

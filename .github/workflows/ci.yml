@@ -34,18 +34,12 @@ jobs:
           node-version: ${{ matrix.node }}
       - run: npm ci
       - run: npm test
-      - name: Live test against the real pinned betterleaks, the audit --ai secret scan (downloads the pinned release from github.com)
-        run: npx vitest run test/betterleaks-live.test.ts
-        env:
-          PIPEGEN_LIVE_TESTS: '1'
-      - name: Live test against the real pinned gitleaks, the fallback (downloads the pinned release from github.com)
-        run: npx vitest run test/gitleaks-live.test.ts
-        env:
-          PIPEGEN_LIVE_TESTS: '1'
-      - name: Live test that a file either scanner skips never reaches the AI unscanned (ruling P34, both pinned scanners)
-        run: npx vitest run test/secret-scan-skip-live.test.ts
-        env:
-          PIPEGEN_LIVE_TESTS: '1'
+      # The secret-scanner upgrade checklist (P34-P38): the live tests of the real pinned betterleaks and gitleaks, run on
+      # every pull request (so on every scanner version bump in data/pinned-binaries.yml). The script fails unless the
+      # canary tests, the belt drift test and the chunk-size pin test each ran and passed (a skipped live test passes
+      # in vitest), and every other test in those files passed too. It downloads the pinned releases from github.com.
+      - name: Secret-scanner live tests (canary, belt drift, chunk-size pin; betterleaks and gitleaks)
+        run: node scripts/scanner-live.ts
       # The reviewed list's signature checks, re-verified with the pinned cosign (an edited keySha256 or identity still
       # loads offline; only this catches it).
       - name: Live test of the reviewed list's cosign checks (downloads the pinned cosign and the signed release files)

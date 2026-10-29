@@ -24,7 +24,7 @@ the signed tags happen only when v0.4 is done). This page has two parts: what is
 How `release.yml` works, in order:
 
 1. **verify**: the tag must be `vMAJOR.MINOR.PATCH`, annotated and signed by a key in `.github/release-signers` (`git verify-tag`; the tag must point at the run's commit), and point at a commit on `main`; that commit must have a green `ci` run
-   (the live-network gitleaks test is not re-run, S13); exact Node 26.12.0 and npm >= 11.5.1 are asserted (S10); then
+   (the secret-scanner live tests run again inside the release check, check 7); exact Node 26.12.0 and npm >= 11.5.1 are asserted (S10); then
    `npm ci --ignore-scripts`, tests, `tsc --noEmit`, build, the release check, **one** `npm pack`, a CycloneDX SBOM of the bundled
    packages (the same list as `THIRD_PARTY_NOTICES`; `node scripts/notices.ts --sbom-only`), a test of the packed `.tgz`, and `SHA256SUMS`. What is tested is what ships (S1).
 2. **attest**: a build provenance attestation (`actions/attest-build-provenance`) for the `.tgz` and the SBOM.
@@ -54,7 +54,26 @@ It fails (exit 1) unless all of these hold:
 3. `THIRD_PARTY_NOTICES` equals what the current build generates;
 4. the version in `package.json` equals the tag;
 5. the 7-day cooldown passes for everything changed since the previous `v*` tag (everything, on the first release);
-6. `checkedAt` in `data/ai-prices.yml` and `data/github-plans.yml` is at most 30 days old.
+6. `checkedAt` in `data/ai-prices.yml` and `data/github-plans.yml` is at most 30 days old;
+7. the secret-scanner live tests pass on the real pinned betterleaks and gitleaks (`scripts/scanner-live.ts`, below).
+
+### Secret-scanner upgrade checklist (P34–P38)
+
+Any betterleaks or gitleaks version bump in `data/pinned-binaries.yml` (and `data/reviewed-tools.yml`) must pass these
+live tests before it merges and before a release:
+
+1. **the canary tests**: every scanned file and every piece of the file list is confirmed by its canary, and a scan
+   path the scanners skip fails closed;
+2. **the belt drift test**: the belt mirrors every folder-level pattern of each scanner's default path allowlist (25 at
+   betterleaks 1.9.0 / gitleaks 8.30.1); a pattern the bump adds or drops fails, so the belt is reviewed with the bump;
+3. **the chunk-size pin test**: two files of exactly `SCAN_CHUNK_SAFE_BYTES` are read whole, every token reported. If it
+   fails, lower `SCAN_CHUNK_SAFE_BYTES`; never skip the test.
+
+All three are in `test/secret-scan-skip-live.test.ts`. `node scripts/scanner-live.ts` runs it with the two scanners' own
+live tests (`PIPEGEN_LIVE_TESTS=1`, vitest's JSON report) and fails unless each required test is there and passed and
+nothing in those files failed or was skipped (a skipped live test passes in vitest). The `test` job in `ci.yml` runs it
+on every pull request, so on every scanner bump, and the release check runs it as check 7. The tests, the script and its
+unit tests are under code-owner review (`.github/CODEOWNERS`).
 
 **Owner dependency:** the release is blocked until Cristiano has reviewed every `PENDING` entry (today: 23 in
 `reviewed-tools.yml`, 3 in `pinned-binaries.yml`) and set `reviewedBy` and `reviewedAt` in a pull request. Claude never

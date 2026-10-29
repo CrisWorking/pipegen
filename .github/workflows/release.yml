@@ -94,7 +94,7 @@ jobs:
       - run: npm test
       - run: npx tsc --noEmit
       - run: npm run build
-      - name: Release check (no PENDING reviews, no dependencies, fresh notices, version = tag, cooldown, fresh data)
+      - name: Release check (no PENDING reviews, no dependencies, fresh notices, version = tag, cooldown, fresh data, secret-scanner live tests)
         run: node scripts/release-check.ts --tag "$TAG"
         env:
           TAG: ${{ github.ref_name }}

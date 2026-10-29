@@ -19,6 +19,12 @@
 /test/reviewed.test.ts @CrisWorking
 /test/pinned-binary.test.ts @CrisWorking
 /test/cooldown.test.ts @CrisWorking
+# The secret-scanner upgrade checklist (P34-P38): the three required live tests, the script that requires them, and
+# its unit tests. A scanner bump must not be able to weaken or skip them in the same PR.
+/test/secret-scan-skip-live.test.ts @CrisWorking
+/scripts/scanner-live.ts @CrisWorking
+/test/scanner-live.test.ts @CrisWorking
+/test/release-check.test.ts @CrisWorking
 /tsup.config.ts        @CrisWorking
 /tsup.dev.config.ts    @CrisWorking
 /tsconfig.json         @CrisWorking

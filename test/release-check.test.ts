@@ -1,7 +1,7 @@
 import { execFileSync } from 'node:child_process';
 import { resolve } from 'node:path';
 import { describe, expect, it } from 'vitest';
-import { checkCooldown, checkDataFresh, checkNoDependencies, checkNotices, checkPending, checkVersion, formatChecks } from '../scripts/release-check.js';
+import { checkCooldown, checkDataFresh, checkNoDependencies, checkNotices, checkPending, checkScannerTests, checkVersion, formatChecks } from '../scripts/release-check.js';
 
 const NOW = new Date('2026-11-20T12:00:00Z');
 const reviewedOk = 'tools:\n  - id: a\n    reviewedBy: Cristiano\n    reviewedAt: "2026-11-01"\n  - id: b\n    reviewedBy: Cristiano\n    reviewedAt: "2026-11-01"\n';
@@ -99,6 +99,18 @@ describe('release-check: cooldown', () => {
     const fetchFn = (async () => new Response(JSON.stringify(doc), { status: 200 })) as typeof fetch;
     const c = await checkCooldown({}, { 'package-lock.json': lock }, fetchFn, NOW);
     expect(c.ok).toBe(false);
+  });
+});
+
+describe('release-check: secret-scanner live tests (canary, belt drift, chunk-size pin)', () => {
+  it('passes the live run\'s verdict through, and fails closed when the run throws', () => {
+    const ok = { name: 'secret-scanner live tests (canary, belt drift, chunk-size pin)', ok: true, problems: [] };
+    expect(checkScannerTests(() => ok)).toEqual(ok);
+    const bad = { ...ok, ok: false, problems: ['chunk-size pin: skipped, not passed'] };
+    expect(checkScannerTests(() => bad)).toEqual(bad);
+    const thrown = checkScannerTests(() => { throw new Error('spawn failed'); });
+    expect(thrown.ok).toBe(false);
+    expect(thrown.problems.join('\n')).toContain('could not run');
   });
 });
 
