@@ -558,7 +558,8 @@ describe('round 2: lock size and order (rulings 5 and 7)', () => {
     const scrub = renderScrub('pipegen-out-secrets', '${{ runner.temp }}/pipegen-raw/pipegen-out-secrets/gitleaks.sarif', 'gitleaks', 'sarif', gateEntry());
     expect(checkJobOrder([projectScript, scrub])).not.toEqual([]);
     expect(checkJobOrder([projectScript, upload])).not.toEqual([]);
-    expect(checkJobOrder([scrub, upload, projectScript])).toEqual([]);
+    expect(checkJobOrder([scrub, upload, projectScript]).join(' ')).toMatch(/holds the fingerprint key/);   // C0a fix round 1: repo code after a scrub is refused too, the key is in the job
+    expect(checkJobOrder([upload, projectScript])).toEqual([]);   // with no scrub step there is no key in the job
     const vitest = render('vitest-coverage').steps;
     expect(checkJobOrder([...vitest, ...render('biome').steps]).length).toBeGreaterThan(0);
     expect(checkJobOrder([...render('biome').steps, ...vitest])).toEqual([]);

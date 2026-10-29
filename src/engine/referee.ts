@@ -555,6 +555,9 @@ function ceilingOf(id: string): Record<string, number> {
 /**
  * Whether a job holds power (ruling 1): any permission beyond `contents: read`, an environment, or a secret that is not a declared app secret.
  * `secrets` are those the job's steps name, except the fingerprint key on a recognised scrub step (judgeStepPolicy, Plan C ruling B1 part 5).
+ * DOCUMENTED RESIDUAL (C0a fix round 1): a job with a scrub step holds no repo code (checkJobOrder), but a reviewed native tool in it (gitleaks, trivy,
+ * osv-scanner, ...) that hostile input turns into code execution could still read the key from the runner. The bullfrog harden step (no sudo,
+ * egress limited to allowed domains) is the mitigation; the key's value is an HMAC key for fingerprints and baselines, not a deploy credential.
  */
 function privileged(j: Obj, secrets: ReadonlySet<string>, ex: Expectations): boolean {
   const p = j.permissions;
@@ -612,7 +615,9 @@ function judgeJob(fc: FileCtx, id: string, j: unknown): void {
 function judgeStepPolicy(fc: FileCtx, id: string, where: string, j: Obj, judged: readonly Judged[]): void {
   const bad = issueFor(fc);
   // the fingerprint key on a recognised scrub step is that step's own power and gives the job none (ruling B1 part 5): a scanner job stays at contents: read; anywhere else the key still makes a job privileged
-  const secrets = new Set(judged.flatMap((x) => [...x.secrets].filter((n) => !(x.kind === 'scrub' && n === SCRUB_SECRET))));
+  // ... but only while the job holds no step that runs code pipegen did not render as harmless (checkJobOrder refuses that too): every step of a job can read the job's secrets
+  const mixed = judged.some((x) => x.kind === 'repo-code' || x.kind === 'unrecognised' || x.kind === 'central');
+  const secrets = new Set(judged.flatMap((x) => [...x.secrets].filter((n) => mixed || !(x.kind === 'scrub' && n === SCRUB_SECRET))));
   const row = own(JOB_STEP_POLICY, id);
   const power = privileged(j, secrets, fc.ex);
   if (power && row === undefined) bad('permissions', `${where} holds power (a permission beyond contents: read, an environment or pipegen's own secret) but is not one of pipegen's jobs (${Object.keys(JOB_STEP_POLICY).join(', ')}).`);

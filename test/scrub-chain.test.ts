@@ -7,7 +7,7 @@ import { join } from 'node:path';
 import { Document } from 'yaml';
 import { describe, expect, it } from 'vitest';
 import { resultArtifactName } from '../src/engine/artifact-names.js';
-import { checkJobOrder, isKnownHarmless } from '../src/engine/job-rules.js';
+import { checkJobOrder, isKnownHarmless, isScrubStep } from '../src/engine/job-rules.js';
 import { JOB_STEP_POLICY, referee, type Linters, type RefereeReport } from '../src/engine/referee.js';
 import { dedupeJobSteps, RenderError, renderJobPrelude, renderPlatformStep, renderScrub, renderStep, renderStepWith, renderUpload, scrubbedPath, stepsToYaml, type RenderContext, type RenderedStep, type RenderResult } from '../src/engine/render-step.js';
 import { NEED_ID_CATEGORY, NEED_IDS } from '../src/engine/need-ids.js';
@@ -190,6 +190,8 @@ describe('RENDERER_INPUTS: the gate action in scrub mode (ruling B1 part 2)', ()
 
 // ---------- the order rule ----------
 
+/** The problem checkJobOrder reports for an upload with no scrub step of its result before it (not the step name "pipegen: scrub the result"). */
+const NO_SCRUB = /but no scrub step for that result comes before it/;
 describe('isKnownHarmless and the job order: the scrub step (ruling B1 part 3)', () => {
   const art = 'pipegen-out-secrets';
   const scrub = (): RenderedStep => renderScrub(art, `\${{ runner.temp }}/pipegen-raw/${art}/gitleaks.sarif`, 'gitleaks', 'sarif', GATE);
@@ -224,19 +226,24 @@ describe('isKnownHarmless and the job order: the scrub step (ruling B1 part 3)',
     const rawPath = `\${{ runner.temp }}/pipegen-raw/${art}/gitleaks.sarif`;
     const outPath = scrubbedPath(rawPath);
     const up = renderUpload(art, outPath, p);
-    expect(checkJobOrder([...prelude(), up]).join(' ')).toMatch(/scrub/);
-    expect(checkJobOrder([...prelude(), up, scrub()]).join(' ')).toMatch(/scrub/);   // a scrub after the upload is too late
+    expect(checkJobOrder([...prelude(), up]).join(' ')).toMatch(NO_SCRUB);
+    expect(checkJobOrder([...prelude(), up, scrub()]).join(' ')).toMatch(NO_SCRUB);   // a scrub after the upload is too late
     const other = renderScrub('pipegen-out-sast', '${{ runner.temp }}/pipegen-raw/pipegen-out-sast/semgrep.sarif', 'semgrep', 'sarif', GATE);
-    expect(checkJobOrder([...prelude(), other, up]).join(' ')).toMatch(/scrub/);   // a scrub for another artifact
+    expect(checkJobOrder([...prelude(), other, up]).join(' ')).toMatch(NO_SCRUB);   // a scrub for another artifact
     const notScrub = { ...scrub(), with: { ...scrub().with, mode: 'gate' } as Record<string, string> };
-    expect(checkJobOrder([...prelude(), notScrub, up]).join(' ')).toMatch(/scrub/);
+    expect(checkJobOrder([...prelude(), notScrub, up]).join(' ')).toMatch(NO_SCRUB);
+    // a step that merely names the artifact is not a scrub step either
+    const names: RenderedStep = { id: 'pipegen-checkout', name: 'x', uses: `actions/checkout@${'c'.repeat(40)}`, with: { artifact: art } };
+    expect(checkJobOrder([...prelude(), names, up]).join(' ')).toMatch(NO_SCRUB);
     expect(checkJobOrder([...prelude(), scrub(), up])).toEqual([]);
     expect(() => dedupeJobSteps([...prelude(), up])).toThrow(RenderError);
   });
 
   it('checkJobOrder: an upload of a pipegen-raw path is refused (also written by hand, past renderUpload)', () => {
     const rawUp: RenderedStep = { name: 'Upload', uses: `actions/upload-artifact@${'b'.repeat(40)}`, with: { name: art, path: `\${{ runner.temp }}/pipegen-raw/${art}/gitleaks.sarif` } };
-    expect(checkJobOrder([...prelude(), scrub(), rawUp]).join(' ')).toMatch(/raw/);
+    const problems = checkJobOrder([...prelude(), scrub(), rawUp]);
+    expect(problems).toHaveLength(1);
+    expect(problems[0]).toContain('uploads the raw result folder (pipegen-raw)');
     expect(() => renderUpload(art, `\${{ runner.temp }}/pipegen-raw/${art}/gitleaks.sarif`, p)).toThrow(RenderError);
     expect(() => renderPlatformStep('upload-artifact', p, { name: art, path: `\${{ runner.temp }}/pipegen-raw/${art}` })).toThrow(RenderError);
     expect(() => stepsToYaml([rawUp])).toThrow(RenderError);
@@ -347,7 +354,7 @@ describe('referee: the scrub chain', () => {
     expect((await run([workflow({ scan: job(failing) }, true)], draftOf([spec]))).ok).toBe(false);
   });
 
-  it('referee: a scrub step with an input the table does not know, or a second scrub for the same artifact with other values, is refused', async () => {
+  it('referee: a scrub step with an input the table does not know, or with its out moved, is refused (a second scrub for one artifact: C0b)', async () => {
     const spec = gitleaksSpec();
     const { steps } = scannerSteps(spec);
     const extra = steps.map((s) => (s.id?.startsWith('scrub-') ? { ...s, with: { ...s.with, 'sarif-in': 'x' } as Record<string, string> } : s));
@@ -544,5 +551,83 @@ describe('the renderer and the referee agree: a full scanner job per findings to
     for (const s of specs) plain[`u-${s.tool.id}`] = job(dedupeJobSteps(scannerSteps(s).steps));
     const r = await run([workflow(jobs), workflow(plain)].map((f, i) => ({ ...f, path: `.github/workflows/pipegen-${i}.yml` })), draftOf(specs));
     expect(show(r)).toBe('');
+  });
+});
+
+// ---------- fix round 1, finding 1: the fingerprint key never shares a job with repo code ----------
+
+const KEY_JOB = /holds the fingerprint key/;
+describe('a job with a scrub step holds no repo code (C0a fix round 1, finding 1)', () => {
+  const repoCodeSteps = (id: string, needId: string): RenderedStep[] => {
+    const t = entry(id);
+    return renderStep(specFor(t, { needId, service: 'app' }), t, p, ctx).steps;
+  };
+  const AFTER: [string, string][] = [['prettier', 'format-lint'], ['knip', 'dead-code'], ['vitest-coverage', 'coverage']];
+
+  it('checkJobOrder and dedupeJobSteps refuse repo code after the scrub and upload (prettier, knip, vitest-coverage with its npm ci, a hand step)', () => {
+    const { steps } = scannerSteps(gitleaksSpec());
+    for (const [id, needId] of AFTER) {
+      const more = repoCodeSteps(id, needId);
+      expect(more.some((x) => x.id !== undefined && /^(?:repocode-|pipegen-npm-ci-)/.test(x.id)), id).toBe(true);
+      expect(checkJobOrder([...steps, ...more]).join('\n'), id).toMatch(KEY_JOB);
+      expect(() => dedupeJobSteps([...steps, ...more]), id).toThrow(KEY_JOB);
+    }
+    expect(checkJobOrder([...steps, { name: 'mine', run: 'true' }]).join('\n')).toMatch(KEY_JOB);
+    expect(checkJobOrder([...steps, { name: 'mine', uses: `someone/else@${'d'.repeat(40)}` }]).join('\n')).toMatch(KEY_JOB);
+  });
+
+  it('checkJobOrder: repo code before the scrub is refused too (the key is in the job from its start), and says so', () => {
+    const { steps } = scannerSteps(gitleaksSpec());
+    const scrubAt = steps.findIndex(isScrubStep);
+    const problems = checkJobOrder([...steps.slice(0, 1), { name: 'mine', run: 'true' }, ...steps.slice(1)]);
+    expect(problems.join('\n')).toMatch(KEY_JOB);
+    expect(scrubAt).toBeGreaterThan(0);
+  });
+
+  it('checkJobOrder: a clean scanner job (several checkers, scrubs and uploads) passes; a job with no scrub may hold repo code', () => {
+    const a = scannerSteps(gitleaksSpec());
+    const b = scannerSteps(specFor(entry('semgrep'), { needId: 'sast', service: 'app', choices: { rules: 'javascript' } }));
+    expect(checkJobOrder(dedupeJobSteps([...a.steps, ...b.steps.slice(1)]))).toEqual([]);
+    expect(checkJobOrder([...prelude(), ...repoCodeSteps('vitest-coverage', 'coverage')])).toEqual([]);
+  });
+
+  it('referee: the reviewer\'s job [checkout, gitleaks, scrub, upload, repo code] is refused for prettier, knip and vitest-coverage, and for a hand-written step', async () => {
+    const spec = gitleaksSpec();
+    const { steps } = scannerSteps(spec);
+    for (const [id, needId] of [...AFTER, ['hand', 'x']] as [string, string][]) {
+      const more: RenderedStep[] = id === 'hand' ? [{ name: 'mine', run: 'true', shell: 'bash' }] : repoCodeSteps(id, needId);
+      // the extra tool is in the draft, so the referee recognises its steps and the refusal is the key rule, not "not rendered"
+      const extra = id === 'hand' ? [] : [specFor(entry(id), { needId, service: 'app' })];
+      const r = await run([workflow({ scan: job([...steps, ...more]) }, true)], draftOf([spec, ...extra]));
+      expect(r.ok, id).toBe(false);
+      expect(r.issues.some((i) => i.check === 'injection' && KEY_JOB.test(i.message)), `${id}: ${show(r)}`).toBe(true);
+      // and the exemption is gone: the job holds the key next to repo code, so it counts as privileged and has no row
+      expect(r.issues.some((i) => i.check === 'permissions' && /holds power/.test(i.message)), `${id}: ${show(r)}`).toBe(true);
+    }
+  });
+
+  it('referee: the same key in a clean scanner job stays unprivileged (the exemption holds without repo code)', async () => {
+    const spec = gitleaksSpec();
+    const r = await run([workflow({ scan: job(scannerSteps(spec).steps) })], draftOf([spec]));
+    expect(show(r)).toBe('');
+  });
+});
+
+describe('guards of the scrub chain that a second layer used to hide (C0a fix round 1, finding 4)', () => {
+  const art = 'pipegen-out-secrets';
+  const GATE_USES = 'crisworking/pipegen/gate';
+  it('RENDERER_INPUTS: raw naming another artifact with no out is refused on its own', () => {
+    const problems = rendererInputProblems(GATE_USES, { raw: '${{ runner.temp }}/pipegen-raw/pipegen-out-sast/semgrep.sarif' }, { mode: 'scrub', artifact: art, raw: '${{ runner.temp }}/pipegen-raw/pipegen-out-sast/semgrep.sarif' });
+    expect(problems.join(' ')).toMatch(/inside the folder of the artifact it names/);
+  });
+
+  it('referee: another reviewed entry that runs the gate path is not a scrub step (kind comes from the gate entry id)', async () => {
+    const spec = gitleaksSpec();
+    const { steps } = scannerSteps(spec);
+    const twin = { ...gateEntry(), id: 'pipegen-watcher' };   // same uses path and pin, another entry
+    twin.candidate = { ...twin.candidate, id: 'pipegen-watcher', name: 'pipegen-watcher' };
+    const files = [workflow({ scan: job(steps) })];
+    const r = await referee(files, draftOf([spec]), p, [...reviewedList(), twin], LINTERS, 'tok', { runLinters: async () => [] });
+    expect(r.issues.some((i) => i.check === 'permissions' && /watcher action runs only in its own job/.test(i.message)), show(r)).toBe(true);
   });
 });

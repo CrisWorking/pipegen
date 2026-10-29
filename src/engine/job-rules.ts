@@ -121,11 +121,18 @@ export function isKnownHarmless(s: RenderedStep): boolean {
 export function checkJobOrder(steps: readonly RenderedStep[]): string[] {
   const problems: string[] = [];
   let repoCode: string | undefined;
+  // A job with a scrub step names PIPEGEN_FP_KEY, and GitHub hands every secret a job names to its runner when the job starts: any
+  // step of the job, before or after the scrub, can read it from the runner's memory. So such a job holds only steps known to run
+  // no repo code (checkers, installs of pinned tools, the scrub, uploads), whatever their order (C0a fix round 1, finding 1).
+  const keyJob = steps.some(isScrubStep);
   const scrubbed = new Set<string>();   // the artifacts a scrub step earlier in this job rebuilt
   steps.forEach((s, i) => {
     if (isKnownHarmless(s)) {
       if (repoCode !== undefined) problems.push(`Step ${i + 1} (${show(s.name)}) comes after the repo-code step ${show(repoCode)}: code from the repository could have changed what it runs or uploads. Put it before, or in another job.`);
-    } else if (repoCode === undefined) repoCode = s.name;
+    } else {
+      if (repoCode === undefined) repoCode = s.name;
+      if (keyJob) problems.push(`Step ${i + 1} (${show(s.name)}) runs code pipegen did not render as harmless, in a job that holds the fingerprint key (it has a scrub step): every step of a job can read the secrets the job names, so this job runs no repo code. Put the step in another job.`);
+    }
     if (isScrubStep(s) && typeof s.with?.artifact === 'string') scrubbed.add(s.with.artifact);
     const uploaded = uploadFolder(s);
     if (uploaded === 'raw') problems.push(`Step ${i + 1} (${show(s.name)}) uploads the raw result folder (pipegen-raw), which is never uploaded: only the scrubbed copy in pipegen-out is.`);
