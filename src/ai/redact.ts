@@ -1104,21 +1104,28 @@ function defaultPriority(path: string): number {
 
 type FileEntry = { path: string; content: string };
 
-/** Notes in plain English: paths only (cleaned), never a value or file content. */
+/**
+ * Notes in plain English: paths only (cleaned), never a value or file content. A path note is rendered when all() is
+ * called (ruling P39), so its names are shown as the secret scan left them: a name the scan flagged is masked, even
+ * in a note added before the scan ran.
+ */
 class Notes {
-  private readonly lines: string[] = [];
+  private readonly entries: (string | (() => string))[] = [];
   add(line: string): void {
-    if (!this.lines.includes(line)) this.lines.push(line);
+    this.entries.push(line);
   }
   /** "<lead> a, b, c and 4 more." */
   addPaths(lead: string, paths: string[], show: (p: string) => string): void {
     if (paths.length === 0) return;
-    const shown = paths.slice(0, MAX_LISTED_IN_NOTE).map(show).join(', ');
-    const more = paths.length > MAX_LISTED_IN_NOTE ? ` and ${paths.length - MAX_LISTED_IN_NOTE} more` : '';
-    this.add(`${lead} ${shown}${more}.`);
+    const list = [...paths];
+    this.entries.push(() => {
+      const shown = list.slice(0, MAX_LISTED_IN_NOTE).map(show).join(', ');
+      const more = list.length > MAX_LISTED_IN_NOTE ? ` and ${list.length - MAX_LISTED_IN_NOTE} more` : '';
+      return `${lead} ${shown}${more}.`;
+    });
   }
   all(): string[] {
-    return [...this.lines];
+    return [...new Set(this.entries.map((e) => (typeof e === 'string' ? e : e())))];
   }
 }
 
@@ -1168,7 +1175,9 @@ export async function bundleCode(dir: string, opts: BundleOptions = {}): Promise
     return clean(p) !== p || clean(shown) !== shown || flagged.some((v) => p.includes(v) || shown.includes(v))
       || flaggedTokens.some((v) => tokenSpans(p, v).length > 0 || tokenSpans(shown, v).length > 0);
   };
-  const show = (p: string) => (nameHidden(p) ? '(a file whose name looks like a secret)' : safeText(p, 300));
+  // P39: names the secret scan flagged as lines of its file list (filled by secretScanPass)
+  const flaggedNames = new Set<string>();
+  const show = (p: string) => (flaggedNames.has(p) || nameHidden(p) ? '(a file whose name looks like a secret)' : safeText(p, 300));
   const notes = new Notes();
   const inRoots = (p: string) => roots === null || roots.some((r) => underRoot(p, r));
 
@@ -1243,7 +1252,10 @@ export async function bundleCode(dir: string, opts: BundleOptions = {}): Promise
 
   let secretScanChecked = false;
   if (opts.secretScanner !== undefined) {
-    collected = await secretScanPass(collected, opts.secretScanner, opts.secretScanTimeoutMs ?? SECRET_SCAN_TIMEOUT_MS, known, { long: flagged, short: flaggedTokens }, notes, show);
+    // P39: the files the notes name but the scan doesn't read (skipped, over the size limit, past the read budget):
+    // their names go through the scan too, in the file list, so a note never shows a name the scanner didn't check
+    const named = [...new Set([...links, ...Object.values(skipped).flat(), ...tooBig, ...overBudget])];
+    collected = await secretScanPass(collected, opts.secretScanner, opts.secretScanTimeoutMs ?? SECRET_SCAN_TIMEOUT_MS, known, { long: flagged, short: flaggedTokens }, notes, show, named, flaggedNames);
     secretScanChecked = true;
   } else {
     notes.add(COUNTING_ONLY_NOTE);
@@ -1344,6 +1356,9 @@ const canaryLine = (written: string) => {
  * this many bytes: one chunk minus a 10% margin for a scanner that reads a little less. Bigger files are left out, never
  * split (a multi-line secret such as a private key could cross a split). paths.txt is split into pieces instead (a
  * path is one line, so a line-boundary split cuts nothing).
+ * Ruling P38: test/secret-scan-skip-live.test.ts "P38 pin" checks this live on both pinned scanners (two files of
+ * exactly this size, tokens back to back on one line, one shifted by 19 bytes: every token and canary must be
+ * reported). A scanner upgrade, or a change to this number, must pass it (Plan R scanner-upgrade checklist).
  */
 export const SCAN_CHUNK_SAFE_BYTES = 90_000;
 
@@ -1533,7 +1548,7 @@ const MIN_GLOBAL_SECRET = 6;
  * Ruling P34: every scanned file and paths.txt carry a canary. A file whose canary did not come back is left out; a
  * scan that does not confirm paths.txt, or confirms none of the files, throws SecretScanError (it may have read nothing).
  */
-async function secretScanPass(files: FileEntry[], scanner: SecretScanner, timeoutMs: number, known: string[], flagged: { long: string[]; short: string[] }, notes: Notes, show: (p: string) => string): Promise<FileEntry[]> {
+async function secretScanPass(files: FileEntry[], scanner: SecretScanner, timeoutMs: number, known: string[], flagged: { long: string[]; short: string[] }, notes: Notes, show: (p: string) => string, named: readonly string[] = [], flaggedNames: Set<string> = new Set()): Promise<FileEntry[]> {
   // An absolute path only: a bare name would be looked up on PATH.
   const { name, path: bin } = scanner;
   if (!isAbsolute(bin)) throw new SecretScanError(`The ${name} binary must be given as an absolute path.`);
@@ -1555,6 +1570,10 @@ async function secretScanPass(files: FileEntry[], scanner: SecretScanner, timeou
   const kept = canaried.filter((f) => !tooBig.includes(f) && !sniffed.includes(f));
   const scanned: FileEntry[] = kept.map((f) => ({ path: f.path, content: f.content }));
   const shownPaths = scanned.map((f) => displayPath(f.path));
+  // P39: every other name a note may show (left out here, or before the scan) is scanned too, after the bundle's own
+  const scannedPaths = new Set(scanned.map((f) => f.path));
+  const others = [...new Set([...named, ...tooBig.map((f) => f.path), ...sniffed.map((f) => f.path)])].filter((p) => !scannedPaths.has(p));
+  const shownOthers = others.map(displayPath);
   const made = await mkdtemp(join(tmpdir(), 'pipegen-secret-scan-'));
   const guard = guardTempDir(made);
   try {
@@ -1562,7 +1581,7 @@ async function secretScanPass(files: FileEntry[], scanner: SecretScanner, timeou
     await chmod(tmp, 0o700);
     // Neutral names: no repo file name (.gitleaksignore, .gitleaks.toml, allowlisted paths) reaches the scanner.
     const names = scanned.map((_, i) => `f${String(i + 1).padStart(6, '0')}.txt`);
-    const pieces = pathPieces(shownPaths.map(neutralizeAllow), name);
+    const pieces = pathPieces([...shownPaths, ...shownOthers].map(neutralizeAllow), name);
     // P34 belt: the default path allowlist matches the absolute path, so a temp folder under node_modules/ (or another
     // folder it lists) would hide every file. Refused before anything is written; the canaries below are the guarantee.
     if ([...names, ...pieces.map((p) => p.name)].some((n) => skippedByDefaultPaths(join(tmp, n)))) {
@@ -1619,6 +1638,12 @@ async function secretScanPass(files: FileEntry[], scanner: SecretScanner, timeou
     const drop = new Set<number>();
     const unplaced = new Set<number>();
     const badPath = new Set<number>();
+    const allShown = [...shownPaths, ...shownOthers];
+    // a name line k of the file list: a bundle file (k < scanned.length) is left out; another one is masked in notes
+    const flagName = (k: number) => {
+      if (k < scanned.length) badPath.add(k);
+      else flaggedNames.add(others[k - scanned.length]);
+    };
     const secrets = new Set<string>();
     const shortSecrets = new Set<string>();
     const shortHit = new Set<number>();
@@ -1637,16 +1662,16 @@ async function secretScanPass(files: FileEntry[], scanner: SecretScanner, timeou
         const { startLine: s, endLine: e } = f;
         let hit = false;
         if (s !== undefined && e !== undefined && s <= e && e <= piece.count) {
-          for (let k = s - 1; k < e; k++) badPath.add(piece.first + k);
+          for (let k = s - 1; k < e; k++) flagName(piece.first + k);
           hit = true;
         }
-        shownPaths.forEach((p, k) => {
+        allShown.forEach((p, k) => {
           if (texts.some((t) => p.includes(t))) {
-            badPath.add(k);
+            flagName(k);
             hit = true;
           }
         });
-        if (!hit) shownPaths.forEach((_, k) => badPath.add(k)); // cannot tell which name: leave them all out
+        if (!hit) allShown.forEach((_, k) => flagName(k)); // cannot tell which name: leave them all out (mask the others)
         continue;
       }
       const i = rel === undefined ? undefined : index.get(rel);

@@ -9,7 +9,7 @@ import { randomBytes } from 'node:crypto';
 import { existsSync, mkdirSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
-import { bundleCode, bundleText, SecretScanError, secretScanArgv, secretScanConfigPath } from '../src/ai/redact.js';
+import { bundleCode, bundleText, SCAN_CHUNK_SAFE_BYTES, SecretScanError, secretScanArgv, secretScanConfigPath } from '../src/ai/redact.js';
 import { DEFAULT_SKIPPED_PATHS, type SecretScannerName } from '../src/ai/secret-scan-config.js';
 import { ensurePinnedBinary } from '../src/engine/linters.js';
 import { betterleaksAt, gitleaksAt, scanWith } from './helpers/gitleaks-stub.js';
@@ -24,6 +24,7 @@ vi.mock('../src/ai/secret-scan-config.js', async (importOriginal) => {
 const live = process.env.PIPEGEN_LIVE_TESTS === '1';
 // built at runtime (repo rule: no secret-like literals in test/); pipegen's own redact() does not catch it
 const shopifyValue = () => 'shp' + 'at_' + '0123456789abcdef'.repeat(2);
+const shopifyRandom = () => 'shp' + 'at_' + randomBytes(16).toString('hex');
 const NAMES = ['betterleaks', 'gitleaks'] as const;
 
 describe.skipIf(!live)('secret scan (live, both pinned scanners): a scan path the default allowlist skips (ruling P34)', () => {
@@ -150,7 +151,8 @@ describe.skipIf(!live)('secret scan (live, both pinned scanners): a scan path th
     let content = `${pre}${head}${shop}";\n`;
     while (content.length < 140_000) content += `// tail ${'c'.repeat(70)}\n`;
     expect(content.indexOf(shop)).toBe(start);
-    // the cause, raw: written the way pipegen wrote it before P36, both scanners miss the token yet report the canary
+    // The cause, raw, as documentation: written the way pipegen wrote it before P36, both scanners miss the token yet
+    // report the canary. Only a record of the 1.9.0 / 8.30.1 behaviour: what keeps pipegen safe is the P38 pin test below.
     for (const name of NAMES) {
       const dir = makeTempDir();
       writeIn(dir, 'f000001.txt', `\n${content}\npipegen-canary-${'0'.repeat(32)}\n`);
@@ -162,7 +164,7 @@ describe.skipIf(!live)('secret scan (live, both pinned scanners): a scan path th
       }
       const rules = (JSON.parse(readFileSync(reportPath, 'utf8')) as { RuleID: string }[]).map((f) => f.RuleID);
       console.log(`P36 ${name}: raw scan of the 140 KB file reports ${JSON.stringify(rules)}`);
-      expect(rules, name).toEqual(['pipegen-canary']);
+      expect(rules, `${name}: the documented 125,000-byte cut is no longer seen (the scanner's chunking changed; the P38 pin test says whether SCAN_CHUNK_SAFE_BYTES is still safe, and this record should be updated)`).toEqual(['pipegen-canary']);
     }
     // the fix, end to end
     const repo = makeTempDir();
@@ -214,6 +216,66 @@ describe.skipIf(!live)('secret scan (live, both pinned scanners): a scan path th
         const re = new RegExp(p.replace('(?i)', ''), p.startsWith('(?i)') ? 'i' : '');
         for (const n of ['/t/f000001.txt', '/t/paths.txt', '/t/paths2.txt']) expect(re.test(n), `${p} ${n}`).toBe(false);
       }
+    }
+  });
+
+  it(`live (P38 pin): a file of exactly SCAN_CHUNK_SAFE_BYTES as written is read whole: every token and each canary is reported`, () => {
+    // Two files laid out as pipegen writes them (prefix line, content, blank line, canary line), each exactly
+    // SCAN_CHUNK_SAFE_BYTES bytes: unique Shopify tokens back to back on ONE line, no blank line anywhere, the second
+    // file shifted by 19 bytes, so any cut inside the files splits a token in at least one of them. Fails if a scanner
+    // version reads such a file in more than one piece (smaller chunks, an earlier cut): then the limit must come down.
+    for (const name of NAMES) {
+      const dir = makeTempDir();
+      const planted: string[] = [];
+      const canaries: string[] = [];
+      for (const [file, shift] of [['f000001.txt', 0], ['f000002.txt', 19]] as const) {
+        const canary = `pipegen-canary-${randomBytes(16).toString('hex')}`;
+        const tail = 1 + 1 + canary.length + 1; // the newline after the content, the blank line, the canary line
+        let body = 'x'.repeat(shift);
+        for (;;) {
+          const value = shopifyRandom();
+          if (1 + body.length + value.length + 1 + tail > SCAN_CHUNK_SAFE_BYTES) break;
+          planted.push(value);
+          body += `${value} `;
+        }
+        body += 'y'.repeat(SCAN_CHUNK_SAFE_BYTES - tail - 1 - body.length);
+        const written = `\n${body}\n\n${canary}\n`;
+        expect(Buffer.byteLength(written)).toBe(SCAN_CHUNK_SAFE_BYTES);
+        writeIn(dir, file, written);
+        canaries.push(canary);
+      }
+      const reportPath = join(makeTempDir(), 'report.json');
+      try {
+        execFileSync(bins[name] as string, secretScanArgv(name, dir, secretScanConfigPath(), reportPath), { cwd: dir, env: { PATH: process.env.PATH ?? '', HOME: process.env.HOME ?? '' }, stdio: 'pipe', timeout: 300_000 });
+      } catch (e) {
+        if (typeof (e as { status?: unknown }).status !== 'number') throw e;
+      }
+      const report = JSON.parse(readFileSync(reportPath, 'utf8')) as Record<string, string>[];
+      const valueOf = (f: Record<string, string>) => f['Sec' + 'ret'];
+      const found = new Set(report.map(valueOf));
+      const missed = planted.filter((t) => !found.has(t));
+      console.log(`P38 ${name}: ${planted.length} tokens in two ${SCAN_CHUNK_SAFE_BYTES}-byte files; missed ${missed.length}`);
+      expect(missed.length, `${name} split a ${SCAN_CHUNK_SAFE_BYTES}-byte file (missed ${missed.length} tokens): SCAN_CHUNK_SAFE_BYTES is no longer safe for this scanner`).toBe(0);
+      for (const c of canaries) expect(report.filter((f) => f.RuleID === 'pipegen-canary' && valueOf(f) === c), `${name} canary`).toHaveLength(1);
+    }
+  }, 600_000);
+
+  it('live (P39): a too-large file whose name holds a SendGrid-shaped value is scanned by name, masked in the note, never in the bundle', async () => {
+    const AN = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
+    const an = (n: number) => [...randomBytes(n)].map((x) => AN[x % AN.length]).join('');
+    const sendgrid = 'SG' + '.' + an(22) + '.' + an(43);
+    const repo = makeTempDir();
+    writeIn(repo, `src/big-${sendgrid}`, `// ${'x'.repeat(77)}\n`.repeat(1_200)); // 96,000 bytes: over the limit
+    writeIn(repo, 'src/b.ts', 'export const b = 2;\n');
+    for (const name of NAMES) {
+      const b = await bundleCode(repo, scanWith(scannerFor(name), { maxBytes: 1_000_000 }));
+      const notes = b.notes.join('\n');
+      console.log(`P39 ${name}: ${b.files.map((f) => f.path)} sent; notes: ${JSON.stringify(b.notes.filter((n) => /checked|Left out/.test(n)))}`);
+      expect(notes, name).not.toContain(sendgrid);
+      expect(bundleText(b), name).not.toContain(sendgrid);
+      expect(notes, name).toContain('too large to secret-scan safely');
+      expect(notes, name).toContain('(a file whose name looks like a secret)');
+      expect(b.files.map((f) => f.path), name).toEqual(['src/b.ts']);
     }
   });
 });

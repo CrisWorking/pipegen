@@ -801,6 +801,34 @@ describe('bundle: scan canaries (ruling P34)', () => {
     }
   });
 
+  it('P39: a left-out file (too large to scan, binary, …) is named in a note only after its name went through the scan; a flagged one is masked', async () => {
+    const big = 'big' + '-name-' + 'value-8812';
+    const bin = 'bin' + '-name-' + 'value-3307';
+    const dir = makeTempDir();
+    const lines = (c: string) => `// ${c.repeat(77)}\n`.repeat(1_200); // 96,000 bytes: over SCAN_CHUNK_SAFE_BYTES
+    writeIn(dir, `src/${big}.js`, lines('x'));
+    writeFileSync(join(dir, `${bin}.dat`), Buffer.from([0, 1, 2, 3, 0, 0, 255])); // binary: skipped before the scan
+    writeIn(dir, 'src/plain-big.js', lines('y'));
+    writeIn(dir, 'src/a.ts', 'export const a = 1;\n');
+    for (const at of [betterleaksAt, gitleaksAt]) {
+      // the scanner flags both names (lines of the paths pieces) and nothing else
+      const stub = makeStub(`const f = [...findingsFor(${JSON.stringify(big)}), ...findingsFor(${JSON.stringify(bin)})].filter((x) => /paths/.test(x.File)); writeReport(JSON.stringify(f)); process.exit(1);`);
+      const b = await bundleCode(dir, scanWith(at(stub.bin), { maxBytes: 1_000_000 }));
+      const rec = stub.record();
+      // the names of the files left out before or outside the scan were in the file list it read
+      expect(rec.files['paths.txt'], at.name).toContain(`src/${big}.js`);
+      expect(rec.files['paths.txt'], at.name).toContain(`${bin}.dat`);
+      expect(rec.files['paths.txt'], at.name).toContain('src/plain-big.js');
+      const notes = b.notes.join('\n');
+      expect(notes, at.name).not.toContain(big);
+      expect(notes, at.name).not.toContain(bin);
+      expect(notes, at.name).toMatch(/too large to secret-scan safely[^\n]*\(a file whose name looks like a secret\), src\/plain-big\.js\./);
+      expect(notes, at.name).toContain('Skipped binary files: (a file whose name looks like a secret).');
+      expect(bundleText(b), at.name).not.toContain(big);
+      expect(paths(b), at.name).toEqual(['src/a.ts']);
+    }
+  });
+
   it('P36: a long file list is scanned in pieces under the limit, each with its own canary, all required; findings map to the right path', async () => {
     const dir = makeTempDir();
     const n = 700; // ~700 × 200 bytes of paths: two pieces
