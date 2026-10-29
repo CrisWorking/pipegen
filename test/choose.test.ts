@@ -293,6 +293,15 @@ describe('choose: iac, secrets, update config, publishing, the scheduled checks'
     expect(none.tool).toEqual({ kind: 'built-in' });
     expect(none.note).toBe('pipegen would write `.github/dependabot.yml`: weekly, grouped, `cooldown.default-days: 7`');
   });
+  it('choose: the wait is already set (the row says so) → never "set cooldown 7" or "set minimumReleaseAge" (hand checks, P55)', () => {
+    const p = profile([svc()], { repoFiles: { ...emptyRepoFiles(), dependabot: '.github/dependabot.yml', renovate: 'renovate.json' } });
+    const row = (by: string, cooldown: 'set' | 'short') => ({ need: needOf('update-config'), status: 'partial' as const, why: '', by, where: '', cooldown });
+    const dSet = chooseTools(needOf('update-config'), undefined, p, caps, LIST, row('dependabot', 'set'));
+    expect(dSet.note).toBe('keep your Dependabot config; its cooldown already waits at least 7 days');
+    expect(chooseTools(needOf('update-config'), undefined, p, caps, LIST, row('dependabot', 'short')).note).toBe('keep your Dependabot config; set `cooldown.default-days: 7`');
+    expect(chooseTools(needOf('update-config'), undefined, p, caps, LIST, row('renovate', 'set')).note).toBe('keep Renovate; its minimumReleaseAge already waits at least 7 days');
+    expect(chooseTools(needOf('update-config'), undefined, p, caps, LIST, row('renovate', 'short')).note).toBe('keep Renovate; set `minimumReleaseAge: "7 days"`');
+  });
   it('choose: publishing is built in; egress → bullfrog; scorecard → scorecard-action; fuzzing → nothing, built in v0.3', () => {
     expect(choose('publishing', profile())).toMatchObject({ tool: { kind: 'built-in' }, note: 'trusted publishing (OIDC); no long-lived token' });
     expect(idOf(choose('egress', profile()).tool)).toBe('bullfrog');

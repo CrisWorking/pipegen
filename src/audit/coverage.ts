@@ -144,7 +144,15 @@ import { Reader, configFilesPass, releaseEgress, releaseSigns, walkWorkflow } fr
 export { COVERAGE_LIMITS } from './coverage/bounds.js';
 export { loadToolSignatures, type ToolSignature } from './coverage/signatures.js';
 
-export interface Coverage { need: Need; status: 'covered' | 'partial' | 'missing' | 'unknown'; by?: string; where?: string; why: string }
+export interface Coverage {
+  need: Need; status: 'covered' | 'partial' | 'missing' | 'unknown'; by?: string; where?: string; why: string;
+  /**
+   * update-config rows only (hand checks, P55): whether the update tool already waits at least COOLDOWN_DAYS before an
+   * update (Dependabot: every active entry's cooldown; Renovate: minimumReleaseAge), whatever else the row says, so
+   * "would add" never tells a repo to set a wait it has. Absent when pipegen couldn't read the config that far.
+   */
+  cooldown?: 'set' | 'short';
+}
 
 export interface MapCoverageOptions {
   /** How many workflow files readWorkflows skipped (unreadable, over the cap): rows that would be missing say unknown. */

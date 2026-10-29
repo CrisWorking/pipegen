@@ -1019,3 +1019,16 @@ describe('buildAudit: would-create never offers a file the repo has (hand checks
     }
   });
 });
+
+describe('buildAudit: would-add never asks for a wait the update tool has (hand checks fix 5, P55)', () => {
+  it('Dependabot waits 7 days on every entry but misses an ecosystem: the row is partial, the pick keeps the cooldown', async () => {
+    const r = await buildAudit(repo({
+      ...nodeApp(), '.github/workflows/ci.yml': 'on: [push, pull_request]\njobs:\n  t:\n    runs-on: ubuntu-latest\n    steps:\n      - run: npm test\n',
+      '.github/dependabot.yml': 'version: 2\nupdates:\n  - package-ecosystem: npm\n    directory: /\n    schedule:\n      interval: weekly\n    cooldown:\n      default-days: 7\n',
+    }), deps());
+    const row = r.coverage.find((c) => c.need.category === 'update-config');
+    expect(row).toMatchObject({ status: 'partial', cooldown: 'set' });
+    const add = rowsOf(r, 'update-config')[0];
+    expect(add?.note).toBe('keep your Dependabot config; its cooldown already waits at least 7 days');
+  });
+});

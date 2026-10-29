@@ -724,7 +724,7 @@ function wouldAddRows(p: RepoProfile, coverage: Coverage[], deps: AuditDeps, cap
     // S27: a service without tests gets starter tests; its own `test` script (npm's default "no test specified") is
     // then not offered as the tool, so the row's tool and note agree (fix round 1, M2).
     const starter = (need.category === 'unit-tests' || need.category === 'full-tests') && service !== undefined && !service.hasTests;
-    const { tool, also, note } = pick(need, starter ? undefined : service, p, deps, caps);
+    const { tool, also, note } = pick(need, starter ? undefined : service, p, deps, caps, c);
     rows.push({ need, status: c.status, tool, also, note: starter ? starterTests(service.name) : note });
   }
   return rows;
@@ -735,11 +735,11 @@ function wouldAddRows(p: RepoProfile, coverage: Coverage[], deps: AuditDeps, cap
  * choose-rules; the first reviewed entry for a check without a rule, PS35) → nothing. The list unavailable (B3/U11)
  * keeps its own note on a row that ends with no tool.
  */
-function pick(need: Need, service: Service | undefined, p: RepoProfile, deps: AuditDeps, caps: Capabilities): { tool: WouldAddTool; also: WouldAddTool[]; note: string } {
+function pick(need: Need, service: Service | undefined, p: RepoProfile, deps: AuditDeps, caps: Capabilities, row: Coverage): { tool: WouldAddTool; also: WouldAddTool[]; note: string } {
   if (isBuiltInNeed(need)) return { tool: { kind: 'built-in' }, also: [], note: ROW_NOTE.builtIn };
   const script = service === undefined ? null : projectScriptFor(need, service);
   if (script !== null) return { tool: script, also: [], note: ROW_NOTE.script(script.script) };
-  const choice = chooseTools(need, service, p, caps, deps.reviewed);
+  const choice = chooseTools(need, service, p, caps, deps.reviewed, row);
   if (choice.tool !== null) return { tool: choice.tool, also: choice.also, note: choice.note };
   // Task 9: an unavailable list explains a pick that is null only for lack of its entry (or has no note at all); a null pick with a reason of its own keeps it
   if (deps.reviewedUnavailable === true && (choice.unlisted === true || choice.note === '')) return { tool: null, also: [], note: ROW_NOTE.unavailable };

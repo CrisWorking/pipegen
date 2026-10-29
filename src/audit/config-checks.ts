@@ -44,7 +44,7 @@ const MAX_NODES = 100_000;         // nodes visited looking for YAML merge keys
 const MAX_PATH = 200;
 
 type Status = Coverage['status'];
-interface Verdict { status: Status; why: string; by: string; where: string }
+interface Verdict { status: Status; why: string; by: string; where: string; cooldown?: 'set' | 'short' }
 const rank: Record<Status, number> = { covered: 3, partial: 2, unknown: 1, missing: 0 };
 
 // ---------- reading a fixed path ----------
@@ -216,10 +216,15 @@ async function dependabotVerdict(p: RepoProfile, dir: string): Promise<Verdict |
     byEco.set(key, [...(byEco.get(key) ?? []), m]);
   }
 
+  // P55: does every active entry already wait long enough? (said on the row whatever else it says)
+  const active = [...byEco.values()].flat();
+  const wait: 'set' | 'short' | undefined = active.length === 0 ? undefined : active.every((m) => m.cooldownOk) ? 'set' : 'short';
+  const mkWait = (status: Status, why: string): Verdict => ({ ...mk(status, why), ...(wait === undefined ? {} : { cooldown: wait }) });
+
   // what the repo needs
   const reqs: Requirement[] = [];
   let unchecked = false;
-  if (p.services.length > 5000) return mk('unknown', 'There are more services than pipegen checks against the Dependabot file.');
+  if (p.services.length > 5000) return mkWait('unknown', 'There are more services than pipegen checks against the Dependabot file.');
   for (const s of p.services) {
     const sd = cleanFolder(s.path) ?? s.path;
     if (s.language === 'node') reqs.push({ ecos: [s.packageManager === 'bun' ? 'bun' : 'npm'], dir: sd });
@@ -235,8 +240,8 @@ async function dependabotVerdict(p: RepoProfile, dir: string): Promise<Verdict |
   // a manifest in a folder no service owns (the service reader skips it) still needs an entry
   for (const d of listed.node) reqs.push({ ecos: ['npm', 'bun'], dir: d });
   for (const d of listed.python) reqs.push({ ecos: ['pip', 'uv'], dir: d });
-  if (reqs.length > MAX_REQUIREMENTS) return mk('unknown', 'There are more ecosystems and folders than pipegen checks against the Dependabot file.');
-  if (reqs.length === 0) return mk('unknown', 'pipegen found no ecosystem it can check against the Dependabot file.');
+  if (reqs.length > MAX_REQUIREMENTS) return mkWait('unknown', 'There are more ecosystems and folders than pipegen checks against the Dependabot file.');
+  if (reqs.length === 0) return mkWait('unknown', 'pipegen found no ecosystem it can check against the Dependabot file.');
 
   const missing = new Set<string>();
   let anyFolderGap = false;
@@ -254,12 +259,12 @@ async function dependabotVerdict(p: RepoProfile, dir: string): Promise<Verdict |
     } else if (!hits.some((m) => m.cooldownOk)) cooldownGap = true;
   }
   if (missing.size > 0) {
-    return mk('partial', `Dependabot has no active entry for ${[...missing].join(', ')}${anyFolderGap ? ' (some folders are not listed)' : ''}, so some dependencies are not updated by it.`);
+    return mkWait('partial', `Dependabot has no active entry for ${[...missing].join(', ')}${anyFolderGap ? ' (some folders are not listed)' : ''}, so some dependencies are not updated by it.`);
   }
-  if (cooldownGap) return mk('partial', `Dependabot's default wait is 3 days; pipegen uses ${COOLDOWN_DAYS}. Set cooldown default-days to at least ${COOLDOWN_DAYS} (with no lower per-type days, include or exclude) on every entry.`);
-  if (unchecked) return mk('partial', "Dependabot covers the ecosystems pipegen checks, but pipegen doesn't check the entries for Java, .NET, Ruby or PHP code.");
-  if (listed.truncated) return mk('unknown', 'The repo has too many files for pipegen to find every Go module and Dockerfile, so it can\'t tell that Dependabot lists them all.');
-  return mk('covered', `Dependabot updates every ecosystem and folder pipegen found, each waiting at least ${COOLDOWN_DAYS} days (cooldown) before an update.`);
+  if (cooldownGap) return mkWait('partial', `Dependabot's default wait is 3 days; pipegen uses ${COOLDOWN_DAYS}. Set cooldown default-days to at least ${COOLDOWN_DAYS} (with no lower per-type days, include or exclude) on every entry.`);
+  if (unchecked) return mkWait('partial', "Dependabot covers the ecosystems pipegen checks, but pipegen doesn't check the entries for Java, .NET, Ruby or PHP code.");
+  if (listed.truncated) return mkWait('unknown', 'The repo has too many files for pipegen to find every Go module and Dockerfile, so it can\'t tell that Dependabot lists them all.');
+  return mkWait('covered', `Dependabot updates every ecosystem and folder pipegen found, each waiting at least ${COOLDOWN_DAYS} days (cooldown) before an update.`);
 }
 
 // ---------- Renovate ----------
@@ -313,9 +318,13 @@ async function renovateVerdict(dir: string, running: boolean): Promise<Verdict |
     if (!Object.hasOwn(o, 'renovate')) return null;
     config = o.renovate;
   }
-  const part = (why: string): Verdict => ({ status: 'partial', by: 'renovate', where, why });
+  let wait: 'set' | 'short' | undefined;
+  const part = (why: string): Verdict => ({ status: 'partial', by: 'renovate', where, why, ...(wait === undefined ? {} : { cooldown: wait }) });
   if (config === null || typeof config !== 'object' || Array.isArray(config)) return part("Renovate's config isn't an object that pipegen can read.");
   const c = config as Record<string, unknown>;
+  // P55: the repo's own top-level minimumReleaseAge (a preset's can't be read, and packageRules may only narrow it)
+  const ownAge = Object.hasOwn(c, 'minimumReleaseAge') ? renovateDays(c.minimumReleaseAge) : null;
+  wait = ownAge !== null && ownAge >= COOLDOWN_DAYS ? 'set' : 'short';
   if (c.enabled === false) return part('Renovate is turned off in its config (enabled is false).');
   const extendsList = Array.isArray(c.extends) ? c.extends : typeof c.extends === 'string' ? [c.extends] : [];
   if (extendsList.some((x) => typeof x === 'string' && /^:?disableRenovate$/.test(x))) return part('Renovate is turned off by a preset in its config.');
@@ -355,7 +364,7 @@ async function renovateVerdict(dir: string, running: boolean): Promise<Verdict |
   // a preset in `extends` can carry its own packageRules with a shorter age; only a match-all rule of the repo's own wins over it
   if (extendsList.length > 0 && !matchAllRule) return part("Renovate's config extends a preset, which may set a shorter minimumReleaseAge for some packages, and pipegen can't read presets.");
   if (!running) return part("Renovate's config waits at least 7 days, but pipegen can't see whether the Renovate app is installed (read access doesn't show GitHub Apps), and no workflow runs Renovate.");
-  return { status: 'covered', by: 'renovate', where, why: `Renovate waits at least ${COOLDOWN_DAYS} days (minimumReleaseAge) before updating, and a workflow runs Renovate on a schedule.` };
+  return { status: 'covered', by: 'renovate', where, cooldown: 'set', why: `Renovate waits at least ${COOLDOWN_DAYS} days (minimumReleaseAge) before updating, and a workflow runs Renovate on a schedule.` };
 }
 
 const MISSING_UPDATE_WHY = 'No Dependabot or Renovate config was found, so nothing opens update pull requests.';
@@ -368,7 +377,7 @@ export async function updateConfigCoverage(_p: RepoProfile, need: Need, dir: str
   const verdicts = [await dependabotVerdict(_p, dir), await renovateVerdict(dir, renovateRuns)].filter((v): v is Verdict => v !== null);
   if (verdicts.length === 0) return { need, status: 'missing', why: MISSING_UPDATE_WHY };
   const best = verdicts.reduce((a, b) => (rank[b.status] > rank[a.status] ? b : a));
-  return { need, status: best.status, by: best.by, where: best.where, why: best.why };
+  return { need, status: best.status, by: best.by, where: best.where, why: best.why, ...(best.cooldown === undefined ? {} : { cooldown: best.cooldown }) };
 }
 
 // ---------- coverage minimum ----------

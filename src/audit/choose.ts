@@ -43,6 +43,8 @@ const NO_ENTRY = 'it is not on the reviewed list yet, so pipegen would only ment
 
 interface Ctx {
   need: Need; s: Service | undefined; p: RepoProfile; caps: Capabilities;
+  /** The need's coverage row, when the caller has it (the audit does): a rule may read what the row found (P55). */
+  row?: Coverage;
   q: Service['quality']; lang: ReturnType<typeof needLanguage>;
   /** The reviewed entries that cover this need and may be picked: right category and language, never on a never-list. */
   usable: ReviewedTool[];
@@ -215,8 +217,11 @@ function apiDastRule(c: Ctx): Choice {
 }
 
 function updateConfigRule(c: Ctx): Choice {
-  if (c.p.repoFiles.renovate !== null) return builtIn('keep Renovate; set `minimumReleaseAge: "7 days"`');
-  if (c.p.repoFiles.dependabot !== null) return builtIn('keep your Dependabot config; set `cooldown.default-days: 7`');
+  // hand checks (P55): the row says which tool it read and whether its wait is already long enough; never ask for a set wait
+  const set = c.row?.cooldown === 'set';
+  const tool = c.row?.by === 'dependabot' || c.row?.by === 'renovate' ? c.row.by : c.p.repoFiles.renovate !== null ? 'renovate' : c.p.repoFiles.dependabot !== null ? 'dependabot' : null;
+  if (tool === 'renovate') return builtIn(set ? 'keep Renovate; its minimumReleaseAge already waits at least 7 days' : 'keep Renovate; set `minimumReleaseAge: "7 days"`');
+  if (tool === 'dependabot') return builtIn(set ? 'keep your Dependabot config; its cooldown already waits at least 7 days' : 'keep your Dependabot config; set `cooldown.default-days: 7`');
   return builtIn('pipegen would write `.github/dependabot.yml`: weekly, grouped, `cooldown.default-days: 7`');
 }
 
@@ -259,12 +264,12 @@ const RULES: Readonly<Record<string, Rule>> = {
 
 /**
  * What pipegen would add for `need`: the rule for its category, else the first reviewed entry that covers it.
- * Pure and deterministic. `s` is the need's service (absent for repo-wide needs).
+ * Pure and deterministic. `s` is the need's service (absent for repo-wide needs); `row`, its coverage row when known.
  */
-export function chooseTools(need: Need, s: Service | undefined, p: RepoProfile, caps: Capabilities, reviewedList: ReviewedTool[]): Choice {
+export function chooseTools(need: Need, s: Service | undefined, p: RepoProfile, caps: Capabilities, reviewedList: ReviewedTool[], row?: Coverage): Choice {
   const usable = reviewedFor(need, needLanguage(need, p), reviewedList, 'audit')
     .filter((t) => neverListed(t.candidate.repo) === null && (t.candidate.kind !== 'docker' || neverImage(t.candidate.repo) === null));
-  const c: Ctx = { need, s, p, caps, q: s?.quality ?? emptyServiceQuality(), lang: needLanguage(need, p), usable };
+  const c: Ctx = { need, s, p, caps, q: s?.quality ?? emptyServiceQuality(), lang: needLanguage(need, p), usable, ...(row === undefined ? {} : { row }) };
   const rule = Object.hasOwn(RULES, need.category) ? (RULES[need.category] as Rule) : generic;
   return rule(c);
 }

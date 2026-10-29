@@ -946,3 +946,23 @@ describe('Task 9: a missing lockfile is not "not applicable"', () => {
     expect(none.some((r) => r.need.id === 'licences')).toBe(false);
   });
 });
+
+// Hand checks 2026-10-29 (ruling P55): the row says whether the wait (cooldown, minimumReleaseAge) is already set, so
+// "would add" never tells a repo to set what it has.
+describe('update-config: the row says whether the wait is already set (hand checks, P55)', () => {
+  it('Dependabot: every entry waits 7 days, but an ecosystem is missing → partial with cooldown "set"; no cooldown → "short"', async () => {
+    const dir = makeTempDir();
+    wf(dir, 'ci.yml', onBoth + job(runStep('npm test'))); // needs a github-actions entry too
+    dep(dir, depFile(upd('npm', '/')));
+    expect(await update(dir)).toMatchObject({ status: 'partial', by: 'dependabot', cooldown: 'set' });
+    dep(dir, depFile(upd('npm', '/', ''), upd('github-actions', '/', '')));
+    expect(await update(dir)).toMatchObject({ status: 'partial', by: 'dependabot', cooldown: 'short' });
+  });
+  it('Renovate: minimumReleaseAge 7 days → "set" even while the row is partial (app not seen); none → "short"', async () => {
+    const dir = makeTempDir();
+    writeIn(dir, 'renovate.json', JSON.stringify({ minimumReleaseAge: '7 days' }));
+    expect(await update(dir)).toMatchObject({ status: 'partial', by: 'renovate', cooldown: 'set' });
+    writeIn(dir, 'renovate.json', JSON.stringify({}));
+    expect(await update(dir)).toMatchObject({ status: 'partial', by: 'renovate', cooldown: 'short' });
+  });
+});
