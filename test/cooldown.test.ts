@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { describe, expect, it } from 'vitest';
 import { binaryItems, changedLockEntries, formatReport, prFromEnv, repoPath, runCooldown, type Files } from '../scripts/cooldown.js';
 
@@ -186,6 +187,23 @@ describe('cooldown: npm lockfile', () => {
       const r = await run({}, head, router(r2));
       expect(r.ok).toBe(false);
       expect(r.findings[0]?.lookupFailed).toBe(true);
+    });
+
+    it('P43: the date is the LATER of the tarball Last-Modified and the version document publish stamp', async () => {
+      const stamped = (at: string, lm: string) => routes({
+        lastModified: httpDate(lm),
+        doc: { name, version: v, dist: { integrity: integ(name, v), tarball }, _npmOperationalInternal: { tmp: `tmp/${name}_${v}_${Date.parse(at)}_0.6120386617728939`, host: 's3://npm-registry-packages' } },
+      });
+      // a young publish stamp with an old Last-Modified: young
+      const young = await run({}, head, router(stamped(daysAgo(2), daysAgo(30))));
+      expect(young.findings[0]?.young).toBe(true);
+      expect(Date.parse(young.findings[0]?.date ?? '')).toBe(Date.parse(daysAgo(2)));
+      // an old stamp with a young Last-Modified (a re-stored tarball): still young, never the older stamp
+      expect((await run({}, head, router(stamped(daysAgo(30), daysAgo(2))))).findings[0]?.young).toBe(true);
+      expect((await run({}, head, router(stamped(daysAgo(30), daysAgo(20))))).ok).toBe(true);
+      // an unreadable stamp is ignored (Last-Modified still decides; it can only be stricter)
+      const odd = routes({ doc: { name, version: v, dist: { integrity: integ(name, v), tarball }, _npmOperationalInternal: { tmp: 'tmp/garbage' } } });
+      expect((await run({}, head, router(odd))).ok).toBe(true);
     });
 
     it('a reviewed npm tool whose packument is too big is checked the same way', async () => {
@@ -467,6 +485,114 @@ ${extra}`;
     expect(problems(npm403)).toBe('lookup failed: HTTP 403');
   });
 
+  // P41: archives a tool downloads at run time, pinned in step.cli.env (and fixedInputs.env), are pins too.
+  const sha256 = (t: string): string => createHash('sha256').update(t).digest('hex');
+  const NT = 'projectdiscovery/nuclei-templates';
+  const ntArchive = `https://github.com/${NT}/archive/refs/tags/v10.5.0.tar.gz`;
+  const ntSumsUrl = `https://github.com/${NT}/releases/download/v10.5.0/nuclei-templates-10.5.0_checksums.txt`;
+  const nuclei = (o: { url?: string; sha?: string; fixedUrl?: string } = {}): string => `  - id: nu
+    candidate: { id: nu, kind: cli, repo: o/r, version: "v1", pin: { checksum: "${HEX}" } }
+    step: { cli: { install: { method: github-release, package: "tool.tar.gz", version: "v1" }, command: [], env: { PIPEGEN_NUCLEI_TEMPLATES_URL: "${o.url ?? ntArchive}", PIPEGEN_NUCLEI_TEMPLATES_SHA256: "${o.sha ?? HEX2}" } } }
+    fixedInputs: { env: { PIPEGEN_NUCLEI_TEMPLATES_URL: "${o.fixedUrl ?? o.url ?? ntArchive}", PIPEGEN_NUCLEI_TEMPLATES_SHA256: "${o.sha ?? HEX2}" } }
+`;
+  const ntRoutes = (o: { published?: string; listed?: string; text?: string; badDigest?: boolean; assetAt?: string; noAsset?: boolean; tarball?: string } = {}): Routes => {
+    const text = o.text ?? `${'9'.repeat(64)}  nuclei-templates-10.5.0.zip\n${o.listed ?? HEX2}  nuclei-templates-10.5.0.tar.gz\n`;
+    const at = o.assetAt ?? daysAgo(30);
+    const assets: unknown[] = o.noAsset ? [] : [{ name: 'nuclei-templates-10.5.0_checksums.txt', browser_download_url: ntSumsUrl, digest: `sha256:${o.badDigest ? HEX : sha256(text)}`, created_at: at, updated_at: at }];
+    if (o.tarball) assets.push({ name: 'nuclei-templates-10.5.0.tar.gz', browser_download_url: `https://github.com/${NT}/releases/download/v10.5.0/nuclei-templates-10.5.0.tar.gz`, digest: `sha256:${o.tarball}`, created_at: at, updated_at: at });
+    return {
+      ...rel('v1', daysAgo(400), HEX),
+      [gh(`${NT}/releases/tags/v10.5.0`)]: { tag_name: 'v10.5.0', published_at: o.published ?? daysAgo(30), assets },
+      [ntSumsUrl]: () => new Response(text, { status: 200 }),
+    };
+  };
+
+  it('P41: nuclei templates (tag archive) are tied to the release checksums file and dated by the release', async () => {
+    const head = { 'data/reviewed-tools.yml': rtFile(nuclei()) };
+    const calls: string[] = [];
+    const ok = await run({}, head, router(ntRoutes(), calls));
+    expect(problems(ok)).toBe('');
+    expect(ok.checked).toBe(2);
+    expect(calls).toContain(ntSumsUrl);
+    const young = await run({}, head, router(ntRoutes({ published: daysAgo(1) })));
+    expect(young.findings.map((f) => `${f.name}: ${f.young}`)).toEqual(['nu (nuclei templates): true']);
+    expect((await run({}, head, router(ntRoutes({ assetAt: daysAgo(2) })))).findings[0]?.young).toBe(true);
+    expect(problems(await run({}, head, router(ntRoutes({ listed: HEX }))))).toContain('does not list the pinned sha256');
+    expect(problems(await run({}, head, router(ntRoutes({ badDigest: true }))))).toContain('digest');
+    expect(problems(await run({}, head, router(ntRoutes({ noAsset: true }))))).toContain('needs owner review');
+    expect(problems(await run({}, head, router({ ...rel('v1', daysAgo(400), HEX) })))).toContain('404');
+  });
+
+  it('P41: nuclei templates as a release asset are tied to its digest; odd URLs or env copies that disagree fail', async () => {
+    const asset = `https://github.com/${NT}/releases/download/v10.5.0/nuclei-templates-10.5.0.tar.gz`;
+    const head = { 'data/reviewed-tools.yml': rtFile(nuclei({ url: asset })) };
+    expect(problems(await run({}, head, router(ntRoutes({ tarball: HEX2 }))))).toBe('');
+    expect(problems(await run({}, head, router(ntRoutes({ tarball: HEX }))))).toContain('differs');
+    const odd = { 'data/reviewed-tools.yml': rtFile(nuclei({ url: 'https://evil.example/t.tar.gz' })) };
+    expect(problems(await run({}, odd, router(ntRoutes())))).toContain('nuclei-templates');
+    const split = { 'data/reviewed-tools.yml': rtFile(nuclei({ fixedUrl: asset })) };
+    expect(problems(await run({}, split, router(ntRoutes({ tarball: HEX2 }))))).toContain('fixedInputs.env');
+  });
+
+  const RULES_COMMIT = 'f'.repeat(40);
+  const semgrep = (o: { url?: string; tree?: string } = {}): string => `  - id: sg
+    candidate: { id: sg, kind: docker, repo: semgrep/semgrep, version: "2026", pin: { digest: "${DIGEST}" } }
+    step: { cli: { install: { method: docker, package: "semgrep/semgrep", version: "2026" }, command: [], env: { PIPEGEN_RULES_URL: "${o.url ?? `https://github.com/semgrep/semgrep-rules/archive/${RULES_COMMIT}.tar.gz`}", PIPEGEN_RULES_SHA256: "${HEX}", PIPEGEN_RULES_TREE: "${o.tree ?? SHA2}" } } }
+`;
+  const sgRoutes = (verification: unknown, committed = daysAgo(400)): Routes => ({
+    'https://hub.docker.com/v2/repositories/semgrep/semgrep/tags/2026': { digest: DIGEST, tag_last_pushed: daysAgo(400) },
+    [gh(`semgrep/semgrep-rules/git/commits/${RULES_COMMIT}`)]: { sha: RULES_COMMIT, tree: { sha: SHA2 }, committer: { date: committed }, verification },
+  });
+  const verified = (at: string) => ({ verified: true, reason: 'valid', verified_at: at });
+
+  it('P41: semgrep rules: the commit tree must be PIPEGEN_RULES_TREE, dated by GitHub verified_at, never the committer date', async () => {
+    const head = { 'data/reviewed-tools.yml': rtFile(semgrep()) };
+    const ok = await run({}, head, router(sgRoutes(verified(daysAgo(30)))));
+    expect(problems(ok)).toBe('');
+    expect(ok.checked).toBe(2);
+    // a backdated committer date does not help: verified_at decides
+    const young = await run({}, head, router(sgRoutes(verified(daysAgo(1)), daysAgo(900))));
+    expect(young.findings.map((f) => `${f.name}: ${f.young}`)).toEqual(['sg (semgrep rules): true']);
+    expect((await run({}, head, router(sgRoutes(verified(daysAgo(30)), daysAgo(1))))).ok).toBe(true);
+    expect(problems(await run({}, { 'data/reviewed-tools.yml': rtFile(semgrep({ tree: SHA })) }, router(sgRoutes(verified(daysAgo(30))))))).toContain('PIPEGEN_RULES_TREE');
+    for (const v of [{ verified: false, reason: 'unsigned', verified_at: null }, { verified: true, reason: 'valid' }, undefined]) {
+      expect(problems(await run({}, head, router(sgRoutes(v)))), JSON.stringify(v)).toContain('needs owner review');
+    }
+    const odd = { 'data/reviewed-tools.yml': rtFile(semgrep({ url: 'https://evil.example/rules.tar.gz' })) };
+    expect(problems(await run({}, odd, router(sgRoutes(verified(daysAgo(30))))))).toContain('PIPEGEN_RULES_URL');
+  });
+
+  it('P41: a hash- or URL-shaped value at a field this check does not know fails; verifiedWith is known', async () => {
+    const base = cli(HEX);
+    const routes = rel('v1', daysAgo(30), HEX);
+    expect((await run({}, { 'data/reviewed-tools.yml': rtFile(base) }, router(routes))).ok).toBe(true);
+    const withEnv = base.replace('command: [] }', `command: [], env: { EXTRA_SHA256: "${HEX2}" } }`);
+    const r1 = await run({}, { 'data/reviewed-tools.yml': rtFile(withEnv) }, router(routes));
+    expect(problems(r1)).toContain('step.cli.env.EXTRA_SHA256');
+    expect(problems(r1)).toContain('needs owner review');
+    for (const extra of [
+      '    fixedInputs: { config: { content: "rules: https://evil.example/r.yml" } }\n',
+      `    fixedInputs: { args: ["--sha", "${SHA}"] }\n`,
+      `    extra: { sri: "sha512-${'A'.repeat(20)}" }\n`,
+      `    wrappedImage: { ref: "x", digest: "${DIGEST}", mirror: "https://m.example" }\n`,
+    ]) {
+      expect((await run({}, { 'data/reviewed-tools.yml': rtFile(cli(HEX, 'v1', 'tool.tar.gz', extra)) }, router(routes))).ok, extra).toBe(false);
+    }
+    const known = `    verifiedWith: { method: cosign-key, keyUrl: "https://raw.example/k.pub", keySha256: "${HEX2}", identity: "https://github.com/o/r/.github/workflows/r.yml@refs/tags/v1" }\n    wrappedImage: { ref: "ghcr.io/o/r:v1", digest: "${DIGEST}" }\n`;
+    expect(problems(await run({}, { 'data/reviewed-tools.yml': rtFile(cli(HEX, 'v1', 'tool.tar.gz', known)) }, router(routes)))).toBe('');
+  });
+
+  it('P42: tools that is not a list, an entry with no id, or a duplicate id fails', async () => {
+    const routes = actionRoutes('v1', SHA, daysAgo(400));
+    const base = { 'data/reviewed-tools.yml': rtFile(action('v1', SHA)) };
+    expect(problems(await run(base, { 'data/reviewed-tools.yml': 'pinnedOn: "x"\ntools: { a: 1 }\n' }, router(routes)))).toContain('not a list');
+    const noId = `  - candidate: { kind: action, repo: o/r, version: "v9", pin: { sha: "${SHA2}" } }\n`;
+    expect(problems(await run(base, { 'data/reviewed-tools.yml': rtFile(action('v1', SHA) + noId) }, router(routes)))).toContain('no id');
+    // a changed copy placed BEFORE the unchanged original is not hidden by it
+    const dup = await run(base, { 'data/reviewed-tools.yml': rtFile(action('v2', SHA2) + action('v1', SHA)) }, router(routes));
+    expect(problems(dup)).toContain('more than once');
+  });
+
   it('an unknown kind fails closed', async () => {
     const odd = `  - id: q\n    candidate: { id: q, kind: weird, repo: o/r, version: "1" }\n`;
     expect(problems(await run({}, { 'data/reviewed-tools.yml': rtFile(odd) }, router({})))).toContain('needs owner review');
@@ -523,6 +649,15 @@ describe('cooldown: pinned binaries', () => {
   it('a url for another tag than the version fails; a 404 release fails', async () => {
     expect(problems(await run({}, { 'data/pinned-binaries.yml': bin({ url: 'https://github.com/o/r/releases/download/v0/g.tgz' }) }, router({})))).toContain('tag v0');
     expect(problems(await run({}, { 'data/pinned-binaries.yml': bin() }, router({})))).toContain('404');
+  });
+
+  it('P41/P42: an unknown hash- or URL-shaped field, a non-tool value or a duplicate tool key fails', async () => {
+    const extra = bin().replace('      archiveSha256:', '      mirror: https://m.example/g.tgz\n      archiveSha256:');
+    expect(problems(await run({}, { 'data/pinned-binaries.yml': extra }, router(rel(daysAgo(30)))))).toContain('mirror');
+    expect(problems(await run({}, { 'data/pinned-binaries.yml': `${bin()}h: "1.0"\n` }, router(rel(daysAgo(30)))))).toContain('not a tool entry');
+    await expect(run({}, { 'data/pinned-binaries.yml': bin() + bin() }, router(rel(daysAgo(30))))).rejects.toThrow('data/pinned-binaries.yml is not valid YAML');
+    const known = bin().replace('      archiveSha256:', `      binarySha256: ${HEX2}\n      archiveSha256:`);
+    expect((await run({}, { 'data/pinned-binaries.yml': known }, router(rel(daysAgo(30))))).ok).toBe(true);
   });
 
   it('with no platforms nothing can be tied, so it fails', () => {

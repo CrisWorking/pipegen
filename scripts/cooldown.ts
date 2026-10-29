@@ -11,7 +11,12 @@
 //   - reviewed tools (whole entry diffed): an action's SHA must be the commit of its tag, a release binary's asset
 //     digest must belong to that GitHub release, a docker digest must be the tag's digest on Docker Hub, an npm/pip
 //     tool's package (step.cli.install.package) is tied to candidate.pin.checksum and each step.cli.plugins entry to
-//     its own checksum on its registry; date = release published_at / registry time;
+//     its own checksum on its registry; date = release published_at / registry time. Archives a tool downloads at run
+//     time, pinned in step.cli.env: the nuclei templates tarball must be listed with its sha256 in the release's
+//     checksums file (GitHub records that file's digest) or be a release asset with that digest, dated by the release;
+//     the semgrep rules commit's tree must be PIPEGEN_RULES_TREE, dated by GitHub's signature verified_at (the git
+//     dates are the pusher's). A hash- or URL-shaped value at any field this script doesn't know fails, and so do a
+//     duplicate or missing id;
 //   - pinned binaries: every platform url and sha256 must belong to the GitHub release of that version.
 // Anything that can't be tied and dated (lookup failed, 404, no digest, unreadable date, date in the future,
 // a kind this script doesn't know) fails closed. A docker pin it can't date says "needs owner review".
@@ -28,6 +33,7 @@
 // The CI job runs the BASE commit's copy of this file against the PR's files, so a PR can't weaken the check that
 // judges it. Keep it dependency-free apart from `yaml`, and keep to syntax Node's type stripping can run
 // (no enums, no parameter properties, no namespaces): `node scripts/cooldown.ts`.
+import { createHash } from 'node:crypto';
 import { lstat, readFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { parse as parseYaml } from 'yaml';
@@ -262,10 +268,10 @@ function httpProblem(url: string, res: Response, hasToken: boolean): string {
 }
 
 /** Reads a body up to the byte cap, cancelling the stream past it. */
-async function readCapped(res: Response): Promise<string> {
+async function readCapped(res: Response): Promise<Buffer> {
   const declared = Number(res.headers.get('content-length') ?? '0');
   if (declared > MAX_BODY_BYTES) throw tooLarge();
-  if (!res.body) return '';
+  if (!res.body) return Buffer.alloc(0);
   const reader = res.body.getReader();
   const chunks: Uint8Array[] = [];
   let total = 0;
@@ -279,13 +285,13 @@ async function readCapped(res: Response): Promise<string> {
     }
     chunks.push(value);
   }
-  return Buffer.concat(chunks).toString('utf8');
+  return Buffer.concat(chunks);
 }
 
 async function request(f: typeof fetch, url: string, init: RequestInit, timeoutMs: number, hasToken: boolean): Promise<Response> {
   let res: Response;
   try {
-    res = await f(url, { ...init, redirect: 'error', signal: AbortSignal.timeout(timeoutMs) });
+    res = await f(url, { redirect: 'error', ...init, signal: AbortSignal.timeout(timeoutMs) });
   } catch (e) {
     throw new LookupError(`request failed (${e instanceof Error ? e.name : 'error'})`);
   }
@@ -297,7 +303,7 @@ async function request(f: typeof fetch, url: string, init: RequestInit, timeoutM
 async function getJson(f: typeof fetch, url: string, headers: Record<string, string>, timeoutMs: number, hasToken: boolean): Promise<unknown> {
   const res = await request(f, url, { headers: { accept: 'application/json', ...headers } }, timeoutMs, hasToken);
   try {
-    return JSON.parse(await readCapped(res));
+    return JSON.parse((await readCapped(res)).toString('utf8'));
   } catch (e) {
     if (e instanceof LookupError) throw e;
     throw new LookupError('unreadable response');
@@ -309,6 +315,11 @@ interface Ctx {
   get: (url: string, headers?: Record<string, string>) => Promise<unknown>;
   /** A HEAD request's Last-Modified header (undefined when there is none). */
   lastModified: (url: string) => Promise<string | undefined>;
+  /**
+   * A file's bytes, capped. Redirects are followed (a release asset is served from another host), so the caller must
+   * check the bytes against a digest it got from the API.
+   */
+  bytes: (url: string) => Promise<Buffer>;
   gh: Record<string, string>;
   notes: string[];
 }
@@ -336,6 +347,7 @@ function makeCtx(opts: CooldownOptions, notes: string[]): Ctx {
       await res.body?.cancel().catch(() => undefined);
       return str(res.headers.get('last-modified'));
     }),
+    bytes: (url) => once(`GET ${url}`, async () => readCapped(await request(opts.fetch, url, { redirect: 'follow' }, timeout, hasToken))),
   };
 }
 
@@ -401,7 +413,18 @@ async function npmVersionOutcome(ctx: Ctx, name: string, version: string, integr
   if (!modified || !HTTP_DATE.test(modified) || Number.isNaN(Date.parse(modified))) {
     return fail('the packument is over the size cap and the registry tarball has no readable Last-Modified date');
   }
-  return { date: new Date(Date.parse(modified)).toISOString() };
+  // The version document's publish stamp, when the registry wrote one, counts too: the LATER of the two decides, so
+  // either can only make the version look younger.
+  const stamp = publishStamp(meta);
+  return { date: new Date(Math.max(Date.parse(modified), stamp ?? 0)).toISOString() };
+}
+
+/** The ms timestamp in a version document's `_npmOperationalInternal.tmp` (`tmp/<name>_<version>_<ms>_<random>`), if readable. */
+function publishStamp(meta: Obj): number | undefined {
+  const tmp = isObj(meta._npmOperationalInternal) ? str(meta._npmOperationalInternal.tmp) : undefined;
+  const m = /^tmp\/.+_(\d{12,14})_[0-9.]+$/.exec(tmp ?? '');
+  const ms = m ? Number(m[1]) : NaN;
+  return Number.isSafeInteger(ms) ? ms : undefined;
 }
 
 /** An npm package version: must exist in the registry; integrity must match; date = time[version]. */
@@ -528,7 +551,105 @@ async function dockerOutcome(ctx: Ctx, image: string, tag: string, digest: strin
   });
 }
 
+/** The nuclei templates archive: a tag archive listed in the release's checksums file, or a release asset. */
+const NT_REPO = 'projectdiscovery/nuclei-templates';
+const NT_ARCHIVE = /^https:\/\/github\.com\/projectdiscovery\/nuclei-templates\/archive\/refs\/tags\/(v(\d{1,4}\.\d{1,4}\.\d{1,4}))\.tar\.gz$/;
+const NT_ASSET = /^https:\/\/github\.com\/projectdiscovery\/nuclei-templates\/releases\/download\/(v\d{1,4}\.\d{1,4}\.\d{1,4})\/([A-Za-z0-9._-]{1,100}\.tar\.gz)$/;
+
+async function templatesOutcome(ctx: Ctx, url: string | undefined, sha: string | undefined): Promise<Outcome> {
+  const want = sha256Of(sha);
+  if (!want) return fail('PIPEGEN_NUCLEI_TEMPLATES_SHA256 is not a sha256');
+  const asset = NT_ASSET.exec(url ?? '');
+  if (asset) return assetOutcome(ctx, NT_REPO, asset[1] as string, asset[2] as string, want);
+  const m = NT_ARCHIVE.exec(url ?? '');
+  if (!m) return fail('PIPEGEN_NUCLEI_TEMPLATES_URL is not a projectdiscovery/nuclei-templates tag archive or release asset; needs owner review');
+  const tag = m[1] as string;
+  const ver = m[2] as string;
+  return guard(async () => {
+    // GitHub makes the tag archive on request and records no digest for it; the release's own checksums file lists
+    // it (as on pin day), and GitHub records that file's digest, so the downloaded file is checked against it.
+    const got = await releaseOf(ctx, NT_REPO, tag);
+    if ('problem' in got) return got;
+    const rel = got.rel;
+    if (rel.tag_name !== tag) return fail('the release is not for this tag');
+    const sumsName = `nuclei-templates-${ver}_checksums.txt`;
+    const sums = (Array.isArray(rel.assets) ? rel.assets : []).find((a) => isObj(a) && a.name === sumsName);
+    if (!isObj(sums)) return fail(`the release has no ${sumsName}, so the tag archive can not be tied; needs owner review`);
+    const sumsUrl = `https://github.com/${NT_REPO}/releases/download/${tag}/${sumsName}`;
+    if (sums.browser_download_url !== sumsUrl) return fail('the checksums file url does not belong to this release');
+    const digest = sha256Of(sums.digest);
+    if (!digest) return fail('GitHub records no digest for the release checksums file; needs owner review');
+    const body = await ctx.bytes(sumsUrl);
+    if (createHash('sha256').update(body).digest('hex') !== digest) return fail('the downloaded checksums file does not match the digest GitHub records for it');
+    const archive = `nuclei-templates-${ver}.tar.gz`;
+    const listed = body.toString('utf8').split(/\r?\n/).map((l) => /^([0-9a-fA-F]{64})\s+\*?(\S+)$/.exec(l.trim())).find((x) => x?.[2] === archive);
+    if (!listed || (listed[1] as string).toLowerCase() !== want) return fail(`the release checksums file does not list the pinned sha256 for ${archive}`);
+    return youngest([rel.published_at, sums.created_at, sums.updated_at], 'release published_at, checksums file created_at and updated_at');
+  });
+}
+
+const RULES_URL = /^https:\/\/github\.com\/([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)\/archive\/([0-9a-f]{40})\.tar\.gz$/;
+
+/**
+ * The semgrep rules archive: a repo archive at a commit. The commit's tree must be PIPEGEN_RULES_TREE; the date is the
+ * `verification.verified_at` GitHub set when it verified the commit's signature. The git author and committer dates
+ * are whatever the pusher wrote, so they are never used: an unsigned commit can't be dated and needs owner review.
+ */
+async function rulesOutcome(ctx: Ctx, url: string | undefined, tree: string | undefined): Promise<Outcome> {
+  const m = RULES_URL.exec(url ?? '');
+  if (!m) return fail('PIPEGEN_RULES_URL is not a GitHub repo archive at a 40-character commit SHA; needs owner review');
+  if (!/^[0-9a-f]{40}$/.test(tree ?? '')) return fail('PIPEGEN_RULES_TREE is not a 40-character tree SHA');
+  const r = repoPath(m[1] as string);
+  if (!r) return fail('repo name is not a plain name');
+  const sha = m[2] as string;
+  return guard(async () => {
+    const c = await ctx.get(`https://api.github.com/repos/${r}/git/commits/${sha}`, ctx.gh);
+    if (!isObj(c) || c.sha !== sha) return fail('unreadable commit answer');
+    if (!isObj(c.tree) || c.tree.sha !== tree) return fail('the commit tree is not PIPEGEN_RULES_TREE');
+    const v = isObj(c.verification) ? c.verification : {};
+    if (v.verified !== true) return fail('the rules commit has no signature GitHub verified, so there is no date GitHub set; needs owner review');
+    const at = str(v.verified_at);
+    if (!at || !ISO.test(at) || Number.isNaN(Date.parse(at))) return fail('GitHub gives no verified_at for the rules commit; needs owner review');
+    return { date: at };
+  });
+}
+
 // --- reviewed tools and pinned binaries -----------------------------------------------------------------------------
+
+/** A string that looks like a hash (40 or 64 hex, sha256:, sha512-) or a URL. */
+const PIN_SHAPED = /[0-9a-f]{40}|sha256:|sha512-|[a-z][a-z0-9+.-]*:\/\//i;
+
+/** Dotted paths (list items as `[]`) of every string value that looks like a hash or a URL. */
+function pinShapedPaths(v: unknown, path = '', out: string[] = []): string[] {
+  if (Array.isArray(v)) v.forEach((x) => pinShapedPaths(x, `${path}.[]`, out));
+  else if (isObj(v)) for (const k of Object.keys(v)) pinShapedPaths(v[k], path ? `${path}.${k}` : k, out);
+  else if (typeof v === 'string' && PIN_SHAPED.test(v)) out.push(path);
+  return out;
+}
+
+const ARCHIVE_ENV = ['PIPEGEN_RULES_URL', 'PIPEGEN_RULES_SHA256', 'PIPEGEN_RULES_TREE', 'PIPEGEN_NUCLEI_TEMPLATES_URL', 'PIPEGEN_NUCLEI_TEMPLATES_SHA256'];
+/**
+ * Where a reviewed entry may hold a hash or a URL: the pins checked here, plus verifiedWith (pin-time signature
+ * inputs, never installed) and wrappedImage.digest (a record of the image an action's own action.yml runs; the action
+ * is tied by its SHA). Anything else that looks like a pin fails, so a new pin field can't be skipped silently.
+ */
+const REVIEWED_PIN_PATHS = [
+  /^candidate\.pin\.(sha|checksum|digest)$/,
+  /^step\.action\.uses$/,
+  /^step\.cli\.install\.(checksum|digest)$/,
+  /^step\.cli\.plugins\.\[\]\.checksum$/,
+  new RegExp(`^(step\\.cli|fixedInputs)\\.env\\.(${ARCHIVE_ENV.join('|')})$`),
+  /^verifiedWith\.[A-Za-z0-9_]+$/,
+  /^wrappedImage\.digest$/,
+];
+/** Where a pinned binary may hold a hash or a URL (binarySha256 is the binary inside the tied archive). */
+const BINARY_PIN_PATHS = [/^platforms\.[^.]+\.(url|archiveSha256|binarySha256)$/];
+
+function unknownPins(entry: Obj, known: readonly RegExp[]): string[] {
+  return [...new Set(pinShapedPaths(entry).filter((p) => !known.some((re) => re.test(p))))];
+}
+const unknownPinProblem = (paths: string[]): string =>
+  `a hash- or URL-shaped value at ${paths.join(', ')}, a field this check does not tie to an upstream date; needs owner review`;
 
 interface Item {
   kind: Finding['kind'];
@@ -557,16 +678,40 @@ function packageItem(tool: string, inst: unknown, label: string, checksum: strin
 
 /** Everything to check for the added or changed entries of data/reviewed-tools.yml. */
 export function reviewedItems(base: string | null | undefined, head: string | null | undefined): Item[] {
-  const index = (doc: Obj): Map<string, Obj> => {
+  const items: Item[] = [];
+  const problem = (name: string, text: string): void => {
+    items.push({ kind: 'reviewed-tool', name, version: '', run: async () => fail(text) });
+  };
+  // Entries by id. A duplicate or missing id would let one copy hide another, so in head it fails; in base, a
+  // duplicated id is dropped, so its head entry counts as new and is checked.
+  const index = (doc: Obj, isHead: boolean): Map<string, Obj> => {
     const m = new Map<string, Obj>();
-    if (Array.isArray(doc.tools)) for (const t of doc.tools) if (isObj(t) && str(t.id)) m.set(t.id as string, t);
+    const dup = new Set<string>();
+    if (!Array.isArray(doc.tools)) {
+      if (isHead && Object.keys(doc).length > 0) problem('data/reviewed-tools.yml', '`tools` is not a list, so no entry can be checked');
+      return m;
+    }
+    doc.tools.forEach((t, i) => {
+      const id = isObj(t) ? str(t.id) : undefined;
+      if (!isObj(t) || id === undefined) {
+        if (isHead) problem(`data/reviewed-tools.yml entry ${i + 1}`, 'the entry has no id (or is not an entry), so it can not be compared or checked');
+        return;
+      }
+      if (m.has(id)) dup.add(id);
+      m.set(id, t);
+    });
+    for (const id of dup) {
+      m.delete(id);
+      if (isHead) problem(id, 'this id appears more than once in data/reviewed-tools.yml; one copy could hide another');
+    }
     return m;
   };
-  const before = index(yamlObj('data/reviewed-tools.yml', base));
-  const items: Item[] = [];
-  for (const [id, tool] of index(yamlObj('data/reviewed-tools.yml', head))) {
+  const before = index(yamlObj('data/reviewed-tools.yml', base), false);
+  for (const [id, tool] of index(yamlObj('data/reviewed-tools.yml', head), true)) {
     const old = before.get(id);
     if (old && canon(old, REVIEWED_SKIP) === canon(tool, REVIEWED_SKIP)) continue;
+    const odd = unknownPins(tool, REVIEWED_PIN_PATHS);
+    if (odd.length > 0) problem(id, unknownPinProblem(odd));
     const cand = isObj(tool.candidate) ? tool.candidate : {};
     const step = isObj(tool.step) ? tool.step : {};
     const cli = isObj(step.cli) ? step.cli : undefined;
@@ -577,6 +722,9 @@ export function reviewedItems(base: string | null | undefined, head: string | nu
     const version = str(cand.version) ?? '';
     const inst = cli && isObj(cli.install) ? cli.install : undefined;
     const label = (run: Item['run']): Item => ({ kind: 'reviewed-tool', name: id, version, run });
+    // An install hash, when written, must be the candidate pin (as the loader requires), never an alternative.
+    if (inst && str(inst.checksum) !== undefined && str(inst.checksum) !== str(pin.checksum)) items.push(label(async () => fail('step.cli.install.checksum differs from candidate.pin.checksum')));
+    if (inst && str(inst.digest) !== undefined && str(inst.digest) !== str(pin.digest)) items.push(label(async () => fail('step.cli.install.digest differs from candidate.pin.digest')));
     if (kind === 'action' && action) {
       items.push(label((ctx) => actionOutcome(ctx, str(action.uses), repo, version, str(pin.sha))));
     } else if (kind === 'cli' && inst && inst.method === 'github-release') {
@@ -586,13 +734,9 @@ export function reviewedItems(base: string | null | undefined, head: string | nu
         return assetOutcome(ctx, repo, tag, str(inst.package) ?? '', str(pin.checksum));
       }));
     } else if (kind === 'cli' && inst && (inst.method === 'npm' || inst.method === 'pip')) {
-      // The package is step.cli.install.package (candidate.id is pipegen's id); its hash is the candidate pin. An
-      // install checksum, when written, must be that same value (as the loader requires), never an alternative.
-      const pinned = str(pin.checksum);
-      const own = str(inst.checksum);
+      // The package is step.cli.install.package (candidate.id is pipegen's id); its hash is the candidate pin.
       if (str(inst.version) !== version) items.push(label(async () => fail('step.cli.install.version differs from the candidate version')));
-      else if (own !== undefined && own !== pinned) items.push(label(async () => fail('step.cli.install.checksum differs from candidate.pin.checksum')));
-      else items.push(packageItem(id, inst, 'tool', pinned));
+      else items.push(packageItem(id, inst, 'tool', str(pin.checksum)));
     } else if (kind === 'docker' && inst && inst.method === 'docker') {
       items.push(label(async (ctx) => {
         if (str(inst.version) !== version) return fail('install version differs from the candidate version');
@@ -604,6 +748,25 @@ export function reviewedItems(base: string | null | undefined, head: string | nu
     // Every plugin is its own package with its own checksum and date.
     if (cli && Array.isArray(cli.plugins)) cli.plugins.forEach((p, i) => items.push(packageItem(id, p, `plugin ${i + 1}`, isObj(p) ? str(p.checksum) : undefined)));
     else if (cli && cli.plugins !== undefined) items.push(label(async () => fail('step.cli.plugins is not a list')));
+    // Archives the tool downloads at run time. step.cli.env and fixedInputs.env must agree on each value.
+    const envs = [cli && isObj(cli.env) ? cli.env : {}, isObj(tool.fixedInputs) && isObj(tool.fixedInputs.env) ? tool.fixedInputs.env : {}];
+    const has = (keys: string[]): boolean => envs.some((e) => keys.some((k) => k in e));
+    const envValue = (k: string): { value?: string; problem?: string } => {
+      const vals = envs.filter((e) => k in e).map((e) => e[k]);
+      if (vals.some((v) => v !== vals[0])) return { problem: `step.cli.env.${k} and fixedInputs.env.${k} differ` };
+      return { value: str(vals[0]) };
+    };
+    const archive = (what: string, keys: string[], run: (v: Record<string, string | undefined>, ctx: Ctx) => Promise<Outcome>): void => {
+      if (!has(keys)) return;
+      const got = keys.map((k) => [k, envValue(k)] as const);
+      const bad = got.find(([, g]) => g.problem);
+      items.push({
+        kind: 'reviewed-tool', name: `${id} (${what})`, version,
+        run: async (ctx) => (bad ? fail(bad[1].problem as string) : run(Object.fromEntries(got.map(([k, g]) => [k, g.value])), ctx)),
+      });
+    };
+    archive('nuclei templates', ['PIPEGEN_NUCLEI_TEMPLATES_URL', 'PIPEGEN_NUCLEI_TEMPLATES_SHA256'], (v, ctx) => templatesOutcome(ctx, v.PIPEGEN_NUCLEI_TEMPLATES_URL, v.PIPEGEN_NUCLEI_TEMPLATES_SHA256));
+    archive('semgrep rules', ['PIPEGEN_RULES_URL', 'PIPEGEN_RULES_SHA256', 'PIPEGEN_RULES_TREE'], (v, ctx) => rulesOutcome(ctx, v.PIPEGEN_RULES_URL, v.PIPEGEN_RULES_TREE));
   }
   return items;
 }
@@ -615,8 +778,14 @@ export function binaryItems(base: string | null | undefined, head: string | null
   const before = yamlObj('data/pinned-binaries.yml', base);
   const items: Item[] = [];
   for (const [name, tool] of Object.entries(yamlObj('data/pinned-binaries.yml', head))) {
-    if (!isObj(tool)) continue;
+    // (A duplicate tool key is a YAML error, which fails the whole check.)
+    if (!isObj(tool)) {
+      items.push({ kind: 'pinned-binary', name, version: '', run: async () => fail('not a tool entry (every top-level key of data/pinned-binaries.yml is a tool)') });
+      continue;
+    }
     if (name in before && canon(before[name], BINARY_SKIP) === canon(tool, BINARY_SKIP)) continue;
+    const odd = unknownPins(tool, BINARY_PIN_PATHS);
+    if (odd.length > 0) items.push({ kind: 'pinned-binary', name, version: str(tool.version) ?? '', run: async () => fail(unknownPinProblem(odd)) });
     const version = str(tool.version) ?? '';
     const repo = str(tool.repo);
     const platforms = isObj(tool.platforms) ? Object.entries(tool.platforms) : [];
