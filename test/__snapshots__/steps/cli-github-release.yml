@@ -67,16 +67,22 @@
     )
     rc=0
     "${pg_env[@]}" "$bin/trivy" config --config "$cfg/trivy.yaml" --disable-telemetry --skip-version-check --skip-check-update --format sarif --output trivy-config.sarif --exit-code 1 . --severity "$PIPEGEN_ARG_0" || rc=$?
+    case "$rc" in 0|1) ;; *)
+      rm -rf -- "$out"
+      echo "pipegen: the tool exited with $rc, so its result is not used" >&2
+      exit "$rc" ;;
+    esac
     if [ -f "$out" ] && [ ! -L "$out" ]; then
-      mkdir -p "$RUNNER_TEMP/pipegen-out"
-      mkdir "$RUNNER_TEMP/pipegen-out/pipegen-out-iac"
-      dest="$RUNNER_TEMP/pipegen-out/pipegen-out-iac/trivy-config.sarif"
+      mkdir -p "$RUNNER_TEMP/pipegen-raw"
+      mkdir "$RUNNER_TEMP/pipegen-raw/pipegen-out-iac"
+      dest="$RUNNER_TEMP/pipegen-raw/pipegen-out-iac/trivy-config.sarif"
       mv -- "$out" "$dest"
-      [ -f "$dest" ] && [ ! -L "$dest" ] || { rm -f -- "$dest"; rc=1; }
-      chmod -R a-w "$RUNNER_TEMP/pipegen-out/pipegen-out-iac"
+      if [ -f "$dest" ] && [ ! -L "$dest" ]; then rc=0; else rm -f -- "$dest"; rc=1; fi
+      chmod -R a-w "$RUNNER_TEMP/pipegen-raw/pipegen-out-iac"
     else
       echo "pipegen: the tool left no regular result file at $out" >&2
-      if [ "$rc" -eq 0 ]; then rc=1; fi
+      rm -rf -- "$out"
+      rc=1
     fi
     exit "$rc"
   shell: bash

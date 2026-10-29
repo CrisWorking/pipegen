@@ -159,10 +159,20 @@ export interface ArgvPolicy extends CommandPolicy {
    * looks up in the repo's node_modules/.bin). Passed through the `env -i` allowlist by name.
    */
   readonly closureEnv?: Readonly<Record<string, string>>;
+  /**
+   * Plan C ruling B2, for every entry whose result is `sarif` or `zap-json` (a findings tool): the exit codes that mean "the
+   * scan worked and found something", besides 0. The run step treats an exit in `{0} ∪ findingsExit` with a regular result
+   * file as success and moves the file to `pipegen-raw`; any other exit deletes the result and fails the step. So the step
+   * fails only when the tool itself failed, and the gate never reads a job's failure as a finding. `[]` for a tool that
+   * exits 0 on findings (semgrep without `--error`, nuclei). An entry with no result file keeps failing on any non-zero exit.
+   */
+  readonly findingsExit?: readonly number[];
 }
 
 // the dedicated tools (trivy, betterleaks, nuclei) have their own full-grammar rules in reviewed.ts; only the pinned config is listed here, for the renderer
 const DEDICATED = (exe: string, pkg: string, config?: ArgvPolicy['config']): ArgvPolicy => ({ method: 'github-release', package: pkg, exe, dialect: 'long', sub: [], flags: {}, dedicated: true, ...(config === undefined ? {} : { config }) });
+/** The exit codes of a findings tool that mean "found something" (ArgvPolicy.findingsExit): 1 for most, none for a tool that exits 0 on findings. */
+const FOUND_1 = [1] as const;
 const TRIVY_CONFIG = { flag: '--config', content: "# pipegen's pinned trivy config: no cache kept between runs\ncache:\n  backend: memory\n", fileName: 'trivy.yaml' } as const;
 const GH = 'github-release' as const;
 const TRIVY_ASSET = 'trivy_0.76.0_Linux-64bit.tar.gz';
@@ -179,9 +189,11 @@ const ESLINT_TS_FILES = "files: ['**/*.{js,mjs,cjs,jsx,ts,mts,cts,tsx,vue,svelte
  * on a list (P20).
  */
 const POLICIES = {
-  'trivy-config': DEDICATED('trivy', TRIVY_ASSET, TRIVY_CONFIG), 'trivy-image': { ...DEDICATED('trivy', TRIVY_ASSET, TRIVY_CONFIG), slots: { '': 'image-digest' } }, 'trivy-licence': DEDICATED('trivy', TRIVY_ASSET, TRIVY_CONFIG),
-  betterleaks: DEDICATED('betterleaks', 'betterleaks_1.9.0_linux_x64.tar.gz', { flag: '--config', content: '[extend]\nuseDefault = true\n', fileName: 'betterleaks.toml' }),
-  nuclei: { ...DEDICATED('nuclei', 'nuclei_3.11.1_linux_amd64.zip'), slots: { '-target': 'local-url' },
+  'trivy-config': { ...DEDICATED('trivy', TRIVY_ASSET, TRIVY_CONFIG), findingsExit: FOUND_1 },
+  'trivy-image': { ...DEDICATED('trivy', TRIVY_ASSET, TRIVY_CONFIG), slots: { '': 'image-digest' }, findingsExit: FOUND_1 },
+  'trivy-licence': { ...DEDICATED('trivy', TRIVY_ASSET, TRIVY_CONFIG), findingsExit: FOUND_1 },
+  betterleaks: { ...DEDICATED('betterleaks', 'betterleaks_1.9.0_linux_x64.tar.gz', { flag: '--config', content: '[extend]\nuseDefault = true\n', fileName: 'betterleaks.toml' }), findingsExit: FOUND_1 },
+  nuclei: { ...DEDICATED('nuclei', 'nuclei_3.11.1_linux_amd64.zip'), slots: { '-target': 'local-url' }, findingsExit: [],
     archive: { repo: 'projectdiscovery/nuclei-templates', commitEnv: 'PIPEGEN_NUCLEI_TEMPLATES_COMMIT', treeEnv: 'PIPEGEN_NUCLEI_TEMPLATES_TREE', dir: '/pipegen-nuclei-templates' } },
   // ruling P28: the image entries too. registry runs the image's own entrypoint, nothing else
   registry: { method: 'docker', package: 'registry', exe: '', entrypoint: true, dialect: 'long', sub: [], flags: {} },
@@ -189,12 +201,13 @@ const POLICIES = {
   'zap-baseline': {
     slots: { '-t': 'local-url' }, network: 'host', asImageUser: true,
     method: 'docker', package: 'zaproxy/zap-stable', exe: 'zap-baseline.py', dialect: 'goflags', sub: [], flags: { J: 'output', z: { values: ['-silent'] } },
+    findingsExit: [1, 2],   // 1: a FAIL alert, 2: a WARN alert (0 is a clean run)
     required: { J: null, z: '-silent' }, mount: { at: '/zap/wrk', source: 'work' }, config: { flag: '-c', content: "# pipegen's pinned ZAP baseline rules: the defaults, nothing ignored\n", fileName: 'zap-baseline.conf' },
   },
   // Semgrep CE 1.181.0: rules only from the verified archive (semgrepProblems), no metrics, no version check, and no file-size skip
   // (--max-target-bytes=0: by default semgrep silently skips every file over 1 MB, so padding a file would hide it from SAST; DECISIONS #108)
   semgrep: {
-    method: 'docker', package: 'semgrep/semgrep', exe: 'semgrep', dialect: 'long', sub: ['scan'],
+    method: 'docker', package: 'semgrep/semgrep', exe: 'semgrep', dialect: 'long', sub: ['scan'], findingsExit: [],
     flags: { metrics: { values: ['off'] }, 'disable-version-check': 'bool', 'max-target-bytes': { values: ['0'] }, config: { values: ['/pipegen-rules'] }, sarif: 'bool', output: 'output' },
     required: { metrics: 'off', 'disable-version-check': 'true', 'max-target-bytes': '0', config: '/pipegen-rules' },
     scopeIgnore: { file: '.semgrepignore', lines: ['node_modules'] },
@@ -204,14 +217,14 @@ const POLICIES = {
   },
   // gitleaks 8.30.1 (`gitleaks git --help`), the secrets fallback (P21): the same locks as betterleaks
   gitleaks: { method: GH, package: 'gitleaks_8.30.1_linux_x64.tar.gz',
-    exe: 'gitleaks', dialect: 'long', sub: ['git'], positionals: ['.'],
+    exe: 'gitleaks', dialect: 'long', sub: ['git'], positionals: ['.'], findingsExit: FOUND_1,
     flags: { 'no-banner': 'bool', 'ignore-gitleaks-allow': 'bool', redact: { values: ['', '100'], optional: true }, 'report-format': { values: ['sarif'] }, 'report-path': 'output', 'exit-code': { values: ['1'] } },
     required: { 'ignore-gitleaks-allow': 'true', redact: '', 'report-format': 'sarif', 'report-path': null, 'exit-code': '1' },
     config: { flag: '--config', content: '[extend]\nuseDefault = true\n', fileName: 'gitleaks.toml' },
   },
   // osv-scanner v2.7.0
   'osv-scanner': { method: GH, package: 'osv-scanner_linux_amd64',
-    exe: 'osv-scanner', dialect: 'long', sub: ['scan', 'source'], positionals: ['.'],
+    exe: 'osv-scanner', dialect: 'long', sub: ['scan', 'source'], positionals: ['.'], findingsExit: FOUND_1,
     flags: { recursive: 'bool', format: { values: ['sarif'] }, output: 'output' }, required: { format: 'sarif', output: null },
     config: { flag: '--config', content: "# pipegen's pinned osv-scanner config: no ignored vulnerabilities\n", fileName: 'osv-scanner.toml' },
   },
@@ -267,13 +280,13 @@ const POLICIES = {
   },
   // hadolint 2.15.1: fails on warnings and errors (never --no-fail or a lower threshold)
   hadolint: { method: GH, slots: { '': 'repo-path' }, repoPathFrom: 'dockerfile', package: 'hadolint-linux-x86_64',
-    exe: 'hadolint', dialect: 'long', sub: [], flags: { 'no-color': 'bool', 'failure-threshold': { values: ['warning'] }, format: { values: ['sarif'] }, output: 'output' },
+    exe: 'hadolint', dialect: 'long', sub: [], findingsExit: FOUND_1, flags: { 'no-color': 'bool', 'failure-threshold': { values: ['warning'] }, format: { values: ['sarif'] }, output: 'output' },
     required: { 'failure-threshold': 'warning', format: 'sarif', output: null },
     config: { flag: '--config', content: "# pipegen's pinned hadolint config: every rule at its default level, nothing ignored\nignored: []\n", fileName: 'hadolint.yaml' },
   },
   // kube-linter 0.8.3: an unrenderable chart, a bad path or YAML it can't parse fails the check (P25)
   'kube-linter': { method: GH, slots: { '': 'repo-path' }, repoPathFrom: 'k8s-dir', package: 'kube-linter-linux',
-    exe: 'kube-linter', dialect: 'long', sub: ['lint'],
+    exe: 'kube-linter', dialect: 'long', sub: ['lint'], findingsExit: FOUND_1,
     flags: { 'fail-if-no-objects-found': 'bool', 'fail-on-invalid-resource': 'bool', format: { values: ['sarif'] }, output: 'output' },
     required: { 'fail-if-no-objects-found': 'true', 'fail-on-invalid-resource': 'true', format: 'sarif', output: null },
     config: { flag: '--config', content: "# pipegen's pinned kube-linter config: the default checks\nchecks:\n  doNotAutoAddDefaults: false\n", fileName: 'kube-linter.yaml' },
@@ -293,12 +306,12 @@ const POLICIES = {
   },
   // gosec 2.29.0 (Go flags): never -no-fail; every #nosec suppression is reported in the SARIF (P27)
   gosec: { method: GH, needsSlot: 'is for Go: Go is not supported in v0.2 (a permanent refusal until Go setup is added)', package: 'gosec_2.29.0_linux_amd64.tar.gz',
-    exe: 'gosec', dialect: 'goflags', sub: [], positionals: ['./...'], flags: { fmt: { values: ['sarif'] }, out: 'output', 'track-suppressions': 'bool' },
+    exe: 'gosec', dialect: 'goflags', sub: [], positionals: ['./...'], findingsExit: FOUND_1, flags: { fmt: { values: ['sarif'] }, out: 'output', 'track-suppressions': 'bool' },
     required: { fmt: 'sarif', out: null, 'track-suppressions': 'true' },
   },
   // Ruff 0.17.1 (never --exit-zero, --fix or a format without --check)
   ruff: { method: GH, package: RUFF_ASSET,
-    exe: 'ruff', dialect: 'long', sub: ['check'], flags: { 'no-cache': 'bool', 'output-format': { values: ['sarif'] }, 'output-file': 'output' },
+    exe: 'ruff', dialect: 'long', sub: ['check'], findingsExit: FOUND_1, flags: { 'no-cache': 'bool', 'output-format': { values: ['sarif'] }, 'output-file': 'output' },
     required: { 'no-cache': 'true', 'output-format': 'sarif', 'output-file': null },
     config: { flag: '--config', content: '[lint]\nextend-select = ["C901"]\n\n[lint.mccabe]\nmax-complexity = 15\n', fileName: 'ruff.toml' },
   },
@@ -317,7 +330,7 @@ const POLICIES = {
   vulture: { method: 'pip', package: 'vulture', exe: 'vulture', dialect: 'long', sub: [], positionals: ['.'], flags: { 'min-confidence': { values: ['80'] } }, required: { 'min-confidence': '80' } },
   // Bandit 1.9.4 (never --exit-zero)
   bandit: { method: 'pip', package: 'bandit',
-    exe: 'bandit', dialect: 'long', sub: [], positionals: ['.'], flags: { recursive: 'bool', format: { values: ['sarif'] }, output: 'output' },
+    exe: 'bandit', dialect: 'long', sub: [], positionals: ['.'], findingsExit: FOUND_1, flags: { recursive: 'bool', format: { values: ['sarif'] }, output: 'output' },
     required: { recursive: 'true', format: 'sarif', output: null },
   },
 } satisfies Record<string, ArgvPolicy>;
@@ -363,8 +376,14 @@ export const CHECKER_STEP_ID_RE = /^checker-run-[0-9a-f]{16}$/;
 export const TOOL_STEP_ID_RE = /^tool-(?:install|pull|run)-[0-9a-f]{16}$/;
 /** The ids of the checkout step of a project script and of the Node and Python setup steps the renderers add (a pinned platform action each): a job keeps the first of each. */
 export const SETUP_STEP_ID_RE = /^pipegen-(?:checkout|setup-node-\d{1,3}|setup-python)$/;
-/** The id of a scrub step (Plan C's gate action) in a job: the order rule treats it like an upload. */
+/** The id of a scrub step (Plan C's gate action in `scrub` mode, ruling B1) in a job: the order rule treats it like an upload. */
 export const SCRUB_STEP_ID_RE = /^scrub-[0-9a-f]{16}$/;
+/** The `uses` path of pipegen's own gate action (a leaf constant: the renderer, the order rule and the referee all name it from here). */
+export const PIPEGEN_GATE_USES = 'crisworking/pipegen/gate';
+/** A pinned use of the gate action: the path, `@`, a 40-character commit. The reviewed pin itself is the referee's question. */
+export const GATE_USES_RE = new RegExp(`^${PIPEGEN_GATE_USES.replace(/[/.]/g, '\\$&')}@[0-9a-f]{40}$`);
+/** The one secret a recognised scrub step may name (ruling B1 parts 5 and 6): the HMAC key of the fingerprints. */
+export const SCRUB_SECRET = 'PIPEGEN_FP_KEY';
 
 // ---------- pip closures (Plan B 6b, ruling B5) ----------
 
@@ -504,6 +523,35 @@ const OWN_ARTIFACT_FOLDER = {
 const OWN_FOLDER_PATH = rx(/^\$\{\{ runner\.temp \}\}\/pipegen-out\/[a-z0-9][a-z0-9-]{0,120}(?:\/[A-Za-z0-9_][A-Za-z0-9._-]{0,100}){0,3}$/, 'a path under ${{ runner.temp }}/pipegen-out/<artifact>', OWN_ARTIFACT_FOLDER);
 const ARTIFACT_NAME = rx(new RegExp(`^${RESULT_ARTIFACT_PREFIX}[a-z0-9][a-z0-9-]{0,120}$`), `a result artifact name (${RESULT_ARTIFACT_PREFIX}…)`);
 
+// ---------- the scrub chain's folders (Plan C ruling B1) ----------
+// A tool's raw result is moved to `${{ runner.temp }}/pipegen-raw/<artifact>/<file>`; only the gate action in scrub mode
+// writes `${{ runner.temp }}/pipegen-out/<artifact>/<file>`, rebuilt from allowlisted fields. The upload rules above accept
+// `pipegen-out` only, so a raw result can never be uploaded: the renderer, the emitter and the referee refuse it alike.
+const TEMP = '${{ runner.temp }}';
+const RESULT_FILE = '[A-Za-z0-9_][A-Za-z0-9._-]{0,100}';
+const RAW_PATH_RE = new RegExp(`^\\$\\{\\{ runner\\.temp \\}\\}/pipegen-raw/(${RESULT_ARTIFACT_PREFIX}[a-z0-9][a-z0-9-]{0,120})/(${RESULT_FILE})$`);
+/** The artifact name and file of a raw result path (`${{ runner.temp }}/pipegen-raw/<artifact>/<file>`), or null for any other text. */
+export function rawResultParts(path: string): { artifact: string; file: string } | null {
+  const m = RAW_PATH_RE.exec(path);
+  return m === null ? null : { artifact: m[1] as string, file: m[2] as string };
+}
+/** Where a raw result path is scrubbed to: the same artifact and file under `pipegen-out`; null when the text is not a raw result path. */
+export function scrubbedResultPath(rawPath: string): string | null {
+  const parts = rawResultParts(rawPath);
+  return parts === null ? null : `${TEMP}/pipegen-out/${parts.artifact}/${parts.file}`;
+}
+const MODE_SCRUB = { check: (all: Readonly<Record<string, string>>) => all.mode === 'scrub', describe: 'only in mode scrub' } as const;
+/** The scrub inputs that name a path: valid in scrub mode only, the raw one in the artifact's raw folder and the scrubbed one at the same file in its pipegen-out folder. */
+const SCRUB_RAW = rx(/^\$\{\{ runner\.temp \}\}\/pipegen-raw\//, 'a path ${{ runner.temp }}/pipegen-raw/<artifact>/<file>', {
+  check: (all) => MODE_SCRUB.check(all) && rawResultParts(all.raw ?? '')?.artifact === all.artifact,
+  describe: 'only in mode scrub, inside the folder of the artifact it names (${{ runner.temp }}/pipegen-raw/<artifact>/<file>)',
+});
+const SCRUB_OUT = rx(/^\$\{\{ runner\.temp \}\}\/pipegen-out\//, 'a path ${{ runner.temp }}/pipegen-out/<artifact>/<file>', {
+  check: (all) => MODE_SCRUB.check(all) && scrubbedResultPath(all.raw ?? '') === all.out && rawResultParts(all.raw ?? '')?.artifact === all.artifact,
+  describe: 'only in mode scrub, at the same file as raw, in the folder of the artifact it names (${{ runner.temp }}/pipegen-out/<artifact>/<file>)',
+});
+const inScrubMode = (input: RendererInput): RendererInput => ({ ...input, whenWith: input.whenWith ?? MODE_SCRUB });
+
 /**
  * Ruling S15: the inputs the renderer sets on a platform action, by the same `owner/repo[/path]` key as ACTION_POLICIES,
  * each with a checker. The renderer refuses any other input it is asked to set, and the referee's template check
@@ -528,6 +576,17 @@ export const RENDERER_INPUTS: Readonly<Record<string, Readonly<Record<string, Re
   'docker/login-action': {
     username: rx(/^\$\{\{ github\.actor \}\}$/, '${{ github.actor }}'),
     password: rx(/^\$\{\{ secrets\.GITHUB_TOKEN \}\}$/, '${{ secrets.GITHUB_TOKEN }}', GHCR_ONLY),
+  },
+  // pipegen's own gate action. Every input is the renderer's (the entry fixes none and offers no choice); each mode has its
+  // own inputs, checked with `whenWith` on `mode`. C0a: `scrub` (ruling B1); the gate's own mode takes its inputs from C0b.
+  [PIPEGEN_GATE_USES]: {
+    mode: rx(/^(?:scrub|gate)$/, 'scrub or gate'),
+    artifact: inScrubMode(ARTIFACT_NAME),
+    tool: inScrubMode(rx(/^[a-z0-9][a-z0-9-]{0,63}$/, 'a reviewed tool id')),
+    format: inScrubMode(rx(/^(?:sarif|zap-json)$/, 'sarif or zap-json')),
+    raw: SCRUB_RAW,
+    out: SCRUB_OUT,
+    'fp-key': inScrubMode(rx(/^\$\{\{ secrets\.PIPEGEN_FP_KEY \}\}$/, '${{ secrets.PIPEGEN_FP_KEY }}')),
   },
 } satisfies Record<string, Record<string, RendererInput>>);
 

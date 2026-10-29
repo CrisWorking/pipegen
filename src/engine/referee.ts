@@ -35,11 +35,11 @@ import { NEED_ID_CATEGORY } from './need-ids.js';
 import { PLATFORM_ACTION_IDS, type PlatformActions } from './pin.js';
 import { APP_RUNNING_CATEGORIES, TRIVY_LAUNCH_RE } from './render-cli.js';
 import { EXPR, own, show } from './render-error.js';
-import { ACTION_PATH_RE, checkExpressions, createdPathProblem, checkJobOrder, IF_VALUES, isDangerousName, isReviewed, SECRET_REF_RE, STEP_KEYS as STEP_KEY_LIST, WORKFLOW_PATH_RE, type RenderedStep } from './job-rules.js';
+import { ACTION_PATH_RE, checkExpressions, createdPathProblem, checkJobOrder, IF_VALUES, isDangerousName, isReviewed, isScrubStep, SECRET_REF_RE, STEP_KEYS as STEP_KEY_LIST, WORKFLOW_PATH_RE, type RenderedStep } from './job-rules.js';
 import { containerRefusal, RenderError, renderProjectScript, renderStep, sameDedupeContent, type RenderContext } from './render-step.js';
 import { projectScriptFor } from './reviewed.js';
 import { slotProblem, type SlotKind } from './slots.js';
-import { ARGV_POLICIES, CACHE_LOCKS, PLAIN_REL_RE, RENDERER_INPUTS, rendererInputProblems } from './tool-flags.js';
+import { ARGV_POLICIES, CACHE_LOCKS, PLAIN_REL_RE, RENDERER_INPUTS, rendererInputProblems, SCRUB_SECRET } from './tool-flags.js';
 
 // ---------- the report ----------
 
@@ -104,7 +104,7 @@ export type StepKind = 'checkout' | 'setup' | 'harden' | 'upload-artifact' | 'do
   | 'gate' | 'watcher' | 'tool' | 'scrub' | 'central' | 'repo-code' | 'unrecognised';
 /** pipegen's own actions by reviewed-entry id (Plan C adds the gate entry, Plan H the watcher entry, under these ids). */
 export const PIPEGEN_ACTION_IDS = { gate: 'pipegen-gate', watcher: 'pipegen-watcher' } as const;
-/** The step kind of each reviewed action entry that is not an ordinary tool, by entry id. */
+/** The step kind of each reviewed action entry that is not an ordinary tool, by entry id. The gate entry is kind `gate`, except a recognised scrub step of it (isScrubStep: judgeUses). */
 const ENTRY_KIND: Readonly<Record<string, StepKind>> = Object.freeze({
   ...Object.fromEntries(Object.entries({ checkout: 'checkout', 'setup-node': 'setup', 'setup-python': 'setup', 'upload-artifact': 'upload-artifact', 'download-artifact': 'download-artifact',
     'upload-sarif': 'upload-sarif', attest: 'attest', 'docker-login': 'docker-login', 'setup-buildx': 'setup-buildx', 'build-push': 'build-push' } satisfies Record<keyof PlatformActions, StepKind>)
@@ -552,7 +552,10 @@ function ceilingOf(id: string): Record<string, number> {
   return allowed;
 }
 
-/** Whether a job holds power (ruling 1): any permission beyond `contents: read`, an environment, or a secret that is not a declared app secret. */
+/**
+ * Whether a job holds power (ruling 1): any permission beyond `contents: read`, an environment, or a secret that is not a declared app secret.
+ * `secrets` are those the job's steps name, except the fingerprint key on a recognised scrub step (judgeStepPolicy, Plan C ruling B1 part 5).
+ */
 function privileged(j: Obj, secrets: ReadonlySet<string>, ex: Expectations): boolean {
   const p = j.permissions;
   if (typeof p === 'string') return true;
@@ -608,7 +611,8 @@ function judgeJob(fc: FileCtx, id: string, j: unknown): void {
  */
 function judgeStepPolicy(fc: FileCtx, id: string, where: string, j: Obj, judged: readonly Judged[]): void {
   const bad = issueFor(fc);
-  const secrets = new Set(judged.flatMap((x) => [...x.secrets]));
+  // the fingerprint key on a recognised scrub step is that step's own power and gives the job none (ruling B1 part 5): a scanner job stays at contents: read; anywhere else the key still makes a job privileged
+  const secrets = new Set(judged.flatMap((x) => [...x.secrets].filter((n) => !(x.kind === 'scrub' && n === SCRUB_SECRET))));
   const row = own(JOB_STEP_POLICY, id);
   const power = privileged(j, secrets, fc.ex);
   if (power && row === undefined) bad('permissions', `${where} holds power (a permission beyond contents: read, an environment or pipegen's own secret) but is not one of pipegen's jobs (${Object.keys(JOB_STEP_POLICY).join(', ')}).`);
@@ -802,7 +806,7 @@ function judgeStep(fc: FileCtx, where: string, raw: unknown): Judged {
       if (r.final) fc.ex.matched.add(r.source);
       appRunning = r.appRunning;
       const id = r.step.id ?? '';
-      kind = r.source.startsWith('script:') || appRunning ? 'repo-code' : /^(?:checker-run|tool-run|tool-install|tool-pull)-/.test(id) ? 'tool' : /^scrub-/.test(id) ? 'scrub' : 'repo-code';
+      kind = r.source.startsWith('script:') || appRunning ? 'repo-code' : /^(?:checker-run|tool-run|tool-install|tool-pull)-/.test(id) ? 'tool' : 'repo-code';
       reads = kind === 'tool' && r.readsWorkspace;
     }
     // trivy keeps a cache between runs unless it runs with pipegen's pinned config (cache.backend: memory, ruling S3), whether
@@ -817,10 +821,10 @@ function judgeStep(fc: FileCtx, where: string, raw: unknown): Judged {
     if (/--cache-dir\b|TRIVY_CACHE/.test(raw.run as string)) bad('cache', at('the step points a tool at a cache folder.'));
   }
   // ruling 4: a step that feeds the gate is never skipped on success and its failure always counts: no continue-on-error,
-  // and `if:` only success(), or always() on an upload (so a failed job still hands its result to the gate)
+  // and `if:` only success(), or always() on an upload or a scrub (so a failed job still hands its result to the gate)
   if (raw['continue-on-error'] !== undefined && raw['continue-on-error'] !== false) bad('template', at('continue-on-error would let a failed step pass; pipegen never sets it.'));
-  if (raw.if !== undefined && raw.if !== 'success()' && !(raw.if === 'always()' && (kind === 'upload-artifact' || kind === 'upload-sarif'))) {
-    bad('template', at(`if: ${safeText(String(raw.if), 20)} could skip this step while the job passes (only success(), or always() on an upload).`));
+  if (raw.if !== undefined && raw.if !== 'success()' && !(raw.if === 'always()' && (kind === 'upload-artifact' || kind === 'upload-sarif' || kind === 'scrub'))) {
+    bad('template', at(`if: ${safeText(String(raw.if), 20)} could skip this step while the job passes (only success(), or always() on an upload or a scrub).`));
   }
   const secrets = judgeSecrets(fc, at, withs, env, kind, appRunning);
   return { step, ...(match === undefined ? {} : { match }), kind, harmlessId, secrets, readsWorkspace: reads };
@@ -905,7 +909,9 @@ function judgeUses(fc: FileCtx, at: (m: string) => string, uses: string, withs: 
   }
   if (raw['working-directory'] !== undefined) bad('template', at('an action step takes no working-directory.'));
   const appRunning = t.categories.some((c) => APP_RUNNING_CATEGORIES.has(c));
-  return { appRunning, kind: own(ENTRY_KIND, t.id) ?? (appRunning ? 'repo-code' : 'tool') };
+  // the gate action in scrub mode under a scrub id is kind scrub; in any other mode (or under another id) it is the gate (ruling B1 part 4)
+  const kind = t.id === PIPEGEN_ACTION_IDS.gate && isScrubStep(raw as unknown as RenderedStep) ? 'scrub' : own(ENTRY_KIND, t.id) ?? (appRunning ? 'repo-code' : 'tool');
+  return { appRunning, kind };
 }
 
 /** The template rule (S15): every fixed input at its value, every choice present and inside its list, nothing else but a renderer-filled input that passes its checker and condition. */
@@ -941,11 +947,13 @@ function judgeSecrets(fc: FileCtx, at: (m: string) => string, withs: Obj, env: O
     for (const m of v.matchAll(SECRET_USE_RE)) names.add(m[1] as string);
   }
   const ownOk = !appRunning && !['tool', 'scrub', 'repo-code', 'unrecognised', 'central'].includes(kind);
+  // a recognised scrub step names the fingerprint key and nothing else of pipegen's (ruling B1 part 6)
+  const scrubOk = (n: string): boolean => kind === 'scrub' && !appRunning && n === SCRUB_SECRET;
   for (const n of names) {
     if (!fc.ex.allowed.has(n)) { bad('permissions', at(`the secret ${show(n)} is neither declared by a step of this pipeline nor one of pipegen's own.`)); continue; }
     if (fc.ex.declared.has(n) && !PIPEGEN_SECRETS.includes(n)) {
       if (!appRunning) bad('injection', at(`the declared secret ${show(n)} reaches a step that does not run the app (a scanner, linter, upload or setup step never gets one).`));
-    } else if (!ownOk) bad('injection', at(`pipegen's own secret ${show(n)} reaches a step that runs code pipegen did not review as harmless.`));
+    } else if (!ownOk && !scrubOk(n)) bad('injection', at(`pipegen's own secret ${show(n)} reaches a step that runs code pipegen did not review as harmless.`));
   }
   return names;
 }

@@ -53,16 +53,22 @@ rc=0
     --metrics=off --disable-version-check --max-target-bytes=0 \
     --config /pipegen-rules \
     --sarif --output semgrep.sarif || rc=$?
+case "$rc" in 0) ;; *)
+  rm -rf -- "$out"
+  echo "pipegen: the tool exited with $rc, so its result is not used" >&2
+  exit "$rc" ;;
+esac
 if [ -f "$out" ] && [ ! -L "$out" ]; then
-  mkdir -p "$RUNNER_TEMP/pipegen-out"
-  mkdir "$RUNNER_TEMP/pipegen-out/pipegen-out-sast--api"
-  dest="$RUNNER_TEMP/pipegen-out/pipegen-out-sast--api/semgrep.sarif"
+  mkdir -p "$RUNNER_TEMP/pipegen-raw"
+  mkdir "$RUNNER_TEMP/pipegen-raw/pipegen-out-sast--api"
+  dest="$RUNNER_TEMP/pipegen-raw/pipegen-out-sast--api/semgrep.sarif"
   mv -- "$out" "$dest"
-  [ -f "$dest" ] && [ ! -L "$dest" ] || { rm -f -- "$dest"; rc=1; }
-  chmod -R a-w "$RUNNER_TEMP/pipegen-out/pipegen-out-sast--api"
+  if [ -f "$dest" ] && [ ! -L "$dest" ]; then rc=0; else rm -f -- "$dest"; rc=1; fi
+  chmod -R a-w "$RUNNER_TEMP/pipegen-raw/pipegen-out-sast--api"
 else
   echo "pipegen: the tool left no regular result file at $out" >&2
-  if [ "$rc" -eq 0 ]; then rc=1; fi
+  rm -rf -- "$out"
+  rc=1
 fi
 exit "$rc"
 # PIPEGEN_ARG values

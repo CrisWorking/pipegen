@@ -5,8 +5,7 @@
 import { Document } from 'yaml';
 import { describe, expect, it } from 'vitest';
 import { ensureLinters, loadPinnedBinaries, runLinters } from '../src/engine/linters.js';
-import { resultArtifactName } from '../src/engine/artifact-names.js';
-import { renderJobPrelude, renderStep, renderUpload, stepsToYaml, type RenderedStep } from '../src/engine/render-step.js';
+import { renderJobPrelude, renderStep, stepsToYaml, type RenderedStep } from '../src/engine/render-step.js';
 import type { CreatedFile } from '../src/types.js';
 import { liveToken } from './helpers/live-token.js';
 import { ctxFor, entry, platform, specFor } from './helpers/render.js';
@@ -21,8 +20,7 @@ function fixture(): CreatedFile {
   const r = renderStep(spec, t, platform(), ctxFor());
   const steps: RenderedStep[] = [
     ...renderJobPrelude({ fetchDepth: r.fullHistory === true ? '0' : '1' }, platform()).steps,
-    ...r.steps,
-    ...(r.output === null ? [] : [renderUpload(resultArtifactName('secrets', undefined), r.output.path, platform())]),
+    ...r.steps,   // no scrub or upload: the point here is the job key, and the scrub step needs the gate action, which is Plan C's C6
   ];
   const doc = new Document();
   doc.contents = doc.createNode({

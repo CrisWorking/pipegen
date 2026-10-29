@@ -8,7 +8,7 @@ import { afterAll, describe, expect, it } from 'vitest';
 import { Document, parse } from 'yaml';
 import { resultArtifactName } from '../src/engine/artifact-names.js';
 import { NEED_IDS } from '../src/engine/need-ids.js';
-import { dedupeJobSteps, RenderError, renderStepWith, renderUpload, stepsToYaml, type RenderedStep, type RenderResult } from '../src/engine/render-step.js';
+import { dedupeJobSteps, RenderError, renderStepWith, renderUpload, scrubbedPath, stepsToYaml, type RenderedStep, type RenderResult } from '../src/engine/render-step.js';
 import { ARGV_POLICIES, PIP_CLOSURES, type ArgvPolicy } from '../src/engine/tool-flags.js';
 import type { ReviewedTool, StepSpec } from '../src/types.js';
 import { ctxFor, entry, platform, reviewedList, service, specFor } from './helpers/render.js';
@@ -441,12 +441,13 @@ describe('6b: env hardening (S6)', () => {
 const lastRunStep = (r: RenderResult): RenderedStep => runs(r).at(-1) as RenderedStep;
 
 describe('6b: outputs (S7)', () => {
-  it('output: renderStep returns the path under runner temp for the entry\'s artifact; renderUpload accepts exactly it', () => {
+  it('output: renderStep returns the raw path under runner temp for the entry\'s artifact; renderUpload refuses it and accepts exactly its scrubbed copy', () => {
     const r = render('trivy-config');
     const artifact = resultArtifactName('iac');
-    expect(r.output).toEqual({ path: `\${{ runner.temp }}/pipegen-out/${artifact}/trivy-config.sarif`, format: 'sarif' });
-    const up = renderUpload(artifact, r.output?.path as string, platform());
-    expect(up.with?.path).toBe(r.output?.path);
+    expect(r.output).toEqual({ path: `\${{ runner.temp }}/pipegen-raw/${artifact}/trivy-config.sarif`, format: 'sarif' });
+    expect(() => renderUpload(artifact, r.output?.path as string, platform())).toThrow(RenderError);
+    const up = renderUpload(artifact, scrubbedPath(r.output?.path as string), platform());
+    expect(up.with?.path).toBe(`\${{ runner.temp }}/pipegen-out/${artifact}/trivy-config.sarif`);
     expect(render('biome').output).toBeNull();
     const per = render('trivy-config', { service: 'app' });
     expect(per.output?.path).toContain(resultArtifactName('iac', 'app'));
@@ -464,7 +465,7 @@ describe('6b: outputs (S7)', () => {
     expect(run.indexOf('"${pg_env[@]}" ')).toBeLessThan(run.indexOf('[ -f "$out" ]'));
   });
 
-  it2('output: a result path that already exists (file, folder or symlink) fails before the tool runs; a good run is moved and keeps the tool\'s exit code', () => {
+  it2('output: a result path that already exists (file, folder or symlink) fails before the tool runs; a good run is moved; a findings exit code is a pass (ruling B2)', () => {
     const t = entry('trivy-config');
     const step = lastRunStep(renderStepWith(spec(t), t, platform(), ctx));
     const out = 'trivy-config.sarif';
@@ -478,12 +479,12 @@ describe('6b: outputs (S7)', () => {
       expect(res.status).not.toBe(0);
       expect(existsSync(join(sb.ws, 'argv.bin'))).toBe(false); // the tool never ran
     }
-    // good run: the tool writes the result and exits 1 (findings): file moved, exit code kept
+    // good run: the tool writes the result and exits 1 (findings, ruling B2): file moved to pipegen-raw, the step passes
     const sb = sandbox();
     fakeTool(sb, artifact, 'trivy', `echo '{"runs":[]}' > ./${out}\nexit 1`);
     const res = exec(step, sb, stepEnv(step, sb));
-    expect(res.status).toBe(1);
-    expect(readFileSync(join(sb.rt, 'pipegen-out', artifact, out), 'utf8')).toContain('"runs"');
+    expect(res.status).toBe(0);
+    expect(readFileSync(join(sb.rt, 'pipegen-raw', artifact, out), 'utf8')).toContain('"runs"');
     expect(existsSync(join(sb.ws, out))).toBe(false);
   });
 
@@ -580,7 +581,7 @@ describe('6b: every reviewed CLI entry', () => {
           expect(back[i]?.run, `${t.id}: run`).toBe(st.run);
           expect(back[i]?.env, `${t.id}: env`).toEqual(st.env);
         });
-        if (t.step.output.path !== '') expect(r.output?.path, t.id).toContain('/pipegen-out/');
+        if (t.step.output.path !== '') expect(r.output?.path, t.id).toContain('/pipegen-raw/');
       } catch (e) {
         expect(e, t.id).toBeInstanceOf(RenderError);
         outcome[t.id] = (e as Error).message;

@@ -6,8 +6,9 @@
 // - The AI may set only the keys in `tool.choices`, each to one of its listed values. Anything else a step needs at
 //   run time (an artifact name, a SARIF file, a Dockerfile) is a renderer-filled input from RENDERER_INPUTS
 //   (tool-flags.ts), each with its own checker (ruling S15).
-// - renderStep never uploads (ruling B3): the scrub step of Plans C and G sits between the scan and the upload, so
-//   renderUpload is a separate helper. Result artifacts are named by artifact-names.ts (ruling B4).
+// - renderStep never uploads (ruling B3): the scrub step (renderScrub, Plan C ruling B1) sits between the scan and the upload,
+//   so renderUpload is a separate helper. A tool's raw result is in `pipegen-raw` and can not be uploaded; the scrub writes
+//   the copy in `pipegen-out` that the upload takes. Result artifacts are named by artifact-names.ts (ruling B4).
 // - Repo-derived values (Service.path, runtimeVersion, dockerfile) are validated or mapped, never copied raw (ruling S8).
 //   All YAML is built with the `yaml` Document API (stepsToYaml); no step text is concatenated into YAML.
 // - 6a builds the action kind completely; 6b the CLI kinds (github-release, docker, npm, pip) in render-cli.ts; 6c the rule
@@ -20,12 +21,12 @@ import { COMMIT_SHA_RE } from './names.js';
 import { NEED_IDS } from './need-ids.js';
 import type { PlatformActions } from './pin.js';
 import { tuningProblems } from './tuning.js';
-import { APP_RUNNING_CATEGORIES, projectScriptSteps, renderCliTool, type CliHooks, type RenderOptions } from './render-cli.js';
+import { APP_RUNNING_CATEGORIES, projectScriptSteps, renderCliTool, sha16, type CliHooks, type RenderOptions } from './render-cli.js';
 import { ArtifactNameError, resultArtifactName } from './artifact-names.js';
 import type { ProjectScriptStep } from './reviewed.js';
 import { own, RenderError, show } from './render-error.js';
 import { checkExpressions, checkJobOrder, isDangerousName, isReviewed, STEP_KEYS, type RenderedStep } from './job-rules.js';
-import { DOCKER_ACTION_USES, IMAGE_BUILT_ACTION_USES, PLAIN_REL_RE, PLATFORM_LOCKS, PLATFORM_USES, RENDERER_INPUTS, rendererInputProblems } from './tool-flags.js';
+import { DOCKER_ACTION_USES, IMAGE_BUILT_ACTION_USES, PIPEGEN_GATE_USES, PLAIN_REL_RE, PLATFORM_LOCKS, PLATFORM_USES, RENDERER_INPUTS, rendererInputProblems, scrubbedResultPath } from './tool-flags.js';
 
 export { RenderError };
 // the job rules live in job-rules.ts (one copy for the renderer, the emitter, the referee and the linters); re-exported for the callers that import them here
@@ -42,7 +43,7 @@ export interface RenderContext {
   base?: true;
 }
 
-/** `output`: where the tool's result will be, under `${{ runner.temp }}` (ruling S7); null when the step makes none. */
+/** `output`: where the tool's RAW result will be, `${{ runner.temp }}/pipegen-raw/<artifact>/<file>` (rulings S7 and B1: never uploadable; scrubbedPath gives the copy the scrub writes); null when the step makes none. */
 export interface RenderResult {
   steps: RenderedStep[]; output: { path: string; format: OutputFormat } | null;
   /** The job needs the whole git history (a base ref slot, jscpd): its checkout must use fetch-depth 0 (renderJobPrelude `fetchDepth: '0'`). */
@@ -445,9 +446,36 @@ export function renderJobPrelude(opts: PreludeOptions, platform: PlatformActions
 }
 
 /**
+ * The scrubbed copy of a raw result path (`${{ runner.temp }}/pipegen-raw/<artifact>/<file>`): the same artifact and file under
+ * `${{ runner.temp }}/pipegen-out/`, which `renderUpload` takes. Throws for any other text.
+ */
+export function scrubbedPath(rawPath: string): string {
+  const out = scrubbedResultPath(rawPath);
+  if (out === null) throw new RenderError(`${show(rawPath)} is not a raw result path (\${{ runner.temp }}/pipegen-raw/<artifact>/<file>).`);
+  return out;
+}
+
+/**
+ * The scrub step of one result (Plan C ruling B1, part 7): pipegen's gate action in `scrub` mode rebuilds the raw result
+ * from allowlisted fields plus HMAC fingerprints, and writes it to `pipegen-out/<artifact>/<file>`, the only copy that
+ * is uploaded. It runs even when the scan step failed (the raw file is then missing and the scrub reports a tool error).
+ * `rawPath` is `RenderResult.output.path`; `tool` the reviewed id of the scanner; `gate` the reviewed gate entry (it fixes
+ * no input and offers no choice: every input is set here and checked by RENDERER_INPUTS).
+ */
+export function renderScrub(artifact: string, rawPath: string, tool: string, format: 'sarif' | 'zap-json', gate: ReviewedTool): RenderedStep {
+  if (!isReviewed(gate.candidate)) throw new RenderError('The gate action is not a reviewed entry.');
+  if (usesOf(gate).path !== PIPEGEN_GATE_USES) throw new RenderError(`The gate entry does not run ${PIPEGEN_GATE_USES}.`);
+  if (Object.keys(gate.fixedInputs.with ?? {}).length > 0 || Object.keys(gate.choices).length > 0) throw new RenderError('The gate entry may fix no input and offer no choice: pipegen sets every input of the gate action itself.');
+  const out = scrubbedPath(rawPath);
+  const step = actionStep(gate, 'pipegen: scrub the result', {}, { mode: 'scrub', artifact, tool, format, raw: rawPath, out, 'fp-key': '${{ secrets.PIPEGEN_FP_KEY }}' });
+  return { id: `scrub-${sha16(artifact)}`, ...step, if: 'always()' };
+}
+
+/**
  * The upload of one result (ruling B3: separate from renderStep, so the scrub step can sit before it). Runs even when
  * the job failed, never uploads hidden files, and fails when the file is missing. `artifact` is a result artifact name
- * (artifact-names.ts) and `path` a place under `${{ runner.temp }}/pipegen-out/`.
+ * (artifact-names.ts) and `path` a place under `${{ runner.temp }}/pipegen-out/<artifact>`: the scrubbed copy
+ * (scrubbedPath), never the raw one, and the job must hold the scrub step of that artifact before it (checkJobOrder).
  */
 export function renderUpload(artifact: string, path: string, platform: PlatformActions): RenderedStep {
   // the path must sit in this artifact's own folder: the rule is the shared whenWith of RENDERER_INPUTS (tool-flags.ts), which the emitter and the referee also use

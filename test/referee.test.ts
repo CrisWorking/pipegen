@@ -4,13 +4,13 @@
 import { Document, parseDocument } from 'yaml';
 import { describe, expect, it } from 'vitest';
 import { JOB_PERMISSIONS, JOB_STEP_POLICY, pipegenLines, referee, type Linters, type RefereeDeps, type RefereeIssue, type RefereeReport } from '../src/engine/referee.js';
-import { dedupeJobSteps, RenderError, renderJobPrelude, renderPlatformStep, renderProjectScript, renderStep, renderUpload, stepsToYaml, type RenderContext, type RenderedStep, type RenderResult } from '../src/engine/render-step.js';
+import { dedupeJobSteps, RenderError, renderJobPrelude, renderPlatformStep, renderProjectScript, renderScrub, renderStep, renderUpload, scrubbedPath, stepsToYaml, type RenderContext, type RenderedStep, type RenderResult } from '../src/engine/render-step.js';
 import { resultArtifactName } from '../src/engine/artifact-names.js';
 import { NEED_ID_CATEGORY, NEED_IDS } from '../src/engine/need-ids.js';
 import { emptyRepoFiles } from '../src/read/quality.js';
 import { GATE_CHECK_NAME, type Capabilities, type CreatedFile, type ExistingWorkflow, type Need, type PipelineDraft, type ReviewedTool, type StepSpec } from '../src/types.js';
 import { stub } from './helpers/linter-stub.js';
-import { entry, platform, profile, reviewedList, service, specFor } from './helpers/render.js';
+import { entry, gateEntry, platform, profile, reviewedList, service, specFor } from './helpers/render.js';
 import { fake } from './helpers/secret-repo.js';
 
 // ---------- builders ----------
@@ -48,11 +48,14 @@ function draftOf(steps: StepSpec[], over: Partial<PipelineDraft> = {}): Pipeline
 }
 const prelude = (depth: '1' | '0' = '1'): RenderedStep[] => renderJobPrelude({ fetchDepth: depth }, platform()).steps;
 const isRepoCode = (s: RenderedStep): boolean => s.id?.startsWith('repocode-') === true;
-/** A tool's job steps as Plan G would compose them: checkout, the tool, and the upload of its result (never after repo code). */
+/** A tool's job steps as Plan G would compose them: checkout, the tool, the scrub of its result and the upload of the scrubbed copy (never after repo code). */
 function toolJob(spec: StepSpec, c: RenderContext = ctx): RenderedStep[] {
   const t = entry(spec.tool.id);
   const r: RenderResult = renderStep(spec, t, platform(), c);
-  const upload = r.output !== null && !r.steps.some(isRepoCode) ? [renderUpload(resultArtifactName(spec.needId, spec.service), r.output.path, platform())] : [];
+  const artifact = resultArtifactName(spec.needId, spec.service);
+  const upload = r.output !== null && !r.steps.some(isRepoCode)
+    ? [...(r.output.format === 'sarif' || r.output.format === 'zap-json' ? [renderScrub(artifact, r.output.path, t.id, r.output.format, GATE)] : []), renderUpload(artifact, scrubbedPath(r.output.path), platform())]
+    : [];
   return [...prelude(r.fullHistory === true ? '0' : '1'), ...r.steps, ...upload];
 }
 type Job = Record<string, unknown>;
@@ -80,7 +83,7 @@ const rawWf = (jobs: Record<string, Job>): CreatedFile => file(workflowText(jobs
 const LINTERS: Linters = { actionlint: async () => '/stub/actionlint', zizmor: async () => '/stub/zizmor' };
 const quiet: RefereeDeps = { runLinters: async () => [] };
 const run = (files: CreatedFile[], d: PipelineDraft, opts: { list?: ReviewedTool[]; deps?: RefereeDeps } = {}): Promise<RefereeReport> =>
-  referee(files, d, platform(), opts.list ?? reviewedList(), LINTERS, 'gh-stub', opts.deps ?? quiet);
+  referee(files, d, platform(), opts.list ?? [...reviewedList(), GATE], LINTERS, 'gh-stub', opts.deps ?? quiet);
 const checks = (r: RefereeReport): string[] => [...new Set(r.issues.map((i) => i.check))].sort();
 const has = (r: RefereeReport, check: RefereeIssue['check']): boolean => r.issues.some((i) => i.check === check);
 const show = (r: RefereeReport): string => r.issues.map((i) => `${i.check}: ${i.message}`).join('\n');
@@ -98,7 +101,8 @@ const ownAction = (id: string, path: string, s: string): ReviewedTool => ({
   step: { action: { uses: `crisworking/pipegen/${path}@${s}`, with: { mode: path } }, output: { path: '', format: 'none' } },
   fixedInputs: { with: { mode: path } }, choices: {}, configFiles: [], reviewedBy: 'fixture', reviewedAt: '2026-10-29', proofs: 0,
 });
-const GATE = ownAction('pipegen-gate', 'gate', sha('1'));
+// the gate entry has no fixed inputs and no choice (Plan C ruling B1/B3): `mode` and the rest are inputs the renderer sets
+const GATE = gateEntry(sha('1'));
 const WATCHER = ownAction('pipegen-watcher', 'watcher', sha('2'));
 
 // ---------- the parity test ----------
@@ -192,7 +196,7 @@ describe('referee: pins', () => {
   });
   it('referee: pipegen gate and watcher actions at the reviewed sha allowed; at another sha → unknown-pin', async () => {
     const list = [...reviewedList(), GATE, WATCHER];
-    const step = (t: ReviewedTool, s: string): RenderedStep => ({ name: t.id, uses: (t.step.action?.uses as string).replace(/@.*$/, `@${s}`), with: { mode: t.fixedInputs.with?.mode as string } });
+    const step = (t: ReviewedTool, s: string): RenderedStep => ({ name: t.id, uses: (t.step.action?.uses as string).replace(/@.*$/, `@${s}`), with: { mode: t.id === GATE.id ? 'gate' : t.fixedInputs.with?.mode as string } });
     const ok = await run([wf({ gate: job([step(GATE, sha('1'))], { permissions: { contents: 'read', actions: 'read', 'pull-requests': 'read' } }), watch: job([step(WATCHER, sha('2'))], { permissions: { contents: 'read', issues: 'write', actions: 'read' } }) })], draftOf([]), { list });
     expect(show(ok)).toBe('');
     for (const [t, other] of [[GATE, sha('3')], [WATCHER, sha('4')]] as const) {

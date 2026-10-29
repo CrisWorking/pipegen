@@ -33,3 +33,16 @@ export const platform = (list: ReviewedTool[] = reviewedList()): PlatformActions
 export const specFor = (tool: ReviewedTool, over: Partial<StepSpec> = {}): StepSpec => ({
   needId: 'sast', tool: tool.candidate, choices: {}, output: tool.step.output, ...over,
 });
+
+/** The commit the fixture gate entry is pinned to. */
+export const GATE_SHA = '1'.repeat(40);
+/**
+ * A fixture for pipegen's own gate action (Plan C C0a): the real entry comes with C6. Like the real one it has no fixed
+ * inputs and no choices; `mode` and everything else are inputs the renderer sets (RENDERER_INPUTS).
+ */
+export const gateEntry = (sha: string = GATE_SHA): ReviewedTool => ({
+  id: 'pipegen-gate', categories: ['gate'], languages: ['any'],
+  candidate: { id: 'pipegen-gate', name: 'pipegen-gate', kind: 'action', repo: 'crisworking/pipegen', version: 'v0.2.0', pin: { sha }, source: 'reviewed', reviewed: true, categories: ['gate'] },
+  step: { action: { uses: `crisworking/pipegen/gate@${sha}`, with: {} }, output: { path: '', format: 'none' } },
+  fixedInputs: { with: {} }, choices: {}, configFiles: [], reviewedBy: 'fixture', reviewedAt: '2026-10-29', proofs: 0,
+});

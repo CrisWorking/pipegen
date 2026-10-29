@@ -5,7 +5,7 @@ import {
 } from '../src/engine/render-step.js';
 import { RENDERER_INPUTS, rendererInputProblems } from '../src/engine/tool-flags.js';
 import { RESULT_ARTIFACT_PREFIX, type ReviewedCandidate, type StepSpec } from '../src/types.js';
-import { ctxFor, entry, platform, reviewedList, service, specFor } from './helpers/render.js';
+import { ctxFor, entry, gateEntry, platform, reviewedList, service, specFor } from './helpers/render.js';
 
 const yamlOf = (steps: RenderedStep[]): string => {
   const doc = new Document();
@@ -301,12 +301,12 @@ describe('renderStep: actions', () => {
 describe('RENDERER_INPUTS (S15)', () => {
   it('RENDERER_INPUTS: only the listed inputs, each with a checker; none is also a template input', () => {
     expect(Object.keys(RENDERER_INPUTS).sort()).toEqual([
-      'actions/attest', 'actions/download-artifact', 'actions/upload-artifact', 'docker/build-push-action', 'docker/login-action', 'github/codeql-action/upload-sarif',
+      'actions/attest', 'actions/download-artifact', 'actions/upload-artifact', 'crisworking/pipegen/gate', 'docker/build-push-action', 'docker/login-action', 'github/codeql-action/upload-sarif',
     ]);
     for (const [uses, inputs] of Object.entries(RENDERER_INPUTS)) {
       for (const [name, spec] of Object.entries(inputs)) {
         expect(typeof spec.check, `${uses} ${name}`).toBe('function');
-        const t = reviewedList().find((e) => e.step.action?.uses.startsWith(`${uses}@`));
+        const t = [...reviewedList(), gateEntry()].find((e) => e.step.action?.uses.startsWith(`${uses}@`));   // the gate entry is a fixture until Plan C's C6
         expect(t, uses).toBeDefined();
         expect(Object.keys(t?.step.action?.with ?? {}), `${uses} ${name}`).not.toContain(name);
         expect(Object.keys(t?.choices ?? {}), `${uses} ${name}`).not.toContain(name);

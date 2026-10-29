@@ -3,7 +3,7 @@
 // the referee and the linters import them from here, so no second copy can drift. It imports only the leaves render-error.ts,
 // tool-flags.ts and types.ts (test/final-fix-b.test.ts and test/module-graph.test.ts check this).
 import { EXPR, own, RenderError, show } from './render-error.js';
-import { CHECKER_STEP_ID_RE, PLATFORM_USES, rendererInputProblems, RENDERER_INPUTS, SCRUB_STEP_ID_RE, SETUP_STEP_ID_RE, TOOL_STEP_ID_RE } from './tool-flags.js';
+import { CHECKER_STEP_ID_RE, GATE_USES_RE, PLATFORM_USES, rendererInputProblems, RENDERER_INPUTS, SCRUB_STEP_ID_RE, SETUP_STEP_ID_RE, TOOL_STEP_ID_RE } from './tool-flags.js';
 
 /** One step of a job, as pipegen renders it. `usesComment` becomes the trailing `# <version>` comment on `uses:`. */
 export interface RenderedStep {
@@ -83,10 +83,20 @@ const SETUP_ID_ACTION: readonly [RegExp, string][] = [
 ];
 
 /**
+ * Whether a step is a scrub step (Plan C ruling B1 part 3): a `scrub-<16 hex>` id on a step with no `run`, whose `uses` is the
+ * gate action pinned by a commit, in `mode: scrub`. Nothing else is: not a run step with that id, not another action, not the
+ * gate in another mode, not the gate action under another id. The shape only; whether the commit is the reviewed pin is the referee's question.
+ */
+export function isScrubStep(s: RenderedStep): boolean {
+  return s.id !== undefined && SCRUB_STEP_ID_RE.test(s.id) && s.run === undefined && s.uses !== undefined && GATE_USES_RE.test(s.uses) && s.with?.mode === 'scrub';
+}
+
+/**
  * Whether a step is KNOWN not to run the repo's code. Everything else is repo code (fail closed): a step with no id, an
  * unknown or renamed id, `pipegen-npm-ci-…` (the repo's own `npm ci` reads its `.npmrc`), the repo-code run steps, and any
  * action that is not a pinned checkout, setup or upload action. An id counts only on the right kind of step: a script
- * for the run ids, and for a setup id the pinned platform action it names (`pipegen-checkout` only on actions/checkout).
+ * for the run ids, for a setup id the pinned platform action it names (`pipegen-checkout` only on actions/checkout), and for
+ * a scrub id the pinned gate action in scrub mode (isScrubStep).
  */
 export function isKnownHarmless(s: RenderedStep): boolean {
   const pinnedAction = s.uses !== undefined && s.run === undefined && TRUSTED_ACTION_RE.test(s.uses);
@@ -95,7 +105,8 @@ export function isKnownHarmless(s: RenderedStep): boolean {
     const path = SETUP_ID_ACTION.find(([re]) => re.test(s.id as string))?.[1];
     return pinnedAction && path !== undefined && (s.uses as string).startsWith(`${path}@`);
   }
-  if (CHECKER_STEP_ID_RE.test(s.id) || SCRUB_STEP_ID_RE.test(s.id) || TOOL_STEP_ID_RE.test(s.id)) return s.run !== undefined && s.uses === undefined;
+  if (SCRUB_STEP_ID_RE.test(s.id)) return isScrubStep(s);   // the gate action in scrub mode: no renderer makes a scrub id on a run step
+  if (CHECKER_STEP_ID_RE.test(s.id) || TOOL_STEP_ID_RE.test(s.id)) return s.run !== undefined && s.uses === undefined;
   return false;   // an unknown or renamed id
 }
 
@@ -110,12 +121,31 @@ export function isKnownHarmless(s: RenderedStep): boolean {
 export function checkJobOrder(steps: readonly RenderedStep[]): string[] {
   const problems: string[] = [];
   let repoCode: string | undefined;
+  const scrubbed = new Set<string>();   // the artifacts a scrub step earlier in this job rebuilt
   steps.forEach((s, i) => {
     if (isKnownHarmless(s)) {
       if (repoCode !== undefined) problems.push(`Step ${i + 1} (${show(s.name)}) comes after the repo-code step ${show(repoCode)}: code from the repository could have changed what it runs or uploads. Put it before, or in another job.`);
     } else if (repoCode === undefined) repoCode = s.name;
+    if (isScrubStep(s) && typeof s.with?.artifact === 'string') scrubbed.add(s.with.artifact);
+    const uploaded = uploadFolder(s);
+    if (uploaded === 'raw') problems.push(`Step ${i + 1} (${show(s.name)}) uploads the raw result folder (pipegen-raw), which is never uploaded: only the scrubbed copy in pipegen-out is.`);
+    else if (uploaded !== null && !scrubbed.has(uploaded)) problems.push(`Step ${i + 1} (${show(s.name)}) uploads the result folder ${show(uploaded)} of pipegen-out, but no scrub step for that result comes before it in this job: a result the gate's scrub did not rebuild may hold secret text.`);
   });
   return problems;
+}
+
+const UPLOAD_USES_RE = new RegExp(`^${PLATFORM_USES['upload-artifact'].replace(/[/.]/g, '\\$&')}@[0-9a-f]{40}$`);
+const OUT_FOLDER_RE = /^\$\{\{ runner\.temp \}\}\/pipegen-out\/([^/]+)(?:\/|$)/;
+/**
+ * What an upload-artifact step uploads: the artifact folder under `pipegen-out` (the name of its result), `'raw'` for anything
+ * in `pipegen-raw` (never uploadable, ruling B1 part 1), or null when the step is no upload or names no pipegen folder (the path rule of RENDERER_INPUTS judges that).
+ */
+function uploadFolder(s: RenderedStep): string | 'raw' | null {
+  if (s.uses === undefined || s.run !== undefined || !UPLOAD_USES_RE.test(s.uses)) return null;
+  const path = s.with?.path;
+  if (typeof path !== 'string') return null;
+  if (path.includes('/pipegen-raw/') || path.endsWith('/pipegen-raw')) return 'raw';
+  return OUT_FOLDER_RE.exec(path)?.[1] ?? null;
 }
 
 // ---------- the expression rule ----------

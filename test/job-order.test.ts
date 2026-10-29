@@ -1,11 +1,11 @@
 // Plan B 6c Part 0 (review-6b-r2 C1, C2, C5): the job order rule is an allowlist that fails closed and is enforced where a
 // job is assembled; every rendered step has a recognised id; an npm checker is one step.
 import { describe, expect, it } from 'vitest';
-import { checkJobOrder, dedupeJobSteps, RenderError, renderProjectScript, renderStepWith, type RenderedStep, type RenderResult } from '../src/engine/render-step.js';
+import { checkJobOrder, dedupeJobSteps, RenderError, renderProjectScript, renderScrub, renderStepWith, type RenderedStep, type RenderResult } from '../src/engine/render-step.js';
 import { NEED_IDS } from '../src/engine/need-ids.js';
 import { ARGV_POLICIES, type ArgvPolicy } from '../src/engine/tool-flags.js';
 import type { ReviewedTool, StepSpec } from '../src/types.js';
-import { ctxFor, entry, platform, reviewedList, service, specFor } from './helpers/render.js';
+import { ctxFor, entry, gateEntry, platform, reviewedList, service, specFor } from './helpers/render.js';
 
 const needFor = (t: ReviewedTool): string => t.categories.find((c) => (NEED_IDS as readonly string[]).includes(c) && c !== 'platform') ?? 'sast';
 const ctx = ctxFor([service({ name: 'app', path: '.' })]);
@@ -48,7 +48,7 @@ describe('C1: checkJobOrder is an allowlist that fails closed (the reviewer\'s p
   it('after repo code only repo code follows: an upload, a scrub and an action are refused, another repo-code step is fine', () => {
     const vitest = steps('vitest-coverage');
     const upload: RenderedStep = { name: 'Upload', uses: `actions/upload-artifact@${sha}` };
-    const scrub: RenderedStep = { id: 'scrub-0123456789abcdef', name: 'scrub', run: 'true' };
+    const scrub = renderScrub('pipegen-out-secrets', '${{ runner.temp }}/pipegen-raw/pipegen-out-secrets/gitleaks.sarif', 'gitleaks', 'sarif', gateEntry());
     expect(checkJobOrder([...vitest, upload]).length).toBeGreaterThan(0);
     expect(checkJobOrder([...vitest, scrub]).length).toBeGreaterThan(0);
     expect(checkJobOrder(dedupeJobSteps([...vitest, ...steps('c8')]))).toEqual([]);

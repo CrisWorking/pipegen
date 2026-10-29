@@ -3,13 +3,13 @@
 import { Document } from 'yaml';
 import { describe, expect, it } from 'vitest';
 import { referee, JOB_STEP_POLICY, type Linters, type RefereeReport } from '../src/engine/referee.js';
-import { dedupeJobSteps, RenderError, renderJobPrelude, renderPlatformStep, renderStep, renderUpload, stepsToYaml, validateSpec, type RenderContext, type RenderedStep } from '../src/engine/render-step.js';
+import { dedupeJobSteps, RenderError, renderJobPrelude, renderPlatformStep, renderScrub, renderStep, renderUpload, scrubbedPath, stepsToYaml, validateSpec, type RenderContext, type RenderedStep } from '../src/engine/render-step.js';
 import { resultArtifactName } from '../src/engine/artifact-names.js';
 import { NEED_ID_CATEGORY } from '../src/engine/need-ids.js';
 import { rendererInputProblems } from '../src/engine/tool-flags.js';
 import { emptyRepoFiles } from '../src/read/quality.js';
 import type { Capabilities, CreatedFile, Need, PipelineDraft, StepSpec } from '../src/types.js';
-import { entry, platform, profile, reviewedList, service, specFor } from './helpers/render.js';
+import { entry, gateEntry, platform, profile, reviewedList, service, specFor } from './helpers/render.js';
 
 const api = service({ name: 'api', path: '.', scripts: ['test'], envVars: ['STRIPE_KEY'] });
 const prof = { ...profile([api]), repoFiles: { ...emptyRepoFiles() } };
@@ -30,12 +30,16 @@ const ref = (n: string): string => ['${{', `secrets.${n}`, '}}'].join(' ');
 /** A spec field named `secrets`, set at run time (the fixture scan). */
 const KEY = ['STRIPE', 'KEY'].join('_');
 const SEC = ['sec', 'rets'].join('');
-const run = (files: CreatedFile[], d: PipelineDraft): Promise<RefereeReport> => referee(files, d, p, reviewedList(), LINTERS, 'tok', { runLinters: async () => [] });
+const GATE = gateEntry();
+const run = (files: CreatedFile[], d: PipelineDraft): Promise<RefereeReport> => referee(files, d, p, [...reviewedList(), GATE], LINTERS, 'tok', { runLinters: async () => [] });
 const showR = (r: RefereeReport): string => r.issues.map((i) => `${i.check}: ${i.message}`).join('\n');
 const prelude = (): RenderedStep[] => renderJobPrelude({ fetchDepth: '1' }, p).steps;
 function toolSteps(spec: StepSpec, c: RenderContext = ctx): RenderedStep[] {
   const r = renderStep(spec, entry(spec.tool.id), p, c);
-  const up = r.output !== null && !r.steps.some((s) => s.id?.startsWith('repocode-')) ? [renderUpload(resultArtifactName(spec.needId, spec.service), r.output.path, p)] : [];
+  const art = resultArtifactName(spec.needId, spec.service);
+  const up = r.output !== null && !r.steps.some((s) => s.id?.startsWith('repocode-'))
+    ? [renderScrub(art, r.output.path, spec.tool.id, r.output.format as 'sarif', GATE), renderUpload(art, scrubbedPath(r.output.path), p)]
+    : [];
   return [...r.steps, ...up];
 }
 
@@ -72,9 +76,9 @@ describe('finding 2: an upload or download path is inside its own name folder (o
     const gl = specFor(entry('gitleaks'), { needId: 'secrets' });
     const r0 = renderStep(gl, entry('gitleaks'), p, ctx);
     // the renderer itself refuses this pair, so the hostile step is made by editing a good one (an edited file)
-    const good = renderUpload(resultArtifactName('secrets'), r0.output?.path as string, p);
+    const good = renderUpload(resultArtifactName('secrets'), scrubbedPath(r0.output?.path as string), p);
     const wrong: RenderedStep = { ...good, with: { ...good.with, name: 'pipegen-out-sast--api' } };
-    expect(() => renderPlatformStep('upload-artifact', p, { name: 'pipegen-out-sast--api', path: r0.output?.path as string })).toThrow(RenderError);
+    expect(() => renderPlatformStep('upload-artifact', p, { name: 'pipegen-out-sast--api', path: scrubbedPath(r0.output?.path as string) })).toThrow(RenderError);
     const steps = [...prelude(), ...r0.steps, wrong];
     expect(() => stepsToYaml(steps)).toThrow(RenderError);   // the emitter refuses it too
     const r = await run([wf({ j: steps }, true)], draftOf([gl], [needOf('secrets')]));
@@ -125,8 +129,9 @@ describe('finding 5: a base-scan variant of the renderer and the referee', () =>
     const base = renderStep(gl, entry('gitleaks'), p, { ...ctx, base: true });
     const art = resultArtifactName('secrets', undefined, { base: true });
     expect(art).toBe('pipegen-out-base-secrets');
-    expect(base.output?.path).toBe(`\${{ runner.temp }}/pipegen-out/${art}/${entry('gitleaks').step.output.path}`);
-    expect(renderUpload(art, base.output?.path as string, p).with?.name).toBe(art);
+    expect(base.output?.path).toBe(`\${{ runner.temp }}/pipegen-raw/${art}/${entry('gitleaks').step.output.path}`);
+    expect(() => renderUpload(art, base.output?.path as string, p)).toThrow(RenderError);   // the raw result is never uploaded
+    expect(renderUpload(art, scrubbedPath(base.output?.path as string), p).with?.name).toBe(art);
     // the non-base render is unchanged
     expect(renderStep(gl, entry('gitleaks'), p, ctx).output?.path).toContain('/pipegen-out-secrets/');
   });
@@ -134,9 +139,11 @@ describe('finding 5: a base-scan variant of the renderer and the referee', () =>
     expect(JOB_STEP_POLICY['base-scan']).toBeDefined();
     const gl = specFor(entry('gitleaks'), { needId: 'secrets' });
     const r0 = renderStep(gl, entry('gitleaks'), p, { ...ctx, base: true });
-    const up = renderUpload(resultArtifactName('secrets', undefined, { base: true }), r0.output?.path as string, p);
+    const baseArt = resultArtifactName('secrets', undefined, { base: true });
+    const scrub = renderScrub(baseArt, r0.output?.path as string, 'gitleaks', 'sarif', GATE);
+    const up = renderUpload(baseArt, scrubbedPath(r0.output?.path as string), p);
     // the PR's own scan is in the file too: the base job alone would not satisfy a blocking need
-    const doc = wf({ scan: toolSteps(gl).length > 0 ? [...prelude(), ...toolSteps(gl)] : [], 'base-scan': [...prelude(), ...r0.steps, up] });
+    const doc = wf({ scan: toolSteps(gl).length > 0 ? [...prelude(), ...toolSteps(gl)] : [], 'base-scan': [...prelude(), ...r0.steps, scrub, up] });
     const r = await run([doc], draftOf([gl], [needOf('secrets')]));
     expect(showR(r)).toBe('');
   });

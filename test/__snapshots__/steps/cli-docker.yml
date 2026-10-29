@@ -50,16 +50,22 @@
     )
     rc=0
     "${pg_env[@]}" /usr/bin/docker run --rm --pull=never --security-opt no-new-privileges --cap-drop ALL --network host -v "$work:/zap/wrk" "$PIPEGEN_IMAGE" zap-baseline.py -c zap-baseline.conf -J zap.json -z -silent || rc=$?
+    case "$rc" in 0|1|2) ;; *)
+      rm -rf -- "$out"
+      echo "pipegen: the tool exited with $rc, so its result is not used" >&2
+      exit "$rc" ;;
+    esac
     if [ -f "$out" ] && [ ! -L "$out" ]; then
-      mkdir -p "$RUNNER_TEMP/pipegen-out"
-      mkdir "$RUNNER_TEMP/pipegen-out/pipegen-out-dast"
-      dest="$RUNNER_TEMP/pipegen-out/pipegen-out-dast/zap.json"
+      mkdir -p "$RUNNER_TEMP/pipegen-raw"
+      mkdir "$RUNNER_TEMP/pipegen-raw/pipegen-out-dast"
+      dest="$RUNNER_TEMP/pipegen-raw/pipegen-out-dast/zap.json"
       mv -- "$out" "$dest"
-      [ -f "$dest" ] && [ ! -L "$dest" ] || { rm -f -- "$dest"; rc=1; }
-      chmod -R a-w "$RUNNER_TEMP/pipegen-out/pipegen-out-dast"
+      if [ -f "$dest" ] && [ ! -L "$dest" ]; then rc=0; else rm -f -- "$dest"; rc=1; fi
+      chmod -R a-w "$RUNNER_TEMP/pipegen-raw/pipegen-out-dast"
     else
       echo "pipegen: the tool left no regular result file at $out" >&2
-      if [ "$rc" -eq 0 ]; then rc=1; fi
+      rm -rf -- "$out"
+      rc=1
     fi
     exit "$rc"
   shell: bash

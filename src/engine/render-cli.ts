@@ -14,7 +14,9 @@
 // - Installs are verified before anything runs: a release asset by its sha256 (from env) before it is extracted, a docker
 //   image by digest, an npm tool and its plugins by the exact version and integrity in the lockfile (ruling B5), a pip tool
 //   only from a reviewed hash-locked closure (none exists yet, so pip is "not available yet").
-// - The result file is checked before and after the tool, and moved under `$RUNNER_TEMP/pipegen-out/<artifact>/` (ruling S7).
+// - The result file is checked before and after the tool, and moved under `$RUNNER_TEMP/pipegen-raw/<artifact>/` (ruling S7;
+//   Plan C ruling B1: the raw result is never uploadable, only the gate's scrub writes `pipegen-out`). An exit code in
+//   `{0} ∪ findingsExit` (ruling B2, ArgvPolicy) with a regular result file is a successful scan; any other exit deletes the result.
 // - The pinned config is written from an env variable with `printf '%s'`, never a heredoc, to a file name the argv policy
 //   chose (ruling S4). The repo's own config files are never named.
 // - Rule archives (semgrep rules, nuclei templates) are fetched by commit and checked by tree (ruling S12), and the values a
@@ -400,7 +402,7 @@ const LAUNCH_ENV = '"${pg_env[@]}"';
 const releaseLauncher = (exe: string): string => `"$bin/${exe}"`;
 /** The line a rendered trivy run step starts trivy with. */
 export const TRIVY_LAUNCH_RE = new RegExp(`${LAUNCH_ENV} ${releaseLauncher('trivy')}`.replace(/[.*+?^${}()|[\]\\/]/g, '\\$&'));
-const sha16 = (text: string): string => createHash('sha256').update(text).digest('hex').slice(0, 16);
+export const sha16 = (text: string): string => createHash('sha256').update(text).digest('hex').slice(0, 16);
 /** Tool categories of the DAST steps: the only docker steps that may use the host network (their target is the app on the runner). */
 const DAST_CATEGORIES: ReadonlySet<string> = new Set(['dast', 'api-dast']);
 
@@ -594,25 +596,35 @@ export function renderCliTool({ spec, tool, service, ctx, hooks, options }: CliA
   // what the tuning did, in plain words, in comment lines (describeTuning): one line of text each, nothing but printable ASCII
   const tuneComments = tuned.lines.map((l) => `# tuning: ${l.replace(/[^\x20-\x7e]/g, '?')}`);
   // the result path must be free before the tool runs and a regular file after it, also where it lands (ruling S7)
-  const outDir = `$RUNNER_TEMP/pipegen-out/${artifact}`;
+  const outDir = `$RUNNER_TEMP/pipegen-raw/${artifact}`;
   const preCheck = out === null ? [] : [
     inWork ? `out="$work/${out}"` : `out=${q(out)}`,
     inWork ? 'outdir="$work"' : 'outdir=.',
     'if [ -e "$out" ] || [ -L "$out" ]; then pg_fail "the result file $out exists before the tool ran, so pipegen will not use it"; fi',
     '[ -d "$outdir" ] && [ ! -L "$outdir" ] || pg_fail "the folder for the result is not a real folder"',
   ];
+  // ruling B2: the exit codes that mean a scan that worked (0, and the findings codes of the policy); anything else is a tool error
+  const okCodes = [0, ...(pol.findingsExit ?? [])];
+  if (!okCodes.every((c) => Number.isInteger(c) && c >= 0 && c <= 125)) return refuse(`The findings exit codes of ${show(tool.id)} are not small whole numbers.`);
   const postCheck = out === null ? [] : [
+    `case "$rc" in ${okCodes.join('|')}) ;; *)`,
+    // the tool failed: its result is not trusted, so it is deleted (it may be half written, or hold anything), and the step fails with the tool's own code
+    '  rm -rf -- "$out"',
+    '  echo "pipegen: the tool exited with $rc, so its result is not used" >&2',
+    '  exit "$rc" ;;',
+    'esac',
     'if [ -f "$out" ] && [ ! -L "$out" ]; then',
-    '  mkdir -p "$RUNNER_TEMP/pipegen-out"',
+    '  mkdir -p "$RUNNER_TEMP/pipegen-raw"',
     `  mkdir "${outDir}"`,
     `  dest="${outDir}/${out}"`,
     '  mv -- "$out" "$dest"',
-    '  [ -f "$dest" ] && [ ! -L "$dest" ] || { rm -f -- "$dest"; rc=1; }',
+    '  if [ -f "$dest" ] && [ ! -L "$dest" ]; then rc=0; else rm -f -- "$dest"; rc=1; fi',
     // a speed bump, not a guard (review-6b-r2 C3): a later step of the same user can chmod it back
     `  chmod -R a-w "${outDir}"`,
     'else',
     '  echo "pipegen: the tool left no regular result file at $out" >&2',
-    '  if [ "$rc" -eq 0 ]; then rc=1; fi',
+    '  rm -rf -- "$out"',
+    '  rc=1',
     'fi',
   ];
   const launch = (words: readonly string[]): string => `${LAUNCH_ENV} ${prefix}${words.length === 0 ? '' : ` ${words.join(' ')}`}`;
@@ -626,7 +638,7 @@ export function renderCliTool({ spec, tool, service, ctx, hooks, options }: CliA
   const appRunning = tool.categories.some((c) => APP_RUNNING_CATEGORIES.has(c));
   const runId = runsRepoCode(pol, appRunning) ? `repocode-${sha16(artifact)}` : checker ? `checker-run-${sha16(artifact)}` : `tool-run-${sha16(artifact)}`;
   steps.push(runStep(`pipegen: run ${exe}`, run, env, runId));
-  return { steps, output: out === null ? null : { path: `\${{ runner.temp }}/pipegen-out/${artifact}/${out}`, format: tool.step.output.format }, ...(built.fullHistory ? { fullHistory: true as const } : {}) };
+  return { steps, output: out === null ? null : { path: `\${{ runner.temp }}/pipegen-raw/${artifact}/${out}`, format: tool.step.output.format }, ...(built.fullHistory ? { fullHistory: true as const } : {}) };
 }
 
 // ---------- github-release (ruling S27) ----------

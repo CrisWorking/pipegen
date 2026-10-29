@@ -7,10 +7,10 @@ import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { closureRootDependencies, expectedPins } from '../src/engine/npm-closure.js';
 import { NEED_IDS } from '../src/engine/need-ids.js';
-import { checkJobOrder, dedupeJobSteps, RenderError, renderStep, renderStepWith, type RenderedStep, type RenderResult } from '../src/engine/render-step.js';
+import { checkJobOrder, dedupeJobSteps, RenderError, renderScrub, renderStep, renderStepWith, type RenderedStep, type RenderResult } from '../src/engine/render-step.js';
 import { ARGV_POLICIES, REPO_CODE_STEP_ID_RE, runsRepoCode, type ArgvPolicy } from '../src/engine/tool-flags.js';
 import type { ReviewedTool, StepSpec } from '../src/types.js';
-import { ctxFor, entry, platform, service, specFor } from './helpers/render.js';
+import { ctxFor, entry, gateEntry, platform, service, specFor } from './helpers/render.js';
 import { exec, fakeTool, FIXED_PATH, sandbox, stepEnv, type Sandbox } from './helpers/step-harness.js';
 import { readFileSync as read } from 'node:fs';
 import { packageDataPath } from '../src/util/package-data.js';
@@ -442,7 +442,7 @@ describe('R-F: hardening (findings 6, 8, 9, 10)', () => {
     const closureText2 = 'coverage==7.16.2 --hash=sha256:' + 'a'.repeat(64) + '\n';
     expect(() => renderStepWith(spec(t), t, platform(), ctx, { pipClosures: { 'coverage-py': closureText2 } })).toThrow(/follow-up/);
     const run = lastRun(render('trivy-config')).run as string;
-    expect(run).toContain('dest="$RUNNER_TEMP/pipegen-out/pipegen-out-iac/trivy-config.sarif"');
+    expect(run).toContain('dest="$RUNNER_TEMP/pipegen-raw/pipegen-out-iac/trivy-config.sarif"');
     expect(run).toContain('[ -f "$dest" ] && [ ! -L "$dest" ]');
   });
 
@@ -536,13 +536,13 @@ describe('round 2: lock size and order (rulings 5 and 7)', () => {
 
   it2('a finished result folder is read-only', () => {
     const run = lastRun(render('trivy-config'));
-    expect(run.run).toContain('chmod -R a-w "$RUNNER_TEMP/pipegen-out/pipegen-out-iac"');
+    expect(run.run).toContain('chmod -R a-w "$RUNNER_TEMP/pipegen-raw/pipegen-out-iac"');
     const sb = sandbox();
     fakeTool(sb, 'pipegen-out-iac', 'trivy', "echo '{}' > ./trivy-config.sarif");
     expect(exec(run, sb, stepEnv(run, sb)).status).toBe(0);
-    const f = join(sb.rt, 'pipegen-out', 'pipegen-out-iac', 'trivy-config.sarif');
+    const f = join(sb.rt, 'pipegen-raw', 'pipegen-out-iac', 'trivy-config.sarif');
     expect(statSync(f).mode & 0o222).toBe(0);
-    expect(statSync(join(sb.rt, 'pipegen-out', 'pipegen-out-iac')).mode & 0o222).toBe(0);
+    expect(statSync(join(sb.rt, 'pipegen-raw', 'pipegen-out-iac')).mode & 0o222).toBe(0);
   });
 
   const projectScript: RenderedStep = { id: 'repocode-0123456789abcdef', name: 'project script', run: 'npm test' };
@@ -555,7 +555,7 @@ describe('round 2: lock size and order (rulings 5 and 7)', () => {
   });
 
   it('checkJobOrder: a repo-code step before a scrub or an upload is refused; the repo-code tools themselves (vitest, prettier) count', () => {
-    const scrub: RenderedStep = { id: 'scrub-0123456789abcdef', name: 'scrub', run: 'true' };
+    const scrub = renderScrub('pipegen-out-secrets', '${{ runner.temp }}/pipegen-raw/pipegen-out-secrets/gitleaks.sarif', 'gitleaks', 'sarif', gateEntry());
     expect(checkJobOrder([projectScript, scrub])).not.toEqual([]);
     expect(checkJobOrder([projectScript, upload])).not.toEqual([]);
     expect(checkJobOrder([scrub, upload, projectScript])).toEqual([]);

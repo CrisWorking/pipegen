@@ -6,11 +6,11 @@ import { describe, expect, it } from 'vitest';
 import { referee, type Linters, type RefereeReport } from '../src/engine/referee.js';
 import { renderJobPrelude, renderStep, stepsToYaml, type RenderContext, type RenderedStep } from '../src/engine/render-step.js';
 import { resultArtifactName } from '../src/engine/artifact-names.js';
-import { renderUpload } from '../src/engine/render-step.js';
+import { renderScrub, renderUpload, scrubbedPath } from '../src/engine/render-step.js';
 import { NEED_ID_CATEGORY } from '../src/engine/need-ids.js';
 import { emptyRepoFiles, emptyServiceQuality } from '../src/read/quality.js';
 import type { Capabilities, CreatedFile, Need, PipelineDraft, StepSpec } from '../src/types.js';
-import { entry, platform, profile, reviewedList, service, specFor } from './helpers/render.js';
+import { entry, gateEntry, platform, profile, reviewedList, service, specFor } from './helpers/render.js';
 
 const api = service({
   name: 'api', path: 'services/api', dockerfile: 'services/api/Dockerfile',
@@ -28,12 +28,14 @@ const draftOf = (steps: StepSpec[]): PipelineDraft => ({
   profile: prof, capabilities: caps, needs: steps.map(needOf), steps, created: [], notProven: [], testDecisions: [],
   layersSkipped: [], scoreboard: [], requireDeployApproval: false, skipped: [], suggestions: [],
 });
-/** One job as Plan G composes it: checkout, the tool, and the upload of a result unless the job ran repo code. */
+const GATE = gateEntry();
+/** One job as Plan G composes it: checkout, the tool, and the scrub and upload of a result unless the job ran repo code. */
 function job(s: StepSpec): { steps: RenderedStep[] } {
   const t = entry(s.tool.id);
   const r = renderStep(s, t, platform(), ctx);
   const repoCode = r.steps.some((x) => x.id?.startsWith('repocode-') === true);
-  const up = r.output !== null && !repoCode ? [renderUpload(resultArtifactName(s.needId, s.service), r.output.path, platform())] : [];
+  const art = resultArtifactName(s.needId, s.service);
+  const up = r.output !== null && !repoCode ? [renderScrub(art, r.output.path, s.tool.id, r.output.format as 'sarif', GATE), renderUpload(art, scrubbedPath(r.output.path), platform())] : [];
   return { steps: [...renderJobPrelude({ fetchDepth: r.fullHistory === true ? '0' : '1' }, platform()).steps, ...r.steps, ...up] };
 }
 function file(jobs: Record<string, RenderedStep[]>): CreatedFile {
@@ -45,7 +47,7 @@ function file(jobs: Record<string, RenderedStep[]>): CreatedFile {
   for (const [id, steps] of Object.entries(jobs)) doc.setIn(['jobs', id, 'steps'], stepsToYaml(steps));
   return { path: '.github/workflows/pipegen.yml', content: doc.toString({ lineWidth: 0 }), part: 'pipeline', reason: 'test', repo: 'app' };
 }
-const run = (f: CreatedFile, d: PipelineDraft): Promise<RefereeReport> => referee([f], d, platform(), reviewedList(), LINTERS, 'gh-stub', { runLinters: async () => [] });
+const run = (f: CreatedFile, d: PipelineDraft): Promise<RefereeReport> => referee([f], d, platform(), [...reviewedList(), GATE], LINTERS, 'gh-stub', { runLinters: async () => [] });
 const show = (r: RefereeReport): string => r.issues.map((i) => `${i.check}: ${i.message}`).join('\n');
 const has = (r: RefereeReport, c: string): boolean => r.issues.some((i) => i.check === c);
 
