@@ -278,4 +278,21 @@ describe.skipIf(!live)('secret scan (live, both pinned scanners): a scan path th
       expect(b.files.map((f) => f.path), name).toEqual(['src/b.ts']);
     }
   });
+
+  it('live (P45): a base64-encoded token as an excluded file name is scanned by name; the encoded text is a found value the report masks', async () => {
+    const shop = shopifyRandom();
+    const encoded = Buffer.from(['tok' + 'en', shop].join('=')).toString('base64url').replace(/=+$/, '');
+    const repo = makeTempDir();
+    writeIn(repo, 'src/a.ts', 'export const a = 1;\n');
+    writeIn(repo, `config/${encoded}.env`, 'X=1\n'); // excluded from the bundle (.env): only its name is scanned
+    for (const name of NAMES) {
+      const b = await bundleCode(repo, scanWith(scannerFor(name)));
+      console.log(`P45 ${name}: names ${JSON.stringify(b.found.names.map((n) => n.replace(encoded, "<enc>")))}, values ${b.found.values.length}`);
+      expect(b.found.names, name).toContain(`config/${encoded}.env`);
+      expect(b.found.values.some((v) => encoded.includes(v) && v.length >= 16), `${name}: the encoded text is a found value`).toBe(true);
+      expect(b.found.values, name).toContain(shop);
+      expect(b.notes.join('\n'), name).not.toContain(encoded);
+      expect(b.files.map((f) => f.path), `${name}: the other file is still sent`).toEqual(['src/a.ts']);
+    }
+  });
 });

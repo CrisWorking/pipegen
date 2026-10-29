@@ -3,8 +3,8 @@
 // safeOutput(), and nothing else cleans those strings. In order:
 // 1. the cleaning safeText does (ANSI/OSC, control and bidi characters, every invisible (default-ignorable) character
 //    and line separator), so a value split by one of them is seen whole by the next two steps;
-// 2. the names an `audit --ai` secret scan flagged (P40, hiddenNames), then scrubKnownValues(knownValues): the GitHub
-//    token and the AI key in use, which redact() may not recognise;
+// 2. what an `audit --ai` secret scan found (P40/P45, ScanFound: flagged names, found values), then
+//    scrubKnownValues(knownValues): the GitHub token and the AI key in use, which redact() may not recognise;
 // 3. redact(): secret-like text (a token or key used as a file, folder or service name);
 // 4. safeText() for the terminal and JSON, or safeMarkdown() for Markdown, with the length cap;
 // 5. a value that is empty after all that becomes EMPTY_PLACEHOLDER in human output, so it never reads as missing data
@@ -13,7 +13,10 @@
 // read as if a secret had been found. makeSafeOutput() works out the known values' forms once, for many strings.
 // Callers apply it exactly once per value (a second safeMarkdown pass escapes the first pass's escapes), build their
 // own structure around it, and never put its result inside backticks.
-import { HIDDEN_NAME, knownValueScrubber, LONG_LINE, redact } from '../ai/redact.js';
+import { HIDDEN_NAME, knownValueScrubber, LONG_LINE, MIN_GLOBAL_SECRET, redact, tokenSpans, type ScanFound } from '../ai/redact.js';
+
+/** What a masked value is shown as (redact()'s marker). */
+const REDACTED = '[REDACTED]';
 import { safeMarkdown, safeText } from './safe-text.js';
 
 export type OutputTarget = 'terminal' | 'markdown';
@@ -70,58 +73,67 @@ export function usableKnownValues(values: readonly unknown[] | undefined): strin
   return (values ?? []).filter((v): v is string => typeof v === 'string' && v.trim().length >= MIN_KNOWN_VALUE);
 }
 
-/**
- * P40: a segment of a hidden name at least this long is masked on its own too (a top folder, a file name shown without
- * its folders). Shorter segments (`src`, `.github`, `workflows`) are masked only as part of the whole name, so ordinary
- * words of the report stay readable; a secret-like segment (an encoded token) is longer than this.
- */
-export const HIDDEN_SEGMENT_MIN = 16;
+/** Spans of `text` matching any of `forms` (substring). */
+function substringSpans(text: string, forms: readonly string[]): [number, number][] {
+  const spans: [number, number][] = [];
+  for (const f of forms) for (let i = text.indexOf(f); i >= 0; i = text.indexOf(f, i + 1)) spans.push([i, i + f.length]);
+  return spans;
+}
+
+/** `text` with every span (overlapping ones merged) replaced by `marker`. */
+function replaceAll(text: string, spans: [number, number][], marker: string): string {
+  if (spans.length === 0) return text;
+  spans.sort((a, b) => a[0] - b[0] || b[1] - a[1]);
+  let out = '';
+  let pos = 0;
+  let [start, end] = spans[0] as [number, number];
+  for (const [s, e] of spans) {
+    if (s <= end) {
+      end = Math.max(end, e);
+      continue;
+    }
+    out += text.slice(pos, start) + marker;
+    pos = end;
+    [start, end] = [s, e];
+  }
+  return out + text.slice(pos, start) + marker + text.slice(end);
+}
 
 /**
- * P40: replaces every occurrence of a hidden name (raw, and as safeText shows it) and of each of its segments of
- * HIDDEN_SEGMENT_MIN or more characters with HIDDEN_NAME. Overlapping matches are masked as one. Null when there is none.
+ * P40/P45: masks what an `audit --ai` secret scan found (ScanFound) in one output string, before anything is cut. First
+ * every hidden name (raw, and as safeText shows it) becomes HIDDEN_NAME; then every found value of MIN_GLOBAL_SECRET or
+ * more characters (and the encoded text of a decoded name finding) becomes [REDACTED] wherever it appears, and every
+ * shorter value only where it stands as a whole word (redact's rule for short values). Null when nothing was found.
  */
-export function hiddenNameMasker(names: readonly unknown[] | undefined): ((s: string) => string) | null {
-  const forms = new Set<string>();
-  for (const n of names ?? []) {
-    if (typeof n !== 'string') continue;
-    for (const f of [n, safeText(n, NO_CUT)]) {
-      if (f.trim() === '') continue;
-      forms.add(f);
-      for (const seg of f.split('/')) if (seg.length >= HIDDEN_SEGMENT_MIN) forms.add(seg);
-    }
-  }
-  if (forms.size === 0) return null;
-  const list = [...forms];
+export function scanFoundMasker(found: ScanFound | undefined): ((s: string) => string) | null {
+  if (found === undefined) return null;
+  const names = new Set<string>();
+  for (const n of found.names) for (const f of [n, safeText(n, NO_CUT)]) if (f.trim() !== '') names.add(f);
+  const values = new Set<string>();
+  for (const v of found.values) for (const f of [v, safeText(v, NO_CUT)]) if (f.length >= MIN_GLOBAL_SECRET) values.add(f);
+  const tokens = new Set<string>();
+  for (const v of found.tokens) for (const f of [v, safeText(v, NO_CUT)]) if (f.trim() !== '') tokens.add(f);
+  if (names.size + values.size + tokens.size === 0) return null;
+  // longest first, so a name is replaced whole before a shorter name inside it
+  const nameList = [...names].sort((a, b) => b.length - a.length);
+  const valueList = [...values];
+  const tokenList = [...tokens];
   return (text) => {
-    const spans: [number, number][] = [];
-    for (const f of list) for (let i = text.indexOf(f); i >= 0; i = text.indexOf(f, i + 1)) spans.push([i, i + f.length]);
-    if (spans.length === 0) return text;
-    spans.sort((a, b) => a[0] - b[0] || b[1] - a[1]);
-    let out = '';
-    let pos = 0;
-    let [start, end] = spans[0];
-    for (const [s, e] of spans) {
-      if (s <= end) {
-        end = Math.max(end, e);
-        continue;
-      }
-      out += text.slice(pos, start) + HIDDEN_NAME;
-      pos = end;
-      [start, end] = [s, e];
-    }
-    return out + text.slice(pos, start) + HIDDEN_NAME + text.slice(end);
+    const named = replaceAll(text, substringSpans(text, nameList), HIDDEN_NAME);
+    const spans = substringSpans(named, valueList);
+    for (const t of tokenList) for (const sp of tokenSpans(named, t)) spans.push(sp);
+    return replaceAll(named, spans, REDACTED);
   };
 }
 
 /**
  * The helper for one render or one command: the known values' forms are worked out once. See the file header.
- * `hiddenNames` (P40): repo paths the secret scan flagged in an `audit --ai` run; masked before the known values.
+ * `found` (P40/P45): what the secret scan of an `audit --ai` run found; masked first, before anything is cut.
  */
-export function makeSafeOutput(knownValues: readonly unknown[] | undefined, hiddenNames?: readonly unknown[]): (s: string, opts: CleanOptions) => string {
+export function makeSafeOutput(knownValues: readonly unknown[] | undefined, found?: ScanFound): (s: string, opts: CleanOptions) => string {
   const known = usableKnownValues(knownValues);
   const scrub = known.length > 0 ? knownValueScrubber(known) : null;
-  const mask = hiddenNameMasker(hiddenNames);
+  const mask = scanFoundMasker(found);
   return (s, opts) => {
     let v = safeText(String(s), NO_CUT); // safeText strips the invisible characters and line separators too (T6)
     if (mask !== null) v = mask(v);

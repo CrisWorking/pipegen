@@ -6,7 +6,7 @@ import { tmpdir } from 'node:os';
 import { isAbsolute, join, relative, resolve, sep } from 'node:path';
 import picomatch from 'picomatch';
 import { IGNORED_DIRS, MAX_FILES_TEXT, listFiles, readTextLimitedWithReason, regexSafe, type Skipped } from '../read/limits.js';
-import { safeText } from '../util/safe-text.js';
+import { PATH_SHOWN_MAX, safeText } from '../util/safe-text.js';
 import { SECRET_SCAN_EXIT, SecretScanError, secretScanArgv, secretScanConfigPath, skippedByDefaultPaths, type SecretScanner } from './secret-scan-config.js';
 
 export { isBinary } from '../read/limits.js';
@@ -24,14 +24,28 @@ export interface CodeBundle {
   truncated: boolean;
   secretScanChecked: boolean;
   notes: string[];
-  /**
-   * P40: every listed repo path (raw) the secret scan made secret: a name the scanner flagged in its file list (also a
-   * decoded finding, such as a base64-encoded secret as a name, which is not in the name as written), or a name holding
-   * a value it found. The notes already mask them; the audit report masks them everywhere too (RenderOptions.hiddenNames).
-   * Empty without the secret scan. Never sent to the AI and never printed.
-   */
-  hiddenNames: readonly string[];
+  /** P40/P45: what the secret scan found, for the audit report to mask everywhere. Empty without the secret scan. */
+  found: ScanFound;
 }
+
+/**
+ * P40/P45: what an `audit --ai` secret scan found, so the report can mask it in every string it prints (the plain-audit
+ * parts too: RenderOptions.found). Never sent to the AI and never printed.
+ */
+export interface ScanFound {
+  /** Every listed repo path (raw) the scan made secret; such a path is shown whole as HIDDEN_NAME. */
+  names: readonly string[];
+  /**
+   * Found values of MIN_GLOBAL_SECRET characters or more (the reported secret and match), plus, for a decoded finding in
+   * a file name (a base64-encoded secret as a name), the encoded text in that name: masked wherever they appear.
+   */
+  values: readonly string[];
+  /** Shorter found values: masked only where they stand as a whole word (the rule for short values everywhere). */
+  tokens: readonly string[];
+}
+
+/** A ScanFound with nothing in it (no secret scan). */
+export const NOTHING_FOUND: ScanFound = Object.freeze({ names: Object.freeze([]), values: Object.freeze([]), tokens: Object.freeze([]) });
 
 /** How a file name that looks like a secret is shown, in the bundle's notes and in the audit report. */
 export const HIDDEN_NAME = '(a file whose name looks like a secret)';
@@ -1184,6 +1198,7 @@ export async function bundleCode(dir: string, opts: BundleOptions = {}): Promise
   const clean = (s: string, path?: string) => scrub(redact(scrub(s), path === undefined ? undefined : { path }));
   const flagged: string[] = []; // secrets the secret scan found; a path holding one is never shown
   const flaggedTokens: string[] = []; // short ones (under 6 characters), matched only as whole tokens
+  const reportValues: string[] = []; // P45: more text the report masks (matches, the encoded text of decoded name findings)
   // Checked on the raw name and on the name as shown (control characters removed), so a control character
   // inside a name cannot split a secret-like pattern.
   const nameHidden = (p: string) => {
@@ -1193,7 +1208,8 @@ export async function bundleCode(dir: string, opts: BundleOptions = {}): Promise
   };
   // P39: names the secret scan flagged as lines of its file list (filled by secretScanPass)
   const flaggedNames = new Set<string>();
-  const show = (p: string) => (flaggedNames.has(p) || nameHidden(p) ? HIDDEN_NAME : safeText(p, 300));
+  // P45: never cut here: the report masks found values first and cuts after (a cut could leave half a secret)
+  const show = (p: string) => (flaggedNames.has(p) || nameHidden(p) ? HIDDEN_NAME : safeText(p, PATH_SHOWN_MAX));
   const notes = new Notes();
   const inRoots = (p: string) => roots === null || roots.some((r) => underRoot(p, r));
 
@@ -1270,8 +1286,10 @@ export async function bundleCode(dir: string, opts: BundleOptions = {}): Promise
   if (opts.secretScanner !== undefined) {
     // P39: the files the notes name but the scan doesn't read (skipped, over the size limit, past the read budget):
     // their names go through the scan too, in the file list, so a note never shows a name the scanner didn't check
-    const named = [...new Set([...links, ...Object.values(skipped).flat(), ...tooBig, ...overBudget])];
-    collected = await secretScanPass(collected, opts.secretScanner, opts.secretScanTimeoutMs ?? SECRET_SCAN_TIMEOUT_MS, known, { long: flagged, short: flaggedTokens }, notes, show, named, flaggedNames);
+    // P45: and every other name the audit report can print (excluded files such as .env, files outside the counted set,
+    // every symbolic link), so a secret in any listed name is found by the scanner and masked in the whole report
+    const named = [...new Set([...links, ...Object.values(skipped).flat(), ...tooBig, ...overBudget, ...listing.files, ...found.links])];
+    collected = await secretScanPass(collected, opts.secretScanner, opts.secretScanTimeoutMs ?? SECRET_SCAN_TIMEOUT_MS, known, { long: flagged, short: flaggedTokens, report: reportValues }, notes, show, named, flaggedNames);
     secretScanChecked = true;
   } else {
     notes.add(COUNTING_ONLY_NOTE);
@@ -1302,6 +1320,11 @@ export async function bundleCode(dir: string, opts: BundleOptions = {}): Promise
       || flaggedTokens.some((v) => tokenSpans(p, v).length > 0 || tokenSpans(shown, v).length > 0);
   };
   const hiddenNames = secretScanChecked ? [...new Set([...listing.files, ...found.links, ...flaggedNames])].filter(scanHidden).sort() : [];
+  const scanFound: ScanFound = !secretScanChecked ? NOTHING_FOUND : Object.freeze({
+    names: Object.freeze(hiddenNames),
+    values: Object.freeze([...new Set([...flagged, ...reportValues])].filter((v) => v.length >= MIN_GLOBAL_SECRET && v !== R).sort()),
+    tokens: Object.freeze([...new Set(flaggedTokens)].filter((v) => v.trim() !== '' && v !== R).sort()),
+  });
 
   const bundle: CodeBundle = {
     files: files.map((f) => Object.freeze({ path: f.path, content: f.content })),
@@ -1309,7 +1332,7 @@ export async function bundleCode(dir: string, opts: BundleOptions = {}): Promise
     truncated,
     secretScanChecked,
     notes: notes.all(),
-    hiddenNames: Object.freeze(hiddenNames),
+    found: scanFound,
   };
   Object.freeze(bundle.files);
   Object.freeze(bundle.notes);
@@ -1521,6 +1544,22 @@ interface PathPiece { name: string; first: number; count: number; canary: string
  * piece as written (prefix, paths, canary line) stays within SCAN_CHUNK_SAFE_BYTES, each with its own canary; all must
  * be confirmed. `first`/`count`: the shown paths a piece holds. Always at least one piece (an empty list has one too).
  */
+/** At most this many extra starts per file-list line (scanLine). */
+const MAX_LINE_STARTS = 24;
+
+/**
+ * P45: one file-list line as the scanners read it: the name, then, after a space each, the rest of the name from every
+ * `/`, `-`, `_`, `+` or `=` in it (at most MAX_LINE_STARTS). The scanners decode a base64 text only from where its token
+ * starts, and these characters are part of a base64 token, so in `config/<b64>.env` the token starts at `config` and
+ * decodes to nothing (both pinned scanners miss it, measured). From each start an encoded secret begins a token of its
+ * own. A finding anywhere on the line still names that one file.
+ */
+export function scanLine(name: string): string {
+  const parts = [name];
+  for (let i = 0; i < name.length - 1 && parts.length <= MAX_LINE_STARTS; i++) if ('/-_+='.includes(name[i] as string)) parts.push(name.slice(i + 1));
+  return parts.join(' ');
+}
+
 function pathPieces(lines: string[], scannerName: string): PathPiece[] {
   const pieces: PathPiece[] = [];
   const fixed = Buffer.byteLength(asScanned('x', newCanary())) - 1; // the prefix, the separators and a canary line
@@ -1546,7 +1585,7 @@ function pathPieces(lines: string[], scannerName: string): PathPiece[] {
 const isWordChar = (c: number) => isLetter(c) || isDigit(c) || c === 95; // [A-Za-z0-9_]
 
 /** Spans of `v` in `text` where it stands as a whole token (no [A-Za-z0-9_] right before or after). Linear. */
-function tokenSpans(text: string, v: string): Span[] {
+export function tokenSpans(text: string, v: string): Span[] {
   const spans: Span[] = [];
   if (v === '') return spans;
   let from = 0;
@@ -1562,7 +1601,52 @@ function tokenSpans(text: string, v: string): Span[] {
   return spans;
 }
 // A found secret shorter than this is not removed from every file (it would hit ordinary text).
-const MIN_GLOBAL_SECRET = 6;
+export const MIN_GLOBAL_SECRET = 6;
+
+/** At most this many cut points per run are tried by encodedSpans (so a hostile name can't make it slow). */
+const MAX_CUTS = 48;
+
+/**
+ * P45: the parts of `name` that decode (base64 or base64url, hex, or percent-encoding, as the scanners decode) to text
+ * holding `value`; the shortest ones. A part starts and ends at the ends of a run of encoding characters or at a
+ * separator inside it (`/`, `-`, `_`, `+`, `=`, `.`), so `src/<b64>.ts` gives `<b64>`. Empty when nothing decodes to it.
+ */
+export function encodedSpans(name: string, value: string): string[] {
+  if (value.length === 0) return [];
+  const hits: string[] = [];
+  const holds = (bytes: Buffer) => bytes.toString('utf8').includes(value) || bytes.toString('latin1').includes(value);
+  for (const run of name.match(/[A-Za-z0-9+/_=.%-]{8,}/g) ?? []) {
+    const cuts = [0];
+    for (let i = 0; i < run.length && cuts.length < MAX_CUTS; i++) if ('/-_+=.'.includes(run[i] as string)) cuts.push(i, i + 1);
+    cuts.push(run.length);
+    const points = [...new Set(cuts)].sort((a, b) => a - b);
+    for (const a of points) {
+      for (const b of points) {
+        if (b - a < 8) continue;
+        const part = run.slice(a, b);
+        let ok = false;
+        if (/^[A-Za-z0-9+/_-]+={0,3}$/.test(part)) ok = holds(Buffer.from(part, 'base64'));
+        if (!ok && /^(?:[0-9a-fA-F]{2})+$/.test(part)) ok = holds(Buffer.from(part, 'hex'));
+        if (!ok && part.includes('%')) {
+          try {
+            ok = decodeURIComponent(part).includes(value);
+          } catch {
+            ok = false;
+          }
+        }
+        if (ok) hits.push(part);
+      }
+    }
+  }
+  if (hits.length === 0) return [];
+  const shortest = Math.min(...hits.map((h) => h.length));
+  return [...new Set(hits.filter((h) => h.length === shortest))];
+}
+
+/** P45 fallback: the parts of a flagged name (split at `/` and `.`) of 8 characters or more, masked when the found text can't be placed. */
+function nameParts(name: string): string[] {
+  return [...new Set(name.split(/[/.]/).filter((p) => p.length >= 8))];
+}
 
 /**
  * Scans the (already cleaned) files with the secret scanner and returns what may be sent. Every finding is replaced
@@ -1573,7 +1657,7 @@ const MIN_GLOBAL_SECRET = 6;
  * Ruling P34: every scanned file and paths.txt carry a canary. A file whose canary did not come back is left out; a
  * scan that does not confirm paths.txt, or confirms none of the files, throws SecretScanError (it may have read nothing).
  */
-async function secretScanPass(files: FileEntry[], scanner: SecretScanner, timeoutMs: number, known: string[], flagged: { long: string[]; short: string[] }, notes: Notes, show: (p: string) => string, named: readonly string[] = [], flaggedNames: Set<string> = new Set()): Promise<FileEntry[]> {
+async function secretScanPass(files: FileEntry[], scanner: SecretScanner, timeoutMs: number, known: string[], flagged: { long: string[]; short: string[]; report?: string[] }, notes: Notes, show: (p: string) => string, named: readonly string[] = [], flaggedNames: Set<string> = new Set()): Promise<FileEntry[]> {
   // An absolute path only: a bare name would be looked up on PATH.
   const { name, path: bin } = scanner;
   if (!isAbsolute(bin)) throw new SecretScanError(`The ${name} binary must be given as an absolute path.`);
@@ -1606,7 +1690,7 @@ async function secretScanPass(files: FileEntry[], scanner: SecretScanner, timeou
     await chmod(tmp, 0o700);
     // Neutral names: no repo file name (.gitleaksignore, .gitleaks.toml, allowlisted paths) reaches the scanner.
     const names = scanned.map((_, i) => `f${String(i + 1).padStart(6, '0')}.txt`);
-    const pieces = pathPieces([...shownPaths, ...shownOthers].map(neutralizeAllow), name);
+    const pieces = pathPieces([...shownPaths, ...shownOthers].map((p) => neutralizeAllow(scanLine(p))), name);
     // P34 belt: the default path allowlist matches the absolute path, so a temp folder under node_modules/ (or another
     // folder it lists) would hide every file. Refused before anything is written; the canaries below are the guarantee.
     if ([...names, ...pieces.map((p) => p.name)].some((n) => skippedByDefaultPaths(join(tmp, n)))) {
@@ -1680,14 +1764,21 @@ async function secretScanPass(files: FileEntry[], scanner: SecretScanner, timeou
       const short = found.length < MIN_GLOBAL_SECRET;
       if (found.trim() !== '' && found !== R) (short ? shortSecrets : secrets).add(found);
       const texts = [f.secret, f.match].filter((t) => t.length >= MIN_GLOBAL_SECRET);
+      flagged.report?.push(...texts);
       const rel = relOf(f.file);
       const piece = rel === undefined ? undefined : pieceOf.get(rel);
       if (piece !== undefined) {
         // A finding in a file name: leave out the files on the reported lines, and any whose path holds the text.
         const { startLine: s, endLine: e } = f;
         let hit = false;
-        if (s !== undefined && e !== undefined && s <= e && e <= piece.count) {
-          for (let k = s - 1; k < e; k++) flagName(piece.first + k);
+        const onLines: number[] = [];
+        // a finding that starts on a name line but is reported as ending past the last name (both scanners end a decoded
+        // match at column 0 of the next line) still names only lines from its start: none before it can hold it
+        if (s !== undefined && e !== undefined && s >= 1 && s <= e && s <= piece.count) {
+          for (let k = s - 1; k < Math.min(e, piece.count); k++) {
+            flagName(piece.first + k);
+            onLines.push(piece.first + k);
+          }
           hit = true;
         }
         allShown.forEach((p, k) => {
@@ -1697,6 +1788,17 @@ async function secretScanPass(files: FileEntry[], scanner: SecretScanner, timeou
           }
         });
         if (!hit) allShown.forEach((_, k) => flagName(k)); // cannot tell which name: leave them all out (mask the others)
+        // P45: a decoded finding (the found text is not in the name as written): the report masks the encoded text in
+        // the name, so the same encoded secret is masked in every other string too
+        if (found.trim() !== '' && found !== R) {
+          for (const k of hit ? onLines : allShown.map((_, j) => j)) {
+            const shown = allShown[k];
+            if (texts.some((t) => shown.includes(t)) || found === '') continue;
+            const spans = encodedSpans(shown, found);
+            if (spans.length > 0) flagged.report?.push(...spans);
+            else if (hit) flagged.report?.push(...nameParts(shown)); // can't tell where: every longer part of that name
+          }
+        }
         continue;
       }
       const i = rel === undefined ? undefined : index.get(rel);

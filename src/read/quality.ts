@@ -2,7 +2,7 @@ import { lstat } from 'node:fs/promises';
 import { join as joinOs } from 'node:path';
 import { parse as parseToml } from 'smol-toml';
 import type { Language, QualityConfig, QualityPackage, RepoFiles, Service, ServiceQuality, UiFramework } from '../types.js';
-import { safeText } from '../util/safe-text.js';
+import { PATH_SHOWN_MAX, safeText } from '../util/safe-text.js';
 import { IGNORED_DIRS, READ_LIMITS, SKIP_REASON, linkedLevel, listFiles, readLinesLimited, readTextLimitedWithReason, regexLines, regexSafe, type Skipped } from './limits.js';
 import { REQUIREMENTS_FILE_RE, asObj, baseOf, dirOf, inDir, pythonNames, readPyproject, requirementLines, type Obj } from './manifest.js';
 
@@ -77,7 +77,7 @@ function note(notes: string[], line: string): void {
   if (!notes.includes(line)) notes.push(line);
 }
 
-const hostileNote = (rel: string) => `Skipped ${safeText(rel)}: its path has control or invisible characters, or is too long.`;
+const hostileNote = (rel: string) => `Skipped ${safeText(rel, PATH_SHOWN_MAX)}: its path has control or invisible characters, or is too long.`;
 const ancestors = (path: string): string[] => {
   const out = [path];
   while (out[out.length - 1] !== '.') out.push(dirOf(out[out.length - 1] as string));
@@ -120,12 +120,12 @@ async function presence(run: QualityRun, rel: string): Promise<'file' | 'link' |
 async function readRel(run: QualityRun, rel: string, notes: string[]): Promise<string | null> {
   const linked = await linkedLevel(run.root, rel);
   if (linked !== null) {
-    note(notes, `Skipped ${safeText(linked)}: ${SKIP_REASON.link}.`);
+    note(notes, `Skipped ${safeText(linked, PATH_SHOWN_MAX)}: ${SKIP_REASON.link}.`);
     return null;
   }
   const result = await readTextLimitedWithReason(joinOs(run.root, rel));
   if ('text' in result) return result.text;
-  note(notes, `Skipped ${safeText(rel)}: ${SKIP_REASON[result.skipped]}.`);
+  note(notes, `Skipped ${safeText(rel, PATH_SHOWN_MAX)}: ${SKIP_REASON[result.skipped]}.`);
   return null;
 }
 
@@ -141,7 +141,7 @@ async function parsedFile(run: QualityRun, rel: string, notes: string[]): Promis
         const doc: unknown = rel.endsWith('.toml') ? parseToml(text) : JSON.parse(text);
         value = asObj(doc);
       } catch {
-        note(notes, `Skipped ${safeText(rel)}: it could not be parsed.`);
+        note(notes, `Skipped ${safeText(rel, PATH_SHOWN_MAX)}: it could not be parsed.`);
       }
     }
   }
@@ -285,7 +285,7 @@ function lockScanner(kind: Exclude<LockKind, 'bun-binary'>): { onLine: (line: st
 async function lockState(run: QualityRun, rel: string, kind: LockKind, found: 'file' | 'link' | 'other'): Promise<LockState> {
   const known = run.locks.get(rel);
   if (known !== undefined) return known;
-  const name = safeText(rel);
+  const name = safeText(rel, PATH_SHOWN_MAX);
   let state: LockState;
   if (found === 'link') state = { unread: `${name} ${LOCK_SKIP.link}` };
   else if (found === 'other') state = { unread: `${name} ${LOCK_SKIP['not-a-file']}` };
@@ -388,8 +388,8 @@ async function versionsIn(run: QualityRun, servicePath: string, names: readonly 
     missing.push(name);
   }
   if (fromRange.length === 0) return { versions, fromRange };
-  const why = lock === null ? 'no lockfile was found' : 'unread' in lock.state ? lock.state.unread : `they are not listed in ${safeText(lock.rel)}`;
-  const where = servicePath === '.' ? 'the repository root' : safeText(servicePath);
+  const why = lock === null ? 'no lockfile was found' : 'unread' in lock.state ? lock.state.unread : `they are not listed in ${safeText(lock.rel, PATH_SHOWN_MAX)}`;
+  const where = servicePath === '.' ? 'the repository root' : safeText(servicePath, PATH_SHOWN_MAX);
   return { versions, fromRange, note: `Versions of ${missing.join(', ')} in ${where} come from package.json ranges (the lowest version each allows), not from a lockfile: ${why}.` };
 }
 
@@ -550,7 +550,7 @@ const K8S_DIRS = new Set(K8S_FOLDERS);
 /** A regular file at a fixed path; a symbolic link at any level of it is noted and never followed. */
 async function realFile(run: QualityRun, rel: string, notes: string[]): Promise<boolean> {
   const found = await presence(run, rel);
-  if (found === 'link') note(notes, `Skipped ${safeText((await linkedLevel(run.root, rel)) ?? rel)}: ${SKIP_REASON.link}.`);
+  if (found === 'link') note(notes, `Skipped ${safeText((await linkedLevel(run.root, rel)) ?? rel, PATH_SHOWN_MAX)}: ${SKIP_REASON.link}.`);
   return found === 'file';
 }
 

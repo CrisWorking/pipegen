@@ -3,6 +3,13 @@
 
 const DEFAULT_MAX = 200;
 
+/**
+ * P45: the cut for a repo path written into a note or a report line before the report is rendered. Longer than any path
+ * a file system allows (PATH_MAX is 4096 on Linux), so in practice nothing is cut there: the renderer cuts, after it has
+ * masked what the secret scan found (a cut first could leave half of a secret that then no longer matches).
+ */
+export const PATH_SHOWN_MAX = 4096;
+
 // OSC: ESC ] ... terminated by BEL or ESC \ (or end of input, so an unterminated one can't hide text).
 // OSC 8 hyperlinks are two OSC sequences around the visible text, so removing both keeps only that text.
 const OSC = /\x1b\][^\x07\x1b]*(?:\x07|\x1b\\|$)/g;

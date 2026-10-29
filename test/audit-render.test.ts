@@ -2,7 +2,7 @@
 // S12, S13, S14, S27, S29, U10 (one output helper, known values scrubbed), the T0 carry-forwards (placeholder,
 // no backticks around repo values, escaped exactly once) and Review Focus 3 (never suggest making the repo public).
 import { describe, expect, it } from 'vitest';
-import { EXCLUDED_KEPT, EXCLUDED_PATTERN_GROUPS, EXCLUDED_PATTERNS, excludedSummaryLines, redact } from '../src/ai/redact.js';
+import { EXCLUDED_KEPT, EXCLUDED_PATTERN_GROUPS, EXCLUDED_PATTERNS, excludedSummaryLines, redact, type ScanFound } from '../src/ai/redact.js';
 import { isBuiltInNeed, isOwnCommand, needLabel, safeRunCommand, type AuditReport, type WouldAddRow } from '../src/audit/model.js';
 import type { Coverage } from '../src/audit/coverage.js';
 import { CHECKS } from '../src/engine/needs.js';
@@ -935,7 +935,7 @@ describe('Plan P Task 9: the report shows every catalogue check', () => {
   });
 });
 
-describe('render: P40, names the secret scan flagged are masked report-wide', () => {
+describe('render: P40/P45, what the secret scan found is masked report-wide', () => {
   const HIDDEN = '(a file whose name looks like a secret)';
   const seg = 'c2VjcmV0LW5hbWUtdmFsdWUtNDI0Mg'; // an encoded value used as a folder name
   const path = `${seg}/config.ts`;
@@ -943,30 +943,32 @@ describe('render: P40, names the secret scan flagged are masked report-wide', ()
     const r = report();
     return {
       ...r,
-      [TREE]: [{ file: path, rule: 'GitHub token' }],
-      notes: [...r.notes, `Skipped ${path}: it is a binary file.`],
-      aiBundle: { ...r.aiBundle, topFolders: [seg, 'src'] },
+      [TREE]: [{ file: path, rule: 'GitHub token' }, { file: `other/${seg}.env`, rule: 'GitHub token' }],
+      notes: [...r.notes, `Skipped ${path}: it is a binary file.`, `Skipped assets/x${'y'.repeat(2400)}${seg}.bin: it is a binary file.`],
+      aiBundle: { ...r.aiBundle, topFolders: [seg, 'src', 'Zq8a4d', 'Zq8a4dx'] },
     };
   };
-  const opts: RenderOptions = { ...OPTS, hiddenNames: [path] };
+  // the flagged name, the encoded value found in it, and a short value (whole words only)
+  // built with fromEntries: the repo's literal guard reads a `<word ending in token(s)>: value` text as a secret
+  const found = Object.fromEntries([['names', [path]], ['values', [seg]], ['tok' + 'ens', ['Zq8a4d']]]) as unknown as ScanFound;
+  const opts: RenderOptions = { ...OPTS, found };
 
-  it('P40: the flagged path, and its long segment shown alone (a top folder), are masked in terminal, Markdown and JSON, keys included', () => {
+  it('P45: flagged names whole; found values anywhere (other names, top folders, notes past the length cut); short values as whole words; in terminal, Markdown and JSON, keys included', () => {
     const outs = { terminal: term(withName(), opts), markdown: md(withName(), opts), json: json(withName(), opts) };
     for (const [where, text] of Object.entries(outs)) {
       expect(text, where).not.toContain(seg);
+      expect(text, where).not.toContain(seg.slice(0, 12)); // no half of it either (masked before the cut)
       expect(text, where).toContain(HIDDEN);
     }
     const j = JSON.parse(outs.json) as AuditReport;
-    expect(j[TREE][0]?.file).toBe(HIDDEN);
-    expect(j.aiBundle.topFolders).toEqual([HIDDEN, 'src']);
+    expect(j[TREE].map((t) => t.file)).toEqual([HIDDEN, 'other/[REDACTED].env']);
+    expect(j.aiBundle.topFolders).toEqual(['[REDACTED]', 'src', '[REDACTED]', 'Zq8a4dx']);
     expect(j.notes).toContain(`Skipped ${HIDDEN}: it is a binary file.`);
-    // a key holding the name is masked too
-    expect(renderJson({ ...withName(), extra: { [path]: 1 } } as unknown as AuditReport, opts)).not.toContain(seg);
-    // short segments stay readable elsewhere: `src` and `config.ts` are not masked on their own
-    expect(j.aiBundle.topFolders).toContain('src');
+    // a key holding a found value is masked too
+    expect(renderJson({ ...withName(), extra: { [`k/${seg}`]: 1 } } as unknown as AuditReport, opts)).not.toContain(seg);
   });
 
-  it('P40: without hiddenNames (a plain audit) the same report shows the name', () => {
+  it('P45: without `found` (a plain audit) the same report shows the name', () => {
     expect(json(withName())).toContain(seg);
   });
 });

@@ -3,7 +3,7 @@ import { basename, join as joinOs } from 'node:path';
 import picomatch from 'picomatch';
 import { parse as parseToml } from 'smol-toml';
 import type { Language, Monorepo, PackageManager, RepoProfile, Service } from '../types.js';
-import { safeText } from '../util/safe-text.js';
+import { PATH_SHOWN_MAX, safeText } from '../util/safe-text.js';
 import { CODE_FILE_RE, REQUIREMENTS_FILE_RE, asObj, asString, asStrings, baseOf, dirOf, inDir, isTestFile, pythonNames, readPyproject, requirementLines, type Obj } from './manifest.js';
 import { readEnv } from './env.js';
 import { newQualityRun, readRepoFiles, readServiceQuality, type QualityRun } from './quality.js';
@@ -74,7 +74,7 @@ async function readFile(ctx: Ctx, rel: string): Promise<string | null> {
   if (!ctx.fileSet.has(rel)) return null;
   const result = await readTextLimitedWithReason(joinOs(ctx.root, rel));
   if ('text' in result) return result.text;
-  note(ctx, `Skipped ${safeText(rel)}: ${SKIP_REASON[result.skipped]}.`);
+  note(ctx, `Skipped ${safeText(rel, PATH_SHOWN_MAX)}: ${SKIP_REASON[result.skipped]}.`);
   return null;
 }
 
@@ -84,7 +84,7 @@ async function readStructured(ctx: Ctx, rel: string, parse: (text: string) => un
   try {
     return asObj(parse(text));
   } catch {
-    note(ctx, `Skipped ${safeText(rel)}: it could not be parsed.`);
+    note(ctx, `Skipped ${safeText(rel, PATH_SHOWN_MAX)}: it could not be parsed.`);
     return null;
   }
 }

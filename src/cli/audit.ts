@@ -21,7 +21,7 @@ import { resolve } from 'node:path';
 import type { Octokit } from '@octokit/rest';
 import { checkOllamaModelRunsThere } from '../ai/ollama.js';
 import { AiError, makeProvider } from '../ai/provider.js';
-import { bundleCode, chooseSecretScanner, scrubKnownValues, SecretScanError, type SecretScanner, type SecretScannerName } from '../ai/redact.js';
+import { bundleCode, chooseSecretScanner, scrubKnownValues, SecretScanError, type ScanFound, type SecretScanner, type SecretScannerName } from '../ai/redact.js';
 import { countingSummary } from '../audit/consent-token.js';
 import { writeOutFile, OutFileError } from '../audit/out-file.js';
 import { addAiSuggestions, buildAudit, buildLocalAudit, needsRequestBytes, type AuditReport } from '../audit/model.js';
@@ -166,8 +166,8 @@ export async function audit(io: CliIO, flags: AuditFlags): Promise<number> {
     if (reviewedProblem !== null) r = { ...r, warnings: [{ text: reviewedUnavailableWarning(reviewedProblem) }, ...r.warnings] };
 
     // 6. --ai: consent first (default No); only a yes gives the token the AI step requires
-    // P40: the names the secret scan flagged, masked in the whole report below (the plain-audit parts too)
-    const hiddenNames = new Set<string>();
+    // P40/P45: what the secret scan found, masked in the whole report below (the plain-audit parts too)
+    let found: ScanFound | undefined;
     if (ai !== null) {
       const nullRows = r.wouldAdd.filter((w) => w.tool === null).length;
       const est = estimateAuditAi(ai.provider, nullRows + EXTRA_NEEDS_MARGIN, needsRequestBytes({ ...r, aiBundle: { ...r.aiBundle, bytes: counted.bytes } }, knownValues));
@@ -184,13 +184,13 @@ export async function audit(io: CliIO, flags: AuditFlags): Promise<number> {
       } else {
         r = await addAiSuggestions(r, dir, {
           ai: ai.provider, gh: github.gh, memory: await openMemory(), fetch: io.fetch ?? globalThis.fetch, reviewed, bar: ai.bar,
-          budget: clock.budget, now: Date.now, knownValues: [...knownValues], anonymous, capUsd: est.capUsd, consent, hiddenNames,
+          budget: clock.budget, now: Date.now, knownValues: [...knownValues], anonymous, capUsd: est.capUsd, consent, onScanFound: (f) => { found = f; },
         });
       }
     }
 
     // 7. the report
-    const opts: RenderOptions = { knownValues, hiddenNames: [...hiddenNames] };
+    const opts: RenderOptions = { knownValues, ...(found === undefined ? {} : { found }) };
     say(flags.json ? renderJson(r, opts) : renderTerminal(r, opts));
     if (flags.out !== undefined) {
       try {

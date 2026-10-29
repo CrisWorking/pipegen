@@ -7,7 +7,7 @@ import { tsupOptions } from '../tsup.config.js';
 import { afterEach, describe, expect, it } from 'vitest';
 import {
   bundleCode, bundleText, EXCLUDED_PATTERNS, SCAN_CHUNK_SAFE_BYTES, SecretScanError, SecretScanRequiredError, secretScanArgv, secretScanConfigPath,
-  isBinary, redact, scrubKnownValues, type CodeBundle,
+  encodedSpans, isBinary, NOTHING_FOUND, redact, scrubKnownValues, type CodeBundle,
 } from '../src/ai/redact.js';
 import { skippedByDefaultPaths } from '../src/ai/secret-scan-config.js';
 import { isBinary as limitsIsBinary } from '../src/read/limits.js';
@@ -287,7 +287,11 @@ describe('bundle: gitleaks pass', () => {
     // line and its canary (ruling P34)
     const unCanaried = (t: string) => t.replace(/\n\npipegen-canary-[0-9a-f]{32}\n$/, '');
     expect(scannedNames.map((f) => unCanaried(rec.files[f])).sort()).toEqual(b.files.map((f) => `\n${f.content.replace(/\n$/, '')}`).sort());
-    expect(unCanaried(rec.files['paths.txt']).split('\n').slice(1).sort()).toEqual(paths(b));
+    const listed = unCanaried(rec.files['paths.txt']).split('\n').slice(1).map((l) => l.split(' ')[0] as string);
+    expect(listed.slice(0, b.files.length).sort()).toEqual(paths(b));
+    // P45: then every other listed name the audit report can print (excluded files such as .env and the repo's own
+    // scanner configs too), so a secret in any name is found
+    expect(listed).toEqual(expect.arrayContaining(['.env', '.gitleaks.toml', '.gitleaksignore']));
     // what gitleaks scanned was already redacted
     const scanned = Object.values(rec.files).join('\n');
     for (const v of values) expect(scanned).not.toContain(v);
@@ -402,10 +406,9 @@ describe('bundle: gitleaks pass', () => {
   });
 
   it('bundle: a file list with a late format marker (paths.txt would be skipped) → SecretScanError, nothing sent', async () => {
-    // "\n" + two shown paths: the second one's "ustar" lands at byte 257 of paths.txt as written
+    // "\n" + one shown path: its "ustar" lands at byte 257 of paths.txt as written (1 + 256 characters before it)
     const dir = makeTempDir();
-    writeIn(dir, `src/${'a'.repeat(200)}`, 'x\n');
-    writeIn(dir, `src/${'b'.repeat(47)}ustar.ts`, 'y\n');
+    writeIn(dir, `src/${'a'.repeat(100)}/${'b'.repeat(151)}ustar.ts`, 'y\n');
     for (const scanner of [betterleaksAt, gitleaksAt]) {
       await expect(bundleCode(dir, scanWith(scanner(makeStub(CLEAN).bin))), scanner.name).rejects.toThrow(/file list has a binary-format marker/);
     }
@@ -749,11 +752,14 @@ describe('bundle: scan canaries (ruling P34)', () => {
       const rec = stub.record();
       // scanned as it is (P37: no neutralising, so no rule loses its word boundary)
       expect(rec.files[nameOf(rec.files, 'const g')], at.name).toContain(`"pipegen-canary-SG.x";\n// PIPEGEN-CANARY-${hex}\n`);
-      expect(rec.files['paths.txt'], at.name).toContain(`\npipegen-canary-${hex}\n`);
-      // the foreign marker in src/d.ts leaves it out; the canary-named file is left out as a flagged name
+      // P45: a file-list line is the name plus its parts after each separator, so a name can never be a whole
+      // canary-shaped line (it can't pose as pipegen's own marker)
+      expect(rec.files['paths.txt'], at.name).toContain(`\npipegen-canary-${hex} canary-${hex} ${hex}\n`);
+      expect(rec.files['paths.txt'], at.name).not.toContain(`\npipegen-canary-${hex}\n`);
+      // the foreign marker in src/d.ts leaves it out; its value is then found in the canary-named file's path too
       expect(paths(b), at.name).toEqual(['src/a.ts', 'src/b.ts', 'src/c.ts', 'src/g.ts']);
-      expect(b.notes.join('\n'), at.name).toContain(`Left out because ${at('/x').name} reported a check marker in them that pipegen did not write there: src/d.ts.`);
       expect(b.notes.join('\n'), at.name).toContain(`Left out 1 file whose path ${at('/x').name} flagged as secret-like (names not shown).`);
+      expect(b.notes.join('\n'), at.name).toContain(`Left out because ${at('/x').name} reported a check marker in them that pipegen did not write there: src/d.ts.`);
       expect(b.files.find((f) => f.path === 'src/g.ts')?.content, at.name).toBe(`export const g = "pipegen-canary-SG.x";\n// PIPEGEN-CANARY-${hex}\n`);
     }
   });
@@ -850,7 +856,7 @@ describe('bundle: scan canaries (ruling P34)', () => {
     }
   });
 
-  it('P40: a base64-encoded secret as a file name, flagged by its decoded value, is in hiddenNames (both scanners); none without the scan', async () => {
+  it('P40/P45: a base64-encoded secret as a file name, flagged by its decoded value, is in found (name, decoded and encoded value; both scanners); nothing without the scan', async () => {
     const decoded = 'decoded' + '-name-' + 'secret-5113';
     const encoded = Buffer.from(decoded).toString('base64').replace(/=+$/, '');
     const dir = makeTempDir();
@@ -860,11 +866,32 @@ describe('bundle: scan canaries (ruling P34)', () => {
       const stub = makeStub(`writeReport(JSON.stringify(findingsFor(${JSON.stringify(encoded)}).filter((x) => /paths/.test(x.File)).map((x) => ({ ...x, Match: ${JSON.stringify(decoded)}, ['Sec' + 'ret']: ${JSON.stringify(decoded)} })))); process.exit(1);`);
       const b = await bundleCode(dir, scanWith(at(stub.bin)));
       expect(paths(b), at.name).toEqual(['src/ok.ts']);
-      expect(b.hiddenNames, at.name).toEqual([`src/${encoded}.ts`]);
-      expect(Object.isFrozen(b.hiddenNames)).toBe(true);
+      expect(b.found.names, at.name).toEqual([`src/${encoded}.ts`]);
+      // P45: the decoded value, and the encoded text located in the name, are values the report masks everywhere
+      expect(b.found.values, at.name).toEqual([decoded, encoded].sort());
+      expect(Object.isFrozen(b.found) && Object.isFrozen(b.found.names) && Object.isFrozen(b.found.values)).toBe(true);
       expect(bundleText(b)).not.toContain(encoded);
     }
-    expect((await bundleCode(dir)).hiddenNames).toEqual([]);
+    expect((await bundleCode(dir)).found).toEqual(NOTHING_FOUND);
+  });
+
+  it('P45: encodedSpans finds the encoded text of a decoded value in a name (base64, base64url, across a slash, hex, percent), or nothing', () => {
+    const value = 'decoded' + '-span-' + 'value-8812';
+    const b64 = Buffer.from(value).toString('base64').replace(/=+$/, '');
+    expect(encodedSpans(`config/${b64}.env`, value)).toEqual([b64]);
+    expect(encodedSpans(`a/${Buffer.from(value).toString('base64url')}`, value)).toEqual([Buffer.from(value).toString('base64url')]);
+    // a standard base64 text holding `/`: as a path it reads as folders, and the whole text is still found
+    let pad = '';
+    while (!Buffer.from(pad + value).toString('base64').includes('/')) pad += '?';
+    const slashed = Buffer.from(pad + value).toString('base64').replace(/=+$/, '');
+    const hits = encodedSpans(`x/${slashed}.ts`, value);
+    expect(hits.length).toBeGreaterThan(0);
+    for (const h of hits) expect(slashed.includes(h) && Buffer.from(h, 'base64').toString('utf8').includes(value), h).toBe(true);
+    const hex = Buffer.from(value).toString('hex');
+    expect(encodedSpans(`h/${hex}.txt`, value)).toEqual([hex]);
+    expect(encodedSpans(`p/${encodeURIComponent(value).replaceAll('-', '%2D')}.txt`, value)).toEqual([encodeURIComponent(value).replaceAll('-', '%2D')]);
+    expect(encodedSpans('src/plain-name.ts', value)).toEqual([]);
+    expect(encodedSpans(`x/${'A/'.repeat(5000)}`, value)).toEqual([]); // bounded on a hostile name
   });
 
   it('P36: a long file list is scanned in pieces under the limit, each with its own canary, all required; findings map to the right path', async () => {
@@ -878,15 +905,17 @@ describe('bundle: scan canaries (ruling P34)', () => {
       const b = await bundleCode(dir, scanWith(at(stub.bin), { maxBytes: 10_000_000 }));
       const rec = stub.record();
       const pieces = Object.keys(rec.files).filter((f) => /^paths\d*\.txt$/.test(f)).sort();
-      expect(pieces, at.name).toEqual(['paths.txt', 'paths2.txt']);
+      // each line is the name plus its parts after each separator (P45), so the list takes several pieces
+      expect(pieces.length, at.name).toBeGreaterThanOrEqual(2);
       for (const p of pieces) {
         expect(Buffer.byteLength(rec.files[p]), `${at.name} ${p}`).toBeLessThanOrEqual(SCAN_CHUNK_SAFE_BYTES);
         expect(rec.files[p], `${at.name} ${p}`).toMatch(/\n\npipegen-canary-[0-9a-f]{32}\n$/);
       }
       // every path is in exactly one piece, in order
-      const listed = pieces.flatMap((p) => rec.files[p].replace(/\n\npipegen-canary-[0-9a-f]{32}\n$/, '').split('\n').slice(1));
+      const order = (p: string) => (p === 'paths.txt' ? 1 : Number(/\d+/.exec(p)?.[0]));
+      const listed = [...pieces].sort((x, y) => order(x) - order(y)).flatMap((p) => rec.files[p].replace(/\n\npipegen-canary-[0-9a-f]{32}\n$/, '').split('\n').slice(1).map((l) => l.split(' ')[0] as string));
       expect(listed, at.name).toEqual(b.files.map((f) => f.path).concat(`src/zz-${flaggedName}.ts`).sort());
-      // the finding on a line of paths2.txt left out that one file only
+      // the finding on a line of a later piece left out that one file only
       expect(b.files, at.name).toHaveLength(n);
       expect(bundleText(b), at.name).not.toContain(flaggedName);
       // the second piece's canary missing → SecretScanError

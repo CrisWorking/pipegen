@@ -986,3 +986,69 @@ describe('pipegen audit --ai (P40: report-wide masking of scanner-flagged names)
     }
   });
 });
+
+describe('pipegen audit --ai (P45: every printable name is scanned; what the scan found is masked in the whole report)', () => {
+  /** --ai with the stub scanner (`body`), --json once and terminal once, each with --out; every output text. */
+  async function runAi(dir: string, body: string): Promise<{ where: string; text: string }[]> {
+    const work = makeTempDir();
+    const outs: { where: string; text: string }[] = [];
+    for (const json of [false, true]) {
+      const { env } = aiSetup(undefined, undefined, body);
+      const file = json ? 'j.md' : 't.md';
+      const r = await audit(['audit', '--ai', '--dir', dir, '--out', file, ...(json ? ['--json'] : [])], { cwd: work, env, prompt: prompter(true) });
+      expect(r.code, r.err).toBe(0);
+      expect(oneLine(r.out), 'the --ai scan ran').toMatch(/checked the bundle/);
+      outs.push({ where: `${json ? 'json' : 'terminal'} stdout`, text: r.out }, { where: 'stderr', text: r.err }, { where: `${file}`, text: readFileSync(join(work, file), 'utf8') });
+    }
+    return outs;
+  }
+  /** The stub reports `decoded` on every file-list line that holds `encoded` (as the real scanners report a base64 name). */
+  const decodedOn = (encoded: string, decoded: string) => `writeReport(JSON.stringify(findingsFor(${JSON.stringify(encoded)}).filter((x) => /paths/.test(x.File)).map((x) => ({ ...x, Match: ${JSON.stringify(decoded)}, ['Sec' + 'ret']: ${JSON.stringify(decoded)} })))); process.exit(1);`;
+  const encodedPair = () => {
+    const decoded = ['decoded', 'name', 'secret', randomBytes(6).toString('hex')].join('-');
+    return { decoded, encoded: Buffer.from(decoded).toString('base64').replace(/=+$/, '') };
+  };
+  const noLeak = (outs: { where: string; text: string }[], ...values: string[]) => {
+    for (const { where, text } of outs) for (const v of values) expect(text, `${where} holds ${v.slice(0, 8)}…`).not.toContain(v);
+  };
+
+  it('P45 repro A: the same encoded secret in an excluded file name (config/<b64>.env) is masked too', async () => {
+    const { decoded, encoded } = encodedPair();
+    const dir = repo({ [`src/${encoded}.ts`]: `export const t = "${fake.githubPat()}";\n`, [`config/${encoded}.env`]: `T=${fake.githubPat()}\n` });
+    const outs = await runAi(dir, decodedOn(encoded, decoded));
+    noLeak(outs, encoded, decoded);
+    // the .env name is now in the scanned file list, so the scanner flags it and the report shows it masked whole
+    const j = JSON.parse(outs.find((o) => o.where === 'json stdout')?.text ?? '{}') as AuditReport;
+    expect(j.secretsInTree.map((s) => s.file).filter((f) => f === '(a file whose name looks like a secret)')).toHaveLength(2);
+  });
+
+  it('P45 repro B: a skipped binary with the encoded secret in its name (assets/<b64>.bin) is masked in the notes', async () => {
+    const { decoded, encoded } = encodedPair();
+    const dir = repo({ [`src/${encoded}.ts`]: 'export const a = 1;\n' });
+    writeIn(dir, `assets/${encoded}.bin`, '');
+    writeFileSync(join(dir, `assets/${encoded}.bin`), Buffer.from([0x50, 0, 0x51]));
+    const outs = await runAi(dir, decodedOn(encoded, decoded));
+    noLeak(outs, encoded, decoded);
+  });
+
+  it('P45 repro C: a 12-character flagged value used as a top folder is masked (top folders, notes, every output)', async () => {
+    const value = 'Zq' + randomBytes(5).toString('hex');
+    expect(value).toHaveLength(12);
+    const dir = repo({ [`${value}/main.ts`]: 'export const m = 1;\n' });
+    const body = `writeReport(JSON.stringify(findingsFor(${JSON.stringify(value)}).filter((x) => /paths/.test(x.File)))); process.exit(1);`;
+    const outs = await runAi(dir, body);
+    noLeak(outs, value);
+  });
+
+  it('P45 repro D: a path over 300 characters with the encoded secret across the old 300-character cut leaks no part of it', async () => {
+    const { decoded, encoded } = encodedPair();
+    const deep = `deep/${'d'.repeat(140)}/${'e'.repeat(140)}`; // 286 characters, so the name runs across 300
+    const name = `${deep}/${encoded}.bin`;
+    expect(name.length).toBeGreaterThan(300);
+    const dir = repo({ [`src/${encoded}.ts`]: 'export const a = 1;\n' });
+    writeIn(dir, name, '');
+    writeFileSync(join(dir, name), Buffer.from([0x50, 0, 0x51]));
+    const outs = await runAi(dir, decodedOn(encoded, decoded));
+    noLeak(outs, encoded, decoded, encoded.slice(0, 10));
+  });
+});

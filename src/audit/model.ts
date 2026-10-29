@@ -31,7 +31,7 @@ import { ollamaHostOf } from '../ai/ollama.js';
 import { AiError, COST_CAP_MESSAGE, refusalFallbackNoteFor, type AiErrorKind } from '../ai/provider.js';
 import {
   bundleCode, bundleTopFolders, COUNTING_ONLY_NOTE, countedBundleRoot, EXCLUDED_PATTERNS, findSecretLike, isExcludedPath, redact, SECRET_SCANNER_ENV, SecretScanError, type SecretScanner, type SecretScannerName,
-  HIDDEN_NAME, scrubKnownValues, type CodeBundle,
+  HIDDEN_NAME, scrubKnownValues, type CodeBundle, type ScanFound,
 } from '../ai/redact.js';
 import { needLanguage, suggestTools } from '../engine/discover.js';
 import type { RateBudget } from '../engine/github-rate.js';
@@ -692,10 +692,10 @@ export interface AiSuggestDeps {
    */
   consent: ConsentToken;
   /**
-   * P40: filled with the secret-scanned bundle's hiddenNames (the names the scan made secret). The caller passes them
-   * to the renderer (RenderOptions.hiddenNames), so a flagged name is masked in the whole report, plain-audit parts too.
+   * P40/P45: called with the secret-scanned bundle's `found` (flagged names, found values). The caller passes it to the
+   * renderer (RenderOptions.found), so what the scan found is masked in the whole report, plain-audit parts too.
    */
-  hiddenNames?: Set<string>;
+  onScanFound?: (found: ScanFound) => void;
 }
 
 const AI_NOTE = {
@@ -934,7 +934,7 @@ export async function addAiSuggestions(r: AuditReport, dir: string, deps: AiSugg
     }
     // only the files the consent screen counted (review I1): the checked bundle can only shrink
     bundle = await bundleCode(dir, { secretScanner: scanner, knownValues: deps.knownValues, onlyPaths: counted.paths() });
-    for (const n of bundle.hiddenNames) deps.hiddenNames?.add(n);
+    deps.onScanFound?.(bundle.found);
   } catch (e) {
     if (!(e instanceof PinnedBinaryError || e instanceof SecretScanError)) throw e;
     notes.add(AI_NOTE.noSecretScan(named.name, e.message));

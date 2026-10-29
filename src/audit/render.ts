@@ -24,7 +24,7 @@
 // in a Markdown code block, after isOwnCommand() confirms they are exactly what the model builds (no repo data).
 // Arrays whose size depends on the repo are appended with loops, never spread into a call (a spread of ~100k lines
 // overflows the stack).
-import { excludedSummaryLines } from '../ai/redact.js';
+import { excludedSummaryLines, type ScanFound } from '../ai/redact.js';
 import { SCHEDULED_CATEGORIES } from '../engine/need-ids.js';
 import { ACTIVITY_CAPPED_PREFIX } from '../estimate/estimate.js';
 import type { RepoToolStep } from '../engine/reviewed.js';
@@ -46,10 +46,10 @@ export interface RenderOptions {
    */
   knownValues: readonly string[];
   /**
-   * P40: in an `audit --ai` run, the repo paths the secret scan flagged (the checked bundle's hiddenNames). Masked in
-   * every output string, the plain-audit sections too; never printed.
+   * P40/P45: in an `audit --ai` run, what the secret scan found (the checked bundle's `found`: flagged names, found
+   * values). Masked in every output string, the plain-audit sections and JSON keys too, before any cut; never printed.
    */
-  hiddenNames?: readonly string[];
+  found?: ScanFound;
   /** Clock for the Markdown report's date; default Date.now. */
   now?: () => number;
 }
@@ -160,7 +160,7 @@ interface Ctx {
 }
 
 function ctxFor(target: OutputTarget, opts: RenderOptions, mergeLock: boolean, services: AuditReport['profile']['services'] = []): Ctx {
-  const clean = makeSafeOutput(opts.knownValues, opts.hiddenNames);
+  const clean = makeSafeOutput(opts.knownValues, opts.found);
   return {
     target,
     mergeLock,
@@ -699,7 +699,7 @@ function deepClean(v: unknown, key: string, depth: number, own: boolean, clean: 
  */
 export function renderJson(r: AuditReport, opts: RenderOptions): string {
   const slim = { ...r, wouldAdd: r.wouldAdd.map((w) => ({ ...w, tool: slimTool(w.tool), also: w.also.map(slimTool) })), cantSee: CANT_SEE };
-  return JSON.stringify(deepClean(slim, '', 0, false, makeSafeOutput(opts.knownValues, opts.hiddenNames), new Set()), null, 2);
+  return JSON.stringify(deepClean(slim, '', 0, false, makeSafeOutput(opts.knownValues, opts.found), new Set()), null, 2);
 }
 
 // ---------- the local-only report (GitHub not read; the `inspect` R10 rule) ----------
@@ -734,5 +734,5 @@ export function renderLocalTerminal(l: LocalAudit, opts: RenderOptions): string 
 /** The local-only report as JSON (`--json`): `github: "not read"` and the parts read from disk, every string cleaned. */
 export function renderLocalJson(l: LocalAudit, opts: RenderOptions): string {
   const doc = { github: 'not read', profile: l.profile, secretsInTree: l.secretsInTree, aiBundle: l.aiBundle, warnings: l.warnings, notes: l.notes };
-  return JSON.stringify(deepClean(doc, '', 0, false, makeSafeOutput(opts.knownValues, opts.hiddenNames), new Set()), null, 2);
+  return JSON.stringify(deepClean(doc, '', 0, false, makeSafeOutput(opts.knownValues, opts.found), new Set()), null, 2);
 }

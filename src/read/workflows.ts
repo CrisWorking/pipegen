@@ -1,7 +1,7 @@
 import { lstatSync } from 'node:fs';
 import { join } from 'node:path';
 import type { ExistingWorkflow, RepoProfile } from '../types.js';
-import { safeText } from '../util/safe-text.js';
+import { PATH_SHOWN_MAX, safeText } from '../util/safe-text.js';
 import { SKIP_REASON, listFiles, parseYamlLimited, readTextLimitedWithReason, regexLines, regexSafe } from './limits.js';
 import { NAME_RE, asObj } from './manifest.js';
 
@@ -163,19 +163,19 @@ export async function readWorkflows(dir: string, files?: string[], notes: string
   const out: ExistingWorkflow[] = [];
   for (const path of all.slice(0, MAX_WORKFLOWS)) {
     if (safeText(path) !== path) {
-      note(`Skipped ${safeText(path)}: its file name has control or invisible characters, or is too long.`);
+      note(`Skipped ${safeText(path, PATH_SHOWN_MAX)}: its file name has control or invisible characters, or is too long.`);
       continue;
     }
     const read = await readTextLimitedWithReason(join(dir, path));
     if (!('text' in read)) {
-      note(`Skipped ${safeText(path)}: ${SKIP_REASON[read.skipped]}.`);
+      note(`Skipped ${safeText(path, PATH_SHOWN_MAX)}: ${SKIP_REASON[read.skipped]}.`);
       continue;
     }
     let doc: Record<string, unknown>;
     try {
       doc = asObj(parseYamlLimited(read.text));
     } catch {
-      note(`Skipped ${safeText(path)}: it could not be parsed.`);
+      note(`Skipped ${safeText(path, PATH_SHOWN_MAX)}: it could not be parsed.`);
       continue;
     }
     out.push({

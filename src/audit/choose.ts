@@ -19,7 +19,7 @@ import { skippedChecks, type SkippedCheck } from '../engine/needs.js';
 import { neverImage, neverListed, reviewedFor, type RepoToolStep, type WouldAddTool } from '../engine/reviewed.js';
 import { emptyServiceQuality } from '../read/quality.js';
 import type { Capabilities, Need, NeedCategory, RepoProfile, ReviewedTool, Service } from '../types.js';
-import { safeText } from '../util/safe-text.js';
+import { PATH_SHOWN_MAX, safeText } from '../util/safe-text.js';
 import type { Coverage } from './coverage.js';
 
 export interface Choice {
@@ -208,7 +208,7 @@ function licencesRule(c: Ctx): Choice {
 
 function apiDastRule(c: Ctx): Choice {
   const spec = c.q.apiSpec;
-  const where = spec === null ? 'the API spec' : spec.kind === 'file' ? safeText(spec.path) : `served by ${spec.by === 'fastapi' ? 'FastAPI' : 'NestJS'}`;
+  const where = spec === null ? 'the API spec' : spec.kind === 'file' ? safeText(spec.path, PATH_SHOWN_MAX) : `served by ${spec.by === 'fastapi' ? 'FastAPI' : 'NestJS'}`;
   return reviewed(c, T.schemathesis, `Schemathesis: tests the API from its spec (${where})`);
 }
 
