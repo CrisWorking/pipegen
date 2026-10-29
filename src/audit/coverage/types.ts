@@ -3,7 +3,7 @@
 import type { Capabilities, Layer, RepoProfile } from '../../types.js';
 import type { ComposeModel, DockerLoad } from './docker.js';
 import type { ScriptClass, Targets } from './scripts.js';
-import type { EnvGate } from './settings.js';
+import type { EnvGate, SkipSet } from './settings.js';
 import type { ToolSignature } from './signatures.js';
 import type { Reader } from './walk.js';
 export type { Obj } from '../../read/manifest.js';
@@ -101,6 +101,8 @@ export interface Found {
   pathArgs?: readonly string[];
   /** P57 (C4): the pre-commit hook id this run comes from (readPrecommitConfig), so SKIP / PREK_SKIP can name it. */
   hookId?: string;
+  /** P57 (C4): a CI pre-commit/prek run's SKIP set (gated): the hooks it names are partial, an unreadable one makes all unknown. */
+  hookSkip?: SkipSet;
 }
 /** Fix round 1 (P8): the softEnv names set in a job (`all`: an `env:` given as one expression could set any). */
 export interface JobEnv { all: boolean; names: ReadonlySet<string>; files: ReadonlySet<string> }
@@ -126,6 +128,8 @@ export interface Hit {
   /** P57 (C1): Found.langs and Found.pathArgs. */
   langs?: readonly string[];
   pathArgs?: readonly string[];
+  /** P57 (C4): Found.hookSkip. */
+  hookSkip?: SkipSet;
 }
 
 export interface Budget { visits: number; bytes: number; truncated: boolean }
@@ -156,6 +160,8 @@ export interface Ctx {
   releaseJobs: { start: number; first: number; where: string }[];
   releaseUnread: boolean;
   precommitConfig?: Promise<{ readable: boolean; found: Found[] }>;
+  /** P57 (C4): prek.toml, which prek reads before .pre-commit-config.yaml: absent, unreadable, or its hooks. */
+  prekConfig?: Promise<'absent' | 'unreadable' | Found[]>;
   /** P55 (batch B): each compose file set's services, worked out once (docker.ts). */
   composeMemo: Map<string, ComposeModel>;
   /** P55 (batch B): each Dockerfile's parse, worked out once (docker.ts). */

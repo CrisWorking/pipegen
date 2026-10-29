@@ -1,13 +1,14 @@
 // Coverage mapper (see ../coverage.ts for the rules): git hooks (pre-commit, husky, lefthook) and CI `pre-commit run`.
+import { parse as parseToml } from 'smol-toml';
 import { regexSafe } from '../../read/limits.js';
 import { asObj } from '../../read/manifest.js';
 import { MAX_FLAG_WORDS, MAX_HITS, MAX_HOOKS } from './bounds.js';
 import { HOOK_FILE } from './decide.js';
 import { cut, firstSet, list, strs, workingDir } from './helpers.js';
 import { resolveScripts } from './scripts.js';
-import { MAY_NOT_RUN, commandReason, configWhy, flagGiven, flagsAllow, foundOf, gateOf, gated, softEnvSet } from './settings.js';
+import { MAY_NOT_RUN, UNKNOWN_PREFIX, commandReason, configWhy, flagGiven, flagsAllow, foundOf, gateOf, gated, softEnvSet } from './settings.js';
 import { DEFAULT_SHELL, scanShell, type ShellMode } from './shell.js';
-import { hookRepo, hookRepoKey } from './signatures.js';
+import { PREK_ID, hookRepo, hookRepoKey } from './signatures.js';
 import { tokenize, type Tk } from './tokenize.js';
 import type { Ctx, Found, Hit, Manager, Obj, Reason } from './types.js';
 
@@ -69,6 +70,36 @@ function readPrecommitConfig(ctx: Ctx): Promise<{ readable: boolean; found: Foun
   ctx.precommitConfig ??= (async () => {
     const r = await ctx.read.yaml(HOOK_FILE['pre-commit']);
     if ('fail' in r) return { readable: r.fail === 'missing', found: [] };
+    return { readable: true, found: await hookConfigRuns(ctx, r.ok) };
+  })();
+  return ctx.precommitConfig;
+}
+
+/**
+ * P57 (C4): prek reads prek.toml before .pre-commit-config.yaml ("the first in the order above" wins,
+ * https://github.com/j178/prek docs/configuration.md): when it exists, a CI prek run runs its hooks, read with the same
+ * rules (its keys are the YAML's). 'unreadable' (a symbolic link, too large, not valid TOML): pipegen can't tell which
+ * hooks run, and never credits the YAML's.
+ */
+function readPrekConfig(ctx: Ctx): Promise<'absent' | 'unreadable' | Found[]> {
+  ctx.prekConfig ??= (async () => {
+    const t = await ctx.read.text('prek.toml');
+    if ('fail' in t) return t.fail === 'missing' ? 'absent' : 'unreadable';
+    let doc: unknown;
+    try {
+      doc = parseToml(t.ok);
+    } catch {
+      return 'unreadable';
+    }
+    return hookConfigRuns(ctx, asObj(doc));
+  })();
+  return ctx.prekConfig;
+}
+
+/** The tools a pre-commit config (`.pre-commit-config.yaml`, or prek.toml with the same keys) runs. */
+async function hookConfigRuns(ctx: Ctx, config: Obj): Promise<Found[]> {
+  {
+    const r = { ok: config };
     const defaultStages = strs(r.ok.default_stages);
     const isSet = (o: Obj, key: string) => key in o && o[key] !== null && o[key] !== undefined;
     const topFiltered = isSet(r.ok, 'files') || isSet(r.ok, 'exclude');
@@ -124,9 +155,8 @@ function readPrecommitConfig(ctx: Ctx): Promise<{ readable: boolean; found: Foun
         found.push(...hookFound);
       }
     }
-    return { readable: true, found: await resolveScripts(ctx, found) };
-  })();
-  return ctx.precommitConfig;
+    return resolveScripts(ctx, found);
+  }
 }
 
 export async function readHooks(ctx: Ctx): Promise<Hooks> {
@@ -180,35 +210,67 @@ const carried = (f: Found): string[] => {
   if (FORMATTER_HOOKS.has(f.by) && (f.formats === true || f.reason !== null) && !out.includes('format')) out.push('format');
   return out;
 };
-export async function hookRunHits(ctx: Ctx): Promise<void> {
-  const reps = new Map<string, Hit>();
-  for (const h of ctx.hits) {
-    const key = `${h.fit.push ? 1 : 0}${h.fit.merge ? 1 : 0}${h.fit.deploy ? 1 : 0}\u0000${h.reason ?? ''}\u0000${h.hookRun === 'changed' ? 'changed' : ''}`;
-    if ((h.hookRun === true || h.hookRun === 'changed') && !reps.has(key)) reps.set(key, h);
-  }
-  if (reps.size === 0) return;
+/** P57 (C4): the carried tools of one config: one per (tool, reason, hook id), each with the categories it carries. */
+function carriedTools(found: readonly Found[]): { f: Found; categories: string[] }[] {
   const tools = new Map<string, { f: Found; categories: string[] }>();
-  for (const f of (await readPrecommitConfig(ctx)).found) {
-    const key = `${f.by}\u0000${f.reason ?? ''}`;
+  for (const f of found) {
+    const key = `${f.by}\u0000${f.reason ?? ''}\u0000${f.hookId ?? ''}`;
     const categories = carried(f);
     // a hook set up for another stage doesn't run in `pre-commit run` (its default stage is pre-commit)
     if (categories.length > 0 && f.reason !== 'stage' && !tools.has(key)) tools.set(key, { f, categories });
   }
+  return [...tools.values()];
+}
+const skipKey = (h: Hit) => (h.hookSkip === undefined ? '' : `${h.hookSkip.unknown ? '?' : ''}${[...h.hookSkip.ids].sort().join(',')}`);
+
+export async function hookRunHits(ctx: Ctx): Promise<void> {
+  const reps = new Map<string, Hit>();
+  for (const h of ctx.hits) {
+    const key = `${h.by ?? ''}\u0000${h.fit.push ? 1 : 0}${h.fit.merge ? 1 : 0}${h.fit.deploy ? 1 : 0}\u0000${h.reason ?? ''}\u0000${h.hookRun === 'changed' ? 'changed' : ''}\u0000${skipKey(h)}`;
+    if ((h.hookRun === true || h.hookRun === 'changed') && !reps.has(key)) reps.set(key, h);
+  }
+  if (reps.size === 0) return;
+  const yamlTools = carriedTools((await readPrecommitConfig(ctx)).found);
   for (const rep of reps.values()) {
-    for (const { f: t, categories } of tools.values()) {
+    // P57 (C4): a prek run reads prek.toml first when there is one
+    const prek = rep.by === PREK_ID ? await readPrekConfig(ctx) : 'absent';
+    const file = prek === 'absent' ? HOOK_FILE['pre-commit'] : 'prek.toml';
+    const where = cut(`${rep.where} → ${file}`);
+    if (prek === 'unreadable') {
+      if (ctx.hits.length >= MAX_HITS) return void (ctx.budget.truncated = true);
+      ctx.hits.push({
+        opaque: false, categories: [...CARRIED].map((c) => `${UNKNOWN_PREFIX}${c}`), by: rep.by as string, subject: 'The prek run', dir: '.', reason: null,
+        partialWhy: "The prek run reads prek.toml before .pre-commit-config.yaml, and pipegen couldn't read prek.toml (a symbolic link, too large or not valid TOML), so it can't tell which hooks run.",
+        fit: rep.fit, where,
+      });
+      continue;
+    }
+    const tools = prek === 'absent' ? yamlTools : carriedTools(prek);
+    // the run's own SKIP reason says some hooks may not run; each hook's own row is lowered only when SKIP names it
+    const repReason = rep.reason === 'skip' ? null : rep.reason;
+    for (const { f: t, categories } of tools) {
       if (ctx.hits.length >= MAX_HITS) {
         ctx.budget.truncated = true;
         return;
       }
       const subject = `${t.subject} in the pre-commit hooks`;
+      if (rep.hookSkip?.unknown === true) {
+        ctx.hits.push({
+          opaque: false, categories: categories.map((c) => `${UNKNOWN_PREFIX}${c}`), by: t.by, subject, dir: '.', reason: null,
+          partialWhy: `${subject} runs unless SKIP or PREK_SKIP names its hook, and that variable is set to a value pipegen can't read here, so it can't tell whether it runs.`,
+          fit: rep.fit, where, ...(t.langs === undefined ? {} : { langs: t.langs }),
+        });
+        continue;
+      }
+      const skipped = t.hookId !== undefined && rep.hookSkip?.ids.has(t.hookId) === true;
       // fix round 1 (P8): a softEnv name set in the CI job reaches the hook's tool; its config files are looked for later
       const set = softEnvSet(t.softEnv, rep.jobEnv);
       // a run over changed files only is partial ('changed'), unless something already keeps the hook from running
-      const reason = rep.reason ?? t.reason ?? (rep.hookRun === 'changed' ? 'changed' : null);
+      const reason = repReason ?? t.reason ?? (skipped ? 'skip' : null) ?? (rep.hookRun === 'changed' ? 'changed' : null);
       const configured = set !== null && (reason === null || !MAY_NOT_RUN.has(reason));
       ctx.hits.push({
         opaque: false, categories, by: t.by, subject, dir: '.', reason: configured ? 'config' : reason,
-        ...(configured ? { partialWhy: configWhy(subject, set) } : {}), fit: rep.fit, where: cut(`${rep.where} → ${HOOK_FILE['pre-commit']}`),
+        ...(configured ? { partialWhy: configWhy(subject, set) } : {}), fit: rep.fit, where,
         ...(t.configFiles === undefined ? {} : { configFiles: t.configFiles }), ...(t.langs === undefined ? {} : { langs: t.langs }),
       });
     }

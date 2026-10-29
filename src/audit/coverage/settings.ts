@@ -5,7 +5,7 @@ import { TRIVY_GRAMMAR } from '../../engine/tool-grammar.js';
 import { regexSafe } from '../../read/limits.js';
 import { asObj } from '../../read/manifest.js';
 import { MAX_FLAG_WORDS, MAX_INPUT_KEYS, MAX_SPELLINGS } from './bounds.js';
-import { isHookRunner, type ToolSignature } from './signatures.js';
+import { PREK_ID, isHookRunner, type ToolSignature } from './signatures.js';
 import { tokenize } from './tokenize.js';
 import type { Found, JobEnv, Obj, Reason } from './types.js';
 
@@ -486,25 +486,58 @@ export function configTurnedOff(tool: ToolSignature, args: readonly string[]): b
  * NOX… pick envs or sessions (tox 4 reads TOX_<option>; TOXENV; NOXSESSION), SKIP skips pre-commit hooks
  * (https://pre-commit.com/#temporarily-disabling-hooks). An action that sets one through GITHUB_ENV isn't seen.
  */
+/**
+ * P57 (C4): the pre-commit hook ids a SKIP (or, for prek only, PREK_SKIP) variable names in a job: literal comma-separated
+ * ids; `unknown` when a value can't be read (an expression, a variable, a bare mention such as `unset SKIP` or a heredoc).
+ * pre-commit: https://pre-commit.com/#temporarily-disabling-hooks; prek: `--skip` "also accepts PREK_SKIP or SKIP".
+ */
+export interface SkipSet { ids: ReadonlySet<string>; unknown: boolean }
+const NO_SKIP: SkipSet = { ids: new Set(), unknown: false };
+const UNKNOWN_SKIP: SkipSet = { ids: new Set(), unknown: true };
+export const orSkip = (a: SkipSet, b: SkipSet): SkipSet =>
+  (b.ids.size === 0 && !b.unknown ? a : a.ids.size === 0 && !a.unknown ? b : { ids: new Set([...a.ids, ...b.ids]), unknown: a.unknown || b.unknown });
+export const skipsAny = (s: SkipSet) => s.unknown || s.ids.size > 0;
+/** A SKIP value from an `env:` map: literal ids, nothing (empty), or unknown. */
+function skipValue(v: unknown): SkipSet {
+  if (v === null || v === undefined || v === '') return NO_SKIP;
+  if (typeof v !== 'string' || v.length > 1000 || !/^[A-Za-z0-9_.,\s-]*$/.test(v)) return UNKNOWN_SKIP;
+  return { ids: new Set(v.split(',').map((x) => x.trim()).filter((x) => x !== '')), unknown: false };
+}
+/** Every mention of the variable `name` (as a whole word) in shell text: `NAME=ids` (optionally quoted) gives the ids; anything else is unknown. */
+function skipInText(text: string, name: 'SKIP' | 'PREK_SKIP'): SkipSet {
+  let out = NO_SKIP;
+  const re = name === 'SKIP' ? /(?<![A-Za-z0-9_])SKIP(?![A-Za-z0-9_])/g : /(?<![A-Za-z0-9_])PREK_SKIP(?![A-Za-z0-9_])/g;
+  for (let m = re.exec(text); m !== null; m = re.exec(text)) {
+    const after = text.slice(m.index + name.length, m.index + name.length + 300);
+    // "ids", 'ids', ids (then a word end), or nothing (then a word end); `"$X"`, `$X`, `$(…)` and the like are unknown
+    const v = after.startsWith('=') ? /^(?:"([A-Za-z0-9_.,-]*)"|'([A-Za-z0-9_.,-]*)'|([A-Za-z0-9_.,-]+)(?=$|[\s;|&)`>"'])|(?=$|[\s;|&)]))/.exec(after.slice(1)) : null;
+    out = orSkip(out, v === null ? UNKNOWN_SKIP : skipValue(v[1] ?? v[2] ?? v[3] ?? ''));
+    if (out.unknown) return out;
+  }
+  return out;
+}
+
 export interface EnvGate {
-  tox: boolean; nox: boolean; skip: boolean; npm: boolean; env: JobEnv;
+  tox: boolean; nox: boolean; npm: boolean; env: JobEnv;
+  /** P57 (C4): the hooks SKIP names (pre-commit and prek), and PREK_SKIP (prek only). */
+  skip: SkipSet; prekSkip: SkipSet;
   /** P57 (C3): COMPOSE_FILE, COMPOSE_PROFILES or COMPOSE_PATH_SEPARATOR may be set, so pipegen can't tell which compose files and services run. */
   compose: boolean;
 }
 const NO_ENV: JobEnv = { all: false, names: new Set(), files: new Set() };
-export const NO_GATE: EnvGate = { tox: false, nox: false, skip: false, npm: false, env: NO_ENV, compose: false };
-export const ALL_GATE: EnvGate = { tox: true, nox: true, skip: true, npm: true, env: { all: true, names: new Set(), files: new Set() }, compose: true };
+export const NO_GATE: EnvGate = { tox: false, nox: false, skip: NO_SKIP, prekSkip: NO_SKIP, npm: false, env: NO_ENV, compose: false };
+export const ALL_GATE: EnvGate = { tox: true, nox: true, skip: UNKNOWN_SKIP, prekSkip: UNKNOWN_SKIP, npm: true, env: { all: true, names: new Set(), files: new Set() }, compose: true };
 /**
  * Fix round 2 (ruling P9): a job with a step pipegen can't see into (an action from the owner's own account, a
  * `docker://` step, a local action that isn't composite) may set any variable through GITHUB_ENV: every softEnv name and
  * SKIP count as set.
  */
-export const OPAQUE_GATE: EnvGate = { tox: false, nox: false, skip: true, npm: false, env: { all: true, names: new Set(), files: new Set() }, compose: true };
+export const OPAQUE_GATE: EnvGate = { tox: false, nox: false, skip: UNKNOWN_SKIP, prekSkip: UNKNOWN_SKIP, npm: false, env: { all: true, names: new Set(), files: new Set() }, compose: true };
 const emptyEnv = (e: JobEnv) => !e.all && e.names.size === 0 && e.files.size === 0;
 const orEnv = (a: JobEnv, b: JobEnv): JobEnv =>
   (emptyEnv(b) ? a : emptyEnv(a) ? b : { all: a.all || b.all, names: new Set([...a.names, ...b.names]), files: new Set([...a.files, ...b.files]) });
 export const orGate = (a: EnvGate, b: EnvGate): EnvGate =>
-  ({ tox: a.tox || b.tox, nox: a.nox || b.nox, skip: a.skip || b.skip, npm: a.npm || b.npm, env: orEnv(a.env, b.env), compose: a.compose || b.compose });
+  ({ tox: a.tox || b.tox, nox: a.nox || b.nox, skip: orSkip(a.skip, b.skip), prekSkip: orSkip(a.prekSkip, b.prekSkip), npm: a.npm || b.npm, env: orEnv(a.env, b.env), compose: a.compose || b.compose });
 /**
  * Fix round 1 (P8): `softNames` (every signature's softEnv) are looked for too: as an `env:` key (any letter case) or
  * in the run text. Fix round 2 (N1b, N1c): the bare name, as SKIP is, so a GITHUB_ENV heredoc (`NAME<<EOF`) or a
@@ -517,13 +550,21 @@ export function gateOf(texts: readonly string[], envs: readonly unknown[], base:
   if (envs.some((e) => e !== undefined && e !== null && (typeof e !== 'object' || Array.isArray(e)))) return ALL_GATE;
   const keys = envs.flatMap((e) => Object.keys(asObj(e)).slice(0, MAX_INPUT_KEYS)).map((k) => k.toUpperCase());
   const inText = (needle: string) => texts.some((t) => t.includes(needle));
+  // P57 (C4): SKIP / PREK_SKIP: the ids an `env:` key (any letter case) or the run text names
+  const skipOf = (name: 'SKIP' | 'PREK_SKIP', from: SkipSet): SkipSet => {
+    let out = from;
+    for (const e of envs) for (const [k, v] of Object.entries(asObj(e)).slice(0, MAX_INPUT_KEYS)) if (k.toUpperCase() === name) out = orSkip(out, skipValue(v));
+    for (const t of texts) if (t.includes(name)) out = orSkip(out, skipInText(t, name));
+    return out;
+  };
   const names = softNames.filter((n) => keys.includes(n) || inText(n));
   const lower = configNames.length === 0 ? [] : texts.map((t) => t.toLowerCase());
   const files = configNames.filter((f) => lower.some((t) => t.includes(f.toLowerCase())));
   return {
     tox: base.tox || keys.some((k) => k.startsWith('TOX')) || inText('TOX'),
     nox: base.nox || keys.some((k) => k.startsWith('NOX')) || inText('NOX'),
-    skip: base.skip || keys.includes('SKIP') || inText('SKIP'),
+    skip: skipOf('SKIP', base.skip),
+    prekSkip: skipOf('PREK_SKIP', base.prekSkip),
     // npm reads npm_config_* in any letter case
     npm: base.npm || keys.includes('NPM_CONFIG_DRY_RUN') || texts.some((t) => t.toLowerCase().includes('npm_config_dry_run')),
     env: names.length === 0 && files.length === 0 ? base.env : orEnv(base.env, { all: false, names: new Set(names), files: new Set(files) }),
@@ -564,7 +605,11 @@ export const gated = (found: Found[], g: EnvGate): Found[] => found
     }
     if (f.envGate === 'tox' && g.tox) return { ...f, reason: 'tox-env' as const };
     if (f.envGate === 'nox' && g.nox) return { ...f, reason: 'nox-env' as const };
-    if (g.skip && isHookRunner(f.by)) return { ...f, hookRun: false, reason: f.reason ?? 'skip' };
+    // P57 (C4): the run itself is partial (some hooks may not run); hookRunHits lowers only the hooks SKIP names
+    if (isHookRunner(f.by)) {
+      const skip = f.by === PREK_ID ? orSkip(g.skip, g.prekSkip) : g.skip;
+      if (skipsAny(skip)) return { ...f, reason: f.reason ?? 'skip', hookSkip: skip };
+    }
     // fix round 1 (P8): a softEnv name set in the job; a CI pre-commit run keeps the job env for the hooks it carries
     const set = softEnvSet(f.softEnv, g.env);
     const file = configFileNamed(f.configFiles, g.env);

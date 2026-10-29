@@ -1314,8 +1314,8 @@ describe('mapCoverage (P55 batch B: prek)', () => {
     expect(row(await lintOf(cfg, act), 'merge', 'lint', 'app')).toMatchObject({ status: 'partial', by: 'ruff' });
   });
 
-  it('SKIP in the job drops a prek run\'s hooks, a conditional or soft run stays partial', async () => {
-    expect(row(await lintOf(cfg, run('SKIP=ruff-check prek run --all-files')), 'merge', 'lint', 'app').status).toBe('missing');
+  it('SKIP in the job lowers the prek hooks it names (P57 C4), a conditional or soft run stays partial', async () => {
+    expect(row(await lintOf(cfg, run('SKIP=ruff-check prek run --all-files')), 'merge', 'lint', 'app').status).toBe('partial');
     expect(row(await lintOf(cfg, run('prek run --all-files || true')), 'merge', 'lint', 'app').status).toBe('partial');
     expect(row(await lintOf(cfg, '      - run: prek run --all-files\n        if: github.actor != \'bot\'\n'), 'merge', 'lint', 'app').status).toBe('partial');
     expect(row(await lintOf(cfg, '      - run: prek run --all-files\n        continue-on-error: true\n'), 'merge', 'lint', 'app').status).toBe('partial');
@@ -1394,8 +1394,7 @@ describe('mapCoverage (Task 5, item 3: pre-commit hook contents)', () => {
     const config = hookConfig('      - id: ruff-check\n');
     for (const steps of [
       run('pre-commit run'), run('pre-commit run ruff-check --all-files'), run('pre-commit run --hook-stage manual --all-files'),
-      run('pre-commit run --files a.py'), run('pre-commit run -c other.yaml --all-files'), run('SKIP=ruff-check pre-commit run --all-files'),
-      '      - run: pre-commit run --all-files\n        env:\n          SKIP: ruff-check\n', run('echo "SKIP=ruff-check" >> "$GITHUB_ENV"') + run('pre-commit run --all-files'),
+      run('pre-commit run --files a.py'), run('pre-commit run -c other.yaml --all-files'),
       "      - uses: pre-commit/action@v3.0.1\n        with:\n          extra_args: ruff-check --all-files\n",
       "      - uses: pre-commit/action@v3.0.1\n        with:\n          extra_args: ${{ inputs.args }}\n",
     ]) {
@@ -1403,6 +1402,14 @@ describe('mapCoverage (Task 5, item 3: pre-commit hook contents)', () => {
       writeIn(dir, '.pre-commit-config.yaml', config);
       ci(dir, steps);
       expect(row(await coverage(dir, pyApp), 'merge', 'lint', 'app').status, steps).toBe('missing');
+    }
+    // P57 (C4): SKIP naming the hook leaves it partial (never covered); it was dropped before
+    for (const steps of [run('SKIP=ruff-check pre-commit run --all-files'), '      - run: pre-commit run --all-files\n        env:\n          SKIP: ruff-check\n',
+      run('echo "SKIP=ruff-check" >> "$GITHUB_ENV"') + run('pre-commit run --all-files')]) {
+      const dir = makeTempDir();
+      writeIn(dir, '.pre-commit-config.yaml', config);
+      ci(dir, steps);
+      expect(row(await coverage(dir, pyApp), 'merge', 'lint', 'app').status, steps).toBe('partial');
     }
   });
 
@@ -1555,7 +1562,7 @@ describe('mapCoverage (Task 5 fix round 1)', () => {
     }
   });
 
-  it('I3: SKIP in the job, the step or inline makes "Git hooks re-run in CI" partial, and nothing carries over', async () => {
+  it('I3: SKIP in the job, the step or inline makes "Git hooks re-run in CI" partial; P57 (C4): the hooks it names are partial', async () => {
     for (const steps of [
       '      - uses: pre-commit/action@v3.0.1\n        env:\n          SKIP: ruff-check,gitleaks\n', run('SKIP=ruff-check pre-commit run --all-files'),
       '      - run: pre-commit run --all-files\n        env:\n          skip: ruff-check\n',
@@ -1566,8 +1573,8 @@ describe('mapCoverage (Task 5 fix round 1)', () => {
       const rows = await coverage(dir, py);
       const hooksCi = row(rows, 'merge', 'hooks-ci');
       expect(hooksCi.status, steps).toBe('partial');
-      expect(hooksCi.why).toBe("The pre-commit check runs, but SKIP is set in this job, so some pre-commit hooks don't run here.");
-      expect(row(rows, 'merge', 'lint', 'app').status, steps).toBe('missing');
+      expect(hooksCi.why).toBe("The pre-commit check runs, but SKIP or PREK_SKIP is set in this job, so some pre-commit hooks don't run here.");
+      expect(row(rows, 'merge', 'lint', 'app').status, steps).toBe('partial');
     }
     const dir = makeTempDir();
     writeIn(dir, '.pre-commit-config.yaml', hookConfig('      - id: ruff-check\n'));
@@ -1730,7 +1737,7 @@ describe('mapCoverage (Task 5 fix round 2)', () => {
     wf(dir, 'ci.yml', PR('      - uses: ./.github/actions/setskip\n' + run('pre-commit run --all-files')));
     const rows = await coverage(dir, py);
     expect(row(rows, 'merge', 'hooks-ci').status).toBe('partial');
-    expect(row(rows, 'merge', 'lint', 'app').status).toBe('missing');
+    expect(row(rows, 'merge', 'lint', 'app').status).toBe('partial'); // P57 (C4): the hook SKIP names
     // the same composite action with an env key
     const dir2 = makeTempDir();
     writeIn(dir2, '.pre-commit-config.yaml', hookConfig('      - id: ruff-check\n'));
@@ -1767,7 +1774,7 @@ describe('mapCoverage (Task 5 fix round 3)', () => {
     wf(dir, 'x.yml', `on: [pull_request]\njobs:\n  c:\n${one}`);
     const rows = await coverage(dir, { services: [svc('.', { language: 'python', packageManager: 'uv', scripts: [] })] });
     expect(row(rows, 'merge', 'hooks-ci').status).toBe('partial');
-    expect(row(rows, 'merge', 'lint', 'app').status).toBe('missing');
+    expect(row(rows, 'merge', 'lint', 'app').status).toBe('partial'); // P57 (C4): the hook SKIP names
   });
 
   it('N7: own-script calls are followed with no depth limit, through npm aliases, yarn <script>, run-s / run-p / npm-run-all and concurrently', async () => {
@@ -2476,11 +2483,11 @@ describe('mapCoverage (Plan P Task 3)', () => {
     writeIn(dir, '.pre-commit-config.yaml', 'repos:\n  - repo: https://github.com/psf/black-pre-commit-mirror\n    rev: 24.8.0\n    hooks:\n      - id: black\n        files: ^src/\n');
     ci(dir, run('pre-commit run --all-files'));
     expect(row(await cov(dir, { services: [pySvc] }), 'merge', 'format', 'app')).toMatchObject({ status: 'partial', by: 'black' });
-    // SKIP drops the carry; a hook-stage run on staged files carries nothing
+    // SKIP naming the hook leaves it partial (P57 C4); a hook-stage run on staged files carries nothing
     const dir2 = makeTempDir();
     writeIn(dir2, '.pre-commit-config.yaml', 'repos:\n  - repo: https://github.com/psf/black-pre-commit-mirror\n    rev: 24.8.0\n    hooks:\n      - id: black\n');
     ci(dir2, run('SKIP=black pre-commit run --all-files'));
-    expect(row(await cov(dir2, { services: [pySvc] }), 'merge', 'format', 'app').status).toBe('missing');
+    expect(row(await cov(dir2, { services: [pySvc] }), 'merge', 'format', 'app').status).toBe('partial');
     const dir3 = makeTempDir();
     writeIn(dir3, '.pre-commit-config.yaml', 'repos:\n  - repo: https://github.com/psf/black-pre-commit-mirror\n    rev: 24.8.0\n    hooks:\n      - id: black\n');
     ci(dir3, run('pre-commit run'));
@@ -3399,5 +3406,56 @@ describe('coverage: pipegen reads the compose files and services Compose really 
     expect(await st({ 'compose.yml': `${TESTS}  more:\n    extends:\n      file: base.yml\n      service: x\n` }, run('docker compose build'))).toMatch(/^unknown/);
     expect(await st({ 'compose.yml': TESTS }, run('docker compose --env-file ci.env build'))).toMatch(/^unknown/);
     expect(await st({ 'compose.yml': TESTS }, run('docker compose -f "$COMPOSE" build'))).toMatch(/^unknown/);
+  });
+});
+
+describe('coverage: prek and pre-commit read SKIP / PREK_SKIP by hook, and prek reads prek.toml first (P57 C4)', () => {
+  const app = svc('.', { language: 'python', packageManager: 'uv', scripts: [], quality: { ...emptyServiceQuality(), pythonTyped: true } });
+  const YAML = 'repos:\n  - repo: https://github.com/pre-commit/mirrors-mypy\n    rev: v1.18.2\n    hooks:\n      - id: mypy\n'
+    + '  - repo: https://github.com/astral-sh/ruff-pre-commit\n    rev: v0.16.0\n    hooks:\n      - id: ruff\n      - id: ruff-format\n';
+  const TOML_RUFF = '[[repos]]\nrepo = "https://github.com/astral-sh/ruff-pre-commit"\nrev = "v0.16.0"\nhooks = [{ id = "ruff" }]\n';
+  const rowsOf = async (steps: string, files: Record<string, string> = {}, extra = '', top = '') => {
+    const dir = makeTempDir();
+    for (const [rel, text] of Object.entries({ '.pre-commit-config.yaml': YAML, ...files })) writeIn(dir, rel, text);
+    wf(dir, 'ci.yml', `${both}${top}${job(steps, extra)}`);
+    return coverage(dir, { services: [app] });
+  };
+  const st = (rows: Coverage[], id: string) => {
+    const r = row(rows, 'push', id, 'app');
+    return `${r.status}${r.by === undefined ? '' : ` ${r.by}`}`;
+  };
+  const three = (rows: Coverage[]) => ['lint', 'type-check', 'format'].map((id) => st(rows, id));
+
+  it('the review\'s probe: PREK_SKIP in the step or job env naming mypy and ruff leaves those hooks partial, the others covered', async () => {
+    const step = '      - run: prek run --all-files\n        env:\n          PREK_SKIP: mypy,ruff\n';
+    expect(three(await rowsOf(step))).toEqual(['partial ruff', 'partial mypy', 'covered ruff-format']);
+    expect(three(await rowsOf(run('prek run --all-files'), {}, '    env:\n      PREK_SKIP: mypy,ruff\n'))).toEqual(['partial ruff', 'partial mypy', 'covered ruff-format']);
+    expect(three(await rowsOf(run('prek run --all-files'), {}, '', 'env:\n  PREK_SKIP: mypy\n'))).toEqual(['covered ruff', 'partial mypy', 'covered ruff-format']);
+    // pre-commit itself doesn't read PREK_SKIP
+    expect(three(await rowsOf('      - run: pre-commit run --all-files\n        env:\n          PREK_SKIP: mypy,ruff\n'))).toEqual(['covered ruff', 'covered mypy', 'covered ruff-format']);
+  });
+
+  it('SKIP names hooks for pre-commit and prek alike (env, inline, GITHUB_ENV); a value pipegen can\'t read is unknown for every hook of the run', async () => {
+    for (const runner of ['prek', 'pre-commit']) {
+      expect(three(await rowsOf(`      - run: ${runner} run --all-files\n        env:\n          SKIP: mypy\n`)), runner).toEqual(['covered ruff', 'partial mypy', 'covered ruff-format']);
+      expect(three(await rowsOf(run(`SKIP=ruff,ruff-format ${runner} run --all-files`))), runner).toEqual(['partial ruff', 'covered mypy', 'partial ruff-format']);
+      expect(three(await rowsOf(run('echo "SKIP=mypy" >> "$GITHUB_ENV"') + run(`${runner} run --all-files`))), runner).toEqual(['covered ruff', 'partial mypy', 'covered ruff-format']);
+      const unknown = three(await rowsOf(`      - run: ${runner} run --all-files\n        env:\n          SKIP: \${{ matrix.skip }}\n`));
+      expect(unknown.every((x) => x.startsWith('unknown')), `${runner} ${unknown.join()}`).toBe(true);
+      const bare = three(await rowsOf(run('export SKIP="$HOOKS"') + run(`${runner} run --all-files`)));
+      expect(bare.every((x) => x.startsWith('unknown')), `${runner} ${bare.join()}`).toBe(true);
+    }
+    // a name that only contains SKIP is not SKIP
+    expect(three(await rowsOf(run('SKIP_TESTS=1 prek run --all-files')))).toEqual(['covered ruff', 'covered mypy', 'covered ruff-format']);
+  });
+
+  it('the review\'s probe: prek reads prek.toml before .pre-commit-config.yaml, so the YAML\'s hooks are never credited to a prek run then', async () => {
+    expect(three(await rowsOf(run('prek run --all-files'), { 'prek.toml': '# nothing here yet\n' }))).toEqual(['missing', 'missing', 'missing']);
+    expect(three(await rowsOf(run('prek run --all-files'), { 'prek.toml': TOML_RUFF }))).toEqual(['covered ruff', 'missing', 'missing']);
+    // pre-commit itself reads only the YAML
+    expect(three(await rowsOf(run('pre-commit run --all-files'), { 'prek.toml': '# nothing\n' }))).toEqual(['covered ruff', 'covered mypy', 'covered ruff-format']);
+    // a prek.toml pipegen can't read: unknown, never the YAML's hooks
+    const bad = three(await rowsOf(run('prek run --all-files'), { 'prek.toml': '[[repos]\nbroken = \n' }));
+    expect(bad.every((x) => x.startsWith('unknown')), bad.join()).toBe(true);
   });
 });
