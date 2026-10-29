@@ -19,7 +19,9 @@ import { DEPENDENCY_KINDS, type OutputFormat, type RepoProfile, type ReviewedToo
 import { COMMIT_SHA_RE } from './names.js';
 import { NEED_IDS } from './need-ids.js';
 import type { PlatformActions } from './pin.js';
-import { renderCliTool, type CliHooks, type RenderOptions } from './render-cli.js';
+import { projectScriptSteps, renderCliTool, type CliHooks, type RenderOptions } from './render-cli.js';
+import { ArtifactNameError, resultArtifactName } from './artifact-names.js';
+import type { ProjectScriptStep } from './reviewed.js';
 import { EXPR, own, RenderError, show } from './render-error.js';
 import { CHECKER_STEP_ID_RE, DOCKER_ACTION_USES, IMAGE_BUILT_ACTION_USES, PLAIN_REL_RE, RENDERER_INPUTS, rendererInputProblems, SCRUB_STEP_ID_RE, SETUP_STEP_ID_RE, TOOL_STEP_ID_RE } from './tool-flags.js';
 
@@ -482,6 +484,41 @@ export function renderUpload(artifact: string, path: string, platform: PlatformA
   if (path !== folder && !path.startsWith(`${folder}/`)) throw new RenderError('An upload may only take a path inside its own artifact folder.');
   const step = renderPlatformStep('upload-artifact', platform, { name: artifact, path });
   return { ...step, name: 'Upload the result', if: 'always()' };
+}
+
+/**
+ * The built-in step that runs a service's own `test` or `lint` script (ruling S10, F3): the prelude's checkout and
+ * setup-node, the guarded repo `npm ci --ignore-scripts` (the repo-code install of render-cli.ts, same id and marker as the
+ * repo-code tools, so a job installs once), then `npm test` / `npm run lint`. npm only: pnpm, yarn and bun are "not
+ * supported yet", Python is Plan W's. Every repo-derived value is checked: the script must be one the service has, the
+ * folder must be the service's own path, the runtime version is only mapped. The run step is a repo-code step.
+ */
+export function renderProjectScript(step: ProjectScriptStep, platform: PlatformActions, ctx: RenderContext): RenderResult {
+  const svc = ctx.profile.services.find((s) => s.name === step.service);
+  if (svc === undefined) throw new RenderError(`The project script is for ${show(step.service)}, which is not a service pipegen found.`);
+  if (step.script !== 'test' && step.script !== 'lint') throw new RenderError(`${show(step.script)} is not a script pipegen runs (only test and lint).`);
+  if (!svc.scripts.includes(step.script)) throw new RenderError(`The service ${show(svc.name)} has no ${step.script} script, so there is no script to run.`);
+  if (svc.language === 'python' || svc.packageManager === 'pip' || svc.packageManager === 'poetry' || svc.packageManager === 'uv') {
+    throw new RenderError(`The service ${show(svc.name)} is a Python project; running its scripts is Plan W's work, not supported yet in this version (Plan W).`);
+  }
+  if (svc.packageManager === 'pnpm' || svc.packageManager === 'yarn' || svc.packageManager === 'bun' || svc.packageManager === 'other') {
+    throw new RenderError(`${svc.packageManager} is not supported yet: pipegen runs project scripts with npm only.`);
+  }
+  if (svc.language !== 'node') throw new RenderError(`The service ${show(svc.name)} is not a Node project; its scripts are not supported yet.`);
+  const expected = svc.path === '' || svc.path === '.' ? undefined : svc.path;
+  if (step.workingDir !== expected || (expected !== undefined && !PLAIN_REL_RE.test(expected))) throw new RenderError(`The folder ${show(step.workingDir)} is not the plain folder of the service ${show(svc.name)}.`);
+  let artifact: string;
+  try {
+    artifact = resultArtifactName(step.needId, svc.name);
+  } catch (e) {
+    if (e instanceof ArtifactNameError) throw new RenderError(e.message);
+    throw e;
+  }
+  const prelude = renderJobPrelude({ node: { runtimeVersion: svc.runtimeVersion } }, platform).steps;
+  const setup = prelude[1] as RenderedStep;
+  const nodeMajor = setup.with?.['node-version'];
+  if (nodeMajor === undefined || !/^\d{1,3}$/.test(nodeMajor)) throw new RenderError('The Node setup step has no plain node-version.');
+  return { steps: [prelude[0] as RenderedStep, { ...setup, id: `pipegen-setup-node-${nodeMajor}` }, ...projectScriptSteps(artifact, step.script, nodeMajor, expected)], output: null };
 }
 
 /** Put on every job that feeds the gate, builds, signs or verifies (Plan G): no cache of any kind. */

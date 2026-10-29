@@ -6,9 +6,10 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { slotProblem, SLOT_KINDS } from '../src/engine/slots.js';
-import { checkJobOrder, dedupeJobSteps, RenderError, renderStepWith, type RenderContext, type RenderedStep, type RenderResult } from '../src/engine/render-step.js';
+import { checkJobOrder, dedupeJobSteps, RenderError, renderProjectScript, renderStepWith, type RenderContext, type RenderedStep, type RenderResult } from '../src/engine/render-step.js';
 import { NEED_IDS } from '../src/engine/need-ids.js';
 import { ARGV_POLICIES, type ArgvPolicy } from '../src/engine/tool-flags.js';
+import type { ProjectScriptStep } from '../src/engine/reviewed.js';
 import type { ReviewedTool, StepSpec } from '../src/types.js';
 import { ctxFor, entry, platform, profile, reviewedList, service, specFor } from './helpers/render.js';
 import { exec, sandbox, stepEnv } from './helpers/step-harness.js';
@@ -331,6 +332,69 @@ describe('S11: the ESLint config resolves @eslint/js and typescript-eslint from 
     const res = spawnSync(process.execPath, ['--input-type=module', '-e', `const m = await import(${JSON.stringify(`file://${join(closure, 'eslint.config.mjs')}`)}); console.log(Array.isArray(m.default));`], { cwd: sb.ws, encoding: 'utf8' });
     expect(res.stderr).not.toContain('repo copy loaded');
     expect(res.stdout.trim()).toBe('true');
+  });
+});
+
+// ---------- project scripts (S10, F3) ----------
+describe('S10: renderProjectScript', () => {
+  const svc = service({ name: 'web', path: 'apps/web', scripts: ['test', 'lint'], packageManager: 'npm', runtimeVersion: '22' });
+  const c = ctxFor([svc, service({ name: 'root', path: '.', scripts: ['test'] })]);
+  const step = (over: Partial<ProjectScriptStep> = {}): ProjectScriptStep => ({ kind: 'project-script', needId: 'unit-tests', service: 'web', script: 'test', workingDir: 'apps/web', ...over });
+
+  it('checkout and setup-node from the prelude, the guarded repo npm ci, then npm test; repocode ids; only platform actions', () => {
+    const r = renderProjectScript(step(), platform(), c);
+    expect(r.output).toBeNull();
+    expect(r.steps[0]?.uses).toMatch(/^actions\/checkout@[0-9a-f]{40}$/);
+    expect(r.steps[1]?.uses).toMatch(/^actions\/setup-node@[0-9a-f]{40}$/);
+    expect(r.steps[1]?.with).toMatchObject({ 'node-version': '22' });
+    const ci = r.steps.find((s) => s.id?.startsWith('pipegen-npm-ci-')) as RenderedStep;
+    expect(ci.run).toContain('ci --ignore-scripts');
+    expect(ci.run).toContain('--workspaces=false');
+    expect(ci.run).toContain('cd -- ./apps/web');
+    expect(ci.run).toContain('pipegen-npm-ci/');
+    const run = runOf(r);
+    expect(run.id).toMatch(/^repocode-[0-9a-f]{16}$/);
+    expect(run.run).toMatch(/npm" run test|npm" test/);
+    expect(run.run).toContain('cd -- ./apps/web');
+    for (const s of r.steps) if (s.uses !== undefined) expect(s.uses).toMatch(/^actions\/(checkout|setup-node)@/);
+    expect(checkJobOrder(dedupeJobSteps(r.steps))).toEqual([]);
+  });
+  it('lint runs npm run lint; a service at the repo root has no cd', () => {
+    const r = renderProjectScript(step({ script: 'test', service: 'root', workingDir: undefined }), platform(), c);
+    expect(runOf(r).run).not.toContain('cd --');
+    const l = renderProjectScript(step({ script: 'lint', needId: 'lint' }), platform(), c);
+    expect(runOf(l).run).toMatch(/npm" run lint/);
+  });
+  it('the script must be in Service.scripts, the service must exist, the folder must be its path', () => {
+    expect(() => renderProjectScript(step({ service: 'root', script: 'lint', workingDir: undefined }), platform(), c)).toThrow(/script/);
+    expect(() => renderProjectScript(step({ service: 'nope' }), platform(), c)).toThrow(RenderError);
+    expect(() => renderProjectScript(step({ workingDir: 'apps/other' }), platform(), c)).toThrow(RenderError);
+    for (const wd of ['../x', '/abs', '-x', 'a b']) expect(() => renderProjectScript(step({ workingDir: wd }), platform(), c), wd).toThrow(RenderError);
+    expect(() => renderProjectScript(step({ script: 'build' as 'test' }), platform(), c)).toThrow(RenderError);
+  });
+  it('pnpm, yarn and bun are "not supported yet"; Python is a RenderError (Plan W)', () => {
+    for (const pm of ['pnpm', 'yarn', 'bun'] as const) expect(() => renderProjectScript(step(), platform(), ctxFor([{ ...svc, packageManager: pm }])), pm).toThrow(/not supported yet/);
+    for (const pm of ['pip', 'poetry', 'uv'] as const) expect(() => renderProjectScript(step(), platform(), ctxFor([{ ...svc, packageManager: pm }])), pm).toThrow(/Plan W/);
+    expect(() => renderProjectScript(step(), platform(), ctxFor([{ ...svc, language: 'python', packageManager: undefined }]))).toThrow(/Plan W/);
+  });
+  it('runtimeVersion is mapped, never rendered raw', () => {
+    const r = renderProjectScript(step(), platform(), ctxFor([{ ...svc, runtimeVersion: '>=18 <21; id' }]));
+    expect(JSON.stringify(r.steps)).not.toContain('; id');
+    expect(JSON.stringify(r.steps)).not.toContain('>=18');
+    expect(r.steps[1]?.with).toMatchObject({ 'node-version': '22' });
+  });
+  it('a step after a project script that needs to be trusted is refused by the order rule', () => {
+    const script = renderProjectScript(step(), platform(), c).steps;
+    const later = render('gitleaks').steps;
+    expect(() => dedupeJobSteps([...script, ...later])).toThrow(RenderError);
+    expect(() => dedupeJobSteps([...later, ...script])).not.toThrow();
+  });
+  it('snapshot', async () => {
+    const { Document } = await import('yaml');
+    const { stepsToYaml } = await import('../src/engine/render-step.js');
+    const doc = new Document();
+    doc.contents = stepsToYaml(renderProjectScript(step(), platform(), c).steps);
+    await expect(doc.toString({ lineWidth: 0 })).toMatchFileSnapshot('__snapshots__/steps/project-script.yml');
   });
 });
 

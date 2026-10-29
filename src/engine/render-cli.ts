@@ -760,6 +760,20 @@ function repoInstall(pins: readonly (NpmPin & { resolved: string })[], artifact:
   return [ci, verify];
 }
 
+/**
+ * The steps of a project script (ruling S10): the guarded repo `npm ci` (shared with the repo-code tools, same id and marker)
+ * and the script itself, which is repo code (`repocode-…` id). `workingDir` is the already-checked service folder.
+ */
+export function projectScriptSteps(artifact: string, which: 'test' | 'lint', nodeMajor: string, workingDir: string | undefined): RenderedStep[] {
+  const ci = repoInstall([], artifact, nodeMajor, workingDir)[0] as RenderedStep;
+  const run = script([
+    ...prologue(artifact, { nodeMajor }), ...cdLines(workingDir),
+    `PATH="$nodebin:${FIXED_PATH}"`,
+    `"$nodebin/npm" ${which === 'test' ? 'test' : 'run lint'}`,
+  ]);
+  return [ci, runStep(`pipegen: run the project's ${which} script`, run, {}, `repocode-${sha16(`project-script:${artifact}:${which}`)}`)];
+}
+
 // ---------- pip (ruling B5; R-C) ----------
 
 const REQUIREMENT_RE = /^([A-Za-z0-9][A-Za-z0-9._-]{0,100})==([0-9][0-9A-Za-z.+!_-]{0,40})((?: --hash=sha256:[0-9a-f]{64}){1,8})$/;
