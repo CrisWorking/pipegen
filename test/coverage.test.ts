@@ -3859,4 +3859,11 @@ describe('coverage: closing patch (ruling P60)', () => {
     expect(await sast(codeql(''))).toEqual(['partial', 'partial']); // autodetect
     expect(await sast(codeql('        with:\n          languages: ${{ inputs.l }}\n'))).toEqual(['partial', 'partial']);
   });
+
+  it('m1: a Dockerfile ENV or ARG whose key isn\'t a plain name is unsure, never dropped', async () => {
+    for (const line of ['ENV "TOXENV"="lint"', 'ARG N=TOXENV\nENV ${N}=lint', "ENV 'TOXENV' lint", 'ENV $N=lint', 'ARG "TOXENV"']) {
+      expect(await st({ Dockerfile: `${IMG}${line}\nRUN tox\n`, 'tox.ini': '[tox]\n' }, run('docker build .')), line).not.toBe('covered your own `tox`');
+    }
+    expect(await st({ Dockerfile: `${IMG}ENV FOO=1\nRUN tox\n`, 'tox.ini': '[tox]\n' }, run('docker build .'))).toBe('covered your own `tox`');
+  });
 });

@@ -283,7 +283,7 @@ export async function placeComposeRun(ctx: Ctx, f: Found): Promise<Found | null>
   }
   // P57 (C5): the image's ENV and the service's environment: reach the command like a step's env: (an env given as a
   // plain string is "could be anything" to gateOf)
-  const [placed] = gated([{ ...rest, dir, compose: true }], gateOf([], [{ ...imageEnv, ...(fileEnv ?? {}), ...svc.environment }, ...(fileEnv === null ? ['$'] : [])], undefined, ctx.sigs.softEnv, ctx.sigs.configFiles));
+  const [placed] = gated([{ ...rest, dir, compose: true }], gateOf([], [...envsOf({ ...imageEnv, ...(fileEnv ?? {}), ...svc.environment }), ...(fileEnv === null ? ['$'] : [])], undefined, ctx.sigs.softEnv, ctx.sigs.configFiles));
   return placed ?? null;
 }
 
@@ -302,18 +302,27 @@ export type Parsed = { stages: Stage[] } | { unreadable: string };
 function envWords(op: 'ENV' | 'ARG', rest: string): Record<string, string> {
   const out: Record<string, string> = {};
   const plain = (v: string) => (/^"[A-Za-z0-9_.,:\/ -]*"$|^'[A-Za-z0-9_.,:\/ -]*'$/.test(v) ? v.slice(1, -1) : /^[A-Za-z0-9_.,:\/-]*$/.test(v) ? v : '$');
+  // P60 (m1): BuildKit expands and unquotes keys too, so a key that isn't a plain name could be any variable: unsure
+  const unsure = () => ({ ...out, [UNSURE_ENV]: '$' });
   const t = rest.trim();
-  if (op === 'ENV' && !/^[A-Za-z_][A-Za-z0-9_]*=/.test(t)) {
+  const words = t.match(/(?:"[^"]*"|'[^']*'|[^\s"']+)+/g) ?? [];
+  if (op === 'ENV' && !(words[0] ?? '').includes('=')) {
     const m = /^([A-Za-z_][A-Za-z0-9_]*)\s+(.*)$/.exec(t);
-    if (m !== null) out[m[1] as string] = plain((m[2] as string).trim());
+    if (m === null) return unsure();
+    out[m[1] as string] = plain((m[2] as string).trim());
     return out;
   }
-  for (const m of t.matchAll(/(?:^|\s)([A-Za-z_][A-Za-z0-9_]*)(?:=("[^"]*"|'[^']*'|\S*))?/g)) {
-    const name = m[1] as string;
-    out[name] = m[2] === undefined ? (op === 'ARG' ? '$' : '') : plain(m[2]);
+  for (const w of words) {
+    const m = /^([A-Za-z_][A-Za-z0-9_]*)(?:=(.*))?$/.exec(w);
+    if (m === null || (op === 'ENV' && m[2] === undefined)) return unsure();
+    out[m[1] as string] = m[2] === undefined ? '$' : plain(m[2]);
   }
   return out;
 }
+/** P60 (m1): the key an ENV or ARG line with a name pipegen can't read adds: the env gate is then all on. */
+export const UNSURE_ENV = '\u0000';
+/** The env objects for gateOf: a plain string ("could be anything") joins an env that holds UNSURE_ENV. */
+const envsOf = (env: DockerEnv): unknown[] => (UNSURE_ENV in env ? [env, '$'] : [env]);
 
 /** The words of a COPY/ADD or FROM line, past its `--flag` words, as [flags, words]. */
 function wordsOf(rest: string): { flags: string[]; words: string[] } {
@@ -565,7 +574,7 @@ async function dockerfileRuns(ctx: Ctx, b: DockerBuild, f: Found, outer: Reason 
                 continue;
               }
               // P57 (C5): the ENV and ARG values the RUN sees count like a step's env:
-              const inner = gated(await resolve(ctx, scanned), gateOf([run.text], [run.env], undefined, ctx.sigs.softEnv, ctx.sigs.configFiles));
+              const inner = gated(await resolve(ctx, scanned), gateOf([run.text], envsOf(run.env), undefined, ctx.sigs.softEnv, ctx.sigs.configFiles));
               for (const g of inner) {
                 const categories = g.categories.filter((x) => SCRIPT_CATEGORIES.has(x.startsWith(UNKNOWN_PREFIX) ? x.slice(UNKNOWN_PREFIX.length) : x));
                 if (categories.length === 0) continue;
