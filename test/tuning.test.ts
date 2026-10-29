@@ -19,13 +19,13 @@ const needFor = (t: ReviewedTool): string => t.categories.find((c) => (NEED_IDS 
 const IMG = `ghcr.io/o/app@sha256:${'a'.repeat(64)}`;
 const TARGETS = { image: IMG, url: 'http://localhost:8080' };
 
-/** A repo with an API service (own lockfile, Dockerfile, tsconfig), a web service and generated folders. */
+/** A repo with an API service (Dockerfile, tsconfig), a web service and generated folders. */
 const api = service({
-  name: 'api', path: 'services/api', dockerfile: 'services/api/Dockerfile', lockfile: 'services/api/package-lock.json',
+  name: 'api', path: 'services/api', dockerfile: 'services/api/Dockerfile',
   scripts: ['start', 'test', 'lint', 'format:check', 'build', 'dev'], quality: { ...emptyServiceQuality(), tsconfig: true },
 });
-const web = service({ name: 'web', path: 'apps/web', lockfile: 'apps/web/pnpm-lock.yaml', packageManager: 'pnpm', scripts: ['serve', 'lint'] });
-const py = service({ name: 'py', path: 'py', language: 'python', packageManager: 'poetry', lockfile: 'py/poetry.lock', alsoLanguages: ['node'], scripts: [] });
+const web = service({ name: 'web', path: 'apps/web', packageManager: 'pnpm', scripts: ['serve', 'lint'] });
+const py = service({ name: 'py', path: 'py', language: 'python', packageManager: 'poetry', alsoLanguages: ['node'], scripts: [] });
 const prof = (services: Service[], over: Partial<RepoProfile> = {}): RepoProfile => ({
   owner: 'o', repo: 'r', defaultBranch: 'main', private: false, ownerType: 'User', plan: 'free', monorepo: 'folders', services,
   terraformDirs: [], hasCompose: false, existingWorkflows: [], precommit: null, repoFiles: emptyRepoFiles(),
@@ -91,7 +91,7 @@ describe('the model: nothing narrows a floor scan (#108)', () => {
   it('walking the model: an option on a floor tool only adds, and none of its flags is a skip, ignore, exclude, severity, unfixed, baseline, threshold or alert switch', () => {
     const tools = new Map(reviewedList().map((t) => [t.id, t]));
     const onFloor = TUNING_OPTIONS.filter((o) => (tools.get(o.tool) as ReviewedTool).categories.some((c) => FLOOR_CATEGORIES.includes(c)));
-    expect(onFloor.length).toBeGreaterThan(0);   // osv-scanner (lockfiles), zap-baseline and nuclei (start-script)
+    expect(onFloor.length).toBeGreaterThan(0);   // zap-baseline and nuclei (start-script)
     for (const o of onFloor) {
       expect(o.kind, `${o.tool}/${o.id}`).toBe('adds');
       for (const f of o.flags) expect(f, `${o.tool}/${o.id} ${f}`).not.toMatch(NARROWING);
@@ -99,9 +99,9 @@ describe('the model: nothing narrows a floor scan (#108)', () => {
   });
 
   it('no floor tool of the reviewed list has any narrowing option: secrets, trivy and syft have none at all', () => {
-    const none = ['gitleaks', 'betterleaks', 'trivy-config', 'trivy-image', 'trivy-licence', 'syft', 'hadolint', 'kube-linter', 'biome', 'knip', 'prettier', 'ruff', 'bandit'];
+    const none = ['gitleaks', 'betterleaks', 'osv-scanner', 'trivy-config', 'trivy-image', 'trivy-licence', 'syft', 'hadolint', 'kube-linter', 'biome', 'knip', 'prettier', 'ruff', 'bandit'];
     for (const id of none) expect(TUNING_OPTIONS.filter((o) => o.tool === id), id).toEqual([]);
-    expect(TUNING_OPTIONS.filter((o) => o.tool === 'osv-scanner').map((o) => [o.id, o.kind, ...o.flags])).toEqual([['lockfiles', 'adds', '--lockfile']]);
+    // OSV has none: `--lockfile` next to `--recursive .` adds nothing (measured, osv-scanner 2.7.0) and exits 127 on bun.lockb
   });
 
   it('the model, tool by tool (the table in the 6d report)', () => {
@@ -109,7 +109,6 @@ describe('the model: nothing narrows a floor scan (#108)', () => {
     expect(rows).toEqual([
       'semgrep | extra-rules | adds | max 4 | --config',
       'semgrep | skip-generated | scope-lint | max 8 | --exclude',
-      'osv-scanner | lockfiles | adds | max 8 | --lockfile',
       'eslint | skip-generated | scope-lint | max 8 | --ignore-pattern',
       'eslint-typescript | skip-generated | scope-lint | max 8 | --ignore-pattern',
       'oxlint-typeaware | skip-generated | scope-lint | max 8 | --ignore-pattern',
@@ -118,6 +117,24 @@ describe('the model: nothing narrows a floor scan (#108)', () => {
       'nuclei | start-script | adds | max 1 | -',
       'lefthook | hooks | adds | max 4 | -',
     ]);
+  });
+
+  it('walking the RENDERED output: every flag an option really emits is one it declares, and floor tools emit no narrowing flag or config', () => {
+    const rich = ctxOf([api, web, py], { terraformDirs: ['infra'], hasCompose: true });
+    const tools = new Map(reviewedList().map((t) => [t.id, t]));
+    for (const o of TUNING_OPTIONS) {
+      const t = tools.get(o.tool) as ReviewedTool;
+      const s0 = specFor(t, { needId: needFor(t), service: 'api', workingDir: 'services/api' });
+      const values = tuningEnums(t, s0, rich)[o.id] ?? [];
+      if (values.length === 0) continue;
+      const e = tuningEffects({ ...s0, choices: { tuning: { [o.id]: values.slice(0, o.max) } } }, t, rich);
+      for (const f of e.flags) expect(o.flags, `${o.tool}/${o.id} emitted ${f.flag}`).toContain(f.flag);
+      if (t.categories.some((c) => FLOOR_CATEGORIES.includes(c))) {
+        for (const f of e.flags) expect(f.flag).not.toMatch(NARROWING);
+        expect(e.generatedConfig?.content ?? '').not.toMatch(NARROWING);
+      }
+    }
+    // the same check on the emitted flags of every option, with a render that lies about its flags, is refused (see the mutation in the report)
   });
 
   it('no reviewed tool has a choice named tuning (the name is the tuning section)', () => {
@@ -147,15 +164,6 @@ describe('enums come from the profile', () => {
     expect(e(spec('semgrep', undefined, { service: 'api' }), infra)).toEqual(['typescript', 'dockerfile', 'terraform', 'yaml']);
   });
 
-  it('osv-scanner lockfiles: the lockfile the profile found per service, inside the step folder', () => {
-    const e = (s: StepSpec) => tuningEnums(entry('osv-scanner'), s, baseCtx).lockfiles;
-    expect(e(spec('osv-scanner', undefined, { needId: 'deps' }))).toEqual(['apps/web/pnpm-lock.yaml', 'py/poetry.lock', 'services/api/package-lock.json']);
-    expect(e(spec('osv-scanner', undefined, { needId: 'deps', service: 'api', workingDir: 'services/api' }))).toEqual(['services/api/package-lock.json']);
-    // a service whose lockfile is the root's has none inside its own folder
-    const rootLock = ctxOf([service({ name: 's', path: 'sub', lockfile: 'package-lock.json' })]);
-    expect(tuningEnums(entry('osv-scanner'), spec('osv-scanner', undefined, { needId: 'deps', service: 's', workingDir: 'sub' }), rootLock).lockfiles).toEqual([]);
-  });
-
   it('skip-generated: the folders the profile marks as vendored or generated, inside the step folder', () => {
     const e = (id: string, s: Partial<StepSpec> = {}) => tuningEnums(entry(id), spec(id, undefined, s), baseCtx)['skip-generated'];
     expect(e('eslint')).toEqual(['apps/web/.next', 'services/api/dist', 'services/api/src/generated', 'vendor']);
@@ -182,14 +190,21 @@ describe('enums come from the profile', () => {
     expect(e(ctxOf([service({ name: 'x', path: '.', scripts: ['format', 'lint:fix', 'fix'] })]), 'x')).toEqual([]);   // scripts that write are not hooks
   });
 
+  it('lefthook hooks are offered only when the repo has no hook manager of any kind', () => {
+    const e = (over: Partial<RepoProfile>) => tuningEnums(entry('lefthook'), spec('lefthook', undefined, { service: 'api', needId: 'hooks-ci' }), ctxOf([api, web, py], over)).hooks;
+    expect(e({})).toEqual(['lint', 'format:check']);
+    for (const precommit of ['lefthook', 'husky', 'pre-commit'] as const) expect(e({ precommit }), precommit).toEqual([]);
+    for (const m of ['simple-git-hooks', 'githooks'] as const) expect(e({ otherHookManagers: [m] }), m).toEqual([]);
+    expect(e({ otherHookManagers: [] })).toEqual(['lint', 'format:check']);
+  });
+
   it('a hostile profile fact never reaches an enum: .., absolute, leading dash, newline, ${{, space, glob', () => {
     const bad = ['../x', '/etc', '-rf', 'a\nb', '${{ x }}', 'a b', 'a/*', 'a//b', '~/x', '', 'a\u001b[31m', 'x'.repeat(300)];
-    const hostile = ctxOf([service({ name: 'h', path: '.', lockfile: bad[0] })], { generatedDirs: [...bad, 'ok/dist'] });
+    const hostile = ctxOf([service({ name: 'h', path: '.' })], { generatedDirs: [...bad, 'ok/dist'] });
     expect(tuningEnums(entry('eslint'), spec('eslint', undefined), hostile)['skip-generated']).toEqual(['ok/dist']);
-    for (const b of bad) {
-      const c = ctxOf([service({ name: 'h', path: '.', lockfile: b })]);
-      expect(tuningEnums(entry('osv-scanner'), spec('osv-scanner', undefined, { needId: 'deps' }), c).lockfiles, JSON.stringify(b)).toEqual([]);
-    }
+    // a profile that lists a source folder as generated (a buggy or hostile reader) is not believed: the last name must be a vendored or generated one
+    const src = ctxOf([service({ name: 'h', path: '.' })], { generatedDirs: ['src', 'lib', 'services/api/src', 'tests', 'a/build', '.'] });
+    for (const id of ['eslint', 'semgrep', 'jscpd']) expect(tuningEnums(entry(id), spec(id, undefined), src)['skip-generated'], id).toEqual([]);
   });
 });
 
@@ -209,12 +224,11 @@ describe('validateSpec checks every tuning value against the enum built for the 
     expect(p[0]).toMatch(/^choices\.tuning\.skip-generated\[0\]: "src" is not one of the values this call allows \(services\/api\/dist, services\/api\/src\/generated\)/);
   });
 
-  it('hostile folder names and lockfile paths are refused: .., absolute, a leading dash, a newline, ${{, quotes, a glob', () => {
+  it('hostile folder names are refused: .., absolute, a leading dash, a newline, ${{, quotes, a glob', () => {
     const hostile = ['..', '../x', 'services/api/../../etc', '/etc/passwd', '-rf', '--config=x', 'a\nb', '${{ secrets.X }}', "x';id;'", '$(id)', '*', 'services/api/*', 'services/api/dist/../..'];
     for (const h of hostile) {
       expect(problems(spec('eslint', { 'skip-generated': [h] }, { service: 'api', workingDir: 'services/api' })), `skip ${JSON.stringify(h)}`).toHaveLength(1);
-      expect(problems(spec('osv-scanner', { lockfiles: [h] }, { needId: 'deps' })), `lock ${JSON.stringify(h)}`).toHaveLength(1);
-      expect(() => render(spec('osv-scanner', { lockfiles: [h] }, { needId: 'deps' })), h).toThrow(RenderError);
+      expect(() => render(spec('eslint', { 'skip-generated': [h] }, { service: 'api', workingDir: 'services/api' })), h).toThrow(RenderError);
     }
   });
 
@@ -232,6 +246,8 @@ describe('validateSpec checks every tuning value against the enum built for the 
       expect(p, id).toHaveLength(1);
       expect(p[0], id).toMatch(/^choices\.tuning\.skip-generated: this tool has no tuning option with that name/);
     }
+    // OSV has no tuning option at all (the lockfiles option was dropped in fix round 1)
+    expect(problems(spec('osv-scanner', { lockfiles: ['package-lock.json'] }, { needId: 'deps' }))[0]).toMatch(/no tuning option/);
     // and the hostile option names that would narrow, on every tool
     for (const name of ['skip-dirs', 'skip-paths', 'ignore-unfixed', 'severity', 'ignore-paths', 'alerts', 'exclude']) {
       for (const id of ['gitleaks', 'osv-scanner', 'trivy-image', 'zap-baseline']) expect(problems(spec(id, { [name]: ['x'] })), `${id}/${name}`).toHaveLength(1);
@@ -290,9 +306,16 @@ describe('each option renders as ruled', () => {
   it('semgrep skip-generated: --exclude, the folder relative to the step folder, the value in env and never in the shell text', async () => {
     const s = spec('semgrep', { 'skip-generated': ['services/api/dist', 'services/api/src/generated'] }, { service: 'api', workingDir: 'services/api' });
     const st = runStep(s);
-    expect(argEnv(st)).toEqual(expect.arrayContaining(['dist', 'src/generated']));
+    expect(argEnv(st)).toEqual(expect.arrayContaining(['/dist', '/src/generated']));   // anchored: a nested folder with the same name is still scanned (live test)
     expect(st.run).toMatch(/--exclude "\$PIPEGEN_ARG_\d+" --exclude "\$PIPEGEN_ARG_\d+"/);
     expect((st.run as string).split('\n').filter((l) => !l.startsWith('# tuning:')).join('\n')).not.toContain('src/generated');   // only the comment names it
+    // every Semgrep skip value starts with a slash (fix round 1): a bare name would skip every folder of that name at any depth
+    for (const dirs of [['vendor'], ['services/api/dist'], ['services/api/src/generated', 'services/api/dist']]) {
+      const x = runStep(spec('semgrep', { 'skip-generated': dirs }, { service: 'api' }));
+      const values = argEnv(x).filter((v) => v !== 'javascript');   // javascript: the base rules choice
+      expect(values.length).toBe(dirs.length);
+      for (const v of values) expect(v, v).toMatch(/^\/[A-Za-z_.]/);
+    }
     await expect(scriptSnapshot(st)).toMatchFileSnapshot('__snapshots__/tuning/semgrep-skip-generated.sh');
   });
 
@@ -301,7 +324,8 @@ describe('each option renders as ruled', () => {
     for (const [id, flag, pos] of [['eslint', '--ignore-pattern', '.'], ['eslint-typescript', '--ignore-pattern', '.'], ['oxlint-typeaware', '--ignore-pattern', null], ['jscpd', '--ignore', '.']] as const) {
       const s = spec(id, { 'skip-generated': ['services/api/dist'] }, wd);
       const st = runStep(s);
-      expect(argEnv(st), id).toContain('dist/**');
+      // jscpd matches a glob against any suffix of the path, so its pattern is anchored with ./ (a nested dist/ is still checked); ESLint and oxlint anchor at the cwd
+      expect(argEnv(st), id).toContain(id === 'jscpd' ? './dist/**' : 'dist/**');
       expect(st.run, id).toMatch(new RegExp(`${flag} "\\$PIPEGEN_ARG_\\d+"`));
       // the files word stays last: the flag is before it (urfave and cobra tools stop reading flags at the first plain word)
       if (pos !== null) {
@@ -317,16 +341,6 @@ describe('each option renders as ruled', () => {
   it('a repo-wide step skips the folders as repo-relative patterns', () => {
     const st = runStep(spec('eslint', { 'skip-generated': ['vendor', 'services/api/dist'] }));
     expect(argEnv(st)).toEqual(expect.arrayContaining(['vendor/**', 'services/api/dist/**']));
-  });
-
-  it('osv-scanner lockfiles: --lockfile per path, right after the subcommand and before --recursive and the folder', async () => {
-    const s = spec('osv-scanner', { lockfiles: ['apps/web/pnpm-lock.yaml', 'services/api/package-lock.json'] }, { needId: 'deps' });
-    const st = runStep(s);
-    expect(argEnv(st)).toEqual(expect.arrayContaining(['apps/web/pnpm-lock.yaml', 'services/api/package-lock.json']));
-    const line = (st.run as string).split('\n').find((l) => l.includes('--recursive')) as string;
-    expect(line).toMatch(/scan source --lockfile "\$PIPEGEN_ARG_\d+" --lockfile "\$PIPEGEN_ARG_\d+"/);
-    expect(line.indexOf('--lockfile')).toBeLessThan(line.indexOf('--recursive'));
-    await expect(yamlOf(render(s).steps)).toMatchFileSnapshot('__snapshots__/tuning/osv-lockfiles.yml');
   });
 
   it('lefthook hooks: a generated config of the service\'s own scripts, written beside the run and named by LEFTHOOK_CONFIG; env -i lets only that through', async () => {
@@ -372,6 +386,13 @@ describe('each option renders as ruled', () => {
     expect(() => render(spec('zap-baseline', { 'start-script': ['start'] }, { service: 'py', needId: 'dast' }))).toThrow(RenderError);
   });
 
+  it('the start-script comment does not claim the app was started: it says Plan G does it', () => {
+    const st = runStep(spec('zap-baseline', { 'start-script': ['start'] }, { service: 'api', needId: 'dast' }));
+    const line = (st.run as string).split('\n').find((l) => l.startsWith('# tuning:')) as string;
+    expect(line).toMatch(/Plan G starts the app/);
+    expect(line).not.toMatch(/is started/);
+  });
+
   it('every tuned step shows its tuning in a comment line of its script', () => {
     const st = runStep(spec('semgrep', { 'extra-rules': ['dockerfile'], 'skip-generated': ['services/api/dist'] }, { service: 'api', workingDir: 'services/api' }));
     const lines = (st.run as string).split('\n').filter((l) => l.startsWith('# tuning:'));
@@ -384,7 +405,7 @@ describe('each option renders as ruled', () => {
   });
 
   it('a spec with no tuning renders exactly as before, and an empty tuning section renders the same', () => {
-    for (const id of ['semgrep', 'eslint', 'osv-scanner', 'lefthook', 'zap-baseline']) {
+    for (const id of ['semgrep', 'eslint', 'lefthook', 'zap-baseline']) {
       const a = render(spec(id, undefined, { needId: needFor(entry(id)) }));
       const b = render(spec(id, {}, { needId: needFor(entry(id)) }));
       const c = render(spec(id, Object.fromEntries(TUNING_OPTIONS.filter((o) => o.tool === id).map((o) => [o.id, []])), { needId: needFor(entry(id)) }));
@@ -406,7 +427,6 @@ describe('tuned scripts are valid shell', () => {
     const all: StepSpec[] = [
       spec('semgrep', { 'extra-rules': ['typescript', 'dockerfile'], 'skip-generated': ['services/api/dist'] }, wd),
       spec('eslint', { 'skip-generated': ['services/api/dist'] }, wd), spec('oxlint-typeaware', { 'skip-generated': ['services/api/dist'] }, wd), spec('jscpd', { 'skip-generated': ['services/api/dist'] }, wd),
-      spec('osv-scanner', { lockfiles: ['services/api/package-lock.json'] }, { needId: 'deps' }),
       spec('lefthook', { hooks: ['lint'] }, { service: 'api', needId: 'hooks-ci' }), spec('zap-baseline', { 'start-script': ['start'] }, { service: 'api', needId: 'dast' }),
     ];
     for (const s of all) {
@@ -420,10 +440,9 @@ describe('describeTuning', () => {
   it('plain-English lines for a tuned spec, none for an untuned one', () => {
     expect(describeTuning(spec('eslint', undefined))).toEqual([]);
     expect(describeTuning(spec('eslint', {}))).toEqual([]);
-    expect(describeTuning(spec('osv-scanner', { lockfiles: ['py/poetry.lock'] }, { needId: 'deps' }))).toEqual(['also scans the lockfile py/poetry.lock (adds coverage)']);
     expect(describeTuning(spec('eslint', { 'skip-generated': ['vendor', 'services/api/dist'] }))).toEqual(['skips the vendored or generated folders vendor, services/api/dist for this lint or SAST tool only']);
     expect(describeTuning(spec('lefthook', { hooks: ['lint'] }, { service: 'api', needId: 'hooks-ci' }))).toEqual(['runs the service\'s own lint script as a pre-commit hook (adds coverage)']);
-    expect(describeTuning(spec('zap-baseline', { 'start-script': ['start'] }, { needId: 'dast' }))).toEqual(['the app is started with its own start script before the scan (adds coverage)']);
+    expect(describeTuning(spec('zap-baseline', { 'start-script': ['start'] }, { needId: 'dast' }))).toEqual(['Plan G starts the app with its own start script before the scan (adds coverage)']);
   });
 
   it('every line is clean text: no control characters, no markup, short, even for hostile values', () => {

@@ -1,5 +1,4 @@
-// Plan B Task 6d: the two profile facts per-repo tuning reads. Written first (strict test-first).
-// - Service.lockfile: the repo-relative path of the lockfile the reader found for the service (its own folder's, else the root's).
+// Plan B Task 6d: the profile facts per-repo tuning reads. Written first (strict test-first).
 // - RepoProfile.generatedDirs: the folders pipegen itself detects as vendored or generated (DECISIONS #108), by a fixed list of
 //   names that exist as real folders (never a link), at the root or in a service folder.
 import { mkdirSync, symlinkSync } from 'node:fs';
@@ -10,29 +9,6 @@ import { cleanupRepos, makeRepo, writeIn } from './helpers/make-repo.js';
 
 afterEach(() => cleanupRepos());
 const GH = 'https://github.com/o/r.git';
-
-describe('read: Service.lockfile (6d)', () => {
-  it('a node service has its own lockfile path; python has poetry.lock, uv.lock or requirements.txt', async () => {
-    expect((await readProject(makeRepo('node-npm', GH))).services[0]?.lockfile).toBe('package-lock.json');
-    expect((await readProject(makeRepo('python-poetry', GH))).services[0]?.lockfile).toBe('poetry.lock');
-    expect((await readProject(makeRepo('python-uv', GH))).services[0]?.lockfile).toBe('uv.lock');
-    const pnpm = await readProject(makeRepo('node-pnpm-workspaces', GH));
-    expect(pnpm.services.map((s) => s.lockfile)).toEqual(pnpm.services.map(() => 'pnpm-lock.yaml'));
-  });
-
-  it('a service folder\'s own lockfile wins over the root\'s, and a service folder with none has the root\'s', async () => {
-    const dir = makeRepo('node-npm', GH);
-    writeIn(dir, 'api/package.json', '{"name":"api","scripts":{"start":"node i.js"}}');
-    writeIn(dir, 'api/yarn.lock', '# yarn\n');
-    writeIn(dir, 'web/package.json', '{"name":"web","scripts":{"start":"node i.js"}}');
-    writeIn(dir, 'api/Dockerfile', 'FROM node:22\n');
-    writeIn(dir, 'web/Dockerfile', 'FROM node:22\n');
-    const p = await readProject(dir);
-    const by = Object.fromEntries(p.services.map((s) => [s.path, s.lockfile]));
-    expect(by.api).toBe('api/yarn.lock');
-    expect(by.web).toBe('package-lock.json');
-  });
-});
 
 describe('read: RepoProfile.generatedDirs (6d, DECISIONS #108)', () => {
   it('only folders that exist as real folders, at the root or in a service folder', async () => {
@@ -76,5 +52,40 @@ describe('read: RepoProfile.generatedDirs (6d, DECISIONS #108)', () => {
     const dir = makeRepo('node-npm', GH);
     mkdirSync(join(dir, 'a b'));   // not on the list anyway; the list is fixed names only
     expect((await readProject(dir)).generatedDirs).toBeUndefined();
+  });
+
+  it('a generated folder that is a service folder, or holds one, is dropped (never a whole service), with a note', async () => {
+    const dir = makeRepo('node-npm', GH);
+    for (const d of ['packages/generated', 'gen/generated/app']) {
+      writeIn(dir, `${d}/package.json`, '{"name":"s-' + d.replace(/\W/g, '') + '","scripts":{"start":"node i.js"}}');
+      writeIn(dir, `${d}/Dockerfile`, 'FROM node:22\n');
+    }
+    mkdirSync(join(dir, 'dist'));   // a real generated folder at the root stays
+    const notes: string[] = [];
+    const p = await readProject(dir, { notes });
+    expect(p.services.map((s) => s.path).sort()).toEqual(['gen/generated/app', 'packages/generated']);
+    expect(p.generatedDirs).toEqual(['dist']);
+    expect(notes.join('\n')).toMatch(/packages\/generated.*service/s);
+    expect(notes.join('\n')).toMatch(/gen\/generated.*service/s);
+  });
+});
+
+describe('read: RepoProfile.otherHookManagers (6d fix round 1)', () => {
+  const managers = async (files: Record<string, string>, config = ''): Promise<string[] | undefined> => {
+    const dir = makeRepo('node-npm', GH);
+    for (const [f, c] of Object.entries(files)) writeIn(dir, f, c);
+    if (config !== '') writeIn(dir, '.git/config', `[remote "origin"]\n\turl = ${GH}\n${config}`);
+    return (await readProject(dir)).otherHookManagers;
+  };
+  it('none by default', async () => { expect(await managers({})).toBeUndefined(); });
+  it('simple-git-hooks: a config file or a package.json key', async () => {
+    expect(await managers({ '.simple-git-hooks.json': '{}' })).toEqual(['simple-git-hooks']);
+    expect(await managers({ '.simple-git-hooks.cjs': 'module.exports={}' })).toEqual(['simple-git-hooks']);
+    expect(await managers({ 'simple-git-hooks.js': 'module.exports={}' })).toEqual(['simple-git-hooks']);
+    expect(await managers({ 'package.json': '{"name":"x","simple-git-hooks":{"pre-commit":"npm test"}}' })).toEqual(['simple-git-hooks']);
+  });
+  it('a .githooks folder, or core.hooksPath in .git/config', async () => {
+    expect(await managers({ '.githooks/pre-commit': '#!/bin/sh\n' })).toEqual(['githooks']);
+    expect(await managers({}, '[core]\n\thooksPath = .githooks\n')).toEqual(['githooks']);
   });
 });

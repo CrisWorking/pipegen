@@ -59,6 +59,6 @@ else
 fi
 exit "$rc"
 # PIPEGEN_ARG values
-dist
-src/generated
+/dist
+/src/generated
 javascript

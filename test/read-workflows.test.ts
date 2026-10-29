@@ -261,6 +261,17 @@ describe('readPrecommit', () => {
     expect(readPrecommit(d2)).toBe('lefthook');
   });
 
+  it('precommit: every config name lefthook 2.2.2 reads counts as lefthook (and its -local files)', () => {
+    const names = ['lefthook.yml', 'lefthook.yaml', 'lefthook.toml', 'lefthook.json', 'lefthook.jsonc', '.lefthook.yml', '.lefthook.yaml', '.lefthook.toml', '.lefthook.json', '.lefthook.jsonc',
+      '.config/lefthook.yml', '.config/lefthook.yaml', '.config/lefthook.toml', '.config/lefthook.json', '.config/lefthook.jsonc',
+      'lefthook-local.yml', 'lefthook-local.toml', '.lefthook-local.yml', '.lefthook-local.json', '.config/lefthook-local.yml'];
+    for (const n of names) {
+      const d = makeTempDir();
+      writeIn(d, n, 'x: 1');
+      expect(readPrecommit(d), n).toBe('lefthook');
+    }
+  });
+
   it('precommit: symlinked config ignored', () => {
     const dir = makeTempDir();
     const other = makeTempDir();

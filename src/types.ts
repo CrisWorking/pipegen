@@ -24,8 +24,6 @@ export interface Service {
   /** P60 (R4): other languages the folder also holds (a Python app with a package.json for its asset build): tools of these cover it too. Set only when not empty. */
   alsoLanguages?: Language[];
   dockerfile?: string; port?: number; hasTests: boolean; testFramework?: string;
-  /** Plan B 6d: the repo-relative path of the lockfile the reader found for this service (its own folder's, else the root's): package-lock.json, pnpm-lock.yaml, yarn.lock, bun.lock(b), poetry.lock, uv.lock or requirements.txt. Raw but validated (a plain path); absent when none was found. Per-repo tuning (OSV) reads it */
-  lockfile?: string;
   envVars: string[]; dependsOn: Dependency[];
   scripts: string[];      // script names from package.json `scripts` / pyproject `[project.scripts]` + `[tool.poetry.scripts]` (names only, never the commands)
   frameworks: string[];   // detected server frameworks: express, fastify, @nestjs/core, next, koa, hapi; flask, fastapi, django (never the service's own package name: the express repo doesn't USE express). Used by isRunnable (Plan B Task 1)
@@ -60,8 +58,10 @@ export interface RepoProfile {
   monorepo: Monorepo; services: Service[]; terraformDirs: string[]; hasCompose: boolean;
   existingWorkflows: ExistingWorkflow[]; precommit: 'pre-commit' | 'husky' | 'lefthook' | null;
   repoFiles: RepoFiles;   // Plan P Task 1: repo-level config files, read once
-  /** Plan B 6d (DECISIONS #108): folders pipegen itself detected as vendored or generated (node_modules, vendor, dist, target, .next, .venv, or a folder named generated or __generated__), repo-relative and plain, sorted. Per-repo tuning may skip them for lint and SAST only. Absent when none */
+  /** Plan B 6d (DECISIONS #108): folders pipegen itself detected as vendored or generated (node_modules, vendor, dist, target, .next, .venv, or a folder named generated or __generated__), repo-relative and plain, sorted. Never a service folder, and never a folder that holds one. Per-repo tuning may skip them for lint and SAST only. Absent when none */
   generatedDirs?: string[];
+  /** Plan B 6d fix round 1: hook managers other than the three `precommit` names (simple-git-hooks: a config file or a package.json key; githooks: a .githooks folder or core.hooksPath in .git/config). Per-repo tuning offers generated lefthook hooks only when `precommit` is null and this is absent. Absent when none */
+  otherHookManagers?: ('simple-git-hooks' | 'githooks')[];
 }
 // ---------- GitHub access (moved here from Plan A Task 6 in round 4: Plan U uses it too) ----------
 export interface Auth {

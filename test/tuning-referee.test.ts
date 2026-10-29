@@ -1,5 +1,6 @@
 // Plan B Task 6d: the referee accepts a tuned config only when it equals what the renderer produces from the same draft
-// (one source of truth: the referee re-renders every draft step, tuning included). Written first (strict test-first).
+// (one source of truth: the referee re-renders every draft step, tuning included). Written AFTER the tuning code, which the referee
+// needed no change for; each tamper below is mutation-checked (a tamper must hit the env value or the script, not only the # tuning: comment).
 import { Document } from 'yaml';
 import { describe, expect, it } from 'vitest';
 import { referee, type Linters, type RefereeReport } from '../src/engine/referee.js';
@@ -12,7 +13,7 @@ import type { Capabilities, CreatedFile, Need, PipelineDraft, StepSpec } from '.
 import { entry, platform, profile, reviewedList, service, specFor } from './helpers/render.js';
 
 const api = service({
-  name: 'api', path: 'services/api', dockerfile: 'services/api/Dockerfile', lockfile: 'services/api/package-lock.json',
+  name: 'api', path: 'services/api', dockerfile: 'services/api/Dockerfile',
   scripts: ['start', 'test', 'lint', 'format:check'], quality: { ...emptyServiceQuality(), tsconfig: true },
 });
 const prof = { ...profile([api]), generatedDirs: ['services/api/dist', 'services/api/src/generated'], repoFiles: emptyRepoFiles() };
@@ -51,7 +52,7 @@ const has = (r: RefereeReport, c: string): boolean => r.issues.some((i) => i.che
 const TUNED: StepSpec[] = [
   specOf('semgrep', 'sast', { 'extra-rules': ['typescript', 'dockerfile'], 'skip-generated': ['services/api/dist'] }),
   specOf('eslint', 'lint', { 'skip-generated': ['services/api/dist', 'services/api/src/generated'] }),
-  specOf('osv-scanner', 'deps', { lockfiles: ['services/api/package-lock.json'] }),
+  specOf('oxlint-typeaware', 'lint', { 'skip-generated': ['services/api/dist'] }),
   specOf('lefthook', 'hooks-ci', { hooks: ['lint', 'format:check'] }),
 ];
 
@@ -101,8 +102,12 @@ describe('referee: tampering with one tuned value in the file is a template issu
     const r = await tamper(0, 'dockerfile:/pipegen-rules-extra/dockerfile:ro', 'dockerfile:/pipegen-rules-extra/dockerfile:rw');
     expect(has(r, 'template'), show(r)).toBe(true);
   });
-  it('a lockfile path changed', async () => {
-    const r = await tamper(2, 'services/api/package-lock.json', 'package-lock.json');
+  it('an oxlint skip value changed in the env (not the comment)', async () => {
+    const r = await tamper(2, 'PIPEGEN_ARG_0: dist/**', 'PIPEGEN_ARG_0: src/**');
+    expect(has(r, 'template'), show(r)).toBe(true);
+  });
+  it('a Semgrep skip anchor removed from the env: the bare name would skip every folder of that name', async () => {
+    const r = await tamper(0, /PIPEGEN_ARG_(\d+): \/dist/, 'PIPEGEN_ARG_$1: dist');
     expect(has(r, 'template'), show(r)).toBe(true);
   });
   it('a generated hook command changed', async () => {

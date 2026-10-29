@@ -26,6 +26,25 @@ const TOP_GENERATED = ['node_modules', 'vendor', 'dist', 'target', '.next', '.ve
 const GENERATED_NAMES = new Set(['generated', '__generated__']);
 const MAX_GENERATED_DIRS = 64;
 
+/** Hook managers beyond pre-commit, husky and lefthook (6d fix round 1): the repo already has hooks, so pipegen builds none. */
+async function readOtherHookManagers(root: string, rootPkg: unknown): Promise<('simple-git-hooks' | 'githooks')[]> {
+  const out: ('simple-git-hooks' | 'githooks')[] = [];
+  const real = async (rel: string, dirNotFile = false): Promise<boolean> => {
+    const info = await lstat(joinOs(root, rel)).catch(() => null);
+    return info !== null && !info.isSymbolicLink() && (dirNotFile ? info.isDirectory() : info.isFile());
+  };
+  let simple = typeof rootPkg === 'object' && rootPkg !== null && Object.hasOwn(rootPkg, 'simple-git-hooks');
+  for (const n of ['.simple-git-hooks.json', '.simple-git-hooks.js', '.simple-git-hooks.cjs', '.simple-git-hooks.mjs', 'simple-git-hooks.js', 'simple-git-hooks.cjs', 'simple-git-hooks.mjs', 'simple-git-hooks.json']) if (!simple && await real(n)) simple = true;
+  if (simple) out.push('simple-git-hooks');
+  let githooks = await real('.githooks', true);
+  if (!githooks) {
+    const cfg = await readTextLimitedWithReason(joinOs(root, '.git', 'config'), root);
+    githooks = 'text' in cfg && /^\s*hookspath\s*=/im.test(cfg.text);
+  }
+  if (githooks) out.push('githooks');
+  return out;
+}
+
 async function readGeneratedDirs(root: string, serviceDirs: readonly string[], files: readonly string[]): Promise<string[]> {
   const found = new Set<string>();
   for (const d of new Set(['.', ...serviceDirs])) {
@@ -189,12 +208,8 @@ async function readService(ctx: Ctx, dir: string, shared: Shared): Promise<Servi
   const testFiles = owned.filter((f) => isTestFile(relTo(f)));
 
   const scope = dir === '.' ? ['.'] : [dir, '.'];
-  const lockHit = (locks: [string, PackageManager][]) => scope.flatMap((d) => locks.filter(([name]) => ctx.fileSet.has(inDir(d, name))).map(([name, pm]) => ({ path: inDir(d, name), pm })))[0];
-  const lockfile = (locks: [string, PackageManager][]) => lockHit(locks)?.pm;
+  const lockfile = (locks: [string, PackageManager][]) => scope.flatMap((d) => locks.filter(([name]) => ctx.fileSet.has(inDir(d, name)))).map(([, pm]) => pm)[0];
   const packageManager = language === 'node' ? lockfile(NODE_LOCKS) : language === 'python' ? lockfile(PYTHON_LOCKS) ?? (requirementFiles.length > 0 ? 'pip' : undefined) : undefined;
-  // Plan B 6d: the path of that lockfile (python without one: the folder's own requirements.txt), kept only when it is a plain path
-  const lockPath = language === 'node' ? lockHit(NODE_LOCKS)?.path : language === 'python' ? lockHit(PYTHON_LOCKS)?.path ?? (requirementFiles.includes(inDir(dir, 'requirements.txt')) ? inDir(dir, 'requirements.txt') : undefined) : undefined;
-  const lockfilePath = lockPath !== undefined && PLAIN_PATH_RE.test(lockPath) ? lockPath : undefined;
 
   const firstLine = async (rels: string[]) => {
     for (const rel of rels) {
@@ -248,7 +263,7 @@ async function readService(ctx: Ctx, dir: string, shared: Shared): Promise<Servi
     dir, read: (rel) => readFile(ctx, rel), fileSet: ctx.fileSet, copies: shared.copies, scripts: pkgScripts, deps, devDeps, frameworks,
     hasDockerfile: dockerfile !== undefined, port, language, serviceDirs: shared.serviceDirs,
   });
-  return { name, path: dir, language, ...(alsoLanguages.length === 0 ? {} : { alsoLanguages }), packageManager, ...(lockfilePath === undefined ? {} : { lockfile: lockfilePath }), runtimeVersion, dockerfile, port, hasTests, testFramework, ...env, scripts, frameworks, quality, ...(notStandalone === undefined ? {} : { notStandalone }) };
+  return { name, path: dir, language, ...(alsoLanguages.length === 0 ? {} : { alsoLanguages }), packageManager, runtimeVersion, dockerfile, port, hasTests, testFramework, ...env, scripts, frameworks, quality, ...(notStandalone === undefined ? {} : { notStandalone }) };
 }
 
 async function anyFileHasLine(ctx: Ctx, files: string[], re: RegExp): Promise<boolean> {
@@ -381,9 +396,16 @@ export async function readProject(dir: string, opts?: { notes?: string[] }): Pro
   const only = services.length === 1 ? services[0] : undefined;
   const registry = only?.language === 'node' ? 'npm' : only?.language === 'python' ? 'pypi' : undefined;
   if (only !== undefined && only.path === '.' && registry !== undefined && existingWorkflows.some((w) => w.publishes?.includes(registry))) only.publishedPackage = true;
-  const generatedDirs = await readGeneratedDirs(dir, dirs, files);
+  // a detected folder is never a whole service (a workspace package called `generated`) nor one that holds a service: skipping it would skip code pipegen was asked to check
+  const detected = await readGeneratedDirs(dir, dirs, files);
+  const generatedDirs = detected.filter((g) => {
+    const hit = dirs.find((d) => d !== '.' && (d === g || d.startsWith(`${g}/`)));
+    if (hit !== undefined) note(ctx, `pipegen did not treat ${g} as a generated folder: it is, or holds, the service folder ${hit}.`);
+    return hit === undefined;
+  });
+  const otherHookManagers = await readOtherHookManagers(dir, rootPkg);
   return {
-    owner, repo, defaultBranch: 'main', monorepo, services, ...(generatedDirs.length === 0 ? {} : { generatedDirs }),
+    owner, repo, defaultBranch: 'main', monorepo, services, ...(generatedDirs.length === 0 ? {} : { generatedDirs }), ...(otherHookManagers.length === 0 ? {} : { otherHookManagers }),
     terraformDirs: [...new Set(files.filter((f) => f.endsWith('.tf')).map(dirOf))].sort(),
     hasCompose: files.some((f) => /^(docker-)?compose\.ya?ml$/.test(baseOf(f))),
     existingWorkflows, precommit: readPrecommit(dir), repoFiles: await readRepoFiles(dir, ctx.notes, shared.quality),

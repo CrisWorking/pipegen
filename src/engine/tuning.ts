@@ -7,19 +7,18 @@
 // DECISIONS #108 (binding): tuning only ADDS coverage. Secret, dependency and image scans are never narrowed by pipegen: no skip
 // path, no ignore-unfixed, no severity above the floor, no ZAP alert moved to warn. Lint and SAST may skip only folders pipegen
 // itself detected as vendored or generated (RepoProfile.generatedDirs). So there are two kinds, and no third:
-//   - `adds`: more coverage (more Semgrep rule folders, more OSV lockfiles, hooks from the repo's own lint scripts, the app's
+//   - `adds`: more coverage (more Semgrep rule folders, hooks from the repo's own lint scripts, the app's
 //     own start script for a web scan);
 //   - `scope-lint`: a folder skip, offered only on tools of the lint, SAST, duplication and dead-code classes (the test walks
 //     this model and fails if a skip option sits on a secret, dependency, image, IaC, licence, SBOM or DAST tool).
 // Tools covered, and why each option fits #108:
 //   semgrep (sast)        extra-rules   adds        more rule folders of the verified rules tree for the languages and files the service has
 //   semgrep (sast)        skip-generated scope-lint --exclude of a folder the profile marks vendored or generated (SAST class)
-//   osv-scanner (deps)    lockfiles     adds        one --lockfile per lockfile the profile found; the recursive scan stays as it is
 //   eslint, eslint-typescript, oxlint-typeaware (lint)   skip-generated  scope-lint  --ignore-pattern of such a folder
 //   jscpd (duplication)   skip-generated scope-lint --ignore of such a folder
 //   zap-baseline, nuclei (dast)  start-script  adds   the service's own start or serve script, for Plan G to start the app
-//   lefthook (hooks-ci)   hooks         adds        hooks from the repo's own lint and format-check scripts, only when the repo has no lefthook hooks of its own
-// NOT built, on purpose: gitleaks/betterleaks extra rules (no reviewed rule list exists; no skip path ever), trivy (no skip dir,
+//   lefthook (hooks-ci)   hooks         adds        hooks from the repo's own lint and format-check scripts, only when the repo has no hook manager at all
+// NOT built, on purpose: OSV --lockfile (dropped in 6d fix round 1: measured with osv-scanner 2.7.0 it adds nothing next to --recursive . and exits 127 on bun.lockb), gitleaks/betterleaks extra rules (no reviewed rule list exists; no skip path ever), trivy (no skip dir,
 // no ignore-unfixed, no severity: it is image/IaC/licence scanning), ZAP alert rules, biome (its only ignore is a config key
 // whose globs are relative to the pinned config's own folder, not the repo, so a safe form can not be shown offline) and knip
 // (no folder ignore on its command line). A tool with no entry here has no tuning, and a tuning value for it is refused.
@@ -151,11 +150,6 @@ function extraRuleFolders(f: Facts): string[] {
   return ordered.filter((x) => x !== base && SEMGREP_RULE_FOLDERS.includes(x) && FOLDER_RE.test(x));
 }
 
-function lockfiles(f: Facts): string[] {
-  if (f.badWd) return [];
-  return sortedUnique(f.scope.map((s) => s.lockfile).filter((p): p is string => plainPath(p) && under(f, p)));
-}
-
 function generated(f: Facts): string[] {
   if (f.badWd) return [];
   const dirs = f.ctx.profile.generatedDirs ?? [];
@@ -170,7 +164,10 @@ function startScripts(f: Facts): string[] {
 
 function hookScripts(f: Facts): string[] {
   const s = f.service;
-  if (s === undefined || f.ctx.profile.precommit === 'lefthook' || s.language !== 'node' || s.packageManager !== 'npm') return [];
+  // only a repo with NO hook manager at all: lefthook in any form (the reader knows every name), husky, pre-commit, simple-git-hooks, .githooks.
+  // lefthook-local.yml in the repo would still merge over a generated config, which is why a repo with any lefthook file is never offered hooks
+  const p = f.ctx.profile;
+  if (s === undefined || p.precommit !== null || (p.otherHookManagers ?? []).length > 0 || s.language !== 'node' || s.packageManager !== 'npm') return [];
   if (s.path !== '.' && !(plainPath(s.path))) return [];
   return HOOK_SCRIPTS.filter((n) => s.scripts.includes(n));
 }
@@ -198,25 +195,20 @@ const DEFS: readonly Def[] = [
     }),
     describe: (values) => `also runs the Semgrep rule sets ${list(values)} (adds coverage)`,
   },
-  skipGenerated('semgrep', '--exclude', (rel) => rel, 'Skips a folder the profile marks as vendored or generated (SAST class only).'),
-  {
-    id: 'lockfiles', tool: 'osv-scanner', kind: 'adds', max: 8, flags: ['--lockfile'],
-    summary: 'Scans each lockfile the profile found for a service by name, besides the recursive scan (which is unchanged).',
-    values: lockfiles,
-    render: (values, f) => ({ flags: values.map((v, i) => ({ flag: '--lockfile', value: relTo(f, v), key: `tune:lockfiles:${i}` })) }),
-    describe: (values) => `also scans the lockfile${values.length === 1 ? '' : 's'} ${list(values)} (adds coverage)`,
-  },
+  // anchored with a leading slash: a bare name skips every folder of that name at any depth (measured, semgrep 1.181.0)
+  skipGenerated('semgrep', '--exclude', (rel) => `/${rel}`, 'Skips a folder the profile marks as vendored or generated (SAST class only), at that path only.'),
   skipGenerated('eslint', '--ignore-pattern', (rel) => `${rel}/**`, 'Skips a folder the profile marks as vendored or generated.'),
   skipGenerated('eslint-typescript', '--ignore-pattern', (rel) => `${rel}/**`, 'Skips a folder the profile marks as vendored or generated.'),
   skipGenerated('oxlint-typeaware', '--ignore-pattern', (rel) => `${rel}/**`, 'Skips a folder the profile marks as vendored or generated.'),
-  skipGenerated('jscpd', '--ignore', (rel) => `${rel}/**`, 'Skips a folder the profile marks as vendored or generated.'),
+  // ./-anchored: jscpd matches a glob against any suffix of the path (measured, jscpd 5.4.2)
+  skipGenerated('jscpd', '--ignore', (rel) => `./${rel}/**`, 'Skips a folder the profile marks as vendored or generated.'),
   ...(['zap-baseline', 'nuclei'] as const).map((tool): Def => ({
     id: 'start-script', tool, kind: 'adds', max: 1, flags: [],
     summary: "Names the service's own start or serve script, which Plan G runs to start the app before the scan. The scan step itself does not change.",
     values: startScripts,
     emptyReason: (f) => `the service ${show(f.service?.name ?? f.spec.service ?? 'for this step')} has no start or serve script in its package.json, so pipegen can not start the app for the scan`,
     render: () => ({}),
-    describe: (values) => `the app is started with its own ${list(values)} script before the scan (adds coverage)`,
+    describe: (values) => `Plan G starts the app with its own ${list(values)} script before the scan (adds coverage)`,
   })),
   {
     id: 'hooks', tool: 'lefthook', kind: 'adds', max: 4, flags: [],
@@ -297,6 +289,8 @@ export function tuningEffects(spec: StepSpec, tool: ReviewedTool, ctx: RenderCon
     const values = picksOf(spec, d.id);
     if (values.length === 0) continue;
     const r = d.render(values, f);
+    // a render may emit only the flags its option declares (DECISIONS #108 guard on what is rendered, not on the metadata)
+    for (const fl of r.flags ?? []) if (!d.flags.includes(fl.flag)) throw new RenderError(`The tuning option ${show(d.id)} of ${show(tool.id)} emitted ${show(fl.flag)}, which it does not declare.`);
     out.flags.push(...(r.flags ?? []));
     out.extraRules.push(...(r.extraRules ?? []));
     if (r.generatedConfig !== undefined) out.generatedConfig = r.generatedConfig;
