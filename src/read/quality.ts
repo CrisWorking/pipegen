@@ -18,7 +18,7 @@ import { REQUIREMENTS_FILE_RE, asObj, baseOf, dirOf, inDir, pythonNames, readPyp
 // - Other files are found in the file list readProject already built (no new glob per service). Fixed repo-level paths
 //   (Dependabot, Renovate, licence config) are checked by path, so the 20,000-file cap can never hide them.
 
-export const QUALITY_PACKAGES: readonly QualityPackage[] = Object.freeze(['typescript', 'eslint', 'prettier', '@biomejs/biome', 'oxlint', 'vitest', 'jest', 'c8', 'knip', 'vue-tsc', 'svelte-check', '@astrojs/check'] as const);
+export const QUALITY_PACKAGES: readonly QualityPackage[] = Object.freeze(['typescript', 'eslint', 'prettier', '@biomejs/biome', 'oxlint', 'vitest', 'jest', 'c8', 'knip', 'vue-tsc', 'svelte-check', '@astrojs/check', 'xo'] as const);
 /** The only version shape kept: the plan's pattern (a prerelease of at most 40 characters, no build metadata). */
 export const VERSION_RE = /^\d+\.\d+\.\d+(-[0-9A-Za-z.-]{1,40})?$/;
 /** Ruling PS4. Decimal megabytes, as READ_LIMITS.maxFileBytes (1 MB) is. */
@@ -413,6 +413,8 @@ const TYPE_CHECKERS = ['mypy', 'pyright', 'basedpyright'];
 interface ConfigRule { config: QualityConfig; language: Language; files: string[]; pkgKey?: string; tool?: string; ini?: RegExp }
 /** Config files are looked for in the service's folder and every folder above it (the tools search upwards). */
 const CONFIG_RULES: readonly ConfigRule[] = [
+  // P55 (batch B): XO, an ESLint wrapper that is configured in package.json (`xo`) or xo.config.* (https://github.com/xojs/xo)
+  { config: 'xo', language: 'node', files: [...JS_EXT.map((x) => `xo.config.${x}`), ...['.xo-config', ...['js', 'cjs', 'json'].map((x) => `.xo-config.${x}`)]], pkgKey: 'xo' },
   { config: 'biome', language: 'node', files: ['biome.json', 'biome.jsonc'] },
   { config: 'prettier', language: 'node', files: ['.prettierrc', ...['json', 'json5', 'yaml', 'yml', 'toml', ...JS_EXT].map((x) => `.prettierrc.${x}`), ...JS_EXT.map((x) => `prettier.config.${x}`)], pkgKey: 'prettier' },
   { config: 'knip', language: 'node', files: ['knip.json', 'knip.jsonc', '.knip.json', '.knip.jsonc', ...JS_EXT.flatMap((x) => [`knip.${x}`, `knip.config.${x}`])], pkgKey: 'knip' },

@@ -87,16 +87,17 @@ const major = (v: string | undefined): number | null => {
 
 // ---------- node lint and format ----------
 
-type NodeLint = { engine: 'eslint' | 'biome' | 'oxlint'; own: boolean };
-/** The repo's own linter if it configured one (ESLint first, then Biome, then Oxlint), else the framework rule, else Biome. */
+type NodeLint = { engine: 'eslint' | 'xo' | 'biome' | 'oxlint'; own: boolean };
+/** The repo's own linter if it configured one (ESLint first, then XO, Biome, Oxlint), else the framework rule, else Biome. XO is an ESLint wrapper that lints and checks style, so nothing else is suggested next to it (P55). */
 function nodeLint(q: Service['quality']): NodeLint {
   if (q.eslintConfig !== 'none') return { engine: 'eslint', own: true };
+  if (q.configs.includes('xo')) return { engine: 'xo', own: true };
   if (q.configs.includes('biome')) return { engine: 'biome', own: true };
   if (q.configs.includes('oxlint')) return { engine: 'oxlint', own: true };
   return q.uiFrameworks.length > 0 ? { engine: 'eslint', own: false } : { engine: 'biome', own: false };
 }
 const isTypeScript = (q: Service['quality']) => q.tsconfig || q.versions.typescript !== undefined;
-const PACKAGE_OF = { eslint: 'eslint', biome: '@biomejs/biome', oxlint: 'oxlint' } as const;
+const PACKAGE_OF = { eslint: 'eslint', xo: 'xo', biome: '@biomejs/biome', oxlint: 'oxlint' } as const;
 const FRAMEWORK_NAMES = { next: 'Next', nuxt: 'Nuxt', vue: 'Vue', svelte: 'Svelte', astro: 'Astro', 'react-native': 'React Native' } as const;
 
 /** Task 9 (DECISIONS #104): ESLint's Vue, Svelte and Astro plugins are not set up by pipegen yet (v0.2), so those files are not linted. */
@@ -119,7 +120,7 @@ function lintRule(c: Ctx): Choice {
     if (l.engine === 'eslint' && (major(version ?? undefined) ?? 0) >= 10 && q.eslintConfig === 'eslintrc') {
       return own(c, 'eslint', version, "the repo's ESLint config: error, ESLint 10 doesn't read .eslintrc; migrate it with ESLint's migration tool (@eslint/migrate-config)", 'eslint');
     }
-    const names = { eslint: 'ESLint', biome: 'Biome', oxlint: 'Oxlint' } as const;
+    const names = { eslint: 'ESLint', xo: 'XO', biome: 'Biome', oxlint: 'Oxlint' } as const;
     return own(c, l.engine, version, `${names[l.engine]} is already configured${l.engine === 'eslint' ? eslintUiNote(q) : ''}`, PACKAGE_OF[l.engine]);
   }
   if (l.engine === 'biome') {
@@ -144,6 +145,7 @@ function formatRule(c: Ctx): Choice {
     return q.versions.prettier !== undefined ? own(c, 'prettier', q.versions.prettier, 'Prettier is already configured', 'prettier') : reviewed(c, T.prettier, 'Prettier: a Prettier config is already in the repo');
   }
   const l = nodeLint(q);
+  if (l.engine === 'xo') return own(c, 'xo', q.versions.xo ?? null, 'XO is already configured, and it checks code style too', 'xo');
   if (l.engine === 'biome') {
     return l.own ? own(c, 'biome', q.versions['@biomejs/biome'] ?? null, 'Biome is already configured', '@biomejs/biome') : reviewed(c, T.biome, 'Biome: it lints here, so it formats too');
   }

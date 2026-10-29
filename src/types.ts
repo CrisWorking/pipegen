@@ -27,8 +27,8 @@ export interface Service {
 }
 // Plan P Task 1. Ruling PS5 left out what no task reads: QualityPackage 'jscpd', QualityConfig 'jscpd'/'hadolint', RepoFiles.rego.
 export type UiFramework = 'next' | 'nuxt' | 'vue' | 'svelte' | 'astro' | 'react-native';
-export type QualityPackage = 'typescript' | 'eslint' | 'prettier' | '@biomejs/biome' | 'oxlint' | 'vitest' | 'jest' | 'c8' | 'knip' | 'vue-tsc' | 'svelte-check' | '@astrojs/check';
-export type QualityConfig = 'biome' | 'prettier' | 'knip' | 'oxlint' | 'ruff' | 'black' | 'flake8' | 'pylint' | 'mypy' | 'pyright' | 'basedpyright';
+export type QualityPackage = 'typescript' | 'eslint' | 'prettier' | '@biomejs/biome' | 'oxlint' | 'vitest' | 'jest' | 'c8' | 'knip' | 'vue-tsc' | 'svelte-check' | '@astrojs/check' | 'xo';
+export type QualityConfig = 'xo' | 'biome' | 'prettier' | 'knip' | 'oxlint' | 'ruff' | 'black' | 'flake8' | 'pylint' | 'mypy' | 'pyright' | 'basedpyright';
 export interface ServiceQuality {
   tsconfig: boolean; versions: Partial<Record<QualityPackage, string>>; fromRange: QualityPackage[];   // versions: each matches /^\d+\.\d+\.\d+(-[0-9A-Za-z.-]{1,40})?$/. fromRange: version from a package.json range (its lower bound), not the lockfile
   eslintConfig: 'flat' | 'eslintrc' | 'both' | 'none'; configs: QualityConfig[]; uiFrameworks: UiFramework[];

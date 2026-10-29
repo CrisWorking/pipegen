@@ -1103,6 +1103,105 @@ const RUFF_REPO = 'https://github.com/astral-sh/ruff-pre-commit';
 const hookConfig = (hooks: string, repo = RUFF_REPO) => `repos:\n  - repo: ${repo}\n    rev: v0.16.0\n    hooks:\n${hooks}`;
 const FLASK_PRECOMMIT = 'uv run --locked --no-default-groups --group pre-commit pre-commit run --show-diff-on-failure --color=always --all-files';
 
+describe('mapCoverage (P55 batch B: XO)', () => {
+  const lintStatus = async (steps: string, scripts: Record<string, string> = {}) => {
+    const dir = makeTempDir();
+    writeIn(dir, 'package.json', JSON.stringify({ name: 'app', scripts }));
+    wf(dir, 'ci.yml', `on: [push, pull_request]\n${job(steps)}`);
+    const rows = await coverage(dir);
+    return ['push', 'merge'].map((l) => { const r = row(rows, l as Layer, 'lint', 'app'); return `${r.status}${r.by === undefined ? '' : ` ${r.by}`}`; });
+  };
+
+  it('xo in a step or in the service\'s test script covers lint (ky shape: `xo && npm run build && tsc && ava`)', async () => {
+    expect(await lintStatus(run('npx xo'))).toEqual(['covered xo', 'covered xo']);
+    expect(await lintStatus(run('npm test'), { test: 'xo && npm run build && tsc --project tsconfig.test.json && ava' })).toEqual(['covered your own `npm test`', 'covered your own `npm test`']);
+  });
+
+  it('xo that can\'t fail the build, fixes instead, or only prints is not covered', async () => {
+    for (const cmd of ['xo || true', 'xo --fix', 'xo --stdin < a.js', 'xo --print-config a.js', 'xo --version']) {
+      const [push] = await lintStatus(run(cmd));
+      expect(push, cmd).not.toBe('covered xo');
+    }
+    expect((await lintStatus(run('xo || true')))[0]).toBe('partial xo');
+    expect((await lintStatus(run('npm test'), { test: 'xo; ava' }))[0]).toBe('partial your own `npm test`');
+    expect((await lintStatus('      - run: xo\n        continue-on-error: true\n'))[0]).toBe('partial xo');
+  });
+});
+
+describe('mapCoverage (P55 batch B: prek)', () => {
+  const lintOf = async (config: string, steps: string, extraWf = '') => {
+    const dir = makeTempDir();
+    writeIn(dir, '.pre-commit-config.yaml', config);
+    wf(dir, 'ci.yml', `on:\n  pull_request:\n${job(steps, extraWf)}`);
+    return coverage(dir);
+  };
+  const cfg = hookConfig('      - id: ruff-check\n');
+  const CHANGED = 'uv run prek run --from-ref origin/${GITHUB_BASE_REF} --to-ref HEAD --show-diff-on-failure';
+
+  it('prek run --all-files counts like pre-commit: hooks-ci covered by prek, the hooks\' lint carried', async () => {
+    const rows = await lintOf(cfg, run('uv run prek run --all-files'));
+    expect(row(rows, 'merge', 'hooks-ci')).toMatchObject({ status: 'covered', by: 'prek' });
+    expect(row(rows, 'merge', 'lint', 'app')).toMatchObject({ status: 'covered', by: 'ruff' });
+  });
+
+  it('j178/prek-action: --all-files by default; install-only, a hook id or a moved folder carry nothing', async () => {
+    const act = (w = '') => `      - uses: j178/prek-action@v1\n${w === '' ? '' : `        with:\n${w}`}`;
+    expect(row(await lintOf(cfg, act()), 'merge', 'lint', 'app')).toMatchObject({ status: 'covered', by: 'ruff' });
+    expect(row(await lintOf(cfg, act('          extra-args: --all-files\n')), 'merge', 'lint', 'app').status).toBe('covered');
+    for (const w of ['          install-only: true\n', '          extra-args: ruff-check --all-files\n', '          working-directory: sub\n',
+      '          extra-args: --all-files\n          extra_args: ruff-check\n', '          extra-args: ${{ inputs.a }}\n']) {
+      expect(row(await lintOf(cfg, act(w)), 'merge', 'lint', 'app').status, w).toBe('missing');
+    }
+    // install-only: the action runs no hooks, so it is not the hooks-in-CI check either
+    expect(row(await lintOf(cfg, act('          install-only: true\n')), 'merge', 'hooks-ci').status).toBe('missing');
+  });
+
+  it('a run over the files between two refs is partial ("changed"), for prek and pre-commit; no refs and no --all-files carries nothing', async () => {
+    for (const cmd of [CHANGED, 'pre-commit run --from-ref origin/main --to-ref HEAD', 'prek run -s origin/main -o HEAD']) {
+      const rows = await lintOf(cfg, run(cmd));
+      const lint = row(rows, 'merge', 'lint', 'app');
+      expect(lint, cmd).toMatchObject({ status: 'partial', by: 'ruff' });
+      expect(lint.why).toMatch(/only on the files that changed between two commits/);
+      expect(row(rows, 'merge', 'hooks-ci').status).toBe('covered');
+    }
+    for (const cmd of ['prek run', 'prek run --from-ref origin/main', 'prek run --all-files --from-ref a --to-ref b', 'prek run ruff-check --from-ref a --to-ref b', 'prek run --files a.py']) {
+      expect(row(await lintOf(cfg, run(cmd)), 'merge', 'lint', 'app').status, cmd).toBe('missing');
+    }
+    const act = "      - uses: j178/prek-action@v1\n        with:\n          extra-args: --from-ref origin/main --to-ref HEAD\n";
+    expect(row(await lintOf(cfg, act), 'merge', 'lint', 'app')).toMatchObject({ status: 'partial', by: 'ruff' });
+  });
+
+  it('SKIP in the job drops a prek run\'s hooks, a conditional or soft run stays partial', async () => {
+    expect(row(await lintOf(cfg, run('SKIP=ruff-check prek run --all-files')), 'merge', 'lint', 'app').status).toBe('missing');
+    expect(row(await lintOf(cfg, run('prek run --all-files || true')), 'merge', 'lint', 'app').status).toBe('partial');
+    expect(row(await lintOf(cfg, '      - run: prek run --all-files\n        if: github.actor != \'bot\'\n'), 'merge', 'lint', 'app').status).toBe('partial');
+    expect(row(await lintOf(cfg, '      - run: prek run --all-files\n        continue-on-error: true\n'), 'merge', 'lint', 'app').status).toBe('partial');
+  });
+
+  it('continue-on-error undone by a later `exit 1` step on the same id counts as blocking; look-alikes do not', async () => {
+    const step = (coe = 'true') => `      - id: pc\n        run: prek run --all-files\n        continue-on-error: ${coe}\n`;
+    const later = (cond: string, runText = 'exit 1', extra = '') => `      - name: fail\n        if: ${cond}\n        run: ${runText}\n${extra}`;
+    const lint = async (steps: string) => row(await lintOf(cfg, steps), 'merge', 'lint', 'app').status;
+    expect(await lint(step() + later("steps.pc.outcome == 'failure'"))).toBe('covered');
+    expect(await lint(step() + later("${{ steps.pc.outcome == 'failure' }}"))).toBe('covered');
+    expect(await lint(step() + later("steps.pc.outcome != 'success'", '"false"'))).toBe('covered');
+    // without the later step, or with a look-alike one, the run can't fail the job
+    expect(await lint(step())).toBe('partial');
+    for (const l of [
+      later("steps.pc.outcome == 'success'"), later("steps.other.outcome == 'failure'"), later("steps.pc.outcome == 'failure' && github.actor != 'x'"),
+      later("steps.pc.outcome == 'failure'", 'exit 0'), later("steps.pc.outcome == 'failure'", 'echo bad'), later("steps.pc.conclusion == 'failure'"),
+      later("steps.pc.outcome == 'failure'", 'exit 1', '        continue-on-error: true\n'), later("steps.pc.outcome == 'failure'", 'exit 1', '        shell: bash {0}\n'),
+    ]) expect(await lint(step() + l), l).toBe('partial');
+    // the later step must come after the step it names
+    expect(await lint(later("steps.pc.outcome == 'failure'") + step())).toBe('partial');
+    // 'changed' stays partial under the rescue, with its own reason
+    const changed = `      - id: pc\n        run: ${CHANGED}\n        continue-on-error: true\n` + later("steps.pc.outcome == 'failure'");
+    const r = row(await lintOf(cfg, changed), 'merge', 'lint', 'app');
+    expect(r.status).toBe('partial');
+    expect(r.why).toMatch(/only on the files that changed/);
+  });
+});
+
 describe('mapCoverage (Task 5, item 3: pre-commit hook contents)', () => {
   it('pre-commit hooks: ruff-check and ruff-format hooks → the format and lint hook is covered', async () => {
     const dir = makeTempDir();

@@ -195,6 +195,14 @@ describe('quality: configs and frameworks', () => {
     expect((await readServiceQuality(repo({ 'package.json': '{}', 'oxlint.config.ts': 'export default {};\n' }), nodeSvc(), [])).configs).toEqual(['oxlint']);
   });
 
+  it('quality (P55): XO is configured by the `xo` key in package.json or an xo.config.* file, and its version is read', async () => {
+    expect((await readServiceQuality(repo({ 'package.json': pkg({ xo: { rules: {} } }) }), nodeSvc(), [])).configs).toEqual(['xo']);
+    expect((await readServiceQuality(repo({ 'package.json': pkg({}), 'xo.config.js': 'export default [];\n' }), nodeSvc(), [])).configs).toEqual(['xo']);
+    expect((await readServiceQuality(repo({ 'package.json': pkg({ devDependencies: { xo: '^1.2.0' } }), 'package-lock.json': '{}' }), nodeSvc(), [])).configs).toEqual([]);
+    const q = await readServiceQuality(repo({ 'package.json': pkg({ devDependencies: { xo: '^1.2.0' }, xo: {} }) }), nodeSvc(), []);
+    expect(q.versions.xo).toBe('1.2.0');
+  });
+
   it('quality: next / vue / svelte / astro / react-native detected from dependencies', async () => {
     const dir = repo({
       'package.json': pkg({ dependencies: { next: '15.0.0', vue: '^3.5.0', svelte: '^5.0.0', astro: '^5.0.0', 'react-native': '0.76.0', nuxt: '^3.0.0' } }),

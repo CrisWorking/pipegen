@@ -4,7 +4,7 @@ import { MAX_FLAG_WORDS, MAX_SCAN_BYTES, MAX_SCRIPT_PATTERNS, MAX_SCRIPT_TARGETS
 import { resolveDir } from './helpers.js';
 import { safeText } from '../../util/safe-text.js';
 import { UNKNOWN_PREFIX, commandReason, configTurnedOff, flagsAllow, foundOf, inputWords, inputWordsCapped, inputsCrowded, type Inputs } from './settings.js';
-import { PRE_COMMIT_ID } from './signatures.js';
+import { isHookRunner } from './signatures.js';
 import { tokenize } from './tokenize.js';
 import type { Budget, CommandRule, Compiled, Found, Reason } from './types.js';
 
@@ -196,12 +196,18 @@ function picksOther(flag: string, long: readonly string[], short: string): boole
 }
 
 /**
- * Task 5: `pre-commit run` words (after `run`) that run every pre-commit-stage hook on every file: `--all-files`/`-a`,
- * no hook id, no other stage, no other config, no file list (https://pre-commit.com/#pre-commit-run). Without
- * --all-files, `pre-commit run` checks the staged files, and a CI checkout has none.
+ * Task 5: `pre-commit run` (or prek) words (after `run`): 'all' when they run every pre-commit-stage hook on every file:
+ * `--all-files`/`-a`, no hook id, no other stage, no other config, no file list (https://pre-commit.com/#pre-commit-run).
+ * P55 (batch B): 'changed' when they run those hooks on the files between two refs (`--from-ref X --to-ref Y`, also
+ * `--source`/`-s` and `--origin`/`-o`, https://pre-commit.com/#pre-commit-run and prek's `prek run --help`): a partial
+ * check, since a problem in a file the change doesn't touch isn't caught. Anything else (a hook id, a file list,
+ * another config, a flag pipegen doesn't know, --all-files together with refs) is null. Without --all-files and refs,
+ * `pre-commit run` checks the staged files, and a CI checkout has none.
  */
-export function preCommitAllFiles(words: readonly string[]): boolean {
+export function preCommitRunMode(words: readonly string[]): 'all' | 'changed' | null {
   let all = false;
+  let from = false;
+  let to = false;
   for (let i = 0; i < words.length; i++) {
     const w = words[i] as string;
     const r = redirection(w);
@@ -209,20 +215,28 @@ export function preCommitAllFiles(words: readonly string[]): boolean {
       if (!r) i++;
       continue;
     }
-    if (!w.startsWith('-')) return false; // a hook id, or the value of a flag pipegen doesn't know
+    if (!w.startsWith('-')) return null; // a hook id, or the value of a flag pipegen doesn't know
     const eq = w.indexOf('=');
     const name = eq < 0 ? w : w.slice(0, eq);
     const value = eq < 0 ? undefined : w.slice(eq + 1);
     if ((name === '-a' || name === '--all-files') && value === undefined) all = true;
     else if (value === undefined && ['--show-diff-on-failure', '-v', '--verbose', '--fail-fast'].includes(name)) continue;
     else if (name === '--color') i += value === undefined ? 1 : 0;
-    else if (name === '--hook-stage') {
+    else if (['--from-ref', '--source', '-s', '--to-ref', '--origin', '-o'].includes(name)) {
+      const v = value ?? words[++i];
+      if (v === undefined || v === '' || v.startsWith('-')) return null;
+      if (name === '--from-ref' || name === '--source' || name === '-s') from = true;
+      else to = true;
+    } else if (name === '--hook-stage') {
       const stage = value ?? words[++i];
-      if (stage !== 'pre-commit' && stage !== 'commit') return false;
-    } else return false;
+      if (stage !== 'pre-commit' && stage !== 'commit') return null;
+    } else return null;
   }
-  return all;
+  if (all) return from || to ? null : 'all';
+  return from && to ? 'changed' : null;
 }
+/** The `all` answer of preCommitRunMode only (the older name). */
+export const preCommitAllFiles = (words: readonly string[]): boolean => preCommitRunMode(words) === 'all';
 
 const basename = (w: string) => w.slice(w.lastIndexOf('/') + 1);
 const NPM_PROVENANCE_ID = 'npm-provenance';
@@ -415,7 +429,7 @@ export function scanShell(text: string, base: string | null, sigs: Compiled, bud
       ? { ...found0, categories: found0.categories.map((c) => (c.startsWith(UNKNOWN_PREFIX) ? c : `${UNKNOWN_PREFIX}${c}`)), reason: null,
         partialWhy: `${found0.subject} runs after a \`set\` whose options pipegen can't read, so it can't tell whether it runs.` }
       : found0;
-    const key = `${f.by}\u0000${f.dir ?? ''}\u0000${f.reason ?? ''}\u0000${f.hookRun === true ? 1 : 0}`;
+    const key = `${f.by}\u0000${f.dir ?? ''}\u0000${f.reason ?? ''}\u0000${f.hookRun === true ? 1 : f.hookRun === 'changed' ? 2 : 0}`;
     if (!seen.has(key)) {
       seen.add(key);
       found.push(f);
@@ -485,9 +499,13 @@ export function scanShell(text: string, base: string | null, sigs: Compiled, bud
         const f = foundOf(r.tool, cwd, shellReason(k) ?? (target === 'unknown' ? 'target' : null) ?? commandReason(r.tool, args) ?? (complete ? null : 'long'),
           configTurnedOff(r.tool, args));
         // `pre-commit run --all-files` at the repo root (the whole list of words read: none past MAX_FLAG_WORDS); in
-        // another folder pre-commit reads that folder's .pre-commit-config.yaml (fix round 1, I2)
-        if (r.tool.id === PRE_COMMIT_ID && r.rest.length === 1 && r.rest[0] === 'run' && segEnd[k]! - k - 1 <= MAX_FLAG_WORDS
-          && cwd === '.' && preCommitAllFiles(args.slice(1))) f.hookRun = true;
+        // another folder pre-commit reads that folder's .pre-commit-config.yaml (fix round 1, I2). P55: prek is read the
+        // same way, and a run over the files between two refs is 'changed'
+        if (isHookRunner(r.tool.id) && r.rest.length === 1 && r.rest[0] === 'run' && segEnd[k]! - k - 1 <= MAX_FLAG_WORDS && cwd === '.') {
+          const mode = preCommitRunMode(args.slice(1));
+          if (mode === 'all') f.hookRun = true;
+          else if (mode === 'changed') f.hookRun = 'changed';
+        }
         if (r.tool.id === NPM_PROVENANCE_ID) f.envGate = 'npm';
         add(f);
       }

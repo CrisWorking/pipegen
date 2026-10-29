@@ -29,7 +29,7 @@ export type Reason = 'continue' | 'suppressed' | 'function' | 'soft' | 'inputs' 
   | 'script-condition'
   // P53: the same, in a workflow step's run:, a package script or a hook file
   | 'shell-condition'
-  | 'hook-repo' | 'files' | 'stage' | 'skip' | 'ref' | 'tox-env' | 'nox-env'
+  | 'hook-repo' | 'files' | 'stage' | 'skip' | 'changed' | 'ref' | 'tox-env' | 'nox-env'
   // Plan P Task 3: an action this repo can't use (availability), an action not set up for the check (requireInputs),
   // egress control missing from some release jobs (PB5), a scan target pipegen can't place (imageArg), a command with
   // more words than pipegen reads
@@ -64,8 +64,12 @@ export interface Found {
   envGate?: 'tox' | 'nox' | 'npm';
   /** Fix round 1 (U23): a script counted by name (test, lint[:x]); its text, when readable, can only lower it. */
   byName?: string;
-  /** Task 5: `pre-commit run` over all files at the pre-commit stage: the hooks' lint tools run here too (SKIP drops it). */
-  hookRun?: boolean;
+  /**
+   * Task 5: `pre-commit run` (or prek) over all files at the pre-commit stage: the hooks' lint tools run here too (SKIP
+   * drops it). P55 (batch B): 'changed' = it runs over the files between two refs only (`--from-ref … --to-ref …`), so
+   * those tools are carried as partial ('changed').
+   */
+  hookRun?: boolean | 'changed';
   /** Plan P Task 3 (PS14): a pre-commit formatter hook that writes files or checks them, so a CI `pre-commit run` fails on a change. */
   formats?: boolean;
   /** Fix round 1 (P8): the tool's softEnv names and the config files it loads (none when its config flag turned them off). */
@@ -87,7 +91,7 @@ export interface Hit {
   fit: Fit;
   where: string;
   why?: string;
-  hookRun?: boolean;
+  hookRun?: boolean | 'changed';
   /** Plan P Task 3 (PB5): found in a local composite action's later step, so not the first step of its job. */
   laterStep?: boolean;
   /** Fix round 1: config files the tool loads by itself (checked for after the walk), and a CI pre-commit run's job env. */

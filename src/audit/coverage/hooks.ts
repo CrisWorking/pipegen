@@ -178,8 +178,8 @@ const carried = (f: Found): string[] => {
 export async function hookRunHits(ctx: Ctx): Promise<void> {
   const reps = new Map<string, Hit>();
   for (const h of ctx.hits) {
-    const key = `${h.fit.push ? 1 : 0}${h.fit.merge ? 1 : 0}${h.fit.deploy ? 1 : 0}\u0000${h.reason ?? ''}`;
-    if (h.hookRun === true && !reps.has(key)) reps.set(key, h);
+    const key = `${h.fit.push ? 1 : 0}${h.fit.merge ? 1 : 0}${h.fit.deploy ? 1 : 0}\u0000${h.reason ?? ''}\u0000${h.hookRun === 'changed' ? 'changed' : ''}`;
+    if ((h.hookRun === true || h.hookRun === 'changed') && !reps.has(key)) reps.set(key, h);
   }
   if (reps.size === 0) return;
   const tools = new Map<string, { f: Found; categories: string[] }>();
@@ -198,7 +198,8 @@ export async function hookRunHits(ctx: Ctx): Promise<void> {
       const subject = `${t.subject} in the pre-commit hooks`;
       // fix round 1 (P8): a softEnv name set in the CI job reaches the hook's tool; its config files are looked for later
       const set = softEnvSet(t.softEnv, rep.jobEnv);
-      const reason = rep.reason ?? t.reason;
+      // a run over changed files only is partial ('changed'), unless something already keeps the hook from running
+      const reason = rep.reason ?? t.reason ?? (rep.hookRun === 'changed' ? 'changed' : null);
       const configured = set !== null && (reason === null || !MAY_NOT_RUN.has(reason));
       ctx.hits.push({
         opaque: false, categories, by: t.by, subject, dir: '.', reason: configured ? 'config' : reason,

@@ -77,7 +77,12 @@ export async function resolveScripts(ctx: Ctx, found: Found[]): Promise<Found[]>
       // coverage) counts through that text only, as for any other own script (the older ones keep the by-name rule)
       if (f.dir !== null && lowered !== null && !lowered.categories.some((c) => c.startsWith(UNKNOWN_PREFIX))) {
         for (const g of await scriptRuns(ctx, f.dir, f.byName)) {
-          const extra = g.categories.filter((c) => PLAN_P_SCRIPT_CATEGORIES.has(c.startsWith(UNKNOWN_PREFIX) ? c.slice(UNKNOWN_PREFIX.length) : c));
+          // P55 (batch B): a linter in a script counted by another name (`test: xo && … && ava`) counts for lint too; the
+          // `lint` script itself already counts for lint by its name
+          const extra = g.categories.filter((c) => {
+            const bare = c.startsWith(UNKNOWN_PREFIX) ? c.slice(UNKNOWN_PREFIX.length) : c;
+            return PLAN_P_SCRIPT_CATEGORIES.has(bare) || (bare === 'lint' && !f.categories.includes('lint'));
+          });
           if (extra.length > 0) {
             out.push({
               categories: extra, by: f.by, subject: f.subject, dir: g.dir, reason: f.reason ?? g.reason,

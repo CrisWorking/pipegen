@@ -644,6 +644,12 @@ tools:
     precommitHooks:
       - repo: https://github.com/biomejs/pre-commit
         ids: [biome-ci, biome-check, biome-lint]
+  # P55 (batch B): XO (https://github.com/xojs/xo) is ESLint with a fixed rule set, style rules included: `xo` exits 1
+  # on a lint error; --fix writes the fixes, --stdin reads one file and --print-config prints, so those don't count
+  - id: xo
+    categories: [lint, format-lint]
+    commands: [xo]
+    notWithFlags: [--fix, --stdin, --print-config]
   - id: biome-format
     categories: [format-lint]
     commands: [biome format]
@@ -1004,6 +1010,16 @@ tools:
     categories: [hooks-ci]
     actions: [pre-commit/action]
     commands: [pre-commit run]
+  # P55 (batch B): prek is a drop-in for pre-commit (https://github.com/j178/prek: "prek run", the same
+  # .pre-commit-config.yaml, --all-files, --from-ref and --to-ref). Its action runs `prek run` unless install-only is
+  # true (https://github.com/j178/prek-action/blob/master/action.yml: extra-args default "--all-files", install-only
+  # default "false").
+  - id: prek
+    categories: [hooks-ci]
+    actions: [j178/prek-action]
+    commands: [prek run]
+    skipInputs:
+      install-only: ['true']
   - id: lefthook
     categories: [hooks-ci]
     commands: [lefthook run]

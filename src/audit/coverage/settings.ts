@@ -5,7 +5,7 @@ import { TRIVY_GRAMMAR } from '../../engine/tool-grammar.js';
 import { regexSafe } from '../../read/limits.js';
 import { asObj } from '../../read/manifest.js';
 import { MAX_FLAG_WORDS, MAX_INPUT_KEYS, MAX_SPELLINGS } from './bounds.js';
-import { PRE_COMMIT_ID, type ToolSignature } from './signatures.js';
+import { isHookRunner, type ToolSignature } from './signatures.js';
 import { tokenize } from './tokenize.js';
 import type { Found, JobEnv, Obj, Reason } from './types.js';
 
@@ -17,7 +17,7 @@ import type { Found, JobEnv, Obj, Reason } from './types.js';
  * file or env var that can turn the check off, and an egress step on a runner it can't guard. (Here, not in decide.ts,
  * so the env gate can read it without an import cycle.)
  */
-export const MAY_NOT_RUN: ReadonlySet<Reason> = new Set<Reason>(['condition', 'script-condition', 'shell-condition', 'hook-repo', 'files', 'stage', 'skip', 'ref', 'tox-env', 'nox-env',
+export const MAY_NOT_RUN: ReadonlySet<Reason> = new Set<Reason>(['condition', 'script-condition', 'shell-condition', 'hook-repo', 'files', 'stage', 'skip', 'changed', 'ref', 'tox-env', 'nox-env',
   'unavailable', 'needs-inputs', 'some-jobs', 'target', 'config', 'runner', 'never-listed']);
 
 // ---------- if: conditions (review I3) ----------
@@ -546,12 +546,12 @@ export const gated = (found: Found[], g: EnvGate): Found[] => found
   .map((f) => {
     if (f.envGate === 'tox' && g.tox) return { ...f, reason: 'tox-env' as const };
     if (f.envGate === 'nox' && g.nox) return { ...f, reason: 'nox-env' as const };
-    if (g.skip && f.by === PRE_COMMIT_ID) return { ...f, hookRun: false, reason: f.reason ?? 'skip' };
+    if (g.skip && isHookRunner(f.by)) return { ...f, hookRun: false, reason: f.reason ?? 'skip' };
     // fix round 1 (P8): a softEnv name set in the job; a CI pre-commit run keeps the job env for the hooks it carries
     const set = softEnvSet(f.softEnv, g.env);
     const file = configFileNamed(f.configFiles, g.env);
     const what = set ?? (file === null ? null : `a ${file} file written in this job`);
     if (what !== null && (f.reason === null || !MAY_NOT_RUN.has(f.reason))) return { ...f, reason: 'config' as const, partialWhy: configWhy(f.subject, what) };
-    if (f.hookRun === true && !emptyEnv(g.env)) return { ...f, jobEnv: g.env };
+    if ((f.hookRun === true || f.hookRun === 'changed') && !emptyEnv(g.env)) return { ...f, jobEnv: g.env };
     return f;
   });

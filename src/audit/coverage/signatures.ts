@@ -269,3 +269,6 @@ export function compile(tools: ToolSignature[]): Compiled {
 }
 
 export const PRE_COMMIT_ID = 'pre-commit';
+/** P55 (batch B): the tools that run the repo's .pre-commit-config.yaml in CI: pre-commit itself and prek, its drop-in. */
+export const PREK_ID = 'prek';
+export const isHookRunner = (id: string): boolean => id === PRE_COMMIT_ID || id === PREK_ID;

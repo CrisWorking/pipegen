@@ -97,6 +97,15 @@ describe('choose: lint', () => {
     expect(ownTool(choose('lint', profile([svc({}, { configs: ['biome'], versions: { '@biomejs/biome': '2.5.15' } })])))).toMatchObject({ tool: 'biome', version: '2.5.15' });
     expect(ownTool(choose('lint', profile([svc({}, { configs: ['oxlint'], versions: { oxlint: '1.40.0' } })])))).toMatchObject({ tool: 'oxlint', version: '1.40.0' });
   });
+  it('choose: XO configured → the repo\'s own XO for lint and format, never Biome next to it (P55)', () => {
+    const p = profile([svc({}, { tsconfig: true, configs: ['xo'], versions: { xo: '1.2.0' } })]);
+    expect(ownTool(choose('lint', p))).toMatchObject({ tool: 'xo', version: '1.2.0' });
+    expect(choose('lint', p).note).toBe('XO is already configured');
+    expect(ownTool(choose('format', p))).toMatchObject({ tool: 'xo', version: '1.2.0' });
+    // a repo's ESLint config still comes first; Prettier stays the format tool when it is configured
+    expect(ownTool(choose('lint', profile([svc({}, { configs: ['xo'], eslintConfig: 'flat', versions: { eslint: '9.1.0' } })])))).toMatchObject({ tool: 'eslint' });
+    expect(ownTool(choose('format', profile([svc({}, { configs: ['xo', 'prettier'], versions: { prettier: '3.6.0' } })])))).toMatchObject({ tool: 'prettier' });
+  });
   it('choose: Prettier config with Biome lint → prettier for format', () => {
     const p = profile([svc({}, { configs: ['biome', 'prettier'], versions: { '@biomejs/biome': '2.5.15' } })]);
     expect(idOf(choose('format', p).tool)).toBe('prettier');

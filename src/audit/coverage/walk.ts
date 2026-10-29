@@ -16,8 +16,8 @@ import {
   ALL_GATE, NO_GATE, OLD_PREFIX, OPAQUE_GATE, actionReason, actionSkipped, condition, foundOf, gateOf, gated, lowerInputs, orGate, refVerdict, requiredInputsHeld,
   configWhy, type EnvGate, type Inputs, type RepoId,
 } from './settings.js';
-import { imageName, preCommitAllFiles, scanImage, scanShell, shellMode } from './shell.js';
-import { PART_RE, PRE_COMMIT_ID, type ToolSignature } from './signatures.js';
+import { imageName, preCommitRunMode, scanImage, scanShell, shellMode } from './shell.js';
+import { PART_RE, PREK_ID, isHookRunner, type ToolSignature } from './signatures.js';
 import { tokenize } from './tokenize.js';
 import type { Compiled, Ctx, Fit, Found, Hit, Obj, Reason } from './types.js';
 
@@ -145,6 +145,8 @@ interface StepCtx {
   release: boolean;
   /** Fix round 2: the job may run on macOS or Windows, where config file names match in any letter case. */
   foldCase?: boolean;
+  /** P55 (batch B): steps of this job whose continue-on-error a later step undoes (rescuedSteps). */
+  rescued?: ReadonlySet<Obj>;
   /** Fix round 1: the job's runner, when `runs-on` is one literal label (lowercased), and whether it runs in a container. */
   runner: string | null;
   container: boolean;
@@ -184,7 +186,7 @@ function addFound(ctx: Ctx, found: Found[], c: StepCtx): void {
     if (c.conditional && (reason === null || !MAY_NOT_RUN.has(reason))) reason = 'condition';
     ctx.hits.push({
       opaque: false, categories: f.categories, by: f.by, subject: f.subject, dir: f.dir, reason,
-      ...(f.partialWhy === undefined ? {} : { partialWhy: f.partialWhy }), fit: c.fit, where: c.where, ...(f.hookRun === true ? { hookRun: true } : {}),
+      ...(f.partialWhy === undefined ? {} : { partialWhy: f.partialWhy }), fit: c.fit, where: c.where, ...(f.hookRun === true || f.hookRun === 'changed' ? { hookRun: f.hookRun } : {}),
       ...(c.laterStep === true ? { laterStep: true } : {}), ...(f.configFiles === undefined ? {} : { configFiles: f.configFiles }),
       ...(f.configFiles !== undefined && c.foldCase === true ? { foldCase: true } : {}),
       ...(f.jobEnv === undefined ? {} : { jobEnv: f.jobEnv }),
@@ -252,22 +254,40 @@ function actionFinds(ctx: Ctx, tools: readonly ToolSignature[], uses: string, w:
     if (verdict === 'old' && t.actionRef !== undefined) {
       return { ...f, categories: t.categories.map((c) => `${OLD_PREFIX}${c}`), reason: null, partialWhy: t.actionRef.oldWhy };
     }
-    if (t.id === PRE_COMMIT_ID && preCommitActionAllFiles(w)) f.hookRun = true;
+    if (isHookRunner(t.id)) {
+      const mode = hookActionMode(t, w);
+      if (mode === 'all') f.hookRun = true;
+      else if (mode === 'changed') f.hookRun = 'changed';
+    }
     return f;
   });
 }
 
-/** Task 5: pre-commit/action runs `pre-commit run … ${extra_args}`, `--all-files` by default (https://github.com/pre-commit/action/blob/main/action.yml). */
-function preCommitActionAllFiles(w: Inputs): boolean {
-  if (w.crowded.has('extra_args')) return false;
-  const all = w.byName.get('extra_args') ?? [];
-  if (all.length === 0) return true;
-  return all.every((v) => {
-    if (v === null || v === undefined) return true; // `extra_args:` with no value: the default
-    if (typeof v !== 'string' || !regexSafe(v) || v.includes('${{')) return false;
+/**
+ * Task 5: pre-commit/action runs `pre-commit run … ${extra_args}`, `--all-files` by default
+ * (https://github.com/pre-commit/action/blob/main/action.yml). P55 (batch B): j178/prek-action runs `prek run
+ * --show-diff-on-failure --color=always ${extra-args}` the same way (`extra-args`, default `--all-files`; the old
+ * `extra_args` name still works; `working-directory` moves the config's folder;
+ * https://github.com/j178/prek-action/blob/master/action.yml). The mode of preCommitRunMode, or null.
+ */
+function hookActionMode(t: ToolSignature, w: Inputs): 'all' | 'changed' | null {
+  const prek = t.id === PREK_ID;
+  const names = prek ? ['extra-args', 'extra_args'] : ['extra_args'];
+  if (names.some((n) => w.crowded.has(n)) || (prek && w.crowded.has('working-directory'))) return null;
+  if (prek) {
+    const dir = w.byName.get('working-directory') ?? [];
+    if (dir.some((v) => !(v === null || v === undefined || v === '' || v === '.'))) return null;
+    if (names.every((n) => (w.byName.get(n) ?? []).length > 0)) return null; // both spellings: pipegen can't tell which wins
+  }
+  const given = names.flatMap((n) => w.byName.get(n) ?? []);
+  if (given.length === 0) return 'all';
+  const modes = given.map((v): 'all' | 'changed' | null => {
+    if (v === null || v === undefined) return 'all'; // `extra_args:` with no value: the default
+    if (typeof v !== 'string' || !regexSafe(v) || v.includes('${{')) return null;
     const toks = tokenize(v);
-    return toks.every((t) => t.op === null) && preCommitAllFiles(toks.map((t) => t.w));
+    return toks.every((x) => x.op === null) ? preCommitRunMode(toks.map((x) => x.w)) : null;
   });
+  return modes.every((m) => m === modes[0]) ? (modes[0] ?? null) : null;
 }
 
 async function walkStep(ctx: Ctx, step: Obj, c: StepCtx): Promise<void> {
@@ -276,7 +296,7 @@ async function walkStep(ctx: Ctx, step: Obj, c: StepCtx): Promise<void> {
   if (cond === 'never') return;
   const withInputs = lowerInputs(asObj(step.with));
   const sc: StepCtx = {
-    ...c, continueOnError: c.continueOnError || allowedToFail(step['continue-on-error']), conditional: c.conditional || cond === 'partial',
+    ...c, continueOnError: c.continueOnError || (allowedToFail(step['continue-on-error']) && c.rescued?.has(step) !== true), conditional: c.conditional || cond === 'partial',
     inputsUnread: c.inputsUnread || withInputs.unread, gate: gateOf(typeof step.run === 'string' ? [step.run] : [], [step.env], c.gate, ctx.sigs.softEnv, ctx.sigs.configFiles),
   };
   if (typeof step.uses === 'string' && regexSafe(step.uses)) {
@@ -300,6 +320,32 @@ async function walkStep(ctx: Ctx, step: Obj, c: StepCtx): Promise<void> {
     const found = mode === 'noexec' ? [] : await resolveScripts(ctx, scanShell(step.run, base, ctx.sigs, ctx.budget, mode));
     addFound(ctx, gated(found, sc.gate), sc);
   }
+}
+
+/**
+ * P55 (batch B): `continue-on-error: true` on a step with an `id`, undone by a LATER step of the same job that is
+ * `if: steps.<id>.outcome == 'failure'` (also `!= 'success'`, in `${{ }}` or not) and runs just `exit <1-255>` or
+ * `false` (the fastapi pre-commit workflow: the step is allowed to fail so the fix-up steps run, then "Error out on
+ * pre-commit errors" fails the job). The later step must have no other condition, no continue-on-error and no custom
+ * shell, so it runs every time the step fails and fails the job. Such a step blocks like any other.
+ */
+function rescuedSteps(steps: readonly Obj[]): Set<Obj> {
+  const out = new Set<Obj>();
+  for (const [i, step] of steps.entries()) {
+    const id = step.id;
+    if (typeof id !== 'string' || !/^[A-Za-z_][A-Za-z0-9_-]{0,63}$/.test(id) || !allowedToFail(step['continue-on-error'])) continue;
+    const failed = new RegExp(`^(?:\\$\\{\\{\\s*)?steps\\.${id.replace(/[-]/g, '\\-')}\\.outcome\\s*(?:==\\s*'failure'|!=\\s*'success')(?:\\s*\\}\\})?$`);
+    for (const later of steps.slice(i + 1)) {
+      const cond = later.if;
+      const run = later.run;
+      if (typeof cond !== 'string' || typeof run !== 'string' || !regexSafe(cond) || !regexSafe(run)) continue;
+      if (!failed.test(cond.trim()) || !/^(?:exit\s+[1-9][0-9]{0,2}|false)$/.test(run.trim())) continue;
+      if (allowedToFail(later['continue-on-error']) || later.shell !== undefined || later['working-directory'] !== undefined) continue;
+      out.add(step);
+      break;
+    }
+  }
+  return out;
 }
 
 /** A local action (`uses: ./dir`): a composite one is followed one level; anything else can't be seen into. */
@@ -467,6 +513,7 @@ export async function walkWorkflow(ctx: Ctx, doc: Obj, path: string, fit: Fit, d
       continueOnError: allowedToFail(job['continue-on-error']), conditional: jobConditional, inputsUnread: false, depth,
       gate: gateOf(kept.flatMap((st) => (typeof st.run === 'string' ? [st.run] : [])), [doc.env, job.env, ...kept.map((st) => st.env)], compositeGates, ctx.sigs.softEnv, ctx.sigs.configFiles),
       release, runner: literalRunner(job), container: job.container !== undefined && job.container !== null, ...(foldsCase(job) ? { foldCase: true } : {}),
+      rescued: rescuedSteps(kept),
     };
     let first = start;
     for (const [k, step] of kept.entries()) {
