@@ -215,3 +215,49 @@ describe('6c fix round 1: dedupe keeps the guarded repo npm ci (finding 5)', () 
     expect(() => dedupeJobSteps([...a, ...b])).toThrow(RenderError);
   });
 });
+
+describe('7a Part 0 (review-6c-r1 minors 2 and 3): dedupe compares contents; setup ids are bound to their own action', () => {
+  const app = ctxFor([service({ name: 'app', path: '.', scripts: ['test', 'lint'] })]);
+  const script = (which: 'test' | 'lint' = 'test') => renderProjectScript({ kind: 'project-script', needId: which === 'test' ? 'unit-tests' : 'lint', service: 'app', script: which }, platform(), app).steps;
+  const checkoutOf = (job: RenderedStep[]): RenderedStep => job.find((s) => s.id === 'pipegen-checkout') as RenderedStep;
+  it('two same-id checkouts that differ (fetch-depth 1 vs 0) are refused, not silently merged', () => {
+    const a = script('test');
+    const b = script('lint').map((s) => (s.id === 'pipegen-checkout' ? { ...s, with: { ...s.with, 'fetch-depth': '0' } } : s));
+    expect(checkoutOf(a).with?.['fetch-depth']).toBe('1');
+    expect(() => dedupeJobSteps([...a, ...b])).toThrow(/pipegen-checkout/);
+  });
+  it('two same-id setup-node steps that differ in uses or with are refused', () => {
+    const a = script('test');
+    const otherSha = a.map((s) => (s.id?.startsWith('pipegen-setup-node-') ? { ...s, uses: (s.uses as string).replace(/@[0-9a-f]{40}$/, `@${'b'.repeat(40)}`) } : s));
+    const otherWith = a.map((s) => (s.id?.startsWith('pipegen-setup-node-') ? { ...s, with: { ...s.with, extra: 'x' } } : s));
+    expect(() => dedupeJobSteps([...a, ...otherSha.slice(1, 2)])).toThrow(RenderError);
+    expect(() => dedupeJobSteps([...a.slice(0, 2), ...otherWith.slice(1, 2), ...a.slice(2)])).toThrow(RenderError);
+  });
+  it('the same step twice (only the display name differs) is still deduped', () => {
+    const a = script('test');
+    const again = a.slice(0, 2).map((s) => ({ ...s, name: `${s.name} again` }));
+    expect(dedupeJobSteps([...a.slice(0, 2), ...again, ...a.slice(2)]).filter((s) => s.id?.startsWith('pipegen-'))).toHaveLength(3);
+  });
+  it('the npm ci pin merge stays: same folder, different tools (their home folders and pins differ) is one step', () => {
+    expect(dedupeJobSteps([...script('test'), ...steps('vitest-coverage')]).filter((s) => s.id?.startsWith('pipegen-npm-ci-'))).toHaveLength(1);
+  });
+  it('two same-id npm ci steps that differ in anything but the pins and the home folder are refused', () => {
+    const a = script('test');
+    const b = script('lint').map((s) => (s.id?.startsWith('pipegen-npm-ci-') ? { ...s, run: `${s.run as string}\necho extra` } : s));
+    expect(() => dedupeJobSteps([...a, ...b])).toThrow(RenderError);
+    const c = script('lint').map((s) => (s.id?.startsWith('pipegen-npm-ci-') ? { ...s, env: { ...s.env, OTHER: 'x' } } : s));
+    expect(() => dedupeJobSteps([...a, ...c])).toThrow(RenderError);
+  });
+  it('a setup or checkout id counts as harmless only on its own platform action', () => {
+    const eslint = steps('eslint');
+    const wrong: [string, string][] = [
+      ['pipegen-checkout', 'actions/upload-artifact'], ['pipegen-checkout', 'actions/setup-node'], ['pipegen-checkout', 'github/codeql-action/upload-sarif'],
+      ['pipegen-setup-node-24', 'actions/checkout'], ['pipegen-setup-node-24', 'actions/setup-python'], ['pipegen-setup-node-24', 'actions/upload-artifact'],
+      ['pipegen-setup-python', 'actions/setup-node'], ['pipegen-setup-python', 'actions/checkout'],
+    ];
+    for (const [id, path] of wrong) expect(checkJobOrder([{ id, name: 'x', uses: `${path}@${sha}` }, ...eslint]).length, `${id} on ${path}`).toBeGreaterThan(0);
+    for (const [id, path] of [['pipegen-checkout', 'actions/checkout'], ['pipegen-setup-node-24', 'actions/setup-node'], ['pipegen-setup-python', 'actions/setup-python']] as const) {
+      expect(checkJobOrder([{ id, name: 'x', uses: `${path}@${sha}` }, ...eslint]), `${id} on ${path}`).toEqual([]);
+    }
+  });
+});

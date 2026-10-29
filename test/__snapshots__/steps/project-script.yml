@@ -96,6 +96,7 @@
       "PATH=$nodebin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
       "RUNNER_TEMP=$RUNNER_TEMP"
       "TMPDIR=$RUNNER_TEMP"
+      "CI=true"
     )
     "${pg_env[@]}" "$nodebin/npm" test
   shell: bash

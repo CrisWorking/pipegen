@@ -369,9 +369,12 @@ function cliHooks(platform: PlatformActions): CliHooks {
 }
 
 /**
- * Keeps the first of every step that has an `id` starting `pipegen-` (the setup-node and `npm ci` steps of the npm tools,
- * which are the same for every tool of a job) and drops the repeats. Steps without such an id are never dropped. Plan G
- * runs a job's steps through this once, so a job installs its dependencies once (ruling B5).
+ * Keeps the first of every step that has an `id` starting `pipegen-` (the checkout, setup-node and `npm ci` steps, which
+ * are the same for every tool of a job) and drops the repeats. Steps without such an id are never dropped. Plan G runs a
+ * job's steps through this once, so a job installs its dependencies once (ruling B5). A repeat must be the SAME step
+ * (only its display name may differ), or this throws (review-6c-r1 minor 2: a later checkout with fetch-depth 0 must not
+ * vanish behind a depth-1 one). The one documented exception is the repo `npm ci` of one folder asked for by several
+ * tools: its pin lists are merged, and its scripts may differ only in the tool's own home folder.
  */
 export function dedupeJobSteps(steps: readonly RenderedStep[]): RenderedStep[] {
   const seen = new Map<string, number>();
@@ -384,9 +387,10 @@ export function dedupeJobSteps(steps: readonly RenderedStep[]): RenderedStep[] {
       kept.push(s);
       continue;
     }
+    const first = kept[at] as RenderedStep;
+    if (!sameDedupeContent(first, s)) throw new RenderError(`Two steps of one job have the id ${show(s.id)} but do different things (${show(first.name)} and ${show(s.name)}); pipegen keeps only identical repeats.`);
     // the same repo `npm ci` asked for by several tools: the one that stays must carry EVERY tool's lockfile pins, so its
     // pre-check (before `npm ci`) guards them all, whichever step came first
-    const first = kept[at] as RenderedStep;
     if (s.id.startsWith('pipegen-npm-ci-') && first.env?.PIPEGEN_NPM_EXPECT !== s.env?.PIPEGEN_NPM_EXPECT) {
       kept[at] = { ...first, env: { ...first.env, PIPEGEN_NPM_EXPECT: mergePins(first.env?.PIPEGEN_NPM_EXPECT, s.env?.PIPEGEN_NPM_EXPECT) } };
     }
@@ -398,6 +402,20 @@ export function dedupeJobSteps(steps: readonly RenderedStep[]): RenderedStep[] {
   const order = checkJobOrder(kept);
   if (order.length > 0) throw new RenderError(order.join(' '));
   return kept;
+}
+
+/** The tool's own home folder line of a script (`home="$RUNNER_TEMP/pipegen-home/<artifact>"`), the one line two guarded `npm ci` steps of one folder may differ in. */
+const HOME_LINE_RE = /^home="\$RUNNER_TEMP\/pipegen-home\/[a-z0-9][a-z0-9-]{0,160}"$/gm;
+
+/** Whether a repeated `pipegen-` step is the same step as the one kept: everything but the name, and for `npm ci` its pins and home folder. */
+function sameDedupeContent(a: RenderedStep, b: RenderedStep): boolean {
+  const norm = (s: RenderedStep): unknown => {
+    const { name: _name, ...rest } = s;
+    if (s.id === undefined || !s.id.startsWith('pipegen-npm-ci-')) return rest;
+    const { PIPEGEN_NPM_EXPECT: _pins, ...env } = s.env ?? {};
+    return { ...rest, env, run: typeof s.run === 'string' ? s.run.replace(HOME_LINE_RE, 'home=<the tool home>') : s.run };
+  };
+  return same(norm(a), norm(b));
 }
 
 /** The union of two lists of pinned packages (JSON, as in PIPEGEN_NPM_EXPECT); one package at two different pins is refused. */
@@ -419,17 +437,24 @@ function mergePins(a: string | undefined, b: string | undefined): string {
 
 /** The platform actions that run no repo code and no step script of ours: pinned by SHA (the version is a comment). */
 const TRUSTED_ACTION_RE = /^(?:actions\/(?:checkout|setup-node|setup-python|upload-artifact)|github\/codeql-action\/upload-sarif)@[0-9a-f]{40}$/;
+/** The `uses` path each setup id belongs to (review-6c-r1 minor 3): `pipegen-checkout` counts only on actions/checkout, and so on. */
+const SETUP_ID_ACTION: readonly [RegExp, string][] = [
+  [/^pipegen-checkout$/, 'actions/checkout'], [/^pipegen-setup-node-\d{1,3}$/, 'actions/setup-node'], [/^pipegen-setup-python$/, 'actions/setup-python'],
+];
 
 /**
  * Whether a step is KNOWN not to run the repo's code. Everything else is repo code (fail closed): a step with no id, an
  * unknown or renamed id, `pipegen-npm-ci-…` (the repo's own `npm ci` reads its `.npmrc`), the repo-code run steps, and any
  * action that is not a pinned checkout, setup or upload action. An id counts only on the right kind of step: a script
- * for the run ids, a pinned platform action for the setup ids.
+ * for the run ids, and for a setup id the pinned platform action it names (`pipegen-checkout` only on actions/checkout).
  */
 function isKnownHarmless(s: RenderedStep): boolean {
   const pinnedAction = s.uses !== undefined && s.run === undefined && TRUSTED_ACTION_RE.test(s.uses);
   if (s.id === undefined) return pinnedAction;
-  if (SETUP_STEP_ID_RE.test(s.id)) return pinnedAction;
+  if (SETUP_STEP_ID_RE.test(s.id)) {
+    const path = SETUP_ID_ACTION.find(([re]) => re.test(s.id as string))?.[1];
+    return pinnedAction && path !== undefined && (s.uses as string).startsWith(`${path}@`);
+  }
   if (CHECKER_STEP_ID_RE.test(s.id) || SCRUB_STEP_ID_RE.test(s.id) || TOOL_STEP_ID_RE.test(s.id)) return s.run !== undefined && s.uses === undefined;
   return false;   // an unknown or renamed id
 }

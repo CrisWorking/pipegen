@@ -470,9 +470,30 @@ describe('S10: renderProjectScript', () => {
     const res = exec(run, sb, env);
     expect(res.status, res.stderr).toBe(0);
     const names = readFileSync(join(sb.rt, 'npm-env.txt'), 'utf8').split('\n').filter((l) => /^[A-Za-z_]\w*=/.test(l)).map((l) => l.slice(0, l.indexOf('='))).filter((n) => n !== 'PWD' && n !== '_' && n !== 'SHLVL');
-    expect(names.sort()).toEqual(['HOME', 'PATH', 'RUNNER_TEMP', 'TMPDIR']);
+    expect(names.sort()).toEqual(['CI', 'HOME', 'PATH', 'RUNNER_TEMP', 'TMPDIR']);
     expect(readFileSync(join(sb.rt, 'npm-env.txt'), 'utf8')).not.toContain('/home/runner');
     expect(readFileSync(join(sb.rt, 'npm-args.txt'), 'utf8').trim()).toBe('test');
+  });
+  it2('7a Part 0: the script gets CI=true from the allowlist itself, whatever the job sets (real bash)', () => {
+    const run = runOf(renderProjectScript(step(), platform(), c));
+    expect(run.run).toContain('"CI=true"');
+    expect(Object.keys(run.env ?? {})).not.toContain('CI');
+    const sb = sandbox();
+    mkdirSync(join(sb.ws, 'apps', 'web'), { recursive: true });
+    const bin = join(sb.dir, 'nodebin');
+    mkdirSync(bin);
+    writeFileSync(join(bin, 'node'), `#!/bin/sh\nif [ "$1" = --version ]; then echo v22.3.0; exit 0; fi\nexec ${process.execPath} "$@"\n`);
+    writeFileSync(join(bin, 'npm'), '#!/bin/sh\nenv > "$RUNNER_TEMP/npm-env.txt"\n');
+    chmodSync(join(bin, 'node'), 0o755);
+    chmodSync(join(bin, 'npm'), 0o755);
+    for (const ambient of [{}, { CI: 'false' }, { CI: '' }] as Record<string, string>[]) {
+      const res = exec(run, sb, { ...stepEnv(run, sb, {}, ambient), PATH: `${bin}:${process.env.PATH ?? ''}` });
+      expect(res.status, res.stderr).toBe(0);
+      expect(readFileSync(join(sb.rt, 'npm-env.txt'), 'utf8').split('\n').filter((l) => l.startsWith('CI='))).toEqual(['CI=true']);
+    }
+  });
+  it('7a Part 0: CI=true is only on the project script; the other repo-code tools keep the plain allowlist', () => {
+    for (const s of render('vitest-coverage', ctxFor([svc])).steps) expect(s.run ?? '', s.name).not.toContain('"CI=true"');
   });
   it('snapshot', async () => {
     const { Document } = await import('yaml');

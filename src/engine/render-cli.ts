@@ -105,8 +105,12 @@ function cdLines(workingDir: string | undefined): string[] {
   ];
 }
 
-/** The `env -i` array: the only variables a tool sees (ruling S6). `names` are passed through from the step's env by name. */
-function allowlist(pathValue: string, names: readonly string[]): string[] {
+/**
+ * The `env -i` array: the only variables a tool sees (ruling S6). `names` are passed through from the step's env by name;
+ * `constants` are reviewed `NAME=value` words written into the script itself (so no job or step variable can change them).
+ */
+function allowlist(pathValue: string, names: readonly string[], constants: readonly string[] = []): string[] {
+  for (const c of constants) if (!/^[A-Z][A-Z0-9_]{0,40}=[A-Za-z0-9_.-]{0,40}$/.test(c)) refuse('A constant of the tool environment is not a plain NAME=value.');
   return [
     'pg_env=(',
     '  /usr/bin/env -i',
@@ -114,6 +118,7 @@ function allowlist(pathValue: string, names: readonly string[]): string[] {
     `  "PATH=${pathValue}"`,
     '  "RUNNER_TEMP=$RUNNER_TEMP"',
     '  "TMPDIR=$RUNNER_TEMP"',
+    ...constants.map((c) => `  "${c}"`),
     ...names.map((n) => `  "${n}=$${n}"`),
     ')',
   ];
@@ -769,8 +774,9 @@ export function projectScriptSteps(artifact: string, which: 'test' | 'lint', nod
   const run = script([
     ...prologue(artifact, { nodeMajor }), ...cdLines(workingDir),
     // repo code, but not with the job's whole environment: the same env -i allowlist as the other repo-code tools (ruling S6 b), so
-    // the OIDC request token, NODE_OPTIONS, NPM_CONFIG_* and the runner HOME never reach the repo's script
-    ...allowlist(`$nodebin:${FIXED_PATH}`, []),
+    // the OIDC request token, NODE_OPTIONS, NPM_CONFIG_* and the runner HOME never reach the repo's script. CI=true is set
+    // here, as a constant (7a Part 0): many test runners change behaviour without it (watch mode, prompts, snapshots written)
+    ...allowlist(`$nodebin:${FIXED_PATH}`, [], ['CI=true']),
     `"\${pg_env[@]}" "$nodebin/npm" ${which === 'test' ? 'test' : 'run lint'}`,
   ]);
   return [ci, runStep(`pipegen: run the project's ${which} script`, run, {}, `repocode-${sha16(`project-script:${artifact}:${which}`)}`)];

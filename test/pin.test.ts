@@ -926,6 +926,19 @@ describe('pin: a sub-path action is judged by its own action.yml (6c fix round 1
     expect((await resolvePin(stored(), deps, undefined, { readActionImage: true, subPath: 'sub' })).wrappedImage?.digest).toBe(D);
     for (const bad of ['../x', '/abs', '-x', 'a b', 'a/../b']) await expect(resolvePin(stored(), setup(github(root)).deps, undefined, { readActionImage: true, subPath: bad }), bad).rejects.toThrow(PinError);
   });
+  it('M32: a hostile sub-path is refused by the plain-path guard even when a digest-pinned action.yml answers at every path', async () => {
+    // every action.yml/action.yaml request, wherever URL normalisation sends it, gets a valid digest-pinned docker action:
+    // without the guard the resolve would succeed, so only the guard can make this fail
+    const docker = f('x', `runs:\n  using: docker\n  image: docker://ghcr.io/o/img@${D}\n`)[`GET ${GH}/repos/o/r/contents/x`] as Reply;
+    const everywhere = (): Routes => new Proxy(github(), {
+      get: (target, key) => (typeof key === 'string' && !(key in target) && /\/action\.ya?ml$/.test(key) ? docker : Reflect.get(target, key)),
+    });
+    // the catch-all works: a plain sub-path resolves through it
+    expect((await resolvePin(stored(), setup(everywhere()).deps, undefined, { readActionImage: true, subPath: 'ok/dir' })).wrappedImage?.digest).toBe(D);
+    for (const bad of ['../x', '../../../repos/evil/x/contents', '/abs', '-x', 'a/../b', 'a/..', '..']) {
+      await expect(resolvePin(stored(), setup(everywhere()).deps, undefined, { readActionImage: true, subPath: bad }), bad).rejects.toThrow(/isn't a plain path inside the repository/);
+    }
+  });
   it('readActionRuns tells the kinds apart (the live check of the container lists uses it)', async () => {
     const kinds: [string, string][] = [
       ['runs:\n  using: node24\n  main: i.js\n', 'node'], ['runs:\n  using: composite\n  steps: []\n', 'composite'],
