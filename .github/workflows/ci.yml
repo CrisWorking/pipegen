@@ -54,6 +54,13 @@ jobs:
         run: npx vitest run test/reviewed-verify-live.test.ts
         env:
           PIPEGEN_LIVE_TESTS: '1'
+      # Every platform's archive hash in data/pinned-binaries.yml against the release's checksums file, verified with
+      # the pinned cosign where upstream signs it (m4: the binaries also run on macOS and arm64 Linux).
+      - name: Live test of every pinned binary platform hash (downloads the pinned cosign and the release checksums files)
+        if: matrix.node == 24
+        run: npx vitest run test/pinned-binaries-verify-live.test.ts
+        env:
+          PIPEGEN_LIVE_TESTS: '1'
       - run: npx tsc --noEmit
 
   no-runtime-deps:
