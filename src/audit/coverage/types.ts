@@ -101,6 +101,8 @@ export interface Found {
   pathArgs?: readonly string[];
   /** P57 (C4): the pre-commit hook id this run comes from (readPrecommitConfig), so SKIP / PREK_SKIP can name it. */
   hookId?: string;
+  /** P57 (C4): the hook's `alias`, which SKIP / PREK_SKIP may name instead of its id. */
+  hookAlias?: string;
   /** P57 (C4): a CI pre-commit/prek run's SKIP set (gated): the hooks it names are partial, an unreadable one makes all unknown. */
   hookSkip?: SkipSet;
 }

@@ -3502,3 +3502,42 @@ describe('coverage: Dockerfile ENV / ARG and a compose service\'s environment go
     expect(await st(HEAD, steps, { 'compose.yml': compose('') })).toBe('covered your own `tox`'); // control
   });
 });
+
+describe('coverage: SKIP / PREK_SKIP, the follow-ups of the security scan (P57 C4)', () => {
+  const app = svc('.', { language: 'python', packageManager: 'uv', scripts: [], quality: { ...emptyServiceQuality(), pythonTyped: true } });
+  const YAML = 'repos:\n  - repo: https://github.com/pre-commit/mirrors-mypy\n    rev: v1.18.2\n    hooks:\n      - id: mypy\n        alias: types\n'
+    + '  - repo: https://github.com/astral-sh/ruff-pre-commit\n    rev: v0.16.0\n    hooks:\n      - id: ruff\n';
+  const two = async (steps: string, files: Record<string, string> = {}) => {
+    const dir = makeTempDir();
+    for (const [rel, text] of Object.entries({ '.pre-commit-config.yaml': YAML, ...files })) writeIn(dir, rel, text);
+    wf(dir, 'ci.yml', `${both}${job(steps)}`);
+    const rows = await coverage(dir, { services: [app] });
+    return ['lint', 'type-check'].map((id) => { const r = row(rows, 'push', id, 'app'); return `${r.status}${r.by === undefined ? '' : ` ${r.by}`}`; });
+  };
+
+  it('a hook is skipped when SKIP or PREK_SKIP names its alias, in the YAML and in prek.toml', async () => {
+    expect(await two(run('SKIP=types pre-commit run --all-files'))).toEqual(['covered ruff', 'partial mypy']);
+    expect(await two(run('PREK_SKIP=types prek run --all-files'))).toEqual(['covered ruff', 'partial mypy']);
+    const toml = '[[repos]]\nrepo = "https://github.com/pre-commit/mirrors-mypy"\nrev = "v1.18.2"\nhooks = [{ id = "mypy", alias = "types" }]\n';
+    expect(await two(run('SKIP=types prek run --all-files'), { 'prek.toml': toml })).toEqual(['missing', 'partial mypy']);
+  });
+
+  it('a value glued to quotes or other text is not the literal it looks like: unknown for every hook', async () => {
+    for (const cmd of ['SKIP="ruff"mypy prek run --all-files', 'SKIP=ruff"x mypy" prek run --all-files', "SKIP='ruff'$X prek run --all-files",
+      'SKIP=ruff\\x prek run --all-files', 'echo SKIP=ruff`x` >> "$GITHUB_ENV"', 'echo "SKIP=ruff"mypy >> "$GITHUB_ENV"']) {
+      const steps = cmd.startsWith('echo') ? run(JSON.stringify(cmd)) + run('prek run --all-files') : run(JSON.stringify(cmd));
+      const out = await two(steps);
+      expect(out.every((x) => x.startsWith('unknown')), `${cmd}: ${out.join()}`).toBe(true);
+    }
+    // a quoted value, or one a quoted echo closes, is still read
+    expect(await two(run('SKIP="mypy" prek run --all-files'))).toEqual(['covered ruff', 'partial mypy']);
+    expect(await two(run('echo "SKIP=mypy" >> "$GITHUB_ENV"') + run('prek run --all-files'))).toEqual(['covered ruff', 'partial mypy']);
+  });
+
+  it('a value longer than 300 characters is read to its end (the hook named last is skipped)', async () => {
+    const long = `${Array.from({ length: 80 }, (_, i) => `hook${i}`).join(',')},mypy`;
+    expect(long.length).toBeGreaterThan(300);
+    expect(await two(run(`SKIP=${long} prek run --all-files`))).toEqual(['covered ruff', 'partial mypy']);
+    expect(await two(`      - run: prek run --all-files\n        env:\n          SKIP: ${long}\n`)).toEqual(['covered ruff', 'partial mypy']);
+  });
+});

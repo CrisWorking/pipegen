@@ -124,6 +124,8 @@ async function hookConfigRuns(ctx: Ctx, config: Obj): Promise<Found[]> {
         // Plan P Task 3: more args than pipegen reads may hide a soft flag past them
         const complete = allArgs.length <= MAX_FLAG_WORDS;
         const id = typeof hook.id === 'string' && regexSafe(hook.id) ? hook.id : '';
+        // P57 (C4): pre-commit and prek also skip a hook by its alias
+        const alias = typeof hook.alias === 'string' && regexSafe(hook.alias) && hook.alias !== '' ? hook.alias : undefined;
         const entry = typeof hook.entry === 'string' && regexSafe(hook.entry) ? hook.entry : undefined;
         let hookFound: Found[] = [];
         // the words the hook runs with, for the formatter rule (PS14): the entry and args, or the args of a known hook
@@ -146,7 +148,7 @@ async function hookConfigRuns(ctx: Ctx, config: Obj): Promise<Found[]> {
             ? tools.filter((t) => flagsAllow(t, args, complete)).map((t) => foundOf(t, '.', commandReason(t, args) ?? (complete ? null : 'long')))
             : tag(scan(hookCommand(id, args)), 'hook-repo');
         }
-        hookFound = hookFound.map((f) => ({ ...(FORMATTER_HOOKS.has(f.by) ? { ...f, formats: formatterFails(f.by, words) } : f), ...(id === '' ? {} : { hookId: id }) }));
+        hookFound = hookFound.map((f) => ({ ...(FORMATTER_HOOKS.has(f.by) ? { ...f, formats: formatterFails(f.by, words) } : f), ...(id === '' ? {} : { hookId: id }), ...(alias === undefined ? {} : { hookAlias: alias }) }));
         // a file filter pipegen doesn't evaluate (they are Python regexes from the repo), or another stage
         const filtered = topFiltered || ['files', 'exclude', 'types', 'types_or', 'exclude_types'].some((k) => isSet(hook, k));
         if (filtered) hookFound = tag(hookFound, 'files');
@@ -214,7 +216,7 @@ const carried = (f: Found): string[] => {
 function carriedTools(found: readonly Found[]): { f: Found; categories: string[] }[] {
   const tools = new Map<string, { f: Found; categories: string[] }>();
   for (const f of found) {
-    const key = `${f.by}\u0000${f.reason ?? ''}\u0000${f.hookId ?? ''}`;
+    const key = `${f.by}\u0000${f.reason ?? ''}\u0000${f.hookId ?? ''}\u0000${f.hookAlias ?? ''}`;
     const categories = carried(f);
     // a hook set up for another stage doesn't run in `pre-commit run` (its default stage is pre-commit)
     if (categories.length > 0 && f.reason !== 'stage' && !tools.has(key)) tools.set(key, { f, categories });
@@ -262,7 +264,7 @@ export async function hookRunHits(ctx: Ctx): Promise<void> {
         });
         continue;
       }
-      const skipped = t.hookId !== undefined && rep.hookSkip?.ids.has(t.hookId) === true;
+      const skipped = [t.hookId, t.hookAlias].some((n) => n !== undefined && rep.hookSkip?.ids.has(n) === true);
       // fix round 1 (P8): a softEnv name set in the CI job reaches the hook's tool; its config files are looked for later
       const set = softEnvSet(t.softEnv, rep.jobEnv);
       // a run over changed files only is partial ('changed'), unless something already keeps the hook from running

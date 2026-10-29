@@ -500,21 +500,45 @@ export const skipsAny = (s: SkipSet) => s.unknown || s.ids.size > 0;
 /** A SKIP value from an `env:` map: literal ids, nothing (empty), or unknown. */
 function skipValue(v: unknown): SkipSet {
   if (v === null || v === undefined || v === '') return NO_SKIP;
-  if (typeof v !== 'string' || v.length > 1000 || !/^[A-Za-z0-9_.,\s-]*$/.test(v)) return UNKNOWN_SKIP;
+  if (typeof v !== 'string' || v.length > 64_000 || !/^[A-Za-z0-9_.,\s-]*$/.test(v)) return UNKNOWN_SKIP;
   return { ids: new Set(v.split(',').map((x) => x.trim()).filter((x) => x !== '')), unknown: false };
 }
-/** Every mention of the variable `name` (as a whole word) in shell text: `NAME=ids` (optionally quoted) gives the ids; anything else is unknown. */
+/** A character that ends a shell word (or the text's end): a blank, a list or pipe operator, a closing bracket, a redirection. */
+const wordEnd = (c: string | undefined) => c === undefined || /[\s;|&)<>]/.test(c);
+const SKIP_ID_CHAR = /[A-Za-z0-9_.,-]/;
+/**
+ * Every mention of the variable `name` (as a whole word) in shell text. `NAME=ids`, `NAME="ids"` or `NAME='ids'`, and
+ * `"NAME=ids"` inside a quoted word (an `echo "SKIP=x" >> "$GITHUB_ENV"`), give the ids, but only when the shell word ends
+ * right there: a value glued to other text (`"a"b`, `a"b c"`, `a$X`, a backslash or a backtick) is not the literal it
+ * looks like, so it is unknown, as is any other mention (`$SKIP`, `unset SKIP`, a heredoc). The value is read to its
+ * end, however long (the text itself is bounded by the scan budget).
+ */
 function skipInText(text: string, name: 'SKIP' | 'PREK_SKIP'): SkipSet {
   let out = NO_SKIP;
   const re = name === 'SKIP' ? /(?<![A-Za-z0-9_])SKIP(?![A-Za-z0-9_])/g : /(?<![A-Za-z0-9_])PREK_SKIP(?![A-Za-z0-9_])/g;
   for (let m = re.exec(text); m !== null; m = re.exec(text)) {
-    const after = text.slice(m.index + name.length, m.index + name.length + 300);
-    // "ids", 'ids', ids (then a word end), or nothing (then a word end); `"$X"`, `$X`, `$(…)` and the like are unknown
-    const v = after.startsWith('=') ? /^(?:"([A-Za-z0-9_.,-]*)"|'([A-Za-z0-9_.,-]*)'|([A-Za-z0-9_.,-]+)(?=$|[\s;|&)`>"'])|(?=$|[\s;|&)]))/.exec(after.slice(1)) : null;
-    out = orSkip(out, v === null ? UNKNOWN_SKIP : skipValue(v[1] ?? v[2] ?? v[3] ?? ''));
+    out = orSkip(out, skipAt(text, m.index, m.index + name.length));
     if (out.unknown) return out;
   }
   return out;
+}
+/** The value of the assignment whose name spans [start, at) in `text` (see skipInText). */
+function skipAt(text: string, start: number, at: number): SkipSet {
+  if (text[at] !== '=') return UNKNOWN_SKIP;
+  // a quote right before the name opens the word the assignment sits in: the same quote must close it
+  const outer = text[start - 1] === '"' || text[start - 1] === "'" ? text[start - 1] : null;
+  let i = at + 1;
+  const inner = outer === null && (text[i] === '"' || text[i] === "'") ? text[i] : null;
+  if (inner !== null) i++;
+  const from = i;
+  while (i < text.length && SKIP_ID_CHAR.test(text[i] as string)) i++;
+  const value = text.slice(from, i);
+  const close = outer ?? inner;
+  if (close !== null) {
+    if (text[i] !== close) return UNKNOWN_SKIP;
+    i++;
+  }
+  return wordEnd(text[i]) ? skipValue(value) : UNKNOWN_SKIP;
 }
 
 export interface EnvGate {
