@@ -261,3 +261,16 @@ describe('7a Part 0 (review-6c-r1 minors 2 and 3): dedupe compares contents; set
     }
   });
 });
+
+describe('7a fix round 1 (ruling 1, ruling 4): download-artifact and the harden step are harmless, pinned and on their own action only', () => {
+  it('a pinned download-artifact or bullfrog before a checker passes; by tag, or with a setup id on it, they are repo code', () => {
+    for (const path of ['actions/download-artifact', 'bullfrogsec/bullfrog']) {
+      expect(checkJobOrder([{ name: 'x', uses: `${path}@${sha}` }, ...steps('eslint')]), path).toEqual([]);
+      expect(checkJobOrder([{ name: 'x', uses: `${path}@v4` }, ...steps('eslint')]).length, path).toBeGreaterThan(0);
+      expect(checkJobOrder([{ id: 'pipegen-checkout', name: 'x', uses: `${path}@${sha}` }, ...steps('eslint')]).length, path).toBeGreaterThan(0);
+    }
+  });
+  it('after repo code they are refused like any harmless step', () => {
+    expect(checkJobOrder([...steps('vitest-coverage'), { name: 'x', uses: `actions/download-artifact@${sha}` }]).length).toBeGreaterThan(0);
+  });
+});

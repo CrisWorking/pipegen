@@ -123,6 +123,7 @@ export interface PipelineDraft {
   requireDeployApproval: boolean;   // set by the judge (Plan F); used by Plan G environments
   skipped: { part: SkippablePart; reason: string }[];   // from --skip
   suggestions: { name: string; repo: string; why: string }[];   // unreviewed tools: MENTION-ONLY in PIPEGEN.md, never run
+  centralPin?: { repo: string; sha: string };   // Plan B 7a fix round 1 (ruling 2): the central `<owner>/pipelines` repo and the commit pipegen itself resolved and wrote; the referee accepts a central `uses` only at this SHA (none recorded: every central `uses` is unknown-pin). Plan G fills it
 }
 
 // ---------- install record (written by Plan G deliver/finish, read by Plan V and `pipegen verify`) ----------

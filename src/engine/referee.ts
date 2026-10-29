@@ -29,7 +29,7 @@ import { GATE_CHECK_NAME, type CreatedFile, type PipegenInserted, type PipelineD
 import { ArtifactNameError, slug } from './artifact-names.js';
 import { COMMIT_SHA_RE } from './names.js';
 import { NEED_ID_CATEGORY } from './need-ids.js';
-import type { PlatformActions } from './pin.js';
+import { PLATFORM_ACTION_IDS, type PlatformActions } from './pin.js';
 import { APP_RUNNING_CATEGORIES } from './render-cli.js';
 import { EXPR, own, show } from './render-error.js';
 import {
@@ -44,8 +44,12 @@ import { ARGV_POLICIES, PLAIN_REL_RE, RENDERER_INPUTS, rendererInputProblems } f
 
 /** What a check found. `'quality-bar'` is gone (F10): no static rule produces it. */
 export type RefereeCheck = 'unpinned' | 'unknown-pin' | 'unreviewed' | 'permissions' | 'injection' | 'not-gate-readable' | 'cache' | 'template' | 'actionlint' | 'zizmor' | 'secret-value';
-/** `line` (1-based) when the finding has one (the linters, 7b): in an edited user workflow it decides between an issue and a note. */
-export interface RefereeIssue { file: string; check: RefereeCheck; message: string; line?: number }
+/**
+ * `line` (1-based) when the finding has one (the linters, 7b): in an edited user workflow it decides between an issue and a
+ * note. `repo`: which repository's file it is (7b knows it, one temp copy per repo); a finding is matched to its file by repo
+ * and path, and one that can not be matched to exactly one file stays an issue.
+ */
+export interface RefereeIssue { file: string; check: RefereeCheck; message: string; line?: number; repo?: CreatedFile['repo'] }
 /**
  * `ok` = no issue. `demoted`: the needs whose blocking was turned off (B7), by need key (`<needId>`, or
  * `<needId>--<service slug>` for a per-service need, as in the result artifact name), each with a note. `notes`: what the
@@ -90,11 +94,67 @@ export const PIPEGEN_SECRETS: readonly string[] = ['PIPEGEN_FP_KEY', 'PIPEGEN_CO
 /** Ruling B7: the checks the gate judges by their findings; their tool must write SARIF (DAST: ZAP's JSON too). Every other category is judged by job status. */
 export const FINDINGS_CATEGORIES: ReadonlySet<string> = new Set(['secrets', 'sast', 'deps', 'iac', 'image-scan', 'dast', 'licences', 'dockerfile-lint']);
 
+/**
+ * What a step is, recognised by its content (the reviewed entry its `uses` and template match, or the rendered step its
+ * run text equals), never by its id alone. `repo-code`: a step that runs or loads the repository's code (tests, project
+ * scripts, the repo's npm ci); `central`: an action from the central pipelines repo; `unrecognised`: anything else.
+ */
+export type StepKind = 'checkout' | 'setup' | 'harden' | 'upload-artifact' | 'download-artifact' | 'upload-sarif' | 'attest' | 'docker-login' | 'setup-buildx' | 'build-push'
+  | 'gate' | 'watcher' | 'tool' | 'scrub' | 'central' | 'repo-code' | 'unrecognised';
+/** pipegen's own actions by reviewed-entry id (Plan C adds the gate entry, Plan H the watcher entry, under these ids). */
+export const PIPEGEN_ACTION_IDS = { gate: 'pipegen-gate', watcher: 'pipegen-watcher' } as const;
+/** The step kind of each reviewed action entry that is not an ordinary tool, by entry id. */
+const ENTRY_KIND: Readonly<Record<string, StepKind>> = Object.freeze({
+  ...Object.fromEntries(Object.entries({ checkout: 'checkout', 'setup-node': 'setup', 'setup-python': 'setup', 'upload-artifact': 'upload-artifact', 'download-artifact': 'download-artifact',
+    'upload-sarif': 'upload-sarif', attest: 'attest', 'docker-login': 'docker-login', 'setup-buildx': 'setup-buildx', 'build-push': 'build-push' } satisfies Record<keyof PlatformActions, StepKind>)
+    .map(([k, kind]) => [PLATFORM_ACTION_IDS[k as keyof PlatformActions], kind])),
+  bullfrog: 'harden', [PIPEGEN_ACTION_IDS.gate]: 'gate', [PIPEGEN_ACTION_IDS.watcher]: 'watcher',
+});
+/**
+ * The steps each job of the permission table may hold (7a fix round 1, ruling 1), by step kind. A job with power (any
+ * permission beyond `contents: read`, an `environment:`, or a secret other than the declared app secrets) runs only what
+ * that power is for: no repo-code step and no unrecognised step, ever. A privileged job whose id is not here is refused.
+ * pipegen's own gate and watcher actions are allowed only in the rows that list them.
+ * DOCUMENTED RESIDUAL: `image-publish` builds the repository's Dockerfile with the reviewed build-push step. That build is
+ * the repo's code running with `packages: write`; it is allowed there and nowhere else, because publishing the image is the
+ * job's purpose (the image is then signed and verified by digest).
+ */
+export const JOB_STEP_POLICY: Readonly<Record<string, readonly StepKind[]>> = Object.freeze({
+  'pr-check': ['harden', 'checkout'],
+  'pipegen-verify': ['harden', 'checkout', 'download-artifact', 'gate'],
+  'code-scanning': ['harden', 'download-artifact', 'upload-sarif'],
+  gate: ['harden', 'checkout', 'download-artifact', 'gate'],
+  'base-scan': ['harden', 'checkout', 'setup', 'tool', 'scrub', 'upload-artifact'],
+  'baseline-check': ['harden', 'checkout', 'download-artifact', 'gate'],
+  'image-publish': ['harden', 'checkout', 'setup-buildx', 'docker-login', 'build-push'],
+  sign: ['harden', 'checkout', 'download-artifact', 'docker-login', 'attest'],
+  nightly: ['harden', 'checkout', 'download-artifact', 'gate'],
+  watch: ['harden', 'checkout', 'watcher'],
+  notify: ['harden', 'download-artifact'],
+  'merged-red': ['harden', 'download-artifact'],
+});
+/** The only jobs that may run in the signing environment (its secrets sign and verify). */
+const SIGNING_JOBS: ReadonlySet<string> = new Set(['sign', 'pipegen-verify']);
+/** Needs pipegen's own jobs implement (Plan G), not a tool step: they never need one. */
+const PIPEGEN_JOB_CATEGORIES: ReadonlySet<string> = new Set(['gate', 'signing', 'attestation', 'deploy-verify']);
+/** The triggers pipegen writes (ruling 7): `pull_request_target`, `workflow_run` and the rest are never in a file pipegen writes whole. */
+const TRIGGERS: ReadonlySet<string> = new Set(['push', 'pull_request', 'merge_group', 'schedule', 'workflow_dispatch', 'workflow_call']);
+/**
+ * GitHub-hosted runner labels, as a plain string (ruling 6). A self-hosted runner keeps state between runs, which breaks the
+ * no-cache rule (spec §19); self-hosted support would be a future, explicit opt-in.
+ */
+const HOSTED_RUNNERS: ReadonlySet<string> = new Set(['ubuntu-latest', 'ubuntu-24.04', 'ubuntu-22.04', 'ubuntu-24.04-arm', 'ubuntu-22.04-arm']);
+/** GitHub's owner name rule (the same pattern as src/github/client.ts), checked again here: the central prefix is built from it. */
+const OWNER_RE = /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})$/;
+/** Local composite actions are expanded inline at most this many levels deep (ruling 3). */
+const MAX_COMPOSITE_DEPTH = 3;
+/** A status function in an `if:` makes a job run although a job it needs failed (always(), failure(), cancelled(), !cancelled()). */
+const STATUS_FN_RE = /\b(?:always|failure|cancelled)\s*\(/i;
+
 const LEVEL: Readonly<Record<string, number>> = { none: 0, read: 1, write: 2 };
 const WORKFLOW_PATH_RE = /^\.github\/workflows\/[A-Za-z0-9._-]{1,100}\.ya?ml$/;
 const ACTION_PATH_RE = /^\.github\/actions\/[A-Za-z0-9._/-]{1,200}\/action\.ya?ml$/;
 const JOB_ID_RE = /^[A-Za-z_][A-Za-z0-9_-]{0,99}$/;
-const RUNS_ON_RE = /^[A-Za-z0-9._-]{1,64}$/;
 const STEP_KEYS: ReadonlySet<string> = new Set(['id', 'name', 'if', 'uses', 'with', 'run', 'shell', 'env', 'working-directory', 'continue-on-error', 'timeout-minutes']);
 const TOP_KEYS: ReadonlySet<string> = new Set(['name', 'run-name', 'on', 'permissions', 'env', 'concurrency', 'jobs']);
 const STEPS_JOB_KEYS: ReadonlySet<string> = new Set(['name', 'runs-on', 'needs', 'if', 'permissions', 'environment', 'concurrency', 'outputs', 'env', 'steps', 'timeout-minutes', 'services', 'cache-mode']);
@@ -108,8 +168,6 @@ const SECRET_USE_RE = /\$\{\{[^}]*?\bsecrets\s*\.\s*([A-Za-z_][A-Za-z0-9_]*)/g;
 /** The line a rendered trivy run step starts trivy with (render-cli.ts launch). */
 const TRIVY_LAUNCH_RE = /"\$\{pg_env\[@\]\}" "\$bin\/trivy"/;
 const TRIVY_CONFIG = ARGV_POLICIES['trivy-config']?.config;
-/** Run-step `if:` values that never skip a tool on success (a blocking tool must run whenever its job runs). */
-const RUNS_ALWAYS: ReadonlySet<string> = new Set(['always()', 'success()', '!cancelled()']);
 
 /** Sentinel targets the referee renders with: two sets, so the env values that differ are the run-time slots (B6). */
 const SENTINELS = [
@@ -117,7 +175,7 @@ const SENTINELS = [
   { image: `ghcr.io/pipegen-referee/b@sha256:${'b'.repeat(64)}`, url: 'http://localhost:2', k8sDir: 'pipegen-referee-b' },
 ] as const;
 
-type Add = (file: string, check: RefereeCheck, message: string, line?: number) => void;
+type Add = (file: string, check: RefereeCheck, message: string, line?: number, repo?: CreatedFile['repo']) => void;
 type Obj = Record<string, unknown>;
 const isObj = (v: unknown): v is Obj => typeof v === 'object' && v !== null && !Array.isArray(v);
 const isReviewed = (c: unknown): boolean => isObj(c) && c.source === 'reviewed' && c.reviewed === true;
@@ -126,7 +184,8 @@ const uniq = <T>(xs: Iterable<T>): T[] => [...new Set(xs)];
 
 // ---------- parsing (S29) ----------
 
-interface Parsed { doc: Document; js: Obj; lines: LineCounter }
+/** `scalars`: every string key and value as parsed (escapes decoded), for the secret-value check (S18). */
+interface Parsed { doc: Document; js: Obj; lines: LineCounter; scalars: string[] }
 
 /**
  * One YAML document as a map, or the problems that make pipegen refuse it. `strict` (a file pipegen wrote whole): no
@@ -149,7 +208,9 @@ function parseYaml(text: string, mode: 'strict' | 'user'): { parsed: Parsed } | 
   if (doc.warnings.length > 0) problems.push(`the YAML parser warns about it (${safeText(doc.warnings[0]?.code ?? '', 40)})`);
   const directives = doc.directives;
   if (directives?.yaml.explicit === true || Object.keys(directives?.tags ?? {}).some((h) => h !== '!!' && h !== '!')) problems.push('it has a YAML directive (%YAML or %TAG), which changes how values are read');
+  const scalars: string[] = [];
   visit(doc, {
+    Scalar(_, n) { if (typeof n.value === 'string') scalars.push(n.value); },
     Alias() { if (mode === 'strict') problems.push('it uses a YAML alias (*name), which can copy a key past a reader'); },
     Node(_, n) {
       if (n.tag !== undefined) problems.push('it has a YAML tag (!!type), which changes what a value is');
@@ -168,7 +229,7 @@ function parseYaml(text: string, mode: 'strict' | 'user'): { parsed: Parsed } | 
     return { problems: ['its aliases can not be resolved within the limit'] };
   }
   if (!isObj(js)) return { problems: ['it is not a map of keys'] };
-  return { parsed: { doc, js, lines } };
+  return { parsed: { doc, js, lines, scalars } };
 }
 
 /** The lines (1-based) a node covers, from its first character to the end of its value. */
@@ -185,9 +246,11 @@ function jobPair(doc: Document, id: string): Pair<YamlNode, YamlNode> | undefine
 }
 
 /**
- * The lines pipegen inserted into an edited user workflow (the jobs it added and the `needs:` entries of the user's jobs
- * it touched), for 7b to tell a linter finding on pipegen's lines (an issue) from one on the user's own (a note). Null for
- * a file pipegen wrote whole (every line is judged) or one that can not be read (judged whole too: fail closed).
+ * The lines of an edited user workflow on which a linter finding is an issue, for 7b and the referee: the jobs pipegen
+ * added, the `needs:` of the user's jobs it touched and those jobs' `if:`, and the user's top-level `on`, `env`,
+ * `defaults` and `permissions`, which apply to pipegen's jobs too (7a fix round 1, ruling 5). A finding elsewhere is on the
+ * user's own lines (a note). Null for a file pipegen wrote whole (every line is judged) or one that can not be read
+ * (judged whole too: fail closed).
  */
 export function pipegenLines(file: CreatedFile): ReadonlySet<number> | null {
   const mark = file.inserted;
@@ -202,8 +265,15 @@ export function pipegenLines(file: CreatedFile): ReadonlySet<number> | null {
   }
   for (const n of mark.needs) {
     const p = jobPair(doc, n.job);
-    const needs = isMap(p?.value) ? (p.value.items.find((q) => isScalar(q.key) && q.key.value === 'needs') as Pair<YamlNode, YamlNode> | undefined) : undefined;
-    if (needs?.key?.range && needs.value?.range) linesOf(lines, needs.key.range[0], needs.value.range[1], out);
+    for (const key of ['needs', 'if']) {
+      const q = isMap(p?.value) ? (p.value.items.find((x) => isScalar(x.key) && x.key.value === key) as Pair<YamlNode, YamlNode> | undefined) : undefined;
+      if (q?.key?.range && q.value?.range) linesOf(lines, q.key.range[0], q.value.range[1], out);
+    }
+  }
+  if (isMap(doc.contents)) {
+    for (const q of doc.contents.items as Pair<YamlNode, YamlNode>[]) {
+      if (isScalar(q.key) && ['on', 'env', 'defaults', 'permissions'].includes(String(q.key.value)) && q.key.range && q.value?.range) linesOf(lines, q.key.range[0], q.value.range[1], out);
+    }
   }
   return out;
 }
@@ -215,6 +285,8 @@ interface Expected {
   /** env keys whose values are run-time slots, with their kind (judged by slots.ts, not by equality) */
   slots: Map<string, SlotKind>;
   source: string; appRunning: boolean; blocking: boolean;
+  /** the tool reads the checked-out workspace (every scanner but the image and URL ones): its job needs the locked checkout first */
+  readsWorkspace: boolean;
 }
 
 interface Expectations {
@@ -255,6 +327,18 @@ function slotKindOf(value: string, a: (typeof SENTINELS)[number]): SlotKind | un
   return undefined;
 }
 
+/**
+ * Whether a cli tool reads the checked-out workspace: every one does, except those whose only run-time values are an image
+ * or a URL (trivy-image, syft, nuclei) and a docker tool that mounts only a fresh work folder (zap). Unknown: it does.
+ */
+function readsWorkspace(entryId: string): boolean {
+  const pol = own(ARGV_POLICIES, entryId);
+  if (pol === undefined) return true;
+  if (pol.method === 'docker' && pol.mount?.source === 'work') return false;
+  const kinds = Object.values(pol.slots ?? {});
+  return !(kinds.length > 0 && kinds.every((k) => k === 'image-digest' || k === 'local-url'));
+}
+
 function expectations(draft: PipelineDraft, platform: PlatformActions, reviewed: readonly ReviewedTool[], add: Add, notes: string[]): Expectations {
   const byId = new Map(reviewed.map((t) => [t.id, t]));
   const actions = new Map<string, ReviewedTool>();
@@ -275,7 +359,7 @@ function expectations(draft: PipelineDraft, platform: PlatformActions, reviewed:
   };
   const ctxs: RenderContext[] = SENTINELS.map((t) => ({ profile: draft.profile, targets: { ...t } }));
   const needOf = (needId: string, service: string | undefined) => draft.needs.find((n) => n.id === needId && n.service === service);
-  const record = (source: string, results: RenderedStep[][], appRunning: boolean, blocking: boolean): void => {
+  const record = (source: string, results: RenderedStep[][], appRunning: boolean, blocking: boolean, readsWorkspace: boolean): void => {
     const [a, b] = results as [RenderedStep[], RenderedStep[]];
     const pins = new Map<string, string[]>();
     a.forEach((s, i) => {
@@ -288,7 +372,7 @@ function expectations(draft: PipelineDraft, platform: PlatformActions, reviewed:
         const kind = slotKindOf(v, SENTINELS[0]);
         if (kind !== undefined) slots.set(k, kind);
       }
-      ex.runs.push({ step: s, slots, source, appRunning, blocking });
+      ex.runs.push({ step: s, slots, source, appRunning, blocking, readsWorkspace });
       if (s.id !== undefined) ex.runIds.add(s.id);
     });
     ex.npmPins.set(source, pins);
@@ -304,7 +388,7 @@ function expectations(draft: PipelineDraft, platform: PlatformActions, reviewed:
     if (t.candidate.kind === 'action') return;   // actions are judged by their template (judgeAction), not by a re-render
     const appRunning = t.categories.some((c) => APP_RUNNING_CATEGORIES.has(c));
     try {
-      record(`spec:${i}`, ctxs.map((c) => renderStep(spec, t, platform, c).steps), appRunning, needOf(spec.needId, spec.service)?.blocking ?? true);
+      record(`spec:${i}`, ctxs.map((c) => renderStep(spec, t, platform, c).steps), appRunning, needOf(spec.needId, spec.service)?.blocking ?? true, readsWorkspace(t.id));
     } catch (e) {
       if (!(e instanceof RenderError)) throw e;
       notes.push(`The step for ${show(spec.needId)} (${t.id}) can not be rendered, so no step may claim to be it: ${safeText(e.message, 200)}`);
@@ -317,7 +401,7 @@ function expectations(draft: PipelineDraft, platform: PlatformActions, reviewed:
       const ps = projectScriptFor(need, s);
       if (ps === null) continue;
       try {
-        record(`script:${need.id}:${s.name}`, ctxs.map((c) => renderProjectScript(ps, platform, c).steps), false, need.blocking);
+        record(`script:${need.id}:${s.name}`, ctxs.map((c) => renderProjectScript(ps, platform, c).steps), false, need.blocking, true);
       } catch (e) {
         if (!(e instanceof RenderError)) throw e;
       }
@@ -336,6 +420,29 @@ interface FileCtx {
 
 const issueFor = (fc: FileCtx) => (check: RefereeCheck, message: string): void => fc.add(fc.file.path, check, message);
 
+/** The event names of an `on:` value (a name, a list of names, or a map by name); null when it is none of those. */
+function triggersOf(on: unknown): string[] | null {
+  if (typeof on === 'string') return [on];
+  if (Array.isArray(on)) return on.every((x) => typeof x === 'string') ? (on as string[]) : null;
+  if (isObj(on)) return Object.keys(on);
+  return null;
+}
+
+/**
+ * The central `<owner>/pipelines/` prefix and the one commit pipegen recorded for it (ruling 2), or null: the owner must
+ * pass GitHub's owner rule again here (an empty or odd owner never makes a prefix), and `draft.centralPin` must name that
+ * repo at a 40-character commit. Without it every central `uses` is unknown-pin.
+ */
+function centralOf(draft: PipelineDraft): { prefix: string; sha: string } | null {
+  const owner = draft.profile.owner;
+  const pin = draft.centralPin;
+  if (typeof owner !== 'string' || !OWNER_RE.test(owner) || pin === undefined || !isObj(pin)) return null;
+  if (typeof pin.repo !== 'string' || pin.repo.toLowerCase() !== `${owner.toLowerCase()}/pipelines` || typeof pin.sha !== 'string' || !COMMIT_SHA_RE.test(pin.sha)) return null;
+  return { prefix: `${owner.toLowerCase()}/pipelines/`, sha: pin.sha };
+}
+/** A `uses` path that looks like any owner's central pipelines repo. */
+const CENTRAL_LIKE_RE = /^[^/]*\/pipelines\//;
+
 /** The workflow's own top level (a file pipegen wrote whole). */
 function judgeTop(fc: FileCtx, js: Obj): void {
   const bad = issueFor(fc);
@@ -343,6 +450,9 @@ function judgeTop(fc: FileCtx, js: Obj): void {
   const p = js.permissions;
   if (!isObj(p) || Object.keys(p).length > 0) bad('permissions', 'The workflow must start from `permissions: {}`, so a job gets only what it declares.');
   for (const k of ['name', 'run-name', 'concurrency']) if (hasExpr(js[k])) bad('injection', `The workflow's ${k} holds an expression (\${{), which pipegen never writes there.`);
+  const triggers = triggersOf(js.on);
+  if (triggers === null || triggers.length === 0) bad('template', 'The workflow has no triggers pipegen can read.');
+  else for (const t of triggers) if (!TRIGGERS.has(t)) bad('template', `The trigger ${show(t)} is not one pipegen writes (only ${[...TRIGGERS].join(', ')}).`);
   judgeEnv(fc, js.env, 'the workflow');
 }
 
@@ -363,6 +473,22 @@ function judgeJobs(fc: FileCtx, jobs: unknown, only?: readonly string[]): void {
   for (const [id, j] of Object.entries(jobs)) if (only === undefined || only.includes(id)) judgeJob(fc, id, j);
 }
 
+/** The highest level of each permission a job with this id may have: `contents: read`, plus its row of JOB_PERMISSIONS. */
+function ceilingOf(id: string): Record<string, number> {
+  const allowed: Record<string, number> = { contents: LEVEL.read as number };
+  for (const [k, v] of Object.entries(own(JOB_PERMISSIONS, id) ?? {})) allowed[k] = Math.max(allowed[k] ?? 0, LEVEL[v] as number);
+  return allowed;
+}
+
+/** Whether a job holds power (ruling 1): any permission beyond `contents: read`, an environment, or a secret that is not a declared app secret. */
+function privileged(j: Obj, secrets: ReadonlySet<string>, ex: Expectations): boolean {
+  const p = j.permissions;
+  if (typeof p === 'string') return true;
+  if (isObj(p) && Object.entries(p).some(([k, v]) => (k === 'contents' ? v !== 'read' && v !== 'none' : v !== 'none'))) return true;
+  if (j.environment !== undefined) return true;
+  return [...secrets].some((n) => !ex.declared.has(n) || PIPEGEN_SECRETS.includes(n));
+}
+
 function judgeJob(fc: FileCtx, id: string, j: unknown): void {
   const bad = issueFor(fc);
   const where = `the job ${show(id)}`;
@@ -371,25 +497,55 @@ function judgeJob(fc: FileCtx, id: string, j: unknown): void {
   const caller = j.uses !== undefined;
   const keys = caller ? CALLER_JOB_KEYS : STEPS_JOB_KEYS;
   for (const k of Object.keys(j)) if (!keys.has(k)) bad('template', `${where} has the key ${show(k)}, which pipegen never writes on a job${k === 'container' || k === 'strategy' || k === 'continue-on-error' || k === 'defaults' ? ' (it changes what runs or whether a failure counts)' : ''}.`);
-  // expressions: nowhere on a job except the forms below (if from the fixed set; a caller's explicit secrets)
+  // expressions: nowhere on a job except the forms below (a caller's explicit secrets)
   for (const k of ['name', 'runs-on', 'needs', 'environment', 'concurrency', 'outputs', 'timeout-minutes', 'with']) if (hasExpr(j[k])) bad('injection', `${where} has an expression (\${{) in ${k}, which pipegen does not write there.`);
-  if (j.if !== undefined && (typeof j.if !== 'string' || !IF_VALUES.has(j.if))) bad('injection', `${where} has an if: pipegen does not write (only always(), success(), failure(), !cancelled()).`);
+  // a job that feeds the gate is never skipped on a condition (ruling 4); only the gate itself may run always(). Plan G's
+  // pr-check form (`needs.pr-check.outputs.has-pr != 'true'`) comes with Plan G, through a checker shared with the renderer
+  if (j.if !== undefined) {
+    if (typeof j.if !== 'string' || !IF_VALUES.has(j.if)) bad('injection', `${where} has an if: pipegen does not write.`);
+    else if (!(id === 'gate' && j.if === 'always()')) bad('template', `${where} has if: ${safeText(j.if, 20)}; a job that feeds the gate runs whenever its workflow does (a skipped job counts as passed).`);
+  }
+  if (j['timeout-minutes'] !== undefined && !(typeof j['timeout-minutes'] === 'number' && Number.isInteger(j['timeout-minutes']) && j['timeout-minutes'] >= 1 && j['timeout-minutes'] <= 360)) bad('template', `${where} has a timeout-minutes that is not 1 to 360.`);
   judgeEnv(fc, j.env, where);
   judgeGateName(fc, id, j);
   const calledPerms = caller ? judgeCaller(fc, id, j) : undefined;
   judgePermissions(fc, id, j, calledPerms);
-  if (id === 'pipegen-verify' && fc.draft.capabilities.environments) {
-    const env = isObj(j.environment) ? j.environment.name : j.environment;
-    if (env !== SIGNING_ENVIRONMENT) bad('permissions', `${where} must run in the environment ${SIGNING_ENVIRONMENT} (only deploys from the default branch pass it).`);
+  const envName = isObj(j.environment) ? j.environment.name : j.environment;
+  if (id === 'pipegen-verify' && fc.draft.capabilities.environments && envName !== SIGNING_ENVIRONMENT) {
+    bad('permissions', `${where} must run in the environment ${SIGNING_ENVIRONMENT} (only deploys from the default branch pass it).`);
   }
+  if (envName === SIGNING_ENVIRONMENT && !SIGNING_JOBS.has(id)) bad('permissions', `${where} runs in ${SIGNING_ENVIRONMENT}, whose secrets only the sign and pipegen-verify jobs may get.`);
   if (caller) return;
-  if (typeof j['runs-on'] === 'string' ? !RUNS_ON_RE.test(j['runs-on']) : !(Array.isArray(j['runs-on']) && j['runs-on'].length > 0 && j['runs-on'].every((r) => typeof r === 'string' && RUNS_ON_RE.test(r)))) {
-    bad('template', `${where} has a runs-on pipegen does not write.`);
+  if (typeof j['runs-on'] !== 'string' || !HOSTED_RUNNERS.has(j['runs-on'])) {
+    bad('template', `${where} must run on a GitHub-hosted runner (${[...HOSTED_RUNNERS].join(', ')}); a self-hosted runner keeps state between runs.`);
   }
   if (j['cache-mode'] !== 'none') bad('cache', `${where} must have cache-mode: none (no cache of any kind may feed the gate, a build, a signature or a verification).`);
   judgeServices(fc, where, j.services);
   if (!Array.isArray(j.steps)) { bad('template', `${where} has no list of steps.`); return; }
-  judgeSteps(fc, where, j.steps);
+  const judged = judgeJobSteps(fc, where, j.steps, true);
+  judgeStepPolicy(fc, id, where, j, judged);
+}
+
+/**
+ * Ruling 1: a job runs only what its power is for. A privileged job must have a row in JOB_STEP_POLICY and hold only the
+ * step kinds of its row (never repo code, never an unrecognised step); a job whose id has a row is held to it either way.
+ * pipegen's own gate and watcher actions run only in the rows that list them, and never after repo code.
+ */
+function judgeStepPolicy(fc: FileCtx, id: string, where: string, j: Obj, judged: readonly Judged[]): void {
+  const bad = issueFor(fc);
+  const secrets = new Set(judged.flatMap((x) => [...x.secrets]));
+  const row = own(JOB_STEP_POLICY, id);
+  const power = privileged(j, secrets, fc.ex);
+  if (power && row === undefined) bad('permissions', `${where} holds power (a permission beyond contents: read, an environment or pipegen's own secret) but is not one of pipegen's jobs (${Object.keys(JOB_STEP_POLICY).join(', ')}).`);
+  if (row !== undefined) {
+    judged.forEach((x, i) => {
+      if (!row.includes(x.kind)) bad('permissions', `${where}, step ${i + 1}, is ${x.kind === 'repo-code' ? 'code from the repository' : x.kind === 'unrecognised' ? 'a step pipegen does not recognise' : `a ${x.kind} step`}; the job ${id} may run only ${row.join(', ')} steps.`);
+    });
+  } else {
+    judged.forEach((x, i) => { if (x.kind === 'gate' || x.kind === 'watcher') bad('permissions', `${where}, step ${i + 1}: pipegen's ${x.kind} action runs only in its own job.`); });
+  }
+  const firstRepo = judged.findIndex((x) => x.kind === 'repo-code' || x.kind === 'unrecognised' || x.kind === 'central');
+  if (firstRepo >= 0) judged.slice(firstRepo + 1).forEach((x) => { if (x.kind === 'gate' || x.kind === 'watcher') bad('injection', `In ${where}: pipegen's ${x.kind} action comes after a step that runs code pipegen did not render.`); });
 }
 
 /** No job takes the gate's check name; the gate job (id `gate`) has the name the required check expects (GATE_CHECK_NAME, never a literal). */
@@ -401,11 +557,33 @@ function judgeGateName(fc: FileCtx, id: string, j: Obj): void {
   else if (id !== 'gate' && j.name === gateJob) bad('not-gate-readable', `The job ${show(id)} is named ${show(gateJob)}, like the gate; a check under the gate's name could pass for it.`);
 }
 
-/** A reusable-workflow caller: its `uses` pin, its inputs, its explicit secrets. Returns the called file's job permissions when that file is in `files`. */
+/**
+ * A reusable-workflow caller: its `uses` pin, its inputs, its explicit secrets. The called workflow must be a file pipegen is
+ * writing (local, or the central repo at the commit pipegen recorded, ruling 2), so it is judged too; pipegen's own secrets
+ * reach it only then. Returns the called file's job permissions.
+ */
 function judgeCaller(fc: FileCtx, id: string, j: Obj): Obj[] | undefined {
   const bad = issueFor(fc);
   const where = `the job ${show(id)}`;
   const uses = j.uses;
+  let called: Parsed | undefined;
+  if (typeof uses !== 'string') bad('unpinned', `${where} calls a workflow that is not named by text.`);
+  else if (uses.startsWith('./')) {
+    const rel = uses.slice(2);
+    called = WORKFLOW_PATH_RE.test(rel) && PLAIN_REL_RE.test(rel) ? fc.others.get(`${fc.file.repo}:${rel}`) : undefined;
+    if (called === undefined) bad('unknown-pin', `${where} calls ${show(uses)}, which is not a workflow file pipegen is writing.`);
+  } else {
+    const k = usesKey(uses);
+    const central = centralOf(fc.draft);
+    if (k === null || !COMMIT_SHA_RE.test(k.ref)) bad('unpinned', `${where} calls ${show(uses)}, which is not pinned to a 40-character commit.`);
+    else if (central === null || !k.path.startsWith(central.prefix)) bad('unknown-pin', `${where} calls ${show(uses)}, which is neither the central pipelines repo (at the commit pipegen recorded) nor a reviewed workflow.`);
+    else if (k.ref !== central.sha) bad('unknown-pin', `${where} calls the central repo at a commit pipegen did not record.`);
+    else {
+      const rel = k.path.slice(central.prefix.length);
+      called = WORKFLOW_PATH_RE.test(rel) ? fc.others.get(`central:${rel}`) : undefined;
+      if (called === undefined) bad('unknown-pin', `${where} calls ${show(uses)}, which is not among the central files pipegen is writing, so it can not be judged.`);
+    }
+  }
   if (j.secrets === 'inherit') bad('permissions', `${where} passes every secret (secrets: inherit); pipegen maps each secret by name.`);
   else if (j.secrets !== undefined) {
     if (!isObj(j.secrets)) bad('template', `${where} has secrets that are not a map.`);
@@ -413,21 +591,7 @@ function judgeCaller(fc: FileCtx, id: string, j: Obj): Obj[] | undefined {
       const m = typeof v === 'string' ? SECRET_REF_RE.exec(v) : null;
       if (m === null || m[1] !== k) bad('injection', `${where} passes the secret ${show(k)} as something other than \${{ secrets.${safeText(k, 40)} }}.`);
       else if (!fc.ex.allowed.has(k)) bad('permissions', `${where} passes the secret ${show(k)}, which no step of this pipeline declared.`);
-    }
-  }
-  if (typeof uses !== 'string') { bad('unpinned', `${where} calls a workflow that is not named by text.`); return undefined; }
-  let called: Parsed | undefined;
-  if (uses.startsWith('./')) {
-    const rel = uses.slice(2);
-    called = WORKFLOW_PATH_RE.test(rel) && PLAIN_REL_RE.test(rel) ? fc.others.get(`${fc.file.repo}:${rel}`) : undefined;
-    if (called === undefined) bad('unknown-pin', `${where} calls ${show(uses)}, which is not a workflow file pipegen is writing.`);
-  } else {
-    const k = usesKey(uses);
-    if (k === null || !COMMIT_SHA_RE.test(k.ref)) bad('unpinned', `${where} calls ${show(uses)}, which is not pinned to a 40-character commit.`);
-    else {
-      const central = `${fc.draft.profile.owner.toLowerCase()}/pipelines/`;
-      if (!k.path.startsWith(central)) bad('unknown-pin', `${where} calls ${show(uses)}, which is neither the central pipelines repo nor a reviewed workflow.`);
-      else called = fc.others.get(`central:${k.path.slice(central.length)}`);
+      else if (called === undefined && PIPEGEN_SECRETS.includes(k)) bad('permissions', `${where} passes pipegen's secret ${show(k)} to a workflow pipegen can not judge.`);
     }
   }
   if (called === undefined || !isObj(called.js.jobs)) return undefined;
@@ -441,8 +605,7 @@ function judgePermissions(fc: FileCtx, id: string, j: Obj, called: Obj[] | undef
   if (p === undefined || p === null) { bad('permissions', `${where} declares no permissions (it would get the repository's defaults).`); return; }
   if (typeof p === 'string') { bad('permissions', `${where} has permissions ${show(p)}; pipegen lists each permission (never read-all or write-all).`); return; }
   if (!isObj(p)) { bad('permissions', `${where} has permissions that are not a map.`); return; }
-  const allowed: Record<string, number> = { contents: LEVEL.read as number };
-  for (const [k, v] of Object.entries(own(JOB_PERMISSIONS, id) ?? {})) allowed[k] = Math.max(allowed[k] ?? 0, LEVEL[v] as number);
+  const allowed = ceilingOf(id);
   for (const c of called ?? []) for (const [k, v] of Object.entries(c)) if (typeof v === 'string' && own(LEVEL, v) !== undefined) allowed[k] = Math.max(allowed[k] ?? 0, LEVEL[v] as number);
   for (const [k, v] of Object.entries(p)) {
     const level = typeof v === 'string' ? own(LEVEL, v) : undefined;
@@ -468,10 +631,21 @@ function judgeServices(fc: FileCtx, where: string, services: unknown): void {
 
 // ---------- steps ----------
 
-interface Judged { step: RenderedStep; match?: Expected; harmlessId: boolean }
+interface Judged {
+  step: RenderedStep; match?: Expected; kind: StepKind;
+  /** the id may be trusted by the order rule (the step is recognised by content) */
+  harmlessId: boolean;
+  /** the secrets the step names */
+  secrets: Set<string>;
+  readsWorkspace: boolean;
+}
 
-function judgeSteps(fc: FileCtx, where: string, steps: unknown[]): void {
-  const judged = steps.map((s, i) => judgeStep(fc, `${where}, step ${i + 1}`, s));
+/**
+ * A job's steps, judged where they run: local composite actions expanded inline (ruling 3), then the order rule, the merged
+ * npm ci pins and, for a job (`job`), the locked checkout before the first scanner that reads the workspace (ruling 4).
+ */
+function judgeJobSteps(fc: FileCtx, where: string, steps: unknown[], job: boolean): Judged[] {
+  const judged = judgeList(fc, where, steps, 0, []);
   // the order rule, on what was parsed: a run step not recognised by content is repo code, whatever id it claims
   const forOrder = judged.map((x) => (x.harmlessId ? x.step : { ...x.step, id: undefined }));
   for (const problem of checkJobOrder(forOrder)) fc.add(fc.file.path, 'injection', `In ${where}: ${problem}`);
@@ -484,12 +658,50 @@ function judgeSteps(fc: FileCtx, where: string, steps: unknown[]): void {
     const got = pinLines(x.step.env?.PIPEGEN_NPM_EXPECT);
     if (got === null || !isDeepStrictEqual(new Set(got), want)) fc.add(fc.file.path, 'template', `In ${where}: the dependency install ${show(id)} does not check exactly the pins of the tools of its job.`);
   }
+  if (job) {
+    const reader = judged.findIndex((x) => x.kind === 'tool' && x.readsWorkspace);
+    if (reader >= 0) {
+      const co = judged.findIndex((x) => x.kind === 'checkout');
+      const ok = co >= 0 && co < reader && judged.slice(0, co).every((x) => x.kind === 'harden' || x.kind === 'setup') && judged[co]?.step.if === undefined;
+      if (!ok) fc.add(fc.file.path, 'template', `In ${where}: a scanner reads the workspace, so the job must check the repository out first (the locked checkout, right after any harden or setup step, with no condition); otherwise it scans nothing and passes.`);
+    }
+  }
+  return judged;
+}
+
+/** Steps in order, with each `./` composite action replaced by its own steps (recursively, at most MAX_COMPOSITE_DEPTH deep, no cycle). */
+function judgeList(fc: FileCtx, where: string, steps: unknown[], depth: number, seen: readonly string[]): Judged[] {
+  const out: Judged[] = [];
+  steps.forEach((raw, i) => {
+    const at = `${where}, step ${i + 1}`;
+    if (isObj(raw) && typeof raw.uses === 'string' && raw.uses.startsWith('./')) out.push(...expandLocal(fc, at, raw, depth, seen));
+    else out.push(judgeStep(fc, at, raw));
+  });
+  return out;
+}
+
+function expandLocal(fc: FileCtx, at: string, raw: Obj, depth: number, seen: readonly string[]): Judged[] {
+  const bad = (check: RefereeCheck, m: string): Judged[] => {
+    fc.add(fc.file.path, check, `In ${at}: ${m}`);
+    return [{ step: { name: '' }, kind: 'unrecognised', harmlessId: false, secrets: new Set(), readsWorkspace: false }];
+  };
+  const uses = raw.uses as string;
+  for (const k of Object.keys(raw)) if (!['name', 'uses', 'id'].includes(k)) return bad('template', `the local action step has ${show(k)}; pipegen's local actions take no inputs, env or condition.`);
+  const rel = uses.slice(2).replace(/\/$/, '');
+  const parsed = PLAIN_REL_RE.test(rel) ? ['action.yml', 'action.yaml'].map((n) => fc.others.get(`${fc.file.repo}:${rel}/${n}`)).find((x) => x !== undefined) : undefined;
+  if (parsed === undefined) return bad('unknown-pin', `${show(uses)} is a local action that is not among the files pipegen is writing.`);
+  if (seen.includes(rel)) return bad('template', `${show(uses)} uses itself (a cycle of local actions).`);
+  if (depth + 1 > MAX_COMPOSITE_DEPTH) return bad('template', `${show(uses)} nests local actions more than ${MAX_COMPOSITE_DEPTH} levels deep.`);
+  const runs = parsed.js.runs;
+  if (!isObj(runs) || runs.using !== 'composite' || !Array.isArray(runs.steps)) return bad('template', `${show(uses)} is not a composite action with a list of steps.`);
+  return judgeList(fc, `${at} (in ${safeText(rel, 80)})`, runs.steps, depth + 1, [...seen, rel]);
 }
 
 function judgeStep(fc: FileCtx, where: string, raw: unknown): Judged {
   const bad = issueFor(fc);
   const at = (m: string): string => `In ${where}: ${m}`;
-  if (!isObj(raw)) { bad('template', at('the step is not a map.')); return { step: { name: '' }, harmlessId: false }; }
+  const none = (step: RenderedStep): Judged => ({ step, kind: 'unrecognised', harmlessId: false, secrets: new Set(), readsWorkspace: false });
+  if (!isObj(raw)) { bad('template', at('the step is not a map.')); return none({ name: '' }); }
   for (const k of Object.keys(raw)) if (!STEP_KEYS.has(k)) bad('template', at(`the key ${show(k)} is not one pipegen writes on a step.`));
   for (const k of ['id', 'name', 'if', 'uses', 'run', 'shell', 'working-directory']) if (raw[k] !== undefined && typeof raw[k] !== 'string') bad('template', at(`${k} is not text.`));
   for (const k of ['with', 'env']) if (raw[k] !== undefined && !isObj(raw[k])) bad('template', at(`${k} is not a map.`));
@@ -502,7 +714,7 @@ function judgeStep(fc: FileCtx, where: string, raw: unknown): Judged {
   }
   const isUses = typeof raw.uses === 'string';
   const isRun = typeof raw.run === 'string';
-  if (isUses === isRun) { bad('template', at('a step must have exactly one of uses and run.')); return { step, harmlessId: false }; }
+  if (isUses === isRun) { bad('template', at('a step must have exactly one of uses and run.')); return none(step); }
   const withs = isObj(raw.with) ? raw.with : {};
   const env = isObj(raw.env) ? raw.env : {};
   // caches: no cache action, no cache input beyond the reviewed locks at their locked value
@@ -511,18 +723,23 @@ function judgeStep(fc: FileCtx, where: string, raw: unknown): Judged {
   }
   if (isUses && /^actions\/cache(?:\/|@)/i.test(raw.uses as string)) bad('cache', at('actions/cache restores files a previous run left; pipegen uses no cache.'));
   let appRunning = false;
+  let kind: StepKind = 'unrecognised';
   let match: Expected | undefined;
   let harmlessId = true;
-  if (isUses) appRunning = judgeUses(fc, at, raw.uses as string, withs, env, raw);
-  else {
+  let reads = false;
+  if (isUses) {
+    ({ appRunning, kind } = judgeUses(fc, at, raw.uses as string, withs, env, raw));
+    if (raw.shell !== undefined) bad('template', at('an action step takes no shell.'));
+  } else {
     const r = matchRun(fc.ex, step);
     if (r === 'near') { bad('template', at(`the step ${show(raw.id)} differs from what pipegen renders for it (an input, its pinned config or its command was changed).`)); harmlessId = false; }
     else if (r === null) { bad('unreviewed', at(`the run step ${show(raw.name ?? raw.id ?? '')} is not a step pipegen renders for this pipeline (a reviewed tool or a project script), so it is not run.`)); harmlessId = false; }
     else {
       match = r;
       appRunning = r.appRunning;
-      // a blocking tool must run whenever its job does, and its failure must count
-      if (r.blocking && (raw['continue-on-error'] === true || (typeof raw.if === 'string' && !RUNS_ALWAYS.has(raw.if)))) bad('template', at('a step of a blocking check may not be skipped on success or have its failure ignored.'));
+      const id = r.step.id ?? '';
+      kind = r.source.startsWith('script:') || appRunning ? 'repo-code' : /^(?:checker-run|tool-run|tool-install|tool-pull)-/.test(id) ? 'tool' : /^scrub-/.test(id) ? 'scrub' : 'repo-code';
+      reads = kind === 'tool' && r.readsWorkspace;
     }
     // trivy keeps a cache between runs unless it runs with pipegen's pinned config (cache.backend: memory, ruling S3), whether
     // or not the step was recognised
@@ -535,8 +752,14 @@ function judgeStep(fc: FileCtx, where: string, raw: unknown): Judged {
     }
     if (/--cache-dir\b|TRIVY_CACHE/.test(raw.run as string)) bad('cache', at('the step points a tool at a cache folder.'));
   }
-  judgeSecrets(fc, at, withs, env, isUses, appRunning);
-  return { step, ...(match === undefined ? {} : { match }), harmlessId };
+  // ruling 4: a step that feeds the gate is never skipped on success and its failure always counts: no continue-on-error,
+  // and `if:` only success(), or always() on an upload (so a failed job still hands its result to the gate)
+  if (raw['continue-on-error'] !== undefined && raw['continue-on-error'] !== false) bad('template', at('continue-on-error would let a failed step pass; pipegen never sets it.'));
+  if (raw.if !== undefined && raw.if !== 'success()' && !(raw.if === 'always()' && (kind === 'upload-artifact' || kind === 'upload-sarif'))) {
+    bad('template', at(`if: ${safeText(String(raw.if), 20)} could skip this step while the job passes (only success(), or always() on an upload).`));
+  }
+  const secrets = judgeSecrets(fc, at, withs, env, kind, appRunning);
+  return { step, ...(match === undefined ? {} : { match }), kind, harmlessId, secrets, readsWorkspace: reads };
 }
 
 /** Which rendered run step this one is: equal to one in every field that runs (name aside), the slots judged by slots.ts. */
@@ -562,26 +785,34 @@ function matchRun(ex: Expectations, s: RenderedStep): Expected | 'near' | null {
   return s.id !== undefined && ex.runIds.has(s.id) ? 'near' : null;
 }
 
-/** A `uses:` step: its pin, and as a reviewed action its template. Returns whether it runs the app (a declared secret may reach it). */
-function judgeUses(fc: FileCtx, at: (m: string) => string, uses: string, withs: Obj, env: Obj, raw: Obj): boolean {
+/** A `uses:` step: its pin, and as a reviewed action its template. Returns its kind and whether it runs the app (a declared secret may reach it). */
+function judgeUses(fc: FileCtx, at: (m: string) => string, uses: string, withs: Obj, env: Obj, raw: Obj): { appRunning: boolean; kind: StepKind } {
   const bad = issueFor(fc);
+  const other = { appRunning: false, kind: 'unrecognised' as StepKind };
   if (uses.startsWith('docker://')) {
     const image = uses.slice('docker://'.length);
     if (!/@sha256:[0-9a-f]{64}$/.test(image)) bad('unpinned', at(`${show(uses)} runs an image by tag; whoever controls the tag controls what runs.`));
     else if (!fc.ex.images.has(image)) bad('unknown-pin', at(`${show(uses)} is not a reviewed image at its reviewed digest.`));
     else bad('template', at('pipegen runs a reviewed image with its own docker step, never as a docker:// action.'));
-    return false;
-  }
-  if (uses.startsWith('./')) {
-    const rel = uses.slice(2).replace(/\/$/, '');
-    const found = PLAIN_REL_RE.test(rel) && ['action.yml', 'action.yaml'].some((n) => fc.others.has(`${fc.file.repo}:${rel}/${n}`));
-    if (!found) bad('unknown-pin', at(`${show(uses)} is a local action that is not among the files pipegen is writing.`));
-    return false;
+    return other;
   }
   const k = usesKey(uses);
-  if (k === null || !COMMIT_SHA_RE.test(k.ref)) { bad('unpinned', at(`${show(uses)} is not pinned to a 40-character commit.`)); return false; }
-  const central = `${fc.draft.profile.owner.toLowerCase()}/pipelines/`;
-  if (k.path.startsWith(central)) return false;
+  if (k === null || !COMMIT_SHA_RE.test(k.ref)) { bad('unpinned', at(`${show(uses)} is not pinned to a 40-character commit.`)); return other; }
+  const central = centralOf(fc.draft);
+  if (central !== null && k.path.startsWith(central.prefix)) {
+    // ruling 2: the central repo only at the commit pipegen recorded, and with every other check (no plain env, no folder)
+    if (k.ref !== central.sha) bad('unknown-pin', at(`${show(uses)} is the central repo at a commit pipegen did not record.`));
+    for (const [name, v] of Object.entries(env)) {
+      const m = typeof v === 'string' ? SECRET_REF_RE.exec(v) : null;
+      if (m === null || m[1] !== name) bad('template', at(`a central action step's env may only map a secret under its own name (${show(name)}).`));
+    }
+    if (raw['working-directory'] !== undefined) bad('template', at('an action step takes no working-directory.'));
+    return { appRunning: false, kind: 'central' };
+  }
+  if (CENTRAL_LIKE_RE.test(k.path) && !fc.ex.actionPaths.has(k.path)) {
+    bad('unknown-pin', at(`${show(uses)} looks like a central pipelines repo, but pipegen recorded no central commit for this repository's owner.`));
+    return other;
+  }
   const t = fc.ex.actions.get(`${k.path}@${k.ref}`);
   if (t === undefined) {
     if (fc.ex.actionPaths.has(k.path)) bad('unknown-pin', at(`${show(uses)} is a reviewed action at another commit than its reviewed pin.`));
@@ -589,7 +820,7 @@ function judgeUses(fc: FileCtx, at: (m: string) => string, uses: string, withs: 
       bad('unknown-pin', at(`${show(uses)} is not a reviewed action (the whole path counts, sub-path included).`));
       bad('unreviewed', at(`${show(uses)} is not on the reviewed list, so pipegen never runs it.`));
     }
-    return false;
+    return other;
   }
   const refusal = containerRefusal(t, k.path);
   if (refusal !== null) bad('unpinned', at(`container action: ${refusal}.`));
@@ -599,7 +830,8 @@ function judgeUses(fc: FileCtx, at: (m: string) => string, uses: string, withs: 
     if (m === null || m[1] !== name) bad('template', at(`an action step's env may only map a secret under its own name (${show(name)}).`));
   }
   if (raw['working-directory'] !== undefined) bad('template', at('an action step takes no working-directory.'));
-  return t.categories.some((c) => APP_RUNNING_CATEGORIES.has(c));
+  const appRunning = t.categories.some((c) => APP_RUNNING_CATEGORIES.has(c));
+  return { appRunning, kind: own(ENTRY_KIND, t.id) ?? (appRunning ? 'repo-code' : 'tool') };
 }
 
 /** The template rule (S15): every fixed input at its value, every choice present and inside its list, nothing else but a renderer-filled input that passes its checker and condition. */
@@ -622,26 +854,35 @@ function judgeTemplate(fc: FileCtx, at: (m: string) => string, t: ReviewedTool, 
   }
 }
 
-/** S9: every secret a step names is in the allowed set; a declared app secret reaches only a step that runs the app; pipegen's own only an action that does not. */
-function judgeSecrets(fc: FileCtx, at: (m: string) => string, withs: Obj, env: Obj, isUses: boolean, appRunning: boolean): void {
+/**
+ * S9: every secret a step names is in the allowed set; a declared app secret reaches only a step that runs the app;
+ * pipegen's own only a reviewed action that does not run the repo's code (never a run step, a central or unknown action).
+ * Returns the names, for the job's privilege.
+ */
+function judgeSecrets(fc: FileCtx, at: (m: string) => string, withs: Obj, env: Obj, kind: StepKind, appRunning: boolean): Set<string> {
   const bad = issueFor(fc);
   const names = new Set<string>();
   for (const v of [...Object.values(withs), ...Object.values(env)]) {
     if (typeof v !== 'string') continue;
     for (const m of v.matchAll(SECRET_USE_RE)) names.add(m[1] as string);
   }
+  const ownOk = !appRunning && !['tool', 'scrub', 'repo-code', 'unrecognised', 'central'].includes(kind);
   for (const n of names) {
     if (!fc.ex.allowed.has(n)) { bad('permissions', at(`the secret ${show(n)} is neither declared by a step of this pipeline nor one of pipegen's own.`)); continue; }
     if (fc.ex.declared.has(n) && !PIPEGEN_SECRETS.includes(n)) {
       if (!appRunning) bad('injection', at(`the declared secret ${show(n)} reaches a step that does not run the app (a scanner, linter, upload or setup step never gets one).`));
-    } else if (!isUses || appRunning) bad('injection', at(`pipegen's own secret ${show(n)} reaches a step that runs code from the repository.`));
+    } else if (!ownOk) bad('injection', at(`pipegen's own secret ${show(n)} reaches a step that runs code pipegen did not review as harmless.`));
   }
+  return names;
 }
 
 // ---------- an edited user workflow (the marker, types.ts PipegenInserted) ----------
 
 /** Needs as a list, whatever form they were written in. */
 const needsList = (v: unknown): unknown[] => (v === undefined ? [] : Array.isArray(v) ? v : [v]);
+
+/** Whether any job of the workflow checks out the repository (workflow_run then runs it with the target's power). */
+const hasCheckout = (jobs: Obj): boolean => Object.values(jobs).some((j) => isObj(j) && Array.isArray(j.steps) && j.steps.some((s) => isObj(s) && typeof s.uses === 'string' && /^actions\/checkout@/i.test(s.uses)));
 
 function judgeEdited(fc: FileCtx, parsed: Parsed, mark: PipegenInserted): void {
   const bad = issueFor(fc);
@@ -656,6 +897,7 @@ function judgeEdited(fc: FileCtx, parsed: Parsed, mark: PipegenInserted): void {
   const jobs = parsed.js.jobs;
   const origJobs = orig.parsed.js.jobs;
   if (!isObj(jobs) || !isObj(origJobs)) { bad('template', 'The workflow has no jobs map.'); return; }
+  judgeUserTop(fc, parsed.js, jobs, mark);
   // pipegen's own parts: present, new, and free of anchors and aliases
   for (const id of mark.jobs) {
     if (!Object.hasOwn(jobs, id)) bad('template', `The job ${show(id)} pipegen inserted is not in the file.`);
@@ -675,6 +917,8 @@ function judgeEdited(fc: FileCtx, parsed: Parsed, mark: PipegenInserted): void {
     const p = jobPair(parsed.doc, n.job);
     const needsNode = isMap(p?.value) ? p.value.get('needs', true) : undefined;
     if (hasAnchorOrAlias(needsNode)) bad('injection', `The needs of ${show(n.job)} use a YAML anchor or alias.`);
+    // a gated job that runs although a job it needs failed is not gated (ruling 5)
+    if (typeof j.if === 'string' && STATUS_FN_RE.test(j.if)) bad('template', `The job ${show(n.job)} has an if: with a status function (always(), failure(), cancelled()), so it runs even when pipegen's check fails; it would not really be gated.`);
     const list = needsList(j.needs);
     for (const a of added) {
       if (typeof a !== 'string' || !mark.jobs.includes(a)) bad('template', `The need ${show(a)} added to ${show(n.job)} is not a job pipegen inserted.`);
@@ -688,6 +932,36 @@ function judgeEdited(fc: FileCtx, parsed: Parsed, mark: PipegenInserted): void {
   }
   if (!isDeepStrictEqual(rest, orig.parsed.js)) bad('template', 'The edit changes the user\'s workflow beyond the job and needs pipegen inserted.');
   judgeJobs(fc, jobs, mark.jobs);
+}
+
+/**
+ * Ruling 5: the parts of the user's own file that apply to pipegen's jobs too. Any of these refuses the insert, so Plan G
+ * writes a file of its own instead: a trigger that runs with the target's power on outside code (pull_request_target, or
+ * workflow_run in a file that checks code out), a workflow env with a dangerous name or an expression, `defaults` other than
+ * `run.shell` bash or sh, and top-level permissions beyond what the inserted jobs may have.
+ */
+function judgeUserTop(fc: FileCtx, js: Obj, jobs: Obj, mark: PipegenInserted): void {
+  const bad = issueFor(fc);
+  const triggers = triggersOf(js.on) ?? [];
+  if (triggers.includes('pull_request_target')) bad('injection', 'The user\'s workflow runs on pull_request_target (with secrets and a write token for outside pull requests); pipegen will not insert its job there. Plan G writes a separate file.');
+  if (triggers.includes('workflow_run') && hasCheckout(jobs)) bad('injection', 'The user\'s workflow runs on workflow_run and checks code out; pipegen will not insert its job there. Plan G writes a separate file.');
+  judgeEnv(fc, js.env, 'the user\'s workflow');
+  const d = js.defaults;
+  if (d !== undefined) {
+    const run = isObj(d) ? d.run : undefined;
+    const ok = isObj(d) && Object.keys(d).every((k) => k === 'run') && isObj(run) && Object.keys(run).every((k) => k === 'shell') && (run.shell === undefined || run.shell === 'bash' || run.shell === 'sh');
+    if (!ok) bad('injection', 'The user\'s workflow has defaults that would change pipegen\'s steps (only defaults.run.shell bash or sh is accepted).');
+  }
+  const p = js.permissions;
+  if (p !== undefined) {
+    const ceiling: Record<string, number> = {};
+    for (const id of mark.jobs) for (const [k, v] of Object.entries(ceilingOf(id))) ceiling[k] = Math.max(ceiling[k] ?? 0, v);
+    if (!isObj(p)) bad('permissions', `The user's workflow sets permissions ${show(p)} for every job, more than pipegen's inserted jobs may have.`);
+    else for (const [k, v] of Object.entries(p)) {
+      const level = typeof v === 'string' ? own(LEVEL, v) : undefined;
+      if (level === undefined || level > (own(ceiling, k) ?? 0)) bad('permissions', `The user's workflow sets ${safeText(k, 40)}: ${safeText(String(v), 10)} at the top, more than pipegen's inserted jobs may have.`);
+    }
+  }
 }
 
 function hasAnchorOrAlias(node: unknown): boolean {
@@ -707,36 +981,45 @@ function judgeAction(fc: FileCtx, js: Obj): void {
   for (const k of Object.keys(js)) if (!ACTION_KEYS.has(k)) bad('template', `The action key ${show(k)} is not one pipegen writes.`);
   const runs = js.runs;
   if (!isObj(runs) || runs.using !== 'composite' || !Array.isArray(runs.steps)) { bad('template', 'A local action pipegen writes is a composite action with a list of steps.'); return; }
-  judgeSteps(fc, 'the action', runs.steps);
+  judgeJobSteps(fc, 'the action', runs.steps, false);
 }
 
 // ---------- the blocking rule (B7) ----------
 
-function blockingRule(draft: PipelineDraft, ex: Expectations, notes: string[]): string[] {
+/**
+ * Every blocking need (outside pipegen's own jobs and the pre-commit layer) has a reviewed tool step or a project script,
+ * else `not-gate-readable` (ruling 7). A findings check (B7) whose tool writes no SARIF the gate reads is demoted with a note.
+ */
+function blockingRule(draft: PipelineDraft, ex: Expectations, add: Add, notes: string[]): string[] {
   const demoted: string[] = [];
-  for (const need of draft.needs) {
-    if (!need.blocking) continue;
+  draft.needs.forEach((need, i) => {
+    if (!need.blocking) return;
     const category = Object.hasOwn(NEED_ID_CATEGORY, need.id) ? (NEED_ID_CATEGORY as Readonly<Record<string, string>>)[need.id] : undefined;
-    // the category comes from the need id, never from the tool
-    if (category !== undefined && !FINDINGS_CATEGORIES.has(category)) continue;
     const formats = draft.steps
       .filter((s) => isObj(s) && s.needId === need.id && s.service === need.service && isReviewed(s.tool))
       .flatMap((s) => {
         const t = ex.byId.get(s.tool.id);
         return t === undefined || !sameCandidate(s.tool, t.candidate) ? [] : [t.step.output.format];
       });
+    const script = draft.profile.services.some((s) => projectScriptFor(need, s) !== null);
+    if (formats.length === 0 && !script && need.layer !== 'pre-commit' && !(category !== undefined && PIPEGEN_JOB_CATEGORIES.has(category))) {
+      add(`draft.needs[${i}]`, 'not-gate-readable', `The blocking check ${show(need.id)}${need.service === undefined ? '' : ` for ${show(need.service)}`} has no reviewed tool step and no project script, so the gate would have nothing to read.`);
+      return;
+    }
+    // the category comes from the need id, never from the tool
+    if (category !== undefined && !FINDINGS_CATEGORIES.has(category)) return;
     const readable = (f: string): boolean => f === 'sarif' || (category === 'dast' && f === 'zap-json');
-    if (category !== undefined && formats.every(readable)) continue;
+    if (category !== undefined && formats.every(readable)) return;
     let key = need.id;
     if (need.service !== undefined) {
       try { key = `${need.id}--${slug(need.service)}`; } catch (e) { if (!(e instanceof ArtifactNameError)) throw e; }
     }
-    if (demoted.includes(key)) continue;
+    if (demoted.includes(key)) return;
     demoted.push(key);
     notes.push(category === undefined
       ? `The check ${show(need.id)} is not one pipegen knows how the gate reads, so it runs as a warning only (non-blocking).`
       : `The check ${show(need.id)}${need.service === undefined ? '' : ` for ${show(need.service)}`} is judged by its findings, but its tool writes no SARIF the gate can read, so it runs as a warning only (non-blocking).`);
-  }
+  });
   return demoted;
 }
 
@@ -752,7 +1035,7 @@ const fileKind = (f: CreatedFile): 'workflow' | 'action' | null => (WORKFLOW_PAT
 export async function referee(files: CreatedFile[], draft: PipelineDraft, platform: PlatformActions, reviewed: ReviewedTool[], linters: Linters, ghToken: string | null, deps: RefereeDeps = {}): Promise<RefereeReport> {
   const issues: RefereeIssue[] = [];
   const notes: string[] = [];
-  const add: Add = (file, check, message, line) => { issues.push({ file: safeText(file, 200), check, message, ...(line === undefined ? {} : { line }) }); };
+  const add: Add = (file, check, message, line, repo) => { issues.push({ file: safeText(file, 200), check, message, ...(line === undefined ? {} : { line }), ...(repo === undefined ? {} : { repo }) }); };
 
   // S18: no secret value in any file (rule names only, never the value)
   for (const f of files) {
@@ -776,6 +1059,12 @@ export async function referee(files: CreatedFile[], draft: PipelineDraft, platfo
       continue;
     }
     parsed.set(`${f.repo}:${f.path}`, r.parsed);
+    // S18 on the parsed values too: an escape (`"\x41…"`) or a folded scalar can hide a value from the raw-text scan
+    const raw = findSecretLike(f.content);
+    // each value on its own, with a `"` read as a line break: a JSON document held in a value (an npm closure lock) is
+    // scanned string by string, as the raw scan sees it, so one URL and the next package name never make a "connection string"
+    const hits = uniq(r.parsed.scalars.flatMap((v) => findSecretLike(v.replace(/"/g, '\n')))).filter((h) => !raw.includes(h));
+    if (hits.length > 0) add(f.path, 'secret-value', `A value in the file, once parsed, looks like a secret (${hits.join(', ')}); pipegen never writes one into a file.`);
   }
   for (const f of files) {
     const p = parsed.get(`${f.repo}:${f.path}`);
@@ -789,7 +1078,7 @@ export async function referee(files: CreatedFile[], draft: PipelineDraft, platfo
     }
   }
 
-  const demoted = blockingRule(draft, ex, notes);
+  const demoted = blockingRule(draft, ex, add, notes);
 
   // the workflow linters (7b): an issue on pipegen's lines, a note on a user's own
   if (lintable.length > 0) {
@@ -803,10 +1092,12 @@ export async function referee(files: CreatedFile[], draft: PipelineDraft, platfo
         found = [{ file: lintable[0]?.path ?? '', check: 'actionlint', message: `The workflow linters could not run (${safeText(e instanceof Error ? e.message : String(e), 160)}).` }];
       }
       for (const i of found) {
-        const f = lintable.find((x) => x.path === i.file);
+        // matched by repo and path (ruling 7): a finding that does not name exactly one file is judged as pipegen's own
+        const hit = lintable.filter((x) => x.path === i.file && (i.repo === undefined || x.repo === i.repo));
+        const f = hit.length === 1 ? hit[0] : undefined;
         const lines = f === undefined ? null : pipegenLines(f);
         if (lines !== null && i.line !== undefined && !lines.has(i.line)) notes.push(`${safeText(i.file, 200)}:${i.line}: ${safeText(i.message, 300)} (on the user's own lines, not pipegen's)`);
-        else add(i.file, i.check, i.message, i.line);
+        else add(i.file, i.check, i.message, i.line, i.repo);
       }
     }
   }

@@ -436,8 +436,13 @@ function mergePins(a: string | undefined, b: string | undefined): string {
   return `[${[...out.values()].join(',')}]`;
 }
 
-/** The platform actions that run no repo code and no step script of ours: pinned by SHA (the version is a comment). */
-const TRUSTED_ACTION_RE = /^(?:actions\/(?:checkout|setup-node|setup-python|upload-artifact)|github\/codeql-action\/upload-sarif)@[0-9a-f]{40}$/;
+/**
+ * The platform actions that run no repo code and no step script of ours: pinned by SHA (the version is a comment).
+ * download-artifact is on the list (7a fix round 1, ruling 1): it runs no code, it only writes data another job uploaded;
+ * whether that data can be trusted is Plan C's question (the scrub and sha256 chain), not the order rule's. bullfrog (the
+ * egress block, reviewed locks: no sudo, allowed domains only) is the harden step a job starts with, before its checkout.
+ */
+const TRUSTED_ACTION_RE = /^(?:actions\/(?:checkout|setup-node|setup-python|upload-artifact|download-artifact)|github\/codeql-action\/upload-sarif|bullfrogsec\/bullfrog)@[0-9a-f]{40}$/;
 /** The `uses` path each setup id belongs to (review-6c-r1 minor 3): `pipegen-checkout` counts only on actions/checkout, and so on. */
 const SETUP_ID_ACTION: readonly [RegExp, string][] = [
   [/^pipegen-checkout$/, 'actions/checkout'], [/^pipegen-setup-node-\d{1,3}$/, 'actions/setup-node'], [/^pipegen-setup-python$/, 'actions/setup-python'],
