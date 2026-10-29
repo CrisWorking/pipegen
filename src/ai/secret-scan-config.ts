@@ -72,7 +72,7 @@ export function secretScanArgv(name: SecretScannerName, dir: string, config: str
  * (extensions, lockfiles, go.mod, …) and never match the neutral names pipegen writes (f000001.txt, paths.txt). The real
  * guarantee is the per-file canary in redact.ts; this check only gives a clear error for the known cause.
  */
-const DEFAULT_SKIPPED_PATHS: readonly RegExp[] = [
+export const DEFAULT_SKIPPED_PATHS: readonly RegExp[] = Object.freeze([
   /gitleaks\.toml/,
   /(?:^|\/)vendor\/(?:github\.com|golang\.org\/x|google\.golang\.org|gopkg\.in|istio\.io|k8s\.io|sigs\.k8s\.io)(?:\/.*)?$/,
   /(?:^|\/)node_modules(?:\/.*)?$/,
@@ -83,7 +83,7 @@ const DEFAULT_SKIPPED_PATHS: readonly RegExp[] = [
   /(?:^|\/)vendor\/(?:bundle|ruby)(?:\/.*?)?$/,
   /verification-metadata\.xml/,
   /Database.refactorlog/,
-];
+]);
 
 /** True when the scanners' default path allowlist would skip the file at absolute `path` (\ read as /). */
 export function skippedByDefaultPaths(path: string): boolean {

@@ -6,7 +6,7 @@ import { build } from 'tsup';
 import { tsupOptions } from '../tsup.config.js';
 import { afterEach, describe, expect, it } from 'vitest';
 import {
-  bundleCode, bundleText, EXCLUDED_PATTERNS, SecretScanError, SecretScanRequiredError, secretScanArgv, secretScanConfigPath,
+  bundleCode, bundleText, EXCLUDED_PATTERNS, SCAN_CHUNK_SAFE_BYTES, SecretScanError, SecretScanRequiredError, secretScanArgv, secretScanConfigPath,
   isBinary, redact, scrubKnownValues, type CodeBundle,
 } from '../src/ai/redact.js';
 import { skippedByDefaultPaths } from '../src/ai/secret-scan-config.js';
@@ -737,24 +737,95 @@ describe('bundle: scan canaries (ruling P34)', () => {
     }
   });
 
-  it('P35: canary-shaped text in the repo (content or a file name) is neutralised before the scan, so only pipegen\'s own line can match the rule', async () => {
+  it('P37: repo text is never rewritten around the canary; a whole canary-shaped line (content or a file name) leaves its file out', async () => {
     const dir = canaryRepo();
     const hex = '0123456789abcdef'.repeat(2);
-    writeIn(dir, 'src/d.ts', `pipegen-canary-${hex}\n// PIPEGEN-CANARY-${hex}\nexport const d = 4;\n`);
-    writeIn(dir, `pipegen-canary-${hex}`, 'x\n'); // a file named like a canary (a whole line of paths.txt)
+    writeIn(dir, 'src/d.ts', `pipegen-canary-${hex}\nexport const d = 4;\n`); // a whole line the canary rule matches
+    writeIn(dir, 'src/g.ts', `export const g = "pipegen-canary-SG.x";\n// PIPEGEN-CANARY-${hex}\n`); // not a whole canary line
+    writeIn(dir, `pipegen-canary-${hex}`, 'x\n'); // a file named like a canary: a whole line of paths.txt
     for (const at of [betterleaksAt, gitleaksAt]) {
-      const stub = makeStub(CLEAN);
+      const stub = makeStub(CLEAN); // reports every whole canary-shaped line, as the real rule does
       const b = await bundleCode(dir, scanWith(at(stub.bin)));
       const rec = stub.record();
-      // what was scanned holds one canary-shaped line per file: pipegen's own, last
-      for (const [name, text] of Object.entries(rec.files)) {
-        expect(text.match(/pipegen-canary-/gi), `${at.name} ${name}`).toHaveLength(1);
-        expect(text, `${at.name} ${name}`).toMatch(/\n\npipegen-canary-[0-9a-f]{32}\n$/);
+      // scanned as it is (P37: no neutralising, so no rule loses its word boundary)
+      expect(rec.files[nameOf(rec.files, 'const g')], at.name).toContain(`"pipegen-canary-SG.x";\n// PIPEGEN-CANARY-${hex}\n`);
+      expect(rec.files['paths.txt'], at.name).toContain(`\npipegen-canary-${hex}\n`);
+      // the foreign marker in src/d.ts leaves it out; the canary-named file is left out as a flagged name
+      expect(paths(b), at.name).toEqual(['src/a.ts', 'src/b.ts', 'src/c.ts', 'src/g.ts']);
+      expect(b.notes.join('\n'), at.name).toContain(`Left out because ${at('/x').name} reported a check marker in them that pipegen did not write there: src/d.ts.`);
+      expect(b.notes.join('\n'), at.name).toContain(`Left out 1 file whose path ${at('/x').name} flagged as secret-like (names not shown).`);
+      expect(b.files.find((f) => f.path === 'src/g.ts')?.content, at.name).toBe(`export const g = "pipegen-canary-SG.x";\n// PIPEGEN-CANARY-${hex}\n`);
+    }
+  });
+
+  it('minor: the own canary reported on another line than the last, or twice, leaves the file out with its own note', async () => {
+    const dir = canaryRepo();
+    for (const at of [betterleaksAt, gitleaksAt]) {
+      const wrongLine = `canary = 'none'; const c = canaryFindings();
+        const fa = c.find((x) => files[path.basename(x.File)].includes('const a')); fa.StartLine -= 1; fa.EndLine -= 1;
+        writeReport(JSON.stringify(c)); process.exit(1);`;
+      const b = await bundleCode(dir, scanWith(at(makeStub(wrongLine).bin)));
+      expect(paths(b), at.name).toEqual(['src/b.ts', 'src/c.ts']);
+      expect(b.notes.join('\n'), at.name).toContain(`Left out because ${at('/x').name} reported their check marker more than once or on an unexpected line: src/a.ts.`);
+      expect(b.notes.join('\n'), at.name).not.toContain('did not confirm');
+      const twice = `canary = 'none'; const c = canaryFindings();
+        writeReport(JSON.stringify([...c, c.find((x) => files[path.basename(x.File)].includes('const b'))])); process.exit(1);`;
+      const b2 = await bundleCode(dir, scanWith(at(makeStub(twice).bin)));
+      expect(paths(b2), at.name).toEqual(['src/a.ts', 'src/c.ts']);
+      expect(b2.notes.join('\n'), at.name).toContain(`more than once or on an unexpected line: src/b.ts.`);
+      // paths.txt's canary on the wrong line: the file names may not have been read as one text → SecretScanError
+      const pathsLine = `canary = 'none'; const c = canaryFindings();
+        const fp = c.find((x) => x.File.endsWith('paths.txt')); fp.StartLine += 1; fp.EndLine += 1;
+        writeReport(JSON.stringify(c)); process.exit(1);`;
+      await expect(bundleCode(dir, scanWith(at(makeStub(pathsLine).bin))), at.name).rejects.toThrow(/file list/);
+    }
+  });
+
+  it('P36: a file whose scanned copy is over SCAN_CHUNK_SAFE_BYTES is left out with its own note; one at the limit is scanned', async () => {
+    // as written: "\n" + content + "\n" + "pipegen-canary-<32 hex>" + "\n" (content ends with a newline)
+    const overhead = 1 + 1 + 'pipegen-canary-'.length + 32 + 1;
+    const line = (n: number) => `// ${'x'.repeat(n - 4)}\n`; // n bytes
+    const body = (total: number) => { let t = ''; while (total - t.length > 80) t += line(80); return t + line(total - t.length); };
+    const dir = makeTempDir();
+    writeIn(dir, 'src/at-limit.js', body(SCAN_CHUNK_SAFE_BYTES - overhead));
+    writeIn(dir, 'src/over-limit.js', body(SCAN_CHUNK_SAFE_BYTES - overhead + 1));
+    writeIn(dir, 'src/small.js', 'export const s = 1;\n');
+    for (const at of [betterleaksAt, gitleaksAt]) {
+      const stub = makeStub(CLEAN);
+      const b = await bundleCode(dir, scanWith(at(stub.bin), { maxBytes: 1_000_000 }));
+      const rec = stub.record();
+      expect(Math.max(...Object.values(rec.files).map((t) => Buffer.byteLength(t))), at.name).toBe(SCAN_CHUNK_SAFE_BYTES);
+      expect(paths(b), at.name).toEqual(['src/at-limit.js', 'src/small.js']);
+      expect(b.notes.join('\n'), at.name).toContain('Left out because they are too large to secret-scan safely (over 90,000 bytes as scanned; the scanners read bigger files in pieces and can miss a secret cut between two): src/over-limit.js.');
+      expect(b.notes.join('\n'), at.name).not.toContain('did not confirm');
+    }
+  });
+
+  it('P36: a long file list is scanned in pieces under the limit, each with its own canary, all required; findings map to the right path', async () => {
+    const dir = makeTempDir();
+    const n = 700; // ~700 × 200 bytes of paths: two pieces
+    for (let i = 0; i < n; i++) writeIn(dir, `src/${String(i).padStart(4, '0')}-${'d'.repeat(180)}.ts`, `export const v${i} = ${i};\n`);
+    const flaggedName = 'flagged' + '-name-' + 'value-5150';
+    writeIn(dir, `src/zz-${flaggedName}.ts`, 'export const z = 0;\n'); // sorts last: in the second piece
+    for (const at of [betterleaksAt, gitleaksAt]) {
+      const stub = makeStub(`const f = findingsFor(${JSON.stringify(flaggedName)}).filter((x) => /paths/.test(x.File)); writeReport(JSON.stringify(f)); process.exit(1);`);
+      const b = await bundleCode(dir, scanWith(at(stub.bin), { maxBytes: 10_000_000 }));
+      const rec = stub.record();
+      const pieces = Object.keys(rec.files).filter((f) => /^paths\d*\.txt$/.test(f)).sort();
+      expect(pieces, at.name).toEqual(['paths.txt', 'paths2.txt']);
+      for (const p of pieces) {
+        expect(Buffer.byteLength(rec.files[p]), `${at.name} ${p}`).toBeLessThanOrEqual(SCAN_CHUNK_SAFE_BYTES);
+        expect(rec.files[p], `${at.name} ${p}`).toMatch(/\n\npipegen-canary-[0-9a-f]{32}\n$/);
       }
-      expect(rec.files['paths.txt'], at.name).toContain(`pipegen-canary_${hex}`);
-      // the repo's text is sent neutralised, and every file is kept (no foreign marker was reported)
-      expect(b.files.find((f) => f.path === 'src/d.ts')?.content, at.name).toBe(`pipegen-canary_${hex}\n// PIPEGEN-CANARY_${hex}\nexport const d = 4;\n`);
-      expect(paths(b), at.name).toEqual([`pipegen-canary-${hex}`, 'src/a.ts', 'src/b.ts', 'src/c.ts', 'src/d.ts']);
+      // every path is in exactly one piece, in order
+      const listed = pieces.flatMap((p) => rec.files[p].replace(/\n\npipegen-canary-[0-9a-f]{32}\n$/, '').split('\n').slice(1));
+      expect(listed, at.name).toEqual(b.files.map((f) => f.path).concat(`src/zz-${flaggedName}.ts`).sort());
+      // the finding on a line of paths2.txt left out that one file only
+      expect(b.files, at.name).toHaveLength(n);
+      expect(bundleText(b), at.name).not.toContain(flaggedName);
+      // the second piece's canary missing → SecretScanError
+      const noSecond = `canary = 'none'; writeReport(JSON.stringify(canaryFindings().filter((x) => !x.File.endsWith('paths2.txt')))); process.exit(1);`;
+      await expect(bundleCode(dir, scanWith(at(makeStub(noSecond).bin), { maxBytes: 10_000_000 })), at.name).rejects.toThrow(/file list/);
     }
   });
 
