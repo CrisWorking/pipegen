@@ -17,6 +17,8 @@ import { emptyRepoFiles } from '../src/read/quality.js';
 import type { Capabilities, CreatedFile, Need, PipelineDraft, ReviewedTool, StepSpec } from '../src/types.js';
 import { entry, gateEntry, GATE_SHA, platform, profile, reviewedList, service, specFor, scansFor } from './helpers/render.js';
 import { exec, fakeTool, sandbox, stepEnv, type Sandbox } from './helpers/step-harness.js';
+import { parseSarifText, SYNTHESIZED_NUCLEI } from '../gate/src/sarif.js';
+import { NUCLEI_EMPTY_SARIF } from '../src/engine/render-cli.js';
 
 // ---------- builders ----------
 
@@ -508,6 +510,53 @@ describe('render-cli: a findings exit code is not a failed step (ruling B2), rea
         expect(existsSync(rawFile(one.sb, e)), `${e.id}: exit 1 keeps nothing`).toBe(false);
       }
     }
+  });
+
+  it('render-cli (C1a fix round 1): nuclei exits 0 and writes NO file when nothing matched; then, and only then, the step writes the marked empty result the gate reads as "nothing reported"', () => {
+    const e = renderableFindings().find((x) => x.id === 'nuclei') as ReturnType<typeof renderableFindings>[number];
+    const none = runWith(e, 0, false);
+    expect(none.status).toBe(0);
+    const marked = readFileSync(rawFile(none.sb, e), 'utf8');
+    expect(marked.trim()).toBe(NUCLEI_EMPTY_SARIF);
+    expect(JSON.parse(marked)).toEqual({ version: '2.1.0', runs: [{ tool: { driver: { name: SYNTHESIZED_NUCLEI.driver } }, results: [], properties: { pipegenSynthesized: SYNTHESIZED_NUCLEI.mark } }] });
+    expect(existsSync(join(none.sb.ws, e.file)), 'the workspace file is moved, not copied').toBe(false);
+    expect(existsSync(join(none.sb.rt, 'pipegen-out'))).toBe(false);
+    // the gate's parser accepts exactly that file for nuclei only
+    expect(parseSarifText(marked, 'nuclei')).toEqual({ findings: [], notes: ['nothing reported (synthesized empty result)'] });
+    expect(parseSarifText(marked, 'semgrep').toolError).toBeDefined();
+  });
+
+  it('render-cli (C1a fix round 1): nuclei\'s own file is never overwritten; any other exit with no file still fails and writes nothing; no other tool gets a synthesized file', () => {
+    const entries = renderableFindings();
+    const nuclei = entries.find((x) => x.id === 'nuclei') as ReturnType<typeof renderableFindings>[number];
+    const own = runWith(nuclei, 0);
+    expect(own.status).toBe(0);
+    expect(readFileSync(rawFile(own.sb, nuclei), 'utf8').trim()).toBe('{"runs":[]}');
+    for (const code of [1, 3, 99, 137]) {
+      const r = runWith(nuclei, code, false);
+      expect(r.status, `nuclei exit ${code}, no file`).toBe(code);
+      expect(existsSync(join(r.sb.rt, 'pipegen-raw')), `nuclei exit ${code}: nothing written`).toBe(false);
+    }
+    for (const e of entries.filter((x) => x.id !== 'nuclei')) {
+      const r = runWith(e, 0, false);
+      expect(r.status, `${e.id}: exit 0 and no file is still a failed scan`).not.toBe(0);
+      expect(existsSync(rawFile(r.sb, e)), `${e.id}: no synthesized result`).toBe(false);
+    }
+  });
+
+  it('render-cli (C1a fix round 1, pinned): osv-scanner exit 127 (one unparsable lockfile) leaves an EMPTY sarif on disk; the result is deleted and the step fails with 127', () => {
+    const e = renderableFindings().find((x) => x.id === 'osv-scanner') as ReturnType<typeof renderableFindings>[number];
+    const sb = sandbox();
+    const empty = '{"version":"2.1.0","runs":[{"tool":{"driver":{"name":"osv-scanner"}},"invocations":[],"results":[]}]}';
+    fakeTool(sb, e.art, e.exe, `printf '%s' '${empty}' > ./${e.file}\nexit 127`);
+    expect(exec(e.step, sb, stepEnv(e.step, sb)).status).toBe(127);
+    expect(existsSync(rawFile(sb, e))).toBe(false);
+    expect(existsSync(join(sb.ws, e.file))).toBe(false);
+    expect(existsSync(join(sb.rt, 'pipegen-raw'))).toBe(false);
+    // and exit 128 (no package source, no file) fails too
+    const sb2 = sandbox();
+    fakeTool(sb2, e.art, e.exe, 'exit 128');
+    expect(exec(e.step, sb2, stepEnv(e.step, sb2)).status).toBe(128);
   });
 
   it('render-cli: a findings exit with a result that is a link, a folder or missing fails the step and keeps nothing', () => {

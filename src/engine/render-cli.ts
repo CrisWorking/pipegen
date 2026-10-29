@@ -613,6 +613,9 @@ export function renderCliTool({ spec, tool, service, ctx, hooks, options }: CliA
     '  echo "pipegen: the tool exited with $rc, so its result is not used" >&2',
     '  exit "$rc" ;;',
     'esac',
+    // nuclei writes no SARIF file when nothing matched (exit 0, measured, C1a review). After a clean exit, and only when there is no file at all
+    // (never over one the tool wrote), pipegen writes a marked empty result: the gate reads it as "nothing reported", never as a nuclei run.
+    ...(tool.id === 'nuclei' ? [`if [ "$rc" = 0 ] && [ ! -e "$out" ] && [ ! -L "$out" ]; then printf '%s\\n' '${NUCLEI_EMPTY_SARIF}' > "$out"; fi`] : []),
     'if [ -f "$out" ] && [ ! -L "$out" ]; then',
     '  mkdir -p "$RUNNER_TEMP/pipegen-raw"',
     `  mkdir "${outDir}"`,
@@ -640,6 +643,9 @@ export function renderCliTool({ spec, tool, service, ctx, hooks, options }: CliA
   steps.push(runStep(`pipegen: run ${exe}`, run, env, runId));
   return { steps, output: out === null ? null : { path: `\${{ runner.temp }}/pipegen-raw/${artifact}/${out}`, format: tool.step.output.format }, ...(built.fullHistory ? { fullHistory: true as const } : {}) };
 }
+
+/** The marked empty result of a nuclei run that wrote no file (gate/src/sarif.ts SYNTHESIZED_NUCLEI is the same text; a test compares). */
+export const NUCLEI_EMPTY_SARIF = '{"version":"2.1.0","runs":[{"tool":{"driver":{"name":"pipegen-empty-nuclei"}},"results":[],"properties":{"pipegenSynthesized":"nuclei-no-file"}}]}';
 
 // ---------- github-release (ruling S27) ----------
 
