@@ -1149,6 +1149,17 @@ describe('mapCoverage (P55 batch B: docker compose and Dockerfile RUN)', () => {
     expect(await t('docker compose run --rm web bash scripts/t.sh')).toMatch(/^unknown/);
   });
 
+  it('compose run places the command in the image\'s last WORKDIR (the fastapi shape: context ".", WORKDIR /app/backend, COPY ./backend/scripts)', async () => {
+    const compose = 'services:\n  backend:\n    build:\n      context: .\n      dockerfile: backend/Dockerfile\n';
+    const dockerfile = 'FROM python:3.14\nWORKDIR /app/\nCOPY ./backend/scripts /app/backend/scripts\nCOPY ./backend/pyproject.toml /app/backend/\nWORKDIR /app/backend/\n';
+    const files = { 'compose.yml': compose, 'backend/Dockerfile': dockerfile, 'backend/pyproject.toml': '[project]\nname = "a"\n', 'backend/scripts/t.sh': 'pytest\n', 'scripts/other.sh': 'pytest\n' };
+    const t = (cmd: string, f: Record<string, string> = files) => statusOf(f, run(cmd));
+    expect(await t('docker compose run --rm backend bash scripts/t.sh')).toBe('covered your own `scripts/t.sh`');
+    expect(await t('docker compose run --rm backend pytest')).toBe('covered your own `pytest`');
+    // the script that is at the repo root is not the one in the image's working folder
+    expect(await t('docker compose run --rm backend bash scripts/other.sh')).toMatch(/^unknown/);
+  });
+
   it('a RUN in a Dockerfile `docker build` builds counts under the same rules (stages, folders, conditions)', async () => {
     const files = (dockerfile: string, extra: Record<string, string> = {}) => ({ 'backend/Dockerfile': dockerfile, 'backend/app.py': 'x = 1\n', ...extra });
     const build = (flags = '-f backend/Dockerfile .') => run(`docker build ${flags}`);

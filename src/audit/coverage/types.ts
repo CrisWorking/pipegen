@@ -1,7 +1,7 @@
 // Coverage mapper (see ../coverage.ts for the rules): the types the coverage modules share. Types only: import it with
 // `import type`.
 import type { Capabilities, Layer, RepoProfile } from '../../types.js';
-import type { ComposeModel } from './docker.js';
+import type { ComposeModel, DockerLoad } from './docker.js';
 import type { ScriptClass, Targets } from './scripts.js';
 import type { EnvGate } from './settings.js';
 import type { ToolSignature } from './signatures.js';
@@ -144,4 +144,6 @@ export interface Ctx {
   precommitConfig?: Promise<{ readable: boolean; found: Found[] }>;
   /** P55 (batch B): each compose file set's services, worked out once (docker.ts). */
   composeMemo: Map<string, ComposeModel>;
+  /** P55 (batch B): each Dockerfile's parse, worked out once (docker.ts). */
+  dockerParsed: Map<string, DockerLoad>;
 }

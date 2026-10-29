@@ -199,7 +199,7 @@ export async function mapCoverage(p: RepoProfile, needs: Need[], dir: string, op
   const sigs = (defaultCompiled ??= compile(loadToolSignatures()));
   const ctx: Ctx = {
     p, sigs, read: new Reader(dir), budget: { visits: 0, bytes: 0, truncated: false }, hits: [], localFiles: new Set(),
-    unreadable: (opts.skippedWorkflows ?? 0) > 0, pkgRead: new Reader(dir), pkgScripts: new Map(), scriptMemo: new Map(), scriptRead: new Reader(dir), scriptFileReads: 0, scriptClass: new Map(), compositeGates: new Map(), composeMemo: new Map(),
+    unreadable: (opts.skippedWorkflows ?? 0) > 0, pkgRead: new Reader(dir), pkgScripts: new Map(), scriptMemo: new Map(), scriptRead: new Reader(dir), scriptFileReads: 0, scriptClass: new Map(), compositeGates: new Map(), composeMemo: new Map(), dockerParsed: new Map(),
     globMemo: new Map(), globWork: 0, ...(opts.capabilities === undefined ? {} : { caps: opts.capabilities }),
     // fix round 1 (P8): a workflow readWorkflows skipped may be a release workflow
     releaseJobs: [], releaseUnread: (opts.skippedWorkflows ?? 0) > 0,

@@ -138,16 +138,27 @@ export async function placeComposeRun(ctx: Ctx, f: Found): Promise<Found | null>
       : !svc.hasBuild ? `a service (${run.service}) that uses a ready-made image` : "a service whose build folder pipegen can't place";
     return { categories: UNKNOWN_SCRIPT_CATEGORIES, by: f.by, subject: f.subject, dir: null, reason: null, partialWhy: `${f.subject} runs in ${why}, so pipegen can't tell which service it checks.` };
   }
+  // the command runs in the image's last WORKDIR (the folder COPY put there): the host folder it maps to, else the build folder
+  let dir = svc.context;
+  if (svc.file !== null && svc.target !== '?') {
+    const d = await loadDockerfile(ctx, svc.file, svc.context);
+    if ('parsed' in d && 'stages' in d.parsed) {
+      const needed = neededStages(d.parsed.stages, svc.target);
+      const last = needed === null ? null : Math.max(...needed);
+      const end = last === null ? null : d.parsed.stages[last]?.endDir ?? null;
+      if (end !== null) dir = end;
+    }
+  }
   const { composeRun: _placed, ...rest } = f;
   void _placed;
-  return { ...rest, dir: svc.context };
+  return { ...rest, dir };
 }
 
 // ---------- Dockerfiles ----------
 
-interface Run { text: string; dir: string | null }
-interface Stage { name: string | null; needs: string[]; runs: Run[] }
-type Parsed = { stages: Stage[] } | { unreadable: string };
+export interface Run { text: string; dir: string | null }
+export interface Stage { name: string | null; needs: string[]; runs: Run[]; endDir: string | null }
+export type Parsed = { stages: Stage[] } | { unreadable: string };
 
 /** The words of a COPY/ADD or FROM line, past its `--flag` words, as [flags, words]. */
 function wordsOf(rest: string): { flags: string[]; words: string[] } {
@@ -189,10 +200,10 @@ async function parseDockerfile(ctx: Ctx, text: string, context: string): Promise
     if (names.has(lower)) return names.get(lower) as number;
     return /^\d{1,2}$/.test(ref) && Number(ref) < stages.length ? Number(ref) : null;
   };
-  const hostOf = (workdir: string | null): string | null => {
+  const hostOf = (workdir: string | null, st: State = state): string | null => {
     if (workdir === null) return null;
     let best: { dest: string; host: string } | null = null;
-    for (const m of state.maps) if ((workdir === m.dest || workdir.startsWith(`${m.dest === '/' ? '' : m.dest}/`)) && (best === null || m.dest.length >= best.dest.length)) best = m;
+    for (const m of st.maps) if ((workdir === m.dest || workdir.startsWith(`${m.dest === '/' ? '' : m.dest}/`)) && (best === null || m.dest.length >= best.dest.length)) best = m;
     return best === null ? null : resolveDir(best.host, posix.relative(best.dest, workdir) || '.');
   };
   const abs = (p: string): string | null => (/[$\\]/.test(p) || state.workdir === null && !p.startsWith('/') ? null : posix.normalize(p.startsWith('/') ? p : posix.join(state.workdir as string, p)).replace(/(.)\/+$/, '$1'));
@@ -209,7 +220,7 @@ async function parseDockerfile(ctx: Ctx, text: string, context: string): Promise
       const asAt = words.findIndex((w) => w.toLowerCase() === 'as');
       const name = asAt >= 0 && /^[A-Za-z0-9_.-]{1,64}$/.test(words[asAt + 1] ?? '') ? (words[asAt + 1] as string) : null;
       const parent = /\$/.test(words[0] ?? '') ? null : refOf(words[0] ?? '');
-      cur = { name, needs: parent === null ? [] : [String(parent)], runs: [] };
+      cur = { name, needs: parent === null ? [] : [String(parent)], runs: [], endDir: null };
       state = parent === null ? { workdir: '/', maps: [] } : { workdir: states[parent]!.workdir, maps: [...states[parent]!.maps] };
       if (name !== null) names.set(name.toLowerCase(), stages.length);
       stages.push(cur);
@@ -258,7 +269,24 @@ async function parseDockerfile(ctx: Ctx, text: string, context: string): Promise
       if (text !== null) cur.runs.push({ text, dir: hostOf(state.workdir) });
     }
   }
+  for (const [i, stage] of stages.entries()) stage.endDir = hostOf(states[i]!.workdir, states[i]!);
   return { stages };
+}
+
+/** A Dockerfile read and parsed once per (file, context): its parse, or why it couldn't be. */
+export type DockerLoad = { parsed: Parsed } | { fail: 'missing' | 'unreadable' | 'limit' };
+async function loadDockerfile(ctx: Ctx, file: string, context: string): Promise<DockerLoad> {
+  const key = `parsed\u0000${file}\u0000${context}`;
+  const known = ctx.dockerParsed.get(key);
+  if (known !== undefined) return known;
+  let out: DockerLoad;
+  if (!spend(ctx)) out = { fail: 'limit' };
+  else {
+    const t = await ctx.scriptRead.text(file);
+    out = 'fail' in t ? { fail: t.fail === 'missing' ? 'missing' : 'unreadable' } : { parsed: await parseDockerfile(ctx, t.ok, context) };
+  }
+  ctx.dockerParsed.set(key, out);
+  return out;
 }
 
 /** The `--flag` words at the start of a RUN, and the rest. */
@@ -306,14 +334,14 @@ async function dockerfileRuns(ctx: Ctx, b: DockerBuild, f: Found, outer: Reason 
   let runs = ctx.scriptMemo.get(key);
   if (runs === undefined) {
     ctx.scriptMemo.set(key, []); // being worked out
-    if (!spend(ctx)) {
+    const loaded = await loadDockerfile(ctx, b.file, b.context);
+    if ('fail' in loaded && loaded.fail === 'limit') {
       runs = unknown(`There are more files than pipegen follows, so it can't tell what the Dockerfile ${b.file} runs.`);
     } else {
-      const t = await ctx.scriptRead.text(b.file);
-      if ('fail' in t) {
-        runs = t.fail === 'missing' ? [] : unknown(`${f.subject} builds the Dockerfile ${b.file}, which pipegen couldn't read (a symbolic link, too large or outside the repo), so it can't tell what it runs.`);
+      if ('fail' in loaded) {
+        runs = loaded.fail === 'missing' ? [] : unknown(`${f.subject} builds the Dockerfile ${b.file}, which pipegen couldn't read (a symbolic link, too large or outside the repo), so it can't tell what it runs.`);
       } else {
-        const parsed = await parseDockerfile(ctx, t.ok, b.context);
+        const parsed = loaded.parsed;
         const needed = 'stages' in parsed ? neededStages(parsed.stages, b.target) : null;
         if ('unreadable' in parsed) runs = unknown(`${f.subject} builds the Dockerfile ${b.file}, and ${parsed.unreadable}, so pipegen can't tell what it runs.`);
         else if (needed === null) runs = unknown(`${f.subject} builds the stage ${b.target ?? ''} of ${b.file}, which pipegen can't find.`);
