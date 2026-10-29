@@ -131,7 +131,10 @@ async function composeModel(ctx: Ctx, files: readonly string[] | null, cwd: stri
         if (profiles === null) return { why: `a compose service (${name}) whose profiles pipegen can't read` };
         // P57 (C5): the service's environment (a map or a list of NAME=value) reaches what runs in it; a later file's adds to it
         const environment = { ...(prev?.environment ?? {}), ...composeEnvironment(svc.environment) };
-        const envFiles = 'env_file' in svc ? envFilesOf(svc.env_file, baseDir) : (prev?.envFiles ?? []);
+        // P60 (R1): a later file's env_file list is added to the earlier one's (Compose merges them); unsure in either is unsure
+        const own = 'env_file' in svc ? envFilesOf(svc.env_file, baseDir) : [];
+        const before = prev?.envFiles ?? [];
+        const envFiles = own === 'unsure' || before === 'unsure' ? 'unsure' as const : [...before, ...own];
         if (!('build' in svc) || svc.build === null || svc.build === undefined) {
           if (prev === undefined) out.set(name, { context: null, file: null, target: null, hasBuild: false, profiles, environment, frontend: null, envFiles });
           else out.set(name, { ...prev, profiles, environment, envFiles });
@@ -181,7 +184,8 @@ function envFileNames(text: string): Record<string, string> | null {
     if (l === '' || l.startsWith('#')) continue;
     const m = /^(?:export\s+)?([A-Za-z_][A-Za-z0-9_.-]*)\s*(?:=(.*))?$/.exec(l);
     if (m === null) return null;
-    const v = (m[2] ?? '').trim().replace(/^(["'])(.*)\1$/, '$2');
+    // a bare NAME passes the variable through from the environment: its value can't be read
+    const v = m[2] === undefined ? '$' : m[2].trim().replace(/^(["'])(.*)\1$/, '$2');
     out[m[1] as string] = /^[A-Za-z0-9_.,:\/ -]*$/.test(v) ? v : '$';
   }
   return out;

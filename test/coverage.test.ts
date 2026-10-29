@@ -3794,4 +3794,18 @@ describe('coverage: closing patch (ruling P60)', () => {
     const rows = await mapCoverage(p, floorNeeds(p, caps), dir);
     expect(row(rows, 'push', 'unit-tests', be.name)).toMatchObject({ status: 'covered', by: 'your own `pytest`' });
   });
+
+  it('R1 follow-up: env_file lists merge across compose files like Compose does; a bare NAME passes the env through (unsure)', async () => {
+    const steps = run('docker compose run --rm app tox');
+    const base = { Dockerfile: IMG, 'tox.ini': '[tox]\n', 'compose.yml': 'services:\n  app:\n    build: .\n    env_file: a.env\n', 'a.env': 'TOXENV=lint\n' };
+    // the override adds b.env; a.env still applies (Compose concatenates the lists)
+    expect(await st({ ...base, 'compose.override.yml': 'services:\n  app:\n    env_file: b.env\n', 'b.env': 'FOO=1\n' }, steps)).toBe('partial your own `tox`');
+    expect(await st({ ...base, 'a.env': 'FOO=1\n', 'compose.override.yml': 'services:\n  app:\n    env_file: ${X}\n' }, steps)).not.toBe('covered your own `tox`');
+    // a bare SKIP line takes its value from the environment: pipegen can't read it, so the hooks are unknown
+    const hooks = { Dockerfile: IMG, '.pre-commit-config.yaml': hookConfig('      - id: ruff-check\n'), 'compose.yml': 'services:\n  app:\n    build: .\n    env_file: a.env\n' };
+    const lint = (aEnv: string) => st({ ...hooks, 'a.env': aEnv }, run('docker compose run --rm app prek run --all-files'), 'lint');
+    expect(await lint('SKIP\n')).toMatch(/^unknown/);
+    expect(await lint('export SKIP\n')).toMatch(/^unknown/);
+    expect(await lint('FOO=1\n')).toBe('covered ruff');
+  });
 });
