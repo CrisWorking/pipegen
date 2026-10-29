@@ -72,6 +72,7 @@ export const CANT_SEE: readonly string[] = Object.freeze([
     + `${num(L.localFiles)} local workflows and actions followed, ${num(L.runTextMb)} MB of run text, ${num(L.stepVisits)} steps visited in all, `
     + `${num(L.hits)} tool findings, ${num(L.hitDirs)} folders with runs, or ${num(L.services)} services.`,
   "Reusable workflows from other repos, and actions from your own account, can't be looked inside: those checks show as unknown.",
+  "Shell tricks such as `trap … EXIT`, `alias`, or a function named like the test tool aren't modelled, so a repo built to fool the audit could make a check look covered.",
   "A local action or reusable workflow that calls another local one isn't followed past the first level, so those checks show as unknown.",
   // Plan U Task 5 fix round 2 (review M4): limits of the checks Task 5 added, each erring toward covered
   "`tox` counts as your own test run whatever environments its config lists: pipegen doesn't read tox's env_list.",

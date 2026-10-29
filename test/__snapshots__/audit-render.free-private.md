@@ -204,6 +204,7 @@ These are counts only, never file contents. They were made without the secret sc
 - Tools inside shell functions, and jobs whose matrix includes Windows, show as partial.
 - Very large repos show some checks as unknown: past 200 workflow files, 100 jobs in a workflow, 200 steps in a job or action, 100 local workflows and actions followed, 16 MB of run text, 50,000 steps visited in all, 100,000 tool findings, 10,000 folders with runs, or 5,000 services.
 - Reusable workflows from other repos, and actions from your own account, can't be looked inside: those checks show as unknown.
+- Shell tricks such as `trap … EXIT`, `alias`, or a function named like the test tool aren't modelled, so a repo built to fool the audit could make a check look covered.
 - A local action or reusable workflow that calls another local one isn't followed past the first level, so those checks show as unknown.
 - `tox` counts as your own test run whatever environments its config lists: pipegen doesn't read tox's env_list.
 - A tox or nox run whose environments a TOX… or NOX… variable in the job picks (like TOXENV from a matrix) shows as partial: pipegen doesn't read the variable's value, so it can't tell if the tests run.

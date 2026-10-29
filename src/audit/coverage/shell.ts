@@ -11,7 +11,10 @@ import type { Budget, CommandRule, Compiled, Found, Reason } from './types.js';
 // ---------- reading shell text (review M2: command position only; round 2: quotes, lists, groups, pipes) ----------
 
 /** How a step's shell treats failures. GitHub: default `bash -e {0}`; `bash` adds -o pipefail; `sh` is `sh -e {0}`. */
-/** `script` (P51): the text is a repo script file pipegen follows, where a check run only under a condition is partial. */
+/**
+ * `script` (P51): the text is a repo script file pipegen follows (its condition why names the script). The condition
+ * rules themselves (P51-P53) apply to every shell text: steps, package scripts, hooks and script files.
+ */
 export interface ShellMode { errexit: boolean; pipefail: boolean; script?: boolean }
 export const DEFAULT_SHELL: ShellMode = { errexit: true, pipefail: false };
 
@@ -316,7 +319,7 @@ export function scanShell(text: string, base: string | null, sigs: Compiled, bud
   };
   // P51: how many if / case / while / until compound commands hold each token (a prefix sum over their ranges)
   const condDepth = new Int32Array(n + 1);
-  if (mode.script === true) {
+  { // P53: for every shell text (steps, package scripts, hooks and followed script files)
     for (let k = 0; k < n; k++) {
       if (toks[k]!.kw !== 'open' || !(CONDITIONAL_KW.has(toks[k]!.w) || (toks[k]!.w === 'for' && !literalForList(k)))) continue;
       condDepth[k + 1]! += 1;
@@ -444,7 +447,9 @@ export function scanShell(text: string, base: string | null, sigs: Compiled, bud
     if (exempt) return 'suppressed';
     // P51: in a followed script, a run inside if/case/while/until, right of a test's && or ||, or after a conditional
     // exit/return runs only under a condition
-    return mode.script === true && (condDepth[k]! > 0 || condChain || afterCondExit) ? 'script-condition' : null;
+    // P53: the same rules for every shell text; a followed script file names itself in the why
+    if (!(condDepth[k]! > 0 || condChain || afterCondExit)) return null;
+    return mode.script === true ? 'script-condition' : 'shell-condition';
   };
   const argsAfter = (k: number) => {
     const out: string[] = [];
@@ -757,7 +762,7 @@ export function scanShell(text: string, base: string | null, sigs: Compiled, bud
     // P52 (a, b): whether this command keeps an `&&` chain unconditional; a call to a script function that can exit
     lastSafe = chainSafe(k, w);
     while (fnStack.length > 0 && fnStack[fnStack.length - 1]!.close <= k) fnStack.pop();
-    if (mode.script === true && exitFns.has(w) && !isDead(k)) afterCondExit = true;
+    if (exitFns.has(w) && !isDead(k)) afterCondExit = true;
     if (w === 'cd') {
       const target = word(k + 1);
       cwd = target === null || target === '' || target === '-' || /[$`~\\]/.test(target) || target.startsWith('/') ? null : resolveDir(cwd, target);
@@ -796,7 +801,7 @@ export function scanShell(text: string, base: string | null, sigs: Compiled, bud
     // P52 (b): an exit/return that can end the script with success (no code, 0, or one pipegen can't read; a literal
     // non-zero code fails the run, never a silent pass): in a function body it marks the function; anywhere else but
     // the top-level list (a group, a subshell, if/case/loop, an &&/|| chain) every later run is under a condition
-    if (mode.script === true && (w === 'exit' || w === 'return') && !isDead(k) && !/^[1-9][0-9]{0,2}$/.test(word(k + 1) ?? '')) {
+    if ((w === 'exit' || w === 'return') && !isDead(k) && !/^[1-9][0-9]{0,2}$/.test(word(k + 1) ?? '')) {
       const fn = fnStack.length > 0 && k < fnStack[fnStack.length - 1]!.close ? fnStack[fnStack.length - 1]! : null;
       if (fn !== null) exitFns.add(fn.name);
       else if (depth[k]! > 0 || condDepth[k]! > 0 || condChain || inCondition) afterCondExit = true;

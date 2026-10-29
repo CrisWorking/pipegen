@@ -543,7 +543,7 @@ describe('mapCoverage (fix round 1)', () => {
     expect(await st('uv run pytest', 'unit-tests')).toBe('covered');
     expect(await st('pipx run pip-audit', 'deps')).toBe('covered');
     expect(await st('python -m semgrep ci', 'sast')).toBe('covered');
-    expect(await st('echo start && gitleaks detect')).toBe('covered');
+    expect(await st('echo start && gitleaks detect')).toBe('partial'); // P53: only cd, pushd, export, set and source keep an && chain unconditional
     expect(await st('result=$(gitleaks detect)')).toBe('covered');
     expect(await st('docker run --rm -v "$GITHUB_WORKSPACE:/repo" zricethezav/gitleaks:v8.18.0 detect --source /repo')).toBe('covered');
     expect(await st('docker run --rm -v "$GITHUB_WORKSPACE:/src" aquasec/trivy:0.50.0 fs /src', 'deps')).toBe('partial'); // no --exit-code
@@ -781,10 +781,10 @@ describe('mapCoverage (fix round 4)', () => {
     ['for …; done | tee (no pipefail)', 'for x in a; do gitleaks detect; done | tee out', 'partial'],
     ['for …; done & (background)', 'for x in a; do gitleaks detect; done &\nwait', 'partial'],
     ['if …; fi && echo, not the last list', 'if true; then gitleaks detect; fi && echo ok\necho next', 'partial'],
-    ['a multi-line if body still blocks', 'if true; then\n  gitleaks detect\nfi\necho next', 'covered'],
+    ['a multi-line if body still blocks', 'if true; then\n  gitleaks detect\nfi\necho next', 'partial'], // P53: an if body runs only under a condition
     ['a for body still blocks', 'for x in a; do gitleaks detect; done\necho next', 'covered'],
     // case arms: a pattern is not a command; the arm's body is
-    ['a case arm body blocks', 'case "$E" in\n  push) gitleaks detect ;;\nesac\necho done', 'covered'],
+    ['a case arm body blocks', 'case "$E" in\n  push) gitleaks detect ;;\nesac\necho done', 'partial'], // P53: a case arm runs only under a condition
     ['a case pattern is not a command', 'case "$1" in\n  a) echo ;;\n  gitleaks) echo hi ;;\nesac', 'missing'],
     ['a reserved word in argument position is a plain word', 'if x; then gitleaks detect; echo then if; fi || true', 'partial'],
     ['a function whose body is a for loop', 'f() for x in a; do gitleaks detect; done\necho next', 'partial'],
@@ -1339,7 +1339,7 @@ describe('mapCoverage (Task 5 fix round 1)', () => {
       ['npm run test:x', { 'test:x': '' }, 'missing'],
       ['npm run test:x', { 'test:x': 'jest || true' }, 'partial'],
       ['npm test', { test: 'jest || true' }, 'partial'],
-      ['npm test', { test: 'eslint . && jest --passWithNoTests' }, 'covered'],
+      ['npm test', { test: 'eslint . && jest --passWithNoTests' }, 'partial'], // P53: eslint isn't on the && allowlist
       ['pnpm test', { test: 'vitest run; echo done' }, 'partial'],
       ['npm test', { test: 'node test.js' }, 'covered'], // an unknown runner keeps its by-name count (left-pad)
       ['npm test', { test: 'tape test/*.js' }, 'covered'],
@@ -1370,12 +1370,16 @@ describe('mapCoverage (Task 5 fix round 1)', () => {
       wf(dir, 'ci.yml', PR(steps));
       expect(row(await coverage(dir, steps.includes('tox') || steps.includes('nox') || steps.includes('pytest') ? py : {}), 'merge', 'unit-tests', 'app').status, steps).toBe('missing');
     }
-    // an exit that only runs on a condition, or inside a group or subshell, ends nothing
-    for (const steps of [run('test -f x || exit 0; jest'), run('if [ -n "$X" ]; then exit 0; fi; jest'), run('(exit 0); jest'), run('jest; exit 0')]) {
+    // an exit that only runs on a condition, or inside a group or subshell, ends nothing; P53: what follows it runs only
+    // under that condition, so it is partial
+    for (const steps of [run('test -f x || exit 0; jest'), run('if [ -n "$X" ]; then exit 0; fi; jest'), run('(exit 0); jest')]) {
       const dir = makeTempDir();
       wf(dir, 'ci.yml', PR(steps));
-      expect(row(await coverage(dir), 'merge', 'unit-tests', 'app').status, steps).toBe('covered');
+      expect(row(await coverage(dir), 'merge', 'unit-tests', 'app').status, steps).toBe('partial');
     }
+    const after = makeTempDir();
+    wf(after, 'ci.yml', PR(run('jest; exit 0')));
+    expect(row(await coverage(after), 'merge', 'unit-tests', 'app').status).toBe('covered');
   });
 
   it('M1: NPM_CONFIG_DRY_RUN in the env turns npm publish --provenance into a dry run', async () => {
@@ -1427,9 +1431,9 @@ describe('mapCoverage (Task 5 fix round 2)', () => {
       // stays counted by name
       ['npm test', { test: 'node script.js' }, 'covered'],
       ['npm test', { test: 'jest && echo done' }, 'covered'],
-      ['npm test', { test: 'npm run a && jest', a: 'echo ok' }, 'covered'],
+      ['npm test', { test: 'npm run a && jest', a: 'echo ok' }, 'partial'], // P53: `npm run a` isn't on the && allowlist
       ['npm test', { test: 'npm run a', a: 'tape test.js' }, 'covered'],
-      ['npm test', { test: 'test -f x || exit 0; node t.js' }, 'covered'],
+      ['npm test', { test: 'test -f x || exit 0; node t.js' }, 'partial'], // P53: after a conditional exit
     ] as [string, Record<string, string>, string][]) {
       const dir = makeTempDir();
       pkg(dir, scripts);
@@ -1459,7 +1463,7 @@ describe('mapCoverage (Task 5 fix round 2)', () => {
 
   it('dead code in CI text too: right of `true ||` / `false &&` never runs', async () => {
     for (const [cmd, status] of [['true || jest', 'missing'], ['false && jest', 'missing'], ['echo x || (jest)', 'missing'], ['true || jest || exit 1', 'missing'],
-      ['true && jest', 'covered'], ['false || jest', 'covered'], ['true || jest; jest', 'covered']]) {
+      ['true && jest', 'partial'], ['false || jest', 'partial'], ['true || jest; jest', 'covered']]) { // P53: && allowlist, right of ||
       const dir = makeTempDir();
       wf(dir, 'ci.yml', PR(run(cmd as string)));
       expect(row(await coverage(dir), 'merge', 'unit-tests', 'app').status, cmd).toBe(status);
@@ -2901,5 +2905,54 @@ describe('coverage: followed scripts and shells, allowlists (P52)', () => {
     }
     // run through a shell, the shebang doesn't matter
     expect((await st('#!/usr/bin/env python3\nset -e\npytest\n')).status).toBe('covered');
+  });
+});
+
+// Ruling P53: a literal non-zero exit isn't conditional, a non-literal one is; the same condition rules (one analyzer)
+// for workflow `run:` blocks and package.json scripts.
+describe('coverage: one condition analyzer for scripts, steps and package scripts (P53)', () => {
+  const script = async (body: string) => {
+    const dir = makeTempDir();
+    wf(dir, 'ci.yml', `${both}jobs:\n  t:\n    runs-on: ubuntu-latest\n    steps:\n${run('bash scripts/test.sh')}`);
+    writeIn(dir, 'scripts/test.sh', body);
+    return row(await coverage(dir), 'merge', 'unit-tests');
+  };
+  const step = async (runText: string, files: Record<string, string> = {}) => {
+    const dir = makeTempDir();
+    wf(dir, 'ci.yml', `${both}jobs:\n  t:\n    runs-on: ubuntu-latest\n    steps:\n      - run: |\n${runText.split('\n').map((l) => `          ${l}`).join('\n')}\n`);
+    for (const [f, t] of Object.entries(files)) writeIn(dir, f, t);
+    return row(await coverage(dir), 'merge', 'unit-tests');
+  };
+
+  it('(1) an exit with a literal non-zero code is not conditional; one with a code pipegen can\'t read is', async () => {
+    for (const s of ['cd . || exit 1', 'cd . || exit 2', '[ -n "$X" ] && exit 3']) expect((await script(`set -e\n${s}\npytest\n`)).status, s).toBe('covered');
+    for (const s of ['[ -n "$X" ] && exit $?', 'cd . || exit "$code"', '[ -n "$X" ] && exit ${RC:-0}', 'grep -q x f || exit $RC']) {
+      expect((await script(`set -e\n${s}\npytest\n`)).status, s).toBe('partial');
+    }
+  });
+
+  it('(2) workflow run: blocks follow the same rules; the old step rules still work', async () => {
+    for (const s of ['[ -f pyproject.toml ] && pytest', 'command -v pytest && pytest', 'if [ -n "$RUN" ]; then pytest; fi', '[ -n "$CI" ] && exit 0\npytest', 'for t in $TESTS; do pytest "$t"; done']) {
+      const r = await step(s);
+      expect(r.status, s).toBe('partial');
+      expect(r.why, s).toMatch(/only under a condition in its shell code/);
+    }
+    expect((await step('set $OPTS\npytest')).status).toBe('unknown');
+    for (const s of ['cd . && pytest', 'pytest', 'export A=1 && pytest', 'cd . || exit 1\npytest']) expect((await step(s)).status, s).toBe('covered');
+    expect((await step('pytest || true')).status).toBe('partial'); // the old rules still apply
+  });
+
+  it('(2) package.json script strings follow the same rules', async () => {
+    const pkg = (test: string) => ({ 'package.json': JSON.stringify({ name: 'app', scripts: { test } }) });
+    const r = await step('npm test', pkg('command -v jest && jest'));
+    expect(r.status).toBe('partial');
+    expect(r.why).toMatch(/only under a condition/);
+    expect((await step('npm test', pkg('cd . && jest'))).status).toBe('covered');
+    expect((await step('npm test', pkg('jest'))).status).toBe('covered');
+  });
+
+  it('(3) what the audit can\'t see names the shell tricks it doesn\'t model', async () => {
+    const { CANT_SEE } = await import('../src/audit/render.js');
+    expect(CANT_SEE.some((l) => /trap … EXIT/.test(l) && /alias/.test(l) && /function named like the test tool/.test(l))).toBe(true);
   });
 });

@@ -27,6 +27,8 @@ export interface Compiled {
 export type Reason = 'continue' | 'suppressed' | 'function' | 'soft' | 'inputs' | 'no-fail' | 'never' | 'condition'
   // P51: in a followed repo script, the check runs only under a condition (if/case/while, a test's && or ||, after a conditional exit)
   | 'script-condition'
+  // P53: the same, in a workflow step's run:, a package script or a hook file
+  | 'shell-condition'
   | 'hook-repo' | 'files' | 'stage' | 'skip' | 'ref' | 'tox-env' | 'nox-env'
   // Plan P Task 3: an action this repo can't use (availability), an action not set up for the check (requireInputs),
   // egress control missing from some release jobs (PB5), a scan target pipegen can't place (imageArg), a command with
