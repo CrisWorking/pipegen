@@ -207,6 +207,7 @@ What this audit can't see
     stage (or the target) needs. Build arguments and ENV count only as variables the RUN lines see;
     a Compose `extends`, `include`, `--env-file` or COMPOSE_FILE, and a custom Dockerfile frontend,
     show as unknown.
+  - Commands given through a variable aren't read.
   - A Dockerfile `ENTRYPOINT` in shell form, or a compose `entrypoint:`, can ignore the command
     `docker compose run` or `docker run` passes, so a check run that way may not run at all: pipegen
     doesn't read the entrypoint.

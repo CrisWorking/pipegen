@@ -215,6 +215,7 @@ These are counts only, never file contents. They were made without the secret sc
 - A tox or nox run whose environments a TOX… or NOX… variable in the job picks (like TOXENV from a matrix) shows as partial: pipegen doesn't read the variable's value, so it can't tell if the tests run.
 - Variables that change what runs (SKIP for pre-commit, TOX… and NOX… for tox and nox, NPM_CONFIG_DRY_RUN) aren't seen when an action from another repo sets them, or when a step writes them under a name built while it runs.
 - Dockerfile RUN lines count only when a `docker build`, docker/build-push-action or `docker compose build` step names the Dockerfile with plain paths, and only for the stages the final stage (or the target) needs. Build arguments and ENV count only as variables the RUN lines see; a Compose `extends`, `include`, `--env-file` or COMPOSE_FILE, and a custom Dockerfile frontend, show as unknown.
+- Commands given through a variable aren't read.
 - A Dockerfile `ENTRYPOINT` in shell form, or a compose `entrypoint:`, can ignore the command `docker compose run` or `docker run` passes, so a check run that way may not run at all: pipegen doesn't read the entrypoint.
 - A tool counts only for services in the languages pipegen lists for it (mypy and Ruff for Python, ESLint and tsc for JavaScript and TypeScript); a tool set up to check other languages as well isn't credited for them.
 - A pre-commit hook pinned to a commit SHA (`rev:`) isn't checked to be a commit of the hook's own repo, so it could come from a fork.
