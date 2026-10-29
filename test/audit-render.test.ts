@@ -1034,6 +1034,12 @@ describe('the quick secret check says what it does and does not look for (hand c
     }
   });
 
+  it("P57 (M4, C1, C3): what this audit can't see names an ENTRYPOINT or compose entrypoint, the languages rule and the compose limits", () => {
+    expect(CANT_SEE.some((l) => l.includes('ENTRYPOINT') && l.includes('entrypoint:'))).toBe(true);
+    expect(CANT_SEE.some((l) => l.includes('languages'))).toBe(true);
+    expect(CANT_SEE.some((l) => l.includes("Build arguments, Compose profiles, `extends` and `include` aren't read"))).toBe(false);
+  });
+
   it('report: JSON carries the scope next to secretsInTree, also when nothing was found', () => {
     for (const r of [report(), quiet()]) {
       const j = (JSON.parse(json(r)) as Record<typeof CHECK, { kind: string; looksFor: string; doesNotLookFor: string; fullScans: string }>)[CHECK];

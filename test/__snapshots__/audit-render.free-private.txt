@@ -204,8 +204,15 @@ What this audit can't see
     writes them under a name built while it runs.
   - Dockerfile RUN lines count only when a `docker build`, docker/build-push-action or `docker
     compose build` step names the Dockerfile with plain paths, and only for the stages the final
-    stage (or the target) needs. Build arguments, Compose profiles, `extends` and `include` aren't
-    read.
+    stage (or the target) needs. Build arguments and ENV count only as variables the RUN lines see;
+    a Compose `extends`, `include`, `--env-file` or COMPOSE_FILE, and a custom Dockerfile frontend,
+    show as unknown.
+  - A Dockerfile `ENTRYPOINT` in shell form, or a compose `entrypoint:`, can ignore the command
+    `docker compose run` or `docker run` passes, so a check run that way may not run at all: pipegen
+    doesn't read the entrypoint.
+  - A tool counts only for services in the languages pipegen lists for it (mypy and Ruff for Python,
+    ESLint and tsc for JavaScript and TypeScript); a tool set up to check other languages as well
+    isn't credited for them.
   - A pre-commit hook pinned to a commit SHA (`rev:`) isn't checked to be a commit of the hook's own
     repo, so it could come from a fork.
   - pipegen knows the PyPI publish action up to v1.14.3: a newer release pinned by its commit SHA
