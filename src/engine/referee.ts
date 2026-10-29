@@ -35,7 +35,7 @@ import { NEED_ID_CATEGORY } from './need-ids.js';
 import { PLATFORM_ACTION_IDS, type PlatformActions } from './pin.js';
 import { APP_RUNNING_CATEGORIES, TRIVY_LAUNCH_RE } from './render-cli.js';
 import { EXPR, own, show } from './render-error.js';
-import { ACTION_PATH_RE, checkExpressions, checkJobOrder, IF_VALUES, isDangerousName, isReviewed, SECRET_REF_RE, STEP_KEYS as STEP_KEY_LIST, WORKFLOW_PATH_RE, type RenderedStep } from './job-rules.js';
+import { ACTION_PATH_RE, checkExpressions, createdPathProblem, checkJobOrder, IF_VALUES, isDangerousName, isReviewed, SECRET_REF_RE, STEP_KEYS as STEP_KEY_LIST, WORKFLOW_PATH_RE, type RenderedStep } from './job-rules.js';
 import { containerRefusal, RenderError, renderProjectScript, renderStep, sameDedupeContent, type RenderContext } from './render-step.js';
 import { projectScriptFor } from './reviewed.js';
 import { slotProblem, type SlotKind } from './slots.js';
@@ -343,6 +343,8 @@ interface Expected {
   /** env keys whose values are run-time slots, with their kind (judged by slots.ts, not by equality) */
   slots: Map<string, SlotKind>;
   source: string; appRunning: boolean; blocking: boolean;
+  /** the last run step of its spec: the tool's own run (before it come installs and checks); only this one makes the spec "present" (R2) */
+  final: boolean;
   /** the tool reads the checked-out workspace (every scanner but the image and URL ones): its job needs the locked checkout first */
   readsWorkspace: boolean;
 }
@@ -423,6 +425,7 @@ function expectations(draft: PipelineDraft, platform: PlatformActions, reviewed:
   const record = (source: string, results: RenderedStep[][], appRunning: boolean, blocking: boolean, readsWorkspace: boolean): void => {
     const [a, b] = results as [RenderedStep[], RenderedStep[]];
     const pins = new Map<string, string[]>();
+    const lastRun = a.map((s) => s.run !== undefined).lastIndexOf(true);
     a.forEach((s, i) => {
       if (s.id?.startsWith('pipegen-npm-ci-') === true) pins.set(s.id, pinLines(s.env?.PIPEGEN_NPM_EXPECT) ?? []);
       if (s.run === undefined) return;
@@ -433,7 +436,7 @@ function expectations(draft: PipelineDraft, platform: PlatformActions, reviewed:
         const kind = slotKindOf(v, SENTINELS[0]);
         if (kind !== undefined) slots.set(k, kind);
       }
-      ex.runs.push({ step: s, slots, source, appRunning, blocking, readsWorkspace });
+      ex.runs.push({ step: s, slots, source, appRunning, blocking, readsWorkspace, final: i === lastRun });
       if (s.id !== undefined) ex.runIds.add(s.id);
     });
     ex.npmPins.set(source, pins);
@@ -796,7 +799,7 @@ function judgeStep(fc: FileCtx, where: string, raw: unknown): Judged {
     else if (r === null) { bad('unreviewed', at(`the run step ${show(raw.name ?? raw.id ?? '')} is not a step pipegen renders for this pipeline (a reviewed tool or a project script), so it is not run.`)); harmlessId = false; }
     else {
       match = r;
-      fc.ex.matched.add(r.source);
+      if (r.final) fc.ex.matched.add(r.source);
       appRunning = r.appRunning;
       const id = r.step.id ?? '';
       kind = r.source.startsWith('script:') || appRunning ? 'repo-code' : /^(?:checker-run|tool-run|tool-install|tool-pull)-/.test(id) ? 'tool' : /^scrub-/.test(id) ? 'scrub' : 'repo-code';
@@ -1119,7 +1122,15 @@ export async function referee(files: CreatedFile[], draft: PipelineDraft, platfo
   const parsed = new Map<string, Parsed>();
   const lintable: CreatedFile[] = [];
   for (const f of files) {
+    // every created path is judged or refused (final review r1, R1): a path that is not plain and normalized, or that is in
+    // .github/ (any letter case) without being exactly a workflow or action file, would otherwise be skipped yet may land in .github/workflows/
+    const pathProblem = createdPathProblem(f.path);
+    if (pathProblem !== null) { add(f.path, 'template', `The file path is refused: ${pathProblem}; pipegen writes only plain, normalized paths.`); continue; }
     const kind = fileKind(f);
+    if (kind === null && /^\.github\//i.test(f.path)) {
+      add(f.path, 'template', 'The file path is in .github/ but is not a workflow (.github/workflows/<name>.yml) or a composite action (.github/actions/<folder>/action.yml) pipegen can judge, so it is not written.');
+      continue;
+    }
     if (kind === null) {
       if (f.inserted !== undefined) add(f.path, 'template', 'Only a workflow file can carry the mark of an edited user workflow.');
       continue;

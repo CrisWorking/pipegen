@@ -47,6 +47,20 @@ export const STEP_KEYS = ['id', 'name', 'if', 'uses', 'with', 'run', 'shell', 'e
 const SEG = '(?!\\.{1,2}(?:/|$))[A-Za-z0-9._-]+';
 /** A workflow file pipegen may write or lint. The file name has no `/`, so it can not hold a `..` segment. */
 export const WORKFLOW_PATH_RE = /^\.github\/workflows\/[A-Za-z0-9._-]{1,100}\.ya?ml$/;
+/**
+ * Why a created file's path is not a plain, normalized repo-relative path, or null (final review r1, R1): ASCII only, no
+ * backslash or NUL, no leading `/`, and no empty, `.` or `..` segment (so `./x`, `a/../b`, `a//b` and a trailing `/` are all refused).
+ * Joined onto a folder, any of those could land in `.github/workflows/` although the text looks like another place.
+ */
+export function createdPathProblem(path: string): string | null {
+  if (typeof path !== 'string' || path === '') return 'the path is empty';
+  if (!/^[\x20-\x7e]+$/.test(path)) return 'the path has a character other than printable ASCII (a control character, NUL or non-ASCII letter)';
+  if (path.includes('\\')) return 'the path has a backslash';
+  if (path.startsWith('/')) return 'the path is absolute';
+  if (path.split('/').some((seg) => seg === '' || seg === '.' || seg === '..')) return 'the path has an empty, . or .. segment';
+  return null;
+}
+
 /** A composite action file pipegen may write or lint: no empty, `.` or `..` segment anywhere in its path, at most 200 characters between `actions/` and `/action.yml`. */
 export const ACTION_PATH_RE = new RegExp(`^\\.github/actions/(?=[^]{1,200}/action\\.ya?ml$)${SEG}(?:/${SEG})*/action\\.ya?ml$`);
 
