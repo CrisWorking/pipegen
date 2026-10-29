@@ -329,6 +329,7 @@ export function renderCliTool({ spec, tool, service, hooks, options }: CliArgs):
   const vars: string[] = [];           // names the run line uses
   const closureVars: string[] = [];    // variables that point into the install folder
   const afterAllow: string[] = [];     // lines that need the env -i array
+  const installLines: string[] = [];   // a checker's install from the closure, before anything else touches its folder
   const prep: string[] = [];           // folders to create
   let nodeMajor: string | undefined;
   let prefix: string;                  // the launcher: what comes right before the tool's own words
@@ -340,7 +341,7 @@ export function renderCliTool({ spec, tool, service, hooks, options }: CliArgs):
     prefix = `"$bin/${exe}"`;
   } else if (kind === 'docker') {
     const image = imageOf(tool, install);
-    steps.push(runStep(`pipegen: pull the ${exe} image`, script([...prologue(artifact), '"${sys[@]}" /usr/bin/docker pull --quiet "$PIPEGEN_IMAGE" > /dev/null']), { PIPEGEN_IMAGE: image }));
+    steps.push(runStep(`pipegen: pull the ${exe} image`, script([...prologue(artifact), '"${sys[@]}" /usr/bin/docker pull --quiet "$PIPEGEN_IMAGE" > /dev/null']), { PIPEGEN_IMAGE: image }, `tool-pull-${sha16(artifact)}`));
     env.PIPEGEN_IMAGE = image;
     const docker = ['/usr/bin/docker', 'run', '--rm', '--pull=never'];
     // DAST steps (and only those) share the runner's network, because their target is the app started on it (ruling R-D); they run as their image user in a fresh, world-writable work folder
@@ -375,8 +376,11 @@ export function renderCliTool({ spec, tool, service, hooks, options }: CliArgs):
     steps.push({ ...setup, id: `pipegen-setup-node-${nodeMajor}` });
     pathValue = `$nodebin:${FIXED_PATH}`;
     if (checker) {
-      steps.push(checkerInstall(tool, pins, artifact, nodeMajor, options));
       vars.push(`npmdir="$RUNNER_TEMP/pipegen-npm/${artifact}"`);
+      // install from the closure, check and run in ONE step: no step can run between the install and the check (review-6b-r2 C2)
+      const inst = checkerInstall(tool, pins, options);
+      installLines.push(...inst.lines);
+      Object.assign(env, inst.env);
       env.PIPEGEN_NPM_EXPECT = JSON.stringify(pins);
       // variables for the tool that name a helper inside the install folder (never one the repo could supply)
       for (const [name, rel] of Object.entries(pol.closureEnv ?? {})) {
@@ -384,7 +388,9 @@ export function renderCliTool({ spec, tool, service, hooks, options }: CliArgs):
         closureVars.push(`${name}="$npmdir/${rel}"`);
         passed.push(name);
       }
-      // the pinned packages are checked, then the tree is made read-only, in the same step that starts the tool
+      // the pinned packages are checked, then the tree is made read-only, in the same step that starts the tool.
+      // The `chmod -R a-w` is a SPEED BUMP, not a guard: a later step of the same user can `chmod -R u+w` and rewrite the tree
+      // (review-6b-r2 C3). What guards the install is the one-step install-check-run and the job order rule (checkJobOrder).
       afterAllow.push(
         `js=${q(NPM_VERIFY_JS)}`,
         '( cd -- "$npmdir" && "${pg_env[@]}" "PIPEGEN_NPM_EXPECT=$PIPEGEN_NPM_EXPECT" "$nodebin/node" -e "$js" )',
@@ -422,6 +428,7 @@ export function renderCliTool({ spec, tool, service, hooks, options }: CliArgs):
     `  dest="${outDir}/${out}"`,
     '  mv -- "$out" "$dest"',
     '  [ -f "$dest" ] && [ ! -L "$dest" ] || { rm -f -- "$dest"; rc=1; }',
+    // a speed bump, not a guard (review-6b-r2 C3): a later step of the same user can chmod it back
     `  chmod -R a-w "${outDir}"`,
     'else',
     '  echo "pipegen: the tool left no regular result file at $out" >&2',
@@ -431,11 +438,13 @@ export function renderCliTool({ spec, tool, service, hooks, options }: CliArgs):
   const launch = (words: readonly string[]): string => `"\${pg_env[@]}" ${prefix}${words.length === 0 ? '' : ` ${words.join(' ')}`}`;
   const chain = [launch(built.main), ...built.then.map(launch)].join(' && ');
   const run = script([
-    ...prologue(artifact, nodeMajor === undefined ? {} : { nodeMajor }), ...vars, ...cdLines(spec.workingDir), ...prep, ...cfgLines, ...preCheck,
+    ...prologue(artifact, nodeMajor === undefined ? {} : { nodeMajor }), ...vars, ...installLines, ...cdLines(spec.workingDir), ...prep, ...cfgLines, ...preCheck,
     ...closureVars, ...allowlist(pathValue, passed), ...afterAllow, 'rc=0', `${chain} || rc=$?`, ...postCheck, 'exit "$rc"',
   ]);
   // a tool that runs the repo's own code is marked, so the referee can apply its order rule (S6 c); the id is not `pipegen-…`, which a job's dedupe may drop
-  const runId = pol.runsRepoCode === true || pol.loadsRepoConfig === true ? `repocode-${sha16(artifact)}` : checker ? `checker-run-${sha16(artifact)}` : undefined;
+  // (a tool of an app-running category is marked too, whatever its policy says: fail closed)
+  const appRunning = tool.categories.some((c) => APP_RUNNING_CATEGORIES.has(c));
+  const runId = pol.runsRepoCode === true || pol.loadsRepoConfig === true || appRunning ? `repocode-${sha16(artifact)}` : checker ? `checker-run-${sha16(artifact)}` : `tool-run-${sha16(artifact)}`;
   steps.push(runStep(`pipegen: run ${exe}`, run, env, runId));
   return { steps, output: out === null ? null : { path: `\${{ runner.temp }}/pipegen-out/${artifact}/${out}`, format: tool.step.output.format } };
 }
@@ -476,7 +485,7 @@ function releaseInstall(tool: ReviewedTool, install: InstallSpec, exe: string, a
     `if [ ! -f "$bin/${exe}" ] || [ -L "$bin/${exe}" ]; then pg_fail "the tool is not a regular file"; fi`,
     `chmod 0755 "$bin/${exe}"`,
   ];
-  return runStep(`pipegen: install ${exe}`, script(lines), { PIPEGEN_DL_URL: url, PIPEGEN_DL_SHA256: hash });
+  return runStep(`pipegen: install ${exe}`, script(lines), { PIPEGEN_DL_URL: url, PIPEGEN_DL_SHA256: hash }, `tool-install-${sha16(artifact)}`);
 }
 
 // ---------- docker (ruling S26) ----------
@@ -567,8 +576,11 @@ function npmPins(tool: ReviewedTool, install: InstallSpec): (NpmPin & { resolved
   });
 }
 
-/** Install a checker from pipegen's closure lock (nothing from the repo). The run step verifies the result and starts the tool in one go. */
-function checkerInstall(tool: ReviewedTool, pins: readonly (NpmPin & { resolved: string })[], artifact: string, nodeMajor: string, options: RenderOptions): RenderedStep {
+/**
+ * The lines that install a checker from pipegen's closure lock (nothing from the repo), and the step env they need. They
+ * run at the top of the SAME step that verifies and starts the tool, so nothing can run between install and use.
+ */
+function checkerInstall(tool: ReviewedTool, pins: readonly (NpmPin & { resolved: string })[], options: RenderOptions): { lines: string[]; env: Record<string, string> } {
   let lock: string;
   try {
     const reader = options.npmClosures === undefined ? undefined : (id: string): string => {
@@ -583,10 +595,7 @@ function checkerInstall(tool: ReviewedTool, pins: readonly (NpmPin & { resolved:
   const compact = JSON.stringify(JSON.parse(lock));
   if (compact.length > MAX_LOCK_BYTES) return refuse(`The npm closure lock of ${show(tool.id)} is too large to carry in a workflow.`);
   const pkg = JSON.stringify({ name: 'pipegen-closure', version: '0.0.0', private: true, dependencies: closureRootDependencies(lock) });
-  const exe = tool.step.cli?.command[0] ?? 'tool';
-  const run = script([
-    ...prologue(artifact, { nodeMajor }),
-    `npmdir="$RUNNER_TEMP/pipegen-npm/${artifact}"`,
+  const lines = [
     'mkdir -p "$RUNNER_TEMP/pipegen-npm"',
     'mkdir "$npmdir"',
     'printf \'%s\' "$PIPEGEN_NPM_LOCK" > "$npmdir/package-lock.json"',
@@ -595,11 +604,9 @@ function checkerInstall(tool: ReviewedTool, pins: readonly (NpmPin & { resolved:
     ': > "$npmdir/user.npmrc"',
     ': > "$npmdir/global.npmrc"',
     ...allowlist(`$nodebin:${FIXED_PATH}`, []),
-    'cd -- "$npmdir"',
-    `"\${pg_env[@]}" "$nodebin/npm" ci --ignore-scripts --no-audit --no-fund --userconfig "$npmdir/user.npmrc" --globalconfig "$npmdir/global.npmrc" --workspaces=false --registry=${REGISTRY_URL}`,
-  ]);
-  // the check of what npm installed is in the run step (no gap between check and use)
-  return runStep(`pipegen: install ${exe} from pipegen's own lock`, run, { PIPEGEN_NPM_LOCK: compact, PIPEGEN_NPM_PACKAGE: pkg }, `checker-install-${sha16(artifact)}`);
+    `( cd -- "$npmdir" && "\${pg_env[@]}" "$nodebin/npm" ci --ignore-scripts --no-audit --no-fund --userconfig "$npmdir/user.npmrc" --globalconfig "$npmdir/global.npmrc" --workspaces=false --registry=${REGISTRY_URL} )`,
+  ];
+  return { lines, env: { PIPEGEN_NPM_LOCK: compact, PIPEGEN_NPM_PACKAGE: pkg } };
 }
 
 /** For a tool that runs repo code: the guarded `npm ci` of the repo (ids deduped per job and folder) and the verification step that needs its marker. */
@@ -671,6 +678,6 @@ function pipSteps(tool: ReviewedTool, install: InstallSpec, artifact: string, ho
     'cd "$RUNNER_TEMP"',
     '"${pg_env[@]}" "$py" -I -m venv "$venv"',
     `"\${pg_env[@]}" "$venv/bin/python" -I -m pip install --isolated --no-input --only-binary=:all: --require-hashes --no-deps --no-cache-dir --disable-pip-version-check -r "${req}"`,
-  ]), { PIPEGEN_REQUIREMENTS: closure });
+  ]), { PIPEGEN_REQUIREMENTS: closure }, `tool-install-${sha16(artifact)}`);
   return [{ ...hooks.setupPython(), id: 'pipegen-setup-python' }, installStep];
 }

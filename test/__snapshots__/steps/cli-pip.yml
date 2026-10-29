@@ -3,7 +3,8 @@
   uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
   with:
     python-version: "3.11"
-- name: "pipegen: install mypy (pip, hashes required)"
+- id: tool-install-ed4f8358c8fde1c3
+  name: "pipegen: install mypy (pip, hashes required)"
   run: |-
     set -euo pipefail
     unset CDPATH
@@ -39,7 +40,8 @@
     PIPEGEN_REQUIREMENTS: "mypy==2.4.0 --hash=sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 
       typing-extensions==4.12.2 --hash=sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n"
-- name: "pipegen: run mypy"
+- id: tool-run-ed4f8358c8fde1c3
+  name: "pipegen: run mypy"
   run: |-
     set -euo pipefail
     unset CDPATH

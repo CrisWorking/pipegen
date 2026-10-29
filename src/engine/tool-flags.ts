@@ -293,8 +293,12 @@ export function runsRepoCode(entryId: string): boolean {
 
 /** The id of the run step of an entry that runs repo code: `repocode-` plus a hash of its artifact name (not `pipegen-…`, so a job's dedupe never drops it). */
 export const REPO_CODE_STEP_ID_RE = /^repocode-[0-9a-f]{16}$/;
-/** The ids of a checker's install step and of its verify-and-run step (a checker only reads code, and is installed from pipegen's own lock). */
-export const CHECKER_STEP_ID_RE = /^checker-(?:install|run)-[0-9a-f]{16}$/;
+/** The id of a checker's step: install from pipegen's own lock, check and run in ONE step (a checker only reads code). */
+export const CHECKER_STEP_ID_RE = /^checker-run-[0-9a-f]{16}$/;
+/** The ids of a release/docker/pip tool's install (or image pull) step and of its run step: tools that only read code, installed from a pinned hash or digest. */
+export const TOOL_STEP_ID_RE = /^tool-(?:install|pull|run)-[0-9a-f]{16}$/;
+/** The ids of the Node and Python setup steps that the CLI renderer adds (a pinned platform action). */
+export const SETUP_STEP_ID_RE = /^pipegen-setup-(?:node-\d{1,3}|python)$/;
 /** The id of a scrub step (Plan C's gate action) in a job: the order rule treats it like an upload. */
 export const SCRUB_STEP_ID_RE = /^scrub-[0-9a-f]{16}$/;
 

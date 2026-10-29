@@ -4,8 +4,8 @@
   with:
     package-manager-cache: "false"
     node-version: "24"
-- id: checker-install-c283698d8c9e3537
-  name: "pipegen: install prettier from pipegen's own lock"
+- id: repocode-c283698d8c9e3537
+  name: "pipegen: run prettier"
   run: |-
     set -euo pipefail
     unset CDPATH
@@ -37,33 +37,7 @@
       "RUNNER_TEMP=$RUNNER_TEMP"
       "TMPDIR=$RUNNER_TEMP"
     )
-    cd -- "$npmdir"
-    "${pg_env[@]}" "$nodebin/npm" ci --ignore-scripts --no-audit --no-fund --userconfig "$npmdir/user.npmrc" --globalconfig "$npmdir/global.npmrc" --workspaces=false --registry=https://registry.npmjs.org/
-  shell: bash
-  env:
-    BASH_ENV: ""
-    ENV: ""
-    PIPEGEN_NPM_LOCK: "{\"name\":\"pipegen-closure\",\"version\":\"0.0.0\",\"lockfileVersion\":3,\"requires\":true,\"packages\":{\"\":{\"name\":\"pipegen-closure\",\"version\":\"0.0.0\",\"dependencies\":{\"prettier\":\"3.9.10\"}},\"node_modules/prettier\":{\"version\":\"3.9.10\",\"resolved\":\"https://registry.npmjs.org/prettier/-/prettier-3.9.10.tgz\",\"integrity\":\"sha512-skGHTH1Yb9QvaTC4hWnRTzEYtCpApF0UMBPz+t/0ZPzP8ihefo/btKd+QA7pUE0fEwA1SbS/NmhyEcstdXOIdA==\",\"license\":\"MIT\",\"bin\":{\"prettier\":\"bin/prettier.cjs\"},\"engines\":{\"node\":\">=14\"},\"funding\":{\"url\":\"https://github.com/prettier/prettier?sponsor=1\"}}}}"
-    PIPEGEN_NPM_PACKAGE: "{\"name\":\"pipegen-closure\",\"version\":\"0.0.0\",\"private\":true,\"dependencies\":{\"prettier\":\"3.9.10\"}}"
-- id: repocode-c283698d8c9e3537
-  name: "pipegen: run prettier"
-  run: |-
-    set -euo pipefail
-    unset CDPATH
-    pg_fail() { echo "pipegen: $1" >&2; exit 1; }
-    node="$(command -v node || true)"
-    [ -n "$node" ] || pg_fail "node was not found; the Node setup step must run first"
-    nodebin="${node%/*}"
-    PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-    home="$RUNNER_TEMP/pipegen-home/pipegen-out-format--web"
-    mkdir -p "$RUNNER_TEMP/pipegen-home" "$home"
-    sys=(
-      /usr/bin/env -i
-      "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
-      "HOME=$home"
-    )
-    case "$("${sys[@]}" "$node" --version)" in v24.*) ;; *) pg_fail "the node on PATH is not version 24, which the Node setup step installed" ;; esac
-    npmdir="$RUNNER_TEMP/pipegen-npm/pipegen-out-format--web"
+    ( cd -- "$npmdir" && "${pg_env[@]}" "$nodebin/npm" ci --ignore-scripts --no-audit --no-fund --userconfig "$npmdir/user.npmrc" --globalconfig "$npmdir/global.npmrc" --workspaces=false --registry=https://registry.npmjs.org/ )
     for d in apps apps/web; do
       if [ -L "$d" ] || [ ! -d "$d" ]; then pg_fail "the folder $d is not a real folder inside the repository"; fi
     done
@@ -109,4 +83,6 @@
   env:
     BASH_ENV: ""
     ENV: ""
+    PIPEGEN_NPM_LOCK: "{\"name\":\"pipegen-closure\",\"version\":\"0.0.0\",\"lockfileVersion\":3,\"requires\":true,\"packages\":{\"\":{\"name\":\"pipegen-closure\",\"version\":\"0.0.0\",\"dependencies\":{\"prettier\":\"3.9.10\"}},\"node_modules/prettier\":{\"version\":\"3.9.10\",\"resolved\":\"https://registry.npmjs.org/prettier/-/prettier-3.9.10.tgz\",\"integrity\":\"sha512-skGHTH1Yb9QvaTC4hWnRTzEYtCpApF0UMBPz+t/0ZPzP8ihefo/btKd+QA7pUE0fEwA1SbS/NmhyEcstdXOIdA==\",\"license\":\"MIT\",\"bin\":{\"prettier\":\"bin/prettier.cjs\"},\"engines\":{\"node\":\">=14\"},\"funding\":{\"url\":\"https://github.com/prettier/prettier?sponsor=1\"}}}}"
+    PIPEGEN_NPM_PACKAGE: "{\"name\":\"pipegen-closure\",\"version\":\"0.0.0\",\"private\":true,\"dependencies\":{\"prettier\":\"3.9.10\"}}"
     PIPEGEN_NPM_EXPECT: "[{\"name\":\"prettier\",\"version\":\"3.9.10\",\"integrity\":\"sha512-skGHTH1Yb9QvaTC4hWnRTzEYtCpApF0UMBPz+t/0ZPzP8ihefo/btKd+QA7pUE0fEwA1SbS/NmhyEcstdXOIdA==\",\"resolved\":\"https://registry.npmjs.org/prettier/-/prettier-3.9.10.tgz\"}]"

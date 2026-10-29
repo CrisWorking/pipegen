@@ -96,8 +96,8 @@ describe('R-A: npm checkers install from pipegen\'s closure lock (DECISIONS #107
   const c = ctxFor([service({ name: 'app', path: '.', runtimeVersion: '>=18 <21' })]);
   const r = render('eslint', { service: 'app' }, c);
 
-  it('layout: setup-node, one install from the closure into a fresh folder, then the run; no npx anywhere, nothing read from the repo\'s lockfile or .npmrc', () => {
-    expect(r.steps).toHaveLength(3);
+  it('layout: setup-node, then ONE step that installs from the closure into a fresh folder, checks it and runs; no npx anywhere, nothing read from the repo\'s lockfile or .npmrc', () => {
+    expect(r.steps).toHaveLength(2);
     expect(r.steps[0]?.uses).toMatch(/^actions\/setup-node@/);
     expect(r.steps[0]?.with).toMatchObject({ 'node-version': '22' });
     const all = r.steps.map((s) => s.run ?? '').join('\n');
@@ -122,7 +122,7 @@ describe('R-A: npm checkers install from pipegen\'s closure lock (DECISIONS #107
     expect(run).toContain('/usr/bin/env -i');
     expect(run).not.toContain('npx');
     expect(lastRun(r).id).toMatch(/^checker-run-[0-9a-f]{16}$/);
-    expect(r.steps[1]?.id).toMatch(/^checker-install-[0-9a-f]{16}$/);
+    expect(r.steps[1]).toBe(lastRun(r));
   });
 
   it('every checker uses its own reviewed bin; the configs that import a plugin are written into the isolated folder (eslint-typescript now renders)', () => {
@@ -161,7 +161,6 @@ describe('R-A: npm checkers install from pipegen\'s closure lock (DECISIONS #107
   });
 
   it2('verify and run are one step: a tool that is a symlink or at another version fails it before the tool starts; a failing npm fails the install', () => {
-    const install = r.steps[1] as RenderedStep;
     const run = lastRun(r);
     const target = expectedPins(entry('eslint'))[0]?.name as string;
     for (const mode of ['symlink', 'wrong-version', 'fail']) {
@@ -169,29 +168,23 @@ describe('R-A: npm checkers install from pipegen\'s closure lock (DECISIONS #107
       const bin = fakeNodeDir(sb, 22);
       writeFileSync(join(sb.rt, 'fake-mode'), mode);
       writeFileSync(join(sb.rt, 'fake-target'), target);
-      const inst = exec(install, sb, withNode(stepEnv(install, sb), bin));
-      if (mode === 'fail') { expect(inst.status, mode).not.toBe(0); continue; }
-      expect(inst.status, mode).toBe(0);
       expect(exec(run, sb, withNode(stepEnv(run, sb), bin)).status, mode).not.toBe(0);
       expect(existsSync(join(sb.rt, 'tool-ran')), `${mode}: the tool must not have started`).toBe(false);
     }
     const ok = sandbox();
     const bin = fakeNodeDir(ok, 22);
-    expect(exec(install, ok, withNode(stepEnv(install, ok), bin)).status).toBe(0);
     const res = exec(run, ok, withNode(stepEnv(run, ok), bin));
     expect(res.status, res.stderr).toBe(0);
     expect(existsSync(join(ok.rt, 'tool-ran'))).toBe(true);
   });
 
   it2('after the check the install tree is made read-only (no write bits), and the config was written before that', () => {
-    const install = r.steps[1] as RenderedStep;
     const run = lastRun(r);
     expect(run.run).toContain('chmod -R a-w "$npmdir"');
     expect((run.run as string).indexOf('eslint.config.mjs')).toBeLessThan((run.run as string).indexOf('chmod -R a-w'));
     expect((run.run as string).indexOf('-e "$js"')).toBeLessThan((run.run as string).indexOf('chmod -R a-w'));
     const sb = sandbox();
     const bin = fakeNodeDir(sb, 22);
-    expect(exec(install, sb, withNode(stepEnv(install, sb), bin)).status).toBe(0);
     expect(exec(run, sb, withNode(stepEnv(run, sb), bin)).status).toBe(0);
     const dir = join(sb.rt, 'pipegen-npm', 'pipegen-out-lint--app');
     for (const f of [join(dir, 'node_modules', 'eslint', 'package.json'), join(dir, 'node_modules', 'eslint', 'bin', 'eslint.js'), join(dir, 'eslint.config.mjs')]) {
@@ -201,7 +194,7 @@ describe('R-A: npm checkers install from pipegen\'s closure lock (DECISIONS #107
   });
 
   it2('node: a node of another major than setup-node was asked for (a poisoned PATH) fails every node step', () => {
-    for (const step of [r.steps[1] as RenderedStep, lastRun(r)]) {
+    for (const step of [lastRun(r)]) {
       const sb = sandbox();
       const bin = fakeNodeDir(sb, 20);
       const res = exec(step, sb, withNode(stepEnv(step, sb), bin));
@@ -506,7 +499,7 @@ describe('round 2: oxlint finds the closure\'s tsgolint, never the repo\'s (ruli
     const r = render('oxlint-typeaware');
     const sb = sandbox();
     const bin = fakeNodeDir(sb, 24);
-    for (const step of [r.steps[1] as RenderedStep, lastRun(r)]) {
+    for (const step of [lastRun(r)]) {
       const res = exec(step, sb, withNode(stepEnv(step, sb), bin));
       expect(res.status, res.stderr).toBe(0);
     }
