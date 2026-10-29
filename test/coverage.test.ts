@@ -2741,7 +2741,8 @@ describe('coverage: stacks pipegen does not support yet (DoD cobra)', () => {
     wf(dir, 'ci.yml', `on: [push, pull_request]\n${job('      - run: cargo test\n')}`);
     const rows = await coverage(dir, { services: [svc('.', { language: 'other', packageManager: undefined, scripts: [] })] });
     expect(row(rows, 'merge', 'unit-tests')).toMatchObject({ status: 'unknown' });
-    expect(row(rows, 'merge', 'unit-tests').why).toMatch(/^pipegen doesn't support this language yet/);
+    // P50 (M7): `other` may be a config-only image (nginx): the why doesn't claim a language
+    expect(row(rows, 'merge', 'unit-tests').why).toMatch(/^pipegen can't tell this service's language, or doesn't support it yet/);
     // Node keeps "missing"
     const node = await coverage(makeTempDir());
     expect(row(node, 'merge', 'unit-tests').status).toBe('missing');

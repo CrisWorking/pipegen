@@ -753,8 +753,15 @@ function deepClean(v: unknown, key: string, depth: number, own: boolean, clean: 
  */
 export function renderJson(r: AuditReport, opts: RenderOptions): string {
   // DoD run 2026-10-29: facts GitHub's rate limit kept pipegen from reading are null, never the model's placeholders
-  const profile = r.githubIncomplete?.unread.includes('repo') === true ? { ...r.profile, private: null, ownerType: null, plan: null, defaultBranch: null } : r.profile;
-  const slim = { ...r, profile, wouldAdd: r.wouldAdd.map((w) => ({ ...w, tool: slimTool(w.tool), also: w.also.map(slimTool) })), cantSee: CANT_SEE };
+  const unread = r.githubIncomplete?.unread ?? [];
+  const profile = unread.includes('repo') ? { ...r.profile, private: null, ownerType: null, plan: null, defaultBranch: null } : r.profile;
+  // P50 (M5): an unread capability is null, never the model's placeholder
+  const capabilities: Record<string, boolean | null> = { ...r.capabilities };
+  for (const k of Object.keys(capabilities) as (keyof AuditReport['capabilities'])[]) {
+    const fact = k === 'deploymentBranchPolicies' ? 'deployment-branch-policies' : CAPABILITY_FACT[k];
+    if (unread.includes('repo') || (fact !== undefined && unread.includes(fact))) capabilities[k] = null;
+  }
+  const slim = { ...r, profile, capabilities, wouldAdd: r.wouldAdd.map((w) => ({ ...w, tool: slimTool(w.tool), also: w.also.map(slimTool) })), cantSee: CANT_SEE };
   return JSON.stringify(deepClean(slim, '', 0, false, makeSafeOutput(opts.knownValues, opts.found), new Set()), null, 2);
 }
 

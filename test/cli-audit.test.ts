@@ -1118,6 +1118,8 @@ describe('GitHub rate limit (DoD)', () => {
     expect(j.githubIncomplete?.unread).toEqual(expect.arrayContaining(['repo', 'branch-protection', 'environments', 'code-scanning', 'activity']));
     expect(j.profile.private).toBeNull();
     expect(j.profile.defaultBranch).toBeNull();
+    // P50 (M5): unread capabilities are null too, never the placeholders
+    expect(Object.values((j as unknown as { capabilities: Record<string, unknown> }).capabilities).every((v) => v === null)).toBe(true);
     // depends on the default branch: unknown, saying why; on every push (any branch) it is a real partial
     expect(cov(j, 'merge', 'unit-tests')).toMatchObject({ status: 'unknown' });
     expect(cov(j, 'merge', 'unit-tests')?.why).toMatch(/GitHub's rate limit/);
@@ -1147,6 +1149,7 @@ describe('GitHub rate limit (DoD)', () => {
       expect(j.githubIncomplete?.unread).not.toContain('repo');
       expect(j.githubIncomplete?.unread).not.toContain('branch-protection');
       expect(j.profile).toMatchObject({ private: false, defaultBranch: 'main' });
+      expect((j as unknown as { capabilities: Record<string, unknown> }).capabilities).toMatchObject({ branchProtection: true, environments: null, envRequiredReviewers: null, codeScanning: null });
       expect(cov(j, 'merge', 'unit-tests')?.status).toBe('covered'); // the default branch was read: a real answer
       // no request after the stop
       const asked = r.calls.filter((c) => c.url.origin === API).map((c) => c.url.pathname);

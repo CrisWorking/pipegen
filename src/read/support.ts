@@ -16,8 +16,9 @@ export const SUPPORTED_STACKS: readonly Language[] = ['node', 'python'];
  * only Python is planned (v0.4, Plan W); other languages are never promised one (see supportLevel).
  */
 export function unsupportedStackWhy(language: Language): string {
-  const name = language === 'other' ? 'this language' : LANGUAGE_NAMES[language];
-  return `pipegen doesn't support ${name} yet, so it can't tell whether this check runs here; it isn't counted as missing.`;
+  // P50 (M7): `other` can be a config-only image (an nginx Dockerfile), so it doesn't claim a language
+  const what = language === 'other' ? "pipegen can't tell this service's language, or doesn't support it yet" : `pipegen doesn't support ${LANGUAGE_NAMES[language]} yet`;
+  return `${what}, so it can't tell whether this check runs here; it isn't counted as missing.`;
 }
 
 /**

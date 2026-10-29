@@ -103,7 +103,9 @@ Exit codes of `pipegen audit`:
   facts. Every check that needs them shows as unknown ("couldn't check"), never as covered or missing; the warning at
   the top says when the limit resets. In `--json`, `githubIncomplete` lists what wasn't read (`unread`), the reset time
   (`resetsAt`) and how many rows it left unknown (`rows`); it is `null` on a complete run. Without a token GitHub allows
-  60 requests an hour; a read-only fine-grained token with the permissions above allows 5,000.
+  60 requests an hour; a read-only fine-grained token with the permissions above allows 5,000. One case still exits `1`
+  without a report: the limit hit while pipegen checks a GitHub App login set in `GITHUB_TOKEN` (pipegen can't confirm
+  which repos that login reaches without GitHub).
 
 `audit --ai` needs Linux or macOS for now (WSL works): it checks your code for secrets with a pinned betterleaks binary
 before anything is sent (or gitleaks, the fallback, when `PIPEGEN_SECRET_SCANNER` is set to `gitleaks`), and those
