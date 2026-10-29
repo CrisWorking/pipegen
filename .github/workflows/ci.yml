@@ -7,11 +7,16 @@ on:
     # labeled, unlabeled and edited re-run the `cooldown` job when the security-fix label or the PR body changes
     # (docs/cooldown.md). The other jobs re-run too: skipping them would report a required check as passed.
     types: [opened, synchronize, reopened, labeled, unlabeled, edited]
+  # P46: weekly, only the `pins-upstream` job runs (every other job skips a scheduled run): upstream drift under pins
+  # nobody changed is seen even when nobody pushes.
+  schedule:
+    - cron: '17 5 * * 1'
 
 permissions: {}
 
 jobs:
   test:
+    if: github.event_name != 'schedule'
     name: test (node ${{ matrix.node }})
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -61,6 +66,7 @@ jobs:
       - run: npx tsc --noEmit
 
   no-runtime-deps:
+    if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     concurrency:
@@ -90,6 +96,7 @@ jobs:
           '
 
   notices-fresh:
+    if: github.event_name != 'schedule'
     # THIRD_PARTY_NOTICES is generated from the bundle's metafile (ruling B4); fail when the committed file is stale.
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -112,6 +119,7 @@ jobs:
         run: git diff --exit-code -- THIRD_PARTY_NOTICES
 
   workflow-lint:
+    if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     concurrency:
@@ -152,7 +160,8 @@ jobs:
   pins-upstream:
     # m5: every pin in data/ tied again to upstream by scripts/cooldown.ts's code (test/pins-upstream-live.test.ts), so a
     # moved tag or a re-uploaded asset under a pin nobody changed is seen. Runs on pull requests that change data/ and on
-    # every push to main; on other pull requests the job passes without running it (it can still be a required check).
+    # every push to main, and weekly (schedule); on other pull requests the job passes without running it (it can still be
+    # a required check).
     runs-on: ubuntu-latest
     timeout-minutes: 15
     concurrency:

@@ -24,7 +24,8 @@ other code, a release asset uploaded again with other bytes, a Docker tag pointi
 `pins-upstream` job in `.github/workflows/ci.yml` runs `test/pins-upstream-live.test.ts`, which ties **every** pin of
 `data/reviewed-tools.yml` and `data/pinned-binaries.yml` to upstream again with this same script's code (as if all were
 new). It fails on any pin that no longer ties. Age is left to the check above. It runs on pull requests that change
-`data/` and on every push to `main`. On other pull requests the job passes without running.
+`data/`, on every push to `main` and once a week (a schedule, so drift is seen even when nobody pushes). On
+other pull requests the job passes without running.
 
 ## It fails closed
 
