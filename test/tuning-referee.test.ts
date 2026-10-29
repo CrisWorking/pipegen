@@ -103,7 +103,7 @@ describe('referee: tampering with one tuned value in the file is a template issu
     expect(has(r, 'template'), show(r)).toBe(true);
   });
   it('the semgrep scope block removed (the repo\'s .semgrepignore and semgrep\'s defaults would decide the scope again)', async () => {
-    const r = await tamper(0, /# pipegen scope: begin\n\s*[^\n]*\n\s*[^\n]*\n\s*# pipegen scope: end\n\s*/, '');
+    const r = await tamper(0, /# pipegen scope: begin\n(?:\s*[^\n]*\n)+?\s*# pipegen scope: end\n\s*/, '');
     expect(has(r, 'template'), show(r)).toBe(true);
   });
   it('an oxlint skip value changed in the env (not the comment)', async () => {

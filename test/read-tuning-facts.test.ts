@@ -88,4 +88,27 @@ describe('read: RepoProfile.otherHookManagers (6d fix round 1)', () => {
     expect(await managers({ '.githooks/pre-commit': '#!/bin/sh\n' })).toEqual(['githooks']);
     expect(await managers({}, '[core]\n\thooksPath = .githooks\n')).toEqual(['githooks']);
   });
+  it('husky v4 (a husky key or a .huskyrc / husky.config file), yorkie (gitHooks), the npm pre-commit package (a key or a dependency), overcommit', async () => {
+    expect(await managers({ 'package.json': '{"name":"x","husky":{"hooks":{"pre-commit":"npm test"}}}' })).toEqual(['husky-v4']);
+    expect(await managers({ '.huskyrc': '{}' })).toEqual(['husky-v4']);
+    expect(await managers({ '.huskyrc.json': '{}' })).toEqual(['husky-v4']);
+    expect(await managers({ 'husky.config.js': 'module.exports={}' })).toEqual(['husky-v4']);
+    expect(await managers({ 'package.json': '{"name":"x","gitHooks":{"pre-commit":"lint-staged"}}' })).toEqual(['yorkie']);
+    expect(await managers({ 'package.json': '{"name":"x","pre-commit":["lint"]}' })).toEqual(['pre-commit-npm']);
+    expect(await managers({ 'package.json': '{"name":"x","devDependencies":{"pre-commit":"^1.2.2"}}' })).toEqual(['pre-commit-npm']);
+    expect(await managers({ 'package.json': '{"name":"x","dependencies":{"pre-commit":"^1.2.2"}}' })).toEqual(['pre-commit-npm']);
+    expect(await managers({ '.overcommit.yml': 'PreCommit: {}\n' })).toEqual(['overcommit']);
+    // a package that merely mentions the words is not a manager
+    expect(await managers({ 'package.json': '{"name":"x","devDependencies":{"husky":"^9.0.0","precommit-hook-x":"1"}}' })).toBeUndefined();
+  });
+
+  it('a symlink at any hook-manager config name counts as a hook manager (never followed; even a dangling one)', async () => {
+    for (const name of ['lefthook.yml', '.lefthook.toml', '.config/lefthook.json', 'lefthook-local.yml', '.pre-commit-config.yaml', '.husky', '.simple-git-hooks.json', '.overcommit.yml', '.huskyrc']) {
+      const dir = makeRepo('node-npm', GH);
+      const outside = join(makeRepo('node-npm', GH), 'target');
+      mkdirSync(join(dir, name, '..'), { recursive: true });
+      symlinkSync(outside, join(dir, name));
+      expect((await readProject(dir)).otherHookManagers, name).toContain('linked-config');
+    }
+  });
 });

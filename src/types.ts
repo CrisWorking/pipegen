@@ -52,6 +52,7 @@ export interface ExistingWorkflow {
   publishes?: ('npm' | 'pypi')[];   // Plan U Task 5: registries a step publishes to (a run line that starts with a publish command, or the PyPI publish action). Absent = none
 }
 export type Plan = 'free' | 'pro' | 'team' | 'enterprise' | 'unknown';
+export type OtherHookManager = 'simple-git-hooks' | 'githooks' | 'husky-v4' | 'yorkie' | 'pre-commit-npm' | 'overcommit' | 'linked-config';
 export interface RepoProfile {
   owner: string; repo: string; defaultBranch: string; private: boolean;
   ownerType: 'User' | 'Organization'; plan: Plan;
@@ -60,8 +61,8 @@ export interface RepoProfile {
   repoFiles: RepoFiles;   // Plan P Task 1: repo-level config files, read once
   /** Plan B 6d (DECISIONS #108): folders pipegen itself detected as vendored or generated (node_modules, vendor, dist, target, .next, .venv, or a folder named generated or __generated__), repo-relative and plain, sorted. Never a service folder, and never a folder that holds one. Per-repo tuning may skip them for lint and SAST only. Absent when none */
   generatedDirs?: string[];
-  /** Plan B 6d fix round 1: hook managers other than the three `precommit` names (simple-git-hooks: a config file or a package.json key; githooks: a .githooks folder or core.hooksPath in .git/config). Per-repo tuning offers generated lefthook hooks only when `precommit` is null and this is absent. Absent when none */
-  otherHookManagers?: ('simple-git-hooks' | 'githooks')[];
+  /** Plan B 6d fix rounds 1 and 2: hook managers other than the three `precommit` names (simple-git-hooks: a config file or a package.json key; githooks: a .githooks folder or core.hooksPath in .git/config; husky-v4: a `husky` key or a .huskyrc/husky.config file; yorkie: a `gitHooks` key; pre-commit-npm: the npm `pre-commit` package as a key or a dependency; overcommit: .overcommit.yml; linked-config: a symbolic link at the name of any hook manager's config, never followed). Per-repo tuning offers generated lefthook hooks only when `precommit` is null and this is absent. Absent when none */
+  otherHookManagers?: OtherHookManager[];
 }
 // ---------- GitHub access (moved here from Plan A Task 6 in round 4: Plan U uses it too) ----------
 export interface Auth {

@@ -3,7 +3,7 @@
 // build/, vendor/ and dist/ at any depth. A file at the scan root REPLACES the defaults (measured on semgrep 1.181.0), so the
 // step deletes every repo `.semgrepignore` and writes its own, which holds only node_modules.
 import { spawnSync } from 'node:child_process';
-import { existsSync, lstatSync, mkdirSync, readFileSync, symlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, symlinkSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { renderStep, type RenderedStep } from '../src/engine/render-step.js';
@@ -28,7 +28,7 @@ const blockOf = (run: string): string[] => {
   const b = lines.indexOf(END);
   return a < 0 || b < a ? [] : lines.slice(a, b + 1);
 };
-const SYS = 'sys=(/usr/bin/env -i "PATH=/usr/local/bin:/usr/bin:/bin")';
+const SYS = 'sys=(/usr/bin/env -i "PATH=/usr/local/bin:/usr/bin:/bin")\npg_fail() { echo "pipegen: $1" >&2; exit 1; }';
 
 describe('semgrep scope (ruling 6)', () => {
   it('only the semgrep policy has a scope ignore, and it holds exactly node_modules', () => {
@@ -89,5 +89,22 @@ describe('semgrep scope (ruling 6)', () => {
   it('the block is valid shell inside the whole script', () => {
     const r = spawnSync('bash', ['-n'], { input: stepOf('semgrep').run, encoding: 'utf8' });
     expect(r.status, r.stderr).toBe(0);
+  });
+
+  it('really run: a folder called .semgrepignore at the scan root fails the step with a pipegen message, not a bash error; nothing is written in it', () => {
+    const block = blockOf(stepOf('semgrep').run as string).join('\n');
+    const sb = sandbox();
+    mkdirSync(join(sb.ws, '.semgrepignore'));
+    writeFileSync(join(sb.ws, '.semgrepignore', 'keep.txt'), 'KEEP\n');
+    const r = spawnSync('bash', ['--noprofile', '--norc', '-e', '-o', 'pipefail', '-c', `${SYS}\n${block}`], { cwd: sb.ws, encoding: 'utf8' });
+    expect(r.status).toBe(1);
+    expect(r.stderr).toMatch(/^pipegen: the repository has a folder named \.semgrepignore at the scan root/);
+    expect(r.stderr).not.toMatch(/Is a directory|line \d+/);
+    expect(readdirSync(join(sb.ws, '.semgrepignore'))).toEqual(['keep.txt']);
+    // a nested folder of that name is not at the scan root and is simply left alone
+    const sb2 = sandbox();
+    mkdirSync(join(sb2.ws, 'a/.semgrepignore'), { recursive: true });
+    const r2 = spawnSync('bash', ['--noprofile', '--norc', '-e', '-o', 'pipefail', '-c', `${SYS}\n${block}`], { cwd: sb2.ws, encoding: 'utf8' });
+    expect(r2.status, r2.stderr).toBe(0);
   });
 });

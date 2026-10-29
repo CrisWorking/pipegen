@@ -2,7 +2,7 @@ import { lstat } from 'node:fs/promises';
 import { basename, join as joinOs } from 'node:path';
 import picomatch from 'picomatch';
 import { parse as parseToml } from 'smol-toml';
-import type { Language, Monorepo, PackageManager, RepoProfile, Service } from '../types.js';
+import type { Language, Monorepo, OtherHookManager, PackageManager, RepoProfile, Service } from '../types.js';
 import { PATH_SHOWN_MAX, safeText } from '../util/safe-text.js';
 import { CODE_FILE_RE, REQUIREMENTS_FILE_RE, asObj, asString, asStrings, baseOf, dirOf, inDir, isTestFile, pythonNames, readPyproject, requirementLines, type Obj } from './manifest.js';
 import { readEnv } from './env.js';
@@ -26,23 +26,42 @@ const TOP_GENERATED = ['node_modules', 'vendor', 'dist', 'target', '.next', '.ve
 const GENERATED_NAMES = new Set(['generated', '__generated__']);
 const MAX_GENERATED_DIRS = 64;
 
-/** Hook managers beyond pre-commit, husky and lefthook (6d fix round 1): the repo already has hooks, so pipegen builds none. */
-async function readOtherHookManagers(root: string, rootPkg: unknown): Promise<('simple-git-hooks' | 'githooks')[]> {
-  const out: ('simple-git-hooks' | 'githooks')[] = [];
-  const real = async (rel: string, dirNotFile = false): Promise<boolean> => {
+/** Every config name of the hook managers pipegen knows. A symbolic link at one counts as "this repo has hooks" (fail toward not offering). */
+const HOOK_CONFIG_NAMES: readonly string[] = [
+  '.pre-commit-config.yaml', '.husky', '.githooks', '.overcommit.yml', '.huskyrc', '.huskyrc.json', '.huskyrc.js', '.huskyrc.cjs', '.huskyrc.yaml', '.huskyrc.yml', 'husky.config.js', 'husky.config.cjs',
+  '.simple-git-hooks.json', '.simple-git-hooks.js', '.simple-git-hooks.cjs', '.simple-git-hooks.mjs', 'simple-git-hooks.js', 'simple-git-hooks.cjs', 'simple-git-hooks.mjs', 'simple-git-hooks.json',
+  ...['', '.config/'].flatMap((d) => ['', '.'].flatMap((dot) => ['lefthook', 'lefthook-local'].flatMap((b) => ['yml', 'yaml', 'toml', 'json', 'jsonc'].map((e) => `${d}${d === '' ? dot : ''}${b}.${e}`)))),
+];
+
+/** Hook managers beyond pre-commit, husky 9 and lefthook (6d fix rounds 1 and 2): the repo already has hooks, so pipegen builds none. */
+async function readOtherHookManagers(root: string, rootPkg: unknown): Promise<OtherHookManager[]> {
+  const out = new Set<OtherHookManager>();
+  const kind = async (rel: string): Promise<'file' | 'dir' | 'link' | null> => {
     const info = await lstat(joinOs(root, rel)).catch(() => null);
-    return info !== null && !info.isSymbolicLink() && (dirNotFile ? info.isDirectory() : info.isFile());
+    return info === null ? null : info.isSymbolicLink() ? 'link' : info.isDirectory() ? 'dir' : info.isFile() ? 'file' : null;
   };
-  let simple = typeof rootPkg === 'object' && rootPkg !== null && Object.hasOwn(rootPkg, 'simple-git-hooks');
-  for (const n of ['.simple-git-hooks.json', '.simple-git-hooks.js', '.simple-git-hooks.cjs', '.simple-git-hooks.mjs', 'simple-git-hooks.js', 'simple-git-hooks.cjs', 'simple-git-hooks.mjs', 'simple-git-hooks.json']) if (!simple && await real(n)) simple = true;
-  if (simple) out.push('simple-git-hooks');
-  let githooks = await real('.githooks', true);
-  if (!githooks) {
-    const cfg = await readTextLimitedWithReason(joinOs(root, '.git', 'config'), root);
-    githooks = 'text' in cfg && /^\s*hookspath\s*=/im.test(cfg.text);
+  const pkg = typeof rootPkg === 'object' && rootPkg !== null ? (rootPkg as Record<string, unknown>) : {};
+  const has = (k: string) => Object.hasOwn(pkg, k);
+  const dep = (n: string) => ['dependencies', 'devDependencies', 'optionalDependencies'].some((g) => typeof pkg[g] === 'object' && pkg[g] !== null && Object.hasOwn(pkg[g] as object, n));
+  if (has('simple-git-hooks')) out.add('simple-git-hooks');
+  if (has('husky')) out.add('husky-v4');
+  if (has('gitHooks')) out.add('yorkie');
+  if (has('pre-commit') || dep('pre-commit')) out.add('pre-commit-npm');
+  for (const n of HOOK_CONFIG_NAMES) {
+    const k = await kind(n);
+    if (k === 'link') out.add('linked-config');
+    else if (k === 'file') {
+      if (n.includes('simple-git-hooks')) out.add('simple-git-hooks');
+      else if (n.startsWith('.huskyrc') || n.startsWith('husky.config')) out.add('husky-v4');
+      else if (n === '.overcommit.yml') out.add('overcommit');
+    }
   }
-  if (githooks) out.push('githooks');
-  return out;
+  if (await kind('.githooks') === 'dir') out.add('githooks');
+  if (!out.has('githooks')) {
+    const cfg = await readTextLimitedWithReason(joinOs(root, '.git', 'config'), root);
+    if ('text' in cfg && /^\s*hookspath\s*=/im.test(cfg.text)) out.add('githooks');
+  }
+  return [...out];
 }
 
 async function readGeneratedDirs(root: string, serviceDirs: readonly string[], files: readonly string[]): Promise<string[]> {

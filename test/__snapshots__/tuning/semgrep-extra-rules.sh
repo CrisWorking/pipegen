@@ -21,6 +21,7 @@ if [ -L "$rules"/"$PIPEGEN_ARG_0" ] || [ ! -d "$rules"/"$PIPEGEN_ARG_0" ]; then 
 if [ -L "$rules"/typescript ] || [ ! -d "$rules"/typescript ]; then pg_fail "the rules folder is missing or a link"; fi
 if [ -L "$rules"/dockerfile ] || [ ! -d "$rules"/dockerfile ]; then pg_fail "the rules folder is missing or a link"; fi
 # pipegen scope: begin
+if [ -d .semgrepignore ] && [ ! -L .semgrepignore ]; then pg_fail "the repository has a folder named .semgrepignore at the scan root, so pipegen can not write its own scope file there"; fi
 "${sys[@]}" find . -name .semgrepignore \( -type f -o -type l \) -delete
 printf '%s\n' node_modules > .semgrepignore
 # pipegen scope: end

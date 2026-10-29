@@ -66,7 +66,7 @@ describe.skipIf(!live)('live: the Semgrep step\'s scope is pipegen\'s, not the r
       writeIn(dir, '.semgrepignore', 'src/\n');          // the repo's own file: must have no effect
       writeIn(dir, 'deep/.semgrepignore', 'test\n');      // nested: no effect either
       if (git) { execFileSync('git', ['init', '-q'], { cwd: dir }); execFileSync('git', ['add', '-A'], { cwd: dir }); }
-      const sh = spawnSync('bash', ['--noprofile', '--norc', '-e', '-o', 'pipefail', '-c', `sys=(/usr/bin/env -i "PATH=/usr/local/bin:/usr/bin:/bin")\n${block}`], { cwd: dir, encoding: 'utf8' });
+      const sh = spawnSync('bash', ['--noprofile', '--norc', '-e', '-o', 'pipefail', '-c', `sys=(/usr/bin/env -i "PATH=/usr/local/bin:/usr/bin:/bin")\npg_fail() { echo "pipegen: $1" >&2; exit 1; }\n${block}`], { cwd: dir, encoding: 'utf8' });
       expect(sh.status, sh.stderr).toBe(0);
       expect(semgrepPaths(semgrepBin(), dir, []), git ? 'git checkout' : 'plain folder').toEqual(['build/x.js', 'deep/test/x.js', 'dist/x.js', 'src/ok/x.js', 'test/x.js', 'tests/x.js', 'vendor/x.js']);
       // and without the step's block, the repo's file and semgrep's defaults shrink the scope (the gap this closes)

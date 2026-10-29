@@ -571,12 +571,16 @@ export function renderCliTool({ spec, tool, service, ctx, hooks, options }: CliA
       ...(tunedCfg === null ? [] : [`printf '%s' "$PIPEGEN_TUNED_CONFIG" > "$cfg/${tunedCfg.fileName}"`])];
   // the tool is told where its generated config is by the one variable the policy named (set inside env -i, like the other constants)
   const dynamicEnv = tunedCfg === null ? [] : [`${tunedCfg.envName}=$cfg/${tunedCfg.fileName}`];
+  // NOTE (6d fix round 2): this edits `.semgrepignore` files in the checkout, so later steps of the same job see that (tracked ones deleted,
+  // an untracked one added). No other tool reads them; Plan G should still place semgrep where no later workspace reader of the job cares.
   // the tool's own scope file replaces the repo's (semgrep: `.semgrepignore`, nested ones included): every file of that name under the
   // step folder is deleted (a link is removed, never followed), then pipegen's own is written. Marker comments let the live test run it.
   const scope = pol.scopeIgnore;
   if (scope !== undefined && (!/^\.[a-z][a-z0-9]{0,30}$/.test(scope.file) || !scope.lines.every((l) => /^[a-z_][a-z0-9_]{0,30}$/.test(l)))) return refuse(`The scope file of ${show(tool.id)} is not a plain name with plain lines.`);
   const scopeLines = scope === undefined ? [] : [
     '# pipegen scope: begin',
+    // a folder of that name at the scan root can not be replaced by a file: say so plainly (fails closed; the PR author can only turn the gate red)
+    `if [ -d ${scope.file} ] && [ ! -L ${scope.file} ]; then pg_fail "the repository has a folder named ${scope.file} at the scan root, so pipegen can not write its own scope file there"; fi`,
     `"\${sys[@]}" find . -name ${scope.file} \\( -type f -o -type l \\) -delete`,
     `printf '%s\\n' ${scope.lines.join(' ')} > ${scope.file}`,
     '# pipegen scope: end',

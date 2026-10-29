@@ -5,7 +5,7 @@
 import { Document } from 'yaml';
 import { describe, expect, it } from 'vitest';
 import { RenderError, renderStep, stepsToYaml, validateSpec, type RenderContext, type RenderedStep } from '../src/engine/render-step.js';
-import { describeTuning, startScriptOf, TUNING_KINDS, TUNING_OPTIONS, tuningEffects, tuningEnums, SEMGREP_RULE_FOLDERS, type TuningOption } from '../src/engine/tuning.js';
+import { describeTuning, startScriptOf, tuningEffectsWith, TUNING_OPTIONS_FOR_TESTS, TUNING_KINDS, TUNING_OPTIONS, tuningEffects, tuningEnums, SEMGREP_RULE_FOLDERS, type TuningOption } from '../src/engine/tuning.js';
 import { NEED_IDS } from '../src/engine/need-ids.js';
 import { emptyRepoFiles, emptyServiceQuality } from '../src/read/quality.js';
 import type { RepoProfile, ReviewedTool, Service, StepSpec } from '../src/types.js';
@@ -137,6 +137,15 @@ describe('the model: nothing narrows a floor scan (#108)', () => {
     // the same check on the emitted flags of every option, with a render that lies about its flags, is refused (see the mutation in the report)
   });
 
+  it('the runtime check refuses an option that emits a flag it does not declare (a test-only option through the internal hook)', () => {
+    const real = TUNING_OPTIONS_FOR_TESTS.find((o) => o.tool === 'eslint') as (typeof TUNING_OPTIONS_FOR_TESTS)[number];
+    const liar = { ...real, render: (values: readonly string[]) => ({ flags: values.map((v, i) => ({ flag: '--no-ignore', value: v, key: `tune:skip-generated:${i}` })) }) };
+    const s = spec('eslint', { 'skip-generated': ['vendor'] });
+    expect(() => tuningEffectsWith(s, entry('eslint'), baseCtx, [liar])).toThrow(/does not declare/);
+    // the honest definition passes through the same hook
+    expect(tuningEffectsWith(s, entry('eslint'), baseCtx, [real]).flags.map((f) => f.flag)).toEqual(['--ignore-pattern']);
+  });
+
   it('no reviewed tool has a choice named tuning (the name is the tuning section)', () => {
     for (const t of reviewedList()) expect(Object.keys(t.choices), t.id).not.toContain('tuning');
   });
@@ -194,7 +203,7 @@ describe('enums come from the profile', () => {
     const e = (over: Partial<RepoProfile>) => tuningEnums(entry('lefthook'), spec('lefthook', undefined, { service: 'api', needId: 'hooks-ci' }), ctxOf([api, web, py], over)).hooks;
     expect(e({})).toEqual(['lint', 'format:check']);
     for (const precommit of ['lefthook', 'husky', 'pre-commit'] as const) expect(e({ precommit }), precommit).toEqual([]);
-    for (const m of ['simple-git-hooks', 'githooks'] as const) expect(e({ otherHookManagers: [m] }), m).toEqual([]);
+    for (const m of ['simple-git-hooks', 'githooks', 'husky-v4', 'yorkie', 'pre-commit-npm', 'overcommit', 'linked-config'] as const) expect(e({ otherHookManagers: [m] }), m).toEqual([]);
     expect(e({ otherHookManagers: [] })).toEqual(['lint', 'format:check']);
   });
 

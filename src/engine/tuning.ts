@@ -96,7 +96,7 @@ interface Facts {
   badWd: boolean;
 }
 
-interface Def extends TuningOption {
+export interface TuningDef extends TuningOption {
   values(f: Facts): string[];
   /** Why no value can be picked at all (shown instead of the generic message when the enum is empty). */
   emptyReason?(f: Facts): string;
@@ -177,14 +177,14 @@ const lineOf = (text: string): string => safeText(text, 400);
 
 // ---------- the model ----------
 
-const skipGenerated = (tool: string, flag: string, how: (rel: string) => string, summary: string): Def => ({
+const skipGenerated = (tool: string, flag: string, how: (rel: string) => string, summary: string): TuningDef => ({
   id: 'skip-generated', tool, kind: 'scope-lint', max: 8, flags: [flag], summary,
   values: generated,
   render: (values, f) => ({ flags: values.map((v, i) => ({ flag, value: how(relTo(f, v)), key: `tune:skip-generated:${i}` })) }),
   describe: (values) => `skips the vendored or generated folders ${list(values)} for this lint or SAST tool only`,
 });
 
-const DEFS: readonly Def[] = [
+const DEFS: readonly TuningDef[] = [
   {
     id: 'extra-rules', tool: 'semgrep', kind: 'adds', max: 4, flags: ['--config'],
     summary: 'Runs more Semgrep rule folders of the pinned rules tree, for the languages and files the service really has.',
@@ -202,7 +202,7 @@ const DEFS: readonly Def[] = [
   skipGenerated('oxlint-typeaware', '--ignore-pattern', (rel) => `${rel}/**`, 'Skips a folder the profile marks as vendored or generated.'),
   // ./-anchored: jscpd matches a glob against any suffix of the path (measured, jscpd 5.4.2)
   skipGenerated('jscpd', '--ignore', (rel) => `./${rel}/**`, 'Skips a folder the profile marks as vendored or generated.'),
-  ...(['zap-baseline', 'nuclei'] as const).map((tool): Def => ({
+  ...(['zap-baseline', 'nuclei'] as const).map((tool): TuningDef => ({
     id: 'start-script', tool, kind: 'adds', max: 1, flags: [],
     summary: "Names the service's own start or serve script, which Plan G runs to start the app before the scan. The scan step itself does not change.",
     values: startScripts,
@@ -226,7 +226,9 @@ const DEFS: readonly Def[] = [
 /** The model, for the reviewer and the tests (functions stay inside this file's use). */
 export const TUNING_OPTIONS: readonly TuningOption[] = DEFS;
 
-const defsOf = (toolId: string): Def[] => DEFS.filter((d) => d.tool === toolId);
+/** The definitions again, for tests that swap one in through tuningEffectsWith. */
+export const TUNING_OPTIONS_FOR_TESTS: readonly TuningDef[] = DEFS;
+const defsOf = (toolId: string, defs: readonly TuningDef[] = DEFS): TuningDef[] => defs.filter((d) => d.tool === toolId);
 
 /** The value enum of every tuning option of a tool, built now from the profile, the service and the working folder of this call. */
 export function tuningEnums(tool: ReviewedTool, spec: SpecLike, ctx: RenderContext): Record<string, string[]> {
@@ -237,12 +239,12 @@ export function tuningEnums(tool: ReviewedTool, spec: SpecLike, ctx: RenderConte
 // ---------- validation ----------
 
 /** Plain-English problems with the `tuning` section of a spec (empty = fine), each starting with its field path. */
-export function tuningProblems(spec: StepSpec, tool: ReviewedTool, ctx: RenderContext): string[] {
+export function tuningProblems(spec: StepSpec, tool: ReviewedTool, ctx: RenderContext, all: readonly TuningDef[] = DEFS): string[] {
   const picks: unknown = spec.choices?.tuning;
   if (picks === undefined) return [];
   if (typeof picks !== 'object' || picks === null || Array.isArray(picks)) return ['choices.tuning: must be a map of tuning option names to lists of values.'];
   const out: string[] = [];
-  const defs = defsOf(tool.id);
+  const defs = defsOf(tool.id, all);
   const f = factsOf(spec, ctx, tool);
   for (const [name, values] of Object.entries(picks)) {
     const path = `choices.tuning.${safeText(name, 40)}`;
@@ -281,11 +283,16 @@ const picksOf = (spec: StepSpec, id: string): string[] => {
  * is a RenderError and nothing is built from it. Values are checked again where they are used (a script name, a folder name).
  */
 export function tuningEffects(spec: StepSpec, tool: ReviewedTool, ctx: RenderContext): TuningEffects {
-  const bad = tuningProblems(spec, tool, ctx);
+  return tuningEffectsWith(spec, tool, ctx, DEFS);
+}
+
+/** tuningEffects with the option definitions given. FOR TESTS ONLY (the public one has no such parameter): proves the runtime flag check. */
+export function tuningEffectsWith(spec: StepSpec, tool: ReviewedTool, ctx: RenderContext, defs: readonly TuningDef[]): TuningEffects {
+  const bad = tuningProblems(spec, tool, ctx, defs);
   if (bad.length > 0) throw new RenderError(`The tuning of ${show(spec.needId)} isn't valid: ${bad.join(' ')}`);
   const f = factsOf(spec, ctx, tool);
   const out: TuningEffects = { flags: [], extraRules: [], generatedConfig: null, lines: describeTuning(spec) };
-  for (const d of defsOf(tool.id)) {
+  for (const d of defsOf(tool.id, defs)) {
     const values = picksOf(spec, d.id);
     if (values.length === 0) continue;
     const r = d.render(values, f);
