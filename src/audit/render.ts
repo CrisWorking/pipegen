@@ -45,6 +45,11 @@ export interface RenderOptions {
    * form scrubKnownValues knows; never printed. Pass [] only when there is neither.
    */
   knownValues: readonly string[];
+  /**
+   * P40: in an `audit --ai` run, the repo paths the secret scan flagged (the checked bundle's hiddenNames). Masked in
+   * every output string, the plain-audit sections too; never printed.
+   */
+  hiddenNames?: readonly string[];
   /** Clock for the Markdown report's date; default Date.now. */
   now?: () => number;
 }
@@ -154,8 +159,8 @@ interface Ctx {
   noImage(need: Pick<Need, 'service'>): boolean;
 }
 
-function ctxFor(target: OutputTarget, knownValues: readonly string[], mergeLock: boolean, services: AuditReport['profile']['services'] = []): Ctx {
-  const clean = makeSafeOutput(knownValues);
+function ctxFor(target: OutputTarget, opts: RenderOptions, mergeLock: boolean, services: AuditReport['profile']['services'] = []): Ctx {
+  const clean = makeSafeOutput(opts.knownValues, opts.hiddenNames);
   return {
     target,
     mergeLock,
@@ -566,7 +571,7 @@ function terminalBlocks(blocks: Block[], out: string[]): void {
 
 /** The report for the terminal: plain text, no colours, lines wrapped at 100 characters. */
 export function renderTerminal(r: AuditReport, opts: RenderOptions): string {
-  return terminalDoc(buildDoc(r, ctxFor('terminal', opts.knownValues, r.capabilities.branchProtection === true, r.profile.services)));
+  return terminalDoc(buildDoc(r, ctxFor('terminal', opts, r.capabilities.branchProtection === true, r.profile.services)));
 }
 
 function terminalDoc(doc: Doc): string {
@@ -619,7 +624,7 @@ function markdownBlocks(blocks: Block[], out: string[]): void {
 
 /** The report as a Markdown file (`--out`): every value through safeMarkdown, every excluded pattern listed. */
 export function renderMarkdown(r: AuditReport, opts: RenderOptions): string {
-  const doc = buildDoc(r, ctxFor('markdown', opts.knownValues, r.capabilities.branchProtection === true, r.profile.services));
+  const doc = buildDoc(r, ctxFor('markdown', opts, r.capabilities.branchProtection === true, r.profile.services));
   const at = (opts.now ?? Date.now)();
   const date = Number.isFinite(at) ? `Audited on ${new Date(at).toISOString().slice(0, 10)}. ` : '';
   const lines = [`# ${doc.title}`, '', `${date}${doc.intro.join(' ')}`, '', `**Verdict:** ${doc.verdict ?? ''}`];
@@ -694,7 +699,7 @@ function deepClean(v: unknown, key: string, depth: number, own: boolean, clean: 
  */
 export function renderJson(r: AuditReport, opts: RenderOptions): string {
   const slim = { ...r, wouldAdd: r.wouldAdd.map((w) => ({ ...w, tool: slimTool(w.tool), also: w.also.map(slimTool) })), cantSee: CANT_SEE };
-  return JSON.stringify(deepClean(slim, '', 0, false, makeSafeOutput(opts.knownValues), new Set()), null, 2);
+  return JSON.stringify(deepClean(slim, '', 0, false, makeSafeOutput(opts.knownValues, opts.hiddenNames), new Set()), null, 2);
 }
 
 // ---------- the local-only report (GitHub not read; the `inspect` R10 rule) ----------
@@ -723,11 +728,11 @@ function localDoc(l: LocalAudit, c: Ctx): Doc {
 
 /** The local-only report for the terminal (GitHub couldn't be read): same cleaning as renderTerminal. */
 export function renderLocalTerminal(l: LocalAudit, opts: RenderOptions): string {
-  return terminalDoc(localDoc(l, ctxFor('terminal', opts.knownValues, false)));
+  return terminalDoc(localDoc(l, ctxFor('terminal', opts, false)));
 }
 
 /** The local-only report as JSON (`--json`): `github: "not read"` and the parts read from disk, every string cleaned. */
 export function renderLocalJson(l: LocalAudit, opts: RenderOptions): string {
   const doc = { github: 'not read', profile: l.profile, secretsInTree: l.secretsInTree, aiBundle: l.aiBundle, warnings: l.warnings, notes: l.notes };
-  return JSON.stringify(deepClean(doc, '', 0, false, makeSafeOutput(opts.knownValues), new Set()), null, 2);
+  return JSON.stringify(deepClean(doc, '', 0, false, makeSafeOutput(opts.knownValues, opts.hiddenNames), new Set()), null, 2);
 }

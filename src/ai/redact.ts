@@ -18,7 +18,23 @@ export {
 export class SecretScanRequiredError extends Error {}
 
 /** `bytes` is the exact UTF-8 size of bundleText(bundle) (wrapper and per-file headers included), never over maxBytes. */
-export interface CodeBundle { files: { path: string; content: string }[]; bytes: number; truncated: boolean; secretScanChecked: boolean; notes: string[] }
+export interface CodeBundle {
+  files: { path: string; content: string }[];
+  bytes: number;
+  truncated: boolean;
+  secretScanChecked: boolean;
+  notes: string[];
+  /**
+   * P40: every listed repo path (raw) the secret scan made secret: a name the scanner flagged in its file list (also a
+   * decoded finding, such as a base64-encoded secret as a name, which is not in the name as written), or a name holding
+   * a value it found. The notes already mask them; the audit report masks them everywhere too (RenderOptions.hiddenNames).
+   * Empty without the secret scan. Never sent to the AI and never printed.
+   */
+  hiddenNames: readonly string[];
+}
+
+/** How a file name that looks like a secret is shown, in the bundle's notes and in the audit report. */
+export const HIDDEN_NAME = '(a file whose name looks like a secret)';
 
 export interface BundleOptions {
   roots?: string[];
@@ -1177,7 +1193,7 @@ export async function bundleCode(dir: string, opts: BundleOptions = {}): Promise
   };
   // P39: names the secret scan flagged as lines of its file list (filled by secretScanPass)
   const flaggedNames = new Set<string>();
-  const show = (p: string) => (flaggedNames.has(p) || nameHidden(p) ? '(a file whose name looks like a secret)' : safeText(p, 300));
+  const show = (p: string) => (flaggedNames.has(p) || nameHidden(p) ? HIDDEN_NAME : safeText(p, 300));
   const notes = new Notes();
   const inRoots = (p: string) => roots === null || roots.some((r) => underRoot(p, r));
 
@@ -1279,12 +1295,21 @@ export async function bundleCode(dir: string, opts: BundleOptions = {}): Promise
   notes.addPaths(`Left out files each larger than the size limit (${maxBytes} bytes):`, tooBig, show);
   notes.addPaths(`Left out lower-priority files to keep the bundle under the size limit (${maxBytes} bytes):`, dropped, show);
 
+  // P40: every name in the listing the scan made secret, so the report can mask it outside these notes too
+  const scanHidden = (p: string) => {
+    const shown = displayPath(p);
+    return flaggedNames.has(p) || flagged.some((v) => p.includes(v) || shown.includes(v))
+      || flaggedTokens.some((v) => tokenSpans(p, v).length > 0 || tokenSpans(shown, v).length > 0);
+  };
+  const hiddenNames = secretScanChecked ? [...new Set([...listing.files, ...found.links, ...flaggedNames])].filter(scanHidden).sort() : [];
+
   const bundle: CodeBundle = {
     files: files.map((f) => Object.freeze({ path: f.path, content: f.content })),
     bytes,
     truncated,
     secretScanChecked,
     notes: notes.all(),
+    hiddenNames: Object.freeze(hiddenNames),
   };
   Object.freeze(bundle.files);
   Object.freeze(bundle.notes);

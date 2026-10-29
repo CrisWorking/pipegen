@@ -3,13 +3,14 @@
 // fake provider, the secret scanner (betterleaks, or gitleaks with the switch) is the shared stub, and no test starts git or any other process of its own (the child
 // process spy would see it). Secret-like strings are built at runtime.
 import * as childProcess from 'node:child_process';
+import { randomBytes } from 'node:crypto';
 import { existsSync, readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import * as execa from 'execa';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { makeProvider } from '../src/ai/provider.js';
 import { bundleCode, chooseSecretScanner, SECRET_SCANNER_ENV as SCANNER_ENV, SecretScanError } from '../src/ai/redact.js';
-import { addAiSuggestions, buildAudit, safeRunCommand } from '../src/audit/model.js';
+import { addAiSuggestions, buildAudit, safeRunCommand, type AuditReport } from '../src/audit/model.js';
 import { CANT_SEE } from '../src/audit/render.js';
 import { run } from '../src/cli/main.js';
 import type { CliIO, Prompter } from '../src/cli/io.js';
@@ -946,5 +947,42 @@ describe('pipegen audit (Plan U final review)', () => {
     const dir = repo();
     const r = await audit(['audit', '--json'], { cwd: dir });
     expect((JSON.parse(r.out) as { cantSee: string[] }).cantSee).toEqual([...CANT_SEE]);
+  });
+});
+
+// ---------- P40: names the secret scan flagged are masked in the whole report ----------
+
+describe('pipegen audit --ai (P40: report-wide masking of scanner-flagged names)', () => {
+  it('P40: a base64-encoded secret as a file name, flagged by the scanner (decoded), is masked in every part of the terminal, JSON and Markdown report', async () => {
+    // the scanner reports the DECODED value, which is not in the name as written, so no name check by pattern sees it
+    const decoded = ['decoded', 'name', 'secret', randomBytes(6).toString('hex')].join('-');
+    const encoded = Buffer.from(decoded).toString('base64').replace(/=+$/, '');
+    expect(encoded).toMatch(/^[A-Za-z0-9+]+$/); // a plain file name (no slash)
+    // the file also holds a secret-like value, so the plain audit names it in "secrets in the files on disk"
+    const name = `src/${encoded}.ts`;
+    const dir = repo({ [name]: `export const t = "${fake.githubPat()}";\n` });
+    const body = `writeReport(JSON.stringify(findingsFor(${JSON.stringify(encoded)}).filter((x) => /paths/.test(x.File)).map((x) => ({ ...x, Match: ${JSON.stringify(decoded)}, ['Sec' + 'ret']: ${JSON.stringify(decoded)} })))); process.exit(1);`;
+    const work = makeTempDir();
+    for (const json of [false, true]) {
+      const { env } = aiSetup(undefined, undefined, body);
+      const argv = ['audit', '--ai', '--dir', dir, '--out', json ? 'r2.md' : 'r1.md', ...(json ? ['--json'] : [])];
+      const r = await audit(argv, { cwd: work, env, prompt: prompter(true) });
+      expect(r.code, r.err).toBe(0);
+      const md = readFileSync(join(work, json ? 'r2.md' : 'r1.md'), 'utf8');
+      // the --ai run happened and the scanner flagged the name (the bundle left the file out)
+      expect(oneLine(r.out)).toMatch(/flagged as secret-like/);
+      for (const [where, text] of [['stdout', r.out], ['stderr', r.err], ['markdown', md]] as const) {
+        expect(text, `${String(json)} ${where}`).not.toContain(encoded);
+        expect(text, `${String(json)} ${where}`).not.toContain(decoded);
+      }
+      // the plain-audit warning still says a file holds a secret-like value, with the name masked
+      expect(md).toContain('(a file whose name looks like a secret)');
+      if (json) {
+        const j = JSON.parse(r.out) as AuditReport;
+        expect(j.secretsInTree.map((s) => s.file)).toContain('(a file whose name looks like a secret)');
+      } else {
+        expect(r.out).toContain('(a file whose name looks like a secret)');
+      }
+    }
   });
 });

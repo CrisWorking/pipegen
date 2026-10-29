@@ -166,6 +166,8 @@ export async function audit(io: CliIO, flags: AuditFlags): Promise<number> {
     if (reviewedProblem !== null) r = { ...r, warnings: [{ text: reviewedUnavailableWarning(reviewedProblem) }, ...r.warnings] };
 
     // 6. --ai: consent first (default No); only a yes gives the token the AI step requires
+    // P40: the names the secret scan flagged, masked in the whole report below (the plain-audit parts too)
+    const hiddenNames = new Set<string>();
     if (ai !== null) {
       const nullRows = r.wouldAdd.filter((w) => w.tool === null).length;
       const est = estimateAuditAi(ai.provider, nullRows + EXTRA_NEEDS_MARGIN, needsRequestBytes({ ...r, aiBundle: { ...r.aiBundle, bytes: counted.bytes } }, knownValues));
@@ -182,13 +184,13 @@ export async function audit(io: CliIO, flags: AuditFlags): Promise<number> {
       } else {
         r = await addAiSuggestions(r, dir, {
           ai: ai.provider, gh: github.gh, memory: await openMemory(), fetch: io.fetch ?? globalThis.fetch, reviewed, bar: ai.bar,
-          budget: clock.budget, now: Date.now, knownValues: [...knownValues], anonymous, capUsd: est.capUsd, consent,
+          budget: clock.budget, now: Date.now, knownValues: [...knownValues], anonymous, capUsd: est.capUsd, consent, hiddenNames,
         });
       }
     }
 
     // 7. the report
-    const opts: RenderOptions = { knownValues };
+    const opts: RenderOptions = { knownValues, hiddenNames: [...hiddenNames] };
     say(flags.json ? renderJson(r, opts) : renderTerminal(r, opts));
     if (flags.out !== undefined) {
       try {

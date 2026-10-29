@@ -934,3 +934,39 @@ describe('Plan P Task 9: the report shows every catalogue check', () => {
     for (const text of [term(report()), md(report())]) expect(flat(text)).toContain('Renovate presets');
   });
 });
+
+describe('render: P40, names the secret scan flagged are masked report-wide', () => {
+  const HIDDEN = '(a file whose name looks like a secret)';
+  const seg = 'c2VjcmV0LW5hbWUtdmFsdWUtNDI0Mg'; // an encoded value used as a folder name
+  const path = `${seg}/config.ts`;
+  const withName = (): AuditReport => {
+    const r = report();
+    return {
+      ...r,
+      [TREE]: [{ file: path, rule: 'GitHub token' }],
+      notes: [...r.notes, `Skipped ${path}: it is a binary file.`],
+      aiBundle: { ...r.aiBundle, topFolders: [seg, 'src'] },
+    };
+  };
+  const opts: RenderOptions = { ...OPTS, hiddenNames: [path] };
+
+  it('P40: the flagged path, and its long segment shown alone (a top folder), are masked in terminal, Markdown and JSON, keys included', () => {
+    const outs = { terminal: term(withName(), opts), markdown: md(withName(), opts), json: json(withName(), opts) };
+    for (const [where, text] of Object.entries(outs)) {
+      expect(text, where).not.toContain(seg);
+      expect(text, where).toContain(HIDDEN);
+    }
+    const j = JSON.parse(outs.json) as AuditReport;
+    expect(j[TREE][0]?.file).toBe(HIDDEN);
+    expect(j.aiBundle.topFolders).toEqual([HIDDEN, 'src']);
+    expect(j.notes).toContain(`Skipped ${HIDDEN}: it is a binary file.`);
+    // a key holding the name is masked too
+    expect(renderJson({ ...withName(), extra: { [path]: 1 } } as unknown as AuditReport, opts)).not.toContain(seg);
+    // short segments stay readable elsewhere: `src` and `config.ts` are not masked on their own
+    expect(j.aiBundle.topFolders).toContain('src');
+  });
+
+  it('P40: without hiddenNames (a plain audit) the same report shows the name', () => {
+    expect(json(withName())).toContain(seg);
+  });
+});

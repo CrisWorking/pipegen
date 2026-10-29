@@ -31,7 +31,7 @@ import { ollamaHostOf } from '../ai/ollama.js';
 import { AiError, COST_CAP_MESSAGE, refusalFallbackNoteFor, type AiErrorKind } from '../ai/provider.js';
 import {
   bundleCode, bundleTopFolders, COUNTING_ONLY_NOTE, countedBundleRoot, EXCLUDED_PATTERNS, findSecretLike, isExcludedPath, redact, SECRET_SCANNER_ENV, SecretScanError, type SecretScanner, type SecretScannerName,
-  scrubKnownValues, type CodeBundle,
+  HIDDEN_NAME, scrubKnownValues, type CodeBundle,
 } from '../ai/redact.js';
 import { needLanguage, suggestTools } from '../engine/discover.js';
 import type { RateBudget } from '../engine/github-rate.js';
@@ -281,7 +281,7 @@ const LIMIT = {
   noCodeScanning: 'No code scanning: GitHub does not show scan results in the Security tab for this repo.',
 } as const;
 
-export const NAME_HIDDEN = '(a file whose name looks like a secret)';
+export const NAME_HIDDEN = HIDDEN_NAME;
 export const EXCLUDED_NOTE = "(never sent to the AI; check it isn't committed)";
 const NAME_RULE = 'secret-like-name';
 const MAX_SECRET_ROWS = 200;
@@ -691,6 +691,11 @@ export interface AiSuggestDeps {
    * match `ai` (provider, model, Ollama host) and `capUsd`, and only files it counted may be sent.
    */
   consent: ConsentToken;
+  /**
+   * P40: filled with the secret-scanned bundle's hiddenNames (the names the scan made secret). The caller passes them
+   * to the renderer (RenderOptions.hiddenNames), so a flagged name is masked in the whole report, plain-audit parts too.
+   */
+  hiddenNames?: Set<string>;
 }
 
 const AI_NOTE = {
@@ -929,6 +934,7 @@ export async function addAiSuggestions(r: AuditReport, dir: string, deps: AiSugg
     }
     // only the files the consent screen counted (review I1): the checked bundle can only shrink
     bundle = await bundleCode(dir, { secretScanner: scanner, knownValues: deps.knownValues, onlyPaths: counted.paths() });
+    for (const n of bundle.hiddenNames) deps.hiddenNames?.add(n);
   } catch (e) {
     if (!(e instanceof PinnedBinaryError || e instanceof SecretScanError)) throw e;
     notes.add(AI_NOTE.noSecretScan(named.name, e.message));

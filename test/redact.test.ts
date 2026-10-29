@@ -850,6 +850,23 @@ describe('bundle: scan canaries (ruling P34)', () => {
     }
   });
 
+  it('P40: a base64-encoded secret as a file name, flagged by its decoded value, is in hiddenNames (both scanners); none without the scan', async () => {
+    const decoded = 'decoded' + '-name-' + 'secret-5113';
+    const encoded = Buffer.from(decoded).toString('base64').replace(/=+$/, '');
+    const dir = makeTempDir();
+    writeIn(dir, `src/${encoded}.ts`, 'export const a = 1;\n');
+    writeIn(dir, 'src/ok.ts', 'export const ok = 1;\n');
+    for (const at of [betterleaksAt, gitleaksAt]) {
+      const stub = makeStub(`writeReport(JSON.stringify(findingsFor(${JSON.stringify(encoded)}).filter((x) => /paths/.test(x.File)).map((x) => ({ ...x, Match: ${JSON.stringify(decoded)}, ['Sec' + 'ret']: ${JSON.stringify(decoded)} })))); process.exit(1);`);
+      const b = await bundleCode(dir, scanWith(at(stub.bin)));
+      expect(paths(b), at.name).toEqual(['src/ok.ts']);
+      expect(b.hiddenNames, at.name).toEqual([`src/${encoded}.ts`]);
+      expect(Object.isFrozen(b.hiddenNames)).toBe(true);
+      expect(bundleText(b)).not.toContain(encoded);
+    }
+    expect((await bundleCode(dir)).hiddenNames).toEqual([]);
+  });
+
   it('P36: a long file list is scanned in pieces under the limit, each with its own canary, all required; findings map to the right path', async () => {
     const dir = makeTempDir();
     const n = 700; // ~700 × 200 bytes of paths: two pieces
