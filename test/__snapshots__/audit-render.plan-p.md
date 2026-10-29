@@ -8,9 +8,12 @@ Scheduled and repo-file checks: gaps (0 of 3 checks covered).
 
 ## ⚠ Warnings
 
-- ⚠ Secret-like text in the files on disk now (pipegen never shows the values):
+- ⚠ Secret-like text in the files on disk now, from a quick check for a few secret formats, not a secret scan (pipegen never shows the values):
   - .env: generic-api-key (never sent to the AI; check it isn't committed)
   - config/dev.json: aws-access-key, private-key
+  - This check looks for private keys, a few known token formats (AWS, GitHub, Slack, Stripe, Google and npm tokens, and sk- API keys), JWTs, passwords inside connection strings, and file names that look like a secret.
+  - It doesn't look for \`name = value\` lines, such as an API key or a password set in code, in a config file or in a .env file (in a .env file only a password inside a connection string is found), and any token format not listed. So this is not a secret scan: finding nothing here does not mean the repo holds no secrets.
+  - \`pipegen audit --ai\` runs a full secret scanner (betterleaks, or gitleaks) on the files it would send, before anything is sent; the pipeline pipegen sets up (v0.2) runs betterleaks or gitleaks on every push and pull request.
 - ⚠ This repo could change which pipegen runs. Run pipegen from outside the repo, from the npm registry, with:
   ```sh
   npx --registry=https://registry.npmjs.org pipegen@0.1.0 audit --dir ./repo
@@ -225,7 +228,7 @@ These are counts only, never file contents. They were made without the secret sc
 
 ## Notes
 
-- The secrets scan did not check dependency and build folders (node\_modules, .venv, dist, build, vendor, target) or .git, so committed build output was not checked either.
+- The quick secret check did not check dependency and build folders (node\_modules, .venv, dist, build, vendor, target) or .git, so committed build output was not checked either.
 - pipegen reads the files on disk without git, so files that aren't committed (for example a local .env) are in this list too.
 
 ## What this audit can't see
@@ -254,6 +257,7 @@ These are counts only, never file contents. They were made without the secret sc
 - Network egress control (blocking unexpected traffic from release jobs) is only partly read on larger runners.
 - Environment variables set by third-party actions aren't seen, so a check one of them turns off can show as covered.
 - pipegen can't check yet that an ESLint config reads .vue, .svelte and .astro files (the parsers and plugins come in v0.2): such a repo never shows a clean pass for ESLint.
+- The quick secret check on the files on disk looks only for a few secret formats (private keys, some token formats, JWTs, passwords in connection strings); it doesn't read `name = value` lines, such as an API key or a password set in code or in a .env file, so it is not a secret scan.
 - Kubernetes manifests are looked for only in YAML under folders named k8s, kubernetes, manifests, deploy, helm or charts (and a Chart.yaml anywhere), so manifests kept elsewhere, like infra/, aren't seen.
 
 ## Next step

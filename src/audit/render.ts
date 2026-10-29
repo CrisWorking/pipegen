@@ -36,7 +36,7 @@ import { safeMarkdown } from '../util/safe-text.js';
 import { K8S_FOLDERS } from '../read/quality.js';
 import { COVERAGE_LIMITS, type Coverage } from './coverage.js';
 import {
-  buildsNoImage, isBuiltInNeed, isOwnCommand, needLabel, type AuditAi, type GitHubFact, type AuditReport, type LocalAudit, type WouldAddRow, type WouldAddTool,
+  buildsNoImage, isBuiltInNeed, isOwnCommand, needLabel, SECRET_CHECK, type AuditAi, type GitHubFact, type AuditReport, type LocalAudit, type WouldAddRow, type WouldAddTool,
 } from './model.js';
 
 export interface RenderOptions {
@@ -90,6 +90,8 @@ export const CANT_SEE: readonly string[] = Object.freeze([
   'Network egress control (blocking unexpected traffic from release jobs) is only partly read on larger runners.',
   "Environment variables set by third-party actions aren't seen, so a check one of them turns off can show as covered.",
   "pipegen can't check yet that an ESLint config reads .vue, .svelte and .astro files (the parsers and plugins come in v0.2): such a repo never shows a clean pass for ESLint.",
+  // hand checks 2026-10-29 (fix 1, ruling P55)
+  "The quick secret check on the files on disk looks only for a few secret formats (private keys, some token formats, JWTs, passwords in connection strings); it doesn't read `name = value` lines, such as an API key or a password set in code or in a .env file, so it is not a secret scan.",
   // final review m1
   `Kubernetes manifests are looked for only in YAML under folders named ${K8S_FOLDERS.slice(0, -1).join(', ')} or ${K8S_FOLDERS.at(-1)} (and a Chart.yaml anywhere), so manifests kept elsewhere, like infra/, aren't seen.`,
 ]);
@@ -288,10 +290,32 @@ function groupByService<T extends { need: Need }>(c: Ctx, items: readonly T[], k
 
 // ---------- sections ----------
 
-function warningsSection(r: Pick<AuditReport, 'secretsInTree' | 'warnings'>, c: Ctx): Section | null {
+/**
+ * Hand checks 2026-10-29 (fix 1, ruling P55): what the quick on-disk check looks for and what it doesn't, from the
+ * report's own `secretCheck` (pipegen's fixed text). Shown with the findings, and in its own section when there are none.
+ */
+function secretScopeItems(r: Pick<AuditReport, 'secretCheck'>, c: Ctx, depth: number): Block[] {
+  const s = r.secretCheck ?? SECRET_CHECK;
+  return [
+    item(`This check looks for ${c.own(s.looksFor)}`, depth),
+    item(`It doesn't look for ${c.own(s.doesNotLookFor)}`, depth),
+    item(c.own(s.fullScans), depth),
+  ];
+}
+
+/** P55: with nothing found, the check still says what it did and what it didn't (never a block that vanishes and reads as clean). */
+function quickSecretSection(r: Pick<AuditReport, 'secretsInTree' | 'secretCheck'>, c: Ctx): Section | null {
+  if (r.secretsInTree.length > 0) return null; // the findings and the same lines are in the warnings
+  return {
+    title: 'Quick secret check (files on disk)',
+    blocks: [text('A quick check for a few secret formats, not a secret scan: it found none of the formats it looks for in the files on disk.'), ...secretScopeItems(r, c, 0)],
+  };
+}
+
+function warningsSection(r: Pick<AuditReport, 'secretsInTree' | 'warnings' | 'secretCheck'>, c: Ctx): Section | null {
   const blocks: Block[] = [];
   if (r.secretsInTree.length > 0) {
-    blocks.push(item('Secret-like text in the files on disk now (pipegen never shows the values):', 0, true));
+    blocks.push(item('Secret-like text in the files on disk now, from a quick check for a few secret formats, not a secret scan (pipegen never shows the values):', 0, true));
     // one line per file, its rules together, in the model's order
     const files = new Map<string, { rules: string[]; note: string | null }>();
     for (const s of r.secretsInTree) {
@@ -306,6 +330,7 @@ function warningsSection(r: Pick<AuditReport, 'secretsInTree' | 'warnings'>, c: 
     const shown = c.target === 'terminal' ? all.slice(0, MAX_SECRET_FILES_TERMINAL) : all;
     for (const [file, e] of shown) blocks.push(item(`${file}: ${e.rules.join(', ')}${e.note === null ? '' : ` ${e.note}`}`, 1));
     if (shown.length < all.length) blocks.push(item(`…and ${plural(all.length - shown.length, 'more file', 'more files')}.`, 1));
+    append(blocks, secretScopeItems(r, c, 1));
   }
   for (const w of r.warnings) {
     blocks.push(item(c.v(w.text, OUTPUT_CAP.text), 0, true));
@@ -560,7 +585,7 @@ function buildDoc(r: AuditReport, c: Ctx): Doc {
   const intro = ['pipegen changed nothing in the repo or on GitHub.'];
   intro.push(r.ai === undefined ? 'Nothing was sent to an AI.' : 'You ran it with --ai: the AI part below says what the AI step found.');
   const sections = [
-    warningsSection(r, c), planSection(r, c), layersSection(c, views), skippedSection(r, c), addSection(r, c), wouldSetSection(r, c),
+    warningsSection(r, c), quickSecretSection(r, c), planSection(r, c), layersSection(c, views), skippedSection(r, c), addSection(r, c), wouldSetSection(r, c),
     costsSection(r, c), bundleSection(r, c), permissionsSection(r, c), notesSection(r, c), { title: "What this audit can't see", blocks: CANT_SEE.map((l) => item(l)) }, nextSection(r, c),
   ].filter((s): s is Section => s !== null);
   return { title: `pipegen audit: ${c.v(`${r.profile.owner}/${r.profile.repo}`, OUTPUT_CAP.path)}`, intro, verdict: verdictOf(views.filter((v) => v.layer !== 'scheduled')),
@@ -695,7 +720,7 @@ export function renderMarkdown(r: AuditReport, opts: RenderOptions): string {
 // ---------- JSON (ruling S13) ----------
 
 /** Keys whose strings are prose (why texts, notes, basis lines): the long cap. */
-const PROSE_KEYS: ReadonlySet<string> = new Set(['why', 'note', 'notes', 'basis', 'reasons', 'text', 'limits', 'nextStep', 'testsNote', 'message', 'cantSee']);
+const PROSE_KEYS: ReadonlySet<string> = new Set(['why', 'note', 'notes', 'basis', 'reasons', 'text', 'limits', 'nextStep', 'testsNote', 'message', 'cantSee', 'looksFor', 'doesNotLookFor', 'fullScans']);
 /** Keys that hold one of pipegen's own fixed commands: written as they are when isOwnCommand holds (U17). */
 const COMMAND_KEYS: ReadonlySet<string> = new Set(['command', 'nextCommand']);
 /** Keys whose strings are paths (or lists of paths): a larger cap than names. */
@@ -781,7 +806,7 @@ function localDoc(l: LocalAudit, c: Ctx): Doc {
   found.push(text(p.existingWorkflows.length === 0 ? 'Workflows: none found.' : `Workflows (${num(p.existingWorkflows.length)}):`));
   for (const w of p.existingWorkflows) found.push(item(c.v(w.path, OUTPUT_CAP.path)));
   const sections = [
-    warningsSection(l, c), { title: 'What pipegen found in the repo', blocks: found }, bundleSection(l, c), notesSection(l, c),
+    warningsSection(l, c), quickSecretSection(l, c), { title: 'What pipegen found in the repo', blocks: found }, bundleSection(l, c), notesSection(l, c),
   ].filter((s): s is Section => s !== null);
   return {
     title: `pipegen audit: ${c.v(`${p.owner}/${p.repo}`, OUTPUT_CAP.path)}`,
@@ -798,6 +823,6 @@ export function renderLocalTerminal(l: LocalAudit, opts: RenderOptions): string 
 
 /** The local-only report as JSON (`--json`): `github: "not read"` and the parts read from disk, every string cleaned. */
 export function renderLocalJson(l: LocalAudit, opts: RenderOptions): string {
-  const doc = { github: 'not read', profile: l.profile, secretsInTree: l.secretsInTree, aiBundle: l.aiBundle, warnings: l.warnings, notes: l.notes };
+  const doc = { github: 'not read', profile: l.profile, secretsInTree: l.secretsInTree, secretCheck: l.secretCheck ?? SECRET_CHECK, aiBundle: l.aiBundle, warnings: l.warnings, notes: l.notes };
   return JSON.stringify(deepClean(doc, '', 0, false, makeSafeOutput(opts.knownValues, opts.found), new Set()), null, 2);
 }

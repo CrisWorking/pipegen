@@ -3,16 +3,16 @@
 // no backticks around repo values, escaped exactly once) and Review Focus 3 (never suggest making the repo public).
 import { describe, expect, it } from 'vitest';
 import { EXCLUDED_KEPT, EXCLUDED_PATTERN_GROUPS, EXCLUDED_PATTERNS, excludedSummaryLines, redact, type ScanFound } from '../src/ai/redact.js';
-import { isBuiltInNeed, isOwnCommand, needLabel, safeRunCommand, type AuditReport, type WouldAddRow } from '../src/audit/model.js';
+import { isBuiltInNeed, isOwnCommand, needLabel, safeRunCommand, SECRET_CHECK, type AuditReport, type WouldAddRow } from '../src/audit/model.js';
 import type { Coverage } from '../src/audit/coverage.js';
 import { CHECKS } from '../src/engine/needs.js';
 import type { RepoToolStep } from '../src/engine/reviewed.js';
 import type { Layer } from '../src/types.js';
-import { CANT_SEE, renderJson, renderMarkdown, renderTerminal, type RenderOptions } from '../src/audit/render.js';
+import { CANT_SEE, renderJson, renderLocalJson, renderLocalTerminal, renderMarkdown, renderTerminal, type RenderOptions } from '../src/audit/render.js';
 import { K8S_FOLDERS } from '../src/read/quality.js';
 import { safeMarkdown } from '../src/util/safe-text.js';
 import { EMPTY_PLACEHOLDER, safeOutput, TOO_LONG } from '../src/util/safe-output.js';
-import { aiPart, FREE_PRIVATE_LIMITS, freePrivateReport, need, reviewedTool, service, SUGGESTION_NOTE, TREE, usageOf } from './fixtures/audit-report.js';
+import { aiPart, FREE_PRIVATE_LIMITS, freePrivateReport, need, reviewedTool, service, SUGGESTION_NOTE, TREE, CHECK, usageOf } from './fixtures/audit-report.js';
 import { hostileNames } from './fixtures/hostile-names.js';
 import { fake } from './helpers/secret-repo.js';
 
@@ -999,5 +999,54 @@ describe('rows shared by several services (DoD fastapi)', () => {
     // the layer still counts checks, one per service, and JSON keeps one row per check
     expect(tflat(twoServices())).toContain('(1 of 6 checks covered)');
     expect((JSON.parse(json(twoServices())) as { coverage: unknown[] }).coverage).toHaveLength(6);
+  });
+});
+
+// Hand checks 2026-10-29 (fix 1, ruling P55): the on-disk check is a quick check for a few formats, not a secret scan.
+// Every output says what it looks for and what it doesn't, also when it finds nothing (no block that vanishes and
+// reads as "clean").
+describe('the quick secret check says what it does and does not look for (hand checks, P55)', () => {
+  const quiet = (): AuditReport => ({ ...report(), [TREE]: [] });
+  const SCOPE = ['not a secret scan', '`name = value`', '.env', 'betterleaks', '--ai'];
+
+  it('report: with nothing found, terminal and Markdown still show the check and its limits', () => {
+    for (const out of [tflat(quiet()), md(quiet())]) {
+      expect(out).toContain('Quick secret check');
+      expect(out).toContain('found none of the formats it looks for');
+      for (const s of SCOPE) expect(out, s).toContain(s);
+      expect(out).not.toMatch(/the secrets scan/i);
+    }
+  });
+
+  it('report: with findings, the warning names the check honestly and its limits', () => {
+    for (const out of [tflat(report()), md(report())]) {
+      expect(out).toContain('config/dev.json');
+      expect(out).toMatch(/quick check for a few secret formats, not a secret scan/);
+      for (const s of SCOPE) expect(out, s).toContain(s);
+    }
+  });
+
+  it('report: JSON carries the scope next to secretsInTree, also when nothing was found', () => {
+    for (const r of [report(), quiet()]) {
+      const j = (JSON.parse(json(r)) as Record<typeof CHECK, { kind: string; looksFor: string; doesNotLookFor: string; fullScans: string }>)[CHECK];
+      expect(j.kind).toBe('quick-format-check');
+      expect(j.looksFor).toContain('private keys');
+      expect(j.doesNotLookFor).toContain('`name = value`');
+      expect(j.fullScans).toContain('betterleaks');
+      expect(j).toEqual({ ...SECRET_CHECK }); // whole, never cut at the name length
+    }
+  });
+
+  it('report: the local-only report (GitHub not read) says the same, in the terminal and in JSON', () => {
+    const r = report();
+    const l = { profile: r.profile, [TREE]: [], [CHECK]: { ...SECRET_CHECK }, aiBundle: r.aiBundle, warnings: [], notes: [] };
+    const t = flat(renderLocalTerminal(l, OPTS));
+    expect(t).toContain('Quick secret check');
+    for (const s of SCOPE) expect(t, s).toContain(s);
+    expect((JSON.parse(renderLocalJson(l, OPTS)) as Record<typeof CHECK, unknown>)[CHECK]).toEqual({ ...SECRET_CHECK });
+  });
+
+  it("report: what this audit can't see names the gap", () => {
+    expect(CANT_SEE.some((l) => l.includes('quick secret check') && l.includes('`name = value`'))).toBe(true);
   });
 });

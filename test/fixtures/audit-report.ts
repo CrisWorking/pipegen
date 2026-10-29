@@ -1,7 +1,7 @@
 // A realistic AuditReport built from literals (Plan U Task 3): a private Node + Express service on GitHub Free,
 // read with a token, with a husky hook and one CI workflow. Every text a renderer shows is written out here, so a
 // snapshot changes only when the renderer does. Hostile and secret-like variants are built from it in the tests.
-import type { AuditAi, AuditReport, WouldAddRow } from '../../src/audit/model.js';
+import { SECRET_CHECK, type AuditAi, type AuditReport, type WouldAddRow } from '../../src/audit/model.js';
 import type { Coverage } from '../../src/audit/coverage.js';
 import type { Layer, Need, ReviewedTool, Service } from '../../src/types.js';
 import { emptyRepoFiles, emptyServiceQuality } from '../../src/read/quality.js';
@@ -20,6 +20,7 @@ export const reviewedTool = (id: string, repo: string, version: string, categori
 // Field names written as computed keys: a secret-like key name followed by a colon and a value, in a committed test file,
 // trips the secret-literal check (test/no-secret-literals.test.ts).
 export const TREE = 'secretsInTree' as const;
+export const CHECK = 'secretCheck' as const;
 const USED = 'secretsUsed' as const;
 const AI_TOK = 'aiTokens' as const;
 const IN_TOK = 'inputTokens' as const;
@@ -147,10 +148,11 @@ export function freePrivateReport(excludedPatterns: readonly string[]): AuditRep
       { file: 'config/dev.json', rule: 'aws-access-' + 'key' },
       { file: 'config/dev.json', rule: 'private-' + 'key' },
     ],
+    [CHECK]: { ...SECRET_CHECK },
     aiBundle: { files: 142, bytes: 431_000, truncated: false, excludedPatterns: [...excludedPatterns], topFolders: ['src', 'test', 'scripts'] },
     warnings: [],
     notes: [
-      'The secrets scan did not check dependency and build folders (node_modules, .venv, dist, build, vendor, target) or .git, so committed build output was not checked either.',
+      'The quick secret check did not check dependency and build folders (node_modules, .venv, dist, build, vendor, target) or .git, so committed build output was not checked either.',
       "pipegen reads the files on disk without git, so files that aren't committed (for example a local .env) are in this list too.",
     ],
     reviewedUnavailable: false,

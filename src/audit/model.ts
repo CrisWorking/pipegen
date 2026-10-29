@@ -88,6 +88,23 @@ export interface SecretInTree {
   note?: string;
 }
 /**
+ * Hand checks 2026-10-29 (fix 1, ruling P55): what the on-disk check (scanTree, findSecretLike) looks for and what it
+ * doesn't. It is a quick check for a few formats, not a secret scan, and every output says so, also when it finds
+ * nothing, so an empty list never reads as "no secrets here".
+ */
+export interface SecretCheckScope { kind: 'quick-format-check'; looksFor: string; doesNotLookFor: string; fullScans: string }
+export const SECRET_CHECK: Readonly<SecretCheckScope> = Object.freeze({
+  kind: 'quick-format-check',
+  looksFor: 'private keys, a few known token formats (AWS, GitHub, Slack, Stripe, Google and npm tokens, and sk- API keys), JWTs, '
+    + 'passwords inside connection strings, and file names that look like a secret.',
+  doesNotLookFor: '`name = value` lines, such as an API key or a password set in code, in a config file or in a .env file (in a .env '
+    + 'file only a password inside a connection string is found), and any token format not listed. So this is not a secret scan: '
+    + 'finding nothing here does not mean the repo holds no secrets.',
+  fullScans: '`pipegen audit --ai` runs a full secret scanner (betterleaks, or gitleaks) on the files it would send, before anything '
+    + 'is sent; the pipeline pipegen sets up (v0.2) runs betterleaks or gitleaks on every push and pull request.',
+});
+
+/**
  * supportLevel for v0.2 plus the next step (ruling S8): `nextStep` is prose; `nextCommand` is pipegen's own fixed command
  * for it (ruling U17), or null. The renderers print the command on its own, unescaped, so it copies exactly.
  */
@@ -111,11 +128,13 @@ export interface AuditReport {
   testsNote: string | null;
   estimates: Estimates; permissions: { permission: string; why: string }[];
   limits: string[]; secretsInTree: SecretInTree[];
+  /** Hand checks (P55): what the on-disk check behind secretsInTree looks for and what it doesn't (always SECRET_CHECK). */
+  secretCheck: SecretCheckScope;
   /** What the full run would send to the AI (counts and folder names, never contents). */
   aiBundle: { files: number; bytes: number; truncated: boolean; excludedPatterns: string[]; topFolders: string[] };
   /** How pipegen was started (a repo .npmrc with a registry, a local node_modules/.bin/pipegen) and anonymous access. */
   warnings: AuditWarning[];
-  /** Reader, workflow, capability-probe, bundle, coverage and secrets-scan notes; deduped (ruling S11), each passed through redact() (a secret-like file name in a reader note is masked). */
+  /** Reader, workflow, capability-probe, bundle, coverage and quick-secret-check notes; deduped (ruling S11), each passed through redact() (a secret-like file name in a reader note is masked). */
   notes: string[];
   /** Ruling U11: the caller couldn't use the reviewed list (B3). Task 2b drops every discovery suggestion when true. */
   reviewedUnavailable: boolean;
@@ -319,7 +338,7 @@ const NAME_RULE = 'secret-like-name';
 const MAX_SECRET_ROWS = 200;
 /** Secrets scan budget: past this many bytes read, the rest isn't scanned (with a note). */
 const MAX_SCAN_BYTES = 200_000_000;
-const SKIPPED_DIRS_NOTE = `The secrets scan did not check dependency and build folders (${IGNORED_DIRS.filter((d) => d !== '.git').join(', ')}) or .git, so committed build output was not checked either.`;
+const SKIPPED_DIRS_NOTE = `The quick secret check did not check dependency and build folders (${IGNORED_DIRS.filter((d) => d !== '.git').join(', ')}) or .git, so committed build output was not checked either.`;
 const UNTRACKED_NOTE = "pipegen reads the files on disk without git, so files that aren't committed (for example a local .env) are in this list too.";
 
 // Worded so redact() leaves it whole at output ("No token: …" would be cut; review M3).
@@ -472,6 +491,7 @@ export async function buildAudit(dir: string, deps: AuditDeps): Promise<AuditRep
     permissions: deps.permissions,
     limits,
     secretsInTree,
+    secretCheck: { ...SECRET_CHECK },
     aiBundle: {
       files: bundle.files.length, bytes: bundle.bytes, truncated: bundle.truncated,
       excludedPatterns: [...EXCLUDED_PATTERNS], topFolders: bundleTopFolders(bundle),
@@ -557,6 +577,7 @@ export type LocalProfile = Awaited<ReturnType<typeof readProject>>;
 export interface LocalAudit {
   profile: LocalProfile;
   secretsInTree: SecretInTree[];
+  secretCheck: SecretCheckScope;
   aiBundle: AuditReport['aiBundle'];
   /** The `.npmrc` / node_modules/.bin/pipegen warning (no anonymous-access warning: pipegen doesn't know the access). */
   warnings: AuditWarning[];
@@ -576,6 +597,7 @@ export async function buildLocalAudit(dir: string, deps: { notes?: string[] } = 
   return {
     profile,
     secretsInTree,
+    secretCheck: { ...SECRET_CHECK },
     aiBundle: {
       files: bundle.files.length, bytes: bundle.bytes, truncated: bundle.truncated,
       excludedPatterns: [...EXCLUDED_PATTERNS], topFolders: bundleTopFolders(bundle),
@@ -746,10 +768,10 @@ async function scanTree(dir: string, notes: Notes): Promise<SecretInTree[]> {
     for (const rule of findSecretLike(text).sort()) add({ file, rule, ...extra });
   }
   notes.add(SKIPPED_DIRS_NOTE);
-  if (listing.truncated) notes.add('The secrets scan stopped listing files at the file limit; the rest were not checked.');
-  if (stopped) notes.add(`The secrets scan stopped after ${MAX_SCAN_BYTES / 1_000_000} MB of files; the rest were not checked.`);
-  if (tooLarge > 0) notes.add(`The secrets scan skipped ${tooLarge === 1 ? '1 file' : `${tooLarge} files`} larger than 1 MB.`);
-  if (unreadable > 0) notes.add(`The secrets scan couldn't read ${unreadable === 1 ? '1 file' : `${unreadable} files`} (no permission, or it changed while being read); ${unreadable === 1 ? 'it was' : 'they were'} not checked.`);
+  if (listing.truncated) notes.add('The quick secret check stopped listing files at the file limit; the rest were not checked.');
+  if (stopped) notes.add(`The quick secret check stopped after ${MAX_SCAN_BYTES / 1_000_000} MB of files; the rest were not checked.`);
+  if (tooLarge > 0) notes.add(`The quick secret check skipped ${tooLarge === 1 ? '1 file' : `${tooLarge} files`} larger than 1 MB.`);
+  if (unreadable > 0) notes.add(`The quick secret check couldn't read ${unreadable === 1 ? '1 file' : `${unreadable} files`} (no permission, or it changed while being read); ${unreadable === 1 ? 'it was' : 'they were'} not checked.`);
   if (more > 0) notes.add(`…and ${more} more secret-like findings not listed.`);
   if (rows.length > 0) notes.add(UNTRACKED_NOTE);
   return rows;

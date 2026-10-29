@@ -625,9 +625,11 @@ describe('buildAudit (fix round 1)', () => {
     }
   });
 
-  it('M5: the report says which folders the secrets scan skipped', async () => {
+  it('M5: the report says which folders the quick secret check skipped (never calls it a secrets scan, P55)', async () => {
     const r = await buildAudit(repo(nodeApp()), deps());
-    expect(r.notes).toContain('The secrets scan did not check dependency and build folders (node_modules, .venv, dist, build, vendor, target) or .git, so committed build output was not checked either.');
+    expect(r.notes.some((n) => /secrets scan/i.test(n))).toBe(false);
+    expect(r.secretCheck.kind).toBe('quick-format-check');
+    expect(r.notes).toContain('The quick secret check did not check dependency and build folders (node_modules, .venv, dist, build, vendor, target) or .git, so committed build output was not checked either.');
   });
 
   it.skipIf(process.getuid?.() === 0)('M7: an unreadable file (mode 000) gives a note, not a crash', async () => {
@@ -635,7 +637,7 @@ describe('buildAudit (fix round 1)', () => {
     chmodSync(join(dir, 'src/locked.ts'), 0o000);
     try {
       const r = await buildAudit(dir, deps());
-      expect(r.notes).toContain("The secrets scan couldn't read 1 file (no permission, or it changed while being read); it was not checked.");
+      expect(r.notes).toContain("The quick secret check couldn't read 1 file (no permission, or it changed while being read); it was not checked.");
     } finally {
       chmodSync(join(dir, 'src/locked.ts'), 0o644);
     }
