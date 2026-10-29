@@ -3736,3 +3736,28 @@ describe('coverage: ruling P59 (round 2)', () => {
     expect(await st(profiled, run('npm run build'))).toBe('missing');
   });
 });
+
+describe('coverage: closing patch (ruling P60)', () => {
+  const app = svc('.', { language: 'python', packageManager: 'uv', scripts: ['start'], frameworks: ['fastapi'], quality: { ...emptyServiceQuality(), pythonTyped: true } });
+  const st = async (files: Record<string, string>, steps: string, id = 'unit-tests', services = [app], service = 'app', layer: Layer = 'push') => {
+    const dir = makeTempDir();
+    for (const [rel, text] of Object.entries(files)) writeIn(dir, rel, text);
+    ci(dir, steps);
+    const r = row(await coverage(dir, { services }), layer, id, service);
+    return `${r.status}${r.by === undefined ? '' : ` ${r.by}`}`;
+  };
+  const IMG = 'FROM python:3.14\nWORKDIR /app\nCOPY . /app\n';
+
+  it('R1: a compose service\'s env_file: goes through the env rules; one pipegen can\'t read is unsure', async () => {
+    const compose = (envFile: string) => ({ Dockerfile: IMG, 'tox.ini': '[tox]\n', 'compose.yml': `services:\n  app:\n    build: .\n    env_file: ${envFile}\n` });
+    const steps = run('docker compose run --rm app tox');
+    expect(await st({ ...compose('ci.env'), 'ci.env': 'TOXENV=lint\n' }, steps)).toBe('partial your own `tox`');
+    expect(await st({ ...compose('[ci.env]'), 'ci.env': '# c\nexport TOXENV=lint\n' }, steps)).toBe('partial your own `tox`');
+    expect(await st({ ...compose('\n      - path: ci.env\n        required: true'), 'ci.env': 'TOXENV=lint\n' }, steps)).toBe('partial your own `tox`');
+    // a file that sets nothing that matters changes nothing
+    expect(await st({ ...compose('ci.env'), 'ci.env': 'FOO=1\n' }, steps)).toBe('covered your own `tox`');
+    // a file pipegen can't read (missing, a variable path) is unsure: never covered
+    expect(await st(compose('missing.env'), steps)).not.toBe('covered your own `tox`');
+    expect(await st(compose('${ENV_FILE}'), steps)).not.toBe('covered your own `tox`');
+  });
+});

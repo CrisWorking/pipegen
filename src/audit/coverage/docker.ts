@@ -40,6 +40,8 @@ interface ComposeService {
   context: string | null; file: string | null; target: string | null; hasBuild: boolean; profiles: readonly string[]; environment: DockerEnv;
   /** P57 (M3): its build `args:` may pick a custom Dockerfile frontend (BUILDKIT_SYNTAX), or can't be read: why, else null. */
   frontend: string | null;
+  /** P60 (R1): its `env_file:` files (repo paths; `required: false` ones may be missing), or 'unsure' when pipegen can't place one. */
+  envFiles: readonly { rel: string; required: boolean }[] | 'unsure';
 }
 /** The services, or: no compose file ('missing'), one pipegen couldn't read ('unreadable'), or a set it can't be sure of (`why`, P57 C3). */
 export type ComposeModel = ReadonlyMap<string, ComposeService> | 'unreadable' | 'missing' | { why: string };
@@ -128,10 +130,11 @@ async function composeModel(ctx: Ctx, files: readonly string[] | null, cwd: stri
         const profiles = !('profiles' in svc) ? (prev?.profiles ?? []) : Array.isArray(svc.profiles) && svc.profiles.every((x) => typeof x === 'string') ? svc.profiles as string[] : null;
         if (profiles === null) return { why: `a compose service (${name}) whose profiles pipegen can't read` };
         // P57 (C5): the service's environment (a map or a list of NAME=value) reaches what runs in it; a later file's adds to it
-        const environment = { ...(prev?.environment ?? {}), ...composeEnvironment(svc.environment), ...(svc.env_file === undefined ? {} : { '\u0000env_file': '$' }) };
+        const environment = { ...(prev?.environment ?? {}), ...composeEnvironment(svc.environment) };
+        const envFiles = 'env_file' in svc ? envFilesOf(svc.env_file, baseDir) : (prev?.envFiles ?? []);
         if (!('build' in svc) || svc.build === null || svc.build === undefined) {
-          if (prev === undefined) out.set(name, { context: null, file: null, target: null, hasBuild: false, profiles, environment, frontend: null });
-          else out.set(name, { ...prev, profiles, environment });
+          if (prev === undefined) out.set(name, { context: null, file: null, target: null, hasBuild: false, profiles, environment, frontend: null, envFiles });
+          else out.set(name, { ...prev, profiles, environment, envFiles });
           continue;
         }
         const b = typeof svc.build === 'string' ? { context: svc.build } : asObj(svc.build);
@@ -143,13 +146,45 @@ async function composeModel(ctx: Ctx, files: readonly string[] | null, cwd: stri
           : dockerfile === undefined ? (typeof b.context === 'string' || prev?.file === null || prev === undefined ? resolveDir(folder, 'Dockerfile') : prev.file)
             : /[$\\]|^\//.test(dockerfile) ? null : resolveDir(folder, dockerfile);
         const target = typeof b.target === 'string' ? (/^[A-Za-z0-9_.-]{1,64}$/.test(b.target) ? b.target : '?') : (prev?.target ?? null);
-        out.set(name, { context: folder, file, target, hasBuild: true, profiles, environment, frontend: composeFrontend(b.args) ?? prev?.frontend ?? null });
+        out.set(name, { context: folder, file, target, hasBuild: true, profiles, environment, frontend: composeFrontend(b.args) ?? prev?.frontend ?? null, envFiles });
       }
     }
     return out;
   })();
   ctx.composeMemo.set(key, model);
   return model;
+}
+
+/**
+ * P60 (R1): a compose `env_file:` (a path, a list of paths, or of `{ path, required }`) as repo paths from the compose
+ * file's folder; 'unsure' for a value pipegen can't place (a variable, an absolute path, `..` out of the repo, another shape).
+ */
+function envFilesOf(v: unknown, baseDir: string): readonly { rel: string; required: boolean }[] | 'unsure' {
+  if (v === null || v === undefined) return [];
+  const items = Array.isArray(v) ? v : [v];
+  const out: { rel: string; required: boolean }[] = [];
+  for (const it of items) {
+    const o = typeof it === 'string' ? { path: it, required: true } : asObj(it);
+    const path = o.path;
+    if (typeof path !== 'string' || /[$\\]|^\//.test(path) || !regexSafe(path)) return 'unsure';
+    const rel = resolveDir(baseDir, path);
+    if (rel === null) return 'unsure';
+    out.push({ rel, required: o.required !== false });
+  }
+  return out;
+}
+/** P60 (R1): the variables an env file sets (`NAME=value`, `export NAME=value`, `NAME`); null when a line can't be read that way. */
+function envFileNames(text: string): Record<string, string> | null {
+  const out: Record<string, string> = {};
+  for (const line of text.split(/\r?\n/)) {
+    const l = line.trim();
+    if (l === '' || l.startsWith('#')) continue;
+    const m = /^(?:export\s+)?([A-Za-z_][A-Za-z0-9_.-]*)\s*(?:=(.*))?$/.exec(l);
+    if (m === null) return null;
+    const v = (m[2] ?? '').trim().replace(/^(["'])(.*)\1$/, '$2');
+    out[m[1] as string] = /^[A-Za-z0-9_.,:\/ -]*$/.test(v) ? v : '$';
+  }
+  return out;
 }
 
 /** P57 (C5): a compose `environment:` (a map, or a list of NAME=value / NAME) as names and values ('$' when not a plain literal). */
@@ -223,8 +258,28 @@ export async function placeComposeRun(ctx: Ctx, f: Found): Promise<Found | null>
   }
   const { composeRun: _placed, ...rest } = f;
   void _placed;
-  // P57 (C5): the image's ENV and the service's environment: reach the command like a step's env:
-  const [placed] = gated([{ ...rest, dir, compose: true }], gateOf([], [{ ...imageEnv, ...svc.environment }], undefined, ctx.sigs.softEnv, ctx.sigs.configFiles));
+  // P60 (R1): the service's env_file: files, read like its environment:; one pipegen can't read could set anything
+  let fileEnv: Record<string, string> | null = {};
+  if (svc.envFiles === 'unsure') fileEnv = null;
+  else {
+    for (const ef of svc.envFiles) {
+      if (!spend(ctx)) {
+        fileEnv = null;
+        break;
+      }
+      const t = await ctx.scriptRead.text(ef.rel);
+      if ('fail' in t && t.fail === 'missing' && !ef.required) continue;
+      const names = 'ok' in t ? envFileNames(t.ok) : null;
+      if (names === null) {
+        fileEnv = null;
+        break;
+      }
+      fileEnv = { ...fileEnv, ...names };
+    }
+  }
+  // P57 (C5): the image's ENV and the service's environment: reach the command like a step's env: (an env given as a
+  // plain string is "could be anything" to gateOf)
+  const [placed] = gated([{ ...rest, dir, compose: true }], gateOf([], [{ ...imageEnv, ...(fileEnv ?? {}), ...svc.environment }, ...(fileEnv === null ? ['$'] : [])], undefined, ctx.sigs.softEnv, ctx.sigs.configFiles));
   return placed ?? null;
 }
 
