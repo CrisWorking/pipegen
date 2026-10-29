@@ -5,10 +5,13 @@
 // date written in the file, and the pin must be tied to that upstream release:
 //   - npm lockfile entries that are new or whose version/resolved/integrity changed (transitive ones too): the
 //     name comes from the node_modules path, the version must exist in the registry, `resolved` must be the
-//     registry tarball and `integrity` must equal the registry's dist.integrity; date = registry `time[version]`;
+//     registry tarball and `integrity` must equal the registry's dist.integrity; date = registry `time[version]`.
+//     A packument over the byte cap (vite) is read as its version document (/<name>/<version>) for the integrity,
+//     dated by the Last-Modified of a HEAD on the registry tarball (never earlier than the publish), never a bigger cap;
 //   - reviewed tools (whole entry diffed): an action's SHA must be the commit of its tag, a release binary's asset
-//     digest must belong to that GitHub release, a docker digest must be the tag's digest on Docker Hub, npm/pip
-//     tools and plugins are checked on their registries; date = release published_at / registry time;
+//     digest must belong to that GitHub release, a docker digest must be the tag's digest on Docker Hub, an npm/pip
+//     tool's package (step.cli.install.package) is tied to candidate.pin.checksum and each step.cli.plugins entry to
+//     its own checksum on its registry; date = release published_at / registry time;
 //   - pinned binaries: every platform url and sha256 must belong to the GitHub release of that version.
 // Anything that can't be tied and dated (lookup failed, 404, no digest, unreadable date, date in the future,
 // a kind this script doesn't know) fails closed. A docker pin it can't date says "needs owner review".
@@ -237,16 +240,31 @@ export function changedLockEntries(base: string | null | undefined, head: string
 
 class LookupError extends Error {
   readonly notFound: boolean;
-  constructor(message: string, notFound = false) {
+  readonly tooLarge: boolean;
+  constructor(message: string, notFound = false, tooLarge = false) {
     super(message);
     this.notFound = notFound;
+    this.tooLarge = tooLarge;
   }
+}
+
+const tooLarge = (): LookupError => new LookupError('response too large', false, true);
+
+/** HTTP status as a problem; a GitHub API 403/429 says how to give a token (unauthenticated runs hit the rate limit). */
+function httpProblem(url: string, res: Response, hasToken: boolean): string {
+  const base = `HTTP ${res.status}`;
+  if (!url.startsWith('https://api.github.com/') || (res.status !== 403 && res.status !== 429)) return base;
+  const limited = res.status === 429 || res.headers.get('x-ratelimit-remaining') === '0';
+  const why = limited ? 'GitHub API rate limit reached' : 'GitHub refused the request (rate limit or access)';
+  return hasToken
+    ? `${base}: ${why}; the GITHUB_TOKEN given may be rate-limited or lack read access`
+    : `${base}: ${why}; no GITHUB_TOKEN was set (CI passes github.token; by hand run with GITHUB_TOKEN=$(gh auth token))`;
 }
 
 /** Reads a body up to the byte cap, cancelling the stream past it. */
 async function readCapped(res: Response): Promise<string> {
   const declared = Number(res.headers.get('content-length') ?? '0');
-  if (declared > MAX_BODY_BYTES) throw new LookupError('response too large');
+  if (declared > MAX_BODY_BYTES) throw tooLarge();
   if (!res.body) return '';
   const reader = res.body.getReader();
   const chunks: Uint8Array[] = [];
@@ -257,22 +275,27 @@ async function readCapped(res: Response): Promise<string> {
     total += value.byteLength;
     if (total > MAX_BODY_BYTES) {
       await reader.cancel().catch(() => undefined);
-      throw new LookupError('response too large');
+      throw tooLarge();
     }
     chunks.push(value);
   }
   return Buffer.concat(chunks).toString('utf8');
 }
 
-async function getJson(f: typeof fetch, url: string, headers: Record<string, string>, timeoutMs: number): Promise<unknown> {
+async function request(f: typeof fetch, url: string, init: RequestInit, timeoutMs: number, hasToken: boolean): Promise<Response> {
   let res: Response;
   try {
-    res = await f(url, { headers: { accept: 'application/json', ...headers }, redirect: 'error', signal: AbortSignal.timeout(timeoutMs) });
+    res = await f(url, { ...init, redirect: 'error', signal: AbortSignal.timeout(timeoutMs) });
   } catch (e) {
     throw new LookupError(`request failed (${e instanceof Error ? e.name : 'error'})`);
   }
   if (res.status === 404) throw new LookupError('not found (404)', true);
-  if (!res.ok) throw new LookupError(`HTTP ${res.status}`);
+  if (!res.ok) throw new LookupError(httpProblem(url, res, hasToken));
+  return res;
+}
+
+async function getJson(f: typeof fetch, url: string, headers: Record<string, string>, timeoutMs: number, hasToken: boolean): Promise<unknown> {
+  const res = await request(f, url, { headers: { accept: 'application/json', ...headers } }, timeoutMs, hasToken);
   try {
     return JSON.parse(await readCapped(res));
   } catch (e) {
@@ -281,30 +304,38 @@ async function getJson(f: typeof fetch, url: string, headers: Record<string, str
   }
 }
 
-/** Every request goes through here: counted against the cap, and one answer per URL. */
+/** Every request goes through here: counted against the cap, and one answer per URL (and method). */
 interface Ctx {
   get: (url: string, headers?: Record<string, string>) => Promise<unknown>;
+  /** A HEAD request's Last-Modified header (undefined when there is none). */
+  lastModified: (url: string) => Promise<string | undefined>;
   gh: Record<string, string>;
   notes: string[];
 }
 
 function makeCtx(opts: CooldownOptions, notes: string[]): Ctx {
   const cap = opts.maxLookups ?? MAX_LOOKUPS;
+  const timeout = opts.timeoutMs ?? LOOKUP_TIMEOUT_MS;
+  const hasToken = Boolean(opts.githubToken);
   const cache = new Map<string, Promise<unknown>>();
+  const once = <T>(key: string, run: () => Promise<T>): Promise<T> => {
+    let p = cache.get(key);
+    if (!p) {
+      p = cache.size >= cap ? Promise.reject(new LookupError(`lookup cap of ${cap} reached; split the PR`)) : run();
+      cache.set(key, p);
+      p.catch(() => undefined);
+    }
+    return p as Promise<T>;
+  };
   return {
     notes,
     gh: opts.githubToken ? { authorization: `Bearer ${opts.githubToken}` } : {},
-    get(url, headers = {}) {
-      let p = cache.get(url);
-      if (!p) {
-        p = cache.size >= cap
-          ? Promise.reject(new LookupError(`lookup cap of ${cap} reached; split the PR`))
-          : getJson(opts.fetch, url, headers, opts.timeoutMs ?? LOOKUP_TIMEOUT_MS);
-        cache.set(url, p);
-        p.catch(() => undefined);
-      }
-      return p;
-    },
+    get: (url, headers = {}) => once(url, () => getJson(opts.fetch, url, headers, timeout, hasToken)),
+    lastModified: (url) => once(`HEAD ${url}`, async () => {
+      const res = await request(opts.fetch, url, { method: 'HEAD' }, timeout, hasToken);
+      await res.body?.cancel().catch(() => undefined);
+      return str(res.headers.get('last-modified'));
+    }),
   };
 }
 
@@ -348,16 +379,45 @@ const sha256Of = (v: unknown): string | undefined => {
   return /^[0-9a-f]{64}$/.test(s) ? s : undefined;
 };
 
+/** The registry's own tarball URL for a package version. */
+const npmTarball = (name: string, version: string): string => `${REGISTRY}${name}/-/${name.includes('/') ? name.slice(name.indexOf('/') + 1) : name}-${version}.tgz`;
+
+const HTTP_DATE = /^(Mon|Tue|Wed|Thu|Fri|Sat|Sun), \d{2} (Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec) \d{4} \d{2}:\d{2}:\d{2} GMT$/;
+
+/**
+ * An npm package version whose packument is over the byte cap: the version document must be this package version
+ * with this integrity and the registry tarball; date = the Last-Modified of that tarball. The registry stores the
+ * tarball when the version is published and a version can never be published again, so that date is never earlier
+ * than the publish: it can only make a version look younger, never older.
+ */
+async function npmVersionOutcome(ctx: Ctx, name: string, version: string, integrity: string | undefined): Promise<Outcome> {
+  const meta = await ctx.get(`${npmUrl(name)}/${encodeURIComponent(version)}`);
+  if (!isObj(meta) || meta.name !== name || meta.version !== version) return fail('the registry version document is not for this package version');
+  const dist = isObj(meta.dist) ? meta.dist : {};
+  if (!integrity || integrity !== str(dist.integrity)) return fail('integrity does not match the registry dist.integrity');
+  const tarball = npmTarball(name, version);
+  if (str(dist.tarball) !== tarball) return fail('the registry dist.tarball is not the registry tarball of this version');
+  const modified = await ctx.lastModified(tarball);
+  if (!modified || !HTTP_DATE.test(modified) || Number.isNaN(Date.parse(modified))) {
+    return fail('the packument is over the size cap and the registry tarball has no readable Last-Modified date');
+  }
+  return { date: new Date(Date.parse(modified)).toISOString() };
+}
+
 /** An npm package version: must exist in the registry; integrity must match; date = time[version]. */
 async function npmOutcome(ctx: Ctx, name: string, version: string, integrity: string | undefined, resolved?: string): Promise<Outcome> {
   if (!NPM_NAME.test(name)) return fail('unusual package name');
   if (!SEMVER.test(version)) return fail('version is not valid semver');
-  if (resolved !== undefined) {
-    const base = name.includes('/') ? name.slice(name.indexOf('/') + 1) : name;
-    if (resolved !== `${REGISTRY}${name}/-/${base}-${version}.tgz`) return fail(`resolved is not the registry tarball of ${name}@${version}`);
-  }
+  if (resolved !== undefined && resolved !== npmTarball(name, version)) return fail(`resolved is not the registry tarball of ${name}@${version}`);
   return guard(async () => {
-    const doc = await ctx.get(npmUrl(name));
+    let doc: unknown;
+    try {
+      doc = await ctx.get(npmUrl(name));
+    } catch (e) {
+      // The full packument of a big package (vite: about 39 MB) is over the cap; the cap stays, the bounded path decides.
+      if (e instanceof LookupError && e.tooLarge) return npmVersionOutcome(ctx, name, version, integrity);
+      throw e;
+    }
     const versions = isObj(doc) && isObj(doc.versions) ? doc.versions : undefined;
     const meta = versions?.[version];
     if (!isObj(meta)) return fail('this version does not exist in the registry');
@@ -480,16 +540,19 @@ interface Item {
 const REVIEWED_SKIP = new Set(['reviewedBy', 'reviewedAt', 'proofs']);
 const BINARY_SKIP = new Set(['reviewedBy', 'reviewedAt']);
 
-function installItems(tool: string, inst: unknown, label: string): Item[] {
-  if (!isObj(inst)) return [];
-  const method = str(inst.method);
-  const pkg = str(inst.package) ?? '';
-  const version = str(inst.version) ?? '';
-  const checksum = str(inst.checksum);
-  const mk = (kind: Finding['kind'], run: Item['run']): Item[] => [{ kind, name: `${tool} (${label} ${pkg})`, version, run }];
-  if (method === 'npm') return mk('npm', (ctx) => npmOutcome(ctx, pkg, version, checksum));
-  if (method === 'pip') return mk('pypi', (ctx) => pypiOutcome(ctx, pkg, version, checksum));
-  return [];
+/**
+ * One npm or pip package, tied to `checksum` on its registry: the tool's own package (with the candidate pin) or a
+ * plugin (with its own checksum). Any other method can't be tied, so it fails rather than being skipped.
+ */
+function packageItem(tool: string, inst: unknown, label: string, checksum: string | undefined): Item {
+  const o = isObj(inst) ? inst : {};
+  const method = str(o.method);
+  const pkg = str(o.package) ?? '';
+  const version = str(o.version) ?? '';
+  const name = `${tool} (${label}${pkg ? ` ${pkg}` : ''})`;
+  if (method === 'npm') return { kind: 'npm', name, version, run: (ctx) => npmOutcome(ctx, pkg, version, checksum) };
+  if (method === 'pip') return { kind: 'pypi', name, version, run: (ctx) => pypiOutcome(ctx, pkg, version, checksum) };
+  return { kind: 'reviewed-tool', name, version, run: async () => fail(`install method "${method ?? '?'}" is not one this check can tie to an upstream date; needs owner review`) };
 }
 
 /** Everything to check for the added or changed entries of data/reviewed-tools.yml. */
@@ -523,7 +586,13 @@ export function reviewedItems(base: string | null | undefined, head: string | nu
         return assetOutcome(ctx, repo, tag, str(inst.package) ?? '', str(pin.checksum));
       }));
     } else if (kind === 'cli' && inst && (inst.method === 'npm' || inst.method === 'pip')) {
-      items.push(...installItems(id, inst, 'tool'));
+      // The package is step.cli.install.package (candidate.id is pipegen's id); its hash is the candidate pin. An
+      // install checksum, when written, must be that same value (as the loader requires), never an alternative.
+      const pinned = str(pin.checksum);
+      const own = str(inst.checksum);
+      if (str(inst.version) !== version) items.push(label(async () => fail('step.cli.install.version differs from the candidate version')));
+      else if (own !== undefined && own !== pinned) items.push(label(async () => fail('step.cli.install.checksum differs from candidate.pin.checksum')));
+      else items.push(packageItem(id, inst, 'tool', pinned));
     } else if (kind === 'docker' && inst && inst.method === 'docker') {
       items.push(label(async (ctx) => {
         if (str(inst.version) !== version) return fail('install version differs from the candidate version');
@@ -532,7 +601,9 @@ export function reviewedItems(base: string | null | undefined, head: string | nu
     } else {
       items.push(label(async () => fail(`kind "${kind ?? '?'}" is not one this check can tie to an upstream date; needs owner review`)));
     }
-    if (cli && Array.isArray(cli.plugins)) cli.plugins.forEach((p, i) => items.push(...installItems(id, p, `plugin ${i + 1}`)));
+    // Every plugin is its own package with its own checksum and date.
+    if (cli && Array.isArray(cli.plugins)) cli.plugins.forEach((p, i) => items.push(packageItem(id, p, `plugin ${i + 1}`, isObj(p) ? str(p.checksum) : undefined)));
+    else if (cli && cli.plugins !== undefined) items.push(label(async () => fail('step.cli.plugins is not a list')));
   }
   return items;
 }

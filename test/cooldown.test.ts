@@ -22,17 +22,25 @@ function lock(pkgs: Record<string, Pkg | string>, over: Record<string, unknown> 
   return JSON.stringify({ lockfileVersion: 3, packages, ...over });
 }
 
-/** Routes: URL -> JSON body, or a status number. Anything unlisted is a 404. Every URL asked is recorded. */
+/**
+ * Routes: URL -> JSON body, a status number, or a function making the Response (it gets the request init, so it can
+ * see a HEAD). Anything unlisted is a 404. Every URL asked is recorded (a HEAD as `HEAD <url>`).
+ */
 type Routes = Record<string, unknown>;
 function router(routes: Routes, calls: string[] = []): typeof fetch {
-  return (async (url: string) => {
-    calls.push(String(url));
+  return (async (url: string, init?: RequestInit) => {
+    calls.push(init?.method === 'HEAD' ? `HEAD ${String(url)}` : String(url));
     const r = routes[String(url)];
     if (r === undefined) return new Response('{}', { status: 404 });
     if (typeof r === 'number') return new Response('x', { status: r });
+    if (typeof r === 'function') return (r as (i?: RequestInit) => Response)(init);
     return new Response(JSON.stringify(r), { status: 200 });
   }) as typeof fetch;
 }
+
+/** A body over the 32 MB cap, as a stream with no content-length (like the registry's gzip answer). */
+const tooBig = (): Response => new Response(new ReadableStream({ start(c) { c.enqueue(new Uint8Array(33 * 1024 * 1024)); c.close(); } }), { status: 200 });
+const httpDate = (iso: string): string => new Date(iso).toUTCString();
 
 const npmDoc = (name: string, versions: Record<string, string>) => ({
   [`https://registry.npmjs.org/${name.replace('/', '%2f')}`]: {
@@ -133,6 +141,61 @@ describe('cooldown: npm lockfile', () => {
   it('integrity must equal the registry dist.integrity', async () => {
     const r = await run({}, { 'package-lock.json': lock({ lodash: { v: '4.17.21', integrity: 'sha512-WRONG' } }) }, router(npmDoc('lodash', { '4.17.21': daysAgo(900) })));
     expect(problems(r)).toContain('integrity');
+  });
+
+  describe('a packument over the byte cap (vite): the version document and the tarball date, never a bigger cap', () => {
+    const name = 'vite';
+    const v = '8.3.4';
+    const tarball = tgz(name, v);
+    const routes = (o: { integrity?: string; lastModified?: string | null; doc?: unknown; tarballUrl?: string } = {}): Routes => ({
+      [`https://registry.npmjs.org/${name}`]: tooBig,
+      [`https://registry.npmjs.org/${name}/${v}`]: o.doc ?? { name, version: v, dist: { integrity: o.integrity ?? integ(name, v), tarball: o.tarballUrl ?? tarball } },
+      [tarball]: (init?: RequestInit) => {
+        if (init?.method !== 'HEAD') return new Response('tarball bytes', { status: 200 });
+        const lm = o.lastModified === undefined ? httpDate(daysAgo(21)) : o.lastModified;
+        return new Response(null, { status: 200, headers: lm === null ? {} : { 'last-modified': lm } });
+      },
+    });
+    const head = { 'package-lock.json': lock({ vite: v }) };
+
+    it('an old version passes: integrity from /<name>/<version>, date from a HEAD of the registry tarball', async () => {
+      const calls: string[] = [];
+      const r = await run({}, head, router(routes(), calls));
+      expect(problems(r)).toBe('');
+      expect(r.ok).toBe(true);
+      expect(calls).toEqual(['https://registry.npmjs.org/vite', 'https://registry.npmjs.org/vite/8.3.4', `HEAD ${tarball}`]);
+    });
+
+    it('a young tarball, a wrong integrity, a missing or odd Last-Modified, another tarball url or a doc for another version fail', async () => {
+      const young = await run({}, head, router(routes({ lastModified: httpDate(daysAgo(2)) })));
+      expect(young.findings[0]?.young).toBe(true);
+      expect(problems(await run({}, head, router(routes({ integrity: 'sha512-WRONG' }))))).toContain('integrity');
+      expect(problems(await run({}, head, router(routes({ lastModified: null }))))).toContain('Last-Modified');
+      expect(problems(await run({}, head, router(routes({ lastModified: 'yesterday' }))))).toContain('Last-Modified');
+      expect(problems(await run({}, head, router(routes({ tarballUrl: 'https://evil.example/vite.tgz' }))))).toContain('tarball');
+      expect(problems(await run({}, head, router(routes({ doc: { name, version: '8.3.5', dist: { integrity: integ(name, v), tarball } } }))))).toContain('not for this package version');
+      const future = await run({}, head, router(routes({ lastModified: httpDate(daysAgo(-2)) })));
+      expect(problems(future)).toContain('future');
+    });
+
+    it('a 404 version document or a failed HEAD fails closed', async () => {
+      const r1 = routes();
+      delete r1[`https://registry.npmjs.org/${name}/${v}`];
+      expect(problems(await run({}, head, router(r1)))).toContain('404');
+      const r2 = { ...routes(), [tarball]: 503 };
+      const r = await run({}, head, router(r2));
+      expect(r.ok).toBe(false);
+      expect(r.findings[0]?.lookupFailed).toBe(true);
+    });
+
+    it('a reviewed npm tool whose packument is too big is checked the same way', async () => {
+      const entry = `  - id: v
+    candidate: { id: v, kind: cli, repo: vitejs/vite, version: "${v}", pin: { checksum: "${integ(name, v)}" } }
+    step: { cli: { install: { method: npm, package: ${name}, version: "${v}" }, command: [] } }
+`;
+      expect((await run({}, { 'data/reviewed-tools.yml': rtFile(entry) }, router(routes()))).ok).toBe(true);
+      expect((await run({}, { 'data/reviewed-tools.yml': rtFile(entry) }, router(routes({ integrity: 'sha512-WRONG' })))).ok).toBe(false);
+    });
   });
 
   it('probe 1d: lockfileVersion 1, no packages, or a removed head lockfile fails', async () => {
@@ -321,6 +384,87 @@ ${extra}`;
     expect(r.findings.some((f) => f.name.includes('plugin 1 plug'))).toBe(true);
     const wrong = { 'data/reviewed-tools.yml': rtFile(plugin('9.9.9', 'sha512-WRONG')) };
     expect(problems(await run(base, wrong, router({ ...routes, ...npmDoc('plug', { '9.9.9': daysAgo(90) }) })))).toContain('integrity');
+  });
+
+  // The data's shape since Plan P: the main package's hash is candidate.pin.checksum (step.cli.install has none), and
+  // each plugin carries its own checksum. candidate.id is pipegen's id, never the package name.
+  const npmTool = (o: { install?: string; plugins?: string; pinned?: string; version?: string } = {}): string => `  - id: lint-ts
+    candidate: { id: lint-ts, kind: cli, repo: o/r, version: "${o.version ?? '1.0.0'}", pin: { checksum: "${o.pinned ?? integ('tool', '1.0.0')}" } }
+    step: { cli: { install: ${o.install ?? '{ method: npm, package: tool, version: "1.0.0" }'}, plugins: ${o.plugins ?? `[{ method: npm, package: "@s/plug", version: "2.0.0", checksum: "${integ('@s/plug', '2.0.0')}" }]`}, command: [] } }
+`;
+  const npmRoutes = (toolAt = daysAgo(90), plugAt = daysAgo(90)) => ({ ...npmDoc('tool', { '1.0.0': toolAt }), ...npmDoc('@s/plug', { '2.0.0': plugAt }) });
+
+  it('an npm tool: the main package is tied to candidate.pin.checksum, each plugin to its own checksum', async () => {
+    const calls: string[] = [];
+    const head = { 'data/reviewed-tools.yml': rtFile(npmTool()) };
+    const r = await run({}, head, router(npmRoutes(), calls));
+    expect(problems(r)).toBe('');
+    expect(r.checked).toBe(2);
+    expect(calls.sort()).toEqual(['https://registry.npmjs.org/@s%2fplug', 'https://registry.npmjs.org/tool']);
+    // never looked up by candidate.id
+    expect(calls.some((c) => c.includes('lint-ts'))).toBe(false);
+    const young = await run({}, head, router(npmRoutes(daysAgo(90), daysAgo(1))));
+    expect(young.findings.map((f) => f.name)).toEqual(['lint-ts (plugin 1 @s/plug)']);
+    const wrongMain = { 'data/reviewed-tools.yml': rtFile(npmTool({ pinned: 'sha512-WRONG' })) };
+    expect((await run({}, wrongMain, router(npmRoutes()))).findings.map((f) => `${f.name}: ${f.problem}`)).toEqual(['lint-ts (tool tool): integrity does not match the registry dist.integrity']);
+  });
+
+  it('an install checksum or version that differs from the candidate pin fails, never picks one', async () => {
+    const own = { 'data/reviewed-tools.yml': rtFile(npmTool({ install: `{ method: npm, package: tool, version: "1.0.0", checksum: "${integ('other', '1')}" }` })) };
+    expect(problems(await run({}, own, router(npmRoutes())))).toContain('candidate.pin.checksum');
+    const same = { 'data/reviewed-tools.yml': rtFile(npmTool({ install: `{ method: npm, package: tool, version: "1.0.0", checksum: "${integ('tool', '1.0.0')}" }` })) };
+    expect((await run({}, same, router(npmRoutes()))).ok).toBe(true);
+    const ver = { 'data/reviewed-tools.yml': rtFile(npmTool({ version: '9.9.9' })) };
+    expect(problems(await run({}, ver, router(npmRoutes())))).toContain('candidate version');
+  });
+
+  it('a plugin with a method this check can not tie, or a plugins value that is not a list, fails closed', async () => {
+    const gh1 = { 'data/reviewed-tools.yml': rtFile(npmTool({ plugins: `[{ method: github-release, package: x.tgz, version: "1", checksum: "${HEX}" }]` })) };
+    const r = await run({}, gh1, router(npmRoutes()));
+    expect(r.findings.map((f) => `${f.name}: ${f.problem}`)).toEqual(['lint-ts (plugin 1 x.tgz): install method "github-release" is not one this check can tie to an upstream date; needs owner review']);
+    const notList = { 'data/reviewed-tools.yml': rtFile(npmTool({ plugins: '{ method: npm }' })) };
+    expect(problems(await run({}, notList, router(npmRoutes())))).toContain('plugins');
+  });
+
+  const pipTool = (pinned: string, plugin = HEX2): string => `  - id: lint-py
+    candidate: { id: lint-py, kind: cli, repo: o/r, version: "1.9.4", pin: { checksum: "${pinned}" } }
+    step: { cli: { install: { method: pip, package: bandit, version: "1.9.4" }, plugins: [{ method: pip, package: sarif-om, version: "1.0.4", checksum: "${plugin}" }], command: [] } }
+`;
+  const pypi = (name: string, v: string, sha: string, at: string) => ({
+    [`https://pypi.org/pypi/${name}/${v}/json`]: { urls: [{ filename: `${name}-${v}.tar.gz`, digests: { sha256: '0'.repeat(64) }, upload_time_iso_8601: daysAgo(900) }, { filename: `${name}-${v}-py3-none-any.whl`, digests: { sha256: sha }, upload_time_iso_8601: at }] },
+  });
+
+  it('a pip tool: the main package is tied to the wheel sha256 in candidate.pin.checksum, the plugin to its own', async () => {
+    const routes = { ...pypi('bandit', '1.9.4', HEX, daysAgo(60)), ...pypi('sarif-om', '1.0.4', HEX2, daysAgo(600)) };
+    const head = { 'data/reviewed-tools.yml': rtFile(pipTool(HEX)) };
+    const r = await run({}, head, router(routes));
+    expect(problems(r)).toBe('');
+    expect(r.checked).toBe(2);
+    expect(problems(await run({}, { 'data/reviewed-tools.yml': rtFile(pipTool('1'.repeat(64))) }, router(routes)))).toContain('pinned sha256');
+    expect(problems(await run({}, { 'data/reviewed-tools.yml': rtFile(pipTool(HEX, '1'.repeat(64))) }, router(routes)))).toContain('pinned sha256');
+    const young = await run({}, head, router({ ...routes, ...pypi('bandit', '1.9.4', HEX, daysAgo(3)) }));
+    expect(young.findings.map((f) => f.name)).toEqual(['lint-py (tool bandit)']);
+  });
+
+  // built at runtime so no committed test line looks like a credential assignment (test/no-secret-literals.test.ts)
+  const HAND_RUN_HINT = ['GITHUB_TOK', 'EN=$(gh auth token)'].join('');
+  const GH_OPTS = Object.fromEntries([[['github', 'Tok', 'en'].join(''), 'x'.repeat(8)]]);
+  it('a GitHub 403 or 429 says to set GITHUB_TOKEN (gh auth token by hand) and still fails closed', async () => {
+    const limited = (status: number) => () => new Response('{}', { status, headers: { 'x-ratelimit-remaining': '0' } });
+    const head = { 'data/reviewed-tools.yml': rtFile(action('v2', SHA2)) };
+    for (const status of [403, 429]) {
+      const r = await run({}, head, router({ [gh('o/r/git/ref/tags/v2')]: limited(status) }));
+      expect(r.ok).toBe(false);
+      expect(r.findings[0]?.lookupFailed).toBe(true);
+      expect(problems(r)).toContain('rate limit');
+      expect(problems(r)).toContain(HAND_RUN_HINT);
+    }
+    const given = await run({}, head, router({ [gh('o/r/git/ref/tags/v2')]: 403 }), GH_OPTS);
+    expect(problems(given)).toContain('GITHUB_TOKEN');
+    expect(problems(given)).not.toContain('gh auth token');
+    // a 403 from the npm registry is just an HTTP error
+    const npm403 = await run({}, { 'package-lock.json': lock({ a: '1.0.0' }) }, router({ 'https://registry.npmjs.org/a': 403 }));
+    expect(problems(npm403)).toBe('lookup failed: HTTP 403');
   });
 
   it('an unknown kind fails closed', async () => {

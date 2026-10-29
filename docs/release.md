@@ -40,8 +40,12 @@ Every job has minimal permissions (`permissions: {}` at the top), and every acti
 
 ```bash
 npm run build
-node scripts/release-check.ts --tag vX.Y.Z   # from the repo root
+GITHUB_TOKEN=$(gh auth token) node scripts/release-check.ts --tag vX.Y.Z   # from the repo root
 ```
+
+The cooldown step asks the GitHub API about every action and release binary. Without a token GitHub's rate limit
+stops it after a few dozen requests (it then fails with `HTTP 403 ... no GITHUB_TOKEN was set`), so pass one when
+running it by hand; `release.yml` passes the job's `github.token`.
 
 It fails (exit 1) unless all of these hold:
 

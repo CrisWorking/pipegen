@@ -6,15 +6,17 @@ pipegen's own rule (DECISIONS #92): no new dependency version and no new pinned 
 
 The `cooldown` job in `.github/workflows/ci.yml` runs on every pull request. It compares the PR with its base commit, looking at three files. The date always comes from upstream, never from a date written in the file, and the pin has to match the upstream release:
 
-- `package-lock.json`: every entry that is new, or whose version, tarball or integrity changed, including packages pulled in by other packages. The name comes from the `node_modules/` path, the tarball must be the npm registry's own, the version must exist in the registry, and `integrity` must equal the registry's. The date is the registry publish time. Workspace links are skipped. An old lockfile format (below version 2), a lockfile without `packages`, or a removed lockfile fails.
-- `data/reviewed-tools.yml`: any entry that changed (every field except `reviewedBy`, `reviewedAt` and `proofs`). An action's SHA must be the commit its tag points to; a release binary's checksum must be the digest GitHub records for that asset; a Docker digest must be the one Docker Hub shows for that tag; npm and pip tools and plugins are checked on their registries. The date is the release's `published_at`, or the registry or push time.
+- `package-lock.json`: every entry that is new, or whose version, tarball or integrity changed, including packages pulled in by other packages. The name comes from the `node_modules/` path, the tarball must be the npm registry's own, the version must exist in the registry, and `integrity` must equal the registry's. The date is the registry publish time. A package whose full registry document is over the 32 MB size limit (vite is about 39 MB) is read from its version document (`/<name>/<version>`) instead, and dated by the `Last-Modified` time of its registry tarball: the registry stores the tarball when the version is published and a version can never be published again, so that time is never earlier than the publish. Workspace links are skipped. An old lockfile format (below version 2), a lockfile without `packages`, or a removed lockfile fails.
+- `data/reviewed-tools.yml`: any entry that changed (every field except `reviewedBy`, `reviewedAt` and `proofs`). An action's SHA must be the commit its tag points to; a release binary's checksum must be the digest GitHub records for that asset; a Docker digest must be the one Docker Hub shows for that tag. An npm or pip tool's package (`step.cli.install.package`, not the candidate id) must have the hash in `candidate.pin.checksum` on its registry (npm: the `dist.integrity`; PyPI: the sha256 of one of that release's files), and every `step.cli.plugins` entry its own `checksum`, each with its own date; a plugin installed any other way fails. The date is the release's `published_at`, or the registry or push time.
 - `data/pinned-binaries.yml`: any tool that changed. Every platform's URL must be an asset of the GitHub release for that version, in the tool's own repo, with the recorded sha256.
 
 If anything is under 7 days old, or cannot be tied to an upstream date, the job fails and lists each item (unless the emergency path below applies). A tool kind or image the script cannot check (not on Docker Hub, no GitHub digest) fails with "needs owner review". Versions the PR did not change are never checked. A downgrade to an older version is fine.
 
 ## It fails closed
 
-If the registry or GitHub cannot be reached, a date cannot be read, a lookup returns 404, or a date is in the future, the job fails. Re-run the failed job when the service is back. There is a cap of 150 distinct lookups and a 15 second timeout and a 32 MB size limit on each; a PR that changes more than that should be split. Parse errors never print file content.
+If the registry or GitHub cannot be reached, a date cannot be read, a lookup returns 404, or a date is in the future, the job fails. Re-run the failed job when the service is back. There is a cap of 150 distinct lookups and a 15 second timeout and a 32 MB size limit on each; a PR that changes more than that should be split. The size limit is never raised: an npm document over it takes the smaller lookups above. Parse errors never print file content.
+
+GitHub's API allows few requests without a token. The CI jobs pass `GITHUB_TOKEN`; for a run by hand, pass one too, for example `GITHUB_TOKEN=$(gh auth token) node scripts/release-check.ts --tag vX.Y.Z`. A GitHub 403 or 429 still fails the check, and its message says whether a token was set.
 
 ## The emergency path for urgent security fixes
 
@@ -44,5 +46,6 @@ The bootstrap case is also open to a repeat: if `scripts/cooldown.ts` is ever de
 
 ## Other limits
 
+- An action's `wrappedImage` in `data/reviewed-tools.yml` (scorecard-action's GHCR image) is a record of the image the action's own `action.yml` runs, not a pin pipegen installs; the action itself is checked by its commit SHA.
 - GitHub Action SHA bumps in `.github/workflows/*.yml` are not checked here. Dependabot's own 7 day `cooldown` setting covers them.
 - `.npmrc` has `min-release-age=7`, but the npm that ships with Node 24 ignores it (it only warns). This check is what enforces the rule on CI for the lockfile.
