@@ -105,6 +105,11 @@ export interface Found {
   langs?: readonly string[];
   /** P57 (C1): the folders the tool was given as path arguments (repo-relative); the run covers only the services under them. */
   pathArgs?: readonly string[];
+  /**
+   * P59 (4): a placeholder for a compose command found while following a script: unknown when the job may set
+   * COMPOSE_FILE / COMPOSE_PROFILES (the step's gate), dropped otherwise (walkStep, readHooks, the hook config).
+   */
+  composeSentinel?: true;
   /** P59 (3): the run was given a path pipegen can't place: why (it can't cover a service, only be unknown there). */
   unplaced?: string;
   /** P57 (C4): the pre-commit hook id this run comes from (readPrecommitConfig), so SKIP / PREK_SKIP can name it. */

@@ -361,7 +361,7 @@ async function walkStep(ctx: Ctx, step: Obj, c: StepCtx): Promise<void> {
       addFound(ctx, scanImage(uses, withInputs, ctx.sigs), sc);
     } else {
       const tools = actionMatches(ctx.sigs, uses);
-      addFound(ctx, gated(await resolveScripts(ctx, actionFinds(ctx, tools, uses, withInputs, false, sc)), sc.gate), sc);
+      addFound(ctx, gated(await resolveScripts(ctx, actionFinds(ctx, tools, uses, withInputs, false, sc)), sc.gate).filter((f) => f.composeSentinel !== true || sc.gate.compose), sc);
       const owner = uses.split('/')[0]?.toLowerCase();
       if (tools.length === 0 && owner !== undefined && owner === ctx.p.owner.toLowerCase()) opaque(ctx, OPAQUE_WHY.ownerAction, validRef(uses), sc);
     }
@@ -373,7 +373,7 @@ async function walkStep(ctx: Ctx, step: Obj, c: StepCtx): Promise<void> {
     if (mode === null) return opaque(ctx, OPAQUE_WHY.unknownShell, undefined, sc);
     // P57 (C3): a compose command in a job that may set COMPOSE_FILE / COMPOSE_PROFILES is unknown before it is followed
     const found = mode === 'noexec' ? [] : await resolveScripts(ctx, composeEnvGated(scanShell(step.run, base, ctx.sigs, ctx.budget, mode), sc.gate.compose));
-    addFound(ctx, gated(found, sc.gate), sc);
+    addFound(ctx, gated(found, sc.gate).filter((f) => f.composeSentinel !== true || sc.gate.compose), sc);
   }
 }
 

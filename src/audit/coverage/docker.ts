@@ -571,7 +571,7 @@ export async function buildRuns(ctx: Ctx, f: Found, resolve: Resolve): Promise<F
 }
 
 /** P57 (C3): what pipegen says for a compose run or build when a COMPOSE_FILE / COMPOSE_PROFILES variable may be set. */
-const composeEnvWhy = (subject: string) =>
+export const composeEnvWhy = (subject: string) =>
   `${subject} runs through docker compose, and a COMPOSE_FILE or COMPOSE_PROFILES variable set in this job can change which compose files and services it uses, so pipegen can't tell what it checks.`;
 /**
  * P57 (C3): a step whose job may set COMPOSE_FILE, COMPOSE_PROFILES or COMPOSE_PATH_SEPARATOR (EnvGate.compose): a

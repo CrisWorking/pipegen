@@ -7,7 +7,7 @@ import {
   OK_COMMANDS, PYTEST_NO_RUN, SCRIPT_CATEGORIES, shebangOk, UNKNOWN_SCRIPT_CATEGORIES, globCappedWhy, probeCall, scanShell, scriptCall, type CmdInfo,
   type ShellMode,
 } from './shell.js';
-import { buildRuns, placeComposeRun } from './docker.js';
+import { buildRuns, composeEnvWhy, placeComposeRun } from './docker.js';
 import { compileGlob } from './triggers.js';
 import type { Compiled, Ctx, Found, Reason } from './types.js';
 
@@ -18,7 +18,7 @@ const carriedConfig = (g: Found) => ({
   ...(g.softEnv === undefined ? {} : { softEnv: g.softEnv }), ...(g.configFiles === undefined ? {} : { configFiles: g.configFiles }),
   // P57 (C1): and the languages it checks and the paths it was given
   ...(g.langs === undefined ? {} : { langs: g.langs }), ...(g.pathArgs === undefined ? {} : { pathArgs: g.pathArgs }),
-  ...(g.unplaced === undefined ? {} : { unplaced: g.unplaced }),
+  ...(g.unplaced === undefined ? {} : { unplaced: g.unplaced }), ...(g.composeSentinel === true ? { composeSentinel: true as const } : {}),
 });
 
 /**
@@ -88,6 +88,11 @@ export async function resolveScripts(ctx: Ctx, found: Found[]): Promise<Found[]>
   for (const f0 of found) {
     // P55 (batch B): the Dockerfiles a build command builds add the checks in their RUN lines; the build itself stays as it is
     if (f0.dockerBuild !== undefined || f0.composeBuild !== undefined) out.push(...(await buildRuns(ctx, f0, resolveScripts)));
+    // P59 (4): a compose command here may use other files or services when the job sets COMPOSE_FILE / COMPOSE_PROFILES,
+    // which only the step's gate knows: a placeholder that the step makes unknown then, and drops otherwise
+    if (f0.composeRun !== undefined || f0.composeBuild !== undefined) {
+      out.push({ categories: UNKNOWN_SCRIPT_CATEGORIES, by: f0.by, subject: f0.subject, dir: null, reason: null, partialWhy: composeEnvWhy(f0.subject), composeSentinel: true });
+    }
     // `docker compose run|exec <service> <command>` counts in the service's build folder
     const f = f0.composeRun === undefined ? f0 : await placeComposeRun(ctx, f0);
     if (f === null) continue;

@@ -175,7 +175,7 @@ async function hookConfigRuns(ctx: Ctx, config: Obj): Promise<Found[]> {
         found.push(...hookFound);
       }
     }
-    return resolveScripts(ctx, found);
+    return (await resolveScripts(ctx, found)).filter((f) => f.composeSentinel !== true); // P59 (4): no job env here
   }
 }
 
@@ -183,8 +183,10 @@ export async function readHooks(ctx: Ctx): Promise<Hooks> {
   const manager = ctx.p.precommit;
   const none: Hooks = { manager, where: '', readable: true, found: [] };
   if (manager === null) return none;
-  const scan = async (text: string, base: string | null, mode: ShellMode) =>
-    gated(await resolveScripts(ctx, scanShell(text, base, ctx.sigs, ctx.budget, mode)), gateOf([text], [], undefined, ctx.sigs.softEnv, ctx.sigs.configFiles));
+  const scan = async (text: string, base: string | null, mode: ShellMode) => {
+    const g = gateOf([text], [], undefined, ctx.sigs.softEnv, ctx.sigs.configFiles);
+    return gated(await resolveScripts(ctx, scanShell(text, base, ctx.sigs, ctx.budget, mode)), g).filter((f) => f.composeSentinel !== true || g.compose);
+  };
   if (manager === 'husky') {
     const where = '.husky/pre-commit';
     const r = await ctx.read.text(where);
