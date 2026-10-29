@@ -912,3 +912,71 @@ describe('buildAudit: GitHub CodeQL default setup (hand checks fix 2, P55)', () 
     expect(r.githubIncomplete?.unread).toContain('code-scanning-setup');
   });
 });
+
+describe('buildAudit: the last run of a covering workflow (hand checks fix 3, P55)', () => {
+  // the secrets repo's shape: `node --test test/` fails on every run (Node 22 reads test/ as a module), so CI is always red
+  const CI = 'on:\n  push:\n  pull_request:\njobs:\n  test:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/checkout@v4\n      - run: npm ci\n      - run: npm test\n';
+  const redRepo = (extra: Record<string, string> = {}) => repo({
+    'package.json': JSON.stringify({ name: 'legacy-report-script', scripts: { start: 'node src/index.js', test: 'node --test test/' } }),
+    'package-lock.json': '{}\n', 'src/index.js': 'console.log(1);\n', 'test/index.test.js': 'import test from "node:test";\n',
+    '.github/workflows/ci.yml': CI, ...extra,
+  });
+  const run = (conclusion: string, at = '2026-10-27T13:10:15Z') => async () => ({ data: { total_count: 1, workflow_runs: [{ id: 1, conclusion, status: 'completed', created_at: at, head_branch: 'main' }] } });
+  const testRows = (r: AuditReport) => r.coverage.filter((c) => (c.need.category === 'unit-tests' || c.need.category === 'full-tests') && c.need.layer !== 'pre-commit');
+
+  it('the last run on the default branch failed: covered test rows become partial and say so, never covered', async () => {
+    const before = testRows(await buildAudit(redRepo(), deps()));
+    expect(before.length).toBe(3);
+    for (const c of before) expect(c.status).toBe('covered');
+    const f = fakeGh({ signals: { runs: run('failure') } });
+    const r = await buildAudit(redRepo(), deps({ gh: f.gh }));
+    for (const c of testRows(r)) {
+      expect(c.status).toBe('partial');
+      expect(c.why).toBe('The last run of .github/workflows/ci.yml on main failed (2026-10-27), so this check may not be running.');
+      expect(c.where).toContain('.github/workflows/ci.yml');
+    }
+    // one call for the workflow, however many rows it covers, asked for the default branch's completed runs
+    expect(f.runs).toHaveBeenCalledTimes(1);
+    expect(f.runs).toHaveBeenCalledWith(expect.objectContaining({ workflow_id: 'ci.yml', branch: 'main', status: 'completed', per_page: 1 }));
+    expect(rowsOf(r, 'unit-tests').map((w) => w.status)).toEqual(['partial', 'partial']);
+  });
+
+  it('a passing last run keeps the rows covered', async () => {
+    for (const c of testRows(await buildAudit(redRepo(), deps({ gh: fakeGh({ signals: { runs: run('success') } }).gh })))) expect(c.status).toBe('covered');
+  });
+
+  it("runs pipegen can't read (no access, no runs yet) keep the status and add an honest can't-see note", async () => {
+    const cases: [GhSignals['runs'], string][] = [
+      [async () => { throw ghError(403, 'Resource not accessible by personal access token'); }, 'no access'],
+      [undefined, 'no completed run'],
+    ];
+    for (const [runs, words] of cases) {
+      const r = await buildAudit(redRepo(), deps({ gh: fakeGh({ signals: runs === undefined ? {} : { runs } }).gh }));
+      for (const c of testRows(r)) expect(c.status).toBe('covered');
+      const note = r.notes.find((n) => n.includes('.github/workflows/ci.yml') && n.includes('on main'));
+      expect(note, words).toBeDefined();
+      expect(note).toContain(words);
+      expect(note).toContain('may still fail');
+    }
+  });
+
+  it("GitHub's rate limit: the rows keep their status, the note says why, and githubIncomplete names the runs", async () => {
+    const limited = async () => { throw Object.assign(ghError(403, 'API rate limit exceeded'), { response: { status: 403, data: { message: 'API rate limit exceeded' }, headers: { 'x-ratelimit-remaining': '0', 'x-ratelimit-reset': String(Math.floor(NOW / 1000) + 7200) } } }); };
+    const r = await buildAudit(redRepo(), deps({ gh: fakeGh({ signals: { runs: limited } }).gh }));
+    for (const c of testRows(r)) expect(c.status).toBe('covered');
+    expect(r.notes.some((n) => n.includes('.github/workflows/ci.yml') && n.includes("GitHub's rate limit"))).toBe(true);
+    expect(r.githubIncomplete?.unread).toContain('workflow-runs');
+  });
+
+  it('one call per workflow: two workflows, two calls; a workflow that covers nothing is not asked about', async () => {
+    const LINT = 'on:\n  push:\n  pull_request:\njobs:\n  lint:\n    runs-on: ubuntu-latest\n    steps:\n      - run: npx eslint .\n';
+    const NOTHING = 'on:\n  push:\njobs:\n  hi:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n';
+    const f = fakeGh({ signals: { runs: async ({ workflow_id }) => (workflow_id === 'lint.yml' ? run('failure', '2026-10-20T00:00:00Z')() : run('success')()) } });
+    const r = await buildAudit(redRepo({ '.github/workflows/lint.yml': LINT, '.github/workflows/hi.yml': NOTHING, 'eslint.config.js': 'export default [];\n' }), deps({ gh: f.gh }));
+    expect(f.runs.mock.calls.map((c) => (c[0] as { workflow_id: string }).workflow_id).sort()).toEqual(['ci.yml', 'lint.yml']);
+    const lint = r.coverage.filter((c) => c.need.category === 'lint' && c.need.layer !== 'pre-commit');
+    expect(lint.length).toBeGreaterThan(0);
+    for (const c of lint) expect(c.why).toBe('The last run of .github/workflows/lint.yml on main failed (2026-10-20), so this check may not be running.');
+    for (const c of testRows(r)) expect(c.status).toBe('covered');
+  });
+});

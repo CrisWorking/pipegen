@@ -6,7 +6,12 @@
 //   findings and blocks only through code scanning merge protection, which pipegen doesn't read; and it scans pushes to
 //   the default branch only (and pull requests to it, and once a week), not every push. When pipegen couldn't check the
 //   setup, a missing row is unknown with the reason, never missing.
+// - The last run of a covering workflow (fix 3): a row covered by a workflow step becomes partial when the latest
+//   completed run of that workflow on the default branch failed: the step exists and can fail the build, but a
+//   workflow that fails every run may never reach it. When the runs can't be read (rate limit, no access, no completed
+//   run yet) the row keeps its status and a note says what pipegen couldn't see.
 import type { DefaultSetup } from '../github/code-scanning-setup.js';
+import type { LastRun } from '../github/workflow-runs.js';
 import type { Language, RepoProfile } from '../types.js';
 import type { Coverage } from './coverage.js';
 
@@ -40,4 +45,42 @@ export function applyDefaultSetup(rows: readonly Coverage[], setup: DefaultSetup
       : `GitHub's CodeQL default setup scans each pull request to ${p.defaultBranch}; it reports findings and blocks a merge only if code scanning merge protection is on, which pipegen doesn't read.${langs}`;
     return { need: r.need, status: 'partial', by: DEFAULT_SETUP_BY, where: DEFAULT_SETUP_WHERE, why };
   });
+}
+
+/** Conclusions that mean the run didn't pass (GitHub's check-run conclusions). */
+const FAILED: ReadonlySet<string> = new Set(['failure', 'timed_out', 'startup_failure']);
+const WORKFLOW_AT = /^(\.github\/workflows\/[A-Za-z0-9._-]{1,200}\.ya?ml) \(job /;
+
+/**
+ * The workflow file a covered row was found in (the start of its `where`, the top-level workflow even when the step is
+ * in a local action or called workflow), when it is one of the repo's listed workflows; else null (a hook, a config file).
+ */
+export function coveringWorkflow(row: Coverage, listed: ReadonlySet<string>): string | null {
+  if (row.status !== 'covered' || row.where === undefined) return null;
+  const path = WORKFLOW_AT.exec(row.where)?.[1];
+  return path !== undefined && listed.has(path) ? path : null;
+}
+
+export type RunAnswer = LastRun | { state: 'unread'; why: 'rate' | 'cap' };
+const UNREAD_WHY: Readonly<Record<string, string>> = {
+  access: 'no access to its runs', network: "GitHub didn't answer", answer: "GitHub's answer couldn't be read",
+  rate: "GitHub's rate limit", cap: 'more workflows than pipegen asks about',
+};
+
+/** Covered rows after the last runs of their workflows, plus the notes for runs pipegen couldn't see (see the header). */
+export function applyLastRuns(rows: readonly Coverage[], runs: ReadonlyMap<string, RunAnswer>, listed: ReadonlySet<string>, branch: string): { rows: Coverage[]; notes: string[] } {
+  const out = rows.map((r) => {
+    const wf = coveringWorkflow(r, listed);
+    const run = wf === null ? undefined : runs.get(wf);
+    if (wf === null || run === undefined || run.state !== 'read' || !FAILED.has(run.conclusion)) return r;
+    const date = run.createdAt === null ? '' : ` (${run.createdAt.slice(0, 10)})`;
+    return { ...r, status: 'partial' as const, why: `The last run of ${wf} on ${branch} failed${date}, so this check may not be running.` };
+  });
+  const unseen = new Map<string, string[]>();
+  for (const [wf, run] of runs) {
+    const why = run.state === 'none' ? 'no completed run there yet' : run.state === 'unread' ? UNREAD_WHY[run.why] ?? 'unknown' : null;
+    if (why !== null) unseen.set(why, [...(unseen.get(why) ?? []), wf]);
+  }
+  const notes = [...unseen].map(([why, wfs]) => `pipegen couldn't see the last run of ${wfs.sort().join(', ')} on ${branch} (${why}), so the checks ${wfs.length === 1 ? 'it covers' : 'they cover'} show as found in the files, but ${wfs.length === 1 ? 'that workflow' : 'those workflows'} may still fail on every run.`);
+  return { rows: out, notes };
 }

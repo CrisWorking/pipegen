@@ -45,6 +45,7 @@ import {
 } from '../estimate/estimate.js';
 import { readOnlyTokenHint } from '../github/client.js';
 import { readDefaultSetup, type DefaultSetup } from '../github/code-scanning-setup.js';
+import { lastCompletedRun } from '../github/workflow-runs.js';
 import { signingMode } from '../github/signing-mode.js';
 import { IGNORED_DIRS, listFiles, READ_LIMITS, readTextLimited, readTextLimitedWithReason } from '../read/limits.js';
 import { readProject } from '../read/project.js';
@@ -61,7 +62,7 @@ import { safeText } from '../util/safe-text.js';
 import { ConsentToken, CountingSummary, isSpent, spend } from './consent-token.js';
 import { chooseTools, skippedGroups, wouldSetSettings, type SkippedGroup, type WouldSet } from './choose.js';
 import { mapCoverage, type Coverage } from './coverage.js';
-import { applyDefaultSetup } from './github-signals.js';
+import { applyDefaultSetup, applyLastRuns, coveringWorkflow, type RunAnswer } from './github-signals.js';
 
 // ---------- types ----------
 
@@ -457,6 +458,7 @@ export async function buildAudit(dir: string, deps: AuditDeps): Promise<AuditRep
   // P55 (hand checks): what GitHub itself says that the files can't show, read after the files and before the picks
   const signalsUnread: GitHubFact[] = [];
   coverage = await defaultSetupRows(deps, profile, coverage, signalsUnread);
+  coverage = await lastRunRows(deps, profile, coverage, signalsUnread, notes);
   const wouldSet = wouldSetFor.map((x) => wouldSetSettings(x, coverage, skippedWf)).reduce((a, b) => same(a, b));
   const wouldAdd = wouldAddRows(profile, coverage, deps, caps);
 
@@ -532,6 +534,40 @@ export const RATE_WHY = {
   applies: "pipegen couldn't tell whether this check applies here: it depends on what GitHub allows for this repo, which GitHub's rate limit kept it from reading.",
   setup: "pipegen couldn't check whether GitHub's CodeQL default setup is on: GitHub's rate limit was reached.",
 } as const;
+
+/** P55 (fix 3): the most workflows whose last run one audit asks about (one call each). */
+export const MAX_RUN_READS = 20;
+
+/**
+ * P55 (hand checks, fix 3): covered rows after the last completed run of their workflow on the default branch, one
+ * GitHub call per workflow (at most MAX_RUN_READS). Not asked when the default branch wasn't read; a rate stop keeps
+ * every row as it is and says so (a note, and 'workflow-runs' in githubIncomplete).
+ */
+async function lastRunRows(deps: AuditDeps, p: RepoProfile, rows: Coverage[], unread: GitHubFact[], notes: Notes): Promise<Coverage[]> {
+  const listed = new Set(p.existingWorkflows.map((w) => w.path));
+  const workflows = [...new Set(rows.map((r) => coveringWorkflow(r, listed)).filter((w): w is string => w !== null))].sort();
+  if (workflows.length === 0) return rows;
+  const clock = { budget: deps.budget, now: deps.now, ...(deps.sleep === undefined ? {} : { sleep: deps.sleep }) };
+  const runs = new Map<string, RunAnswer>();
+  let stopped = deps.context === null || rateStopOf(deps.budget, deps.now()) !== null;
+  for (const [i, wf] of workflows.entries()) {
+    if (stopped) runs.set(wf, { state: 'unread', why: 'rate' });
+    else if (i >= MAX_RUN_READS) runs.set(wf, { state: 'unread', why: 'cap' });
+    else {
+      try {
+        runs.set(wf, await lastCompletedRun(deps.gh, p.owner, p.repo, wf, p.defaultBranch, clock));
+      } catch (e) {
+        if (!isRateStop(e)) throw e;
+        stopped = true;
+        runs.set(wf, { state: 'unread', why: 'rate' });
+      }
+    }
+  }
+  if ([...runs.values()].some((r) => r.state === 'unread' && r.why === 'rate')) unread.push('workflow-runs');
+  const out = applyLastRuns(rows, runs, listed, deps.context === null ? 'the default branch' : p.defaultBranch);
+  for (const n of out.notes) notes.add(n);
+  return out.rows;
+}
 
 /**
  * P55 (hand checks, fix 2): code-scan rows after GitHub's CodeQL default setup, which no workflow file shows. Read only
