@@ -538,11 +538,12 @@ async function onDefaultBranch(ctx: Ctx, repo: string, sha: string): Promise<Out
     cmp = await ctx.get(`https://api.github.com/repos/${r}/compare/${sha}...${branch.split('/').map(encodeURIComponent).join('/')}?per_page=1`, ctx.gh);
   } catch (e) {
     // A 404 says GitHub could not compare at all (the commit or the branch is unknown there), not that the commit is
-    // off the branch: report the failed lookup as it is. Still a failure, like every other 404.
+    // off the branch: report the failed lookup as it is. Still a failure, like every other 404, and like them it is not
+    // marked lookupFailed (that flag means "re-running may help", which it won't for a 404).
     if (e instanceof LookupError && e.notFound) return fail(`lookup failed: GitHub could not compare commit ${sha.slice(0, 12)} with the default branch (${branch}) of ${repo} (404); needs owner review`);
     throw e;
   }
-  const on =isObj(cmp) && (cmp.status === 'ahead' || cmp.status === 'identical') && cmp.behind_by === 0 && isObj(cmp.merge_base_commit) && cmp.merge_base_commit.sha === sha;
+  const on = isObj(cmp) && (cmp.status === 'ahead' || cmp.status === 'identical') && cmp.behind_by === 0 && isObj(cmp.merge_base_commit) && cmp.merge_base_commit.sha === sha;
   return on ? undefined : fail(`commit ${sha.slice(0, 12)} is not on the default branch (${branch}) of ${repo} (a fork's commit, or another branch); needs owner review`);
 }
 
