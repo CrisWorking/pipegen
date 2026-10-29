@@ -3,7 +3,7 @@
 // the referee and the linters import them from here, so no second copy can drift. It imports only the leaves render-error.ts,
 // tool-flags.ts and types.ts (test/final-fix-b.test.ts and test/module-graph.test.ts check this).
 import { EXPR, own, RenderError, show } from './render-error.js';
-import { CHECKER_STEP_ID_RE, GATE_USES_RE, PLATFORM_USES, rendererInputProblems, RENDERER_INPUTS, SCRUB_STEP_ID_RE, SETUP_STEP_ID_RE, TOOL_STEP_ID_RE } from './tool-flags.js';
+import { ARGV_POLICIES, BASE_CHECKOUT_REFS, CHECKER_STEP_ID_RE, GATE_USES_RE, PLATFORM_USES, rendererInputProblems, RENDERER_INPUTS, scrubStepId, SCRUB_STEP_ID_RE, SETUP_STEP_ID_RE, sha16, TOOL_STEP_ID_RE } from './tool-flags.js';
 
 /** One step of a job, as pipegen renders it. `usesComment` becomes the trailing `# <version>` comment on `uses:`. */
 export interface RenderedStep {
@@ -110,6 +110,21 @@ export function isKnownHarmless(s: RenderedStep): boolean {
   return false;   // an unknown or renamed id
 }
 
+/** What a scan step of a findings tool is, for the scrub that follows it: the reviewed entry's id and the format of its result. */
+export interface ScanFact { tool: string; format: 'sarif' | 'zap-json' }
+/**
+ * What the shared job rules know about the job they judge (Plan C C0b):
+ * - `id`: the job's id. A checkout `ref` (the base commit) is allowed only in the job `base-scan`; with no id it is refused.
+ * - `scans`: the scan steps pipegen rendered or the referee recognised, by step id (`tool-run-…` / `checker-run-…`), each with
+ *   its reviewed tool and result format. With it, a scrub step's `tool` and `format` must equal those of its scan step; without
+ *   it the rule still checks that the tool is a reviewed one and that a scan step of the result precedes the scrub.
+ */
+export interface JobContext { id?: string; scans?: ReadonlyMap<string, ScanFact> }
+
+/** The job a base-commit checkout may sit in (ruling S16). */
+export const BASE_SCAN_JOB = 'base-scan';
+const BASE_REF_VALUES: readonly string[] = Object.values(BASE_CHECKOUT_REFS);
+
 /**
  * The order rule of the referee (S6 c, Plan 7a), as an allowlist that fails closed (review-6b-r2 C1). A step that runs or
  * loads the repo's code can rewrite what runs after it in the same job (runner temp, the install folders, `$GITHUB_ENV`,
@@ -117,8 +132,13 @@ export function isKnownHarmless(s: RenderedStep): boolean {
  * steps may follow. So no checker, release or docker tool, scrub, upload or action may come after one. There is no list of
  * harmless steps that may follow repo code: none can be justified. Returns plain-English problems, empty when the order is
  * fine; `dedupeJobSteps` throws on them and the referee runs it on the final YAML.
+ * With a JobContext it also holds the job to the rest of the wiring: the base checkout only in `base-scan`, and every scrub
+ * step to its scan (scrubChainProblems).
+ * NOTE (C0a review m2): the id shape alone is what this function sees. For a hand-written file, what closes a forged harmless
+ * id is the referee's re-render match (a run step that is not exactly a step pipegen renders is unrecognised, and the referee
+ * drops its id before calling this), not this function on its own.
  */
-export function checkJobOrder(steps: readonly RenderedStep[]): string[] {
+export function checkJobOrder(steps: readonly RenderedStep[], job: JobContext = {}): string[] {
   const problems: string[] = [];
   let repoCode: string | undefined;
   // A job with a scrub step names PIPEGEN_FP_KEY, and GitHub hands every secret a job names to its runner when the job starts: any
@@ -137,7 +157,109 @@ export function checkJobOrder(steps: readonly RenderedStep[]): string[] {
     const uploaded = uploadFolder(s);
     if (uploaded === 'raw') problems.push(`Step ${i + 1} (${show(s.name)}) uploads the raw result folder (pipegen-raw), which is never uploaded: only the scrubbed copy in pipegen-out is.`);
     else if (uploaded !== null && !scrubbed.has(uploaded)) problems.push(`Step ${i + 1} (${show(s.name)}) uploads the result folder ${show(uploaded)} of pipegen-out, but no scrub step for that result comes before it in this job: a result the gate's scrub did not rebuild may hold secret text.`);
+    if (isCheckout(s) && s.with?.ref !== undefined && !(job.id === BASE_SCAN_JOB && BASE_REF_VALUES.includes(s.with.ref))) {
+      problems.push(`Step ${i + 1} (${show(s.name)}) checks out a ref, which only the base commit of the ${BASE_SCAN_JOB} job may be (${BASE_REF_VALUES.join(' or ')}): any other ref would scan code pipegen did not choose, or put the pull request's code where the base is expected.`);
+    }
   });
+  problems.push(...scrubChainProblems(steps, job.scans));
+  return problems;
+}
+
+const CHECKOUT_USES_RE = new RegExp(`^${PLATFORM_USES.checkout.replace(/[/.]/g, '\\$&')}@[0-9a-f]{40}$`);
+const isCheckout = (s: RenderedStep): boolean => s.run === undefined && s.uses !== undefined && CHECKOUT_USES_RE.test(s.uses);
+
+/** The scrub inputs every scrub step carries (mode is what makes it a scrub step). */
+const SCRUB_INPUTS = ['artifact', 'tool', 'format', 'raw', 'out', 'fp-key'] as const;
+/** The ids a scan step of a result can have: the tool's run step, named by the hash of its artifact. */
+const scanIdsOf = (artifact: string): string[] => [`tool-run-${sha16(artifact)}`, `checker-run-${sha16(artifact)}`];
+
+/**
+ * The scrub cross-checks (C0a review finding 3, carried to C0b), for every scrub step of a job:
+ * - it names its result (`artifact`), and its id is `scrub-<sha16(artifact)>`;
+ * - `tool`, `format`, `raw`, `out` and `fp-key` are all present, and the tool is one pipegen reviewed;
+ * - it is the only scrub of that result in the job;
+ * - a scan step of that result (`tool-run-<sha16>` / `checker-run-<sha16>`) is in the same job, before it;
+ * - with `scans`: that step is a scan step pipegen renders, and the scrub's `tool` and `format` equal its tool and result format.
+ * A scrub that does not match its scan could give a result the wrong tool's allowlist or fingerprint rules.
+ */
+export function scrubChainProblems(steps: readonly RenderedStep[], scans?: ReadonlyMap<string, ScanFact>): string[] {
+  const problems: string[] = [];
+  const first = new Map<string, number>();   // artifact → index of the first scrub of it
+  steps.forEach((s, i) => {
+    if (!isScrubStep(s)) return;
+    const at = `Step ${i + 1} (${show(s.name)})`;
+    const w = s.with ?? {};
+    for (const k of SCRUB_INPUTS) if (typeof w[k] !== 'string' || w[k] === '') problems.push(`${at} is a scrub step with no ${k} input.`);
+    const artifact = w.artifact;
+    if (typeof artifact !== 'string' || artifact === '') return;
+    if (s.id !== scrubStepId(artifact)) problems.push(`${at} is a scrub step whose id is ${show(s.id ?? '')}, but a scrub step's id is ${scrubStepId(artifact)} for the result ${show(artifact)}.`);
+    if (first.has(artifact)) problems.push(`${at} is a second scrub step for the result ${show(artifact)} in this job: a result has exactly one scrub.`);
+    else first.set(artifact, i);
+    const tool = w.tool;
+    if (typeof tool === 'string' && tool !== '' && !Object.hasOwn(ARGV_POLICIES, tool)) problems.push(`${at} scrubs for the tool ${show(tool)}, which is not a tool pipegen reviewed.`);
+    const scanAt = steps.findIndex((x) => x.run !== undefined && x.id !== undefined && scanIdsOf(artifact).includes(x.id));
+    if (scanAt < 0 || scanAt > i) {
+      problems.push(`${at} scrubs the result ${show(artifact)}, but no scan step of that result comes before it in this job: the scrub must follow the tool run that wrote the raw file.`);
+      return;
+    }
+    if (scans === undefined) return;
+    const scan = scans.get(steps[scanAt]?.id as string);
+    if (scan === undefined) problems.push(`${at} scrubs the result ${show(artifact)}, but the step before it that carries its scan id is not a scan step pipegen renders for a reviewed tool.`);
+    else {
+      if (typeof tool === 'string' && tool !== scan.tool) problems.push(`${at} scrubs it as the tool ${show(tool)}, but the scan step ran ${show(scan.tool)}.`);
+      if (typeof w.format === 'string' && w.format !== scan.format) problems.push(`${at} scrubs it as the format ${show(w.format)}, but the scan step wrote ${show(scan.format)}.`);
+    }
+  });
+  return problems;
+}
+
+// ---------- job outputs (Plan C ruling B3) ----------
+
+const OUTPUT_NAMES = ['sha256', 'status', 'error'] as const;
+/**
+ * The `outputs` a job with scrub steps hands the gate: for each scrubbed result `<artifact>-sha256`, `-status` and `-error`, each
+ * exactly `${{ steps.<that result's scrub id>.outputs.<sha256|status|error> }}`. The renderer writes them with this function;
+ * jobOutputsProblems judges any `outputs` map against the same rule.
+ */
+export function jobOutputsFor(steps: readonly RenderedStep[]): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const s of steps) {
+    if (!isScrubStep(s) || typeof s.with?.artifact !== 'string' || s.id === undefined) continue;
+    for (const n of OUTPUT_NAMES) out[`${s.with.artifact}-${n}`] = `\${{ steps.${s.id}.outputs.${n} }}`;
+  }
+  return out;
+}
+
+/**
+ * Why a job's `outputs` are not allowed (Plan C ruling B3), as plain-English problems: only `<artifact>-sha256`, `-status` and
+ * `-error`, for an artifact whose scrub step is in this job, each exactly `${{ steps.<that scrub's id>.outputs.<same> }}`.
+ * Nothing else is an output of a job that feeds the gate (no `has-pr`, no `digest`: Plan G extends this function when it adds
+ * one). The emitter and the referee both call this, so they allow the same forms.
+ */
+export function jobOutputsProblems(jobId: string, outputs: unknown, steps: readonly RenderedStep[]): string[] {
+  if (outputs === undefined) return [];
+  const where = `The outputs of the job ${show(jobId)}`;
+  if (typeof outputs !== 'object' || outputs === null || Array.isArray(outputs)) return [`${where} are not a map.`];
+  const scrubs = new Map<string, string[]>();   // artifact → ids of its scrub steps in this job
+  for (const s of steps) {
+    if (isScrubStep(s) && typeof s.with?.artifact === 'string' && s.id !== undefined) scrubs.set(s.with.artifact, [...(scrubs.get(s.with.artifact) ?? []), s.id]);
+  }
+  const problems: string[] = [];
+  for (const [key, value] of Object.entries(outputs)) {
+    const name = OUTPUT_NAMES.find((n) => key.endsWith(`-${n}`));
+    const artifact = name === undefined ? undefined : key.slice(0, key.length - name.length - 1);
+    if (name === undefined || artifact === undefined || artifact === '') {
+      problems.push(`${where} include ${show(key)}, which is not one of <result>-sha256, <result>-status or <result>-error: the gate reads nothing else from a job.`);
+      continue;
+    }
+    const ids = scrubs.get(artifact);
+    if (ids === undefined || ids.length !== 1) {
+      problems.push(`${where} include ${show(key)}, but this job has ${ids === undefined ? 'no scrub step' : 'more than one scrub step'} for the result ${show(artifact)}.`);
+      continue;
+    }
+    const want = `\${{ steps.${ids[0]}.outputs.${name} }}`;
+    if (value !== want) problems.push(`${where}: ${show(key)} must be exactly ${want} (the ${name} of the scrub step of that result), nothing else.`);
+  }
   return problems;
 }
 

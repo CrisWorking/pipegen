@@ -301,7 +301,7 @@ describe('renderStep: actions', () => {
 describe('RENDERER_INPUTS (S15)', () => {
   it('RENDERER_INPUTS: only the listed inputs, each with a checker; none is also a template input', () => {
     expect(Object.keys(RENDERER_INPUTS).sort()).toEqual([
-      'actions/attest', 'actions/download-artifact', 'actions/upload-artifact', 'crisworking/pipegen/gate', 'docker/build-push-action', 'docker/login-action', 'github/codeql-action/upload-sarif',
+      'actions/attest', 'actions/checkout', 'actions/download-artifact', 'actions/upload-artifact', 'crisworking/pipegen/gate', 'docker/build-push-action', 'docker/login-action', 'github/codeql-action/upload-sarif',
     ]);
     for (const [uses, inputs] of Object.entries(RENDERER_INPUTS)) {
       for (const [name, spec] of Object.entries(inputs)) {

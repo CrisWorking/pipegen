@@ -1,9 +1,10 @@
-// The policy leaf: every argv and action policy pipegen applies, in one module (it imports only the import-free types.ts, and slots.ts as a
+// The policy leaf: every argv and action policy pipegen applies, in one module (it imports only the import-free types.ts, node:crypto, and slots.ts as a
 // type), so the loader, the renderers and the referee check against the same tables (Plan P ruling PS34): the tool flags pipegen never
 // passes, the argv policies (ARGV_POLICIES), the reviewed action input policies, the platform action paths and locks, the step-id
 // patterns, the pip closures and the renderer-filled inputs (RENDERER_INPUTS with their checkers).
 
-import { RESULT_ARTIFACT_PREFIX } from '../types.js';
+import { createHash } from 'node:crypto';
+import { NEED_CATEGORIES, RESULT_ARTIFACT_PREFIX } from '../types.js';
 import type { SlotKind } from './slots.js';
 
 /**
@@ -380,6 +381,10 @@ export const TOOL_STEP_ID_RE = /^tool-(?:install|pull|run)-[0-9a-f]{16}$/;
 export const SETUP_STEP_ID_RE = /^pipegen-(?:checkout|setup-node-\d{1,3}|setup-python)$/;
 /** The id of a scrub step (Plan C's gate action in `scrub` mode, ruling B1) in a job: the order rule treats it like an upload. */
 export const SCRUB_STEP_ID_RE = /^scrub-[0-9a-f]{16}$/;
+/** The first 16 hex digits of the SHA-256 of a text: the short, stable part of the ids that tie a result's steps together (scan, scrub). */
+export const sha16 = (text: string): string => createHash('sha256').update(text).digest('hex').slice(0, 16);
+/** The id of the scrub step of a result artifact: `scrub-<sha16(artifact)>`. The job outputs and the scrub cross-checks name a scrub by this id. */
+export const scrubStepId = (artifact: string): string => `scrub-${sha16(artifact)}`;
 /** The `uses` path of pipegen's own gate action (a leaf constant: the renderer, the order rule and the referee all name it from here). */
 export const PIPEGEN_GATE_USES = 'crisworking/pipegen/gate';
 /** A pinned use of the gate action: the path, `@`, a 40-character commit. The reviewed pin itself is the referee's question. */
@@ -554,6 +559,98 @@ const SCRUB_OUT = rx(/^\$\{\{ runner\.temp \}\}\/pipegen-out\//, 'a path ${{ run
 });
 const inScrubMode = (input: RendererInput): RendererInput => ({ ...input, whenWith: input.whenWith ?? MODE_SCRUB });
 
+// ---------- the gate action's modes (Plan C ruling B3) ----------
+/** The modes of the gate action pipegen renders today (Plan I adds `merged-red` to this list and its row). */
+export const GATE_MODES = ['scrub', 'gate', 'find-run', 'nightly'] as const;
+/** An input valid only in the listed modes: the whole `with:` must name one of them. */
+const inModes = (modes: readonly (typeof GATE_MODES)[number][]): NonNullable<RendererInput['whenWith']> => ({
+  check: (all) => modes.some((m) => all.mode === m), describe: `only in mode ${modes.join(' or ')}`,
+});
+const modeInput = (modes: readonly (typeof GATE_MODES)[number][], re: RegExp, describe: string): RendererInput => rx(re, describe, inModes(modes));
+/** A literal input that must pass a schema function (a null return = fine), in the listed modes only. */
+const literalInput = (modes: readonly (typeof GATE_MODES)[number][], problem: (v: string) => string | null, describe: string): RendererInput => ({
+  describe, check: (v) => problem(v) === null, whenWith: inModes(modes),
+});
+
+const ID_LIST_MAX = 50;
+/** Why a text is not a JSON list of need ids (`not-proven`, `skipped`), or null. */
+function idListProblem(text: string): string | null {
+  const list = parseJson(text);
+  if (!Array.isArray(list) || list.length > ID_LIST_MAX) return `a JSON list of at most ${ID_LIST_MAX} need ids`;
+  return list.every((x) => typeof x === 'string' && NEED_ID_TEXT_RE.test(x)) ? null : 'a JSON list of need ids (lower case letters, digits and dashes)';
+}
+/** Why a text is not the gate's policy (`{ "block": [severities], "warn": [severities] }`), or null. */
+function policyProblem(text: string): string | null {
+  const v = parseJson(text);
+  if (!isPlainObject(v) || Object.keys(v).sort().join() !== 'block,warn') return 'a JSON object with exactly block and warn';
+  const sev = ['critical', 'high', 'medium', 'low', 'info'];
+  return ['block', 'warn'].every((k) => Array.isArray(v[k]) && (v[k] as unknown[]).length <= 5 && (v[k] as unknown[]).every((x) => typeof x === 'string' && sev.includes(x))) ? null : 'block and warn lists of severities';
+}
+/** Extra protected paths: globs without `..`, a leading `/` or an option dash, in plain characters (ruling S22). */
+const GLOB_RE = /^(?![-/])(?!.*(?:^|\/)\.\.(?:\/|$))[A-Za-z0-9._/*?-]{1,200}$/;
+function pathListProblem(text: string): string | null {
+  const list = parseJson(text);
+  if (!Array.isArray(list) || list.length > 100) return 'a JSON list of at most 100 path globs';
+  return list.every((x) => typeof x === 'string' && GLOB_RE.test(x)) ? null : 'a JSON list of plain relative path globs (no .., no leading /)';
+}
+
+// the job list literal (rulings B4 and S4): the shape of one entry, kept here so the gate row can check it; gate-job-list.ts builds it
+const NEED_ID_TEXT_RE = /^(?!base-)(?!.*--)[a-z0-9][a-z0-9-]{0,63}$/;
+const JOB_ID_TEXT_RE = /^[A-Za-z_][A-Za-z0-9_-]{0,99}$/;
+const SERVICE_SLUG_RE = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
+const TOOL_ID_TEXT_RE = /^[a-z0-9][a-z0-9-]{0,63}$/;
+const RESULT_NAME_TEXT_RE = new RegExp(`^${RESULT_ARTIFACT_PREFIX}[a-z0-9][a-z0-9-]{0,120}$`);
+const DATE_TEXT_RE = /^\d{4}-(?:0[1-9]|1[0-2])-(?:0[1-9]|[12]\d|3[01])$/;
+/** The keys an entry of the gate's job list may have, in the order the list is written. */
+export const JOB_LIST_KEYS = ['needId', 'service', 'job', 'category', 'tool', 'format', 'artifact', 'baseArtifact', 'blocking', 'needsSecrets', 'warnFirst'] as const;
+const JOB_LIST_MAX = 500;
+const JOB_LIST_MAX_TEXT = 200_000;
+const isPlainObject = (v: unknown): v is Record<string, unknown> => typeof v === 'object' && v !== null && !Array.isArray(v);
+function parseJson(text: string): unknown {
+  if (typeof text !== 'string' || text.length > JOB_LIST_MAX_TEXT) return undefined;
+  try { return JSON.parse(text); } catch { return undefined; }
+}
+const FIELD_CHECKS: Readonly<Record<(typeof JOB_LIST_KEYS)[number], (v: unknown) => boolean>> = {
+  needId: (v) => typeof v === 'string' && NEED_ID_TEXT_RE.test(v),
+  service: (v) => typeof v === 'string' && v.length <= 40 && SERVICE_SLUG_RE.test(v) && !v.includes('--'),
+  job: (v) => typeof v === 'string' && JOB_ID_TEXT_RE.test(v),
+  category: (v) => typeof v === 'string' && (NEED_CATEGORIES as readonly string[]).includes(v),
+  tool: (v) => typeof v === 'string' && TOOL_ID_TEXT_RE.test(v),
+  format: (v) => v === 'sarif' || v === 'zap-json' || v === 'junit' || v === 'none',
+  artifact: (v) => typeof v === 'string' && RESULT_NAME_TEXT_RE.test(v),
+  baseArtifact: (v) => typeof v === 'string' && RESULT_NAME_TEXT_RE.test(v),
+  blocking: (v) => typeof v === 'boolean',
+  needsSecrets: (v) => typeof v === 'boolean',
+  warnFirst: (v) => isPlainObject(v) && Object.keys(v).join() === 'since' && typeof v.since === 'string' && DATE_TEXT_RE.test(v.since),
+};
+const JOB_LIST_REQUIRED: readonly (typeof JOB_LIST_KEYS)[number][] = ['needId', 'job', 'category', 'format', 'blocking', 'needsSecrets'];
+/**
+ * Why a text is not a job list the gate may read (a JSON list of entries: known keys only, each field of its shape, the
+ * required ones present, no job twice, at most 500 entries), or null. The text is the `job-list` input of the gate step.
+ */
+export function jobListLiteralProblem(text: string): string | null {
+  const list = parseJson(text);
+  if (!Array.isArray(list)) return 'it is not a JSON list';
+  if (list.length > JOB_LIST_MAX) return `it has more than ${JOB_LIST_MAX} entries`;
+  const jobs = new Set<string>();
+  for (const [i, e] of list.entries()) {
+    if (!isPlainObject(e)) return `entry ${i + 1} is not an object`;
+    for (const k of Object.keys(e)) if (!(JOB_LIST_KEYS as readonly string[]).includes(k)) return `entry ${i + 1} has the key ${JSON.stringify(k.slice(0, 40))}, which a job list entry never has`;
+    for (const k of JOB_LIST_REQUIRED) if (!Object.hasOwn(e, k)) return `entry ${i + 1} has no ${k}`;
+    for (const k of JOB_LIST_KEYS) if (Object.hasOwn(e, k) && !FIELD_CHECKS[k](e[k])) return `entry ${i + 1} has a ${k} that is not in the form pipegen writes`;
+    if (jobs.has(e.job as string)) return `the job ${JSON.stringify(e.job)} is listed twice`;
+    jobs.add(e.job as string);
+  }
+  return null;
+}
+
+/** The two forms of the base commit a base-scan checkout may name (ruling S16): a pull request's base, or the push's previous head. Only the job `base-scan` may use one (job-rules.ts). */
+export const BASE_CHECKOUT_REFS = Object.freeze({
+  'pull-request-base': '${{ github.event.pull_request.base.sha }}',
+  'push-before': '${{ github.event.before }}',
+} as const);
+export type BaseCheckoutRef = keyof typeof BASE_CHECKOUT_REFS;
+
 /**
  * Ruling S15: the inputs the renderer sets on a platform action, by the same `owner/repo[/path]` key as ACTION_POLICIES,
  * each with a checker. The renderer refuses any other input it is asked to set, and the referee's template check
@@ -564,6 +661,8 @@ const inScrubMode = (input: RendererInput): RendererInput => ({ ...input, whenWi
  * - docker login: the actor and the workflow token, nothing else.
  */
 export const RENDERER_INPUTS: Readonly<Record<string, Readonly<Record<string, RendererInput>>>> = Object.freeze({
+  // the base commit, for the base-scan job only (the job rule is in job-rules.ts); no other ref is ever set
+  'actions/checkout': { ref: rx(new RegExp(`^(?:${Object.values(BASE_CHECKOUT_REFS).map((v) => v.replace(/[$.{}()]/g, '\\$&')).join('|')})$`), 'the pull request base commit or the push\'s previous head') },
   'actions/upload-artifact': { name: ARTIFACT_NAME, path: OWN_FOLDER_PATH },
   'actions/download-artifact': { name: ARTIFACT_NAME, path: OWN_FOLDER_PATH },
   'github/codeql-action/upload-sarif': { sarif_file: RUNNER_TEMP_PATH, category: rx(/^pipegen-[a-z0-9][a-z0-9-]{0,100}$/, 'a category starting pipegen-') },
@@ -580,15 +679,35 @@ export const RENDERER_INPUTS: Readonly<Record<string, Readonly<Record<string, Re
     password: rx(/^\$\{\{ secrets\.GITHUB_TOKEN \}\}$/, '${{ secrets.GITHUB_TOKEN }}', GHCR_ONLY),
   },
   // pipegen's own gate action. Every input is the renderer's (the entry fixes none and offers no choice); each mode has its
-  // own inputs, checked with `whenWith` on `mode`. C0a: `scrub` (ruling B1); the gate's own mode takes its inputs from C0b.
+  // own inputs, checked with `whenWith` on `mode`, so a mode's input is refused under another mode (Plan C rulings B1 and B3).
   [PIPEGEN_GATE_USES]: {
-    mode: rx(/^(?:scrub|gate)$/, 'scrub or gate'),
+    mode: rx(new RegExp(`^(?:${GATE_MODES.join('|')})$`), `one of ${GATE_MODES.join(', ')}`),
+    // scrub (ruling B1)
     artifact: inScrubMode(ARTIFACT_NAME),
     tool: inScrubMode(rx(/^[a-z0-9][a-z0-9-]{0,63}$/, 'a reviewed tool id')),
     format: inScrubMode(rx(/^(?:sarif|zap-json)$/, 'sarif or zap-json')),
     raw: SCRUB_RAW,
     out: SCRUB_OUT,
-    'fp-key': inScrubMode(rx(/^\$\{\{ secrets\.PIPEGEN_FP_KEY \}\}$/, '${{ secrets.PIPEGEN_FP_KEY }}')),
+    // the fingerprint key: the scrub hashes with it, the gate checks the baseline's MAC with it (ruling B6)
+    'fp-key': modeInput(['scrub', 'gate'], /^\$\{\{ secrets\.PIPEGEN_FP_KEY \}\}$/, '${{ secrets.PIPEGEN_FP_KEY }}'),
+    // gate (ruling B3)
+    jobs: modeInput(['gate'], /^\$\{\{ toJSON\(needs\) \}\}$/, '${{ toJSON(needs) }}'),
+    'job-list': literalInput(['gate'], jobListLiteralProblem, 'a job list literal (a JSON list of entries)'),
+    'not-proven': literalInput(['gate'], idListProblem, 'a JSON list of need ids'),
+    skipped: literalInput(['gate'], idListProblem, 'a JSON list of need ids'),
+    policy: literalInput(['gate'], policyProblem, 'a JSON policy { "block": [...], "warn": [...] }'),
+    'protected-paths': literalInput(['gate'], pathListProblem, 'a JSON list of plain relative path globs'),
+    // gate and nightly
+    'block-from': modeInput(['gate', 'nightly'], /^\$\{\{ vars\.PIPEGEN_BLOCK_FROM \}\}$/, '${{ vars.PIPEGEN_BLOCK_FROM }}'),
+    'block-from-recorded': modeInput(['gate', 'nightly'], DATE_TEXT_RE, 'a date YYYY-MM-DD'),
+    // gate, find-run and nightly: the workflow token, nothing else
+    'github-token': modeInput(['gate', 'find-run', 'nightly'], /^\$\{\{ secrets\.GITHUB_TOKEN \}\}$/, '${{ secrets.GITHUB_TOKEN }}'),
+    // find-run
+    sha: modeInput(['find-run'], /^\$\{\{ (?:github\.sha|github\.event\.workflow_run\.head_sha) \}\}$/, '${{ github.sha }} or ${{ github.event.workflow_run.head_sha }}'),
+    'central-workflow': modeInput(['find-run'], PLAIN_REL_RE, 'a plain relative path of the central workflow'),
+    'central-sha': modeInput(['find-run'], /^[0-9a-f]{40}$/, 'a 40-character commit'),
+    // nightly
+    'merged-at': modeInput(['nightly'], /^\d{4}-(?:0[1-9]|1[0-2])-(?:0[1-9]|[12]\d|3[01])(?:T\d{2}:\d{2}:\d{2}(?:\.\d{1,3})?Z)?$/, 'a date or an ISO time in UTC'),
   },
 } satisfies Record<string, Record<string, RendererInput>>);
 

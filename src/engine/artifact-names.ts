@@ -40,3 +40,13 @@ export function resultArtifactNames(items: readonly { needId: string; service?: 
     return name;
   });
 }
+
+// ---------- artifacts that are not a check's result (ruling S3) ----------
+// The gate's own artifacts. None starts with RESULT_ARTIFACT_PREFIX and resultArtifactName always does, so no result name can
+// equal one of them; the upload and download steps take result names only (RENDERER_INPUTS), so a template cannot use them either.
+/** The gate's decision and summary data (a JSON file, no SARIF text), uploaded before the gate step fails. */
+export const GATE_RESULT_ARTIFACT = 'pipegen-gate-result';
+/** The trusted run's baseline counts, written only by the gate action (carries a MAC). */
+export const BASELINE_ARTIFACT = 'pipegen-baseline';
+/** The marker of a trusted clean run, written only by the gate action (carries a MAC). */
+export const CLEAN_RUN_ARTIFACT = 'pipegen-clean-run';

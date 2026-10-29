@@ -4,7 +4,8 @@
 import { Document, parseDocument } from 'yaml';
 import { describe, expect, it } from 'vitest';
 import { JOB_PERMISSIONS, JOB_STEP_POLICY, pipegenLines, referee, type Linters, type RefereeDeps, type RefereeIssue, type RefereeReport } from '../src/engine/referee.js';
-import { dedupeJobSteps, RenderError, renderJobPrelude, renderPlatformStep, renderProjectScript, renderScrub, renderStep, renderUpload, scrubbedPath, stepsToYaml, type RenderContext, type RenderedStep, type RenderResult } from '../src/engine/render-step.js';
+import { gateJobList } from '../src/engine/gate-job-list.js';
+import { dedupeJobSteps, RenderError, renderGateStep, renderJobPrelude, renderPlatformStep, renderProjectScript, renderScrub, renderStep, renderUpload, scrubbedPath, stepsToYaml, type RenderContext, type RenderedStep, type RenderResult } from '../src/engine/render-step.js';
 import { resultArtifactName } from '../src/engine/artifact-names.js';
 import { NEED_ID_CATEGORY, NEED_IDS } from '../src/engine/need-ids.js';
 import { emptyRepoFiles } from '../src/read/quality.js';
@@ -113,14 +114,20 @@ describe('referee: the renderer and the referee agree', () => {
     const specs: StepSpec[] = [];
     const refused: string[] = [];
     const p = platform();
+    // several tools share a need id (two DAST tools, say); one need and service has one result and one job (ruling S4), so each later tool of a need gets a service of its own
+    const profN = { ...prof, services: [svc, ...Array.from({ length: 12 }, (_, i) => service({ ...svc, name: `app${i + 2}` }))] };
+    const ctxN: RenderContext = { ...ctx, profile: profN };
+    const perNeed = new Map<string, number>();
     for (const t of reviewedList()) {
       if (t.categories.includes('platform') && !t.categories.includes('image-build')) continue;   // the platform actions are rendered below, by their helpers
-      const spec = specFor(t, { needId: needFor(t), service: 'app' });
+      const nth = (perNeed.get(needFor(t)) ?? 0) + 1;
+      perNeed.set(needFor(t), nth);
+      const spec = specFor(t, { needId: needFor(t), service: nth === 1 ? 'app' : `app${nth}` });
       let steps: RenderedStep[];
       try {
         steps = t.id === 'docker-build-push-action'
-          ? [...prelude(), renderPlatformStep('setup-buildx', p), renderPlatformStep('docker-login', p, loginInputs(), { registry: 'ghcr.io' }), ...renderStep(spec, t, p, { ...ctx, targets: { image: 'ghcr.io/o/app:pr-1' } }).steps]
-          : toolJob(spec);
+          ? [...prelude(), renderPlatformStep('setup-buildx', p), renderPlatformStep('docker-login', p, loginInputs(), { registry: 'ghcr.io' }), ...renderStep(spec, t, p, { ...ctxN, targets: { image: 'ghcr.io/o/app:pr-1' } }).steps]
+          : toolJob(spec, ctxN);
       } catch (e) {
         if (!(e instanceof RenderError)) throw e;
         refused.push(t.id);
@@ -135,20 +142,20 @@ describe('referee: the renderer and the referee agree', () => {
     // every job shape of JOB_STEP_POLICY, under its real job id (fix round 1): the step allowlist and the renderer agree
     const download = (): RenderedStep => renderPlatformStep('download-artifact', p, { name: 'pipegen-out-sast--app', path: '${{ runner.temp }}/pipegen-out/pipegen-out-sast--app' });
     const harden = renderStep(specFor(entry('bullfrog'), { needId: 'egress' }), entry('bullfrog'), p, ctx).steps;
-    const gateAct: RenderedStep = { name: 'gate', uses: GATE.step.action?.uses as string, with: { mode: 'gate' } };
+    // each mode of the gate action in the job that runs it (Plan C ruling B3); baseline-check's mode is Plan C's task 3, find-run stands in for it here
+    const gateAct = (mode: string): RenderedStep => ({ name: 'gate', uses: GATE.step.action?.uses as string, with: { mode } });
     const watchAct: RenderedStep = { name: 'watch', uses: WATCHER.step.action?.uses as string, with: { mode: 'watcher' } };
     const [checkout] = prelude();
     const co = checkout as RenderedStep;
     jobs['code-scanning'] = job([download(), renderPlatformStep('upload-sarif', p, { sarif_file: sarif, category: 'pipegen-sast' })], { permissions: { contents: 'read', 'security-events': 'write', actions: 'read' } });
-    jobs['baseline-check'] = job([download(), gateAct], { permissions: { contents: 'read', actions: 'read' } });
+    jobs['baseline-check'] = job([download(), gateAct('find-run')], { permissions: { contents: 'read', actions: 'read' } });
     jobs.sign = job([
       co, download(),
       renderPlatformStep('docker-login', p, loginInputs(), { registry: 'ghcr.io' }),
       renderPlatformStep('attest', p, { 'subject-name': 'ghcr.io/o/app', 'subject-digest': `sha256:${'a'.repeat(64)}` }),
     ], { permissions: { contents: 'read', [OIDC]: 'write', packages: 'write', attestations: 'write' }, environment: 'pipegen-signing' });
-    jobs.gate = job([...harden, co, download(), gateAct], { name: GATE_CHECK_NAME.split(' / ')[1], permissions: { contents: 'read', actions: 'read', 'pull-requests': 'read' } });
-    jobs['pipegen-verify'] = job([co, download(), gateAct], { permissions: { contents: 'read', actions: 'read', packages: 'read', attestations: 'read' }, environment: 'pipegen-signing' });
-    jobs.nightly = job([download(), gateAct], { permissions: { contents: 'read', actions: 'read', issues: 'write' } });
+    jobs['pipegen-verify'] = job([co, download(), gateAct('find-run')], { permissions: { contents: 'read', actions: 'read', packages: 'read', attestations: 'read' }, environment: 'pipegen-signing' });
+    jobs.nightly = job([download(), gateAct('nightly')], { permissions: { contents: 'read', actions: 'read', issues: 'write' } });
     jobs.watch = job([co, watchAct], { permissions: { contents: 'read', issues: 'write', actions: 'read' } });
     jobs.notify = job([download()], { permissions: { contents: 'read', 'pull-requests': 'read', checks: 'read' } });
     jobs['merged-red'] = job([download()], { permissions: { contents: 'read', 'pull-requests': 'read', checks: 'read' } });
@@ -159,8 +166,11 @@ describe('referee: the renderer and the referee agree', () => {
       renderProjectScript({ kind: 'project-script', needId: 'lint', service: 'app', script: 'lint' }, p, ctx).steps];
     jobs['project-test'] = job(scripts[0] as RenderedStep[]);
     jobs['project-lint'] = job(scripts[1] as RenderedStep[]);
-    const d = draftOf([...specs, specOf('gitleaks', { needId: 'secrets', service: undefined })]);
+    const d = draftOf([...specs, specOf('gitleaks', { needId: 'secrets', service: undefined })], { profile: profN });
     d.needs.push(needOf('unit-tests', true, 'app'), needOf('lint', true, 'app'));
+    // the gate job: no checkout (ruling S21), the job list of this draft, and a needs entry for every job of it (ruling S4)
+    const entries = gateJobList(d);
+    jobs.gate = job([...harden, download(), renderGateStep(GATE, entries)], { name: GATE_CHECK_NAME.split(' / ')[1], needs: entries.map((e) => e.job), permissions: { contents: 'read', actions: 'read', 'pull-requests': 'read' } });
     const r = await run([wf(jobs)], d, { list: [...reviewedList(), GATE, WATCHER] });
     for (const id of Object.keys(JOB_STEP_POLICY)) expect(Object.keys(jobs), id).toContain(id);
     expect(show(r)).toBe('');
@@ -196,7 +206,9 @@ describe('referee: pins', () => {
   });
   it('referee: pipegen gate and watcher actions at the reviewed sha allowed; at another sha → unknown-pin', async () => {
     const list = [...reviewedList(), GATE, WATCHER];
-    const step = (t: ReviewedTool, s: string): RenderedStep => ({ name: t.id, uses: (t.step.action?.uses as string).replace(/@.*$/, `@${s}`), with: { mode: t.id === GATE.id ? 'gate' : t.fixedInputs.with?.mode as string } });
+    const step = (t: ReviewedTool, s: string): RenderedStep => (t.id === GATE.id
+      ? { ...renderGateStep(GATE, []), uses: (t.step.action?.uses as string).replace(/@.*$/, `@${s}`) }
+      : { name: t.id, uses: (t.step.action?.uses as string).replace(/@.*$/, `@${s}`), with: { mode: t.fixedInputs.with?.mode as string } });
     const ok = await run([wf({ gate: job([step(GATE, sha('1'))], { permissions: { contents: 'read', actions: 'read', 'pull-requests': 'read' } }), watch: job([step(WATCHER, sha('2'))], { permissions: { contents: 'read', issues: 'write', actions: 'read' } }) })], draftOf([]), { list });
     expect(show(ok)).toBe('');
     for (const [t, other] of [[GATE, sha('3')], [WATCHER, sha('4')]] as const) {
@@ -690,7 +702,7 @@ describe('referee: an edited user workflow is judged only where pipegen inserted
     '      - run: ./deploy.sh',
     '',
   ].join('\n');
-  const verifySteps = (): RenderedStep[] => [{ name: 'verify', uses: (GATE.step.action?.uses as string), with: { mode: 'gate' } }];
+  const verifySteps = (): RenderedStep[] => [{ name: 'verify', uses: (GATE.step.action?.uses as string), with: { mode: 'find-run' } }];
   /** The user's file as insertVerify would leave it: `needs: [pipegen-verify]` on deploy, and the pipegen-verify job (steps through stepsToYaml). */
   const edited = (steps = verifySteps(), extra: (doc: Document) => void = () => {}): string => {
     const src = original.replace('  deploy:\n    runs-on: ubuntu-latest', '  deploy:\n    needs: [pipegen-verify]\n    runs-on: ubuntu-latest');
@@ -761,7 +773,9 @@ describe('fix round 1: the reviewer\'s attacks are refused', () => {
   const VERIFYP = { contents: 'read', actions: 'read', packages: 'read', attestations: 'read' };
   const scriptSteps = (): RenderedStep[] => renderProjectScript({ kind: 'project-script', needId: 'unit-tests', service: 'app', script: 'test' }, p, ctx).steps;
   const dScripts = (over: Partial<PipelineDraft> = {}): PipelineDraft => draftOf([], { needs: [needOf('unit-tests', true, 'app')], ...over });
-  const gateStep = (): RenderedStep => ({ name: 'gate', uses: GATE.step.action?.uses as string, with: { mode: 'gate' } });
+  // the gate job's step (mode gate, an empty job list: these drafts have no check the gate waits for) and the verify job's step (mode find-run)
+  const gateStep = (): RenderedStep => renderGateStep(GATE, []);
+  const verifyStep = (): RenderedStep => ({ name: 'verify', uses: GATE.step.action?.uses as string, with: { mode: 'find-run' } });
   const CENTRAL = { repo: 'o/pipelines', sha: sha('c') };
   const existing = (path: string, triggers: string[]): ExistingWorkflow => ({ path, triggers, deploys: true, [`${SEC_FIELD}Used`]: [], jobs: ['deploy'] } as unknown as ExistingWorkflow);
 
@@ -839,7 +853,7 @@ describe('fix round 1: the reviewer\'s attacks are refused', () => {
   it('A2c, A2d: repo code before the gate action, in gate and in pipegen-verify → refused', async () => {
     const r = await run([wf({ gate: job([...scriptSteps(), gateStep()], { permissions: { contents: 'read', actions: 'read', 'pull-requests': 'read' } }) })], dScripts(), { list: LIST });
     expect(has(r, 'permissions'), show(r)).toBe(true);
-    const r2 = await run([wf({ 'pipegen-verify': job([...scriptSteps(), gateStep()], { permissions: VERIFYP }) })], dScripts(), { list: LIST });
+    const r2 = await run([wf({ 'pipegen-verify': job([...scriptSteps(), verifyStep()], { permissions: VERIFYP }) })], dScripts(), { list: LIST });
     expect(has(r2, 'permissions'), show(r2)).toBe(true);
   });
   it('the gate and watcher actions only in their own jobs, never after repo code', async () => {
@@ -950,8 +964,10 @@ describe('fix round 1: the reviewer\'s attacks are refused', () => {
 
 describe('fix round 1: an edited user workflow\'s own top level is judged where it reaches pipegen\'s job', () => {
   const VERIFYP = { contents: 'read', actions: 'read', packages: 'read', attestations: 'read' };
-  const gateStep = (): RenderedStep => ({ name: 'gate', uses: GATE.step.action?.uses as string, with: { mode: 'gate' } });
-  const build = (original: string, steps: RenderedStep[] = [gateStep()]): CreatedFile => {
+  // the gate job's step (mode gate, an empty job list: these drafts have no check the gate waits for) and the verify job's step (mode find-run)
+  const gateStep = (): RenderedStep => renderGateStep(GATE, []);
+  const verifyStep = (): RenderedStep => ({ name: 'verify', uses: GATE.step.action?.uses as string, with: { mode: 'find-run' } });
+  const build = (original: string, steps: RenderedStep[] = [verifyStep()]): CreatedFile => {
     const src = original.replace('  deploy:\n', '  deploy:\n    needs: [pipegen-verify]\n');
     const doc = parseDocument(`${src}  pipegen-verify:\n    runs-on: ubuntu-latest\n    permissions:\n${Object.entries(VERIFYP).map(([k, v]) => `      ${k}: ${v}\n`).join('')}    cache-mode: none\n    steps: []\n`);
     doc.setIn(['jobs', 'pipegen-verify', 'steps'], stepsToYaml(steps));
@@ -1023,7 +1039,9 @@ describe('fix round 2: the re-review probes are refused', () => {
   const p = platform();
   const LIST = [...reviewedList(), GATE, WATCHER];
   const CENTRAL = { repo: 'o/pipelines', sha: sha('c') };
-  const gateStep = (): RenderedStep => ({ name: 'gate', uses: GATE.step.action?.uses as string, with: { mode: 'gate' } });
+  // the gate job's step (mode gate, an empty job list: these drafts have no check the gate waits for) and the verify job's step (mode find-run)
+  const gateStep = (): RenderedStep => renderGateStep(GATE, []);
+  const verifyStep = (): RenderedStep => ({ name: 'verify', uses: GATE.step.action?.uses as string, with: { mode: 'find-run' } });
   const g = gitleaks();
   const base = (): string => wf({ scan: job(g.steps) }).content;
   const editedWith = (cond: string | undefined): { f: CreatedFile; d: PipelineDraft } => {
@@ -1031,7 +1049,7 @@ describe('fix round 2: the re-review probes are refused', () => {
     const text = original.replace('  deploy:\n', '  deploy:\n    needs: [pipegen-verify]\n')
       + '  pipegen-verify:\n    runs-on: ubuntu-latest\n    permissions:\n      contents: read\n      actions: read\n      packages: read\n      attestations: read\n    cache-mode: none\n    steps: []\n';
     const doc = parseDocument(text);
-    doc.setIn(['jobs', 'pipegen-verify', 'steps'], stepsToYaml([gateStep()]));
+    doc.setIn(['jobs', 'pipegen-verify', 'steps'], stepsToYaml([verifyStep()]));
     const f = file(doc.toString({ lineWidth: 0 }), '.github/workflows/deploy.yml', { inserted: { original, jobs: ['pipegen-verify'], needs: [{ job: 'deploy', added: ['pipegen-verify'] }] } });
     const d = draftOf([], { profile: { ...prof, existingWorkflows: [{ path: '.github/workflows/deploy.yml', triggers: ['push'], deploys: true, [`${SEC_FIELD}Used`]: [], jobs: ['deploy'] } as unknown as ExistingWorkflow] } });
     return { f, d };
@@ -1105,7 +1123,7 @@ describe('fix round 2: the re-review probes are refused', () => {
   it('T3 and ruling 4: an environment name is compared without case', async () => {
     const r = await run([wf({ gate: job([gateStep()], { permissions: { contents: 'read', actions: 'read' }, environment: 'Pipegen-Signing' }) })], draftOf([]), { list: LIST });
     expect(r.issues.some((i) => i.check === 'permissions' && /pipegen-signing/i.test(i.message)), show(r)).toBe(true);
-    const v = await run([wf({ 'pipegen-verify': job([gateStep()], { permissions: { contents: 'read', actions: 'read' }, environment: 'Pipegen-Signing' }) })], draftOf([], { capabilities: caps({ environments: true }) }), { list: LIST });
+    const v = await run([wf({ 'pipegen-verify': job([verifyStep()], { permissions: { contents: 'read', actions: 'read' }, environment: 'Pipegen-Signing' }) })], draftOf([], { capabilities: caps({ environments: true }) }), { list: LIST });
     expect(has(v, 'permissions'), show(v)).toBe(true);
     const sign = await run([wf({ sign: job([], { permissions: { contents: 'read' }, environment: { name: 'PIPEGEN-SIGNING' } }) })], draftOf([]));
     expect(has(sign, 'permissions'), show(sign)).toBe(true);

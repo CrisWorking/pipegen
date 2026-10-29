@@ -180,10 +180,13 @@ describe('RENDERER_INPUTS: the gate action in scrub mode (ruling B1 part 2)', ()
   });
 
   it('RENDERER_INPUTS: the scrub inputs are allowed only when mode is scrub (whenWith on mode)', () => {
-    for (const k of ['artifact', 'tool', 'format', 'raw', 'out', 'fp-key']) {
+    for (const k of ['artifact', 'tool', 'format', 'raw', 'out']) {
       const all = { ...good, mode: 'gate' };
       expect(rendererInputProblems(GATE_USES, { [k]: good[k] as string }, all), k).not.toEqual([]);
     }
+    // the key is also a gate input (it checks the baseline's MAC, ruling B6): allowed under mode gate, refused under the other modes
+    expect(rendererInputProblems(GATE_USES, { 'fp-key': good['fp-key'] as string }, { ...good, mode: 'gate' }), 'fp-key under gate').toEqual([]);
+    for (const mode of ['nightly', 'find-run']) expect(rendererInputProblems(GATE_USES, { 'fp-key': good['fp-key'] as string }, { ...good, mode }), `fp-key under ${mode}`).not.toEqual([]);
     expect(rendererInputProblems(GATE_USES, { mode: 'gate' }, { mode: 'gate' })).toEqual([]);
   });
 });
@@ -196,6 +199,8 @@ describe('isKnownHarmless and the job order: the scrub step (ruling B1 part 3)',
   const art = 'pipegen-out-secrets';
   const scrub = (): RenderedStep => renderScrub(art, `\${{ runner.temp }}/pipegen-raw/${art}/gitleaks.sarif`, 'gitleaks', 'sarif', GATE);
   const repoCode: RenderedStep = { name: 'mine', run: 'true' };
+  // C0b: a scrub must follow the scan step of its result (tool-run-<sha16(artifact)>); a stub stands for the tool's run step here
+  const scan: RenderedStep = { id: `tool-run-${sha16(art)}`, name: 'scan', run: 'true' };
 
   it('isKnownHarmless: a scrub id is harmless only on the pinned gate action with mode scrub; on a run step or another action it is repo code', () => {
     const s = scrub();
@@ -217,7 +222,7 @@ describe('isKnownHarmless and the job order: the scrub step (ruling B1 part 3)',
 
   it('checkJobOrder: a scrub step (and an upload after it) after repo code is refused; before it, fine', () => {
     const up = renderUpload(art, scrubbedPath(`\${{ runner.temp }}/pipegen-raw/${art}/gitleaks.sarif`), p);
-    expect(checkJobOrder([...prelude(), scrub(), up])).toEqual([]);
+    expect(checkJobOrder([...prelude(), scan, scrub(), up])).toEqual([]);
     expect(checkJobOrder([repoCode, scrub()]).length).toBeGreaterThan(0);
     expect(checkJobOrder([repoCode, { ...scrub(), id: 'scrub-0123456789abcdef', run: 'true', uses: undefined, with: undefined }])).toEqual([]);   // a run step that only claims the id is just more repo code
   });
@@ -235,13 +240,13 @@ describe('isKnownHarmless and the job order: the scrub step (ruling B1 part 3)',
     // a step that merely names the artifact is not a scrub step either
     const names: RenderedStep = { id: 'pipegen-checkout', name: 'x', uses: `actions/checkout@${'c'.repeat(40)}`, with: { artifact: art } };
     expect(checkJobOrder([...prelude(), names, up]).join(' ')).toMatch(NO_SCRUB);
-    expect(checkJobOrder([...prelude(), scrub(), up])).toEqual([]);
+    expect(checkJobOrder([...prelude(), scan, scrub(), up])).toEqual([]);
     expect(() => dedupeJobSteps([...prelude(), up])).toThrow(RenderError);
   });
 
   it('checkJobOrder: an upload of a pipegen-raw path is refused (also written by hand, past renderUpload)', () => {
     const rawUp: RenderedStep = { name: 'Upload', uses: `actions/upload-artifact@${'b'.repeat(40)}`, with: { name: art, path: `\${{ runner.temp }}/pipegen-raw/${art}/gitleaks.sarif` } };
-    const problems = checkJobOrder([...prelude(), scrub(), rawUp]);
+    const problems = checkJobOrder([...prelude(), scan, scrub(), rawUp]);
     expect(problems).toHaveLength(1);
     expect(problems[0]).toContain('uploads the raw result folder (pipegen-raw)');
     expect(() => renderUpload(art, `\${{ runner.temp }}/pipegen-raw/${art}/gitleaks.sarif`, p)).toThrow(RenderError);

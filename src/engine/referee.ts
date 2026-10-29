@@ -20,6 +20,9 @@
 //   in-memory cache config (S3).
 // - Order (S6 c): the renderer's own checkJobOrder runs over every parsed job; a run step not recognised by content counts
 //   as repo code whatever its id says.
+// - The gate's wiring (Plan C C0b): job `outputs` only in the forms of jobOutputsProblems (job-rules.ts); the gate step in mode gate only in
+//   the job `gate`, with a `job-list` literal equal to gateJobList(draft) and `needs` covering every listed job (else `not-gate-readable`);
+//   each scrub step equal to its scan step (tool, format, id; job-rules.ts scrubChainProblems); a checkout `ref` only in `base-scan`.
 // - The gate's check name comes from GATE_CHECK_NAME; the blocking rule (B7) demotes a findings check whose tool writes no
 //   SARIF; findSecretLike runs over every file (S18). The workflow linters (actionlint, zizmor) run through `deps.runLinters`
 //   (default: linters.ts runLinters, 7b), which tests replace with a stub.
@@ -27,15 +30,16 @@ import { isDeepStrictEqual } from 'node:util';
 import { isAlias, isMap, isScalar, isSeq, LineCounter, parseAllDocuments, visit, type Document, type Node as YamlNode, type Pair } from 'yaml';
 import { findSecretLike } from '../ai/redact.js';
 import { safeText } from '../util/safe-text.js';
-import { GATE_CHECK_NAME, type CreatedFile, type PipegenInserted, type PipelineDraft, type ReviewedTool, type StepSpec } from '../types.js';
+import { GATE_CHECK_NAME, type CreatedFile, type OutputFormat, type PipegenInserted, type PipelineDraft, type ReviewedTool, type StepSpec } from '../types.js';
 import { ArtifactNameError, slug } from './artifact-names.js';
+import { FINDINGS_CATEGORIES, gateJobList, GateJobListError, PIPEGEN_JOB_CATEGORIES, readableFormat, type JobListEntry } from './gate-job-list.js';
 import { runLinters } from './linters.js';
 import { COMMIT_SHA_RE } from './names.js';
 import { NEED_ID_CATEGORY } from './need-ids.js';
 import { PLATFORM_ACTION_IDS, type PlatformActions } from './pin.js';
 import { APP_RUNNING_CATEGORIES, TRIVY_LAUNCH_RE } from './render-cli.js';
 import { EXPR, own, show } from './render-error.js';
-import { ACTION_PATH_RE, checkExpressions, createdPathProblem, checkJobOrder, IF_VALUES, isDangerousName, isReviewed, isScrubStep, SECRET_REF_RE, STEP_KEYS as STEP_KEY_LIST, WORKFLOW_PATH_RE, type RenderedStep } from './job-rules.js';
+import { ACTION_PATH_RE, checkExpressions, createdPathProblem, checkJobOrder, IF_VALUES, isDangerousName, isReviewed, isScrubStep, jobOutputsProblems, SECRET_REF_RE, STEP_KEYS as STEP_KEY_LIST, WORKFLOW_PATH_RE, type RenderedStep, type ScanFact } from './job-rules.js';
 import { containerRefusal, RenderError, renderProjectScript, renderStep, sameDedupeContent, type RenderContext } from './render-step.js';
 import { projectScriptFor } from './reviewed.js';
 import { slotProblem, type SlotKind } from './slots.js';
@@ -93,7 +97,7 @@ export const SIGNING_ENVIRONMENT = 'pipegen-signing';
 /** pipegen's own secrets (gate fingerprint key, cosign key, Slack webhook) and the workflow token: allowed besides the draft's declared ones (S9). */
 export const PIPEGEN_SECRETS: readonly string[] = ['PIPEGEN_FP_KEY', 'PIPEGEN_COSIGN_KEY', 'PIPEGEN_SLACK_WEBHOOK', 'GITHUB_TOKEN'];
 /** Ruling B7: the checks the gate judges by their findings; their tool must write SARIF (DAST: ZAP's JSON too). Every other category is judged by job status. */
-export const FINDINGS_CATEGORIES: ReadonlySet<string> = new Set(['secrets', 'sast', 'deps', 'iac', 'image-scan', 'dast', 'licences', 'dockerfile-lint']);
+export { FINDINGS_CATEGORIES };   // defined in gate-job-list.ts (the job list needs the same set)
 
 /**
  * What a step is, recognised by its content (the reviewed entry its `uses` and template match, or the rendered step its
@@ -124,7 +128,8 @@ export const JOB_STEP_POLICY: Readonly<Record<string, readonly StepKind[]>> = Ob
   'pr-check': ['harden', 'checkout'],
   'pipegen-verify': ['harden', 'checkout', 'download-artifact', 'gate'],
   'code-scanning': ['harden', 'download-artifact', 'upload-sarif'],
-  gate: ['harden', 'checkout', 'download-artifact', 'gate'],
+  // no checkout: the gate never reads the workspace (Plan C ruling S21); it reads the event, the job outputs and the API
+  gate: ['harden', 'download-artifact', 'gate'],
   'base-scan': ['harden', 'checkout', 'setup', 'tool', 'scrub', 'upload-artifact'],
   'baseline-check': ['harden', 'checkout', 'download-artifact', 'gate'],
   'image-publish': ['harden', 'checkout', 'setup-buildx', 'docker-login', 'build-push'],
@@ -136,8 +141,6 @@ export const JOB_STEP_POLICY: Readonly<Record<string, readonly StepKind[]>> = Ob
 });
 /** The only jobs that may run in the signing environment (its secrets sign and verify). */
 const SIGNING_JOBS: ReadonlySet<string> = new Set(['sign', 'pipegen-verify']);
-/** Needs pipegen's own jobs implement (Plan G), not a tool step: they never need one. */
-const PIPEGEN_JOB_CATEGORIES: ReadonlySet<string> = new Set(['gate', 'signing', 'attestation', 'deploy-verify']);
 /** The triggers pipegen writes (ruling 7): `pull_request_target`, `workflow_run` and the rest are never in a file pipegen writes whole. */
 const TRIGGERS: ReadonlySet<string> = new Set(['push', 'pull_request', 'merge_group', 'schedule', 'workflow_dispatch', 'workflow_call']);
 /**
@@ -365,6 +368,8 @@ interface Expectations {
   /** source → the pins each of its `pipegen-npm-ci-…` steps carries */
   npmPins: Map<string, Map<string, string[]>>;
   byId: Map<string, ReviewedTool>;
+  /** checks that need every file judged first (the gate's job list), run once after the last file */
+  deferred: (() => void)[];
 }
 
 const coreOf = (s: RenderedStep): Obj => ({ id: s.id, uses: s.uses, with: s.with, run: s.run, shell: s.shell, env: s.env, 'working-directory': s['working-directory'] });
@@ -418,7 +423,7 @@ function expectations(draft: PipelineDraft, platform: PlatformActions, reviewed:
   }
   const ex: Expectations = {
     runs: [], runIds: new Set(), actions, actionPaths: new Set([...actions.keys()].map((k) => k.slice(0, k.lastIndexOf('@')))), images,
-    declared: new Set(), allowed: new Set(PIPEGEN_SECRETS), rendered: new Set(), matched: new Set(), npmPins: new Map(), byId,
+    declared: new Set(), allowed: new Set(PIPEGEN_SECRETS), rendered: new Set(), matched: new Set(), npmPins: new Map(), byId, deferred: [],
   };
   const ctxs: RenderContext[] = SENTINELS.map((t) => ({ profile: draft.profile, targets: { ...t } }));
   const needOf = (needId: string, service: string | undefined) => draft.needs.find((n) => n.id === needId && n.service === service);
@@ -575,8 +580,8 @@ function judgeJob(fc: FileCtx, id: string, j: unknown): void {
   const caller = j.uses !== undefined;
   const keys = caller ? CALLER_JOB_KEYS : STEPS_JOB_KEYS;
   for (const k of Object.keys(j)) if (!keys.has(k)) bad('template', `${where} has the key ${show(k)}, which pipegen never writes on a job${k === 'container' || k === 'strategy' || k === 'continue-on-error' || k === 'defaults' ? ' (it changes what runs or whether a failure counts)' : ''}.`);
-  // expressions: nowhere on a job except the forms below (a caller's explicit secrets)
-  for (const k of ['name', 'runs-on', 'needs', 'environment', 'concurrency', 'outputs', 'timeout-minutes', 'with']) if (hasExpr(j[k])) bad('injection', `${where} has an expression (\${{) in ${k}, which pipegen does not write there.`);
+  // expressions: nowhere on a job except the forms below (a caller's explicit secrets) and the job outputs, which jobOutputsProblems judges (ruling B3)
+  for (const k of ['name', 'runs-on', 'needs', 'environment', 'concurrency', 'timeout-minutes', 'with']) if (hasExpr(j[k])) bad('injection', `${where} has an expression (\${{) in ${k}, which pipegen does not write there.`);
   // a job that feeds the gate is never skipped on a condition (ruling 4); only the gate itself may run always(). Plan G's
   // pr-check form (`needs.pr-check.outputs.has-pr != 'true'`) comes with Plan G, through a checker shared with the renderer
   if (j.if !== undefined) {
@@ -602,9 +607,66 @@ function judgeJob(fc: FileCtx, id: string, j: unknown): void {
   }
   if (j['cache-mode'] !== 'none') bad('cache', `${where} must have cache-mode: none (no cache of any kind may feed the gate, a build, a signature or a verification).`);
   judgeServices(fc, where, j.services);
-  if (!Array.isArray(j.steps)) { bad('template', `${where} has no list of steps.`); return; }
-  const judged = judgeJobSteps(fc, where, j.steps, true);
+  if (!Array.isArray(j.steps)) { bad('template', `${where} has no list of steps.`); judgeOutputs(fc, id, where, j, []); return; }
+  const judged = judgeJobSteps(fc, where, j.steps, true, id);
+  judgeOutputs(fc, id, where, j, judged);
   judgeStepPolicy(fc, id, where, j, judged);
+  judgeGateSteps(fc, id, where, j, judged);
+}
+
+/** The job's `outputs`: only the forms of jobOutputsProblems (one rule for the renderer's jobOutputsFor and this judge), else `injection` (ruling B3). */
+function judgeOutputs(fc: FileCtx, id: string, where: string, j: Obj, judged: readonly Judged[]): void {
+  for (const problem of jobOutputsProblems(id, j.outputs, judged.map((x) => x.step))) fc.add(fc.file.path, 'injection', `In ${where}: ${problem}`);
+}
+
+/**
+ * The gate step in mode `gate` (ruling S4): only in the job `gate`, with the `jobs` input, and its `job-list` literal equal to
+ * gateJobList(draft) with the gate job's `needs` covering every job of the list, else `not-gate-readable`. Checked after every
+ * file is judged (the list counts only the steps a parsed file holds, and the scanner jobs may come after the gate in a file).
+ */
+function judgeGateSteps(fc: FileCtx, id: string, where: string, j: Obj, judged: readonly Judged[]): void {
+  const gates = judged.filter((x) => x.kind === 'gate' && x.step.with?.mode === 'gate');
+  if (gates.length === 0) return;
+  const bad = issueFor(fc);
+  if (id !== 'gate') { bad('not-gate-readable', `${where} runs the gate action in mode gate, which only the job gate does (the required check ${GATE_CHECK_NAME} is its result).`); return; }
+  if (gates.length > 1) bad('not-gate-readable', `${where} runs the gate action in mode gate ${gates.length} times; once is the gate.`);
+  const needs = needsList(j.needs).filter((x): x is string => typeof x === 'string');
+  for (const g of gates) {
+    if (g.step.with?.jobs === undefined) bad('not-gate-readable', `${where}: the gate step has no jobs input, so it would not see the results of the jobs it needs.`);
+    const literal = g.step.with?.['job-list'];
+    fc.ex.deferred.push(() => {
+      let expected: JobListEntry[];
+      try {
+        expected = gateJobList(fc.draft, { formatOf: reviewedFormatOf(fc.ex) });
+      } catch (e) {
+        if (!(e instanceof GateJobListError || e instanceof ArtifactNameError)) throw e;
+        bad('not-gate-readable', `${where}: the job list of this pipeline can not be made (${safeText(e.message, 200)}), so the gate has no list to read.`);
+        return;
+      }
+      let actual: unknown;
+      try { actual = typeof literal === 'string' ? JSON.parse(literal) : undefined; } catch { actual = undefined; }
+      if (!isDeepStrictEqual(actual, JSON.parse(JSON.stringify(expected)))) {
+        const listed = Array.isArray(actual) ? actual.map((x) => (isObj(x) ? String(x.job) : '?')) : [];
+        const want = expected.map((e) => e.job);
+        const diff = [...want.filter((x) => !listed.includes(x)).map((x) => `${x} is missing`), ...listed.filter((x) => !want.includes(x)).map((x) => `${x} is extra`)];
+        bad('not-gate-readable', `${where}: the gate's job-list is not the list this pipeline needs (${safeText(diff.length > 0 ? diff.join(', ') : 'an entry differs', 200)}), so the gate would read other checks than the pipeline runs.`);
+      }
+      for (const e of expected) {
+        if (!needs.includes(e.job)) bad('not-gate-readable', `${where} does not need the job ${show(e.job)} of its job list, so the gate would not wait for that check (needs must include every listed job).`);
+      }
+    });
+  }
+}
+
+/** The output format of a spec's reviewed tool, only for a spec that rendered and that a parsed file holds a step of (an action spec counts as reviewed): the one rule of the blocking rule and the job list. */
+function reviewedFormatOf(ex: Expectations): (spec: StepSpec, index: number) => OutputFormat | undefined {
+  return (s, si) => {
+    if (!(isObj(s) && isReviewed(s.tool))) return undefined;
+    const t = ex.byId.get(s.tool.id);
+    if (t === undefined || !sameCandidate(s.tool, t.candidate)) return undefined;
+    if (t.candidate.kind !== 'action' && !(ex.rendered.has(`spec:${si}`) && ex.matched.has(`spec:${si}`))) return undefined;
+    return t.step.output.format;
+  };
 }
 
 /**
@@ -728,11 +790,19 @@ interface Judged {
  * A job's steps, judged where they run: each step (judgeList), then the order rule, the merged npm ci pins and, for a job
  * (`job`), the locked checkout before the first scanner that reads the workspace (ruling 4).
  */
-function judgeJobSteps(fc: FileCtx, where: string, steps: unknown[], job: boolean): Judged[] {
+function judgeJobSteps(fc: FileCtx, where: string, steps: unknown[], job: boolean, jobId?: string): Judged[] {
   const judged = judgeList(fc, where, steps);
   // the order rule, on what was parsed: a run step not recognised by content is repo code, whatever id it claims
   const forOrder = judged.map((x) => (x.harmlessId ? x.step : { ...x.step, id: undefined }));
-  for (const problem of checkJobOrder(forOrder)) fc.add(fc.file.path, 'injection', `In ${where}: ${problem}`);
+  // the scan steps pipegen rendered (recognised by content, so their ids can be trusted), with their reviewed tool and result format: the scrub steps must equal them
+  const scans = new Map<string, ScanFact>();
+  for (const x of judged) {
+    const m = x.match === undefined || !x.match.final || x.kind !== 'tool' || !x.harmlessId || x.step.id === undefined ? null : /^spec:(\d+)(?::base)?$/.exec(x.match.source);
+    const spec = m === null ? undefined : fc.draft.steps[Number(m[1])];
+    const format = spec === undefined || !isObj(spec) || !isObj(spec.tool) ? undefined : fc.ex.byId.get(spec.tool.id)?.step.output.format;
+    if (spec !== undefined && x.step.id !== undefined && (format === 'sarif' || format === 'zap-json')) scans.set(x.step.id, { tool: spec.tool.id, format });
+  }
+  for (const problem of checkJobOrder(forOrder, { ...(jobId === undefined ? {} : { id: jobId }), scans })) fc.add(fc.file.path, 'injection', `In ${where}: ${problem}`);
   // a merged repo `npm ci` (dedupeJobSteps) carries exactly the pins of the tools of this job that need it
   const sources = new Set(judged.flatMap((x) => (x.match === undefined ? [] : [x.match.source])));
   for (const x of judged) {
@@ -925,6 +995,8 @@ function judgeTemplate(fc: FileCtx, at: (m: string) => string, t: ReviewedTool, 
   const fixed = t.fixedInputs.with ?? {};
   const all = Object.fromEntries(Object.entries(withs).map(([k, v]) => [k, typeof v === 'string' ? v : String(v)]));
   for (const [k, v] of Object.entries(fixed)) if (withs[k] !== v) bad('template', at(`${t.id} must have ${safeText(k, 40)}: ${show(v)} (a reviewed fixed input).`));
+  // the gate action does one thing per mode and has no default: a step without a mode would run whatever the action's own default is
+  if (t.id === PIPEGEN_ACTION_IDS.gate && withs.mode === undefined) bad('template', at(`${t.id} must set its mode (scrub, gate, find-run or nightly); the action has no reviewed default.`));
   for (const [k, values] of Object.entries(t.choices)) {
     const v = withs[k];
     if (v === undefined) bad('template', at(`${t.id} must set its choice ${show(k)} (left out, the action's own default would run, which nobody reviewed).`));
@@ -1077,18 +1149,15 @@ function judgeAction(fc: FileCtx, js: Obj): void {
  */
 function blockingRule(draft: PipelineDraft, ex: Expectations, add: Add, notes: string[]): string[] {
   const demoted: string[] = [];
+  const formatOf = reviewedFormatOf(ex);
   draft.needs.forEach((need, i) => {
     if (!need.blocking) return;
     const category = Object.hasOwn(NEED_ID_CATEGORY, need.id) ? (NEED_ID_CATEGORY as Readonly<Record<string, string>>)[need.id] : undefined;
-    // a spec counts only if it rendered and one of its rendered run steps is in a parsed file (an action spec has none: it counts as reviewed)
-    const formats = draft.steps
-      .flatMap((s, si) => {
-        if (!(isObj(s) && s.needId === need.id && s.service === need.service && isReviewed(s.tool))) return [];
-        const t = ex.byId.get(s.tool.id);
-        if (t === undefined || !sameCandidate(s.tool, t.candidate)) return [];
-        if (t.candidate.kind !== 'action' && !(ex.rendered.has(`spec:${si}`) && ex.matched.has(`spec:${si}`))) return [];
-        return [t.step.output.format];
-      });
+    // a spec counts only if it rendered and one of its rendered run steps is in a parsed file (an action spec has none: it counts as reviewed); the job list counts the same way
+    const formats = draft.steps.flatMap((s, si) => {
+      const f = isObj(s) && s.needId === need.id && s.service === need.service ? formatOf(s, si) : undefined;
+      return f === undefined ? [] : [f];
+    });
     const script = draft.profile.services.some((s) => projectScriptFor(need, s) !== null);
     if (formats.length === 0 && !script && need.layer !== 'pre-commit' && !(category !== undefined && PIPEGEN_JOB_CATEGORIES.has(category))) {
       add(`draft.needs[${i}]`, 'not-gate-readable', `The blocking check ${show(need.id)}${need.service === undefined ? '' : ` for ${show(need.service)}`} has no reviewed tool step and no project script, so the gate would have nothing to read.`);
@@ -1096,8 +1165,7 @@ function blockingRule(draft: PipelineDraft, ex: Expectations, add: Add, notes: s
     }
     // the category comes from the need id, never from the tool
     if (category !== undefined && !FINDINGS_CATEGORIES.has(category)) return;
-    const readable = (f: string): boolean => f === 'sarif' || (category === 'dast' && f === 'zap-json');
-    if (category !== undefined && formats.every(readable)) return;
+    if (category !== undefined && formats.every((f) => readableFormat(category, f))) return;
     let key = need.id;
     if (need.service !== undefined) {
       try { key = `${need.id}--${slug(need.service)}`; } catch (e) { if (!(e instanceof ArtifactNameError)) throw e; }
@@ -1174,6 +1242,7 @@ export async function referee(files: CreatedFile[], draft: PipelineDraft, platfo
     }
   }
 
+  for (const check of ex.deferred) check();
   const demoted = blockingRule(draft, ex, add, notes);
 
   // the workflow linters (7b): an issue on pipegen's lines, a note on a user's own

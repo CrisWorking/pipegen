@@ -22,7 +22,6 @@
 // - Rule archives (semgrep rules, nuclei templates) are fetched by commit and checked by tree (ruling S12), and the values a
 //   tool needs at run time (image, local URL, Dockerfile, base ref) are slots from the render context (ruling B6): slots.ts.
 // Nothing here uploads (ruling B3).
-import { createHash } from 'node:crypto';
 import { isDeepStrictEqual } from 'node:util';
 import { ArtifactNameError, resultArtifactName } from './artifact-names.js';
 import { ASSET_RE, COMMIT_SHA_RE, DIGEST_RE, isGitHubRepo, isNpmName, isPypiName, parseImageRef, pep503, SHA256_RE, SRI_SHA512_RE, TAG_RE } from './names.js';
@@ -30,7 +29,9 @@ import { closureRootDependencies, loadNpmClosure, NpmClosureError, type NpmPin }
 import { EXPR, own, refuse, show } from './render-error.js';
 import type { RenderContext, RenderedStep, RenderResult } from './render-step.js';
 import { slotProblem, type SlotKind } from './slots.js';
-import { ARGV_POLICIES, PIP_CLOSURES, PLAIN_REL_RE, runsRepoCode, type ArgvPolicy } from './tool-flags.js';
+import { ARGV_POLICIES, PIP_CLOSURES, PLAIN_REL_RE, runsRepoCode, sha16, type ArgvPolicy } from './tool-flags.js';
+
+export { sha16 };   // defined in tool-flags.ts (the job rules need it too); re-exported for the callers that import it from here
 import { EXTRA_RULES_AT, tuningEffects, type TuningEffects } from './tuning.js';
 import type { InstallSpec, ReviewedTool, Service, StepSpec } from '../types.js';
 
@@ -402,7 +403,6 @@ const LAUNCH_ENV = '"${pg_env[@]}"';
 const releaseLauncher = (exe: string): string => `"$bin/${exe}"`;
 /** The line a rendered trivy run step starts trivy with. */
 export const TRIVY_LAUNCH_RE = new RegExp(`${LAUNCH_ENV} ${releaseLauncher('trivy')}`.replace(/[.*+?^${}()|[\]\\/]/g, '\\$&'));
-export const sha16 = (text: string): string => createHash('sha256').update(text).digest('hex').slice(0, 16);
 /** Tool categories of the DAST steps: the only docker steps that may use the host network (their target is the app on the runner). */
 const DAST_CATEGORIES: ReadonlySet<string> = new Set(['dast', 'api-dast']);
 

@@ -25,13 +25,14 @@ import { APP_RUNNING_CATEGORIES, projectScriptSteps, renderCliTool, sha16, type 
 import { ArtifactNameError, resultArtifactName } from './artifact-names.js';
 import type { ProjectScriptStep } from './reviewed.js';
 import { own, RenderError, show } from './render-error.js';
-import { checkExpressions, checkJobOrder, isDangerousName, isReviewed, STEP_KEYS, type RenderedStep } from './job-rules.js';
-import { DOCKER_ACTION_USES, IMAGE_BUILT_ACTION_USES, PIPEGEN_GATE_USES, PLAIN_REL_RE, PLATFORM_LOCKS, PLATFORM_USES, RENDERER_INPUTS, rendererInputProblems, scrubbedResultPath } from './tool-flags.js';
+import { checkExpressions, checkJobOrder, isDangerousName, isReviewed, STEP_KEYS, type JobContext, type RenderedStep, type ScanFact } from './job-rules.js';
+import { jobListLiteral, type JobListEntry } from './gate-job-list.js';
+import { BASE_CHECKOUT_REFS, DOCKER_ACTION_USES, IMAGE_BUILT_ACTION_USES, PIPEGEN_GATE_USES, PLAIN_REL_RE, PLATFORM_LOCKS, PLATFORM_USES, RENDERER_INPUTS, rendererInputProblems, scrubbedResultPath, scrubStepId, type BaseCheckoutRef } from './tool-flags.js';
 
 export { RenderError };
 // the job rules live in job-rules.ts (one copy for the renderer, the emitter, the referee and the linters); re-exported for the callers that import them here
 export { checkExpressions, checkJobOrder, IF_VALUES, isDangerousName, SECRET_REF_RE } from './job-rules.js';
-export type { RenderedStep };
+export type { JobContext, RenderedStep, ScanFact };
 export type { RenderOptions };
 
 /** What a render needs besides the step: the repo facts (services, folders) and, for steps that need them, run-time targets (ruling S2). */
@@ -180,7 +181,7 @@ export function mapNodeVersion(runtimeVersion: string | undefined, allowed: read
 // ---------- the action core ----------
 
 /** Actions the renderer fills inputs for through their own helper (renderUpload, renderPlatformStep); renderStep refuses them. */
-const HELPER_ONLY: ReadonlySet<string> = new Set(Object.keys(RENDERER_INPUTS).filter((k) => k !== 'docker/login-action' && k !== 'docker/build-push-action'));
+const HELPER_ONLY: ReadonlySet<string> = new Set(Object.keys(RENDERER_INPUTS).filter((k) => k !== 'docker/login-action' && k !== 'docker/build-push-action' && k !== 'actions/checkout'));   // checkout's only renderer input (the base ref) is optional: renderStep renders it without
 
 /**
  * Container actions (ruling S13), refused by `uses` path (so a renamed copy of an entry is refused too) or because the entry
@@ -338,8 +339,10 @@ function cliHooks(platform: PlatformActions): CliHooks {
  * (only its display name may differ), or this throws (review-6c-r1 minor 2: a later checkout with fetch-depth 0 must not
  * vanish behind a depth-1 one). The one documented exception is the repo `npm ci` of one folder asked for by several
  * tools: its pin lists are merged, and its scripts may differ only in the tool's own home folder.
+ * `job` (C0b): the job's id and the scan facts of its scrub steps, for the shared job rules (checkJobOrder): the base checkout ref only
+ * in `base-scan`, and each scrub step equal to its scan (scanFactOf gives the fact of a rendered tool).
  */
-export function dedupeJobSteps(steps: readonly RenderedStep[]): RenderedStep[] {
+export function dedupeJobSteps(steps: readonly RenderedStep[], job: JobContext = {}): RenderedStep[] {
   const seen = new Map<string, number>();
   const kept: RenderedStep[] = [];
   for (const s of steps) {
@@ -362,7 +365,7 @@ export function dedupeJobSteps(steps: readonly RenderedStep[]): RenderedStep[] {
   const majors = new Set(kept.filter((s) => s.id?.startsWith('pipegen-setup-node-')).map((s) => s.id));
   if (majors.size > 1) throw new RenderError('One job can have only one Node version, but its steps ask for more than one; they belong in separate jobs.');
   // no job is assembled in a bad order (review-6b-r2 C1)
-  const order = checkJobOrder(kept);
+  const order = checkJobOrder(kept, job);
   if (order.length > 0) throw new RenderError(order.join(' '));
   return kept;
 }
@@ -420,6 +423,8 @@ function rendererFill(usesPath: string, service: Service | undefined, ctx: Rende
 
 export interface PreludeOptions {
   fetchDepth?: '1' | '0';
+  /** Check out the base commit instead of the event's own (the `base-scan` job only, ruling S16): the pull request's base, or the push's previous head. */
+  baseRef?: BaseCheckoutRef;
   /** Set up Node. `runtimeVersion` is the repo's raw text (Service.runtimeVersion); it is only mapped, never rendered. */
   node?: { runtimeVersion?: string };
 }
@@ -435,7 +440,9 @@ export function renderJobPrelude(opts: PreludeOptions, platform: PlatformActions
   const checkout = platformEntry(platform, 'checkout');
   const depth = opts.fetchDepth ?? '1';
   if (!(checkout.choices['fetch-depth'] ?? []).includes(depth)) throw new RenderError(`The reviewed checkout entry doesn't offer fetch-depth ${show(depth)}.`);
-  steps.push(actionStep(checkout, 'Check out the repository', { 'fetch-depth': depth }, {}));
+  const ref = opts.baseRef === undefined ? undefined : own(BASE_CHECKOUT_REFS, opts.baseRef);
+  if (opts.baseRef !== undefined && ref === undefined) throw new RenderError(`${show(opts.baseRef)} is not a base checkout form (${Object.keys(BASE_CHECKOUT_REFS).join(', ')}).`);
+  steps.push(actionStep(checkout, opts.baseRef === undefined ? 'Check out the repository' : 'Check out the base commit', { 'fetch-depth': depth }, ref === undefined ? {} : { ref }));
   if (opts.node !== undefined) {
     const setup = platformEntry(platform, 'setup-node');
     const mapped = mapNodeVersion(opts.node.runtimeVersion, setup.choices['node-version'] ?? []);
@@ -455,6 +462,13 @@ export function scrubbedPath(rawPath: string): string {
   return out;
 }
 
+/** The gate entry must be the reviewed, pinned gate action with no fixed input and no choice: pipegen sets every input itself. */
+function checkGateEntry(gate: ReviewedTool): void {
+  if (!isReviewed(gate.candidate)) throw new RenderError('The gate action is not a reviewed entry.');
+  if (usesOf(gate).path !== PIPEGEN_GATE_USES) throw new RenderError(`The gate entry does not run ${PIPEGEN_GATE_USES}.`);
+  if (Object.keys(gate.fixedInputs.with ?? {}).length > 0 || Object.keys(gate.choices).length > 0) throw new RenderError('The gate entry may fix no input and offer no choice: pipegen sets every input of the gate action itself.');
+}
+
 /**
  * The scrub step of one result (Plan C ruling B1, part 7): pipegen's gate action in `scrub` mode rebuilds the raw result
  * from allowlisted fields plus HMAC fingerprints, and writes it to `pipegen-out/<artifact>/<file>`, the only copy that
@@ -463,12 +477,10 @@ export function scrubbedPath(rawPath: string): string {
  * no input and offers no choice: every input is set here and checked by RENDERER_INPUTS).
  */
 export function renderScrub(artifact: string, rawPath: string, tool: string, format: 'sarif' | 'zap-json', gate: ReviewedTool): RenderedStep {
-  if (!isReviewed(gate.candidate)) throw new RenderError('The gate action is not a reviewed entry.');
-  if (usesOf(gate).path !== PIPEGEN_GATE_USES) throw new RenderError(`The gate entry does not run ${PIPEGEN_GATE_USES}.`);
-  if (Object.keys(gate.fixedInputs.with ?? {}).length > 0 || Object.keys(gate.choices).length > 0) throw new RenderError('The gate entry may fix no input and offer no choice: pipegen sets every input of the gate action itself.');
+  checkGateEntry(gate);
   const out = scrubbedPath(rawPath);
   const step = actionStep(gate, 'pipegen: scrub the result', {}, { mode: 'scrub', artifact, tool, format, raw: rawPath, out, 'fp-key': '${{ secrets.PIPEGEN_FP_KEY }}' });
-  return { id: `scrub-${sha16(artifact)}`, ...step, if: 'always()' };
+  return { id: scrubStepId(artifact), ...step, if: 'always()' };
 }
 
 /**
@@ -481,6 +493,45 @@ export function renderUpload(artifact: string, path: string, platform: PlatformA
   // the path must sit in this artifact's own folder: the rule is the shared whenWith of RENDERER_INPUTS (tool-flags.ts), which the emitter and the referee also use
   const step = renderPlatformStep('upload-artifact', platform, { name: artifact, path });
   return { ...step, name: 'Upload the result', if: 'always()' };
+}
+
+/** The optional literal inputs of the gate step in mode `gate` (each is checked by its schema in RENDERER_INPUTS). */
+export interface GateStepOptions {
+  /** need ids the user chose not to prove */ notProven?: readonly string[];
+  /** need ids skipped with --skip */ skipped?: readonly string[];
+  policy?: { block: readonly string[]; warn: readonly string[] };
+  /** extra protected path globs */ protectedPaths?: readonly string[];
+  /** the date the install recorded for blocking, YYYY-MM-DD */ blockFromRecorded?: string;
+}
+
+/**
+ * The gate step in mode `gate` (Plan C ruling B3): the job list literal from gateJobList, the needs of the gate job as
+ * `${{ toJSON(needs) }}`, the block-from variable, the workflow token and the fingerprint key. The gate job holds this step
+ * and no checkout (the gate never reads the workspace, ruling S21), and its `needs` include every job of the list.
+ */
+export function renderGateStep(gate: ReviewedTool, entries: readonly JobListEntry[], opts: GateStepOptions = {}): RenderedStep {
+  checkGateEntry(gate);
+  const filled: Record<string, string> = {
+    mode: 'gate', jobs: '${{ toJSON(needs) }}', 'job-list': jobListLiteral(entries),
+    'block-from': '${{ vars.PIPEGEN_BLOCK_FROM }}', 'github-token': '${{ secrets.GITHUB_TOKEN }}', 'fp-key': '${{ secrets.PIPEGEN_FP_KEY }}',
+  };
+  if (opts.notProven !== undefined) filled['not-proven'] = JSON.stringify(opts.notProven);
+  if (opts.skipped !== undefined) filled.skipped = JSON.stringify(opts.skipped);
+  if (opts.policy !== undefined) filled.policy = JSON.stringify({ block: opts.policy.block, warn: opts.policy.warn });
+  if (opts.protectedPaths !== undefined) filled['protected-paths'] = JSON.stringify(opts.protectedPaths);
+  if (opts.blockFromRecorded !== undefined) filled['block-from-recorded'] = opts.blockFromRecorded;
+  return actionStep(gate, 'pipegen: the merge gate', {}, filled);
+}
+
+/**
+ * The scan fact of a rendered tool: the id of its run step (the last step with a `run`) and the reviewed tool id with the
+ * format of its result, for the scrub cross-checks (JobContext.scans). Null when the tool writes no findings file (format none or junit).
+ */
+export function scanFactOf(result: RenderResult, tool: string): { stepId: string; fact: ScanFact } | null {
+  const format = result.output?.format;
+  if (format !== 'sarif' && format !== 'zap-json') return null;
+  const run = [...result.steps].reverse().find((s) => s.run !== undefined);
+  return run?.id === undefined ? null : { stepId: run.id, fact: { tool, format } };
 }
 
 /**
