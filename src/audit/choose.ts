@@ -69,7 +69,8 @@ function own(c: Ctx, tool: string, version: string | null, reason: string, pkg?:
   const step: RepoToolStep = { kind: 'repo-tool', needId: c.need.id, service: c.s?.name ?? c.need.service ?? '', tool, version };
   if (version !== null && pkg !== undefined && (c.q.fromRange as readonly string[]).includes(pkg)) step.fromRange = true;
   if (c.s !== undefined && c.s.path !== '' && c.s.path !== '.') step.workingDir = c.s.path;
-  return { tool: step, also: [], note: reason };
+  // a null version means the tool is configured but nothing installed was found: say so rather than imply it would run
+  return { tool: step, also: [], note: version === null ? `${reason}, but no installed version was found` : reason };
 }
 
 const major = (v: string | undefined): number | null => {

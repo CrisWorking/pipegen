@@ -807,7 +807,7 @@ describe('Plan P Task 9: the report shows every catalogue check', () => {
     }
     // an own tool with no readable version names no version
     const nov = { ...r, wouldAdd: r.wouldAdd.map((w) => (w.tool !== null && 'kind' in w.tool && w.tool.kind === 'repo-tool' ? { ...w, tool: repoTool({ version: null, tool: 'flake8' }) } : w)) };
-    expect(tflat(nov)).toContain('your own `flake8` would run here');
+    expect(tflat(nov)).toContain('your own `flake8`, if installed, would run here');
     // JSON: the tool is slimmed, `also` too, with fromRange kept
     const j = JSON.parse(json(ranged)) as { wouldAdd: { tool: Record<string, unknown> | null; also: Record<string, unknown>[] }[] };
     const own = j.wouldAdd.find((w) => w.tool?.kind === 'repo-tool');

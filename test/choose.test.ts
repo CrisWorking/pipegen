@@ -121,6 +121,31 @@ describe('choose: lint', () => {
   });
 });
 
+describe('choose: configured tools with no installed version (m3)', () => {
+  const NO_VERSION = 'but no installed version was found';
+  const cases: [string, string, Partial<Service['quality']>, string][] = [
+    ['lint', 'flake8', { configs: ['flake8'] }, 'flake8'],
+    ['lint', 'pylint', { configs: ['pylint'] }, 'pylint'],
+    ['format', 'black', { configs: ['black'] }, 'black'],
+    ['type-check', 'mypy', { configs: ['mypy'] }, 'mypy'],
+    ['type-check', 'pyright', { configs: ['pyright'] }, 'pyright'],
+    ['lint', 'biome', { configs: ['biome'] }, 'biome'],
+    ['format', 'biome', { configs: ['biome'] }, 'biome'],
+  ];
+  for (const [cat, name, q, tool] of cases) {
+    it(`choose: ${cat} with ${name} configured but no version → says so, does not claim it is installed`, () => {
+      const lang = ['biome'].includes(name) ? 'node' : 'python';
+      const c = choose(cat, profile([svc({ language: lang }, q)]));
+      expect(ownTool(c)).toMatchObject({ kind: 'repo-tool', tool, version: null });
+      expect(c.note).toContain(NO_VERSION);
+    });
+  }
+  it('choose: with a version the note has no such caveat', () => {
+    const c = choose('lint', profile([svc({}, { configs: ['biome'], versions: { '@biomejs/biome': '2.0.0' } })]));
+    expect(c.note).not.toContain(NO_VERSION);
+  });
+});
+
 describe('choose: type-check', () => {
   it('choose: Vue → vue-tsc, Svelte → svelte-check, Astro → astro check (own, at the lockfile version)', () => {
     const q = (f: 'vue' | 'svelte' | 'astro', versions: Service['quality']['versions']) => profile([svc({}, { uiFrameworks: [f], tsconfig: true, versions })]);

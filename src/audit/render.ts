@@ -358,7 +358,8 @@ function ownToolText(c: Ctx, t: RepoToolStep): string {
   const name = c.v(t.tool);
   const plain = name === t.tool && /^[a-z][a-z0-9 -]{0,30}$/.test(name);
   const version = t.version === null ? '' : ` ${c.v(t.version)} ${t.fromRange === true ? '(version from package.json)' : '(from your lockfile)'}`;
-  return `your own ${plain ? `\`${name}\`` : name}${version} would run here`;
+  const when = t.version === null ? ', if installed, would run here' : ' would run here';
+  return `your own ${plain ? `\`${name}\`` : name}${version}${when}`;
 }
 
 function aiBlocks(ai: AuditAi, reviewedUnavailable: boolean, c: Ctx): Block[] {
