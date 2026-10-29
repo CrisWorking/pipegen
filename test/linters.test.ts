@@ -125,7 +125,9 @@ describe('runLinters (S19, S21)', () => {
     const action = file('.github/actions/fetch/action.yml', { repo: 'central' });
     const wfc = file(WF, { repo: 'central' });
     const { a, z } = await run([action, wfc]);
-    expect((a.records()[0] as Rec).args.slice(-1)).toEqual([WF]);
+    const ra = (a.records()[0] as Rec).args;
+    expect(ra.slice(6)).toEqual([WF]);
+    expect(ra.some((x) => x.endsWith('action.yml'))).toBe(false);
     expect((z.records()[0] as Rec).args.slice(-2)).toEqual(['.github/actions/fetch/action.yml', WF]);
   });
 
@@ -156,7 +158,7 @@ describe('runLinters (S19, S21)', () => {
   it('linters: zizmor runs online with the impostor-commit audit; no token → zizmor issue', async () => {
     const { z } = await run([file(WF)]);
     const r = z.records()[0] as Rec;
-    expect(r.args).toEqual(['--config', `${r.cwd}/zizmor.yml`, '--format', 'json', '--cache-dir', `${r.cwd}/zizmor-cache`, WF]);
+    expect(r.args).toEqual(['--config', `${r.cwd}/zizmor.yml`, '--format', 'json', '--no-ignores', '--strict-collection', '--cache-dir', `${r.cwd}/zizmor-cache`, WF]);
     expect(r.args).not.toContain('--offline');
     expect(r.args).not.toContain('--no-online-audits');
     // no login: zizmor is never started, and that is an issue, not a skip; actionlint still runs
@@ -209,16 +211,21 @@ describe('runLinters (S19, S21)', () => {
       expect(own[0]?.message).toMatch(/not defined/);
     }
     // errors: bad JSON, a crash, an exit code outside the finding codes, empty output on a failure: never a silent pass
-    const cases: [string, number, string][] = [['not json', 1, 'bad json, exit 1'], ['{"a":1}', 1, 'not an array'], ['', 2, 'exit 2 empty'], ['[]', 3, 'exit 3'], ['not json', 0, 'exit 0 with junk']];
+    const cases: [string, number, string][] = [['not json', 1, 'bad json, exit 1'], ['{"a":1}', 1, 'not an array'], ['', 2, 'exit 2 empty'], ['[]', 3, 'exit 3'], ['not json', 0, 'exit 0 with junk'], ['[]', 1, 'exit 1 with an empty list'], ['', 3, 'exit 3 empty']];
     for (const [out, code, label] of cases) {
       const a = stub(); a.set(out, code);
       const z = stub(); z.set(out, code === 1 ? 14 : code);
       const issues = await runLinters([file(WF)], closures(a, z), LOGIN);
       const bad = (check: 'actionlint' | 'zizmor') => issues.filter((i) => i.check === check && i.line === undefined);
-      if (!(out === '' && code === 0)) {
-        expect(bad('zizmor'), `${label}: zizmor ${JSON.stringify(issues)}`).toHaveLength(1);
-      }
+      expect(bad('zizmor'), `${label}: zizmor ${JSON.stringify(issues)}`).toHaveLength(1);
+      expect(bad('actionlint'), `${label}: actionlint ${JSON.stringify(issues)}`).toHaveLength(1);
       expect(JSON.stringify(issues)).not.toContain(LOGIN);
+    }
+    // zizmor: a findings exit code with an empty list is an issue too (the list was lost), and so is exit 0 with junk
+    for (const [out, code] of [['[]', 10], ['[]', 14], ['junk', 0], ['', 12]] as [string, number][]) {
+      const a = stub(); const z = stub(); z.set(out, code);
+      const issues = await runLinters([file(WF)], closures(a, z), LOGIN);
+      expect(issues.filter((i) => i.check === 'zizmor'), `zizmor ${out} exit ${code}`).toHaveLength(1);
     }
     // exit 0 with no output at all is clean for actionlint (it prints nothing when there is nothing to say)
     {
@@ -233,6 +240,36 @@ describe('runLinters (S19, S21)', () => {
     z2.set(JSON.stringify([{ ident: 'x', desc: 'y', locations: [] }]), 12);
     const odd = await runLinters([file(WF)], closures(a2, z2), LOGIN);
     expect(odd.filter((i) => i.check === 'zizmor').map((i) => [i.file, i.line])).toEqual([[WF, undefined]]);
+  });
+
+  it('runLinters: zizmor is told to ignore inline ignore comments; a finding it marks ignored is still an issue', async () => {
+    const z = stub();
+    z.set(JSON.stringify([{ ...zizmorFinding(WF, 9), ignored: true }]), 13);
+    const a = stub();
+    const issues = await runLinters([file(WF)], closures(a, z), LOGIN);
+    expect((z.records()[0] as Rec).args).toContain('--no-ignores');
+    expect((z.records()[0] as Rec).args).toContain('--strict-collection');
+    expect(issues.map((i) => [i.check, i.line])).toEqual([['zizmor', 10]]);
+  });
+
+  it('runLinters: two names that differ only in case are refused (no overwrite on a case-insensitive disk)', async () => {
+    const { a, z, issues } = await run([file('.github/workflows/A.yml', { content: 'name: first\n' }), file('.github/workflows/a.yml', { content: 'name: second\n' })]);
+    expect(issues.some((i) => /twice|same name|case/i.test(i.message)), JSON.stringify(issues)).toBe(true);
+    for (const s of [a, z]) {
+      const files = (s.records()[0] as Rec).files.filter((f) => f.includes('.github/workflows'));
+      expect(files).toEqual(['./.github/workflows/A.yml']);
+    }
+  });
+
+  it('runLinters: a file that can not be written is an issue and is not linted', async () => {
+    const long = `.github/workflows/${'a'.repeat(300)}.yml`;
+    const { a, z, issues } = await run([file(long), file(WF)]);
+    expect(issues.some((i) => /could not be copied/.test(i.message)), JSON.stringify(issues)).toBe(true);
+    for (const s of [a, z]) expect((s.records()[0] as Rec).files.filter((f) => f.includes('aaaa'))).toEqual([]);
+    // when nothing can be written there is nothing to run, and that is still an issue
+    const only = await run([file(long)]);
+    expect(only.issues).toHaveLength(1);
+    expect(only.a.records()).toEqual([]);
   });
 
   it('runLinters: a long or hostile finding message is cut and cleaned', async () => {

@@ -1060,7 +1060,7 @@ describe('fix round 2: the re-review probes are refused', () => {
     }
   });
   it('review-7a-r2 loosening: an if: with no status function is accepted (GitHub implies success() && (…)); any status call outside the success() forms, or non-ASCII, is refused', async () => {
-    const accepted = ["github.ref == 'refs/heads/main'", "${{ github.ref == 'refs/heads/main' }}", "needs.x.result == 'failure'", 'true', "github.event_name == 'push' || github.event_name == 'workflow_dispatch'"];
+    const accepted = ["github.ref == 'a'\n", "github.ref == 'refs/heads/main'", "${{ github.ref == 'refs/heads/main' }}", "needs.x.result == 'failure'", 'true', "github.event_name == 'push' || github.event_name == 'workflow_dispatch'"];
     for (const cond of accepted) {
       const { f, d } = editedWith(cond);
       expect(show(await run([f], d, { list: LIST })), cond).toBe('');
@@ -1069,7 +1069,9 @@ describe('fix round 2: the re-review probes are refused', () => {
     // is whitespace to GitHub's .NET lexer but not to JS \s, and U+017F folds to 'S' in .NET only, so non-ASCII is refused
     const refused = ["contains(github.ref, 'always()')", 'ALWAYS ()', 'always\t()', 'x-success() || true', 'success\u0085() || true', 'ſuccess() || true', "github.ref == 'é'",
       // GitHub ends the expression at the first }}; a trailing } makes the whole value a (truthy) string template
-      '${{ x }}}', '${{ success() && x }}}', '${{ {x} }}', "${{ format('{0}', x) }}"];
+      '${{ x }}}', '${{ success() && x }}}', '${{ {x} }}', "${{ format('{0}', x) }}",
+      // whitespace outside the wrapper is part of the value (`if: |`, "\n"): GitHub reads it as a truthy string template
+      '${{ success() && x }}\n', ' ${{ x }}', '${{ x }} ', '\n${{ x }}'];
     for (const cond of refused) {
       const { f, d } = editedWith(cond);
       expect((await run([f], d, { list: LIST })).ok, JSON.stringify(cond)).toBe(false);

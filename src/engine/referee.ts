@@ -190,7 +190,7 @@ function topLevelOr(e: string): boolean {
  * exactly `success()`, or `success() && <expr>` where <expr> holds no status call and no `||` at its top level. Anything else
  * can run the job although pipegen's job failed (`success() || …`, `!success()`, `always()`, `!cancelled()`).
  * Refused first: non-ASCII (U+0085 is whitespace to GitHub's .NET lexer but not to JS \s; U+017F folds to 'S' in .NET only),
- * more than one `${{ }}` or text outside it (read by GitHub as a truthy string), any `{` or `}` left after the unwrap (GitHub
+ * more than one `${{ }}` or text outside it, whitespace included (read by GitHub as a truthy string; a value with no `${{` may be trimmed), any `{` or `}` left after the unwrap (GitHub
  * ends the expression at the first `}}`, so `${{ x }}}` is a truthy string template; expressions have no brace syntax, so braces
  * inside string literals are refused too, which is only stricter), an empty condition, and unbalanced
  * parentheses or quotes (GitHub refuses the workflow; the referee says so itself). A YAML boolean is not a string: refused.
@@ -198,9 +198,13 @@ function topLevelOr(e: string): boolean {
 export function gatedIfAllowed(cond: unknown): boolean {
   if (cond === undefined) return true;
   if (typeof cond !== 'string' || !/^[\t\n\r\x20-\x7e]*$/.test(cond)) return false;
-  let e = cond.trim();
-  const wrapped = /^\$\{\{([\s\S]*)\}\}$/.exec(e);
-  if (wrapped !== null) e = (wrapped[1] as string).trim();
+  let e = cond;
+  if (cond.includes(EXPR)) {
+    // the wrapper is judged on the untrimmed value: whitespace outside it is literal text, which GitHub reads as a (truthy) string template
+    const wrapped = /^\$\{\{([\s\S]*)\}\}$/.exec(cond);
+    if (wrapped === null) return false;
+    e = (wrapped[1] as string).trim();
+  } else e = cond.trim();
   if (e === '' || e.includes(EXPR) || /[{}]/.test(e) || !balanced(e)) return false;
   if (!STATUS_CALL_RE.test(e)) return true;
   if (/^success\(\s*\)$/i.test(e)) return true;

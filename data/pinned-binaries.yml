@@ -191,7 +191,8 @@ cosign:
 
 # The referee's workflow security audit (Plan B Task 7b, ruling S19), run online with a read-only token so the
 # impostor-commit audit is on. The same release as reviewed-tools.yml's zizmor entry (ruling S25).
-# The release has no checksums file and no attestation: each archiveSha256 is the sha256 GitHub records for the asset
+# The release has no checksums file; GitHub build attestations exist for the archives but are not checked yet (a later task
+# should verify them with the pinned cosign, as for actionlint). Each archiveSha256 is the sha256 GitHub records for the asset
 # (releases API `digest`, read 2026-10-29), and each was confirmed by one real download of the asset on 2026-10-29
 # (sha256 of the downloaded file equals the digest). binarySize and binarySha256 are the one `zizmor` member of each
 # downloaded archive. Pinned 2026-10-29; the release (2026-10-15) was 13 days old. Review delegated (DECISIONS 105).

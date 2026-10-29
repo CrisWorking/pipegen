@@ -62,5 +62,26 @@ describe.skipIf(!live)('live: the real actionlint and zizmor accept cache-mode: 
     expect(found.filter((i) => /cache-mode/.test(i.message))).toEqual([]);
     expect(found.some((i) => i.check === 'actionlint' && i.line !== undefined), JSON.stringify(found)).toBe(true);
     if (online !== null) expect(found.some((i) => i.check === 'zizmor' && i.line !== undefined), JSON.stringify(found)).toBe(true);
+
+    // --no-ignores: an inline ignore comment on a planted injection does not silence it
+    const ignored: CreatedFile = { ...f, content: bad.content.replace('${{ github.head_ref }}', '${{ github.head_ref }} # zizmor: ignore[template-injection]') };
+    const ig = await runLinters([ignored], linters, online);
+    for (const i of ig) console.log(`inline-ignore: ${i.check} ${i.file}:${i.line ?? '-'} ${i.message.slice(0, 80)}`);
+    if (online !== null) expect(ig.some((i) => i.check === 'zizmor' && /template-injection/.test(i.message)), JSON.stringify(ig)).toBe(true);
+    // --strict-collection: a central repo with one valid workflow and one schema-invalid action file is an issue
+    const central: CreatedFile[] = [
+      { ...f, repo: 'central' },
+      { path: '.github/actions/x/action.yml', content: 'name: x\nruns:\n  using: composite\n  steps: 5\n  bogus-key: ${{ github.head_ref }}\n', part: 'pipeline', reason: 'live test', repo: 'central' },
+    ];
+    const strict = await runLinters(central, linters, online);
+    for (const i of strict) console.log(`strict: ${i.check} ${i.file}:${i.line ?? '-'} ${i.message.slice(0, 100)}`);
+    if (online !== null) expect(strict.some((i) => i.check === 'zizmor' && i.repo === 'central'), JSON.stringify(strict)).toBe(true);
+    // impostor-commit (online only): a commit that exists only in a fork of actions/checkout
+    const impostor: CreatedFile = { ...f, content: 'name: imp\non: pull_request\npermissions: {}\njobs:\n  a:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/checkout@c7d749a2d57b4b375d1ebcd17cfbfb60c676f18e\n' };
+    const imp = await runLinters([impostor], linters, online);
+    for (const i of imp) console.log(`impostor: ${i.check} ${i.file}:${i.line ?? '-'} ${i.message.slice(0, 100)}`);
+    if (online !== null) expect(imp.some((i) => i.check === 'zizmor' && /impostor-commit/.test(i.message)), JSON.stringify(imp)).toBe(true);
+    // S22 again under --no-ignores and --strict-collection: the rendered fixture still passes
+    expect((await runLinters([f], linters, online)).filter((i) => /cache-mode/.test(i.message))).toEqual([]);
   }, 600_000);
 });

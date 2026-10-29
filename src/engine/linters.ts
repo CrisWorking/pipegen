@@ -411,7 +411,9 @@ export function checkPinnedAgainstReviewed(pins: PinnedBinaries, reviewed: reado
 // `central`). Nothing else is copied, and every run gets an explicit config path, so a repo's own .github/zizmor.yml,
 // zizmor.yml or .github/actionlint.yaml is never read. The configs are the reviewed entries' pinned config text.
 // Chosen: the central repo's composite action files (the referee still parses them) are copied too, and only zizmor
-// reads them; actionlint gets the workflow files. Anything that is not such a file is not copied and is an issue (it
+// reads them; actionlint gets the workflow files. zizmor runs with --no-ignores (no inline `# zizmor: ignore[...]`
+// comment can silence a finding) and --strict-collection (an input it can't validate fails the run instead of being
+// skipped with a warning). Anything that is not such a file is not copied and is an issue (it
 // was not linted, so it is not cleared). The linters start with an empty environment plus what they need (S19).
 
 const WORKFLOW_FILE_RE = /^\.github\/workflows\/[A-Za-z0-9._-]+\.ya?ml$/;
@@ -540,8 +542,8 @@ export async function runLinters(files: CreatedFile[], linters: Linters, ghToken
     for (const f of mine) {
       const kind = lintablePath(f.path);
       if (kind === null) out.push(issue('actionlint', f.path, `The file ${safeText(f.path, 80)} is not a workflow file, so it was not copied for the linters and is not cleared.`));
-      else if (seen.has(f.path)) out.push(issue('actionlint', f.path, `The file ${safeText(f.path, 80)} is listed twice, so it was not linted and is not cleared.`));
-      else { seen.add(f.path); copied.push({ path: f.path, kind }); }
+      else if (seen.has(f.path.toLowerCase())) out.push(issue('actionlint', f.path, `The file ${safeText(f.path, 80)} is listed twice (names are compared without case), so it was not linted and is not cleared.`));
+      else { seen.add(f.path.toLowerCase()); copied.push({ path: f.path, kind }); }
     }
     if (copied.length === 0) continue;
 
@@ -605,10 +607,11 @@ export async function runLinters(files: CreatedFile[], linters: Linters, ghToken
           out.push(issue('zizmor', first, `zizmor could not be set up: ${e instanceof Error ? e.message : 'unknown error'} It was not run, so the files are not cleared.`));
         }
         if (bin !== null) {
-          const r = await spawnLinter(bin, ['--config', join(dir, 'zizmor.yml'), '--format', 'json', '--cache-dir', join(dir, 'zizmor-cache'), ...written.map((c) => c.path)], dir, { GH_TOKEN: ghToken, HOME: dir, NO_COLOR: '1' }, timeoutMs);
+          const r = await spawnLinter(bin, ['--config', join(dir, 'zizmor.yml'), '--format', 'json', '--no-ignores', '--strict-collection', '--cache-dir', join(dir, 'zizmor-cache'), ...written.map((c) => c.path)], dir, { GH_TOKEN: ghToken, HOME: dir, NO_COLOR: '1' }, timeoutMs);
           if (r.code !== null && (r.code === 0 || ZIZMOR_FINDING_CODES.has(r.code))) {
             const items = parseJsonArray(r.stdout);
             if (items === null) out.push(issue('zizmor', first, 'zizmor printed output pipegen could not read, so the files are not cleared.'));
+            else if (items.length === 0 && r.code !== 0) out.push(issue('zizmor', first, `zizmor reported findings (exit ${r.code}) but its list was empty, so the files are not cleared.`));
             else out.push(...zizmorFindings(items, issue, first));
           } else {
             out.push(issue('zizmor', first, r.failed === null ? `zizmor failed (exit ${r.code}), so the files are not cleared.` : `zizmor could not run (${safeText(r.failed, 40)}), so the files are not cleared.`));
