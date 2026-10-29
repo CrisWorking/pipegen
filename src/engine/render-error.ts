@@ -1,8 +1,17 @@
-// The renderer's error type and the one way it quotes a value from outside in a message. A leaf module (it imports only
-// safe-text), so render-step.ts and render-cli.ts can share it without importing each other.
+// The renderer's shared leaf: its error type and the few helpers both renderers use (render-step.ts and render-cli.ts).
+// It imports only safe-text, so neither renderer has to import the other for them.
 import { safeText } from '../util/safe-text.js';
 
 export class RenderError extends Error {}
 
 /** A value from outside, shown in a message: one clean line, cut short, quoted when it is a string. */
 export const show = (v: unknown): string => (typeof v === 'string' ? JSON.stringify(safeText(v, 60)) : safeText(String(v), 30));
+
+/** An expression opener. Actions evaluates `${{` anywhere in a workflow value, quoted or not, so no rendered text may hold one. */
+export const EXPR = '${{';
+
+/** Throws a RenderError (as a function, so it can end an expression). */
+export const refuse = (message: string): never => { throw new RenderError(message); };
+
+/** An own property of a table, or undefined: a repo-derived key can not reach the prototype (`toString`, `__proto__`). */
+export const own = <T>(o: Readonly<Record<string, T>>, k: string): T | undefined => (Object.hasOwn(o, k) ? o[k] : undefined);

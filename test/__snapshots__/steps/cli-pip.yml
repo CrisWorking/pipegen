@@ -6,12 +6,18 @@
 - name: "pipegen: install mypy (pip, hashes required)"
   run: |-
     set -euo pipefail
+    unset CDPATH
     pg_fail() { echo "pipegen: $1" >&2; exit 1; }
     py="$(command -v python3 || true)"
     [ -n "$py" ] || pg_fail "python3 was not found; the Python setup step must run first"
     PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
     home="$RUNNER_TEMP/pipegen-home/pipegen-out-type-check"
     mkdir -p "$RUNNER_TEMP/pipegen-home" "$home"
+    sys=(
+      /usr/bin/env -i
+      "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+      "HOME=$home"
+    )
     venv="$RUNNER_TEMP/pipegen-venv/pipegen-out-type-check"
     mkdir -p "$RUNNER_TEMP/pipegen-pip" "$RUNNER_TEMP/pipegen-venv"
     mkdir "$RUNNER_TEMP/pipegen-pip/pipegen-out-type-check"
@@ -23,8 +29,9 @@
       "RUNNER_TEMP=$RUNNER_TEMP"
       "TMPDIR=$RUNNER_TEMP"
     )
-    "${pg_env[@]}" "$py" -m venv "$venv"
-    "${pg_env[@]}" "$venv/bin/python" -m pip install --require-hashes --no-deps --no-cache-dir --disable-pip-version-check -r "$RUNNER_TEMP/pipegen-pip/pipegen-out-type-check/requirements.txt"
+    cd "$RUNNER_TEMP"
+    "${pg_env[@]}" "$py" -I -m venv "$venv"
+    "${pg_env[@]}" "$venv/bin/python" -I -m pip install --isolated --no-input --only-binary=:all: --require-hashes --no-deps --no-cache-dir --disable-pip-version-check -r "$RUNNER_TEMP/pipegen-pip/pipegen-out-type-check/requirements.txt"
   shell: bash
   env:
     BASH_ENV: ""
@@ -35,11 +42,17 @@
 - name: "pipegen: run mypy"
   run: |-
     set -euo pipefail
+    unset CDPATH
     pg_fail() { echo "pipegen: $1" >&2; exit 1; }
     PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-    venv="$RUNNER_TEMP/pipegen-venv/pipegen-out-type-check"
     home="$RUNNER_TEMP/pipegen-home/pipegen-out-type-check"
     mkdir -p "$RUNNER_TEMP/pipegen-home" "$home"
+    sys=(
+      /usr/bin/env -i
+      "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+      "HOME=$home"
+    )
+    venv="$RUNNER_TEMP/pipegen-venv/pipegen-out-type-check"
     pg_env=(
       /usr/bin/env -i
       "HOME=$home"

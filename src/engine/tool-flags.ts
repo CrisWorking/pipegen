@@ -85,8 +85,22 @@ export interface ArgvPolicy extends CommandPolicy {
    * config and receives the result (ZAP reads `-c` and writes `-J` under /zap/wrk). A docker entry with no mount is not rendered.
    */
   readonly mount?: { readonly at: string; readonly source: 'repo' | 'work'; readonly workdir?: true };
-  /** Docker entries only: run with `--network none` (semgrep, whose rules are mounted and which needs no network). */
-  readonly network?: 'none';
+  /**
+   * Docker entries only: `none` (semgrep, whose rules are mounted and which needs no network) or `host` (DAST steps only, ruling
+   * R-D: their target is the app started on the runner at localhost, which a bridge network can not reach).
+   */
+  readonly network?: 'none' | 'host';
+  /**
+   * Docker DAST entries only (zap, nuclei): the container runs as its image's own user (no `--user` override), with the
+   * fresh work folder made world-writable (it is empty and holds only pipegen's output). Needs `network: 'host'`'s kind of
+   * step: a DAST check with a fresh work folder and no repo mount (ruling R-D).
+   */
+  readonly asImageUser?: true;
+  /**
+   * Why this entry is not rendered yet, in plain words (a missing target, a tool pipegen does not run): a RenderError
+   * now, instead of a step that fails at run time (6b fix round 1, R-E). Removed when the slot exists (6c).
+   */
+  readonly needsSlot?: string;
   readonly env?: readonly string[];
   readonly then?: readonly CommandPolicy[];
   readonly dedicated?: true;
@@ -121,13 +135,14 @@ const ESLINT_TS_FILES = "files: ['**/*.{js,mjs,cjs,jsx,ts,mts,cts,tsx,vue,svelte
  * on a list (P20).
  */
 export const ARGV_POLICIES: Readonly<Record<string, ArgvPolicy>> = Object.freeze({
-  'trivy-config': DEDICATED('trivy', TRIVY_ASSET, TRIVY_CONFIG), 'trivy-image': DEDICATED('trivy', TRIVY_ASSET, TRIVY_CONFIG), 'trivy-licence': DEDICATED('trivy', TRIVY_ASSET, TRIVY_CONFIG),
+  'trivy-config': DEDICATED('trivy', TRIVY_ASSET, TRIVY_CONFIG), 'trivy-image': { ...DEDICATED('trivy', TRIVY_ASSET, TRIVY_CONFIG), needsSlot: 'needs an image to scan, a target slot that is rendered in 6c (ruling B6)' }, 'trivy-licence': DEDICATED('trivy', TRIVY_ASSET, TRIVY_CONFIG),
   betterleaks: DEDICATED('betterleaks', 'betterleaks_1.9.0_linux_x64.tar.gz', { flag: '--config', content: '[extend]\nuseDefault = true\n', fileName: 'betterleaks.toml' }),
   nuclei: DEDICATED('nuclei', 'nuclei_3.11.1_linux_amd64.zip'),
   // ruling P28: the image entries too. registry runs the image's own entrypoint, nothing else
   registry: { method: 'docker', package: 'registry', exe: '', entrypoint: true, dialect: 'long', sub: [], flags: {} },
   // ZAP baseline (zaproxy/zap-stable): getopt short options, read as Go-style words; no -I (warnings that never fail)
   'zap-baseline': {
+    needsSlot: 'needs the URL of the running app (-t), a target slot that is rendered in 6c (ruling B6)', network: 'host', asImageUser: true,
     method: 'docker', package: 'zaproxy/zap-stable', exe: 'zap-baseline.py', dialect: 'goflags', sub: [], flags: { J: 'output', z: { values: ['-silent'] } },
     required: { J: null, z: '-silent' }, mount: { at: '/zap/wrk', source: 'work' }, config: { flag: '-c', content: "# pipegen's pinned ZAP baseline rules: the defaults, nothing ignored\n", fileName: 'zap-baseline.conf' },
   },
@@ -153,11 +168,11 @@ export const ARGV_POLICIES: Readonly<Record<string, ArgvPolicy>> = Object.freeze
     config: { flag: '--config', content: "# pipegen's pinned osv-scanner config: no ignored vulnerabilities\n", fileName: 'osv-scanner.toml' },
   },
   lefthook: { method: GH, runsRepoCode: true, package: 'lefthook_2.2.2_Linux_x86_64', exe: 'lefthook', dialect: 'long', sub: ['run', 'pre-commit'], flags: { 'all-files': 'bool' }, required: { 'all-files': 'true' } },
-  syft: { method: GH, package: 'syft_1.55.0_linux_amd64.tar.gz',
+  syft: { method: GH, needsSlot: 'needs an image to scan, a target slot that is rendered in 6c (ruling B6)', package: 'syft_1.55.0_linux_amd64.tar.gz',
     exe: 'syft', dialect: 'long', sub: ['scan'], flags: { output: { values: ['spdx-json=sbom.spdx.json'] } }, required: { output: 'spdx-json=sbom.spdx.json' },
     config: { flag: '--config', content: 'check-for-app-update: false\n', fileName: 'syft.yaml' },
   },
-  cosign: { method: GH, package: 'cosign-linux-amd64', exe: 'cosign', dialect: 'long', sub: ['sign'], flags: { yes: 'bool' }, required: { yes: 'true' } },
+  cosign: { method: GH, needsSlot: "is run by Plan G's sign job, which adds its own reviewed flags (ruling B6)", package: 'cosign-linux-amd64', exe: 'cosign', dialect: 'long', sub: ['sign'], flags: { yes: 'bool' }, required: { yes: 'true' } },
   actionlint: { method: GH, package: 'actionlint_1.7.12_linux_amd64.tar.gz',
     exe: 'actionlint', dialect: 'goflags', sub: [], flags: { 'no-color': 'bool', shellcheck: { values: [''] }, pyflakes: { values: [''] } },
     required: { shellcheck: '', pyflakes: '' },
@@ -203,13 +218,13 @@ export const ARGV_POLICIES: Readonly<Record<string, ArgvPolicy>> = Object.freeze
     config: { flag: '--config', content: '{}\n', fileName: 'jscpd.json' },
   },
   // hadolint 2.15.1: fails on warnings and errors (never --no-fail or a lower threshold)
-  hadolint: { method: GH, package: 'hadolint-linux-x86_64',
+  hadolint: { method: GH, needsSlot: 'needs the Dockerfile to check, a repo-path slot that is rendered in 6c', package: 'hadolint-linux-x86_64',
     exe: 'hadolint', dialect: 'long', sub: [], flags: { 'no-color': 'bool', 'failure-threshold': { values: ['warning'] }, format: { values: ['sarif'] }, output: 'output' },
     required: { 'failure-threshold': 'warning', format: 'sarif', output: null },
     config: { flag: '--config', content: "# pipegen's pinned hadolint config: every rule at its default level, nothing ignored\nignored: []\n", fileName: 'hadolint.yaml' },
   },
   // kube-linter 0.8.3: an unrenderable chart, a bad path or YAML it can't parse fails the check (P25)
-  'kube-linter': { method: GH, package: 'kube-linter-linux',
+  'kube-linter': { method: GH, needsSlot: 'needs the folder to check, a repo-path slot that is rendered in 6c', package: 'kube-linter-linux',
     exe: 'kube-linter', dialect: 'long', sub: ['lint'],
     flags: { 'fail-if-no-objects-found': 'bool', 'fail-on-invalid-resource': 'bool', format: { values: ['sarif'] }, output: 'output' },
     required: { 'fail-if-no-objects-found': 'true', 'fail-on-invalid-resource': 'true', format: 'sarif', output: null },
@@ -229,7 +244,7 @@ export const ARGV_POLICIES: Readonly<Record<string, ArgvPolicy>> = Object.freeze
     config: { flag: '--config', content: "# pipegen's pinned poutine config: no skipped rules\nskip: []\n", fileName: 'poutine.yml' },
   },
   // gosec 2.29.0 (Go flags): never -no-fail; every #nosec suppression is reported in the SARIF (P27)
-  gosec: { method: GH, package: 'gosec_2.29.0_linux_amd64.tar.gz',
+  gosec: { method: GH, needsSlot: 'is for Go: Go is not supported in v0.2 (it needs setup-go discovery, 6c)', package: 'gosec_2.29.0_linux_amd64.tar.gz',
     exe: 'gosec', dialect: 'goflags', sub: [], positionals: ['./...'], flags: { fmt: { values: ['sarif'] }, out: 'output', 'track-suppressions': 'bool' },
     required: { fmt: 'sarif', out: null, 'track-suppressions': 'true' },
   },

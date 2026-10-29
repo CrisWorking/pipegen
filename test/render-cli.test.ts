@@ -8,12 +8,12 @@ import { afterAll, describe, expect, it } from 'vitest';
 import { Document, parse } from 'yaml';
 import { resultArtifactName } from '../src/engine/artifact-names.js';
 import { NEED_IDS } from '../src/engine/need-ids.js';
-import { dedupeJobSteps, RenderError, renderStep, renderUpload, stepsToYaml, type RenderedStep, type RenderResult } from '../src/engine/render-step.js';
+import { dedupeJobSteps, RenderError, renderStepWith, renderUpload, stepsToYaml, type RenderedStep, type RenderResult } from '../src/engine/render-step.js';
 import { ARGV_POLICIES, PIP_CLOSURES, type ArgvPolicy } from '../src/engine/tool-flags.js';
 import type { ReviewedTool, StepSpec } from '../src/types.js';
 import { ctxFor, entry, platform, reviewedList, service, specFor } from './helpers/render.js';
+import { argvOf, envNames, exec, fakeTool, FIXED_PATH, sandbox, stepEnv, type Sandbox } from './helpers/step-harness.js';
 
-const FIXED_PATH = '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin';
 const needFor = (t: ReviewedTool): string => t.categories.find((c) => (NEED_IDS as readonly string[]).includes(c) && c !== 'platform') ?? 'sast';
 const ctx = ctxFor([service({ name: 'app', path: '.' })]);
 // declared-name lists are set through Reflect: the fixture scan (no-secret-literals) treats a keyword key with a value as a leak
@@ -22,10 +22,18 @@ const withNames = (spec: StepSpec, names: string[]): StepSpec => {
   Reflect.set(copy, 'secrets', names);
   return copy;
 };
+/** An argv policy with some fields dropped and some added, as the `policies` option of a test render. */
+const withPolicy = (id: string, drop: (keyof ArgvPolicy)[] = [], add: Partial<ArgvPolicy> = {}): { policies: Record<string, ArgvPolicy> } => {
+  const p = { ...ARGV_POLICIES[id] } as Record<string, unknown>;
+  for (const k of drop) delete p[k];
+  return { policies: { ...ARGV_POLICIES, [id]: { ...p, ...add } as ArgvPolicy } };
+};
+/** zap with the plain docker rules of S26 (no target slot needed here, no host network, the caller's uid): the generic docker tests. */
+const PLAIN_ZAP = withPolicy('zap-baseline', ['needsSlot', 'network', 'asImageUser']);
 const spec = (t: ReviewedTool, over: Partial<StepSpec> = {}): StepSpec => specFor(t, { needId: needFor(t), ...over });
-const render = (id: string, over: Partial<StepSpec> = {}, c = ctx, opts?: Parameters<typeof renderStep>[4]): RenderResult => {
+const render = (id: string, over: Partial<StepSpec> = {}, c = ctx, opts?: Parameters<typeof renderStepWith>[4]): RenderResult => {
   const t = entry(id);
-  return renderStep(spec(t, over), t, platform(), c, opts);
+  return renderStepWith(spec(t, over), t, platform(), c, opts);
 };
 const runs = (r: RenderResult): RenderedStep[] => r.steps.filter((s) => s.run !== undefined);
 const lastRun = (r: RenderResult): string => runs(r).at(-1)?.run ?? '';
@@ -41,41 +49,6 @@ const bashN = (script: string): { ok: boolean; err: string } => {
 const REAL_BASH = process.platform !== 'win32';
 const it2 = it.skipIf(!REAL_BASH);
 
-// ---------- a harness that really runs a rendered step in a temp folder ----------
-const tmps: string[] = [];
-afterAll(() => { for (const d of tmps) rmSync(d, { recursive: true, force: true }); });
-interface Sandbox { dir: string; rt: string; ws: string }
-function sandbox(): Sandbox {
-  const dir = mkdtempSync(join(tmpdir(), 'pipegen-6b-'));
-  tmps.push(dir);
-  const rt = join(dir, 'rt');
-  const ws = join(dir, 'ws');
-  mkdirSync(rt);
-  mkdirSync(ws);
-  return { dir, rt, ws };
-}
-/** The step's env as the runner would set it (a `${{ secrets.X }}` is replaced by the given value), plus the runner's own variables. */
-function stepEnv(step: RenderedStep, sb: Sandbox, declared: Record<string, string> = {}, extra: Record<string, string> = {}): Record<string, string> {
-  const env: Record<string, string> = { PATH: process.env.PATH ?? FIXED_PATH, RUNNER_TEMP: sb.rt, GITHUB_WORKSPACE: sb.ws, ...extra };
-  for (const [k, v] of Object.entries(step.env ?? {})) env[k] = v.replace(/^\$\{\{ secrets\.([A-Z0-9_]+) \}\}$/, (_m, n: string) => declared[n] ?? '');
-  return env;
-}
-function exec(step: RenderedStep, sb: Sandbox, env: Record<string, string>): { status: number | null; stdout: string; stderr: string } {
-  expect(step.shell).toBe('bash');
-  const r = spawnSync('bash', ['--noprofile', '--norc', '-e', '-o', 'pipefail', '-c', step.run ?? ''], { cwd: sb.ws, env, encoding: 'utf8' });
-  return { status: r.status, stdout: r.stdout, stderr: r.stderr };
-}
-/** A stand-in for the installed tool: records its argv (NUL separated) and its environment into the working folder. */
-function fakeTool(sb: Sandbox, artifact: string, exe: string, extra = ''): void {
-  const dir = join(sb.rt, 'pipegen-bin', artifact);
-  mkdirSync(dir, { recursive: true });
-  const path = join(dir, exe);
-  writeFileSync(path, `#!/bin/sh\nfor a in "$@"; do printf '%s\\0' "$a"; done > ./argv.bin\nenv > ./env.txt\n${extra}\n`);
-  chmodSync(path, 0o755);
-}
-const argvOf = (sb: Sandbox): string[] => readFileSync(join(sb.ws, 'argv.bin'), 'utf8').split('\0').slice(0, -1);
-const envNames = (sb: Sandbox): string[] => readFileSync(join(sb.ws, 'env.txt'), 'utf8').split('\n').filter((l) => /^[A-Za-z_][A-Za-z0-9_]*=/.test(l)).map((l) => l.slice(0, l.indexOf('=')));
-
 // ---------- a synthetic github-release entry with hostile template text and hostile choice values ----------
 const HOSTILE = ["a'b", 'a"b', '$(touch pwned)', '`touch pwned`', 'a\nb', '; touch pwned', "'; touch pwned; '", '$HOME', '*', '-rf', '', ' lead', 'x y', 'a\\b', '${HOME}', '"$(touch pwned)"'];
 function hostileRuff(): ReviewedTool {
@@ -88,10 +61,10 @@ function hostileRuff(): ReviewedTool {
 
 describe('6b: github-release (S27)', () => {
   it('github-release: an https download of the entry\'s own repo, version and asset; the sha256 comes from env and is checked before anything is extracted', () => {
-    const r = render('trivy-image');
+    const r = render('trivy-config');
     expect(r.steps).toHaveLength(2);
     const install = r.steps[0] as RenderedStep;
-    const t = entry('trivy-image');
+    const t = entry('trivy-config');
     expect(install.env).toMatchObject({
       PIPEGEN_DL_URL: 'https://github.com/aquasecurity/trivy/releases/download/v0.76.0/trivy_0.76.0_Linux-64bit.tar.gz',
       PIPEGEN_DL_SHA256: t.candidate.pin.checksum,
@@ -106,13 +79,13 @@ describe('6b: github-release (S27)', () => {
   });
 
   it('github-release: extracted into an empty folder under runner temp; exactly one regular file named like the exe, else it fails; run by absolute path', () => {
-    const run = (render('trivy-image').steps[0] as RenderedStep).run as string;
-    expect(run).toContain('pipegen-bin/pipegen-out-image-scan');
+    const run = (render('trivy-config').steps[0] as RenderedStep).run as string;
+    expect(run).toContain('pipegen-bin/pipegen-out-iac');
     expect(run).toMatch(/mkdir "\$bin"/); // plain mkdir: fails when the folder already exists
     expect(run).toContain('-name trivy -type f');
     expect(run).toContain('-name trivy ! -type f');
-    expect(lastRun(render('trivy-image'))).toContain('"$bin/trivy"');
-    expect(lastRun(render('trivy-image'))).not.toMatch(/^trivy /m);
+    expect(lastRun(render('trivy-config'))).toContain('"$bin/trivy"');
+    expect(lastRun(render('trivy-config'))).not.toMatch(/^trivy /m);
   });
 
   it('github-release: a tag without a v (ruff) is used as the entry says; a raw binary asset is just made executable; a zip is unzipped', () => {
@@ -124,7 +97,7 @@ describe('6b: github-release (S27)', () => {
     const t = entry('ruff');
     (t.step.cli as { install: { package: string } }).install.package = 'ruff.zip';
     const policy = { ...ARGV_POLICIES.ruff, package: 'ruff.zip' } as ArgvPolicy;
-    const z = renderStep(spec(t), t, platform(), ctx, { policies: { ...ARGV_POLICIES, ruff: policy } });
+    const z = renderStepWith(spec(t), t, platform(), ctx, { policies: { ...ARGV_POLICIES, ruff: policy } });
     expect((z.steps[0] as RenderedStep).run).toContain('unzip');
   });
 
@@ -132,7 +105,7 @@ describe('6b: github-release (S27)', () => {
     const tamper = (edit: (t: ReviewedTool) => void) => {
       const t = entry('ruff');
       edit(t);
-      return () => renderStep(spec(t), t, platform(), ctx);
+      return () => renderStepWith(spec(t), t, platform(), ctx);
     };
     expect(tamper((t) => { t.candidate.pin = { checksum: 'abc' }; })).toThrow(RenderError);
     expect(tamper((t) => { t.candidate.pin = { checksum: `${'a'.repeat(63)}'` }; })).toThrow(RenderError);
@@ -147,8 +120,8 @@ describe('6b: github-release (S27)', () => {
 
 describe('6b: docker (S26)', () => {
   it('docker: the image is pulled by digest from env; run with --rm, the caller\'s uid, the policy mount, and none of the dangerous options', () => {
-    const r = render('zap-baseline');
     const t = entry('zap-baseline');
+    const r = renderStepWith(spec(t), t, platform(), ctx, PLAIN_ZAP);
     expect(r.steps[0]?.env?.PIPEGEN_IMAGE).toBe(`zaproxy/zap-stable@${t.candidate.pin.digest}`);
     const run = lastRun(r);
     expect(run).toContain('/usr/bin/docker run --rm');
@@ -163,17 +136,16 @@ describe('6b: docker (S26)', () => {
     const t = entry('zap-baseline');
     t.categories = ['coverage']; // pretend it runs the app, to look at the -e rendering
     const c = ctxFor([service({ name: 'app', path: '.', envVars: ['STRIPE_KEY'] })]);
-    const none = renderStep(spec(t), t, platform(), c);
+    const none = renderStepWith(spec(t), t, platform(), c, PLAIN_ZAP);
     expect(lastRun(none)).not.toMatch(/ -e [A-Z_]+ /);
-    const some = renderStep(withNames(spec(t, { service: 'app' }), ['STRIPE_KEY']), t, platform(), c);
+    const some = renderStepWith(withNames(spec(t, { service: 'app' }), ['STRIPE_KEY']), t, platform(), c, PLAIN_ZAP);
     expect(lastRun(some)).toMatch(/ -e STRIPE_KEY /);
     expect(lastRun(some).match(/ -e [A-Z_]+ /g)).toHaveLength(1);
   });
 
   it('docker: the policy can ask for --network none, and the mount of the repo goes with -w', () => {
     const t = entry('zap-baseline');
-    const pol: ArgvPolicy = { ...ARGV_POLICIES['zap-baseline'], network: 'none', mount: { at: '/src', source: 'repo', workdir: true } } as ArgvPolicy;
-    const r = renderStep(spec(t), t, platform(), ctx, { policies: { ...ARGV_POLICIES, 'zap-baseline': pol } });
+    const r = renderStepWith(spec(t), t, platform(), ctx, withPolicy('zap-baseline', ['needsSlot', 'asImageUser'], { network: 'none', mount: { at: '/src', source: 'repo', workdir: true } }));
     expect(lastRun(r)).toContain('--network none');
     expect(lastRun(r)).toContain('-w /src');
     expect(lastRun(r)).toContain(`-v "$${'P'}WD${':'}/src"`);
@@ -186,103 +158,16 @@ describe('6b: docker (S26)', () => {
 
   it('docker: a docker entry without a reviewed mount is refused', () => {
     const t = entry('zap-baseline');
-    const pol = { ...ARGV_POLICIES['zap-baseline'] } as { mount?: unknown };
-    delete pol.mount;
-    expect(() => renderStep(spec(t), t, platform(), ctx, { policies: { ...ARGV_POLICIES, 'zap-baseline': pol as ArgvPolicy } })).toThrow(/mount/);
+    expect(() => renderStepWith(spec(t), t, platform(), ctx, withPolicy('zap-baseline', ['needsSlot', 'mount']))).toThrow(/mount/);
   });
 
   it('docker: an image or digest that is not plain is refused', () => {
     const t = entry('zap-baseline');
     t.candidate.pin = { digest: 'sha256:abc' };
-    expect(() => renderStep(spec(t), t, platform(), ctx)).toThrow(RenderError);
+    expect(() => renderStepWith(spec(t), t, platform(), ctx, PLAIN_ZAP)).toThrow(RenderError);
     const u = entry('zap-baseline');
     (u.step.cli as { install: { package: string } }).install.package = 'zaproxy/zap-stable --privileged';
-    expect(() => renderStep(spec(u), u, platform(), ctx)).toThrow(RenderError);
-  });
-});
-
-describe('6b: npm (B5)', () => {
-  const c = ctxFor([service({ name: 'app', path: '.', runtimeVersion: '>=18 <21' })]);
-
-  it('npm: setup-node (version mapped from the repo), one npm ci --ignore-scripts, a lockfile check, then npx --no-install', () => {
-    const r = render('biome', { service: 'app' }, c);
-    expect(r.steps).toHaveLength(4);
-    expect(r.steps[0]?.uses).toMatch(/^actions\/setup-node@/);
-    expect(r.steps[0]?.with).toMatchObject({ 'node-version': '22', 'package-manager-cache': 'false' });
-    expect(r.steps[0]?.with).not.toHaveProperty('cache');
-    expect(r.steps[1]?.run).toContain('ci --ignore-scripts');
-    expect(r.steps[2]?.run).toContain('-e "$js"');
-    expect(lastRun(r)).toContain('npx" --no-install biome ci');
-    expect(r.steps.map((s) => s.run ?? '').join('\n')).not.toMatch(/npm (install|i|pack)\b/);
-    expect(r.steps.map((s) => s.run ?? '').join('\n')).not.toContain('install -g');
-  });
-
-  it('npm: the check step carries the tool and every plugin with the exact version and integrity, from env', () => {
-    const t = entry('biome');
-    const expectList = JSON.parse(render('biome', {}, c).steps[2]?.env?.PIPEGEN_NPM_EXPECT as string) as { name: string; version: string; integrity: string }[];
-    const cli = t.step.cli as NonNullable<typeof t.step.cli>;
-    expect(expectList).toEqual([
-      { name: '@biomejs/biome', version: '2.5.15', integrity: t.candidate.pin.checksum },
-      ...(cli.plugins ?? []).map((p) => ({ name: p.package, version: p.version, integrity: p.checksum })),
-    ]);
-    expect(expectList.length).toBeGreaterThan(1);
-    expect(render('biome', {}, c).steps[2]?.run).not.toContain(t.candidate.pin.checksum as string);
-    // oxlint has three plugins
-    expect(JSON.parse(render('oxlint-typeaware', {}, c).steps[2]?.env?.PIPEGEN_NPM_EXPECT as string)).toHaveLength(4);
-  });
-
-  it2('npm: the lockfile check passes when version and integrity match and fails closed on any mismatch', () => {
-    const r = render('biome', {}, c);
-    const check = r.steps[2] as RenderedStep;
-    const wanted = JSON.parse(check.env?.PIPEGEN_NPM_EXPECT as string) as { name: string; version: string; integrity: string }[];
-    const build = (edit: (w: typeof wanted) => { lock?: object; skipInstalled?: string; installedVersion?: Record<string, string> }) => {
-      const sb = sandbox();
-      const mod = edit(structuredClone(wanted));
-      const packages: Record<string, { version: string; integrity: string }> = {};
-      for (const w of mod.lock ? (mod.lock as typeof wanted) : wanted) packages[`node_modules/${w.name}`] = { version: w.version, integrity: w.integrity };
-      writeFileSync(join(sb.ws, 'package-lock.json'), JSON.stringify({ lockfileVersion: 3, packages }));
-      for (const w of wanted) {
-        if (w.name === mod.skipInstalled) continue;
-        mkdirSync(join(sb.ws, 'node_modules', w.name), { recursive: true });
-        writeFileSync(join(sb.ws, 'node_modules', w.name, 'package.json'), JSON.stringify({ name: w.name, version: mod.installedVersion?.[w.name] ?? w.version }));
-      }
-      return exec(check, sb, stepEnv(check, sb));
-    };
-    expect(build(() => ({})).status).toBe(0);
-    expect(build((w) => ({ lock: w.map((x, i) => (i === 0 ? { ...x, integrity: `sha512-${'A'.repeat(86)}==` } : x)) })).status).not.toBe(0);
-    expect(build((w) => ({ lock: w.map((x, i) => (i === 1 ? { ...x, version: '9.9.9' } : x)) })).status).not.toBe(0);
-    expect(build((w) => ({ lock: w.slice(0, 1) })).status).not.toBe(0); // a plugin missing from the lockfile
-    expect(build((w) => ({ installedVersion: { [w[1]?.name as string]: '0.0.1' } })).status).not.toBe(0); // the installed copy differs
-    expect(build((w) => ({ skipInstalled: w[0]?.name })).status).not.toBe(0);
-  });
-
-  it('npm: two tools in one job share one setup-node and one npm ci (dedupeJobSteps keeps the first of each id)', () => {
-    const a = render('biome', {}, c).steps;
-    const b = render('knip', {}, c).steps;
-    const all = dedupeJobSteps([...a, ...b]);
-    expect(all.filter((s) => s.uses?.startsWith('actions/setup-node@'))).toHaveLength(1);
-    expect(all.filter((s) => s.run?.includes('ci --ignore-scripts'))).toHaveLength(1);
-    expect(all).toHaveLength(a.length + b.length - 2);
-    expect(a[1]?.id).toBe(b[1]?.id);
-    // steps without an id are never dropped
-    const plain: RenderedStep = { name: 'x', run: 'true' };
-    expect(dedupeJobSteps([plain, { ...plain }])).toHaveLength(2);
-  });
-
-  it('npm: eslint-typescript waits for 6c (its config imports a plugin that must resolve from the lockfile install)', () => {
-    expect(() => render('eslint-typescript', {}, c)).toThrow(/6c/);
-  });
-
-  it('npm: a bad package name, version or integrity is refused', () => {
-    for (const edit of [
-      (t: ReviewedTool) => { (t.step.cli as { install: { package: string } }).install.package = "biome'; id; '"; },
-      (t: ReviewedTool) => { t.candidate.pin = { checksum: 'sha512-short' }; },
-      (t: ReviewedTool) => { ((t.step.cli as { plugins: { version: string }[] }).plugins[0] as { version: string }).version = '1.0.0 && id'; },
-    ]) {
-      const t = entry('biome');
-      edit(t);
-      expect(() => renderStep(spec(t), t, platform(), c)).toThrow(RenderError);
-    }
+    expect(() => renderStepWith(spec(u), u, platform(), ctx, PLAIN_ZAP)).toThrow(RenderError);
   });
 });
 
@@ -299,15 +184,15 @@ describe('6b: pip (B5)', () => {
 
   it('pip: with a hash-locked closure, install is `pip install --require-hashes --no-deps -r` in a fresh venv, run by absolute path', () => {
     const t = entry('mypy');
-    const r = renderStep(spec(t), t, platform(), ctx, { pipClosures: { mypy: closure(t) } });
+    const r = renderStepWith(spec(t), t, platform(), ctx, { pipClosures: { mypy: closure(t) } });
     expect(r.steps[0]?.uses).toMatch(/^actions\/setup-python@/);
     expect(r.steps[0]?.with).not.toHaveProperty('cache');
     expect(r.steps[0]?.with).not.toHaveProperty('cache-dependency-path');
     const install = r.steps[1] as RenderedStep;
-    expect(install.run).toMatch(/-m pip install --require-hashes --no-deps --no-cache-dir --disable-pip-version-check -r "\$RUNNER_TEMP\/pipegen-pip\/pipegen-out-type-check\/requirements\.txt"/);
+    expect(install.run).toMatch(/-I -m pip install --isolated --no-input --only-binary=:all: --require-hashes --no-deps --no-cache-dir --disable-pip-version-check -r "\$RUNNER_TEMP\/pipegen-pip\/pipegen-out-type-check\/requirements\.txt"/);
     expect(install.run).toContain("printf '%s' \"$PIPEGEN_REQUIREMENTS\"");
     expect(install.env?.PIPEGEN_REQUIREMENTS).toBe(closure(t));
-    expect(install.run).not.toMatch(/pip install(?! --require-hashes)/);
+    expect(install.run).not.toMatch(/pip install(?! --isolated --no-input --only-binary=:all: --require-hashes)/);
     expect(lastRun(r)).toContain('"$venv/bin/mypy"');
   });
 
@@ -319,12 +204,12 @@ describe('6b: pip (B5)', () => {
       ok + 'x==1.0 --hash=sha256:' + 'a'.repeat(63) + '\n', ok.replace('mypy==2.4.0', 'mypy==2.4.1'), 'click==8.1.7 --hash=sha256:' + 'c'.repeat(64) + '\n', ok + '${{ x }}==1 --hash=sha256:' + 'a'.repeat(64) + '\n',
       ok + 'x==1.0 --hash=sha256:' + 'a'.repeat(64) + ' ; id\n',
     ];
-    for (const closureText of bad) expect(() => renderStep(spec(t), t, platform(), ctx, { pipClosures: { mypy: closureText } }), closureText.slice(-60)).toThrow(RenderError);
+    for (const closureText of bad) expect(() => renderStepWith(spec(t), t, platform(), ctx, { pipClosures: { mypy: closureText } }), closureText.slice(-60)).toThrow(RenderError);
   });
 
   it('pip: coverage-py renders its follow-up command in the same step', () => {
     const t = entry('coverage-py');
-    const r = renderStep(spec(t, { choices: { 'fail-under': '80' } }), t, platform(), ctx, { pipClosures: { 'coverage-py': closure(t) } });
+    const r = renderStepWith(spec(t, { choices: { 'fail-under': '80' } }), t, platform(), ctx, { pipClosures: { 'coverage-py': closure(t) } });
     const run = lastRun(r);
     expect(run).toContain('"$venv/bin/coverage" run --module pytest');
     expect(run).toMatch(/"\$venv\/bin\/coverage" report --fail-under="\$PIPEGEN_ARG_0"/);
@@ -334,19 +219,19 @@ describe('6b: pip (B5)', () => {
 
 describe('6b: pinned config (S4, S3)', () => {
   it('config: the content travels in env and is written with printf %s to runner temp under the policy file name, passed by the policy flag', () => {
-    const t = entry('trivy-image');
-    const r = render('trivy-image');
+    const t = entry('trivy-config');
+    const r = render('trivy-config');
     const step = runs(r).at(-1) as RenderedStep;
     expect(step.env?.PIPEGEN_CONFIG).toBe(t.fixedInputs.config?.content);
     expect(step.run).toContain("printf '%s' \"$PIPEGEN_CONFIG\" > \"$cfg/trivy.yaml\"");
-    expect(step.run).toContain('cfg="$RUNNER_TEMP/pipegen-cfg/pipegen-out-image-scan"');
-    expect(step.run).toMatch(/trivy" image --config "\$cfg\/trivy\.yaml" /);
+    expect(step.run).toContain('cfg="$RUNNER_TEMP/pipegen-cfg/pipegen-out-iac"');
+    expect(step.run).toMatch(/trivy" config --config "\$cfg\/trivy\.yaml" /);
     expect(step.run).not.toContain('<<'); // no heredoc
   });
 
   it('trivy: the pinned config has cache.backend memory and the command has no --cache-dir', () => {
     for (const id of ['trivy-config', 'trivy-image', 'trivy-licence']) {
-      const r = render(id);
+      const r = render(id, {}, ctx, withPolicy(id, ['needsSlot']));
       expect(runs(r).at(-1)?.env?.PIPEGEN_CONFIG, id).toMatch(/cache:\n {2}backend: memory/);
       expect(lastRun(r), id).not.toContain('--cache-dir');
     }
@@ -354,7 +239,6 @@ describe('6b: pinned config (S4, S3)', () => {
 
   it('config: goflags tools get the flag right after the executable (their flags end at the first word), cobra tools after the subcommand', () => {
     expect(lastRun(render('actionlint'))).toMatch(/actionlint" -config-file "\$cfg\/actionlint\.yaml" -no-color/);
-    expect(lastRun(render('gosec'))).not.toContain('--config'); // gosec has no pinned config
     expect(lastRun(render('osv-scanner'))).toMatch(/osv-scanner" scan source --config "\$cfg\/osv-scanner\.toml" --recursive/);
   });
 
@@ -371,19 +255,19 @@ describe('6b: pinned config (S4, S3)', () => {
   it('config: content with an expression, a config passed as an input, or a file name that is not plain is refused', () => {
     const expr = entry('ruff');
     (expr.fixedInputs.config as { content: string }).content = 'a = "${{ secrets.X }}"\n';
-    expect(() => renderStep(spec(expr), expr, platform(), ctx)).toThrow(/expression/);
+    expect(() => renderStepWith(spec(expr), expr, platform(), ctx)).toThrow(/expression/);
     const input = entry('ruff');
     (input.fixedInputs.config as { passAs: unknown }).passAs = { input: 'config' };
-    expect(() => renderStep(spec(input), input, platform(), ctx)).toThrow(/input/);
+    expect(() => renderStepWith(spec(input), input, platform(), ctx)).toThrow(/input/);
     const t = entry('ruff');
     for (const fileName of ['../x', 'a b', '-x', 'a/b', "x'y", '']) {
       const pol = { ...ARGV_POLICIES.ruff, config: { ...ARGV_POLICIES.ruff?.config, fileName } } as ArgvPolicy;
-      expect(() => renderStep(spec(t), t, platform(), ctx, { policies: { ...ARGV_POLICIES, ruff: pol } }), fileName).toThrow(RenderError);
+      expect(() => renderStepWith(spec(t), t, platform(), ctx, { policies: { ...ARGV_POLICIES, ruff: pol } }), fileName).toThrow(RenderError);
     }
   });
 
   it("config: the repo's own config files are never referenced in a rendered step", () => {
-    for (const id of ['trivy-image', 'betterleaks', 'ruff', 'hadolint', 'osv-scanner', 'zizmor', 'actionlint', 'kube-linter', 'poutine']) {
+    for (const id of ['trivy-config', 'betterleaks', 'ruff', 'osv-scanner', 'zizmor', 'actionlint', 'poutine']) {
       const t = entry(id);
       const text = JSON.stringify(render(id).steps).replace(/\$cfg\/[A-Za-z0-9._-]+/g, '');
       for (const f of t.configFiles) expect(text, `${id}: ${f}`).not.toContain(f);
@@ -393,12 +277,12 @@ describe('6b: pinned config (S4, S3)', () => {
 
 describe('6b: command (S5)', () => {
   it('command: dedicated tools get --<choice> "$V" appended, and a bool choice is --<choice>="$V"; a missing choice takes the first value', () => {
-    const r = render('trivy-image', { choices: { severity: 'HIGH,CRITICAL', 'ignore-unfixed': 'true' } });
+    const r = render('trivy-image', { choices: { severity: 'HIGH,CRITICAL', 'ignore-unfixed': 'true' } }, ctx, withPolicy('trivy-image', ['needsSlot']));
     const step = runs(r).at(-1) as RenderedStep;
     expect(step.run).toContain('--severity "$PIPEGEN_ARG_0"');
     expect(step.run).toContain('--ignore-unfixed="$PIPEGEN_ARG_1"');
     expect(step.env).toMatchObject({ PIPEGEN_ARG_0: 'HIGH,CRITICAL', PIPEGEN_ARG_1: 'true' });
-    const d = runs(render('trivy-image')).at(-1) as RenderedStep;
+    const d = runs(render('trivy-image', {}, ctx, withPolicy('trivy-image', ['needsSlot']))).at(-1) as RenderedStep;
     expect(d.env).toMatchObject({ PIPEGEN_ARG_0: 'CRITICAL', PIPEGEN_ARG_1: 'false' });
   });
 
@@ -414,7 +298,7 @@ describe('6b: command (S5)', () => {
   it('command: reviewed constants are bare when plain and single-quoted otherwise', () => {
     const t = entry('ruff');
     (t.step.cli as { command: string[] }).command.push('plain-word_1.2/x', 'it\'s', 'a b', '');
-    const run = lastRun(renderStep(spec(t), t, platform(), ctx));
+    const run = lastRun(renderStepWith(spec(t), t, platform(), ctx));
     expect(run).toContain(' plain-word_1.2/x');
     expect(run).toContain(" 'it'\\''s'");
     expect(run).toContain(" 'a b'");
@@ -424,22 +308,22 @@ describe('6b: command (S5)', () => {
   it('command: an expression in a template constant or a chosen value is refused (Actions would evaluate it)', () => {
     const t = entry('ruff');
     (t.step.cli as { command: string[] }).command.push('--x=${{ github.head_ref }}');
-    expect(() => renderStep(spec(t), t, platform(), ctx)).toThrow(RenderError);
+    expect(() => renderStepWith(spec(t), t, platform(), ctx)).toThrow(RenderError);
     const u = hostileRuff();
     u.choices['line-length'] = ['${{ secrets.X }}'];
-    expect(() => renderStep(spec(u, { choices: { 'line-length': '${{ secrets.X }}' } }), u, platform(), ctx)).toThrow(RenderError);
+    expect(() => renderStepWith(spec(u, { choices: { 'line-length': '${{ secrets.X }}' } }), u, platform(), ctx)).toThrow(RenderError);
   });
 
   it('command: a choice with no place in the command is refused', () => {
     const t = entry('ruff');
     t.choices.stray = ['a', 'b'];
-    expect(() => renderStep(spec(t), t, platform(), ctx)).toThrow(/stray/);
+    expect(() => renderStepWith(spec(t), t, platform(), ctx)).toThrow(/stray/);
   });
 
   it2('command: every hostile choice value and a hostile template constant reach the tool as one inert argument (bash -n and a real run)', () => {
     const t = hostileRuff();
     for (const value of HOSTILE) {
-      const r = renderStep(spec(t, { choices: { 'line-length': value } }), t, platform(), ctx);
+      const r = renderStepWith(spec(t, { choices: { 'line-length': value } }), t, platform(), ctx);
       const step = runs(r).at(-1) as RenderedStep;
       expect(bashN(step.run as string), JSON.stringify(value)).toEqual({ ok: true, err: '' });
       expect(step.run).not.toContain('${{');
@@ -459,7 +343,7 @@ describe('6b: command (S5)', () => {
   it2('command: the then commands run in the same step; the first failing one fails it (set -euo pipefail)', () => {
     const t = entry('coverage-py');
     const closureText = ['coverage==7.16.2 --hash=sha256:' + 'a'.repeat(64)].join('\n') + '\n';
-    const r = renderStep(spec(t, { choices: { 'fail-under': '70' } }), t, platform(), ctx, { pipClosures: { 'coverage-py': closureText } });
+    const r = renderStepWith(spec(t, { choices: { 'fail-under': '70' } }), t, platform(), ctx, { pipClosures: { 'coverage-py': closureText } });
     const step = r.steps.at(-1) as RenderedStep;
     expect(step.run).toContain('set -euo pipefail');
     expect(bashN(step.run as string).ok).toBe(true);
@@ -477,7 +361,7 @@ describe('6b: command (S5)', () => {
 
 describe('6b: env hardening (S6)', () => {
   it('env: no rendered step writes GITHUB_ENV or GITHUB_PATH; every run step sets shell bash, BASH_ENV and ENV empty, and runs the tool under /usr/bin/env -i', () => {
-    for (const r of [render('trivy-image'), render('zap-baseline'), render('biome'), render('ruff')]) {
+    for (const r of [render('trivy-config'), render('zap-baseline', {}, ctx, PLAIN_ZAP), render('biome'), render('ruff')]) {
       for (const s of runs(r)) {
         expect(s.run).not.toMatch(/GITHUB_ENV|GITHUB_PATH|GITHUB_OUTPUT|GITHUB_STATE/);
         expect(s.shell).toBe('bash');
@@ -492,16 +376,14 @@ describe('6b: env hardening (S6)', () => {
   it2('env: only the allowlist reaches the tool (HOME, a fixed PATH, RUNNER_TEMP, TMPDIR, the template env, PIPEGEN_ARG_n, declared secrets of an app-running tool)', () => {
     const t = entry('vitest-coverage');
     const c = ctxFor([service({ name: 'app', path: '.', envVars: ['STRIPE_KEY'] })]);
-    const r = renderStep(withNames(spec(t, { service: 'app', choices: { 'coverage-thresholds-lines': '80' } }), ['STRIPE_KEY']), t, platform(), c);
+    const r = renderStepWith(withNames(spec(t, { service: 'app', choices: { 'coverage-thresholds-lines': '80' } }), ['STRIPE_KEY']), t, platform(), c);
     const step = r.steps.at(-1) as RenderedStep;
     const sb = sandbox();
-    // vitest is run through npx: put fakes for node and npx on a PATH the script will find
+    // vitest runs through node directly (no npx): a fake node answers --version and records its argv and environment
     const bin = join(sb.dir, 'nodebin');
     mkdirSync(bin);
-    writeFileSync(join(bin, 'node'), '#!/bin/sh\nexit 0\n');
-    writeFileSync(join(bin, 'npx'), '#!/bin/sh\nfor a in "$@"; do printf \'%s\\0\' "$a"; done > ./argv.bin\nenv > ./env.txt\n');
+    writeFileSync(join(bin, 'node'), '#!/bin/sh\n[ "$1" = --version ] && { echo v24.1.0; exit 0; }\nfor a in "$@"; do printf \'%s\\0\' "$a"; done > ./argv.bin\nenv > ./env.txt\n');
     chmodSync(join(bin, 'node'), 0o755);
-    chmodSync(join(bin, 'npx'), 0o755);
     const poison = { NODE_OPTIONS: '--require /evil.js', COVERAGE_RCFILE: '/evil', TRIVY_CACHE_DIR: '/evil', LD_PRELOAD: '/evil.so', PINACT_X: '1', HADOLINT_NO_FAIL: '1', GITHUB_ENV: '/x', PIPEGEN_UNLISTED: 'x', npm_config_registry: 'https://evil.example/' };
     const res = exec(step, sb, { ...stepEnv(step, sb, { STRIPE_KEY: 's3cret-value' }, poison), PATH: `${bin}:${process.env.PATH ?? ''}` });
     expect(res.status, res.stderr).toBe(0);
@@ -516,7 +398,7 @@ describe('6b: env hardening (S6)', () => {
 
   it2('env: a step env key that is not on the allowlist (the pinned config, the config of a docker-style template) never reaches the tool', () => {
     const t = entry('ruff');
-    const step = lastRunStep(renderStep(spec(t), t, platform(), ctx));
+    const step = lastRunStep(renderStepWith(spec(t), t, platform(), ctx));
     expect(step.env).toHaveProperty('PIPEGEN_CONFIG');
     const sb = sandbox();
     fakeTool(sb, 'pipegen-out-lint', 'ruff', "echo '{}' > ./ruff.sarif");
@@ -531,13 +413,13 @@ describe('6b: env hardening (S6)', () => {
 
   it('declared names: a scanner or linter step refuses them (they reach only steps that run the app)', () => {
     const c = ctxFor([service({ name: 'app', path: '.', envVars: ['STRIPE_KEY'] })]);
-    for (const id of ['ruff', 'trivy-image', 'betterleaks', 'biome', 'zap-baseline', 'hadolint', 'osv-scanner']) {
+    for (const id of ['ruff', 'trivy-config', 'betterleaks', 'biome', 'osv-scanner', 'zap-baseline']) {
       const t = entry(id);
-      expect(() => renderStep(withNames(spec(t, { service: 'app' }), ['STRIPE_KEY']), t, platform(), c), id).toThrow(/run the app|scanner|linter/);
+      expect(() => renderStepWith(withNames(spec(t, { service: 'app' }), ['STRIPE_KEY']), t, platform(), c, PLAIN_ZAP), id).toThrow(/run the app|scanner|linter/);
     }
     // a coverage tool runs the project's tests: it may get them
     const v = entry('vitest-coverage');
-    const r = renderStep(withNames(spec(v, { service: 'app' }), ['STRIPE_KEY']), v, platform(), c);
+    const r = renderStepWith(withNames(spec(v, { service: 'app' }), ['STRIPE_KEY']), v, platform(), c);
     expect(r.steps.at(-1)?.env?.STRIPE_KEY).toBe('${{ secrets.STRIPE_KEY }}');
     expect(r.steps.at(-1)?.run).toContain('"STRIPE_KEY=$STRIPE_KEY"');
   });
@@ -546,11 +428,11 @@ describe('6b: env hardening (S6)', () => {
     for (const bad of ['PATH', 'BASH_ENV', 'NODE_OPTIONS', 'LD_PRELOAD', 'PIPEGEN_CONFIG', 'PIPEGEN_ARG_0', 'HOME', 'RUNNER_TEMP', 'TMPDIR', 'lower', 'A B']) {
       const t = entry('ruff');
       (t.step.cli as { env?: Record<string, string> }).env = { [bad]: 'x' };
-      expect(() => renderStep(spec(t), t, platform(), ctx), bad).toThrow(RenderError);
+      expect(() => renderStepWith(spec(t), t, platform(), ctx), bad).toThrow(RenderError);
     }
     const ok = entry('ruff');
     (ok.step.cli as { env?: Record<string, string> }).env = { PIPEGEN_X_FLAG: 'a b' };
-    const step = lastRunStep(renderStep(spec(ok), ok, platform(), ctx));
+    const step = lastRunStep(renderStepWith(spec(ok), ok, platform(), ctx));
     expect(step.env?.PIPEGEN_X_FLAG).toBe('a b');
     expect(step.run).toContain('"PIPEGEN_X_FLAG=$PIPEGEN_X_FLAG"');
   });
@@ -560,33 +442,33 @@ const lastRunStep = (r: RenderResult): RenderedStep => runs(r).at(-1) as Rendere
 
 describe('6b: outputs (S7)', () => {
   it('output: renderStep returns the path under runner temp for the entry\'s artifact; renderUpload accepts exactly it', () => {
-    const r = render('trivy-image');
-    const artifact = resultArtifactName('image-scan');
-    expect(r.output).toEqual({ path: `\${{ runner.temp }}/pipegen-out/${artifact}/trivy-image.sarif`, format: 'sarif' });
+    const r = render('trivy-config');
+    const artifact = resultArtifactName('iac');
+    expect(r.output).toEqual({ path: `\${{ runner.temp }}/pipegen-out/${artifact}/trivy-config.sarif`, format: 'sarif' });
     const up = renderUpload(artifact, r.output?.path as string, platform());
     expect(up.with?.path).toBe(r.output?.path);
     expect(render('biome').output).toBeNull();
-    const per = render('trivy-image', { service: 'app' });
-    expect(per.output?.path).toContain(resultArtifactName('image-scan', 'app'));
+    const per = render('trivy-config', { service: 'app' });
+    expect(per.output?.path).toContain(resultArtifactName('iac', 'app'));
     expect(per.output?.path).toContain('--app/');
   });
 
   it('output: the step checks the reviewed path is free and its parent a real folder before, and a regular file after, then moves it', () => {
-    const run = lastRun(render('trivy-image'));
+    const run = lastRun(render('trivy-config'));
     expect(run).toContain('[ -e "$out" ] || [ -L "$out" ]');
     expect(run).toContain('[ -d "$outdir" ] && [ ! -L "$outdir" ]');
     expect(run).toContain('[ -f "$out" ] && [ ! -L "$out" ]');
-    expect(run).toContain('mv -- "$out" "$RUNNER_TEMP/pipegen-out/pipegen-out-image-scan/trivy-image.sarif"');
+    expect(run).toContain('mv -- "$out" "$dest"');
     expect(run.indexOf('[ -e "$out" ]')).toBeGreaterThan(-1);
     expect(run.indexOf('[ -e "$out" ]')).toBeLessThan(run.indexOf('"${pg_env[@]}" '));
     expect(run.indexOf('"${pg_env[@]}" ')).toBeLessThan(run.indexOf('[ -f "$out" ]'));
   });
 
   it2('output: a result path that already exists (file, folder or symlink) fails before the tool runs; a good run is moved and keeps the tool\'s exit code', () => {
-    const t = entry('trivy-image');
-    const step = lastRunStep(renderStep(spec(t), t, platform(), ctx));
-    const out = 'trivy-image.sarif';
-    const artifact = 'pipegen-out-image-scan';
+    const t = entry('trivy-config');
+    const step = lastRunStep(renderStepWith(spec(t), t, platform(), ctx));
+    const out = 'trivy-config.sarif';
+    const artifact = 'pipegen-out-iac';
     // existing file, existing dangling symlink, existing symlink to a file
     for (const make of [(sb: Sandbox) => writeFileSync(join(sb.ws, out), 'x'), (sb: Sandbox) => symlinkSync('/nonexistent-target', join(sb.ws, out)), (sb: Sandbox) => { writeFileSync(join(sb.dir, 'real'), 'x'); symlinkSync(join(sb.dir, 'real'), join(sb.ws, out)); }, (sb: Sandbox) => mkdirSync(join(sb.ws, out))]) {
       const sb = sandbox();
@@ -606,14 +488,14 @@ describe('6b: outputs (S7)', () => {
   });
 
   it2('output: a result that is a symlink (or not there at all) is not moved and fails the step', () => {
-    const t = entry('trivy-image');
-    const step = lastRunStep(renderStep(spec(t), t, platform(), ctx));
-    const artifact = 'pipegen-out-image-scan';
+    const t = entry('trivy-config');
+    const step = lastRunStep(renderStepWith(spec(t), t, platform(), ctx));
+    const artifact = 'pipegen-out-iac';
     const sb = sandbox();
     writeFileSync(join(sb.dir, 'secret.txt'), 'top secret');
-    fakeTool(sb, artifact, 'trivy', `ln -s ${join(sb.dir, 'secret.txt')} ./trivy-image.sarif`);
+    fakeTool(sb, artifact, 'trivy', `ln -s ${join(sb.dir, 'secret.txt')} ./trivy-config.sarif`);
     expect(exec(step, sb, stepEnv(step, sb)).status).not.toBe(0);
-    expect(existsSync(join(sb.rt, 'pipegen-out', artifact, 'trivy-image.sarif'))).toBe(false);
+    expect(existsSync(join(sb.rt, 'pipegen-out', artifact, 'trivy-config.sarif'))).toBe(false);
     const sb2 = sandbox();
     fakeTool(sb2, artifact, 'trivy');
     expect(exec(step, sb2, stepEnv(step, sb2)).status).not.toBe(0);
@@ -621,15 +503,15 @@ describe('6b: outputs (S7)', () => {
 
   it('output: an output path that is not a plain file name is refused', () => {
     for (const p of ['../x.sarif', '/etc/x', 'a/b.sarif', '-x', 'a b']) {
-      const t = entry('trivy-image');
+      const t = entry('trivy-config');
       t.step.output = { path: p, format: 'sarif' };
       const s = spec(t);
-      expect(() => renderStep(s, t, platform(), ctx), p).toThrow(RenderError);
+      expect(() => renderStepWith(s, t, platform(), ctx), p).toThrow(RenderError);
     }
   });
 
   it('output: zap writes its result into a fresh work folder it mounts, and the move starts from there', () => {
-    const r = render('zap-baseline');
+    const r = render('zap-baseline', {}, ctx, PLAIN_ZAP);
     const run = lastRun(r);
     expect(run).toContain('work="$RUNNER_TEMP/pipegen-work/pipegen-out-dast"');
     expect(run).toContain('-v "$work:/zap/wrk"');
@@ -645,18 +527,18 @@ describe('6b: working folder (S8 run-time check)', () => {
 
   it('workingDir: the step moves into the service folder after checking every part is a real folder inside the workspace', () => {
     const t = entry('ruff');
-    const run = lastRun(renderStep(spec(t, { service: 'api', workingDir: 'services/api' }), t, platform(), c));
+    const run = lastRun(renderStepWith(spec(t, { service: 'api', workingDir: 'services/api' }), t, platform(), c));
     expect(run).toContain('for d in services services/api; do');
     expect(run).toContain('[ -L "$d" ]');
-    expect(run).toContain('cd -- services/api');
+    expect(run).toContain('cd -- ./services/api');
     expect(run).toContain('pwd -P');
     expect(run).not.toContain('working-directory');
-    expect(lastRunStep(renderStep(spec(t, { service: 'api', workingDir: 'services/api' }), t, platform(), c))['working-directory']).toBeUndefined();
+    expect(lastRunStep(renderStepWith(spec(t, { service: 'api', workingDir: 'services/api' }), t, platform(), c))['working-directory']).toBeUndefined();
   });
 
   it2('workingDir: a symlinked service folder fails the step before anything runs; a real folder works', () => {
     const t = entry('ruff');
-    const step = lastRunStep(renderStep(spec(t, { service: 'api', workingDir: 'services/api' }), t, platform(), c));
+    const step = lastRunStep(renderStepWith(spec(t, { service: 'api', workingDir: 'services/api' }), t, platform(), c));
     const sb = sandbox();
     mkdirSync(join(sb.dir, 'outside'));
     mkdirSync(join(sb.ws, 'services'));
@@ -680,7 +562,7 @@ describe('6b: every reviewed CLI entry', () => {
     for (const t of reviewedList()) {
       if (t.step.cli === undefined) continue;
       try {
-        const r = renderStep(spec(t), t, platform(), ctxFor([service({ name: 'app', path: '.' })]));
+        const r = renderStepWith(spec(t), t, platform(), ctxFor([service({ name: 'app', path: '.' })]));
         rendered++;
         outcome[t.id] = 'rendered';
         for (const s of runs(r)) {
@@ -702,34 +584,39 @@ describe('6b: every reviewed CLI entry', () => {
       } catch (e) {
         expect(e, t.id).toBeInstanceOf(RenderError);
         outcome[t.id] = (e as Error).message;
-        expect((e as Error).message, t.id).toMatch(/6c|not available yet|job service/);
+        expect((e as Error).message, t.id).toMatch(/6c|B6|Plan G|not available yet|job service|Go is not supported/);
       }
     }
     expect(rendered).toBeGreaterThan(20);
-    // the ones that wait, by name
-    for (const id of ['semgrep', 'nuclei', 'eslint-typescript', 'registry', 'schemathesis', 'mypy', 'bandit', 'coverage-py', 'creosote', 'vulture']) expect(outcome[id], id).not.toBe('rendered');
-    for (const id of ['trivy-config', 'trivy-image', 'trivy-licence', 'betterleaks', 'gitleaks', 'osv-scanner', 'lefthook', 'syft', 'cosign', 'actionlint', 'zizmor', 'biome', 'eslint', 'oxlint-typeaware', 'prettier', 'vitest-coverage', 'c8', 'knip', 'jscpd', 'hadolint', 'kube-linter', 'pinact', 'poutine', 'gosec', 'ruff', 'ruff-format', 'zap-baseline']) expect(outcome[id], id).toBe('rendered');
+    // the ones that wait, by name (R-E: a tool that would fail at run time for want of a target is refused now)
+    for (const id of ['semgrep', 'nuclei', 'registry', 'schemathesis', 'mypy', 'bandit', 'coverage-py', 'creosote', 'vulture', 'trivy-image', 'syft', 'zap-baseline', 'cosign', 'hadolint', 'kube-linter', 'gosec']) expect(outcome[id], id).not.toBe('rendered');
+    for (const id of ['trivy-config', 'trivy-licence', 'betterleaks', 'gitleaks', 'osv-scanner', 'lefthook', 'actionlint', 'zizmor', 'biome', 'eslint', 'eslint-typescript', 'oxlint-typeaware', 'prettier', 'vitest-coverage', 'c8', 'knip', 'jscpd', 'pinact', 'poutine', 'ruff', 'ruff-format']) expect(outcome[id], id).toBe('rendered');
   });
 });
 
 describe('6b: snapshots', () => {
-  it('snapshot: a github-release tool (trivy image with choices)', async () => {
-    const r = render('trivy-image', { choices: { severity: 'HIGH,CRITICAL', 'ignore-unfixed': 'true' } });
+  it('snapshot: a github-release tool (trivy config with a choice)', async () => {
+    const r = render('trivy-config', { choices: { severity: 'HIGH,CRITICAL' } });
     await expect(yamlOf(r.steps)).toMatchFileSnapshot('__snapshots__/steps/cli-github-release.yml');
   });
 
-  it('snapshot: a docker tool (zap baseline)', async () => {
-    await expect(yamlOf(render('zap-baseline').steps)).toMatchFileSnapshot('__snapshots__/steps/cli-docker.yml');
+  it('snapshot: a docker tool (zap baseline with its target slot waived, as a test fixture)', async () => {
+    await expect(yamlOf(render('zap-baseline', {}, ctx, withPolicy('zap-baseline', ['needsSlot'])).steps)).toMatchFileSnapshot('__snapshots__/steps/cli-docker.yml');
   });
 
-  it('snapshot: an npm tool (biome with its plugin, in a service folder)', async () => {
+  it('snapshot: an npm checker (prettier, installed from pipegen\'s closure lock, in a service folder; the snapshot is small because a big lock would be one very long line)', async () => {
     const c = ctxFor([service({ name: 'web', path: 'apps/web', runtimeVersion: '24' })]);
-    await expect(yamlOf(render('biome', { service: 'web', workingDir: 'apps/web' }, c).steps)).toMatchFileSnapshot('__snapshots__/steps/cli-npm.yml');
+    await expect(yamlOf(render('prettier', { service: 'web', workingDir: 'apps/web' }, c).steps)).toMatchFileSnapshot('__snapshots__/steps/cli-npm.yml');
+  });
+
+  it('snapshot: an npm tool that runs the repo\'s code (vitest coverage)', async () => {
+    const c = ctxFor([service({ name: 'web', path: 'apps/web', runtimeVersion: '24' })]);
+    await expect(yamlOf(render('vitest-coverage', { service: 'web', workingDir: 'apps/web' }, c).steps)).toMatchFileSnapshot('__snapshots__/steps/cli-npm-repo-code.yml');
   });
 
   it('snapshot: a pip tool with a fixture closure (mypy)', async () => {
     const t = entry('mypy');
     const closureText = `mypy==2.4.0 --hash=sha256:${'a'.repeat(64)}\ntyping-extensions==4.12.2 --hash=sha256:${'b'.repeat(64)}\n`;
-    await expect(yamlOf(renderStep(spec(t), t, platform(), ctx, { pipClosures: { mypy: closureText } }).steps)).toMatchFileSnapshot('__snapshots__/steps/cli-pip.yml');
+    await expect(yamlOf(renderStepWith(spec(t), t, platform(), ctx, { pipClosures: { mypy: closureText } }).steps)).toMatchFileSnapshot('__snapshots__/steps/cli-pip.yml');
   });
 });

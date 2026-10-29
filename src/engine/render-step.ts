@@ -20,7 +20,7 @@ import { COMMIT_SHA_RE } from './names.js';
 import { NEED_IDS } from './need-ids.js';
 import type { PlatformActions } from './pin.js';
 import { renderCliTool, type CliHooks, type RenderOptions } from './render-cli.js';
-import { RenderError, show } from './render-error.js';
+import { EXPR, own, RenderError, show } from './render-error.js';
 import { PLAIN_REL_RE, RENDERER_INPUTS, rendererInputProblems } from './tool-flags.js';
 
 export { RenderError };
@@ -72,7 +72,6 @@ const DANGEROUS_NAMES: readonly { family: string; match: RegExp }[] = [
 const isDangerousName = (name: string): boolean => DANGEROUS_NAMES.some((d) => d.match.test(name));
 
 const same = (a: unknown, b: unknown): boolean => isDeepStrictEqual(a, b);
-const own = <T>(o: Readonly<Record<string, T>>, k: string): T | undefined => (Object.hasOwn(o, k) ? o[k] : undefined);
 
 /** Why a candidate counts as reviewed: both marks (the type says so, a cast or a JSON copy might not). */
 const isReviewed = (c: { source: string; reviewed: boolean }): boolean => c.source === 'reviewed' && c.reviewed === true;
@@ -299,10 +298,17 @@ export function renderPlatformStep(key: keyof PlatformActions, platform: Platfor
 /**
  * Renders a reviewed tool's step (never an unreviewed one). Throws a RenderError for a spec with problems, a tool whose
  * id or pin differs from the spec's, or a tool that can't be rendered yet (pip without a closure, 6c's rule archives). It
- * never uploads the output (ruling B3). `platform` supplies the setup actions the npm and pip kinds need. `options` is
- * for tests and internal callers (the argv policies and pip closures; production passes none).
+ * never uploads the output (ruling B3). `platform` supplies the setup actions the npm and pip kinds need.
  */
-export function renderStep(given: StepSpec, tool: ReviewedTool, platform: PlatformActions, ctx: RenderContext, options: RenderOptions = {}): RenderResult {
+export function renderStep(given: StepSpec, tool: ReviewedTool, platform: PlatformActions, ctx: RenderContext): RenderResult {
+  return renderStepWith(given, tool, platform, ctx);
+}
+
+/**
+ * renderStep with the internal hooks (the argv policies, the pip closures, the npm closure locks). FOR TESTS ONLY: the
+ * public renderStep has no such parameter, so Plans F, G and H can't swap a reviewed policy by accident (review finding 8).
+ */
+export function renderStepWith(given: StepSpec, tool: ReviewedTool, platform: PlatformActions, ctx: RenderContext, options: RenderOptions = {}): RenderResult {
   // render exactly what is validated: one plain copy (a getter or proxy is read once), not the caller's live object
   let spec: StepSpec;
   try {
@@ -354,14 +360,17 @@ function cliHooks(platform: PlatformActions): CliHooks {
  */
 export function dedupeJobSteps(steps: readonly RenderedStep[]): RenderedStep[] {
   const seen = new Set<string>();
-  return steps.filter((s) => {
+  const kept = steps.filter((s) => {
     if (s.id === undefined || !s.id.startsWith('pipegen-')) return true;
     if (seen.has(s.id)) return false;
     seen.add(s.id);
     return true;
   });
+  // one Node version per job: a second major would run a tool on a node it was not set up for (Plan G splits the job)
+  const majors = new Set(kept.filter((s) => s.id?.startsWith('pipegen-setup-node-')).map((s) => s.id));
+  if (majors.size > 1) throw new RenderError('One job can have only one Node version, but its steps ask for more than one; they belong in separate jobs.');
+  return kept;
 }
-
 /** The renderer-filled inputs of an action for this service and context (the others are set by the helpers that own them). */
 function rendererFill(usesPath: string, service: Service | undefined, ctx: RenderContext, registry?: string): Record<string, string> {
   if (usesPath === 'docker/login-action') {
@@ -440,7 +449,6 @@ function str(value: string, block = false): Scalar {
   return s;
 }
 
-const EXPR = '${{';
 /** `if:` values pipegen writes: nothing else is an allowed condition (an `if` is always an expression, with or without `${{`). */
 const IF_VALUES: ReadonlySet<string> = new Set(['always()', 'success()', 'failure()', '!cancelled()']);
 const SECRET_REF_RE = /^\$\{\{ secrets\.([A-Z][A-Z0-9_]{0,99}) \}\}$/;

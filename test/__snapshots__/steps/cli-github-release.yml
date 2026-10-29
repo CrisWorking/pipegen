@@ -1,21 +1,29 @@
 - name: "pipegen: install trivy"
   run: |-
     set -euo pipefail
+    unset CDPATH
     pg_fail() { echo "pipegen: $1" >&2; exit 1; }
     PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-    bin="$RUNNER_TEMP/pipegen-bin/pipegen-out-image-scan"
-    dl="$RUNNER_TEMP/pipegen-dl/pipegen-out-image-scan"
+    home="$RUNNER_TEMP/pipegen-home/pipegen-out-iac"
+    mkdir -p "$RUNNER_TEMP/pipegen-home" "$home"
+    sys=(
+      /usr/bin/env -i
+      "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+      "HOME=$home"
+    )
+    bin="$RUNNER_TEMP/pipegen-bin/pipegen-out-iac"
+    dl="$RUNNER_TEMP/pipegen-dl/pipegen-out-iac"
     mkdir -p "$RUNNER_TEMP/pipegen-bin" "$RUNNER_TEMP/pipegen-dl"
     mkdir "$bin" "$dl"
-    curl --proto '=https' --proto-redir '=https' --tlsv1.2 --fail --silent --show-error --location --max-redirs 5 --retry 3 --output "$dl/asset" "$PIPEGEN_DL_URL"
+    "${sys[@]}" curl --proto '=https' --proto-redir '=https' --tlsv1.2 --fail --silent --show-error --location --max-redirs 5 --retry 3 --output "$dl/asset" "$PIPEGEN_DL_URL"
     cd "$dl"
-    printf '%s  asset\n' "$PIPEGEN_DL_SHA256" | sha256sum --check --strict -
+    printf '%s  asset\n' "$PIPEGEN_DL_SHA256" | "${sys[@]}" sha256sum --check --strict -
     mkdir "$bin/pkg"
-    tar -xzf asset -C "$bin/pkg" --no-same-owner
-    n="$(find "$bin/pkg" -name trivy -type f | wc -l)"
-    o="$(find "$bin/pkg" -name trivy ! -type f | wc -l)"
+    "${sys[@]}" tar -xzf asset -C "$bin/pkg" --no-same-owner
+    n="$("${sys[@]}" find "$bin/pkg" -name trivy -type f | wc -l)"
+    o="$("${sys[@]}" find "$bin/pkg" -name trivy ! -type f | wc -l)"
     if [ "$n" -ne 1 ] || [ "$o" -ne 0 ]; then pg_fail "the archive must hold exactly one regular file named trivy"; fi
-    found="$(find "$bin/pkg" -name trivy -type f)"
+    found="$("${sys[@]}" find "$bin/pkg" -name trivy -type f)"
     mv -- "$found" "$bin/trivy"
     if [ ! -f "$bin/trivy" ] || [ -L "$bin/trivy" ]; then pg_fail "the tool is not a regular file"; fi
     chmod 0755 "$bin/trivy"
@@ -28,16 +36,22 @@
 - name: "pipegen: run trivy"
   run: |-
     set -euo pipefail
+    unset CDPATH
     pg_fail() { echo "pipegen: $1" >&2; exit 1; }
     PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-    bin="$RUNNER_TEMP/pipegen-bin/pipegen-out-image-scan"
-    home="$RUNNER_TEMP/pipegen-home/pipegen-out-image-scan"
+    home="$RUNNER_TEMP/pipegen-home/pipegen-out-iac"
     mkdir -p "$RUNNER_TEMP/pipegen-home" "$home"
+    sys=(
+      /usr/bin/env -i
+      "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+      "HOME=$home"
+    )
+    bin="$RUNNER_TEMP/pipegen-bin/pipegen-out-iac"
     mkdir -p "$RUNNER_TEMP/pipegen-cfg"
-    cfg="$RUNNER_TEMP/pipegen-cfg/pipegen-out-image-scan"
+    cfg="$RUNNER_TEMP/pipegen-cfg/pipegen-out-iac"
     mkdir "$cfg"
     printf '%s' "$PIPEGEN_CONFIG" > "$cfg/trivy.yaml"
-    out=trivy-image.sarif
+    out=trivy-config.sarif
     outdir=.
     if [ -e "$out" ] || [ -L "$out" ]; then pg_fail "the result file $out exists before the tool ran, so pipegen will not use it"; fi
     [ -d "$outdir" ] && [ ! -L "$outdir" ] || pg_fail "the folder for the result is not a real folder"
@@ -48,14 +62,15 @@
       "RUNNER_TEMP=$RUNNER_TEMP"
       "TMPDIR=$RUNNER_TEMP"
       "PIPEGEN_ARG_0=$PIPEGEN_ARG_0"
-      "PIPEGEN_ARG_1=$PIPEGEN_ARG_1"
     )
     rc=0
-    "${pg_env[@]}" "$bin/trivy" image --config "$cfg/trivy.yaml" --disable-telemetry --skip-version-check --skip-check-update --format sarif --output trivy-image.sarif --exit-code 1 --severity "$PIPEGEN_ARG_0" --ignore-unfixed="$PIPEGEN_ARG_1" || rc=$?
+    "${pg_env[@]}" "$bin/trivy" config --config "$cfg/trivy.yaml" --disable-telemetry --skip-version-check --skip-check-update --format sarif --output trivy-config.sarif --exit-code 1 . --severity "$PIPEGEN_ARG_0" || rc=$?
     if [ -f "$out" ] && [ ! -L "$out" ]; then
       mkdir -p "$RUNNER_TEMP/pipegen-out"
-      mkdir "$RUNNER_TEMP/pipegen-out/pipegen-out-image-scan"
-      mv -- "$out" "$RUNNER_TEMP/pipegen-out/pipegen-out-image-scan/trivy-image.sarif"
+      mkdir "$RUNNER_TEMP/pipegen-out/pipegen-out-iac"
+      dest="$RUNNER_TEMP/pipegen-out/pipegen-out-iac/trivy-config.sarif"
+      mv -- "$out" "$dest"
+      [ -f "$dest" ] && [ ! -L "$dest" ] || { rm -f -- "$dest"; rc=1; }
     else
       echo "pipegen: the tool left no regular result file at $out" >&2
       if [ "$rc" -eq 0 ]; then rc=1; fi
@@ -66,7 +81,6 @@
     BASH_ENV: ""
     ENV: ""
     PIPEGEN_ARG_0: HIGH,CRITICAL
-    PIPEGEN_ARG_1: "true"
     PIPEGEN_CONFIG: "# pipegen's pinned trivy config: no cache kept between runs
 
       cache:

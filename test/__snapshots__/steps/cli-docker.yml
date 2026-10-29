@@ -1,9 +1,17 @@
 - name: "pipegen: pull the zap-baseline.py image"
   run: |-
     set -euo pipefail
+    unset CDPATH
     pg_fail() { echo "pipegen: $1" >&2; exit 1; }
     PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-    /usr/bin/docker pull --quiet "$PIPEGEN_IMAGE" > /dev/null
+    home="$RUNNER_TEMP/pipegen-home/pipegen-out-dast"
+    mkdir -p "$RUNNER_TEMP/pipegen-home" "$home"
+    sys=(
+      /usr/bin/env -i
+      "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+      "HOME=$home"
+    )
+    "${sys[@]}" /usr/bin/docker pull --quiet "$PIPEGEN_IMAGE" > /dev/null
   shell: bash
   env:
     BASH_ENV: ""
@@ -12,13 +20,20 @@
 - name: "pipegen: run zap-baseline.py"
   run: |-
     set -euo pipefail
+    unset CDPATH
     pg_fail() { echo "pipegen: $1" >&2; exit 1; }
     PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-    work="$RUNNER_TEMP/pipegen-work/pipegen-out-dast"
     home="$RUNNER_TEMP/pipegen-home/pipegen-out-dast"
     mkdir -p "$RUNNER_TEMP/pipegen-home" "$home"
+    sys=(
+      /usr/bin/env -i
+      "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+      "HOME=$home"
+    )
+    work="$RUNNER_TEMP/pipegen-work/pipegen-out-dast"
     mkdir -p "$RUNNER_TEMP/pipegen-work"
     mkdir "$work"
+    chmod 0777 "$work"
     printf '%s' "$PIPEGEN_CONFIG" > "$work/zap-baseline.conf"
     out="$work/zap.json"
     outdir="$work"
@@ -32,11 +47,13 @@
       "TMPDIR=$RUNNER_TEMP"
     )
     rc=0
-    "${pg_env[@]}" /usr/bin/docker run --rm --pull=never --user "$(id -u):$(id -g)" --security-opt no-new-privileges --cap-drop ALL -v "$work:/zap/wrk" "$PIPEGEN_IMAGE" zap-baseline.py -c zap-baseline.conf -J zap.json -z -silent || rc=$?
+    "${pg_env[@]}" /usr/bin/docker run --rm --pull=never --security-opt no-new-privileges --cap-drop ALL --network host -v "$work:/zap/wrk" "$PIPEGEN_IMAGE" zap-baseline.py -c zap-baseline.conf -J zap.json -z -silent || rc=$?
     if [ -f "$out" ] && [ ! -L "$out" ]; then
       mkdir -p "$RUNNER_TEMP/pipegen-out"
       mkdir "$RUNNER_TEMP/pipegen-out/pipegen-out-dast"
-      mv -- "$out" "$RUNNER_TEMP/pipegen-out/pipegen-out-dast/zap.json"
+      dest="$RUNNER_TEMP/pipegen-out/pipegen-out-dast/zap.json"
+      mv -- "$out" "$dest"
+      [ -f "$dest" ] && [ ! -L "$dest" ] || { rm -f -- "$dest"; rc=1; }
     else
       echo "pipegen: the tool left no regular result file at $out" >&2
       if [ "$rc" -eq 0 ]; then rc=1; fi
