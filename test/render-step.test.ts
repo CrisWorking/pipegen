@@ -526,7 +526,7 @@ describe('fix round 1', () => {
     const ok: RenderedStep[] = [
       { name: 'n', env: { STRIPE_KEY: '${{ secrets.STRIPE_KEY }}' } },
       { name: 'n', uses: `actions/upload-artifact@${'a'.repeat(40)}`, with: { path: '${{ runner.temp }}/pipegen-out/pipegen-out-sast/x.sarif' } },
-      { name: 'n', uses: `docker/login-action@${'a'.repeat(40)}`, with: Object.fromEntries([['username', ACTOR], ['password', WF_CRED]]) },
+      { name: 'n', uses: `docker/login-action@${'a'.repeat(40)}`, with: { registry: 'ghcr.io', ...Object.fromEntries([['username', ACTOR], ['password', WF_CRED]]) } },   // the token only goes with ghcr.io (R1-1)
     ];
     expect(withStep(ok)).not.toThrow();
   });

@@ -61,7 +61,12 @@ const DANGEROUS_NAMES: readonly { family: string; match: RegExp }[] = [
   { family: 'rust and go', match: /^(?:CARGO_|RUSTUP_|RUSTFLAGS$)|^GO[A-Z0-9]*$/ },
   { family: 'git, docker, XDG', match: /^(?:GIT_|DOCKER_|XDG_)/ },
   { family: 'the reviewed tools', match: /^(?:TRIVY_|HADOLINT_|PINACT_|SEMGREP_|COVERAGE_)/ },
+  // build toolchains (6b, review R1-7): a compiler, linker, make or package-manager setting changes what a build runs
+  { family: 'C, C++ and Go build', match: /^(?:CGO_|PKG_CONFIG_)|^(?:CC|CXX|AR|CFLAGS|CXXFLAGS|CPPFLAGS|LDFLAGS|MAKEFLAGS)$/ },
+  { family: 'js package managers and runtimes', match: /^(?:YARN_|PNPM_|BUN_|DENO_|COREPACK_)/ },
+  { family: 'jvm, .NET, php, conda, rust compiler', match: /^(?:COMPOSER_|CONDA_|DOTNET_|NUGET_|RUSTC)|^(?:MAVEN_OPTS|GRADLE_OPTS|GRADLE_USER_HOME|PHPRC|PHP_INI_SCAN_DIR|SSH_ASKPASS)$/ },
 ];
+const isDangerousName = (name: string): boolean => DANGEROUS_NAMES.some((d) => d.match.test(name));
 
 /** A value from outside, shown in a message: one clean line, cut short, quoted when it is a string. */
 const show = (v: unknown): string => (typeof v === 'string' ? JSON.stringify(safeText(v, 60)) : safeText(String(v), 30));
@@ -140,7 +145,7 @@ export function validateSpec(spec: StepSpec, tool: ReviewedTool, ctx: RenderCont
       spec.secrets.forEach((name, i) => {
         const path = `secrets[${i}]`;
         if (typeof name !== 'string' || !SECRET_NAME_RE.test(name)) problem(path, `${show(name)} isn't a secret name (capital letters, digits and _, starting with a letter, at most 100 characters).`);
-        else if (DANGEROUS_NAMES.some((d) => d.match.test(name))) problem(path, `${name} can't be passed to a step: it changes how code runs or what the runner does.`);
+        else if (isDangerousName(name)) problem(path, `${name} can't be passed to a step: it changes how code runs or what the runner does.`);
         else if (!declared.has(name)) problem(path, `${name} isn't used by ${service === undefined ? 'any service' : `the service ${show(service.name)}`} (its code or its dependencies), so pipegen won't pass it.`);
         else if (seen.has(name)) problem(path, `${name} is listed twice.`);
         seen.add(String(name));
@@ -199,6 +204,10 @@ const PLATFORM_LOCKS: Readonly<Record<string, Readonly<Record<string, string>>>>
   'actions/checkout': { 'persist-credentials': 'false', 'allow-unsafe-pr-checkout': 'false' },
   'actions/setup-node': { 'package-manager-cache': 'false' },
   'actions/upload-artifact': { 'include-hidden-files': 'false', 'if-no-files-found': 'error' },
+  // the docker actions' cache and credential locks (6b, review R1-5): checked here, not only by the loader
+  'docker/build-push-action': { 'no-cache': 'true', 'github-token': '', context: '.' },
+  'docker/setup-buildx-action': { 'cache-binary': 'false' },
+  'docker/login-action': { logout: 'true' },
 });
 
 /** Actions the renderer fills inputs for through their own helper (renderUpload, renderPlatformStep); renderStep refuses them. */
@@ -206,10 +215,10 @@ const HELPER_ONLY: ReadonlySet<string> = new Set(Object.keys(RENDERER_INPUTS).fi
 
 /**
  * Entries that run a container (their action.yml says `runs.using: docker`). The reviewed list does not carry the image
- * yet (`wrappedImage` is filled in 6c, ruling S13), so until then these ids are refused by name, and any entry that has a
- * `wrappedImage` is a container action by definition. TODO(6c/S13): drop the id list once resolvePin fills wrappedImage.
+ * yet (`wrappedImage` is filled in 6c, ruling S13), so until then these `uses` paths are refused (by path, so a renamed copy of an entry is refused too), and any entry that has a
+ * `wrappedImage` is a container action by definition. TODO(6c/S13): drop the path list once resolvePin fills wrappedImage.
  */
-const CONTAINER_ACTION_IDS: ReadonlySet<string> = new Set(['pypi-publish', 'scorecard-action']);
+const CONTAINER_ACTION_USES: ReadonlySet<string> = new Set(['pypa/gh-action-pypi-publish', 'ossf/scorecard-action']);
 
 /** The entry's `uses:` split into its path (lower case, no `@sha`), checked against the entry's own repo and pin. */
 function usesOf(tool: ReviewedTool): { path: string; uses: string } {
@@ -305,7 +314,7 @@ export function renderStep(given: StepSpec, tool: ReviewedTool, platform: Platfo
   if (tool.candidate.kind !== 'action' || tool.step.action === undefined) {
     throw new RenderError(`not implemented in 6a: ${tool.step.cli?.install.method ?? tool.candidate.kind}`);
   }
-  if (CONTAINER_ACTION_IDS.has(tool.id) || tool.wrappedImage !== undefined) throw new RenderError(`not implemented in 6a: container action ${show(tool.id)} (it runs an image the review has not pinned; 6c, ruling S13)`);
+  if (CONTAINER_ACTION_USES.has(usesOf(tool).path) || tool.wrappedImage !== undefined) throw new RenderError(`not implemented in 6a: container action ${show(tool.id)} (it runs an image the review has not pinned; 6c, ruling S13)`);
   if (HELPER_ONLY.has(usesOf(tool).path)) throw new RenderError(`${show(tool.id)} is rendered with renderPlatformStep or renderUpload, which supply the inputs it needs.`);
   if (tool.step.output.format !== 'none') throw new RenderError(`not implemented in 6a: an action that writes a result (${show(tool.id)}); its output is moved under runner.temp in 6b.`);
 
@@ -396,29 +405,47 @@ function str(value: string, block = false): Scalar {
 }
 
 const EXPR = '${{';
-/** The only expressions that may appear in a rendered step: a declared-looking secret by name, as a whole value. */
-const SECRET_EXPR_RE = /^\$\{\{ secrets\.[A-Z][A-Z0-9_]{0,99} \}\}$/;
+/** `if:` values pipegen writes: nothing else is an allowed condition (an `if` is always an expression, with or without `${{`). */
+const IF_VALUES: ReadonlySet<string> = new Set(['always()', 'success()', 'failure()', '!cancelled()']);
+const SECRET_REF_RE = /^\$\{\{ secrets\.([A-Z][A-Z0-9_]{0,99}) \}\}$/;
 
 /**
- * Refuses an expression (`${{`) anywhere but the forms pipegen itself writes: `env` and `with` values that are exactly
- * `${{ secrets.NAME }}`, and `with` values that pass the RENDERER_INPUTS checker of that action (the runner.temp paths,
- * the login actor and token). Quoting does not stop Actions from evaluating one, so a name, a run line, an id, an
- * `if`, a folder, or any key with `${{` is a bug or an attack, never rendered.
+ * Refuses an expression (`${{`) anywhere but the forms pipegen itself writes (Quoting does not stop Actions from
+ * evaluating one, so an expression in a name, run line, id, folder or any key is a bug or an attack, never rendered):
+ * - an `env` value that is exactly `${{ secrets.NAME }}` under the same name NAME, which is not a dangerous one (S9);
+ * - a `with` value that passes the RENDERER_INPUTS checker of that action together with its `whenWith` condition on the
+ *   step's whole `with` (the runner.temp paths, the login actor, the token only with ghcr.io). A `uses` with no `@` has no table.
+ * The step's other fields are held to their type too: `if` is one of a fixed set, `continue-on-error` a boolean and
+ * `timeout-minutes` a whole number of minutes (a hand-built step may be cast past the types, review R1-2/R1-4).
  */
 function checkExpressions(step: RenderedStep): void {
   const bad = (what: string): never => { throw new RenderError(`A step may not contain an expression in its ${what} (${show(step.name)}).`); };
-  for (const key of ['id', 'name', 'if', 'uses', 'usesComment', 'run', 'shell', 'working-directory'] as const) {
-    const v = step[key];
+  const odd = (what: string): never => { throw new RenderError(`A step's ${what} is not in a form pipegen writes (${show(step.name)}).`); };
+  for (const key of KEY_ORDER) {
+    const v: unknown = step[key];
     if (typeof v === 'string' && v.includes(EXPR)) bad(key);
   }
+  if (typeof step.usesComment === 'string' && step.usesComment.includes(EXPR)) bad('usesComment');
+  if (step.if !== undefined && (typeof step.if !== 'string' || !IF_VALUES.has(step.if))) odd('if');
+  const coe: unknown = step['continue-on-error'];
+  if (coe !== undefined && typeof coe !== 'boolean') odd('continue-on-error');
+  const tm: unknown = step['timeout-minutes'];
+  if (tm !== undefined && (typeof tm !== 'number' || !Number.isInteger(tm) || tm < 1 || tm > 360)) odd('timeout-minutes');
+  const at = step.uses === undefined ? -1 : step.uses.lastIndexOf('@');
+  const usesPath = at < 0 || step.uses === undefined ? undefined : step.uses.slice(0, at);
+  const table = usesPath === undefined ? undefined : own(RENDERER_INPUTS, usesPath.toLowerCase());
   for (const [group, values] of [['env', step.env], ['with', step.with]] as const) {
     for (const [k, v] of Object.entries(values ?? {})) {
       if (k.includes(EXPR)) bad(`${group} names`);
+      if (typeof v !== 'string') odd(`${group} value ${show(k)}`);
       if (!v.includes(EXPR)) continue;
-      const table = step.uses === undefined ? undefined : own(RENDERER_INPUTS, step.uses.slice(0, step.uses.lastIndexOf('@')).toLowerCase());
-      const spec = group === 'with' && table !== undefined ? own(table, k) : undefined;
-      // an input the renderer fills is judged by its own checker; any other value may be a bare secret reference
-      if (spec === undefined ? !SECRET_EXPR_RE.test(v) : !spec.check(v)) bad(`${group} value ${show(k)}`);
+      if (group === 'env') {
+        const m = SECRET_REF_RE.exec(v);
+        if (m === null || m[1] !== k || isDangerousName(k)) bad(`env value ${show(k)}`);
+      } else if (usesPath === undefined || table === undefined || own(table, k) === undefined || rendererInputProblems(usesPath, { [k]: v }, step.with ?? {}).length > 0) {
+        // an input the renderer fills is judged by its own checker and its condition; a with value may carry no other expression
+        bad(`with value ${show(k)}`);
+      }
     }
   }
 }
