@@ -1006,3 +1006,16 @@ describe('buildAudit: the audited commit (hand checks fix 10, P55)', () => {
     expect((JSON.parse(renderJson(none, { knownValues: [] })) as { commit: unknown }).commit).toBeNull();
   });
 });
+
+describe('buildAudit: would-create never offers a file the repo has (hand checks fix 5, P55)', () => {
+  const pgApp = () => nodeApp({ dependencies: { pg: '8.0.0' } });
+  it('a Compose file already in the repo (compose.y*ml, docker-compose.y*ml): no "would create a Compose file"', async () => {
+    const without = await buildAudit(repo(pgApp()), deps());
+    expect(without.wouldCreate.map((w) => w.what)).toContain('compose');
+    for (const name of ['compose.yml', 'compose.yaml', 'docker-compose.yml', 'docker-compose.yaml']) {
+      const r = await buildAudit(repo({ ...pgApp(), [name]: 'services:\n  db:\n    image: postgres:18\n' }), deps());
+      expect(r.profile.hasCompose, name).toBe(true);
+      expect(r.wouldCreate.map((w) => w.what), name).not.toContain('compose');
+    }
+  });
+});
