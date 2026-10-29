@@ -129,6 +129,13 @@ export interface ArgvPolicy extends CommandPolicy {
    * constants. A file at the scan root replaces the defaults (measured on semgrep 1.181.0).
    */
   readonly scopeIgnore?: { readonly file: string; readonly lines: readonly string[] };
+  /**
+   * Repo files the tool reads to drop findings (C1b fix round 2, review R1-I1): betterleaks and gitleaks silence a finding named by a
+   * `file:rule:line` entry of `.gitleaksignore` / `.betterleaksignore` at the scan root, and `--gitleaks-ignore-path` cannot turn that off.
+   * The renderer deletes every file of these names under the step folder (links included, never followed) before the scan and writes
+   * nothing in their place; the files stay protected paths, so a PR that changes one is still flagged.
+   */
+  readonly removeFiles?: readonly string[];
   readonly env?: readonly string[];
   readonly then?: readonly CommandPolicy[];
   readonly dedicated?: true;
@@ -177,6 +184,8 @@ const FOUND_1 = [1] as const;
 /** trivy, betterleaks and gitleaks are told `--exit-code 10`: their errors, and betterleaks' partial scan, exit 1, so 1 can not also mean a finding (C0a fix round 1). */
 const FOUND_10 = [10] as const;
 const TRIVY_CONFIG = { flag: '--config', content: "# pipegen's pinned trivy config: no cache kept between runs\ncache:\n  backend: memory\n", fileName: 'trivy.yaml' } as const;
+/** The ignore files betterleaks 1.9.0 and gitleaks 8.30.1 read from the scan root (`--help` of `dir`: `.betterleaksignore` or `.gitleaksignore`). */
+const SECRETS_IGNORE_FILES = ['.gitleaksignore', '.betterleaksignore'] as const;
 const GH = 'github-release' as const;
 const TRIVY_ASSET = 'trivy_0.76.0_Linux-64bit.tar.gz';
 const RUFF_ASSET = 'ruff-x86_64-unknown-linux-gnu.tar.gz';
@@ -195,7 +204,7 @@ const POLICIES = {
   'trivy-config': { ...DEDICATED('trivy', TRIVY_ASSET, TRIVY_CONFIG), findingsExit: FOUND_10 },
   'trivy-image': { ...DEDICATED('trivy', TRIVY_ASSET, TRIVY_CONFIG), slots: { '': 'image-digest' }, findingsExit: FOUND_10 },
   'trivy-licence': { ...DEDICATED('trivy', TRIVY_ASSET, TRIVY_CONFIG), findingsExit: FOUND_10 },
-  betterleaks: { ...DEDICATED('betterleaks', 'betterleaks_1.9.0_linux_x64.tar.gz', { flag: '--config', content: '[extend]\nuseDefault = true\n', fileName: 'betterleaks.toml' }), findingsExit: FOUND_10 },
+  betterleaks: { ...DEDICATED('betterleaks', 'betterleaks_1.9.0_linux_x64.tar.gz', { flag: '--config', content: '[extend]\nuseDefault = true\n', fileName: 'betterleaks.toml' }), findingsExit: FOUND_10, removeFiles: SECRETS_IGNORE_FILES },
   nuclei: { ...DEDICATED('nuclei', 'nuclei_3.11.1_linux_amd64.zip'), slots: { '-target': 'local-url' }, findingsExit: [],
     archive: { repo: 'projectdiscovery/nuclei-templates', commitEnv: 'PIPEGEN_NUCLEI_TEMPLATES_COMMIT', treeEnv: 'PIPEGEN_NUCLEI_TEMPLATES_TREE', dir: '/pipegen-nuclei-templates' } },
   // ruling P28: the image entries too. registry runs the image's own entrypoint, nothing else
@@ -220,7 +229,7 @@ const POLICIES = {
   },
   // gitleaks 8.30.1 (`gitleaks dir --help`; dir mode since C1b fix round 1, so the scanner reads the bytes the scrub reads), the secrets fallback (P21): the same locks as betterleaks
   gitleaks: { method: GH, package: 'gitleaks_8.30.1_linux_x64.tar.gz',
-    exe: 'gitleaks', dialect: 'long', sub: ['dir'], positionals: ['.'], findingsExit: FOUND_10,
+    exe: 'gitleaks', dialect: 'long', sub: ['dir'], positionals: ['.'], findingsExit: FOUND_10, removeFiles: SECRETS_IGNORE_FILES,
     flags: { 'no-banner': 'bool', 'ignore-gitleaks-allow': 'bool', redact: { values: ['', '100'], optional: true }, 'report-format': { values: ['sarif'] }, 'report-path': 'output', 'exit-code': { values: ['10'] }, 'max-archive-depth': { values: ['0'] } },
     required: { 'ignore-gitleaks-allow': 'true', redact: '', 'report-format': 'sarif', 'report-path': null, 'exit-code': '10', 'max-archive-depth': '0' },
     config: { flag: '--config', content: '[extend]\nuseDefault = true\n', fileName: 'gitleaks.toml' },

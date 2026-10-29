@@ -593,6 +593,15 @@ export function renderCliTool({ spec, tool, service, ctx, hooks, options }: CliA
     `printf '%s\\n' ${scope.lines.join(' ')} > ${scope.file}`,
     '# pipegen scope: end',
   ];
+  // the repo's own ignore files (betterleaks, gitleaks: R1-I1) are deleted before the scan, in the same step; a link is removed, never followed
+  const dropNames = pol.removeFiles ?? [];
+  if (!dropNames.every((n) => /^\.[a-z][a-z0-9]{0,30}$/.test(n))) return refuse(`The ignore files of ${show(tool.id)} are not plain names.`);
+  const dropLines = dropNames.length === 0 ? [] : [
+    '# pipegen ignore files: begin',
+    ...dropNames.map((n) => `if [ -d ${n} ] && [ ! -L ${n} ]; then pg_fail "the repository has a folder named ${n} at the scan root, so pipegen can not remove it"; fi`),
+    ...dropNames.map((n) => `"\${sys[@]}" find . -name ${n} \\( -type f -o -type l \\) -delete`),
+    '# pipegen ignore files: end',
+  ];
   // what the tuning did, in plain words, in comment lines (describeTuning): one line of text each, nothing but printable ASCII
   const tuneComments = tuned.lines.map((l) => `# tuning: ${l.replace(/[^\x20-\x7e]/g, '?')}`);
   // the result path must be free before the tool runs and a regular file after it, also where it lands (ruling S7)
@@ -633,7 +642,7 @@ export function renderCliTool({ spec, tool, service, ctx, hooks, options }: CliA
   const launch = (words: readonly string[]): string => `${LAUNCH_ENV} ${prefix}${words.length === 0 ? '' : ` ${words.join(' ')}`}`;
   const chain = [launch(built.main), ...built.then.map(launch)].join(' && ');
   const run = script([
-    ...prologue(artifact, nodeMajor === undefined ? {} : { nodeMajor }), ...tuneComments, ...vars, ...installLines, ...cdLines(spec.workingDir), ...pathChecks, ...prep, ...cfgLines, ...scopeLines, ...preCheck,
+    ...prologue(artifact, nodeMajor === undefined ? {} : { nodeMajor }), ...tuneComments, ...vars, ...installLines, ...cdLines(spec.workingDir), ...pathChecks, ...prep, ...cfgLines, ...scopeLines, ...dropLines, ...preCheck,
     ...closureVars, ...allowlist(pathValue, passed, [], dynamicEnv), ...afterAllow, 'rc=0', `${chain} || rc=$?`, ...postCheck, 'exit "$rc"',
   ]);
   // a tool that runs the repo's own code is marked, so the referee can apply its order rule (S6 c); the id is not `pipegen-…`, which a job's dedupe may drop
