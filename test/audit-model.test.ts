@@ -14,7 +14,7 @@ import { floorNeeds, jobCategories } from '../src/engine/needs.js';
 import { estimate } from '../src/estimate/estimate.js';
 import { readProject } from '../src/read/project.js';
 import { skippedWorkflowCount } from '../src/read/workflows.js';
-import { DEFAULT_MODEL, type Capabilities, type ReviewedTool } from '../src/types.js';
+import { DEFAULT_MODEL, type Capabilities, type RepoProfile, type ReviewedTool } from '../src/types.js';
 import { cleanupRepos, makeTempDir, writeIn } from './helpers/make-repo.js';
 import { fake } from './helpers/secret-repo.js';
 
@@ -1079,5 +1079,16 @@ describe('buildAudit: would-add for a check whose workflow fails (hand checks fi
     expect(row?.lastRun).toEqual({ workflow: '.github/workflows/ci.yml', branch: 'main', conclusion: 'failure', date: '2026-10-27' });
     const add = rowsOf(r, 'unit-tests').find((w) => w.need.layer === 'push');
     expect(add?.note).toBe('your own `test` script already runs in .github/workflows/ci.yml, but its last run on main failed: make that workflow pass first');
+  });
+});
+
+describe('applyDefaultSetup: a language CodeQL can\'t scan (P57 M5)', () => {
+  it('with the scanned languages unknown, a PHP or unnamed-language service\'s missing code scan stays missing', async () => {
+    const { applyDefaultSetup } = await import('../src/audit/github-signals.js');
+    const need = (service: string) => ({ id: 'sast', layer: 'merge' as const, category: 'sast', service, why: 'x', blocking: true, floor: true });
+    const services = ['php', 'other', 'python'].map((language) => ({ name: language, language })) as unknown as RepoProfile['services'];
+    const rows = applyDefaultSetup(['php', 'other', 'python'].map((s) => ({ need: need(s), status: 'missing' as const, why: 'x' })), { state: 'on', languages: null, source: 'workflow' }, { services, defaultBranch: 'main' });
+    expect(rows.map((r) => r.status)).toEqual(['missing', 'missing', 'partial']);
+    expect(rows[0]?.why).toContain("doesn't scan PHP code");
   });
 });

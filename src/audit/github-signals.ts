@@ -36,6 +36,10 @@ export function applyDefaultSetup(rows: readonly Coverage[], setup: DefaultSetup
     if (setup.state === 'unknown') return { need: r.need, status: 'unknown', why: setup.why };
     const service = r.need.service === undefined ? undefined : p.services.find((s) => s.name === r.need.service);
     const scanned = setup.languages === null ? null : setup.languages.join(', ');
+    // P57 (M5): CodeQL has no PHP (or unnamed-language) analysis, whatever languages default setup lists
+    if (service !== undefined && CODEQL_LANGUAGES[service.language].length === 0) {
+      return { ...r, why: `GitHub's CodeQL default setup is on here, but CodeQL doesn't scan ${LANGUAGE_NAME[service.language]} code.` };
+    }
     if (service !== undefined && setup.languages !== null && !CODEQL_LANGUAGES[service.language].some((l) => setup.languages?.includes(l))) {
       return { ...r, why: `GitHub's CodeQL default setup is on here, but it doesn't scan ${LANGUAGE_NAME[service.language]} code (it scans ${scanned}).` };
     }
