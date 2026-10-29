@@ -2764,7 +2764,7 @@ describe('coverage: repo shell script files, fix round 1 (P50)', () => {
     for (const cmd of ['bash -n scripts/test.sh', 'sh -n scripts/test.sh', 'bash --noexec scripts/test.sh', 'bash -o noexec scripts/test.sh', 'bash -en scripts/test.sh', 'bash --rcfile x scripts/test.sh', 'zsh -q scripts/test.sh']) {
       expect((await mergeTests(withScript(steps(cmd)))).status, cmd).toBe('missing');
     }
-    for (const cmd of ['bash scripts/test.sh', 'bash -eux scripts/test.sh', 'bash -e -o pipefail scripts/test.sh', 'sh -x -- scripts/test.sh', 'bash +x -o errexit -o nounset -o xtrace -v scripts/test.sh', './scripts/test.sh']) {
+    for (const cmd of ['bash scripts/test.sh', 'bash -eux scripts/test.sh', 'bash -e -o pipefail scripts/test.sh', 'sh -x -- scripts/test.sh', 'bash +x -o errexit -o nounset -o xtrace -v scripts/test.sh']) {
       expect((await mergeTests(withScript(steps(cmd)))).status, cmd).toBe('covered');
     }
   });
@@ -2835,5 +2835,71 @@ describe('coverage: conditions inside a followed script (P51)', () => {
     for (const s of ['set -e\npytest\n', 'set -e\ncd . && pytest\n', 'set -e\nif [ -n "$X" ]; then echo x; fi\npytest\n']) {
       expect((await st(s)).status, s).toBe('covered');
     }
+  });
+});
+
+// Closing patch (ruling P52, dod-fixes-rereview-1.md N1, N2, m1, m2): allowlists, so the class of conditions closes.
+describe('coverage: followed scripts and shells, allowlists (P52)', () => {
+  const ci = (runLine: string, shell?: string) => `${both}jobs:\n  t:\n    runs-on: ubuntu-latest\n    steps:\n      - run: ${runLine}\n${shell === undefined ? '' : `        shell: ${shell}\n`}`;
+  const st = async (script: string, runLine = 'bash scripts/test.sh', shell?: string) => {
+    const dir = makeTempDir();
+    wf(dir, 'ci.yml', ci(runLine, shell));
+    writeIn(dir, 'scripts/test.sh', script);
+    return row(await coverage(dir), 'merge', 'unit-tests');
+  };
+  const COND = 'Your own `scripts/test.sh` runs the check only under a condition in that script, so it may not run on every pull request.';
+
+  it('(a) a test on an &&/|| chain is unconditional only after cd, pushd, export X=…, a literal allowlisted set, or source of a repo script', async () => {
+    for (const s of ['command -v pytest >/dev/null && pytest', 'grep -q run ci.txt && pytest', 'make deps && pytest', 'true && pytest', 'f() { :; }\nf && pytest', '( cd . ) || pytest']) {
+      const r = await st(`set -e\n${s}\n`);
+      expect(r.status, s).toBe('partial');
+      expect(r.why, s).toBe(COND);
+    }
+    for (const s of ['cd . && pytest', 'pushd . && pytest', 'export A=1 && pytest', 'set -eu && pytest', 'source scripts/env.sh && pytest', 'cd . && export A=1 && pytest']) {
+      expect((await st(`set -e\n${s}\n`)).status, s).toBe('covered');
+    }
+  });
+
+  it('(b) after an exit/return that can run under any condition, in a loop over a non-literal list, or after a call to a function that exits: partial', async () => {
+    for (const s of [
+      'grep -q skip ci.txt && exit 0\npytest', '( [ -n "$CI" ] ) && exit 0\npytest', 'skip() { exit 0; }\n[ -n "$CI" ] && skip\npytest',
+      'skip() { exit 0; }\nskip\npytest', '{ exit 0; }\npytest', 'cd . || exit\npytest', 'for t in $TESTS; do pytest "$t"; done', 'for t in $(ls tests); do pytest; done',
+      'for t; do pytest; done', 'f() { return; }\nf\npytest',
+    ]) {
+      const r = await st(`set -e\n${s}\n`);
+      expect(r.status, s).toBe('partial');
+    }
+    // a literal list runs; an exit with a literal non-zero code fails the run (never a silent pass); a finished if block
+    for (const s of ['for t in unit api; do pytest "$t"; done', 'cd . || exit 1\npytest', 'if true; then echo x; fi\npytest', 'if [ -n "$X" ]; then echo x; fi\npytest']) {
+      expect((await st(`set -e\n${s}\n`)).status, s).toBe('covered');
+    }
+  });
+
+  it('(c) `set` with a non-literal argument ends coverage: later tests are unknown', async () => {
+    for (const s of ['set -${flags}', 'set $OPTS', 'set "$@"', 'set -e `opts`']) {
+      const r = await st(`set -e\n${s}\npytest\n`);
+      expect(r.status, s).toBe('unknown');
+    }
+  });
+
+  it('(d) the shell: of a step must be a known spec; any other (bash -n {0}, perl {0}) gives no coverage', async () => {
+    const dir = (shell: string) => { const d = makeTempDir(); wf(d, 'ci.yml', ci('pytest', shell)); return d; };
+    for (const sh of ['bash -n {0}', 'bash -o noexec {0}', 'perl {0}', 'bash -c {0}', 'node {0}']) {
+      expect(row(await coverage(dir(sh)), 'merge', 'unit-tests').status, sh).toBe('missing');
+    }
+    for (const sh of ['bash', 'sh', 'bash --noprofile --norc -eo pipefail {0}', 'sh -e {0}', 'bash -e {0}', 'bash {0}']) {
+      expect(row(await coverage(dir(sh)), 'merge', 'unit-tests').status, sh).not.toBe('missing');
+    }
+  });
+
+  it('(e) a script run directly needs a bash or sh shebang with allowlisted flags; anything else gives no coverage', async () => {
+    for (const sb of ['#!/bin/bash -n', '#!/bin/true', '#!/usr/bin/env python3', '#!/usr/bin/env -S bash -n', '']) {
+      expect((await st(`${sb}\nset -e\npytest\n`, './scripts/test.sh')).status, JSON.stringify(sb)).toBe('missing');
+    }
+    for (const sb of ['#!/bin/bash', '#!/usr/bin/env bash', '#!/bin/sh -e', '#! /usr/bin/env sh', '#!/bin/bash -eux']) {
+      expect((await st(`${sb}\nset -e\npytest\n`, './scripts/test.sh')).status, sb).toBe('covered');
+    }
+    // run through a shell, the shebang doesn't matter
+    expect((await st('#!/usr/bin/env python3\nset -e\npytest\n')).status).toBe('covered');
   });
 });

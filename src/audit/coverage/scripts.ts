@@ -4,7 +4,7 @@ import { asObj } from '../../read/manifest.js';
 import { MAX_GLOB_NAME, MAX_GLOB_WORK, MAX_PACKAGE_FILES, MAX_SCRIPTS, MAX_SCRIPT_FILES, MAX_SCRIPT_TARGETS } from './bounds.js';
 import { UNKNOWN_PREFIX, flagGiven, gateOf, gated } from './settings.js';
 import {
-  OK_COMMANDS, PYTEST_NO_RUN, SCRIPT_CATEGORIES, UNKNOWN_SCRIPT_CATEGORIES, globCappedWhy, probeCall, scanShell, scriptCall, type CmdInfo,
+  OK_COMMANDS, PYTEST_NO_RUN, SCRIPT_CATEGORIES, shebangOk, UNKNOWN_SCRIPT_CATEGORIES, globCappedWhy, probeCall, scanShell, scriptCall, type CmdInfo,
   type ShellMode,
 } from './shell.js';
 import { compileGlob } from './triggers.js';
@@ -133,7 +133,7 @@ async function scriptFileRuns(ctx: Ctx, f: Found): Promise<Found[]> {
   if (f.dir === null) return unknown(`${f.subject} runs in a folder pipegen can't place, so it can't tell which script file runs.`);
   const path = posix.normalize(f.dir === '.' ? f.scriptFile as string : `${f.dir}/${f.scriptFile as string}`);
   if (path.startsWith('../') || path === '..') return unknown(cantRead);
-  const key = `file\u0000${f.dir}\u0000${path}`;
+  const key = `file\u0000${f.scriptDirect === true ? 1 : 0}\u0000${f.dir}\u0000${path}`;
   let runs = ctx.scriptMemo.get(key);
   if (runs === undefined) {
     // P50 (C2): script files have their own reader and their own bound, and every file tried counts, read or not, so a
@@ -148,6 +148,11 @@ async function scriptFileRuns(ctx: Ctx, f: Found): Promise<Found[]> {
       runs = unknown(cantRead);
       ctx.scriptMemo.set(key, runs);
       return runs;
+    }
+    // P52 (e): run directly, the shebang decides what runs: only bash or sh with allowlisted flags is read
+    if (f.scriptDirect === true && !shebangOk(t.ok)) {
+      ctx.scriptMemo.set(key, []);
+      return [];
     }
     const inner = gated(await resolveScripts(ctx, scanShell(t.ok, f.dir, ctx.sigs, ctx.budget, SCRIPT_FILE_SHELL)), gateOf([t.ok], [], undefined, ctx.sigs.softEnv, ctx.sigs.configFiles));
     runs = inner.flatMap((g): Found[] => {

@@ -53,6 +53,8 @@ export interface Found {
   script?: string;
   /** DoD run (fastapi): a shell script file of the repo (repoScriptFile), relative to `dir`, followed by resolveScripts. */
   scriptFile?: string;
+  /** P52 (e): the script file is run directly (not after `bash|sh`), so its shebang decides what runs. */
+  scriptDirect?: boolean;
   /**
    * Task 5: a tox or nox run; an environment variable that picks other envs or sessions (TOX*, NOX*) drops it. 'npm':
    * an npm publish, which NPM_CONFIG_DRY_RUN turns into a dry run (fix round 1, M1).

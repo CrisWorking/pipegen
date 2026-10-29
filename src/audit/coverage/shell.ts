@@ -15,26 +15,64 @@ import type { Budget, CommandRule, Compiled, Found, Reason } from './types.js';
 export interface ShellMode { errexit: boolean; pipefail: boolean; script?: boolean }
 export const DEFAULT_SHELL: ShellMode = { errexit: true, pipefail: false };
 
-/** The mode of a step's `shell:` (or defaults.run.shell). A custom shell without -e (bash {0}, pwsh, python) has no errexit. */
-export function shellMode(v: unknown): ShellMode {
+/** Shells GitHub runs with errexit off that pipegen reads as before (pwsh, powershell, python, cmd): `run:` text isn't sh there. */
+const OTHER_STEP_SHELLS: ReadonlySet<string> = new Set(['pwsh', 'powershell', 'python', 'cmd']);
+
+/**
+ * The mode of a step's `shell:` (or defaults.run.shell), or null when pipegen doesn't know the spec (P52 d): then the
+ * step gives no coverage. Known: none (the default), `bash`, `sh`, and `bash|sh` followed only by allowlisted words
+ * (-e -u -x -v and combined or + forms, `-o pipefail|errexit|nounset|xtrace`, --noprofile, --norc) then `{0}`; and
+ * pwsh, powershell, python and cmd as before (errexit off). Anything else (`bash -n {0}`, `perl {0}`) is null.
+ */
+export function shellMode(v: unknown): ShellMode | null {
   if (v === undefined || v === null) return DEFAULT_SHELL;
-  if (typeof v !== 'string' || !regexSafe(v)) return { errexit: false, pipefail: false };
+  if (typeof v !== 'string' || !regexSafe(v)) return null;
   const s = v.trim();
   if (s === 'bash') return { errexit: true, pipefail: true };
   if (s === 'sh') return { errexit: true, pipefail: false };
-  const parts = s.split(/\s+/).slice(0, 16);
-  const prog = basename(parts[0] ?? '');
-  if (prog !== 'bash' && prog !== 'sh') return { errexit: false, pipefail: false };
-  const e = parts.some((x) => x.startsWith('-') && !x.startsWith('--') && /^-[a-z]+$/.test(x) && x.includes('e'));
-  return { errexit: e, pipefail: prog === 'bash' && parts.includes('pipefail') };
+  const parts = s.split(/\s+/).slice(0, 17);
+  const prog = parts[0] ?? '';
+  if (OTHER_STEP_SHELLS.has(basename(prog))) return { errexit: false, pipefail: false };
+  if ((prog !== 'bash' && prog !== 'sh') || parts.length > 16 || parts[parts.length - 1] !== '{0}') return null;
+  let errexit = false;
+  let pipefail = false;
+  const mid = parts.slice(1, -1);
+  for (let i = 0; i < mid.length; i++) {
+    const x = mid[i] as string;
+    if (x === '--noprofile' || x === '--norc') continue;
+    const o = /^-([euxv]*)o$/.exec(x);
+    if (o !== null) {
+      const opt = mid[i + 1] ?? '';
+      if (!SHELL_OPTIONS.has(opt)) return null;
+      if ((o[1] as string).includes('e') || opt === 'errexit') errexit = true;
+      if (opt === 'pipefail') pipefail = true;
+      i++;
+      continue;
+    }
+    if (!SHELL_FLAGS.test(x)) return null;
+    if (x.startsWith('-') && x.includes('e')) errexit = true;
+  }
+  return { errexit, pipefail: prog === 'bash' && pipefail };
+}
+
+/**
+ * P52 (e): a script run directly runs under its shebang: only bash or sh (by path or `/usr/bin/env bash|sh`), with
+ * allowlisted flags (-e -u -x -v, combined or + forms), is read; anything else (`-n`, /bin/true, python, `env -S`, no
+ * shebang) gives no coverage.
+ */
+export function shebangOk(text: string): boolean {
+  const first = (text.split('\n', 1)[0] ?? '').replace(/\r$/, '');
+  const m = /^#!\s*(?:\/usr\/bin\/env\s+(?:bash|sh)|(?:\/usr)?\/bin\/(?:bash|sh))((?:\s+\S+){0,4})\s*$/.exec(first);
+  if (m === null) return false;
+  return (m[1] ?? '').trim().split(/\s+/).filter((x) => x !== '').every((x) => SHELL_FLAGS.test(x));
 }
 
 const ASSIGN = /^[A-Za-z_][A-Za-z0-9_]*=/;
 /** Words after which the next non-flag word is a command. */
 /** P51: the compound commands whose body runs only under a condition. */
-const CONDITIONAL_KW: ReadonlySet<string> = new Set(['if', 'case', 'while', 'until']);
-/** P51: commands that only test a condition (`[ … ] && x`, `test -z … || x`). */
-const TEST_COMMANDS: ReadonlySet<string> = new Set(['[', '[[', 'test']);
+const CONDITIONAL_KW: ReadonlySet<string> = new Set(['if', 'case', 'while', 'until', 'select']);
+/** P52 (a): the commands after which the rest of an `&&` chain still runs unconditionally (with argument checks, see chainSafe). */
+const CHAIN_SAFE: ReadonlySet<string> = new Set(['cd', 'pushd', 'export', 'set', 'source', '.']);
 /** P50 (C1): the shells whose flags are allowlisted before a script (anything else: the command gives no coverage). */
 const SHELLS: ReadonlySet<string> = new Set(['sh', 'bash', 'zsh', 'dash']);
 /** -e -u -x -v and their combined and `+` forms (-eux, +x). */
@@ -261,11 +299,26 @@ export function scanShell(text: string, base: string | null, sigs: Compiled, bud
       if (open.length > 0) pair(k);
     }
   }
+  /**
+   * P52 (b): whether the `for` at k loops over a literal list (`for t in unit api`): no `in` (the positional
+   * parameters), a word with `$` or a backtick, a `$( … )`, or an empty list is not literal (it may run zero times).
+   */
+  const literalForList = (k: number): boolean => {
+    if (word(k + 2) !== 'in') return false;
+    let items = 0;
+    for (let j = k + 3; j < n; j++) {
+      const t = toks[j]!;
+      if (t.op === ';' || t.op === '\n' || (t.op === null && t.w === 'do')) return items > 0;
+      if (t.op !== null || /[$`]/.test(t.w)) return false;
+      items++;
+    }
+    return false;
+  };
   // P51: how many if / case / while / until compound commands hold each token (a prefix sum over their ranges)
   const condDepth = new Int32Array(n + 1);
   if (mode.script === true) {
     for (let k = 0; k < n; k++) {
-      if (toks[k]!.kw !== 'open' || !CONDITIONAL_KW.has(toks[k]!.w)) continue;
+      if (toks[k]!.kw !== 'open' || !(CONDITIONAL_KW.has(toks[k]!.w) || (toks[k]!.w === 'for' && !literalForList(k)))) continue;
       condDepth[k + 1]! += 1;
       condDepth[closer[k]! >= 0 ? closer[k]! : n]! -= 1;
     }
@@ -346,7 +399,12 @@ export function scanShell(text: string, base: string | null, sigs: Compiled, bud
 
   const found: Found[] = [];
   const seen = new Set<string>(); // one finding per tool, directory and reason per text
-  const add = (f: Found) => {
+  const add = (found0: Found) => {
+    // P52 (c): after a `set` pipegen can't read, a run may be under `set -n` or anything: unknown, never covered
+    const f: Found = opaqueSet && found0.categories.some((c) => !c.startsWith(UNKNOWN_PREFIX))
+      ? { ...found0, categories: found0.categories.map((c) => (c.startsWith(UNKNOWN_PREFIX) ? c : `${UNKNOWN_PREFIX}${c}`)), reason: null,
+        partialWhy: `${found0.subject} runs after a \`set\` whose options pipegen can't read, so it can't tell whether it runs.` }
+      : found0;
     const key = `${f.by}\u0000${f.dir ?? ''}\u0000${f.reason ?? ''}\u0000${f.hookRun === true ? 1 : 0}`;
     if (!seen.has(key)) {
       seen.add(key);
@@ -364,9 +422,15 @@ export function scanShell(text: string, base: string | null, sigs: Compiled, bud
   let lastCmd: { kind: 'ok' | 'fail' | 'other'; start: number; end: number } | null = null; // the last command run, where it starts and its list end
   const isDead = (k: number) => k > deadAfter || k <= deadTo;
   let containerEnd = -1; // P50 (M1): words before this index are the command of a `docker run` container
-  // P51 (script files only): the rest of this and-or list follows a test command's && or ||; a conditional exit/return was seen
+  // P51/P52 (script files only): the rest of this and-or list may not run (after `||`, or `&&` after a command not on
+  // the CHAIN_SAFE list); an exit/return that can run under a condition was seen; the last command was CHAIN_SAFE
   let condChain = false;
   let afterCondExit = false;
+  let lastSafe = false;
+  const exitFns = new Set<string>(); // P52 (b): script functions whose body can exit or return with success
+  const fnStack: { name: string; close: number }[] = [];
+  let opaqueSet = false; // P52 (c): a `set` with an argument pipegen can't read: later runs are unknown
+  let shellScriptAt = -1; // P52 (e): the index of the script word after `bash|sh [flags]` (else the script runs directly)
   let binNext = -1; // the word after `yarn` / `pnpm` that may be a binary (or a script: classifyScript decides)
   // `( … )` and `$( … )` run in a subshell: `set` and `cd` inside them end at the closing bracket.
   const subshells: { close: number; errexit: boolean; pipefail: boolean; cwd: string | null }[] = [];
@@ -425,7 +489,7 @@ export function scanShell(text: string, base: string | null, sigs: Compiled, bud
       return;
     }
     if (file !== null) {
-      add({ categories: [], by: `your own \`${file}\``, subject: `Your own \`${file}\``, dir: cwd, reason: shellReason(k), scriptFile: file });
+      add({ categories: [], by: `your own \`${file}\``, subject: `Your own \`${file}\``, dir: cwd, reason: shellReason(k), scriptFile: file, ...(k === shellScriptAt ? {} : { scriptDirect: true }) });
       return;
     }
     if (w !== name) return;
@@ -570,6 +634,19 @@ export function scanShell(text: string, base: string | null, sigs: Compiled, bud
     }
     return j;
   };
+  /**
+   * P52 (a): a command after which an `&&` chain still runs unconditionally: cd, pushd, `export NAME[=…]`, `set` with
+   * literal allowlisted flags, `source`/`.` of a plain repo script path. Anything else may make the rest conditional.
+   */
+  const chainSafe = (k: number, w: string): boolean => {
+    if (!CHAIN_SAFE.has(w)) return false;
+    const args: string[] = [];
+    for (let j = k + 1; j < segEnd[k]!; j++) args.push(toks[j]!.w);
+    if (w === 'export') return args.every((a) => /^[A-Za-z_][A-Za-z0-9_]*(?:=.*)?$/.test(a));
+    if (w === 'set') return args.every((a, i) => SHELL_FLAGS.test(a) || /^[-+][euxv]*o$/.test(a) || (i > 0 && /^[-+][euxv]*o$/.test(args[i - 1] as string) && SHELL_OPTIONS.has(a)));
+    if (w === 'source' || w === '.') return args.length === 1 && repoScriptFile(args[0] as string) !== null;
+    return true; // cd, pushd
+  };
   /** P50 (C1): past a shell's flags when every one is allowlisted (SHELL_FLAGS, `-o` SHELL_OPTIONS, `--`): the script's index, else -1. */
   const shellFlagsEnd = (k: number): number => {
     let j = k;
@@ -605,8 +682,9 @@ export function scanShell(text: string, base: string | null, sigs: Compiled, bud
   while (k < n) {
     const op = toks[k]!.op;
     if (op !== null) {
-      if (op === '&&' || op === '||') condChain ||= lastCmd !== null && TEST_COMMANDS.has(toks[lastCmd.start]!.w);
+      if (op === '||' || (op === '&&' && !lastSafe)) condChain = true;
       else if (op === ';' || op === '\n' || op === '&') condChain = false;
+      if (op === ')' || op === '}') lastSafe = false; // a group's status: pipegen doesn't vouch for it
       if ((op === '(' || op === '$(') && closer[k]! >= 0) subshells.push({ close: closer[k]!, errexit, pipefail, cwd });
       while (subshells.length > 0 && subshells[subshells.length - 1]!.close <= k) {
         const s = subshells.pop()!;
@@ -650,6 +728,7 @@ export function scanShell(text: string, base: string | null, sigs: Compiled, bud
     // so tools inside it count as partial.
     const fnBody = functionBody(k);
     if (fnBody >= 0) {
+      fnStack.push({ name: (w === 'function' ? word(k + 1) ?? '' : w).replace(/\(\)$/, ''), close: closer[fnBody]! < 0 ? n : closer[fnBody]! });
       functionEnd = Math.max(functionEnd, closer[fnBody]! < 0 ? n : closer[fnBody]!);
       k = fnBody;
       continue;
@@ -675,6 +754,10 @@ export function scanShell(text: string, base: string | null, sigs: Compiled, bud
       continue;
     }
     const name = basename(w);
+    // P52 (a, b): whether this command keeps an `&&` chain unconditional; a call to a script function that can exit
+    lastSafe = chainSafe(k, w);
+    while (fnStack.length > 0 && fnStack[fnStack.length - 1]!.close <= k) fnStack.pop();
+    if (mode.script === true && exitFns.has(w) && !isDead(k)) afterCondExit = true;
     if (w === 'cd') {
       const target = word(k + 1);
       cwd = target === null || target === '' || target === '-' || /[$`~\\]/.test(target) || target.startsWith('/') ? null : resolveDir(cwd, target);
@@ -683,6 +766,8 @@ export function scanShell(text: string, base: string | null, sigs: Compiled, bud
       continue;
     }
     if (w === 'set') {
+      for (let j = k + 1; j < segEnd[k]!; j++) if (!isDead(k) && (toks[j]!.op === '$(' || /[$`]/.test(toks[j]!.w))) opaqueSet = true;
+      if (!isDead(k) && segEnd[k]! < n && toks[segEnd[k]!]!.op === '$(') opaqueSet = true;
       for (let j = k + 1; j < segEnd[k]!; j++) {
         const f = toks[j]!.w;
         if (!(f.startsWith('-') || f.startsWith('+')) || f.startsWith('--') || f.length < 2) continue;
@@ -708,7 +793,14 @@ export function scanShell(text: string, base: string | null, sigs: Compiled, bud
     }
     // `exit` on its own in the step's top-level list (not in a group, a compound command, a function or a condition,
     // and not joined by && || | &): nothing after it runs
-    if (mode.script === true && (w === 'exit' || w === 'return') && k >= functionEnd && !isDead(k) && (condDepth[k]! > 0 || condChain)) afterCondExit = true;
+    // P52 (b): an exit/return that can end the script with success (no code, 0, or one pipegen can't read; a literal
+    // non-zero code fails the run, never a silent pass): in a function body it marks the function; anywhere else but
+    // the top-level list (a group, a subshell, if/case/loop, an &&/|| chain) every later run is under a condition
+    if (mode.script === true && (w === 'exit' || w === 'return') && !isDead(k) && !/^[1-9][0-9]{0,2}$/.test(word(k + 1) ?? '')) {
+      const fn = fnStack.length > 0 && k < fnStack[fnStack.length - 1]!.close ? fnStack[fnStack.length - 1]! : null;
+      if (fn !== null) exitFns.add(fn.name);
+      else if (depth[k]! > 0 || condDepth[k]! > 0 || condChain || inCondition) afterCondExit = true;
+    }
     if ((w === 'exit' || w === 'return') && depth[k] === 0 && !inCondition && k >= functionEnd && k > negateEnd
       && (k === 0 || toks[k - 1]!.op === ';' || toks[k - 1]!.op === '\n')
       && (segEnd[k]! >= n || toks[segEnd[k]!]!.op === ';' || toks[segEnd[k]!]!.op === '\n')) deadAfter = Math.min(deadAfter, k);
@@ -748,6 +840,7 @@ export function scanShell(text: string, base: string | null, sigs: Compiled, bud
         continue;
       }
       visit(word(j) !== null);
+      shellScriptAt = j;
       cmd = true;
       k = j;
       continue;
