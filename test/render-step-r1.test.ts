@@ -116,12 +116,12 @@ describe('R1-7: build-toolchain names and the structural secret rule', () => {
   it('validateSpec: each toolchain variable name is refused as a secret name', () => {
     for (const name of names) {
       const c = ctxFor([service({ name: 'api', envVars: [name] })]);
-      const t = entry('actions-checkout');
+      const t = entry('actions-checkout'); t.categories = [...t.categories, 'unit-tests'];   // an app-running tool: secrets are refused for any other (final review finding 1)
       expect(validateSpec(withNames(specFor(t, { service: 'api' }), [name]), t, c), name).toHaveLength(1);
     }
     for (const name of ['STRIPE_KEY', 'CCTV_TOKEN', 'ARTIFACTORY_TOKEN', 'CONDAS_KEY', 'DENOISE_KEY']) {
       const c = ctxFor([service({ name: 'api', envVars: [name] })]);
-      const t = entry('actions-checkout');
+      const t = entry('actions-checkout'); t.categories = [...t.categories, 'unit-tests'];   // an app-running tool: secrets are refused for any other (final review finding 1)
       expect(validateSpec(withNames(specFor(t, { service: 'api' }), [name]), t, c), name).toEqual([]);
     }
   });

@@ -454,6 +454,15 @@ const rx = (re: RegExp, describe: string, whenWith?: RendererInput['whenWith']):
 export const PLAIN_REL_RE = /^(?![-/])(?!.*(?:^|\/)\.\.(?:\/|$))[A-Za-z0-9._/-]{1,200}$/;
 const GHCR_ONLY = { check: (all: Readonly<Record<string, string>>) => all.registry === 'ghcr.io', describe: 'only when the registry is ghcr.io' } as const;
 const RUNNER_TEMP_PATH = rx(/^\$\{\{ runner\.temp \}\}\/pipegen-out\/[a-z0-9][a-z0-9-]{0,120}(?:\/[A-Za-z0-9_][A-Za-z0-9._-]{0,100}){0,3}$/, 'a path under ${{ runner.temp }}/pipegen-out/<artifact>');
+/** The path of an upload or download sits in the folder of the artifact it names (`pipegen-out/<with.name>`): one rule for the renderer, the emitter and the referee (final review finding 2). */
+const OWN_ARTIFACT_FOLDER = {
+  check: (all: Readonly<Record<string, string>>) => {
+    const folder = `\${{ runner.temp }}/pipegen-out/${all.name ?? ''}`;
+    return typeof all.name === 'string' && typeof all.path === 'string' && (all.path === folder || all.path.startsWith(`${folder}/`));
+  },
+  describe: 'only inside its own artifact folder (${{ runner.temp }}/pipegen-out/<name>)',
+} as const;
+const OWN_FOLDER_PATH = rx(/^\$\{\{ runner\.temp \}\}\/pipegen-out\/[a-z0-9][a-z0-9-]{0,120}(?:\/[A-Za-z0-9_][A-Za-z0-9._-]{0,100}){0,3}$/, 'a path under ${{ runner.temp }}/pipegen-out/<artifact>', OWN_ARTIFACT_FOLDER);
 const ARTIFACT_NAME = rx(new RegExp(`^${RESULT_ARTIFACT_PREFIX}[a-z0-9][a-z0-9-]{0,120}$`), `a result artifact name (${RESULT_ARTIFACT_PREFIX}…)`);
 
 /**
@@ -466,8 +475,8 @@ const ARTIFACT_NAME = rx(new RegExp(`^${RESULT_ARTIFACT_PREFIX}[a-z0-9][a-z0-9-]
  * - docker login: the actor and the workflow token, nothing else.
  */
 export const RENDERER_INPUTS: Readonly<Record<string, Readonly<Record<string, RendererInput>>>> = Object.freeze({
-  'actions/upload-artifact': { name: ARTIFACT_NAME, path: RUNNER_TEMP_PATH },
-  'actions/download-artifact': { name: ARTIFACT_NAME, path: RUNNER_TEMP_PATH },
+  'actions/upload-artifact': { name: ARTIFACT_NAME, path: OWN_FOLDER_PATH },
+  'actions/download-artifact': { name: ARTIFACT_NAME, path: OWN_FOLDER_PATH },
   'github/codeql-action/upload-sarif': { sarif_file: RUNNER_TEMP_PATH, category: rx(/^pipegen-[a-z0-9][a-z0-9-]{0,100}$/, 'a category starting pipegen-') },
   'actions/attest': {
     'subject-name': rx(/^(?:ghcr\.io|docker\.io)\/[a-z0-9][a-z0-9._/-]{0,200}$/, 'an image name on ghcr.io or docker.io, with no tag'),

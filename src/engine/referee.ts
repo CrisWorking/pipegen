@@ -364,6 +364,9 @@ interface Expectations {
   images: Set<string>;
   declared: Set<string>;
   allowed: Set<string>;
+  /** the sources (`spec:<i>`) of the cli specs that rendered, and those of them a parsed file holds a step of (the blocking rule, finding 3) */
+  rendered: Set<string>;
+  matched: Set<string>;
   /** source → the pins each of its `pipegen-npm-ci-…` steps carries */
   npmPins: Map<string, Map<string, string[]>>;
   byId: Map<string, ReviewedTool>;
@@ -420,7 +423,7 @@ function expectations(draft: PipelineDraft, platform: PlatformActions, reviewed:
   }
   const ex: Expectations = {
     runs: [], runIds: new Set(), actions, actionPaths: new Set([...actions.keys()].map((k) => k.slice(0, k.lastIndexOf('@')))), images,
-    declared: new Set(), allowed: new Set(PIPEGEN_SECRETS), npmPins: new Map(), byId,
+    declared: new Set(), allowed: new Set(PIPEGEN_SECRETS), rendered: new Set(), matched: new Set(), npmPins: new Map(), byId,
   };
   const ctxs: RenderContext[] = SENTINELS.map((t) => ({ profile: draft.profile, targets: { ...t } }));
   const needOf = (needId: string, service: string | undefined) => draft.needs.find((n) => n.id === needId && n.service === service);
@@ -449,11 +452,19 @@ function expectations(draft: PipelineDraft, platform: PlatformActions, reviewed:
       add(`draft.steps[${i}]`, 'unreviewed', `The step for ${show(spec?.needId)} runs ${show(spec?.tool?.id)}, which is not an entry of the reviewed list at its reviewed pin; pipegen never runs it, not even as a non-blocking job (it belongs in the suggestions).`);
       return;
     }
-    for (const n of spec.secrets ?? []) ex.declared.add(n);
-    if (t.candidate.kind === 'action') return;   // actions are judged by their template (judgeAction), not by a re-render
+    if (t.candidate.kind === 'action') {   // actions are judged by their template (judgeAction), not by a re-render
+      for (const n of spec.secrets ?? []) ex.declared.add(n);
+      return;
+    }
     const appRunning = t.categories.some((c) => APP_RUNNING_CATEGORIES.has(c));
     try {
-      record(`spec:${i}`, ctxs.map((c) => renderStep(spec, t, platform, c).steps), appRunning, needOf(spec.needId, spec.service)?.blocking ?? true, readsWorkspace(t.id));
+      const blocking = needOf(spec.needId, spec.service)?.blocking ?? true;
+      record(`spec:${i}`, ctxs.map((c) => renderStep(spec, t, platform, c).steps), appRunning, blocking, readsWorkspace(t.id));
+      // the target-branch variant (the base-scan job): the same spec, rendered into the base artifact folder
+      record(`spec:${i}:base`, ctxs.map((c) => renderStep(spec, t, platform, { ...c, base: true }).steps), appRunning, blocking, readsWorkspace(t.id));
+      ex.rendered.add(`spec:${i}`);
+      // only a spec that rendered declares its secrets (one that did not names no step, so nothing may carry them)
+      for (const n of spec.secrets ?? []) ex.declared.add(n);
     } catch (e) {
       if (!(e instanceof RenderError)) throw e;
       notes.push(`The step for ${show(spec.needId)} (${t.id}) can not be rendered, so no step may claim to be it: ${safeText(e.message, 200)}`);
@@ -792,6 +803,7 @@ function judgeStep(fc: FileCtx, where: string, raw: unknown): Judged {
     else if (r === null) { bad('unreviewed', at(`the run step ${show(raw.name ?? raw.id ?? '')} is not a step pipegen renders for this pipeline (a reviewed tool or a project script), so it is not run.`)); harmlessId = false; }
     else {
       match = r;
+      fc.ex.matched.add(r.source);
       appRunning = r.appRunning;
       const id = r.step.id ?? '';
       kind = r.source.startsWith('script:') || appRunning ? 'repo-code' : /^(?:checker-run|tool-run|tool-install|tool-pull)-/.test(id) ? 'tool' : /^scrub-/.test(id) ? 'scrub' : 'repo-code';
@@ -1059,11 +1071,14 @@ function blockingRule(draft: PipelineDraft, ex: Expectations, add: Add, notes: s
   draft.needs.forEach((need, i) => {
     if (!need.blocking) return;
     const category = Object.hasOwn(NEED_ID_CATEGORY, need.id) ? (NEED_ID_CATEGORY as Readonly<Record<string, string>>)[need.id] : undefined;
+    // a spec counts only if it rendered and one of its rendered run steps is in a parsed file (an action spec has none: it counts as reviewed)
     const formats = draft.steps
-      .filter((s) => isObj(s) && s.needId === need.id && s.service === need.service && isReviewed(s.tool))
-      .flatMap((s) => {
+      .flatMap((s, si) => {
+        if (!(isObj(s) && s.needId === need.id && s.service === need.service && isReviewed(s.tool))) return [];
         const t = ex.byId.get(s.tool.id);
-        return t === undefined || !sameCandidate(s.tool, t.candidate) ? [] : [t.step.output.format];
+        if (t === undefined || !sameCandidate(s.tool, t.candidate)) return [];
+        if (t.candidate.kind !== 'action' && !(ex.rendered.has(`spec:${si}`) && ex.matched.has(`spec:${si}`))) return [];
+        return [t.step.output.format];
       });
     const script = draft.profile.services.some((s) => projectScriptFor(need, s) !== null);
     if (formats.length === 0 && !script && need.layer !== 'pre-commit' && !(category !== undefined && PIPEGEN_JOB_CATEGORIES.has(category))) {

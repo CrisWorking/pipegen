@@ -23,6 +23,8 @@ const ACTOR = '${{ github.actor }}';
 const WF_CRED = '${{ secrets.GITHUB_TOKEN }}';
 const loginWith = () => Object.fromEntries([['username', ACTOR], ['password', WF_CRED]]);
 const checkout = () => entry('actions-checkout');
+/** A copy of the checkout entry that counts as an app-running tool (secrets are refused for any other: final review finding 1), for the secret-name tests. */
+const appRunning = () => { const t = checkout(); t.categories = [...t.categories, 'unit-tests']; return t; };
 const setupNode = () => entry('actions-setup-node');
 
 describe('types (B1)', () => {
@@ -110,7 +112,7 @@ describe('validateSpec', () => {
 
   it('validateSpec: secret names must look like names, be declared by the service, and not be dangerous', () => {
     const c = ctxFor([service({ name: 'api', envVars: ['STRIPE_KEY', 'NODE_OPTIONS', 'PATH'], dependsOn: [{ kind: 'postgres', name: 'pg', evidence: 'x', envVars: ['DATABASE_URL'] }] }), service({ name: 'web', path: 'web', envVars: ['WEB_ONLY'] })]);
-    const t = checkout();
+    const t = appRunning();
     const ok = (names: string[], svc = 'api') => validateSpec(withNames(specFor(t, { service: svc }), names), t, c);
     expect(ok(['STRIPE_KEY', 'DATABASE_URL'])).toEqual([]);
     expect(ok(['lower_case'])[0]).toMatch(/^secrets\[0\]: /);
@@ -245,7 +247,7 @@ describe('renderStep: actions', () => {
 
   it('renderStep: a secret reaches a step only through env, and only a declared name', () => {
     const c = ctxFor([service({ name: 'api', envVars: ['STRIPE_KEY'] })]);
-    const t = checkout();
+    const t = appRunning();
     const r = renderStep(withNames(specFor(t, { service: 'api' }), ['STRIPE_KEY']), t, platform(), c);
     expect(r.steps[0]?.env).toEqual(Object.fromEntries([['STRIPE_KEY', '${{ secrets.STRIPE_KEY }}']]));
     expect(JSON.stringify(r.steps[0]?.with)).not.toContain('secrets');
@@ -518,7 +520,7 @@ describe('fix round 1', () => {
 
   it('renderStep: renders what it validated (a getter that changes after the first read cannot swap the secrets)', () => {
     const c = ctxFor([service({ name: 'api', envVars: ['STRIPE_KEY'] })]);
-    const t = checkout();
+    const t = appRunning();
     const spec = specFor(t, { service: 'api' });
     let reads = 0;
     Object.defineProperty(spec, 'secrets', { enumerable: true, get: () => (++reads <= 1 ? ['STRIPE_KEY'] : ['NODE_OPTIONS', 'X }}${{ github.token']) });
@@ -542,7 +544,7 @@ describe('fix round 1', () => {
     ] as RenderedStep[]) expect(withStep([step]), JSON.stringify(step)).toThrow(RenderError);
     const ok: RenderedStep[] = [
       { name: 'n', env: { STRIPE_KEY: '${{ secrets.STRIPE_KEY }}' } },
-      { name: 'n', uses: `actions/upload-artifact@${'a'.repeat(40)}`, with: { path: '${{ runner.temp }}/pipegen-out/pipegen-out-sast/x.sarif' } },
+      { name: 'n', uses: `actions/upload-artifact@${'a'.repeat(40)}`, with: { name: 'pipegen-out-sast', path: '${{ runner.temp }}/pipegen-out/pipegen-out-sast/x.sarif' } },
       { name: 'n', uses: `docker/login-action@${'a'.repeat(40)}`, with: { registry: 'ghcr.io', ...Object.fromEntries([['username', ACTOR], ['password', WF_CRED]]) } },   // the token only goes with ghcr.io (R1-1)
     ];
     expect(withStep(ok)).not.toThrow();
@@ -621,7 +623,7 @@ describe('fix round 1', () => {
     for (const [family, names] of Object.entries(families)) {
       for (const name of names) {
         const c = ctxFor([service({ name: 'api', envVars: [name] })]);
-        const t = checkout();
+        const t = appRunning();
         const problems = validateSpec(withNames(specFor(t, { service: 'api' }), [name]), t, c);
         expect(problems, `${family}: ${name}`).toHaveLength(1); // refused by the name rule or the dangerous list
       }
@@ -629,7 +631,7 @@ describe('fix round 1', () => {
     // an ordinary application secret that merely starts with GO, TERM, TMP… is not caught by accident
     for (const name of ['GOOGLE_API_KEY', 'STRIPE_KEY', 'DATABASE_URL', 'TWILIO_AUTH', 'SENDGRID_API_KEY']) {
       const c = ctxFor([service({ name: 'api', envVars: [name] })]);
-      const t = checkout();
+      const t = appRunning();
       expect(validateSpec(withNames(specFor(t, { service: 'api' }), [name]), t, c), name).toEqual([]);
     }
   });

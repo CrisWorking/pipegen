@@ -414,7 +414,7 @@ export function renderCliTool({ spec, tool, service, ctx, hooks, options }: CliA
   }
   let artifact: string;
   try {
-    artifact = resultArtifactName(spec.needId, spec.service);
+    artifact = resultArtifactName(spec.needId, spec.service, ctx.base === true ? { base: true } : undefined);
   } catch (e) {
     if (e instanceof ArtifactNameError) return refuse(e.message);
     throw e;

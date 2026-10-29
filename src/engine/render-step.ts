@@ -20,7 +20,7 @@ import { COMMIT_SHA_RE } from './names.js';
 import { NEED_IDS } from './need-ids.js';
 import type { PlatformActions } from './pin.js';
 import { tuningProblems } from './tuning.js';
-import { projectScriptSteps, renderCliTool, type CliHooks, type RenderOptions } from './render-cli.js';
+import { APP_RUNNING_CATEGORIES, projectScriptSteps, renderCliTool, type CliHooks, type RenderOptions } from './render-cli.js';
 import { ArtifactNameError, resultArtifactName } from './artifact-names.js';
 import type { ProjectScriptStep } from './reviewed.js';
 import { EXPR, own, RenderError, show } from './render-error.js';
@@ -34,6 +34,8 @@ export interface RenderContext {
   profile: RepoProfile;
   /** Values only known at render time (6c slots): an image reference, a local URL, an API spec path. Never from the AI. */
   targets?: { image?: string; url?: string; spec?: string; k8sDir?: string };
+  /** Render the target-branch (baseline) variant of the check: its result goes to the `pipegen-out-base-<needId>` artifact (the `base-scan` job). */
+  base?: true;
 }
 
 /** One step of a job, as pipegen renders it. `usesComment` becomes the trailing `# <version>` comment on `uses:`. */
@@ -151,6 +153,9 @@ export function validateSpec(spec: StepSpec, tool: ReviewedTool, ctx: RenderCont
   }
 
   // secrets: names only, a real variable of this service, never one that changes how code runs (ruling S9)
+  if (Array.isArray(spec.secrets) && spec.secrets.length > 0 && !tool.categories.some((cat) => APP_RUNNING_CATEGORIES.has(cat))) {
+    problem('secrets', `${show(tool.id)} does not run the app: declared secrets reach only steps that run the app (tests, builds), never a scanner, linter, action or upload step.`);
+  }
   if (spec.secrets !== undefined) {
     if (!Array.isArray(spec.secrets)) problem('secrets', 'must be a list of names.');
     else {
@@ -545,9 +550,7 @@ export function renderJobPrelude(opts: PreludeOptions, platform: PlatformActions
  * (artifact-names.ts) and `path` a place under `${{ runner.temp }}/pipegen-out/`.
  */
 export function renderUpload(artifact: string, path: string, platform: PlatformActions): RenderedStep {
-  // the folder is this artifact's own: another check's unscrubbed file must not go up under this name
-  const folder = `\${{ runner.temp }}/pipegen-out/${artifact}`;
-  if (path !== folder && !path.startsWith(`${folder}/`)) throw new RenderError('An upload may only take a path inside its own artifact folder.');
+  // the path must sit in this artifact's own folder: the rule is the shared whenWith of RENDERER_INPUTS (tool-flags.ts), which the emitter and the referee also use
   const step = renderPlatformStep('upload-artifact', platform, { name: artifact, path });
   return { ...step, name: 'Upload the result', if: 'always()' };
 }

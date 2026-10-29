@@ -587,7 +587,9 @@ describe('referee: blocking needs (B7)', () => {
     const list = reviewedList().map((t) => (t.id === 'gitleaks' ? { ...t, step: { ...t.step, output: { ...t.step.output, format: 'junit' as const } } } : t));
     const t = list.find((x) => x.id === 'gitleaks') as ReviewedTool;
     const spec = specFor(t, { needId: 'secrets' });
-    const r = await run([wf({ scan: job(prelude()) })], draftOf([spec]), { list });
+    // the job holds the step the renderer makes for this (edited) entry: a spec that is in no file is not-gate-readable instead (final review finding 3)
+    const steps = [...prelude(), ...renderStep(spec, t, platform(), ctx).steps];
+    const r = await run([wf({ scan: job(steps) })], draftOf([spec]), { list });
     expect(r.demoted).toEqual(['secrets']);
     expect(r.notes.join(' ')).toMatch(/secrets/);
     expect(r.ok, show(r)).toBe(true);
@@ -613,7 +615,10 @@ describe('referee: blocking needs (B7)', () => {
     // osv-scanner is both deps and dependency-review: as `deps` (findings) its sarif keeps it blocking; a junit copy would be demoted only there
     const list = reviewedList().map((t) => (t.id === 'osv-scanner' ? { ...t, step: { ...t.step, output: { ...t.step.output, format: 'junit' as const } } } : t));
     const t = list.find((x) => x.id === 'osv-scanner') as ReviewedTool;
-    const r = await run([wf({ a: job(prelude()) })], draftOf([specFor(t, { needId: 'deps', service: 'app' }), specFor(t, { needId: 'dependency-review' })]), { list });
+    const s1 = specFor(t, { needId: 'deps', service: 'app' });
+    const s2 = specFor(t, { needId: 'dependency-review' });
+    const jobs = { a: job([...prelude(), ...renderStep(s1, t, platform(), ctx).steps]), b: job([...prelude(), ...renderStep(s2, t, platform(), ctx).steps]) };
+    const r = await run([wf(jobs)], draftOf([s1, s2]), { list });
     expect(r.demoted).toEqual(['deps--app']);
   });
 });
