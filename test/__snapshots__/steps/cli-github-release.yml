@@ -66,8 +66,8 @@
       "PIPEGEN_ARG_0=$PIPEGEN_ARG_0"
     )
     rc=0
-    "${pg_env[@]}" "$bin/trivy" config --config "$cfg/trivy.yaml" --disable-telemetry --skip-version-check --skip-check-update --format sarif --output trivy-config.sarif --exit-code 1 . --severity "$PIPEGEN_ARG_0" || rc=$?
-    case "$rc" in 0|1) ;; *)
+    "${pg_env[@]}" "$bin/trivy" config --config "$cfg/trivy.yaml" --disable-telemetry --skip-version-check --skip-check-update --format sarif --output trivy-config.sarif --exit-code 10 . --severity "$PIPEGEN_ARG_0" || rc=$?
+    case "$rc" in 0|10) ;; *)
       rm -rf -- "$out"
       echo "pipegen: the tool exited with $rc, so its result is not used" >&2
       exit "$rc" ;;

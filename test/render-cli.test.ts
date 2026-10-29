@@ -481,9 +481,14 @@ describe('6b: outputs (S7)', () => {
     }
     // good run: the tool writes the result and exits 1 (findings, ruling B2): file moved to pipegen-raw, the step passes
     const sb = sandbox();
-    fakeTool(sb, artifact, 'trivy', `echo '{"runs":[]}' > ./${out}\nexit 1`);
+    fakeTool(sb, artifact, 'trivy', `echo '{"runs":[]}' > ./${out}\nexit 10`);
     const res = exec(step, sb, stepEnv(step, sb));
     expect(res.status).toBe(0);
+    // exit 1 is trivy's error exit (C0a fix round 1): it fails the step and keeps nothing
+    const err = sandbox();
+    fakeTool(err, artifact, 'trivy', `echo '{"runs":[]}' > ./${out}\nexit 1`);
+    expect(exec(step, err, stepEnv(step, err)).status).toBe(1);
+    expect(existsSync(join(err.rt, 'pipegen-raw'))).toBe(false);
     expect(readFileSync(join(sb.rt, 'pipegen-raw', artifact, out), 'utf8')).toContain('"runs"');
     expect(existsSync(join(sb.ws, out))).toBe(false);
   });

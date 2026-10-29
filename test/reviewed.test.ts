@@ -68,7 +68,7 @@ function actionEntry(over: Entry = {}): Entry {
 }
 
 /** gitleaks' locked flags (ruling P21), in the command and the fixed args. */
-const GITLEAKS_ARGS = ['--ignore-gitleaks-allow', '--redact', '--report-format', 'sarif', '--report-path', 'gitleaks.sarif', '--exit-code', '1'];
+const GITLEAKS_ARGS = ['--ignore-gitleaks-allow', '--redact', '--report-format', 'sarif', '--report-path', 'gitleaks.sarif', '--exit-code', '10'];
 
 /**
  * Argv allowlists for the fixture-only ids (ruling P19 refuses a cli entry without one): the real table, plus the
@@ -479,8 +479,8 @@ function trivyEntry(over: { command?: string[]; args?: string[]; verifiedWith?: 
   const repo = over.repo ?? 'aquasecurity/trivy';
   return binEntry(repo, {
     id: 'trivy-config',
-    command: over.command ?? ['trivy', 'config', ...TRIVY_FLAGS, '--format', 'sarif', '--output', 'tool.sarif', '--exit-code', '1', '.'],
-    args: over.args ?? [...TRIVY_FLAGS, '--format', 'sarif', '--exit-code', '1'],
+    command: over.command ?? ['trivy', 'config', ...TRIVY_FLAGS, '--format', 'sarif', '--output', 'tool.sarif', '--exit-code', '10', '.'],
+    args: over.args ?? [...TRIVY_FLAGS, '--format', 'sarif', '--exit-code', '10'],
     config: { content: 'cache:\n  backend: memory\n', passAs: { flag: '--config' } },
     verifiedWith: over.verifiedWith === undefined ? verified(repo) : over.verifiedWith,
     ...(over.choices === undefined ? {} : { choices: over.choices }),
@@ -495,9 +495,9 @@ const jscpdEntry = (over: BinOver = {}) => {
   e.step.output = { path: '', format: 'none' };
   return e;
 };
-const blCmd = (...rest: string[]) => ['betterleaks', 'git', '--redact', '--report-format', 'sarif', '--report-path', 'tool.sarif', '--exit-code', '1', ...rest];
+const blCmd = (...rest: string[]) => ['betterleaks', 'git', '--redact', '--report-format', 'sarif', '--report-path', 'tool.sarif', '--exit-code', '10', ...rest];
 /** betterleaks' fixed args (P18, P21): --redact, the report format, --exit-code 1. */
-const BL_ARGS = ['--redact', '--report-format', 'sarif', '--exit-code', '1'];
+const BL_ARGS = ['--redact', '--report-format', 'sarif', '--exit-code', '10'];
 const betterleaksEntry = (over: BinOver = {}) => binEntry('betterleaks/betterleaks', {
   id: 'betterleaks', command: blCmd(), args: BL_ARGS,
   config: { content: '[extend]\nuseDefault = true\n', passAs: { flag: '--config' } }, verifiedWith: verified('betterleaks/betterleaks'), ...over,
@@ -647,7 +647,7 @@ describe('loader rules (Plan P Task 5)', () => {
   });
 
   it('reviewed: trivy argv is read with v0.76.0\'s grammar: a swallowed, late or unknown flag is refused (fix round 1)', () => {
-    const tail = ['--format', 'sarif', '--output', 'tool.sarif', '--exit-code', '1', '.'];
+    const tail = ['--format', 'sarif', '--output', 'tool.sarif', '--exit-code', '10', '.'];
     // a value-taking flag swallows the next word: --template (-t) takes --disable-telemetry as its value
     rejects([trivyEntry({ command: ['trivy', 'image', '--template', ...TRIVY_FLAGS, ...tail] })], /--disable-telemetry in effect/);
     rejects([trivyEntry({ command: ['trivy', 'image', '-t', ...TRIVY_FLAGS, ...tail] })], /--disable-telemetry in effect/);
@@ -663,8 +663,8 @@ describe('loader rules (Plan P Task 5)', () => {
     rejects([trivyEntry({ command: [...TRIVY_FLAGS, 'trivy', 'image', ...tail] })], /trivy config\|image\|fs/);
     rejects([trivyEntry({ command: ['trivy', 'plugin', 'install', 'x'], args: [] })], /trivy config\|image\|fs/);
     // shorthands read as pflag does: combined bools and glued values
-    expect(load([trivyEntry({ command: ['trivy', 'image', ...TRIVY_FLAGS, '-fsarif', '-o=tool.sarif', '--exit-code', '1', '.'], args: [...TRIVY_FLAGS, '--exit-code', '1'] })])).toHaveLength(1);
-    expect(load([trivyEntry({ command: ['trivy', 'fs', ...TRIVY_FLAGS, '--scanners', 'license', '--severity', 'HIGH,CRITICAL', '--exit-code', '1', '.'], args: [...TRIVY_FLAGS, '--exit-code', '1'] })])).toHaveLength(1);
+    expect(load([trivyEntry({ command: ['trivy', 'image', ...TRIVY_FLAGS, '-fsarif', '-o=tool.sarif', '--exit-code', '10', '.'], args: [...TRIVY_FLAGS, '--exit-code', '10'] })])).toHaveLength(1);
+    expect(load([trivyEntry({ command: ['trivy', 'fs', ...TRIVY_FLAGS, '--scanners', 'license', '--severity', 'HIGH,CRITICAL', '--exit-code', '10', '.'], args: [...TRIVY_FLAGS, '--exit-code', '10'] })])).toHaveLength(1);
     // the environment can set any flag: no TRIVY_* env at all
     const env = trivyEntry();
     env.step.cli.env = { ['TRIVY_DISABLE_' + 'TELEMETRY']: 'false' };
@@ -750,7 +750,7 @@ describe('loader rules (Plan P Task 5)', () => {
     }
     expect([...BETTERLEAKS_FORBIDDEN_SUBCOMMANDS]).toEqual(expect.arrayContaining(['validate', 'github', 'gitlab', 'huggingface', 's3']));
     expect(load([betterleaksEntry()])).toHaveLength(1);
-    expect(load([betterleaksEntry({ command: ['betterleaks', 'dir', '--redact', '--report-format', 'sarif', '--report-path', 'tool.sarif', '--exit-code', '1', '.'] })])).toHaveLength(1);
+    expect(load([betterleaksEntry({ command: ['betterleaks', 'dir', '--redact', '--report-format', 'sarif', '--report-path', 'tool.sarif', '--exit-code', '10', '.'] })])).toHaveLength(1);
     for (const flag of BETTERLEAKS_FORBIDDEN_FLAGS) {
       const re = new RegExp(`never use ${flag}`);
       rejects([betterleaksEntry({ command: blCmd(flag) })], re);
@@ -1024,7 +1024,7 @@ describe('loader rules (Plan P Task 5)', () => {
     for (const [allowed, gs] of grammars) for (const f of allowed) expect(gs.some((g) => g.value.has(f) || g.bool.has(f) || g.optional.has(f)), f).toBe(true);
     // none of the forbidden ones is allowlisted
     for (const f of BETTERLEAKS_FORBIDDEN_FLAGS) expect(BETTERLEAKS_ALLOWED_FLAGS.has(f.replace(/^-+/, ''))).toBe(false);
-    const tail = ['--format', 'sarif', '--output', 'tool.sarif', '--exit-code', '1', '.'];
+    const tail = ['--format', 'sarif', '--output', 'tool.sarif', '--exit-code', '10', '.'];
     for (const f of ['--help', '-h', '--version', '-v', '--quiet', '-q', '--debug', '--no-progress', '--skip-db-update', '--list-all-pkgs', '-qv']) {
       rejects([trivyEntry({ command: ['trivy', 'image', ...TRIVY_FLAGS, f, ...tail] })], /allowlist, ruling P13/);
     }
@@ -1038,7 +1038,7 @@ describe('loader rules (Plan P Task 5)', () => {
     rejects([betterleaksEntry({ command: blCmd('--no-color'), args: [...BL_ARGS, '--no-color'] })], /allowlist, ruling P13/);
     rejects([trivyEntry({ command: ['trivy', 'image', ...TRIVY_FLAGS, '--no-such', ...tail], args: [...TRIVY_FLAGS, '--no-such'] })], /unknown flag --no-such/);
     // allowlisted flags load (the Task 6 trivy-licence, image and betterleaks shapes)
-    expect(load([trivyEntry({ command: ['trivy', 'fs', ...TRIVY_FLAGS, '--scanners', 'license', '--severity', 'HIGH,CRITICAL', '--exit-code', '1', '.'], args: [...TRIVY_FLAGS, '--exit-code', '1'] })])).toHaveLength(1);
+    expect(load([trivyEntry({ command: ['trivy', 'fs', ...TRIVY_FLAGS, '--scanners', 'license', '--severity', 'HIGH,CRITICAL', '--exit-code', '10', '.'], args: [...TRIVY_FLAGS, '--exit-code', '10'] })])).toHaveLength(1);
     expect(load([betterleaksEntry({ command: blCmd('--no-banner', '--ignore-gitleaks-allow'), args: BL_ARGS })])).toHaveLength(1);
     expect(load([nucleiEntry({ command: nucleiCmd('-u', 'http://localhost:8080', '-ni', '-as') })])).toHaveLength(1);
   });
@@ -1046,28 +1046,28 @@ describe('loader rules (Plan P Task 5)', () => {
   it('reviewed: betterleaks --report-path is the output file, never - (findings with secrets to the CI log); --exit-code is a fixed arg (Task 5 carry-forward)', () => {
     // without --exit-code (the cases below add their own); --redact as P21 requires
     const blCmd = (...rest: string[]) => ['betterleaks', 'git', '--redact', '--report-format', 'sarif', '--report-path', 'tool.sarif', ...rest];
-    const cmd = (path: string, ...rest: string[]) => ['betterleaks', 'git', '--redact', '--report-format', 'sarif', '--report-path', path, '--exit-code', '1', ...rest];
+    const cmd = (path: string, ...rest: string[]) => ['betterleaks', 'git', '--redact', '--report-format', 'sarif', '--report-path', path, '--exit-code', '10', ...rest];
     for (const path of ['-', '/dev/stdout', '/dev/stderr', '/proc/self/fd/1', 'other.sarif']) {
       rejects([betterleaksEntry({ command: cmd(path) })], /--report-path/);
-      rejects([betterleaksEntry({ command: [...blCmd('--exit-code', '1'), `--report-path=${path}`] })], /--report-path/); // a later value wins
-      rejects([betterleaksEntry({ command: [...blCmd('--exit-code', '1'), '-r', path] })], /--report-path/);
-      rejects([betterleaksEntry({ command: [...blCmd('--exit-code', '1'), '--report-path', path], args: ['--redact', '--report-format', 'sarif', '--exit-code', '1', '--report-path', path] })], /--report-path/);
+      rejects([betterleaksEntry({ command: [...blCmd('--exit-code', '10'), `--report-path=${path}`] })], /--report-path/); // a later value wins
+      rejects([betterleaksEntry({ command: [...blCmd('--exit-code', '10'), '-r', path] })], /--report-path/);
+      rejects([betterleaksEntry({ command: [...blCmd('--exit-code', '10'), '--report-path', path], args: ['--redact', '--report-format', 'sarif', '--exit-code', '10', '--report-path', path] })], /--report-path/);
     }
     const dash = betterleaksEntry({ command: cmd('-') });
     dash.step.output = { path: '-', format: 'sarif' };
     rejects([dash], /--report-path|output path starts with/);
     // --exit-code: set by the template (in the command and the fixed args, same value, not 0), never chosen by the AI
-    const fixed = ['--redact', '--report-format', 'sarif', '--exit-code', '1'];
-    expect(load([betterleaksEntry({ command: blCmd('--exit-code', '1'), args: fixed })])).toHaveLength(1);
-    rejects([betterleaksEntry({ command: blCmd('--exit-code', '1'), args: ['--redact', '--report-format', 'sarif'] })], /--exit-code/); // not a fixed arg
-    rejects([betterleaksEntry({ command: blCmd('--exit-code', '1', '--exit-code', '0'), args: fixed })], /--exit-code/);
+    const fixed = ['--redact', '--report-format', 'sarif', '--exit-code', '10'];
+    expect(load([betterleaksEntry({ command: blCmd('--exit-code', '10'), args: fixed })])).toHaveLength(1);
+    rejects([betterleaksEntry({ command: blCmd('--exit-code', '10'), args: ['--redact', '--report-format', 'sarif'] })], /--exit-code/); // not a fixed arg
+    rejects([betterleaksEntry({ command: blCmd('--exit-code', '10', '--exit-code', '0'), args: fixed })], /--exit-code/);
     rejects([betterleaksEntry({ command: blCmd('--exit-code', '0'), args: ['--redact', '--report-format', 'sarif', '--exit-code', '0'] })], /--exit-code/);
-    rejects([betterleaksEntry({ command: blCmd('--exit-code', '1'), args: fixed, choices: { 'exit-code': ['0', '1'] } })], /exit-code/);
+    rejects([betterleaksEntry({ command: blCmd('--exit-code', '10'), args: fixed, choices: { 'exit-code': ['0', '1'] } })], /exit-code/);
     // security scan finding (fail-open): both sources are checked, not only the command
     rejects([betterleaksEntry({ command: [...blCmd(), '--', '--exit-code', '0'], args: ['--redact', '--report-format', 'sarif', '--exit-code', '0'] })], /--exit-code/); // fixed-only 0
-    rejects([betterleaksEntry({ command: [...blCmd(), '--', '--exit-code', '1'], args: ['--redact', '--report-format', 'sarif', '--exit-code', '1'] })], /--exit-code/); // fixed-only 1
+    rejects([betterleaksEntry({ command: [...blCmd(), '--', '--exit-code', '10'], args: ['--redact', '--report-format', 'sarif', '--exit-code', '10'] })], /--exit-code/); // fixed-only 1
     rejects([betterleaksEntry({ command: blCmd('--exit-code', '2'), args: ['--redact', '--report-format', 'sarif'] })], /--exit-code/); // command-only
-    rejects([betterleaksEntry({ command: blCmd('--exit-code', '1', '--exit-code', '2'), args: ['--redact', '--report-format', 'sarif', '--exit-code', '1'] })], /--exit-code/); // both, different
+    rejects([betterleaksEntry({ command: blCmd('--exit-code', '10', '--exit-code', '2'), args: ['--redact', '--report-format', 'sarif', '--exit-code', '10'] })], /--exit-code/); // both, different
     for (const zero of ['00', '+0', '0x0', '-0', ' 1', '1 ', '01']) {
       rejects([betterleaksEntry({ command: blCmd('--exit-code', zero), args: ['--redact', '--report-format', 'sarif', '--exit-code', zero] })], /--exit-code/);
       rejects([betterleaksEntry({ command: blCmd(`--exit-code=${zero}`), args: ['--redact', '--report-format', 'sarif', `--exit-code=${zero}`] })], /--exit-code/);
@@ -1078,7 +1078,7 @@ describe('loader rules (Plan P Task 5)', () => {
       rejects([betterleaksEntry({ command: blCmd(`--exit-code=${code}`), args: ['--redact', '--report-format', 'sarif', `--exit-code=${code}`] })], /--exit-code/);
     }
     // an earlier 0 overridden by a later 1 is still refused (every value must be 1)
-    rejects([betterleaksEntry({ command: blCmd('--exit-code', '0', '--exit-code', '1'), args: ['--redact', '--report-format', 'sarif', '--exit-code', '0', '--exit-code', '1'] })], /--exit-code/);
+    rejects([betterleaksEntry({ command: blCmd('--exit-code', '0', '--exit-code', '10'), args: ['--redact', '--report-format', 'sarif', '--exit-code', '0', '--exit-code', '10'] })], /--exit-code/);
   });
 
   it('reviewed: betterleaks --redact takes an optional value, as pflag reads it (NoOptDefVal "100", v1.9.0 cmd/root.go:95)', () => {
@@ -1130,10 +1130,10 @@ describe('Task 5 review probes (fix round 1)', () => {
     step: { cli: { install: { method: 'github-release', package: pkg, version }, command }, output: { path: '', format: 'none' } },
     fixedInputs: {}, choices: {}, configFiles: [], reviewedBy: 'PENDING', reviewedAt: 'PENDING', proofs: 0, ...extra,
   });
-  const pbetterleaks = () => pcli('betterleaks', 'betterleaks/betterleaks', 'v1.9.0', 'betterleaks_1.9.0_linux_x64.tar.gz', ['betterleaks', 'dir', '--redact', '--report-format', 'sarif', '--report-path', 'b.sarif', '--exit-code', '1', '.'],
+  const pbetterleaks = () => pcli('betterleaks', 'betterleaks/betterleaks', 'v1.9.0', 'betterleaks_1.9.0_linux_x64.tar.gz', ['betterleaks', 'dir', '--redact', '--report-format', 'sarif', '--report-path', 'b.sarif', '--exit-code', '10', '.'],
     {
-      fixedInputs: { args: ['--redact', '--report-format', 'sarif', '--exit-code', '1'], config: { content: '[extend]\nuseDefault = true\n', passAs: { flag: '--config' } } },
-      verifiedWith: vw('betterleaks/betterleaks', 'refs/tags/v1.9.0'), step: { cli: { install: { method: 'github-release', package: 'betterleaks_1.9.0_linux_x64.tar.gz', version: 'v1.9.0' }, command: ['betterleaks', 'dir', '--redact', '--report-format', 'sarif', '--report-path', 'b.sarif', '--exit-code', '1', '.'] }, output: { path: 'b.sarif', format: 'sarif' } },
+      fixedInputs: { args: ['--redact', '--report-format', 'sarif', '--exit-code', '10'], config: { content: '[extend]\nuseDefault = true\n', passAs: { flag: '--config' } } },
+      verifiedWith: vw('betterleaks/betterleaks', 'refs/tags/v1.9.0'), step: { cli: { install: { method: 'github-release', package: 'betterleaks_1.9.0_linux_x64.tar.gz', version: 'v1.9.0' }, command: ['betterleaks', 'dir', '--redact', '--report-format', 'sarif', '--report-path', 'b.sarif', '--exit-code', '10', '.'] }, output: { path: 'b.sarif', format: 'sarif' } },
     });
   const PNUC_ENV = { ...NUCLEI_ENV, [NUCLEI_SUM_ENV]: H };
   const pnuclei = () => {
@@ -1242,11 +1242,11 @@ describe('Task 5 review probes (fix round 1)', () => {
     [34, 'scoped token @reviewdog/action-setup in an arg', (d) => { trivy(d).step.cli.command.push('@reviewdog/action-setup'); }, NEVER_MSG],
     [35, 'npm plugin @reviewdog/reviewdog (scoped)', withAdded(pnpm, (e) => { e.step.cli.plugins = [pplugin('@reviewdog/reviewdog')]; }), NEVER_MSG],
     [36, 'trivy: --template swallows --disable-telemetry', (d) => {
-      trivy(d).step.cli.command = ['trivy', 'image', '--template', '--disable-telemetry', '--skip-version-check', '--skip-check-update', '--format', 'sarif', '--output', 'trivy-image.sarif', '--exit-code', '1'];
+      trivy(d).step.cli.command = ['trivy', 'image', '--template', '--disable-telemetry', '--skip-version-check', '--skip-check-update', '--format', 'sarif', '--output', 'trivy-image.sarif', '--exit-code', '10'];
     }, /--disable-telemetry in effect/],
     [37, 'trivy: flags only after --', (d) => {
       const e = trivy(d);
-      e.step.cli.command = ['trivy', 'image', '--format', 'sarif', '--output', 'trivy-image.sarif', '--exit-code', '1', '--', '--disable-telemetry', '--skip-version-check', '--skip-check-update'];
+      e.step.cli.command = ['trivy', 'image', '--format', 'sarif', '--output', 'trivy-image.sarif', '--exit-code', '10', '--', '--disable-telemetry', '--skip-version-check', '--skip-check-update'];
       e.fixedInputs.args = ['--format', 'sarif', '--disable-telemetry', '--skip-version-check', '--skip-check-update'];
     }, /in effect/],
     [38, 'trivy: env TRIVY_DISABLE_TELEMETRY=false', setEnv('trivy-image', 'TRIVY_DISABLE_' + 'TELEMETRY', 'false'), /TRIVY_/],
@@ -1634,7 +1634,7 @@ describe('data/reviewed-tools.yml', () => {
   });
 
   // entries re-reviewed by delegation (DECISIONS 105) after the owner's 2026-10-28 review; add an id here on purpose, never skip it
-  const DELEGATED: Record<string, string> = { 'actions-setup-node': '2026-10-29', 'docker-login-action': '2026-10-29', eslint: '2026-10-29', 'eslint-typescript': '2026-10-29', nuclei: '2026-10-29', semgrep: '2026-10-29' };
+  const DELEGATED: Record<string, string> = { 'actions-setup-node': '2026-10-29', betterleaks: '2026-10-29', gitleaks: '2026-10-29', 'trivy-config': '2026-10-29', 'trivy-image': '2026-10-29', 'trivy-licence': '2026-10-29', 'docker-login-action': '2026-10-29', eslint: '2026-10-29', 'eslint-typescript': '2026-10-29', nuclei: '2026-10-29', semgrep: '2026-10-29' };
 
   it('data: every catalogue entry is reviewed by the owner (2026-10-28, DECISIONS #104) or by delegation (listed), with proofs 0', () => {
     const list = real();
@@ -1688,7 +1688,7 @@ describe('data/reviewed-tools.yml', () => {
       expect(t.verifiedWith, t.id).toMatchObject({ method: 'cosign-bundle', asset: 'trivy_0.76.0_checksums.txt' });
     }
     expect(byId(list, 'trivy-image')[0]?.choices['ignore-unfixed']).toEqual(['false', 'true']);
-    expect(byId(list, 'trivy-licence')[0]?.fixedInputs.args).toEqual(expect.arrayContaining(['--scanners', 'license', '--severity', 'HIGH,CRITICAL', '--exit-code', '1']));
+    expect(byId(list, 'trivy-licence')[0]?.fixedInputs.args).toEqual(expect.arrayContaining(['--scanners', 'license', '--severity', 'HIGH,CRITICAL', '--exit-code', '10']));
     for (const t of list) {
       expect(neverListed(t.candidate.repo), t.id).toBeNull();
       if (t.step.action !== undefined) expect(neverListed(t.step.action.uses), t.id).toBeNull();
@@ -1736,7 +1736,7 @@ describe('data/reviewed-tools.yml', () => {
     const pub = byId(list, 'pypi-publish')[0];
     expect(Object.keys(pub?.step.action?.with ?? {})).toEqual(['attestations']);
     const bl = byId(list, 'betterleaks')[0];
-    expect(bl?.fixedInputs.args).toEqual(expect.arrayContaining(['--report-path', 'betterleaks.sarif', '--exit-code', '1']));
+    expect(bl?.fixedInputs.args).toEqual(expect.arrayContaining(['--report-path', 'betterleaks.sarif', '--exit-code', '10']));
   });
 
   it(`reviewed-tools.yml: every release was at least ${COOLDOWN_DAYS} days old when pinned (S26)`, () => {
@@ -1873,13 +1873,26 @@ describe('Task 6 review fix round 1 (P19-P27)', () => {
     for (const id of new Set(cases.map(([id]) => id))) expect(loadAt([realEntry(id)]), id).toHaveLength(1);
   });
 
-  it('P20 (I2, probe 14): trivy --exit-code is exactly 1 in the command and the fixed args, never a choice; every severity includes CRITICAL', () => {
-    const EXIT = /--exit-code 1, exactly/;
-    refused(both(realEntry('trivy-licence'), swap('1', '0')), EXIT);
+  it('C0a fix round 1: betterleaks, gitleaks and trivy report findings with exit 10, never 1 (1 is what they exit with on an error)', () => {
+    for (const id of ['betterleaks', 'gitleaks', 'trivy-config', 'trivy-image', 'trivy-licence']) {
+      const t = byId(real(), id)[0];
+      expect(t?.step.cli?.command, id).toEqual(expect.arrayContaining(['--exit-code', '10']));
+      expect(t?.fixedInputs.args, id).toEqual(expect.arrayContaining(['--exit-code', '10']));
+      expect(ARGV_POLICIES[id]?.findingsExit, id).toEqual([10]);
+      expect(t?.reviewedBy, id).toBe('Claude delegated DECISIONS 105');
+      expect(t?.reviewedAt, id).toBe('2026-10-29');
+      // the old value (1), also only in the command or only in the fixed args, no longer loads
+      refused(both(realEntry(id), swap('10', '1')), /--exit-code 10|--exit-code is a fixed arg: exactly 10|exit-code is one of "10"/);
+    }
+  });
+
+  it('P20 (I2, probe 14): trivy --exit-code is exactly 10 in the command and the fixed args, never a choice; every severity includes CRITICAL', () => {
+    const EXIT = /--exit-code 10, exactly/;
+    refused(both(realEntry('trivy-licence'), swap('10', '0')), EXIT);
     refused(both(realEntry('trivy-licence'), (xs) => xs.filter((x, i) => x !== '--exit-code' && xs[i - 1] !== '--exit-code')), EXIT);
-    refused(both(realEntry('trivy-image'), swap('1', '256')), EXIT);
+    refused(both(realEntry('trivy-image'), swap('10', '256')), EXIT);
     const fixedOnly = realEntry('trivy-config');
-    fixedOnly.fixedInputs.args = without('--exit-code', '1')(fixedOnly.fixedInputs.args);
+    fixedOnly.fixedInputs.args = without('--exit-code', '10')(fixedOnly.fixedInputs.args);
     refused(fixedOnly, EXIT);
     const choice = realEntry('trivy-image');
     choice.choices['exit-code'] = ['0', '1'];
@@ -1900,7 +1913,7 @@ describe('Task 6 review fix round 1 (P19-P27)', () => {
     refused(both(realEntry('gitleaks'), plus('-v')), NOPE);
     refused(both(realEntry('gitleaks'), plus('--verbose')), NOPE);
     refused(both(realEntry('gitleaks'), swap('gitleaks.sarif', '-')), NOPE);
-    refused(both(realEntry('gitleaks'), swap('1', '0')), NOPE);
+    refused(both(realEntry('gitleaks'), swap('10', '0')), NOPE);
     refused(both(realEntry('gitleaks'), swap('--redact', '--redact=0')), NOPE);
     refused(both(realEntry('gitleaks'), without('--redact')), NOPE);
     refused(both(realEntry('gitleaks'), without('--ignore-gitleaks-allow')), NOPE);

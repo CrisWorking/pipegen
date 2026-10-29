@@ -474,18 +474,18 @@ tools:
     step:
       cli:
         install: { method: github-release, package: "trivy_0.76.0_Linux-64bit.tar.gz", version: "v0.76.0" }
-        command: ["trivy", "config", "--disable-telemetry", "--skip-version-check", "--skip-check-update", "--format", "sarif", "--output", "trivy-config.sarif", "--exit-code", "1", "."]
+        command: ["trivy", "config", "--disable-telemetry", "--skip-version-check", "--skip-check-update", "--format", "sarif", "--output", "trivy-config.sarif", "--exit-code", "10", "."]
       output: { path: "trivy-config.sarif", format: sarif }
     fixedInputs:
-      args: ["--disable-telemetry", "--skip-version-check", "--skip-check-update", "--format", "sarif", "--exit-code", "1"]
+      args: ["--disable-telemetry", "--skip-version-check", "--skip-check-update", "--format", "sarif", "--exit-code", "10"]
       config:
         content: "# pipegen's pinned trivy config: no cache kept between runs\ncache:\n  backend: memory\n"
         passAs: { flag: "--config" }
     choices:
       severity: ["CRITICAL", "HIGH,CRITICAL", "MEDIUM,HIGH,CRITICAL"]
     configFiles: ["trivy.yaml", ".trivyignore", ".trivyignore.yaml"]
-    reviewedBy: Cristiano
-    reviewedAt: "2026-10-28"
+    reviewedBy: Claude delegated DECISIONS 105
+    reviewedAt: "2026-10-29"
     proofs: 0
     verifiedWith:
       method: cosign-bundle
@@ -520,10 +520,10 @@ tools:
     step:
       cli:
         install: { method: github-release, package: "trivy_0.76.0_Linux-64bit.tar.gz", version: "v0.76.0" }
-        command: ["trivy", "image", "--disable-telemetry", "--skip-version-check", "--skip-check-update", "--format", "sarif", "--output", "trivy-image.sarif", "--exit-code", "1"]
+        command: ["trivy", "image", "--disable-telemetry", "--skip-version-check", "--skip-check-update", "--format", "sarif", "--output", "trivy-image.sarif", "--exit-code", "10"]
       output: { path: "trivy-image.sarif", format: sarif }
     fixedInputs:
-      args: ["--disable-telemetry", "--skip-version-check", "--skip-check-update", "--format", "sarif", "--exit-code", "1"]
+      args: ["--disable-telemetry", "--skip-version-check", "--skip-check-update", "--format", "sarif", "--exit-code", "10"]
       config:
         content: "# pipegen's pinned trivy config: no cache kept between runs\ncache:\n  backend: memory\n"
         passAs: { flag: "--config" }
@@ -531,8 +531,8 @@ tools:
       severity: ["CRITICAL", "HIGH,CRITICAL", "MEDIUM,HIGH,CRITICAL"]
       ignore-unfixed: ["false", "true"]
     configFiles: ["trivy.yaml", ".trivyignore", ".trivyignore.yaml"]
-    reviewedBy: Cristiano
-    reviewedAt: "2026-10-28"
+    reviewedBy: Claude delegated DECISIONS 105
+    reviewedAt: "2026-10-29"
     proofs: 0
     verifiedWith:
       method: cosign-bundle
@@ -567,17 +567,17 @@ tools:
     step:
       cli:
         install: { method: github-release, package: "betterleaks_1.9.0_linux_x64.tar.gz", version: "v1.9.0" }
-        command: ["betterleaks", "git", "--no-banner", "--ignore-gitleaks-allow", "--redact", "--report-format", "sarif", "--report-path", "betterleaks.sarif", "--exit-code", "1", "."]
+        command: ["betterleaks", "git", "--no-banner", "--ignore-gitleaks-allow", "--redact", "--report-format", "sarif", "--report-path", "betterleaks.sarif", "--exit-code", "10", "."]
       output: { path: "betterleaks.sarif", format: sarif }
     fixedInputs:
-      args: ["--ignore-gitleaks-allow", "--redact", "--report-format", "sarif", "--report-path", "betterleaks.sarif", "--exit-code", "1"]
+      args: ["--ignore-gitleaks-allow", "--redact", "--report-format", "sarif", "--report-path", "betterleaks.sarif", "--exit-code", "10"]
       config:
         content: "[extend]\nuseDefault = true\n"
         passAs: { flag: "--config" }
     choices: {}
     configFiles: [".betterleaks.toml", ".gitleaks.toml", ".gitleaksignore", ".betterleaksignore"]
-    reviewedBy: Cristiano
-    reviewedAt: "2026-10-28"
+    reviewedBy: Claude delegated DECISIONS 105
+    reviewedAt: "2026-10-29"
     proofs: 0
     verifiedWith:
       method: cosign-bundle
@@ -587,7 +587,7 @@ tools:
       verifiedOn: "2026-10-28"
 
   # Secret scan, the fallback listed after betterleaks. Same release as data/pinned-binaries.yml (ruling S25).
-  # The same locks as betterleaks (ruling P21): --redact, --report-path its own SARIF file only, --exit-code 1, the pinned --config, no verbose output.
+  # The same locks as betterleaks (ruling P21): --redact, --report-path its own SARIF file only, --exit-code 10 (C0a fix round 1: their errors exit 1), the pinned --config, no verbose output.
   # Source: release v8.30.1 of gitleaks/gitleaks: gitleaks_8.30.1_linux_x64.tar.gz sha256 from the release checksums file. Released 2026-03-21T02:17:58Z.
   - id: gitleaks
     categories: ["secrets"]
@@ -606,17 +606,17 @@ tools:
     step:
       cli:
         install: { method: github-release, package: "gitleaks_8.30.1_linux_x64.tar.gz", version: "v8.30.1" }
-        command: ["gitleaks", "git", "--no-banner", "--ignore-gitleaks-allow", "--redact", "--report-format", "sarif", "--report-path", "gitleaks.sarif", "--exit-code", "1", "."]
+        command: ["gitleaks", "git", "--no-banner", "--ignore-gitleaks-allow", "--redact", "--report-format", "sarif", "--report-path", "gitleaks.sarif", "--exit-code", "10", "."]
       output: { path: "gitleaks.sarif", format: sarif }
     fixedInputs:
-      args: ["--ignore-gitleaks-allow", "--redact", "--report-format", "sarif", "--report-path", "gitleaks.sarif", "--exit-code", "1"]
+      args: ["--ignore-gitleaks-allow", "--redact", "--report-format", "sarif", "--report-path", "gitleaks.sarif", "--exit-code", "10"]
       config:
         content: "[extend]\nuseDefault = true\n"
         passAs: { flag: "--config" }
     choices: {}
     configFiles: [".gitleaks.toml", ".gitleaksignore"]
-    reviewedBy: Cristiano
-    reviewedAt: "2026-10-28"
+    reviewedBy: Claude delegated DECISIONS 105
+    reviewedAt: "2026-10-29"
     proofs: 0
 
   # Semgrep CE (image). Rules come only from a pinned semgrep-rules archive, never the registry (ruling S22).
@@ -1191,17 +1191,17 @@ tools:
     step:
       cli:
         install: { method: github-release, package: "trivy_0.76.0_Linux-64bit.tar.gz", version: "v0.76.0" }
-        command: ["trivy", "fs", "--disable-telemetry", "--skip-version-check", "--skip-check-update", "--scanners", "license", "--severity", "HIGH,CRITICAL", "--format", "sarif", "--output", "trivy-licence.sarif", "--exit-code", "1", "."]
+        command: ["trivy", "fs", "--disable-telemetry", "--skip-version-check", "--skip-check-update", "--scanners", "license", "--severity", "HIGH,CRITICAL", "--format", "sarif", "--output", "trivy-licence.sarif", "--exit-code", "10", "."]
       output: { path: "trivy-licence.sarif", format: sarif }
     fixedInputs:
-      args: ["--disable-telemetry", "--skip-version-check", "--skip-check-update", "--scanners", "license", "--severity", "HIGH,CRITICAL", "--format", "sarif", "--output", "trivy-licence.sarif", "--exit-code", "1"]
+      args: ["--disable-telemetry", "--skip-version-check", "--skip-check-update", "--scanners", "license", "--severity", "HIGH,CRITICAL", "--format", "sarif", "--output", "trivy-licence.sarif", "--exit-code", "10"]
       config:
         content: "# pipegen's pinned trivy config: no cache kept between runs\ncache:\n  backend: memory\n"
         passAs: { flag: "--config" }
     choices: {}
     configFiles: ["trivy.yaml", ".trivyignore", ".trivyignore.yaml"]
-    reviewedBy: Cristiano
-    reviewedAt: "2026-10-28"
+    reviewedBy: Claude delegated DECISIONS 105
+    reviewedAt: "2026-10-29"
     proofs: 0
     verifiedWith:
       method: cosign-bundle

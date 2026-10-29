@@ -400,7 +400,8 @@ describe('render-cli: the raw result folder (ruling B1 part 1)', () => {
 
 describe('ArgvPolicy.findingsExit (ruling B2)', () => {
   const FINDINGS: Record<string, readonly number[]> = {
-    'trivy-config': [1], 'trivy-image': [1], 'trivy-licence': [1], betterleaks: [1], gitleaks: [1], 'osv-scanner': [1], hadolint: [1], 'kube-linter': [1], 'zap-baseline': [1, 2], semgrep: [], nuclei: [],
+    // trivy, betterleaks and gitleaks are told to report findings with 10: their errors (and betterleaks' partial scan) exit 1 (C0a fix round 1)
+    'trivy-config': [10], 'trivy-image': [10], 'trivy-licence': [10], betterleaks: [10], gitleaks: [10], 'osv-scanner': [1], hadolint: [1], 'kube-linter': [1], 'zap-baseline': [1, 2], semgrep: [], nuclei: [],
   };
   it('findingsExit: every cli entry with a sarif or zap-json result has a list (as ruled), and no other entry has one', () => {
     const seen: string[] = [];

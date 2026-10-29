@@ -670,6 +670,8 @@ function choiceProblems(tool: string, e: Entry, known: (name: string) => boolean
 export const TRIVY_ALLOWED_FLAGS: ReadonlySet<string> = new Set([
   'disable-telemetry', 'skip-version-check', 'skip-check-update', 'format', 'output', 'exit-code', 'severity', 'scanners', 'ignore-unfixed',
 ]);
+/** The `--exit-code` of trivy, betterleaks and gitleaks: a finding is reported with 10, a code their errors never use (an error or a betterleaks partial scan exits 1). Keep equal to their `findingsExit` in tool-flags.ts. */
+const FINDINGS_EXIT_FLAG = '10';
 export const BETTERLEAKS_ALLOWED_FLAGS: ReadonlySet<string> = new Set(['report-format', 'report-path', 'no-banner', 'ignore-gitleaks-allow', 'redact', 'exit-code']);
 export const NUCLEI_ALLOWED_FLAGS: ReadonlySet<string> = new Set([
   'disable-update-check', 'templates', 'severity', 'sarif-export', 'target', 'automatic-scan', 'tags', 'no-interactsh',
@@ -759,10 +761,10 @@ function trivyProblems(e: Entry): Problem[] {
   for (const k of [...Object.keys(e.step.cli?.env ?? {}), ...Object.keys(e.fixedInputs.env ?? {})]) {
     if (/^trivy_/i.test(k)) bad(`trivy gets no ${k}: a TRIVY_* variable sets a flag outside the command pipegen checks`, 'step', 'cli', 'env');
   }
-  // ruling P20 (as P18): --exit-code exactly 1, in the command and the fixed args; 0 (or 256, …) passes any finding
+  // ruling P20 (as P18): --exit-code exactly 10, in the command and the fixed args; 0 (or 256, …) passes any finding, and 1 is what trivy exits with on an error (C0a fix round 1)
   const codes = [...p.flags, ...pa.flags].filter((f) => f.name === 'exit-code').map((f) => f.value);
-  if (lastValue(p, 'exit-code') !== '1' || lastValue(pa, 'exit-code') !== '1' || codes.some((v) => v !== '1')) {
-    bad('trivy must run with --exit-code 1, exactly, in the command and fixedInputs.args (trivy exits 0 on findings by default, and 0 or 256 passes them; ruling P20)', 'fixedInputs', 'args');
+  if (lastValue(p, 'exit-code') !== FINDINGS_EXIT_FLAG || lastValue(pa, 'exit-code') !== FINDINGS_EXIT_FLAG || codes.some((v) => v !== FINDINGS_EXIT_FLAG)) {
+    bad(`trivy must run with --exit-code ${FINDINGS_EXIT_FLAG}, exactly, in the command and fixedInputs.args (trivy exits 0 on findings by default, 0 or 256 passes them, and 1 is its error exit, so a finding must not share it; ruling P20)`, 'fixedInputs', 'args');
   }
   // P20: every severity list (command, fixed args, choices) includes CRITICAL; UNKNOWN or LOW alone blocks on nothing that matters
   const severities = [...p.flags, ...pa.flags].filter((f) => f.name === 'severity').map((f) => f.value);
@@ -856,11 +858,11 @@ function betterleaksProblems(e: Entry): Problem[] {
       bad(`betterleaks --report-path must be the entry's output file (${outPath || 'none'}), never - or a device: anything else can print the findings, secrets included, into the CI log`, 'step', 'cli', 'command');
     }
     // --exit-code (ruling P18): fixed by the template, in the command AND the fixed args (both or neither), and every
-    // value exactly 1. 0 (or 00, +0, 0x0) passes a scan that found secrets, and so does 256, 512, … (the process exit
+    // value exactly 10. 0 (or 00, +0, 0x0) passes a scan that found secrets, and so does 256, 512, … (the process exit
     // status is the code modulo 256)
     const codes = [...p.flags, ...pa.flags].filter((f) => f.name === 'exit-code').map((f) => f.value);
-    if (lastValue(p, 'exit-code') !== '1' || lastValue(pa, 'exit-code') !== '1' || codes.some((v) => v !== '1')) {
-      bad('betterleaks --exit-code is a fixed arg: exactly 1, in the command and fixedInputs.args (0, or 256 and its multiples, would pass a scan that found secrets; ruling P18)', 'fixedInputs', 'args');
+    if (lastValue(p, 'exit-code') !== FINDINGS_EXIT_FLAG || lastValue(pa, 'exit-code') !== FINDINGS_EXIT_FLAG || codes.some((v) => v !== FINDINGS_EXIT_FLAG)) {
+      bad(`betterleaks --exit-code is a fixed arg: exactly ${FINDINGS_EXIT_FLAG}, in the command and fixedInputs.args (0, or 256 and its multiples, would pass a scan that found secrets, and 1 is the exit of an error or a partial scan; ruling P18, C0a fix round 1)`, 'fixedInputs', 'args');
     }
     // --redact (P21): findings are redacted in the report and the log, in the command and the fixed args
     if (lastValue(p, 'redact') === undefined || lastValue(pa, 'redact') === undefined) bad('betterleaks runs with --redact, in the command and fixedInputs.args (ruling P21: the secret never reaches the report or the log)', 'step', 'cli', 'command');

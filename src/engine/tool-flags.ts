@@ -173,6 +173,8 @@ export interface ArgvPolicy extends CommandPolicy {
 const DEDICATED = (exe: string, pkg: string, config?: ArgvPolicy['config']): ArgvPolicy => ({ method: 'github-release', package: pkg, exe, dialect: 'long', sub: [], flags: {}, dedicated: true, ...(config === undefined ? {} : { config }) });
 /** The exit codes of a findings tool that mean "found something" (ArgvPolicy.findingsExit): 1 for most, none for a tool that exits 0 on findings. */
 const FOUND_1 = [1] as const;
+/** trivy, betterleaks and gitleaks are told `--exit-code 10`: their errors, and betterleaks' partial scan, exit 1, so 1 can not also mean a finding (C0a fix round 1). */
+const FOUND_10 = [10] as const;
 const TRIVY_CONFIG = { flag: '--config', content: "# pipegen's pinned trivy config: no cache kept between runs\ncache:\n  backend: memory\n", fileName: 'trivy.yaml' } as const;
 const GH = 'github-release' as const;
 const TRIVY_ASSET = 'trivy_0.76.0_Linux-64bit.tar.gz';
@@ -189,10 +191,10 @@ const ESLINT_TS_FILES = "files: ['**/*.{js,mjs,cjs,jsx,ts,mts,cts,tsx,vue,svelte
  * on a list (P20).
  */
 const POLICIES = {
-  'trivy-config': { ...DEDICATED('trivy', TRIVY_ASSET, TRIVY_CONFIG), findingsExit: FOUND_1 },
-  'trivy-image': { ...DEDICATED('trivy', TRIVY_ASSET, TRIVY_CONFIG), slots: { '': 'image-digest' }, findingsExit: FOUND_1 },
-  'trivy-licence': { ...DEDICATED('trivy', TRIVY_ASSET, TRIVY_CONFIG), findingsExit: FOUND_1 },
-  betterleaks: { ...DEDICATED('betterleaks', 'betterleaks_1.9.0_linux_x64.tar.gz', { flag: '--config', content: '[extend]\nuseDefault = true\n', fileName: 'betterleaks.toml' }), findingsExit: FOUND_1 },
+  'trivy-config': { ...DEDICATED('trivy', TRIVY_ASSET, TRIVY_CONFIG), findingsExit: FOUND_10 },
+  'trivy-image': { ...DEDICATED('trivy', TRIVY_ASSET, TRIVY_CONFIG), slots: { '': 'image-digest' }, findingsExit: FOUND_10 },
+  'trivy-licence': { ...DEDICATED('trivy', TRIVY_ASSET, TRIVY_CONFIG), findingsExit: FOUND_10 },
+  betterleaks: { ...DEDICATED('betterleaks', 'betterleaks_1.9.0_linux_x64.tar.gz', { flag: '--config', content: '[extend]\nuseDefault = true\n', fileName: 'betterleaks.toml' }), findingsExit: FOUND_10 },
   nuclei: { ...DEDICATED('nuclei', 'nuclei_3.11.1_linux_amd64.zip'), slots: { '-target': 'local-url' }, findingsExit: [],
     archive: { repo: 'projectdiscovery/nuclei-templates', commitEnv: 'PIPEGEN_NUCLEI_TEMPLATES_COMMIT', treeEnv: 'PIPEGEN_NUCLEI_TEMPLATES_TREE', dir: '/pipegen-nuclei-templates' } },
   // ruling P28: the image entries too. registry runs the image's own entrypoint, nothing else
@@ -217,9 +219,9 @@ const POLICIES = {
   },
   // gitleaks 8.30.1 (`gitleaks git --help`), the secrets fallback (P21): the same locks as betterleaks
   gitleaks: { method: GH, package: 'gitleaks_8.30.1_linux_x64.tar.gz',
-    exe: 'gitleaks', dialect: 'long', sub: ['git'], positionals: ['.'], findingsExit: FOUND_1,
-    flags: { 'no-banner': 'bool', 'ignore-gitleaks-allow': 'bool', redact: { values: ['', '100'], optional: true }, 'report-format': { values: ['sarif'] }, 'report-path': 'output', 'exit-code': { values: ['1'] } },
-    required: { 'ignore-gitleaks-allow': 'true', redact: '', 'report-format': 'sarif', 'report-path': null, 'exit-code': '1' },
+    exe: 'gitleaks', dialect: 'long', sub: ['git'], positionals: ['.'], findingsExit: FOUND_10,
+    flags: { 'no-banner': 'bool', 'ignore-gitleaks-allow': 'bool', redact: { values: ['', '100'], optional: true }, 'report-format': { values: ['sarif'] }, 'report-path': 'output', 'exit-code': { values: ['10'] } },
+    required: { 'ignore-gitleaks-allow': 'true', redact: '', 'report-format': 'sarif', 'report-path': null, 'exit-code': '10' },
     config: { flag: '--config', content: '[extend]\nuseDefault = true\n', fileName: 'gitleaks.toml' },
   },
   // osv-scanner v2.7.0
