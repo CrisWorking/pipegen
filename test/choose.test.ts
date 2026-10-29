@@ -113,6 +113,15 @@ describe('choose: lint', () => {
     expect(idOf(choose('type-check', py()).tool)).toBe('mypy');
     expect(ownTool(choose('type-check', py({ configs: ['pyright'] }))).tool).toBe('pyright');
   });
+  it('choose: Ruff configured ([tool.ruff] or ruff.toml) → the repo\'s own Ruff for lint, never "no Python linter configured" (hand checks, P55)', () => {
+    const py = (q: Partial<Service['quality']> = {}) => profile([svc({ language: 'python', packageManager: 'uv' }, q)]);
+    for (const configs of [['ruff'], ['ruff', 'mypy'], ['ruff', 'flake8']] as Service['quality']['configs'][]) {
+      const c = choose('lint', py({ configs }));
+      expect(ownTool(c)).toMatchObject({ kind: 'repo-tool', tool: 'ruff' });
+      expect(c.note).toContain('Ruff is already configured');
+      expect(c.note).not.toContain('no Python linter configured');
+    }
+  });
   it('choose: a node tool is never picked for a Python service, nor a Python tool for Node', () => {
     const py = profile([svc({ language: 'python', packageManager: 'pip' })]);
     expect(JSON.stringify(choose('lint', py, [fixtureTool('biome', ['lint'], ['node'])]))).not.toContain('biome');

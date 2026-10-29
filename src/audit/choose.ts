@@ -105,6 +105,8 @@ const eslintUiNote = (q: Service['quality']): string => (q.uiFrameworks.some((f)
 function lintRule(c: Ctx): Choice {
   const { q } = c;
   if (c.lang === 'python') {
+    // hand checks (P55): Ruff configured ([tool.ruff], ruff.toml) is the repo's own linter too, and comes first
+    if (q.configs.includes('ruff')) return own(c, 'ruff', null, 'Ruff is already configured');
     const configured = q.configs.find((x) => x === 'flake8' || x === 'pylint');
     return configured !== undefined ? own(c, configured, null, `${configured} is already configured`) : reviewed(c, T.ruff, 'Ruff: no Python linter configured');
   }
