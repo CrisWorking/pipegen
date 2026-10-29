@@ -892,6 +892,9 @@ tools:
     proofs: 0
 
   # ESLint for JavaScript repos whose framework needs ESLint plugins (catalogue §2). Flat config only.
+  # 6c (ruling S11): plugin @eslint/js@10.0.1 (npm dist.integrity, the tarball hashes to it; published 2026-02-06T22:34:56Z, peer eslint ^10) for js.configs.recommended.
+  #   The config is written into pipegen's isolated closure folder (DECISIONS #107), so '@eslint/js' resolves there and the repo's copy is never read.
+  #   Re-reviewed by delegation on 2026-10-29 (DECISIONS #105); same for eslint-typescript below.
   # Source: npm eslint@10.13.0 dist.integrity (the downloaded tarball hashes to it), published 2026-10-16T14:24:10.765Z; npm provenance: no.
   # pipegen's pinned flat config sets complexity 15; never eslint-config-prettier or eslint-plugin-prettier (CVE-2025-54313).
   # It lints .jsx and the framework files too (ruling P25): without their ESLint parser (not pinned here; owner review), a
@@ -913,17 +916,19 @@ tools:
     step:
       cli:
         install: { method: npm, package: "eslint", version: "10.13.0" }
+        plugins:
+          - { method: npm, package: "@eslint/js", version: "10.0.1", checksum: "sha512-zeR9k5pd4gxjZ0abRoIaxdc7I3nDktoXZk2qOv9gCNWx3mVwEn32VRhyLaRsDiJjTs0xq/T8mfPtyuXu7GWBcA==" }
         command: ["eslint", "--max-warnings", "0", "."]
       output: { path: "", format: none }
     fixedInputs:
       args: ["--max-warnings", "0"]
       config:
-        content: "export default [{ files: ['**/*.{js,mjs,cjs,jsx,vue,svelte,astro}'], languageOptions: { parserOptions: { ecmaFeatures: { jsx: true } } }, rules: { complexity: ['error', 15] } }];\n"
+        content: "import js from '@eslint/js';\nexport default [js.configs.recommended, { files: ['**/*.{js,mjs,cjs,jsx,vue,svelte,astro}'], languageOptions: { parserOptions: { ecmaFeatures: { jsx: true } } }, rules: { complexity: ['error', 15] } }];\n"
         passAs: { flag: "--config" }
     choices: {}
     configFiles: ["eslint.config.js", "eslint.config.mjs", "eslint.config.cjs", "eslint.config.ts", "eslint.config.mts", "eslint.config.cts"]
-    reviewedBy: Cristiano
-    reviewedAt: "2026-10-28"
+    reviewedBy: Claude delegated DECISIONS 105
+    reviewedAt: "2026-10-29"
     proofs: 0
 
   # ESLint with typescript-eslint, for TypeScript before 7 (typescript-eslint 8.72.0 peers: typescript >=4.8.4 <6.1.0).
@@ -948,17 +953,18 @@ tools:
         install: { method: npm, package: "eslint", version: "10.13.0" }
         plugins:
           - { method: npm, package: "typescript-eslint", version: "8.72.0", checksum: "sha512-r26Fkc8As+mZvqp7SLsMmNFyYUup/6CjK7/eHBHmhOw6GH6n6YFxHVFrG0jN1c5CMpDzelLPxvgeCOzx7BjN+A==" }
+          - { method: npm, package: "@eslint/js", version: "10.0.1", checksum: "sha512-zeR9k5pd4gxjZ0abRoIaxdc7I3nDktoXZk2qOv9gCNWx3mVwEn32VRhyLaRsDiJjTs0xq/T8mfPtyuXu7GWBcA==" }
         command: ["eslint", "--max-warnings", "0", "."]
       output: { path: "", format: none }
     fixedInputs:
       args: ["--max-warnings", "0"]
       config:
-        content: "import tseslint from 'typescript-eslint';\nexport default [...tseslint.configs.recommended, { files: ['**/*.{js,mjs,cjs,jsx,ts,mts,cts,tsx,vue,svelte,astro}'], rules: { complexity: ['error', 15] } }];\n"
+        content: "import js from '@eslint/js';\nimport tseslint from 'typescript-eslint';\nexport default [js.configs.recommended, ...tseslint.configs.recommended, { files: ['**/*.{js,mjs,cjs,jsx,ts,mts,cts,tsx,vue,svelte,astro}'], rules: { complexity: ['error', 15] } }];\n"
         passAs: { flag: "--config" }
     choices: {}
     configFiles: ["eslint.config.js", "eslint.config.mjs", "eslint.config.cjs", "eslint.config.ts", "eslint.config.mts", "eslint.config.cts"]
-    reviewedBy: Cristiano
-    reviewedAt: "2026-10-28"
+    reviewedBy: Claude delegated DECISIONS 105
+    reviewedAt: "2026-10-29"
     proofs: 0
 
   # Oxlint's type-aware rules (tsgolint), next to ESLint for TypeScript 7 and later (typescript-eslint doesn't support it).
@@ -1353,6 +1359,9 @@ tools:
   # Templates (G4, rulings PS30 and P3): nuclei-templates v10.5.0 (released 2026-10-05T07:27:40Z; tag commit
   #   f8b8b8dcd70d93826c3767e1829ef8243af9f03b). On pin day GitHub's tag archive (the URL below) hashed to exactly the
   #   sha256 the release's nuclei-templates-10.5.0_checksums.txt lists for nuclei-templates-10.5.0.tar.gz.
+  # 6c (ruling S12): PIPEGEN_NUCLEI_TEMPLATES_COMMIT is that tag commit (GitHub API refs/tags/v10.5.0 -> commit, read 2026-10-29) and
+  #   PIPEGEN_NUCLEI_TEMPLATES_TREE its git tree (GitHub API git/commits/<sha> .tree.sha, read 2026-10-29). The renderer fetches the commit
+  #   with git and checks HEAD and HEAD^{tree} against them. Re-reviewed by delegation on 2026-10-29 (DECISIONS #105).
   # -duc: no update check; -t: only the verified templates; -ni: no interactsh callbacks to ProjectDiscovery's servers.
   - id: nuclei
     categories: ["dast"]
@@ -1375,16 +1384,20 @@ tools:
         env:
           PIPEGEN_NUCLEI_TEMPLATES_URL: "https://github.com/projectdiscovery/nuclei-templates/archive/refs/tags/v10.5.0.tar.gz"
           PIPEGEN_NUCLEI_TEMPLATES_SHA256: "80fbabceca095fac40afecc7f023748df22b9576b9ff10a4422bd2fbf81f9a41"
+          PIPEGEN_NUCLEI_TEMPLATES_COMMIT: "f8b8b8dcd70d93826c3767e1829ef8243af9f03b"
+          PIPEGEN_NUCLEI_TEMPLATES_TREE: "041a8a68269d2408f0853060f3f5e793938fdbf6"
       output: { path: "nuclei.sarif", format: sarif }
     fixedInputs:
       args: ["-duc", "-t", "/pipegen-nuclei-templates", "-severity", "medium,high,critical", "-ni"]
       env:
         PIPEGEN_NUCLEI_TEMPLATES_URL: "https://github.com/projectdiscovery/nuclei-templates/archive/refs/tags/v10.5.0.tar.gz"
         PIPEGEN_NUCLEI_TEMPLATES_SHA256: "80fbabceca095fac40afecc7f023748df22b9576b9ff10a4422bd2fbf81f9a41"
+        PIPEGEN_NUCLEI_TEMPLATES_COMMIT: "f8b8b8dcd70d93826c3767e1829ef8243af9f03b"
+        PIPEGEN_NUCLEI_TEMPLATES_TREE: "041a8a68269d2408f0853060f3f5e793938fdbf6"
     choices: {}
     configFiles: []
-    reviewedBy: Cristiano
-    reviewedAt: "2026-10-28"
+    reviewedBy: Claude delegated DECISIONS 105
+    reviewedAt: "2026-10-29"
     proofs: 0
 
   # OpenSSF Scorecard, weekly; reported, never gated. Results are never published (publish_results false; catalogue §3 SD5).

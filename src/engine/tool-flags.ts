@@ -204,12 +204,12 @@ const POLICIES = {
   // ESLint 10.13.0: no warnings allowed; the pinned flat config lints the framework files too (P25)
   eslint: { method: 'npm', package: 'eslint', npmBin: 'bin/eslint.js',
     exe: 'eslint', dialect: 'long', sub: [], positionals: ['.'], flags: { 'max-warnings': { values: ['0'] } }, required: { 'max-warnings': '0' },
-    config: { flag: '--config', content: `export default [{ ${ESLINT_FILES}, languageOptions: { parserOptions: { ecmaFeatures: { jsx: true } } }, rules: { complexity: ['error', 15] } }];\n`, fileName: 'eslint.config.mjs' },
+    config: { flag: '--config', content: [`import js from`, `'@eslint/js';\nexport default [js.configs.recommended, { ${ESLINT_FILES}, languageOptions: { parserOptions: { ecmaFeatures: { jsx: true } } }, rules: { complexity: ['error', 15] } }];\n`].join(' '), fileName: 'eslint.config.mjs' },
   },
   'eslint-typescript': { method: 'npm', package: 'eslint', npmBin: 'bin/eslint.js',
     exe: 'eslint', dialect: 'long', sub: [], positionals: ['.'], flags: { 'max-warnings': { values: ['0'] } }, required: { 'max-warnings': '0' },
-    // built in two parts so the bundled CLI holds no import statement of a non-node module (test/package.test.ts)
-    config: { flag: '--config', content: [`import tseslint from`, `'typescript-eslint';\nexport default [...tseslint.configs.recommended, { ${ESLINT_TS_FILES}, rules: { complexity: ['error', 15] } }];\n`].join(' '), fileName: 'eslint.config.mjs' },
+    // built in parts so the bundled CLI holds no import statement of a non-node module (test/package.test.ts)
+    config: { flag: '--config', content: [`import js from`, `'@eslint/js';\nimport tseslint from`, `'typescript-eslint';\nexport default [js.configs.recommended, ...tseslint.configs.recommended, { ${ESLINT_TS_FILES}, rules: { complexity: ['error', 15] } }];\n`].join(' '), fileName: 'eslint.config.mjs' },
   },
   // Oxlint 1.89.0
   'oxlint-typeaware': { method: 'npm', package: 'oxlint', npmBin: 'bin/oxlint', closureEnv: { OXLINT_TSGOLINT_PATH: 'node_modules/.bin/tsgolint' },

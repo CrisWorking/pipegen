@@ -33,7 +33,7 @@ type Artifact =
   | { type: 'asset'; owner: string; repo: string; tag: string; asset: string; sha256: string }
   | { type: 'docker'; owner: string; image: string; tag: string; digest: string }
   /** An archive a tool downloads at run time, pinned in step.cli.env (nuclei templates: a release tag's tarball). */
-  | { type: 'templates'; owner: string; url: string; tag: string; sha256: string }
+  | { type: 'templates'; owner: string; url: string; tag: string; sha256: string; commit: string; tree: string }
   /** semgrep rules: a repo archive at a commit, tied by the commit's tree. */
   | { type: 'rules'; owner: string; url: string; repo: string; commit: string; tree: string };
 
@@ -58,7 +58,7 @@ function artifacts(): Artifact[] {
     const env = (t.step?.cli?.env ?? {}) as Obj;
     if (env.PIPEGEN_NUCLEI_TEMPLATES_URL) {
       const m = /\/(v\d+\.\d+\.\d+)\.tar\.gz$/.exec(env.PIPEGEN_NUCLEI_TEMPLATES_URL);
-      out.push({ type: 'templates', owner: t.id, url: env.PIPEGEN_NUCLEI_TEMPLATES_URL, tag: m?.[1] as string, sha256: env.PIPEGEN_NUCLEI_TEMPLATES_SHA256 });
+      out.push({ type: 'templates', owner: t.id, url: env.PIPEGEN_NUCLEI_TEMPLATES_URL, tag: m?.[1] as string, sha256: env.PIPEGEN_NUCLEI_TEMPLATES_SHA256, commit: env.PIPEGEN_NUCLEI_TEMPLATES_COMMIT, tree: env.PIPEGEN_NUCLEI_TEMPLATES_TREE });
     }
     if (env.PIPEGEN_RULES_URL) {
       const m = /^https:\/\/github\.com\/([^/]+\/[^/]+)\/archive\/([0-9a-f]{40})\.tar\.gz$/.exec(env.PIPEGEN_RULES_URL);
@@ -156,7 +156,8 @@ function upstream(dateOf: (a: Artifact) => string, hashOf: (a: Artifact, pinned:
       const text = `${hashOf(a, a.sha256)}  nuclei-templates-${ver}.tar.gz\n`;
       routes.set(sumsUrl, { text });
       // the tag's commit, on the repo's default branch (P44)
-      const tagCommit = sha256(a.tag).slice(0, 40);
+      const tagCommit = a.commit;
+      routes.set(gh(`${NT}/git/commits/${tagCommit}`), { sha: tagCommit, tree: { sha: hashOf(a, a.tree) } });
       routes.set(gh(`${NT}/git/ref/tags/${a.tag}`), { object: { type: 'commit', sha: tagCommit } });
       routes.set(gh(NT), { default_branch: 'main' });
       routes.set(gh(`${NT}/compare/${tagCommit}...main?per_page=1`), { status: 'ahead', behind_by: 0, merge_base_commit: { sha: tagCommit } });
@@ -200,8 +201,8 @@ describe('cooldown: the real data', () => {
     // 16 pinned-binary platforms, the nuclei templates archive and the semgrep rules archive
     const count = (t: Artifact['type']) => ALL.filter((a) => a.type === t).length;
     expect({ action: count('action'), docker: count('docker'), asset: count('asset'), npm: count('npm'), pypi: count('pypi'), templates: count('templates'), rules: count('rules') })
-      .toEqual({ action: 14, docker: 3, asset: 36, npm: 14, pypi: 8, templates: 1, rules: 1 });
-    expect(ALL).toHaveLength(77);
+      .toEqual({ action: 14, docker: 3, asset: 36, npm: 16, pypi: 8, templates: 1, rules: 1 });
+    expect(ALL).toHaveLength(79);
     // each plugin is its own artifact (biome's binary, oxlint's three, bandit's two)
     expect(ALL.filter((a) => a.owner === 'oxlint-typeaware').map((a) => (a.type === 'npm' ? a.name : '')).sort()).toEqual(['@oxlint-tsgolint/linux-x64', '@oxlint/binding-linux-x64-gnu', 'oxlint', 'oxlint-tsgolint']);
   });
@@ -255,7 +256,7 @@ describe('cooldown: the real data', () => {
       else if (a.type === 'pypi' || a.type === 'asset') covered.add(a.sha256);
       else if (a.type === 'action') covered.add(a.sha);
       else if (a.type === 'docker') covered.add(a.digest);
-      else if (a.type === 'templates') covered.add(a.url).add(a.sha256);
+      else if (a.type === 'templates') covered.add(a.url).add(a.sha256).add(a.commit).add(a.tree);
       else covered.add(a.url).add(a.commit).add(a.tree);
     }
     for (const [, b] of Object.entries(parse(FILES['data/pinned-binaries.yml']) as Obj)) for (const p of Object.values(b.platforms as Obj)) covered.add(p.url);

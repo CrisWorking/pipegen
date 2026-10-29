@@ -422,7 +422,9 @@ const NUCLEI_URL_ENV = ['PIPEGEN', 'NUCLEI', 'TEMPLATES', 'URL'].join('_');
 const NUCLEI_SUM_ENV = ['PIPEGEN', 'NUCLEI', 'TEMPLATES', 'SHA256'].join('_');
 const NUCLEI_DIR = '/pipegen-nuclei-templates';
 const NUCLEI_URL = 'https://github.com/projectdiscovery/nuclei-templates/archive/refs/tags/v10.5.0.tar.gz';
-const NUCLEI_ENV = { [NUCLEI_URL_ENV]: NUCLEI_URL, [NUCLEI_SUM_ENV]: SUM };
+const NUCLEI_COMMIT_ENV = ['PIPEGEN', 'NUCLEI', 'TEMPLATES', 'COMMIT'].join('_');
+const NUCLEI_TREE_ENV = ['PIPEGEN', 'NUCLEI', 'TEMPLATES', 'TREE'].join('_');
+const NUCLEI_ENV = { [NUCLEI_URL_ENV]: NUCLEI_URL, [NUCLEI_SUM_ENV]: SUM, [NUCLEI_COMMIT_ENV]: 'f8b8b8dcd70d93826c3767e1829ef8243af9f03b', [NUCLEI_TREE_ENV]: '041a8a68269d2408f0853060f3f5e793938fdbf6' };
 
 type BinOver = { id?: string; command?: string[]; args?: string[]; env?: Record<string, string>; config?: Entry | null; verifiedWith?: Entry | null; choices?: Entry };
 /** A release-binary entry for any repo, valid unless the test breaks it (cliEntry with the parts the test names). */
@@ -799,7 +801,13 @@ describe('loader rules (Plan P Task 5)', () => {
     rejects([nucleiEntry({ command: ['nuclei', '-duc', '-severity', 'high'], args: ['-duc'] })], /-t/);
     rejects([nucleiEntry({ args: ['-duc'] })], /-t/);
     // the pinned archive: an official nuclei-templates release tarball and its sha256
-    rejects([nucleiEntry({ env: { [NUCLEI_SUM_ENV]: SUM } })], new RegExp(NUCLEI_URL_ENV));
+    rejects([nucleiEntry({ env: { ...NUCLEI_ENV, [NUCLEI_SUM_ENV]: SUM, [NUCLEI_URL_ENV]: undefined as unknown as string } })], new RegExp(NUCLEI_URL_ENV));
+    // 6c (S12): the commit and its git tree, checked by the renderer after the fetch
+    for (const k of [NUCLEI_COMMIT_ENV, NUCLEI_TREE_ENV]) {
+      const { [k]: _gone, ...without } = NUCLEI_ENV;
+      rejects([nucleiEntry({ env: without })], new RegExp(k));
+      for (const bad of ['abc', 'F'.repeat(40), 'g'.repeat(40), `${'a'.repeat(40)}\n`]) rejects([nucleiEntry({ env: { ...NUCLEI_ENV, [k]: bad } })], new RegExp(k));
+    }
     rejects([nucleiEntry({ env: { ...NUCLEI_ENV, [NUCLEI_URL_ENV]: 'https://github.com/evil/nuclei-templates/archive/refs/tags/v10.5.0.tar.gz' } })], new RegExp(NUCLEI_URL_ENV));
     rejects([nucleiEntry({ env: { ...NUCLEI_ENV, [NUCLEI_URL_ENV]: 'https://github.com/projectdiscovery/nuclei-templates/archive/refs/heads/main.tar.gz' } })], new RegExp(NUCLEI_URL_ENV));
     rejects([nucleiEntry({ env: { ...NUCLEI_ENV, [NUCLEI_URL_ENV]: 'https://github.com/ProjectDiscovery/nuclei-templates/archive/refs/tags/v10.5.0.tar.gz' } })], new RegExp(NUCLEI_URL_ENV));
@@ -1126,7 +1134,7 @@ describe('Task 5 review probes (fix round 1)', () => {
       fixedInputs: { args: ['--redact', '--report-format', 'sarif', '--exit-code', '1'], config: { content: '[extend]\nuseDefault = true\n', passAs: { flag: '--config' } } },
       verifiedWith: vw('betterleaks/betterleaks', 'refs/tags/v1.9.0'), step: { cli: { install: { method: 'github-release', package: 'betterleaks_1.9.0_linux_x64.tar.gz', version: 'v1.9.0' }, command: ['betterleaks', 'dir', '--redact', '--report-format', 'sarif', '--report-path', 'b.sarif', '--exit-code', '1', '.'] }, output: { path: 'b.sarif', format: 'sarif' } },
     });
-  const PNUC_ENV = { [NUCLEI_URL_ENV]: NUCLEI_URL, [NUCLEI_SUM_ENV]: H };
+  const PNUC_ENV = { ...NUCLEI_ENV, [NUCLEI_SUM_ENV]: H };
   const pnuclei = () => {
     const e = pcli('nuclei', 'projectdiscovery/nuclei', 'v3.11.1', 'nuclei_3.11.1_linux_amd64.zip', ['nuclei', '-duc', '-t', NUCLEI_DIR, '-u', 'http://localhost:8080', '-sarif-export', 'n.sarif']);
     e.categories = ['dast'];
@@ -1566,8 +1574,8 @@ describe('data/reviewed-tools.yml', () => {
   const CATALOGUE: Record<string, [string, string, string[]]> = {
     betterleaks: ['betterleaks/betterleaks', 'v1.9.0', []],
     biome: ['biomejs/biome', '2.5.15', ['@biomejs/cli-linux-x64@2.5.15']],
-    eslint: ['eslint/eslint', '10.13.0', []],
-    'eslint-typescript': ['eslint/eslint', '10.13.0', ['typescript-eslint@8.72.0']],
+    eslint: ['eslint/eslint', '10.13.0', ['@eslint/js@10.0.1']],
+    'eslint-typescript': ['eslint/eslint', '10.13.0', ['typescript-eslint@8.72.0', '@eslint/js@10.0.1']],
     'oxlint-typeaware': ['oxc-project/oxc', '1.89.0', ['@oxlint/binding-linux-x64-gnu@1.89.0', 'oxlint-tsgolint@7.0.2004', '@oxlint-tsgolint/linux-x64@7.0.2004']],
     prettier: ['prettier/prettier', '3.9.10', []],
     'vitest-coverage': ['vitest-dev/vitest', '5.0.5', ['@vitest/coverage-v8@5.0.5']],
@@ -1619,11 +1627,13 @@ describe('data/reviewed-tools.yml', () => {
     expect(byId(list, 'nuclei')[0]?.fixedInputs.env).toEqual({
       PIPEGEN_NUCLEI_TEMPLATES_URL: 'https://github.com/projectdiscovery/nuclei-templates/archive/refs/tags/v10.5.0.tar.gz',
       PIPEGEN_NUCLEI_TEMPLATES_SHA256: '80fbabceca095fac40afecc7f023748df22b9576b9ff10a4422bd2fbf81f9a41',
+      PIPEGEN_NUCLEI_TEMPLATES_COMMIT: 'f8b8b8dcd70d93826c3767e1829ef8243af9f03b',
+      PIPEGEN_NUCLEI_TEMPLATES_TREE: '041a8a68269d2408f0853060f3f5e793938fdbf6',
     });
   });
 
   // entries re-reviewed by delegation (DECISIONS 105) after the owner's 2026-10-28 review; add an id here on purpose, never skip it
-  const DELEGATED: Record<string, string> = { 'actions-setup-node': '2026-10-29', 'docker-login-action': '2026-10-29' };
+  const DELEGATED: Record<string, string> = { 'actions-setup-node': '2026-10-29', 'docker-login-action': '2026-10-29', eslint: '2026-10-29', 'eslint-typescript': '2026-10-29', nuclei: '2026-10-29' };
 
   it('data: every catalogue entry is reviewed by the owner (2026-10-28, DECISIONS #104) or by delegation (listed), with proofs 0', () => {
     const list = real();

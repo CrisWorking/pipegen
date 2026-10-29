@@ -155,3 +155,15 @@ describe('readsOnly: a run step is repo code unless its policy says it only read
     expect(steps('eslint').at(-1)?.id).toMatch(/^checker-run-/);
   });
 });
+
+describe('S11: the ESLint configs start from @eslint/js recommended (pinned plugin, isolated closure)', () => {
+  it('both entries pin @eslint/js and their configs use js.configs.recommended; policy and data agree', () => {
+    for (const id of ['eslint', 'eslint-typescript']) {
+      const t = entry(id);
+      expect(t.step.cli?.plugins?.map((p) => p.package), id).toContain('@eslint/js');
+      expect(t.fixedInputs.config?.content, id).toContain("import js from '@eslint/js'");
+      expect(t.fixedInputs.config?.content, id).toContain('js.configs.recommended');
+      expect(ARGV_POLICIES[id]?.config?.content, id).toBe(t.fixedInputs.config?.content);
+    }
+  });
+});

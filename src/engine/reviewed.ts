@@ -123,6 +123,9 @@ export const SEMGREP_RULES_DIR = '/pipegen-rules';
 /** The Nuclei templates archive (catalogue §3 MG5, ruling PS30): an official nuclei-templates release tarball and its sha256. */
 export const NUCLEI_TEMPLATES_URL_ENV = 'PIPEGEN_NUCLEI_TEMPLATES_URL';
 export const NUCLEI_TEMPLATES_SHA256_ENV = 'PIPEGEN_NUCLEI_TEMPLATES_SHA256';
+/** The templates commit and its git tree (6c, ruling S12): the renderer fetches the commit and checks HEAD and HEAD^{tree} against these. */
+export const NUCLEI_TEMPLATES_COMMIT_ENV = 'PIPEGEN_NUCLEI_TEMPLATES_COMMIT';
+export const NUCLEI_TEMPLATES_TREE_ENV = 'PIPEGEN_NUCLEI_TEMPLATES_TREE';
 /** Where the renderer puts the verified templates; `-t` must name this directory, and nothing else (like Semgrep's rules, S22). */
 export const NUCLEI_TEMPLATES_DIR = '/pipegen-nuclei-templates';
 const NUCLEI_TEMPLATES_URL_RE = /^https:\/\/github\.com\/projectdiscovery\/nuclei-templates\/(?:archive\/refs\/tags\/v\d{1,4}\.\d{1,4}\.\d{1,4}\.tar\.gz|releases\/download\/v\d{1,4}\.\d{1,4}\.\d{1,4}\/[A-Za-z0-9._-]{1,100}\.tar\.gz)$/;
@@ -922,15 +925,21 @@ function nucleiProblems(e: Entry): Problem[] {
   if (!reasons.has(NUCLEI_TEMPLATES) && (inCommand.length === 0 || inCommand.some((d) => d !== NUCLEI_TEMPLATES_DIR) || !dirs(a).includes(NUCLEI_TEMPLATES_DIR))) {
     bad(NUCLEI_TEMPLATES, 'step', 'cli', 'command');
   }
-  const allowedEnv = new Set([NUCLEI_TEMPLATES_URL_ENV, NUCLEI_TEMPLATES_SHA256_ENV]);
+  const allowedEnv = new Set([NUCLEI_TEMPLATES_URL_ENV, NUCLEI_TEMPLATES_SHA256_ENV, NUCLEI_TEMPLATES_COMMIT_ENV, NUCLEI_TEMPLATES_TREE_ENV]);
   for (const k of new Set([...Object.keys(e.step.cli?.env ?? {}), ...Object.keys(fx.env ?? {})])) {
-    if (!allowedEnv.has(k)) bad(`nuclei gets only ${NUCLEI_TEMPLATES_URL_ENV} and ${NUCLEI_TEMPLATES_SHA256_ENV} in its env, not ${k} (nuclei reads PDCP_*, ENABLE_CLOUD_UPLOAD and template sources from it)`, 'step', 'cli', 'env');
+    if (!allowedEnv.has(k)) bad(`nuclei gets only its four template variables (${NUCLEI_TEMPLATES_URL_ENV}, …) in its env, not ${k} (nuclei reads PDCP_*, ENABLE_CLOUD_UPLOAD and template sources from it)`, 'step', 'cli', 'env');
   }
   const env = fx.env ?? {};
   if (!NUCLEI_TEMPLATES_URL_RE.test(env[NUCLEI_TEMPLATES_URL_ENV] ?? '')) {
     bad(`nuclei needs fixedInputs.env.${NUCLEI_TEMPLATES_URL_ENV}: an official projectdiscovery/nuclei-templates release tarball (a vX.Y.Z tag)`, 'fixedInputs', 'env');
   }
   if (!SHA256_RE.test(env[NUCLEI_TEMPLATES_SHA256_ENV] ?? '')) bad(`nuclei needs fixedInputs.env.${NUCLEI_TEMPLATES_SHA256_ENV}: the templates archive's sha256`, 'fixedInputs', 'env');
+  for (const [k, what] of [[NUCLEI_TEMPLATES_COMMIT_ENV, 'the templates commit (40 hex)'], [NUCLEI_TEMPLATES_TREE_ENV, "the templates commit's git tree (40 hex)"]] as const) {
+    if (!COMMIT_SHA_RE.test(env[k] ?? '')) bad(`nuclei needs fixedInputs.env.${k}: ${what}`, 'fixedInputs', 'env');
+  }
+  for (const k of [NUCLEI_TEMPLATES_COMMIT_ENV, NUCLEI_TEMPLATES_TREE_ENV]) {
+    if ((e.step.cli?.env ?? {})[k] !== env[k]) bad(`nuclei step.cli.env.${k} must equal fixedInputs.env.${k}`, 'step', 'cli', 'env');
+  }
   // the allowlist last, so a more specific refusal (-duc swallowed, templates) is the one reported first
   out.push(...allowlistProblems('nuclei', [p, a], NUCLEI_ALLOWED_FLAGS, '-', (n) => NUCLEI_FORBIDDEN[n] !== undefined));
   const long = (k: string) => NUCLEI_GRAMMAR.shorts[k] ?? k;

@@ -595,9 +595,11 @@ const NT_REPO = 'projectdiscovery/nuclei-templates';
 const NT_ARCHIVE = /^https:\/\/github\.com\/projectdiscovery\/nuclei-templates\/archive\/refs\/tags\/(v(\d{1,4}\.\d{1,4}\.\d{1,4}))\.tar\.gz$/;
 const NT_ASSET = /^https:\/\/github\.com\/projectdiscovery\/nuclei-templates\/releases\/download\/(v\d{1,4}\.\d{1,4}\.\d{1,4})\/([A-Za-z0-9._-]{1,100}\.tar\.gz)$/;
 
-async function templatesOutcome(ctx: Ctx, url: string | undefined, sha: string | undefined): Promise<Outcome> {
+async function templatesOutcome(ctx: Ctx, url: string | undefined, sha: string | undefined, commit: string | undefined, tree: string | undefined): Promise<Outcome> {
   const want = sha256Of(sha);
   if (!want) return fail('PIPEGEN_NUCLEI_TEMPLATES_SHA256 is not a sha256');
+  // 6c (S12): the renderer fetches this commit with git and checks HEAD and HEAD^{tree}
+  if (!/^[0-9a-f]{40}$/.test(commit ?? '') || !/^[0-9a-f]{40}$/.test(tree ?? '')) return fail('PIPEGEN_NUCLEI_TEMPLATES_COMMIT and _TREE must be 40-character SHAs');
   const asset = NT_ASSET.exec(url ?? '');
   const m = NT_ARCHIVE.exec(url ?? '');
   if (!asset && !m) return fail('PIPEGEN_NUCLEI_TEMPLATES_URL is not a projectdiscovery/nuclei-templates tag archive or release asset; needs owner review');
@@ -606,6 +608,9 @@ async function templatesOutcome(ctx: Ctx, url: string | undefined, sha: string |
     // The tag's commit must be on upstream's default branch (P44), whichever form the URL has.
     const { obj } = await tagTarget(ctx, NT_REPO, encodeURIComponent(tag));
     if (obj.type !== 'commit' || typeof obj.sha !== 'string') return fail(`the tag ${tag} does not point to a commit; needs owner review`);
+    if (obj.sha !== commit) return fail(`the tag ${tag} does not lead to PIPEGEN_NUCLEI_TEMPLATES_COMMIT`);
+    const c = await ctx.get(`https://api.github.com/repos/${NT_REPO}/git/commits/${obj.sha}`, ctx.gh);
+    if (!isObj(c) || c.sha !== obj.sha || !isObj(c.tree) || c.tree.sha !== tree) return fail('the templates commit tree is not PIPEGEN_NUCLEI_TEMPLATES_TREE');
     const off = await onDefaultBranch(ctx, NT_REPO, obj.sha);
     if (off) return off;
     if (asset) return assetOutcome(ctx, NT_REPO, tag, asset[2] as string, want);
@@ -678,7 +683,7 @@ function pinShapedPaths(v: unknown, path = '', out: string[] = []): string[] {
   return out;
 }
 
-const ARCHIVE_ENV = ['PIPEGEN_RULES_URL', 'PIPEGEN_RULES_SHA256', 'PIPEGEN_RULES_TREE', 'PIPEGEN_NUCLEI_TEMPLATES_URL', 'PIPEGEN_NUCLEI_TEMPLATES_SHA256'];
+const ARCHIVE_ENV = ['PIPEGEN_RULES_URL', 'PIPEGEN_RULES_SHA256', 'PIPEGEN_RULES_TREE', 'PIPEGEN_NUCLEI_TEMPLATES_URL', 'PIPEGEN_NUCLEI_TEMPLATES_SHA256', 'PIPEGEN_NUCLEI_TEMPLATES_COMMIT', 'PIPEGEN_NUCLEI_TEMPLATES_TREE'];
 /**
  * Where a reviewed entry may hold a hash or a URL: the pins checked here, plus verifiedWith (pin-time signature
  * inputs, never installed) and wrappedImage.digest (a record of the image an action's own action.yml runs; the action
@@ -816,7 +821,7 @@ export function reviewedItems(base: string | null | undefined, head: string | nu
         run: async (ctx) => (bad ? fail(bad[1].problem as string) : run(Object.fromEntries(got.map(([k, g]) => [k, g.value])), ctx)),
       });
     };
-    archive('nuclei templates', ['PIPEGEN_NUCLEI_TEMPLATES_URL', 'PIPEGEN_NUCLEI_TEMPLATES_SHA256'], (v, ctx) => templatesOutcome(ctx, v.PIPEGEN_NUCLEI_TEMPLATES_URL, v.PIPEGEN_NUCLEI_TEMPLATES_SHA256));
+    archive('nuclei templates', ['PIPEGEN_NUCLEI_TEMPLATES_URL', 'PIPEGEN_NUCLEI_TEMPLATES_SHA256', 'PIPEGEN_NUCLEI_TEMPLATES_COMMIT', 'PIPEGEN_NUCLEI_TEMPLATES_TREE'], (v, ctx) => templatesOutcome(ctx, v.PIPEGEN_NUCLEI_TEMPLATES_URL, v.PIPEGEN_NUCLEI_TEMPLATES_SHA256, v.PIPEGEN_NUCLEI_TEMPLATES_COMMIT, v.PIPEGEN_NUCLEI_TEMPLATES_TREE));
     archive('semgrep rules', ['PIPEGEN_RULES_URL', 'PIPEGEN_RULES_SHA256', 'PIPEGEN_RULES_TREE'], (v, ctx) => rulesOutcome(ctx, v.PIPEGEN_RULES_URL, v.PIPEGEN_RULES_TREE));
   }
   return items;
