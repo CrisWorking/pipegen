@@ -1,5 +1,5 @@
 import { constants } from 'node:fs';
-import { lstat, open, type FileHandle } from 'node:fs/promises';
+import { lstat, open, readlink, realpath, type FileHandle } from 'node:fs/promises';
 import { isAbsolute, join, relative, sep } from 'node:path';
 import fg from 'fast-glob';
 import { isMap, isPair, isScalar, isSeq, parseDocument } from 'yaml';
@@ -98,6 +98,27 @@ export const MAX_FILES_TEXT = READ_LIMITS.maxFiles.toLocaleString('en-US');
  */
 const OPEN_CHECKED = constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0) | (constants.O_NONBLOCK ?? 0);
 
+/**
+ * P49, macOS: O_NOFOLLOW_ANY refuses a symbolic link at ANY level of the path, so the open itself can't be redirected by
+ * a swapped folder. Used when Node exposes the constant (Node's fs.constants doesn't list it today, so then macOS keeps
+ * the path checks below; threat model T51).
+ */
+const NOFOLLOW_ANY = (constants as unknown as Record<string, number | undefined>).O_NOFOLLOW_ANY ?? 0;
+
+/**
+ * P49, Linux: the real path of an open descriptor, read from /proc/self/fd (the kernel's own record of the opened file,
+ * not a path that can be swapped). Null when /proc is not there (another platform, or /proc not mounted): then the path
+ * checks are all there is (threat model T51).
+ */
+async function openedPath(fd: number): Promise<string | null> {
+  if (process.platform !== 'linux') return null;
+  try {
+    return await readlink(`/proc/self/fd/${fd}`);
+  } catch {
+    return null;
+  }
+}
+
 /** True for the error an O_NOFOLLOW open gives on a symbolic link (ELOOP; EMLINK on FreeBSD). */
 const isLinkRefusal = (e: unknown): boolean => ['ELOOP', 'EMLINK'].includes(String((e as { code?: unknown } | null)?.code));
 
@@ -124,6 +145,11 @@ function under(root: string, path: string): string | null {
  * through those checked folders after the open must be the opened one: a folder swapped for a link to somewhere else
  * between the checks and the open is refused (the open would have followed it to another file). Such a swap is
  * reported as `link` when a level is a link at the second check, else as `unreadable`.
+ *
+ * P49: path checks alone can't close that race (a folder swapped back and forth wins between any two of them), so with
+ * `root` the opened descriptor is verified itself: on Linux its real path (/proc/self/fd) must be inside the root's real
+ * path (`link` otherwise); on macOS the open uses O_NOFOLLOW_ANY when Node exposes it. Elsewhere, or without /proc,
+ * only the path checks remain (threat model T51).
  */
 export async function readTextLimitedWithReason(path: string, root?: string): Promise<{ text: string } | { skipped: Skipped }> {
   let handle: FileHandle | undefined;
@@ -136,7 +162,7 @@ export async function readTextLimitedWithReason(path: string, root?: string): Pr
     if (!info.isFile()) return { skipped: 'not-a-file' };
     if (info.size > READ_LIMITS.maxFileBytes) return { skipped: 'too-large' };
     try {
-      handle = await open(path, OPEN_CHECKED);
+      handle = await open(path, OPEN_CHECKED | (root !== undefined ? NOFOLLOW_ANY : 0));
     } catch (e) {
       if (isLinkRefusal(e)) return { skipped: 'link' };
       throw e;
@@ -146,6 +172,13 @@ export async function readTextLimitedWithReason(path: string, root?: string): Pr
     if (opened.size > READ_LIMITS.maxFileBytes) return { skipped: 'too-large' };
     if (!sameFile(opened, info)) return { skipped: 'unreadable' };
     if (root !== undefined && rel !== null) {
+      // P49: the opened file itself must be inside the repo (Linux: the descriptor's real path). Path checks alone always
+      // leave a window, because a folder can be swapped back and forth between any two of them.
+      const real = await openedPath(handle.fd);
+      if (real !== null) {
+        const rootReal = await realpath(root);
+        if (under(rootReal, real.replace(/ \(deleted\)$/, '')) === null) return { skipped: 'link' };
+      }
       if ((await linkedLevel(root, rel)) !== null) return { skipped: 'link' };
       const again = await lstat(path);
       if (!sameFile(opened, again)) return { skipped: 'unreadable' };
