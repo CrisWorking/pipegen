@@ -1039,9 +1039,10 @@ describe('the quick secret check says what it does and does not look for (hand c
 
   it('report: the local-only report (GitHub not read) says the same, in the terminal and in JSON', () => {
     const r = report();
-    const l = { profile: r.profile, [TREE]: [], [CHECK]: { ...SECRET_CHECK }, aiBundle: r.aiBundle, warnings: [], notes: [] };
+    const l = { profile: r.profile, commit: null, [TREE]: [], [CHECK]: { ...SECRET_CHECK }, aiBundle: r.aiBundle, warnings: [], notes: [] };
     const t = flat(renderLocalTerminal(l, OPTS));
     expect(t).toContain('Quick secret check');
+    expect(t).toContain("Audited commit: pipegen couldn't read it from .git"); // P55 fix 10: the local report too
     for (const s of SCOPE) expect(t, s).toContain(s);
     expect((JSON.parse(renderLocalJson(l, OPTS)) as Record<typeof CHECK, unknown>)[CHECK]).toEqual({ ...SECRET_CHECK });
   });

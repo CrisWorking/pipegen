@@ -107,6 +107,7 @@ export function freePrivateReport(excludedPatterns: readonly string[]): AuditRep
       existingWorkflows: [{ path: CI, triggers: ['push', 'pull_request'], deploys: false, [USED]: [], jobs: ['test', 'audit', 'zap'] }],
       precommit: 'husky', repoFiles: emptyRepoFiles(),
     },
+    commit: { sha: 'f4bcfaba7c85be3c6332cc74a20819f586dcdbc6', short: 'f4bcfab', branch: 'main' },
     capabilities: {
       branchProtection: false, environments: true, envRequiredReviewers: false, deploymentBranchPolicies: true,
       attestations: false, codeScanning: false, keylessSigningAllowed: false,

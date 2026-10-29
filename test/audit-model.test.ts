@@ -980,3 +980,29 @@ describe('buildAudit: the last run of a covering workflow (hand checks fix 3, P5
     for (const c of testRows(r)) expect(c.status).toBe('covered');
   });
 });
+
+describe('buildAudit: the audited commit (hand checks fix 10, P55)', () => {
+  const SHA = '3541888878c4d303a8bc2ad61815f4e048f55a5d';
+  it('HEAD on a branch (loose ref, packed ref), detached, or unreadable', async () => {
+    const loose = await buildAudit(repo({ ...nodeApp(), '.git/HEAD': 'ref: refs/heads/main\n', '.git/refs/heads/main': `${SHA}\n` }), deps());
+    expect(loose.commit).toEqual({ sha: SHA, short: '3541888', branch: 'main' });
+    const packed = await buildAudit(repo({ ...nodeApp(), '.git/HEAD': 'ref: refs/heads/release/v1\n', '.git/packed-refs': `# pack-refs with: peeled fully-peeled sorted\n${'1'.repeat(40)} refs/heads/main\n${SHA} refs/heads/release/v1\n` }), deps());
+    expect(packed.commit).toEqual({ sha: SHA, short: '3541888', branch: 'release/v1' });
+    const detached = await buildAudit(repo({ ...nodeApp(), '.git/HEAD': `${SHA}\n` }), deps());
+    expect(detached.commit).toEqual({ sha: SHA, short: '3541888', branch: null });
+    expect((await buildAudit(repo(nodeApp()), deps())).commit).toBeNull(); // no HEAD file
+    // a ref that tries to leave .git, or a HEAD that isn't a ref or a SHA, is not followed
+    expect((await buildAudit(repo({ ...nodeApp(), '.git/HEAD': 'ref: refs/heads/../../../etc/passwd\n' }), deps())).commit).toBeNull();
+    expect((await buildAudit(repo({ ...nodeApp(), '.git/HEAD': 'hello\n' }), deps())).commit).toBeNull();
+  });
+
+  it('all three outputs print the commit (short SHA and branch), and say so when it could not be read', async () => {
+    const r = await buildAudit(repo({ ...nodeApp(), '.git/HEAD': 'ref: refs/heads/main\n', '.git/refs/heads/main': `${SHA}\n` }), deps());
+    expect(renderTerminal(r, { knownValues: [] })).toContain('Audited commit: 3541888 on branch main');
+    expect(renderMarkdown(r, { knownValues: [] })).toContain('Audited commit: 3541888 on branch main');
+    expect((JSON.parse(renderJson(r, { knownValues: [] })) as { commit: unknown }).commit).toEqual({ sha: SHA, short: '3541888', branch: 'main' });
+    const none = await buildAudit(repo(nodeApp()), deps());
+    expect(renderTerminal(none, { knownValues: [] })).toContain("Audited commit: pipegen couldn't read it from .git");
+    expect((JSON.parse(renderJson(none, { knownValues: [] })) as { commit: unknown }).commit).toBeNull();
+  });
+});

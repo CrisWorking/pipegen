@@ -1,4 +1,5 @@
 pipegen audit: acme/shop-api
+Audited commit: f4bcfab on branch main.
 pipegen changed nothing in the repo or on GitHub.
 You ran it with --ai: the AI part below says what the AI step found.
 

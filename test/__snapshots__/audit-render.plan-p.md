@@ -1,5 +1,7 @@
 # pipegen audit: acme/shop-api
 
+Audited commit: f4bcfab on branch main.
+
 Audited on 2026-10-27. pipegen changed nothing in the repo or on GitHub. Nothing was sent to an AI.
 
 **Verdict:** 4 of 4 layers have gaps; 4 are serious. pipegen couldn't check everything in 2 layers.

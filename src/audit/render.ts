@@ -150,7 +150,7 @@ type Block =
   /** One of pipegen's own fixed commands, under the block before it (depth: that item's depth, or -1 under text). */
   | { kind: 'command'; command: string; depth: number };
 interface Section { title: string; blocks: Block[] }
-interface Doc { title: string; intro: string[]; verdict: string | null; /** PS37: the scheduled group's own status line (not part of the verdict). */ scheduled?: string; sections: Section[] }
+interface Doc { title: string; intro: string[]; /** P55: the audited commit line. */ commit: string; verdict: string | null; /** PS37: the scheduled group's own status line (not part of the verdict). */ scheduled?: string; sections: Section[] }
 
 /** How values are cleaned and amounts written for one target. */
 interface Ctx {
@@ -579,6 +579,13 @@ function nextSection(r: AuditReport, c: Ctx): Section {
 
 const dedupe = (xs: string[]) => [...new Set(xs)];
 
+/** P55 (hand checks fix 10): the commit the audit read, so two runs (or a hand check) can be compared. */
+function commitLine(r: Pick<AuditReport, 'commit'>, c: Ctx): string {
+  const k = r.commit;
+  if (k === null || k === undefined) return "Audited commit: pipegen couldn't read it from .git (it reads the files on disk as they are now).";
+  return `Audited commit: ${c.v(k.short)}${k.branch === null ? ' (detached HEAD, no branch)' : ` on branch ${c.v(k.branch, OUTPUT_CAP.path)}`}.`;
+}
+
 function buildDoc(r: AuditReport, c: Ctx): Doc {
   const views = layerViews(r);
   const sched = views.find((v) => v.layer === 'scheduled');
@@ -588,7 +595,7 @@ function buildDoc(r: AuditReport, c: Ctx): Doc {
     warningsSection(r, c), quickSecretSection(r, c), planSection(r, c), layersSection(c, views), skippedSection(r, c), addSection(r, c), wouldSetSection(r, c),
     costsSection(r, c), bundleSection(r, c), permissionsSection(r, c), notesSection(r, c), { title: "What this audit can't see", blocks: CANT_SEE.map((l) => item(l)) }, nextSection(r, c),
   ].filter((s): s is Section => s !== null);
-  return { title: `pipegen audit: ${c.v(`${r.profile.owner}/${r.profile.repo}`, OUTPUT_CAP.path)}`, intro, verdict: verdictOf(views.filter((v) => v.layer !== 'scheduled')),
+  return { title: `pipegen audit: ${c.v(`${r.profile.owner}/${r.profile.repo}`, OUTPUT_CAP.path)}`, intro, commit: commitLine(r, c), verdict: verdictOf(views.filter((v) => v.layer !== 'scheduled')),
     ...(sched === undefined || !sched.needed ? {} : { scheduled: `Scheduled and repo-file checks: ${layerStatus(sched)}.` }), sections };
 }
 
@@ -658,6 +665,7 @@ export function renderTerminal(r: AuditReport, opts: RenderOptions): string {
 function terminalDoc(doc: Doc): string {
   const lines: string[] = [];
   append(lines, wrap(doc.title, ''));
+  append(lines, wrap(doc.commit, ''));
   for (const l of doc.intro) append(lines, wrap(l, ''));
   if (doc.verdict !== null) {
     lines.push('');
@@ -708,7 +716,7 @@ export function renderMarkdown(r: AuditReport, opts: RenderOptions): string {
   const doc = buildDoc(r, ctxFor('markdown', opts, r.capabilities.branchProtection === true, r.profile.services));
   const at = (opts.now ?? Date.now)();
   const date = Number.isFinite(at) ? `Audited on ${new Date(at).toISOString().slice(0, 10)}. ` : '';
-  const lines = [`# ${doc.title}`, '', `${date}${doc.intro.join(' ')}`, '', `**Verdict:** ${doc.verdict ?? ''}`];
+  const lines = [`# ${doc.title}`, '', doc.commit, '', `${date}${doc.intro.join(' ')}`, '', `**Verdict:** ${doc.verdict ?? ''}`];
   if (doc.scheduled !== undefined) lines.push('', doc.scheduled);
   for (const s of doc.sections) {
     lines.push('', `## ${s.title}`, '');
@@ -810,6 +818,7 @@ function localDoc(l: LocalAudit, c: Ctx): Doc {
   ].filter((s): s is Section => s !== null);
   return {
     title: `pipegen audit: ${c.v(`${p.owner}/${p.repo}`, OUTPUT_CAP.path)}`,
+    commit: commitLine(l, c),
     intro: ['pipegen changed nothing in the repo or on GitHub.', 'Nothing was sent to an AI.', '', GITHUB_NOT_READ],
     verdict: null,
     sections,
@@ -823,6 +832,6 @@ export function renderLocalTerminal(l: LocalAudit, opts: RenderOptions): string 
 
 /** The local-only report as JSON (`--json`): `github: "not read"` and the parts read from disk, every string cleaned. */
 export function renderLocalJson(l: LocalAudit, opts: RenderOptions): string {
-  const doc = { github: 'not read', profile: l.profile, secretsInTree: l.secretsInTree, secretCheck: l.secretCheck ?? SECRET_CHECK, aiBundle: l.aiBundle, warnings: l.warnings, notes: l.notes };
+  const doc = { github: 'not read', profile: l.profile, commit: l.commit ?? null, secretsInTree: l.secretsInTree, secretCheck: l.secretCheck ?? SECRET_CHECK, aiBundle: l.aiBundle, warnings: l.warnings, notes: l.notes };
   return JSON.stringify(deepClean(doc, '', 0, false, makeSafeOutput(opts.knownValues, opts.found), new Set()), null, 2);
 }

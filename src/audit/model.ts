@@ -47,6 +47,7 @@ import { readOnlyTokenHint } from '../github/client.js';
 import { readDefaultSetup, type DefaultSetup } from '../github/code-scanning-setup.js';
 import { lastCompletedRun } from '../github/workflow-runs.js';
 import { signingMode } from '../github/signing-mode.js';
+import { readHeadCommit, type HeadCommit } from '../read/git-head.js';
 import { IGNORED_DIRS, listFiles, READ_LIMITS, readTextLimited, readTextLimitedWithReason } from '../read/limits.js';
 import { readProject } from '../read/project.js';
 import { supportLevel } from '../read/support.js';
@@ -120,7 +121,10 @@ export type AuditSupport = ReturnType<typeof supportLevel> & { nextStep: string;
 export interface AuditWarning { text: string; command?: string }
 
 export interface AuditReport {
-  profile: RepoProfile; capabilities: Capabilities; support: AuditSupport;
+  profile: RepoProfile;
+  /** P55 (hand checks fix 10): the commit read (HEAD's SHA and branch, from .git as text), or null when it couldn't be read. */
+  commit: HeadCommit | null;
+  capabilities: Capabilities; support: AuditSupport;
   coverage: Coverage[]; wouldAdd: WouldAddRow[];
   /** Plan P Task 8: the checks that don't apply to this repo, one line per reason. */
   skipped: SkippedGroup[];
@@ -489,6 +493,7 @@ export async function buildAudit(dir: string, deps: AuditDeps): Promise<AuditRep
 
   return {
     profile,
+    commit: await readHeadCommit(dir),
     capabilities: caps,
     support: supportOf(profile),
     coverage,
@@ -643,6 +648,7 @@ export type LocalProfile = Awaited<ReturnType<typeof readProject>>;
  */
 export interface LocalAudit {
   profile: LocalProfile;
+  commit: HeadCommit | null;
   secretsInTree: SecretInTree[];
   secretCheck: SecretCheckScope;
   aiBundle: AuditReport['aiBundle'];
@@ -663,6 +669,7 @@ export async function buildLocalAudit(dir: string, deps: { notes?: string[] } = 
   for (const n of bundle.notes) if (n !== COUNTING_ONLY_NOTE) notes.add(n);
   return {
     profile,
+    commit: await readHeadCommit(dir),
     secretsInTree,
     secretCheck: { ...SECRET_CHECK },
     aiBundle: {
