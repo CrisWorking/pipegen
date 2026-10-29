@@ -17,6 +17,15 @@ The `cooldown` job in `.github/workflows/ci.yml` runs on every pull request. It 
 
 If anything is under 7 days old, or cannot be tied to an upstream date, the job fails and lists each item (unless the emergency path below applies). A tool kind or image the script cannot check (not on Docker Hub, no GitHub digest) fails with "needs owner review". Versions the PR did not change are never checked. A downgrade to an older version is fine, with one exception: a package too big for the full registry document is dated by its tarball's `Last-Modified`. The registry sometimes stores old tarballs again (vite 5.0.0, published in 2023, shows 2026), so a downgrade of such a package can look young. That is the safe direction. Wait until the date is 7 days old, or use the emergency path below.
 
+## Pins nobody changed
+
+The check above only looks at what a PR adds or changes. Upstream can still drift under an old pin: a tag moved to
+other code, a release asset uploaded again with other bytes, a Docker tag pointing at another digest. The
+`pins-upstream` job in `.github/workflows/ci.yml` runs `test/pins-upstream-live.test.ts`, which ties **every** pin of
+`data/reviewed-tools.yml` and `data/pinned-binaries.yml` to upstream again with this same script's code (as if all were
+new). It fails on any pin that no longer ties. Age is left to the check above. It runs on pull requests that change
+`data/` and on every push to `main`. On other pull requests the job passes without running.
+
 ## It fails closed
 
 If the registry or GitHub cannot be reached, a date cannot be read, a lookup returns 404, or a date is in the future, the job fails. Re-run the failed job when the service is back. There is a cap of 150 distinct lookups and a 15 second timeout and a 32 MB size limit on each; a PR that changes more than that should be split. The size limit is never raised: an npm document over it takes the smaller lookups above. Parse errors never print file content.

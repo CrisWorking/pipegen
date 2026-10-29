@@ -152,6 +152,52 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
 
+  pins-upstream:
+    # m5: every pin in data/ tied again to upstream by scripts/cooldown.ts's code (test/pins-upstream-live.test.ts), so a
+    # moved tag or a re-uploaded asset under a pin nobody changed is seen. Runs on pull requests that change data/ and on
+    # every push to main; on other pull requests the job passes without running it (it can still be a required check).
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    concurrency:
+      group: ci-pins-upstream-${{ github.event_name == 'pull_request' && github.ref || github.sha }}
+      cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: "Check out the base commit's data/ only (to see whether this PR changes it)"
+        if: github.event_name == 'pull_request'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          path: .base-data
+          sparse-checkout: data
+          persist-credentials: false
+      - name: Does this run need the re-check?
+        id: changed
+        run: |
+          if [ "$GITHUB_EVENT_NAME" != pull_request ] || ! diff -rq .base-data/data data >/dev/null 2>&1; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::data/ is unchanged in this PR; the re-check of every pin runs on PRs that change data/ and on main"
+          fi
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        if: steps.changed.outputs.run == 'true'
+        with:
+          node-version: 24
+      - if: steps.changed.outputs.run == 'true'
+        run: npm ci
+      - name: Live re-check of every pin in data/ against upstream
+        if: steps.changed.outputs.run == 'true'
+        run: npx vitest run test/pins-upstream-live.test.ts
+        env:
+          PIPEGEN_LIVE_TESTS: '1'
+          # read-only job token, given to this step only: several hundred GitHub API lookups
+          GITHUB_TOKEN: ${{ github.token }}
+
   cooldown:
     # 7-day cooldown for new or changed dependency and tool versions (DECISIONS #92, docs/cooldown.md).
     # The BASE commit's script judges the PR's files. This protects the script file only: a PR can still edit this
