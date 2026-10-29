@@ -31,6 +31,8 @@ const MAX_PORT_SCAN_FILES = 100;
 /** Service.name pattern (types.ts identifier rule). Exported so the needs planner (Plan B Task 1) re-checks names before an AI prompt. */
 export const SERVICE_NAME_RE = /^[A-Za-z0-9._@/-]{1,214}$/;
 const MAX_WORKSPACE_PATTERNS = 100;
+/** Manifests of an app that isn't a Node package: a folder holding one (and a Dockerfile) is a service next to Node workspaces. */
+const OTHER_APP_MANIFESTS = ['pyproject.toml', 'setup.py', 'go.mod'];
 const NOT_SERVICE_DIRS = ['.devcontainer', 'test', 'tests', '__tests__', 'fixtures', 'examples', 'docs'];
 // Root files read by direct path so the file cap can never hide them.
 const ROOT_FILES = ['package.json', 'pnpm-workspace.yaml', 'turbo.json', 'nx.json', '.nvmrc', '.node-version', '.python-version', 'pyproject.toml', 'setup.py', 'Dockerfile', ...NODE_LOCKS.map(([f]) => f), ...PYTHON_LOCKS.map(([f]) => f)];
@@ -286,6 +288,14 @@ export async function readProject(dir: string, opts?: { notes?: string[] }): Pro
   const isAppDockerfile = (f: string) => baseOf(f) === 'Dockerfile' && !dirOf(f).split('/').some((s) => NOT_SERVICE_DIRS.includes(s));
   const dockerDirs = [...new Set([...ctx.fileSet].filter(isAppDockerfile).map(dirOf))].sort();
   if (dirs.length === 0) dirs = dockerDirs.length > 0 ? dockerDirs : ['.'];
+  else {
+    // A Node workspace list names Node packages only (DoD run, fastapi/full-stack-fastapi-template: backend/ was lost). A
+    // folder with a Dockerfile and a Python or Go manifest beside it is a service the list can't name; a Dockerfile
+    // folder without one (an nginx or database image) stays out, as before.
+    const otherApp = (d: string) => !ctx.fileSet.has(inDir(d, 'package.json'))
+      && (OTHER_APP_MANIFESTS.some((m) => ctx.fileSet.has(inDir(d, m))) || [...ctx.fileSet].some((f) => dirOf(f) === d && REQUIREMENTS_FILE_RE.test(baseOf(f))));
+    for (const d of dockerDirs) if (d !== '.' && !dirs.includes(d) && otherApp(d)) dirs.push(d);
+  }
 
   let monorepo: Monorepo = 'none';
   if (pnpmWs) monorepo = 'pnpm-workspaces';

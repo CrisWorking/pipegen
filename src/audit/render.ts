@@ -238,13 +238,47 @@ const checkLabel = (c: Ctx, need: Pick<Need, 'id' | 'service'>) =>
   `${needLabel(need.id, { noImage: c.noImage(need) }) ?? c.v(need.id)}${need.service === undefined ? '' : ` for ${c.v(need.service)}`}`;
 const lowerFirst = (s: string) => (/^[A-Z][a-z]/.test(s) ? `${s[0]?.toLowerCase()}${s.slice(1)}` : s);
 
-function row(c: Ctx, cov: Coverage): Row {
+function row(c: Ctx, cov: Coverage, services: readonly string[] = []): Row {
   const by = cov.by === undefined ? null : c.v(cov.by, OUTPUT_CAP.path);
   const where = cov.where === undefined ? null : c.v(cov.where, OUTPUT_CAP.path);
+  const label = services.length > 1 ? groupLabel(c, cov.need, services) : checkLabel(c, cov.need);
   return {
-    serious: isSerious(cov), status: cov.status, check: `${checkLabel(c, cov.need)}${cov.need.blocking ? '' : ` (${WARNING_ONLY})`}`, why: c.v(cov.why, OUTPUT_CAP.text),
+    serious: isSerious(cov), status: cov.status, check: `${label}${cov.need.blocking ? '' : ` (${WARNING_ONLY})`}`, why: c.v(cov.why, OUTPUT_CAP.text),
     found: by !== null && where !== null ? `${by} in ${where}` : by ?? where,
   };
+}
+
+/** "a", "a and b", "a, b and c". */
+const andList = (xs: readonly string[]) => (xs.length <= 1 ? xs.join('') : `${xs.slice(0, -1).join(', ')} and ${xs[xs.length - 1] as string}`);
+/** A check's name for several services at once: "Lint for frontend and backend". */
+const groupLabel = (c: Ctx, need: Need, services: readonly string[]) =>
+  `${needLabel(need.id, { noImage: c.noImage(need) }) ?? c.v(need.id)} for ${andList(services.map((s) => c.v(s)))}`;
+
+/**
+ * DoD run (fastapi): per-service rows that say the same thing (the same check, status, why, finding and label) become
+ * one row naming every service, at the first one's place, so several services don't read as every row printed twice.
+ * `key` is what must match besides the check; a row without a service is never merged. Order is kept.
+ */
+function groupByService<T extends { need: Need }>(c: Ctx, items: readonly T[], key: (x: T) => string): { first: T; services: string[] }[] {
+  const out: { first: T; services: string[] }[] = [];
+  const at = new Map<string, { first: T; services: string[] }>();
+  for (const x of items) {
+    const svc = x.need.service;
+    if (svc === undefined) {
+      out.push({ first: x, services: [] });
+      continue;
+    }
+    const k = `${x.need.id}\u0000${x.need.layer}\u0000${x.need.blocking ? 1 : 0}\u0000${c.noImage(x.need) ? 1 : 0}\u0000${key(x)}`;
+    const g = at.get(k);
+    if (g !== undefined) {
+      g.services.push(svc);
+      continue;
+    }
+    const fresh = { first: x, services: [svc] };
+    at.set(k, fresh);
+    out.push(fresh);
+  }
+  return out;
 }
 
 // ---------- sections ----------
@@ -294,7 +328,10 @@ function layersSection(c: Ctx, views: LayerView[]): Section {
   for (const v of views) {
     if (v.layer === 'scheduled' && !v.needed) continue; // a group with no checks is left out, not counted
     blocks.push({ kind: 'sub', title: `${GROUP_TITLE[v.layer]}: ${layerStatus(v)}` });
-    if (v.needed) blocks.push({ kind: 'rows', rows: v.rows.map((cov) => row(c, cov)) });
+    if (v.needed) {
+      const groups = groupByService(c, v.rows, (cov) => `${cov.status}\u0000${cov.why}\u0000${cov.by ?? ''}\u0000${cov.where ?? ''}`);
+      blocks.push({ kind: 'rows', rows: groups.map((g) => row(c, g.first, g.services)) });
+    }
   }
   return { title: 'Checks by layer', blocks };
 }
@@ -412,8 +449,11 @@ function addSection(r: AuditReport, c: Ctx): Section {
   const blocks: Block[] = [];
   if (r.wouldAdd.length > 0) {
     blocks.push(text("For each check that isn't covered:"));
-    for (const w of r.wouldAdd) {
-      blocks.push(item(`${checkLabel(c, w.need)}, ${isScheduled(w.need) ? 'on a schedule' : LAYER_WHEN[w.need.layer]} (now ${w.status}): ${toolText(c, w)}`));
+    // rows that say the same for several services are one line naming them all (DoD fastapi)
+    for (const g of groupByService(c, r.wouldAdd, (w) => `${w.status}\u0000${isScheduled(w.need) ? 1 : 0}\u0000${toolText(c, w)}`)) {
+      const w = g.first;
+      const label = g.services.length > 1 ? groupLabel(c, w.need, g.services) : checkLabel(c, w.need);
+      blocks.push(item(`${label}, ${isScheduled(w.need) ? 'on a schedule' : LAYER_WHEN[w.need.layer]} (now ${w.status}): ${toolText(c, w)}`));
     }
   }
   if (r.testsNote !== null) blocks.push(text(c.v(r.testsNote, OUTPUT_CAP.text)));

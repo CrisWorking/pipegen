@@ -1,4 +1,5 @@
 // Coverage mapper (see ../coverage.ts for the rules): own package.json scripts, read and followed per (dir, script).
+import { posix } from 'node:path';
 import { asObj } from '../../read/manifest.js';
 import { MAX_GLOB_NAME, MAX_GLOB_WORK, MAX_PACKAGE_FILES, MAX_SCRIPTS, MAX_SCRIPT_TARGETS } from './bounds.js';
 import { UNKNOWN_PREFIX, flagGiven, gateOf, gated } from './settings.js';
@@ -66,7 +67,7 @@ async function scriptRuns(ctx: Ctx, dir: string, name: string): Promise<Found[]>
  * nothing that counts is dropped.
  */
 export async function resolveScripts(ctx: Ctx, found: Found[]): Promise<Found[]> {
-  if (!found.some((f) => f.script !== undefined || f.byName !== undefined)) return found;
+  if (!found.some((f) => f.script !== undefined || f.byName !== undefined || f.scriptFile !== undefined)) return found;
   const out: Found[] = [];
   for (const f of found) {
     if (f.byName !== undefined) {
@@ -85,6 +86,10 @@ export async function resolveScripts(ctx: Ctx, found: Found[]): Promise<Found[]>
           }
         }
       }
+      continue;
+    }
+    if (f.scriptFile !== undefined) {
+      for (const g of await scriptFileRuns(ctx, f)) out.push(g);
       continue;
     }
     if (f.script === undefined) {
@@ -106,6 +111,51 @@ export async function resolveScripts(ctx: Ctx, found: Found[]): Promise<Found[]>
     }
   }
   return out;
+}
+
+/** How bash runs a script file (`bash x.sh`, `./x.sh`): no -e unless the file sets it (`set -e`, read by scanShell). */
+const SCRIPT_FILE_SHELL: ShellMode = { errexit: false, pipefail: false };
+
+/**
+ * DoD run (fastapi/full-stack-fastapi-template: `uv run bash scripts/tests-start.sh` → `bash scripts/test.sh` →
+ * `coverage run -m pytest`): what a repo shell script file runs that counts for an own script (tests, lint, format,
+ * type-check, coverage, dead-code, …), under the caller's phrase. The file is read through the coverage Reader (no
+ * symbolic link at any level, real path inside the repo, the read limits), its text read like a step's (`set -e` and
+ * `cd` count; the script runs in the caller's folder, so paths inside it are taken from there), and the script files
+ * and own package scripts it calls in turn are followed the same way: each (folder, file) once, a cycle adding
+ * nothing, at most MAX_SCRIPTS. A file pipegen can't read or place, or one past that bound, is never covered and never
+ * missing: its own-script checks are unknown, saying why.
+ */
+async function scriptFileRuns(ctx: Ctx, f: Found): Promise<Found[]> {
+  const unknown = (why: string): Found[] => [{ categories: UNKNOWN_SCRIPT_CATEGORIES, by: f.by, subject: f.subject, dir: f.dir, reason: null, partialWhy: why }];
+  const cantRead = `${f.subject} runs a script file pipegen couldn't read (missing, a symbolic link, too large or outside the repo), so it can't tell what it runs.`;
+  if (f.dir === null) return unknown(`${f.subject} runs in a folder pipegen can't place, so it can't tell which script file runs.`);
+  const path = posix.normalize(f.dir === '.' ? f.scriptFile as string : `${f.dir}/${f.scriptFile as string}`);
+  if (path.startsWith('../') || path === '..') return unknown(cantRead);
+  const key = `file\u0000${f.dir}\u0000${path}`;
+  let runs = ctx.scriptMemo.get(key);
+  if (runs === undefined) {
+    if (ctx.scriptMemo.size >= MAX_SCRIPTS) {
+      return unknown(`There are more scripts than pipegen follows (${MAX_SCRIPTS.toLocaleString('en-US')}), so it can't tell what ${f.subject.charAt(0).toLowerCase()}${f.subject.slice(1)} runs.`);
+    }
+    ctx.scriptMemo.set(key, []); // being worked out: a script that calls itself (directly or not) adds nothing
+    const t = await ctx.pkgRead.text(path);
+    if (!('ok' in t)) {
+      ctx.scriptMemo.delete(key);
+      return unknown(cantRead);
+    }
+    const inner = gated(await resolveScripts(ctx, scanShell(t.ok, f.dir, ctx.sigs, ctx.budget, SCRIPT_FILE_SHELL)), gateOf([t.ok], [], undefined, ctx.sigs.softEnv, ctx.sigs.configFiles));
+    runs = inner.flatMap((g) => {
+      const categories = g.categories.filter((x) => SCRIPT_CATEGORIES.has(x.startsWith(UNKNOWN_PREFIX) ? x.slice(UNKNOWN_PREFIX.length) : x));
+      return categories.length === 0 ? [] : [{ ...g, categories, hookRun: false }];
+    });
+    ctx.scriptMemo.set(key, runs);
+  }
+  return runs.map((g) => ({ // the script's own `cd` counts, as for a package script
+    categories: g.categories, by: f.by, subject: f.subject, dir: g.dir, reason: f.reason ?? g.reason,
+    ...(f.reason === null && g.partialWhy !== undefined ? { partialWhy: g.partialWhy } : {}),
+    ...(g.envGate === undefined ? {} : { envGate: g.envGate }), ...carriedConfig(g),
+  }));
 }
 
 export type Targets = string[] | 'capped';

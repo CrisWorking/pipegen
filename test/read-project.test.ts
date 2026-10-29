@@ -303,6 +303,18 @@ describe('read', () => {
     expect(await readProject(makeRepo('node-npm', 'https://github.com/o-1/my.repo_x-y.git'))).toMatchObject({ owner: 'o-1', repo: 'my.repo_x-y' });
   });
 
+  it('read: a Python folder with a Dockerfile is a service next to Node workspace packages (DoD fastapi)', async () => {
+    // fastapi/full-stack-fastapi-template: the root package.json lists Node workspaces (frontend), and backend/ is a
+    // Python app with its own Dockerfile. The workspace list names Node packages only, so it must not hide backend/.
+    const p = await readProject(repo('workspaces-python-backend'));
+    expect(p.services.map((s) => [s.path, s.language])).toEqual([['frontend', 'node'], ['backend', 'python']]);
+    expect(p.services.find((s) => s.path === 'backend')?.hasTests).toBe(true);
+    // a Dockerfile folder without a Python or Go manifest (an nginx or database image) stays out
+    const infra = repo('workspaces-python-backend');
+    writeIn(infra, 'nginx/Dockerfile', 'FROM nginx\n');
+    expect((await readProject(infra)).services.map((s) => s.path)).toEqual(['frontend', 'backend']);
+  });
+
   it('read: Dockerfiles under .devcontainer, test, fixtures, examples, docs are not services', async () => {
     const dir = repo('node-npm');
     writeIn(dir, 'Dockerfile', 'FROM node:20\n');

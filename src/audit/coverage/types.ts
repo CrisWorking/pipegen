@@ -49,6 +49,8 @@ export interface Found {
   categories: readonly string[]; by: string; subject: string; dir: string | null; reason: Reason | null; partialWhy?: string;
   /** Task 5: `npm|pnpm|yarn|bun run <script>`, counted only once the script's own text is read (resolveScripts). */
   script?: string;
+  /** DoD run (fastapi): a shell script file of the repo (repoScriptFile), relative to `dir`, followed by resolveScripts. */
+  scriptFile?: string;
   /**
    * Task 5: a tox or nox run; an environment variable that picks other envs or sessions (TOX*, NOX*) drops it. 'npm':
    * an npm publish, which NPM_CONFIG_DRY_RUN turns into a dry run (fix round 1, M1).

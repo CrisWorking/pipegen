@@ -31,6 +31,10 @@
 //   row that would be missing is unknown when the repo has more services (MAX_SERVICES) or more distinct run dirs
 //   (MAX_HIT_DIRS) than pipegen matches; a cap only drops runs, so it never makes a row covered.
 // - missing: nothing matches. `gate` and `deploy-verify` are always missing: they are pipegen's own checks.
+// DoD run 2026-10-29 (fastapi): a repo shell script file run as a command (`bash scripts/test.sh`, `./ci.sh`; a plain
+//   relative `.sh` path, no `..`) is read like a step (no -e unless it sets it, in the caller's folder) and followed
+//   like an own package script: its tests, lint, format, type-check, coverage and dead-code runs count under "your own
+//   `<file>`"; a file pipegen can't read is unknown. `coverage run [flags] -m pytest` runs the tests.
 // Task 5 (accuracy from real repos):
 // - own scripts: `npm|pnpm|yarn|bun run <name>` for a name other than test/lint[:x] counts only through the script's
 //   own text in <dir>/package.json (the run's directory), read as npm runs it (sh -c, no -e), following the own

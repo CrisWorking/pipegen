@@ -972,3 +972,32 @@ describe('render: P40/P45, what the secret scan found is masked report-wide', ()
     expect(json(withName())).toContain(seg);
   });
 });
+
+// DoD run 2026-10-29 (fastapi/full-stack-fastapi-template): with two services, every per-service check was printed
+// once per service with the same status and why, so each layer read as if every row were printed twice.
+describe('rows shared by several services (DoD fastapi)', () => {
+  const twoServices = (): AuditReport => {
+    const r = report();
+    const why = 'Without a code scan, common security bugs reach the main branch unnoticed.';
+    const sast = (svc: string) => ({ need: need('push', 'sast', svc), status: 'missing' as const, why });
+    const lint = (svc: string, status: Coverage['status'], w: string) => ({ need: need('push', 'lint', svc), status, why: w });
+    return {
+      ...r,
+      profile: { ...r.profile, services: [service({ name: 'frontend', path: 'frontend' }), service({ name: 'emails', path: 'emails' }), service({ name: 'app', path: 'backend' })] },
+      coverage: [sast('frontend'), sast('emails'), sast('app'), lint('frontend', 'missing', 'No lint.'), lint('emails', 'covered', 'eslint runs.'), lint('app', 'missing', 'No lint.')],
+      wouldAdd: ['frontend', 'emails', 'app'].map((s) => ({ need: need('push', 'sast', s), status: 'missing' as const, tool: null, also: [], note: SUGGESTION_NOTE })),
+    };
+  };
+
+  it('report: one row names every service when status, why and finding are the same; different answers stay apart', () => {
+    for (const out of [tflat(twoServices()), md(twoServices())]) {
+      expect(out.match(/Code scan \(SAST\) for/g)?.length).toBe(2); // one in the layer, one in "would add"
+      expect(out).toContain('Code scan (SAST) for frontend, emails and app');
+      expect(out).toContain('Lint for frontend and app');
+      expect(out).toContain('Lint for emails');
+    }
+    // the layer still counts checks, one per service, and JSON keeps one row per check
+    expect(tflat(twoServices())).toContain('(1 of 6 checks covered)');
+    expect((JSON.parse(json(twoServices())) as { coverage: unknown[] }).coverage).toHaveLength(6);
+  });
+});

@@ -2590,3 +2590,59 @@ describe('mapCoverage (Plan P final review I1, ruling P33)', () => {
     expect(r.status).toBe('covered');
   });
 });
+
+// DoD run 2026-10-29 (fastapi/full-stack-fastapi-template): backend tests run through repo shell scripts
+// (`uv run bash scripts/tests-start.sh` → `bash scripts/test.sh` → `coverage run -m pytest`). The fixture is a minimal
+// synthetic copy of that layout (test/fixtures/repos/workspaces-python-backend).
+describe('coverage: repo shell script files (DoD fastapi)', () => {
+  const fixtureProfile = async () => {
+    const { makeRepo } = await import('./helpers/make-repo.js');
+    const { readProject } = await import('../src/read/project.js');
+    const dir = makeRepo('workspaces-python-backend', 'https://github.com/o/r.git');
+    const p: RepoProfile = { ...(await readProject(dir)), private: false, ownerType: 'User', plan: 'free' };
+    return { dir, p };
+  };
+
+  it('coverage: tests run by a script file the step calls, and the script it calls, count for that service', async () => {
+    const { dir, p } = await fixtureProfile();
+    const rows = await mapCoverage(p, floorNeeds(p, caps), dir);
+    const merge = row(rows, 'merge', 'unit-tests', 'app');
+    expect(merge).toMatchObject({ status: 'covered', by: 'your own `scripts/tests-start.sh`', where: '.github/workflows/test-backend.yml (job test-backend)' });
+    expect(row(rows, 'push', 'unit-tests', 'app').status).toBe('covered');
+    // the frontend has no run of its own: still missing (a script in backend/ covers only backend)
+    expect(row(rows, 'merge', 'unit-tests', 'frontend').status).toBe('missing');
+  });
+
+  it('coverage: a script file pipegen can\'t read is unknown, never missing; a script run under || true is partial', async () => {
+    const { dir, p } = await fixtureProfile();
+    const { rmSync } = await import('node:fs');
+    rmSync(join(dir, 'backend/scripts/test.sh'));
+    const rows = await mapCoverage(p, floorNeeds(p, caps), dir);
+    expect(row(rows, 'merge', 'unit-tests', 'app')).toMatchObject({ status: 'unknown', by: 'your own `scripts/tests-start.sh`' });
+    expect(row(rows, 'merge', 'unit-tests', 'app').why).toMatch(/couldn't read/);
+
+    const soft = await fixtureProfile();
+    writeIn(soft.dir, '.github/workflows/test-backend.yml', `on: [push, pull_request]\njobs:\n  t:\n    runs-on: ubuntu-latest\n    steps:\n      - run: bash scripts/tests-start.sh || true\n        working-directory: backend\n`);
+    const softRows = await mapCoverage(soft.p, floorNeeds(soft.p, caps), soft.dir);
+    expect(row(softRows, 'merge', 'unit-tests', 'app').status).toBe('partial');
+  });
+
+  it('coverage: a script file is read without -e unless it sets it; a path that leaves the repo is never read', async () => {
+    const { dir, p } = await fixtureProfile();
+    writeIn(dir, 'backend/scripts/test.sh', '#!/usr/bin/env bash\npytest tests/\necho done\n'); // no set -e: pytest can't fail it
+    const rows = await mapCoverage(p, floorNeeds(p, caps), dir);
+    expect(row(rows, 'merge', 'unit-tests', 'app').status).toBe('partial');
+    writeIn(dir, 'backend/scripts/tests-start.sh', 'set -e\nbash ../../outside/test.sh\n');
+    const out = await mapCoverage(p, floorNeeds(p, caps), dir);
+    expect(row(out, 'merge', 'unit-tests', 'app').status).toBe('missing'); // `..` is never followed (not a repo script path)
+  });
+
+  it('coverage: `coverage run -m pytest` runs the tests; a flag whose value is the next word stops it', async () => {
+    const dir = makeTempDir();
+    wf(dir, 'ci.yml', `on: [push, pull_request]\n${job('      - run: coverage run --branch -m pytest tests/\n')}`);
+    expect(row(await coverage(dir), 'merge', 'unit-tests').status).toBe('covered');
+    const odd = makeTempDir();
+    wf(odd, 'ci.yml', `on: [push, pull_request]\n${job('      - run: coverage run --rcfile cfg -m pytest tests/\n')}`);
+    expect(row(await coverage(odd), 'merge', 'unit-tests').status).toBe('missing');
+  });
+});

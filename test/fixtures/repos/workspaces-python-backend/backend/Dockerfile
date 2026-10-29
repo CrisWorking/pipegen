@@ -1,0 +1,2 @@
+FROM python:3.14
+EXPOSE 8000

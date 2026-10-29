@@ -174,6 +174,16 @@ export function imageName(image: string): string {
   const colon = name.indexOf(':');
   return colon < 0 ? name : name.slice(0, colon);
 }
+/**
+ * A shell script file of the repo run as a command (`scripts/test.sh`, `./ci.sh`, after `bash`/`sh` or not): its path
+ * without leading `./`, or null. Only plain relative paths of ASCII letters, digits and . _ - / ending in `.sh` (no `..`
+ * part, at most 200 characters), so the path is safe to show and can't leave the repo by its text.
+ */
+export function repoScriptFile(w: string): string | null {
+  const path = stripDotSlash(w);
+  if (path.length > 200 || !/^[A-Za-z0-9_.][A-Za-z0-9_./-]*\.sh$/.test(path) || path.split('/').some((x) => x === '..' || x === '.' || x === '')) return null;
+  return path;
+}
 const stripDotSlash = (w: string) => {
   let i = 0;
   while (w.startsWith('./', i)) i += 2;
@@ -372,6 +382,13 @@ export function scanShell(text: string, base: string | null, sigs: Compiled, bud
     };
     if (w.includes('/')) tryRules(sigs.byPath.get(stripDotSlash(w)));
     tryRules(sigs.byFirstWord.get(name));
+    // DoD run (fastapi): `bash scripts/tests-start.sh`, `./ci.sh`: a shell script file from the repo, followed by
+    // resolveScripts (its own text read like a step's), so its tests and lint count under "your own `<file>`"
+    const file = repoScriptFile(w);
+    if (file !== null) {
+      add({ categories: [], by: `your own \`${file}\``, subject: `Your own \`${file}\``, dir: cwd, reason: shellReason(k), scriptFile: file });
+      return;
+    }
     if (w !== name) return;
     // The service's own scripts (ruling S5): npm test, npm run test|lint, pnpm|yarn|bun [run] test|lint, pytest,
     // python -m pytest; never a script that only fixes. Task 5: `npm|pnpm|yarn|bun run <other name>` (counted once
@@ -385,7 +402,15 @@ export function scanShell(text: string, base: string | null, sigs: Compiled, bud
     const b = word(k + 2);
     if (name === 'pytest') words = args.some((x) => PYTEST_NO_RUN.has(x)) ? null : ['pytest'];
     else if ((name === 'python' || name === 'python3') && a === '-m' && b === 'pytest') words = args.some((x) => PYTEST_NO_RUN.has(x)) ? null : [name, '-m', 'pytest'];
-    else if (name === 'npm' && a !== null && NPM_TEST.has(a) && scriptFlagsOk(k + 1)) [words, byName] = [['npm', a], 'test'];
+    else if (name === 'coverage' && a === 'run') {
+      // DoD run (fastapi): `coverage run [flags] -m pytest` runs pytest and exits with its code (coverage.py docs,
+      // https://coverage.readthedocs.io/en/latest/cmd.html#execution-coverage-run). Only `--flag[=value]` / `-x` words
+      // before `-m`: a flag whose value is the next word stops it (pipegen doesn't read coverage's flag list).
+      const m = args.indexOf('-m');
+      if (m >= 1 && args[m + 1] === 'pytest' && args.slice(1, m).every((x) => /^-[A-Za-z]$|^--[a-z][a-z-]*(?:=\S*)?$/.test(x))) {
+        words = args.some((x) => PYTEST_NO_RUN.has(x)) ? null : ['coverage', 'run', '-m', 'pytest'];
+      }
+    } else if (name === 'npm' && a !== null && NPM_TEST.has(a) && scriptFlagsOk(k + 1)) [words, byName] = [['npm', a], 'test'];
     else if (PACKAGE_MANAGERS.includes(name) && a !== null && (a === 'run' || (name === 'npm' && NPM_RUN.has(a))) && b !== null && ownName(b)
       && scriptFlagsOk(k + 2)) [words, byName] = [[name, a, b], b];
     else if (['pnpm', 'yarn', 'bun'].includes(name) && a !== null && ownName(a) && scriptFlagsOk(k + 1)) [words, byName] = [[name, a], a];
