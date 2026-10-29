@@ -40,7 +40,7 @@
     PIPEGEN_REQUIREMENTS: "mypy==2.4.0 --hash=sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 
       typing-extensions==4.12.2 --hash=sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n"
-- id: tool-run-ed4f8358c8fde1c3
+- id: repocode-ed4f8358c8fde1c3
   name: "pipegen: run mypy"
   run: |-
     set -euo pipefail

@@ -442,9 +442,10 @@ export function renderCliTool({ spec, tool, service, hooks, options }: CliArgs):
     ...closureVars, ...allowlist(pathValue, passed), ...afterAllow, 'rc=0', `${chain} || rc=$?`, ...postCheck, 'exit "$rc"',
   ]);
   // a tool that runs the repo's own code is marked, so the referee can apply its order rule (S6 c); the id is not `pipegen-…`, which a job's dedupe may drop
-  // (a tool of an app-running category is marked too, whatever its policy says: fail closed)
+  // fail closed: the run is repo code unless the policy says it only reads (readsOnly), and never for an app-running category
   const appRunning = tool.categories.some((c) => APP_RUNNING_CATEGORIES.has(c));
-  const runId = pol.runsRepoCode === true || pol.loadsRepoConfig === true || appRunning ? `repocode-${sha16(artifact)}` : checker ? `checker-run-${sha16(artifact)}` : `tool-run-${sha16(artifact)}`;
+  const harmless = pol.readsOnly === true && pol.runsRepoCode !== true && pol.loadsRepoConfig !== true && !appRunning;
+  const runId = !harmless ? `repocode-${sha16(artifact)}` : checker ? `checker-run-${sha16(artifact)}` : `tool-run-${sha16(artifact)}`;
   steps.push(runStep(`pipegen: run ${exe}`, run, env, runId));
   return { steps, output: out === null ? null : { path: `\${{ runner.temp }}/pipegen-out/${artifact}/${out}`, format: tool.step.output.format } };
 }

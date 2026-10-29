@@ -120,3 +120,38 @@ describe('C5: a closureEnv path with .. is refused', () => {
     expect(() => renderStepWith(specFor(t, { needId: needFor(t) }), t, platform(), ctx, { policies: { ...ARGV_POLICIES, 'oxlint-typeaware': ok } })).not.toThrow();
   });
 });
+
+describe('readsOnly: a run step is repo code unless its policy says it only reads (controller ruling on Part 0)', () => {
+  /** readsOnly tools without a pinned config flag, each with the reason it can not load repo code. */
+  const DOCUMENTED: Record<string, string> = {
+    semgrep: 'rules come only from the verified archive via --config /pipegen-rules, in a container with --network none (semgrepProblems)',
+    nuclei: 'templates come only from the verified archive via -t; code templates need -code, which is not on its allowlist (nucleiProblems)',
+  };
+  it('every policy with readsOnly has a pinned config passed by flag, or a documented reason listed here', () => {
+    const offenders: string[] = [];
+    for (const [id, pol] of Object.entries(ARGV_POLICIES)) {
+      if (pol.readsOnly !== true) continue;
+      if (pol.runsRepoCode === true || pol.loadsRepoConfig === true) offenders.push(`${id}: readsOnly with repo code`);
+      if (pol.config === undefined && DOCUMENTED[id] === undefined) offenders.push(`${id}: no pinned config and no documented reason`);
+    }
+    expect(offenders).toEqual([]);
+    for (const id of Object.keys(DOCUMENTED)) expect(ARGV_POLICIES[id]?.readsOnly, id).toBe(true);
+  });
+  it('pip tools, schemathesis, pinact and the repo-code tools are not readsOnly', () => {
+    for (const id of ['mypy', 'coverage-py', 'creosote', 'vulture', 'bandit', 'schemathesis', 'pinact', 'lefthook', 'prettier', 'knip', 'vitest-coverage', 'c8']) expect(ARGV_POLICIES[id]?.readsOnly, id).not.toBe(true);
+  });
+  it('a policy with no readsOnly flag renders a repocode- run step; with it, tool-run / checker-run', () => {
+    const t = entry('gitleaks');
+    const without = { ...ARGV_POLICIES.gitleaks } as Record<string, unknown>;
+    delete without.readsOnly;
+    const r = renderStepWith(specFor(t, { needId: needFor(t) }), t, platform(), ctx, { policies: { ...ARGV_POLICIES, gitleaks: without as unknown as ArgvPolicy } });
+    expect(r.steps.at(-1)?.id).toMatch(/^repocode-[0-9a-f]{16}$/);
+    expect(steps('gitleaks').at(-1)?.id).toMatch(/^tool-run-/);
+    const e = entry('eslint');
+    const w = { ...ARGV_POLICIES.eslint } as Record<string, unknown>;
+    delete w.readsOnly;
+    const r2 = renderStepWith(specFor(e, { needId: needFor(e) }), e, platform(), ctx, { policies: { ...ARGV_POLICIES, eslint: w as unknown as ArgvPolicy } });
+    expect(r2.steps.at(-1)?.id).toMatch(/^repocode-/);
+    expect(steps('eslint').at(-1)?.id).toMatch(/^checker-run-/);
+  });
+});

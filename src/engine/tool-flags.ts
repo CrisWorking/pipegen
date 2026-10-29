@@ -116,6 +116,11 @@ export interface ArgvPolicy extends CommandPolicy {
    */
   readonly runsRepoCode?: true;
   /**
+   * The tool only reads code and can not load repo plugins or hooks (see READS_ONLY for the reason per entry). Without it
+   * the run step is a repo-code step (`repocode-…`): the default fails closed.
+   */
+  readonly readsOnly?: true;
+  /**
    * An npm checker that still loads files from the repo by design (prettier runs a repo `.prettierrc.cjs` and its plugins, knip
    * runs `knip.ts` and the repo's tool configs). It keeps the closure install, but its run step is a repo-code step too
    * (`repocode-…` id, runsRepoCode(id) is true), so the referee's order rule applies to it.
@@ -146,7 +151,7 @@ const ESLINT_TS_FILES = "files: ['**/*.{js,mjs,cjs,jsx,ts,mts,cts,tsx,vue,svelte
  * failing off (`--exit-zero`, `-no-fail`, `--no-fail`, `--write`, `--fix`, `--failure-threshold none`, …) is never
  * on a list (P20).
  */
-export const ARGV_POLICIES: Readonly<Record<string, ArgvPolicy>> = Object.freeze({
+const POLICIES = {
   'trivy-config': DEDICATED('trivy', TRIVY_ASSET, TRIVY_CONFIG), 'trivy-image': { ...DEDICATED('trivy', TRIVY_ASSET, TRIVY_CONFIG), needsSlot: 'needs an image to scan, a target slot that is rendered in 6c (ruling B6)' }, 'trivy-licence': DEDICATED('trivy', TRIVY_ASSET, TRIVY_CONFIG),
   betterleaks: DEDICATED('betterleaks', 'betterleaks_1.9.0_linux_x64.tar.gz', { flag: '--config', content: '[extend]\nuseDefault = true\n', fileName: 'betterleaks.toml' }),
   nuclei: DEDICATED('nuclei', 'nuclei_3.11.1_linux_amd64.zip'),
@@ -284,7 +289,28 @@ export const ARGV_POLICIES: Readonly<Record<string, ArgvPolicy>> = Object.freeze
     exe: 'bandit', dialect: 'long', sub: [], positionals: ['.'], flags: { recursive: 'bool', format: { values: ['sarif'] }, output: 'output' },
     required: { recursive: 'true', format: 'sarif', output: null },
   },
-} satisfies Record<string, ArgvPolicy>);
+} satisfies Record<string, ArgvPolicy>;
+
+/**
+ * The tools whose run step may carry a harmless id (`tool-run-…` / `checker-run-…`) instead of `repocode-…` (controller
+ * ruling on 6b Part 0): the default is repo code, because a tool that reads a repo config can load plugins or hooks from
+ * it (mypy, schemathesis, pinact). An entry is listed only with a reason it can not load repo code. Everything with a
+ * pinned config passed by flag reads that one (the loop test in test/job-order.test.ts checks this); semgrep and nuclei
+ * have no config file but a verified rules archive. NOT listed, on purpose: lefthook, vitest-coverage, c8 (run repo code),
+ * prettier, knip (load repo config), pinact (reads .pinact.yaml, no pinned config), gosec, cosign, registry (not rendered
+ * as a step), and every pip tool and schemathesis.
+ */
+const READS_ONLY: readonly string[] = [
+  // pinned config passed by flag
+  'trivy-config', 'trivy-image', 'trivy-licence', 'betterleaks', 'gitleaks', 'osv-scanner', 'syft', 'actionlint', 'zizmor',
+  'biome', 'eslint', 'eslint-typescript', 'oxlint-typeaware', 'jscpd', 'hadolint', 'kube-linter', 'poutine', 'ruff', 'ruff-format', 'zap-baseline',
+  // no config file, but verified rules/templates only, no repo plugin mechanism on the allowlist
+  'semgrep', 'nuclei',
+];
+
+export const ARGV_POLICIES: Readonly<Record<string, ArgvPolicy>> = Object.freeze(Object.fromEntries(
+  Object.entries(POLICIES as Record<string, ArgvPolicy>).map(([id, pol]) => [id, READS_ONLY.includes(id) ? { ...pol, readsOnly: true as const } : pol]),
+));
 
 /** Whether a reviewed entry runs or loads the repo's own code (tests, hooks, a JS config): the referee's order rule treats its step as a repo-code step. */
 export function runsRepoCode(entryId: string): boolean {
