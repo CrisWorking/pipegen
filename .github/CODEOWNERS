@@ -25,6 +25,9 @@
 /scripts/scanner-live.ts @CrisWorking
 /test/scanner-live.test.ts @CrisWorking
 /test/release-check.test.ts @CrisWorking
+# The helpers the live tests import (the scanner stubs and scanWith, the temp repos, counted()): editing them can weaken
+# every live test at once.
+/test/helpers/         @CrisWorking
 /tsup.config.ts        @CrisWorking
 /tsup.dev.config.ts    @CrisWorking
 /tsconfig.json         @CrisWorking
