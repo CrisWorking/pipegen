@@ -1,5 +1,6 @@
 // Release check (ruling S18), run only by .github/workflows/release.yml and by hand from docs/release.md. It is NOT part
-// of pull-request CI: until the owner has reviewed the lists, it is expected to fail (the PENDING entries).
+// of pull-request CI. It fails whenever an entry of the lists is not reviewed (PENDING); every entry was reviewed on
+// 2026-10-28, and a new or changed entry needs a review again (by the owner, or by Claude under DECISIONS #105).
 //
 // Before a release it checks, and fails closed on every one of them:
 //   1. no `reviewedBy`/`reviewedAt` PENDING (or missing) in data/reviewed-tools.yml and data/pinned-binaries.yml;

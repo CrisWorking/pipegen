@@ -17,7 +17,7 @@ the signed tags happen only when v0.4 is done). This page has two parts: what is
 | Piece | File | Guard |
 |---|---|---|
 | Release workflow | `.github/workflows/release.yml` | Runs only on pushed `v*` tags **and** only when `github.event.repository.visibility == 'public'` **and** the repository is `CrisWorking/pipegen`. In the private repo a `v*` tag starts nothing. |
-| Release check | `scripts/release-check.ts` | Run by `release.yml` (and by hand, below). Not part of pull-request CI: it is expected to fail until the owner has reviewed the lists. |
+| Release check | `scripts/release-check.ts` | Run by `release.yml` (and by hand, below). Not part of pull-request CI. It fails while any list entry is `PENDING`; all entries were reviewed on 2026-10-28, and a new or changed entry needs a review again. |
 | Scorecard | `.github/workflows/scorecard.yml` | Runs only when the repo is public. |
 | Cooldown | `scripts/cooldown.ts` | Pull requests; see [cooldown.md](cooldown.md). |
 
