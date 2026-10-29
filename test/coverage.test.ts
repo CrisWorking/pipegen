@@ -1143,7 +1143,10 @@ describe('mapCoverage (P55 batch B: docker compose and Dockerfile RUN)', () => {
     expect(await t('docker compose run --rm db pytest')).toMatch(/^unknown/); // a ready-made image: pipegen can't tell which service it checks
     expect(await t('docker compose run --rm nope pytest')).toMatch(/^unknown/);
     expect(await t('docker compose run --rm web pytest', {})).toBe('missing'); // no compose file: the runner fails
-    expect(await t('docker compose run --rm web bash scripts/t.sh')).toMatch(/^unknown/); // the container's own copy of the script
+    // a script file is read from the service's build folder (the image holds the repo's copy); one that isn't there is unknown
+    expect(await t('docker compose run --rm web bash scripts/t.sh', { 'compose.yml': COMPOSE, 'backend/scripts/t.sh': 'pytest\n' })).toBe('covered your own `scripts/t.sh`');
+    expect(await t('docker compose run --rm web bash scripts/t.sh', { 'compose.yml': COMPOSE, 'backend/scripts/t.sh': 'echo hi\n' })).toBe('missing');
+    expect(await t('docker compose run --rm web bash scripts/t.sh')).toMatch(/^unknown/);
   });
 
   it('a RUN in a Dockerfile `docker build` builds counts under the same rules (stages, folders, conditions)', async () => {

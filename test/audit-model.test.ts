@@ -937,7 +937,7 @@ describe('buildAudit: the last run of a covering workflow (hand checks fix 3, P5
     }
     // one call for the workflow, however many rows it covers, asked for the default branch's completed runs
     expect(f.runs).toHaveBeenCalledTimes(1);
-    expect(f.runs).toHaveBeenCalledWith(expect.objectContaining({ workflow_id: 'ci.yml', branch: 'main', status: 'completed', per_page: 1 }));
+    expect(f.runs).toHaveBeenCalledWith(expect.objectContaining({ workflow_id: 'ci.yml', branch: 'main', status: 'completed', exclude_pull_requests: true, per_page: 1 }));
     expect(rowsOf(r, 'unit-tests').map((w) => w.status)).toEqual(['partial', 'partial']);
   });
 

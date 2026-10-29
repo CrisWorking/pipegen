@@ -896,7 +896,8 @@ export function scanShell(text: string, base: string | null, sigs: Compiled, bud
       const c = composeCommand(k, name === 'docker' ? k + 2 : k + 1);
       if (c !== null) {
         visit(false);
-        containerEnd = segEnd[k]!; // the command runs in the service's container, from its image's own copy of the files
+        // a script file named here is read from the service's build folder (resolveScripts places the run): the image of a
+        // compose service that builds from the repo holds the repo's copy; a service with no build is unknown there
         composeRegion = { start: c.commandAt, end: segEnd[k]!, run: c.run };
         k = c.commandAt;
         cmd = true;

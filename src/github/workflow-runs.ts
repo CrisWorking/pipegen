@@ -2,7 +2,8 @@
 // can be "covered" by a step that exists and can fail the build, while the workflow fails on every run (the secrets
 // repo's `node --test test/` never ran a test). The run's conclusion is the one signal pipegen can read for that.
 //
-// GET /repos/{o}/{r}/actions/workflows/{file}/runs?branch=<default>&status=completed&per_page=1: Actions: read (in the
+// GET /repos/{o}/{r}/actions/workflows/{file}/runs?branch=<default>&status=completed&exclude_pull_requests=true&per_page=1
+// (a pull request opened from a fork's branch of the same name is not a run on the default branch): Actions: read (in the
 // read-only token; anonymous works on a public repo). One call per workflow; a rate stop is thrown (the caller keeps
 // what it has and says so); anything else is a plain "couldn't read" with its kind. Read-only.
 import type { Octokit } from '@octokit/rest';
@@ -23,7 +24,7 @@ export async function lastCompletedRun(gh: Octokit, owner: string, repo: string,
   if (file === null) return { state: 'unread', why: 'answer' };
   let data: unknown;
   try {
-    data = (await withRateLimit(() => gh.rest.actions.listWorkflowRuns({ owner, repo, workflow_id: file, branch, status: 'completed', per_page: 1 }), clock)).data;
+    data = (await withRateLimit(() => gh.rest.actions.listWorkflowRuns({ owner, repo, workflow_id: file, branch, status: 'completed', exclude_pull_requests: true, per_page: 1 }), clock)).data;
   } catch (e) {
     if (isRateStop(e)) throw e;
     const status = (e as { status?: unknown } | null)?.status;
