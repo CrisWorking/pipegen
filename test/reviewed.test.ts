@@ -91,7 +91,7 @@ function cliEntry(over: Entry = {}): Entry {
     id, categories, languages: ['any'], releasedAt: '2026-01-01T00:00:00Z',
     candidate: candidate(id, 'cli', repo, 'v8.30.1', { checksum: SUM }, categories),
     step: {
-      cli: { install: { method: 'github-release', package: 'gitleaks_8.30.1_linux_x64.tar.gz', version: 'v8.30.1' }, command: ['gitleaks', 'git', ...GITLEAKS_ARGS, '.'] },
+      cli: { install: { method: 'github-release', package: 'gitleaks_8.30.1_linux_x64.tar.gz', version: 'v8.30.1' }, command: ['gitleaks', 'dir', ...GITLEAKS_ARGS, '.'] },
       output: { path: 'gitleaks.sarif', format: 'sarif' },
     },
     fixedInputs: { args: [...GITLEAKS_ARGS], config: { content: '[extend]\nuseDefault = true\n', passAs: { flag: '--config' } } },
@@ -137,6 +137,12 @@ const svc = (over: Partial<Service> = {}): Service => ({
 /** The real list, read raw (for releasedAt and pinnedOn, which loadReviewed doesn't return). */
 const rawFile = () => parse(readFileSync(DATA, 'utf8')) as { pinnedOn: string; tools: Entry[] };
 const real = () => loadReviewed();
+/** A list of the given real-shaped entries, loaded with the real list's pinnedOn and the real policies. */
+const loadAtReal = (tools: Entry[]) => {
+  const dir = makeTempDir();
+  writeIn(dir, 'reviewed-tools.yml', stringify({ pinnedOn: rawFile().pinnedOn, tools }));
+  return loadReviewed(`${dir}/reviewed-tools.yml`);
+};
 const byId = (list: ReviewedTool[], id: string) => list.filter((t) => t.id === id);
 
 // ---------- loading and validation ----------
@@ -1659,6 +1665,24 @@ describe('data/reviewed-tools.yml', () => {
     rejects([semgrepEntry(undefined, cmd, (t?.fixedInputs.args ?? []).filter((x) => x !== '--max-target-bytes=0'))], /max-target-bytes/);
     const limited = (t?.step.cli?.command ?? []).map((x) => (x === '--max-target-bytes=0' ? '--max-target-bytes=1000000' : x));
     rejects([semgrepEntry(undefined, limited, (t?.fixedInputs.args ?? []).map((x) => (x === '--max-target-bytes=0' ? '--max-target-bytes=1000000' : x)))], /max-target-bytes/);
+  });
+
+  it('data (C1b fix round 1, C1): betterleaks and gitleaks scan the checked-out tree (dir mode), not the git history, reviewed by delegation', () => {
+    for (const id of ['betterleaks', 'gitleaks']) {
+      const t = byId(real(), id)[0];
+      expect(t?.step.cli?.command.slice(0, 2), id).toEqual([id, 'dir']);
+      expect(t?.step.cli?.command, id).not.toContain('git');
+      expect(t?.step.cli?.command.at(-1), id).toBe('.');
+      expect(t?.reviewedBy, id).toBe('Claude delegated DECISIONS 105');
+      expect(t?.reviewedAt, id).toBe('2026-10-29');
+      expect(DELEGATED[id], id).toBe('2026-10-29');
+      // the same command with `git` does not load: gitleaks' policy allows only dir, and the real entry is read with its own policy
+      const raw = rawFile().tools.find((x) => x.id === id) as Entry;
+      const gitMode = structuredClone(raw);
+      gitMode.step.cli.command[1] = 'git';
+      if (id === 'gitleaks') expect(() => loadAtReal([gitMode]), id).toThrow();
+    }
+    expect(ARGV_POLICIES.gitleaks?.sub).toEqual(['dir']);
   });
 
   it('data: docker login offers ghcr.io only (the workflow token must not go to another registry), reviewed by delegation', () => {

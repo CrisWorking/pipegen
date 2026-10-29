@@ -1347,7 +1347,7 @@
    "results": [
     {
      "message": {
-      "text": "github-pat has detected secret for file src/config.js at commit 7ef3593f4e18747fd475f883dd537255a13678b4."
+      "text": "github-pat has detected secret for file src/config.js."
      },
      "ruleId": "github-pat",
      "locations": [
@@ -1369,11 +1369,11 @@
       }
      ],
      "partialFingerprints": {
-      "commitSha": "7ef3593f4e18747fd475f883dd537255a13678b4",
-      "email": "t@example.com",
-      "author": "t",
-      "date": "2026-10-29T20:24:20Z",
-      "commitMessage": "planted fixture repo"
+      "commitSha": "",
+      "email": "",
+      "author": "",
+      "date": "",
+      "commitMessage": ""
      },
      "properties": {
       "tags": []
@@ -1381,7 +1381,7 @@
     },
     {
      "message": {
-      "text": "github-pat has detected secret for file src/config.js at commit 7ef3593f4e18747fd475f883dd537255a13678b4."
+      "text": "github-pat has detected secret for file src/config.js."
      },
      "ruleId": "github-pat",
      "locations": [
@@ -1403,11 +1403,11 @@
       }
      ],
      "partialFingerprints": {
-      "commitSha": "7ef3593f4e18747fd475f883dd537255a13678b4",
-      "email": "t@example.com",
-      "author": "t",
-      "date": "2026-10-29T20:24:20Z",
-      "commitMessage": "planted fixture repo"
+      "commitSha": "",
+      "email": "",
+      "author": "",
+      "date": "",
+      "commitMessage": ""
      },
      "properties": {
       "tags": []

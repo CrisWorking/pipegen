@@ -25,8 +25,8 @@ capture time (`capture/plant.sh`), and every secrets scan ran with `--redact`, s
 
 | Fixture | Tool and version | Command (reviewed, differences in the last column) | Exit | Results | Differences from the reviewed run |
 |---|---|---|---|---|---|
-| `betterleaks.sarif` | betterleaks 1.9.0 | `betterleaks git --config bl.toml --no-banner --ignore-gitleaks-allow --redact --report-format sarif --report-path betterleaks.sarif --exit-code 10 .` | 10 | 2 | none. `bl.toml` is the entry's `[extend] useDefault = true`. |
-| `gitleaks.sarif` | gitleaks 8.30.1 | same flags, `gitleaks git ...` | 10 | 2 | none |
+| `betterleaks.sarif` | betterleaks 1.9.0 | `betterleaks dir --config bl.toml --no-banner --ignore-gitleaks-allow --redact --report-format sarif --report-path betterleaks.sarif --exit-code 10 .` | 10 | 2 | none. `bl.toml` is the entry's `[extend] useDefault = true`. |
+| `gitleaks.sarif` | gitleaks 8.30.1 | same flags, `gitleaks dir ...` | 10 | 2 | none |
 | `semgrep.sarif` | semgrep 1.181.0 (pip venv) | `semgrep scan --metrics=off --disable-version-check --max-target-bytes=0 --config <rules> --sarif --output semgrep.sarif` | 0 | 7 | the reviewed entry runs the docker image (digest in the entry); it cannot run here, so the same version from a venv ran. Rules: semgrep-rules commit 17e31e11ebac99fb7dfe1cd288f7a32151b6f3f9 (archive sha256 9dfe6866fbecd557f507078cb79721a9eb8f4764fc2f6163648ea1320be25933, checked), folders `javascript/lang/security`, `javascript/express`, `python/lang/security` at `/home/runner/pipegen-rules`. |
 | `semgrep-timeout.sarif` | semgrep 1.181.0 | as above with `--config .../javascript/lang/security` over a repo whose only file is a 20 MB padded `src/huge.js` | 0 | 0 | the real Timeout shape from review-6d-r2: `executionSuccessful: true`, no results, `toolExecutionNotifications` with `Timeout` warnings |
 | `osv-scanner.sarif` | osv-scanner 2.7.0 | `osv-scanner scan source --recursive --config osv.toml --format sarif --output osv.sarif .` | 1 | 8 | queries api.osv.dev when it runs, so the vulnerability list (8, including one critical) is the state of 2026-10-29. `osv.toml` is the entry's one-line comment config. |
@@ -40,6 +40,10 @@ capture time (`capture/plant.sh`), and every secrets scan ran with `--redact`, s
 | `ruff.sarif` | ruff 0.17.1 | `ruff check --no-cache --config ruff.toml --output-format sarif --output-file ruff.sarif` | 1 | 1 | none. `ruff.toml` is the entry's (C901 at 15). The uri is `file://` + the absolute path. |
 | `gosec.sarif` | gosec 2.29.0 | `gosec -fmt sarif -out gosec.sarif -track-suppressions ./...` | 1 | 2 | run inside the `go/` module folder, so the uris are `main.go` |
 | `bandit.sarif` | bandit 1.9.4 | `bandit --recursive --format sarif --output bandit.sarif .` | 1 | 4 | pip install of the three reviewed wheels (bandit, sarif-om 1.0.4, jschema-to-python 1.2.3); their sha256 equal the entry's. Bandit's own dependencies were resolved by pip, unpinned. Python 3.12.3. |
+
+The two secrets fixtures were captured again in `dir` mode (C1b fix round 1, review finding C1: the reviewed entries scan the checked-out tree, so the scanner
+reads the bytes the scrub reads). Results, rules, files, lines and columns are identical to the earlier `git` capture; the only differences are the
+commit fields (`commitSha`, `email`, `author`, `date`, `commitMessage` are now empty strings) and the message, which no longer names a commit.
 
 ## Clean-run fixtures (`clean/*.sarif`)
 

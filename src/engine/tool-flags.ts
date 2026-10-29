@@ -218,9 +218,9 @@ const POLICIES = {
     mount: { at: '/src', source: 'repo', workdir: true }, network: 'none',
     archive: { repo: 'semgrep/semgrep-rules', urlEnv: 'PIPEGEN_RULES_URL', treeEnv: 'PIPEGEN_RULES_TREE', dir: '/pipegen-rules', subChoice: 'rules' },
   },
-  // gitleaks 8.30.1 (`gitleaks git --help`), the secrets fallback (P21): the same locks as betterleaks
+  // gitleaks 8.30.1 (`gitleaks dir --help`; dir mode since C1b fix round 1, so the scanner reads the bytes the scrub reads), the secrets fallback (P21): the same locks as betterleaks
   gitleaks: { method: GH, package: 'gitleaks_8.30.1_linux_x64.tar.gz',
-    exe: 'gitleaks', dialect: 'long', sub: ['git'], positionals: ['.'], findingsExit: FOUND_10,
+    exe: 'gitleaks', dialect: 'long', sub: ['dir'], positionals: ['.'], findingsExit: FOUND_10,
     flags: { 'no-banner': 'bool', 'ignore-gitleaks-allow': 'bool', redact: { values: ['', '100'], optional: true }, 'report-format': { values: ['sarif'] }, 'report-path': 'output', 'exit-code': { values: ['10'] } },
     required: { 'ignore-gitleaks-allow': 'true', redact: '', 'report-format': 'sarif', 'report-path': null, 'exit-code': '10' },
     config: { flag: '--config', content: '[extend]\nuseDefault = true\n', fileName: 'gitleaks.toml' },
