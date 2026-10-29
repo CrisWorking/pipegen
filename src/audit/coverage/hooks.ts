@@ -27,12 +27,21 @@ const LEFTHOOK_SHELL: ShellMode = { errexit: false, pipefail: false };
  * (a word with spaces or quotes, like `bash -c '…'`, isn't read into).
  */
 function hookCommand(entry: string, args: readonly string[]): string {
+  return hookWords(entry, args).text;
+}
+/**
+ * P57 (fail closed): the same, and whether every word was read. A word pipegen doesn't read (spaces, quotes, an
+ * operator, past MAX_FLAG_WORDS) ends the command early, and a soft flag after it would be missed: `complete` false
+ * makes the hook's runs partial ('long'), never covered.
+ */
+function hookWords(entry: string, args: readonly string[]): { text: string; complete: boolean } {
   const out: string[] = [];
-  for (const t of [...tokenize(entry), ...args.flatMap((a) => (regexSafe(a) ? [{ op: null, w: a, kw: null } as Tk] : []))]) {
-    if (t.op !== null || !/^[A-Za-z0-9_./:=@+,%-]+$/.test(t.w) || out.length > MAX_FLAG_WORDS) break;
+  const all = [...tokenize(entry), ...args.map((a) => (regexSafe(a) ? { op: null, w: a, kw: null } as Tk : { op: null, w: '\u0000', kw: null } as Tk))];
+  for (const t of all) {
+    if (t.op !== null || !/^[A-Za-z0-9_./:=@+,%-]+$/.test(t.w) || out.length > MAX_FLAG_WORDS) return { text: out.join(' '), complete: false };
     out.push(t.w);
   }
-  return out.join(' ');
+  return { text: out.join(' '), complete: true };
 }
 
 /**
@@ -106,11 +115,17 @@ async function hookConfigRuns(ctx: Ctx, config: Obj): Promise<Found[]> {
     const found: Found[] = [];
     const scan = (text: string) => scanShell(text, '.', ctx.sigs, ctx.budget, DEFAULT_SHELL);
     // P57 (C1): a hook from a repo pipegen doesn't know may run anything, in any language: its id says nothing about which
+    // P57 (fail closed): hooks past MAX_HOOKS aren't read, so what they run is unknown, never missing
+    if (list(r.ok.repos).length > MAX_HOOKS || list(r.ok.repos).some((x) => list(asObj(x).hooks).length > MAX_HOOKS)) {
+      found.push({ categories: [...HOOK_CATEGORIES].map((c) => `${UNKNOWN_PREFIX}${c}`), by: 'pre-commit', subject: 'The pre-commit config', dir: '.', reason: null,
+        partialWhy: "The pre-commit config has more hooks than pipegen reads, so it can't tell what the rest run." });
+    }
     const tag = (fs: Found[], reason: Reason): Found[] => fs.map((f) => {
       const { langs: _langs, ...rest } = f;
       void _langs;
       return { ...(reason === 'hook-repo' ? rest : f), reason: f.reason ?? reason };
     });
+    const long = (fs: Found[], complete: boolean): Found[] => (complete ? fs : fs.map((f) => ({ ...f, reason: f.reason ?? 'long' })));
     for (const rawRepo of list(r.ok.repos).slice(0, MAX_HOOKS)) {
       const repo = asObj(rawRepo);
       const url = typeof repo.repo === 'string' && regexSafe(repo.repo) ? repo.repo : '';
@@ -135,18 +150,21 @@ async function hookConfigRuns(ctx: Ctx, config: Obj): Promise<Found[]> {
           // `unsupported_script` run the entry as a file in the repo, and `docker_image` starts with an image name
           // (https://pre-commit.com/#supported-languages): none of them runs the named tool (fix round 2, N2)
           if (entry !== undefined && !(typeof hook.language === 'string' && NOT_A_COMMAND_LANGUAGES.has(hook.language))) {
-            words = hookCommand(entry, args).split(' ');
-            hookFound = scan(hookCommand(entry, args));
+            const hw = hookWords(entry, allArgs);
+            words = hw.text.split(' ');
+            hookFound = long(scan(hw.text), hw.complete);
           }
         } else if (entry !== undefined) {
-          words = hookCommand(entry, args).split(' ');
-          hookFound = known ? scan(hookCommand(entry, args)) : tag(scan(hookCommand(entry, args)), 'hook-repo');
+          const hw = hookWords(entry, allArgs);
+          words = hw.text.split(' ');
+          hookFound = long(known ? scan(hw.text) : tag(scan(hw.text), 'hook-repo'), hw.complete);
         } else if (id !== '') {
           const tools = known ? ctx.sigs.hooks.get(hookRepoKey(url, id)) : undefined;
-          words = tools !== undefined ? args : hookCommand(id, args).split(' ');
+          const hw = hookWords(id, allArgs);
+          words = tools !== undefined ? args : hw.text.split(' ');
           hookFound = tools !== undefined
             ? tools.filter((t) => flagsAllow(t, args, complete)).map((t) => foundOf(t, '.', commandReason(t, args) ?? (complete ? null : 'long')))
-            : tag(scan(hookCommand(id, args)), 'hook-repo');
+            : long(tag(scan(hw.text), 'hook-repo'), hw.complete);
         }
         hookFound = hookFound.map((f) => ({ ...(FORMATTER_HOOKS.has(f.by) ? { ...f, formats: formatterFails(f.by, words) } : f), ...(id === '' ? {} : { hookId: id }), ...(alias === undefined ? {} : { hookAlias: alias }) }));
         // a file filter pipegen doesn't evaluate (they are Python regexes from the repo), or another stage
@@ -183,10 +201,12 @@ export async function readHooks(ctx: Ctx): Promise<Hooks> {
     if ('fail' in r && r.fail === 'missing') continue;
     if ('fail' in r) return { ...none, where, readable: false };
     const hook = asObj(r.ok['pre-commit']);
-    const entries = [...Object.values(asObj(hook.commands)), ...list(hook.jobs)].slice(0, MAX_HOOKS).map(asObj);
+    const all = [...Object.values(asObj(hook.commands)), ...list(hook.jobs)];
+    const entries = all.slice(0, MAX_HOOKS).map(asObj);
     const found: Found[] = [];
     for (const e of entries) if (typeof e.run === 'string') found.push(...(await scan(e.run, firstSet(workingDir(e.root)), LEFTHOOK_SHELL)));
-    return { manager, where, readable: true, found };
+    // P57 (fail closed): commands past MAX_HOOKS aren't read: the rows they could cover are unknown, never missing
+    return { manager, where, readable: all.length <= MAX_HOOKS, found };
   }
   return none;
 }
@@ -203,12 +223,14 @@ export async function readHooks(ctx: Ctx): Promise<Hooks> {
  * never carry anything here.
  */
 const CARRIED: ReadonlySet<string> = new Set(['lint', 'type-check', 'dockerfile-lint', 'workflow-lint', 'format']);
+/** P57 (fail closed): every category a hook can count for, at the pre-commit layer or carried into CI. */
+const HOOK_CATEGORIES: readonly string[] = ['format-lint', 'secrets', 'lint', 'type-check', 'dockerfile-lint', 'workflow-lint', 'format'];
 /**
  * A formatter hook carries format when it writes files or checks them (formatterFails), or when a reason already keeps
  * it partial (a hook repo pipegen doesn't know, a file filter): it never makes the row covered then.
  */
 const carried = (f: Found): string[] => {
-  const out = f.categories.filter((c) => CARRIED.has(c));
+  const out = f.categories.filter((c) => CARRIED.has(c.startsWith(UNKNOWN_PREFIX) ? c.slice(UNKNOWN_PREFIX.length) : c));
   if (FORMATTER_HOOKS.has(f.by) && (f.formats === true || f.reason !== null) && !out.includes('format')) out.push('format');
   return out;
 };
@@ -272,7 +294,7 @@ export async function hookRunHits(ctx: Ctx): Promise<void> {
       const configured = set !== null && (reason === null || !MAY_NOT_RUN.has(reason));
       ctx.hits.push({
         opaque: false, categories, by: t.by, subject, dir: '.', reason: configured ? 'config' : reason,
-        ...(configured ? { partialWhy: configWhy(subject, set) } : {}), fit: rep.fit, where,
+        ...(configured ? { partialWhy: configWhy(subject, set) } : t.partialWhy !== undefined && categories.every((c) => c.startsWith(UNKNOWN_PREFIX)) ? { partialWhy: t.partialWhy } : {}), fit: rep.fit, where,
         ...(t.configFiles === undefined ? {} : { configFiles: t.configFiles }), ...(t.langs === undefined ? {} : { langs: t.langs }),
       });
     }

@@ -3616,3 +3616,59 @@ describe('coverage: prek run flags (P57 M2)', () => {
     expect(await lint('prek run --all-files --stage manual')).toBe('missing');
   });
 });
+
+describe('coverage: every cap in the Docker, compose, prek and env code fails closed (P57, security scan follow-up)', () => {
+  const app = svc('.', { language: 'python', packageManager: 'uv', scripts: ['start'], frameworks: ['fastapi'] });
+  const BODY = 'FROM python:3.14\nWORKDIR /app\nCOPY . /app\nRUN pytest\n';
+  const st = async (files: Record<string, string>, steps: string, id = 'unit-tests', layer: Layer = 'push') => {
+    const dir = makeTempDir();
+    for (const [rel, text] of Object.entries(files)) writeIn(dir, rel, text);
+    ci(dir, steps);
+    const r = row(await coverage(dir, { services: [app] }), layer, id, 'app');
+    return `${r.status}${r.by === undefined ? '' : ` ${r.by}`}`;
+  };
+  const many = (n: number, f: (i: number) => string) => Array.from({ length: n }, (_, i) => f(i)).join('');
+
+  it('1. docker compose build --build-arg BUILDKIT_SYNTAX (= and next-word forms, a value from the env): unknown', async () => {
+    const files = { Dockerfile: BODY, 'compose.yml': 'services:\n  app:\n    build: .\n' };
+    for (const cmd of ['docker compose build --build-arg BUILDKIT_SYNTAX=evil/fe', 'docker compose build --build-arg=BUILDKIT_SYNTAX=evil/fe', 'docker compose build --build-arg BUILDKIT_SYNTAX app']) {
+      expect(await st(files, run(cmd)), cmd).toMatch(/^unknown/);
+    }
+    expect(await st(files, run('docker compose build --build-arg BUILDKIT_SYNTAX=docker/dockerfile:1'))).toBe('covered your own `pytest`');
+  });
+
+  it('2. compose build args, environment and services past any cap are still read, or unknown', async () => {
+    const args = (list: boolean) => ({ Dockerfile: BODY, 'compose.yml': `services:\n  app:\n    build:\n      context: .\n      args:\n${list ? many(250, (i) => `        - A${i}=1\n`) + '        - BUILDKIT_SYNTAX=evil/fe\n' : many(250, (i) => `        A${i}: "1"\n`) + '        BUILDKIT_SYNTAX: evil/fe\n'}` });
+    expect(await st(args(true), run('docker compose build'))).toMatch(/^unknown/);
+    expect(await st(args(false), run('docker compose build'))).toMatch(/^unknown/);
+    const env = { Dockerfile: 'FROM python:3.14\nWORKDIR /app\nCOPY . /app\n', 'tox.ini': '[tox]\n', 'compose.yml': `services:\n  app:\n    build: .\n    environment:\n${many(250, (i) => `      A${i}: "1"\n`)}      TOXENV: lint\n` };
+    expect(await st(env, run('docker compose run --rm app tox'))).toBe('partial your own `tox`');
+    const services = { Dockerfile: BODY, 'compose.yml': `services:\n${many(200, (i) => `  s${i}:\n    image: x\n`)}  app:\n    build: .\n` };
+    expect(await st(services, run('docker compose build'))).toMatch(/^unknown/);
+  });
+
+  it('3. the leading directive block is read to its end: a syntax or escape directive past line 200 (or 5) still counts', async () => {
+    expect(await st({ Dockerfile: `${many(250, (i) => `# check${i}=x\n`)}# syntax=evil/fe\n${BODY}` }, run('docker build .'))).toMatch(/^unknown/);
+    expect(await st({ Dockerfile: `${many(6, (i) => `# check${i}=x\n`)}# escape=\`\n${BODY}` }, run('docker build .'))).toMatch(/^unknown/);
+  });
+
+  it('the rest of the class: a RUN with more flags than read, a compose or docker build line longer than read, an env: with more keys than read', async () => {
+    const flags = many(9, (i) => `--mount=type=cache,target=/c${i} `);
+    expect(await st({ Dockerfile: `FROM python:3.14 AS t\nWORKDIR /app\nCOPY . /app\nRUN pytest\nFROM python:3.14\nRUN ${flags}--mount=from=t,target=/x echo\n` }, run('docker build .'))).toMatch(/^unknown/);
+    const long = many(70, (i) => ` --build-arg A${i}=1`);
+    expect(await st({ Dockerfile: BODY }, run(`docker build${long} .`))).toMatch(/^unknown/);
+    expect(await st({ Dockerfile: BODY, 'compose.yml': 'services:\n  app:\n    build: .\n' }, run(`docker compose build${long}`))).toMatch(/^unknown/);
+    const envKeys = `      - run: tox\n        env:\n${many(300, (i) => `          A${i}: "1"\n`)}          TOXENV: lint\n`;
+    expect(await st({ 'tox.ini': '[tox]\n' }, envKeys)).not.toBe('covered your own `tox`');
+  });
+
+  it('the rest of the class: more pre-commit hooks than read, a hook entry longer than read, more path arguments than read', async () => {
+    const cfg = `repos:\n  - repo: local\n    hooks:\n${many(200, (i) => `      - id: h${i}\n        name: h\n        entry: "true"\n        language: system\n`)}      - id: r\n        name: r\n        entry: ruff check\n        language: system\n`;
+    expect(await st({ '.pre-commit-config.yaml': cfg }, run('pre-commit run --all-files'), 'lint', 'merge')).toMatch(/^unknown/);
+    const longEntry = `repos:\n  - repo: local\n    hooks:\n      - id: r\n        name: r\n        entry: ruff check${many(70, (i) => ` a${i}`)} --exit-zero\n        language: system\n`;
+    expect(await st({ '.pre-commit-config.yaml': longEntry }, run('pre-commit run --all-files'), 'lint', 'merge')).not.toBe('covered ruff');
+    const dirs: Record<string, string> = {};
+    for (let i = 0; i < 40; i++) dirs[`d${i}/a.py`] = 'x = 1\n'; // more than pipegen places (32), fewer than it reads (64)
+    expect(await st(dirs, run(`ruff check ${Object.keys(dirs).map((f) => f.split('/')[0]).join(' ')}`), 'lint')).not.toBe('covered ruff');
+  });
+});

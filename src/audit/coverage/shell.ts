@@ -244,15 +244,15 @@ export const preCommitAllFiles = (words: readonly string[]): boolean => preCommi
 
 const basename = (w: string) => w.slice(w.lastIndexOf('/') + 1);
 
-/** P57 (C1): at most this many path arguments are read; more and the run keeps its folder. */
-const MAX_PATH_ARGS = 8;
+/** P57 (C1): at most this many path arguments are read; more is 'capped' (the run is partial, 'long'). */
+const MAX_PATH_ARGS = 32;
 /**
  * P57 (C1): the words of a tool's command line that may name what it checks (not a flag, not a redirection), resolved
  * from the folder it runs in. Null when there is none, more than MAX_PATH_ARGS, or one pipegen can't place (a
  * variable, a glob, a quote, a path that leaves the repo): the run then keeps its folder. Which of these words are
  * real paths (not a subcommand such as `check`) is decided once the repo can be looked at (scopeToPaths).
  */
-export function pathWords(args: readonly string[], cwd: string | null): string[] | null {
+export function pathWords(args: readonly string[], cwd: string | null): string[] | 'capped' | null {
   if (cwd === null) return null;
   const out: string[] = [];
   for (let i = 0; i < args.length; i++) {
@@ -266,7 +266,8 @@ export function pathWords(args: readonly string[], cwd: string | null): string[]
     if (w.startsWith('-') || w === '') continue;
     if (!/^[A-Za-z0-9_.@+/-]{1,200}$/.test(w)) return null;
     const d = resolveDir(cwd, stripDotSlash(w));
-    if (d === null || out.length >= MAX_PATH_ARGS) return null;
+    if (d === null) return null;
+    if (out.length >= MAX_PATH_ARGS) return 'capped';
     if (!out.includes(d)) out.push(d);
   }
   return out.length === 0 ? null : out;
@@ -545,14 +546,17 @@ export function scanShell(text: string, base: string | null, sigs: Compiled, bud
           else if (mode === 'changed') f.hookRun = 'changed';
         }
         // P55 (batch B): the Dockerfile a `docker build` names, so its RUN lines count (resolveScripts)
-        if (r.tool.id === DOCKER_BUILD_ID && r.tool.commands?.includes(r.rest.length === 1 ? 'docker build' : 'docker buildx build') === true && cwd !== null && complete) {
-          const b = dockerBuildOf(cwd, buildWords(word, k + 1 + r.rest.length, segEnd[k]!));
+        if (r.tool.id === DOCKER_BUILD_ID && r.tool.commands?.includes(r.rest.length === 1 ? 'docker build' : 'docker buildx build') === true && cwd !== null) {
+          // P57 (fail closed): a build line longer than pipegen reads is unknown, never missing
+          const b = complete ? dockerBuildOf(cwd, buildWords(word, k + 1 + r.rest.length, segEnd[k]!)) : { file: '', context: '', target: null, unsure: 'a build command line longer than pipegen reads' };
           if (b !== null) f.dockerBuild = b;
         }
         if (r.tool.id === NPM_PROVENANCE_ID) f.envGate = 'npm';
         // P57 (C1): path arguments scope the run to the services under them (scopeToPaths, once the repo can be checked)
         const paths = complete ? pathWords(args.slice(r.rest.length), cwd) : null;
-        if (paths !== null) f.pathArgs = paths;
+        // P57 (fail closed): more path arguments than pipegen reads: it can't tell which services they cover
+        if (paths === 'capped') f.reason ??= 'long';
+        else if (paths !== null) f.pathArgs = paths;
         add(f);
       }
     };
@@ -636,11 +640,13 @@ export function scanShell(text: string, base: string | null, sigs: Compiled, bud
     // P57 (C1): pytest, tox and nox test Python; a package script counted by name is a Node package's, and pipegen can't
     // tell what else its runner checks ('?': resolveScripts narrows it from the script's text when it can)
     const python = byName === undefined && script === undefined;
-    const paths = name === 'pytest' && segEnd[k]! - k - 1 <= MAX_FLAG_WORDS ? pathWords(args, cwd) : null;
+    const paths0 = name === 'pytest' && segEnd[k]! - k - 1 <= MAX_FLAG_WORDS ? pathWords(args, cwd) : null;
+    const paths = paths0 === 'capped' ? null : paths0;
     add({
       categories, by: `your own \`${cmd}\``, subject: `Your own \`${cmd}\``, dir: cwd, reason: shellReason(k),
       ...(script === undefined ? {} : { script }), ...(envGate === undefined ? {} : { envGate }), ...(byName === undefined ? {} : { byName }),
       ...(python ? { langs: ['python'] } : byName !== undefined ? { langs: ['node', '?'] } : {}), ...(paths === null ? {} : { pathArgs: paths }),
+      ...(paths0 === 'capped' && shellReason(k) === null ? { reason: 'long' as const } : {}),
     });
   };
   /**
@@ -651,7 +657,13 @@ export function scanShell(text: string, base: string | null, sigs: Compiled, bud
    */
   const composeCommand = (k: number, from: number): { commandAt: number; run: NonNullable<Found['composeRun']> } | null => {
     const end = segEnd[k]!;
-    if (end - k - 1 > MAX_FLAG_WORDS || cwd === null) return null;
+    if (cwd === null) return null;
+    if (end - k - 1 > MAX_FLAG_WORDS) {
+      // P57 (fail closed): a compose line longer than pipegen reads may build or run anything: unknown, never missing
+      add({ categories: UNKNOWN_SCRIPT_CATEGORIES, by: 'docker-compose', subject: 'A docker compose command', dir: null, reason: null,
+        partialWhy: "A docker compose command has more words than pipegen reads, so it can't tell what it builds or runs." });
+      return null;
+    }
     const g = composeWords(word, from, end);
     if (g === null || g.sub === null) return null;
     const tool = (sigs.byFirstWord.get('docker') ?? []).concat(sigs.byFirstWord.get('docker-compose') ?? []).find((r) => r.tool.id === COMPOSE_BUILD_ID)?.tool;
@@ -661,7 +673,7 @@ export function scanShell(text: string, base: string | null, sigs: Compiled, bud
       const services = g.sub === 'build' ? composeBuildServices(word, g.subAt + 1, end) : null;
       const f = foundOf(tool, cwd, shellReason(k) ?? commandReason(tool, args));
       if (g.sub === 'build' && services !== null) {
-        f.composeBuild = { files: g.files, cwd, services: services.length === 0 ? null : services, shellReason: shellReason(k), profiles: g.profiles, unsure: g.unsure };
+        f.composeBuild = { files: g.files, cwd, services: services.services.length === 0 ? null : services.services, shellReason: shellReason(k), profiles: g.profiles, unsure: g.unsure ?? services.unsure };
       }
       add(f);
       return null;

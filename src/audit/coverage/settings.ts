@@ -574,6 +574,8 @@ export function gateOf(texts: readonly string[], envs: readonly unknown[], base:
   configNames: readonly string[] = []): EnvGate {
   // an `env:` given as one expression could set anything
   if (envs.some((e) => e !== undefined && e !== null && (typeof e !== 'object' || Array.isArray(e)))) return ALL_GATE;
+  // P57 (fail closed): an env: with more keys than pipegen reads could set any variable past them
+  if (envs.some((e) => Object.keys(asObj(e)).length > MAX_INPUT_KEYS)) return ALL_GATE;
   const keys = envs.flatMap((e) => Object.keys(asObj(e)).slice(0, MAX_INPUT_KEYS)).map((k) => k.toUpperCase());
   const inText = (needle: string) => texts.some((t) => t.includes(needle));
   // P57 (C4): SKIP / PREK_SKIP: the ids an `env:` key (any letter case) or the run text names

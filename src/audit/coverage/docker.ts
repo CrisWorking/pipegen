@@ -117,7 +117,10 @@ async function composeModel(ctx: Ctx, files: readonly string[] | null, cwd: stri
     for (const { doc } of docs) {
       // P57 (C3): other files pipegen doesn't follow can add or change services
       if ('include' in doc) return { why: 'a compose file with an include: pipegen doesn\'t follow' };
-      for (const [name, raw] of Object.entries(asObj(doc.services)).slice(0, MAX_COMPOSE_SERVICES)) {
+      const all = Object.entries(asObj(doc.services));
+      // P57 (fail closed): more services than pipegen reads: it can't tell which are built
+      if (all.length > MAX_COMPOSE_SERVICES) return { why: 'a compose file with more services than pipegen reads' };
+      for (const [name, raw] of all) {
         const svc = asObj(raw);
         const prev = out.get(name);
         if ('extends' in svc) return { why: `a compose service (${name}) that extends another, which pipegen doesn't follow` };
@@ -154,12 +157,12 @@ function composeEnvironment(v: unknown): Record<string, string> {
   const out: Record<string, string> = {};
   const literal = (x: unknown) => (typeof x === 'string' && /^[A-Za-z0-9_.,:\/ -]*$/.test(x) ? x : typeof x === 'number' || typeof x === 'boolean' ? String(x) : '$');
   if (Array.isArray(v)) {
-    for (const e of v.slice(0, MAX_COMPOSE_SERVICES)) {
+    for (const e of v) { // every entry (the file is bounded by the read limits): a variable past a cap could hide
       if (typeof e !== 'string') continue;
       const eq = e.indexOf('=');
       out[eq < 0 ? e : e.slice(0, eq)] = eq < 0 ? '$' : literal(e.slice(eq + 1));
     }
-  } else for (const [k, x] of Object.entries(asObj(v)).slice(0, MAX_COMPOSE_SERVICES)) out[k] = x === null ? '$' : literal(x);
+  } else for (const [k, x] of Object.entries(asObj(v))) out[k] = x === null ? '$' : literal(x);
   return out;
 }
 
@@ -167,14 +170,14 @@ function composeEnvironment(v: unknown): Record<string, string> {
 function composeFrontend(args: unknown): string | null {
   if (args === undefined || args === null) return null;
   if (Array.isArray(args)) {
-    for (const a of args.slice(0, MAX_COMPOSE_SERVICES)) {
+    for (const a of args) {
       const why = typeof a === 'string' ? frontendArg(a) : 'build args pipegen can\'t read';
       if (why !== null) return why;
     }
     return null;
   }
   if (typeof args !== 'object') return 'build args pipegen can\'t read';
-  for (const [k, v] of Object.entries(asObj(args)).slice(0, MAX_COMPOSE_SERVICES)) {
+  for (const [k, v] of Object.entries(asObj(args))) {
     const why = frontendArg(v === null || v === undefined ? k : `${k}=${typeof v === 'string' ? v : '$'}`);
     if (why !== null) return why;
   }
@@ -267,9 +270,11 @@ const flagValue = (flags: readonly string[], name: string): string | undefined =
 async function parseDockerfile(ctx: Ctx, text: string, context: string): Promise<Parsed> {
   const raw = text.split(/\r?\n/);
   if (raw.length > MAX_DOCKERFILE_LINES || !raw.every(regexSafe)) return { unreadable: 'it has more or longer lines than pipegen reads' };
-  if (/^\s*#\s*escape\s*=/im.test(raw.slice(0, 5).join('\n'))) return { unreadable: 'it changes the escape character' };
-  // P57 (M3): a syntax directive picks the frontend that reads the file; only Docker's own (docker/dockerfile) is read as BuildKit does
-  if (customFrontend(text)) return { unreadable: 'it picks its own Dockerfile frontend (a syntax directive)' };
+  // P57 (M3, fail closed): the whole leading directive block is read (the file is already bounded): an escape directive
+  // changes how lines join, a syntax directive picks the frontend that reads the file
+  const directive = leadingDirective(text);
+  if (directive === 'escape') return { unreadable: 'it changes the escape character' };
+  if (directive === 'frontend') return { unreadable: 'it picks its own Dockerfile frontend (a syntax directive)' };
   // instructions, with line continuations joined (comment lines inside a continuation are dropped, as Docker does)
   const lines: string[] = [];
   for (let i = 0; i < raw.length; i++) {
@@ -361,7 +366,9 @@ async function parseDockerfile(ctx: Ctx, text: string, context: string): Promise
     }
     if (op === 'RUN') {
       if (++runs > MAX_RUNS) return { unreadable: 'it has more RUN lines than pipegen reads' };
-      const { flags } = leadingFlags(rest);
+      const { flags, rest: runRest } = leadingFlags(rest);
+      // P57 (fail closed): more flags than pipegen reads could hide a --mount from= another stage
+      if (/^--[A-Za-z]/.test(runRest)) return { unreadable: 'a RUN line has more flags than pipegen reads' };
       for (const f of flags) {
         const mount = /^--mount=(.*)$/i.exec(f);
         const from = mount === null ? undefined : /(?:^|,)from=([^,]+)/.exec(mount[1] as string)?.[1];
@@ -385,26 +392,28 @@ async function parseDockerfile(ctx: Ctx, text: string, context: string): Promise
  * other directives such as `# escape=` or `# check=`), or a JSON file with a `syntax` key. Fail closed: a leading
  * comment that mentions syntax but doesn't read as a directive counts too; the block ends at the first other line.
  */
-function customFrontend(text: string): boolean {
+function leadingDirective(text: string): 'escape' | 'frontend' | null {
   const t = text.replace(/^\ufeff/, '');
   if (t.trimStart().startsWith('{')) {
     try {
       const j = JSON.parse(t) as unknown;
-      if (j !== null && typeof j === 'object' && Object.keys(j).some((k) => k.toLowerCase() === 'syntax')) return true;
+      if (j !== null && typeof j === 'object' && Object.keys(j).some((k) => k.toLowerCase() === 'syntax')) return 'frontend';
     } catch { /* not JSON: read as a Dockerfile */ }
   }
-  for (const line of t.split(/\r?\n/, 200)) {
+  for (const line of t.split(/\r?\n/)) { // no cap: the caller already bounds the file's lines
     const l = line.trim();
     if (l === '') continue;
     if (!(l.startsWith('#') || l.startsWith('//'))) break;
     const m = /^(?:#|\/\/)\s*([A-Za-z][A-Za-z0-9_-]*)\s*=\s*(.*?)\s*$/.exec(l);
     if (m === null) {
-      if (/syntax/i.test(l)) return true;
+      if (/syntax|escape/i.test(l)) return 'frontend';
       break;
     }
-    if ((m[1] as string).toLowerCase() === 'syntax' && !OFFICIAL_FRONTEND.test(m[2] as string)) return true;
+    const key = (m[1] as string).toLowerCase();
+    if (key === 'escape' && l.startsWith('#')) return 'escape';
+    if (key === 'syntax' && !OFFICIAL_FRONTEND.test(m[2] as string)) return 'frontend';
   }
-  return false;
+  return null;
 }
 
 /** A Dockerfile read and parsed once per (file, context): its parse, or why it couldn't be. */

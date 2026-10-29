@@ -145,11 +145,15 @@ export function composeWords(at: At, from: number, end: number): ComposeWords | 
   return { files: files.length === 0 ? null : files, profiles, unsure, sub: i < end ? at(i) : null, subAt: i };
 }
 
-/** `docker compose build [flags] [service…]`: the service names, or null (unknown flag, `--dry-run`, a word that isn't a service). */
+/**
+ * `docker compose build [flags] [service…]`: the service names, or null (unknown flag, `--dry-run`, a word that isn't a
+ * service). P57 (M3): `unsure` when a --build-arg may pick a custom Dockerfile frontend (BUILDKIT_SYNTAX).
+ */
 const COMPOSE_BUILD_VALUE: ReadonlySet<string> = new Set(['--build-arg', '--builder', '-m', '--memory', '--ssh', '--progress']);
 const COMPOSE_BUILD_BOOL: ReadonlySet<string> = new Set(['--no-cache', '--pull', '--push', '-q', '--quiet', '--with-dependencies']);
-export function composeBuildServices(at: At, from: number, end: number): string[] | null {
+export function composeBuildServices(at: At, from: number, end: number): { services: string[]; unsure: string | null } | null {
   const out: string[] = [];
+  let unsure: string | null = null;
   for (let i = from; i < end; i++) {
     const w = at(i);
     if (w === null) return null;
@@ -157,12 +161,14 @@ export function composeBuildServices(at: At, from: number, end: number): string[
       const eq = w.indexOf('=');
       const name = eq < 0 ? w : w.slice(0, eq);
       if (COMPOSE_BUILD_VALUE.has(name)) {
-        if (eq < 0 && at(++i) === null) return null;
+        const value = eq < 0 ? at(++i) : w.slice(eq + 1);
+        if (value === null) return null;
+        if (name === '--build-arg') unsure ??= frontendArg(value);
       } else if (!(eq < 0 && COMPOSE_BUILD_BOOL.has(name))) return null;
     } else if (SERVICE_RE.test(w)) out.push(w);
     else return null;
   }
-  return out;
+  return { services: out, unsure };
 }
 
 /**
