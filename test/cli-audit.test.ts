@@ -1168,6 +1168,29 @@ describe('GitHub rate limit (DoD)', () => {
     expect(full.githubIncomplete).toBeNull();
   });
 
+  it('P51 (M5): with the limit hit, "would add" and the --ai consent screen say they rest on incomplete GitHub data, in every output', async () => {
+    const dir = repo({ '.github/workflows/ci.yml': CI });
+    const routes = publicRoutes({ [`GET ${R}`]: limited403(resetSec()) });
+    const NOTE = 'These picks are based on incomplete GitHub data (rate limit)';
+    const t = await audit(['audit'], { cwd: dir, routes });
+    expect(t.out.replace(/\n {2,}/g, ' ')).toContain(NOTE);
+    const j = JSON.parse((await audit(['audit', '--json'], { cwd: dir, routes })).out) as { wouldAddNote: string | null };
+    expect(j.wouldAddNote).toContain(NOTE);
+    const work = makeTempDir();
+    await audit(['audit', '--dir', dir, '--out', 'r.md'], { cwd: work, routes });
+    expect(readFileSync(join(work, 'r.md'), 'utf8').replace(/\n/g, ' ')).toContain(NOTE);
+    // a complete run has no such note
+    expect((JSON.parse((await audit(['audit', '--json'], { cwd: dir })).out) as { wouldAddNote: unknown }).wouldAddNote).toBeNull();
+    // the --ai consent screen (answered No)
+    const { env } = aiSetup();
+    const ask = prompter(false);
+    await audit(['audit', '--ai'], { cwd: dir, env, routes, prompt: ask });
+    expect(ask.asked[0]).toContain('Based on incomplete GitHub data (rate limit)');
+    const okAsk = prompter(false);
+    await audit(['audit', '--ai'], { cwd: dir, env: aiSetup().env, prompt: okAsk });
+    expect(okAsk.asked[0]).not.toContain('incomplete GitHub data');
+  });
+
   it('rate limit with a token set: the same report and exit 3, no hint to set one; other failures keep exit 1', async () => {
     const dir = repo({ '.github/workflows/ci.yml': CI });
     const tok = fake.githubPat();

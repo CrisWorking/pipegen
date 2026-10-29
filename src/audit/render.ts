@@ -462,6 +462,7 @@ function aiCostText(ai: AuditAi, c: Ctx): string {
 function addSection(r: AuditReport, c: Ctx): Section {
   const blocks: Block[] = [];
   if (r.wouldAdd.length > 0) {
+    if (r.wouldAddNote !== null) blocks.push(item(c.v(r.wouldAddNote, OUTPUT_CAP.text), 0, true)); // P51 (M5)
     blocks.push(text("For each check that isn't covered:"));
     // rows that say the same for several services are one line naming them all (DoD fastapi)
     for (const g of groupByService(c, r.wouldAdd, (w) => `${w.status}\u0000${isScheduled(w.need) ? 1 : 0}\u0000${toolText(c, w)}`)) {

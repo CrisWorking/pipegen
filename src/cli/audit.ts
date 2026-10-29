@@ -27,7 +27,7 @@ import { AiError, makeProvider } from '../ai/provider.js';
 import { bundleCode, chooseSecretScanner, scrubKnownValues, SecretScanError, type ScanFound, type SecretScanner, type SecretScannerName } from '../ai/redact.js';
 import { countingSummary } from '../audit/consent-token.js';
 import { writeOutFile, OutFileError } from '../audit/out-file.js';
-import { addAiSuggestions, buildAudit, buildLocalAudit, needsRequestBytes, type AuditReport } from '../audit/model.js';
+import { addAiSuggestions, buildAudit, buildLocalAudit, CONSENT_INCOMPLETE, needsRequestBytes, type AuditReport } from '../audit/model.js';
 import { renderJson, renderLocalJson, renderLocalTerminal, renderMarkdown, renderTerminal, type RenderOptions } from '../audit/render.js';
 import { isRateStop, newRateBudget, rateStopOf, type RateClock } from '../engine/github-rate.js';
 import { loadPinnedBinaries, PinnedBinaryError, PLATFORM_KEYS } from '../engine/linters.js';
@@ -211,7 +211,7 @@ export async function audit(io: CliIO, flags: AuditFlags): Promise<number> {
         fail(clean(est.unpriced.message));
         return 1;
       }
-      const screen = consentScreen(r.profile, ai.provider, est, countingSummary(counted), permissionsTable('read'), [], 'audit-ai', { secretScanner: ai.secretScanner });
+      const screen = consentScreen(r.profile, ai.provider, est, countingSummary(counted), permissionsTable('read'), [], 'audit-ai', { secretScanner: ai.secretScanner, ...(r.githubIncomplete === null ? {} : { incompleteNote: CONSENT_INCOMPLETE }) });
       // defence in depth: the screen is pipegen's own text with cleaned repo names; known values are hidden all the same
       const scrub = (s: string) => scrubKnownValues(hideToken(s, token), usableKnownValues(knownValues));
       const consent = await askConsent({ ...io.prompt, confirm: (msg, def) => io.prompt.confirm(scrub(msg), def) }, screen, fail);

@@ -51,6 +51,8 @@ export type PermissionRows = { permission: string; why: string }[];
 export interface AuditConsentFacts {
   /** The pinned secret scanner pipegen downloads, checksum-verified, into its cache before bundling, and its version. */
   secretScanner: Pick<SecretScanner, 'name' | 'version'>;
+  /** P51 (M5): pipegen's own note when GitHub's rate limit left facts unread (shown right after the opening lines). */
+  incompleteNote?: string;
 }
 /** Facts the 'full' screen must show. */
 export interface FullConsentFacts extends AuditConsentFacts {
@@ -256,6 +258,7 @@ function screenFor(p: RepoProfile, provider: AiProvider, est: Estimates | AuditA
     capUsd = a.capUsd;
     sections.push(
       ['pipegen audit --ai is about to send part of your code to an AI. Nothing has left this computer yet.', 'This audit only reads: it changes nothing on GitHub.'],
+      ...(facts.incompleteNote === undefined ? [] : [[facts.incompleteNote]]),
       filesSection(p, bundle, facts.secretScanner),
       providerSection(provider, place),
       costSection('AI cost of this audit (estimate)', a.costUsd, a.capUsd, place),

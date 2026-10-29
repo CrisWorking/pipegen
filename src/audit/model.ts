@@ -124,6 +124,11 @@ export interface AuditReport {
    * coverage row whose answer depends on it is `unknown`; the report says so at the top, with the reset time.
    */
   githubIncomplete: GitHubIncomplete | null;
+  /**
+   * P51 (review M5): when GitHub's rate limit left facts unread, the "would add" picks were made with placeholders for
+   * them (private, plan unknown, the unread capabilities off): this plain note says so in every output. Else null.
+   */
+  wouldAddNote: string | null;
   /** Only with --ai, after consent (Task 2b, addAiSuggestions); mention-only. */
   ai?: AuditAi;
 }
@@ -478,8 +483,14 @@ export async function buildAudit(dir: string, deps: AuditDeps): Promise<AuditRep
     notes: notes.all(),
     reviewedUnavailable: deps.reviewedUnavailable === true,
     githubIncomplete,
+    wouldAddNote: githubIncomplete === null ? null : WOULD_ADD_INCOMPLETE,
   };
 }
+
+/** P51 (M5): the "would add" note when GitHub's rate limit left facts unread. */
+export const WOULD_ADD_INCOMPLETE = "These picks are based on incomplete GitHub data (rate limit): pipegen picked them as if the facts it couldn't read were the most restrictive (a private repo, an unknown plan, no GitHub feature it couldn't check).";
+/** P51 (M5): the --ai consent screen's note when GitHub's rate limit left facts unread. */
+export const CONSENT_INCOMPLETE = "Based on incomplete GitHub data (rate limit): GitHub's rate limit stopped pipegen reading some GitHub facts, so the repo facts sent to the AI may be wrong where GitHub wasn't read (a private repo and an unknown plan are assumed).";
 
 // ---------- GitHub's rate limit (DoD run 2026-10-29) ----------
 

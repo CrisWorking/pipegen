@@ -155,6 +155,7 @@ export function freePrivateReport(excludedPatterns: readonly string[]): AuditRep
     ],
     reviewedUnavailable: false,
     githubIncomplete: null,
+    wouldAddNote: null,
   };
 }
 
