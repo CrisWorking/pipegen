@@ -355,7 +355,9 @@ interface Expected {
 }
 
 /** A judged job, kept for the checks that need every file judged first (the gate's binding to the jobs it lists). */
-interface JobRecord { id: string; judged: readonly Judged[]; outputs: unknown }
+interface JobRecord { file: string; id: string; judged: readonly Judged[]; outputs: unknown }
+/** The key of a workflow file in every map of the referee. */
+const fileKey = (f: CreatedFile): string => `${f.repo}:${f.path}`;
 
 interface Expectations {
   runs: Expected[];
@@ -536,6 +538,33 @@ function centralOf(draft: PipelineDraft): { prefix: string; sha: string } | null
 /** A `uses` path that looks like any owner's central pipelines repo. */
 const CENTRAL_LIKE_RE = /^[^/]*\/pipelines\//;
 
+/**
+ * The events that start a file, for the base commit form (C0b fix round 2, ruling 4). A called workflow (`workflow_call`) runs on its
+ * caller's event, so its triggers are the union of the triggers of every file in `files` of the same repo that calls it through a
+ * job-level `uses: ./<its path>` (a caller that is itself called counts its callers, up to three levels). With no such caller the
+ * `workflow_call` stays in the list, and the base-scan rule refuses it. Null when the `on:` is unreadable.
+ */
+function effectiveTriggers(file: CreatedFile, on: unknown, parsed: Map<string, Parsed>, depth = 0): string[] | null {
+  const own = triggersOf(on);
+  if (own === null || !own.includes('workflow_call')) return own;
+  const out = new Set(own.filter((t) => t !== 'workflow_call'));
+  let called = false;
+  if (depth < 3) {
+    for (const [key, other] of parsed) {
+      if (!key.startsWith(`${file.repo}:`) || key === fileKey(file) || !isObj(other.js.jobs)) continue;
+      const calls = Object.values(other.js.jobs).some((j) => isObj(j) && j.uses === `./${file.path}`);
+      if (!calls) continue;
+      const path = key.slice(file.repo.length + 1);
+      const t = effectiveTriggers({ path, repo: file.repo } as CreatedFile, other.js.on, parsed, depth + 1);
+      if (t === null) return null;
+      called = true;
+      for (const x of t) out.add(x);
+    }
+  }
+  if (!called) out.add('workflow_call');   // no caller in files: no base commit form fits
+  return [...out];
+}
+
 /** The workflow's own top level (a file pipegen wrote whole). */
 function judgeTop(fc: FileCtx, js: Obj): void {
   const bad = issueFor(fc);
@@ -625,7 +654,7 @@ function judgeJob(fc: FileCtx, id: string, j: unknown): void {
   judgeServices(fc, where, j.services);
   if (!Array.isArray(j.steps)) { bad('template', `${where} has no list of steps.`); judgeOutputs(fc, id, where, j, []); return; }
   const judged = judgeJobSteps(fc, where, j.steps, true, id);
-  fc.ex.jobs.push({ id, judged, outputs: j.outputs });
+  fc.ex.jobs.push({ file: fileKey(fc.file), id, judged, outputs: j.outputs });
   judgeOutputs(fc, id, where, j, judged);
   judgeStepPolicy(fc, id, where, j, judged);
   judgeGateSteps(fc, id, where, j, judged);
@@ -680,43 +709,61 @@ function judgeGateSteps(fc: FileCtx, id: string, where: string, j: Obj, judged: 
     for (const e of expected) {
       if (!needs.includes(e.job)) bad('not-gate-readable', `${where} does not need the job ${show(e.job)} of its job list, so the gate would not wait for that check (needs must include every listed job).`);
     }
-    judgeListedJobs(fc.ex, expected, bad);
+    judgeListedJobs(fc.ex, fc.draft, expected, fileKey(fc.file), bad);
   });
 }
 
 /**
- * Each job the gate lists is the job that runs its check, and no other job does (C0b fix round 1, ruling 3): the steps pipegen
- * rendered for the check (its tool run or project script, not the shared checkout and installs) sit in `entry.job` and nowhere else;
- * their base twins only in `base-scan`; a findings job holds the scrub and the upload of its artifact and declares exactly the
- * outputs the gate reads (`<artifact>-sha256|-status|-error`); an artifact is uploaded once in the whole workflow set. Without this the
- * gate could wait on an empty job, so its `success` would say nothing about the check, which runs (or fails) in a job nobody reads.
+ * Each job the gate lists is the job that runs its check, and no other job of the gate's file does (C0b fix rounds 1 and 2): the
+ * gate's `needs` and `toJSON(needs)` see only the file the gate is in, so everything here is judged over that file's jobs alone
+ * (`file`), never over a job of the same id in another file. The steps pipegen rendered for the check (its tool run or project
+ * script, not the shared checkout and installs) sit in `entry.job` only; their base twins only in `base-scan`; a check that is a
+ * reviewed ACTION (dependency-review-action) has its action step in `entry.job` and in no other job, unless that job is the listed job
+ * of another check of the same action; a findings job holds the scrub and the upload of its artifact and declares exactly the outputs
+ * the gate reads (`<artifact>-sha256|-status|-error`). Without this the gate could wait on an empty job, so its `success` would say
+ * nothing about the check, which runs (or fails) in a job nobody reads.
  */
-function judgeListedJobs(ex: Expectations, expected: readonly JobListEntry[], bad: (check: RefereeCheck, message: string) => void): void {
+function judgeListedJobs(ex: Expectations, draft: PipelineDraft, expected: readonly JobListEntry[], file: string, bad: (check: RefereeCheck, message: string) => void): void {
+  const records = ex.jobs.filter((r) => r.file === file);
   const listed = new Set(expected.map((e) => e.job));
   const nb = (m: string): void => bad('not-gate-readable', m);
   // a rendered step of a listed check runs in its own job only
-  for (const r of ex.jobs) {
+  for (const r of records) {
     for (const x of r.judged) {
       const m = x.match;
       if (m?.need === undefined || m.owner === undefined || !listed.has(m.need) || x.step.run === undefined || x.step.id?.startsWith('pipegen-') === true) continue;
       if (r.id !== m.owner) nb(`The step ${show(x.step.name)} belongs to the job ${show(m.owner)} (the check ${show(m.need)}${m.owner === 'base-scan' ? ', run on the base' : ''}) but sits in the job ${show(r.id)}: the gate reads the job ${show(m.owner)}, so this step's result would not count.`);
     }
   }
-  const holds = (jobId: string): readonly Judged[] => ex.jobs.filter((r) => r.id === jobId).flatMap((r) => r.judged);
-  const outputsOf = (jobId: string): Record<string, unknown>[] => ex.jobs.filter((r) => r.id === jobId).map((r) => (isObj(r.outputs) ? r.outputs : {}));
+  const holds = (jobId: string): readonly Judged[] => records.filter((r) => r.id === jobId).flatMap((r) => r.judged);
+  const outputsOf = (jobId: string): Record<string, unknown>[] => records.filter((r) => r.id === jobId).map((r) => (isObj(r.outputs) ? r.outputs : {}));
   const withOf = (x: Judged, k: string): unknown => x.step.with?.[k];
+  // the reviewed action entries a listed check is made of (its specs whose tool is an action entry that rendered as reviewed)
+  const actionsOf = (job: string): string[] => draft.steps.flatMap((spec, i) => {
+    if (!isObj(spec) || !isReviewed(spec.tool) || keyOf(spec.needId, spec.service) !== job) return [];
+    const t = ex.byId.get(spec.tool.id);
+    // only an action that IS the check: not the harden step, the platform actions or pipegen's own (those have a reserved kind and sit in many jobs)
+    return t !== undefined && t.candidate.kind === 'action' && own(ENTRY_KIND, t.id) === undefined && sameCandidate(spec.tool, t.candidate) && reviewedFormatOf(ex)(spec, i) !== undefined ? [t.id] : [];
+  });
   for (const e of expected) {
     // 1. the job holds the rendered tool or script of its check
     const sources = [...new Set(ex.runs.filter((r) => r.need === e.job && r.owner === e.job && !r.source.endsWith(':base') && r.step.id?.startsWith('pipegen-') !== true).map((r) => r.source))];
     for (const src of sources) {
       if (!holds(e.job).some((x) => x.match?.source === src)) nb(`The job ${show(e.job)} is in the gate's list for the check ${show(e.needId)}, but it holds no step of the check (the rendered ${src.startsWith('script:') ? 'project script' : 'tool run'}); the gate would wait on a job that does not run it.`);
     }
+    // 1b. an action check: its action step is in the listed job and in no other job of the file
+    for (const entryId of new Set(actionsOf(e.job))) {
+      if (!holds(e.job).some((x) => x.entryId === entryId)) nb(`The job ${show(e.job)} is in the gate's list for the check ${show(e.needId)}, but it holds no step of the action check ${show(entryId)}; the gate would wait on a job that does not run it.`);
+      for (const r of records) {
+        if (r.id !== e.job && r.judged.some((x) => x.entryId === entryId) && !actionsOf(r.id).includes(entryId)) nb(`The action step of the check ${show(e.needId)} (${show(entryId)}) sits in the job ${show(r.id)}, but the gate reads the job ${show(e.job)}: that step's result would not count.`);
+      }
+    }
     if (e.artifact === undefined) continue;
     // 2. a findings job holds the scrub and the upload of its artifact, and declares its outputs; no other job touches that artifact
     for (const [artifact, home, label] of [[e.artifact, e.job, 'result'], [e.baseArtifact, 'base-scan', 'base result']] as const) {
       if (artifact === undefined) continue;
-      const scrubs = ex.jobs.flatMap((r) => r.judged.filter((x) => x.kind === 'scrub' && withOf(x, 'artifact') === artifact).map(() => r.id));
-      const uploads = ex.jobs.flatMap((r) => r.judged.filter((x) => x.kind === 'upload-artifact' && withOf(x, 'name') === artifact).map(() => r.id));
+      const scrubs = records.flatMap((r) => r.judged.filter((x) => x.kind === 'scrub' && withOf(x, 'artifact') === artifact).map(() => r.id));
+      const uploads = records.flatMap((r) => r.judged.filter((x) => x.kind === 'upload-artifact' && withOf(x, 'name') === artifact).map(() => r.id));
       for (const id of new Set([...scrubs, ...uploads])) if (id !== home) nb(`The scrub step of the ${label} ${show(artifact)} sits in the job ${show(id)}, but only the job ${show(home)} may hold the scrub and the upload of it.`);
       if (artifact === e.artifact) {
         if (!scrubs.includes(home)) nb(`The job ${show(home)} holds no scrub step of the ${label} ${show(artifact)}, so the gate would have nothing it can trust to read.`);
@@ -729,10 +776,23 @@ function judgeListedJobs(ex: Expectations, expected: readonly JobListEntry[], ba
       }
     }
   }
-  // an artifact name is uploaded by one step in the whole set of files (a second upload of one name fails at run time, or hides the first)
-  const uploadedBy = new Map<string, number>();
-  for (const r of ex.jobs) for (const x of r.judged) if (x.kind === 'upload-artifact' && typeof withOf(x, 'name') === 'string') uploadedBy.set(withOf(x, 'name') as string, (uploadedBy.get(withOf(x, 'name') as string) ?? 0) + 1);
-  for (const [name, n] of uploadedBy) if (n > 1) nb(`The artifact ${show(name)} is uploaded by more than one step (${n}); one name has one upload, or a later one could replace the scrubbed result.`);
+}
+
+/**
+ * An artifact name is uploaded by one step per workflow file (the artifact namespace is per workflow run, so per file: a repo with a
+ * pull_request file and a merge_group file has each pipeline's uploads in its own run). A second upload of one name fails at run time or hides the first.
+ */
+function judgeUploadsPerFile(ex: Expectations, add: Add): void {
+  const seen = new Map<string, number>();
+  for (const r of ex.jobs) {
+    for (const x of r.judged) {
+      const name = x.kind === 'upload-artifact' ? x.step.with?.name : undefined;
+      if (typeof name === 'string') seen.set(`${r.file}\0${name}`, (seen.get(`${r.file}\0${name}`) ?? 0) + 1);
+    }
+  }
+  for (const [k, n] of seen) {
+    if (n > 1) { const [file, name] = k.split('\0') as [string, string]; add(file.slice(file.indexOf(':') + 1), 'not-gate-readable', `The artifact ${show(name)} is uploaded by more than one step (${n}) in this workflow file; one name has one upload, or a later one could replace the scrubbed result.`, undefined, file.slice(0, file.indexOf(':')) as CreatedFile['repo']); }
+  }
 }
 
 /** The output format of a spec's reviewed tool, only for a spec that rendered and that a parsed file holds a step of (an action spec counts as reviewed): the one rule of the blocking rule and the job list. */
@@ -856,6 +916,8 @@ function judgeServices(fc: FileCtx, where: string, services: unknown): void {
 
 interface Judged {
   step: RenderedStep; match?: Expected; kind: StepKind;
+  /** the reviewed entry id of an action step (its `uses` path and pin matched that entry): what binds an action check to its job */
+  entryId?: string;
   /** the id may be trusted by the order rule (the step is recognised by content) */
   harmlessId: boolean;
   /** the secrets the step names */
@@ -946,8 +1008,9 @@ function judgeStep(fc: FileCtx, where: string, raw: unknown): Judged {
   let match: Expected | undefined;
   let harmlessId = true;
   let reads = false;
+  let entryId: string | undefined;
   if (isUses) {
-    ({ appRunning, kind } = judgeUses(fc, at, raw.uses as string, withs, env, raw));
+    ({ appRunning, kind, entryId } = judgeUses(fc, at, raw.uses as string, withs, env, raw));
     if (raw.shell !== undefined) bad('template', at('an action step takes no shell.'));
   } else {
     const r = matchRun(fc.ex, step);
@@ -979,7 +1042,7 @@ function judgeStep(fc: FileCtx, where: string, raw: unknown): Judged {
     bad('template', at(`if: ${safeText(String(raw.if), 20)} could skip this step while the job passes (only success(), or always() on an upload or a scrub).`));
   }
   const secrets = judgeSecrets(fc, at, withs, env, kind, appRunning);
-  return { step, ...(match === undefined ? {} : { match }), kind, harmlessId, secrets, readsWorkspace: reads };
+  return { step, ...(match === undefined ? {} : { match }), kind, harmlessId, secrets, readsWorkspace: reads, ...(entryId === undefined ? {} : { entryId }) };
 }
 
 /** Which rendered run step this one is: equal to one in every field that runs (name aside), the slots judged by slots.ts. */
@@ -1006,7 +1069,7 @@ function matchRun(ex: Expectations, s: RenderedStep): Expected | 'near' | null {
 }
 
 /** A `uses:` step: its pin, and as a reviewed action its template. Returns its kind and whether it runs the app (a declared secret may reach it). */
-function judgeUses(fc: FileCtx, at: (m: string) => string, uses: string, withs: Obj, env: Obj, raw: Obj): { appRunning: boolean; kind: StepKind } {
+function judgeUses(fc: FileCtx, at: (m: string) => string, uses: string, withs: Obj, env: Obj, raw: Obj): { appRunning: boolean; kind: StepKind; entryId?: string } {
   const bad = issueFor(fc);
   const other = { appRunning: false, kind: 'unrecognised' as StepKind };
   if (uses.startsWith('docker://')) {
@@ -1063,7 +1126,7 @@ function judgeUses(fc: FileCtx, at: (m: string) => string, uses: string, withs: 
   const appRunning = t.categories.some((c) => APP_RUNNING_CATEGORIES.has(c));
   // the gate action in scrub mode under a scrub id is kind scrub; in any other mode (or under another id) it is the gate (ruling B1 part 4)
   const kind = t.id === PIPEGEN_ACTION_IDS.gate && isScrubStep(raw as unknown as RenderedStep) ? 'scrub' : own(ENTRY_KIND, t.id) ?? (appRunning ? 'repo-code' : 'tool');
-  return { appRunning, kind };
+  return { appRunning, kind, entryId: t.id };
 }
 
 /** The template rule (S15): every fixed input at its value, every choice present and inside its list, nothing else but a renderer-filled input that passes its checker and condition. */
@@ -1310,7 +1373,7 @@ export async function referee(files: CreatedFile[], draft: PipelineDraft, platfo
   for (const f of files) {
     const p = parsed.get(`${f.repo}:${f.path}`);
     if (p === undefined) continue;
-    const fc: FileCtx = { file: f, add, ex, draft, others: parsed, triggers: triggersOf(p.js.on) };
+    const fc: FileCtx = { file: f, add, ex, draft, others: parsed, triggers: effectiveTriggers(f, p.js.on, parsed) };
     if (fileKind(f) === 'action') judgeAction(fc, p.js);
     else if (f.inserted !== undefined) judgeEdited(fc, p, f.inserted);
     else {
@@ -1320,6 +1383,7 @@ export async function referee(files: CreatedFile[], draft: PipelineDraft, platfo
   }
 
   for (const check of ex.deferred) check();
+  judgeUploadsPerFile(ex, add);
   const demoted = blockingRule(draft, ex, add, notes);
 
   // the workflow linters (7b): an issue on pipegen's lines, a note on a user's own

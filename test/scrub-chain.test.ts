@@ -546,18 +546,23 @@ describe('the renderer and the referee agree: a full scanner job per findings to
     const jobs: Record<string, Job> = {};
     const specs: StepSpec[] = [];
     const harden = renderStep(specFor(entry('bullfrog'), { needId: 'egress' }), entry('bullfrog'), p, ctx).steps;
+    // several tools share a need (two DAST tools): one result artifact is uploaded once per file, so each later tool of a need gets a service of its own
+    const ctxN: RenderContext = { ...ctx, profile: { ...prof, services: [svc, ...Array.from({ length: 12 }, (_, i) => ({ ...svc, name: `app${i + 2}` }))] } };
+    const perNeed = new Map<string, number>();
     for (const t of reviewedList().filter((e) => RAW_FORMATS.includes(e.step.output.format))) {
-      const spec = specFor(t, { needId: needFor(t), service: 'app' });
+      const nth = (perNeed.get(needFor(t)) ?? 0) + 1;
+      perNeed.set(needFor(t), nth);
+      const spec = specFor(t, { needId: needFor(t), service: nth === 1 ? 'app' : `app${nth}` });
       let built: ReturnType<typeof scannerSteps>;
-      try { built = scannerSteps(spec); } catch (e) { if (e instanceof RenderError) continue; throw e; }
+      try { built = scannerSteps(spec, ctxN); } catch (e) { if (e instanceof RenderError) continue; throw e; }
       specs.push(spec);
       jobs[`t-${t.id}`] = job(dedupeJobSteps([...harden, ...built.steps], { scans: scansFor([...harden, ...built.steps]) }));
     }
     expect(specs.map((s) => s.tool.id)).toEqual(expect.arrayContaining(['gitleaks', 'betterleaks', 'semgrep', 'osv-scanner', 'trivy-config', 'trivy-image', 'trivy-licence', 'hadolint', 'kube-linter', 'semgrep', 'nuclei', 'zap-baseline']));
     // without the harden step too (the job shape of Plan G's scanner jobs differs by the egress policy)
     const plain: Record<string, Job> = {};
-    for (const s of specs) plain[`u-${s.tool.id}`] = job(dedupeJobSteps(scannerSteps(s).steps, { scans: scansFor(scannerSteps(s).steps) }));
-    const r = await run([workflow(jobs), workflow(plain)].map((f, i) => ({ ...f, path: `.github/workflows/pipegen-${i}.yml` })), draftOf(specs));
+    for (const s of specs) plain[`u-${s.tool.id}`] = job(dedupeJobSteps(scannerSteps(s, ctxN).steps, { scans: scansFor(scannerSteps(s, ctxN).steps) }));
+    const r = await run([workflow(jobs), workflow(plain)].map((f, i) => ({ ...f, path: `.github/workflows/pipegen-${i}.yml` })), { ...draftOf(specs), profile: ctxN.profile });
     expect(show(r)).toBe('');
   });
 });
