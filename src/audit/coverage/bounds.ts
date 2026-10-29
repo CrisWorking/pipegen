@@ -34,6 +34,8 @@ export const COVERAGE_LIMITS = Object.freeze({
 // ---------- own scripts read from package.json (Task 5) ----------
 
 export const MAX_PACKAGE_FILES = 50; // distinct package.json files read for scripts
+/** P50 (C2): distinct repo shell script files tried (read or not); past it a script call is unknown. Below the Reader's cache cap. */
+export const MAX_SCRIPT_FILES = 100;
 export const MAX_SCRIPTS = 1_000;    // distinct (dir, script) pairs worked out (fix round 3: was 200, with a depth limit of 4)
 export const MAX_SCRIPT_TARGETS = 200;
 

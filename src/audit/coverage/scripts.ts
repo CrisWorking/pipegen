@@ -1,7 +1,7 @@
 // Coverage mapper (see ../coverage.ts for the rules): own package.json scripts, read and followed per (dir, script).
 import { posix } from 'node:path';
 import { asObj } from '../../read/manifest.js';
-import { MAX_GLOB_NAME, MAX_GLOB_WORK, MAX_PACKAGE_FILES, MAX_SCRIPTS, MAX_SCRIPT_TARGETS } from './bounds.js';
+import { MAX_GLOB_NAME, MAX_GLOB_WORK, MAX_PACKAGE_FILES, MAX_SCRIPTS, MAX_SCRIPT_FILES, MAX_SCRIPT_TARGETS } from './bounds.js';
 import { UNKNOWN_PREFIX, flagGiven, gateOf, gated } from './settings.js';
 import {
   OK_COMMANDS, PYTEST_NO_RUN, SCRIPT_CATEGORIES, UNKNOWN_SCRIPT_CATEGORIES, globCappedWhy, probeCall, scanShell, scriptCall, type CmdInfo,
@@ -123,8 +123,9 @@ const SCRIPT_FILE_SHELL: ShellMode = { errexit: false, pipefail: false };
  * symbolic link at any level, real path inside the repo, the read limits), its text read like a step's (`set -e` and
  * `cd` count; the script runs in the caller's folder, so paths inside it are taken from there), and the script files
  * and own package scripts it calls in turn are followed the same way: each (folder, file) once, a cycle adding
- * nothing, at most MAX_SCRIPTS. A file pipegen can't read or place, or one past that bound, is never covered and never
- * missing: its own-script checks are unknown, saying why.
+ * nothing. Script files have their own Reader and bound (MAX_SCRIPT_FILES, every file tried counts, read or not;
+ * P50 C2). A file pipegen can't read, one past that bound, or a run inside it in a folder pipegen can't place (P50
+ * I4: it sits at the root as unknown, see Firsts) is never covered and never missing: unknown, saying why.
  */
 async function scriptFileRuns(ctx: Ctx, f: Found): Promise<Found[]> {
   const unknown = (why: string): Found[] => [{ categories: UNKNOWN_SCRIPT_CATEGORIES, by: f.by, subject: f.subject, dir: f.dir, reason: null, partialWhy: why }];
@@ -135,19 +136,29 @@ async function scriptFileRuns(ctx: Ctx, f: Found): Promise<Found[]> {
   const key = `file\u0000${f.dir}\u0000${path}`;
   let runs = ctx.scriptMemo.get(key);
   if (runs === undefined) {
-    if (ctx.scriptMemo.size >= MAX_SCRIPTS) {
-      return unknown(`There are more scripts than pipegen follows (${MAX_SCRIPTS.toLocaleString('en-US')}), so it can't tell what ${f.subject.charAt(0).toLowerCase()}${f.subject.slice(1)} runs.`);
+    // P50 (C2): script files have their own reader and their own bound, and every file tried counts, read or not, so a
+    // repo can't spend the package.json reader (U23 needs it) or slip past the bound with files that don't exist
+    if (ctx.scriptFileReads >= MAX_SCRIPT_FILES || ctx.scriptMemo.size >= MAX_SCRIPTS) {
+      return unknown(`There are more script files than pipegen follows (${MAX_SCRIPT_FILES}), so it can't tell what ${f.subject.charAt(0).toLowerCase()}${f.subject.slice(1)} runs.`);
     }
+    ctx.scriptFileReads++;
     ctx.scriptMemo.set(key, []); // being worked out: a script that calls itself (directly or not) adds nothing
-    const t = await ctx.pkgRead.text(path);
+    const t = await ctx.scriptRead.text(path);
     if (!('ok' in t)) {
-      ctx.scriptMemo.delete(key);
-      return unknown(cantRead);
+      runs = unknown(cantRead);
+      ctx.scriptMemo.set(key, runs);
+      return runs;
     }
     const inner = gated(await resolveScripts(ctx, scanShell(t.ok, f.dir, ctx.sigs, ctx.budget, SCRIPT_FILE_SHELL)), gateOf([t.ok], [], undefined, ctx.sigs.softEnv, ctx.sigs.configFiles));
-    runs = inner.flatMap((g) => {
+    runs = inner.flatMap((g): Found[] => {
       const categories = g.categories.filter((x) => SCRIPT_CATEGORIES.has(x.startsWith(UNKNOWN_PREFIX) ? x.slice(UNKNOWN_PREFIX.length) : x));
-      return categories.length === 0 ? [] : [{ ...g, categories, hookRun: false }];
+      if (categories.length === 0) return [];
+      // P50 (I4): a run in a folder pipegen can't place (`cd "$(dirname "$0")"`) could be any service's: unknown
+      if (g.dir === null && categories.some((c) => !c.startsWith(UNKNOWN_PREFIX))) {
+        return [{ categories: categories.map((c) => (c.startsWith(UNKNOWN_PREFIX) ? c : `${UNKNOWN_PREFIX}${c}`)), by: g.by, subject: g.subject, dir: null, reason: null,
+          partialWhy: `${f.subject} changes to a folder pipegen can't place before it runs ${g.subject.charAt(0).toLowerCase()}${g.subject.slice(1)}, so it can't tell which service that checks.` }];
+      }
+      return [{ ...g, categories, hookRun: false }];
     });
     ctx.scriptMemo.set(key, runs);
   }

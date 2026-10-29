@@ -100,6 +100,9 @@ export interface Ctx {
   pkgScripts: Map<string, Promise<ReadonlyMap<string, string> | null>>;
   /** Task 5: what each (dir, script) runs, worked out once; an entry being worked out is [] (a cycle ends there). */
   scriptMemo: Map<string, Found[]>;
+  /** P50 (C2): the reader for repo shell script files, apart from pkgRead, and how many script files were tried (failed ones too). */
+  scriptRead: Reader;
+  scriptFileReads: number;
   /** Fix round 2: classifyScript's answer per (dir, script). */
   scriptClass: Map<string, ScriptClass>;
   /** Fix round 3 (N6): the env gate of each local composite action path, worked out once. */

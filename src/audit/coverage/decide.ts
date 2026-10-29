@@ -149,7 +149,10 @@ export class Firsts {
   constructor(readonly hits: readonly Hit[], dirs: Dirs) {
     for (let i = 0; i < hits.length; i++) {
       const h = hits[i] as Hit;
-      const d = dirs.idOf(h.dir);
+      // P50 (I4): an unknown run whose folder can't be known (a script pipegen can't place) could be in any service's
+      // folder, so it sits at the root too: every service's row it could cover is unknown, never missing. A real run
+      // there never does (that would be a guessed covered).
+      const d = h.dir === null && h.categories.length > 0 && h.categories.every((c) => c.startsWith(UNKNOWN_PREFIX)) ? ROOT : dirs.idOf(h.dir);
       for (const key of h.opaque ? [OPAQUE_KEY] : h.categories) {
         this.put(key, ALL, h, i);
         if (d >= 0) this.put(key, d, h, i);

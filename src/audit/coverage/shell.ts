@@ -2,6 +2,7 @@
 import { regexSafe } from '../../read/limits.js';
 import { MAX_FLAG_WORDS, MAX_SCAN_BYTES, MAX_SCRIPT_PATTERNS, MAX_SCRIPT_TARGETS } from './bounds.js';
 import { resolveDir } from './helpers.js';
+import { safeText } from '../../util/safe-text.js';
 import { UNKNOWN_PREFIX, commandReason, configTurnedOff, flagsAllow, foundOf, inputWords, inputWordsCapped, inputsCrowded, type Inputs } from './settings.js';
 import { PRE_COMMIT_ID } from './signatures.js';
 import { tokenize } from './tokenize.js';
@@ -29,6 +30,14 @@ export function shellMode(v: unknown): ShellMode {
 
 const ASSIGN = /^[A-Za-z_][A-Za-z0-9_]*=/;
 /** Words after which the next non-flag word is a command. */
+/** P50 (C1): the shells whose flags are allowlisted before a script (anything else: the command gives no coverage). */
+const SHELLS: ReadonlySet<string> = new Set(['sh', 'bash', 'zsh', 'dash']);
+/** -e -u -x -v and their combined and `+` forms (-eux, +x). */
+const SHELL_FLAGS = /^[-+][euxv]+$/;
+/** The `-o` options that keep a script running as written. */
+const SHELL_OPTIONS: ReadonlySet<string> = new Set(['pipefail', 'errexit', 'nounset', 'xtrace']);
+/** A word that names a shell script by its ending, whatever its path (`$DIR/x.sh`, `/opt/x.sh`, `"x.sh"`). */
+const looksLikeScript = (w: string) => /\.sh['"]?$/.test(w);
 const WRAPPERS = new Set(['sudo', 'time', 'npx', 'bunx', 'uvx', 'env', 'nohup', 'exec', 'command', 'xargs', 'sh', 'bash', 'zsh', 'dash', 'nyc', 'cross-env']);
 /** Commands that always succeed and do nothing a check needs (fix round 2, N1). */
 export const OK_COMMANDS: ReadonlySet<string> = new Set(['true', ':', 'echo', 'printf']);
@@ -339,6 +348,7 @@ export function scanShell(text: string, base: string | null, sigs: Compiled, bud
   let deadTo = -1;   // fix round 2 (N1): commands up to here are the right side of `true ||` or `false &&`
   let lastCmd: { kind: 'ok' | 'fail' | 'other'; start: number; end: number } | null = null; // the last command run, where it starts and its list end
   const isDead = (k: number) => k > deadAfter || k <= deadTo;
+  let containerEnd = -1; // P50 (M1): words before this index are the command of a `docker run` container
   let binNext = -1; // the word after `yarn` / `pnpm` that may be a binary (or a script: classifyScript decides)
   // `( … )` and `$( … )` run in a subshell: `set` and `cd` inside them end at the closing bracket.
   const subshells: { close: number; errexit: boolean; pipefail: boolean; cwd: string | null }[] = [];
@@ -385,6 +395,14 @@ export function scanShell(text: string, base: string | null, sigs: Compiled, bud
     // DoD run (fastapi): `bash scripts/tests-start.sh`, `./ci.sh`: a shell script file from the repo, followed by
     // resolveScripts (its own text read like a step's), so its tests and lint count under "your own `<file>`"
     const file = repoScriptFile(w);
+    // P50 (I4, M1): a `.sh` command pipegen can't place (a variable or an absolute or `..` path), or one a container
+    // runs (its own copy, not the repo's), is unknown for every service, never missing
+    const unplaced = file === null && looksLikeScript(w) ? `${safeText(w, 60)} runs a script file pipegen can't place` : null;
+    const contained = file !== null && k < containerEnd ? `${file} runs inside a container, from the image's own copy` : null;
+    if (unplaced !== null || contained !== null) {
+      add({ categories: UNKNOWN_SCRIPT_CATEGORIES, by: 'a script file', subject: 'A script file', dir: null, reason: null, partialWhy: `${unplaced ?? contained}, so pipegen can't tell what it runs.` });
+      return;
+    }
     if (file !== null) {
       add({ categories: [], by: `your own \`${file}\``, subject: `Your own \`${file}\``, dir: cwd, reason: shellReason(k), scriptFile: file });
       return;
@@ -531,6 +549,22 @@ export function scanShell(text: string, base: string | null, sigs: Compiled, bud
     }
     return j;
   };
+  /** P50 (C1): past a shell's flags when every one is allowlisted (SHELL_FLAGS, `-o` SHELL_OPTIONS, `--`): the script's index, else -1. */
+  const shellFlagsEnd = (k: number): number => {
+    let j = k;
+    for (let w = word(j); w !== null && (w.startsWith('-') || w.startsWith('+')) && j < segEnd[k - 1]!; w = word(j)) {
+      if (w === '--') return j + 1;
+      const o = /^[-+]([euxv]*)o$/.exec(w); // `-o name`, also after combined flags (`-eo pipefail`)
+      if (o !== null) {
+        if (!SHELL_OPTIONS.has(word(j + 1) ?? '')) return -1;
+        j += 2;
+        continue;
+      }
+      if (!SHELL_FLAGS.test(w)) return -1;
+      j++;
+    }
+    return j;
+  };
   const skipFlags = (k: number, wrapper: string) => {
     const strict = STRICT_WRAPPER_FLAGS[wrapper];
     if (strict !== undefined) return skipStrictFlags(k, strict);
@@ -631,10 +665,13 @@ export function scanShell(text: string, base: string | null, sigs: Compiled, bud
         if (!(f.startsWith('-') || f.startsWith('+')) || f.startsWith('--') || f.length < 2) continue;
         const on = f[0] === '-';
         if (f.includes('e')) errexit = on;
+        // P50 (C1): `set -n` / `set -o noexec` (any spelling): bash only reads what follows, it runs none of it
+        if (on && /^-[a-zA-Z]*n/.test(f)) deadAfter = Math.min(deadAfter, k);
         if (f.endsWith('o')) {
           const opt = word(j + 1);
           if (opt === 'errexit') errexit = on;
           if (opt === 'pipefail') pipefail = on;
+          if (opt === 'noexec' && on) deadAfter = Math.min(deadAfter, k);
         }
       }
       cmd = false;
@@ -664,6 +701,7 @@ export function scanShell(text: string, base: string | null, sigs: Compiled, bud
       for (let f = word(j); f !== null && f.startsWith('-'); f = word(j)) j += !f.includes('=') && DOCKER_VALUE_FLAGS.has(f) ? 2 : 1;
       const image = word(j);
       if (image !== null) match(j, image, imageName(image));
+      containerEnd = segEnd[k]!;
       k = j + 1; // the container's command follows the image
       cmd = true;
       continue;
@@ -673,6 +711,21 @@ export function scanShell(text: string, base: string | null, sigs: Compiled, bud
       visit(j >= 0 && word(j) !== null);
       cmd = j >= 0; // a flag a strict wrapper doesn't know: no command follows
       k = j >= 0 ? j : k + 2;
+      continue;
+    }
+    if (SHELLS.has(name)) {
+      // P50 (C1): `bash|sh|zsh|dash [allowlisted flags] <script>`: any other flag (-n, --noexec, -o noexec, -c, one
+      // pipegen doesn't know) and this command gives no coverage at all
+      const j = shellFlagsEnd(k + 1);
+      if (j < 0) {
+        visit(false);
+        cmd = false;
+        k = segEnd[k]!;
+        continue;
+      }
+      visit(word(j) !== null);
+      cmd = true;
+      k = j;
       continue;
     }
     if (WRAPPERS.has(name)) {

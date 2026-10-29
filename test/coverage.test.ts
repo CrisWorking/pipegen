@@ -2665,7 +2665,7 @@ describe('coverage: repo shell script files (DoD fastapi)', () => {
     expect(row(rows, 'merge', 'unit-tests', 'app').status).toBe('partial');
     writeIn(dir, 'backend/scripts/tests-start.sh', 'set -e\nbash ../../outside/test.sh\n');
     const out = await mapCoverage(p, floorNeeds(p, caps), dir);
-    expect(row(out, 'merge', 'unit-tests', 'app').status).toBe('missing'); // `..` is never followed (not a repo script path)
+    expect(row(out, 'merge', 'unit-tests', 'app').status).toBe('unknown'); // `..` is never followed: a script pipegen can't place (P50 I4)
   });
 
   it('coverage: `coverage run -m pytest` runs the tests; a flag whose value is the next word stops it', async () => {
@@ -2715,5 +2715,61 @@ describe('coverage: stacks pipegen does not support yet (DoD cobra)', () => {
     // Node keeps "missing"
     const node = await coverage(makeTempDir());
     expect(row(node, 'merge', 'unit-tests').status).toBe('missing');
+  });
+});
+
+// Fix round 1 of the DoD fixes (ruling P50; dod-fixes-review.md C1, C2, I4, M1): the reviewer's reproductions.
+describe('coverage: repo shell script files, fix round 1 (P50)', () => {
+  const steps = (...runs: string[]) => `${both}jobs:\n  t:\n    runs-on: ubuntu-latest\n    steps:\n${runs.map((r) => run(r)).join('')}`;
+  const mergeTests = async (dir: string, over: Partial<RepoProfile> = {}) => row(await coverage(dir, over), 'merge', 'unit-tests');
+  const withScript = (body: string, files: Record<string, string> = { 'scripts/test.sh': 'set -e\npytest\n' }) => {
+    const dir = makeTempDir();
+    wf(dir, 'ci.yml', body);
+    for (const [f, t] of Object.entries(files)) writeIn(dir, f, t);
+    return dir;
+  };
+
+  it('C1: a script is followed only after allowlisted shell flags; -n, --noexec, -o noexec, -c or an unknown flag give no coverage', async () => {
+    for (const cmd of ['bash -n scripts/test.sh', 'sh -n scripts/test.sh', 'bash --noexec scripts/test.sh', 'bash -o noexec scripts/test.sh', 'bash -en scripts/test.sh', 'bash --rcfile x scripts/test.sh', 'zsh -q scripts/test.sh']) {
+      expect((await mergeTests(withScript(steps(cmd)))).status, cmd).toBe('missing');
+    }
+    for (const cmd of ['bash scripts/test.sh', 'bash -eux scripts/test.sh', 'bash -e -o pipefail scripts/test.sh', 'sh -x -- scripts/test.sh', 'bash +x -o errexit -o nounset -o xtrace -v scripts/test.sh', './scripts/test.sh']) {
+      expect((await mergeTests(withScript(steps(cmd)))).status, cmd).toBe('covered');
+    }
+  });
+
+  it('C1: `set -n` or `set -o noexec` in a script (any spelling) ends coverage from that line on', async () => {
+    for (const s of ['set -n', 'set -en', 'set -o noexec', 'set -eo noexec', 'set -e -o noexec']) {
+      expect((await mergeTests(withScript(steps('bash scripts/test.sh'), { 'scripts/test.sh': `set -e\n${s}\npytest\n` }))).status, s).toBe('missing');
+    }
+    // before it, a run still counts
+    expect((await mergeTests(withScript(steps('bash scripts/test.sh'), { 'scripts/test.sh': 'set -e\npytest\nset -n\necho x\n' }))).status).toBe('covered');
+  });
+
+  it('C2: script files have their own read budget; a missing one makes the step unknown; package.json stays readable', async () => {
+    // 310 missing scripts, then a `npm test` whose script does nothing: never covered (U23 still reads package.json)
+    const many = Array.from({ length: 310 }, (_, i) => `bash scripts/m${i}.sh || true`);
+    const dir = withScript(steps(...many, 'npm test'), { 'package.json': JSON.stringify({ name: 'app', scripts: { test: 'echo "Error: no test specified"' } }), 'package-lock.json': '{}' });
+    expect((await mergeTests(dir)).status).not.toBe('covered');
+    const only = withScript(steps('npm test'), { 'package.json': JSON.stringify({ name: 'app', scripts: { test: 'echo "Error: no test specified"' } }), 'package-lock.json': '{}' });
+    expect((await mergeTests(only)).status).toBe('missing');
+    // a script that runs the tests but comes after the budget is spent: unknown, never covered, never missing
+    const files: Record<string, string> = { 'scripts/real.sh': 'set -e\npytest\n' };
+    for (let i = 0; i < 130; i++) files[`scripts/e${i}.sh`] = 'echo hi\n';
+    const spent = withScript(steps(...Array.from({ length: 130 }, (_, i) => `bash scripts/e${i}.sh`), 'bash scripts/real.sh'), files);
+    const r = await mergeTests(spent);
+    expect(r.status).toBe('unknown');
+  });
+
+  it('I4: a script pipegen can\'t place (cd "$(dirname "$0")", a variable in its path, a path outside the repo) is unknown, never missing', async () => {
+    const dirname = withScript(steps('bash scripts/test.sh'), { 'scripts/test.sh': 'set -e\ncd "$(dirname "$0")/.."\nbash scripts/inner.sh\n', 'scripts/inner.sh': 'pytest\n' });
+    expect((await mergeTests(dirname)).status).toBe('unknown');
+    for (const cmd of ['bash "$DIR/test.sh"', 'bash ${GITHUB_WORKSPACE}/scripts/test.sh', 'bash ../outside/test.sh', 'bash /opt/ci/test.sh']) {
+      expect((await mergeTests(withScript(steps(cmd)))).status, cmd).toBe('unknown');
+    }
+  });
+
+  it('M1: a script run inside `docker run IMAGE` is the container\'s copy: unknown, not the host file', async () => {
+    expect((await mergeTests(withScript(steps('docker run --rm python:3.14 bash scripts/test.sh')))).status).toBe('unknown');
   });
 });

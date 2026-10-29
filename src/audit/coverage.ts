@@ -37,6 +37,12 @@
 //   relative `.sh` path, no `..`) is read like a step (no -e unless it sets it, in the caller's folder) and followed
 //   like an own package script: its tests, lint, format, type-check, coverage and dead-code runs count under "your own
 //   `<file>`"; a file pipegen can't read is unknown. `coverage run [flags] -m pytest` runs the tests.
+//   Fix round 1 (ruling P50): only `bash|sh|zsh|dash [-e -u -x -v, combined, -o pipefail|errexit|nounset|xtrace, --]
+//   <file>` (or the file run directly) is followed; any other shell flag (-n, --noexec, -c, unknown) gives no
+//   coverage from that command. `set -n` / `set -o noexec` ends coverage from that line on (in steps too). Script files
+//   have their own reader and bound (MAX_SCRIPT_FILES, failed reads counted); past it a call is unknown. A script
+//   pipegen can't place (a variable, an absolute or `..` path, a `cd` it can't follow, a `docker run` container's copy)
+//   is unknown for every service (an unknown run of unknown folder sits at the root), never missing.
 // Task 5 (accuracy from real repos):
 // - own scripts: `npm|pnpm|yarn|bun run <name>` for a name other than test/lint[:x] counts only through the script's
 //   own text in <dir>/package.json (the run's directory), read as npm runs it (sh -c, no -e), following the own
@@ -173,7 +179,7 @@ export async function mapCoverage(p: RepoProfile, needs: Need[], dir: string, op
   const sigs = (defaultCompiled ??= compile(loadToolSignatures()));
   const ctx: Ctx = {
     p, sigs, read: new Reader(dir), budget: { visits: 0, bytes: 0, truncated: false }, hits: [], localFiles: new Set(),
-    unreadable: (opts.skippedWorkflows ?? 0) > 0, pkgRead: new Reader(dir), pkgScripts: new Map(), scriptMemo: new Map(), scriptClass: new Map(), compositeGates: new Map(),
+    unreadable: (opts.skippedWorkflows ?? 0) > 0, pkgRead: new Reader(dir), pkgScripts: new Map(), scriptMemo: new Map(), scriptRead: new Reader(dir), scriptFileReads: 0, scriptClass: new Map(), compositeGates: new Map(),
     globMemo: new Map(), globWork: 0, ...(opts.capabilities === undefined ? {} : { caps: opts.capabilities }),
     // fix round 1 (P8): a workflow readWorkflows skipped may be a release workflow
     releaseJobs: [], releaseUnread: (opts.skippedWorkflows ?? 0) > 0,
