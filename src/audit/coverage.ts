@@ -152,6 +152,11 @@ export interface Coverage {
    * "would add" never tells a repo to set a wait it has. Absent when pipegen couldn't read the config that far.
    */
   cooldown?: 'set' | 'short';
+  /**
+   * Hand checks (P55): a covered row made partial because the last completed run of its workflow on the default branch
+   * failed: that run (workflow path, branch, conclusion, day as YYYY-MM-DD or null).
+   */
+  lastRun?: { workflow: string; branch: string; conclusion: string; date: string | null };
 }
 
 export interface MapCoverageOptions {

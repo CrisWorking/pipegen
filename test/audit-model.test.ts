@@ -1032,3 +1032,15 @@ describe('buildAudit: would-add never asks for a wait the update tool has (hand 
     expect(add?.note).toBe('keep your Dependabot config; its cooldown already waits at least 7 days');
   });
 });
+
+describe('buildAudit: would-add for a check whose workflow fails (hand checks fix 3, P55)', () => {
+  const CI = 'on:\n  push:\n  pull_request:\njobs:\n  test:\n    runs-on: ubuntu-latest\n    steps:\n      - run: npm test\n';
+  it('the row carries the failed run, and the pick says to fix that run instead of offering the script that already runs', async () => {
+    const runs = async () => ({ data: { total_count: 1, workflow_runs: [{ id: 1, conclusion: 'failure', status: 'completed', created_at: '2026-10-27T13:10:15Z' }] } });
+    const r = await buildAudit(repo({ ...nodeApp(), '.github/workflows/ci.yml': CI }), deps({ gh: fakeGh({ signals: { runs } }).gh }));
+    const row = r.coverage.find((c) => c.need.category === 'unit-tests' && c.need.layer === 'push');
+    expect(row?.lastRun).toEqual({ workflow: '.github/workflows/ci.yml', branch: 'main', conclusion: 'failure', date: '2026-10-27' });
+    const add = rowsOf(r, 'unit-tests').find((w) => w.need.layer === 'push');
+    expect(add?.note).toBe('your own `test` script already runs in .github/workflows/ci.yml, but its last run on main failed: make that workflow pass first');
+  });
+});

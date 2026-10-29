@@ -725,9 +725,21 @@ function wouldAddRows(p: RepoProfile, coverage: Coverage[], deps: AuditDeps, cap
     // then not offered as the tool, so the row's tool and note agree (fix round 1, M2).
     const starter = (need.category === 'unit-tests' || need.category === 'full-tests') && service !== undefined && !service.hasTests;
     const { tool, also, note } = pick(need, starter ? undefined : service, p, deps, caps, c);
-    rows.push({ need, status: c.status, tool, also, note: starter ? starterTests(service.name) : note });
+    rows.push({ need, status: c.status, tool, also, note: starter ? starterTests(service.name) : c.lastRun === undefined ? note : failedRunNote(c.lastRun, tool, note) });
   }
   return rows;
+}
+
+/**
+ * P55 (fix 3): the pick for a row whose covering workflow's last run failed. The project's own script already runs
+ * there, so offering it again would be no advice: the note says to make that workflow pass. Another pick keeps its note,
+ * with the failed run said after it.
+ */
+function failedRunNote(run: NonNullable<Coverage['lastRun']>, tool: WouldAddTool, note: string): string {
+  if (tool !== null && 'kind' in tool && tool.kind === 'project-script') {
+    return `your own \`${tool.script}\` script already runs in ${run.workflow}, but its last run on ${run.branch} failed: make that workflow pass first`;
+  }
+  return `${note}; the check pipegen found in ${run.workflow} may not be running: its last run on ${run.branch} failed`;
 }
 
 /**

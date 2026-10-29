@@ -73,8 +73,11 @@ export function applyLastRuns(rows: readonly Coverage[], runs: ReadonlyMap<strin
     const wf = coveringWorkflow(r, listed);
     const run = wf === null ? undefined : runs.get(wf);
     if (wf === null || run === undefined || run.state !== 'read' || !FAILED.has(run.conclusion)) return r;
-    const date = run.createdAt === null ? '' : ` (${run.createdAt.slice(0, 10)})`;
-    return { ...r, status: 'partial' as const, why: `The last run of ${wf} on ${branch} failed${date}, so this check may not be running.` };
+    const day = run.createdAt === null ? null : run.createdAt.slice(0, 10);
+    return {
+      ...r, status: 'partial' as const, why: `The last run of ${wf} on ${branch} failed${day === null ? '' : ` (${day})`}, so this check may not be running.`,
+      lastRun: { workflow: wf, branch, conclusion: run.conclusion, date: day },
+    };
   });
   const unseen = new Map<string, string[]>();
   for (const [wf, run] of runs) {
