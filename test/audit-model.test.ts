@@ -937,7 +937,7 @@ describe('buildAudit: the last run of a covering workflow (hand checks fix 3, P5
     }
     // one call for the workflow, however many rows it covers, asked for the default branch's completed runs
     expect(f.runs).toHaveBeenCalledTimes(1);
-    expect(f.runs).toHaveBeenCalledWith(expect.objectContaining({ workflow_id: 'ci.yml', branch: 'main', status: 'completed', per_page: 10 }));
+    expect(f.runs).toHaveBeenCalledWith(expect.objectContaining({ workflow_id: 'ci.yml', branch: 'main', status: 'completed', per_page: 50 }));
     expect(rowsOf(r, 'unit-tests').map((w) => w.status)).toEqual(['partial', 'partial']);
   });
 
@@ -947,6 +947,24 @@ describe('buildAudit: the last run of a covering workflow (hand checks fix 3, P5
     expect(await status(mixed(['pull_request', 'failure'], ['push', 'success']))).toEqual(['covered', 'covered', 'covered']);
     expect(await status(mixed(['pull_request', 'success'], ['push', 'failure']))).toEqual(['partial', 'partial', 'partial']);
     expect(await status(mixed(['pull_request', 'failure'], ['pull_request_target', 'failure']))).toEqual(['covered', 'covered', 'covered']);
+  });
+
+  it('P57 (I2): a cancelled, skipped, neutral or stale newer run doesn\'t hide the last decisive one (concurrency: cancel-in-progress)', async () => {
+    const seq = (...cs: string[]) => async () => ({ data: { total_count: cs.length, workflow_runs: cs.map((conclusion, i) => ({ id: i, conclusion, status: 'completed', created_at: `2026-10-${String(28 - i).padStart(2, '0')}T10:00:00Z`, head_branch: 'main', event: 'push' })) } });
+    const status = async (runs: GhSignals['runs']) => testRows(await buildAudit(redRepo(), deps({ gh: fakeGh({ signals: { runs } }).gh }))).map((c) => c.status);
+    for (const skip of ['cancelled', 'skipped', 'neutral', 'stale', 'action_required']) {
+      expect(await status(seq(skip, 'failure')), skip).toEqual(['partial', 'partial', 'partial']);
+      expect(await status(seq(skip, skip, 'success', 'failure')), skip).toEqual(['covered', 'covered', 'covered']);
+    }
+    // only undecided runs: the rows keep their status, and a note says pipegen saw no run that passed or failed
+    const r = await buildAudit(redRepo(), deps({ gh: fakeGh({ signals: { runs: seq('cancelled', 'skipped') } }).gh }));
+    for (const c of testRows(r)) expect(c.status).toBe('covered');
+    expect(r.notes.some((n) => n.includes('.github/workflows/ci.yml') && n.includes('no run that passed or failed'))).toBe(true);
+    // still one call, asking for enough runs to get past a streak of cancelled ones
+    const f = fakeGh({ signals: { runs: seq('cancelled', 'failure') } });
+    await buildAudit(redRepo(), deps({ gh: f.gh }));
+    expect(f.runs).toHaveBeenCalledTimes(1);
+    expect(f.runs).toHaveBeenCalledWith(expect.objectContaining({ per_page: 50 }));
   });
 
   it('a passing last run keeps the rows covered', async () => {

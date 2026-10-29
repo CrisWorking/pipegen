@@ -81,7 +81,7 @@ export function applyLastRuns(rows: readonly Coverage[], runs: ReadonlyMap<strin
   });
   const unseen = new Map<string, string[]>();
   for (const [wf, run] of runs) {
-    const why = run.state === 'none' ? 'no completed run there yet' : run.state === 'unread' ? UNREAD_WHY[run.why] ?? 'unknown' : null;
+    const why = run.state === 'none' ? 'no completed run there yet' : run.state === 'undecided' ? 'no run that passed or failed among its latest runs, only cancelled or skipped ones' : run.state === 'unread' ? UNREAD_WHY[run.why] ?? 'unknown' : null;
     if (why !== null) unseen.set(why, [...(unseen.get(why) ?? []), wf]);
   }
   const notes = [...unseen].map(([why, wfs]) => `pipegen couldn't see the last run of ${wfs.sort().join(', ')} on ${branch} (${why}), so the checks ${wfs.length === 1 ? 'it covers' : 'they cover'} show as found in the files, but ${wfs.length === 1 ? 'that workflow' : 'those workflows'} may still fail on every run.`);
