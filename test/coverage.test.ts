@@ -3601,3 +3601,18 @@ describe('coverage: a custom BuildKit frontend makes a Dockerfile build unknown 
     expect(await st(compose('        OTHER: "1"\n'), run('docker compose build'))).toBe('covered your own `pytest`');
   });
 });
+
+describe('coverage: prek run flags (P57 M2)', () => {
+  const lint = async (cmd: string) => {
+    const dir = makeTempDir();
+    writeIn(dir, '.pre-commit-config.yaml', hookConfig('      - id: ruff-check\n'));
+    ci(dir, run(cmd));
+    const r = row(await coverage(dir, pyApp), 'merge', 'lint', 'app');
+    return `${r.status}${r.by === undefined ? '' : ` ${r.by}`}`;
+  };
+  it('--last-commit runs the hooks on the last commit\'s files only (partial); --stage is --hook-stage', async () => {
+    expect(await lint('prek run --last-commit')).toBe('partial ruff');
+    expect(await lint('prek run --all-files --stage pre-commit')).toBe('covered ruff');
+    expect(await lint('prek run --all-files --stage manual')).toBe('missing');
+  });
+});

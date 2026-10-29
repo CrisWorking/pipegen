@@ -209,6 +209,7 @@ export function preCommitRunMode(words: readonly string[]): 'all' | 'changed' | 
   let all = false;
   let from = false;
   let to = false;
+  let last = false; // P57 (M2): prek's --last-commit: the files the last commit changed
   for (let i = 0; i < words.length; i++) {
     const w = words[i] as string;
     const r = redirection(w);
@@ -221,6 +222,7 @@ export function preCommitRunMode(words: readonly string[]): 'all' | 'changed' | 
     const name = eq < 0 ? w : w.slice(0, eq);
     const value = eq < 0 ? undefined : w.slice(eq + 1);
     if ((name === '-a' || name === '--all-files') && value === undefined) all = true;
+    else if (name === '--last-commit' && value === undefined) last = true;
     else if (value === undefined && ['--show-diff-on-failure', '-v', '--verbose', '--fail-fast'].includes(name)) continue;
     else if (name === '--color') i += value === undefined ? 1 : 0;
     else if (['--from-ref', '--source', '-s', '--to-ref', '--origin', '-o'].includes(name)) {
@@ -228,12 +230,13 @@ export function preCommitRunMode(words: readonly string[]): 'all' | 'changed' | 
       if (v === undefined || v === '' || v.startsWith('-')) return null;
       if (name === '--from-ref' || name === '--source' || name === '-s') from = true;
       else to = true;
-    } else if (name === '--hook-stage') {
+    } else if (name === '--hook-stage' || name === '--stage') { // P57 (M2): prek's --stage is --hook-stage
       const stage = value ?? words[++i];
       if (stage !== 'pre-commit' && stage !== 'commit') return null;
     } else return null;
   }
-  if (all) return from || to ? null : 'all';
+  if (all) return from || to || last ? null : 'all';
+  if (last) return from || to ? null : 'changed';
   return from && to ? 'changed' : null;
 }
 /** The `all` answer of preCommitRunMode only (the older name). */
