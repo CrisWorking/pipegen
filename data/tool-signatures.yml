@@ -433,6 +433,15 @@ tools:
     categories: [image-build]
     actions: [docker/build-push-action]
     commands: [docker build, docker buildx build]
+  # P55 (batch B): `docker compose build` (and `docker-compose build`, `docker compose up --build`) builds the images of the
+  # Compose file's services that have a `build:` (https://docs.docker.com/reference/cli/docker/compose/build/). pipegen
+  # reads these itself (global flags such as -f come before the subcommand); the row is partial because it can't tell
+  # which images are built for the deploy.
+  - id: docker-compose-build
+    categories: [image-build]
+    commands: [docker compose build, docker-compose build]
+    commandFails: never
+    partialWhy: It builds the images a Compose file defines, and pipegen can't tell whether they are the ones that get scanned and deployed.
   # CLI: https://github.com/bridgecrewio/checkov/blob/main/docs/2.Basics/CLI%20Command%20Reference.md (-s, --soft-fail)
   # Action: https://github.com/bridgecrewio/checkov/blob/main/github_action_resources/entrypoint.sh (adds --soft-fail
   # only when soft_fail is "true")

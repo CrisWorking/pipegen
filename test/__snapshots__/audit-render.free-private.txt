@@ -202,6 +202,10 @@ What this audit can't see
   - Variables that change what runs (SKIP for pre-commit, TOX… and NOX… for tox and nox,
     NPM_CONFIG_DRY_RUN) aren't seen when an action from another repo sets them, or when a step
     writes them under a name built while it runs.
+  - Dockerfile RUN lines count only when a `docker build`, docker/build-push-action or `docker
+    compose build` step names the Dockerfile with plain paths, and only for the stages the final
+    stage (or the target) needs. Build arguments, Compose profiles, `extends` and `include` aren't
+    read.
   - A pre-commit hook pinned to a commit SHA (`rev:`) isn't checked to be a commit of the hook's own
     repo, so it could come from a fork.
   - pipegen knows the PyPI publish action up to v1.14.3: a newer release pinned by its commit SHA

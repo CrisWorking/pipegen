@@ -1,6 +1,7 @@
 // Coverage mapper (see ../coverage.ts for the rules): the types the coverage modules share. Types only: import it with
 // `import type`.
 import type { Capabilities, Layer, RepoProfile } from '../../types.js';
+import type { ComposeModel } from './docker.js';
 import type { ScriptClass, Targets } from './scripts.js';
 import type { EnvGate } from './settings.js';
 import type { ToolSignature } from './signatures.js';
@@ -48,6 +49,9 @@ export type CiLayer = Exclude<Layer, 'pre-commit'>;
 export type Slot = CiLayer | 'scheduled';
 export type Fit = Record<Slot, boolean>;
 
+/** One Dockerfile a command builds (repo-relative, plain paths), its build context, and the --target stage ('' = none). */
+export interface DockerBuild { file: string; context: string; target: string | null }
+
 /** A tool found in shell text or a step. `reason` null = it runs and can fail the run. */
 export interface Found {
   categories: readonly string[]; by: string; subject: string; dir: string | null; reason: Reason | null; partialWhy?: string;
@@ -70,6 +74,15 @@ export interface Found {
    * those tools are carried as partial ('changed').
    */
   hookRun?: boolean | 'changed';
+  /**
+   * P55 (batch B): `docker build`, docker/build-push-action or `docker compose build` builds these images, so the RUN lines
+   * of their Dockerfiles run in CI (read by resolveScripts, docker.ts): one Dockerfile and its context, or the services of
+   * a compose file (all of them when `services` is null), found from the folder `cwd`.
+   */
+  dockerBuild?: DockerBuild;
+  composeBuild?: { files: readonly string[] | null; cwd: string; services: readonly string[] | null; shellReason: Reason | null };
+  /** P55 (batch B): this command runs inside the compose service `service` (`docker compose run|exec`), so its folder is that service's build context. */
+  composeRun?: { files: readonly string[] | null; cwd: string; service: string };
   /** Plan P Task 3 (PS14): a pre-commit formatter hook that writes files or checks them, so a CI `pre-commit run` fails on a change. */
   formats?: boolean;
   /** Fix round 1 (P8): the tool's softEnv names and the config files it loads (none when its config flag turned them off). */
@@ -129,4 +142,6 @@ export interface Ctx {
   releaseJobs: { start: number; first: number; where: string }[];
   releaseUnread: boolean;
   precommitConfig?: Promise<{ readable: boolean; found: Found[] }>;
+  /** P55 (batch B): each compose file set's services, worked out once (docker.ts). */
+  composeMemo: Map<string, ComposeModel>;
 }

@@ -10,16 +10,17 @@ import { neverListed, plainNeverReason } from '../../engine/never-list.js';
 import { safeText } from '../../util/safe-text.js';
 import { MAX_FILTER_PATTERNS, MAX_HITS, MAX_JOBS, MAX_LOCAL_FILES, MAX_SCAN_BYTES, MAX_STEPS, MAX_STEP_VISITS } from './bounds.js';
 import { MAY_NOT_RUN, OPAQUE_WHY } from './decide.js';
-import { allowedToFail, cut, defaultsDir, firstSet, list, strs, validRef, workingDir } from './helpers.js';
+import { allowedToFail, cut, defaultsDir, firstSet, list, resolveDir, strs, validRef, workingDir } from './helpers.js';
 import { resolveScripts } from './scripts.js';
 import {
   ALL_GATE, NO_GATE, OLD_PREFIX, OPAQUE_GATE, actionReason, actionSkipped, condition, foundOf, gateOf, gated, lowerInputs, orGate, refVerdict, requiredInputsHeld,
   configWhy, type EnvGate, type Inputs, type RepoId,
 } from './settings.js';
 import { imageName, preCommitRunMode, scanImage, scanShell, shellMode } from './shell.js';
-import { PART_RE, PREK_ID, isHookRunner, type ToolSignature } from './signatures.js';
+import { plainPath } from './docker-words.js';
+import { DOCKER_BUILD_ID, PART_RE, PREK_ID, isHookRunner, type ToolSignature } from './signatures.js';
 import { tokenize } from './tokenize.js';
-import type { Compiled, Ctx, Fit, Found, Hit, Obj, Reason } from './types.js';
+import type { Compiled, Ctx, DockerBuild, Fit, Found, Hit, Obj, Reason } from './types.js';
 
 // ---------- reading files safely (ruling S2) ----------
 
@@ -44,6 +45,25 @@ export class Reader {
     }
     return r;
   }
+
+  /**
+   * P55 (batch B): whether `rel` is a folder or a regular file (a symbolic link at any level, a path that leaves the
+   * repo or one that is missing: null). Worked out once per path; past MAX_CONFIG_CHECKS paths null.
+   */
+  kind(rel: string): Promise<'dir' | 'file' | null> {
+    let r = this.kinds.get(rel);
+    if (r === undefined) {
+      const ok = regexSafe(rel) && safeText(rel) === rel && !rel.startsWith('/') && !rel.split('/').some((x) => x === '..' || x === '');
+      r = !ok || this.kinds.size >= MAX_CONFIG_CHECKS ? Promise.resolve(null) : (async () => {
+        if ((await linkedLevel(this.dir, rel)) !== null) return null;
+        const st = await lstat(join(this.dir, rel)).catch(() => null);
+        return st === null ? null : st.isDirectory() ? 'dir' : st.isFile() ? 'file' : null;
+      })();
+      this.kinds.set(rel, r);
+    }
+    return r;
+  }
+  private kinds = new Map<string, Promise<'dir' | 'file' | null>>();
 
   /**
    * Fix round 1 (P8): whether `rel` exists (a file, a folder or a link: the tool would find it there), without reading
@@ -254,6 +274,10 @@ function actionFinds(ctx: Ctx, tools: readonly ToolSignature[], uses: string, w:
     if (verdict === 'old' && t.actionRef !== undefined) {
       return { ...f, categories: t.categories.map((c) => `${OLD_PREFIX}${c}`), reason: null, partialWhy: t.actionRef.oldWhy };
     }
+    if (t.id === DOCKER_BUILD_ID) {
+      const b = buildActionBuild(w);
+      if (b !== null) f.dockerBuild = b;
+    }
     if (isHookRunner(t.id)) {
       const mode = hookActionMode(t, w);
       if (mode === 'all') f.hookRun = true;
@@ -261,6 +285,30 @@ function actionFinds(ctx: Ctx, tools: readonly ToolSignature[], uses: string, w:
     }
     return f;
   });
+}
+
+/** A `with:` input as one literal string: undefined when not given, null when it can't be read (several spellings, an expression, not text). */
+function literalInput(w: Inputs, name: string): string | null | undefined {
+  if (w.crowded.has(name)) return null;
+  const vals = (w.byName.get(name) ?? []).filter((v) => !(v === null || v === undefined || v === ''));
+  if (vals.length === 0) return undefined;
+  const v = vals[0];
+  if (typeof v !== 'string' || !regexSafe(v) || v.includes('${{') || vals.some((x) => x !== v)) return null;
+  return v.trim();
+}
+
+/**
+ * P55 (batch B): the Dockerfile docker/build-push-action builds (https://github.com/docker/build-push-action/blob/master/action.yml):
+ * `file` (default `<context>/Dockerfile`), `context` (default the repo root) and `target`, each a plain literal; a `call`
+ * (check, print: no build), an expression or a context that isn't a repo folder gives null.
+ */
+function buildActionBuild(w: Inputs): DockerBuild | null {
+  const [call, context, file, target] = ['call', 'context', 'file', 'target'].map((n) => literalInput(w, n));
+  if (call !== undefined || context === null || file === null || target === null) return null;
+  const folder = context === undefined ? '.' : context === '.' || (plainPath(context.replace(/^(?:\.\/)+/, '')) !== null && !context.startsWith('/')) ? resolveDir('.', context) : null;
+  const path = file === undefined ? (folder === null ? null : resolveDir(folder, 'Dockerfile')) : plainPath(file) === null ? null : resolveDir('.', file);
+  if (folder === null || path === null || (target !== undefined && !/^[A-Za-z0-9_.-]{1,64}$/.test(target))) return null;
+  return { file: path, context: folder, target: target ?? null };
 }
 
 /**
@@ -307,7 +355,7 @@ async function walkStep(ctx: Ctx, step: Obj, c: StepCtx): Promise<void> {
       addFound(ctx, scanImage(uses, withInputs, ctx.sigs), sc);
     } else {
       const tools = actionMatches(ctx.sigs, uses);
-      addFound(ctx, gated(actionFinds(ctx, tools, uses, withInputs, false, sc), sc.gate), sc);
+      addFound(ctx, gated(await resolveScripts(ctx, actionFinds(ctx, tools, uses, withInputs, false, sc)), sc.gate), sc);
       const owner = uses.split('/')[0]?.toLowerCase();
       if (tools.length === 0 && owner !== undefined && owner === ctx.p.owner.toLowerCase()) opaque(ctx, OPAQUE_WHY.ownerAction, validRef(uses), sc);
     }

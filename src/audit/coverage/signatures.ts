@@ -271,4 +271,7 @@ export function compile(tools: ToolSignature[]): Compiled {
 export const PRE_COMMIT_ID = 'pre-commit';
 /** P55 (batch B): the tools that run the repo's .pre-commit-config.yaml in CI: pre-commit itself and prek, its drop-in. */
 export const PREK_ID = 'prek';
+/** P55 (batch B): image builds whose Dockerfiles' RUN lines run in CI. docker-compose-build is read by shell.ts itself (it needs the global flags), not by the command table. */
+export const DOCKER_BUILD_ID = 'docker-build';
+export const COMPOSE_BUILD_ID = 'docker-compose-build';
 export const isHookRunner = (id: string): boolean => id === PRE_COMMIT_ID || id === PREK_ID;

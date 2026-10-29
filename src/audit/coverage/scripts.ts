@@ -7,6 +7,7 @@ import {
   OK_COMMANDS, PYTEST_NO_RUN, SCRIPT_CATEGORIES, shebangOk, UNKNOWN_SCRIPT_CATEGORIES, globCappedWhy, probeCall, scanShell, scriptCall, type CmdInfo,
   type ShellMode,
 } from './shell.js';
+import { buildRuns, placeComposeRun } from './docker.js';
 import { compileGlob } from './triggers.js';
 import type { Compiled, Ctx, Found, Reason } from './types.js';
 
@@ -67,9 +68,14 @@ async function scriptRuns(ctx: Ctx, dir: string, name: string): Promise<Found[]>
  * nothing that counts is dropped.
  */
 export async function resolveScripts(ctx: Ctx, found: Found[]): Promise<Found[]> {
-  if (!found.some((f) => f.script !== undefined || f.byName !== undefined || f.scriptFile !== undefined)) return found;
+  if (!found.some((f) => f.script !== undefined || f.byName !== undefined || f.scriptFile !== undefined || f.composeRun !== undefined || f.dockerBuild !== undefined || f.composeBuild !== undefined)) return found;
   const out: Found[] = [];
-  for (const f of found) {
+  for (const f0 of found) {
+    // P55 (batch B): the Dockerfiles a build command builds add the checks in their RUN lines; the build itself stays as it is
+    if (f0.dockerBuild !== undefined || f0.composeBuild !== undefined) out.push(...(await buildRuns(ctx, f0, resolveScripts)));
+    // `docker compose run|exec <service> <command>` counts in the service's build folder
+    const f = f0.composeRun === undefined ? f0 : await placeComposeRun(ctx, f0);
+    if (f === null) continue;
     if (f.byName !== undefined) {
       const lowered = await byNameRun(ctx, f);
       if (lowered !== null) out.push(lowered);

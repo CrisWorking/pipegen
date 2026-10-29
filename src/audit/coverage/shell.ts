@@ -4,9 +4,10 @@ import { MAX_FLAG_WORDS, MAX_SCAN_BYTES, MAX_SCRIPT_PATTERNS, MAX_SCRIPT_TARGETS
 import { resolveDir } from './helpers.js';
 import { safeText } from '../../util/safe-text.js';
 import { UNKNOWN_PREFIX, commandReason, configTurnedOff, flagsAllow, foundOf, inputWords, inputWordsCapped, inputsCrowded, type Inputs } from './settings.js';
-import { isHookRunner } from './signatures.js';
+import { buildWords, composeBuildServices, composeRunWords, composeWords } from './docker-words.js';
+import { COMPOSE_BUILD_ID, DOCKER_BUILD_ID, isHookRunner } from './signatures.js';
 import { tokenize } from './tokenize.js';
-import type { Budget, CommandRule, Compiled, Found, Reason } from './types.js';
+import type { Budget, CommandRule, Compiled, DockerBuild, Found, Reason } from './types.js';
 
 // ---------- reading shell text (review M2: command position only; round 2: quotes, lists, groups, pipes) ----------
 
@@ -423,13 +424,17 @@ export function scanShell(text: string, base: string | null, sigs: Compiled, bud
 
   const found: Found[] = [];
   const seen = new Set<string>(); // one finding per tool, directory and reason per text
-  const add = (found0: Found) => {
+  let matchAt = -1;                                                                  // the command word match() is reading
+  let composeRegion: { start: number; end: number; run: NonNullable<Found['composeRun']> } | null = null; // P55: the command of a `docker compose run|exec`
+  const add = (found00: Found) => {
+    // P55 (batch B): what a `docker compose run|exec <service>` runs counts for that service's folder (resolveScripts places it)
+    const found0 = composeRegion !== null && matchAt >= composeRegion.start && matchAt < composeRegion.end ? { ...found00, composeRun: composeRegion.run } : found00;
     // P52 (c): after a `set` pipegen can't read, a run may be under `set -n` or anything: unknown, never covered
     const f: Found = opaqueSet && found0.categories.some((c) => !c.startsWith(UNKNOWN_PREFIX))
       ? { ...found0, categories: found0.categories.map((c) => (c.startsWith(UNKNOWN_PREFIX) ? c : `${UNKNOWN_PREFIX}${c}`)), reason: null,
         partialWhy: `${found0.subject} runs after a \`set\` whose options pipegen can't read, so it can't tell whether it runs.` }
       : found0;
-    const key = `${f.by}\u0000${f.dir ?? ''}\u0000${f.reason ?? ''}\u0000${f.hookRun === true ? 1 : f.hookRun === 'changed' ? 2 : 0}`;
+    const key = `${f.by}\u0000${f.dir ?? ''}\u0000${f.reason ?? ''}\u0000${f.hookRun === true ? 1 : f.hookRun === 'changed' ? 2 : 0}\u0000${f.dockerBuild?.file ?? ''}\u0000${f.composeRun?.service ?? ''}\u0000${f.composeBuild?.services?.join(',') ?? ''}`;
     if (!seen.has(key)) {
       seen.add(key);
       found.push(f);
@@ -486,6 +491,7 @@ export function scanShell(text: string, base: string | null, sigs: Compiled, bud
   const followedBy = (k: number, rest: readonly string[]) => rest.every((x, i) => word(k + 1 + i) === x);
   /** Signatures and own scripts for the command word at k (`name` = its basename, or an image name). */
   const match = (k: number, w: string, name: string) => {
+    matchAt = k;
     if (isDead(k)) return;
     const args = argsAfter(k);
     if (probeCall(args)) return;
@@ -493,6 +499,7 @@ export function scanShell(text: string, base: string | null, sigs: Compiled, bud
     const complete = segEnd[k]! - k - 1 <= MAX_FLAG_WORDS;
     const tryRules = (rules: CommandRule[] | undefined) => {
       for (const r of rules ?? []) {
+        if (r.tool.id === COMPOSE_BUILD_ID) continue; // read by composeCommand, which knows the global flags
         if (!followedBy(k, r.rest) || r.excludes.some((x) => followedBy(k, x)) || !flagsAllow(r.tool, args, complete)) continue;
         const target = r.tool.scanTarget === undefined ? null : imageTarget(args.slice(r.rest.length));
         if (target !== null && target !== 'unknown' && target !== r.tool.scanTarget) continue;
@@ -505,6 +512,11 @@ export function scanShell(text: string, base: string | null, sigs: Compiled, bud
           const mode = preCommitRunMode(args.slice(1));
           if (mode === 'all') f.hookRun = true;
           else if (mode === 'changed') f.hookRun = 'changed';
+        }
+        // P55 (batch B): the Dockerfile a `docker build` names, so its RUN lines count (resolveScripts)
+        if (r.tool.id === DOCKER_BUILD_ID && r.tool.commands?.includes(r.rest.length === 1 ? 'docker build' : 'docker buildx build') === true && cwd !== null && complete) {
+          const b = dockerBuildOf(cwd, buildWords(word, k + 1 + r.rest.length, segEnd[k]!));
+          if (b !== null) f.dockerBuild = b;
         }
         if (r.tool.id === NPM_PROVENANCE_ID) f.envGate = 'npm';
         add(f);
@@ -590,6 +602,38 @@ export function scanShell(text: string, base: string | null, sigs: Compiled, bud
       categories, by: `your own \`${cmd}\``, subject: `Your own \`${cmd}\``, dir: cwd, reason: shellReason(k),
       ...(script === undefined ? {} : { script }), ...(envGate === undefined ? {} : { envGate }), ...(byName === undefined ? {} : { byName }),
     });
+  };
+  /**
+   * P55 (batch B): `docker compose|docker-compose [global flags] <sub> …` at k (its first word after `docker compose` is
+   * `from`). `build` (and `up --build`) is the image build of the compose-build signature (partial); `build` also names
+   * the services whose Dockerfiles run. `run` and `exec` with a service and a command: the command's index and the
+   * service (the caller scans the command, tagged with the service). Anything else, or a line pipegen can't read: null.
+   */
+  const composeCommand = (k: number, from: number): { commandAt: number; run: NonNullable<Found['composeRun']> } | null => {
+    const end = segEnd[k]!;
+    if (end - k - 1 > MAX_FLAG_WORDS || cwd === null) return null;
+    const g = composeWords(word, from, end);
+    if (g === null || g.sub === null) return null;
+    const tool = (sigs.byFirstWord.get('docker') ?? []).concat(sigs.byFirstWord.get('docker-compose') ?? []).find((r) => r.tool.id === COMPOSE_BUILD_ID)?.tool;
+    if (g.sub === 'build' || g.sub === 'up') {
+      const args = argsAfter(k);
+      if (tool === undefined || (g.sub === 'up' && !args.includes('--build')) || args.includes('--dry-run')) return null;
+      const services = g.sub === 'build' ? composeBuildServices(word, g.subAt + 1, end) : null;
+      const f = foundOf(tool, cwd, shellReason(k) ?? commandReason(tool, args));
+      if (g.sub === 'build' && services !== null) f.composeBuild = { files: g.files, cwd, services: services.length === 0 ? null : services, shellReason: shellReason(k) };
+      add(f);
+      return null;
+    }
+    if (g.sub !== 'run' && g.sub !== 'exec') return null;
+    const r = composeRunWords(word, g.subAt + 1, end);
+    return r === null ? null : { commandAt: r.commandAt, run: { files: g.files, cwd, service: r.service } };
+  };
+  /** The Dockerfile and context a `docker build` names, as repo-relative paths from the folder it runs in; null when they leave the repo. */
+  const dockerBuildOf = (from: string, b: ReturnType<typeof buildWords>): DockerBuild | null => {
+    if (b === null) return null;
+    const context = resolveDir(from, b.context);
+    const file = b.file !== null ? resolveDir(from, b.file) : context === null ? null : resolveDir(context, 'Dockerfile');
+    return context === null || file === null ? null : { file, context, target: b.target };
   };
   /**
    * The words of the simple command at k, past redirections (more than MAX_FLAG_WORDS: false). `onWord` sees each
@@ -848,6 +892,17 @@ export function scanShell(text: string, base: string | null, sigs: Compiled, bud
       onCmd?.({ name, args: argsAfter(k), dir: cwd, reason: shellReason(k), dead, wrapper, afterBin: binNext === k });
       if (!dead && !wrapper) lastCmd = { kind: OK_COMMANDS.has(name) ? 'ok' : name === 'false' ? 'fail' : 'other', start: k, end: segEnd[k]! };
     };
+    if ((name === 'docker' && next === 'compose') || name === 'docker-compose') {
+      const c = composeCommand(k, name === 'docker' ? k + 2 : k + 1);
+      if (c !== null) {
+        visit(false);
+        containerEnd = segEnd[k]!; // the command runs in the service's container, from its image's own copy of the files
+        composeRegion = { start: c.commandAt, end: segEnd[k]!, run: c.run };
+        k = c.commandAt;
+        cmd = true;
+        continue;
+      }
+    }
     if (name === 'docker' && next === 'run') {
       visit(false);
       let j = k + 2;

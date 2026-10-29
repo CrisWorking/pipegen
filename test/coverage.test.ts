@@ -1103,6 +1103,121 @@ const RUFF_REPO = 'https://github.com/astral-sh/ruff-pre-commit';
 const hookConfig = (hooks: string, repo = RUFF_REPO) => `repos:\n  - repo: ${repo}\n    rev: v0.16.0\n    hooks:\n${hooks}`;
 const FLASK_PRECOMMIT = 'uv run --locked --no-default-groups --group pre-commit pre-commit run --show-diff-on-failure --color=always --all-files';
 
+describe('mapCoverage (P55 batch B: docker compose and Dockerfile RUN)', () => {
+  const web = svc('backend', { scripts: ['start'], frameworks: ['express'], language: 'python', packageManager: 'uv' });
+  const root = svc('.', { name: 'app', scripts: ['start'], frameworks: ['express'], language: 'python', packageManager: 'uv' });
+  const COMPOSE = 'services:\n  web:\n    build: ./backend\n  tests:\n    build:\n      context: .\n      dockerfile: backend/Dockerfile\n      target: test\n  db:\n    image: postgres:18\n';
+  const DOCKERFILE = 'FROM python:3.14 AS base\nWORKDIR /app\nCOPY ./backend /app\nFROM base AS test\nRUN pytest\nFROM base AS final\nRUN echo done\n';
+  const statusOf = async (files: Record<string, string>, steps: string, id = 'unit-tests', service = 'backend', services = [web, root], layer: Layer = 'merge') => {
+    const dir = makeTempDir();
+    for (const [rel, text] of Object.entries(files)) writeIn(dir, rel, text);
+    ci(dir, steps);
+    const rows = await coverage(dir, { services });
+    const r = row(rows, layer, id, service);
+    return `${r.status}${r.by === undefined ? '' : ` ${r.by}`}`;
+  };
+
+  it('docker compose build (and docker-compose, -f, up --build) is a partial image build; a dry run or a plain up is not', async () => {
+    const image = (steps: string) => statusOf({ 'compose.yml': COMPOSE }, steps, 'image-build');
+    for (const cmd of ['docker compose build', 'docker-compose build', 'docker compose -f compose.yml build web', 'docker compose up --build -d']) {
+      expect(await image(run(cmd)), cmd).toBe('partial docker-compose-build');
+    }
+    for (const cmd of ['docker compose --dry-run build', 'docker compose up -d', 'docker compose --project-directory x build', 'docker compose build --dry-run']) {
+      expect(await image(run(cmd)), cmd).toBe('missing');
+    }
+  });
+
+  it('docker compose run|exec <service> <command> counts for the folder the service builds from', async () => {
+    const t = (cmd: string, files: Record<string, string> = { 'compose.yml': COMPOSE }) => statusOf(files, run(cmd));
+    expect(await t('docker compose run --rm web pytest')).toBe('covered your own `pytest`');
+    expect(await t('docker compose -f compose.yml run --rm -T -e A=b web pytest -q')).toBe('covered your own `pytest`');
+    expect(await t('docker compose exec -T web pytest')).toBe('covered your own `pytest`');
+    expect(await t('docker-compose run web pytest')).toBe('covered your own `pytest`');
+    // the root service is not the one that is tested
+    expect(await statusOf({ 'compose.yml': COMPOSE }, run('docker compose run --rm web pytest'), 'unit-tests', 'app')).toBe('missing');
+    // look-alikes: the failure doesn't fail the step, another command or folder, an unknown flag, a service that isn't built here
+    expect(await t('docker compose run --rm web pytest || true')).toBe('partial your own `pytest`');
+    for (const cmd of ['docker compose run --rm --entrypoint sh web pytest', 'docker compose run --rm -w /x web pytest', 'docker compose run --rm --weird web pytest', 'docker compose run web', 'docker compose --dry-run run web pytest']) {
+      expect(await t(cmd), cmd).toBe('missing');
+    }
+    expect(await t('docker compose run --rm db pytest')).toMatch(/^unknown/); // a ready-made image: pipegen can't tell which service it checks
+    expect(await t('docker compose run --rm nope pytest')).toMatch(/^unknown/);
+    expect(await t('docker compose run --rm web pytest', {})).toBe('missing'); // no compose file: the runner fails
+    expect(await t('docker compose run --rm web bash scripts/t.sh')).toMatch(/^unknown/); // the container's own copy of the script
+  });
+
+  it('a RUN in a Dockerfile `docker build` builds counts under the same rules (stages, folders, conditions)', async () => {
+    const files = (dockerfile: string, extra: Record<string, string> = {}) => ({ 'backend/Dockerfile': dockerfile, 'backend/app.py': 'x = 1\n', ...extra });
+    const build = (flags = '-f backend/Dockerfile .') => run(`docker build ${flags}`);
+    const st = (dockerfile: string, steps = build(), extra: Record<string, string> = {}) => statusOf(files(dockerfile, extra), steps);
+    const single = 'FROM python:3.14\nWORKDIR /app\nCOPY ./backend /app\nRUN pytest\n';
+    expect(await st(single)).toBe('covered your own `pytest`');
+    expect(await st('FROM python:3.14\nWORKDIR /app\nCOPY . /app\nRUN pytest\n', run('docker build backend'))).toBe('covered your own `pytest`'); // the context is backend/
+    expect(await st('FROM python:3.14\nWORKDIR /app\nCOPY . .\nRUN ["pytest", "-q"]\n', run('docker build backend'))).toBe('covered your own `pytest`');
+    // only the stages the final stage needs are built
+    expect(await st(DOCKERFILE)).toBe('missing');
+    expect(await st(DOCKERFILE, build('--target test -f backend/Dockerfile .'))).toBe('covered your own `pytest`');
+    expect(await st(`${DOCKERFILE}COPY --from=test /app /out\n`)).toBe('covered your own `pytest`');
+    expect(await st('FROM python:3.14 AS test\nWORKDIR /app\nCOPY ./backend /app\nRUN pytest\nFROM scratch\nCOPY --from=ghcr.io/x/y /a /b\n')).toBe('missing');
+    expect(await st(DOCKERFILE, build('--target nope -f backend/Dockerfile .'))).toMatch(/^unknown/);
+    // a RUN that can't fail the build, or runs under a condition
+    for (const runLine of ['RUN pytest || true', 'RUN pytest; echo ok', 'RUN if [ -n "$X" ]; then pytest; fi']) {
+      expect(await st(`FROM python:3.14\nWORKDIR /app\nCOPY ./backend /app\n${runLine}\n`), runLine).toBe('partial your own `pytest`');
+    }
+    // a Dockerfile pipegen can't read the way the builder does is unknown, never covered
+    for (const dockerfile of ['FROM x\nRUN <<EOF\npytest\nEOF\n', 'FROM x\nSHELL ["/bin/bash", "-c"]\nRUN pytest\n', '# escape=`\nFROM x\nRUN pytest\n']) {
+      expect(await st(dockerfile), dockerfile).toMatch(/^unknown/);
+    }
+    // a command that doesn't name one Dockerfile, a check run, or a build the step can't fail
+    for (const steps of [run('docker build --weird -f backend/Dockerfile .'), run('docker build --check -f backend/Dockerfile .'), run('docker build -f backend/Dockerfile'), run('docker build -f "$F" .'),
+      run('docker build -f backend/Dockerfile . || true'), '      - run: docker build -f backend/Dockerfile .\n        continue-on-error: true\n']) {
+      expect(await st(single, steps), steps).not.toBe('covered your own `pytest`');
+    }
+    expect(await st(single, run('docker build -f backend/Dockerfile . || true'))).toBe('partial your own `pytest`');
+    expect(await st(single, "      - run: docker build -f backend/Dockerfile .\n        if: github.actor != 'bot'\n")).toBe('partial your own `pytest`');
+    // no Dockerfile at that path: the build fails, nothing runs
+    expect(await st(single, run('docker build -f backend/Missing.Dockerfile .'))).toBe('missing');
+    // a Dockerfile that is a symbolic link is not read: unknown
+    const dir = makeTempDir();
+    const outside = makeTempDir();
+    writeIn(outside, 'Dockerfile', single);
+    mkdirSync(join(dir, 'backend'), { recursive: true });
+    symlinkSync(join(outside, 'Dockerfile'), join(dir, 'backend/Dockerfile'));
+    ci(dir, build());
+    const linked = row(await coverage(dir, { services: [web, root] }), 'merge', 'unit-tests', 'backend');
+    expect(linked.status).toBe('unknown');
+  });
+
+  it('a RUN counts through docker/build-push-action (file, context, target) and docker compose build, with the compose service\'s folder and target', async () => {
+    const act = (w: string) => `      - uses: docker/build-push-action@v6\n        with:\n${w}`;
+    const f = { 'backend/Dockerfile': DOCKERFILE, 'backend/app.py': 'x = 1\n' };
+    expect(await statusOf(f, act('          file: backend/Dockerfile\n          target: test\n'))).toBe('covered your own `pytest`');
+    expect(await statusOf({ ...f, 'backend/Dockerfile': DOCKERFILE.replace('COPY ./backend /app', 'COPY . /app') }, act('          context: ./backend\n          target: test\n'))).toBe('covered your own `pytest`');
+    for (const w of ['          file: backend/Dockerfile\n', '          file: backend/Dockerfile\n          target: ${{ matrix.t }}\n', '          file: backend/Dockerfile\n          target: test\n          call: check\n', '          context: .\n          target: test\n']) {
+      expect(await statusOf(f, act(w)), w).not.toBe('covered your own `pytest`');
+    }
+    // compose build: the `tests` service builds backend/Dockerfile up to its `test` target; `web` builds the final stage
+    const both = { ...f, 'compose.yml': COMPOSE };
+    expect(await statusOf(both, run('docker compose build'))).toBe('covered your own `pytest`');
+    expect(await statusOf(both, run('docker compose build tests'))).toBe('covered your own `pytest`');
+    expect(await statusOf(both, run('docker compose build web'))).toBe('missing'); // only the stages `web` needs
+    expect(await statusOf(both, run('docker compose build db'))).toBe('missing');
+    expect(await statusOf({ ...both, 'compose.yml': 'services:\n  tests:\n    build: ${CTX}\n' }, run('docker compose build'))).toMatch(/^unknown/);
+  });
+
+  it('a script run in the folder a RUN works in is read there (bun run build in WORKDIR /app/frontend type-checks the frontend)', async () => {
+    const fe = svc('frontend', { quality: { ...emptyServiceQuality(), tsconfig: true, versions: { typescript: '5.9.2' } } });
+    const files = {
+      'frontend/package.json': JSON.stringify({ name: 'frontend', scripts: { build: 'tsc -p tsconfig.build.json && vite build' } }), 'frontend/src/main.ts': 'x\n',
+      'backend/Dockerfile': 'FROM oven/bun:1 AS build\nWORKDIR /app\nCOPY frontend/package.json /app/frontend/\nWORKDIR /app/frontend\nCOPY ./frontend /app/frontend\nRUN bun run build\nFROM python:3.14\nCOPY --from=build /app/dist /dist\n',
+    };
+    const status = (steps: string) => statusOf(files, steps, 'type-check', 'frontend', [web, fe]);
+    expect(await status(run('docker build -f backend/Dockerfile .'))).toBe('covered your own `bun run build`');
+    // a WORKDIR no COPY maps to a repo folder is a folder pipegen can't place: unknown
+    expect(await statusOf({ ...files, 'backend/Dockerfile': 'FROM oven/bun:1\nWORKDIR /somewhere\nRUN bun run build\n' }, run('docker build -f backend/Dockerfile .'), 'type-check', 'frontend', [web, fe])).toMatch(/^unknown/);
+  });
+});
+
 describe('mapCoverage (P55 batch B: XO)', () => {
   const lintStatus = async (steps: string, scripts: Record<string, string> = {}) => {
     const dir = makeTempDir();

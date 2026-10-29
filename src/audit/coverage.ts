@@ -44,6 +44,12 @@
 //   have their own reader and bound (MAX_SCRIPT_FILES, failed reads counted); past it a call is unknown. A script
 //   pipegen can't place (a variable, an absolute or `..` path, a `cd` it can't follow, a `docker run` container's copy)
 //   is unknown for every service (an unknown run of unknown folder sits at the root), never missing.
+// P55 (batch B, hand checks): prek and pre-commit run over the files between two refs carry the hooks as partial
+//   ('changed'); a continue-on-error step undone by a later `if: steps.<id>.outcome == 'failure'` + `exit 1` step blocks;
+//   `docker compose run|exec <service> <command>` counts in the service's build folder (docker.ts); the RUN lines of a
+//   Dockerfile that `docker build`, docker/build-push-action or `docker compose build` builds count under the shell rules,
+//   for the stages the final stage (or --target) needs, in the folder WORKDIR and COPY map to; a Dockerfile pipegen can't
+//   read that way is unknown, never covered and never missing.
 // Task 5 (accuracy from real repos):
 // - own scripts: `npm|pnpm|yarn|bun run <name>` for a name other than test/lint[:x] counts only through the script's
 //   own text in <dir>/package.json (the run's directory), read as npm runs it (sh -c, no -e), following the own
@@ -193,7 +199,7 @@ export async function mapCoverage(p: RepoProfile, needs: Need[], dir: string, op
   const sigs = (defaultCompiled ??= compile(loadToolSignatures()));
   const ctx: Ctx = {
     p, sigs, read: new Reader(dir), budget: { visits: 0, bytes: 0, truncated: false }, hits: [], localFiles: new Set(),
-    unreadable: (opts.skippedWorkflows ?? 0) > 0, pkgRead: new Reader(dir), pkgScripts: new Map(), scriptMemo: new Map(), scriptRead: new Reader(dir), scriptFileReads: 0, scriptClass: new Map(), compositeGates: new Map(),
+    unreadable: (opts.skippedWorkflows ?? 0) > 0, pkgRead: new Reader(dir), pkgScripts: new Map(), scriptMemo: new Map(), scriptRead: new Reader(dir), scriptFileReads: 0, scriptClass: new Map(), compositeGates: new Map(), composeMemo: new Map(),
     globMemo: new Map(), globWork: 0, ...(opts.capabilities === undefined ? {} : { caps: opts.capabilities }),
     // fix round 1 (P8): a workflow readWorkflows skipped may be a release workflow
     releaseJobs: [], releaseUnread: (opts.skippedWorkflows ?? 0) > 0,
