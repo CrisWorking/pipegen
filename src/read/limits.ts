@@ -1,5 +1,5 @@
 import { constants } from 'node:fs';
-import { lstat, open, readFile, type FileHandle } from 'node:fs/promises';
+import { lstat, open, type FileHandle } from 'node:fs/promises';
 import { join } from 'node:path';
 import fg from 'fast-glob';
 import { isMap, isPair, isScalar, isSeq, parseDocument } from 'yaml';
@@ -92,18 +92,65 @@ export const SKIP_REASON: Readonly<Record<Skipped, string>> = Object.freeze({
 /** READ_LIMITS.maxFiles as people write it (20,000). */
 export const MAX_FILES_TEXT = READ_LIMITS.maxFiles.toLocaleString('en-US');
 
-/** Like readTextLimited, but says why a file was skipped. */
+/**
+ * Flags for opening a file that was just checked with lstat: never through a final symbolic link, and without blocking
+ * on a FIFO (a plain open of a FIFO waits for a writer forever). Both are 0 where the platform has no such flag.
+ */
+const OPEN_CHECKED = constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0) | (constants.O_NONBLOCK ?? 0);
+
+/** True for the error an O_NOFOLLOW open gives on a symbolic link (ELOOP; EMLINK on FreeBSD). */
+const isLinkRefusal = (e: unknown): boolean => ['ELOOP', 'EMLINK'].includes(String((e as { code?: unknown } | null)?.code));
+
+/**
+ * Like readTextLimited, but says why a file was skipped. lstat gives the reason first; then the file is opened without
+ * following a symbolic link and without blocking (OPEN_CHECKED), the opened descriptor is checked again with fstat
+ * (regular file, size), and at most maxFileBytes + 1 bytes are read from it. So a file swapped after the lstat check
+ * (for a FIFO, a symlink, a bigger file) is skipped for the same reasons, and the read can't block or grow unbounded.
+ */
 export async function readTextLimitedWithReason(path: string): Promise<{ text: string } | { skipped: Skipped }> {
+  let handle: FileHandle | undefined;
   try {
     const info = await lstat(path);
     if (info.isSymbolicLink()) return { skipped: 'link' };
     if (!info.isFile()) return { skipped: 'not-a-file' };
     if (info.size > READ_LIMITS.maxFileBytes) return { skipped: 'too-large' };
-    const buf = await readFile(path);
+    try {
+      handle = await open(path, OPEN_CHECKED);
+    } catch (e) {
+      if (isLinkRefusal(e)) return { skipped: 'link' };
+      throw e;
+    }
+    const opened = await handle.stat();
+    if (!opened.isFile()) return { skipped: 'not-a-file' };
+    if (opened.size > READ_LIMITS.maxFileBytes) return { skipped: 'too-large' };
+    const buf = await readAtMost(handle, opened.size, READ_LIMITS.maxFileBytes + 1);
+    if (buf.length > READ_LIMITS.maxFileBytes) return { skipped: 'too-large' };
     return isBinary(buf) ? { skipped: 'binary' } : { text: buf.toString('utf8') };
   } catch {
     return { skipped: 'unreadable' };
+  } finally {
+    await handle?.close().catch(() => undefined);
   }
+}
+
+/**
+ * Reads from the start of `handle` until the end of the file or `limit` bytes, whichever comes first. `expected` (the
+ * fstat size) sizes the first buffer, so a small file never costs a buffer of `limit` bytes; a file that grew since
+ * fstat is read on, in more pieces, up to `limit`. Callers pass one byte over their limit to tell "grew past it".
+ */
+async function readAtMost(handle: FileHandle, expected: number, limit: number): Promise<Buffer> {
+  const parts: Buffer[] = [];
+  let total = 0;
+  let size = Math.max(1, Math.min(expected + 1, limit));
+  while (total < limit) {
+    const buf = Buffer.alloc(Math.min(size, limit - total));
+    const { bytesRead } = await handle.read(buf, 0, buf.length, null);
+    if (bytesRead === 0) break;
+    parts.push(buf.subarray(0, bytesRead));
+    total += bytesRead;
+    size = LINE_CHUNK_BYTES;
+  }
+  return parts.length === 1 ? parts[0] : Buffer.concat(parts, total);
 }
 
 /** Text of a regular file, or null when it is missing, unreadable, a symlink, over 1 MB, or binary. */
@@ -187,7 +234,7 @@ export async function readLinesLimited(path: string, opts: { maxBytes: number; m
     if (info.isSymbolicLink()) return { skipped: 'link' };
     if (!info.isFile()) return { skipped: 'not-a-file' };
     if (info.size > opts.maxBytes) return { skipped: 'too-large' };
-    handle = await open(path, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
+    handle = await open(path, OPEN_CHECKED);
     const opened = await handle.stat();
     if (!opened.isFile()) return { skipped: 'not-a-file' };
     if (opened.size > opts.maxBytes) return { skipped: 'too-large' };
