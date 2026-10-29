@@ -8,7 +8,9 @@
 //      fails, lower SCAN_CHUNK_SAFE_BYTES; never skip the test.
 // A live test that is skipped passes in vitest, so the exit code alone proves nothing: this script runs the scanner
 // live test files with PIPEGEN_LIVE_TESTS=1 and vitest's JSON report, and fails unless each required test is there and
-// passed, and every other test in those files passed too. Run by the `test` job in .github/workflows/ci.yml (every pull
+// passed, and every other test in those files passed too. A required test must also have asserted something: it is
+// wrapped in counted() (test/helpers/counted.ts), which fails it without an assertion and records the count in the
+// report's `meta.assertionCalls`; a count of 0 or none fails here (P46). Run by the `test` job in .github/workflows/ci.yml (every pull
 // request, so every scanner bump) and by scripts/release-check.ts (check 7). By hand: `node scripts/scanner-live.ts`.
 // Keep to syntax Node's type stripping can run.
 import { execFileSync } from 'node:child_process';
@@ -56,7 +58,14 @@ export function checkScannerLive(report: unknown, root: string): ScannerCheck {
   for (const r of REQUIRED_SCANNER_TESTS) {
     const hits = testsOf(fileOf(r.file)).filter((t) => r.title.test(String(t.title)));
     if (hits.length === 0) problems.push(`${r.label}: not found in ${r.file} (renamed or deleted? update scripts/scanner-live.ts with owner review)`);
-    else for (const t of hits) if (t.status !== 'passed') problems.push(`${r.label}: ${String(t.status)}, not passed (a scanner bump must pass it live; never skip it)`);
+    else {
+      for (const t of hits) {
+        if (t.status !== 'passed') problems.push(`${r.label}: ${String(t.status)}, not passed (a scanner bump must pass it live; never skip it)`);
+        // P46: a passed test proves nothing if it asserted nothing; counted() (test/helpers/counted.ts) records the count
+        const calls = isObj(t.meta) ? t.meta.assertionCalls : undefined;
+        if (!(typeof calls === 'number' && calls > 0)) problems.push(`${r.label}: made no assertion that was recorded (wrap the test in counted(); never empty it)`);
+      }
+    }
   }
   return { name: NAME, ok: problems.length === 0, problems: [...new Set(problems)] };
 }

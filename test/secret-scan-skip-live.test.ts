@@ -13,6 +13,7 @@ import { bundleCode, bundleText, SCAN_CHUNK_SAFE_BYTES, SecretScanError, secretS
 import { DEFAULT_SKIPPED_PATHS, type SecretScannerName } from '../src/ai/secret-scan-config.js';
 import { ensurePinnedBinary } from '../src/engine/linters.js';
 import { betterleaksAt, gitleaksAt, scanWith } from './helpers/gitleaks-stub.js';
+import { counted } from './helpers/counted.js';
 import { cleanupRepos, makeTempDir, writeIn } from './helpers/make-repo.js';
 
 const belt = vi.hoisted(() => ({ on: true }));
@@ -77,7 +78,7 @@ describe.skipIf(!live)('secret scan (live, both pinned scanners): a scan path th
     }
   });
 
-  it('live: TMPDIR under node_modules/: bundleCode throws SecretScanError (the belt), and with the belt off the canary alone fails closed', async () => {
+  it('live: TMPDIR under node_modules/: bundleCode throws SecretScanError (the belt), and with the belt off the canary alone fails closed', counted(async () => {
     for (const on of [true, false]) {
       belt.on = on;
       for (const name of NAMES) {
@@ -89,9 +90,9 @@ describe.skipIf(!live)('secret scan (live, both pinned scanners): a scan path th
         expect((error as Error).message, `${name} belt ${on}`).toMatch(on ? /TMPDIR/ : /did not confirm it read/);
       }
     }
-  });
+  }));
 
-  it('live: a normal temp folder: both scanners report every canary, and a real finding is redacted on its line', async () => {
+  it('live: a normal temp folder: both scanners report every canary, and a real finding is redacted on its line', counted(async () => {
     const repo = makeTempDir();
     writeIn(repo, 'src/a.ts', `const a = 1;\nexport const k = "${shopifyValue()}";`); // no final newline
     writeIn(repo, 'src/b.ts', 'export const b = 2;\n');
@@ -102,7 +103,7 @@ describe.skipIf(!live)('secret scan (live, both pinned scanners): a scan path th
       expect(bundleText(b), name).not.toContain('pipegen-canary');
       expect(b.notes.join('\n'), name).toContain(`${name} checked the bundle: 1 finding redacted.`);
     }
-  });
+  }));
 
   it('live (P35/P37): canary-shaped text next to a real token never lets the canary rule hide it (betterleaks and gitleaks)', async () => {
     const shop = shopifyValue();
@@ -179,7 +180,7 @@ describe.skipIf(!live)('secret scan (live, both pinned scanners): a scan path th
     }
   });
 
-  it("live (belt drift): the belt mirrors every folder-level pattern of each pinned scanner's default path allowlist", () => {
+  it("live (belt drift): the belt mirrors every folder-level pattern of each pinned scanner's default path allowlist", counted(() => {
     // A pattern a scanner bump adds (or drops) fails here, so the belt and FILE_ONLY are reviewed with the bump.
     // FILE_ONLY: anchored to the end of a file name, so they never match f000001.txt / paths*.txt (checked below).
     const FILE_ONLY = [
@@ -217,9 +218,9 @@ describe.skipIf(!live)('secret scan (live, both pinned scanners): a scan path th
         for (const n of ['/t/f000001.txt', '/t/paths.txt', '/t/paths2.txt']) expect(re.test(n), `${p} ${n}`).toBe(false);
       }
     }
-  });
+  }));
 
-  it(`live (P38 pin): a file of exactly SCAN_CHUNK_SAFE_BYTES as written is read whole: every token and each canary is reported`, () => {
+  it(`live (P38 pin): a file of exactly SCAN_CHUNK_SAFE_BYTES as written is read whole: every token and each canary is reported`, counted(() => {
     // Two files laid out as pipegen writes them (prefix line, content, blank line, canary line), each exactly
     // SCAN_CHUNK_SAFE_BYTES bytes: unique Shopify tokens back to back on ONE line, no blank line anywhere, the second
     // file shifted by 19 bytes, so any cut inside the files splits a token in at least one of them. Fails if a scanner
@@ -258,7 +259,7 @@ describe.skipIf(!live)('secret scan (live, both pinned scanners): a scan path th
       expect(missed.length, `${name} split a ${SCAN_CHUNK_SAFE_BYTES}-byte file (missed ${missed.length} tokens): SCAN_CHUNK_SAFE_BYTES is no longer safe for this scanner`).toBe(0);
       for (const c of canaries) expect(report.filter((f) => f.RuleID === 'pipegen-canary' && valueOf(f) === c), `${name} canary`).toHaveLength(1);
     }
-  }, 600_000);
+  }), 600_000);
 
   it('live (P39): a too-large file whose name holds a SendGrid-shaped value is scanned by name, masked in the note, never in the bundle', async () => {
     const AN = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';

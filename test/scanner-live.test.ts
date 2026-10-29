@@ -14,7 +14,7 @@ const TITLES = [
   'live (P38 pin): a file of exactly SCAN_CHUNK_SAFE_BYTES as written is read whole: every token and each canary is reported',
 ];
 type Status = 'passed' | 'failed' | 'skipped' | 'pending' | 'todo';
-const result = (name: string, tests: [string, Status][]) => ({ name, status: tests.some(([, s]) => s === 'failed') ? 'failed' : 'passed', assertionResults: tests.map(([title, status]) => ({ title, fullName: `suite ${title}`, status })) });
+const result = (name: string, tests: [string, Status][], calls = 3) => ({ name, status: tests.some(([, s]) => s === 'failed') ? 'failed' : 'passed', assertionResults: tests.map(([title, status]) => ({ title, fullName: `suite ${title}`, status, meta: { assertionCalls: calls } })) });
 const others = SCANNER_LIVE_FILES.filter((f) => !f.endsWith('secret-scan-skip-live.test.ts')).map((f) => result(`${ROOT}/${f}`, [['live: something', 'passed']]));
 const report = (skip: [string, Status][] = TITLES.map((t) => [t, 'passed']), more = others) => ({ success: true, testResults: [result(SKIP, skip), ...more] });
 
@@ -49,6 +49,15 @@ describe('scanner-live: the three required live tests', () => {
     const missingFile = checkScannerLive(report(undefined, others.slice(1)), ROOT);
     expect(missingFile.ok).toBe(false);
     expect(missingFile.problems.join('\n')).toMatch(/did not run/);
+  });
+
+  it('P46: fails when a required test made no assertion or did not record its count (its body emptied, or not wrapped in counted())', () => {
+    const none = { success: true, testResults: [result(SKIP, TITLES.map((t) => [t, 'passed']), 0), ...others] };
+    const c = checkScannerLive(none, ROOT);
+    expect(c.ok).toBe(false);
+    expect(c.problems.join('\n')).toMatch(/belt drift: made no assertion/);
+    const noMeta = { success: true, testResults: [{ ...result(SKIP, TITLES.map((t) => [t, 'passed'])), assertionResults: TITLES.map((title) => ({ title, status: 'passed' })) }, ...others] };
+    expect(checkScannerLive(noMeta, ROOT).problems.join('\n')).toMatch(/chunk-size pin: made no assertion/);
   });
 
   it('fails closed on a missing or unreadable report', () => {
