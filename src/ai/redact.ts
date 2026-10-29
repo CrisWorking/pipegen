@@ -1719,6 +1719,8 @@ async function secretScanPass(files: FileEntry[], scanner: SecretScanner, timeou
       if ([...secrets].some((v) => f.path.includes(v) || shownPaths[i].includes(v))) badPath.add(i);
     });
 
+    // a flagged path is masked in every note, also one that leaves the file out for another reason
+    for (const i of badPath) flaggedNames.add(scanned[i].path);
     const pathsOf = (set: Set<number>) => [...set].sort((a, b) => a - b).map((i) => scanned[i].path);
     notes.add(`${name} checked the bundle: ${plural(redacted, 'finding', 'findings')} redacted.`);
     notes.addPaths(`Left out because ${name} did not confirm it read them:`, pathsOf(unconfirmed), show);

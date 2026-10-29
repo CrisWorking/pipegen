@@ -829,6 +829,27 @@ describe('bundle: scan canaries (ruling P34)', () => {
     }
   });
 
+  it('P39: a file whose path the scanner flagged is masked in every note, also when it is left out for a second reason', async () => {
+    const nameVal = 'flagged' + '-path-' + 'value-6021';
+    const S = 'Qm4' + 'Tz8Rw2Yv6Np1Hs5Kd9';
+    const dir = makeTempDir();
+    writeIn(dir, `src/${nameVal}.ts`, `export const one = "${S}";\n`);
+    writeIn(dir, 'src/ok.ts', 'export const ok = 1;\n');
+    for (const at of [betterleaksAt, gitleaksAt]) {
+      // the name is flagged in the file list, and a finding with no line in the same file can't be located
+      // the scanner reports the DECODED value (as for a base64 name), which is not in the name as written
+      const stub = makeStub(`const f = [...findingsFor(${JSON.stringify(nameVal)}).filter((x) => /paths/.test(x.File)).map((x) => ({ ...x, Match: 'decoded-secret-value-4417', ['Sec' + 'ret']: 'decoded-secret-value-4417' })),
+        { RuleID: 'x', File: path.join(src, 'f000001.txt'), Match: ${JSON.stringify(S)}, ['Sec' + 'ret']: ${JSON.stringify(S)}, Tags: [] }];
+        writeReport(JSON.stringify(f)); process.exit(1);`);
+      const b = await bundleCode(dir, scanWith(at(stub.bin), { priority: (p) => (p === `src/${nameVal}.ts` ? 9 : 0) }));
+      const notes = b.notes.join('\n');
+      expect(paths(b), at.name).toEqual(['src/ok.ts']);
+      expect(notes, at.name).toMatch(/could not locate to redact: \(a file whose name looks like a secret\)\./);
+      expect(notes, at.name).not.toContain(nameVal);
+      expect(bundleText(b), at.name).not.toContain(nameVal);
+    }
+  });
+
   it('P36: a long file list is scanned in pieces under the limit, each with its own canary, all required; findings map to the right path', async () => {
     const dir = makeTempDir();
     const n = 700; // ~700 × 200 bytes of paths: two pieces
