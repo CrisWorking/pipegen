@@ -1052,3 +1052,31 @@ describe('pipegen audit --ai (P45: every printable name is scanned; what the sca
     noLeak(outs, encoded, decoded, encoded.slice(0, 10));
   });
 });
+
+describe('pipegen audit --ai (P45 addendum: a name longer than the scanner saw is hidden whole)', () => {
+  it('P45: a 1,200-character path with a secret after character 1,000 (past the scanned part) never appears in terminal, JSON or Markdown', async () => {
+    const value = ['tail', 'secret', randomBytes(8).toString('hex')].join('-');
+    const head = `p/${Array.from({ length: 5 }, (_, i) => `${i}${'q'.repeat(198)}`).join('/')}`; // 1,001 characters
+    const name = `${head}/${value}-${'r'.repeat(1_200 - head.length - value.length - 5)}.ts`;
+    expect(name.length).toBe(1_200);
+    expect(name.indexOf(value)).toBeGreaterThan(1_000);
+    const dir = repo({ 'src/a.ts': 'export const a = 1;\n' });
+    writeIn(dir, name, `export const t = "${fake.githubPat()}";\n`); // a secret-like value: the warnings name the file
+    const work = makeTempDir();
+    // the stub flags the value wherever it sees it: it never does (the scanned name is cut at 1,000 characters)
+    const body = `writeReport(JSON.stringify(findingsFor(${JSON.stringify(value)}))); process.exit(1);`;
+    for (const json of [false, true]) {
+      const { env } = aiSetup(undefined, undefined, body);
+      const file = json ? 'j.md' : 't.md';
+      const r = await audit(['audit', '--ai', '--dir', dir, '--out', file, ...(json ? ['--json'] : [])], { cwd: work, env, prompt: prompter(true) });
+      expect(r.code, r.err).toBe(0);
+      expect(oneLine(r.out)).toMatch(/checked the bundle/);
+      const md = readFileSync(join(work, file), 'utf8');
+      expect(md, 'the warning names the file, hidden whole').toContain('(a file whose name looks like a secret)');
+      for (const [where, text] of [['stdout', r.out], ['stderr', r.err], ['markdown', md]] as const) {
+        expect(text, `${String(json)} ${where}`).not.toContain(value);
+        expect(text, `${String(json)} ${where}`).not.toContain('r'.repeat(40));
+      }
+    }
+  });
+});

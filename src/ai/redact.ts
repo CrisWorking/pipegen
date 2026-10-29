@@ -1209,7 +1209,8 @@ export async function bundleCode(dir: string, opts: BundleOptions = {}): Promise
   // P39: names the secret scan flagged as lines of its file list (filled by secretScanPass)
   const flaggedNames = new Set<string>();
   // P45: never cut here: the report masks found values first and cuts after (a cut could leave half a secret)
-  const show = (p: string) => (flaggedNames.has(p) || nameHidden(p) ? HIDDEN_NAME : safeText(p, PATH_SHOWN_MAX));
+  // P45: in the checked bundle, a name longer than the scanner reads of it is hidden whole too
+  const show = (p: string) => (flaggedNames.has(p) || nameHidden(p) || (opts.secretScanner !== undefined && tooLongToScan(p)) ? HIDDEN_NAME : safeText(p, PATH_SHOWN_MAX));
   const notes = new Notes();
   const inRoots = (p: string) => roots === null || roots.some((r) => underRoot(p, r));
 
@@ -1316,7 +1317,7 @@ export async function bundleCode(dir: string, opts: BundleOptions = {}): Promise
   // P40: every name in the listing the scan made secret, so the report can mask it outside these notes too
   const scanHidden = (p: string) => {
     const shown = displayPath(p);
-    return flaggedNames.has(p) || flagged.some((v) => p.includes(v) || shown.includes(v))
+    return flaggedNames.has(p) || tooLongToScan(p) || flagged.some((v) => p.includes(v) || shown.includes(v))
       || flaggedTokens.some((v) => tokenSpans(p, v).length > 0 || tokenSpans(shown, v).length > 0);
   };
   const hiddenNames = secretScanChecked ? [...new Set([...listing.files, ...found.links, ...flaggedNames])].filter(scanHidden).sort() : [];
@@ -1690,7 +1691,7 @@ async function secretScanPass(files: FileEntry[], scanner: SecretScanner, timeou
     await chmod(tmp, 0o700);
     // Neutral names: no repo file name (.gitleaksignore, .gitleaks.toml, allowlisted paths) reaches the scanner.
     const names = scanned.map((_, i) => `f${String(i + 1).padStart(6, '0')}.txt`);
-    const pieces = pathPieces([...shownPaths, ...shownOthers].map((p) => neutralizeAllow(scanLine(p))), name);
+    const pieces = pathPieces([...scanned.map((f) => f.path), ...others].map((p) => neutralizeAllow(scanLine(scannedName(p)))), name);
     // P34 belt: the default path allowlist matches the absolute path, so a temp folder under node_modules/ (or another
     // folder it lists) would hide every file. Refused before anything is written; the canaries below are the guarantee.
     if ([...names, ...pieces.map((p) => p.name)].some((n) => skippedByDefaultPaths(join(tmp, n)))) {
@@ -1907,7 +1908,32 @@ const MIN_MAX_BYTES = 64;
 
 /** A path as bundleText shows it (and as the secret scan scans it). */
 function displayPath(path: string): string {
-  return neutralizeTags(safeText(path, 1000));
+  return neutralizeTags(safeText(path, SCAN_NAME_MAX));
+}
+
+/**
+ * P45: a name is scanned (and shown to the AI) cut at this many code points. A longer name has characters the scanner
+ * never saw, so the audit report hides it whole (HIDDEN_NAME), wherever it would show it.
+ */
+const SCAN_NAME_MAX = 1000;
+
+/** A name as every output shows it before its own escaping: cleaned (safeText), not cut. */
+const shownForm = (path: string): string => safeText(path, Number.MAX_SAFE_INTEGER);
+
+/** P45: true when the name is longer than what the scanner reads of it. */
+export function tooLongToScan(path: string): boolean {
+  return Array.from(shownForm(path)).length > SCAN_NAME_MAX;
+}
+
+/**
+ * P45: the text scanned for one name: exactly the string the report can show (cleaned, before any escaping), and also
+ * the form the AI gets (displayPath) when that differs. A name too long to scan whole is scanned cut (and hidden whole).
+ */
+function scannedName(path: string): string {
+  const shown = displayPath(path);
+  if (tooLongToScan(path)) return shown;
+  const full = shownForm(path);
+  return full === shown ? full : `${full} ${shown}`;
 }
 
 /** One file's part of bundleText: header line, content, a final newline. */
