@@ -75,7 +75,8 @@ const DANGEROUS_NAMES: readonly { family: string; match: RegExp }[] = [
   { family: 'js package managers and runtimes', match: /^(?:YARN_|PNPM_|BUN_|DENO_|COREPACK_)/ },
   { family: 'jvm, .NET, php, conda, rust compiler', match: /^(?:COMPOSER_|CONDA_|DOTNET_|NUGET_|RUSTC)|^(?:MAVEN_OPTS|GRADLE_OPTS|GRADLE_USER_HOME|PHPRC|PHP_INI_SCAN_DIR|SSH_ASKPASS)$/ },
 ];
-const isDangerousName = (name: string): boolean => DANGEROUS_NAMES.some((d) => d.match.test(name));
+/** Whether a variable name is one a mapped secret (or a job-level variable) must never take. Shared with the referee. */
+export const isDangerousName = (name: string): boolean => DANGEROUS_NAMES.some((d) => d.match.test(name));
 
 const same = (a: unknown, b: unknown): boolean => isDeepStrictEqual(a, b);
 
@@ -225,7 +226,7 @@ const HELPER_ONLY: ReadonlySet<string> = new Set(Object.keys(RENDERER_INPUTS).fi
  * only when its entry records that image and the image is pinned by the digest it recorded (resolvePin reads it from
  * action.yml at the pinned commit). Returns why not, or null when the action may be rendered.
  */
-function containerRefusal(tool: ReviewedTool, path: string): string | null {
+export function containerRefusal(tool: ReviewedTool, path: string): string | null {
   if (IMAGE_BUILT_ACTION_USES.has(path)) return `${show(tool.id)} builds its image from a Dockerfile at run time, so what it runs can not be pinned; it stays refused (a permanent refusal until a pinned replacement exists)`;
   const w = tool.wrappedImage;
   if (!DOCKER_ACTION_USES.has(path) && w === undefined) return null;
@@ -408,7 +409,7 @@ export function dedupeJobSteps(steps: readonly RenderedStep[]): RenderedStep[] {
 const HOME_LINE_RE = /^home="\$RUNNER_TEMP\/pipegen-home\/[a-z0-9][a-z0-9-]{0,160}"$/gm;
 
 /** Whether a repeated `pipegen-` step is the same step as the one kept: everything but the name, and for `npm ci` its pins and home folder. */
-function sameDedupeContent(a: RenderedStep, b: RenderedStep): boolean {
+export function sameDedupeContent(a: RenderedStep, b: RenderedStep): boolean {
   const norm = (s: RenderedStep): unknown => {
     const { name: _name, ...rest } = s;
     if (s.id === undefined || !s.id.startsWith('pipegen-npm-ci-')) return rest;
@@ -592,8 +593,8 @@ function str(value: string, block = false): Scalar {
 }
 
 /** `if:` values pipegen writes: nothing else is an allowed condition (an `if` is always an expression, with or without `${{`). */
-const IF_VALUES: ReadonlySet<string> = new Set(['always()', 'success()', 'failure()', '!cancelled()']);
-const SECRET_REF_RE = /^\$\{\{ secrets\.([A-Z][A-Z0-9_]{0,99}) \}\}$/;
+export const IF_VALUES: ReadonlySet<string> = new Set(['always()', 'success()', 'failure()', '!cancelled()']);
+export const SECRET_REF_RE = /^\$\{\{ secrets\.([A-Z][A-Z0-9_]{0,99}) \}\}$/;
 
 /**
  * Refuses an expression (`${{`) anywhere but the forms pipegen itself writes (Quoting does not stop Actions from
@@ -603,8 +604,9 @@ const SECRET_REF_RE = /^\$\{\{ secrets\.([A-Z][A-Z0-9_]{0,99}) \}\}$/;
  *   step's whole `with` (the runner.temp paths, the login actor, the token only with ghcr.io). A `uses` with no `@` has no table.
  * The step's other fields are held to their type too: `if` is one of a fixed set, `continue-on-error` a boolean and
  * `timeout-minutes` a whole number of minutes (a hand-built step may be cast past the types, review R1-2/R1-4).
+ * The referee (7a) runs this same function on every step it parses, so the emitter and the judge allow the same forms.
  */
-function checkExpressions(step: RenderedStep): void {
+export function checkExpressions(step: RenderedStep): void {
   const bad = (what: string): never => { throw new RenderError(`A step may not contain an expression in its ${what} (${show(step.name)}).`); };
   const odd = (what: string): never => { throw new RenderError(`A step's ${what} is not in a form pipegen writes (${show(step.name)}).`); };
   for (const key of KEY_ORDER) {

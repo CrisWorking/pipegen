@@ -65,7 +65,7 @@ const PLACEHOLDER_SPLIT = /(\{[A-Za-z_][A-Za-z0-9_-]{0,63}\})/;
 const CHOICE_FLAG_RE = /^[a-z][a-z0-9-]{0,40}$/;
 const MAX_TEXT = 64 * 1024;
 /** Tool categories that run the project's own code (tests, coverage, image builds): the only steps a declared secret may reach. */
-const APP_RUNNING_CATEGORIES: ReadonlySet<string> = new Set(['coverage', 'unit-tests', 'full-tests', 'image-build']);
+export const APP_RUNNING_CATEGORIES: ReadonlySet<string> = new Set(['coverage', 'unit-tests', 'full-tests', 'image-build']);
 /** Names the renderer itself puts in a step's env or in the tool's environment; a template env may not use them. */
 const RESERVED_ENV = /^(?:HOME|PATH|RUNNER_TEMP|TMPDIR|BASH_ENV|ENV|PIPEGEN_(?:CONFIG|IMAGE|DL_.*|NPM_EXPECT|REQUIREMENTS|RULES_(?:REMOTE|COMMIT|TREE_WANT)|ARG_\d+))$/;
 

@@ -103,7 +103,17 @@ export interface StepSpec {
 
 // ---------- created files, decisions ----------
 export type Part = 'pipeline' | 'precommit' | 'docker' | 'compose' | 'tests' | 'test-migration' | 'codeowners' | 'deploy-verify' | 'docs';
-export interface CreatedFile { path: string; content: string; part: Part; reason: string; repo: 'app' | 'central'; needsConfirm?: boolean }   // needsConfirm: AI change to package.json scripts/dependencies → own preview section + own yes (Plan D Task 5, Plan E Task 5, Plan G)
+export interface CreatedFile { path: string; content: string; part: Part; reason: string; repo: 'app' | 'central'; needsConfirm?: boolean; inserted?: PipegenInserted }   // needsConfirm: AI change to package.json scripts/dependencies → own preview section + own yes (Plan D Task 5, Plan E Task 5, Plan G)
+/**
+ * The marker convention for an edited user workflow (Plan B 7a, for Plan G's insertVerify): a CreatedFile field, set by
+ * pipegen's own code and never by the AI or read from the file text, so no content can forge it. `original` is the user's
+ * file exactly as it was before the edit; `jobs` are the jobs pipegen added (the referee judges them like any job of its
+ * own); `needs` are the entries pipegen added to the user's own jobs. The referee checks that the edited file, without
+ * those jobs and needs entries, is the original (anything else pipegen changed is an issue), and judges nothing else of
+ * the user's. Linter findings on lines outside the added jobs and needs become notes (referee.ts `pipegenLines`).
+ * A file without this field was written by pipegen whole, and every line is judged.
+ */
+export interface PipegenInserted { original: string; jobs: string[]; needs: { job: string; added: string[] }[] }
 export interface NotProven { part: Part; needId?: string; reason: string; missingSecrets: string[] }
 export interface TestDecision { service: string; current?: string; proposed?: string; reasons: string[]; choice: 'keep' | 'switch' | 'none' }
 export interface PipelineDraft {
