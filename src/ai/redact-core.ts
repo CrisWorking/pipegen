@@ -23,7 +23,8 @@ export function regexSafe(s: string): boolean {
 
 // Token formats, each replaced whole. Names are what findSecretLike reports (never the value).
 const TOKEN_RULES: readonly (readonly [string, RegExp])[] = [
-  ['aws-access-key', /AKIA[0-9A-Z]{16}/g],
+  // AKIA long-term keys, ASIA temporary (STS) keys, and the other documented access-key id prefixes; the body is the old [0-9A-Z] class (a superset of base32)
+  ['aws-access-key', /(?:AKIA|ASIA|ABIA|ACCA|A3T[A-Z0-9])[0-9A-Z]{16}/g],
   ['github-token', /gh[pousr]_[A-Za-z0-9]{36,}/g],
   ['github-fine-grained-token', /github_pat_[A-Za-z0-9_]{20,}/g],
   ['slack-token', /xox[abpr]-[A-Za-z0-9-]+/g],
@@ -945,17 +946,15 @@ export function maskText(text: string): string {
 /** The longest name secretShapedName reads; a longer one counts as secret-shaped (failing closed, as P48 does for a name it cannot scan in full). */
 export const MAX_NAME_CHARS = 4096;
 
-const MIN_NAME_SEGMENT = 6;
 const looksSecret = (text: string): boolean => redact(text) !== text || findSecretLike(text).length > 0 || highEntropyRuns(text).length > 0;
 
 /**
- * True when a file name or path looks like a secret (P39/P40/P45/P48, scanner-free): the name, each of its segments (a token
- * starts at a segment however deep) and pipegen's own decodings of it (base64 at four alignments, hex, percent-escapes)
+ * True when a file name or path looks like a secret (P39/P40/P45/P48, scanner-free): the name (a token
+ * anywhere in it is inside the whole name; the entropy belt reads each segment itself) and pipegen's own decodings of it (base64 at four alignments, hex, percent-escapes)
  * hold a token shape, a JWT, a connection-string password, a password-like assignment or a high-entropy run.
  */
 export function secretShapedName(name: string): boolean {
   if (name.length > MAX_NAME_CHARS) return true;
   if (looksSecret(name)) return true;
-  for (const seg of name.split('/')) if (seg.length >= MIN_NAME_SEGMENT && seg !== name && looksSecret(seg)) return true;
   return decodedNamePieces(name).some(looksSecret);
 }

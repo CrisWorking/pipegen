@@ -97,5 +97,26 @@ describe.skipIf(!live)('R1-C1 and R1-C2 against the real binaries', () => {
       expect(f.map((x) => x.fingerprint)).not.toContain(old);
       expect(f.filter((x) => x.file?.includes('!'))).toEqual([]);
     });
+
+    for (const keyed of [true, false]) {
+      it(`${id} (r1-utf8, ${keyed ? 'keyed' : 'keyless'}): a file name that is not UTF-8 and a file named with U+FFFD: the finding is unmapped, never filed under the decoy`, () => {
+        const old = baseFingerprint(id);
+        const dir = makeTempDir();
+        git(dir, 'init', '-q');
+        writeFileSync(Buffer.concat([Buffer.from(`${dir}/k`), Buffer.from([0xff]), Buffer.from('.js')]), `stripe = "${NEW}"\n`);
+        writeFileSync(join(dir, 'k�.js'), `stripe = q${OLD}"\n`);   // the decoy the scanner cannot see
+        git(dir, 'add', '-A');
+        git(dir, 'commit', '-q', '-m', 'head');
+        const f = findings(id, dir, keyed ? {} : { fpKey: '', eventText: JSON.stringify({ repository: { id: 7 }, pull_request: { head: { repo: { id: 8 } } } }) });
+        expect(f).toHaveLength(1);
+        expect(f[0].file).toBeUndefined();
+        expect(f[0].uriUnmapped).toBe(true);
+        expect(f[0].fingerprint).not.toBe(old);
+        if (keyed) expect(f[0].fpBy).toBe('line');
+        // the parser alone says the same
+        const parsed = parseSarifText(runEntry(id, bins[id], dir), id, { workspace: dir });
+        expect(parsed.findings[0]).toMatchObject({ uriUnmapped: true });
+      });
+    }
   }
 });

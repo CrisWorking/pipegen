@@ -117,12 +117,15 @@ function decodeOnce(s: string): string | undefined {
  * segments, and reads a `%` by the tool's `encoding` (SarifToolInfo.uriEncoding): 'raw' leaves it alone, 'percent' decodes
  * once, and 'unmeasured' (also the default, when no encoding is given) refuses any uri that holds one. Unmapped, never a
  * path: any `..` segment, an absolute path, a backslash, a control character, another scheme or a drive letter, a host, an
- * invalid or double-encoded percent sequence (percent only, so `%2e%2e` in any case and under any encoding layer cannot get
+ * a U+FFFD (the lossy mark of a name that is not valid UTF-8), an invalid or double-encoded percent sequence (percent only, so `%2e%2e` in any case and under any encoding layer cannot get
  * through), an empty result, or a uri longer than 4096.
  */
 export function normaliseUri(uri: unknown, opts: { workspace?: string; encoding?: UriEncoding } = {}): string | undefined {
   if (typeof uri !== 'string' || uri.trim() === '' || uri.length > MAX_URI_CHARS) return undefined;
   const encoding = opts.encoding ?? 'unmeasured';
+  // U+FFFD is what Go's JSON writes for every byte that is not valid UTF-8: the name of a file with such a byte is the same string as the
+  // name of another, valid file (review R1-C2). No tool can say which bytes it stands for.
+  if (uri.includes('\uFFFD')) return undefined;
   let p = uri;
   if (/^file:\/\//i.test(p)) {
     p = p.slice(7);
@@ -139,7 +142,7 @@ export function normaliseUri(uri: unknown, opts: { workspace?: string; encoding?
     if (p.includes('%')) return undefined;
   } else if (encoding === 'percent') {
     const decoded = decodeOnce(p);
-    if (decoded === undefined) return undefined;
+    if (decoded === undefined || decoded.includes('\uFFFD')) return undefined;
     once = decoded;
     const twice = decodeOnce(once);
     if (twice !== once) return undefined;           // double-encoded (or an unreadable second layer)
@@ -348,7 +351,9 @@ function readRun(run: unknown, index: number, toolId: string, info: SarifToolInf
       if (info.fileMode === 'none') {
         uriUnmapped = true;
       } else {
-        file = mapUri(uri, baseId, run, bases, opts.workspace, info.uriEncoding, at);
+        // a secrets tool's uri with "!" is an archive member path (outer.zip!in/s.txt) or a made-up one: the bytes the scanner matched are not a
+        // workspace file's, so it is unmapped (fail closed); archives are not opened at all by the reviewed command (--max-archive-depth 0), this is the belt
+        file = info.secrets && uri.includes('!') ? undefined : mapUri(uri, baseId, run, bases, opts.workspace, info.uriEncoding, at);
         uriUnmapped = file === undefined;
         if (uriUnmapped) unmapped++;
       }
