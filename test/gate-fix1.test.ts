@@ -83,7 +83,7 @@ const needs = [needOf('secrets'), needOf('sast', 'app'), needOf('sast', 'web'), 
 const d = draftOf(specs, needs);
 const entries = gateJobList(d);
 const GATE_PERM = { contents: 'read', actions: 'read', 'pull-requests': 'read' };
-type BaseRef = 'pull-request-base' | 'push-before' | 'merge-group-base' | 'none';
+type BaseRef = 'pull-request-base' | 'none';
 function jobs(baseRef: BaseRef = 'pull-request-base'): Record<string, Job> {
   const out: Record<string, Job> = {};
   for (const spec of specs) {
@@ -94,7 +94,7 @@ function jobs(baseRef: BaseRef = 'pull-request-base'): Record<string, Job> {
   const script = renderProjectScript({ kind: 'project-script', needId: 'unit-tests', service: 'app', script: 'test' }, p, ctx).steps;
   out['unit-tests--app'] = job(dedupeJobSteps(script, { id: 'unit-tests--app', scans: NO_SCANS }));
   const baseBlocks = specs.map((s) => block(s, { ...ctx, base: true }));
-  const baseSteps = [...prelude(baseRef === 'none' ? {} : { baseRef }), ...baseBlocks.flatMap((b) => b.steps)];
+  const baseSteps = [...prelude(baseRef === 'none' ? {} : { baseRef: true }), ...baseBlocks.flatMap((b) => b.steps)];
   out['base-scan'] = job(baseSteps, { outputs: jobOutputsFor(baseBlocks.flatMap((b) => b.steps)) });
   out.gate = job([renderGateStep(GATE, entries)], { name: 'gate', if: 'always()', needs: [...entries.map((e) => e.job), 'base-scan'], permissions: GATE_PERM });
   return out;
@@ -193,7 +193,7 @@ describe('finding 3: the listed jobs are the real checks (ruling 3)', () => {
   it('A11: base-scan holding the head renders (the PR twin of a check) → refused', async () => {
     const j = jobs();
     const bs = specs.map((s) => block(s));
-    const steps = [...prelude({ baseRef: 'pull-request-base' }), ...bs.flatMap((b) => b.steps)];
+    const steps = [...prelude({ baseRef: true }), ...bs.flatMap((b) => b.steps)];
     const r = await run([workflow({ ...j, 'base-scan': job(steps, { outputs: jobOutputsFor(steps) }) }, true)], d);
     expect(has(r, 'not-gate-readable', /belongs to the job "secrets".* but sits in the job "base-scan"/), show(r)).toBe(true);
   });
@@ -254,33 +254,13 @@ describe('finding 5: base-scan checks out the base, and only the base (ruling 5)
     const late = await run([workflow(withBase(j, [rest[0] as RenderedStep, first as RenderedStep, ...rest.slice(1)]), true)], d);
     expect(has(late, 'injection', /first step/), show(late)).toBe(true);
   });
-  it('A3: before under pull_request; A3b/A3c: the PR form under merge_group and under push → refused', async () => {
-    const r1 = await run([workflow(jobs('push-before'))], d);
-    expect(has(r1, 'injection', /does not fit the trigger pull_request/), show(r1)).toBe(true);
-    const r2 = await run([wfOn({ merge_group: null }, jobs('pull-request-base'))], d);
-    expect(has(r2, 'injection', /does not fit the trigger merge_group/), show(r2)).toBe(true);
-    const r3 = await run([wfOn({ push: { branches: ['main'] } }, jobs('pull-request-base'))], d);
-    expect(has(r3, 'injection', /does not fit the trigger push/), show(r3)).toBe(true);
-  });
-  it('each trigger with its own form passes: pull_request, merge_group, push', async () => {
-    expect(show(await run([workflow(jobs('pull-request-base'))], d))).toBe('');
-    expect(show(await run([wfOn({ merge_group: null }, jobs('merge-group-base'))], d))).toBe('');
-    expect(show(await run([wfOn({ push: { branches: ['main'] } }, jobs('push-before'))], d))).toBe('');
-  });
-  it('a file with triggers that need two different forms, or any other trigger, is refused', async () => {
-    const r = await run([wfOn({ pull_request: null, push: { branches: ['main'] } }, jobs('pull-request-base'))], d);
-    expect(has(r, 'injection', /does not fit the trigger push/), show(r)).toBe(true);
-    const r2 = await run([wfOn({ pull_request: null, workflow_dispatch: null }, jobs('pull-request-base'))], d);
-    expect(has(r2, 'injection', /no base commit form for the trigger "workflow_dispatch"/), show(r2)).toBe(true);
-  });
   it('checkJobOrder / dedupeJobSteps: the base-scan rules, directly', () => {
-    const one = prelude({ baseRef: 'pull-request-base' });
-    expect(checkJobOrder(one, { id: 'base-scan', triggers: ['pull_request'] })).toEqual([]);
-    expect(checkJobOrder(one, { id: 'base-scan' }).join(' ')).toMatch(/triggers/);
-    expect(checkJobOrder(prelude(), { id: 'base-scan', triggers: ['pull_request'] }).join(' ')).toMatch(/needs a ref/);
-    expect(checkJobOrder([...one, ...prelude()], { id: 'base-scan', triggers: ['pull_request'] }).join(' ')).toMatch(/exactly one checkout/);
-    expect(checkJobOrder([], { id: 'base-scan', triggers: ['pull_request'] }).join(' ')).toMatch(/exactly one checkout/);
-    expect(() => dedupeJobSteps(prelude({ baseRef: 'push-before' }), { id: 'base-scan', scans: NO_SCANS, triggers: ['pull_request'] })).toThrow(RenderError);
+    const one = prelude({ baseRef: true });
+    expect(checkJobOrder(one, { id: 'base-scan' })).toEqual([]);
+    expect(checkJobOrder(prelude(), { id: 'base-scan' }).join(' ')).toMatch(/needs a ref/);
+    expect(checkJobOrder([...one, ...prelude()], { id: 'base-scan' }).join(' ')).toMatch(/exactly one checkout/);
+    expect(checkJobOrder([], { id: 'base-scan' }).join(' ')).toMatch(/exactly one checkout/);
+    expect(() => dedupeJobSteps(prelude({ baseRef: true }), { id: 'secrets', scans: NO_SCANS })).toThrow(RenderError);   // the base ref outside base-scan
   });
 });
 

@@ -18,7 +18,7 @@ import { Scalar, YAMLMap, YAMLSeq } from 'yaml';
 import { safeText } from '../util/safe-text.js';
 import { DEPENDENCY_KINDS, type OutputFormat, type RepoProfile, type ReviewedTool, type Service, type StepSpec } from '../types.js';
 import { COMMIT_SHA_RE } from './names.js';
-import { NEED_IDS } from './need-ids.js';
+import { NEED_IDS, toolCoversNeed } from './need-ids.js';
 import type { PlatformActions } from './pin.js';
 import { tuningProblems } from './tuning.js';
 import { APP_RUNNING_CATEGORIES, projectScriptSteps, renderCliTool, sha16, type CliHooks, type RenderOptions } from './render-cli.js';
@@ -27,7 +27,7 @@ import type { ProjectScriptStep } from './reviewed.js';
 import { own, RenderError, show } from './render-error.js';
 import { checkExpressions, checkJobOrder, isDangerousName, isReviewed, STEP_KEYS, type JobContext, type RenderedStep, type ScanFact } from './job-rules.js';
 import { jobListLiteral, type JobListEntry } from './gate-job-list.js';
-import { BASE_CHECKOUT_REFS, DOCKER_ACTION_USES, IMAGE_BUILT_ACTION_USES, PIPEGEN_GATE_USES, PLAIN_REL_RE, PLATFORM_LOCKS, PLATFORM_USES, RENDERER_INPUTS, rendererInputProblems, scrubbedResultPath, scrubStepId, type BaseCheckoutRef } from './tool-flags.js';
+import { BASE_CHECKOUT_REF, DOCKER_ACTION_USES, IMAGE_BUILT_ACTION_USES, PIPEGEN_GATE_USES, PLAIN_REL_RE, PLATFORM_LOCKS, PLATFORM_USES, RENDERER_INPUTS, rendererInputProblems, scrubbedResultPath, scrubStepId } from './tool-flags.js';
 
 export { RenderError };
 // the job rules live in job-rules.ts (one copy for the renderer, the emitter, the referee and the linters); re-exported for the callers that import them here
@@ -82,6 +82,8 @@ export function validateSpec(spec: StepSpec, tool: ReviewedTool, ctx: RenderCont
   }
 
   if (!(NEED_IDS as readonly string[]).includes(spec.needId)) problem('needId', `${show(spec.needId)} isn't a check pipegen knows.`);
+  // a platform-only entry (checkout, setup, upload, login, ...) is a step helper, rendered by renderPlatformStep and never a check of a need; the referee refuses any spec that names one
+  else if (!(tool.categories.length === 1 && tool.categories[0] === 'platform') && !toolCoversNeed(tool.categories, spec.needId)) problem('tool', `${show(tool.id)} does not cover the check ${show(spec.needId)} (its categories are ${tool.categories.map((c) => show(c)).join(', ')}).`);
 
   const service = spec.service === undefined ? undefined : services.find((s) => s.name === spec.service);
   if (spec.service !== undefined && service === undefined) problem('service', `${show(spec.service)} isn't a service of this repository.`);
@@ -340,7 +342,7 @@ function cliHooks(platform: PlatformActions): CliHooks {
  * (only its display name may differ), or this throws (review-6c-r1 minor 2: a later checkout with fetch-depth 0 must not
  * vanish behind a depth-1 one). The one documented exception is the repo `npm ci` of one folder asked for by several
  * tools: its pin lists are merged, and its scripts may differ only in the tool's own home folder.
- * `job` (C0b, required): the job's id, the file's triggers (for `base-scan`) and the scan facts of its scrub steps, for the shared job rules (checkJobOrder): the base checkout ref only
+ * `job` (C0b, required): the job's id and the scan facts of its scrub steps, for the shared job rules (checkJobOrder): the base checkout ref only
  * in `base-scan`, and each scrub step equal to its scan (scanFactOf gives the fact of a rendered tool).
  */
 export function dedupeJobSteps(steps: readonly RenderedStep[], job: JobContext): RenderedStep[] {
@@ -425,8 +427,8 @@ function rendererFill(usesPath: string, service: Service | undefined, ctx: Rende
 
 export interface PreludeOptions {
   fetchDepth?: '1' | '0';
-  /** Check out the base commit instead of the event's own (the `base-scan` job only, ruling S16): the pull request's base, or the push's previous head. */
-  baseRef?: BaseCheckoutRef;
+  /** Check out the base commit instead of the event's own (the `base-scan` job only, ruling S16): the one event-switched expression BASE_CHECKOUT_REF. */
+  baseRef?: true;
   /** Set up Node. `runtimeVersion` is the repo's raw text (Service.runtimeVersion); it is only mapped, never rendered. */
   node?: { runtimeVersion?: string };
 }
@@ -442,8 +444,8 @@ export function renderJobPrelude(opts: PreludeOptions, platform: PlatformActions
   const checkout = platformEntry(platform, 'checkout');
   const depth = opts.fetchDepth ?? '1';
   if (!(checkout.choices['fetch-depth'] ?? []).includes(depth)) throw new RenderError(`The reviewed checkout entry doesn't offer fetch-depth ${show(depth)}.`);
-  const ref = opts.baseRef === undefined ? undefined : own(BASE_CHECKOUT_REFS, opts.baseRef);
-  if (opts.baseRef !== undefined && ref === undefined) throw new RenderError(`${show(opts.baseRef)} is not a base checkout form (${Object.keys(BASE_CHECKOUT_REFS).join(', ')}).`);
+  if (opts.baseRef !== undefined && opts.baseRef !== true) throw new RenderError('baseRef is true or absent: the base checkout has one form (BASE_CHECKOUT_REF).');
+  const ref = opts.baseRef === true ? BASE_CHECKOUT_REF : undefined;
   steps.push(actionStep(checkout, opts.baseRef === undefined ? 'Check out the repository' : 'Check out the base commit', { 'fetch-depth': depth }, ref === undefined ? {} : { ref }));
   if (opts.node !== undefined) {
     const setup = platformEntry(platform, 'setup-node');

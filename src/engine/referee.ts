@@ -35,7 +35,7 @@ import { ArtifactNameError, slug } from './artifact-names.js';
 import { FINDINGS_CATEGORIES, gateJobList, GateJobListError, jobIdFor, PIPEGEN_JOB_CATEGORIES, readableFormat, type JobListEntry } from './gate-job-list.js';
 import { runLinters } from './linters.js';
 import { COMMIT_SHA_RE } from './names.js';
-import { NEED_ID_CATEGORY } from './need-ids.js';
+import { NEED_ID_CATEGORY, toolCoversNeed } from './need-ids.js';
 import { PLATFORM_ACTION_IDS, type PlatformActions } from './pin.js';
 import { APP_RUNNING_CATEGORIES, TRIVY_LAUNCH_RE } from './render-cli.js';
 import { EXPR, own, show } from './render-error.js';
@@ -467,6 +467,10 @@ function expectations(draft: PipelineDraft, platform: PlatformActions, reviewed:
       add(`draft.steps[${i}]`, 'unreviewed', `The step for ${show(spec?.needId)} runs ${show(spec?.tool?.id)}, which is not an entry of the reviewed list at its reviewed pin; pipegen never runs it, not even as a non-blocking job (it belongs in the suggestions).`);
       return;
     }
+    if (!toolCoversNeed(t.categories, spec.needId)) {
+      add(`draft.steps[${i}]`, 'unreviewed', `The step for ${show(spec.needId)} runs ${show(t.id)}, which does not cover the check ${show(spec.needId)} (its categories are ${t.categories.map((c) => show(c)).join(', ')}); a tool of another kind would leave the check undone, so it is not run.`);
+      return;
+    }
     if (t.candidate.kind === 'action') {   // actions are judged by their template (judgeAction), not by a re-render
       for (const n of spec.secrets ?? []) ex.declared.add(n);
       return;
@@ -509,8 +513,6 @@ interface FileCtx {
   file: CreatedFile; add: Add; ex: Expectations; draft: PipelineDraft;
   /** every parsed workflow and action file, by `<repo>:<path>` */
   others: Map<string, Parsed>;
-  /** the event names that start the file (null when unreadable) */
-  triggers?: string[] | null;
 }
 
 const issueFor = (fc: FileCtx) => (check: RefereeCheck, message: string): void => fc.add(fc.file.path, check, message);
@@ -537,33 +539,6 @@ function centralOf(draft: PipelineDraft): { prefix: string; sha: string } | null
 }
 /** A `uses` path that looks like any owner's central pipelines repo. */
 const CENTRAL_LIKE_RE = /^[^/]*\/pipelines\//;
-
-/**
- * The events that start a file, for the base commit form (C0b fix round 2, ruling 4). A called workflow (`workflow_call`) runs on its
- * caller's event, so its triggers are the union of the triggers of every file in `files` of the same repo that calls it through a
- * job-level `uses: ./<its path>` (a caller that is itself called counts its callers, up to three levels). With no such caller the
- * `workflow_call` stays in the list, and the base-scan rule refuses it. Null when the `on:` is unreadable.
- */
-function effectiveTriggers(file: CreatedFile, on: unknown, parsed: Map<string, Parsed>, depth = 0): string[] | null {
-  const own = triggersOf(on);
-  if (own === null || !own.includes('workflow_call')) return own;
-  const out = new Set(own.filter((t) => t !== 'workflow_call'));
-  let called = false;
-  if (depth < 3) {
-    for (const [key, other] of parsed) {
-      if (!key.startsWith(`${file.repo}:`) || key === fileKey(file) || !isObj(other.js.jobs)) continue;
-      const calls = Object.values(other.js.jobs).some((j) => isObj(j) && j.uses === `./${file.path}`);
-      if (!calls) continue;
-      const path = key.slice(file.repo.length + 1);
-      const t = effectiveTriggers({ path, repo: file.repo } as CreatedFile, other.js.on, parsed, depth + 1);
-      if (t === null) return null;
-      called = true;
-      for (const x of t) out.add(x);
-    }
-  }
-  if (!called) out.add('workflow_call');   // no caller in files: no base commit form fits
-  return [...out];
-}
 
 /** The workflow's own top level (a file pipegen wrote whole). */
 function judgeTop(fc: FileCtx, js: Obj): void {
@@ -742,8 +717,7 @@ function judgeListedJobs(ex: Expectations, draft: PipelineDraft, expected: reado
   const actionsOf = (job: string): string[] => draft.steps.flatMap((spec, i) => {
     if (!isObj(spec) || !isReviewed(spec.tool) || keyOf(spec.needId, spec.service) !== job) return [];
     const t = ex.byId.get(spec.tool.id);
-    // only an action that IS the check: not the harden step, the platform actions or pipegen's own (those have a reserved kind and sit in many jobs)
-    return t !== undefined && t.candidate.kind === 'action' && own(ENTRY_KIND, t.id) === undefined && sameCandidate(spec.tool, t.candidate) && reviewedFormatOf(ex)(spec, i) !== undefined ? [t.id] : [];
+    return t !== undefined && t.candidate.kind === 'action' && sameCandidate(spec.tool, t.candidate) && reviewedFormatOf(ex)(spec, i) !== undefined ? [t.id] : [];
   });
   for (const e of expected) {
     // 1. the job holds the rendered tool or script of its check
@@ -754,6 +728,8 @@ function judgeListedJobs(ex: Expectations, draft: PipelineDraft, expected: reado
     // 1b. an action check: its action step is in the listed job and in no other job of the file
     for (const entryId of new Set(actionsOf(e.job))) {
       if (!holds(e.job).some((x) => x.entryId === entryId)) nb(`The job ${show(e.job)} is in the gate's list for the check ${show(e.needId)}, but it holds no step of the action check ${show(entryId)}; the gate would wait on a job that does not run it.`);
+      // an action with a reserved kind (the harden step, the platform actions, the build) is also in other jobs (every job starts with the harden step), so only the other kinds are held to one job
+      if (own(ENTRY_KIND, entryId) !== undefined) continue;
       for (const r of records) {
         if (r.id !== e.job && r.judged.some((x) => x.entryId === entryId) && !actionsOf(r.id).includes(entryId)) nb(`The action step of the check ${show(e.needId)} (${show(entryId)}) sits in the job ${show(r.id)}, but the gate reads the job ${show(e.job)}: that step's result would not count.`);
       }
@@ -941,7 +917,7 @@ function judgeJobSteps(fc: FileCtx, where: string, steps: unknown[], job: boolea
     const format = spec === undefined || !isObj(spec) || !isObj(spec.tool) ? undefined : fc.ex.byId.get(spec.tool.id)?.step.output.format;
     if (spec !== undefined && x.step.id !== undefined && (format === 'sarif' || format === 'zap-json')) scans.set(x.step.id, { tool: spec.tool.id, format });
   }
-  for (const problem of checkJobOrder(forOrder, { ...(jobId === undefined ? {} : { id: jobId }), scans, ...(fc.triggers == null ? {} : { triggers: fc.triggers }) })) fc.add(fc.file.path, 'injection', `In ${where}: ${problem}`);
+  for (const problem of checkJobOrder(forOrder, { ...(jobId === undefined ? {} : { id: jobId }), scans })) fc.add(fc.file.path, 'injection', `In ${where}: ${problem}`);
   // a merged repo `npm ci` (dedupeJobSteps) carries exactly the pins of the tools of this job that need it
   const sources = new Set(judged.flatMap((x) => (x.match === undefined ? [] : [x.match.source])));
   for (const x of judged) {
@@ -1373,7 +1349,7 @@ export async function referee(files: CreatedFile[], draft: PipelineDraft, platfo
   for (const f of files) {
     const p = parsed.get(`${f.repo}:${f.path}`);
     if (p === undefined) continue;
-    const fc: FileCtx = { file: f, add, ex, draft, others: parsed, triggers: effectiveTriggers(f, p.js.on, parsed) };
+    const fc: FileCtx = { file: f, add, ex, draft, others: parsed };
     if (fileKind(f) === 'action') judgeAction(fc, p.js);
     else if (f.inserted !== undefined) judgeEdited(fc, p, f.inserted);
     else {

@@ -83,7 +83,7 @@ const needs = [needOf('secrets'), needOf('sast', 'app'), needOf('sast', 'web'), 
 const d = draftOf(specs, needs);
 const entries = gateJobList(d);
 const GATE_PERM = { contents: 'read', actions: 'read', 'pull-requests': 'read' };
-type BaseRef = 'pull-request-base' | 'push-before' | 'merge-group-base' | 'none';
+type BaseRef = 'pull-request-base' | 'none';
 function jobs(baseRef: BaseRef = 'pull-request-base'): Record<string, Job> {
   const out: Record<string, Job> = {};
   for (const spec of specs) {
@@ -94,7 +94,7 @@ function jobs(baseRef: BaseRef = 'pull-request-base'): Record<string, Job> {
   const script = renderProjectScript({ kind: 'project-script', needId: 'unit-tests', service: 'app', script: 'test' }, p, ctx).steps;
   out['unit-tests--app'] = job(dedupeJobSteps(script, { id: 'unit-tests--app', scans: NO_SCANS }));
   const baseBlocks = specs.map((s) => block(s, { ...ctx, base: true }));
-  const baseSteps = [...prelude(baseRef === 'none' ? {} : { baseRef }), ...baseBlocks.flatMap((b) => b.steps)];
+  const baseSteps = [...prelude(baseRef === 'none' ? {} : { baseRef: true }), ...baseBlocks.flatMap((b) => b.steps)];
   out['base-scan'] = job(baseSteps, { outputs: jobOutputsFor(baseBlocks.flatMap((b) => b.steps)) });
   out.gate = job([renderGateStep(GATE, entries)], { name: 'gate', if: 'always()', needs: [...entries.map((e) => e.job), 'base-scan'], permissions: GATE_PERM });
   return out;
@@ -110,7 +110,6 @@ const withGate = (j: Record<string, Job>, steps: RenderedStep[], over: Job = {})
 const wfAt = (f: CreatedFile, path: string): CreatedFile => ({ ...f, path });
 const mqJobs = (): Record<string, Job> => {
   const mg = structuredClone(jobs());
-  mg['base-scan'] = { ...(mg['base-scan'] as Job), steps: (mg['base-scan']?.steps as RenderedStep[]).map((s, i) => (i === 0 ? { ...s, with: { ...s.with, ref: '${{ github.event.merge_group.base_sha }}' } } : s)) };
   return mg;
 };
 
@@ -178,45 +177,6 @@ describe('finding 3: an artifact has one upload per workflow file (ruling 3)', (
   it('two uploads of one name in one file are still refused (A13), the same name in two files is not', async () => {
     const j = jobs();
     expect(has(await run([workflow({ ...j, 'sast-dup': structuredClone(j['sast--web']) as Job })], d), 'not-gate-readable', /uploaded by more than one step/)).toBe(true);
-  });
-});
-
-describe('finding 4: a called workflow with base-scan takes the triggers of its callers (ruling 4)', () => {
-  const CALLED = '.github/workflows/pipegen-merge.yml';
-  const called = (): CreatedFile => wfAt(wfOn({ workflow_call: null }, jobs(), true), CALLED);
-  const caller = (on: unknown, path: string): CreatedFile => ({
-    path, part: 'pipeline', reason: 't', repo: 'app',
-    content: `name: caller\non: ${JSON.stringify(on)}\npermissions: {}\njobs:\n  merge:\n    uses: ./${CALLED}\n    permissions:\n      contents: read\n      actions: read\n      pull-requests: read\n`,
-  });
-  it('R3: one pull_request caller in files → the pull request form passes', async () => {
-    const r = await run([caller({ pull_request: null }, '.github/workflows/pipegen.yml'), called()], d);
-    expect(show(r)).toBe('');
-  });
-  it('R3: callers on pull_request and merge_group (two different forms) → refused', async () => {
-    const r = await run([caller({ pull_request: null }, '.github/workflows/a.yml'), caller({ merge_group: null }, '.github/workflows/b.yml'), called()], d);
-    expect(has(r, 'injection', /does not fit the trigger merge_group/), show(r)).toBe(true);
-  });
-  it('R3: a caller whose own triggers mix two forms → refused', async () => {
-    const r = await run([caller({ pull_request: null, push: { branches: ['main'] } }, '.github/workflows/a.yml'), called()], d);
-    expect(has(r, 'injection', /does not fit the trigger push/), show(r)).toBe(true);
-  });
-  it('R3: no caller in files → refused', async () => {
-    const r = await run([called()], d);
-    expect(has(r, 'injection', /no base commit form for the trigger "workflow_call"/), show(r)).toBe(true);
-  });
-  it('R3: a caller in another repo of files, or calling another file, does not count', async () => {
-    const other = { ...caller({ pull_request: null }, '.github/workflows/a.yml'), content: caller({ pull_request: null }, 'x').content.replace('pipegen-merge', 'something-else') };
-    const r = await run([other, called()], d);
-    expect(has(r, 'injection', /no base commit form for the trigger "workflow_call"/), show(r)).toBe(true);
-  });
-  it('R3: a file of another repo (central) that calls the same path does not count as a caller', async () => {
-    const central = { ...caller({ merge_group: null }, '.github/workflows/c.yml'), repo: 'central' as const };
-    const r = await run([caller({ pull_request: null }, '.github/workflows/pipegen.yml'), central, called()], d);
-    expect(has(r, 'injection', /does not fit the trigger/), show(r)).toBe(false);
-  });
-  it('R3 (held): pull_request_target, workflow_dispatch and push with the PR form stay refused; a merge_group file with its form passes', async () => {
-    for (const on of [{ pull_request_target: null }, ['pull_request', 'workflow_dispatch']]) expect((await run([wfOn(on, jobs(), true)], d)).ok, JSON.stringify(on)).toBe(false);
-    expect(show(await run([wfOn({ merge_group: null }, mqJobs(), true)], d))).toBe('');
   });
 });
 

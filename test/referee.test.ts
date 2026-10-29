@@ -136,6 +136,8 @@ describe('referee: the renderer and the referee agree', () => {
         continue;
       }
       specs.push(spec);
+      // the PR-time build (push false) is the listed check: it runs in image-build--<service>; image-publish is a separate job, not a listed check
+      if (t.id === 'docker-build-push-action') jobs[jobIdFor(spec.needId, spec.service)] = job([...prelude(), ...renderStep(spec, t, p, { ...ctxN, targets: { image: 'ghcr.io/o/app:pr-1' } }).steps]);
       // a listed check runs in the job named for it (ruling 3 of C0b fix round 1), with the outputs the gate reads
       const outputs = jobOutputsFor(steps);
       jobs[t.id === 'docker-build-push-action' ? 'image-publish' : jobIdFor(spec.needId, spec.service)] = job(steps, {
@@ -171,7 +173,7 @@ describe('referee: the renderer and the referee agree', () => {
     jobs[['sec', 'rets'].join('')] = job(repoWideSteps, { outputs: jobOutputsFor(repoWideSteps) });
     const baseRun = renderStep(repoWide, entry('gitleaks'), p, { ...ctx, base: true });
     const baseArt = resultArtifactName('secrets', undefined, { base: true });
-    const baseSteps = [...renderJobPrelude({ baseRef: 'pull-request-base' }, p).steps, ...baseRun.steps, renderScrub(baseArt, baseRun.output?.path as string, 'gitleaks', 'sarif', GATE), renderUpload(baseArt, scrubbedPath(baseRun.output?.path as string), p)];
+    const baseSteps = [...renderJobPrelude({ baseRef: true }, p).steps, ...baseRun.steps, renderScrub(baseArt, baseRun.output?.path as string, 'gitleaks', 'sarif', GATE), renderUpload(baseArt, scrubbedPath(baseRun.output?.path as string), p)];
     jobs['base-scan'] = job(baseSteps, { permissions: { contents: 'read', actions: 'read' }, outputs: jobOutputsFor(baseSteps) });
     // the project's own scripts, for a service of their own (the tools above took the first service of each need)
     const scripts = [renderProjectScript({ kind: 'project-script', needId: 'unit-tests', service: 'script-app', script: 'test' }, p, ctxN).steps,

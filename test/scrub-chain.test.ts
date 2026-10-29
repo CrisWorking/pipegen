@@ -12,7 +12,7 @@ import { checkJobOrder, isKnownHarmless, isScrubStep } from '../src/engine/job-r
 import { JOB_STEP_POLICY, referee, type Linters, type RefereeReport } from '../src/engine/referee.js';
 import { dedupeJobSteps, RenderError, renderJobPrelude, renderPlatformStep, renderScrub, renderStep, renderStepWith, renderUpload, scrubbedPath, stepsToYaml, type RenderContext, type RenderedStep, type RenderResult } from '../src/engine/render-step.js';
 import { NEED_ID_CATEGORY, NEED_IDS } from '../src/engine/need-ids.js';
-import { ARGV_POLICIES, rendererInputProblems, SCRUB_STEP_ID_RE } from '../src/engine/tool-flags.js';
+import { ARGV_POLICIES, BASE_CHECKOUT_REF, rendererInputProblems, SCRUB_STEP_ID_RE } from '../src/engine/tool-flags.js';
 import { emptyRepoFiles } from '../src/read/quality.js';
 import type { Capabilities, CreatedFile, Need, PipelineDraft, ReviewedTool, StepSpec } from '../src/types.js';
 import { entry, gateEntry, GATE_SHA, platform, profile, reviewedList, service, specFor, scansFor } from './helpers/render.js';
@@ -276,8 +276,8 @@ describe('referee: the scrub chain', () => {
     // the PR-side scan of the same check sits in its own job; the base-scan job holds the target branch's twin of it
     const pr = scannerSteps(spec).steps;
     // the base-scan job checks out the base commit, as its first step (C0b fix round 1)
-    const baseSteps = [{ ...(steps[0] as RenderedStep), with: { ...steps[0]?.with, ref: '${{ github.event.pull_request.base.sha }}' } }, ...steps.slice(1)];
-    const r = await run([workflow({ scan: job(dedupeJobSteps(pr, { scans: scansFor(pr) })), 'base-scan': job(dedupeJobSteps(baseSteps, { id: 'base-scan', scans: scansFor(baseSteps), triggers: ['pull_request'] })) })], draftOf([spec]));
+    const baseSteps = [{ ...(steps[0] as RenderedStep), with: { ...steps[0]?.with, ref: BASE_CHECKOUT_REF } }, ...steps.slice(1)];
+    const r = await run([workflow({ scan: job(dedupeJobSteps(pr, { scans: scansFor(pr) })), 'base-scan': job(dedupeJobSteps(baseSteps, { id: 'base-scan', scans: scansFor(baseSteps) })) })], draftOf([spec]));
     expect(show(r)).toBe('');
   });
 
@@ -575,7 +575,7 @@ describe('a job with a scrub step holds no repo code (C0a fix round 1, finding 1
     const t = entry(id);
     return renderStep(specFor(t, { needId, service: 'app' }), t, p, ctx).steps;
   };
-  const AFTER: [string, string][] = [['prettier', 'format-lint'], ['knip', 'dead-code'], ['vitest-coverage', 'coverage']];
+  const AFTER: [string, string][] = [['prettier', 'format'], ['knip', 'dead-code'], ['vitest-coverage', 'coverage']];
 
   it('checkJobOrder and dedupeJobSteps refuse repo code after the scrub and upload (prettier, knip, vitest-coverage with its npm ci, a hand step)', () => {
     const { steps } = scannerSteps(gitleaksSpec());

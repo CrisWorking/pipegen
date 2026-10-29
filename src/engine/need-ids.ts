@@ -30,3 +30,12 @@ export const NEED_ID_CATEGORY: Readonly<Record<NeedId, NeedCategory>> = Object.f
   ...(Object.fromEntries(NEED_CATEGORIES.map((c) => [c, c])) as Record<NeedCategory, NeedCategory>),
   'migration-check': 'full-tests',
 });
+
+/**
+ * Whether a reviewed tool covers a check: its categories include the category of the need id (C0c CF1). A spec that pairs a need with a tool of
+ * another category (bullfrog as the dependency-review, say) would be a check nothing performs, so validateSpec and the referee refuse it.
+ */
+export function toolCoversNeed(categories: readonly string[], needId: string): boolean {
+  const cat = Object.hasOwn(NEED_ID_CATEGORY, needId) ? (NEED_ID_CATEGORY as Readonly<Record<string, string>>)[needId] : undefined;
+  return cat !== undefined && categories.includes(cat);
+}

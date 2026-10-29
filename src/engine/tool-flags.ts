@@ -650,19 +650,14 @@ export function jobListLiteralProblem(text: string): string | null {
   return null;
 }
 
-/** The two forms of the base commit a base-scan checkout may name (ruling S16): a pull request's base, or the push's previous head. Only the job `base-scan` may use one (job-rules.ts). */
-export const BASE_CHECKOUT_REFS = Object.freeze({
-  'pull-request-base': '${{ github.event.pull_request.base.sha }}',
-  'merge-group-base': '${{ github.event.merge_group.base_sha }}',
-  'push-before': '${{ github.event.before }}',
-} as const);
-export type BaseCheckoutRef = keyof typeof BASE_CHECKOUT_REFS;
 /**
- * The one base form that is valid for each event that can start a workflow with a `base-scan` job (C0b fix round 1, ruling 5): the
- * other events' payloads lack the field, the expression is empty and the checkout falls back to the head. A file's triggers must
- * all map to the same form; a trigger not listed has no base commit form, so such a file may not hold a base-scan job.
+ * The ONE base commit a base-scan checkout may name (ruling S16, C0c CF3a), switched on the event, so it holds in any file, a called
+ * workflow included, whatever event starts it: a pull request's base, a merge group's base, a push's previous head. On every other event,
+ * and on a push to a new branch (`before` all zeros), the value is the all-zero COMMIT sha, which can never exist: the checkout fails and
+ * the base-scan job fails ("no base"), instead of an empty ref falling back to the head. Never a ref NAME as the sentinel: anyone with push
+ * access can create a branch with that name. Only the job `base-scan` may use it (job-rules.ts).
  */
-export const BASE_REF_FOR_TRIGGER: Readonly<Record<string, BaseCheckoutRef>> = Object.freeze({ pull_request: 'pull-request-base', merge_group: 'merge-group-base', push: 'push-before' });
+export const BASE_CHECKOUT_REF = `\${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event_name == 'merge_group' && github.event.merge_group.base_sha || github.event_name == 'push' && github.event.before || '${'0'.repeat(40)}' }}`;
 
 /**
  * Ruling S15: the inputs the renderer sets on a platform action, by the same `owner/repo[/path]` key as ACTION_POLICIES,
@@ -675,7 +670,7 @@ export const BASE_REF_FOR_TRIGGER: Readonly<Record<string, BaseCheckoutRef>> = O
  */
 export const RENDERER_INPUTS: Readonly<Record<string, Readonly<Record<string, RendererInput>>>> = Object.freeze({
   // the base commit, for the base-scan job only (the job rule is in job-rules.ts); no other ref is ever set
-  'actions/checkout': { ref: rx(new RegExp(`^(?:${Object.values(BASE_CHECKOUT_REFS).map((v) => v.replace(/[$.{}()]/g, '\\$&')).join('|')})$`), 'the pull request base commit or the push\'s previous head') },
+  'actions/checkout': { ref: { describe: 'the event-switched base commit (BASE_CHECKOUT_REF) and nothing else', check: (v) => v === BASE_CHECKOUT_REF } },
   'actions/upload-artifact': { name: ARTIFACT_NAME, path: OWN_FOLDER_PATH },
   'actions/download-artifact': { name: ARTIFACT_NAME, path: OWN_FOLDER_PATH },
   'github/codeql-action/upload-sarif': { sarif_file: RUNNER_TEMP_PATH, category: rx(/^pipegen-[a-z0-9][a-z0-9-]{0,100}$/, 'a category starting pipegen-') },

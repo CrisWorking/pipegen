@@ -2,6 +2,7 @@
 import { emptyRepoFiles, emptyServiceQuality } from '../../src/read/quality.js';
 import { PLATFORM_ACTION_IDS, type PlatformActions } from '../../src/engine/pin.js';
 import { loadReviewed } from '../../src/engine/reviewed.js';
+import { NEED_ID_CATEGORY, NEED_IDS } from '../../src/engine/need-ids.js';
 import type { ScanFact } from '../../src/engine/job-rules.js';
 import type { RenderContext } from '../../src/engine/render-step.js';
 import { SCRUB_STEP_ID_RE, sha16 } from '../../src/engine/tool-flags.js';
@@ -33,7 +34,7 @@ export const platform = (list: ReviewedTool[] = reviewedList()): PlatformActions
 
 /** A spec for a reviewed entry: the entry's own candidate, no choices, no copies of the template. */
 export const specFor = (tool: ReviewedTool, over: Partial<StepSpec> = {}): StepSpec => ({
-  needId: 'sast', tool: tool.candidate, choices: {}, output: tool.step.output, ...over,
+  needId: (NEED_IDS as readonly string[]).find((n) => tool.categories.includes(n) && NEED_ID_CATEGORY[n as keyof typeof NEED_ID_CATEGORY] === n) ?? 'sast', tool: tool.candidate, choices: {}, output: tool.step.output, ...over,
 });
 
 /** The commit the fixture gate entry is pinned to. */

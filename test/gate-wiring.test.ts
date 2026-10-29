@@ -13,7 +13,7 @@ import {
   type RenderContext, type RenderedStep, type RenderResult,
 } from '../src/engine/render-step.js';
 import { NEED_ID_CATEGORY } from '../src/engine/need-ids.js';
-import { rendererInputProblems, scrubStepId } from '../src/engine/tool-flags.js';
+import { BASE_CHECKOUT_REF, rendererInputProblems, scrubStepId } from '../src/engine/tool-flags.js';
 import { emptyRepoFiles } from '../src/read/quality.js';
 import type { Capabilities, CreatedFile, Need, PipelineDraft, ReviewedTool, StepSpec } from '../src/types.js';
 import { entry, gateEntry, platform, profile, reviewedList, service, specFor } from './helpers/render.js';
@@ -360,30 +360,28 @@ describe('referee: the gate job (rulings S4 and S21)', () => {
 describe('base-scan checkout ref (ruling S16)', () => {
   const BASE = '${{ github.event.pull_request.base.sha }}';
   const BEFORE = '${{ github.event.before }}';
-  it('RENDERER_INPUTS actions/checkout: ref only ${{ github.event.pull_request.base.sha }} or ${{ github.event.before }}', () => {
-    expect(rendererInputProblems('actions/checkout', { ref: BASE })).toEqual([]);
-    expect(rendererInputProblems('actions/checkout', { ref: BEFORE })).toEqual([]);
-    for (const bad of ['main', '${{ github.head_ref }}', '${{ github.event.pull_request.head.sha }}', '${{ github.sha }}', `${BASE} `, '${{ github.event.before }}${{ x }}', '', '${{ github.event.pull_request.base.ref }}', 'refs/pull/1/merge']) {
+  it('RENDERER_INPUTS actions/checkout: ref only the one event-switched base expression (the per-event forms alone are refused now)', () => {
+    expect(rendererInputProblems('actions/checkout', { ref: BASE_CHECKOUT_REF })).toEqual([]);
+    for (const bad of [BASE, BEFORE, 'main', '${{ github.head_ref }}', '${{ github.event.pull_request.head.sha }}', '${{ github.sha }}', `${BASE_CHECKOUT_REF} `, '', 'refs/pull/1/merge']) {
       expect(rendererInputProblems('actions/checkout', { ref: bad }).length, bad).toBeGreaterThan(0);
     }
   });
 
-  it('renderJobPrelude: baseRef gives the checkout one of the two refs; anything else is refused', () => {
-    const pr = prelude({ baseRef: 'pull-request-base' });
-    expect(pr[0]?.with?.ref).toBe(BASE);
-    expect(prelude({ baseRef: 'push-before' })[0]?.with?.ref).toBe(BEFORE);
+  it('renderJobPrelude: baseRef true gives the checkout the base expression; anything else is refused', () => {
+    const pr = prelude({ baseRef: true });
+    expect(pr[0]?.with?.ref).toBe(BASE_CHECKOUT_REF);
     expect(prelude()[0]?.with?.ref).toBeUndefined();
-    expect(() => prelude({ baseRef: 'main' as 'push-before' })).toThrow(RenderError);
+    expect(() => prelude({ baseRef: 'main' as unknown as true })).toThrow(RenderError);
     expect(() => stepsToYaml(pr)).not.toThrow();
   });
 
   it('base-scan checkout ref only in job base-scan: checkJobOrder and dedupeJobSteps refuse it in any other job (and with no job id)', () => {
-    const steps = prelude({ baseRef: 'pull-request-base' });
-    expect(checkJobOrder(steps, { id: 'base-scan', triggers: ['pull_request'] })).toEqual([]);
-    expect(dedupeJobSteps(steps, { id: 'base-scan', scans: NO_SCANS, triggers: ['pull_request'] })).toHaveLength(1);
+    const steps = prelude({ baseRef: true });
+    expect(checkJobOrder(steps, { id: 'base-scan' })).toEqual([]);
+    expect(dedupeJobSteps(steps, { id: 'base-scan', scans: NO_SCANS })).toHaveLength(1);
     for (const ctxOf of [{ id: 'secrets' }, { id: 'gate' }, { id: 'base-scan2' }, { id: 'Base-Scan' }, {}]) {
       expect(checkJobOrder(steps, ctxOf).join(' '), JSON.stringify(ctxOf)).toMatch(/base-scan/);
-      expect(() => dedupeJobSteps(steps, { ...ctxOf, scans: NO_SCANS, triggers: ['pull_request'] }), JSON.stringify(ctxOf)).toThrow(RenderError);
+      expect(() => dedupeJobSteps(steps, { ...ctxOf, scans: NO_SCANS }), JSON.stringify(ctxOf)).toThrow(RenderError);
     }
     expect(checkJobOrder(prelude())).toEqual([]);   // a checkout with no ref is fine anywhere
   });
@@ -392,10 +390,10 @@ describe('base-scan checkout ref (ruling S16)', () => {
     const spec = gitleaksSpec();
     const dd = draftOf([spec], [needOf('secrets')]);
     const base = block(spec, { ...ctx, base: true });
-    const baseSteps = [...prelude({ baseRef: 'pull-request-base' }), ...base.steps];
+    const baseSteps = [...prelude({ baseRef: true }), ...base.steps];
     const pr = block(spec);
     const prJob = job(dedupeJobSteps([...prelude(), ...pr.steps], { id: 'secrets', scans: facts(pr) }), { outputs: jobOutputsFor(pr.steps) });
-    const ok = await run([workflow({ [SEC]: prJob, 'base-scan': job(dedupeJobSteps(baseSteps, { id: 'base-scan', scans: facts(base), triggers: ['pull_request'] }), { outputs: jobOutputsFor(base.steps) }) })], dd);
+    const ok = await run([workflow({ [SEC]: prJob, 'base-scan': job(dedupeJobSteps(baseSteps, { id: 'base-scan', scans: facts(base) }), { outputs: jobOutputsFor(base.steps) }) })], dd);
     expect(show(ok)).toBe('');
     const elsewhere = await run([workflow({ [SEC]: prJob, other: job(baseSteps) })], dd);
     expect(has(elsewhere, 'injection', /base-scan/), show(elsewhere)).toBe(true);
@@ -526,8 +524,8 @@ describe('parity: a full draft (two services, scanners, base-scan, gate job) thr
     out['unit-tests--app'] = job(dedupeJobSteps(script, { id: 'unit-tests--app' , scans: NO_SCANS }));
     // base-scan: one checkout of the base commit, then the base twin of every findings check
     const baseBlocks = specs.map((s) => block(s, { ...ctx, base: true }));
-    const baseSteps = [...prelude({ baseRef: 'pull-request-base' }), ...baseBlocks.flatMap((b) => b.steps)];
-    out['base-scan'] = job(dedupeJobSteps(baseSteps, { id: 'base-scan', scans: facts(...baseBlocks), triggers: ['pull_request'] }), { outputs: jobOutputsFor(baseBlocks.flatMap((b) => b.steps)) });
+    const baseSteps = [...prelude({ baseRef: true }), ...baseBlocks.flatMap((b) => b.steps)];
+    out['base-scan'] = job(dedupeJobSteps(baseSteps, { id: 'base-scan', scans: facts(...baseBlocks) }), { outputs: jobOutputsFor(baseBlocks.flatMap((b) => b.steps)) });
     out.gate = job([renderGateStep(GATE, entries)], { name: 'gate', if: 'always()', needs: [...entries.map((e) => e.job), 'base-scan'], permissions: GATE_PERM });
     return out;
   }

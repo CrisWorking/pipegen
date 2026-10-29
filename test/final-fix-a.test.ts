@@ -144,7 +144,7 @@ describe('finding 5: a base-scan variant of the renderer and the referee', () =>
     const scrub = renderScrub(baseArt, r0.output?.path as string, 'gitleaks', 'sarif', GATE);
     const up = renderUpload(baseArt, scrubbedPath(r0.output?.path as string), p);
     // the PR's own scan is in the file too: the base job alone would not satisfy a blocking need
-    const doc = wf({ scan: toolSteps(gl).length > 0 ? [...prelude(), ...toolSteps(gl)] : [], 'base-scan': [...renderJobPrelude({ baseRef: 'pull-request-base' }, p).steps, ...r0.steps, scrub, up] });
+    const doc = wf({ scan: toolSteps(gl).length > 0 ? [...prelude(), ...toolSteps(gl)] : [], 'base-scan': [...renderJobPrelude({ baseRef: true }, p).steps, ...r0.steps, scrub, up] });
     const r = await run([doc], draftOf([gl], [needOf('secrets')]));
     expect(showR(r)).toBe('');
   });
