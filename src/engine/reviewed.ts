@@ -1066,7 +1066,8 @@ export function argvPolicyProblems(e: ReviewedEntry, policies: Readonly<Record<s
 }
 
 /**
- * Ruling P29: an action entry's inputs against its policy (tool-flags.ts ACTION_POLICIES, by the exact owner/repo).
+ * Ruling P29: an action entry's inputs against its policy (tool-flags.ts ACTION_POLICIES, by the exact owner/repo[/path]
+ * of its `uses:`, ruling S14: `github/codeql-action/init` has no policy just because `.../upload-sarif` has one).
  * No policy → refused. Every input in step.action.with, fixedInputs.with and choices is listed (exact spelling); a
  * fixed one has the same allowed value in both withs, a chosen one only allowed values; required ones are fixed.
  */
@@ -1075,10 +1076,11 @@ export function actionPolicyProblems(e: ReviewedEntry, policies: Readonly<Record
   const action = e.step.action;
   if (e.candidate.kind !== 'action' && action === undefined) return out;
   const bad = (message: string, ...path: (string | number)[]) => out.push({ message, path });
-  const repo = lower(e.candidate.repo);
+  const at = action?.uses.lastIndexOf('@') ?? -1;
+  const repo = lower(action === undefined ? e.candidate.repo : at < 0 ? action.uses : action.uses.slice(0, at));
   const pol = Object.hasOwn(policies, repo) ? policies[repo] : undefined;
   if (pol === undefined) {
-    bad(`the action ${e.candidate.repo} has no input policy (tool-flags.ts ACTION_POLICIES, by exact owner/repo): pipegen runs no action whose every input wasn't reviewed (default deny, ruling P29)`, 'candidate', 'repo');
+    bad(`the action ${repo} has no input policy (tool-flags.ts ACTION_POLICIES, by exact owner/repo[/path]): pipegen runs no action whose every input wasn't reviewed (default deny, ruling P29, S14)`, ...(action === undefined ? ['candidate', 'repo'] : ['step', 'action', 'uses']));
     return out;
   }
   const stepWith = action?.with ?? {};

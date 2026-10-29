@@ -84,12 +84,18 @@ export interface Candidate {
   source: 'reviewed' | 'discovery' | 'memory'; reviewed: boolean;   // only reviewed tools may block
   stats?: ToolStats; categories: string[];
 }
+/** A candidate that comes from the reviewed list. The only kind a step may carry (B1): a discovery or memory Candidate does not fit. */
+export type ReviewedCandidate = Candidate & { source: 'reviewed'; reviewed: true };
 export type OutputFormat = 'sarif' | 'junit' | 'zap-json' | 'none';   // zap-json is converted by pipegen's parser
 export interface InstallSpec { method: 'npm' | 'pip' | 'github-release' | 'docker'; package: string; version: string; checksum?: string; digest?: string }
 export interface StepSpec {
-  needId: string; tool: Candidate;
+  needId: string; service?: string;   // service: the Service.name the step is for (absent for repo-wide needs)
+  tool: ReviewedCandidate;            // only a reviewed entry's candidate; renderStep checks it equals the entry it is given
+  choices: Record<string, string>;    // the AI's picks among the entry's `choices` (Plan F fills them); a missing one takes the first listed value
+  // action/cli/output are copies of the reviewed template (memory or the AI may send them back): when present they must
+  // deep-equal the template, and nothing renders from them. Rendering uses tool.step + tool.fixedInputs + choices only.
   action?: { uses: string; with: Record<string, string> };
-  cli?: { install: InstallSpec; plugins?: InstallSpec[]; command: string[]; then?: string[][]; env?: Record<string, string> };   // plugins (Plan P Task 5): npm or pip packages installed next to the tool, each an exact version with its checksum; at most 4. then (Task 6, P24): follow-up commands of the same tool. The one rendering rule for choices (review M-R1): a `{name}` word in command/then is replaced by the chosen value of choice `name`, and `name` is the flag it fills with dots as dashes (`--fail-under={fail-under}`, `--coverage.thresholds.lines={coverage-thresholds-lines}`); dedicated tools (trivy, betterleaks, nuclei) instead get `--<choice> <value>` appended; action choices are `with:` inputs
+  cli?: { install: InstallSpec; plugins?: InstallSpec[]; command: string[]; then?: string[][]; env?: Record<string, string> };   // plugins (Plan P Task 5): npm or pip packages installed next to the tool, each an exact version with its checksum; at most 4. then (Task 6, P24): follow-up commands of the same tool. The one rendering rule for choices (review M-R1): a `{name}` word in command/then is replaced by the chosen value of choice `name`, and `name` is the flag it fills with dots as dashes (`--fail-under={fail-under}`, `--coverage.thresholds.lines={coverage-thresholds-lines}`); dedicated tools (trivy, betterleaks, nuclei) instead get `--<choice> <value>` appended, and a bool choice is written `--<choice>=<value>` (review M8: `--ignore-unfixed=true`, never a bare flag that a later word could swallow); action choices are `with:` inputs
   output: { path: string; format: OutputFormat };
   workingDir?: string; needsServices?: DependencyKind[]; secrets?: string[];   // names only, never values
 }
@@ -149,8 +155,8 @@ export interface AiProvider { name: 'claude' | 'openai' | 'ollama'; model: strin
 // Loaded from data/reviewed-tools.yml by Plan B Task 8 (`loadReviewed`). Only these tools ever run in a user's CI.
 export interface ReviewedTool {
   id: string; categories: string[]; languages: (Language | 'any')[];
-  candidate: Candidate;                                    // pinned exactly; reviewed: true
-  step: Omit<StepSpec, 'needId' | 'tool'>;                 // the reviewed step template
+  candidate: ReviewedCandidate;                            // pinned exactly; reviewed: true
+  step: Omit<StepSpec, 'needId' | 'service' | 'tool' | 'choices'>;   // the reviewed step template
   fixedInputs: {                                           // security-relevant inputs, set by the template; the AI can never change them
     with?: Record<string, string>; args?: string[]; env?: Record<string, string>;
     config?: { content: string; passAs: { flag: string } | { input: string } };   // explicit pinned config, so repo config files are never picked up silently

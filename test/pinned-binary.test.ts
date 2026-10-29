@@ -10,7 +10,7 @@ import {
 } from '../src/engine/linters.js';
 import { COOLDOWN_DAYS } from '../src/engine/pin.js';
 import { loadReviewed } from '../src/engine/reviewed.js';
-import type { Candidate, ReviewedTool } from '../src/types.js';
+import type { ReviewedCandidate, ReviewedTool } from '../src/types.js';
 import { fakeFetch, type Routes } from './helpers/fake-http.js';
 import { makeTarGz, type TarEntry } from './helpers/fake-tar.js';
 import { cleanupRepos, makeTempDir } from './helpers/make-repo.js';
@@ -617,7 +617,7 @@ describe('pinned-binaries.yml', () => {
 describe('checkPinnedAgainstReviewed (ruling S25)', () => {
   /** `asset`: the release asset the entry installs (S25 compares the hash to that platform's). */
   const reviewedCli = (repo: string, version: string, checksum?: string, asset?: string): ReviewedTool => {
-    const candidate: Candidate = {
+    const candidate: ReviewedCandidate = {
       id: repo.split('/')[1] ?? repo, name: repo, kind: 'cli', repo, version, pin: checksum === undefined ? {} : { checksum },
       source: 'reviewed', reviewed: true, categories: ['workflow-lint'],
     };

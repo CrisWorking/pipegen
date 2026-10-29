@@ -1,5 +1,7 @@
-// Tool flags pipegen never passes, in one leaf module (no imports) so every rule that checks them uses the same list
+// Tool flags pipegen never passes, in one leaf module (it imports only the import-free types.ts) so every rule that checks them uses the same list
 // (Plan P ruling PS34): the reviewed-list loader (reviewed.ts) and the local secret scan's own argv (Task 7).
+
+import { RESULT_ARTIFACT_PREFIX } from '../types.js';
 
 /**
  * betterleaks flags pipegen never passes (catalogue §3 PC2: no egress, no config from the scanned repo). Taken from
@@ -238,10 +240,11 @@ export const ARGV_POLICIES: Readonly<Record<string, ArgvPolicy>> = Object.freeze
 export interface InputSpec { readonly values: readonly string[]; readonly as: 'fixed' | 'choice' | 'either'; readonly required?: true }
 
 /**
- * Ruling P29: every reviewed action's inputs, by its EXACT `owner/repo` (lowercased). An action whose repo has no
- * policy fails to load (so a renamed or typo fork never gets the reviewed locks' benefit of the doubt); any input not
- * listed is refused (default deny). Inputs the renderer fills per run (an artifact's name and path, a SARIF file, the
- * subject of an attestation) are not template inputs and aren't listed.
+ * Ruling P29: every reviewed action's inputs, by its EXACT `owner/repo[/path]` (lowercased, the `uses:` value without
+ * `@<sha>`; ruling S14, review M-R7). An action whose path has no policy fails to load (so a renamed or typo fork, or
+ * another sub-action of the same repo, never gets the reviewed locks' benefit of the doubt); any input not listed is
+ * refused (default deny). Inputs the renderer fills per run (an artifact's name and path, a SARIF file, the subject of
+ * an attestation) are not template inputs and aren't listed here: they are RENDERER_INPUTS below.
  */
 export const ACTION_POLICIES: Readonly<Record<string, Readonly<Record<string, InputSpec>>>> = Object.freeze({
   'actions/checkout': {
@@ -251,7 +254,7 @@ export const ACTION_POLICIES: Readonly<Record<string, Readonly<Record<string, In
   },
   'actions/setup-node': {
     'package-manager-cache': { values: ['false'], as: 'fixed', required: true },
-    'node-version': { values: ['24', '26'], as: 'choice' },
+    'node-version': { values: ['22', '24', '26'], as: 'choice' },   // 22 (maintenance until 2027-04-30), 24, 26; the renderer maps the repo's own version onto these (render-step.ts mapNodeVersion)
   },
   'actions/setup-python': { 'python-version': { values: ['3.11', '3.12', '3.13', '3.14'], as: 'choice' } },
   // hidden files (.env and the like) are never uploaded; a missing file is an error. `path` is set by the renderer
@@ -267,7 +270,7 @@ export const ACTION_POLICIES: Readonly<Record<string, Readonly<Record<string, In
     context: { values: ['.'], as: 'fixed', required: true }, 'github-token': { values: [''], as: 'fixed', required: true },
     'no-cache': { values: ['true'], as: 'fixed', required: true }, push: { values: ['false', 'true'], as: 'choice' },
   },
-  'github/codeql-action': {},
+  'github/codeql-action/upload-sarif': {},
   'actions/attest': {},
   'bullfrogsec/bullfrog': {
     'egress-policy': { values: ['block'], as: 'fixed', required: true },
@@ -299,3 +302,52 @@ export const ACTION_POLICIES: Readonly<Record<string, Readonly<Record<string, In
     verbose: { values: ['true', 'false'], as: 'fixed' },
   },
 } satisfies Record<string, Record<string, InputSpec>>);
+
+// ---------- inputs the renderer fills (ruling S15) ----------
+
+/** One input the renderer (never a template, never the AI) fills at render time, with the check its value must pass. */
+export interface RendererInput { readonly describe: string; readonly check: (v: string) => boolean }
+
+const rx = (re: RegExp, describe: string): RendererInput => ({ describe, check: (v) => re.test(v) });
+const RUNNER_TEMP_PATH = rx(/^\$\{\{ runner\.temp \}\}\/pipegen-out\/[a-z0-9][a-z0-9-]{0,120}(?:\/[A-Za-z0-9_][A-Za-z0-9._-]{0,100}){0,3}$/, 'a path under ${{ runner.temp }}/pipegen-out/<artifact>');
+const ARTIFACT_NAME = rx(new RegExp(`^${RESULT_ARTIFACT_PREFIX}[a-z0-9][a-z0-9-]{0,120}$`), `a result artifact name (${RESULT_ARTIFACT_PREFIX}…)`);
+
+/**
+ * Ruling S15: the inputs the renderer sets on a platform action, by the same `owner/repo[/path]` key as ACTION_POLICIES,
+ * each with a checker. The renderer refuses any other input it is asked to set, and the referee's template check
+ * accepts only these beyond the reviewed template. No name here is also a template input.
+ * - upload/download-artifact: the result's name (resultArtifactName) and its place under runner.temp (ruling S7);
+ * - upload-sarif: the scrubbed SARIF file and the code-scanning category;
+ * - attest: the image and its digest; build-push: the Dockerfile (Service.dockerfile) and the one image tag;
+ * - docker login: the actor and the workflow token, nothing else.
+ */
+export const RENDERER_INPUTS: Readonly<Record<string, Readonly<Record<string, RendererInput>>>> = Object.freeze({
+  'actions/upload-artifact': { name: ARTIFACT_NAME, path: RUNNER_TEMP_PATH },
+  'actions/download-artifact': { name: ARTIFACT_NAME, path: RUNNER_TEMP_PATH },
+  'github/codeql-action/upload-sarif': { sarif_file: RUNNER_TEMP_PATH, category: rx(/^pipegen-[a-z0-9][a-z0-9-]{0,100}$/, 'a category starting pipegen-') },
+  'actions/attest': {
+    'subject-name': rx(/^(?:ghcr\.io|docker\.io)\/[a-z0-9][a-z0-9._/-]{0,200}$/, 'an image name on ghcr.io or docker.io, with no tag'),
+    'subject-digest': rx(/^sha256:[0-9a-f]{64}$/, 'a sha256 digest'),
+  },
+  'docker/build-push-action': {
+    file: rx(/^(?![-/])(?!.*(?:^|\/)\.\.(?:\/|$))[A-Za-z0-9._/-]{1,200}$/, 'a repo-relative file path'),
+    tags: rx(/^[a-z0-9][a-z0-9._/-]{0,200}:[A-Za-z0-9_][A-Za-z0-9._-]{0,127}$/, 'one image reference with a tag'),
+  },
+  'docker/login-action': {
+    username: rx(/^\$\{\{ github\.actor \}\}$/, '${{ github.actor }}'),
+    password: rx(/^\$\{\{ secrets\.GITHUB_TOKEN \}\}$/, '${{ secrets.GITHUB_TOKEN }}'),
+  },
+} satisfies Record<string, Record<string, RendererInput>>);
+
+/** Plain-English problems with renderer-filled inputs for an action (its `uses` path without `@sha`, any letter case). */
+export function rendererInputProblems(usesPath: string, inputs: Readonly<Record<string, string>>): string[] {
+  const key = usesPath.toLowerCase();
+  const table = Object.hasOwn(RENDERER_INPUTS, key) ? RENDERER_INPUTS[key] : undefined;
+  const out: string[] = [];
+  for (const [name, value] of Object.entries(inputs)) {
+    const spec = table !== undefined && Object.hasOwn(table, name) ? table[name] : undefined;
+    if (spec === undefined) out.push(`${usesPath} takes no renderer-filled input ${JSON.stringify(name.slice(0, 40))}${table === undefined ? '' : ` (only ${Object.keys(table).join(', ')})`}`);
+    else if (typeof value !== 'string' || !spec.check(value)) out.push(`${usesPath} input ${name} must be ${spec.describe}`);
+  }
+  return out;
+}

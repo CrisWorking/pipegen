@@ -71,7 +71,7 @@ tools:
     reviewedAt: "2026-10-28"
     proofs: 0
 
-  # Installs Node.js. Its automatic package-manager cache is off (pipegen uses no caches, spec §19). Node 24 and 26 only (DECISIONS #92).
+  # Installs Node.js. Its automatic package-manager cache is off (pipegen uses no caches, spec §19). Node 22 (maintenance until 2027-04-30), 24 and 26 only (DECISIONS #92, widened 2026-10-29).
   # Source: git ref refs/tags/v7.1.0 of actions/setup-node (GitHub API), release published_at. Released 2026-10-08T02:52:34Z.
   - id: actions-setup-node
     categories: ["platform"]
@@ -97,10 +97,10 @@ tools:
       with:
         package-manager-cache: "false"
     choices:
-      node-version: ["24", "26"]
+      node-version: ["22", "24", "26"]
     configFiles: []
-    reviewedBy: Cristiano
-    reviewedAt: "2026-10-28"
+    reviewedBy: Claude delegated DECISIONS 105
+    reviewedAt: "2026-10-29"
     proofs: 0
 
   # Installs Python. No cache input is set or offered (pipegen uses no caches, spec §19).

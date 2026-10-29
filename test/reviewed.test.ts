@@ -336,6 +336,13 @@ describe('loadReviewed', () => {
     sub.step.action.with = {};
     sub.choices = {};
     expect(load([sub])).toHaveLength(1);
+    // ... but only the sub-path that has a policy: init can't stand in for upload-sarif (ruling S14, M-R7)
+    const init = actionEntry({ id: 'codeql-upload-sarif', repo: 'github/codeql-action' });
+    init.step.action.uses = `github/codeql-action/init@${SHA}`;
+    init.fixedInputs = {};
+    init.step.action.with = {};
+    init.choices = {};
+    rejects([init], /no input policy/);
     // install hash: absent (the candidate pin is the one source) or equal to the pin
     const same = cliEntry();
     same.step.cli.install.checksum = SUM;
@@ -1619,14 +1626,19 @@ describe('data/reviewed-tools.yml', () => {
     const list = real();
     for (const id of Object.keys(CATALOGUE)) {
       const t = byId(list, id)[0];
+      if (id === 'actions-setup-node') continue; // widened on 2026-10-29 and re-reviewed by delegation (next test)
       expect(t?.reviewedBy, id).toBe('Cristiano');
       expect(t?.reviewedAt, id).toBe('2026-10-28');
       expect(t?.proofs, id).toBe(0);
     }
   });
 
-  it('data: setup-node offers exactly 24 and 26 (DECISIONS #92)', () => {
-    expect(byId(real(), 'actions-setup-node')[0]?.choices['node-version']).toEqual(['24', '26']);
+  it('data: setup-node offers exactly 22, 24 and 26 (DECISIONS #92, widened to include 22 on 2026-10-29), reviewed by delegation', () => {
+    const t = byId(real(), 'actions-setup-node')[0];
+    expect(t?.choices['node-version']).toEqual(['22', '24', '26']);
+    expect(ACTION_POLICIES['actions/setup-node']?.['node-version']?.values).toEqual(['22', '24', '26']);
+    expect(t?.reviewedBy).toBe('Claude delegated DECISIONS 105');
+    expect(t?.reviewedAt).toBe('2026-10-29');
   });
 
   it('data: every trivy entry carries the three flags and a verifiedWith; no entry uses a never-list repo', () => {

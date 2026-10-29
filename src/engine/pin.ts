@@ -81,8 +81,12 @@ export class PinMovedWarning {
   }
 }
 
-/** No 'cache': pipegen uses no caches (spec §19). */
-export type PlatformActions = Record<'checkout' | 'setup-node' | 'setup-python' | 'upload-artifact' | 'download-artifact' | 'docker-login' | 'setup-buildx' | 'build-push' | 'upload-sarif' | 'attest', Candidate>;
+/**
+ * No 'cache': pipegen uses no caches (spec §19). Whole reviewed entries (ruling B2), not bare candidates: the renderer
+ * needs the `uses:` sub-path (`github/codeql-action/upload-sarif`) and the fixed inputs (`persist-credentials`,
+ * `include-hidden-files`, …) that only the entry holds.
+ */
+export type PlatformActions = Record<'checkout' | 'setup-node' | 'setup-python' | 'upload-artifact' | 'download-artifact' | 'docker-login' | 'setup-buildx' | 'build-push' | 'upload-sarif' | 'attest', ReviewedTool>;
 
 /** PlatformActions key → ReviewedTool.id (the ids are set by Plan B Task 8's reviewed list). */
 export const PLATFORM_ACTION_IDS: Record<keyof PlatformActions, string> = {
@@ -575,7 +579,8 @@ function parseImage(ref: unknown): ImageRef {
 
 /**
  * The platform actions from the REVIEWED list, found by PLATFORM_ACTION_IDS. Each stored pin is re-verified
- * against its tag: a moved tag raises a PinMovedWarning and the stored SHA is kept.
+ * against its tag: a moved tag raises a PinMovedWarning and the stored SHA is kept. Each result is the reviewed entry
+ * with its `candidate` replaced by the re-verified one (a copy; the input list is not edited).
  */
 export async function platformActions(reviewed: ReviewedTool[], deps: PinDeps): Promise<PlatformActions> {
   const out: Partial<PlatformActions> = {};
@@ -586,7 +591,9 @@ export async function platformActions(reviewed: ReviewedTool[], deps: PinDeps): 
     if (c.kind !== 'action' || c.source !== 'reviewed' || c.reviewed !== true || c.pin.sha === undefined) {
       throw new PinError(`The reviewed entry ${id} isn't a reviewed action with a pinned commit.`);
     }
-    out[key] = await resolvePin(c, deps);
+    const verified = await resolvePin(c, deps);
+    if (verified.source !== 'reviewed' || verified.reviewed !== true) throw new PinError(`The reviewed entry ${id} lost its reviewed mark while its pin was verified.`);
+    out[key] = { ...(matches[0] as ReviewedTool), candidate: { ...verified, source: 'reviewed', reviewed: true } };
   }
   return out as PlatformActions;
 }
