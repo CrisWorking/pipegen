@@ -3459,3 +3459,46 @@ describe('coverage: prek and pre-commit read SKIP / PREK_SKIP by hook, and prek 
     expect(bad.every((x) => x.startsWith('unknown')), bad.join()).toBe(true);
   });
 });
+
+describe('coverage: Dockerfile ENV / ARG and a compose service\'s environment go through the env rules (P57 C5)', () => {
+  const app = svc('.', { language: 'python', packageManager: 'uv', scripts: ['start'], frameworks: ['fastapi'] });
+  const st = async (dockerfile: string, steps = run('docker build .'), files: Record<string, string> = {}) => {
+    const dir = makeTempDir();
+    for (const [rel, text] of Object.entries({ Dockerfile: dockerfile, 'tox.ini': '[tox]\nenv_list = py, lint\n', ...files })) writeIn(dir, rel, text);
+    ci(dir, steps);
+    const r = row(await coverage(dir, { services: [app] }), 'push', 'unit-tests', 'app');
+    return `${r.status}${r.by === undefined ? '' : ` ${r.by}`}`;
+  };
+  const HEAD = 'FROM python:3.14\nWORKDIR /app\nCOPY . /app\n';
+
+  it('py probe: ENV TOXENV before RUN tox picks the envs, so the run is partial (as RUN TOXENV=lint tox already was)', async () => {
+    expect(await st(`${HEAD}ENV TOXENV=lint\nRUN tox\n`)).toBe('partial your own `tox`');
+    expect(await st(`${HEAD}ENV TOXENV lint\nRUN tox\n`)).toBe('partial your own `tox`');
+    expect(await st(`${HEAD}ENV A=1 TOX_ENV=lint\nRUN tox\n`)).toBe('partial your own `tox`');
+    expect(await st(`${HEAD}RUN TOXENV=lint tox\n`)).toBe('partial your own `tox`'); // control
+    // inherited from the stage FROM names
+    expect(await st('FROM python:3.14 AS base\nENV TOXENV=lint\nFROM base\nWORKDIR /app\nCOPY . /app\nRUN tox\n')).toBe('partial your own `tox`');
+    // an ENV after the RUN doesn't reach it
+    expect(await st(`${HEAD}RUN tox\nENV TOXENV=lint\n`)).toBe('covered your own `tox`');
+  });
+
+  it('ARG (with a build-arg from the CI step or not) counts like ENV', async () => {
+    expect(await st(`${HEAD}ARG TOXENV\nRUN tox\n`, run('docker build --build-arg TOXENV=lint .'))).toBe('partial your own `tox`');
+    expect(await st(`${HEAD}ARG NOXSESSION=lint\nRUN nox\n`)).toBe('partial your own `nox`');
+  });
+
+  it('PYTEST_ADDOPTS (it can add --collect-only or -k) makes a pytest run partial, in a Dockerfile and in a workflow alike', async () => {
+    expect(await st(`${HEAD}ENV PYTEST_ADDOPTS="--co"\nRUN pytest\n`)).toBe('partial your own `pytest`');
+    expect(await st(HEAD, '      - run: pytest\n        env:\n          PYTEST_ADDOPTS: --co\n')).toBe('partial your own `pytest`');
+    expect(await st(`${HEAD}RUN pytest\n`)).toBe('covered your own `pytest`'); // control
+  });
+
+  it('compose run: the service\'s environment: and its image\'s ENV reach the command', async () => {
+    const compose = (env: string) => `services:\n  web:\n    build: .\n${env}`;
+    const steps = run('docker compose run --rm web tox');
+    expect(await st(HEAD, steps, { 'compose.yml': compose('    environment:\n      TOXENV: lint\n') })).toBe('partial your own `tox`');
+    expect(await st(HEAD, steps, { 'compose.yml': compose('    environment:\n      - TOXENV=lint\n') })).toBe('partial your own `tox`');
+    expect(await st(`${HEAD}ENV TOXENV=lint\n`, steps, { 'compose.yml': compose('') })).toBe('partial your own `tox`');
+    expect(await st(HEAD, steps, { 'compose.yml': compose('') })).toBe('covered your own `tox`'); // control
+  });
+});

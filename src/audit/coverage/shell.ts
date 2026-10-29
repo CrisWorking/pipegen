@@ -581,15 +581,16 @@ export function scanShell(text: string, base: string | null, sigs: Compiled, bud
     let envGate: Found['envGate'];
     const a = word(k + 1);
     const b = word(k + 2);
-    if (name === 'pytest') words = args.some((x) => PYTEST_NO_RUN.has(x)) ? null : ['pytest'];
-    else if ((name === 'python' || name === 'python3') && a === '-m' && b === 'pytest') words = args.some((x) => PYTEST_NO_RUN.has(x)) ? null : [name, '-m', 'pytest'];
+    // P57 (C5): PYTEST_ADDOPTS in the env adds flags pipegen can't see (envGate)
+    if (name === 'pytest') [words, envGate] = [args.some((x) => PYTEST_NO_RUN.has(x)) ? null : ['pytest'], 'pytest'];
+    else if ((name === 'python' || name === 'python3') && a === '-m' && b === 'pytest') [words, envGate] = [args.some((x) => PYTEST_NO_RUN.has(x)) ? null : [name, '-m', 'pytest'], 'pytest'];
     else if (name === 'coverage' && a === 'run') {
       // DoD run (fastapi): `coverage run [flags] -m pytest` runs pytest and exits with its code (coverage.py docs,
       // https://coverage.readthedocs.io/en/latest/cmd.html#execution-coverage-run). Only `--flag[=value]` / `-x` words
       // before `-m`: a flag whose value is the next word stops it (pipegen doesn't read coverage's flag list).
       const m = args.indexOf('-m');
       if (m >= 1 && args[m + 1] === 'pytest' && args.slice(1, m).every((x) => /^-[A-Za-z]$|^--[a-z][a-z-]*(?:=\S*)?$/.test(x))) {
-        words = args.some((x) => PYTEST_NO_RUN.has(x)) ? null : ['coverage', 'run', '-m', 'pytest'];
+        [words, envGate] = [args.some((x) => PYTEST_NO_RUN.has(x)) ? null : ['coverage', 'run', '-m', 'pytest'], 'pytest'];
       }
     } else if (name === 'npm' && a !== null && NPM_TEST.has(a) && scriptFlagsOk(k + 1)) [words, byName] = [['npm', a], 'test'];
     else if (PACKAGE_MANAGERS.includes(name) && a !== null && (a === 'run' || (name === 'npm' && NPM_RUN.has(a))) && b !== null && ownName(b)

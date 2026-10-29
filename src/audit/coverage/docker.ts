@@ -35,7 +35,7 @@ type Resolve = (ctx: Ctx, found: Found[]) => Promise<Found[]>;
 
 // ---------- compose files ----------
 
-interface ComposeService { context: string | null; file: string | null; target: string | null; hasBuild: boolean; profiles: readonly string[] }
+interface ComposeService { context: string | null; file: string | null; target: string | null; hasBuild: boolean; profiles: readonly string[]; environment: DockerEnv }
 /** The services, or: no compose file ('missing'), one pipegen couldn't read ('unreadable'), or a set it can't be sure of (`why`, P57 C3). */
 export type ComposeModel = ReadonlyMap<string, ComposeService> | 'unreadable' | 'missing' | { why: string };
 /** P57 (C3): the variables that pick other compose files or services (https://docs.docker.com/compose/how-tos/environment-variables/envvars/). */
@@ -119,9 +119,11 @@ async function composeModel(ctx: Ctx, files: readonly string[] | null, cwd: stri
         // a later file's profiles replace an earlier one's; a value pipegen can't read leaves the set unknown
         const profiles = !('profiles' in svc) ? (prev?.profiles ?? []) : Array.isArray(svc.profiles) && svc.profiles.every((x) => typeof x === 'string') ? svc.profiles as string[] : null;
         if (profiles === null) return { why: `a compose service (${name}) whose profiles pipegen can't read` };
+        // P57 (C5): the service's environment (a map or a list of NAME=value) reaches what runs in it; a later file's adds to it
+        const environment = { ...(prev?.environment ?? {}), ...composeEnvironment(svc.environment), ...(svc.env_file === undefined ? {} : { '\u0000env_file': '$' }) };
         if (!('build' in svc) || svc.build === null || svc.build === undefined) {
-          if (prev === undefined) out.set(name, { context: null, file: null, target: null, hasBuild: false, profiles });
-          else out.set(name, { ...prev, profiles });
+          if (prev === undefined) out.set(name, { context: null, file: null, target: null, hasBuild: false, profiles, environment });
+          else out.set(name, { ...prev, profiles, environment });
           continue;
         }
         const b = typeof svc.build === 'string' ? { context: svc.build } : asObj(svc.build);
@@ -133,13 +135,27 @@ async function composeModel(ctx: Ctx, files: readonly string[] | null, cwd: stri
           : dockerfile === undefined ? (typeof b.context === 'string' || prev?.file === null || prev === undefined ? resolveDir(folder, 'Dockerfile') : prev.file)
             : /[$\\]|^\//.test(dockerfile) ? null : resolveDir(folder, dockerfile);
         const target = typeof b.target === 'string' ? (/^[A-Za-z0-9_.-]{1,64}$/.test(b.target) ? b.target : '?') : (prev?.target ?? null);
-        out.set(name, { context: folder, file, target, hasBuild: true, profiles });
+        out.set(name, { context: folder, file, target, hasBuild: true, profiles, environment });
       }
     }
     return out;
   })();
   ctx.composeMemo.set(key, model);
   return model;
+}
+
+/** P57 (C5): a compose `environment:` (a map, or a list of NAME=value / NAME) as names and values ('$' when not a plain literal). */
+function composeEnvironment(v: unknown): Record<string, string> {
+  const out: Record<string, string> = {};
+  const literal = (x: unknown) => (typeof x === 'string' && /^[A-Za-z0-9_.,:\/ -]*$/.test(x) ? x : typeof x === 'number' || typeof x === 'boolean' ? String(x) : '$');
+  if (Array.isArray(v)) {
+    for (const e of v.slice(0, MAX_COMPOSE_SERVICES)) {
+      if (typeof e !== 'string') continue;
+      const eq = e.indexOf('=');
+      out[eq < 0 ? e : e.slice(0, eq)] = eq < 0 ? '$' : literal(e.slice(eq + 1));
+    }
+  } else for (const [k, x] of Object.entries(asObj(v)).slice(0, MAX_COMPOSE_SERVICES)) out[k] = x === null ? '$' : literal(x);
+  return out;
 }
 
 /** A compose build context word as a repo folder: not a URL, an absolute path or a variable. */
@@ -168,6 +184,7 @@ export async function placeComposeRun(ctx: Ctx, f: Found): Promise<Found | null>
   }
   // the command runs in the image's last WORKDIR (the folder COPY put there): the host folder it maps to, else the build folder
   let dir = svc.context;
+  let imageEnv: DockerEnv = {};
   if (svc.file !== null && svc.target !== '?') {
     const d = await loadDockerfile(ctx, svc.file, svc.context);
     if ('parsed' in d && 'stages' in d.parsed) {
@@ -175,18 +192,43 @@ export async function placeComposeRun(ctx: Ctx, f: Found): Promise<Found | null>
       const last = needed === null ? null : Math.max(...needed);
       const end = last === null ? null : d.parsed.stages[last]?.endDir ?? null;
       if (end !== null) dir = end;
+      if (last !== null) imageEnv = d.parsed.stages[last]?.endEnv ?? {};
     }
   }
   const { composeRun: _placed, ...rest } = f;
   void _placed;
-  return { ...rest, dir, compose: true };
+  // P57 (C5): the image's ENV and the service's environment: reach the command like a step's env:
+  const [placed] = gated([{ ...rest, dir, compose: true }], gateOf([], [{ ...imageEnv, ...svc.environment }], undefined, ctx.sigs.softEnv, ctx.sigs.configFiles));
+  return placed ?? null;
 }
 
 // ---------- Dockerfiles ----------
 
-export interface Run { text: string; dir: string | null }
-export interface Stage { name: string | null; needs: string[]; runs: Run[]; endDir: string | null }
+/** P57 (C5): the ENV and ARG names a RUN sees (inherited through FROM), with their literal value ('$' when pipegen can't read it). */
+export type DockerEnv = Readonly<Record<string, string>>;
+export interface Run { text: string; dir: string | null; env: DockerEnv }
+export interface Stage { name: string | null; needs: string[]; runs: Run[]; endDir: string | null; endEnv: DockerEnv }
 export type Parsed = { stages: Stage[] } | { unreadable: string };
+
+/**
+ * P57 (C5): the names an ENV or ARG line sets, with their value when it is a plain literal ('$' otherwise): `ENV K=v K2="v"`,
+ * the old `ENV K v`, `ARG K[=default] …` (an ARG without a default takes its value from a --build-arg, so '$').
+ */
+function envWords(op: 'ENV' | 'ARG', rest: string): Record<string, string> {
+  const out: Record<string, string> = {};
+  const plain = (v: string) => (/^"[A-Za-z0-9_.,:\/ -]*"$|^'[A-Za-z0-9_.,:\/ -]*'$/.test(v) ? v.slice(1, -1) : /^[A-Za-z0-9_.,:\/-]*$/.test(v) ? v : '$');
+  const t = rest.trim();
+  if (op === 'ENV' && !/^[A-Za-z_][A-Za-z0-9_]*=/.test(t)) {
+    const m = /^([A-Za-z_][A-Za-z0-9_]*)\s+(.*)$/.exec(t);
+    if (m !== null) out[m[1] as string] = plain((m[2] as string).trim());
+    return out;
+  }
+  for (const m of t.matchAll(/(?:^|\s)([A-Za-z_][A-Za-z0-9_]*)(?:=("[^"]*"|'[^']*'|\S*))?/g)) {
+    const name = m[1] as string;
+    out[name] = m[2] === undefined ? (op === 'ARG' ? '$' : '') : plain(m[2]);
+  }
+  return out;
+}
 
 /** The words of a COPY/ADD or FROM line, past its `--flag` words, as [flags, words]. */
 function wordsOf(rest: string): { flags: string[]; words: string[] } {
@@ -218,10 +260,10 @@ async function parseDockerfile(ctx: Ctx, text: string, context: string): Promise
   }
   const stages: Stage[] = [];
   const names = new Map<string, number>();
-  interface State { workdir: string | null; maps: { dest: string; host: string }[] }
+  interface State { workdir: string | null; maps: { dest: string; host: string }[]; env: Record<string, string> }
   const states: State[] = [];
   let cur: Stage | null = null;
-  let state: State = { workdir: '/', maps: [] };
+  let state: State = { workdir: '/', maps: [], env: {} };
   let runs = 0;
   const refOf = (ref: string): number | null => {
     const lower = ref.toLowerCase();
@@ -248,8 +290,8 @@ async function parseDockerfile(ctx: Ctx, text: string, context: string): Promise
       const asAt = words.findIndex((w) => w.toLowerCase() === 'as');
       const name = asAt >= 0 && /^[A-Za-z0-9_.-]{1,64}$/.test(words[asAt + 1] ?? '') ? (words[asAt + 1] as string) : null;
       const parent = /\$/.test(words[0] ?? '') ? null : refOf(words[0] ?? '');
-      cur = { name, needs: parent === null ? [] : [String(parent)], runs: [], endDir: null };
-      state = parent === null ? { workdir: '/', maps: [] } : { workdir: states[parent]!.workdir, maps: [...states[parent]!.maps] };
+      cur = { name, needs: parent === null ? [] : [String(parent)], runs: [], endDir: null, endEnv: {} };
+      state = parent === null ? { workdir: '/', maps: [], env: {} } : { workdir: states[parent]!.workdir, maps: [...states[parent]!.maps], env: { ...states[parent]!.env } };
       if (name !== null) names.set(name.toLowerCase(), stages.length);
       stages.push(cur);
       states.push(state);
@@ -257,6 +299,11 @@ async function parseDockerfile(ctx: Ctx, text: string, context: string): Promise
     }
     if (cur === null) continue; // ARG before the first FROM
     if (op === 'SHELL') return { unreadable: 'it changes the shell RUN uses' };
+    // P57 (C5): ENV and ARG set variables every later RUN of the stage (and of the stages built FROM it) sees
+    if (op === 'ENV' || op === 'ARG') {
+      for (const [k, v] of Object.entries(envWords(op, rest))) state.env[k] = v;
+      continue;
+    }
     if (op === 'WORKDIR') {
       state.workdir = abs(rest.replace(/^["']|["']$/g, '').trim());
       continue;
@@ -297,10 +344,13 @@ async function parseDockerfile(ctx: Ctx, text: string, context: string): Promise
         if (at !== null && !cur.needs.includes(String(at))) cur.needs.push(String(at));
       }
       const text = runText(leadingFlags(rest).rest);
-      if (text !== null) cur.runs.push({ text, dir: hostOf(state.workdir) });
+      if (text !== null) cur.runs.push({ text, dir: hostOf(state.workdir), env: { ...state.env } });
     }
   }
-  for (const [i, stage] of stages.entries()) stage.endDir = hostOf(states[i]!.workdir, states[i]!);
+  for (const [i, stage] of stages.entries()) {
+    stage.endDir = hostOf(states[i]!.workdir, states[i]!);
+    stage.endEnv = { ...states[i]!.env };
+  }
   return { stages };
 }
 
@@ -389,7 +439,8 @@ async function dockerfileRuns(ctx: Ctx, b: DockerBuild, f: Found, outer: Reason 
                 }
                 continue;
               }
-              const inner = gated(await resolve(ctx, scanned), gateOf([run.text], [], undefined, ctx.sigs.softEnv, ctx.sigs.configFiles));
+              // P57 (C5): the ENV and ARG values the RUN sees count like a step's env:
+              const inner = gated(await resolve(ctx, scanned), gateOf([run.text], [run.env], undefined, ctx.sigs.softEnv, ctx.sigs.configFiles));
               for (const g of inner) {
                 const categories = g.categories.filter((x) => SCRIPT_CATEGORIES.has(x.startsWith(UNKNOWN_PREFIX) ? x.slice(UNKNOWN_PREFIX.length) : x));
                 if (categories.length === 0) continue;

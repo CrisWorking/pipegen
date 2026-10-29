@@ -65,7 +65,7 @@ export interface Found {
    * Task 5: a tox or nox run; an environment variable that picks other envs or sessions (TOX*, NOX*) drops it. 'npm':
    * an npm publish, which NPM_CONFIG_DRY_RUN turns into a dry run (fix round 1, M1).
    */
-  envGate?: 'tox' | 'nox' | 'npm';
+  envGate?: 'tox' | 'nox' | 'npm' | 'pytest';
   /** Fix round 1 (U23): a script counted by name (test, lint[:x]); its text, when readable, can only lower it. */
   byName?: string;
   /**
