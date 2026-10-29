@@ -543,7 +543,8 @@ describe('mapCoverage (fix round 1)', () => {
     expect(await st('uv run pytest', 'unit-tests')).toBe('covered');
     expect(await st('pipx run pip-audit', 'deps')).toBe('covered');
     expect(await st('python -m semgrep ci', 'sast')).toBe('covered');
-    expect(await st('echo start && gitleaks detect')).toBe('partial'); // P53: only cd, pushd, export, set and source keep an && chain unconditional
+    expect(await st('echo start && gitleaks detect')).toBe('covered'); // P54: the last && chain carries the step's status
+    expect(await st('echo start && gitleaks detect; echo done')).toBe('partial'); // P53: not last, echo isn't on the && allowlist
     expect(await st('result=$(gitleaks detect)')).toBe('covered');
     expect(await st('docker run --rm -v "$GITHUB_WORKSPACE:/repo" zricethezav/gitleaks:v8.18.0 detect --source /repo')).toBe('covered');
     expect(await st('docker run --rm -v "$GITHUB_WORKSPACE:/src" aquasec/trivy:0.50.0 fs /src', 'deps')).toBe('partial'); // no --exit-code
@@ -1339,7 +1340,8 @@ describe('mapCoverage (Task 5 fix round 1)', () => {
       ['npm run test:x', { 'test:x': '' }, 'missing'],
       ['npm run test:x', { 'test:x': 'jest || true' }, 'partial'],
       ['npm test', { test: 'jest || true' }, 'partial'],
-      ['npm test', { test: 'eslint . && jest --passWithNoTests' }, 'partial'], // P53: eslint isn't on the && allowlist
+      ['npm test', { test: 'eslint . && jest --passWithNoTests' }, 'covered'], // P54: the script's last && chain
+      ['npm test', { test: 'eslint . && jest --passWithNoTests; echo ok' }, 'partial'], // P53: not last
       ['pnpm test', { test: 'vitest run; echo done' }, 'partial'],
       ['npm test', { test: 'node test.js' }, 'covered'], // an unknown runner keeps its by-name count (left-pad)
       ['npm test', { test: 'tape test/*.js' }, 'covered'],
@@ -1431,7 +1433,7 @@ describe('mapCoverage (Task 5 fix round 2)', () => {
       // stays counted by name
       ['npm test', { test: 'node script.js' }, 'covered'],
       ['npm test', { test: 'jest && echo done' }, 'covered'],
-      ['npm test', { test: 'npm run a && jest', a: 'echo ok' }, 'partial'], // P53: `npm run a` isn't on the && allowlist
+      ['npm test', { test: 'npm run a && jest', a: 'echo ok' }, 'covered'], // P54: the script's last && chain
       ['npm test', { test: 'npm run a', a: 'tape test.js' }, 'covered'],
       ['npm test', { test: 'test -f x || exit 0; node t.js' }, 'partial'], // P53: after a conditional exit
     ] as [string, Record<string, string>, string][]) {
@@ -1463,7 +1465,7 @@ describe('mapCoverage (Task 5 fix round 2)', () => {
 
   it('dead code in CI text too: right of `true ||` / `false &&` never runs', async () => {
     for (const [cmd, status] of [['true || jest', 'missing'], ['false && jest', 'missing'], ['echo x || (jest)', 'missing'], ['true || jest || exit 1', 'missing'],
-      ['true && jest', 'partial'], ['false || jest', 'partial'], ['true || jest; jest', 'covered']]) { // P53: && allowlist, right of ||
+      ['true && jest', 'covered'], ['false || jest', 'partial'], ['true || jest; jest', 'covered']]) { // P54: last && chain; P53: right of ||
       const dir = makeTempDir();
       wf(dir, 'ci.yml', PR(run(cmd as string)));
       expect(row(await coverage(dir), 'merge', 'unit-tests', 'app').status, cmd).toBe(status);
@@ -2823,7 +2825,7 @@ describe('coverage: conditions inside a followed script (P51)', () => {
       'set -e\nif [ "$1" = ci ]; then\n  pytest\nfi\n',
       'set -e\ncase "$1" in\n  ci) pytest ;;\nesac\n',
       'set -e\nwhile false; do pytest; done\n',
-      'set -e\n[ -n "$CI" ] && pytest\n',
+      'set -e\n[ -n "$CI" ] && pytest\necho done\n', // P54: not the last command
       'set -e\ntest -z "$SKIP" || pytest\n',
       'set -e\n[ -n "$CI" ] && exit 0\npytest\n',
       'set -e\nif [ -n "$CI" ]; then exit 0; fi\npytest\n',
@@ -2855,7 +2857,7 @@ describe('coverage: followed scripts and shells, allowlists (P52)', () => {
 
   it('(a) a test on an &&/|| chain is unconditional only after cd, pushd, export X=…, a literal allowlisted set, or source of a repo script', async () => {
     for (const s of ['command -v pytest >/dev/null && pytest', 'grep -q run ci.txt && pytest', 'make deps && pytest', 'true && pytest', 'f() { :; }\nf && pytest', '( cd . ) || pytest']) {
-      const r = await st(`set -e\n${s}\n`);
+      const r = await st(`set -e\n${s}\necho done\n`); // P54: not the script's last command
       expect(r.status, s).toBe('partial');
       expect(r.why, s).toBe(COND);
     }
@@ -2932,7 +2934,7 @@ describe('coverage: one condition analyzer for scripts, steps and package script
   });
 
   it('(2) workflow run: blocks follow the same rules; the old step rules still work', async () => {
-    for (const s of ['[ -f pyproject.toml ] && pytest', 'command -v pytest && pytest', 'if [ -n "$RUN" ]; then pytest; fi', '[ -n "$CI" ] && exit 0\npytest', 'for t in $TESTS; do pytest "$t"; done']) {
+    for (const s of ['[ -f pyproject.toml ] && pytest\necho done', 'command -v pytest && pytest\necho done', 'if [ -n "$RUN" ]; then pytest; fi', '[ -n "$CI" ] && exit 0\npytest', 'for t in $TESTS; do pytest "$t"; done']) {
       const r = await step(s);
       expect(r.status, s).toBe('partial');
       expect(r.why, s).toMatch(/only under a condition in its shell code/);
@@ -2944,7 +2946,7 @@ describe('coverage: one condition analyzer for scripts, steps and package script
 
   it('(2) package.json script strings follow the same rules', async () => {
     const pkg = (test: string) => ({ 'package.json': JSON.stringify({ name: 'app', scripts: { test } }) });
-    const r = await step('npm test', pkg('command -v jest && jest'));
+    const r = await step('npm test', pkg('command -v jest || exit 0; jest')); // after a conditional exit (P54: not a last && chain)
     expect(r.status).toBe('partial');
     expect(r.why).toMatch(/only under a condition/);
     expect((await step('npm test', pkg('cd . && jest'))).status).toBe('covered');
@@ -2954,5 +2956,40 @@ describe('coverage: one condition analyzer for scripts, steps and package script
   it('(3) what the audit can\'t see names the shell tricks it doesn\'t model', async () => {
     const { CANT_SEE } = await import('../src/audit/render.js');
     expect(CANT_SEE.some((l) => /trap … EXIT/.test(l) && /alias/.test(l) && /function named like the test tool/.test(l))).toBe(true);
+  });
+});
+
+// Ruling P54: an && chain whose exit status is the final status of the step, package script or followed script (its
+// last command, no `||`, nothing conditional before it) is unconditional: an earlier failure fails the run visibly.
+describe('coverage: the last && chain carries the run\'s status (P54)', () => {
+  const step = async (runText: string, files: Record<string, string> = {}, id = 'unit-tests') => {
+    const dir = makeTempDir();
+    wf(dir, 'ci.yml', `${both}jobs:\n  t:\n    runs-on: ubuntu-latest\n    steps:\n      - run: |\n${runText.split('\n').map((l) => `          ${l}`).join('\n')}\n`);
+    for (const [f, t] of Object.entries(files)) writeIn(dir, f, t);
+    // a TypeScript service, so the type check is one of its needs
+    return row(await coverage(dir, { services: [svc('.', { quality: { ...emptyServiceQuality(), tsconfig: true } })] }), 'merge', id);
+  };
+  const pkg = (test: string) => ({ 'package.json': JSON.stringify({ name: 'app', scripts: { test, build: 'tsc -p .' } }) });
+
+  it('P54: ky\'s chain as the last command of its package script → type check covered; followed by another command → partial', async () => {
+    expect((await step('npm test', pkg('xo && npm run build && tsc --project tsconfig.test.json && ava'), 'type-check')).status).toBe('covered');
+    expect((await step('npm test', pkg('xo && npm run build && tsc --project tsconfig.test.json && ava; echo done'), 'type-check')).status).toBe('partial');
+  });
+
+  it('P54: in a step, the last && chain is covered; not last, with || anywhere, or after a conditional exit or loop, it is partial', async () => {
+    expect((await step('[ -f x ] && pytest')).status).toBe('covered');
+    expect((await step('echo start\ncommand -v pytest && pytest')).status).toBe('covered');
+    for (const s of ['command -v pytest && pytest\necho done', '[ -f x ] || make && pytest', 'false || jest', '[ -n "$X" ] && exit 0\nmake && pytest',
+      'for t in $T; do :; done\nmake && pytest', 'if [ -n "$X" ]; then make && pytest; fi', '{ make && pytest; }\necho x']) {
+      expect((await step(s)).status, s).toBe('partial');
+    }
+  });
+
+  it('P54: a followed script\'s last chain is covered only when the script\'s own call carries its status to the step', async () => {
+    const s = { 'scripts/test.sh': 'set -e\necho prep\nlint && pytest\n' };
+    expect((await step('bash scripts/test.sh', s)).status).toBe('covered');
+    expect((await step('set -e\nbash scripts/test.sh\necho after', s)).status).toBe('covered'); // set -e on, a plain command
+    expect((await step('if [ -n "$X" ]; then bash scripts/test.sh; fi', s)).status).toBe('partial');
+    expect((await step('bash scripts/test.sh', { 'scripts/test.sh': 'lint && pytest\necho done\n' })).status).toBe('partial');
   });
 });

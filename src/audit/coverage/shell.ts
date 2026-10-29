@@ -319,9 +319,11 @@ export function scanShell(text: string, base: string | null, sigs: Compiled, bud
   };
   // P51: how many if / case / while / until compound commands hold each token (a prefix sum over their ranges)
   const condDepth = new Int32Array(n + 1);
+  let firstLoop = -1; // P54: the first while/until/select or non-literal for
   { // P53: for every shell text (steps, package scripts, hooks and followed script files)
     for (let k = 0; k < n; k++) {
       if (toks[k]!.kw !== 'open' || !(CONDITIONAL_KW.has(toks[k]!.w) || (toks[k]!.w === 'for' && !literalForList(k)))) continue;
+      if (toks[k]!.w !== 'if' && toks[k]!.w !== 'case' && firstLoop < 0) firstLoop = k; // P54: a loop that may run zero times
       condDepth[k + 1]! += 1;
       condDepth[closer[k]! >= 0 ? closer[k]! : n]! -= 1;
     }
@@ -428,6 +430,7 @@ export function scanShell(text: string, base: string | null, sigs: Compiled, bud
   // P51/P52 (script files only): the rest of this and-or list may not run (after `||`, or `&&` after a command not on
   // the CHAIN_SAFE list); an exit/return that can run under a condition was seen; the last command was CHAIN_SAFE
   let condChain = false;
+  let orInList = false; // P54: this and-or list has a `||` so far
   let afterCondExit = false;
   let lastSafe = false;
   const exitFns = new Set<string>(); // P52 (b): script functions whose body can exit or return with success
@@ -447,8 +450,12 @@ export function scanShell(text: string, base: string | null, sigs: Compiled, bud
     if (exempt) return 'suppressed';
     // P51: in a followed script, a run inside if/case/while/until, right of a test's && or ||, or after a conditional
     // exit/return runs only under a condition
+    // P54: an && chain whose status is the run's final status (the last list, top level, no `||` in it, nothing
+    // conditional before it) is unconditional: an earlier failure in it fails the run visibly. Anywhere else bash's
+    // set -e ignores a failure inside an && list, so a skipped check would be hidden.
+    const lastChain = condChain && !orInList && k > lastList && depth[k] === 0 && condDepth[k] === 0 && !afterCondExit && !(firstLoop >= 0 && firstLoop < k);
     // P53: the same rules for every shell text; a followed script file names itself in the why
-    if (!(condDepth[k]! > 0 || condChain || afterCondExit)) return null;
+    if (!(condDepth[k]! > 0 || (condChain && !lastChain) || afterCondExit)) return null;
     return mode.script === true ? 'script-condition' : 'shell-condition';
   };
   const argsAfter = (k: number) => {
@@ -689,6 +696,8 @@ export function scanShell(text: string, base: string | null, sigs: Compiled, bud
     if (op !== null) {
       if (op === '||' || (op === '&&' && !lastSafe)) condChain = true;
       else if (op === ';' || op === '\n' || op === '&') condChain = false;
+      if (op === '||') orInList = true;
+      else if (op === ';' || op === '\n' || op === '&') orInList = false;
       if (op === ')' || op === '}') lastSafe = false; // a group's status: pipegen doesn't vouch for it
       if ((op === '(' || op === '$(') && closer[k]! >= 0) subshells.push({ close: closer[k]!, errexit, pipefail, cwd });
       while (subshells.length > 0 && subshells[subshells.length - 1]!.close <= k) {
