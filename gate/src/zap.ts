@@ -13,6 +13,17 @@ import type { Severity } from '../../src/types.js';
 import { safeText } from '../../src/util/safe-text.js';
 
 export const ZAP_TOOL = 'zap-baseline';
+
+/**
+ * UNVERIFIED. The only report this parser has been run on is a unit-test output of the ZAP reports add-on
+ * (zap-extensions, `@version: "Dev Build"`), not a `zap-baseline.py -J` run of the pinned image, and there is no clean
+ * report at all (so "no site is a tool error" has never been checked against a real clean run: if a clean run writes
+ * `site: []`, every clean DAST run would block). A real `-J` capture from the pinned image digest, clean and with
+ * alerts, is required before ZAP gates anything. Until then a blocking DAST need on ZAP is judged as not proven
+ * (a warning), which is C2's rule, and every result of this parser carries a note saying so.
+ */
+export const ZAP_JSON_VERIFIED = false;
+const UNVERIFIED_NOTE = 'zap-json parsing is unverified against a real zap-baseline -J report';
 const MAX_PLUGIN_ID = 256;
 const MAX_URL_PATH = 2048;
 const MAX_SITES = 1000;
@@ -94,6 +105,7 @@ export function parseZapJson(json: unknown, toolId: string, opts: ZapOptions = {
         }
       }
     }
+    notes.push(UNVERIFIED_NOTE);
     if (unknownRisk > 0) notes.push(`${unknownRisk} alert(s) had an unknown riskcode and are counted as high`);
     return findings;
   });

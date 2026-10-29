@@ -75,3 +75,10 @@ It has one site, one alert (pluginid 1, riskcode 3) with two instances of one UR
 | ruff | none | none | result `level` (always `error`) |
 | gosec | none | none | the severity word in the rule's `tags`; the `level` is `error` for MEDIUM too |
 | bandit | one | true | result `properties.issue_severity` |
+
+## Failed-scan fixtures (`failed/*.sarif`, C1a fix round 1)
+
+Captured by the C1a reviewer from the same pinned binaries and reviewed flags over broken input (kube-linter: a manifest it cannot parse, alone and next to a
+good one; hadolint: an unparsable Dockerfile; ruff: a file with a syntax error beside a good one). Each is a tool saying "I could not read this target" as an
+ordinary result. The only edit is the reviewer's scratch path, replaced with `/home/runner/work/fixture/fixture` (a text substitution; `ruff-syntax-error` and
+`hadolint-parse-error` needed none or only that). The parser must read each as a tool error.

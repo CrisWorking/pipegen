@@ -9,6 +9,7 @@ import type { Severity } from '../src/types.js';
 
 const DIR = join(import.meta.dirname, 'fixtures', 'sarif');
 const WS = '/home/runner/work/fixture/fixture';
+const GITLEAKS_NOTE = 'completeness not provable (gitleaks)';
 const SEC = 'sec' + 'ret:';   // the prefix of a secret rule id (built here: no secret-like literal in a committed test file)
 const read = (name: string) => readFileSync(join(DIR, name));
 const parse = (name: string, tool: string, opts: { workspace?: string } = { workspace: WS }) => parseSarifText(read(name), tool, opts);
@@ -54,7 +55,7 @@ describe('real fixtures: planted findings', () => {
 
   it('fixture notes: only kube-linter says anything (no severity anywhere in its SARIF); an image or web finding has no repo path by design and says nothing', () => {
     const notes = Object.fromEntries(PLANTED.map(([file, tool]) => [tool, parse(file, tool).notes.length]));
-    expect(notes).toEqual({ betterleaks: 0, gitleaks: 0, semgrep: 0, 'osv-scanner': 0, 'trivy-config': 0, 'trivy-image': 0, 'trivy-licence': 0, hadolint: 0, 'kube-linter': 1, nuclei: 0, ruff: 0, gosec: 0, bandit: 0 });
+    expect(notes).toEqual({ betterleaks: 0, gitleaks: 1, semgrep: 0, 'osv-scanner': 0, 'trivy-config': 0, 'trivy-image': 0, 'trivy-licence': 0, hadolint: 0, 'kube-linter': 1, nuclei: 0, ruff: 0, gosec: 0, bandit: 0 });
     expect(parse('kube-linter.sarif', 'kube-linter').notes[0]).toMatch(/5 finding\(s\).*no severity/i);
   });
 
@@ -113,9 +114,9 @@ describe('real fixtures: planted findings', () => {
 
 describe('real fixtures: clean runs (a real clean scan is not a tool error)', () => {
   for (const tool of CLEAN) {
-    it(`fixture clean/${tool}.sarif: no toolError, no findings, no note (results is [], the tool still wrote it)`, () => {
+    it(`fixture clean/${tool}.sarif: no toolError, no findings, no note but gitleaks' (results is [], the tool still wrote it)`, () => {
       const out = parse(`clean/${tool}.sarif`, tool);
-      expect(out).toEqual({ findings: [], notes: [] });
+      expect(out).toEqual({ findings: [], notes: tool === 'gitleaks' ? [GITLEAKS_NOTE] : [] });
     });
   }
 });

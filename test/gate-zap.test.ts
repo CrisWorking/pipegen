@@ -8,6 +8,7 @@ import { MAX_RAW_BYTES } from '../gate/src/sarif.js';
 import { parseZapJson, parseZapJsonText } from '../gate/src/zap.js';
 
 type Obj = Record<string, unknown>;
+const ZAP_UNVERIFIED_NOTE = 'zap-json parsing is unverified against a real zap-baseline -J report';
 const FIXTURE = join(import.meta.dirname, 'fixtures', 'zap', 'zap-traditional-json.json');
 
 function instance(uri: string, over: Obj = {}): Obj {
@@ -35,8 +36,7 @@ describe('zap: findings', () => {
   it('zap: riskcode 3 → high, 2 medium, 1 low, 0 info (as a string or a number); anything else → high with a note', () => {
     const out = parse(report([alert({ riskcode: '3' }), alert({ riskcode: 2 }), alert({ riskcode: '1' }), alert({ riskcode: 0 }), alert({ riskcode: '0' }), alert({ riskcode: '4' }), alert({ riskcode: 'high' }), alert({ riskcode: undefined })]));
     expect(out.findings.map((f) => f.severity)).toEqual(['high', 'medium', 'low', 'info', 'info', 'high', 'high', 'high']);
-    expect(out.notes).toHaveLength(1);
-    expect(out.notes[0]).toMatch(/3 alert\(s\).*riskcode.*high/i);
+    expect(out.notes.filter((n) => /3 alert\(s\).*riskcode.*high/i.test(n))).toHaveLength(1);
   });
 
   it('zap: one finding per instance (the same alert on two urls is two findings), and an alert with no instances is still one finding', () => {
@@ -157,7 +157,7 @@ describe('zap: the real report (zaproxy/zap-extensions at a pinned commit)', () 
   it('fixture zap-traditional-json.json: no toolError, two findings (one alert on one url, twice), high, path /example_3, nothing of the evidence', () => {
     const out = parseZapJsonText(readFileSync(FIXTURE), 'zap-baseline');
     expect(out.toolError).toBeUndefined();
-    expect(out.notes).toEqual([]);
+    expect(out.notes).toEqual([ZAP_UNVERIFIED_NOTE]);
     expect(out.findings).toEqual([
       { tool: 'zap-baseline', ruleId: '1', severity: 'high', file: '/example_3', message: 'XSS', method: 'GET', uriUnmapped: false },
       { tool: 'zap-baseline', ruleId: '1', severity: 'high', file: '/example_3', message: 'XSS', method: 'GET', uriUnmapped: false },

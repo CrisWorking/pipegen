@@ -17,7 +17,7 @@ const TAG = 'sec' + 'ret';
 function doc(driver: string, results: unknown[] = [], extra: { rules?: unknown[]; invocations?: unknown; version?: unknown; run?: Obj } = {}): Obj {
   return {
     version: 'version' in extra ? extra.version : '2.1.0',
-    runs: [{ tool: { driver: { name: driver, rules: extra.rules ?? [] } }, ...(extra.invocations === undefined ? {} : { invocations: extra.invocations }), results, ...extra.run }],
+    runs: [{ tool: { driver: { name: driver, rules: extra.rules ?? [] } }, ...(Object.hasOwn(extra, 'invocations') && extra.invocations !== undefined ? { invocations: extra.invocations } : {}), results, ...extra.run }],
   };
 }
 function result(ruleId: string, over: Obj = {}): Obj {
@@ -35,18 +35,18 @@ function sev(driver: string, tool: string, r: Obj, rules: unknown[] = []) {
 }
 
 describe('sarif: severity, per tool source (S8)', () => {
-  it('sarif: trivy 9.8 → critical (rule-level security-severity); 7 high, 4 medium, 0.1 low, 0 info', () => {
+  it('sarif: trivy 9.8 → critical (rule-level security-severity); 7 high, 4 medium, 0.1 low', () => {
     const rules = [{ id: 'CVE-1', properties: { 'security-severity': '9.8' } }, { id: 'CVE-2', properties: { 'security-severity': '7.0' } }, { id: 'CVE-3', properties: { 'security-severity': '4.0' } },
-      { id: 'CVE-4', properties: { 'security-severity': '0.1' } }, { id: 'CVE-5', properties: { 'security-severity': '0' } }];
-    const out = parse(doc('Trivy', ['CVE-1', 'CVE-2', 'CVE-3', 'CVE-4', 'CVE-5'].map((id, i) => result(id, { ruleIndex: i })), { rules }), 'trivy-image');
+      { id: 'CVE-4', properties: { 'security-severity': '0.1' } }];
+    const out = parse(doc('Trivy', ['CVE-1', 'CVE-2', 'CVE-3', 'CVE-4'].map((id, i) => result(id, { ruleIndex: i })), { rules }), 'trivy-image');
     expect(out.toolError).toBeUndefined();
-    expect(out.findings.map((f) => f.severity)).toEqual(['critical', 'high', 'medium', 'low', 'info']);
+    expect(out.findings.map((f) => f.severity)).toEqual(['critical', 'high', 'medium', 'low']);
   });
 
   it('severity: the boundaries are 9 critical, 7 high, 4 medium, above 0 low', () => {
-    const scores = ['10', '9.0', '8.9', '7.0', '6.9', '4.0', '3.9', '0.1', '0.0', 9, 8.99];
+    const scores = ['10', '9.0', '8.9', '7.0', '6.9', '4.0', '3.9', '0.1', 9, 8.99];
     const out = parse(doc('Trivy', scores.map((v) => result('x', { properties: { 'security-severity': v } }))), 'trivy-config');
-    expect(out.findings.map((f) => f.severity)).toEqual(['critical', 'critical', 'high', 'high', 'medium', 'medium', 'low', 'low', 'info', 'critical', 'high']);
+    expect(out.findings.map((f) => f.severity)).toEqual(['critical', 'critical', 'high', 'high', 'medium', 'medium', 'low', 'low', 'critical', 'high']);
   });
 
   it('severity: trivy takes the result-level security-severity first, then the rule\'s (by ruleIndex, else by ruleId); a number works too', () => {

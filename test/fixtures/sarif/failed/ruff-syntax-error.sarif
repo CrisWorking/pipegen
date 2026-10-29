@@ -1,0 +1,467 @@
+{
+  "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
+  "runs": [
+    {
+      "results": [
+        {
+          "level": "error",
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "file:///home/runner/work/fixture/fixture/py/bad.py"
+                },
+                "region": {
+                  "endColumn": 1,
+                  "endLine": 1,
+                  "startColumn": 1,
+                  "startLine": 1
+                }
+              }
+            }
+          ],
+          "message": {
+            "text": "File `py/bad.py` is part of an implicit namespace package. Add an `__init__.py`."
+          },
+          "ruleId": "INP001"
+        },
+        {
+          "level": "error",
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "file:///home/runner/work/fixture/fixture/py/bad.py"
+                },
+                "region": {
+                  "endColumn": 1,
+                  "endLine": 1,
+                  "startColumn": 1,
+                  "startLine": 1
+                }
+              }
+            }
+          ],
+          "message": {
+            "text": "Missing copyright notice at top of file"
+          },
+          "ruleId": "CPY001"
+        },
+        {
+          "level": "error",
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "file:///home/runner/work/fixture/fixture/py/bad.py"
+                },
+                "region": {
+                  "endColumn": 1,
+                  "endLine": 3,
+                  "startColumn": 9,
+                  "startLine": 2
+                }
+              }
+            }
+          ],
+          "message": {
+            "text": "Expected `:`, found newline"
+          },
+          "ruleId": "invalid-syntax"
+        },
+        {
+          "level": "error",
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "file:///home/runner/work/fixture/fixture/py/ok.py"
+                },
+                "region": {
+                  "endColumn": 1,
+                  "endLine": 1,
+                  "startColumn": 1,
+                  "startLine": 1
+                }
+              }
+            }
+          ],
+          "message": {
+            "text": "File `py/ok.py` is part of an implicit namespace package. Add an `__init__.py`."
+          },
+          "ruleId": "INP001"
+        },
+        {
+          "level": "error",
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "file:///home/runner/work/fixture/fixture/py/ok.py"
+                },
+                "region": {
+                  "endColumn": 1,
+                  "endLine": 1,
+                  "startColumn": 1,
+                  "startLine": 1
+                }
+              }
+            }
+          ],
+          "message": {
+            "text": "Missing docstring in public module"
+          },
+          "ruleId": "D100"
+        },
+        {
+          "fixes": [
+            {
+              "artifactChanges": [
+                {
+                  "artifactLocation": {
+                    "uri": "file:///home/runner/work/fixture/fixture/py/ok.py"
+                  },
+                  "replacements": [
+                    {
+                      "deletedRegion": {
+                        "endColumn": 1,
+                        "endLine": 2,
+                        "startColumn": 1,
+                        "startLine": 1
+                      },
+                      "insertedContent": {
+                        "text": "import subprocess\n\n\n"
+                      }
+                    }
+                  ]
+                }
+              ],
+              "description": {
+                "text": "Organize imports"
+              }
+            }
+          ],
+          "level": "error",
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "file:///home/runner/work/fixture/fixture/py/ok.py"
+                },
+                "region": {
+                  "endColumn": 18,
+                  "endLine": 1,
+                  "startColumn": 1,
+                  "startLine": 1
+                }
+              }
+            }
+          ],
+          "message": {
+            "text": "Import block is un-sorted or un-formatted"
+          },
+          "ruleId": "I001"
+        },
+        {
+          "level": "error",
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "file:///home/runner/work/fixture/fixture/py/ok.py"
+                },
+                "region": {
+                  "endColumn": 1,
+                  "endLine": 1,
+                  "startColumn": 1,
+                  "startLine": 1
+                }
+              }
+            }
+          ],
+          "message": {
+            "text": "Missing copyright notice at top of file"
+          },
+          "ruleId": "CPY001"
+        },
+        {
+          "fixes": [
+            {
+              "artifactChanges": [
+                {
+                  "artifactLocation": {
+                    "uri": "file:///home/runner/work/fixture/fixture/py/ok.py"
+                  },
+                  "replacements": [
+                    {
+                      "deletedRegion": {
+                        "endColumn": 9,
+                        "endLine": 2,
+                        "startColumn": 9,
+                        "startLine": 2
+                      },
+                      "insertedContent": {
+                        "text": " -> None"
+                      }
+                    }
+                  ]
+                }
+              ],
+              "description": {
+                "text": "Add return type annotation: `None`"
+              }
+            }
+          ],
+          "level": "error",
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "file:///home/runner/work/fixture/fixture/py/ok.py"
+                },
+                "region": {
+                  "endColumn": 6,
+                  "endLine": 2,
+                  "startColumn": 5,
+                  "startLine": 2
+                }
+              }
+            }
+          ],
+          "message": {
+            "text": "Missing return type annotation for public function `f`"
+          },
+          "ruleId": "ANN201"
+        },
+        {
+          "level": "error",
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "file:///home/runner/work/fixture/fixture/py/ok.py"
+                },
+                "region": {
+                  "endColumn": 6,
+                  "endLine": 2,
+                  "startColumn": 5,
+                  "startLine": 2
+                }
+              }
+            }
+          ],
+          "message": {
+            "text": "Missing docstring in public function"
+          },
+          "ruleId": "D103"
+        },
+        {
+          "level": "error",
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "file:///home/runner/work/fixture/fixture/py/ok.py"
+                },
+                "region": {
+                  "endColumn": 8,
+                  "endLine": 2,
+                  "startColumn": 7,
+                  "startLine": 2
+                }
+              }
+            }
+          ],
+          "message": {
+            "text": "Missing type annotation for function argument `x`"
+          },
+          "ruleId": "ANN001"
+        },
+        {
+          "level": "error",
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "file:///home/runner/work/fixture/fixture/py/ok.py"
+                },
+                "region": {
+                  "endColumn": 20,
+                  "endLine": 3,
+                  "startColumn": 5,
+                  "startLine": 3
+                }
+              }
+            }
+          ],
+          "message": {
+            "text": "`subprocess` call with `shell=True` identified, security issue"
+          },
+          "ruleId": "S602"
+        }
+      ],
+      "tool": {
+        "driver": {
+          "informationUri": "https://github.com/astral-sh/ruff",
+          "name": "ruff",
+          "rules": [
+            {
+              "fullDescription": {
+                "text": "## What it does\nChecks that function arguments have type annotations.\n\n## Why is this bad?\nType annotations are a good way to document the types of function arguments. They also\nhelp catch bugs, when used alongside a type checker, by ensuring that the types of\nany provided arguments match expectation.\n\n## Example\n\n```python\ndef foo(x): ...\n```\n\nUse instead:\n\n```python\ndef foo(x: int): ...\n```\n\n## Options\n- `lint.flake8-annotations.suppress-dummy-args`\n"
+              },
+              "help": {
+                "text": "Missing type annotation for function argument `{name}`"
+              },
+              "helpUri": "https://docs.astral.sh/ruff/rules/missing-type-function-argument",
+              "id": "ANN001",
+              "properties": {
+                "id": "ANN001",
+                "kind": "flake8-annotations",
+                "name": "missing-type-function-argument",
+                "problem.severity": "error"
+              },
+              "shortDescription": {
+                "text": "Missing type annotation for function argument `{name}`"
+              }
+            },
+            {
+              "fullDescription": {
+                "text": "## What it does\nChecks that public functions and methods have return type annotations.\n\n## Why is this bad?\nType annotations are a good way to document the return types of functions. They also\nhelp catch bugs, when used alongside a type checker, by ensuring that the types of\nany returned values, and the types expected by callers, match expectation.\n\n## Example\n```python\ndef add(a, b):\n    return a + b\n```\n\nUse instead:\n```python\ndef add(a: int, b: int) -> int:\n    return a + b\n```\n\n## Availability\n\nBecause this rule relies on the third-party `typing_extensions` module for some Python versions,\nits diagnostic will not be emitted, and no fix will be offered, if `typing_extensions` imports\nhave been disabled by the [`lint.typing-extensions`] linter option.\n\n## Options\n\n- `lint.typing-extensions`\n"
+              },
+              "help": {
+                "text": "Missing return type annotation for public function `{name}`"
+              },
+              "helpUri": "https://docs.astral.sh/ruff/rules/missing-return-type-undocumented-public-function",
+              "id": "ANN201",
+              "properties": {
+                "id": "ANN201",
+                "kind": "flake8-annotations",
+                "name": "missing-return-type-undocumented-public-function",
+                "problem.severity": "error"
+              },
+              "shortDescription": {
+                "text": "Missing return type annotation for public function `{name}`"
+              }
+            },
+            {
+              "fullDescription": {
+                "text": "## What it does\nChecks for the absence of copyright notices within Python files.\n\nNote that this check only searches within the first 4096 bytes of the file.\n\n## Why is this bad?\nIn some codebases, it's common to have a license header at the top of every\nfile. This rule ensures that the license header is present.\n\n## Options\n- `lint.flake8-copyright.author`\n- `lint.flake8-copyright.min-file-size`\n- `lint.flake8-copyright.notice-rgx`\n"
+              },
+              "help": {
+                "text": "Missing copyright notice at top of file"
+              },
+              "helpUri": "https://docs.astral.sh/ruff/rules/missing-copyright-notice",
+              "id": "CPY001",
+              "properties": {
+                "id": "CPY001",
+                "kind": "flake8-copyright",
+                "name": "missing-copyright-notice",
+                "problem.severity": "error"
+              },
+              "shortDescription": {
+                "text": "Missing copyright notice at top of file"
+              }
+            },
+            {
+              "fullDescription": {
+                "text": "## What it does\nChecks for undocumented public module definitions.\n\n## Why is this bad?\nPublic modules should be documented via docstrings to outline their purpose\nand contents.\n\nGenerally, module docstrings should describe the purpose of the module and\nlist the classes, exceptions, functions, and other objects that are exported\nby the module, alongside a one-line summary of each.\n\nIf the module is a script, the docstring should be usable as its \"usage\"\nmessage.\n\nIf the codebase adheres to a standard format for module docstrings, follow\nthat format for consistency.\n\n## Example\n\n```python\nclass FasterThanLightError(ZeroDivisionError): ...\n\n\ndef calculate_speed(distance: float, time: float) -> float: ...\n```\n\nUse instead:\n\n```python\n\"\"\"Utility functions and classes for calculating speed.\n\nThis module provides:\n- FasterThanLightError: exception when FTL speed is calculated;\n- calculate_speed: calculate speed given distance and time.\n\"\"\"\n\n\nclass FasterThanLightError(ZeroDivisionError): ...\n\n\ndef calculate_speed(distance: float, time: float) -> float: ...\n```\n\n## Notebook behavior\nThis rule is ignored for Jupyter Notebooks.\n\n## Options\n\n- `lint.pydocstyle.ignore-decorators`\n\n## References\n- [PEP 257 – Docstring Conventions](https://peps.python.org/pep-0257/)\n- [PEP 287 – reStructuredText Docstring Format](https://peps.python.org/pep-0287/)\n- [NumPy Style Guide](https://numpydoc.readthedocs.io/en/latest/format.html)\n- [Google Python Style Guide - Docstrings](https://google.github.io/styleguide/pyguide.html#38-comments-and-docstrings)\n"
+              },
+              "help": {
+                "text": "Missing docstring in public module"
+              },
+              "helpUri": "https://docs.astral.sh/ruff/rules/undocumented-public-module",
+              "id": "D100",
+              "properties": {
+                "id": "D100",
+                "kind": "pydocstyle",
+                "name": "undocumented-public-module",
+                "problem.severity": "error"
+              },
+              "shortDescription": {
+                "text": "Missing docstring in public module"
+              }
+            },
+            {
+              "fullDescription": {
+                "text": "## What it does\nChecks for undocumented public function definitions.\n\n## Why is this bad?\nPublic functions should be documented via docstrings to outline their\npurpose and behavior.\n\nGenerally, a function docstring should describe the function's behavior,\narguments, side effects, exceptions, return values, and any other\ninformation that may be relevant to the user.\n\nIf the codebase adheres to a standard format for function docstrings, follow\nthat format for consistency.\n\n## Example\n```python\ndef calculate_speed(distance: float, time: float) -> float:\n    try:\n        return distance / time\n    except ZeroDivisionError as exc:\n        raise FasterThanLightError from exc\n```\n\nUse instead (using the NumPy docstring format):\n```python\ndef calculate_speed(distance: float, time: float) -> float:\n    \"\"\"Calculate speed as distance divided by time.\n\n    Parameters\n    ----------\n    distance : float\n        Distance traveled.\n    time : float\n        Time spent traveling.\n\n    Returns\n    -------\n    float\n        Speed as distance divided by time.\n\n    Raises\n    ------\n    FasterThanLightError\n        If speed is greater than the speed of light.\n    \"\"\"\n    try:\n        return distance / time\n    except ZeroDivisionError as exc:\n        raise FasterThanLightError from exc\n```\n\nOr, using the Google docstring format:\n```python\ndef calculate_speed(distance: float, time: float) -> float:\n    \"\"\"Calculate speed as distance divided by time.\n\n    Args:\n        distance: Distance traveled.\n        time: Time spent traveling.\n\n    Returns:\n        Speed as distance divided by time.\n\n    Raises:\n        FasterThanLightError: If speed is greater than the speed of light.\n    \"\"\"\n    try:\n        return distance / time\n    except ZeroDivisionError as exc:\n        raise FasterThanLightError from exc\n```\n\n## Options\n- `lint.pydocstyle.ignore-decorators`\n\n## References\n- [PEP 257 – Docstring Conventions](https://peps.python.org/pep-0257/)\n- [PEP 287 – reStructuredText Docstring Format](https://peps.python.org/pep-0287/)\n- [NumPy Style Guide](https://numpydoc.readthedocs.io/en/latest/format.html)\n- [Google Style Python Docstrings](https://google.github.io/styleguide/pyguide.html#s3.8-comments-and-docstrings)\n"
+              },
+              "help": {
+                "text": "Missing docstring in public function"
+              },
+              "helpUri": "https://docs.astral.sh/ruff/rules/undocumented-public-function",
+              "id": "D103",
+              "properties": {
+                "id": "D103",
+                "kind": "pydocstyle",
+                "name": "undocumented-public-function",
+                "problem.severity": "error"
+              },
+              "shortDescription": {
+                "text": "Missing docstring in public function"
+              }
+            },
+            {
+              "fullDescription": {
+                "text": "## What it does\nDe-duplicates, groups, and sorts imports based on the provided `isort` settings.\n\n## Why is this bad?\nConsistency is good. Use a common convention for imports to make your code\nmore readable and idiomatic.\n\n## Example\n```python\nimport pandas\nimport numpy as np\n```\n\nUse instead:\n```python\nimport numpy as np\nimport pandas\n```\n\n"
+              },
+              "help": {
+                "text": "Import block is un-sorted or un-formatted"
+              },
+              "helpUri": "https://docs.astral.sh/ruff/rules/unsorted-imports",
+              "id": "I001",
+              "properties": {
+                "id": "I001",
+                "kind": "isort",
+                "name": "unsorted-imports",
+                "problem.severity": "error"
+              },
+              "shortDescription": {
+                "text": "Import block is un-sorted or un-formatted"
+              }
+            },
+            {
+              "fullDescription": {
+                "text": "## What it does\nChecks for packages that are missing an `__init__.py` file.\n\n## Why is this bad?\nPython packages are directories that contain a file named `__init__.py`.\nThe existence of this file indicates that the directory is a Python\npackage, and so it can be imported the same way a module can be\nimported.\n\nDirectories that lack an `__init__.py` file can still be imported, but\nthey're indicative of a special kind of package, known as a \"namespace\npackage\" (see: [PEP 420](https://peps.python.org/pep-0420/)).\nNamespace packages are less widely used, so a package that lacks an\n`__init__.py` file is typically meant to be a regular package, and\nthe absence of the `__init__.py` file is probably an oversight.\n\n## Options\n- `namespace-packages`\n"
+              },
+              "help": {
+                "text": "File `{filename}` is part of an implicit namespace package. Add an `__init__.py`."
+              },
+              "helpUri": "https://docs.astral.sh/ruff/rules/implicit-namespace-package",
+              "id": "INP001",
+              "properties": {
+                "id": "INP001",
+                "kind": "flake8-no-pep420",
+                "name": "implicit-namespace-package",
+                "problem.severity": "error"
+              },
+              "shortDescription": {
+                "text": "File `{filename}` is part of an implicit namespace package. Add an `__init__.py`."
+              }
+            },
+            {
+              "fullDescription": {
+                "text": "## What it does\nCheck for method calls that initiate a subprocess with a shell.\n\n## Why is this bad?\nStarting a subprocess with a shell can allow attackers to execute arbitrary\nshell commands. Consider starting the process without a shell call and\nsanitize the input to mitigate the risk of shell injection.\n\n## Example\n```python\nimport subprocess\n\nsubprocess.run(\"ls -l\", shell=True)\n```\n\nUse instead:\n```python\nimport subprocess\n\nsubprocess.run([\"ls\", \"-l\"])\n```\n\n## References\n- [Python documentation: `subprocess` — Subprocess management](https://docs.python.org/3/library/subprocess.html)\n- [Common Weakness Enumeration: CWE-78](https://cwe.mitre.org/data/definitions/78.html)\n"
+              },
+              "help": {
+                "text": "`subprocess` call with `shell=True` seems safe, but may be changed in the future; consider rewriting without `shell`"
+              },
+              "helpUri": "https://docs.astral.sh/ruff/rules/subprocess-popen-with-shell-equals-true",
+              "id": "S602",
+              "properties": {
+                "id": "S602",
+                "kind": "flake8-bandit",
+                "name": "subprocess-popen-with-shell-equals-true",
+                "problem.severity": "error"
+              },
+              "shortDescription": {
+                "text": "`subprocess` call with `shell=True` seems safe, but may be changed in the future; consider rewriting without `shell`"
+              }
+            }
+          ],
+          "version": "0.17.1"
+        }
+      }
+    }
+  ],
+  "version": "2.1.0"
+}
