@@ -79,7 +79,7 @@ export const SARIF_TOOLS: Readonly<Record<string, SarifToolInfo>> = Object.freez
   hadolint: tool('Hadolint', 'level', { errorRules: ['DL1000'] }),
   'kube-linter': tool('kube-linter', 'level', { executionSuccessfulFalse: 'findings', errorRules: ['failed-to-load-object'] }),
   nuclei: tool('Nuclei', 'security-severity', { fileMode: 'none', executionSuccessfulFalse: 'ignored' }),
-  ruff: tool('ruff', 'level', { errorRules: ['invalid-syntax', 'E999', 'E902', 'io-error'] }),
+  ruff: tool('ruff', 'level', { errorRules: ['invalid-syntax', 'E999', 'E902', 'panic'] }),
   gosec: tool('gosec', 'tag-word'),
   bandit: tool('Bandit', 'issue-severity'),
 }));
@@ -363,6 +363,7 @@ function readRun(run: unknown, index: number, toolId: string, info: SarifToolInf
  * result, and only then (never over a file nuclei wrote). It is not a nuclei run: its driver name is not `Nuclei`, and
  * the parser accepts exactly this shape, for nuclei only, as "nothing reported", never as proof of coverage.
  */
+export const NOTHING_REPORTED_NUCLEI = 'nothing reported (nuclei run with no result)';
 export const SYNTHESIZED_NUCLEI = Object.freeze({ driver: 'pipegen-empty-nuclei', mark: 'nuclei-no-file' });
 function isSynthesizedNuclei(json: Obj): boolean {
   const keys = (o: Obj): string => Object.keys(o).sort().join(',');
@@ -396,6 +397,8 @@ export function parseSarif(json: unknown, toolId: string, opts: ParseOptions = {
     const limits = limitsFrom(opts.limits);
     if (runs.length > limits.maxRuns) fail(`the result has more than ${limits.maxRuns} runs`);
     const findings = runs.flatMap((run, i) => readRun(run, i, toolId, info, opts, limits, notes));
+    // nuclei writes no file when nothing matched (so a file with no result is not what it writes: the app under test could have written it): accepted, but only as "nothing reported", never as coverage
+    if (toolId === 'nuclei' && findings.length === 0) notes.push(NOTHING_REPORTED_NUCLEI);
     if (info.note !== undefined) notes.push(info.note);
     return findings;
   });

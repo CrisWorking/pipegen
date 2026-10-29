@@ -526,6 +526,17 @@ describe('render-cli: a findings exit code is not a failed step (ruling B2), rea
     expect(parseSarifText(marked, 'semgrep').toolError).toBeDefined();
   });
 
+  it('render-cli (C1b part 0, m4): a link the tool left at the result path (dangling, exit 0) is never written through; the step fails and the link target stays absent', () => {
+    const e = renderableFindings().find((x) => x.id === 'nuclei') as ReturnType<typeof renderableFindings>[number];
+    const sb = sandbox();
+    const target = join(sb.dir, 'written-through-the-link');
+    fakeTool(sb, e.art, e.exe, `ln -s ${JSON.stringify(target)} ./${e.file}\nexit 0`);
+    const r = exec(e.step, sb, stepEnv(e.step, sb));
+    expect(r.status, 'a link at the result path fails the step').not.toBe(0);
+    expect(existsSync(target), 'nothing was written through the dangling link').toBe(false);
+    expect(existsSync(join(sb.rt, 'pipegen-raw', e.art, e.file))).toBe(false);
+  });
+
   it('render-cli (C1a fix round 1): nuclei\'s own file is never overwritten; any other exit with no file still fails and writes nothing; no other tool gets a synthesized file', () => {
     const entries = renderableFindings();
     const nuclei = entries.find((x) => x.id === 'nuclei') as ReturnType<typeof renderableFindings>[number];

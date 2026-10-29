@@ -36,7 +36,7 @@ describe('I1: a target the tool could not read is a tool error, not a finding', 
   });
 
   it('every error rule of every tool, counted; a rule of another tool with the same id is a plain finding', () => {
-    const cases: [string, string, string[]][] = [['kube-linter', 'kube-linter', ['failed-to-load-object']], ['Hadolint', 'hadolint', ['DL1000']], ['ruff', 'ruff', ['invalid-syntax', 'E999', 'E902', 'io-error']]];
+    const cases: [string, string, string[]][] = [['kube-linter', 'kube-linter', ['failed-to-load-object']], ['Hadolint', 'hadolint', ['DL1000']], ['ruff', 'ruff', ['invalid-syntax', 'E999', 'E902', 'panic']]];
     for (const [driver, tool, ids] of cases) {
       for (const id of ids) {
         const out = parse(doc(driver, [result('ok', { level: 'error' }), result(id, { level: 'error' }), result(id, { level: 'error' })]), tool);
