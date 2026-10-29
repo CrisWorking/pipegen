@@ -10,7 +10,8 @@ import type { RenderedStep } from '../../src/engine/render-step.js';
 export const FIXED_PATH = '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin';
 
 const tmps: string[] = [];
-afterAll(() => { for (const d of tmps) rmSync(d, { recursive: true, force: true }); });
+// a checker's install tree and a finished result folder are made read-only, so the sandbox is made writable again first
+afterAll(() => { for (const d of tmps) { spawnSync('chmod', ['-R', 'u+w', d]); rmSync(d, { recursive: true, force: true }); } });
 export interface Sandbox { dir: string; rt: string; ws: string }
 export function sandbox(): Sandbox {
   const dir = mkdtempSync(join(tmpdir(), 'pipegen-6b-'));

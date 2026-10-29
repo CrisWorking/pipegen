@@ -71,6 +71,7 @@
       dest="$RUNNER_TEMP/pipegen-out/pipegen-out-iac/trivy-config.sarif"
       mv -- "$out" "$dest"
       [ -f "$dest" ] && [ ! -L "$dest" ] || { rm -f -- "$dest"; rc=1; }
+      chmod -R a-w "$RUNNER_TEMP/pipegen-out/pipegen-out-iac"
     else
       echo "pipegen: the tool left no regular result file at $out" >&2
       if [ "$rc" -eq 0 ]; then rc=1; fi

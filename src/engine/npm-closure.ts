@@ -35,11 +35,14 @@ export function expectedPins(tool: ReviewedTool): NpmPin[] {
   ];
 }
 
-/** The package name a `node_modules/…` key stands for (its last `node_modules/` segment), or null for a key that isn't one. */
+const NAME = '(?:@[a-z0-9][a-z0-9._-]*/)?[a-z0-9][a-z0-9._-]*';
+/** `node_modules/<name>` or `node_modules/<name>/node_modules/<name>…`: nothing else (no `.` or `..` segment, no absolute path, no other folder). */
+const KEY_RE = new RegExp(`^node_modules/(?:${NAME}/node_modules/)*(${NAME})$`);
+
+/** The package name a `node_modules/…` key stands for (its last segment), or null for a key that isn't exactly that shape. */
 function nameOfKey(key: string): string | null {
-  const m = /^(?:.*\/)?node_modules\/((?:@[a-z0-9][a-z0-9._-]*\/)?[a-z0-9][a-z0-9._-]*)$/.exec(key);
-  if (m === null || !/^node_modules\//.test(key)) return null;
-  return m[1] as string;
+  const m = KEY_RE.exec(key);
+  return m === null ? null : (m[1] as string);
 }
 
 /** Plain-English problems with a closure's text; empty = fine. */
@@ -57,6 +60,7 @@ export function closureProblems(text: string, pins: readonly NpmPin[]): string[]
   const keys = Object.keys(packages);
   if (keys.length > MAX_PACKAGES) return ['the closure has too many packages'];
   const root = packages[''];
+  if (isObj(root)) for (const f of Object.keys(root)) if (f !== 'name' && f !== 'version' && f !== 'dependencies') out.push(`the root package has ${f}; only name, version and dependencies are allowed`);
   if (!isObj(root) || !isObj(root.dependencies)) out.push('the closure has no root package with dependencies');
   else for (const [name, spec] of Object.entries(root.dependencies)) if (typeof spec !== 'string' || !EXACT_RE.test(spec) || !isNpmName(name)) out.push(`the root depends on ${name} at ${String(spec)}, not an exact version`);
   for (const key of keys) {

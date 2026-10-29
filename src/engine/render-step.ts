@@ -21,7 +21,7 @@ import { NEED_IDS } from './need-ids.js';
 import type { PlatformActions } from './pin.js';
 import { renderCliTool, type CliHooks, type RenderOptions } from './render-cli.js';
 import { EXPR, own, RenderError, show } from './render-error.js';
-import { PLAIN_REL_RE, RENDERER_INPUTS, rendererInputProblems } from './tool-flags.js';
+import { CHECKER_STEP_ID_RE, PLAIN_REL_RE, RENDERER_INPUTS, rendererInputProblems, REPO_CODE_STEP_ID_RE, SCRUB_STEP_ID_RE } from './tool-flags.js';
 
 export { RenderError };
 export type { RenderOptions };
@@ -371,6 +371,26 @@ export function dedupeJobSteps(steps: readonly RenderedStep[]): RenderedStep[] {
   if (majors.size > 1) throw new RenderError('One job can have only one Node version, but its steps ask for more than one; they belong in separate jobs.');
   return kept;
 }
+/**
+ * Defence in depth for the order rule of the referee (S6 c, Plan 7a): a step that runs or loads the repo's code (a project
+ * script, a test or coverage tool, prettier, knip: ids `repocode-…`) can rewrite what runs after it in the same job (runner
+ * temp, the install folders, `$GITHUB_ENV`). So no checker install or run, scrub or upload may FOLLOW one. Returns plain-English
+ * problems, empty when the order is fine; it changes nothing. Callers that build a job from rendered steps (and the
+ * referee) run it on the job's steps.
+ */
+export function checkJobOrder(steps: readonly RenderedStep[]): string[] {
+  const problems: string[] = [];
+  let repoCode: string | undefined;
+  steps.forEach((s, i) => {
+    const what = s.id !== undefined && CHECKER_STEP_ID_RE.test(s.id) ? 'a checker step'
+      : s.id !== undefined && SCRUB_STEP_ID_RE.test(s.id) ? 'a scrub step'
+        : s.uses !== undefined && /^(?:actions\/upload-artifact|github\/codeql-action\/upload-sarif)@/.test(s.uses) ? 'an upload step' : undefined;
+    if (what !== undefined && repoCode !== undefined) problems.push(`Step ${i + 1} (${show(s.name)}) is ${what} after the repo-code step ${show(repoCode)}: code from the repository could have changed what it runs or uploads. Put it before, or in another job.`);
+    if (s.id !== undefined && REPO_CODE_STEP_ID_RE.test(s.id) && repoCode === undefined) repoCode = s.name;
+  });
+  return problems;
+}
+
 /** The renderer-filled inputs of an action for this service and context (the others are set by the helpers that own them). */
 function rendererFill(usesPath: string, service: Service | undefined, ctx: RenderContext, registry?: string): Record<string, string> {
   if (usesPath === 'docker/login-action') {

@@ -4,7 +4,8 @@
   with:
     package-manager-cache: "false"
     node-version: "24"
-- name: "pipegen: install prettier from pipegen's own lock"
+- id: checker-install-c283698d8c9e3537
+  name: "pipegen: install prettier from pipegen's own lock"
   run: |-
     set -euo pipefail
     unset CDPATH
@@ -37,39 +38,15 @@
       "TMPDIR=$RUNNER_TEMP"
     )
     cd -- "$npmdir"
-    "${pg_env[@]}" "$nodebin/npm" ci --ignore-scripts --no-audit --no-fund --userconfig "$npmdir/user.npmrc" --globalconfig "$npmdir/global.npmrc" --registry=https://registry.npmjs.org/
-    js='const fs = require("fs"), path = require("path");
-    const want = JSON.parse(process.env.PIPEGEN_NPM_EXPECT);
-    let bad = 0;
-    const fail = (m) => { console.error("pipegen: " + m); bad = 1; };
-    let top = null;
-    try { top = fs.lstatSync("node_modules"); } catch (e) { top = null; }
-    if (!top || !top.isDirectory() || top.isSymbolicLink()) { fail("node_modules is not a real folder"); process.exit(1); }
-    const root = fs.realpathSync("node_modules");
-    let hidden = {};
-    try { hidden = JSON.parse(fs.readFileSync("node_modules/.package-lock.json", "utf8")).packages || {}; } catch (e) { hidden = {}; }
-    for (const w of want) {
-      const dir = path.join("node_modules", w.name);
-      let st = null;
-      try { st = fs.lstatSync(dir); } catch (e) { st = null; }
-      if (!st || !st.isDirectory() || st.isSymbolicLink()) { fail(w.name + " is not a real folder in node_modules"); continue; }
-      if (!fs.realpathSync(dir).startsWith(root + path.sep)) { fail(w.name + " is outside node_modules"); continue; }
-      let version = null;
-      try { version = JSON.parse(fs.readFileSync(path.join(dir, "package.json"), "utf8")).version; } catch (e) { version = null; }
-      if (version !== w.version) fail(w.name + " is " + version + ", not the reviewed " + w.version);
-      const h = hidden["node_modules/" + w.name];
-      if (!h || h.integrity !== w.integrity || h.resolved !== w.resolved) fail(w.name + " was not installed from the reviewed registry tarball");
-    }
-    process.exit(bad);'
-    "${pg_env[@]}" "PIPEGEN_NPM_EXPECT=$PIPEGEN_NPM_EXPECT" "$nodebin/node" -e "$js"
+    "${pg_env[@]}" "$nodebin/npm" ci --ignore-scripts --no-audit --no-fund --userconfig "$npmdir/user.npmrc" --globalconfig "$npmdir/global.npmrc" --workspaces=false --registry=https://registry.npmjs.org/
   shell: bash
   env:
     BASH_ENV: ""
     ENV: ""
     PIPEGEN_NPM_LOCK: "{\"name\":\"pipegen-closure\",\"version\":\"0.0.0\",\"lockfileVersion\":3,\"requires\":true,\"packages\":{\"\":{\"name\":\"pipegen-closure\",\"version\":\"0.0.0\",\"dependencies\":{\"prettier\":\"3.9.10\"}},\"node_modules/prettier\":{\"version\":\"3.9.10\",\"resolved\":\"https://registry.npmjs.org/prettier/-/prettier-3.9.10.tgz\",\"integrity\":\"sha512-skGHTH1Yb9QvaTC4hWnRTzEYtCpApF0UMBPz+t/0ZPzP8ihefo/btKd+QA7pUE0fEwA1SbS/NmhyEcstdXOIdA==\",\"license\":\"MIT\",\"bin\":{\"prettier\":\"bin/prettier.cjs\"},\"engines\":{\"node\":\">=14\"},\"funding\":{\"url\":\"https://github.com/prettier/prettier?sponsor=1\"}}}}"
     PIPEGEN_NPM_PACKAGE: "{\"name\":\"pipegen-closure\",\"version\":\"0.0.0\",\"private\":true,\"dependencies\":{\"prettier\":\"3.9.10\"}}"
-    PIPEGEN_NPM_EXPECT: "[{\"name\":\"prettier\",\"version\":\"3.9.10\",\"integrity\":\"sha512-skGHTH1Yb9QvaTC4hWnRTzEYtCpApF0UMBPz+t/0ZPzP8ihefo/btKd+QA7pUE0fEwA1SbS/NmhyEcstdXOIdA==\",\"resolved\":\"https://registry.npmjs.org/prettier/-/prettier-3.9.10.tgz\"}]"
-- name: "pipegen: run prettier"
+- id: repocode-c283698d8c9e3537
+  name: "pipegen: run prettier"
   run: |-
     set -euo pipefail
     unset CDPATH
@@ -100,6 +77,31 @@
       "RUNNER_TEMP=$RUNNER_TEMP"
       "TMPDIR=$RUNNER_TEMP"
     )
+    js='const fs = require("fs"), path = require("path");
+    const want = JSON.parse(process.env.PIPEGEN_NPM_EXPECT);
+    let bad = 0;
+    const fail = (m) => { console.error("pipegen: " + m); bad = 1; };
+    let top = null;
+    try { top = fs.lstatSync("node_modules"); } catch (e) { top = null; }
+    if (!top || !top.isDirectory() || top.isSymbolicLink()) { fail("node_modules is not a real folder"); process.exit(1); }
+    const root = fs.realpathSync("node_modules");
+    let hidden = {};
+    try { hidden = JSON.parse(fs.readFileSync("node_modules/.package-lock.json", "utf8")).packages || {}; } catch (e) { hidden = {}; }
+    for (const w of want) {
+      const dir = path.join("node_modules", w.name);
+      let st = null;
+      try { st = fs.lstatSync(dir); } catch (e) { st = null; }
+      if (!st || !st.isDirectory() || st.isSymbolicLink()) { fail(w.name + " is not a real folder in node_modules"); continue; }
+      if (!fs.realpathSync(dir).startsWith(root + path.sep)) { fail(w.name + " is outside node_modules"); continue; }
+      let version = null;
+      try { version = JSON.parse(fs.readFileSync(path.join(dir, "package.json"), "utf8")).version; } catch (e) { version = null; }
+      if (version !== w.version) fail(w.name + " is " + version + ", not the reviewed " + w.version);
+      const h = hidden["node_modules/" + w.name];
+      if (!h || h.integrity !== w.integrity || h.resolved !== w.resolved) fail(w.name + " was not installed from the reviewed registry tarball");
+    }
+    process.exit(bad);'
+    ( cd -- "$npmdir" && "${pg_env[@]}" "PIPEGEN_NPM_EXPECT=$PIPEGEN_NPM_EXPECT" "$nodebin/node" -e "$js" )
+    chmod -R a-w "$npmdir"
     rc=0
     "${pg_env[@]}" "$nodebin/node" "$npmdir/node_modules/prettier/bin/prettier.cjs" --check . || rc=$?
     exit "$rc"
@@ -107,3 +109,4 @@
   env:
     BASH_ENV: ""
     ENV: ""
+    PIPEGEN_NPM_EXPECT: "[{\"name\":\"prettier\",\"version\":\"3.9.10\",\"integrity\":\"sha512-skGHTH1Yb9QvaTC4hWnRTzEYtCpApF0UMBPz+t/0ZPzP8ihefo/btKd+QA7pUE0fEwA1SbS/NmhyEcstdXOIdA==\",\"resolved\":\"https://registry.npmjs.org/prettier/-/prettier-3.9.10.tgz\"}]"

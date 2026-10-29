@@ -115,6 +115,18 @@ export interface ArgvPolicy extends CommandPolicy {
    * declared secrets. Every other npm tool is a checker: it reads code and is installed from pipegen's own closure lock.
    */
   readonly runsRepoCode?: true;
+  /**
+   * An npm checker that still loads files from the repo by design (prettier runs a repo `.prettierrc.cjs` and its plugins, knip
+   * runs `knip.ts` and the repo's tool configs). It keeps the closure install, but its run step is a repo-code step too
+   * (`repocode-…` id, runsRepoCode(id) is true), so the referee's order rule applies to it.
+   */
+  readonly loadsRepoConfig?: true;
+  /**
+   * npm checkers only: variables the renderer sets for the tool, name → a path inside the install folder (relative to
+   * it), so the tool finds the pinned copy of a helper and never the repo's (oxlint's tsgolint, which it otherwise
+   * looks up in the repo's node_modules/.bin). Passed through the `env -i` allowlist by name.
+   */
+  readonly closureEnv?: Readonly<Record<string, string>>;
 }
 
 // the dedicated tools (trivy, betterleaks, nuclei) have their own full-grammar rules in reviewed.ts; only the pinned config is listed here, for the renderer
@@ -195,12 +207,12 @@ export const ARGV_POLICIES: Readonly<Record<string, ArgvPolicy>> = Object.freeze
     config: { flag: '--config', content: [`import tseslint from`, `'typescript-eslint';\nexport default [...tseslint.configs.recommended, { ${ESLINT_TS_FILES}, rules: { complexity: ['error', 15] } }];\n`].join(' '), fileName: 'eslint.config.mjs' },
   },
   // Oxlint 1.89.0
-  'oxlint-typeaware': { method: 'npm', package: 'oxlint', npmBin: 'bin/oxlint',
+  'oxlint-typeaware': { method: 'npm', package: 'oxlint', npmBin: 'bin/oxlint', closureEnv: { OXLINT_TSGOLINT_PATH: 'node_modules/.bin/tsgolint' },
     exe: 'oxlint', dialect: 'long', sub: [], flags: { 'type-aware': 'bool', 'deny-warnings': 'bool' }, required: { 'type-aware': 'true', 'deny-warnings': 'true' },
     config: { flag: '--config', content: '{ "categories": { "correctness": "error" } }\n', fileName: 'oxlintrc.json' },
   },
   // Prettier 3.9.10: check only (never --write); the repo's own Prettier config is used (catalogue §2)
-  prettier: { method: 'npm', package: 'prettier', npmBin: 'bin/prettier.cjs', exe: 'prettier', dialect: 'long', sub: [], positionals: ['.'], flags: { check: 'bool' }, required: { check: 'true' } },
+  prettier: { method: 'npm', package: 'prettier', npmBin: 'bin/prettier.cjs', loadsRepoConfig: true, exe: 'prettier', dialect: 'long', sub: [], positionals: ['.'], flags: { check: 'bool' }, required: { check: 'true' } },
   // Vitest 5.0.5: coverage on, with a minimum the AI chooses (P24)
   'vitest-coverage': { method: 'npm', package: 'vitest', npmBin: 'vitest.mjs', runsRepoCode: true,
     exe: 'vitest', dialect: 'long', sub: ['run'], flags: { coverage: 'bool', 'coverage.thresholds.lines': { values: COVERAGE_MINIMUMS } },
@@ -209,7 +221,7 @@ export const ARGV_POLICIES: Readonly<Record<string, ArgvPolicy>> = Object.freeze
   // c8 12.0.0
   c8: { method: 'npm', package: 'c8', npmBin: 'bin/c8.js', runsRepoCode: true, exe: 'c8', dialect: 'long', sub: [], flags: { 'check-coverage': 'bool' }, required: { 'check-coverage': 'true' } },
   // Knip 6.42.1
-  knip: { method: 'npm', package: 'knip', npmBin: 'bin/knip.js', exe: 'knip', dialect: 'long', sub: [], flags: { 'no-progress': 'bool' } },
+  knip: { method: 'npm', package: 'knip', npmBin: 'bin/knip.js', loadsRepoConfig: true, exe: 'knip', dialect: 'long', sub: [], flags: { 'no-progress': 'bool' } },
   // jscpd 5.4.2 (the release binary): new copy-paste against the base only; no semantic mode (jscpdProblems)
   jscpd: { method: GH, package: 'jscpd-linux-x64-gnu.tar.gz',
     exe: 'jscpd', dialect: 'long', sub: [], positionals: ['.'],
@@ -274,13 +286,17 @@ export const ARGV_POLICIES: Readonly<Record<string, ArgvPolicy>> = Object.freeze
   },
 } satisfies Record<string, ArgvPolicy>);
 
-/** Whether a reviewed entry runs the repo's own code (tests, hooks): the referee's order rule treats its step as a repo-code step. */
+/** Whether a reviewed entry runs or loads the repo's own code (tests, hooks, a JS config): the referee's order rule treats its step as a repo-code step. */
 export function runsRepoCode(entryId: string): boolean {
-  return Object.hasOwn(ARGV_POLICIES, entryId) && ARGV_POLICIES[entryId]?.runsRepoCode === true;
+  return Object.hasOwn(ARGV_POLICIES, entryId) && (ARGV_POLICIES[entryId]?.runsRepoCode === true || ARGV_POLICIES[entryId]?.loadsRepoConfig === true);
 }
 
 /** The id of the run step of an entry that runs repo code: `repocode-` plus a hash of its artifact name (not `pipegen-…`, so a job's dedupe never drops it). */
 export const REPO_CODE_STEP_ID_RE = /^repocode-[0-9a-f]{16}$/;
+/** The ids of a checker's install step and of its verify-and-run step (a checker only reads code, and is installed from pipegen's own lock). */
+export const CHECKER_STEP_ID_RE = /^checker-(?:install|run)-[0-9a-f]{16}$/;
+/** The id of a scrub step (Plan C's gate action) in a job: the order rule treats it like an upload. */
+export const SCRUB_STEP_ID_RE = /^scrub-[0-9a-f]{16}$/;
 
 // ---------- pip closures (Plan B 6b, ruling B5) ----------
 

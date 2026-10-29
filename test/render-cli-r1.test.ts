@@ -2,13 +2,13 @@
 // injective dedupe, hardened system tools, DAST networking, and tools that are refused until their slot exists.
 // The shell is run through real bash with stand-ins for node, npm and python (no network).
 import { spawnSync } from 'node:child_process';
-import { chmodSync, existsSync, mkdirSync, readFileSync, symlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { closureRootDependencies, expectedPins } from '../src/engine/npm-closure.js';
 import { NEED_IDS } from '../src/engine/need-ids.js';
-import { dedupeJobSteps, RenderError, renderStep, renderStepWith, type RenderedStep, type RenderResult } from '../src/engine/render-step.js';
-import { ARGV_POLICIES, REPO_CODE_STEP_ID_RE, type ArgvPolicy } from '../src/engine/tool-flags.js';
+import { checkJobOrder, dedupeJobSteps, RenderError, renderStep, renderStepWith, type RenderedStep, type RenderResult } from '../src/engine/render-step.js';
+import { ARGV_POLICIES, REPO_CODE_STEP_ID_RE, runsRepoCode, type ArgvPolicy } from '../src/engine/tool-flags.js';
 import type { ReviewedTool, StepSpec } from '../src/types.js';
 import { ctxFor, entry, platform, service, specFor } from './helpers/render.js';
 import { exec, fakeTool, FIXED_PATH, sandbox, stepEnv, type Sandbox } from './helpers/step-harness.js';
@@ -68,7 +68,14 @@ for (const [k, e] of Object.entries(lock.packages)) {
   if (mode === "wrong-version" && k === "node_modules/" + process.env.FAKE_TARGET) version = "0.0.1";
   fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({ name: k.split("node_modules/").pop(), version }));
   hidden.packages[k] = { version: e.version, resolved: e.resolved, integrity: e.integrity };
+  // every package gets the bin files the policies name; running one records its arguments and the names of its environment
+  for (const b of ["bin/eslint.js", "bin/oxlint", "bin/prettier.cjs", "bin/knip.js", "bin/biome", "vitest.mjs", "bin/c8.js"]) {
+    fs.mkdirSync(path.join(dir, path.dirname(b)), { recursive: true });
+    fs.writeFileSync(path.join(dir, b), "const fs = require(\\"fs\\"); fs.writeFileSync(process.env.RUNNER_TEMP + \\"/tool-ran\\", process.argv.slice(2).join(\\" \\")); fs.writeFileSync(process.env.RUNNER_TEMP + \\"/tool-env.json\\", JSON.stringify(process.env));");
+  }
 }
+fs.mkdirSync("node_modules/.bin", { recursive: true });
+fs.writeFileSync("node_modules/.bin/tsgolint", "#!/bin/sh\\n");
 if (mode === "symlink") {
   const target = path.join(process.env.RUNNER_TEMP, "outside");
   fs.mkdirSync(target, { recursive: true });
@@ -105,7 +112,7 @@ describe('R-A: npm checkers install from pipegen\'s closure lock (DECISIONS #107
     expect(install.run).toContain('mkdir "$npmdir"');
     expect(install.run).toContain("printf '%s' \"$PIPEGEN_NPM_LOCK\" > \"$npmdir/package-lock.json\"");
     expect(install.run).toContain('cd -- "$npmdir"');
-    expect(install.run).toContain('ci --ignore-scripts --no-audit --no-fund --userconfig "$npmdir/user.npmrc" --globalconfig "$npmdir/global.npmrc" --registry=https://registry.npmjs.org/');
+    expect(install.run).toContain('ci --ignore-scripts --no-audit --no-fund --userconfig "$npmdir/user.npmrc" --globalconfig "$npmdir/global.npmrc" --workspaces=false --registry=https://registry.npmjs.org/');
     expect(install.run).toContain(': > "$npmdir/.npmrc"');
   });
 
@@ -114,7 +121,8 @@ describe('R-A: npm checkers install from pipegen\'s closure lock (DECISIONS #107
     expect(run).toContain('"$nodebin/node" "$npmdir/node_modules/eslint/bin/eslint.js"');
     expect(run).toContain('/usr/bin/env -i');
     expect(run).not.toContain('npx');
-    expect(lastRun(r).id).toBeUndefined();
+    expect(lastRun(r).id).toMatch(/^checker-run-[0-9a-f]{16}$/);
+    expect(r.steps[1]?.id).toMatch(/^checker-install-[0-9a-f]{16}$/);
   });
 
   it('every checker uses its own reviewed bin; the configs that import a plugin are written into the isolated folder (eslint-typescript now renders)', () => {
@@ -152,22 +160,44 @@ describe('R-A: npm checkers install from pipegen\'s closure lock (DECISIONS #107
     expect(envNames).not.toContain('PIPEGEN_NPM_LOCK');
   });
 
-  it2('install: a tool that is a symlink, at another version, or missing its hidden-lock entry fails the step; a failing npm fails it', () => {
+  it2('verify and run are one step: a tool that is a symlink or at another version fails it before the tool starts; a failing npm fails the install', () => {
     const install = r.steps[1] as RenderedStep;
-    const pins = expectedPins(entry('eslint'));
-    const target = pins[0]?.name as string;
+    const run = lastRun(r);
+    const target = expectedPins(entry('eslint'))[0]?.name as string;
     for (const mode of ['symlink', 'wrong-version', 'fail']) {
       const sb = sandbox();
       const bin = fakeNodeDir(sb, 22);
-      mkdirSync(sb.rt, { recursive: true });
       writeFileSync(join(sb.rt, 'fake-mode'), mode);
       writeFileSync(join(sb.rt, 'fake-target'), target);
-      const res = exec(install, sb, withNode(stepEnv(install, sb), bin));
-      expect(res.status, mode).not.toBe(0);
+      const inst = exec(install, sb, withNode(stepEnv(install, sb), bin));
+      if (mode === 'fail') { expect(inst.status, mode).not.toBe(0); continue; }
+      expect(inst.status, mode).toBe(0);
+      expect(exec(run, sb, withNode(stepEnv(run, sb), bin)).status, mode).not.toBe(0);
+      expect(existsSync(join(sb.rt, 'tool-ran')), `${mode}: the tool must not have started`).toBe(false);
     }
     const ok = sandbox();
     const bin = fakeNodeDir(ok, 22);
     expect(exec(install, ok, withNode(stepEnv(install, ok), bin)).status).toBe(0);
+    const res = exec(run, ok, withNode(stepEnv(run, ok), bin));
+    expect(res.status, res.stderr).toBe(0);
+    expect(existsSync(join(ok.rt, 'tool-ran'))).toBe(true);
+  });
+
+  it2('after the check the install tree is made read-only (no write bits), and the config was written before that', () => {
+    const install = r.steps[1] as RenderedStep;
+    const run = lastRun(r);
+    expect(run.run).toContain('chmod -R a-w "$npmdir"');
+    expect((run.run as string).indexOf('eslint.config.mjs')).toBeLessThan((run.run as string).indexOf('chmod -R a-w'));
+    expect((run.run as string).indexOf('-e "$js"')).toBeLessThan((run.run as string).indexOf('chmod -R a-w'));
+    const sb = sandbox();
+    const bin = fakeNodeDir(sb, 22);
+    expect(exec(install, sb, withNode(stepEnv(install, sb), bin)).status).toBe(0);
+    expect(exec(run, sb, withNode(stepEnv(run, sb), bin)).status).toBe(0);
+    const dir = join(sb.rt, 'pipegen-npm', 'pipegen-out-lint--app');
+    for (const f of [join(dir, 'node_modules', 'eslint', 'package.json'), join(dir, 'node_modules', 'eslint', 'bin', 'eslint.js'), join(dir, 'eslint.config.mjs')]) {
+      expect(statSync(f).mode & 0o222, f).toBe(0);
+    }
+    expect(statSync(join(dir, 'node_modules', 'eslint')).mode & 0o222).toBe(0);
   });
 
   it2('node: a node of another major than setup-node was asked for (a poisoned PATH) fails every node step', () => {
@@ -200,8 +230,8 @@ describe('R-A: npm tools that run the repo\'s code (vitest, c8) keep the repo in
     expect(r.steps.map((s) => s.run ?? '').join('\n')).not.toMatch(/npx/);
     expect(lastRun(r).run).toContain('"$nodebin/node" "$PWD/node_modules/vitest/vitest.mjs" run');
     expect(lastRun(r).id).toMatch(REPO_CODE_STEP_ID_RE);
-    // a checker is not marked
-    expect(lastRun(render('prettier')).id).toBeUndefined();
+    // a checker that only reads code is not marked (its id is checker-run-…)
+    expect(lastRun(render('biome')).id).toMatch(/^checker-run-/);
   });
 
   it2('pre-check: a shrinkwrap, a link, an alias or a non-registry source for the tool or a plugin, or a non-sha512 integrity fails BEFORE npm ci runs', () => {
@@ -440,5 +470,110 @@ describe('R-A: the unchanged checker data is what the policies say', () => {
   it('a fixture closure and a different Node major are the only things a checker render depends on', () => {
     expect(spawnSync('bash', ['-n'], { input: lastRun(render('knip')).run as string }).status).toBe(0);
     for (const s of render('knip').steps) if (s.run !== undefined) expect(spawnSync('bash', ['-n'], { input: s.run }).status).toBe(0);
+  });
+});
+
+describe('round 2: prettier and knip load repo config (ruling 1)', () => {
+  it('their run step is marked as a repo-code step, runsRepoCode says so, and they still install from their closure', () => {
+    for (const id of ['prettier', 'knip']) {
+      expect(ARGV_POLICIES[id]?.loadsRepoConfig, id).toBe(true);
+      expect(runsRepoCode(id), id).toBe(true);
+      const r = render(id);
+      expect(lastRun(r).id, id).toMatch(REPO_CODE_STEP_ID_RE);
+      expect(r.steps[1]?.env?.PIPEGEN_NPM_LOCK, id).toBeDefined(); // the closure install is kept
+    }
+  });
+
+  it('every npm policy that neither runs repo code nor loads repo config has a pinned config passed by flag', () => {
+    const offenders: string[] = [];
+    for (const [id, pol] of Object.entries(ARGV_POLICIES)) {
+      if (pol.method !== 'npm' || pol.runsRepoCode === true || pol.loadsRepoConfig === true) continue;
+      if (pol.config === undefined || !/^-{1,2}[a-z-]+$/.test(pol.config.flag)) offenders.push(id);
+    }
+    expect(offenders).toEqual([]);
+  });
+});
+
+describe('round 2: oxlint finds the closure\'s tsgolint, never the repo\'s (ruling 2)', () => {
+  it('the run step sets OXLINT_TSGOLINT_PATH to the closure folder\'s tsgolint and passes it through the allowlist', () => {
+    const run = lastRun(render('oxlint-typeaware')).run as string;
+    expect(run).toContain('OXLINT_TSGOLINT_PATH="$npmdir/node_modules/.bin/tsgolint"');
+    expect(run).toContain('"OXLINT_TSGOLINT_PATH=$OXLINT_TSGOLINT_PATH"');
+    expect(lastRun(render('eslint')).run).not.toContain('OXLINT_TSGOLINT_PATH');
+  });
+
+  it2('the tool starts with that variable set (and nothing else from the allowlist is added)', () => {
+    const r = render('oxlint-typeaware');
+    const sb = sandbox();
+    const bin = fakeNodeDir(sb, 24);
+    for (const step of [r.steps[1] as RenderedStep, lastRun(r)]) {
+      const res = exec(step, sb, withNode(stepEnv(step, sb), bin));
+      expect(res.status, res.stderr).toBe(0);
+    }
+    const env = JSON.parse(readFileSync(join(sb.rt, 'tool-env.json'), 'utf8')) as Record<string, string>;
+    expect(env.OXLINT_TSGOLINT_PATH).toBe(join(sb.rt, 'pipegen-npm', 'pipegen-out-lint', 'node_modules', '.bin', 'tsgolint'));
+    expect(Object.keys(env).filter((n) => n !== 'PWD').sort()).toEqual(['HOME', 'OXLINT_TSGOLINT_PATH', 'PATH', 'RUNNER_TEMP', 'TMPDIR']);   // PWD is added by the stand-in's own shell
+  });
+});
+
+describe('round 2: npm ci never walks up to a parent workspace (ruling 3)', () => {
+  it2('both npm ci commands carry --workspaces=false', () => {
+    const sb = sandbox();
+    const bin = fakeNodeDir(sb, 24);
+    const checker = render('eslint');
+    const installC = checker.steps[1] as RenderedStep;
+    expect(installC.run).toContain('--workspaces=false');
+    // a parent folder that is a workspace root with its own .npmrc and package.json
+    writeFileSync(join(sb.rt, 'package.json'), JSON.stringify({ name: 'root', workspaces: ['pipegen-npm/*'] }));
+    writeFileSync(join(sb.rt, '.npmrc'), 'git=./evilgit.sh\n');
+    expect(exec(installC, sb, withNode(stepEnv(installC, sb), bin)).status).toBe(0);
+    expect(readFileSync(join(sb.rt, 'npm-args.bin'), 'utf8').split('\0')).toContain('--workspaces=false');
+    const repo = render('vitest-coverage', { choices: { 'coverage-thresholds-lines': '80' } });
+    expect(repo.steps[1]?.run).toContain('--workspaces=false');
+  });
+});
+
+describe('round 2: lock size and order (rulings 5 and 7)', () => {
+  it('a closure whose compact JSON is over 120 KiB is refused', () => {
+    const t = entry('eslint');
+    const big = JSON.parse(closureText('eslint')) as { packages: Record<string, Record<string, unknown>> };
+    (big.packages['node_modules/eslint'] as Record<string, unknown>).description = 'x'.repeat(130 * 1024);
+    expect(() => renderStepWith(spec(t), t, platform(), ctx, { npmClosures: { eslint: JSON.stringify(big) } })).toThrow(/too large/);
+    const fine = JSON.parse(closureText('eslint')) as { packages: Record<string, Record<string, unknown>> };
+    (fine.packages['node_modules/eslint'] as Record<string, unknown>).description = 'x'.repeat(10 * 1024);
+    expect(() => renderStepWith(spec(t), t, platform(), ctx, { npmClosures: { eslint: JSON.stringify(fine) } })).not.toThrow();
+  });
+
+  it2('a finished result folder is read-only', () => {
+    const run = lastRun(render('trivy-config'));
+    expect(run.run).toContain('chmod -R a-w "$RUNNER_TEMP/pipegen-out/pipegen-out-iac"');
+    const sb = sandbox();
+    fakeTool(sb, 'pipegen-out-iac', 'trivy', "echo '{}' > ./trivy-config.sarif");
+    expect(exec(run, sb, stepEnv(run, sb)).status).toBe(0);
+    const f = join(sb.rt, 'pipegen-out', 'pipegen-out-iac', 'trivy-config.sarif');
+    expect(statSync(f).mode & 0o222).toBe(0);
+    expect(statSync(join(sb.rt, 'pipegen-out', 'pipegen-out-iac')).mode & 0o222).toBe(0);
+  });
+
+  const projectScript: RenderedStep = { id: 'repocode-0123456789abcdef', name: 'project script', run: 'npm test' };
+  const upload: RenderedStep = { name: 'Upload', uses: `actions/upload-artifact@${'a'.repeat(40)}` };
+
+  it('checkJobOrder: [project-script, eslint] is refused, [eslint, project-script] passes', () => {
+    const eslint = render('eslint').steps;
+    expect(checkJobOrder([projectScript, ...eslint]).join(' ')).toMatch(/repo-code step/);
+    expect(checkJobOrder([...eslint, projectScript])).toEqual([]);
+  });
+
+  it('checkJobOrder: a repo-code step before a scrub or an upload is refused; the repo-code tools themselves (vitest, prettier) count', () => {
+    const scrub: RenderedStep = { id: 'scrub-0123456789abcdef', name: 'scrub', run: 'true' };
+    expect(checkJobOrder([projectScript, scrub])).not.toEqual([]);
+    expect(checkJobOrder([projectScript, upload])).not.toEqual([]);
+    expect(checkJobOrder([scrub, upload, projectScript])).toEqual([]);
+    const vitest = render('vitest-coverage').steps;
+    expect(checkJobOrder([...vitest, ...render('biome').steps]).length).toBeGreaterThan(0);
+    expect(checkJobOrder([...render('biome').steps, ...vitest])).toEqual([]);
+    const prettier = render('prettier').steps;
+    expect(checkJobOrder([...prettier, ...render('biome').steps]).length).toBeGreaterThan(0);
+    expect(checkJobOrder([])).toEqual([]);
   });
 });
