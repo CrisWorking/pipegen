@@ -61,14 +61,20 @@ export interface GateJobListOptions {
 export function gateJobList(draft: PipelineDraft, opts: GateJobListOptions = {}): JobListEntry[] {
   const formatOf = opts.formatOf ?? ((s: StepSpec): OutputFormat | undefined => s.output.format);
   const out: JobListEntry[] = [];
-  const seen = new Set<string>();
+  const seen = new Map<string, string>();   // job id → the (need id, service) that owns it
   for (const need of draft.needs) {
     if (need.layer !== 'merge') continue;
     const category = Object.hasOwn(NEED_ID_CATEGORY, need.id) ? (NEED_ID_CATEGORY as Readonly<Record<string, NeedCategory>>)[need.id] : undefined;
     if (category === undefined || SCHEDULED_CATEGORIES.has(category) || PIPEGEN_JOB_CATEGORIES.has(category)) continue;
     const key = jobIdFor(need.id, need.service);
-    if (seen.has(key)) continue;
-    seen.add(key);
+    // an exact duplicate (the same need on another layer) is one entry; two different pairs with one job id would drop a check silently (slugging, the 40-character cut)
+    const owner = `${need.id}\0${need.service ?? ''}`;
+    const known = seen.get(key);
+    if (known !== undefined) {
+      if (known !== owner) throw new GateJobListError(`The checks ${JSON.stringify(known.replace('\0', ' / ').slice(0, 80))} and ${JSON.stringify(owner.replace('\0', ' / ').slice(0, 80))} would be the same job (${key}) and the same result, so one of them would drop out of the gate's list; rename a service.`);
+      continue;
+    }
+    seen.set(key, owner);
     const specs = draft.steps
       .map((spec, i) => ({ spec, format: formatOf(spec, i) }))
       .filter((x): x is { spec: StepSpec; format: OutputFormat } => x.format !== undefined && x.spec.needId === need.id && x.spec.service === need.service);

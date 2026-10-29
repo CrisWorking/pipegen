@@ -1,6 +1,7 @@
 // Plan C, sub-task C0b: the gate job and its links to the scanner jobs, in Plan B's engine (rulings B3, B4, S3, S4, S16, S21)
 // plus the scrub cross-checks C0a left to this task. Written first (strict test-first).
 import { createHash } from 'node:crypto';
+import { NO_SCANS } from '../src/engine/job-rules.js';
 import { Document } from 'yaml';
 import { describe, expect, it } from 'vitest';
 import { resultArtifactName } from '../src/engine/artifact-names.js';
@@ -142,7 +143,7 @@ describe('jobOutputsProblems (ruling B3)', () => {
   it('referee: job outputs in another form → injection; the allowed form → no issue', async () => {
     const spec = gitleaksSpec();
     const d = draftOf([spec], [needOf('secrets')]);
-    const good = await run([workflow({ [SEC]: job(dedupeJobSteps([...prelude(), ...g.steps]), { outputs: ok() }) })], d);
+    const good = await run([workflow({ [SEC]: job(dedupeJobSteps([...prelude(), ...g.steps], { scans: facts(g) }), { outputs: ok() }) })], d);
     expect(show(good)).toBe('');
     for (const outputs of [
       { ...ok(), 'has-pr': '${{ github.event.pull_request.number }}' },
@@ -150,7 +151,7 @@ describe('jobOutputsProblems (ruling B3)', () => {
       { [`${g.artifact}-sha256`]: `\${{ steps.${id}.outputs.status }}` },
       { digest: 'x' },
     ]) {
-      const r = await run([workflow({ [SEC]: job(dedupeJobSteps([...prelude(), ...g.steps]), { outputs }) })], d);
+      const r = await run([workflow({ [SEC]: job(dedupeJobSteps([...prelude(), ...g.steps], { scans: facts(g) }), { outputs }) })], d);
       expect(has(r, 'injection'), JSON.stringify(outputs) + show(r)).toBe(true);
     }
   });
@@ -378,11 +379,11 @@ describe('base-scan checkout ref (ruling S16)', () => {
 
   it('base-scan checkout ref only in job base-scan: checkJobOrder and dedupeJobSteps refuse it in any other job (and with no job id)', () => {
     const steps = prelude({ baseRef: 'pull-request-base' });
-    expect(checkJobOrder(steps, { id: 'base-scan' })).toEqual([]);
-    expect(dedupeJobSteps(steps, { id: 'base-scan' })).toHaveLength(1);
+    expect(checkJobOrder(steps, { id: 'base-scan', triggers: ['pull_request'] })).toEqual([]);
+    expect(dedupeJobSteps(steps, { id: 'base-scan', scans: NO_SCANS, triggers: ['pull_request'] })).toHaveLength(1);
     for (const ctxOf of [{ id: 'secrets' }, { id: 'gate' }, { id: 'base-scan2' }, { id: 'Base-Scan' }, {}]) {
       expect(checkJobOrder(steps, ctxOf).join(' '), JSON.stringify(ctxOf)).toMatch(/base-scan/);
-      expect(() => dedupeJobSteps(steps, ctxOf), JSON.stringify(ctxOf)).toThrow(RenderError);
+      expect(() => dedupeJobSteps(steps, { ...ctxOf, scans: NO_SCANS, triggers: ['pull_request'] }), JSON.stringify(ctxOf)).toThrow(RenderError);
     }
     expect(checkJobOrder(prelude())).toEqual([]);   // a checkout with no ref is fine anywhere
   });
@@ -394,7 +395,7 @@ describe('base-scan checkout ref (ruling S16)', () => {
     const baseSteps = [...prelude({ baseRef: 'pull-request-base' }), ...base.steps];
     const pr = block(spec);
     const prJob = job(dedupeJobSteps([...prelude(), ...pr.steps], { id: 'secrets', scans: facts(pr) }), { outputs: jobOutputsFor(pr.steps) });
-    const ok = await run([workflow({ [SEC]: prJob, 'base-scan': job(dedupeJobSteps(baseSteps, { id: 'base-scan', scans: facts(base) }), { outputs: jobOutputsFor(base.steps) }) })], dd);
+    const ok = await run([workflow({ [SEC]: prJob, 'base-scan': job(dedupeJobSteps(baseSteps, { id: 'base-scan', scans: facts(base), triggers: ['pull_request'] }), { outputs: jobOutputsFor(base.steps) }) })], dd);
     expect(show(ok)).toBe('');
     const elsewhere = await run([workflow({ [SEC]: prJob, other: job(baseSteps) })], dd);
     expect(has(elsewhere, 'injection', /base-scan/), show(elsewhere)).toBe(true);
@@ -522,11 +523,11 @@ describe('parity: a full draft (two services, scanners, base-scan, gate job) thr
       out[id] = job(dedupeJobSteps([...prelude(), ...b.steps], { id, scans: facts(b) }), { outputs: jobOutputsFor(b.steps) });
     }
     const script = renderProjectScript({ kind: 'project-script', needId: 'unit-tests', service: 'app', script: 'test' }, p, ctx).steps;
-    out['unit-tests--app'] = job(dedupeJobSteps(script, { id: 'unit-tests--app' }));
+    out['unit-tests--app'] = job(dedupeJobSteps(script, { id: 'unit-tests--app' , scans: NO_SCANS }));
     // base-scan: one checkout of the base commit, then the base twin of every findings check
     const baseBlocks = specs.map((s) => block(s, { ...ctx, base: true }));
     const baseSteps = [...prelude({ baseRef: 'pull-request-base' }), ...baseBlocks.flatMap((b) => b.steps)];
-    out['base-scan'] = job(dedupeJobSteps(baseSteps, { id: 'base-scan', scans: facts(...baseBlocks) }), { outputs: jobOutputsFor(baseBlocks.flatMap((b) => b.steps)) });
+    out['base-scan'] = job(dedupeJobSteps(baseSteps, { id: 'base-scan', scans: facts(...baseBlocks), triggers: ['pull_request'] }), { outputs: jobOutputsFor(baseBlocks.flatMap((b) => b.steps)) });
     out.gate = job([renderGateStep(GATE, entries)], { name: 'gate', if: 'always()', needs: [...entries.map((e) => e.job), 'base-scan'], permissions: GATE_PERM });
     return out;
   }

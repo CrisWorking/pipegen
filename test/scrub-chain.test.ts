@@ -2,6 +2,7 @@
 // Written first (strict test-first). Raw results go to `pipegen-raw` and are never uploadable; the gate action in `scrub`
 // mode rebuilds them into `pipegen-out/<artifact>/`; a findings exit code of a tool is not a failed step.
 import { createHash } from 'node:crypto';
+import { NO_SCANS } from '../src/engine/job-rules.js';
 import { chmodSync, existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { Document } from 'yaml';
@@ -14,7 +15,7 @@ import { NEED_ID_CATEGORY, NEED_IDS } from '../src/engine/need-ids.js';
 import { ARGV_POLICIES, rendererInputProblems, SCRUB_STEP_ID_RE } from '../src/engine/tool-flags.js';
 import { emptyRepoFiles } from '../src/read/quality.js';
 import type { Capabilities, CreatedFile, Need, PipelineDraft, ReviewedTool, StepSpec } from '../src/types.js';
-import { entry, gateEntry, GATE_SHA, platform, profile, reviewedList, service, specFor } from './helpers/render.js';
+import { entry, gateEntry, GATE_SHA, platform, profile, reviewedList, service, specFor, scansFor } from './helpers/render.js';
 import { exec, fakeTool, sandbox, stepEnv, type Sandbox } from './helpers/step-harness.js';
 
 // ---------- builders ----------
@@ -241,7 +242,7 @@ describe('isKnownHarmless and the job order: the scrub step (ruling B1 part 3)',
     const names: RenderedStep = { id: 'pipegen-checkout', name: 'x', uses: `actions/checkout@${'c'.repeat(40)}`, with: { artifact: art } };
     expect(checkJobOrder([...prelude(), names, up]).join(' ')).toMatch(NO_SCRUB);
     expect(checkJobOrder([...prelude(), scan, scrub(), up])).toEqual([]);
-    expect(() => dedupeJobSteps([...prelude(), up])).toThrow(RenderError);
+    expect(() => dedupeJobSteps([...prelude(), up], { scans: scansFor([...prelude(), up]) })).toThrow(RenderError);
   });
 
   it('checkJobOrder: an upload of a pipegen-raw path is refused (also written by hand, past renderUpload)', () => {
@@ -261,9 +262,9 @@ describe('referee: the scrub chain', () => {
   it('scrub chain: [checkout, tool, renderScrub, renderUpload] passes dedupeJobSteps, stepsToYaml and the referee with 0 issues (probe S1)', async () => {
     const spec = gitleaksSpec();
     const { steps } = scannerSteps(spec);
-    expect(() => dedupeJobSteps(steps)).not.toThrow();
+    expect(() => dedupeJobSteps(steps, { scans: scansFor(steps) })).not.toThrow();
     expect(() => stepsToYaml(steps)).not.toThrow();
-    const r = await run([workflow({ scan: job(dedupeJobSteps(steps)) })], draftOf([spec]));
+    const r = await run([workflow({ scan: job(dedupeJobSteps(steps, { scans: scansFor(steps) })) })], draftOf([spec]));
     expect(show(r)).toBe('');
     expect(r.issues).toEqual([]);
   });
@@ -274,7 +275,9 @@ describe('referee: the scrub chain', () => {
     expect(artifact).toBe('pipegen-out-base-secrets');
     // the PR-side scan of the same check sits in its own job; the base-scan job holds the target branch's twin of it
     const pr = scannerSteps(spec).steps;
-    const r = await run([workflow({ scan: job(dedupeJobSteps(pr)), 'base-scan': job(dedupeJobSteps(steps)) })], draftOf([spec]));
+    // the base-scan job checks out the base commit, as its first step (C0b fix round 1)
+    const baseSteps = [{ ...(steps[0] as RenderedStep), with: { ...steps[0]?.with, ref: '${{ github.event.pull_request.base.sha }}' } }, ...steps.slice(1)];
+    const r = await run([workflow({ scan: job(dedupeJobSteps(pr, { scans: scansFor(pr) })), 'base-scan': job(dedupeJobSteps(baseSteps, { id: 'base-scan', scans: scansFor(baseSteps), triggers: ['pull_request'] })) })], draftOf([spec]));
     expect(show(r)).toBe('');
   });
 
@@ -548,12 +551,12 @@ describe('the renderer and the referee agree: a full scanner job per findings to
       let built: ReturnType<typeof scannerSteps>;
       try { built = scannerSteps(spec); } catch (e) { if (e instanceof RenderError) continue; throw e; }
       specs.push(spec);
-      jobs[`t-${t.id}`] = job(dedupeJobSteps([...harden, ...built.steps]));
+      jobs[`t-${t.id}`] = job(dedupeJobSteps([...harden, ...built.steps], { scans: scansFor([...harden, ...built.steps]) }));
     }
     expect(specs.map((s) => s.tool.id)).toEqual(expect.arrayContaining(['gitleaks', 'betterleaks', 'semgrep', 'osv-scanner', 'trivy-config', 'trivy-image', 'trivy-licence', 'hadolint', 'kube-linter', 'semgrep', 'nuclei', 'zap-baseline']));
     // without the harden step too (the job shape of Plan G's scanner jobs differs by the egress policy)
     const plain: Record<string, Job> = {};
-    for (const s of specs) plain[`u-${s.tool.id}`] = job(dedupeJobSteps(scannerSteps(s).steps));
+    for (const s of specs) plain[`u-${s.tool.id}`] = job(dedupeJobSteps(scannerSteps(s).steps, { scans: scansFor(scannerSteps(s).steps) }));
     const r = await run([workflow(jobs), workflow(plain)].map((f, i) => ({ ...f, path: `.github/workflows/pipegen-${i}.yml` })), draftOf(specs));
     expect(show(r)).toBe('');
   });
@@ -575,7 +578,7 @@ describe('a job with a scrub step holds no repo code (C0a fix round 1, finding 1
       const more = repoCodeSteps(id, needId);
       expect(more.some((x) => x.id !== undefined && /^(?:repocode-|pipegen-npm-ci-)/.test(x.id)), id).toBe(true);
       expect(checkJobOrder([...steps, ...more]).join('\n'), id).toMatch(KEY_JOB);
-      expect(() => dedupeJobSteps([...steps, ...more]), id).toThrow(KEY_JOB);
+      expect(() => dedupeJobSteps([...steps, ...more], { scans: scansFor([...steps, ...more]) }), id).toThrow(KEY_JOB);
     }
     expect(checkJobOrder([...steps, { name: 'mine', run: 'true' }]).join('\n')).toMatch(KEY_JOB);
     expect(checkJobOrder([...steps, { name: 'mine', uses: `someone/else@${'d'.repeat(40)}` }]).join('\n')).toMatch(KEY_JOB);
@@ -592,7 +595,7 @@ describe('a job with a scrub step holds no repo code (C0a fix round 1, finding 1
   it('checkJobOrder: a clean scanner job (several checkers, scrubs and uploads) passes; a job with no scrub may hold repo code', () => {
     const a = scannerSteps(gitleaksSpec());
     const b = scannerSteps(specFor(entry('semgrep'), { needId: 'sast', service: 'app', choices: { rules: 'javascript' } }));
-    expect(checkJobOrder(dedupeJobSteps([...a.steps, ...b.steps.slice(1)]))).toEqual([]);
+    expect(checkJobOrder(dedupeJobSteps([...a.steps, ...b.steps.slice(1)], { scans: scansFor([...a.steps, ...b.steps.slice(1)]) }))).toEqual([]);
     expect(checkJobOrder([...prelude(), ...repoCodeSteps('vitest-coverage', 'coverage')])).toEqual([]);
   });
 

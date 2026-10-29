@@ -32,7 +32,7 @@ import { findSecretLike } from '../ai/redact.js';
 import { safeText } from '../util/safe-text.js';
 import { GATE_CHECK_NAME, type CreatedFile, type OutputFormat, type PipegenInserted, type PipelineDraft, type ReviewedTool, type StepSpec } from '../types.js';
 import { ArtifactNameError, slug } from './artifact-names.js';
-import { FINDINGS_CATEGORIES, gateJobList, GateJobListError, PIPEGEN_JOB_CATEGORIES, readableFormat, type JobListEntry } from './gate-job-list.js';
+import { FINDINGS_CATEGORIES, gateJobList, GateJobListError, jobIdFor, PIPEGEN_JOB_CATEGORIES, readableFormat, type JobListEntry } from './gate-job-list.js';
 import { runLinters } from './linters.js';
 import { COMMIT_SHA_RE } from './names.js';
 import { NEED_ID_CATEGORY } from './need-ids.js';
@@ -350,7 +350,12 @@ interface Expected {
   final: boolean;
   /** the tool reads the checked-out workspace (every scanner but the image and URL ones): its job needs the locked checkout first */
   readsWorkspace: boolean;
+  /** the job id of the check this step is for (jobIdFor of its need and service), and the job it must run in: that same id, or `base-scan` for the base twin (C0b fix round 1, ruling 3) */
+  need?: string; owner?: string;
 }
+
+/** A judged job, kept for the checks that need every file judged first (the gate's binding to the jobs it lists). */
+interface JobRecord { id: string; judged: readonly Judged[]; outputs: unknown }
 
 interface Expectations {
   runs: Expected[];
@@ -370,6 +375,8 @@ interface Expectations {
   byId: Map<string, ReviewedTool>;
   /** checks that need every file judged first (the gate's job list), run once after the last file */
   deferred: (() => void)[];
+  /** every steps job judged, in every file */
+  jobs: JobRecord[];
 }
 
 const coreOf = (s: RenderedStep): Obj => ({ id: s.id, uses: s.uses, with: s.with, run: s.run, shell: s.shell, env: s.env, 'working-directory': s['working-directory'] });
@@ -407,6 +414,11 @@ function readsWorkspace(entryId: string): boolean {
   return !(kinds.length > 0 && kinds.every((k) => k === 'image-digest' || k === 'local-url'));
 }
 
+/** The job id of a check (the gate's job list key), or undefined for a name that cannot make one. */
+function keyOf(needId: string, service: string | undefined): string | undefined {
+  try { return jobIdFor(needId, service); } catch (e) { if (e instanceof GateJobListError) return undefined; throw e; }
+}
+
 function expectations(draft: PipelineDraft, platform: PlatformActions, reviewed: readonly ReviewedTool[], add: Add, notes: string[]): Expectations {
   const byId = new Map(reviewed.map((t) => [t.id, t]));
   const actions = new Map<string, ReviewedTool>();
@@ -423,11 +435,11 @@ function expectations(draft: PipelineDraft, platform: PlatformActions, reviewed:
   }
   const ex: Expectations = {
     runs: [], runIds: new Set(), actions, actionPaths: new Set([...actions.keys()].map((k) => k.slice(0, k.lastIndexOf('@')))), images,
-    declared: new Set(), allowed: new Set(PIPEGEN_SECRETS), rendered: new Set(), matched: new Set(), npmPins: new Map(), byId, deferred: [],
+    declared: new Set(), allowed: new Set(PIPEGEN_SECRETS), rendered: new Set(), matched: new Set(), npmPins: new Map(), byId, deferred: [], jobs: [],
   };
   const ctxs: RenderContext[] = SENTINELS.map((t) => ({ profile: draft.profile, targets: { ...t } }));
   const needOf = (needId: string, service: string | undefined) => draft.needs.find((n) => n.id === needId && n.service === service);
-  const record = (source: string, results: RenderedStep[][], appRunning: boolean, blocking: boolean, readsWorkspace: boolean): void => {
+  const record = (source: string, results: RenderedStep[][], appRunning: boolean, blocking: boolean, readsWorkspace: boolean, need: string | undefined, owner: string | undefined): void => {
     const [a, b] = results as [RenderedStep[], RenderedStep[]];
     const pins = new Map<string, string[]>();
     const lastRun = a.map((s) => s.run !== undefined).lastIndexOf(true);
@@ -441,7 +453,7 @@ function expectations(draft: PipelineDraft, platform: PlatformActions, reviewed:
         const kind = slotKindOf(v, SENTINELS[0]);
         if (kind !== undefined) slots.set(k, kind);
       }
-      ex.runs.push({ step: s, slots, source, appRunning, blocking, readsWorkspace, final: i === lastRun });
+      ex.runs.push({ step: s, slots, source, appRunning, blocking, readsWorkspace, final: i === lastRun, ...(need === undefined ? {} : { need }), ...(owner === undefined ? {} : { owner }) });
       if (s.id !== undefined) ex.runIds.add(s.id);
     });
     ex.npmPins.set(source, pins);
@@ -460,9 +472,10 @@ function expectations(draft: PipelineDraft, platform: PlatformActions, reviewed:
     const appRunning = t.categories.some((c) => APP_RUNNING_CATEGORIES.has(c));
     try {
       const blocking = needOf(spec.needId, spec.service)?.blocking ?? true;
-      record(`spec:${i}`, ctxs.map((c) => renderStep(spec, t, platform, c).steps), appRunning, blocking, readsWorkspace(t.id));
+      const need = keyOf(spec.needId, spec.service);
+      record(`spec:${i}`, ctxs.map((c) => renderStep(spec, t, platform, c).steps), appRunning, blocking, readsWorkspace(t.id), need, need);
       // the target-branch variant (the base-scan job): the same spec, rendered into the base artifact folder
-      record(`spec:${i}:base`, ctxs.map((c) => renderStep(spec, t, platform, { ...c, base: true }).steps), appRunning, blocking, readsWorkspace(t.id));
+      record(`spec:${i}:base`, ctxs.map((c) => renderStep(spec, t, platform, { ...c, base: true }).steps), appRunning, blocking, readsWorkspace(t.id), need, 'base-scan');
       ex.rendered.add(`spec:${i}`);
       // only a spec that rendered declares its secrets (one that did not names no step, so nothing may carry them)
       for (const n of spec.secrets ?? []) ex.declared.add(n);
@@ -478,7 +491,8 @@ function expectations(draft: PipelineDraft, platform: PlatformActions, reviewed:
       const ps = projectScriptFor(need, s);
       if (ps === null) continue;
       try {
-        record(`script:${need.id}:${s.name}`, ctxs.map((c) => renderProjectScript(ps, platform, c).steps), false, need.blocking, true);
+        const key = keyOf(need.id, need.service);
+        record(`script:${need.id}:${s.name}`, ctxs.map((c) => renderProjectScript(ps, platform, c).steps), false, need.blocking, true, key, key);
       } catch (e) {
         if (!(e instanceof RenderError)) throw e;
       }
@@ -493,6 +507,8 @@ interface FileCtx {
   file: CreatedFile; add: Add; ex: Expectations; draft: PipelineDraft;
   /** every parsed workflow and action file, by `<repo>:<path>` */
   others: Map<string, Parsed>;
+  /** the event names that start the file (null when unreadable) */
+  triggers?: string[] | null;
 }
 
 const issueFor = (fc: FileCtx) => (check: RefereeCheck, message: string): void => fc.add(fc.file.path, check, message);
@@ -609,6 +625,7 @@ function judgeJob(fc: FileCtx, id: string, j: unknown): void {
   judgeServices(fc, where, j.services);
   if (!Array.isArray(j.steps)) { bad('template', `${where} has no list of steps.`); judgeOutputs(fc, id, where, j, []); return; }
   const judged = judgeJobSteps(fc, where, j.steps, true, id);
+  fc.ex.jobs.push({ id, judged, outputs: j.outputs });
   judgeOutputs(fc, id, where, j, judged);
   judgeStepPolicy(fc, id, where, j, judged);
   judgeGateSteps(fc, id, where, j, judged);
@@ -620,42 +637,102 @@ function judgeOutputs(fc: FileCtx, id: string, where: string, j: Obj, judged: re
 }
 
 /**
- * The gate step in mode `gate` (ruling S4): only in the job `gate`, with the `jobs` input, and its `job-list` literal equal to
- * gateJobList(draft) with the gate job's `needs` covering every job of the list, else `not-gate-readable`. Checked after every
- * file is judged (the list counts only the steps a parsed file holds, and the scanner jobs may come after the gate in a file).
+ * The job `gate` decides (C0b fix round 1, rulings 1 to 3). It runs the gate action exactly once, in mode `gate` (whatever the
+ * draft holds: with no checks the gate still has to run), and has `if: always()` (a skipped required check counts as passed). The
+ * gate action in mode `gate` runs in no other job. Its `job-list` literal must equal gateJobList(draft) with `needs` covering every
+ * listed job, and each listed job must really hold the check it is listed for (judgeListedJobs). The list and job checks run after
+ * every file is judged (the list counts only the steps a parsed file holds, and the scanner jobs may come after the gate in a file).
  */
 function judgeGateSteps(fc: FileCtx, id: string, where: string, j: Obj, judged: readonly Judged[]): void {
-  const gates = judged.filter((x) => x.kind === 'gate' && x.step.with?.mode === 'gate');
-  if (gates.length === 0) return;
   const bad = issueFor(fc);
-  if (id !== 'gate') { bad('not-gate-readable', `${where} runs the gate action in mode gate, which only the job gate does (the required check ${GATE_CHECK_NAME} is its result).`); return; }
-  if (gates.length > 1) bad('not-gate-readable', `${where} runs the gate action in mode gate ${gates.length} times; once is the gate.`);
-  const needs = needsList(j.needs).filter((x): x is string => typeof x === 'string');
-  for (const g of gates) {
-    if (g.step.with?.jobs === undefined) bad('not-gate-readable', `${where}: the gate step has no jobs input, so it would not see the results of the jobs it needs.`);
-    const literal = g.step.with?.['job-list'];
-    fc.ex.deferred.push(() => {
-      let expected: JobListEntry[];
-      try {
-        expected = gateJobList(fc.draft, { formatOf: reviewedFormatOf(fc.ex) });
-      } catch (e) {
-        if (!(e instanceof GateJobListError || e instanceof ArtifactNameError)) throw e;
-        bad('not-gate-readable', `${where}: the job list of this pipeline can not be made (${safeText(e.message, 200)}), so the gate has no list to read.`);
-        return;
-      }
-      let actual: unknown;
-      try { actual = typeof literal === 'string' ? JSON.parse(literal) : undefined; } catch { actual = undefined; }
-      if (!isDeepStrictEqual(actual, JSON.parse(JSON.stringify(expected)))) {
-        const listed = Array.isArray(actual) ? actual.map((x) => (isObj(x) ? String(x.job) : '?')) : [];
-        const want = expected.map((e) => e.job);
-        const diff = [...want.filter((x) => !listed.includes(x)).map((x) => `${x} is missing`), ...listed.filter((x) => !want.includes(x)).map((x) => `${x} is extra`)];
-        bad('not-gate-readable', `${where}: the gate's job-list is not the list this pipeline needs (${safeText(diff.length > 0 ? diff.join(', ') : 'an entry differs', 200)}), so the gate would read other checks than the pipeline runs.`);
-      }
-      for (const e of expected) {
-        if (!needs.includes(e.job)) bad('not-gate-readable', `${where} does not need the job ${show(e.job)} of its job list, so the gate would not wait for that check (needs must include every listed job).`);
-      }
-    });
+  const gateKind = judged.filter((x) => x.kind === 'gate');
+  const gates = gateKind.filter((x) => x.step.with?.mode === 'gate');
+  if (id !== 'gate') {
+    if (gates.length > 0) bad('not-gate-readable', `${where} runs the gate action in mode gate, which only the job gate does (the required check ${GATE_CHECK_NAME} is its result).`);
+    return;
   }
+  if (j.if !== 'always()') bad('not-gate-readable', `${where} must have if: always(): without it a failing check skips the gate, and a skipped required check counts as passed.`);
+  if (gateKind.length !== 1 || gates.length !== 1) {
+    bad('not-gate-readable', `${where} must run the gate action exactly once, in mode gate (it has ${gateKind.length} gate step${gateKind.length === 1 ? '' : 's'}${gateKind.length === 0 ? '' : `, modes ${gateKind.map((x) => show(String(x.step.with?.mode ?? 'none'))).join(', ')}`}); otherwise the required check ${GATE_CHECK_NAME} decides nothing.`);
+    return;
+  }
+  const g = gates[0] as Judged;
+  const needs = needsList(j.needs).filter((x): x is string => typeof x === 'string');
+  if (g.step.with?.jobs === undefined) bad('not-gate-readable', `${where}: the gate step has no jobs input, so it would not see the results of the jobs it needs.`);
+  const literal = g.step.with?.['job-list'];
+  fc.ex.deferred.push(() => {
+    let expected: JobListEntry[];
+    try {
+      expected = gateJobList(fc.draft, { formatOf: reviewedFormatOf(fc.ex) });
+    } catch (e) {
+      if (!(e instanceof GateJobListError || e instanceof ArtifactNameError)) throw e;
+      bad('not-gate-readable', `${where}: the job list of this pipeline can not be made (${safeText(e.message, 300)}), so the gate has no list to read.`);
+      return;
+    }
+    let actual: unknown;
+    try { actual = typeof literal === 'string' ? JSON.parse(literal) : undefined; } catch { actual = undefined; }
+    if (!isDeepStrictEqual(actual, JSON.parse(JSON.stringify(expected)))) {
+      const listed = Array.isArray(actual) ? actual.map((x) => (isObj(x) ? String(x.job) : '?')) : [];
+      const want = expected.map((e) => e.job);
+      const diff = [...want.filter((x) => !listed.includes(x)).map((x) => `${x} is missing`), ...listed.filter((x) => !want.includes(x)).map((x) => `${x} is extra`)];
+      bad('not-gate-readable', `${where}: the gate's job-list is not the list this pipeline needs (${safeText(diff.length > 0 ? diff.join(', ') : 'an entry differs', 200)}), so the gate would read other checks than the pipeline runs.`);
+    }
+    for (const e of expected) {
+      if (!needs.includes(e.job)) bad('not-gate-readable', `${where} does not need the job ${show(e.job)} of its job list, so the gate would not wait for that check (needs must include every listed job).`);
+    }
+    judgeListedJobs(fc.ex, expected, bad);
+  });
+}
+
+/**
+ * Each job the gate lists is the job that runs its check, and no other job does (C0b fix round 1, ruling 3): the steps pipegen
+ * rendered for the check (its tool run or project script, not the shared checkout and installs) sit in `entry.job` and nowhere else;
+ * their base twins only in `base-scan`; a findings job holds the scrub and the upload of its artifact and declares exactly the
+ * outputs the gate reads (`<artifact>-sha256|-status|-error`); an artifact is uploaded once in the whole workflow set. Without this the
+ * gate could wait on an empty job, so its `success` would say nothing about the check, which runs (or fails) in a job nobody reads.
+ */
+function judgeListedJobs(ex: Expectations, expected: readonly JobListEntry[], bad: (check: RefereeCheck, message: string) => void): void {
+  const listed = new Set(expected.map((e) => e.job));
+  const nb = (m: string): void => bad('not-gate-readable', m);
+  // a rendered step of a listed check runs in its own job only
+  for (const r of ex.jobs) {
+    for (const x of r.judged) {
+      const m = x.match;
+      if (m?.need === undefined || m.owner === undefined || !listed.has(m.need) || x.step.run === undefined || x.step.id?.startsWith('pipegen-') === true) continue;
+      if (r.id !== m.owner) nb(`The step ${show(x.step.name)} belongs to the job ${show(m.owner)} (the check ${show(m.need)}${m.owner === 'base-scan' ? ', run on the base' : ''}) but sits in the job ${show(r.id)}: the gate reads the job ${show(m.owner)}, so this step's result would not count.`);
+    }
+  }
+  const holds = (jobId: string): readonly Judged[] => ex.jobs.filter((r) => r.id === jobId).flatMap((r) => r.judged);
+  const outputsOf = (jobId: string): Record<string, unknown>[] => ex.jobs.filter((r) => r.id === jobId).map((r) => (isObj(r.outputs) ? r.outputs : {}));
+  const withOf = (x: Judged, k: string): unknown => x.step.with?.[k];
+  for (const e of expected) {
+    // 1. the job holds the rendered tool or script of its check
+    const sources = [...new Set(ex.runs.filter((r) => r.need === e.job && r.owner === e.job && !r.source.endsWith(':base') && r.step.id?.startsWith('pipegen-') !== true).map((r) => r.source))];
+    for (const src of sources) {
+      if (!holds(e.job).some((x) => x.match?.source === src)) nb(`The job ${show(e.job)} is in the gate's list for the check ${show(e.needId)}, but it holds no step of the check (the rendered ${src.startsWith('script:') ? 'project script' : 'tool run'}); the gate would wait on a job that does not run it.`);
+    }
+    if (e.artifact === undefined) continue;
+    // 2. a findings job holds the scrub and the upload of its artifact, and declares its outputs; no other job touches that artifact
+    for (const [artifact, home, label] of [[e.artifact, e.job, 'result'], [e.baseArtifact, 'base-scan', 'base result']] as const) {
+      if (artifact === undefined) continue;
+      const scrubs = ex.jobs.flatMap((r) => r.judged.filter((x) => x.kind === 'scrub' && withOf(x, 'artifact') === artifact).map(() => r.id));
+      const uploads = ex.jobs.flatMap((r) => r.judged.filter((x) => x.kind === 'upload-artifact' && withOf(x, 'name') === artifact).map(() => r.id));
+      for (const id of new Set([...scrubs, ...uploads])) if (id !== home) nb(`The scrub step of the ${label} ${show(artifact)} sits in the job ${show(id)}, but only the job ${show(home)} may hold the scrub and the upload of it.`);
+      if (artifact === e.artifact) {
+        if (!scrubs.includes(home)) nb(`The job ${show(home)} holds no scrub step of the ${label} ${show(artifact)}, so the gate would have nothing it can trust to read.`);
+        if (!uploads.includes(home)) nb(`The job ${show(home)} does not upload the ${label} ${show(artifact)}, so the gate would have nothing to download.`);
+      }
+      if (scrubs.includes(home)) {
+        for (const n of ['sha256', 'status', 'error']) {
+          if (!outputsOf(home).some((o) => Object.hasOwn(o, `${artifact}-${n}`))) nb(`The job ${show(home)} must declare the output ${show(`${artifact}-${n}`)}: the gate reads the scrub's ${n} from the job's outputs (a missing one reads as no result).`);
+        }
+      }
+    }
+  }
+  // an artifact name is uploaded by one step in the whole set of files (a second upload of one name fails at run time, or hides the first)
+  const uploadedBy = new Map<string, number>();
+  for (const r of ex.jobs) for (const x of r.judged) if (x.kind === 'upload-artifact' && typeof withOf(x, 'name') === 'string') uploadedBy.set(withOf(x, 'name') as string, (uploadedBy.get(withOf(x, 'name') as string) ?? 0) + 1);
+  for (const [name, n] of uploadedBy) if (n > 1) nb(`The artifact ${show(name)} is uploaded by more than one step (${n}); one name has one upload, or a later one could replace the scrubbed result.`);
 }
 
 /** The output format of a spec's reviewed tool, only for a spec that rendered and that a parsed file holds a step of (an action spec counts as reviewed): the one rule of the blocking rule and the job list. */
@@ -802,7 +879,7 @@ function judgeJobSteps(fc: FileCtx, where: string, steps: unknown[], job: boolea
     const format = spec === undefined || !isObj(spec) || !isObj(spec.tool) ? undefined : fc.ex.byId.get(spec.tool.id)?.step.output.format;
     if (spec !== undefined && x.step.id !== undefined && (format === 'sarif' || format === 'zap-json')) scans.set(x.step.id, { tool: spec.tool.id, format });
   }
-  for (const problem of checkJobOrder(forOrder, { ...(jobId === undefined ? {} : { id: jobId }), scans })) fc.add(fc.file.path, 'injection', `In ${where}: ${problem}`);
+  for (const problem of checkJobOrder(forOrder, { ...(jobId === undefined ? {} : { id: jobId }), scans, ...(fc.triggers == null ? {} : { triggers: fc.triggers }) })) fc.add(fc.file.path, 'injection', `In ${where}: ${problem}`);
   // a merged repo `npm ci` (dedupeJobSteps) carries exactly the pins of the tools of this job that need it
   const sources = new Set(judged.flatMap((x) => (x.match === undefined ? [] : [x.match.source])));
   for (const x of judged) {
@@ -1233,7 +1310,7 @@ export async function referee(files: CreatedFile[], draft: PipelineDraft, platfo
   for (const f of files) {
     const p = parsed.get(`${f.repo}:${f.path}`);
     if (p === undefined) continue;
-    const fc: FileCtx = { file: f, add, ex, draft, others: parsed };
+    const fc: FileCtx = { file: f, add, ex, draft, others: parsed, triggers: triggersOf(p.js.on) };
     if (fileKind(f) === 'action') judgeAction(fc, p.js);
     else if (f.inserted !== undefined) judgeEdited(fc, p, f.inserted);
     else {

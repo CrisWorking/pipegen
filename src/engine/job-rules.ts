@@ -3,7 +3,7 @@
 // the referee and the linters import them from here, so no second copy can drift. It imports only the leaves render-error.ts,
 // tool-flags.ts and types.ts (test/final-fix-b.test.ts and test/module-graph.test.ts check this).
 import { EXPR, own, RenderError, show } from './render-error.js';
-import { ARGV_POLICIES, BASE_CHECKOUT_REFS, CHECKER_STEP_ID_RE, GATE_USES_RE, PLATFORM_USES, rendererInputProblems, RENDERER_INPUTS, scrubStepId, SCRUB_STEP_ID_RE, SETUP_STEP_ID_RE, sha16, TOOL_STEP_ID_RE } from './tool-flags.js';
+import { ARGV_POLICIES, BASE_CHECKOUT_REFS, BASE_REF_FOR_TRIGGER, CHECKER_STEP_ID_RE, GATE_USES_RE, PLATFORM_USES, rendererInputProblems, RENDERER_INPUTS, scrubStepId, SCRUB_STEP_ID_RE, SETUP_STEP_ID_RE, sha16, TOOL_STEP_ID_RE } from './tool-flags.js';
 
 /** One step of a job, as pipegen renders it. `usesComment` becomes the trailing `# <version>` comment on `uses:`. */
 export interface RenderedStep {
@@ -114,16 +114,21 @@ export function isKnownHarmless(s: RenderedStep): boolean {
 export interface ScanFact { tool: string; format: 'sarif' | 'zap-json' }
 /**
  * What the shared job rules know about the job they judge (Plan C C0b):
- * - `id`: the job's id. A checkout `ref` (the base commit) is allowed only in the job `base-scan`; with no id it is refused.
+ * - `id`: the job's id. A checkout `ref` is allowed only in the job `base-scan`; with no id it is refused.
  * - `scans`: the scan steps pipegen rendered or the referee recognised, by step id (`tool-run-…` / `checker-run-…`), each with
- *   its reviewed tool and result format. With it, a scrub step's `tool` and `format` must equal those of its scan step; without
- *   it the rule still checks that the tool is a reviewed one and that a scan step of the result precedes the scrub.
+ *   its reviewed tool and result format. A scrub step's `tool` and `format` must equal those of its scan step. REQUIRED by
+ *   dedupeJobSteps (fix round 1, minor 10): a job built without the facts could not be held to them. A job with no scan passes NO_SCANS.
+ *   checkJobOrder itself accepts a context without it (only the unit tests of the order rule do that): the equality is then skipped.
+ * - `triggers`: the event names that start the file, required for `base-scan` (the base commit form depends on the event).
  */
-export interface JobContext { id?: string; scans?: ReadonlyMap<string, ScanFact> }
+export interface JobContext { id?: string; scans: ReadonlyMap<string, ScanFact>; triggers?: readonly string[] }
+/** The scan facts of a job that holds no scan step. */
+export const NO_SCANS: ReadonlyMap<string, ScanFact> = new Map();
 
 /** The job a base-commit checkout may sit in (ruling S16). */
 export const BASE_SCAN_JOB = 'base-scan';
 const BASE_REF_VALUES: readonly string[] = Object.values(BASE_CHECKOUT_REFS);
+const HARDEN_USES_RE = /^bullfrogsec\/bullfrog@[0-9a-f]{40}$/;
 
 /**
  * The order rule of the referee (S6 c, Plan 7a), as an allowlist that fails closed (review-6b-r2 C1). A step that runs or
@@ -138,7 +143,7 @@ const BASE_REF_VALUES: readonly string[] = Object.values(BASE_CHECKOUT_REFS);
  * id is the referee's re-render match (a run step that is not exactly a step pipegen renders is unrecognised, and the referee
  * drops its id before calling this), not this function on its own.
  */
-export function checkJobOrder(steps: readonly RenderedStep[], job: JobContext = {}): string[] {
+export function checkJobOrder(steps: readonly RenderedStep[], job: Partial<JobContext> = {}): string[] {
   const problems: string[] = [];
   let repoCode: string | undefined;
   // A job with a scrub step names PIPEGEN_FP_KEY, and GitHub hands every secret a job names to its runner when the job starts: any
@@ -161,7 +166,34 @@ export function checkJobOrder(steps: readonly RenderedStep[], job: JobContext = 
       problems.push(`Step ${i + 1} (${show(s.name)}) checks out a ref, which only the base commit of the ${BASE_SCAN_JOB} job may be (${BASE_REF_VALUES.join(' or ')}): any other ref would scan code pipegen did not choose, or put the pull request's code where the base is expected.`);
     }
   });
+  if (job.id === BASE_SCAN_JOB) problems.push(...baseScanProblems(steps, job.triggers));
   problems.push(...scrubChainProblems(steps, job.scans));
+  return problems;
+}
+
+/**
+ * The base-scan job scans the base commit and nothing else (C0b fix round 1, ruling 5): exactly one checkout, the first step
+ * after any harden step, with a `ref` that is the base commit form of EVERY event that starts the file. An event payload that lacks
+ * the field gives an empty ref and the checkout falls back to the head, so every finding would count as old and nothing new would block.
+ */
+export function baseScanProblems(steps: readonly RenderedStep[], triggers: readonly string[] | undefined): string[] {
+  const problems: string[] = [];
+  const at = steps.flatMap((s, i) => (isCheckout(s) ? [i] : []));
+  if (at.length !== 1) return [`The ${BASE_SCAN_JOB} job has ${at.length} checkout steps; it needs exactly one checkout of the base commit (a second one could replace it with the head).`];
+  const i = at[0] as number;
+  const checkout = steps[i] as RenderedStep;
+  if (!steps.slice(0, i).every((s) => s.run === undefined && s.uses !== undefined && HARDEN_USES_RE.test(s.uses))) problems.push(`The checkout of the ${BASE_SCAN_JOB} job must be its first step (after any harden step): a step before it could leave files the base scan would read.`);
+  const ref = checkout.with?.ref;
+  if (ref === undefined) problems.push(`The checkout of the ${BASE_SCAN_JOB} job needs a ref (the base commit): without one it checks out the head and the scan would call it the base.`);
+  if (triggers === undefined) problems.push(`The ${BASE_SCAN_JOB} job can be judged only with the triggers of its file (the base commit form depends on the event).`);
+  else if (triggers.length === 0) problems.push(`The file of the ${BASE_SCAN_JOB} job has no trigger pipegen can read, so no base commit form fits it.`);
+  else {
+    for (const t of triggers) {
+      const form = Object.hasOwn(BASE_REF_FOR_TRIGGER, t) ? (BASE_REF_FOR_TRIGGER as Readonly<Record<string, keyof typeof BASE_CHECKOUT_REFS>>)[t] : undefined;
+      if (form === undefined) problems.push(`The ${BASE_SCAN_JOB} job has no base commit form for the trigger ${show(t)} (only ${Object.keys(BASE_REF_FOR_TRIGGER).join(', ')}).`);
+      else if (ref !== undefined && ref !== BASE_CHECKOUT_REFS[form]) problems.push(`The checkout of the ${BASE_SCAN_JOB} job uses ${show(ref)}, which does not fit the trigger ${t} (its base is ${BASE_CHECKOUT_REFS[form]}): that event's payload has no such field, so the checkout would fall back to the head. Use one file per form.`);
+    }
+  }
   return problems;
 }
 

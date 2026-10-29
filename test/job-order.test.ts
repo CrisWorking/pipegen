@@ -1,6 +1,7 @@
 // Plan B 6c Part 0 (review-6b-r2 C1, C2, C5): the job order rule is an allowlist that fails closed and is enforced where a
 // job is assembled; every rendered step has a recognised id; an npm checker is one step.
 import { describe, expect, it } from 'vitest';
+import { NO_SCANS } from '../src/engine/job-rules.js';
 import { checkJobOrder, dedupeJobSteps, RenderError, renderProjectScript, renderScrub, renderStepWith, type RenderedStep, type RenderResult } from '../src/engine/render-step.js';
 import { NEED_IDS } from '../src/engine/need-ids.js';
 import { ARGV_POLICIES, type ArgvPolicy } from '../src/engine/tool-flags.js';
@@ -51,17 +52,17 @@ describe('C1: checkJobOrder is an allowlist that fails closed (the reviewer\'s p
     const scrub = renderScrub('pipegen-out-secrets', '${{ runner.temp }}/pipegen-raw/pipegen-out-secrets/gitleaks.sarif', 'gitleaks', 'sarif', gateEntry());
     expect(checkJobOrder([...vitest, upload]).length).toBeGreaterThan(0);
     expect(checkJobOrder([...vitest, scrub]).length).toBeGreaterThan(0);
-    expect(checkJobOrder(dedupeJobSteps([...vitest, ...steps('c8')]))).toEqual([]);
+    expect(checkJobOrder(dedupeJobSteps([...vitest, ...steps('c8')], { scans: NO_SCANS }))).toEqual([]);
     expect(checkJobOrder([...vitest, { name: 'mine', run: 'true' }]).length).toBe(0);
   });
   it('[checkers, then repo code] passes, with the prelude (checkout, setup-node) in front', () => {
     const prelude: RenderedStep[] = [{ name: 'Checkout', uses: `actions/checkout@${sha}` }, { name: 'Node', uses: `actions/setup-node@${sha}` }];
-    const job = dedupeJobSteps([...prelude, ...steps('eslint'), ...steps('gitleaks'), ...steps('biome'), ...steps('vitest-coverage')]);
+    const job = dedupeJobSteps([...prelude, ...steps('eslint'), ...steps('gitleaks'), ...steps('biome'), ...steps('vitest-coverage')], { scans: NO_SCANS });
     expect(checkJobOrder(job)).toEqual([]);
   });
   it('dedupeJobSteps throws on a bad order, so no job can be assembled in it', () => {
-    expect(() => dedupeJobSteps([...steps('vitest-coverage'), ...steps('gitleaks')])).toThrow(RenderError);
-    expect(() => dedupeJobSteps([{ name: 'x', run: 'true' }, ...steps('eslint')])).toThrow(/repo-code step/);
+    expect(() => dedupeJobSteps([...steps('vitest-coverage'), ...steps('gitleaks')], { scans: NO_SCANS })).toThrow(RenderError);
+    expect(() => dedupeJobSteps([{ name: 'x', run: 'true' }, ...steps('eslint')], { scans: NO_SCANS })).toThrow(/repo-code step/);
   });
 });
 
@@ -76,7 +77,7 @@ describe('C2: every rendered step has a recognised id, and a checker is one step
       // the check of a repo-code tool's install has no id on purpose: it follows the repo's own `npm ci`, so it is repo code
       for (const s of r.steps.filter((x) => x.run !== undefined && !x.name.includes('check the installed tool'))) expect(s.id, `${t.id}: ${s.name}`).toMatch(RECOGNISED);
       expect(new Set(r.steps.map((s) => s.id).filter((i) => i !== undefined)).size, t.id).toBe(r.steps.filter((s) => s.id !== undefined).length);
-      expect(checkJobOrder(dedupeJobSteps(r.steps)), t.id).toEqual([]);
+      expect(checkJobOrder(dedupeJobSteps(r.steps, { scans: NO_SCANS })), t.id).toEqual([]);
     }
     expect(rendered).toBeGreaterThan(15);
   });
@@ -191,7 +192,7 @@ describe('6c fix round 1: an id counts only on the right kind of step, and actio
 
 describe('6c fix round 1: dedupe keeps the guarded repo npm ci (finding 5)', () => {
   const script = () => renderProjectScript({ kind: 'project-script', needId: 'unit-tests', service: 'app', script: 'test' }, platform(), ctxFor([service({ name: 'app', path: '.', scripts: ['test'] })])).steps;
-  const guarded = (job: RenderedStep[]): RenderedStep => dedupeJobSteps(job).find((s) => s.id?.startsWith('pipegen-npm-ci-')) as RenderedStep;
+  const guarded = (job: RenderedStep[]): RenderedStep => dedupeJobSteps(job, { scans: NO_SCANS }).find((s) => s.id?.startsWith('pipegen-npm-ci-')) as RenderedStep;
   it('[project script, vitest] and [vitest, project script]: the one npm ci that stays checks vitest\'s pins before installing', () => {
     const vitest = steps('vitest-coverage');
     const want = JSON.parse(vitest.find((s) => s.id?.startsWith('pipegen-npm-ci-'))?.env?.PIPEGEN_NPM_EXPECT as string) as { name: string }[];
@@ -200,11 +201,11 @@ describe('6c fix round 1: dedupe keeps the guarded repo npm ci (finding 5)', () 
       const ci = guarded(job);
       expect(JSON.parse(ci.env?.PIPEGEN_NPM_EXPECT as string).map((w: { name: string }) => w.name).sort()).toEqual(want.map((w) => w.name).sort());
       expect(ci.run).toContain('process.env.PIPEGEN_NPM_EXPECT');
-      expect(dedupeJobSteps(job).filter((s) => s.id?.startsWith('pipegen-npm-ci-'))).toHaveLength(1);
+      expect(dedupeJobSteps(job, { scans: NO_SCANS }).filter((s) => s.id?.startsWith('pipegen-npm-ci-'))).toHaveLength(1);
     }
   });
   it('two project scripts of one service share one checkout, setup-node and npm ci', () => {
-    const both = dedupeJobSteps([...script(), ...renderProjectScript({ kind: 'project-script', needId: 'lint', service: 'app', script: 'lint' }, platform(), ctxFor([service({ name: 'app', path: '.', scripts: ['test', 'lint'] })])).steps]);
+    const both = dedupeJobSteps([...script(), ...renderProjectScript({ kind: 'project-script', needId: 'lint', service: 'app', script: 'lint' }, platform(), ctxFor([service({ name: 'app', path: '.', scripts: ['test', 'lint'] })])).steps], { scans: NO_SCANS });
     expect(both.filter((s) => s.uses?.startsWith('actions/checkout@'))).toHaveLength(1);
     expect(both.filter((s) => s.id?.startsWith('pipegen-npm-ci-'))).toHaveLength(1);
     expect(both.filter((s) => s.id?.startsWith('repocode-'))).toHaveLength(2);
@@ -212,7 +213,7 @@ describe('6c fix round 1: dedupe keeps the guarded repo npm ci (finding 5)', () 
   it('two guarded installs with different pins of one package are refused', () => {
     const a = steps('vitest-coverage');
     const b = steps('vitest-coverage').map((s) => (s.id?.startsWith('pipegen-npm-ci-') ? { ...s, env: { ...s.env, PIPEGEN_NPM_EXPECT: (s.env?.PIPEGEN_NPM_EXPECT as string).replace(/"version":"[^"]+"/, '"version":"0.0.1"') } } : s));
-    expect(() => dedupeJobSteps([...a, ...b])).toThrow(RenderError);
+    expect(() => dedupeJobSteps([...a, ...b], { scans: NO_SCANS })).toThrow(RenderError);
   });
 });
 
@@ -224,29 +225,29 @@ describe('7a Part 0 (review-6c-r1 minors 2 and 3): dedupe compares contents; set
     const a = script('test');
     const b = script('lint').map((s) => (s.id === 'pipegen-checkout' ? { ...s, with: { ...s.with, 'fetch-depth': '0' } } : s));
     expect(checkoutOf(a).with?.['fetch-depth']).toBe('1');
-    expect(() => dedupeJobSteps([...a, ...b])).toThrow(/pipegen-checkout/);
+    expect(() => dedupeJobSteps([...a, ...b], { scans: NO_SCANS })).toThrow(/pipegen-checkout/);
   });
   it('two same-id setup-node steps that differ in uses or with are refused', () => {
     const a = script('test');
     const otherSha = a.map((s) => (s.id?.startsWith('pipegen-setup-node-') ? { ...s, uses: (s.uses as string).replace(/@[0-9a-f]{40}$/, `@${'b'.repeat(40)}`) } : s));
     const otherWith = a.map((s) => (s.id?.startsWith('pipegen-setup-node-') ? { ...s, with: { ...s.with, extra: 'x' } } : s));
-    expect(() => dedupeJobSteps([...a, ...otherSha.slice(1, 2)])).toThrow(RenderError);
-    expect(() => dedupeJobSteps([...a.slice(0, 2), ...otherWith.slice(1, 2), ...a.slice(2)])).toThrow(RenderError);
+    expect(() => dedupeJobSteps([...a, ...otherSha.slice(1, 2)], { scans: NO_SCANS })).toThrow(RenderError);
+    expect(() => dedupeJobSteps([...a.slice(0, 2), ...otherWith.slice(1, 2), ...a.slice(2)], { scans: NO_SCANS })).toThrow(RenderError);
   });
   it('the same step twice (only the display name differs) is still deduped', () => {
     const a = script('test');
     const again = a.slice(0, 2).map((s) => ({ ...s, name: `${s.name} again` }));
-    expect(dedupeJobSteps([...a.slice(0, 2), ...again, ...a.slice(2)]).filter((s) => s.id?.startsWith('pipegen-'))).toHaveLength(3);
+    expect(dedupeJobSteps([...a.slice(0, 2), ...again, ...a.slice(2)], { scans: NO_SCANS }).filter((s) => s.id?.startsWith('pipegen-'))).toHaveLength(3);
   });
   it('the npm ci pin merge stays: same folder, different tools (their home folders and pins differ) is one step', () => {
-    expect(dedupeJobSteps([...script('test'), ...steps('vitest-coverage')]).filter((s) => s.id?.startsWith('pipegen-npm-ci-'))).toHaveLength(1);
+    expect(dedupeJobSteps([...script('test'), ...steps('vitest-coverage')], { scans: NO_SCANS }).filter((s) => s.id?.startsWith('pipegen-npm-ci-'))).toHaveLength(1);
   });
   it('two same-id npm ci steps that differ in anything but the pins and the home folder are refused', () => {
     const a = script('test');
     const b = script('lint').map((s) => (s.id?.startsWith('pipegen-npm-ci-') ? { ...s, run: `${s.run as string}\necho extra` } : s));
-    expect(() => dedupeJobSteps([...a, ...b])).toThrow(RenderError);
+    expect(() => dedupeJobSteps([...a, ...b], { scans: NO_SCANS })).toThrow(RenderError);
     const c = script('lint').map((s) => (s.id?.startsWith('pipegen-npm-ci-') ? { ...s, env: { ...s.env, OTHER: 'x' } } : s));
-    expect(() => dedupeJobSteps([...a, ...c])).toThrow(RenderError);
+    expect(() => dedupeJobSteps([...a, ...c], { scans: NO_SCANS })).toThrow(RenderError);
   });
   it('a setup or checkout id counts as harmless only on its own platform action', () => {
     const eslint = steps('eslint');

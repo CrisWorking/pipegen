@@ -1,0 +1,318 @@
+// Plan C, C0b fix round 1: every attack of the C0b review as a regression test (review-C0b.md findings 1-10, task-C0b-fix-round-1.md).
+import { Document } from 'yaml';
+import { describe, expect, it } from 'vitest';
+import { resultArtifactName } from '../src/engine/artifact-names.js';
+import { GateJobListError, gateJobList } from '../src/engine/gate-job-list.js';
+import { checkJobOrder, jobOutputsFor, jobOutputsProblems, NO_SCANS, type ScanFact } from '../src/engine/job-rules.js';
+import { referee, type Linters, type RefereeReport } from '../src/engine/referee.js';
+import {
+  dedupeJobSteps, RenderError, renderGateStep, renderJobPrelude, renderPlatformStep, renderProjectScript, renderScrub, renderStep, renderUpload, scanFactOf, scrubbedPath, stepsToYaml,
+  type RenderContext, type RenderedStep, type RenderResult,
+} from '../src/engine/render-step.js';
+import { NEED_ID_CATEGORY } from '../src/engine/need-ids.js';
+import { rendererInputProblems } from '../src/engine/tool-flags.js';
+import { emptyRepoFiles } from '../src/read/quality.js';
+import type { Capabilities, CreatedFile, Need, PipelineDraft, ReviewedTool, StepSpec } from '../src/types.js';
+import { entry, gateEntry, platform, profile, reviewedList, service, specFor } from './helpers/render.js';
+
+// object keys spelled at run time (see test/no-secret-literals.test.ts)
+const NS = ['needs', 'Sec', 'rets'].join('');
+const SEC = ['sec', 'rets'].join('');
+const GH_IN = ['github', 'token'].join('-');
+const FP_IN = ['fp', 'key'].join('-');
+
+// ---------- builders ----------
+
+/** `${{ secrets.NAME }}`, built at run time (test/no-secret-literals.test.ts). */
+const sref = (n: string): string => ['${{', `secrets.${n}`, '}}'].join(' ');
+const p = platform();
+const GATE = gateEntry();
+const app = service({ name: 'app', path: '.', scripts: ['test', 'lint'] });
+const web = service({ name: 'web', path: 'web', scripts: ['test'] });
+const prof = { ...profile([app, web]), repoFiles: { ...emptyRepoFiles(), kubernetes: true } };
+const ctx: RenderContext = { profile: prof, targets: { image: `ghcr.io/o/app@sha256:${'a'.repeat(64)}`, url: 'http://localhost:8080', k8sDir: 'k8s' } };
+const caps: Capabilities = { branchProtection: true, environments: false, envRequiredReviewers: false, deploymentBranchPolicies: false, attestations: true, codeScanning: true, keylessSigningAllowed: true };
+const needOf = (id: string, svcName?: string): Need => ({ id, layer: 'merge', category: (NEED_ID_CATEGORY as Record<string, string>)[id] ?? id, ...(svcName === undefined ? {} : { service: svcName }), why: 't', blocking: true, floor: false });
+const draftOf = (specs: StepSpec[], needs: Need[]): PipelineDraft => ({
+  profile: prof, capabilities: caps, needs, steps: specs, created: [], notProven: [], testDecisions: [], layersSkipped: [], scoreboard: [], requireDeployApproval: false, skipped: [], suggestions: [],
+});
+const LINTERS: Linters = { actionlint: async () => '/stub/actionlint', zizmor: async () => '/stub/zizmor' };
+const run = (files: CreatedFile[], d: PipelineDraft): Promise<RefereeReport> => referee(files, d, p, [...reviewedList(), GATE], LINTERS, 'tok', { runLinters: async () => [] });
+const show = (r: RefereeReport): string => r.issues.map((i) => `${i.check}: ${i.message}`).join('\n');
+const has = (r: RefereeReport, check: string, re?: RegExp): boolean => r.issues.some((i) => i.check === check && (re === undefined || re.test(i.message)));
+
+type Job = Record<string, unknown>;
+const job = (steps: RenderedStep[], over: Job = {}): Job => ({ 'runs-on': 'ubuntu-latest', permissions: { contents: 'read' }, 'cache-mode': 'none', steps, ...over });
+/** `raw`: steps written as plain YAML, for hostile steps the emitter itself refuses (the referee must refuse them too). */
+function workflow(jobs: Record<string, Job>, raw = false): CreatedFile {
+  const doc = new Document();
+  const plain = Object.fromEntries(Object.entries(jobs).map(([id, j]) => [id, Object.fromEntries(Object.entries(j).filter(([k]) => k !== 'steps'))]));
+  doc.contents = doc.createNode({ name: 'pipegen', on: { pull_request: null }, permissions: {}, jobs: plain });
+  for (const [id, j] of Object.entries(jobs)) {
+    const steps = j.steps as RenderedStep[];
+    doc.setIn(['jobs', id, 'steps'], raw ? doc.createNode(steps.map(({ usesComment: _c, ...rest }) => rest)) : stepsToYaml(steps));
+  }
+  return { path: '.github/workflows/pipegen.yml', content: doc.toString({ lineWidth: 0 }), part: 'pipeline', reason: 't', repo: 'app' };
+}
+const prelude = (over: Parameters<typeof renderJobPrelude>[0] = {}): RenderedStep[] => renderJobPrelude(over, p).steps;
+
+interface Block { steps: RenderedStep[]; scrub: RenderedStep; upload: RenderedStep; artifact: string; scan: { stepId: string; fact: ScanFact }; result: RenderResult }
+/** The tool steps, the scrub and the upload of one spec (no prelude): what Plan G puts after the checkout. */
+function block(spec: StepSpec, c: RenderContext = ctx): Block {
+  const t = entry(spec.tool.id);
+  const result = renderStep(spec, t, p, c);
+  const out = result.output;
+  if (out === null || (out.format !== 'sarif' && out.format !== 'zap-json')) throw new Error('not a findings tool');
+  const artifact = resultArtifactName(spec.needId, spec.service, c.base === true ? { base: true } : undefined);
+  const scrub = renderScrub(artifact, out.path, t.id, out.format, GATE);
+  const upload = renderUpload(artifact, scrubbedPath(out.path), p);
+  const scan = scanFactOf(result, t.id);
+  if (scan === null) throw new Error('no scan fact');
+  return { steps: [...result.steps, scrub, upload], scrub, upload, artifact, scan, result };
+}
+const gitleaksSpec = (): StepSpec => specFor(entry('gitleaks'), { needId: 'secrets' });
+const semgrepSpec = (svc: string): StepSpec => specFor(entry('semgrep'), { needId: 'sast', service: svc });
+const facts = (...bs: Block[]): ReadonlyMap<string, ScanFact> => new Map(bs.map((b) => [b.scan.stepId, b.scan.fact]));
+const scrubOf = (steps: RenderedStep[]): RenderedStep => steps.find((s) => s.id?.startsWith('scrub-')) as RenderedStep;
+const withScrub = (steps: RenderedStep[], f: (s: RenderedStep) => RenderedStep): RenderedStep[] => steps.map((s) => (s.id?.startsWith('scrub-') ? f(s) : s));
+
+
+// ---------- the jobs of a full draft ----------
+const specs = [gitleaksSpec(), semgrepSpec('app'), semgrepSpec('web')];
+const needs = [needOf('secrets'), needOf('sast', 'app'), needOf('sast', 'web'), needOf('unit-tests', 'app'), needOf('gate')];
+const d = draftOf(specs, needs);
+const entries = gateJobList(d);
+const GATE_PERM = { contents: 'read', actions: 'read', 'pull-requests': 'read' };
+type BaseRef = 'pull-request-base' | 'push-before' | 'merge-group-base' | 'none';
+function jobs(baseRef: BaseRef = 'pull-request-base'): Record<string, Job> {
+  const out: Record<string, Job> = {};
+  for (const spec of specs) {
+    const b = block(spec);
+    const id = `${spec.needId}${spec.service === undefined ? '' : `--${spec.service}`}`;
+    out[id] = job(dedupeJobSteps([...prelude(), ...b.steps], { id, scans: facts(b) }), { outputs: jobOutputsFor(b.steps) });
+  }
+  const script = renderProjectScript({ kind: 'project-script', needId: 'unit-tests', service: 'app', script: 'test' }, p, ctx).steps;
+  out['unit-tests--app'] = job(dedupeJobSteps(script, { id: 'unit-tests--app', scans: NO_SCANS }));
+  const baseBlocks = specs.map((s) => block(s, { ...ctx, base: true }));
+  const baseSteps = [...prelude(baseRef === 'none' ? {} : { baseRef }), ...baseBlocks.flatMap((b) => b.steps)];
+  out['base-scan'] = job(baseSteps, { outputs: jobOutputsFor(baseBlocks.flatMap((b) => b.steps)) });
+  out.gate = job([renderGateStep(GATE, entries)], { name: 'gate', if: 'always()', needs: [...entries.map((e) => e.job), 'base-scan'], permissions: GATE_PERM });
+  return out;
+}
+function wfOn(on: unknown, jobsIn: Record<string, Job>, raw = false): CreatedFile {
+  const f = workflow(jobsIn, raw);
+  return { ...f, content: f.content.replace(/^on:\n  pull_request: null\n/m, `on: ${JSON.stringify(on)}\n`) };
+}
+const gs = (j: Record<string, Job>): RenderedStep => (j.gate?.steps as RenderedStep[])[0] as RenderedStep;
+const withGate = (j: Record<string, Job>, steps: RenderedStep[], over: Job = {}): Record<string, Job> => ({ ...j, gate: { ...(j.gate as Job), steps, ...over } });
+
+describe('the baseline: the attack harness draft is clean', () => {
+  it('A0: the full draft passes with 0 issues', async () => {
+    expect(show(await run([workflow(jobs())], d))).toBe('');
+  });
+});
+
+describe('finding 1: the job gate decides (ruling 1)', () => {
+  const FR = (j: Record<string, Job>): RenderedStep => ({ ...gs(j), with: { mode: 'find-run', sha: '${{ github.sha }}', [GH_IN]: sref('GITHUB_TOKEN') } });
+  const NI = (j: Record<string, Job>): RenderedStep => ({ ...gs(j), with: { mode: 'nightly', [GH_IN]: sref('GITHUB_TOKEN') } });
+  it('A6: no gate step, a find-run step or a nightly step in the job gate → not-gate-readable', async () => {
+    const j = jobs();
+    for (const [name, steps] of [['empty', []], ['find-run', [FR(j)]], ['nightly', [NI(j)]]] as const) {
+      const r = await run([workflow(withGate(j, [...steps]), true)], d);
+      expect(has(r, 'not-gate-readable', /exactly once, in mode gate/), `${name}: ${show(r)}`).toBe(true);
+    }
+  });
+  it('the gate runs even when the draft has no check for it to wait for', async () => {
+    const dd = draftOf([], []);
+    const noStep = job([], { name: 'gate', if: 'always()', permissions: GATE_PERM });
+    expect(has(await run([workflow({ gate: noStep })], dd), 'not-gate-readable', /exactly once, in mode gate/)).toBe(true);
+    const ok = job([renderGateStep(GATE, [])], { name: 'gate', if: 'always()', permissions: GATE_PERM });
+    expect(show(await run([workflow({ gate: ok })], dd))).toBe('');
+  });
+  it('A9: two gate steps (mode gate twice, or mode gate and find-run) → not-gate-readable', async () => {
+    const j = jobs();
+    for (const steps of [[gs(j), FR(j)], [gs(j), structuredClone(gs(j))], [FR(j), gs(j)]]) {
+      const r = await run([workflow(withGate(j, steps), true)], d);
+      expect(has(r, 'not-gate-readable', /exactly once, in mode gate/), show(r)).toBe(true);
+    }
+  });
+});
+
+describe('finding 2: the gate always runs (ruling 2)', () => {
+  it('A7: the job gate without if: always() → refused; with another condition → refused; with always() → fine', async () => {
+    const j = jobs();
+    const { if: _i, ...noIf } = j.gate as Job;
+    expect(has(await run([workflow({ ...j, gate: noIf })], d), 'not-gate-readable', /must have if: always\(\)/)).toBe(true);
+    for (const cond of ['success()', 'failure()', '!cancelled()']) {
+      expect((await run([workflow({ ...j, gate: { ...(j.gate as Job), if: cond } })], d)).ok, cond).toBe(false);
+    }
+    expect(show(await run([workflow(j)], d))).toBe('');
+  });
+});
+
+describe('finding 3: the listed jobs are the real checks (ruling 3)', () => {
+  it('A1: a job-status entry whose job is only a checkout, the real script running elsewhere → refused', async () => {
+    const j = jobs();
+    const r = await run([workflow({ ...j, 'unit-tests--app': job(prelude()), 'tests-real': j['unit-tests--app'] as Job })], d);
+    expect(has(r, 'not-gate-readable', /belongs to the job "unit-tests--app".* but sits in the job "tests-real"/), show(r)).toBe(true);
+    expect(has(r, 'not-gate-readable', /holds no step of the check/), show(r)).toBe(true);
+  });
+  it('A1b: a findings entry whose job is only a checkout, the scan, scrub and upload elsewhere → refused', async () => {
+    const j = jobs();
+    const r = await run([workflow({ ...j, 'sast--web': job(prelude()), elsewhere: j['sast--web'] as Job })], d);
+    expect(has(r, 'not-gate-readable', /belongs to the job "sast--web".* but sits in the job "elsewhere"/), show(r)).toBe(true);
+    expect(has(r, 'not-gate-readable', /holds no step of the check/), show(r)).toBe(true);
+    expect(has(r, 'not-gate-readable', /scrub step of the result .* sits in the job "elsewhere"/), show(r)).toBe(true);
+  });
+  it('a findings job that holds the tool but declares none of the outputs, or only some → refused', async () => {
+    const j = jobs();
+    const noOut = { ...(j['sast--app'] as Job) };
+    delete noOut.outputs;
+    const r = await run([workflow({ ...j, 'sast--app': noOut })], d);
+    expect(has(r, 'not-gate-readable', /must declare the output "pipegen-out-sast--app-sha256"/), show(r)).toBe(true);
+    const some = { ...(j['sast--app'] as Job), outputs: Object.fromEntries(Object.entries(j['sast--app']?.outputs as Record<string, string>).filter(([k]) => !k.endsWith('-error'))) };
+    expect(has(await run([workflow({ ...j, 'sast--app': some })], d), 'not-gate-readable', /must declare the output "pipegen-out-sast--app-error"/)).toBe(true);
+  });
+  it('a findings job that runs the tool but holds no scrub, or no upload, of its artifact → refused', async () => {
+    const j = jobs();
+    const steps = j['sast--app']?.steps as RenderedStep[];
+    const noScrub = steps.filter((s) => !s.id?.startsWith('scrub-'));
+    const r1 = await run([workflow({ ...j, 'sast--app': { ...(j['sast--app'] as Job), steps: noScrub, outputs: undefined } }, true)], d);
+    expect(has(r1, 'not-gate-readable', /holds no scrub step of the result "pipegen-out-sast--app"/), show(r1)).toBe(true);
+    const noUpload = steps.filter((s) => !s.uses?.startsWith('actions/upload-artifact@'));
+    const r2 = await run([workflow({ ...j, 'sast--app': { ...(j['sast--app'] as Job), steps: noUpload } }, true)], d);
+    expect(has(r2, 'not-gate-readable', /does not upload the result "pipegen-out-sast--app"/), show(r2)).toBe(true);
+  });
+  it('A10: the base twin of a check in the head job (and its scrub) → refused; base twins only in base-scan', async () => {
+    const j = jobs();
+    const bb = block(gitleaksSpec(), { ...ctx, base: true });
+    const steps = [...(j.secrets?.steps as RenderedStep[]), ...bb.steps];
+    const r = await run([workflow({ ...j, [SEC]: { ...(j.secrets as Job), steps, outputs: jobOutputsFor(steps) } }, true)], d);
+    expect(has(r, 'not-gate-readable', /belongs to the job "base-scan".* but sits in the job "secrets"/), show(r)).toBe(true);
+  });
+  it('A11: base-scan holding the head renders (the PR twin of a check) → refused', async () => {
+    const j = jobs();
+    const bs = specs.map((s) => block(s));
+    const steps = [...prelude({ baseRef: 'pull-request-base' }), ...bs.flatMap((b) => b.steps)];
+    const r = await run([workflow({ ...j, 'base-scan': job(steps, { outputs: jobOutputsFor(steps) }) }, true)], d);
+    expect(has(r, 'not-gate-readable', /belongs to the job "secrets".* but sits in the job "base-scan"/), show(r)).toBe(true);
+  });
+  it('A13: one artifact uploaded by two jobs → refused', async () => {
+    const j = jobs();
+    const r = await run([workflow({ ...j, 'sast-dup': structuredClone(j['sast--web']) as Job })], d);
+    expect(has(r, 'not-gate-readable', /uploaded by more than one step/), show(r)).toBe(true);
+  });
+});
+
+describe('finding 4: no silent drop in the job list (ruling 4)', () => {
+  const dupe = (a: string, b: string, scripts = ['test']): PipelineDraft => {
+    const pr = { ...profile([service({ name: a, path: 'a', scripts }), service({ name: b, path: 'b', scripts })]), repoFiles: emptyRepoFiles() };
+    return { ...draftOf([], [needOf('unit-tests', a), needOf('unit-tests', b)]), profile: pr };
+  };
+  it('A8: Web App and web-app (one slug) → GateJobListError', () => {
+    expect(() => gateJobList(dupe('Web App', 'web-app'))).toThrow(GateJobListError);
+    expect(() => gateJobList(dupe('Web App', 'web-app'))).toThrow(/same job/);
+  });
+  it('two names that share their first 40 characters → GateJobListError', () => {
+    const base = 'a'.repeat(40);
+    expect(() => gateJobList(dupe(`${base}-one`, `${base}-two`))).toThrow(GateJobListError);
+  });
+  it('the same need and service on two layers is still one entry (an exact duplicate is not a collision)', () => {
+    const dd = draftOf([], [needOf('unit-tests', 'app'), { ...needOf('unit-tests', 'app'), layer: 'push' }]);
+    expect(gateJobList(dd)).toHaveLength(1);
+  });
+  it('A8s/A8r: through the referee, a collision is not-gate-readable', async () => {
+    const dd = dupe('Web App', 'web-app');
+    const ok = draftOf([], [needOf('unit-tests', 'app')]);
+    const step = renderGateStep(GATE, gateJobList(ok));
+    const r = await run([workflow({ gate: job([step], { name: 'gate', if: 'always()', permissions: GATE_PERM }) })], dd);
+    expect(has(r, 'not-gate-readable', /same job/), show(r)).toBe(true);
+  });
+});
+
+describe('finding 5: base-scan checks out the base, and only the base (ruling 5)', () => {
+  const bs = (j: Record<string, Job>): RenderedStep[] => j['base-scan']?.steps as RenderedStep[];
+  const withBase = (j: Record<string, Job>, steps: RenderedStep[]): Record<string, Job> => ({ ...j, 'base-scan': { ...(j['base-scan'] as Job), steps } });
+  it('A2: no ref on the base-scan checkout → refused', async () => {
+    const r = await run([workflow(jobs('none'))], d);
+    expect(has(r, 'injection', /needs a ref/), show(r)).toBe(true);
+  });
+  it('A4: a second checkout in base-scan → refused', async () => {
+    const j = jobs();
+    const steps = bs(j);
+    const bent = [steps[0] as RenderedStep, prelude()[0] as RenderedStep, ...steps.slice(1)];
+    const r = await run([workflow(withBase(j, bent), true)], d);
+    expect(has(r, 'injection', /exactly one checkout/), show(r)).toBe(true);
+  });
+  it('the checkout is the first step of base-scan after the harden step; a step before it → refused', async () => {
+    const j = jobs();
+    const steps = bs(j);
+    const [first, ...rest] = steps;
+    const harden = renderStep(specFor(entry('bullfrog'), { needId: 'egress' }), entry('bullfrog'), p, ctx).steps;
+    const ok = await run([workflow(withBase(j, [...harden, first as RenderedStep, ...rest]), true)], d);
+    expect(has(ok, 'injection', /checkout/), show(ok)).toBe(false);
+    const late = await run([workflow(withBase(j, [rest[0] as RenderedStep, first as RenderedStep, ...rest.slice(1)]), true)], d);
+    expect(has(late, 'injection', /first step/), show(late)).toBe(true);
+  });
+  it('A3: before under pull_request; A3b/A3c: the PR form under merge_group and under push → refused', async () => {
+    const r1 = await run([workflow(jobs('push-before'))], d);
+    expect(has(r1, 'injection', /does not fit the trigger pull_request/), show(r1)).toBe(true);
+    const r2 = await run([wfOn({ merge_group: null }, jobs('pull-request-base'))], d);
+    expect(has(r2, 'injection', /does not fit the trigger merge_group/), show(r2)).toBe(true);
+    const r3 = await run([wfOn({ push: { branches: ['main'] } }, jobs('pull-request-base'))], d);
+    expect(has(r3, 'injection', /does not fit the trigger push/), show(r3)).toBe(true);
+  });
+  it('each trigger with its own form passes: pull_request, merge_group, push', async () => {
+    expect(show(await run([workflow(jobs('pull-request-base'))], d))).toBe('');
+    expect(show(await run([wfOn({ merge_group: null }, jobs('merge-group-base'))], d))).toBe('');
+    expect(show(await run([wfOn({ push: { branches: ['main'] } }, jobs('push-before'))], d))).toBe('');
+  });
+  it('a file with triggers that need two different forms, or any other trigger, is refused', async () => {
+    const r = await run([wfOn({ pull_request: null, push: { branches: ['main'] } }, jobs('pull-request-base'))], d);
+    expect(has(r, 'injection', /does not fit the trigger push/), show(r)).toBe(true);
+    const r2 = await run([wfOn({ pull_request: null, workflow_dispatch: null }, jobs('pull-request-base'))], d);
+    expect(has(r2, 'injection', /no base commit form for the trigger "workflow_dispatch"/), show(r2)).toBe(true);
+  });
+  it('checkJobOrder / dedupeJobSteps: the base-scan rules, directly', () => {
+    const one = prelude({ baseRef: 'pull-request-base' });
+    expect(checkJobOrder(one, { id: 'base-scan', triggers: ['pull_request'] })).toEqual([]);
+    expect(checkJobOrder(one, { id: 'base-scan' }).join(' ')).toMatch(/triggers/);
+    expect(checkJobOrder(prelude(), { id: 'base-scan', triggers: ['pull_request'] }).join(' ')).toMatch(/needs a ref/);
+    expect(checkJobOrder([...one, ...prelude()], { id: 'base-scan', triggers: ['pull_request'] }).join(' ')).toMatch(/exactly one checkout/);
+    expect(checkJobOrder([], { id: 'base-scan', triggers: ['pull_request'] }).join(' ')).toMatch(/exactly one checkout/);
+    expect(() => dedupeJobSteps(prelude({ baseRef: 'push-before' }), { id: 'base-scan', scans: NO_SCANS, triggers: ['pull_request'] })).toThrow(RenderError);
+  });
+});
+
+describe('minor findings (ruling 6)', () => {
+  const U = 'crisworking/pipegen/gate';
+  const pol = (block: string[], warn: string[]): string => JSON.stringify({ block, warn });
+  const bad = (t: string): boolean => rendererInputProblems(U, { policy: t }, { mode: 'gate', policy: t }).length > 0;
+  it('7: a policy must block at least critical and high, with no duplicate and no severity in both lists', () => {
+    expect(bad(pol([], []))).toBe(true);
+    expect(bad(pol(['info'], ['critical', 'high']))).toBe(true);
+    expect(bad(pol(['critical'], ['medium']))).toBe(true);
+    expect(bad(pol(['high'], ['medium']))).toBe(true);
+    expect(bad(pol(['critical', 'high', 'high'], ['medium']))).toBe(true);
+    expect(bad(pol(['critical', 'high', 'medium'], ['medium']))).toBe(true);
+    expect(bad(pol(['critical', 'high'], ['medium', 'medium']))).toBe(true);
+    expect(bad(pol(['critical', 'high'], ['medium']))).toBe(false);
+    expect(bad(pol(['critical', 'high', 'medium'], ['low']))).toBe(false);
+    expect(bad(pol(['critical', 'high'], []))).toBe(false);
+  });
+  it('10: dedupeJobSteps needs the scan facts (a call without them is refused at run time too)', () => {
+    const g = block(gitleaksSpec());
+    expect(() => (dedupeJobSteps as (s: RenderedStep[], j?: unknown) => unknown)([...prelude(), ...g.steps])).toThrow(RenderError);
+    expect(() => dedupeJobSteps([...prelude(), ...g.steps], { scans: facts(g) })).not.toThrow();
+  });
+  it('6 (M2): jobOutputsProblems with two scrub steps for one artifact is refused on its own', () => {
+    const g = block(gitleaksSpec());
+    const twice = [...prelude(), ...g.result.steps, g.scrub, { ...g.scrub, id: 'scrub-ffffffffffffffff' }];
+    expect(jobOutputsProblems('secrets', jobOutputsFor([g.scrub]), twice).join('\n')).toMatch(/more than one scrub step/);
+  });
+  it('6 (M28): an expression in a job\'s needs is refused', async () => {
+    const j = jobs();
+    const r = await run([workflow({ ...j, gate: { ...(j.gate as Job), needs: [...entries.map((e) => e.job), '${{ github.ref }}'] } })], d);
+    expect(has(r, 'injection', /expression .* in needs/), show(r)).toBe(true);
+  });
+});

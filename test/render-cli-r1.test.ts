@@ -2,6 +2,7 @@
 // injective dedupe, hardened system tools, DAST networking, and tools that are refused until their slot exists.
 // The shell is run through real bash with stand-ins for node, npm and python (no network).
 import { spawnSync } from 'node:child_process';
+import { NO_SCANS } from '../src/engine/job-rules.js';
 import { chmodSync, existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
@@ -306,25 +307,25 @@ describe('R-B: dedupe is injective, one Node version per job', () => {
   const at = (path: string) => render('vitest-coverage', { service: 'x', workingDir: path }, ctxFor([service({ name: 'x', path })]));
 
   it('folders a/b and a-b keep two npm ci steps (a hash, not a slug); the same folder spelled two ways keeps one', () => {
-    const all = dedupeJobSteps([...at('a/b').steps, ...at('a-b').steps]);
+    const all = dedupeJobSteps([...at('a/b').steps, ...at('a-b').steps], { scans: NO_SCANS });
     expect(all.filter((s) => s.run?.includes('ci --ignore-scripts'))).toHaveLength(2);
     expect(at('a/b').steps[1]?.id).toMatch(hash16);
     expect(at('a/b').steps[1]?.id).not.toBe(at('a-b').steps[1]?.id);
-    const same = dedupeJobSteps([...at('a/b').steps, ...at('./a//b').steps]);
+    const same = dedupeJobSteps([...at('a/b').steps, ...at('./a//b').steps], { scans: NO_SCANS });
     expect(same.filter((s) => s.run?.includes('ci --ignore-scripts'))).toHaveLength(1);
   });
 
   it('run steps are never dropped by the dedupe (they carry a repocode id, not a pipegen- id)', () => {
-    const all = dedupeJobSteps([...at('a').steps, ...at('a').steps]);
+    const all = dedupeJobSteps([...at('a').steps, ...at('a').steps], { scans: NO_SCANS });
     expect(all.filter((s) => s.id?.startsWith('repocode-'))).toHaveLength(2);
   });
 
   it('two different Node majors in one job are a RenderError (Plan G splits the job)', () => {
     const one = render('prettier', { service: 'a' }, ctxFor([service({ name: 'a', path: '.', runtimeVersion: '22' })])).steps;
     const two = render('knip', { service: 'b' }, ctxFor([service({ name: 'b', path: '.', runtimeVersion: '26' })])).steps;
-    expect(() => dedupeJobSteps([...one, ...two])).toThrow(RenderError);
+    expect(() => dedupeJobSteps([...one, ...two], { scans: NO_SCANS })).toThrow(RenderError);
     const same = render('knip', { service: 'b' }, ctxFor([service({ name: 'b', path: '.', runtimeVersion: '22' })])).steps;
-    expect(dedupeJobSteps([...one, ...same]).filter((s) => s.uses?.startsWith('actions/setup-node@'))).toHaveLength(1);
+    expect(dedupeJobSteps([...one, ...same], { scans: NO_SCANS }).filter((s) => s.uses?.startsWith('actions/setup-node@'))).toHaveLength(1);
   });
 });
 

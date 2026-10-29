@@ -32,6 +32,7 @@ import { BASE_CHECKOUT_REFS, DOCKER_ACTION_USES, IMAGE_BUILT_ACTION_USES, PIPEGE
 export { RenderError };
 // the job rules live in job-rules.ts (one copy for the renderer, the emitter, the referee and the linters); re-exported for the callers that import them here
 export { checkExpressions, checkJobOrder, IF_VALUES, isDangerousName, SECRET_REF_RE } from './job-rules.js';
+export { NO_SCANS } from './job-rules.js';
 export type { JobContext, RenderedStep, ScanFact };
 export type { RenderOptions };
 
@@ -339,10 +340,11 @@ function cliHooks(platform: PlatformActions): CliHooks {
  * (only its display name may differ), or this throws (review-6c-r1 minor 2: a later checkout with fetch-depth 0 must not
  * vanish behind a depth-1 one). The one documented exception is the repo `npm ci` of one folder asked for by several
  * tools: its pin lists are merged, and its scripts may differ only in the tool's own home folder.
- * `job` (C0b): the job's id and the scan facts of its scrub steps, for the shared job rules (checkJobOrder): the base checkout ref only
+ * `job` (C0b, required): the job's id, the file's triggers (for `base-scan`) and the scan facts of its scrub steps, for the shared job rules (checkJobOrder): the base checkout ref only
  * in `base-scan`, and each scrub step equal to its scan (scanFactOf gives the fact of a rendered tool).
  */
-export function dedupeJobSteps(steps: readonly RenderedStep[], job: JobContext = {}): RenderedStep[] {
+export function dedupeJobSteps(steps: readonly RenderedStep[], job: JobContext): RenderedStep[] {
+  if (!(job?.scans instanceof Map)) throw new RenderError('dedupeJobSteps needs the scan facts of the job (JobContext.scans; NO_SCANS for a job with no scan step), or it could not hold a scrub step to its scan.');
   const seen = new Map<string, number>();
   const kept: RenderedStep[] = [];
   for (const s of steps) {

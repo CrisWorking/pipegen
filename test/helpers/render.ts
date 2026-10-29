@@ -2,7 +2,9 @@
 import { emptyRepoFiles, emptyServiceQuality } from '../../src/read/quality.js';
 import { PLATFORM_ACTION_IDS, type PlatformActions } from '../../src/engine/pin.js';
 import { loadReviewed } from '../../src/engine/reviewed.js';
+import type { ScanFact } from '../../src/engine/job-rules.js';
 import type { RenderContext } from '../../src/engine/render-step.js';
+import { SCRUB_STEP_ID_RE, sha16 } from '../../src/engine/tool-flags.js';
 import type { RepoProfile, ReviewedTool, Service, StepSpec } from '../../src/types.js';
 
 export const service = (over: Partial<Service> = {}): Service => ({
@@ -46,3 +48,18 @@ export const gateEntry = (sha: string = GATE_SHA): ReviewedTool => ({
   step: { action: { uses: `crisworking/pipegen/gate@${sha}`, with: {} }, output: { path: '', format: 'none' } },
   fixedInputs: { with: {} }, choices: {}, configFiles: [], reviewedBy: 'fixture', reviewedAt: '2026-10-29', proofs: 0,
 });
+
+/**
+ * Scan facts for the scrub steps of a list of steps, taken from the scrub steps themselves (each scrub's tool and format at the scan
+ * step id of its artifact). For tests where the scan-to-scrub equality is not the point: the facts agree with the steps by construction.
+ */
+export function scansFor(steps: readonly { id?: string; with?: Record<string, string> }[]): Map<string, ScanFact> {
+  const out = new Map<string, ScanFact>();
+  for (const s of steps) {
+    const w = s.with;
+    if (s.id === undefined || !SCRUB_STEP_ID_RE.test(s.id) || w === undefined || w.artifact === undefined) continue;
+    out.set(`tool-run-${sha16(w.artifact)}`, { tool: w.tool as string, format: w.format as 'sarif' | 'zap-json' });
+    out.set(`checker-run-${sha16(w.artifact)}`, { tool: w.tool as string, format: w.format as 'sarif' | 'zap-json' });
+  }
+  return out;
+}

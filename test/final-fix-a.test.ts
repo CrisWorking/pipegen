@@ -1,6 +1,7 @@
 // v0.2 Plan B final-review fix round, commit A (findings 1, 2, 3, 5): the renderer and the referee agree.
 // Written first; each test fails without its fix. Probes are the final reviewer's (P2, P3, P4, P5).
 import { Document } from 'yaml';
+import { NO_SCANS } from '../src/engine/job-rules.js';
 import { describe, expect, it } from 'vitest';
 import { referee, JOB_STEP_POLICY, type Linters, type RefereeReport } from '../src/engine/referee.js';
 import { dedupeJobSteps, RenderError, renderJobPrelude, renderPlatformStep, renderScrub, renderStep, renderUpload, scrubbedPath, stepsToYaml, validateSpec, type RenderContext, type RenderedStep } from '../src/engine/render-step.js';
@@ -9,7 +10,7 @@ import { NEED_ID_CATEGORY } from '../src/engine/need-ids.js';
 import { rendererInputProblems } from '../src/engine/tool-flags.js';
 import { emptyRepoFiles } from '../src/read/quality.js';
 import type { Capabilities, CreatedFile, Need, PipelineDraft, StepSpec } from '../src/types.js';
-import { entry, gateEntry, platform, profile, reviewedList, service, specFor } from './helpers/render.js';
+import { entry, gateEntry, platform, profile, reviewedList, service, specFor, scansFor } from './helpers/render.js';
 
 const api = service({ name: 'api', path: '.', scripts: ['test'], envVars: ['STRIPE_KEY'] });
 const prof = { ...profile([api]), repoFiles: { ...emptyRepoFiles() } };
@@ -117,7 +118,7 @@ describe('finding 3: the blocking rule counts only specs that rendered and are i
     const gl = specFor(entry('gitleaks'), { needId: 'secrets' });
     const sg = specFor(entry('semgrep'), { needId: 'sast', service: 'api', choices: { rules: 'javascript' } });
     const d = draftOf([gl, sg], [needOf('secrets'), needOf('sast', 'api')]);
-    const r = await run([wf({ a: [...prelude(), ...toolSteps(gl)], b: dedupeJobSteps([...prelude(), ...toolSteps(sg)]) })], d);
+    const r = await run([wf({ a: [...prelude(), ...toolSteps(gl)], b: dedupeJobSteps([...prelude(), ...toolSteps(sg)], { scans: scansFor([...prelude(), ...toolSteps(sg)]) }) })], d);
     expect(showR(r)).toBe('');
     expect(r.ok).toBe(true);
   });
@@ -143,7 +144,7 @@ describe('finding 5: a base-scan variant of the renderer and the referee', () =>
     const scrub = renderScrub(baseArt, r0.output?.path as string, 'gitleaks', 'sarif', GATE);
     const up = renderUpload(baseArt, scrubbedPath(r0.output?.path as string), p);
     // the PR's own scan is in the file too: the base job alone would not satisfy a blocking need
-    const doc = wf({ scan: toolSteps(gl).length > 0 ? [...prelude(), ...toolSteps(gl)] : [], 'base-scan': [...prelude(), ...r0.steps, scrub, up] });
+    const doc = wf({ scan: toolSteps(gl).length > 0 ? [...prelude(), ...toolSteps(gl)] : [], 'base-scan': [...renderJobPrelude({ baseRef: 'pull-request-base' }, p).steps, ...r0.steps, scrub, up] });
     const r = await run([doc], draftOf([gl], [needOf('secrets')]));
     expect(showR(r)).toBe('');
   });

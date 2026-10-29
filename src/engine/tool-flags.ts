@@ -584,7 +584,13 @@ function policyProblem(text: string): string | null {
   const v = parseJson(text);
   if (!isPlainObject(v) || Object.keys(v).sort().join() !== 'block,warn') return 'a JSON object with exactly block and warn';
   const sev = ['critical', 'high', 'medium', 'low', 'info'];
-  return ['block', 'warn'].every((k) => Array.isArray(v[k]) && (v[k] as unknown[]).length <= 5 && (v[k] as unknown[]).every((x) => typeof x === 'string' && sev.includes(x))) ? null : 'block and warn lists of severities';
+  if (!['block', 'warn'].every((k) => Array.isArray(v[k]) && (v[k] as unknown[]).length <= 5 && (v[k] as unknown[]).every((x) => typeof x === 'string' && sev.includes(x)))) return 'block and warn lists of severities';
+  const block = v.block as string[];
+  const warn = v.warn as string[];
+  // the floor (decision 13): a policy can never stop critical and high findings from blocking, and no severity is in both lists or twice
+  if (!block.includes('critical') || !block.includes('high')) return 'a policy whose block list includes at least critical and high';
+  if (new Set(block).size !== block.length || new Set(warn).size !== warn.length || warn.some((x) => block.includes(x))) return 'a policy with no duplicate and no severity in both lists';
+  return null;
 }
 /** Extra protected paths: globs without `..`, a leading `/` or an option dash, in plain characters (ruling S22). */
 const GLOB_RE = /^(?![-/])(?!.*(?:^|\/)\.\.(?:\/|$))[A-Za-z0-9._/*?-]{1,200}$/;
@@ -647,9 +653,16 @@ export function jobListLiteralProblem(text: string): string | null {
 /** The two forms of the base commit a base-scan checkout may name (ruling S16): a pull request's base, or the push's previous head. Only the job `base-scan` may use one (job-rules.ts). */
 export const BASE_CHECKOUT_REFS = Object.freeze({
   'pull-request-base': '${{ github.event.pull_request.base.sha }}',
+  'merge-group-base': '${{ github.event.merge_group.base_sha }}',
   'push-before': '${{ github.event.before }}',
 } as const);
 export type BaseCheckoutRef = keyof typeof BASE_CHECKOUT_REFS;
+/**
+ * The one base form that is valid for each event that can start a workflow with a `base-scan` job (C0b fix round 1, ruling 5): the
+ * other events' payloads lack the field, the expression is empty and the checkout falls back to the head. A file's triggers must
+ * all map to the same form; a trigger not listed has no base commit form, so such a file may not hold a base-scan job.
+ */
+export const BASE_REF_FOR_TRIGGER: Readonly<Record<string, BaseCheckoutRef>> = Object.freeze({ pull_request: 'pull-request-base', merge_group: 'merge-group-base', push: 'push-before' });
 
 /**
  * Ruling S15: the inputs the renderer sets on a platform action, by the same `owner/repo[/path]` key as ACTION_POLICIES,

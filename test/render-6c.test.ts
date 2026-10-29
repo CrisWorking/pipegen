@@ -1,6 +1,7 @@
 // Plan B 6c: run-time slots (B6), rule archives (S12), container actions (S13), project scripts (S10). Written first.
 // Shell is run through real bash and real git (a local bare repo, no network).
 import { spawnSync } from 'node:child_process';
+import { NO_SCANS } from '../src/engine/job-rules.js';
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -246,7 +247,7 @@ describe('S12: rule archives are fetched by commit and checked by tree (real git
     expect(s.env?.PIPEGEN_RULES_COMMIT).toBe(fx.commit);
     // the tool is told the checked-out folder, not a path that does not exist on the runner
     expect(runOf(r).run).not.toContain('/pipegen-nuclei-templates');
-    expect(checkJobOrder(dedupeJobSteps(r.steps))).toEqual([]);
+    expect(checkJobOrder(dedupeJobSteps(r.steps, { scans: NO_SCANS }))).toEqual([]);
   });
 
   it2('a correct commit and tree: the folder holds the files, has no .git, and is read-only', () => {
@@ -324,7 +325,7 @@ describe('S12: rule archives are fetched by commit and checked by tree (real git
       expect(run).toContain('--config /pipegen-rules');
       expect(argEnv(runOf(r))).toContain('javascript');
       expect(rulesStep(r).env?.PIPEGEN_RULES_COMMIT).toBe(sg.commit);
-      expect(checkJobOrder(dedupeJobSteps(r.steps))).toEqual([]);
+      expect(checkJobOrder(dedupeJobSteps(r.steps, { scans: NO_SCANS }))).toEqual([]);
     });
     it2('the rules step with real git: right tree passes, wrong tree fails', () => {
       const ok = rulesStep(renderSemgrep(semgrepAgainst({ commit: sg.commit, tree: sg.tree })));
@@ -421,7 +422,7 @@ describe('S10: renderProjectScript', () => {
     expect(run.run).toMatch(/npm" run test|npm" test/);
     expect(run.run).toContain('cd -- ./apps/web');
     for (const s of r.steps) if (s.uses !== undefined) expect(s.uses).toMatch(/^actions\/(checkout|setup-node)@/);
-    expect(checkJobOrder(dedupeJobSteps(r.steps))).toEqual([]);
+    expect(checkJobOrder(dedupeJobSteps(r.steps, { scans: NO_SCANS }))).toEqual([]);
   });
   it('lint runs npm run lint; a service at the repo root has no cd', () => {
     const r = renderProjectScript(step({ script: 'test', service: 'root', workingDir: undefined }), platform(), c);
@@ -450,8 +451,8 @@ describe('S10: renderProjectScript', () => {
   it('a step after a project script that needs to be trusted is refused by the order rule', () => {
     const script = renderProjectScript(step(), platform(), c).steps;
     const later = render('gitleaks').steps;
-    expect(() => dedupeJobSteps([...script, ...later])).toThrow(RenderError);
-    expect(() => dedupeJobSteps([...later, ...script])).not.toThrow();
+    expect(() => dedupeJobSteps([...script, ...later], { scans: NO_SCANS })).toThrow(RenderError);
+    expect(() => dedupeJobSteps([...later, ...script], { scans: NO_SCANS })).not.toThrow();
   });
   it2('the script runs under the env -i allowlist: ambient tokens, NODE_OPTIONS and the runner HOME never reach npm (real bash)', () => {
     const run = runOf(renderProjectScript(step(), platform(), c));

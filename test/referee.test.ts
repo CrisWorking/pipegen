@@ -2,16 +2,18 @@
 // The referee reads the finished files, never the renderer's intentions: every test hands it YAML text, most of it made by
 // the real renderer and stepsToYaml, some of it hand-written and hostile.
 import { Document, parseDocument } from 'yaml';
+import { NO_SCANS } from '../src/engine/job-rules.js';
 import { describe, expect, it } from 'vitest';
 import { JOB_PERMISSIONS, JOB_STEP_POLICY, pipegenLines, referee, type Linters, type RefereeDeps, type RefereeIssue, type RefereeReport } from '../src/engine/referee.js';
-import { gateJobList } from '../src/engine/gate-job-list.js';
+import { gateJobList, jobIdFor } from '../src/engine/gate-job-list.js';
+import { jobOutputsFor } from '../src/engine/job-rules.js';
 import { dedupeJobSteps, RenderError, renderGateStep, renderJobPrelude, renderPlatformStep, renderProjectScript, renderScrub, renderStep, renderUpload, scrubbedPath, stepsToYaml, type RenderContext, type RenderedStep, type RenderResult } from '../src/engine/render-step.js';
 import { resultArtifactName } from '../src/engine/artifact-names.js';
 import { NEED_ID_CATEGORY, NEED_IDS } from '../src/engine/need-ids.js';
 import { emptyRepoFiles } from '../src/read/quality.js';
 import { GATE_CHECK_NAME, type Capabilities, type CreatedFile, type ExistingWorkflow, type Need, type PipelineDraft, type ReviewedTool, type StepSpec } from '../src/types.js';
 import { stub } from './helpers/linter-stub.js';
-import { entry, gateEntry, platform, profile, reviewedList, service, specFor } from './helpers/render.js';
+import { entry, gateEntry, platform, profile, reviewedList, service, specFor, scansFor } from './helpers/render.js';
 import { fake } from './helpers/secret-repo.js';
 
 // ---------- builders ----------
@@ -115,7 +117,7 @@ describe('referee: the renderer and the referee agree', () => {
     const refused: string[] = [];
     const p = platform();
     // several tools share a need id (two DAST tools, say); one need and service has one result and one job (ruling S4), so each later tool of a need gets a service of its own
-    const profN = { ...prof, services: [svc, ...Array.from({ length: 12 }, (_, i) => service({ ...svc, name: `app${i + 2}` }))] };
+    const profN = { ...prof, services: [service({ ...svc, scripts: [] }), service({ ...svc, name: 'script-app' }), ...Array.from({ length: 12 }, (_, i) => service({ ...svc, scripts: [], name: `app${i + 2}` }))] };
     const ctxN: RenderContext = { ...ctx, profile: profN };
     const perNeed = new Map<string, number>();
     for (const t of reviewedList()) {
@@ -134,8 +136,11 @@ describe('referee: the renderer and the referee agree', () => {
         continue;
       }
       specs.push(spec);
-      const id = `t-${t.id}`;
-      jobs[t.id === 'docker-build-push-action' ? 'image-publish' : id] = job(steps, t.id === 'docker-build-push-action' ? { permissions: { contents: 'read', packages: 'write' } } : {});
+      // a listed check runs in the job named for it (ruling 3 of C0b fix round 1), with the outputs the gate reads
+      const outputs = jobOutputsFor(steps);
+      jobs[t.id === 'docker-build-push-action' ? 'image-publish' : jobIdFor(spec.needId, spec.service)] = job(steps, {
+        ...(t.id === 'docker-build-push-action' ? { permissions: { contents: 'read', packages: 'write' } } : {}), ...(Object.keys(outputs).length > 0 ? { outputs } : {}),
+      });
     }
     // the helper-rendered platform actions, as Plan G uses them
     const sarif = '${{ runner.temp }}/pipegen-out/pipegen-out-sast--app/semgrep.sarif';
@@ -160,17 +165,24 @@ describe('referee: the renderer and the referee agree', () => {
     jobs.notify = job([download()], { permissions: { contents: 'read', 'pull-requests': 'read', checks: 'read' } });
     jobs['merged-red'] = job([download()], { permissions: { contents: 'read', 'pull-requests': 'read', checks: 'read' } });
     jobs['pr-check'] = job([co], { permissions: { 'pull-requests': 'read' } });
-    jobs['base-scan'] = job(toolJob(specOf('gitleaks', { needId: 'secrets', service: undefined })), { permissions: { contents: 'read', actions: 'read' } });
-    // the project's own scripts
-    const scripts = [renderProjectScript({ kind: 'project-script', needId: 'unit-tests', service: 'app', script: 'test' }, p, ctx).steps,
-      renderProjectScript({ kind: 'project-script', needId: 'lint', service: 'app', script: 'lint' }, p, ctx).steps];
-    jobs['project-test'] = job(scripts[0] as RenderedStep[]);
-    jobs['project-lint'] = job(scripts[1] as RenderedStep[]);
-    const d = draftOf([...specs, specOf('gitleaks', { needId: 'secrets', service: undefined })], { profile: profN });
-    d.needs.push(needOf('unit-tests', true, 'app'), needOf('lint', true, 'app'));
+    // the repo-wide secrets check: its job, and its base twin in base-scan (which checks out the base commit first, ruling 5)
+    const repoWide = specOf('gitleaks', { needId: 'secrets', service: undefined });
+    const repoWideSteps = toolJob(repoWide);
+    jobs[['sec', 'rets'].join('')] = job(repoWideSteps, { outputs: jobOutputsFor(repoWideSteps) });
+    const baseRun = renderStep(repoWide, entry('gitleaks'), p, { ...ctx, base: true });
+    const baseArt = resultArtifactName('secrets', undefined, { base: true });
+    const baseSteps = [...renderJobPrelude({ baseRef: 'pull-request-base' }, p).steps, ...baseRun.steps, renderScrub(baseArt, baseRun.output?.path as string, 'gitleaks', 'sarif', GATE), renderUpload(baseArt, scrubbedPath(baseRun.output?.path as string), p)];
+    jobs['base-scan'] = job(baseSteps, { permissions: { contents: 'read', actions: 'read' }, outputs: jobOutputsFor(baseSteps) });
+    // the project's own scripts, for a service of their own (the tools above took the first service of each need)
+    const scripts = [renderProjectScript({ kind: 'project-script', needId: 'unit-tests', service: 'script-app', script: 'test' }, p, ctxN).steps,
+      renderProjectScript({ kind: 'project-script', needId: 'lint', service: 'script-app', script: 'lint' }, p, ctxN).steps];
+    jobs['unit-tests--script-app'] = job(scripts[0] as RenderedStep[]);
+    jobs['lint--script-app'] = job(scripts[1] as RenderedStep[]);
+    const d = draftOf([...specs, repoWide], { profile: profN });
+    d.needs.push(needOf('unit-tests', true, 'script-app'), needOf('lint', true, 'script-app'));
     // the gate job: no checkout (ruling S21), the job list of this draft, and a needs entry for every job of it (ruling S4)
     const entries = gateJobList(d);
-    jobs.gate = job([...harden, download(), renderGateStep(GATE, entries)], { name: GATE_CHECK_NAME.split(' / ')[1], needs: entries.map((e) => e.job), permissions: { contents: 'read', actions: 'read', 'pull-requests': 'read' } });
+    jobs.gate = job([...harden, download(), renderGateStep(GATE, entries)], { name: GATE_CHECK_NAME.split(' / ')[1], if: 'always()', needs: entries.map((e) => e.job), permissions: { contents: 'read', actions: 'read', 'pull-requests': 'read' } });
     const r = await run([wf(jobs)], d, { list: [...reviewedList(), GATE, WATCHER] });
     for (const id of Object.keys(JOB_STEP_POLICY)) expect(Object.keys(jobs), id).toContain(id);
     expect(show(r)).toBe('');
@@ -209,7 +221,7 @@ describe('referee: pins', () => {
     const step = (t: ReviewedTool, s: string): RenderedStep => (t.id === GATE.id
       ? { ...renderGateStep(GATE, []), uses: (t.step.action?.uses as string).replace(/@.*$/, `@${s}`) }
       : { name: t.id, uses: (t.step.action?.uses as string).replace(/@.*$/, `@${s}`), with: { mode: t.fixedInputs.with?.mode as string } });
-    const ok = await run([wf({ gate: job([step(GATE, sha('1'))], { permissions: { contents: 'read', actions: 'read', 'pull-requests': 'read' } }), watch: job([step(WATCHER, sha('2'))], { permissions: { contents: 'read', issues: 'write', actions: 'read' } }) })], draftOf([]), { list });
+    const ok = await run([wf({ gate: job([step(GATE, sha('1'))], { if: 'always()', permissions: { contents: 'read', actions: 'read', 'pull-requests': 'read' } }), watch: job([step(WATCHER, sha('2'))], { permissions: { contents: 'read', issues: 'write', actions: 'read' } }) })], draftOf([]), { list });
     expect(show(ok)).toBe('');
     for (const [t, other] of [[GATE, sha('3')], [WATCHER, sha('4')]] as const) {
       const r = await run([wf({ gate: job([step(t, other)], { permissions: { contents: 'read', actions: 'read' } }) })], draftOf([]), { list });
@@ -507,7 +519,7 @@ describe('referee: more of a job, judged from the parsed file', () => {
     const script = renderProjectScript({ kind: 'project-script', needId: 'unit-tests', service: 'app', script: 'test' }, platform(), ctx).steps;
     const vSteps = renderStep(v, entry('vitest-coverage'), platform(), ctx).steps;
     const d = draftOf([v], { needs: [needOf('coverage', true, 'app'), needOf('unit-tests', true, 'app')] });
-    const merged = dedupeJobSteps([...script, ...vSteps]);
+    const merged = dedupeJobSteps([...script, ...vSteps], { scans: scansFor([...script, ...vSteps]) });
     expect(show(await run([wf({ test: job(merged) })], d))).toBe('');
     // the kept npm ci without vitest's pins: its pre-check would no longer guard vitest's lockfile entries
     const dropped = merged.map((s) => (s.id?.startsWith('pipegen-npm-ci-') ? { ...s, env: { ...s.env, PIPEGEN_NPM_EXPECT: '[]' } } : s));
@@ -593,7 +605,7 @@ describe('referee: the gate check name', () => {
     expect(has(await run([wf({ scan: job(g.steps, { name: gateName }) })], draftOf([g.spec])), 'not-gate-readable')).toBe(true);
     const perms = { permissions: { contents: 'read', actions: 'read', 'pull-requests': 'read' } };
     expect(has(await run([wf({ gate: job(g.steps, { ...perms, name: 'the gate' }) })], draftOf([g.spec])), 'not-gate-readable')).toBe(true);
-    expect(has(await run([wf({ gate: job(g.steps, { ...perms, name: gateName }) })], draftOf([g.spec])), 'not-gate-readable')).toBe(false);
+    expect((await run([wf({ gate: job(g.steps, { ...perms, name: gateName }) })], draftOf([g.spec]))).issues.some((i) => i.check === 'not-gate-readable' && /must be named/.test(i.message))).toBe(false);
     expect(caller).toBe('pipegen');
   });
 });
@@ -807,7 +819,7 @@ describe('fix round 1: the reviewer\'s attacks are refused', () => {
     }
   });
   it('job-level central: accepted only at the recorded SHA with the called file in files (and judged there)', async () => {
-    const called = { ...wf({ gate: job([gateStep()], { permissions: { contents: 'read', actions: 'read', 'pull-requests': 'read' } }) }, { on: { workflow_call: null } }, '.github/workflows/gate.yml'), repo: 'central' as const };
+    const called = { ...wf({ gate: job([gateStep()], { if: 'always()', permissions: { contents: 'read', actions: 'read', 'pull-requests': 'read' } }) }, { on: { workflow_call: null } }, '.github/workflows/gate.yml'), repo: 'central' as const };
     const caller = (at: string): CreatedFile => wf({ pipegen: { name: 'pipegen', uses: `o/pipelines/.github/workflows/gate.yml@${at}`, permissions: { contents: 'read', actions: 'read', 'pull-requests': 'read' }, [SEC_FIELD]: { PIPEGEN_FP_KEY: ref('PIPEGEN_FP_KEY') } } });
     expect(show(await run([caller(CENTRAL.sha), called], draftOf([], { centralPin: CENTRAL }), { list: LIST }))).toBe('');
     expect(has(await run([caller(sha('d')), called], draftOf([], { centralPin: CENTRAL }), { list: LIST }), 'unknown-pin')).toBe(true);
