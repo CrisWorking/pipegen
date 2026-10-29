@@ -93,6 +93,26 @@ describe.skipIf(process.platform === 'win32')('limited readers: a file swapped a
     expect(await readTextLimitedWithReason(join(root, 'ok.txt'), root)).toEqual({ text: 'fine\n' });
   });
 
+  it('T51 review: the lockfile reader gets the same checks (swapped folder refused; with the root, a link at any level is a link)', async () => {
+    const root = makeTempDir();
+    const outside = makeTempDir();
+    writeFileSync(join(outside, 'f.txt'), 'OUTSIDE SECRET\n');
+    symlinkSync(outside, join(root, 'sub'));
+    const lines: string[] = [];
+    const opts = { maxBytes: 1_000_000, maxLineBytes: 4096 };
+    // no swap: a linked level under the root is a link, a path outside the root is unreadable
+    expect(await readLinesLimited(join(root, 'sub', 'f.txt'), opts, (l) => lines.push(l), root)).toEqual({ skipped: 'link' });
+    expect(await readLinesLimited(join(outside, 'f.txt'), opts, (l) => lines.push(l), root)).toEqual({ skipped: 'unreadable' });
+    // swapped: lstat answers for a real folder and a small repo file, the open lands outside
+    const realDir = join(root, 'real');
+    mkdirSync(realDir);
+    swapped.paths.set(join(root, 'sub'), realDir);
+    swappedIn(root, join(root, 'sub', 'f.txt'));
+    expect(await readLinesLimited(join(root, 'sub', 'f.txt'), opts, (l) => lines.push(l), root)).toEqual({ skipped: 'unreadable' });
+    expect(await readLinesLimited(join(root, 'sub', 'f.txt'), opts, (l) => lines.push(l))).toEqual({ skipped: 'unreadable' });
+    expect(lines).toEqual([]);
+  });
+
   it('a regular file not swapped reads as before', async () => {
     const dir = makeTempDir();
     const ok = join(dir, 'ok.txt');

@@ -1,4 +1,4 @@
-import { constants } from 'node:fs';
+import { constants, type Stats } from 'node:fs';
 import { lstat, open, readlink, realpath, type FileHandle } from 'node:fs/promises';
 import { isAbsolute, join, relative, sep } from 'node:path';
 import fg from 'fast-glob';
@@ -134,6 +134,34 @@ function under(root: string, path: string): string | null {
 }
 
 /**
+ * The root checks before the open (P46): `path` must be under `root`, and no level of it under the root may be a link.
+ * Null when the read may go on (or when no root is given).
+ */
+async function checkBeforeOpen(path: string, root: string | undefined, rel: string | null): Promise<Skipped | null> {
+  if (root === undefined) return null;
+  if (rel === null) return 'unreadable';
+  return (await linkedLevel(root, rel)) !== null ? 'link' : null;
+}
+
+/**
+ * The checks after the open (P46, P49): the descriptor is the file lstat described; with `root`, the opened file itself
+ * must be inside the repo (Linux: the descriptor's real path; path checks alone always leave a window, because a folder
+ * can be swapped back and forth between any two of them), no level is a link at the second check, and the path still
+ * leads to the opened file. Null when the read may go on.
+ */
+async function checkAfterOpen(handle: FileHandle, opened: Stats, info: Stats, path: string, root: string | undefined, rel: string | null): Promise<Skipped | null> {
+  if (!sameFile(opened, info)) return 'unreadable';
+  if (root === undefined || rel === null) return null;
+  const real = await openedPath(handle.fd);
+  if (real !== null) {
+    const rootReal = await realpath(root);
+    if (under(rootReal, real.replace(/ \(deleted\)$/, '')) === null) return 'link';
+  }
+  if ((await linkedLevel(root, rel)) !== null) return 'link';
+  return sameFile(opened, await lstat(path)) ? null : 'unreadable';
+}
+
+/**
  * Like readTextLimited, but says why a file was skipped. lstat gives the reason first; then the file is opened without
  * following a symbolic link and without blocking (OPEN_CHECKED), the opened descriptor is checked again with fstat
  * (regular file, size), and at most maxFileBytes + 1 bytes are read from it. So a file swapped after the lstat check
@@ -155,8 +183,8 @@ export async function readTextLimitedWithReason(path: string, root?: string): Pr
   let handle: FileHandle | undefined;
   try {
     const rel = root === undefined ? null : under(root, path);
-    if (root !== undefined && rel === null) return { skipped: 'unreadable' };
-    if (root !== undefined && rel !== null && (await linkedLevel(root, rel)) !== null) return { skipped: 'link' };
+    const before = await checkBeforeOpen(path, root, rel);
+    if (before !== null) return { skipped: before };
     const info = await lstat(path);
     if (info.isSymbolicLink()) return { skipped: 'link' };
     if (!info.isFile()) return { skipped: 'not-a-file' };
@@ -170,19 +198,8 @@ export async function readTextLimitedWithReason(path: string, root?: string): Pr
     const opened = await handle.stat();
     if (!opened.isFile()) return { skipped: 'not-a-file' };
     if (opened.size > READ_LIMITS.maxFileBytes) return { skipped: 'too-large' };
-    if (!sameFile(opened, info)) return { skipped: 'unreadable' };
-    if (root !== undefined && rel !== null) {
-      // P49: the opened file itself must be inside the repo (Linux: the descriptor's real path). Path checks alone always
-      // leave a window, because a folder can be swapped back and forth between any two of them.
-      const real = await openedPath(handle.fd);
-      if (real !== null) {
-        const rootReal = await realpath(root);
-        if (under(rootReal, real.replace(/ \(deleted\)$/, '')) === null) return { skipped: 'link' };
-      }
-      if ((await linkedLevel(root, rel)) !== null) return { skipped: 'link' };
-      const again = await lstat(path);
-      if (!sameFile(opened, again)) return { skipped: 'unreadable' };
-    }
+    const after = await checkAfterOpen(handle, opened, info, path, root, rel);
+    if (after !== null) return { skipped: after };
     const buf = await readAtMost(handle, opened.size, READ_LIMITS.maxFileBytes + 1);
     if (buf.length > READ_LIMITS.maxFileBytes) return { skipped: 'too-large' };
     return isBinary(buf) ? { skipped: 'binary' } : { text: buf.toString('utf8') };
@@ -287,17 +304,27 @@ const LINE_CHUNK_BYTES = 64 * 1024;
  * without its line ending. A skipped file may already have passed some lines to `onLine` (when it grows past `maxBytes`
  * while being read): callers must drop what they collected when a file is skipped.
  */
-export async function readLinesLimited(path: string, opts: { maxBytes: number; maxLineBytes: number }, onLine: (line: string) => void): Promise<{ bytes: number } | { skipped: Skipped }> {
+export async function readLinesLimited(path: string, opts: { maxBytes: number; maxLineBytes: number }, onLine: (line: string) => void, root?: string): Promise<{ bytes: number } | { skipped: Skipped }> {
   let handle: FileHandle | undefined;
   try {
+    const rel = root === undefined ? null : under(root, path);
+    const before = await checkBeforeOpen(path, root, rel);
+    if (before !== null) return { skipped: before };
     const info = await lstat(path);
     if (info.isSymbolicLink()) return { skipped: 'link' };
     if (!info.isFile()) return { skipped: 'not-a-file' };
     if (info.size > opts.maxBytes) return { skipped: 'too-large' };
-    handle = await open(path, OPEN_CHECKED);
+    try {
+      handle = await open(path, OPEN_CHECKED | (root !== undefined ? NOFOLLOW_ANY : 0));
+    } catch (e) {
+      if (isLinkRefusal(e)) return { skipped: 'link' };
+      throw e;
+    }
     const opened = await handle.stat();
     if (!opened.isFile()) return { skipped: 'not-a-file' };
     if (opened.size > opts.maxBytes) return { skipped: 'too-large' };
+    const after = await checkAfterOpen(handle, opened, info, path, root, rel);
+    if (after !== null) return { skipped: after };
     const buf = Buffer.alloc(LINE_CHUNK_BYTES);
     let parts: Buffer[] = [];
     let length = 0;

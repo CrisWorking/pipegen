@@ -298,7 +298,7 @@ async function lockState(run: QualityRun, rel: string, kind: LockKind, found: 'f
     else {
       run.lockBudget -= info.size;
       const scan = lockScanner(kind);
-      const read = await readLinesLimited(joinOs(run.root, rel), { maxBytes: LOCKFILE_MAX_BYTES, maxLineBytes: READ_LIMITS.maxRegexLineBytes }, scan.onLine);
+      const read = await readLinesLimited(joinOs(run.root, rel), { maxBytes: LOCKFILE_MAX_BYTES, maxLineBytes: READ_LIMITS.maxRegexLineBytes }, scan.onLine, run.root);
       state = 'skipped' in read ? { unread: `${name} ${LOCK_SKIP[read.skipped]}` } : { index: scan.index };
     }
   }
