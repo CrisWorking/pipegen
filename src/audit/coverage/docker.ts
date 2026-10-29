@@ -21,6 +21,7 @@ import { resolveDir } from './helpers.js';
 import { UNKNOWN_PREFIX, gateOf, gated } from './settings.js';
 import { SCRIPT_CATEGORIES, UNKNOWN_SCRIPT_CATEGORIES, scanShell, type ShellMode } from './shell.js';
 import { asObj } from '../../read/manifest.js';
+import { OFFICIAL_FRONTEND, frontendArg } from './docker-words.js';
 import type { Ctx, DockerBuild, Found, Obj, Reason } from './types.js';
 
 const MAX_DOCKERFILE_LINES = 5_000;
@@ -35,7 +36,11 @@ type Resolve = (ctx: Ctx, found: Found[]) => Promise<Found[]>;
 
 // ---------- compose files ----------
 
-interface ComposeService { context: string | null; file: string | null; target: string | null; hasBuild: boolean; profiles: readonly string[]; environment: DockerEnv }
+interface ComposeService {
+  context: string | null; file: string | null; target: string | null; hasBuild: boolean; profiles: readonly string[]; environment: DockerEnv;
+  /** P57 (M3): its build `args:` may pick a custom Dockerfile frontend (BUILDKIT_SYNTAX), or can't be read: why, else null. */
+  frontend: string | null;
+}
 /** The services, or: no compose file ('missing'), one pipegen couldn't read ('unreadable'), or a set it can't be sure of (`why`, P57 C3). */
 export type ComposeModel = ReadonlyMap<string, ComposeService> | 'unreadable' | 'missing' | { why: string };
 /** P57 (C3): the variables that pick other compose files or services (https://docs.docker.com/compose/how-tos/environment-variables/envvars/). */
@@ -122,7 +127,7 @@ async function composeModel(ctx: Ctx, files: readonly string[] | null, cwd: stri
         // P57 (C5): the service's environment (a map or a list of NAME=value) reaches what runs in it; a later file's adds to it
         const environment = { ...(prev?.environment ?? {}), ...composeEnvironment(svc.environment), ...(svc.env_file === undefined ? {} : { '\u0000env_file': '$' }) };
         if (!('build' in svc) || svc.build === null || svc.build === undefined) {
-          if (prev === undefined) out.set(name, { context: null, file: null, target: null, hasBuild: false, profiles, environment });
+          if (prev === undefined) out.set(name, { context: null, file: null, target: null, hasBuild: false, profiles, environment, frontend: null });
           else out.set(name, { ...prev, profiles, environment });
           continue;
         }
@@ -135,7 +140,7 @@ async function composeModel(ctx: Ctx, files: readonly string[] | null, cwd: stri
           : dockerfile === undefined ? (typeof b.context === 'string' || prev?.file === null || prev === undefined ? resolveDir(folder, 'Dockerfile') : prev.file)
             : /[$\\]|^\//.test(dockerfile) ? null : resolveDir(folder, dockerfile);
         const target = typeof b.target === 'string' ? (/^[A-Za-z0-9_.-]{1,64}$/.test(b.target) ? b.target : '?') : (prev?.target ?? null);
-        out.set(name, { context: folder, file, target, hasBuild: true, profiles, environment });
+        out.set(name, { context: folder, file, target, hasBuild: true, profiles, environment, frontend: composeFrontend(b.args) ?? prev?.frontend ?? null });
       }
     }
     return out;
@@ -156,6 +161,24 @@ function composeEnvironment(v: unknown): Record<string, string> {
     }
   } else for (const [k, x] of Object.entries(asObj(v)).slice(0, MAX_COMPOSE_SERVICES)) out[k] = x === null ? '$' : literal(x);
   return out;
+}
+
+/** P57 (M3): compose build `args:` (a map, or a list of NAME=value / NAME) that set BUILDKIT_SYNTAX to anything but Docker's own frontend. */
+function composeFrontend(args: unknown): string | null {
+  if (args === undefined || args === null) return null;
+  if (Array.isArray(args)) {
+    for (const a of args.slice(0, MAX_COMPOSE_SERVICES)) {
+      const why = typeof a === 'string' ? frontendArg(a) : 'build args pipegen can\'t read';
+      if (why !== null) return why;
+    }
+    return null;
+  }
+  if (typeof args !== 'object') return 'build args pipegen can\'t read';
+  for (const [k, v] of Object.entries(asObj(args)).slice(0, MAX_COMPOSE_SERVICES)) {
+    const why = frontendArg(v === null || v === undefined ? k : `${k}=${typeof v === 'string' ? v : '$'}`);
+    if (why !== null) return why;
+  }
+  return null;
 }
 
 /** A compose build context word as a repo folder: not a URL, an absolute path or a variable. */
@@ -245,9 +268,8 @@ async function parseDockerfile(ctx: Ctx, text: string, context: string): Promise
   const raw = text.split(/\r?\n/);
   if (raw.length > MAX_DOCKERFILE_LINES || !raw.every(regexSafe)) return { unreadable: 'it has more or longer lines than pipegen reads' };
   if (/^\s*#\s*escape\s*=/im.test(raw.slice(0, 5).join('\n'))) return { unreadable: 'it changes the escape character' };
-  // P57 (M3): a `# syntax=` directive picks the frontend that reads the file; only Docker's own (docker/dockerfile) is read as BuildKit does
-  const syntax = /^\s*#\s*syntax\s*=\s*(\S+)/im.exec(raw.slice(0, 5).join('\n'))?.[1];
-  if (syntax !== undefined && !/^(?:docker\.io\/)?docker\/dockerfile(?::[A-Za-z0-9._-]+)?(?:@sha256:[0-9a-f]{64})?$/.test(syntax)) return { unreadable: 'it names its own Dockerfile frontend (# syntax=)' };
+  // P57 (M3): a syntax directive picks the frontend that reads the file; only Docker's own (docker/dockerfile) is read as BuildKit does
+  if (customFrontend(text)) return { unreadable: 'it picks its own Dockerfile frontend (a syntax directive)' };
   // instructions, with line continuations joined (comment lines inside a continuation are dropped, as Docker does)
   const lines: string[] = [];
   for (let i = 0; i < raw.length; i++) {
@@ -357,6 +379,34 @@ async function parseDockerfile(ctx: Ctx, text: string, context: string): Promise
   return { stages };
 }
 
+/**
+ * P57 (M3): whether the Dockerfile picks a frontend other than Docker's own, the way BuildKit detects one: a `syntax`
+ * directive in the leading comment block, as `# syntax=x` or `// syntax=x` (any letter case, spaces around `=`, after
+ * other directives such as `# escape=` or `# check=`), or a JSON file with a `syntax` key. Fail closed: a leading
+ * comment that mentions syntax but doesn't read as a directive counts too; the block ends at the first other line.
+ */
+function customFrontend(text: string): boolean {
+  const t = text.replace(/^\ufeff/, '');
+  if (t.trimStart().startsWith('{')) {
+    try {
+      const j = JSON.parse(t) as unknown;
+      if (j !== null && typeof j === 'object' && Object.keys(j).some((k) => k.toLowerCase() === 'syntax')) return true;
+    } catch { /* not JSON: read as a Dockerfile */ }
+  }
+  for (const line of t.split(/\r?\n/, 200)) {
+    const l = line.trim();
+    if (l === '') continue;
+    if (!(l.startsWith('#') || l.startsWith('//'))) break;
+    const m = /^(?:#|\/\/)\s*([A-Za-z][A-Za-z0-9_-]*)\s*=\s*(.*?)\s*$/.exec(l);
+    if (m === null) {
+      if (/syntax/i.test(l)) return true;
+      break;
+    }
+    if ((m[1] as string).toLowerCase() === 'syntax' && !OFFICIAL_FRONTEND.test(m[2] as string)) return true;
+  }
+  return false;
+}
+
 /** A Dockerfile read and parsed once per (file, context): its parse, or why it couldn't be. */
 export type DockerLoad = { parsed: Parsed } | { fail: 'missing' | 'unreadable' | 'limit' };
 async function loadDockerfile(ctx: Ctx, file: string, context: string): Promise<DockerLoad> {
@@ -414,6 +464,10 @@ function neededStages(stages: readonly Stage[], target: string | null): Set<numb
 /** The RUN texts of the Dockerfile `b` builds that count as checks, as findings under the building command `f`. */
 async function dockerfileRuns(ctx: Ctx, b: DockerBuild, f: Found, outer: Reason | null, resolve: Resolve): Promise<Found[]> {
   const unknown = (why: string): Found[] => [{ categories: UNKNOWN_SCRIPT_CATEGORIES, by: f.by, subject: f.subject, dir: f.dir, reason: null, partialWhy: why }];
+  // P57 (M1, M3): a build pipegen can't read may build any Dockerfile with any frontend: unknown for every service
+  if (b.unsure !== undefined) {
+    return [{ categories: UNKNOWN_SCRIPT_CATEGORIES, by: f.by, subject: f.subject, dir: null, reason: null, partialWhy: `${f.subject} uses ${b.unsure}, so pipegen can't tell what the build runs.` }];
+  }
   const key = `docker\u0000${b.file}\u0000${b.context}\u0000${b.target ?? ''}`;
   let runs = ctx.scriptMemo.get(key);
   if (runs === undefined) {
@@ -490,6 +544,9 @@ export async function buildRuns(ctx: Ctx, f: Found, resolve: Resolve): Promise<F
       for (const name of names.slice(0, MAX_COMPOSE_SERVICES)) {
         const svc = services.get(name);
         if (svc === undefined || !svc.hasBuild) continue;
+        if (svc.frontend !== null) {
+          return [{ categories: UNKNOWN_SCRIPT_CATEGORIES, by: f.by, subject: f.subject, dir: null, reason: null, partialWhy: `${f.subject} builds a service (${name}) with ${svc.frontend}, so pipegen can't tell what it runs.` }];
+        }
         if (svc.context === null || svc.file === null || svc.target === '?') {
           return [{ categories: UNKNOWN_SCRIPT_CATEGORIES, by: f.by, subject: f.subject, dir: f.dir, reason: null, partialWhy: `${f.subject} builds a service (${name}) whose Dockerfile pipegen can't place, so it can't tell what it runs.` }];
         }

@@ -670,9 +670,11 @@ export function scanShell(text: string, base: string | null, sigs: Compiled, bud
   /** The Dockerfile and context a `docker build` names, as repo-relative paths from the folder it runs in; null when they leave the repo. */
   const dockerBuildOf = (from: string, b: ReturnType<typeof buildWords>): DockerBuild | null => {
     if (b === null) return null;
+    // P57 (M1, M3): a build pipegen can't read is unknown, never missing
+    if ('unsure' in b) return { file: '', context: '', target: null, unsure: b.unsure };
     const context = resolveDir(from, b.context);
     const file = b.file !== null ? resolveDir(from, b.file) : context === null ? null : resolveDir(context, 'Dockerfile');
-    return context === null || file === null ? null : { file, context, target: b.target };
+    return context === null || file === null ? { file: '', context: '', target: null, unsure: 'a build context or Dockerfile outside the repo' } : { file, context, target: b.target };
   };
   /**
    * The words of the simple command at k, past redirections (more than MAX_FLAG_WORDS: false). `onWord` sees each

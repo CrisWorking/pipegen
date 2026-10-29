@@ -27,13 +27,25 @@ const BUILD_VALUE: ReadonlySet<string> = new Set([
 const BUILD_BOOL: ReadonlySet<string> = new Set(['--no-cache', '--pull', '--push', '--load', '-q', '--quiet', '--rm', '--force-rm', '--compress', '--squash', '--debug', '-D', '--disable-content-trust']);
 
 export interface BuildWords { file: string | null; context: string; target: string | null }
+/** P57: Docker's own Dockerfile frontend (any tag or digest); any other BUILDKIT_SYNTAX or `# syntax=` picks a custom one. */
+export const OFFICIAL_FRONTEND = /^(?:docker\.io\/)?docker\/dockerfile(?::[A-Za-z0-9._-]+)?(?:@sha256:[0-9a-f]{64})?$/;
+/** P57 (M3): a build arg that picks the frontend: only Docker's own, as a plain literal, is read; anything else (or a value from the env) is a reason to be unsure. */
+export function frontendArg(arg: string): string | null {
+  const eq = arg.indexOf('=');
+  if ((eq < 0 ? arg : arg.slice(0, eq)).trim() !== 'BUILDKIT_SYNTAX') return null;
+  const v = eq < 0 ? null : arg.slice(eq + 1).trim().replace(/^(["'])(.*)\1$/, '$2');
+  return v !== null && OFFICIAL_FRONTEND.test(v) ? null : 'a BUILDKIT_SYNTAX build arg that picks a custom Dockerfile frontend';
+}
 /**
  * `docker build` / `docker buildx build` words from index `from` to `end` (exclusive): the Dockerfile named by -f/--file
- * (relative to the folder the command runs in), the one context word, and --target. Null for a flag pipegen doesn't
- * know, no or several context words, a context that isn't a plain path (a URL, `-` for stdin, a variable), a
- * Dockerfile from stdin or a variable, or a `--check` / `--call` run (a lint of the Dockerfile, not a build).
+ * (relative to the folder the command runs in), the one context word, and --target. Null for a `--check` / `--call` run
+ * (a lint of the Dockerfile, not a build). P57 (M1, M3): `{ unsure }` for a flag pipegen doesn't know (`--opt
+ * source=…` included), no or several context words, a context that isn't a plain path (a URL, `-` for stdin, a
+ * variable), a Dockerfile from stdin or a variable, and a BUILDKIT_SYNTAX build arg other than Docker's own frontend:
+ * it builds, but pipegen can't tell what.
  */
-export function buildWords(at: At, from: number, end: number): BuildWords | null {
+export function buildWords(at: At, from: number, end: number): BuildWords | { unsure: string } | null {
+  let unsure: string | null = null;
   let file: string | null = null;
   let target: string | null = null;
   const positional: string[] = [];
@@ -54,15 +66,17 @@ export function buildWords(at: At, from: number, end: number): BuildWords | null
     if (name === '--check' || name === '--call') return null;
     if (BUILD_VALUE.has(name)) {
       const value = eq < 0 ? at(++i) : w.slice(eq + 1);
-      if (value === null) return null;
+      if (value === null) return { unsure: 'a build command line pipegen can\'t read to its end' };
       if (name === '-f' || name === '--file') file = value;
       else if (name === '--target') target = value;
-    } else if (!(eq < 0 && BUILD_BOOL.has(name))) return null;
+      else if (name === '--build-arg') unsure ??= frontendArg(value);
+    } else if (!(eq < 0 && BUILD_BOOL.has(name))) unsure ??= `a build flag pipegen doesn't read (${name.slice(0, 40)})`;
   }
+  if (unsure !== null) return { unsure };
   const context = positional.length === 1 ? plainPath(positional[0]) : null;
-  if (context === null) return null;
-  if (file !== null && plainPath(file) === null) return null;
-  if (target !== null && !/^[A-Za-z0-9_.-]{1,64}$/.test(target)) return null;
+  if (context === null) return { unsure: "a build context pipegen can't place" };
+  if (file !== null && plainPath(file) === null) return { unsure: "a Dockerfile path pipegen can't place" };
+  if (target !== null && !/^[A-Za-z0-9_.-]{1,64}$/.test(target)) return { unsure: "a build target pipegen can't read" };
   return { file, context, target };
 }
 

@@ -18,7 +18,7 @@ import {
 } from './settings.js';
 import { imageName, preCommitRunMode, scanImage, scanShell, shellMode } from './shell.js';
 import { composeEnvGated } from './docker.js';
-import { plainPath } from './docker-words.js';
+import { frontendArg, plainPath } from './docker-words.js';
 import { DOCKER_BUILD_ID, PART_RE, PREK_ID, isHookRunner, type ToolSignature } from './signatures.js';
 import { tokenize } from './tokenize.js';
 import type { Compiled, Ctx, DockerBuild, Fit, Found, Hit, Obj, Reason } from './types.js';
@@ -306,8 +306,11 @@ function literalInput(w: Inputs, name: string): string | null | undefined {
  * (check, print: no build), an expression or a context that isn't a repo folder gives null.
  */
 function buildActionBuild(w: Inputs): DockerBuild | null {
-  const [call, context, file, target] = ['call', 'context', 'file', 'target'].map((n) => literalInput(w, n));
+  const [call, context, file, target, args] = ['call', 'context', 'file', 'target', 'build-args'].map((n) => literalInput(w, n));
   if (call !== undefined || context === null || file === null || target === null) return null;
+  // P57 (M3): build args that may pick a custom Dockerfile frontend (BUILDKIT_SYNTAX), or that pipegen can't read
+  const frontend = args === null ? 'build args pipegen can\'t read' : (args ?? '').split(/[\n,]/).map((a) => frontendArg(a)).find((x) => x !== null);
+  if (frontend !== undefined && frontend !== null) return { file: '', context: '', target: null, unsure: frontend };
   const folder = context === undefined ? '.' : context === '.' || (plainPath(context.replace(/^(?:\.\/)+/, '')) !== null && !context.startsWith('/')) ? resolveDir('.', context) : null;
   const path = file === undefined ? (folder === null ? null : resolveDir(folder, 'Dockerfile')) : plainPath(file) === null ? null : resolveDir('.', file);
   if (folder === null || path === null || (target !== undefined && !/^[A-Za-z0-9_.-]{1,64}$/.test(target))) return null;

@@ -3562,3 +3562,42 @@ describe('coverage: minors of the hand-check fixes review (P57)', () => {
     }
   });
 });
+
+describe('coverage: a custom BuildKit frontend makes a Dockerfile build unknown (P57 M3, security scan follow-up)', () => {
+  const app = svc('.', { language: 'python', packageManager: 'uv', scripts: ['start'], frameworks: ['fastapi'] });
+  const BODY = 'FROM python:3.14\nWORKDIR /app\nCOPY . /app\nRUN pytest\n';
+  const st = async (files: Record<string, string>, steps: string) => {
+    const dir = makeTempDir();
+    for (const [rel, text] of Object.entries(files)) writeIn(dir, rel, text);
+    ci(dir, steps);
+    const r = row(await coverage(dir, { services: [app] }), 'push', 'unit-tests', 'app');
+    return `${r.status}${r.by === undefined ? '' : ` ${r.by}`}`;
+  };
+  const build = run('docker build .');
+
+  it('every directive form BuildKit reads in the leading block: // and #, any case, spaces, after other directives; a JSON file with a syntax key', async () => {
+    for (const head of ['// syntax=evil/frontend', '# SyNtAx = x', '#syntax=evil/fe', '# check=skip=all\n# syntax=evil/fe', '//syntax = docker/dockerfile-upstream:master',
+      '# escape=\\\n# syntax=evil/fe', '\ufeff# syntax=evil/fe']) {
+      expect(await st({ Dockerfile: `${head}\n${BODY}` }, build), head).toMatch(/^unknown/);
+    }
+    expect(await st({ Dockerfile: '{"syntax": "evil/fe", "x": "FROM python:3.14\\nRUN pytest"}\n' }, build)).toMatch(/^unknown/);
+    // Docker's own frontend, and a syntax line after the leading block (a plain comment then), still read
+    expect(await st({ Dockerfile: `// syntax=docker/dockerfile:1\n${BODY}` }, build)).toBe('covered your own `pytest`');
+    expect(await st({ Dockerfile: `${BODY}# syntax=evil/fe\n` }, build)).toBe('covered your own `pytest`');
+  });
+
+  it('BUILDKIT_SYNTAX as a build arg (command line, from the env, compose args, the build action) or a frontend option: unknown', async () => {
+    for (const steps of [run('docker build --build-arg BUILDKIT_SYNTAX=evil/fe .'), run('docker buildx build --build-arg=BUILDKIT_SYNTAX=evil/fe .'),
+      run('docker build --build-arg BUILDKIT_SYNTAX .'), run('docker build --build-arg BUILDKIT_SYNTAX="$FE" .'), run('docker buildx build --opt source=x .'),
+      run('docker build --weird-flag .'),
+      '      - uses: docker/build-push-action@v6\n        with:\n          build-args: |\n            BUILDKIT_SYNTAX=evil/fe\n']) {
+      expect(await st({ Dockerfile: BODY }, steps), steps).toMatch(/^unknown/);
+    }
+    expect(await st({ Dockerfile: BODY }, run('docker build --build-arg BUILDKIT_SYNTAX=docker/dockerfile:1 .'))).toBe('covered your own `pytest`');
+    expect(await st({ Dockerfile: BODY }, run('docker build --build-arg OTHER=1 .'))).toBe('covered your own `pytest`');
+    const compose = (args: string) => ({ Dockerfile: BODY, 'compose.yml': `services:\n  app:\n    build:\n      context: .\n      args:\n${args}` });
+    expect(await st(compose('        BUILDKIT_SYNTAX: evil/fe\n'), run('docker compose build'))).toMatch(/^unknown/);
+    expect(await st(compose('        - BUILDKIT_SYNTAX=evil/fe\n'), run('docker compose build'))).toMatch(/^unknown/);
+    expect(await st(compose('        OTHER: "1"\n'), run('docker compose build'))).toBe('covered your own `pytest`');
+  });
+});

@@ -50,7 +50,11 @@ export type Slot = CiLayer | 'scheduled';
 export type Fit = Record<Slot, boolean>;
 
 /** One Dockerfile a command builds (repo-relative, plain paths), its build context, and the --target stage ('' = none). */
-export interface DockerBuild { file: string; context: string; target: string | null }
+export interface DockerBuild {
+  file: string; context: string; target: string | null;
+  /** P57 (M1, M3): why pipegen can't tell what this build runs (a flag it doesn't know, a custom frontend, a path it can't place): unknown. */
+  unsure?: string;
+}
 
 /** A tool found in shell text or a step. `reason` null = it runs and can fail the run. */
 export interface Found {
