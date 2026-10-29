@@ -1,0 +1,8 @@
+[project]
+name = "uv-app"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = ["fastapi>=0.110", "uvicorn>=0.29"]
+
+[project.scripts]
+uv-app = "uv_app:main"

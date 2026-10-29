@@ -1,0 +1,1792 @@
+# pipegen's reviewed tool list (Plan B Task 8), read by loadReviewed (src/engine/reviewed.ts). This file is a trust
+# root: only the tools listed here ever run in a user's CI. Each entry is one exact tool, version, pin and step
+# template. Code owners must review every change (Plan R's CODEOWNERS covers data/).
+#
+# Every value was pinned live with resolvePin (src/engine/pin.ts), read-only: the Plan B entries on 2026-10-26 (most at
+# 23:11:58Z; Bullfrog and the zizmor re-check at 23:39:15Z), the Plan P Task 6 entries (from "Plan P Task 6" below) on
+# pin day (resolvePin and the downloads at 2026-10-27T23:00-23:20Z; the signature checks again at
+# 2026-10-28T00:00:14-26Z, so every verifiedOn is pinnedOn's day): actions by the commit SHA of their tag (from the
+# upstream repo's own refs), release binaries by the linux amd64 asset's sha256 (from the release's own checksums file, unless an
+# entry says checksumSource: github-asset-digest or computed), npm packages by their sha512 integrity, pip packages by
+# the sha256 of their py3-none-any wheel (ruling S20), images by the digest of their multi-platform index. On pin day
+# each binary, npm tarball and wheel was also downloaded and hashed, and matched. Every release was published at
+# least 7 days before that (ruling S26); releasedAt is the server-recorded date. A tool also in data/pinned-binaries.yml has the same version and hash there (ruling S25).
+#
+# reviewedBy is PENDING until the owner has reviewed the entry (repo, version, pin, fixedInputs, choices,
+# configFiles) and sets reviewedBy and reviewedAt in a PR. A release build refuses this list while any entry is
+# PENDING (ruling S21).
+#
+# Entry fields: categories (need categories, plus platform); languages; candidate (the exact
+# pin); step (the template: step.action for actions, step.cli for binaries and images; step.cli.plugins for npm or
+# pip packages installed next to the tool, exact and hashed); verifiedWith (the signature or attestation check made
+# when pinning: method, the signed asset, the exact certificate identity and issuer, the day; required for the
+# MUST_VERIFY repos in src/engine/reviewed.ts); fixedInputs (set by the
+# template, the AI can never change them; config is pipegen's own pinned config, so repo config files are never
+# picked up silently); choices (the only inputs the AI may set, each limited to these values); configFiles (files
+# the tool would load from a repo by itself; added to the protected paths); configSections (`<file>:<section>` of shared
+# files the tool reads, e.g. pyproject.toml:tool.mypy; ruling P23); wrappedImage (the image an action's action.yml runs,
+# with the digest it resolved to when pinned; ruling P26); step.cli.then (follow-up commands of the same tool; a
+# `{choice}` word is the AI's choice, named after the flag it fills, ruling P24); proofs (passed Plan E runs). Every
+# entry with a step.cli (cli or image) must match its allowlist in src/engine/tool-flags.ts (ARGV_POLICIES, by id: its
+# install method and package, executable, flags, pinned config and env; rulings P19, P28), and every action its input
+# policy (ACTION_POLICIES, by exact owner/repo; ruling P29): change the data and the policy together.
+#
+# Not here, on purpose: KICS was never on this list (its action tags and images were hijacked; the loader refuses it,
+# Plan P Task 5). Dependabot (the update-config file) and npm trusted publishing are pipegen's own built-in steps,
+# not reviewed entries (Plan P Task 8); so are the repo's own tsc and Jest at their lockfile version (DECISIONS #95).
+
+pinnedOn: "2026-10-28T00:00:26Z"
+tools:
+  # Checks out the repo. The job credential is never written to .git/config (persist-credentials false).
+  # Source: git ref refs/tags/v7.0.1 of actions/checkout (GitHub API), release published_at. Released 2026-07-20T15:10:05Z.
+  - id: actions-checkout
+    categories: ["platform"]
+    languages: ["any"]
+    releasedAt: "2026-07-20T15:10:05Z"
+    candidate:
+      id: actions-checkout
+      name: "actions/checkout"
+      kind: action
+      repo: actions/checkout
+      version: "v7.0.1"
+      pin: { sha: "3d3c42e5aac5ba805825da76410c181273ba90b1" }
+      source: reviewed
+      reviewed: true
+      categories: ["platform"]
+    step:
+      action:
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: "false"
+          allow-unsafe-pr-checkout: "false"
+      output: { path: "", format: none }
+    fixedInputs:
+      with:
+        persist-credentials: "false"
+        allow-unsafe-pr-checkout: "false"
+    choices:
+      fetch-depth: ["1", "0"]
+    configFiles: []
+    reviewedBy: Cristiano
+    reviewedAt: "2026-10-28"
+    proofs: 0
+
+  # Installs Node.js. Its automatic package-manager cache is off (pipegen uses no caches, spec §19). Node 24 and 26 only (DECISIONS #92).
+  # Source: git ref refs/tags/v7.1.0 of actions/setup-node (GitHub API), release published_at. Released 2026-10-08T02:52:34Z.
+  - id: actions-setup-node
+    categories: ["platform"]
+    languages: ["node"]
+    releasedAt: "2026-10-08T02:52:34Z"
+    candidate:
+      id: actions-setup-node
+      name: "actions/setup-node"
+      kind: action
+      repo: actions/setup-node
+      version: "v7.1.0"
+      pin: { sha: "949feb2413d6458794dcd2491c4babbbce0c15c1" }
+      source: reviewed
+      reviewed: true
+      categories: ["platform"]
+    step:
+      action:
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1
+        with:
+          package-manager-cache: "false"
+      output: { path: "", format: none }
+    fixedInputs:
+      with:
+        package-manager-cache: "false"
+    choices:
+      node-version: ["24", "26"]
+    configFiles: []
+    reviewedBy: Cristiano
+    reviewedAt: "2026-10-28"
+    proofs: 0
+
+  # Installs Python. No cache input is set or offered (pipegen uses no caches, spec §19).
+  # Source: git ref refs/tags/v7.0.0 of actions/setup-python (GitHub API), release published_at. Released 2026-07-20T03:15:01Z.
+  - id: actions-setup-python
+    categories: ["platform"]
+    languages: ["python"]
+    releasedAt: "2026-07-20T03:15:01Z"
+    candidate:
+      id: actions-setup-python
+      name: "actions/setup-python"
+      kind: action
+      repo: actions/setup-python
+      version: "v7.0.0"
+      pin: { sha: "5fda3b95a4ea91299a34e894583c3862153e4b97" }
+      source: reviewed
+      reviewed: true
+      categories: ["platform"]
+    step:
+      action:
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+        with: {}
+      output: { path: "", format: none }
+    fixedInputs: {}
+    choices:
+      python-version: ["3.11", "3.12", "3.13", "3.14"]
+    configFiles: []
+    reviewedBy: Cristiano
+    reviewedAt: "2026-10-28"
+    proofs: 0
+
+  # Uploads scan results for the gate. Hidden files (.env and the like) are never included.
+  # Source: git ref refs/tags/v7.0.2 of actions/upload-artifact (GitHub API), release published_at. Released 2026-10-07T10:08:14Z.
+  - id: actions-upload-artifact
+    categories: ["platform"]
+    languages: ["any"]
+    releasedAt: "2026-10-07T10:08:14Z"
+    candidate:
+      id: actions-upload-artifact
+      name: "actions/upload-artifact"
+      kind: action
+      repo: actions/upload-artifact
+      version: "v7.0.2"
+      pin: { sha: "cf430e030ddbb5b0abf93d22962f4752f3646cd9" }
+      source: reviewed
+      reviewed: true
+      categories: ["platform"]
+    step:
+      action:
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          include-hidden-files: "false"
+          if-no-files-found: "error"
+      output: { path: "", format: none }
+    fixedInputs:
+      with:
+        include-hidden-files: "false"
+        if-no-files-found: "error"
+    choices: {}
+    configFiles: []
+    reviewedBy: Cristiano
+    reviewedAt: "2026-10-28"
+    proofs: 0
+
+  # Downloads scan results in the gate job (exact artifact names are set by the renderer).
+  # Source: git ref refs/tags/v8.0.2 of actions/download-artifact (GitHub API), release published_at. Released 2026-10-07T10:09:51Z.
+  - id: actions-download-artifact
+    categories: ["platform"]
+    languages: ["any"]
+    releasedAt: "2026-10-07T10:09:51Z"
+    candidate:
+      id: actions-download-artifact
+      name: "actions/download-artifact"
+      kind: action
+      repo: actions/download-artifact
+      version: "v8.0.2"
+      pin: { sha: "9000827ccba6bdab643e8b6fd33ac0654aef8333" }
+      source: reviewed
+      reviewed: true
+      categories: ["platform"]
+    step:
+      action:
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
+        with: {}
+      output: { path: "", format: none }
+    fixedInputs: {}
+    choices: {}
+    configFiles: []
+    reviewedBy: Cristiano
+    reviewedAt: "2026-10-28"
+    proofs: 0
+
+  # Logs in to a container registry for image builds; logs out at the end of the job.
+  # Source: git ref refs/tags/v4.6.0 of docker/login-action (GitHub API), release published_at. Released 2026-07-29T12:12:00Z.
+  - id: docker-login-action
+    categories: ["platform"]
+    languages: ["any"]
+    releasedAt: "2026-07-29T12:12:00Z"
+    candidate:
+      id: docker-login-action
+      name: "docker/login-action"
+      kind: action
+      repo: docker/login-action
+      version: "v4.6.0"
+      pin: { sha: "dbcb813823bdd20940b903addbd779551569679f" }
+      source: reviewed
+      reviewed: true
+      categories: ["platform"]
+    step:
+      action:
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f
+        with:
+          logout: "true"
+      output: { path: "", format: none }
+    fixedInputs:
+      with:
+        logout: "true"
+    choices:
+      registry: ["ghcr.io", "docker.io"]
+    configFiles: []
+    reviewedBy: Cristiano
+    reviewedAt: "2026-10-28"
+    proofs: 0
+
+  # Sets up Docker Buildx. Its binary cache is off (pipegen uses no caches, spec §19).
+  # Source: git ref refs/tags/v4.4.1 of docker/setup-buildx-action (GitHub API), release published_at. Released 2026-09-16T07:50:21Z.
+  - id: docker-setup-buildx-action
+    categories: ["platform"]
+    languages: ["any"]
+    releasedAt: "2026-09-16T07:50:21Z"
+    candidate:
+      id: docker-setup-buildx-action
+      name: "docker/setup-buildx-action"
+      kind: action
+      repo: docker/setup-buildx-action
+      version: "v4.4.1"
+      pin: { sha: "f87e5991a6d7451dcb8d9637bfbc97413f497069" }
+      source: reviewed
+      reviewed: true
+      categories: ["platform"]
+    step:
+      action:
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069
+        with:
+          cache-binary: "false"
+      output: { path: "", format: none }
+    fixedInputs:
+      with:
+        cache-binary: "false"
+    choices: {}
+    configFiles: []
+    reviewedBy: Cristiano
+    reviewedAt: "2026-10-28"
+    proofs: 0
+
+  # Builds the container image once (no build cache), so the same image is scanned and deployed. Context "." and an empty github-token: the job credential is never a build secret.
+  # Source: git ref refs/tags/v7.4.0 of docker/build-push-action (GitHub API), release published_at. Released 2026-09-15T08:22:01Z.
+  - id: docker-build-push-action
+    categories: ["platform", "image-build"]
+    languages: ["any"]
+    releasedAt: "2026-09-15T08:22:01Z"
+    candidate:
+      id: docker-build-push-action
+      name: "docker/build-push-action"
+      kind: action
+      repo: docker/build-push-action
+      version: "v7.4.0"
+      pin: { sha: "c3c9e263c25d99ce0380d002d59b67737d91b0dc" }
+      source: reviewed
+      reviewed: true
+      categories: ["platform", "image-build"]
+    step:
+      action:
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc
+        with:
+          context: "."
+          github-token: ""
+          no-cache: "true"
+      output: { path: "", format: none }
+    fixedInputs:
+      with:
+        context: "."
+        github-token: ""
+        no-cache: "true"
+    choices:
+      push: ["false", "true"]
+    configFiles: []
+    reviewedBy: Cristiano
+    reviewedAt: "2026-10-28"
+    proofs: 0
+
+  # Uploads SARIF results to GitHub code scanning (only where code scanning is available).
+  # Source: git ref refs/tags/v4.39.0 of github/codeql-action (GitHub API), release published_at. Released 2026-10-15T10:57:05Z.
+  - id: codeql-upload-sarif
+    categories: ["platform"]
+    languages: ["any"]
+    releasedAt: "2026-10-15T10:57:05Z"
+    candidate:
+      id: codeql-upload-sarif
+      name: "github/codeql-action"
+      kind: action
+      repo: github/codeql-action
+      version: "v4.39.0"
+      pin: { sha: "6f2ac81f5cd81fe351a197ba0b00d91d03cd2aee" }
+      source: reviewed
+      reviewed: true
+      categories: ["platform"]
+    step:
+      action:
+        uses: github/codeql-action/upload-sarif@6f2ac81f5cd81fe351a197ba0b00d91d03cd2aee
+        with: {}
+      output: { path: "", format: none }
+    fixedInputs: {}
+    choices: {}
+    configFiles: []
+    reviewedBy: Cristiano
+    reviewedAt: "2026-10-28"
+    proofs: 0
+
+  # Records a GitHub build attestation for the image (v4, ruling S24: checked live).
+  # Source: git ref refs/tags/v4.2.2 of actions/attest (GitHub API), release published_at. Released 2026-08-04T20:36:29Z.
+  - id: actions-attest
+    categories: ["platform", "attestation"]
+    languages: ["any"]
+    releasedAt: "2026-08-04T20:36:29Z"
+    candidate:
+      id: actions-attest
+      name: "actions/attest"
+      kind: action
+      repo: actions/attest
+      version: "v4.2.2"
+      pin: { sha: "1e69f48acb82d1966a394da916b4c1698aa569d6" }
+      source: reviewed
+      reviewed: true
+      categories: ["platform", "attestation"]
+    step:
+      action:
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6
+        with: {}
+      output: { path: "", format: none }
+    fixedInputs: {}
+    choices: {}
+    configFiles: []
+    reviewedBy: Cristiano
+    reviewedAt: "2026-10-28"
+    proofs: 0
+
+  # Egress control for proof and CI jobs (spike S8): Bullfrog in block mode, sudo off, so no later step can undo it.
+  # Source: git ref refs/tags/v0.11.1 of bullfrogsec/bullfrog (GitHub API), release published_at. Released 2026-08-25T02:34:34Z.
+  # Replaces Harden-Runner: its free tier blocked nothing on a private repo, silently (S8). The action checks its agent download against a sha256 pinned inside it.
+  - id: bullfrog
+    categories: ["egress"]
+    languages: ["any"]
+    releasedAt: "2026-08-25T02:34:34Z"
+    candidate:
+      id: bullfrog
+      name: "bullfrogsec/bullfrog"
+      kind: action
+      repo: bullfrogsec/bullfrog
+      version: "v0.11.1"
+      pin: { sha: "7dee337d4575320b6d8cbe9a56d48d2fb765963a" }
+      source: reviewed
+      reviewed: true
+      categories: ["egress"]
+    step:
+      action:
+        uses: bullfrogsec/bullfrog@7dee337d4575320b6d8cbe9a56d48d2fb765963a
+        with:
+          egress-policy: "block"
+          dns-policy: "allowed-domains-only"
+          enable-sudo: "false"
+      output: { path: "", format: none }
+    fixedInputs:
+      with:
+        egress-policy: "block"
+        dns-policy: "allowed-domains-only"
+        enable-sudo: "false"
+    choices:
+      allowed-domains: ["github-core", "npm", "pypi", "dockerhub", "ghcr"]
+      allowed-ips: ["172.16.0.0/12"]
+    configFiles: []
+    reviewedBy: Cristiano
+    reviewedAt: "2026-10-28"
+    proofs: 0
+
+  # The registry:2 image, a local registry service for image builds in proof jobs (no scan output).
+  # Source: Docker Hub library/registry:2.8.3 index digest (registry-1.docker.io HEAD), push date from hub.docker.com. Released 2025-02-14T22:38:32.712916Z.
+  - id: registry
+    categories: ["platform"]
+    languages: ["any"]
+    releasedAt: "2025-02-14T22:38:32.712916Z"
+    candidate:
+      id: registry
+      name: "distribution/distribution"
+      kind: docker
+      repo: distribution/distribution
+      version: "2.8.3"
+      pin: { digest: "sha256:a3d8aaa63ed8681a604f1dea0aa03f100d5895b6a58ace528858a7b332415373" }
+      source: reviewed
+      reviewed: true
+      categories: ["platform"]
+    step:
+      cli:
+        install: { method: docker, package: "registry", version: "2.8.3" }
+        command: []
+      output: { path: "", format: none }
+    fixedInputs: {}
+    choices: {}
+    configFiles: []
+    reviewedBy: Cristiano
+    reviewedAt: "2026-10-28"
+    proofs: 0
+
+  # OWASP ZAP baseline scan of the running app. zap-json output, converted by pipegen's parser.
+  # Source: Docker Hub zaproxy/zap-stable:20261016 index digest (registry-1.docker.io HEAD), push date from hub.docker.com. Released 2026-10-16T09:36:50.415097Z.
+  # zaproxy/zap-stable:20261016 is the newest dated stable build at least 7 days old (the 2.17.0 and latest tags were pushed on the pin day); it already holds the ZAP 2.17.0 core.
+  # -z "-silent": no add-on update or install at run time. The image bundles the release passive rules (pscanrules); pscanrulesBeta is not bundled, so beta passive rules do not run.
+  - id: zap-baseline
+    categories: ["dast"]
+    languages: ["any"]
+    releasedAt: "2026-10-16T09:36:50.415097Z"
+    candidate:
+      id: zap-baseline
+      name: "zaproxy/zaproxy"
+      kind: docker
+      repo: zaproxy/zaproxy
+      version: "20261016"
+      pin: { digest: "sha256:5ccfff9a411743ab2615136a2edd7416bec9ce41572fa94e935df38c14adb2b6" }
+      source: reviewed
+      reviewed: true
+      categories: ["dast"]
+    step:
+      cli:
+        install: { method: docker, package: "zaproxy/zap-stable", version: "20261016" }
+        command: ["zap-baseline.py", "-J", "zap.json", "-z", "-silent"]
+      output: { path: "zap.json", format: zap-json }
+    fixedInputs:
+      args: ["-J", "zap.json", "-z", "-silent"]
+      config:
+        content: "# pipegen's pinned ZAP baseline rules: the defaults, nothing ignored\n"
+        passAs: { flag: "-c" }
+    choices: {}
+    configFiles: [".zap/**"]
+    reviewedBy: Cristiano
+    reviewedAt: "2026-10-28"
+    proofs: 0
+
+  # Trivy config scan of Terraform and other infrastructure code. Release binary, no cache, only the checks built into the pinned binary.
+  # Source: release v0.76.0 of aquasecurity/trivy: trivy_0.76.0_Linux-64bit.tar.gz sha256 from the release checksums file. Released 2026-10-14T11:45:44Z.
+  # Signature: pipegen's pinned cosign 3.1.3 ran `cosign verify-blob --bundle trivy_0.76.0_checksums.txt.sigstore.json
+  #   --certificate-identity https://github.com/aquasecurity/trivy/.github/workflows/reusable-release.yaml@refs/tags/v0.76.0
+  #   --certificate-oidc-issuer https://token.actions.githubusercontent.com trivy_0.76.0_checksums.txt` on 2026-10-27T18:59:28Z
+  #   and again on pin day, 2026-10-28T00:00:14Z: "Verified OK" (checksums.txt sha256 761d7853500074a0c81b1ef2f05ccb07f05080937aab68f98e7f2902a565e945,
+  #   the digest GitHub records for the asset). The checksums file lists the pinned sha256 above. Immutable release.
+  # Flags (catalogue §4, Plan P Task 5): --disable-telemetry, --skip-version-check and --skip-check-update, all three
+  #   in docs/guide/references/configuration/cli/trivy_config.md and trivy_image.md at tag v0.76.0.
+  - id: trivy-config
+    categories: ["iac"]
+    languages: ["any"]
+    releasedAt: "2026-10-14T11:45:44Z"
+    candidate:
+      id: trivy-config
+      name: "aquasecurity/trivy"
+      kind: cli
+      repo: aquasecurity/trivy
+      version: "v0.76.0"
+      pin: { checksum: "e24b1c51293c1b15e4ba8d45bbc7891ba053f90278ec2698f3562c993e145fe7" }
+      source: reviewed
+      reviewed: true
+      categories: ["iac"]
+    step:
+      cli:
+        install: { method: github-release, package: "trivy_0.76.0_Linux-64bit.tar.gz", version: "v0.76.0" }
+        command: ["trivy", "config", "--disable-telemetry", "--skip-version-check", "--skip-check-update", "--format", "sarif", "--output", "trivy-config.sarif", "--exit-code", "1", "."]
+      output: { path: "trivy-config.sarif", format: sarif }
+    fixedInputs:
+      args: ["--disable-telemetry", "--skip-version-check", "--skip-check-update", "--format", "sarif", "--exit-code", "1"]
+      config:
+        content: "# pipegen's pinned trivy config: no cache kept between runs\ncache:\n  backend: memory\n"
+        passAs: { flag: "--config" }
+    choices:
+      severity: ["CRITICAL", "HIGH,CRITICAL", "MEDIUM,HIGH,CRITICAL"]
+    configFiles: ["trivy.yaml", ".trivyignore", ".trivyignore.yaml"]
+    reviewedBy: Cristiano
+    reviewedAt: "2026-10-28"
+    proofs: 0
+    verifiedWith:
+      method: cosign-bundle
+      asset: "trivy_0.76.0_checksums.txt"
+      identity: "https://github.com/aquasecurity/trivy/.github/workflows/reusable-release.yaml@refs/tags/v0.76.0"
+      issuer: "https://token.actions.githubusercontent.com"
+      verifiedOn: "2026-10-28"
+
+  # Trivy scan of the built container image. Release binary, no cache.
+  # Source: release v0.76.0 of aquasecurity/trivy: trivy_0.76.0_Linux-64bit.tar.gz sha256 from the release checksums file. Released 2026-10-14T11:45:44Z.
+  # Signature: pipegen's pinned cosign 3.1.3 ran `cosign verify-blob --bundle trivy_0.76.0_checksums.txt.sigstore.json
+  #   --certificate-identity https://github.com/aquasecurity/trivy/.github/workflows/reusable-release.yaml@refs/tags/v0.76.0
+  #   --certificate-oidc-issuer https://token.actions.githubusercontent.com trivy_0.76.0_checksums.txt` on 2026-10-27T18:59:28Z
+  #   and again on pin day, 2026-10-28T00:00:14Z: "Verified OK" (checksums.txt sha256 761d7853500074a0c81b1ef2f05ccb07f05080937aab68f98e7f2902a565e945,
+  #   the digest GitHub records for the asset). The checksums file lists the pinned sha256 above. Immutable release.
+  # Flags (catalogue §4, Plan P Task 5): --disable-telemetry, --skip-version-check and --skip-check-update, all three
+  #   in docs/guide/references/configuration/cli/trivy_config.md and trivy_image.md at tag v0.76.0.
+  - id: trivy-image
+    categories: ["image-scan"]
+    languages: ["any"]
+    releasedAt: "2026-10-14T11:45:44Z"
+    candidate:
+      id: trivy-image
+      name: "aquasecurity/trivy"
+      kind: cli
+      repo: aquasecurity/trivy
+      version: "v0.76.0"
+      pin: { checksum: "e24b1c51293c1b15e4ba8d45bbc7891ba053f90278ec2698f3562c993e145fe7" }
+      source: reviewed
+      reviewed: true
+      categories: ["image-scan"]
+    step:
+      cli:
+        install: { method: github-release, package: "trivy_0.76.0_Linux-64bit.tar.gz", version: "v0.76.0" }
+        command: ["trivy", "image", "--disable-telemetry", "--skip-version-check", "--skip-check-update", "--format", "sarif", "--output", "trivy-image.sarif", "--exit-code", "1"]
+      output: { path: "trivy-image.sarif", format: sarif }
+    fixedInputs:
+      args: ["--disable-telemetry", "--skip-version-check", "--skip-check-update", "--format", "sarif", "--exit-code", "1"]
+      config:
+        content: "# pipegen's pinned trivy config: no cache kept between runs\ncache:\n  backend: memory\n"
+        passAs: { flag: "--config" }
+    choices:
+      severity: ["CRITICAL", "HIGH,CRITICAL", "MEDIUM,HIGH,CRITICAL"]
+      ignore-unfixed: ["false", "true"]
+    configFiles: ["trivy.yaml", ".trivyignore", ".trivyignore.yaml"]
+    reviewedBy: Cristiano
+    reviewedAt: "2026-10-28"
+    proofs: 0
+    verifiedWith:
+      method: cosign-bundle
+      asset: "trivy_0.76.0_checksums.txt"
+      identity: "https://github.com/aquasecurity/trivy/.github/workflows/reusable-release.yaml@refs/tags/v0.76.0"
+      issuer: "https://token.actions.githubusercontent.com"
+      verifiedOn: "2026-10-28"
+
+  # Secret scan (catalogue §3 PC2): betterleaks, the first pick for secrets; gitleaks below is the fallback.
+  # Source: release v1.9.0 of betterleaks/betterleaks: betterleaks_1.9.0_linux_x64.tar.gz sha256 from the release checksums file (checksums.txt; also GitHub's asset digest and the sha256 of the downloaded archive). Released 2026-09-29T20:08:06Z. Immutable release.
+  # Signature: pipegen's pinned cosign 3.1.3 ran `cosign verify-blob --bundle checksums.txt.sigstore.json
+  #   --certificate-identity https://github.com/betterleaks/betterleaks/.github/workflows/release.yml@refs/tags/v1.9.0
+  #   --certificate-oidc-issuer https://token.actions.githubusercontent.com checksums.txt`: "Verified OK" (2026-10-28T00:00:14Z; the
+  #   same check with @refs/tags/v1.8.0 fails). checksums.txt lists the pinned sha256 above.
+  # --redact (ruling P21): the secret never reaches the report or the CI log. --ignore-gitleaks-allow: inline allow comments can't hide a secret.
+  # Only pipegen's pinned --config (never the repo's .betterleaks.toml or .gitleaks.toml); no validation flags (they send
+  #   candidate secrets to provider APIs); --report-path is the SARIF file, never - (the findings would reach the CI log).
+  - id: betterleaks
+    categories: ["secrets"]
+    languages: ["any"]
+    releasedAt: "2026-09-29T20:08:06Z"
+    candidate:
+      id: betterleaks
+      name: "betterleaks/betterleaks"
+      kind: cli
+      repo: betterleaks/betterleaks
+      version: "v1.9.0"
+      pin: { checksum: "f8b185a39ffcece2a1ca82bf3a4e7435cd81963ffd16b7a9128daf75f35f6de7" }
+      source: reviewed
+      reviewed: true
+      categories: ["secrets"]
+    step:
+      cli:
+        install: { method: github-release, package: "betterleaks_1.9.0_linux_x64.tar.gz", version: "v1.9.0" }
+        command: ["betterleaks", "git", "--no-banner", "--ignore-gitleaks-allow", "--redact", "--report-format", "sarif", "--report-path", "betterleaks.sarif", "--exit-code", "1", "."]
+      output: { path: "betterleaks.sarif", format: sarif }
+    fixedInputs:
+      args: ["--ignore-gitleaks-allow", "--redact", "--report-format", "sarif", "--report-path", "betterleaks.sarif", "--exit-code", "1"]
+      config:
+        content: "[extend]\nuseDefault = true\n"
+        passAs: { flag: "--config" }
+    choices: {}
+    configFiles: [".betterleaks.toml", ".gitleaks.toml", ".gitleaksignore", ".betterleaksignore"]
+    reviewedBy: Cristiano
+    reviewedAt: "2026-10-28"
+    proofs: 0
+    verifiedWith:
+      method: cosign-bundle
+      asset: "checksums.txt"
+      identity: "https://github.com/betterleaks/betterleaks/.github/workflows/release.yml@refs/tags/v1.9.0"
+      issuer: "https://token.actions.githubusercontent.com"
+      verifiedOn: "2026-10-28"
+
+  # Secret scan, the fallback listed after betterleaks. Same release as data/pinned-binaries.yml (ruling S25).
+  # The same locks as betterleaks (ruling P21): --redact, --report-path its own SARIF file only, --exit-code 1, the pinned --config, no verbose output.
+  # Source: release v8.30.1 of gitleaks/gitleaks: gitleaks_8.30.1_linux_x64.tar.gz sha256 from the release checksums file. Released 2026-03-21T02:17:58Z.
+  - id: gitleaks
+    categories: ["secrets"]
+    languages: ["any"]
+    releasedAt: "2026-03-21T02:17:58Z"
+    candidate:
+      id: gitleaks
+      name: "gitleaks/gitleaks"
+      kind: cli
+      repo: gitleaks/gitleaks
+      version: "v8.30.1"
+      pin: { checksum: "551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb" }
+      source: reviewed
+      reviewed: true
+      categories: ["secrets"]
+    step:
+      cli:
+        install: { method: github-release, package: "gitleaks_8.30.1_linux_x64.tar.gz", version: "v8.30.1" }
+        command: ["gitleaks", "git", "--no-banner", "--ignore-gitleaks-allow", "--redact", "--report-format", "sarif", "--report-path", "gitleaks.sarif", "--exit-code", "1", "."]
+      output: { path: "gitleaks.sarif", format: sarif }
+    fixedInputs:
+      args: ["--ignore-gitleaks-allow", "--redact", "--report-format", "sarif", "--report-path", "gitleaks.sarif", "--exit-code", "1"]
+      config:
+        content: "[extend]\nuseDefault = true\n"
+        passAs: { flag: "--config" }
+    choices: {}
+    configFiles: [".gitleaks.toml", ".gitleaksignore"]
+    reviewedBy: Cristiano
+    reviewedAt: "2026-10-28"
+    proofs: 0
+
+  # Semgrep CE (image). Rules come only from a pinned semgrep-rules archive, never the registry (ruling S22).
+  # Source: Docker Hub semgrep/semgrep:1.181.0 index digest (registry-1.docker.io HEAD), push date from hub.docker.com. Released 2026-10-14T21:25:26.956057Z.
+  # Rules: semgrep/semgrep-rules commit 17e31e11ebac99fb7dfe1cd288f7a32151b6f3f9 on develop ("Merge pull request #4083 from semgrep/malaverdiere/fix-keyvault-timeadd-duration"), committed and GitHub-signed (web-flow) 2026-10-15T21:04:55Z.
+  # Rules archive sha256 computed by downloading https://github.com/semgrep/semgrep-rules/archive/17e31e11ebac99fb7dfe1cd288f7a32151b6f3f9.tar.gz twice (same hash, 1214304 bytes): checksumSource: computed.
+  # PIPEGEN_RULES_TREE is that commit's git tree SHA (GitHub API). --config /pipegen-rules is explicit because semgrep's default config is auto.
+  # No --disable-nosem: a nosem comment is a suppression the gate already reports as a finding.
+  - id: semgrep
+    categories: ["sast"]
+    languages: ["node", "python"]
+    releasedAt: "2026-10-14T21:25:26.956057Z"
+    candidate:
+      id: semgrep
+      name: "semgrep/semgrep"
+      kind: docker
+      repo: semgrep/semgrep
+      version: "1.181.0"
+      pin: { digest: "sha256:81474464c1f07483ba0682a44787fd93c91397419762a04abe2bafaae396304b" }
+      source: reviewed
+      reviewed: true
+      categories: ["sast"]
+    step:
+      cli:
+        install: { method: docker, package: "semgrep/semgrep", version: "1.181.0" }
+        command: ["semgrep", "scan", "--metrics=off", "--disable-version-check", "--config", "/pipegen-rules", "--sarif", "--output", "semgrep.sarif"]
+        env:
+          PIPEGEN_RULES_URL: "https://github.com/semgrep/semgrep-rules/archive/17e31e11ebac99fb7dfe1cd288f7a32151b6f3f9.tar.gz"
+          PIPEGEN_RULES_SHA256: "9dfe6866fbecd557f507078cb79721a9eb8f4764fc2f6163648ea1320be25933"
+          PIPEGEN_RULES_TREE: "dd3179667faf14717e05c33b1916b0d2c349673d"
+      output: { path: "semgrep.sarif", format: sarif }
+    fixedInputs:
+      args: ["--metrics=off", "--disable-version-check", "--config", "/pipegen-rules"]
+      env:
+        PIPEGEN_RULES_URL: "https://github.com/semgrep/semgrep-rules/archive/17e31e11ebac99fb7dfe1cd288f7a32151b6f3f9.tar.gz"
+        PIPEGEN_RULES_SHA256: "9dfe6866fbecd557f507078cb79721a9eb8f4764fc2f6163648ea1320be25933"
+        PIPEGEN_RULES_TREE: "dd3179667faf14717e05c33b1916b0d2c349673d"
+    choices:
+      rules: ["javascript", "typescript", "python"]
+    configFiles: [".semgrepignore"]
+    reviewedBy: Cristiano
+    reviewedAt: "2026-10-28"
+    proofs: 0
+
+  # Dependency scan against the OSV database. Release binary. Also the dependency-review check (Plan P Task 6): comparing
+  # the base and the head of a pull request in one run is Plan C's job.
+  # Source: release v2.7.0 of google/osv-scanner: osv-scanner_linux_amd64 sha256 from the release checksums file. Released 2026-10-12T01:32:07Z.
+  - id: osv-scanner
+    categories: ["deps", "dependency-review"]
+    languages: ["any"]
+    releasedAt: "2026-10-12T01:32:07Z"
+    candidate:
+      id: osv-scanner
+      name: "google/osv-scanner"
+      kind: cli
+      repo: google/osv-scanner
+      version: "v2.7.0"
+      pin: { checksum: "160c6253e2922e9e0a6a9771c5c4c40a4b3c6090b34a3cdd5e80c96cc2e4218b" }
+      source: reviewed
+      reviewed: true
+      categories: ["deps", "dependency-review"]
+    step:
+      cli:
+        install: { method: github-release, package: "osv-scanner_linux_amd64", version: "v2.7.0" }
+        command: ["osv-scanner", "scan", "source", "--recursive", "--format", "sarif", "--output", "osv.sarif", "."]
+      output: { path: "osv.sarif", format: sarif }
+    fixedInputs:
+      args: ["--format", "sarif", "--output", "osv.sarif"]
+      config:
+        content: "# pipegen's pinned osv-scanner config: no ignored vulnerabilities\n"
+        passAs: { flag: "--config" }
+    choices: {}
+    configFiles: ["**/osv-scanner.toml"]
+    reviewedBy: Cristiano
+    reviewedAt: "2026-10-28"
+    proofs: 0
+
+  # Git hook manager: sets up the pre-commit hooks, and runs them in CI on all files.
+  # Source: release v2.2.2 of evilmartians/lefthook: lefthook_2.2.2_Linux_x86_64 sha256 from the release checksums file. Released 2026-10-13T09:20:36Z.
+  - id: lefthook
+    categories: ["hooks", "hooks-ci"]
+    languages: ["any"]
+    releasedAt: "2026-10-13T09:20:36Z"
+    candidate:
+      id: lefthook
+      name: "evilmartians/lefthook"
+      kind: cli
+      repo: evilmartians/lefthook
+      version: "v2.2.2"
+      pin: { checksum: "4fbf89eb7748c6aed84d833ee1a29edac48fae614468ca9a82896ec32f2800b6" }
+      source: reviewed
+      reviewed: true
+      categories: ["hooks", "hooks-ci"]
+    step:
+      cli:
+        install: { method: github-release, package: "lefthook_2.2.2_Linux_x86_64", version: "v2.2.2" }
+        command: ["lefthook", "run", "pre-commit", "--all-files"]
+      output: { path: "", format: none }
+    fixedInputs:
+      args: ["--all-files"]
+    choices: {}
+    configFiles: ["lefthook.yml", "lefthook.yaml", ".lefthook.yml", ".lefthook.yaml", "lefthook-local.yml", "lefthook-local.yaml", ".lefthook-local.yml", ".lefthook-local.yaml", ".lefthook/**", ".lefthook-local/**"]
+    reviewedBy: Cristiano
+    reviewedAt: "2026-10-28"
+    proofs: 0
+
+  # Lists every component of the built image (SBOM, SPDX JSON). Release binary.
+  # Source: release v1.55.0 of anchore/syft: syft_1.55.0_linux_amd64.tar.gz sha256 from the release checksums file. Released 2026-10-19T19:01:26Z.
+  - id: syft
+    categories: ["sbom"]
+    languages: ["any"]
+    releasedAt: "2026-10-19T19:01:26Z"
+    candidate:
+      id: syft
+      name: "anchore/syft"
+      kind: cli
+      repo: anchore/syft
+      version: "v1.55.0"
+      pin: { checksum: "bb65249542db5fedeeb4d3f9b018b75e7264dbfbbb10486f044581a92f90490d" }
+      source: reviewed
+      reviewed: true
+      categories: ["sbom"]
+    step:
+      cli:
+        install: { method: github-release, package: "syft_1.55.0_linux_amd64.tar.gz", version: "v1.55.0" }
+        command: ["syft", "scan", "--output", "spdx-json=sbom.spdx.json"]
+      output: { path: "", format: none }
+    fixedInputs:
+      args: ["--output", "spdx-json=sbom.spdx.json"]
+      config:
+        content: "check-for-app-update: false\n"
+        passAs: { flag: "--config" }
+    choices: {}
+    configFiles: [".syft.yaml", ".syft.yml", ".syft/**", "syft.yaml"]
+    reviewedBy: Cristiano
+    reviewedAt: "2026-10-28"
+    proofs: 0
+
+  # Signs the built image. Same release as data/pinned-binaries.yml (ruling S25).
+  # Source: release v3.1.3 of sigstore/cosign: cosign-linux-amd64 sha256 from the release checksums file. Released 2026-08-06T01:09:23Z.
+  - id: cosign
+    categories: ["signing"]
+    languages: ["any"]
+    releasedAt: "2026-08-06T01:09:23Z"
+    candidate:
+      id: cosign
+      name: "sigstore/cosign"
+      kind: cli
+      repo: sigstore/cosign
+      version: "v3.1.3"
+      pin: { checksum: "4629c757b7618056f8ddd7e2625ae9fdd94c0372a65049520bc7d9df9efc7f71" }
+      source: reviewed
+      reviewed: true
+      categories: ["signing"]
+    step:
+      cli:
+        install: { method: github-release, package: "cosign-linux-amd64", version: "v3.1.3" }
+        command: ["cosign", "sign", "--yes"]
+      output: { path: "", format: none }
+    fixedInputs:
+      args: ["--yes"]
+    choices: {}
+    configFiles: []
+    reviewedBy: Cristiano
+    reviewedAt: "2026-10-28"
+    proofs: 0
+
+  # Lints GitHub workflow files. Same release as data/pinned-binaries.yml (ruling S25). No shellcheck or pyflakes from the runner's PATH.
+  # Source: release v1.7.12 of rhysd/actionlint: actionlint_1.7.12_linux_amd64.tar.gz sha256 from the release checksums file. Released 2026-03-30T17:49:21Z.
+  # The pinned config ignores only the cache-mode job key, which actionlint 1.7.12 rejects (DECISIONS #79; checked with the real 1.7.12 binary).
+  - id: actionlint
+    categories: ["workflow-lint"]
+    languages: ["any"]
+    releasedAt: "2026-03-30T17:49:21Z"
+    candidate:
+      id: actionlint
+      name: "rhysd/actionlint"
+      kind: cli
+      repo: rhysd/actionlint
+      version: "v1.7.12"
+      pin: { checksum: "8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8" }
+      source: reviewed
+      reviewed: true
+      categories: ["workflow-lint"]
+    step:
+      cli:
+        install: { method: github-release, package: "actionlint_1.7.12_linux_amd64.tar.gz", version: "v1.7.12" }
+        command: ["actionlint", "-no-color", "-shellcheck=", "-pyflakes="]
+      output: { path: "", format: none }
+    fixedInputs:
+      args: ["-shellcheck=", "-pyflakes="]
+      config:
+        content: "self-hosted-runner:\n  labels: []\npaths:\n  .github/workflows/**/*.{yml,yaml}:\n    ignore:\n      - 'unexpected key \"cache-mode\" for \"job\" section'\n"
+        passAs: { flag: "-config-file" }
+    choices: {}
+    configFiles: [".github/actionlint.yaml", ".github/actionlint.yml"]
+    reviewedBy: Cristiano
+    reviewedAt: "2026-10-28"
+    proofs: 0
+
+  # Security audit of GitHub workflow files, offline. Release binary.
+  # Source: release v1.31.1 of zizmorcore/zizmor: zizmor-x86_64-unknown-linux-gnu.tar.gz sha256 GitHub records for the asset (the release has no checksums file). Released 2026-10-15T23:16:39Z.
+  # checksumSource: github-asset-digest. zizmorcore/zizmor v1.31.1 has no checksums file, so pipegen took the sha256 GitHub records for zizmor-x86_64-unknown-linux-gnu.tar.gz (immutable release: yes); a reviewer must confirm it.
+  - id: zizmor
+    categories: ["workflow-lint"]
+    languages: ["any"]
+    releasedAt: "2026-10-15T23:16:39Z"
+    candidate:
+      id: zizmor
+      name: "zizmorcore/zizmor"
+      kind: cli
+      repo: zizmorcore/zizmor
+      version: "v1.31.1"
+      pin: { checksum: "d185f726bdaf92df78273217dfdd24ebcd6b0ef48cf3ce776ff5762b6e138c99" }
+      source: reviewed
+      reviewed: true
+      categories: ["workflow-lint"]
+    step:
+      cli:
+        install: { method: github-release, package: "zizmor-x86_64-unknown-linux-gnu.tar.gz", version: "v1.31.1" }
+        command: ["zizmor", "--offline", ".github/workflows"]
+      output: { path: "", format: none }
+    fixedInputs:
+      args: ["--offline"]
+      config:
+        content: "rules: {}\n"
+        passAs: { flag: "--config" }
+    choices: {}
+    configFiles: ["zizmor.yml", "zizmor.yaml", ".github/zizmor.yml", ".github/zizmor.yaml"]
+    reviewedBy: Cristiano
+    reviewedAt: "2026-10-28"
+    proofs: 0
+
+  # ---------- Plan P Task 6 (pin day): the catalogue's tools (catalogue §4, verification.md R1) ----------
+  # npm and pip entries pin the tool's own package (and its plugins) only. Their dependency trees are not pinned here:
+  # v0.2 installs npm tools through the repo's lockfile integrity (Plan D: an exact devDependency) and pip tools from
+  # a hash-locked requirements file (`pip install --require-hashes`) (pin-day open issue 8, ruling P17). npm
+  # platform packages that hold the real binary are pinned as plugins (linux x64, glibc).
+
+  # Biome: lints and formats JavaScript and TypeScript in one tool (`biome ci`: lint + format check, no writes).
+  # Source: npm @biomejs/biome@2.5.15 dist.integrity (registry.npmjs.org; the downloaded tarball hashes to it), published 2026-09-30T15:23:18.673Z; npm provenance: yes.
+  # Plugin: @biomejs/cli-linux-x64@2.5.15 (the linux x64 binary @biomejs/biome runs), published 2026-09-30T15:25:13.312Z.
+  # pipegen's pinned biome.json turns on noExcessiveCognitiveComplexity at 15 (maxAllowedComplexity, configuration_schema.json at 2.5.15).
+  - id: biome
+    categories: ["lint", "format", "format-lint"]
+    languages: ["node"]
+    releasedAt: "2026-09-30T15:25:13.312Z"  # the later of the package and its plugin
+    candidate:
+      id: biome
+      name: "biomejs/biome"
+      kind: cli
+      repo: biomejs/biome
+      version: "2.5.15"
+      pin: { checksum: "sha512-WZTW4slm/pdkh92K6t/3aEN++44JD1PQ7squ7RCMLI1flHGl43DVOIGXvCjHiZgBMO1V4uYxoFNtqrIA4qGuIQ==" }
+      source: reviewed
+      reviewed: true
+      categories: ["lint", "format", "format-lint"]
+    step:
+      cli:
+        install: { method: npm, package: "@biomejs/biome", version: "2.5.15" }
+        plugins:
+          - { method: npm, package: "@biomejs/cli-linux-x64", version: "2.5.15", checksum: "sha512-xE4iEW/3LqlYj9GFgGrFsFSH51dEEpUbYWBfeOv0q87WkUDxK2o/HhreSb7qMJqck70RVM6Lg96hgedcAYcOkA==" }
+        command: ["biome", "ci"]
+      output: { path: "", format: none }
+    fixedInputs:
+      config:
+        content: "{\n  \"linter\": {\n    \"rules\": {\n      \"complexity\": {\n        \"noExcessiveCognitiveComplexity\": { \"level\": \"error\", \"options\": { \"maxAllowedComplexity\": 15 } }\n      }\n    }\n  }\n}\n"
+        passAs: { flag: "--config-path" }
+    choices: {}
+    configFiles: ["biome.json", "biome.jsonc", ".biome.json", ".biome.jsonc", "**/biome.json", "**/biome.jsonc", ".editorconfig"]
+    reviewedBy: Cristiano
+    reviewedAt: "2026-10-28"
+    proofs: 0
+
+  # ESLint for JavaScript repos whose framework needs ESLint plugins (catalogue §2). Flat config only.
+  # Source: npm eslint@10.13.0 dist.integrity (the downloaded tarball hashes to it), published 2026-10-16T14:24:10.765Z; npm provenance: no.
+  # pipegen's pinned flat config sets complexity 15; never eslint-config-prettier or eslint-plugin-prettier (CVE-2025-54313).
+  # It lints .jsx and the framework files too (ruling P25): without their ESLint parser (not pinned here; owner review), a
+  #   .vue/.svelte/.astro file fails with a parsing error, so the row is never a false pass.
+  - id: eslint
+    categories: ["lint"]
+    languages: ["node"]
+    releasedAt: "2026-10-16T14:24:10.765Z"
+    candidate:
+      id: eslint
+      name: "eslint/eslint"
+      kind: cli
+      repo: eslint/eslint
+      version: "10.13.0"
+      pin: { checksum: "sha512-UohDjD4zSzEwhf58M3O7vc/ycc8O1I7dNlhtD0WxE8Px8EHNJKtUwzBqrzeGhisRuv2ag4sAYswszCJRgKXYUg==" }
+      source: reviewed
+      reviewed: true
+      categories: ["lint"]
+    step:
+      cli:
+        install: { method: npm, package: "eslint", version: "10.13.0" }
+        command: ["eslint", "--max-warnings", "0", "."]
+      output: { path: "", format: none }
+    fixedInputs:
+      args: ["--max-warnings", "0"]
+      config:
+        content: "export default [{ files: ['**/*.{js,mjs,cjs,jsx,vue,svelte,astro}'], languageOptions: { parserOptions: { ecmaFeatures: { jsx: true } } }, rules: { complexity: ['error', 15] } }];\n"
+        passAs: { flag: "--config" }
+    choices: {}
+    configFiles: ["eslint.config.js", "eslint.config.mjs", "eslint.config.cjs", "eslint.config.ts", "eslint.config.mts", "eslint.config.cts"]
+    reviewedBy: Cristiano
+    reviewedAt: "2026-10-28"
+    proofs: 0
+
+  # ESLint with typescript-eslint, for TypeScript before 7 (typescript-eslint 8.72.0 peers: typescript >=4.8.4 <6.1.0).
+  # Source: npm eslint@10.13.0 as above. Plugin: npm typescript-eslint@8.72.0 dist.integrity (tarball hashes to it), published 2026-10-19T17:08:09.147Z; npm provenance: yes.
+  # typescript-eslint is a meta package: its @typescript-eslint/* dependencies come through the lockfile (see the note above).
+  - id: eslint-typescript
+    categories: ["lint"]
+    languages: ["node"]
+    releasedAt: "2026-10-19T17:08:09.147Z"
+    candidate:
+      id: eslint-typescript
+      name: "eslint/eslint"
+      kind: cli
+      repo: eslint/eslint
+      version: "10.13.0"
+      pin: { checksum: "sha512-UohDjD4zSzEwhf58M3O7vc/ycc8O1I7dNlhtD0WxE8Px8EHNJKtUwzBqrzeGhisRuv2ag4sAYswszCJRgKXYUg==" }
+      source: reviewed
+      reviewed: true
+      categories: ["lint"]
+    step:
+      cli:
+        install: { method: npm, package: "eslint", version: "10.13.0" }
+        plugins:
+          - { method: npm, package: "typescript-eslint", version: "8.72.0", checksum: "sha512-r26Fkc8As+mZvqp7SLsMmNFyYUup/6CjK7/eHBHmhOw6GH6n6YFxHVFrG0jN1c5CMpDzelLPxvgeCOzx7BjN+A==" }
+        command: ["eslint", "--max-warnings", "0", "."]
+      output: { path: "", format: none }
+    fixedInputs:
+      args: ["--max-warnings", "0"]
+      config:
+        content: "import tseslint from 'typescript-eslint';\nexport default [...tseslint.configs.recommended, { files: ['**/*.{js,mjs,cjs,jsx,ts,mts,cts,tsx,vue,svelte,astro}'], rules: { complexity: ['error', 15] } }];\n"
+        passAs: { flag: "--config" }
+    choices: {}
+    configFiles: ["eslint.config.js", "eslint.config.mjs", "eslint.config.cjs", "eslint.config.ts", "eslint.config.mts", "eslint.config.cts"]
+    reviewedBy: Cristiano
+    reviewedAt: "2026-10-28"
+    proofs: 0
+
+  # Oxlint's type-aware rules (tsgolint), next to ESLint for TypeScript 7 and later (typescript-eslint doesn't support it).
+  # Source: npm oxlint@1.89.0 dist.integrity (tarball hashes to it), published 2026-10-19T17:24:22.105Z; npm provenance: yes.
+  # Plugins: @oxlint/binding-linux-x64-gnu@1.89.0 (the linux x64 binary, 2026-10-19T17:18:54.257Z), oxlint-tsgolint@7.0.2004
+  #   (oxlint peers on >=7.0.2003; 2026-10-10T13:00:10.601Z) and @oxlint-tsgolint/linux-x64@7.0.2004 (its binary,
+  #   2026-10-10T13:00:16.501Z); all with npm provenance, each tarball hashed to its integrity.
+  # pipegen's pinned .oxlintrc.json: the correctness rules as errors; the repo's .oxlintrc.json is never read.
+  - id: oxlint-typeaware
+    categories: ["lint"]
+    languages: ["node"]
+    releasedAt: "2026-10-19T17:24:22.105Z"
+    candidate:
+      id: oxlint-typeaware
+      name: "oxc-project/oxc"
+      kind: cli
+      repo: oxc-project/oxc
+      version: "1.89.0"
+      pin: { checksum: "sha512-a25hkfo61okGPvJz432fRIPoxlKtNnOVy9w4rzrmGgNm4iVTPwpSQlmdqNWnp6p9QyyPVfAZRgnf5XvSBZFk/A==" }
+      source: reviewed
+      reviewed: true
+      categories: ["lint"]
+    step:
+      cli:
+        install: { method: npm, package: "oxlint", version: "1.89.0" }
+        plugins:
+          - { method: npm, package: "@oxlint/binding-linux-x64-gnu", version: "1.89.0", checksum: "sha512-hqjwIj5KOYM8Wjef/p7IruNi1iByLhSzbMBk62y22P/E8q7Jj0Pp+DeUTKTRYyZYCDtU1wEGlnWOnttHbyNIww==" }
+          - { method: npm, package: "oxlint-tsgolint", version: "7.0.2004", checksum: "sha512-vQ9WDF3fiZJvRdSDosNOflerOCOpwol6vWzVDxW76RcU19cjTh7engvkHLvmv+tzedR8fAiJUVUGr6IVZdkzXQ==" }
+          - { method: npm, package: "@oxlint-tsgolint/linux-x64", version: "7.0.2004", checksum: "sha512-LPunZvm6ZbWPfHMAyfZf9ci3HHvNEzLejO8zdqO3GoVGoSEHqqufHUD7+OgeatVSaJP7uXDJ2HaNOHIoH7go4Q==" }
+        command: ["oxlint", "--type-aware", "--deny-warnings"]
+      output: { path: "", format: none }
+    fixedInputs:
+      args: ["--type-aware", "--deny-warnings"]
+      config:
+        content: "{ \"categories\": { \"correctness\": \"error\" } }\n"
+        passAs: { flag: "--config" }
+    choices: {}
+    configFiles: [".oxlintrc.json", "oxlint.config.ts", "**/.oxlintrc.json", ".eslintignore", ".gitignore"]
+    reviewedBy: Cristiano
+    reviewedAt: "2026-10-28"
+    proofs: 0
+
+  # Prettier format check (no writes). A Prettier config already in the repo is used (catalogue §2), so it is protected.
+  # Source: npm prettier@3.9.10 dist.integrity (tarball hashes to it), published 2026-10-10T08:35:28.472Z; npm provenance: no.
+  - id: prettier
+    categories: ["format"]
+    languages: ["node"]
+    releasedAt: "2026-10-10T08:35:28.472Z"
+    candidate:
+      id: prettier
+      name: "prettier/prettier"
+      kind: cli
+      repo: prettier/prettier
+      version: "3.9.10"
+      pin: { checksum: "sha512-skGHTH1Yb9QvaTC4hWnRTzEYtCpApF0UMBPz+t/0ZPzP8ihefo/btKd+QA7pUE0fEwA1SbS/NmhyEcstdXOIdA==" }
+      source: reviewed
+      reviewed: true
+      categories: ["format"]
+    step:
+      cli:
+        install: { method: npm, package: "prettier", version: "3.9.10" }
+        command: ["prettier", "--check", "."]
+      output: { path: "", format: none }
+    fixedInputs:
+      args: ["--check"]
+    choices: {}
+    configFiles: [".prettierrc", ".prettierrc.*", "prettier.config.*", ".prettierignore", "**/.prettierrc", "**/.prettierrc.*", ".editorconfig", ".gitignore"]
+    configSections: ["package.json:prettier"]
+    reviewedBy: Cristiano
+    reviewedAt: "2026-10-28"
+    proofs: 0
+
+  # Vitest coverage (v8), when Vitest is the test runner. The minimum of lines is a fixed flag whose value the AI chooses
+  #   (ruling P24: {coverage-thresholds-lines} is that choice; never 0), so a repo config without thresholds can't pass everything.
+  # Source: npm vitest@5.0.5 dist.integrity (tarball hashes to it), published 2026-10-15T14:29:01.396Z; npm provenance: yes.
+  # Plugin: @vitest/coverage-v8@5.0.5 (peers on vitest 5.0.5 exactly; G5 closed by PS30), published 2026-10-15T14:27:49.006Z; npm provenance: yes.
+  - id: vitest-coverage
+    categories: ["coverage"]
+    languages: ["node"]
+    releasedAt: "2026-10-15T14:29:01.396Z"
+    candidate:
+      id: vitest-coverage
+      name: "vitest-dev/vitest"
+      kind: cli
+      repo: vitest-dev/vitest
+      version: "5.0.5"
+      pin: { checksum: "sha512-cPODOMF8YnkiiYtDdHo6n4wWmBrOBBbOIYH2d33M4l3CdNn72h+qMmO6uXffUN6A5AZFXNND/d+krS9mgkXRfg==" }
+      source: reviewed
+      reviewed: true
+      categories: ["coverage"]
+    step:
+      cli:
+        install: { method: npm, package: "vitest", version: "5.0.5" }
+        plugins:
+          - { method: npm, package: "@vitest/coverage-v8", version: "5.0.5", checksum: "sha512-4KpkGdIrSqBihx/JyP/e+S+IKB98etg1XDQiLAxksLfcShnwi1VReGeOT9NI43hLHbknosKp/1CCLn9Zgcs8mg==" }
+        command: ["vitest", "run", "--coverage", "--coverage.thresholds.lines={coverage-thresholds-lines}"]
+      output: { path: "", format: none }
+    fixedInputs:
+      args: ["--coverage", "--coverage.thresholds.lines={coverage-thresholds-lines}"]
+    choices:
+      coverage-thresholds-lines: ["60", "70", "80", "90"]
+    configFiles: ["vitest.config.*", "vite.config.*", "vitest.workspace.*", "**/vitest.config.*"]
+    reviewedBy: Cristiano
+    reviewedAt: "2026-10-28"
+    proofs: 0
+
+  # c8 coverage for test runners without their own (node:test and others; catalogue D7). The minimum goes into .c8rc.json (Plan D).
+  # Source: npm c8@12.0.0 dist.integrity (tarball hashes to it), published 2026-07-14T13:51:32.917Z; npm provenance: no.
+  - id: c8
+    categories: ["coverage"]
+    languages: ["node"]
+    releasedAt: "2026-07-14T13:51:32.917Z"
+    candidate:
+      id: c8
+      name: "bcoe/c8"
+      kind: cli
+      repo: bcoe/c8
+      version: "12.0.0"
+      pin: { checksum: "sha512-4zpJvrd1nKWutnnKC2pXkFmb6iM1l+ffN//o1CzlTNwW7GSOs9a1xrLqkC48nU8oEkjmPZLPiwMsIaOvoF4Pqg==" }
+      source: reviewed
+      reviewed: true
+      categories: ["coverage"]
+    step:
+      cli:
+        install: { method: npm, package: "c8", version: "12.0.0" }
+        command: ["c8", "--check-coverage"]
+      output: { path: "", format: none }
+    fixedInputs:
+      args: ["--check-coverage"]
+    choices: {}
+    configFiles: [".c8rc", ".c8rc.*", ".nycrc", ".nycrc.*"]
+    configSections: ["package.json:c8"]
+    reviewedBy: Cristiano
+    reviewedAt: "2026-10-28"
+    proofs: 0
+
+  # Knip: unused files, exports and dependencies. Report-only on the first run; blocking only with the repo's own knip config (pipegen never writes one).
+  # Source: npm knip@6.42.1 dist.integrity (tarball hashes to it), published 2026-10-19T18:24:59.186Z; npm provenance: no.
+  - id: knip
+    categories: ["dead-code"]
+    languages: ["node"]
+    releasedAt: "2026-10-19T18:24:59.186Z"
+    candidate:
+      id: knip
+      name: "webpro-nl/knip"
+      kind: cli
+      repo: webpro-nl/knip
+      version: "6.42.1"
+      pin: { checksum: "sha512-gKJVsiT4LJQ0lfc8uSHOCzkOY8adAXNFGarIeODZbJOkBnQRVsG3e0UZFnO4LMwjA82A5tBWX/VgoeTYcjdKiQ==" }
+      source: reviewed
+      reviewed: true
+      categories: ["dead-code"]
+    step:
+      cli:
+        install: { method: npm, package: "knip", version: "6.42.1" }
+        command: ["knip", "--no-progress"]
+      output: { path: "", format: none }
+    fixedInputs: {}
+    choices: {}
+    configFiles: ["knip.json", "knip.jsonc", ".knip.json", ".knip.jsonc", "knip.config.*", "knip.ts", "knip.js"]
+    configSections: ["package.json:knip"]
+    reviewedBy: Cristiano
+    reviewedAt: "2026-10-28"
+    proofs: 0
+
+  # jscpd: copy-paste detection, warning only (DECISIONS #93); new copy-paste in the pull request only.
+  # Source: release v5.4.2 of kucherenko/jscpd: jscpd-linux-x64-gnu.tar.gz sha256 from the release checksums file (checksums.txt; also GitHub's asset digest and the sha256 of the downloaded archive). Released 2026-10-20T16:14:54Z (its last asset was updated 2026-10-20T16:15:27Z). The release is not immutable.
+  # The release binary, not the npm wrapper (ruling PS27). Not on MUST_VERIFY (ruling P12): checksums.txt.sigstore.json is
+  #   signed by https://github.com/kucherenko/jscpd/.github/workflows/release.yml@refs/heads/master (a branch, so the signature
+  #   isn't bound to this release). For information: pipegen's pinned cosign 3.1.3 verified it with that identity ("Verified
+  #   OK", pin day). The sha256 pin is the guarantee (ruling P6).
+  # No semantic mode (--semantic*, --compare, --mcp, --dashboard): it can send code to an embeddings API (catalogue D6).
+  - id: jscpd
+    categories: ["duplication"]
+    languages: ["any"]
+    releasedAt: "2026-10-20T16:15:27Z"  # the later of the release and its assets (review M5)
+    candidate:
+      id: jscpd
+      name: "kucherenko/jscpd"
+      kind: cli
+      repo: kucherenko/jscpd
+      version: "v5.4.2"
+      pin: { checksum: "216bae5de2b30c57f893286585c7a348e8af7cd36810949831f569d29f495a3b" }
+      source: reviewed
+      reviewed: true
+      categories: ["duplication"]
+    step:
+      cli:
+        install: { method: github-release, package: "jscpd-linux-x64-gnu.tar.gz", version: "v5.4.2" }
+        command: ["jscpd", "--baseline-from-ref", "origin/main", "--fail-on-new-clones", "--reporters", "sarif", "--output", "jscpd-report", "."]
+      output: { path: "", format: none }
+    fixedInputs:
+      args: ["--baseline-from-ref", "origin/main", "--fail-on-new-clones"]
+      config:
+        content: "{}\n"
+        passAs: { flag: "--config" }
+    choices: {}
+    configFiles: [".jscpd.json"]
+    configSections: ["package.json:jscpd"]
+    reviewedBy: Cristiano
+    reviewedAt: "2026-10-28"
+    proofs: 0
+
+  # Trivy licence scan of the dependencies (catalogue §3): blocks on HIGH and CRITICAL licence findings. Same binary as trivy-config.
+  # Source: release v0.76.0 of aquasecurity/trivy: trivy_0.76.0_Linux-64bit.tar.gz sha256 from the release checksums file. Released 2026-10-14T11:45:44Z.
+  # Signature: pipegen's pinned cosign 3.1.3 ran `cosign verify-blob --bundle trivy_0.76.0_checksums.txt.sigstore.json
+  #   --certificate-identity https://github.com/aquasecurity/trivy/.github/workflows/reusable-release.yaml@refs/tags/v0.76.0
+  #   --certificate-oidc-issuer https://token.actions.githubusercontent.com trivy_0.76.0_checksums.txt`: "Verified OK" (2026-10-28T00:00:14Z).
+  #   The checksums file lists the pinned sha256 above. Immutable release.
+  - id: trivy-licence
+    categories: ["licences"]
+    languages: ["any"]
+    releasedAt: "2026-10-14T11:45:44Z"
+    candidate:
+      id: trivy-licence
+      name: "aquasecurity/trivy"
+      kind: cli
+      repo: aquasecurity/trivy
+      version: "v0.76.0"
+      pin: { checksum: "e24b1c51293c1b15e4ba8d45bbc7891ba053f90278ec2698f3562c993e145fe7" }
+      source: reviewed
+      reviewed: true
+      categories: ["licences"]
+    step:
+      cli:
+        install: { method: github-release, package: "trivy_0.76.0_Linux-64bit.tar.gz", version: "v0.76.0" }
+        command: ["trivy", "fs", "--disable-telemetry", "--skip-version-check", "--skip-check-update", "--scanners", "license", "--severity", "HIGH,CRITICAL", "--format", "sarif", "--output", "trivy-licence.sarif", "--exit-code", "1", "."]
+      output: { path: "trivy-licence.sarif", format: sarif }
+    fixedInputs:
+      args: ["--disable-telemetry", "--skip-version-check", "--skip-check-update", "--scanners", "license", "--severity", "HIGH,CRITICAL", "--format", "sarif", "--output", "trivy-licence.sarif", "--exit-code", "1"]
+      config:
+        content: "# pipegen's pinned trivy config: no cache kept between runs\ncache:\n  backend: memory\n"
+        passAs: { flag: "--config" }
+    choices: {}
+    configFiles: ["trivy.yaml", ".trivyignore", ".trivyignore.yaml"]
+    reviewedBy: Cristiano
+    reviewedAt: "2026-10-28"
+    proofs: 0
+    verifiedWith:
+      method: cosign-bundle
+      asset: "trivy_0.76.0_checksums.txt"
+      identity: "https://github.com/aquasecurity/trivy/.github/workflows/reusable-release.yaml@refs/tags/v0.76.0"
+      issuer: "https://token.actions.githubusercontent.com"
+      verifiedOn: "2026-10-28"
+
+  # GitHub dependency review: new vulnerable dependencies in a pull request, where code security is available. No PR comments (a write; catalogue §3 MG1).
+  # Source: git ref refs/tags/v5.0.0 of actions/dependency-review-action (GitHub API; lightweight tag), release published_at. Released 2026-05-08T20:23:50Z.
+  - id: dependency-review-action
+    categories: ["dependency-review"]
+    languages: ["any"]
+    releasedAt: "2026-05-08T20:23:50Z"
+    candidate:
+      id: dependency-review-action
+      name: "actions/dependency-review-action"
+      kind: action
+      repo: actions/dependency-review-action
+      version: "v5.0.0"
+      pin: { sha: "a1d282b36b6f3519aa1f3fc636f609c47dddb294" }
+      source: reviewed
+      reviewed: true
+      categories: ["dependency-review"]
+    step:
+      action:
+        uses: actions/dependency-review-action@a1d282b36b6f3519aa1f3fc636f609c47dddb294
+        with:
+          comment-summary-in-pr: "never"
+      output: { path: "", format: none }
+    fixedInputs:
+      with:
+        comment-summary-in-pr: "never"
+    choices: {}
+    configFiles: [".github/dependency-review-config.yml"]
+    reviewedBy: Cristiano
+    reviewedAt: "2026-10-28"
+    proofs: 0
+
+  # Hadolint: lints Dockerfiles; fails on warnings and errors. pipegen's pinned config, so the repo's .hadolint.yaml is never read.
+  # Source: release v2.15.1 of hadolint/hadolint: the raw binary hadolint-linux-x86_64. Its sha256 is listed in the release's
+  #   checksums.sha256 (checked by hand on pin day), equals GitHub's asset digest (resolvePin took it from there:
+  #   checksumSource: github-asset-digest, as the file name checksums.sha256 isn't one resolvePin reads) and the sha256 of the
+  #   downloaded binary. Released 2026-07-31T10:13:06Z (assets 2026-07-31T10:10:16Z). The release is not immutable.
+  # Not on MUST_VERIFY (ruling P16). For information: `gh attestation verify hadolint-linux-x86_64 --repo hadolint/hadolint`
+  #   passed on pin day (SLSA provenance v1; one bundle covers all five binaries), but it is signed by
+  #   https://github.com/hadolint/hadolint/.github/workflows/release.yml@refs/heads/master (a push build, a branch identity),
+  #   with source commit 2eece55955ced00200be9729e9728cb7dacca505, which is the commit of tag v2.15.1.
+  - id: hadolint
+    categories: ["dockerfile-lint"]
+    languages: ["any"]
+    releasedAt: "2026-07-31T10:13:06Z"
+    candidate:
+      id: hadolint
+      name: "hadolint/hadolint"
+      kind: cli
+      repo: hadolint/hadolint
+      version: "v2.15.1"
+      pin: { checksum: "c7187db94eeeeca956519a6af171adc31453941a1e777961f6e680f697c8c507" }
+      source: reviewed
+      reviewed: true
+      categories: ["dockerfile-lint"]
+    step:
+      cli:
+        install: { method: github-release, package: "hadolint-linux-x86_64", version: "v2.15.1" }
+        command: ["hadolint", "--no-color", "--failure-threshold", "warning", "--format", "sarif", "--output", "hadolint.sarif"]
+      output: { path: "hadolint.sarif", format: sarif }
+    fixedInputs:
+      args: ["--failure-threshold", "warning", "--format", "sarif", "--output", "hadolint.sarif"]
+      config:
+        content: "# pipegen's pinned hadolint config: every rule at its default level, nothing ignored\nignored: []\n"
+        passAs: { flag: "--config" }
+    choices: {}
+    configFiles: [".hadolint.yaml", ".hadolint.yml"]
+    reviewedBy: Cristiano
+    reviewedAt: "2026-10-28"
+    proofs: 0
+
+  # kube-linter: lints Kubernetes manifests and Helm charts, next to Trivy config. pipegen's pinned config (the default checks).
+  # --fail-if-no-objects-found and --fail-on-invalid-resource (ruling P25; the second is a hidden flag of v0.8.3, accepted
+  #   by the pinned binary): a chart that doesn't render, a wrong path or YAML it can't parse fails instead of passing empty.
+  # Source: release v0.8.3 of stackrox/kube-linter: the raw binary kube-linter-linux. checksumSource: computed (ruling PS31):
+  #   the release has no checksums file; pipegen downloaded the binary and hashed it, and the hash equals GitHub's asset digest.
+  #   Released 2026-03-10T13:17:40Z. The release is not immutable.
+  # Signature (key-based, ruling P10): pipegen's pinned cosign 3.1.3 ran `cosign verify-blob --key kubelinter-cosign.pub
+  #   --bundle kube-linter-linux.sigstore.json kube-linter-linux`: "Verified OK" (2026-10-28T00:00:14Z; the same check with gosec's
+  #   key fails). The key is the repo's kubelinter-cosign.pub at tag v0.8.3 (sha256 below).
+  - id: kube-linter
+    categories: ["iac"]
+    languages: ["any"]
+    releasedAt: "2026-03-10T13:17:40Z"
+    candidate:
+      id: kube-linter
+      name: "stackrox/kube-linter"
+      kind: cli
+      repo: stackrox/kube-linter
+      version: "v0.8.3"
+      pin: { checksum: "618d299a3e2839c8ca9d86fce0db617be0fba41f0fecbbbfb7fbf1c04299fae1" }
+      source: reviewed
+      reviewed: true
+      categories: ["iac"]
+    step:
+      cli:
+        install: { method: github-release, package: "kube-linter-linux", version: "v0.8.3" }
+        command: ["kube-linter", "lint", "--fail-if-no-objects-found", "--fail-on-invalid-resource", "--format", "sarif", "--output", "kube-linter.sarif"]
+      output: { path: "kube-linter.sarif", format: sarif }
+    fixedInputs:
+      args: ["--fail-if-no-objects-found", "--fail-on-invalid-resource", "--format", "sarif", "--output", "kube-linter.sarif"]
+      config:
+        content: "# pipegen's pinned kube-linter config: the default checks\nchecks:\n  doNotAutoAddDefaults: false\n"
+        passAs: { flag: "--config" }
+    choices: {}
+    configFiles: [".kube-linter.yaml", ".kube-linter.yml"]
+    reviewedBy: Cristiano
+    reviewedAt: "2026-10-28"
+    proofs: 0
+    verifiedWith:
+      kind: cosign-key
+      keyUrl: "https://raw.githubusercontent.com/stackrox/kube-linter/v0.8.3/kubelinter-cosign.pub"
+      keySha256: "db5fb95bf3e1d432a3e9153abcc75ca4985aad1e44f414b8ebc624a2fac97ba0"
+      verifiedOn: "2026-10-28"
+
+  # Schemathesis: tests a running API from its spec (OpenAPI/GraphQL); 25 examples per operation (catalogue §3). JUnit output.
+  # Source: PyPI schemathesis 4.32.2, the py3-none-any wheel's sha256 (pypi.org JSON; the downloaded wheel hashes to it), uploaded 2026-10-20T14:48:33.490445Z; PyPI provenance: yes.
+  - id: schemathesis
+    categories: ["api-dast"]
+    languages: ["any"]
+    releasedAt: "2026-10-20T14:48:33.490445Z"
+    candidate:
+      id: schemathesis
+      name: "schemathesis/schemathesis"
+      kind: cli
+      repo: schemathesis/schemathesis
+      version: "4.32.2"
+      pin: { checksum: "95bfeeafc457401d04c911162a6b73e557c4d9806a909c70bfef196b77114ead" }
+      source: reviewed
+      reviewed: true
+      categories: ["api-dast"]
+    step:
+      cli:
+        install: { method: pip, package: "schemathesis", version: "4.32.2" }
+        command: ["schemathesis", "run", "--max-examples", "25", "--report", "junit", "--report-junit-path", "schemathesis.xml"]
+      output: { path: "schemathesis.xml", format: junit }
+    fixedInputs:
+      args: ["--max-examples", "25", "--report", "junit", "--report-junit-path", "schemathesis.xml"]
+    choices: {}
+    configFiles: ["schemathesis.toml"]
+    reviewedBy: Cristiano
+    reviewedAt: "2026-10-28"
+    proofs: 0
+
+  # Nuclei: DAST templates against the running app, on the schedule and on main; warning only (catalogue §3 MG5).
+  # Source: release v3.11.1 of projectdiscovery/nuclei: nuclei_3.11.1_linux_amd64.zip sha256 from the release checksums file (also GitHub's asset digest and the sha256 of the downloaded zip). Released 2026-08-08T12:21:32Z (assets 2026-08-08T12:51:42Z). The release is not immutable; no signature or attestation (checksums only, ruling PS31).
+  # A zip: nuclei runs only in the generated CI (sha256sum -c in the job), never through ensurePinnedBinary (ruling P5).
+  # Templates (G4, rulings PS30 and P3): nuclei-templates v10.5.0 (released 2026-10-05T07:27:40Z; tag commit
+  #   f8b8b8dcd70d93826c3767e1829ef8243af9f03b). On pin day GitHub's tag archive (the URL below) hashed to exactly the
+  #   sha256 the release's nuclei-templates-10.5.0_checksums.txt lists for nuclei-templates-10.5.0.tar.gz.
+  # -duc: no update check; -t: only the verified templates; -ni: no interactsh callbacks to ProjectDiscovery's servers.
+  - id: nuclei
+    categories: ["dast"]
+    languages: ["any"]
+    releasedAt: "2026-08-08T12:51:42Z"  # the later of the release and its assets (review M5)
+    candidate:
+      id: nuclei
+      name: "projectdiscovery/nuclei"
+      kind: cli
+      repo: projectdiscovery/nuclei
+      version: "v3.11.1"
+      pin: { checksum: "ea63d4ae232808cd7c6bc00d0142428e231fab59dae01042246097d195835ab6" }
+      source: reviewed
+      reviewed: true
+      categories: ["dast"]
+    step:
+      cli:
+        install: { method: github-release, package: "nuclei_3.11.1_linux_amd64.zip", version: "v3.11.1" }
+        command: ["nuclei", "-duc", "-t", "/pipegen-nuclei-templates", "-severity", "medium,high,critical", "-ni", "-sarif-export", "nuclei.sarif"]
+        env:
+          PIPEGEN_NUCLEI_TEMPLATES_URL: "https://github.com/projectdiscovery/nuclei-templates/archive/refs/tags/v10.5.0.tar.gz"
+          PIPEGEN_NUCLEI_TEMPLATES_SHA256: "80fbabceca095fac40afecc7f023748df22b9576b9ff10a4422bd2fbf81f9a41"
+      output: { path: "nuclei.sarif", format: sarif }
+    fixedInputs:
+      args: ["-duc", "-t", "/pipegen-nuclei-templates", "-severity", "medium,high,critical", "-ni"]
+      env:
+        PIPEGEN_NUCLEI_TEMPLATES_URL: "https://github.com/projectdiscovery/nuclei-templates/archive/refs/tags/v10.5.0.tar.gz"
+        PIPEGEN_NUCLEI_TEMPLATES_SHA256: "80fbabceca095fac40afecc7f023748df22b9576b9ff10a4422bd2fbf81f9a41"
+    choices: {}
+    configFiles: []
+    reviewedBy: Cristiano
+    reviewedAt: "2026-10-28"
+    proofs: 0
+
+  # OpenSSF Scorecard, weekly; reported, never gated. Results are never published (publish_results false; catalogue §3 SD5).
+  # Source: git ref refs/tags/v2.5.0 of ossf/scorecard-action (GitHub API; annotated tag 46dc3187a971a9febf3aeb7f94ccde489f7bb46a dereferenced), release published_at. Released 2026-10-12T02:54:09Z.
+  # Note for the reviewer (ruling P26, an accepted residual for v0.1): its action.yaml at this commit (line 61) runs
+  #   docker://ghcr.io/ossf/scorecard-action:v2.5.0, an image BY TAG, so whoever controls that tag controls what runs.
+  #   wrappedImage records it and the digest it resolved to on 2026-10-28T00:26Z (GHCR, anonymous read; a single-platform
+  #   docker manifest v2). v0.2 (Plan C) runs it as a digest-pinned docker step instead.
+  - id: scorecard-action
+    categories: ["scorecard"]
+    languages: ["any"]
+    releasedAt: "2026-10-12T02:54:09Z"
+    candidate:
+      id: scorecard-action
+      name: "ossf/scorecard-action"
+      kind: action
+      repo: ossf/scorecard-action
+      version: "v2.5.0"
+      pin: { sha: "fa7117db83c52d787ae5a89f350999701505d78e" }
+      source: reviewed
+      reviewed: true
+      categories: ["scorecard"]
+    step:
+      action:
+        uses: ossf/scorecard-action@fa7117db83c52d787ae5a89f350999701505d78e
+        with:
+          publish_results: "false"
+          results_format: "sarif"
+          results_file: "scorecard.sarif"
+      output: { path: "scorecard.sarif", format: sarif }
+    fixedInputs:
+      with:
+        publish_results: "false"
+        results_format: "sarif"
+        results_file: "scorecard.sarif"
+    choices: {}
+    configFiles: []
+    wrappedImage:
+      ref: "ghcr.io/ossf/scorecard-action:v2.5.0"
+      digest: "sha256:1e1481c65fc2407d3fd6ab18a23c741eb4d1c0d9359ebafc4b3ab13aa61d8627"
+    reviewedBy: Cristiano
+    reviewedAt: "2026-10-28"
+    proofs: 0
+
+  # pinact: every action pinned to a full commit SHA, and each version comment matches its SHA (--verify-comment calls the
+  #   GitHub API with the job's read token). --check: report only, never rewrite. Flags confirmed with `pinact run --help` of v5.0.0.
+  # Source: release v5.0.0 of suzuki-shunsuke/pinact: pinact_linux_amd64.tar.gz sha256 from the release checksums file (also GitHub's asset digest and the sha256 of the downloaded archive). Released 2026-09-12T04:54:28Z. Immutable release.
+  # For information (not MUST_VERIFY): pinact_5.0.0_checksums.txt.sigstore.json verified with pipegen's pinned cosign
+  #   ("Verified OK"); its identity is https://github.com/suzuki-shunsuke/go-release-workflow/.github/workflows/release.yaml@1cf29d7b17983b901021799b87a55d357cfff790
+  #   (a shared workflow at a commit), which verifiedWith can't bind to this repo's tag.
+  - id: pinact
+    categories: ["workflow-pin-check"]
+    languages: ["any"]
+    releasedAt: "2026-09-12T04:54:28Z"
+    candidate:
+      id: pinact
+      name: "suzuki-shunsuke/pinact"
+      kind: cli
+      repo: suzuki-shunsuke/pinact
+      version: "v5.0.0"
+      pin: { checksum: "d005bbb85da80dacdc07816f24a5da723a9f6d1e9f3d3e7e73df33f9caa1358f" }
+      source: reviewed
+      reviewed: true
+      categories: ["workflow-pin-check"]
+    step:
+      cli:
+        install: { method: github-release, package: "pinact_linux_amd64.tar.gz", version: "v5.0.0" }
+        command: ["pinact", "run", "--check", "--verify-comment"]
+      output: { path: "", format: none }
+    fixedInputs:
+      args: ["--check", "--verify-comment"]
+    choices: {}
+    configFiles: [".pinact.yaml", ".pinact.yml", ".github/pinact.yaml", ".github/pinact.yml"]
+    reviewedBy: Cristiano
+    reviewedAt: "2026-10-28"
+    proofs: 0
+
+  # poutine: supply-chain checks of the workflows, offline on the local checkout (analyze_local; no version check).
+  # Source: release v1.1.6 of boostsecurityio/poutine: poutine_Linux_x86_64.tar.gz sha256 from the release checksums file (also GitHub's asset digest and the sha256 of the downloaded archive). Released 2026-05-22T20:06:25Z. Immutable release.
+  # For information (not MUST_VERIFY): poutine_1.1.6_checksums.txt.sigstore.json verified with pipegen's pinned cosign and
+  #   identity https://github.com/boostsecurityio/poutine/.github/workflows/release.yml@refs/tags/v1.1.6 ("Verified OK", pin day).
+  - id: poutine
+    categories: ["workflow-lint"]
+    languages: ["any"]
+    releasedAt: "2026-05-22T20:06:25Z"
+    candidate:
+      id: poutine
+      name: "boostsecurityio/poutine"
+      kind: cli
+      repo: boostsecurityio/poutine
+      version: "v1.1.6"
+      pin: { checksum: "abde716599a65608b023a69ed9316e5f083a7bca48612151c2720835883757ea" }
+      source: reviewed
+      reviewed: true
+      categories: ["workflow-lint"]
+    step:
+      cli:
+        install: { method: github-release, package: "poutine_Linux_x86_64.tar.gz", version: "v1.1.6" }
+        command: ["poutine", "analyze_local", "--disable-version-check", "--fail-on-violation", "--quiet", "."]
+      output: { path: "", format: none }
+    fixedInputs:
+      args: ["--disable-version-check", "--fail-on-violation"]
+      config:
+        content: "# pipegen's pinned poutine config: no skipped rules\nskip: []\n"
+        passAs: { flag: "--config" }
+    choices: {}
+    configFiles: [".poutine.yml", ".poutine.yaml", ".github/poutine.yml", ".github/poutine.yaml"]
+    reviewedBy: Cristiano
+    reviewedAt: "2026-10-28"
+    proofs: 0
+
+  # gosec: Go security checks (SARIF). No AI flags (-ai-*) and no config from the repo. #nosec comments stay allowed (they
+  #   show in the diff), and -track-suppressions lists each one in the SARIF (ruling P27).
+  # Source: release v2.29.0 of securego/gosec: gosec_2.29.0_linux_amd64.tar.gz sha256 from the release checksums file (also GitHub's asset digest and the sha256 of the downloaded archive). Released 2026-08-26T08:34:58Z. Immutable release.
+  # Signature (key-based, ruling P10): pipegen's pinned cosign 3.1.3 ran `cosign verify-blob --key cosign.pub --bundle
+  #   gosec_2.29.0_linux_amd64.tar.gz.sigstore.json gosec_2.29.0_linux_amd64.tar.gz` and the same for
+  #   gosec_2.29.0_checksums.txt with its bundle: both "Verified OK" (2026-10-28T00:00:14Z). The key is the repo's cosign.pub at tag v2.29.0.
+  - id: gosec
+    categories: ["sast"]
+    languages: ["go"]
+    releasedAt: "2026-08-26T08:34:58Z"
+    candidate:
+      id: gosec
+      name: "securego/gosec"
+      kind: cli
+      repo: securego/gosec
+      version: "v2.29.0"
+      pin: { checksum: "6431b119741c1f4a50fdfcf94e782e16b9e642afc8c7fa9b5d39d48bf3003095" }
+      source: reviewed
+      reviewed: true
+      categories: ["sast"]
+    step:
+      cli:
+        install: { method: github-release, package: "gosec_2.29.0_linux_amd64.tar.gz", version: "v2.29.0" }
+        command: ["gosec", "-fmt", "sarif", "-out", "gosec.sarif", "-track-suppressions", "./..."]
+      output: { path: "gosec.sarif", format: sarif }
+    fixedInputs:
+      args: ["-fmt", "sarif", "-out", "gosec.sarif", "-track-suppressions"]
+    choices: {}
+    configFiles: []
+    reviewedBy: Cristiano
+    reviewedAt: "2026-10-28"
+    proofs: 0
+    verifiedWith:
+      kind: cosign-key
+      keyUrl: "https://raw.githubusercontent.com/securego/gosec/v2.29.0/cosign.pub"
+      keySha256: "4f9553257dbbb9f07c830da7773e49ae7150962f6d6d187d6243f95002d497fb"
+      verifiedOn: "2026-10-28"
+
+  # Ruff lint for Python (C901 complexity at 15), with pipegen's pinned ruff.toml (--config with a file: the repo's ruff
+  #   settings are not read; the pyproject.toml section is still listed, ruling P23). No cache (spec §19). Ruff skips
+  #   files in .gitignore/.ignore, so those are protected too.
+  # Source: release 0.17.1 of astral-sh/ruff (the tag has no v): ruff-x86_64-unknown-linux-gnu.tar.gz sha256 from sha256.sum
+  #   (and the asset's own .sha256; also GitHub's asset digest and the sha256 of the downloaded archive). Released 2026-10-15T15:24:28Z. Immutable release.
+  - id: ruff
+    categories: ["lint", "format-lint"]
+    languages: ["python"]
+    releasedAt: "2026-10-15T15:24:28Z"
+    candidate:
+      id: ruff
+      name: "astral-sh/ruff"
+      kind: cli
+      repo: astral-sh/ruff
+      version: "0.17.1"
+      pin: { checksum: "a293ac937715ae6fb6b64da86761598379e6149f40fbc00fde9ba8a2a562ac65" }
+      source: reviewed
+      reviewed: true
+      categories: ["lint", "format-lint"]
+    step:
+      cli:
+        install: { method: github-release, package: "ruff-x86_64-unknown-linux-gnu.tar.gz", version: "0.17.1" }
+        command: ["ruff", "check", "--no-cache", "--output-format", "sarif", "--output-file", "ruff.sarif"]
+      output: { path: "ruff.sarif", format: sarif }
+    fixedInputs:
+      args: ["--no-cache", "--output-format", "sarif", "--output-file", "ruff.sarif"]
+      config:
+        content: "[lint]\nextend-select = [\"C901\"]\n\n[lint.mccabe]\nmax-complexity = 15\n"
+        passAs: { flag: "--config" }
+    choices: {}
+    configFiles: ["ruff.toml", ".ruff.toml", ".gitignore", ".ignore"]
+    configSections: ["pyproject.toml:tool.ruff"]
+    reviewedBy: Cristiano
+    reviewedAt: "2026-10-28"
+    proofs: 0
+
+  # Ruff format check for Python (no writes). Same binary and pin as ruff.
+  - id: ruff-format
+    categories: ["format"]
+    languages: ["python"]
+    releasedAt: "2026-10-15T15:24:28Z"
+    candidate:
+      id: ruff-format
+      name: "astral-sh/ruff"
+      kind: cli
+      repo: astral-sh/ruff
+      version: "0.17.1"
+      pin: { checksum: "a293ac937715ae6fb6b64da86761598379e6149f40fbc00fde9ba8a2a562ac65" }
+      source: reviewed
+      reviewed: true
+      categories: ["format"]
+    step:
+      cli:
+        install: { method: github-release, package: "ruff-x86_64-unknown-linux-gnu.tar.gz", version: "0.17.1" }
+        command: ["ruff", "format", "--check", "--no-cache"]
+      output: { path: "", format: none }
+    fixedInputs:
+      args: ["--check", "--no-cache"]
+      config:
+        content: "# pipegen's pinned ruff config: the default format\n"
+        passAs: { flag: "--config" }
+    choices: {}
+    configFiles: ["ruff.toml", ".ruff.toml", ".gitignore", ".ignore"]
+    configSections: ["pyproject.toml:tool.ruff"]
+    reviewedBy: Cristiano
+    reviewedAt: "2026-10-28"
+    proofs: 0
+
+  # mypy for Python repos that configured type checking (DECISIONS #95: no config and no py.typed → skipped).
+  # Source: PyPI mypy 2.4.0, the pure-Python py3-none-any wheel's sha256 (S20; slower than the compiled wheels; the downloaded wheel hashes to it), uploaded 2026-10-01T20:39:26.837765Z; PyPI provenance: none.
+  - id: mypy
+    categories: ["type-check"]
+    languages: ["python"]
+    releasedAt: "2026-10-01T20:39:26.837765Z"
+    candidate:
+      id: mypy
+      name: "python/mypy"
+      kind: cli
+      repo: python/mypy
+      version: "2.4.0"
+      pin: { checksum: "d01c5d26a352acc6d5cf3128225477e1e8465e8d3029d4c345807fbf7f3cf093" }
+      source: reviewed
+      reviewed: true
+      categories: ["type-check"]
+    step:
+      cli:
+        install: { method: pip, package: "mypy", version: "2.4.0" }
+        command: ["mypy", "--no-incremental", "."]
+      output: { path: "", format: none }
+    fixedInputs:
+      args: ["--no-incremental"]
+    choices: {}
+    configFiles: ["mypy.ini", ".mypy.ini"]
+    configSections: ["pyproject.toml:tool.mypy", "setup.cfg:mypy", "setup.cfg:mypy-*"]
+    reviewedBy: Cristiano
+    reviewedAt: "2026-10-28"
+    proofs: 0
+
+  # coverage.py: runs pytest under coverage, then `coverage report --fail-under=<minimum>` (ruling P24: step.cli.then;
+  #   {fail-under} is the AI's choice, never 0; 60 first, the catalogue's minimum for repos with few tests, D7).
+  # Source: PyPI coverage 7.16.2, the py3-none-any wheel's sha256 (no C tracer: slower, same results; the downloaded wheel hashes to it), uploaded 2026-09-27T12:28:59.075376Z; PyPI provenance: yes.
+  - id: coverage-py
+    categories: ["coverage"]
+    languages: ["python"]
+    releasedAt: "2026-09-27T12:28:59.075376Z"
+    candidate:
+      id: coverage-py
+      name: "coveragepy/coveragepy"
+      kind: cli
+      repo: coveragepy/coveragepy
+      version: "7.16.2"
+      pin: { checksum: "11d28e9123a9156cb405d8d27b44256c9a58fb5decc2073a8f17862057e3aa0f" }
+      source: reviewed
+      reviewed: true
+      categories: ["coverage"]
+    step:
+      cli:
+        install: { method: pip, package: "coverage", version: "7.16.2" }
+        command: ["coverage", "run", "--module", "pytest"]
+        then:
+          - ["coverage", "report", "--fail-under={fail-under}"]
+      output: { path: "", format: none }
+    fixedInputs:
+      args: ["--module"]
+    choices:
+      fail-under: ["60", "70", "80", "90"]
+    configFiles: [".coveragerc"]
+    configSections: ["pyproject.toml:tool.coverage", "setup.cfg:coverage:*", "tox.ini:coverage:*"]
+    reviewedBy: Cristiano
+    reviewedAt: "2026-10-28"
+    proofs: 0
+
+  # Creosote: unused Python dependencies (catalogue D8: not deptry).
+  # Source: PyPI creosote 5.2.0, the py3-none-any wheel's sha256 (the downloaded wheel hashes to it; no sdist on PyPI), uploaded 2026-03-28T17:08:46.712713Z; PyPI provenance: yes.
+  - id: creosote
+    categories: ["dead-code"]
+    languages: ["python"]
+    releasedAt: "2026-03-28T17:08:46.712713Z"
+    candidate:
+      id: creosote
+      name: "fredrikaverpil/creosote"
+      kind: cli
+      repo: fredrikaverpil/creosote
+      version: "5.2.0"
+      pin: { checksum: "6cd63d19c98cb31d87854628e1d59727902a190c84fed2cd75276599a55a6ec4" }
+      source: reviewed
+      reviewed: true
+      categories: ["dead-code"]
+    step:
+      cli:
+        install: { method: pip, package: "creosote", version: "5.2.0" }
+        command: ["creosote"]
+      output: { path: "", format: none }
+    fixedInputs: {}
+    choices: {}
+    configFiles: []
+    configSections: ["pyproject.toml:tool.creosote"]
+    reviewedBy: Cristiano
+    reviewedAt: "2026-10-28"
+    proofs: 0
+
+  # Vulture: unused Python code at 80% confidence or more; non-blocking.
+  # Source: PyPI vulture 2.16, the py3-none-any wheel's sha256 (the downloaded wheel hashes to it), uploaded 2026-03-25T14:41:26.210949Z; PyPI provenance: none.
+  - id: vulture
+    categories: ["dead-code"]
+    languages: ["python"]
+    releasedAt: "2026-03-25T14:41:26.210949Z"
+    candidate:
+      id: vulture
+      name: "jendrikseipp/vulture"
+      kind: cli
+      repo: jendrikseipp/vulture
+      version: "2.16"
+      pin: { checksum: "6e0f1c312cef1c87856957e5c2ca9608834a7c794c2180477f30bf0e4cc58eee" }
+      source: reviewed
+      reviewed: true
+      categories: ["dead-code"]
+    step:
+      cli:
+        install: { method: pip, package: "vulture", version: "2.16" }
+        command: ["vulture", "--min-confidence", "80", "."]
+      output: { path: "", format: none }
+    fixedInputs:
+      args: ["--min-confidence", "80"]
+    choices: {}
+    configFiles: []
+    configSections: ["pyproject.toml:tool.vulture"]
+    reviewedBy: Cristiano
+    reviewedAt: "2026-10-28"
+    proofs: 0
+
+  # Bandit: Python security checks (SARIF). Listed after Semgrep, so Semgrep stays the first sast pick for Python.
+  # Source: PyPI bandit 1.9.4, the py3-none-any wheel's sha256 (the downloaded wheel hashes to it), uploaded 2026-02-25T06:44:13.694900Z; PyPI provenance: yes.
+  # Plugins: the two packages of bandit's `sarif` extra (bandit 1.9.4 METADATA), each its py3-none-any wheel's sha256:
+  #   sarif-om 1.0.4 (uploaded 2019-10-05T20:11:21Z) and jschema-to-python 1.2.3 (uploaded 2019-10-05T20:02:37Z).
+  - id: bandit
+    categories: ["sast"]
+    languages: ["python"]
+    releasedAt: "2026-02-25T06:44:13.694900Z"
+    candidate:
+      id: bandit
+      name: "PyCQA/bandit"
+      kind: cli
+      repo: PyCQA/bandit
+      version: "1.9.4"
+      pin: { checksum: "f89ffa663767f5a0585ea075f01020207e966a9c0f2b9ef56a57c7963a3f6f8e" }
+      source: reviewed
+      reviewed: true
+      categories: ["sast"]
+    step:
+      cli:
+        install: { method: pip, package: "bandit", version: "1.9.4" }
+        plugins:
+          - { method: pip, package: "sarif-om", version: "1.0.4", checksum: "539ef47a662329b1c8502388ad92457425e95dc0aaaf995fe46f4984c4771911" }
+          - { method: pip, package: "jschema-to-python", version: "1.2.3", checksum: "8a703ca7604d42d74b2815eecf99a33359a8dccbb80806cce386d5e2dd992b05" }
+        command: ["bandit", "--recursive", "--format", "sarif", "--output", "bandit.sarif", "."]
+      output: { path: "bandit.sarif", format: sarif }
+    fixedInputs:
+      args: ["--recursive", "--format", "sarif", "--output", "bandit.sarif"]
+    choices: {}
+    configFiles: [".bandit"]
+    configSections: ["pyproject.toml:tool.bandit"]
+    reviewedBy: Cristiano
+    reviewedAt: "2026-10-28"
+    proofs: 0
+
+  # PyPI trusted publishing (OIDC) with attestations; never a password input (no long-lived token).
+  # Source: git ref refs/tags/v1.14.3 of pypa/gh-action-pypi-publish (GitHub API; annotated tag aef6c9b6e301dc803e1bc9133e9ce67ae9b0906b dereferenced), release published_at. Released 2026-10-20T18:53:36Z. Immutable release.
+  - id: pypi-publish
+    categories: ["attestation", "publishing"]
+    languages: ["python"]
+    releasedAt: "2026-10-20T18:53:36Z"
+    candidate:
+      id: pypi-publish
+      name: "pypa/gh-action-pypi-publish"
+      kind: action
+      repo: pypa/gh-action-pypi-publish
+      version: "v1.14.3"
+      pin: { sha: "7245906fb61fa33a13554f9d5fb856fe61758086" }
+      source: reviewed
+      reviewed: true
+      categories: ["attestation", "publishing"]
+    step:
+      action:
+        uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086
+        with:
+          attestations: "true"
+      output: { path: "", format: none }
+    fixedInputs:
+      with:
+        attestations: "true"
+    choices: {}
+    configFiles: []
+    reviewedBy: Cristiano
+    reviewedAt: "2026-10-28"
+    proofs: 0

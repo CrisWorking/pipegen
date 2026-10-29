@@ -1,0 +1,41 @@
+# Plan R owns this file. User logins only, no teams.
+# Everything that decides what runs or what ships needs owner review.
+
+/data/                 @CrisWorking
+/gate/                 @CrisWorking
+/watcher/              @CrisWorking
+/.github/              @CrisWorking
+/.github/release-signers @CrisWorking
+/scripts/              @CrisWorking
+/src/engine/           @CrisWorking
+# The audit --ai secret pass and consent (what reaches an AI), and where data/ is loaded from.
+/src/ai/               @CrisWorking
+/src/cli/consent.ts    @CrisWorking
+/src/audit/consent-token.ts @CrisWorking
+/src/util/package-data.ts @CrisWorking
+/src/audit/choose.ts   @CrisWorking
+# Tests that pin the trust root: a PR must not weaken the checks a data change is judged by.
+/test/*-live.test.ts   @CrisWorking
+/test/reviewed.test.ts @CrisWorking
+/test/pinned-binary.test.ts @CrisWorking
+/test/cooldown.test.ts @CrisWorking
+# The secret-scanner upgrade checklist (P34-P38): the three required live tests, the script that requires them, and
+# its unit tests. A scanner bump must not be able to weaken or skip them in the same PR.
+/test/secret-scan-skip-live.test.ts @CrisWorking
+/scripts/scanner-live.ts @CrisWorking
+/test/scanner-live.test.ts @CrisWorking
+/test/release-check.test.ts @CrisWorking
+# The helpers the live tests import (the scanner stubs and scanWith, the temp repos, counted()): editing them can weaken
+# every live test at once.
+/test/helpers/         @CrisWorking
+/tsup.config.ts        @CrisWorking
+/tsup.dev.config.ts    @CrisWorking
+/tsconfig.json         @CrisWorking
+/vitest.config.ts      @CrisWorking
+/package.json          @CrisWorking
+/package-lock.json     @CrisWorking
+/.npmrc                @CrisWorking
+/.nvmrc                @CrisWorking
+/LICENSE               @CrisWorking
+/THIRD_PARTY_NOTICES   @CrisWorking
+/SECURITY.md           @CrisWorking

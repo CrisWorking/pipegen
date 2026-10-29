@@ -1,0 +1,11 @@
+# GitHub Actions minutes included per month for PRIVATE repos, per plan (Plan A Task 9). Public repos using standard
+# GitHub-hosted runners don't use these minutes (they are free). Loaded by loadGitHubPlans (src/estimate/estimate.ts)
+# with a strict schema. Source: https://docs.github.com/en/billing/concepts/product-billing/github-actions
+# ("GitHub Free for organizations" also has 2,000; pipegen's plan 'free' covers both.)
+checkedAt: '2026-10-27'
+source: 'https://docs.github.com/en/billing/concepts/product-billing/github-actions'
+includedMinutes:
+  free: 2000
+  pro: 3000
+  team: 3000
+  enterprise: 50000

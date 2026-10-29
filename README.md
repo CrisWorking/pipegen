@@ -4,27 +4,58 @@
 For small teams with nobody dedicated to security, DevOps or code quality.
 It opens one pull request. You review it. It never touches your app code or your `main` branch.
 
-> **Status: early. Design only, no code yet.** The first release is `pipegen audit` (read-only). See the [roadmap](docs/roadmap.md).
+> **Status: early, not published yet.** `pipegen audit` (read-only) is built and tested on real public repos; it is not on npm yet, so the install commands below don't work until the first release. The full run (one PR) comes later. See the [roadmap](docs/roadmap.md).
 
-## What the audit will show you *(example, not real yet)*
+## What the audit shows you *(excerpt of a real run on a public repo, expressjs/express; "..." marks cut parts)*
 
 ```text
-$ npx pipegen@0.1.0 audit
+$ npx --registry=https://registry.npmjs.org pipegen@0.1.0 audit --dir ./my-repo
 
-Verdict: 4 of 4 layers have gaps · 2 are serious · 1 secret found in your files
+pipegen audit: expressjs/express
 
-FOUR LAYERS
-  Layer         Status       What covers it today       Missing
-  1 Pre-commit  ✗ missing    —                          secret scan before commit
-  2 Push        ⚠ partial    npm test (on push)         secret scan, code scan, dependency scan
-  3 Merge       ⚠ partial    npm test (on PR)           image scan, attack test, gate, merge lock
-  4 Deploy      ✗ missing    deploy.yml (Vercel)        verify-first before deploy, SBOM
+Verdict: 4 of 4 layers have gaps; 4 are serious. pipegen couldn't check everything in 1 layer.
+Scheduled and repo-file checks: gaps (1 of 2 checks covered).
 
-COSTS
-  After setup, monthly    ~610 GitHub Actions minutes (31% of your free 2,000)
+...
+
+  On a schedule and in repo files: gaps (1 of 2 checks covered)
+      partial  Dependency update config (warning only)
+               Dependabot's default wait is 3 days; pipegen uses 7. Set cooldown default-days to at
+               least 7 (with no lower per-type days, include or exclude) on every entry.
+               Found: dependabot in .github/dependabot.yml
+      covered  OpenSSF Scorecard (warning only)
+               The scorecard check runs on a schedule or on every push to the default branch.
+               Found: scorecard in .github/workflows/scorecard.yml (job analysis)
+
+...
+
+Checks that don't apply here
+  - Type check (for express): no tsconfig.json or typescript dependency found
+  - Dockerfile lint (for express): no Dockerfile found
+  ...
+
+After the setup PR is merged, pipegen would turn on:
+  - Require actions pinned to a commit: Makes GitHub refuse any action that is not pinned to a
+    commit. pipegen turns it on only after your other workflows pin their actions to a commit. Today
+    none of your 5 workflows use tag pins; pipegen can't see this setting with read access, so it
+    can't say whether it is already on.
+  ...
 ```
 
 [See the full example report →](examples/audit-example.md)
+
+## What the audit checks
+
+Every check below is a row in the report: covered, partial, missing or unknown. A check that blocks a merge when it is missing is marked serious; the ones that only warn say **warning only**.
+
+- **Before each commit:** a git hook manager, a secret scan, a format and lint hook.
+- **On every push and pull request:** secret scan, code scan (SAST), dependency check, unit and full tests, lint, format, type check, test coverage minimum, dead code and unused dependencies, copy-paste check, Dockerfile lint, workflow lint, action pin check, new-dependency review, licence check, running-app scan (DAST), API scan against the spec, infrastructure code scan, container image build and scan, and the merge gate.
+- **At deploy or release:** SBOM, image signing, build attestation, trusted publishing, a network lock for release jobs and the deploy check.
+- **On a schedule and in repo files:** dependency update config (Dependabot or Renovate with a 7-day wait), OpenSSF Scorecard and fuzzing.
+
+Checks that do not apply to a repo (no Dockerfile, no tests, no API spec) are listed with the reason, in "Checks that don't apply here". The report also lists the GitHub settings the setup would turn on after the pull request is merged, and what it can't see.
+
+The code scan can use Semgrep CE with rules that pipegen pins to one reviewed commit of `semgrep/semgrep-rules`. Those rules are under the Semgrep Rules License v1.0, which is not an open-source licence: using them to scan your own code is allowed; reselling them or offering them as a service is not.
 
 ## What the full run does (v0.2)
 
@@ -45,19 +76,81 @@ It protects four stages: **pre-commit → push → merge → deploy**.
 ## Permissions and cost (honest numbers before you start)
 
 - **Access:** a GitHub App or fine-grained token limited to the repos involved. Broad classic tokens are refused by default.
+  `pipegen audit` only reads: on a private repo, give the token just Metadata: read, Pull requests: read, Actions: read
+  and Code scanning alerts: read (optional; without it pipegen can't confirm code scanning). A public repo works without a token.
 - **Shown before anything runs:** setup Actions minutes (hard limit 2× the estimate), **monthly** minutes afterwards, approximate AI cost (or "free" with a local model), and approximate time.
-- **GitHub Free + private repos:** some protections (merge locks, deploy environments, signing) need GitHub Pro (personal) or Team (organisation). pipegen sets up everything else and tells you exactly what's missing.
+- **GitHub Free + private repos:** merge locks need GitHub Pro (personal) or Team (organisation), and required deploy reviewers on private repos need GitHub Enterprise. pipegen checks what your repo really allows, sets up everything else and tells you exactly what's missing. Image signing works on Free private repos too, when pipegen can confirm the signing environment's branch rule (only your default branch may use the key).
 
 ## Commands *(planned)*
 
 ```bash
-npx --registry=https://registry.npmjs.org pipegen@x.y.z audit --dir ./my-repo
+npx --registry=https://registry.npmjs.org pipegen@0.1.0 audit --dir ./my-repo
                           # read-only report; run it from OUTSIDE the repo, exact version, explicit registry
-npx pipegen               # the full job → one PR
-npx pipegen finish        # after you merge: applies the merge rules, signing key and dates
-npx pipegen verify        # read-only: checks nobody weakened the pipeline files
-npx pipegen uninstall     # removes everything pipegen added
+npx --registry=https://registry.npmjs.org pipegen@0.1.0 audit --dir ./my-repo --out report.md
+                          # also save the report as a Markdown file, outside the repo
+                          # (--json prints the report as JSON instead of text)
+npx --registry=https://registry.npmjs.org pipegen@0.1.0 audit --dir ./my-repo --ai
+                          # also ask an AI for extra checks and tools to mention, after it shows what it would send
+                          # and asks you (default No)
 ```
+
+Exit codes of `pipegen audit`:
+
+- `0`: the report was printed (and written, with `--out`).
+- `1`: a refusal or an error, including GitHub not readable at all (a private repo without access, a refused token, no
+  answer): only what is on disk is printed, and no `--out` file is written.
+- `3`: the report was printed (and written, with `--out`), but GitHub's rate limit stopped pipegen reading some GitHub
+  facts. Every check that needs them shows as unknown ("couldn't check"), never as covered or missing; the warning at
+  the top says when the limit resets. In `--json`, `githubIncomplete` lists what wasn't read (`unread`), the reset time
+  (`resetsAt`) and how many rows it left unknown (`rows`); it is `null` on a complete run. Without a token GitHub allows
+  60 requests an hour; a read-only fine-grained token with the permissions above allows 5,000. One case still exits `1`
+  without a report: the limit hit while pipegen checks a GitHub App login set in `GITHUB_TOKEN` (pipegen can't confirm
+  which repos that login reaches without GitHub).
+
+`audit --ai` needs Linux or macOS for now (WSL works): it checks your code for secrets with a pinned betterleaks binary
+before anything is sent (or gitleaks, the fallback, when `PIPEGEN_SECRET_SCANNER` is set to `gitleaks`), and those
+binaries exist for those systems only.
+
+Later versions add the full job (one PR), then `finish` (after you merge: merge rules, signing key and dates), `verify`
+(read-only: checks nobody weakened the pipeline files) and `uninstall`. Their exact commands will be shown here when
+they exist; until then no other pipegen command is safe to copy, because the npm name isn't published yet.
+
+## Install safely, and check what you installed
+
+pipegen is not published yet. Once it is, install an exact version, from the official registry. An unversioned run takes whatever the registry serves at that
+moment, so always give the version and the registry:
+
+```bash
+npx --registry=https://registry.npmjs.org pipegen@x.y.z audit --dir ./my-repo
+```
+
+Replace `x.y.z` with the version from the release page; do not copy a version from anywhere else. Run it from outside the repo you audit.
+
+To check a release, in an empty folder:
+
+```bash
+npm init -y
+npm install --registry=https://registry.npmjs.org pipegen@x.y.z
+npm audit signatures --registry=https://registry.npmjs.org
+```
+
+`npm audit signatures` verifies the registry signature and the provenance attestation of every installed package: it
+should report the package as having a verified attestation. Then open the version's page on npmjs.com, follow the
+provenance link to the GitHub Actions run, and check that it is a run of `release.yml` in this repository for the matching tag.
+You can also verify the downloaded release file with `gh attestation verify <file>.tgz --repo CrisWorking/pipegen`.
+The steps for making a release are in [docs/release.md](docs/release.md).
+
+## Maintenance promise
+
+- **Updates:** the latest minor version is maintained. Fixes ship as new patch versions; nothing is changed in an existing
+  version after release.
+- **Security fixes:** report a problem privately (see [SECURITY.md](SECURITY.md)), not in a public issue. A report gets an
+  acknowledgement within 7 days and a fix or a written plan within 30 days.
+- **Dependencies and tools:** pipegen ships with no runtime dependencies, and every pinned dependency or tool version waits
+  7 days after its release before it is used (see [the cooldown](docs/cooldown.md)). An urgent security fix may skip the wait only with the maintainer's approval each time, and the exception is printed in the check (see [the emergency path](docs/cooldown.md#the-emergency-path-for-urgent-security-fixes)).
+- **Releases:** every release is built in GitHub Actions from an annotated tag signed by the maintainer's key listed in `.github/release-signers` (the workflow fails otherwise), with a provenance attestation you can verify as above.
+- **Side project:** pipegen is open source and maintained by one person; replies may be slow, and the promise above is the
+  part that is not.
 
 ## Read more
 

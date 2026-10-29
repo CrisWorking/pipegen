@@ -1,0 +1,161 @@
+// Ollama adapter (experimental). Plain fetch to {OLLAMA_HOST}/api/chat. No API key is ever sent here. Redirects are
+// refused: the consent screen names the host the code goes to, and a 307/308 would re-send it somewhere else.
+import { HttpError, readBytes } from '../engine/http.js';
+import type { AiProvider, AiRequest, AiUsage } from '../types.js';
+import { safeText } from '../util/safe-text.js';
+import { AiError, count, outputLimit, withTimeout } from './errors.js';
+
+export const OLLAMA_DEFAULT_HOST = 'http://127.0.0.1:11434';
+export const OLLAMA_DEFAULT_MODEL = 'llama3.1';
+/** Always sent: Ollama's own small default silently cuts long prompts. */
+export const OLLAMA_DEFAULT_CTX = 32768;
+
+export interface OllamaOptions { host?: string; model?: string; numCtx?: number; fetch?: typeof fetch }
+
+/**
+ * The /api/chat URL for an OLLAMA_HOST value. Only http and https are allowed (anything else: AiError 'http').
+ * A bare `host:port` (as Ollama itself accepts) is read as http. Any path on the host is kept as a prefix.
+ */
+export function ollamaChatUrl(host: string = OLLAMA_DEFAULT_HOST): URL {
+  const raw = host.trim() === '' ? OLLAMA_DEFAULT_HOST : host.trim();
+  let url: URL;
+  try {
+    url = new URL(/^[a-z][a-z0-9+.-]*:\/\//i.test(raw) ? raw : `http://${raw}`);
+  } catch {
+    throw new AiError('http', 'OLLAMA_HOST is not a valid URL. Use something like http://127.0.0.1:11434.');
+  }
+  if (url.protocol !== 'http:' && url.protocol !== 'https:') {
+    throw new AiError('http', 'OLLAMA_HOST must be an http:// or https:// URL.');
+  }
+  url.pathname = `${url.pathname.replace(/\/+$/, '')}/api/chat`;
+  url.search = '';
+  url.hash = '';
+  return url;
+}
+
+function usageOf(a: { prompt_eval_count?: unknown; eval_count?: unknown }): AiUsage {
+  return { inputTokens: count(a.prompt_eval_count), outputTokens: count(a.eval_count) };
+}
+
+/** An Ollama provider, with the host:port its requests go to (shown at consent; never userinfo or a path). */
+export type OllamaProvider = AiProvider & { readonly name: 'ollama'; readonly host: string };
+
+export const OLLAMA_CLOUD_MESSAGE = 'Ollama cloud models send your code to ollama.com; pipegen v0.1 only uses local Ollama models.';
+/**
+ * An Ollama cloud model: the local daemon forwards the prompt to ollama.com, so the code leaves this machine while
+ * consent says it runs locally (ruling U14). Ollama's docs (docs.ollama.com/cloud, read 2026-10-27) name them with a
+ * `:cloud` tag in the app and CLI (`gemma4:cloud`); earlier releases used a `-cloud` suffix (`gpt-oss:120b-cloud`).
+ * Both forms are refused, in any letter case (fail closed).
+ */
+export function isOllamaCloudModel(model: string): boolean {
+  return /(?:^|[:-])cloud$/i.test(model.trim());
+}
+
+/** The host:port an Ollama provider sends to, or null when `p` isn't one built by ollamaProvider (unknown: never assume local). */
+export function ollamaHostOf(p: AiProvider): string | null {
+  const host = (p as { host?: unknown }).host;
+  return p.name === 'ollama' && typeof host === 'string' && host !== '' ? host : null;
+}
+
+export function ollamaProvider(opts: OllamaOptions = {}): OllamaProvider {
+  const url = ollamaChatUrl(opts.host);
+  const where = url.host; // shown in errors: host and port only, never userinfo or a path
+  const model = opts.model ?? OLLAMA_DEFAULT_MODEL;
+  if (isOllamaCloudModel(model)) throw new AiError('invalid', OLLAMA_CLOUD_MESSAGE);
+  const numCtx = opts.numCtx ?? OLLAMA_DEFAULT_CTX;
+  if (!Number.isInteger(numCtx) || numCtx < 1) throw new AiError('invalid', '--ollama-ctx must be a whole number above 0.');
+  const doFetch = opts.fetch ?? globalThis.fetch;
+
+  return {
+    name: 'ollama',
+    model,
+    host: where,
+    async complete(req: AiRequest) {
+      const limit = outputLimit(req.maxOutputTokens); // free locally, but it bounds the time
+      const answer = await withTimeout(req.timeoutMs, 'Ollama', async (signal) => {
+        let res: Response;
+        try {
+          res = await doFetch(url, {
+            method: 'POST',
+            signal,
+            redirect: 'error', // a 3xx must never re-send the code bundle to a host the consent screen didn't name
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({
+              model,
+              messages: [{ role: 'system', content: req.system }, { role: 'user', content: req.user }],
+              format: req.jsonSchema,
+              stream: false,
+              options: { num_ctx: numCtx, ...(limit === undefined ? {} : { num_predict: limit }) },
+            }),
+          });
+        } catch (e) {
+          if (signal.aborted) throw e;
+          throw new AiError('http', `Could not reach Ollama at ${where}: is Ollama running?`);
+        }
+        if (!res.ok) throw new AiError('http', `Ollama at ${where} returned HTTP ${res.status}. Is the model "${safeText(model, 100)}" pulled?`);
+        try {
+          return (await res.json()) as { message?: { content?: unknown }; done_reason?: unknown; prompt_eval_count?: unknown; eval_count?: unknown };
+        } catch (e) {
+          if (signal.aborted) throw e;
+          throw new AiError('http', `Ollama at ${where} sent an answer pipegen could not read.`);
+        }
+      });
+
+      const usage = usageOf(answer);
+      if (answer.done_reason === 'length') throw new AiError('truncated', 'Ollama\'s answer was cut off before it was complete. Nothing was changed.', usage);
+      const content = answer.message?.content;
+      if (typeof content !== 'string') throw new AiError('invalid', 'Ollama stopped without a complete answer.', usage);
+      try {
+        return { data: JSON.parse(content) as unknown, usage };
+      } catch {
+        throw new AiError('invalid', 'Ollama\'s answer was not valid JSON.', usage);
+      }
+    },
+  };
+}
+
+/** Ollama's own cloud: a model there runs on ollama.com, not on a machine the user controls (Plan U ruling U15/H2). */
+const OLLAMA_CLOUD_HOST = /(?:^|\.)ollama\.com$/;
+/**
+ * The host as DNS sees it (review M10): URL parsing has already lower-cased it and applied IDNA (fullwidth letters,
+ * U+3002 dots); trailing dots, any number of them, name the same host, so they are removed before the check.
+ */
+const dnsHost = (url: URL) => url.hostname.toLowerCase().replace(/\.+$/, '');
+const SHOW_TIMEOUT_MS = 15_000;
+/** /api/show answers with the model's metadata (licence text included); more than this is refused. */
+const MAX_SHOW_BYTES = 8 * 1024 * 1024;
+
+export const OLLAMA_COM_HOST_MESSAGE = 'OLLAMA_HOST points at ollama.com, which runs models in Ollama\'s cloud; pipegen v0.1 only uses Ollama models that run on a machine you control.';
+
+/**
+ * Before consent (`audit --ai ollama`, Plan U ruling U15/H2): refuses an OLLAMA_HOST on ollama.com, then asks the
+ * server about the model (POST /api/show) and refuses a model the server says runs elsewhere (`remote_host` or
+ * `remote_model` in the answer: a cloud model behind a local name). Fails closed: a server that doesn't answer, an
+ * error or an answer pipegen can't read is refused too. Only the model name is sent; redirects are refused.
+ * Throws AiError('invalid') with a plain message; returns nothing when the model runs on that server.
+ */
+export async function checkOllamaModelRunsThere(host: string | undefined, model: string, fetchFn: typeof fetch = globalThis.fetch): Promise<void> {
+  const url = ollamaChatUrl(host);
+  if (OLLAMA_CLOUD_HOST.test(dnsHost(url))) throw new AiError('invalid', OLLAMA_COM_HOST_MESSAGE);
+  url.pathname = url.pathname.replace(/\/api\/chat$/, '/api/show');
+  const where = url.host;
+  const refuse = (why: string) => new AiError('invalid', `pipegen couldn't confirm that the Ollama model "${safeText(model, 100)}" runs on ${where} (${why}), so it won't send your code to it.`);
+  let answer: unknown;
+  try {
+    answer = await withTimeout(SHOW_TIMEOUT_MS, 'Ollama', async (signal) => {
+      const res = await fetchFn(url, { method: 'POST', signal, redirect: 'error', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ model }) });
+      if (!res.ok) {
+        await res.body?.cancel().catch(() => {});
+        throw refuse(`it answered HTTP ${res.status}; is the model pulled?`);
+      }
+      // read with a byte cap: the answer comes from a server pipegen doesn't control
+      return JSON.parse((await readBytes(res, MAX_SHOW_BYTES, 'Ollama\'s model description')).toString('utf8')) as unknown;
+    });
+  } catch (e) {
+    if (e instanceof AiError && e.kind === 'invalid') throw e;
+    throw refuse(e instanceof SyntaxError ? 'its answer was not JSON' : e instanceof HttpError ? 'its answer was too large or broken' : 'it did not answer; is Ollama running?');
+  }
+  if (answer === null || typeof answer !== 'object' || Array.isArray(answer)) throw refuse('its answer was not a model description');
+  const a = answer as Record<string, unknown>;
+  if (Object.hasOwn(a, 'remote_host') || Object.hasOwn(a, 'remote_model')) throw new AiError('invalid', OLLAMA_CLOUD_MESSAGE);
+}

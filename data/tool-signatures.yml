@@ -1,0 +1,1280 @@
+# Tool signatures (Plan U Task 1), read by loadToolSignatures (src/audit/coverage.ts). The audit uses them to
+# recognise checks a repo's existing workflows and git hooks already run. Nothing here is ever run or installed:
+# it only names what to look for.
+#
+# Entry fields:
+#   id            pipegen's label for the tool (lowercase letters, digits, dashes); shown as "by" in the audit.
+#   categories    the need categories (src/types.ts NEED_CATEGORIES) a run of this tool counts for.
+#   languages     (P57 C1) the service languages (src/types.ts Language) the tool checks: a run covers a service only
+#                 when its language is listed. `any`: language-neutral (secret scans, image and IaC scans, workflow and
+#                 Dockerfile linters, multi-language scanners); `unknown`: pipegen can't tell which other languages it
+#                 checks (lint-staged runs what its config names), so a run is at most partial for a service of a
+#                 language not listed.
+#   actions       GitHub Actions, as owner/name or owner/name/sub-path. A `uses:` value matches only that exact path
+#                 (case-insensitive, @ref ignored), so snyk/actions/setup or anchore/sbom-action/download-syft, which
+#                 only install, never count. A last part ending in * is a prefix (snyk/actions/python* matches
+#                 snyk/actions/python-3.10).
+#   commands      command names, matched only where a command starts (start, after ; && || | $( ( { a newline, a
+#                 shell keyword or a wrapper such as npx, sudo, env, uv run, python -m; a path's basename; the image
+#                 after docker run), never inside quotes. Words are separated by one space ("npm audit"); a first word
+#                 with a slash is a path (.husky/pre-commit). A call with --version or --help (or only -v, -V or -h)
+#                 is never a run.
+#   excludes      longer commands that start like one of `commands` but are not this check (gitleaks version).
+#   commandFails  default (fails on findings), flag (only with one of failFlags), never (only reports).
+#   failFlags     flags that make a `flag` command fail on findings.
+#   softFlags     flags that stop a command from failing ("--exit-code=0" also matches "--exit-code 0"). They are
+#                 also read inside an action's args, cmd_options and options inputs.
+#   actionFails   default, input (only with one of failInputs) or never, for the actions.
+#   failInputs    `with:` inputs (name: lowercase values, * = any non-empty value) that make an `input` action fail.
+#   softInputs    `with:` inputs (name: lowercase values, * = any non-empty value) that stop the action from failing.
+#   softUnless    `with:` inputs set (non-empty) to anything except these values stop the action from failing.
+#                 Input names are compared case-insensitively, as GitHub does.
+#   partialWhy    pipegen's own sentence for a check that never fails the job.
+#   onlyWithFlags a command counts only when one of these words is given exactly (npm publish --provenance).
+#   notWithFlags  a command doesn't count when one of these flags is given (matched like softFlags).
+#   skipInputs    `with:` inputs set to one of these values (* = any non-empty; an expression counts too) mean the
+#                 action doesn't do this check at all (pypi-publish with a password makes no attestation).
+#   skipUnless    `with:` inputs set (non-empty) to anything but these values (or an expression) mean the same.
+#   precommitHooks pre-commit hooks that run this tool: `repo` is the hook repo's exact URL, `ids` its hook ids (from
+#                 the repo's .pre-commit-hooks.yaml). These repos are the ones pipegen knows: a hook from any other
+#                 repo (a look-alike or a mirror) counts only as partial, since pipegen can't see what it runs.
+#   actionRef     the action does the check only from a version on: `moving` branches, tags vX.Y[.Z] and release/vX.Y
+#                 at or above `minVersion`, and the commit SHAs in `shas` count; a lower version is missing (`oldWhy`);
+#                 any other ref is partial (`unknownWhy`).
+# Plan P Task 3 fields:
+#   reusableWorkflows  called workflows, exactly owner/repo/.github/workflows/<file>.yml: a job-level `uses:` of one counts
+#                 like the entry's action (letter case and @ref ignored), with the job's `with:` inputs read like an
+#                 action's. It is read before the "a remote reusable workflow can't be seen into" rule (U2), for the
+#                 listed workflows only. A ref that is neither a commit SHA nor a vX[.Y[.Z]] tag is partial.
+#   onlyWithFlagValue  { flag, input, contains, ifGiven }: a command counts only when `flag` is given (`--f v` or
+#                 `--f=v`; the last one wins) with a value; with `contains`, its comma-split value must include that
+#                 word. An action is read the same way through `input`. With `ifGiven`, leaving the flag or input out
+#                 is fine (the tool's default does the check), but a value without the word isn't.
+#   onlyWithInputs the action does this check only when one of these inputs is set to a listed value (* = any non-empty
+#                 value) in every spelling; an expression doesn't count.
+#   availability  public, or public-or-code-security (public repos, and organisation-owned private repos with code
+#                 scanning). Elsewhere a run is partial with `unavailableWhy`. Without the repo's capabilities, pipegen
+#                 assumes no code scanning.
+#   requireInputs { all, any, unset, why }: the action does the check only when every `all` input and one `any` input
+#                 is set to a listed value (every spelling; an expression doesn't count) and no `unset` input is set
+#                 (to anything but "false"). Otherwise it is partial with `why`.
+#   scanTarget    image or folder: a command counts only when its arguments name that kind of target (an image: an
+#                 image scheme or a name with a :tag or @sha256 digest; a folder: dir:, file:, sbom:, `--from dir`, a
+#                 path); one that names neither is partial.
+#   onlyWithFlags is matched like notWithFlags from Plan P Task 3 on (`--cov` also matches `--cov=pkg`), and a value
+#                 that reads as false (false, 0, null, no, off, empty) never counts.
+# DoD run fields (2026-10-29):
+#   partialWithFlagValue { flags, input, needsAll, grammar, why }: a run is partial with `why` when one of `flags` (or the
+#                 action's `input`) is given, any time, with a value whose comma-split words don't include every word of
+#                 `needsAll` (any letter case); a flag without a value, a variable, an expression or crowded spellings count
+#                 as such a value. `grammar: trivy` reads the command line with Trivy's own flag grammar.
+# Every entry has actions, commands, reusableWorkflows or a mix. Where an entry sets commandFails, actionFails,
+# failFlags, softFlags, failInputs, softInputs or softUnless, that behaviour was checked on 2026-10-27 against the
+# source or docs named in the comment above it (fetched with curl). An entry with no such comment uses the plain
+# default (a run fails on findings), which pipegen has not checked tool by tool. Plan P Task 3 (ruling PS18): every
+# entry it adds or extends names its source above it, whatever its fields, checked on 2026-10-27 with curl and
+# read-only `gh api`.
+tools:
+  # ---------- secrets ----------
+  # https://github.com/gitleaks/gitleaks/blob/master/README.md ("--exit-code int ... (default 1)")
+  # hooks: https://github.com/gitleaks/gitleaks/blob/master/.pre-commit-hooks.yaml (gitleaks, gitleaks-docker,
+  # gitleaks-system: `gitleaks git --pre-commit --redact --staged --verbose`)
+  - id: gitleaks
+    categories: [secrets]
+    languages: [any]
+    actions: [gitleaks/gitleaks-action]
+    # the old URL https://github.com/zricethezav/gitleaks redirects to gitleaks/gitleaks and serves the same
+    # .pre-commit-hooks.yaml (checked 2026-10-27)
+    precommitHooks:
+      - repo: https://github.com/gitleaks/gitleaks
+        ids: [gitleaks, gitleaks-docker, gitleaks-system]
+      - repo: https://github.com/zricethezav/gitleaks
+        ids: [gitleaks, gitleaks-docker, gitleaks-system]
+    commands: [gitleaks]
+    excludes: [gitleaks version, gitleaks help, gitleaks completion]
+    softFlags: [--exit-code=0]
+  # Plan P Task 3. betterleaks v1.9.0, the pinned version: https://github.com/betterleaks/betterleaks/blob/v1.9.0/cmd/root.go
+  # (`--exit-code`, default 1: a run that finds leaks exits 1); `config`, `validate` and `version` don't scan
+  # (cmd/config.go, cmd/validate.go, cmd/version.go). hooks:
+  # https://github.com/betterleaks/betterleaks/blob/v1.9.0/.pre-commit-hooks.yaml (betterleaks, betterleaks-docker,
+  # betterleaks-system: `betterleaks git --pre-commit --redact --staged --verbose`)
+  - id: betterleaks
+    categories: [secrets]
+    languages: [any]
+    commands: [betterleaks]
+    excludes: [betterleaks version, betterleaks help, betterleaks completion, betterleaks config, betterleaks validate]
+    softFlags: [--exit-code=0]
+    precommitHooks:
+      - repo: https://github.com/betterleaks/betterleaks
+        ids: [betterleaks, betterleaks-docker, betterleaks-system]
+  # CLI: https://github.com/trufflesecurity/trufflehog/blob/main/README.md ("183 ... only returned if --fail is used")
+  # Action: https://github.com/trufflesecurity/trufflehog/blob/main/action.yml (always passes --fail)
+  - id: trufflehog
+    categories: [secrets]
+    languages: [any]
+    actions: [trufflesecurity/trufflehog]
+    commands: [trufflehog]
+    commandFails: flag
+    failFlags: [--fail]
+  # https://github.com/Yelp/detect-secrets/blob/master/README.md ("detect-secrets scan" builds a baseline;
+  # "detect-secrets-hook" alerts on new secrets)
+  # hook: https://github.com/Yelp/detect-secrets/blob/master/.pre-commit-hooks.yaml (id detect-secrets, entry detect-secrets-hook)
+  - id: detect-secrets
+    categories: [secrets]
+    languages: [any]
+    commands: [detect-secrets-hook]
+    precommitHooks:
+      - repo: https://github.com/Yelp/detect-secrets
+        ids: [detect-secrets]
+  - id: detect-secrets-scan
+    categories: [secrets]
+    languages: [any]
+    commands: [detect-secrets scan]
+    commandFails: never
+    partialWhy: The detect-secrets scan command only writes a baseline file; it doesn't fail when it finds a secret.
+  # ---------- code scanning (SAST) ----------
+  # semgrep ci: https://semgrep.dev/docs/semgrep-ci/configuring-blocking-and-errors-in-ci ("blocking findings ... exit code 1")
+  # semgrep-action is the deprecated wrapper around semgrep ci: https://github.com/returntocorp/semgrep-action
+  - id: semgrep
+    categories: [sast]
+    languages: [any]
+    actions: [semgrep/semgrep-action, returntocorp/semgrep-action]
+    commands: [semgrep ci]
+  # semgrep scan / semgrep --config: https://github.com/semgrep/semgrep/blob/develop/cli/src/semgrep/commands/scan.py
+  # (--error/--no-error, off by default: findings exit 0)
+  - id: semgrep-scan
+    categories: [sast]
+    languages: [any]
+    commands: [semgrep]
+    excludes: [semgrep ci, semgrep login, semgrep logout, semgrep install-semgrep-pro, semgrep publish, semgrep lsp, semgrep mcp]
+    commandFails: flag
+    failFlags: [--error]
+    softFlags: [--no-error]
+  # Ruling U5: CodeQL uploads results; it blocks only through code scanning merge protection
+  # (https://docs.github.com/en/code-security/code-scanning/managing-your-code-scanning-configuration/set-code-scanning-merge-protection)
+  - id: codeql
+    categories: [sast]
+    languages: [node, python, go, java, dotnet, ruby]
+    actions: [github/codeql-action/analyze]
+    commands: [codeql database analyze]
+    commandFails: never
+    actionFails: never
+    partialWhy: CodeQL reports findings but does not fail the job; they block only if code scanning merge protection is on.
+  # CLI: https://github.com/PyCQA/bandit/blob/main/bandit/cli/main.py (--exit-zero)
+  # Action: https://github.com/PyCQA/bandit-action/blob/main/action.yml (runs bandit ... -f sarif -o results.sarif || true)
+  - id: bandit
+    categories: [sast]
+    languages: [python]
+    actions: [PyCQA/bandit-action]
+    commands: [bandit]
+    softFlags: [--exit-zero]
+    actionFails: never
+    partialWhy: The official bandit action ignores bandit's exit code, so it never fails the job.
+  # https://github.com/securego/gosec/blob/master/README.md ("Use -no-fail to always return 0"); Go's flag package
+  # also takes --no-fail. The action passes its `args` input straight to gosec
+  # (https://github.com/securego/gosec/blob/master/action.yml), so -no-fail there counts too.
+  - id: gosec
+    categories: [sast]
+    languages: [go]
+    actions: [securego/gosec]
+    commands: [gosec]
+    softFlags: [-no-fail, --no-fail]
+  # ---------- dependencies ----------
+  # https://github.com/snyk/actions/blob/master/action.yml (input command, default test); only the scanning
+  # sub-actions are listed, never snyk/actions/setup (install only)
+  - id: snyk
+    categories: [deps]
+    languages: [any]
+    actions:
+      - snyk/actions
+      - snyk/actions/node
+      - snyk/actions/python*
+      - snyk/actions/golang
+      - snyk/actions/ruby
+      - snyk/actions/php
+      - snyk/actions/dotnet
+      - snyk/actions/gradle*
+      - snyk/actions/maven*
+      - snyk/actions/scala
+      - snyk/actions/sbt*
+      - snyk/actions/cocoapods
+      - snyk/actions/elixir*
+    commands: [snyk test]
+    softInputs:
+      command: [monitor]
+  - id: snyk-code
+    categories: [sast]
+    languages: [any]
+    commands: [snyk code test]
+  - id: snyk-container
+    categories: [image-scan]
+    languages: [any]
+    actions: [snyk/actions/docker]
+    commands: [snyk container test]
+    softInputs:
+      command: [monitor, container monitor]
+  - id: snyk-iac
+    categories: [iac]
+    languages: [any]
+    actions: [snyk/actions/iac]
+    commands: [snyk iac test]
+  # https://github.com/google/osv-scanner/blob/main/docs/output.md ("non-zero exit code (1) if any vulnerabilities are found")
+  - id: osv-scanner
+    categories: [deps]
+    languages: [any]
+    actions: [google/osv-scanner-action, google/osv-scanner-action/osv-scanner-action]
+    commands: [osv-scanner]
+  # npm audit signatures checks registry signatures, not vulnerabilities
+  # --audit-level=none: https://github.com/npm/cli/blob/latest/lib/utils/reify-output.js uses 'none' as the level
+  # for commands that must not fail on an audit
+  - id: npm-audit
+    categories: [deps]
+    languages: [node]
+    commands: [npm audit, pnpm audit, yarn audit]
+    excludes: [npm audit signatures]
+    softFlags: [--audit-level=none]
+  # Action: https://github.com/pypa/gh-action-pip-audit/blob/main/action.py (exits 0 when
+  # internal-be-careful-allow-failure is anything but "false")
+  - id: pip-audit
+    categories: [deps]
+    languages: [python]
+    actions: [pypa/gh-action-pip-audit]
+    commands: [pip-audit]
+    softUnless:
+      internal-be-careful-allow-failure: ['false']
+  # https://github.com/actions/dependency-review-action/blob/main/README.md (fail-on-severity default low; warn-only)
+  # Plan P Task 3 (rulings PB5, R4): one entry for deps and dependency-review. The README: it runs only on public repos
+  # and organisation-owned private repos with GitHub Advanced Security; vulnerability-check: false skips the check;
+  # fail-on-scopes (default runtime) leaves runtime dependencies out when it doesn't name them; a config-file can set
+  # all of these. Inputs: https://github.com/actions/dependency-review-action/blob/main/action.yml (fix round 1:
+  # base-ref and head-ref set in the workflow can make it compare a branch with itself)
+  - id: dependency-review
+    categories: [deps, dependency-review]
+    languages: [any]
+    actions: [actions/dependency-review-action]
+    softInputs:
+      warn-only: ['true']
+    skipInputs:
+      vulnerability-check: ['false']
+    onlyWithFlagValue: { input: fail-on-scopes, contains: runtime, ifGiven: true }
+    requireInputs:
+      unset: [config-file, base-ref, head-ref]
+      why: The dependency review action here reads a config file or compares refs set in the workflow, which pipegen can't check, so it may warn only or compare nothing.
+    availability: public-or-code-security
+    unavailableWhy: Dependency review works only on public repos and on organisation-owned private repos with GitHub Advanced Security, so here it checks nothing.
+  # Plan P Task 3: https://github.com/google/osv-scanner-action/blob/main/.github/workflows/osv-scanner-reusable-pr.yml
+  # (fail-on-vuln: default true, passed to the reporter as --fail-on-vuln; it scans the base branch and the pull
+  # request and fails on the vulnerabilities the pull request adds). Ruling PS19.
+  - id: osv-pr-diff
+    categories: [dependency-review]
+    languages: [any]
+    reusableWorkflows: [google/osv-scanner-action/.github/workflows/osv-scanner-reusable-pr.yml]
+    softUnless:
+      fail-on-vuln: ['true']
+  # CLI: https://github.com/golang/vuln/blob/master/cmd/govulncheck/doc.go ("Exit codes": exits 0 with -json,
+  # -format sarif or -format openvex, whatever it finds)
+  # Action: https://github.com/golang/govulncheck-action/blob/master/action.yml (output-format goes to -format)
+  - id: govulncheck
+    categories: [deps]
+    languages: [go]
+    actions: [golang/govulncheck-action]
+    commands: [govulncheck]
+    softFlags: [-json, --json, -format=json, -format=sarif, -format=openvex, --format=json, --format=sarif, --format=openvex]
+    softInputs:
+      output-format: [json, sarif, openvex]
+  # ---------- containers and infrastructure ----------
+  # CLI: https://github.com/aquasecurity/trivy/blob/main/docs/guide/configuration/others.md ("By default, Trivy exits
+  # with code 0 even when security issues are detected"; --exit-code covers vulnerability, misconfiguration, secret and
+  # licence findings)
+  # Action: https://github.com/aquasecurity/trivy-action/blob/master/action.yaml (exit-code has no default and is
+  # passed on only when non-empty: set_env_var_if_provided "TRIVY_EXIT_CODE")
+  # Fix round 1: an exit code is any value that isn't a plain 1-255 (pflag reads base prefixes:
+  # https://github.com/spf13/pflag/blob/master/int.go; the action through cast: https://github.com/spf13/cast), so
+  # failInputs take `+` (a non-zero exit code). --download-db-only and --download-java-db-only download and scan nothing
+  # (https://github.com/aquasecurity/trivy/blob/main/pkg/flag/db_flags.go). Ruling P8: TRIVY_* variables set the same
+  # options, and trivy loads ./trivy.yaml by default (https://github.com/aquasecurity/trivy/blob/main/pkg/flag/global_flags.go,
+  # `--config` default "trivy.yaml"; `--config ''` loads none).
+  # Plan P Task 3 (ruling PB3): one entry per subcommand, so `trivy config` never counts as an image scan. Subcommands
+  # and aliases: https://github.com/aquasecurity/trivy/blob/main/pkg/commands/app.go (image|i, filesystem|fs, rootfs,
+  # repository|repo, sbom, config|conf). --scanners picks what is scanned (image and fs scan vuln,secret by default),
+  # so a list without vuln is no vulnerability scan. The action: scan-type (default 'image'), scanners (default '':
+  # trivy's own) and trivy-config (a trivy.yaml that can change all of this).
+  - id: trivy-image
+    categories: [image-scan]
+    languages: [any]
+    actions: [aquasecurity/trivy-action]
+    commands: [trivy image, trivy i]
+    commandFails: flag
+    notWithFlags: [--download-db-only, --download-java-db-only]
+    softEnv: [TRIVY_EXIT_CODE, TRIVY_SCANNERS, TRIVY_DOWNLOAD_DB_ONLY, TRIVY_DOWNLOAD_JAVA_DB_ONLY, TRIVY_CONFIG]
+    configFiles: [trivy.yaml]
+    configFlag: --config
+    failFlags: [--exit-code]
+    softFlags: [--exit-code=0]
+    onlyWithFlagValue: { flag: --scanners, input: scanners, contains: vuln, ifGiven: true }
+    actionFails: input
+    failInputs:
+      exit-code: ['+']
+    softInputs:
+      exit-code: ['0']
+    skipUnless:
+      scan-type: [image]
+    requireInputs:
+      unset: [trivy-config]
+      why: The Trivy action reads a trivy.yaml here that can change what it scans and when it fails, and pipegen doesn't read that file.
+  # Plan P Task 3 (PB3): the filesystem, repository, root filesystem and SBOM scans are dependency scans (sources above:
+  # https://github.com/aquasecurity/trivy/blob/main/pkg/commands/app.go)
+  - id: trivy-fs
+    categories: [deps]
+    languages: [any]
+    actions: [aquasecurity/trivy-action]
+    commands: [trivy fs, trivy filesystem, trivy repo, trivy repository, trivy rootfs, trivy sbom]
+    commandFails: flag
+    notWithFlags: [--download-db-only, --download-java-db-only]
+    softEnv: [TRIVY_EXIT_CODE, TRIVY_SCANNERS, TRIVY_DOWNLOAD_DB_ONLY, TRIVY_DOWNLOAD_JAVA_DB_ONLY, TRIVY_CONFIG]
+    configFiles: [trivy.yaml]
+    configFlag: --config
+    failFlags: [--exit-code]
+    softFlags: [--exit-code=0]
+    onlyWithFlagValue: { flag: --scanners, input: scanners, contains: vuln, ifGiven: true }
+    actionFails: input
+    failInputs:
+      exit-code: ['+']
+    softInputs:
+      exit-code: ['0']
+    onlyWithInputs:
+      scan-type: [fs, filesystem, repo, repository, rootfs, sbom]
+    requireInputs:
+      unset: [trivy-config]
+      why: The Trivy action reads a trivy.yaml here that can change what it scans and when it fails, and pipegen doesn't read that file.
+  # Plan P Task 3 (PB3): `trivy config` scans infrastructure files (sources above;
+  # https://github.com/aquasecurity/trivy/blob/main/docs/guide/scanner/misconfiguration/index.md)
+  - id: trivy-config
+    categories: [iac]
+    languages: [any]
+    actions: [aquasecurity/trivy-action]
+    commands: [trivy config, trivy conf]
+    commandFails: flag
+    notWithFlags: [--download-db-only, --download-java-db-only]
+    softEnv: [TRIVY_EXIT_CODE, TRIVY_SCANNERS, TRIVY_DOWNLOAD_DB_ONLY, TRIVY_DOWNLOAD_JAVA_DB_ONLY, TRIVY_CONFIG]
+    configFiles: [trivy.yaml]
+    configFlag: --config
+    failFlags: [--exit-code]
+    softFlags: [--exit-code=0]
+    actionFails: input
+    failInputs:
+      exit-code: ['+']
+    softInputs:
+      exit-code: ['0']
+    onlyWithInputs:
+      scan-type: [config, conf]
+    requireInputs:
+      unset: [trivy-config]
+      why: The Trivy action reads a trivy.yaml here that can change what it scans and when it fails, and pipegen doesn't read that file.
+  # Plan P Task 3: `trivy config` checks a Dockerfile's settings among its misconfiguration checks
+  # (https://github.com/aquasecurity/trivy/blob/main/docs/guide/scanner/misconfiguration/index.md), never the shell in
+  # its RUN lines, so it is never more than partial for the Dockerfile lint
+  - id: trivy-dockerfile
+    categories: [dockerfile-lint]
+    languages: [any]
+    actions: [aquasecurity/trivy-action]
+    commands: [trivy config, trivy conf]
+    commandFails: never
+    actionFails: never
+    onlyWithInputs:
+      scan-type: [config, conf]
+    partialWhy: Trivy config checks Dockerfile security settings, not the shell in RUN lines; hadolint adds that.
+  # Plan P Task 3: licence findings. https://github.com/aquasecurity/trivy/blob/main/docs/guide/scanner/license.md
+  # (`--scanners license`; licences are classified into severities) and the exit-code table in others.md above
+  # (licence findings count). The image, filesystem, repository and root filesystem scans take it.
+  - id: trivy-license
+    categories: [licences]
+    languages: [any]
+    actions: [aquasecurity/trivy-action]
+    commands: [trivy fs, trivy filesystem, trivy repo, trivy repository, trivy rootfs, trivy image, trivy i]
+    onlyWithFlagValue: { flag: --scanners, input: scanners, contains: license }
+    # DoD G11 (reviews/dod/2026-10-29/g11-licences.md, Trivy 0.76.0): a licence Trivy can't classify gets the UNKNOWN
+    # severity, forbidden ones CRITICAL and restricted ones HIGH, so a --severity / -s / `severity:` list without all
+    # three hides some of them and the run exits 0 (https://github.com/aquasecurity/trivy/blob/main/docs/guide/scanner/license.md,
+    # "Severity"; the default is every severity). TRIVY_SEVERITY does the same from the environment (softEnv).
+    partialWithFlagValue:
+      flags: [--severity, -s]
+      input: severity
+      needsAll: [unknown, high, critical]
+      grammar: trivy
+      why: The Trivy licence scan here reports only some severities (UNKNOWN for licences it can't classify, HIGH for restricted and CRITICAL for forbidden ones are all needed), so the others never fail the run.
+    commandFails: flag
+    notWithFlags: [--download-db-only, --download-java-db-only]
+    softEnv: [TRIVY_EXIT_CODE, TRIVY_SCANNERS, TRIVY_DOWNLOAD_DB_ONLY, TRIVY_DOWNLOAD_JAVA_DB_ONLY, TRIVY_CONFIG, TRIVY_SEVERITY]
+    configFiles: [trivy.yaml]
+    configFlag: --config
+    failFlags: [--exit-code]
+    softFlags: [--exit-code=0]
+    actionFails: input
+    failInputs:
+      exit-code: ['+']
+    softInputs:
+      exit-code: ['0']
+    skipUnless:
+      scan-type: [image, fs, filesystem, repo, repository, rootfs]
+    requireInputs:
+      unset: [trivy-config]
+      why: The Trivy action reads a trivy.yaml here that can change what it scans and when it fails, and pipegen doesn't read that file.
+  # CLI: https://github.com/anchore/grype/blob/main/cmd/grype/cli/options/grype.go (--fail-on / -f, empty by default)
+  # Action: https://github.com/anchore/scan-action/blob/main/action.yml (fail-build default "true") and its bundled
+  # code (`failBuild = failBuild.toLowerCase() === "true"`, an empty value means "true"): anything else is soft
+  # Plan P Task 3 (ruling PB3): grype by target. Sources: https://oss.anchore.com/docs/reference/grype/cli/ (an image,
+  # or dir:, file:, sbom:, purl:, cpes:, …; --from picks the source; `grype db`, `config` and `explain` don't scan).
+  # A folder, file or SBOM is a dependency scan; an image an image scan. The action scans `image`, `path` or `sbom`,
+  # and its `config` input replaces grype's config file, which can ignore findings.
+  - id: grype
+    categories: [deps]
+    languages: [any]
+    actions: [anchore/scan-action]
+    commands: [grype]
+    excludes: [grype version, grype db, grype config, grype explain, grype completion, grype help]
+    scanTarget: folder
+    commandFails: flag
+    failFlags: [--fail-on, -f]
+    softUnless:
+      fail-build: ['true']
+    skipInputs:
+      image: ['*']
+    requireInputs:
+      unset: [config]
+      why: The scan action reads a grype config file here that can ignore findings, and pipegen doesn't read that file.
+  # Plan P Task 3 (PB3): an image source is an image scan (https://oss.anchore.com/docs/reference/grype/cli/; the
+  # action's `image` input: https://github.com/anchore/scan-action/blob/main/action.yml)
+  - id: grype-image
+    categories: [image-scan]
+    languages: [any]
+    actions: [anchore/scan-action]
+    commands: [grype]
+    excludes: [grype version, grype db, grype config, grype explain, grype completion, grype help]
+    scanTarget: image
+    commandFails: flag
+    failFlags: [--fail-on, -f]
+    softUnless:
+      fail-build: ['true']
+    onlyWithInputs:
+      image: ['*']
+    requireInputs:
+      unset: [config]
+      why: The scan action reads a grype config file here that can ignore findings, and pipegen doesn't read that file.
+  - id: docker-build
+    categories: [image-build]
+    languages: [any]
+    actions: [docker/build-push-action]
+    commands: [docker build, docker buildx build]
+  # P55 (batch B): `docker compose build` (and `docker-compose build`, `docker compose up --build`) builds the images of the
+  # Compose file's services that have a `build:` (https://docs.docker.com/reference/cli/docker/compose/build/). pipegen
+  # reads these itself (global flags such as -f come before the subcommand); the row is partial because it can't tell
+  # which images are built for the deploy.
+  - id: docker-compose-build
+    categories: [image-build]
+    languages: [any]
+    commands: [docker compose build, docker-compose build]
+    commandFails: never
+    partialWhy: It builds the images a Compose file defines, and pipegen can't tell whether they are the ones that get scanned and deployed.
+  # CLI: https://github.com/bridgecrewio/checkov/blob/main/docs/2.Basics/CLI%20Command%20Reference.md (-s, --soft-fail)
+  # Action: https://github.com/bridgecrewio/checkov/blob/main/github_action_resources/entrypoint.sh (adds --soft-fail
+  # only when soft_fail is "true")
+  - id: checkov
+    categories: [iac]
+    languages: [any]
+    actions: [bridgecrewio/checkov-action]
+    commands: [checkov]
+    softFlags: [--soft-fail, -s]
+    softInputs:
+      soft_fail: ['true']
+  # CLI: https://github.com/aquasecurity/tfsec/blob/master/internal/app/tfsec/cmd/flags.go (--soft-fail, -s)
+  # Action: https://github.com/aquasecurity/tfsec-action/blob/master/entrypoint.sh (`if [ -n "${INPUT_SOFT_FAIL}" ]`:
+  # any non-empty soft_fail, even "false", adds --soft-fail)
+  - id: tfsec
+    categories: [iac]
+    languages: [any]
+    actions: [aquasecurity/tfsec-action]
+    commands: [tfsec]
+    softFlags: [--soft-fail, -s]
+    softInputs:
+      soft_fail: ['*']
+  # Plan P Task 3: https://github.com/stackrox/kube-linter/blob/main/README.md ("When a lint check fails, KubeLinter
+  # reports recommendations ... and returns a non-zero exit code"). Action:
+  # https://github.com/stackrox/kube-linter-action/blob/main/action.yml (runs `kube-linter … lint … | tee` in a bash
+  # step, whose pipefail keeps kube-linter's exit code)
+  - id: kube-linter
+    categories: [iac]
+    languages: [any]
+    actions: [stackrox/kube-linter-action]
+    commands: [kube-linter lint]
+  # Plan P Task 3: https://github.com/open-policy-agent/conftest/blob/master/docs/options.md ("By default, Conftest only
+  # returns an exit code of 1 when a policy has failed") and
+  # https://github.com/open-policy-agent/conftest/blob/master/internal/commands/test.go (--no-fail: "Return an exit
+  # code of zero even if a policy fails")
+  - id: conftest
+    categories: [iac]
+    languages: [any]
+    commands: [conftest test]
+    softFlags: [--no-fail]
+  # ---------- running app (DAST) ----------
+  # https://github.com/zaproxy/action-baseline/blob/master/action.yml (fail_action default false; same in
+  # action-full-scan and action-api-scan)
+  # Plan P Task 3: the scripts exit 1 on a FAIL and 2 on a WARN, and -I "do not return failure on warning"
+  # (https://github.com/zaproxy/zaproxy/blob/main/docker/zap-baseline.py and zap-api-scan.py); with ZAP's default
+  # rules, which only warn, -I means no failure. Also read in the actions' cmd_options.
+  - id: zap
+    categories: [dast]
+    languages: [any]
+    actions: [zaproxy/action-baseline, zaproxy/action-full-scan, zaproxy/action-api-scan]
+    commands: [zap-baseline.py, zap-full-scan.py, zap-api-scan.py]
+    softFlags: [-I]
+    actionFails: input
+    failInputs:
+      fail_action: ['true']
+  # Plan P Task 3: the API scan against the spec (sources as for zap above;
+  # https://github.com/zaproxy/action-api-scan/blob/master/action.yml: fail_action default false)
+  - id: zap-api
+    categories: [api-dast]
+    languages: [any]
+    actions: [zaproxy/action-api-scan]
+    commands: [zap-api-scan.py]
+    softFlags: [-I]
+    actionFails: input
+    failInputs:
+      fail_action: ['true']
+  # Plan P Task 3: https://github.com/schemathesis/schemathesis/blob/master/docs/reference/cli.md ("Exit codes": 1 when
+  # a check failed). Action: https://github.com/schemathesis/action/blob/main/action.yml (runs `schemathesis run`
+  # under set -euo pipefail, so a failure fails the step)
+  - id: schemathesis
+    categories: [api-dast]
+    languages: [any]
+    actions: [schemathesis/action]
+    commands: [schemathesis run, st run]
+  # Plan P Task 3: https://github.com/projectdiscovery/nuclei/blob/dev/README.md (no option makes a finding fail the
+  # run). Action: https://github.com/projectdiscovery/nuclei-action/blob/main/src/index.js (fails only on an error;
+  # install-only: true scans nothing)
+  - id: nuclei
+    categories: [dast]
+    languages: [any]
+    actions: [projectdiscovery/nuclei-action]
+    commands: [nuclei]
+    commandFails: never
+    actionFails: never
+    skipInputs:
+      install-only: ['true']
+    partialWhy: Nuclei reports what it finds but exits with success, so it can't block anything.
+  # ---------- tests ----------
+  # --listTests, --showConfig and --collectTests print or collect and exit without running tests (https://jestjs.io/docs/cli)
+  - id: jest
+    categories: [unit-tests, full-tests]
+    languages: [node]
+    commands: [jest]
+    notWithFlags: [--listTests, --showConfig, --collectTests]
+  - id: vitest
+    categories: [unit-tests, full-tests]
+    languages: [node]
+    commands: [vitest]
+  - id: mocha
+    categories: [unit-tests, full-tests]
+    languages: [node]
+    commands: [mocha]
+  # Fix round 1: -list prints the matching tests and runs none
+  # (https://github.com/golang/go/blob/master/src/cmd/go/internal/test/test.go)
+  - id: go-test
+    categories: [unit-tests, full-tests]
+    languages: [go]
+    commands: [go test]
+    notWithFlags: [-list, --list]
+  # ---------- test coverage (Plan P Task 3, ruling PS17: partial until a minimum is found) ----------
+  # Plan P Task 4 (PB4 b), checked 2026-10-27: a run is covered only with a minimum above 0, from a flag (minimumFlags,
+  # minimumSwitches here) or from a config file mapCoverage reads (src/audit/config-checks.ts). Flags:
+  # vitest https://vitest.dev/config/coverage (--coverage.thresholds.lines|functions|branches|statements=<number>);
+  # jest https://jestjs.io/docs/configuration (coverageThreshold; a positive number is a minimum percentage; the CLI flag
+  # takes the same object as JSON); pytest-cov https://pytest-cov.readthedocs.io/en/latest/config.html ("--cov-fail-under:
+  # Fail if the total coverage is less than MIN"); coverage.py https://coverage.readthedocs.io/en/latest/config.html
+  # ([report] fail_under; the config file can be swapped with --rcfile or COVERAGE_RCFILE, so that env var is a softEnv);
+  # c8 https://github.com/bcoe/c8/blob/main/README.md (`c8 --check-coverage --lines 100 npm test`; its default
+  # thresholds aren't documented there, so --check-coverage counts only with a threshold flag). Fix round 1: a flag that
+  # swaps the config file (jest --config/-c/--rootDir/--projects; vitest --config/-c/--root/-r; pytest --cov-config, -c and
+  # --rootdir; coverage --rcfile) is a softFlag, so the run stays partial; a minimum flag set to 0 is "off" (the CLI value wins
+  # over config, as in pytest-cov's `if self.options.cov_fail_under is None`); c8, nyc and coverage run read flags only
+  # before the command they wrap.
+  # https://vitest.dev/guide/coverage (--coverage, or --coverage.enabled; false turns it off)
+  - id: vitest-cov
+    categories: [coverage]
+    languages: [node]
+    commands: [vitest]
+    onlyWithFlags: [--coverage, --coverage.enabled]
+    notWithFlags: [--coverage=false, --coverage.enabled=false, --no-coverage]
+    commandFails: never
+    partialWhy: This run measures test coverage, but pipegen hasn't checked for a minimum, so a drop in coverage may not fail it.
+    softFlags: [--config, -c, --root, -r]
+    minimumFlags: [--coverage.thresholds.lines, --coverage.thresholds.functions, --coverage.thresholds.branches, --coverage.thresholds.statements]
+  # https://jestjs.io/docs/cli (--coverage, alias --collectCoverage; --listTests, --showConfig and --collectTests run no tests)
+  - id: jest-cov
+    categories: [coverage]
+    languages: [node]
+    commands: [jest]
+    onlyWithFlags: [--coverage, --collectCoverage]
+    notWithFlags: [--coverage=false, --collectCoverage=false, --no-coverage, --listTests, --showConfig, --collectTests]
+    commandFails: never
+    partialWhy: This run measures test coverage, but pipegen hasn't checked for a minimum, so a drop in coverage may not fail it.
+    softFlags: [--config, -c, --rootDir, --projects]
+    minimumFlags: [--coverageThreshold]
+  # https://github.com/bcoe/c8/blob/main/README.md (c8 runs a command and measures its coverage)
+  - id: c8
+    categories: [coverage]
+    languages: [node]
+    commands: [c8]
+    commandFails: never
+    partialWhy: This run measures test coverage, but pipegen hasn't checked for a minimum, so a drop in coverage may not fail it.
+    minimumLeading: true
+    minimumSwitches: [--check-coverage]
+  # https://github.com/istanbuljs/nyc/blob/main/README.md (nyc runs a command and measures its coverage; it is also a
+  # wrapper, so the command it runs is read too)
+  - id: nyc
+    categories: [coverage]
+    languages: [node]
+    commands: [nyc]
+    commandFails: never
+    partialWhy: This run measures test coverage, but pipegen hasn't checked for a minimum, so a drop in coverage may not fail it.
+    minimumLeading: true
+    minimumSwitches: [--check-coverage]
+  # https://pytest-cov.readthedocs.io/en/latest/config.html (--cov[=SOURCE]; --no-cov turns it off)
+  - id: pytest-cov
+    categories: [coverage]
+    languages: [python]
+    commands: [pytest]
+    onlyWithFlags: [--cov]
+    notWithFlags: [--no-cov]
+    commandFails: never
+    partialWhy: This run measures test coverage, but pipegen hasn't checked for a minimum, so a drop in coverage may not fail it.
+    softFlags: [--cov-config, -c, --rootdir]
+    minimumFlags: [--cov-fail-under]
+    softEnv: [COVERAGE_RCFILE]
+  # https://coverage.readthedocs.io/en/latest/cmd.html (coverage run measures, coverage report reports)
+  - id: coverage-py
+    categories: [coverage]
+    languages: [python]
+    commands: [coverage run, coverage report]
+    commandFails: never
+    partialWhy: This run measures test coverage, but pipegen hasn't checked for a minimum, so a drop in coverage may not fail it.
+    softFlags: [--rcfile]
+    minimumLeading: true
+    minimumFlags: [--fail-under]
+    softEnv: [COVERAGE_RCFILE]
+  # https://github.com/golang/go/blob/master/src/cmd/go/internal/test/test.go (-cover; -covermode, -coverpkg and
+  # -coverprofile each set -cover)
+  - id: go-cover
+    categories: [coverage]
+    languages: [go]
+    commands: [go test]
+    onlyWithFlags: [-cover, -covermode, -coverpkg, -coverprofile, --cover, --covermode, --coverpkg, --coverprofile]
+    notWithFlags: [-list, --list]
+    commandFails: never
+    partialWhy: This run measures test coverage, but pipegen hasn't checked for a minimum, so a drop in coverage may not fail it.
+  # ---------- dependency updates (Plan P Task 4) ----------
+  # Renovate run by the repo itself: the sign that the Renovate config is used (the hosted app can't be seen with read
+  # access). It covers no need by itself: mapCoverage's update-config check (src/audit/config-checks.ts) reads the repo's
+  # config and uses a clean run of this tool as the sign that Renovate is in use. https://github.com/renovatebot/github-action/blob/main/action.yml (input `configurationFile` swaps the config
+  # file); https://docs.renovatebot.com/self-hosted-configuration/ (env RENOVATE_CONFIG_FILE swaps it too)
+  - id: renovate
+    categories: [update-config]
+    languages: [any]
+    actions: [renovatebot/github-action]
+    commands: [renovate]
+    requireInputs:
+      unset: [configurationFile]
+      why: This Renovate run uses a config file named in the workflow, which pipegen doesn't read.
+    softEnv: [RENOVATE_CONFIG_FILE]
+  # ---------- lint and format ----------
+  # hook: https://github.com/pre-commit/mirrors-eslint/blob/main/.pre-commit-hooks.yaml (id eslint, entry eslint)
+  - id: eslint
+    categories: [lint, format-lint]
+    languages: [node]
+    commands: [eslint]
+    precommitHooks:
+      - repo: https://github.com/pre-commit/mirrors-eslint
+        ids: [eslint]
+  # hooks: https://github.com/biomejs/pre-commit/blob/main/.pre-commit-hooks.yaml (biome ci / check / format / lint)
+  # `biome format` only formats: it is the biome-format entry below, never lint (fix round 1, I1)
+  # Plan P Task 3: the commands that lint nothing (https://biomejs.dev/reference/cli/: version, upgrade, rage, start,
+  # stop, init, lsp-proxy, migrate, search, explain, clean) are left out too
+  - id: biome
+    categories: [lint, format-lint]
+    languages: [node]
+    commands: [biome]
+    excludes: [biome format, biome version, biome upgrade, biome rage, biome start, biome stop, biome init, biome lsp-proxy, biome migrate, biome search,
+      biome explain, biome clean]
+    precommitHooks:
+      - repo: https://github.com/biomejs/pre-commit
+        ids: [biome-ci, biome-check, biome-lint]
+  # P55 (batch B): XO (https://github.com/xojs/xo) is ESLint with a fixed rule set, style rules included: `xo` exits 1
+  # on a lint error; --fix writes the fixes, --stdin reads one file and --print-config prints, so those don't count
+  - id: xo
+    categories: [lint, format-lint]
+    languages: [node]
+    commands: [xo]
+    notWithFlags: [--fix, --stdin, --print-config]
+  - id: biome-format
+    categories: [format-lint]
+    languages: [node]
+    commands: [biome format]
+    precommitHooks:
+      - repo: https://github.com/biomejs/pre-commit
+        ids: [biome-format]
+  # https://github.com/astral-sh/ruff/blob/main/docs/linter.md (--exit-zero)
+  # hooks: https://github.com/astral-sh/ruff-pre-commit/blob/main/.pre-commit-hooks.yaml (ruff-check and the legacy
+  # alias ruff: `ruff check --force-exclude`; ruff-format: `ruff format --force-exclude`)
+  # The old URL https://github.com/charliermarsh/ruff-pre-commit redirects to astral-sh and serves the same hooks
+  # (checked 2026-10-27). `ruff format` only formats: it is the ruff-format entry below, never lint (fix round 1, I1).
+  - id: ruff
+    categories: [lint, format-lint]
+    languages: [python]
+    actions: [astral-sh/ruff-action]
+    commands: [ruff]
+    excludes: [ruff format]
+    softFlags: [--exit-zero]
+    precommitHooks:
+      - repo: https://github.com/astral-sh/ruff-pre-commit
+        ids: [ruff, ruff-check]
+      - repo: https://github.com/charliermarsh/ruff-pre-commit
+        ids: [ruff, ruff-check]
+  - id: ruff-format
+    categories: [format-lint]
+    languages: [python]
+    commands: [ruff format]
+    precommitHooks:
+      - repo: https://github.com/astral-sh/ruff-pre-commit
+        ids: [ruff-format]
+      - repo: https://github.com/charliermarsh/ruff-pre-commit
+        ids: [ruff-format]
+  # https://github.com/PyCQA/flake8/blob/main/src/flake8/main/options.py (--exit-zero)
+  # hook: https://github.com/PyCQA/flake8/blob/main/.pre-commit-hooks.yaml (id flake8, entry flake8)
+  - id: flake8
+    categories: [lint, format-lint]
+    languages: [python]
+    commands: [flake8]
+    softFlags: [--exit-zero]
+    precommitHooks:
+      - repo: https://github.com/PyCQA/flake8
+        ids: [flake8]
+  # https://github.com/pylint-dev/pylint/blob/main/pylint/lint/run.py (exit_zero)
+  - id: pylint
+    categories: [lint]
+    languages: [python]
+    commands: [pylint]
+    softFlags: [--exit-zero]
+  # https://github.com/golangci/golangci-lint/blob/main/pkg/commands/flagsets.go (issues-exit-code)
+  # Plan P Task 3: `golangci-lint fmt` only formats (the golangci-lint-fmt entry below), and the other commands in
+  # https://github.com/golangci/golangci-lint/tree/main/pkg/commands (cache, config, custom, formatters, help,
+  # linters, migrate, version) lint nothing
+  - id: golangci-lint
+    categories: [lint, format-lint]
+    languages: [go]
+    actions: [golangci/golangci-lint-action]
+    commands: [golangci-lint]
+    excludes: [golangci-lint fmt, golangci-lint cache, golangci-lint config, golangci-lint custom, golangci-lint formatters, golangci-lint help,
+      golangci-lint linters, golangci-lint migrate, golangci-lint version, golangci-lint completion]
+    softFlags: [--issues-exit-code=0]
+  # Plan P Task 3: https://github.com/golangci/golangci-lint/blob/main/pkg/goformat/runner.go (with --diff, -d or
+  # --diff-colored, a file that needs formatting sets exit code 1; without, fmt rewrites files)
+  - id: golangci-lint-fmt
+    categories: [format]
+    languages: [go]
+    commands: [golangci-lint fmt]
+    onlyWithFlags: [--diff, -d, --diff-colored]
+  # Plan P Task 3: https://github.com/golang/go/blob/master/src/cmd/gofmt/gofmt.go (-d shows diffs and exits 1 when a
+  # file's formatting differs; -l only lists those files and exits 0)
+  - id: gofmt-diff
+    categories: [format]
+    languages: [go]
+    commands: [gofmt]
+    onlyWithFlags: [-d]
+  # Plan P Task 3: gofmt -l exits 0 whatever it lists (https://github.com/golang/go/blob/master/src/cmd/gofmt/gofmt.go)
+  - id: gofmt-list
+    categories: [format]
+    languages: [go]
+    commands: [gofmt]
+    onlyWithFlags: [-l]
+    commandFails: never
+    partialWhy: The gofmt -l command lists files that need formatting but exits with success, so it can't block anything.
+  # Plan P Task 3 (ruling PS15): https://github.com/oxc-project/website/blob/main/src/docs/guide/usage/linter/quickstart.md
+  # ("Fail CI reliably": warnings don't fail the run; --deny-warnings or --max-warnings make them) and
+  # https://github.com/oxc-project/website/blob/main/src/docs/guide/usage/linter/generated-cli.md (--quiet reports
+  # errors only; --silent shows nothing)
+  - id: oxlint
+    categories: [lint]
+    languages: [node]
+    commands: [oxlint]
+    commandFails: flag
+    failFlags: [--deny-warnings, --max-warnings]
+    softFlags: [--quiet, --silent]
+  # Plan P Task 3 (PS15): https://github.com/oxc-project/website/blob/main/src/docs/guide/usage/linter/type-aware.md
+  # (`--type-aware --type-check` "can replace a separate tsc --noEmit step in CI"); TypeScript diagnostics are
+  # errors (https://github.com/oxc-project/oxc/blob/main/crates/oxc_linter/src/tsgolint.rs: OxcDiagnostic::error),
+  # and --type-check without type-aware linting is refused (apps/oxlint/src/lint.rs)
+  - id: oxlint-type-check
+    categories: [type-check]
+    languages: [node]
+    commands: [oxlint]
+    onlyWithFlags: [--type-check, --type-check-only]
+    softFlags: [--silent]
+  - id: prettier
+    categories: [format-lint]
+    languages: [node]
+    commands: [prettier]
+  # hooks: https://github.com/psf/black-pre-commit-mirror/blob/main/.pre-commit-hooks.yaml (black, black-jupyter: entry
+  # black); https://github.com/psf/black/blob/main/.pre-commit-hooks.yaml has the same two (checked 2026-10-27)
+  - id: black
+    categories: [format-lint]
+    languages: [python]
+    commands: [black]
+    precommitHooks:
+      - repo: https://github.com/psf/black-pre-commit-mirror
+        ids: [black, black-jupyter]
+      - repo: https://github.com/psf/black
+        ids: [black, black-jupyter]
+  - id: lint-staged
+    categories: [format-lint]
+    languages: [node, unknown]
+    commands: [lint-staged]
+  # ---------- format checks (Plan P Task 3) ----------
+  # https://github.com/prettier/prettier/blob/main/docs/cli.md (--check / -c and --list-different / -l exit 1 when a
+  # file isn't formatted; without them prettier prints or writes). Fix round 1: --support-info, --find-config-path and
+  # --file-info print information and check nothing (same page).
+  - id: prettier-check
+    categories: [format]
+    languages: [node]
+    commands: [prettier]
+    onlyWithFlags: [--check, -c, --list-different, -l]
+    notWithFlags: [--write, -w, --support-info, --find-config-path, --file-info]
+  # https://github.com/astral-sh/ruff/blob/main/docs/formatter.md ("Exit codes": ruff format --check exits 1 when a file
+  # would be formatted) and https://github.com/astral-sh/ruff/blob/main/crates/ruff/src/args.rs (--diff: "exit with a
+  # non-zero status code and the difference"); --stdin-filename formats standard input, not the files (fix round 1)
+  - id: ruff-format-check
+    categories: [format]
+    languages: [python]
+    commands: [ruff format]
+    onlyWithFlags: [--check, --diff]
+    notWithFlags: [--stdin-filename]
+  # https://github.com/psf/black/blob/main/docs/usage_and_configuration/the_basics.md (--check: "code 1 if some files
+  # would be reformatted"; --diff alone only prints)
+  - id: black-check
+    categories: [format]
+    languages: [python]
+    commands: [black]
+    onlyWithFlags: [--check]
+  # https://biomejs.dev/reference/cli/ (biome ci "runs formatting checks, linting checks, and assist actions in CI
+  # without modifying files"; biome check checks formatting too; --write/--fix apply the changes,
+  # --formatter-enabled=false turns formatting off, --staged checks staged files only). A file that isn't formatted
+  # fails the run: https://github.com/biomejs/biome/blob/main/crates/biome_cli/tests/snapshots/main_commands_format/print_verbose.snap
+  # ("Some errors were emitted while running checks").
+  - id: biome-ci
+    categories: [format]
+    languages: [node]
+    commands: [biome ci, biome check]
+    notWithFlags: [--write, --fix, --apply, --apply-unsafe, --formatter-enabled=false, --staged, --watch, --stdin-file-path]
+  # Plan P Task 3 (PS12): `biome format` without --write checks formatting and fails on a file that isn't formatted
+  # (https://biomejs.dev/reference/cli/ and the snapshot above); the biome-format entry keeps the format-lint hook
+  - id: biome-format-check
+    categories: [format]
+    languages: [node]
+    commands: [biome format]
+    notWithFlags: [--write, --fix, --staged, --watch, --stdin-file-path]
+  # ---------- type checks (Plan P Task 3) ----------
+  # tsc exits 1 or 2 when it reports a diagnostic
+  # (https://github.com/microsoft/typescript-go/blob/main/internal/execute/tsc/emit.go: ExitStatusDiagnosticsPresent_*);
+  # --init, --showConfig, --listFilesOnly, --all, --watch / -w, --noCheck and --build --clean check nothing
+  # (https://www.typescriptlang.org/docs/handbook/compiler-options.html). vue-tsc and tsgo take tsc's flags.
+  # svelte-check: https://github.com/sveltejs/language-tools/blob/master/packages/svelte-check/README.md (errors exit
+  # with an error code; --fail-on-warnings adds warnings). astro check: https://docs.astro.build/en/reference/cli-reference/
+  # ("If any errors are found the process will exit with a code of 1"). Fix round 1: TypeScript reads option names in
+  # any letter case and with one or two dashes (https://github.com/microsoft/TypeScript/blob/main/src/compiler/commandLineParser.ts:
+  # names are looked up lowercased; `-noCheck`, `--nocheck` and `-NOCHECK` are --noCheck), so flagsAnyCase.
+  - id: tsc
+    categories: [type-check]
+    languages: [node]
+    commands: [tsc, tsgo, vue-tsc, svelte-check, astro check]
+    notWithFlags: [--init, --showConfig, --listFilesOnly, --all, --watch, -w, --noCheck, --clean, --version, -v, --help, -h]
+    flagsAnyCase: true
+  # https://github.com/python/mypy/blob/master/mypy/main.py (exit code 1 when it reports errors, 2 on a blocking one)
+  # hook: https://github.com/pre-commit/mirrors-mypy/blob/main/.pre-commit-hooks.yaml (id mypy, entry mypy)
+  - id: mypy
+    categories: [type-check]
+    languages: [python]
+    commands: [mypy]
+    precommitHooks:
+      - repo: https://github.com/pre-commit/mirrors-mypy
+        ids: [mypy]
+  # https://github.com/microsoft/pyright/blob/main/docs/command-line.md ("Pyright Exit Codes": 1 when errors are
+  # reported; --watch keeps running; --createstub and --verifytypes do something else)
+  # hook: https://github.com/RobertCraigie/pyright-python/blob/main/.pre-commit-hooks.yaml (id pyright, entry pyright)
+  - id: pyright
+    categories: [type-check]
+    languages: [python]
+    commands: [pyright]
+    notWithFlags: [--watch, -w, --createstub, --verifytypes]
+    precommitHooks:
+      - repo: https://github.com/RobertCraigie/pyright-python
+        ids: [pyright]
+  # https://github.com/DetachHead/basedpyright/blob/main/docs/configuration/command-line.md (pyright's exit codes;
+  # --writebaseline writes the errors to the baseline file)
+  - id: basedpyright
+    categories: [type-check]
+    languages: [python]
+    commands: [basedpyright]
+    notWithFlags: [--watch, -w, --createstub, --verifytypes, --writebaseline]
+  # ---------- dead code and duplication (Plan P Task 3) ----------
+  # https://github.com/webpro-nl/knip/blob/main/packages/docs/src/content/docs/reference/cli.md (--max-issues: "Maximum
+  # number of issues before non-zero exit code. Default: 0"; --no-exit-code; --watch keeps running). Ruling PS13:
+  # any --max-issues counts as soft.
+  - id: knip
+    categories: [dead-code]
+    languages: [node]
+    commands: [knip]
+    softFlags: [--no-exit-code, --max-issues]
+    notWithFlags: [--watch, -w]
+  # https://github.com/fredrikaverpil/creosote/blob/main/src/creosote/cli.py (returns 1 when it finds unused dependencies)
+  - id: creosote
+    categories: [dead-code]
+    languages: [python]
+    commands: [creosote]
+  # https://github.com/osprey-oss/deptry/blob/main/python/deptry/core.py (`sys.exit(bool(violations))`)
+  - id: deptry
+    categories: [dead-code]
+    languages: [python]
+    commands: [deptry]
+  # https://github.com/jendrikseipp/vulture/blob/main/README.md ("Exit codes": 3 when dead code is found;
+  # --make-whitelist prints a whitelist instead)
+  - id: vulture
+    categories: [dead-code]
+    languages: [python]
+    commands: [vulture]
+    notWithFlags: [--make-whitelist]
+  # https://github.com/golang/go/blob/master/src/cmd/go/internal/modcmd/tidy.go (-diff: "exits with a non-zero code if
+  # the diff is not empty"; without it, tidy rewrites go.mod)
+  - id: go-mod-tidy
+    categories: [dead-code]
+    languages: [go]
+    commands: [go mod tidy]
+    onlyWithFlags: [-diff, --diff]
+  # https://github.com/kucherenko/jscpd/blob/master/README.md (exits non-zero only past a --threshold); duplication is a
+  # warning check, so a run is enough
+  - id: jscpd
+    categories: [duplication]
+    languages: [any]
+    commands: [jscpd]
+    commandFails: never
+    partialWhy: The jscpd check reports copy-pasted code and fails only past a set threshold.
+  # ---------- Dockerfile and workflow lint (Plan P Task 3) ----------
+  # https://github.com/hadolint/hadolint/blob/master/README.md (fails on any finding: --failure-threshold defaults to
+  # info; --no-fail never fails; -t / --failure-threshold none or ignore). Action:
+  # https://github.com/hadolint/hadolint-action/blob/master/action.yml (no-fail default 'false'; failure-threshold
+  # default 'info'; config names a config file, which can set no-fail). hooks:
+  # https://github.com/hadolint/hadolint/blob/master/.pre-commit-hooks.yaml (hadolint, hadolint-docker)
+  # Fix round 1: optparse-applicative takes a short option's value attached (-tnone), and the README's environment
+  # variables (HADOLINT_NOFAIL, HADOLINT_FAILURE_THRESHOLD) and ./.hadolint.yaml (read first; it can set no-fail and
+  # failure-threshold) can turn failure off (ruling P8)
+  - id: hadolint
+    categories: [dockerfile-lint]
+    languages: [any]
+    actions: [hadolint/hadolint-action]
+    commands: [hadolint]
+    softFlags: [--no-fail, --failure-threshold=none, --failure-threshold=ignore, -t=none, -t=ignore, -tnone, -tignore]
+    softInputs:
+      no-fail: ['true']
+      failure-threshold: [none, ignore]
+    softEnv: [HADOLINT_NOFAIL, HADOLINT_FAILURE_THRESHOLD]
+    configFiles: [.hadolint.yaml, .hadolint.yml]
+    requireInputs:
+      unset: [config]
+      why: The hadolint action reads a config file here that can turn failures off, and pipegen doesn't read that file.
+    precommitHooks:
+      - repo: https://github.com/hadolint/hadolint
+        ids: [hadolint, hadolint-docker]
+  # https://github.com/rhysd/actionlint/blob/main/docs/usage.md ("Exit status": 1 when a problem is found). Action:
+  # https://github.com/raven-actions/actionlint/blob/main/action.yml (fails only when fail-on-error is 'true', its
+  # default). hooks: https://github.com/rhysd/actionlint/blob/main/.pre-commit-hooks.yaml. Fix round 1: -init-config
+  # writes a config and checks nothing (docs/usage.md)
+  - id: actionlint
+    categories: [workflow-lint]
+    languages: [any]
+    actions: [raven-actions/actionlint]
+    commands: [actionlint]
+    notWithFlags: [-init-config]
+    softUnless:
+      fail-on-error: ['true']
+    precommitHooks:
+      - repo: https://github.com/rhysd/actionlint
+        ids: [actionlint, actionlint-docker, actionlint-system]
+  # https://github.com/zizmorcore/zizmor/blob/main/docs/usage.md ("Exit codes": 11-14 for findings, but not with
+  # --no-exit-codes or --format=sarif, nor when --fix fixes all). Action:
+  # https://github.com/zizmorcore/zizmor-action/blob/main/action.yml (advanced-security defaults to "true", which runs
+  # --format=sarif: action.sh), so the action fails only with advanced-security: false
+  - id: zizmor
+    categories: [workflow-lint]
+    languages: [any]
+    actions: [zizmorcore/zizmor-action]
+    commands: [zizmor]
+    softFlags: [--no-exit-codes, --format=sarif, --fix]
+    actionFails: input
+    failInputs:
+      advanced-security: ['false']
+  # https://github.com/boostsecurityio/poutine/blob/main/README.md (--fail-on-violation: "Exit with a non-zero code
+  # (10) when violations are found"; without it, it reports only)
+  - id: poutine
+    categories: [workflow-lint]
+    languages: [any]
+    commands: [poutine]
+    commandFails: flag
+    failFlags: [--fail-on-violation]
+  # https://github.com/suzuki-shunsuke/ghalint/blob/main/README.md ("If there are violatation ghalint outputs error logs
+  # and fails")
+  - id: ghalint
+    categories: [workflow-lint]
+    languages: [any]
+    commands: [ghalint run, ghalint run-action, ghalint act]
+  # https://github.com/suzuki-shunsuke/pinact/blob/main/docs/check.md (--check or --fix=false: check without editing)
+  # and https://github.com/suzuki-shunsuke/pinact/blob/main/docs/exit_codes.md (1 when something needs pinning with
+  # --fix=false; 0 when pinact fixed it)
+  - id: pinact
+    categories: [workflow-pin-check]
+    languages: [any]
+    commands: [pinact run]
+    onlyWithFlags: [--check, --fix=false]
+  # https://github.com/sethvargo/ratchet/blob/main/README.md (lint: "exiting with a non-zero error code when entries are
+  # not pinned")
+  - id: ratchet
+    categories: [workflow-pin-check]
+    languages: [any]
+    commands: [ratchet lint]
+  # https://github.com/zizmorcore/zizmor/blob/main/docs/audits.md (unpinned-uses: hash pins for all actions by default
+  # only from v1.20.0, and a zizmor config can allow tag pins), so zizmor is never more than partial here
+  - id: zizmor-pins
+    categories: [workflow-pin-check]
+    languages: [any]
+    actions: [zizmorcore/zizmor-action]
+    commands: [zizmor]
+    commandFails: never
+    actionFails: never
+    partialWhy: Zizmor checks action pins, but a zizmor config or a version before v1.20.0 can allow tag pins, and pipegen doesn't check either.
+  # ---------- licences (Plan P Task 3) ----------
+  # https://github.com/actions/dependency-review-action/blob/main/README.md (allow-licenses / deny-licenses: the action
+  # fails on a pull request that adds a dependency with a licence outside the allow list or on the deny list; with
+  # neither it checks no licence; license-check: false turns it off; deny-licenses is deprecated but still an input in
+  # action.yml)
+  - id: dependency-review-licences
+    categories: [licences]
+    languages: [any]
+    actions: [actions/dependency-review-action]
+    onlyWithInputs:
+      allow-licenses: ['*']
+      deny-licenses: ['*']
+      config-file: ['*']
+    softInputs:
+      warn-only: ['true']
+    skipInputs:
+      license-check: ['false']
+    requireInputs:
+      unset: [config-file, base-ref, head-ref]
+      why: The dependency review action here reads its licence list from a config file or compares refs set in the workflow, which pipegen can't check.
+    availability: public-or-code-security
+    unavailableWhy: Dependency review works only on public repos and on organisation-owned private repos with GitHub Advanced Security, so here it checks nothing.
+  # https://github.com/EmbarkStudios/cargo-deny/blob/main/docs/src/cli/check.md ("By default, all checks will be
+  # performed, unless one or more checks are specified") and docs/src/checks/licenses/cfg.md ("Licenses not in this
+  # list are denied by default")
+  - id: cargo-deny-licences
+    categories: [licences]
+    languages: [other]
+    commands: [cargo deny check licenses, cargo-deny check licenses]
+  # cargo-deny's checks can follow its flags (https://github.com/EmbarkStudios/cargo-deny/blob/main/docs/src/cli/check.md),
+  # so pipegen can't tell which ones a plain `check` runs
+  - id: cargo-deny
+    categories: [licences]
+    languages: [other]
+    commands: [cargo deny check, cargo-deny check]
+    excludes: [cargo deny check licenses, cargo deny check advisories, cargo deny check bans, cargo deny check sources, cargo-deny check licenses,
+      cargo-deny check advisories, cargo-deny check bans, cargo-deny check sources]
+    commandFails: never
+    partialWhy: This cargo-deny run may not include its licence check (the checks can come after its flags), so pipegen can't tell whether licences are checked.
+  # https://github.com/anchore/grant/blob/main/cmd/grant/cli/command/check.go (non-compliant targets fail the run;
+  # --dry-run: "run check without returning non-zero exit code on violations")
+  - id: grant
+    categories: [licences]
+    languages: [any]
+    commands: [grant check]
+    softFlags: [--dry-run]
+  # https://github.com/fossas/fossa-cli/blob/master/docs/references/subcommands/test.md (exits 1 when there are issues);
+  # the issues come from FOSSA's server-side policy, which pipegen can't see
+  - id: fossa
+    categories: [licences]
+    languages: [any]
+    commands: [fossa test]
+    commandFails: never
+    partialWhy: FOSSA fails on the issues its server-side policy flags, and pipegen can't see whether that policy covers licences.
+  # ---------- git hooks run in CI ----------
+  - id: pre-commit
+    categories: [hooks-ci]
+    languages: [any]
+    actions: [pre-commit/action]
+    commands: [pre-commit run]
+  # P55 (batch B): prek is a drop-in for pre-commit (https://github.com/j178/prek: "prek run", the same
+  # .pre-commit-config.yaml, --all-files, --from-ref and --to-ref). Its action runs `prek run` unless install-only is
+  # true (https://github.com/j178/prek-action/blob/master/action.yml: extra-args default "--all-files", install-only
+  # default "false").
+  - id: prek
+    categories: [hooks-ci]
+    languages: [any]
+    actions: [j178/prek-action]
+    commands: [prek run]
+    skipInputs:
+      install-only: ['true']
+  - id: lefthook
+    categories: [hooks-ci]
+    languages: [any]
+    commands: [lefthook run]
+  - id: husky-hooks
+    categories: [hooks-ci]
+    languages: [any]
+    commands: [.husky/pre-commit]
+  # ---------- release jobs: egress (Plan P Task 3, ruling PB5, DEC #80) ----------
+  # https://github.com/bullfrogsec/bullfrog/blob/main/action.yml (egress-policy default "audit", which blocks nothing;
+  # enable-sudo default true) and README ("Why enable-sudo: false matters": root can bypass the filter; it "should be
+  # the first step of your job, and should be loaded on every separate job"); with api-token, the control plane's
+  # policy replaces egress-policy and enable-sudo: https://github.com/bullfrogsec/bullfrog/blob/main/action/src/policy.ts
+  # Fix round 1: `_dry-run-print-config: true` returns before the agent starts
+  # (https://github.com/bullfrogsec/bullfrog/blob/main/action/src/main.ts); dns-policy `any` lets any DNS request out
+  # (action.yml); README "Limitations": GitHub-hosted Ubuntu runners only (ubuntu-latest, -22.04, -24.04, the arm ones,
+  # ubuntu-slim), and jobs in containers are not supported.
+  - id: bullfrog
+    categories: [egress]
+    languages: [any]
+    actions: [bullfrogsec/bullfrog]
+    requireInputs:
+      all:
+        egress-policy: [block]
+        enable-sudo: ['false']
+      unset: [api-token, _dry-run-print-config]
+      ifSet:
+        dns-policy: [allowed-domains-only]
+      why: Bullfrog blocks traffic only with egress-policy set to block, enable-sudo set to false and DNS kept to the allowed domains, with no control-plane policy (api-token) or dry run.
+    runners: [ubuntu-latest, ubuntu-22.04, ubuntu-24.04, ubuntu-22.04-arm, ubuntu-24.04-arm, ubuntu-arm-22.04, ubuntu-arm-24.04, ubuntu-slim]
+  # https://github.com/step-security/harden-runner/blob/main/action.yml (egress-policy "audit or block"; disable-sudo and
+  # disable-sudo-and-containers default "false"; policy, api-key and use-policy-store fetch a stored policy). DEC #80
+  # (spike S8): its free tier blocked nothing on a private repo, and sudo undid it on a public one.
+  # Fix round 1: disable-sudo alone leaves docker, which is root-equivalent, and action.yml says it will be deprecated
+  # for disable-sudo-and-containers. https://github.com/step-security/harden-runner/blob/main/src/setup.ts skips a
+  # container job (CONTAINER_MESSAGE), ubuntu-slim (UBUNTU_SLIM_MESSAGE) and, without its agent, a self-hosted runner.
+  - id: harden-runner
+    categories: [egress]
+    languages: [any]
+    actions: [step-security/harden-runner]
+    availability: public
+    unavailableWhy: On a private repo, the free Harden-Runner blocks nothing (pipegen's spike S8), and pipegen can't see a paid plan.
+    requireInputs:
+      all:
+        egress-policy: [block]
+        disable-sudo-and-containers: ['true']
+      unset: [policy, api-key, use-policy-store]
+      why: Harden-Runner blocks traffic only with egress-policy set to block and sudo and containers turned off (disable-sudo-and-containers) in the workflow, with no stored policy to replace them.
+    runners: [ubuntu-latest, ubuntu-22.04, ubuntu-24.04, ubuntu-22.04-arm, ubuntu-24.04-arm]
+  # ---------- scheduled checks (Plan P Task 3): right on `schedule` or a push to the default branch ----------
+  # https://github.com/ossf/scorecard-action/blob/main/action.yaml (writes results; nothing fails on a low score) and
+  # README ("free for all public repositories. Private repositories are supported if they have GitHub Advanced
+  # Security")
+  - id: scorecard
+    categories: [scorecard]
+    languages: [any]
+    actions: [ossf/scorecard-action]
+    actionFails: never
+    availability: public-or-code-security
+    unavailableWhy: The Scorecard action works only on public repos and on private repos with GitHub Advanced Security, so here it checks nothing.
+    partialWhy: Scorecard scores the repo's security practices and doesn't fail the job on a low score.
+  # https://github.com/ossf/scorecard/blob/main/README.md (the scorecard command line, which runs on any repo it can read).
+  # Fix round 1: --repo can name another repo, so only `--local <path>` (this checkout) counts
+  - id: scorecard-cli
+    categories: [scorecard]
+    languages: [any]
+    commands: [scorecard]
+    onlyWithFlagValue: { flag: --local }
+    commandFails: never
+    partialWhy: Scorecard scores the repo's security practices and doesn't fail the job on a low score.
+  # https://github.com/golang/go/blob/master/src/cmd/go/internal/test/test.go ("-fuzz regexp: Run the fuzz test
+  # matching the regular expression"); fuzzing is a warning check, so a run is enough
+  - id: go-fuzz
+    categories: [fuzzing]
+    languages: [go]
+    commands: [go test]
+    onlyWithFlagValue: { flag: -fuzz }
+    notWithFlags: [-list, --list]
+  # https://github.com/google/clusterfuzzlite/blob/main/actions/run_fuzzers/action.yml and
+  # https://github.com/google/oss-fuzz/blob/master/infra/cifuzz/actions/run_fuzzers/action.yml (mode coverage and prune
+  # don't fuzz)
+  - id: fuzz-actions
+    categories: [fuzzing]
+    languages: [any]
+    actions: [google/clusterfuzzlite/actions/run_fuzzers, google/oss-fuzz/infra/cifuzz/actions/run_fuzzers]
+    skipInputs:
+      mode: [coverage, prune]
+  # ---------- deploy: SBOM, signing, attestation ----------
+  # anchore/sbom-action only (never anchore/sbom-action/download-syft, which only downloads syft)
+  - id: syft
+    categories: [sbom]
+    languages: [any]
+    actions: [anchore/sbom-action]
+    commands: [syft]
+    excludes: [syft version]
+  - id: cosign
+    categories: [signing]
+    languages: [any]
+    commands: [cosign sign, cosign sign-blob]
+  - id: attest-build-provenance
+    categories: [attestation]
+    languages: [any]
+    actions: [actions/attest-build-provenance, actions/attest, actions/attest-sbom]
+  # npm provenance: https://docs.npmjs.com/generating-provenance-statements ("Add the --provenance flag to your publish
+  # command"; the job needs id-token: write, or the publish fails). npm reads `--provenance false` as off, and a dry
+  # run publishes nothing. Trusted publishing also adds provenance without the flag
+  # (https://docs.npmjs.com/trusted-publishers), but that is set on npmjs.com, not in the repo, so it isn't counted.
+  - id: npm-provenance
+    categories: [attestation]
+    languages: [node]
+    commands: [npm publish]
+    onlyWithFlags: [--provenance, --provenance=true]
+    notWithFlags: [--provenance=false, --no-provenance, --dry-run]
+  # https://github.com/pypa/gh-action-pypi-publish/blob/unstable/v1/action.yml (attestations: default 'true', "Only
+  # works with PyPI and TestPyPI via Trusted Publishing"); the README: attestations are "limited to Trusted Publishing
+  # flows using PyPI or TestPyPI". A password (an API token) means no trusted publishing, so no attestation.
+  # Fix round 1 (C1): attestations are on by default only from v1.11.0. Each tag's action.yml, fetched 2026-10-27
+  # (https://raw.githubusercontent.com/pypa/gh-action-pypi-publish/<tag>/action.yml): v1.8.14 has no `attestations`
+  # input, v1.10.x has default 'false', v1.11.0 and later default 'true'. `shas` are the peeled commits of the tags
+  # v1.11.0 … v1.14.3 from `git ls-remote --tags https://github.com/pypa/gh-action-pypi-publish` (2026-10-27).
+  # release/v1 and unstable/v1 follow the newest release (v1.14.x on 2026-10-27).
+  - id: pypi-publish
+    categories: [attestation]
+    languages: [python]
+    actions: [pypa/gh-action-pypi-publish]
+    actionRef:
+      moving: [release/v1, unstable/v1]
+      minVersion: [1, 11]
+      shas:
+        - fb13cb306901256ace3dab689990e13a5550ffaa # v1.11.0
+        - 61da13deb5f5124fb1536194f82ed3d9bbc7e8f3 # v1.12.0
+        - 1f5d4ec244f65dce93685ee3e98e77123f090866 # v1.12.1
+        - 15c56dba361d8335944d31a2ecd17d700fc7bcbc # v1.12.2
+        - 67339c736fd9354cd4f8cb0b744f2b82a74b5c70 # v1.12.3
+        - 76f52bc884231f62b9a034ebfe128415bbaabdfc # v1.12.4
+        - ed0c53931b1dc9bd32cbe73a98c7f6766f8a527e # v1.13.0
+        - cef221092ed1bacb1cc03d23a2d87d1d172e277b # v1.14.0
+        - ba38be9e461d3875417946c167d0b5f3d385a247 # v1.14.1
+        - dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2
+        - 7245906fb61fa33a13554f9d5fb856fe61758086 # v1.14.3
+      oldWhy: The PyPI publish action runs at a version before v1.11.0, which makes no attestation unless told to.
+      unknownWhy: The PyPI publish action makes attestations by default only from v1.11.0, and pipegen can't tell which version this ref is.
+    skipInputs:
+      password: ['*']
+    skipUnless:
+      attestations: ['true']
+      repository-url: ['https://upload.pypi.org/legacy/', 'https://test.pypi.org/legacy/']
+      repository_url: ['https://upload.pypi.org/legacy/', 'https://test.pypi.org/legacy/']

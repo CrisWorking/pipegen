@@ -1,0 +1,262 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    # labeled, unlabeled and edited re-run the `cooldown` job when the security-fix label or the PR body changes
+    # (docs/cooldown.md). The other jobs re-run too: skipping them would report a required check as passed.
+    types: [opened, synchronize, reopened, labeled, unlabeled, edited]
+  # P46: weekly, only the `pins-upstream` job runs (every other job skips a scheduled run): upstream drift under pins
+  # nobody changed is seen even when nobody pushes.
+  schedule:
+    - cron: '17 5 * * 1'
+
+permissions: {}
+
+jobs:
+  test:
+    if: github.event_name != 'schedule'
+    name: test (node ${{ matrix.node }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        # engines is >=24 (maintained until 2028-04-30); 26 is the development version (.nvmrc). DECISIONS #92.
+        node: [24, 26]
+    concurrency:
+      group: ci-test-${{ matrix.node }}-${{ github.event_name == 'pull_request' && github.ref || github.sha }}
+      cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: ${{ matrix.node }}
+      - run: npm ci
+      - run: npm test
+      # The secret-scanner upgrade checklist (P34-P38): the live tests of the real pinned betterleaks and gitleaks, run on
+      # every pull request (so on every scanner version bump in data/pinned-binaries.yml). The script fails unless the
+      # canary tests, the belt drift test and the chunk-size pin test each ran and passed (a skipped live test passes
+      # in vitest), and every other test in those files passed too. It downloads the pinned releases from github.com.
+      - name: Secret-scanner live tests (canary, belt drift, chunk-size pin; betterleaks and gitleaks)
+        run: node scripts/scanner-live.ts
+      # The reviewed list's signature checks, re-verified with the pinned cosign (an edited keySha256 or identity still
+      # loads offline; only this catches it).
+      - name: Live test of the reviewed list's cosign checks (downloads the pinned cosign and the signed release files)
+        # once per run, not once per Node version (review M-R6: fewer unauthenticated downloads)
+        if: matrix.node == 24
+        run: npx vitest run test/reviewed-verify-live.test.ts
+        env:
+          PIPEGEN_LIVE_TESTS: '1'
+      # Every platform's archive hash in data/pinned-binaries.yml against the release's checksums file, verified with
+      # the pinned cosign where upstream signs it or attests the archives (m4, P46: the binaries also run on macOS and
+      # arm64 Linux).
+      - name: Live test of every pinned binary platform hash (downloads the pinned cosign and the release checksums files)
+        if: matrix.node == 24
+        run: npx vitest run test/pinned-binaries-verify-live.test.ts
+        env:
+          PIPEGEN_LIVE_TESTS: '1'
+          # read-only job token for the GitHub attestations API (actionlint's build provenance), this step only
+          GITHUB_TOKEN: ${{ github.token }}
+      - run: npx tsc --noEmit
+
+  no-runtime-deps:
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    concurrency:
+      group: ci-no-runtime-deps-${{ github.event_name == 'pull_request' && github.ref || github.sha }}
+      cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+      - run: npm ci
+      - run: npm pack
+      - name: Fail if the published package has runtime dependencies
+        run: |
+          mkdir unpacked
+          tar -xzf pipegen-*.tgz -C unpacked
+          node -e '
+            const p = JSON.parse(require("fs").readFileSync("unpacked/package/package.json", "utf8"));
+            if (p.dependencies && Object.keys(p.dependencies).length > 0) {
+              console.error("published package.json has dependencies");
+              process.exit(1);
+            }
+          '
+
+  notices-fresh:
+    if: github.event_name != 'schedule'
+    # THIRD_PARTY_NOTICES is generated from the bundle's metafile (ruling B4); fail when the committed file is stale.
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    concurrency:
+      group: ci-notices-fresh-${{ github.event_name == 'pull_request' && github.ref || github.sha }}
+      cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+      - run: npm ci
+      - run: npm run build
+      - run: npm run notices
+      - name: Fail if THIRD_PARTY_NOTICES differs from the committed file
+        run: git diff --exit-code -- THIRD_PARTY_NOTICES
+
+  workflow-lint:
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    concurrency:
+      group: ci-workflow-lint-${{ github.event_name == 'pull_request' && github.ref || github.sha }}
+      cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install actionlint (script, version and binary pinned by checksum)
+        run: |
+          set -euo pipefail
+          script_url=https://raw.githubusercontent.com/rhysd/actionlint/914e7df21a07ef503a81201c76d2b11c789d3fca/scripts/download-actionlint.bash
+          curl --proto '=https' --proto-redir '=https' -fsSL "$script_url" -o "$RUNNER_TEMP/download-actionlint.bash"
+          echo "72fa3e45ac20f3c3a512d6747b4fcf719e21f890e8c43e78d48a41fdfb900c4e  $RUNNER_TEMP/download-actionlint.bash" | sha256sum -c -
+          bash "$RUNNER_TEMP/download-actionlint.bash" 1.7.12 "$RUNNER_TEMP"
+          echo "c872d6db8c6bf83a8eaa704fc93999f027d55dffbc63b8a6abdccb47df5f4cd4  $RUNNER_TEMP/actionlint" | sha256sum -c -
+      - name: Run actionlint
+        run: '"$RUNNER_TEMP/actionlint" -color .github/workflows/*.yml'
+      # zizmor-action is on pipegen's never-list (beta, DECISIONS #92), so the pinned release binary runs instead:
+      # v1.31.1, the same pin as data/reviewed-tools.yml (archive sha256 = GitHub's recorded asset digest; immutable release).
+      - name: Install zizmor (release archive and binary pinned by checksum)
+        run: |
+          set -euo pipefail
+          url=https://github.com/zizmorcore/zizmor/releases/download/v1.31.1/zizmor-x86_64-unknown-linux-gnu.tar.gz
+          curl --proto '=https' --proto-redir '=https' -fsSL "$url" -o "$RUNNER_TEMP/zizmor.tar.gz"
+          echo "d185f726bdaf92df78273217dfdd24ebcd6b0ef48cf3ce776ff5762b6e138c99  $RUNNER_TEMP/zizmor.tar.gz" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/zizmor.tar.gz" -C "$RUNNER_TEMP" zizmor
+          echo "dc3bb05237ddd11c62ac19cf5ac1c633acd228e386b7e18f9adb3498873d271f  $RUNNER_TEMP/zizmor" | sha256sum -c -
+      - name: Run zizmor
+        # online audits (impostor commits, known-vulnerable actions) need the read-only job token, as the action had
+        run: '"$RUNNER_TEMP/zizmor" --format plain .github/workflows/'
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+  pins-upstream:
+    # m5: every pin in data/ tied again to upstream by scripts/cooldown.ts's code (test/pins-upstream-live.test.ts), so a
+    # moved tag or a re-uploaded asset under a pin nobody changed is seen. Runs on pull requests that change data/ and on
+    # every push to main, and weekly (schedule); on other pull requests the job passes without running it (it can still be
+    # a required check).
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    concurrency:
+      group: ci-pins-upstream-${{ github.event_name == 'pull_request' && github.ref || github.sha }}
+      cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: "Check out the base commit's data/ only (to see whether this PR changes it)"
+        if: github.event_name == 'pull_request'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          path: .base-data
+          sparse-checkout: data
+          persist-credentials: false
+      - name: Does this run need the re-check?
+        id: changed
+        run: |
+          if [ "$GITHUB_EVENT_NAME" != pull_request ] || ! diff -rq .base-data/data data >/dev/null 2>&1; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::data/ is unchanged in this PR; the re-check of every pin runs on PRs that change data/ and on main"
+          fi
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        if: steps.changed.outputs.run == 'true'
+        with:
+          node-version: 24
+      - if: steps.changed.outputs.run == 'true'
+        run: npm ci
+      - name: Live re-check of every pin in data/ against upstream
+        if: steps.changed.outputs.run == 'true'
+        run: npx vitest run test/pins-upstream-live.test.ts
+        env:
+          PIPEGEN_LIVE_TESTS: '1'
+          # read-only job token, given to this step only: several hundred GitHub API lookups
+          GITHUB_TOKEN: ${{ github.token }}
+
+  cooldown:
+    # 7-day cooldown for new or changed dependency and tool versions (DECISIONS #92, docs/cooldown.md).
+    # The BASE commit's script judges the PR's files. This protects the script file only: a PR can still edit this
+    # job, so the check is as strong as enforced code-owner review of /.github/ and /scripts/ (docs/cooldown.md).
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    concurrency:
+      group: ci-cooldown-${{ github.ref }}
+      cancel-in-progress: true
+    permissions:
+      contents: read
+      pull-requests: read # the PR, its label events and reviews, for the security-fix path (read-only)
+    steps:
+      # Both commits come from the same event payload, so base and head stay consistent for the whole run.
+      - name: "Check out the base commit (trusted, holds the script)"
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          path: base
+          persist-credentials: false
+      - name: "Check out the PR head commit (data only, its files are read and never run)"
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          path: head
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+      - name: Install the base's dependencies (base lockfile, no install scripts)
+        working-directory: base
+        run: |
+          # Bootstrap (the next step): a base without the script has nothing to install for it
+          if [ ! -f scripts/cooldown.ts ]; then echo "::notice::base has no scripts/cooldown.ts; nothing to install"; exit 0; fi
+          npm ci --ignore-scripts
+      - name: Run the base's cooldown script on the PR's files
+        run: |
+          if [ ! -f base/scripts/cooldown.ts ]; then
+            # Bootstrap: skip only when the base has no script AND this PR adds it. Anything else fails.
+            if [ -f head/scripts/cooldown.ts ]; then
+              echo "::notice::base has no scripts/cooldown.ts and this PR adds it; nothing to run yet"
+              exit 0
+            fi
+            echo "::error::scripts/cooldown.ts is missing in the base and not added by this PR"
+            exit 1
+          fi
+          node base/scripts/cooldown.ts --base-dir base --head-dir head
+        env:
+          # Read-only job token (contents and pull-requests: read), given to this step only.
+          GITHUB_TOKEN: ${{ github.token }}
+          # Identify the PR for the security-fix path. The label, the body and the reviews are read from the API by
+          # the script, never from the event payload, and nothing from the PR is put into the shell command.
+          PR_REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}

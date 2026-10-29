@@ -1,0 +1,44 @@
+# pipegen's own gitleaks config for the code bundle it may send to an AI provider
+# (src/ai/redact.ts). pipegen always passes it with --config, so a .gitleaks.toml in the
+# scanned repo is never used.
+#
+# Rules: gitleaks' default rule set, plus pipegen redaction patterns that the defaults do
+# not cover. There is deliberately no allowlist here: nothing in a repo can switch a rule
+# off. pipegen also writes the bundle under neutral file names (f000001.txt, ...), so the
+# path-based allowlists inside the default set never match a repo's own file names.
+
+title = "pipegen code bundle"
+
+[extend]
+useDefault = true
+
+# The password part of a connection string (scheme, then user, a colon, the password, an @
+# and the host). RE2-safe and greedy: the user part stops at the first colon (it may hold an
+# @, like an email address), and the password runs to the last @ of the non-space token, so it
+# may hold /, ?, # or @. It over-matches rather than misses. pipegen's own scan in
+# src/ai/redact.ts is the precise one; this rule is the second line.
+[[rules]]
+id = "pipegen-connection-string-password"
+description = "Password inside a connection string"
+regex = '''[a-zA-Z][a-zA-Z0-9+.-]*://[^:/\s]*:(\S+)@'''
+secretGroup = 1
+
+[[rules]]
+id = "pipegen-sk-key"
+description = "API key of the sk- form"
+regex = '''sk-[A-Za-z0-9_-]{20,}'''
+
+# Ruling P34: pipegen's scan marker. Before each scan, redact.ts ends every scanned file (and paths.txt) with one line
+# holding a fresh random `pipegen-canary-<32 hex>` token, and accepts a file only when this rule reported that file's
+# own token, exactly once. A file the scanner skipped without saying so (a path on the default allowlist, a format it
+# sniffs, a size limit, …) is then left out, and a scan that read none of them stops the AI call. Not a secret: these
+# findings are removed before any real finding is applied.
+# Ruling P35: the regex matches only a WHOLE line that is exactly one token. Both scanners drop a generic finding whose
+# value overlaps another rule's finding on the same line (live probe), so a canary rule that could match inside real
+# content could hide a real secret. Ruling P37: repo text is not rewritten (that broke other rules' word boundaries);
+# a canary-rule finding that is not the file's own token, on its last line, is a real finding and its file is left out.
+[[rules]]
+id = "pipegen-canary"
+description = "pipegen scan marker (proves the file was read)"
+regex = '''(?m)^pipegen-canary-[0-9a-f]{32}$'''
+keywords = ["pipegen-canary-"]
