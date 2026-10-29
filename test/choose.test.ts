@@ -102,6 +102,8 @@ describe('choose: lint', () => {
     expect(ownTool(choose('lint', p))).toMatchObject({ tool: 'xo', version: '1.2.0' });
     expect(choose('lint', p).note).toBe('XO is already configured');
     expect(ownTool(choose('format', p))).toMatchObject({ tool: 'xo', version: '1.2.0' });
+    expect(ownTool(choose('format-lint', p))).toMatchObject({ tool: 'xo', version: '1.2.0' });
+    expect(idOf(choose('format-lint', profile([svc({}, { tsconfig: true })])).tool)).not.toBe('xo');
     // a repo's ESLint config still comes first; Prettier stays the format tool when it is configured
     expect(ownTool(choose('lint', profile([svc({}, { configs: ['xo'], eslintConfig: 'flat', versions: { eslint: '9.1.0' } })])))).toMatchObject({ tool: 'eslint' });
     expect(ownTool(choose('format', profile([svc({}, { configs: ['xo', 'prettier'], versions: { prettier: '3.6.0' } })])))).toMatchObject({ tool: 'prettier' });

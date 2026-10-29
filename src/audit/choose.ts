@@ -240,7 +240,9 @@ function generic(c: Ctx): Choice {
 
 type Rule = (c: Ctx) => Choice;
 const RULES: Readonly<Record<string, Rule>> = {
-  lint: lintRule, format: formatRule, 'type-check': typeCheckRule, coverage: coverageRule, 'dead-code': deadCodeRule,
+  lint: lintRule, format: formatRule,
+  // P55 (batch B): the pre-commit hook runs the repo's own XO (a repo with XO never gets Biome suggested next to it); other repos keep the first reviewed entry
+  'format-lint': (c) => (c.lang === 'node' && c.q.eslintConfig === 'none' && c.q.configs.includes('xo') ? lintRule(c) : generic(c)), 'type-check': typeCheckRule, coverage: coverageRule, 'dead-code': deadCodeRule,
   duplication: (c) => reviewed(c, T.jscpd, 'jscpd: finds copy-pasted code', [], '; warning only; new copy-paste in the pull request only'),
   'dockerfile-lint': (c) => reviewed(c, T.hadolint, 'Hadolint: lints the Dockerfile', [], "; Trivy config's Dockerfile checks stay on"),
   'workflow-lint': (c) => {
