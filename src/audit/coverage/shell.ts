@@ -22,12 +22,14 @@ export const DEFAULT_SHELL: ShellMode = { errexit: true, pipefail: false };
 const OTHER_STEP_SHELLS: ReadonlySet<string> = new Set(['pwsh', 'powershell', 'python', 'cmd']);
 
 /**
- * The mode of a step's `shell:` (or defaults.run.shell), or null when pipegen doesn't know the spec (P52 d): then the
- * step gives no coverage. Known: none (the default), `bash`, `sh`, and `bash|sh` followed only by allowlisted words
- * (-e -u -x -v and combined or + forms, `-o pipefail|errexit|nounset|xtrace`, --noprofile, --norc) then `{0}`; and
- * pwsh, powershell, python and cmd as before (errexit off). Anything else (`bash -n {0}`, `perl {0}`) is null.
+ * The mode of a step's `shell:` (or defaults.run.shell). Known: none (the default), `bash`, `sh` (also by absolute path,
+ * /bin or /usr/bin), and `bash|sh` followed only by allowlisted words (-e -u -x -v and combined or + forms, -l, --login,
+ * `-o pipefail|errexit|nounset|xtrace`, --noprofile, --norc) then `{0}`; and pwsh, powershell, python and cmd as before
+ * (errexit off). `noexec` (P52 d): bash or sh told not to run the commands (-n in a flag word, `-o noexec`), so nothing
+ * in the step runs. null: a spec pipegen doesn't know (`perl {0}`, `bash -c {0}`, `bash --posix {0}`); it can't tell
+ * what runs, so the step is opaque (unknown, never missing: re-review 2, `bash -el {0}` of conda setups).
  */
-export function shellMode(v: unknown): ShellMode | null {
+export function shellMode(v: unknown): ShellMode | 'noexec' | null {
   if (v === undefined || v === null) return DEFAULT_SHELL;
   if (typeof v !== 'string' || !regexSafe(v)) return null;
   const s = v.trim();
@@ -36,14 +38,17 @@ export function shellMode(v: unknown): ShellMode | null {
   const parts = s.split(/\s+/).slice(0, 17);
   const prog = parts[0] ?? '';
   if (OTHER_STEP_SHELLS.has(basename(prog))) return { errexit: false, pipefail: false };
-  if ((prog !== 'bash' && prog !== 'sh') || parts.length > 16 || parts[parts.length - 1] !== '{0}') return null;
+  const sh = /^(?:(?:\/usr)?\/bin\/)?(bash|sh)$/.exec(prog)?.[1];
+  if (sh === undefined || parts.length > 16 || parts[parts.length - 1] !== '{0}') return null;
+  const mid = parts.slice(1, -1);
+  // told not to run the commands: nothing in the step runs (checked first, so `-l -n` is noexec, not unknown)
+  if (mid.some((x, i) => /^-[A-Za-z]*n[A-Za-z]*$/.test(x) || (/^-[A-Za-z]*o$/.test(x) && mid[i + 1] === 'noexec'))) return 'noexec';
   let errexit = false;
   let pipefail = false;
-  const mid = parts.slice(1, -1);
   for (let i = 0; i < mid.length; i++) {
     const x = mid[i] as string;
-    if (x === '--noprofile' || x === '--norc') continue;
-    const o = /^-([euxv]*)o$/.exec(x);
+    if (x === '--noprofile' || x === '--norc' || x === '--login' || x === '-l') continue;
+    const o = /^-([euxvl]*)o$/.exec(x);
     if (o !== null) {
       const opt = mid[i + 1] ?? '';
       if (!SHELL_OPTIONS.has(opt)) return null;
@@ -52,10 +57,10 @@ export function shellMode(v: unknown): ShellMode | null {
       i++;
       continue;
     }
-    if (!SHELL_FLAGS.test(x)) return null;
+    if (!SHELL_FLAGS.test(x) && !/^-[euxvl]+$/.test(x)) return null;
     if (x.startsWith('-') && x.includes('e')) errexit = true;
   }
-  return { errexit, pipefail: prog === 'bash' && pipefail };
+  return { errexit, pipefail: sh === 'bash' && pipefail };
 }
 
 /**

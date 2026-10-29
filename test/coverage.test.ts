@@ -2888,13 +2888,19 @@ describe('coverage: followed scripts and shells, allowlists (P52)', () => {
     }
   });
 
-  it('(d) the shell: of a step must be a known spec; any other (bash -n {0}, perl {0}) gives no coverage', async () => {
+  it('(d) the shell: of a step must be a known spec; a no-exec one runs nothing, an unknown one is unknown (never missing)', async () => {
     const dir = (shell: string) => { const d = makeTempDir(); wf(d, 'ci.yml', ci('pytest', shell)); return d; };
-    for (const sh of ['bash -n {0}', 'bash -o noexec {0}', 'perl {0}', 'bash -c {0}', 'node {0}']) {
+    // bash/sh told not to run the commands: nothing runs
+    for (const sh of ['bash -n {0}', 'bash -o noexec {0}', 'sh -en {0}', 'bash -e -n {0}', 'bash -l -n {0}']) {
       expect(row(await coverage(dir(sh)), 'merge', 'unit-tests').status, sh).toBe('missing');
     }
-    for (const sh of ['bash', 'sh', 'bash --noprofile --norc -eo pipefail {0}', 'sh -e {0}', 'bash -e {0}', 'bash {0}']) {
-      expect(row(await coverage(dir(sh)), 'merge', 'unit-tests').status, sh).not.toBe('missing');
+    // a spec pipegen doesn't know: it can't tell what runs (re-review 2: never a false missing)
+    for (const sh of ['perl {0}', 'bash -c {0}', 'node {0}', 'bash --posix {0}', 'zsh {0}', '/usrbash {0}', 'usr/bin/bash {0}', '/opt/bin/bash {0}']) {
+      expect(row(await coverage(dir(sh)), 'merge', 'unit-tests').status, sh).toBe('unknown');
+    }
+    // known specs, including the login shells setup-miniconda/setup-micromamba tell users to write, and absolute paths
+    for (const sh of ['bash', 'sh', 'bash --noprofile --norc -eo pipefail {0}', 'sh -e {0}', 'bash -e {0}', 'bash {0}', 'bash -el {0}', 'bash -l {0}', 'bash --login -e {0}', '/usr/bin/bash -e {0}', '/bin/sh {0}']) {
+      expect(row(await coverage(dir(sh)), 'merge', 'unit-tests').status, sh).toBe('covered');
     }
   });
 

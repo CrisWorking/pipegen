@@ -49,6 +49,7 @@ export const OPAQUE_WHY = {
   workflowsUnreadable: "Some workflow files couldn't be read, so pipegen can't tell.",
   hookUnreadable: "The git hook file couldn't be read (a symbolic link, too large or not valid), so pipegen can't tell.",
   tooMany: "There are too many services or workflow steps to check in full, so pipegen can't tell.",
+  unknownShell: "A step runs its commands with a `shell:` setting pipegen doesn't know, so it can't tell what runs.",
 } as const;
 
 const LAYER_DONE: Readonly<Record<Slot, string>> = {

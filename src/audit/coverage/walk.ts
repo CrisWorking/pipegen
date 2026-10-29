@@ -294,9 +294,10 @@ async function walkStep(ctx: Ctx, step: Obj, c: StepCtx): Promise<void> {
   }
   if (typeof step.run === 'string') {
     const base = firstSet(workingDir(step['working-directory']), c.runDir);
-    // P52 (d): a `shell:` spec pipegen doesn't know gives no coverage
+    // P52 (d): a no-exec shell runs nothing; a `shell:` spec pipegen doesn't know makes the step opaque (unknown)
     const mode = shellMode(step.shell ?? c.shell);
-    const found = mode === null ? [] : await resolveScripts(ctx, scanShell(step.run, base, ctx.sigs, ctx.budget, mode));
+    if (mode === null) return opaque(ctx, OPAQUE_WHY.unknownShell, undefined, sc);
+    const found = mode === 'noexec' ? [] : await resolveScripts(ctx, scanShell(step.run, base, ctx.sigs, ctx.budget, mode));
     addFound(ctx, gated(found, sc.gate), sc);
   }
 }
