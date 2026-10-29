@@ -571,6 +571,16 @@ export function renderCliTool({ spec, tool, service, ctx, hooks, options }: CliA
       ...(tunedCfg === null ? [] : [`printf '%s' "$PIPEGEN_TUNED_CONFIG" > "$cfg/${tunedCfg.fileName}"`])];
   // the tool is told where its generated config is by the one variable the policy named (set inside env -i, like the other constants)
   const dynamicEnv = tunedCfg === null ? [] : [`${tunedCfg.envName}=$cfg/${tunedCfg.fileName}`];
+  // the tool's own scope file replaces the repo's (semgrep: `.semgrepignore`, nested ones included): every file of that name under the
+  // step folder is deleted (a link is removed, never followed), then pipegen's own is written. Marker comments let the live test run it.
+  const scope = pol.scopeIgnore;
+  if (scope !== undefined && (!/^\.[a-z][a-z0-9]{0,30}$/.test(scope.file) || !scope.lines.every((l) => /^[a-z_][a-z0-9_]{0,30}$/.test(l)))) return refuse(`The scope file of ${show(tool.id)} is not a plain name with plain lines.`);
+  const scopeLines = scope === undefined ? [] : [
+    '# pipegen scope: begin',
+    `"\${sys[@]}" find . -name ${scope.file} \\( -type f -o -type l \\) -delete`,
+    `printf '%s\\n' ${scope.lines.join(' ')} > ${scope.file}`,
+    '# pipegen scope: end',
+  ];
   // what the tuning did, in plain words, in comment lines (describeTuning): one line of text each, nothing but printable ASCII
   const tuneComments = tuned.lines.map((l) => `# tuning: ${l.replace(/[^\x20-\x7e]/g, '?')}`);
   // the result path must be free before the tool runs and a regular file after it, also where it lands (ruling S7)
@@ -598,7 +608,7 @@ export function renderCliTool({ spec, tool, service, ctx, hooks, options }: CliA
   const launch = (words: readonly string[]): string => `"\${pg_env[@]}" ${prefix}${words.length === 0 ? '' : ` ${words.join(' ')}`}`;
   const chain = [launch(built.main), ...built.then.map(launch)].join(' && ');
   const run = script([
-    ...prologue(artifact, nodeMajor === undefined ? {} : { nodeMajor }), ...tuneComments, ...vars, ...installLines, ...cdLines(spec.workingDir), ...pathChecks, ...prep, ...cfgLines, ...preCheck,
+    ...prologue(artifact, nodeMajor === undefined ? {} : { nodeMajor }), ...tuneComments, ...vars, ...installLines, ...cdLines(spec.workingDir), ...pathChecks, ...prep, ...cfgLines, ...scopeLines, ...preCheck,
     ...closureVars, ...allowlist(pathValue, passed, [], dynamicEnv), ...afterAllow, 'rc=0', `${chain} || rc=$?`, ...postCheck, 'exit "$rc"',
   ]);
   // a tool that runs the repo's own code is marked, so the referee can apply its order rule (S6 c); the id is not `pipegen-…`, which a job's dedupe may drop

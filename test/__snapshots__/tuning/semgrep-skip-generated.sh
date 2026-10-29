@@ -18,6 +18,10 @@ cd -- ./services/api
 ws="$(cd "$GITHUB_WORKSPACE" && pwd -P)"
 case "$(pwd -P)" in "$ws"/*) ;; *) pg_fail "the working folder is outside the repository" ;; esac
 if [ -L "$rules"/"$PIPEGEN_ARG_2" ] || [ ! -d "$rules"/"$PIPEGEN_ARG_2" ]; then pg_fail "the rules folder is missing or a link"; fi
+# pipegen scope: begin
+"${sys[@]}" find . -name .semgrepignore \( -type f -o -type l \) -delete
+printf '%s\n' node_modules > .semgrepignore
+# pipegen scope: end
 out=semgrep.sarif
 outdir=.
 if [ -e "$out" ] || [ -L "$out" ]; then pg_fail "the result file $out exists before the tool ran, so pipegen will not use it"; fi

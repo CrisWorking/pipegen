@@ -20,6 +20,10 @@ case "$(pwd -P)" in "$ws"/*) ;; *) pg_fail "the working folder is outside the re
 if [ -L "$rules"/"$PIPEGEN_ARG_0" ] || [ ! -d "$rules"/"$PIPEGEN_ARG_0" ]; then pg_fail "the rules folder is missing or a link"; fi
 if [ -L "$rules"/typescript ] || [ ! -d "$rules"/typescript ]; then pg_fail "the rules folder is missing or a link"; fi
 if [ -L "$rules"/dockerfile ] || [ ! -d "$rules"/dockerfile ]; then pg_fail "the rules folder is missing or a link"; fi
+# pipegen scope: begin
+"${sys[@]}" find . -name .semgrepignore \( -type f -o -type l \) -delete
+printf '%s\n' node_modules > .semgrepignore
+# pipegen scope: end
 out=semgrep.sarif
 outdir=.
 if [ -e "$out" ] || [ -L "$out" ]; then pg_fail "the result file $out exists before the tool ran, so pipegen will not use it"; fi

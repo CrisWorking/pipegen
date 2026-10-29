@@ -119,6 +119,13 @@ export interface ArgvPolicy extends CommandPolicy {
    * replaced by the checked-out folder); `subChoice` is the choice that picks a sub-folder to mount.
    */
   readonly archive?: { readonly repo: string; readonly treeEnv: string; readonly commitEnv?: string; readonly urlEnv?: string; readonly dir: string; readonly subChoice?: string };
+  /**
+   * The tool's own scope file (6d fix round 1, ruling 6, DECISIONS #108): semgrep reads every `.semgrepignore` in the tree and, with
+   * none, applies built-in ignores that skip test/, tests/, build/, vendor/ and dist/ at any depth. The renderer deletes every
+   * file of this name under the step folder (links included, never followed) and writes pipegen's own, whose `lines` are reviewed
+   * constants. A file at the scan root replaces the defaults (measured on semgrep 1.181.0).
+   */
+  readonly scopeIgnore?: { readonly file: string; readonly lines: readonly string[] };
   readonly env?: readonly string[];
   readonly then?: readonly CommandPolicy[];
   readonly dedicated?: true;
@@ -187,6 +194,7 @@ const POLICIES = {
     method: 'docker', package: 'semgrep/semgrep', exe: 'semgrep', dialect: 'long', sub: ['scan'],
     flags: { metrics: { values: ['off'] }, 'disable-version-check': 'bool', config: { values: ['/pipegen-rules'] }, sarif: 'bool', output: 'output' },
     required: { metrics: 'off', 'disable-version-check': 'true', config: '/pipegen-rules' },
+    scopeIgnore: { file: '.semgrepignore', lines: ['node_modules'] },
     env: ['PIPEGEN_RULES_URL', 'PIPEGEN_RULES_SHA256', 'PIPEGEN_RULES_TREE'], extraChoices: { rules: ['javascript', 'typescript', 'python'] },
     mount: { at: '/src', source: 'repo', workdir: true }, network: 'none',
     archive: { repo: 'semgrep/semgrep-rules', urlEnv: 'PIPEGEN_RULES_URL', treeEnv: 'PIPEGEN_RULES_TREE', dir: '/pipegen-rules', subChoice: 'rules' },
