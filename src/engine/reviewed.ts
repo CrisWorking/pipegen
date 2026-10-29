@@ -672,7 +672,7 @@ export const TRIVY_ALLOWED_FLAGS: ReadonlySet<string> = new Set([
 ]);
 /** The `--exit-code` of trivy, betterleaks and gitleaks: a finding is reported with 10, a code their errors never use (an error or a betterleaks partial scan exits 1). Keep equal to their `findingsExit` in tool-flags.ts. */
 const FINDINGS_EXIT_FLAG = '10';
-export const BETTERLEAKS_ALLOWED_FLAGS: ReadonlySet<string> = new Set(['report-format', 'report-path', 'no-banner', 'ignore-gitleaks-allow', 'redact', 'exit-code']);
+export const BETTERLEAKS_ALLOWED_FLAGS: ReadonlySet<string> = new Set(['report-format', 'report-path', 'no-banner', 'ignore-gitleaks-allow', 'redact', 'exit-code', 'max-archive-depth']);
 export const NUCLEI_ALLOWED_FLAGS: ReadonlySet<string> = new Set([
   'disable-update-check', 'templates', 'severity', 'sarif-export', 'target', 'automatic-scan', 'tags', 'no-interactsh',
 ]);
@@ -876,6 +876,12 @@ function betterleaksProblems(e: Entry): Problem[] {
     out.push(...choiceProblems('betterleaks', e, (k) => (g.value.has(k) || g.bool.has(k) || g.optional.has(k)) && BETTERLEAKS_ALLOWED_FLAGS.has(k),
       (k) => (k === 'config' ? pinnedMsg : forbidden.has(`--${k}`) || k.startsWith('validation') ? `betterleaks must never use --${k}`
         : k === 'exit-code' || k === 'report-path' ? `the AI may not choose betterleaks' --${k}: it is fixed by the template` : null)));
+    // --max-archive-depth 0 (C1b fix round 2, review R1-C1): betterleaks opens zip, tar and gzip files by default (depth 8) and reports their
+    // contents under the file's own name or a made-up path, so the gate would hash bytes the scanner never matched. Fixed to 0, in both places.
+    const depths = [...p.flags, ...pa.flags].filter((f) => f.name === 'max-archive-depth').map((f) => f.value);
+    if (lastValue(p, 'max-archive-depth') !== '0' || lastValue(pa, 'max-archive-depth') !== '0' || depths.some((v) => v !== '0')) {
+      bad('betterleaks --max-archive-depth is a fixed arg: exactly 0, in the command and fixedInputs.args (a deeper scan reports archive members under paths whose bytes the gate reads differently; review R1-C1)', 'fixedInputs', 'args');
+    }
   }
   const pinned = fx.config !== undefined && 'flag' in fx.config.passAs && fx.config.passAs.flag === '--config';
   if (!pinned || (fx.args ?? []).some((a) => a === '-c' || /^-c./.test(a) || flagName(a) === 'config')) bad(pinnedMsg, 'fixedInputs', 'config');

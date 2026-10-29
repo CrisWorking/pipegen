@@ -68,7 +68,7 @@ function actionEntry(over: Entry = {}): Entry {
 }
 
 /** gitleaks' locked flags (ruling P21), in the command and the fixed args. */
-const GITLEAKS_ARGS = ['--ignore-gitleaks-allow', '--redact', '--report-format', 'sarif', '--report-path', 'gitleaks.sarif', '--exit-code', '10'];
+const GITLEAKS_ARGS = ['--ignore-gitleaks-allow', '--redact', '--report-format', 'sarif', '--report-path', 'gitleaks.sarif', '--exit-code', '10', '--max-archive-depth', '0'];
 
 /**
  * Argv allowlists for the fixture-only ids (ruling P19 refuses a cli entry without one): the real table, plus the
@@ -501,9 +501,10 @@ const jscpdEntry = (over: BinOver = {}) => {
   e.step.output = { path: '', format: 'none' };
   return e;
 };
-const blCmd = (...rest: string[]) => ['betterleaks', 'git', '--redact', '--report-format', 'sarif', '--report-path', 'tool.sarif', '--exit-code', '10', ...rest];
+const blCmd = (...rest: string[]) => ['betterleaks', 'git', '--redact', '--report-format', 'sarif', '--report-path', 'tool.sarif', '--exit-code', '10', '--max-archive-depth', '0', ...rest];
 /** betterleaks' fixed args (P18, P21): --redact, the report format, --exit-code 1. */
-const BL_ARGS = ['--redact', '--report-format', 'sarif', '--exit-code', '10'];
+const BL_ARGS_NO_DEPTH = ['--redact', '--report-format', 'sarif', '--exit-code', '10'];
+const BL_ARGS = ['--redact', '--report-format', 'sarif', '--exit-code', '10', '--max-archive-depth', '0'];
 const betterleaksEntry = (over: BinOver = {}) => binEntry('betterleaks/betterleaks', {
   id: 'betterleaks', command: blCmd(), args: BL_ARGS,
   config: { content: '[extend]\nuseDefault = true\n', passAs: { flag: '--config' } }, verifiedWith: verified('betterleaks/betterleaks'), ...over,
@@ -756,7 +757,7 @@ describe('loader rules (Plan P Task 5)', () => {
     }
     expect([...BETTERLEAKS_FORBIDDEN_SUBCOMMANDS]).toEqual(expect.arrayContaining(['validate', 'github', 'gitlab', 'huggingface', 's3']));
     expect(load([betterleaksEntry()])).toHaveLength(1);
-    expect(load([betterleaksEntry({ command: ['betterleaks', 'dir', '--redact', '--report-format', 'sarif', '--report-path', 'tool.sarif', '--exit-code', '10', '.'] })])).toHaveLength(1);
+    expect(load([betterleaksEntry({ command: ['betterleaks', 'dir', '--redact', '--report-format', 'sarif', '--report-path', 'tool.sarif', '--exit-code', '10', '--max-archive-depth', '0', '.'] })])).toHaveLength(1);
     for (const flag of BETTERLEAKS_FORBIDDEN_FLAGS) {
       const re = new RegExp(`never use ${flag}`);
       rejects([betterleaksEntry({ command: blCmd(flag) })], re);
@@ -1051,19 +1052,19 @@ describe('loader rules (Plan P Task 5)', () => {
 
   it('reviewed: betterleaks --report-path is the output file, never - (findings with secrets to the CI log); --exit-code is a fixed arg (Task 5 carry-forward)', () => {
     // without --exit-code (the cases below add their own); --redact as P21 requires
-    const blCmd = (...rest: string[]) => ['betterleaks', 'git', '--redact', '--report-format', 'sarif', '--report-path', 'tool.sarif', ...rest];
-    const cmd = (path: string, ...rest: string[]) => ['betterleaks', 'git', '--redact', '--report-format', 'sarif', '--report-path', path, '--exit-code', '10', ...rest];
+    const blCmd = (...rest: string[]) => ['betterleaks', 'git', '--redact', '--report-format', 'sarif', '--report-path', 'tool.sarif', '--max-archive-depth', '0', ...rest];
+    const cmd = (path: string, ...rest: string[]) => ['betterleaks', 'git', '--redact', '--report-format', 'sarif', '--report-path', path, '--exit-code', '10', '--max-archive-depth', '0', ...rest];
     for (const path of ['-', '/dev/stdout', '/dev/stderr', '/proc/self/fd/1', 'other.sarif']) {
       rejects([betterleaksEntry({ command: cmd(path) })], /--report-path/);
-      rejects([betterleaksEntry({ command: [...blCmd('--exit-code', '10'), `--report-path=${path}`] })], /--report-path/); // a later value wins
-      rejects([betterleaksEntry({ command: [...blCmd('--exit-code', '10'), '-r', path] })], /--report-path/);
+      rejects([betterleaksEntry({ command: [...blCmd('--exit-code', '10'), `--report-path=${path}`], args: BL_ARGS_NO_DEPTH })], /--report-path/); // a later value wins
+      rejects([betterleaksEntry({ command: [...blCmd('--exit-code', '10'), '-r', path], args: BL_ARGS_NO_DEPTH })], /--report-path/);
       rejects([betterleaksEntry({ command: [...blCmd('--exit-code', '10'), '--report-path', path], args: ['--redact', '--report-format', 'sarif', '--exit-code', '10', '--report-path', path] })], /--report-path/);
     }
     const dash = betterleaksEntry({ command: cmd('-') });
     dash.step.output = { path: '-', format: 'sarif' };
     rejects([dash], /--report-path|output path starts with/);
     // --exit-code: set by the template (in the command and the fixed args, same value, not 0), never chosen by the AI
-    const fixed = ['--redact', '--report-format', 'sarif', '--exit-code', '10'];
+    const fixed = ['--redact', '--report-format', 'sarif', '--max-archive-depth', '0', '--exit-code', '10'];
     expect(load([betterleaksEntry({ command: blCmd('--exit-code', '10'), args: fixed })])).toHaveLength(1);
     rejects([betterleaksEntry({ command: blCmd('--exit-code', '10'), args: ['--redact', '--report-format', 'sarif'] })], /--exit-code/); // not a fixed arg
     rejects([betterleaksEntry({ command: blCmd('--exit-code', '10', '--exit-code', '0'), args: fixed })], /--exit-code/);
@@ -1136,10 +1137,10 @@ describe('Task 5 review probes (fix round 1)', () => {
     step: { cli: { install: { method: 'github-release', package: pkg, version }, command }, output: { path: '', format: 'none' } },
     fixedInputs: {}, choices: {}, configFiles: [], reviewedBy: 'PENDING', reviewedAt: 'PENDING', proofs: 0, ...extra,
   });
-  const pbetterleaks = () => pcli('betterleaks', 'betterleaks/betterleaks', 'v1.9.0', 'betterleaks_1.9.0_linux_x64.tar.gz', ['betterleaks', 'dir', '--redact', '--report-format', 'sarif', '--report-path', 'b.sarif', '--exit-code', '10', '.'],
+  const pbetterleaks = () => pcli('betterleaks', 'betterleaks/betterleaks', 'v1.9.0', 'betterleaks_1.9.0_linux_x64.tar.gz', ['betterleaks', 'dir', '--redact', '--report-format', 'sarif', '--report-path', 'b.sarif', '--exit-code', '10', '--max-archive-depth', '0', '.'],
     {
-      fixedInputs: { args: ['--redact', '--report-format', 'sarif', '--exit-code', '10'], config: { content: '[extend]\nuseDefault = true\n', passAs: { flag: '--config' } } },
-      verifiedWith: vw('betterleaks/betterleaks', 'refs/tags/v1.9.0'), step: { cli: { install: { method: 'github-release', package: 'betterleaks_1.9.0_linux_x64.tar.gz', version: 'v1.9.0' }, command: ['betterleaks', 'dir', '--redact', '--report-format', 'sarif', '--report-path', 'b.sarif', '--exit-code', '10', '.'] }, output: { path: 'b.sarif', format: 'sarif' } },
+      fixedInputs: { args: ['--redact', '--report-format', 'sarif', '--exit-code', '10', '--max-archive-depth', '0'], config: { content: '[extend]\nuseDefault = true\n', passAs: { flag: '--config' } } },
+      verifiedWith: vw('betterleaks/betterleaks', 'refs/tags/v1.9.0'), step: { cli: { install: { method: 'github-release', package: 'betterleaks_1.9.0_linux_x64.tar.gz', version: 'v1.9.0' }, command: ['betterleaks', 'dir', '--redact', '--report-format', 'sarif', '--report-path', 'b.sarif', '--exit-code', '10', '--max-archive-depth', '0', '.'] }, output: { path: 'b.sarif', format: 'sarif' } },
     });
   const PNUC_ENV = { ...NUCLEI_ENV, [NUCLEI_SUM_ENV]: H };
   const pnuclei = () => {
@@ -1683,6 +1684,33 @@ describe('data/reviewed-tools.yml', () => {
       if (id === 'gitleaks') expect(() => loadAtReal([gitMode]), id).toThrow();
     }
     expect(ARGV_POLICIES.gitleaks?.sub).toEqual(['dir']);
+  });
+
+  it('data (C1b fix round 2, R1-C1): betterleaks and gitleaks never open archives (--max-archive-depth 0, in the command and the fixed args, required by the policy)', () => {
+    for (const id of ['betterleaks', 'gitleaks']) {
+      const t = byId(real(), id)[0];
+      const cmd = t?.step.cli?.command ?? [];
+      expect(cmd.slice(cmd.indexOf('--max-archive-depth'), cmd.indexOf('--max-archive-depth') + 2), id).toEqual(['--max-archive-depth', '0']);
+      const args = t?.fixedInputs.args ?? [];
+      expect(args.slice(args.indexOf('--max-archive-depth'), args.indexOf('--max-archive-depth') + 2), id).toEqual(['--max-archive-depth', '0']);
+      expect(t?.reviewedBy, id).toBe('Claude delegated DECISIONS 105');
+      expect(t?.reviewedAt, id).toBe('2026-10-29');
+      const raw = rawFile().tools.find((x) => x.id === id) as Entry;
+      const without = (xs: string[]) => xs.filter((x, i) => !(x === '--max-archive-depth' || xs[i - 1] === '--max-archive-depth'));
+      const withDepth = (xs: string[], d: string) => xs.map((x, i) => (xs[i - 1] === '--max-archive-depth' ? d : x));
+      const edit = (f: (xs: string[]) => string[], where: 'both' | 'command' | 'args') => {
+        const e = structuredClone(raw);
+        if (where !== 'args') e.step.cli.command = f(e.step.cli.command);
+        if (where !== 'command') e.fixedInputs.args = f(e.fixedInputs.args ?? []);
+        return e;
+      };
+      expect(() => loadAtReal([edit((xs) => xs, 'both')]), `${id} control`).not.toThrow();
+      expect(() => loadAtReal([edit(without, 'both')]), `${id} flag removed`).toThrow(/max-archive-depth/);
+      expect(() => loadAtReal([edit(without, 'command')]), `${id} removed from the command`).toThrow();
+      expect(() => loadAtReal([edit(without, 'args')]), `${id} removed from the fixed args`).toThrow(/max-archive-depth/);
+      for (const d of ['1', '8', '-1', '00']) expect(() => loadAtReal([edit((xs) => withDepth(xs, d), 'both')]), `${id} depth ${d}`).toThrow(/max-archive-depth/);
+    }
+    expect(ARGV_POLICIES.gitleaks?.required?.['max-archive-depth']).toBe('0');
   });
 
   it('data: docker login offers ghcr.io only (the workflow token must not go to another registry), reviewed by delegation', () => {

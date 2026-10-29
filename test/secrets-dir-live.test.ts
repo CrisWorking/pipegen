@@ -9,36 +9,16 @@ import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { ensurePinnedBinary } from '../src/engine/linters.js';
-import { loadReviewed } from '../src/engine/reviewed.js';
 import { readRegion } from '../gate/src/fingerprint.js';
 import { parseSarifText, SARIF_TOOLS } from '../gate/src/sarif.js';
 import { cleanupRepos, makeTempDir, writeIn } from './helpers/make-repo.js';
+import { git, runEntry } from './helpers/secrets-live.js';
 
 const live = process.env.PIPEGEN_LIVE_TESTS === '1';
 // built at runtime: the repo's own check refuses secret-like literals in test/
 const mk = (seed: string): string => `gh` + `p_` + createHash('sha256').update(seed).digest('hex').slice(0, 18).toUpperCase() + createHash('sha256').update(seed).digest('hex').slice(18, 36);
 const PLANT_A = mk('one');
 const PLANT_B = mk('two');
-const git = (dir: string, ...args: string[]): void => {
-  execFileSync('git', ['-c', 'user.name=t', '-c', 'user.email=t@example.com', '-c', 'commit.gpgsign=false', '-c', 'core.hooksPath=/dev/null', ...args], { cwd: dir, stdio: 'pipe' });
-};
-
-/** The reviewed entry's own command, with the pinned config and an absolute report path; returns the SARIF text. */
-function runEntry(id: 'betterleaks' | 'gitleaks', bin: string, dir: string): string {
-  const entry = loadReviewed().find((t) => t.id === id);
-  if (entry?.step.cli === undefined) throw new Error('no entry');
-  const report = join(makeTempDir(), `${id}.sarif`);
-  const conf = join(makeTempDir(), `${id}.toml`);
-  writeIn(join(conf, '..'), `${id}.toml`, '[extend]\nuseDefault = true\n');
-  const argv = entry.step.cli.command.slice(1).map((a) => (a === `${id}.sarif` ? report : a));
-  try {
-    execFileSync(bin, [...argv.slice(0, -1), '--config', conf, argv.at(-1) as string], { cwd: dir, stdio: 'pipe', env: { PATH: process.env.PATH ?? '', HOME: dir }, timeout: 120_000 });
-  } catch (e) {
-    if ((e as { status?: number }).status !== 10) throw e;
-  }
-  return readFileSync(report, 'utf8');
-}
-
 describe.skipIf(!live)('secrets tools in dir mode read what the scrub reads (live, real pinned binaries)', () => {
   const bins: Record<string, string> = {};
   beforeAll(async () => {
