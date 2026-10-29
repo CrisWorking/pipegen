@@ -56,12 +56,17 @@ const builtIn = (note: string): Choice => ({ tool: { kind: 'built-in' }, also: [
 /** A reviewed id from the usable entries, or null. */
 const entry = (c: Ctx, id: string): ReviewedTool | null => c.usable.find((t) => t.id === id) ?? null;
 
-/** The reviewed tool `id` with its reason; missing from the list → tool null and a note that says so. `also` ids that are missing are left out. */
-function reviewed(c: Ctx, id: string, reason: string, alsoIds: readonly string[] = [], extra = ''): Choice {
+/** Note text; a function gets the ids of the `also` tools that were actually found, so a note never names one the list lacks. */
+type NoteText = string | ((found: ReadonlySet<string>) => string);
+const text = (t: NoteText, found: ReadonlySet<string>): string => (typeof t === 'string' ? t : t(found));
+
+/** The reviewed tool `id` with its reason; missing from the list → tool null and a note that says so. `also` ids that are missing are left out, and so are their names in the note (use a NoteText). */
+function reviewed(c: Ctx, id: string, reason: NoteText, alsoIds: readonly string[] = [], extra: NoteText = ''): Choice {
   const tool = entry(c, id);
-  if (tool === null) return { ...none(`${reason}; ${NO_ENTRY}`), unlisted: true };
+  if (tool === null) return { ...none(`${text(reason, new Set())}; ${NO_ENTRY}`), unlisted: true };
   const also = alsoIds.map((a) => entry(c, a)).filter((t): t is ReviewedTool => t !== null);
-  return { tool, also, note: `${reason}${extra}` };
+  const found = new Set(also.map((t) => t.id));
+  return { tool, also, note: `${text(reason, found)}${text(extra, found)}` };
 }
 
 /** The repo's own tool at its lockfile version. */
@@ -226,13 +231,22 @@ const RULES: Readonly<Record<string, Rule>> = {
   'dockerfile-lint': (c) => reviewed(c, T.hadolint, 'Hadolint: lints the Dockerfile', [], "; Trivy config's Dockerfile checks stay on"),
   'workflow-lint': (c) => {
     const risky = c.p.existingWorkflows.some((w) => w.triggers.some((t) => RISKY_TRIGGERS.includes(t)));
-    return reviewed(c, T.actionlint, `actionlint and zizmor: check the workflows for mistakes and risky patterns${risky ? '; poutine too, because a workflow runs on untrusted pull request input' : ''}`, risky ? [T.zizmor, T.poutine] : [T.zizmor]);
+    return reviewed(
+      c, T.actionlint,
+      (found) => (found.has(T.zizmor) ? 'actionlint and zizmor: check the workflows for mistakes and risky patterns' : 'actionlint: checks the workflows for mistakes'),
+      risky ? [T.zizmor, T.poutine] : [T.zizmor],
+      (found) => (risky && found.has(T.poutine) ? '; poutine too, because a workflow runs on untrusted pull request input' : ''),
+    );
   },
   'workflow-pin-check': (c) => reviewed(c, T.pinact, 'pinact: checks that every action is pinned to a commit', [], c.p.repoFiles.actionsLock ? "; an actions.lock exists, so pinact won't rewrite its pins" : ''),
   'dependency-review': dependencyReviewRule,
   licences: licencesRule,
   'api-dast': apiDastRule,
-  iac: (c) => reviewed(c, T.trivyConfig, c.p.repoFiles.kubernetes ? 'Trivy config: scans Terraform and Kubernetes files, plus kube-linter' : 'Trivy config: scans Terraform files', c.p.repoFiles.kubernetes ? [T.kubeLinter] : []),
+  iac: (c) => reviewed(
+    c, T.trivyConfig,
+    (found) => (c.p.repoFiles.kubernetes ? `Trivy config: scans Terraform and Kubernetes files${found.has(T.kubeLinter) ? ', plus kube-linter' : ''}` : 'Trivy config: scans Terraform files'),
+    c.p.repoFiles.kubernetes ? [T.kubeLinter] : [],
+  ),
   secrets: (c) => reviewed(c, T.betterleaks, 'Betterleaks: scans for committed secrets', [], c.p.repoFiles.secretsBaseline ? '; a .secrets.baseline exists, so detect-secrets also runs' : ''),
   'update-config': updateConfigRule,
   publishing: () => builtIn('trusted publishing (OIDC); no long-lived token'),

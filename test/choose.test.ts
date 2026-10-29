@@ -146,6 +146,32 @@ describe('choose: configured tools with no installed version (m3)', () => {
   });
 });
 
+describe('choose: a note names only `also` tools the list has (m6)', () => {
+  const without = (...ids: string[]) => LIST.filter((t) => !ids.includes(t.id));
+  const risky: ExistingWorkflow = { path: '.github/workflows/a.yml', triggers: ['pull_request_target'], deploys: false, [USED]: [], jobs: ['a'] };
+  const k8s = profile([svc()], { repoFiles: { ...emptyRepoFiles(), kubernetes: true } });
+  it('choose: workflow-lint without poutine or zizmor → no note names them', () => {
+    const p = profile([svc()], { existingWorkflows: [risky] });
+    const all = choose('workflow-lint', p);
+    expect(all.note).toContain('actionlint and zizmor');
+    expect(all.note).toContain('poutine too');
+    const noPoutine = choose('workflow-lint', p, without('poutine'));
+    expect(alsoIds(noPoutine)).toEqual(['zizmor']);
+    expect(noPoutine.note).toContain('actionlint and zizmor');
+    expect(noPoutine.note).not.toContain('poutine');
+    const bare = choose('workflow-lint', p, without('poutine', 'zizmor'));
+    expect(alsoIds(bare)).toEqual([]);
+    expect(bare.note).not.toMatch(/zizmor|poutine/);
+    expect(bare.note).toContain('actionlint');
+  });
+  it('choose: iac on Kubernetes without kube-linter → no "plus kube-linter"', () => {
+    expect(choose('iac', k8s).note).toContain('plus kube-linter');
+    const c = choose('iac', k8s, without('kube-linter'));
+    expect(alsoIds(c)).toEqual([]);
+    expect(c.note).toBe('Trivy config: scans Terraform and Kubernetes files');
+  });
+});
+
 describe('choose: type-check', () => {
   it('choose: Vue → vue-tsc, Svelte → svelte-check, Astro → astro check (own, at the lockfile version)', () => {
     const q = (f: 'vue' | 'svelte' | 'astro', versions: Service['quality']['versions']) => profile([svc({}, { uiFrameworks: [f], tsconfig: true, versions })]);
