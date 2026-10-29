@@ -105,8 +105,10 @@ jobs:
           set -euo pipefail
           mkdir out
           npm pack --ignore-scripts --pack-destination out
-          tgz=$(ls out/*.tgz)
-          [ "$(ls out/*.tgz | wc -l)" = 1 ] || { echo "::error::expected exactly one tarball"; exit 1; }
+          shopt -s nullglob
+          tgzs=(out/*.tgz)
+          [ "${#tgzs[@]}" = 1 ] || { echo "::error::expected exactly one tarball"; exit 1; }
+          tgz=${tgzs[0]}
           echo "version=$(node -p 'require("./package.json").version')" >> "$GITHUB_OUTPUT"
           # CycloneDX SBOM of exactly the bundled packages (the same list as THIRD_PARTY_NOTICES, from the build metafile);
           # devDependencies that are not bundled (vitest, typescript, tsup...) are not listed

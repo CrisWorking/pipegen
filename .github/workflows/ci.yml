@@ -236,7 +236,10 @@ jobs:
           node-version: 24
       - name: Install the base's dependencies (base lockfile, no install scripts)
         working-directory: base
-        run: npm ci --ignore-scripts
+        run: |
+          # Bootstrap (the next step): a base without the script has nothing to install for it
+          if [ ! -f scripts/cooldown.ts ]; then echo "::notice::base has no scripts/cooldown.ts; nothing to install"; exit 0; fi
+          npm ci --ignore-scripts
       - name: Run the base's cooldown script on the PR's files
         run: |
           if [ ! -f base/scripts/cooldown.ts ]; then
