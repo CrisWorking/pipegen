@@ -943,7 +943,18 @@ export function scanShell(text: string, base: string | null, sigs: Compiled, bud
     if (name === 'docker' && next === 'run') {
       visit(false);
       let j = k + 2;
-      for (let f = word(j); f !== null && f.startsWith('-'); f = word(j)) j += !f.includes('=') && DOCKER_VALUE_FLAGS.has(f) ? 2 : 1;
+      let detached = false;
+      for (let f = word(j); f !== null && f.startsWith('-'); f = word(j)) {
+        // P57 (C2): -d / --detach (also in a group of short flags, -dit) runs the container in the background: docker returns
+        // at once, so nothing the container runs can fail the step
+        if (f === '--detach' || f === '--detach=true' || /^-[A-Za-z]*d[A-Za-z]*$/.test(f)) detached = true;
+        j += !f.includes('=') && DOCKER_VALUE_FLAGS.has(f) ? 2 : 1;
+      }
+      if (detached) {
+        cmd = false;
+        k = segEnd[k]!;
+        continue;
+      }
       const image = word(j);
       if (image !== null) match(j, image, imageName(image));
       containerEnd = segEnd[k]!;

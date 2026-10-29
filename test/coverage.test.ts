@@ -3322,3 +3322,32 @@ describe('coverage: a tool covers only services of its languages (P57 C1)', () =
     expect(st(rows3, 'push', 'lint', 'worker')).toBe('missing');
   });
 });
+
+describe('coverage: a detached compose or docker run gives no coverage (P57 C2)', () => {
+  const backend = svc('backend', { language: 'python', packageManager: 'uv', scripts: ['start'], frameworks: ['fastapi'] });
+  const COMPOSE = 'services:\n  web:\n    build: ./backend\n';
+  const unitTests = async (steps: string) => {
+    const dir = makeTempDir();
+    writeIn(dir, 'compose.yml', COMPOSE);
+    writeIn(dir, 'backend/Dockerfile', 'FROM python:3.14\nWORKDIR /app\nCOPY . /app\n');
+    ci(dir, steps);
+    const r = row(await coverage(dir, { services: [backend] }), 'push', 'unit-tests', 'backend');
+    return `${r.status}${r.by === undefined ? '' : ` ${r.by}`}`;
+  };
+
+  it('dk probe: compose run -d / --detach and exec -d return at once, so the tests\' failure never reaches the step', async () => {
+    for (const steps of [run('docker compose run -d web pytest'), run('docker compose run --detach web pytest'), run('docker compose run --rm -d web pytest'),
+      run('docker compose up -d') + run('docker compose exec -d web pytest'), run('docker compose exec --detach web pytest'), run('docker-compose run -d web pytest')]) {
+      expect(await unitTests(steps), steps).toBe('missing');
+    }
+    // the same commands without -d still count
+    expect(await unitTests(run('docker compose run --rm web pytest'))).toBe('covered your own `pytest`');
+    expect(await unitTests(run('docker compose up -d') + run('docker compose exec -T web pytest'))).toBe('covered your own `pytest`');
+  });
+
+  it('docker run -d (also in a group of short flags) runs the container in the background: its command gives no coverage', async () => {
+    for (const cmd of ['docker run -d img:1 pytest', 'docker run --detach img:1 pytest', 'docker run -dit img:1 pytest', 'docker run --rm -d -e A=b img:1 pytest']) {
+      expect(await unitTests(run(cmd)), cmd).toBe('missing');
+    }
+  });
+});

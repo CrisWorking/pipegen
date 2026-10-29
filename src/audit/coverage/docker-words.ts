@@ -129,11 +129,12 @@ export function composeBuildServices(at: At, from: number, end: number): string[
 /**
  * `docker compose run|exec [flags] <service> <command…>`: the service name and the index of the command's first word.
  * Flags that don't change what runs or where are skipped; `--entrypoint` and `-w/--workdir` (another command, another
- * folder), `--build` and any flag pipegen doesn't know give null.
+ * folder), `--build` and any flag pipegen doesn't know give null. P57 (C2): so does `-d`/`--detach`: the command runs in
+ * the background and compose returns at once, so its failure never reaches the step.
  */
 const RUN_VALUE: ReadonlySet<string> = new Set(['-e', '--env', '-v', '--volume', '-p', '--publish', '-u', '--user', '--name', '-l', '--label', '--cap-add', '--cap-drop', '--pull', '--env-from-file', '--index']);
 const RUN_BOOL: ReadonlySet<string> = new Set([
-  '-d', '--detach', '--rm', '-T', '--no-TTY', '--no-tty', '-i', '-t', '--interactive', '--tty', '--no-deps', '--service-ports', '-P', '--use-aliases', '--quiet-pull', '--remove-orphans',
+  '--rm', '-T', '--no-TTY', '--no-tty', '-i', '-t', '--interactive', '--tty', '--no-deps', '--service-ports', '-P', '--use-aliases', '--quiet-pull', '--remove-orphans',
   '--privileged', '--quiet',
 ]);
 export function composeRunWords(at: At, from: number, end: number): { service: string; commandAt: number } | null {
