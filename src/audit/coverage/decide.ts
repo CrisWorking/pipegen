@@ -75,6 +75,7 @@ const REASON_WHY: Readonly<Record<Reason, (subject: string, when: string) => str
   stage: (s) => `${s} is set up for another pre-commit stage, so it doesn't run before each commit.`,
   skip: (s) => `${s} runs, but SKIP or PREK_SKIP is set in this job, so some pre-commit hooks don't run here.`,
   changed: (s) => `${s} runs only on the files that changed between two commits, not on every file, so a problem in an untouched file isn't caught.`,
+  part: (s) => `${s} runs only on part of the repo (a folder, a glob or a list of files), so a problem elsewhere isn't caught.`,
   ref: (s) => `${s} runs at a version pipegen can't place, so pipegen can't tell whether it does this check.`,
   'tox-env': (s) => `${s} runs, but a TOX… variable in this job (like TOXENV) picks which tox environments run, so pipegen can't tell if it runs the tests.`,
   'nox-env': (s) => `${s} runs, but a NOX… variable in this job (like NOXSESSION) picks which nox sessions run, so pipegen can't tell if it runs the tests.`,

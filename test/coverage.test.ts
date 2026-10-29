@@ -1307,7 +1307,8 @@ describe('mapCoverage (P55 batch B: prek)', () => {
       expect(lint.why).toMatch(/only on the files that changed between two commits/);
       expect(row(rows, 'merge', 'hooks-ci').status).toBe('covered');
     }
-    for (const cmd of ['prek run', 'prek run --from-ref origin/main', 'prek run --all-files --from-ref a --to-ref b', 'prek run ruff-check --from-ref a --to-ref b', 'prek run --files a.py']) {
+    // P59 (2): `--files a.py` is part of the repo (partial), tested with the other part-of-repo flags
+    for (const cmd of ['prek run', 'prek run --from-ref origin/main', 'prek run --all-files --from-ref a --to-ref b', 'prek run ruff-check --from-ref a --to-ref b']) {
       expect(row(await lintOf(cfg, run(cmd)), 'merge', 'lint', 'app').status, cmd).toBe('missing');
     }
     const act = "      - uses: j178/prek-action@v1\n        with:\n          extra-args: --from-ref origin/main --to-ref HEAD\n";
@@ -1394,7 +1395,7 @@ describe('mapCoverage (Task 5, item 3: pre-commit hook contents)', () => {
     const config = hookConfig('      - id: ruff-check\n');
     for (const steps of [
       run('pre-commit run'), run('pre-commit run ruff-check --all-files'), run('pre-commit run --hook-stage manual --all-files'),
-      run('pre-commit run --files a.py'), run('pre-commit run -c other.yaml --all-files'),
+      run('pre-commit run -c other.yaml --all-files'), // P59 (2): --files a.py is partial now, tested apart
       "      - uses: pre-commit/action@v3.0.1\n        with:\n          extra_args: ruff-check --all-files\n",
       "      - uses: pre-commit/action@v3.0.1\n        with:\n          extra_args: ${{ inputs.args }}\n",
     ]) {
@@ -3670,5 +3671,67 @@ describe('coverage: every cap in the Docker, compose, prek and env code fails cl
     const dirs: Record<string, string> = {};
     for (let i = 0; i < 40; i++) dirs[`d${i}/a.py`] = 'x = 1\n'; // more than pipegen places (32), fewer than it reads (64)
     expect(await st(dirs, run(`ruff check ${Object.keys(dirs).map((f) => f.split('/')[0]).join(' ')}`), 'lint')).not.toBe('covered ruff');
+  });
+});
+
+describe('coverage: ruling P59 (round 2)', () => {
+  const app = svc('.', { language: 'python', packageManager: 'uv', scripts: ['start'], frameworks: ['fastapi'], quality: { ...emptyServiceQuality(), pythonTyped: true } });
+  const st = async (files: Record<string, string>, steps: string, id = 'unit-tests', services = [app], service = 'app') => {
+    const dir = makeTempDir();
+    for (const [rel, text] of Object.entries(files)) writeIn(dir, rel, text);
+    ci(dir, steps);
+    const r = row(await coverage(dir, { services }), 'push', id, service);
+    return `${r.status}${r.by === undefined ? '' : ` ${r.by}`}`;
+  };
+
+  it('1. a command given through a variable is never credited to any tool', async () => {
+    const BODY = 'FROM python:3.14\nWORKDIR /app\nCOPY . /app\n';
+    expect(await st({ Dockerfile: `${BODY}ARG TEST_CMD=pytest\nRUN $TEST_CMD\n` }, run('docker build .'))).toBe('missing');
+    for (const cmd of ['$CMD pytest', '${RUNNER} pytest', '"$PY" -m pytest', '$TOOL']) expect(await st({}, run(cmd)), cmd).toBe('missing');
+    expect(await st({ 'package.json': JSON.stringify({ name: 'a', scripts: { ci: '$X pytest' } }) }, run('npm run ci'))).toBe('missing');
+    const { CANT_SEE } = await import('../src/audit/render.js');
+    expect(CANT_SEE).toContain("Commands given through a variable aren't read.");
+  });
+
+  it('2. prek --directory / --glob and pre-commit --files run on part of the repo: partial with their own reason', async () => {
+    for (const cmd of ['prek run --all-files --directory backend', 'prek run --all-files -d backend', 'prek run --all-files --glob "*.py"', 'pre-commit run --files a.py b.py', 'prek run --files a.py']) {
+      const dir = makeTempDir();
+      writeIn(dir, '.pre-commit-config.yaml', hookConfig('      - id: ruff-check\n'));
+      ci(dir, run(cmd));
+      const r = row(await coverage(dir, pyApp), 'merge', 'lint', 'app');
+      expect(`${r.status} ${r.by ?? ''}`, cmd).toBe('partial ruff');
+      expect(r.why, cmd).toMatch(/runs only on part of the repo/);
+    }
+  });
+
+  it('3. a path argument pipegen can\'t place never falls back to the run\'s whole folder: unknown, never covered', async () => {
+    const backend = svc('backend', { language: 'python', packageManager: 'uv', scripts: [], quality: { ...emptyServiceQuality(), pythonTyped: true } });
+    const worker = svc('worker', { language: 'python', packageManager: 'uv', scripts: [], quality: { ...emptyServiceQuality(), pythonTyped: true } });
+    const tree = { 'backend/app.py': 'x = 1\n', 'worker/w.py': 'x = 1\n' };
+    for (const cmd of ['mypy $DIRS', 'mypy "$SRC"', 'mypy backend/**/x*.py', 'mypy ../elsewhere', 'mypy --strict $DIR', 'pytest $TESTS']) {
+      const id = cmd.startsWith('pytest') ? 'unit-tests' : 'type-check';
+      for (const s of ['backend', 'worker']) expect(await st(tree, run(cmd), id, [backend, worker], s), `${cmd} ${s}`).toMatch(/^unknown/);
+    }
+    // a flag's quoted value is not a path; plain paths and subcommands still read as before
+    expect(await st(tree, run('pytest -k "not slow"'), 'unit-tests', [backend, worker], 'worker')).toBe('covered your own `pytest`');
+    expect(await st(tree, run('mypy backend'), 'type-check', [backend, worker], 'worker')).toBe('missing');
+    expect(await st(tree, run('ruff check .'), 'lint', [backend, worker], 'worker')).toBe('covered ruff');
+  });
+
+  it('4. a compose command inside a package script, with COMPOSE_FILE or COMPOSE_PROFILES set in the job: unknown, not missing', async () => {
+    const files = {
+      'package.json': JSON.stringify({ name: 'a', scripts: { ci: 'docker compose run --rm app pytest', build: 'docker compose build' } }),
+      'compose.ci.yml': 'services:\n  app:\n    build: .\n', Dockerfile: 'FROM python:3.14\nWORKDIR /app\nCOPY . /app\n',
+    };
+    expect(await st(files, '      - run: npm run ci\n        env:\n          COMPOSE_FILE: compose.ci.yml\n')).toMatch(/^unknown/);
+    const profiled = {
+      'package.json': JSON.stringify({ name: 'a', scripts: { build: 'docker compose build' } }), Dockerfile: 'FROM python:3.14\nWORKDIR /app\nCOPY . /app\n',
+      'Dockerfile.test': 'FROM python:3.14\nWORKDIR /app\nCOPY . /app\nRUN pytest\n',
+      'compose.yml': 'services:\n  app:\n    build: .\n  tests:\n    profiles: [test]\n    build:\n      context: .\n      dockerfile: Dockerfile.test\n',
+    };
+    expect(await st(profiled, '      - run: npm run build\n        env:\n          COMPOSE_PROFILES: test\n')).toMatch(/^unknown/);
+    // without the variable: the default file decides (no compose file → the runner fails → missing; the profile is off → missing)
+    expect(await st(files, run('npm run ci'))).toBe('missing');
+    expect(await st(profiled, run('npm run build'))).toBe('missing');
   });
 });

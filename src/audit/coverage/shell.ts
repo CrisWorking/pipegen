@@ -205,8 +205,10 @@ function picksOther(flag: string, long: readonly string[], short: string): boole
  * another config, a flag pipegen doesn't know, --all-files together with refs) is null. Without --all-files and refs,
  * `pre-commit run` checks the staged files, and a CI checkout has none.
  */
-export function preCommitRunMode(words: readonly string[]): 'all' | 'changed' | null {
+export function preCommitRunMode(words: readonly string[]): 'all' | 'changed' | 'part' | null {
   let all = false;
+  let part = false; // P59 (2): prek --directory / -d / --glob, or a --files list: only part of the repo
+  let files = false; // after --files, plain words are file names
   let from = false;
   let to = false;
   let last = false; // P57 (M2): prek's --last-commit: the files the last commit changed
@@ -217,12 +219,22 @@ export function preCommitRunMode(words: readonly string[]): 'all' | 'changed' | 
       if (!r) i++;
       continue;
     }
-    if (!w.startsWith('-')) return null; // a hook id, or the value of a flag pipegen doesn't know
+    if (!w.startsWith('-')) {
+      if (files) continue; // a file of the --files list
+      return null; // a hook id, or the value of a flag pipegen doesn't know
+    }
+    files = false;
     const eq = w.indexOf('=');
     const name = eq < 0 ? w : w.slice(0, eq);
     const value = eq < 0 ? undefined : w.slice(eq + 1);
     if ((name === '-a' || name === '--all-files') && value === undefined) all = true;
     else if (name === '--last-commit' && value === undefined) last = true;
+    else if (name === '--files' && value === undefined) part = files = true;
+    else if (name === '--directory' || name === '-d' || name === '--glob') {
+      const v = value ?? words[++i];
+      if (v === undefined || v === '' || v.startsWith('-')) return null;
+      part = true;
+    }
     else if (value === undefined && ['--show-diff-on-failure', '-v', '--verbose', '--fail-fast'].includes(name)) continue;
     else if (name === '--color') i += value === undefined ? 1 : 0;
     else if (['--from-ref', '--source', '-s', '--to-ref', '--origin', '-o'].includes(name)) {
@@ -235,6 +247,7 @@ export function preCommitRunMode(words: readonly string[]): 'all' | 'changed' | 
       if (stage !== 'pre-commit' && stage !== 'commit') return null;
     } else return null;
   }
+  if (part) return 'part';
   if (all) return from || to || last ? null : 'all';
   if (last) return from || to ? null : 'changed';
   return from && to ? 'changed' : null;
@@ -543,7 +556,7 @@ export function scanShell(text: string, base: string | null, sigs: Compiled, bud
         if (isHookRunner(r.tool.id) && r.rest.length === 1 && r.rest[0] === 'run' && segEnd[k]! - k - 1 <= MAX_FLAG_WORDS && cwd === '.') {
           const mode = preCommitRunMode(args.slice(1));
           if (mode === 'all') f.hookRun = true;
-          else if (mode === 'changed') f.hookRun = 'changed';
+          else if (mode !== null) f.hookRun = mode;
         }
         // P55 (batch B): the Dockerfile a `docker build` names, so its RUN lines count (resolveScripts)
         if (r.tool.id === DOCKER_BUILD_ID && r.tool.commands?.includes(r.rest.length === 1 ? 'docker build' : 'docker buildx build') === true && cwd !== null) {

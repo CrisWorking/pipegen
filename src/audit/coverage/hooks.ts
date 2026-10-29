@@ -250,8 +250,8 @@ const skipKey = (h: Hit) => (h.hookSkip === undefined ? '' : `${h.hookSkip.unkno
 export async function hookRunHits(ctx: Ctx): Promise<void> {
   const reps = new Map<string, Hit>();
   for (const h of ctx.hits) {
-    const key = `${h.by ?? ''}\u0000${h.fit.push ? 1 : 0}${h.fit.merge ? 1 : 0}${h.fit.deploy ? 1 : 0}\u0000${h.reason ?? ''}\u0000${h.hookRun === 'changed' ? 'changed' : ''}\u0000${skipKey(h)}`;
-    if ((h.hookRun === true || h.hookRun === 'changed') && !reps.has(key)) reps.set(key, h);
+    const key = `${h.by ?? ''}\u0000${h.fit.push ? 1 : 0}${h.fit.merge ? 1 : 0}${h.fit.deploy ? 1 : 0}\u0000${h.reason ?? ''}\u0000${h.hookRun === 'changed' || h.hookRun === 'part' ? h.hookRun : ''}\u0000${skipKey(h)}`;
+    if ((h.hookRun === true || h.hookRun === 'changed' || h.hookRun === 'part') && !reps.has(key)) reps.set(key, h);
   }
   if (reps.size === 0) return;
   const yamlTools = carriedTools((await readPrecommitConfig(ctx)).found);
@@ -290,7 +290,7 @@ export async function hookRunHits(ctx: Ctx): Promise<void> {
       // fix round 1 (P8): a softEnv name set in the CI job reaches the hook's tool; its config files are looked for later
       const set = softEnvSet(t.softEnv, rep.jobEnv);
       // a run over changed files only is partial ('changed'), unless something already keeps the hook from running
-      const reason = repReason ?? t.reason ?? (skipped ? 'skip' : null) ?? (rep.hookRun === 'changed' ? 'changed' : null);
+      const reason = repReason ?? t.reason ?? (skipped ? 'skip' : null) ?? (rep.hookRun === 'changed' || rep.hookRun === 'part' ? rep.hookRun : null);
       const configured = set !== null && (reason === null || !MAY_NOT_RUN.has(reason));
       ctx.hits.push({
         opaque: false, categories, by: t.by, subject, dir: '.', reason: configured ? 'config' : reason,

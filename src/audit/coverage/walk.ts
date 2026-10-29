@@ -207,7 +207,7 @@ function addFound(ctx: Ctx, found: Found[], c: StepCtx): void {
     if (c.conditional && (reason === null || !MAY_NOT_RUN.has(reason))) reason = 'condition';
     ctx.hits.push({
       opaque: false, categories: f.categories, by: f.by, subject: f.subject, dir: f.dir, reason,
-      ...(f.partialWhy === undefined ? {} : { partialWhy: f.partialWhy }), fit: c.fit, where: c.where, ...(f.hookRun === true || f.hookRun === 'changed' ? { hookRun: f.hookRun } : {}),
+      ...(f.partialWhy === undefined ? {} : { partialWhy: f.partialWhy }), fit: c.fit, where: c.where, ...(f.hookRun === true || f.hookRun === 'changed' || f.hookRun === 'part' ? { hookRun: f.hookRun } : {}),
       ...(c.laterStep === true ? { laterStep: true } : {}), ...(f.configFiles === undefined ? {} : { configFiles: f.configFiles }),
       ...(f.configFiles !== undefined && c.foldCase === true ? { foldCase: true } : {}),
       ...(f.jobEnv === undefined ? {} : { jobEnv: f.jobEnv }),
@@ -284,7 +284,7 @@ function actionFinds(ctx: Ctx, tools: readonly ToolSignature[], uses: string, w:
     if (isHookRunner(t.id)) {
       const mode = hookActionMode(t, w);
       if (mode === 'all') f.hookRun = true;
-      else if (mode === 'changed') f.hookRun = 'changed';
+      else if (mode !== null) f.hookRun = mode;
     }
     return f;
   });
@@ -324,7 +324,7 @@ function buildActionBuild(w: Inputs): DockerBuild | null {
  * `extra_args` name still works; `working-directory` moves the config's folder;
  * https://github.com/j178/prek-action/blob/master/action.yml). The mode of preCommitRunMode, or null.
  */
-function hookActionMode(t: ToolSignature, w: Inputs): 'all' | 'changed' | null {
+function hookActionMode(t: ToolSignature, w: Inputs): 'all' | 'changed' | 'part' | null {
   const prek = t.id === PREK_ID;
   const names = prek ? ['extra-args', 'extra_args'] : ['extra_args'];
   if (names.some((n) => w.crowded.has(n)) || (prek && w.crowded.has('working-directory'))) return null;
@@ -335,7 +335,7 @@ function hookActionMode(t: ToolSignature, w: Inputs): 'all' | 'changed' | null {
   }
   const given = names.flatMap((n) => w.byName.get(n) ?? []);
   if (given.length === 0) return 'all';
-  const modes = given.map((v): 'all' | 'changed' | null => {
+  const modes = given.map((v): 'all' | 'changed' | 'part' | null => {
     if (v === null || v === undefined) return 'all'; // `extra_args:` with no value: the default
     if (typeof v !== 'string' || !regexSafe(v) || v.includes('${{')) return null;
     const toks = tokenize(v);

@@ -17,7 +17,7 @@ import type { Found, JobEnv, Obj, Reason } from './types.js';
  * file or env var that can turn the check off, and an egress step on a runner it can't guard. (Here, not in decide.ts,
  * so the env gate can read it without an import cycle.)
  */
-export const MAY_NOT_RUN: ReadonlySet<Reason> = new Set<Reason>(['condition', 'script-condition', 'shell-condition', 'hook-repo', 'files', 'stage', 'skip', 'changed', 'ref', 'tox-env', 'nox-env',
+export const MAY_NOT_RUN: ReadonlySet<Reason> = new Set<Reason>(['condition', 'script-condition', 'shell-condition', 'hook-repo', 'files', 'stage', 'skip', 'changed', 'part', 'ref', 'tox-env', 'nox-env',
   'unavailable', 'needs-inputs', 'some-jobs', 'target', 'config', 'runner', 'never-listed']);
 
 // ---------- if: conditions (review I3) ----------
@@ -645,6 +645,6 @@ export const gated = (found: Found[], g: EnvGate): Found[] => found
     const file = configFileNamed(f.configFiles, g.env);
     const what = set ?? (file === null ? null : `a ${file} file written in this job`);
     if (what !== null && (f.reason === null || !MAY_NOT_RUN.has(f.reason))) return { ...f, reason: 'config' as const, partialWhy: configWhy(f.subject, what) };
-    if ((f.hookRun === true || f.hookRun === 'changed') && !emptyEnv(g.env)) return { ...f, jobEnv: g.env };
+    if ((f.hookRun === true || f.hookRun === 'changed' || f.hookRun === 'part') && !emptyEnv(g.env)) return { ...f, jobEnv: g.env };
     return f;
   });

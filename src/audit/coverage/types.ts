@@ -31,6 +31,8 @@ export type Reason = 'continue' | 'suppressed' | 'function' | 'soft' | 'inputs' 
   // P53: the same, in a workflow step's run:, a package script or a hook file
   | 'shell-condition'
   | 'hook-repo' | 'files' | 'stage' | 'skip' | 'changed' | 'ref' | 'tox-env' | 'nox-env'
+  // P59 (2): a CI hook run limited to part of the repo (prek --directory / --glob, a --files list)
+  | 'part'
   // Plan P Task 3: an action this repo can't use (availability), an action not set up for the check (requireInputs),
   // egress control missing from some release jobs (PB5), a scan target pipegen can't place (imageArg), a command with
   // more words than pipegen reads
@@ -77,7 +79,7 @@ export interface Found {
    * drops it). P55 (batch B): 'changed' = it runs over the files between two refs only (`--from-ref … --to-ref …`), so
    * those tools are carried as partial ('changed').
    */
-  hookRun?: boolean | 'changed';
+  hookRun?: boolean | 'changed' | 'part';
   /**
    * P55 (batch B): `docker build`, docker/build-push-action or `docker compose build` builds these images, so the RUN lines
    * of their Dockerfiles run in CI (read by resolveScripts, docker.ts): one Dockerfile and its context, or the services of
@@ -123,7 +125,7 @@ export interface Hit {
   fit: Fit;
   where: string;
   why?: string;
-  hookRun?: boolean | 'changed';
+  hookRun?: boolean | 'changed' | 'part';
   /** Plan P Task 3 (PB5): found in a local composite action's later step, so not the first step of its job. */
   laterStep?: boolean;
   /** Fix round 1: config files the tool loads by itself (checked for after the walk), and a CI pre-commit run's job env. */
