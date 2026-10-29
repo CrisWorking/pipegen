@@ -123,7 +123,7 @@ function repo(files: Record<string, string> = {}): string {
 const nodeApp = (over: Record<string, unknown> = {}): Record<string, string> => ({
   'package.json': JSON.stringify({ name: 'app', scripts: { test: 'vitest run', lint: 'eslint .', start: 'node index.js' }, devDependencies: { vitest: '1.0.0' }, ...over }),
   'package-lock.json': '{}\n',
-  'index.js': 'console.log("hi");\n',
+  'index.js': 'require("node:http").createServer(() => {}).listen(8080);\n',
 });
 
 const tool = (id: string, categories: string[], languages: ReviewedTool['languages'] = ['any']): ReviewedTool => ({

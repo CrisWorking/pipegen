@@ -104,6 +104,7 @@ export interface NeedsPlan {
  * framework or a Dockerfile); a port number in its code alone (Flask's `app.run(port=5000)` default) doesn't make it one.
  */
 export function isRunnable(s: Service): boolean {
+  if (s.notStandalone !== undefined) return false; // P55 (batch B): a one-shot script, built into another image, or an email-template package
   return s.scripts.some((n) => RUN_SCRIPTS.includes(n)) || s.frameworks.length > 0 || (s.port !== undefined && s.publishedPackage !== true)
     || (s.dockerfile ?? '') !== '';
 }

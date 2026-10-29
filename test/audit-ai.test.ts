@@ -87,7 +87,7 @@ function repo(files: Record<string, string>): string {
 const nodeApp = (name = 'app'): Record<string, string> => ({
   'package.json': JSON.stringify({ name, scripts: { test: 'vitest run', lint: 'eslint .', start: 'node index.js' }, devDependencies: { vitest: '1.0.0' } }),
   'package-lock.json': '{}\n',
-  'index.js': 'console.log("hi");\n',
+  'index.js': 'require("node:http").createServer(() => {}).listen(8080);\n',
 });
 
 /** GitHub and web answers: o/r's activity, empty searches, and `o/good`, an action that passes BAR. */

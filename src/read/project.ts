@@ -6,6 +6,7 @@ import type { Language, Monorepo, PackageManager, RepoProfile, Service } from '.
 import { PATH_SHOWN_MAX, safeText } from '../util/safe-text.js';
 import { CODE_FILE_RE, REQUIREMENTS_FILE_RE, asObj, asString, asStrings, baseOf, dirOf, inDir, isTestFile, pythonNames, readPyproject, requirementLines, type Obj } from './manifest.js';
 import { readEnv } from './env.js';
+import { copySources, dockerfilesOf, notStandaloneOf, type DockerCopy } from './service-kind.js';
 import { newQualityRun, readRepoFiles, readServiceQuality, type QualityRun } from './quality.js';
 import { readPrecommit, readWorkflows } from './workflows.js';
 import { IGNORED_DIRS, MAX_FILES_TEXT, SKIP_REASON, listFiles, parseYamlLimited, readTextLimitedWithReason, regexLines, regexSafe } from './limits.js';
@@ -127,7 +128,7 @@ async function readOrigin(root: string): Promise<{ owner: string; repo: string }
   return { owner, repo };
 }
 
-interface Shared { repo: string; serviceDirs: string[]; quality: QualityRun }
+interface Shared { repo: string; serviceDirs: string[]; quality: QualityRun; copies: DockerCopy[] }
 
 async function readService(ctx: Ctx, dir: string, shared: Shared): Promise<Service> {
   const files = [...ctx.fileSet];
@@ -201,7 +202,12 @@ async function readService(ctx: Ctx, dir: string, shared: Shared): Promise<Servi
   const name = [declared, folder].find((n): n is string => n !== undefined && SERVICE_NAME_RE.test(n)) ?? 'app';
   const env = await readEnv(ctx.root, { path: dir, name }, owned, { pkg, py, requirements });
   const quality = await readServiceQuality(ctx.root, { path: dir, language, frameworks }, ctx.notes, shared.quality);
-  return { name, path: dir, language, packageManager, runtimeVersion, dockerfile, port, hasTests, testFramework, ...env, scripts, frameworks, quality };
+  // P55 (batch B): a folder that runs only by its start script, but is a one-shot script, is built into another image, or is an email-template package
+  const notStandalone = await notStandaloneOf({
+    dir, read: (rel) => readFile(ctx, rel), fileSet: ctx.fileSet, copies: shared.copies, scripts: pkgScripts, deps, devDeps, frameworks,
+    hasDockerfile: dockerfile !== undefined, port, language,
+  });
+  return { name, path: dir, language, packageManager, runtimeVersion, dockerfile, port, hasTests, testFramework, ...env, scripts, frameworks, quality, ...(notStandalone === undefined ? {} : { notStandalone }) };
 }
 
 async function anyFileHasLine(ctx: Ctx, files: string[], re: RegExp): Promise<boolean> {
@@ -316,7 +322,14 @@ export async function readProject(dir: string, opts?: { notes?: string[] }): Pro
   else if (dirs.length > 1) monorepo = 'folders';
 
   // Plan P Task 1: one run for the quality facts, so each lockfile is read once and the read budgets hold for the repo.
-  const shared: Shared = { repo, serviceDirs: dirs, quality: newQualityRun(dir, [...ctx.fileSet], dirs, workspaceMembers) };
+  const shared: Shared = { repo, serviceDirs: dirs, quality: newQualityRun(dir, [...ctx.fileSet], dirs, workspaceMembers), copies: [] };
+  // P55 (batch B): what each Dockerfile copies into its image (read once; a folder it copies is part of that image)
+  const known = new Set<string>(ctx.fileSet);
+  for (const f of ctx.fileSet) for (let d = dirOf(f); d !== '.' && !known.has(d); d = dirOf(d)) known.add(d);
+  for (const f of dockerfilesOf(ctx.fileSet)) {
+    const text = await readFile(ctx, f);
+    if (text !== null) shared.copies.push(...copySources(dirOf(f), text, (p) => known.has(p)).map((source) => ({ dockerDir: dirOf(f), source })));
+  }
   const services: Service[] = [];
   for (const d of dirs) services.push(await readService(ctx, d, shared));
   uniqueServiceNames(ctx, services);

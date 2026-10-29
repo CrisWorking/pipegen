@@ -507,3 +507,94 @@ describe('read (Task 5 fix round 1: packages vs apps)', () => {
     expect((await readProject(own)).services[0]?.frameworks).toEqual([]);
   });
 });
+
+// P55 batch B (hand checks 2026-10-29): packages that run by a script's name but are not services of their own.
+describe('read (P55 batch B: not a standalone service)', () => {
+  const files = (f: Record<string, string>) => {
+    const dir = repo('node-library');
+    for (const [rel, text] of Object.entries(f)) writeIn(dir, rel, text);
+    return dir;
+  };
+  const one = async (f: Record<string, string>, path = '.') => {
+    const p = await readProject(files(f));
+    return p.services.find((s) => s.path === path)!;
+  };
+  const pkgOf = (scripts: Record<string, string>, extra: Record<string, unknown> = {}) => JSON.stringify({ name: 'x', version: '1.0.0', type: 'module', scripts, ...extra });
+
+  it('a start script that runs a one-shot script (prints and exits, imports only repo files and quiet built-ins) is not runnable', async () => {
+    const s = await one({
+      'package.json': pkgOf({ start: 'node src/index.js' }), 'src/index.js': 'import config from "../config.js";\nimport { buildReport } from "./report.js";\nconsole.log(buildReport(config.name));\n',
+      'config.js': 'export default { name: "x" };\n', 'src/report.js': 'import { readFileSync } from "node:fs";\nexport const buildReport = (n) => `report ${n}`;\n',
+    });
+    expect(s.notStandalone).toBe('one-shot');
+    expect(isRunnable(s)).toBe(false);
+  });
+
+  it('a start script stays runnable when the script can\'t be shown to exit: a listener, a timer, a package, a computed import, a missing file, an unknown command', async () => {
+    const base = { 'package.json': pkgOf({ start: 'node src/index.js' }) };
+    const cases: Record<string, Record<string, string>> = {
+      listen: { ...base, 'src/index.js': 'import http from "node:http";\nhttp.createServer(() => {}).listen(3000);\n' },
+      'listen in an import': { ...base, 'src/index.js': 'import "./server.js";\n', 'src/server.js': 'const s = createServer();\ns.listen(8080);\n' },
+      timer: { ...base, 'src/index.js': 'setInterval(() => console.log("tick"), 1000);\n' },
+      'event handler': { ...base, 'src/index.js': 'process.on("SIGTERM", () => {});\n' },
+      package: { ...base, 'src/index.js': 'import ws from "ws";\nconsole.log(ws);\n' },
+      'bare require': { ...base, 'src/index.js': 'const m = require("some-queue-client");\n' },
+      'child process': { ...base, 'src/index.js': 'import { spawn } from "node:child_process";\n' },
+      computed: { ...base, 'src/index.js': 'const m = await import(name);\n' },
+      'missing import': { ...base, 'src/index.js': 'import "./gone.js";\n' },
+      'file missing': base,
+      'long line hides an import': { ...base, 'src/index.js': `console.log(1);${' '.repeat(5000)}import "./x.js";\n` },
+      'not node': { 'package.json': pkgOf({ start: 'nodemon src/index.js' }), 'src/index.js': 'console.log(1);\n' },
+      'two commands': { 'package.json': pkgOf({ start: 'node src/index.js && node src/other.js' }), 'src/index.js': 'console.log(1);\n' },
+      'dev starts a server': { 'package.json': pkgOf({ start: 'node src/index.js', dev: 'vite' }), 'src/index.js': 'console.log(1);\n' },
+      'dot dot path': { 'package.json': pkgOf({ start: 'node ../x.js' }) },
+    };
+    for (const [name, f] of Object.entries(cases)) {
+      const s = await one(f);
+      expect(s.notStandalone, name).toBeUndefined();
+      expect(isRunnable(s), name).toBe(true);
+    }
+  });
+
+  it('a one-shot start script with a Dockerfile, a framework or a port is still a service', async () => {
+    const f = { 'package.json': pkgOf({ start: 'node src/index.js' }), 'src/index.js': 'console.log(1);\n' };
+    expect((await one({ ...f, Dockerfile: 'FROM node:22\n' })).notStandalone).toBeUndefined();
+    expect((await one({ ...f, 'package.json': pkgOf({ start: 'node src/index.js' }, { dependencies: { express: '5.0.0' } }) })).notStandalone).toBeUndefined();
+    expect((await one({ ...f, 'src/index.js': 'const port = 8080;\nconsole.log(port);\n' })).notStandalone).toBeUndefined();
+  });
+
+  it('a frontend another service\'s Dockerfile copies into its image is part of that service', async () => {
+    const f = {
+      'package.json': JSON.stringify({ name: 'root', private: true, workspaces: ['frontend'] }),
+      'frontend/package.json': pkgOf({ dev: 'vite', build: 'vite build' }), 'frontend/src/main.ts': 'console.log(1);\n',
+      'backend/pyproject.toml': '[project]\nname = "backend"\ndependencies = ["fastapi"]\n', 'backend/app/main.py': 'x = 1\n',
+      'backend/Dockerfile': 'FROM oven/bun:1 AS build\nCOPY frontend/package.json /app/frontend/\nCOPY ./frontend /app/frontend\nRUN bun run build\nFROM python:3.14\nCOPY --from=build /app/dist /app/dist\nCOPY ./backend/app /app/backend/app\n',
+    };
+    const p = await readProject(files(f));
+    const fe = p.services.find((s) => s.path === 'frontend')!;
+    expect(fe.notStandalone).toBe('built-in-image');
+    expect(isRunnable(fe)).toBe(false);
+    const be = p.services.find((s) => s.path === 'backend')!;
+    expect(be.notStandalone).toBeUndefined();
+    expect(isRunnable(be)).toBe(true);
+    // a --from copy, a copy of an unrelated folder, or a folder that has its own Dockerfile does not count
+    const other = await readProject(files({ ...f, 'backend/Dockerfile': 'FROM python:3.14\nCOPY --from=build /app/frontend /app/frontend\nCOPY ./docs /app/docs\n', 'docs/a.md': 'x\n' }));
+    expect(other.services.find((s) => s.path === 'frontend')!.notStandalone).toBeUndefined();
+    const own = await readProject(files({ ...f, 'frontend/Dockerfile': 'FROM node:22\nCOPY . .\n' }));
+    expect(own.services.find((s) => s.path === 'frontend')!.notStandalone).toBeUndefined();
+    // a Dockerfile in the folder's own context holding its own `frontend` folder is not the repo's frontend
+    const nested = await readProject(files({ ...f, 'backend/frontend/x.txt': 'x\n' }));
+    expect(nested.services.find((s) => s.path === 'frontend')!.notStandalone).toBeUndefined();
+  });
+
+  it('an email-template package (react-email, mjml, maizzle) is a design-time tool, not a service', async () => {
+    for (const dep of ['react-email', '@react-email/components', 'mjml', '@maizzle/framework']) {
+      const s = await one({ 'package.json': pkgOf({ dev: 'email dev --port 3333', export: 'email export' }, { dependencies: { [dep]: '1.0.0' } }) });
+      expect(s.notStandalone, dep).toBe('email-templates');
+      expect(isRunnable(s), dep).toBe(false);
+    }
+    // an email package that also is a server (a framework or a Dockerfile) stays a service
+    expect((await one({ 'package.json': pkgOf({ start: 'node a.js' }, { dependencies: { 'react-email': '1.0.0', express: '5.0.0' } }) })).notStandalone).toBeUndefined();
+    expect((await one({ 'package.json': pkgOf({ dev: 'email dev' }, { dependencies: { mjml: '4.0.0' } }), Dockerfile: 'FROM node:22\n' })).notStandalone).toBeUndefined();
+  });
+});

@@ -16,12 +16,15 @@ export type Monorepo = 'none' | 'npm-workspaces' | 'pnpm-workspaces' | 'yarn-wor
 export type DependencyKind = 'postgres' | 'mysql' | 'redis' | 'mongodb' | 'rabbitmq' | 'external';
 
 export interface Dependency { kind: DependencyKind; name: string; evidence: string; envVars: string[] }   // external = SaaS (Stripe, Auth0…)
+/** P55 (batch B): a one-shot script, a folder built into another service's image, or an email-template package. */
+export type NotStandalone = 'one-shot' | 'built-in-image' | 'email-templates';
 export interface Service {
   name: string; path: string; language: Language; packageManager?: PackageManager; runtimeVersion?: string;
   dockerfile?: string; port?: number; hasTests: boolean; testFramework?: string;
   envVars: string[]; dependsOn: Dependency[];
   scripts: string[];      // script names from package.json `scripts` / pyproject `[project.scripts]` + `[tool.poetry.scripts]` (names only, never the commands)
   frameworks: string[];   // detected server frameworks: express, fastify, @nestjs/core, next, koa, hapi; flask, fastapi, django (never the service's own package name: the express repo doesn't USE express). Used by isRunnable (Plan B Task 1)
+  notStandalone?: NotStandalone;   // P55 (batch B): why this folder isn't a service of its own although it has a start or dev script (src/read/service-kind.ts). isRunnable is then false. Set only when true
   publishedPackage?: boolean;   // Plan U Task 5: the repo's only service, and a workflow publishes it to its registry (npm for node, PyPI for python). Set only when true. isRunnable then ignores a port found in its code (a library's default port isn't a server)
   quality: ServiceQuality;      // Plan P Task 1 (src/read/quality.ts): the facts the quality and supply-chain checks read. Always set; emptyServiceQuality() when nothing is known
 }
