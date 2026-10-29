@@ -1,5 +1,4 @@
 import { execFile, type ChildProcess, type ExecFileException } from 'node:child_process';
-import { randomBytes } from 'node:crypto';
 import { rmSync } from 'node:fs';
 import { chmod, lstat, mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -8,11 +7,14 @@ import picomatch from 'picomatch';
 import { IGNORED_DIRS, MAX_FILES_TEXT, listFiles, readTextLimitedWithReason, regexSafe, type Skipped } from '../read/limits.js';
 import { PATH_SHOWN_MAX, safeText } from '../util/safe-text.js';
 import { LONG_LINE, R, code, decodedNamePieces, findSecretLike, highEntropyRuns, isDigit, isLetter, redact, replaceSpans, type Span } from './redact-core.js';
+import { asScanned, CANARY_RULE, canaryLine, newCanary, PREFIX_LINES, SCAN_CHUNK_SAFE_BYTES, scannersWouldSkip } from './scan-staging.js';
 import { SECRET_SCAN_EXIT, SecretScanError, secretScanArgv, secretScanConfigPath, skippedByDefaultPaths, type SecretScanner } from './secret-scan-config.js';
 
 export { isBinary } from '../read/limits.js';
 // the pure redaction core (C1b fix round 1): re-exported so every importer of redact.ts sees what it did
 export { LONG_LINE, decodedNamePieces, findSecretLike, highEntropyRuns, redact };
+// the shared scan-staging core (C1c)
+export { SCAN_CHUNK_SAFE_BYTES };
 export {
   chooseSecretScanner, SECRET_SCAN_EXIT, SECRET_SCANNER_ENV, secretScanArgv, secretScanConfigPath, SecretScanError, type SecretScanner, type SecretScannerName,
 } from './secret-scan-config.js';
@@ -512,63 +514,8 @@ export async function bundleCode(dir: string, opts: BundleOptions = {}): Promise
  */
 interface Finding { file: string; rule: string; startLine?: number; endLine?: number; secret: string; match: string; decoded: boolean; onPrefix: boolean }
 
-/**
- * Ruling P30 (Task 7 review C1): both pinned scanners sniff a file's first bytes and silently skip one that looks like
- * a binary format (%PDF-, MZ, %!PS, {\rtf1, SQLite format 3, FWS, …), with a clean exit. So every scanned file, and
- * paths.txt, is written after this prefix (nothing pipegen scans starts with a magic number), and every reported line
- * is moved back by the lines it adds. test/betterleaks-live.test.ts checks the review's 11 heads on both scanners.
- */
-const SCAN_PREFIX = '\n';
-const PREFIX_LINES = 1;
-
-/**
- * Task 7 re-review R1: the prefix only helps for magic numbers at byte 0. Both scanners also sniff a few formats at a
- * fixed later byte of the file as written (tar's `ustar` at 257, DICOM's `DICM` at 128, ISO 9660's `CD001` at 32769,
- * 34817 and 36865) and skip such a file with a clean exit. A file matching one is left out before the scan.
- */
-const LATE_MAGIC: ReadonlyArray<readonly [number, string]> = [[257, 'ustar'], [128, 'DICM'], [32769, 'CD001'], [34817, 'CD001'], [36865, 'CD001']];
-
-function scannersWouldSkip(written: string): boolean {
-  const buf = Buffer.from(written, 'utf8');
-  return LATE_MAGIC.some(([at, magic]) => buf.subarray(at, at + magic.length).toString('latin1') === magic);
-}
-
-/**
- * Ruling P34 (final review I2): a scanner can skip a file and still exit clean, and the causes keep coming (magic bytes
- * at offset 0 (P30) or later (R1), and a scan path under node_modules/ that the default path allowlist matches). So
- * pipegen ends every scanned file, and paths.txt, with one line holding a fresh random canary that data/gitleaks-bundle.toml's
- * `pipegen-canary` rule reports, and accepts a file only when that file's own canary came back reported against it,
- * exactly once. The canary goes AFTER the content, behind a blank line (so it never joins the content's last line), so
- * the reported lines of real findings don't move. Canary findings are removed before any real finding is applied.
- */
-// Rulings P35/P37: the rule matches only a whole line that is exactly one token, and repo text is NOT rewritten (P37:
-// turning `pipegen-canary-` into `pipegen-canary_` removed the word boundary that rules like SendGrid's `\b(SG\.…)`
-// need, so a glued token went unseen). Repo text can still hold a whole canary-shaped line; its finding is then not the
-// file's own token, so it stays a real finding and that file is left out (secretScanPass), never silently dropped.
-const CANARY_RULE = 'pipegen-canary';
-const newCanary = () => `${CANARY_RULE}-${randomBytes(16).toString('hex')}`;
-/** A file as the scanner sees it: the prefix, the content, a blank line, the canary on its own line. */
-const asScanned = (content: string, canary: string) => `${SCAN_PREFIX}${content}${content === '' || content.endsWith('\n') ? '' : '\n'}\n${canary}\n`;
-/** The canary's line in `written` (asScanned's text), as a finding reports it after unprefixed(): its last line. */
-const canaryLine = (written: string) => {
-  let n = 0;
-  for (let i = written.indexOf('\n'); i >= 0; i = written.indexOf('\n', i + 1)) n++;
-  return n - PREFIX_LINES;
-};
-
-/**
- * Ruling P36 (P34 verify review I-A): both pinned scanners read a file in 100,000-byte chunks, each stretched by up to
- * 25,000 bytes to the next blank line, and otherwise cut at byte 125,000 even mid-line: a secret across that cut is in
- * neither piece and is never found, while the canary at the end is still reported. A file of at most one chunk is read
- * as one piece, so pipegen scans (and sends) only files whose copy AS WRITTEN (prefix, content, canary line) is at most
- * this many bytes: one chunk minus a 10% margin for a scanner that reads a little less. Bigger files are left out, never
- * split (a multi-line secret such as a private key could cross a split). paths.txt is split into pieces instead (a
- * path is one line, so a line-boundary split cuts nothing).
- * Ruling P38: test/secret-scan-skip-live.test.ts "P38 pin" checks this live on both pinned scanners (two files of
- * exactly this size, tokens back to back on one line, one shifted by 19 bytes: every token and canary must be
- * reported). A scanner upgrade, or a change to this number, must pass it (Plan R scanner-upgrade checklist).
- */
-export const SCAN_CHUNK_SAFE_BYTES = 90_000;
+// The prefix line, the canary (P34/P35/P37), the late magic numbers (Task 7 R1) and the chunk size (P36/P38) are the shared
+// scan-staging core (src/ai/scan-staging.ts, C1c), which the gate's staged secrets scan uses too.
 
 /** Maps a finding's lines from the file as written to its content; a finding on the prefix can't be placed. */
 function unprefixed(f: Finding): Finding {
