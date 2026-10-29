@@ -77,3 +77,27 @@ describe.skipIf(!live)('live: the Semgrep step\'s scope is pipegen\'s, not the r
     }
   }, 600_000);
 });
+
+describe.skipIf(!live)('live: semgrep scans files of any size (6d fix round 2, #108)', () => {
+  it('the pinned flags from the reviewed entry report a 1.1 MB file; semgrep\'s default silently skips it', () => {
+    const t = entry('semgrep');
+    const flag = (t.step.cli?.command ?? []).find((x) => x.startsWith('--max-target-bytes')) as string;
+    expect(flag).toBe('--max-target-bytes=0');
+    const dir = makeTempDir();
+    writeIn(dir, 'src/big.js', `eval(x)\n// ${'x'.repeat(1_100_000)}\n`);
+    writeIn(dir, 'src/small.js', 'eval(x)\n');
+    writeIn(dir, '.semgrepignore', 'node_modules\n');
+    expect(semgrepPaths(semgrepBin(), dir, [flag])).toEqual(['src/big.js', 'src/small.js']);
+    expect(semgrepPaths(semgrepBin(), dir, []), 'without the flag').toEqual(['src/small.js']);
+  }, 600_000);
+
+  it('a committed file named in .gitignore is scanned (the 6d re-review measurement)', () => {
+    const dir = makeTempDir();
+    writeIn(dir, 'src/evil.js', 'eval(x)\n');
+    writeIn(dir, '.gitignore', 'src/evil.js\n');
+    writeIn(dir, '.semgrepignore', 'node_modules\n');
+    execFileSync('git', ['init', '-q'], { cwd: dir });
+    execFileSync('git', ['add', '-A', '-f'], { cwd: dir });
+    expect(semgrepPaths(semgrepBin(), dir, [])).toEqual(['src/evil.js']);
+  }, 600_000);
+});

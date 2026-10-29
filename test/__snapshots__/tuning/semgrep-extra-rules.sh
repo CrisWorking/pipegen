@@ -49,7 +49,7 @@ rc=0
     -v "$rules/dockerfile:/pipegen-rules-extra/dockerfile:ro" "$PIPEGEN_IMAGE" semgrep scan \
     --config /pipegen-rules-extra/typescript \
     --config /pipegen-rules-extra/dockerfile \
-    --metrics=off --disable-version-check \
+    --metrics=off --disable-version-check --max-target-bytes=0 \
     --config /pipegen-rules \
     --sarif --output semgrep.sarif || rc=$?
 if [ -f "$out" ] && [ ! -L "$out" ]; then

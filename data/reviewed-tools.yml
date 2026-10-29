@@ -642,14 +642,14 @@ tools:
     step:
       cli:
         install: { method: docker, package: "semgrep/semgrep", version: "1.181.0" }
-        command: ["semgrep", "scan", "--metrics=off", "--disable-version-check", "--config", "/pipegen-rules", "--sarif", "--output", "semgrep.sarif"]
+        command: ["semgrep", "scan", "--metrics=off", "--disable-version-check", "--max-target-bytes=0", "--config", "/pipegen-rules", "--sarif", "--output", "semgrep.sarif"]
         env:
           PIPEGEN_RULES_URL: "https://github.com/semgrep/semgrep-rules/archive/17e31e11ebac99fb7dfe1cd288f7a32151b6f3f9.tar.gz"
           PIPEGEN_RULES_SHA256: "9dfe6866fbecd557f507078cb79721a9eb8f4764fc2f6163648ea1320be25933"
           PIPEGEN_RULES_TREE: "dd3179667faf14717e05c33b1916b0d2c349673d"
       output: { path: "semgrep.sarif", format: sarif }
     fixedInputs:
-      args: ["--metrics=off", "--disable-version-check", "--config", "/pipegen-rules"]
+      args: ["--metrics=off", "--disable-version-check", "--max-target-bytes=0", "--config", "/pipegen-rules"]
       env:
         PIPEGEN_RULES_URL: "https://github.com/semgrep/semgrep-rules/archive/17e31e11ebac99fb7dfe1cd288f7a32151b6f3f9.tar.gz"
         PIPEGEN_RULES_SHA256: "9dfe6866fbecd557f507078cb79721a9eb8f4764fc2f6163648ea1320be25933"
@@ -657,8 +657,8 @@ tools:
     choices:
       rules: ["javascript", "typescript", "python"]
     configFiles: [".semgrepignore"]
-    reviewedBy: Cristiano
-    reviewedAt: "2026-10-28"
+    reviewedBy: Claude delegated DECISIONS 105
+    reviewedAt: "2026-10-29"
     proofs: 0
 
   # Dependency scan against the OSV database. Release binary. Also the dependency-review check (Plan P Task 6): comparing

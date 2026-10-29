@@ -102,13 +102,13 @@ function cliEntry(over: Entry = {}): Entry {
 }
 
 /** The Semgrep CE entry: an image, with a rules pack pinned by commit SHA and archive sha256 (ruling S22). */
-function semgrepEntry(env: Record<string, string> = RULES_ENV, command?: string[], args = ['--metrics=off', '--disable-version-check', '--config', RULES_DIR]): Entry {
+function semgrepEntry(env: Record<string, string> = RULES_ENV, command?: string[], args = ['--metrics=off', '--disable-version-check', '--max-target-bytes=0', '--config', RULES_DIR]): Entry {
   const categories = ['sast'];
   return {
     id: 'semgrep', categories, languages: ['node', 'python'], releasedAt: '2026-01-01T00:00:00Z',
     candidate: candidate('semgrep', 'docker', 'semgrep/semgrep', '1.181.0', { digest: DIGEST }, categories),
     step: {
-      cli: { install: { method: 'docker', package: 'semgrep/semgrep', version: '1.181.0' }, command: command ?? ['semgrep', 'scan', '--metrics=off', '--disable-version-check', '--config', RULES_DIR, '--sarif', '--output', 'semgrep.sarif'], env },
+      cli: { install: { method: 'docker', package: 'semgrep/semgrep', version: '1.181.0' }, command: command ?? ['semgrep', 'scan', '--metrics=off', '--disable-version-check', '--max-target-bytes=0', '--config', RULES_DIR, '--sarif', '--output', 'semgrep.sarif'], env },
       output: { path: 'semgrep.sarif', format: 'sarif' },
     },
     fixedInputs: { args, env },
@@ -238,7 +238,7 @@ describe('loadReviewed', () => {
   it('reviewed: semgrep entry with a registry rule pack (p/…) or auto rejected; sha-pinned pack accepted', () => {
     expect(load([semgrepEntry()])[0]?.fixedInputs.env?.[RULES_URL_ENV]).toBe(RULES_URL);
     // registry names and auto, anywhere in the command (the fixed args stay, so only the pack is wrong)
-    const scan = (...rest: string[]) => ['semgrep', 'scan', '--metrics=off', '--disable-version-check', '--config', RULES_DIR, ...rest];
+    const scan = (...rest: string[]) => ['semgrep', 'scan', '--metrics=off', '--disable-version-check', '--max-target-bytes=0', '--config', RULES_DIR, ...rest];
     const REGISTRY = /registry rule packs/;
     rejects([semgrepEntry(undefined, scan('--config', 'p/default'))], REGISTRY);
     rejects([semgrepEntry(undefined, scan('--config', 'auto'))], REGISTRY);
@@ -268,7 +268,7 @@ describe('loadReviewed', () => {
     rejects([semgrepEntry({ [RULES_URL_ENV]: RULES_URL, [RULES_SUM_ENV]: SUM })], /tree/);
     // the explicit config at the verified rules dir is accepted, in both spellings
     expect(load([semgrepEntry(undefined, scan('--sarif'))])).toHaveLength(1);
-    expect(load([semgrepEntry(undefined, ['semgrep', 'scan', '--metrics=off', '--disable-version-check', `--config=${RULES_DIR}`], ['--metrics=off', '--disable-version-check', `--config=${RULES_DIR}`])])).toHaveLength(1);
+    expect(load([semgrepEntry(undefined, ['semgrep', 'scan', '--metrics=off', '--disable-version-check', '--max-target-bytes=0', `--config=${RULES_DIR}`], ['--metrics=off', '--disable-version-check', '--max-target-bytes=0', `--config=${RULES_DIR}`])])).toHaveLength(1);
     // the real entry: explicit --config at the verified dir, and the commit's tree SHA recorded
     const real = byId(loadReviewed(), 'semgrep')[0];
     expect(real?.step.cli?.command.join(' ')).toContain(`--config ${RULES_DIR}`);
@@ -1634,7 +1634,7 @@ describe('data/reviewed-tools.yml', () => {
   });
 
   // entries re-reviewed by delegation (DECISIONS 105) after the owner's 2026-10-28 review; add an id here on purpose, never skip it
-  const DELEGATED: Record<string, string> = { 'actions-setup-node': '2026-10-29', 'docker-login-action': '2026-10-29', eslint: '2026-10-29', 'eslint-typescript': '2026-10-29', nuclei: '2026-10-29' };
+  const DELEGATED: Record<string, string> = { 'actions-setup-node': '2026-10-29', 'docker-login-action': '2026-10-29', eslint: '2026-10-29', 'eslint-typescript': '2026-10-29', nuclei: '2026-10-29', semgrep: '2026-10-29' };
 
   it('data: every catalogue entry is reviewed by the owner (2026-10-28, DECISIONS #104) or by delegation (listed), with proofs 0', () => {
     const list = real();
@@ -1645,6 +1645,20 @@ describe('data/reviewed-tools.yml', () => {
       expect(t?.reviewedAt, id).toBe(delegated ?? '2026-10-28');
       expect(t?.proofs, id).toBe(0);
     }
+  });
+
+  it('data: semgrep scans files of any size (--max-target-bytes=0 is fixed in the entry and required by the policy), reviewed by delegation', () => {
+    const t = byId(real(), 'semgrep')[0];
+    expect(t?.step.cli?.command).toContain('--max-target-bytes=0');
+    expect(t?.fixedInputs.args).toContain('--max-target-bytes=0');
+    expect(ARGV_POLICIES.semgrep?.required?.['max-target-bytes']).toBe('0');
+    expect(t?.reviewedBy).toBe('Claude delegated DECISIONS 105');
+    expect(t?.reviewedAt).toBe('2026-10-29');
+    // a command without it, or with any other size limit, does not load
+    const cmd = (t?.step.cli?.command ?? []).filter((x) => x !== '--max-target-bytes=0');
+    rejects([semgrepEntry(undefined, cmd, (t?.fixedInputs.args ?? []).filter((x) => x !== '--max-target-bytes=0'))], /max-target-bytes/);
+    const limited = (t?.step.cli?.command ?? []).map((x) => (x === '--max-target-bytes=0' ? '--max-target-bytes=1000000' : x));
+    rejects([semgrepEntry(undefined, limited, (t?.fixedInputs.args ?? []).map((x) => (x === '--max-target-bytes=0' ? '--max-target-bytes=1000000' : x)))], /max-target-bytes/);
   });
 
   it('data: docker login offers ghcr.io only (the workflow token must not go to another registry), reviewed by delegation', () => {

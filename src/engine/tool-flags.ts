@@ -189,11 +189,12 @@ const POLICIES = {
     method: 'docker', package: 'zaproxy/zap-stable', exe: 'zap-baseline.py', dialect: 'goflags', sub: [], flags: { J: 'output', z: { values: ['-silent'] } },
     required: { J: null, z: '-silent' }, mount: { at: '/zap/wrk', source: 'work' }, config: { flag: '-c', content: "# pipegen's pinned ZAP baseline rules: the defaults, nothing ignored\n", fileName: 'zap-baseline.conf' },
   },
-  // Semgrep CE 1.181.0: rules only from the verified archive (semgrepProblems), no metrics, no version check
+  // Semgrep CE 1.181.0: rules only from the verified archive (semgrepProblems), no metrics, no version check, and no file-size skip
+  // (--max-target-bytes=0: by default semgrep silently skips every file over 1 MB, so padding a file would hide it from SAST; DECISIONS #108)
   semgrep: {
     method: 'docker', package: 'semgrep/semgrep', exe: 'semgrep', dialect: 'long', sub: ['scan'],
-    flags: { metrics: { values: ['off'] }, 'disable-version-check': 'bool', config: { values: ['/pipegen-rules'] }, sarif: 'bool', output: 'output' },
-    required: { metrics: 'off', 'disable-version-check': 'true', config: '/pipegen-rules' },
+    flags: { metrics: { values: ['off'] }, 'disable-version-check': 'bool', 'max-target-bytes': { values: ['0'] }, config: { values: ['/pipegen-rules'] }, sarif: 'bool', output: 'output' },
+    required: { metrics: 'off', 'disable-version-check': 'true', 'max-target-bytes': '0', config: '/pipegen-rules' },
     scopeIgnore: { file: '.semgrepignore', lines: ['node_modules'] },
     env: ['PIPEGEN_RULES_URL', 'PIPEGEN_RULES_SHA256', 'PIPEGEN_RULES_TREE'], extraChoices: { rules: ['javascript', 'typescript', 'python'] },
     mount: { at: '/src', source: 'repo', workdir: true }, network: 'none',

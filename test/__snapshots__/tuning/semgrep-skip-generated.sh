@@ -47,7 +47,7 @@ rc=0
     -v "$rules/$PIPEGEN_ARG_2:/pipegen-rules:ro" "$PIPEGEN_IMAGE" semgrep scan \
     --exclude "$PIPEGEN_ARG_0" \
     --exclude "$PIPEGEN_ARG_1" \
-    --metrics=off --disable-version-check \
+    --metrics=off --disable-version-check --max-target-bytes=0 \
     --config /pipegen-rules \
     --sarif --output semgrep.sarif || rc=$?
 if [ -f "$out" ] && [ ! -L "$out" ]; then
