@@ -1034,7 +1034,8 @@ describe('fix round 2: the re-review probes are refused', () => {
   it('T2 and ruling 1: a gated user job\'s if: may only be success(), or success() && an expression with no status function and no top-level ||', async () => {
     const refused = ['success() || true', "${{ success() || github.event_name == 'workflow_dispatch' }}", '!success()', "success() || github.ref == 'refs/heads/main'",
       'always()', 'failure()', 'cancelled()', '!cancelled()', '${{ !cancelled() }}', 'SUCCESS() || true', "success() && github.ref == 'x' || true", 'success() && always()',
-      "github.ref == 'refs/heads/main'", 'true'];
+      // r2 carry-forwards: two templates read as a truthy string; unparseable conditions
+      '${{ success() && x }}${{ y }}', '${{ a }}${{ b }}', '${{ a }} && b', 'success() && x) || (y', "success() && 'a || b", 'a) || (b', "'a || b", ''];
     for (const cond of refused) {
       const { f, d } = editedWith(cond);
       expect((await run([f], d, { list: LIST })).ok, cond).toBe(false);
@@ -1043,6 +1044,20 @@ describe('fix round 2: the re-review probes are refused', () => {
     for (const cond of accepted) {
       const { f, d } = editedWith(cond);
       expect(show(await run([f], d, { list: LIST })), String(cond)).toBe('');
+    }
+  });
+  it('review-7a-r2 loosening: an if: with no status function is accepted (GitHub implies success() && (…)); any status call outside the success() forms, or non-ASCII, is refused', async () => {
+    const accepted = ["github.ref == 'refs/heads/main'", "${{ github.ref == 'refs/heads/main' }}", "needs.x.result == 'failure'", 'true', "github.event_name == 'push' || github.event_name == 'workflow_dispatch'"];
+    for (const cond of accepted) {
+      const { f, d } = editedWith(cond);
+      expect(show(await run([f], d, { list: LIST })), cond).toBe('');
+    }
+    // over-approximated on purpose: a status name in a string literal, a space before '(', a '-' before the name; NEL (U+0085)
+    // is whitespace to GitHub's .NET lexer but not to JS \s, and U+017F folds to 'S' in .NET only, so non-ASCII is refused
+    const refused = ["contains(github.ref, 'always()')", 'ALWAYS ()', 'always\t()', 'x-success() || true', 'success\u0085() || true', 'ſuccess() || true', "github.ref == 'é'"];
+    for (const cond of refused) {
+      const { f, d } = editedWith(cond);
+      expect((await run([f], d, { list: LIST })).ok, JSON.stringify(cond)).toBe(false);
     }
   });
   it('T3 and ruling 4: an environment name is compared without case', async () => {

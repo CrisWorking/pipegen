@@ -146,8 +146,28 @@ const TRIGGERS: ReadonlySet<string> = new Set(['push', 'pull_request', 'merge_gr
 const HOSTED_RUNNERS: ReadonlySet<string> = new Set(['ubuntu-latest', 'ubuntu-24.04', 'ubuntu-22.04', 'ubuntu-24.04-arm', 'ubuntu-22.04-arm']);
 /** GitHub's owner name rule (the same pattern as src/github/client.ts), checked again here: the central prefix is built from it. */
 const OWNER_RE = /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})$/;
-/** Any status function (success(), always(), failure(), cancelled()): GitHub adds its implicit success() && only when an if holds none. */
-const STATUS_FN_RE = /\b(?:success|always|failure|cancelled)\s*\(/i;
+/**
+ * Any status-function call (success(), always(), failure(), cancelled()): GitHub adds its implicit `success() && (…)` only when
+ * an if holds none. Over-approximated on purpose (review-7a-r2): no \b, so `x-success(` matches; a name inside a string literal
+ * matches too (refusing it is only stricter, and a quote stripper that lexes differently from GitHub's could hide a real call).
+ * Non-ASCII is refused before this runs, so JS \s covers every whitespace GitHub's lexer skips.
+ */
+const STATUS_CALL_RE = /(?:success|always|failure|cancelled)\s*\(/i;
+
+/** Parentheses never below zero and back to zero at the end, and every single-quoted string closed ('' is an escape). */
+function balanced(e: string): boolean {
+  let depth = 0;
+  for (let i = 0; i < e.length; i++) {
+    const c = e[i];
+    if (c === "'") {
+      let closed = false;
+      for (i++; i < e.length; i++) if (e[i] === "'") { if (e[i + 1] === "'") i++; else { closed = true; break; } }
+      if (!closed) return false;
+    } else if (c === '(') depth++;
+    else if (c === ')' && --depth < 0) return false;
+  }
+  return depth === 0;
+}
 
 /** Whether an expression holds `||` outside parentheses and quoted strings. */
 function topLevelOr(e: string): boolean {
@@ -164,23 +184,27 @@ function topLevelOr(e: string): boolean {
 }
 
 /**
- * Ruling 1 (fix round 2): the `if:` of a user job pipegen gated with `needs:` may only be absent, exactly `success()` (bare or
- * in `${{ }}`), or `success() && <expr>` where <expr> holds no status function and no `||` at its top level. Anything else
- * can run the job although pipegen's job failed (`success() || …`, `!success()`, `always()`, `!cancelled()`), and a
- * condition without success() is refused too (the ruling's list is exhaustive; Plan G may write its own file instead).
+ * Ruling 1 (fix round 2), loosened after review-7a-r2: the `if:` of a user job pipegen gated with `needs:` may be absent, an
+ * expression with no status-function call at all (GitHub runs it as `success() && (…)`, so it still respects the needs),
+ * exactly `success()`, or `success() && <expr>` where <expr> holds no status call and no `||` at its top level. Anything else
+ * can run the job although pipegen's job failed (`success() || …`, `!success()`, `always()`, `!cancelled()`).
+ * Refused first: non-ASCII (U+0085 is whitespace to GitHub's .NET lexer but not to JS \s; U+017F folds to 'S' in .NET only),
+ * more than one `${{ }}` or text outside it (read by GitHub as a truthy string), an empty condition, and unbalanced
+ * parentheses or quotes (GitHub refuses the workflow; the referee says so itself). A YAML boolean is not a string: refused.
  */
 export function gatedIfAllowed(cond: unknown): boolean {
   if (cond === undefined) return true;
-  if (typeof cond !== 'string') return false;
+  if (typeof cond !== 'string' || !/^[\t\n\r\x20-\x7e]*$/.test(cond)) return false;
   let e = cond.trim();
   const wrapped = /^\$\{\{([\s\S]*)\}\}$/.exec(e);
   if (wrapped !== null) e = (wrapped[1] as string).trim();
-  if (e.includes(EXPR) || e.includes('}}')) return false;
+  if (e === '' || e.includes(EXPR) || e.includes('}}') || !balanced(e)) return false;
+  if (!STATUS_CALL_RE.test(e)) return true;
   if (/^success\(\s*\)$/i.test(e)) return true;
   const m = /^success\(\s*\)\s*&&([\s\S]+)$/i.exec(e);
   if (m === null) return false;
   const rest = m[1] as string;
-  return rest.trim() !== '' && !STATUS_FN_RE.test(rest) && !topLevelOr(rest);
+  return rest.trim() !== '' && !STATUS_CALL_RE.test(rest) && !topLevelOr(rest);
 }
 
 const LEVEL: Readonly<Record<string, number>> = { none: 0, read: 1, write: 2 };
