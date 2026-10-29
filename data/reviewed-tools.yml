@@ -219,10 +219,10 @@ tools:
       with:
         logout: "true"
     choices:
-      registry: ["ghcr.io", "docker.io"]
+      registry: ["ghcr.io"]
     configFiles: []
-    reviewedBy: Cristiano
-    reviewedAt: "2026-10-28"
+    reviewedBy: Claude delegated DECISIONS 105
+    reviewedAt: "2026-10-29"
     proofs: 0
 
   # Sets up Docker Buildx. Its binary cache is off (pipegen uses no caches, spec §19).

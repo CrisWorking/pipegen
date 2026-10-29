@@ -15,11 +15,11 @@
 import { isDeepStrictEqual } from 'node:util';
 import { Scalar, YAMLMap, YAMLSeq } from 'yaml';
 import { safeText } from '../util/safe-text.js';
-import type { OutputFormat, RepoProfile, ReviewedTool, Service, StepSpec } from '../types.js';
+import { DEPENDENCY_KINDS, type OutputFormat, type RepoProfile, type ReviewedTool, type Service, type StepSpec } from '../types.js';
 import { COMMIT_SHA_RE } from './names.js';
 import { NEED_IDS } from './need-ids.js';
 import type { PlatformActions } from './pin.js';
-import { rendererInputProblems } from './tool-flags.js';
+import { PLAIN_REL_RE, RENDERER_INPUTS, rendererInputProblems } from './tool-flags.js';
 
 export class RenderError extends Error {}
 
@@ -44,13 +44,24 @@ export interface RenderResult { steps: RenderedStep[]; output: { path: string; f
 
 /** A `with:` value from a template or a choice: plain words only (no expression, no quote, no shell character). */
 const WITH_VALUE_RE = /^[A-Za-z0-9_@./:,=+\- ]{0,300}$/;
-/** A folder or file that is repo-relative, plain, no `*`, no `..`, not an option (`-x`). */
-const PLAIN_REL_RE = /^(?![-/])(?!.*(?:^|\/)\.\.(?:\/|$))[A-Za-z0-9._/-]{1,200}$/;
 const SECRET_NAME_RE = /^[A-Z][A-Z0-9_]{0,99}$/;
-const DEPENDENCY_KINDS: readonly string[] = ['postgres', 'mysql', 'redis', 'mongodb', 'rabbitmq', 'external'];
-/** Env names a mapped secret must never take: they change how a shell, runtime, tool or the runner itself behaves (ruling S9). */
-const DANGEROUS_EXACT: ReadonlySet<string> = new Set(['CI', 'PATH', 'HOME', 'BASH_ENV', 'ENV', 'SHELLOPTS', 'PS4', 'IFS']);
-const DANGEROUS_PREFIX = ['GITHUB_', 'RUNNER_', 'ACTIONS_', 'PIPEGEN_', 'NODE_', 'NPM_CONFIG_', 'npm_config_', 'LD_', 'DYLD_', 'GIT_', 'DOCKER_', 'PYTHON', 'TRIVY_', 'HADOLINT_', 'PINACT_', 'SEMGREP_', 'COVERAGE_'];
+/**
+ * Env names a mapped secret must never take (ruling S9, widened in 6a fix round 1). One table, by family: each name
+ * changes how a shell, a runtime, a package manager, a TLS or proxy setting, the C library, the locale or the runner
+ * itself behaves, and 6b passes declared secrets into the tool's environment. Names are matched as a whole (`^…$`).
+ * An ordinary application secret (STRIPE_KEY, GOOGLE_API_KEY, DATABASE_URL) is not caught.
+ */
+const DANGEROUS_NAMES: readonly { family: string; match: RegExp }[] = [
+  { family: 'shell and process', match: /^(?:CI|PATH|HOME|BASH_ENV|ENV|SHELLOPTS|PS4|IFS|SHELL|PROMPT_COMMAND|TMPDIR|TMP|TEMP|LANG|LANGUAGE|TZ|TERM[A-Z0-9_]*)$/ },
+  { family: 'runner, CI and pipegen', match: /^(?:GITHUB|RUNNER|ACTIONS|PIPEGEN)_/ },
+  { family: 'loader and libc', match: /^(?:LD_|DYLD_|MALLOC_|LC_)|^(?:GCONV_PATH|GLIBC_TUNABLES|HOSTALIASES|RES_OPTIONS|LOCALDOMAIN)$/ },
+  { family: 'proxy and TLS', match: /_PROXY$|^(?:SSL_|CURL_|OPENSSL_)|^REQUESTS_CA_BUNDLE$/i },
+  { family: 'node, npm, python and package indexes', match: /^(?:NODE_|NPM_CONFIG_|PYTHON|PIP_|UV_)|^npm_config_/ },
+  { family: 'java, perl, ruby', match: /^(?:JAVA_TOOL_OPTIONS|_JAVA_OPTIONS|JDK_JAVA_OPTIONS|PERLLIB)$|^(?:PERL5|RUBY|GEM_|BUNDLE_)/ },
+  { family: 'rust and go', match: /^(?:CARGO_|RUSTUP_|RUSTFLAGS$)|^GO[A-Z0-9]*$/ },
+  { family: 'git, docker, XDG', match: /^(?:GIT_|DOCKER_|XDG_)/ },
+  { family: 'the reviewed tools', match: /^(?:TRIVY_|HADOLINT_|PINACT_|SEMGREP_|COVERAGE_)/ },
+];
 
 /** A value from outside, shown in a message: one clean line, cut short, quoted when it is a string. */
 const show = (v: unknown): string => (typeof v === 'string' ? JSON.stringify(safeText(v, 60)) : safeText(String(v), 30));
@@ -116,19 +127,20 @@ export function validateSpec(spec: StepSpec, tool: ReviewedTool, ctx: RenderCont
 
   if (spec.needsServices !== undefined) {
     if (!Array.isArray(spec.needsServices)) problem('needsServices', 'must be a list of service kinds.');
-    else spec.needsServices.forEach((k, i) => { if (!DEPENDENCY_KINDS.includes(k)) problem(`needsServices[${i}]`, `${show(k)} isn't a service kind pipegen can start.`); });
+    else spec.needsServices.forEach((k, i) => { if (!(DEPENDENCY_KINDS as readonly string[]).includes(k)) problem(`needsServices[${i}]`, `${show(k)} isn't a service kind pipegen can start.`); });
   }
 
   // secrets: names only, a real variable of this service, never one that changes how code runs (ruling S9)
   if (spec.secrets !== undefined) {
     if (!Array.isArray(spec.secrets)) problem('secrets', 'must be a list of names.');
     else {
+      // no service on the spec (a repo-wide step): the names any service declares count
       const declared = declaredEnvVars(service === undefined ? services : [service]);
       const seen = new Set<string>();
       spec.secrets.forEach((name, i) => {
         const path = `secrets[${i}]`;
         if (typeof name !== 'string' || !SECRET_NAME_RE.test(name)) problem(path, `${show(name)} isn't a secret name (capital letters, digits and _, starting with a letter, at most 100 characters).`);
-        else if (DANGEROUS_EXACT.has(name) || DANGEROUS_PREFIX.some((p) => name.startsWith(p))) problem(path, `${name} can't be passed to a step: it changes how code runs or what the runner does.`);
+        else if (DANGEROUS_NAMES.some((d) => d.match.test(name))) problem(path, `${name} can't be passed to a step: it changes how code runs or what the runner does.`);
         else if (!declared.has(name)) problem(path, `${name} isn't used by ${service === undefined ? 'any service' : `the service ${show(service.name)}`} (its code or its dependencies), so pipegen won't pass it.`);
         else if (seen.has(name)) problem(path, `${name} is listed twice.`);
         seen.add(String(name));
@@ -178,6 +190,27 @@ const PLATFORM_USES: Readonly<Record<keyof PlatformActions, string>> = Object.fr
   'setup-buildx': 'docker/setup-buildx-action', 'build-push': 'docker/build-push-action', 'upload-sarif': 'github/codeql-action/upload-sarif', attest: 'actions/attest',
 });
 
+/**
+ * Inputs a platform action's entry must FIX to these values (by `uses` path). They are checked on every render path
+ * (renderStep, renderPlatformStep, the prelude, the upload), not only where an entry is first used, and an input listed
+ * here can not also be an AI choice.
+ */
+const PLATFORM_LOCKS: Readonly<Record<string, Readonly<Record<string, string>>>> = Object.freeze({
+  'actions/checkout': { 'persist-credentials': 'false', 'allow-unsafe-pr-checkout': 'false' },
+  'actions/setup-node': { 'package-manager-cache': 'false' },
+  'actions/upload-artifact': { 'include-hidden-files': 'false', 'if-no-files-found': 'error' },
+});
+
+/** Actions the renderer fills inputs for through their own helper (renderUpload, renderPlatformStep); renderStep refuses them. */
+const HELPER_ONLY: ReadonlySet<string> = new Set(Object.keys(RENDERER_INPUTS).filter((k) => k !== 'docker/login-action' && k !== 'docker/build-push-action'));
+
+/**
+ * Entries that run a container (their action.yml says `runs.using: docker`). The reviewed list does not carry the image
+ * yet (`wrappedImage` is filled in 6c, ruling S13), so until then these ids are refused by name, and any entry that has a
+ * `wrappedImage` is a container action by definition. TODO(6c/S13): drop the id list once resolvePin fills wrappedImage.
+ */
+const CONTAINER_ACTION_IDS: ReadonlySet<string> = new Set(['pypi-publish', 'scorecard-action']);
+
 /** The entry's `uses:` split into its path (lower case, no `@sha`), checked against the entry's own repo and pin. */
 function usesOf(tool: ReviewedTool): { path: string; uses: string } {
   const action = tool.step.action;
@@ -214,8 +247,11 @@ function actionStep(tool: ReviewedTool, name: string, choices: Readonly<Record<s
   const { path, uses } = usesOf(tool);
   const fixed = tool.fixedInputs.with ?? {};
   if (!same(tool.step.action?.with ?? {}, fixed)) throw new RenderError(`The reviewed entry ${show(tool.id)} has a step template that disagrees with its fixed inputs.`);
+  for (const [input, locked] of Object.entries(own(PLATFORM_LOCKS, path) ?? {})) {
+    if (own(fixed, input) !== locked || Object.hasOwn(tool.choices, input)) throw new RenderError(`The reviewed entry ${show(tool.id)} no longer fixes ${input} to ${locked}.`);
+  }
   const chosen = chosenInputs(tool, choices);
-  const fill = rendererInputProblems(path, filled);
+  const fill = rendererInputProblems(path, filled, { ...fixed, ...chosen, ...filled });
   if (fill.length > 0) throw new RenderError(fill.join(' '));
   const withs: Record<string, string> = {};
   for (const [group, values, checked] of [['fixed', fixed, true], ['chosen', chosen, true], ['filled', filled, false]] as const) {
@@ -255,26 +291,39 @@ export function renderPlatformStep(key: keyof PlatformActions, platform: Platfor
  * id or pin differs from the spec's, or a kind not built yet. It never uploads the output (ruling B3). `platform` is for
  * the CLI kinds (6b), whose steps need the platform actions; an action step doesn't use it.
  */
-export function renderStep(spec: StepSpec, tool: ReviewedTool, platform: PlatformActions, ctx: RenderContext): RenderResult {
+export function renderStep(given: StepSpec, tool: ReviewedTool, platform: PlatformActions, ctx: RenderContext): RenderResult {
+  // render exactly what is validated: one plain copy (a getter or proxy is read once), not the caller's live object
+  let spec: StepSpec;
+  try {
+    spec = structuredClone(given);
+  } catch {
+    throw new RenderError('The step can not be copied as plain data (it holds a function or another object that is not data).');
+  }
   if (!isReviewed(tool.candidate)) throw new RenderError(`${show(tool.id)} is not a reviewed tool, and pipegen never renders a tool that isn't.`);
   const problems = validateSpec(spec, tool, ctx);
   if (problems.length > 0) throw new RenderError(`The step for ${show(spec.needId)} isn't valid: ${problems.join(' ')}`);
   if (tool.candidate.kind !== 'action' || tool.step.action === undefined) {
     throw new RenderError(`not implemented in 6a: ${tool.step.cli?.install.method ?? tool.candidate.kind}`);
   }
+  if (CONTAINER_ACTION_IDS.has(tool.id) || tool.wrappedImage !== undefined) throw new RenderError(`not implemented in 6a: container action ${show(tool.id)} (it runs an image the review has not pinned; 6c, ruling S13)`);
+  if (HELPER_ONLY.has(usesOf(tool).path)) throw new RenderError(`${show(tool.id)} is rendered with renderPlatformStep or renderUpload, which supply the inputs it needs.`);
   if (tool.step.output.format !== 'none') throw new RenderError(`not implemented in 6a: an action that writes a result (${show(tool.id)}); its output is moved under runner.temp in 6b.`);
 
   const { path } = usesOf(tool);
   const service = spec.service === undefined ? undefined : ctx.profile.services.find((s) => s.name === spec.service);
-  const step = actionStep(tool, `pipegen: ${path}`, spec.choices, rendererFill(path, service, ctx));
+  const step = actionStep(tool, `pipegen: ${path}`, spec.choices, rendererFill(path, service, ctx, spec.choices.registry ?? tool.choices.registry?.[0]));
   const secrets = spec.secrets ?? [];
   if (secrets.length > 0) step.env = Object.fromEntries(secrets.map((n) => [n, `\${{ secrets.${n} }}`]));
   return { steps: [step], output: null };
 }
 
 /** The renderer-filled inputs of an action for this service and context (the others are set by the helpers that own them). */
-function rendererFill(usesPath: string, service: Service | undefined, ctx: RenderContext): Record<string, string> {
-  if (usesPath === 'docker/login-action') return { username: '${{ github.actor }}', password: '${{ secrets.GITHUB_TOKEN }}' };
+function rendererFill(usesPath: string, service: Service | undefined, ctx: RenderContext, registry?: string): Record<string, string> {
+  if (usesPath === 'docker/login-action') {
+    // the login sends the workflow token: only to ghcr.io (the entry offers nothing else; this holds if it ever does)
+    if ((registry ?? 'ghcr.io') !== 'ghcr.io') throw new RenderError('A login to a registry other than ghcr.io would need its own secrets; pipegen does not send the workflow token anywhere else.');
+    return { username: '${{ github.actor }}', password: '${{ secrets.GITHUB_TOKEN }}' };
+  }
   if (usesPath !== 'docker/build-push-action') return {};
   const out: Record<string, string> = {};
   if (service !== undefined) {
@@ -303,15 +352,11 @@ export function renderJobPrelude(opts: PreludeOptions, platform: PlatformActions
   const steps: RenderedStep[] = [];
   const notes: string[] = [];
   const checkout = platformEntry(platform, 'checkout');
-  for (const lock of ['persist-credentials', 'allow-unsafe-pr-checkout']) {
-    if (own(checkout.fixedInputs.with ?? {}, lock) !== 'false') throw new RenderError(`The reviewed checkout entry no longer fixes ${lock} to false.`);
-  }
   const depth = opts.fetchDepth ?? '1';
   if (!(checkout.choices['fetch-depth'] ?? []).includes(depth)) throw new RenderError(`The reviewed checkout entry doesn't offer fetch-depth ${show(depth)}.`);
   steps.push(actionStep(checkout, 'Check out the repository', { 'fetch-depth': depth }, {}));
   if (opts.node !== undefined) {
     const setup = platformEntry(platform, 'setup-node');
-    if (own(setup.fixedInputs.with ?? {}, 'package-manager-cache') !== 'false') throw new RenderError('The reviewed setup-node entry no longer turns its package-manager cache off.');
     const mapped = mapNodeVersion(opts.node.runtimeVersion, setup.choices['node-version'] ?? []);
     if (mapped.note !== undefined) notes.push(mapped.note);
     steps.push(actionStep(setup, 'Set up Node.js', { 'node-version': mapped.version }, {}));
@@ -325,6 +370,9 @@ export function renderJobPrelude(opts: PreludeOptions, platform: PlatformActions
  * (artifact-names.ts) and `path` a place under `${{ runner.temp }}/pipegen-out/`.
  */
 export function renderUpload(artifact: string, path: string, platform: PlatformActions): RenderedStep {
+  // the folder is this artifact's own: another check's unscrubbed file must not go up under this name
+  const folder = `\${{ runner.temp }}/pipegen-out/${artifact}`;
+  if (path !== folder && !path.startsWith(`${folder}/`)) throw new RenderError('An upload may only take a path inside its own artifact folder.');
   const step = renderPlatformStep('upload-artifact', platform, { name: artifact, path });
   return { ...step, name: 'Upload the result', if: 'always()' };
 }
@@ -347,14 +395,43 @@ function str(value: string, block = false): Scalar {
   return s;
 }
 
+const EXPR = '${{';
+/** The only expressions that may appear in a rendered step: a declared-looking secret by name, as a whole value. */
+const SECRET_EXPR_RE = /^\$\{\{ secrets\.[A-Z][A-Z0-9_]{0,99} \}\}$/;
+
+/**
+ * Refuses an expression (`${{`) anywhere but the forms pipegen itself writes: `env` and `with` values that are exactly
+ * `${{ secrets.NAME }}`, and `with` values that pass the RENDERER_INPUTS checker of that action (the runner.temp paths,
+ * the login actor and token). Quoting does not stop Actions from evaluating one, so a name, a run line, an id, an
+ * `if`, a folder, or any key with `${{` is a bug or an attack, never rendered.
+ */
+function checkExpressions(step: RenderedStep): void {
+  const bad = (what: string): never => { throw new RenderError(`A step may not contain an expression in its ${what} (${show(step.name)}).`); };
+  for (const key of ['id', 'name', 'if', 'uses', 'usesComment', 'run', 'shell', 'working-directory'] as const) {
+    const v = step[key];
+    if (typeof v === 'string' && v.includes(EXPR)) bad(key);
+  }
+  for (const [group, values] of [['env', step.env], ['with', step.with]] as const) {
+    for (const [k, v] of Object.entries(values ?? {})) {
+      if (k.includes(EXPR)) bad(`${group} names`);
+      if (!v.includes(EXPR)) continue;
+      const table = step.uses === undefined ? undefined : own(RENDERER_INPUTS, step.uses.slice(0, step.uses.lastIndexOf('@')).toLowerCase());
+      const spec = group === 'with' && table !== undefined ? own(table, k) : undefined;
+      // an input the renderer fills is judged by its own checker; any other value may be a bare secret reference
+      if (spec === undefined ? !SECRET_EXPR_RE.test(v) : !spec.check(v)) bad(`${group} value ${show(k)}`);
+    }
+  }
+}
+
 /**
  * Steps as a YAML sequence node, built with the `yaml` Document API so no value can break out of its scalar: a name
  * with a newline or `${{` stays one quoted string. The version goes in as the trailing comment on `uses:` (cut to one
- * plain line). Plan G puts this node into its workflow Document, so the files and the snapshots show the same YAML.
+ * plain line). Expressions are refused except the forms pipegen writes (checkExpressions). Plan G puts this node into its workflow Document, so the files and the snapshots show the same YAML.
  */
 export function stepsToYaml(steps: readonly RenderedStep[]): YAMLSeq {
   const seq = new YAMLSeq();
   for (const step of steps) {
+    checkExpressions(step);
     const map = new YAMLMap();
     for (const key of KEY_ORDER) {
       const value = step[key];

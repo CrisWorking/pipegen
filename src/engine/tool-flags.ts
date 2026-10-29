@@ -264,7 +264,7 @@ export const ACTION_POLICIES: Readonly<Record<string, Readonly<Record<string, In
     'if-no-files-found': { values: ['error'], as: 'fixed' },
   },
   'actions/download-artifact': {},
-  'docker/login-action': { logout: { values: ['true'], as: 'fixed', required: true }, registry: { values: ['ghcr.io', 'docker.io'], as: 'choice' } },
+  'docker/login-action': { logout: { values: ['true'], as: 'fixed', required: true }, registry: { values: ['ghcr.io'], as: 'choice' } },   // ghcr.io only: the login sends the workflow token, which must never go to another registry (review 6a)
   'docker/setup-buildx-action': { 'cache-binary': { values: ['false'], as: 'fixed', required: true } },
   'docker/build-push-action': {
     context: { values: ['.'], as: 'fixed', required: true }, 'github-token': { values: [''], as: 'fixed', required: true },
@@ -306,9 +306,16 @@ export const ACTION_POLICIES: Readonly<Record<string, Readonly<Record<string, In
 // ---------- inputs the renderer fills (ruling S15) ----------
 
 /** One input the renderer (never a template, never the AI) fills at render time, with the check its value must pass. */
-export interface RendererInput { readonly describe: string; readonly check: (v: string) => boolean }
+export interface RendererInput {
+  readonly describe: string; readonly check: (v: string) => boolean;
+  /** A condition on the action's whole `with:` (template, chosen and filled inputs), e.g. the login token only goes to ghcr.io. */
+  readonly whenWith?: { readonly check: (all: Readonly<Record<string, string>>) => boolean; readonly describe: string };
+}
 
-const rx = (re: RegExp, describe: string): RendererInput => ({ describe, check: (v) => re.test(v) });
+const rx = (re: RegExp, describe: string, whenWith?: RendererInput['whenWith']): RendererInput => ({ describe, check: (v) => re.test(v), ...(whenWith === undefined ? {} : { whenWith }) });
+/** A repo-relative file path: not absolute, not an option (`-x`), no `..`, plain characters, no `*`. Shared by the renderer's folder checks. */
+export const PLAIN_REL_RE = /^(?![-/])(?!.*(?:^|\/)\.\.(?:\/|$))[A-Za-z0-9._/-]{1,200}$/;
+const GHCR_ONLY = { check: (all: Readonly<Record<string, string>>) => all.registry === 'ghcr.io', describe: 'only when the registry is ghcr.io' } as const;
 const RUNNER_TEMP_PATH = rx(/^\$\{\{ runner\.temp \}\}\/pipegen-out\/[a-z0-9][a-z0-9-]{0,120}(?:\/[A-Za-z0-9_][A-Za-z0-9._-]{0,100}){0,3}$/, 'a path under ${{ runner.temp }}/pipegen-out/<artifact>');
 const ARTIFACT_NAME = rx(new RegExp(`^${RESULT_ARTIFACT_PREFIX}[a-z0-9][a-z0-9-]{0,120}$`), `a result artifact name (${RESULT_ARTIFACT_PREFIX}…)`);
 
@@ -330,17 +337,20 @@ export const RENDERER_INPUTS: Readonly<Record<string, Readonly<Record<string, Re
     'subject-digest': rx(/^sha256:[0-9a-f]{64}$/, 'a sha256 digest'),
   },
   'docker/build-push-action': {
-    file: rx(/^(?![-/])(?!.*(?:^|\/)\.\.(?:\/|$))[A-Za-z0-9._/-]{1,200}$/, 'a repo-relative file path'),
+    file: rx(PLAIN_REL_RE, 'a repo-relative file path'),
     tags: rx(/^[a-z0-9][a-z0-9._/-]{0,200}:[A-Za-z0-9_][A-Za-z0-9._-]{0,127}$/, 'one image reference with a tag'),
   },
   'docker/login-action': {
     username: rx(/^\$\{\{ github\.actor \}\}$/, '${{ github.actor }}'),
-    password: rx(/^\$\{\{ secrets\.GITHUB_TOKEN \}\}$/, '${{ secrets.GITHUB_TOKEN }}'),
+    password: rx(/^\$\{\{ secrets\.GITHUB_TOKEN \}\}$/, '${{ secrets.GITHUB_TOKEN }}', GHCR_ONLY),
   },
 } satisfies Record<string, Record<string, RendererInput>>);
 
-/** Plain-English problems with renderer-filled inputs for an action (its `uses` path without `@sha`, any letter case). */
-export function rendererInputProblems(usesPath: string, inputs: Readonly<Record<string, string>>): string[] {
+/**
+ * Plain-English problems with renderer-filled inputs for an action (its `uses` path without `@sha`, any letter case).
+ * `all` is the action's whole `with:` (defaults to `inputs`), for the inputs that depend on another one.
+ */
+export function rendererInputProblems(usesPath: string, inputs: Readonly<Record<string, string>>, all: Readonly<Record<string, string>> = inputs): string[] {
   const key = usesPath.toLowerCase();
   const table = Object.hasOwn(RENDERER_INPUTS, key) ? RENDERER_INPUTS[key] : undefined;
   const out: string[] = [];
@@ -348,6 +358,7 @@ export function rendererInputProblems(usesPath: string, inputs: Readonly<Record<
     const spec = table !== undefined && Object.hasOwn(table, name) ? table[name] : undefined;
     if (spec === undefined) out.push(`${usesPath} takes no renderer-filled input ${JSON.stringify(name.slice(0, 40))}${table === undefined ? '' : ` (only ${Object.keys(table).join(', ')})`}`);
     else if (typeof value !== 'string' || !spec.check(value)) out.push(`${usesPath} input ${name} must be ${spec.describe}`);
+    else if (spec.whenWith !== undefined && !spec.whenWith.check(all)) out.push(`${usesPath} input ${name} is allowed ${spec.whenWith.describe}`);
   }
   return out;
 }

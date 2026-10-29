@@ -1622,15 +1622,25 @@ describe('data/reviewed-tools.yml', () => {
     });
   });
 
-  it('data: every catalogue entry is reviewed by the owner (2026-10-28, DECISIONS #104) with proofs 0', () => {
+  // entries re-reviewed by delegation (DECISIONS 105) after the owner's 2026-10-28 review; add an id here on purpose, never skip it
+  const DELEGATED: Record<string, string> = { 'actions-setup-node': '2026-10-29', 'docker-login-action': '2026-10-29' };
+
+  it('data: every catalogue entry is reviewed by the owner (2026-10-28, DECISIONS #104) or by delegation (listed), with proofs 0', () => {
     const list = real();
     for (const id of Object.keys(CATALOGUE)) {
       const t = byId(list, id)[0];
-      if (id === 'actions-setup-node') continue; // widened on 2026-10-29 and re-reviewed by delegation (next test)
-      expect(t?.reviewedBy, id).toBe('Cristiano');
-      expect(t?.reviewedAt, id).toBe('2026-10-28');
+      const delegated = DELEGATED[id];
+      expect(t?.reviewedBy, id).toBe(delegated === undefined ? 'Cristiano' : 'Claude delegated DECISIONS 105');
+      expect(t?.reviewedAt, id).toBe(delegated ?? '2026-10-28');
       expect(t?.proofs, id).toBe(0);
     }
+  });
+
+  it('data: docker login offers ghcr.io only (the workflow token must not go to another registry), reviewed by delegation', () => {
+    const t = byId(real(), 'docker-login-action')[0];
+    expect(t?.choices.registry).toEqual(['ghcr.io']);
+    expect(ACTION_POLICIES['docker/login-action']?.registry?.values).toEqual(['ghcr.io']);
+    expect(t?.reviewedBy).toBe('Claude delegated DECISIONS 105');
   });
 
   it('data: setup-node offers exactly 22, 24 and 26 (DECISIONS #92, widened to include 22 on 2026-10-29), reviewed by delegation', () => {

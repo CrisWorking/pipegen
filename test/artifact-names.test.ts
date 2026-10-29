@@ -32,7 +32,13 @@ describe('resultArtifactName', () => {
   });
 
   it('resultArtifactName: a need id that is not a plain id is refused', () => {
-    for (const bad of ['', 'Sast', 'sast/../x', 'a b', '${{ x }}', '-x', 'x\n']) expect(() => resultArtifactName(bad), bad).toThrow(ArtifactNameError);
+    for (const bad of ['', 'Sast', 'sast/../x', 'a b', '${{ x }}', '-x', 'x\n', 'sast--api', 'base-sast']) expect(() => resultArtifactName(bad), bad).toThrow(ArtifactNameError);
+  });
+
+  it('resultArtifactName: a single call can not collide with another: no `--` or leading base- in a need id', () => {
+    expect(() => resultArtifactName('sast--api')).toThrow(ArtifactNameError);
+    expect(() => resultArtifactName('base-sast')).toThrow(ArtifactNameError);
+    expect(resultArtifactName('dependency-review')).toBe(`${RESULT_ARTIFACT_PREFIX}dependency-review`);
   });
 
   it('resultArtifactNames: a collision after slugging throws; distinct names pass', () => {

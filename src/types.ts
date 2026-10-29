@@ -13,7 +13,8 @@
 export type Language = 'node' | 'python' | 'go' | 'java' | 'dotnet' | 'ruby' | 'php' | 'other';
 export type PackageManager = 'npm' | 'pnpm' | 'yarn' | 'bun' | 'pip' | 'poetry' | 'uv' | 'other';
 export type Monorepo = 'none' | 'npm-workspaces' | 'pnpm-workspaces' | 'yarn-workspaces' | 'turbo' | 'nx' | 'folders';
-export type DependencyKind = 'postgres' | 'mysql' | 'redis' | 'mongodb' | 'rabbitmq' | 'external';
+export const DEPENDENCY_KINDS = ['postgres', 'mysql', 'redis', 'mongodb', 'rabbitmq', 'external'] as const;
+export type DependencyKind = typeof DEPENDENCY_KINDS[number];
 
 export interface Dependency { kind: DependencyKind; name: string; evidence: string; envVars: string[] }   // external = SaaS (Stripe, Auth0…)
 /** P55 (batch B): a one-shot script, a folder built into another service's image, or an email-template package. */

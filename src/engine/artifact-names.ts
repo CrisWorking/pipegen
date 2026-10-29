@@ -5,7 +5,8 @@ import { RESULT_ARTIFACT_PREFIX } from '../types.js';
 
 export class ArtifactNameError extends Error {}
 
-const NEED_ID_RE = /^[a-z0-9][a-z0-9-]{0,63}$/;
+// no `--` (the service separator) and no leading `base-` (the baseline marker), so two different calls never give one name
+const NEED_ID_RE = /^(?!base-)(?!.*--)[a-z0-9][a-z0-9-]{0,63}$/;
 const MAX_SLUG = 40;
 
 /**
@@ -21,7 +22,7 @@ export function slug(s: string): string {
 
 /**
  * `pipegen-out-[base-]<needId>[--<slug(service)>]`. `base` marks the target-branch run of the same check (the
- * baseline scan). The need id must already be a plain id (the floor ids are).
+ * baseline scan). The need id must already be a plain id (the floor ids are), without `--` or a leading `base-`.
  */
 export function resultArtifactName(needId: string, service?: string, opts?: { base?: true }): string {
   if (!NEED_ID_RE.test(needId)) throw new ArtifactNameError('A need id for an artifact name must be lower case letters, digits and dashes.');

