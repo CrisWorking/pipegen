@@ -348,7 +348,8 @@ describe('cooldown: the real data', () => {
       const r = await check(upstream(() => OLD, same, extra).fetch, { 'data/reviewed-tools.yml': head }, realBase);
       expect(r.ok, JSON.stringify(cmp)).toBe(false);
       expect(r.findings.map((f) => f.name)).toEqual(['semgrep (semgrep rules)']);
-      expect(lines(r)).toContain('not on the default branch');
+      // a diverged compare says why; a 404 compare is a failed lookup (it proves nothing either way)
+      expect(lines(r)).toContain(typeof cmp === 'object' ? 'not on the default branch' : 'lookup failed');
     }
   });
 

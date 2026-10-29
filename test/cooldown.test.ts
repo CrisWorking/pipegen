@@ -587,11 +587,18 @@ ${extra}`;
       expect(seen.some((c) => c.includes(repo)), repo).toBe(false);
     }
     // a commit that is not on the default branch (a fork's commit served under the upstream repo, or a side branch)
-    for (const status of ['diverged', 'behind', 404]) {
+    for (const status of ['diverged', 'behind']) {
       const r = await run({}, head, router({ ...sgRoutes(verified(daysAgo(30))), ...onDefault('semgrep/semgrep-rules', RULES_COMMIT, 'trunk', status) }));
       expect(r.ok, String(status)).toBe(false);
+      expect(problems(r), String(status)).toContain('is not on the default branch');
       expect(problems(r), String(status)).toContain('needs owner review');
     }
+    // a compare that 404s proves nothing either way: a failed lookup (still failing closed), not "not on the branch"
+    const r404 = await run({}, head, router({ ...sgRoutes(verified(daysAgo(30))), ...onDefault('semgrep/semgrep-rules', RULES_COMMIT, 'trunk', 404) }));
+    expect(r404.ok).toBe(false);
+    expect(problems(r404)).toContain('lookup failed');
+    expect(problems(r404)).toContain('404');
+    expect(problems(r404)).not.toContain('is not on the default branch');
     // `ahead` with a merge base that is not the commit is not proof either
     const lying = { ...sgRoutes(verified(daysAgo(30))), [gh(`semgrep/semgrep-rules/compare/${RULES_COMMIT}...trunk?per_page=1`)]: { status: 'ahead', behind_by: 0, merge_base_commit: { sha: SHA } } };
     expect(problems(await run({}, head, router(lying)))).toContain('needs owner review');
@@ -605,10 +612,14 @@ ${extra}`;
     const calls: string[] = [];
     expect(problems(await run({}, head, router(ntRoutes(), calls)))).toBe('');
     expect(calls).toContain(gh(`${NT}/compare/${NT_COMMIT}...main?per_page=1`));
-    for (const status of ['diverged', 'behind', 404]) {
+    for (const status of ['diverged', 'behind']) {
       const r = await run({}, head, router({ ...ntRoutes(), ...onDefault(NT, NT_COMMIT, 'main', status) }));
       expect(problems(r), String(status)).toContain('needs owner review');
     }
+    const r404 = await run({}, head, router({ ...ntRoutes(), ...onDefault(NT, NT_COMMIT, 'main', 404) }));
+    expect(r404.ok).toBe(false);
+    expect(problems(r404)).toContain('lookup failed');
+    expect(problems(r404)).not.toContain('is not on the default branch');
     const noTag = ntRoutes();
     delete noTag[gh(`${NT}/git/ref/tags/v10.5.0`)];
     expect((await run({}, head, router(noTag))).ok).toBe(false);
