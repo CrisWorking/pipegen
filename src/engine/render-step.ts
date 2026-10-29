@@ -374,13 +374,23 @@ function cliHooks(platform: PlatformActions): CliHooks {
  * runs a job's steps through this once, so a job installs its dependencies once (ruling B5).
  */
 export function dedupeJobSteps(steps: readonly RenderedStep[]): RenderedStep[] {
-  const seen = new Set<string>();
-  const kept = steps.filter((s) => {
-    if (s.id === undefined || !s.id.startsWith('pipegen-')) return true;
-    if (seen.has(s.id)) return false;
-    seen.add(s.id);
-    return true;
-  });
+  const seen = new Map<string, number>();
+  const kept: RenderedStep[] = [];
+  for (const s of steps) {
+    if (s.id === undefined || !s.id.startsWith('pipegen-')) { kept.push(s); continue; }
+    const at = seen.get(s.id);
+    if (at === undefined) {
+      seen.set(s.id, kept.length);
+      kept.push(s);
+      continue;
+    }
+    // the same repo `npm ci` asked for by several tools: the one that stays must carry EVERY tool's lockfile pins, so its
+    // pre-check (before `npm ci`) guards them all, whichever step came first
+    const first = kept[at] as RenderedStep;
+    if (s.id.startsWith('pipegen-npm-ci-') && first.env?.PIPEGEN_NPM_EXPECT !== s.env?.PIPEGEN_NPM_EXPECT) {
+      kept[at] = { ...first, env: { ...first.env, PIPEGEN_NPM_EXPECT: mergePins(first.env?.PIPEGEN_NPM_EXPECT, s.env?.PIPEGEN_NPM_EXPECT) } };
+    }
+  }
   // one Node version per job: a second major would run a tool on a node it was not set up for (Plan G splits the job)
   const majors = new Set(kept.filter((s) => s.id?.startsWith('pipegen-setup-node-')).map((s) => s.id));
   if (majors.size > 1) throw new RenderError('One job can have only one Node version, but its steps ask for more than one; they belong in separate jobs.');
@@ -388,6 +398,23 @@ export function dedupeJobSteps(steps: readonly RenderedStep[]): RenderedStep[] {
   const order = checkJobOrder(kept);
   if (order.length > 0) throw new RenderError(order.join(' '));
   return kept;
+}
+
+/** The union of two lists of pinned packages (JSON, as in PIPEGEN_NPM_EXPECT); one package at two different pins is refused. */
+function mergePins(a: string | undefined, b: string | undefined): string {
+  const out = new Map<string, string>();
+  for (const text of [a, b]) {
+    let list: unknown;
+    try { list = JSON.parse(text ?? '[]'); } catch { throw new RenderError('A dependency install step carries a pin list that is not JSON.'); }
+    if (!Array.isArray(list)) throw new RenderError('A dependency install step carries a pin list that is not a list.');
+    for (const p of list as { name?: unknown }[]) {
+      const name = typeof p?.name === 'string' ? p.name : '';
+      const line = JSON.stringify(p);
+      if (name === '' || (out.has(name) && out.get(name) !== line)) throw new RenderError(`Two steps of one job install ${show(name)} at different pins.`);
+      out.set(name, line);
+    }
+  }
+  return `[${[...out.values()].join(',')}]`;
 }
 
 /** The platform actions that run no repo code and no step script of ours: pinned by SHA (the version is a comment). */
@@ -518,7 +545,7 @@ export function renderProjectScript(step: ProjectScriptStep, platform: PlatformA
   const setup = prelude[1] as RenderedStep;
   const nodeMajor = setup.with?.['node-version'];
   if (nodeMajor === undefined || !/^\d{1,3}$/.test(nodeMajor)) throw new RenderError('The Node setup step has no plain node-version.');
-  return { steps: [prelude[0] as RenderedStep, { ...setup, id: `pipegen-setup-node-${nodeMajor}` }, ...projectScriptSteps(artifact, step.script, nodeMajor, expected)], output: null };
+  return { steps: [{ ...(prelude[0] as RenderedStep), id: 'pipegen-checkout' }, { ...setup, id: `pipegen-setup-node-${nodeMajor}` }, ...projectScriptSteps(artifact, step.script, nodeMajor, expected)], output: null };
 }
 
 /** Put on every job that feeds the gate, builds, signs or verifies (Plan G): no cache of any kind. */

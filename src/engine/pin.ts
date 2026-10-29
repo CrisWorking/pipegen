@@ -139,6 +139,9 @@ const COMBINED_SUMS_RE = /(?:^|[._-])(?:checksums|sha256sums?)(?:\.txt)?$/i;
 const contentsSchema = z.object({ type: z.literal('file'), encoding: z.literal('base64'), content: z.string(), size: z.number() });
 /** The image an action's action.yml runs (`runs.using: docker`), by digest (ruling S13). */
 export interface WrappedImage { ref: string; digest: string }
+/** What an action's action.yml runs, by kind (resolvePin's `onRuns` and `readActionRuns` report it). */
+export interface ActionRuns { kind: 'node' | 'composite' | 'docker-digest' | 'docker-tag' | 'docker-build'; text: string; image?: WrappedImage }
+const PLAIN_SUB_PATH_RE = /^(?![-/])(?!.*(?:^|\/)\.\.(?:\/|$))[A-Za-z0-9._/-]{1,200}$/;
 /** action.yml bigger than this is refused (a real one is a few KiB). */
 const MAX_ACTION_YML = 100_000;
 const refSchema = z.object({ ref: z.string(), object: z.object({ type: z.string(), sha: z.string() }) });
@@ -197,7 +200,7 @@ function readDate(s: unknown): number | null {
  * (discovery, memory, `reviewed: false`) gets a new pin, whatever pin it carries (cooldown applies).
  * Throws PinError (or GitHubRateLimitError) when the pin can't be made safely.
  */
-export async function resolvePin(c: Candidate, deps: PinDeps, install?: InstallSpec, options: { readActionImage?: boolean } = {}): Promise<Candidate & { wrappedImage?: WrappedImage }> {
+export async function resolvePin(c: Candidate, deps: PinDeps, install?: InstallSpec, options: { readActionImage?: boolean; subPath?: string; onRuns?: (r: ActionRuns) => void } = {}): Promise<Candidate & { wrappedImage?: WrappedImage }> {
   const now = () => (deps.now ?? Date.now)();
   const note = (text: string) => { deps.notes.push(safeText(text, 400)); };
   /** Every new pin is flagged for a human: nothing pipegen pins by itself runs until it is reviewed. */
@@ -214,7 +217,7 @@ export async function resolvePin(c: Candidate, deps: PinDeps, install?: InstallS
   if (c.kind === 'action') {
     const pinned = await pinAction();
     if (options.readActionImage !== true) return pinned;
-    const image = await actionImage(pinned);
+    const image = await actionImage(pinned, options.subPath);
     return image === undefined ? pinned : { ...pinned, wrappedImage: image };
   }
   if (c.kind === 'docker' || install?.method === 'docker') return pinImage();
@@ -227,22 +230,25 @@ export async function resolvePin(c: Candidate, deps: PinDeps, install?: InstallS
   // ---------- GitHub Actions ----------
 
   /**
-   * What the action's own action.yml runs, read at the pinned commit (ruling S13): an image for `runs.using: docker`, only
-   * when it is `docker://<image>@sha256:<digest>`. A Dockerfile-built action, an image by tag, an image from another
-   * registry, a file that is not what it should be, or no action file at all fails closed. node and composite actions
-   * run no image of their own: undefined.
+   * What the action's own action.yml runs, read at the pinned commit (ruling S13) from the action's own folder (`subPath`
+   * for `owner/repo/path@sha`, else the repo root): an image for `runs.using: docker`, only when it is
+   * `docker://<image>@sha256:<digest>`. A Dockerfile-built action, an image by tag, an image from another registry, a file
+   * that is not what it should be, or no action file at all fails closed. node and composite actions run no image of
+   * their own: undefined.
    */
-  async function actionImage(pinned: Candidate): Promise<WrappedImage | undefined> {
+  async function actionRuns(pinned: Candidate, subPath: string | undefined): Promise<ActionRuns> {
     const repo = checkRepo(pinned.repo);
     const sha = pinned.pin.sha;
     if (sha === undefined || !COMMIT_SHA_RE.test(sha)) throw new PinError(`${repo} has no pinned commit to read its action.yml at.`);
+    if (subPath !== undefined && !PLAIN_SUB_PATH_RE.test(subPath)) throw new PinError(`The action folder of ${repo} isn't a plain path inside the repository.`);
     const gh = github(repo);
+    const dir = subPath === undefined || subPath === '' ? '' : `${subPath}/`;
     let text: string | null = null;
     for (const name of ['action.yml', 'action.yaml']) {
-      text = await gh.fileText(name, sha);
+      text = await gh.fileText(`${dir}${name}`, sha);
       if (text !== null) break;
     }
-    if (text === null) throw new PinError(`${repo} has no action.yml at ${sha}, so pipegen can't tell what the action runs.`);
+    if (text === null) throw new PinError(`${repo} has no ${dir}action.yml at ${sha}, so pipegen can't tell what the action runs.`);
     let doc: unknown;
     try {
       doc = parseYaml(text, { maxAliasCount: 20 });
@@ -252,14 +258,23 @@ export async function resolvePin(c: Candidate, deps: PinDeps, install?: InstallS
     const runs = typeof doc === 'object' && doc !== null && !Array.isArray(doc) ? (doc as Record<string, unknown>).runs : undefined;
     if (typeof runs !== 'object' || runs === null || Array.isArray(runs)) throw new PinError(`The action.yml of ${repo} has no runs section.`);
     const using = (runs as Record<string, unknown>).using;
-    if (using === 'composite' || (typeof using === 'string' && /^node\d{1,3}$/.test(using))) return undefined;
+    if (using === 'composite') return { kind: 'composite', text };
+    if (typeof using === 'string' && /^node\d{1,3}$/.test(using)) return { kind: 'node', text };
     if (using !== 'docker') throw new PinError(`The action.yml of ${repo} runs with "${safeText(String(using), 40)}", which pipegen doesn't know.`);
     const image = (runs as Record<string, unknown>).image;
-    const m = typeof image === 'string' ? /^docker:\/\/([^@]{1,255})@(sha256:[0-9a-f]{64})$/.exec(image) : null;
-    if (m === null || parseImageRef(m[1]) === null) {
-      throw new PinError(`${repo} runs ${typeof image === 'string' && image.startsWith('docker://') ? 'an image that is not pinned by digest, or from a registry pipegen does not use' : 'an image built from a Dockerfile at run time'}, so pipegen can't pin what it runs.`);
-    }
-    return { ref: `${m[1] as string}@${m[2] as string}`, digest: m[2] as string };
+    if (typeof image !== 'string') throw new PinError(`The action.yml of ${repo} runs a docker action with no image.`);
+    const m = /^docker:\/\/([^@]{1,255})@(sha256:[0-9a-f]{64})$/.exec(image);
+    if (m !== null && parseImageRef(m[1]) !== null) return { kind: 'docker-digest', text, image: { ref: `${m[1] as string}@${m[2] as string}`, digest: m[2] as string } };
+    return { kind: image.startsWith('docker://') ? 'docker-tag' : 'docker-build', text };
+  }
+
+  async function actionImage(pinned: Candidate, subPath: string | undefined): Promise<WrappedImage | undefined> {
+    const r = await actionRuns(pinned, subPath);
+    options.onRuns?.(r);
+    if (r.kind === 'composite' || r.kind === 'node') return undefined;
+    if (r.kind === 'docker-digest') return r.image;
+    if (options.onRuns !== undefined) return undefined;
+    throw new PinError(`${pinned.repo} runs ${r.kind === 'docker-tag' ? 'an image that is not pinned by digest, or from a registry pipegen does not use' : 'an image built from a Dockerfile at run time'}, so pipegen can't pin what it runs.`);
   }
 
   async function pinAction(): Promise<Candidate> {
@@ -521,7 +536,7 @@ export async function resolvePin(c: Candidate, deps: PinDeps, install?: InstallS
       },
       /** The text of one file of the repo at a commit, or null when there is none. A folder, a big file or another encoding is refused. */
       fileText: async (path: string, ref: string): Promise<string | null> => {
-        const r = await call(`the file ${path}`, () => deps.gh.request('GET /repos/{owner}/{repo}/contents/{path}', { owner, repo: name, path, ref }), contentsSchema);
+        const r = await call(`the file ${path}`, () => deps.gh.request('GET /repos/{owner}/{repo}/contents/{+path}', { owner, repo: name, path, ref }), contentsSchema);
         if (r === null) return null;
         if (r.size > MAX_ACTION_YML || r.content.length > MAX_ACTION_YML * 2) throw new PinError(`The file ${path} of ${repo} is too large to read.`);
         return Buffer.from(r.content, 'base64').toString('utf8');
@@ -650,4 +665,12 @@ export async function platformActions(reviewed: ReviewedTool[], deps: PinDeps): 
     out[key] = { ...(matches[0] as ReviewedTool), candidate: { ...verified, source: 'reviewed', reviewed: true } };
   }
   return out as PlatformActions;
+}
+
+/** What the pinned action (at its sub-path, if any) runs: pins it first like resolvePin, then reports the kind of its action.yml. For the live check of the container lists. */
+export async function readActionRuns(c: Candidate, deps: PinDeps, subPath?: string): Promise<ActionRuns> {
+  let out: ActionRuns | undefined;
+  await resolvePin(c, deps, undefined, { readActionImage: true, ...(subPath === undefined ? {} : { subPath }), onRuns: (r) => { out = r; } });
+  if (out === undefined) throw new PinError('The action was not read.');
+  return out;
 }

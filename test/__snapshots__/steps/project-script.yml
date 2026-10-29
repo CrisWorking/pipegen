@@ -1,4 +1,5 @@
-- name: Check out the repository
+- id: pipegen-checkout
+  name: Check out the repository
   uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
   with:
     persist-credentials: "false"
@@ -89,8 +90,14 @@
     cd -- ./apps/web
     ws="$(cd "$GITHUB_WORKSPACE" && pwd -P)"
     case "$(pwd -P)" in "$ws"/*) ;; *) pg_fail "the working folder is outside the repository" ;; esac
-    PATH="$nodebin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
-    "$nodebin/npm" test
+    pg_env=(
+      /usr/bin/env -i
+      "HOME=$home"
+      "PATH=$nodebin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+      "RUNNER_TEMP=$RUNNER_TEMP"
+      "TMPDIR=$RUNNER_TEMP"
+    )
+    "${pg_env[@]}" "$nodebin/npm" test
   shell: bash
   env:
     BASH_ENV: ""

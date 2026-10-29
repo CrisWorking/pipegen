@@ -1,7 +1,7 @@
 // Plan B 6c: run-time slots (B6), rule archives (S12), container actions (S13), project scripts (S10). Written first.
 // Shell is run through real bash and real git (a local bare repo, no network).
 import { spawnSync } from 'node:child_process';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
@@ -12,7 +12,7 @@ import { ARGV_POLICIES, type ArgvPolicy } from '../src/engine/tool-flags.js';
 import type { ProjectScriptStep } from '../src/engine/reviewed.js';
 import type { ReviewedTool, StepSpec } from '../src/types.js';
 import { ctxFor, entry, platform, profile, reviewedList, service, specFor } from './helpers/render.js';
-import { exec, sandbox, stepEnv } from './helpers/step-harness.js';
+import { argvOf, exec, fakeTool, sandbox, stepEnv, type Sandbox } from './helpers/step-harness.js';
 
 const IMG = `ghcr.io/o/app@sha256:${'a'.repeat(64)}`;
 const needFor = (t: ReviewedTool): string => t.categories.find((c) => (NEED_IDS as readonly string[]).includes(c) && c !== 'platform') ?? 'sast';
@@ -114,9 +114,49 @@ describe('B6: slots in rendered steps (values only from the render context, pass
     expect(argEnv(runOf(render('kube-linter', { ...withK8s, targets: { k8sDir: 'deploy/k8s' } })))).toContain('deploy/k8s');
     expect(() => render('kube-linter', { ...withK8s, targets: { k8sDir: '../x' } })).toThrow(RenderError);
   });
-  it2('a repo-path slot that is a symlink fails the step at run time', () => {
-    const run = runOf(render('hadolint', full, { service: 'app' }));
-    expect(run.run).toMatch(/\[ -L /);
+  it('M26: a repo-path slot with a service folder (workingDir) is refused', () => {
+    const svc = service({ name: 'web', path: 'apps/web', dockerfile: 'apps/web/Dockerfile' });
+    expect(() => render('hadolint', ctxWith({}, svc), { service: 'web', workingDir: 'apps/web' })).toThrow(/relative to the repository root/);
+    expect(() => render('hadolint', ctxWith({}, svc), { service: 'web' })).not.toThrow();
+  });
+  describe('M12/M13: the run-time repo-path checks, run with real bash against a temp tree', () => {
+    const artifact = 'pipegen-out-dockerfile-lint--app';
+    /** Runs the hadolint step in a fresh sandbox after `plant` set up the workspace; the stand-in tool leaves a marker and a result. */
+    const run = (dockerfile: string, plant: (sb: Sandbox) => void): { status: number | null; stderr: string; started: boolean } => {
+      const r = render('hadolint', ctxWith({}, service({ name: 'app', path: '.', dockerfile })), { service: 'app' });
+      const step = runOf(r);
+      const sb = sandbox();
+      fakeTool(sb, artifact, 'hadolint', "echo '{}' > ./hadolint.sarif");
+      plant(sb);
+      const res = exec(step, sb, stepEnv(step, sb));
+      return { status: res.status, stderr: res.stderr, started: existsSync(join(sb.ws, 'argv.bin')) };
+    };
+    it2('a regular file inside the repository runs the tool with exactly that path', () => {
+      const r = run('docker/Dockerfile', (sb) => { mkdirSync(join(sb.ws, 'docker')); writeFileSync(join(sb.ws, 'docker', 'Dockerfile'), 'FROM scratch\n'); });
+      expect(r.status, r.stderr).toBe(0);
+      expect(r.started).toBe(true);
+    });
+    it2('M13: a missing file and a symlinked file fail the step before the tool starts', () => {
+      const missing = run('Dockerfile', () => {});
+      expect(missing.status).not.toBe(0);
+      expect(missing.started).toBe(false);
+      expect(missing.stderr).toMatch(/missing or a link/);
+      const link = run('Dockerfile', (sb) => { writeFileSync(join(sb.dir, 'real'), 'FROM scratch\n'); symlinkSync(join(sb.dir, 'real'), join(sb.ws, 'Dockerfile')); });
+      expect(link.status).not.toBe(0);
+      expect(link.started).toBe(false);
+      expect(link.stderr).toMatch(/missing or a link/);
+    });
+    it2('M12: a path through a symlinked folder that leaves the repository fails the step before the tool starts', () => {
+      const out = run('docker/Dockerfile', (sb) => {
+        const outside = join(sb.dir, 'outside');
+        mkdirSync(outside);
+        writeFileSync(join(outside, 'Dockerfile'), 'FROM scratch\n');
+        symlinkSync(outside, join(sb.ws, 'docker'));
+      });
+      expect(out.status).not.toBe(0);
+      expect(out.started).toBe(false);
+      expect(out.stderr).toMatch(/leaves the repository/);
+    });
   });
   it('slot values never appear in the shell text', () => {
     for (const [id, v] of [['trivy-image', IMG], ['zap-baseline', 'http://localhost:8080'], ['nuclei', 'http://localhost:8080']] as const) expect(runOf(render(id)).run, id).not.toContain(v);
@@ -298,6 +338,30 @@ describe('S12: rule archives are fetched by commit and checked by tree (real git
     it('a rules choice that is not in the entry\'s list is refused', () => {
       expect(() => renderSemgrep(semgrepAgainst({ commit: sg.commit, tree: sg.tree }), '../x')).toThrow(RenderError);
     });
+    it2('M11: the rules sub-folder must be a real folder: a link fails the run step before docker, a folder passes that check', () => {
+      const step = runOf(renderSemgrep(semgrepAgainst({ commit: sg.commit, tree: sg.tree })));
+      const sbLink = sandbox();
+      const base = join(sbLink.rt, 'pipegen-rules', 'pipegen-out-sast');
+      mkdirSync(base, { recursive: true });
+      mkdirSync(join(sbLink.dir, 'elsewhere'));
+      symlinkSync(join(sbLink.dir, 'elsewhere'), join(base, 'javascript'));
+      const link = exec(step, sbLink, stepEnv(step, sbLink));
+      expect(link.status).not.toBe(0);
+      expect(link.stderr).toMatch(/rules folder is missing or a link/);
+      const sbDir = sandbox();
+      mkdirSync(join(sbDir.rt, 'pipegen-rules', 'pipegen-out-sast', 'javascript'), { recursive: true });
+      expect(exec(step, sbDir, stepEnv(step, sbDir)).stderr).not.toMatch(/rules folder is missing or a link/);
+    });
+    it2('M27: the rules folder is fresh: a folder planted there beforehand (writable, with a decoy file) makes the step fail', () => {
+      const s2 = rulesStep(renderSemgrep(semgrepAgainst({ commit: sg.commit, tree: sg.tree })));
+      const sb = sandbox();
+      const planted = join(sb.rt, 'pipegen-rules', 'pipegen-out-sast');
+      mkdirSync(planted, { recursive: true });
+      writeFileSync(join(planted, 'decoy.yaml'), 'rules: [evil]\n');
+      expect(exec(s2, sb, stepEnv(s2, sb)).status).not.toBe(0);
+      const clean = sandbox();
+      expect(exec(s2, clean, stepEnv(s2, clean)).status).toBe(0);
+    });
     it('the real entry renders (no gitBase): https://github.com/ and only the https protocol', () => {
       const r = render('semgrep');
       const s = rulesStep(r);
@@ -311,7 +375,7 @@ describe('S12: rule archives are fetched by commit and checked by tree (real git
 
 // ---------- ESLint (S11 as amended by DECISIONS #107) ----------
 describe('S11: the ESLint config resolves @eslint/js and typescript-eslint from pipegen\'s closure folder, never from the repo', () => {
-  it2('a planted repo copy that throws on import is never loaded', () => {
+  it2('node resolves the config\'s imports from the config\'s own folder, so repo copies are not reached (Node semantics; the render guard is the $npmdir write asserted first)', () => {
     const t = entry('eslint-typescript');
     const r = renderStepWith(specFor(t, { needId: 'lint' }), t, platform(), full);
     const run = runOf(r);
@@ -388,6 +452,27 @@ describe('S10: renderProjectScript', () => {
     const later = render('gitleaks').steps;
     expect(() => dedupeJobSteps([...script, ...later])).toThrow(RenderError);
     expect(() => dedupeJobSteps([...later, ...script])).not.toThrow();
+  });
+  it2('the script runs under the env -i allowlist: ambient tokens, NODE_OPTIONS and the runner HOME never reach npm (real bash)', () => {
+    const run = runOf(renderProjectScript(step(), platform(), c));
+    expect(run.run).toContain('/usr/bin/env -i');
+    const sb = sandbox();
+    mkdirSync(join(sb.ws, 'apps', 'web'), { recursive: true });
+    const bin = join(sb.dir, 'nodebin');
+    mkdirSync(bin);
+    writeFileSync(join(bin, 'node'), `#!/bin/sh\nif [ "$1" = --version ]; then echo v22.3.0; exit 0; fi\nexec ${process.execPath} "$@"\n`);
+    writeFileSync(join(bin, 'npm'), '#!/bin/sh\nenv > "$RUNNER_TEMP/npm-env.txt"\nfor a in "$@"; do printf \'%s\\n\' "$a"; done > "$RUNNER_TEMP/npm-args.txt"\n');
+    chmodSync(join(bin, 'node'), 0o755);
+    chmodSync(join(bin, 'npm'), 0o755);
+    const env = { ...stepEnv(run, sb, {}, {
+      [['ACTIONS_ID', 'TOKEN_REQUEST', 'TOKEN'].join('_')]: 'planted', [['ACTIONS_ID', 'TOKEN_REQUEST', 'URL'].join('_')]: 'https://example.invalid/oidc', NODE_OPTIONS: '--require ./evil.js', AMBIENT_PLANT: 'x', HOME: '/home/runner', NPM_CONFIG_REGISTRY: 'https://evil.invalid',
+    }), PATH: `${bin}:${process.env.PATH ?? ''}` };
+    const res = exec(run, sb, env);
+    expect(res.status, res.stderr).toBe(0);
+    const names = readFileSync(join(sb.rt, 'npm-env.txt'), 'utf8').split('\n').filter((l) => /^[A-Za-z_]\w*=/.test(l)).map((l) => l.slice(0, l.indexOf('='))).filter((n) => n !== 'PWD' && n !== '_' && n !== 'SHLVL');
+    expect(names.sort()).toEqual(['HOME', 'PATH', 'RUNNER_TEMP', 'TMPDIR']);
+    expect(readFileSync(join(sb.rt, 'npm-env.txt'), 'utf8')).not.toContain('/home/runner');
+    expect(readFileSync(join(sb.rt, 'npm-args.txt'), 'utf8').trim()).toBe('test');
   });
   it('snapshot', async () => {
     const { Document } = await import('yaml');

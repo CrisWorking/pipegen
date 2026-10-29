@@ -2,7 +2,7 @@ import { createHash } from 'node:crypto';
 import { describe, expect, it, vi } from 'vitest';
 import { GitHubRateLimitError, isRateStop, newRateBudget } from '../src/engine/github-rate.js';
 import {
-  COOLDOWN_DAYS, PinError, PinMovedWarning, PLATFORM_ACTION_IDS, platformActions, resolvePin, type PinDeps, type PlatformActions,
+  COOLDOWN_DAYS, PinError, PinMovedWarning, PLATFORM_ACTION_IDS, platformActions, readActionRuns, resolvePin, type PinDeps, type PlatformActions,
 } from '../src/engine/pin.js';
 import type { Candidate, InstallSpec, ReviewedTool } from '../src/types.js';
 import { fakeFetch, fakeOctokit, type Reply, type Routes } from './helpers/fake-http.js';
@@ -904,5 +904,37 @@ describe('pin: container actions read action.yml at the pinned SHA (S13)', () =>
     const { deps, ghCalls } = setup(github());
     await resolvePin(stored(), deps);
     expect(ghCalls.some((c) => c.url.pathname.includes('/contents/'))).toBe(false);
+  });
+});
+
+describe('pin: a sub-path action is judged by its own action.yml (6c fix round 1, finding 2)', () => {
+  const D = `sha256:${'9'.repeat(64)}`;
+  const f = (path: string, text: string): Routes => ({ [`GET ${GH}/repos/o/r/contents/${path}`]: { body: { type: 'file', encoding: 'base64', content: Buffer.from(text).toString('base64'), size: text.length, path } } });
+  const root = f('action.yml', 'runs:\n  using: composite\n  steps: []\n');
+  it('the root action is composite and the sub-path action is docker: the sub-path image is returned', async () => {
+    const { deps, ghCalls } = setup(github({ ...root, ...f('sub/dir/action.yml', `runs:\n  using: docker\n  image: docker://ghcr.io/o/img@${D}\n`) }));
+    const out = await resolvePin(stored(), deps, undefined, { readActionImage: true, subPath: 'sub/dir' });
+    expect(out.wrappedImage).toEqual({ ref: `ghcr.io/o/img@${D}`, digest: D });
+    expect(ghCalls.some((c) => c.url.pathname === '/repos/o/r/contents/action.yml')).toBe(false);
+  });
+  it('the root action is composite and the sub-path action is docker by tag: refused (the root stub is not what runs)', async () => {
+    const { deps } = setup(github({ ...root, ...f('sub/action.yml', 'runs:\n  using: docker\n  image: docker://ghcr.io/o/img:v1\n') }));
+    await expect(resolvePin(stored(), deps, undefined, { readActionImage: true, subPath: 'sub' })).rejects.toThrow(PinError);
+  });
+  it('action.yaml of the sub-path is the fallback; hostile sub-paths are refused', async () => {
+    const { deps } = setup(github(f('sub/action.yaml', `runs:\n  using: docker\n  image: docker://ghcr.io/o/img@${D}\n`)));
+    expect((await resolvePin(stored(), deps, undefined, { readActionImage: true, subPath: 'sub' })).wrappedImage?.digest).toBe(D);
+    for (const bad of ['../x', '/abs', '-x', 'a b', 'a/../b']) await expect(resolvePin(stored(), setup(github(root)).deps, undefined, { readActionImage: true, subPath: bad }), bad).rejects.toThrow(PinError);
+  });
+  it('readActionRuns tells the kinds apart (the live check of the container lists uses it)', async () => {
+    const kinds: [string, string][] = [
+      ['runs:\n  using: node24\n  main: i.js\n', 'node'], ['runs:\n  using: composite\n  steps: []\n', 'composite'],
+      [`runs:\n  using: docker\n  image: docker://ghcr.io/o/img@${D}\n`, 'docker-digest'], ['runs:\n  using: docker\n  image: docker://ghcr.io/o/img:v1\n', 'docker-tag'], ['runs:\n  using: docker\n  image: Dockerfile\n', 'docker-build'],
+    ];
+    for (const [yml, kind] of kinds) {
+      const r = await readActionRuns(stored(), setup(github(f('action.yml', yml))).deps);
+      expect(r.kind, kind).toBe(kind);
+      expect(r.text).toContain('runs:');
+    }
   });
 });

@@ -768,8 +768,10 @@ export function projectScriptSteps(artifact: string, which: 'test' | 'lint', nod
   const ci = repoInstall([], artifact, nodeMajor, workingDir)[0] as RenderedStep;
   const run = script([
     ...prologue(artifact, { nodeMajor }), ...cdLines(workingDir),
-    `PATH="$nodebin:${FIXED_PATH}"`,
-    `"$nodebin/npm" ${which === 'test' ? 'test' : 'run lint'}`,
+    // repo code, but not with the job's whole environment: the same env -i allowlist as the other repo-code tools (ruling S6 b), so
+    // the OIDC request token, NODE_OPTIONS, NPM_CONFIG_* and the runner HOME never reach the repo's script
+    ...allowlist(`$nodebin:${FIXED_PATH}`, []),
+    `"\${pg_env[@]}" "$nodebin/npm" ${which === 'test' ? 'test' : 'run lint'}`,
   ]);
   return [ci, runStep(`pipegen: run the project's ${which} script`, run, {}, `repocode-${sha16(`project-script:${artifact}:${which}`)}`)];
 }

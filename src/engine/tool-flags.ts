@@ -343,8 +343,8 @@ export const REPO_CODE_STEP_ID_RE = /^repocode-[0-9a-f]{16}$/;
 export const CHECKER_STEP_ID_RE = /^checker-run-[0-9a-f]{16}$/;
 /** The ids of a release/docker/pip tool's install (or image pull) step and of its run step: tools that only read code, installed from a pinned hash or digest. */
 export const TOOL_STEP_ID_RE = /^tool-(?:install|pull|run)-[0-9a-f]{16}$/;
-/** The ids of the Node and Python setup steps that the CLI renderer adds (a pinned platform action). */
-export const SETUP_STEP_ID_RE = /^pipegen-setup-(?:node-\d{1,3}|python)$/;
+/** The ids of the checkout step of a project script and of the Node and Python setup steps the renderers add (a pinned platform action each): a job keeps the first of each. */
+export const SETUP_STEP_ID_RE = /^pipegen-(?:checkout|setup-node-\d{1,3}|setup-python)$/;
 /** The id of a scrub step (Plan C's gate action) in a job: the order rule treats it like an upload. */
 export const SCRUB_STEP_ID_RE = /^scrub-[0-9a-f]{16}$/;
 

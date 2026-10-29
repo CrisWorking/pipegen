@@ -1,7 +1,7 @@
 // Plan B 6c Part 0 (review-6b-r2 C1, C2, C5): the job order rule is an allowlist that fails closed and is enforced where a
 // job is assembled; every rendered step has a recognised id; an npm checker is one step.
 import { describe, expect, it } from 'vitest';
-import { checkJobOrder, dedupeJobSteps, RenderError, renderStepWith, type RenderedStep, type RenderResult } from '../src/engine/render-step.js';
+import { checkJobOrder, dedupeJobSteps, RenderError, renderProjectScript, renderStepWith, type RenderedStep, type RenderResult } from '../src/engine/render-step.js';
 import { NEED_IDS } from '../src/engine/need-ids.js';
 import { ARGV_POLICIES, type ArgvPolicy } from '../src/engine/tool-flags.js';
 import type { ReviewedTool, StepSpec } from '../src/types.js';
@@ -165,5 +165,53 @@ describe('S11: the ESLint configs start from @eslint/js recommended (pinned plug
       expect(t.fixedInputs.config?.content, id).toContain('js.configs.recommended');
       expect(ARGV_POLICIES[id]?.config?.content, id).toBe(t.fixedInputs.config?.content);
     }
+  });
+});
+
+describe('6c fix round 1: an id counts only on the right kind of step, and actions must be pinned by SHA', () => {
+  const eslint = (): RenderedStep[] => steps('eslint');
+  it('M1: a checker, tool or scrub id on a uses: step is not harmless', () => {
+    for (const id of ['checker-run-0123456789abcdef', 'tool-run-0123456789abcdef', 'tool-install-0123456789abcdef', 'scrub-0123456789abcdef']) {
+      expect(checkJobOrder([{ id, name: 'x', uses: `someone/else@${sha}` }, ...eslint()]).length, id).toBeGreaterThan(0);
+    }
+  });
+  it('M2: a setup id on a run: step, or on an unpinned or foreign action, is not harmless', () => {
+    expect(checkJobOrder([{ id: 'pipegen-setup-node-24', name: 'x', run: 'true' }, ...eslint()]).length).toBeGreaterThan(0);
+    expect(checkJobOrder([{ id: 'pipegen-checkout', name: 'x', run: 'true' }, ...eslint()]).length).toBeGreaterThan(0);
+    expect(checkJobOrder([{ id: 'pipegen-setup-node-24', name: 'x', uses: `someone/else@${sha}` }, ...eslint()]).length).toBeGreaterThan(0);
+    expect(checkJobOrder([{ id: 'pipegen-setup-python', name: 'x', uses: `actions/setup-python@${sha}`, run: 'true' }, ...eslint()]).length).toBeGreaterThan(0);
+  });
+  it('M4: a platform action not pinned by a 40-character SHA is repo code', () => {
+    for (const uses of ['actions/checkout@v4', 'actions/checkout@main', `actions/checkout@${'a'.repeat(39)}`, `actions/checkout@${'A'.repeat(40)}`, 'actions/setup-node@v4']) {
+      expect(checkJobOrder([{ name: 'x', uses }, ...eslint()]).length, uses).toBeGreaterThan(0);
+    }
+    expect(checkJobOrder([{ name: 'x', uses: `actions/checkout@${sha}` }, ...eslint()])).toEqual([]);
+  });
+});
+
+describe('6c fix round 1: dedupe keeps the guarded repo npm ci (finding 5)', () => {
+  const script = () => renderProjectScript({ kind: 'project-script', needId: 'unit-tests', service: 'app', script: 'test' }, platform(), ctxFor([service({ name: 'app', path: '.', scripts: ['test'] })])).steps;
+  const guarded = (job: RenderedStep[]): RenderedStep => dedupeJobSteps(job).find((s) => s.id?.startsWith('pipegen-npm-ci-')) as RenderedStep;
+  it('[project script, vitest] and [vitest, project script]: the one npm ci that stays checks vitest\'s pins before installing', () => {
+    const vitest = steps('vitest-coverage');
+    const want = JSON.parse(vitest.find((s) => s.id?.startsWith('pipegen-npm-ci-'))?.env?.PIPEGEN_NPM_EXPECT as string) as { name: string }[];
+    expect(want.length).toBeGreaterThan(0);
+    for (const job of [[...script(), ...vitest], [...script().slice(0, 2), ...vitest, ...script().slice(2)]]) {
+      const ci = guarded(job);
+      expect(JSON.parse(ci.env?.PIPEGEN_NPM_EXPECT as string).map((w: { name: string }) => w.name).sort()).toEqual(want.map((w) => w.name).sort());
+      expect(ci.run).toContain('process.env.PIPEGEN_NPM_EXPECT');
+      expect(dedupeJobSteps(job).filter((s) => s.id?.startsWith('pipegen-npm-ci-'))).toHaveLength(1);
+    }
+  });
+  it('two project scripts of one service share one checkout, setup-node and npm ci', () => {
+    const both = dedupeJobSteps([...script(), ...renderProjectScript({ kind: 'project-script', needId: 'lint', service: 'app', script: 'lint' }, platform(), ctxFor([service({ name: 'app', path: '.', scripts: ['test', 'lint'] })])).steps]);
+    expect(both.filter((s) => s.uses?.startsWith('actions/checkout@'))).toHaveLength(1);
+    expect(both.filter((s) => s.id?.startsWith('pipegen-npm-ci-'))).toHaveLength(1);
+    expect(both.filter((s) => s.id?.startsWith('repocode-'))).toHaveLength(2);
+  });
+  it('two guarded installs with different pins of one package are refused', () => {
+    const a = steps('vitest-coverage');
+    const b = steps('vitest-coverage').map((s) => (s.id?.startsWith('pipegen-npm-ci-') ? { ...s, env: { ...s.env, PIPEGEN_NPM_EXPECT: (s.env?.PIPEGEN_NPM_EXPECT as string).replace(/"version":"[^"]+"/, '"version":"0.0.1"') } } : s));
+    expect(() => dedupeJobSteps([...a, ...b])).toThrow(RenderError);
   });
 });
