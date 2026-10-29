@@ -252,7 +252,7 @@ These are counts only, never file contents. They were made without the secret sc
 - A deploy workflow that uses no secret and no write grant isn't seen as a release.
 - Network egress control (blocking unexpected traffic from release jobs) is only partly read on larger runners.
 - Environment variables set by third-party actions aren't seen, so a check one of them turns off can show as covered.
-- ESLint on .vue, .svelte and .astro files is not supported yet (the plugins that read them come in v0.2): such a repo never shows a clean pass for ESLint.
+- pipegen can't check yet that an ESLint config reads .vue, .svelte and .astro files (the parsers and plugins come in v0.2): such a repo never shows a clean pass for ESLint.
 - Kubernetes manifests are looked for only in YAML under folders named k8s, kubernetes, manifests, deploy, helm or charts (and a Chart.yaml anywhere), so manifests kept elsewhere, like infra/, aren't seen.
 
 ## Next step

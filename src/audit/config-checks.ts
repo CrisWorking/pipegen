@@ -623,7 +623,7 @@ export function versionAdjust(rows: Coverage[], p: RepoProfile): Coverage[] {
 // ---------- ESLint on Vue, Svelte and Astro files (DECISIONS #104) ----------
 
 const UI_FILES = new Set(['vue', 'nuxt', 'svelte', 'astro']);
-const UI_FILES_WHY = 'ESLint on .vue, .svelte and .astro files is not supported yet (the plugins that read them come in v0.2), so pipegen cannot say those files are linted.';
+const UI_FILES_WHY = "pipegen can't check yet that your ESLint config reads .vue, .svelte and .astro files (that takes a parser or plugin such as eslint-plugin-vue, and pipegen reads those in v0.2), so it can't say those files are linted.";
 
 /**
  * A lint row that pipegen found as the repo's own ESLint, for a Vue, Nuxt, Svelte or Astro service: those files need an

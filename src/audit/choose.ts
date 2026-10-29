@@ -98,7 +98,7 @@ const PACKAGE_OF = { eslint: 'eslint', biome: '@biomejs/biome', oxlint: 'oxlint'
 const FRAMEWORK_NAMES = { next: 'Next', nuxt: 'Nuxt', vue: 'Vue', svelte: 'Svelte', astro: 'Astro', 'react-native': 'React Native' } as const;
 
 /** Task 9 (DECISIONS #104): ESLint's Vue, Svelte and Astro plugins are not set up by pipegen yet (v0.2), so those files are not linted. */
-export const ESLINT_UI_NOTE = 'ESLint on .vue, .svelte and .astro files is not supported yet, so those files would not be linted';
+export const ESLINT_UI_NOTE = "pipegen can't set up ESLint's parsers for .vue, .svelte and .astro files yet (v0.2), so those files would not be linted";
 const UI_FILE_FRAMEWORKS: readonly string[] = ['vue', 'nuxt', 'svelte', 'astro'];
 const eslintUiNote = (q: Service['quality']): string => (q.uiFrameworks.some((f) => UI_FILE_FRAMEWORKS.includes(f)) ? `; ${ESLINT_UI_NOTE}` : '');
 

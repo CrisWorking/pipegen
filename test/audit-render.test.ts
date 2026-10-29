@@ -928,7 +928,7 @@ describe('Plan P Task 9: the report shows every catalogue check', () => {
       'JS or TS config files', 'Renovate presets', 'Repo settings',
       'without a `permissions:` block', "deploy workflow that uses no secret and no write grant isn't seen as a release",
       'only partly read on larger runners', 'set by third-party actions',
-      'ESLint on .vue, .svelte and .astro files is not supported yet',
+      "pipegen can't check yet that an ESLint config reads .vue, .svelte and .astro files",
     ]) expect(all, part).toContain(part);
     expect(all).not.toMatch(/public/i);
     for (const text of [term(report()), md(report())]) expect(flat(text)).toContain('Renovate presets');

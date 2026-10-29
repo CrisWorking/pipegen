@@ -899,13 +899,14 @@ describe('Task 9: wording of rows the earlier tasks left rough', () => {
     expect(versionAdjust([lint], profileWith({ versions: { eslint: '9.0.0' }, eslintConfig: 'eslintrc', fromRange: ['eslint'] }))[0]?.why).toMatch(/ESLint 10 doesn't read \.eslintrc/);
   });
 
-  it('frameworks: ESLint on a Vue, Svelte, Astro or Nuxt repo is never a clean pass: "not supported yet"', () => {
+  it('frameworks: ESLint on a Vue, Svelte, Astro or Nuxt repo is never a clean pass: the config reading those files is unchecked', () => {
     for (const ui of ['vue', 'svelte', 'astro', 'nuxt'] as const) {
       const p = profileWith({ versions: { eslint: '9.39.5' }, eslintConfig: 'flat', uiFrameworks: [ui] });
       const r = frameworkAdjust([lint], p)[0];
       expect(r?.status, ui).toBe('partial');
       expect(r?.by).toBe('eslint');
-      expect(r?.why, ui).toMatch(/ESLint on \.vue, \.svelte and \.astro files is not supported yet/);
+      expect(r?.why, ui).toContain("pipegen can't check yet that your ESLint config reads .vue, .svelte and .astro files");
+      expect(r?.why, ui).not.toMatch(/not supported/);
       expect(r?.why, ui).toContain(lint.why);
     }
     // not a UI framework of those, or no ESLint config at all, or a missing row: unchanged
@@ -923,7 +924,7 @@ describe('Task 9: wording of rows the earlier tasks left rough', () => {
     const s = svc('.', { quality: { ...emptyServiceQuality(), versions: { eslint: '9.39.5' }, eslintConfig: 'flat', uiFrameworks: ['vue'] } });
     const r = pick(await rows(dir, { services: [s] }), 'merge', 'lint', 'app');
     expect(r.status).toBe('partial');
-    expect(r.why).toMatch(/not supported yet/);
+    expect(r.why).toMatch(/can't check yet that your ESLint config reads/);
   });
 });
 
