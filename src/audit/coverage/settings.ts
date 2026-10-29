@@ -1,5 +1,7 @@
 // Coverage mapper (see ../coverage.ts for the rules): step and job settings that lower a run: `if:` conditions, soft-fail
 // flags and `with:` inputs, the action version (`actionRef`), and the env gate (TOX…, NOX…, SKIP, NPM_CONFIG_DRY_RUN).
+import { parseArgv } from '../../engine/argv.js';
+import { TRIVY_GRAMMAR } from '../../engine/tool-grammar.js';
 import { regexSafe } from '../../read/limits.js';
 import { asObj } from '../../read/manifest.js';
 import { MAX_FLAG_WORDS, MAX_INPUT_KEYS, MAX_SPELLINGS } from './bounds.js';
@@ -405,18 +407,40 @@ export function flagsAllow(tool: ToolSignature, args: readonly string[], complet
     && (tool.onlyWithFlagValue?.flag === undefined || flagValueAllows(tool.onlyWithFlagValue, lastFlagValue(spec(tool.onlyWithFlagValue.flag), ws), complete));
 }
 
-/** DoD G11: a partialWithFlagValue value that leaves the needed word out (or can't be read: null, an expression). */
-const filteredValue = (rule: NonNullable<ToolSignature['partialWithFlagValue']>, v: string | null) =>
-  v === null || v.includes('${{') || !v.toLowerCase().split(',').some((x) => x.trim() === rule.unlessContains);
+/** DoD G11 / P50 I2: a partialWithFlagValue value that leaves a needed word out (or can't be read: null, a variable, an expression). */
+function filteredValue(rule: NonNullable<ToolSignature['partialWithFlagValue']>, v: string | null): boolean {
+  if (v === null || /[$`]/.test(v)) return true;
+  const words = new Set(v.toLowerCase().split(',').map((x) => x.trim()));
+  return !rule.needsAll.every((x) => words.has(x));
+}
 
-/** DoD G11: one of partialWithFlagValue's flags is given with a value that filters the check (the last one of each wins). */
+/** Every value `flag` is given in `ws` (`--f v`, `--f=v`); null for one without a value word. */
+function allFlagValues(flag: string, ws: readonly string[]): (string | null)[] {
+  const out: (string | null)[] = [];
+  for (let i = 0; i < ws.length; i++) {
+    const w = ws[i] as string;
+    if (w === flag) out.push(i + 1 < ws.length ? (ws[i + 1] as string) : null);
+    else if (w.startsWith(`${flag}=`)) out.push(w.slice(flag.length + 1));
+  }
+  return out;
+}
+
+/**
+ * DoD G11 / P50 I2: partialWithFlagValue's flags are given (any time) with a value that filters the check. With
+ * `grammar: trivy` the words (after `trivy`: the subcommand first) are read with Trivy's own grammar, so glued
+ * `-sVALUE` and `-s=VALUE` count; a command line that grammar can't read counts as filtering.
+ */
 function filteredByFlag(tool: ToolSignature, ws: readonly string[], spec: (f: string) => string): boolean {
   const rule = tool.partialWithFlagValue;
   if (rule?.flags === undefined) return false;
-  return rule.flags.some((f) => {
-    const v = lastFlagValue(spec(f), ws);
-    return v !== undefined && filteredValue(rule, v);
-  });
+  if (rule.grammar === 'trivy') {
+    const sub = ws.find((w) => !w.startsWith('-'));
+    const parsed = parseArgv(ws, TRIVY_GRAMMAR[sub === 'image' || sub === 'i' ? 'image' : 'fs'], 'pflag');
+    if (parsed.errors.length > 0) return true;
+    const names = new Set(rule.flags.filter((f) => f.startsWith('--')).map((f) => f.slice(2)));
+    return parsed.flags.some((f) => names.has(f.name) && filteredValue(rule, f.value === '' ? null : f.value));
+  }
+  return rule.flags.some((f) => allFlagValues(spec(f), ws).some((v) => filteredValue(rule, v)));
 }
 
 /** DoD G11: the action's partialWithFlagValue input is set (any spelling, crowded, or an expression) to a filtering value. */

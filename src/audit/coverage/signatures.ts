@@ -117,15 +117,18 @@ const signatureSchema = z.strictObject({
    */
   onlyWithInputs: inputs.optional(),
   /**
-   * DoD G11 (2026-10-29): a run that filters what it reports so the check can't see everything it should (Trivy's
-   * `--severity HIGH,CRITICAL` hides every UNKNOWN licence) is partial with `why`: one of `flags` (or the action's
-   * `input`) given with a value whose comma-split words don't include `unlessContains` (any letter case). A flag without
-   * a value, an expression or more spellings than pipegen reads count as filtered too.
+   * DoD G11 (2026-10-29), fix round 1 (P50 I2): a run that filters what it reports so the check can't see everything it
+   * should (Trivy's `--severity HIGH,CRITICAL` hides every UNKNOWN licence; `--severity UNKNOWN` every forbidden one) is
+   * partial with `why`: one of `flags` (or the action's `input`) given, any time, with a value whose comma-split words
+   * (any letter case) don't include every word of `needsAll`. A flag without a value, a variable, an expression or more
+   * spellings than pipegen reads count as filtering. `grammar: trivy`: the command line is read with Trivy's own flag
+   * grammar (src/engine/tool-grammar.ts: glued `-sVALUE`, `-s=VALUE`, `--flag=VALUE`), and one it can't read is filtering.
    */
   partialWithFlagValue: z.strictObject({
     flags: z.array(z.string().regex(FLAG_NAME_RE)).min(1).optional(),
     input: z.string().regex(INPUT_RE).optional(),
-    unlessContains: z.string().regex(/^[a-z0-9._-]{1,32}$/),
+    needsAll: z.array(z.string().regex(/^[a-z0-9._-]{1,32}$/)).min(1),
+    grammar: z.literal('trivy').optional(),
     why,
   }).refine((v) => v.flags !== undefined || v.input !== undefined, 'needs flags or input').optional(),
   /**
