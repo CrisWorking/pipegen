@@ -3760,4 +3760,16 @@ describe('coverage: closing patch (ruling P60)', () => {
     expect(await st(compose('missing.env'), steps)).not.toBe('covered your own `tox`');
     expect(await st(compose('${ENV_FILE}'), steps)).not.toBe('covered your own `tox`');
   });
+
+  it('R3: a build arg whose name pipegen can\'t read (a variable, a quoted expression) is unsure', async () => {
+    const BODY = `${IMG}RUN pytest\n`;
+    for (const cmd of ['docker build --build-arg "$ARGS" .', 'docker build --build-arg $A .', 'docker buildx build --build-arg=${A}=x .']) {
+      expect(await st({ Dockerfile: BODY }, run(cmd)), cmd).toMatch(/^unknown/);
+    }
+    const compose = (extra: string) => ({ Dockerfile: BODY, 'compose.yml': `services:\n  app:\n    build:\n      context: .\n${extra}` });
+    expect(await st(compose(''), run('docker compose build --build-arg $A'))).toMatch(/^unknown/);
+    expect(await st(compose('      args:\n        ${K}: x\n'), run('docker compose build'))).toMatch(/^unknown/);
+    expect(await st(compose('      args:\n        - ${K}=x\n'), run('docker compose build'))).toMatch(/^unknown/);
+    expect(await st({ Dockerfile: BODY }, run('docker build --build-arg A=$B .'))).toBe('covered your own `pytest`'); // a variable value of a plain name is fine
+  });
 });

@@ -309,7 +309,7 @@ function buildActionBuild(w: Inputs): DockerBuild | null {
   const [call, context, file, target, args] = ['call', 'context', 'file', 'target', 'build-args'].map((n) => literalInput(w, n));
   if (call !== undefined || context === null || file === null || target === null) return null;
   // P57 (M3): build args that may pick a custom Dockerfile frontend (BUILDKIT_SYNTAX), or that pipegen can't read
-  const frontend = args === null ? 'build args pipegen can\'t read' : (args ?? '').split(/[\n,]/).map((a) => frontendArg(a)).find((x) => x !== null);
+  const frontend = args === null ? 'build args pipegen can\'t read' : (args ?? '').split(/\n/).map((a) => a.trim()).filter((a) => a !== '').map((a) => frontendArg(a)).find((x) => x !== null);
   if (frontend !== undefined && frontend !== null) return { file: '', context: '', target: null, unsure: frontend };
   const folder = context === undefined ? '.' : context === '.' || (plainPath(context.replace(/^(?:\.\/)+/, '')) !== null && !context.startsWith('/')) ? resolveDir('.', context) : null;
   const path = file === undefined ? (folder === null ? null : resolveDir(folder, 'Dockerfile')) : plainPath(file) === null ? null : resolveDir('.', file);

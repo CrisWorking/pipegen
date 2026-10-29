@@ -32,7 +32,10 @@ export const OFFICIAL_FRONTEND = /^(?:docker\.io\/)?docker\/dockerfile(?::[A-Za-
 /** P57 (M3): a build arg that picks the frontend: only Docker's own, as a plain literal, is read; anything else (or a value from the env) is a reason to be unsure. */
 export function frontendArg(arg: string): string | null {
   const eq = arg.indexOf('=');
-  if ((eq < 0 ? arg : arg.slice(0, eq)).trim() !== 'BUILDKIT_SYNTAX') return null;
+  const name = (eq < 0 ? arg : arg.slice(0, eq)).trim();
+  // P60 (R3): a name pipegen can't read (a variable, an expression) could be BUILDKIT_SYNTAX, or more flags after word splitting
+  if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(name)) return "a build arg whose name pipegen can't read";
+  if (name !== 'BUILDKIT_SYNTAX') return null;
   const v = eq < 0 ? null : arg.slice(eq + 1).trim().replace(/^(["'])(.*)\1$/, '$2');
   return v !== null && OFFICIAL_FRONTEND.test(v) ? null : 'a BUILDKIT_SYNTAX build arg that picks a custom Dockerfile frontend';
 }
