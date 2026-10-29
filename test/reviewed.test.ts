@@ -972,6 +972,7 @@ describe('loader rules (Plan P Task 5)', () => {
       a.step.action.with = value === undefined ? {} : { [key]: value };
       a.fixedInputs = value === undefined ? {} : { with: { [key]: value } };
       a.choices = {};
+      if (repo.toLowerCase() === 'ossf/scorecard-action') a.wrappedImage = { ref: 'ghcr.io/ossf/scorecard-action:v2.5.0', digest: `sha256:${'a'.repeat(64)}` };
       return a;
     };
     expect(load([act('ossf/scorecard-action', 'publish_results', 'false')])).toHaveLength(1);
@@ -2001,6 +2002,10 @@ describe('Task 6 review fix round 1 (P19-P27)', () => {
     const noDigest = realEntry('scorecard-action');
     delete noDigest.wrappedImage.digest;
     refused(noDigest, /digest/);
+    // S13: an action that runs a docker image must record it; scorecard-action may not lose its wrappedImage
+    const lost = realEntry('scorecard-action');
+    delete lost.wrappedImage;
+    refused(lost, /wrappedImage/);
     const badDigest = realEntry('scorecard-action');
     badDigest.wrappedImage.digest = 'v2.5.0';
     refused(badDigest, /digest/);

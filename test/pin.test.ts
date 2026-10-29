@@ -857,3 +857,52 @@ describe('PinMovedWarning', () => {
     expect(w.tag).toBe('v1\u001b[2J'); // the field stays raw; only display text is cleaned
   });
 });
+
+// ---------- container actions (6c, ruling S13) ----------
+describe('pin: container actions read action.yml at the pinned SHA (S13)', () => {
+  const file = (path: string, text: string): Routes => ({
+    [`GET ${GH}/repos/o/r/contents/${path}`]: { body: { type: 'file', encoding: 'base64', content: Buffer.from(text).toString('base64'), size: text.length, path } },
+  });
+  const withYml = (text: string, path = 'action.yml', extra: Routes = {}): Routes => github({ ...file(path, text), ...extra });
+  const IMAGE_DIGEST = `sha256:${'9'.repeat(64)}`;
+
+  it('runs.using docker with a digest-pinned docker:// image: wrappedImage is filled from it', async () => {
+    const { deps, ghCalls } = setup(withYml(`name: x\nruns:\n  using: docker\n  image: docker://ghcr.io/o/img@${IMAGE_DIGEST}\n`));
+    const out = await resolvePin(stored(), deps, undefined, { readActionImage: true });
+    expect(out.wrappedImage).toEqual({ ref: `ghcr.io/o/img@${IMAGE_DIGEST}`, digest: IMAGE_DIGEST });
+    expect(ghCalls.some((c) => c.url.pathname === '/repos/o/r/contents/action.yml' && c.url.searchParams.get('ref') === SHA)).toBe(true);
+  });
+  it('action.yaml is read when there is no action.yml', async () => {
+    const { deps } = setup(withYml(`runs:\n  using: docker\n  image: docker://ghcr.io/o/img@${IMAGE_DIGEST}\n`, 'action.yaml'));
+    expect((await resolvePin(stored(), deps, undefined, { readActionImage: true })).wrappedImage?.digest).toBe(IMAGE_DIGEST);
+  });
+  it('a node or composite action has no wrappedImage', async () => {
+    for (const using of ['node24', 'composite']) {
+      const { deps } = setup(withYml(`runs:\n  using: ${using}\n  main: index.js\n`));
+      expect((await resolvePin(stored(), deps, undefined, { readActionImage: true })).wrappedImage, using).toBeUndefined();
+    }
+  });
+  it('a Dockerfile-built action, a tag-only image, a different registry or a malformed file fails closed', async () => {
+    for (const body of [
+      'runs:\n  using: docker\n  image: Dockerfile\n', 'runs:\n  using: docker\n  image: docker://ghcr.io/o/img:v1\n', 'runs:\n  using: docker\n  image: ghcr.io/o/img\n',
+      `runs:\n  using: docker\n  image: docker://evil.example/o/img@${IMAGE_DIGEST}\n`, `runs:\n  using: docker\n  image: docker://ghcr.io/o/img:v1@${IMAGE_DIGEST}\n`,
+      'runs: [1, 2\n', 'name: nothing\n', 'runs:\n  using: docker\n',
+    ]) {
+      const { deps } = setup(withYml(body));
+      await expect(resolvePin(stored(), deps, undefined, { readActionImage: true }), body).rejects.toThrow(PinError);
+    }
+  });
+  it('no action file, a folder instead of a file, or a huge file is refused', async () => {
+    const none = setup(github());
+    await expect(resolvePin(stored(), none.deps, undefined, { readActionImage: true })).rejects.toThrow(PinError);
+    const dir = setup(github({ [`GET ${GH}/repos/o/r/contents/action.yml`]: { body: [{ name: 'x' }] } }));
+    await expect(resolvePin(stored(), dir.deps, undefined, { readActionImage: true })).rejects.toThrow(PinError);
+    const big = setup(withYml(`runs:\n  using: node24\n#${'x'.repeat(200_000)}\n`));
+    await expect(resolvePin(stored(), big.deps, undefined, { readActionImage: true })).rejects.toThrow(PinError);
+  });
+  it('without the option nothing is read (existing callers are unchanged)', async () => {
+    const { deps, ghCalls } = setup(github());
+    await resolvePin(stored(), deps);
+    expect(ghCalls.some((c) => c.url.pathname.includes('/contents/'))).toBe(false);
+  });
+});

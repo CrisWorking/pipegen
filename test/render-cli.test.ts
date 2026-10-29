@@ -15,7 +15,7 @@ import { ctxFor, entry, platform, reviewedList, service, specFor } from './helpe
 import { argvOf, envNames, exec, fakeTool, FIXED_PATH, sandbox, stepEnv, type Sandbox } from './helpers/step-harness.js';
 
 const needFor = (t: ReviewedTool): string => t.categories.find((c) => (NEED_IDS as readonly string[]).includes(c) && c !== 'platform') ?? 'sast';
-const ctx = ctxFor([service({ name: 'app', path: '.' })]);
+const ctx = ctxFor([service({ name: 'app', path: '.' })], { image: `ghcr.io/o/app@sha256:${'a'.repeat(64)}`, url: 'http://localhost:8080' });
 // declared-name lists are set through Reflect: the fixture scan (no-secret-literals) treats a keyword key with a value as a leak
 const withNames = (spec: StepSpec, names: string[]): StepSpec => {
   const copy = { ...spec };
@@ -29,7 +29,7 @@ const withPolicy = (id: string, drop: (keyof ArgvPolicy)[] = [], add: Partial<Ar
   return { policies: { ...ARGV_POLICIES, [id]: { ...p, ...add } as ArgvPolicy } };
 };
 /** zap with the plain docker rules of S26 (no target slot needed here, no host network, the caller's uid): the generic docker tests. */
-const PLAIN_ZAP = withPolicy('zap-baseline', ['needsSlot', 'network', 'asImageUser']);
+const PLAIN_ZAP = withPolicy('zap-baseline', ['slots', 'network', 'asImageUser']);
 const spec = (t: ReviewedTool, over: Partial<StepSpec> = {}): StepSpec => specFor(t, { needId: needFor(t), ...over });
 const render = (id: string, over: Partial<StepSpec> = {}, c = ctx, opts?: Parameters<typeof renderStepWith>[4]): RenderResult => {
   const t = entry(id);
@@ -145,20 +145,20 @@ describe('6b: docker (S26)', () => {
 
   it('docker: the policy can ask for --network none, and the mount of the repo goes with -w', () => {
     const t = entry('zap-baseline');
-    const r = renderStepWith(spec(t), t, platform(), ctx, withPolicy('zap-baseline', ['needsSlot', 'asImageUser'], { network: 'none', mount: { at: '/src', source: 'repo', workdir: true } }));
+    const r = renderStepWith(spec(t), t, platform(), ctx, withPolicy('zap-baseline', ['slots', 'asImageUser'], { network: 'none', mount: { at: '/src', source: 'repo', workdir: true } }));
     expect(lastRun(r)).toContain('--network none');
     expect(lastRun(r)).toContain('-w /src');
     expect(lastRun(r)).toContain(`-v "$${'P'}WD${':'}/src"`);
   });
 
-  it('docker: semgrep waits for its rules archive (6c); registry is a job service, not a step', () => {
-    expect(() => render('semgrep')).toThrow(/6c/);
+  it('docker: semgrep renders with its rules archive (6c); registry is a job service, not a step', () => {
+    expect(() => render('semgrep')).not.toThrow();
     expect(() => render('registry')).toThrow(/service/);
   });
 
   it('docker: a docker entry without a reviewed mount is refused', () => {
     const t = entry('zap-baseline');
-    expect(() => renderStepWith(spec(t), t, platform(), ctx, withPolicy('zap-baseline', ['needsSlot', 'mount']))).toThrow(/mount/);
+    expect(() => renderStepWith(spec(t), t, platform(), ctx, withPolicy('zap-baseline', ['slots', 'mount']))).toThrow(/mount/);
   });
 
   it('docker: an image or digest that is not plain is refused', () => {
@@ -231,7 +231,7 @@ describe('6b: pinned config (S4, S3)', () => {
 
   it('trivy: the pinned config has cache.backend memory and the command has no --cache-dir', () => {
     for (const id of ['trivy-config', 'trivy-image', 'trivy-licence']) {
-      const r = render(id, {}, ctx, withPolicy(id, ['needsSlot']));
+      const r = render(id, {}, ctx, withPolicy(id, ['slots']));
       expect(runs(r).at(-1)?.env?.PIPEGEN_CONFIG, id).toMatch(/cache:\n {2}backend: memory/);
       expect(lastRun(r), id).not.toContain('--cache-dir');
     }
@@ -277,12 +277,12 @@ describe('6b: pinned config (S4, S3)', () => {
 
 describe('6b: command (S5)', () => {
   it('command: dedicated tools get --<choice> "$V" appended, and a bool choice is --<choice>="$V"; a missing choice takes the first value', () => {
-    const r = render('trivy-image', { choices: { severity: 'HIGH,CRITICAL', 'ignore-unfixed': 'true' } }, ctx, withPolicy('trivy-image', ['needsSlot']));
+    const r = render('trivy-image', { choices: { severity: 'HIGH,CRITICAL', 'ignore-unfixed': 'true' } }, ctx, withPolicy('trivy-image', ['slots']));
     const step = runs(r).at(-1) as RenderedStep;
     expect(step.run).toContain('--severity "$PIPEGEN_ARG_0"');
     expect(step.run).toContain('--ignore-unfixed="$PIPEGEN_ARG_1"');
     expect(step.env).toMatchObject({ PIPEGEN_ARG_0: 'HIGH,CRITICAL', PIPEGEN_ARG_1: 'true' });
-    const d = runs(render('trivy-image', {}, ctx, withPolicy('trivy-image', ['needsSlot']))).at(-1) as RenderedStep;
+    const d = runs(render('trivy-image', {}, ctx, withPolicy('trivy-image', ['slots']))).at(-1) as RenderedStep;
     expect(d.env).toMatchObject({ PIPEGEN_ARG_0: 'CRITICAL', PIPEGEN_ARG_1: 'false' });
   });
 
@@ -562,7 +562,7 @@ describe('6b: every reviewed CLI entry', () => {
     for (const t of reviewedList()) {
       if (t.step.cli === undefined) continue;
       try {
-        const r = renderStepWith(spec(t), t, platform(), ctxFor([service({ name: 'app', path: '.' })]));
+        const r = renderStepWith(spec(t), t, platform(), ctx);
         rendered++;
         outcome[t.id] = 'rendered';
         for (const s of runs(r)) {
@@ -584,13 +584,13 @@ describe('6b: every reviewed CLI entry', () => {
       } catch (e) {
         expect(e, t.id).toBeInstanceOf(RenderError);
         outcome[t.id] = (e as Error).message;
-        expect((e as Error).message, t.id).toMatch(/6c|B6|Plan G|not available yet|job service|Go is not supported/);
+        expect((e as Error).message, t.id).toMatch(/does not have|Plan G|not available yet|job service|Go is not supported/);
       }
     }
     expect(rendered).toBeGreaterThan(20);
     // the ones that wait, by name (R-E: a tool that would fail at run time for want of a target is refused now)
-    for (const id of ['semgrep', 'nuclei', 'registry', 'schemathesis', 'mypy', 'bandit', 'coverage-py', 'creosote', 'vulture', 'trivy-image', 'syft', 'zap-baseline', 'cosign', 'hadolint', 'kube-linter', 'gosec']) expect(outcome[id], id).not.toBe('rendered');
-    for (const id of ['trivy-config', 'trivy-licence', 'betterleaks', 'gitleaks', 'osv-scanner', 'lefthook', 'actionlint', 'zizmor', 'biome', 'eslint', 'eslint-typescript', 'oxlint-typeaware', 'prettier', 'vitest-coverage', 'c8', 'knip', 'jscpd', 'pinact', 'poutine', 'ruff', 'ruff-format']) expect(outcome[id], id).toBe('rendered');
+    for (const id of ['registry', 'schemathesis', 'mypy', 'bandit', 'coverage-py', 'creosote', 'vulture', 'cosign', 'hadolint', 'kube-linter', 'gosec']) expect(outcome[id], id).not.toBe('rendered');
+    for (const id of ['semgrep', 'nuclei', 'trivy-image', 'syft', 'zap-baseline', 'trivy-config', 'trivy-licence', 'betterleaks', 'gitleaks', 'osv-scanner', 'lefthook', 'actionlint', 'zizmor', 'biome', 'eslint', 'eslint-typescript', 'oxlint-typeaware', 'prettier', 'vitest-coverage', 'c8', 'knip', 'jscpd', 'pinact', 'poutine', 'ruff', 'ruff-format']) expect(outcome[id], id).toBe('rendered');
   });
 });
 
@@ -601,7 +601,7 @@ describe('6b: snapshots', () => {
   });
 
   it('snapshot: a docker tool (zap baseline with its target slot waived, as a test fixture)', async () => {
-    await expect(yamlOf(render('zap-baseline', {}, ctx, withPolicy('zap-baseline', ['needsSlot'])).steps)).toMatchFileSnapshot('__snapshots__/steps/cli-docker.yml');
+    await expect(yamlOf(render('zap-baseline', {}, ctx, withPolicy('zap-baseline', ['slots'])).steps)).toMatchFileSnapshot('__snapshots__/steps/cli-docker.yml');
   });
 
   it('snapshot: an npm checker (prettier, installed from pipegen\'s closure lock, in a service folder; the snapshot is small because a big lock would be one very long line)', async () => {

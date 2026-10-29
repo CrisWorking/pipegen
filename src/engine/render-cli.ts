@@ -17,14 +17,17 @@
 // - The result file is checked before and after the tool, and moved under `$RUNNER_TEMP/pipegen-out/<artifact>/` (ruling S7).
 // - The pinned config is written from an env variable with `printf '%s'`, never a heredoc, to a file name the argv policy
 //   chose (ruling S4). The repo's own config files are never named.
-// Nothing here uploads (ruling B3) and nothing here fetches rule archives or fills target slots (6c).
+// - Rule archives (semgrep rules, nuclei templates) are fetched by commit and checked by tree (ruling S12), and the values a
+//   tool needs at run time (image, local URL, Dockerfile, base ref) are slots from the render context (ruling B6): slots.ts.
+// Nothing here uploads (ruling B3).
 import { createHash } from 'node:crypto';
 import { isDeepStrictEqual } from 'node:util';
 import { ArtifactNameError, resultArtifactName } from './artifact-names.js';
-import { ASSET_RE, DIGEST_RE, isGitHubRepo, isNpmName, isPypiName, parseImageRef, pep503, SHA256_RE, SRI_SHA512_RE, TAG_RE } from './names.js';
+import { ASSET_RE, COMMIT_SHA_RE, DIGEST_RE, isGitHubRepo, isNpmName, isPypiName, parseImageRef, pep503, SHA256_RE, SRI_SHA512_RE, TAG_RE } from './names.js';
 import { closureRootDependencies, loadNpmClosure, NpmClosureError, type NpmPin } from './npm-closure.js';
 import { EXPR, own, refuse, show } from './render-error.js';
-import type { RenderedStep, RenderResult } from './render-step.js';
+import type { RenderContext, RenderedStep, RenderResult } from './render-step.js';
+import { slotProblem, type SlotKind } from './slots.js';
 import { ARGV_POLICIES, PIP_CLOSURES, PLAIN_REL_RE, type ArgvPolicy } from './tool-flags.js';
 import type { InstallSpec, ReviewedTool, Service, StepSpec } from '../types.js';
 
@@ -34,6 +37,8 @@ export interface RenderOptions {
   pipClosures?: Readonly<Record<string, string>>;
   /** npm closure locks by entry id, instead of data/npm-closures/ (tests). A lock is judged the same either way. */
   npmClosures?: Readonly<Record<string, string>>;
+  /** Where rule and template archives are fetched from (default `https://github.com/`, with only the https protocol). A test points it at a local bare repo (`file:///…/`). */
+  gitBase?: string;
 }
 
 /** What the CLI renderer needs from render-step.ts (which owns the platform actions and the secret-name rules). */
@@ -44,7 +49,7 @@ export interface CliHooks {
   isDangerousName(name: string): boolean;
 }
 
-export interface CliArgs { spec: StepSpec; tool: ReviewedTool; service: Service | undefined; hooks: CliHooks; options: RenderOptions }
+export interface CliArgs { spec: StepSpec; tool: ReviewedTool; service: Service | undefined; ctx: RenderContext; hooks: CliHooks; options: RenderOptions }
 
 // ---------- shell text ----------
 
@@ -62,7 +67,7 @@ const MAX_TEXT = 64 * 1024;
 /** Tool categories that run the project's own code (tests, coverage, image builds): the only steps a declared secret may reach. */
 const APP_RUNNING_CATEGORIES: ReadonlySet<string> = new Set(['coverage', 'unit-tests', 'full-tests', 'image-build']);
 /** Names the renderer itself puts in a step's env or in the tool's environment; a template env may not use them. */
-const RESERVED_ENV = /^(?:HOME|PATH|RUNNER_TEMP|TMPDIR|BASH_ENV|ENV|PIPEGEN_(?:CONFIG|IMAGE|DL_.*|NPM_EXPECT|REQUIREMENTS|ARG_\d+))$/;
+const RESERVED_ENV = /^(?:HOME|PATH|RUNNER_TEMP|TMPDIR|BASH_ENV|ENV|PIPEGEN_(?:CONFIG|IMAGE|DL_.*|NPM_EXPECT|REQUIREMENTS|RULES_(?:REMOTE|COMMIT|TREE_WANT)|ARG_\d+))$/;
 
 
 /** A reviewed constant as a shell word: bare when plain, else single-quoted (`'` becomes `'\''`). `${{` and NUL are refused. */
@@ -155,7 +160,7 @@ function templateEnv(tool: ReviewedTool, hooks: CliHooks): Record<string, string
     if (env[k] !== v) refuse(`The reviewed entry ${show(tool.id)} has an env that disagrees with its fixed inputs.`);
   }
   for (const [k, v] of Object.entries(env)) {
-    // PIPEGEN_* names are the renderer's own family (the rules archives of 6c use them); everything else must be harmless to pass on
+    // PIPEGEN_* names are the renderer's own family (the rules archives use them); everything else must be harmless to pass on
     const dangerous = !k.startsWith('PIPEGEN_') && hooks.isDangerousName(k);
     if (!NAME_RE.test(k) || k !== k.toUpperCase() || RESERVED_ENV.test(k) || dangerous) {
       refuse(`The reviewed env name ${show(k)} can't be passed to a tool: it is reserved by the renderer or changes how code runs.`);
@@ -234,14 +239,14 @@ function wordOf(word: string, tool: ReviewedTool, spec: StepSpec, w: Words): str
 
 const isBoolChoice = (values: readonly string[]): boolean => values.length === 2 && values.includes('false') && values.includes('true');
 
-interface Built { main: string[]; then: string[][]; env: Record<string, string> }
+interface Built { main: string[]; then: string[][]; env: Record<string, string>; /** `"$PIPEGEN_ARG_n"` of the archive sub-folder choice */ sub?: string; /** repo-path slot variables (checked at run time) */ paths: string[]; fullHistory: boolean }
 
 /**
  * The words after the executable, as shell words: placeholders become quoted env variables, the pinned config flag goes
  * right after the leading subcommand words (a Go or urfave tool stops reading flags at the first plain word), and a
  * dedicated tool's choices are appended as `--<choice> "$V"` (a bool choice `--<choice>="$V"`).
  */
-function buildWords(tool: ReviewedTool, spec: StepSpec, pol: ArgvPolicy, config: PinnedConfig | null, configPath: string | null): Built {
+function buildWords(tool: ReviewedTool, spec: StepSpec, pol: ArgvPolicy, config: PinnedConfig | null, configPath: string | null, slots: Slot[]): Built {
   const cli = tool.step.cli as NonNullable<typeof tool.step.cli>;
   const w: Words = { env: {}, index: new Map() };
   const rest = cli.command.slice(1);
@@ -249,12 +254,36 @@ function buildWords(tool: ReviewedTool, spec: StepSpec, pol: ArgvPolicy, config:
   while (lead < rest.length && !(rest[lead] as string).startsWith('-') && !PLACEHOLDER_SPLIT.test(rest[lead] as string)) lead++;
   if (pol.dedicated !== true && !isDeepStrictEqual(rest.slice(0, lead), pol.sub)) refuse(`The subcommand of ${show(tool.id)} is not the one its argv policy reviewed.`);
   const main = rest.map((x) => wordOf(x, tool, spec, w));
+  // a slot: the value of a flag that the command already has is replaced; otherwise `flag value` (or just the value) goes last
+  const paths: string[] = [];
+  let fullHistory = false;
+  for (const sl of slots) {
+    const v = argVar(w, `slot:${sl.key}`, sl.value);
+    if (sl.kind === 'repo-path') paths.push(v);
+    if (sl.kind === 'git-ref') fullHistory = true;
+    if (sl.key === '') { main.push(v); continue; }
+    const at = rest.indexOf(sl.key);
+    if (at >= 0 && at + 1 < rest.length) main[at + 1] = v;
+    else main.push(q(sl.key), v);
+  }
+  // the archive folder: a tool run on the runner is told the checked-out folder where the reviewed command names its directory
+  if (pol.archive !== undefined && pol.method !== 'docker') {
+    let hit = 0;
+    rest.forEach((x, i) => { if (x === pol.archive?.dir) { main[i] = '"$rules"'; hit++; } });
+    if (hit === 0) return refuse(`The command of ${show(tool.id)} does not name its rules folder ${show(pol.archive.dir)}.`);
+  }
   if (config !== null && configPath !== null) main.splice(lead, 0, q(config.flag), configPath);
   const then = (cli.then ?? []).map((cmd) => {
     if (cmd[0] !== pol.exe) refuse(`A follow-up command of ${show(tool.id)} does not run its own executable.`);
     return cmd.slice(1).map((x) => wordOf(x, tool, spec, w));
   });
+  let sub: string | undefined;
   for (const [name, values] of Object.entries(tool.choices)) {
+    if (pol.archive?.subChoice === name) {
+      if (!/^[a-z][a-z0-9-]{0,30}$/.test(chosenValue(tool, spec, name))) return refuse(`The rules folder ${show(name)} of ${show(tool.id)} is not a plain folder name.`);
+      sub = argVar(w, name, chosenValue(tool, spec, name));
+      continue;
+    }
     if (w.index.has(name)) continue;
     if (pol.dedicated !== true) return refuse(`The choice ${show(name)} of ${show(tool.id)} has no place in its command (only a {${name}} placeholder may take it).`);
     if (!CHOICE_FLAG_RE.test(name)) return refuse(`The choice ${show(name)} of ${show(tool.id)} is not a plain flag name.`);
@@ -262,9 +291,93 @@ function buildWords(tool: ReviewedTool, spec: StepSpec, pol: ArgvPolicy, config:
     if (isBoolChoice(values)) main.push(`--${name}=${v}`);
     else main.push(`--${name}`, v);
   }
-  return { main, then, env: w.env };
+  return { main, then, env: w.env, ...(sub === undefined ? {} : { sub }), paths, fullHistory };
 }
 
+
+// ---------- slots (ruling B6) ----------
+
+interface Slot { key: string; kind: SlotKind; value: string }
+
+/** The slot values of an entry, from the render context and the profile only, each checked by slots.ts. */
+function slotsOf(tool: ReviewedTool, pol: ArgvPolicy, service: Service | undefined, ctx: RenderContext, spec: StepSpec): Slot[] {
+  const out: Slot[] = [];
+  for (const [key, kind] of Object.entries(pol.slots ?? {})) {
+    let value: string | undefined;
+    let what: string;
+    if (kind === 'image-digest') { value = ctx.targets?.image; what = 'the image to scan (an image target)'; }
+    else if (kind === 'local-url') { value = ctx.targets?.url; what = 'the URL of the running app (a url target)'; }
+    else if (kind === 'git-ref') { value = `origin/${ctx.profile.defaultBranch}`; what = 'the base ref'; }
+    else if (pol.repoPathFrom === 'dockerfile') { value = service?.dockerfile; what = "the service's Dockerfile"; }
+    else { value = ctx.targets?.k8sDir ?? (ctx.profile.repoFiles.kubernetes ? '.' : undefined); what = 'a folder of Kubernetes files (the repository has none and no folder was given)'; }
+    if (value === undefined) return refuse(`${show(tool.id)} needs ${what}, which the render context does not have.`);
+    const problem = slotProblem(kind, value, { defaultBranch: ctx.profile.defaultBranch });
+    if (problem !== null) return refuse(`${what} for ${show(tool.id)} can't be used: ${problem}.`);
+    // a repo path is relative to the repository root; the step runs in the service folder when it has one
+    if (kind === 'repo-path' && spec.workingDir !== undefined) return refuse(`${show(tool.id)} takes a path relative to the repository root, so it can not run in a service folder.`);
+    out.push({ key, kind, value });
+  }
+  return out;
+}
+
+// ---------- rule archives (ruling S12) ----------
+
+const GIT_BASE = 'https://github.com/';
+
+/** The reviewed commit of an archive: from its own env value, or from the archive URL that holds it. */
+function archiveCommit(tool: ReviewedTool, a: NonNullable<ArgvPolicy['archive']>, env: Record<string, string>): string {
+  let commit: string | undefined;
+  if (a.commitEnv !== undefined) commit = env[a.commitEnv];
+  else if (a.urlEnv !== undefined) commit = /\/archive\/([0-9a-f]{40})\.tar\.gz$/.exec(env[a.urlEnv] ?? '')?.[1];
+  if (commit === undefined || !COMMIT_SHA_RE.test(commit)) return refuse(`${show(tool.id)} has no pinned 40-character commit for its rules.`);
+  return commit;
+}
+
+/**
+ * One step that fetches a pinned git archive and refuses it unless it is exactly the reviewed one: `git init` in a fresh
+ * folder under runner temp; `git fetch --depth 1 <remote> <commit>`; `git checkout FETCH_HEAD`; HEAD must be the commit and
+ * HEAD^{tree} the reviewed tree (the tree also catches GitHub serving a fork's objects under the upstream name). git runs
+ * under `env -i` with a fixed PATH and a fresh HOME, no system or global config, and only the https protocol, so no repo
+ * or user git configuration and no GIT_* variable is read. Then `.git` is removed and the folder is made read-only (a speed
+ * bump; semgrep mounts it `:ro`). The archive's sha256 in the data is not used here: GitHub archives are not byte-stable, and
+ * the tree check is the stronger one. Any failure fails the step; there is no fallback.
+ */
+function rulesStep(tool: ReviewedTool, a: NonNullable<ArgvPolicy['archive']>, artifact: string, env: Record<string, string>, base: string): RenderedStep {
+  if (!isGitHubRepo(a.repo)) return refuse(`The rules repo of ${show(tool.id)} is not a GitHub owner/name.`);
+  const tree = env[a.treeEnv];
+  if (tree === undefined || !COMMIT_SHA_RE.test(tree)) return refuse(`${show(tool.id)} has no pinned 40-character git tree for its rules.`);
+  const commit = archiveCommit(tool, a, env);
+  const protocol = /^([a-z]+):\/\//.exec(base)?.[1];
+  if (protocol !== 'https' && protocol !== 'file') return refuse('The rules remote is neither https nor file.');
+  const lines = [
+    ...prologue(artifact),
+    `rules="$RUNNER_TEMP/pipegen-rules/${artifact}"`,
+    'mkdir -p "$RUNNER_TEMP/pipegen-rules"',
+    'mkdir "$rules"',
+    'git=(',
+    '  /usr/bin/env -i',
+    `  "PATH=${FIXED_PATH}"`,
+    '  "HOME=$home"',
+    '  GIT_CONFIG_NOSYSTEM=1',
+    '  GIT_CONFIG_GLOBAL=/dev/null',
+    '  GIT_TERMINAL_PROMPT=0',
+    `  GIT_ALLOW_PROTOCOL=${protocol}`,
+    '  /usr/bin/git',
+    ')',
+    'cd -- "$rules"',
+    '"${git[@]}" init --quiet --template=',
+    '"${git[@]}" fetch --quiet --depth 1 -- "$PIPEGEN_RULES_REMOTE" "$PIPEGEN_RULES_COMMIT"',
+    '"${git[@]}" checkout --quiet FETCH_HEAD',
+    '[ "$("${git[@]}" rev-parse HEAD)" = "$PIPEGEN_RULES_COMMIT" ] || pg_fail "the fetched commit is not the reviewed one"',
+    '[ "$("${git[@]}" rev-parse \'HEAD^{tree}\')" = "$PIPEGEN_RULES_TREE_WANT" ] || pg_fail "the fetched tree is not the reviewed one"',
+    'rm -rf -- "$rules/.git"',
+    // a speed bump, not a guard (review-6b-r2 C3)
+    'chmod -R a-w "$rules"',
+  ];
+  return runStep(`pipegen: fetch the ${a.repo.split('/')[1]} rules (pinned commit and tree)`, script(lines), {
+    PIPEGEN_RULES_REMOTE: `${base}${a.repo}`, PIPEGEN_RULES_COMMIT: commit, PIPEGEN_RULES_TREE_WANT: tree,
+  }, `tool-install-${sha16(`rules:${artifact}`)}`);
+}
 
 // ---------- the main entry ----------
 
@@ -272,7 +385,7 @@ const sha16 = (text: string): string => createHash('sha256').update(text).digest
 /** Tool categories of the DAST steps: the only docker steps that may use the host network (their target is the app on the runner). */
 const DAST_CATEGORIES: ReadonlySet<string> = new Set(['dast', 'api-dast']);
 
-export function renderCliTool({ spec, tool, service, hooks, options }: CliArgs): RenderResult {
+export function renderCliTool({ spec, tool, service, ctx, hooks, options }: CliArgs): RenderResult {
   const policies = options.policies ?? ARGV_POLICIES;
   const cli = tool.step.cli;
   if (cli === undefined || tool.candidate.kind === 'action') return refuse(`${show(tool.id)} is not a cli entry.`);
@@ -281,11 +394,6 @@ export function renderCliTool({ spec, tool, service, hooks, options }: CliArgs):
   if (pol.entrypoint === true) return refuse(`${show(tool.id)} is a job service (the image runs its own entrypoint), not a step; the job composer starts it.`);
   if (pol.needsSlot !== undefined) return refuse(`${show(tool.id)} ${pol.needsSlot}.`);
   const install = checkInstall(tool, pol);
-
-  // 6c: rule and template archives
-  if (Object.keys(cli.env ?? {}).some((k) => /^PIPEGEN_(?:RULES|NUCLEI)_/.test(k)) || cli.command.some((x) => x.startsWith('/pipegen-') || x.includes('=/pipegen-'))) {
-    return refuse(`${show(tool.id)} needs its pinned rules or templates archive, which is rendered in 6c (ruling S12).`);
-  }
 
   const secrets = spec.secrets ?? [];
   if (secrets.length > 0 && !tool.categories.some((c) => APP_RUNNING_CATEGORIES.has(c))) {
@@ -313,10 +421,12 @@ export function renderCliTool({ spec, tool, service, hooks, options }: CliArgs):
   const config = configOf(tool, pol);
   // where the tool finds its config: a file on the runner, the work folder's own file (ZAP reads -c there), or a read-only mount
   const configPath = config === null ? null : kind !== 'docker' ? `"${cfgBase}/${config.fileName}"` : inWork ? q(config.fileName) : q(`/pipegen-cfg/${config.fileName}`);
-  const built = buildWords(tool, spec, pol, config, configPath);
+  const slots = slotsOf(tool, pol, service, ctx, spec);
+  const built = buildWords(tool, spec, pol, config, configPath, slots);
   const tplEnv = templateEnv(tool, hooks);
 
   const env: Record<string, string> = { ...tplEnv, ...built.env };
+  const archive = pol.archive;
   const passed: string[] = Object.keys(env);   // handed to the tool by name through the allowlist
   if (config !== null) env.PIPEGEN_CONFIG = config.content;
   for (const name of secrets) {
@@ -362,6 +472,12 @@ export function renderCliTool({ spec, tool, service, hooks, options }: CliArgs):
     } else docker.push('-v', `"$PWD:${at}"`);
     if (mount?.workdir === true) docker.push('-w', at);
     if (config !== null && !inWork) docker.push('-v', '"$cfg:/pipegen-cfg:ro"');
+    if (archive !== undefined) {
+      // the verified rules folder (or its chosen sub-folder), read-only, at the path the reviewed command names
+      const sub = built.sub === undefined ? '' : `/${built.sub.slice(1, -1)}`;
+      if (built.sub !== undefined) prep.push(`if [ -L "$rules"/${built.sub} ] || [ ! -d "$rules"/${built.sub} ]; then pg_fail "the rules folder is missing or a link"; fi`);
+      docker.push('-v', `"$rules${sub}:${archive.dir}:ro"`);
+    }
     for (const n of secrets) docker.push('-e', n);
     docker.push('"$PIPEGEN_IMAGE"', q(exe));
     prefix = docker.join(' ');
@@ -409,6 +525,16 @@ export function renderCliTool({ spec, tool, service, hooks, options }: CliArgs):
     pathValue = `$venv/bin:${FIXED_PATH}`;
   }
 
+  if (archive !== undefined) {
+    steps.push(rulesStep(tool, archive, artifact, tplEnv, options.gitBase ?? GIT_BASE));
+    vars.push(`rules="$RUNNER_TEMP/pipegen-rules/${artifact}"`);
+  }
+  // a repo path (hadolint's Dockerfile, kube-linter's folder) must exist, not be a link and stay inside the repository
+  const pathChecks = built.paths.flatMap((v) => [
+    `if [ -L ${v} ] || [ ! -e ${v} ]; then pg_fail "the path ${'$'}{${v.slice(2, -1)}} is missing or a link"; fi`,
+    `case "$(/usr/bin/realpath -e -- ${v})" in "$(pwd -P)"|"$(pwd -P)"/*) ;; *) pg_fail "the path leaves the repository" ;; esac`,
+  ]);
+
   // the pinned config goes in a file the tool is told about (ruling S4)
   const cfgLines = config === null ? [] : checker || inWork
     ? [`printf '%s' "$PIPEGEN_CONFIG" > "${cfgBase}/${config.fileName}"`]
@@ -438,7 +564,7 @@ export function renderCliTool({ spec, tool, service, hooks, options }: CliArgs):
   const launch = (words: readonly string[]): string => `"\${pg_env[@]}" ${prefix}${words.length === 0 ? '' : ` ${words.join(' ')}`}`;
   const chain = [launch(built.main), ...built.then.map(launch)].join(' && ');
   const run = script([
-    ...prologue(artifact, nodeMajor === undefined ? {} : { nodeMajor }), ...vars, ...installLines, ...cdLines(spec.workingDir), ...prep, ...cfgLines, ...preCheck,
+    ...prologue(artifact, nodeMajor === undefined ? {} : { nodeMajor }), ...vars, ...installLines, ...cdLines(spec.workingDir), ...pathChecks, ...prep, ...cfgLines, ...preCheck,
     ...closureVars, ...allowlist(pathValue, passed), ...afterAllow, 'rc=0', `${chain} || rc=$?`, ...postCheck, 'exit "$rc"',
   ]);
   // a tool that runs the repo's own code is marked, so the referee can apply its order rule (S6 c); the id is not `pipegen-…`, which a job's dedupe may drop
@@ -447,7 +573,7 @@ export function renderCliTool({ spec, tool, service, hooks, options }: CliArgs):
   const harmless = pol.readsOnly === true && pol.runsRepoCode !== true && pol.loadsRepoConfig !== true && !appRunning;
   const runId = !harmless ? `repocode-${sha16(artifact)}` : checker ? `checker-run-${sha16(artifact)}` : `tool-run-${sha16(artifact)}`;
   steps.push(runStep(`pipegen: run ${exe}`, run, env, runId));
-  return { steps, output: out === null ? null : { path: `\${{ runner.temp }}/pipegen-out/${artifact}/${out}`, format: tool.step.output.format } };
+  return { steps, output: out === null ? null : { path: `\${{ runner.temp }}/pipegen-out/${artifact}/${out}`, format: tool.step.output.format }, ...(built.fullHistory ? { fullHistory: true as const } : {}) };
 }
 
 // ---------- github-release (ruling S27) ----------

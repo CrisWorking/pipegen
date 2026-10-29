@@ -2,6 +2,7 @@
 // (Plan P ruling PS34): the reviewed-list loader (reviewed.ts) and the local secret scan's own argv (Task 7).
 
 import { RESULT_ARTIFACT_PREFIX } from '../types.js';
+import type { SlotKind } from './slots.js';
 
 /**
  * betterleaks flags pipegen never passes (catalogue §3 PC2: no egress, no config from the scanned repo). Taken from
@@ -97,10 +98,27 @@ export interface ArgvPolicy extends CommandPolicy {
    */
   readonly asImageUser?: true;
   /**
-   * Why this entry is not rendered yet, in plain words (a missing target, a tool pipegen does not run): a RenderError
-   * now, instead of a step that fails at run time (6b fix round 1, R-E). Removed when the slot exists (6c).
+   * Why this entry is never rendered as a step by renderStep, in plain words (cosign: Plan G's sign job; gosec: Go is not
+   * supported in v0.2): a RenderError now, instead of a step that fails at run time. (Named `needsSlot` in 6b, when the
+   * target slots did not exist yet; they do now, see `slots`.)
    */
   readonly needsSlot?: string;
+  /**
+   * Run-time slots (6c, ruling B6), by flag (`-t`, `--baseline-from-ref`) or `''` for a trailing positional: the kind of value
+   * the renderer fills from the render context or the profile (never the AI), checked by slots.ts and passed in env. A flag
+   * that is already in the command has its value replaced; otherwise `flag value` is appended.
+   */
+  readonly slots?: Readonly<Record<string, SlotKind>>;
+  /** For a `repo-path` slot: where the path comes from, a service's Dockerfile or the Kubernetes folder (context target, else `.` when the repo has Kubernetes files). */
+  readonly repoPathFrom?: 'dockerfile' | 'k8s-dir';
+  /**
+   * A pinned git archive of rules or templates (6c, ruling S12): fetched by commit into a fresh runner-temp folder, and
+   * HEAD and HEAD^{tree} are checked against the reviewed values before anything uses it. `treeEnv` and `commitEnv` (or
+   * `urlEnv`, whose archive URL holds the commit) name the template env variables with the reviewed values; `dir` is the
+   * word of the command that names the folder (docker: the path inside the container, mounted read-only; otherwise it is
+   * replaced by the checked-out folder); `subChoice` is the choice that picks a sub-folder to mount.
+   */
+  readonly archive?: { readonly repo: string; readonly treeEnv: string; readonly commitEnv?: string; readonly urlEnv?: string; readonly dir: string; readonly subChoice?: string };
   readonly env?: readonly string[];
   readonly then?: readonly CommandPolicy[];
   readonly dedicated?: true;
@@ -152,14 +170,15 @@ const ESLINT_TS_FILES = "files: ['**/*.{js,mjs,cjs,jsx,ts,mts,cts,tsx,vue,svelte
  * on a list (P20).
  */
 const POLICIES = {
-  'trivy-config': DEDICATED('trivy', TRIVY_ASSET, TRIVY_CONFIG), 'trivy-image': { ...DEDICATED('trivy', TRIVY_ASSET, TRIVY_CONFIG), needsSlot: 'needs an image to scan, a target slot that is rendered in 6c (ruling B6)' }, 'trivy-licence': DEDICATED('trivy', TRIVY_ASSET, TRIVY_CONFIG),
+  'trivy-config': DEDICATED('trivy', TRIVY_ASSET, TRIVY_CONFIG), 'trivy-image': { ...DEDICATED('trivy', TRIVY_ASSET, TRIVY_CONFIG), slots: { '': 'image-digest' } }, 'trivy-licence': DEDICATED('trivy', TRIVY_ASSET, TRIVY_CONFIG),
   betterleaks: DEDICATED('betterleaks', 'betterleaks_1.9.0_linux_x64.tar.gz', { flag: '--config', content: '[extend]\nuseDefault = true\n', fileName: 'betterleaks.toml' }),
-  nuclei: DEDICATED('nuclei', 'nuclei_3.11.1_linux_amd64.zip'),
+  nuclei: { ...DEDICATED('nuclei', 'nuclei_3.11.1_linux_amd64.zip'), slots: { '-target': 'local-url' },
+    archive: { repo: 'projectdiscovery/nuclei-templates', commitEnv: 'PIPEGEN_NUCLEI_TEMPLATES_COMMIT', treeEnv: 'PIPEGEN_NUCLEI_TEMPLATES_TREE', dir: '/pipegen-nuclei-templates' } },
   // ruling P28: the image entries too. registry runs the image's own entrypoint, nothing else
   registry: { method: 'docker', package: 'registry', exe: '', entrypoint: true, dialect: 'long', sub: [], flags: {} },
   // ZAP baseline (zaproxy/zap-stable): getopt short options, read as Go-style words; no -I (warnings that never fail)
   'zap-baseline': {
-    needsSlot: 'needs the URL of the running app (-t), a target slot that is rendered in 6c (ruling B6)', network: 'host', asImageUser: true,
+    slots: { '-t': 'local-url' }, network: 'host', asImageUser: true,
     method: 'docker', package: 'zaproxy/zap-stable', exe: 'zap-baseline.py', dialect: 'goflags', sub: [], flags: { J: 'output', z: { values: ['-silent'] } },
     required: { J: null, z: '-silent' }, mount: { at: '/zap/wrk', source: 'work' }, config: { flag: '-c', content: "# pipegen's pinned ZAP baseline rules: the defaults, nothing ignored\n", fileName: 'zap-baseline.conf' },
   },
@@ -170,6 +189,7 @@ const POLICIES = {
     required: { metrics: 'off', 'disable-version-check': 'true', config: '/pipegen-rules' },
     env: ['PIPEGEN_RULES_URL', 'PIPEGEN_RULES_SHA256', 'PIPEGEN_RULES_TREE'], extraChoices: { rules: ['javascript', 'typescript', 'python'] },
     mount: { at: '/src', source: 'repo', workdir: true }, network: 'none',
+    archive: { repo: 'semgrep/semgrep-rules', urlEnv: 'PIPEGEN_RULES_URL', treeEnv: 'PIPEGEN_RULES_TREE', dir: '/pipegen-rules', subChoice: 'rules' },
   },
   // gitleaks 8.30.1 (`gitleaks git --help`), the secrets fallback (P21): the same locks as betterleaks
   gitleaks: { method: GH, package: 'gitleaks_8.30.1_linux_x64.tar.gz',
@@ -185,11 +205,11 @@ const POLICIES = {
     config: { flag: '--config', content: "# pipegen's pinned osv-scanner config: no ignored vulnerabilities\n", fileName: 'osv-scanner.toml' },
   },
   lefthook: { method: GH, runsRepoCode: true, package: 'lefthook_2.2.2_Linux_x86_64', exe: 'lefthook', dialect: 'long', sub: ['run', 'pre-commit'], flags: { 'all-files': 'bool' }, required: { 'all-files': 'true' } },
-  syft: { method: GH, needsSlot: 'needs an image to scan, a target slot that is rendered in 6c (ruling B6)', package: 'syft_1.55.0_linux_amd64.tar.gz',
+  syft: { method: GH, slots: { '': 'image-digest' }, package: 'syft_1.55.0_linux_amd64.tar.gz',
     exe: 'syft', dialect: 'long', sub: ['scan'], flags: { output: { values: ['spdx-json=sbom.spdx.json'] } }, required: { output: 'spdx-json=sbom.spdx.json' },
     config: { flag: '--config', content: 'check-for-app-update: false\n', fileName: 'syft.yaml' },
   },
-  cosign: { method: GH, needsSlot: "is run by Plan G's sign job, which adds its own reviewed flags (ruling B6)", package: 'cosign-linux-amd64', exe: 'cosign', dialect: 'long', sub: ['sign'], flags: { yes: 'bool' }, required: { yes: 'true' } },
+  cosign: { method: GH, needsSlot: "is run by Plan G's sign job, which adds its own reviewed flags", package: 'cosign-linux-amd64', exe: 'cosign', dialect: 'long', sub: ['sign'], flags: { yes: 'bool' }, required: { yes: 'true' } },
   actionlint: { method: GH, package: 'actionlint_1.7.12_linux_amd64.tar.gz',
     exe: 'actionlint', dialect: 'goflags', sub: [], flags: { 'no-color': 'bool', shellcheck: { values: [''] }, pyflakes: { values: [''] } },
     required: { shellcheck: '', pyflakes: '' },
@@ -228,20 +248,20 @@ const POLICIES = {
   // Knip 6.42.1
   knip: { method: 'npm', package: 'knip', npmBin: 'bin/knip.js', loadsRepoConfig: true, exe: 'knip', dialect: 'long', sub: [], flags: { 'no-progress': 'bool' } },
   // jscpd 5.4.2 (the release binary): new copy-paste against the base only; no semantic mode (jscpdProblems)
-  jscpd: { method: GH, package: 'jscpd-linux-x64-gnu.tar.gz',
+  jscpd: { method: GH, slots: { '--baseline-from-ref': 'git-ref' }, package: 'jscpd-linux-x64-gnu.tar.gz',
     exe: 'jscpd', dialect: 'long', sub: [], positionals: ['.'],
     flags: { 'baseline-from-ref': { values: ['origin/main'] }, 'fail-on-new-clones': { values: [''], optional: true }, reporters: { values: ['sarif'] }, output: { values: ['jscpd-report'] } },
     required: { 'baseline-from-ref': 'origin/main', 'fail-on-new-clones': '' },
     config: { flag: '--config', content: '{}\n', fileName: 'jscpd.json' },
   },
   // hadolint 2.15.1: fails on warnings and errors (never --no-fail or a lower threshold)
-  hadolint: { method: GH, needsSlot: 'needs the Dockerfile to check, a repo-path slot that is rendered in 6c', package: 'hadolint-linux-x86_64',
+  hadolint: { method: GH, slots: { '': 'repo-path' }, repoPathFrom: 'dockerfile', package: 'hadolint-linux-x86_64',
     exe: 'hadolint', dialect: 'long', sub: [], flags: { 'no-color': 'bool', 'failure-threshold': { values: ['warning'] }, format: { values: ['sarif'] }, output: 'output' },
     required: { 'failure-threshold': 'warning', format: 'sarif', output: null },
     config: { flag: '--config', content: "# pipegen's pinned hadolint config: every rule at its default level, nothing ignored\nignored: []\n", fileName: 'hadolint.yaml' },
   },
   // kube-linter 0.8.3: an unrenderable chart, a bad path or YAML it can't parse fails the check (P25)
-  'kube-linter': { method: GH, needsSlot: 'needs the folder to check, a repo-path slot that is rendered in 6c', package: 'kube-linter-linux',
+  'kube-linter': { method: GH, slots: { '': 'repo-path' }, repoPathFrom: 'k8s-dir', package: 'kube-linter-linux',
     exe: 'kube-linter', dialect: 'long', sub: ['lint'],
     flags: { 'fail-if-no-objects-found': 'bool', 'fail-on-invalid-resource': 'bool', format: { values: ['sarif'] }, output: 'output' },
     required: { 'fail-if-no-objects-found': 'true', 'fail-on-invalid-resource': 'true', format: 'sarif', output: null },
@@ -261,7 +281,7 @@ const POLICIES = {
     config: { flag: '--config', content: "# pipegen's pinned poutine config: no skipped rules\nskip: []\n", fileName: 'poutine.yml' },
   },
   // gosec 2.29.0 (Go flags): never -no-fail; every #nosec suppression is reported in the SARIF (P27)
-  gosec: { method: GH, needsSlot: 'is for Go: Go is not supported in v0.2 (it needs setup-go discovery, 6c)', package: 'gosec_2.29.0_linux_amd64.tar.gz',
+  gosec: { method: GH, needsSlot: 'is for Go: Go is not supported in v0.2 (a permanent refusal until Go setup is added)', package: 'gosec_2.29.0_linux_amd64.tar.gz',
     exe: 'gosec', dialect: 'goflags', sub: [], positionals: ['./...'], flags: { fmt: { values: ['sarif'] }, out: 'output', 'track-suppressions': 'bool' },
     required: { fmt: 'sarif', out: null, 'track-suppressions': 'true' },
   },
@@ -470,3 +490,12 @@ export function rendererInputProblems(usesPath: string, inputs: Readonly<Record<
   }
   return out;
 }
+
+/**
+ * Actions whose action.yml runs a docker image (`runs.using: docker`), by `uses` path (ruling S13). Their reviewed entry
+ * must record the image in `wrappedImage` (the loader checks it), and a render runs them only when that image is pinned
+ * by digest. scorecard-action's is by tag today, so it stays refused.
+ */
+export const DOCKER_ACTION_USES: ReadonlySet<string> = new Set(['ossf/scorecard-action']);
+/** Actions that build an image from a Dockerfile at run time (a composite that generates one): what runs can not be pinned, so they are refused. */
+export const IMAGE_BUILT_ACTION_USES: ReadonlySet<string> = new Set(['pypa/gh-action-pypi-publish']);

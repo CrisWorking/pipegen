@@ -27,14 +27,14 @@ const withPolicy = (id: string, drop: (keyof ArgvPolicy)[] = [], add: Partial<Ar
   for (const k of drop) delete p[k];
   return { policies: { ...ARGV_POLICIES, [id]: { ...p, ...add } as ArgvPolicy } };
 };
-const render = (id: string, over: Partial<StepSpec> = {}, c = ctxFor([service({ name: 'app', path: '.' })]), opts?: Parameters<typeof renderStepWith>[4]): RenderResult => {
+const render = (id: string, over: Partial<StepSpec> = {}, c = ctx, opts?: Parameters<typeof renderStepWith>[4]): RenderResult => {
   const t = entry(id);
   return renderStepWith(spec(t, over), t, platform(), c, opts);
 };
 const runs = (r: RenderResult): RenderedStep[] => r.steps.filter((s) => s.run !== undefined);
 const lastRun = (r: RenderResult): RenderedStep => runs(r).at(-1) as RenderedStep;
 const closureText = (id: string): string => read(packageDataPath(`npm-closures/${id}.json`), 'utf8');
-const ctx = ctxFor([service({ name: 'app', path: '.' })]);
+const ctx = ctxFor([service({ name: 'app', path: '.' })], { image: `ghcr.io/o/app@sha256:${'a'.repeat(64)}`, url: 'http://localhost:8080' });
 const REAL_BASH = process.platform !== 'win32';
 const it2 = it.skipIf(!REAL_BASH);
 const hash16 = /^pipegen-npm-ci-[0-9a-f]{16}$/;
@@ -357,7 +357,7 @@ describe('R-C: the pip install does not import the repo', () => {
 });
 
 describe('R-D: DAST steps (and only those) may use the host network', () => {
-  const dastOnly = withPolicy('zap-baseline', ['needsSlot']);
+  const dastOnly = withPolicy('zap-baseline', ['slots']);
 
   it('zap: --network host, no --user override, a fresh work folder made world-writable, no repo mount, no -e, no secrets', () => {
     const t = entry('zap-baseline');
@@ -376,24 +376,21 @@ describe('R-D: DAST steps (and only those) may use the host network', () => {
   it('every other docker step keeps the S26 rule: asking for host networking is refused, with or without the DAST mount', () => {
     const t = entry('zap-baseline');
     t.categories = ['sast'];
-    expect(() => renderStepWith(spec(t), t, platform(), ctx, withPolicy('zap-baseline', ['needsSlot', 'asImageUser'], { network: 'host' }))).toThrow(/host/);
+    expect(() => renderStepWith(spec(t), t, platform(), ctx, withPolicy('zap-baseline', ['slots', 'asImageUser'], { network: 'host' }))).toThrow(/host/);
     // a DAST step with a repo mount is refused too
     const d = entry('zap-baseline');
-    expect(() => renderStepWith(spec(d), d, platform(), ctx, withPolicy('zap-baseline', ['needsSlot'], { mount: { at: '/src', source: 'repo' } }))).toThrow(/host|work/);
+    expect(() => renderStepWith(spec(d), d, platform(), ctx, withPolicy('zap-baseline', ['slots'], { mount: { at: '/src', source: 'repo' } }))).toThrow(/host|work/);
     // the plain docker rule
-    const plain = renderStepWith(spec(d), d, platform(), ctx, withPolicy('zap-baseline', ['needsSlot', 'network', 'asImageUser']));
+    const plain = renderStepWith(spec(d), d, platform(), ctx, withPolicy('zap-baseline', ['slots', 'network', 'asImageUser']));
     expect(lastRun(plain).run).toContain('--user "$(id -u):$(id -g)"');
     expect(lastRun(plain).run).not.toContain('--network');
   });
 });
 
-describe('R-E: a tool that would fail at run time for want of a target is refused now', () => {
-  it('trivy-image, syft, zap-baseline, cosign, hadolint, kube-linter and gosec are RenderErrors that say why', () => {
-    const cases: [string, RegExp][] = [
-      ['trivy-image', /6c.*B6|B6.*6c/], ['syft', /6c.*B6|B6.*6c/], ['zap-baseline', /6c.*B6|B6.*6c/], ['cosign', /Plan G's sign job/],
-      ['hadolint', /repo-path.*6c|6c.*repo-path/], ['kube-linter', /repo-path.*6c|6c.*repo-path/], ['gosec', /Go is not supported in v0\.2/],
-    ];
-    for (const [id, why] of cases) expect(() => render(id), id).toThrow(why);
+describe('R-E (6c): the tools that wait for a target now render with one; the permanent refusals say why', () => {
+  it('cosign and gosec are refused for good; trivy-image, syft, zap-baseline, nuclei, semgrep render with a target', () => {
+    for (const [id, why] of [['cosign', /Plan G's sign job/], ['gosec', /Go is not supported in v0\.2/]] as const) expect(() => render(id), id).toThrow(why);
+    for (const id of ['trivy-image', 'syft', 'zap-baseline', 'nuclei', 'semgrep']) expect(() => render(id), id).not.toThrow();
   });
 
   it('the rest of the github-release and npm tools still render', () => {
@@ -408,7 +405,7 @@ describe('R-F: hardening (findings 6, 8, 9, 10)', () => {
     expect(install).toContain('unset CDPATH');
     expect(install).toMatch(/sys=\(\n {2}\/usr\/bin\/env -i\n {2}"PATH=\/usr\/local\/sbin/);
     expect((render('osv-scanner').steps[0]?.run as string)).toContain('"${sys[@]}" sha256sum');
-    const zap = renderStepWith(spec(entry('zap-baseline')), entry('zap-baseline'), platform(), ctx, withPolicy('zap-baseline', ['needsSlot']));
+    const zap = renderStepWith(spec(entry('zap-baseline')), entry('zap-baseline'), platform(), ctx, withPolicy('zap-baseline', ['slots']));
     expect(zap.steps[0]?.run).toContain('"${sys[@]}" /usr/bin/docker pull');
     const wd = render('ruff', { service: 'api', workingDir: 'services/api' }, ctxFor([service({ name: 'api', path: 'services/api' })]));
     expect(lastRun(wd).run).toContain('cd -- ./services/api');

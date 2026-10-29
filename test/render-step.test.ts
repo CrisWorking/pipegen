@@ -176,7 +176,7 @@ describe('renderStep: reviewed entries only', () => {
   it('renderStep: a cli entry is rendered by the CLI renderer (6b), and one that cannot be yet says why', () => {
     const t = entry('gitleaks');
     expect(renderStep(specFor(t), t, platform(), ctx).steps.length).toBeGreaterThan(1);
-    for (const [id, why] of [['semgrep', /6c/], ['bandit', /not available yet/], ['registry', /service/]] as const) {
+    for (const [id, why] of [['bandit', /not available yet/], ['registry', /service/]] as const) {
       const u = entry(id);
       expect(() => renderStep(specFor(u), u, platform(), ctx), id).toThrow(why);
     }
@@ -491,14 +491,29 @@ describe('fix round 1', () => {
     expect(rendererInputProblems('docker/login-action', login, login)).toEqual([expect.stringMatching(/ghcr\.io/)]);
   });
 
-  it('renderStep: container actions are refused until wrappedImage exists (6c, S13)', () => {
-    for (const id of ['pypi-publish', 'scorecard-action']) {
-      const t = entry(id);
-      expect(() => renderStep(specFor(t, { needId: id === 'pypi-publish' ? 'publishing' : 'scorecard' }), t, platform(), ctx), id).toThrow(/container action/);
-    }
+  it('renderStep: container actions (S13): pypi-publish builds its image at run time and scorecard runs one by tag, so both stay refused with the reason; a digest-pinned wrappedImage renders', () => {
+    const pypi = entry('pypi-publish');
+    expect(() => renderStep(specFor(pypi, { needId: 'publishing' }), pypi, platform(), ctx)).toThrow(/Dockerfile/);
+    const sc = entry('scorecard-action');
+    expect(() => renderStep(specFor(sc, { needId: 'scorecard' }), sc, platform(), ctx)).toThrow(/by tag/);
+    // keyed by the uses path: a copy with another id and no wrappedImage is refused as a container action
+    const copy = entry('scorecard-action');
+    copy.id = 'other';
+    copy.candidate.id = 'other';
+    delete copy.wrappedImage;
+    expect(() => renderStep(specFor(copy, { needId: 'scorecard' }), copy, platform(), ctx)).toThrow(/container action.*wrappedImage|wrappedImage/);
+    // an entry that has a wrappedImage is a container action by definition
     const marked = entry('dependency-review-action');
-    marked.wrappedImage = { ref: 'docker.io/x/y', digest: `sha256:${'a'.repeat(64)}` };
-    expect(() => renderStep(specFor(marked, { needId: 'dependency-review' }), marked, platform(), ctx)).toThrow(/container action/);
+    marked.wrappedImage = { ref: 'docker.io/x/y:1', digest: `sha256:${'a'.repeat(64)}` };
+    expect(() => renderStep(specFor(marked, { needId: 'dependency-review' }), marked, platform(), ctx)).toThrow(/by tag/);
+    // ... and renders when its image is pinned by the digest it recorded
+    const pinned = entry('dependency-review-action');
+    pinned.wrappedImage = { ref: `ghcr.io/x/y@sha256:${'a'.repeat(64)}`, digest: `sha256:${'a'.repeat(64)}` };
+    expect(renderStep(specFor(pinned, { needId: 'dependency-review' }), pinned, platform(), ctx).steps[0]?.uses).toMatch(/@[0-9a-f]{40}$/);
+    // a digest in the ref that is not the recorded one is not trusted
+    const lying = entry('dependency-review-action');
+    lying.wrappedImage = { ref: `ghcr.io/x/y@sha256:${'b'.repeat(64)}`, digest: `sha256:${'a'.repeat(64)}` };
+    expect(() => renderStep(specFor(lying, { needId: 'dependency-review' }), lying, platform(), ctx)).toThrow(/by tag/);
   });
 
   it('renderStep: renders what it validated (a getter that changes after the first read cannot swap the secrets)', () => {

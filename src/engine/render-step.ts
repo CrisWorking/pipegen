@@ -10,8 +10,8 @@
 //   renderUpload is a separate helper. Result artifacts are named by artifact-names.ts (ruling B4).
 // - Repo-derived values (Service.path, runtimeVersion, dockerfile) are validated or mapped, never copied raw (ruling S8).
 //   All YAML is built with the `yaml` Document API (stepsToYaml); no step text is concatenated into YAML.
-// - 6a builds the action kind completely; 6b the CLI kinds (github-release, docker, npm, pip) in render-cli.ts. Rule
-//   archives, target slots and project scripts are 6c.
+// - 6a builds the action kind completely; 6b the CLI kinds (github-release, docker, npm, pip) in render-cli.ts; 6c the rule
+//   archives, the run-time slots (slots.ts), container actions and renderProjectScript.
 import { isDeepStrictEqual } from 'node:util';
 import { Scalar, YAMLMap, YAMLSeq } from 'yaml';
 import { safeText } from '../util/safe-text.js';
@@ -21,7 +21,7 @@ import { NEED_IDS } from './need-ids.js';
 import type { PlatformActions } from './pin.js';
 import { renderCliTool, type CliHooks, type RenderOptions } from './render-cli.js';
 import { EXPR, own, RenderError, show } from './render-error.js';
-import { CHECKER_STEP_ID_RE, PLAIN_REL_RE, RENDERER_INPUTS, rendererInputProblems, SCRUB_STEP_ID_RE, SETUP_STEP_ID_RE, TOOL_STEP_ID_RE } from './tool-flags.js';
+import { CHECKER_STEP_ID_RE, DOCKER_ACTION_USES, IMAGE_BUILT_ACTION_USES, PLAIN_REL_RE, RENDERER_INPUTS, rendererInputProblems, SCRUB_STEP_ID_RE, SETUP_STEP_ID_RE, TOOL_STEP_ID_RE } from './tool-flags.js';
 
 export { RenderError };
 export type { RenderOptions };
@@ -30,7 +30,7 @@ export type { RenderOptions };
 export interface RenderContext {
   profile: RepoProfile;
   /** Values only known at render time (6c slots): an image reference, a local URL, an API spec path. Never from the AI. */
-  targets?: { image?: string; url?: string; spec?: string };
+  targets?: { image?: string; url?: string; spec?: string; k8sDir?: string };
 }
 
 /** One step of a job, as pipegen renders it. `usesComment` becomes the trailing `# <version>` comment on `uses:`. */
@@ -41,7 +41,11 @@ export interface RenderedStep {
 }
 
 /** `output`: where the tool's result will be, under `${{ runner.temp }}` (ruling S7); null when the step makes none. */
-export interface RenderResult { steps: RenderedStep[]; output: { path: string; format: OutputFormat } | null }
+export interface RenderResult {
+  steps: RenderedStep[]; output: { path: string; format: OutputFormat } | null;
+  /** The job needs the whole git history (a base ref slot, jscpd): its checkout must use fetch-depth 0 (renderJobPrelude `fetchDepth: '0'`). */
+  fullHistory?: true;
+}
 
 // ---------- shared checks ----------
 
@@ -214,11 +218,19 @@ const PLATFORM_LOCKS: Readonly<Record<string, Readonly<Record<string, string>>>>
 const HELPER_ONLY: ReadonlySet<string> = new Set(Object.keys(RENDERER_INPUTS).filter((k) => k !== 'docker/login-action' && k !== 'docker/build-push-action'));
 
 /**
- * Entries that run a container (their action.yml says `runs.using: docker`). The reviewed list does not carry the image
- * yet (`wrappedImage` is filled in 6c, ruling S13), so until then these `uses` paths are refused (by path, so a renamed copy of an entry is refused too), and any entry that has a
- * `wrappedImage` is a container action by definition. TODO(6c/S13): drop the path list once resolvePin fills wrappedImage.
+ * Container actions (ruling S13), refused by `uses` path (so a renamed copy of an entry is refused too) or because the entry
+ * records a `wrappedImage`: one that builds its image at run time can never be pinned; one that runs a docker image renders
+ * only when its entry records that image and the image is pinned by the digest it recorded (resolvePin reads it from
+ * action.yml at the pinned commit). Returns why not, or null when the action may be rendered.
  */
-const CONTAINER_ACTION_USES: ReadonlySet<string> = new Set(['pypa/gh-action-pypi-publish', 'ossf/scorecard-action']);
+function containerRefusal(tool: ReviewedTool, path: string): string | null {
+  if (IMAGE_BUILT_ACTION_USES.has(path)) return `${show(tool.id)} builds its image from a Dockerfile at run time, so what it runs can not be pinned; it stays refused (a permanent refusal until a pinned replacement exists)`;
+  const w = tool.wrappedImage;
+  if (!DOCKER_ACTION_USES.has(path) && w === undefined) return null;
+  if (w === undefined) return `${show(tool.id)} is a container action (its action.yml runs a docker image) but its entry has no wrappedImage, so what it runs is not pinned`;
+  if (!w.ref.endsWith(`@${w.digest}`)) return `the container action ${show(tool.id)} runs its image by tag (${show(w.ref)}), so whoever controls the tag controls what runs; it stays refused until the image is pinned by digest`;
+  return null;
+}
 
 /** The entry's `uses:` split into its path (lower case, no `@sha`), checked against the entry's own repo and pin. */
 function usesOf(tool: ReviewedTool): { path: string; uses: string } {
@@ -297,7 +309,7 @@ export function renderPlatformStep(key: keyof PlatformActions, platform: Platfor
 
 /**
  * Renders a reviewed tool's step (never an unreviewed one). Throws a RenderError for a spec with problems, a tool whose
- * id or pin differs from the spec's, or a tool that can't be rendered yet (pip without a closure, 6c's rule archives). It
+ * id or pin differs from the spec's, or a tool that can't be rendered yet (pip without a closure, cosign, gosec). It
  * never uploads the output (ruling B3). `platform` supplies the setup actions the npm and pip kinds need.
  */
 export function renderStep(given: StepSpec, tool: ReviewedTool, platform: PlatformActions, ctx: RenderContext): RenderResult {
@@ -322,9 +334,10 @@ export function renderStepWith(given: StepSpec, tool: ReviewedTool, platform: Pl
   if (tool.candidate.kind !== 'action' || tool.step.action === undefined) {
     if (tool.step.cli === undefined) throw new RenderError(`${show(tool.id)} is neither an action nor a cli entry.`);
     const service = spec.service === undefined ? undefined : ctx.profile.services.find((s) => s.name === spec.service);
-    return renderCliTool({ spec, tool, service, hooks: cliHooks(platform), options });
+    return renderCliTool({ spec, tool, service, ctx, hooks: cliHooks(platform), options });
   }
-  if (CONTAINER_ACTION_USES.has(usesOf(tool).path) || tool.wrappedImage !== undefined) throw new RenderError(`not implemented in 6a: container action ${show(tool.id)} (it runs an image the review has not pinned; 6c, ruling S13)`);
+  const container = containerRefusal(tool, usesOf(tool).path);
+  if (container !== null) throw new RenderError(`container action: ${container}.`);
   if (HELPER_ONLY.has(usesOf(tool).path)) throw new RenderError(`${show(tool.id)} is rendered with renderPlatformStep or renderUpload, which supply the inputs it needs.`);
   if (tool.step.output.format !== 'none') throw new RenderError(`not implemented in 6a: an action that writes a result (${show(tool.id)}); its output is moved under runner.temp in 6b.`);
 

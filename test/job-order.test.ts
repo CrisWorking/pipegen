@@ -84,7 +84,7 @@ describe('C2: every rendered step has a recognised id, and a checker is one step
     const g = steps('gitleaks');
     expect(g[0]?.id).toMatch(/^tool-install-[0-9a-f]{16}$/);
     expect(g[1]?.id).toMatch(/^tool-run-[0-9a-f]{16}$/);
-    const z = render('zap-baseline', {}, { policies: { ...ARGV_POLICIES, 'zap-baseline': { ...ARGV_POLICIES['zap-baseline'], needsSlot: undefined } as ArgvPolicy } }).steps;
+    const z = render('zap-baseline', {}, { policies: { ...ARGV_POLICIES, 'zap-baseline': { ...ARGV_POLICIES['zap-baseline'], slots: undefined } as ArgvPolicy } }).steps;
     expect(z[0]?.id).toMatch(/^tool-pull-[0-9a-f]{16}$/);
     expect(z.at(-1)?.id).toMatch(/^tool-run-[0-9a-f]{16}$/);
   });

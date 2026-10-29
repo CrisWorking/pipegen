@@ -46,7 +46,7 @@ import { isRealDate, isReleaseBuild, listPending, PENDING, REVIEWER_RE, reviewMa
 import { expectedPins, loadNpmClosure, NpmClosureError } from './npm-closure.js';
 import { lastValue, parseArgv, type ParsedArgv } from './argv.js';
 import {
-  ACTION_POLICIES, ARGV_POLICIES, BETTERLEAKS_FORBIDDEN_FLAGS, type InputSpec, BETTERLEAKS_FORBIDDEN_SUBCOMMANDS, BETTERLEAKS_SUBCOMMANDS, type ArgvPolicy, type CommandPolicy, type FlagSpec,
+  ACTION_POLICIES, ARGV_POLICIES, DOCKER_ACTION_USES, BETTERLEAKS_FORBIDDEN_FLAGS, type InputSpec, BETTERLEAKS_FORBIDDEN_SUBCOMMANDS, BETTERLEAKS_SUBCOMMANDS, type ArgvPolicy, type CommandPolicy, type FlagSpec,
 } from './tool-flags.js';
 import { BETTERLEAKS_GRAMMAR, NUCLEI_GRAMMAR, TRIVY_GRAMMAR, type FlagGrammar } from './tool-grammar.js';
 import { levenshtein, neverImage, neverListed } from './never-list.js';
@@ -495,6 +495,9 @@ function entryProblems(e: Entry): { message: string; path: (string | number)[] }
         if (!PYPI_UPLOAD_URLS.includes(v) || fx.with?.[k] !== v || stepWith[k] !== v) bad(`pypi-publish's ${k} is fixed to ${PYPI_UPLOAD_URLS.join(' or ')} or not set: another host would get the job's OIDC token and could publish as you (ruling P22)`, 'fixedInputs', 'with', k);
       }
     }
+  }
+  if (e.wrappedImage === undefined && c.kind === 'action' && e.step.action !== undefined && DOCKER_ACTION_USES.has(e.step.action.uses.slice(0, e.step.action.uses.lastIndexOf('@')).toLowerCase())) {
+    bad('this action runs a docker image (runs.using: docker), so the entry must record it in wrappedImage (ruling S13)', 'wrappedImage');
   }
   if (e.wrappedImage !== undefined) {
     if (c.kind !== 'action') bad('wrappedImage is for actions (the image their action.yml runs)', 'wrappedImage');

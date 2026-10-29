@@ -34,6 +34,7 @@
 // spent budget a PinError whose cause is that error; isRateStop (github-rate.ts) recognises both.
 import { createHash } from 'node:crypto';
 import type { Octokit } from '@octokit/rest';
+import { parse as parseYaml } from 'yaml';
 import { z } from 'zod';
 import { safeText } from '../util/safe-text.js';
 import type { Candidate, InstallSpec, ReviewedTool } from '../types.js';
@@ -135,6 +136,11 @@ const SIDE_FILE_RE = /\.(?:sha256|sha256sum|sha512|sha512sum|md5|sig|asc|pem|cer
 /** A checksums file covering several assets: checksums.txt, tool_1.0_checksums.txt, SHA256SUMS. */
 const COMBINED_SUMS_RE = /(?:^|[._-])(?:checksums|sha256sums?)(?:\.txt)?$/i;
 
+const contentsSchema = z.object({ type: z.literal('file'), encoding: z.literal('base64'), content: z.string(), size: z.number() });
+/** The image an action's action.yml runs (`runs.using: docker`), by digest (ruling S13). */
+export interface WrappedImage { ref: string; digest: string }
+/** action.yml bigger than this is refused (a real one is a few KiB). */
+const MAX_ACTION_YML = 100_000;
 const refSchema = z.object({ ref: z.string(), object: z.object({ type: z.string(), sha: z.string() }) });
 const tagObjectSchema = z.object({ object: z.object({ type: z.string(), sha: z.string() }) });
 const assetSchema = z.object({ name: z.string(), size: z.number().int().nonnegative(), updated_at: z.string().nullish(), digest: z.string().nullish() });
@@ -191,7 +197,7 @@ function readDate(s: unknown): number | null {
  * (discovery, memory, `reviewed: false`) gets a new pin, whatever pin it carries (cooldown applies).
  * Throws PinError (or GitHubRateLimitError) when the pin can't be made safely.
  */
-export async function resolvePin(c: Candidate, deps: PinDeps, install?: InstallSpec): Promise<Candidate> {
+export async function resolvePin(c: Candidate, deps: PinDeps, install?: InstallSpec, options: { readActionImage?: boolean } = {}): Promise<Candidate & { wrappedImage?: WrappedImage }> {
   const now = () => (deps.now ?? Date.now)();
   const note = (text: string) => { deps.notes.push(safeText(text, 400)); };
   /** Every new pin is flagged for a human: nothing pipegen pins by itself runs until it is reviewed. */
@@ -205,7 +211,12 @@ export async function resolvePin(c: Candidate, deps: PinDeps, install?: InstallS
       throw new PinError(`The stored hash for ${safeText(String(install?.package), 120)} and its pin disagree.`);
     }
   }
-  if (c.kind === 'action') return pinAction();
+  if (c.kind === 'action') {
+    const pinned = await pinAction();
+    if (options.readActionImage !== true) return pinned;
+    const image = await actionImage(pinned);
+    return image === undefined ? pinned : { ...pinned, wrappedImage: image };
+  }
   if (c.kind === 'docker' || install?.method === 'docker') return pinImage();
   if (c.kind !== 'cli') throw new PinError(`pipegen can't pin a tool of kind "${safeText(String(c.kind), 40)}".`);
   if (install?.method === 'npm') return pinNpm(install);
@@ -214,6 +225,42 @@ export async function resolvePin(c: Candidate, deps: PinDeps, install?: InstallS
   throw new PinError(`pipegen can't pin a tool installed with "${safeText(String(install.method), 40)}".`);
 
   // ---------- GitHub Actions ----------
+
+  /**
+   * What the action's own action.yml runs, read at the pinned commit (ruling S13): an image for `runs.using: docker`, only
+   * when it is `docker://<image>@sha256:<digest>`. A Dockerfile-built action, an image by tag, an image from another
+   * registry, a file that is not what it should be, or no action file at all fails closed. node and composite actions
+   * run no image of their own: undefined.
+   */
+  async function actionImage(pinned: Candidate): Promise<WrappedImage | undefined> {
+    const repo = checkRepo(pinned.repo);
+    const sha = pinned.pin.sha;
+    if (sha === undefined || !COMMIT_SHA_RE.test(sha)) throw new PinError(`${repo} has no pinned commit to read its action.yml at.`);
+    const gh = github(repo);
+    let text: string | null = null;
+    for (const name of ['action.yml', 'action.yaml']) {
+      text = await gh.fileText(name, sha);
+      if (text !== null) break;
+    }
+    if (text === null) throw new PinError(`${repo} has no action.yml at ${sha}, so pipegen can't tell what the action runs.`);
+    let doc: unknown;
+    try {
+      doc = parseYaml(text, { maxAliasCount: 20 });
+    } catch {
+      throw new PinError(`The action.yml of ${repo} isn't valid YAML.`);
+    }
+    const runs = typeof doc === 'object' && doc !== null && !Array.isArray(doc) ? (doc as Record<string, unknown>).runs : undefined;
+    if (typeof runs !== 'object' || runs === null || Array.isArray(runs)) throw new PinError(`The action.yml of ${repo} has no runs section.`);
+    const using = (runs as Record<string, unknown>).using;
+    if (using === 'composite' || (typeof using === 'string' && /^node\d{1,3}$/.test(using))) return undefined;
+    if (using !== 'docker') throw new PinError(`The action.yml of ${repo} runs with "${safeText(String(using), 40)}", which pipegen doesn't know.`);
+    const image = (runs as Record<string, unknown>).image;
+    const m = typeof image === 'string' ? /^docker:\/\/([^@]{1,255})@(sha256:[0-9a-f]{64})$/.exec(image) : null;
+    if (m === null || parseImageRef(m[1]) === null) {
+      throw new PinError(`${repo} runs ${typeof image === 'string' && image.startsWith('docker://') ? 'an image that is not pinned by digest, or from a registry pipegen does not use' : 'an image built from a Dockerfile at run time'}, so pipegen can't pin what it runs.`);
+    }
+    return { ref: `${m[1] as string}@${m[2] as string}`, digest: m[2] as string };
+  }
 
   async function pinAction(): Promise<Candidate> {
     const repo = checkRepo(c.repo);
@@ -471,6 +518,13 @@ export async function resolvePin(c: Candidate, deps: PinDeps, install?: InstallS
         const r = await call('the latest release', () => deps.gh.rest.repos.getLatestRelease({ owner, repo: name }), releaseSchema);
         if (r === null) throw new PinError(`${repo} has no published release to pin.`);
         return r;
+      },
+      /** The text of one file of the repo at a commit, or null when there is none. A folder, a big file or another encoding is refused. */
+      fileText: async (path: string, ref: string): Promise<string | null> => {
+        const r = await call(`the file ${path}`, () => deps.gh.request('GET /repos/{owner}/{repo}/contents/{path}', { owner, repo: name, path, ref }), contentsSchema);
+        if (r === null) return null;
+        if (r.size > MAX_ACTION_YML || r.content.length > MAX_ACTION_YML * 2) throw new PinError(`The file ${path} of ${repo} is too large to read.`);
+        return Buffer.from(r.content, 'base64').toString('utf8');
       },
       releaseByTag: (tag: string) => call(`the release ${tag}`, () => deps.gh.rest.repos.getReleaseByTag({ owner, repo: name, tag }), releaseSchema),
       /** Where a tag leads, from the repo's own refs (annotated tags dereferenced, at most MAX_TAG_DEPTH deep). */
