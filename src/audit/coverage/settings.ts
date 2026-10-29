@@ -169,6 +169,7 @@ export function minimumState(tool: ToolSignature, all: readonly string[]): 'set'
 export function commandReason(tool: ToolSignature, words: readonly string[]): Reason | null {
   const { ws, spec } = flagView(tool, words);
   if ((tool.softFlags ?? []).some((f) => flagGiven(spec(f), ws))) return 'soft';
+  if (filteredByFlag(tool, ws, spec)) return 'needs-inputs';
   if (tool.commandFails === 'never') {
     const m = minimumState(tool, ws);
     return m === 'set' ? null : m === 'off' ? 'soft' : 'never';
@@ -273,6 +274,7 @@ export function actionReason(tool: ToolSignature, w: Inputs): Reason | null {
   if (inputsCrowded(tool, w, ARGS_INPUTS) || ARGS_INPUTS.some((name) => inputWordsCapped(w, name))) return 'inputs';
   const args = ARGS_INPUTS.flatMap((name) => inputWords(w, name));
   if (softInputGiven(tool.softInputs, w) || inputSetOtherwise(tool.softUnless, w) || (tool.softFlags ?? []).some((f) => flagGiven(f, args))) return 'soft';
+  if (filteredByInput(tool, w) || filteredByFlag(tool, args, (f) => f)) return 'needs-inputs';
   if (tool.actionFails === 'never') return 'never';
   if (tool.actionFails === 'input' && !failInputGiven(tool.failInputs, w)) return 'no-fail';
   return null;
@@ -403,9 +405,37 @@ export function flagsAllow(tool: ToolSignature, args: readonly string[], complet
     && (tool.onlyWithFlagValue?.flag === undefined || flagValueAllows(tool.onlyWithFlagValue, lastFlagValue(spec(tool.onlyWithFlagValue.flag), ws), complete));
 }
 
+/** DoD G11: a partialWithFlagValue value that leaves the needed word out (or can't be read: null, an expression). */
+const filteredValue = (rule: NonNullable<ToolSignature['partialWithFlagValue']>, v: string | null) =>
+  v === null || v.includes('${{') || !v.toLowerCase().split(',').some((x) => x.trim() === rule.unlessContains);
+
+/** DoD G11: one of partialWithFlagValue's flags is given with a value that filters the check (the last one of each wins). */
+function filteredByFlag(tool: ToolSignature, ws: readonly string[], spec: (f: string) => string): boolean {
+  const rule = tool.partialWithFlagValue;
+  if (rule?.flags === undefined) return false;
+  return rule.flags.some((f) => {
+    const v = lastFlagValue(spec(f), ws);
+    return v !== undefined && filteredValue(rule, v);
+  });
+}
+
+/** DoD G11: the action's partialWithFlagValue input is set (any spelling, crowded, or an expression) to a filtering value. */
+function filteredByInput(tool: ToolSignature, w: Inputs): boolean {
+  const rule = tool.partialWithFlagValue;
+  if (rule?.input === undefined) return false;
+  const name = rule.input.toLowerCase();
+  if (w.crowded.has(name)) return true;
+  return (w.byName.get(name) ?? []).some((v) => {
+    if (v === null || v === undefined) return false;
+    const t = inputText(v);
+    return t === null ? true : t !== '' && filteredValue(rule, t);
+  });
+}
+
 export const foundOf = (tool: ToolSignature, dir: string | null, reason: Reason | null, configOff = false): Found => ({
   categories: tool.categories, by: tool.id, subject: `The ${tool.id} check`, dir, reason,
-  ...(tool.partialWhy === undefined ? {} : { partialWhy: tool.partialWhy }),
+  ...(reason === 'needs-inputs' && tool.partialWithFlagValue !== undefined ? { partialWhy: tool.partialWithFlagValue.why }
+    : tool.partialWhy === undefined ? {} : { partialWhy: tool.partialWhy }),
   ...(tool.softEnv === undefined ? {} : { softEnv: tool.softEnv }),
   ...(tool.configFiles === undefined || configOff ? {} : { configFiles: tool.configFiles }),
 });

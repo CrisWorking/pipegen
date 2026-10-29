@@ -2037,6 +2037,37 @@ describe('mapCoverage (Plan P Task 3)', () => {
     expect((await rowOf(ciUses('actions/dependency-review-action@v5', '          config-file: ./.github/dr.yml\n'), 'merge', 'dependency-review')).status).toBe('partial');
   });
 
+  // DoD G11 (reviews/dod/2026-10-29/g11-licences.md): Trivy files every licence it can't classify under UNKNOWN, so
+  // `--severity HIGH,CRITICAL` hides them all and exits 0; and pnpm-lock.yaml, bun.lock, uv.lock, requirements files and
+  // go.mod give no licence data unless the packages are installed first (uv.lock never, in Trivy 0.76.0).
+  it('coverage: a Trivy licence scan filtered to severities without UNKNOWN is partial, saying why (DoD G11)', async () => {
+    neverOff.on = true;
+    const pr = (cmd: string) => `on: pull_request\n${job(run(cmd))}`;
+    const filtered = await rowOf(pr('trivy fs --scanners license --severity HIGH,CRITICAL --exit-code 1 .'), 'merge', 'licences');
+    expect(filtered).toMatchObject({ status: 'partial', by: 'trivy-license' });
+    expect(filtered.why).toMatch(/UNKNOWN/);
+    expect((await rowOf(pr('trivy fs --scanners license --severity=CRITICAL --exit-code 1 .'), 'merge', 'licences')).status).toBe('partial');
+    expect((await rowOf(pr('trivy fs --scanners license -s HIGH,CRITICAL --exit-code 1 .'), 'merge', 'licences')).status).toBe('partial');
+    expect((await rowOf(pr('trivy fs --scanners license --severity UNKNOWN,HIGH,CRITICAL --exit-code 1 .'), 'merge', 'licences')).status).toBe('covered');
+    // the action: its severity input, and TRIVY_SEVERITY in the job
+    const act = (withLines: string) => `on: pull_request\n${job(`      - uses: aquasecurity/trivy-action@76071ef0d7ec797419534a183b498b4d6366cf37\n        with:\n          scan-type: fs\n          scanners: license\n          exit-code: '1'\n${withLines}`)}`;
+    expect((await rowOf(act(''), 'merge', 'licences')).status).toBe('covered');
+    expect((await rowOf(act("          severity: 'HIGH,CRITICAL'\n"), 'merge', 'licences')).status).toBe('partial');
+    expect((await rowOf(`on: pull_request\n${job(run('trivy fs --scanners license --exit-code 1 .'), '    env:\n      TRIVY_SEVERITY: HIGH,CRITICAL\n')}`, 'merge', 'licences')).status).toBe('partial');
+  });
+
+  it('coverage: a Trivy licence scan over a lockfile that holds no licences without an install is partial (DoD G11)', async () => {
+    neverOff.on = true;
+    const body = `on: pull_request\n${job(run('trivy fs --scanners license --exit-code 1 .'))}`;
+    for (const packageManager of ['pnpm', 'bun', 'uv', 'pip'] as const) {
+      const r = await rowOf(body, 'merge', 'licences', { services: [svc('.', { packageManager, language: packageManager === 'uv' || packageManager === 'pip' ? 'python' : 'node' })] });
+      expect(r.status, packageManager).toBe('partial');
+      expect(r.why, packageManager).toMatch(/installed/);
+    }
+    // npm's package-lock.json carries the licences itself: covered
+    expect((await rowOf(body, 'merge', 'licences')).status).toBe('covered');
+  });
+
   it('coverage: trivy fs --scanners vuln,license --exit-code 1 on pull_request → licences covered; without license → missing', async () => {
     neverOff.on = true; // trivy-action as the vehicle for the input rules (P33)
     const pr = (cmd: string) => `on: pull_request\n${job(run(cmd))}`;

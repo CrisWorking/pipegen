@@ -58,6 +58,10 @@
 #                 path); one that names neither is partial.
 #   onlyWithFlags is matched like notWithFlags from Plan P Task 3 on (`--cov` also matches `--cov=pkg`), and a value
 #                 that reads as false (false, 0, null, no, off, empty) never counts.
+# DoD run fields (2026-10-29):
+#   partialWithFlagValue { flags, input, unlessContains, why }: a run is partial with `why` when one of `flags` (or the
+#                 action's `input`) is given with a value whose comma-split words don't include `unlessContains` (any
+#                 letter case); a flag without a value, an expression or crowded spellings count as such a value.
 # Every entry has actions, commands, reusableWorkflows or a mix. Where an entry sets commandFails, actionFails,
 # failFlags, softFlags, failInputs, softInputs or softUnless, that behaviour was checked on 2026-10-27 against the
 # source or docs named in the comment above it (fetched with curl). An entry with no such comment uses the plain
@@ -358,9 +362,18 @@ tools:
     actions: [aquasecurity/trivy-action]
     commands: [trivy fs, trivy filesystem, trivy repo, trivy repository, trivy rootfs, trivy image, trivy i]
     onlyWithFlagValue: { flag: --scanners, input: scanners, contains: license }
+    # DoD G11 (reviews/dod/2026-10-29/g11-licences.md, Trivy 0.76.0): a licence Trivy can't classify gets the UNKNOWN
+    # severity, so a --severity / -s / `severity:` list without UNKNOWN hides every one and the run exits 0
+    # (https://github.com/aquasecurity/trivy/blob/main/docs/guide/scanner/license.md, "Severity"; the default is every
+    # severity). TRIVY_SEVERITY does the same from the environment.
+    partialWithFlagValue:
+      flags: [--severity, -s]
+      input: severity
+      unlessContains: unknown
+      why: The Trivy licence scan here reports only some severities, and Trivy files every licence it can't classify as UNKNOWN, so those never fail the run.
     commandFails: flag
     notWithFlags: [--download-db-only, --download-java-db-only]
-    softEnv: [TRIVY_EXIT_CODE, TRIVY_SCANNERS, TRIVY_DOWNLOAD_DB_ONLY, TRIVY_DOWNLOAD_JAVA_DB_ONLY, TRIVY_CONFIG]
+    softEnv: [TRIVY_EXIT_CODE, TRIVY_SCANNERS, TRIVY_DOWNLOAD_DB_ONLY, TRIVY_DOWNLOAD_JAVA_DB_ONLY, TRIVY_CONFIG, TRIVY_SEVERITY]
     configFiles: [trivy.yaml]
     configFlag: --config
     failFlags: [--exit-code]

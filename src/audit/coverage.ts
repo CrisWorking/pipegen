@@ -31,6 +31,8 @@
 //   row that would be missing is unknown when the repo has more services (MAX_SERVICES) or more distinct run dirs
 //   (MAX_HIT_DIRS) than pipegen matches; a cap only drops runs, so it never makes a row covered.
 // - missing: nothing matches. `gate` and `deploy-verify` are always missing: they are pipegen's own checks.
+// DoD G11: a Trivy licence scan filtered to severities without UNKNOWN (partialWithFlagValue), or over a lockfile that
+//   holds no licences without an install (pnpm, bun, uv, pip, go), is at most partial.
 // DoD run 2026-10-29 (fastapi): a repo shell script file run as a command (`bash scripts/test.sh`, `./ci.sh`; a plain
 //   relative `.sh` path, no `..`) is read like a step (no -e unless it sets it, in the caller's folder) and followed
 //   like an own package script: its tests, lint, format, type-check, coverage and dead-code runs count under "your own
@@ -256,7 +258,25 @@ export async function mapCoverage(p: RepoProfile, needs: Need[], dir: string, op
     } else rows.push(ciCoverage(need, need.layer, d));
   }
   // PS22: the last steps, so the chooser reads the adjusted row
-  return unsupportedStack(noLockfile(frameworkAdjust(versionAdjust(rows, p), p), p), p);
+  return unsupportedStack(licenceInstall(noLockfile(frameworkAdjust(versionAdjust(rows, p), p), p), p), p);
+}
+
+/**
+ * DoD G11 (reviews/dod/2026-10-29/g11-licences.md, Trivy 0.76.0): the lockfiles Trivy's licence scan reads no licence
+ * from unless the packages are installed first: pnpm-lock.yaml, bun.lock, requirements files (pip, and only with the
+ * venv's python on PATH), go.mod (an empty module cache), and uv.lock, which gives none even then. npm's
+ * package-lock.json carries the licences itself. yarn and poetry weren't measured, so they keep the old answer.
+ */
+const NO_LICENCE_WITHOUT_INSTALL: ReadonlySet<string> = new Set(['pnpm', 'bun', 'uv', 'pip']);
+const LICENCE_INSTALL_WHY = "The Trivy licence scan reads no licences from pnpm-lock.yaml, bun.lock, uv.lock, requirements files or go.mod unless the packages are installed first (uv.lock not even then), and pipegen doesn't check for an install step before it, so a clean run may have checked nothing.";
+/** DoD G11: a Trivy licence scan over such a lockfile is at most partial (pipegen can't see whether an install comes first). */
+function licenceInstall(rows: Coverage[], p: RepoProfile): Coverage[] {
+  const blind = (s: RepoProfile['services'][number]) => (s.packageManager !== undefined && NO_LICENCE_WITHOUT_INSTALL.has(s.packageManager)) || s.language === 'go';
+  return rows.map((r) => {
+    if (r.need.category !== 'licences' || r.status !== 'covered' || r.by !== 'trivy-license') return r;
+    const scope = r.need.service === undefined ? p.services : p.services.filter((s) => s.name === r.need.service);
+    return scope.some(blind) ? { ...r, status: 'partial', why: LICENCE_INSTALL_WHY } : r;
+  });
 }
 
 /**

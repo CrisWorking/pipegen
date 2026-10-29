@@ -117,6 +117,18 @@ const signatureSchema = z.strictObject({
    */
   onlyWithInputs: inputs.optional(),
   /**
+   * DoD G11 (2026-10-29): a run that filters what it reports so the check can't see everything it should (Trivy's
+   * `--severity HIGH,CRITICAL` hides every UNKNOWN licence) is partial with `why`: one of `flags` (or the action's
+   * `input`) given with a value whose comma-split words don't include `unlessContains` (any letter case). A flag without
+   * a value, an expression or more spellings than pipegen reads count as filtered too.
+   */
+  partialWithFlagValue: z.strictObject({
+    flags: z.array(z.string().regex(FLAG_NAME_RE)).min(1).optional(),
+    input: z.string().regex(INPUT_RE).optional(),
+    unlessContains: z.string().regex(/^[a-z0-9._-]{1,32}$/),
+    why,
+  }).refine((v) => v.flags !== undefined || v.input !== undefined, 'needs flags or input').optional(),
+  /**
    * Plan P Task 3 (ruling R4, PS16): who can use the action. `public`: public repos only; `public-or-code-security`:
    * public repos, and organisation-owned private repos with code scanning. Elsewhere a run is partial with
    * `unavailableWhy`.
