@@ -109,7 +109,7 @@ export class Reader {
     const [root, real] = await Promise.all([this.rootReal, realpath(abs).catch(() => null)]);
     if (root === null || real === null) return { fail: 'unreadable' };
     if (!real.startsWith(root + sep)) return { fail: 'outside' };
-    const read = await readTextLimitedWithReason(abs);
+    const read = await readTextLimitedWithReason(abs, this.dir);
     return 'text' in read ? { ok: read.text } : { fail: 'unreadable' };
   }
 }

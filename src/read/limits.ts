@@ -1,6 +1,6 @@
 import { constants } from 'node:fs';
 import { lstat, open, type FileHandle } from 'node:fs/promises';
-import { join } from 'node:path';
+import { isAbsolute, join, relative, sep } from 'node:path';
 import fg from 'fast-glob';
 import { isMap, isPair, isScalar, isSeq, parseDocument } from 'yaml';
 
@@ -101,15 +101,36 @@ const OPEN_CHECKED = constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0) | (constan
 /** True for the error an O_NOFOLLOW open gives on a symbolic link (ELOOP; EMLINK on FreeBSD). */
 const isLinkRefusal = (e: unknown): boolean => ['ELOOP', 'EMLINK'].includes(String((e as { code?: unknown } | null)?.code));
 
+/** True when the stats describe the same file (device and inode). */
+const sameFile = (a: { dev: number | bigint; ino: number | bigint }, b: { dev: number | bigint; ino: number | bigint }): boolean => a.dev === b.dev && a.ino === b.ino;
+
+/**
+ * `path` as a relative path under `root` (forward slashes), or null when it isn't under it. Used for the component check.
+ */
+function under(root: string, path: string): string | null {
+  const rel = relative(root, path).split(sep).join('/');
+  return rel === '' || rel === '..' || rel.startsWith('../') || isAbsolute(rel) ? null : rel;
+}
+
 /**
  * Like readTextLimited, but says why a file was skipped. lstat gives the reason first; then the file is opened without
  * following a symbolic link and without blocking (OPEN_CHECKED), the opened descriptor is checked again with fstat
  * (regular file, size), and at most maxFileBytes + 1 bytes are read from it. So a file swapped after the lstat check
  * (for a FIFO, a symlink, a bigger file) is skipped for the same reasons, and the read can't block or grow unbounded.
+ *
+ * P46: the descriptor must also be the file that lstat described (same device and inode), so a swap of the last
+ * component between lstat and open is refused. With `root` (the repo folder the caller read `path` from), no level of
+ * `path` under it may be a symbolic link, checked before the lstat and again after the open, and the file reached
+ * through those checked folders after the open must be the opened one: a folder swapped for a link to somewhere else
+ * between the checks and the open is refused (the open would have followed it to another file). Such a swap is
+ * reported as `link` when a level is a link at the second check, else as `unreadable`.
  */
-export async function readTextLimitedWithReason(path: string): Promise<{ text: string } | { skipped: Skipped }> {
+export async function readTextLimitedWithReason(path: string, root?: string): Promise<{ text: string } | { skipped: Skipped }> {
   let handle: FileHandle | undefined;
   try {
+    const rel = root === undefined ? null : under(root, path);
+    if (root !== undefined && rel === null) return { skipped: 'unreadable' };
+    if (root !== undefined && rel !== null && (await linkedLevel(root, rel)) !== null) return { skipped: 'link' };
     const info = await lstat(path);
     if (info.isSymbolicLink()) return { skipped: 'link' };
     if (!info.isFile()) return { skipped: 'not-a-file' };
@@ -123,6 +144,12 @@ export async function readTextLimitedWithReason(path: string): Promise<{ text: s
     const opened = await handle.stat();
     if (!opened.isFile()) return { skipped: 'not-a-file' };
     if (opened.size > READ_LIMITS.maxFileBytes) return { skipped: 'too-large' };
+    if (!sameFile(opened, info)) return { skipped: 'unreadable' };
+    if (root !== undefined && rel !== null) {
+      if ((await linkedLevel(root, rel)) !== null) return { skipped: 'link' };
+      const again = await lstat(path);
+      if (!sameFile(opened, again)) return { skipped: 'unreadable' };
+    }
     const buf = await readAtMost(handle, opened.size, READ_LIMITS.maxFileBytes + 1);
     if (buf.length > READ_LIMITS.maxFileBytes) return { skipped: 'too-large' };
     return isBinary(buf) ? { skipped: 'binary' } : { text: buf.toString('utf8') };
@@ -154,8 +181,8 @@ async function readAtMost(handle: FileHandle, expected: number, limit: number): 
 }
 
 /** Text of a regular file, or null when it is missing, unreadable, a symlink, over 1 MB, or binary. */
-export async function readTextLimited(path: string): Promise<string | null> {
-  const result = await readTextLimitedWithReason(path);
+export async function readTextLimited(path: string, root?: string): Promise<string | null> {
+  const result = await readTextLimitedWithReason(path, root);
   return 'text' in result ? result.text : null;
 }
 

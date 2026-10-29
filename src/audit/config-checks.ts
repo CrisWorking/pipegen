@@ -58,7 +58,7 @@ async function readAt(dir: string, rel: string): Promise<Read> {
   if ((await linkedLevel(dir, rel)) !== null) return { skipped: 'link' };
   const info = await lstat(join(dir, rel)).catch(() => null);
   if (info === null) return null;
-  return readTextLimitedWithReason(join(dir, rel));
+  return readTextLimitedWithReason(join(dir, rel), dir);
 }
 
 /** A folder that came from a workflow: a clean relative path that stays inside the repo, else null. */

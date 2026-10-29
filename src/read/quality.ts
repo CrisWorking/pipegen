@@ -123,7 +123,7 @@ async function readRel(run: QualityRun, rel: string, notes: string[]): Promise<s
     note(notes, `Skipped ${safeText(linked, PATH_SHOWN_MAX)}: ${SKIP_REASON.link}.`);
     return null;
   }
-  const result = await readTextLimitedWithReason(joinOs(run.root, rel));
+  const result = await readTextLimitedWithReason(joinOs(run.root, rel), run.root);
   if ('text' in result) return result.text;
   note(notes, `Skipped ${safeText(rel, PATH_SHOWN_MAX)}: ${SKIP_REASON[result.skipped]}.`);
   return null;

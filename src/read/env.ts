@@ -63,7 +63,7 @@ const isPostgresUrl = (v: unknown): boolean => typeof v === 'string' && regexSaf
  * closing quote). A file that ends inside an open quote just stops. The value itself is never kept.
  */
 async function envFileNames(root: string, rel: string, names: Set<string>, pgUrl: string[]): Promise<void> {
-  const text = await readTextLimited(joinOs(root, rel));
+  const text = await readTextLimited(joinOs(root, rel), root);
   let open: string | null = null;
   for (const line of text === null ? [] : text.split(/\r?\n/)) {
     if (open !== null) {
@@ -102,7 +102,7 @@ function buildsHere(composeDir: string, build: unknown, servicePath: string): bo
 
 /** Keys of `environment:` for the compose services that build this service (by build context; by name only when the compose service has no build). */
 async function composeNames(root: string, composeRel: string, service: Pick<Service, 'path' | 'name'>, names: Set<string>, pgUrl: string[]): Promise<void> {
-  const text = await readTextLimited(joinOs(root, composeRel));
+  const text = await readTextLimited(joinOs(root, composeRel), root);
   if (text === null) return;
   let doc: unknown;
   try { doc = parseYamlLimited(text); } catch { return; }
@@ -177,10 +177,10 @@ export async function readEnv(dir: string, service: Pick<Service, 'path' | 'name
   const found: Found[] = [];
   for (const rel of rels) {
     if (baseOf(rel) === 'schema.prisma') {
-      const text = await readTextLimited(joinOs(dir, rel));
+      const text = await readTextLimited(joinOs(dir, rel), dir);
       if (text !== null && prismaPostgres(text)) found.push({ kind: 'postgres', name: 'postgres', evidence: `${rel}: datasource provider postgresql`, keywords: KIND_KEYWORDS.postgres });
     } else if (!isTestFile(relToBase(rel))) {
-      const text = await readTextLimited(joinOs(dir, rel));
+      const text = await readTextLimited(joinOs(dir, rel), dir);
       if (text !== null) codeNames(text, names);
     }
   }

@@ -3,7 +3,7 @@
 // follows; or by a bigger file). The swap is simulated by an lstat that still describes the file as it was checked: a
 // small regular file. What is read must be judged on the opened descriptor, so none of these is read as text.
 import { execFileSync } from 'node:child_process';
-import { symlinkSync, writeFileSync } from 'node:fs';
+import { mkdirSync, symlinkSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { READ_LIMITS, readLinesLimited, readTextLimitedWithReason } from '../src/read/limits.js';
@@ -62,6 +62,35 @@ describe.skipIf(process.platform === 'win32')('limited readers: a file swapped a
     writeFileSync(big, 'a'.repeat(READ_LIMITS.maxFileBytes + 1));
     swappedIn(dir, big);
     expect(await readTextLimitedWithReason(big)).toEqual({ skipped: 'too-large' });
+  });
+
+  it('P46: a folder swapped for a link to elsewhere after the checks is refused (with the repo root given)', async () => {
+    const root = makeTempDir();
+    const outside = makeTempDir();
+    writeFileSync(join(outside, 'f.txt'), 'OUTSIDE SECRET\n');
+    // on disk `sub` is a link to the outside folder; lstat still answers as at the check: `sub` a real folder, `sub/f.txt`
+    // a small regular file of the repo
+    symlinkSync(outside, join(root, 'sub'));
+    const realDir = join(root, 'real');
+    mkdirSync(realDir);
+    swapped.paths.set(join(root, 'sub'), realDir);
+    swappedIn(root, join(root, 'sub', 'f.txt'));
+    const r = await readTextLimitedWithReason(join(root, 'sub', 'f.txt'), root);
+    expect(r).not.toHaveProperty('text');
+    expect(r).toEqual({ skipped: 'unreadable' }); // the opened file is not the one lstat described
+    // the last component swapped between lstat and open is refused even without a root
+    expect(await readTextLimitedWithReason(join(root, 'sub', 'f.txt'))).toEqual({ skipped: 'unreadable' });
+  });
+
+  it('P46: with the root given, a link at any level is a link (no swap needed); a path outside the root is unreadable', async () => {
+    const root = makeTempDir();
+    const outside = makeTempDir();
+    writeFileSync(join(outside, 'f.txt'), 'OUTSIDE\n');
+    symlinkSync(outside, join(root, 'sub'));
+    expect(await readTextLimitedWithReason(join(root, 'sub', 'f.txt'), root)).toEqual({ skipped: 'link' });
+    expect(await readTextLimitedWithReason(join(outside, 'f.txt'), root)).toEqual({ skipped: 'unreadable' });
+    writeFileSync(join(root, 'ok.txt'), 'fine\n');
+    expect(await readTextLimitedWithReason(join(root, 'ok.txt'), root)).toEqual({ text: 'fine\n' });
   });
 
   it('a regular file not swapped reads as before', async () => {

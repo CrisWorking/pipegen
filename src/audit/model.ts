@@ -594,7 +594,7 @@ async function scanTree(dir: string, notes: Notes): Promise<SecretInTree[]> {
       stopped = true;
       continue;
     }
-    const read = await readTextLimitedWithReason(abs);
+    const read = await readTextLimitedWithReason(abs, dir);
     if (!('text' in read)) {
       if (read.skipped === 'unreadable') unreadable++;
       continue;

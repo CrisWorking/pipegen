@@ -72,7 +72,7 @@ function uniqueServiceNames(ctx: Ctx, services: Service[]): void {
 /** Reads a listed file through the read limits; a skipped file is noted in plain English. */
 async function readFile(ctx: Ctx, rel: string): Promise<string | null> {
   if (!ctx.fileSet.has(rel)) return null;
-  const result = await readTextLimitedWithReason(joinOs(ctx.root, rel));
+  const result = await readTextLimitedWithReason(joinOs(ctx.root, rel), ctx.root);
   if ('text' in result) return result.text;
   note(ctx, `Skipped ${safeText(rel, PATH_SHOWN_MAX)}: ${SKIP_REASON[result.skipped]}.`);
   return null;
@@ -99,7 +99,7 @@ async function readOrigin(root: string): Promise<{ owner: string; repo: string }
   if (gitInfo === null) throw new NotGitHubRepoError('This folder is not a git repository (no .git folder found).');
   if (gitInfo.isSymbolicLink()) throw new NotGitHubRepoError('.git is a symbolic link; refusing to follow it.');
   if (gitInfo.isFile()) throw new NotGitHubRepoError('.git is a file, so this is a git worktree or submodule; run pipegen from the main checkout.');
-  const config = await readTextLimitedWithReason(joinOs(gitDir, 'config'));
+  const config = await readTextLimitedWithReason(joinOs(gitDir, 'config'), root);
   if (!('text' in config)) throw new NotGitHubRepoError('.git/config is missing or is not a regular text file, so pipegen cannot read the remote.');
   let inOrigin = false;
   let url: string | undefined;

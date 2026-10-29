@@ -166,7 +166,7 @@ export async function readWorkflows(dir: string, files?: string[], notes: string
       note(`Skipped ${safeText(path, PATH_SHOWN_MAX)}: its file name has control or invisible characters, or is too long.`);
       continue;
     }
-    const read = await readTextLimitedWithReason(join(dir, path));
+    const read = await readTextLimitedWithReason(join(dir, path), dir);
     if (!('text' in read)) {
       note(`Skipped ${safeText(path, PATH_SHOWN_MAX)}: ${SKIP_REASON[read.skipped]}.`);
       continue;

@@ -1259,7 +1259,7 @@ export async function bundleCode(dir: string, opts: BundleOptions = {}): Promise
     if (!info.isFile()) { skipped['not-a-file'].push(path); continue; }
     const real = await realpath(abs).catch(() => null);
     if (real === null || !insideDir(realRoot, real)) { skipped.outside.push(path); continue; }
-    const result = await readTextLimitedWithReason(abs);
+    const result = await readTextLimitedWithReason(abs, dir);
     if (!('text' in result)) {
       (result.skipped === 'link' ? links : skipped[result.skipped]).push(path);
       continue;
