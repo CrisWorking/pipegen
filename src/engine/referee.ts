@@ -19,14 +19,15 @@
 // - Order (S6 c): the renderer's own checkJobOrder runs over every parsed job; a run step not recognised by content counts
 //   as repo code whatever its id says.
 // - The gate's check name comes from GATE_CHECK_NAME; the blocking rule (B7) demotes a findings check whose tool writes no
-//   SARIF; findSecretLike runs over every file (S18). The workflow linters (actionlint, zizmor) are 7b's: they are called
-//   through `deps.runLinters`, and without one the referee reports that they did not run.
+//   SARIF; findSecretLike runs over every file (S18). The workflow linters (actionlint, zizmor) run through `deps.runLinters`
+//   (default: linters.ts runLinters, 7b), which tests replace with a stub.
 import { isDeepStrictEqual } from 'node:util';
 import { isAlias, isMap, isScalar, isSeq, LineCounter, parseAllDocuments, visit, type Document, type Node as YamlNode, type Pair } from 'yaml';
 import { findSecretLike } from '../ai/redact.js';
 import { safeText } from '../util/safe-text.js';
 import { GATE_CHECK_NAME, type CreatedFile, type PipegenInserted, type PipelineDraft, type ReviewedTool, type StepSpec } from '../types.js';
 import { ArtifactNameError, slug } from './artifact-names.js';
+import { runLinters } from './linters.js';
 import { COMMIT_SHA_RE } from './names.js';
 import { NEED_ID_CATEGORY } from './need-ids.js';
 import { PLATFORM_ACTION_IDS, type PlatformActions } from './pin.js';
@@ -62,7 +63,7 @@ export interface RefereeReport { ok: boolean; issues: RefereeIssue[]; demoted: s
 export interface Linters { actionlint: () => Promise<string>; zizmor: () => Promise<string> }
 /** The linter run (7b's runLinters): actionlint and zizmor over the workflow files, findings as issues. */
 export type RunLinters = (files: CreatedFile[], linters: Linters, ghToken: string | null) => Promise<RefereeIssue[]>;
-/** The injectable parts. 7b sets `runLinters` to the real one; without it the referee reports that the linters did not run. */
+/** The injectable parts. `runLinters` defaults to the real one (linters.ts); a throwing runner is an issue. */
 export interface RefereeDeps { runLinters?: RunLinters }
 
 // ---------- the tables ----------
@@ -1088,8 +1089,8 @@ const fileKind = (f: CreatedFile): 'workflow' | 'action' | null => (WORKFLOW_PAT
 
 /**
  * Judges the files pipegen is about to propose. `platform` from platformActions, `reviewed` from loadReviewed, `linters` from
- * ensureLinters and `ghToken` the read-only token zizmor's online audits use (7b); `deps.runLinters` runs the linters (7b
- * wires the real one; without it the referee reports that they did not run). Never throws for anything in the files.
+ * ensureLinters and `ghToken` the read-only token zizmor's online audits use (7b); `deps.runLinters` runs the linters (default:
+ * the real runLinters). Never throws for anything in the files.
  */
 export async function referee(files: CreatedFile[], draft: PipelineDraft, platform: PlatformActions, reviewed: ReviewedTool[], linters: Linters, ghToken: string | null, deps: RefereeDeps = {}): Promise<RefereeReport> {
   const issues: RefereeIssue[] = [];
@@ -1141,23 +1142,19 @@ export async function referee(files: CreatedFile[], draft: PipelineDraft, platfo
 
   // the workflow linters (7b): an issue on pipegen's lines, a note on a user's own
   if (lintable.length > 0) {
-    if (deps.runLinters === undefined) {
-      add(lintable[0]?.path ?? '', 'actionlint', 'The workflow linters (actionlint and zizmor) were not run, so the files are not cleared.');
-    } else {
-      let found: RefereeIssue[];
-      try {
-        found = await deps.runLinters(lintable, linters, ghToken);
-      } catch (e) {
-        found = [{ file: lintable[0]?.path ?? '', check: 'actionlint', message: `The workflow linters could not run (${safeText(e instanceof Error ? e.message : String(e), 160)}).` }];
-      }
-      for (const i of found) {
-        // matched by repo and path (ruling 7): a finding that does not name exactly one file is judged as pipegen's own
-        const hit = lintable.filter((x) => x.path === i.file && (i.repo === undefined || x.repo === i.repo));
-        const f = hit.length === 1 ? hit[0] : undefined;
-        const lines = f === undefined ? null : pipegenLines(f);
-        if (lines !== null && i.line !== undefined && !lines.has(i.line)) notes.push(`${safeText(i.file, 200)}:${i.line}: ${safeText(i.message, 300)} (on the user's own lines, not pipegen's)`);
-        else add(i.file, i.check, i.message, i.line, i.repo);
-      }
+    let found: RefereeIssue[];
+    try {
+      found = await (deps.runLinters ?? runLinters)(lintable, linters, ghToken);
+    } catch (e) {
+      found = [{ file: lintable[0]?.path ?? '', check: 'actionlint', message: `The workflow linters could not run (${safeText(e instanceof Error ? e.message : String(e), 160)}).` }];
+    }
+    for (const i of found) {
+      // matched by repo and path (ruling 7): a finding that does not name exactly one file is judged as pipegen's own
+      const hit = lintable.filter((x) => x.path === i.file && (i.repo === undefined || x.repo === i.repo));
+      const f = hit.length === 1 ? hit[0] : undefined;
+      const lines = f === undefined ? null : pipegenLines(f);
+      if (lines !== null && i.line !== undefined && !lines.has(i.line)) notes.push(`${safeText(i.file, 200)}:${i.line}: ${safeText(i.message, 300)} (on the user's own lines, not pipegen's)`);
+      else add(i.file, i.check, i.message, i.line, i.repo);
     }
   }
   return { ok: issues.length === 0, issues, demoted, notes };

@@ -9,6 +9,7 @@ import { resultArtifactName } from '../src/engine/artifact-names.js';
 import { NEED_ID_CATEGORY, NEED_IDS } from '../src/engine/need-ids.js';
 import { emptyRepoFiles } from '../src/read/quality.js';
 import { GATE_CHECK_NAME, type Capabilities, type CreatedFile, type ExistingWorkflow, type Need, type PipelineDraft, type ReviewedTool, type StepSpec } from '../src/types.js';
+import { stub } from './helpers/linter-stub.js';
 import { entry, platform, profile, reviewedList, service, specFor } from './helpers/render.js';
 import { fake } from './helpers/secret-repo.js';
 
@@ -643,9 +644,21 @@ describe('referee: secret values and the linters', () => {
     expect(has(r, 'actionlint')).toBe(true);
     expect(r.ok).toBe(false);
   });
-  it('no linter runner given → an issue, never a silent pass (7b wires runLinters)', async () => {
-    const r = await referee([wf({ scan: job(g.steps) })], draftOf([g.spec]), platform(), reviewedList(), LINTERS, 'gh-stub');
-    expect(has(r, 'actionlint'), show(r)).toBe(true);
+  it('referee: default deps use runLinters (7b): no deps → the real runner starts the linters the closures name', async () => {
+    const a = stub();
+    const z = stub();
+    z.set('[]');
+    const linters: Linters = { actionlint: async () => a.bin, zizmor: async () => z.bin };
+    const r = await referee([wf({ scan: job(g.steps) })], draftOf([g.spec]), platform(), reviewedList(), linters, 'gh-stub');
+    expect(a.records()).toHaveLength(1);
+    expect(z.records()).toHaveLength(1);
+    expect(has(r, 'actionlint') || has(r, 'zizmor'), show(r)).toBe(false);
+    // a finding from the real runner fails the referee; no token → a zizmor issue
+    a.set(JSON.stringify([{ message: 'bad expression', filepath: '.github/workflows/pipegen.yml', line: 4, column: 1, kind: 'expression', snippet: '', end_column: 2 }]), 1);
+    const r2 = await referee([wf({ scan: job(g.steps) })], draftOf([g.spec]), platform(), reviewedList(), linters, 'gh-stub');
+    expect(r2.issues.some((i) => i.check === 'actionlint' && i.line === 4), show(r2)).toBe(true);
+    const r3 = await referee([wf({ scan: job(g.steps) })], draftOf([g.spec]), platform(), reviewedList(), linters, null);
+    expect(r3.issues.some((i) => i.check === 'zizmor'), show(r3)).toBe(true);
   });
 });
 
@@ -1061,6 +1074,22 @@ describe('fix round 2: the re-review probes are refused', () => {
       const { f, d } = editedWith(cond);
       expect((await run([f], d, { list: LIST })).ok, JSON.stringify(cond)).toBe(false);
     }
+  });
+  it('referee: a linter finding in an edited user file outside pipegen\'s lines is a note; inside → issue (7b)', async () => {
+    const { f, d } = editedWith(undefined);
+    const lines = f.content.split('\n');
+    const userLine = lines.findIndex((l) => l.includes('./deploy.sh')) + 1;
+    const ownLine = lines.findIndex((l) => l.includes('contents: read')) + 1;
+    expect(userLine).toBeGreaterThan(0);
+    expect(ownLine).toBeGreaterThan(0);
+    const finding = (line: number, message: string) => ({ message, filepath: f.path, line, column: 1, kind: 'expression', snippet: '', end_column: 2 });
+    const a = stub();
+    a.set(JSON.stringify([finding(userLine, 'user problem'), finding(ownLine, 'pipegen problem')]), 1);
+    const z = stub();
+    z.set('[]');
+    const r = await referee([f], d, platform(), LIST, { actionlint: async () => a.bin, zizmor: async () => z.bin }, 'gh-stub');
+    expect(r.issues.map((i) => [i.check, i.line, i.message]), show(r)).toEqual([['actionlint', ownLine, 'pipegen problem']]);
+    expect(r.notes.some((n) => n.includes('user problem') && n.includes(`${f.path}:${userLine}`)), r.notes.join('\n')).toBe(true);
   });
   it('T3 and ruling 4: an environment name is compared without case', async () => {
     const r = await run([wf({ gate: job([gateStep()], { permissions: { contents: 'read', actions: 'read' }, environment: 'Pipegen-Signing' }) })], draftOf([]), { list: LIST });
