@@ -151,7 +151,7 @@ describe('scrub: output rebuilt from allowlisted fields; nothing planted survive
     expect(keys(result)).toEqual(['level', 'locations', 'message', 'partialFingerprints', 'properties', 'ruleId']);
     expect(keys(result.message)).toEqual(['text']);
     expect(keys(result.partialFingerprints)).toEqual(['pipegenFingerprint']);
-    expect(keys(result.properties)).toEqual(['pipegenFpBy', 'pipegenSecret', 'pipegenSeverity', 'pipegenUnmapped']);
+    expect(keys(result.properties)).toEqual(['pipegenFpBy', 'pipegenPathWithheld', 'pipegenSecret', 'pipegenSeverity', 'pipegenUnmapped']);
     const loc = (result.locations as Obj[])[0];
     expect(keys(loc)).toEqual(['physicalLocation']);
     expect(keys((loc.physicalLocation as Obj).artifactLocation)).toEqual(['uri']);
@@ -198,12 +198,13 @@ describe('scrub: output rebuilt from allowlisted fields; nothing planted survive
 
   it('a defence at the end: if the key or the bytes of a read region were in the output, the scrub is a tool error and writes nothing', () => {
     const ws = plantedWorkspace();
-    // the file name of the finding holds the secret it names: the path is an allowlisted field, so the final check must catch it
-    writeFileSync(join(ws, `leak-${LEAK_ONE}.txt`), `${LEAK_ONE}\n`);
-    const raw = { version: '2.1.0', runs: [{ tool: { driver: { name: 'gitleaks' } }, results: [{ ruleId: 'github-pat', message: { text: 'x' }, locations: [{ physicalLocation: { artifactLocation: { uri: `leak-${LEAK_ONE}.txt` }, region: { startLine: 1, startColumn: 1, endLine: 1, endColumn: 40 } } }] }] }] };
+    // the file name of the finding holds the text it names (plain words, so the path is not withheld as secret-shaped): the path is an allowlisted field, so the final check must catch it
+    const words = 'plain words that are not secret';
+    writeFileSync(join(ws, `leak-${words}.txt`), `${words}\n`);
+    const raw = { version: '2.1.0', runs: [{ tool: { driver: { name: 'gitleaks' } }, results: [{ ruleId: 'github-pat', message: { text: 'x' }, locations: [{ physicalLocation: { artifactLocation: { uri: `leak-${words}.txt` }, region: { startLine: 1, startColumn: 1, endLine: 1, endColumn: words.length } } }] }] }] };
     const out = run(JSON.stringify(raw), 'gitleaks', { workspace: ws });
     expect(out.status).toBe('tool-error');
-    expect(JSON.stringify(out)).not.toContain(LEAK_ONE);
+    expect(JSON.stringify(out)).not.toContain(words);
     expect((out as { error: string }).error).toMatch(/would hold/);
   });
 });
@@ -471,8 +472,8 @@ describe('scrub: input checks', () => {
 });
 
 describe('gate/src: no new dependency', () => {
-  it('fingerprint.ts and scrub.ts import only node:crypto, node:fs, node:path and files of gate/src, src/types.ts and src/util/safe-text.ts', () => {
-    const allowed = new Set(['node:crypto', 'node:fs', 'node:path', './fingerprint.js', './parse-common.js', './sarif.js', './zap.js', '../../src/types.js', '../../src/util/safe-text.js']);
+  it('fingerprint.ts and scrub.ts import only node:crypto, node:fs, node:path and files of gate/src, src/types.ts, src/util/safe-text.ts and src/ai/redact-core.ts', () => {
+    const allowed = new Set(['node:crypto', 'node:fs', 'node:path', './fingerprint.js', './parse-common.js', './sarif.js', './zap.js', '../../src/types.js', '../../src/util/safe-text.js', '../../src/ai/redact-core.js']);
     for (const f of ['fingerprint.ts', 'scrub.ts']) {
       const text = readFileSync(join(import.meta.dirname, '..', 'gate', 'src', f), 'utf8');
       const specs = [...text.matchAll(/^(?:import|export)\s[^;]*?from\s+'([^']+)'/gms)].map((m) => m[1]);

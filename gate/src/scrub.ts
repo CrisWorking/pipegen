@@ -14,15 +14,20 @@
 // replaced it by "secret detected by rule <id>"). The message of any other tool has the known secret shapes masked, and the
 // messages of the rules that quote the matched string (bandit B105 to B107) are withheld.
 //
+// A path or url path that looks like a secret (redact-core: secretShapedName) is withheld: no uri or path is written and the finding is
+// marked unmapped and `pathWithheld`; its fingerprint is still the one computed over the real path. It is not masked in place: a masked
+// path would look mapped, and C2's added-line lookup would miss it (review m1).
+//
 // The key (`fp-key`): `mask` (core.setSecret in C5) is called with it before anything else. It is never in an output, an error
 // text or a log (this module logs nothing); a last check refuses an output that holds the key or the bytes of a secret region.
 // "Fork" is read from the event payload only (S11), never from an input.
-import { createHash } from 'node:crypto';
-import { closeSync, constants, fstatSync, lstatSync, mkdirSync, openSync, readSync, writeSync } from 'node:fs';
-import { dirname, isAbsolute, join, sep } from 'node:path';
+import { createHash, randomBytes } from 'node:crypto';
+import { closeSync, constants, fstatSync, linkSync, lstatSync, mkdirSync, openSync, readSync, unlinkSync, writeSync } from 'node:fs';
+import { basename, dirname, isAbsolute, join, sep } from 'node:path';
+import { secretShapedName } from '../../src/ai/redact-core.js';
 import type { Severity } from '../../src/types.js';
 import { safeText } from '../../src/util/safe-text.js';
-import { fingerprintAll, isQuotingFinding, keyId, keyProblem, maskSecretShapes, type FpBy, type FingerprintedFinding } from './fingerprint.js';
+import { CONTENT_FORMS, fingerprintAll, isQuotingFinding, keyId, keyProblem, maskSecretShapes, POSITION_FORMS, type FpBy, type FingerprintedFinding } from './fingerprint.js';
 import { fail, getOwn, isObj, MAX_RAW_BYTES, ReadError, readJson, type ParsedFinding, type ParseResult } from './parse-common.js';
 import { SARIF_TOOLS, parseSarifText } from './sarif.js';
 import { ZAP_TOOL, parseZapJsonText } from './zap.js';
@@ -54,7 +59,7 @@ const MAX_FIELD = 1024;
 const sha256 = (b: Buffer): string => createHash('sha256').update(b).digest('hex');
 const LEVEL: Readonly<Record<Severity, string>> = { critical: 'error', high: 'error', medium: 'warning', low: 'note', info: 'note' };
 const SEVERITIES: readonly string[] = ['critical', 'high', 'medium', 'low', 'info'];
-const FP_BYS: readonly string[] = ['hash', 'region', 'line', 'nokey'];
+const FP_BYS: readonly string[] = [...CONTENT_FORMS, ...POSITION_FORMS];
 
 /** The pull request comes from another repository: `pull_request.head.repo.id` and `repository.id` are both numbers and differ. Anything else (no payload, a push, odd shapes) is "not a fork": the stricter rule. */
 export function forkFromEvent(eventText: string | undefined): boolean {
@@ -78,8 +83,12 @@ export function forkFromEvent(eventText: string | undefined): boolean {
 const clip = (s: string, max = MAX_FIELD): string => (s.length <= max ? s : s.slice(0, max));
 /** A text for an output field: shapes of secrets masked, cut. Never the key (see `withoutKey`). */
 const outText = (s: string): string => clip(maskSecretShapes(s));
+/** A rule id as written: the `secret:` prefix the parser adds is kept (the masking core would read `secret:<rule>` as an assignment), the rest masked. */
+const SECRET_PREFIX = 'sec' + 'ret:';
+const ruleIdText = (id: string): string => (id.startsWith(SECRET_PREFIX) ? SECRET_PREFIX + outText(id.slice(SECRET_PREFIX.length)) : outText(id));
 const withoutKey = (text: string, key: string): string => (key === '' ? text : text.split(key).join('[key]'));
-const toolError = (error: string, key: string): ScrubOutcome => ({ status: 'tool-error', error: clip(withoutKey(safeText(error, MAX_ERROR_CHARS), key), MAX_ERROR_CHARS) });
+/** An error text: cut, the key taken out, then everything secret-shaped masked (a text may echo a string of the tool, such as its driver name). */
+const toolError = (error: string, key: string): ScrubOutcome => ({ status: 'tool-error', error: clip(maskSecretShapes(withoutKey(safeText(error, MAX_ERROR_CHARS), key)), MAX_ERROR_CHARS) });
 
 /** What the scrub writes for a message: the rules that quote the matched string are withheld, the rest has secret shapes masked. */
 function writtenMessage(f: ParsedFinding): string {
@@ -87,19 +96,32 @@ function writtenMessage(f: ParsedFinding): string {
   return outText(f.message);
 }
 
+/** True for a path that must not be written (see the header); the answer is kept per path. */
+function withholder(): (file: string | undefined) => boolean {
+  const known = new Map<string, boolean>();
+  return (file) => {
+    if (file === undefined) return false;
+    let v = known.get(file);
+    if (v === undefined) { v = secretShapedName(file); known.set(file, v); }
+    return v;
+  };
+}
+
 function sarifOut(tool: string, findings: readonly FingerprintedFinding[], notes: readonly string[], key: string | undefined): string {
   const info = SARIF_TOOLS[tool];
+  const withheld = withholder();
   const results = findings.map((f) => {
+    const hide = withheld(f.file);
     const loc: Record<string, unknown> = {};
-    if (f.file !== undefined) loc.artifactLocation = { uri: clip(f.file, 4096) };
+    if (f.file !== undefined && !hide) loc.artifactLocation = { uri: clip(f.file, 4096) };
     if (f.line !== undefined) loc.region = { startLine: f.line, endLine: f.endLine ?? f.line };
     return {
-      ruleId: outText(f.ruleId),
+      ruleId: ruleIdText(f.ruleId),
       level: LEVEL[f.severity],
       message: { text: writtenMessage(f) },
       ...(Object.keys(loc).length === 0 ? {} : { locations: [{ physicalLocation: loc }] }),
       partialFingerprints: { pipegenFingerprint: f.fingerprint },
-      properties: { pipegenSeverity: f.severity, pipegenSecret: f.secret, pipegenUnmapped: f.uriUnmapped, pipegenFpBy: f.fpBy },
+      properties: { pipegenSeverity: f.severity, pipegenSecret: f.secret, pipegenUnmapped: f.uriUnmapped || hide, pipegenPathWithheld: hide, pipegenFpBy: f.fpBy },
     };
   });
   return JSON.stringify({
@@ -113,14 +135,18 @@ function sarifOut(tool: string, findings: readonly FingerprintedFinding[], notes
 }
 
 function zapOut(findings: readonly FingerprintedFinding[], notes: readonly string[]): string {
+  const withheld = withholder();
   return JSON.stringify({
     pipegenScrubbed: true,
     tool: ZAP_TOOL,
     notes: [...notes],
-    alerts: findings.map((f) => ({
-      pluginid: outText(f.ruleId), name: outText(f.message), severity: f.severity, fingerprint: f.fingerprint, unmapped: f.uriUnmapped,
-      ...(f.method === undefined ? {} : { method: f.method }), ...(f.file === undefined ? {} : { path: clip(f.file, 4096) }),
-    })),
+    alerts: findings.map((f) => {
+      const hide = withheld(f.file);
+      return {
+        pluginid: outText(f.ruleId), name: outText(f.message), severity: f.severity, fingerprint: f.fingerprint, unmapped: f.uriUnmapped || hide, pathWithheld: hide,
+        ...(f.method === undefined ? {} : { method: f.method }), ...(f.file === undefined || hide ? {} : { path: clip(f.file, 4096) }),
+      };
+    }),
   });
 }
 
@@ -169,11 +195,14 @@ export function scrubBytes(raw: Uint8Array, opts: ScrubOptions): ScrubOutcome {
     const bytes = Buffer.from(opts.format === 'sarif' ? sarifOut(opts.tool, findings, notes, usedKey) : zapOut(findings, notes), 'utf8');
 
     // the last check: nothing secret may have reached an allowlisted field (a file name, a rule id)
-    if (usedKey !== undefined && bytes.includes(usedKey)) return toolError('the output would hold the key, so it was not written', key);
+    // as written and as JSON writes it (a quote, a backslash or a newline in the text is escaped in the file)
+    const written = bytes.toString('utf8');
+    const holds = (text: string): boolean => bytes.includes(text) || written.includes(JSON.stringify(text).slice(1, -1));
+    if (usedKey !== undefined && holds(usedKey)) return toolError('the output would hold the key, so it was not written', key);
     for (const region of regions) {
-      if (region.length >= 8 && bytes.includes(region)) return toolError('the output would hold the text of a secret region, so it was not written', key);
+      if (region.length >= 8 && (bytes.includes(region) || written.includes(JSON.stringify(region.toString('utf8')).slice(1, -1)))) return toolError('the output would hold the text of a secret region, so it was not written', key);
     }
-    const fpBy: Record<FpBy, number> = { hash: 0, region: 0, line: 0, nokey: 0 };
+    const fpBy: Record<FpBy, number> = { hash: 0, region: 0, quoted: 0, line: 0, nokey: 0, 'quoted-nokey': 0 };
     for (const f of findings) fpBy[f.fpBy]++;
     return { status: 'ok', bytes, sha256: sha256(bytes), findings: findings.length, ...(usedKey === undefined ? {} : { keyId: keyId(usedKey) }), notes, fpBy };
   } catch {
@@ -185,7 +214,10 @@ export function scrubBytes(raw: Uint8Array, opts: ScrubOptions): ScrubOutcome {
 
 export interface ScrubbedFinding {
   tool: string; ruleId: string; severity: Severity; file?: string; line?: number; endLine?: number; message: string; fingerprint: string;
-  secret: boolean; fpBy: FpBy; uriUnmapped: boolean; method?: string;
+  secret: boolean; fpBy: FpBy; uriUnmapped: boolean;
+  /** The path looked like a secret and was not written (`file` is then absent and `uriUnmapped` is true). */
+  pathWithheld: boolean;
+  method?: string;
 }
 export interface ScrubbedResult { findings: ScrubbedFinding[]; keyId?: string; notes: string[]; toolError?: string }
 
@@ -196,6 +228,13 @@ const str = (o: Record<string, unknown>, k: string, where: string): string => {
 };
 const bool = (o: Record<string, unknown>, k: string, where: string): boolean => {
   const v = getOwn(o, k);
+  if (typeof v !== 'boolean') fail(`${where}: ${k} is not a boolean`);
+  return v;
+};
+/** A boolean that may be absent (then false): files written before the field existed. */
+const optBool = (o: Record<string, unknown>, k: string, where: string): boolean => {
+  const v = getOwn(o, k);
+  if (v === undefined) return false;
   if (typeof v !== 'boolean') fail(`${where}: ${k} is not a boolean`);
   return v;
 };
@@ -258,7 +297,7 @@ export function readScrubbed(input: string | Uint8Array, format: ScrubFormat, ma
         }
         return {
           tool, ruleId: str(r, 'ruleId', at), severity: severity as Severity, ...(file === undefined ? {} : { file }), ...(line === undefined ? {} : { line }), ...(endLine === undefined ? {} : { endLine }),
-          message: str(msg, 'text', at), fingerprint, secret: bool(p, 'pipegenSecret', at), fpBy: fpBy as FpBy, uriUnmapped: bool(p, 'pipegenUnmapped', at),
+          message: str(msg, 'text', at), fingerprint, secret: bool(p, 'pipegenSecret', at), fpBy: fpBy as FpBy, uriUnmapped: bool(p, 'pipegenUnmapped', at), pathWithheld: optBool(p, 'pipegenPathWithheld', at),
         };
       });
       return { findings, ...(typeof id === 'string' ? { keyId: id } : {}), notes: readNotes(getOwn(props, 'pipegenNotes'), 'properties') };
@@ -277,7 +316,7 @@ export function readScrubbed(input: string | Uint8Array, format: ScrubFormat, ma
       if ((method !== undefined && typeof method !== 'string') || (path !== undefined && typeof path !== 'string')) fail(`${at}: a method or path is not a string`);
       return {
         tool: ZAP_TOOL, ruleId: str(a, 'pluginid', at), severity: severity as Severity, ...(path === undefined ? {} : { file: path }), message: str(a, 'name', at), fingerprint,
-        secret: false, fpBy: 'hash', uriUnmapped: bool(a, 'unmapped', at), ...(method === undefined ? {} : { method }),
+        secret: false, fpBy: 'hash', uriUnmapped: bool(a, 'unmapped', at), pathWithheld: optBool(a, 'pathWithheld', at), ...(method === undefined ? {} : { method }),
       };
     });
     return { findings, notes: readNotes(getOwn(doc, 'notes'), 'report') };
@@ -408,20 +447,33 @@ export function scrubFile(opts: ScrubFileOptions): ScrubFileResult {
   }
   const scrubbed = scrubBytes(raw, { tool: opts.tool, format: opts.format, fpKey: opts.fpKey, eventText, workspace: opts.workspace, maxBytes: opts.maxBytes });
   if (scrubbed.status !== 'ok') return { status: 'tool-error', error: scrubbed.error };
+  // The result is written to a temporary file of its own in the artifact folder and published whole (a hard link that cannot replace
+  // a file, then the temporary name removed): a failed write leaves no partial result for the upload step to pick up (review m5).
   let fd: number | undefined;
+  let tmp: string | undefined;
   try {
     const path = prepareOutFolder(opts.out, opts.artifact);
+    tmp = join(dirname(path), `.${basename(path)}.${randomBytes(8).toString('hex')}.tmp`);
     try {
-      fd = openSync(path, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o644);
-    } catch (e) {
-      throw new ScrubFileError((e as NodeJS.ErrnoException).code === 'EEXIST' ? 'the scrubbed result file already exists, so it is not overwritten' : 'the scrubbed result file cannot be created');
+      fd = openSync(tmp, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o644);
+    } catch {
+      tmp = undefined;
+      throw new ScrubFileError('the scrubbed result file cannot be created');
     }
     let at = 0;
     while (at < scrubbed.bytes.length) at += writeSync(fd, scrubbed.bytes, at, scrubbed.bytes.length - at);
+    closeSync(fd);
+    fd = undefined;
+    try {
+      linkSync(tmp, path);
+    } catch (e) {
+      throw new ScrubFileError((e as NodeJS.ErrnoException).code === 'EEXIST' ? 'the scrubbed result file already exists, so it is not overwritten' : 'the scrubbed result file cannot be created');
+    }
   } catch (e) {
     return fail1(e instanceof ScrubFileError ? e.message : 'the scrubbed result could not be written');
   } finally {
     if (fd !== undefined) try { closeSync(fd); } catch { /* nothing left to do */ }
+    if (tmp !== undefined) try { unlinkSync(tmp); } catch { /* nothing left to do */ }
   }
   return { status: 'ok', sha256: scrubbed.sha256, findings: scrubbed.findings, ...(scrubbed.keyId === undefined ? {} : { keyId: scrubbed.keyId }), notes: scrubbed.notes };
 }

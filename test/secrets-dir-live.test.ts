@@ -11,7 +11,7 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { ensurePinnedBinary } from '../src/engine/linters.js';
 import { loadReviewed } from '../src/engine/reviewed.js';
 import { readRegion } from '../gate/src/fingerprint.js';
-import { parseSarifText } from '../gate/src/sarif.js';
+import { parseSarifText, SARIF_TOOLS } from '../gate/src/sarif.js';
 import { cleanupRepos, makeTempDir, writeIn } from './helpers/make-repo.js';
 
 const live = process.env.PIPEGEN_LIVE_TESTS === '1';
@@ -61,6 +61,22 @@ describe.skipIf(!live)('secrets tools in dir mode read what the scrub reads (liv
       const parsed = parseSarifText(runEntry(id, bins[id], dir), id, { workspace: dir });
       expect(parsed.toolError).toBeUndefined();
       expect(parsed.findings).toHaveLength(1);
+      const region = readRegion(dir, parsed.findings[0]);
+      expect(region.ok && region.bytes.toString('utf8')).toBe(PLANT_A);
+    });
+
+    it(`${id}: the uri is written raw: a file named src/%61pp.js is reported as src/%61pp.js (the SARIF_TOOLS row says raw), with its own region`, () => {
+      const dir = makeTempDir();
+      git(dir, 'init', '-q');
+      writeIn(dir, 'src/%61pp.js', `var a = "${PLANT_A}";\n`);
+      writeIn(dir, 'src/app.js', 'var a = 1;\n');   // the file a decoding parser would file the finding under
+      git(dir, 'add', '-A');
+      git(dir, 'commit', '-q', '-m', 'x');
+      const text = runEntry(id, bins[id], dir);
+      expect((JSON.parse(text) as { runs: { results: { locations: { physicalLocation: { artifactLocation: { uri: string } } }[] }[] }[] }).runs[0].results.map((r) => r.locations[0].physicalLocation.artifactLocation.uri)).toEqual(['src/%61pp.js']);
+      expect(SARIF_TOOLS[id].uriEncoding).toBe('raw');
+      const parsed = parseSarifText(text, id, { workspace: dir });
+      expect(parsed.findings[0]).toMatchObject({ file: 'src/%61pp.js' });
       const region = readRegion(dir, parsed.findings[0]);
       expect(region.ok && region.bytes.toString('utf8')).toBe(PLANT_A);
     });

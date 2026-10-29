@@ -59,9 +59,23 @@ export interface SarifToolInfo {
   readonly zeroScoreIsUnknown: boolean;
   /** A note put on every result of this tool (what its SARIF cannot prove). */
   readonly note?: string;
+  /**
+   * How the tool writes `artifactLocation.uri` (C1b fix round 1, review C2): 'raw' = the path as is, a `%` is a literal
+   * character (measured: betterleaks 1.9.0 and gitleaks 8.30.1 with a file named `src/%61pp.js`); 'percent' = RFC 3986
+   * percent-encoded, decoded once; 'unmeasured' = not measured yet, so a uri with a `%` is unmapped (fail closed: a
+   * keyless secret in an unmapped file stays new). Decoding a raw path would file a new file's finding under another file.
+   */
+  readonly uriEncoding: UriEncoding;
+  /**
+   * Where the finding's message comes from: 'result' (the result's own message.text, masked later) or 'rule-template' (the
+   * rule's uninterpolated `fullDescription.text`: semgrep puts metavariable values, even the value of a secret, into the
+   * result message, and writes the template with `$VALUE` in the rules list).
+   */
+  readonly messageFrom: 'result' | 'rule-template';
 }
+export type UriEncoding = 'raw' | 'percent' | 'unmeasured';
 const tool = (driver: string, severity: SeveritySource, over: Partial<SarifToolInfo> = {}): SarifToolInfo =>
-  ({ driver, severity, secrets: false, fileMode: 'repo', executionSuccessfulFalse: 'error', errorRules: [], zeroScoreIsUnknown: false, ...over });
+  ({ driver, severity, secrets: false, fileMode: 'repo', executionSuccessfulFalse: 'error', errorRules: [], zeroScoreIsUnknown: false, uriEncoding: 'unmeasured', messageFrom: 'result', ...over });
 
 /**
  * The reviewed tools that write SARIF and that the gate reads, by reviewed-list id. A null-prototype table: an id from
@@ -69,9 +83,9 @@ const tool = (driver: string, severity: SeveritySource, over: Partial<SarifToolI
  * never gated, so it is not here (test: every other `format: sarif` reviewed entry is).
  */
 export const SARIF_TOOLS: Readonly<Record<string, SarifToolInfo>> = Object.freeze(Object.assign(Object.create(null) as Record<string, SarifToolInfo>, {
-  betterleaks: tool('betterleaks', 'secret', { secrets: true }),
-  gitleaks: tool('gitleaks', 'secret', { secrets: true, note: 'completeness not provable (gitleaks)' }),
-  semgrep: tool('Semgrep OSS', 'level'),
+  betterleaks: tool('betterleaks', 'secret', { secrets: true, uriEncoding: 'raw' }),
+  gitleaks: tool('gitleaks', 'secret', { secrets: true, uriEncoding: 'raw', note: 'completeness not provable (gitleaks)' }),
+  semgrep: tool('Semgrep OSS', 'level', { messageFrom: 'rule-template' }),
   'osv-scanner': tool('osv-scanner', 'security-severity'),
   'trivy-config': tool('Trivy', 'security-severity', { zeroScoreIsUnknown: true }),
   'trivy-image': tool('Trivy', 'security-severity', { fileMode: 'none', zeroScoreIsUnknown: true }),
@@ -99,13 +113,16 @@ function decodeOnce(s: string): string | undefined {
 
 /**
  * A scanner's uri as a repository-relative POSIX path, or undefined ("unmapped") when it cannot be made one. Strips
- * `file://` (empty authority only), the workspace and `/src/` prefixes (the whole prefix up to a `/`), percent-decodes
- * once, folds `//` and `.` segments. Unmapped, never a path: any `..` segment, an absolute path, a backslash, a control
- * character, another scheme or a drive letter, a host, an invalid or double-encoded percent sequence (so `%2e%2e` in
- * any case and under any encoding layer cannot get through), an empty result, or a uri longer than 4096.
+ * `file://` (empty authority only), the workspace and `/src/` prefixes (the whole prefix up to a `/`), folds `//` and `.`
+ * segments, and reads a `%` by the tool's `encoding` (SarifToolInfo.uriEncoding): 'raw' leaves it alone, 'percent' decodes
+ * once, and 'unmeasured' (also the default, when no encoding is given) refuses any uri that holds one. Unmapped, never a
+ * path: any `..` segment, an absolute path, a backslash, a control character, another scheme or a drive letter, a host, an
+ * invalid or double-encoded percent sequence (percent only, so `%2e%2e` in any case and under any encoding layer cannot get
+ * through), an empty result, or a uri longer than 4096.
  */
-export function normaliseUri(uri: unknown, opts: { workspace?: string } = {}): string | undefined {
+export function normaliseUri(uri: unknown, opts: { workspace?: string; encoding?: UriEncoding } = {}): string | undefined {
   if (typeof uri !== 'string' || uri.trim() === '' || uri.length > MAX_URI_CHARS) return undefined;
+  const encoding = opts.encoding ?? 'unmeasured';
   let p = uri;
   if (/^file:\/\//i.test(p)) {
     p = p.slice(7);
@@ -117,10 +134,16 @@ export function normaliseUri(uri: unknown, opts: { workspace?: string } = {}): s
   if (ws.startsWith('/') && p.startsWith(`${ws}/`)) p = p.slice(ws.length + 1);
   else if (p.startsWith('/src/')) p = p.slice(5);
   else if (p.startsWith('/zap/wrk/')) p = p.slice(9);
-  const once = decodeOnce(p);
-  if (once === undefined) return undefined;
-  const twice = decodeOnce(once);
-  if (twice !== once) return undefined;           // double-encoded (or an unreadable second layer)
+  let once = p;
+  if (encoding === 'unmeasured') {
+    if (p.includes('%')) return undefined;
+  } else if (encoding === 'percent') {
+    const decoded = decodeOnce(p);
+    if (decoded === undefined) return undefined;
+    once = decoded;
+    const twice = decodeOnce(once);
+    if (twice !== once) return undefined;           // double-encoded (or an unreadable second layer)
+  }
   if (CONTROL.test(once) || once.includes('\\') || once.startsWith('/') || SCHEME.test(once)) return undefined;
   const kept: string[] = [];
   for (const segment of once.split('/')) {
@@ -149,9 +172,9 @@ function fromLevel(v: string | undefined): Severity | undefined {
 // ---------- the reader ----------
 
 const MAX_TAGS = 256;
-const SAME = (a: Rule, b: Rule): boolean => a.level === b.level && String(a.score) === String(b.score) && a.tags.join('\0') === b.tags.join('\0');
+const SAME = (a: Rule, b: Rule): boolean => a.level === b.level && String(a.score) === String(b.score) && a.tags.join('\0') === b.tags.join('\0') && a.template === b.template;
 
-interface Rule { id: string; level?: string; score?: unknown; tags: string[]; secret: boolean; word?: Severity }
+interface Rule { id: string; level?: string; score?: unknown; tags: string[]; secret: boolean; word?: Severity; template?: string }
 
 /** The tag facts of a rule or a result, computed once: a secret tag, and the highest severity word (gosec). */
 function tagFacts(tags: readonly string[]): { secret: boolean; word?: Severity } {
@@ -184,7 +207,8 @@ function readRules(driver: Obj, where: string): { list: Rule[]; byId: Map<string
     const score = getOwn(props, 'security-severity');
     if (score !== undefined && typeof score !== 'string' && typeof score !== 'number') fail(`${at}: security-severity is not a string or a number`);
     const tags = readTags(props, `${at} properties`);
-    const rule: Rule = { id, level, score, tags, ...tagFacts(tags) };
+    const template = optStr(optObj(r, 'fullDescription', at) ?? {}, 'text', `${at} fullDescription`);
+    const rule: Rule = { id, level, score, tags, ...tagFacts(tags), ...(template === undefined ? {} : { template }) };
     list.push(rule);
     const same = byId.get(id);
     if (same === undefined) byId.set(id, rule);
@@ -218,12 +242,17 @@ function readInvocations(run: Obj, info: SarifToolInfo, where: string): { execut
   return { executionFailed };
 }
 
+/** The message of a finding of a 'rule-template' tool: the rule's uninterpolated text, or a fixed sentence. The result's own message is never read for it. */
+function templateMessage(rule: Rule | undefined, ruleId: string): string {
+  return rule?.template !== undefined && rule.template !== '' ? cutText(rule.template, MAX_MESSAGE_CHARS) : cutText(`finding of rule ${ruleId}`, MAX_MESSAGE_CHARS);
+}
+
 function secretMessage(ruleId: string): string {
   return cutText(`secret detected by rule ${ruleId}`);
 }
 
 /** The folder (relative to the workspace, '' for the workspace itself) a uriBaseId names, or undefined when it is outside the workspace or unknown. */
-function baseFolder(baseId: string, run: Obj, workspace: string | undefined, where: string): string | undefined {
+function baseFolder(baseId: string, run: Obj, workspace: string | undefined, encoding: UriEncoding, where: string): string | undefined {
   const table = optObj(run, 'originalUriBaseIds', where);
   const entry = table === undefined ? undefined : getOwn(table, baseId);
   if (entry === undefined) return baseId === '%SRCROOT%' ? '' : undefined;   // semgrep's base names no uri: the root of what was scanned
@@ -233,14 +262,14 @@ function baseFolder(baseId: string, run: Obj, workspace: string | undefined, whe
   if (uri === undefined || !ws.startsWith('/') || !/^file:\/\/\//i.test(uri)) return undefined;
   const path = uri.slice(7).replace(/\/+$/, '');
   if (path === ws) return '';
-  return path.startsWith(`${ws}/`) ? normaliseUri(path.slice(ws.length + 1), {}) : undefined;
+  return path.startsWith(`${ws}/`) ? normaliseUri(path.slice(ws.length + 1), { encoding }) : undefined;
 }
 
 /** A result's uri as a workspace-relative path, with its uriBaseId (when it has one and the uri is relative) resolved inside the workspace. */
-function mapUri(uri: string, baseId: string | undefined, run: Obj, bases: Map<string, string | undefined>, workspace: string | undefined, where: string): string | undefined {
-  const own = normaliseUri(uri, { workspace });
+function mapUri(uri: string, baseId: string | undefined, run: Obj, bases: Map<string, string | undefined>, workspace: string | undefined, encoding: UriEncoding, where: string): string | undefined {
+  const own = normaliseUri(uri, { workspace, encoding });
   if (baseId === undefined || uri.startsWith('/') || SCHEME.test(uri)) return own;
-  if (!bases.has(baseId)) bases.set(baseId, baseFolder(baseId, run, workspace, where));
+  if (!bases.has(baseId)) bases.set(baseId, baseFolder(baseId, run, workspace, encoding, where));
   const base = bases.get(baseId);
   if (base === undefined || own === undefined) return undefined;
   return base === '' ? own : `${base}/${own}`;
@@ -319,7 +348,7 @@ function readRun(run: unknown, index: number, toolId: string, info: SarifToolInf
       if (info.fileMode === 'none') {
         uriUnmapped = true;
       } else {
-        file = mapUri(uri, baseId, run, bases, opts.workspace, at);
+        file = mapUri(uri, baseId, run, bases, opts.workspace, info.uriEncoding, at);
         uriUnmapped = file === undefined;
         if (uriUnmapped) unmapped++;
       }
@@ -353,7 +382,7 @@ function readRun(run: unknown, index: number, toolId: string, info: SarifToolInf
       severity,
       file,
       line,
-      message: isSecret ? secretMessage(rawId) : cutText(text ?? '', MAX_MESSAGE_CHARS),
+      message: isSecret ? secretMessage(rawId) : info.messageFrom === 'rule-template' ? templateMessage(rule, rawId) : cutText(text ?? '', MAX_MESSAGE_CHARS),
       uriUnmapped,
       secret: isSecret,
       ...(startColumn === undefined ? {} : { startColumn }),

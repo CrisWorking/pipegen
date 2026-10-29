@@ -20,13 +20,28 @@
 import { createHash, createHmac } from 'node:crypto';
 import { closeSync, constants, fstatSync, lstatSync, openSync, readlinkSync, readSync, realpathSync } from 'node:fs';
 import { join, sep } from 'node:path';
+import { maskText } from '../../src/ai/redact-core.js';
 import type { ParsedFinding } from './parse-common.js';
 
 export const FP_KEY_MIN = 32;
 export const REGION_MAX_BYTES = 64 * 1024;
 const FILE_SCAN_MAX = 16 * 1024 * 1024;
 
-export type FpBy = 'hash' | 'region' | 'line' | 'nokey';
+/**
+ * How a fingerprint was made (written as `pipegenFpBy`, read back by C2). The forms differ in what they can see:
+ * - content forms: `hash` (every non-secret: tool, rule, file, message), `region` (a secret: an HMAC over the bytes the
+ *   scanner matched) and `quoted` (an HMAC over a message that quotes a string). The same text gives the same value
+ *   wherever it moves, so C2 counts them per (tool, fingerprint) and an extra occurrence is new.
+ * - position forms: `line` (a secret whose region could not be read, and every trivy secret: an HMAC of the place),
+ *   `nokey` (a secret without a key, a fork: a hash of the place) and `quoted-nokey` (the same for a quoting rule). They hold
+ *   no content, so a secret REPLACED in place keeps its value. C2 must read them as new when the count says so, or when any
+ *   line of the finding is on an added line of the diff, or when it has no mapped repository file (review I1).
+ */
+export type FpBy = 'hash' | 'region' | 'quoted' | 'line' | 'nokey' | 'quoted-nokey';
+export const CONTENT_FORMS: readonly FpBy[] = Object.freeze(['hash', 'region', 'quoted'] as const);
+export const POSITION_FORMS: readonly FpBy[] = Object.freeze(['line', 'nokey', 'quoted-nokey'] as const);
+/** True for a fingerprint that holds no content of the finding (see FpBy). */
+export const isPositionForm = (by: FpBy): boolean => POSITION_FORMS.includes(by);
 export interface FpContext {
   /** PIPEGEN_FP_KEY. Empty or absent: the no-key form. A key that keyProblem refuses must not be passed (the caller stops first). */
   fpKey?: string;
@@ -34,6 +49,8 @@ export interface FpContext {
   workspace?: string;
   /** Called with the bytes of every region that was read (the scrub uses them to check that none reaches its output). */
   onRegion?: (bytes: Buffer) => void;
+  /** The files read so far in this scrub (fingerprintAll makes one when this is absent). */
+  cache?: RegionCache;
 }
 export interface FpResult {
   fingerprint: string;
@@ -63,34 +80,21 @@ export function keyProblem(key: string | undefined, fork: boolean, needed: boole
   if (key === undefined || key === '') {
     return fork ? undefined : 'PIPEGEN_FP_KEY is missing (an empty key is only allowed on a fork pull request), so secret fingerprints cannot be made';
   }
-  return key.length < FP_KEY_MIN ? `PIPEGEN_FP_KEY is too short: it needs at least ${FP_KEY_MIN} characters` : undefined;
+  if (key.length < FP_KEY_MIN) return `PIPEGEN_FP_KEY is too short: it needs at least ${FP_KEY_MIN} characters`;
+  // printable ASCII without a quote or a backslash: JSON then writes the key as it is, so the last check of the scrub sees it
+  return /^[\x20-\x7e]*$/.test(key) && !/["\\]/.test(key) ? undefined : 'PIPEGEN_FP_KEY must be printable ASCII without a double quote or a backslash';
 }
 
 // ---------- message ----------
 
-const SHAPES: readonly RegExp[] = [
-  /-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----[\s\S]*?(?:-----END [A-Z0-9 ]*PRIVATE KEY-----|$)/g,
-  /\bgh[pousr]_[A-Za-z0-9]{20,}/g,
-  /\bgithub_pat_[A-Za-z0-9_]{20,}/g,
-  /\bsk-[A-Za-z0-9_-]{20,}/g,
-  /\bsk_(?:live|test)_[A-Za-z0-9]{16,}/g,
-  /\b(?:AKIA|ASIA)[A-Z0-9]{16}\b/g,
-  /\bxox[abprs]-[A-Za-z0-9-]{10,}/g,
-  /\bhttps:\/\/hooks\.slack\.com\/services\/[A-Za-z0-9/]+/g,
-  /\bAIza[0-9A-Za-z_-]{35}/g,
-  /\bnpm_[A-Za-z0-9]{36}/g,
-  /\bey[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{4,}\.[A-Za-z0-9_-]{8,}/g,
-];
 /**
- * The message of a finding with the well-known secret shapes replaced by [REDACTED]. A message may quote the matched text
- * (bandit does for hard-coded passwords); this is the same guard for what is written and for what is hashed, so a
- * fingerprint never covers a recognised token. Not a secret scanner: the secrets tools' messages are never carried at all.
+ * The text of a message or a name with everything secret-shaped masked: the shared core of redact.ts (src/ai/redact-core.ts:
+ * token formats, JWTs, private keys, connection-string passwords, password-like assignments and the entropy belt per token).
+ * A message may quote the matched text (bandit does for hard-coded passwords, semgrep for a metavariable); this is the same
+ * guard for what is written and for what is hashed, so a fingerprint never covers a recognised secret. Not a secret scanner:
+ * the secrets tools' messages are never carried at all.
  */
-export function maskSecretShapes(text: string): string {
-  let out = text;
-  for (const re of SHAPES) out = out.replace(re, '[REDACTED]');
-  return out;
-}
+export const maskSecretShapes = (text: string): string => maskText(text);
 
 /**
  * The message as it enters a fingerprint: whitespace collapsed, and the finding's own start and end line numbers removed
@@ -117,50 +121,66 @@ const COLUMN_RULES: Readonly<Record<string, { shiftAfterFirstLine: number }>> = 
 export type RegionResult = { ok: true; bytes: Buffer } | { ok: false; reason: string };
 const no = (reason: string): RegionResult => ({ ok: false, reason });
 
-/** The bytes of the region of a secret finding in the workspace file it names, or why they cannot be read. Never throws. */
-export function readRegion(workspace: string, f: ParsedFinding): RegionResult {
-  const rule = Object.hasOwn(COLUMN_RULES, f.tool) ? COLUMN_RULES[f.tool] : undefined;
-  if (rule === undefined) return no(`the columns of ${f.tool} are not known (they are placeholders there), so the region is not read`);
-  const { line, startColumn, endColumn } = f;
-  const endLine = f.endLine ?? line;
-  if (line === undefined || startColumn === undefined || endColumn === undefined || endLine === undefined) return no('the finding has no complete region');
-  const startCol = startColumn - (line >= 2 ? rule.shiftAfterFirstLine : 0);
-  const endCol = endColumn - (endLine >= 2 ? rule.shiftAfterFirstLine : 0);
-  if (endLine < line || startCol < 1 || endCol < 1 || (endLine === line && endCol < startCol)) return no('the region is empty or its end is before its start');
-  const file = f.file;
-  if (file === undefined || file === '' || file.startsWith('/') || file.includes('\0') || file.includes('\\') || file.split('/').some((s) => s === '..')) return no('the path is not inside the workspace');
+/** One workspace file as the region reader holds it: its bytes (at most FILE_SCAN_MAX), and the offsets of the line starts found so far. */
+type FileRead = { ok: true; buf: Buffer; got: number; size: number; starts: number[]; atEnd: boolean } | { ok: false; reason: string };
+
+/**
+ * The files read during one scrub, by workspace path, so a file that many findings point into is read once (review m3: 2000
+ * findings in a 16 MiB file took 25 s). The answer for a file that could not be read is kept as well. Bounded: past
+ * CACHE_MAX_BYTES of buffers the cache starts again, so a result with findings in very many large files stays small.
+ */
+const CACHE_MAX_BYTES = 128 * 1024 * 1024;
+export class RegionCache {
+  private readonly files = new Map<string, FileRead>();
+  private bytes = 0;
+  get(file: string, load: () => FileRead): FileRead {
+    const known = this.files.get(file);
+    if (known !== undefined) return known;
+    const made = load();
+    if (made.ok) {
+      if (this.bytes + made.buf.length > CACHE_MAX_BYTES) { this.files.clear(); this.bytes = 0; }
+      this.bytes += made.buf.length;
+    }
+    this.files.set(file, made);
+    return made;
+  }
+}
+
+/** Opens one workspace file for the region reader: no link on the path, a regular file, never blocking, inside the workspace. Never throws. */
+function loadWorkspaceFile(workspace: string, file: string): FileRead {
+  const bad = (reason: string): FileRead => ({ ok: false, reason });
   let fd: number | undefined;
   try {
     const wsReal = realpathSync(workspace);
     // every level: no link, folders until the last, a regular file at the end (lstat does not follow)
     let cur = workspace;
-    const parts = file.split('/').filter((s) => s !== '' && s !== '.');
-    if (parts.length === 0) return no('the path is not inside the workspace');
+    const parts = file.split('/').filter((x) => x !== '' && x !== '.');
+    if (parts.length === 0) return bad('the path is not inside the workspace');
     let last = lstatSync(cur);
     for (const [i, part] of parts.entries()) {
       cur = join(cur, part);
       try {
         last = lstatSync(cur);
       } catch (e) {
-        return no((e as NodeJS.ErrnoException).code === 'ENOENT' ? 'the file is missing' : 'the file cannot be read');
+        return bad((e as NodeJS.ErrnoException).code === 'ENOENT' ? 'the file is missing' : 'the file cannot be read');
       }
-      if (last.isSymbolicLink()) return no('the file or a folder on its path is a link');
-      if (i < parts.length - 1 && !last.isDirectory()) return no('a folder on the path is not a folder');
+      if (last.isSymbolicLink()) return bad('the file or a folder on its path is a link');
+      if (i < parts.length - 1 && !last.isDirectory()) return bad('a folder on the path is not a folder');
     }
-    if (!last.isFile()) return no('the path is not a regular file');
+    if (!last.isFile()) return bad('the path is not a regular file');
     try {
       fd = openSync(cur, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK | constants.O_NOCTTY);
     } catch (e) {
-      return no((e as NodeJS.ErrnoException).code === 'ELOOP' ? 'the file or a folder on its path is a link' : 'the file cannot be opened');
+      return bad((e as NodeJS.ErrnoException).code === 'ELOOP' ? 'the file or a folder on its path is a link' : 'the file cannot be opened');
     }
     const opened = fstatSync(fd);
-    if (!opened.isFile()) return no('the path is not a regular file');
-    if (opened.dev !== last.dev || opened.ino !== last.ino) return no('the file changed while it was opened');
+    if (!opened.isFile()) return bad('the path is not a regular file');
+    if (opened.dev !== last.dev || opened.ino !== last.ino) return bad('the file changed while it was opened');
     let real: string | undefined;
     try {
       real = readlinkSync(`/proc/self/fd/${fd}`).replace(/ \(deleted\)$/, '');
     } catch { /* no /proc here: the checks above are all there is */ }
-    if (real !== undefined && !real.startsWith(wsReal + sep)) return no('the opened file is outside the workspace');
+    if (real !== undefined && !real.startsWith(wsReal + sep)) return bad('the opened file is outside the workspace');
 
     const want = Math.min(opened.size, FILE_SCAN_MAX);
     const buf = Buffer.alloc(want);
@@ -170,29 +190,61 @@ export function readRegion(workspace: string, f: ParsedFinding): RegionResult {
       if (n === 0) break;
       got += n;
     }
-    // line starts (offsets) up to the end line
-    const starts: number[] = [0];
-    for (let at = 0; starts.length < endLine; ) {
-      const nl = buf.indexOf(0x0a, at);
-      if (nl === -1 || nl >= got) break;
-      at = nl + 1;
-      starts.push(at);
-    }
-    if (starts.length < endLine || starts[endLine - 1] >= got) return no(got < opened.size ? 'the region is too far into a large file' : 'the region is outside the file');
-    const lineEnd = (n: number): number => {   // exclusive end of line n's content (before its newline)
-      const nl = buf.indexOf(0x0a, starts[n - 1]);
-      return nl === -1 || nl >= got ? got : nl;
-    };
-    const from = starts[line - 1] + startCol - 1;
-    const to = starts[endLine - 1] + endCol;   // end column inclusive: the exclusive offset is the column itself
-    if (from >= lineEnd(line) || to > lineEnd(endLine)) return no('the region is outside the file');
-    if (to - from > REGION_MAX_BYTES) return no('the region is over 64 KiB');
-    if (to - from < 1) return no('the region is empty or its end is before its start');
-    return { ok: true, bytes: Buffer.from(buf.subarray(from, to)) };
+    return { ok: true, buf, got, size: opened.size, starts: [0], atEnd: false };
   } catch {
-    return no('the file cannot be read');
+    return bad('the file cannot be read');
   } finally {
     if (fd !== undefined) try { closeSync(fd); } catch { /* nothing left to do */ }
+  }
+}
+
+/** The offset where line `n` (1-based) starts, or undefined when the file has fewer lines (within what was read). */
+function lineStart(f: Extract<FileRead, { ok: true }>, n: number): number | undefined {
+  while (f.starts.length < n && !f.atEnd) {
+    const nl = f.buf.indexOf(0x0a, f.starts[f.starts.length - 1]);
+    if (nl === -1 || nl >= f.got) f.atEnd = true;
+    else f.starts.push(nl + 1);
+  }
+  const at = f.starts[n - 1];
+  return at === undefined || at >= f.got ? undefined : at;
+}
+
+/**
+ * The bytes of the region of a secret finding in the workspace file it names, or why they cannot be read. Never throws.
+ * `cache`: the files already read in this scrub (see RegionCache); without one, the file is read for this call only.
+ */
+export function readRegion(workspace: string, f: ParsedFinding, cache?: RegionCache): RegionResult {
+  const rule = Object.hasOwn(COLUMN_RULES, f.tool) ? COLUMN_RULES[f.tool] : undefined;
+  if (rule === undefined) return no(`the columns of ${f.tool} are not known (they are placeholders there), so the region is not read`);
+  const { line, startColumn, endColumn } = f;
+  const endLine = f.endLine ?? line;
+  if (line === undefined || startColumn === undefined || endColumn === undefined || endLine === undefined) return no('the finding has no complete region');
+  const startCol = startColumn - (line >= 2 ? rule.shiftAfterFirstLine : 0);
+  const endCol = endColumn - (endLine >= 2 ? rule.shiftAfterFirstLine : 0);
+  if (endLine < line || startCol < 1 || endCol < 1 || (endLine === line && endCol < startCol)) return no('the region is empty or its end is before its start');
+  const file = f.file;
+  if (file === undefined || file === '' || file.startsWith('/') || file.includes('\0') || file.includes('\\') || file.split('/').some((x) => x === '..')) return no('the path is not inside the workspace');
+  try {
+    const read = (cache ?? new RegionCache()).get(file, () => loadWorkspaceFile(workspace, file));
+    if (!read.ok) return no(read.reason);
+    const first = lineStart(read, line);
+    const last = lineStart(read, endLine);
+    if (first === undefined || last === undefined) return no(read.got < read.size ? 'the region is too far into a large file' : 'the region is outside the file');
+    const lineEnd = (at: number): number => {   // exclusive end of the line starting at `at` (before its newline)
+      const nl = read.buf.indexOf(0x0a, at);
+      return nl === -1 || nl >= read.got ? read.got : nl;
+    };
+    const from = first + startCol - 1;
+    const to = last + endCol;   // end column inclusive: the exclusive offset is the column itself
+    if (from >= lineEnd(first) || to > lineEnd(last)) return no('the region is outside the file');
+    if (to - from > REGION_MAX_BYTES) return no('the region is over 64 KiB');
+    if (to - from < 1) return no('the region is empty or its end is before its start');
+    const bytes = Buffer.from(read.buf.subarray(from, to));
+    // a NUL cannot be in text a scanner matched in a source file; it is the sign of a file the scanner and the scrub read differently (review C1)
+    if (bytes.includes(0)) return no('the region holds a NUL byte');
+    return { ok: true, bytes };
+  } catch {
+    return no('the file cannot be read');
   }
 }
 
@@ -208,11 +260,18 @@ function uriSlot(f: ParsedFinding): string {
   return f.uriUnmapped ? `unmapped:${field(f.uriId)}` : '';
 }
 
-function nonSecretMessage(f: ParsedFinding, profile: Profile): string {
-  let m = maskSecretShapes(f.message);
+/** The message with what is specific to the profile removed (an image digest, a web host); not masked, not normalised. */
+function profileMessage(f: ParsedFinding, profile: Profile): string {
+  let m = f.message;
   if (profile === 'image') m = m.replace(/@?\bsha256:[0-9a-fA-F]{16,}/g, '');
   if (profile === 'web') m = m.replace(/\bhttps?:\/\/[^\s/]+/gi, '').replace(/\b\d{1,3}(?:\.\d{1,3}){3}(?::\d+)?\b/g, '');
-  return normaliseMessage(m, [f.line, f.endLine].filter((n): n is number => n !== undefined));
+  return m;
+}
+const ownLines = (f: ParsedFinding): number[] => [f.line, f.endLine].filter((n): n is number => n !== undefined);
+
+/** The message as it is hashed and written: profile-specific parts removed, everything secret-shaped masked (so no fingerprint covers a recognised secret), then normalised. */
+function nonSecretMessage(f: ParsedFinding, profile: Profile): string {
+  return normaliseMessage(maskSecretShapes(profileMessage(f, profile)), ownLines(f));
 }
 
 /**
@@ -233,8 +292,8 @@ export function fingerprintFinding(f: ParsedFinding, ctx: FpContext): FpResult {
     const base = [field(f.tool), field(f.ruleId), uriSlot(f)];
     const key = ctx.fpKey ?? '';
     return key === ''
-      ? { fingerprint: `quoted-nokey:${sha([...base, field(f.line)].join('\0'))}`, by: 'nokey' }
-      : { fingerprint: `quoted:${hmac(key, [...base, field(nonSecretMessage(f, profile))].join('\0'))}`, by: 'hash' };
+      ? { fingerprint: `quoted-nokey:${sha([...base, field(f.line)].join('\0'))}`, by: 'quoted-nokey' }
+      : { fingerprint: `quoted:${hmac(key, [...base, field(normaliseMessage(profileMessage(f, profile), ownLines(f)))].join('\0'))}`, by: 'quoted' };   // keyed, so the quoted string itself is covered: two strings in one file differ
   }
   if (!f.secret) {
     return { fingerprint: sha([field(f.tool), field(f.ruleId), profile === 'file' ? uriSlot(f) : '', field(nonSecretMessage(f, profile))].join('\0')), by: 'hash' };
@@ -246,7 +305,7 @@ export function fingerprintFinding(f: ParsedFinding, ctx: FpContext): FpResult {
   if (f.file === undefined) why = 'the finding has no file in the workspace';
   else if (ctx.workspace === undefined || ctx.workspace === '') why = 'no workspace to read the region from';
   else {
-    const region = readRegion(ctx.workspace, f);
+    const region = readRegion(ctx.workspace, f, ctx.cache);
     if (region.ok) {
       ctx.onRegion?.(region.bytes);
       return { fingerprint: `secret:${hmac(key, Buffer.concat([Buffer.from(`${where.join('\0')}\0`), region.bytes]))}`, by: 'region' };
@@ -263,8 +322,9 @@ function uriSlotZap(f: ParsedFinding): string {
 
 /** Every finding with its fingerprint, how it was made (`fpBy`) and, for the line form, why (`fpNote`). */
 export function fingerprintAll(findings: readonly ParsedFinding[], ctx: FpContext): FingerprintedFinding[] {
+  const shared: FpContext = { ...ctx, cache: ctx.cache ?? new RegionCache() };
   return findings.map((f) => {
-    const r = fingerprintFinding(f, ctx);
+    const r = fingerprintFinding(f, shared);
     return { ...f, fingerprint: r.fingerprint, fpBy: r.by, ...(r.note === undefined ? {} : { fpNote: r.note }) };
   });
 }

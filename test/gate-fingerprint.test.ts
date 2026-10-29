@@ -376,7 +376,7 @@ describe('fingerprint: rules that quote the matched string (bandit B105, B106, B
   });
   it('without a key: quoted-nokey: + sha256 of tool, rule, path and line, no message (an unkeyed hash of a password string would be guessable)', () => {
     const a = fingerprintFinding(f(`${PW}'one-plain'`), {});
-    expect(a).toMatchObject({ by: 'nokey', fingerprint: `${QPN}${sha(['bandit', 'B105', 'py/app.py', '4'].join('\0'))}` });
+    expect(a).toMatchObject({ by: 'quoted-nokey', fingerprint: `${QPN}${sha(['bandit', 'B105', 'py/app.py', '4'].join('\0'))}` });
   });
 });
 
@@ -385,7 +385,8 @@ describe('maskSecretShapes', () => {
     for (const v of [fake.githubClassic(), fake.githubPat(), fake.stripeKey(), fake.openaiKey(), fake.awsKey(), fake.slackBot(), fake.jwt(), fake.slackWebhook(), fake.googleKey(), fake.npmPublish()]) {
       expect(maskSecretShapes(`before ${v} after`), v.slice(0, 4)).toBe('before [REDACTED] after');
     }
-    expect(maskSecretShapes(`${fake.keyBegin()}\n${fake.keyBody()}\n${fake.keyEnd()} tail`)).toBe('[REDACTED] tail');
+    expect(maskSecretShapes(`${fake.keyBegin()}\n${fake.keyBody()}\n${fake.keyEnd()} tail`)).toBe('[REDACTED]\n tail');   // the shared core hides the block (BEGIN to END) and keeps the text after it, on the END line
+    expect(maskSecretShapes(`${fake.keyBegin()}\n${fake.keyBody()}\n${fake.keyEnd()} tail`)).not.toContain(fake.keyBody());
     expect(maskSecretShapes('Package: busybox 1.30.1-r2 CVE-2021-28831 https://avd.aquasec.com/nvd/cve-2021-28831')).toBe('Package: busybox 1.30.1-r2 CVE-2021-28831 https://avd.aquasec.com/nvd/cve-2021-28831');
   });
 });

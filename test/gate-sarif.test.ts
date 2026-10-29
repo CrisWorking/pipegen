@@ -369,7 +369,7 @@ describe('sarif: hostile keys and nesting (S7)', () => {
 });
 
 describe('uri: normalisation (S10, uri part)', () => {
-  const n = (uri: unknown, workspace: string | undefined = WS) => normaliseUri(uri, { workspace });
+  const n = (uri: unknown, workspace: string | undefined = WS) => normaliseUri(uri, { workspace, encoding: 'percent' });
 
   it('uri: relative paths stay, with ./ and // and . segments folded', () => {
     expect(n('src/a.js')).toBe('src/a.js');
