@@ -597,4 +597,52 @@ describe('read (P55 batch B: not a standalone service)', () => {
     expect((await one({ 'package.json': pkgOf({ start: 'node a.js' }, { dependencies: { 'react-email': '1.0.0', express: '5.0.0' } }) })).notStandalone).toBeUndefined();
     expect((await one({ 'package.json': pkgOf({ dev: 'email dev' }, { dependencies: { mjml: '4.0.0' } }), Dockerfile: 'FROM node:22\n' })).notStandalone).toBeUndefined();
   });
+
+  // P57 (I1): hiding a package needs strong proof; by default it is runnable. The svc probe's four reproductions.
+  describe('P57 I1: a package is hidden only with strong proof', () => {
+    const ws = (f: Record<string, string>) => files({ 'package.json': JSON.stringify({ name: 'root', private: true, workspaces: ['apps/*'] }), ...f });
+    const svcAt = async (f: Record<string, string>, path: string) => (await readProject(ws(f))).services.find((s) => s.path === path)!;
+    const HONO = 'import { Hono } from "hono";\nimport { serve } from "@hono/node-server";\nconst app = new Hono();\nserve({ fetch: app.fetch, port: 8787 });\n';
+
+    it('a Hono or h3 server that sends mail with react-email or mjml is a server, not an email-template package', async () => {
+      const api = await svcAt({
+        'apps/api/package.json': pkgOf({ dev: 'tsx watch src/index.ts', start: 'node dist/index.js' }, { dependencies: { hono: '4.0.0', '@hono/node-server': '1.0.0', '@react-email/components': '0.1.0' } }),
+        'apps/api/src/index.ts': HONO,
+      }, 'apps/api');
+      expect(api.notStandalone).toBeUndefined();
+      expect(isRunnable(api)).toBe(true);
+      const mailer = await svcAt({
+        'apps/mailer/package.json': pkgOf({ start: 'node src/server.js' }, { dependencies: { h3: '1.0.0', mjml: '4.0.0' } }),
+        'apps/mailer/src/server.js': 'import http from "node:http";\nimport { createApp, toNodeListener } from "h3";\nhttp.createServer(toNodeListener(createApp())).listen(3000);\n',
+      }, 'apps/mailer');
+      expect(mailer.notStandalone).toBeUndefined();
+      // an email package whose run script isn't the email tool's own CLI, even without a port found, stays runnable
+      const plain = await svcAt({ 'apps/m/package.json': pkgOf({ start: 'node src/x.js' }, { dependencies: { mjml: '4.0.0' } }), 'apps/m/src/x.js': 'console.log(1);\n' }, 'apps/m');
+      expect(plain.notStandalone).not.toBe('email-templates');
+    });
+
+    it('a Dockerfile that copies one file out of a folder, or one that belongs to no service (docker/api.Dockerfile), doesn\'t hide it', async () => {
+      const api = { 'apps/api/package.json': pkgOf({ dev: 'tsx watch src/index.ts', start: 'node dist/index.js' }), 'apps/api/src/index.ts': 'console.log(1);\n', 'apps/api/openapi.json': '{}\n' };
+      const web = { 'apps/web/package.json': pkgOf({ dev: 'vite', start: 'vite preview' }, { dependencies: { vite: '7.0.0' } }), 'apps/web/src/main.ts': 'x\n' };
+      const oneFile = await svcAt({ ...api, ...web, 'apps/web/Dockerfile': 'FROM node:22\nCOPY apps/api/openapi.json /app/openapi.json\nCOPY apps/web /app\n' }, 'apps/api');
+      expect(oneFile.notStandalone).toBeUndefined();
+      const dockerDir = await svcAt({ ...api, ...web, 'docker/api.Dockerfile': 'FROM node:22\nCOPY apps/api /app\n' }, 'apps/api');
+      expect(dockerDir.notStandalone).toBeUndefined();
+    });
+
+    it('a poller (while (!stop) with timers/promises), a recursive loop or any loop is not provably one-shot', async () => {
+      const worker = (code: string) => svcAt({ 'apps/worker/package.json': pkgOf({ start: 'node src/worker.js' }), 'apps/worker/src/worker.js': code }, 'apps/worker');
+      for (const code of [
+        'import { scheduler } from "node:timers/promises";\nlet stop = false;\nwhile (!stop) {\n  await fetch("https://x.test/jobs");\n  await scheduler.wait(5000);\n}\n',
+        'while (1) { await fetch("https://x.test"); }\n',
+        'async function poll() {\n  await fetch("https://x.test");\n  return poll();\n}\nawait poll();\n',
+        'async function poll() { await fetch("https://x.test"); setImmediate; return poll(); }\n',
+        'function tick() { console.log(1); tick(); }\n',
+        'do { await fetch("https://x.test"); } while (Date.now() > 0);\n',
+        'for (const x of jobs()) console.log(x);\n',
+      ]) expect((await worker(code)).notStandalone, code).toBeUndefined();
+      // a plain script still is one-shot
+      expect((await worker('console.log("hello");\n')).notStandalone).toBe('one-shot');
+    });
+  });
 });

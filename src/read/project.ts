@@ -205,7 +205,7 @@ async function readService(ctx: Ctx, dir: string, shared: Shared): Promise<Servi
   // P55 (batch B): a folder that runs only by its start script, but is a one-shot script, is built into another image, or is an email-template package
   const notStandalone = await notStandaloneOf({
     dir, read: (rel) => readFile(ctx, rel), fileSet: ctx.fileSet, copies: shared.copies, scripts: pkgScripts, deps, devDeps, frameworks,
-    hasDockerfile: dockerfile !== undefined, port, language,
+    hasDockerfile: dockerfile !== undefined, port, language, serviceDirs: shared.serviceDirs,
   });
   return { name, path: dir, language, packageManager, runtimeVersion, dockerfile, port, hasTests, testFramework, ...env, scripts, frameworks, quality, ...(notStandalone === undefined ? {} : { notStandalone }) };
 }

@@ -10,7 +10,10 @@
 //   - 'email-templates': a package of an email-template tool (react-email, mjml, maizzle) is a design-time tool that
 //     exports files; nothing deploys it.
 // Everything here is read through the caller's `read` (the read limits, no symbolic links), is bounded, and is
-// conservative: anything that can't be shown leaves the folder runnable.
+// conservative: anything that can't be shown leaves the folder runnable. P57 (I1): each case needs strong proof:
+//   - one-shot: the files have no loop (while, do, for) and no function that may call itself, on top of the rest;
+//   - built-in-image: the Dockerfile copies the whole folder, and it is the Dockerfile of another service's folder;
+//   - email-templates: no port, no server dependency, and every run script is the email tool's own CLI.
 import { builtinModules } from 'node:module';
 import { posix } from 'node:path';
 import { asString, baseOf, dirOf, inDir } from './manifest.js';
@@ -30,7 +33,20 @@ const RUN_SCRIPTS = ['start', 'dev', 'serve'];
 const EMAIL_TOOLS = ['react-email', '@react-email/components', '@react-email/render', 'mjml', '@maizzle/framework', 'maizzle'];
 
 /** Node built-ins that open a socket, start a process or a thread, or read the terminal: a script using one may keep running. */
-const LONG_RUNNING_BUILTINS: ReadonlySet<string> = new Set(['http', 'https', 'http2', 'net', 'tls', 'dgram', 'cluster', 'worker_threads', 'child_process', 'readline', 'repl', 'inspector', 'tty', 'dns']);
+const LONG_RUNNING_BUILTINS: ReadonlySet<string> = new Set(['http', 'https', 'http2', 'net', 'tls', 'dgram', 'cluster', 'worker_threads', 'child_process', 'readline', 'repl', 'inspector', 'tty', 'dns',
+  // P57 (I1): timers/promises (scheduler.wait, setInterval as an async iterator) and events (on, once) can keep a script alive
+  'timers', 'events']);
+/** P57 (I1): a loop keyword: a script with one may keep running (a poller), so it is never shown one-shot. */
+const LOOP_RE = /\b(?:while|do|for)\b/;
+/** P57 (I1): a declared function's name, so a call of it inside the file (recursion is a loop too) can be found. */
+const FUNCTION_NAME_RE = /\bfunction\s*\*?\s*([A-Za-z_$][A-Za-z0-9_$]*)|\b(?:const|let|var)\s+([A-Za-z_$][A-Za-z0-9_$]*)\s*=\s*(?:async\s*)?(?:function\b|\([^)]*\)\s*=>|[A-Za-z_$][A-Za-z0-9_$]*\s*=>)/g;
+/** P57 (I1): a call: a name right before `(` (one pass per line). */
+const CALL_RE = /(?<![A-Za-z0-9_$.])([A-Za-z_$][A-Za-z0-9_$]*)\s*\(/g;
+/** P57 (I1): dependencies that make a package a server (it listens), whatever else it uses. */
+const SERVER_DEPS = ['hono', '@hono/node-server', 'h3', 'elysia', 'express', 'fastify', 'koa', '@nestjs/core', 'next', 'nuxt', '@remix-run/node', '@remix-run/serve',
+  '@sveltejs/kit', 'astro', 'nitropack', '@hapi/hapi', 'restify', 'polka', 'micro', 'srvx', 'socket.io', 'ws', 'graphql-yoga', '@apollo/server', 'apollo-server'];
+/** P57 (I1): the email tools' own CLIs (react-email's `email`, mjml, maizzle), optionally through npx / bunx / pnpm exec. */
+const EMAIL_CLI_RE = /^(?:(?:npx|bunx|pnpm exec|yarn)\s+)?(?:email|mjml|maizzle)(?:\s|$)/;
 const BUILTINS: ReadonlySet<string> = new Set(builtinModules.map((m) => m.replace(/^node:/, '')));
 /** Text that starts or keeps something running (a server, a timer, an event handler, a loop). Case-sensitive, linear. */
 const LONG_RUNNING_RE = /\b(?:listen|createServer|serve|setInterval|setTimeout|setImmediate|WebSocket|addEventListener|process\.(?:stdin|on|once)|\.on\s*\(|fork|spawn|exec|execSync|cron|schedule|watch|Server|app\.use)\b|while\s*\(\s*true\s*\)|for\s*\(\s*;\s*;\s*\)/;
@@ -60,10 +76,14 @@ export function copySources(dockerDir: string, text: string, has: (path: string)
   return sources.map((s) => (inOwn ? inDir(dockerDir, s) : s));
 }
 
-/** Whether another folder's Dockerfile copies `dir` (or a file in it) into its image. */
-function builtIntoAnImage(dir: string, copies: readonly DockerCopy[]): boolean {
+/**
+ * Whether another service's Dockerfile copies the whole of `dir` into its image. P57 (I1): one file out of the folder
+ * (an openapi.json) doesn't make it part of that image, and a Dockerfile that belongs to no service (docker/api.Dockerfile
+ * copying apps/api) may be the folder's own.
+ */
+function builtIntoAnImage(dir: string, copies: readonly DockerCopy[], serviceDirs: readonly string[]): boolean {
   if (dir === '.') return false;
-  return copies.some((c) => c.dockerDir !== dir && !c.dockerDir.startsWith(`${dir}/`) && (c.source === dir || c.source.startsWith(`${dir}/`)));
+  return copies.some((c) => c.dockerDir !== dir && !c.dockerDir.startsWith(`${dir}/`) && c.source === dir && serviceDirs.includes(c.dockerDir));
 }
 
 /** The one file `node [--flags] file.js` runs, repo-relative, or null for any other script text. */
@@ -84,8 +104,13 @@ type Reader = (rel: string) => Promise<string | null>;
  */
 function importsOf(lines: readonly string[]): string[] | null {
   const rel: string[] = [];
+  const names = new Set<string>();
+  for (const line of lines) for (const m of line.matchAll(FUNCTION_NAME_RE)) names.add((m[1] ?? m[2]) as string);
   for (const line of lines) {
-    if (LONG_RUNNING_RE.test(line)) return null;
+    if (LONG_RUNNING_RE.test(line) || LOOP_RE.test(line)) return null;
+    // a declared function named again (a call; inside its own body it is recursion): pipegen doesn't tell which
+    // the declaration itself (`function poll(`) is not a call; anything else naming it is
+    if (names.size > 0) for (const m of line.replace(/\bfunction\s*\*?\s*[A-Za-z_$][A-Za-z0-9_$]*\s*\(/g, 'function (').matchAll(CALL_RE)) if (names.has(m[1] as string)) return null;
     if (/\b(?:import|require)\s*\(\s*(?!['"])/.test(line)) return null; // a computed import
     const specs = [...line.matchAll(/\bfrom\s+['"]([^'"]+)['"]/g), ...line.matchAll(/^\s*import\s+['"]([^'"]+)['"]/g), ...line.matchAll(/\b(?:require|import)\s*\(\s*['"]([^'"]+)['"]/g)];
     for (const [, spec] of specs) {
@@ -128,16 +153,19 @@ async function isOneShot(entry: string, read: Reader, fileSet: ReadonlySet<strin
 export interface KindInput {
   dir: string; read: Reader; fileSet: ReadonlySet<string>; copies: readonly DockerCopy[];
   scripts: Obj; deps: Obj; devDeps: Obj; frameworks: readonly string[]; hasDockerfile: boolean; port: number | undefined; language: string;
+  /** P57 (I1): every service folder of the repo, so only a service's own Dockerfile can build a folder into its image. */
+  serviceDirs: readonly string[];
 }
 
 /** Why this folder isn't a standalone service, or undefined (the folder keeps the runnable test of isRunnable). */
 export async function notStandaloneOf(k: KindInput): Promise<NotStandalone | undefined> {
   if (k.hasDockerfile || k.frameworks.length > 0 || k.language !== 'node') return undefined;
   const names = new Set([...Object.keys(k.deps), ...Object.keys(k.devDeps)]);
-  if (EMAIL_TOOLS.some((t) => names.has(t))) return 'email-templates';
-  if (k.port !== undefined) return undefined;
-  if (builtIntoAnImage(k.dir, k.copies)) return 'built-in-image';
+  // P57 (I1): a port found, or a server dependency, and it is a server, whatever else it uses
+  if (k.port !== undefined || SERVER_DEPS.some((d) => names.has(d))) return undefined;
   const run = RUN_SCRIPTS.filter((n) => n in k.scripts);
+  if (EMAIL_TOOLS.some((t) => names.has(t)) && run.length > 0 && run.every((n) => EMAIL_CLI_RE.test((asString(k.scripts[n]) ?? '').trim()))) return 'email-templates';
+  if (builtIntoAnImage(k.dir, k.copies, k.serviceDirs)) return 'built-in-image';
   if (run.length === 0) return undefined;
   for (const n of run) {
     const entry = nodeEntry(k.dir, asString(k.scripts[n]) ?? '');
