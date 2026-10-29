@@ -123,9 +123,12 @@ Work through it in order. Tick a step only after Cristiano said go and the resul
 - [ ] **B5. `npm-release` environment on the real repo** (ask Cristiano first): deployment branches and tags limited to `v*`
       tags. When a second maintainer exists, also turn on required reviewers and "prevent self-review" for it.
 - [ ] **B6. Rulesets on `main`, just before the first release, not during the build** (ask Cristiano first): pull requests
-      required, required checks of `ci` (including `cooldown`), no force-push, no deletion, signed commits required, and
-      code-owner review of `/.github/`, `/scripts/` and `/data/` (this is what makes the cooldown and the trust-root lists
-      more than advisory, see [cooldown.md](cooldown.md)). A solo owner cannot approve their own PRs, so the owner needs a
+      required, required checks of `ci`: `test (node 24)` and `test (node 26)` (they carry the secret-scanner live tests,
+      `node scripts/scanner-live.ts`), `cooldown`, `pins-upstream` (every pin re-tied to upstream), `no-runtime-deps`,
+      `notices-fresh` and `workflow-lint`; no force-push, no deletion, signed commits required, and code-owner review of
+      every path in `.github/CODEOWNERS` (`/.github/`, `/scripts/`, `/data/`, `/src/ai/`, and the trust-root tests and
+      test helpers under `/test/`: this is what makes the cooldown, the trust-root lists and the scanner checklist more
+      than advisory, see [cooldown.md](cooldown.md)). A solo owner cannot approve their own PRs, so the owner needs a
       bypass on the PR rules (DEC #74). Record the ruleset ids here.
 - [ ] **B7. GitHub private vulnerability reporting on** (ask Cristiano first; S9).
 - [ ] **B8. The `security-fix` label** (ask Cristiano first). Create it on the real repo: the cooldown's emergency path
