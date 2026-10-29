@@ -1538,7 +1538,11 @@ const neutralizeAllow = (s: string) => s.replace(ALLOW_COMMENT, (_m, tool: strin
 
 const PATHS_FILE = 'paths.txt';
 
-interface PathPiece { name: string; first: number; count: number; canary: string; written: string }
+/** One file-list piece: its lines, and for each line the index of the name it stands for (`owners`). */
+interface PathPiece { name: string; owners: number[]; count: number; canary: string; written: string }
+
+/** One scanned line of the file list and the index of the name it belongs to. */
+interface NameLine { text: string; owner: number }
 
 /**
  * Ruling P36: the bundle's file list as one or more pieces (paths.txt, paths2.txt, …), split at line boundaries so each
@@ -1561,26 +1565,115 @@ export function scanLine(name: string): string {
   return parts.join(' ');
 }
 
-function pathPieces(lines: string[], scannerName: string): PathPiece[] {
+function pathPieces(lines: NameLine[], scannerName: string): PathPiece[] {
   const pieces: PathPiece[] = [];
   const fixed = Buffer.byteLength(asScanned('x', newCanary())) - 1; // the prefix, the separators and a canary line
   let first = 0;
   while (pieces.length === 0 || first < lines.length) {
     let bytes = fixed;
     let count = 0;
-    while (first + count < lines.length && bytes + Buffer.byteLength(lines[first + count]) + (count > 0 ? 1 : 0) <= SCAN_CHUNK_SAFE_BYTES) {
-      bytes += Buffer.byteLength(lines[first + count]) + (count > 0 ? 1 : 0);
+    while (first + count < lines.length && bytes + Buffer.byteLength((lines[first + count] as NameLine).text) + (count > 0 ? 1 : 0) <= SCAN_CHUNK_SAFE_BYTES) {
+      bytes += Buffer.byteLength((lines[first + count] as NameLine).text) + (count > 0 ? 1 : 0);
       count++;
     }
     if (count === 0 && first < lines.length) throw new SecretScanError(`A file name in the bundle is too long for ${scannerName} to scan safely; nothing was sent.`);
     const canary = newCanary();
-    const written = asScanned(lines.slice(first, first + count).join('\n'), canary);
+    const part = lines.slice(first, first + count);
+    const written = asScanned(part.map((l) => l.text).join('\n'), canary);
     // R1 for the paths too: the scanners would skip such a piece, and so never check those file names. Fail closed.
     if (scannersWouldSkip(written)) throw new SecretScanError(`The bundle's file list has a binary-format marker at a byte the ${scannerName} scanner sniffs, so it would not be scanned; nothing was sent.`);
-    pieces.push({ name: pieces.length === 0 ? PATHS_FILE : `paths${pieces.length + 1}.txt`, first, count, canary, written });
+    pieces.push({ name: pieces.length === 0 ? PATHS_FILE : `paths${pieces.length + 1}.txt`, owners: part.map((l) => l.owner), count, canary, written });
     first += count;
   }
   return pieces;
+}
+
+/** P48: at most this many extra scan lines (segments and decoded text) for one name; a name that needs more is hidden. */
+export const MAX_NAME_LINES = 48;
+/** P48: at most this many extra scan lines in all; names past it are hidden whole (failing closed). */
+export const MAX_EXTRA_NAME_LINES = 200_000;
+/** P48: a decoded piece of a name is scanned when it has at least this many printable characters in a row. */
+const MIN_DECODED_PIECE = 8;
+
+/** Printable ASCII runs of MIN_DECODED_PIECE or more characters in decoded bytes (read as latin1, one char per byte). */
+function readablePieces(bytes: Buffer): string[] {
+  return bytes.toString('latin1').match(new RegExp(`[\\x20-\\x7e]{${MIN_DECODED_PIECE},}`, 'g')) ?? [];
+}
+
+/**
+ * P48: pipegen's own decoding of a name, so it doesn't depend on where the scanners start a token. Every maximal run of
+ * base64 or base64url characters is decoded from each of its first four characters (the four alignments: a secret that
+ * starts anywhere in the run is decoded whole in one of them), every run of hex digits from each of its first two, and
+ * the name once with percent-escapes decoded. The readable pieces are returned (deduplicated, in order).
+ */
+export function decodedNamePieces(name: string): string[] {
+  const out = new Set<string>();
+  for (const run of name.match(/[A-Za-z0-9+/_=-]{12,}/g) ?? []) {
+    for (let k = 0; k < 4 && k < run.length; k++) for (const p of readablePieces(Buffer.from(run.slice(k), 'base64'))) out.add(p);
+  }
+  for (const run of name.match(/[0-9a-fA-F]{16,}/g) ?? []) {
+    for (let k = 0; k < 2; k++) {
+      const even = run.slice(k, k + Math.floor((run.length - k) / 2) * 2);
+      for (const p of readablePieces(Buffer.from(even, 'hex'))) out.add(p);
+    }
+  }
+  if (/%[0-9a-fA-F]{2}/.test(name)) {
+    const decoded = name.replace(/(?:%[0-9a-fA-F]{2})+/g, (m) => {
+      try {
+        return decodeURIComponent(m);
+      } catch {
+        return Buffer.from(m.replaceAll('%', ''), 'hex').toString('latin1');
+      }
+    });
+    if (decoded !== name) out.add(decoded);
+  }
+  for (const p of [...out]) if (name.includes(p)) out.delete(p); // already on the name's own line
+  return [...out];
+}
+
+/**
+ * P48: every line scanned for one name: the name (scanLine of the form the report shows), each of its path segments on
+ * a line of its own (so a token starts at the segment, however deep), and pipegen's own decodings of it. Null when it
+ * would take more than MAX_NAME_LINES extra lines: then the name is hidden instead (failing closed).
+ */
+function nameLines(path: string): string[] | null {
+  const shown = scannedName(path);
+  const extra = new Set<string>();
+  for (const seg of shownForm(path).split('/')) if (seg.length >= MIN_GLOBAL_SECRET && seg !== shown) extra.add(seg);
+  for (const piece of decodedNamePieces(shownForm(path))) extra.add(piece);
+  if (extra.size > MAX_NAME_LINES) return null;
+  return [scanLine(shown), ...[...extra].map((x) => x.replaceAll('\n', ' '))];
+}
+
+/** Shannon entropy of a string, in bits per character. */
+function entropy(s: string): number {
+  const counts = new Map<string, number>();
+  for (const c of s) counts.set(c, (counts.get(c) ?? 0) + 1);
+  let h = 0;
+  for (const n of counts.values()) {
+    const p = n / s.length;
+    h -= p * Math.log2(p);
+  }
+  return h;
+}
+
+/**
+ * P48 belt: the part of a name that looks like an encoded secret whatever the scanner says: in one path segment, a run
+ * of 20 or more base64 characters (`+`, `=`, letters, digits) holding both letters and digits, with a Shannon entropy of
+ * at least 3.5 bits per character (3.0 when the run is only hex digits). Measured on 36,862 real file names (express,
+ * flask, trpc, left-pad, next.js): 11 match (0.03%; none in express, flask, trpc or left-pad; in next.js 7 hashed font
+ * and lockfile names and 4 `classPrivateField{Get,Set}2.js` babel helpers), and 92% of random base64, base64url and hex
+ * secrets of 15 to 45 bytes do. Returns the matching runs.
+ */
+export function highEntropyRuns(name: string): string[] {
+  const hits: string[] = [];
+  for (const seg of name.split('/')) {
+    for (const run of seg.match(/[A-Za-z0-9+=]{20,}/g) ?? []) {
+      if (!/\d/.test(run) || !/[A-Za-z]/.test(run)) continue;
+      if (entropy(run) >= (/^[0-9a-fA-F]+$/.test(run) ? 3.0 : 3.5)) hits.push(run);
+    }
+  }
+  return hits;
 }
 
 const isWordChar = (c: number) => isLetter(c) || isDigit(c) || c === 95; // [A-Za-z0-9_]
@@ -1604,39 +1697,34 @@ export function tokenSpans(text: string, v: string): Span[] {
 // A found secret shorter than this is not removed from every file (it would hit ordinary text).
 export const MIN_GLOBAL_SECRET = 6;
 
-/** At most this many cut points per run are tried by encodedSpans (so a hostile name can't make it slow). */
-const MAX_CUTS = 48;
-
 /**
- * P45: the parts of `name` that decode (base64 or base64url, hex, or percent-encoding, as the scanners decode) to text
- * holding `value`; the shortest ones. A part starts and ends at the ends of a run of encoding characters or at a
- * separator inside it (`/`, `-`, `_`, `+`, `=`, `.`), so `src/<b64>.ts` gives `<b64>`. Empty when nothing decodes to it.
+ * P45/P48: the parts of `name` whose decoding holds `value`, as the encoded text to mask; the shortest ones. Every
+ * maximal run of base64/base64url characters is decoded at its four alignments (as decodedNamePieces does), and every
+ * run of hex digits at its two; where the decoded bytes hold `value`, the encoded characters that produced those bytes
+ * are the span. A part with percent-escapes is decoded whole. Linear in the name. Empty when nothing decodes to it.
  */
 export function encodedSpans(name: string, value: string): string[] {
   if (value.length === 0) return [];
+  const want = Buffer.from(value, 'utf8').toString('latin1');
   const hits: string[] = [];
-  const holds = (bytes: Buffer) => bytes.toString('utf8').includes(value) || bytes.toString('latin1').includes(value);
-  for (const run of name.match(/[A-Za-z0-9+/_=.%-]{8,}/g) ?? []) {
-    const cuts = [0];
-    for (let i = 0; i < run.length && cuts.length < MAX_CUTS; i++) if ('/-_+=.'.includes(run[i] as string)) cuts.push(i, i + 1);
-    cuts.push(run.length);
-    const points = [...new Set(cuts)].sort((a, b) => a - b);
-    for (const a of points) {
-      for (const b of points) {
-        if (b - a < 8) continue;
-        const part = run.slice(a, b);
-        let ok = false;
-        if (/^[A-Za-z0-9+/_-]+={0,3}$/.test(part)) ok = holds(Buffer.from(part, 'base64'));
-        if (!ok && /^(?:[0-9a-fA-F]{2})+$/.test(part)) ok = holds(Buffer.from(part, 'hex'));
-        if (!ok && part.includes('%')) {
-          try {
-            ok = decodeURIComponent(part).includes(value);
-          } catch {
-            ok = false;
-          }
-        }
-        if (ok) hits.push(part);
-      }
+  const add = (run: string, start: number, end: number) => hits.push(run.slice(Math.max(0, start), Math.min(run.length, end)));
+  for (const run of name.match(/[A-Za-z0-9+/_=-]{8,}/g) ?? []) {
+    for (let k = 0; k < 4 && k < run.length; k++) {
+      const text = Buffer.from(run.slice(k), 'base64').toString('latin1');
+      for (let i = text.indexOf(want); i >= 0; i = text.indexOf(want, i + 1)) add(run, k + Math.floor(i / 3) * 4, k + Math.ceil((i + want.length) / 3) * 4);
+    }
+  }
+  for (const run of name.match(/[0-9a-fA-F]{16,}/g) ?? []) {
+    for (let k = 0; k < 2; k++) {
+      const text = Buffer.from(run.slice(k, k + Math.floor((run.length - k) / 2) * 2), 'hex').toString('latin1');
+      for (let i = text.indexOf(want); i >= 0; i = text.indexOf(want, i + 1)) add(run, k + 2 * i, k + 2 * (i + want.length));
+    }
+  }
+  for (const part of name.match(/[A-Za-z0-9_~%+-]*%[0-9a-fA-F]{2}[A-Za-z0-9_~%+-]*/g) ?? []) {
+    try {
+      if (decodeURIComponent(part).includes(value)) hits.push(part);
+    } catch {
+      // not valid percent-encoding: the scanners can't decode it either
     }
   }
   if (hits.length === 0) return [];
@@ -1691,7 +1779,23 @@ async function secretScanPass(files: FileEntry[], scanner: SecretScanner, timeou
     await chmod(tmp, 0o700);
     // Neutral names: no repo file name (.gitleaksignore, .gitleaks.toml, allowlisted paths) reaches the scanner.
     const names = scanned.map((_, i) => `f${String(i + 1).padStart(6, '0')}.txt`);
-    const pieces = pathPieces([...scanned.map((f) => f.path), ...others].map((p) => neutralizeAllow(scanLine(scannedName(p)))), name);
+    // P48: each name as several lines (the name, its segments, pipegen's own decodings), each tied to that name. A name
+    // that needs too many lines, or comes after the total cap, is not scanned in full: it is hidden instead.
+    const lines: NameLine[] = [];
+    const unscannable: number[] = [];
+    let extraLines = 0;
+    const allNames = [...scanned.map((f) => f.path), ...others];
+    allNames.forEach((p, k) => {
+      const all = nameLines(p);
+      if (all === null || extraLines + all.length - 1 > MAX_EXTRA_NAME_LINES) {
+        unscannable.push(k);
+        lines.push({ text: neutralizeAllow(scanLine(scannedName(p))), owner: k });
+        return;
+      }
+      extraLines += all.length - 1;
+      for (const text of all) lines.push({ text: neutralizeAllow(text), owner: k });
+    });
+    const pieces = pathPieces(lines, name);
     // P34 belt: the default path allowlist matches the absolute path, so a temp folder under node_modules/ (or another
     // folder it lists) would hide every file. Refused before anything is written; the canaries below are the guarantee.
     if ([...names, ...pieces.map((p) => p.name)].some((n) => skippedByDefaultPaths(join(tmp, n)))) {
@@ -1754,6 +1858,15 @@ async function secretScanPass(files: FileEntry[], scanner: SecretScanner, timeou
       if (k < scanned.length) badPath.add(k);
       else flaggedNames.add(others[k - scanned.length]);
     };
+    // P48: a name too big to scan in full is treated as flagged (failing closed); so is one the entropy belt matches,
+    // whatever the scanner said: its file is left out, the name hidden, and the high-entropy text masked everywhere
+    for (const k of unscannable) flagName(k);
+    allNames.forEach((p, k) => {
+      const runs = highEntropyRuns(shownForm(p));
+      if (runs.length === 0) return;
+      flagName(k);
+      flagged.report?.push(...runs);
+    });
     const secrets = new Set<string>();
     const shortSecrets = new Set<string>();
     const shortHit = new Set<number>();
@@ -1777,8 +1890,8 @@ async function secretScanPass(files: FileEntry[], scanner: SecretScanner, timeou
         // match at column 0 of the next line) still names only lines from its start: none before it can hold it
         if (s !== undefined && e !== undefined && s >= 1 && s <= e && s <= piece.count) {
           for (let k = s - 1; k < Math.min(e, piece.count); k++) {
-            flagName(piece.first + k);
-            onLines.push(piece.first + k);
+            flagName(piece.owners[k] as number);
+            onLines.push(piece.owners[k] as number);
           }
           hit = true;
         }

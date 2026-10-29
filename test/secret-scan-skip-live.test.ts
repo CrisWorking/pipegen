@@ -9,9 +9,10 @@ import { randomBytes } from 'node:crypto';
 import { existsSync, mkdirSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
-import { bundleCode, bundleText, SCAN_CHUNK_SAFE_BYTES, SecretScanError, secretScanArgv, secretScanConfigPath } from '../src/ai/redact.js';
+import { bundleCode, bundleText, decodedNamePieces, SCAN_CHUNK_SAFE_BYTES, SecretScanError, secretScanArgv, secretScanConfigPath } from '../src/ai/redact.js';
 import { DEFAULT_SKIPPED_PATHS, type SecretScannerName } from '../src/ai/secret-scan-config.js';
 import { ensurePinnedBinary } from '../src/engine/linters.js';
+import { makeSafeOutput } from '../src/util/safe-output.js';
 import { betterleaksAt, gitleaksAt, scanWith } from './helpers/gitleaks-stub.js';
 import { counted } from './helpers/counted.js';
 import { cleanupRepos, makeTempDir, writeIn } from './helpers/make-repo.js';
@@ -294,6 +295,53 @@ describe.skipIf(!live)('secret scan (live, both pinned scanners): a scan path th
       expect(b.found.values, name).toContain(shop);
       expect(b.notes.join('\n'), name).not.toContain(encoded);
       expect(b.files.map((f) => f.path), `${name}: the other file is still sent`).toEqual(['src/a.ts']);
+    }
+  });
+
+  it('live (P48): the reviewer\'s repros (a token not at a separator, past 24 separators, hex) are flagged by both real scanners and masked', async () => {
+    const shop = shopifyRandom();
+    const text = ['tok' + 'en', shop].join('=');
+    const b64 = Buffer.from(text).toString('base64').replace(/=+$/, '');
+    const hex = Buffer.from(text).toString('hex');
+    const repros: Record<string, string> = {
+      'ab<b64>': `config/ab${b64}.env`, 'x<b64>': `src/x${b64}.ts`, 'abc<b64>': `src/abc${b64}.ts`, 'abcd<b64>': `src/abcd${b64}.ts`,
+      '26 dd/': `${'dd/'.repeat(26)}${b64}.env`, 'a<hex>': `config/a${hex}.env`,
+    };
+    // the scanner itself, not the entropy belt: each name as written alone is missed, and pipegen's decoded lines are found
+    const reportOf = (name: SecretScannerName, lines: string[]): Record<string, string>[] => {
+      const dir = makeTempDir();
+      writeIn(dir, 'f000001.txt', `\n${lines.join('\n')}\n`);
+      const reportPath = join(makeTempDir(), 'report.json');
+      try {
+        execFileSync(bins[name] as string, secretScanArgv(name, dir, secretScanConfigPath(), reportPath), { cwd: dir, env: { PATH: process.env.PATH ?? '', HOME: process.env.HOME ?? '' }, stdio: 'pipe', timeout: 120_000 });
+      } catch (e) {
+        if (typeof (e as { status?: unknown }).status !== 'number') throw e;
+      }
+      return JSON.parse(readFileSync(reportPath, 'utf8')) as Record<string, string>[];
+    };
+    for (const name of NAMES) {
+      for (const [label, n] of Object.entries(repros)) {
+        expect(reportOf(name, [n]).filter((f) => f.RuleID !== 'pipegen-canary'), `${name} ${label}: the bare name is missed`).toEqual([]);
+        expect(reportOf(name, decodedNamePieces(n)).some((f) => f['Sec' + 'ret'] === shop), `${name} ${label}: pipegen's decoded line is found`).toBe(true);
+      }
+    }
+    const repo = makeTempDir();
+    writeIn(repo, 'src/a.ts', 'export const a = 1;\n');
+    for (const n of Object.values(repros)) writeIn(repo, n, 'export const v = 1;\n');
+    for (const name of NAMES) {
+      const b = await bundleCode(repo, scanWith(scannerFor(name)));
+      const flagged = Object.entries(repros).filter(([, n]) => b.found.names.includes(n)).map(([l]) => l);
+      console.log(`P48 ${name}: flagged ${flagged.length}/6 ${JSON.stringify(flagged)}`);
+      expect(flagged, name).toEqual(Object.keys(repros));
+      expect(b.found.values, name).toContain(shop);
+      expect(b.files.map((f) => f.path), name).toEqual(['src/a.ts']);
+      // the report masks the encoded text in any other string too
+      const mask = makeSafeOutput([], b.found);
+      for (const n of Object.values(repros)) {
+        const shown = mask(`elsewhere: x${n.split('/').pop() as string}`, { target: 'terminal', max: 5000 });
+        expect(shown, `${name} ${n.slice(0, 20)}`).not.toContain(b64.slice(4, 30));
+        expect(shown, `${name} ${n.slice(0, 20)}`).not.toContain(hex.slice(4, 40));
+      }
     }
   });
 });
