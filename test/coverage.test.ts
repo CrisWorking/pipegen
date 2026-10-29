@@ -2804,3 +2804,36 @@ describe('coverage: repo shell script files, fix round 1 (P50)', () => {
     expect((await mergeTests(withScript(steps('docker run --rm python:3.14 bash scripts/test.sh')))).status).toBe('unknown');
   });
 });
+
+// Round 2 (ruling P51, review M2): in a followed script, a test that runs only under a condition is partial, saying so.
+describe('coverage: conditions inside a followed script (P51)', () => {
+  const st = async (script: string) => {
+    const dir = makeTempDir();
+    wf(dir, 'ci.yml', `${both}jobs:\n  t:\n    runs-on: ubuntu-latest\n    steps:\n${run('bash scripts/test.sh')}`);
+    writeIn(dir, 'scripts/test.sh', script);
+    return row(await coverage(dir), 'merge', 'unit-tests');
+  };
+
+  it('P51: a test run only inside if/case/while, after && or || on a test, or after a conditional exit is partial', async () => {
+    for (const s of [
+      'set -e\nif [ "$1" = ci ]; then\n  pytest\nfi\n',
+      'set -e\ncase "$1" in\n  ci) pytest ;;\nesac\n',
+      'set -e\nwhile false; do pytest; done\n',
+      'set -e\n[ -n "$CI" ] && pytest\n',
+      'set -e\ntest -z "$SKIP" || pytest\n',
+      'set -e\n[ -n "$CI" ] && exit 0\npytest\n',
+      'set -e\nif [ -n "$CI" ]; then exit 0; fi\npytest\n',
+      'set -e\nf() { return 0; }\n[ -z "$X" ] || return 0\npytest\n',
+    ]) {
+      const r = await st(s);
+      expect(r.status, s).toBe('partial');
+      expect(r.why, s).toBe('Your own `scripts/test.sh` runs the check only under a condition in that script, so it may not run on every pull request.');
+    }
+  });
+
+  it('P51: an unconditional run stays covered (also after a plain `cd x &&` and after a finished if block)', async () => {
+    for (const s of ['set -e\npytest\n', 'set -e\ncd . && pytest\n', 'set -e\nif [ -n "$X" ]; then echo x; fi\npytest\n']) {
+      expect((await st(s)).status, s).toBe('covered');
+    }
+  });
+});

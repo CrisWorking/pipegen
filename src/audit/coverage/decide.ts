@@ -67,6 +67,7 @@ const REASON_WHY: Readonly<Record<Reason, (subject: string, when: string) => str
   'no-fail': (s) => `${s} runs, but doesn't fail on findings unless told to, so it can't block anything.`,
   never: (s) => `${s} reports findings but doesn't fail the job, so it can't block anything.`,
   condition: (s, when) => `${s} runs only when a condition holds, so it may not run ${when}.`,
+  'script-condition': (s, when) => `${s} runs the check only under a condition in that script, so it may not run ${when}.`,
   'hook-repo': (s) => `${s} comes from a pre-commit hook repo pipegen doesn't know, so pipegen can't tell what it really runs.`,
   files: (s) => `${s} runs only on the files its pre-commit files, exclude or types settings allow, and pipegen doesn't check which files those are.`,
   stage: (s) => `${s} is set up for another pre-commit stage, so it doesn't run before each commit.`,

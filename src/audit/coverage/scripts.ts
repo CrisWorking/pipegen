@@ -114,7 +114,7 @@ export async function resolveScripts(ctx: Ctx, found: Found[]): Promise<Found[]>
 }
 
 /** How bash runs a script file (`bash x.sh`, `./x.sh`): no -e unless the file sets it (`set -e`, read by scanShell). */
-const SCRIPT_FILE_SHELL: ShellMode = { errexit: false, pipefail: false };
+const SCRIPT_FILE_SHELL: ShellMode = { errexit: false, pipefail: false, script: true };
 
 /**
  * DoD run (fastapi/full-stack-fastapi-template: `uv run bash scripts/tests-start.sh` → `bash scripts/test.sh` →

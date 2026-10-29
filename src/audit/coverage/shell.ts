@@ -11,7 +11,8 @@ import type { Budget, CommandRule, Compiled, Found, Reason } from './types.js';
 // ---------- reading shell text (review M2: command position only; round 2: quotes, lists, groups, pipes) ----------
 
 /** How a step's shell treats failures. GitHub: default `bash -e {0}`; `bash` adds -o pipefail; `sh` is `sh -e {0}`. */
-export interface ShellMode { errexit: boolean; pipefail: boolean }
+/** `script` (P51): the text is a repo script file pipegen follows, where a check run only under a condition is partial. */
+export interface ShellMode { errexit: boolean; pipefail: boolean; script?: boolean }
 export const DEFAULT_SHELL: ShellMode = { errexit: true, pipefail: false };
 
 /** The mode of a step's `shell:` (or defaults.run.shell). A custom shell without -e (bash {0}, pwsh, python) has no errexit. */
@@ -30,6 +31,10 @@ export function shellMode(v: unknown): ShellMode {
 
 const ASSIGN = /^[A-Za-z_][A-Za-z0-9_]*=/;
 /** Words after which the next non-flag word is a command. */
+/** P51: the compound commands whose body runs only under a condition. */
+const CONDITIONAL_KW: ReadonlySet<string> = new Set(['if', 'case', 'while', 'until']);
+/** P51: commands that only test a condition (`[ … ] && x`, `test -z … || x`). */
+const TEST_COMMANDS: ReadonlySet<string> = new Set(['[', '[[', 'test']);
 /** P50 (C1): the shells whose flags are allowlisted before a script (anything else: the command gives no coverage). */
 const SHELLS: ReadonlySet<string> = new Set(['sh', 'bash', 'zsh', 'dash']);
 /** -e -u -x -v and their combined and `+` forms (-eux, +x). */
@@ -256,6 +261,16 @@ export function scanShell(text: string, base: string | null, sigs: Compiled, bud
       if (open.length > 0) pair(k);
     }
   }
+  // P51: how many if / case / while / until compound commands hold each token (a prefix sum over their ranges)
+  const condDepth = new Int32Array(n + 1);
+  if (mode.script === true) {
+    for (let k = 0; k < n; k++) {
+      if (toks[k]!.kw !== 'open' || !CONDITIONAL_KW.has(toks[k]!.w)) continue;
+      condDepth[k + 1]! += 1;
+      condDepth[closer[k]! >= 0 ? closer[k]! : n]! -= 1;
+    }
+    for (let k = 1; k <= n; k++) condDepth[k]! += condDepth[k - 1]!;
+  }
   const closes = (k: number) => toks[k]!.op === ')' || toks[k]!.op === '}' || (toks[k]!.kw === 'close' && opener[k]! >= 0);
   const opens = (k: number) => toks[k]!.op === '(' || toks[k]!.op === '{' || toks[k]!.op === '$(' || (toks[k]!.kw === 'open' && closer[k]! >= 0);
   /** Whether the right side of the `||` at k lets the list succeed (anything but exit <non-zero>, return <non-zero>, false). */
@@ -349,6 +364,9 @@ export function scanShell(text: string, base: string | null, sigs: Compiled, bud
   let lastCmd: { kind: 'ok' | 'fail' | 'other'; start: number; end: number } | null = null; // the last command run, where it starts and its list end
   const isDead = (k: number) => k > deadAfter || k <= deadTo;
   let containerEnd = -1; // P50 (M1): words before this index are the command of a `docker run` container
+  // P51 (script files only): the rest of this and-or list follows a test command's && or ||; a conditional exit/return was seen
+  let condChain = false;
+  let afterCondExit = false;
   let binNext = -1; // the word after `yarn` / `pnpm` that may be a binary (or a script: classifyScript decides)
   // `( … )` and `$( … )` run in a subshell: `set` and `cd` inside them end at the closing bracket.
   const subshells: { close: number; errexit: boolean; pipefail: boolean; cwd: string | null }[] = [];
@@ -359,7 +377,10 @@ export function scanShell(text: string, base: string | null, sigs: Compiled, bud
     const inLast = k > lastList;
     const exempt = swallowed[k] === 1 || (piped[k] === 1 && !pipefail) || background[k] === 1 || inCondition || k < negateEnd
       || (!errexit && !inLast) || (errexit && andAfter[k] === 1 && !inLast);
-    return exempt ? 'suppressed' : null;
+    if (exempt) return 'suppressed';
+    // P51: in a followed script, a run inside if/case/while/until, right of a test's && or ||, or after a conditional
+    // exit/return runs only under a condition
+    return mode.script === true && (condDepth[k]! > 0 || condChain || afterCondExit) ? 'script-condition' : null;
   };
   const argsAfter = (k: number) => {
     const out: string[] = [];
@@ -584,6 +605,8 @@ export function scanShell(text: string, base: string | null, sigs: Compiled, bud
   while (k < n) {
     const op = toks[k]!.op;
     if (op !== null) {
+      if (op === '&&' || op === '||') condChain ||= lastCmd !== null && TEST_COMMANDS.has(toks[lastCmd.start]!.w);
+      else if (op === ';' || op === '\n' || op === '&') condChain = false;
       if ((op === '(' || op === '$(') && closer[k]! >= 0) subshells.push({ close: closer[k]!, errexit, pipefail, cwd });
       while (subshells.length > 0 && subshells[subshells.length - 1]!.close <= k) {
         const s = subshells.pop()!;
@@ -685,6 +708,7 @@ export function scanShell(text: string, base: string | null, sigs: Compiled, bud
     }
     // `exit` on its own in the step's top-level list (not in a group, a compound command, a function or a condition,
     // and not joined by && || | &): nothing after it runs
+    if (mode.script === true && (w === 'exit' || w === 'return') && k >= functionEnd && !isDead(k) && (condDepth[k]! > 0 || condChain)) afterCondExit = true;
     if ((w === 'exit' || w === 'return') && depth[k] === 0 && !inCondition && k >= functionEnd && k > negateEnd
       && (k === 0 || toks[k - 1]!.op === ';' || toks[k - 1]!.op === '\n')
       && (segEnd[k]! >= n || toks[segEnd[k]!]!.op === ';' || toks[segEnd[k]!]!.op === '\n')) deadAfter = Math.min(deadAfter, k);
