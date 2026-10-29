@@ -3541,3 +3541,24 @@ describe('coverage: SKIP / PREK_SKIP, the follow-ups of the security scan (P57 C
     expect(await two(`      - run: prek run --all-files\n        env:\n          SKIP: ${long}\n`)).toEqual(['covered ruff', 'partial mypy']);
   });
 });
+
+describe('coverage: minors of the hand-check fixes review (P57)', () => {
+  const app = svc('.', { language: 'python', packageManager: 'uv', scripts: ['start'], frameworks: ['fastapi'] });
+  const st = async (files: Record<string, string>, steps: string) => {
+    const dir = makeTempDir();
+    for (const [rel, text] of Object.entries(files)) writeIn(dir, rel, text);
+    ci(dir, steps);
+    const r = row(await coverage(dir, { services: [app] }), 'push', 'unit-tests', 'app');
+    return `${r.status}${r.by === undefined ? '' : ` ${r.by}`}`;
+  };
+  const BODY = 'FROM python:3.14\nWORKDIR /app\nCOPY . /app\nRUN pytest\n';
+
+  it('M3: a # syntax= directive naming a frontend other than docker/dockerfile can change how the file is read: unknown', async () => {
+    for (const d of ['# syntax=docker/dockerfile:1', '# syntax=docker/dockerfile:1.7-labs', '# syntax = docker.io/docker/dockerfile:1']) {
+      expect(await st({ Dockerfile: `${d}\n${BODY}` }, run('docker build .')), d).toBe('covered your own `pytest`');
+    }
+    for (const d of ['# syntax=ghcr.io/evil/frontend:1', '# syntax=docker/dockerfile-upstream:master', '#syntax=example.com/x']) {
+      expect(await st({ Dockerfile: `${d}\n${BODY}` }, run('docker build .')), d).toMatch(/^unknown/);
+    }
+  });
+});

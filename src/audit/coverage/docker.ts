@@ -245,6 +245,9 @@ async function parseDockerfile(ctx: Ctx, text: string, context: string): Promise
   const raw = text.split(/\r?\n/);
   if (raw.length > MAX_DOCKERFILE_LINES || !raw.every(regexSafe)) return { unreadable: 'it has more or longer lines than pipegen reads' };
   if (/^\s*#\s*escape\s*=/im.test(raw.slice(0, 5).join('\n'))) return { unreadable: 'it changes the escape character' };
+  // P57 (M3): a `# syntax=` directive picks the frontend that reads the file; only Docker's own (docker/dockerfile) is read as BuildKit does
+  const syntax = /^\s*#\s*syntax\s*=\s*(\S+)/im.exec(raw.slice(0, 5).join('\n'))?.[1];
+  if (syntax !== undefined && !/^(?:docker\.io\/)?docker\/dockerfile(?::[A-Za-z0-9._-]+)?(?:@sha256:[0-9a-f]{64})?$/.test(syntax)) return { unreadable: 'it names its own Dockerfile frontend (# syntax=)' };
   // instructions, with line continuations joined (comment lines inside a continuation are dropped, as Docker does)
   const lines: string[] = [];
   for (let i = 0; i < raw.length; i++) {
