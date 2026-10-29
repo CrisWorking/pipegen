@@ -488,6 +488,12 @@ ${extra}`;
   // P41: archives a tool downloads at run time, pinned in step.cli.env (and fixedInputs.env), are pins too.
   const sha256 = (t: string): string => createHash('sha256').update(t).digest('hex');
   const NT = 'projectdiscovery/nuclei-templates';
+  const NT_COMMIT = '7'.repeat(40);
+  /** P44: the repo's default branch, and a compare showing the commit is on it (`ahead`: the branch is ahead of it). */
+  const onDefault = (repo: string, sha: string, branch: string, status: unknown = 'ahead'): Routes => ({
+    [gh(repo)]: { full_name: repo, default_branch: branch },
+    [gh(`${repo}/compare/${sha}...${branch}?per_page=1`)]: typeof status === 'number' ? status : { status, merge_base_commit: { sha: status === 'diverged' ? '0'.repeat(40) : sha }, behind_by: status === 'ahead' || status === 'identical' ? 0 : 3 },
+  });
   const ntArchive = `https://github.com/${NT}/archive/refs/tags/v10.5.0.tar.gz`;
   const ntSumsUrl = `https://github.com/${NT}/releases/download/v10.5.0/nuclei-templates-10.5.0_checksums.txt`;
   const nuclei = (o: { url?: string; sha?: string; fixedUrl?: string } = {}): string => `  - id: nu
@@ -502,6 +508,8 @@ ${extra}`;
     if (o.tarball) assets.push({ name: 'nuclei-templates-10.5.0.tar.gz', browser_download_url: `https://github.com/${NT}/releases/download/v10.5.0/nuclei-templates-10.5.0.tar.gz`, digest: `sha256:${o.tarball}`, created_at: at, updated_at: at });
     return {
       ...rel('v1', daysAgo(400), HEX),
+      ...onDefault(NT, NT_COMMIT, 'main'),
+      [gh(`${NT}/git/ref/tags/v10.5.0`)]: { object: { type: 'commit', sha: NT_COMMIT } },
       [gh(`${NT}/releases/tags/v10.5.0`)]: { tag_name: 'v10.5.0', published_at: o.published ?? daysAgo(30), assets },
       [ntSumsUrl]: () => new Response(text, { status: 200 }),
     };
@@ -540,6 +548,8 @@ ${extra}`;
     step: { cli: { install: { method: docker, package: "semgrep/semgrep", version: "2026" }, command: [], env: { PIPEGEN_RULES_URL: "${o.url ?? `https://github.com/semgrep/semgrep-rules/archive/${RULES_COMMIT}.tar.gz`}", PIPEGEN_RULES_SHA256: "${HEX}", PIPEGEN_RULES_TREE: "${o.tree ?? SHA2}" } } }
 `;
   const sgRoutes = (verification: unknown, committed = daysAgo(400)): Routes => ({
+    // the default branch is read, never assumed: here it is `trunk`, not semgrep's `develop`
+    ...onDefault('semgrep/semgrep-rules', RULES_COMMIT, 'trunk'),
     'https://hub.docker.com/v2/repositories/semgrep/semgrep/tags/2026': { digest: DIGEST, tag_last_pushed: daysAgo(400) },
     [gh(`semgrep/semgrep-rules/git/commits/${RULES_COMMIT}`)]: { sha: RULES_COMMIT, tree: { sha: SHA2 }, committer: { date: committed }, verification },
   });
@@ -560,6 +570,52 @@ ${extra}`;
     }
     const odd = { 'data/reviewed-tools.yml': rtFile(semgrep({ url: 'https://evil.example/rules.tar.gz' })) };
     expect(problems(await run({}, odd, router(sgRoutes(verified(daysAgo(30))))))).toContain('PIPEGEN_RULES_URL');
+  });
+
+  it('P44: semgrep rules must be semgrep/semgrep-rules itself (exact) and on its default branch', async () => {
+    const head = { 'data/reviewed-tools.yml': rtFile(semgrep()) };
+    const calls: string[] = [];
+    expect(problems(await run({}, head, router(sgRoutes(verified(daysAgo(30))), calls)))).toBe('');
+    expect(calls).toContain(gh(`semgrep/semgrep-rules/compare/${RULES_COMMIT}...trunk?per_page=1`));
+    expect((await run({}, head, router({ ...sgRoutes(verified(daysAgo(30))), ...onDefault('semgrep/semgrep-rules', RULES_COMMIT, 'trunk', 'identical') }))).ok).toBe(true);
+    // another owner or repo, or another letter case, never reaches the network for the rules
+    for (const repo of ['attacker/rules', 'Semgrep/semgrep-rules', 'semgrep/semgrep-rules-x']) {
+      const odd = { 'data/reviewed-tools.yml': rtFile(semgrep({ url: `https://github.com/${repo}/archive/${RULES_COMMIT}.tar.gz` })) };
+      const seen: string[] = [];
+      const routes = { ...sgRoutes(verified(daysAgo(30))), [gh(`${repo}/git/commits/${RULES_COMMIT}`)]: { sha: RULES_COMMIT, tree: { sha: SHA2 }, verification: verified(daysAgo(30)) } };
+      expect(problems(await run({}, odd, router(routes, seen))), repo).toContain('semgrep/semgrep-rules');
+      expect(seen.some((c) => c.includes(repo)), repo).toBe(false);
+    }
+    // a commit that is not on the default branch (a fork's commit served under the upstream repo, or a side branch)
+    for (const status of ['diverged', 'behind', 404]) {
+      const r = await run({}, head, router({ ...sgRoutes(verified(daysAgo(30))), ...onDefault('semgrep/semgrep-rules', RULES_COMMIT, 'trunk', status) }));
+      expect(r.ok, String(status)).toBe(false);
+      expect(problems(r), String(status)).toContain('needs owner review');
+    }
+    // `ahead` with a merge base that is not the commit is not proof either
+    const lying = { ...sgRoutes(verified(daysAgo(30))), [gh(`semgrep/semgrep-rules/compare/${RULES_COMMIT}...trunk?per_page=1`)]: { status: 'ahead', behind_by: 0, merge_base_commit: { sha: SHA } } };
+    expect(problems(await run({}, head, router(lying)))).toContain('needs owner review');
+    // no readable default branch, or an odd one, fails
+    expect((await run({}, head, router({ ...sgRoutes(verified(daysAgo(30))), [gh('semgrep/semgrep-rules')]: { default_branch: '../x' } }))).ok).toBe(false);
+    expect((await run({}, head, router({ ...sgRoutes(verified(daysAgo(30))), [gh('semgrep/semgrep-rules')]: 503 }))).findings[0]?.lookupFailed).toBe(true);
+  });
+
+  it('P44: the nuclei templates tag commit must be on the default branch of projectdiscovery/nuclei-templates', async () => {
+    const head = { 'data/reviewed-tools.yml': rtFile(nuclei()) };
+    const calls: string[] = [];
+    expect(problems(await run({}, head, router(ntRoutes(), calls)))).toBe('');
+    expect(calls).toContain(gh(`${NT}/compare/${NT_COMMIT}...main?per_page=1`));
+    for (const status of ['diverged', 'behind', 404]) {
+      const r = await run({}, head, router({ ...ntRoutes(), ...onDefault(NT, NT_COMMIT, 'main', status) }));
+      expect(problems(r), String(status)).toContain('needs owner review');
+    }
+    const noTag = ntRoutes();
+    delete noTag[gh(`${NT}/git/ref/tags/v10.5.0`)];
+    expect((await run({}, head, router(noTag))).ok).toBe(false);
+    // the release-asset form too
+    const asset = { 'data/reviewed-tools.yml': rtFile(nuclei({ url: `https://github.com/${NT}/releases/download/v10.5.0/nuclei-templates-10.5.0.tar.gz` })) };
+    expect(problems(await run({}, asset, router(ntRoutes({ tarball: HEX2 }))))).toBe('');
+    expect(problems(await run({}, asset, router({ ...ntRoutes({ tarball: HEX2 }), ...onDefault(NT, NT_COMMIT, 'main', 'diverged') })))).toContain('needs owner review');
   });
 
   it('P41: a hash- or URL-shaped value at a field this check does not know fails; verifiedWith is known', async () => {

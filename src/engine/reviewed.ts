@@ -103,8 +103,12 @@ const ISO_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?Z$/;
 const CONFIG_SECTION_RE = /^(?!\/)(?!.*(?:^|\/)\.\.(?:\/|:))[A-Za-z0-9._*/-]{1,120}:[A-Za-z0-9._*:-]{1,79}$/;
 /** A repo-relative path or glob: no absolute path, no `..`, no backslash. */
 const REL_GLOB_RE = /^(?!\/)(?!.*(?:^|\/)\.\.(?:\/|$))[A-Za-z0-9._*/-]{1,200}$/;
-/** The Semgrep rules archive (ruling S22): a GitHub archive at a 40-character commit SHA. */
-const RULES_URL_RE = /^https:\/\/github\.com\/[A-Za-z0-9-]{1,39}\/[A-Za-z0-9._-]{1,100}\/archive\/([0-9a-f]{40})\.tar\.gz$/;
+/**
+ * The Semgrep rules archive (ruling S22): semgrep/semgrep-rules itself (exact owner, repo and case; ruling P44) at a
+ * 40-character commit SHA. Any other repo could hold any rules. The cooldown (scripts/cooldown.ts) also requires the
+ * commit to be on upstream's default branch, since GitHub serves a fork's commit under the upstream URL too.
+ */
+const RULES_URL_RE = /^https:\/\/github\.com\/semgrep\/semgrep-rules\/archive\/([0-9a-f]{40})\.tar\.gz$/;
 export const RULES_URL_ENV = 'PIPEGEN_RULES_URL';
 export const RULES_SHA256_ENV = 'PIPEGEN_RULES_SHA256';
 /** The git tree SHA of the rules commit: the v0.2 renderer fetches the commit and checks HEAD^{tree} against it. */
@@ -1135,7 +1139,7 @@ function semgrepProblems(e: Entry): { message: string; path: (string | number)[]
   const out: { message: string; path: (string | number)[] }[] = [];
   const env = e.fixedInputs.env ?? {};
   const url = env[RULES_URL_ENV];
-  if (url === undefined || !RULES_URL_RE.test(url)) out.push({ message: `semgrep needs fixedInputs.env.${RULES_URL_ENV}: a rules archive at a 40-character commit SHA`, path: ['fixedInputs', 'env'] });
+  if (url === undefined || !RULES_URL_RE.test(url)) out.push({ message: `semgrep needs fixedInputs.env.${RULES_URL_ENV}: a rules archive of semgrep/semgrep-rules at a 40-character commit SHA (https://github.com/semgrep/semgrep-rules/archive/<sha>.tar.gz)`, path: ['fixedInputs', 'env'] });
   if (!SHA256_RE.test(env[RULES_SHA256_ENV] ?? '')) out.push({ message: `semgrep needs fixedInputs.env.${RULES_SHA256_ENV}: the archive's sha256`, path: ['fixedInputs', 'env'] });
   if (!COMMIT_SHA_RE.test(env[RULES_TREE_ENV] ?? '')) out.push({ message: `semgrep needs fixedInputs.env.${RULES_TREE_ENV}: the rules commit's tree SHA`, path: ['fixedInputs', 'env'] });
   const values = [

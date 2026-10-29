@@ -259,6 +259,10 @@ describe('loadReviewed', () => {
     // a rules URL that isn't pinned to a 40-character commit, no archive hash, or no tree SHA
     rejects([semgrepEntry({ ...RULES_ENV, [RULES_URL_ENV]: 'https://github.com/semgrep/semgrep-rules/archive/refs/heads/develop.tar.gz' })], /40-character commit/);
     rejects([semgrepEntry({ ...RULES_ENV, [RULES_URL_ENV]: 'https://semgrep.dev/c/p/default' })], /40-character commit/);
+    // P44: only semgrep/semgrep-rules itself (exact owner, repo and case); a look-alike or the attacker's own repo is refused
+    for (const repo of ['attacker/rules', 'Semgrep/semgrep-rules', 'semgrep/Semgrep-Rules', 'semgrep/semgrep-rules-fork', 'semgrep-x/semgrep-rules']) {
+      rejects([semgrepEntry({ ...RULES_ENV, [RULES_URL_ENV]: `https://github.com/${repo}/archive/${RULES_SHA}.tar.gz` })], /semgrep\/semgrep-rules/);
+    }
     rejects([semgrepEntry({ [RULES_URL_ENV]: RULES_URL, [RULES_TREE_ENV]: RULES_TREE })], /sha256/);
     rejects([semgrepEntry({ ...RULES_ENV, [RULES_SUM_ENV]: 'abc' })], /sha256/);
     rejects([semgrepEntry({ [RULES_URL_ENV]: RULES_URL, [RULES_SUM_ENV]: SUM })], /tree/);
@@ -791,6 +795,7 @@ describe('loader rules (Plan P Task 5)', () => {
     rejects([nucleiEntry({ env: { [NUCLEI_SUM_ENV]: SUM } })], new RegExp(NUCLEI_URL_ENV));
     rejects([nucleiEntry({ env: { ...NUCLEI_ENV, [NUCLEI_URL_ENV]: 'https://github.com/evil/nuclei-templates/archive/refs/tags/v10.5.0.tar.gz' } })], new RegExp(NUCLEI_URL_ENV));
     rejects([nucleiEntry({ env: { ...NUCLEI_ENV, [NUCLEI_URL_ENV]: 'https://github.com/projectdiscovery/nuclei-templates/archive/refs/heads/main.tar.gz' } })], new RegExp(NUCLEI_URL_ENV));
+    rejects([nucleiEntry({ env: { ...NUCLEI_ENV, [NUCLEI_URL_ENV]: 'https://github.com/ProjectDiscovery/nuclei-templates/archive/refs/tags/v10.5.0.tar.gz' } })], new RegExp(NUCLEI_URL_ENV));
     rejects([nucleiEntry({ env: { [NUCLEI_URL_ENV]: NUCLEI_URL, [NUCLEI_SUM_ENV]: 'abc' } })], new RegExp(NUCLEI_SUM_ENV));
     expect(load([nucleiEntry({ env: { ...NUCLEI_ENV, [NUCLEI_URL_ENV]: 'https://github.com/projectdiscovery/nuclei-templates/releases/download/v10.5.0/nuclei-templates-10.5.0.tar.gz' } })])).toHaveLength(1);
   });

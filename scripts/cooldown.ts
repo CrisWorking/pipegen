@@ -502,6 +502,48 @@ function youngest(dates: unknown[], what: string): Outcome {
   return { date: ok.reduce((a, b) => (Date.parse(b) > Date.parse(a) ? b : a)) };
 }
 
+/**
+ * What a tag of `r` (an encoded repo path) points to, following annotated tags (at most 3 hops). taggerDate is the
+ * youngest tagger date seen, or 'none' for a lightweight tag.
+ */
+async function tagTarget(ctx: Ctx, r: string, t: string): Promise<{ obj: Obj; taggerDate: unknown }> {
+  let ref = await ctx.get(`https://api.github.com/repos/${r}/git/ref/tags/${t}`, ctx.gh);
+  let obj = isObj(ref) && isObj(ref.object) ? ref.object : {};
+  let taggerDate: unknown = 'none';
+  for (let hops = 0; obj.type === 'tag' && hops < 3; hops++) {
+    ref = await ctx.get(`https://api.github.com/repos/${r}/git/tags/${encodeURIComponent(String(obj.sha))}`, ctx.gh);
+    const tagger = isObj(ref) && isObj(ref.tagger) ? ref.tagger.date : undefined;
+    if (taggerDate === 'none' || (str(tagger) && Date.parse(String(tagger)) > Date.parse(String(taggerDate)))) taggerDate = tagger;
+    obj = isObj(ref) && isObj(ref.object) ? ref.object : {};
+  }
+  return { obj, taggerDate };
+}
+
+const BRANCH = /^[A-Za-z0-9._-]+(\/[A-Za-z0-9._-]+)*$/;
+
+/**
+ * Undefined when `sha` is on `repo`'s default branch (an ancestor of its tip, or the tip), else a failure. The branch
+ * is read from the repo, never assumed. GitHub serves a commit pushed only to a fork under the upstream repo's API and
+ * archive URLs too (forks share objects), so a commit being readable there proves nothing; only the compare does:
+ * `<sha>...<branch>` must be `ahead` or `identical`, with no commits behind and `sha` as the merge base.
+ */
+async function onDefaultBranch(ctx: Ctx, repo: string, sha: string): Promise<Outcome | undefined> {
+  const r = repoPath(repo);
+  if (!r || !/^[0-9a-f]{40}$/.test(sha)) return fail('repo or commit is not a plain name');
+  const info = await ctx.get(`https://api.github.com/repos/${r}`, ctx.gh);
+  const branch = isObj(info) ? str(info.default_branch) : undefined;
+  if (!branch || !BRANCH.test(branch) || branch.split('/').some((p) => p === '.' || p === '..')) return fail(`${repo} has no readable default branch; needs owner review`);
+  let cmp: unknown;
+  try {
+    cmp = await ctx.get(`https://api.github.com/repos/${r}/compare/${sha}...${branch.split('/').map(encodeURIComponent).join('/')}?per_page=1`, ctx.gh);
+  } catch (e) {
+    if (e instanceof LookupError && e.notFound) cmp = undefined;
+    else throw e;
+  }
+  const on = isObj(cmp) && (cmp.status === 'ahead' || cmp.status === 'identical') && cmp.behind_by === 0 && isObj(cmp.merge_base_commit) && cmp.merge_base_commit.sha === sha;
+  return on ? undefined : fail(`commit ${sha.slice(0, 12)} is not on the default branch (${branch}) of ${repo} (a fork's commit, or another branch); needs owner review`);
+}
+
 /** An action: the pinned SHA must be the commit its tag points to; date = the tag's release published_at. */
 async function actionOutcome(ctx: Ctx, uses: string | undefined, repo: string | undefined, tag: string, sha: string | undefined): Promise<Outcome> {
   const m = /^([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)(?:\/[^@]*)?@([0-9a-f]{40})$/.exec(uses ?? '');
@@ -511,15 +553,7 @@ async function actionOutcome(ctx: Ctx, uses: string | undefined, repo: string | 
     const r = repoPath(repo);
     const t = tagPath(tag);
     if (!r || !t) return fail('repo or tag name is not a plain name');
-    let ref = await ctx.get(`https://api.github.com/repos/${r}/git/ref/tags/${t}`, ctx.gh);
-    let obj = isObj(ref) && isObj(ref.object) ? ref.object : {};
-    let taggerDate: unknown = 'none';
-    for (let hops = 0; obj.type === 'tag' && hops < 3; hops++) {
-      ref = await ctx.get(`https://api.github.com/repos/${r}/git/tags/${encodeURIComponent(String(obj.sha))}`, ctx.gh);
-      const tagger = isObj(ref) && isObj(ref.tagger) ? ref.tagger.date : undefined;
-      if (taggerDate === 'none' || (str(tagger) && Date.parse(String(tagger)) > Date.parse(String(taggerDate)))) taggerDate = tagger;
-      obj = isObj(ref) && isObj(ref.object) ? ref.object : {};
-    }
+    const { obj, taggerDate } = await tagTarget(ctx, r, t);
     if (obj.type !== 'commit' || obj.sha !== sha) return fail('the pinned sha is not the commit of this tag');
     const got = await releaseOf(ctx, repo, tag);
     if ('problem' in got) return got;
@@ -560,35 +594,46 @@ async function templatesOutcome(ctx: Ctx, url: string | undefined, sha: string |
   const want = sha256Of(sha);
   if (!want) return fail('PIPEGEN_NUCLEI_TEMPLATES_SHA256 is not a sha256');
   const asset = NT_ASSET.exec(url ?? '');
-  if (asset) return assetOutcome(ctx, NT_REPO, asset[1] as string, asset[2] as string, want);
   const m = NT_ARCHIVE.exec(url ?? '');
-  if (!m) return fail('PIPEGEN_NUCLEI_TEMPLATES_URL is not a projectdiscovery/nuclei-templates tag archive or release asset; needs owner review');
-  const tag = m[1] as string;
-  const ver = m[2] as string;
+  if (!asset && !m) return fail('PIPEGEN_NUCLEI_TEMPLATES_URL is not a projectdiscovery/nuclei-templates tag archive or release asset; needs owner review');
+  const tag = (asset ?? m)?.[1] as string;
   return guard(async () => {
-    // GitHub makes the tag archive on request and records no digest for it; the release's own checksums file lists
-    // it (as on pin day), and GitHub records that file's digest, so the downloaded file is checked against it.
-    const got = await releaseOf(ctx, NT_REPO, tag);
-    if ('problem' in got) return got;
-    const rel = got.rel;
-    if (rel.tag_name !== tag) return fail('the release is not for this tag');
-    const sumsName = `nuclei-templates-${ver}_checksums.txt`;
-    const sums = (Array.isArray(rel.assets) ? rel.assets : []).find((a) => isObj(a) && a.name === sumsName);
-    if (!isObj(sums)) return fail(`the release has no ${sumsName}, so the tag archive can not be tied; needs owner review`);
-    const sumsUrl = `https://github.com/${NT_REPO}/releases/download/${tag}/${sumsName}`;
-    if (sums.browser_download_url !== sumsUrl) return fail('the checksums file url does not belong to this release');
-    const digest = sha256Of(sums.digest);
-    if (!digest) return fail('GitHub records no digest for the release checksums file; needs owner review');
-    const body = await ctx.bytes(sumsUrl);
-    if (createHash('sha256').update(body).digest('hex') !== digest) return fail('the downloaded checksums file does not match the digest GitHub records for it');
-    const archive = `nuclei-templates-${ver}.tar.gz`;
-    const listed = body.toString('utf8').split(/\r?\n/).map((l) => /^([0-9a-fA-F]{64})\s+\*?(\S+)$/.exec(l.trim())).find((x) => x?.[2] === archive);
-    if (!listed || (listed[1] as string).toLowerCase() !== want) return fail(`the release checksums file does not list the pinned sha256 for ${archive}`);
-    return youngest([rel.published_at, sums.created_at, sums.updated_at], 'release published_at, checksums file created_at and updated_at');
+    // The tag's commit must be on upstream's default branch (P44), whichever form the URL has.
+    const { obj } = await tagTarget(ctx, NT_REPO, encodeURIComponent(tag));
+    if (obj.type !== 'commit' || typeof obj.sha !== 'string') return fail(`the tag ${tag} does not point to a commit; needs owner review`);
+    const off = await onDefaultBranch(ctx, NT_REPO, obj.sha);
+    if (off) return off;
+    if (asset) return assetOutcome(ctx, NT_REPO, tag, asset[2] as string, want);
+    return archiveFromChecksums(ctx, tag, (m as RegExpExecArray)[2] as string, want);
   });
 }
 
-const RULES_URL = /^https:\/\/github\.com\/([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)\/archive\/([0-9a-f]{40})\.tar\.gz$/;
+/** A tag archive (no digest recorded): its sha256 must be listed in the release's checksums file. */
+async function archiveFromChecksums(ctx: Ctx, tag: string, ver: string, want: string): Promise<Outcome> {
+  // GitHub makes the tag archive on request and records no digest for it; the release's own checksums file lists
+  // it (as on pin day), and GitHub records that file's digest, so the downloaded file is checked against it.
+  const got = await releaseOf(ctx, NT_REPO, tag);
+  if ('problem' in got) return got;
+  const rel = got.rel;
+  if (rel.tag_name !== tag) return fail('the release is not for this tag');
+  const sumsName = `nuclei-templates-${ver}_checksums.txt`;
+  const sums = (Array.isArray(rel.assets) ? rel.assets : []).find((a) => isObj(a) && a.name === sumsName);
+  if (!isObj(sums)) return fail(`the release has no ${sumsName}, so the tag archive can not be tied; needs owner review`);
+  const sumsUrl = `https://github.com/${NT_REPO}/releases/download/${tag}/${sumsName}`;
+  if (sums.browser_download_url !== sumsUrl) return fail('the checksums file url does not belong to this release');
+  const digest = sha256Of(sums.digest);
+  if (!digest) return fail('GitHub records no digest for the release checksums file; needs owner review');
+  const body = await ctx.bytes(sumsUrl);
+  if (createHash('sha256').update(body).digest('hex') !== digest) return fail('the downloaded checksums file does not match the digest GitHub records for it');
+  const archive = `nuclei-templates-${ver}.tar.gz`;
+  const listed = body.toString('utf8').split(/\r?\n/).map((l) => /^([0-9a-fA-F]{64})\s+\*?(\S+)$/.exec(l.trim())).find((x) => x?.[2] === archive);
+  if (!listed || (listed[1] as string).toLowerCase() !== want) return fail(`the release checksums file does not list the pinned sha256 for ${archive}`);
+  return youngest([rel.published_at, sums.created_at, sums.updated_at], 'release published_at, checksums file created_at and updated_at');
+}
+
+/** Only upstream's own repo (exact owner, repo and case); the commit in the URL is the pinned one. */
+const RULES_REPO = 'semgrep/semgrep-rules';
+const RULES_URL = /^https:\/\/github\.com\/semgrep\/semgrep-rules\/archive\/([0-9a-f]{40})\.tar\.gz$/;
 
 /**
  * The semgrep rules archive: a repo archive at a commit. The commit's tree must be PIPEGEN_RULES_TREE; the date is the
@@ -597,11 +642,10 @@ const RULES_URL = /^https:\/\/github\.com\/([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)\/a
  */
 async function rulesOutcome(ctx: Ctx, url: string | undefined, tree: string | undefined): Promise<Outcome> {
   const m = RULES_URL.exec(url ?? '');
-  if (!m) return fail('PIPEGEN_RULES_URL is not a GitHub repo archive at a 40-character commit SHA; needs owner review');
+  if (!m) return fail(`PIPEGEN_RULES_URL is not https://github.com/${RULES_REPO}/archive/<40-character commit SHA>.tar.gz; needs owner review`);
   if (!/^[0-9a-f]{40}$/.test(tree ?? '')) return fail('PIPEGEN_RULES_TREE is not a 40-character tree SHA');
-  const r = repoPath(m[1] as string);
-  if (!r) return fail('repo name is not a plain name');
-  const sha = m[2] as string;
+  const r = RULES_REPO;
+  const sha = m[1] as string;
   return guard(async () => {
     const c = await ctx.get(`https://api.github.com/repos/${r}/git/commits/${sha}`, ctx.gh);
     if (!isObj(c) || c.sha !== sha) return fail('unreadable commit answer');
@@ -610,7 +654,9 @@ async function rulesOutcome(ctx: Ctx, url: string | undefined, tree: string | un
     if (v.verified !== true) return fail('the rules commit has no signature GitHub verified, so there is no date GitHub set; needs owner review');
     const at = str(v.verified_at);
     if (!at || !ISO.test(at) || Number.isNaN(Date.parse(at))) return fail('GitHub gives no verified_at for the rules commit; needs owner review');
-    return { date: at };
+    // A signed commit in a fork is served under semgrep/semgrep-rules too: it must be on upstream's default branch.
+    const off = await onDefaultBranch(ctx, RULES_REPO, sha);
+    return off ?? { date: at };
   });
 }
 

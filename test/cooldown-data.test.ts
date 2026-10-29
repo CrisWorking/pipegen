@@ -100,7 +100,7 @@ const sha256 = (t: string): string => createHash('sha256').update(t).digest('hex
 const NT = 'projectdiscovery/nuclei-templates';
 
 /** The fake upstream for the artifacts: each one agrees with its pin, dated `dateOf(a)`, hashed `hashOf(a)`. */
-function upstream(dateOf: (a: Artifact) => string, hashOf: (a: Artifact, pinned: string) => string): { fetch: typeof fetch; calls: string[] } {
+function upstream(dateOf: (a: Artifact) => string, hashOf: (a: Artifact, pinned: string) => string, extra: Record<string, unknown> = {}): { fetch: typeof fetch; calls: string[] } {
   const routes = new Map<string, unknown>();
   const merge = (url: string, make: () => Obj, add: (doc: Obj) => void): void => {
     if (!routes.has(url)) routes.set(url, make());
@@ -155,9 +155,16 @@ function upstream(dateOf: (a: Artifact) => string, hashOf: (a: Artifact, pinned:
       const sumsUrl = `https://github.com/${NT}/releases/download/${a.tag}/${sumsName}`;
       const text = `${hashOf(a, a.sha256)}  nuclei-templates-${ver}.tar.gz\n`;
       routes.set(sumsUrl, { text });
+      // the tag's commit, on the repo's default branch (P44)
+      const tagCommit = sha256(a.tag).slice(0, 40);
+      routes.set(gh(`${NT}/git/ref/tags/${a.tag}`), { object: { type: 'commit', sha: tagCommit } });
+      routes.set(gh(NT), { default_branch: 'main' });
+      routes.set(gh(`${NT}/compare/${tagCommit}...main?per_page=1`), { status: 'ahead', behind_by: 0, merge_base_commit: { sha: tagCommit } });
       routes.set(gh(`${NT}/releases/tags/${a.tag}`), { tag_name: a.tag, published_at: at, assets: [{ name: sumsName, browser_download_url: sumsUrl, digest: `sha256:${sha256(text)}`, created_at: OLD, updated_at: OLD }] });
     } else if (a.type === 'rules') {
       routes.set(gh(`${a.repo}/git/commits/${a.commit}`), { sha: a.commit, tree: { sha: hashOf(a, a.tree) }, committer: { date: OLD }, verification: { verified: true, reason: 'valid', verified_at: at } });
+      routes.set(gh(a.repo), { default_branch: 'develop' });
+      routes.set(gh(`${a.repo}/compare/${a.commit}...develop?per_page=1`), { status: 'ahead', behind_by: 0, merge_base_commit: { sha: a.commit } });
     } else {
       const [ns, name] = a.image.includes('/') ? a.image.split('/') : ['library', a.image];
       merge(`https://hub.docker.com/v2/repositories/${ns}/${name}/tags/${a.tag}`, () => ({ digest: a.digest }), (doc) => {
@@ -166,6 +173,7 @@ function upstream(dateOf: (a: Artifact) => string, hashOf: (a: Artifact, pinned:
       });
     }
   }
+  for (const [k, v] of Object.entries(extra)) routes.set(k, v);
   const calls: string[] = [];
   const f = (async (url: string) => {
     calls.push(String(url));
@@ -258,8 +266,9 @@ describe('cooldown: the real data', () => {
       for (const v of Object.values((t.verifiedWith ?? {}) as Obj)) if (typeof v === 'string') allowed.add(v);
       // a record of the image an action's own action.yml runs; the action is tied by its commit SHA
       if (t.wrappedImage?.digest) allowed.add(t.wrappedImage.digest);
-      // the sha256 of GitHub's archive of the pinned rules commit: the commit and its tree are tied and dated, and the
-      // generated CI checks these bytes when it downloads them
+      // the sha256 of GitHub's archive of the pinned rules commit. The commit (upstream's, on its default branch) and its
+      // tree are tied and dated, so these bytes can't hold other rules; checking them on download is a requirement on
+      // the renderer (v0.2, not written yet: docs/cooldown.md), not something this check or today's code does
       if (t.step?.cli?.env?.PIPEGEN_RULES_SHA256) allowed.add(t.step.cli.env.PIPEGEN_RULES_SHA256);
     }
     // the hash of the binary inside a pinned archive; the archive's own sha256 is tied above
@@ -309,6 +318,38 @@ describe('cooldown: the real data', () => {
     expect(head).not.toBe(t);
     const r = await check(upstream(() => OLD, same).fetch, { 'data/reviewed-tools.yml': head }, realBase);
     expect(r.findings.map((f) => f.name)).toEqual(['semgrep (semgrep rules)']);
+  });
+
+  // The re-review's probe2 (P44): a signed commit of the attacker's, verified long ago, with its own tree and sha256.
+  const UP_SHA = '17e31e11ebac99fb7dfe1cd288f7a32151b6f3f9';
+  const UP_TREE = 'dd3179667faf14717e05c33b1916b0d2c349673d';
+  const UP_SUM = '9dfe6866fbecd557f507078cb79721a9eb8f4764fc2f6163648ea1320be25933';
+  const EVIL_SHA = 'e'.repeat(40);
+  const EVIL_TREE = 'f'.repeat(40);
+  const evilCommit = { sha: EVIL_SHA, tree: { sha: EVIL_TREE }, verification: { verified: true, reason: 'valid', verified_at: OLD } };
+  const gh = (p: string): string => `https://api.github.com/repos/${p}`;
+
+  it('probe2 C: the rules moved to the attacker\'s own repo (own signed commit, tree and sha256) fail', async () => {
+    const t = FILES['data/reviewed-tools.yml'];
+    const head = t.replaceAll(`semgrep/semgrep-rules/archive/${UP_SHA}`, `attacker/rules/archive/${EVIL_SHA}`).replaceAll(UP_TREE, EVIL_TREE).replaceAll(UP_SUM, '2'.repeat(64));
+    expect(head).not.toBe(t);
+    const extra = { [gh(`attacker/rules/git/commits/${EVIL_SHA}`)]: evilCommit, [gh('attacker/rules')]: { default_branch: 'main' }, [gh(`attacker/rules/compare/${EVIL_SHA}...main?per_page=1`)]: { status: 'ahead', behind_by: 0, merge_base_commit: { sha: EVIL_SHA } } };
+    const r = await check(upstream(() => OLD, same, extra).fetch, { 'data/reviewed-tools.yml': head }, realBase);
+    expect(r.findings.map((f) => `${f.name}: ${f.problem}`)).toEqual(['semgrep (semgrep rules): PIPEGEN_RULES_URL is not https://github.com/semgrep/semgrep-rules/archive/<40-character commit SHA>.tar.gz; needs owner review']);
+  });
+
+  it('probe2 D: a fork\'s commit served under the upstream URL (forks share objects) fails', async () => {
+    const t = FILES['data/reviewed-tools.yml'];
+    const head = t.replaceAll(UP_SHA, EVIL_SHA).replaceAll(UP_TREE, EVIL_TREE).replaceAll(UP_SUM, '3'.repeat(64));
+    expect(head).not.toBe(t);
+    // GitHub answers for the fork's commit under semgrep/semgrep-rules; only the compare with develop tells it apart
+    for (const cmp of [{ status: 'diverged', behind_by: 4, merge_base_commit: { sha: UP_SHA } }, 404]) {
+      const extra = { [gh(`semgrep/semgrep-rules/git/commits/${EVIL_SHA}`)]: evilCommit, ...(typeof cmp === 'object' ? { [gh(`semgrep/semgrep-rules/compare/${EVIL_SHA}...develop?per_page=1`)]: cmp } : {}) };
+      const r = await check(upstream(() => OLD, same, extra).fetch, { 'data/reviewed-tools.yml': head }, realBase);
+      expect(r.ok, JSON.stringify(cmp)).toBe(false);
+      expect(r.findings.map((f) => f.name)).toEqual(['semgrep (semgrep rules)']);
+      expect(lines(r)).toContain('not on the default branch');
+    }
   });
 
   it('probe M2: a changed duplicate of an entry placed before the unchanged original fails', async () => {
