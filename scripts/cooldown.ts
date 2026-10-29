@@ -34,7 +34,7 @@
 // judges it. Keep it dependency-free apart from `yaml`, and keep to syntax Node's type stripping can run
 // (no enums, no parameter properties, no namespaces): `node scripts/cooldown.ts`.
 import { createHash } from 'node:crypto';
-import { lstat, readFile } from 'node:fs/promises';
+import { lstat, readdir, readFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { parse as parseYaml } from 'yaml';
 
@@ -99,6 +99,8 @@ export interface CooldownOptions {
   githubToken?: string;
   pr?: PrContext;
   maxLookups?: number;
+  /** The weekly job: check every package of every closure lock, changed or not (a pull request checks only the changed ones). */
+  all?: boolean;
   timeoutMs?: number;
 }
 
@@ -1039,6 +1041,22 @@ export function prFromEnv(env: Record<string, string | undefined>): PrContext | 
 
 // --- the check ----------------------------------------------------------------------------------------------------
 
+/** A closure lock file (not its meta file) under data/npm-closures/. */
+const CLOSURE_FILE = /^data\/npm-closures\/[a-z0-9][a-z0-9-]*\.json$/;
+const CLOSURE_META_FILE = /^data\/npm-closures\/[a-z0-9][a-z0-9-]*\.meta\.json$/;
+
+/** The `before` date (ms) of a closure's meta file, or undefined when it is missing or not an ISO date. */
+function closureBefore(metaText: string | null | undefined): number | undefined {
+  if (!metaText) return undefined;
+  try {
+    const v: unknown = JSON.parse(metaText);
+    const b = isObj(v) ? v.before : undefined;
+    return typeof b === 'string' && ISO.test(b) && !Number.isNaN(Date.parse(b)) ? Date.parse(b) : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 const ISO = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:\d{2})$/;
 
 /** A problem when the date is too young (`young`), unreadable or in the future; otherwise undefined. */
@@ -1072,6 +1090,31 @@ export async function runCooldown(opts: CooldownOptions): Promise<CooldownResult
       kind: 'npm', name: e.name, version: e.version,
       run: async () => (e.bad ? fail(e.bad) : !e.resolved ? fail('entry has no resolved tarball') : npmOutcome(ctx, e.name, e.version, e.integrity, e.resolved)),
     });
+  }
+  // pipegen's own npm closure locks (data/npm-closures/<id>.json, DECISIONS #107): every package must be old enough, have
+  // the registry's integrity, and have been published on or before the `before` date its meta file records
+  for (const key of Object.keys(head).filter((k) => CLOSURE_FILE.test(k))) {
+    const text = head[key];
+    const metaKey = key.replace(/\.json$/, '.meta.json');
+    const before = closureBefore(head[metaKey]);
+    if (!text) continue;
+    const problem = lockfileProblem(text);
+    if (problem || before === undefined) {
+      findings.push({ kind: 'lockfile', name: key, version: '', date: null, lookupFailed: false, problem: problem ?? `its meta file (${metaKey}) has no readable \`before\` date`, young: false });
+      continue;
+    }
+    for (const e of changedLockEntries(opts.all === true ? null : base[key], text, [], [])) {
+      jobs.push({
+        kind: 'npm', name: e.name, version: e.version,
+        run: async () => {
+          if (e.bad) return fail(e.bad);
+          if (!e.resolved) return fail('entry has no resolved tarball');
+          const o = await npmOutcome(ctx, e.name, e.version, e.integrity, e.resolved);
+          if ('date' in o && Date.parse(o.date) > before) return fail(`published ${o.date}, after the closure's \`before\` date`);
+          return o;
+        },
+      });
+    }
   }
   for (const i of [...reviewedItems(base['data/reviewed-tools.yml'], head['data/reviewed-tools.yml']), ...binaryItems(base['data/pinned-binaries.yml'], head['data/pinned-binaries.yml'])]) {
     jobs.push({ kind: i.kind, name: i.name, version: i.version, run: () => i.run(ctx) });
@@ -1158,7 +1201,7 @@ async function main(argv: string[]): Promise<number> {
   const baseDir = get('--base-dir');
   const headDir = get('--head-dir');
   if (!baseDir || !headDir) {
-    console.error('usage: node cooldown.ts --base-dir <base checkout> --head-dir <PR checkout>');
+    console.error('usage: node cooldown.ts --base-dir <base checkout> --head-dir <PR checkout> [--all]');
     return 2;
   }
   const base: Files = {};
@@ -1167,9 +1210,22 @@ async function main(argv: string[]): Promise<number> {
     base[f] = await readIf(baseDir, f);
     head[f] = await readIf(headDir, f);
   }
+  // pipegen's npm closure locks and their meta files (only the head's files are judged; the base's say what is unchanged)
+  for (const [dir, files] of [[baseDir, base], [headDir, head]] as const) {
+    let names: string[] = [];
+    try {
+      names = await readdir(join(dir, 'data/npm-closures'));
+    } catch (e) {
+      if ((e as NodeJS.ErrnoException).code !== 'ENOENT') throw new FileError('data/npm-closures can not be read');
+    }
+    for (const n of names.sort()) {
+      const rel = `data/npm-closures/${n}`;
+      if (CLOSURE_FILE.test(rel) || CLOSURE_META_FILE.test(rel)) files[rel] = await readIf(dir, rel);
+    }
+  }
   base[CODEOWNERS_FILE] = await readIf(baseDir, CODEOWNERS_FILE);
   const pr = prFromEnv(process.env);
-  const result = await runCooldown({ base, head, fetch, now: new Date(), githubToken: process.env.GITHUB_TOKEN, ...(pr ? { pr } : {}) });
+  const result = await runCooldown({ base, head, fetch, now: new Date(), githubToken: process.env.GITHUB_TOKEN, ...(argv.includes('--all') ? { all: true, maxLookups: 1000 } : {}), ...(pr ? { pr } : {}) });
   const report = formatReport(result);
   console.log(report);
   return result.ok ? 0 : 1;

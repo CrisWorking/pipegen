@@ -90,6 +90,17 @@ export interface ArgvPolicy extends CommandPolicy {
   readonly env?: readonly string[];
   readonly then?: readonly CommandPolicy[];
   readonly dedicated?: true;
+  /**
+   * npm entries only (6b fix round 1): the tool's own bin file inside its package, a constant reviewed here and never read
+   * from a repo-influenced file. The renderer runs `node <package folder>/<npmBin>`, never npx.
+   */
+  readonly npmBin?: string;
+  /**
+   * The tool executes the repo's own tests or hooks (vitest, c8, lefthook): its step is a repo-code step for the
+   * referee's order rule (S6 c), it needs the repo's own dependency tree, and it is the only kind of step that may get
+   * declared secrets. Every other npm tool is a checker: it reads code and is installed from pipegen's own closure lock.
+   */
+  readonly runsRepoCode?: true;
 }
 
 // the dedicated tools (trivy, betterleaks, nuclei) have their own full-grammar rules in reviewed.ts; only the pinned config is listed here, for the renderer
@@ -141,7 +152,7 @@ export const ARGV_POLICIES: Readonly<Record<string, ArgvPolicy>> = Object.freeze
     flags: { recursive: 'bool', format: { values: ['sarif'] }, output: 'output' }, required: { format: 'sarif', output: null },
     config: { flag: '--config', content: "# pipegen's pinned osv-scanner config: no ignored vulnerabilities\n", fileName: 'osv-scanner.toml' },
   },
-  lefthook: { method: GH, package: 'lefthook_2.2.2_Linux_x86_64', exe: 'lefthook', dialect: 'long', sub: ['run', 'pre-commit'], flags: { 'all-files': 'bool' }, required: { 'all-files': 'true' } },
+  lefthook: { method: GH, runsRepoCode: true, package: 'lefthook_2.2.2_Linux_x86_64', exe: 'lefthook', dialect: 'long', sub: ['run', 'pre-commit'], flags: { 'all-files': 'bool' }, required: { 'all-files': 'true' } },
   syft: { method: GH, package: 'syft_1.55.0_linux_amd64.tar.gz',
     exe: 'syft', dialect: 'long', sub: ['scan'], flags: { output: { values: ['spdx-json=sbom.spdx.json'] } }, required: { output: 'spdx-json=sbom.spdx.json' },
     config: { flag: '--config', content: 'check-for-app-update: false\n', fileName: 'syft.yaml' },
@@ -154,36 +165,36 @@ export const ARGV_POLICIES: Readonly<Record<string, ArgvPolicy>> = Object.freeze
   },
   zizmor: { method: GH, package: 'zizmor-x86_64-unknown-linux-gnu.tar.gz', exe: 'zizmor', dialect: 'long', sub: [], positionals: ['.github/workflows'], flags: { offline: 'bool' }, required: { offline: 'true' }, config: { flag: '--config', content: 'rules: {}\n', fileName: 'zizmor.yml' } },
   // Biome 2.5.15: `biome ci` (lint + format check, never writes)
-  biome: { method: 'npm', package: '@biomejs/biome',
+  biome: { method: 'npm', package: '@biomejs/biome', npmBin: 'bin/biome',
     exe: 'biome', dialect: 'long', sub: ['ci'], flags: {},
     config: { flag: '--config-path', content: '{\n  "linter": {\n    "rules": {\n      "complexity": {\n        "noExcessiveCognitiveComplexity": { "level": "error", "options": { "maxAllowedComplexity": 15 } }\n      }\n    }\n  }\n}\n', fileName: 'biome.json' },
   },
   // ESLint 10.13.0: no warnings allowed; the pinned flat config lints the framework files too (P25)
-  eslint: { method: 'npm', package: 'eslint',
+  eslint: { method: 'npm', package: 'eslint', npmBin: 'bin/eslint.js',
     exe: 'eslint', dialect: 'long', sub: [], positionals: ['.'], flags: { 'max-warnings': { values: ['0'] } }, required: { 'max-warnings': '0' },
     config: { flag: '--config', content: `export default [{ ${ESLINT_FILES}, languageOptions: { parserOptions: { ecmaFeatures: { jsx: true } } }, rules: { complexity: ['error', 15] } }];\n`, fileName: 'eslint.config.mjs' },
   },
-  'eslint-typescript': { method: 'npm', package: 'eslint',
+  'eslint-typescript': { method: 'npm', package: 'eslint', npmBin: 'bin/eslint.js',
     exe: 'eslint', dialect: 'long', sub: [], positionals: ['.'], flags: { 'max-warnings': { values: ['0'] } }, required: { 'max-warnings': '0' },
     // built in two parts so the bundled CLI holds no import statement of a non-node module (test/package.test.ts)
     config: { flag: '--config', content: [`import tseslint from`, `'typescript-eslint';\nexport default [...tseslint.configs.recommended, { ${ESLINT_TS_FILES}, rules: { complexity: ['error', 15] } }];\n`].join(' '), fileName: 'eslint.config.mjs' },
   },
   // Oxlint 1.89.0
-  'oxlint-typeaware': { method: 'npm', package: 'oxlint',
+  'oxlint-typeaware': { method: 'npm', package: 'oxlint', npmBin: 'bin/oxlint',
     exe: 'oxlint', dialect: 'long', sub: [], flags: { 'type-aware': 'bool', 'deny-warnings': 'bool' }, required: { 'type-aware': 'true', 'deny-warnings': 'true' },
     config: { flag: '--config', content: '{ "categories": { "correctness": "error" } }\n', fileName: 'oxlintrc.json' },
   },
   // Prettier 3.9.10: check only (never --write); the repo's own Prettier config is used (catalogue §2)
-  prettier: { method: 'npm', package: 'prettier', exe: 'prettier', dialect: 'long', sub: [], positionals: ['.'], flags: { check: 'bool' }, required: { check: 'true' } },
+  prettier: { method: 'npm', package: 'prettier', npmBin: 'bin/prettier.cjs', exe: 'prettier', dialect: 'long', sub: [], positionals: ['.'], flags: { check: 'bool' }, required: { check: 'true' } },
   // Vitest 5.0.5: coverage on, with a minimum the AI chooses (P24)
-  'vitest-coverage': { method: 'npm', package: 'vitest',
+  'vitest-coverage': { method: 'npm', package: 'vitest', npmBin: 'vitest.mjs', runsRepoCode: true,
     exe: 'vitest', dialect: 'long', sub: ['run'], flags: { coverage: 'bool', 'coverage.thresholds.lines': { values: COVERAGE_MINIMUMS } },
     required: { coverage: 'true', 'coverage.thresholds.lines': null },
   },
   // c8 12.0.0
-  c8: { method: 'npm', package: 'c8', exe: 'c8', dialect: 'long', sub: [], flags: { 'check-coverage': 'bool' }, required: { 'check-coverage': 'true' } },
+  c8: { method: 'npm', package: 'c8', npmBin: 'bin/c8.js', runsRepoCode: true, exe: 'c8', dialect: 'long', sub: [], flags: { 'check-coverage': 'bool' }, required: { 'check-coverage': 'true' } },
   // Knip 6.42.1
-  knip: { method: 'npm', package: 'knip', exe: 'knip', dialect: 'long', sub: [], flags: { 'no-progress': 'bool' } },
+  knip: { method: 'npm', package: 'knip', npmBin: 'bin/knip.js', exe: 'knip', dialect: 'long', sub: [], flags: { 'no-progress': 'bool' } },
   // jscpd 5.4.2 (the release binary): new copy-paste against the base only; no semantic mode (jscpdProblems)
   jscpd: { method: GH, package: 'jscpd-linux-x64-gnu.tar.gz',
     exe: 'jscpd', dialect: 'long', sub: [], positionals: ['.'],
@@ -247,6 +258,14 @@ export const ARGV_POLICIES: Readonly<Record<string, ArgvPolicy>> = Object.freeze
     required: { recursive: 'true', format: 'sarif', output: null },
   },
 } satisfies Record<string, ArgvPolicy>);
+
+/** Whether a reviewed entry runs the repo's own code (tests, hooks): the referee's order rule treats its step as a repo-code step. */
+export function runsRepoCode(entryId: string): boolean {
+  return Object.hasOwn(ARGV_POLICIES, entryId) && ARGV_POLICIES[entryId]?.runsRepoCode === true;
+}
+
+/** The id of the run step of an entry that runs repo code: `repocode-` plus a hash of its artifact name (not `pipegen-…`, so a job's dedupe never drops it). */
+export const REPO_CODE_STEP_ID_RE = /^repocode-[0-9a-f]{16}$/;
 
 // ---------- pip closures (Plan B 6b, ruling B5) ----------
 

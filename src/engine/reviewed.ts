@@ -43,6 +43,7 @@ import { NEED_ID_CATEGORY } from './need-ids.js';
 import { fetchAllowed, HttpError } from './http.js';
 import { COOLDOWN_DAYS } from './pin.js';
 import { isRealDate, isReleaseBuild, listPending, PENDING, REVIEWER_RE, reviewMarkerProblems } from './review-marker.js';
+import { expectedPins, loadNpmClosure, NpmClosureError } from './npm-closure.js';
 import { lastValue, parseArgv, type ParsedArgv } from './argv.js';
 import {
   ACTION_POLICIES, ARGV_POLICIES, BETTERLEAKS_FORBIDDEN_FLAGS, type InputSpec, BETTERLEAKS_FORBIDDEN_SUBCOMMANDS, BETTERLEAKS_SUBCOMMANDS, type ArgvPolicy, type CommandPolicy, type FlagSpec,
@@ -1190,7 +1191,7 @@ function isSubsequence(needle: readonly string[], hay: readonly string[]): boole
  */
 export function loadReviewed(
   path: string = packageDataPath('reviewed-tools.yml'),
-  opts: { argvPolicies?: Readonly<Record<string, ArgvPolicy>>; actionPolicies?: Readonly<Record<string, Readonly<Record<string, InputSpec>>>> } = {},
+  opts: { argvPolicies?: Readonly<Record<string, ArgvPolicy>>; actionPolicies?: Readonly<Record<string, Readonly<Record<string, InputSpec>>>>; closureReader?: (id: string) => string } = {},
 ): ReviewedTool[] {
   let raw: unknown;
   try {
@@ -1215,6 +1216,17 @@ export function loadReviewed(
     if (problem !== undefined) {
       const where = ` (entry ${t.id}) at ${['tools', i, ...problem.path].join('.')}: ${problem.message}`;
       throw new ReviewedListError(`pipegen's reviewed tool list is invalid${where}`, { reason: `it is invalid${where}` });
+    }
+  }
+  // DECISIONS #107: a checker's npm closure lock must exist and be a plain registry lock of exactly its pins
+  for (const t of entries) {
+    const pol = Object.hasOwn(opts.argvPolicies ?? ARGV_POLICIES, t.id) ? (opts.argvPolicies ?? ARGV_POLICIES)[t.id] : undefined;
+    if (pol?.method !== 'npm' || pol.npmBin === undefined || pol.runsRepoCode === true) continue;
+    try {
+      loadNpmClosure(t.id, expectedPins(toReviewedTool(t)), opts.closureReader);
+    } catch (e) {
+      const reason = e instanceof NpmClosureError ? e.message : `the npm closure lock of ${t.id} could not be checked`;
+      throw new ReviewedListError(`pipegen's reviewed tool list is invalid (entry ${t.id}): ${reason}`, { cause: e, reason: `it is invalid (entry ${t.id}): ${reason}` });
     }
   }
   const ids = entries.map((t) => t.id);

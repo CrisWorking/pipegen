@@ -59,7 +59,7 @@ describe('package', () => {
     const notices = files.find((f) => f.path === 'THIRD_PARTY_NOTICES');
     expect(notices, 'THIRD_PARTY_NOTICES is in the packed file list').toBeDefined();
     expect(notices?.size).toBeGreaterThan(0);
-    expect(files.filter((f) => f.path.includes('meta.json') || f.path.startsWith('.build'))).toEqual([]);
+    expect(files.filter((f) => (f.path.includes('meta.json') && !f.path.startsWith('data/npm-closures/')) || f.path.startsWith('.build'))).toEqual([]);
     expect(readFileSync(resolve(root, '.gitignore'), 'utf8').split('\n').map((l) => l.trim())).toContain('.build/');
   });
 
@@ -127,6 +127,7 @@ describe('build', () => {
     const outDir = join(pkgDir, 'dist', 'cli');
     writeIn(pkgDir, 'package.json', JSON.stringify({ name: 'pipegen' }));
     for (const file of DATA_FILES) writeIn(pkgDir, `data/${file}`, readFileSync(resolve(root, 'data', file), 'utf8'));
+    for (const file of readdirSync(resolve(root, 'data/npm-closures'))) writeIn(pkgDir, `data/npm-closures/${file}`, readFileSync(resolve(root, 'data/npm-closures', file), 'utf8')); // the checkers' closure locks (DECISIONS #107)
     await build({ ...tsupOptions, entry: { probe: 'test/helpers/bundle-probe.ts' }, outDir, config: false, silent: true });
     const probe = join(outDir, 'probe.js');
     const code = readFileSync(probe, 'utf8');

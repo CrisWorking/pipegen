@@ -1004,3 +1004,42 @@ describe('cooldown: security-fix emergency path', () => {
     expect(out.split('\n').some((l) => l.trimStart().startsWith('::'))).toBe(false);
   });
 });
+
+describe('cooldown: npm closure locks (Plan B 6b fix round 1)', () => {
+  const CLOSURE = 'data/npm-closures/eslint.json';
+  const META = 'data/npm-closures/eslint.meta.json';
+  const meta = (before: string): string => JSON.stringify({ generatedAt: daysAgo(0), before, npm: '11.9.0' });
+  const files = (pkgs: Record<string, Pkg | string>, before = daysAgo(8)): Files => ({ [CLOSURE]: lock(pkgs), [META]: meta(before) });
+
+  it('checks every package of a new closure like a lockfile entry (age and registry integrity)', async () => {
+    const r = await run({}, files({ a: '1.0.0', b: '1.0.0' }, daysAgo(0)), router({ ...npmDoc('a', { '1.0.0': daysAgo(30) }), ...npmDoc('b', { '1.0.0': daysAgo(2) }) }));
+    expect(r.findings.map((x) => x.name)).toEqual(['b']);
+  });
+
+  it('fails a package published after the closure\'s own `before` date, even when it is old enough', async () => {
+    const r = await run({}, files({ a: '1.0.0' }, daysAgo(20)), router(npmDoc('a', { '1.0.0': daysAgo(10) })));
+    expect(r.ok).toBe(false);
+    expect(problems(r)).toMatch(/before/);
+  });
+
+  it('a closure with no readable meta file fails closed', async () => {
+    const r = await run({}, { [CLOSURE]: lock({ a: '1.0.0' }) }, router(npmDoc('a', { '1.0.0': daysAgo(30) })));
+    expect(r.ok).toBe(false);
+    expect(problems(r)).toMatch(/meta/);
+  });
+
+  it('an unchanged closure makes no request on a pull request, and `all` checks it anyway (the weekly job)', async () => {
+    const f = files({ a: '1.0.0' });
+    const calls: string[] = [];
+    expect((await run(f, f, router({}, calls))).ok).toBe(true);
+    expect(calls).toEqual([]);
+    const weekly = await run(f, f, router(npmDoc('a', { '1.0.0': daysAgo(30) }), calls), { all: true });
+    expect(weekly.ok).toBe(true);
+    expect(calls.length).toBeGreaterThan(0);
+  });
+
+  it('a link or a non-registry source in a closure is a finding', async () => {
+    const r = await run({}, files({ a: { v: '1.0.0', extra: { link: true } } }), router({}));
+    expect(r.ok).toBe(false);
+  });
+});

@@ -203,6 +203,11 @@ jobs:
           PIPEGEN_LIVE_TESTS: '1'
           # read-only job token, given to this step only: several hundred GitHub API lookups
           GITHUB_TOKEN: ${{ github.token }}
+      - name: Every package of pipegen's npm closure locks, dated and tied to the registry (weekly, and when data/ changes)
+        if: steps.changed.outputs.run == 'true'
+        run: node scripts/cooldown.ts --base-dir . --head-dir . --all
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
 
   cooldown:
     # 7-day cooldown for new or changed dependency and tool versions (DECISIONS #92, docs/cooldown.md).
