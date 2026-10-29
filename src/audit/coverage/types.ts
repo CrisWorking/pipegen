@@ -105,6 +105,8 @@ export interface Found {
   langs?: readonly string[];
   /** P57 (C1): the folders the tool was given as path arguments (repo-relative); the run covers only the services under them. */
   pathArgs?: readonly string[];
+  /** P59 (3): the run was given a path pipegen can't place: why (it can't cover a service, only be unknown there). */
+  unplaced?: string;
   /** P57 (C4): the pre-commit hook id this run comes from (readPrecommitConfig), so SKIP / PREK_SKIP can name it. */
   hookId?: string;
   /** P57 (C4): the hook's `alias`, which SKIP / PREK_SKIP may name instead of its id. */
@@ -138,6 +140,8 @@ export interface Hit {
   pathArgs?: readonly string[];
   /** P57 (C4): Found.hookSkip. */
   hookSkip?: SkipSet;
+  /** P59 (3): Found.unplaced. */
+  unplaced?: string;
 }
 
 export interface Budget { visits: number; bytes: number; truncated: boolean }

@@ -18,6 +18,7 @@ const carriedConfig = (g: Found) => ({
   ...(g.softEnv === undefined ? {} : { softEnv: g.softEnv }), ...(g.configFiles === undefined ? {} : { configFiles: g.configFiles }),
   // P57 (C1): and the languages it checks and the paths it was given
   ...(g.langs === undefined ? {} : { langs: g.langs }), ...(g.pathArgs === undefined ? {} : { pathArgs: g.pathArgs }),
+  ...(g.unplaced === undefined ? {} : { unplaced: g.unplaced }),
 });
 
 /**

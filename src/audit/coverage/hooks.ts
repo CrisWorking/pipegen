@@ -296,6 +296,7 @@ export async function hookRunHits(ctx: Ctx): Promise<void> {
         opaque: false, categories, by: t.by, subject, dir: '.', reason: configured ? 'config' : reason,
         ...(configured ? { partialWhy: configWhy(subject, set) } : t.partialWhy !== undefined && categories.every((c) => c.startsWith(UNKNOWN_PREFIX)) ? { partialWhy: t.partialWhy } : {}), fit: rep.fit, where,
         ...(t.configFiles === undefined ? {} : { configFiles: t.configFiles }), ...(t.langs === undefined ? {} : { langs: t.langs }),
+        ...(t.unplaced === undefined ? {} : { unplaced: t.unplaced }),
       });
     }
   }

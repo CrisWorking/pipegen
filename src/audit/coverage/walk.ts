@@ -212,7 +212,7 @@ function addFound(ctx: Ctx, found: Found[], c: StepCtx): void {
       ...(f.configFiles !== undefined && c.foldCase === true ? { foldCase: true } : {}),
       ...(f.jobEnv === undefined ? {} : { jobEnv: f.jobEnv }),
       ...(f.langs === undefined ? {} : { langs: f.langs }), ...(f.pathArgs === undefined ? {} : { pathArgs: f.pathArgs }),
-      ...(f.hookSkip === undefined ? {} : { hookSkip: f.hookSkip }),
+      ...(f.hookSkip === undefined ? {} : { hookSkip: f.hookSkip }), ...(f.unplaced === undefined ? {} : { unplaced: f.unplaced }),
     });
   }
 }

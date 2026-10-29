@@ -265,7 +265,7 @@ export async function mapCoverage(p: RepoProfile, needs: Need[], dir: string, op
   const hookRuns = new Firsts(hooks.found.map((f): Hit => ({
     opaque: false, categories: f.categories, by: f.by, subject: f.subject, dir: f.dir, reason: f.reason,
     ...(f.partialWhy === undefined ? {} : { partialWhy: f.partialWhy }), fit: HOOK_FIT, where: hooks.where,
-    ...(f.langs === undefined ? {} : { langs: f.langs }),
+    ...(f.langs === undefined ? {} : { langs: f.langs }), ...(f.unplaced === undefined ? {} : { unplaced: f.unplaced }),
   })), dirs);
   const d: Decide = {
     ci, hooks: hookRuns, scope: new Scope(p.services, dirs), dirsCapped: dirs.capped,

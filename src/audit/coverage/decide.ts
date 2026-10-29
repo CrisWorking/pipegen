@@ -171,9 +171,13 @@ export class Firsts {
       // there never does (that would be a guessed covered).
       const d = h.dir === null && h.categories.length > 0 && h.categories.every((c) => c.startsWith(UNKNOWN_PREFIX)) ? ROOT : dirs.idOf(h.dir);
       const langs = h.opaque || h.langs === undefined ? [ANY_LANG] : h.langs;
+      // P59 (3): a run given a path pipegen can't place, that would cover, is unknown for the services under its folder
+      // (it still counts for repo-wide rows); one with a reason already is only partial there, never covered
+      const unplaced = h.unplaced !== undefined && h.reason === null;
       for (const key of h.opaque ? [OPAQUE_KEY] : h.categories) {
         this.put(key, ALL, h, i);
-        if (d >= 0) for (const lang of langs) this.put(langKey(key, lang), d, h, i);
+        const here = unplaced && !key.startsWith(UNKNOWN_PREFIX) ? `${UNKNOWN_PREFIX}${key}` : key;
+        if (d >= 0) for (const lang of langs) this.put(langKey(here, lang), d, h, i);
       }
     }
   }
@@ -338,7 +342,8 @@ export function ciCoverage(need: Need, ciLayer: CiLayer, d: Decide): Coverage {
   const cover = d.ci.first(cat, dirs, layer, coverKinds(need));
   if (cover) return { need, status: 'covered', ...located(cover), why: `${cover.subject} runs ${LAYER_DONE[layer]}.` };
   const unknownRun = d.ci.first([...matchKeys(`${UNKNOWN_PREFIX}${need.category}`, lang), ...unsureKeys(`${UNKNOWN_PREFIX}${need.category}`, lang)], dirs, layer, [FN, FC, FO]);
-  if (unknownRun?.partialWhy !== undefined) return { need, status: 'unknown', ...located(unknownRun), why: unknownRun.partialWhy };
+  const unknownWhy = unknownRun?.unplaced ?? unknownRun?.partialWhy;
+  if (unknownRun !== undefined && unknownWhy !== undefined) return { need, status: 'unknown', ...located(unknownRun), why: unknownWhy };
   const strongOpaque = d.ci.first(matchKeys(OPAQUE_KEY, lang), dirs, layer, [FN]);
   if (strongOpaque) return { need, status: 'unknown', ...located(strongOpaque), why: strongOpaque.why as string };
   if (d.truncated) return { need, status: 'unknown', why: OPAQUE_WHY.truncated };
@@ -380,7 +385,8 @@ export function hookCoverage(need: Need, hooks: Hooks, d: Decide): Coverage {
     const cover = d.hooks.first(cat, dirs, 'push', coverKinds(need));
     if (cover) return { need, status: 'covered', by: cover.by as string, where: hooks.where, why: `${cover.subject} runs in ${HOOK_PLACE[m]} before each commit.` };
     const unknownRun = d.hooks.first([...matchKeys(`${UNKNOWN_PREFIX}${need.category}`, lang), ...unsureKeys(`${UNKNOWN_PREFIX}${need.category}`, lang)], dirs, 'push', [FN, FC, FO]);
-    if (unknownRun?.partialWhy !== undefined) return { need, status: 'unknown', by: unknownRun.by as string, where: hooks.where, why: unknownRun.partialWhy };
+    const unknownWhy = unknownRun?.unplaced ?? unknownRun?.partialWhy;
+    if (unknownRun !== undefined && unknownWhy !== undefined) return { need, status: 'unknown', by: unknownRun.by as string, where: hooks.where, why: unknownWhy };
     const partial = d.hooks.first(cat, dirs, 'push', partialKinds(need));
     if (partial) return { need, status: 'partial', by: partial.by as string, where: hooks.where, why: reasonWhy(partial, effectiveReason(need, partial.reason) as Reason, 'before each commit', need.category) };
     const unsure = d.hooks.first(unsureKeys(need.category, lang), dirs, 'push', [FN, FC, FO]);

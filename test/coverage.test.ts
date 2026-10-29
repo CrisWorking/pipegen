@@ -3129,7 +3129,8 @@ describe('coverage: followed scripts and shells, allowlists (P52)', () => {
       expect(r.status, s).toBe('partial');
     }
     // a literal list runs; an exit with a literal non-zero code fails the run (never a silent pass); a finished if block
-    for (const s of ['for t in unit api; do pytest "$t"; done', 'cd . || exit 1\npytest', 'if true; then echo x; fi\npytest', 'if [ -n "$X" ]; then echo x; fi\npytest']) {
+    // P59 (3): `pytest "$t"` names a path pipegen can't place (unknown), so the loop is checked with -k, whose value isn't a path
+    for (const s of ['for t in unit api; do pytest -k "$t"; done', 'cd . || exit 1\npytest', 'if true; then echo x; fi\npytest', 'if [ -n "$X" ]; then echo x; fi\npytest']) {
       expect((await st(`set -e\n${s}\n`)).status, s).toBe('covered');
     }
   });

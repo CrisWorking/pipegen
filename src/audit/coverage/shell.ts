@@ -260,30 +260,67 @@ const basename = (w: string) => w.slice(w.lastIndexOf('/') + 1);
 /** P57 (C1): at most this many path arguments are read; more is 'capped' (the run is partial, 'long'). */
 const MAX_PATH_ARGS = 32;
 /**
- * P57 (C1): the words of a tool's command line that may name what it checks (not a flag, not a redirection), resolved
- * from the folder it runs in. Null when there is none, more than MAX_PATH_ARGS, or one pipegen can't place (a
- * variable, a glob, a quote, a path that leaves the repo): the run then keeps its folder. Which of these words are
- * real paths (not a subcommand such as `check`) is decided once the repo can be looked at (scopeToPaths).
+ * P59 (3): flags that take a value, common to the tools pipegen reads (docker, pytest, mypy, ruff, eslint, trivy…): a
+ * word after one is that value, not a path, even when pipegen can't read it (`-t app:$TAG`). After any other flag such a
+ * word may be a path (`mypy --strict $DIR`), so it counts as one pipegen can't place.
  */
-export function pathWords(args: readonly string[], cwd: string | null): string[] | 'capped' | null {
+const VALUE_FLAGS: ReadonlySet<string> = new Set(['-t', '--tag', '-f', '--file', '-l', '--label', '--build-arg', '--secret', '--platform', '--target', '--cache-from',
+  '--cache-to', '-o', '--output', '--format', '--template', '-c', '--config', '--config-file', '--rcfile', '-k', '-m', '--deselect', '--junitxml', '--junit-xml',
+  '--tb', '-n', '--maxfail', '--log-level', '-p', '--project', '-e', '--env', '--name', '--select', '--ignore', '--extend-select', '--exclude', '--extend-exclude',
+  '--severity', '-s', '--exit-code', '--timeout', '--reporter', '--ext', '--max-warnings', '--testPathPattern', '--testNamePattern', '--python-version',
+  '--cov', '--cov-report', '--cov-fail-under', '--skip-dirs', '--skip-files', '--ignorefile', '--policy', '--out', '--report']);
+/**
+ * P57 (C1): the words of a tool's command line that may name what it checks (not a flag, not a redirection), resolved
+ * from the folder it runs in. Null when there is none. Which of these words are real paths (not a subcommand such as
+ * `check`) is decided once the repo can be looked at (scopeToPaths). More than MAX_PATH_ARGS: 'capped'.
+ * P59 (3): a word pipegen can't place (a variable, a `${{ }}` expression, a glob, a quote, a path that leaves the repo)
+ * is 'unplaced': the run may check any service under its folder or none, so it is unknown there, never covered by
+ * falling back to the whole folder. A quoted value with spaces, or any word right after a VALUE_FLAGS flag, is that
+ * flag's value.
+ */
+export function pathWords(args: readonly string[], cwd: string | null): string[] | 'capped' | 'unplaced' | null {
   if (cwd === null) return null;
   const out: string[] = [];
+  let prev: string | null = null; // the flag word right before, when it has no `=value`
   for (let i = 0; i < args.length; i++) {
-    const w = args[i] as string;
+    let w = args[i] as string;
     const r = redirection(w);
     if (r !== null) {
       if (!r) i++;
+      prev = null;
       continue;
     }
     if (w === '--') break;
-    if (w.startsWith('-') || w === '') continue;
-    if (!/^[A-Za-z0-9_.@+/-]{1,200}$/.test(w)) return null;
+    // a GitHub expression split into words (`${{ inputs.dir }}`) is one word
+    if (w.includes('${{') && !w.includes('}}')) {
+      while (i + 1 < args.length && !(args[i] as string).includes('}}')) w = `${w} ${args[++i] as string}`;
+    }
+    if (w.startsWith('-') && w.length > 1 && !w.includes('${{')) {
+      prev = w.includes('=') ? null : w;
+      continue;
+    }
+    const flag = prev;
+    prev = null;
+    if (w === '') continue;
+    const odd = w.length > 200 || /[$`*?[\]{}~\\\s'"]/.test(w);
+    if (odd) {
+      if (flag !== null && (VALUE_FLAGS.has(flag) || (/\s/.test(w) && !/[$`]/.test(w)))) continue; // that flag's value
+      return 'unplaced';
+    }
+    if (flag !== null && VALUE_FLAGS.has(flag)) continue;
     const d = resolveDir(cwd, stripDotSlash(w));
-    if (d === null) return null;
+    if (d === null) return 'unplaced';
     if (out.length >= MAX_PATH_ARGS) return 'capped';
     if (!out.includes(d)) out.push(d);
   }
   return out.length === 0 ? null : out;
+}
+/**
+ * P59 (3): a run given a path pipegen can't place: Found.unplaced says why. It still counts for repo-wide rows; for the
+ * services under its folder it is unknown where it would have covered (decide.ts, Firsts).
+ */
+export function unplacedRun(f: Found): Found {
+  return { ...f, unplaced: `${f.subject} is given a path pipegen can't place (a variable, an expression, a glob or a path outside the repo), so it can't tell which services it checks.` };
 }
 const NPM_PROVENANCE_ID = 'npm-provenance';
 /** The image's name: no registry or owner, no :tag or @digest (ghcr.io/zricethezav/gitleaks:v8 → gitleaks). */
@@ -566,11 +603,12 @@ export function scanShell(text: string, base: string | null, sigs: Compiled, bud
         }
         if (r.tool.id === NPM_PROVENANCE_ID) f.envGate = 'npm';
         // P57 (C1): path arguments scope the run to the services under them (scopeToPaths, once the repo can be checked)
-        const paths = complete ? pathWords(args.slice(r.rest.length), cwd) : null;
+        // a hook runner's words are hook ids, not paths
+        const paths = complete && !isHookRunner(r.tool.id) ? pathWords(args.slice(r.rest.length), cwd) : null;
         // P57 (fail closed): more path arguments than pipegen reads: it can't tell which services they cover
         if (paths === 'capped') f.reason ??= 'long';
-        else if (paths !== null) f.pathArgs = paths;
-        add(f);
+        else if (paths !== null && paths !== 'unplaced') f.pathArgs = paths;
+        add(paths === 'unplaced' ? unplacedRun(f) : f);
       }
     };
     if (w.includes('/')) tryRules(sigs.byPath.get(stripDotSlash(w)));
@@ -654,13 +692,14 @@ export function scanShell(text: string, base: string | null, sigs: Compiled, bud
     // tell what else its runner checks ('?': resolveScripts narrows it from the script's text when it can)
     const python = byName === undefined && script === undefined;
     const paths0 = name === 'pytest' && segEnd[k]! - k - 1 <= MAX_FLAG_WORDS ? pathWords(args, cwd) : null;
-    const paths = paths0 === 'capped' ? null : paths0;
-    add({
+    const paths = paths0 === 'capped' || paths0 === 'unplaced' ? null : paths0;
+    const own: Found = {
       categories, by: `your own \`${cmd}\``, subject: `Your own \`${cmd}\``, dir: cwd, reason: shellReason(k),
       ...(script === undefined ? {} : { script }), ...(envGate === undefined ? {} : { envGate }), ...(byName === undefined ? {} : { byName }),
       ...(python ? { langs: ['python'] } : byName !== undefined ? { langs: ['node', '?'] } : {}), ...(paths === null ? {} : { pathArgs: paths }),
       ...(paths0 === 'capped' && shellReason(k) === null ? { reason: 'long' as const } : {}),
-    });
+    };
+    add(paths0 === 'unplaced' ? unplacedRun(own) : own);
   };
   /**
    * P55 (batch B): `docker compose|docker-compose [global flags] <sub> …` at k (its first word after `docker compose` is
