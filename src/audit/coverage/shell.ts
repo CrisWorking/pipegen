@@ -16,7 +16,15 @@ import type { Budget, CommandRule, Compiled, DockerBuild, Found, Reason } from '
  * `script` (P51): the text is a repo script file pipegen follows (its condition why names the script). The condition
  * rules themselves (P51-P53) apply to every shell text: steps, package scripts, hooks and script files.
  */
-export interface ShellMode { errexit: boolean; pipefail: boolean; script?: boolean }
+export interface ShellMode {
+  errexit: boolean; pipefail: boolean; script?: boolean;
+  /**
+   * P60 (R5): a followed script (a package script or a script file): a detached `docker run -d` / `docker compose
+   * run|exec -d` / `up -d` there runs in the background, like `&` (partial), so a script counted by name is lowered too.
+   * In a step's own text such a command still gives no coverage (C2).
+   */
+  followed?: boolean;
+}
 export const DEFAULT_SHELL: ShellMode = { errexit: true, pipefail: false };
 
 /** Shells GitHub runs with errexit off that pipegen reads as before (pwsh, powershell, python, cmd): `run:` text isn't sh there. */
@@ -533,6 +541,15 @@ export function scanShell(text: string, base: string | null, sigs: Compiled, bud
   let lastCmd: { kind: 'ok' | 'fail' | 'other'; start: number; end: number } | null = null; // the last command run, where it starts and its list end
   const isDead = (k: number) => k > deadAfter || k <= deadTo;
   let containerEnd = -1; // P50 (M1): words before this index are the command of a `docker run` container
+  let backgroundFrom = -1; // P60 (R5): the words of a detached docker / compose command in a followed script
+  let backgroundTo = -1;
+  /** P60 (R5): a detached command from k to its list end, in a followed script: it and what it runs are background runs. */
+  const detachedHere = (k: number): boolean => {
+    if (mode.followed !== true) return false;
+    backgroundFrom = k;
+    backgroundTo = segEnd[k]!;
+    return true;
+  };
   // P51/P52 (script files only): the rest of this and-or list may not run (after `||`, or `&&` after a command not on
   // the CHAIN_SAFE list); an exit/return that can run under a condition was seen; the last command was CHAIN_SAFE
   let condChain = false;
@@ -550,6 +567,7 @@ export function scanShell(text: string, base: string | null, sigs: Compiled, bud
   /** Why the failure of the command at k can't fail the step, or null. */
   const shellReason = (k: number): Reason | null => {
     if (k < functionEnd) return 'function';
+    if (k >= backgroundFrom && k < backgroundTo) return 'suppressed'; // P60 (R5): a detached run in a followed script
     const inLast = k > lastList;
     const exempt = swallowed[k] === 1 || (piped[k] === 1 && !pipefail) || background[k] === 1 || inCondition || k < negateEnd
       || (!errexit && !inLast) || (errexit && andAfter[k] === 1 && !inLast);
@@ -718,6 +736,11 @@ export function scanShell(text: string, base: string | null, sigs: Compiled, bud
     }
     const g = composeWords(word, from, end);
     if (g === null || g.sub === null) return null;
+    // P60 (R5): `up -d` without --exit-code-from / --abort-on-container-exit returns at once: in a followed script, a background run
+    if (g.sub === 'up') {
+      const upArgs = argsAfter(k);
+      if (upArgs.some((x) => x === '-d' || x === '--detach' || /^-[A-Za-z]*d[A-Za-z]*$/.test(x)) && !upArgs.some((x) => x.startsWith('--exit-code-from') || x === '--abort-on-container-exit')) detachedHere(k);
+    }
     const tool = (sigs.byFirstWord.get('docker') ?? []).concat(sigs.byFirstWord.get('docker-compose') ?? []).find((r) => r.tool.id === COMPOSE_BUILD_ID)?.tool;
     if (g.sub === 'build' || g.sub === 'up') {
       const args = argsAfter(k);
@@ -732,6 +755,8 @@ export function scanShell(text: string, base: string | null, sigs: Compiled, bud
     }
     if (g.sub !== 'run' && g.sub !== 'exec') return null;
     const r = composeRunWords(word, g.subAt + 1, end);
+    // P57 (C2): a detached run or exec gives no coverage in a step; P60 (R5): in a followed script it is a background run
+    if (r !== null && r.detached && !detachedHere(k)) return null;
     return r === null ? null : { commandAt: r.commandAt, run: { files: g.files, cwd, service: r.service, unsure: g.unsure } };
   };
   /** The Dockerfile and context a `docker build` names, as repo-relative paths from the folder it runs in; null when they leave the repo. */
@@ -1013,6 +1038,8 @@ export function scanShell(text: string, base: string | null, sigs: Compiled, bud
       }
     }
     if (name === 'docker' && next === 'run') {
+      // P60 (R5): a detached run in a followed script is a background run (its own reason, for a script counted by name)
+      for (let j = k + 2, f = word(j); f !== null && f.startsWith('-'); f = word(++j)) if (f === '--detach' || f === '--detach=true' || /^-[A-Za-z]*d[A-Za-z]*$/.test(f)) detachedHere(k);
       visit(false);
       let j = k + 2;
       let detached = false;
@@ -1022,7 +1049,7 @@ export function scanShell(text: string, base: string | null, sigs: Compiled, bud
         if (f === '--detach' || f === '--detach=true' || /^-[A-Za-z]*d[A-Za-z]*$/.test(f)) detached = true;
         j += !f.includes('=') && DOCKER_VALUE_FLAGS.has(f) ? 2 : 1;
       }
-      if (detached) {
+      if (detached && !detachedHere(k)) {
         cmd = false;
         k = segEnd[k]!;
         continue;

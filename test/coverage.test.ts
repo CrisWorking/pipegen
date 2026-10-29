@@ -3808,4 +3808,20 @@ describe('coverage: closing patch (ruling P60)', () => {
     expect(await lint('export SKIP\n')).toMatch(/^unknown/);
     expect(await lint('FOO=1\n')).toBe('covered ruff');
   });
+
+  it('R5: a detached docker or compose run inside a followed package script is partial, like `&`', async () => {
+    const node = svc('.', { scripts: ['test', 'start'] });
+    const byName = (test: string) => st({ 'package.json': JSON.stringify({ name: 'a', scripts: { test } }), 'compose.yml': 'services:\n  app:\n    build: .\n', Dockerfile: 'FROM node:22\nWORKDIR /app\nCOPY . /app\n' },
+      run('npm test'), 'unit-tests', [node], 'app');
+    for (const t of ['docker compose run -d app npm test', 'docker compose run --detach app vitest run', 'docker run -d img:1 vitest', 'docker compose up -d', 'docker compose exec -d app vitest run', 'docker compose run -dT app vitest run']) {
+      expect(await byName(t), t).toBe('partial your own `npm test`');
+    }
+    expect(await byName('vitest run &')).toBe('partial your own `npm test`'); // the same as the background &
+    expect(await byName('docker compose up --exit-code-from app')).toBe('covered your own `npm test`'); // waits: trusted by name
+    // a script followed by its text: the detached command counts as a background run
+    const files = { 'package.json': JSON.stringify({ name: 'a', scripts: { ci: 'docker compose run -d app pytest' } }), 'compose.yml': 'services:\n  app:\n    build: .\n', Dockerfile: IMG };
+    expect(await st(files, run('npm run ci'))).toBe('partial your own `npm run ci`');
+    // directly in a step it still gives no coverage (C2)
+    expect(await st(files, run('docker compose run -d app pytest'))).toBe('missing');
+  });
 });

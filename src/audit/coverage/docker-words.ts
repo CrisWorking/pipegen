@@ -185,14 +185,16 @@ const RUN_BOOL: ReadonlySet<string> = new Set([
   '--rm', '-T', '--no-TTY', '--no-tty', '-i', '-t', '--interactive', '--tty', '--no-deps', '--service-ports', '-P', '--use-aliases', '--quiet-pull', '--remove-orphans',
   '--privileged', '--quiet',
 ]);
-export function composeRunWords(at: At, from: number, end: number): { service: string; commandAt: number } | null {
+export function composeRunWords(at: At, from: number, end: number): { service: string; commandAt: number; detached: boolean } | null {
+  let detached = false;
   for (let i = from; i < end; i++) {
     const w = at(i);
     if (w === null) return null;
-    if (!w.startsWith('-')) return SERVICE_RE.test(w) && i + 1 < end ? { service: w, commandAt: i + 1 } : null;
+    if (!w.startsWith('-')) return SERVICE_RE.test(w) && i + 1 < end ? { service: w, commandAt: i + 1, detached } : null;
     const eq = w.indexOf('=');
     const name = eq < 0 ? w : w.slice(0, eq);
-    if (RUN_VALUE.has(name)) {
+    if (w === '--detach' || w === '--detach=true' || /^-[A-Za-z]*d[A-Za-z]*$/.test(w)) detached = true; // P60 (R5): the caller decides (C2: no coverage in a step)
+    else if (RUN_VALUE.has(name)) {
       if (eq < 0 && at(++i) === null) return null;
     } else if (!(eq < 0 && RUN_BOOL.has(name))) return null;
   }

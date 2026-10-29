@@ -35,7 +35,7 @@ function byNameLangs(f: Found, runs: readonly Found[]): readonly string[] | unde
 const PLAN_P_SCRIPT_CATEGORIES: ReadonlySet<string> = new Set(['format', 'type-check', 'coverage', 'dead-code', 'duplication']);
 
 /** How npm runs a script: `/bin/sh -c` on POSIX (https://docs.npmjs.com/cli/v11/using-npm/scripts), so no -e. */
-const NPM_SCRIPT_SHELL: ShellMode = { errexit: false, pipefail: false };
+const NPM_SCRIPT_SHELL: ShellMode = { errexit: false, pipefail: false, followed: true };
 
 /** The `scripts` of `<dir>/package.json` (string values only), or null when it can't be read. */
 function packageScripts(ctx: Ctx, dir: string): Promise<ReadonlyMap<string, string> | null> {
@@ -147,7 +147,7 @@ export async function resolveScripts(ctx: Ctx, found: Found[]): Promise<Found[]>
 }
 
 /** How bash runs a script file (`bash x.sh`, `./x.sh`): no -e unless the file sets it (`set -e`, read by scanShell). */
-const SCRIPT_FILE_SHELL: ShellMode = { errexit: false, pipefail: false, script: true };
+const SCRIPT_FILE_SHELL: ShellMode = { errexit: false, pipefail: false, script: true, followed: true };
 
 /**
  * DoD run (fastapi/full-stack-fastapi-template: `uv run bash scripts/tests-start.sh` → `bash scripts/test.sh` →
