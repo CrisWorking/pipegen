@@ -7,6 +7,7 @@ import { describe, expect, it, vi } from 'vitest';
 import { newRateBudget } from '../src/engine/github-rate.js';
 import { readActionRuns, type PinDeps } from '../src/engine/pin.js';
 import { DOCKER_ACTION_USES, IMAGE_BUILT_ACTION_USES } from '../src/engine/tool-flags.js';
+import { liveToken } from './helpers/live-token.js';
 import { reviewedList } from './helpers/render.js';
 
 const live = process.env.PIPEGEN_LIVE_TESTS === '1';
@@ -28,7 +29,7 @@ describe('container action lists (offline)', () => {
 describe.skipIf(!live)('container action lists match the real action.yml files (live)', () => {
   it('docker <=> DOCKER_ACTION_USES; Dockerfile-built <=> IMAGE_BUILT_ACTION_USES; nothing else is in either', async () => {
     const options: Record<string, string> = {};
-    const given = process.env[['GITHUB', 'TOKEN'].join('_')];
+    const given = liveToken();
     if (given !== undefined) options[['au', 'th'].join('')] = given;
     const deps: PinDeps = { gh: new Octokit(options), fetch, alert: vi.fn(), notes: [], sleep: async (ms) => { await new Promise((r) => setTimeout(r, ms)); }, now: () => Date.now(), budget: newRateBudget() };
     const seen: string[] = [];

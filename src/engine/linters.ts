@@ -39,6 +39,7 @@ import { prepareTrustedDir, type TrustedDirKind } from '../util/trusted-dir.js';
 import { TarError, readTarMember } from '../util/tar.js';
 import { COOLDOWN_DAYS, downloadRelease } from './pin.js';
 import { isReleaseBuild, listPending, PENDING, reviewMarkerProblems } from './review-marker.js';
+import { ACTION_PATH_RE, WORKFLOW_PATH_RE } from './job-rules.js';
 import { ASSET_RE, isGitHubRepo, SHA256_RE } from './names.js';
 import type { Linters, RefereeIssue } from './referee.js';
 import { loadReviewed } from './reviewed.js';
@@ -416,8 +417,6 @@ export function checkPinnedAgainstReviewed(pins: PinnedBinaries, reviewed: reado
 // skipped with a warning). Anything that is not such a file is not copied and is an issue (it
 // was not linted, so it is not cleared). The linters start with an empty environment plus what they need (S19).
 
-const WORKFLOW_FILE_RE = /^\.github\/workflows\/[A-Za-z0-9._-]+\.ya?ml$/;
-const ACTION_FILE_RE = /^\.github\/actions\/[A-Za-z0-9._/-]+\/action\.ya?ml$/;
 const LINTER_TIMEOUT_MS = 120_000;
 const LINTER_MAX_OUTPUT = 16 * 1024 * 1024;
 /** zizmor's exit codes: 0 nothing found; 10 to 14 findings (by severity). Anything else is a failure. */
@@ -439,11 +438,10 @@ export interface RunLintersDeps {
   timeoutMs?: number;
 }
 
-/** A file path that may be copied: a workflow, or a composite action file, with no `.`/`..`/empty segment. */
+/** A file path that may be copied: a workflow, or a composite action file (job-rules.ts: no `.`, `..` or empty segment). */
 function lintablePath(path: string): 'workflow' | 'action' | null {
-  if (path.split('/').some((seg) => seg === '' || seg === '.' || seg === '..')) return null;
-  if (WORKFLOW_FILE_RE.test(path)) return 'workflow';
-  return ACTION_FILE_RE.test(path) ? 'action' : null;
+  if (WORKFLOW_PATH_RE.test(path)) return 'workflow';
+  return ACTION_PATH_RE.test(path) ? 'action' : null;
 }
 
 /** The pinned config text of a reviewed linter (fixedInputs.config.content). */

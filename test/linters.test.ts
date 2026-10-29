@@ -285,7 +285,8 @@ describe('runLinters (S19, S21)', () => {
   it('runLinters: a file that can not be written is an issue and is not linted', async () => {
     const long = `.github/workflows/${'a'.repeat(300)}.yml`;
     const { a, z, issues } = await run([file(long), file(WF)]);
-    expect(issues.some((i) => /could not be copied/.test(i.message)), JSON.stringify(issues)).toBe(true);
+    // a name longer than the shared path rule (job-rules.ts) is refused before any write is tried; either way it is an issue and is not linted
+    expect(issues.some((i) => /could not be copied|is not a workflow file/.test(i.message)), JSON.stringify(issues)).toBe(true);
     for (const s of [a, z]) expect((s.records()[0] as Rec).files.filter((f) => f.includes('aaaa'))).toEqual([]);
     // when nothing can be written there is nothing to run, and that is still an issue
     const only = await run([file(long)]);

@@ -23,10 +23,14 @@ import { tuningProblems } from './tuning.js';
 import { APP_RUNNING_CATEGORIES, projectScriptSteps, renderCliTool, type CliHooks, type RenderOptions } from './render-cli.js';
 import { ArtifactNameError, resultArtifactName } from './artifact-names.js';
 import type { ProjectScriptStep } from './reviewed.js';
-import { EXPR, own, RenderError, show } from './render-error.js';
-import { CHECKER_STEP_ID_RE, DOCKER_ACTION_USES, IMAGE_BUILT_ACTION_USES, PLAIN_REL_RE, RENDERER_INPUTS, rendererInputProblems, SCRUB_STEP_ID_RE, SETUP_STEP_ID_RE, TOOL_STEP_ID_RE } from './tool-flags.js';
+import { own, RenderError, show } from './render-error.js';
+import { checkExpressions, checkJobOrder, isDangerousName, isReviewed, STEP_KEYS, type RenderedStep } from './job-rules.js';
+import { DOCKER_ACTION_USES, IMAGE_BUILT_ACTION_USES, PLAIN_REL_RE, PLATFORM_LOCKS, PLATFORM_USES, RENDERER_INPUTS, rendererInputProblems } from './tool-flags.js';
 
 export { RenderError };
+// the job rules live in job-rules.ts (one copy for the renderer, the emitter, the referee and the linters); re-exported for the callers that import them here
+export { checkExpressions, checkJobOrder, IF_VALUES, isDangerousName, SECRET_REF_RE } from './job-rules.js';
+export type { RenderedStep };
 export type { RenderOptions };
 
 /** What a render needs besides the step: the repo facts (services, folders) and, for steps that need them, run-time targets (ruling S2). */
@@ -36,13 +40,6 @@ export interface RenderContext {
   targets?: { image?: string; url?: string; spec?: string; k8sDir?: string };
   /** Render the target-branch (baseline) variant of the check: its result goes to the `pipegen-out-base-<needId>` artifact (the `base-scan` job). */
   base?: true;
-}
-
-/** One step of a job, as pipegen renders it. `usesComment` becomes the trailing `# <version>` comment on `uses:`. */
-export interface RenderedStep {
-  id?: string; name: string; if?: string; uses?: string; usesComment?: string; with?: Record<string, string>;
-  run?: string; shell?: 'bash'; env?: Record<string, string>; 'working-directory'?: string;
-  'continue-on-error'?: boolean; 'timeout-minutes'?: number;
 }
 
 /** `output`: where the tool's result will be, under `${{ runner.temp }}` (ruling S7); null when the step makes none. */
@@ -57,37 +54,10 @@ export interface RenderResult {
 /** A `with:` value from a template or a choice: plain words only (no expression, no quote, no shell character). */
 const WITH_VALUE_RE = /^[A-Za-z0-9_@./:,=+\- ]{0,300}$/;
 const SECRET_NAME_RE = /^[A-Z][A-Z0-9_]{0,99}$/;
-/**
- * Env names a mapped secret must never take (ruling S9, widened in 6a fix round 1). One table, by family: each name
- * changes how a shell, a runtime, a package manager, a TLS or proxy setting, the C library, the locale or the runner
- * itself behaves, and 6b passes declared secrets into the tool's environment. Names are matched as a whole (`^…$`).
- * An ordinary application secret (STRIPE_KEY, GOOGLE_API_KEY, DATABASE_URL) is not caught.
- */
-const DANGEROUS_NAMES: readonly { family: string; match: RegExp }[] = [
-  { family: 'shell and process', match: /^(?:CI|PATH|HOME|BASH_ENV|ENV|SHELLOPTS|PS4|IFS|SHELL|PROMPT_COMMAND|TMPDIR|TMP|TEMP|LANG|LANGUAGE|TZ|TERM[A-Z0-9_]*)$/ },
-  { family: 'runner, CI and pipegen', match: /^(?:GITHUB|RUNNER|ACTIONS|PIPEGEN)_/ },
-  { family: 'loader and libc', match: /^(?:LD_|DYLD_|MALLOC_|LC_)|^(?:GCONV_PATH|GLIBC_TUNABLES|HOSTALIASES|RES_OPTIONS|LOCALDOMAIN)$/ },
-  { family: 'proxy and TLS', match: /_PROXY$|^(?:SSL_|CURL_|OPENSSL_)|^REQUESTS_CA_BUNDLE$/i },
-  { family: 'node, npm, python and package indexes', match: /^(?:NODE_|NPM_CONFIG_|PYTHON|PIP_|UV_)|^npm_config_/ },
-  { family: 'java, perl, ruby', match: /^(?:JAVA_TOOL_OPTIONS|_JAVA_OPTIONS|JDK_JAVA_OPTIONS|PERLLIB)$|^(?:PERL5|RUBY|GEM_|BUNDLE_)/ },
-  { family: 'rust and go', match: /^(?:CARGO_|RUSTUP_|RUSTFLAGS$)|^GO[A-Z0-9]*$/ },
-  { family: 'git, docker, XDG', match: /^(?:GIT_|DOCKER_|XDG_)/ },
-  { family: 'the reviewed tools', match: /^(?:TRIVY_|HADOLINT_|PINACT_|SEMGREP_|COVERAGE_)/ },
-  // build toolchains (6b, review R1-7): a compiler, linker, make or package-manager setting changes what a build runs
-  { family: 'C, C++ and Go build', match: /^(?:CGO_|PKG_CONFIG_)|^(?:CC|CXX|AR|CFLAGS|CXXFLAGS|CPPFLAGS|LDFLAGS|MAKEFLAGS)$/ },
-  { family: 'js package managers and runtimes', match: /^(?:YARN_|PNPM_|BUN_|DENO_|COREPACK_)/ },
-  { family: 'jvm, .NET, php, conda, rust compiler', match: /^(?:COMPOSER_|CONDA_|DOTNET_|NUGET_|RUSTC)|^(?:MAVEN_OPTS|GRADLE_OPTS|GRADLE_USER_HOME|PHPRC|PHP_INI_SCAN_DIR|SSH_ASKPASS)$/ },
-];
-/** Whether a variable name is one a mapped secret (or a job-level variable) must never take. Shared with the referee. */
-export const isDangerousName = (name: string): boolean => DANGEROUS_NAMES.some((d) => d.match.test(name));
-
 /** The tool's own choices (text values) of a spec's choices, without the tuning section. */
 const textChoices = (c: StepSpec['choices']): Record<string, string> => Object.fromEntries(Object.entries(c).filter((e): e is [string, string] => typeof e[1] === 'string'));
 
 const same = (a: unknown, b: unknown): boolean => isDeepStrictEqual(a, b);
-
-/** Why a candidate counts as reviewed: both marks (the type says so, a cast or a JSON copy might not). */
-const isReviewed = (c: { source: string; reviewed: boolean }): boolean => c.source === 'reviewed' && c.reviewed === true;
 
 // ---------- validateSpec ----------
 
@@ -207,28 +177,6 @@ export function mapNodeVersion(runtimeVersion: string | undefined, allowed: read
 }
 
 // ---------- the action core ----------
-
-/** PlatformActions key → the `uses:` path (owner/repo[/path], lower case) its entry must have; a swapped entry is refused. */
-const PLATFORM_USES: Readonly<Record<keyof PlatformActions, string>> = Object.freeze({
-  checkout: 'actions/checkout', 'setup-node': 'actions/setup-node', 'setup-python': 'actions/setup-python',
-  'upload-artifact': 'actions/upload-artifact', 'download-artifact': 'actions/download-artifact', 'docker-login': 'docker/login-action',
-  'setup-buildx': 'docker/setup-buildx-action', 'build-push': 'docker/build-push-action', 'upload-sarif': 'github/codeql-action/upload-sarif', attest: 'actions/attest',
-});
-
-/**
- * Inputs a platform action's entry must FIX to these values (by `uses` path). They are checked on every render path
- * (renderStep, renderPlatformStep, the prelude, the upload), not only where an entry is first used, and an input listed
- * here can not also be an AI choice.
- */
-const PLATFORM_LOCKS: Readonly<Record<string, Readonly<Record<string, string>>>> = Object.freeze({
-  'actions/checkout': { 'persist-credentials': 'false', 'allow-unsafe-pr-checkout': 'false' },
-  'actions/setup-node': { 'package-manager-cache': 'false' },
-  'actions/upload-artifact': { 'include-hidden-files': 'false', 'if-no-files-found': 'error' },
-  // the docker actions' cache and credential locks (6b, review R1-5): checked here, not only by the loader
-  'docker/build-push-action': { 'no-cache': 'true', 'github-token': '', context: '.' },
-  'docker/setup-buildx-action': { 'cache-binary': 'false' },
-  'docker/login-action': { logout: 'true' },
-});
 
 /** Actions the renderer fills inputs for through their own helper (renderUpload, renderPlatformStep); renderStep refuses them. */
 const HELPER_ONLY: ReadonlySet<string> = new Set(Object.keys(RENDERER_INPUTS).filter((k) => k !== 'docker/login-action' && k !== 'docker/build-push-action'));
@@ -355,7 +303,7 @@ export function renderStepWith(given: StepSpec, tool: ReviewedTool, platform: Pl
   const container = containerRefusal(tool, usesOf(tool).path);
   if (container !== null) throw new RenderError(`container action: ${container}.`);
   if (HELPER_ONLY.has(usesOf(tool).path)) throw new RenderError(`${show(tool.id)} is rendered with renderPlatformStep or renderUpload, which supply the inputs it needs.`);
-  if (tool.step.output.format !== 'none') throw new RenderError(`not implemented in 6a: an action that writes a result (${show(tool.id)}); its output is moved under runner.temp in 6b.`);
+  if (tool.step.output.format !== 'none') throw new RenderError(`an action that writes a result (${show(tool.id)}) can't be rendered: its output would have to be moved under runner.temp first, and no reviewed action needs that yet.`);
 
   const { path } = usesOf(tool);
   const service = spec.service === undefined ? undefined : ctx.profile.services.find((s) => s.name === spec.service);
@@ -447,54 +395,6 @@ function mergePins(a: string | undefined, b: string | undefined): string {
     }
   }
   return `[${[...out.values()].join(',')}]`;
-}
-
-/**
- * The platform actions that run no repo code and no step script of ours: pinned by SHA (the version is a comment).
- * download-artifact is on the list (7a fix round 1, ruling 1): it runs no code, it only writes data another job uploaded;
- * whether that data can be trusted is Plan C's question (the scrub and sha256 chain), not the order rule's. bullfrog (the
- * egress block, reviewed locks: no sudo, allowed domains only) is the harden step a job starts with, before its checkout.
- */
-const TRUSTED_ACTION_RE = /^(?:actions\/(?:checkout|setup-node|setup-python|upload-artifact|download-artifact)|github\/codeql-action\/upload-sarif|bullfrogsec\/bullfrog)@[0-9a-f]{40}$/;
-/** The `uses` path each setup id belongs to (review-6c-r1 minor 3): `pipegen-checkout` counts only on actions/checkout, and so on. */
-const SETUP_ID_ACTION: readonly [RegExp, string][] = [
-  [/^pipegen-checkout$/, 'actions/checkout'], [/^pipegen-setup-node-\d{1,3}$/, 'actions/setup-node'], [/^pipegen-setup-python$/, 'actions/setup-python'],
-];
-
-/**
- * Whether a step is KNOWN not to run the repo's code. Everything else is repo code (fail closed): a step with no id, an
- * unknown or renamed id, `pipegen-npm-ci-…` (the repo's own `npm ci` reads its `.npmrc`), the repo-code run steps, and any
- * action that is not a pinned checkout, setup or upload action. An id counts only on the right kind of step: a script
- * for the run ids, and for a setup id the pinned platform action it names (`pipegen-checkout` only on actions/checkout).
- */
-function isKnownHarmless(s: RenderedStep): boolean {
-  const pinnedAction = s.uses !== undefined && s.run === undefined && TRUSTED_ACTION_RE.test(s.uses);
-  if (s.id === undefined) return pinnedAction;
-  if (SETUP_STEP_ID_RE.test(s.id)) {
-    const path = SETUP_ID_ACTION.find(([re]) => re.test(s.id as string))?.[1];
-    return pinnedAction && path !== undefined && (s.uses as string).startsWith(`${path}@`);
-  }
-  if (CHECKER_STEP_ID_RE.test(s.id) || SCRUB_STEP_ID_RE.test(s.id) || TOOL_STEP_ID_RE.test(s.id)) return s.run !== undefined && s.uses === undefined;
-  return false;   // an unknown or renamed id
-}
-
-/**
- * The order rule of the referee (S6 c, Plan 7a), as an allowlist that fails closed (review-6b-r2 C1). A step that runs or
- * loads the repo's code can rewrite what runs after it in the same job (runner temp, the install folders, `$GITHUB_ENV`,
- * the PATH). Every step that is not KNOWN to be harmless (isKnownHarmless) is repo code; once one has run, only repo-code
- * steps may follow. So no checker, release or docker tool, scrub, upload or action may come after one. There is no list of
- * harmless steps that may follow repo code: none can be justified. Returns plain-English problems, empty when the order is
- * fine; `dedupeJobSteps` throws on them and the referee runs it on the final YAML.
- */
-export function checkJobOrder(steps: readonly RenderedStep[]): string[] {
-  const problems: string[] = [];
-  let repoCode: string | undefined;
-  steps.forEach((s, i) => {
-    if (isKnownHarmless(s)) {
-      if (repoCode !== undefined) problems.push(`Step ${i + 1} (${show(s.name)}) comes after the repo-code step ${show(repoCode)}: code from the repository could have changed what it runs or uploads. Put it before, or in another job.`);
-    } else if (repoCode === undefined) repoCode = s.name;
-  });
-  return problems;
 }
 
 /** The renderer-filled inputs of an action for this service and context (the others are set by the helpers that own them). */
@@ -597,7 +497,6 @@ export function jobSettings(spec: StepSpec): { 'cache-mode': 'none' } {
 
 // ---------- YAML ----------
 
-const KEY_ORDER = ['id', 'name', 'if', 'uses', 'with', 'run', 'shell', 'env', 'working-directory', 'continue-on-error', 'timeout-minutes'] as const;
 const NEEDS_QUOTES = /[\u0000-\u001f\u007f-\u009f\u2028\u2029]|\$\{\{|^\s|\s$|\s#|:\s|^[-?:,[\]{}#&*!|>'"%@`]/;
 
 /** A string scalar that can't be read as anything else: quoted whenever it has control characters, an expression or YAML syntax. */
@@ -606,52 +505,6 @@ function str(value: string, block = false): Scalar {
   if (block && value.includes('\n') && !/[\u0000-\u0009\u000b-\u001f\u007f-\u009f\u2028\u2029]|\s\n|^\s/.test(value)) s.type = Scalar.BLOCK_LITERAL;
   else if (NEEDS_QUOTES.test(value)) s.type = Scalar.QUOTE_DOUBLE;
   return s;
-}
-
-/** `if:` values pipegen writes: nothing else is an allowed condition (an `if` is always an expression, with or without `${{`). */
-export const IF_VALUES: ReadonlySet<string> = new Set(['always()', 'success()', 'failure()', '!cancelled()']);
-export const SECRET_REF_RE = /^\$\{\{ secrets\.([A-Z][A-Z0-9_]{0,99}) \}\}$/;
-
-/**
- * Refuses an expression (`${{`) anywhere but the forms pipegen itself writes (Quoting does not stop Actions from
- * evaluating one, so an expression in a name, run line, id, folder or any key is a bug or an attack, never rendered):
- * - an `env` value that is exactly `${{ secrets.NAME }}` under the same name NAME, which is not a dangerous one (S9);
- * - a `with` value that passes the RENDERER_INPUTS checker of that action together with its `whenWith` condition on the
- *   step's whole `with` (the runner.temp paths, the login actor, the token only with ghcr.io). A `uses` with no `@` has no table.
- * The step's other fields are held to their type too: `if` is one of a fixed set, `continue-on-error` a boolean and
- * `timeout-minutes` a whole number of minutes (a hand-built step may be cast past the types, review R1-2/R1-4).
- * The referee (7a) runs this same function on every step it parses, so the emitter and the judge allow the same forms.
- */
-export function checkExpressions(step: RenderedStep): void {
-  const bad = (what: string): never => { throw new RenderError(`A step may not contain an expression in its ${what} (${show(step.name)}).`); };
-  const odd = (what: string): never => { throw new RenderError(`A step's ${what} is not in a form pipegen writes (${show(step.name)}).`); };
-  for (const key of KEY_ORDER) {
-    const v: unknown = step[key];
-    if (typeof v === 'string' && v.includes(EXPR)) bad(key);
-  }
-  if (typeof step.usesComment === 'string' && step.usesComment.includes(EXPR)) bad('usesComment');
-  if (step.if !== undefined && (typeof step.if !== 'string' || !IF_VALUES.has(step.if))) odd('if');
-  const coe: unknown = step['continue-on-error'];
-  if (coe !== undefined && typeof coe !== 'boolean') odd('continue-on-error');
-  const tm: unknown = step['timeout-minutes'];
-  if (tm !== undefined && (typeof tm !== 'number' || !Number.isInteger(tm) || tm < 1 || tm > 360)) odd('timeout-minutes');
-  const at = step.uses === undefined ? -1 : step.uses.lastIndexOf('@');
-  const usesPath = at < 0 || step.uses === undefined ? undefined : step.uses.slice(0, at);
-  const table = usesPath === undefined ? undefined : own(RENDERER_INPUTS, usesPath.toLowerCase());
-  for (const [group, values] of [['env', step.env], ['with', step.with]] as const) {
-    for (const [k, v] of Object.entries(values ?? {})) {
-      if (k.includes(EXPR)) bad(`${group} names`);
-      if (typeof v !== 'string') odd(`${group} value ${show(k)}`);
-      if (!v.includes(EXPR)) continue;
-      if (group === 'env') {
-        const m = SECRET_REF_RE.exec(v);
-        if (m === null || m[1] !== k || isDangerousName(k)) bad(`env value ${show(k)}`);
-      } else if (usesPath === undefined || table === undefined || own(table, k) === undefined || rendererInputProblems(usesPath, { [k]: v }, step.with ?? {}).length > 0) {
-        // an input the renderer fills is judged by its own checker and its condition; a with value may carry no other expression
-        bad(`with value ${show(k)}`);
-      }
-    }
-  }
 }
 
 /**
@@ -664,7 +517,7 @@ export function stepsToYaml(steps: readonly RenderedStep[]): YAMLSeq {
   for (const step of steps) {
     checkExpressions(step);
     const map = new YAMLMap();
-    for (const key of KEY_ORDER) {
+    for (const key of STEP_KEYS) {
       const value = step[key];
       if (value === undefined) continue;
       if (typeof value === 'string') {

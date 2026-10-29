@@ -28,7 +28,7 @@ import { closureRootDependencies, loadNpmClosure, NpmClosureError, type NpmPin }
 import { EXPR, own, refuse, show } from './render-error.js';
 import type { RenderContext, RenderedStep, RenderResult } from './render-step.js';
 import { slotProblem, type SlotKind } from './slots.js';
-import { ARGV_POLICIES, PIP_CLOSURES, PLAIN_REL_RE, type ArgvPolicy } from './tool-flags.js';
+import { ARGV_POLICIES, PIP_CLOSURES, PLAIN_REL_RE, runsRepoCode, type ArgvPolicy } from './tool-flags.js';
 import { EXTRA_RULES_AT, tuningEffects, type TuningEffects } from './tuning.js';
 import type { InstallSpec, ReviewedTool, Service, StepSpec } from '../types.js';
 
@@ -394,6 +394,12 @@ function rulesStep(tool: ReviewedTool, a: NonNullable<ArgvPolicy['archive']>, ar
 
 // ---------- the main entry ----------
 
+/** The text a run line starts a tool with: the env -i array, then the launcher. The referee finds trivy's launch by these (final review minor 10), so a change here changes its check too. */
+const LAUNCH_ENV = '"${pg_env[@]}"';
+/** The launcher of a downloaded release binary. */
+const releaseLauncher = (exe: string): string => `"$bin/${exe}"`;
+/** The line a rendered trivy run step starts trivy with. */
+export const TRIVY_LAUNCH_RE = new RegExp(`${LAUNCH_ENV} ${releaseLauncher('trivy')}`.replace(/[.*+?^${}()|[\]\\/]/g, '\\$&'));
 const sha16 = (text: string): string => createHash('sha256').update(text).digest('hex').slice(0, 16);
 /** Tool categories of the DAST steps: the only docker steps that may use the host network (their target is the app on the runner). */
 const DAST_CATEGORIES: ReadonlySet<string> = new Set(['dast', 'api-dast']);
@@ -471,7 +477,7 @@ export function renderCliTool({ spec, tool, service, ctx, hooks, options }: CliA
   if (kind === 'github-release') {
     steps.push(releaseInstall(tool, install, exe, artifact));
     vars.push(`bin="$RUNNER_TEMP/pipegen-bin/${artifact}"`);
-    prefix = `"$bin/${exe}"`;
+    prefix = releaseLauncher(exe);
   } else if (kind === 'docker') {
     const image = imageOf(tool, install);
     steps.push(runStep(`pipegen: pull the ${exe} image`, script([...prologue(artifact), '"${sys[@]}" /usr/bin/docker pull --quiet "$PIPEGEN_IMAGE" > /dev/null']), { PIPEGEN_IMAGE: image }, `tool-pull-${sha16(artifact)}`));
@@ -609,7 +615,7 @@ export function renderCliTool({ spec, tool, service, ctx, hooks, options }: CliA
     '  if [ "$rc" -eq 0 ]; then rc=1; fi',
     'fi',
   ];
-  const launch = (words: readonly string[]): string => `"\${pg_env[@]}" ${prefix}${words.length === 0 ? '' : ` ${words.join(' ')}`}`;
+  const launch = (words: readonly string[]): string => `${LAUNCH_ENV} ${prefix}${words.length === 0 ? '' : ` ${words.join(' ')}`}`;
   const chain = [launch(built.main), ...built.then.map(launch)].join(' && ');
   const run = script([
     ...prologue(artifact, nodeMajor === undefined ? {} : { nodeMajor }), ...tuneComments, ...vars, ...installLines, ...cdLines(spec.workingDir), ...pathChecks, ...prep, ...cfgLines, ...scopeLines, ...preCheck,
@@ -618,8 +624,7 @@ export function renderCliTool({ spec, tool, service, ctx, hooks, options }: CliA
   // a tool that runs the repo's own code is marked, so the referee can apply its order rule (S6 c); the id is not `pipegen-…`, which a job's dedupe may drop
   // fail closed: the run is repo code unless the policy says it only reads (readsOnly), and never for an app-running category
   const appRunning = tool.categories.some((c) => APP_RUNNING_CATEGORIES.has(c));
-  const harmless = pol.readsOnly === true && pol.runsRepoCode !== true && pol.loadsRepoConfig !== true && !appRunning;
-  const runId = !harmless ? `repocode-${sha16(artifact)}` : checker ? `checker-run-${sha16(artifact)}` : `tool-run-${sha16(artifact)}`;
+  const runId = runsRepoCode(pol, appRunning) ? `repocode-${sha16(artifact)}` : checker ? `checker-run-${sha16(artifact)}` : `tool-run-${sha16(artifact)}`;
   steps.push(runStep(`pipegen: run ${exe}`, run, env, runId));
   return { steps, output: out === null ? null : { path: `\${{ runner.temp }}/pipegen-out/${artifact}/${out}`, format: tool.step.output.format }, ...(built.fullHistory ? { fullHistory: true as const } : {}) };
 }

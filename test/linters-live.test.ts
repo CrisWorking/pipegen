@@ -8,12 +8,11 @@ import { ensureLinters, loadPinnedBinaries, runLinters } from '../src/engine/lin
 import { resultArtifactName } from '../src/engine/artifact-names.js';
 import { renderJobPrelude, renderStep, renderUpload, stepsToYaml, type RenderedStep } from '../src/engine/render-step.js';
 import type { CreatedFile } from '../src/types.js';
+import { liveToken } from './helpers/live-token.js';
 import { ctxFor, entry, platform, specFor } from './helpers/render.js';
 
 const live = process.env.PIPEGEN_LIVE_TESTS === '1' && process.platform !== 'win32';
-// the variable's name is spelled at run time (test/no-secret-literals.test.ts)
-const ENV_NAME = ['GH', 'TOKEN'].join('_');
-const online = (process.env[ENV_NAME] ?? '') === '' ? null : (process.env[ENV_NAME] as string);
+const online = liveToken() ?? null;
 
 /** A pull_request workflow with one gitleaks job as the renderer makes it, `cache-mode: none` on the job. */
 function fixture(): CreatedFile {
@@ -46,7 +45,7 @@ describe.skipIf(!live)('live: the real actionlint and zizmor accept cache-mode: 
     console.log(`zizmor ${pins.zizmor.version} at ${z}`);
     const issues = await runLinters([f], linters, online);
     for (const i of issues) console.log(`${i.check} ${i.file}:${i.line ?? '-'} ${i.message}`);
-    if (online === null) console.log(`${ENV_NAME} is not set: zizmor was skipped (the no-credential issue above is expected)`);
+    if (online === null) console.log(`no GitHub token is set (GITHUB_TOKEN or GH_TOKEN): zizmor was skipped (the no-credential issue above is expected)`);
     // S22: no linter refuses the job key
     expect(issues.filter((i) => /cache-mode/.test(i.message)), JSON.stringify(issues)).toEqual([]);
     // and the tools really ran: every issue is a finding with a line, except the expected no-token one

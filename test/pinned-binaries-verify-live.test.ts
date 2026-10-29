@@ -23,6 +23,7 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { parse } from 'yaml';
 import { ensurePinnedBinary } from '../src/engine/linters.js';
 import { downloadRelease } from '../src/engine/pin.js';
+import { liveToken } from './helpers/live-token.js';
 import { cleanupRepos, makeTempDir } from './helpers/make-repo.js';
 
 const live = process.env.PIPEGEN_LIVE_TESTS === '1';
@@ -70,7 +71,7 @@ function verifyBlob(file: string, signer: { identity: string; issuer: string }, 
 
 /** The Sigstore bundles of the GitHub attestations of `sha256` in `repo` (api.github.com; the job token when set). */
 async function attestationBundles(repo: string, sha256: string): Promise<unknown[]> {
-  const env = process.env[['GITHUB', 'TOKEN'].join('_')];
+  const env = liveToken();
   const headers: Record<string, string> = { accept: 'application/vnd.github+json' };
   if (env) headers[['author', 'ization'].join('')] = ['Bear', 'er ', env].join('');
   const res = await fetch(`https://api.github.com/repos/${repo}/attestations/sha256:${sha256}`, { headers, redirect: 'error', signal: AbortSignal.timeout(30_000) });

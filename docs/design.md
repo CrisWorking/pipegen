@@ -237,7 +237,7 @@ These rules take priority over anything earlier in this document.
 **Trusting results**
 - Caller triggers are `push: branches: ['**']` (tags never run the pipeline) and `pull_request`, with `concurrency` per ref that cancels in-progress runs **except on the default branch** (baseline, signing and deploy runs always finish). Push-layer jobs skip when the branch has an open PR, because the merge layer covers it.
 - A **trusted run** also requires its `head_sha` to be in the default branch's history.
-- Every job that feeds the gate, builds, signs or verifies runs with **`cache-mode: none`**, and scanners' own caches are off (e.g. Trivy `cache: false`).
+- Every job that feeds the gate, builds, signs or verifies runs with **`cache-mode: none`**, and scanners' own caches are off (e.g. Trivy runs with pipegen's pinned config, `cache.backend: memory`).
 - `base-scan` runs **every blocking scanner that can run on the base commit**. Dependency and image findings are **always** compared with the base scan from the **same run** (a CVE published yesterday in an unchanged dependency is not "new"). Findings from scanners that can't run on the base (e.g. no Dockerfile yet) are warnings on installing PRs, and otherwise block.
 - **Secret fingerprints** are an HMAC of the matched secret using the repo secret `PIPEGEN_FP_KEY`. They're computed inside the scanner job before scrubbing. On fork PRs (no secrets), any secret on an added line counts as new.
 - On fork PRs, jobs that need secrets report **"not run"**, not "failed".

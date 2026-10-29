@@ -262,7 +262,7 @@ describe('renderStep: actions', () => {
     for (const s of [...r.steps, ...pre.steps, up]) expect(s.run ?? '', s.name).not.toContain('${{');
   });
 
-  it('renderStep: an action with an output is refused until the output move exists (6b)', () => {
+  it('renderStep: an action with an output is refused (scorecard is a container action)', () => {
     const t = entry('scorecard-action');
     expect(() => renderStep(specFor(t, { needId: 'scorecard' }), t, platform(), ctxFor())).toThrow(RenderError);
   });

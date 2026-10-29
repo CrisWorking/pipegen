@@ -1,5 +1,7 @@
-// Tool flags pipegen never passes, in one leaf module (it imports only the import-free types.ts) so every rule that checks them uses the same list
-// (Plan P ruling PS34): the reviewed-list loader (reviewed.ts) and the local secret scan's own argv (Task 7).
+// The policy leaf: every argv and action policy pipegen applies, in one module (it imports only the import-free types.ts, and slots.ts as a
+// type), so the loader, the renderers and the referee check against the same tables (Plan P ruling PS34): the tool flags pipegen never
+// passes, the argv policies (ARGV_POLICIES), the reviewed action input policies, the platform action paths and locks, the step-id
+// patterns, the pip closures and the renderer-filled inputs (RENDERER_INPUTS with their checkers).
 
 import { RESULT_ARTIFACT_PREFIX } from '../types.js';
 import type { SlotKind } from './slots.js';
@@ -341,9 +343,16 @@ export const ARGV_POLICIES: Readonly<Record<string, ArgvPolicy>> = Object.freeze
   Object.entries(POLICIES as Record<string, ArgvPolicy>).map(([id, pol]) => [id, READS_ONLY.includes(id) ? { ...pol, readsOnly: true as const } : pol]),
 ));
 
-/** Whether a reviewed entry runs or loads the repo's own code (tests, hooks, a JS config): the referee's order rule treats its step as a repo-code step. */
-export function runsRepoCode(entryId: string): boolean {
-  return Object.hasOwn(ARGV_POLICIES, entryId) && (ARGV_POLICIES[entryId]?.runsRepoCode === true || ARGV_POLICIES[entryId]?.loadsRepoConfig === true);
+/**
+ * Whether the run step of a reviewed entry is a repo-code step (the order rule applies to it). This IS the renderer's rule,
+ * which render-cli.ts calls: fail closed, a run is repo code unless its policy says it only reads (`readsOnly`) and it
+ * neither runs the repo's code nor loads its config, and it is not an app-running tool (`appRunning`: tests, coverage, builds).
+ * Pass an entry id (looked up in ARGV_POLICIES) or the policy the renderer holds. An unknown id is repo code.
+ */
+export function runsRepoCode(entry: string | ArgvPolicy | undefined, appRunning = false): boolean {
+  const pol = typeof entry === 'string' ? (Object.hasOwn(ARGV_POLICIES, entry) ? ARGV_POLICIES[entry] : undefined) : entry;
+  const harmless = pol !== undefined && pol.readsOnly === true && pol.runsRepoCode !== true && pol.loadsRepoConfig !== true && !appRunning;
+  return !harmless;
 }
 
 /** The id of the run step of an entry that runs repo code: `repocode-` plus a hash of its artifact name (not `pipegen-…`, so a job's dedupe never drops it). */
@@ -367,6 +376,36 @@ export const SCRUB_STEP_ID_RE = /^scrub-[0-9a-f]{16}$/;
  * RenderError "not available yet". A closure is added here with its entry, by a code-reviewed change.
  */
 export const PIP_CLOSURES: Readonly<Record<string, string>> = Object.freeze({});
+
+/** The keys of PlatformActions (pin.ts), spelled here so this module stays a leaf. */
+export type PlatformKey = 'checkout' | 'setup-node' | 'setup-python' | 'upload-artifact' | 'download-artifact' | 'docker-login' | 'setup-buildx' | 'build-push' | 'upload-sarif' | 'attest';
+
+/** PlatformActions key → the `uses:` path (owner/repo[/path], lower case) its entry must have; a swapped entry is refused. */
+export const PLATFORM_USES: Readonly<Record<PlatformKey, string>> = Object.freeze({
+  checkout: 'actions/checkout', 'setup-node': 'actions/setup-node', 'setup-python': 'actions/setup-python',
+  'upload-artifact': 'actions/upload-artifact', 'download-artifact': 'actions/download-artifact', 'docker-login': 'docker/login-action',
+  'setup-buildx': 'docker/setup-buildx-action', 'build-push': 'docker/build-push-action', 'upload-sarif': 'github/codeql-action/upload-sarif', attest: 'actions/attest',
+});
+
+/**
+ * Inputs a platform action's entry must FIX to these values (by `uses` path). They are checked on every render path
+ * (renderStep, renderPlatformStep, the prelude, the upload), not only where an entry is first used, and an input listed
+ * here can not also be an AI choice.
+ */
+export const PLATFORM_LOCKS: Readonly<Record<string, Readonly<Record<string, string>>>> = Object.freeze({
+  'actions/checkout': { 'persist-credentials': 'false', 'allow-unsafe-pr-checkout': 'false' },
+  'actions/setup-node': { 'package-manager-cache': 'false' },
+  'actions/upload-artifact': { 'include-hidden-files': 'false', 'if-no-files-found': 'error' },
+  // the docker actions' cache and credential locks (6b, review R1-5): checked here, not only by the loader
+  'docker/build-push-action': { 'no-cache': 'true', 'github-token': '', context: '.' },
+  'docker/setup-buildx-action': { 'cache-binary': 'false' },
+  'docker/login-action': { logout: 'true' },
+});
+
+/** The cache inputs of the reviewed locks with their only allowed value (everything else that names a cache is refused): derived from PLATFORM_LOCKS, never typed twice. */
+export const CACHE_LOCKS: Readonly<Record<string, string>> = Object.freeze(Object.fromEntries(
+  Object.values(PLATFORM_LOCKS).flatMap((locks) => Object.entries(locks)).filter(([k]) => /(?:^|[-_])cache(?:$|[-_])/i.test(k)),
+));
 
 // ---------- input allowlists for every action entry (Plan P Task 6 fix round 2, ruling P29) ----------
 

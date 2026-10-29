@@ -10,17 +10,17 @@ import { renderStep } from '../src/engine/render-step.js';
 import { tuningEffects } from '../src/engine/tuning.js';
 import { ctxFor, entry, platform, service, specFor } from './helpers/render.js';
 import { cleanupRepos, makeTempDir, writeIn } from './helpers/make-repo.js';
+import { liveToken } from './helpers/live-token.js';
 import { semgrepBin, semgrepPaths } from './helpers/semgrep-live.js';
 
 const live = process.env.PIPEGEN_LIVE_TESTS === '1';
-const ENV_NAME = ['GH', 'TOKEN'].join('_');
 
 describe.skipIf(!live)('live: SEMGREP_RULE_FOLDERS are folders of the pinned semgrep-rules tree', () => {
   it('every listed folder is a tree entry of the reviewed tree', async () => {
     const env = entry('semgrep').fixedInputs.env ?? {};
     const tree = env.PIPEGEN_RULES_TREE as string;
     const headers: Record<string, string> = { accept: 'application/vnd.github+json' };
-    const credential = process.env[ENV_NAME] ?? '';
+    const credential = liveToken() ?? '';
     // the header's name is spelled at run time (test/no-secret-literals.test.ts)
     if (credential !== '') headers[['auth', 'orization'].join('')] = ['Bea', 'rer ', credential].join('');
     const res = await fetch(`https://api.github.com/repos/semgrep/semgrep-rules/git/trees/${tree}`, { headers });

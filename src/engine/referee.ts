@@ -4,9 +4,11 @@
 // user's own workflow). Every check fails closed.
 // - Parsing (ruling S29): one YAML document, unique keys, no anchors, aliases, `<<` merge keys, tags or directives, so no
 //   key can hide from the walkers below. Job-level `uses:` (reusable workflows) and step-level `uses:` are both walked.
+// - Run-time slot values (an image digest, a local URL, a repo path) are checked by shape only (slots.ts `slotProblem`): the
+//   referee can not know which image or URL is the right one, so Plan G binds the values it writes (final review minor 15).
 // - Pins: every `uses:` is a reviewed entry (the platform actions, the draft's tools, pipegen's own gate and watcher), the
-//   central `<owner>/pipelines/` repo at a 40-character SHA, or a local file that is in `files`. The comparison uses the
-//   whole `uses` path, sub-path included (S14). A tag or branch is `unpinned`; any other commit is `unknown-pin`.
+//   central `<owner>/pipelines/` repo at a 40-character SHA. A local `./` action is refused outright (fix round 2). The
+//   comparison uses the whole `uses` path, sub-path included (S14). A tag or branch is `unpinned`; any other commit is `unknown-pin`.
 // - Only reviewed tools, only as their template: an action step must carry exactly its entry's fixed inputs, its choices
 //   inside their lists, and otherwise only RENDERER_INPUTS, each judged by its own checker and `whenWith` (S15). A run step
 //   must BE a step the renderer makes for this draft (the draft's tools and the project scripts its needs call for): it is
@@ -31,15 +33,13 @@ import { runLinters } from './linters.js';
 import { COMMIT_SHA_RE } from './names.js';
 import { NEED_ID_CATEGORY } from './need-ids.js';
 import { PLATFORM_ACTION_IDS, type PlatformActions } from './pin.js';
-import { APP_RUNNING_CATEGORIES } from './render-cli.js';
+import { APP_RUNNING_CATEGORIES, TRIVY_LAUNCH_RE } from './render-cli.js';
 import { EXPR, own, show } from './render-error.js';
-import {
-  checkExpressions, checkJobOrder, containerRefusal, IF_VALUES, isDangerousName, RenderError, renderProjectScript, renderStep, sameDedupeContent,
-  SECRET_REF_RE, type RenderContext, type RenderedStep,
-} from './render-step.js';
+import { ACTION_PATH_RE, checkExpressions, checkJobOrder, IF_VALUES, isDangerousName, isReviewed, SECRET_REF_RE, STEP_KEYS as STEP_KEY_LIST, WORKFLOW_PATH_RE, type RenderedStep } from './job-rules.js';
+import { containerRefusal, RenderError, renderProjectScript, renderStep, sameDedupeContent, type RenderContext } from './render-step.js';
 import { projectScriptFor } from './reviewed.js';
 import { slotProblem, type SlotKind } from './slots.js';
-import { ARGV_POLICIES, PLAIN_REL_RE, RENDERER_INPUTS, rendererInputProblems } from './tool-flags.js';
+import { ARGV_POLICIES, CACHE_LOCKS, PLAIN_REL_RE, RENDERER_INPUTS, rendererInputProblems } from './tool-flags.js';
 
 // ---------- the report ----------
 
@@ -215,21 +215,15 @@ export function gatedIfAllowed(cond: unknown): boolean {
 }
 
 const LEVEL: Readonly<Record<string, number>> = { none: 0, read: 1, write: 2 };
-const WORKFLOW_PATH_RE = /^\.github\/workflows\/[A-Za-z0-9._-]{1,100}\.ya?ml$/;
-const ACTION_PATH_RE = /^\.github\/actions\/[A-Za-z0-9._/-]{1,200}\/action\.ya?ml$/;
 const JOB_ID_RE = /^[A-Za-z_][A-Za-z0-9_-]{0,99}$/;
-const STEP_KEYS: ReadonlySet<string> = new Set(['id', 'name', 'if', 'uses', 'with', 'run', 'shell', 'env', 'working-directory', 'continue-on-error', 'timeout-minutes']);
+const STEP_KEYS: ReadonlySet<string> = new Set(STEP_KEY_LIST);
 const TOP_KEYS: ReadonlySet<string> = new Set(['name', 'run-name', 'on', 'permissions', 'env', 'concurrency', 'jobs']);
 const STEPS_JOB_KEYS: ReadonlySet<string> = new Set(['name', 'runs-on', 'needs', 'if', 'permissions', 'environment', 'concurrency', 'outputs', 'env', 'steps', 'timeout-minutes', 'services', 'cache-mode']);
 const CALLER_JOB_KEYS: ReadonlySet<string> = new Set(['name', 'uses', 'with', 'secrets', 'needs', 'if', 'permissions']);
 const ACTION_KEYS: ReadonlySet<string> = new Set(['name', 'description', 'author', 'inputs', 'outputs', 'runs', 'branding']);
-/** Cache inputs the reviewed locks set, with the only value they may have (everything else that names a cache is refused). */
-const CACHE_LOCKS: Readonly<Record<string, string>> = { 'package-manager-cache': 'false', 'no-cache': 'true', 'cache-binary': 'false' };
 const CACHE_INPUT_RE = /(?:^|[-_])cache(?:$|[-_])/i;
 /** Any `secrets.X` reference inside an expression, however it is spaced. */
 const SECRET_USE_RE = /\$\{\{[^}]*?\bsecrets\s*\.\s*([A-Za-z_][A-Za-z0-9_]*)/g;
-/** The line a rendered trivy run step starts trivy with (render-cli.ts launch). */
-const TRIVY_LAUNCH_RE = /"\$\{pg_env\[@\]\}" "\$bin\/trivy"/;
 const TRIVY_CONFIG = ARGV_POLICIES['trivy-config']?.config;
 
 /** Sentinel targets the referee renders with: two sets, so the env values that differ are the run-time slots (B6). */
@@ -241,7 +235,6 @@ const SENTINELS = [
 type Add = (file: string, check: RefereeCheck, message: string, line?: number, repo?: CreatedFile['repo']) => void;
 type Obj = Record<string, unknown>;
 const isObj = (v: unknown): v is Obj => typeof v === 'object' && v !== null && !Array.isArray(v);
-const isReviewed = (c: unknown): boolean => isObj(c) && c.source === 'reviewed' && c.reviewed === true;
 const hasExpr = (v: unknown): boolean => (typeof v === 'string' ? v.includes(EXPR) : Array.isArray(v) ? v.some(hasExpr) : isObj(v) ? Object.entries(v).some(([k, x]) => k.includes(EXPR) || hasExpr(x)) : false);
 const uniq = <T>(xs: Iterable<T>): T[] => [...new Set(xs)];
 
