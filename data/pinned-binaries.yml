@@ -188,3 +188,47 @@ cosign:
       archiveSha256: 5cf948c2f4dfe59687bdd0b8523709067383e03982cc543475c8a7dc70e92a76
       binarySize: 139618946
       binarySha256: 5cf948c2f4dfe59687bdd0b8523709067383e03982cc543475c8a7dc70e92a76
+
+# The referee's workflow security audit (Plan B Task 7b, ruling S19), run online with a read-only token so the
+# impostor-commit audit is on. The same release as reviewed-tools.yml's zizmor entry (ruling S25).
+# The release has no checksums file and no attestation: each archiveSha256 is the sha256 GitHub records for the asset
+# (releases API `digest`, read 2026-10-29), and each was confirmed by one real download of the asset on 2026-10-29
+# (sha256 of the downloaded file equals the digest). binarySize and binarySha256 are the one `zizmor` member of each
+# downloaded archive. Pinned 2026-10-29; the release (2026-10-15) was 13 days old. Review delegated (DECISIONS 105).
+zizmor:
+  version: 1.31.1
+  repo: zizmorcore/zizmor
+  releasedAt: "2026-10-15T23:16:39Z"
+  pinnedOn: "2026-10-29T00:00:00Z"
+  reviewedBy: Claude delegated DECISIONS 105
+  reviewedAt: "2026-10-29"
+  member: zizmor
+  platforms:
+    linux-x64:
+      url: https://github.com/zizmorcore/zizmor/releases/download/v1.31.1/zizmor-x86_64-unknown-linux-gnu.tar.gz
+      archive: tar.gz
+      archiveSize: 9272720
+      archiveSha256: d185f726bdaf92df78273217dfdd24ebcd6b0ef48cf3ce776ff5762b6e138c99
+      binarySize: 27049184
+      binarySha256: dc3bb05237ddd11c62ac19cf5ac1c633acd228e386b7e18f9adb3498873d271f
+    linux-arm64:
+      url: https://github.com/zizmorcore/zizmor/releases/download/v1.31.1/zizmor-aarch64-unknown-linux-gnu.tar.gz
+      archive: tar.gz
+      archiveSize: 8889396
+      archiveSha256: 37eebbd5762a44f262d94875431b14a6d2402991e90a685113ea97b8b41be833
+      binarySize: 25377496
+      binarySha256: e2cf0a73958aed6646f7937dcf647dd86b52d49eb2b4190a81b17fa63123f8b0
+    darwin-x64:
+      url: https://github.com/zizmorcore/zizmor/releases/download/v1.31.1/zizmor-x86_64-apple-darwin.tar.gz
+      archive: tar.gz
+      archiveSize: 9006452
+      archiveSha256: 72ae63bb85b67229c06242f04195cb43927e9fab5f43803c6434dc701a517d61
+      binarySize: 25374208
+      binarySha256: fa1f3bca4733602a90225a87fea88e183e110b896921074c43ddb1e3c98864c0
+    darwin-arm64:
+      url: https://github.com/zizmorcore/zizmor/releases/download/v1.31.1/zizmor-aarch64-apple-darwin.tar.gz
+      archive: tar.gz
+      archiveSize: 8490680
+      archiveSha256: ad5aa633cd56215b11e6c51d51f90c7e6b22904a75047d1215abbd422f61d698
+      binarySize: 23352736
+      binarySha256: 200733b2102e1bf5d53acfed2ab303fadf136532578a1ba9ec076c5bc543e70a

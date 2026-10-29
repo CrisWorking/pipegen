@@ -95,6 +95,7 @@ function setup(opts: {
     actionlint: { ...entry, repo: 'rhysd/actionlint', member: 'actionlint', platforms: rehost(platforms, 'rhysd/actionlint', 'actionlint') },
     cosign: { ...entry, repo: 'sigstore/cosign', member: 'cosign', platforms: rehost(platforms, 'sigstore/cosign', 'cosign') },
     betterleaks: { ...entry, repo: 'betterleaks/betterleaks', member: 'betterleaks', platforms: rehost(platforms, 'betterleaks/betterleaks', 'betterleaks') },
+    zizmor: { ...entry, repo: 'zizmorcore/zizmor', member: 'zizmor', platforms: rehost(platforms, 'zizmorcore/zizmor', 'zizmor') },
   } as PinnedBinaries;
   const routes: Routes = {
     [`GET ${DL}${URL_PATH}`]: { status: 302, headers: { location: `${ASSETS}${ASSET_PATH}?sig=x` } },
@@ -482,9 +483,9 @@ describe('ensurePinnedBinary: platforms', () => {
 describe('pinned-binaries.yml', () => {
   const HEX = /^[0-9a-f]{64}$/;
 
-  it('pinned-binaries.yml: betterleaks, gitleaks, actionlint and cosign pinned for linux and darwin, x64 and arm64, with both hashes', () => {
+  it('pinned-binaries.yml: betterleaks, gitleaks, actionlint, cosign and zizmor pinned for linux and darwin, x64 and arm64, with both hashes', () => {
     const pins = loadPinnedBinaries();
-    expect(Object.keys(pins).sort()).toEqual(['actionlint', 'betterleaks', 'cosign', 'gitleaks']);
+    expect(Object.keys(pins).sort()).toEqual(['actionlint', 'betterleaks', 'cosign', 'gitleaks', 'zizmor']);
     for (const [name, entry] of Object.entries(pins)) {
       expect(Object.keys(entry.platforms).sort(), name).toEqual(['darwin-arm64', 'darwin-x64', 'linux-arm64', 'linux-x64']);
       for (const [key, a] of Object.entries(entry.platforms)) {
@@ -533,6 +534,31 @@ describe('pinned-binaries.yml', () => {
     expect(checkPinnedAgainstReviewed(bumped, [entry]).join('\n')).toMatch(/^betterleaks: the reviewed entry betterleaks is version v1\.9\.0/m);
     const rehashed = { ...pins, betterleaks: { ...b, platforms: { ...b.platforms, 'linux-x64': { ...b.platforms['linux-x64'], archiveSha256: 'a'.repeat(64) } } } };
     expect(checkPinnedAgainstReviewed(rehashed, [entry]).join('\n')).toMatch(/^betterleaks: the reviewed entry betterleaks has a hash/m);
+  });
+
+  it('pins: zizmor 1.31.1 is a release binary for 4 platforms, hashes from one real download, delegated review (S19)', () => {
+    const pins = loadPinnedBinaries();
+    const z = pins.zizmor;
+    expect(z).toMatchObject({ version: '1.31.1', repo: 'zizmorcore/zizmor', releasedAt: '2026-10-15T23:16:39Z', member: 'zizmor', reviewedBy: 'Claude delegated DECISIONS 105', reviewedAt: '2026-10-29' });
+    // archive sha256 = the digest GitHub records for each asset (the release has no checksums file); the binary hash and
+    // size from the one `zizmor` member of each archive, from one real download on 2026-10-29
+    const want: Record<string, [string, number, string, number, string]> = {
+      'linux-x64': ['x86_64-unknown-linux-gnu', 9272720, 'd185f726bdaf92df78273217dfdd24ebcd6b0ef48cf3ce776ff5762b6e138c99', 27049184, 'dc3bb05237ddd11c62ac19cf5ac1c633acd228e386b7e18f9adb3498873d271f'],
+      'linux-arm64': ['aarch64-unknown-linux-gnu', 8889396, '37eebbd5762a44f262d94875431b14a6d2402991e90a685113ea97b8b41be833', 25377496, 'e2cf0a73958aed6646f7937dcf647dd86b52d49eb2b4190a81b17fa63123f8b0'],
+      'darwin-x64': ['x86_64-apple-darwin', 9006452, '72ae63bb85b67229c06242f04195cb43927e9fab5f43803c6434dc701a517d61', 25374208, 'fa1f3bca4733602a90225a87fea88e183e110b896921074c43ddb1e3c98864c0'],
+      'darwin-arm64': ['aarch64-apple-darwin', 8490680, 'ad5aa633cd56215b11e6c51d51f90c7e6b22904a75047d1215abbd422f61d698', 23352736, '200733b2102e1bf5d53acfed2ab303fadf136532578a1ba9ec076c5bc543e70a'],
+    };
+    expect(Object.keys(z.platforms).sort()).toEqual(Object.keys(want).sort());
+    for (const [key, [plat, archiveSize, archiveSha256, binarySize, binarySha256]] of Object.entries(want)) {
+      expect(z.platforms[key as keyof typeof z.platforms], key).toEqual({
+        url: `https://github.com/zizmorcore/zizmor/releases/download/v1.31.1/zizmor-${plat}.tar.gz`,
+        archive: 'tar.gz', archiveSize, archiveSha256, binarySize, binarySha256,
+      });
+    }
+    // S25: the reviewed entry is the same release and hash
+    const entry = loadReviewed().find((t) => t.id === 'zizmor') as ReviewedTool;
+    expect(entry.candidate.pin.checksum).toBe(z.platforms['linux-x64'].archiveSha256);
+    expect(checkPinnedAgainstReviewed(pins, loadReviewed())).toEqual([]);
   });
 
   it(`pinned-binaries.yml: every release was at least ${COOLDOWN_DAYS} days old when pinned, by the pinnedOn the file records (ruling S26, M5)`, () => {
@@ -638,7 +664,7 @@ describe('checkPinnedAgainstReviewed (ruling S25)', () => {
     const assetOf = (k: 'linux-x64' | 'linux-arm64') => a.platforms[k].url.split('/').pop() as string;
     const list = [
       reviewedCli('rhysd/actionlint', `v${a.version}`, a.platforms['linux-x64'].archiveSha256, assetOf('linux-x64')),
-      reviewedCli('zizmorcore/zizmor', 'v1.0.0', 'f'.repeat(64)),
+      reviewedCli('aquasecurity/trivy', 'v1.0.0', 'f'.repeat(64)),
     ];
     expect(checkPinnedAgainstReviewed(pins, list)).toEqual([]);
     // the extracted binary's hash is the same tool too

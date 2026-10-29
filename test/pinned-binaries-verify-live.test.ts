@@ -32,6 +32,8 @@ const GH_ISSUER = 'https://token.actions.githubusercontent.com';
 interface Platform { url: string; archiveSha256: string }
 interface Tool { version: string; repo: string; platforms: Record<string, Platform> }
 const TOOLS = parse(readFileSync(new URL('../data/pinned-binaries.yml', import.meta.url), 'utf8')) as Record<string, Tool>;
+// zizmor (7b) has no checksums file; its hashes are GitHub's asset digests, confirmed by a real download (see its entry), so it is not in this checksums-file check.
+delete TOOLS.zizmor;
 
 type Proof =
   | { kind: 'signed-checksums'; identity: string; issuer: string }
