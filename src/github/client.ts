@@ -261,6 +261,10 @@ const PERMISSIONS: readonly PermissionRow[] = [
  * - GET /repos/{o}/{r}/environments/{env}/deployment-branch-policies  → Actions: read
  * - GET /repos/{o}/{r}/code-scanning/analyses                          → Code scanning alerts: read (without it, code
  *   scanning on a private repo reads "not available", with a note that pipegen couldn't check)
+ * - GET /repos/{o}/{r}/code-scanning/default-setup (with a token only)  → Administration: read, which this table does
+ *   NOT ask for: a refusal is expected and pipegen falls back to the workflow list below (P55)
+ * - GET /repos/{o}/{r}/actions/workflows, …/actions/workflows/{id}/runs, …/actions/runs/{id}/jobs → Actions: read
+ *   (CodeQL default setup's dynamic workflow and its languages; the last run of each workflow that covers a check, P55)
  * - GET /user (the token's login, for a personal account's plan), GET /orgs/{org} (an organisation's plan),
  *   GET /user/installations and /user/installations/{id}/repositories (pipegen's App: which repos it reaches): no
  *   repository permission.
@@ -272,7 +276,7 @@ const PERMISSIONS: readonly PermissionRow[] = [
 const READ_PERMISSIONS: readonly PermissionRow[] = [
   { key: 'metadata', name: 'Metadata', write: 'read', read: 'read', why: '', readWhy: 'Repo details (visibility, default branch), the rulesets list and recent pushes.', probe: '' },
   { key: 'pull_requests', name: 'Pull requests', write: 'read', read: 'read', why: '', readWhy: 'Count the pull requests opened in the last 30 days.', probe: '/pulls?per_page=1' },
-  { key: 'actions', name: 'Actions', write: 'read', read: 'read', why: '', readWhy: 'The environments list and the signing environment\'s branch rule.', probe: '/environments?per_page=1' },
+  { key: 'actions', name: 'Actions', write: 'read', read: 'read', why: '', readWhy: 'The environments list, the signing environment\'s branch rule, whether CodeQL default setup is on, and the last run of each workflow that covers a check.', probe: '/environments?per_page=1' },
   {
     key: 'security_events', name: 'Code scanning alerts', write: 'read', read: 'read', why: '',
     readWhy: 'Whether code scanning has run here (optional: without it pipegen can\'t confirm code scanning on a private repo). pipegen reads no alerts.',

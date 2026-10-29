@@ -63,8 +63,20 @@ const bareCaps: Capabilities = {
   attestations: false, codeScanning: false, keylessSigningAllowed: false,
 };
 
-interface FakeGh { gh: Octokit; events: ReturnType<typeof vi.fn>; pulls: ReturnType<typeof vi.fn> }
-function fakeGh(opts: { fail?: boolean; pushesPerPage?: number } = {}): FakeGh {
+interface FakeGh {
+  gh: Octokit; events: ReturnType<typeof vi.fn>; pulls: ReturnType<typeof vi.fn>;
+  setup: ReturnType<typeof vi.fn>; workflows: ReturnType<typeof vi.fn>; runs: ReturnType<typeof vi.fn>; jobs: ReturnType<typeof vi.fn>;
+}
+const ghError = (status: number, message: string) => Object.assign(new Error(message), { status, response: { status, data: { message }, headers: {} } });
+/**
+ * GitHub's answers about checks the files can't show (P55). Defaults: default setup not readable with this token
+ * (403, like a token without Administration), an empty workflow list, no runs, no jobs.
+ */
+interface GhSignals {
+  setup?: () => Promise<unknown>; workflows?: () => Promise<unknown>;
+  runs?: (args: { workflow_id: string | number; branch?: string }) => Promise<unknown>; jobs?: () => Promise<unknown>;
+}
+function fakeGh(opts: { fail?: boolean; pushesPerPage?: number; signals?: GhSignals } = {}): FakeGh {
   const at = new Date(NOW - 60_000).toISOString();
   // a busy repo (100 a page) has more pages: GitHub says so in its Link header (final review I1)
   const events = vi.fn(async ({ page }: { page: number }) => {
@@ -76,7 +88,18 @@ function fakeGh(opts: { fail?: boolean; pushesPerPage?: number } = {}): FakeGh {
     };
   });
   const pulls = vi.fn(async () => ({ data: [] }));
-  return { gh: { rest: { activity: { listRepoEvents: events }, pulls: { list: pulls } } } as unknown as Octokit, events, pulls };
+  const sig = opts.signals ?? {};
+  const setup = vi.fn(sig.setup ?? (async () => { throw ghError(403, 'You are not authorized to read code scanning default setup.'); }));
+  const workflows = vi.fn(sig.workflows ?? (async () => ({ data: { total_count: 0, workflows: [] } })));
+  const runs = vi.fn(sig.runs ?? (async () => ({ data: { total_count: 0, workflow_runs: [] } })));
+  const jobs = vi.fn(sig.jobs ?? (async () => ({ data: { total_count: 0, jobs: [] } })));
+  const gh = {
+    rest: {
+      activity: { listRepoEvents: events }, pulls: { list: pulls }, codeScanning: { getDefaultSetup: setup },
+      actions: { listRepoWorkflows: workflows, listWorkflowRuns: runs, listJobsForWorkflowRun: jobs },
+    },
+  } as unknown as Octokit;
+  return { gh, events, pulls, setup, workflows, runs, jobs };
 }
 
 function deps(over: Partial<AuditDeps> = {}): AuditDeps {
@@ -797,5 +820,95 @@ describe('buildAudit: Plan P final review I1 (ruling P33)', () => {
     for (const out of [renderTerminal(r, { knownValues: [] }), renderMarkdown(r, { knownValues: [] }), renderJson(r, { knownValues: [] })]) {
       expect(out.replace(/\s+/g, ' ')).toContain("never-use list (proprietary licence, needs a licence key and phones home); pin a reviewed alternative");
     }
+  });
+});
+
+// ---------- hand checks 2026-10-29 (ruling P55): what GitHub says that the files can't show ----------
+
+describe('buildAudit: GitHub CodeQL default setup (hand checks fix 2, P55)', () => {
+  const sast = (r: AuditReport) => r.coverage.filter((c) => c.need.category === 'sast');
+  const dynamicList = (state = 'active') => async () => ({ data: { total_count: 2, workflows: [
+    { id: 11, path: '.github/workflows/ci.yml', state: 'active' }, { id: 77, path: 'dynamic/github-code-scanning/codeql', state },
+  ] } });
+
+  it('the setup API says configured for the service language: push and PR code-scan rows are partial, never covered', async () => {
+    const f = fakeGh({ signals: { setup: async () => ({ data: { state: 'configured', languages: ['actions', 'javascript-typescript'], schedule: 'weekly' } }) } });
+    const r = await buildAudit(repo(nodeApp()), deps({ gh: f.gh }));
+    const rows = sast(r);
+    expect(rows.map((c) => c.need.layer).sort()).toEqual(['merge', 'push']);
+    for (const c of rows) {
+      expect(c.status).toBe('partial');
+      expect(c.by).toBe('codeql-default-setup');
+      expect(c.why).toContain('actions, javascript-typescript');
+    }
+    expect(rows.find((c) => c.need.layer === 'push')?.why).toContain('pushes to main only');
+    expect(rows.find((c) => c.need.layer === 'merge')?.why).toContain('each pull request to main');
+    expect(f.workflows).not.toHaveBeenCalled();
+    // the would-add rows follow the adjusted status
+    for (const w of rowsOf(r, 'sast')) expect(w.status).toBe('partial');
+  });
+
+  it('the setup API refuses the GitHub login: the dynamic CodeQL workflow (Actions: read) and its last run name the languages', async () => {
+    const f = fakeGh({ signals: {
+      workflows: dynamicList(),
+      runs: async () => ({ data: { total_count: 1, workflow_runs: [{ id: 501, conclusion: 'success', created_at: '2026-10-26T10:47:37Z' }] } }),
+      jobs: async () => ({ data: { total_count: 2, jobs: [{ name: 'Analyze (python)' }, { name: 'Analyze (javascript-typescript)' }] } }),
+    } });
+    const r = await buildAudit(repo(nodeApp()), deps({ gh: f.gh }));
+    for (const c of sast(r)) {
+      expect(c.status).toBe('partial');
+      expect(c.why).toContain('javascript-typescript, python');
+    }
+    expect(f.runs).toHaveBeenCalledWith(expect.objectContaining({ workflow_id: 77, branch: 'main', status: 'completed' }));
+  });
+
+  it('on, but not for the service language: the row stays missing and says why', async () => {
+    const f = fakeGh({ signals: { setup: async () => ({ data: { state: 'configured', languages: ['python'] } }) } });
+    for (const c of sast(await buildAudit(repo(nodeApp()), deps({ gh: f.gh })))) {
+      expect(c.status).toBe('missing');
+      expect(c.why).toContain("doesn't scan JavaScript/TypeScript code");
+    }
+  });
+
+  it('on, languages unreadable: partial, and the why says the languages are unknown', async () => {
+    const f = fakeGh({ signals: { workflows: dynamicList() } }); // no runs to read the languages from
+    for (const c of sast(await buildAudit(repo(nodeApp()), deps({ gh: f.gh })))) {
+      expect(c.status).toBe('partial');
+      expect(c.why).toContain("couldn't read which languages it scans");
+    }
+  });
+
+  it('off (not configured, not enabled, or not in a complete workflow list): the rows stay missing', async () => {
+    for (const signals of [
+      { setup: async () => ({ data: { state: 'not-configured', languages: [] } }) },
+      { setup: async () => { throw ghError(403, 'Code scanning is not enabled for this repository. Please enable code scanning in the repository settings.'); } },
+      {}, // 403 on the setup, an empty complete workflow list
+      { workflows: dynamicList('disabled_manually') },
+    ] satisfies GhSignals[]) {
+      const r = await buildAudit(repo(nodeApp()), deps({ gh: fakeGh({ signals }).gh }));
+      for (const c of sast(r)) expect(c.status).toBe('missing');
+    }
+  });
+
+  it("pipegen can't check (the setup and the workflow list both refused): the row is unknown with the reason, never missing", async () => {
+    const f = fakeGh({ signals: { workflows: async () => { throw ghError(403, 'Resource not accessible by personal access token'); } } });
+    for (const c of sast(await buildAudit(repo(nodeApp()), deps({ gh: f.gh })))) {
+      expect(c.status).toBe('unknown');
+      expect(c.why).toContain("pipegen couldn't check whether GitHub's CodeQL default setup is on");
+    }
+  });
+
+  it('without a token the setup API is not asked; the public workflow list is', async () => {
+    const f = fakeGh({ signals: { workflows: dynamicList() } });
+    const r = await buildAudit(repo(nodeApp()), deps({ gh: f.gh, anonymous: true }));
+    expect(f.setup).not.toHaveBeenCalled();
+    for (const c of sast(r)) expect(c.status).toBe('partial');
+  });
+
+  it("GitHub's rate limit stops the read: the rows aren't guessed and the report says what wasn't read", async () => {
+    const f = fakeGh({ signals: { setup: async () => { throw Object.assign(ghError(403, 'API rate limit exceeded'), { response: { status: 403, data: { message: 'API rate limit exceeded' }, headers: { 'x-ratelimit-remaining': '0', 'x-ratelimit-reset': String(Math.floor(NOW / 1000) + 7200) } } }); } } });
+    const r = await buildAudit(repo(nodeApp()), deps({ gh: f.gh }));
+    for (const c of sast(r)) expect(c.status).toBe('unknown');
+    expect(r.githubIncomplete?.unread).toContain('code-scanning-setup');
   });
 });

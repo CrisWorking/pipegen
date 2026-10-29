@@ -34,7 +34,7 @@ import {
   HIDDEN_NAME, scrubKnownValues, type CodeBundle, type ScanFound,
 } from '../ai/redact.js';
 import { needLanguage, suggestTools } from '../engine/discover.js';
-import { rateStopOf, resetText, type RateBudget } from '../engine/github-rate.js';
+import { isRateStop, rateStopOf, resetText, type RateBudget } from '../engine/github-rate.js';
 import { ensurePinnedBinary, loadPinnedBinaries, PinnedBinaryError } from '../engine/linters.js';
 import type { MemoryStore } from '../engine/memory.js';
 import { CHECK_LABELS, floorNeeds, isRunnable, jobCategories, needKey, needsPromptBytes, planNeeds, type NeedsPlan } from '../engine/needs.js';
@@ -44,6 +44,7 @@ import {
   activity30d, aiRequestBytes, estimate, requestCeilingUsd, unpricedModel, usageCeilingUsd, usageCostUsd, type Activity, type Estimates,
 } from '../estimate/estimate.js';
 import { readOnlyTokenHint } from '../github/client.js';
+import { readDefaultSetup, type DefaultSetup } from '../github/code-scanning-setup.js';
 import { signingMode } from '../github/signing-mode.js';
 import { IGNORED_DIRS, listFiles, READ_LIMITS, readTextLimited, readTextLimitedWithReason } from '../read/limits.js';
 import { readProject } from '../read/project.js';
@@ -60,6 +61,7 @@ import { safeText } from '../util/safe-text.js';
 import { ConsentToken, CountingSummary, isSpent, spend } from './consent-token.js';
 import { chooseTools, skippedGroups, wouldSetSettings, type SkippedGroup, type WouldSet } from './choose.js';
 import { mapCoverage, type Coverage } from './coverage.js';
+import { applyDefaultSetup } from './github-signals.js';
 
 // ---------- types ----------
 
@@ -155,9 +157,11 @@ export interface AuditReport {
 /**
  * The GitHub facts a run couldn't read: 'repo' (visibility, owner, plan and default branch), 'branch-protection',
  * 'environments', 'deployment-branch-policies', 'code-scanning', 'activity' (pushes and pull requests, for the monthly
- * minutes).
+ * minutes), 'code-scanning-setup' (CodeQL default setup) and 'workflow-runs' (the last run of a covering workflow).
  */
-export type GitHubFact = 'repo' | 'branch-protection' | 'environments' | 'deployment-branch-policies' | 'code-scanning' | 'activity';
+export type GitHubFact = 'repo' | 'branch-protection' | 'environments' | 'deployment-branch-policies' | 'code-scanning' | 'activity'
+  /** P55: whether GitHub's CodeQL default setup is on, and the last run of each workflow that covers a check. */
+  | 'code-scanning-setup' | 'workflow-runs';
 export interface GitHubIncomplete {
   reason: 'github-rate-limit';
   /** When GitHub said its limit resets (ISO 8601, UTC), or null when it didn't say. */
@@ -420,13 +424,14 @@ export async function buildAudit(dir: string, deps: AuditDeps): Promise<AuditRep
   let needs: Need[];
   let coverage: Coverage[];
   let skipped: SkippedGroup[];
-  let wouldSet: WouldSet[];
+  let wouldSetFor: RepoProfile[];
   let limits: string[];
+  const same = <T>(a: readonly T[], b: readonly T[]) => { const keys = new Set(b.map((x) => JSON.stringify(x))); return a.filter((x) => keys.has(JSON.stringify(x))); };
   if (unreadCaps.size === 0) {
     needs = floorNeeds(profile, caps);
     coverage = await coverageOf(profile, needs, dir, skippedWf, notes, caps);
     skipped = skippedGroups(profile, caps);
-    wouldSet = wouldSetSettings(profile, coverage, skippedWf);
+    wouldSetFor = [profile];
     limits = limitsOf(profile, caps);
   } else {
     // DoD run 2026-10-29: GitHub's rate limit left facts unread. The coverage is mapped twice, with every unread fact
@@ -445,11 +450,14 @@ export async function buildAudit(dir: string, deps: AuditDeps): Promise<AuditRep
     const covLo = await coverageOf(lo.p, floorNeeds(lo.p, lo.c), dir, skippedWf, notes, lo.c, guess('narrowest'));
     coverage = bothWorlds(covHi, covLo, deps.context === null);
     needs = coverage.map((c) => c.need);
-    const same = <T>(a: readonly T[], b: readonly T[]) => { const keys = new Set(b.map((x) => JSON.stringify(x))); return a.filter((x) => keys.has(JSON.stringify(x))); };
     skipped = same(skippedGroups(hi.p, hi.c), skippedGroups(lo.p, lo.c));
-    wouldSet = same(wouldSetSettings(hi.p, coverage, skippedWf), wouldSetSettings(lo.p, coverage, skippedWf));
+    wouldSetFor = [hi.p, lo.p];
     limits = same(limitsOf(hi.p, hi.c), limitsOf(lo.p, lo.c));
   }
+  // P55 (hand checks): what GitHub itself says that the files can't show, read after the files and before the picks
+  const signalsUnread: GitHubFact[] = [];
+  coverage = await defaultSetupRows(deps, profile, coverage, signalsUnread);
+  const wouldSet = wouldSetFor.map((x) => wouldSetSettings(x, coverage, skippedWf)).reduce((a, b) => same(a, b));
   const wouldAdd = wouldAddRows(profile, coverage, deps, caps);
 
   const activity = await activityOf(deps, profile);
@@ -467,8 +475,8 @@ export async function buildAudit(dir: string, deps: AuditDeps): Promise<AuditRep
   const githubIncomplete: GitHubIncomplete | null = stop === undefined ? null : {
     reason: 'github-rate-limit',
     resetsAt: stop.resetAt === null ? null : new Date(stop.resetAt).toISOString(),
-    unread: unreadFacts(deps.context === null, unreadCaps, activity === null),
-    rows: coverage.filter((c) => c.status === 'unknown' && (c.why === RATE_WHY.context || c.why === RATE_WHY.caps || c.why === RATE_WHY.applies)).length,
+    unread: [...unreadFacts(deps.context === null, unreadCaps, activity === null), ...signalsUnread],
+    rows: coverage.filter((c) => c.status === 'unknown' && (Object.values(RATE_WHY) as string[]).includes(c.why)).length,
   };
 
   const secretsInTree = await scanTree(dir, notes);
@@ -522,7 +530,30 @@ export const RATE_WHY = {
   context: "pipegen couldn't check this: GitHub's rate limit kept it from reading this repo's default branch and settings, and the answer depends on them.",
   caps: "pipegen couldn't check this: GitHub's rate limit kept it from asking what GitHub allows here, and the answer depends on it.",
   applies: "pipegen couldn't tell whether this check applies here: it depends on what GitHub allows for this repo, which GitHub's rate limit kept it from reading.",
+  setup: "pipegen couldn't check whether GitHub's CodeQL default setup is on: GitHub's rate limit was reached.",
 } as const;
+
+/**
+ * P55 (hand checks, fix 2): code-scan rows after GitHub's CodeQL default setup, which no workflow file shows. Read only
+ * when a code-scan row is missing; a rate stop (before or during the read) makes those rows unknown, never guessed.
+ */
+async function defaultSetupRows(deps: AuditDeps, p: RepoProfile, rows: Coverage[], unread: GitHubFact[]): Promise<Coverage[]> {
+  if (!rows.some((c) => c.need.category === 'sast' && c.status === 'missing')) return rows;
+  const clock = { budget: deps.budget, now: deps.now, ...(deps.sleep === undefined ? {} : { sleep: deps.sleep }) };
+  let setup: DefaultSetup;
+  if (deps.context === null || rateStopOf(deps.budget, deps.now()) !== null) {
+    setup = { state: 'unknown', why: RATE_WHY.setup };
+  } else {
+    try {
+      setup = await readDefaultSetup(deps.gh, p.owner, p.repo, p.defaultBranch, clock, deps.anonymous);
+    } catch (e) {
+      if (!isRateStop(e)) throw e;
+      setup = { state: 'unknown', why: RATE_WHY.setup };
+    }
+  }
+  if (setup.state === 'unknown' && setup.why === RATE_WHY.setup) unread.push('code-scanning-setup');
+  return applyDefaultSetup(rows, setup, p);
+}
 
 /** One row per need of either world: the row when both worlds agree on it, else unknown with RATE_WHY. */
 function bothWorlds(hi: readonly Coverage[], lo: readonly Coverage[], contextUnread: boolean): Coverage[] {
