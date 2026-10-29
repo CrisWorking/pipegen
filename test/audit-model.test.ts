@@ -937,8 +937,16 @@ describe('buildAudit: the last run of a covering workflow (hand checks fix 3, P5
     }
     // one call for the workflow, however many rows it covers, asked for the default branch's completed runs
     expect(f.runs).toHaveBeenCalledTimes(1);
-    expect(f.runs).toHaveBeenCalledWith(expect.objectContaining({ workflow_id: 'ci.yml', branch: 'main', status: 'completed', exclude_pull_requests: true, per_page: 1 }));
+    expect(f.runs).toHaveBeenCalledWith(expect.objectContaining({ workflow_id: 'ci.yml', branch: 'main', status: 'completed', per_page: 10 }));
     expect(rowsOf(r, 'unit-tests').map((w) => w.status)).toEqual(['partial', 'partial']);
+  });
+
+  it('a pull request run is not a run on the default branch (a fork\'s PR from a branch of the same name): the newest other run counts, none means no run', async () => {
+    const mixed = (...rs: [string, string][]) => async () => ({ data: { total_count: rs.length, workflow_runs: rs.map(([event, conclusion], i) => ({ id: i, conclusion, status: 'completed', created_at: '2026-10-2' + i + 'T10:00:00Z', head_branch: 'main', event })) } });
+    const status = async (runs: GhSignals['runs']) => testRows(await buildAudit(redRepo(), deps({ gh: fakeGh({ signals: { runs } }).gh }))).map((c) => c.status);
+    expect(await status(mixed(['pull_request', 'failure'], ['push', 'success']))).toEqual(['covered', 'covered', 'covered']);
+    expect(await status(mixed(['pull_request', 'success'], ['push', 'failure']))).toEqual(['partial', 'partial', 'partial']);
+    expect(await status(mixed(['pull_request', 'failure'], ['pull_request_target', 'failure']))).toEqual(['covered', 'covered', 'covered']);
   });
 
   it('a passing last run keeps the rows covered', async () => {

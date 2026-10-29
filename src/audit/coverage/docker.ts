@@ -245,13 +245,16 @@ async function parseDockerfile(ctx: Ctx, text: string, context: string): Promise
       const sources = words.slice(0, -1);
       if (dest === null) continue;
       const destIsDir = (words[words.length - 1] as string).endsWith('/');
-      if (sources.length === 1 || destIsDir) {
-        const src = sources[0] as string;
-        if (sources.length === 1 && !/[*?$]|^[a-z][a-z0-9+.-]*:\/\//i.test(src) && !src.startsWith('/')) {
-          const host = resolveDir(context, src.replace(/\/+$/, '') || '.');
-          const kind = host === null ? null : await ctx.scriptRead.kind(host);
-          if (kind === 'dir') state.maps.push({ dest, host: host as string });
-          else if (kind === 'file' && destIsDir) state.maps.push({ dest, host: posix.dirname(host as string) });
+      // each plain source as a host path and its kind; any glob, variable, URL or absolute source leaves the copy unmapped
+      const plain = sources.filter((src) => !/[*?$]|^[a-z][a-z0-9+.-]*:\/\//i.test(src) && !src.startsWith('/'));
+      if (plain.length === sources.length && (sources.length === 1 || destIsDir)) {
+        const hosts = sources.map((src) => resolveDir(context, src.replace(/\/+$/, '') || '.'));
+        const kinds = await Promise.all(hosts.map((h) => (h === null ? Promise.resolve(null) : ctx.scriptRead.kind(h))));
+        if (sources.length === 1 && kinds[0] === 'dir') state.maps.push({ dest, host: hosts[0] as string });
+        else if (destIsDir && kinds.every((k) => k === 'file')) {
+          // files copied into a folder keep their names: that folder holds them, so it maps to their folder when they share one
+          const dirs = new Set(hosts.map((h) => posix.dirname(h as string)));
+          if (dirs.size === 1) state.maps.push({ dest, host: [...dirs][0] as string });
         }
       }
       continue;
