@@ -3772,4 +3772,26 @@ describe('coverage: closing patch (ruling P60)', () => {
     expect(await st(compose('      args:\n        - ${K}=x\n'), run('docker compose build'))).toMatch(/^unknown/);
     expect(await st({ Dockerfile: BODY }, run('docker build --build-arg A=$B .'))).toBe('covered your own `pytest`'); // a variable value of a plain name is fine
   });
+
+  it('R4: a Python folder with a package.json (an asset build) is Python and Node: tools of either language cover it', async () => {
+    const { readProject } = await import('../src/read/project.js');
+    const dir = makeTempDir();
+    writeIn(dir, 'package.json', JSON.stringify({ name: 'root', private: true, workspaces: ['backend', 'frontend'] }));
+    writeIn(dir, 'backend/pyproject.toml', '[project]\nname = "be"\ndependencies = ["django"]\n');
+    writeIn(dir, 'backend/package.json', JSON.stringify({ name: 'be-assets', scripts: { build: 'webpack' } }));
+    writeIn(dir, 'backend/app/main.py', 'x = 1\n');
+    writeIn(dir, 'backend/Dockerfile', 'FROM python:3.14\n');
+    writeIn(dir, 'frontend/package.json', JSON.stringify({ name: 'fe', scripts: { dev: 'vite', test: 'vitest run' } }));
+    writeIn(dir, 'frontend/src/a.ts', 'x\n');
+    ci(dir, run('cd backend && pytest') + run('cd frontend && npx vitest run'));
+    const { execFileSync } = await import('node:child_process');
+    execFileSync('git', ['init', '-q'], { cwd: dir, stdio: 'pipe' });
+    execFileSync('git', ['remote', 'add', 'origin', 'https://github.com/o/r.git'], { cwd: dir, stdio: 'pipe' });
+    const p = { ...(await readProject(dir)), private: false, ownerType: 'User' as const, plan: 'free' as const };
+    const be = p.services.find((x) => x.path === 'backend')!;
+    expect([be.language, ...(be.alsoLanguages ?? [])].sort()).toEqual(['node', 'python']);
+    expect(p.services.find((x) => x.path === 'frontend')!.alsoLanguages).toBeUndefined();
+    const rows = await mapCoverage(p, floorNeeds(p, caps), dir);
+    expect(row(rows, 'push', 'unit-tests', be.name)).toMatchObject({ status: 'covered', by: 'your own `pytest`' });
+  });
 });

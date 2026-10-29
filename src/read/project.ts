@@ -145,6 +145,10 @@ async function readService(ctx: Ctx, dir: string, shared: Shared): Promise<Servi
   // DoD run (spf13/cobra): a go.mod makes a Go service, so the audit can say plainly that Go isn't supported yet
   const language: Language = pkg ? 'node' : toml || requirementFiles.length > 0 || ctx.fileSet.has(inDir(dir, 'setup.py')) ? 'python'
     : ctx.fileSet.has(inDir(dir, 'go.mod')) ? 'go' : 'other';
+  // P60 (R4): the folder's other manifests: a Python or Go app beside its package.json is that language too
+  const python = toml !== null && toml !== undefined || requirementFiles.length > 0 || ctx.fileSet.has(inDir(dir, 'setup.py'));
+  const alsoLanguages = ([['python', python], ['go', ctx.fileSet.has(inDir(dir, 'go.mod'))]] as [Language, boolean][])
+    .filter(([l, has]) => has && l !== language).map(([l]) => l);
 
   // Files that belong to this service and not to a deeper one.
   const owned = files.filter((f) => isUnder(f, dir) && !shared.serviceDirs.some((o) => o.length > dir.length && isUnder(f, o)));
@@ -207,7 +211,7 @@ async function readService(ctx: Ctx, dir: string, shared: Shared): Promise<Servi
     dir, read: (rel) => readFile(ctx, rel), fileSet: ctx.fileSet, copies: shared.copies, scripts: pkgScripts, deps, devDeps, frameworks,
     hasDockerfile: dockerfile !== undefined, port, language, serviceDirs: shared.serviceDirs,
   });
-  return { name, path: dir, language, packageManager, runtimeVersion, dockerfile, port, hasTests, testFramework, ...env, scripts, frameworks, quality, ...(notStandalone === undefined ? {} : { notStandalone }) };
+  return { name, path: dir, language, ...(alsoLanguages.length === 0 ? {} : { alsoLanguages }), packageManager, runtimeVersion, dockerfile, port, hasTests, testFramework, ...env, scripts, frameworks, quality, ...(notStandalone === undefined ? {} : { notStandalone }) };
 }
 
 async function anyFileHasLine(ctx: Ctx, files: string[], re: RegExp): Promise<boolean> {

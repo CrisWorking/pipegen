@@ -20,6 +20,8 @@ export interface Dependency { kind: DependencyKind; name: string; evidence: stri
 export type NotStandalone = 'one-shot' | 'built-in-image' | 'email-templates';
 export interface Service {
   name: string; path: string; language: Language; packageManager?: PackageManager; runtimeVersion?: string;
+  /** P60 (R4): other languages the folder also holds (a Python app with a package.json for its asset build): tools of these cover it too. Set only when not empty. */
+  alsoLanguages?: Language[];
   dockerfile?: string; port?: number; hasTests: boolean; testFramework?: string;
   envVars: string[]; dependsOn: Dependency[];
   scripts: string[];      // script names from package.json `scripts` / pyproject `[project.scripts]` + `[tool.poetry.scripts]` (names only, never the commands)

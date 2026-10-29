@@ -154,10 +154,10 @@ const OPAQUE_KEY = '\0opaque'; // not a category: the opaque runs (they have non
 const ANY_LANG = '*';
 export const UNSURE_LANG = '?';
 const langKey = (key: string, lang: string) => `${key}\u0001${lang}`;
-/** The keys whose runs check a service of this language: language-neutral ones and its own. */
-export const matchKeys = (key: string, lang: string | undefined): string[] => (lang === undefined ? [key] : [langKey(key, ANY_LANG), langKey(key, lang)]);
+/** The keys whose runs check a service of these languages (P60 R4: a service may hold several): language-neutral ones and its own. */
+export const matchKeys = (key: string, langs: readonly string[] | undefined): string[] => (langs === undefined ? [key] : [langKey(key, ANY_LANG), ...langs.map((l) => langKey(key, l))]);
 /** The keys whose runs may or may not check a service of this language (pipegen can't tell which languages they check). */
-const unsureKeys = (key: string, lang: string | undefined): string[] => (lang === undefined ? [] : [langKey(key, UNSURE_LANG)]);
+const unsureKeys = (key: string, langs: readonly string[] | undefined): string[] => (langs === undefined ? [] : [langKey(key, UNSURE_LANG)]);
 
 /** Per (category, language, dir): the index of the first run of each kind, for each layer (-1 = none). */
 export class Firsts {
@@ -229,14 +229,14 @@ export class Scope {
   /** More services than MAX_SERVICES: per-service needs read only the runs at the root. */
   readonly capped: boolean;
   private readonly target = new Map<string, string>(); // service name → path of the first service with that name
-  private readonly languages = new Map<string, string>(); // P57 (C1): service name → the language of the first service with that name
+  private readonly languages = new Map<string, readonly string[]>(); // P57 (C1), P60 (R4): service name → the languages of the first service with that name
   private readonly owned = new Map<string, number[]>(); // service name → the dirs it owns
   private readonly dirTree = segNode();
   private readonly memo = new Map<string, readonly number[]>();
 
   constructor(services: readonly Service[], dirs: Dirs) {
     this.capped = services.length > MAX_SERVICES;
-    for (const s of services) if (!this.languages.has(s.name)) this.languages.set(s.name, s.language);
+    for (const s of services) if (!this.languages.has(s.name)) this.languages.set(s.name, [s.language, ...(s.alsoLanguages ?? [])]);
     if (this.capped) return;
     const tree = segNode();
     let root = -1;
@@ -272,9 +272,9 @@ export class Scope {
     }
   }
 
-  /** P57 (C1): the language of a service need's service ('other' when pipegen can't find it); undefined for a repo-wide need. */
-  languageOf(service: string | undefined): string | undefined {
-    return service === undefined ? undefined : (this.languages.get(service) ?? 'other');
+  /** P57 (C1), P60 (R4): the languages of a service need's service (['other'] when pipegen can't find it); undefined for a repo-wide need. */
+  languageOf(service: string | undefined): readonly string[] | undefined {
+    return service === undefined ? undefined : (this.languages.get(service) ?? ['other']);
   }
 
   /** The dirs whose runs count for a need of this service (ALL for a repo-wide need). */
