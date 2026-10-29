@@ -76,8 +76,10 @@ function own(c: Ctx, tool: string, version: string | null, reason: string, pkg?:
   const step: RepoToolStep = { kind: 'repo-tool', needId: c.need.id, service: c.s?.name ?? c.need.service ?? '', tool, version };
   if (version !== null && pkg !== undefined && (c.q.fromRange as readonly string[]).includes(pkg)) step.fromRange = true;
   if (c.s !== undefined && c.s.path !== '' && c.s.path !== '.') step.workingDir = c.s.path;
-  // a null version means the tool is configured but nothing installed was found: say so rather than imply it would run
-  return { tool: step, also: [], note: version === null ? `${reason}, but no installed version was found` : reason };
+  // a null version means the tool is configured but pipegen has no version for it: say why, rather than imply it would run.
+  // pipegen reads no Python lockfile (uv.lock, poetry.lock) yet, so for Python it says that, not "no installed version was found" (hand checks, P55)
+  const noVersion = c.lang === 'python' ? "; pipegen doesn't read Python lockfiles yet, so it can't say which version is installed" : ', but no installed version was found';
+  return { tool: step, also: [], note: version === null ? `${reason}${noVersion}` : reason };
 }
 
 const major = (v: string | undefined): number | null => {
@@ -138,7 +140,10 @@ function lintRule(c: Ctx): Choice {
 function formatRule(c: Ctx): Choice {
   const { q } = c;
   if (c.lang === 'python') {
-    return q.configs.includes('black') ? own(c, 'black', null, 'Black is already configured') : reviewed(c, T.ruffFormat, 'Ruff format: no Python formatter configured');
+    if (q.configs.includes('black')) return own(c, 'black', null, 'Black is already configured');
+    // hand checks (P55): Ruff configured ([tool.ruff], ruff.toml) formats too (`ruff format`), so it is the repo's own formatter
+    if (q.configs.includes('ruff')) return own(c, 'ruff format', null, 'Ruff is already configured, and `ruff format` formats with it');
+    return reviewed(c, T.ruffFormat, 'Ruff format: no Python formatter configured');
   }
   if (c.lang !== 'node') return generic(c);
   if (q.configs.includes('prettier')) {

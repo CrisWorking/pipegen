@@ -141,6 +141,51 @@ function entryOn(entry: Record<string, unknown>): boolean {
 
 interface Requirement { ecos: readonly string[]; dir: string }
 
+type Member = (folder: string) => boolean;
+const MAX_WORKSPACE_GLOBS = 100;
+/**
+ * P55 (batch B): the member folders of the repo's root workspaces, from the root package.json `workspaces` (or the
+ * pnpm-workspace.yaml `packages`) and the root pyproject.toml `[tool.uv.workspace] members`. Dependabot's npm, bun and uv
+ * updaters read the root lockfile, so an entry at `/` also updates a member (hand check, fastapi: uv and bun at `/`).
+ * A file that can't be read, or a glob that isn't plain, gives no members.
+ */
+async function workspaceMembers(dir: string): Promise<{ node: Member | null; python: Member | null }> {
+  const globs = (v: unknown): string[] => (Array.isArray(v) ? v.filter((g): g is string => typeof g === 'string' && g.length <= 200 && !g.startsWith('/') && !g.includes('..')).slice(0, MAX_WORKSPACE_GLOBS) : []);
+  const matcher = (include: string[], exclude: string[]): Member | null => {
+    if (include.length === 0) return null;
+    const clean = (g: string) => g.replace(/^\.\//, '').replace(/\/+$/, '');
+    const inc = include.map((g) => picomatch(clean(g), { dot: true }));
+    const exc = exclude.map((g) => picomatch(clean(g.replace(/^!/, '')), { dot: true }));
+    return (d) => d !== '.' && inc.some((m) => m(d)) && !exc.some((m) => m(d));
+  };
+  const text = async (rel: string): Promise<string | null> => {
+    const r = await readAt(dir, rel);
+    return r !== null && 'text' in r ? r.text : null;
+  };
+  let node: Member | null = null;
+  try {
+    const pnpm = await text('pnpm-workspace.yaml');
+    const pkg = await text('package.json');
+    if (pnpm !== null) {
+      const packages = globs(asObj(parseYamlLimited(pnpm)).packages);
+      node = matcher(packages.filter((g) => !g.startsWith('!')), packages.filter((g) => g.startsWith('!')));
+    } else if (pkg !== null) {
+      const ws = asObj(JSON.parse(pkg)).workspaces;
+      const packages = globs(Array.isArray(ws) ? ws : asObj(ws).packages);
+      node = matcher(packages.filter((g) => !g.startsWith('!')), packages.filter((g) => g.startsWith('!')));
+    }
+  } catch { node = null; }
+  let python: Member | null = null;
+  try {
+    const py = await text('pyproject.toml');
+    if (py !== null) {
+      const ws = asObj(asObj(asObj(parseToml(py)).tool).uv).workspace;
+      python = matcher(globs(asObj(ws).members), globs(asObj(ws).exclude));
+    }
+  } catch { python = null; }
+  return { node, python };
+}
+
 /** Where a Go module, or a Dockerfile, sits: found here because no reader sets language 'go' (ruling P2). */
 async function listedFolders(dir: string): Promise<{ go: string[]; docker: string[]; node: string[]; python: string[]; truncated: boolean }> {
   const ignore = IGNORED_DIRS.map((d) => `**/${d}/**`);
@@ -243,6 +288,7 @@ async function dependabotVerdict(p: RepoProfile, dir: string): Promise<Verdict |
   if (reqs.length > MAX_REQUIREMENTS) return mkWait('unknown', 'There are more ecosystems and folders than pipegen checks against the Dependabot file.');
   if (reqs.length === 0) return mkWait('unknown', 'pipegen found no ecosystem it can check against the Dependabot file.');
 
+  const members = await workspaceMembers(dir);
   const missing = new Set<string>();
   let anyFolderGap = false;
   let cooldownGap = false;
@@ -252,14 +298,23 @@ async function dependabotVerdict(p: RepoProfile, dir: string): Promise<Verdict |
     if (seen.has(key)) continue;
     seen.add(key);
     const matchers = r.ecos.flatMap((e) => byEco.get(e) ?? []);
-    const hits = matchers.filter((m) => m.literals.has(r.dir) || m.globs.some((g) => g(r.dir)));
+    let hits = matchers.filter((m) => m.literals.has(r.dir) || m.globs.some((g) => g(r.dir)));
+    // P55 (batch B): a workspace member is updated by the entry at the workspace root (`/`)
+    if (hits.length === 0 && r.dir !== '.') {
+      if (r.ecos.some((e) => e === 'npm' || e === 'bun') && members.node?.(r.dir) === true) hits = matchers.filter((m) => m.literals.has('.'));
+      else if (r.ecos.includes('uv') && members.python?.(r.dir) === true) hits = (byEco.get('uv') ?? []).filter((m) => m.literals.has('.'));
+    }
     if (hits.length === 0) {
       missing.add(r.ecos.join(' or '));
       if (matchers.length > 0) anyFolderGap = true;
     } else if (!hits.some((m) => m.cooldownOk)) cooldownGap = true;
   }
   if (missing.size > 0) {
-    return mkWait('partial', `Dependabot has no active entry for ${[...missing].join(', ')}${anyFolderGap ? ' (some folders are not listed)' : ''}, so some dependencies are not updated by it.`);
+    // each ecosystem once: "bun" already says "npm or bun" is missing too
+    const labels = [...missing];
+    const singles = new Set(labels.filter((l) => !l.includes(' or ')));
+    const shown = labels.filter((l) => !l.includes(' or ') || !l.split(' or ').some((x) => singles.has(x))).sort();
+    return mkWait('partial', `Dependabot has no active entry for ${shown.join(', ')}${anyFolderGap ? ' (some folders are not listed)' : ''}, so some dependencies are not updated by it.`);
   }
   if (cooldownGap) return mkWait('partial', `Dependabot's default wait is 3 days; pipegen uses ${COOLDOWN_DAYS}. Set cooldown default-days to at least ${COOLDOWN_DAYS} (with no lower per-type days, include or exclude) on every entry.`);
   if (unchecked) return mkWait('partial', "Dependabot covers the ecosystems pipegen checks, but pipegen doesn't check the entries for Java, .NET, Ruby or PHP code.");

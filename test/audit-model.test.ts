@@ -1020,6 +1020,17 @@ describe('buildAudit: would-create never offers a file the repo has (hand checks
   });
 });
 
+describe('buildAudit: would-create is about what the code uses (hand checks, P55 batch B)', () => {
+  it('a database named only in a .env file gets no Compose file; the same database in the code\'s dependencies does', async () => {
+    const envOnly = nodeApp();
+    const a = await buildAudit(repo({ ...envOnly, '.env': 'DATABASE_URL=postgres://localhost/app\n' }), deps());
+    expect(a.profile.services[0]?.dependsOn.map((d) => d.kind)).toEqual(['postgres']);
+    expect(a.wouldCreate.map((w) => w.what)).not.toContain('compose');
+    const b = await buildAudit(repo({ ...nodeApp({ dependencies: { pg: '8.0.0' } }), '.env': 'DATABASE_URL=postgres://localhost/app\n' }), deps());
+    expect(b.wouldCreate.map((w) => w.what)).toContain('compose');
+  });
+});
+
 describe('buildAudit: would-add never asks for a wait the update tool has (hand checks fix 5, P55)', () => {
   it('Dependabot waits 7 days on every entry but misses an ecosystem: the row is partial, the pick keeps the cooldown', async () => {
     const r = await buildAudit(repo({

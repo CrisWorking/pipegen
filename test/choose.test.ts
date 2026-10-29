@@ -141,6 +141,7 @@ describe('choose: lint', () => {
 
 describe('choose: configured tools with no installed version (m3)', () => {
   const NO_VERSION = 'but no installed version was found';
+  const NO_PY_LOCK = "pipegen doesn't read Python lockfiles yet, so it can't say which version is installed";
   const cases: [string, string, Partial<Service['quality']>, string][] = [
     ['lint', 'flake8', { configs: ['flake8'] }, 'flake8'],
     ['lint', 'pylint', { configs: ['pylint'] }, 'pylint'],
@@ -155,9 +156,17 @@ describe('choose: configured tools with no installed version (m3)', () => {
       const lang = ['biome'].includes(name) ? 'node' : 'python';
       const c = choose(cat, profile([svc({ language: lang }, q)]));
       expect(ownTool(c)).toMatchObject({ kind: 'repo-tool', tool, version: null });
-      expect(c.note).toContain(NO_VERSION);
+      expect(c.note).toContain(lang === 'python' ? NO_PY_LOCK : NO_VERSION);
+      if (lang === 'python') expect(c.note).not.toContain('no installed version was found');
     });
   }
+  it('choose: Ruff configured → the repo\'s own `ruff format` for format, never "no Python formatter configured"; Black still wins when both are configured', () => {
+    const c = choose('format', profile([svc({ language: 'python' }, { configs: ['ruff'] })]));
+    expect(ownTool(c)).toMatchObject({ kind: 'repo-tool', tool: 'ruff format', version: null });
+    expect(c.note).not.toContain('no Python formatter configured');
+    expect(ownTool(choose('format', profile([svc({ language: 'python' }, { configs: ['ruff', 'black'] })])))).toMatchObject({ tool: 'black' });
+    expect(idOf(choose('format', profile([svc({ language: 'python' })])).tool)).toBe('ruff-format');
+  });
   it('choose: with a version the note has no such caveat', () => {
     const c = choose('lint', profile([svc({}, { configs: ['biome'], versions: { '@biomejs/biome': '2.0.0' } })]));
     expect(c.note).not.toContain(NO_VERSION);

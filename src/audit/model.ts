@@ -764,7 +764,9 @@ function wouldCreateOf(p: RepoProfile): { what: Part; why: string }[] {
   for (const s of p.services) {
     if (isRunnable(s) && (s.dockerfile ?? '') === '') out.push({ what: 'docker', why: `${s.name} runs but has no Dockerfile: pipegen would create one, so the image can be built and scanned.` });
   }
-  const kinds = [...new Set(p.services.flatMap((s) => s.dependsOn.map((d) => d.kind)).filter((k) => k !== 'external'))].sort();
+  // hand checks (P55 batch B): a database named only in a .env file (a sample's DATABASE_URL) isn't one the code uses
+  const fromEnvFile = (d: { evidence: string }) => /(?:^|\/)\.env(?:\.[^:/]*)?: /.test(d.evidence);
+  const kinds = [...new Set(p.services.flatMap((s) => s.dependsOn.filter((d) => !fromEnvFile(d)).map((d) => d.kind)).filter((k) => k !== 'external'))].sort();
   // hand checks (P55): a repo with its own Compose file (compose.y*ml, docker-compose.y*ml) is never offered one
   if (kinds.length > 0 && !p.hasCompose) out.push({ what: 'compose', why: `The app uses ${kinds.join(', ')}: pipegen would create a Compose file that starts them for the tests.` });
   for (const s of p.services) if (!s.hasTests) out.push({ what: 'tests', why: starterTests(s.name) });

@@ -52,6 +52,52 @@ async function update(dir: string, over: Partial<RepoProfile> = {}, running = fa
   const p = await profileOf(dir, over);
   return updateConfigCoverage(p, need('update-config', 'merge'), dir, running);
 }
+describe('update-config: workspaces and the reason text (hand checks, P55 batch B)', () => {
+  const run = async (files: Record<string, string>, services: Service[], entries: string[]) => {
+    const dir = makeTempDir();
+    for (const [rel, text] of Object.entries(files)) writeIn(dir, rel, text);
+    dep(dir, depFile(...entries));
+    return update(dir, { services });
+  };
+  const rootPkg = (workspaces: unknown) => JSON.stringify({ name: 'root', private: true, workspaces });
+  const bunSvc = (path: string) => svc(path, { packageManager: 'bun' });
+
+  it('bun and uv at `/` cover the workspace members that the root lists (fastapi shape)', async () => {
+    const files = {
+      'package.json': rootPkg(['frontend', 'packages/*']), 'frontend/package.json': '{"name":"frontend"}', 'packages/react-email/package.json': '{"name":"emails"}',
+      'pyproject.toml': '[tool.uv.workspace]\nmembers = ["backend"]\n', 'backend/pyproject.toml': '[project]\nname = "app"\n',
+    };
+    const services = [svc('backend', { language: 'python', packageManager: 'uv' }), bunSvc('frontend'), bunSvc('packages/react-email')];
+    const r = await run(files, services, [upd('uv', '/'), upd('bun', '/')]);
+    expect(r.status).toBe('covered');
+    // a folder the root doesn't list, or an entry for another ecosystem, is still missing
+    const unlisted = await run({ ...files, 'package.json': rootPkg(['packages/*']) }, services, [upd('uv', '/'), upd('bun', '/')]);
+    expect(unlisted.status).toBe('partial');
+    expect(unlisted.why).toMatch(/no active entry for bun/);
+    const noUv = await run(files, services, [upd('bun', '/')]);
+    expect(noUv.status).toBe('partial');
+    const pipOnly = await run(files, services, [upd('pip', '/'), upd('bun', '/')]);
+    expect(pipOnly.status).toBe('partial');
+    const exclude = await run({ ...files, 'package.json': rootPkg(['frontend', 'packages/*', '!packages/react-email']) }, services, [upd('uv', '/'), upd('bun', '/')]);
+    expect(exclude.status).toBe('partial');
+  });
+
+  it('pnpm-workspace.yaml members count too; no workspace file means no members', async () => {
+    const files = { 'pnpm-workspace.yaml': 'packages:\n  - "apps/*"\n', 'package.json': '{"name":"root"}', 'apps/web/package.json': '{"name":"web"}' };
+    expect((await run(files, [svc('apps/web')], [upd('npm', '/')])).status).toBe('covered');
+    const { 'pnpm-workspace.yaml': _drop, ...without } = files;
+    void _drop;
+    expect((await run(without, [svc('apps/web')], [upd('npm', '/')])).status).toBe('partial');
+  });
+
+  it('the missing ecosystems are listed once each, never "bun" next to "npm or bun"', async () => {
+    const files = { 'package.json': '{"name":"root"}', 'frontend/package.json': '{"name":"frontend"}', 'backend/pyproject.toml': '[project]\nname = "app"\n' };
+    const r = await run(files, [svc('backend', { language: 'python', packageManager: 'uv' }), bunSvc('frontend')], [upd('docker', '/')]);
+    expect(r.status).toBe('partial');
+    expect(r.why).toBe('Dependabot has no active entry for bun, pip or uv, so some dependencies are not updated by it.');
+  });
+});
+
 const ADJUST_PS22 = /ESLint's migration tool \(@eslint\/migrate-config\)/;
 
 // ---------- versionAdjust ----------
