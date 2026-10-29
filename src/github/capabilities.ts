@@ -45,7 +45,7 @@
 // keyless signing writes to the public Sigstore log, so never for private repos).
 import type { Octokit } from '@octokit/rest';
 import type { Capabilities, RepoProfile } from '../types.js';
-import { isRateStop, withRateLimit, type RateClock } from '../engine/github-rate.js';
+import { isRateStop, rateStopOf, withRateLimit, type RateClock } from '../engine/github-rate.js';
 import { checkRepoNames, clockOf, githubTokenRejected, isAnonymousClient, isNoAnswer } from './client.js';
 
 /** Plan B Task 1's pure signingMode, re-exported (not written again). key-env needs environments AND proven deployment branch policies (DECISIONS #86, fix round 1 R4). */
@@ -96,8 +96,8 @@ export function classifyProbe(e: unknown): ProbeClass {
   return { result: 'inconclusive', why: 'other' };
 }
 
-/** `network`: GitHub never answered (not settled; the note must not blame the token). */
-type Answer<T> = { ok: true; data: T } | { ok: false; settled?: boolean; network?: boolean };
+/** `network`: GitHub never answered (not settled; the note must not blame the token). `rate`: GitHub's rate limit stopped it. */
+type Answer<T> = { ok: true; data: T } | { ok: false; settled?: boolean; network?: boolean; rate?: boolean };
 
 /**
  * One GET probe: its data, or a settled false, or nothing settled. Rate stops are thrown, and so is a 401 on a client
@@ -149,21 +149,42 @@ function onlyDefaultBranch(data: unknown, branch: string): boolean {
  * GETs through `gh`, which only talks to api.github.com). `notes` gets one line per probe that couldn't settle its
  * answer (see the header for what each becomes). `p.defaultBranch` is the branch the signing rule must name.
  */
-export async function probeCapabilities(gh: Octokit, owner: string, repo: string, p: ProfileBits & Pick<RepoProfile, 'defaultBranch'>, notes: string[] = [], clock: RateClock = clockOf(gh)): Promise<Capabilities> {
+export async function probeCapabilities(
+  gh: Octokit, owner: string, repo: string, p: ProfileBits & Pick<RepoProfile, 'defaultBranch'>, notes: string[] = [], clock: RateClock = clockOf(gh),
+  opts: { onRateStop?: (unread: (keyof Capabilities)[]) => void } = {},
+): Promise<Capabilities> {
   checkRepoNames(owner, [repo]);
   const table = capabilityTable(p);
-  const couldnt = (what: string, then: string, a: Answer<unknown>) => notes.push(!a.ok && a.network
-    ? `GitHub didn't answer when pipegen checked ${what} (a network problem); ${then}.`
-    : `Couldn't check ${what} ${isAnonymousClient(gh) ? 'without a token' : 'with this token'}; ${then}.`);
+  const couldnt = (what: string, then: string, a: Answer<unknown>) => notes.push(!a.ok && a.rate
+    ? `Couldn't check ${what}: GitHub's rate limit was reached.`
+    : !a.ok && a.network
+      ? `GitHub didn't answer when pipegen checked ${what} (a network problem); ${then}.`
+      : `Couldn't check ${what} ${isAnonymousClient(gh) ? 'without a token' : 'with this token'}; ${then}.`);
+  // DoD run 2026-10-29: with onRateStop (the audit), a rate stop leaves that probe unread instead of ending the run;
+  // the caller is told which capabilities it couldn't read, and the value given for them is only a placeholder.
+  const probe = async <T>(call: () => Promise<{ data: T }>, unread: (keyof Capabilities)[], special?: (e: unknown) => boolean | undefined): Promise<Answer<T>> => {
+    // after a stop, nothing more is asked until the reset (an anonymous run has 60 requests an hour)
+    if (opts.onRateStop !== undefined && rateStopOf(clock.budget, (clock.now ?? Date.now)()) !== null) {
+      opts.onRateStop(unread);
+      return { ok: false, rate: true };
+    }
+    try {
+      return await ask(gh, call, clock, special);
+    } catch (e) {
+      if (opts.onRateStop === undefined || !isRateStop(e)) throw e;
+      opts.onRateStop(unread);
+      return { ok: false, rate: true };
+    }
+  };
 
-  const rulesets = await ask(gh, () => gh.rest.repos.getRepoRulesets({ owner, repo, per_page: 1 }), clock);
+  const rulesets = await probe(() => gh.rest.repos.getRepoRulesets({ owner, repo, per_page: 1 }), ['branchProtection']);
   let branchProtection = verdict(rulesets);
   if (branchProtection === undefined) {
     couldnt('branch protection', 'used the plan table', rulesets);
     branchProtection = table.branchProtection;
   }
 
-  const envs = await ask(gh, () => gh.rest.repos.getAllEnvironments({ owner, repo, per_page: 100 }), clock);
+  const envs = await probe(() => gh.rest.repos.getAllEnvironments({ owner, repo, per_page: 100 }), ['environments', 'envRequiredReviewers', ...(p.private ? ['deploymentBranchPolicies' as const] : [])]);
   let environments = verdict(envs);
   if (environments === undefined) {
     if (p.private) couldnt('environments', 'treated as not available', envs);
@@ -171,7 +192,7 @@ export async function probeCapabilities(gh: Octokit, owner: string, repo: string
     environments = p.private ? false : table.environments;
   }
 
-  const scan = await ask(gh, () => gh.rest.codeScanning.listRecentAnalyses({ owner, repo, per_page: 1 }), clock, codeScanningAnswer);
+  const scan = await probe(() => gh.rest.codeScanning.listRecentAnalyses({ owner, repo, per_page: 1 }), ['codeScanning'], codeScanningAnswer);
   let codeScanning = verdict(scan);
   if (codeScanning === undefined) {
     if (p.private) couldnt('code scanning', 'treated as not available', scan);
@@ -182,9 +203,9 @@ export async function probeCapabilities(gh: Octokit, owner: string, repo: string
   let deploymentBranchPolicies = !p.private;
   if (p.private) {
     if (environments && envs.ok && signingEnvIsCustom(envs.data)) {
-      const rules = await ask(gh, () => gh.request('GET /repos/{owner}/{repo}/environments/{environment_name}/deployment-branch-policies', {
+      const rules = await probe(() => gh.request('GET /repos/{owner}/{repo}/environments/{environment_name}/deployment-branch-policies', {
         owner, repo, environment_name: SIGNING_ENVIRONMENT, per_page: 100,
-      }), clock);
+      }), ['deploymentBranchPolicies']);
       deploymentBranchPolicies = rules.ok && onlyDefaultBranch(rules.data, p.defaultBranch);
     }
     if (!deploymentBranchPolicies) notes.push("Couldn't prove deployment branch policies here; key-based signing is decided at `finish`.");

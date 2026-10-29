@@ -34,7 +34,7 @@ import {
   HIDDEN_NAME, scrubKnownValues, type CodeBundle, type ScanFound,
 } from '../ai/redact.js';
 import { needLanguage, suggestTools } from '../engine/discover.js';
-import type { RateBudget } from '../engine/github-rate.js';
+import { rateStopOf, resetText, type RateBudget } from '../engine/github-rate.js';
 import { ensurePinnedBinary, loadPinnedBinaries, PinnedBinaryError } from '../engine/linters.js';
 import type { MemoryStore } from '../engine/memory.js';
 import { CHECK_LABELS, floorNeeds, isRunnable, jobCategories, needKey, needsPromptBytes, planNeeds, type NeedsPlan } from '../engine/needs.js';
@@ -43,6 +43,7 @@ import { projectScriptFor, type WouldAddTool } from '../engine/reviewed.js';
 import {
   activity30d, aiRequestBytes, estimate, requestCeilingUsd, unpricedModel, usageCeilingUsd, usageCostUsd, type Activity, type Estimates,
 } from '../estimate/estimate.js';
+import { readOnlyTokenHint } from '../github/client.js';
 import { signingMode } from '../github/signing-mode.js';
 import { IGNORED_DIRS, listFiles, READ_LIMITS, readTextLimited, readTextLimitedWithReason } from '../read/limits.js';
 import { readProject } from '../read/project.js';
@@ -118,8 +119,28 @@ export interface AuditReport {
   notes: string[];
   /** Ruling U11: the caller couldn't use the reviewed list (B3). Task 2b drops every discovery suggestion when true. */
   reviewedUnavailable: boolean;
+  /**
+   * DoD run 2026-10-29: what GitHub's rate limit kept pipegen from reading (null: GitHub was read in full). Every
+   * coverage row whose answer depends on it is `unknown`; the report says so at the top, with the reset time.
+   */
+  githubIncomplete: GitHubIncomplete | null;
   /** Only with --ai, after consent (Task 2b, addAiSuggestions); mention-only. */
   ai?: AuditAi;
+}
+
+/**
+ * The GitHub facts a run couldn't read: 'repo' (visibility, owner, plan and default branch), 'branch-protection',
+ * 'environments', 'deployment-branch-policies', 'code-scanning', 'activity' (pushes and pull requests, for the monthly
+ * minutes).
+ */
+export type GitHubFact = 'repo' | 'branch-protection' | 'environments' | 'deployment-branch-policies' | 'code-scanning' | 'activity';
+export interface GitHubIncomplete {
+  reason: 'github-rate-limit';
+  /** When GitHub said its limit resets (ISO 8601, UTC), or null when it didn't say. */
+  resetsAt: string | null;
+  unread: GitHubFact[];
+  /** How many coverage rows are unknown because of it. */
+  rows: number;
 }
 
 /**
@@ -166,9 +187,15 @@ export interface AuditDeps {
   /** Always set; an anonymous client works for a public repo. */
   gh: Octokit;
   anonymous: boolean;
-  /** readGitHubContext's answer (the CLI reads it; ruling B1). */
-  context: Pick<RepoProfile, 'private' | 'ownerType' | 'plan' | 'defaultBranch'>;
+  /**
+   * readGitHubContext's answer (the CLI reads it; ruling B1), or null when GitHub's rate limit stopped that read (DoD
+   * run 2026-10-29): every check that depends on the visibility, the owner or the default branch is then unknown.
+   */
+  context: Pick<RepoProfile, 'private' | 'ownerType' | 'plan' | 'defaultBranch'> | null;
+  /** probeCapabilities' answer; with a null context, a placeholder (every capability counts as unread). */
   capabilities: Capabilities;
+  /** DoD run 2026-10-29: the capabilities GitHub's rate limit kept probeCapabilities from reading (their values are placeholders). */
+  unreadCapabilities?: readonly (keyof Capabilities)[];
   /** What the full run would need (permissionsTable('write', …)); shown as given. */
   permissions: { permission: string; why: string }[];
   reviewed: ReviewedTool[];
@@ -352,18 +379,53 @@ export async function buildAudit(dir: string, deps: AuditDeps): Promise<AuditRep
   const notes = new Notes();
   const readerNotes: string[] = [];
   const local = await readProject(dir, { notes: readerNotes });
+  // DoD run 2026-10-29: with no context (GitHub's rate limit), the profile's GitHub facts are placeholders (the
+  // fail-closed side: private, plan unknown); nothing below states them, and --json writes them as null
+  const context = deps.context ?? { private: true, ownerType: 'User' as const, plan: 'unknown' as const, defaultBranch: local.defaultBranch };
   const profile: RepoProfile = {
     ...local,
-    private: deps.context.private, ownerType: deps.context.ownerType, plan: deps.context.plan, defaultBranch: deps.context.defaultBranch,
+    private: context.private, ownerType: context.ownerType, plan: context.plan, defaultBranch: context.defaultBranch,
   };
   for (const n of readerNotes) notes.add(n);
   for (const n of deps.notes ?? []) notes.add(n);
   for (const n of libraryNotes(profile)) notes.add(n);
 
   const caps = deps.capabilities;
-  const needs = floorNeeds(profile, caps);
-
-  const coverage = await coverageOf(profile, needs, dir, skippedWorkflowCount(readerNotes), notes, caps);
+  const unreadCaps: ReadonlySet<keyof Capabilities> = new Set(deps.context === null ? CAPABILITY_KEYS : deps.unreadCapabilities ?? []);
+  const skippedWf = skippedWorkflowCount(readerNotes);
+  let needs: Need[];
+  let coverage: Coverage[];
+  let skipped: SkippedGroup[];
+  let wouldSet: WouldSet[];
+  let limits: string[];
+  if (unreadCaps.size === 0) {
+    needs = floorNeeds(profile, caps);
+    coverage = await coverageOf(profile, needs, dir, skippedWf, notes, caps);
+    skipped = skippedGroups(profile, caps);
+    wouldSet = wouldSetSettings(profile, coverage, skippedWf);
+    limits = limitsOf(profile, caps);
+  } else {
+    // DoD run 2026-10-29: GitHub's rate limit left facts unread. The coverage is mapped twice, with every unread fact
+    // on its most permissive side (public, the capability there, every branch filter taking the default branch) and on
+    // its least (private, the capability absent, only unfiltered triggers taking it). A row both give alike doesn't
+    // depend on what wasn't read; any other row is unknown, saying why. Never a guessed covered, never a guessed missing.
+    const world = (hi: boolean) => {
+      const c = { ...caps };
+      for (const k of unreadCaps) c[k] = hi;
+      return { p: deps.context === null ? { ...profile, private: !hi } : profile, c };
+    };
+    const hi = world(true);
+    const lo = world(false);
+    const guess = (g: 'widest' | 'narrowest') => (deps.context === null ? g : undefined);
+    const covHi = await coverageOf(hi.p, floorNeeds(hi.p, hi.c), dir, skippedWf, notes, hi.c, guess('widest'));
+    const covLo = await coverageOf(lo.p, floorNeeds(lo.p, lo.c), dir, skippedWf, notes, lo.c, guess('narrowest'));
+    coverage = bothWorlds(covHi, covLo, deps.context === null);
+    needs = coverage.map((c) => c.need);
+    const same = <T>(a: readonly T[], b: readonly T[]) => { const keys = new Set(b.map((x) => JSON.stringify(x))); return a.filter((x) => keys.has(JSON.stringify(x))); };
+    skipped = same(skippedGroups(hi.p, hi.c), skippedGroups(lo.p, lo.c));
+    wouldSet = same(wouldSetSettings(hi.p, coverage, skippedWf), wouldSetSettings(lo.p, coverage, skippedWf));
+    limits = same(limitsOf(hi.p, hi.c), limitsOf(lo.p, lo.c));
+  }
   const wouldAdd = wouldAddRows(profile, coverage, deps, caps);
 
   const activity = await activityOf(deps, profile);
@@ -374,6 +436,16 @@ export async function buildAudit(dir: string, deps: AuditDeps): Promise<AuditRep
     if (at >= 0) estimates.basis[at] = line;
     else estimates.basis.push(line);
   }
+  if (deps.context === null) {
+    estimates.basis.push("GitHub's rate limit kept pipegen from reading whether this repo is public, so these minutes assume a private repo with an unknown plan (on a public repo GitHub-hosted minutes are free).");
+  }
+  const stop = deps.budget.stopped;
+  const githubIncomplete: GitHubIncomplete | null = stop === undefined ? null : {
+    reason: 'github-rate-limit',
+    resetsAt: stop.resetAt === null ? null : new Date(stop.resetAt).toISOString(),
+    unread: unreadFacts(deps.context === null, unreadCaps, activity === null),
+    rows: coverage.filter((c) => c.status === 'unknown' && (c.why === RATE_WHY.context || c.why === RATE_WHY.caps || c.why === RATE_WHY.applies)).length,
+  };
 
   const secretsInTree = await scanTree(dir, notes);
 
@@ -387,22 +459,78 @@ export async function buildAudit(dir: string, deps: AuditDeps): Promise<AuditRep
     support: supportOf(profile),
     coverage,
     wouldAdd,
-    skipped: skippedGroups(profile, caps),
-    wouldSet: wouldSetSettings(profile, coverage, skippedWorkflowCount(readerNotes)),
+    skipped,
+    wouldSet,
     wouldCreate: wouldCreateOf(profile),
     testsNote: profile.services.length === 0 ? NO_SERVICE_TO_TEST : null,
     estimates,
     permissions: deps.permissions,
-    limits: limitsOf(profile, caps),
+    limits,
     secretsInTree,
     aiBundle: {
       files: bundle.files.length, bytes: bundle.bytes, truncated: bundle.truncated,
       excludedPatterns: [...EXCLUDED_PATTERNS], topFolders: bundleTopFolders(bundle),
     },
-    warnings: await warningsOf(dir, deps.anonymous),
+    warnings: [
+      ...(stop === undefined ? [] : [{ text: rateLimitWarning(stop.resetAt, deps.now(), deps.anonymous, local.repo) }]),
+      ...await warningsOf(dir, deps.anonymous),
+    ],
     notes: notes.all(),
     reviewedUnavailable: deps.reviewedUnavailable === true,
+    githubIncomplete,
   };
+}
+
+// ---------- GitHub's rate limit (DoD run 2026-10-29) ----------
+
+const CAPABILITY_KEYS: readonly (keyof Capabilities)[] = [
+  'branchProtection', 'environments', 'deploymentBranchPolicies', 'envRequiredReviewers', 'attestations', 'codeScanning', 'keylessSigningAllowed',
+];
+/** The whys of rows GitHub's rate limit left unknown (pipegen's own text). */
+export const RATE_WHY = {
+  context: "pipegen couldn't check this: GitHub's rate limit kept it from reading this repo's default branch and settings, and the answer depends on them.",
+  caps: "pipegen couldn't check this: GitHub's rate limit kept it from asking what GitHub allows here, and the answer depends on it.",
+  applies: "pipegen couldn't tell whether this check applies here: it depends on what GitHub allows for this repo, which GitHub's rate limit kept it from reading.",
+} as const;
+
+/** One row per need of either world: the row when both worlds agree on it, else unknown with RATE_WHY. */
+function bothWorlds(hi: readonly Coverage[], lo: readonly Coverage[], contextUnread: boolean): Coverage[] {
+  const loBy = new Map(lo.map((r) => [needKey(r.need), r]));
+  const hiKeys = new Set(hi.map((r) => needKey(r.need)));
+  const why = contextUnread ? RATE_WHY.context : RATE_WHY.caps;
+  const alike = (a: Coverage, b: Coverage) => a.status === b.status && a.why === b.why && a.by === b.by && a.where === b.where;
+  const out: Coverage[] = hi.map((h) => {
+    const l = loBy.get(needKey(h.need));
+    if (l === undefined) return { need: h.need, status: 'unknown', why: RATE_WHY.applies };
+    return alike(h, l) ? h : { need: h.need, status: 'unknown', why };
+  });
+  for (const l of lo) if (!hiKeys.has(needKey(l.need))) out.push({ need: l.need, status: 'unknown', why: RATE_WHY.applies });
+  return out;
+}
+
+function unreadFacts(contextUnread: boolean, caps: ReadonlySet<keyof Capabilities>, activityUnread: boolean): GitHubFact[] {
+  const out: GitHubFact[] = [];
+  if (contextUnread) out.push('repo');
+  if (caps.has('branchProtection')) out.push('branch-protection');
+  if (caps.has('environments')) out.push('environments');
+  if (caps.has('deploymentBranchPolicies')) out.push('deployment-branch-policies');
+  if (caps.has('codeScanning')) out.push('code-scanning');
+  if (activityUnread) out.push('activity');
+  return out;
+}
+
+/**
+ * The top warning when GitHub's rate limit was reached: what it means for the report, when the limit resets, and (with
+ * no token) the read-only fine-grained token that lifts it, with its exact permissions (Plan U: "says so plainly and
+ * suggests GITHUB_TOKEN").
+ */
+export function rateLimitWarning(resetAt: number | null, nowMs: number, anonymous: boolean, repo: string, timeZone?: string): string {
+  const head = "GitHub's rate limit was reached, so pipegen couldn't read everything it needs from GitHub. "
+    + 'The checks that depend on it show as unknown (couldn\'t check), never as covered or missing. '
+    + `${resetText(resetAt, nowMs, timeZone)} `;
+  return head + (anonymous
+    ? `Without a token GitHub allows 60 requests an hour. For a full check, ${readOnlyTokenHint(repo)}`
+    : 'This limit counts the requests made with your token; run the audit again after it resets.');
 }
 
 // ---------- the local-only audit (GitHub not read) ----------
@@ -467,10 +595,12 @@ function supportOf(p: RepoProfile): AuditSupport {
 }
 
 /** mapCoverage, or every need `unknown` with a plain note when it fails (the tool signatures can't be loaded). */
-async function coverageOf(p: RepoProfile, needs: Need[], dir: string, skippedWorkflows: number, notes: Notes, capabilities: Capabilities): Promise<Coverage[]> {
+async function coverageOf(
+  p: RepoProfile, needs: Need[], dir: string, skippedWorkflows: number, notes: Notes, capabilities: Capabilities, branchGuess?: 'widest' | 'narrowest',
+): Promise<Coverage[]> {
   try {
     // Plan P Task 3 (PS16): the capabilities too, so an action this repo can't use is never read as covered
-    return await mapCoverage(p, needs, dir, { skippedWorkflows, noImage: (need) => buildsNoImage(need, p), capabilities });
+    return await mapCoverage(p, needs, dir, { skippedWorkflows, noImage: (need) => buildsNoImage(need, p), capabilities, ...(branchGuess === undefined ? {} : { branchGuess }) });
   } catch (e) {
     const why = e instanceof Error ? e.message.split('\n')[0] : 'unknown error';
     notes.add(`pipegen couldn't load its list of tool signatures, so it can't tell which checks your workflows already run (${why}).`);
@@ -534,6 +664,7 @@ function limitsOf(p: RepoProfile, caps: Capabilities): string[] {
 
 /** The last 30 days of pushes and pull requests, or null when GitHub won't say (rate limit, no access, bad answer). */
 async function activityOf(deps: AuditDeps, p: RepoProfile): Promise<Activity | null> {
+  if (rateStopOf(deps.budget, deps.now()) !== null) return null; // GitHub's rate limit was hit: nothing more is asked (DoD run)
   try {
     return await activity30d(deps.gh, p, { budget: deps.budget, now: deps.now, ...(deps.sleep === undefined ? {} : { sleep: deps.sleep }) });
   } catch {

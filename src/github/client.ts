@@ -349,6 +349,16 @@ export function readAccessSteps(owner: string, repo: string): string {
 }
 
 /**
+ * DoD run 2026-10-29: the read-only token that lifts the anonymous rate limit (60 requests an hour; 5,000 with a
+ * token), with exactly the permissions the audit reads with (permissionsTable('read')).
+ */
+export function readOnlyTokenHint(repo: string): string {
+  const perms = permissionsTable('read').map((p) => p.permission).join(', ');
+  return `set GITHUB_TOKEN to a read-only fine-grained token for this one repo (${FG_PAGE}; Repository access: Only select repositories → `
+    + `${safeText(repo, 100)}) with ${perms}. Every one of them is read-only; GitHub then allows 5,000 requests an hour.`;
+}
+
+/**
  * No token, and GitHub doesn't show the repo to anonymous callers (Plan U ruling S22): a 404 can't tell a private repo
  * from a missing one, so the message says both, then how to give read access.
  */
@@ -607,7 +617,8 @@ const planOf = (data: unknown): Plan => {
  * organisation's plan only to its members, so the answer would be 'unknown' anyway (one request less per run).
  */
 export async function readGitHubContext(
-  gh: Octokit, owner: string, repo: string, login: string | null, clock: RateClock = clockOf(gh), notes?: string[], opts: { known?: unknown } = {},
+  gh: Octokit, owner: string, repo: string, login: string | null, clock: RateClock = clockOf(gh), notes?: string[],
+  opts: { known?: unknown; planRateStop?: 'unknown' } = {},
 ): Promise<Pick<RepoProfile, 'private' | 'ownerType' | 'plan' | 'defaultBranch'>> {
   checkRepoNames(owner, [repo]);
   let data: { private?: unknown; default_branch?: unknown; owner?: { type?: unknown }; full_name?: unknown };
@@ -638,8 +649,11 @@ export async function readGitHubContext(
     try {
       plan = planOf((await withRateLimit(call, clock)).data);
     } catch (e) {
-      if (isRateStop(e)) throw e;
-      if (rejectedOn(gh, e)) throw tokenRejected();
+      // DoD run 2026-10-29: the audit asks for planRateStop 'unknown': the repo's facts are read, so a rate stop on
+      // the plan alone leaves the plan unknown (as for any other failure) and the run goes on
+      if (isRateStop(e) && opts.planRateStop === undefined) throw e;
+      if (isRateStop(e)) notes?.push("Couldn't check the account's GitHub plan: GitHub's rate limit was reached.");
+      else if (rejectedOn(gh, e)) throw tokenRejected();
       plan = 'unknown';
     }
   };

@@ -13,8 +13,13 @@ const RESET_MARGIN_MS = 1_000;
 export const DEFAULT_RATE_BUDGET_MS = 120_000;
 export const BUDGET_SPENT_MESSAGE = 'GitHub rate limit: stopped waiting.';
 
-/** What is left of a run's total wait budget; whoever holds the object shares it. */
-export interface RateBudget { remainingMs: number }
+/**
+ * What is left of a run's total wait budget; whoever holds the object shares it. `stopped` (DoD run 2026-10-29): the
+ * run's rate stop (the one with the latest reset), so the caller can say the limit was hit and when it resets, and can
+ * skip its own further calls (rateStopOf). withRateLimit itself still sends every call: GitHub's search API has its
+ * own limit, so a stop on one call says nothing certain about the next.
+ */
+export interface RateBudget { remainingMs: number; stopped?: GitHubRateLimitError }
 /** `budget`: the run's wait budget, created once per run by the caller (newRateBudget) and shared by every call. */
 export interface RateClock { sleep?: (ms: number) => Promise<void>; now?: () => number; budget: RateBudget }
 
@@ -26,11 +31,35 @@ export function newRateBudget(ms: number = DEFAULT_RATE_BUDGET_MS): RateBudget {
 export class GitHubRateLimitError extends Error {
   /** True when the run's total wait budget is spent (rather than one reset being too far away). */
   readonly budgetSpent: boolean;
-  constructor(message: string, options?: { cause?: unknown; budgetSpent?: boolean }) {
+  /** When GitHub accepts requests again (ms since epoch), from x-ratelimit-reset or retry-after; null when it didn't say. */
+  readonly resetAt: number | null;
+  constructor(message: string, options?: { cause?: unknown; budgetSpent?: boolean; resetAt?: number | null }) {
     super(message, options);
     this.name = 'GitHubRateLimitError';
     this.budgetSpent = options?.budgetSpent ?? false;
+    this.resetAt = options?.resetAt ?? null;
   }
+}
+
+/** The run's rate stop, while its reset time hasn't passed (a stop without a reset time lasts for the run). */
+export function rateStopOf(budget: RateBudget, nowMs: number = Date.now()): GitHubRateLimitError | null {
+  const s = budget.stopped;
+  if (s === undefined) return null;
+  return s.resetAt === null || nowMs < s.resetAt ? s : null;
+}
+
+/**
+ * When GitHub's limit resets, in plain words (DoD run 2026-10-29). The time is rounded UP to the next minute and the
+ * minutes are rounded up too, so pipegen never says the limit resets sooner than GitHub said. `timeZone`: for tests;
+ * default the machine's own time zone.
+ */
+export function resetText(resetAt: number | null, nowMs: number, timeZone?: string): string {
+  if (resetAt === null) return "GitHub didn't say when its limit resets.";
+  const mins = Math.max(1, Math.ceil((resetAt - nowMs) / 60_000));
+  const shown = new Date(Math.ceil(resetAt / 60_000) * 60_000);
+  const parts = new Intl.DateTimeFormat('en-GB', { hour: '2-digit', minute: '2-digit', hourCycle: 'h23', timeZoneName: 'short', ...(timeZone === undefined ? {} : { timeZone }) }).formatToParts(shown);
+  const part = (t: string) => parts.find((x) => x.type === t)?.value ?? '';
+  return `GitHub's limit resets by ${part('hour')}:${part('minute')} ${part('timeZoneName')} (your local time), within ${mins} ${mins === 1 ? 'minute' : 'minutes'}.`;
 }
 
 /**
@@ -70,32 +99,44 @@ export function rateLimitWaitMs(err: unknown, nowMs: number): number | undefined
   return Math.max(0, Number(reset) * 1000 - nowMs);
 }
 
-function limitError(waitMs: number, cause: unknown): GitHubRateLimitError {
+function limitError(waitMs: number, cause: unknown, nowMs: number): GitHubRateLimitError {
   const when = Number.isFinite(waitMs) ? `in about ${Math.max(1, Math.ceil(waitMs / 60_000))} minutes` : 'later';
-  return new GitHubRateLimitError(`GitHub's rate limit was reached; it resets ${when}.`, { cause });
+  return new GitHubRateLimitError(`GitHub's rate limit was reached; it resets ${when}.`, { cause, resetAt: Number.isFinite(waitMs) ? nowMs + waitMs : null });
 }
 
-/** Runs one GitHub call; on a rate limit that resets within 60 s (and fits the run's budget), waits and retries it once. */
+/** Records the run's first rate stop on its budget (rateStopOf), then returns it to throw. */
+function stop(budget: RateBudget, e: GitHubRateLimitError): GitHubRateLimitError {
+  budget.stopped ??= e;
+  if (budget.stopped !== e && (budget.stopped.resetAt ?? Infinity) < (e.resetAt ?? Infinity)) budget.stopped = e; // the later reset wins
+  return e;
+}
+
+/**
+ * Runs one GitHub call; on a rate limit that resets within 60 s (and fits the run's budget), waits and retries it once.
+ * Every rate stop it throws is recorded on the budget (`stopped`).
+ */
 export async function withRateLimit<T>(call: () => Promise<T>, clock: RateClock): Promise<T> {
   const sleep = clock.sleep ?? realSleep;
   const now = clock.now ?? Date.now;
+  const budget = clock.budget;
   try {
     return await call();
   } catch (e) {
-    const wait = rateLimitWaitMs(e, now());
+    const t = now();
+    const wait = rateLimitWaitMs(e, t);
     if (wait === undefined) throw e;
-    if (wait > MAX_RATE_WAIT_MS) throw limitError(wait, e);
-    const budget = clock.budget;
+    if (wait > MAX_RATE_WAIT_MS) throw stop(budget, limitError(wait, e, t));
     const cost = wait + RESET_MARGIN_MS;
-    if (!(cost <= budget.remainingMs)) throw new GitHubRateLimitError(BUDGET_SPENT_MESSAGE, { cause: e, budgetSpent: true });
+    if (!(cost <= budget.remainingMs)) throw stop(budget, new GitHubRateLimitError(BUDGET_SPENT_MESSAGE, { cause: e, budgetSpent: true, resetAt: t + wait }));
     budget.remainingMs -= cost;
     await sleep(cost);
   }
   try {
     return await call();
   } catch (e) {
-    const wait = rateLimitWaitMs(e, now());
+    const t = now();
+    const wait = rateLimitWaitMs(e, t);
     if (wait === undefined) throw e;
-    throw limitError(wait, e);
+    throw stop(budget, limitError(wait, e, t));
   }
 }

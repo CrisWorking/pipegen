@@ -153,7 +153,25 @@ export function scheduleFires(on: unknown): boolean {
   });
 }
 
-export function fitOf(events: Map<string, Obj>, defaultBranch: string, deploys: boolean, scheduleLive = true): Fit {
+/**
+ * DoD run 2026-10-29: the default branch when GitHub couldn't be read (rate limit). `widest`: every branch filter that
+ * can let some branch through lets the default branch through; `narrowest`: only a trigger without a branch filter
+ * does. The real answer lies between the two, so a row both give alike doesn't depend on the default branch.
+ */
+export interface BranchGuess { guess: 'widest' | 'narrowest' }
+
+/** Whether `cfg`'s branch filter lets the default branch through (the real name, or a BranchGuess bound). */
+function takesDefault(cfg: Obj, defaultBranch: string | BranchGuess, tagOnly = false): boolean {
+  if (tagOnly) return false;
+  if (typeof defaultBranch === 'string') return branchFilter(cfg)(defaultBranch);
+  const hasB = isSet(cfg, 'branches');
+  const hasBi = isSet(cfg, 'branches-ignore');
+  if (hasB && hasBi) return false;
+  if (!hasB && !hasBi) return true;
+  return defaultBranch.guess === 'widest';
+}
+
+export function fitOf(events: Map<string, Obj>, defaultBranch: string | BranchGuess, deploys: boolean, scheduleLive = true): Fit {
   let everyPush = false;
   let pushDefault = false;
   let pushTags = false;
@@ -164,11 +182,11 @@ export function fitOf(events: Map<string, Obj>, defaultBranch: string, deploys: 
     // A push trigger with only a tag filter never runs for branch pushes.
     const includes = !branchesSet && pushTags ? () => false : branchFilter(push);
     everyPush = FEATURE_BRANCHES.every(includes);
-    pushDefault = includes(defaultBranch);
+    pushDefault = takesDefault(push, defaultBranch, !branchesSet && pushTags);
   }
   const pr = events.get('pull_request');
   const types = pr ? strs(pr.types) : [];
-  const merge = pr !== undefined && !pathFiltered(pr) && branchFilter(pr)(defaultBranch) && (types.length === 0 || types.includes('synchronize'));
+  const merge = pr !== undefined && !pathFiltered(pr) && takesDefault(pr, defaultBranch) && (types.length === 0 || types.includes('synchronize'));
   // Plan P Task 3: a scheduled check runs on `schedule`, or on every push to the default branch (no paths filter)
   return { push: everyPush, merge, deploy: deploys || pushDefault || pushTags || events.has('release'), scheduled: (events.has('schedule') && scheduleLive) || pushDefault };
 }

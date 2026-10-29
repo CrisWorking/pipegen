@@ -99,3 +99,40 @@ describe('github rate limit', () => {
     expect(MAX_RATE_WAIT_MS).toBe(60_000);
   });
 });
+
+// DoD run 2026-10-29: the audit must say when GitHub's limit resets (x-ratelimit-reset), and stop asking once it is hit.
+describe('github rate limit: reset time and stop (DoD)', () => {
+  it('githubRate: the error carries the reset time from x-ratelimit-reset, or from retry-after', async () => {
+    const { gh } = fakeOctokit({ 'GET https://api.github.com/repos/o/r': limited(3300) });
+    const clock = fakeClock();
+    const e = await withRateLimit(() => gh.rest.repos.get({ owner: 'o', repo: 'r' }), clock).catch((x: unknown) => x);
+    expect(e).toBeInstanceOf(GitHubRateLimitError);
+    expect((e as GitHubRateLimitError).resetAt).toBe((Math.floor(NOW / 1000) + 3300) * 1000);
+    const { gh: gh2 } = fakeOctokit({ 'GET https://api.github.com/repos/o/r': { status: 429, body: { message: 'slow down' }, headers: { 'retry-after': '600' } } });
+    const e2 = await withRateLimit(() => gh2.rest.repos.get({ owner: 'o', repo: 'r' }), fakeClock()).catch((x: unknown) => x);
+    expect((e2 as GitHubRateLimitError).resetAt).toBe(NOW + 600_000);
+    const { gh: gh3 } = fakeOctokit({ 'GET https://api.github.com/repos/o/r': { status: 403, body: { message: 'limit' }, headers: { 'x-ratelimit-remaining': '0' } } });
+    const e3 = await withRateLimit(() => gh3.rest.repos.get({ owner: 'o', repo: 'r' }), fakeClock()).catch((x: unknown) => x);
+    expect((e3 as GitHubRateLimitError).resetAt).toBeNull();
+  });
+
+  it('githubRate: a stop is recorded on the run budget, and rateStopOf gives it until the reset', async () => {
+    const { rateStopOf } = await import('../src/engine/github-rate.js');
+    const { gh } = fakeOctokit({ 'GET https://api.github.com/repos/o/r': limited(3300) });
+    const clock = fakeClock();
+    expect(rateStopOf(clock.budget, NOW)).toBeNull();
+    const first = await withRateLimit(() => gh.rest.repos.get({ owner: 'o', repo: 'r' }), clock).catch((x: unknown) => x);
+    expect(clock.budget.stopped).toBe(first);
+    expect(rateStopOf(clock.budget, NOW + 60_000)).toBe(first);
+    expect(rateStopOf(clock.budget, NOW + 3_400_000)).toBeNull(); // past the reset
+  });
+
+  it('githubRate: resetText rounds the time up to the minute and never says sooner than GitHub', async () => {
+    const { resetText } = await import('../src/engine/github-rate.js');
+    const now = Date.UTC(2026, 9, 29, 4, 12, 10);
+    // reset at 05:07:31 UTC: shown as 05:08, within 56 minutes (55 min 21 s, rounded up)
+    expect(resetText(Date.UTC(2026, 9, 29, 5, 7, 31), now, 'UTC')).toBe("GitHub's limit resets by 05:08 UTC (your local time), within 56 minutes.");
+    expect(resetText(now + 20_000, now, 'UTC')).toBe("GitHub's limit resets by 04:13 UTC (your local time), within 1 minute.");
+    expect(resetText(null, now, 'UTC')).toBe("GitHub didn't say when its limit resets.");
+  });
+});

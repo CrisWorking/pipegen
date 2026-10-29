@@ -5,8 +5,11 @@
 // Flow (ruling B1): readProject (owner/repo) → getAuth({ mode: 'read' }) → makeOctokit(token or null, per-request
 // timeout) → GET /user only with a token → readGitHubContext (reusing getAuth's anonymous GET /repos, M6) → probeCapabilities → buildAudit with the full run's
 // permissions (permissionsTable('write', …)), ONE rate budget for every GitHub call of the run (S18).
-// - GitHub can't be read (no access, a refused token, no answer, a rate stop): only what is on disk is reported, with
+// - GitHub can't be read (no access, a refused token, no answer): only what is on disk is reported, with
 //   "GitHub: not read", and the exit code is 1 (the inspect R10 rule). No GitHub fact is guessed.
+// - GitHub's rate limit stops the reads (DoD run 2026-10-29): the full report from the files, what GitHub answered
+//   kept, every check that needed the rest unknown, a top warning with the reset time (and the read-only token that
+//   lifts the anonymous limit), `githubIncomplete` in --json, exit code 3.
 // - The reviewed tool list can't be used (B3: the release build refuses it while entries wait for review): the audit
 //   runs with no reviewed tools and a warning at the top, exit 0.
 // - `--ai`: everything that can refuse it is checked first, before any GitHub call (S21 platform, PIPEGEN_SECRET_SCANNER,
@@ -26,7 +29,7 @@ import { countingSummary } from '../audit/consent-token.js';
 import { writeOutFile, OutFileError } from '../audit/out-file.js';
 import { addAiSuggestions, buildAudit, buildLocalAudit, needsRequestBytes, type AuditReport } from '../audit/model.js';
 import { renderJson, renderLocalJson, renderLocalTerminal, renderMarkdown, renderTerminal, type RenderOptions } from '../audit/render.js';
-import { isRateStop, newRateBudget, type RateClock } from '../engine/github-rate.js';
+import { isRateStop, newRateBudget, rateStopOf, type RateClock } from '../engine/github-rate.js';
 import { loadPinnedBinaries, PinnedBinaryError, PLATFORM_KEYS } from '../engine/linters.js';
 import { openMemory } from '../engine/memory.js';
 import { loadQualityBar, type QualityBar } from '../engine/quality-bar.js';
@@ -75,10 +78,24 @@ export const reviewedUnavailableWarning = (why: string) =>
 const EXTRA_NEEDS_MARGIN = 2;
 
 type GitHubContext = Pick<RepoProfile, 'private' | 'ownerType' | 'plan' | 'defaultBranch'>;
-interface GitHubRead { auth: Auth; gh: Octokit; context: GitHubContext; caps: Capabilities }
+/**
+ * `context` null and `unread`: what GitHub's rate limit kept the run from reading (DoD run 2026-10-29); `caps` is then
+ * a placeholder for the unread capabilities.
+ */
+interface GitHubRead { auth: Auth; gh: Octokit; context: GitHubContext | null; caps: Capabilities; unread: (keyof Capabilities)[] }
+/** The capabilities when none could be read (a placeholder: buildAudit treats every one as unread). */
+const NO_CAPABILITIES: Capabilities = {
+  branchProtection: false, environments: false, deploymentBranchPolicies: false, envRequiredReviewers: false, attestations: false, codeScanning: false, keylessSigningAllowed: false,
+};
+/** `pipegen audit`'s exit code when the report is complete from the files but GitHub's rate limit left GitHub facts unread. */
+export const EXIT_INCOMPLETE = 3;
 interface AiReady { provider: AiProvider; secretScanner: Pick<SecretScanner, 'name' | 'version'>; bar: QualityBar }
 
-/** Runs `pipegen audit`. 0: a report was printed (also with the reviewed list unusable); 1: a refusal or an error. */
+/**
+ * Runs `pipegen audit`. 0: a report was printed (also with the reviewed list unusable); 1: a refusal or an error (also
+ * GitHub not read at all: no access, a refused token, no answer); 3 (EXIT_INCOMPLETE): a report was printed, but
+ * GitHub's rate limit left some GitHub facts unread, so the checks that need them are unknown.
+ */
 export async function audit(io: CliIO, flags: AuditFlags): Promise<number> {
   const cwd = io.cwd ?? process.cwd();
   const knownValues: string[] = knownValuesFrom(io.env); // the token and the AI keys (S19), never printed nor sent
@@ -124,19 +141,38 @@ export async function audit(io: CliIO, flags: AuditFlags): Promise<number> {
     }
     const { owner, repo } = local;
 
-    // 3. GitHub, read-only, one rate budget for the whole run (S18)
+    // 3. GitHub, read-only, one rate budget for the whole run (S18). DoD run 2026-10-29 (Plan U: "discovery stops
+    //    early, keeping what passed"): a rate stop at any point keeps what was read and goes on from the files; the
+    //    report marks every check that needed the rest as unknown and exits EXIT_INCOMPLETE. Other failures are unchanged.
     const clock: RateClock = { budget: newRateBudget() };
     let github: GitHubRead;
     try {
       const repoAnswer: { data?: unknown } = {}; // getAuth's anonymous GET /repos, reused below (review M6)
-      const auth = await getAuth({ owner, repos: [repo], allowBroad: flags.allowBroad, mode: 'read' }, { env: io.env, fetch: io.fetch, clock, notes, repoAnswer });
+      let auth: Auth;
+      try {
+        auth = await getAuth({ owner, repos: [repo], allowBroad: flags.allowBroad, mode: 'read' }, { env: io.env, fetch: io.fetch, clock, notes, repoAnswer });
+      } catch (e) {
+        // only the anonymous check (is the repo public?) asks GitHub before a token is chosen; with a token set, keep
+        // the old behaviour (a GitHub App login can't be confirmed without GitHub)
+        if (!isRateStop(e) || (io.env.GITHUB_TOKEN ?? '').trim() !== '') throw e;
+        auth = { kind: 'anonymous', token: null, repos: [repo], canCreateRepos: false, canDeleteRepos: false };
+      }
       token = auth.token;
       if (auth.token !== null) knownValues.push(auth.token);
       const gh = makeOctokit(auth.token, { fetch: io.fetch, clock, timeoutMs: GITHUB_TIMEOUT_MS, log: fail });
-      const login = await tokenLogin(gh, auth, clock, notes);
-      const context = await readGitHubContext(gh, owner, repo, login, clock, notes, { known: repoAnswer.data });
-      const caps = await probeCapabilities(gh, owner, repo, { ...local, ...context }, notes, clock);
-      github = { auth, gh, context, caps };
+      let context: GitHubContext | null = null;
+      let caps: Capabilities = NO_CAPABILITIES;
+      const unread = new Set<keyof Capabilities>();
+      try {
+        // after a rate stop in getAuth nothing more is asked (an anonymous run has 60 requests an hour)
+        if (rateStopOf(clock.budget) !== null) throw clock.budget.stopped;
+        const login = await tokenLogin(gh, auth, clock, notes);
+        context = await readGitHubContext(gh, owner, repo, login, clock, notes, { known: repoAnswer.data, planRateStop: 'unknown' });
+        caps = await probeCapabilities(gh, owner, repo, { ...local, ...context }, notes, clock, { onRateStop: (keys) => { for (const k of keys) unread.add(k); } });
+      } catch (e) {
+        if (!isRateStop(e)) throw e;
+      }
+      github = { auth, gh, context, caps, unread: [...unread] };
     } catch (e) {
       if (!(e instanceof GitHubAccessError) && !isRateStop(e)) throw e;
       // a token that can't see the repo: the same read-only steps as without one (never `gh auth login`)
@@ -159,7 +195,7 @@ export async function audit(io: CliIO, flags: AuditFlags): Promise<number> {
     const anonymous = github.auth.kind === 'anonymous';
     const counted = await bundleCode(dir, { knownValues });
     let r: AuditReport = await buildAudit(dir, {
-      gh: github.gh, anonymous, context: github.context, capabilities: github.caps,
+      gh: github.gh, anonymous, context: github.context, capabilities: github.caps, unreadCapabilities: github.unread,
       permissions: permissionsTable('write', { appCreatesRepos: github.auth.canCreateRepos }),
       reviewed, reviewedUnavailable: reviewedProblem !== null, now: Date.now, notes, budget: clock.budget, bundle: counted,
     });
@@ -202,6 +238,10 @@ export async function audit(io: CliIO, flags: AuditFlags): Promise<number> {
         return 1;
       }
       fail(`The Markdown report was written to ${clean(resolve(cwd, flags.out), OUTPUT_CAP.path)}.`);
+    }
+    if (r.githubIncomplete !== null) {
+      fail(`GitHub's rate limit was reached: the report is complete from the files, but the checks that needed GitHub show as unknown (see the warning at the top). exit code ${EXIT_INCOMPLETE}.`);
+      return EXIT_INCOMPLETE;
     }
     return 0;
   }

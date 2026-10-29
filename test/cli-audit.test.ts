@@ -1080,3 +1080,105 @@ describe('pipegen audit --ai (P45 addendum: a name longer than the scanner saw i
     }
   });
 });
+
+// DoD run 2026-10-29: GitHub's rate limit (anonymous 60 an hour) made `audit` exit 1 with no report. Plan U's promise:
+// the audit completes from the local files, says plainly that the limit was hit and when it resets, and suggests a
+// read-only GITHUB_TOKEN. Every check that needed GitHub is unknown, never covered and never missing. Exit code 3.
+describe('GitHub rate limit (DoD)', () => {
+  const resetSec = () => Math.floor(Date.now() / 1000) + 3300;
+  const limited403 = (reset: number): Reply => ({ status: 403, body: { message: 'API rate limit exceeded for 203.0.113.9.' }, headers: { 'x-ratelimit-remaining': '0', 'x-ratelimit-limit': '60', 'x-ratelimit-reset': String(reset) } });
+  const limited429 = (): Reply => ({ status: 429, body: { message: 'You have exceeded a secondary rate limit.' }, headers: { 'retry-after': '3300' } });
+  // the push trigger is limited to main (partial on every push, whatever the default branch); the pull request
+  // trigger targets main, which is covered only if main is the default branch
+  const CI = 'on:\n  push:\n    branches: [main]\n  pull_request:\n    branches: [main]\njobs:\n  t:\n    runs-on: ubuntu-latest\n    steps:\n      - run: npm test\n';
+  const READ_PERMS = 'Metadata: read, Pull requests: read, Actions: read, Code scanning alerts: read';
+  type J = { githubIncomplete: { reason: string; resetsAt: string | null; unread: string[]; rows: number } | null; coverage: { need: { id: string; layer: string }; status: string; why: string }[]; profile: Record<string, unknown> };
+  const cov = (j: J, layer: string, id: string) => j.coverage.find((c) => c.need.layer === layer && c.need.id === id);
+
+  it('rate limit at the first call (anonymous): full report from the files, unknown where GitHub was needed, reset time, token hint, exit 3', async () => {
+    const dir = repo({ '.github/workflows/ci.yml': CI });
+    const reset = resetSec();
+    const routes = publicRoutes({ [`GET ${R}`]: limited403(reset) });
+    const r = await audit(['audit'], { cwd: dir, routes });
+    expect(r.code).toBe(3);
+    expect(r.out).toContain('Verdict:');
+    expect(r.out).toContain('Checks by layer');
+    const flatOut = r.out.replace(/\n {2,}/g, ' ');
+    expect(flatOut).toContain("GitHub's rate limit was reached, so pipegen couldn't read everything it needs from GitHub.");
+    expect(flatOut).toMatch(/GitHub's limit resets by \d\d:\d\d \S+ \(your local time\), within 5[56] minutes\./);
+    expect(flatOut).toContain(`set GITHUB_TOKEN to a read-only fine-grained token for this one repo`);
+    expect(flatOut).toContain(READ_PERMS);
+    expect(flatOut).not.toMatch(/Repo: (public|private)/);
+    expect(r.err).toContain('exit code 3');
+    // one request, then nothing more is asked of GitHub
+    expect(r.calls.filter((c) => c.url.origin === API)).toHaveLength(1);
+
+    const j = JSON.parse((await audit(['audit', '--json'], { cwd: dir, routes })).out) as J;
+    expect(j.githubIncomplete).toMatchObject({ reason: 'github-rate-limit', resetsAt: new Date(reset * 1000).toISOString() });
+    expect(j.githubIncomplete?.unread).toEqual(expect.arrayContaining(['repo', 'branch-protection', 'environments', 'code-scanning', 'activity']));
+    expect(j.profile.private).toBeNull();
+    expect(j.profile.defaultBranch).toBeNull();
+    // depends on the default branch: unknown, saying why; on every push (any branch) it is a real partial
+    expect(cov(j, 'merge', 'unit-tests')).toMatchObject({ status: 'unknown' });
+    expect(cov(j, 'merge', 'unit-tests')?.why).toMatch(/GitHub's rate limit/);
+    expect(cov(j, 'push', 'unit-tests')?.status).toBe('partial');
+    // a check that needs nothing from GitHub keeps its answer
+    expect(cov(j, 'pre-commit', 'hooks')?.status).toBe('missing');
+    expect(j.githubIncomplete?.rows).toBe(j.coverage.filter((c) => /GitHub's rate limit/.test(c.why)).length);
+    expect(j.githubIncomplete!.rows).toBeGreaterThan(0);
+
+    // --out writes the report, warning first
+    const work = makeTempDir();
+    const o = await audit(['audit', '--dir', dir, '--out', 'r.md'], { cwd: work, routes });
+    expect(o.code).toBe(3);
+    const md = readFileSync(join(work, 'r.md'), 'utf8');
+    expect(md).toContain("GitHub's rate limit was reached");
+    expect(md).toContain(READ_PERMS);
+  });
+
+  it('rate limit mid-run (403 at environments, then 429): what was read stays, the rest is unknown; the default branch is known', async () => {
+    const dir = repo({ '.github/workflows/ci.yml': CI });
+    for (const limitedReply of [limited403(resetSec()), limited429()]) {
+      const routes = publicRoutes({ [`GET ${R}/environments`]: limitedReply });
+      const r = await audit(['audit', '--json'], { cwd: dir, routes });
+      expect(r.code).toBe(3);
+      const j = JSON.parse(r.out) as J;
+      expect(j.githubIncomplete?.unread).toEqual(expect.arrayContaining(['environments', 'code-scanning', 'activity']));
+      expect(j.githubIncomplete?.unread).not.toContain('repo');
+      expect(j.githubIncomplete?.unread).not.toContain('branch-protection');
+      expect(j.profile).toMatchObject({ private: false, defaultBranch: 'main' });
+      expect(cov(j, 'merge', 'unit-tests')?.status).toBe('covered'); // the default branch was read: a real answer
+      // no request after the stop
+      const asked = r.calls.filter((c) => c.url.origin === API).map((c) => c.url.pathname);
+      expect(asked).toEqual(['/repos/o/r', '/repos/o/r/rulesets', '/repos/o/r/environments']);
+    }
+  });
+
+  it('rate limit at the last call (activity): every check keeps its answer; the minutes say so; still exit 3', async () => {
+    const dir = repo({ '.github/workflows/ci.yml': CI });
+    const full = JSON.parse((await audit(['audit', '--json'], { cwd: dir })).out) as J;
+    const r = await audit(['audit', '--json'], { cwd: dir, routes: publicRoutes({ [`GET ${R}/events`]: limited403(resetSec()) }) });
+    expect(r.code).toBe(3);
+    const j = JSON.parse(r.out) as J;
+    expect(j.githubIncomplete).toMatchObject({ reason: 'github-rate-limit', unread: ['activity'], rows: 0 });
+    expect(j.coverage).toEqual(full.coverage);
+    expect(full.githubIncomplete).toBeNull();
+  });
+
+  it('rate limit with a token set: the same report and exit 3, no hint to set one; other failures keep exit 1', async () => {
+    const dir = repo({ '.github/workflows/ci.yml': CI });
+    const tok = fake.githubPat();
+    const routes = privateRoutes({ [`GET ${API}/user`]: limited403(resetSec()) });
+    const r = await audit(['audit'], { cwd: dir, routes, env: { [GH_VAR]: tok } });
+    expect(r.code).toBe(3);
+    const flatOut = r.out.replace(/\n {2,}/g, ' ');
+    expect(flatOut).toContain("GitHub's rate limit was reached");
+    expect(flatOut).not.toContain('set GITHUB_TOKEN to');
+    expect(flatOut).toContain('This limit counts the requests made with your token');
+    expect(r.all).not.toContain(tok);
+    // a refused token is not a rate limit: unchanged (exit 1, GitHub not read)
+    const refused = await audit(['audit'], { cwd: dir, routes: privateRoutes({ [`GET ${API}/user`]: err(401, 'Bad credentials') }), env: { [GH_VAR]: tok } });
+    expect(refused.code).toBe(1);
+    expect(refused.out).toContain('GitHub: not read');
+  });
+});

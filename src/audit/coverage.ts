@@ -128,7 +128,7 @@ import { coverageMinimumRow, frameworkAdjust, publishingCoverage, updateConfigCo
 import { DEPLOY_VERIFY_WHY, Dirs, Firsts, GATE_WHY, Scope, ciCoverage, firstPartialHit, hookCoverage, type Decide } from './coverage/decide.js';
 import { hookRunHits, readHooks } from './coverage/hooks.js';
 import { compile, loadToolSignatures } from './coverage/signatures.js';
-import { fitOf, parseOn, scheduleFires } from './coverage/triggers.js';
+import { fitOf, parseOn, scheduleFires, type BranchGuess } from './coverage/triggers.js';
 import type { Compiled, Ctx, Fit, Hit } from './coverage/types.js';
 import { Reader, configFilesPass, releaseEgress, releaseSigns, walkWorkflow } from './coverage/walk.js';
 
@@ -150,6 +150,11 @@ export interface MapCoverageOptions {
    * owner type from the profile) for actions some repos can't use; absent = no code scanning.
    */
   capabilities?: Capabilities;
+  /**
+   * DoD run 2026-10-29: GitHub's rate limit kept pipegen from reading the default branch; p.defaultBranch is then a
+   * placeholder and this bound is used instead (see BranchGuess). The audit maps coverage under both bounds.
+   */
+  branchGuess?: BranchGuess['guess'];
 }
 
 let defaultCompiled: Compiled | undefined;
@@ -195,7 +200,7 @@ export async function mapCoverage(p: RepoProfile, needs: Need[], dir: string, op
     const events = parseOn(on);
     events.delete('workflow_call'); // a reusable workflow runs when it is called; its callers carry it
     if (events.size === 0) continue;
-    const fit = fitOf(events, p.defaultBranch, w.deploys, scheduleFires(on));
+    const fit = fitOf(events, opts.branchGuess === undefined ? p.defaultBranch : { guess: opts.branchGuess }, w.deploys, scheduleFires(on));
     // fix round 2 (ruling P9): it is also a release workflow when it calls a local workflow that deploys or publishes
     // (one level), or when it runs on a deploy trigger and uses a secret other than GITHUB_TOKEN, grants id-token,
     // packages or contents write, or pushes an image (its own signs, or those of the local workflows it calls)

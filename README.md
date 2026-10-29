@@ -94,6 +94,17 @@ npx --registry=https://registry.npmjs.org pipegen@0.1.0 audit --dir ./my-repo --
                           # and asks you (default No)
 ```
 
+Exit codes of `pipegen audit`:
+
+- `0`: the report was printed (and written, with `--out`).
+- `1`: a refusal or an error, including GitHub not readable at all (a private repo without access, a refused token, no
+  answer): only what is on disk is printed, and no `--out` file is written.
+- `3`: the report was printed (and written, with `--out`), but GitHub's rate limit stopped pipegen reading some GitHub
+  facts. Every check that needs them shows as unknown ("couldn't check"), never as covered or missing; the warning at
+  the top says when the limit resets. In `--json`, `githubIncomplete` lists what wasn't read (`unread`), the reset time
+  (`resetsAt`) and how many rows it left unknown (`rows`); it is `null` on a complete run. Without a token GitHub allows
+  60 requests an hour; a read-only fine-grained token with the permissions above allows 5,000.
+
 `audit --ai` needs Linux or macOS for now (WSL works): it checks your code for secrets with a pinned betterleaks binary
 before anything is sent (or gitleaks, the fallback, when `PIPEGEN_SECRET_SCANNER` is set to `gitleaks`), and those
 binaries exist for those systems only.

@@ -36,7 +36,7 @@ import { safeMarkdown } from '../util/safe-text.js';
 import { K8S_FOLDERS } from '../read/quality.js';
 import { COVERAGE_LIMITS, type Coverage } from './coverage.js';
 import {
-  buildsNoImage, isBuiltInNeed, isOwnCommand, needLabel, type AuditAi, type AuditReport, type LocalAudit, type WouldAddRow, type WouldAddTool,
+  buildsNoImage, isBuiltInNeed, isOwnCommand, needLabel, type AuditAi, type GitHubFact, type AuditReport, type LocalAudit, type WouldAddRow, type WouldAddTool,
 } from './model.js';
 
 export interface RenderOptions {
@@ -126,6 +126,10 @@ const CAPABILITY_NAMES: readonly [keyof AuditReport['capabilities'], string][] =
   ['branchProtection', 'merge rules'], ['environments', 'environments'], ['envRequiredReviewers', 'required deploy reviewers'],
   ['attestations', 'artifact attestations'], ['codeScanning', 'code scanning'], ['keylessSigningAllowed', 'keyless signing'],
 ];
+/** The GitHub fact (AuditReport.githubIncomplete.unread) each capability comes from; the rest come from the repo's own facts. */
+const CAPABILITY_FACT: Partial<Record<keyof AuditReport['capabilities'], GitHubFact>> = {
+  branchProtection: 'branch-protection', environments: 'environments', envRequiredReviewers: 'environments', codeScanning: 'code-scanning',
+};
 const PLAN_UNKNOWN = "not known (GitHub shows it only to the account's own token, or to an organisation member)";
 const MAX_TOP_FOLDERS = 10;
 /** Files listed under "secret-like text" in the terminal; Markdown and JSON list them all. */
@@ -313,13 +317,23 @@ function planSection(r: AuditReport, c: Ctx): Section {
   const blocks: Block[] = [];
   // the limits first (Review Focus 3: never "make the repo public")
   for (const l of r.limits) blocks.push(item(c.v(l, OUTPUT_CAP.text), 0, true));
-  if (r.limits.length === 0) blocks.push(text('Nothing here limits the pipeline pipegen would build.'));
-  const available = CAPABILITY_NAMES.filter(([k]) => r.capabilities[k] === true).map(([, name]) => name);
-  blocks.push(text(`Available here: ${available.length === 0 ? 'none of the GitHub features pipegen uses' : available.join(', ')}.`));
+  // DoD run 2026-10-29: what GitHub's rate limit kept pipegen from reading is said, never guessed
+  const gap = r.githubIncomplete;
+  const repoUnread = gap?.unread.includes('repo') === true;
+  const unreadNames = CAPABILITY_NAMES.filter(([k]) => {
+    const fact = CAPABILITY_FACT[k];
+    return repoUnread || (gap !== null && fact !== undefined && gap.unread.includes(fact));
+  }).map(([, name]) => name);
+  if (r.limits.length === 0) blocks.push(text(unreadNames.length > 0 ? "pipegen couldn't check every limit (GitHub's rate limit)." : 'Nothing here limits the pipeline pipegen would build.'));
+  const available = CAPABILITY_NAMES.filter(([k, name]) => r.capabilities[k] === true && !unreadNames.includes(name)).map(([, name]) => name);
+  if (!repoUnread) blocks.push(text(`Available here: ${available.length === 0 ? 'none of the GitHub features pipegen uses' : available.join(', ')}.`));
+  if (unreadNames.length > 0) blocks.push(text(`Couldn't check (GitHub's rate limit): ${unreadNames.join(', ')}.`));
   const p = r.profile;
   const owner = p.ownerType === 'Organization' ? 'an organisation' : 'a user account';
   const plan = p.plan === 'unknown' ? PLAN_UNKNOWN : c.v(p.plan);
-  blocks.push(text(`Repo: ${p.private ? 'private' : 'public'}, owned by ${owner}, GitHub plan: ${plan}.`));
+  blocks.push(text(repoUnread
+    ? "Repo: pipegen couldn't read whether it is public or private, who owns it, its GitHub plan or its default branch (GitHub's rate limit)."
+    : `Repo: ${p.private ? 'private' : 'public'}, owned by ${owner}, GitHub plan: ${plan}.`));
   return { title: 'What your GitHub plan allows', blocks };
 }
 
@@ -738,7 +752,9 @@ function deepClean(v: unknown, key: string, depth: number, own: boolean, clean: 
  * (CANT_SEE: the limits the human report always shows; final review M7).
  */
 export function renderJson(r: AuditReport, opts: RenderOptions): string {
-  const slim = { ...r, wouldAdd: r.wouldAdd.map((w) => ({ ...w, tool: slimTool(w.tool), also: w.also.map(slimTool) })), cantSee: CANT_SEE };
+  // DoD run 2026-10-29: facts GitHub's rate limit kept pipegen from reading are null, never the model's placeholders
+  const profile = r.githubIncomplete?.unread.includes('repo') === true ? { ...r.profile, private: null, ownerType: null, plan: null, defaultBranch: null } : r.profile;
+  const slim = { ...r, profile, wouldAdd: r.wouldAdd.map((w) => ({ ...w, tool: slimTool(w.tool), also: w.also.map(slimTool) })), cantSee: CANT_SEE };
   return JSON.stringify(deepClean(slim, '', 0, false, makeSafeOutput(opts.knownValues, opts.found), new Set()), null, 2);
 }
 

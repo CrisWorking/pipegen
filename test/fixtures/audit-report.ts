@@ -154,6 +154,7 @@ export function freePrivateReport(excludedPatterns: readonly string[]): AuditRep
       "pipegen reads the files on disk without git, so files that aren't committed (for example a local .env) are in this list too.",
     ],
     reviewedUnavailable: false,
+    githubIncomplete: null,
   };
 }
 
