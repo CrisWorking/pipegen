@@ -1026,6 +1026,14 @@ describe('the quick secret check says what it does and does not look for (hand c
     }
   });
 
+  it('report (P57 M6): Markdown shows pipegen\'s own `name = value` as code, not as escaped backticks', () => {
+    for (const r of [report(), quiet()]) {
+      const out = md(r);
+      expect(out).not.toContain('\\`name = value\\`');
+      expect(out).toContain("It doesn't look for `name = value` lines");
+    }
+  });
+
   it('report: JSON carries the scope next to secretsInTree, also when nothing was found', () => {
     for (const r of [report(), quiet()]) {
       const j = (JSON.parse(json(r)) as Record<typeof CHECK, { kind: string; looksFor: string; doesNotLookFor: string; fullScans: string }>)[CHECK];

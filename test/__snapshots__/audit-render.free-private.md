@@ -12,8 +12,8 @@ Audited on 2026-10-27. pipegen changed nothing in the repo or on GitHub. You ran
   - .env: generic-api-key (never sent to the AI; check it isn't committed)
   - config/dev.json: aws-access-key, private-key
   - This check looks for private keys, a few known token formats (AWS, GitHub, Slack, Stripe, Google and npm tokens, and sk- API keys), JWTs, passwords inside connection strings, and file names that look like a secret.
-  - It doesn't look for \`name = value\` lines, such as an API key or a password set in code, in a config file or in a .env file (in a .env file only a password inside a connection string is found), and any token format not listed. So this is not a secret scan: finding nothing here does not mean the repo holds no secrets.
-  - \`pipegen audit --ai\` runs a full secret scanner (betterleaks, or gitleaks) on the files it would send, before anything is sent; the pipeline pipegen sets up (v0.2) runs betterleaks or gitleaks on every push and pull request.
+  - It doesn't look for `name = value` lines, such as an API key or a password set in code, in a config file or in a .env file (in a .env file only a password inside a connection string is found), and any token format not listed. So this is not a secret scan: finding nothing here does not mean the repo holds no secrets.
+  - `pipegen audit --ai` runs a full secret scanner (betterleaks, or gitleaks) on the files it would send, before anything is sent; the pipeline pipegen sets up (v0.2) runs betterleaks or gitleaks on every push and pull request.
 - ⚠ This repo could change which pipegen runs. Run pipegen from outside the repo, from the npm registry, with:
   ```sh
   npx --registry=https://registry.npmjs.org pipegen@0.1.0 audit --dir ./repo

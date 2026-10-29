@@ -297,10 +297,12 @@ function groupByService<T extends { need: Need }>(c: Ctx, items: readonly T[], k
  */
 function secretScopeItems(r: Pick<AuditReport, 'secretCheck'>, c: Ctx, depth: number): Block[] {
   const s = r.secretCheck ?? SECRET_CHECK;
+  // P57 (M6): pipegen's own code spans (`name = value`) stay code in Markdown; the text around them is cleaned as before
+  const own = (t: string) => (c.target !== 'markdown' ? c.own(t) : c.own(t).replace(/\\`([A-Za-z0-9 =._-]{1,40})\\`/g, '`$1`'));
   return [
-    item(`This check looks for ${c.own(s.looksFor)}`, depth),
-    item(`It doesn't look for ${c.own(s.doesNotLookFor)}`, depth),
-    item(c.own(s.fullScans), depth),
+    item(`This check looks for ${own(s.looksFor)}`, depth),
+    item(`It doesn't look for ${own(s.doesNotLookFor)}`, depth),
+    item(own(s.fullScans), depth),
   ];
 }
 
