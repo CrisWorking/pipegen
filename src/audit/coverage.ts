@@ -145,7 +145,7 @@ import { hookRunHits, readHooks } from './coverage/hooks.js';
 import { compile, loadToolSignatures } from './coverage/signatures.js';
 import { fitOf, parseOn, scheduleFires, type BranchGuess } from './coverage/triggers.js';
 import type { Compiled, Ctx, Fit, Hit } from './coverage/types.js';
-import { Reader, configFilesPass, releaseEgress, releaseSigns, walkWorkflow } from './coverage/walk.js';
+import { Reader, configFilesPass, releaseEgress, releaseSigns, scopeToPaths, walkWorkflow } from './coverage/walk.js';
 
 export { COVERAGE_LIMITS } from './coverage/bounds.js';
 export { loadToolSignatures, type ToolSignature } from './coverage/signatures.js';
@@ -257,6 +257,7 @@ export async function mapCoverage(p: RepoProfile, needs: Need[], dir: string, op
   releaseEgress(ctx);
   await hookRunHits(ctx);
   await configFilesPass(ctx);
+  await scopeToPaths(ctx);
   const hooks = await readHooks(ctx);
   // Each need is answered from tables built once, not by a pass over every run (review C1).
   const dirs = new Dirs();
@@ -264,6 +265,7 @@ export async function mapCoverage(p: RepoProfile, needs: Need[], dir: string, op
   const hookRuns = new Firsts(hooks.found.map((f): Hit => ({
     opaque: false, categories: f.categories, by: f.by, subject: f.subject, dir: f.dir, reason: f.reason,
     ...(f.partialWhy === undefined ? {} : { partialWhy: f.partialWhy }), fit: HOOK_FIT, where: hooks.where,
+    ...(f.langs === undefined ? {} : { langs: f.langs }),
   })), dirs);
   const d: Decide = {
     ci, hooks: hookRuns, scope: new Scope(p.services, dirs), dirsCapped: dirs.capped,

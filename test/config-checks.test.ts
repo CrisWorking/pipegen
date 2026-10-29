@@ -809,7 +809,8 @@ describe('fix round 1 (review of Task 4)', () => {
     ] as const) {
       const dir = makeTempDir();
       ci(dir, cmd);
-      expect((await covOf(dir)).status, cmd).toBe(expected);
+      // P57 (C1): coverage.py measures a Python service
+      expect((await covOf(dir, cmd.startsWith('coverage ') ? [svc('.', { language: 'python', packageManager: 'uv' })] : undefined)).status, cmd).toBe(expected);
     }
   });
 

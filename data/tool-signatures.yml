@@ -5,6 +5,11 @@
 # Entry fields:
 #   id            pipegen's label for the tool (lowercase letters, digits, dashes); shown as "by" in the audit.
 #   categories    the need categories (src/types.ts NEED_CATEGORIES) a run of this tool counts for.
+#   languages     (P57 C1) the service languages (src/types.ts Language) the tool checks: a run covers a service only
+#                 when its language is listed. `any`: language-neutral (secret scans, image and IaC scans, workflow and
+#                 Dockerfile linters, multi-language scanners); `unknown`: pipegen can't tell which other languages it
+#                 checks (lint-staged runs what its config names), so a run is at most partial for a service of a
+#                 language not listed.
 #   actions       GitHub Actions, as owner/name or owner/name/sub-path. A `uses:` value matches only that exact path
 #                 (case-insensitive, @ref ignored), so snyk/actions/setup or anchore/sbom-action/download-syft, which
 #                 only install, never count. A last part ending in * is a prefix (snyk/actions/python* matches
@@ -76,6 +81,7 @@ tools:
   # gitleaks-system: `gitleaks git --pre-commit --redact --staged --verbose`)
   - id: gitleaks
     categories: [secrets]
+    languages: [any]
     actions: [gitleaks/gitleaks-action]
     # the old URL https://github.com/zricethezav/gitleaks redirects to gitleaks/gitleaks and serves the same
     # .pre-commit-hooks.yaml (checked 2026-10-27)
@@ -94,6 +100,7 @@ tools:
   # betterleaks-system: `betterleaks git --pre-commit --redact --staged --verbose`)
   - id: betterleaks
     categories: [secrets]
+    languages: [any]
     commands: [betterleaks]
     excludes: [betterleaks version, betterleaks help, betterleaks completion, betterleaks config, betterleaks validate]
     softFlags: [--exit-code=0]
@@ -104,6 +111,7 @@ tools:
   # Action: https://github.com/trufflesecurity/trufflehog/blob/main/action.yml (always passes --fail)
   - id: trufflehog
     categories: [secrets]
+    languages: [any]
     actions: [trufflesecurity/trufflehog]
     commands: [trufflehog]
     commandFails: flag
@@ -113,12 +121,14 @@ tools:
   # hook: https://github.com/Yelp/detect-secrets/blob/master/.pre-commit-hooks.yaml (id detect-secrets, entry detect-secrets-hook)
   - id: detect-secrets
     categories: [secrets]
+    languages: [any]
     commands: [detect-secrets-hook]
     precommitHooks:
       - repo: https://github.com/Yelp/detect-secrets
         ids: [detect-secrets]
   - id: detect-secrets-scan
     categories: [secrets]
+    languages: [any]
     commands: [detect-secrets scan]
     commandFails: never
     partialWhy: The detect-secrets scan command only writes a baseline file; it doesn't fail when it finds a secret.
@@ -127,12 +137,14 @@ tools:
   # semgrep-action is the deprecated wrapper around semgrep ci: https://github.com/returntocorp/semgrep-action
   - id: semgrep
     categories: [sast]
+    languages: [any]
     actions: [semgrep/semgrep-action, returntocorp/semgrep-action]
     commands: [semgrep ci]
   # semgrep scan / semgrep --config: https://github.com/semgrep/semgrep/blob/develop/cli/src/semgrep/commands/scan.py
   # (--error/--no-error, off by default: findings exit 0)
   - id: semgrep-scan
     categories: [sast]
+    languages: [any]
     commands: [semgrep]
     excludes: [semgrep ci, semgrep login, semgrep logout, semgrep install-semgrep-pro, semgrep publish, semgrep lsp, semgrep mcp]
     commandFails: flag
@@ -142,6 +154,7 @@ tools:
   # (https://docs.github.com/en/code-security/code-scanning/managing-your-code-scanning-configuration/set-code-scanning-merge-protection)
   - id: codeql
     categories: [sast]
+    languages: [node, python, go, java, dotnet, ruby]
     actions: [github/codeql-action/analyze]
     commands: [codeql database analyze]
     commandFails: never
@@ -151,6 +164,7 @@ tools:
   # Action: https://github.com/PyCQA/bandit-action/blob/main/action.yml (runs bandit ... -f sarif -o results.sarif || true)
   - id: bandit
     categories: [sast]
+    languages: [python]
     actions: [PyCQA/bandit-action]
     commands: [bandit]
     softFlags: [--exit-zero]
@@ -161,6 +175,7 @@ tools:
   # (https://github.com/securego/gosec/blob/master/action.yml), so -no-fail there counts too.
   - id: gosec
     categories: [sast]
+    languages: [go]
     actions: [securego/gosec]
     commands: [gosec]
     softFlags: [-no-fail, --no-fail]
@@ -169,6 +184,7 @@ tools:
   # sub-actions are listed, never snyk/actions/setup (install only)
   - id: snyk
     categories: [deps]
+    languages: [any]
     actions:
       - snyk/actions
       - snyk/actions/node
@@ -188,20 +204,24 @@ tools:
       command: [monitor]
   - id: snyk-code
     categories: [sast]
+    languages: [any]
     commands: [snyk code test]
   - id: snyk-container
     categories: [image-scan]
+    languages: [any]
     actions: [snyk/actions/docker]
     commands: [snyk container test]
     softInputs:
       command: [monitor, container monitor]
   - id: snyk-iac
     categories: [iac]
+    languages: [any]
     actions: [snyk/actions/iac]
     commands: [snyk iac test]
   # https://github.com/google/osv-scanner/blob/main/docs/output.md ("non-zero exit code (1) if any vulnerabilities are found")
   - id: osv-scanner
     categories: [deps]
+    languages: [any]
     actions: [google/osv-scanner-action, google/osv-scanner-action/osv-scanner-action]
     commands: [osv-scanner]
   # npm audit signatures checks registry signatures, not vulnerabilities
@@ -209,6 +229,7 @@ tools:
   # for commands that must not fail on an audit
   - id: npm-audit
     categories: [deps]
+    languages: [node]
     commands: [npm audit, pnpm audit, yarn audit]
     excludes: [npm audit signatures]
     softFlags: [--audit-level=none]
@@ -216,6 +237,7 @@ tools:
   # internal-be-careful-allow-failure is anything but "false")
   - id: pip-audit
     categories: [deps]
+    languages: [python]
     actions: [pypa/gh-action-pip-audit]
     commands: [pip-audit]
     softUnless:
@@ -228,6 +250,7 @@ tools:
   # base-ref and head-ref set in the workflow can make it compare a branch with itself)
   - id: dependency-review
     categories: [deps, dependency-review]
+    languages: [any]
     actions: [actions/dependency-review-action]
     softInputs:
       warn-only: ['true']
@@ -244,6 +267,7 @@ tools:
   # request and fails on the vulnerabilities the pull request adds). Ruling PS19.
   - id: osv-pr-diff
     categories: [dependency-review]
+    languages: [any]
     reusableWorkflows: [google/osv-scanner-action/.github/workflows/osv-scanner-reusable-pr.yml]
     softUnless:
       fail-on-vuln: ['true']
@@ -252,6 +276,7 @@ tools:
   # Action: https://github.com/golang/govulncheck-action/blob/master/action.yml (output-format goes to -format)
   - id: govulncheck
     categories: [deps]
+    languages: [go]
     actions: [golang/govulncheck-action]
     commands: [govulncheck]
     softFlags: [-json, --json, -format=json, -format=sarif, -format=openvex, --format=json, --format=sarif, --format=openvex]
@@ -276,6 +301,7 @@ tools:
   # trivy's own) and trivy-config (a trivy.yaml that can change all of this).
   - id: trivy-image
     categories: [image-scan]
+    languages: [any]
     actions: [aquasecurity/trivy-action]
     commands: [trivy image, trivy i]
     commandFails: flag
@@ -300,6 +326,7 @@ tools:
   # https://github.com/aquasecurity/trivy/blob/main/pkg/commands/app.go)
   - id: trivy-fs
     categories: [deps]
+    languages: [any]
     actions: [aquasecurity/trivy-action]
     commands: [trivy fs, trivy filesystem, trivy repo, trivy repository, trivy rootfs, trivy sbom]
     commandFails: flag
@@ -324,6 +351,7 @@ tools:
   # https://github.com/aquasecurity/trivy/blob/main/docs/guide/scanner/misconfiguration/index.md)
   - id: trivy-config
     categories: [iac]
+    languages: [any]
     actions: [aquasecurity/trivy-action]
     commands: [trivy config, trivy conf]
     commandFails: flag
@@ -348,6 +376,7 @@ tools:
   # its RUN lines, so it is never more than partial for the Dockerfile lint
   - id: trivy-dockerfile
     categories: [dockerfile-lint]
+    languages: [any]
     actions: [aquasecurity/trivy-action]
     commands: [trivy config, trivy conf]
     commandFails: never
@@ -360,6 +389,7 @@ tools:
   # (licence findings count). The image, filesystem, repository and root filesystem scans take it.
   - id: trivy-license
     categories: [licences]
+    languages: [any]
     actions: [aquasecurity/trivy-action]
     commands: [trivy fs, trivy filesystem, trivy repo, trivy repository, trivy rootfs, trivy image, trivy i]
     onlyWithFlagValue: { flag: --scanners, input: scanners, contains: license }
@@ -399,6 +429,7 @@ tools:
   # and its `config` input replaces grype's config file, which can ignore findings.
   - id: grype
     categories: [deps]
+    languages: [any]
     actions: [anchore/scan-action]
     commands: [grype]
     excludes: [grype version, grype db, grype config, grype explain, grype completion, grype help]
@@ -416,6 +447,7 @@ tools:
   # action's `image` input: https://github.com/anchore/scan-action/blob/main/action.yml)
   - id: grype-image
     categories: [image-scan]
+    languages: [any]
     actions: [anchore/scan-action]
     commands: [grype]
     excludes: [grype version, grype db, grype config, grype explain, grype completion, grype help]
@@ -431,6 +463,7 @@ tools:
       why: The scan action reads a grype config file here that can ignore findings, and pipegen doesn't read that file.
   - id: docker-build
     categories: [image-build]
+    languages: [any]
     actions: [docker/build-push-action]
     commands: [docker build, docker buildx build]
   # P55 (batch B): `docker compose build` (and `docker-compose build`, `docker compose up --build`) builds the images of the
@@ -439,6 +472,7 @@ tools:
   # which images are built for the deploy.
   - id: docker-compose-build
     categories: [image-build]
+    languages: [any]
     commands: [docker compose build, docker-compose build]
     commandFails: never
     partialWhy: It builds the images a Compose file defines, and pipegen can't tell whether they are the ones that get scanned and deployed.
@@ -447,6 +481,7 @@ tools:
   # only when soft_fail is "true")
   - id: checkov
     categories: [iac]
+    languages: [any]
     actions: [bridgecrewio/checkov-action]
     commands: [checkov]
     softFlags: [--soft-fail, -s]
@@ -457,6 +492,7 @@ tools:
   # any non-empty soft_fail, even "false", adds --soft-fail)
   - id: tfsec
     categories: [iac]
+    languages: [any]
     actions: [aquasecurity/tfsec-action]
     commands: [tfsec]
     softFlags: [--soft-fail, -s]
@@ -468,6 +504,7 @@ tools:
   # step, whose pipefail keeps kube-linter's exit code)
   - id: kube-linter
     categories: [iac]
+    languages: [any]
     actions: [stackrox/kube-linter-action]
     commands: [kube-linter lint]
   # Plan P Task 3: https://github.com/open-policy-agent/conftest/blob/master/docs/options.md ("By default, Conftest only
@@ -476,6 +513,7 @@ tools:
   # code of zero even if a policy fails")
   - id: conftest
     categories: [iac]
+    languages: [any]
     commands: [conftest test]
     softFlags: [--no-fail]
   # ---------- running app (DAST) ----------
@@ -486,6 +524,7 @@ tools:
   # rules, which only warn, -I means no failure. Also read in the actions' cmd_options.
   - id: zap
     categories: [dast]
+    languages: [any]
     actions: [zaproxy/action-baseline, zaproxy/action-full-scan, zaproxy/action-api-scan]
     commands: [zap-baseline.py, zap-full-scan.py, zap-api-scan.py]
     softFlags: [-I]
@@ -496,6 +535,7 @@ tools:
   # https://github.com/zaproxy/action-api-scan/blob/master/action.yml: fail_action default false)
   - id: zap-api
     categories: [api-dast]
+    languages: [any]
     actions: [zaproxy/action-api-scan]
     commands: [zap-api-scan.py]
     softFlags: [-I]
@@ -507,6 +547,7 @@ tools:
   # under set -euo pipefail, so a failure fails the step)
   - id: schemathesis
     categories: [api-dast]
+    languages: [any]
     actions: [schemathesis/action]
     commands: [schemathesis run, st run]
   # Plan P Task 3: https://github.com/projectdiscovery/nuclei/blob/dev/README.md (no option makes a finding fail the
@@ -514,6 +555,7 @@ tools:
   # install-only: true scans nothing)
   - id: nuclei
     categories: [dast]
+    languages: [any]
     actions: [projectdiscovery/nuclei-action]
     commands: [nuclei]
     commandFails: never
@@ -525,18 +567,22 @@ tools:
   # --listTests, --showConfig and --collectTests print or collect and exit without running tests (https://jestjs.io/docs/cli)
   - id: jest
     categories: [unit-tests, full-tests]
+    languages: [node]
     commands: [jest]
     notWithFlags: [--listTests, --showConfig, --collectTests]
   - id: vitest
     categories: [unit-tests, full-tests]
+    languages: [node]
     commands: [vitest]
   - id: mocha
     categories: [unit-tests, full-tests]
+    languages: [node]
     commands: [mocha]
   # Fix round 1: -list prints the matching tests and runs none
   # (https://github.com/golang/go/blob/master/src/cmd/go/internal/test/test.go)
   - id: go-test
     categories: [unit-tests, full-tests]
+    languages: [go]
     commands: [go test]
     notWithFlags: [-list, --list]
   # ---------- test coverage (Plan P Task 3, ruling PS17: partial until a minimum is found) ----------
@@ -556,6 +602,7 @@ tools:
   # https://vitest.dev/guide/coverage (--coverage, or --coverage.enabled; false turns it off)
   - id: vitest-cov
     categories: [coverage]
+    languages: [node]
     commands: [vitest]
     onlyWithFlags: [--coverage, --coverage.enabled]
     notWithFlags: [--coverage=false, --coverage.enabled=false, --no-coverage]
@@ -566,6 +613,7 @@ tools:
   # https://jestjs.io/docs/cli (--coverage, alias --collectCoverage; --listTests, --showConfig and --collectTests run no tests)
   - id: jest-cov
     categories: [coverage]
+    languages: [node]
     commands: [jest]
     onlyWithFlags: [--coverage, --collectCoverage]
     notWithFlags: [--coverage=false, --collectCoverage=false, --no-coverage, --listTests, --showConfig, --collectTests]
@@ -576,6 +624,7 @@ tools:
   # https://github.com/bcoe/c8/blob/main/README.md (c8 runs a command and measures its coverage)
   - id: c8
     categories: [coverage]
+    languages: [node]
     commands: [c8]
     commandFails: never
     partialWhy: This run measures test coverage, but pipegen hasn't checked for a minimum, so a drop in coverage may not fail it.
@@ -585,6 +634,7 @@ tools:
   # wrapper, so the command it runs is read too)
   - id: nyc
     categories: [coverage]
+    languages: [node]
     commands: [nyc]
     commandFails: never
     partialWhy: This run measures test coverage, but pipegen hasn't checked for a minimum, so a drop in coverage may not fail it.
@@ -593,6 +643,7 @@ tools:
   # https://pytest-cov.readthedocs.io/en/latest/config.html (--cov[=SOURCE]; --no-cov turns it off)
   - id: pytest-cov
     categories: [coverage]
+    languages: [python]
     commands: [pytest]
     onlyWithFlags: [--cov]
     notWithFlags: [--no-cov]
@@ -604,6 +655,7 @@ tools:
   # https://coverage.readthedocs.io/en/latest/cmd.html (coverage run measures, coverage report reports)
   - id: coverage-py
     categories: [coverage]
+    languages: [python]
     commands: [coverage run, coverage report]
     commandFails: never
     partialWhy: This run measures test coverage, but pipegen hasn't checked for a minimum, so a drop in coverage may not fail it.
@@ -615,6 +667,7 @@ tools:
   # -coverprofile each set -cover)
   - id: go-cover
     categories: [coverage]
+    languages: [go]
     commands: [go test]
     onlyWithFlags: [-cover, -covermode, -coverpkg, -coverprofile, --cover, --covermode, --coverpkg, --coverprofile]
     notWithFlags: [-list, --list]
@@ -627,6 +680,7 @@ tools:
   # file); https://docs.renovatebot.com/self-hosted-configuration/ (env RENOVATE_CONFIG_FILE swaps it too)
   - id: renovate
     categories: [update-config]
+    languages: [any]
     actions: [renovatebot/github-action]
     commands: [renovate]
     requireInputs:
@@ -637,6 +691,7 @@ tools:
   # hook: https://github.com/pre-commit/mirrors-eslint/blob/main/.pre-commit-hooks.yaml (id eslint, entry eslint)
   - id: eslint
     categories: [lint, format-lint]
+    languages: [node]
     commands: [eslint]
     precommitHooks:
       - repo: https://github.com/pre-commit/mirrors-eslint
@@ -647,6 +702,7 @@ tools:
   # stop, init, lsp-proxy, migrate, search, explain, clean) are left out too
   - id: biome
     categories: [lint, format-lint]
+    languages: [node]
     commands: [biome]
     excludes: [biome format, biome version, biome upgrade, biome rage, biome start, biome stop, biome init, biome lsp-proxy, biome migrate, biome search,
       biome explain, biome clean]
@@ -657,10 +713,12 @@ tools:
   # on a lint error; --fix writes the fixes, --stdin reads one file and --print-config prints, so those don't count
   - id: xo
     categories: [lint, format-lint]
+    languages: [node]
     commands: [xo]
     notWithFlags: [--fix, --stdin, --print-config]
   - id: biome-format
     categories: [format-lint]
+    languages: [node]
     commands: [biome format]
     precommitHooks:
       - repo: https://github.com/biomejs/pre-commit
@@ -672,6 +730,7 @@ tools:
   # (checked 2026-10-27). `ruff format` only formats: it is the ruff-format entry below, never lint (fix round 1, I1).
   - id: ruff
     categories: [lint, format-lint]
+    languages: [python]
     actions: [astral-sh/ruff-action]
     commands: [ruff]
     excludes: [ruff format]
@@ -683,6 +742,7 @@ tools:
         ids: [ruff, ruff-check]
   - id: ruff-format
     categories: [format-lint]
+    languages: [python]
     commands: [ruff format]
     precommitHooks:
       - repo: https://github.com/astral-sh/ruff-pre-commit
@@ -693,6 +753,7 @@ tools:
   # hook: https://github.com/PyCQA/flake8/blob/main/.pre-commit-hooks.yaml (id flake8, entry flake8)
   - id: flake8
     categories: [lint, format-lint]
+    languages: [python]
     commands: [flake8]
     softFlags: [--exit-zero]
     precommitHooks:
@@ -701,6 +762,7 @@ tools:
   # https://github.com/pylint-dev/pylint/blob/main/pylint/lint/run.py (exit_zero)
   - id: pylint
     categories: [lint]
+    languages: [python]
     commands: [pylint]
     softFlags: [--exit-zero]
   # https://github.com/golangci/golangci-lint/blob/main/pkg/commands/flagsets.go (issues-exit-code)
@@ -709,6 +771,7 @@ tools:
   # linters, migrate, version) lint nothing
   - id: golangci-lint
     categories: [lint, format-lint]
+    languages: [go]
     actions: [golangci/golangci-lint-action]
     commands: [golangci-lint]
     excludes: [golangci-lint fmt, golangci-lint cache, golangci-lint config, golangci-lint custom, golangci-lint formatters, golangci-lint help,
@@ -718,17 +781,20 @@ tools:
   # --diff-colored, a file that needs formatting sets exit code 1; without, fmt rewrites files)
   - id: golangci-lint-fmt
     categories: [format]
+    languages: [go]
     commands: [golangci-lint fmt]
     onlyWithFlags: [--diff, -d, --diff-colored]
   # Plan P Task 3: https://github.com/golang/go/blob/master/src/cmd/gofmt/gofmt.go (-d shows diffs and exits 1 when a
   # file's formatting differs; -l only lists those files and exits 0)
   - id: gofmt-diff
     categories: [format]
+    languages: [go]
     commands: [gofmt]
     onlyWithFlags: [-d]
   # Plan P Task 3: gofmt -l exits 0 whatever it lists (https://github.com/golang/go/blob/master/src/cmd/gofmt/gofmt.go)
   - id: gofmt-list
     categories: [format]
+    languages: [go]
     commands: [gofmt]
     onlyWithFlags: [-l]
     commandFails: never
@@ -739,6 +805,7 @@ tools:
   # errors only; --silent shows nothing)
   - id: oxlint
     categories: [lint]
+    languages: [node]
     commands: [oxlint]
     commandFails: flag
     failFlags: [--deny-warnings, --max-warnings]
@@ -749,16 +816,19 @@ tools:
   # and --type-check without type-aware linting is refused (apps/oxlint/src/lint.rs)
   - id: oxlint-type-check
     categories: [type-check]
+    languages: [node]
     commands: [oxlint]
     onlyWithFlags: [--type-check, --type-check-only]
     softFlags: [--silent]
   - id: prettier
     categories: [format-lint]
+    languages: [node]
     commands: [prettier]
   # hooks: https://github.com/psf/black-pre-commit-mirror/blob/main/.pre-commit-hooks.yaml (black, black-jupyter: entry
   # black); https://github.com/psf/black/blob/main/.pre-commit-hooks.yaml has the same two (checked 2026-10-27)
   - id: black
     categories: [format-lint]
+    languages: [python]
     commands: [black]
     precommitHooks:
       - repo: https://github.com/psf/black-pre-commit-mirror
@@ -767,6 +837,7 @@ tools:
         ids: [black, black-jupyter]
   - id: lint-staged
     categories: [format-lint]
+    languages: [node, unknown]
     commands: [lint-staged]
   # ---------- format checks (Plan P Task 3) ----------
   # https://github.com/prettier/prettier/blob/main/docs/cli.md (--check / -c and --list-different / -l exit 1 when a
@@ -774,6 +845,7 @@ tools:
   # --file-info print information and check nothing (same page).
   - id: prettier-check
     categories: [format]
+    languages: [node]
     commands: [prettier]
     onlyWithFlags: [--check, -c, --list-different, -l]
     notWithFlags: [--write, -w, --support-info, --find-config-path, --file-info]
@@ -782,6 +854,7 @@ tools:
   # non-zero status code and the difference"); --stdin-filename formats standard input, not the files (fix round 1)
   - id: ruff-format-check
     categories: [format]
+    languages: [python]
     commands: [ruff format]
     onlyWithFlags: [--check, --diff]
     notWithFlags: [--stdin-filename]
@@ -789,6 +862,7 @@ tools:
   # would be reformatted"; --diff alone only prints)
   - id: black-check
     categories: [format]
+    languages: [python]
     commands: [black]
     onlyWithFlags: [--check]
   # https://biomejs.dev/reference/cli/ (biome ci "runs formatting checks, linting checks, and assist actions in CI
@@ -798,12 +872,14 @@ tools:
   # ("Some errors were emitted while running checks").
   - id: biome-ci
     categories: [format]
+    languages: [node]
     commands: [biome ci, biome check]
     notWithFlags: [--write, --fix, --apply, --apply-unsafe, --formatter-enabled=false, --staged, --watch, --stdin-file-path]
   # Plan P Task 3 (PS12): `biome format` without --write checks formatting and fails on a file that isn't formatted
   # (https://biomejs.dev/reference/cli/ and the snapshot above); the biome-format entry keeps the format-lint hook
   - id: biome-format-check
     categories: [format]
+    languages: [node]
     commands: [biome format]
     notWithFlags: [--write, --fix, --staged, --watch, --stdin-file-path]
   # ---------- type checks (Plan P Task 3) ----------
@@ -818,6 +894,7 @@ tools:
   # names are looked up lowercased; `-noCheck`, `--nocheck` and `-NOCHECK` are --noCheck), so flagsAnyCase.
   - id: tsc
     categories: [type-check]
+    languages: [node]
     commands: [tsc, tsgo, vue-tsc, svelte-check, astro check]
     notWithFlags: [--init, --showConfig, --listFilesOnly, --all, --watch, -w, --noCheck, --clean, --version, -v, --help, -h]
     flagsAnyCase: true
@@ -825,6 +902,7 @@ tools:
   # hook: https://github.com/pre-commit/mirrors-mypy/blob/main/.pre-commit-hooks.yaml (id mypy, entry mypy)
   - id: mypy
     categories: [type-check]
+    languages: [python]
     commands: [mypy]
     precommitHooks:
       - repo: https://github.com/pre-commit/mirrors-mypy
@@ -834,6 +912,7 @@ tools:
   # hook: https://github.com/RobertCraigie/pyright-python/blob/main/.pre-commit-hooks.yaml (id pyright, entry pyright)
   - id: pyright
     categories: [type-check]
+    languages: [python]
     commands: [pyright]
     notWithFlags: [--watch, -w, --createstub, --verifytypes]
     precommitHooks:
@@ -843,6 +922,7 @@ tools:
   # --writebaseline writes the errors to the baseline file)
   - id: basedpyright
     categories: [type-check]
+    languages: [python]
     commands: [basedpyright]
     notWithFlags: [--watch, -w, --createstub, --verifytypes, --writebaseline]
   # ---------- dead code and duplication (Plan P Task 3) ----------
@@ -851,33 +931,39 @@ tools:
   # any --max-issues counts as soft.
   - id: knip
     categories: [dead-code]
+    languages: [node]
     commands: [knip]
     softFlags: [--no-exit-code, --max-issues]
     notWithFlags: [--watch, -w]
   # https://github.com/fredrikaverpil/creosote/blob/main/src/creosote/cli.py (returns 1 when it finds unused dependencies)
   - id: creosote
     categories: [dead-code]
+    languages: [python]
     commands: [creosote]
   # https://github.com/osprey-oss/deptry/blob/main/python/deptry/core.py (`sys.exit(bool(violations))`)
   - id: deptry
     categories: [dead-code]
+    languages: [python]
     commands: [deptry]
   # https://github.com/jendrikseipp/vulture/blob/main/README.md ("Exit codes": 3 when dead code is found;
   # --make-whitelist prints a whitelist instead)
   - id: vulture
     categories: [dead-code]
+    languages: [python]
     commands: [vulture]
     notWithFlags: [--make-whitelist]
   # https://github.com/golang/go/blob/master/src/cmd/go/internal/modcmd/tidy.go (-diff: "exits with a non-zero code if
   # the diff is not empty"; without it, tidy rewrites go.mod)
   - id: go-mod-tidy
     categories: [dead-code]
+    languages: [go]
     commands: [go mod tidy]
     onlyWithFlags: [-diff, --diff]
   # https://github.com/kucherenko/jscpd/blob/master/README.md (exits non-zero only past a --threshold); duplication is a
   # warning check, so a run is enough
   - id: jscpd
     categories: [duplication]
+    languages: [any]
     commands: [jscpd]
     commandFails: never
     partialWhy: The jscpd check reports copy-pasted code and fails only past a set threshold.
@@ -892,6 +978,7 @@ tools:
   # failure-threshold) can turn failure off (ruling P8)
   - id: hadolint
     categories: [dockerfile-lint]
+    languages: [any]
     actions: [hadolint/hadolint-action]
     commands: [hadolint]
     softFlags: [--no-fail, --failure-threshold=none, --failure-threshold=ignore, -t=none, -t=ignore, -tnone, -tignore]
@@ -912,6 +999,7 @@ tools:
   # writes a config and checks nothing (docs/usage.md)
   - id: actionlint
     categories: [workflow-lint]
+    languages: [any]
     actions: [raven-actions/actionlint]
     commands: [actionlint]
     notWithFlags: [-init-config]
@@ -926,6 +1014,7 @@ tools:
   # --format=sarif: action.sh), so the action fails only with advanced-security: false
   - id: zizmor
     categories: [workflow-lint]
+    languages: [any]
     actions: [zizmorcore/zizmor-action]
     commands: [zizmor]
     softFlags: [--no-exit-codes, --format=sarif, --fix]
@@ -936,6 +1025,7 @@ tools:
   # (10) when violations are found"; without it, it reports only)
   - id: poutine
     categories: [workflow-lint]
+    languages: [any]
     commands: [poutine]
     commandFails: flag
     failFlags: [--fail-on-violation]
@@ -943,23 +1033,27 @@ tools:
   # and fails")
   - id: ghalint
     categories: [workflow-lint]
+    languages: [any]
     commands: [ghalint run, ghalint run-action, ghalint act]
   # https://github.com/suzuki-shunsuke/pinact/blob/main/docs/check.md (--check or --fix=false: check without editing)
   # and https://github.com/suzuki-shunsuke/pinact/blob/main/docs/exit_codes.md (1 when something needs pinning with
   # --fix=false; 0 when pinact fixed it)
   - id: pinact
     categories: [workflow-pin-check]
+    languages: [any]
     commands: [pinact run]
     onlyWithFlags: [--check, --fix=false]
   # https://github.com/sethvargo/ratchet/blob/main/README.md (lint: "exiting with a non-zero error code when entries are
   # not pinned")
   - id: ratchet
     categories: [workflow-pin-check]
+    languages: [any]
     commands: [ratchet lint]
   # https://github.com/zizmorcore/zizmor/blob/main/docs/audits.md (unpinned-uses: hash pins for all actions by default
   # only from v1.20.0, and a zizmor config can allow tag pins), so zizmor is never more than partial here
   - id: zizmor-pins
     categories: [workflow-pin-check]
+    languages: [any]
     actions: [zizmorcore/zizmor-action]
     commands: [zizmor]
     commandFails: never
@@ -972,6 +1066,7 @@ tools:
   # action.yml)
   - id: dependency-review-licences
     categories: [licences]
+    languages: [any]
     actions: [actions/dependency-review-action]
     onlyWithInputs:
       allow-licenses: ['*']
@@ -991,11 +1086,13 @@ tools:
   # list are denied by default")
   - id: cargo-deny-licences
     categories: [licences]
+    languages: [other]
     commands: [cargo deny check licenses, cargo-deny check licenses]
   # cargo-deny's checks can follow its flags (https://github.com/EmbarkStudios/cargo-deny/blob/main/docs/src/cli/check.md),
   # so pipegen can't tell which ones a plain `check` runs
   - id: cargo-deny
     categories: [licences]
+    languages: [other]
     commands: [cargo deny check, cargo-deny check]
     excludes: [cargo deny check licenses, cargo deny check advisories, cargo deny check bans, cargo deny check sources, cargo-deny check licenses,
       cargo-deny check advisories, cargo-deny check bans, cargo-deny check sources]
@@ -1005,18 +1102,21 @@ tools:
   # --dry-run: "run check without returning non-zero exit code on violations")
   - id: grant
     categories: [licences]
+    languages: [any]
     commands: [grant check]
     softFlags: [--dry-run]
   # https://github.com/fossas/fossa-cli/blob/master/docs/references/subcommands/test.md (exits 1 when there are issues);
   # the issues come from FOSSA's server-side policy, which pipegen can't see
   - id: fossa
     categories: [licences]
+    languages: [any]
     commands: [fossa test]
     commandFails: never
     partialWhy: FOSSA fails on the issues its server-side policy flags, and pipegen can't see whether that policy covers licences.
   # ---------- git hooks run in CI ----------
   - id: pre-commit
     categories: [hooks-ci]
+    languages: [any]
     actions: [pre-commit/action]
     commands: [pre-commit run]
   # P55 (batch B): prek is a drop-in for pre-commit (https://github.com/j178/prek: "prek run", the same
@@ -1025,15 +1125,18 @@ tools:
   # default "false").
   - id: prek
     categories: [hooks-ci]
+    languages: [any]
     actions: [j178/prek-action]
     commands: [prek run]
     skipInputs:
       install-only: ['true']
   - id: lefthook
     categories: [hooks-ci]
+    languages: [any]
     commands: [lefthook run]
   - id: husky-hooks
     categories: [hooks-ci]
+    languages: [any]
     commands: [.husky/pre-commit]
   # ---------- release jobs: egress (Plan P Task 3, ruling PB5, DEC #80) ----------
   # https://github.com/bullfrogsec/bullfrog/blob/main/action.yml (egress-policy default "audit", which blocks nothing;
@@ -1046,6 +1149,7 @@ tools:
   # ubuntu-slim), and jobs in containers are not supported.
   - id: bullfrog
     categories: [egress]
+    languages: [any]
     actions: [bullfrogsec/bullfrog]
     requireInputs:
       all:
@@ -1064,6 +1168,7 @@ tools:
   # container job (CONTAINER_MESSAGE), ubuntu-slim (UBUNTU_SLIM_MESSAGE) and, without its agent, a self-hosted runner.
   - id: harden-runner
     categories: [egress]
+    languages: [any]
     actions: [step-security/harden-runner]
     availability: public
     unavailableWhy: On a private repo, the free Harden-Runner blocks nothing (pipegen's spike S8), and pipegen can't see a paid plan.
@@ -1080,6 +1185,7 @@ tools:
   # Security")
   - id: scorecard
     categories: [scorecard]
+    languages: [any]
     actions: [ossf/scorecard-action]
     actionFails: never
     availability: public-or-code-security
@@ -1089,6 +1195,7 @@ tools:
   # Fix round 1: --repo can name another repo, so only `--local <path>` (this checkout) counts
   - id: scorecard-cli
     categories: [scorecard]
+    languages: [any]
     commands: [scorecard]
     onlyWithFlagValue: { flag: --local }
     commandFails: never
@@ -1097,6 +1204,7 @@ tools:
   # matching the regular expression"); fuzzing is a warning check, so a run is enough
   - id: go-fuzz
     categories: [fuzzing]
+    languages: [go]
     commands: [go test]
     onlyWithFlagValue: { flag: -fuzz }
     notWithFlags: [-list, --list]
@@ -1105,6 +1213,7 @@ tools:
   # don't fuzz)
   - id: fuzz-actions
     categories: [fuzzing]
+    languages: [any]
     actions: [google/clusterfuzzlite/actions/run_fuzzers, google/oss-fuzz/infra/cifuzz/actions/run_fuzzers]
     skipInputs:
       mode: [coverage, prune]
@@ -1112,14 +1221,17 @@ tools:
   # anchore/sbom-action only (never anchore/sbom-action/download-syft, which only downloads syft)
   - id: syft
     categories: [sbom]
+    languages: [any]
     actions: [anchore/sbom-action]
     commands: [syft]
     excludes: [syft version]
   - id: cosign
     categories: [signing]
+    languages: [any]
     commands: [cosign sign, cosign sign-blob]
   - id: attest-build-provenance
     categories: [attestation]
+    languages: [any]
     actions: [actions/attest-build-provenance, actions/attest, actions/attest-sbom]
   # npm provenance: https://docs.npmjs.com/generating-provenance-statements ("Add the --provenance flag to your publish
   # command"; the job needs id-token: write, or the publish fails). npm reads `--provenance false` as off, and a dry
@@ -1127,6 +1239,7 @@ tools:
   # (https://docs.npmjs.com/trusted-publishers), but that is set on npmjs.com, not in the repo, so it isn't counted.
   - id: npm-provenance
     categories: [attestation]
+    languages: [node]
     commands: [npm publish]
     onlyWithFlags: [--provenance, --provenance=true]
     notWithFlags: [--provenance=false, --no-provenance, --dry-run]
@@ -1140,6 +1253,7 @@ tools:
   # release/v1 and unstable/v1 follow the newest release (v1.14.x on 2026-10-27).
   - id: pypi-publish
     categories: [attestation]
+    languages: [python]
     actions: [pypa/gh-action-pypi-publish]
     actionRef:
       moving: [release/v1, unstable/v1]

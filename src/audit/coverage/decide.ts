@@ -146,7 +146,19 @@ const LAYER_SLOT: Readonly<Record<Slot, number>> = { push: 0, merge: 4, deploy: 
 const SLOTS: readonly Slot[] = ['push', 'merge', 'deploy', 'scheduled'];
 const OPAQUE_KEY = '\0opaque'; // not a category: the opaque runs (they have none)
 
-/** Per (category, dir): the index of the first run of each kind, for each layer (-1 = none). */
+/**
+ * P57 (C1): the language tag a per-service table key carries. A run is filed under its category plus each language it
+ * checks ('*' = any language, '?' = one pipegen can't tell); a repo-wide need reads the plain category (every run).
+ */
+const ANY_LANG = '*';
+export const UNSURE_LANG = '?';
+const langKey = (key: string, lang: string) => `${key}\u0001${lang}`;
+/** The keys whose runs check a service of this language: language-neutral ones and its own. */
+export const matchKeys = (key: string, lang: string | undefined): string[] => (lang === undefined ? [key] : [langKey(key, ANY_LANG), langKey(key, lang)]);
+/** The keys whose runs may or may not check a service of this language (pipegen can't tell which languages they check). */
+const unsureKeys = (key: string, lang: string | undefined): string[] => (lang === undefined ? [] : [langKey(key, UNSURE_LANG)]);
+
+/** Per (category, language, dir): the index of the first run of each kind, for each layer (-1 = none). */
 export class Firsts {
   private readonly byKey = new Map<string, Map<number, Int32Array>>();
 
@@ -157,9 +169,10 @@ export class Firsts {
       // folder, so it sits at the root too: every service's row it could cover is unknown, never missing. A real run
       // there never does (that would be a guessed covered).
       const d = h.dir === null && h.categories.length > 0 && h.categories.every((c) => c.startsWith(UNKNOWN_PREFIX)) ? ROOT : dirs.idOf(h.dir);
+      const langs = h.opaque || h.langs === undefined ? [ANY_LANG] : h.langs;
       for (const key of h.opaque ? [OPAQUE_KEY] : h.categories) {
         this.put(key, ALL, h, i);
-        if (d >= 0) this.put(key, d, h, i);
+        if (d >= 0) for (const lang of langs) this.put(langKey(key, lang), d, h, i);
       }
     }
   }
@@ -175,17 +188,19 @@ export class Firsts {
     }
   }
 
-  /** The first run in these dirs of one of these kinds on the layer. */
-  first(key: string, dirs: readonly number[], layer: Slot, kinds: readonly number[]): Hit | undefined {
-    const byDir = this.byKey.get(key);
-    if (!byDir) return undefined;
+  /** The first run under these keys, in these dirs, of one of these kinds on the layer. */
+  first(keys: string | readonly string[], dirs: readonly number[], layer: Slot, kinds: readonly number[]): Hit | undefined {
     let best = -1;
-    for (const d of dirs) {
-      const at = byDir.get(d);
-      if (!at) continue;
-      for (const k of kinds) {
-        const i = at[LAYER_SLOT[layer] + k] as number;
-        if (i >= 0 && (best < 0 || i < best)) best = i;
+    for (const key of typeof keys === 'string' ? [keys] : keys) {
+      const byDir = this.byKey.get(key);
+      if (!byDir) continue;
+      for (const d of dirs) {
+        const at = byDir.get(d);
+        if (!at) continue;
+        for (const k of kinds) {
+          const i = at[LAYER_SLOT[layer] + k] as number;
+          if (i >= 0 && (best < 0 || i < best)) best = i;
+        }
       }
     }
     return best < 0 ? undefined : this.hits[best];
@@ -209,12 +224,14 @@ export class Scope {
   /** More services than MAX_SERVICES: per-service needs read only the runs at the root. */
   readonly capped: boolean;
   private readonly target = new Map<string, string>(); // service name → path of the first service with that name
+  private readonly languages = new Map<string, string>(); // P57 (C1): service name → the language of the first service with that name
   private readonly owned = new Map<string, number[]>(); // service name → the dirs it owns
   private readonly dirTree = segNode();
   private readonly memo = new Map<string, readonly number[]>();
 
   constructor(services: readonly Service[], dirs: Dirs) {
     this.capped = services.length > MAX_SERVICES;
+    for (const s of services) if (!this.languages.has(s.name)) this.languages.set(s.name, s.language);
     if (this.capped) return;
     const tree = segNode();
     let root = -1;
@@ -248,6 +265,11 @@ export class Scope {
       if (list) list.push(d);
       else this.owned.set(name, [d]);
     }
+  }
+
+  /** P57 (C1): the language of a service need's service ('other' when pipegen can't find it); undefined for a repo-wide need. */
+  languageOf(service: string | undefined): string | undefined {
+    return service === undefined ? undefined : (this.languages.get(service) ?? 'other');
   }
 
   /** The dirs whose runs count for a need of this service (ALL for a repo-wide need). */
@@ -292,6 +314,9 @@ const partialKinds = (need: Need) => (need.blocking ? [FC, FO] : [FC]);
 /** Task 9: a coverage run that is "soft" has its minimum turned off on the command line, or its config swapped; it isn't about findings. */
 const COVERAGE_SOFT_WHY = (s: string) => `${s} measures coverage, but a flag on its command line turns the minimum off (0, or not a number) or swaps the coverage config file, so a drop in coverage can't be counted on to fail it.`;
 
+/** P57 (C1): a run of a tool whose languages pipegen can't tell, for a service it may or may not check. */
+const UNSURE_LANG_WHY = (s: string) => `${s} runs, but pipegen can't tell whether it checks this service's language, so it may check nothing here.`;
+
 function reasonWhy(h: { subject: string; partialWhy?: string }, reason: Reason, when: string, category?: string): string {
   if (reason === 'soft' && category === 'coverage') return COVERAGE_SOFT_WHY(h.subject);
   return OWN_WHY.has(reason) && h.partialWhy !== undefined ? h.partialWhy : REASON_WHY[reason](h.subject, when);
@@ -306,32 +331,37 @@ export function ciCoverage(need: Need, ciLayer: CiLayer, d: Decide): Coverage {
   // Plan P Task 3: a scheduled check (merge-layer need) is read on the scheduled trigger, not on pull requests
   const layer: Slot = (SCHEDULED_CATEGORIES as ReadonlySet<string>).has(need.category) ? 'scheduled' : ciLayer;
   const dirs = d.scope.dirsOf(need.service);
-  const cover = d.ci.first(need.category, dirs, layer, coverKinds(need));
+  // P57 (C1): only runs of a tool that checks the service's language count; one whose languages pipegen can't tell is partial
+  const lang = d.scope.languageOf(need.service);
+  const cat = matchKeys(need.category, lang);
+  const cover = d.ci.first(cat, dirs, layer, coverKinds(need));
   if (cover) return { need, status: 'covered', ...located(cover), why: `${cover.subject} runs ${LAYER_DONE[layer]}.` };
-  const unknownRun = d.ci.first(`${UNKNOWN_PREFIX}${need.category}`, dirs, layer, [FN, FC, FO]);
+  const unknownRun = d.ci.first([...matchKeys(`${UNKNOWN_PREFIX}${need.category}`, lang), ...unsureKeys(`${UNKNOWN_PREFIX}${need.category}`, lang)], dirs, layer, [FN, FC, FO]);
   if (unknownRun?.partialWhy !== undefined) return { need, status: 'unknown', ...located(unknownRun), why: unknownRun.partialWhy };
-  const strongOpaque = d.ci.first(OPAQUE_KEY, dirs, layer, [FN]);
+  const strongOpaque = d.ci.first(matchKeys(OPAQUE_KEY, lang), dirs, layer, [FN]);
   if (strongOpaque) return { need, status: 'unknown', ...located(strongOpaque), why: strongOpaque.why as string };
   if (d.truncated) return { need, status: 'unknown', why: OPAQUE_WHY.truncated };
-  const partialRight = d.ci.first(need.category, dirs, layer, partialKinds(need));
+  const partialRight = d.ci.first(cat, dirs, layer, partialKinds(need));
   if (partialRight) {
     return { need, status: 'partial', ...located(partialRight), why: reasonWhy(partialRight, effectiveReason(need, partialRight.reason) as Reason, LAYER_DONE[layer], need.category) };
   }
-  const partialTrigger = d.ci.first(need.category, dirs, layer, [NF]);
+  const partialTrigger = d.ci.first(cat, dirs, layer, [NF]);
   if (partialTrigger) return { need, status: 'partial', ...located(partialTrigger), why: `${partialTrigger.subject} runs, but not ${LAYER_DONE[layer]}.` };
-  const weakOpaque = d.ci.first(OPAQUE_KEY, dirs, layer, [NF]);
+  const unsure = d.ci.first(unsureKeys(need.category, lang), dirs, layer, [FN, FC, FO, NF]);
+  if (unsure) return { need, status: 'partial', ...located(unsure), why: UNSURE_LANG_WHY(unsure.subject) };
+  const weakOpaque = d.ci.first(matchKeys(OPAQUE_KEY, lang), dirs, layer, [NF]);
   if (weakOpaque) return { need, status: 'unknown', ...located(weakOpaque), why: weakOpaque.why as string };
   if (d.unreadable) return { need, status: 'unknown', why: OPAQUE_WHY.workflowsUnreadable };
   if (capped(need, d)) return { need, status: 'unknown', why: OPAQUE_WHY.tooMany };
   // Task 5 fix round 1 (C1): a version known not to do this check (pypi-publish before v1.11.0): missing, saying why
-  const old = d.ci.first(`${OLD_PREFIX}${need.category}`, dirs, layer, [FN, FC, FO, NF]);
+  const old = d.ci.first(matchKeys(`${OLD_PREFIX}${need.category}`, lang), dirs, layer, [FN, FC, FO, NF]);
   if (old && old.partialWhy !== undefined) return { need, status: 'missing', ...located(old), why: old.partialWhy };
   return { need, status: 'missing', why: missingWhy(need, d) };
 }
 
 /** Plan P Task 4: the run behind a CI row that is partial (the first of its kind ciCoverage picks), for the coverage minimum check. */
 export function firstPartialHit(need: Need, ciLayer: CiLayer, d: Decide): Hit | undefined {
-  return d.ci.first(need.category, d.scope.dirsOf(need.service), ciLayer, partialKinds(need));
+  return d.ci.first(matchKeys(need.category, d.scope.languageOf(need.service)), d.scope.dirsOf(need.service), ciLayer, partialKinds(need));
 }
 
 export function hookCoverage(need: Need, hooks: Hooks, d: Decide): Coverage {
@@ -344,12 +374,16 @@ export function hookCoverage(need: Need, hooks: Hooks, d: Decide): Coverage {
   if (m !== null) {
     // the hook's runs sit in their own table, every one on the "push" layer's trigger
     const dirs = d.scope.dirsOf(need.service);
-    const cover = d.hooks.first(need.category, dirs, 'push', coverKinds(need));
+    const lang = d.scope.languageOf(need.service);
+    const cat = matchKeys(need.category, lang);
+    const cover = d.hooks.first(cat, dirs, 'push', coverKinds(need));
     if (cover) return { need, status: 'covered', by: cover.by as string, where: hooks.where, why: `${cover.subject} runs in ${HOOK_PLACE[m]} before each commit.` };
-    const unknownRun = d.hooks.first(`${UNKNOWN_PREFIX}${need.category}`, dirs, 'push', [FN, FC, FO]);
+    const unknownRun = d.hooks.first([...matchKeys(`${UNKNOWN_PREFIX}${need.category}`, lang), ...unsureKeys(`${UNKNOWN_PREFIX}${need.category}`, lang)], dirs, 'push', [FN, FC, FO]);
     if (unknownRun?.partialWhy !== undefined) return { need, status: 'unknown', by: unknownRun.by as string, where: hooks.where, why: unknownRun.partialWhy };
-    const partial = d.hooks.first(need.category, dirs, 'push', partialKinds(need));
+    const partial = d.hooks.first(cat, dirs, 'push', partialKinds(need));
     if (partial) return { need, status: 'partial', by: partial.by as string, where: hooks.where, why: reasonWhy(partial, effectiveReason(need, partial.reason) as Reason, 'before each commit', need.category) };
+    const unsure = d.hooks.first(unsureKeys(need.category, lang), dirs, 'push', [FN, FC, FO]);
+    if (unsure) return { need, status: 'partial', by: unsure.by as string, where: hooks.where, why: UNSURE_LANG_WHY(unsure.subject) };
     if (!hooks.readable) return { need, status: 'unknown', where: hooks.where, why: OPAQUE_WHY.hookUnreadable };
     if (capped(need, d)) return { need, status: 'unknown', why: OPAQUE_WHY.tooMany };
   }

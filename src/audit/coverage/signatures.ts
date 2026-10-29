@@ -10,6 +10,8 @@ import type { ActionRule, CommandRule, Compiled } from './types.js';
 // ---------- tool signatures (ruling S1) ----------
 
 const ID_RE = /^[a-z0-9][a-z0-9-]{0,63}$/;
+/** P57 (C1): the languages a signature may list (src/types.ts Language, plus `any` and `unknown`). */
+export const TOOL_LANGUAGES = ['node', 'python', 'go', 'java', 'dotnet', 'ruby', 'php', 'other', 'any', 'unknown'] as const;
 export const PART_RE = /^[A-Za-z0-9_.-]+$/;
 const LAST_PART_RE = /^[A-Za-z0-9_.-]+\*?$/;
 // Plan P Task 3: a dot in the name for vitest's `--coverage.enabled`
@@ -48,6 +50,13 @@ const why = z.string().regex(WHY_RE).refine((s) => safeText(s, 300) === s, 'must
 const signatureSchema = z.strictObject({
   id: z.string().regex(ID_RE),
   categories: z.array(z.enum(NEED_CATEGORIES)).min(1),
+  /**
+   * P57 (C1): the service languages the tool checks. A run counts for a service only when the service's language is
+   * listed; `any` (language-neutral: secret scans, image and IaC scans, workflow and Dockerfile linters) counts for every
+   * service; `unknown` (pipegen can't tell which others: lint-staged runs what its config names) makes a run at most
+   * partial for a service of a language not listed.
+   */
+  languages: z.array(z.enum(TOOL_LANGUAGES)).min(1),
   actions: z.array(z.string().refine(isActionRef, 'must be owner/name[/sub]')).min(1).optional(),
   commands: z.array(z.string().refine(isCommand, 'must be whole-word command names')).min(1).optional(),
   /** Longer commands that start like one of `commands` but are not this check (npm audit signatures, gitleaks version). */
@@ -207,7 +216,8 @@ const signatureSchema = z.strictObject({
   .refine((t) => (t.availability === undefined) === (t.unavailableWhy === undefined), { message: 'availability and unavailableWhy go together' })
   .refine((t) => t.scanTarget === undefined || t.commands !== undefined, { message: 'scanTarget needs commands' })
   .refine((t) => t.configFlag === undefined || t.configFiles !== undefined, { message: 'configFlag needs configFiles' })
-  .refine((t) => t.runners === undefined || t.actions !== undefined, { message: 'runners needs actions' });
+  .refine((t) => t.runners === undefined || t.actions !== undefined, { message: 'runners needs actions' })
+  .refine((t) => !(t.languages.length > 1 && t.languages.includes('any')), { message: 'any stands alone in languages' });
 
 const signaturesSchema = z.strictObject({ tools: z.array(signatureSchema).min(1) })
   .refine((f) => new Set(f.tools.map((t) => t.id)).size === f.tools.length, { message: 'ids must be unique' });

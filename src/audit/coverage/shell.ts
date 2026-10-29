@@ -240,6 +240,34 @@ export function preCommitRunMode(words: readonly string[]): 'all' | 'changed' | 
 export const preCommitAllFiles = (words: readonly string[]): boolean => preCommitRunMode(words) === 'all';
 
 const basename = (w: string) => w.slice(w.lastIndexOf('/') + 1);
+
+/** P57 (C1): at most this many path arguments are read; more and the run keeps its folder. */
+const MAX_PATH_ARGS = 8;
+/**
+ * P57 (C1): the words of a tool's command line that may name what it checks (not a flag, not a redirection), resolved
+ * from the folder it runs in. Null when there is none, more than MAX_PATH_ARGS, or one pipegen can't place (a
+ * variable, a glob, a quote, a path that leaves the repo): the run then keeps its folder. Which of these words are
+ * real paths (not a subcommand such as `check`) is decided once the repo can be looked at (scopeToPaths).
+ */
+export function pathWords(args: readonly string[], cwd: string | null): string[] | null {
+  if (cwd === null) return null;
+  const out: string[] = [];
+  for (let i = 0; i < args.length; i++) {
+    const w = args[i] as string;
+    const r = redirection(w);
+    if (r !== null) {
+      if (!r) i++;
+      continue;
+    }
+    if (w === '--') break;
+    if (w.startsWith('-') || w === '') continue;
+    if (!/^[A-Za-z0-9_.@+/-]{1,200}$/.test(w)) return null;
+    const d = resolveDir(cwd, stripDotSlash(w));
+    if (d === null || out.length >= MAX_PATH_ARGS) return null;
+    if (!out.includes(d)) out.push(d);
+  }
+  return out.length === 0 ? null : out;
+}
 const NPM_PROVENANCE_ID = 'npm-provenance';
 /** The image's name: no registry or owner, no :tag or @digest (ghcr.io/zricethezav/gitleaks:v8 → gitleaks). */
 export function imageName(image: string): string {
@@ -519,6 +547,9 @@ export function scanShell(text: string, base: string | null, sigs: Compiled, bud
           if (b !== null) f.dockerBuild = b;
         }
         if (r.tool.id === NPM_PROVENANCE_ID) f.envGate = 'npm';
+        // P57 (C1): path arguments scope the run to the services under them (scopeToPaths, once the repo can be checked)
+        const paths = complete ? pathWords(args.slice(r.rest.length), cwd) : null;
+        if (paths !== null) f.pathArgs = paths;
         add(f);
       }
     };
@@ -598,9 +629,14 @@ export function scanShell(text: string, base: string | null, sigs: Compiled, bud
     if (words === null) return;
     const cmd = words.join(' ');
     const categories = script !== undefined ? [] : (words[words.length - 1] as string).startsWith('lint') ? ['lint'] : TEST_CATEGORIES;
+    // P57 (C1): pytest, tox and nox test Python; a package script counted by name is a Node package's, and pipegen can't
+    // tell what else its runner checks ('?': resolveScripts narrows it from the script's text when it can)
+    const python = byName === undefined && script === undefined;
+    const paths = name === 'pytest' && segEnd[k]! - k - 1 <= MAX_FLAG_WORDS ? pathWords(args, cwd) : null;
     add({
       categories, by: `your own \`${cmd}\``, subject: `Your own \`${cmd}\``, dir: cwd, reason: shellReason(k),
       ...(script === undefined ? {} : { script }), ...(envGate === undefined ? {} : { envGate }), ...(byName === undefined ? {} : { byName }),
+      ...(python ? { langs: ['python'] } : byName !== undefined ? { langs: ['node', '?'] } : {}), ...(paths === null ? {} : { pathArgs: paths }),
     });
   };
   /**

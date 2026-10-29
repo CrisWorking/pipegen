@@ -462,7 +462,14 @@ export const foundOf = (tool: ToolSignature, dir: string | null, reason: Reason 
     : tool.partialWhy === undefined ? {} : { partialWhy: tool.partialWhy }),
   ...(tool.softEnv === undefined ? {} : { softEnv: tool.softEnv }),
   ...(tool.configFiles === undefined || configOff ? {} : { configFiles: tool.configFiles }),
+  ...langsOf(tool),
 });
+
+/** P57 (C1): a signature's languages as Found.langs: `any` → absent (every service), `unknown` → '?'. */
+export function langsOf(tool: ToolSignature): { langs?: readonly string[] } {
+  if (tool.languages.includes('any')) return {};
+  return { langs: tool.languages.map((l) => (l === 'unknown' ? '?' : l)) };
+}
 
 /** Fix round 1 (P8): a command line that turns the tool's config file loading off (`trivy --config ''`). */
 export function configTurnedOff(tool: ToolSignature, args: readonly string[]): boolean {

@@ -14,7 +14,21 @@ import type { Compiled, Ctx, Found, Reason } from './types.js';
 // ---------- own scripts read from package.json (Task 5) ----------
 
 /** Fix round 1 (P8): a script's tool keeps its softEnv names and config files, so the job's env and files reach it. */
-const carriedConfig = (g: Found) => ({ ...(g.softEnv === undefined ? {} : { softEnv: g.softEnv }), ...(g.configFiles === undefined ? {} : { configFiles: g.configFiles }) });
+const carriedConfig = (g: Found) => ({
+  ...(g.softEnv === undefined ? {} : { softEnv: g.softEnv }), ...(g.configFiles === undefined ? {} : { configFiles: g.configFiles }),
+  // P57 (C1): and the languages it checks and the paths it was given
+  ...(g.langs === undefined ? {} : { langs: g.langs }), ...(g.pathArgs === undefined ? {} : { pathArgs: g.pathArgs }),
+});
+
+/**
+ * P57 (C1): the languages a script counted by name checks, from what its text runs for the row's categories: the
+ * known tools' languages when every one of them is known; else the caller's (a Node package's script, '?').
+ */
+function byNameLangs(f: Found, runs: readonly Found[]): readonly string[] | undefined {
+  const own = runs.filter((g) => g.categories.some((c) => f.categories.includes(c)));
+  if (own.length === 0 || own.some((g) => g.langs === undefined || g.langs.includes('?'))) return f.langs;
+  return [...new Set(own.flatMap((g) => g.langs as readonly string[]))];
+}
 
 /** Plan P Task 3 (PS11): the own-script categories a by-name script (test, lint) also counts for through its text. */
 const PLAN_P_SCRIPT_CATEGORIES: ReadonlySet<string> = new Set(['format', 'type-check', 'coverage', 'dead-code', 'duplication']);
@@ -77,7 +91,9 @@ export async function resolveScripts(ctx: Ctx, found: Found[]): Promise<Found[]>
     const f = f0.composeRun === undefined ? f0 : await placeComposeRun(ctx, f0);
     if (f === null) continue;
     if (f.byName !== undefined) {
-      const lowered = await byNameRun(ctx, f);
+      const lowered0 = await byNameRun(ctx, f);
+      const langs = lowered0 === null || f.dir === null ? undefined : byNameLangs(lowered0, await scriptRuns(ctx, f.dir, f.byName));
+      const lowered = lowered0 === null ? null : { ...lowered0, ...(langs === undefined ? {} : { langs }) };
       if (lowered !== null) out.push(lowered);
       // Plan P Task 3 (PS11): what the script's text runs for the Plan P categories (`npm run test:coverage` →
       // coverage) counts through that text only, as for any other own script (the older ones keep the by-name rule)

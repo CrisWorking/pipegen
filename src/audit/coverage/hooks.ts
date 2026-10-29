@@ -74,7 +74,12 @@ function readPrecommitConfig(ctx: Ctx): Promise<{ readable: boolean; found: Foun
     const topFiltered = isSet(r.ok, 'files') || isSet(r.ok, 'exclude');
     const found: Found[] = [];
     const scan = (text: string) => scanShell(text, '.', ctx.sigs, ctx.budget, DEFAULT_SHELL);
-    const tag = (fs: Found[], reason: Reason): Found[] => fs.map((f) => ({ ...f, reason: f.reason ?? reason }));
+    // P57 (C1): a hook from a repo pipegen doesn't know may run anything, in any language: its id says nothing about which
+    const tag = (fs: Found[], reason: Reason): Found[] => fs.map((f) => {
+      const { langs: _langs, ...rest } = f;
+      void _langs;
+      return { ...(reason === 'hook-repo' ? rest : f), reason: f.reason ?? reason };
+    });
     for (const rawRepo of list(r.ok.repos).slice(0, MAX_HOOKS)) {
       const repo = asObj(rawRepo);
       const url = typeof repo.repo === 'string' && regexSafe(repo.repo) ? repo.repo : '';
@@ -110,7 +115,7 @@ function readPrecommitConfig(ctx: Ctx): Promise<{ readable: boolean; found: Foun
             ? tools.filter((t) => flagsAllow(t, args, complete)).map((t) => foundOf(t, '.', commandReason(t, args) ?? (complete ? null : 'long')))
             : tag(scan(hookCommand(id, args)), 'hook-repo');
         }
-        hookFound = hookFound.map((f) => (FORMATTER_HOOKS.has(f.by) ? { ...f, formats: formatterFails(f.by, words) } : f));
+        hookFound = hookFound.map((f) => ({ ...(FORMATTER_HOOKS.has(f.by) ? { ...f, formats: formatterFails(f.by, words) } : f), ...(id === '' ? {} : { hookId: id }) }));
         // a file filter pipegen doesn't evaluate (they are Python regexes from the repo), or another stage
         const filtered = topFiltered || ['files', 'exclude', 'types', 'types_or', 'exclude_types'].some((k) => isSet(hook, k));
         if (filtered) hookFound = tag(hookFound, 'files');
@@ -204,7 +209,7 @@ export async function hookRunHits(ctx: Ctx): Promise<void> {
       ctx.hits.push({
         opaque: false, categories, by: t.by, subject, dir: '.', reason: configured ? 'config' : reason,
         ...(configured ? { partialWhy: configWhy(subject, set) } : {}), fit: rep.fit, where: cut(`${rep.where} → ${HOOK_FILE['pre-commit']}`),
-        ...(t.configFiles === undefined ? {} : { configFiles: t.configFiles }),
+        ...(t.configFiles === undefined ? {} : { configFiles: t.configFiles }), ...(t.langs === undefined ? {} : { langs: t.langs }),
       });
     }
   }

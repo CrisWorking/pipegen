@@ -210,6 +210,7 @@ function addFound(ctx: Ctx, found: Found[], c: StepCtx): void {
       ...(c.laterStep === true ? { laterStep: true } : {}), ...(f.configFiles === undefined ? {} : { configFiles: f.configFiles }),
       ...(f.configFiles !== undefined && c.foldCase === true ? { foldCase: true } : {}),
       ...(f.jobEnv === undefined ? {} : { jobEnv: f.jobEnv }),
+      ...(f.langs === undefined ? {} : { langs: f.langs }), ...(f.pathArgs === undefined ? {} : { pathArgs: f.pathArgs }),
     });
   }
 }
@@ -614,6 +615,32 @@ export async function configFilesPass(ctx: Ctx): Promise<void> {
     }
     if (found !== null) ctx.hits[i] = { ...h, reason: 'config', partialWhy: configWhy(h.subject, `a ${found} file`) };
   }
+}
+
+/**
+ * P57 (C1): a run given path arguments (Found.pathArgs) covers only the services under them. The words that exist in
+ * the repo are its paths (a subcommand such as `check` or `run`, or a flag's value that is no file, is dropped); with
+ * none, or one of them the run's own folder (`.`), it keeps its folder. Otherwise it becomes one run per path. Runs
+ * after configFilesPass, so a tool still looks for its config file in the folder it runs in.
+ */
+export async function scopeToPaths(ctx: Ctx): Promise<void> {
+  if (!ctx.hits.some((h) => h.pathArgs !== undefined)) return;
+  const out: Hit[] = [];
+  for (const h of ctx.hits) {
+    if (h.pathArgs === undefined || h.dir === null) {
+      out.push(h);
+      continue;
+    }
+    const there: string[] = [];
+    for (const p of h.pathArgs) if (p === '.' || (await ctx.read.exists(p))) there.push(p);
+    if (there.length === 0 || there.includes(h.dir)) out.push(h);
+    else for (const p of there) out.push({ ...h, dir: p });
+  }
+  if (out.length > MAX_HITS) {
+    ctx.budget.truncated = true;
+    return;
+  }
+  ctx.hits = out;
 }
 
 /**

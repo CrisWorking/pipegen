@@ -161,7 +161,7 @@ describe('mapCoverage (rulings)', () => {
   it('coverage: pre-commit framework and lefthook hook configs are read (S4)', async () => {
     const dir = makeTempDir();
     writeIn(dir, '.pre-commit-config.yaml', 'repos:\n  - repo: https://github.com/gitleaks/gitleaks\n    rev: v8.0.0\n    hooks:\n      - id: gitleaks\n  - repo: local\n    hooks:\n      - id: fmt\n        entry: ruff format\n        stages: [manual]\n');
-    const rows = await coverage(dir);
+    const rows = await coverage(dir, pyApp);
     expect(row(rows, 'pre-commit', 'secrets')).toMatchObject({ status: 'covered', by: 'gitleaks', where: '.pre-commit-config.yaml' });
     expect(row(rows, 'pre-commit', 'hooks')).toMatchObject({ status: 'covered', by: 'pre-commit' });
     expect(row(rows, 'pre-commit', 'format-lint', 'app').status).toBe('partial'); // manual stage only: set up, but not run before a commit (fix round 1, I2)
@@ -216,7 +216,7 @@ describe('mapCoverage (rulings)', () => {
     expect(row(rows, 'push', 'unit-tests', 'app').why).toBe('Your own `npm test` runs on every push.');
     const dir2 = makeTempDir();
     wf(dir2, 'ci.yml', `on: push\n${job(run('python -m pytest -q'))}`);
-    expect(row(await coverage(dir2), 'push', 'unit-tests', 'app')).toMatchObject({ status: 'covered', by: 'your own `python -m pytest`' });
+    expect(row(await coverage(dir2, pyApp), 'push', 'unit-tests', 'app')).toMatchObject({ status: 'covered', by: 'your own `python -m pytest`' });
     // whole words only: not a substring, not inside another word, not in a shell comment
     const dir3 = makeTempDir();
     wf(dir3, 'ci.yml', `on: push\n${job(run('nogitleaksx --npm-testx') + run('cat .gitleaks.toml') + run('"# gitleaks later"'))}`);
@@ -384,6 +384,11 @@ async function one(body: string, layer: Layer, id: string, over: Partial<RepoPro
 }
 const both = 'on: [push, pull_request]\n';
 const runnable = { services: [svc('.', { scripts: ['start'] })] };
+// P57 (C1): a tool counts only for services of its languages, so Python and Go tools are tested on Python and Go services
+const pyApp = { services: [svc('.', { language: 'python', packageManager: 'uv', scripts: [] })] };
+const goApp = { services: [svc('.', { language: 'go', packageManager: 'other', scripts: [] })] };
+/** P57 (C1): the root service in the language of the command's runner (pytest/coverage → Python, go → Go, else Node). */
+const langOver = (cmd: string): Partial<RepoProfile> => (/\bpytest\b|\bcoverage (?:run|report)\b|\btox\b|\bnox\b/.test(cmd) ? pyApp : /^go /.test(cmd) ? goApp : {});
 
 describe('mapCoverage (fix round 1)', () => {
   it('coverage: I1 shell suppression (|| true, || :, || exit 0, set +e) → partial', async () => {
@@ -529,7 +534,7 @@ describe('mapCoverage (fix round 1)', () => {
   });
 
   it('coverage: M2 a tool counts only where a command starts', async () => {
-    const st = async (cmd: string, id = 'secrets') => (await one(`${both}${job(run(cmd))}`, 'push', id, {}, id === 'secrets' ? undefined : 'app')).status;
+    const st = async (cmd: string, id = 'secrets', over: Partial<RepoProfile> = {}) => (await one(`${both}${job(run(cmd))}`, 'push', id, over, id === 'secrets' ? undefined : 'app')).status;
     expect(await st('pip install semgrep', 'sast')).toBe('missing');
     expect(await st('echo "TODO gitleaks"')).toBe('missing');
     expect(await st('some-tool --format semgrep', 'sast')).toBe('missing');
@@ -540,8 +545,8 @@ describe('mapCoverage (fix round 1)', () => {
     expect(await st('time gitleaks detect')).toBe('covered');
     expect(await st('npx --yes eslint .', 'lint')).toBe('covered');
     expect(await st('pnpm dlx eslint .', 'lint')).toBe('covered');
-    expect(await st('uv run pytest', 'unit-tests')).toBe('covered');
-    expect(await st('pipx run pip-audit', 'deps')).toBe('covered');
+    expect(await st('uv run pytest', 'unit-tests', pyApp)).toBe('covered');
+    expect(await st('pipx run pip-audit', 'deps', pyApp)).toBe('covered');
     expect(await st('python -m semgrep ci', 'sast')).toBe('covered');
     expect(await st('echo start && gitleaks detect')).toBe('covered'); // P54: the last && chain carries the step's status
     expect(await st('echo start && gitleaks detect; echo done')).toBe('partial'); // P53: not last, echo isn't on the && allowlist
@@ -681,7 +686,10 @@ describe('mapCoverage (fix round 2)', () => {
   for (const [label, body, layer, id, want] of cases) {
     it(`coverage: round 2: ${label} → ${want}`, async () => {
       neverOff.on = label.startsWith('trivy-action'); // the input rule, not the never-list (P33)
-      const r = await one(body, layer, id, runnableTf, id === 'secrets' || id === 'iac' ? undefined : 'app');
+      // P57 (C1): Go and Python scanners are checked on a service of their language
+      const lang = /^(gosec|govulncheck)/.test(label) ? 'go' : /^(bandit|pip-audit)/.test(label) ? 'python' : 'node';
+      const over = lang === 'node' ? runnableTf : { ...runnableTf, services: [svc('.', { scripts: ['start'], language: lang })] };
+      const r = await one(body, layer, id, over, id === 'secrets' || id === 'iac' ? undefined : 'app');
       expect(r.status).toBe(want);
     });
   }
@@ -921,18 +929,23 @@ describe('loadToolSignatures (S1)', () => {
       writeIn(dir, 'sig.yml', yaml);
       return () => loadToolSignatures(join(dir, 'sig.yml'));
     };
-    expect(load('tools:\n  - id: a\n    categories: [secrets]\n    commands: [a]\n')()).toHaveLength(1);
-    expect(load('tools:\n  - id: a\n    categories: [secrets]\n    commands: [a]\n    extra: 1\n')).toThrow(/not valid/);
-    expect(load('tools:\n  - id: a\n    categories: [nope]\n    commands: [a]\n')).toThrow(/not valid/);
-    expect(load('tools:\n  - id: a\n    categories: [secrets]\n    actions: [noslash]\n')).toThrow(/not valid/);
-    expect(load('tools:\n  - id: a\n    categories: [secrets]\n    commands: ["a(b|c)*"]\n')).toThrow(/not valid/);
-    expect(load('tools:\n  - id: a\n    categories: [secrets]\n')).toThrow(/not valid/);
-    expect(load('tools:\n  - id: a\n    categories: [secrets]\n    commands: [a]\n    commandFails: flag\n')).toThrow(/not valid/); // flag needs failFlags
-    expect(load('tools:\n  - id: a\n    categories: [secrets]\n    actions: [o/a]\n    actionFails: input\n')).toThrow(/not valid/); // input needs failInputs
-    expect(load('tools:\n  - id: a\n    categories: [secrets]\n    commands: [a]\n    softFlags: [exit-zero]\n')).toThrow(/not valid/); // not a flag
-    expect(load('tools:\n  - id: a\n    categories: [secrets]\n    commands: [a]\n    partialWhy: lower case and no stop\n')).toThrow(/not valid/);
-    expect(load('tools:\n  - id: a\n    categories: [secrets]\n    actions: [o/a*/b]\n')).toThrow(/not valid/); // * only on the last part
-    expect(load('tools:\n  - id: a\n    categories: [secrets]\n    commands: [a]\n  - id: a\n    categories: [sast]\n    commands: [b]\n')).toThrow(/not valid/);
+    expect(load('tools:\n  - id: a\n    categories: [secrets]\n    languages: [any]\n    commands: [a]\n')()).toHaveLength(1);
+    // P57 (C1): every signature names the languages it checks; `any` stands alone
+    expect(load('tools:\n  - id: a\n    categories: [secrets]\n    commands: [a]\n')).toThrow(/not valid/);
+    expect(load('tools:\n  - id: a\n    categories: [secrets]\n    languages: [any, node]\n    commands: [a]\n')).toThrow(/not valid/);
+    expect(load('tools:\n  - id: a\n    categories: [secrets]\n    languages: [cobol]\n    commands: [a]\n')).toThrow(/not valid/);
+    expect(load('tools:\n  - id: a\n    categories: [lint]\n    languages: [node, unknown]\n    commands: [a]\n')()).toHaveLength(1);
+    expect(load('tools:\n  - id: a\n    categories: [secrets]\n    languages: [any]\n    commands: [a]\n    extra: 1\n')).toThrow(/not valid/);
+    expect(load('tools:\n  - id: a\n    categories: [nope]\n    languages: [any]\n    commands: [a]\n')).toThrow(/not valid/);
+    expect(load('tools:\n  - id: a\n    categories: [secrets]\n    languages: [any]\n    actions: [noslash]\n')).toThrow(/not valid/);
+    expect(load('tools:\n  - id: a\n    categories: [secrets]\n    languages: [any]\n    commands: ["a(b|c)*"]\n')).toThrow(/not valid/);
+    expect(load('tools:\n  - id: a\n    categories: [secrets]\n    languages: [any]\n')).toThrow(/not valid/);
+    expect(load('tools:\n  - id: a\n    categories: [secrets]\n    languages: [any]\n    commands: [a]\n    commandFails: flag\n')).toThrow(/not valid/); // flag needs failFlags
+    expect(load('tools:\n  - id: a\n    categories: [secrets]\n    languages: [any]\n    actions: [o/a]\n    actionFails: input\n')).toThrow(/not valid/); // input needs failInputs
+    expect(load('tools:\n  - id: a\n    categories: [secrets]\n    languages: [any]\n    commands: [a]\n    softFlags: [exit-zero]\n')).toThrow(/not valid/); // not a flag
+    expect(load('tools:\n  - id: a\n    categories: [secrets]\n    languages: [any]\n    commands: [a]\n    partialWhy: lower case and no stop\n')).toThrow(/not valid/);
+    expect(load('tools:\n  - id: a\n    categories: [secrets]\n    languages: [any]\n    actions: [o/a*/b]\n')).toThrow(/not valid/); // * only on the last part
+    expect(load('tools:\n  - id: a\n    categories: [secrets]\n    languages: [any]\n    commands: [a]\n  - id: a\n    categories: [sast]\n    languages: [any]\n    commands: [b]\n')).toThrow(/not valid/);
   });
 });
 
@@ -1051,7 +1064,7 @@ describe('mapCoverage (Task 5, item 2: Python runners)', () => {
   it('python runners: flask shape `uv run --locked --no-default-groups --group dev tox run` → covered "your own `tox run`"', async () => {
     const dir = makeTempDir();
     ci(dir, run('uv run --locked --no-default-groups --group dev tox run'));
-    const rows = await coverage(dir);
+    const rows = await coverage(dir, pyApp);
     expect(row(rows, 'push', 'unit-tests', 'app')).toMatchObject({ status: 'covered', by: 'your own `tox run`' });
     expect(row(rows, 'merge', 'full-tests', 'app')).toMatchObject({ status: 'covered', by: 'your own `tox run`' });
   });
@@ -1064,7 +1077,7 @@ describe('mapCoverage (Task 5, item 2: Python runners)', () => {
     ]) {
       const dir = makeTempDir();
       ci(dir, run(cmd as string));
-      expect(row(await coverage(dir), 'push', 'unit-tests', 'app'), cmd).toMatchObject({ status: 'covered', by });
+      expect(row(await coverage(dir, pyApp), 'push', 'unit-tests', 'app'), cmd).toMatchObject({ status: 'covered', by });
     }
   });
 
@@ -1076,7 +1089,7 @@ describe('mapCoverage (Task 5, item 2: Python runners)', () => {
     ]) {
       const dir = makeTempDir();
       ci(dir, steps);
-      expect(row(await coverage(dir), 'push', 'unit-tests', 'app').status, steps).toBe('missing');
+      expect(row(await coverage(dir, pyApp), 'push', 'unit-tests', 'app').status, steps).toBe('missing');
     }
   });
 
@@ -1087,15 +1100,15 @@ describe('mapCoverage (Task 5, item 2: Python runners)', () => {
     ]) {
       const dir = makeTempDir();
       ci(dir, steps);
-      expect(row(await coverage(dir), 'push', 'unit-tests', 'app').status, steps).toBe('partial');
+      expect(row(await coverage(dir, pyApp), 'push', 'unit-tests', 'app').status, steps).toBe('partial');
     }
     // an env set for the whole job or workflow picks the envs too
     const dir = makeTempDir();
     wf(dir, 'ci.yml', `${both}env:\n  TOX_ENV: lint\n${job(run('tox run'))}`);
-    expect(row(await coverage(dir), 'push', 'unit-tests', 'app').status).toBe('partial');
+    expect(row(await coverage(dir, pyApp), 'push', 'unit-tests', 'app').status).toBe('partial');
     const dir2 = makeTempDir();
     ci(dir2, run('tox run'), '    env:\n      TOX_ENV: lint\n');
-    expect(row(await coverage(dir2), 'push', 'unit-tests', 'app').status).toBe('partial');
+    expect(row(await coverage(dir2, pyApp), 'push', 'unit-tests', 'app').status).toBe('partial');
   });
 });
 
@@ -1262,7 +1275,7 @@ describe('mapCoverage (P55 batch B: prek)', () => {
     const dir = makeTempDir();
     writeIn(dir, '.pre-commit-config.yaml', config);
     wf(dir, 'ci.yml', `on:\n  pull_request:\n${job(steps, extraWf)}`);
-    return coverage(dir);
+    return coverage(dir, pyApp);
   };
   const cfg = hookConfig('      - id: ruff-check\n');
   const CHANGED = 'uv run prek run --from-ref origin/${GITHUB_BASE_REF} --to-ref HEAD --show-diff-on-failure';
@@ -1335,7 +1348,7 @@ describe('mapCoverage (Task 5, item 3: pre-commit hook contents)', () => {
   it('pre-commit hooks: ruff-check and ruff-format hooks → the format and lint hook is covered', async () => {
     const dir = makeTempDir();
     writeIn(dir, '.pre-commit-config.yaml', hookConfig('      - id: ruff-check\n      - id: ruff-format\n'));
-    const rows = await coverage(dir);
+    const rows = await coverage(dir, pyApp);
     expect(row(rows, 'pre-commit', 'format-lint', 'app')).toMatchObject({ status: 'covered', by: 'ruff', where: '.pre-commit-config.yaml' });
     expect(row(rows, 'pre-commit', 'hooks')).toMatchObject({ status: 'covered', by: 'pre-commit' });
   });
@@ -1344,7 +1357,7 @@ describe('mapCoverage (Task 5, item 3: pre-commit hook contents)', () => {
     const dir = makeTempDir();
     writeIn(dir, '.pre-commit-config.yaml', hookConfig('      - id: ruff-check\n      - id: ruff-format\n'));
     wf(dir, 'pre-commit.yaml', `on:\n  pull_request:\n  push:\n    branches: [main, stable]\n${job(run(FLASK_PRECOMMIT))}`);
-    const rows = await coverage(dir);
+    const rows = await coverage(dir, pyApp);
     expect(row(rows, 'merge', 'hooks-ci')).toMatchObject({ status: 'covered', by: 'pre-commit' });
     expect(row(rows, 'push', 'hooks-ci').status).toBe('partial'); // feature-branch pushes don't run it
     const lint = row(rows, 'merge', 'lint', 'app');
@@ -1355,7 +1368,7 @@ describe('mapCoverage (Task 5, item 3: pre-commit hook contents)', () => {
     const dir2 = makeTempDir();
     writeIn(dir2, '.pre-commit-config.yaml', hookConfig('      - id: ruff\n'));
     ci(dir2, '      - uses: pre-commit/action@v3.0.1\n');
-    expect(row(await coverage(dir2), 'merge', 'lint', 'app')).toMatchObject({ status: 'covered', by: 'ruff' });
+    expect(row(await coverage(dir2, pyApp), 'merge', 'lint', 'app')).toMatchObject({ status: 'covered', by: 'ruff' });
   });
 
   it('pre-commit hooks (adversarial): a manual stage, a local hook named like a tool, a look-alike repo, an overridden entry → not covered', async () => {
@@ -1370,7 +1383,7 @@ describe('mapCoverage (Task 5, item 3: pre-commit hook contents)', () => {
     ] as const) {
       const dir = makeTempDir();
       writeIn(dir, '.pre-commit-config.yaml', config);
-      const rows = await coverage(dir);
+      const rows = await coverage(dir, pyApp);
       expect(row(rows, 'pre-commit', 'format-lint', 'app').status, config).toBe(expected);
       expect(row(rows, 'pre-commit', 'secrets').status, config).toBe('missing');
     }
@@ -1388,7 +1401,7 @@ describe('mapCoverage (Task 5, item 3: pre-commit hook contents)', () => {
       const dir = makeTempDir();
       writeIn(dir, '.pre-commit-config.yaml', config);
       ci(dir, steps);
-      expect(row(await coverage(dir), 'merge', 'lint', 'app').status, steps).toBe('missing');
+      expect(row(await coverage(dir, pyApp), 'merge', 'lint', 'app').status, steps).toBe('missing');
     }
   });
 
@@ -1396,35 +1409,36 @@ describe('mapCoverage (Task 5, item 3: pre-commit hook contents)', () => {
     const dir = makeTempDir();
     writeIn(dir, '.pre-commit-config.yaml', hookConfig('      - id: gitleaks\n', 'https://github.com/gitleaks/gitleaks'));
     ci(dir, run('pre-commit run --all-files'));
-    const rows = await coverage(dir);
+    const rows = await coverage(dir, pyApp);
     expect(row(rows, 'pre-commit', 'secrets')).toMatchObject({ status: 'covered', by: 'gitleaks' });
     expect(row(rows, 'merge', 'secrets').status).toBe('missing');
     const dir2 = makeTempDir();
     writeIn(dir2, '.pre-commit-config.yaml', hookConfig('      - id: ruff-check\n        args: [--exit-zero]\n'));
     ci(dir2, run('pre-commit run --all-files'));
-    expect(row(await coverage(dir2), 'merge', 'lint', 'app').status).toBe('partial');
+    expect(row(await coverage(dir2, pyApp), 'merge', 'lint', 'app').status).toBe('partial');
   });
 });
 
 describe('mapCoverage (Task 5, item 4: package publishing at the deploy layer)', () => {
   const pkgService = { services: [svc('.', { scripts: ['test'] })] };
+  const pyPkg = { services: [svc('.', { scripts: ['test'], language: 'python', packageManager: 'uv' })] }; // P57 (C1): PyPI publishes a Python package
   const tagPush = 'on:\n  push:\n    tags: [\'*\']\n';
 
   it('deploy: pypa/gh-action-pypi-publish with trusted publishing → attestation covered (flask shape)', async () => {
     const dir = makeTempDir();
     wf(dir, 'publish.yaml', `${tagPush}${job('      - uses: pypa/gh-action-pypi-publish@v1.14.2\n        with:\n          packages-dir: "dist/"\n', `    permissions:\n      ${'id-' + 'token'}: write\n`)}`); // built at runtime (secret-literal guard)
-    expect(row(await coverage(dir, pkgService), 'deploy', 'attestation', 'app')).toMatchObject({ status: 'covered', by: 'pypi-publish' });
+    expect(row(await coverage(dir, pyPkg), 'deploy', 'attestation', 'app')).toMatchObject({ status: 'covered', by: 'pypi-publish' });
   });
 
   it('deploy (adversarial): pypi-publish with a password, attestations off or another index makes no attestation → missing', async () => {
     for (const w of [`${'pass' + 'word'}: \${{ secrets.${'PYPI_' + 'TOKEN'} }}`, 'attestations: false', 'Attestations: "false"', 'attestations: ${{ inputs.attest }}', 'repository-url: https://pypi.example.test/legacy/', 'repository_url: https://pypi.example.test/legacy/']) {
       const dir = makeTempDir();
       wf(dir, 'publish.yaml', `${tagPush}${job(`      - uses: pypa/gh-action-pypi-publish@release/v1\n        with:\n          ${w}\n`)}`);
-      expect(row(await coverage(dir, pkgService), 'deploy', 'attestation', 'app').status, w).toBe('missing');
+      expect(row(await coverage(dir, pyPkg), 'deploy', 'attestation', 'app').status, w).toBe('missing');
     }
     const ok = makeTempDir();
     wf(ok, 'publish.yaml', `${tagPush}${job('      - uses: pypa/gh-action-pypi-publish@release/v1\n        with:\n          repository-url: https://test.pypi.org/legacy/\n')}`);
-    expect(row(await coverage(ok, pkgService), 'deploy', 'attestation', 'app').status).toBe('covered');
+    expect(row(await coverage(ok, pyPkg), 'deploy', 'attestation', 'app').status).toBe('covered');
   });
 
   it('deploy: `npm publish --provenance` on release → attestation covered', async () => {
@@ -1451,7 +1465,7 @@ describe('mapCoverage (Task 5 fix round 1)', () => {
 
   it('C1: pypi-publish counts only at v1.11.0 or later; an older version is missing with its own why, an unknown ref partial', async () => {
     const pub = (ref: string, w = '') => `on:\n  release:\n    types: [published]\n${job(`      - uses: pypa/gh-action-pypi-publish@${ref}\n${w}`)}`;
-    const pkgService = { services: [svc('.', { scripts: ['test'] })] };
+    const pkgService = { services: [svc('.', { scripts: ['test'], language: 'python', packageManager: 'uv' })] };
     const OLD = 'The PyPI publish action runs at a version before v1.11.0, which makes no attestation unless told to.';
     const UNKNOWN = "The PyPI publish action makes attestations by default only from v1.11.0, and pipegen can't tell which version this ref is.";
     for (const [ref, status, why] of [
@@ -1507,7 +1521,7 @@ describe('mapCoverage (Task 5 fix round 1)', () => {
     for (const [name, config, fmt, secrets, ciLint] of cases) {
       const dir = makeTempDir();
       writeIn(dir, '.pre-commit-config.yaml', config);
-      const hooks = await coverage(dir, py);
+      const hooks = await coverage(dir, name.startsWith('biome') ? {} : py); // P57 (C1): biome formats Node code
       expect(row(hooks, 'pre-commit', 'format-lint', 'app').status, `${name}: hook`).toBe(fmt);
       expect(row(hooks, 'pre-commit', 'secrets').status, `${name}: secrets`).toBe(secrets);
       wf(dir, 'ci.yml', PR(run('pre-commit run --all-files')));
@@ -1526,7 +1540,7 @@ describe('mapCoverage (Task 5 fix round 1)', () => {
     for (const [cmd, lint] of [['ruff format --check .', 'missing'], ['biome format .', 'missing'], ['ruff check .', 'covered'], ['biome ci .', 'covered'], ['biome lint .', 'covered']]) {
       const dir = makeTempDir();
       wf(dir, 'ci.yml', PR(run(cmd as string)));
-      expect(row(await coverage(dir), 'merge', 'lint', 'app').status, cmd).toBe(lint);
+      expect(row(await coverage(dir, (cmd as string).startsWith('ruff') ? py : {}), 'merge', 'lint', 'app').status, cmd).toBe(lint);
     }
   });
 
@@ -1997,7 +2011,7 @@ describe('mapCoverage (Plan U final review I2)', () => {
     const steps = '      - uses: actions/checkout@v4\n      - run: uv run --locked --no-default-groups --group dev tox run\n'
       + "        env:\n          TOX_ENV: ${{ matrix.tox || format('py{0}', matrix.python) }}\n";
     ci(dir, steps, matrix);
-    for (const r of testRows(await coverage(dir))) expect(r, `${r.need.layer} ${r.need.id}`).toMatchObject({ status: 'partial', by: 'your own `tox run`', why: TOX_WHY });
+    for (const r of testRows(await coverage(dir, pyApp))) expect(r, `${r.need.layer} ${r.need.id}`).toMatchObject({ status: 'partial', by: 'your own `tox run`', why: TOX_WHY });
   });
 
   it('I2: TOXENV from a matrix value, set for the step, the job or the workflow, inline or through GITHUB_ENV → partial', async () => {
@@ -2011,7 +2025,7 @@ describe('mapCoverage (Plan U final review I2)', () => {
     ]) {
       const dir = makeTempDir();
       wf(dir, 'ci.yml', body as string);
-      for (const r of testRows(await coverage(dir))) {
+      for (const r of testRows(await coverage(dir, pyApp))) {
         expect(r.status, body).toBe('partial');
         expect(r.by, body).toBe(by);
         expect(r.why, body).toMatch(/a TOX… variable in this job \(like TOXENV\) picks which tox environments run, so pipegen can't tell if it runs the tests\.$/);
@@ -2022,7 +2036,7 @@ describe('mapCoverage (Plan U final review I2)', () => {
   it('I2: a NOX… variable (NOXSESSION) makes a nox run partial the same way', async () => {
     const dir = makeTempDir();
     ci(dir, '      - run: nox\n        env:\n          NOXSESSION: ${{ matrix.session }}\n');
-    for (const r of testRows(await coverage(dir))) {
+    for (const r of testRows(await coverage(dir, pyApp))) {
       expect(r).toMatchObject({ status: 'partial', by: 'your own `nox`' });
       expect(r.why).toBe("Your own `nox` runs, but a NOX… variable in this job (like NOXSESSION) picks which nox sessions run, so pipegen can't tell if it runs the tests.");
     }
@@ -2031,7 +2045,7 @@ describe('mapCoverage (Plan U final review I2)', () => {
   it('I2: another run that covers the tests still wins over the partial tox run', async () => {
     const dir = makeTempDir();
     ci(dir, '      - run: tox run\n        env:\n          TOXENV: ${{ matrix.toxenv }}\n' + run('pytest'));
-    expect(row(await coverage(dir), 'push', 'unit-tests', 'app')).toMatchObject({ status: 'covered', by: 'your own `pytest`' });
+    expect(row(await coverage(dir, pyApp), 'push', 'unit-tests', 'app')).toMatchObject({ status: 'covered', by: 'your own `pytest`' });
   });
 });
 
@@ -2190,8 +2204,8 @@ describe('mapCoverage (Plan P Task 3)', () => {
     for (const [cmd, by] of [['vulture src', 'vulture'], ['deptry .', 'deptry'], ['creosote --venv .venv', 'creosote']]) {
       expect(await rowOf(ciRun(cmd), 'merge', 'dead-code', py, 'app'), cmd).toMatchObject({ status: 'covered', by });
     }
-    expect(await rowOf(ciRun('go mod tidy -diff'), 'merge', 'dead-code', {}, 'app')).toMatchObject({ status: 'covered', by: 'go-mod-tidy' });
-    expect((await rowOf(ciRun('go mod tidy'), 'merge', 'dead-code', {}, 'app')).status).toBe('missing');
+    expect(await rowOf(ciRun('go mod tidy -diff'), 'merge', 'dead-code', goApp, 'app')).toMatchObject({ status: 'covered', by: 'go-mod-tidy' });
+    expect((await rowOf(ciRun('go mod tidy'), 'merge', 'dead-code', goApp, 'app')).status).toBe('unknown'); // not covered; Go is a stack pipegen doesn't support yet, so not missing either
   });
 
   it('coverage: pinact run without --check → workflow-pin-check missing', async () => {
@@ -2482,7 +2496,8 @@ describe('mapCoverage (Plan P Task 3)', () => {
       const dir = makeTempDir();
       writeIn(dir, '.pre-commit-config.yaml', `repos:\n${hooks}`);
       ci(dir, run('pre-commit run --all-files'));
-      const r = row(await cov(dir, { services: [pySvc] }), 'merge', 'format', 'app');
+      // P57 (C1): prettier and biome format Node code, black Python
+      const r = row(await cov(dir, /prettier|biome/.test(hooks) ? {} : { services: [pySvc] }), 'merge', 'format', 'app');
       return `${r.status}${r.by === undefined ? '' : ` ${r.by}`}`;
     };
     const local = (entry: string) => `  - repo: local\n    hooks:\n      - id: fmt\n        name: fmt\n        language: system\n        entry: ${entry}\n`;
@@ -2507,7 +2522,7 @@ describe('mapCoverage (Plan P Task 3)', () => {
   });
 
   it('coverage: go test -fuzz=FuzzX on schedule → fuzzing covered; go test alone doesn\'t', async () => {
-    const over = { services: [svc('.', { quality: { ...q, fuzzTargets: true } })] };
+    const over = { services: [svc('.', { language: 'go', quality: { ...q, fuzzTargets: true } })] };
     const sched = (cmd: string) => `on:\n  schedule:\n    - cron: '0 2 * * *'\n${job(run(cmd))}`;
     expect(await rowOf(sched('go test ./pkg -fuzz=FuzzX -fuzztime=10m'), 'merge', 'fuzzing', over, 'app')).toMatchObject({ status: 'covered', by: 'go-fuzz' });
     expect(await rowOf(sched('go test ./pkg -fuzz FuzzX'), 'merge', 'fuzzing', over, 'app')).toMatchObject({ status: 'covered', by: 'go-fuzz' });
@@ -2521,13 +2536,14 @@ describe('mapCoverage (Plan P Task 3)', () => {
   it('coverage: coverage runs are partial until a minimum is checked (PS17)', async () => {
     for (const [cmd, by] of [['npx vitest run --coverage', 'vitest-cov'], ['vitest --coverage.enabled', 'vitest-cov'], ['jest --coverage', 'jest-cov'], ['npx c8 mocha', 'c8'],
       ['nyc mocha', 'nyc'], ['pytest --cov=pkg', 'pytest-cov'], ['coverage report', 'coverage-py'], ['go test -coverprofile=c.out ./...', 'go-cover']]) {
-      const r = await rowOf(ciRun(cmd), 'merge', 'coverage', {}, 'app');
+      const r = await rowOf(ciRun(cmd), 'merge', 'coverage', langOver(cmd), 'app');
       expect(r, cmd).toMatchObject({ status: 'partial', by });
       // Plan P Task 4: vitest, jest and pytest runs are checked for a minimum (config-checks.test.ts); the others still aren't
       expect(r.why, cmd).toMatch(['vitest-cov', 'jest-cov', 'pytest-cov'].includes(by) ? /sets no minimum, so a drop can't fail the build/ : /hasn't checked for a minimum/);
     }
     for (const cmd of ['vitest run', 'vitest --coverage=false', 'vitest --coverage.enabled=false', 'jest', 'pytest --no-cov --cov=x', 'go test ./...']) {
-      expect((await rowOf(ciRun(cmd), 'merge', 'coverage', {}, 'app')).status, cmd).toBe('missing');
+      // Go is a stack pipegen doesn't support yet: a would-be missing row there is unknown
+      expect((await rowOf(ciRun(cmd), 'merge', 'coverage', langOver(cmd), 'app')).status, cmd).toBe(cmd.startsWith('go ') ? 'unknown' : 'missing');
     }
   });
 
@@ -2935,10 +2951,10 @@ describe('coverage: repo shell script files (DoD fastapi)', () => {
   it('coverage: `coverage run -m pytest` runs the tests; a flag whose value is the next word stops it', async () => {
     const dir = makeTempDir();
     wf(dir, 'ci.yml', `on: [push, pull_request]\n${job('      - run: coverage run --branch -m pytest tests/\n')}`);
-    expect(row(await coverage(dir), 'merge', 'unit-tests').status).toBe('covered');
+    expect(row(await coverage(dir, pyApp), 'merge', 'unit-tests').status).toBe('covered');
     const odd = makeTempDir();
     wf(odd, 'ci.yml', `on: [push, pull_request]\n${job('      - run: coverage run --rcfile cfg -m pytest tests/\n')}`);
-    expect(row(await coverage(odd), 'merge', 'unit-tests').status).toBe('missing');
+    expect(row(await coverage(odd, pyApp), 'merge', 'unit-tests').status).toBe('missing');
   });
 });
 
@@ -2986,7 +3002,7 @@ describe('coverage: stacks pipegen does not support yet (DoD cobra)', () => {
 // Fix round 1 of the DoD fixes (ruling P50; dod-fixes-review.md C1, C2, I4, M1): the reviewer's reproductions.
 describe('coverage: repo shell script files, fix round 1 (P50)', () => {
   const steps = (...runs: string[]) => `${both}jobs:\n  t:\n    runs-on: ubuntu-latest\n    steps:\n${runs.map((r) => run(r)).join('')}`;
-  const mergeTests = async (dir: string, over: Partial<RepoProfile> = {}) => row(await coverage(dir, over), 'merge', 'unit-tests');
+  const mergeTests = async (dir: string, over: Partial<RepoProfile> = pyApp) => row(await coverage(dir, over), 'merge', 'unit-tests');
   const withScript = (body: string, files: Record<string, string> = { 'scripts/test.sh': 'set -e\npytest\n' }) => {
     const dir = makeTempDir();
     wf(dir, 'ci.yml', body);
@@ -3015,9 +3031,9 @@ describe('coverage: repo shell script files, fix round 1 (P50)', () => {
     // 310 missing scripts, then a `npm test` whose script does nothing: never covered (U23 still reads package.json)
     const many = Array.from({ length: 310 }, (_, i) => `bash scripts/m${i}.sh || true`);
     const dir = withScript(steps(...many, 'npm test'), { 'package.json': JSON.stringify({ name: 'app', scripts: { test: 'echo "Error: no test specified"' } }), 'package-lock.json': '{}' });
-    expect((await mergeTests(dir)).status).not.toBe('covered');
+    expect((await mergeTests(dir, {})).status).not.toBe('covered');
     const only = withScript(steps('npm test'), { 'package.json': JSON.stringify({ name: 'app', scripts: { test: 'echo "Error: no test specified"' } }), 'package-lock.json': '{}' });
-    expect((await mergeTests(only)).status).toBe('missing');
+    expect((await mergeTests(only, {})).status).toBe('missing');
     // a script that runs the tests but comes after the budget is spent: unknown, never covered, never missing
     const files: Record<string, string> = { 'scripts/real.sh': 'set -e\npytest\n' };
     for (let i = 0; i < 130; i++) files[`scripts/e${i}.sh`] = 'echo hi\n';
@@ -3045,7 +3061,7 @@ describe('coverage: conditions inside a followed script (P51)', () => {
     const dir = makeTempDir();
     wf(dir, 'ci.yml', `${both}jobs:\n  t:\n    runs-on: ubuntu-latest\n    steps:\n${run('bash scripts/test.sh')}`);
     writeIn(dir, 'scripts/test.sh', script);
-    return row(await coverage(dir), 'merge', 'unit-tests');
+    return row(await coverage(dir, pyApp), 'merge', 'unit-tests');
   };
 
   it('P51: a test run only inside if/case/while, after && or || on a test, or after a conditional exit is partial', async () => {
@@ -3079,7 +3095,7 @@ describe('coverage: followed scripts and shells, allowlists (P52)', () => {
     const dir = makeTempDir();
     wf(dir, 'ci.yml', ci(runLine, shell));
     writeIn(dir, 'scripts/test.sh', script);
-    return row(await coverage(dir), 'merge', 'unit-tests');
+    return row(await coverage(dir, pyApp), 'merge', 'unit-tests');
   };
   const COND = 'Your own `scripts/test.sh` runs the check only under a condition in that script, so it may not run on every pull request.';
 
@@ -3120,15 +3136,15 @@ describe('coverage: followed scripts and shells, allowlists (P52)', () => {
     const dir = (shell: string) => { const d = makeTempDir(); wf(d, 'ci.yml', ci('pytest', shell)); return d; };
     // bash/sh told not to run the commands: nothing runs
     for (const sh of ['bash -n {0}', 'bash -o noexec {0}', 'sh -en {0}', 'bash -e -n {0}', 'bash -l -n {0}']) {
-      expect(row(await coverage(dir(sh)), 'merge', 'unit-tests').status, sh).toBe('missing');
+      expect(row(await coverage(dir(sh), pyApp), 'merge', 'unit-tests').status, sh).toBe('missing');
     }
     // a spec pipegen doesn't know: it can't tell what runs (re-review 2: never a false missing)
     for (const sh of ['perl {0}', 'bash -c {0}', 'node {0}', 'bash --posix {0}', 'zsh {0}', '/usrbash {0}', 'usr/bin/bash {0}', '/opt/bin/bash {0}']) {
-      expect(row(await coverage(dir(sh)), 'merge', 'unit-tests').status, sh).toBe('unknown');
+      expect(row(await coverage(dir(sh), pyApp), 'merge', 'unit-tests').status, sh).toBe('unknown');
     }
     // known specs, including the login shells setup-miniconda/setup-micromamba tell users to write, and absolute paths
     for (const sh of ['bash', 'sh', 'bash --noprofile --norc -eo pipefail {0}', 'sh -e {0}', 'bash -e {0}', 'bash {0}', 'bash -el {0}', 'bash -l {0}', 'bash --login -e {0}', '/usr/bin/bash -e {0}', '/bin/sh {0}']) {
-      expect(row(await coverage(dir(sh)), 'merge', 'unit-tests').status, sh).toBe('covered');
+      expect(row(await coverage(dir(sh), pyApp), 'merge', 'unit-tests').status, sh).toBe('covered');
     }
   });
 
@@ -3151,13 +3167,13 @@ describe('coverage: one condition analyzer for scripts, steps and package script
     const dir = makeTempDir();
     wf(dir, 'ci.yml', `${both}jobs:\n  t:\n    runs-on: ubuntu-latest\n    steps:\n${run('bash scripts/test.sh')}`);
     writeIn(dir, 'scripts/test.sh', body);
-    return row(await coverage(dir), 'merge', 'unit-tests');
+    return row(await coverage(dir, pyApp), 'merge', 'unit-tests');
   };
   const step = async (runText: string, files: Record<string, string> = {}) => {
     const dir = makeTempDir();
     wf(dir, 'ci.yml', `${both}jobs:\n  t:\n    runs-on: ubuntu-latest\n    steps:\n      - run: |\n${runText.split('\n').map((l) => `          ${l}`).join('\n')}\n`);
     for (const [f, t] of Object.entries(files)) writeIn(dir, f, t);
-    return row(await coverage(dir), 'merge', 'unit-tests');
+    return row(await coverage(dir, langOver(`${runText}\n${Object.values(files).join('\n')}`)), 'merge', 'unit-tests');
   };
 
   it('(1) an exit with a literal non-zero code is not conditional; one with a code pipegen can\'t read is', async () => {
@@ -3200,8 +3216,9 @@ describe('coverage: the last && chain carries the run\'s status (P54)', () => {
     const dir = makeTempDir();
     wf(dir, 'ci.yml', `${both}jobs:\n  t:\n    runs-on: ubuntu-latest\n    steps:\n      - run: |\n${runText.split('\n').map((l) => `          ${l}`).join('\n')}\n`);
     for (const [f, t] of Object.entries(files)) writeIn(dir, f, t);
-    // a TypeScript service, so the type check is one of its needs
-    return row(await coverage(dir, { services: [svc('.', { quality: { ...emptyServiceQuality(), tsconfig: true } })] }), 'merge', id);
+    // a TypeScript service, so the type check is one of its needs; P57 (C1): a Python one for pytest
+    const python = /\bpytest\b/.test(`${runText}\n${Object.values(files).join('\n')}`);
+    return row(await coverage(dir, python ? pyApp : { services: [svc('.', { quality: { ...emptyServiceQuality(), tsconfig: true } })] }), 'merge', id);
   };
   const pkg = (test: string) => ({ 'package.json': JSON.stringify({ name: 'app', scripts: { test, build: 'tsc -p .' } }) });
 
@@ -3225,5 +3242,83 @@ describe('coverage: the last && chain carries the run\'s status (P54)', () => {
     expect((await step('set -e\nbash scripts/test.sh\necho after', s)).status).toBe('covered'); // set -e on, a plain command
     expect((await step('if [ -n "$X" ]; then bash scripts/test.sh; fi', s)).status).toBe('partial');
     expect((await step('bash scripts/test.sh', { 'scripts/test.sh': 'lint && pytest\necho done\n' })).status).toBe('partial');
+  });
+});
+
+// ---------- P57 (hand-check fixes review, fix round 1): every reproduction is a test, seen failing first ----------
+
+describe('coverage: a tool covers only services of its languages (P57 C1)', () => {
+  const backend = svc('backend', { language: 'python', packageManager: 'uv', scripts: [], quality: { ...emptyServiceQuality(), pythonTyped: true } });
+  const frontend = svc('frontend', { quality: { ...emptyServiceQuality(), tsconfig: true, versions: { typescript: '5.9.2' } } });
+  const PRECOMMIT = 'repos:\n  - repo: https://github.com/pre-commit/mirrors-mypy\n    rev: v1.18.2\n    hooks:\n      - id: mypy\n'
+    + '  - repo: https://github.com/astral-sh/ruff-pre-commit\n    rev: v0.16.0\n    hooks:\n      - id: ruff\n      - id: ruff-format\n';
+  const rowsOf = async (steps: string, files: Record<string, string> = {}, services = [backend, frontend], precommit: RepoProfile['precommit'] = null) => {
+    const dir = makeTempDir();
+    for (const [rel, text] of Object.entries(files)) writeIn(dir, rel, text);
+    ci(dir, steps);
+    return coverage(dir, { services, precommit, monorepo: 'folders' });
+  };
+  const st = (rows: Coverage[], layer: Layer, id: string, service: string) => {
+    const r = row(rows, layer, id, service);
+    return `${r.status}${r.by === undefined ? '' : ` ${r.by}`}`;
+  };
+
+  it('lang1 probe: a Python tool run at the root never covers the TypeScript frontend, and a TS tool never the Python backend', async () => {
+    const cases: [string, string, string, string][] = [
+      ['mypy .', 'type-check', 'frontend', 'backend'],
+      ['ruff check .', 'lint', 'frontend', 'backend'],
+      ['pytest', 'unit-tests', 'frontend', 'backend'],
+      ['npx tsc --noEmit', 'type-check', 'backend', 'frontend'],
+      ['npx eslint .', 'lint', 'backend', 'frontend'],
+      ['npx vitest run', 'unit-tests', 'backend', 'frontend'],
+    ];
+    for (const [cmd, id, wrong, right] of cases) {
+      const rows = await rowsOf(run(cmd));
+      expect(st(rows, 'push', id, wrong), `${cmd} → ${wrong}`).toBe('missing');
+      expect(row(rows, 'push', id, right).status, `${cmd} → ${right}`).toBe('covered');
+    }
+  });
+
+  it('lang1 probe: prek/pre-commit --all-files carries mypy, ruff and ruff-format only to the Python service', async () => {
+    for (const cmd of ['prek run --all-files', 'pre-commit run --all-files']) {
+      const rows = await rowsOf(run(cmd), { '.pre-commit-config.yaml': PRECOMMIT });
+      for (const id of ['type-check', 'lint', 'format']) {
+        expect(st(rows, 'push', id, 'frontend'), `${cmd} ${id} frontend`).toBe('missing');
+        expect(row(rows, 'push', id, 'backend').status, `${cmd} ${id} backend`).toBe('covered');
+      }
+    }
+  });
+
+  it('lang1 probe: the pre-commit layer\'s ruff hook is not the frontend\'s format and lint hook', async () => {
+    const rows = await rowsOf('', { '.pre-commit-config.yaml': PRECOMMIT }, [backend, frontend], 'pre-commit');
+    expect(st(rows, 'pre-commit', 'format-lint', 'frontend')).toBe('missing');
+    expect(row(rows, 'pre-commit', 'format-lint', 'backend').status).toBe('covered');
+  });
+
+  it('a language-neutral tool (a secret scan, hadolint, trivy) still covers every service', async () => {
+    const rows = await rowsOf(run('gitleaks git --exit-code 1') + run('hadolint backend/Dockerfile frontend/Dockerfile'));
+    expect(row(rows, 'push', 'secrets').status).toBe('covered');
+  });
+
+  it('an own package script whose language pipegen can\'t tell (an unknown runner) is partial for a service of another language', async () => {
+    const files = { 'package.json': JSON.stringify({ name: 'root', scripts: { test: 'node run-all-tests.js' } }) };
+    const root = svc('.', { name: 'root' });
+    const rows = await rowsOf(run('npm test'), files, [root, backend]);
+    expect(row(rows, 'push', 'unit-tests', 'root').status).toBe('covered');
+    expect(st(rows, 'push', 'unit-tests', 'backend')).toBe('partial your own `npm test`');
+  });
+
+  it('a tool given explicit path arguments covers only the services under those paths', async () => {
+    const worker = svc('worker', { language: 'python', packageManager: 'uv', scripts: [], quality: { ...emptyServiceQuality(), pythonTyped: true } });
+    const tree = { 'backend/app.py': 'x = 1\n', 'worker/w.py': 'x = 1\n' };
+    const rows = await rowsOf(run('mypy backend'), tree, [backend, worker, frontend]);
+    expect(row(rows, 'push', 'type-check', 'backend').status).toBe('covered');
+    expect(st(rows, 'push', 'type-check', 'worker')).toBe('missing');
+    // a word that is no service folder (a subcommand, a file) keeps the run where it is
+    const rows2 = await rowsOf(run('ruff check .'), tree, [backend, worker, frontend]);
+    expect(row(rows2, 'push', 'lint', 'worker').status).toBe('covered');
+    const rows3 = await rowsOf(run('ruff check backend/app.py'), tree, [backend, worker, frontend]);
+    expect(row(rows3, 'push', 'lint', 'backend').status).toBe('covered');
+    expect(st(rows3, 'push', 'lint', 'worker')).toBe('missing');
   });
 });

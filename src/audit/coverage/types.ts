@@ -90,6 +90,15 @@ export interface Found {
   configFiles?: readonly string[];
   /** Fix round 1: the job env a CI `pre-commit run` sees, so the hooks' tools carried there check their softEnv against it. */
   jobEnv?: JobEnv;
+  /**
+   * P57 (C1): the service languages the run checks (src/types.ts Language); absent = any language. '?' = pipegen can't
+   * tell (an own script whose runner it doesn't know): the run is at most partial for a service of a language not listed.
+   */
+  langs?: readonly string[];
+  /** P57 (C1): the folders the tool was given as path arguments (repo-relative); the run covers only the services under them. */
+  pathArgs?: readonly string[];
+  /** P57 (C4): the pre-commit hook id this run comes from (readPrecommitConfig), so SKIP / PREK_SKIP can name it. */
+  hookId?: string;
 }
 /** Fix round 1 (P8): the softEnv names set in a job (`all`: an `env:` given as one expression could set any). */
 export interface JobEnv { all: boolean; names: ReadonlySet<string>; files: ReadonlySet<string> }
@@ -112,6 +121,9 @@ export interface Hit {
   jobEnv?: JobEnv;
   /** Fix round 2: the run's job may be on macOS or Windows, where config file names match in any letter case. */
   foldCase?: boolean;
+  /** P57 (C1): Found.langs and Found.pathArgs. */
+  langs?: readonly string[];
+  pathArgs?: readonly string[];
 }
 
 export interface Budget { visits: number; bytes: number; truncated: boolean }
