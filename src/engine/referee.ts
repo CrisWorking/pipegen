@@ -146,10 +146,42 @@ const TRIGGERS: ReadonlySet<string> = new Set(['push', 'pull_request', 'merge_gr
 const HOSTED_RUNNERS: ReadonlySet<string> = new Set(['ubuntu-latest', 'ubuntu-24.04', 'ubuntu-22.04', 'ubuntu-24.04-arm', 'ubuntu-22.04-arm']);
 /** GitHub's owner name rule (the same pattern as src/github/client.ts), checked again here: the central prefix is built from it. */
 const OWNER_RE = /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})$/;
-/** Local composite actions are expanded inline at most this many levels deep (ruling 3). */
-const MAX_COMPOSITE_DEPTH = 3;
-/** A status function in an `if:` makes a job run although a job it needs failed (always(), failure(), cancelled(), !cancelled()). */
-const STATUS_FN_RE = /\b(?:always|failure|cancelled)\s*\(/i;
+/** Any status function (success(), always(), failure(), cancelled()): GitHub adds its implicit success() && only when an if holds none. */
+const STATUS_FN_RE = /\b(?:success|always|failure|cancelled)\s*\(/i;
+
+/** Whether an expression holds `||` outside parentheses and quoted strings. */
+function topLevelOr(e: string): boolean {
+  let depth = 0;
+  for (let i = 0; i < e.length; i++) {
+    const c = e[i];
+    if (c === "'") {
+      for (i++; i < e.length; i++) if (e[i] === "'") { if (e[i + 1] === "'") i++; else break; }
+    } else if (c === '(') depth++;
+    else if (c === ')') depth--;
+    else if (c === '|' && e[i + 1] === '|' && depth === 0) return true;
+  }
+  return false;
+}
+
+/**
+ * Ruling 1 (fix round 2): the `if:` of a user job pipegen gated with `needs:` may only be absent, exactly `success()` (bare or
+ * in `${{ }}`), or `success() && <expr>` where <expr> holds no status function and no `||` at its top level. Anything else
+ * can run the job although pipegen's job failed (`success() || …`, `!success()`, `always()`, `!cancelled()`), and a
+ * condition without success() is refused too (the ruling's list is exhaustive; Plan G may write its own file instead).
+ */
+export function gatedIfAllowed(cond: unknown): boolean {
+  if (cond === undefined) return true;
+  if (typeof cond !== 'string') return false;
+  let e = cond.trim();
+  const wrapped = /^\$\{\{([\s\S]*)\}\}$/.exec(e);
+  if (wrapped !== null) e = (wrapped[1] as string).trim();
+  if (e.includes(EXPR) || e.includes('}}')) return false;
+  if (/^success\(\s*\)$/i.test(e)) return true;
+  const m = /^success\(\s*\)\s*&&([\s\S]+)$/i.exec(e);
+  if (m === null) return false;
+  const rest = m[1] as string;
+  return rest.trim() !== '' && !STATUS_FN_RE.test(rest) && !topLevelOr(rest);
+}
 
 const LEVEL: Readonly<Record<string, number>> = { none: 0, read: 1, write: 2 };
 const WORKFLOW_PATH_RE = /^\.github\/workflows\/[A-Za-z0-9._-]{1,100}\.ya?ml$/;
@@ -210,9 +242,11 @@ function parseYaml(text: string, mode: 'strict' | 'user'): { parsed: Parsed } | 
   if (directives?.yaml.explicit === true || Object.keys(directives?.tags ?? {}).some((h) => h !== '!!' && h !== '!')) problems.push('it has a YAML directive (%YAML or %TAG), which changes how values are read');
   const scalars: string[] = [];
   visit(doc, {
-    Scalar(_, n) { if (typeof n.value === 'string') scalars.push(n.value); },
     Alias() { if (mode === 'strict') problems.push('it uses a YAML alias (*name), which can copy a key past a reader'); },
+    // the S18 values are collected here, not in a Scalar visitor: one would replace this one for scalars, and their tags and
+    // anchors would go unchecked (review-7a-r1 finding 2)
     Node(_, n) {
+      if (isScalar(n) && typeof n.value === 'string') scalars.push(n.value);
       if (n.tag !== undefined) problems.push('it has a YAML tag (!!type), which changes what a value is');
       if (mode === 'strict' && n.anchor !== undefined) problems.push('it defines a YAML anchor (&name)');
     },
@@ -511,10 +545,13 @@ function judgeJob(fc: FileCtx, id: string, j: unknown): void {
   const calledPerms = caller ? judgeCaller(fc, id, j) : undefined;
   judgePermissions(fc, id, j, calledPerms);
   const envName = isObj(j.environment) ? j.environment.name : j.environment;
+  // GitHub environment names are not case-sensitive (fix round 2, ruling 4): any spelling of the signing environment counts
+  const signing = typeof envName === 'string' && envName.toLowerCase() === SIGNING_ENVIRONMENT;
   if (id === 'pipegen-verify' && fc.draft.capabilities.environments && envName !== SIGNING_ENVIRONMENT) {
     bad('permissions', `${where} must run in the environment ${SIGNING_ENVIRONMENT} (only deploys from the default branch pass it).`);
   }
-  if (envName === SIGNING_ENVIRONMENT && !SIGNING_JOBS.has(id)) bad('permissions', `${where} runs in ${SIGNING_ENVIRONMENT}, whose secrets only the sign and pipegen-verify jobs may get.`);
+  if (signing && !SIGNING_JOBS.has(id)) bad('permissions', `${where} runs in ${SIGNING_ENVIRONMENT} (in any spelling), whose secrets only the sign and pipegen-verify jobs may get.`);
+  else if (signing && envName !== SIGNING_ENVIRONMENT) bad('permissions', `${where} must name the environment exactly ${SIGNING_ENVIRONMENT}.`);
   if (caller) return;
   if (typeof j['runs-on'] !== 'string' || !HOSTED_RUNNERS.has(j['runs-on'])) {
     bad('template', `${where} must run on a GitHub-hosted runner (${[...HOSTED_RUNNERS].join(', ')}); a self-hosted runner keeps state between runs.`);
@@ -641,11 +678,11 @@ interface Judged {
 }
 
 /**
- * A job's steps, judged where they run: local composite actions expanded inline (ruling 3), then the order rule, the merged
- * npm ci pins and, for a job (`job`), the locked checkout before the first scanner that reads the workspace (ruling 4).
+ * A job's steps, judged where they run: each step (judgeList), then the order rule, the merged npm ci pins and, for a job
+ * (`job`), the locked checkout before the first scanner that reads the workspace (ruling 4).
  */
 function judgeJobSteps(fc: FileCtx, where: string, steps: unknown[], job: boolean): Judged[] {
-  const judged = judgeList(fc, where, steps, 0, []);
+  const judged = judgeList(fc, where, steps);
   // the order rule, on what was parsed: a run step not recognised by content is repo code, whatever id it claims
   const forOrder = judged.map((x) => (x.harmlessId ? x.step : { ...x.step, id: undefined }));
   for (const problem of checkJobOrder(forOrder)) fc.add(fc.file.path, 'injection', `In ${where}: ${problem}`);
@@ -669,32 +706,20 @@ function judgeJobSteps(fc: FileCtx, where: string, steps: unknown[], job: boolea
   return judged;
 }
 
-/** Steps in order, with each `./` composite action replaced by its own steps (recursively, at most MAX_COMPOSITE_DEPTH deep, no cycle). */
-function judgeList(fc: FileCtx, where: string, steps: unknown[], depth: number, seen: readonly string[]): Judged[] {
-  const out: Judged[] = [];
-  steps.forEach((raw, i) => {
+/**
+ * Steps in order. A `./` local action is refused outright in v0.2 (fix round 2, ruling 3): GitHub runs it from the job's
+ * checked-out workspace, which on a pull request is the author's code (and in a central reusable workflow, the caller's
+ * repository), never from the files pipegen judged. A future opt-in would have to treat it as repo code.
+ */
+function judgeList(fc: FileCtx, where: string, steps: unknown[]): Judged[] {
+  return steps.map((raw, i) => {
     const at = `${where}, step ${i + 1}`;
-    if (isObj(raw) && typeof raw.uses === 'string' && raw.uses.startsWith('./')) out.push(...expandLocal(fc, at, raw, depth, seen));
-    else out.push(judgeStep(fc, at, raw));
+    if (isObj(raw) && typeof raw.uses === 'string' && raw.uses.startsWith('./')) {
+      fc.add(fc.file.path, 'unreviewed', `In ${at}: ${show(raw.uses)} is a local action. GitHub runs it from the checked-out workspace, which on a pull request is the author's code, not the file pipegen judged; pipegen does not run local actions.`);
+      return { step: { name: '' }, kind: 'unrecognised', harmlessId: false, secrets: new Set<string>(), readsWorkspace: false };
+    }
+    return judgeStep(fc, at, raw);
   });
-  return out;
-}
-
-function expandLocal(fc: FileCtx, at: string, raw: Obj, depth: number, seen: readonly string[]): Judged[] {
-  const bad = (check: RefereeCheck, m: string): Judged[] => {
-    fc.add(fc.file.path, check, `In ${at}: ${m}`);
-    return [{ step: { name: '' }, kind: 'unrecognised', harmlessId: false, secrets: new Set(), readsWorkspace: false }];
-  };
-  const uses = raw.uses as string;
-  for (const k of Object.keys(raw)) if (!['name', 'uses', 'id'].includes(k)) return bad('template', `the local action step has ${show(k)}; pipegen's local actions take no inputs, env or condition.`);
-  const rel = uses.slice(2).replace(/\/$/, '');
-  const parsed = PLAIN_REL_RE.test(rel) ? ['action.yml', 'action.yaml'].map((n) => fc.others.get(`${fc.file.repo}:${rel}/${n}`)).find((x) => x !== undefined) : undefined;
-  if (parsed === undefined) return bad('unknown-pin', `${show(uses)} is a local action that is not among the files pipegen is writing.`);
-  if (seen.includes(rel)) return bad('template', `${show(uses)} uses itself (a cycle of local actions).`);
-  if (depth + 1 > MAX_COMPOSITE_DEPTH) return bad('template', `${show(uses)} nests local actions more than ${MAX_COMPOSITE_DEPTH} levels deep.`);
-  const runs = parsed.js.runs;
-  if (!isObj(runs) || runs.using !== 'composite' || !Array.isArray(runs.steps)) return bad('template', `${show(uses)} is not a composite action with a list of steps.`);
-  return judgeList(fc, `${at} (in ${safeText(rel, 80)})`, runs.steps, depth + 1, [...seen, rel]);
 }
 
 function judgeStep(fc: FileCtx, where: string, raw: unknown): Judged {
@@ -802,6 +827,16 @@ function judgeUses(fc: FileCtx, at: (m: string) => string, uses: string, withs: 
   if (central !== null && k.path.startsWith(central.prefix)) {
     // ruling 2: the central repo only at the commit pipegen recorded, and with every other check (no plain env, no folder)
     if (k.ref !== central.sha) bad('unknown-pin', at(`${show(uses)} is the central repo at a commit pipegen did not record.`));
+    // fix round 2, ruling 4: the action file must be a central file pipegen is writing (so it is judged), and the step takes
+    // only the inputs that file declares
+    const head = uses.slice(0, central.prefix.length);
+    const rel = head.toLowerCase() === central.prefix ? uses.slice(central.prefix.length, uses.lastIndexOf('@')) : '';
+    const action = PLAIN_REL_RE.test(rel) ? ['action.yml', 'action.yaml'].map((n) => fc.others.get(`central:${rel}/${n}`)).find((x) => x !== undefined) : undefined;
+    if (action === undefined) bad('unknown-pin', at(`${show(uses)} is not a central action file pipegen is writing, so what it runs can not be judged.`));
+    else {
+      const inputs = isObj(action.js.inputs) ? action.js.inputs : {};
+      for (const name of Object.keys(withs)) if (!Object.hasOwn(inputs, name)) bad('template', at(`the central action ${show(rel)} declares no input ${show(name)}.`));
+    }
     for (const [name, v] of Object.entries(env)) {
       const m = typeof v === 'string' ? SECRET_REF_RE.exec(v) : null;
       if (m === null || m[1] !== name) bad('template', at(`a central action step's env may only map a secret under its own name (${show(name)}).`));
@@ -881,8 +916,6 @@ function judgeSecrets(fc: FileCtx, at: (m: string) => string, withs: Obj, env: O
 /** Needs as a list, whatever form they were written in. */
 const needsList = (v: unknown): unknown[] => (v === undefined ? [] : Array.isArray(v) ? v : [v]);
 
-/** Whether any job of the workflow checks out the repository (workflow_run then runs it with the target's power). */
-const hasCheckout = (jobs: Obj): boolean => Object.values(jobs).some((j) => isObj(j) && Array.isArray(j.steps) && j.steps.some((s) => isObj(s) && typeof s.uses === 'string' && /^actions\/checkout@/i.test(s.uses)));
 
 function judgeEdited(fc: FileCtx, parsed: Parsed, mark: PipegenInserted): void {
   const bad = issueFor(fc);
@@ -897,7 +930,7 @@ function judgeEdited(fc: FileCtx, parsed: Parsed, mark: PipegenInserted): void {
   const jobs = parsed.js.jobs;
   const origJobs = orig.parsed.js.jobs;
   if (!isObj(jobs) || !isObj(origJobs)) { bad('template', 'The workflow has no jobs map.'); return; }
-  judgeUserTop(fc, parsed.js, jobs, mark);
+  judgeUserTop(fc, parsed.js, mark);
   // pipegen's own parts: present, new, and free of anchors and aliases
   for (const id of mark.jobs) {
     if (!Object.hasOwn(jobs, id)) bad('template', `The job ${show(id)} pipegen inserted is not in the file.`);
@@ -917,8 +950,8 @@ function judgeEdited(fc: FileCtx, parsed: Parsed, mark: PipegenInserted): void {
     const p = jobPair(parsed.doc, n.job);
     const needsNode = isMap(p?.value) ? p.value.get('needs', true) : undefined;
     if (hasAnchorOrAlias(needsNode)) bad('injection', `The needs of ${show(n.job)} use a YAML anchor or alias.`);
-    // a gated job that runs although a job it needs failed is not gated (ruling 5)
-    if (typeof j.if === 'string' && STATUS_FN_RE.test(j.if)) bad('template', `The job ${show(n.job)} has an if: with a status function (always(), failure(), cancelled()), so it runs even when pipegen's check fails; it would not really be gated.`);
+    // a gated job that can run although a job it needs failed is not gated (ruling 5; fix round 2, ruling 1)
+    if (!gatedIfAllowed(j.if)) bad('template', `The job ${show(n.job)} has an if: other than success() or success() && <condition without a status function or a top-level ||>, so it could run even when pipegen's check fails; it would not really be gated.`);
     const list = needsList(j.needs);
     for (const a of added) {
       if (typeof a !== 'string' || !mark.jobs.includes(a)) bad('template', `The need ${show(a)} added to ${show(n.job)} is not a job pipegen inserted.`);
@@ -940,11 +973,11 @@ function judgeEdited(fc: FileCtx, parsed: Parsed, mark: PipegenInserted): void {
  * workflow_run in a file that checks code out), a workflow env with a dangerous name or an expression, `defaults` other than
  * `run.shell` bash or sh, and top-level permissions beyond what the inserted jobs may have.
  */
-function judgeUserTop(fc: FileCtx, js: Obj, jobs: Obj, mark: PipegenInserted): void {
+function judgeUserTop(fc: FileCtx, js: Obj, mark: PipegenInserted): void {
   const bad = issueFor(fc);
   const triggers = triggersOf(js.on) ?? [];
   if (triggers.includes('pull_request_target')) bad('injection', 'The user\'s workflow runs on pull_request_target (with secrets and a write token for outside pull requests); pipegen will not insert its job there. Plan G writes a separate file.');
-  if (triggers.includes('workflow_run') && hasCheckout(jobs)) bad('injection', 'The user\'s workflow runs on workflow_run and checks code out; pipegen will not insert its job there. Plan G writes a separate file.');
+  if (triggers.includes('workflow_run')) bad('injection', 'The user\'s workflow runs on workflow_run (with the target\'s power, after another run that may have run outside code); pipegen will not insert its job there. Plan G writes a separate file.');
   judgeEnv(fc, js.env, 'the user\'s workflow');
   const d = js.defaults;
   if (d !== undefined) {

