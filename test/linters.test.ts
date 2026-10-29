@@ -227,6 +227,15 @@ describe('runLinters (S19, S21)', () => {
       const issues = await runLinters([file(WF)], closures(a, z), LOGIN);
       expect(issues.filter((i) => i.check === 'zizmor'), `zizmor ${out} exit ${code}`).toHaveLength(1);
     }
+    // zizmor: a crash code (outside 0 and 10 to 14) with a NON-empty, valid list is still an issue, and the list is not trusted
+    for (const code of [1, 2, 3, 101, 9, 15]) {
+      const a = stub(); const z = stub(); z.set(JSON.stringify([zizmorFinding(WF, 4)]), code);
+      const issues = await runLinters([file(WF)], closures(a, z), LOGIN);
+      const zi = issues.filter((i) => i.check === 'zizmor');
+      expect(zi, `zizmor crash exit ${code}: ${JSON.stringify(issues)}`).toHaveLength(1);
+      expect(zi[0]?.line, `exit ${code}: the failure issue, not the finding`).toBeUndefined();
+      expect(zi[0]?.message).toMatch(/failed \(exit /);
+    }
     // exit 0 with no output at all is clean for actionlint (it prints nothing when there is nothing to say)
     {
       const a = stub(); const z = stub(); z.set('[]');
@@ -258,6 +267,18 @@ describe('runLinters (S19, S21)', () => {
     for (const s of [a, z]) {
       const files = (s.records()[0] as Rec).files.filter((f) => f.includes('.github/workflows'));
       expect(files).toEqual(['./.github/workflows/A.yml']);
+    }
+  });
+
+  it('runLinters: case-insensitive duplicates are refused in both orders (the second name never overwrites the first)', async () => {
+    for (const [first, second] of [['A.yml', 'a.yml'], ['a.yml', 'A.yml']] as const) {
+      const { a, z, issues } = await run([file(`.github/workflows/${first}`, { content: 'name: first\n' }), file(`.github/workflows/${second}`, { content: 'name: second\n' })]);
+      const dup = issues.filter((i) => /twice/.test(i.message));
+      expect(dup.map((i) => i.file), `${first} then ${second}: ${JSON.stringify(issues)}`).toEqual([`.github/workflows/${second}`]);
+      for (const s of [a, z]) {
+        const files = (s.records()[0] as Rec).files.filter((f) => f.includes('.github/workflows'));
+        expect(files).toEqual([`./.github/workflows/${first}`]);
+      }
     }
   });
 

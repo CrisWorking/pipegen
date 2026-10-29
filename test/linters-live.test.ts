@@ -63,11 +63,14 @@ describe.skipIf(!live)('live: the real actionlint and zizmor accept cache-mode: 
     expect(found.some((i) => i.check === 'actionlint' && i.line !== undefined), JSON.stringify(found)).toBe(true);
     if (online !== null) expect(found.some((i) => i.check === 'zizmor' && i.line !== undefined), JSON.stringify(found)).toBe(true);
 
-    // --no-ignores: an inline ignore comment on a planted injection does not silence it
-    const ignored: CreatedFile = { ...f, content: bad.content.replace('${{ github.head_ref }}', '${{ github.head_ref }} # zizmor: ignore[template-injection]') };
+    // --no-ignores: an inline ignore comment does not silence an injection. The comment sits on the `run: |` line itself, so it
+    // does not cut the scalar and BOTH planted expressions stay active (the comment on the expression line used to hide one).
+    const ignored: CreatedFile = { ...f, content: bad.content.replace('      - run: echo ${{ github.head_ref }} ${{ nosuchcontext.x }}\n', '      - run: | # zizmor: ignore[template-injection]\n          echo ${{ github.head_ref }} ${{ nosuchcontext.x }}\n') };
+    expect(ignored.content).toContain('# zizmor: ignore[template-injection]\n          echo ${{ github.head_ref }} ${{ nosuchcontext.x }}');
     const ig = await runLinters([ignored], linters, online);
     for (const i of ig) console.log(`inline-ignore: ${i.check} ${i.file}:${i.line ?? '-'} ${i.message.slice(0, 80)}`);
-    if (online !== null) expect(ig.some((i) => i.check === 'zizmor' && /template-injection/.test(i.message)), JSON.stringify(ig)).toBe(true);
+    // both expressions stay active: zizmor reports two template-injection findings (it reported one before the fix)
+    if (online !== null) expect(ig.filter((i) => i.check === 'zizmor' && /template-injection/.test(i.message)), JSON.stringify(ig)).toHaveLength(2);
     // --strict-collection: a central repo with one valid workflow and one schema-invalid action file is an issue
     const central: CreatedFile[] = [
       { ...f, repo: 'central' },
