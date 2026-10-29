@@ -29,6 +29,7 @@ import { EXPR, own, refuse, show } from './render-error.js';
 import type { RenderContext, RenderedStep, RenderResult } from './render-step.js';
 import { slotProblem, type SlotKind } from './slots.js';
 import { ARGV_POLICIES, PIP_CLOSURES, PLAIN_REL_RE, type ArgvPolicy } from './tool-flags.js';
+import { EXTRA_RULES_AT, tuningEffects, type TuningEffects } from './tuning.js';
 import type { InstallSpec, ReviewedTool, Service, StepSpec } from '../types.js';
 
 /** Test and internal hooks: the argv policies and the pip closures the renderer reads (production passes neither). */
@@ -67,7 +68,7 @@ const MAX_TEXT = 64 * 1024;
 /** Tool categories that run the project's own code (tests, coverage, image builds): the only steps a declared secret may reach. */
 export const APP_RUNNING_CATEGORIES: ReadonlySet<string> = new Set(['coverage', 'unit-tests', 'full-tests', 'image-build']);
 /** Names the renderer itself puts in a step's env or in the tool's environment; a template env may not use them. */
-const RESERVED_ENV = /^(?:HOME|PATH|RUNNER_TEMP|TMPDIR|BASH_ENV|ENV|PIPEGEN_(?:CONFIG|IMAGE|DL_.*|NPM_EXPECT|REQUIREMENTS|RULES_(?:REMOTE|COMMIT|TREE_WANT)|ARG_\d+))$/;
+const RESERVED_ENV = /^(?:HOME|PATH|RUNNER_TEMP|TMPDIR|BASH_ENV|ENV|PIPEGEN_(?:CONFIG|TUNED_CONFIG|IMAGE|DL_.*|NPM_EXPECT|REQUIREMENTS|RULES_(?:REMOTE|COMMIT|TREE_WANT)|ARG_\d+))$/;
 
 
 /** A reviewed constant as a shell word: bare when plain, else single-quoted (`'` becomes `'\''`). `${{` and NUL are refused. */
@@ -109,7 +110,7 @@ function cdLines(workingDir: string | undefined): string[] {
  * The `env -i` array: the only variables a tool sees (ruling S6). `names` are passed through from the step's env by name;
  * `constants` are reviewed `NAME=value` words written into the script itself (so no job or step variable can change them).
  */
-function allowlist(pathValue: string, names: readonly string[], constants: readonly string[] = []): string[] {
+function allowlist(pathValue: string, names: readonly string[], constants: readonly string[] = [], dynamic: readonly string[] = []): string[] {
   for (const c of constants) if (!/^[A-Z][A-Z0-9_]{0,40}=[A-Za-z0-9_.-]{0,40}$/.test(c)) refuse('A constant of the tool environment is not a plain NAME=value.');
   return [
     'pg_env=(',
@@ -119,6 +120,7 @@ function allowlist(pathValue: string, names: readonly string[], constants: reado
     '  "RUNNER_TEMP=$RUNNER_TEMP"',
     '  "TMPDIR=$RUNNER_TEMP"',
     ...constants.map((c) => `  "${c}"`),
+    ...dynamic.map((d) => `  "${d}"`),
     ...names.map((n) => `  "${n}=$${n}"`),
     ')',
   ];
@@ -251,7 +253,7 @@ interface Built { main: string[]; then: string[][]; env: Record<string, string>;
  * right after the leading subcommand words (a Go or urfave tool stops reading flags at the first plain word), and a
  * dedicated tool's choices are appended as `--<choice> "$V"` (a bool choice `--<choice>="$V"`).
  */
-function buildWords(tool: ReviewedTool, spec: StepSpec, pol: ArgvPolicy, config: PinnedConfig | null, configPath: string | null, slots: Slot[]): Built {
+function buildWords(tool: ReviewedTool, spec: StepSpec, pol: ArgvPolicy, config: PinnedConfig | null, configPath: string | null, slots: Slot[], tuned: TuningEffects): Built {
   const cli = tool.step.cli as NonNullable<typeof tool.step.cli>;
   const w: Words = { env: {}, index: new Map() };
   const rest = cli.command.slice(1);
@@ -278,6 +280,12 @@ function buildWords(tool: ReviewedTool, spec: StepSpec, pol: ArgvPolicy, config:
     if (hit === 0) return refuse(`The command of ${show(tool.id)} does not name its rules folder ${show(pol.archive.dir)}.`);
   }
   if (config !== null && configPath !== null) main.splice(lead, 0, q(config.flag), configPath);
+  // per-repo tuning flags (6d) go in the same place, before the config flag and every other word: a Go or urfave tool stops reading
+  // flags at the first plain word. A value picked from an enum travels in an env variable like every run-time value; a reviewed
+  // constant (a rule folder inside the container) is written as a quoted word.
+  const tuning: string[] = [];
+  for (const fl of tuned.flags) tuning.push(q(fl.flag), fl.literal === true ? q(fl.value) : argVar(w, fl.key, fl.value));
+  main.splice(lead, 0, ...tuning);
   const then = (cli.then ?? []).map((cmd) => {
     if (cmd[0] !== pol.exe) refuse(`A follow-up command of ${show(tool.id)} does not run its own executable.`);
     return cmd.slice(1).map((x) => wordOf(x, tool, spec, w));
@@ -427,13 +435,23 @@ export function renderCliTool({ spec, tool, service, ctx, hooks, options }: CliA
   // where the tool finds its config: a file on the runner, the work folder's own file (ZAP reads -c there), or a read-only mount
   const configPath = config === null ? null : kind !== 'docker' ? `"${cfgBase}/${config.fileName}"` : inWork ? q(config.fileName) : q(`/pipegen-cfg/${config.fileName}`);
   const slots = slotsOf(tool, pol, service, ctx, spec);
-  const built = buildWords(tool, spec, pol, config, configPath, slots);
+  const tuned = tuningEffects(spec, tool, ctx);
+  const built = buildWords(tool, spec, pol, config, configPath, slots, tuned);
   const tplEnv = templateEnv(tool, hooks);
 
   const env: Record<string, string> = { ...tplEnv, ...built.env };
   const archive = pol.archive;
   const passed: string[] = Object.keys(env);   // handed to the tool by name through the allowlist
   if (config !== null) env.PIPEGEN_CONFIG = config.content;
+  // a generated config (lefthook's hooks, 6d) is written next to the run in a folder of its own; only a plain release-binary step with no pinned config takes one
+  const tunedCfg = tuned.generatedConfig;
+  if (tunedCfg !== null) {
+    if (kind !== 'github-release' || config !== null || !FILE_NAME_RE.test(tunedCfg.fileName) || !NAME_RE.test(tunedCfg.envName) || tunedCfg.content.includes(EXPR) || tunedCfg.content.includes('\0') || tunedCfg.content.length > MAX_TEXT) {
+      return refuse(`${show(tool.id)} can not take a generated config.`);
+    }
+    env.PIPEGEN_TUNED_CONFIG = tunedCfg.content;
+  }
+  if (tuned.extraRules.length > 0 && (archive === undefined || kind !== 'docker')) return refuse(`${show(tool.id)} has no rules archive to add rule folders from.`);
   for (const name of secrets) {
     if (!NAME_RE.test(name) || hooks.isDangerousName(name)) return refuse(`The secret name ${show(name)} can't be passed to a tool.`);
     env[name] = `\${{ secrets.${name} }}`;
@@ -482,6 +500,11 @@ export function renderCliTool({ spec, tool, service, ctx, hooks, options }: CliA
       const sub = built.sub === undefined ? '' : `/${built.sub.slice(1, -1)}`;
       if (built.sub !== undefined) prep.push(`if [ -L "$rules"/${built.sub} ] || [ ! -d "$rules"/${built.sub} ]; then pg_fail "the rules folder is missing or a link"; fi`);
       docker.push('-v', `"$rules${sub}:${archive.dir}:ro"`);
+      // tuning (6d): more rule folders of the same verified archive, each read-only at its own path (names are reviewed constants)
+      for (const x of tuned.extraRules) {
+        prep.push(`if [ -L "$rules"/${q(x)} ] || [ ! -d "$rules"/${q(x)} ]; then pg_fail "the rules folder is missing or a link"; fi`);
+        docker.push('-v', `"$rules/${x}:${EXTRA_RULES_AT}/${x}:ro"`);
+      }
     }
     for (const n of secrets) docker.push('-e', n);
     docker.push('"$PIPEGEN_IMAGE"', q(exe));
@@ -541,9 +564,15 @@ export function renderCliTool({ spec, tool, service, ctx, hooks, options }: CliA
   ]);
 
   // the pinned config goes in a file the tool is told about (ruling S4)
-  const cfgLines = config === null ? [] : checker || inWork
-    ? [`printf '%s' "$PIPEGEN_CONFIG" > "${cfgBase}/${config.fileName}"`]
-    : ['mkdir -p "$RUNNER_TEMP/pipegen-cfg"', `cfg="$RUNNER_TEMP/pipegen-cfg/${artifact}"`, 'mkdir "$cfg"', `printf '%s' "$PIPEGEN_CONFIG" > "$cfg/${config.fileName}"`];
+  const cfgLines = config === null && tunedCfg === null ? [] : checker || inWork
+    ? [`printf '%s' "$PIPEGEN_CONFIG" > "${cfgBase}/${(config as PinnedConfig).fileName}"`]
+    : ['mkdir -p "$RUNNER_TEMP/pipegen-cfg"', `cfg="$RUNNER_TEMP/pipegen-cfg/${artifact}"`, 'mkdir "$cfg"',
+      ...(config === null ? [] : [`printf '%s' "$PIPEGEN_CONFIG" > "$cfg/${config.fileName}"`]),
+      ...(tunedCfg === null ? [] : [`printf '%s' "$PIPEGEN_TUNED_CONFIG" > "$cfg/${tunedCfg.fileName}"`])];
+  // the tool is told where its generated config is by the one variable the policy named (set inside env -i, like the other constants)
+  const dynamicEnv = tunedCfg === null ? [] : [`${tunedCfg.envName}=$cfg/${tunedCfg.fileName}`];
+  // what the tuning did, in plain words, in comment lines (describeTuning): one line of text each, nothing but printable ASCII
+  const tuneComments = tuned.lines.map((l) => `# tuning: ${l.replace(/[^\x20-\x7e]/g, '?')}`);
   // the result path must be free before the tool runs and a regular file after it, also where it lands (ruling S7)
   const outDir = `$RUNNER_TEMP/pipegen-out/${artifact}`;
   const preCheck = out === null ? [] : [
@@ -569,8 +598,8 @@ export function renderCliTool({ spec, tool, service, ctx, hooks, options }: CliA
   const launch = (words: readonly string[]): string => `"\${pg_env[@]}" ${prefix}${words.length === 0 ? '' : ` ${words.join(' ')}`}`;
   const chain = [launch(built.main), ...built.then.map(launch)].join(' && ');
   const run = script([
-    ...prologue(artifact, nodeMajor === undefined ? {} : { nodeMajor }), ...vars, ...installLines, ...cdLines(spec.workingDir), ...pathChecks, ...prep, ...cfgLines, ...preCheck,
-    ...closureVars, ...allowlist(pathValue, passed), ...afterAllow, 'rc=0', `${chain} || rc=$?`, ...postCheck, 'exit "$rc"',
+    ...prologue(artifact, nodeMajor === undefined ? {} : { nodeMajor }), ...tuneComments, ...vars, ...installLines, ...cdLines(spec.workingDir), ...pathChecks, ...prep, ...cfgLines, ...preCheck,
+    ...closureVars, ...allowlist(pathValue, passed, [], dynamicEnv), ...afterAllow, 'rc=0', `${chain} || rc=$?`, ...postCheck, 'exit "$rc"',
   ]);
   // a tool that runs the repo's own code is marked, so the referee can apply its order rule (S6 c); the id is not `pipegen-…`, which a job's dedupe may drop
   // fail closed: the run is repo code unless the policy says it only reads (readsOnly), and never for an app-running category

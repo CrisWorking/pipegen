@@ -15,6 +15,39 @@ export class NotGitHubRepoError extends Error {}
 
 type Profile = Omit<RepoProfile, 'private' | 'ownerType' | 'plan'>;
 
+/** A plain repo-relative path: letters, digits and . _ / - only, no leading / or -, no `..` segment (the same rule as the renderer's PLAIN_REL_RE, which the reader may not import). */
+const PLAIN_PATH_RE = /^(?![-/])(?!.*(?:^|\/)\.\.(?:\/|$))[A-Za-z0-9._/-]{1,200}$/;
+/**
+ * Plan B 6d (DECISIONS #108): names of folders that are vendored or generated. Looked for at the top of the root and of each
+ * service folder (listFiles leaves node_modules, vendor, dist and target out of the file list on purpose), plus any folder
+ * named generated or __generated__ among the files. `build` and `out` are NOT here: build scripts live in such folders.
+ */
+const TOP_GENERATED = ['node_modules', 'vendor', 'dist', 'target', '.next', '.venv'];
+const GENERATED_NAMES = new Set(['generated', '__generated__']);
+const MAX_GENERATED_DIRS = 64;
+
+async function readGeneratedDirs(root: string, serviceDirs: readonly string[], files: readonly string[]): Promise<string[]> {
+  const found = new Set<string>();
+  for (const d of new Set(['.', ...serviceDirs])) {
+    for (const name of TOP_GENERATED) {
+      const rel = inDir(d, name);
+      const info = await lstat(joinOs(root, rel)).catch(() => null);
+      if (info !== null && info.isDirectory() && !info.isSymbolicLink() && PLAIN_PATH_RE.test(rel)) found.add(rel);
+    }
+  }
+  for (const f of files) {
+    const parts = f.split('/');
+    for (let i = 0; i < parts.length - 1; i++) {
+      if (GENERATED_NAMES.has(parts[i] as string)) {
+        const rel = parts.slice(0, i + 1).join('/');
+        if (PLAIN_PATH_RE.test(rel)) found.add(rel);
+        break;
+      }
+    }
+  }
+  return [...found].sort().slice(0, MAX_GENERATED_DIRS);
+}
+
 const NPM_DEFAULT_TEST = 'echo "Error: no test specified" && exit 1';
 const NODE_LOCKS: [string, PackageManager][] = [['pnpm-lock.yaml', 'pnpm'], ['yarn.lock', 'yarn'], ['bun.lockb', 'bun'], ['bun.lock', 'bun'], ['package-lock.json', 'npm']];
 const PYTHON_LOCKS: [string, PackageManager][] = [['poetry.lock', 'poetry'], ['uv.lock', 'uv']];
@@ -156,8 +189,12 @@ async function readService(ctx: Ctx, dir: string, shared: Shared): Promise<Servi
   const testFiles = owned.filter((f) => isTestFile(relTo(f)));
 
   const scope = dir === '.' ? ['.'] : [dir, '.'];
-  const lockfile = (locks: [string, PackageManager][]) => scope.flatMap((d) => locks.filter(([name]) => ctx.fileSet.has(inDir(d, name)))).map(([, pm]) => pm)[0];
+  const lockHit = (locks: [string, PackageManager][]) => scope.flatMap((d) => locks.filter(([name]) => ctx.fileSet.has(inDir(d, name))).map(([name, pm]) => ({ path: inDir(d, name), pm })))[0];
+  const lockfile = (locks: [string, PackageManager][]) => lockHit(locks)?.pm;
   const packageManager = language === 'node' ? lockfile(NODE_LOCKS) : language === 'python' ? lockfile(PYTHON_LOCKS) ?? (requirementFiles.length > 0 ? 'pip' : undefined) : undefined;
+  // Plan B 6d: the path of that lockfile (python without one: the folder's own requirements.txt), kept only when it is a plain path
+  const lockPath = language === 'node' ? lockHit(NODE_LOCKS)?.path : language === 'python' ? lockHit(PYTHON_LOCKS)?.path ?? (requirementFiles.includes(inDir(dir, 'requirements.txt')) ? inDir(dir, 'requirements.txt') : undefined) : undefined;
+  const lockfilePath = lockPath !== undefined && PLAIN_PATH_RE.test(lockPath) ? lockPath : undefined;
 
   const firstLine = async (rels: string[]) => {
     for (const rel of rels) {
@@ -211,7 +248,7 @@ async function readService(ctx: Ctx, dir: string, shared: Shared): Promise<Servi
     dir, read: (rel) => readFile(ctx, rel), fileSet: ctx.fileSet, copies: shared.copies, scripts: pkgScripts, deps, devDeps, frameworks,
     hasDockerfile: dockerfile !== undefined, port, language, serviceDirs: shared.serviceDirs,
   });
-  return { name, path: dir, language, ...(alsoLanguages.length === 0 ? {} : { alsoLanguages }), packageManager, runtimeVersion, dockerfile, port, hasTests, testFramework, ...env, scripts, frameworks, quality, ...(notStandalone === undefined ? {} : { notStandalone }) };
+  return { name, path: dir, language, ...(alsoLanguages.length === 0 ? {} : { alsoLanguages }), packageManager, ...(lockfilePath === undefined ? {} : { lockfile: lockfilePath }), runtimeVersion, dockerfile, port, hasTests, testFramework, ...env, scripts, frameworks, quality, ...(notStandalone === undefined ? {} : { notStandalone }) };
 }
 
 async function anyFileHasLine(ctx: Ctx, files: string[], re: RegExp): Promise<boolean> {
@@ -344,8 +381,9 @@ export async function readProject(dir: string, opts?: { notes?: string[] }): Pro
   const only = services.length === 1 ? services[0] : undefined;
   const registry = only?.language === 'node' ? 'npm' : only?.language === 'python' ? 'pypi' : undefined;
   if (only !== undefined && only.path === '.' && registry !== undefined && existingWorkflows.some((w) => w.publishes?.includes(registry))) only.publishedPackage = true;
+  const generatedDirs = await readGeneratedDirs(dir, dirs, files);
   return {
-    owner, repo, defaultBranch: 'main', monorepo, services,
+    owner, repo, defaultBranch: 'main', monorepo, services, ...(generatedDirs.length === 0 ? {} : { generatedDirs }),
     terraformDirs: [...new Set(files.filter((f) => f.endsWith('.tf')).map(dirOf))].sort(),
     hasCompose: files.some((f) => /^(docker-)?compose\.ya?ml$/.test(baseOf(f))),
     existingWorkflows, precommit: readPrecommit(dir), repoFiles: await readRepoFiles(dir, ctx.notes, shared.quality),

@@ -1,0 +1,80 @@
+- id: tool-install-fd142d42ba6c712d
+  name: "pipegen: install lefthook"
+  run: |-
+    set -euo pipefail
+    unset CDPATH
+    pg_fail() { echo "pipegen: $1" >&2; exit 1; }
+    PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+    home="$RUNNER_TEMP/pipegen-home/pipegen-out-hooks-ci--api"
+    mkdir -p "$RUNNER_TEMP/pipegen-home" "$home"
+    sys=(
+      /usr/bin/env -i
+      "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+      "HOME=$home"
+    )
+    bin="$RUNNER_TEMP/pipegen-bin/pipegen-out-hooks-ci--api"
+    dl="$RUNNER_TEMP/pipegen-dl/pipegen-out-hooks-ci--api"
+    mkdir -p "$RUNNER_TEMP/pipegen-bin" "$RUNNER_TEMP/pipegen-dl"
+    mkdir "$bin" "$dl"
+    "${sys[@]}" curl --proto '=https' --proto-redir '=https' --tlsv1.2 --fail --silent --show-error --location --max-redirs 5 --retry 3 --output "$dl/asset" "$PIPEGEN_DL_URL"
+    cd "$dl"
+    printf '%s  asset\n' "$PIPEGEN_DL_SHA256" | "${sys[@]}" sha256sum --check --strict -
+    mv -- "$dl/asset" "$bin/lefthook"
+    if [ ! -f "$bin/lefthook" ] || [ -L "$bin/lefthook" ]; then pg_fail "the tool is not a regular file"; fi
+    chmod 0755 "$bin/lefthook"
+  shell: bash
+  env:
+    BASH_ENV: ""
+    ENV: ""
+    PIPEGEN_DL_URL: https://github.com/evilmartians/lefthook/releases/download/v2.2.2/lefthook_2.2.2_Linux_x86_64
+    PIPEGEN_DL_SHA256: 4fbf89eb7748c6aed84d833ee1a29edac48fae614468ca9a82896ec32f2800b6
+- id: repocode-fd142d42ba6c712d
+  name: "pipegen: run lefthook"
+  run: |-
+    set -euo pipefail
+    unset CDPATH
+    pg_fail() { echo "pipegen: $1" >&2; exit 1; }
+    PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+    home="$RUNNER_TEMP/pipegen-home/pipegen-out-hooks-ci--api"
+    mkdir -p "$RUNNER_TEMP/pipegen-home" "$home"
+    sys=(
+      /usr/bin/env -i
+      "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+      "HOME=$home"
+    )
+    # tuning: runs the service's own lint, format:check scripts as a pre-commit hook (adds coverage)
+    bin="$RUNNER_TEMP/pipegen-bin/pipegen-out-hooks-ci--api"
+    mkdir -p "$RUNNER_TEMP/pipegen-cfg"
+    cfg="$RUNNER_TEMP/pipegen-cfg/pipegen-out-hooks-ci--api"
+    mkdir "$cfg"
+    printf '%s' "$PIPEGEN_TUNED_CONFIG" > "$cfg/lefthook.yml"
+    pg_env=(
+      /usr/bin/env -i
+      "HOME=$home"
+      "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+      "RUNNER_TEMP=$RUNNER_TEMP"
+      "TMPDIR=$RUNNER_TEMP"
+      "LEFTHOOK_CONFIG=$cfg/lefthook.yml"
+    )
+    rc=0
+    "${pg_env[@]}" "$bin/lefthook" run pre-commit --all-files || rc=$?
+    exit "$rc"
+  shell: bash
+  env:
+    BASH_ENV: ""
+    ENV: ""
+    PIPEGEN_TUNED_CONFIG: "pre-commit:
+
+      \  commands:
+
+      \    lint:
+
+      \      root: services/api/
+
+      \      run: npm run lint
+
+      \    format-check:
+
+      \      root: services/api/
+
+      \      run: npm run format:check\n"

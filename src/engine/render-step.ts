@@ -19,6 +19,7 @@ import { DEPENDENCY_KINDS, type OutputFormat, type RepoProfile, type ReviewedToo
 import { COMMIT_SHA_RE } from './names.js';
 import { NEED_IDS } from './need-ids.js';
 import type { PlatformActions } from './pin.js';
+import { tuningProblems } from './tuning.js';
 import { projectScriptSteps, renderCliTool, type CliHooks, type RenderOptions } from './render-cli.js';
 import { ArtifactNameError, resultArtifactName } from './artifact-names.js';
 import type { ProjectScriptStep } from './reviewed.js';
@@ -78,6 +79,9 @@ const DANGEROUS_NAMES: readonly { family: string; match: RegExp }[] = [
 /** Whether a variable name is one a mapped secret (or a job-level variable) must never take. Shared with the referee. */
 export const isDangerousName = (name: string): boolean => DANGEROUS_NAMES.some((d) => d.match.test(name));
 
+/** The tool's own choices (text values) of a spec's choices, without the tuning section. */
+const textChoices = (c: StepSpec['choices']): Record<string, string> => Object.fromEntries(Object.entries(c).filter((e): e is [string, string] => typeof e[1] === 'string'));
+
 const same = (a: unknown, b: unknown): boolean => isDeepStrictEqual(a, b);
 
 /** Why a candidate counts as reviewed: both marks (the type says so, a cast or a JSON copy might not). */
@@ -111,6 +115,7 @@ export function validateSpec(spec: StepSpec, tool: ReviewedTool, ctx: RenderCont
   if (typeof spec.choices !== 'object' || spec.choices === null || Array.isArray(spec.choices)) problem('choices', 'must be a map of choice names to values.');
   else {
     for (const [key, value] of Object.entries(spec.choices)) {
+      if (key === 'tuning') continue;   // the per-repo tuning section (6d), checked by tuningProblems below
       const path = `choices.${safeText(key, 40)}`;
       const offered = own(tool.choices, key);
       if (offered === undefined) {
@@ -120,6 +125,9 @@ export function validateSpec(spec: StepSpec, tool: ReviewedTool, ctx: RenderCont
       else if (!offered.includes(value)) problem(path, `${show(value)} is not one of the values this tool allows (${offered.join(', ')}).`);
     }
   }
+
+  // per-repo tuning (6d): every value must be in the enum built for this call from the profile
+  if (typeof spec.choices === 'object' && spec.choices !== null && !Array.isArray(spec.choices)) out.push(...tuningProblems(spec, tool, ctx));
 
   // copies of the template: never inputs, so they must equal it
   const template = (path: 'action' | 'cli', given: unknown, reviewed: unknown) => {
@@ -346,7 +354,7 @@ export function renderStepWith(given: StepSpec, tool: ReviewedTool, platform: Pl
 
   const { path } = usesOf(tool);
   const service = spec.service === undefined ? undefined : ctx.profile.services.find((s) => s.name === spec.service);
-  const step = actionStep(tool, `pipegen: ${path}`, spec.choices, rendererFill(path, service, ctx, spec.choices.registry ?? tool.choices.registry?.[0]));
+  const step = actionStep(tool, `pipegen: ${path}`, textChoices(spec.choices), rendererFill(path, service, ctx, typeof spec.choices.registry === 'string' ? spec.choices.registry : tool.choices.registry?.[0]));
   const secrets = spec.secrets ?? [];
   if (secrets.length > 0) step.env = Object.fromEntries(secrets.map((n) => [n, `\${{ secrets.${n} }}`]));
   return { steps: [step], output: null };

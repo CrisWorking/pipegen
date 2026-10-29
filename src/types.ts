@@ -24,6 +24,8 @@ export interface Service {
   /** P60 (R4): other languages the folder also holds (a Python app with a package.json for its asset build): tools of these cover it too. Set only when not empty. */
   alsoLanguages?: Language[];
   dockerfile?: string; port?: number; hasTests: boolean; testFramework?: string;
+  /** Plan B 6d: the repo-relative path of the lockfile the reader found for this service (its own folder's, else the root's): package-lock.json, pnpm-lock.yaml, yarn.lock, bun.lock(b), poetry.lock, uv.lock or requirements.txt. Raw but validated (a plain path); absent when none was found. Per-repo tuning (OSV) reads it */
+  lockfile?: string;
   envVars: string[]; dependsOn: Dependency[];
   scripts: string[];      // script names from package.json `scripts` / pyproject `[project.scripts]` + `[tool.poetry.scripts]` (names only, never the commands)
   frameworks: string[];   // detected server frameworks: express, fastify, @nestjs/core, next, koa, hapi; flask, fastapi, django (never the service's own package name: the express repo doesn't USE express). Used by isRunnable (Plan B Task 1)
@@ -58,6 +60,8 @@ export interface RepoProfile {
   monorepo: Monorepo; services: Service[]; terraformDirs: string[]; hasCompose: boolean;
   existingWorkflows: ExistingWorkflow[]; precommit: 'pre-commit' | 'husky' | 'lefthook' | null;
   repoFiles: RepoFiles;   // Plan P Task 1: repo-level config files, read once
+  /** Plan B 6d (DECISIONS #108): folders pipegen itself detected as vendored or generated (node_modules, vendor, dist, target, .next, .venv, or a folder named generated or __generated__), repo-relative and plain, sorted. Per-repo tuning may skip them for lint and SAST only. Absent when none */
+  generatedDirs?: string[];
 }
 // ---------- GitHub access (moved here from Plan A Task 6 in round 4: Plan U uses it too) ----------
 export interface Auth {
@@ -89,10 +93,17 @@ export interface Candidate {
 export type ReviewedCandidate = Candidate & { source: 'reviewed'; reviewed: true };
 export type OutputFormat = 'sarif' | 'junit' | 'zap-json' | 'none';   // zap-json is converted by pipegen's parser
 export interface InstallSpec { method: 'npm' | 'pip' | 'github-release' | 'docker'; package: string; version: string; checksum?: string; digest?: string }
+/**
+ * Per-repo tuning picks (Plan B 6d, DECISIONS #84 and #108): tuning option id → the values chosen, each from the enum the
+ * renderer builds for that call from the profile (src/engine/tuning.ts). Enum values only, never free text.
+ */
+export type TuningPicks = Record<string, string[]>;
+/** `StepSpec.choices`: the tool's own choices (name → one listed value) and, under `tuning`, the per-repo tuning picks. */
+export interface StepChoices { [name: string]: string | TuningPicks | undefined; tuning?: TuningPicks }
 export interface StepSpec {
   needId: string; service?: string;   // service: the Service.name the step is for (absent for repo-wide needs)
   tool: ReviewedCandidate;            // only a reviewed entry's candidate; renderStep checks it equals the entry it is given
-  choices: Record<string, string>;    // the AI's picks among the entry's `choices` (Plan F fills them); a missing one takes the first listed value
+  choices: StepChoices;               // the AI's picks among the entry's `choices` (Plan F fills them); a missing one takes the first listed value. `tuning` (6d) holds the per-repo tuning picks, enum values only
   // action/cli/output are copies of the reviewed template (memory or the AI may send them back): when present they must
   // deep-equal the template, and nothing renders from them. Rendering uses tool.step + tool.fixedInputs + choices only.
   action?: { uses: string; with: Record<string, string> };
