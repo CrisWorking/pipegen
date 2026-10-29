@@ -1,0 +1,884 @@
+{
+  "version": "2.1.0",
+  "runs": [
+    {
+      "invocations": [
+        {
+          "executionSuccessful": true,
+          "toolExecutionNotifications": [
+            {
+              "descriptor": {
+                "id": "Timeout"
+              },
+              "level": "warning",
+              "message": {
+                "text": "Timeout when running home.runner.pipegen-rules.javascript.lang.security.audit.detect-non-literal-require on src/huge.js:\n "
+              }
+            },
+            {
+              "descriptor": {
+                "id": "Timeout"
+              },
+              "level": "warning",
+              "message": {
+                "text": "Timeout when running home.runner.pipegen-rules.javascript.lang.security.detect-child-process on src/huge.js:\n "
+              }
+            },
+            {
+              "descriptor": {
+                "id": "Timeout"
+              },
+              "level": "warning",
+              "message": {
+                "text": "Timeout when running home.runner.pipegen-rules.javascript.lang.security.html-in-template-string on src/huge.js:\n "
+              }
+            }
+          ]
+        }
+      ],
+      "results": [],
+      "tool": {
+        "driver": {
+          "name": "Semgrep OSS",
+          "rules": [
+            {
+              "defaultConfiguration": {
+                "level": "error"
+              },
+              "fullDescription": {
+                "text": "Found data from an Express or Next web request flowing to `eval`. If this data is user-controllable this can lead to execution of arbitrary system commands in the context of your application process. Avoid `eval` whenever possible."
+              },
+              "help": {
+                "markdown": "Found data from an Express or Next web request flowing to `eval`. If this data is user-controllable this can lead to execution of arbitrary system commands in the context of your application process. Avoid `eval` whenever possible.\n\n<b>References:</b>\n - [https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/eval](https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/eval)\n - [https://nodejs.org/api/child_process.html#child_processexeccommand-options-callback](https://nodejs.org/api/child_process.html#child_processexeccommand-options-callback)\n - [https://www.stackhawk.com/blog/nodejs-command-injection-examples-and-prevention/](https://www.stackhawk.com/blog/nodejs-command-injection-examples-and-prevention/)\n - [https://ckarande.gitbooks.io/owasp-nodegoat-tutorial/content/tutorial/a1_-_server_side_js_injection.html](https://ckarande.gitbooks.io/owasp-nodegoat-tutorial/content/tutorial/a1_-_server_side_js_injection.html)\n",
+                "text": "Found data from an Express or Next web request flowing to `eval`. If this data is user-controllable this can lead to execution of arbitrary system commands in the context of your application process. Avoid `eval` whenever possible."
+              },
+              "id": "home.runner.pipegen-rules.javascript.lang.security.audit.code-string-concat",
+              "name": "home.runner.pipegen-rules.javascript.lang.security.audit.code-string-concat",
+              "properties": {
+                "precision": "very-high",
+                "tags": [
+                  "CWE-95: Improper Neutralization of Directives in Dynamically Evaluated Code ('Eval Injection')",
+                  "HIGH CONFIDENCE",
+                  "OWASP-A03:2021 - Injection",
+                  "OWASP-A05:2025 - Injection",
+                  "security"
+                ]
+              },
+              "shortDescription": {
+                "text": "Semgrep Finding: home.runner.pipegen-rules.javascript.lang.security.audit.code-string-concat"
+              }
+            },
+            {
+              "defaultConfiguration": {
+                "level": "error"
+              },
+              "fullDescription": {
+                "text": "Detected non-literal calls to $EXEC(). This could lead to a command injection vulnerability."
+              },
+              "help": {
+                "markdown": "Detected non-literal calls to $EXEC(). This could lead to a command injection vulnerability.\n\n<b>References:</b>\n - [Semgrep Rule](https://github.com/nodesecurity/eslint-plugin-security/blob/master/rules/detect-child-process.js)\n - [https://cheatsheetseries.owasp.org/cheatsheets/Nodejs_Security_Cheat_Sheet.html#do-not-use-dangerous-functions](https://cheatsheetseries.owasp.org/cheatsheets/Nodejs_Security_Cheat_Sheet.html#do-not-use-dangerous-functions)\n",
+                "text": "Detected non-literal calls to $EXEC(). This could lead to a command injection vulnerability."
+              },
+              "helpUri": "https://github.com/nodesecurity/eslint-plugin-security/blob/master/rules/detect-child-process.js",
+              "id": "home.runner.pipegen-rules.javascript.lang.security.audit.dangerous-spawn-shell",
+              "name": "home.runner.pipegen-rules.javascript.lang.security.audit.dangerous-spawn-shell",
+              "properties": {
+                "precision": "very-high",
+                "tags": [
+                  "CWE-78: Improper Neutralization of Special Elements used in an OS Command ('OS Command Injection')",
+                  "LOW CONFIDENCE",
+                  "OWASP-A01:2017 - Injection",
+                  "OWASP-A03:2021 - Injection",
+                  "OWASP-A05:2025 - Injection",
+                  "security"
+                ]
+              },
+              "shortDescription": {
+                "text": "Semgrep Finding: home.runner.pipegen-rules.javascript.lang.security.audit.dangerous-spawn-shell"
+              }
+            },
+            {
+              "defaultConfiguration": {
+                "level": "warning"
+              },
+              "fullDescription": {
+                "text": "Detected that function argument `$ARG` has entered the fs module. An attacker could potentially control the location of this file, to include going backwards in the directory with '../'. To address this, ensure that user-controlled variables in file paths are validated."
+              },
+              "help": {
+                "markdown": "Detected that function argument `$ARG` has entered the fs module. An attacker could potentially control the location of this file, to include going backwards in the directory with '../'. To address this, ensure that user-controlled variables in file paths are validated.\n\n<b>References:</b>\n - [Semgrep Rule](https://github.com/nodesecurity/eslint-plugin-security/blob/master/rules/detect-non-literal-fs-filename.js)\n - [https://owasp.org/www-community/attacks/Path_Traversal](https://owasp.org/www-community/attacks/Path_Traversal)\n",
+                "text": "Detected that function argument `$ARG` has entered the fs module. An attacker could potentially control the location of this file, to include going backwards in the directory with '../'. To address this, ensure that user-controlled variables in file paths are validated."
+              },
+              "helpUri": "https://github.com/nodesecurity/eslint-plugin-security/blob/master/rules/detect-non-literal-fs-filename.js",
+              "id": "home.runner.pipegen-rules.javascript.lang.security.audit.detect-non-literal-fs-filename",
+              "name": "home.runner.pipegen-rules.javascript.lang.security.audit.detect-non-literal-fs-filename",
+              "properties": {
+                "precision": "very-high",
+                "tags": [
+                  "CWE-22: Improper Limitation of a Pathname to a Restricted Directory ('Path Traversal')",
+                  "LOW CONFIDENCE",
+                  "OWASP-A01:2021 - Broken Access Control",
+                  "OWASP-A01:2025 - Broken Access Control",
+                  "OWASP-A05:2017 - Broken Access Control",
+                  "security"
+                ]
+              },
+              "shortDescription": {
+                "text": "Semgrep Finding: home.runner.pipegen-rules.javascript.lang.security.audit.detect-non-literal-fs-filename"
+              }
+            },
+            {
+              "defaultConfiguration": {
+                "level": "warning"
+              },
+              "fullDescription": {
+                "text": "RegExp() called with a `$ARG` function argument, this might allow an attacker to cause a Regular Expression Denial-of-Service (ReDoS) within your application as RegExP blocks the main thread. For this reason, it is recommended to use hardcoded regexes instead. If your regex is run on user-controlled input, consider performing input validation or use a regex checking/sanitization library such as https://www.npmjs.com/package/recheck to verify that the regex does not appear vulnerable to ReDoS."
+              },
+              "help": {
+                "markdown": "RegExp() called with a `$ARG` function argument, this might allow an attacker to cause a Regular Expression Denial-of-Service (ReDoS) within your application as RegExP blocks the main thread. For this reason, it is recommended to use hardcoded regexes instead. If your regex is run on user-controlled input, consider performing input validation or use a regex checking/sanitization library such as https://www.npmjs.com/package/recheck to verify that the regex does not appear vulnerable to ReDoS.\n\n<b>References:</b>\n - [Semgrep Rule](https://github.com/nodesecurity/eslint-plugin-security/blob/master/rules/detect-non-literal-regexp.js)\n - [https://owasp.org/www-community/attacks/Regular_expression_Denial_of_Service_-_ReDoS](https://owasp.org/www-community/attacks/Regular_expression_Denial_of_Service_-_ReDoS)\n",
+                "text": "RegExp() called with a `$ARG` function argument, this might allow an attacker to cause a Regular Expression Denial-of-Service (ReDoS) within your application as RegExP blocks the main thread. For this reason, it is recommended to use hardcoded regexes instead. If your regex is run on user-controlled input, consider performing input validation or use a regex checking/sanitization library such as https://www.npmjs.com/package/recheck to verify that the regex does not appear vulnerable to ReDoS."
+              },
+              "helpUri": "https://github.com/nodesecurity/eslint-plugin-security/blob/master/rules/detect-non-literal-regexp.js",
+              "id": "home.runner.pipegen-rules.javascript.lang.security.audit.detect-non-literal-regexp",
+              "name": "home.runner.pipegen-rules.javascript.lang.security.audit.detect-non-literal-regexp",
+              "properties": {
+                "precision": "very-high",
+                "tags": [
+                  "CWE-1333: Inefficient Regular Expression Complexity",
+                  "LOW CONFIDENCE",
+                  "OWASP-A02:2025 - Security Misconfiguration",
+                  "OWASP-A05:2021 - Security Misconfiguration",
+                  "OWASP-A06:2017 - Security Misconfiguration",
+                  "security"
+                ]
+              },
+              "shortDescription": {
+                "text": "Semgrep Finding: home.runner.pipegen-rules.javascript.lang.security.audit.detect-non-literal-regexp"
+              }
+            },
+            {
+              "defaultConfiguration": {
+                "level": "warning"
+              },
+              "fullDescription": {
+                "text": "Detected the use of require(variable). Calling require with a non-literal argument might allow an attacker to load and run arbitrary code, or access arbitrary files."
+              },
+              "help": {
+                "markdown": "Detected the use of require(variable). Calling require with a non-literal argument might allow an attacker to load and run arbitrary code, or access arbitrary files.\n\n<b>References:</b>\n - [Semgrep Rule](https://github.com/nodesecurity/eslint-plugin-security/blob/master/rules/detect-non-literal-require.js)\n - [https://github.com/nodesecurity/eslint-plugin-security/blob/master/rules/detect-non-literal-require.js](https://github.com/nodesecurity/eslint-plugin-security/blob/master/rules/detect-non-literal-require.js)\n",
+                "text": "Detected the use of require(variable). Calling require with a non-literal argument might allow an attacker to load and run arbitrary code, or access arbitrary files."
+              },
+              "helpUri": "https://github.com/nodesecurity/eslint-plugin-security/blob/master/rules/detect-non-literal-require.js",
+              "id": "home.runner.pipegen-rules.javascript.lang.security.audit.detect-non-literal-require",
+              "name": "home.runner.pipegen-rules.javascript.lang.security.audit.detect-non-literal-require",
+              "properties": {
+                "precision": "very-high",
+                "tags": [
+                  "CWE-95: Improper Neutralization of Directives in Dynamically Evaluated Code ('Eval Injection')",
+                  "LOW CONFIDENCE",
+                  "OWASP-A03:2021 - Injection",
+                  "OWASP-A05:2025 - Injection",
+                  "security"
+                ]
+              },
+              "shortDescription": {
+                "text": "Semgrep Finding: home.runner.pipegen-rules.javascript.lang.security.audit.detect-non-literal-require"
+              }
+            },
+            {
+              "defaultConfiguration": {
+                "level": "warning"
+              },
+              "fullDescription": {
+                "text": "Detected the use of a regular expression `$REDOS` which appears to be vulnerable to a Regular expression Denial-of-Service (ReDoS). For this reason, it is recommended to review the regex and ensure it is not vulnerable to catastrophic backtracking, and if possible use a library which offers default safety against ReDoS vulnerabilities."
+              },
+              "help": {
+                "markdown": "Detected the use of a regular expression `$REDOS` which appears to be vulnerable to a Regular expression Denial-of-Service (ReDoS). For this reason, it is recommended to review the regex and ensure it is not vulnerable to catastrophic backtracking, and if possible use a library which offers default safety against ReDoS vulnerabilities.\n\n<b>References:</b>\n - [https://owasp.org/www-community/attacks/Regular_expression_Denial_of_Service_-_ReDoS](https://owasp.org/www-community/attacks/Regular_expression_Denial_of_Service_-_ReDoS)\n - [https://www.regular-expressions.info/redos.html](https://www.regular-expressions.info/redos.html)\n",
+                "text": "Detected the use of a regular expression `$REDOS` which appears to be vulnerable to a Regular expression Denial-of-Service (ReDoS). For this reason, it is recommended to review the regex and ensure it is not vulnerable to catastrophic backtracking, and if possible use a library which offers default safety against ReDoS vulnerabilities."
+              },
+              "id": "home.runner.pipegen-rules.javascript.lang.security.audit.detect-redos",
+              "name": "home.runner.pipegen-rules.javascript.lang.security.audit.detect-redos",
+              "properties": {
+                "precision": "very-high",
+                "tags": [
+                  "CWE-1333: Inefficient Regular Expression Complexity",
+                  "LOW CONFIDENCE",
+                  "OWASP-A02:2025 - Security Misconfiguration",
+                  "OWASP-A05:2021 - Security Misconfiguration",
+                  "OWASP-A06:2017 - Security Misconfiguration",
+                  "security"
+                ]
+              },
+              "shortDescription": {
+                "text": "Semgrep Finding: home.runner.pipegen-rules.javascript.lang.security.audit.detect-redos"
+              }
+            },
+            {
+              "defaultConfiguration": {
+                "level": "warning"
+              },
+              "fullDescription": {
+                "text": "Detected a hardcoded hmac key. Avoid hardcoding secrets and consider using an alternate option such as reading the secret from a config file or using an environment variable."
+              },
+              "help": {
+                "markdown": "Detected a hardcoded hmac key. Avoid hardcoding secrets and consider using an alternate option such as reading the secret from a config file or using an environment variable.\n\n<b>References:</b>\n - [https://rules.sonarsource.com/javascript/RSPEC-2068](https://rules.sonarsource.com/javascript/RSPEC-2068)\n - [https://cheatsheetseries.owasp.org/cheatsheets/Cryptographic_Storage_Cheat_Sheet.html#key-management](https://cheatsheetseries.owasp.org/cheatsheets/Cryptographic_Storage_Cheat_Sheet.html#key-management)\n",
+                "text": "Detected a hardcoded hmac key. Avoid hardcoding secrets and consider using an alternate option such as reading the secret from a config file or using an environment variable."
+              },
+              "id": "home.runner.pipegen-rules.javascript.lang.security.audit.hardcoded-hmac-key",
+              "name": "home.runner.pipegen-rules.javascript.lang.security.audit.hardcoded-hmac-key",
+              "properties": {
+                "precision": "very-high",
+                "tags": [
+                  "CWE-798: Use of Hard-coded Credentials",
+                  "LOW CONFIDENCE",
+                  "OWASP-A07:2021 - Identification and Authentication Failures",
+                  "OWASP-A07:2025 - Authentication Failures",
+                  "security"
+                ]
+              },
+              "shortDescription": {
+                "text": "Semgrep Finding: home.runner.pipegen-rules.javascript.lang.security.audit.hardcoded-hmac-key"
+              }
+            },
+            {
+              "defaultConfiguration": {
+                "level": "warning"
+              },
+              "fullDescription": {
+                "text": "`$STR.replace` method will only replace the first occurrence when used with a string argument ($CHAR). If this method is used for escaping of dangerous data then there is a possibility for a bypass. Try to use sanitization library instead or use a Regex with a global flag."
+              },
+              "help": {
+                "markdown": "`$STR.replace` method will only replace the first occurrence when used with a string argument ($CHAR). If this method is used for escaping of dangerous data then there is a possibility for a bypass. Try to use sanitization library instead or use a Regex with a global flag.\n\n<b>References:</b>\n - [https://owasp.org/Top10/A03_2021-Injection](https://owasp.org/Top10/A03_2021-Injection)\n",
+                "text": "`$STR.replace` method will only replace the first occurrence when used with a string argument ($CHAR). If this method is used for escaping of dangerous data then there is a possibility for a bypass. Try to use sanitization library instead or use a Regex with a global flag."
+              },
+              "id": "home.runner.pipegen-rules.javascript.lang.security.audit.incomplete-sanitization",
+              "name": "home.runner.pipegen-rules.javascript.lang.security.audit.incomplete-sanitization",
+              "properties": {
+                "precision": "very-high",
+                "tags": [
+                  "CWE-116: Improper Encoding or Escaping of Output",
+                  "LOW CONFIDENCE",
+                  "OWASP-A03:2021 - Injection",
+                  "OWASP-A05:2025 - Injection",
+                  "security"
+                ]
+              },
+              "shortDescription": {
+                "text": "Semgrep Finding: home.runner.pipegen-rules.javascript.lang.security.audit.incomplete-sanitization"
+              }
+            },
+            {
+              "defaultConfiguration": {
+                "level": "warning"
+              },
+              "fullDescription": {
+                "text": "It looks like MD5 is used as a password hash. MD5 is not considered a secure password hash because it can be cracked by an attacker in a short amount of time. Use a suitable password hashing function such as bcrypt. You can use the `bcrypt` node.js package."
+              },
+              "help": {
+                "markdown": "It looks like MD5 is used as a password hash. MD5 is not considered a secure password hash because it can be cracked by an attacker in a short amount of time. Use a suitable password hashing function such as bcrypt. You can use the `bcrypt` node.js package.\n\n<b>References:</b>\n - [https://tools.ietf.org/id/draft-lvelvindron-tls-md5-sha1-deprecate-01.html](https://tools.ietf.org/id/draft-lvelvindron-tls-md5-sha1-deprecate-01.html)\n - [https://security.stackexchange.com/questions/211/how-to-securely-hash-passwords](https://security.stackexchange.com/questions/211/how-to-securely-hash-passwords)\n - [https://github.com/returntocorp/semgrep-rules/issues/1609](https://github.com/returntocorp/semgrep-rules/issues/1609)\n - [https://www.npmjs.com/package/bcrypt](https://www.npmjs.com/package/bcrypt)\n",
+                "text": "It looks like MD5 is used as a password hash. MD5 is not considered a secure password hash because it can be cracked by an attacker in a short amount of time. Use a suitable password hashing function such as bcrypt. You can use the `bcrypt` node.js package."
+              },
+              "id": "home.runner.pipegen-rules.javascript.lang.security.audit.md5-used-as-password",
+              "name": "home.runner.pipegen-rules.javascript.lang.security.audit.md5-used-as-password",
+              "properties": {
+                "precision": "very-high",
+                "tags": [
+                  "CWE-327: Use of a Broken or Risky Cryptographic Algorithm",
+                  "LOW CONFIDENCE",
+                  "OWASP-A02:2021 - Cryptographic Failures",
+                  "OWASP-A03:2017 - Sensitive Data Exposure",
+                  "OWASP-A04:2025 - Cryptographic Failures",
+                  "security"
+                ]
+              },
+              "shortDescription": {
+                "text": "Semgrep Finding: home.runner.pipegen-rules.javascript.lang.security.audit.md5-used-as-password"
+              }
+            },
+            {
+              "defaultConfiguration": {
+                "level": "warning"
+              },
+              "fullDescription": {
+                "text": "Detected possible user input going into a `path.join` or `path.resolve` function. This could possibly lead to a path traversal vulnerability,  where the attacker can access arbitrary files stored in the file system. Instead, be sure to sanitize or validate user input first."
+              },
+              "help": {
+                "markdown": "Detected possible user input going into a `path.join` or `path.resolve` function. This could possibly lead to a path traversal vulnerability,  where the attacker can access arbitrary files stored in the file system. Instead, be sure to sanitize or validate user input first.\n\n<b>References:</b>\n - [https://owasp.org/www-community/attacks/Path_Traversal](https://owasp.org/www-community/attacks/Path_Traversal)\n",
+                "text": "Detected possible user input going into a `path.join` or `path.resolve` function. This could possibly lead to a path traversal vulnerability,  where the attacker can access arbitrary files stored in the file system. Instead, be sure to sanitize or validate user input first."
+              },
+              "id": "home.runner.pipegen-rules.javascript.lang.security.audit.path-traversal.path-join-resolve-traversal",
+              "name": "home.runner.pipegen-rules.javascript.lang.security.audit.path-traversal.path-join-resolve-traversal",
+              "properties": {
+                "precision": "very-high",
+                "tags": [
+                  "CWE-22: Improper Limitation of a Pathname to a Restricted Directory ('Path Traversal')",
+                  "LOW CONFIDENCE",
+                  "OWASP-A01:2021 - Broken Access Control",
+                  "OWASP-A01:2025 - Broken Access Control",
+                  "OWASP-A05:2017 - Broken Access Control",
+                  "security"
+                ]
+              },
+              "shortDescription": {
+                "text": "Semgrep Finding: home.runner.pipegen-rules.javascript.lang.security.audit.path-traversal.path-join-resolve-traversal"
+              }
+            },
+            {
+              "defaultConfiguration": {
+                "level": "warning"
+              },
+              "fullDescription": {
+                "text": "Possibility of prototype polluting assignment detected. By adding or modifying attributes of an object prototype, it is possible to create attributes that exist on every object, or replace critical attributes with malicious ones. This can be problematic if the software depends on existence or non-existence of certain attributes, or uses pre-defined attributes of object prototype (such as hasOwnProperty, toString or valueOf). Possible mitigations might be: freezing the object prototype, using an object without prototypes (via Object.create(null) ), blocking modifications of attributes that resolve to object prototype, using Map instead of object."
+              },
+              "help": {
+                "markdown": "Possibility of prototype polluting assignment detected. By adding or modifying attributes of an object prototype, it is possible to create attributes that exist on every object, or replace critical attributes with malicious ones. This can be problematic if the software depends on existence or non-existence of certain attributes, or uses pre-defined attributes of object prototype (such as hasOwnProperty, toString or valueOf). Possible mitigations might be: freezing the object prototype, using an object without prototypes (via Object.create(null) ), blocking modifications of attributes that resolve to object prototype, using Map instead of object.\n\n<b>References:</b>\n - [https://github.com/HoLyVieR/prototype-pollution-nsec18/blob/master/paper/JavaScript_prototype_pollution_attack_in_NodeJS.pdf](https://github.com/HoLyVieR/prototype-pollution-nsec18/blob/master/paper/JavaScript_prototype_pollution_attack_in_NodeJS.pdf)\n",
+                "text": "Possibility of prototype polluting assignment detected. By adding or modifying attributes of an object prototype, it is possible to create attributes that exist on every object, or replace critical attributes with malicious ones. This can be problematic if the software depends on existence or non-existence of certain attributes, or uses pre-defined attributes of object prototype (such as hasOwnProperty, toString or valueOf). Possible mitigations might be: freezing the object prototype, using an object without prototypes (via Object.create(null) ), blocking modifications of attributes that resolve to object prototype, using Map instead of object."
+              },
+              "id": "home.runner.pipegen-rules.javascript.lang.security.audit.prototype-pollution.prototype-pollution-assignment",
+              "name": "home.runner.pipegen-rules.javascript.lang.security.audit.prototype-pollution.prototype-pollution-assignment",
+              "properties": {
+                "precision": "very-high",
+                "tags": [
+                  "CWE-915: Improperly Controlled Modification of Dynamically-Determined Object Attributes",
+                  "LOW CONFIDENCE",
+                  "OWASP-A08:2021 - Software and Data Integrity Failures",
+                  "OWASP-A08:2025 - Software or Data Integrity Failures",
+                  "security"
+                ]
+              },
+              "shortDescription": {
+                "text": "Semgrep Finding: home.runner.pipegen-rules.javascript.lang.security.audit.prototype-pollution.prototype-pollution-assignment"
+              }
+            },
+            {
+              "defaultConfiguration": {
+                "level": "warning"
+              },
+              "fullDescription": {
+                "text": "Possibility of prototype polluting function detected. By adding or modifying attributes of an object prototype, it is possible to create attributes that exist on every object, or replace critical attributes with malicious ones. This can be problematic if the software depends on existence or non-existence of certain attributes, or uses pre-defined attributes of object prototype (such as hasOwnProperty, toString or valueOf). Possible mitigations might be: freezing the object prototype, using an object without prototypes (via Object.create(null) ), blocking modifications of attributes that resolve to object prototype, using Map instead of object."
+              },
+              "help": {
+                "markdown": "Possibility of prototype polluting function detected. By adding or modifying attributes of an object prototype, it is possible to create attributes that exist on every object, or replace critical attributes with malicious ones. This can be problematic if the software depends on existence or non-existence of certain attributes, or uses pre-defined attributes of object prototype (such as hasOwnProperty, toString or valueOf). Possible mitigations might be: freezing the object prototype, using an object without prototypes (via Object.create(null) ), blocking modifications of attributes that resolve to object prototype, using Map instead of object.\n\n<b>References:</b>\n - [https://github.com/HoLyVieR/prototype-pollution-nsec18/blob/master/paper/JavaScript_prototype_pollution_attack_in_NodeJS.pdf](https://github.com/HoLyVieR/prototype-pollution-nsec18/blob/master/paper/JavaScript_prototype_pollution_attack_in_NodeJS.pdf)\n",
+                "text": "Possibility of prototype polluting function detected. By adding or modifying attributes of an object prototype, it is possible to create attributes that exist on every object, or replace critical attributes with malicious ones. This can be problematic if the software depends on existence or non-existence of certain attributes, or uses pre-defined attributes of object prototype (such as hasOwnProperty, toString or valueOf). Possible mitigations might be: freezing the object prototype, using an object without prototypes (via Object.create(null) ), blocking modifications of attributes that resolve to object prototype, using Map instead of object."
+              },
+              "id": "home.runner.pipegen-rules.javascript.lang.security.audit.prototype-pollution.prototype-pollution-loop",
+              "name": "home.runner.pipegen-rules.javascript.lang.security.audit.prototype-pollution.prototype-pollution-loop",
+              "properties": {
+                "precision": "very-high",
+                "tags": [
+                  "CWE-915: Improperly Controlled Modification of Dynamically-Determined Object Attributes",
+                  "LOW CONFIDENCE",
+                  "OWASP-A08:2021 - Software and Data Integrity Failures",
+                  "OWASP-A08:2025 - Software or Data Integrity Failures",
+                  "security"
+                ]
+              },
+              "shortDescription": {
+                "text": "Semgrep Finding: home.runner.pipegen-rules.javascript.lang.security.audit.prototype-pollution.prototype-pollution-loop"
+              }
+            },
+            {
+              "defaultConfiguration": {
+                "level": "error"
+              },
+              "fullDescription": {
+                "text": "Found '$SPAWN' with '{shell: $SHELL}'. This is dangerous because this call will spawn the command using a shell process. Doing so propagates current shell settings and variables, which makes it much easier for a malicious actor to execute commands. Use '{shell: false}' instead."
+              },
+              "help": {
+                "markdown": "Found '$SPAWN' with '{shell: $SHELL}'. This is dangerous because this call will spawn the command using a shell process. Doing so propagates current shell settings and variables, which makes it much easier for a malicious actor to execute commands. Use '{shell: false}' instead.\n\n<b>References:</b>\n - [https://owasp.org/Top10/A03_2021-Injection](https://owasp.org/Top10/A03_2021-Injection)\n",
+                "text": "Found '$SPAWN' with '{shell: $SHELL}'. This is dangerous because this call will spawn the command using a shell process. Doing so propagates current shell settings and variables, which makes it much easier for a malicious actor to execute commands. Use '{shell: false}' instead."
+              },
+              "id": "home.runner.pipegen-rules.javascript.lang.security.audit.spawn-shell-true",
+              "name": "home.runner.pipegen-rules.javascript.lang.security.audit.spawn-shell-true",
+              "properties": {
+                "precision": "very-high",
+                "tags": [
+                  "CWE-78: Improper Neutralization of Special Elements used in an OS Command ('OS Command Injection')",
+                  "LOW CONFIDENCE",
+                  "OWASP-A01:2017 - Injection",
+                  "OWASP-A03:2021 - Injection",
+                  "OWASP-A05:2025 - Injection",
+                  "security"
+                ]
+              },
+              "shortDescription": {
+                "text": "Semgrep Finding: home.runner.pipegen-rules.javascript.lang.security.audit.spawn-shell-true"
+              }
+            },
+            {
+              "defaultConfiguration": {
+                "level": "warning"
+              },
+              "fullDescription": {
+                "text": "Detected SQL statement that is tainted by `$REQ` object. This could lead to SQL injection if the variable is user-controlled and not properly sanitized. In order to prevent SQL injection, it is recommended to use parameterized queries or prepared statements. An example of parameterized queries like so: `knex.raw('SELECT $1 from table', [userinput])` can help prevent SQLi."
+              },
+              "help": {
+                "markdown": "Detected SQL statement that is tainted by `$REQ` object. This could lead to SQL injection if the variable is user-controlled and not properly sanitized. In order to prevent SQL injection, it is recommended to use parameterized queries or prepared statements. An example of parameterized queries like so: `knex.raw('SELECT $1 from table', [userinput])` can help prevent SQLi.\n\n<b>References:</b>\n - [https://knexjs.org/#Builder-fromRaw](https://knexjs.org/#Builder-fromRaw)\n - [https://knexjs.org/#Builder-whereRaw](https://knexjs.org/#Builder-whereRaw)\n - [https://cheatsheetseries.owasp.org/cheatsheets/SQL_Injection_Prevention_Cheat_Sheet.html](https://cheatsheetseries.owasp.org/cheatsheets/SQL_Injection_Prevention_Cheat_Sheet.html)\n",
+                "text": "Detected SQL statement that is tainted by `$REQ` object. This could lead to SQL injection if the variable is user-controlled and not properly sanitized. In order to prevent SQL injection, it is recommended to use parameterized queries or prepared statements. An example of parameterized queries like so: `knex.raw('SELECT $1 from table', [userinput])` can help prevent SQLi."
+              },
+              "id": "home.runner.pipegen-rules.javascript.lang.security.audit.sqli.node-knex-sqli",
+              "name": "home.runner.pipegen-rules.javascript.lang.security.audit.sqli.node-knex-sqli",
+              "properties": {
+                "precision": "very-high",
+                "tags": [
+                  "CWE-89: Improper Neutralization of Special Elements used in an SQL Command ('SQL Injection')",
+                  "MEDIUM CONFIDENCE",
+                  "OWASP-A01:2017 - Injection",
+                  "OWASP-A03:2021 - Injection",
+                  "OWASP-A05:2025 - Injection",
+                  "security"
+                ]
+              },
+              "shortDescription": {
+                "text": "Semgrep Finding: home.runner.pipegen-rules.javascript.lang.security.audit.sqli.node-knex-sqli"
+              }
+            },
+            {
+              "defaultConfiguration": {
+                "level": "warning"
+              },
+              "fullDescription": {
+                "text": "Detected string concatenation with a non-literal variable in a `mssql` JS SQL statement. This could lead to SQL injection if the variable is user-controlled and not properly sanitized. In order to prevent SQL injection, use parameterized queries or prepared statements instead. You can use parameterized statements like so: `$REQ.input('USER_ID', mssql.Int, id);`"
+              },
+              "help": {
+                "markdown": "Detected string concatenation with a non-literal variable in a `mssql` JS SQL statement. This could lead to SQL injection if the variable is user-controlled and not properly sanitized. In order to prevent SQL injection, use parameterized queries or prepared statements instead. You can use parameterized statements like so: `$REQ.input('USER_ID', mssql.Int, id);`\n\n<b>References:</b>\n - [https://www.npmjs.com/package/mssql](https://www.npmjs.com/package/mssql)\n",
+                "text": "Detected string concatenation with a non-literal variable in a `mssql` JS SQL statement. This could lead to SQL injection if the variable is user-controlled and not properly sanitized. In order to prevent SQL injection, use parameterized queries or prepared statements instead. You can use parameterized statements like so: `$REQ.input('USER_ID', mssql.Int, id);`"
+              },
+              "id": "home.runner.pipegen-rules.javascript.lang.security.audit.sqli.node-mssql-sqli",
+              "name": "home.runner.pipegen-rules.javascript.lang.security.audit.sqli.node-mssql-sqli",
+              "properties": {
+                "precision": "very-high",
+                "tags": [
+                  "CWE-89: Improper Neutralization of Special Elements used in an SQL Command ('SQL Injection')",
+                  "LOW CONFIDENCE",
+                  "OWASP-A01:2017 - Injection",
+                  "OWASP-A03:2021 - Injection",
+                  "OWASP-A05:2025 - Injection",
+                  "security"
+                ]
+              },
+              "shortDescription": {
+                "text": "Semgrep Finding: home.runner.pipegen-rules.javascript.lang.security.audit.sqli.node-mssql-sqli"
+              }
+            },
+            {
+              "defaultConfiguration": {
+                "level": "warning"
+              },
+              "fullDescription": {
+                "text": "Detected a `$IMPORT` SQL statement that comes from a function argument. This could lead to SQL injection if the variable is user-controlled and is not properly sanitized. In order to prevent SQL injection, it is recommended to use parameterized queries or prepared statements."
+              },
+              "help": {
+                "markdown": "Detected a `$IMPORT` SQL statement that comes from a function argument. This could lead to SQL injection if the variable is user-controlled and is not properly sanitized. In order to prevent SQL injection, it is recommended to use parameterized queries or prepared statements.\n\n<b>References:</b>\n - [https://www.npmjs.com/package/mysql2](https://www.npmjs.com/package/mysql2)\n - [https://www.npmjs.com/package/mysql](https://www.npmjs.com/package/mysql)\n - [https://cheatsheetseries.owasp.org/cheatsheets/SQL_Injection_Prevention_Cheat_Sheet.html](https://cheatsheetseries.owasp.org/cheatsheets/SQL_Injection_Prevention_Cheat_Sheet.html)\n",
+                "text": "Detected a `$IMPORT` SQL statement that comes from a function argument. This could lead to SQL injection if the variable is user-controlled and is not properly sanitized. In order to prevent SQL injection, it is recommended to use parameterized queries or prepared statements."
+              },
+              "id": "home.runner.pipegen-rules.javascript.lang.security.audit.sqli.node-mysql-sqli",
+              "name": "home.runner.pipegen-rules.javascript.lang.security.audit.sqli.node-mysql-sqli",
+              "properties": {
+                "precision": "very-high",
+                "tags": [
+                  "CWE-89: Improper Neutralization of Special Elements used in an SQL Command ('SQL Injection')",
+                  "LOW CONFIDENCE",
+                  "OWASP-A01:2017 - Injection",
+                  "OWASP-A03:2021 - Injection",
+                  "OWASP-A05:2025 - Injection",
+                  "security"
+                ]
+              },
+              "shortDescription": {
+                "text": "Semgrep Finding: home.runner.pipegen-rules.javascript.lang.security.audit.sqli.node-mysql-sqli"
+              }
+            },
+            {
+              "defaultConfiguration": {
+                "level": "warning"
+              },
+              "fullDescription": {
+                "text": "Detected string concatenation with a non-literal variable in a node-postgres JS SQL statement. This could lead to SQL injection if the variable is user-controlled and not properly sanitized. In order to prevent SQL injection, use parameterized queries or prepared statements instead. You can use parameterized statements like so: `client.query('SELECT $1 from table', [userinput])`"
+              },
+              "help": {
+                "markdown": "Detected string concatenation with a non-literal variable in a node-postgres JS SQL statement. This could lead to SQL injection if the variable is user-controlled and not properly sanitized. In order to prevent SQL injection, use parameterized queries or prepared statements instead. You can use parameterized statements like so: `client.query('SELECT $1 from table', [userinput])`\n\n<b>References:</b>\n - [https://node-postgres.com/features/queries](https://node-postgres.com/features/queries)\n",
+                "text": "Detected string concatenation with a non-literal variable in a node-postgres JS SQL statement. This could lead to SQL injection if the variable is user-controlled and not properly sanitized. In order to prevent SQL injection, use parameterized queries or prepared statements instead. You can use parameterized statements like so: `client.query('SELECT $1 from table', [userinput])`"
+              },
+              "id": "home.runner.pipegen-rules.javascript.lang.security.audit.sqli.node-postgres-sqli",
+              "name": "home.runner.pipegen-rules.javascript.lang.security.audit.sqli.node-postgres-sqli",
+              "properties": {
+                "precision": "very-high",
+                "tags": [
+                  "CWE-915: Improperly Controlled Modification of Dynamically-Determined Object Attributes",
+                  "LOW CONFIDENCE",
+                  "OWASP-A08:2021 - Software and Data Integrity Failures",
+                  "OWASP-A08:2025 - Software or Data Integrity Failures",
+                  "security"
+                ]
+              },
+              "shortDescription": {
+                "text": "Semgrep Finding: home.runner.pipegen-rules.javascript.lang.security.audit.sqli.node-postgres-sqli"
+              }
+            },
+            {
+              "defaultConfiguration": {
+                "level": "warning"
+              },
+              "fullDescription": {
+                "text": "Cannot determine what '$UNK' is and it is used with a '<script>' tag. This could be susceptible to cross-site scripting (XSS). Ensure '$UNK' is not externally controlled, or sanitize this data."
+              },
+              "help": {
+                "markdown": "Cannot determine what '$UNK' is and it is used with a '<script>' tag. This could be susceptible to cross-site scripting (XSS). Ensure '$UNK' is not externally controlled, or sanitize this data.\n\n<b>References:</b>\n - [https://www.developsec.com/2017/11/09/xss-in-a-script-tag/](https://www.developsec.com/2017/11/09/xss-in-a-script-tag/)\n - [https://github.com/juice-shop/juice-shop/blob/1ceb8751e986dacd3214a618c37e7411be6bc11a/routes/videoHandler.ts#L68](https://github.com/juice-shop/juice-shop/blob/1ceb8751e986dacd3214a618c37e7411be6bc11a/routes/videoHandler.ts#L68)\n",
+                "text": "Cannot determine what '$UNK' is and it is used with a '<script>' tag. This could be susceptible to cross-site scripting (XSS). Ensure '$UNK' is not externally controlled, or sanitize this data."
+              },
+              "id": "home.runner.pipegen-rules.javascript.lang.security.audit.unknown-value-with-script-tag",
+              "name": "home.runner.pipegen-rules.javascript.lang.security.audit.unknown-value-with-script-tag",
+              "properties": {
+                "precision": "very-high",
+                "tags": [
+                  "CWE-79: Improper Neutralization of Input During Web Page Generation ('Cross-site Scripting')",
+                  "LOW CONFIDENCE",
+                  "OWASP-A03:2021 - Injection",
+                  "OWASP-A05:2025 - Injection",
+                  "OWASP-A07:2017 - Cross-Site Scripting (XSS)",
+                  "security"
+                ]
+              },
+              "shortDescription": {
+                "text": "Semgrep Finding: home.runner.pipegen-rules.javascript.lang.security.audit.unknown-value-with-script-tag"
+              }
+            },
+            {
+              "defaultConfiguration": {
+                "level": "warning"
+              },
+              "fullDescription": {
+                "text": "Using non-static data to retrieve and run functions from the object is dangerous. If the data is user-controlled, it may allow executing arbitrary code."
+              },
+              "help": {
+                "markdown": "Using non-static data to retrieve and run functions from the object is dangerous. If the data is user-controlled, it may allow executing arbitrary code.\n\n<b>References:</b>\n - [https://owasp.org/Top10/A03_2021-Injection](https://owasp.org/Top10/A03_2021-Injection)\n",
+                "text": "Using non-static data to retrieve and run functions from the object is dangerous. If the data is user-controlled, it may allow executing arbitrary code."
+              },
+              "id": "home.runner.pipegen-rules.javascript.lang.security.audit.unsafe-dynamic-method",
+              "name": "home.runner.pipegen-rules.javascript.lang.security.audit.unsafe-dynamic-method",
+              "properties": {
+                "precision": "very-high",
+                "tags": [
+                  "CWE-94: Improper Control of Generation of Code ('Code Injection')",
+                  "LOW CONFIDENCE",
+                  "OWASP-A03:2021 - Injection",
+                  "OWASP-A05:2025 - Injection",
+                  "security"
+                ]
+              },
+              "shortDescription": {
+                "text": "Semgrep Finding: home.runner.pipegen-rules.javascript.lang.security.audit.unsafe-dynamic-method"
+              }
+            },
+            {
+              "defaultConfiguration": {
+                "level": "note"
+              },
+              "fullDescription": {
+                "text": "Detected string concatenation with a non-literal variable in a util.format / console.log function. If an attacker injects a format specifier in the string, it will forge the log message. Try to use constant values for the format string."
+              },
+              "help": {
+                "markdown": "Detected string concatenation with a non-literal variable in a util.format / console.log function. If an attacker injects a format specifier in the string, it will forge the log message. Try to use constant values for the format string.\n\n<b>References:</b>\n - [https://cwe.mitre.org/data/definitions/134.html](https://cwe.mitre.org/data/definitions/134.html)\n",
+                "text": "Detected string concatenation with a non-literal variable in a util.format / console.log function. If an attacker injects a format specifier in the string, it will forge the log message. Try to use constant values for the format string."
+              },
+              "id": "home.runner.pipegen-rules.javascript.lang.security.audit.unsafe-formatstring",
+              "name": "home.runner.pipegen-rules.javascript.lang.security.audit.unsafe-formatstring",
+              "properties": {
+                "precision": "very-high",
+                "tags": [
+                  "CWE-134: Use of Externally-Controlled Format String",
+                  "LOW CONFIDENCE",
+                  "OWASP-A01:2021 - Broken Access Control",
+                  "OWASP-A01:2025 - Broken Access Control",
+                  "security"
+                ]
+              },
+              "shortDescription": {
+                "text": "Semgrep Finding: home.runner.pipegen-rules.javascript.lang.security.audit.unsafe-formatstring"
+              }
+            },
+            {
+              "defaultConfiguration": {
+                "level": "warning"
+              },
+              "fullDescription": {
+                "text": "Detected usage of noassert in Buffer API, which allows the offset the be beyond the end of the buffer. This could result in writing or reading beyond the end of the buffer."
+              },
+              "help": {
+                "markdown": "Detected usage of noassert in Buffer API, which allows the offset the be beyond the end of the buffer. This could result in writing or reading beyond the end of the buffer.\n\n<b>References:</b>\n - [Semgrep Rule](https://github.com/nodesecurity/eslint-plugin-security/blob/master/rules/detect-buffer-noassert.js)\n - [https://cwe.mitre.org/data/definitions/119.html](https://cwe.mitre.org/data/definitions/119.html)\n",
+                "text": "Detected usage of noassert in Buffer API, which allows the offset the be beyond the end of the buffer. This could result in writing or reading beyond the end of the buffer."
+              },
+              "helpUri": "https://github.com/nodesecurity/eslint-plugin-security/blob/master/rules/detect-buffer-noassert.js",
+              "id": "home.runner.pipegen-rules.javascript.lang.security.detect-buffer-noassert",
+              "name": "home.runner.pipegen-rules.javascript.lang.security.detect-buffer-noassert",
+              "properties": {
+                "precision": "very-high",
+                "tags": [
+                  "CWE-119: Improper Restriction of Operations within the Bounds of a Memory Buffer",
+                  "LOW CONFIDENCE",
+                  "security"
+                ]
+              },
+              "shortDescription": {
+                "text": "Semgrep Finding: home.runner.pipegen-rules.javascript.lang.security.detect-buffer-noassert"
+              }
+            },
+            {
+              "defaultConfiguration": {
+                "level": "error"
+              },
+              "fullDescription": {
+                "text": "Detected calls to child_process from a function argument `$FUNC`. This could lead to a command injection if the input is user controllable. Try to avoid calls to child_process, and if it is needed ensure user input is correctly sanitized or sandboxed. "
+              },
+              "help": {
+                "markdown": "Detected calls to child_process from a function argument `$FUNC`. This could lead to a command injection if the input is user controllable. Try to avoid calls to child_process, and if it is needed ensure user input is correctly sanitized or sandboxed. \n\n<b>References:</b>\n - [Semgrep Rule](https://github.com/nodesecurity/eslint-plugin-security/blob/master/rules/detect-child-process.js)\n - [https://cheatsheetseries.owasp.org/cheatsheets/Nodejs_Security_Cheat_Sheet.html#do-not-use-dangerous-functions](https://cheatsheetseries.owasp.org/cheatsheets/Nodejs_Security_Cheat_Sheet.html#do-not-use-dangerous-functions)\n",
+                "text": "Detected calls to child_process from a function argument `$FUNC`. This could lead to a command injection if the input is user controllable. Try to avoid calls to child_process, and if it is needed ensure user input is correctly sanitized or sandboxed. "
+              },
+              "helpUri": "https://github.com/nodesecurity/eslint-plugin-security/blob/master/rules/detect-child-process.js",
+              "id": "home.runner.pipegen-rules.javascript.lang.security.detect-child-process",
+              "name": "home.runner.pipegen-rules.javascript.lang.security.detect-child-process",
+              "properties": {
+                "precision": "very-high",
+                "tags": [
+                  "CWE-78: Improper Neutralization of Special Elements used in an OS Command ('OS Command Injection')",
+                  "LOW CONFIDENCE",
+                  "OWASP-A01:2017 - Injection",
+                  "OWASP-A03:2021 - Injection",
+                  "OWASP-A05:2025 - Injection",
+                  "security"
+                ]
+              },
+              "shortDescription": {
+                "text": "Semgrep Finding: home.runner.pipegen-rules.javascript.lang.security.detect-child-process"
+              }
+            },
+            {
+              "defaultConfiguration": {
+                "level": "warning"
+              },
+              "fullDescription": {
+                "text": "Markup escaping disabled. This can be used with some template engines to escape disabling of HTML entities, which can lead to XSS attacks."
+              },
+              "help": {
+                "markdown": "Markup escaping disabled. This can be used with some template engines to escape disabling of HTML entities, which can lead to XSS attacks.\n\n<b>References:</b>\n - [Semgrep Rule](https://github.com/nodesecurity/eslint-plugin-security/blob/master/rules/detect-disable-mustache-escape.js)\n - [https://owasp.org/Top10/A03_2021-Injection](https://owasp.org/Top10/A03_2021-Injection)\n",
+                "text": "Markup escaping disabled. This can be used with some template engines to escape disabling of HTML entities, which can lead to XSS attacks."
+              },
+              "helpUri": "https://github.com/nodesecurity/eslint-plugin-security/blob/master/rules/detect-disable-mustache-escape.js",
+              "id": "home.runner.pipegen-rules.javascript.lang.security.detect-disable-mustache-escape",
+              "name": "home.runner.pipegen-rules.javascript.lang.security.detect-disable-mustache-escape",
+              "properties": {
+                "precision": "very-high",
+                "tags": [
+                  "CWE-116: Improper Encoding or Escaping of Output",
+                  "LOW CONFIDENCE",
+                  "OWASP-A03:2021 - Injection",
+                  "OWASP-A05:2025 - Injection",
+                  "security"
+                ]
+              },
+              "shortDescription": {
+                "text": "Semgrep Finding: home.runner.pipegen-rules.javascript.lang.security.detect-disable-mustache-escape"
+              }
+            },
+            {
+              "defaultConfiguration": {
+                "level": "warning"
+              },
+              "fullDescription": {
+                "text": "Detected use of dynamic execution of JavaScript which may come from user-input, which can lead to Cross-Site-Scripting (XSS). Where possible avoid including user-input in functions which dynamically execute user-input."
+              },
+              "help": {
+                "markdown": "Detected use of dynamic execution of JavaScript which may come from user-input, which can lead to Cross-Site-Scripting (XSS). Where possible avoid including user-input in functions which dynamically execute user-input.\n\n<b>References:</b>\n - [Semgrep Rule](https://github.com/nodesecurity/eslint-plugin-security/blob/master/rules/detect-eval-with-expression.js)\n - [https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/eval#never_use_eval!](https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/eval#never_use_eval!)\n",
+                "text": "Detected use of dynamic execution of JavaScript which may come from user-input, which can lead to Cross-Site-Scripting (XSS). Where possible avoid including user-input in functions which dynamically execute user-input."
+              },
+              "helpUri": "https://github.com/nodesecurity/eslint-plugin-security/blob/master/rules/detect-eval-with-expression.js",
+              "id": "home.runner.pipegen-rules.javascript.lang.security.detect-eval-with-expression",
+              "name": "home.runner.pipegen-rules.javascript.lang.security.detect-eval-with-expression",
+              "properties": {
+                "precision": "very-high",
+                "tags": [
+                  "CWE-95: Improper Neutralization of Directives in Dynamically Evaluated Code ('Eval Injection')",
+                  "MEDIUM CONFIDENCE",
+                  "OWASP-A03:2021 - Injection",
+                  "OWASP-A05:2025 - Injection",
+                  "security"
+                ]
+              },
+              "shortDescription": {
+                "text": "Semgrep Finding: home.runner.pipegen-rules.javascript.lang.security.detect-eval-with-expression"
+              }
+            },
+            {
+              "defaultConfiguration": {
+                "level": "error"
+              },
+              "fullDescription": {
+                "text": "Insecure WebSocket Detected. WebSocket Secure (wss) should be used for all WebSocket connections."
+              },
+              "help": {
+                "markdown": "Insecure WebSocket Detected. WebSocket Secure (wss) should be used for all WebSocket connections.\n\n<b>References:</b>\n - [https://owasp.org/Top10/A02_2021-Cryptographic_Failures](https://owasp.org/Top10/A02_2021-Cryptographic_Failures)\n",
+                "text": "Insecure WebSocket Detected. WebSocket Secure (wss) should be used for all WebSocket connections."
+              },
+              "id": "home.runner.pipegen-rules.javascript.lang.security.detect-insecure-websocket",
+              "name": "home.runner.pipegen-rules.javascript.lang.security.detect-insecure-websocket",
+              "properties": {
+                "precision": "very-high",
+                "tags": [
+                  "CWE-319: Cleartext Transmission of Sensitive Information",
+                  "LOW CONFIDENCE",
+                  "OWASP-A02:2021 - Cryptographic Failures",
+                  "OWASP-A03:2017 - Sensitive Data Exposure",
+                  "OWASP-A04:2025 - Cryptographic Failures",
+                  "security"
+                ]
+              },
+              "shortDescription": {
+                "text": "Semgrep Finding: home.runner.pipegen-rules.javascript.lang.security.detect-insecure-websocket"
+              }
+            },
+            {
+              "defaultConfiguration": {
+                "level": "warning"
+              },
+              "fullDescription": {
+                "text": "Detected use of express.csrf() middleware before express.methodOverride(). This can allow GET requests (which are not checked by csrf) to turn into POST requests later."
+              },
+              "help": {
+                "markdown": "Detected use of express.csrf() middleware before express.methodOverride(). This can allow GET requests (which are not checked by csrf) to turn into POST requests later.\n\n<b>References:</b>\n - [Semgrep Rule](https://github.com/nodesecurity/eslint-plugin-security/blob/master/rules/detect-no-csrf-before-method-override.js)\n - [https://github.com/nodesecurity/eslint-plugin-security/blob/master/docs/bypass-connect-csrf-protection-by-abusing.md](https://github.com/nodesecurity/eslint-plugin-security/blob/master/docs/bypass-connect-csrf-protection-by-abusing.md)\n",
+                "text": "Detected use of express.csrf() middleware before express.methodOverride(). This can allow GET requests (which are not checked by csrf) to turn into POST requests later."
+              },
+              "helpUri": "https://github.com/nodesecurity/eslint-plugin-security/blob/master/rules/detect-no-csrf-before-method-override.js",
+              "id": "home.runner.pipegen-rules.javascript.lang.security.detect-no-csrf-before-method-override",
+              "name": "home.runner.pipegen-rules.javascript.lang.security.detect-no-csrf-before-method-override",
+              "properties": {
+                "precision": "very-high",
+                "tags": [
+                  "CWE-352: Cross-Site Request Forgery (CSRF)",
+                  "LOW CONFIDENCE",
+                  "OWASP-A01:2021 - Broken Access Control",
+                  "OWASP-A01:2025 - Broken Access Control",
+                  "OWASP-A05:2017 - Broken Access Control",
+                  "security"
+                ]
+              },
+              "shortDescription": {
+                "text": "Semgrep Finding: home.runner.pipegen-rules.javascript.lang.security.detect-no-csrf-before-method-override"
+              }
+            },
+            {
+              "defaultConfiguration": {
+                "level": "warning"
+              },
+              "fullDescription": {
+                "text": "Detected usage of crypto.pseudoRandomBytes, which does not produce secure random numbers."
+              },
+              "help": {
+                "markdown": "Detected usage of crypto.pseudoRandomBytes, which does not produce secure random numbers.\n\n<b>References:</b>\n - [Semgrep Rule](https://github.com/nodesecurity/eslint-plugin-security/blob/master/rules/detect-pseudoRandomBytes.js)\n - [https://owasp.org/Top10/A02_2021-Cryptographic_Failures](https://owasp.org/Top10/A02_2021-Cryptographic_Failures)\n",
+                "text": "Detected usage of crypto.pseudoRandomBytes, which does not produce secure random numbers."
+              },
+              "helpUri": "https://github.com/nodesecurity/eslint-plugin-security/blob/master/rules/detect-pseudoRandomBytes.js",
+              "id": "home.runner.pipegen-rules.javascript.lang.security.detect-pseudoRandomBytes",
+              "name": "home.runner.pipegen-rules.javascript.lang.security.detect-pseudoRandomBytes",
+              "properties": {
+                "precision": "very-high",
+                "tags": [
+                  "CWE-338: Use of Cryptographically Weak Pseudo-Random Number Generator (PRNG)",
+                  "LOW CONFIDENCE",
+                  "OWASP-A02:2021 - Cryptographic Failures",
+                  "OWASP-A04:2025 - Cryptographic Failures",
+                  "security"
+                ]
+              },
+              "shortDescription": {
+                "text": "Semgrep Finding: home.runner.pipegen-rules.javascript.lang.security.detect-pseudoRandomBytes"
+              }
+            },
+            {
+              "defaultConfiguration": {
+                "level": "warning"
+              },
+              "fullDescription": {
+                "text": "This template literal looks like HTML and has interpolated variables. These variables are not HTML-encoded by default. If the variables contain HTML tags, these may be interpreted by the browser, resulting in cross-site scripting (XSS)."
+              },
+              "help": {
+                "markdown": "This template literal looks like HTML and has interpolated variables. These variables are not HTML-encoded by default. If the variables contain HTML tags, these may be interpreted by the browser, resulting in cross-site scripting (XSS).\n\n<b>References:</b>\n - [https://owasp.org/Top10/A03_2021-Injection](https://owasp.org/Top10/A03_2021-Injection)\n",
+                "text": "This template literal looks like HTML and has interpolated variables. These variables are not HTML-encoded by default. If the variables contain HTML tags, these may be interpreted by the browser, resulting in cross-site scripting (XSS)."
+              },
+              "id": "home.runner.pipegen-rules.javascript.lang.security.html-in-template-string",
+              "name": "home.runner.pipegen-rules.javascript.lang.security.html-in-template-string",
+              "properties": {
+                "precision": "very-high",
+                "tags": [
+                  "CWE-116: Improper Encoding or Escaping of Output",
+                  "LOW CONFIDENCE",
+                  "OWASP-A03:2021 - Injection",
+                  "OWASP-A05:2025 - Injection",
+                  "security"
+                ]
+              },
+              "shortDescription": {
+                "text": "Semgrep Finding: home.runner.pipegen-rules.javascript.lang.security.html-in-template-string"
+              }
+            },
+            {
+              "defaultConfiguration": {
+                "level": "warning"
+              },
+              "fullDescription": {
+                "text": "Depending on the context, user control data in `Object.assign` can cause web response to include data that it should not have or can lead to a mass assignment vulnerability."
+              },
+              "help": {
+                "markdown": "Depending on the context, user control data in `Object.assign` can cause web response to include data that it should not have or can lead to a mass assignment vulnerability.\n\n<b>References:</b>\n - [https://cheatsheetseries.owasp.org/cheatsheets/Mass_Assignment_Cheat_Sheet.html](https://cheatsheetseries.owasp.org/cheatsheets/Mass_Assignment_Cheat_Sheet.html)\n - [https://en.wikipedia.org/wiki/Mass_assignment_vulnerability](https://en.wikipedia.org/wiki/Mass_assignment_vulnerability)\n",
+                "text": "Depending on the context, user control data in `Object.assign` can cause web response to include data that it should not have or can lead to a mass assignment vulnerability."
+              },
+              "id": "home.runner.pipegen-rules.javascript.lang.security.insecure-object-assign",
+              "name": "home.runner.pipegen-rules.javascript.lang.security.insecure-object-assign",
+              "properties": {
+                "precision": "very-high",
+                "tags": [
+                  "CWE-601: URL Redirection to Untrusted Site ('Open Redirect')",
+                  "LOW CONFIDENCE",
+                  "OWASP-A01:2021 - Broken Access Control",
+                  "OWASP-A01:2025 - Broken Access Control",
+                  "security"
+                ]
+              },
+              "shortDescription": {
+                "text": "Semgrep Finding: home.runner.pipegen-rules.javascript.lang.security.insecure-object-assign"
+              }
+            },
+            {
+              "defaultConfiguration": {
+                "level": "error"
+              },
+              "fullDescription": {
+                "text": "Git allows shell commands to be specified in ext URLs for remote repositories. For example, git clone 'ext::sh -c whoami% >&2' will execute the whoami command to try to connect to a remote repository. Make sure that the URL is not controlled by external input."
+              },
+              "help": {
+                "markdown": "Git allows shell commands to be specified in ext URLs for remote repositories. For example, git clone 'ext::sh -c whoami% >&2' will execute the whoami command to try to connect to a remote repository. Make sure that the URL is not controlled by external input.\n\n<b>References:</b>\n - [https://owasp.org/Top10/A03_2021-Injection](https://owasp.org/Top10/A03_2021-Injection)\n",
+                "text": "Git allows shell commands to be specified in ext URLs for remote repositories. For example, git clone 'ext::sh -c whoami% >&2' will execute the whoami command to try to connect to a remote repository. Make sure that the URL is not controlled by external input."
+              },
+              "id": "home.runner.pipegen-rules.javascript.lang.security.spawn-git-clone",
+              "name": "home.runner.pipegen-rules.javascript.lang.security.spawn-git-clone",
+              "properties": {
+                "precision": "very-high",
+                "tags": [
+                  "CWE-78: Improper Neutralization of Special Elements used in an OS Command ('OS Command Injection')",
+                  "LOW CONFIDENCE",
+                  "OWASP-A01:2017 - Injection",
+                  "OWASP-A03:2021 - Injection",
+                  "OWASP-A05:2025 - Injection",
+                  "security"
+                ]
+              },
+              "shortDescription": {
+                "text": "Semgrep Finding: home.runner.pipegen-rules.javascript.lang.security.spawn-git-clone"
+              }
+            }
+          ],
+          "semanticVersion": "1.181.0"
+        }
+      }
+    }
+  ],
+  "$schema": "https://docs.oasis-open.org/sarif/sarif/v2.1.0/os/schemas/sarif-schema-2.1.0.json"
+}

@@ -1,0 +1,132 @@
+{
+  "version": "2.1.0",
+  "$schema": "https://raw.githubusercontent.com/oasis-tcs/sarif-spec/main/sarif-2.1/schema/sarif-schema-2.1.0.json",
+  "runs": [
+    {
+      "tool": {
+        "driver": {
+          "fullName": "Trivy Vulnerability Scanner",
+          "informationUri": "https://github.com/aquasecurity/trivy",
+          "name": "Trivy",
+          "rules": [
+            {
+              "id": "acme/gpl:GPL-3.0-only",
+              "name": "License",
+              "shortDescription": {
+                "text": "GPL-3.0-only in acme/gpl"
+              },
+              "fullDescription": {
+                "text": "GPL-3.0-only in acme/gpl"
+              },
+              "defaultConfiguration": {
+                "level": "error"
+              },
+              "help": {
+                "text": "License GPL-3.0-only\nClassification: restricted\nPkgName: acme/gpl\nPath: php/composer.lock",
+                "markdown": "**License GPL-3.0-only**\n| PkgName | Classification | Path |\n| --- | --- | --- |\n|acme/gpl|restricted|php/composer.lock|"
+              },
+              "properties": {
+                "precision": "very-high",
+                "security-severity": "8.0",
+                "tags": [
+                  "license",
+                  "security",
+                  "HIGH"
+                ]
+              }
+            },
+            {
+              "id": "acme/agpl:AGPL-3.0-only",
+              "name": "License",
+              "shortDescription": {
+                "text": "AGPL-3.0-only in acme/agpl"
+              },
+              "fullDescription": {
+                "text": "AGPL-3.0-only in acme/agpl"
+              },
+              "defaultConfiguration": {
+                "level": "error"
+              },
+              "help": {
+                "text": "License AGPL-3.0-only\nClassification: forbidden\nPkgName: acme/agpl\nPath: php/composer.lock",
+                "markdown": "**License AGPL-3.0-only**\n| PkgName | Classification | Path |\n| --- | --- | --- |\n|acme/agpl|forbidden|php/composer.lock|"
+              },
+              "properties": {
+                "precision": "very-high",
+                "security-severity": "9.5",
+                "tags": [
+                  "license",
+                  "security",
+                  "CRITICAL"
+                ]
+              }
+            }
+          ],
+          "version": "0.76.0"
+        }
+      },
+      "results": [
+        {
+          "ruleId": "acme/gpl:GPL-3.0-only",
+          "ruleIndex": 0,
+          "level": "error",
+          "message": {
+            "text": "Artifact: php/composer.lock\nLicense GPL-3.0-only\nPkgName: acme/gpl\n Classification: restricted\n Path: php/composer.lock"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "php/composer.lock",
+                  "uriBaseId": "ROOTPATH"
+                },
+                "region": {
+                  "startLine": 1,
+                  "startColumn": 1,
+                  "endLine": 1,
+                  "endColumn": 1
+                }
+              },
+              "message": {
+                "text": ""
+              }
+            }
+          ]
+        },
+        {
+          "ruleId": "acme/agpl:AGPL-3.0-only",
+          "ruleIndex": 1,
+          "level": "error",
+          "message": {
+            "text": "Artifact: php/composer.lock\nLicense AGPL-3.0-only\nPkgName: acme/agpl\n Classification: forbidden\n Path: php/composer.lock"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "php/composer.lock",
+                  "uriBaseId": "ROOTPATH"
+                },
+                "region": {
+                  "startLine": 1,
+                  "startColumn": 1,
+                  "endLine": 1,
+                  "endColumn": 1
+                }
+              },
+              "message": {
+                "text": ""
+              }
+            }
+          ]
+        }
+      ],
+      "columnKind": "utf16CodeUnits",
+      "originalUriBaseIds": {
+        "ROOTPATH": {
+          "uri": "file:///home/runner/work/fixture/fixture/"
+        }
+      }
+    }
+  ]
+}

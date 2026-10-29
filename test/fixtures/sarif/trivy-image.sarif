@@ -1,0 +1,199 @@
+{
+  "version": "2.1.0",
+  "$schema": "https://raw.githubusercontent.com/oasis-tcs/sarif-spec/main/sarif-2.1/schema/sarif-schema-2.1.0.json",
+  "runs": [
+    {
+      "tool": {
+        "driver": {
+          "fullName": "Trivy Vulnerability Scanner",
+          "informationUri": "https://github.com/aquasecurity/trivy",
+          "name": "Trivy",
+          "rules": [
+            {
+              "id": "CVE-2021-28831",
+              "name": "OsPackageVulnerability",
+              "shortDescription": {
+                "text": "busybox: invalid free or segmentation fault via malformed gzip data"
+              },
+              "fullDescription": {
+                "text": "decompress_gunzip.c in BusyBox through 1.32.1 mishandles the error bit on the huft_build result pointer, with a resultant invalid free or segmentation fault, via malformed gzip data."
+              },
+              "defaultConfiguration": {
+                "level": "error"
+              },
+              "helpUri": "https://avd.aquasec.com/nvd/cve-2021-28831",
+              "help": {
+                "text": "Vulnerability CVE-2021-28831\nSeverity: HIGH\nPackage: busybox\nFixed Version: 1.30.1-r5\nLink: [CVE-2021-28831](https://avd.aquasec.com/nvd/cve-2021-28831)\ndecompress_gunzip.c in BusyBox through 1.32.1 mishandles the error bit on the huft_build result pointer, with a resultant invalid free or segmentation fault, via malformed gzip data.",
+                "markdown": "**Vulnerability CVE-2021-28831**\n| Severity | Package | Fixed Version | Link |\n| --- | --- | --- | --- |\n|HIGH|busybox|1.30.1-r5|[CVE-2021-28831](https://avd.aquasec.com/nvd/cve-2021-28831)|\n\ndecompress_gunzip.c in BusyBox through 1.32.1 mishandles the error bit on the huft_build result pointer, with a resultant invalid free or segmentation fault, via malformed gzip data."
+              },
+              "properties": {
+                "cvssv2_score": 5,
+                "cvssv2_vector": "AV:N/AC:L/Au:N/C:N/I:N/A:P",
+                "cvssv3_baseScore": 7.5,
+                "cvssv3_vector": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:N/I:N/A:H",
+                "precision": "very-high",
+                "security-severity": "7.5",
+                "tags": [
+                  "vulnerability",
+                  "security",
+                  "HIGH"
+                ]
+              }
+            },
+            {
+              "id": "CVE-2020-28928",
+              "name": "OsPackageVulnerability",
+              "shortDescription": {
+                "text": "In musl libc through 1.2.1, wcsnrtombs mishandles particular combinati ..."
+              },
+              "fullDescription": {
+                "text": "In musl libc through 1.2.1, wcsnrtombs mishandles particular combinations of destination buffer size and source character limit, as demonstrated by an invalid write access (buffer overflow)."
+              },
+              "defaultConfiguration": {
+                "level": "warning"
+              },
+              "helpUri": "https://avd.aquasec.com/nvd/cve-2020-28928",
+              "help": {
+                "text": "Vulnerability CVE-2020-28928\nSeverity: MEDIUM\nPackage: musl\nFixed Version: 1.1.22-r4\nLink: [CVE-2020-28928](https://avd.aquasec.com/nvd/cve-2020-28928)\nIn musl libc through 1.2.1, wcsnrtombs mishandles particular combinations of destination buffer size and source character limit, as demonstrated by an invalid write access (buffer overflow).",
+                "markdown": "**Vulnerability CVE-2020-28928**\n| Severity | Package | Fixed Version | Link |\n| --- | --- | --- | --- |\n|MEDIUM|musl|1.1.22-r4|[CVE-2020-28928](https://avd.aquasec.com/nvd/cve-2020-28928)|\n\nIn musl libc through 1.2.1, wcsnrtombs mishandles particular combinations of destination buffer size and source character limit, as demonstrated by an invalid write access (buffer overflow)."
+              },
+              "properties": {
+                "cvssv2_score": 2.1,
+                "cvssv2_vector": "AV:L/AC:L/Au:N/C:N/I:N/A:P",
+                "cvssv3_baseScore": 5.5,
+                "cvssv3_vector": "CVSS:3.1/AV:L/AC:L/PR:L/UI:N/S:U/C:N/I:N/A:H",
+                "precision": "very-high",
+                "security-severity": "5.5",
+                "tags": [
+                  "vulnerability",
+                  "security",
+                  "MEDIUM"
+                ]
+              }
+            },
+            {
+              "id": "github-pat",
+              "name": "Secret",
+              "shortDescription": {
+                "text": "GitHub Personal Access Token"
+              },
+              "fullDescription": {
+                "text": "GITHUB_TOKEN=****************************************"
+              },
+              "defaultConfiguration": {
+                "level": "error"
+              },
+              "helpUri": "https://github.com/aquasecurity/trivy/blob/main/pkg/fanal/secret/builtin-rules.go",
+              "help": {
+                "text": "Secret GitHub Personal Access Token\nSeverity: CRITICAL\nMatch: GITHUB_TOKEN=****************************************",
+                "markdown": "**Secret GitHub Personal Access Token**\n| Severity | Match |\n| --- | --- |\n|CRITICAL|GITHUB_TOKEN=****************************************|"
+              },
+              "properties": {
+                "precision": "very-high",
+                "security-severity": "9.5",
+                "tags": [
+                  "secret",
+                  "security",
+                  "CRITICAL"
+                ]
+              }
+            }
+          ],
+          "version": "0.76.0"
+        }
+      },
+      "results": [
+        {
+          "ruleId": "CVE-2021-28831",
+          "ruleIndex": 0,
+          "level": "error",
+          "message": {
+            "text": "Package: busybox\nInstalled Version: 1.30.1-r2\nVulnerability CVE-2021-28831\nSeverity: HIGH\nFixed Version: 1.30.1-r5\nLink: [CVE-2021-28831](https://avd.aquasec.com/nvd/cve-2021-28831)"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "/home/runner/image.tar",
+                  "uriBaseId": "ROOTPATH"
+                },
+                "region": {
+                  "startLine": 1,
+                  "startColumn": 1,
+                  "endLine": 1,
+                  "endColumn": 1
+                }
+              },
+              "message": {
+                "text": "/home/runner/image.tar: busybox@1.30.1-r2"
+              }
+            }
+          ]
+        },
+        {
+          "ruleId": "CVE-2020-28928",
+          "ruleIndex": 1,
+          "level": "warning",
+          "message": {
+            "text": "Package: musl\nInstalled Version: 1.1.22-r3\nVulnerability CVE-2020-28928\nSeverity: MEDIUM\nFixed Version: 1.1.22-r4\nLink: [CVE-2020-28928](https://avd.aquasec.com/nvd/cve-2020-28928)"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "/home/runner/image.tar",
+                  "uriBaseId": "ROOTPATH"
+                },
+                "region": {
+                  "startLine": 1,
+                  "startColumn": 1,
+                  "endLine": 1,
+                  "endColumn": 1
+                }
+              },
+              "message": {
+                "text": "/home/runner/image.tar: musl@1.1.22-r3"
+              }
+            }
+          ]
+        },
+        {
+          "ruleId": "github-pat",
+          "ruleIndex": 2,
+          "level": "error",
+          "message": {
+            "text": "Artifact: /app/.env\nType: \nSecret GitHub Personal Access Token\nSeverity: CRITICAL\nMatch: GITHUB_TOKEN=****************************************"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "/app/.env",
+                  "uriBaseId": "ROOTPATH"
+                },
+                "region": {
+                  "startLine": 1,
+                  "startColumn": 1,
+                  "endLine": 1,
+                  "endColumn": 1
+                }
+              },
+              "message": {
+                "text": "/app/.env"
+              }
+            }
+          ]
+        }
+      ],
+      "columnKind": "utf16CodeUnits",
+      "properties": {
+        "imageID": "sha256:2af7572f1bb2c0cb2184a5cc9308251ffb344d57ad4694a8a03ce9f9efe1075b",
+        "imageName": "/home/runner/image.tar",
+        "repoDigests": null,
+        "repoTags": [
+          "fixture:latest"
+        ]
+      }
+    }
+  ]
+}

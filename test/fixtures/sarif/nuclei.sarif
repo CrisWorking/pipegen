@@ -1,0 +1,124 @@
+{
+  "$schema": "https://schemastore.azurewebsites.net/schemas/json/sarif-2.1.0-rtm.6.json",
+  "runs": [
+    {
+      "invocations": [
+        {
+          "arguments": [
+            "-duc",
+            "-t",
+            "/home/runner/nt/git-config.yaml",
+            "-severity",
+            "medium,high,critical",
+            "-ni",
+            "-u",
+            "http://127.0.0.1:8197",
+            "-sarif-export",
+            "/home/runner/out/nuclei.sarif"
+          ],
+          "commandLine": "/home/runner/bin/nuclei",
+          "executionSuccessful": false,
+          "responseFiles": [
+            {
+              "description": {
+                "text": "Nuclei Sarif Report"
+              },
+              "uri": "file:////home/runner/out/nuclei.sarif"
+            }
+          ]
+        }
+      ],
+      "results": [
+        {
+          "kind": "open",
+          "level": "note",
+          "locations": [
+            {
+              "message": {
+                "text": "127.0.0.1"
+              },
+              "physicalLocation": {
+                "artifactLocation": {
+                  "description": {
+                    "text": "127.0.0.1"
+                  },
+                  "uri": ".",
+                  "uriBaseId": "%SRCROOT%"
+                },
+                "contextRegion": {
+                  "endLine": 3,
+                  "snippet": {
+                    "text": "127.0.0.1"
+                  },
+                  "startLine": 1
+                },
+                "region": {
+                  "snippet": {
+                    "text": "127.0.0.1"
+                  },
+                  "startLine": 1
+                }
+              }
+            }
+          ],
+          "message": {
+            "text": "Git Configuration - Detect (git-config) found on 127.0.0.1"
+          },
+          "partialFingerprints": {
+            "primaryLocationLineHash": "8d2855e1de3de1ad19acee80c3eb3ce0"
+          },
+          "ruleId": "git-config"
+        }
+      ],
+      "tool": {
+        "driver": {
+          "downloadUri": "https://github.com/projectdiscovery/nuclei/releases",
+          "fullDescription": {
+            "text": "Fast and customizable vulnerability scanner based on simple YAML based DSL"
+          },
+          "fullName": "Nuclei v3.11.1",
+          "name": "Nuclei",
+          "organization": "ProjectDiscovery",
+          "product": "Nuclei",
+          "rules": [
+            {
+              "fullDescription": {
+                "text": "Git configuration was detected via the pattern /.git/config and log file on passed URLs.\nMore details at\nhttps://cloud.projectdiscovery.io/public/git-config\n"
+              },
+              "help": {
+                "text": "Git configuration was detected via the pattern /.git/config and log file on passed URLs.\nMore details at\nhttps://cloud.projectdiscovery.io/public/git-config"
+              },
+              "helpUri": "https://github.com/projectdiscovery/sarif",
+              "id": "git-config",
+              "name": "Git Configuration - Detect",
+              "properties": {
+                "security-severity": "5",
+                "tags": [
+                  "security"
+                ]
+              },
+              "shortDescription": {
+                "text": "Git Configuration - Detect (git-config) found on 127.0.0.1"
+              }
+            }
+          ],
+          "semanticVersion": "v3.11.1",
+          "shortDescription": {
+            "text": "Fast and Customizable Vulnerability Scanner"
+          }
+        }
+      },
+      "versionControlProvenance": [
+        {
+          "mappedTo": {
+            "uri": ".",
+            "uriBaseId": "%SRCROOT%"
+          },
+          "repositoryUri": "https://github.com/projectdiscovery/nuclei/releases",
+          "revisionId": "unknown"
+        }
+      ]
+    }
+  ],
+  "version": "2.1.0"
+}

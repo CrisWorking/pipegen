@@ -30,7 +30,9 @@ describe('fixtures', () => {
     for (const f of testFiles) {
       const buf = readFileSync(join(root, f));
       if (isBinary(buf)) continue;
-      const text = buf.toString('utf8');
+      // Real scanner output (test/fixtures/sarif, C1a) holds two benign strings that look like secrets to redact(): osv-scanner's
+      // empty `redactionTokens` array and trivy's already-masked match line. Nothing else is excused.
+      const text = buf.toString('utf8').replaceAll('"redactionTokens": [],', '').replaceAll('GITHUB_TOKEN=****************************************', 'masked match');
       expect(redact(text) === text, `a redact pattern matches ${f}`).toBe(true);
     }
   });

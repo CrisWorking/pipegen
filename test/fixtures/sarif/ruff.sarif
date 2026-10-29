@@ -1,0 +1,60 @@
+{
+  "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
+  "runs": [
+    {
+      "results": [
+        {
+          "level": "error",
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "file:///home/runner/work/fixture/fixture/py/complex.py"
+                },
+                "region": {
+                  "endColumn": 8,
+                  "endLine": 1,
+                  "startColumn": 5,
+                  "startLine": 1
+                }
+              }
+            }
+          ],
+          "message": {
+            "text": "`big` is too complex (19 > 15)"
+          },
+          "ruleId": "C901"
+        }
+      ],
+      "tool": {
+        "driver": {
+          "informationUri": "https://github.com/astral-sh/ruff",
+          "name": "ruff",
+          "rules": [
+            {
+              "fullDescription": {
+                "text": "## What it does\nChecks for functions with a high `McCabe` complexity.\n\n## Why is this bad?\nThe `McCabe` complexity of a function is a measure of the complexity of\nthe control flow graph of the function. It is calculated by adding\none to the number of decision points in the function. A decision\npoint is a place in the code where the program has a choice of two\nor more paths to follow.\n\nFunctions with a high complexity are hard to understand and maintain.\n\n## Example\n```python\ndef normalize_status(status):\n    if status == \"new\":\n        return \"queued\"\n    if status == \"queued\":\n        return \"running\"\n    if status == \"running\":\n        return \"done\"\n    if status == \"failed\":\n        return \"retry\"\n    if status == \"cancelled\":\n        return \"closed\"\n    return \"unknown\"\n```\n\nUse instead:\n\n```python\nSTATUS_TRANSITIONS = {\n    \"new\": \"queued\",\n    \"queued\": \"running\",\n    \"running\": \"done\",\n    \"failed\": \"retry\",\n    \"cancelled\": \"closed\",\n}\n\n\ndef normalize_status(status):\n    return STATUS_TRANSITIONS.get(status, \"unknown\")\n```\n\nNote that this example assumes a `lint.mccabe.max-complexity` of 5 or less to trigger a\ndiagnostic because the initial code only has a complexity of 6.\n\n## Options\n- `lint.mccabe.max-complexity`\n"
+              },
+              "help": {
+                "text": "`{name}` is too complex ({complexity} > {max_complexity})"
+              },
+              "helpUri": "https://docs.astral.sh/ruff/rules/complex-structure",
+              "id": "C901",
+              "properties": {
+                "id": "C901",
+                "kind": "mccabe",
+                "name": "complex-structure",
+                "problem.severity": "error"
+              },
+              "shortDescription": {
+                "text": "`{name}` is too complex ({complexity} > {max_complexity})"
+              }
+            }
+          ],
+          "version": "0.17.1"
+        }
+      }
+    }
+  ],
+  "version": "2.1.0"
+}
