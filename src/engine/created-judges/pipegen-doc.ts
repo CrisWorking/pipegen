@@ -23,8 +23,9 @@ const SHA_RE = /^[0-9a-f]{40}$/;
 const OWNER_RE = /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})$/;
 const REPO_RE = /^(?!\.+$)[A-Za-z0-9._-]{1,100}$/;
 // C0 controls except tab, LF and CR; DEL and C1 (Cc); every format character (Cf: zero-width, bidirectional, soft hyphen, BOM, the tag characters,
-// U+061C), line and paragraph separators (Zl, Zp), private use (Co), and the blank-looking Hangul fillers (Lo). All of them also inside fences.
-const INVISIBLE_RE = /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f\p{Cf}\p{Zl}\p{Zp}\p{Co}\u3164\u115f\u1160\uffa0]/u;
+// U+061C), line and paragraph separators (Zl, Zp), private use (Co), the blank-looking Hangul fillers (Lo), every Default_Ignorable_Code_Point (variation selectors, CGJ, the Khmer and Mongolian
+// fillers: GitHub renders them as nothing, so a byte-per-selector payload hides in plain sight) and every unassigned code point (Cn). All of them also inside fences.
+const INVISIBLE_RE = /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f\p{Cf}\p{Zl}\p{Zp}\p{Co}\p{Default_Ignorable_Code_Point}\p{Cn}\u3164\u115f\u1160\uffa0]/u;
 
 const TEXT_CH = /^[\p{L}\p{N} .,;:!?'"()/\-_+=%*~]$/u;
 const URL_CH = /^[A-Za-z0-9._~:/?#&=%+-]+$/;

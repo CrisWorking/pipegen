@@ -74,11 +74,12 @@ export function codeownersFile(original: string, block: string): string {
 
 /**
  * The second edit form (a re-run): `inserted` is the old block the install record says pipegen wrote (EditKind 'codeowners'); it is replaced
- * in place by the new block and every other byte stays. Returns null if `inserted` is not in the original exactly once.
+ * in place by the new block and every other byte stays. Returns null if `inserted` is not in the original exactly once, or does not start a line.
  */
 export function codeownersReplace(original: string, inserted: string, block: string): string | null {
   const i = inserted === '' ? -1 : original.indexOf(inserted);
   if (i < 0 || original.indexOf(inserted, i + 1) >= 0) return null;
+  if (i > 0 && original[i - 1] !== '\n') return null;   // the block starts a line; mid-line, the user's text before it would be read as part of a rule
   return `${original.slice(0, i)}${block}${original.slice(i + inserted.length)}`;
 }
 

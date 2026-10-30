@@ -7,7 +7,7 @@ import { codeOwners, ownersOf } from '../gate/src/integrity.js';
 import { knownValueScrubber } from '../src/ai/redact.js';
 import { CODEOWNERS_BEGIN, CODEOWNERS_END, CENTRAL_PROTECTED_PATHS, codeownersBlock, codeownersFile, codeownersOverrides, codeownersPattern, codeownersProtectedPaths, codeownersReplace, dependabotEntry, dependabotEntryText, dependabotFile } from '../src/engine/created-builders.js';
 import { createdFileProblems, type CreatedEnv } from '../src/engine/created-files.js';
-import { codeownersJudge, codeownersProbes, codeownersSemanticProblems } from '../src/engine/created-judges/codeowners.js';
+import { codeownersJudge, codeownersLaterOverrides, codeownersProbes, codeownersSemanticProblems } from '../src/engine/created-judges/codeowners.js';
 import { effectiveProtectedPaths } from '../src/engine/protected-paths.js';
 import { referee, type Linters } from '../src/engine/referee.js';
 import { emptyRepoFiles } from '../src/read/quality.js';
@@ -373,6 +373,32 @@ describe('D0b fix round 1: CODEOWNERS re-run, symlink, overrides', () => {
   it('a user rule after the old block that would override the new one is refused by the whole-file pass', () => {
     const original = `${OLD}\n/.github/workflows/ @mallory\n`;
     expect(text(coFile(replaceBlock(original, OLD, block), original), existCo, withFacts(OLD))).toMatch(/gate would not read/);
+  });
+  it('D0b re-review m2: a narrow user rule after the block that re-owns one protected file is refused, and the message lists it', () => {
+    for (const rule of ['/.github/workflows/deploy.yml @dev', '.github/workflows/ci.yml @dev', '/lefthook.yml @dev', 'lefthook.yml @dev', '/.github/workflows/sub/ @dev', '/.github/workflows/*.yml @dev']) {
+      const original = `${OLD}${rule}\n`;
+      const t = text(coFile(replaceBlock(original, OLD, block), original), existCo, withFacts(OLD));
+      expect(t, rule).toMatch(/after the pipegen block/);
+      expect(t, rule).toContain(rule);
+    }
+    // not protected, or owned by exactly the block owners: accepted
+    for (const rule of ['/src/ @carol', 'docs/*.md @carol', '/.github/workflows/deploy.yml @alice @bob', '# comment', '']) {
+      const original = `${OLD}${rule}\n`;
+      expect(text(coFile(replaceBlock(original, OLD, block), original), existCo, withFacts(OLD)), rule).toBe('');
+    }
+  });
+  it('D0b re-review m2: codeownersLaterOverrides lists the rules after the block that touch a protected path', () => {
+    const paths = codeownersProtectedPaths(existCo, reviewed);
+    const after = '/src/ @carol\n/.github/workflows/deploy.yml @dev\n# x\nlefthook.yml @alice @bob\n';
+    expect(codeownersLaterOverrides(after, paths, ['@alice', '@bob'])).toEqual(['/.github/workflows/deploy.yml @dev']);
+    expect(codeownersLaterOverrides('', paths, ['@alice', '@bob'])).toEqual([]);
+  });
+  it('D0b re-review m3: the recorded old block must start at a line start', () => {
+    expect(codeownersReplace(`x ${OLD}`, OLD, block)).toBeNull();
+    expect(codeownersReplace(`x\n${OLD}`, OLD, block)).toBe(`x\n${block}`);
+    expect(codeownersReplace(OLD, OLD, block)).toBe(block);
+    const original = `x ${OLD}`;
+    expect(text(coFile(`x ${block}`, original), existCo, withFacts(OLD))).toMatch(/marker|pipegen:begin/);
   });
   it('the replace form works for the central file too', () => {
     const cb = codeownersBlock(CENTRAL_PROTECTED_PATHS, ['@alice', '@bob']);
@@ -832,11 +858,25 @@ describe('pipegen-doc judge', () => {
       expect(docText('# t\n\n```\na' + c + 'b\n```\n'), `fence ${JSON.stringify(c)}`).toMatch(/invisible|control/i);
       expect(docText(`# t\n\n- a${c}b\n`), JSON.stringify(c)).toMatch(/invisible|control/i);
     }
-    const marks = ['\u0301', '\ufe0f', '\ufe00', '\u{e0100}', '\u0300'];   // Mn: combining accents, variation selectors
+    const marks = ['\u0301', '\u0300'];   // Mn: combining accents (not default-ignorable: visible, so fine inside a fence)
     for (const c of marks) {
       expect(docText(`# t\n\nBefore${c}after\n`), JSON.stringify(c)).toMatch(/not allowed/);
       expect(docText('# t\n\n```\na' + c + 'b\n```\n'), `fence ${JSON.stringify(c)}`).toBe('');
     }
+  });
+  it('D0b re-review m1: default-ignorable and unassigned code points are refused everywhere, fences too (variation-selector smuggling)', () => {
+    const hidden = ['\ufe00', '\ufe0f', '\u{e0100}', '\u{e01ef}', '\u034f', '\u17b4', '\u17b5', '\u180b', '\u180d', '\u{e0080}', '\u{e0fff}', '\u2064', '\u{1d173}', '\u0378'];
+    for (const c of hidden) {
+      expect(docText(`# t\n\nBefore${c}after\n`), JSON.stringify(c)).toMatch(/invisible|control/i);
+      expect(docText('# t\n\n```\na' + c + 'b\n```\n'), `fence ${JSON.stringify(c)}`).toMatch(/invisible|control/i);
+    }
+    // the reviewer's payload: "secret payload" one byte per variation selector, inside a fence
+    const payload = [...'secret payload'].map((ch) => String.fromCodePoint(0xe0100 + ch.charCodeAt(0) - 16)).join('');
+    expect(docText('# t\n\n```\nok' + payload + '\n```\n')).toMatch(/invisible|control/i);
+    const low = [...'secret payload'].map((ch) => String.fromCodePoint(0xfe00 + (ch.charCodeAt(0) % 16))).join('');
+    expect(docText('# t\n\n```\nok' + low + '\n```\n')).toMatch(/invisible|control/i);
+    // ordinary text, accents and a plain emoji-free line still pass
+    expect(docText('# t\n\n```\ncafe\u00e9 \u4e2d\u6587\n```\n')).toBe('');
   });
   it('recorded GitHub renders (test/fixtures/d0b-renders): every input whose render leaves the allowlist or adds an image or an invisible gap is refused; the baseline passes', () => {
     const dir = new URL('./fixtures/d0b-renders/', import.meta.url);
