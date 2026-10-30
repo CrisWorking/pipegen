@@ -2596,7 +2596,8 @@ function jobListLiteralProblem(text) {
 }
 var BASE_CHECKOUT_REF = `\${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event_name == 'pull_request_review' && github.event.pull_request.base.sha || github.event_name == 'merge_group' && github.event.merge_group.base_sha || github.event_name == 'push' && github.event.before || '${"0".repeat(40)}' }}`;
 var RANGE_HEAD_REF = `\${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.event_name == 'pull_request_review' && github.event.pull_request.head.sha || github.event_name == 'merge_group' && github.event.merge_group.head_sha || github.event_name == 'push' && github.event.after || '${"0".repeat(40)}' }}`;
-var RANGE_STEP_ENV = Object.freeze({ PIPEGEN_RANGE_BASE: BASE_CHECKOUT_REF, PIPEGEN_RANGE_HEAD: RANGE_HEAD_REF });
+var RANGE_BEFORE_REF = `\${{ github.event_name == 'pull_request' && github.event.action == 'synchronize' && github.event.before || '${"0".repeat(40)}' }}`;
+var RANGE_STEP_ENV = Object.freeze({ PIPEGEN_RANGE_BASE: BASE_CHECKOUT_REF, PIPEGEN_RANGE_HEAD: RANGE_HEAD_REF, PIPEGEN_RANGE_BEFORE: RANGE_BEFORE_REF });
 var rangeScanStepId = `checker-run-${sha16(SECRETS_RANGE_ARTIFACT)}`;
 var RENDERER_INPUTS = Object.freeze({
   // the base commit, for the base-scan job only (the job rule is in job-rules.ts); no other ref is ever set

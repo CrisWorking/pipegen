@@ -1,12 +1,13 @@
 // C9 (Plan C final review, Important 2), the engine half, written first (strict test-first): the secrets job also scans the pull
-// request's own commits. A second betterleaks run in `git` mode over base..head (the event-switched base and head forms), --no-merges,
-// the whole history (fetch-depth 0), pipegen's pinned config with the canary rule and no path allowlist (prefilter false: git mode applies
-// it, measured), --max-archive-depth 0, --redact, exit code 10. Its result goes through the same scrub chain under its own artifact
+// request's own commits. A second betterleaks run in `git` mode over the event's range (the event-switched base and head forms), the whole
+// history (fetch-depth 0), pipegen's pinned config with the canary rule and no path allowlist (prefilter false: git mode applies it,
+// measured), --max-archive-depth 0, --redact, exit code 10. Its result goes through the same scrub chain under its own artifact
 // (resultArtifactName('secrets-range')) with its own job-list entry (`range: true`). The referee and the job rules recognise the exact step
-// (kind checker) by its content. Completeness: the scanner's own count of the commits it scanned must equal `git rev-list --count
-// --no-merges` of the range, computed in the same step; betterleaks prints that count only in its parallel mode with two commits or more
-// (measured), so the step adds two canary commits on the head (local objects, never pushed), whose canary lines also prove the scanner read
-// the commits with pipegen's config.
+// (kind checker) by its content.
+// Fix round 1 (review-C9.md, task-C9-fix-round-1.md): ONE ordered stream (betterleaks single mode, `--reverse --remerge-diff --text`): the
+// two canary commits on the head are dated last, so the tip canary is the stream's last commit and finding it proves the stream was read to
+// its end (I1); merges are in the stream with only what their own resolution added (I3); on a synchronize the commits a force-push dropped
+// (`before`) are in it too (I2); an event with no range skips with a note.
 import { execFileSync, spawnSync } from 'node:child_process';
 import { chmodSync, existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
@@ -15,7 +16,7 @@ import { resultArtifactName, SECRETS_RANGE_ARTIFACT } from '../src/engine/artifa
 import { gateJobList, type JobListEntry } from '../src/engine/gate-job-list.js';
 import { checkExpressions, checkJobOrder, isKnownHarmless, jobOutputsFor, type ScanFact } from '../src/engine/job-rules.js';
 import { RenderError, renderFindingsBlock, renderJobPrelude, renderRangeBlock, type RenderedStep } from '../src/engine/render-step.js';
-import { BASE_CHECKOUT_REF, jobListLiteralProblem, RANGE_HEAD_REF, rangeScanStepId, sha16 } from '../src/engine/tool-flags.js';
+import { BASE_CHECKOUT_REF, jobListLiteralProblem, RANGE_BEFORE_REF, RANGE_HEAD_REF, rangeScanStepId, sha16 } from '../src/engine/tool-flags.js';
 import { draftOf, editSteps, GATE, jobsOf, p, run, SEC_JOB, show, workflow, type Job } from './helpers/gate-pipeline.js';
 import { entry, specFor } from './helpers/render.js';
 import { sandbox, stepEnv, type Sandbox } from './helpers/step-harness.js';
@@ -52,25 +53,34 @@ describe('renderRangeBlock: install, the range scan (checker), scrub, upload', (
     expect(block.result.fullHistory).toBe(true);
   });
 
-  it('the scan: the base and head forms in its env (and nothing the job rules would refuse), pipegen\'s config with no path allowlist and the canary rule', () => {
+  it('the scan: the base, head and before forms in its env (and nothing the job rules would refuse), pipegen\'s config with no path allowlist and the canary rule', () => {
     expect(scan.env?.PIPEGEN_RANGE_BASE).toBe(BASE_CHECKOUT_REF);
     expect(scan.env?.PIPEGEN_RANGE_HEAD).toBe(RANGE_HEAD_REF);
+    expect(scan.env?.PIPEGEN_RANGE_BEFORE).toBe(RANGE_BEFORE_REF);
     expect(() => checkExpressions(scan)).not.toThrow();
     const cfg = scan.env?.PIPEGEN_CONFIG ?? '';
     expect(cfg.startsWith("prefilter = '''false'''\n\n[extend]\nuseDefault = true\n")).toBe(true);
     expect(cfg).toContain(entry('betterleaks').fixedInputs.config?.content as string);
     expect(cfg).toContain('id = "pipegen-canary"');
     const r = scan.run ?? '';
-    for (const w of ['"$bin/betterleaks" git', '--no-merges', '--git-workers 2', '--max-archive-depth 0', '--redact', '--exit-code 10', '--ignore-gitleaks-allow', '--log-level info', '--no-color', 'rev-list --count --no-merges', '* diff', 'commit-tree', '/usr/bin/env -i']) expect(r, w).toContain(w);
+    // fix round 1 (I1, I3): one ordered stream (single mode), merges with their own resolution, every file as text
+    for (const w of ['"$bin/betterleaks" git', '--git-workers 0', '--reverse --remerge-diff --text', '--max-archive-depth 0', '--redact', '--exit-code 10', '--ignore-gitleaks-allow', '--log-level info', '--no-color', 'commit-tree', '/usr/bin/env -i', 'git version']) expect(r, w).toContain(w);
+    // the parallel mode's count and its workarounds are gone, and so is --no-merges
+    for (const w of ['--no-merges', '--git-workers 2', 'commits=', 'info/attributes', '^T']) expect(r, w).not.toContain(w);
     expect(r).not.toContain('${{');
   });
 
-  it('a step env changed by hand (another base form, an extra expression) is refused by the expression rule', () => {
+  it('a step env changed by hand (another base, head or before form, an extra expression) is refused by the expression rule', () => {
     expect(() => checkExpressions({ ...scan, env: { ...scan.env, PIPEGEN_RANGE_BASE: '${{ github.event.pull_request.head.sha }}' } })).toThrow(RenderError);
     expect(() => checkExpressions({ ...scan, env: { ...scan.env, PIPEGEN_RANGE_HEAD: BASE_CHECKOUT_REF } })).toThrow(RenderError);
+    expect(() => checkExpressions({ ...scan, env: { ...scan.env, PIPEGEN_RANGE_BEFORE: '${{ github.event.before }}' } })).toThrow(RenderError);
     expect(() => checkExpressions({ ...scan, env: { ...scan.env, PIPEGEN_OTHER: BASE_CHECKOUT_REF } })).toThrow(RenderError);
     // the forms only on the range scan's own step
     expect(() => checkExpressions({ ...scan, id: `checker-run-${sha16('pipegen-out-secrets')}` })).toThrow(RenderError);
+  });
+
+  it('the before form: a pull request\'s previous head on synchronize only, else the all-zero commit', () => {
+    expect(RANGE_BEFORE_REF).toBe(`\${{ github.event_name == 'pull_request' && github.event.action == 'synchronize' && github.event.before || '${ZERO}' }}`);
   });
 
   it('only the reviewed betterleaks entry: another tool, an unreviewed copy or a gate entry that fixes an input is refused', () => {
@@ -83,29 +93,24 @@ describe('renderRangeBlock: install, the range scan (checker), scrub, upload', (
 // ---------- the scan step itself, run in a sandbox with a stand-in for betterleaks (no network) ----------
 
 const git = (dir: string, ...args: string[]): string => execFileSync('git', ['-c', 'user.name=t', '-c', 'user.email=t@example.com', '-c', 'commit.gpgsign=false', ...args], { cwd: dir, encoding: 'utf8' }).trim();
-/** The workspace: a repository with a base commit and `n` commits after it (one of them a type change when asked). */
-function repo(sb: Sandbox, n: number, typeChange = false): { base: string; head: string } {
+/** The workspace: a repository with a base commit and `n` commits after it. */
+function repo(sb: Sandbox, n: number): { base: string; head: string } {
   git(sb.ws, 'init', '-q', '-b', 'main');
   writeFileSync(join(sb.ws, 'a.txt'), 'base\n');
-  if (typeChange) execFileSync('ln', ['-s', 'a.txt', 'x'], { cwd: sb.ws });
   git(sb.ws, 'add', '-A');
   git(sb.ws, 'commit', '-q', '-m', 'base');
   const base = git(sb.ws, 'rev-parse', 'HEAD');
   for (let i = 0; i < n; i++) {
-    if (typeChange && i === 0) { execFileSync('rm', ['x'], { cwd: sb.ws }); writeFileSync(join(sb.ws, 'x'), 'now a file\n'); } else writeFileSync(join(sb.ws, `f${i}.txt`), `c${i}\n`);
+    writeFileSync(join(sb.ws, `f${i}.txt`), `c${i}\n`);
     git(sb.ws, 'add', '-A');
     git(sb.ws, 'commit', '-q', '-m', `c${i}`);
   }
   return { base, head: git(sb.ws, 'rev-parse', 'HEAD') };
 }
-/**
- * A stand-in for betterleaks: records its argv, cwd and the folder's names, writes an empty SARIF to --report-path and prints the parallel
- * count line with the number in $RUNNER_TEMP/fake-count (none when that file says `none`); exits with the code in $RUNNER_TEMP/fake-rc.
- */
-function fakeBetterleaks(sb: Sandbox, count: string, rc = 10): void {
+/** A stand-in for betterleaks: records its argv, cwd and the folder's names, writes an empty SARIF to --report-path; exits with `rc`. */
+function fakeBetterleaks(sb: Sandbox, rc = 10): void {
   const dir = join(sb.rt, 'pipegen-bin', A);
   mkdirSync(dir, { recursive: true });
-  writeFileSync(join(sb.rt, 'fake-count'), count);
   writeFileSync(join(sb.rt, 'fake-rc'), String(rc));
   const path = join(dir, 'betterleaks');
   writeFileSync(path, [
@@ -113,97 +118,167 @@ function fakeBetterleaks(sb: Sandbox, count: string, rc = 10): void {
     'printf "%s\\0" "$@" > "$RUNNER_TEMP/fake-argv"; pwd > "$RUNNER_TEMP/fake-cwd"; ls -A > "$RUNNER_TEMP/fake-ls"',
     'out=""; prev=""; for a in "$@"; do [ "$prev" = --report-path ] && out="$a"; prev="$a"; done',
     'printf \'{"version":"2.1.0","runs":[]}\' > "$out"',
-    'c="$(cat "$RUNNER_TEMP/fake-count")"',
-    '[ "$c" = none ] || echo "3:04PM INF parallel git scan chunk_size=1 commits=$c workers=2" >&2',
-    'echo "3:04PM INF scanned ~1 bytes (1 bytes) in 1ms" >&2',
     'exit "$(cat "$RUNNER_TEMP/fake-rc")"',
   ].join('\n'));
   chmodSync(path, 0o755);
 }
-function tryScan(sb: Sandbox, range: { base: string; head: string }): { status: number | null; stderr: string } {
+interface Range { base: string; head: string; before?: string }
+function tryScan(sb: Sandbox, range: Range): { status: number | null; stdout: string; stderr: string } {
   const scan = renderRangeBlock(entry('betterleaks'), p, GATE).steps[1] as RenderedStep;
-  const env = { ...stepEnv(scan, sb), PIPEGEN_RANGE_BASE: range.base, PIPEGEN_RANGE_HEAD: range.head };
+  const env = { ...stepEnv(scan, sb), PIPEGEN_RANGE_BASE: range.base, PIPEGEN_RANGE_HEAD: range.head, PIPEGEN_RANGE_BEFORE: range.before ?? ZERO };
   const r = spawnSync('bash', ['--noprofile', '--norc', '-c', scan.run ?? ''], { cwd: sb.ws, env, encoding: 'utf8' });
-  return { status: r.status, stderr: r.status === 0 ? '' : r.stderr };
+  return { status: r.status, stdout: r.stdout, stderr: r.status === 0 ? '' : r.stderr };
 }
 const rawDir = (sb: Sandbox): string => join(sb.rt, 'pipegen-raw', A);
+const logOpts = (sb: Sandbox): string => { const argv = readFileSync(join(sb.rt, 'fake-argv'), 'utf8').split('\0').slice(0, -1); return argv[argv.indexOf('--log-opts') + 1] as string; };
+const LO_RE = /^--reverse --remerge-diff --text \^([0-9a-f]{40}) ([0-9a-f]{40})(?: ([0-9a-f]{40}))?$/;
 
-describe('the range scan step (a stand-in scanner): the count, the canaries, the attributes, the ignore files', () => {
-  it('a range of n commits: the scanner is told --no-merges base..<second canary>, from an empty folder naming the checkout\'s git folder; the count n+2 matches; raw result and range.json', () => {
+describe('the range scan step (a stand-in scanner): one ordered stream, the tip canary last, the dropped commits, the ignore files', () => {
+  it('a range of n commits: the scanner reads ^base <tip canary> in one reversed stream, from an empty folder naming the checkout\'s git folder; raw result and range.json', () => {
     const sb = sandbox();
     const r = repo(sb, 1);
-    fakeBetterleaks(sb, '3');
-    expect(tryScan(sb, r)).toEqual({ status: 0, stderr: '' });
+    fakeBetterleaks(sb);
+    expect(tryScan(sb, r)).toMatchObject({ status: 0, stderr: '' });
     const argv = readFileSync(join(sb.rt, 'fake-argv'), 'utf8').split('\0').slice(0, -1);
     expect(argv[0]).toBe('git');
-    const lo = argv[argv.indexOf('--log-opts') + 1] as string;
-    const m = /^--no-merges ([0-9a-f]{40})\.\.([0-9a-f]{40})$/.exec(lo);
-    expect(m?.[1]).toBe(r.base);
     expect(argv.at(-1)).toBe('.');
+    const m = LO_RE.exec(logOpts(sb));
+    expect(m?.[1]).toBe(r.base);
+    expect(m?.[3]).toBeUndefined();
     // the scanner's folder holds only the git file: the checkout's .betterleaksignore / .gitleaksignore are never read
     expect(readFileSync(join(sb.rt, 'fake-ls'), 'utf8').trim()).toBe('.git');
     expect(readFileSync(join(sb.rt, 'fake-cwd'), 'utf8').trim().startsWith(join(sb.rt, 'pipegen-work', A))).toBe(true);
-    // the two canary commits sit on the head, each adding its canary file; they are local objects only (no ref names them)
+    // two canary commits on the head, each adding only its canary file to its parent's tree; local objects only (no ref names them)
     const c2 = m?.[2] as string;
+    const c1 = git(sb.ws, 'rev-parse', `${c2}~1`);
     expect(git(sb.ws, 'rev-parse', `${c2}~2`)).toBe(r.head);
-    expect(git(sb.ws, 'show', '--format=', '--name-only', c2)).toContain('pipegen-range-canary-2.txt');
+    expect(git(sb.ws, 'diff', '--name-status', r.head, c1)).toBe('A\tpipegen-range-canary-1.txt');
+    expect(git(sb.ws, 'diff', '--name-status', c1, c2)).toBe('A\tpipegen-range-canary-2.txt');
     expect(git(sb.ws, 'show', `${c2}:pipegen-range-canary-2.txt`)).toMatch(/^pipegen-canary-[0-9a-f]{32}$/);
     expect(git(sb.ws, 'for-each-ref', '--contains', c2)).toBe('');
-    // every file is text to the diff (the checkout's .gitattributes can not hide one as binary)
-    expect(readFileSync(join(sb.ws, '.git', 'info', 'attributes'), 'utf8')).toBe('* diff\n');
-    // the raw result and the range facts the scrub reads
+    // the stream's order: the two canaries come last, the tip canary at the very end
+    expect(git(sb.ws, 'rev-list', '--reverse', `^${r.base}`, c2).split('\n').slice(-2)).toEqual([c1, c2]);
+    // the raw result and the range facts the scrub reads; no info/attributes any more (--text)
+    expect(existsSync(join(sb.ws, '.git', 'info', 'attributes'))).toBe(false);
     expect(readdirSync(rawDir(sb)).sort()).toEqual(['betterleaks.sarif', 'range.json']);
     const facts = JSON.parse(readFileSync(join(rawDir(sb), 'range.json'), 'utf8')) as Record<string, unknown>;
-    expect(facts).toEqual({ pipegenRange: 1, base: r.base, head: r.head, commits: 1, canaries: [{ commit: git(sb.ws, 'rev-parse', `${c2}~1`), path: 'pipegen-range-canary-1.txt' }, { commit: c2, path: 'pipegen-range-canary-2.txt' }] });
+    expect(facts).toEqual({ pipegenRange: 1, base: r.base, head: r.head, before: null, commits: 1, canaries: [{ commit: c1, path: 'pipegen-range-canary-1.txt' }, { commit: c2, path: 'pipegen-range-canary-2.txt' }] });
   });
 
-  it('a count that differs from the range, or no count at all, fails the step and leaves no raw result (the scrub then reports a tool error)', () => {
-    for (const count of ['4', '2', 'none']) {
-      const sb = sandbox();
-      const r = repo(sb, 1);
-      fakeBetterleaks(sb, count);
-      const x = tryScan(sb, r);
-      expect(x.status, count).toBe(1);
-      expect(x.stderr, count).toMatch(count === 'none' ? /did not report how many commits it scanned/ : /scanned \d+ commits, but the range/);
-      expect(existsSync(rawDir(sb)), count).toBe(false);
-    }
+  it('merges count: a merge inside the range is in the stream (its own resolution, --remerge-diff) and in the commit count', () => {
+    const sb = sandbox();
+    const r = repo(sb, 1);
+    git(sb.ws, 'checkout', '-q', '-b', 'side', r.base);
+    writeFileSync(join(sb.ws, 's.txt'), 's\n');
+    git(sb.ws, 'add', '-A');
+    git(sb.ws, 'commit', '-q', '-m', 'side');
+    git(sb.ws, 'checkout', '-q', 'main');
+    git(sb.ws, 'merge', '-q', '--no-edit', 'side');
+    const head = git(sb.ws, 'rev-parse', 'HEAD');
+    fakeBetterleaks(sb);
+    expect(tryScan(sb, { base: r.base, head }).status).toBe(0);
+    expect((JSON.parse(readFileSync(join(rawDir(sb), 'range.json'), 'utf8')) as { commits: number }).commits).toBe(3);   // c0, side, the merge
+  });
+
+  it('a commit dated after the canaries on another line of the stream (a dropped commit) puts the tip canary out of last place: the step fails (fail closed)', () => {
+    const sb = sandbox();
+    const r = repo(sb, 1);
+    writeFileSync(join(sb.ws, 'late.txt'), 'x\n');
+    git(sb.ws, 'add', '-A');
+    execFileSync('git', ['-c', 'user.name=t', '-c', 'user.email=t@example.com', 'commit', '-q', '-m', 'from the future'], { cwd: sb.ws, env: { ...process.env, GIT_COMMITTER_DATE: '@4200000000 +0000', GIT_AUTHOR_DATE: '@4200000000 +0000' } });
+    const future = git(sb.ws, 'rev-parse', 'HEAD');
+    git(sb.ws, 'reset', '-q', '--hard', 'HEAD~1');
+    fakeBetterleaks(sb);
+    const x = tryScan(sb, { ...r, before: future });
+    expect(x.status).toBe(1);
+    expect(x.stderr).toMatch(/not the last commit/);
+    expect(existsSync(join(sb.rt, 'fake-argv'))).toBe(false);
+    // on the head's own line a later date can not pass the canaries (a child is never listed after its parent)
+    const own = sandbox();
+    const r2 = repo(own, 1);
+    writeFileSync(join(own.ws, 'late.txt'), 'x\n');
+    git(own.ws, 'add', '-A');
+    execFileSync('git', ['-c', 'user.name=t', '-c', 'user.email=t@example.com', 'commit', '-q', '-m', 'from the future'], { cwd: own.ws, env: { ...process.env, GIT_COMMITTER_DATE: '@4200000000 +0000', GIT_AUTHOR_DATE: '@4200000000 +0000' } });
+    fakeBetterleaks(own);
+    expect(tryScan(own, { base: r2.base, head: git(own.ws, 'rev-parse', 'HEAD') }).status).toBe(0);
+  });
+
+  it('I2: on a synchronize after a force-push, the commits the push dropped are in the stream (before, read from the checkout); a before that is an ancestor changes nothing', () => {
+    const sb = sandbox();
+    const r = repo(sb, 1);
+    writeFileSync(join(sb.ws, 'k.txt'), 'dropped\n');
+    git(sb.ws, 'add', '-A');
+    git(sb.ws, 'commit', '-q', '-m', 'pushed, then amended away');
+    const dropped = git(sb.ws, 'rev-parse', 'HEAD');
+    git(sb.ws, 'reset', '-q', '--hard', 'HEAD~1');
+    writeFileSync(join(sb.ws, 'k.txt'), 'amended\n');
+    git(sb.ws, 'add', '-A');
+    git(sb.ws, 'commit', '-q', '-m', 'the amend');
+    const head = git(sb.ws, 'rev-parse', 'HEAD');
+    fakeBetterleaks(sb);
+    expect(tryScan(sb, { base: r.base, head, before: dropped }).status).toBe(0);
+    expect(LO_RE.exec(logOpts(sb))?.[3]).toBe(dropped);
+    const facts = JSON.parse(readFileSync(join(rawDir(sb), 'range.json'), 'utf8')) as { before: string; commits: number };
+    expect(facts.before).toBe(dropped);
+    expect(facts.commits).toBe(3);   // c0, the amend, the dropped commit
+    // a normal push: before is the previous head, an ancestor of head: the same commits
+    const ok = sandbox();
+    const r2 = repo(ok, 2);
+    fakeBetterleaks(ok);
+    expect(tryScan(ok, { ...r2, before: git(ok.ws, 'rev-parse', 'HEAD~1') }).status).toBe(0);
+    expect((JSON.parse(readFileSync(join(rawDir(ok), 'range.json'), 'utf8')) as { commits: number }).commits).toBe(2);
+  });
+
+  it('I2: a before that is not in the checkout and can not be fetched fails the step (the gate blocks)', () => {
+    const sb = sandbox();
+    const r = repo(sb, 1);
+    fakeBetterleaks(sb);
+    const x = tryScan(sb, { ...r, before: 'e'.repeat(40) });
+    expect(x.status).toBe(1);
+    expect(x.stderr).toMatch(/could not be fetched/);
+    expect(existsSync(rawDir(sb))).toBe(false);
   });
 
   it('a scanner error exit (1: a partial scan) fails the step with that code; 0 and 10 are a scan that worked', () => {
     const sb = sandbox();
     const r = repo(sb, 2);
-    fakeBetterleaks(sb, '4', 1);
+    fakeBetterleaks(sb, 1);
     expect(tryScan(sb, r).status).toBe(1);
     expect(existsSync(rawDir(sb))).toBe(false);
     const ok = sandbox();
-    fakeBetterleaks(ok, '4', 0);
+    fakeBetterleaks(ok, 0);
     expect(tryScan(ok, repo(ok, 2)).status).toBe(0);
   });
 
-  it('no range: the all-zero base (a new branch, another event), a value that is not a commit, or a commit not in the checkout (a shallow clone) fails the step', () => {
+  it('no range on this event (an all-zero base or head: a new branch, workflow_dispatch, schedule): the step skips with a note and the facts say so, no scan', () => {
+    for (const edit of [(r: Range) => ({ ...r, base: ZERO }), (r: Range) => ({ ...r, head: ZERO })]) {
+      const sb = sandbox();
+      const r = repo(sb, 1);
+      fakeBetterleaks(sb);
+      const x = tryScan(sb, edit(r));
+      expect(x.status).toBe(0);
+      expect(x.stdout + x.stderr).toMatch(/no commit range/);
+      expect(existsSync(join(sb.rt, 'fake-argv'))).toBe(false);
+      expect(readdirSync(rawDir(sb))).toEqual(['range.json']);
+      expect(JSON.parse(readFileSync(join(rawDir(sb), 'range.json'), 'utf8'))).toEqual({ pipegenRange: 1, skipped: 'no-range' });
+    }
+  });
+
+  it('a value that is not a commit (also 40 characters that git would resolve), or a commit not in the checkout (a shallow clone), fails the step', () => {
     for (const [what, edit] of [
-      ['zero base', (r: { base: string; head: string }) => ({ ...r, base: ZERO })],
-      ['zero head', (r: { base: string; head: string }) => ({ ...r, head: ZERO })],
-      ['not hex', (r: { base: string; head: string }) => ({ ...r, base: 'main' })],
-      ['injection', (r: { base: string; head: string }) => ({ ...r, head: `${r.head};id` })],
-      ['missing', (r: { base: string; head: string }) => ({ ...r, base: 'e'.repeat(40) })],
+      ['not hex', (r: Range) => ({ ...r, base: 'main' })],
+      ['40 characters git resolves', (r: Range) => ({ ...r, base: `HEAD~${'0'.repeat(35)}` })],
+      ['injection', (r: Range) => ({ ...r, head: `${r.head};id` })],
+      ['before not hex', (r: Range) => ({ ...r, before: `HEAD~${'0'.repeat(35)}` })],
+      ['missing', (r: Range) => ({ ...r, base: 'e'.repeat(40) })],
     ] as const) {
       const sb = sandbox();
       const r = repo(sb, 1);
-      fakeBetterleaks(sb, '3');
+      fakeBetterleaks(sb);
       const x = tryScan(sb, edit(r));
       expect(x.status, what).toBe(1);
       expect(existsSync(join(sb.rt, 'fake-argv')), what).toBe(false);
     }
-  });
-
-  it('a commit of the range that changes a file\'s type (a link that becomes a file) fails the step: the scanner\'s parallel mode skips type changes (measured)', () => {
-    const sb = sandbox();
-    const r = repo(sb, 2, true);
-    fakeBetterleaks(sb, '4');
-    const x = tryScan(sb, r);
-    expect(x.status).toBe(1);
-    expect(x.stderr).toMatch(/type/);
   });
 });
 
@@ -269,13 +344,13 @@ describe('the referee: the full pull-request job set with the range block (parit
     expect(show(await run([workflow(jobsOf(d))], d))).toBe('');
   });
 
-  it('without the range block, with the range scan edited (no --no-merges), or with a depth-1 secrets checkout, it is refused', async () => {
+  it('without the range block, with the range scan edited (no --remerge-diff), or with a depth-1 secrets checkout, it is refused', async () => {
     const d = draftOf();
     const none = await run([workflow(jobsOf(d, { range: false }))], d);
     expect(none.ok, show(none)).toBe(false);
     expect(show(none)).toMatch(/secrets-range|range/);
     const all = jobsOf(d);
-    const r1 = await run([workflow(editSteps(all, SEC_JOB, (s) => (s.id === rangeScanStepId ? { ...s, run: (s.run ?? '').replace('--no-merges ', '') } : s)))], d);
+    const r1 = await run([workflow(editSteps(all, SEC_JOB, (s) => (s.id === rangeScanStepId ? { ...s, run: (s.run ?? '').replace('--remerge-diff ', '') } : s)))], d);
     expect(r1.ok, show(r1)).toBe(false);
     // the checkout of the secrets job edited to depth 1 (the renderer itself refuses to build it, so it is edited in the file)
     const shallow = await run([workflow(editSteps(all, SEC_JOB, (s) => (s.with?.['fetch-depth'] === '0' ? { ...s, with: { ...s.with, 'fetch-depth': '1' } } : s)))], d);

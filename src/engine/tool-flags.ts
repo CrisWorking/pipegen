@@ -812,8 +812,13 @@ export const BASE_CHECKOUT_REF = `\${{ github.event_name == 'pull_request' && gi
  * range scan refuses (no range). Only the range scan step carries it (job-rules.ts checkExpressions).
  */
 export const RANGE_HEAD_REF = `\${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.event_name == 'pull_request_review' && github.event.pull_request.head.sha || github.event_name == 'merge_group' && github.event.merge_group.head_sha || github.event_name == 'push' && github.event.after || '${'0'.repeat(40)}' }}`;
-/** C9: the env of the commit-range scan step that holds an expression: exactly these two names, each exactly its form, on that step only. */
-export const RANGE_STEP_ENV: Readonly<Record<string, string>> = Object.freeze({ PIPEGEN_RANGE_BASE: BASE_CHECKOUT_REF, PIPEGEN_RANGE_HEAD: RANGE_HEAD_REF });
+/**
+ * C9 fix round 1 (review I2): on a pull request's `synchronize`, the head before this push. After a force-push its commits are no longer in
+ * base..head, but they were pushed (a secret in them has leaked), so the range scan reads them too. Any other event: the all-zero commit.
+ */
+export const RANGE_BEFORE_REF = `\${{ github.event_name == 'pull_request' && github.event.action == 'synchronize' && github.event.before || '${'0'.repeat(40)}' }}`;
+/** C9: the env of the commit-range scan step that holds an expression: exactly these three names, each exactly its form, on that step only. */
+export const RANGE_STEP_ENV: Readonly<Record<string, string>> = Object.freeze({ PIPEGEN_RANGE_BASE: BASE_CHECKOUT_REF, PIPEGEN_RANGE_HEAD: RANGE_HEAD_REF, PIPEGEN_RANGE_BEFORE: RANGE_BEFORE_REF });
 /** C9: the id of the commit-range scan step (a checker step: the hash of the range artifact). */
 export const rangeScanStepId = `checker-run-${sha16(SECRETS_RANGE_ARTIFACT)}`;
 

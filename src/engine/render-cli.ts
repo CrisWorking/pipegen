@@ -709,29 +709,52 @@ export function renderCliTool({ spec, tool, service, ctx, hooks, options }: CliA
 
 /** C9: the config of the range scan: pipegen's pinned betterleaks config (the canary rule included) with no global path allowlist. */
 export const RANGE_PREFILTER = "prefilter = '''false'''\n\n";
+/** C9 fix round 1: the date of the canary commits (2100-01-01), later than any real commit, so the date-ordered stream ends with them. */
+const CANARY_DATE = '@4102444800 +0000';
+/** The oldest git with `--remerge-diff` (2.36). */
+const REMERGE_GIT = [2, 36] as const;
 
 /**
- * The commit-range secrets scan (C9, Plan C final review Important 2): the reviewed betterleaks entry's release install, then ONE checker step
- * that scans the pull request's own commits in `git` mode. Every word is a reviewed constant; the only values from outside are this event's
- * base and head commits, which come in the step env (the event-switched forms RANGE_STEP_ENV) and must be 40 hex digits, never all zero.
+ * The text Plan G prints in PIPEGEN.md about the commit-range scan (C9 and its fix round 1), so the residuals are said where people read them.
+ */
+export const RANGE_PIPEGEN_NOTE = [
+  'pipegen also scans every commit a pull request pushes, not only its last one: a secret added in one commit and removed in a later one still blocks, because it was pushed and has leaked. Rotate it now.',
+  'When a push rewrites the pull request (a force-push), the commits it replaced are scanned too, once, on that push. A commit replaced two or more pushes ago is no longer in the range: a secret pushed is leaked whatever later pushes do, so rotate it when pipegen first reports it.',
+  'A merge from the default branch into the pull request brings that branch\'s newer commits into the range: a secret there blocks the pull request too. A merge commit is scanned for what its own resolution added.',
+  'Commit messages are not scanned for secrets.',
+].join('\n\n');
+
+/**
+ * The commit-range secrets scan (C9, Plan C final review Important 2; fix round 1, review-C9.md I1 to I3): the reviewed betterleaks entry's
+ * release install, then ONE checker step that scans the pull request's commits in `git` mode, as one ordered stream. Every word is a reviewed
+ * constant; the only values from outside are this event's base, head and before commits, which come in the step env (the event-switched forms
+ * RANGE_STEP_ENV) and must each be 40 hex digits.
  *
- * Measured with the pinned betterleaks 1.9.0 (the C9 report has the logs):
+ * Measured with the pinned betterleaks 1.9.0 (the C9 report and review have the logs):
  * - git mode applies the config's global path allowlist (node_modules/, package-lock.json, …), so the config is the entry's own with
- *   `prefilter = '''false'''` put first (a prefilter after [extend] is read as extend.prefilter and changes nothing);
+ *   `prefilter = '''false'''` put first (a prefilter after [extend] is read as extend.prefilter and changes nothing). The rules' own narrow
+ *   path conditions (betterleaks' isCodeFile discard of an unquoted password in code, the bitbake SRC= lines, the octokit README) still apply
+ *   here, on the real paths, where the HEAD scan's neutral staged names never meet them: the range can report a little less than the HEAD scan
+ *   of the same file, never more hidden than an unstaged scan;
  * - betterleaks reads `.betterleaksignore` / `.gitleaksignore` from the folder it scans whatever --gitleaks-ignore-path says, so it runs from
  *   an empty folder whose `.git` file names the checkout's git folder;
- * - the count of the commits it scans is printed only in its parallel mode (`--git-workers 2`) and only for two commits or more
- *   (`parallel git scan chunk_size=… commits=N workers=…`), so two canary commits (each adding one canary line, local objects that no ref
- *   names and nothing pushes) sit on the head: the range is base..<second canary>, always two commits or more, and the canaries prove the
- *   scanner read the commits with pipegen's config (the scrub requires both, at their commits);
- * - the parallel mode runs `git log -p -U0 --no-walk --stdin --diff-filter=tuxdb` per chunk: our --log-opts reach only the commit list, so
- *   `--text` is lost (binary files, archives included, would be skipped) and type changes (a link that becomes a file) are never read.
- *   `* diff` in the git folder's info/attributes (which wins over the repository's .gitattributes) makes every file text to the diff, and a
- *   range with a type change is refused (not scanned, the gate blocks).
- * Completeness: the step counts the range with `git rev-list --count --no-merges` and requires the scanner's own count to equal it; a
- * mismatch, no count, a partial scan (betterleaks exits 1) or any other exit than 0 and 10 fails the step, and no raw result is left (the
- * scrub then reports a tool error). `--no-merges`: a merge commit is not scanned (its parents are); a merge from the default branch into the
- * pull request brings that branch's newer commits into base..head, so a secret there blocks too (false blocks only, fail closed).
+ * - single mode (`--git-workers 0`) hands --log-opts to ONE `git log -p -U0`: `--reverse` prints the oldest commit first, `--text` makes every
+ *   file text to the diff (archives, NUL bytes, the repository's `-diff` and `binary` attributes, type changes are all read), and
+ *   `--remerge-diff` shows each merge commit as what its own resolution added to the automatic merge of its parents (a conflict resolution, a
+ *   file staged while resolving), so merges are in the range. The parallel mode of the first round read chunks the step could not prove
+ *   (review I1), and is gone with its count check and its workarounds.
+ * Completeness (I1): two canary commits on the head, each its parent's tree plus one canary file, dated after every real commit, so the
+ * reversed stream ends with them (the step checks the stream order with `git rev-list --reverse` of the same revisions and fails when they are
+ * not the last two). The scanner reports a finding when it reads it, so the tip canary is found only when the stream was read to its end: a
+ * stream cut short anywhere (a parse error, a killed git) has no tip canary, and the scrub calls that a tool error.
+ * The dropped commits (I2): on a synchronize, `before` (the previous head) is a revision of the stream too (`^base <tip> <before>`): the
+ * commits a force-push replaced. A `before` not in the checkout is fetched by sha; one that can not be fetched fails the step. Residual: a
+ * commit replaced two or more pushes ago is no longer in any range (RANGE_PIPEGEN_NOTE).
+ * Not scanned: commit messages and author fields (betterleaks reads the patches only; a known limit, carried to Plan P).
+ * No range on this event (an all-zero base or head: a push that made the branch, workflow_dispatch, schedule): the step writes the facts
+ * `{ skipped: 'no-range' }` and exits 0; the gate reads that as not applicable on those events only, and blocks on a pull request event.
+ * Any other failure fails the step and leaves no raw result (the scrub then reports a tool error). A merge from the default branch brings
+ * that branch's newer commits into the range: a secret there blocks too (false blocks only, fail closed).
  */
 export function renderRangeScan(tool: ReviewedTool): RenderResult {
   const pol = own(ARGV_POLICIES, tool.id);
@@ -746,70 +769,95 @@ export function renderRangeScan(tool: ReviewedTool): RenderResult {
   const outDir = `$RUNNER_TEMP/pipegen-raw/${artifact}`;
   const zero = '0'.repeat(40);
   const [c1, c2] = RANGE_CANARY_FILES;
-  const notCommits = 'pg_fail "the commit range is not two commit shas, so it is not scanned"';
+  const notCommits = 'pg_fail "the commit range is not given as commit shas, so it is not scanned"';
   const run = script([
     ...prologue(artifact),
     `bin="$RUNNER_TEMP/pipegen-bin/${artifact}"`,
     `work="$RUNNER_TEMP/pipegen-work/${artifact}"`,
     'mkdir -p "$RUNNER_TEMP/pipegen-work"',
     'mkdir "$work"',
-    // the range: this event's base and head (the event-switched forms), each a commit sha, never the all-zero commit (no range on this event)
+    // the range: this event's base, head and (on a synchronize) before, each a commit sha (the hex test also stops `HEAD~000…`, which git resolves)
     'base="$PIPEGEN_RANGE_BASE"',
     'head="$PIPEGEN_RANGE_HEAD"',
-    'for c in "$base" "$head"; do',
+    'before="$PIPEGEN_RANGE_BEFORE"',
+    'for c in "$base" "$head" "$before"; do',
     `  case "$c" in *[!0-9a-f]*|"") ${notCommits} ;; esac`,
     `  [ "\${#c}" -eq 40 ] || ${notCommits}`,
-    `  [ "$c" != ${zero} ] || pg_fail "this event has no commit range (a new branch, or an event that is not a pull request, a merge queue or a push), so it is not scanned"`,
     'done',
+    // no range on this event: a note, and facts that say so (the gate blocks on a pull request event, and notes it on the others)
+    `if [ "$base" = ${zero} ] || [ "$head" = ${zero} ]; then`,
+    '  echo "pipegen: this event has no commit range (a push that made the branch, workflow_dispatch or schedule), so no commit range is scanned"',
+    '  mkdir -p "$RUNNER_TEMP/pipegen-raw"',
+    `  mkdir "${outDir}"`,
+    `  printf '{"pipegenRange":1,"skipped":"no-range"}\\n' > "${outDir}/${RANGE_FACTS_FILE}"`,
+    `  chmod -R a-w "${outDir}"`,
+    '  exit 0',
+    'fi',
     'git=(',
     '  "${sys[@]}"',
     '  GIT_CONFIG_NOSYSTEM=1',
     '  GIT_CONFIG_GLOBAL=/dev/null',
     '  GIT_TERMINAL_PROMPT=0',
+    '  GIT_ALLOW_PROTOCOL=https',
     '  GIT_AUTHOR_NAME=pipegen',
     '  GIT_AUTHOR_EMAIL=pipegen@invalid',
-    "  'GIT_AUTHOR_DATE=@0 +0000'",
+    `  'GIT_AUTHOR_DATE=${CANARY_DATE}'`,
     '  GIT_COMMITTER_NAME=pipegen',
     '  GIT_COMMITTER_EMAIL=pipegen@invalid',
-    "  'GIT_COMMITTER_DATE=@0 +0000'",
+    `  'GIT_COMMITTER_DATE=${CANARY_DATE}'`,
     '  /usr/bin/git',
     ')',
+    // --remerge-diff needs git 2.36 or later
+    'gv="$("${git[@]}" version)"',
+    'case "$gv" in "git version "[0-9]*.[0-9]*) ;; *) pg_fail "the version of git could not be read, so merge commits can not be scanned" ;; esac',
+    'gv="${gv#git version }"',
+    'gmaj="${gv%%.*}"',
+    'gmin="${gv#*.}"',
+    'gmin="${gmin%%[!0-9]*}"',
+    'case "$gmaj$gmin" in *[!0-9]*|"") pg_fail "the version of git could not be read, so merge commits can not be scanned" ;; esac',
+    `if [ "$gmaj" -lt ${REMERGE_GIT[0]} ] || { [ "$gmaj" -eq ${REMERGE_GIT[0]} ] && [ "$gmin" -lt ${REMERGE_GIT[1]} ]; }; then pg_fail "git $gv can not show what a merge commit added (--remerge-diff needs git ${REMERGE_GIT.join('.')}), so the commit range is not scanned"; fi`,
     'for c in "$base" "$head"; do',
     '  "${git[@]}" cat-file -e "$c^{commit}" 2> /dev/null || pg_fail "the commit $c is not in the checkout: the secrets job checks out the whole history (fetch-depth: 0)"',
     'done',
+    // the commits a force-push dropped: fetched by sha when the checkout does not hold them (a pushed commit stays fetchable)
+    'revs=()',
+    `if [ "$before" != ${zero} ]; then`,
+    '  if ! "${git[@]}" cat-file -e "$before^{commit}" 2> /dev/null; then',
+    '    "${git[@]}" fetch --quiet --no-tags --no-recurse-submodules origin "$before" > /dev/null 2>&1 || true',
+    '    "${git[@]}" cat-file -e "$before^{commit}" 2> /dev/null || pg_fail "the head before this push ($before) could not be fetched, so the commits the push dropped are not scanned"',
+    '  fi',
+    '  revs+=("$before")',
+    'fi',
     'gitdir="$("${git[@]}" rev-parse --absolute-git-dir)"',
     'if [ -L "$gitdir" ] || [ ! -d "$gitdir" ]; then pg_fail "the git folder of the checkout is not a real folder"; fi',
-    // every file is text to the diff: the git folder's info/attributes wins over the repository's .gitattributes (`-diff`, `binary`)
-    'mkdir -p -- "$gitdir/info"',
-    'if [ -L "$gitdir/info" ] || [ ! -d "$gitdir/info" ]; then pg_fail "the info folder of the git folder is not a real folder"; fi',
-    'rm -f -- "$gitdir/info/attributes"',
-    'printf \'* diff\\n\' > "$gitdir/info/attributes"',
-    // a type change is never read by the scanner's parallel mode (--diff-filter=tuxdb, measured): such a range is not scanned
-    '"${git[@]}" log --no-merges --format= --name-status "$base..$head" > "$work/changes.txt"',
-    'set +e',
-    '"${sys[@]}" grep -q "^T"$\'\\t\' -- "$work/changes.txt"',
-    'tc=$?',
-    'set -e',
-    'case "$tc" in 1) ;; 0) pg_fail "a commit of the range changes the type of a file (a link that becomes a file), which the scanner does not read, so the range is not scanned" ;; *) pg_fail "the changes of the range could not be read" ;; esac',
-    // two canary commits on the head (local objects only): the scanner then always reports its count, and must report both canaries
+    // two canary commits on the head, each its parent's tree plus one canary file (local objects only, dated after every real commit)
     'canary() { printf \'pipegen-canary-%s\' "$("${sys[@]}" od -An -N16 -tx1 /dev/urandom | "${sys[@]}" tr -d \' \\n\')"; }',
     'parent="$head"',
-    'commits=()',
+    'canaries=()',
     `for f in ${c1} ${c2}; do`,
     '  line="$(canary)"',
     '  case "$line" in pipegen-canary-*[!0-9a-f]*) pg_fail "a canary could not be made" ;; esac',
     '  [ "${#line}" -eq 47 ] || pg_fail "a canary could not be made"',
-    '  blob="$(printf \'%s\\n\' "$line" | "${git[@]}" hash-object -w --stdin)"',
-    '  tree="$(printf \'100644 blob %s\\t%s\\0\' "$blob" "$f" | "${git[@]}" mktree -z)"',
+    '  blob="$("${git[@]}" hash-object -w --stdin <<< "$line")"',
+    '  "${git[@]}" ls-tree -z "$parent" > "$work/tree.bin"',
+    '  while IFS= read -r -d \'\' e; do',
+    '    case "$e" in *$\'\\t\'"$f") ;; *) printf \'%s\\0\' "$e" ;; esac',
+    '  done < "$work/tree.bin" > "$work/tree2.bin"',
+    '  printf \'100644 blob %s\\t%s\\0\' "$blob" "$f" >> "$work/tree2.bin"',
+    '  tree="$("${git[@]}" mktree -z < "$work/tree2.bin")"',
     '  parent="$("${git[@]}" commit-tree "$tree" -p "$parent" -m \'pipegen: commit-range canary\' < /dev/null)"',
     `  case "$parent" in *[!0-9a-f]*|"") pg_fail "a canary commit could not be made" ;; esac`,
     '  [ "${#parent}" -eq 40 ] || pg_fail "a canary commit could not be made"',
-    '  commits+=("$parent")',
+    '  canaries+=("$parent")',
     'done',
     'last="$parent"',
-    'want="$("${git[@]}" rev-list --count --no-merges "$base..$last")"',
+    // the stream: everything reachable from the tip canary (and before), not from the base; the two canaries must be its last commits
+    '"${git[@]}" rev-list --reverse "^$base" "$last" "${revs[@]}" > "$work/order.txt"',
+    'want="$("${sys[@]}" wc -l < "$work/order.txt")"',
     'case "$want" in *[!0-9]*|"") pg_fail "the commits of the range could not be counted" ;; esac',
     '[ "$want" -ge 2 ] || pg_fail "the commits of the range could not be counted"',
+    'tail2="$("${sys[@]}" tail -n 2 -- "$work/order.txt" | "${sys[@]}" tr \'\\n\' \' \')"',
+    '[ "$tail2" = "${canaries[0]} ${canaries[1]} " ] || pg_fail "a commit of the range is dated after the canary commits, so the canary is not the last commit the scanner reads and the stream can not be proven read to its end"',
     'own=$((want - 2))',
     // the scanner runs from an empty folder whose .git file names the checkout's git folder (no ignore file of the checkout is read)
     'src="$work/src"',
@@ -817,25 +865,22 @@ export function renderRangeScan(tool: ReviewedTool): RenderResult {
     'printf \'gitdir: %s\\n\' "$gitdir" > "$src/.git"',
     `printf '%s' "$PIPEGEN_CONFIG" > "$work/${config.fileName}"`,
     `out="$work/${out}"`,
-    'log="$work/scan.log"',
+    'logopts="--reverse --remerge-diff --text ^$base $last${revs[0]:+ ${revs[0]}}"',
     'cd -- "$src"',
     ...allowlist(FIXED_PATH, []),
     'rc=0',
-    `${LAUNCH_ENV} ${releaseLauncher(exe)} git --no-banner --no-color --log-level info --ignore-gitleaks-allow --redact --report-format sarif --report-path "$out" --exit-code 10 --max-archive-depth 0 --git-workers 2 ${config.flag} "$work/${config.fileName}" --log-opts "--no-merges $base..$last" . 2> "$log" || rc=$?`,
-    '"${sys[@]}" cat -- "$log" >&2',
+    `${LAUNCH_ENV} ${releaseLauncher(exe)} git --no-banner --no-color --log-level info --ignore-gitleaks-allow --redact --report-format sarif --report-path "$out" --exit-code 10 --max-archive-depth 0 --git-workers 0 ${config.flag} "$work/${config.fileName}" --log-opts "$logopts" . || rc=$?`,
     'case "$rc" in 0|10) ;; *)',
     '  rm -rf -- "$out"',
     '  echo "pipegen: the tool exited with $rc, so its result is not used" >&2',
     '  exit "$rc" ;;',
     'esac',
-    // completeness: the scanner's own count of the commits it scanned equals the range's (once, in its own log line)
-    'got="$("${sys[@]}" sed -nE \'s/^[^ ]+ INF parallel git scan chunk_size=[0-9]+ commits=([0-9]+) workers=[0-9]+$/\\1/p\' -- "$log")"',
-    'case "$got" in *[!0-9]*|"") pg_fail "the scanner did not report how many commits it scanned (once), so the range is not proven scanned" ;; esac',
-    '[ "$got" -eq "$want" ] || pg_fail "the scanner scanned $got commits, but the range has $want ($own of the pull request and the 2 canary commits), so the range is not proven scanned"',
     'if [ -f "$out" ] && [ ! -L "$out" ]; then',
     '  mkdir -p "$RUNNER_TEMP/pipegen-raw"',
     `  mkdir "${outDir}"`,
-    `  printf '{"pipegenRange":1,"base":"%s","head":"%s","commits":%s,"canaries":[{"commit":"%s","path":"${c1}"},{"commit":"%s","path":"${c2}"}]}\\n' "$base" "$head" "$own" "\${commits[0]}" "\${commits[1]}" > "${outDir}/${RANGE_FACTS_FILE}"`,
+    '  bjson=null',
+    `  [ "$before" = ${zero} ] || bjson="\\"$before\\""`,
+    `  printf '{"pipegenRange":1,"base":"%s","head":"%s","before":%s,"commits":%s,"canaries":[{"commit":"%s","path":"${c1}"},{"commit":"%s","path":"${c2}"}]}\\n' "$base" "$head" "$bjson" "$own" "\${canaries[0]}" "\${canaries[1]}" > "${outDir}/${RANGE_FACTS_FILE}"`,
     `  mv -- "$out" "${outDir}/${out}"`,
     `  chmod -R a-w "${outDir}"`,
     'else',
