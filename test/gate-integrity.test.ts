@@ -77,6 +77,7 @@ class Gh implements GateGithub {
   async downloadArtifact(): Promise<Uint8Array> { throw new Error('not used'); }
   async branchHead(): Promise<unknown> { throw new Error('not used'); }
   async tagExists(): Promise<boolean> { throw new Error('not used'); }
+  async getCommit(): Promise<unknown> { throw new Error('not used'); }
 }
 
 // ---------- CODEOWNERS: syntax and GitHub's glob semantics ----------

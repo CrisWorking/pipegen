@@ -52,6 +52,8 @@ interface World {
   event: string; sha: string; payload: Record<string, unknown>; list: JobListEntry[]; needs: Record<string, unknown>; arts: Art[];
   inputs: Record<string, string | undefined>; compare: Map<string, unknown>; files: unknown[]; reviews: unknown[];
   pull: Record<string, unknown>; contents: Map<string, unknown>; runs: unknown[]; now: Date; lockfileKinds?: string[];
+  /** GET /commits/{sha} answers (C5b Part 0: the merge commit's parents). */
+  commits: Map<string, unknown>;
 }
 const FILE_PATCH = { filename: 'src/a.ts', status: 'modified', changes: 2, patch: '@@ -1 +1 @@\n-a\n+b' };
 const b64 = (t: string): unknown => ({ type: 'file', encoding: 'base64', size: Buffer.byteLength(t), content: Buffer.from(t).toString('base64') });
@@ -92,6 +94,8 @@ function world(): World {
     pull: { number: 5, head: { sha: HEAD, repo: { id: 7 } }, base: { sha: BASE }, changed_files: 1, user: { login: 'author' } },
     contents: new Map<string, unknown>([[`${BASE}:.github/workflows/pipegen.yml`, b64('name: pipegen\n')], [`${BASE}:.github/CODEOWNERS`, b64('* @olga\n')]]),
     runs: [], now: new Date('2026-10-30T12:00:00Z'),
+    // C5b Part 0: the scanned test merge commit, base tip first and the PR head second
+    commits: new Map<string, unknown>([[MERGE, { sha: MERGE, parents: [{ sha: BASE }, { sha: HEAD }] }]]),
   };
 }
 /** Re-derive the inputs that mirror the world's needs and list (after a tamper changed them). */
@@ -124,6 +128,10 @@ class FakeGh implements GateGithub {
   }
   async collaboratorPermission(_o: string, _n: string, login: string): Promise<unknown> { this.log(`perm ${login}`); return { permission: 'write' }; }
   async rawFileAt(): Promise<unknown> { return null; }
+  async getCommit(_o: string, _n: string, sha: string): Promise<unknown> {
+    this.log(`commit ${sha.slice(0, 1)}`);
+    const a = this.w.commits.get(sha); if (a === undefined) throw new Error('404'); return a;
+  }
 }
 function ioOf(w: World, gh: FakeGh): GateIo & { zips: number[]; lists: string[] } {
   const zips: number[] = [];
@@ -517,5 +525,85 @@ describe('fix round 2: the event\'s head commit is the scanned commit or an ance
     const g = world(); g.event = 'merge_group';
     g.payload = { merge_group: { base_sha: BASE, base_ref: 'refs/heads/main' }, repository: g.payload.repository };
     expect(await blocked(g)).toMatch(/no head commit, so the scanned commit can not be tied to it/);
+  });
+});
+
+// ---------- C5b Part 0 (review-C5a-r2 r2-m1): the scanned merge commit's second parent is the PR head ----------
+
+describe('C5b Part 0: on pull_request and pull_request_review the scanned merge commit\'s second parent is the payload head', () => {
+  const NOT_MERGE = /the scanned commit is not GitHub's merge of the pull request's head/;
+  const blocked = async (w: World): Promise<string> => { const r = decideGate((await gather(w)).input); expect(r.pass).toBe(false); return r.blockReasons.join('\n'); };
+  const worlds = (): [string, World][] => [['pull_request', world()], ['pull_request_review', reviewWorld()]];
+  it('the control: parents [base tip, head] → passes, with one GET /commits/{github.sha}', async () => {
+    for (const [ev, w] of worlds()) {
+      const { input, gh } = await gather(w);
+      expect(why(input), ev).toBe('');
+      expect(gh.calls.filter((c) => c.startsWith('commit ')), ev).toEqual(['commit d']);
+    }
+  });
+  it('a second parent that is not the head (an older head, the head first, the base twice) → blocks', async () => {
+    const OLDER = 'a'.repeat(40);
+    for (const parents of [[{ sha: BASE }, { sha: OLDER }], [{ sha: HEAD }, { sha: BASE }], [{ sha: BASE }, { sha: BASE }]]) {
+      for (const [ev, w] of worlds()) {
+        w.commits.set(MERGE, { sha: MERGE, parents });
+        expect(await blocked(w), ev).toMatch(NOT_MERGE);
+      }
+    }
+  });
+  it('a commit that is not a two-parent merge (one parent, three parents, none) → blocks', async () => {
+    for (const parents of [[{ sha: HEAD }], [{ sha: BASE }, { sha: HEAD }, { sha: 'a'.repeat(40) }], []]) {
+      for (const [ev, w] of worlds()) {
+        w.commits.set(MERGE, { sha: MERGE, parents });
+        expect(await blocked(w), `${ev} ${parents.length}`).toMatch(NOT_MERGE);
+      }
+    }
+  });
+  it('a malformed answer (no parents, parents not a list, a parent with no sha, an upper-case sha, another commit\'s sha) → blocks', async () => {
+    const answers: unknown[] = [
+      { sha: MERGE }, { sha: MERGE, parents: 'x' }, { sha: MERGE, parents: [{ sha: BASE }, {}] }, { sha: MERGE, parents: [{ sha: BASE }, { sha: HEAD.toUpperCase() }] },
+      { sha: 'e'.repeat(40), parents: [{ sha: BASE }, { sha: HEAD }] }, null, [], 'text',
+    ];
+    for (const a of answers) {
+      for (const [ev, w] of worlds()) {
+        w.commits.set(MERGE, a);
+        expect(await blocked(w), `${ev} ${JSON.stringify(a)}`).toMatch(NOT_MERGE);
+      }
+    }
+  });
+  it('an inherited parents field (prototype) is not read', async () => {
+    const w = world();
+    const proto = { parents: [{ sha: BASE }, { sha: HEAD }] };
+    w.commits.set(MERGE, Object.assign(Object.create(proto) as object, { sha: MERGE }));
+    expect(await blocked(w)).toMatch(NOT_MERGE);
+  });
+  it('an API error → blocks, fail closed', async () => {
+    for (const [ev, w] of worlds()) {
+      w.commits.delete(MERGE);
+      expect(await blocked(w), ev).toMatch(/whether the scanned commit is the merge of the pull request's head could not be checked/);
+    }
+  });
+  it('the head equal to github.sha on a pull request (not a merge commit) → blocks', async () => {
+    const w = world();
+    w.sha = HEAD;
+    w.commits.set(HEAD, { sha: HEAD, parents: [{ sha: BASE }] });
+    w.compare.set(`${BASE}...${HEAD}`, { status: 'ahead', files: [FILE_PATCH] });
+    expect(await blocked(w)).toMatch(NOT_MERGE);
+  });
+  it('merge_group keeps the equality rule: no commit call', async () => {
+    const w = world();
+    w.event = 'merge_group';
+    w.payload = { merge_group: { base_sha: BASE, head_sha: MERGE, base_ref: 'refs/heads/main' }, repository: w.payload.repository };
+    w.commits.clear();
+    const { input, gh } = await gather(w);
+    expect(decideGate(input).pass).toBe(true);
+    expect(gh.calls.some((c) => c.startsWith('commit '))).toBe(false);
+  });
+  it('a push makes no commit call', async () => {
+    const w = world();
+    w.event = 'push';
+    w.payload = { ref: 'refs/heads/main', before: BASE, after: MERGE, repository: w.payload.repository };
+    w.commits.clear();
+    const { gh } = await gather(w);
+    expect(gh.calls.some((c) => c.startsWith('commit '))).toBe(false);
   });
 });

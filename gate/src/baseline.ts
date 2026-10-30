@@ -143,6 +143,9 @@ export interface GateGithub {
   collaboratorPermission(owner: string, name: string, login: string): Promise<unknown>;
   /** The raw text of a file (`GET .../contents/{path}?ref=` with `Accept: application/vnd.github.raw+json`), for files over 1 MiB; a 404 is `null`, any other error is thrown. */
   rawFileAt(owner: string, name: string, path: string, ref: string): Promise<unknown>;
+  // ---- C5b Part 0 (review-C5a-r2 r2-m1) ----
+  /** `GET /repos/{owner}/{name}/commits/{sha}` → the commit, with `sha` and `parents: [{ sha }, ...]`; `sha` is a 40-hex commit sha. Any error is thrown. */
+  getCommit(owner: string, name: string, sha: string): Promise<unknown>;
 }
 /** The write side (C5 wires `@actions/artifact`). */
 export interface ArtifactUploader {

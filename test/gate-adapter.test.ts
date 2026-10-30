@@ -33,6 +33,16 @@ const make = (route: (url: string, seen: Seen) => Reply, extra: { notes?: string
 };
 
 describe('requests: the REST paths of GateGithub, with the token and nothing else', () => {
+  it('C5b Part 0: getCommit is GET /repos/{o}/{r}/commits/{sha}; a name that is not a 40-hex sha makes no request', async () => {
+    const { gh, seen } = make(() => json({ sha: SHA('d'), parents: [] }));
+    expect(await gh.getCommit('acme', 'app', SHA('d'))).toEqual({ sha: SHA('d'), parents: [] });
+    expect(seen.map((s) => s.url)).toEqual([`${API_ROOT}/repos/acme/app/commits/${SHA('d')}`]);
+    expect(seen[0]?.headers.authorization).toBe(`Bearer ${CRED}`);
+    for (const bad of ['main', SHA('D'), `${SHA('d')}x`, 'HEAD', '../x']) await expect(gh.getCommit('acme', 'app', bad)).rejects.toThrow(GitHubApiError);
+    expect(seen.length).toBe(1);
+    const { gh: g404 } = make(() => json({}, 404));
+    await expect(g404.getCommit('acme', 'app', SHA('d'))).rejects.toThrow(/404/);
+  });
   it('each call goes to api.github.com at the documented path, with Bearer auth and the API version; answers are the parsed JSON', async () => {
     const { gh, seen } = make(() => json({ ok: 1 }));
     await gh.compare('acme', 'app', SHA('a'), SHA('b'));

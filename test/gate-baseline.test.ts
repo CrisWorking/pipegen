@@ -85,6 +85,7 @@ class FakeGh implements GateGithub {
   async compareFiles(): Promise<unknown> { throw new Error('not used'); }
   async collaboratorPermission(): Promise<unknown> { throw new Error('not used'); }
   async rawFileAt(): Promise<unknown> { throw new Error('not used'); }
+  async getCommit(): Promise<unknown> { throw new Error('not used'); }
 }
 const run = (over: Record<string, unknown> = {}): Record<string, unknown> => ({
   id: 100, event: 'push', conclusion: 'success', path: WORKFLOW_PATH, head_branch: 'main', head_sha: S1, head_repository: { id: 7 }, ...over,

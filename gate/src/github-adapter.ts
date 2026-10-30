@@ -235,6 +235,7 @@ export function githubAdapter(opts: AdapterOptions): GateGithubAdapter {
       if (r.status === 404) return null;
       try { return new TextDecoder('utf-8', { fatal: true }).decode(r.body); } catch { throw new GitHubApiError('the raw file is not UTF-8 text'); }
     },
+    getCommit: async (owner, name, commit) => getJson(`${repo(owner, name)}/commits/${sha(commit)}`),
     collaboratorPermission: async (owner, name, login) => {
       if (typeof login !== 'string' || !LOGIN_RE.test(login)) fail('a login that is not a GitHub login');
       return getJson(`${repo(owner, name)}/collaborators/${encodeURIComponent(login)}/permission`);

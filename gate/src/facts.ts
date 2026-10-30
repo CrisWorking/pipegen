@@ -24,6 +24,9 @@
 //
 // The head (fix round 2): on pull_request, pull_request_review and merge_group, the event's head commit must be github.sha or an ancestor of
 // it (compare head...github.sha: ahead or identical), else a settings error: the check lands on the head, so the head must have been scanned.
+// The exact binding (C5b Part 0, review-C5a-r2 r2-m1): on pull_request and pull_request_review, github.sha must also be GitHub's test merge
+// of exactly that head: GET /commits/{github.sha} has two parents and the second is the payload head. `ahead` alone accepts a merge of a
+// NEWER head C that merely contains the payload head B, so B would get a green check from a scan of C. merge_group keeps the equality rule.
 //
 // One range is compared once (fix round 1, m6): the ancestry and the diff both read GET /compare/{base}...{github.sha} on a pull request, so
 // the answer is fetched once and both read it.
@@ -154,6 +157,15 @@ export async function gatherGateInput(ctx: GateContext, client: GateGithub, io: 
         const status = isPlain(a) && Object.hasOwn(a, 'status') ? a.status : undefined;
         if (status !== 'ahead' && status !== 'identical') settings.errors.push(stale);
       } catch { settings.errors.push('whether the scanned commit contains the pull request\'s head could not be checked, so the gate fails closed'); }
+    }
+    if (head !== undefined && PR_EVENTS.has(event.name)) {
+      const notMerge = 'the scanned commit is not GitHub\'s merge of the pull request\'s head (its second parent must be the head): re-run the gate after GitHub has updated the merge commit';
+      try {
+        const c = await gh.getCommit(repo.owner, repo.name, sha);
+        const parents = isPlain(c) && Object.hasOwn(c, 'parents') ? c.parents : undefined;
+        const ok = isPlain(c) && at(c, 'sha') === sha && Array.isArray(parents) && parents.length === 2 && sha40(at(parents[1], 'sha')) === head;
+        if (!ok) settings.errors.push(notMerge);
+      } catch { settings.errors.push('whether the scanned commit is the merge of the pull request\'s head could not be checked, so the gate fails closed'); }
     }
   }
   const mapped = mapJobs(settings.needs, settings.jobList);
