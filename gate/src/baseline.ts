@@ -61,6 +61,13 @@ export const RUNS_PER_PAGE = 100;
 export const MAX_TRUSTED_RUNS = 20;
 /** At most this many default-history checks (two API calls each, plus the tag check) per lookup; hitting the cap fails closed. */
 export const HISTORY_CHECK_CAP = 20;
+/**
+ * The clean-run marker is looked for in the newest MARKER_WINDOW field-valid runs only (fix round 2). A search that finishes without
+ * error and finds none is `none`, whatever the window or the page budget was used up by: normal green pushes without a marker must
+ * not push the repo out of warn mode. C5 re-writes the marker on every trusted green push once block mode has been reached through a
+ * clean run, so the window always holds one. Worst case: 5 run-list pages + tag + tip + 10 x (compare + artifact list + download) = 37.
+ */
+export const MARKER_WINDOW = 10;
 /** The cap on the artifact (as listed) and on the file inside it. */
 export const MAX_ARTIFACT_BYTES = 8 * 1024 * 1024;
 export const MAX_COUNT_ENTRIES = 200_000;
@@ -119,16 +126,25 @@ const posInt = (v: unknown): v is number => typeof v === 'number' && Number.isSa
 
 // ---------- inDefaultHistory and trustedRun ----------
 
+/** Per-lookup memo (never across lookups): the branch tip and the tag answer are asked once per walk. A tip that moves meanwhile is harmless: ancestry only grows. */
+interface Lookup { tip?: Promise<string | undefined>; tag?: Promise<'none' | 'tag' | 'error'> }
 type History = 'in' | 'out' | 'error';
 /** The default history, three-valued: `error` is an API failure or an answer that is not what the API gives. */
-async function historyState(gh: GateGithub, repo: RepoRef, sha: string): Promise<History> {
-  if (typeof sha !== 'string' || !SHA_RE.test(sha)) return 'out';
+async function resolveTip(gh: GateGithub, repo: RepoRef): Promise<string | undefined> {
   try {
     const ref = await gh.branchHead(repo.owner, repo.name, repo.defaultBranch);
-    if (!isPlain(ref) || own(ref, 'ref') !== `refs/heads/${repo.defaultBranch}`) return 'error';
+    if (!isPlain(ref) || own(ref, 'ref') !== `refs/heads/${repo.defaultBranch}`) return undefined;
     const obj = own(ref, 'object');
     const tip = isPlain(obj) && own(obj, 'type') === 'commit' ? own(obj, 'sha') : undefined;
-    if (typeof tip !== 'string' || !SHA_RE.test(tip)) return 'error';
+    return typeof tip === 'string' && SHA_RE.test(tip) ? tip : undefined;
+  } catch { return undefined; }
+}
+async function historyState(gh: GateGithub, repo: RepoRef, sha: string, lk?: Lookup): Promise<History> {
+  if (typeof sha !== 'string' || !SHA_RE.test(sha)) return 'out';
+  try {
+    const tipP = lk === undefined ? resolveTip(gh, repo) : (lk.tip ??= resolveTip(gh, repo));
+    const tip = await tipP;
+    if (tip === undefined) return 'error';
     const answer = await gh.compare(repo.owner, repo.name, sha, tip);
     const status = isPlain(answer) ? own(answer, 'status') : undefined;
     if (typeof status !== 'string') return 'error';
@@ -147,12 +163,12 @@ export async function inDefaultHistory(gh: GateGithub, repo: RepoRef, sha: strin
   return (await historyState(gh, repo, sha)) === 'in';
 }
 
-type Judged = { ok: true } | { ok: false; why: 'untrusted' | 'tag' | 'error' | 'cap' };
+type Judged = { ok: true } | { ok: false; why: 'untrusted' | 'history' | 'tag' | 'error' | 'cap' };
 /**
  * trustedRun with the reason it said no. `untrusted` is a clean no (wrong field, not in the history); `tag`, `error` and `cap` are
  * "could not tell or can't be trusted now" (the marker lookup treats them as unknown). `budget` counts history checks (m4).
  */
-async function judgeRun(gh: GateGithub, run: unknown, repo: RepoRef, budget?: { left: number }): Promise<Judged> {
+async function judgeRun(gh: GateGithub, run: unknown, repo: RepoRef, budget?: { left: number }, lk?: Lookup): Promise<Judged> {
   const no = (why: 'untrusted'): Judged => ({ ok: false, why });
   if (!isPlain(run)) return no('untrusted');
   if (!posInt(own(run, 'id'))) return no('untrusted');
@@ -164,13 +180,15 @@ async function judgeRun(gh: GateGithub, run: unknown, repo: RepoRef, budget?: { 
   const sha = own(run, 'head_sha');
   if (typeof sha !== 'string' || !SHA_RE.test(sha)) return no('untrusted');
   if (budget !== undefined) { if (budget.left <= 0) return { ok: false, why: 'cap' }; budget.left--; }
-  // a tag named like the default branch (fresh for every run): see the header; anything but a clear "no" fails closed
-  let tag: unknown;
-  try { tag = await gh.tagExists(repo.owner, repo.name, repo.defaultBranch); } catch { return { ok: false, why: 'error' }; }
-  if (tag === true) return { ok: false, why: 'tag' };
-  if (tag !== false) return { ok: false, why: 'error' };
-  const h = await historyState(gh, repo, sha);
-  return h === 'in' ? { ok: true } : { ok: false, why: h === 'out' ? 'untrusted' : 'error' };
+  // a tag named like the default branch (once per lookup, fresh for every trustedRun call): see the header; anything but a clear "no" fails closed
+  const askTag = async (): Promise<'none' | 'tag' | 'error'> => {
+    try { const t = await gh.tagExists(repo.owner, repo.name, repo.defaultBranch); return t === false ? 'none' : t === true ? 'tag' : 'error'; } catch { return 'error'; }
+  };
+  const tag = await (lk === undefined ? askTag() : (lk.tag ??= askTag()));
+  if (tag === 'tag') return { ok: false, why: 'tag' };
+  if (tag === 'error') return { ok: false, why: 'error' };
+  const h = await historyState(gh, repo, sha, lk);
+  return h === 'in' ? { ok: true } : { ok: false, why: h === 'out' ? 'history' : 'error' };
 }
 
 /**
@@ -339,8 +357,12 @@ type Use<T> = (input: { bytes: Uint8Array } | { problem: string }, meta: Artifac
  * bytes of the newest to `use`. `use` returns a result to stop with, or undefined to go on. `st.incomplete` is set whenever the walk
  * could not tell (an API error, a malformed answer, a cap, a tag named like the default branch).
  */
-async function walk<T>(gh: GateGithub, repo: RepoRef, ctx: VerifyContext, artifactName: string, use: Use<T>, notes: string[], st: WalkState): Promise<T | undefined> {
-  const budget = { left: HISTORY_CHECK_CAP };
+async function walk<T>(gh: GateGithub, repo: RepoRef, ctx: VerifyContext, artifactName: string, use: Use<T>, notes: string[], st: WalkState, window?: number): Promise<T | undefined> {
+  // `window` (the marker): only the newest `window` field-valid runs are looked at; using it up is a normal end (none), not a cap
+  const budget = { left: window ?? HISTORY_CHECK_CAP };
+  const lk: Lookup = {};
+  let historyFails = 0;
+  let windowFull = false;
   let trustedSeen = 0;
   let expired = 0;
   let notSuccess = 0;
@@ -355,16 +377,18 @@ async function walk<T>(gh: GateGithub, repo: RepoRef, ctx: VerifyContext, artifa
     const ordered = runs.filter((r): r is Record<string, unknown> => isPlain(r) && posInt(own(r, 'id'))).sort((x, y) => (own(y, 'id') as number) - (own(x, 'id') as number));
     for (const r of ordered) {
       if (own(r, 'conclusion') !== 'success') { notSuccess++; continue; }
-      const j = await judgeRun(gh, r, repo, budget);   // an untrusted run is invisible: no artifact call, no trusted-run budget
+      const j = await judgeRun(gh, r, repo, budget, lk);   // an untrusted run is invisible: no artifact call, no trusted-run budget
       if (!j.ok) {
         if (j.why === 'untrusted') continue;
+        if (j.why === 'history') { historyFails++; continue; }
+        if (j.why === 'cap' && window !== undefined) { windowFull = true; break; }
         st.incomplete = true;
         notes.push(j.why === 'tag' ? `a tag named ${repo.defaultBranch} exists; no run is trusted until it is deleted`
           : j.why === 'cap' ? `more than ${HISTORY_CHECK_CAP} runs needed a default-history check (cap)` : 'the default history of a run could not be checked');
         if (j.why === 'tag' || j.why === 'cap') return undefined;
         continue;
       }
-      if (++trustedSeen > MAX_TRUSTED_RUNS) { notes.push('too many runs without a usable artifact'); st.incomplete = true; return undefined; }
+      if (++trustedSeen > (window ?? MAX_TRUSTED_RUNS)) { notes.push('too many runs without a usable artifact'); st.incomplete = true; return undefined; }
       const runId = own(r, 'id') as number;
       let found: Candidate[];
       try { found = candidatesOf(await gh.listRunArtifacts(repo.owner, repo.name, runId, artifactName), artifactName, runId); } catch { notes.push(`the artifacts of run ${runId} could not be read`); st.incomplete = true; continue; }
@@ -384,9 +408,11 @@ async function walk<T>(gh: GateGithub, repo: RepoRef, ctx: VerifyContext, artifa
       const x = use({ bytes }, meta, st);
       if (x !== undefined) return x;
     }
-    if (runs.length < RUNS_PER_PAGE) { exhausted = false; break; }
+    if (windowFull || runs.length < RUNS_PER_PAGE) { exhausted = false; break; }
   }
-  if (exhausted) { notes.push(`the run list was cut after ${MAX_RUN_PAGES} pages`); st.incomplete = true; }
+  // the marker window: a finished search is a normal end, except a window with history failures and no trusted run (an anomaly)
+  if (window !== undefined && trustedSeen === 0 && historyFails > 0) { notes.push(`${historyFails} run${historyFails === 1 ? '' : 's'} look valid but fail the default-history check, and none passes`); st.incomplete = true; }
+  if (exhausted && window === undefined) { notes.push(`the run list was cut after ${MAX_RUN_PAGES} pages`); st.incomplete = true; }
   if (expired > 0 && notes.length === 0) notes.push(`the ${artifactName} artifact has expired`);
   if (notSuccess > 0) notes.push(`${notSuccess} run${notSuccess === 1 ? '' : 's'} did not have conclusion success (a red main does not refresh the baseline)`);
   return undefined;
@@ -422,7 +448,7 @@ export async function cleanRunSeen(gh: GateGithub, repo: RepoRef, ctx: VerifyCon
     if (r.malformed) s.incomplete = true;
     if (r.note !== undefined) notes.push(r.note);
     return undefined;
-  }, notes, st);
+  }, notes, st, MARKER_WINDOW);
   if (result !== undefined) return result;
   const why = notes.join('; ');
   return st.incomplete

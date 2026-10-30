@@ -7,7 +7,7 @@ import { describe, expect, it } from 'vitest';
 import { BASELINE_ARTIFACT, CLEAN_RUN_ARTIFACT } from '../src/engine/artifact-names.js';
 import {
   buildBaseline, buildCleanRunMarker, cleanRunSeen, inDefaultHistory, loadBaseline, saveBaseline, trustedRun, verifyBaselineArtifact, verifyCleanRunArtifact,
-  BASELINE_RETENTION_DAYS, HISTORY_CHECK_CAP, MAX_COUNT_ENTRIES, MAX_RUN_PAGES, MAX_TRUSTED_RUNS, WORKFLOW_PATH, type ArtifactMeta, type ArtifactUploader, type GateGithub, type RepoRef, type RunQuery, type VerifyContext,
+  BASELINE_RETENTION_DAYS, HISTORY_CHECK_CAP, MARKER_WINDOW, MAX_COUNT_ENTRIES, MAX_RUN_PAGES, MAX_TRUSTED_RUNS, WORKFLOW_PATH, type ArtifactMeta, type ArtifactUploader, type GateGithub, type RepoRef, type RunQuery, type VerifyContext,
 } from '../gate/src/baseline.js';
 import { countKeyOf } from '../gate/src/decide.js';
 import { keyId } from '../gate/src/fingerprint.js';
@@ -979,9 +979,10 @@ describe('fix round 1: minors', () => {
     expect(r.note).toMatch(/cap/);
     expect(gb.calls.filter((c) => c.startsWith('compare')).length).toBeLessThanOrEqual(HISTORY_CHECK_CAP);
     expect(HISTORY_CHECK_CAP).toBe(20);
+    // the marker search has its own window (fix round 2): a window filled only with history failures is an anomaly → unknown, within MARKER_WINDOW checks
     const gm = make();
     expect((await cleanRunSeen(gm, REPO, CTX)).state).toBe('unknown');
-    expect(gm.calls.filter((c) => c.startsWith('compare')).length).toBeLessThanOrEqual(HISTORY_CHECK_CAP);
+    expect(gm.calls.filter((c) => c.startsWith('compare')).length).toBeLessThanOrEqual(MARKER_WINDOW);
   });
   it('m5: with a tag named like the default branch the note says so', async () => {
     const gh = world([art(2, 200)], [run({ id: 200 })], [[2, goodDoc({ runId: 200 })]]); gh.tagAnswer = true;
@@ -1026,11 +1027,96 @@ describe('fix round 1: minors', () => {
 });
 
 describe('fix round 1: a run list cut at the page cap', () => {
-  it('a full last page means the list was cut: the marker lookup is unknown and the baseline note says so', async () => {
+  it('a full last page means the list was cut: the baseline note says so; the marker lookup is none (a page budget used up by normal runs, fix round 2)', async () => {
     const flood = Array.from({ length: MAX_RUN_PAGES * 100 + 50 }, (_, i) => run({ id: 90000 - i, event: 'pull_request', head_repository: { id: 8 } }));
     const gm = world([], flood, []);
-    expect((await cleanRunSeen(gm, REPO, CTX)).state).toBe('unknown');
+    expect((await cleanRunSeen(gm, REPO, CTX)).state).toBe('none');
     const gb = world([], flood, []);
     expect((await loadBaseline(gb, REPO, CTX)).note).toMatch(/cut after/);
+  });
+});
+
+describe('fix round 2 (R1-I1): a finished marker search finds none, not unknown', () => {
+  const cart = (id: number, runId: number) => art(id, runId, {}, CLEAN_RUN_ARTIFACT);
+  const markerOf = (runId: number, key = KEY): Record<string, unknown> => ({ runId, keyId: keyId(key), mac: markerMac(key, runId, keyId(key)) });
+  // n trusted green pushes with no marker, each with its own commit (so one can be made to fail)
+  const busy = (n: number): FakeGh => world([], Array.from({ length: n }, (_, i) => run({ id: 10_000 - i, head_sha: (1000 + i).toString(16).padStart(40, 'a') })), []);
+  const NOKEY: VerifyContext = { key: undefined, now: NOW };
+
+  it('BUSY probe: 5, 19, 20, 21, 25, 120 and 600 trusted runs with no marker give none (warn while the dates are in the future), with and without a key', async () => {
+    for (const n of [5, 19, 20, 21, 25, 120, 600]) {
+      for (const ctx of [CTX, NOKEY]) {
+        const gh = busy(n);
+        const r = await cleanRunSeen(gh, REPO, ctx);
+        expect(r.state, `${n} runs, key ${ctx.key !== undefined}`).toBe('none');
+        expect(resolveMode(undefined, '2099-01-01', NOW, r.state === 'unknown' ? 'unknown' : r.seen), `${n}`).toBe('warn');
+        expect(gh.calls.length, `${n} runs: ${gh.calls.length} calls`).toBeLessThanOrEqual(40);
+      }
+    }
+  });
+  it('the window is the newest MARKER_WINDOW trusted runs: a marker inside it is seen, one older than it is not looked for', async () => {
+    expect(MARKER_WINDOW).toBe(10);
+    const runs = Array.from({ length: 30 }, (_, i) => run({ id: 10_000 - i, head_sha: (1000 + i).toString(16).padStart(40, 'a') }));
+    const inside = world([cart(1, 10_000 - 9)], runs, [[1, markerOf(10_000 - 9)]]);
+    expect((await cleanRunSeen(inside, REPO, CTX)).state).toBe('seen');
+    const outside = world([cart(1, 10_000 - 10)], runs, [[1, markerOf(10_000 - 10)]]);
+    expect((await cleanRunSeen(outside, REPO, CTX)).state).toBe('none');
+    expect(outside.calls.filter((c) => c.startsWith('compare')).length).toBe(MARKER_WINDOW);
+  });
+  it('the tip and the tag are asked once per lookup, not once per run', async () => {
+    const gh = busy(25);
+    await cleanRunSeen(gh, REPO, CTX);
+    expect(gh.calls.filter((c) => c === 'tag main').length).toBe(1);
+    expect(gh.calls.filter((c) => c === 'branch main').length).toBe(1);
+    const gb = busy(5);
+    await loadBaseline(gb, REPO, CTX);
+    expect(gb.calls.filter((c) => c === 'tag main').length).toBe(1);
+    expect(gb.calls.filter((c) => c === 'branch main').length).toBe(1);
+  });
+  it('unknown stays for real uncertainty: an API error, a malformed answer, a history error among the runs, a tag, and a window filled with history failures', async () => {
+    const e = new Error('429 rate limited');
+    const cases: [string, FakeGh][] = [];
+    const a = busy(25); a.runsAnswer = e; cases.push(['run list error', a]);
+    const b = busy(25); b.runsAnswer = { workflow_runs: 'x' }; cases.push(['malformed run list', b]);
+    const c = busy(25); c.runArtifacts.set(10_000, e); cases.push(['artifact list error', c]);
+    const d = busy(25); d.compares.set((1003).toString(16).padStart(40, 'a'), e); cases.push(['history error on one run', d]);
+    const f = busy(25); f.tagAnswer = true; cases.push(['tag named like the branch', f]);
+    const g = busy(25); f.tagAnswer = true; g.tagAnswer = e; cases.push(['tag lookup error', g]);
+    const h = busy(25); h.branchAnswer = e; cases.push(['tip lookup error', h]);
+    const i = busy(25); i.fallbackCompare = { status: 'diverged' }; cases.push(['every run fails the history check', i]);
+    const j = busy(25); for (let k = 0; k < 25; k++) j.compares.set((1000 + k).toString(16).padStart(40, 'a'), { status: 'behind' }); cases.push(['all behind', j]);
+    for (const [why, gh] of cases) {
+      const r = await cleanRunSeen(gh, REPO, CTX);
+      expect(r.state, why).toBe('unknown');
+      expect(resolveMode(undefined, '2099-01-01', NOW, 'unknown'), why).toBe('block');
+    }
+  });
+  it('a few runs that fail the history check do not make the search unknown while trusted runs were also seen', async () => {
+    const gh = busy(25);
+    for (let k = 0; k < 3; k++) gh.compares.set((1000 + k).toString(16).padStart(40, 'a'), { status: 'diverged' });
+    expect((await cleanRunSeen(gh, REPO, CTX)).state).toBe('none');
+  });
+  it('a malformed or errored marker file among the window is still unknown; a wrong-MAC marker is ignored (none)', async () => {
+    const mk = (blob: unknown): FakeGh => { const g = world([cart(1, 10_000)], Array.from({ length: 12 }, (_, i) => run({ id: 10_000 - i, head_sha: (1000 + i).toString(16).padStart(40, 'a') })), []); g.blobs.set(1, blob as Answer); return g; };
+    expect((await cleanRunSeen(mk(bytesOf('{')), REPO, CTX)).state).toBe('unknown');
+    expect((await cleanRunSeen(mk(new Error('500')), REPO, CTX)).state).toBe('unknown');
+    expect((await cleanRunSeen(mk(bytesOf({ ...markerOf(10_000), mac: '0'.repeat(64) })), REPO, CTX)).state).toBe('none');
+  });
+  it('worst case: 10 trusted runs each with a marker file that is ignored → at most 33 calls (and never more than 40)', async () => {
+    const runs = Array.from({ length: 10 }, (_, i) => run({ id: 10_000 - i, head_sha: (1000 + i).toString(16).padStart(40, 'a') }));
+    const arts = runs.map((r, i) => cart(i + 1, r.id as number));
+    const gh = world(arts, runs, runs.map((r, i) => [i + 1, { ...markerOf(r.id as number), mac: '0'.repeat(64) }] as [number, unknown]));
+    const r = await cleanRunSeen(gh, REPO, CTX);
+    expect(r.state).toBe('none');
+    expect(gh.calls.length).toBe(33);   // 1 list + tag + tip + 10 x (compare + artifact list + download)
+  });
+  it('baseline: a finished search with no baseline is null (base-scan), not an error, however many runs there are; only its caps apply', async () => {
+    for (const n of [5, 21, 600]) {
+      const gh = busy(n);
+      const r = await loadBaseline(gh, REPO, CTX);
+      expect(r.baseline, String(n)).toBeNull();
+      expect(r.note, String(n)).toMatch(/the base scan decides/);
+      expect(gh.calls.filter((c) => c.startsWith('compare')).length, String(n)).toBeLessThanOrEqual(HISTORY_CHECK_CAP);
+    }
   });
 });
