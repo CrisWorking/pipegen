@@ -358,6 +358,15 @@ describe('C3 fix round 1: baseline-check row and recorded-date checks', () => {
     expect(has(r, 'permissions', /checkout/), show(r)).toBe(true);
     expect(show(await run([workflow({ ...j, 'baseline-check': job([bc], { permissions: perm }) })], d))).toBe('');
   });
+  it('C7 fix round 1: the job nightly holds PIPEGEN_FP_KEY too, so its row allows no checkout either', async () => {
+    const j = jobs();
+    const co = prelude()[0] as RenderedStep;
+    const nightlyStep: RenderedStep = { ...renderBaselineCheckStep(GATE), with: { mode: 'nightly', [GH_IN]: sref('GITHUB_TOKEN'), [FP_IN]: sref('PIPEGEN_FP_KEY'), 'block-from': '${{ vars.PIPEGEN_BLOCK_FROM }}' } };
+    const perm = { contents: 'read', actions: 'read', issues: 'write' };
+    const withCheckout = await run([workflow({ ...j, nightly: job([co, nightlyStep], { permissions: perm }) })], d);
+    expect(has(withCheckout, 'permissions', /checkout/), show(withCheckout)).toBe(true);
+    expect(has(await run([workflow({ ...j, nightly: job([nightlyStep], { permissions: perm }) })], d), 'permissions', /checkout/)).toBe(false);
+  });
   it('m2: block-from-recorded must be a real calendar date (no 2026-02-30, 2026-04-31, 0000-01-01) in the renderer row and so in the referee', () => {
     const base: Record<string, string> = { mode: 'nightly', [GH_IN]: sref('GITHUB_TOKEN'), 'block-from': '${{ vars.PIPEGEN_BLOCK_FROM }}' };
     expect(rendererInputProblems('crisworking/pipegen/gate', { ...base, 'block-from-recorded': '2028-02-29' }, { ...base, 'block-from-recorded': '2028-02-29' })).toEqual([]);

@@ -137,7 +137,8 @@ export const JOB_STEP_POLICY: Readonly<Record<string, readonly StepKind[]>> = Ob
   'baseline-check': ['harden', 'download-artifact', 'gate'],
   'image-publish': ['harden', 'checkout', 'setup-buildx', 'docker-login', 'build-push'],
   sign: ['harden', 'checkout', 'download-artifact', 'docker-login', 'attest'],
-  nightly: ['harden', 'checkout', 'download-artifact', 'gate'],
+  // no checkout: the nightly job holds PIPEGEN_FP_KEY (it verifies the baseline) and reads only the API; the identity comes from GITHUB_REPOSITORY (C7 fix round 1)
+  nightly: ['harden', 'download-artifact', 'gate'],
   watch: ['harden', 'checkout', 'watcher'],
   notify: ['harden', 'download-artifact'],
   'merged-red': ['harden', 'download-artifact'],
