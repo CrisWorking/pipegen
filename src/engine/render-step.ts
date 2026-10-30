@@ -251,7 +251,9 @@ function actionStep(tool: ReviewedTool, name: string, choices: Readonly<Record<s
       withs[key] = value;
     }
   }
-  return { name, uses, usesComment: tool.candidate.version, ...(Object.keys(withs).length === 0 ? {} : { with: withs }) };
+  // pipegen's own gate is tagged gate-v<version> (the cooldown ties the pin to that tag), so that is what the comment names (review-C6-r1 m6)
+  const comment = path.toLowerCase() === PIPEGEN_GATE_USES ? `gate-v${tool.candidate.version}` : tool.candidate.version;
+  return { name, uses, usesComment: comment, ...(Object.keys(withs).length === 0 ? {} : { with: withs }) };
 }
 
 function platformEntry(platform: PlatformActions, key: keyof PlatformActions): ReviewedTool {

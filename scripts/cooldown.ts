@@ -513,8 +513,10 @@ function youngest(dates: unknown[], what: string): Outcome {
  * What a tag of `r` (an encoded repo path) points to, following annotated tags (at most 3 hops). taggerDate is the
  * youngest tagger date seen, or 'none' for a lightweight tag.
  */
-async function tagTarget(ctx: Ctx, r: string, t: string): Promise<{ obj: Obj; taggerDate: unknown }> {
+async function tagTarget(ctx: Ctx, r: string, t: string, exactRef = false): Promise<{ obj: Obj; taggerDate: unknown }> {
   let ref = await ctx.get(`https://api.github.com/repos/${r}/git/ref/tags/${t}`, ctx.gh);
+  // review-C6-r1 m5: the singular endpoint is exact, but one line pins it: the answer must be for the tag asked for
+  if (exactRef && !(isObj(ref) && ref.ref === `refs/tags/${t}`)) return { obj: {}, taggerDate: 'none' };
   let obj = isObj(ref) && isObj(ref.object) ? ref.object : {};
   let taggerDate: unknown = 'none';
   for (let hops = 0; obj.type === 'tag' && hops < 3; hops++) {
@@ -564,7 +566,7 @@ async function ownGateOutcome(ctx: Ctx, repo: string, version: string, sha: stri
   return guard(async () => {
     const r = repoPath(repo);
     if (!r) return fail('repo is not a plain name');
-    const { obj } = await tagTarget(ctx, r, `gate-v${version}`);
+    const { obj } = await tagTarget(ctx, r, `gate-v${version}`, true);
     if (obj.type !== 'commit' || obj.sha !== sha) return fail(`the pinned sha is not the commit of the tag gate-v${version}`);
     if (release) {
       const off = await onDefaultBranch(ctx, repo, sha);

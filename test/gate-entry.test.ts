@@ -103,7 +103,7 @@ describe('C6 fix round 1: the cooldown skips the AGE rule for pipegen\'s own rep
     const r = await runCooldown({ base: {}, head: { 'data/reviewed-tools.yml': head }, fetch: f, now: NOW, maxLookups: 100, ...(release ? { release: true } : {}) });
     return { ok: r.ok, calls, problems: r.findings.map((x) => x.problem).join('\n') };
   };
-  const tagRoute = (sha: string = PIN, type = 'commit'): Record<string, unknown> => ({ [`${API}/git/ref/tags/${TAG}`]: { object: { type, sha } } });
+  const tagRoute = (sha: string = PIN, type = 'commit'): Record<string, unknown> => ({ [`${API}/git/ref/tags/${TAG}`]: { ref: `refs/tags/${TAG}`, object: { type, sha } } });
   const onMain = (sha: string = PIN, over: Record<string, unknown> = {}): Record<string, unknown> => ({
     [API]: { default_branch: 'main' },
     [`${API}/compare/${sha}...main?per_page=1`]: { status: 'ahead', behind_by: 0, merge_base_commit: { sha }, ...over },
@@ -132,7 +132,7 @@ describe('C6 fix round 1: the cooldown skips the AGE rule for pipegen\'s own rep
     expect((await run(impostor, {})).ok).toBe(false);
     expect((await run(impostor, tagRoute())).problems).toMatch(/not the commit of the tag gate-v0\.2\.0/);
     expect((await run(onlyGate(), tagRoute('a'.repeat(40)))).ok).toBe(false);
-    expect((await run(onlyGate(), { [`${API}/git/ref/tags/${TAG}`]: { object: { type: 'tree', sha: PIN } } })).ok).toBe(false);
+    expect((await run(onlyGate(), { [`${API}/git/ref/tags/${TAG}`]: { ref: `refs/tags/${TAG}`, object: { type: 'tree', sha: PIN } } })).ok).toBe(false);
     expect((await run(onlyGate(), {})).ok).toBe(false);
   });
   it('a version that is not a bare semver fails without a lookup (no tag name built from junk)', async () => {
