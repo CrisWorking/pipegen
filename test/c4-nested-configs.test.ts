@@ -13,7 +13,7 @@ import { ctxFor, entry, platform, reviewedList, service, specFor } from './helpe
 
 const file = (filename: string): PrFile => ({ filename, status: 'modified', changes: 2, patch: '@@ -1 +1 @@\n-a\n+b' });
 const pr = (files: PrFile[]) => ({ number: 1, headSha: 'a'.repeat(40), baseSha: 'b'.repeat(40), isFork: false, files, filesComplete: true, approvals: [], approvalsComplete: true, problems: [] });
-const protectedNow = (path: string): boolean => integrityFindings(pr([file(path)]), effectiveProtectedPaths(reviewedList()), []).some((f) => f.ruleId === 'integrity:protected-path');
+const protectedNow = (path: string): boolean => integrityFindings(pr([file(path)]), effectiveProtectedPaths(reviewedList(), []), []).some((f) => f.ruleId === 'integrity:protected-path');
 
 describe('the real reviewed list protects tool configs at any depth', () => {
   it('tests/fixtures/.bandit and services/api/mypy.ini are protected (the review-C4 probes)', () => {
@@ -103,7 +103,7 @@ describe('configFiles are nested (any depth) or root (the root and the service r
     expect(p).not.toContain('/./ruff.toml');
     expect(p).not.toContain('ruff.toml');
     expect(new Set(p).size).toBe(p.length);
-    expect(effectiveProtectedPaths([])).toEqual(PROTECTED_PATHS_BASE);
+    expect(effectiveProtectedPaths([], [])).toEqual(PROTECTED_PATHS_BASE);
   });
   it('nested names (bandit, mypy, prettier configs, biome, c8, knip, vitest, coverage) are protected at any depth', () => {
     for (const f of ['a/b/.bandit', 'a/mypy.ini', 'a/b/.prettierrc.json', 'a/biome.json', 'a/.c8rc.json', 'a/knip.json', 'a/vitest.config.ts', 'a/.coveragerc', 'a/.oxlintrc.json']) expect(protectedWith(f), f).toBe(true);

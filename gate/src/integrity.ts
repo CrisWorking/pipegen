@@ -74,6 +74,23 @@ const BINARY_EXT = new Set([
 const baseName = (path: string): string => path.slice(path.lastIndexOf('/') + 1);
 const isLockfile = (path: string): boolean => LOCKFILES.has(baseName(path).toLowerCase());
 const isBinary = (path: string): boolean => { const n = baseName(path).toLowerCase(); const i = n.lastIndexOf('.'); return i > 0 && BINARY_EXT.has(n.slice(i + 1)); };
+/**
+ * Extensions the scanners pick files by (semgrep's languages, oxlint's file list, ruff, bandit, the IaC and workflow scanners). A file whose
+ * extension is one of these in another letter case (`B.JS`, `c.Py`) is skipped by them (semgrep 1.181.0 and oxlint 1.89.0, checked live
+ * in review-C4-r2), while a runtime may still load it (Node's `require('./B.JS')` runs it as JavaScript): C5a CF2.
+ */
+const SCANNED_EXTENSIONS: ReadonlySet<string> = new Set([
+  'js', 'mjs', 'cjs', 'jsx', 'ts', 'mts', 'cts', 'tsx', 'vue', 'svelte', 'astro', 'py', 'pyi', 'pyw', 'go', 'java', 'kt', 'kts', 'scala', 'rb', 'php', 'cs', 'swift', 'rs',
+  'c', 'h', 'cc', 'cpp', 'cxx', 'hpp', 'm', 'sh', 'bash', 'ex', 'exs', 'lua', 'dart', 'tf', 'hcl', 'yaml', 'yml', 'json', 'html', 'erb', 'sol',
+]);
+/** The extension of a path when it is a scanned one in another letter case (`JS` for `.js`), else undefined. */
+function caseVariantExtension(path: string): string | undefined {
+  const n = baseName(path);
+  const i = n.lastIndexOf('.');
+  if (i <= 0) return undefined;
+  const ext = n.slice(i + 1);
+  return ext !== ext.toLowerCase() && SCANNED_EXTENSIONS.has(ext.toLowerCase()) ? ext : undefined;
+}
 /** `.gitleaksignore`, `.semgrepignore`, `.trivyignore`, `.trivyignore.yaml`, `.prettierignore`: any ADDED line is a suppression. */
 const IGNORE_FILE_RE = /^\.[^/]*ignore[^/]*$/i;
 
@@ -212,9 +229,10 @@ const REVIEW_STATES_IGNORED = new Set(['COMMENTED', 'PENDING']);
  * GET the pull, all its files and all its reviews. Fail closed on everything: the file list is complete only when it has exactly
  * `changed_files` entries and is below the 3,000 cap; approvals are the logins whose latest review that is neither COMMENTED nor
  * PENDING is APPROVED on exactly the head commit (DISMISSED, CHANGES_REQUESTED and any unknown state revoke), and an incomplete review
- * list gives none. `expectHeadSha` (the commit the event is about): when the pull's head has moved, nothing is approved.
+ * list gives none. `expectHeadSha` (the commit the event is about): when the pull's head has moved, nothing is approved. `codeowners` (the
+ * base commit's rules, loaded first) is required: only a login it names as a user is an approver candidate (C4 r1, C5a CF3).
  */
-export async function readPrContext(gh: GateGithub, repo: RepoId, prNumber: number, opts: { expectHeadSha?: string; codeowners?: readonly CodeownersRule[] } = {}): Promise<PrContext> {
+export async function readPrContext(gh: GateGithub, repo: RepoId, prNumber: number, opts: { expectHeadSha?: string; codeowners: readonly CodeownersRule[] }): Promise<PrContext> {
   const pr: PrContext = { number: prNumber, headSha: '', baseSha: '', isFork: true, files: [], filesComplete: false, approvals: [], approvalsComplete: false, problems: [] };
   let pull: unknown;
   try { pull = await gh.getPull(repo.owner, repo.name, prNumber); } catch { pr.problems.push('the pull request could not be read'); return pr; }
@@ -280,10 +298,11 @@ export async function readPrContext(gh: GateGithub, repo: RepoId, prNumber: numb
   }
   // Owners first: only a login that CODEOWNERS names as a user gets a permission check (so throwaway approvers cost nothing and cannot
   // crowd the real owner out), then the cap, then the permission itself.
-  const ownerLogins = opts.codeowners === undefined ? undefined : new Set(opts.codeowners.flatMap((r) => r.owners));
+  // required (C5a CF3): without the owner filter the approver flood is back; a list missing at run time counts as no owner at all
+  const ownerLogins = new Set((Array.isArray(opts.codeowners) ? opts.codeowners : []).flatMap((r) => r.owners));
   const authorLogin = typeof author === 'string' ? author.toLowerCase() : '';
   const candidates = [...latest]
-    .filter(([login, r]) => r.state === 'APPROVED' && r.commit === headSha && login !== authorLogin && (ownerLogins === undefined || ownerLogins.has(login)))
+    .filter(([login, r]) => r.state === 'APPROVED' && r.commit === headSha && login !== authorLogin && ownerLogins.has(login))
     .map(([login]) => login).sort();
   if (candidates.length > MAX_APPROVERS) pr.problems.push(`more than ${MAX_APPROVERS} code-owner approvers; only the first ${MAX_APPROVERS} were checked`);
   // an approval counts only from a user with write, maintain or admin permission (GitHub's own rule for code owners); any error means no
@@ -482,7 +501,7 @@ export async function loadCodeowners(gh: GateGithub, repo: RepoId, baseSha: stri
 
 /** A non-finite TOML number (nan, inf, -inf). A class, so no document can produce one by spelling a key or a table. */
 export class NonFinite { constructor(readonly kind: 'nan' | 'inf' | '-inf') {} }
-/** A TOML integer beyond the safe range, by its digits. */
+/** A TOML integer, by its digits (C5a CF4: always this class, so `1` and `1.0` stay different values, and a 64-bit integer is read exactly). */
 export class BigInteger { constructor(readonly digits: string) {} }
 
 const isTable = (v: unknown): v is Record<string, unknown> =>
@@ -491,7 +510,7 @@ const isTable = (v: unknown): v is Record<string, unknown> =>
 /** A document as plain data: non-finite numbers and big integers become typed tags, never a string or an object a document could write. */
 function norm(v: unknown): unknown {
   if (typeof v === 'number') return Number.isFinite(v) ? v : new NonFinite(Number.isNaN(v) ? 'nan' : v > 0 ? 'inf' : '-inf');
-  if (typeof v === 'bigint') return Number.isSafeInteger(Number(v)) ? Number(v) : new BigInteger(String(v));
+  if (typeof v === 'bigint') return new BigInteger(String(v));
   if (Array.isArray(v)) return v.map(norm);
   if (isTable(v)) return Object.fromEntries(Object.keys(v).sort().map((k) => [k, norm(v[k])]));
   return v;
@@ -513,7 +532,7 @@ function canon(v: unknown): string {
 /**
  * Python configparser (`RawConfigParser`, strict), ported: a header is `^\[(.+)\]` (greedy) on the stripped line and the rest of the line
  * is ignored; an indented line after an option continues it; `#` and `;` lines are comments (not inline ones); blank lines inside a value
- * are kept; `[DEFAULT]` is merged into every section; keys are lower-cased; a duplicate section or option, an option before a header, a
+ * are kept; `[DEFAULT]` is merged into every section; keys are lower-cased; values are kept as written (`""` is two characters); a duplicate section or option, an option before a header, a
  * line without `=` or `:` and an empty key are errors (undefined).
  */
 /**
@@ -558,7 +577,7 @@ function parseIni(text: string): Record<string, Record<string, string>> | undefi
     if (seen.has(id)) return undefined;
     seen.add(id);
     const first = (o[2] as string).trim();
-    cur.set(key, [first === '""' ? '' : first]);
+    cur.set(key, [first]);   // `k = ""` keeps its two quote characters, as Python's RawConfigParser does (C5a CF4)
     opt = key;
   }
   const done = (lines: string[]): string => lines.join('\n').trimEnd();
@@ -577,7 +596,7 @@ export function parseConfigDoc(path: string, text: string): Record<string, unkno
   const lower = path.toLowerCase();
   try {
     if (lower.endsWith('.json')) { const v: unknown = JSON.parse(text); return isTable(v) ? (norm(v) as Record<string, unknown>) : undefined; }
-    if (lower.endsWith('.toml')) return norm(parseToml(text)) as Record<string, unknown>;
+    if (lower.endsWith('.toml')) return norm(parseToml(text, { integersAsBigInt: true })) as Record<string, unknown>;   // integers typed apart from floats (CF4)
     if (lower.endsWith('.cfg') || lower.endsWith('.ini')) return parseIni(text);
   } catch { return undefined; }
   return undefined;
@@ -700,7 +719,8 @@ const fp = (...parts: string[]): string => createHash('sha256').update(parts.joi
  * Pipeline-integrity findings of a pull request. Critical `integrity:incomplete-list` (no approval waives it), critical
  * `integrity:protected-path` (a changed file or rename source that matches `protectedPaths` case-insensitively, or a changed section of a
  * shared file), critical `integrity:no-patch` (a text file with changes and no readable patch; lockfiles and known binary types are
- * exempt), high `integrity:suppression` (an added suppression marker, or any added line in a declared ignore file). All but the first are
+ * exempt), high `integrity:suppression` (an added suppression marker, or any added line in a declared ignore file), high
+ * `integrity:case-extension` (a new file name whose extension is a scanned one in another letter case, C5a CF2). All but the first are
  * waived by an approval, on the head commit, of a code owner (a user) of the path (last matching CODEOWNERS rule of the base commit).
  */
 export function integrityFindings(
@@ -738,6 +758,10 @@ export function integrityFindings(
   for (const f of pr.files) {
     for (const path of f.previous_filename === undefined || f.status === 'copied' ? [f.filename] : [f.filename, f.previous_filename]) {
       if (isProtected(path) && !waived(path)) push('integrity:protected-path', 'critical', path, `This file is part of the pipeline (a workflow, a tool config or an ignore file).${how(path)}`, 'path');
+    }
+    // a new name (added, renamed, copied) with a scanned extension in another letter case: the scanners skip it (CF2)
+    if ((f.status === 'added' || f.status === 'renamed' || f.status === 'copied') && caseVariantExtension(f.filename) !== undefined && !waived(f.filename)) {
+      push('integrity:case-extension', 'high', f.filename, `This new file name has a scanned language's extension written in another letter case, so the scanners skip the file while a runtime may still load it. Rename it to the lower-case extension.${how(f.filename)}`, 'case-extension');
     }
     const hasPatch = typeof f.patch === 'string' && f.patch !== '';
     const parsed = hasPatch ? parsePatch(f.patch as string) : undefined;

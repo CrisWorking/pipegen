@@ -481,13 +481,15 @@ tools:
     fixedInputs:
       args: ["--disable-telemetry", "--skip-version-check", "--skip-check-update", "--format", "sarif", "--exit-code", "10"]
       config:
-        content: "# pipegen's pinned trivy config: no cache kept between runs\ncache:\n  backend: memory\n"
+        content: "# pipegen's pinned trivy config: no cache kept between runs, and no repository trivy-secret.yaml (an empty path loads none)\ncache:\n  backend: memory\nsecret:\n  config: \"\"\n"
         passAs: { flag: "--config" }
     choices:
       severity: ["CRITICAL", "HIGH,CRITICAL", "MEDIUM,HIGH,CRITICAL"]
     # Config scope: root. trivy runs with its pinned --config (it never loads the repo's trivy.yaml), and reads .trivyignore / .trivyignore.yaml from the working folder only (--ignorefile defaults to ./.trivyignore).
+    # trivy-secret.yaml (C5a CF1): the pinned config sets secret.config to "", so trivy loads none (checked live on 0.76.0: without it, a
+    #   trivy-secret.yaml in the working folder with disable-rules silenced a secret finding); the name stays protected as a belt.
     configFiles: []
-    rootConfigFiles: ["trivy.yaml", ".trivyignore", ".trivyignore.yaml"]
+    rootConfigFiles: ["trivy.yaml", ".trivyignore", ".trivyignore.yaml", "trivy-secret.yaml"]
     reviewedBy: Claude delegated DECISIONS 105
     reviewedAt: "2026-10-30"
     proofs: 0
@@ -529,14 +531,16 @@ tools:
     fixedInputs:
       args: ["--disable-telemetry", "--skip-version-check", "--skip-check-update", "--format", "sarif", "--exit-code", "10"]
       config:
-        content: "# pipegen's pinned trivy config: no cache kept between runs\ncache:\n  backend: memory\n"
+        content: "# pipegen's pinned trivy config: no cache kept between runs, and no repository trivy-secret.yaml (an empty path loads none)\ncache:\n  backend: memory\nsecret:\n  config: \"\"\n"
         passAs: { flag: "--config" }
     choices:
       severity: ["CRITICAL", "HIGH,CRITICAL", "MEDIUM,HIGH,CRITICAL"]
       ignore-unfixed: ["false", "true"]
     # Config scope: root. trivy runs with its pinned --config (it never loads the repo's trivy.yaml), and reads .trivyignore / .trivyignore.yaml from the working folder only (--ignorefile defaults to ./.trivyignore).
+    # trivy-secret.yaml (C5a CF1): the pinned config sets secret.config to "", so trivy loads none (checked live on 0.76.0: without it, a
+    #   trivy-secret.yaml in the working folder with disable-rules silenced a secret finding); the name stays protected as a belt.
     configFiles: []
-    rootConfigFiles: ["trivy.yaml", ".trivyignore", ".trivyignore.yaml"]
+    rootConfigFiles: ["trivy.yaml", ".trivyignore", ".trivyignore.yaml", "trivy-secret.yaml"]
     reviewedBy: Claude delegated DECISIONS 105
     reviewedAt: "2026-10-30"
     proofs: 0
@@ -1235,12 +1239,14 @@ tools:
     fixedInputs:
       args: ["--disable-telemetry", "--skip-version-check", "--skip-check-update", "--scanners", "license", "--severity", "HIGH,CRITICAL", "--format", "sarif", "--output", "trivy-licence.sarif", "--exit-code", "10"]
       config:
-        content: "# pipegen's pinned trivy config: no cache kept between runs\ncache:\n  backend: memory\n"
+        content: "# pipegen's pinned trivy config: no cache kept between runs, and no repository trivy-secret.yaml (an empty path loads none)\ncache:\n  backend: memory\nsecret:\n  config: \"\"\n"
         passAs: { flag: "--config" }
     choices: {}
     # Config scope: root. trivy runs with its pinned --config (it never loads the repo's trivy.yaml), and reads .trivyignore / .trivyignore.yaml from the working folder only (--ignorefile defaults to ./.trivyignore).
+    # trivy-secret.yaml (C5a CF1): the pinned config sets secret.config to "", so trivy loads none (checked live on 0.76.0: without it, a
+    #   trivy-secret.yaml in the working folder with disable-rules silenced a secret finding); the name stays protected as a belt.
     configFiles: []
-    rootConfigFiles: ["trivy.yaml", ".trivyignore", ".trivyignore.yaml"]
+    rootConfigFiles: ["trivy.yaml", ".trivyignore", ".trivyignore.yaml", "trivy-secret.yaml"]
     reviewedBy: Claude delegated DECISIONS 105
     reviewedAt: "2026-10-30"
     proofs: 0

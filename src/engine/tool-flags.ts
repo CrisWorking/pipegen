@@ -193,13 +193,16 @@ export interface ArgvPolicy extends CommandPolicy {
   readonly findingsExit?: readonly number[];
 }
 
+/** The text of trivy's pinned config file, in the reviewed entries and in their policies alike. */
+export const TRIVY_PINNED_CONFIG = "# pipegen's pinned trivy config: no cache kept between runs, and no repository trivy-secret.yaml (an empty path loads none)\ncache:\n  backend: memory\nsecret:\n  config: \"\"\n";
 // the dedicated tools (trivy, betterleaks, nuclei) have their own full-grammar rules in reviewed.ts; only the pinned config is listed here, for the renderer
 const DEDICATED = (exe: string, pkg: string, config?: ArgvPolicy['config']): ArgvPolicy => ({ method: 'github-release', package: pkg, exe, dialect: 'long', sub: [], flags: {}, dedicated: true, ...(config === undefined ? {} : { config }) });
 /** The exit codes of a findings tool that mean "found something" (ArgvPolicy.findingsExit): 1 for most, none for a tool that exits 0 on findings. */
 const FOUND_1 = [1] as const;
 /** trivy, betterleaks and gitleaks are told `--exit-code 10`: their errors, and betterleaks' partial scan, exit 1, so 1 can not also mean a finding (C0a fix round 1). */
 const FOUND_10 = [10] as const;
-const TRIVY_CONFIG = { flag: '--config', content: "# pipegen's pinned trivy config: no cache kept between runs\ncache:\n  backend: memory\n", fileName: 'trivy.yaml' } as const;
+/** trivy's pinned config: no cache kept between runs, and no repo trivy-secret.yaml (an empty secret config path loads none: C5a CF1, checked live on 0.76.0). */
+const TRIVY_CONFIG = { flag: '--config', content: TRIVY_PINNED_CONFIG, fileName: 'trivy.yaml' } as const;
 /**
  * The pinned config of the secrets tools (C1c): the default rules (`[extend] useDefault`), plus pipegen's canary rule. The stage step ends
  * every staged file with a fresh `pipegen-canary-<32 hex>` line, and the scrub counts a staged file as scanned only when this rule reported

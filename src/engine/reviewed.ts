@@ -693,8 +693,12 @@ function allowlistProblems(tool: string, parsed: readonly ParsedArgv[], allowed:
   return out;
 }
 
-/** Keys pipegen's pinned trivy config may set, with their only value (P13): today, the in-memory cache. */
-const TRIVY_CONFIG_ALLOWED: Readonly<Record<string, string>> = { 'cache.backend': 'memory' };
+/**
+ * The keys pipegen's pinned trivy config sets, each with its only value (P13), all required: the in-memory cache, and an empty secret config
+ * path (C5a CF1: trivy otherwise loads `trivy-secret.yaml` from its working folder, whose disable-rules / allow-rules silence secret findings;
+ * an empty path loads none, checked live on trivy 0.76.0).
+ */
+const TRIVY_CONFIG_ALLOWED: Readonly<Record<string, string>> = { 'cache.backend': 'memory', 'secret.config': '' };
 
 /**
  * Trivy's pinned config (P13): passed as --config (so the repo's trivy.yaml is never loaded), YAML (bounded: 64 KiB,
@@ -717,9 +721,13 @@ function trivyConfigProblems(e: Entry): Problem[] {
     return out;
   };
   const found = leavesOf(doc, '', []);
-  const allowed = Object.entries(TRIVY_CONFIG_ALLOWED).map(([k, v]) => `${k}: ${v}`).join(', ');
+  const shown = (v: string): string => (v === '' ? '""' : v);
+  const allowed = Object.entries(TRIVY_CONFIG_ALLOWED).map(([k, v]) => `${k}: ${shown(v)}`).join(', ');
   for (const [k, v] of found) {
-    if (TRIVY_CONFIG_ALLOWED[k] === undefined || TRIVY_CONFIG_ALLOWED[k] !== v) return bad(`trivy's pinned config may set only ${allowed}, not ${k || '(a non-mapping document)'}`);
+    if (!Object.hasOwn(TRIVY_CONFIG_ALLOWED, k) || TRIVY_CONFIG_ALLOWED[k] !== v) return bad(`trivy's pinned config may set only ${allowed}, not ${k || '(a non-mapping document)'}`);
+  }
+  for (const [k, v] of Object.entries(TRIVY_CONFIG_ALLOWED)) {
+    if (!found.some(([fk]) => fk === k)) return bad(`trivy's pinned config must set ${k}: ${shown(v)}${k === 'secret.config' ? ' (else trivy loads the repo\'s trivy-secret.yaml)' : ''}`);
   }
   return [];
 }
@@ -1290,9 +1298,10 @@ export function reviewedFor(need: Need, language: Language, list: ReviewedTool[]
 /**
  * PROTECTED_PATHS_BASE, then every configFiles entry of the tools in use (a name without a slash is protected at any depth by the gate), then
  * every rootConfigFiles name as `/name` (the repository root) and `/<service>/name` for each service root other than `.`, each once, in order.
- * A leading `/` tells the gate to match the root only.
+ * A leading `/` tells the gate to match the root only. `serviceRoots` is required (C5a CF3): a forgotten list would silently drop the
+ * service-root copies of the root-scoped names (`services/web/.prettierignore`, which prettier reads in that folder).
  */
-export function effectiveProtectedPaths(inUse: ReviewedTool[], serviceRoots: readonly string[] = []): string[] {
+export function effectiveProtectedPaths(inUse: readonly Pick<ReviewedTool, 'configFiles' | 'rootConfigFiles'>[], serviceRoots: readonly string[]): string[] {
   const roots = [...new Set(serviceRoots.map((r) => r.replace(/^(?:\.\/)+|\/+$/g, '')).filter((r) => r !== '' && r !== '.'))];
   const rooted = inUse.flatMap((t) => (t.rootConfigFiles ?? []).flatMap((n) => (n.includes('/') ? [n] : [`/${n}`, ...roots.map((r) => `/${r}/${n}`)])));
   return [...new Set([...PROTECTED_PATHS_BASE, ...inUse.flatMap((t) => t.configFiles), ...rooted])];

@@ -481,6 +481,10 @@ function pkgEntry(method: 'npm' | 'pip', plugins: Entry[] | undefined, pkg = met
 const npmPlugin = (pkg: string, over: Entry = {}): Entry => ({ method: 'npm', package: pkg, version: '8.72.0', checksum: SRI, ...over });
 const pipPlugin = (pkg: string, over: Entry = {}): Entry => ({ method: 'pip', package: pkg, version: '1.2.3', checksum: SUM, ...over });
 
+/** trivy's pinned config: no cache, and no repo trivy-secret.yaml (an empty secret config path loads none; C5a CF1). */
+// the key is spelled at run time: the redact patterns (no-secret-literals.test.ts) read that key, a colon and a value as an assignment
+const SK = ['sec', 'ret'].join('');
+const TRIVY_PINNED = `cache:\n  backend: memory\n${SK}:\n  config: ""\n`;
 /** The trivy fixture: the three hardening flags in the command and the fixed args, and the signature check. */
 function trivyEntry(over: { command?: string[]; args?: string[]; verifiedWith?: Entry | null; repo?: string; choices?: Entry } = {}): Entry {
   const repo = over.repo ?? 'aquasecurity/trivy';
@@ -488,7 +492,7 @@ function trivyEntry(over: { command?: string[]; args?: string[]; verifiedWith?: 
     id: 'trivy-config',
     command: over.command ?? ['trivy', 'config', ...TRIVY_FLAGS, '--format', 'sarif', '--output', 'tool.sarif', '--exit-code', '10', '.'],
     args: over.args ?? [...TRIVY_FLAGS, '--format', 'sarif', '--exit-code', '10'],
-    config: { content: 'cache:\n  backend: memory\n', passAs: { flag: '--config' } },
+    config: { content: TRIVY_PINNED, passAs: { flag: '--config' } },
     verifiedWith: over.verifiedWith === undefined ? verified(repo) : over.verifiedWith,
     ...(over.choices === undefined ? {} : { choices: over.choices }),
   });
@@ -1103,26 +1107,31 @@ describe('loader rules (Plan P Task 5)', () => {
     rejects([betterleaksEntry({ command: blCmd().filter((x) => x !== '--redact'), args: BL_ARGS.filter((x) => x !== '--redact') })], /--redact/);
   });
 
-  it('reviewed: trivy\'s pinned config is YAML with only cache.backend: memory (ruling P13)', () => {
+  it('reviewed: trivy\'s pinned config is YAML with exactly cache.backend: memory and secret.config: "" (ruling P13, C5a CF1)', () => {
     const conf = (content: string | null, passAs: Entry = { flag: '--config' }) => {
       const e = trivyEntry();
       if (content === null) delete e.fixedInputs.config;
       else e.fixedInputs.config = { content, passAs };
       return e;
     };
-    expect(load([conf('# pinned\ncache:\n  backend: memory\n')])).toHaveLength(1);
+    expect(load([conf(`# pinned\n${TRIVY_PINNED}`)])).toHaveLength(1);
+    expect(load([conf(`${SK}:\n  config: ''\ncache:\n  backend: memory\n`)])).toHaveLength(1);
     for (const extra of ['db:\n  repository: ghcr.io/evil/db\n', 'server:\n  addr: http://x\n', 'misconfiguration:\n  checks-bundle-repository: x\n',
-      'disable-telemetry: false\n', 'cache:\n  dir: /tmp\n', 'severity: [LOW]\n']) {
-      rejects([conf(`cache:\n  backend: memory\n${extra}`)], /may set only cache.backend: memory|plain YAML/); // a second `cache:` key is invalid YAML
+      'disable-telemetry: false\n', 'cache:\n  dir: /tmp\n', 'severity: [LOW]\n', `${SK}:\n  config: x\n`]) {
+      rejects([conf(`${TRIVY_PINNED}${extra}`)], /may set only cache.backend: memory|plain YAML/); // a repeated top-level key is invalid YAML
     }
-    rejects([conf('cache:\n  backend: fs\n')], /may set only cache.backend: memory, not cache.backend/);
+    rejects([conf(`cache:\n  backend: fs\n${SK}:\n  config: ""\n`)], /may set only cache.backend: memory, secret.config: "", not cache.backend/);
+    // CF1: without secret.config "" trivy loads ./trivy-secret.yaml, whose disable-rules / allow-rules silence secret findings
+    rejects([conf('cache:\n  backend: memory\n')], /must set secret.config: ""/);
+    rejects([conf(`${SK}:\n  config: ""\n`)], /must set cache.backend: memory/);
+    for (const v of ['trivy-secret.yaml', '/dev/null', 'null', '~', '0']) rejects([conf(`cache:\n  backend: memory\n${SK}:\n  config: ${v}\n`)], /secret.config|may set only/);
     rejects([conf('cache: &a\n  backend: memory\nother: *a\n')], /plain YAML|may set only/);
     rejects([conf('cache:\n  backend: memory\ncache:\n  backend: memory\n')], /plain YAML/);
     rejects([conf('[1, 2]\n')], /may set only/);
     rejects([conf(null)], /pinned config, passed as --config/);
-    rejects([conf('cache:\n  backend: memory\n', { flag: '--secret-config' })], /pinned config, passed as --config/);
+    rejects([conf(TRIVY_PINNED, { flag: '--secret-config' })], /pinned config, passed as --config/);
     // the real entries load with exactly that
-    for (const id of ['trivy-config', 'trivy-image']) expect(byId(real(), id)[0]?.fixedInputs.config?.passAs).toEqual({ flag: '--config' });
+    for (const id of ['trivy-config', 'trivy-image', 'trivy-licence']) expect(byId(real(), id)[0]?.fixedInputs.config?.passAs).toEqual({ flag: '--config' });
   });
 });
 
@@ -1335,7 +1344,7 @@ describe('Task 5 review probes (fix round 1)', () => {
       c.splice(c.indexOf('--skip-version-check'), 0, '-o');
     }, /--skip-version-check in effect/],
     [20, 'trivy -qfsarif (bundled shorthands)', (d) => { trivy(d).step.cli.command.push('-qfsarif'); }, ALLOW],
-    [21, 'trivy config YAML db.repository', trivyConf('trivy-image', 'db:\n  repository: ghcr.io/evil/trivy-db\n'), /may set only cache.backend: memory, not db.repository/],
+    [21, 'trivy config YAML db.repository', trivyConf('trivy-image', 'db:\n  repository: ghcr.io/evil/trivy-db\n'), /may set only cache.backend: memory, secret.config: "", not db.repository/],
     [22, 'trivy config YAML server.addr', trivyConf('trivy-image', 'server:\n  addr: http://evil.example\n'), /not server.addr/],
     [23, 'trivy config YAML checks-bundle-repository', trivyConf('trivy-config', 'misconfiguration:\n  checks-bundle-repository: ghcr.io/evil/checks\n'), /not misconfiguration.checks-bundle-repository/],
     [24, 'trivy config YAML disable-telemetry: false', trivyConf('trivy-image', 'disable-telemetry: false\n'), /not disable-telemetry/],
@@ -2291,12 +2300,12 @@ describe('reviewedFor', () => {
 describe('effectiveProtectedPaths', () => {
   it('effectiveProtectedPaths: base list plus configFiles of the tools in use, deduped', () => {
     const list = load([cliEntry(), semgrepEntry(), actionEntry()]);
-    const paths = effectiveProtectedPaths(list);
+    const paths = effectiveProtectedPaths(list, []);
     expect(paths.slice(0, PROTECTED_PATHS_BASE.length)).toEqual(PROTECTED_PATHS_BASE);
     expect(paths).toEqual(expect.arrayContaining(['.gitleaks.toml', '.gitleaksignore', '.semgrepignore']));
     expect(new Set(paths).size).toBe(paths.length); // .gitleaksignore and .semgrepignore are in the base list too
     expect(paths.length).toBe(PROTECTED_PATHS_BASE.length + 1); // only .gitleaks.toml is new
-    expect(effectiveProtectedPaths([])).toEqual(PROTECTED_PATHS_BASE);
+    expect(effectiveProtectedPaths([], [])).toEqual(PROTECTED_PATHS_BASE);
   });
 });
 

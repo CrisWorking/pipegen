@@ -6,13 +6,13 @@
 import { describe, expect, it } from 'vitest';
 import type { GateGithub } from '../gate/src/baseline.js';
 import {
-  addedLinesOf, baseHasInstall, buildPrDiff, codeOwners, integrityFindings, loadCodeowners, ownersOf, parseConfigDoc, readConfigSections, readPrContext,
+  addedLinesOf, baseHasInstall, buildPrDiff, codeOwners, integrityFindings, loadCodeowners, ownersOf, parseConfigDoc, readConfigSections, readPrContext as readPrContextStrict,
   type CodeownersRule, type PrContext, type PrFile,
 } from '../gate/src/integrity.js';
 import { PROTECTED_PATHS_BASE } from '../src/types.js';
-import { NonFinite } from '../gate/src/integrity.js';
-/** Non-finite numbers are typed tags in the parsed document; the oracle writes them as {"$num": kind}. */
-const plain = (v: unknown): unknown => (v instanceof NonFinite ? { $num: v.kind } : Array.isArray(v) ? v.map(plain) : typeof v === 'object' && v !== null && !(v instanceof Date) ? Object.fromEntries(Object.entries(v).map(([k, x]) => [k, plain(x)])) : v);
+import { BigInteger, NonFinite } from '../gate/src/integrity.js';
+/** Non-finite numbers are typed tags in the parsed document; the oracle writes them as {"$num": kind}. TOML integers are BigInteger (C5a CF4); the oracle writes them as JSON numbers. */
+const plain = (v: unknown): unknown => (v instanceof NonFinite ? { $num: v.kind } : v instanceof BigInteger ? Number(v.digits) : Array.isArray(v) ? v.map(plain) : typeof v === 'object' && v !== null && !(v instanceof Date) ? Object.fromEntries(Object.entries(v).map(([k, x]) => [k, plain(x)])) : v);
 
 // ---------- builders ----------
 const SHA = (c: string): string => c.repeat(40);
@@ -205,6 +205,18 @@ describe('loadCodeowners: from the BASE commit, .github/ then root then docs/', 
 });
 
 // ---------- readPrContext: the pull, its files (paged), its reviews (paged) ----------
+
+/**
+ * C5a CF3: `codeowners` is required. Most tests here are about the reading itself, so they model "every reviewer is a code owner" (a
+ * CODEOWNERS rule `*` naming each login that reviewed); the owner filter has its own tests below, with explicit lists.
+ */
+const everyReviewer = (g: Gh): CodeownersRule[] => {
+  const list = Array.isArray(g.reviews) ? (g.reviews as unknown[]) : [];
+  const logins = list.flatMap((r) => { const l = (r as { user?: { login?: unknown } } | null)?.user?.login; return typeof l === 'string' ? [l.toLowerCase()] : []; });
+  return [{ pattern: '*', owners: [...new Set(logins)] }];
+};
+const readPrContext = (g: Gh, repo: typeof REPO, n: number, opts: { expectHeadSha?: string; codeowners?: readonly CodeownersRule[] } = {}): Promise<PrContext> =>
+  readPrContextStrict(g, repo, n, { ...opts, codeowners: opts.codeowners ?? everyReviewer(g) });
 
 const review = (id: number, login: string, state: string, commit = HEAD): Record<string, unknown> => ({ id, user: { login }, state, commit_id: commit });
 const many = (n: number, mk: (i: number) => unknown): unknown[] => Array.from({ length: n }, (_, i) => mk(i));
@@ -1038,7 +1050,7 @@ describe('fix round 2 (4, 6): approver flood and the permission note', () => {
     expect(pr.approvals.length).toBe(30);
     expect(pr.problems.join(' ')).toMatch(/approvers/);
   });
-  it('without a CODEOWNERS list nothing is filtered (the old behaviour); an owner list with no owner names means no approver and no call', async () => {
+  it('a CODEOWNERS list naming the reviewer lets it through; an owner list with no owner names means no approver and no call', async () => {
     const g = ghWith([]); g.reviews = [review(1, 'a', 'APPROVED')];
     expect((await readPrContext(g, REPO, 5)).approvals).toEqual(['a']);
     const h = ghWith([]); h.reviews = [review(1, 'a', 'APPROVED')];

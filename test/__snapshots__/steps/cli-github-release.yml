@@ -90,8 +90,12 @@
     BASH_ENV: ""
     ENV: ""
     PIPEGEN_ARG_0: HIGH,CRITICAL
-    PIPEGEN_CONFIG: "# pipegen's pinned trivy config: no cache kept between runs
+    PIPEGEN_CONFIG: "# pipegen's pinned trivy config: no cache kept between runs, and no repository trivy-secret.yaml (an empty path loads none)
 
       cache:
 
-      \  backend: memory\n"
+      \  backend: memory
+
+      secret:
+
+      \  config: \"\"\n"
