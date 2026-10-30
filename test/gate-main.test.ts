@@ -402,7 +402,7 @@ describe('mode gate: the baseline and the clean-run marker on a trusted green pu
     const r = runner(w.inputs, { event: w.event, sha: w.sha, payload: w.payload });
     mkdirSync(join(r.temp, 'pipegen-gate', 'result.json'), { recursive: true });
     const x = await go(w.inputs, { w, r });
-    expect(x.code).toBe(1);
+    expect(x.code).toBe(2); // C6 part 0: an entry left at result.json is stale
     expect(x.outputs.result).toBe('block');
     expect(x.summary).toMatch(/result file could not be written/);
   });

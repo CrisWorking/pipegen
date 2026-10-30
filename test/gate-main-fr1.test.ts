@@ -1,6 +1,6 @@
 // C5b fix round 1 (review-C5b.md, rulings in task-C5b-fix-round-1.md): the entry always runs, and every guard the brief names has a test
 // that fails without it. The reviewer's probes (tmp-C5b-review/copy/test/probe-c5b.test.ts, P1-P15) are regression tests here. Written first.
-import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { parse } from 'yaml';
@@ -168,15 +168,14 @@ describe('fix round 1: baseline-check fails toward missing', () => {
 });
 
 describe('fix round 1: no-link, no-overwrite reads and writes', () => {
-  it('a planted result.json (a regular file) is never overwritten: the gate blocks and the planted file stays', async () => {
+  it('a planted result.json (a regular file) is removed first (C6 c2): the real result replaces it, the planted pass never ships', async () => {
     const w = pushWorld(CLEAN());
     const r = runner(w.inputs, { event: w.event, sha: w.sha, payload: w.payload });
     mkdirSync(join(r.temp, 'pipegen-gate'));
     writeFileSync(gateFile(r, 'result.json'), '{"result":"pass","planted":true}');
     const x = await go(w.inputs, { w, r });
-    expect(x.code).toBe(1);
-    expect(x.outputs.result).toBe('block');
-    expect(readFileSync(gateFile(r, 'result.json'), 'utf8')).toBe('{"result":"pass","planted":true}');
+    expect(x.outputs.result).toBe(readJson(gateFile(r, 'result.json')).result);
+    expect(readFileSync(gateFile(r, 'result.json'), 'utf8')).not.toContain('planted');
   });
   it('a planted baseline.json or marker.json is never overwritten (a warning, the planted file stays)', async () => {
     const w = pushWorld(CLEAN());
@@ -377,7 +376,7 @@ describe('fix round 2: no stale result survives a late failure', () => {
     const r = runner(w.inputs, { event: w.event, sha: w.sha, payload: w.payload });
     mkdirSync(join(r.temp, 'pipegen-gate', 'result.json'), { recursive: true });
     const x = await go(w.inputs, { w, r });
-    expect(x.code).toBe(1);
+    expect(x.code).toBe(2); // C6 part 0: a folder left at result.json is stale
     expect(x.outputs.result).toBe('block');
     expect(existsSync(gateFile(r, 'baseline.json'))).toBe(false);
     expect(existsSync(gateFile(r, 'marker.json'))).toBe(false);
@@ -398,8 +397,9 @@ describe('fix round 2: no stale result survives a late failure', () => {
     const chunks: string[] = [];
     const gh = new FakeGh(w);
     const code = await main({ env, now: () => NOW, reviewed: () => VIEW, write: (t) => { chunks.push(t); }, github: () => gh });
-    chmodSync(dir, 0o755);
     expect(code).toBe(2);
     expect(chunks.join('')).toMatch(/::error::.*result file may be stale/);
+    expect(existsSync(dir)).toBe(false); // C6 c1: the folder was moved aside, so the upload ships nothing
+    for (const a of readdirSync(r.temp).filter((n) => n.startsWith('pipegen-gate.stale-'))) chmodSync(join(r.temp, a), 0o755);
   });
 });

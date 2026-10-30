@@ -18,8 +18,8 @@
 // (renderGateUploads): pipegen-gate-result with if: always(), pipegen-baseline and pipegen-clean-run with if-no-files-found: ignore.
 // Gate mode never reads GITHUB_WORKSPACE (ruling S21): its facts come from the inputs, the event payload and the API.
 import { randomUUID } from 'node:crypto';
-import { closeSync, constants, fstatSync, lstatSync, mkdirSync, openSync, readSync, renameSync, unlinkSync, writeSync } from 'node:fs';
-import { basename, isAbsolute, join } from 'node:path';
+import { accessSync, chmodSync, closeSync, constants, fstatSync, lstatSync, mkdirSync, openSync, readSync, renameSync, unlinkSync, writeFileSync, writeSync } from 'node:fs';
+import { basename, dirname, isAbsolute, join } from 'node:path';
 import { GATE_UPLOAD_FILES, isStagedTool } from '../../src/engine/tool-flags.js';
 import { loadReviewed } from '../../src/engine/reviewed.js';
 import { safeMarkdown, safeText } from '../../src/util/safe-text.js';
@@ -54,7 +54,22 @@ export interface MainDeps {
   github?: (opts: AdapterOptions) => GateGithubAdapter;
   /** The built-in reviewed list's gate view. C6 replaces the default with the generated view it bundles (ruling S5). */
   reviewed?: () => readonly GateToolView[];
+  /** The file system calls that remove, move aside or lock gate files (tests inject failures; the real calls by default). */
+  fs?: Partial<GateFs>;
 }
+/** The three file system calls the stale-file handling uses. */
+export interface GateFs {
+  unlink: (path: string) => void; rename: (from: string, to: string) => void; chmod: (path: string, mode: number) => void;
+  /** Overwrites an existing file in place (never through a link). */
+  overwrite: (path: string, data: string) => void;
+  /** Throws unless the folder can be read. */
+  access: (path: string) => void;
+}
+const REAL_FS: GateFs = {
+  unlink: unlinkSync, rename: renameSync, chmod: chmodSync,
+  overwrite: (path, data) => { writeFileSync(path, data, { flag: constants.O_WRONLY | constants.O_TRUNC | constants.O_NOFOLLOW } as unknown as { flag: string }); },
+  access: (path) => { accessSync(path, constants.R_OK); },
+};
 
 /** The event payload and other runner files are read under this cap, without following a link. */
 const MAX_EVENT_BYTES = 16 * 1024 * 1024;
@@ -70,9 +85,35 @@ class StaleResultError extends StepError {}
 /** The exit status when the gate folder may still hold a stale result, baseline or marker. */
 export const STALE_EXIT = 2;
 /** Whether the file is gone (removed now, or never there). */
-function removeIfThere(dir: string, name: string): boolean {
-  try { unlinkSync(join(dir, name)); return true; } catch (e) { return (e as NodeJS.ErrnoException).code === 'ENOENT'; }
+function removeIfThere(fs: GateFs, dir: string, name: string): boolean {
+  try { fs.unlink(join(dir, name)); return true; } catch (e) { return (e as NodeJS.ErrnoException).code === 'ENOENT'; }
 }
+/** Whether any entry is still at the path, of any type (a link, a folder or a FIFO counts: upload-artifact follows links). */
+function entryStillThere(dir: string, name: string): boolean {
+  try { lstatSync(join(dir, name)); return true; } catch { return false; }
+}
+/**
+ * C6 part 0 (review-C5b-r2 c1): the gate could not remove or replace a file of the gate folder, so the uploads (if: always()) would ship it.
+ * The one design: move the whole folder aside (a rename needs only the parent folder, not the files). If that fails: overwrite result.json
+ * with the block document (best effort), then lock the folder (mode 0) and check it really is unreadable now (root ignores the mode). Either
+ * way the pinned result upload finds nothing it can read and fails (if-no-files-found: error). Only if nothing holds does the step say so.
+ * ACCEPTED RESIDUAL: reaching this needs the runner's temp folder to fail writes in the middle of one process. Its trust impact is nil:
+ * pipegen-gate-result is a report, never authority, and C3 trusts only a baseline or marker from a run that concluded `success`; this step
+ * exits non-zero, so that run can not. No further hardening of this path (reviews of C5b-r2 and C6 part 0).
+ */
+function quarantine(step: Step, dir: string, blockDoc: string): void {
+  const fs = step.fs;
+  try { fs.rename(dir, join(dirname(dir), `${basename(dir)}.stale-${randomUUID()}`)); step.error('the gate folder holds a file that could not be removed, so the folder was moved aside: the result file may be stale, the upload finds nothing and fails'); return; } catch { /* lock it */ }
+  try { fs.overwrite(join(dir, RESULT_FILE), blockDoc); } catch { /* best effort */ }
+  try {
+    fs.chmod(dir, 0);
+    let readable = true;
+    try { fs.access(dir); } catch { readable = false; }
+    if (!readable) { step.error('the gate folder holds a file that could not be removed, so the folder was locked: the result file may be stale, the upload can not read it and fails'); return; }
+  } catch { /* below */ }
+  step.error('the gate folder holds a file that could not be removed, and the folder could not be moved aside or locked: the result file may be stale and the uploads may ship stale files');
+}
+
 /** Masked lines shorter than this are not redacted from what the action writes (they are still masked by the runner). */
 const MIN_REDACTED = 8;
 /** The fixed text for a key the fingerprint rules refuse (review-C5b minor 5): never the key or its length. */
@@ -86,7 +127,8 @@ const escapeData = (s: string): string => s.replace(/%/g, '%25').replace(/\r/g, 
 /** What one run of the action writes, all through one place: masking first, the redaction belt, the outputs and the summary. */
 class Step {
   private secrets: string[] = [];
-  constructor(private deps: MainDeps) {}
+  readonly fs: GateFs;
+  constructor(private deps: MainDeps) { this.fs = { ...REAL_FS, ...deps.fs }; }
   env(name: string): string | undefined { const v = this.deps.env[name]; return typeof v === 'string' ? v : undefined; }
   /** `::add-mask::` for each line of a secret, before anything else is written with it. */
   mask(value: string | undefined): void {
@@ -454,15 +496,24 @@ async function runGate(step: Step, deps: MainDeps, inputs: Map<string, string>):
   }
   // 1. the result file (pinned upload step, if: always()); a result that can not be written makes the gate fail closed
   let written = false;
+  let stale = false;
   if (dir !== undefined) {
+    // C6 part 0 (c2): a result.json that is already there (planted) is removed first, so a stale pass never survives a failed write
+    if (!removeIfThere(step.fs, dir, RESULT_FILE) && entryStillThere(dir, RESULT_FILE)) stale = true;
     try { step.writeGateFile(dir, RESULT_FILE, resultDoc(d, verdict, ev, saved)); written = true; } catch { /* below */ }
   }
-  let stale = false;
   if (!written) {
     verdict = 'block';
     d = { ...d, errors: [...(d.errors ?? []), 'the gate result file could not be written, so the gate fails closed'] };
+    // scan finding: whatever entry remains at result.json after a failed write is stale
+    if (dir !== undefined && entryStillThere(dir, RESULT_FILE)) stale = true;
     // fix round 2 (r1-3): no baseline or marker beside a result that is not there
-    if (dir !== undefined) for (const f of [GATE_UPLOAD_FILES['pipegen-baseline'] as string, GATE_UPLOAD_FILES['pipegen-clean-run'] as string]) if (!removeIfThere(dir, f)) stale = true;
+    if (dir !== undefined) for (const f of [GATE_UPLOAD_FILES['pipegen-baseline'] as string, GATE_UPLOAD_FILES['pipegen-clean-run'] as string]) if (!removeIfThere(step.fs, dir, f)) stale = true;
+  }
+  // a stale file is handled at once, before the outputs and the summary can fail on their own (scan note)
+  if (stale && dir !== undefined) {
+    step.error('a gate file could not be removed beside a missing or planted result: the result file may be stale, so the step fails with status 2');
+    quarantine(step, dir, resultDoc({ errors: [...(d.errors ?? []), 'the gate folder may hold a stale result'] }, 'block', ev, { baseline: 'removed', marker: 'removed' }));
   }
   // 2. the outputs, 3. the summary (each repo string through safeMarkdown once: decideGate's summary)
   try {
@@ -470,10 +521,11 @@ async function runGate(step: Step, deps: MainDeps, inputs: Map<string, string>):
     const summary = d.result !== undefined && written ? d.result.summary : blockedSummary([...(d.result?.blockReasons ?? []), ...(d.errors ?? [])]);
     step.summary(`${summary}${saved.lines.length > 0 ? `\n### Baseline\n${saved.lines.join('\n')}\n` : ''}`);
   } catch (e) {
+    if (stale) throw new StaleResultError('the gate folder may hold a stale result'); // already quarantined above
     // review-C5b minor 6: the step fails after the files were written; the uploads (if: always()) must not ship a pass, a baseline or a marker
     if (dir !== undefined && written) {
       let left = false;
-      for (const f of [GATE_UPLOAD_FILES['pipegen-baseline'] as string, GATE_UPLOAD_FILES['pipegen-clean-run'] as string]) if (!removeIfThere(dir, f)) left = true;
+      for (const f of [GATE_UPLOAD_FILES['pipegen-baseline'] as string, GATE_UPLOAD_FILES['pipegen-clean-run'] as string]) if (!removeIfThere(step.fs, dir, f)) left = true;
       const failed: Decided = { errors: [...(d.result?.blockReasons ?? []), ...(d.errors ?? []), 'the gate could not hand on its result (the outputs or the summary), so it fails closed'] };
       // fix round 2 (r1-2): the block document under a temporary name, renamed over result.json (no moment without a result file); if that
       // fails, result.json is removed (the result upload then fails: closed); if even that fails, the result may be stale: status 2
@@ -484,11 +536,12 @@ async function runGate(step: Step, deps: MainDeps, inputs: Map<string, string>):
         renameSync(join(dir, tmp), join(dir, RESULT_FILE));
         replaced = true;
       } catch {
-        removeIfThere(dir, tmp);
-        replaced = removeIfThere(dir, RESULT_FILE);
+        removeIfThere(step.fs, dir, tmp);
+        replaced = removeIfThere(step.fs, dir, RESULT_FILE);
       }
       if (left || !replaced) {
         step.error('the gate failed after writing its files, and they could not be replaced or removed: the result file may be stale, so the step fails with status 2');
+        quarantine(step, dir, resultDoc(failed, 'block', ev, { baseline: 'removed', marker: 'removed' }));
         throw new StaleResultError('the gate folder may hold a stale result');
       }
     }
@@ -496,7 +549,7 @@ async function runGate(step: Step, deps: MainDeps, inputs: Map<string, string>):
   }
   // 4. only then the exit status
   step.log(`gate result: ${verdict}`);
-  if (stale) { step.error('the baseline or the marker could not be removed beside a missing result: the result file may be stale, so the step fails with status 2'); return STALE_EXIT; }
+  if (stale) return STALE_EXIT; // quarantined and reported above
   if (verdict === 'block') { step.error('pipegen gate: blocked; the job summary says why'); return 1; }
   return 0;
 }
