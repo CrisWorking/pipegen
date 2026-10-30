@@ -5,9 +5,12 @@ import { referee, type Linters } from '../src/engine/referee.js';
 import { createdPathProblem } from '../src/engine/job-rules.js';
 import { CREATED_RULES, duplicatePathProblems, type CreatedRule } from '../src/engine/created-files.js';
 import type { Capabilities, CreatedFile, PipelineDraft } from '../src/types.js';
-import { platform, profile, reviewedList, service } from './helpers/render.js';
+import { PROTECTED_PATHS_BASE } from '../src/types.js';
+import { renderJobPrelude, renderStep, stepsToYaml, type RenderContext } from '../src/engine/render-step.js';
+import { Document } from 'yaml';
+import { entry, platform, profile, reviewedList, service, specFor } from './helpers/render.js';
 
-const prof = profile([service({ name: 'api', path: '.' })]);
+const prof = profile([service({ name: 'root', path: '.' }), service({ name: 'api', path: 'api' })]);
 const caps: Capabilities = { branchProtection: true, environments: false, envRequiredReviewers: false, deploymentBranchPolicies: false, attestations: true, codeScanning: true, keylessSigningAllowed: true };
 const draft: PipelineDraft = { profile: prof, capabilities: caps, needs: [], steps: [], created: [], notProven: [], testDecisions: [], layersSkipped: [], scoreboard: [], requireDeployApproval: false, skipped: [], suggestions: [] };
 const LINTERS: Linters = { actionlint: async () => '/x', zizmor: async () => '/x' };
@@ -200,11 +203,21 @@ describe('the five P14 paths and the CF-1 table (final-review-r1 l.140-147) are 
 });
 
 describe('parity: what the engine produces today still passes', () => {
-  const good = ['name: pipegen', 'on: pull_request', 'permissions: {}', 'jobs:', '  noop:', '    runs-on: ubuntu-latest', '    permissions:', '      contents: read', '    steps:', '      - run: echo hi', ''].join('\n');
-  it('a workflow and a composite action keep their old paths and verdicts', async () => {
-    const wf = await run([file('.github/workflows/pipegen.yml', good, { part: 'pipeline' })]);
-    const wfOld = wf.issues.filter((i) => i.file === '.github/workflows/pipegen.yml' && /path|kind of|edited|case/i.test(i.message));
-    expect(wfOld).toEqual([]);
+  // a real rendered workflow (the Plan B/C renderer): prelude + the gitleaks steps, in the shape final-fix-c uses
+  const gl = specFor(entry('gitleaks'), { needId: 'secrets' });
+  const rctx: RenderContext = { profile: prof };
+  const wfText = (): string => {
+    const steps = [...renderJobPrelude({ fetchDepth: '1' }, p).steps, ...renderStep(gl, entry('gitleaks'), p, rctx).steps];
+    const doc = new Document();
+    doc.contents = doc.createNode({ name: 'pipegen', on: { pull_request: null }, permissions: {}, jobs: { j: { 'runs-on': 'ubuntu-latest', permissions: { contents: 'read' }, 'cache-mode': 'none' } } });
+    doc.setIn(['jobs', 'j', 'steps'], stepsToYaml(steps));
+    return doc.toString({ lineWidth: 0 });
+  };
+  it('a rendered workflow keeps its verdict: nothing the new rules add', async () => {
+    const d: PipelineDraft = { ...draft, steps: [gl], needs: [{ id: 'secrets', layer: 'merge', category: 'secrets', why: 't', blocking: true, floor: false }] };
+    const before = await referee([file('.github/workflows/pipegen.yml', wfText(), { part: 'pipeline' })], d, p, reviewedList(), LINTERS, 'tok', { runLinters: async () => [] });
+    expect(before.issues.filter((i) => /path|kind|edited|case|rule/i.test(i.message))).toEqual([]);
+    expect(before.issues.filter((i) => i.check === 'template')).toEqual([]);
   });
   it('the rule table did not grow a rule for a workflow or an action path', () => {
     for (const path of ['.github/workflows/pipegen.yml', '.github/workflows/pipegen-central.yml', '.github/actions/x/action.yml']) {
@@ -213,5 +226,90 @@ describe('parity: what the engine produces today still passes', () => {
   });
   it('workflow paths pass the path rule', () => {
     for (const path of ['.github/workflows/pipegen.yml', '.github/workflows/pipegen-central.yml', `.github/workflows/${'a'.repeat(96)}.yml`, '.github/actions/pipegen-gate/action.yml', '.github/actions/a_b.c/action.yaml']) expect(createdPathProblem(path), path).toBeNull();
+  });
+});
+
+describe('fix round 1: matchers claim only their own files', () => {
+  const claim = (path: string, repo: 'app' | 'central' = 'app') => CREATED_RULES.filter((r) => r.repo === repo && r.match(path, draft)).map((r) => r.id);
+  const ALLOWED: Record<string, string[]> = { CODEOWNERS: ['codeowners', 'codeowners-central'], 'docs/CODEOWNERS': ['codeowners', 'codeowners-central'], '.github/CODEOWNERS': ['codeowners', 'codeowners-central'], '.github/dependabot.yml': ['dependabot'], 'docker-compose.pipegen.yml': ['compose'] };
+  const configNames = [...new Set([...reviewedList().flatMap((t) => t.configFiles), 'biome.json', 'biome.jsonc', 'eslint.config.js', 'eslint.config.mjs', '.hadolint.yaml', '.c8rc.json', '.c8rc', 'vitest.config.ts', 'vite.config.ts', 'knip.json', '.prettierrc', '.prettierignore', '.gitleaksignore', '.semgrepignore', '.trivyignore', 'lefthook.yml', '.pre-commit-config.yaml', '.husky/pre-commit', '.zap/rules.tsv', 'renovate.json', '.renovaterc', 'CODEOWNERS', 'dependabot.yml', 'docker-compose.pipegen.yml'])];
+  const protectedNames = PROTECTED_PATHS_BASE.map((x) => x.replace(/\/\*\*$/, '/x'));
+  const FOLDERS = ['', 'test/', 'tests/', '__tests__/', 'api/', 'api/test/', 'api/tests/', 'api/__tests__/', '.github/', '.github/workflows/', '.github/actions/x/', '.github/actions/x/tests/', '.husky/', '.husky/test/', '.zap/', 'node_modules/x/', 'test/.github/'];
+  it('no protected path, config, ignore or hook name is claimed by a rule not meant for it, at any depth', () => {
+    const bad: string[] = [];
+    for (const name of [...configNames, ...protectedNames]) for (const dir of FOLDERS) {
+      const path = `${dir}${name}`;
+      for (const repo of ['app', 'central'] as const) {
+        const ids = claim(path, repo);
+        if (ids.length > 0 && !(ALLOWED[path] !== undefined && ids.every((i) => ALLOWED[path]?.includes(i)))) bad.push(`${repo}:${path} -> ${ids.join(',')}`);
+      }
+    }
+    expect(bad).toEqual([]);
+  });
+  it('the reviewer\'s attack paths are unclaimed', () => {
+    for (const path of ['api/tests/biome.json', 'test/eslint.config.js', 'test/vitest.config.ts', '__tests__/.gitleaksignore', 'test/lefthook.yml', '.husky/test/x', '.github/test/x.yml', '.github/workflows/tests/x.yml', '.github/actions/x/tests/run.sh', '.github/Dockerfile', '.github/workflows/Dockerfile', '.github/actions/x/Dockerfile', '.github/.dockerignore', '.github/package.json', 'node_modules/x/package.json', 'a/b/c/Dockerfile', 'a/package.json', 'x/api/package.json', 'api/tests/helper.ts', 'api/tests/x.test.json', 'api/tests/a.json.ts', 'api/tests/a.test.d.ts', 'api/tests/.hidden.test.ts', 'api/tests/.x/a.test.ts', 'api/src/a.test.ts', 'api/tests/a.test.ts.bak', 'dockerfile', 'api/Dockerfile.prod', 'API/Dockerfile']) expect(claim(path), path).toEqual([]);
+  });
+  it('the real forms are still claimed by exactly one rule', () => {
+    const want: Record<string, string> = { Dockerfile: 'dockerfile', 'api/Dockerfile': 'dockerfile', '.dockerignore': 'dockerignore', 'api/.dockerignore': 'dockerignore', 'package.json': 'package-json', 'api/package.json': 'package-json', 'package-lock.json': 'package-lock', 'api/package-lock.json': 'package-lock', 'tests/a.test.ts': 'starter-tests', 'api/tests/a.test.ts': 'starter-tests', 'api/test/sub/b.spec.mjs': 'starter-tests', 'api/__tests__/c.test.tsx': 'starter-tests', 'test/x.test.cjs': 'starter-tests', 'docker-compose.pipegen.yml': 'compose', 'PIPEGEN.md': 'pipegen-doc', '.github/dependabot.yml': 'dependabot', '.github/dependabot.yaml': 'dependabot' };
+    for (const [path, id] of Object.entries(want)) expect(claim(path), path).toEqual([id]);
+  });
+  it('a service folder named test is claimed once (no double claim)', () => {
+    const d: PipelineDraft = { ...draft, profile: profile([service({ name: 't', path: 'test' })]) };
+    for (const path of ['test/package.json', 'test/Dockerfile', 'test/package-lock.json']) expect(CREATED_RULES.filter((r) => r.repo === 'app' && r.match(path, d)).length, path).toBe(1);
+  });
+  it('a service folder that is itself hidden or vendored gets no created file', () => {
+    const d: PipelineDraft = { ...draft, profile: profile([service({ name: 'g', path: '.github' }), service({ name: 'n', path: 'node_modules/x' }), service({ name: 'h', path: '.hidden' })]) };
+    for (const path of ['.github/Dockerfile', '.github/package.json', 'node_modules/x/package.json', 'node_modules/x/Dockerfile', '.hidden/package.json', '.hidden/Dockerfile', '.hidden/.dockerignore', '.hidden/tests/a.test.ts', '.github/tests/a.test.ts']) expect(CREATED_RULES.filter((r) => r.match(path, d)), path).toEqual([]);
+  });
+  it('a file at a service root needs that service; the root only counts when a service is there', () => {
+    const d: PipelineDraft = { ...draft, profile: profile([service({ name: 'web', path: './web/' })]) };
+    expect(CREATED_RULES.filter((r) => r.match('web/package.json', d)).map((r) => r.id)).toEqual(['package-json']);
+    expect(CREATED_RULES.filter((r) => r.match('package.json', d))).toEqual([]);
+    expect(CREATED_RULES.filter((r) => r.match('api/package.json', d))).toEqual([]);
+  });
+});
+
+describe('fix round 1: inserted only on workflows, before parsing', () => {
+  const ins = { original: '', jobs: [] as string[], needs: [] as { job: string; added: string[] }[] };
+  const act = 'name: &a x\ndescription: *a\ninputs:\n  mode:\n    description: m\nruns:\n  using: composite\n  steps: []\n';
+  it('inserted on a composite action is refused, with anchor content too', async () => {
+    for (const content of [act, act.replace('&a ', '').replace('*a', 'd')]) {
+      const r = await run([file('.github/actions/x/action.yml', content, { part: 'pipeline', inserted: ins })]);
+      expect(r.ok).toBe(false);
+      expect(r.issues.some((i) => i.check === 'template' && /edited user workflow/.test(i.message))).toBe(true);
+      expect(r.issues.some((i) => /anchor|alias/i.test(i.message))).toBe(false);   // refused before the parse
+    }
+  });
+  it('the anchor action without the marker is still refused for the anchor', async () => {
+    expect((await run([file('.github/actions/x/action.yml', act, { part: 'pipeline' })])).issues.some((i) => /anchor|alias/i.test(i.message))).toBe(true);
+  });
+});
+
+describe('fix round 1: minors', () => {
+  const any: CreatedRule = { id: 't', repo: 'app', parts: ['docs'], match: () => true, mode: 'edit', judge: () => [] };
+  it('edited: null and other malformed markers are an issue, never a throw', async () => {
+    for (const bad of [null, 5, 'x', {}, { original: null }, []]) {
+      const r = await run([file('N.md', 'x', { edited: bad as unknown as { original: string } })], [any]);
+      expect(r.ok, JSON.stringify(bad)).toBe(false);
+    }
+  });
+  it('a file and a folder of the same name (any case) are refused', () => {
+    expect(duplicatePathProblems([file('a'), file('a/b')])).toHaveLength(1);
+    expect(duplicatePathProblems([file('A'), file('a/b/c')])).toHaveLength(1);
+    expect(duplicatePathProblems([file('a/b'), file('a')])).toHaveLength(1);
+    expect(duplicatePathProblems([file('a'), file('a/b', 'x', { repo: 'central' })])).toEqual([]);
+    expect(duplicatePathProblems([file('ab'), file('a/b')])).toEqual([]);
+  });
+  it('the referee refuses the file/folder clash', async () => {
+    expect((await run([file('a'), file('a/b')], [{ ...any, mode: 'new' }])).ok).toBe(false);
+  });
+  it('unclaimed and path-refused issues carry the repo', async () => {
+    const r = await run([file('x.txt', 'x', { repo: 'central' }), file('a b', 'x', { repo: 'central' })]);
+    expect(r.issues.length).toBeGreaterThanOrEqual(2);
+    for (const i of r.issues) expect(i.repo).toBe('central');
+  });
+  it('registry problems on a wrong-part file still carry the repo', async () => {
+    const r = await run([file('NOTES.md', 'x', { part: 'tests' })], [{ ...any, mode: 'new', match: (x) => x === 'NOTES.md' }]);
+    expect(r.issues.every((i) => i.repo === 'app')).toBe(true);
   });
 });

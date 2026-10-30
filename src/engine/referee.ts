@@ -1440,7 +1440,7 @@ export async function referee(files: CreatedFile[], draft: PipelineDraft, platfo
     // every created path is judged or refused (final review r1, R1): a path that is not plain and normalized, or that is in
     // .github/ (any letter case) without being exactly a workflow or action file, would otherwise be skipped yet may land in .github/workflows/
     const pathProblem = createdPathProblem(f.path);
-    if (pathProblem !== null) { add(f.path, 'template', `The file path is refused: ${pathProblem}; pipegen writes only plain, normalized paths.`); continue; }
+    if (pathProblem !== null) { add(f.path, 'template', `The file path is refused: ${pathProblem}; pipegen writes only plain, normalized paths.`, undefined, f.repo); continue; }
     const kind = fileKind(f);
     if (kind === null) {
       // not a workflow or action: a created-file rule (src/engine/created-files.ts) must claim it, else it is refused (D0a, B1)
@@ -1448,12 +1448,14 @@ export async function referee(files: CreatedFile[], draft: PipelineDraft, platfo
       if (!v.claimed) {
         add(f.path, 'template', /^\.github\//i.test(f.path)
           ? 'The file path is in .github/ but is not a workflow (.github/workflows/<name>.yml) or a composite action (.github/actions/<folder>/action.yml) pipegen can judge, so it is not written.'
-          : 'pipegen writes no file of this kind (no rule claims this path), so it is not written.');
+          : 'pipegen writes no file of this kind (no rule claims this path), so it is not written.', undefined, f.repo);
       }
       for (const m of v.problems) add(f.path, 'template', `pipegen refuses this file: ${m.replace(/\.$/, '')}.`, undefined, f.repo);
       continue;
     }
-    if (f.edited !== undefined) add(f.path, 'template', 'Only a file of a registered kind can carry the edited marker; an edit to a workflow uses the inserted mark.');
+    if (f.edited !== undefined) add(f.path, 'template', 'Only a file of a registered kind can carry the edited marker; an edit to a workflow uses the inserted mark.', undefined, f.repo);
+    // `inserted` marks an edited user WORKFLOW only; on a composite action it would relax the strict parse (anchors, aliases), so it is refused before the parse
+    if (kind === 'action' && f.inserted !== undefined) { add(f.path, 'template', 'Only a workflow file can carry the mark of an edited user workflow.', undefined, f.repo); continue; }
     lintable.push(f);
     const r = parseYaml(f.content, f.inserted === undefined ? 'strict' : 'user');
     if ('problems' in r) {
