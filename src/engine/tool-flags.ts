@@ -1,11 +1,13 @@
-// The policy leaf: every argv and action policy pipegen applies, in one module (it imports only the import-free types.ts, node:crypto, and slots.ts as a
-// type), so the loader, the renderers and the referee check against the same tables (Plan P ruling PS34): the tool flags pipegen never
+// The policy leaf: every argv and action policy pipegen applies, in one module (it imports only the import-free types.ts, node:crypto, slots.ts as a
+// type, and the gate's policy leaf gate/src/policy-default.ts), so the loader, the renderers and the referee check against the same tables (Plan P ruling PS34): the tool flags pipegen never
 // passes, the argv policies (ARGV_POLICIES), the reviewed action input policies, the platform action paths and locks, the step-id
 // patterns, the pip closures and the renderer-filled inputs (RENDERER_INPUTS with their checkers).
 
 import { createHash } from 'node:crypto';
 import { NEED_CATEGORIES, RESULT_ARTIFACT_PREFIX } from '../types.js';
 import type { SlotKind } from './slots.js';
+// the gate's policy rule (C2): a leaf that imports only types.ts, so the engine and the gate check a policy with one function
+import { policyProblem as gatePolicyProblem } from '../../gate/src/policy-default.js';
 
 /**
  * betterleaks flags pipegen never passes (catalogue §3 PC2: no egress, no config from the scanned repo). Taken from
@@ -606,18 +608,9 @@ function idListProblem(text: string): string | null {
   if (!Array.isArray(list) || list.length > ID_LIST_MAX) return `a JSON list of at most ${ID_LIST_MAX} need ids`;
   return list.every((x) => typeof x === 'string' && NEED_ID_TEXT_RE.test(x)) ? null : 'a JSON list of need ids (lower case letters, digits and dashes)';
 }
-/** Why a text is not the gate's policy (`{ "block": [severities], "warn": [severities] }`), or null. */
+/** Why a text is not the gate's policy (`{ "block": [severities], "warn": [severities] }`), or null: the one shared definition (gate/src/policy-default.ts), which the gate also applies (C2). */
 function policyProblem(text: string): string | null {
-  const v = parseJson(text);
-  if (!isPlainObject(v) || Object.keys(v).sort().join() !== 'block,warn') return 'a JSON object with exactly block and warn';
-  const sev = ['critical', 'high', 'medium', 'low', 'info'];
-  if (!['block', 'warn'].every((k) => Array.isArray(v[k]) && (v[k] as unknown[]).length <= 5 && (v[k] as unknown[]).every((x) => typeof x === 'string' && sev.includes(x)))) return 'block and warn lists of severities';
-  const block = v.block as string[];
-  const warn = v.warn as string[];
-  // the floor (decision 13): a policy can never stop critical and high findings from blocking, and no severity is in both lists or twice
-  if (!block.includes('critical') || !block.includes('high')) return 'a policy whose block list includes at least critical and high';
-  if (new Set(block).size !== block.length || new Set(warn).size !== warn.length || warn.some((x) => block.includes(x))) return 'a policy with no duplicate and no severity in both lists';
-  return null;
+  return gatePolicyProblem(parseJson(text));
 }
 /** Extra protected paths: globs without `..`, a leading `/` or an option dash, in plain characters (ruling S22). */
 const GLOB_RE = /^(?![-/])(?!.*(?:^|\/)\.\.(?:\/|$))[A-Za-z0-9._/*?-]{1,200}$/;
