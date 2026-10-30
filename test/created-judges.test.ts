@@ -601,6 +601,13 @@ describe('pipegen-doc judge', () => {
     for (const info of ['', 'yaml', 'sh', 'bash', 'json', 'text']) expect(docText('# t\n\n' + '```' + info + '\nx\n```\n'), info).toBe('');
     for (const info of ['mermaid', 'math', 'geojson', 'topojson', 'stl', 'Yaml', 'js', 'html', 'svg', 'a-b', 'yml', 'diff', 'yaml2']) expect(docText('# t\n\n' + '```' + info + '\nx\n```\n'), info).toMatch(/fence/);
   });
+  it('closing the gaps the mutation run found: invisible characters in a fence, empty label, non-ASCII or @ in a url, deeper list nesting, other github hosts', () => {
+    for (const c of ['\u202e', '\u200b', '\u0000']) expect(docText('# t\n\n```\nab' + c + 'cd\n```\n'), JSON.stringify(c)).toMatch(/invisible/);
+    expect(docText('# t\n\n[](https://github.com/o/r)\n')).toMatch(/link/);
+    for (const u of ['https://github.com/o/r/\u00e9', 'https://github.com/o/r/@x', 'https://github.com/o/r/a|b', 'https://github.com/o/r/a\'b']) expect(docText(`# t\n\n[a](${u})\n`), u).toMatch(/link/);
+    for (const l of ['   - x', '    - x', '      - x', ' - x']) expect(docText(`# t\n\n${l}\n`), l).not.toBe('');
+    for (const u of ['https://gist.github.com/x', 'https://api.github.com/x', 'https://raw.githubusercontent.com/o/r/main/x', 'https://docs.github.com.evil.example/x', 'https://evildocs.github.com/x', 'https://github.com.evil.example/o/r']) expect(docText(`# t\n\n[a](${u})\n`), u).toMatch(/link/);
+  });
   it('a pipe outside a table row, and a table row that is not closed, are refused', () => {
     for (const l of ['a | b', '|a|b', '| a | b', 'x | y |']) expect(docText(`# t\n\n${l}\n`), l).not.toBe('');
     for (const l of ['| a |', '|a|b|', '| |', '||']) expect(docText(`# t\n\n${l}\n`), l).toBe('');
