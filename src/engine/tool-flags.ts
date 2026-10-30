@@ -5,6 +5,7 @@
 
 import { createHash } from 'node:crypto';
 import { NEED_CATEGORIES, RESULT_ARTIFACT_PREFIX } from '../types.js';
+import { BASELINE_ARTIFACT, CLEAN_RUN_ARTIFACT, GATE_RESULT_ARTIFACT } from './artifact-names.js';
 import type { SlotKind } from './slots.js';
 // the gate's policy rule (C2): a leaf that imports only types.ts, so the engine and the gate check a policy with one function
 import { policyProblem as gatePolicyProblem } from '../../gate/src/policy-default.js';
@@ -581,6 +582,30 @@ const OWN_ARTIFACT_FOLDER = {
 const OWN_FOLDER_PATH = rx(/^\$\{\{ runner\.temp \}\}\/pipegen-out\/[a-z0-9][a-z0-9-]{0,120}(?:\/[A-Za-z0-9_][A-Za-z0-9._-]{0,100}){0,3}$/, 'a path under ${{ runner.temp }}/pipegen-out/<artifact>', OWN_ARTIFACT_FOLDER);
 const ARTIFACT_NAME = rx(new RegExp(`^${RESULT_ARTIFACT_PREFIX}[a-z0-9][a-z0-9-]{0,120}$`), `a result artifact name (${RESULT_ARTIFACT_PREFIX}…)`);
 
+// ---------- the gate's own uploads (C5b rulings 2 and 5) ----------
+// The gate step (mode gate) writes its files into ${{ runner.temp }}/pipegen-gate/: result.json always, baseline.json and marker.json
+// only on a trusted green push to the default branch. Pinned upload-artifact steps rendered AFTER the gate step (renderGateUploads, in the
+// job `gate` only: checkJobOrder) upload them under the three reserved names, each only from its own file. A pull request run uploading
+// `pipegen-baseline` or `pipegen-clean-run` this way is harmless: the C3 loader trusts only a MAC'd file from a trusted push run.
+/** The folder the gate step writes its files to. */
+export const GATE_FILES_DIR = `\${{ runner.temp }}/pipegen-gate`;
+/** Reserved artifact name → the one file of pipegen-gate it is uploaded from. */
+export const GATE_UPLOAD_FILES: Readonly<Record<string, string>> = Object.freeze({
+  [GATE_RESULT_ARTIFACT]: 'result.json', [BASELINE_ARTIFACT]: 'baseline.json', [CLEAN_RUN_ARTIFACT]: 'marker.json',
+});
+/** The reserved uploads whose file exists only when eligible: their upload ignores a missing file (`if-no-files-found: ignore`); every other upload errors. */
+export const GATE_OPTIONAL_UPLOADS: ReadonlySet<string> = new Set([BASELINE_ARTIFACT, CLEAN_RUN_ARTIFACT]);
+/** Whether a name is one of the gate's reserved upload names. */
+export const isGateUploadName = (name: unknown): name is string => typeof name === 'string' && Object.hasOwn(GATE_UPLOAD_FILES, name);
+/** The path a reserved name is uploaded from. */
+export const gateUploadPath = (name: string): string => `${GATE_FILES_DIR}/${GATE_UPLOAD_FILES[name] as string}`;
+/** The `if-no-files-found` value an upload with this name must have (the reviewed lock is `error`; the two optional gate files `ignore`). */
+export const uploadIfNoFiles = (name: unknown): 'error' | 'ignore' => (typeof name === 'string' && GATE_OPTIONAL_UPLOADS.has(name) ? 'ignore' : 'error');
+const UPLOAD_NAME: RendererInput = {
+  describe: `a result artifact name (${RESULT_ARTIFACT_PREFIX}…) or one of the gate's own (${Object.keys(GATE_UPLOAD_FILES).join(', ')})`,
+  check: (v) => ARTIFACT_NAME.check(v) || isGateUploadName(v),
+};
+
 // ---------- the scrub chain's folders (Plan C ruling B1) ----------
 // A tool's raw result is moved to `${{ runner.temp }}/pipegen-raw/<artifact>/<file>`; only the gate action in scrub mode
 // writes `${{ runner.temp }}/pipegen-out/<artifact>/<file>`, rebuilt from allowlisted fields. The upload rules above accept
@@ -722,7 +747,18 @@ export const BASE_CHECKOUT_REF = `\${{ github.event_name == 'pull_request' && gi
 export const RENDERER_INPUTS: Readonly<Record<string, Readonly<Record<string, RendererInput>>>> = Object.freeze({
   // the base commit, for the base-scan job only (the job rule is in job-rules.ts); no other ref is ever set
   'actions/checkout': { ref: { describe: 'the event-switched base commit (BASE_CHECKOUT_REF) and nothing else', check: (v) => v === BASE_CHECKOUT_REF } },
-  'actions/upload-artifact': { name: ARTIFACT_NAME, path: OWN_FOLDER_PATH },
+  // a result upload sits in its own pipegen-out folder; the gate's reserved names only at their own pipegen-gate file (C5b)
+  'actions/upload-artifact': {
+    name: UPLOAD_NAME,
+    path: {
+      describe: `${OWN_FOLDER_PATH.describe}, or for the gate's own artifacts their file in ${GATE_FILES_DIR}`,
+      check: (v) => OWN_FOLDER_PATH.check(v) || Object.keys(GATE_UPLOAD_FILES).some((n) => v === gateUploadPath(n)),
+      whenWith: {
+        check: (all) => (isGateUploadName(all.name) ? all.path === gateUploadPath(all.name) : OWN_ARTIFACT_FOLDER.check(all)),
+        describe: `only inside its own artifact folder (\${{ runner.temp }}/pipegen-out/<name>), or for a gate artifact at its own file in ${GATE_FILES_DIR}`,
+      },
+    },
+  },
   'actions/download-artifact': { name: ARTIFACT_NAME, path: OWN_FOLDER_PATH },
   'github/codeql-action/upload-sarif': { sarif_file: RUNNER_TEMP_PATH, category: rx(/^pipegen-[a-z0-9][a-z0-9-]{0,100}$/, 'a category starting pipegen-') },
   'actions/attest': {

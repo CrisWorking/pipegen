@@ -621,3 +621,122 @@ describe('parity: a full draft (two services, scanners, base-scan, gate job) thr
     expect(has(r, 'injection', /scan step ran "semgrep"/), show(r)).toBe(true);
   });
 });
+
+// ---------- C5b: the gate's uploads (rulings 2 and 5 of task-C5b-rulings.md) ----------
+// The gate writes result.json (always) and baseline.json / marker.json (only when eligible) into ${{ runner.temp }}/pipegen-gate/;
+// pinned upload-artifact steps after the gate step upload them under the three reserved names. Written first.
+import { renderGateUploads } from '../src/engine/render-step.js';
+import { isKnownHarmless } from '../src/engine/job-rules.js';
+import { BASELINE_ARTIFACT, CLEAN_RUN_ARTIFACT, GATE_RESULT_ARTIFACT } from '../src/engine/artifact-names.js';
+
+describe('C5b: renderGateUploads and the reserved gate uploads', () => {
+  const UP = 'actions/upload-artifact';
+  const T = '${{ runner.temp }}/pipegen-gate';
+  const specs = [gitleaksSpec(), semgrepSpec('app')];
+  const needs = [needOf('secrets'), needOf('sast', 'app')];
+  const d = draftOf(specs, needs);
+  const entries = gateJobList(d);
+  const g = block(specs[0] as StepSpec);
+  const s = block(specs[1] as StepSpec);
+  const scanJobs = (): Record<string, Job> => ({
+    [SEC]: job(dedupeJobSteps([...prelude(), ...g.steps], { id: 'secrets', scans: facts(g) }), { outputs: jobOutputsFor(g.steps) }),
+    'sast--app': job(dedupeJobSteps([...prelude(), ...s.steps], { id: 'sast--app', scans: facts(s) }), { outputs: jobOutputsFor(s.steps) }),
+  });
+  const GATE_PERM = { contents: 'read', actions: 'read', 'pull-requests': 'read' };
+  const gateJob = (steps: RenderedStep[], over: Job = {}): Job => job(steps, { name: 'gate', if: 'always()', needs: entries.map((e) => e.job), permissions: GATE_PERM, ...over });
+  const gateStep = (): RenderedStep => renderGateStep(GATE, entries);
+  const uploads = (): RenderedStep[] => renderGateUploads(p);
+
+  it('renderGateUploads: three uploads, each if: always(), at its own file in pipegen-gate; only the baseline and the marker ignore a missing file', () => {
+    const u = uploads();
+    expect(u.map((x) => x.with?.name)).toEqual([GATE_RESULT_ARTIFACT, BASELINE_ARTIFACT, CLEAN_RUN_ARTIFACT]);
+    expect(u.map((x) => x.with?.path)).toEqual([`${T}/result.json`, `${T}/baseline.json`, `${T}/marker.json`]);
+    expect(u.map((x) => x.if)).toEqual(['always()', 'always()', 'always()']);
+    expect(u.map((x) => x.with?.['if-no-files-found'])).toEqual(['error', 'ignore', 'ignore']);
+    for (const x of u) {
+      expect(x.uses?.startsWith(`${UP}@`)).toBe(true);
+      expect(x.with?.['include-hidden-files']).toBe('false');
+      expect(x.with?.archive).toBe('true');
+    }
+    expect(() => stepsToYaml([gateStep(), ...u])).not.toThrow();
+  });
+
+  it('RENDERER_INPUTS: a reserved name only at its own pipegen-gate file; a result name never there; no other pipegen-gate path', () => {
+    const ok = (w: Record<string, string>): boolean => rendererInputProblems(UP, w, w).length === 0;
+    expect(ok({ name: GATE_RESULT_ARTIFACT, path: `${T}/result.json` })).toBe(true);
+    expect(ok({ name: BASELINE_ARTIFACT, path: `${T}/baseline.json` })).toBe(true);
+    expect(ok({ name: CLEAN_RUN_ARTIFACT, path: `${T}/marker.json` })).toBe(true);
+    expect(ok({ name: BASELINE_ARTIFACT, path: `${T}/marker.json` })).toBe(false);
+    expect(ok({ name: GATE_RESULT_ARTIFACT, path: `${T}/baseline.json` })).toBe(false);
+    expect(ok({ name: GATE_RESULT_ARTIFACT, path: '${{ runner.temp }}/pipegen-out/pipegen-gate-result/result.json' })).toBe(false);
+    expect(ok({ name: 'pipegen-out-secrets', path: `${T}/result.json` })).toBe(false);
+    for (const path of [T, `${T}/`, `${T}/x.json`, `${T}/result.json/x`, '${{ runner.temp }}/pipegen-gate/../pipegen-out/x']) expect(ok({ name: GATE_RESULT_ARTIFACT, path }), path).toBe(false);
+    for (const name of ['pipegen-gate-results', 'pipegen-Baseline', 'pipegen-clean-run-x']) expect(ok({ name, path: `${T}/result.json` }), name).toBe(false);
+    // the download side is unchanged: the gate's own names are never downloaded by a step
+    expect(rendererInputProblems('actions/download-artifact', { name: GATE_RESULT_ARTIFACT }).length).toBeGreaterThan(0);
+    // result uploads keep their own rule
+    expect(ok({ name: 'pipegen-out-secrets', path: '${{ runner.temp }}/pipegen-out/pipegen-out-secrets/x.sarif' })).toBe(true);
+  });
+
+  it('isKnownHarmless: the gate step in mode gate (pinned, no run) runs no repo code; other modes and forms are not this rule', () => {
+    expect(isKnownHarmless(gateStep())).toBe(true);
+    expect(isKnownHarmless({ ...gateStep(), uses: 'crisworking/pipegen/gate@main' })).toBe(false);
+    expect(isKnownHarmless({ ...gateStep(), run: 'echo' })).toBe(false);
+    expect(isKnownHarmless({ ...gateStep(), with: { ...gateStep().with, mode: 'nightly' } })).toBe(false);
+    expect(isKnownHarmless({ ...gateStep(), uses: (gateStep().uses as string).replace('crisworking/pipegen/gate', 'crisworking/pipegen/other') })).toBe(false);
+  });
+
+  it('checkJobOrder: in job gate the uploads after the gate step are fine; before it, elsewhere, without always(), twice, or another upload → problems', () => {
+    const [r, b, m] = uploads() as [RenderedStep, RenderedStep, RenderedStep];
+    expect(checkJobOrder([...prelude(), gateStep(), r, b, m], { id: 'gate', scans: NO_SCANS })).toEqual([]);
+    expect(checkJobOrder([gateStep(), r], { id: 'gate', scans: NO_SCANS })).toEqual([]);
+    const bad = (steps: RenderedStep[], id: string | undefined, re: RegExp): void => {
+      const got = checkJobOrder(steps, id === undefined ? { scans: NO_SCANS } : { id, scans: NO_SCANS });
+      expect(got.some((x) => re.test(x)), `${id}: ${got.join(' | ')}`).toBe(true);
+    };
+    bad([r, gateStep()], 'gate', /after the gate step/);
+    bad([...prelude(), r], 'secrets', /only the gate job/);
+    bad([gateStep(), r], undefined, /only the gate job/);
+    bad([gateStep(), { ...r, if: 'success()' }], 'gate', /always\(\)/);
+    bad([gateStep(), { ...r }, { ...r }], 'gate', /more than once/);
+    bad([gateStep(), s.upload], 'gate', /gate job uploads only/);
+  });
+
+  it('referee: the gate job with its uploads → no issue', async () => {
+    const r = await run([workflow({ ...scanJobs(), gate: gateJob([gateStep(), ...uploads()]) })], d);
+    expect(show(r)).toBe('');
+  });
+
+  it('referee: if-no-files-found ignore only on the baseline and the marker, error on the result; a reserved upload outside the gate job, or before the gate step → issues', async () => {
+    const [r0, b0, m0] = uploads() as [RenderedStep, RenderedStep, RenderedStep];
+    const flip = (x: RenderedStep, v: string): RenderedStep => ({ ...x, with: { ...x.with, 'if-no-files-found': v } as Record<string, string> });
+    const one = async (gateSteps: RenderedStep[], extra: Record<string, Job> = {}): Promise<RefereeReport> => run([workflow({ ...scanJobs(), ...extra, gate: gateJob(gateSteps) }, true)], d);
+    expect(has(await one([gateStep(), flip(r0, 'ignore'), b0, m0]), 'template', /if-no-files-found/)).toBe(true);
+    expect(has(await one([gateStep(), r0, flip(b0, 'error'), m0]), 'template', /if-no-files-found/)).toBe(true);
+    expect(has(await one([gateStep(), r0, b0, flip(m0, 'warn')]), 'template', /if-no-files-found/)).toBe(true);
+    // ignore on a result upload in a scanner job
+    const j = scanJobs();
+    const secSteps = (j[SEC] as Job).steps as RenderedStep[];
+    const ignoring = secSteps.map((x) => (x.with?.name === g.artifact ? flip(x, 'ignore') : x));
+    const rr = await run([workflow({ ...j, [SEC]: { ...(j[SEC] as Job), steps: ignoring }, gate: gateJob([gateStep(), r0, b0, m0]) }, true)], d);
+    expect(has(rr, 'template', /if-no-files-found/), show(rr)).toBe(true);
+    // a reserved upload in a scanner job
+    const stray = await run([workflow({ ...j, [SEC]: { ...(j[SEC] as Job), steps: [...secSteps, b0] }, gate: gateJob([gateStep(), r0, m0]) }, true)], d);
+    expect(show(stray)).toMatch(/only the gate job/);
+    // before the gate step
+    expect(show(await one([r0, gateStep(), b0, m0]))).toMatch(/after the gate step/);
+  });
+
+  it('JOB_STEP_POLICY: the gate row allows uploads (the reserved ones only, checkJobOrder) and still no checkout', () => {
+    expect(JOB_STEP_POLICY.gate).toEqual(['harden', 'download-artifact', 'gate', 'upload-artifact']);
+  });
+
+  it('ruling 5: a scrub step\'s declared outputs are sha256, status and error; the job outputs keep <artifact>-<name> and reference them', () => {
+    const out = jobOutputsFor(g.steps);
+    const id = scrubStepId(g.artifact);
+    expect(out).toEqual({
+      [`${g.artifact}-sha256`]: `\${{ steps.${id}.outputs.sha256 }}`, [`${g.artifact}-status`]: `\${{ steps.${id}.outputs.status }}`, [`${g.artifact}-error`]: `\${{ steps.${id}.outputs.error }}`,
+    });
+    expect(jobOutputsProblems('secrets', { [`${g.artifact}-sha256`]: `\${{ steps.${id}.outputs.${g.artifact}-sha256 }}` }, g.steps).length).toBe(1);
+  });
+});

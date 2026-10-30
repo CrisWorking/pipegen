@@ -3,7 +3,7 @@
 // the referee and the linters import them from here, so no second copy can drift. It imports only the leaves render-error.ts,
 // tool-flags.ts and types.ts (test/final-fix-b.test.ts and test/module-graph.test.ts check this).
 import { EXPR, own, RenderError, show } from './render-error.js';
-import { ARGV_POLICIES, BASE_CHECKOUT_REF, CHECKER_STEP_ID_RE, GATE_USES_RE, isStagedTool, PLATFORM_USES, rendererInputProblems, RENDERER_INPUTS, scrubStepId, SCRUB_STEP_ID_RE, SETUP_STEP_ID_RE, sha16, stagePath, stageStepId, STAGE_STEP_ID_RE, TOOL_STEP_ID_RE } from './tool-flags.js';
+import { ARGV_POLICIES, BASE_CHECKOUT_REF, isGateUploadName, CHECKER_STEP_ID_RE, GATE_USES_RE, isStagedTool, PLATFORM_USES, rendererInputProblems, RENDERER_INPUTS, scrubStepId, SCRUB_STEP_ID_RE, SETUP_STEP_ID_RE, sha16, stagePath, stageStepId, STAGE_STEP_ID_RE, TOOL_STEP_ID_RE } from './tool-flags.js';
 
 /** One step of a job, as pipegen renders it. `usesComment` becomes the trailing `# <version>` comment on `uses:`. */
 export interface RenderedStep {
@@ -101,6 +101,15 @@ export function isStageStep(s: RenderedStep): boolean {
 }
 
 /**
+ * Whether a step is the gate step that decides (C5b): no id, no `run`, the gate action pinned by a commit, in `mode: gate`. It runs
+ * pipegen's own code on the event, the job outputs and the API (the gate job holds no checkout, ruling S21), never the repo's, so the
+ * gate's own uploads may follow it. The shape only; the referee holds the pin and the job (mode gate runs only in the job gate).
+ */
+export function isGateDecideStep(s: RenderedStep): boolean {
+  return s.id === undefined && s.run === undefined && s.uses !== undefined && GATE_USES_RE.test(s.uses) && s.with?.mode === 'gate';
+}
+
+/**
  * Whether a step is KNOWN not to run the repo's code. Everything else is repo code (fail closed): a step with no id, an
  * unknown or renamed id, `pipegen-npm-ci-…` (the repo's own `npm ci` reads its `.npmrc`), the repo-code run steps, and any
  * action that is not a pinned checkout, setup or upload action. An id counts only on the right kind of step: a script
@@ -109,7 +118,7 @@ export function isStageStep(s: RenderedStep): boolean {
  */
 export function isKnownHarmless(s: RenderedStep): boolean {
   const pinnedAction = s.uses !== undefined && s.run === undefined && TRUSTED_ACTION_RE.test(s.uses);
-  if (s.id === undefined) return pinnedAction;
+  if (s.id === undefined) return pinnedAction || isGateDecideStep(s);
   if (SETUP_STEP_ID_RE.test(s.id)) {
     const path = SETUP_ID_ACTION.find(([re]) => re.test(s.id as string))?.[1];
     return pinnedAction && path !== undefined && (s.uses as string).startsWith(`${path}@`);
@@ -175,6 +184,7 @@ export function checkJobOrder(steps: readonly RenderedStep[], job: Partial<JobCo
     }
   });
   if (job.id === BASE_SCAN_JOB) problems.push(...baseScanProblems(steps));
+  problems.push(...gateUploadProblems(steps, job.id));
   problems.push(...scrubChainProblems(steps, job.scans));
   problems.push(...stageChainProblems(steps, job.scans));
   return problems;
@@ -283,6 +293,40 @@ export function scrubChainProblems(steps: readonly RenderedStep[], scans?: Reado
       if (typeof tool === 'string' && tool !== scan.tool) problems.push(`${at} scrubs it as the tool ${show(tool)}, but the scan step ran ${show(scan.tool)}.`);
       if (typeof w.format === 'string' && w.format !== scan.format) problems.push(`${at} scrubs it as the format ${show(w.format)}, but the scan step wrote ${show(scan.format)}.`);
     }
+  });
+  return problems;
+}
+
+/** The job that decides (its uploads are the gate's own, C5b). */
+export const GATE_JOB = 'gate';
+/** The reserved name an upload step uploads, or undefined (not an upload, or a result upload). */
+const gateUploadNameOf = (s: RenderedStep): string | undefined => {
+  if (s.uses === undefined || s.run !== undefined || !UPLOAD_USES_RE.test(s.uses)) return undefined;
+  const name = s.with?.name;
+  return isGateUploadName(name) ? name : undefined;
+};
+/**
+ * The gate's own uploads (C5b ruling 2): `pipegen-gate-result`, `pipegen-baseline` and `pipegen-clean-run` are uploaded only in the job
+ * `gate`, each once, with `if: always()` (so the result is there when the gate fails), and only AFTER the gate step (which writes their
+ * files); the gate job uploads nothing else. Their paths (each its own file in pipegen-gate) are RENDERER_INPUTS' rule, and their
+ * `if-no-files-found` the template rule (uploadIfNoFiles). A job with no id is not the gate job (fail closed).
+ */
+export function gateUploadProblems(steps: readonly RenderedStep[], jobId: string | undefined): string[] {
+  const problems: string[] = [];
+  const seen = new Set<string>();
+  let decided = false;
+  steps.forEach((s, i) => {
+    if (isGateDecideStep(s)) decided = true;
+    const name = gateUploadNameOf(s);
+    if (name === undefined) {
+      if (jobId === GATE_JOB && s.uses !== undefined && s.run === undefined && UPLOAD_USES_RE.test(s.uses)) problems.push(`Step ${i + 1} (${show(s.name)}): the gate job uploads only its own result, baseline and clean-run marker, nothing else.`);
+      return;
+    }
+    if (jobId !== GATE_JOB) { problems.push(`Step ${i + 1} (${show(s.name)}) uploads ${show(name)}, which only the gate job does (after its gate step).`); return; }
+    if (!decided) problems.push(`Step ${i + 1} (${show(s.name)}) uploads ${show(name)} before the gate step has written it: it must come after the gate step.`);
+    if (s.if !== 'always()') problems.push(`Step ${i + 1} (${show(s.name)}) uploads ${show(name)} without if: always(), so a failed gate would leave no ${name}.`);
+    if (seen.has(name)) problems.push(`Step ${i + 1} (${show(s.name)}) uploads ${show(name)} more than once in the job.`);
+    seen.add(name);
   });
   return problems;
 }

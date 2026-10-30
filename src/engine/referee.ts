@@ -43,7 +43,7 @@ import { ACTION_PATH_RE, checkExpressions, createdPathProblem, checkJobOrder, IF
 import { containerRefusal, RenderError, renderProjectScript, renderStep, sameDedupeContent, type RenderContext } from './render-step.js';
 import { projectScriptFor } from './reviewed.js';
 import { slotProblem, type SlotKind } from './slots.js';
-import { ARGV_POLICIES, CACHE_LOCKS, PLAIN_REL_RE, RENDERER_INPUTS, rendererInputProblems, SCRUB_SECRET } from './tool-flags.js';
+import { ARGV_POLICIES, CACHE_LOCKS, PLAIN_REL_RE, PLATFORM_USES, RENDERER_INPUTS, rendererInputProblems, SCRUB_SECRET, uploadIfNoFiles } from './tool-flags.js';
 
 // ---------- the report ----------
 
@@ -129,7 +129,8 @@ export const JOB_STEP_POLICY: Readonly<Record<string, readonly StepKind[]>> = Ob
   'pipegen-verify': ['harden', 'checkout', 'download-artifact', 'gate'],
   'code-scanning': ['harden', 'download-artifact', 'upload-sarif'],
   // no checkout: the gate never reads the workspace (Plan C ruling S21); it reads the event, the job outputs and the API
-  gate: ['harden', 'download-artifact', 'gate'],
+  // C5b: the gate's own uploads (result, baseline, clean-run marker) after the gate step, and no other upload (checkJobOrder, gateUploadProblems)
+  gate: ['harden', 'download-artifact', 'gate', 'upload-artifact'],
   'base-scan': ['harden', 'checkout', 'setup', 'stage', 'tool', 'scrub', 'upload-artifact'],
   // no checkout: this job holds PIPEGEN_FP_KEY and reads only the API and artifacts (C3 review m9, like the gate job's S21)
   'baseline-check': ['harden', 'download-artifact', 'gate'],
@@ -1125,7 +1126,11 @@ function judgeTemplate(fc: FileCtx, at: (m: string) => string, t: ReviewedTool, 
   const bad = issueFor(fc);
   const fixed = t.fixedInputs.with ?? {};
   const all = Object.fromEntries(Object.entries(withs).map(([k, v]) => [k, typeof v === 'string' ? v : String(v)]));
-  for (const [k, v] of Object.entries(fixed)) if (withs[k] !== v) bad('template', at(`${t.id} must have ${safeText(k, 40)}: ${show(v)} (a reviewed fixed input).`));
+  for (const [k, v] of Object.entries(fixed)) {
+    // C5b: an upload's `if-no-files-found` is `error`, except `ignore` on the gate's two optional files (the baseline and the marker)
+    const want = path === PLATFORM_USES['upload-artifact'] && k === 'if-no-files-found' ? uploadIfNoFiles(withs.name) : v;
+    if (withs[k] !== want) bad('template', at(`${t.id} must have ${safeText(k, 40)}: ${show(want)} (a reviewed fixed input${want === v ? '' : ', for this artifact'}).`));
+  }
   // the gate action does one thing per mode and has no default: a step without a mode would run whatever the action's own default is
   if (t.id === PIPEGEN_ACTION_IDS.gate && withs.mode === undefined) bad('template', at(`${t.id} must set its mode (scrub, stage, gate, find-run, nightly or baseline-check); the action has no reviewed default.`));
   for (const [k, values] of Object.entries(t.choices)) {

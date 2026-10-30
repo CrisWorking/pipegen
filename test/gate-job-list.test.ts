@@ -165,10 +165,11 @@ describe('reserved artifact names (ruling S3)', () => {
     expect(n).toBeGreaterThan(200);
   });
 
-  it('artifact names: an upload or download step cannot take a reserved name (the name must be a result artifact name)', () => {
+  it('artifact names: a download step cannot take a reserved name; an upload only from its own pipegen-gate file (C5b ruling 2; the job rule is checkJobOrder)', () => {
     for (const n of [BASELINE_ARTIFACT, CLEAN_RUN_ARTIFACT, GATE_RESULT_ARTIFACT]) {
-      expect(rendererInputProblems('actions/upload-artifact', { name: n }).length, n).toBeGreaterThan(0);
       expect(rendererInputProblems('actions/download-artifact', { name: n }).length, n).toBeGreaterThan(0);
+      const inOut = { name: n, path: `\${{ runner.temp }}/pipegen-out/${n}/x.json` };
+      expect(rendererInputProblems('actions/upload-artifact', inOut, inOut).length, n).toBeGreaterThan(0);
     }
   });
 });

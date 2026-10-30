@@ -43,8 +43,9 @@ export function resultArtifactNames(items: readonly { needId: string; service?: 
 
 // ---------- artifacts that are not a check's result (ruling S3) ----------
 // The gate's own artifacts. None starts with RESULT_ARTIFACT_PREFIX and resultArtifactName always does, so no result name can
-// equal one of them; the upload and download steps take result names only (RENDERER_INPUTS), so a template cannot use them either.
-/** The gate's decision and summary data (a JSON file, no SARIF text), uploaded before the gate step fails. */
+// equal one of them. A download step takes result names only (RENDERER_INPUTS); an upload step takes these three only from their own
+// file in ${{ runner.temp }}/pipegen-gate, in the gate job, after the gate step (C5b ruling 2: RENDERER_INPUTS and checkJobOrder).
+/** The gate's decision and summary data (a JSON file, no SARIF text), uploaded by an `if: always()` step after the gate step (C5b ruling 2). */
 export const GATE_RESULT_ARTIFACT = 'pipegen-gate-result';
 /** The trusted run's baseline counts, written only by the gate action (carries a MAC). */
 export const BASELINE_ARTIFACT = 'pipegen-baseline';

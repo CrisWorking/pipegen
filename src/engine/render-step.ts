@@ -27,7 +27,7 @@ import type { ProjectScriptStep } from './reviewed.js';
 import { own, RenderError, show } from './render-error.js';
 import { BASE_CHECKOUT_ID, checkExpressions, checkJobOrder, isDangerousName, isReviewed, STEP_KEYS, type JobContext, type RenderedStep, type ScanFact } from './job-rules.js';
 import { jobListLiteral, type JobListEntry } from './gate-job-list.js';
-import { BASE_CHECKOUT_REF, DOCKER_ACTION_USES, IMAGE_BUILT_ACTION_USES, isStagedTool, PIPEGEN_GATE_USES, PLAIN_REL_RE, PLATFORM_LOCKS, PLATFORM_USES, RENDERER_INPUTS, rendererInputProblems, scrubbedResultPath, scrubStepId, stagePath, stageStepId } from './tool-flags.js';
+import { BASE_CHECKOUT_REF, DOCKER_ACTION_USES, GATE_UPLOAD_FILES, gateUploadPath, uploadIfNoFiles, IMAGE_BUILT_ACTION_USES, isStagedTool, PIPEGEN_GATE_USES, PLAIN_REL_RE, PLATFORM_LOCKS, PLATFORM_USES, RENDERER_INPUTS, rendererInputProblems, scrubbedResultPath, scrubStepId, stagePath, stageStepId } from './tool-flags.js';
 
 export { RenderError };
 // the job rules live in job-rules.ts (one copy for the renderer, the emitter, the referee and the linters); re-exported for the callers that import them here
@@ -530,6 +530,20 @@ export function renderUpload(artifact: string, path: string, platform: PlatformA
   // the path must sit in this artifact's own folder: the rule is the shared whenWith of RENDERER_INPUTS (tool-flags.ts), which the emitter and the referee also use
   const step = renderPlatformStep('upload-artifact', platform, { name: artifact, path });
   return { ...step, name: 'Upload the result', if: 'always()' };
+}
+
+/**
+ * The gate job's uploads (C5b ruling 2), rendered after its gate step: `pipegen-gate-result` from `${{ runner.temp }}/pipegen-gate/result.json`
+ * (always written, a missing file is an error), then `pipegen-baseline` and `pipegen-clean-run` from `baseline.json` and `marker.json`, which
+ * the gate writes only on a trusted green push to the default branch, so their upload ignores a missing file. All `if: always()`: the result
+ * is uploaded even when the gate step failed. The other reviewed locks (no hidden files, zipped) stay. A pull request run that uploads
+ * the two optional names is harmless: the C3 loader trusts only a MAC'd file from a trusted push run.
+ */
+export function renderGateUploads(platform: PlatformActions): RenderedStep[] {
+  return Object.keys(GATE_UPLOAD_FILES).map((name) => {
+    const step = renderPlatformStep('upload-artifact', platform, { name, path: gateUploadPath(name) });
+    return { ...step, name: `Upload ${name}`, if: 'always()', with: { ...step.with, 'if-no-files-found': uploadIfNoFiles(name) } };
+  });
 }
 
 /** The optional literal inputs of the gate step in mode `gate` (each is checked by its schema in RENDERER_INPUTS). */
