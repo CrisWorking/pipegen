@@ -607,3 +607,11 @@ describe('C5b Part 0: on pull_request and pull_request_review the scanned merge 
     expect(gh.calls.some((c) => c.startsWith('commit '))).toBe(false);
   });
 });
+
+// ---------- C5b: the clean-run state reaches the action (the marker re-write rule needs it) ----------
+describe('C5b: gatherGateInput passes the clean-run marker state on (cleanRun)', () => {
+  it('no trusted run → none; it is the state cleanRunSeen gave, never derived from the mode', async () => {
+    const { input } = await gather(world());
+    expect(input.cleanRun).toBe('none');
+  });
+});

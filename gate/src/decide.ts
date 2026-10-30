@@ -130,6 +130,11 @@ export interface GateInput {
    * check and in the notes, so a check with no findings is never read as covering what it could not see. It never blocks.
    */
   coverage?: readonly { job: string; text: string }[];
+  /**
+   * C5b: what the clean-run marker lookup (C3 cleanRunSeen) found. decideGate never reads it (the mode already holds its effect); the action
+   * reads it for the marker re-write rule (once block mode was reached through a clean run, every trusted green push re-writes the marker).
+   */
+  cleanRun?: 'seen' | 'none' | 'unknown';
 }
 
 /** A finding as decided: which check, new or old (`undefined`: no base to tell, an installing PR), and why. */

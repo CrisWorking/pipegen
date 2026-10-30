@@ -1,0 +1,87 @@
+# pipegen's gate action (Plan C). One action, one mode per step. pipegen's renderer sets every input, and RENDERER_INPUTS
+# (src/engine/tool-flags.ts) checks each one. A test keeps these inputs equal to that row. No input has a default.
+# The bundle dist/index.js is built in C6.
+name: pipegen gate
+description: Scrubs scanner results, stages the checkout for the secrets scan, decides pass, warn or block, and looks up the trusted baseline.
+author: CrisWorking
+inputs:
+  mode:
+    description: "What to do: scrub, stage, gate, baseline-check, find-run or nightly. There is no default: every step names its mode."
+    required: true
+  artifact:
+    description: "scrub, stage: the result artifact name (pipegen-out-...)."
+    required: false
+  tool:
+    description: "scrub, stage: the reviewed id of the scanner."
+    required: false
+  stage:
+    description: "stage, and scrub for a secrets tool: the stage folder RUNNER_TEMP/pipegen-stage/<artifact>."
+    required: false
+  format:
+    description: "scrub: sarif or zap-json."
+    required: false
+  raw:
+    description: "scrub: the raw result, RUNNER_TEMP/pipegen-raw/<artifact>/<file>."
+    required: false
+  out:
+    description: "scrub: where the scrubbed copy goes, RUNNER_TEMP/pipegen-out/<artifact>/<file>."
+    required: false
+  fp-key:
+    description: "scrub, gate, baseline-check: the PIPEGEN_FP_KEY secret. It is masked first, and is empty on a fork pull request."
+    required: false
+  jobs:
+    description: "gate: toJSON(needs)."
+    required: false
+  job-list:
+    description: "gate: the trusted job list literal pipegen wrote."
+    required: false
+  not-proven:
+    description: "gate: a JSON list of need ids judged as not proven."
+    required: false
+  skipped:
+    description: "gate: a JSON list of need ids skipped at setup."
+    required: false
+  policy:
+    description: "gate: the policy for private repositories. A public repository uses the built-in default."
+    required: false
+  protected-paths:
+    description: "gate: extra protected path globs, as a JSON list."
+    required: false
+  service-roots:
+    description: "gate: the service folders, as a JSON list."
+    required: false
+  block-from:
+    description: "gate, nightly: the PIPEGEN_BLOCK_FROM variable."
+    required: false
+  block-from-recorded:
+    description: "gate, nightly: the date the install recorded for blocking (YYYY-MM-DD)."
+    required: false
+  github-token:
+    description: "gate, baseline-check, find-run, nightly: the workflow token (GITHUB_TOKEN). It is masked first."
+    required: false
+  sha:
+    description: "find-run: the commit to find the gated run for."
+    required: false
+  central-workflow:
+    description: "find-run: the path of the central workflow."
+    required: false
+  central-sha:
+    description: "find-run: the commit of the central workflow."
+    required: false
+  merged-at:
+    description: "nightly: when the install was merged."
+    required: false
+outputs:
+  sha256:
+    description: "scrub: the sha256 of the scrubbed file (empty on a tool error)."
+  status:
+    description: "scrub: ok or tool-error. stage: ok or error."
+  error:
+    description: "scrub, stage: a short error text (empty when ok)."
+  found:
+    description: "baseline-check: found or missing (a verified trusted baseline exists or not)."
+  result:
+    description: "gate: pass, warn or block."
+runs:
+  using: node24
+  main: dist/index.js

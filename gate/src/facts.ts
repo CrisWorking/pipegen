@@ -100,8 +100,8 @@ export function licenceCoverage(kinds: readonly string[] | undefined): string[] 
   return [...new Set(kinds)].filter((k) => LICENCE_UNREADABLE.has(k)).sort().map((k) => `${k}: not covered (lockfile type)`);
 }
 
-/** The repository of this run, from the payload, checked against GITHUB_REPOSITORY. */
-function repoOf(payload: unknown, repository: string): (RepoRef & { private: boolean | undefined }) | string {
+/** The repository of this run, from the payload, checked against GITHUB_REPOSITORY (a text: why not). The action's baseline-check mode reads it too. */
+export function repoOf(payload: unknown, repository: string): (RepoRef & { private: boolean | undefined }) | string {
   const r = at(payload, 'repository');
   const id = at(r, 'id');
   const name = at(r, 'name');
@@ -252,7 +252,7 @@ export async function gatherGateInput(ctx: GateContext, client: GateGithub, io: 
   return {
     event, checks, baseScan: mapped.baseScan, ancestry, baseline: loaded.baseline, sameRunTools: settings.sameRunTools, installing, diff,
     rangeScans: [], mode: mode.mode, policy: settings.policy, notProvenNeeds: settings.notProven, skipped: settings.skipped,
-    settingsErrors: settings.errors, integrity, floorNeeds: settings.floorNeeds, notes: [...new Set(notes)], coverage,
+    settingsErrors: settings.errors, integrity, floorNeeds: settings.floorNeeds, notes: [...new Set(notes)], coverage, cleanRun: marker.state,
   };
 }
 
