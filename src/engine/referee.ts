@@ -28,7 +28,7 @@
 //   SARIF; findSecretLike runs over every file (S18). The workflow linters (actionlint, zizmor) run through `deps.runLinters`
 //   (default: linters.ts runLinters, 7b), which tests replace with a stub.
 import { isDeepStrictEqual } from 'node:util';
-import { isAlias, isMap, isScalar, isSeq, LineCounter, parseAllDocuments, visit, type Document, type Node as YamlNode, type Pair } from 'yaml';
+import { isMap, isScalar, LineCounter, visit, type Document, type Node as YamlNode, type Pair } from 'yaml';
 import { findSecretLike } from '../ai/redact.js';
 import { safeText } from '../util/safe-text.js';
 import { GATE_CHECK_NAME, type CreatedFile, type OutputFormat, type PipegenInserted, type PipelineDraft, type ReviewedTool, type StepSpec } from '../types.js';
@@ -41,6 +41,7 @@ import { NEED_ID_CATEGORY, toolCoversNeed } from './need-ids.js';
 import { PLATFORM_ACTION_IDS, type PlatformActions } from './pin.js';
 import { APP_RUNNING_CATEGORIES, renderRangeScan, TRIVY_LAUNCH_RE } from './render-cli.js';
 import { EXPR, own, show } from './render-error.js';
+import { isObj, parseYaml, uniq, type Obj, type Parsed } from './yaml-parse.js';
 import { createdFileProblems, duplicatePathProblems, type CreatedRule } from './created-files.js';
 import { ACTION_PATH_RE, checkExpressions, createdPathProblem, checkJobOrder, gateResultUploadProblems, IF_VALUES, isDangerousName, isReviewed, isScrubStep, isStageStep, jobOutputsProblems, SECRET_REF_RE, STEP_KEYS as STEP_KEY_LIST, WORKFLOW_PATH_RE, type RenderedStep, type ScanFact } from './job-rules.js';
 import { containerRefusal, RenderError, renderProjectScript, renderStep, sameDedupeContent, type RenderContext } from './render-step.js';
@@ -243,62 +244,10 @@ const SENTINELS = [
 ] as const;
 
 type Add = (file: string, check: RefereeCheck, message: string, line?: number, repo?: CreatedFile['repo']) => void;
-type Obj = Record<string, unknown>;
-const isObj = (v: unknown): v is Obj => typeof v === 'object' && v !== null && !Array.isArray(v);
 const hasExpr = (v: unknown): boolean => (typeof v === 'string' ? v.includes(EXPR) : Array.isArray(v) ? v.some(hasExpr) : isObj(v) ? Object.entries(v).some(([k, x]) => k.includes(EXPR) || hasExpr(x)) : false);
-const uniq = <T>(xs: Iterable<T>): T[] => [...new Set(xs)];
 
 // ---------- parsing (S29) ----------
 
-/** `scalars`: every string key and value as parsed (escapes decoded), for the secret-value check (S18). */
-interface Parsed { doc: Document; js: Obj; lines: LineCounter; scalars: string[] }
-
-/**
- * One YAML document as a map, or the problems that make pipegen refuse it. `strict` (a file pipegen wrote whole): no
- * anchor or alias at all. `user` (a user's own workflow pipegen edited): the user's anchors are theirs, so they resolve
- * (bounded); the parts pipegen inserted are checked for them separately. Both refuse `<<` merge keys, tags, directives,
- * duplicate keys, a key that is not text, more than one document and anything that is not a map.
- */
-function parseYaml(text: string, mode: 'strict' | 'user'): { parsed: Parsed } | { problems: string[] } {
-  const lines = new LineCounter();
-  const problems: string[] = [];
-  let docs: Document[];
-  try {
-    docs = parseAllDocuments(text, { uniqueKeys: true, lineCounter: lines, prettyErrors: false }) as unknown as Document[];
-  } catch {
-    return { problems: ['it is not YAML pipegen can read'] };
-  }
-  if (docs.length !== 1) return { problems: [`it holds ${docs.length} YAML documents; a workflow is exactly one`] };
-  const doc = docs[0] as Document;
-  for (const e of doc.errors) problems.push(e.code === 'DUPLICATE_KEY' ? 'a key is set twice (a later one could hide the first from a reader)' : `it is not valid YAML (${safeText(e.code, 40)})`);
-  if (doc.warnings.length > 0) problems.push(`the YAML parser warns about it (${safeText(doc.warnings[0]?.code ?? '', 40)})`);
-  const directives = doc.directives;
-  if (directives?.yaml.explicit === true || Object.keys(directives?.tags ?? {}).some((h) => h !== '!!' && h !== '!')) problems.push('it has a YAML directive (%YAML or %TAG), which changes how values are read');
-  const scalars: string[] = [];
-  visit(doc, {
-    Alias() { if (mode === 'strict') problems.push('it uses a YAML alias (*name), which can copy a key past a reader'); },
-    // the S18 values are collected here, not in a Scalar visitor: one would replace this one for scalars, and their tags and
-    // anchors would go unchecked (review-7a-r1 finding 2)
-    Node(_, n) {
-      if (isScalar(n) && typeof n.value === 'string') scalars.push(n.value);
-      if (n.tag !== undefined) problems.push('it has a YAML tag (!!type), which changes what a value is');
-      if (mode === 'strict' && n.anchor !== undefined) problems.push('it defines a YAML anchor (&name)');
-    },
-    Pair(_, p) {
-      if (!isScalar(p.key) || typeof p.key.value !== 'string') problems.push('a key is not plain text');
-      else if (p.key.value === '<<') problems.push('it has a << merge key, which can bring in keys a reader does not see');
-    },
-  });
-  if (problems.length > 0) return { problems: uniq(problems) };
-  let js: unknown;
-  try {
-    js = doc.toJS({ maxAliasCount: mode === 'strict' ? 0 : 100 });
-  } catch {
-    return { problems: ['its aliases can not be resolved within the limit'] };
-  }
-  if (!isObj(js)) return { problems: ['it is not a map of keys'] };
-  return { parsed: { doc, js, lines, scalars } };
-}
 
 /** The lines (1-based) a node covers, from its first character to the end of its value. */
 function linesOf(lc: LineCounter, from: number, to: number, into: Set<number>): void {
