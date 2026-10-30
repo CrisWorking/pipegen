@@ -30,6 +30,7 @@ import { safeText } from '../../src/util/safe-text.js';
 import { CONTENT_FORMS, fingerprintAll, isQuotingFinding, keyId, keyProblem, maskSecretShapes, POSITION_FORMS, type FpBy, type FingerprintedFinding } from './fingerprint.js';
 import { fail, getOwn, isObj, MAX_RAW_BYTES, ReadError, readJson, type ParsedFinding, type ParseResult } from './parse-common.js';
 import { SARIF_TOOLS, parseSarifText } from './sarif.js';
+import { applyStage, readStage, StageError, STAGED_NAME_RE, type Stage, type StagedFindings } from './stage.js';
 import { ZAP_TOOL, parseZapJsonText } from './zap.js';
 
 export type ScrubFormat = 'sarif' | 'zap-json';
@@ -47,6 +48,12 @@ export interface ScrubOptions {
   mask?: (secret: string) => void;
   /** The raw size cap in bytes (default 64 MiB). */
   maxBytes?: number;
+  /**
+   * C1c: the stage folder of a secrets scan (`$RUNNER_TEMP/pipegen-stage/<artifact>`, gate/src/stage.ts). The scanner ran on its
+   * neutral names; the scrub checks the folder against its manifest, proves coverage by the canaries and maps every finding back to
+   * the original path and line, reading each region from the staged copy. Only for the secrets tools.
+   */
+  stage?: string;
 }
 export type ScrubOutcome =
   | { status: 'ok'; bytes: Buffer; sha256: string; findings: number; keyId?: string; notes: string[]; fpBy: Record<FpBy, number> }
@@ -172,17 +179,38 @@ export function scrubBytes(raw: Uint8Array, opts: ScrubOptions): ScrubOutcome {
     const maxBytes = opts.maxBytes ?? MAX_RAW_BYTES;
     let parsed: ParseResult;
     let secretsTool = false;
+    let stage: Stage | undefined;
     if (opts.format === 'sarif') {
       if (!Object.hasOwn(SARIF_TOOLS, opts.tool)) return toolError(`${JSON.stringify(safeText(opts.tool, 60))} is not a tool whose SARIF the gate reads`, key);
       secretsTool = SARIF_TOOLS[opts.tool].secrets;
-      parsed = parseSarifText(raw, opts.tool, { workspace: opts.workspace, limits: { maxBytes } });
+      if (opts.stage !== undefined) {
+        if (!secretsTool) return toolError('a stage folder is only for the secrets tools', key);
+        try {
+          stage = readStage(opts.stage);
+        } catch (e) {
+          return toolError(e instanceof StageError ? e.message : 'the stage folder could not be read', key);
+        }
+      }
+      parsed = stage === undefined
+        ? parseSarifText(raw, opts.tool, { workspace: opts.workspace, limits: { maxBytes } })
+        : parseSarifText(raw, opts.tool, { workspace: stage.files, exactNames: STAGED_NAME_RE, limits: { maxBytes } });
     } else if (opts.format === 'zap-json') {
+      if (opts.stage !== undefined) return toolError('a stage folder is only for the secrets tools', key);
       if (opts.tool !== ZAP_TOOL) return toolError(`${JSON.stringify(safeText(opts.tool, 60))} is not a tool whose ZAP report the gate reads`, key);
       parsed = parseZapJsonText(raw, opts.tool, { limits: { maxBytes } });
     } else {
       return toolError('the result format is not one the gate reads', key);
     }
     if (parsed.toolError !== undefined) return toolError(parsed.toolError, key);
+    let staged: StagedFindings | undefined;
+    if (stage !== undefined) {
+      try {
+        staged = applyStage(parsed.findings, stage, opts.tool);
+      } catch (e) {
+        return toolError(e instanceof StageError ? e.message : 'the staged findings could not be mapped back', key);
+      }
+      parsed = { findings: staged.findings, notes: [...parsed.notes, ...staged.notes] };
+    }
 
     const needsKey = secretsTool || parsed.findings.some((f) => f.secret || isQuotingFinding(f));
     const problem = keyProblem(key, forkFromEvent(opts.eventText), needsKey);
@@ -190,7 +218,10 @@ export function scrubBytes(raw: Uint8Array, opts: ScrubOptions): ScrubOutcome {
     const usedKey = needsKey && key !== '' ? key : undefined;
 
     const regions: Buffer[] = [];
-    const findings = fingerprintAll(parsed.findings, { fpKey: usedKey, workspace: opts.workspace, onRegion: (b) => { regions.push(b); } });
+    const findings = fingerprintAll(parsed.findings, {
+      fpKey: usedKey, workspace: opts.workspace, onRegion: (b) => { regions.push(b); },
+      ...(staged === undefined ? {} : { regionOf: staged.regionOf, fileHashOf: staged.fileHashOf }),
+    });
     const notes = [...parsed.notes, ...lineNotes(findings)].slice(0, MAX_NOTES).map((n) => clip(maskSecretShapes(n), MAX_NOTE_CHARS));
     const bytes = Buffer.from(opts.format === 'sarif' ? sarifOut(opts.tool, findings, notes, usedKey) : zapOut(findings, notes), 'utf8');
 
@@ -202,7 +233,7 @@ export function scrubBytes(raw: Uint8Array, opts: ScrubOptions): ScrubOutcome {
     for (const region of regions) {
       if (region.length >= 8 && (bytes.includes(region) || written.includes(JSON.stringify(region.toString('utf8')).slice(1, -1)))) return toolError('the output would hold the text of a secret region, so it was not written', key);
     }
-    const fpBy: Record<FpBy, number> = { hash: 0, region: 0, quoted: 0, line: 0, nokey: 0, 'quoted-nokey': 0 };
+    const fpBy: Record<FpBy, number> = { hash: 0, region: 0, quoted: 0, file: 0, line: 0, nokey: 0, 'quoted-nokey': 0 };
     for (const f of findings) fpBy[f.fpBy]++;
     return { status: 'ok', bytes, sha256: sha256(bytes), findings: findings.length, ...(usedKey === undefined ? {} : { keyId: keyId(usedKey) }), notes, fpBy };
   } catch {
@@ -431,6 +462,10 @@ export function scrubFile(opts: ScrubFileOptions): ScrubFileResult {
   } catch {
     return fail1('the key could not be masked in the logs, so the scrub did not run');
   }
+  // C1c: a secrets scan always runs on the stage folder; without it its coverage can not be proven, so it is never read as clean
+  if (Object.hasOwn(SARIF_TOOLS, opts.tool) && SARIF_TOOLS[opts.tool].secrets && opts.stage === undefined) {
+    return fail1('the secrets scan has no stage folder (the stage input): pipegen stages the checkout under neutral names before every secrets scan, and without it the scan\'s coverage can not be proven');
+  }
   let raw: Buffer;
   try {
     raw = readPlainFile(opts.raw, opts.maxBytes ?? MAX_RAW_BYTES, 'the raw result');
@@ -445,7 +480,7 @@ export function scrubFile(opts: ScrubFileOptions): ScrubFileResult {
       eventText = undefined;   // unreadable: not a fork (the stricter rule)
     }
   }
-  const scrubbed = scrubBytes(raw, { tool: opts.tool, format: opts.format, fpKey: opts.fpKey, eventText, workspace: opts.workspace, maxBytes: opts.maxBytes });
+  const scrubbed = scrubBytes(raw, { tool: opts.tool, format: opts.format, fpKey: opts.fpKey, eventText, workspace: opts.workspace, maxBytes: opts.maxBytes, ...(opts.stage === undefined ? {} : { stage: opts.stage }) });
   if (scrubbed.status !== 'ok') return { status: 'tool-error', error: scrubbed.error };
   // The result is written to a temporary file of its own in the artifact folder and published whole (a hard link that cannot replace
   // a file, then the temporary name removed): a failed write leaves no partial result for the upload step to pick up (review m5).

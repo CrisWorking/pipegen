@@ -82,6 +82,9 @@ describe.skipIf(!live)('R1-C1 and R1-C2 against the real binaries', () => {
       git(dir, 'add', '-A');
       git(dir, 'commit', '-q', '-m', 'head');
       expect(findings(id, dir).map((f) => f.fingerprint)).not.toContain(old);
+      // review-C1b-r2 m1: pinned outcome of the UNSTAGED command: nothing at all, because dir mode never reads a file it takes for an archive
+      // (R2-C1). The staged scan reads its raw bytes instead (test/secrets-stage-live.test.ts, r1-gz staged).
+      expect(findings(id, dir)).toHaveLength(0);
     });
 
     it(`${id} (r1-arch): a key inside x.zip with a decoy folder "x.zip!in/" never gets the old key's fingerprint, and no finding is mapped to the decoy`, () => {
@@ -96,6 +99,8 @@ describe.skipIf(!live)('R1-C1 and R1-C2 against the real binaries', () => {
       const f = findings(id, dir);
       expect(f.map((x) => x.fingerprint)).not.toContain(old);
       expect(f.filter((x) => x.file?.includes('!'))).toEqual([]);
+      // review-C1b-r2 m1: the unstaged command reads neither the zip nor (its decoy aside) anything: R2-C1; staged, see secrets-stage-live
+      expect(f).toHaveLength(0);
     });
 
     for (const keyed of [true, false]) {

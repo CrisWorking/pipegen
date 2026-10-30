@@ -128,7 +128,7 @@ describe('I1: every fingerprint says which form it is', () => {
   const finding = (over: Partial<ParsedFinding>): ParsedFinding => ({ tool: 'hadolint', ruleId: 'DL3000', severity: 'high', file: 'Dockerfile', line: 2, message: 'm', uriUnmapped: false, [SF]: false, ...over });
 
   it('the forms are exported, split into content forms and position forms (C2 compares them differently)', () => {
-    expect([...CONTENT_FORMS].sort()).toEqual(['hash', 'quoted', 'region']);
+    expect([...CONTENT_FORMS].sort()).toEqual(['file', 'hash', 'quoted', 'region']);   // file: C1c, a staged file not scanned or a whole-file finding
     expect([...POSITION_FORMS].sort()).toEqual(['line', 'nokey', 'quoted-nokey']);
     for (const f of CONTENT_FORMS) expect(isPositionForm(f)).toBe(false);
     for (const f of POSITION_FORMS) expect(isPositionForm(f)).toBe(true);
@@ -266,10 +266,10 @@ describe('I3: messages and fingerprints come from the rule template (semgrep) or
     }
   });
 
-  it('the gate scrub pulls in redact-core and nothing else of src/ai/ (no child_process, picomatch or limits.js)', async () => {
+  it('the gate scrub pulls in redact-core and the scan-staging core (C1c) and nothing else of src/ai/ (no child_process, picomatch or limits.js)', async () => {
     const r = await build({ entryPoints: [join(import.meta.dirname, '..', 'gate/src/scrub.ts')], bundle: true, write: false, metafile: true, platform: 'node', format: 'esm', packages: 'external', logLevel: 'silent' });
     const files = Object.keys(r.metafile.inputs);
-    expect(files.filter((f) => f.startsWith('src/ai/'))).toEqual(['src/ai/redact-core.ts']);
+    expect(files.filter((f) => f.startsWith('src/ai/')).sort()).toEqual(['src/ai/redact-core.ts', 'src/ai/scan-staging.ts']);
     expect(files).not.toContain('src/read/limits.ts');
     const externals = new Set(Object.values(r.metafile.inputs).flatMap((i) => i.imports.filter((x) => x.external).map((x) => x.path)));
     expect([...externals].filter((p) => ['node:child_process', 'child_process', 'picomatch', 'fast-glob', 'yaml'].includes(p))).toEqual([]);

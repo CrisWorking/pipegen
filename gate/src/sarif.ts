@@ -29,6 +29,11 @@ export interface ParseOptions {
   workspace?: string;
   /** Redundant for the secrets tools (the table says it), and never able to turn the secret handling off. */
   secretsTool?: boolean;
+  /**
+   * C1c, a staged scan: the only uris that map, exactly as written (no prefix stripped, no `.` folded, no decoding): the neutral names
+   * of the stage step. Any other uri is unmapped (and the staged scrub makes that a tool error).
+   */
+  exactNames?: RegExp;
   limits?: Partial<ParseLimits>;
 }
 
@@ -353,7 +358,8 @@ function readRun(run: unknown, index: number, toolId: string, info: SarifToolInf
       } else {
         // a secrets tool's uri with "!" is an archive member path (outer.zip!in/s.txt) or a made-up one: the bytes the scanner matched are not a
         // workspace file's, so it is unmapped (fail closed); archives are not opened at all by the reviewed command (--max-archive-depth 0), this is the belt
-        file = info.secrets && uri.includes('!') ? undefined : mapUri(uri, baseId, run, bases, opts.workspace, info.uriEncoding, at);
+        file = opts.exactNames !== undefined ? (baseId === undefined && opts.exactNames.test(uri) ? uri : undefined)
+          : info.secrets && uri.includes('!') ? undefined : mapUri(uri, baseId, run, bases, opts.workspace, info.uriEncoding, at);
         uriUnmapped = file === undefined;
         if (uriUnmapped) unmapped++;
       }

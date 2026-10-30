@@ -329,19 +329,20 @@ describe('scrub: key handling (S11)', () => {
 });
 
 describe('scrub: sha256 and the written file', () => {
+  // a secrets tool needs a stage folder since C1c (test/gate-stage.test.ts); the written-file rules are the same for every tool
   it('scrub: sha256 is of the written bytes (scrubFile, files read back from disk)', () => {
     const base = makeTempDir();
     const ws = plantedWorkspace();
-    const raw = join(base, 'pipegen-raw', 'pipegen-out-sast', 'gitleaks.sarif');
+    const raw = join(base, 'pipegen-raw', 'pipegen-out-sast', 'semgrep.sarif');
     mkdirSync(join(base, 'pipegen-raw', 'pipegen-out-sast'), { recursive: true });
-    writeFileSync(raw, read('gitleaks.sarif'));
-    const out = join(base, 'pipegen-out', 'pipegen-out-sast', 'gitleaks.sarif');
-    const r = scrubFile({ tool: 'gitleaks', format: 'sarif', artifact: 'pipegen-out-sast', raw, out, fpKey: KEY, workspace: ws, eventText: PUSH_EVENT });
+    writeFileSync(raw, read('semgrep.sarif'));
+    const out = join(base, 'pipegen-out', 'pipegen-out-sast', 'semgrep.sarif');
+    const r = scrubFile({ tool: 'semgrep', format: 'sarif', artifact: 'pipegen-out-sast', raw, out, fpKey: KEY, workspace: ws, eventText: PUSH_EVENT });
     expect(r.status).toBe('ok');
     expect(r.sha256).toBe(sha(readFileSync(out)));
     expect(r.sha256).toMatch(/^[0-9a-f]{64}$/);
     expect(scrubOutputs('pipegen-out-sast', r)).toEqual({ 'pipegen-out-sast-sha256': r.sha256, 'pipegen-out-sast-status': 'ok', 'pipegen-out-sast-error': '' });
-    expect(readdirSync(join(base, 'pipegen-out', 'pipegen-out-sast'))).toEqual(['gitleaks.sarif']);
+    expect(readdirSync(join(base, 'pipegen-out', 'pipegen-out-sast'))).toEqual(['semgrep.sarif']);
   });
 
   const setup = (content?: Buffer | string) => {
@@ -472,9 +473,9 @@ describe('scrub: input checks', () => {
 });
 
 describe('gate/src: no new dependency', () => {
-  it('fingerprint.ts and scrub.ts import only node:crypto, node:fs, node:path and files of gate/src, src/types.ts, src/util/safe-text.ts and src/ai/redact-core.ts', () => {
-    const allowed = new Set(['node:crypto', 'node:fs', 'node:path', './fingerprint.js', './parse-common.js', './sarif.js', './zap.js', '../../src/types.js', '../../src/util/safe-text.js', '../../src/ai/redact-core.js']);
-    for (const f of ['fingerprint.ts', 'scrub.ts']) {
+  it('fingerprint.ts, scrub.ts and stage.ts import only node:crypto, node:fs, node:path and files of gate/src, src/types.ts, src/util/safe-text.ts, src/ai/redact-core.ts and src/ai/scan-staging.ts', () => {
+    const allowed = new Set(['node:crypto', 'node:fs', 'node:path', './fingerprint.js', './parse-common.js', './sarif.js', './zap.js', './stage.js', './generated/secrets-path-rules.js', '../../src/types.js', '../../src/util/safe-text.js', '../../src/ai/redact-core.js', '../../src/ai/scan-staging.js']);
+    for (const f of ['fingerprint.ts', 'scrub.ts', 'stage.ts']) {
       const text = readFileSync(join(import.meta.dirname, '..', 'gate', 'src', f), 'utf8');
       const specs = [...text.matchAll(/^(?:import|export)\s[^;]*?from\s+'([^']+)'/gms)].map((m) => m[1]);
       expect(specs.length, f).toBeGreaterThan(0);

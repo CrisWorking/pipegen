@@ -30,15 +30,16 @@ const FILE_SCAN_MAX = 16 * 1024 * 1024;
 /**
  * How a fingerprint was made (written as `pipegenFpBy`, read back by C2). The forms differ in what they can see:
  * - content forms: `hash` (every non-secret: tool, rule, file, message), `region` (a secret: an HMAC over the bytes the
- *   scanner matched) and `quoted` (an HMAC over a message that quotes a string). The same text gives the same value
- *   wherever it moves, so C2 counts them per (tool, fingerprint) and an extra occurrence is new.
+ *   scanner matched), `quoted` (an HMAC over a message that quotes a string) and `file` (C1c: a staged file the secrets scanner
+ *   did not confirm it read, `secret:not-scanned`: an HMAC over the sha256 of the whole original file). The same text gives the
+ *   same value wherever it moves, so C2 counts them per (tool, fingerprint) and an extra occurrence is new.
  * - position forms: `line` (a secret whose region could not be read, and every trivy secret: an HMAC of the place),
  *   `nokey` (a secret without a key, a fork: a hash of the place) and `quoted-nokey` (the same for a quoting rule). They hold
  *   no content, so a secret REPLACED in place keeps its value. C2 must read them as new when the count says so, or when any
  *   line of the finding is on an added line of the diff, or when it has no mapped repository file (review I1).
  */
-export type FpBy = 'hash' | 'region' | 'quoted' | 'line' | 'nokey' | 'quoted-nokey';
-export const CONTENT_FORMS: readonly FpBy[] = Object.freeze(['hash', 'region', 'quoted'] as const);
+export type FpBy = 'hash' | 'region' | 'quoted' | 'file' | 'line' | 'nokey' | 'quoted-nokey';
+export const CONTENT_FORMS: readonly FpBy[] = Object.freeze(['hash', 'region', 'quoted', 'file'] as const);
 export const POSITION_FORMS: readonly FpBy[] = Object.freeze(['line', 'nokey', 'quoted-nokey'] as const);
 /** True for a fingerprint that holds no content of the finding (see FpBy). */
 export const isPositionForm = (by: FpBy): boolean => POSITION_FORMS.includes(by);
@@ -51,6 +52,13 @@ export interface FpContext {
   onRegion?: (bytes: Buffer) => void;
   /** The files read so far in this scrub (fingerprintAll makes one when this is absent). */
   cache?: RegionCache;
+  /**
+   * C1c, a staged scan: the region of a secret finding as the scanner read it, from the staged copy (the finding itself carries the
+   * ORIGINAL file and line by then). When this gives a result, the workspace is not read for that finding.
+   */
+  regionOf?: (f: ParsedFinding) => RegionResult | undefined;
+  /** C1c: the sha256 of the original file of a `secret:not-scanned` finding, which takes the `file` form. */
+  fileHashOf?: (f: ParsedFinding) => string | undefined;
 }
 export interface FpResult {
   fingerprint: string;
@@ -119,7 +127,9 @@ const COLUMN_RULES: Readonly<Record<string, { shiftAfterFirstLine: number }>> = 
 }));
 
 export type RegionResult = { ok: true; bytes: Buffer } | { ok: false; reason: string };
-const no = (reason: string): RegionResult => ({ ok: false, reason });
+/** A region and where it is in its file: bytes `[from, to)`. */
+export type RegionSpan = { ok: true; bytes: Buffer; from: number; to: number } | { ok: false; reason: string };
+const no = (reason: string): { ok: false; reason: string } => ({ ok: false, reason });
 
 /** One workspace file as the region reader holds it: its bytes (at most FILE_SCAN_MAX), and the offsets of the line starts found so far. */
 type FileRead = { ok: true; buf: Buffer; got: number; size: number; starts: number[]; atEnd: boolean } | { ok: false; reason: string };
@@ -214,6 +224,12 @@ function lineStart(f: Extract<FileRead, { ok: true }>, n: number): number | unde
  * `cache`: the files already read in this scrub (see RegionCache); without one, the file is read for this call only.
  */
 export function readRegion(workspace: string, f: ParsedFinding, cache?: RegionCache): RegionResult {
+  const span = regionSpan(workspace, f, cache);
+  return span.ok ? { ok: true, bytes: span.bytes } : span;
+}
+
+/** readRegion, with the byte offsets of the region in its file (the staged scrub maps them back through the manifest, C1c). */
+export function regionSpan(workspace: string, f: ParsedFinding, cache?: RegionCache): RegionSpan {
   const rule = Object.hasOwn(COLUMN_RULES, f.tool) ? COLUMN_RULES[f.tool] : undefined;
   if (rule === undefined) return no(`the columns of ${f.tool} are not known (they are placeholders there), so the region is not read`);
   const { line, startColumn, endColumn } = f;
@@ -242,7 +258,7 @@ export function readRegion(workspace: string, f: ParsedFinding, cache?: RegionCa
     const bytes = Buffer.from(read.buf.subarray(from, to));
     // a NUL cannot be in text a scanner matched in a source file; it is the sign of a file the scanner and the scrub read differently (review C1)
     if (bytes.includes(0)) return no('the region holds a NUL byte');
-    return { ok: true, bytes };
+    return { ok: true, bytes, from, to };
   } catch {
     return no('the file cannot be read');
   }
@@ -301,8 +317,17 @@ export function fingerprintFinding(f: ParsedFinding, ctx: FpContext): FpResult {
   const key = ctx.fpKey ?? '';
   const where = [field(f.tool), field(f.ruleId)];
   if (key === '') return { fingerprint: `secret-nokey:${sha([...where, uriSlot(f), field(f.line)].join('\0'))}`, by: 'nokey' };
+  const fileHash = ctx.fileHashOf?.(f);
+  if (fileHash !== undefined) return { fingerprint: `secret:${hmac(key, ['file', ...where, field(fileHash)].join('\0'))}`, by: 'file' };
+  const staged = ctx.regionOf?.(f);
   let why: string;
-  if (f.file === undefined) why = 'the finding has no file in the workspace';
+  if (staged !== undefined) {
+    if (staged.ok) {
+      ctx.onRegion?.(staged.bytes);
+      return { fingerprint: `secret:${hmac(key, Buffer.concat([Buffer.from(`${where.join('\0')}\0`), staged.bytes]))}`, by: 'region' };
+    }
+    why = staged.reason;
+  } else if (f.file === undefined) why = 'the finding has no file in the workspace';
   else if (ctx.workspace === undefined || ctx.workspace === '') why = 'no workspace to read the region from';
   else {
     const region = readRegion(ctx.workspace, f, ctx.cache);
