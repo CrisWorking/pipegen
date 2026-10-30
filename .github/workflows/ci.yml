@@ -118,6 +118,34 @@ jobs:
       - name: Fail if THIRD_PARTY_NOTICES differs from the committed file
         run: git diff --exit-code -- THIRD_PARTY_NOTICES
 
+  gate-dist:
+    if: github.event_name != 'schedule'
+    # GitHub runs the COMMITTED gate/dist/index.js, not the TypeScript (gate/action.yml). Rebuild it and the generated gate view
+    # from source and fail when either differs from what is committed (Plan C, C6).
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    concurrency:
+      group: ci-gate-dist-${{ github.event_name == 'pull_request' && github.ref || github.sha }}
+      cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+      - run: npm ci
+      - run: npm run build:gate
+      - name: Fail if gate/dist or gate/src/generated differs from the committed files
+        run: |
+          git diff --exit-code -- gate/dist gate/src/generated
+          # a file the build adds that is not committed is a difference too
+          test -z "$(git status --porcelain -- gate/dist gate/src/generated)"
+          # nothing but the three generated files may be committed there (an extra file would ship unreviewed code)
+          test "$(git ls-files gate/dist | LC_ALL=C sort | tr '\n' ' ')" = "gate/dist/README.md gate/dist/THIRD_PARTY_NOTICES gate/dist/index.js "
+
   workflow-lint:
     if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
@@ -202,6 +230,11 @@ jobs:
         env:
           PIPEGEN_LIVE_TESTS: '1'
           # read-only job token, given to this step only: several hundred GitHub API lookups
+          GITHUB_TOKEN: ${{ github.token }}
+      - name: Every package of pipegen's npm closure locks, dated and tied to the registry (weekly, and when data/ changes)
+        if: steps.changed.outputs.run == 'true'
+        run: node scripts/cooldown.ts --base-dir . --head-dir . --all
+        env:
           GITHUB_TOKEN: ${{ github.token }}
 
   cooldown:

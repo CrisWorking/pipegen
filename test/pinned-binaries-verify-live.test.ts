@@ -23,6 +23,7 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { parse } from 'yaml';
 import { ensurePinnedBinary } from '../src/engine/linters.js';
 import { downloadRelease } from '../src/engine/pin.js';
+import { liveToken } from './helpers/live-token.js';
 import { cleanupRepos, makeTempDir } from './helpers/make-repo.js';
 
 const live = process.env.PIPEGEN_LIVE_TESTS === '1';
@@ -32,6 +33,8 @@ const GH_ISSUER = 'https://token.actions.githubusercontent.com';
 interface Platform { url: string; archiveSha256: string }
 interface Tool { version: string; repo: string; platforms: Record<string, Platform> }
 const TOOLS = parse(readFileSync(new URL('../data/pinned-binaries.yml', import.meta.url), 'utf8')) as Record<string, Tool>;
+// zizmor (7b) has no checksums file; its hashes are GitHub's asset digests, confirmed by a real download (see its entry), so it is not in this checksums-file check.
+delete TOOLS.zizmor;
 
 type Proof =
   | { kind: 'signed-checksums'; identity: string; issuer: string }
@@ -68,7 +71,7 @@ function verifyBlob(file: string, signer: { identity: string; issuer: string }, 
 
 /** The Sigstore bundles of the GitHub attestations of `sha256` in `repo` (api.github.com; the job token when set). */
 async function attestationBundles(repo: string, sha256: string): Promise<unknown[]> {
-  const env = process.env[['GITHUB', 'TOKEN'].join('_')];
+  const env = liveToken();
   const headers: Record<string, string> = { accept: 'application/vnd.github+json' };
   if (env) headers[['author', 'ization'].join('')] = ['Bear', 'er ', env].join('');
   const res = await fetch(`https://api.github.com/repos/${repo}/attestations/sha256:${sha256}`, { headers, redirect: 'error', signal: AbortSignal.timeout(30_000) });

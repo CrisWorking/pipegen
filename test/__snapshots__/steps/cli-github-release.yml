@@ -1,0 +1,101 @@
+- id: tool-install-8f869db3aaed8790
+  name: "pipegen: install trivy"
+  run: |-
+    set -euo pipefail
+    unset CDPATH
+    pg_fail() { echo "pipegen: $1" >&2; exit 1; }
+    PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+    home="$RUNNER_TEMP/pipegen-home/pipegen-out-iac"
+    mkdir -p "$RUNNER_TEMP/pipegen-home" "$home"
+    sys=(
+      /usr/bin/env -i
+      "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+      "HOME=$home"
+    )
+    bin="$RUNNER_TEMP/pipegen-bin/pipegen-out-iac"
+    dl="$RUNNER_TEMP/pipegen-dl/pipegen-out-iac"
+    mkdir -p "$RUNNER_TEMP/pipegen-bin" "$RUNNER_TEMP/pipegen-dl"
+    mkdir "$bin" "$dl"
+    "${sys[@]}" curl --proto '=https' --proto-redir '=https' --tlsv1.2 --fail --silent --show-error --location --max-redirs 5 --retry 3 --output "$dl/asset" "$PIPEGEN_DL_URL"
+    cd "$dl"
+    printf '%s  asset\n' "$PIPEGEN_DL_SHA256" | "${sys[@]}" sha256sum --check --strict -
+    mkdir "$bin/pkg"
+    "${sys[@]}" tar -xzf asset -C "$bin/pkg" --no-same-owner
+    n="$("${sys[@]}" find "$bin/pkg" -name trivy -type f | wc -l)"
+    o="$("${sys[@]}" find "$bin/pkg" -name trivy ! -type f | wc -l)"
+    if [ "$n" -ne 1 ] || [ "$o" -ne 0 ]; then pg_fail "the archive must hold exactly one regular file named trivy"; fi
+    found="$("${sys[@]}" find "$bin/pkg" -name trivy -type f)"
+    mv -- "$found" "$bin/trivy"
+    if [ ! -f "$bin/trivy" ] || [ -L "$bin/trivy" ]; then pg_fail "the tool is not a regular file"; fi
+    chmod 0755 "$bin/trivy"
+  shell: bash
+  env:
+    BASH_ENV: ""
+    ENV: ""
+    PIPEGEN_DL_URL: https://github.com/aquasecurity/trivy/releases/download/v0.76.0/trivy_0.76.0_Linux-64bit.tar.gz
+    PIPEGEN_DL_SHA256: e24b1c51293c1b15e4ba8d45bbc7891ba053f90278ec2698f3562c993e145fe7
+- id: tool-run-8f869db3aaed8790
+  name: "pipegen: run trivy"
+  run: |-
+    set -euo pipefail
+    unset CDPATH
+    pg_fail() { echo "pipegen: $1" >&2; exit 1; }
+    PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+    home="$RUNNER_TEMP/pipegen-home/pipegen-out-iac"
+    mkdir -p "$RUNNER_TEMP/pipegen-home" "$home"
+    sys=(
+      /usr/bin/env -i
+      "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+      "HOME=$home"
+    )
+    bin="$RUNNER_TEMP/pipegen-bin/pipegen-out-iac"
+    mkdir -p "$RUNNER_TEMP/pipegen-cfg"
+    cfg="$RUNNER_TEMP/pipegen-cfg/pipegen-out-iac"
+    mkdir "$cfg"
+    printf '%s' "$PIPEGEN_CONFIG" > "$cfg/trivy.yaml"
+    out=trivy-config.sarif
+    outdir=.
+    if [ -e "$out" ] || [ -L "$out" ]; then pg_fail "the result file $out exists before the tool ran, so pipegen will not use it"; fi
+    [ -d "$outdir" ] && [ ! -L "$outdir" ] || pg_fail "the folder for the result is not a real folder"
+    pg_env=(
+      /usr/bin/env -i
+      "HOME=$home"
+      "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+      "RUNNER_TEMP=$RUNNER_TEMP"
+      "TMPDIR=$RUNNER_TEMP"
+      "PIPEGEN_ARG_0=$PIPEGEN_ARG_0"
+    )
+    rc=0
+    "${pg_env[@]}" "$bin/trivy" config --config "$cfg/trivy.yaml" --disable-telemetry --skip-version-check --skip-check-update --format sarif --output trivy-config.sarif --exit-code 10 . --severity "$PIPEGEN_ARG_0" || rc=$?
+    case "$rc" in 0|10) ;; *)
+      rm -rf -- "$out"
+      echo "pipegen: the tool exited with $rc, so its result is not used" >&2
+      exit "$rc" ;;
+    esac
+    if [ -f "$out" ] && [ ! -L "$out" ]; then
+      mkdir -p "$RUNNER_TEMP/pipegen-raw"
+      mkdir "$RUNNER_TEMP/pipegen-raw/pipegen-out-iac"
+      dest="$RUNNER_TEMP/pipegen-raw/pipegen-out-iac/trivy-config.sarif"
+      mv -- "$out" "$dest"
+      if [ -f "$dest" ] && [ ! -L "$dest" ]; then rc=0; else rm -f -- "$dest"; rc=1; fi
+      chmod -R a-w "$RUNNER_TEMP/pipegen-raw/pipegen-out-iac"
+    else
+      echo "pipegen: the tool left no regular result file at $out" >&2
+      rm -rf -- "$out"
+      rc=1
+    fi
+    exit "$rc"
+  shell: bash
+  env:
+    BASH_ENV: ""
+    ENV: ""
+    PIPEGEN_ARG_0: HIGH,CRITICAL
+    PIPEGEN_CONFIG: "# pipegen's pinned trivy config: no cache kept between runs, and no repository trivy-secret.yaml (an empty path loads none)
+
+      cache:
+
+      \  backend: memory
+
+      secret:
+
+      \  config: \"\"\n"

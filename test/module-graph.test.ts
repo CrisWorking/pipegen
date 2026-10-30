@@ -36,6 +36,12 @@ describe('module graph (final review M6)', () => {
     expect(await graph('src/engine/need-ids.ts')).toEqual(['src/engine/need-ids.ts', 'src/types.ts']);
   });
 
+  it('module graph (Plan B 6a, ruling B4): artifact-names.ts is a leaf (only the import-free types.ts); render-step.ts pulls in no AI or GitHub client code', async () => {
+    expect(await graph('src/engine/artifact-names.ts')).toEqual(['src/engine/artifact-names.ts', 'src/types.ts']);
+    const files = await graph('src/engine/render-step.ts');
+    expect(files.filter((f) => f.startsWith('src/ai/') || f.startsWith('src/github/'))).toEqual([]);
+  });
+
   it('module graph: the estimator pulls in no AI, GitHub client or network code (final review batch 2, M5)', async () => {
     const files = await graph('src/estimate/estimate.ts');
     expect(files.filter((f) => f.startsWith('src/ai/') || f.startsWith('src/github/'))).toEqual([]);

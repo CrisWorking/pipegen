@@ -33,7 +33,7 @@ type Artifact =
   | { type: 'asset'; owner: string; repo: string; tag: string; asset: string; sha256: string }
   | { type: 'docker'; owner: string; image: string; tag: string; digest: string }
   /** An archive a tool downloads at run time, pinned in step.cli.env (nuclei templates: a release tag's tarball). */
-  | { type: 'templates'; owner: string; url: string; tag: string; sha256: string }
+  | { type: 'templates'; owner: string; url: string; tag: string; sha256: string; commit: string; tree: string }
   /** semgrep rules: a repo archive at a commit, tied by the commit's tree. */
   | { type: 'rules'; owner: string; url: string; repo: string; commit: string; tree: string };
 
@@ -49,6 +49,8 @@ function artifacts(): Artifact[] {
     const c = t.candidate;
     const inst = t.step?.cli?.install;
     const before = out.length;
+    // pipegen's own gate action is not dated or tied to a release (C6: the cooldown skips the exact repo crisworking/pipegen); tested in gate-entry.test.ts
+    if (c.kind === 'action' && c.repo === 'crisworking/pipegen') continue;
     if (c.kind === 'action') out.push({ type: 'action', owner: t.id, repo: c.repo, tag: c.version, sha: c.pin.sha });
     else if (c.kind === 'docker') out.push({ type: 'docker', owner: t.id, image: inst.package, tag: inst.version, digest: c.pin.digest });
     else if (c.kind === 'cli' && inst.method === 'github-release') out.push({ type: 'asset', owner: t.id, repo: c.repo, tag: inst.version, asset: inst.package, sha256: c.pin.checksum });
@@ -58,7 +60,7 @@ function artifacts(): Artifact[] {
     const env = (t.step?.cli?.env ?? {}) as Obj;
     if (env.PIPEGEN_NUCLEI_TEMPLATES_URL) {
       const m = /\/(v\d+\.\d+\.\d+)\.tar\.gz$/.exec(env.PIPEGEN_NUCLEI_TEMPLATES_URL);
-      out.push({ type: 'templates', owner: t.id, url: env.PIPEGEN_NUCLEI_TEMPLATES_URL, tag: m?.[1] as string, sha256: env.PIPEGEN_NUCLEI_TEMPLATES_SHA256 });
+      out.push({ type: 'templates', owner: t.id, url: env.PIPEGEN_NUCLEI_TEMPLATES_URL, tag: m?.[1] as string, sha256: env.PIPEGEN_NUCLEI_TEMPLATES_SHA256, commit: env.PIPEGEN_NUCLEI_TEMPLATES_COMMIT, tree: env.PIPEGEN_NUCLEI_TEMPLATES_TREE });
     }
     if (env.PIPEGEN_RULES_URL) {
       const m = /^https:\/\/github\.com\/([^/]+\/[^/]+)\/archive\/([0-9a-f]{40})\.tar\.gz$/.exec(env.PIPEGEN_RULES_URL);
@@ -156,7 +158,8 @@ function upstream(dateOf: (a: Artifact) => string, hashOf: (a: Artifact, pinned:
       const text = `${hashOf(a, a.sha256)}  nuclei-templates-${ver}.tar.gz\n`;
       routes.set(sumsUrl, { text });
       // the tag's commit, on the repo's default branch (P44)
-      const tagCommit = sha256(a.tag).slice(0, 40);
+      const tagCommit = a.commit;
+      routes.set(gh(`${NT}/git/commits/${tagCommit}`), { sha: tagCommit, tree: { sha: hashOf(a, a.tree) } });
       routes.set(gh(`${NT}/git/ref/tags/${a.tag}`), { object: { type: 'commit', sha: tagCommit } });
       routes.set(gh(NT), { default_branch: 'main' });
       routes.set(gh(`${NT}/compare/${tagCommit}...main?per_page=1`), { status: 'ahead', behind_by: 0, merge_base_commit: { sha: tagCommit } });
@@ -172,6 +175,10 @@ function upstream(dateOf: (a: Artifact) => string, hashOf: (a: Artifact, pinned:
         doc.tag_last_pushed = younger(doc.tag_last_pushed, at);
       });
     }
+  }
+  // pipegen's own gate action: no age, but its pin is tied to the tag gate-v<version> of the repo (C6 fix round 1)
+  for (const t of (parse(FILES['data/reviewed-tools.yml']) as Obj).tools as Obj[]) {
+    if (t.candidate.kind === 'action' && t.candidate.repo === 'crisworking/pipegen') routes.set(gh(`${t.candidate.repo}/git/ref/tags/gate-v${t.candidate.version}`), { ref: `refs/tags/gate-v${t.candidate.version}`, object: { type: 'commit', sha: t.candidate.pin.sha } });
   }
   for (const [k, v] of Object.entries(extra)) routes.set(k, v);
   const calls: string[] = [];
@@ -197,11 +204,11 @@ describe('cooldown: the real data', () => {
     const kinds = new Set(ALL.map((a) => a.type));
     expect([...kinds].sort()).toEqual(['action', 'asset', 'docker', 'npm', 'pypi', 'rules', 'templates']);
     // 14 actions, 3 images, 20 release assets, 8 npm tools + 6 npm plugins, 6 pip tools + 2 pip plugins,
-    // 16 pinned-binary platforms, the nuclei templates archive and the semgrep rules archive
+    // 20 pinned-binary platforms, the nuclei templates archive and the semgrep rules archive
     const count = (t: Artifact['type']) => ALL.filter((a) => a.type === t).length;
     expect({ action: count('action'), docker: count('docker'), asset: count('asset'), npm: count('npm'), pypi: count('pypi'), templates: count('templates'), rules: count('rules') })
-      .toEqual({ action: 14, docker: 3, asset: 36, npm: 14, pypi: 8, templates: 1, rules: 1 });
-    expect(ALL).toHaveLength(77);
+      .toEqual({ action: 14, docker: 3, asset: 40, npm: 16, pypi: 8, templates: 1, rules: 1 });
+    expect(ALL).toHaveLength(83);
     // each plugin is its own artifact (biome's binary, oxlint's three, bandit's two)
     expect(ALL.filter((a) => a.owner === 'oxlint-typeaware').map((a) => (a.type === 'npm' ? a.name : '')).sort()).toEqual(['@oxlint-tsgolint/linux-x64', '@oxlint/binding-linux-x64-gnu', 'oxlint', 'oxlint-tsgolint']);
   });
@@ -255,13 +262,15 @@ describe('cooldown: the real data', () => {
       else if (a.type === 'pypi' || a.type === 'asset') covered.add(a.sha256);
       else if (a.type === 'action') covered.add(a.sha);
       else if (a.type === 'docker') covered.add(a.digest);
-      else if (a.type === 'templates') covered.add(a.url).add(a.sha256);
+      else if (a.type === 'templates') covered.add(a.url).add(a.sha256).add(a.commit).add(a.tree);
       else covered.add(a.url).add(a.commit).add(a.tree);
     }
     for (const [, b] of Object.entries(parse(FILES['data/pinned-binaries.yml']) as Obj)) for (const p of Object.values(b.platforms as Obj)) covered.add(p.url);
     // Allowed, not pins this check dates (each explained in docs/cooldown.md):
     const allowed = new Set<string>();
     for (const t of (parse(FILES['data/reviewed-tools.yml']) as Obj).tools as Obj[]) {
+      // pipegen's own gate action: its pin is a commit of this repository (not dated by the cooldown, see gate-entry.test.ts)
+      if (t.candidate.repo === 'crisworking/pipegen') allowed.add(t.candidate.pin.sha);
       // pin-time verification inputs (cosign identity/issuer, key URL and its sha256), never installed
       for (const v of Object.values((t.verifiedWith ?? {}) as Obj)) if (typeof v === 'string') allowed.add(v);
       // a record of the image an action's own action.yml runs; the action is tied by its commit SHA

@@ -1,5 +1,6 @@
 // Pinned tool binaries pipegen runs on the user's machine (Plan B Task 7 Part 1): betterleaks for the required code
-// bundle secret scan (Plan A Task 5, `audit --ai`; Plan P Task 7), gitleaks as its fallback, actionlint, and cosign. A
+// bundle secret scan (Plan A Task 5, `audit --ai`; Plan P Task 7), gitleaks as its fallback, actionlint and zizmor (the
+// referee's workflow linters, 7b), and cosign. A
 // wrong or tampered binary must never run.
 //
 // ensurePinnedBinary (ruling B3):
@@ -22,25 +23,29 @@
 // - Like reviewed-tools.yml, every entry carries a human-review marker (reviewedBy / reviewedAt, PENDING until the
 //   owner reviews it; review-marker.ts). A release build (PIPEGEN_RELEASE or NODE_ENV=production) refuses the
 //   file while any entry is PENDING, before anything is downloaded; dev and test builds load it (final review I2).
+import { execFile } from 'node:child_process';
 import { createHash, randomBytes } from 'node:crypto';
 import { constants, readFileSync } from 'node:fs';
-import { lstat, open, readdir, rename, rm, unlink } from 'node:fs/promises';
-import { homedir } from 'node:os';
+import { lstat, mkdir, mkdtemp, open, readdir, rename, rm, unlink } from 'node:fs/promises';
+import { homedir, tmpdir } from 'node:os';
 import { dirname, isAbsolute, join } from 'node:path';
 import { gunzipSync } from 'node:zlib';
 import { parse } from 'yaml';
 import { z } from 'zod';
-import type { ReviewedTool } from '../types.js';
+import type { CreatedFile, ReviewedTool } from '../types.js';
 import { packageDataPath } from '../util/package-data.js';
 import { safeText } from '../util/safe-text.js';
 import { prepareTrustedDir, type TrustedDirKind } from '../util/trusted-dir.js';
 import { TarError, readTarMember } from '../util/tar.js';
 import { COOLDOWN_DAYS, downloadRelease } from './pin.js';
 import { isReleaseBuild, listPending, PENDING, reviewMarkerProblems } from './review-marker.js';
+import { ACTION_PATH_RE, WORKFLOW_PATH_RE } from './job-rules.js';
 import { ASSET_RE, isGitHubRepo, SHA256_RE } from './names.js';
+import type { Linters, RefereeIssue } from './referee.js';
+import { loadReviewed } from './reviewed.js';
 
-export type PinnedName = 'actionlint' | 'betterleaks' | 'cosign' | 'gitleaks';
-export const PINNED_NAMES: readonly PinnedName[] = ['actionlint', 'betterleaks', 'cosign', 'gitleaks'];
+export type PinnedName = 'actionlint' | 'betterleaks' | 'cosign' | 'gitleaks' | 'zizmor';
+export const PINNED_NAMES: readonly PinnedName[] = ['actionlint', 'betterleaks', 'cosign', 'gitleaks', 'zizmor'];
 export const PLATFORM_KEYS = ['linux-x64', 'linux-arm64', 'darwin-x64', 'darwin-arm64'] as const;
 export type PlatformKey = (typeof PLATFORM_KEYS)[number];
 
@@ -88,8 +93,8 @@ const entrySchema = z.object({
   }
 });
 
-/** data/pinned-binaries.yml: exactly betterleaks, gitleaks, actionlint and cosign. */
-export const pinnedBinariesSchema = z.object({ betterleaks: entrySchema, gitleaks: entrySchema, actionlint: entrySchema, cosign: entrySchema }).strict();
+/** data/pinned-binaries.yml: exactly betterleaks, gitleaks, actionlint, cosign and zizmor. */
+export const pinnedBinariesSchema = z.object({ betterleaks: entrySchema, gitleaks: entrySchema, actionlint: entrySchema, cosign: entrySchema, zizmor: entrySchema }).strict();
 export type PinnedBinaries = z.infer<typeof pinnedBinariesSchema>;
 export type PinnedBinary = PinnedBinaries[PinnedName];
 export type PinnedAsset = PinnedBinary['platforms'][PlatformKey];
@@ -396,4 +401,224 @@ export function checkPinnedAgainstReviewed(pins: PinnedBinaries, reviewed: reado
     }
   }
   return problems;
+}
+
+// ---------- the referee's workflow linters (Plan B Task 7b, rulings S19 to S21) ----------
+//
+// ensureLinters: closures that give the pinned actionlint and zizmor. Each call runs ensurePinnedBinary again (the hash
+// is re-checked) right before the spawn, so a binary swapped in the cache between two runs is never run (S20).
+//
+// runLinters: the linters run on a fresh temporary copy of the workflow files, one copy per repository (`app`,
+// `central`). Nothing else is copied, and every run gets an explicit config path, so a repo's own .github/zizmor.yml,
+// zizmor.yml or .github/actionlint.yaml is never read. The configs are the reviewed entries' pinned config text.
+// Chosen: the central repo's composite action files (the referee still parses them) are copied too, and only zizmor
+// reads them; actionlint gets the workflow files. zizmor runs with --no-ignores (no inline `# zizmor: ignore[...]`
+// comment can silence a finding) and --strict-collection (an input it can't validate fails the run instead of being
+// skipped with a warning). Anything that is not such a file is not copied and is an issue (it
+// was not linted, so it is not cleared). The linters start with an empty environment plus what they need (S19).
+
+const LINTER_TIMEOUT_MS = 120_000;
+const LINTER_MAX_OUTPUT = 16 * 1024 * 1024;
+/** zizmor's exit codes: 0 nothing found; 10 to 14 findings (by severity). Anything else is a failure. */
+const ZIZMOR_FINDING_CODES: ReadonlySet<number> = new Set([10, 11, 12, 13, 14]);
+
+/** The pinned linters as closures (nothing is downloaded until one is called). */
+export function ensureLinters(cacheDir?: string, deps: PinnedBinaryDeps = {}): Linters {
+  return {
+    actionlint: () => ensurePinnedBinary('actionlint', cacheDir, deps),
+    zizmor: () => ensurePinnedBinary('zizmor', cacheDir, deps),
+  };
+}
+
+export interface RunLintersDeps {
+  /** The reviewed list the pinned linter configs come from. Default: the real one. */
+  reviewed?: ReviewedTool[];
+  /** Default: the system temp directory. */
+  tmp?: string;
+  timeoutMs?: number;
+}
+
+/** A file path that may be copied: a workflow, or a composite action file (job-rules.ts: no `.`, `..` or empty segment). */
+function lintablePath(path: string): 'workflow' | 'action' | null {
+  if (WORKFLOW_PATH_RE.test(path)) return 'workflow';
+  return ACTION_PATH_RE.test(path) ? 'action' : null;
+}
+
+/** The pinned config text of a reviewed linter (fixedInputs.config.content). */
+function pinnedConfig(reviewed: readonly ReviewedTool[], id: string): string {
+  const content = reviewed.find((t) => t.id === id)?.fixedInputs.config?.content;
+  if (typeof content !== 'string') throw new PinnedBinaryError(`pipegen has no pinned config for ${id}.`);
+  return content;
+}
+
+interface RunResult { code: number | null; stdout: string; failed: string | null }
+
+/** Runs a linter with exactly this environment (nothing inherited); never throws. */
+function spawnLinter(bin: string, args: string[], cwd: string, env: Record<string, string>, timeoutMs: number): Promise<RunResult> {
+  return new Promise((resolve) => {
+    execFile(bin, args, { cwd, env, timeout: timeoutMs, killSignal: 'SIGKILL', maxBuffer: LINTER_MAX_OUTPUT, windowsHide: true, encoding: 'utf8' }, (err, stdout) => {
+      if (err === null) return resolve({ code: 0, stdout, failed: null });
+      const code = (err as { code?: unknown }).code;
+      if (typeof code === 'number') return resolve({ code, stdout, failed: null });
+      resolve({ code: null, stdout, failed: typeof code === 'string' ? code : 'did not finish' });
+    });
+  });
+}
+
+function parseJsonArray(text: string): unknown[] | null {
+  try {
+    const v: unknown = JSON.parse(text);
+    return Array.isArray(v) ? v : null;
+  } catch {
+    return null;
+  }
+}
+
+const isObj = (v: unknown): v is Record<string, unknown> => typeof v === 'object' && v !== null && !Array.isArray(v);
+const cleanPath = (p: string): string => p.replace(/^(\.\/)+/, '');
+
+type Issue = (check: 'actionlint' | 'zizmor', file: string, message: string, line?: number) => RefereeIssue;
+
+function actionlintFindings(items: unknown[], issue: Issue, fallback: string): RefereeIssue[] {
+  return items.map((it) => {
+    const o = isObj(it) ? it : {};
+    const line = typeof o.line === 'number' && Number.isInteger(o.line) && o.line > 0 ? o.line : undefined;
+    return issue('actionlint', typeof o.filepath === 'string' ? cleanPath(o.filepath) : fallback, typeof o.message === 'string' ? o.message : 'a finding without a message', line);
+  });
+}
+
+function zizmorFindings(items: unknown[], issue: Issue, fallback: string): RefereeIssue[] {
+  return items.map((it) => {
+    const o = isObj(it) ? it : {};
+    const locations = Array.isArray(o.locations) ? o.locations.filter(isObj) : [];
+    const loc = locations.find((l) => isObj(l.symbolic) && l.symbolic.kind === 'Primary') ?? locations[0];
+    const symbolic = isObj(loc?.symbolic) ? loc.symbolic : {};
+    const key = isObj(symbolic.key) ? symbolic.key : {};
+    const local = isObj(key.Local) ? key.Local : {};
+    const concrete = isObj(loc?.concrete) ? loc.concrete : {};
+    const point = isObj(concrete.location) && isObj(concrete.location.start_point) ? concrete.location.start_point : {};
+    // zizmor counts rows from 0
+    const line = typeof point.row === 'number' && Number.isInteger(point.row) && point.row >= 0 ? point.row + 1 : undefined;
+    const ident = typeof o.ident === 'string' ? o.ident : 'finding';
+    const desc = typeof o.desc === 'string' ? o.desc : '';
+    const note = typeof symbolic.annotation === 'string' && symbolic.annotation !== '' ? `: ${symbolic.annotation}` : '';
+    return issue('zizmor', typeof local.verbatim_path === 'string' ? cleanPath(local.verbatim_path) : fallback, `${ident}: ${desc}${note}`, line);
+  });
+}
+
+/**
+ * Runs actionlint and zizmor over the workflow files (one temporary copy per repo, pipegen's own configs) and returns
+ * their findings as issues, each with its repo, repo-relative file and line. Never throws and never skips silently: a
+ * linter that can not start, crashes, exits with an unexpected code or prints JSON that doesn't parse is an issue, and so
+ * is a missing token (zizmor's online audits, `impostor-commit` among them, need one; zizmor is then not started).
+ */
+export async function runLinters(files: CreatedFile[], linters: Linters, ghToken: string | null, deps: RunLintersDeps = {}): Promise<RefereeIssue[]> {
+  const out: RefereeIssue[] = [];
+  const mk = (repo: CreatedFile['repo']): Issue => (check, file, message, line) => ({
+    file: safeText(file, 200), check, message: safeText(message, 300), repo, ...(line === undefined ? {} : { line }),
+  });
+  let reviewed: ReviewedTool[];
+  try {
+    reviewed = deps.reviewed ?? loadReviewed();
+  } catch (e) {
+    return [{ file: files[0]?.path ?? '', check: 'actionlint', message: safeText(`The workflow linters could not run: pipegen's reviewed list could not be read (${e instanceof Error ? e.message : 'error'}).`, 300) }];
+  }
+  let configs: { actionlint: string; zizmor: string };
+  try {
+    configs = { actionlint: pinnedConfig(reviewed, 'actionlint'), zizmor: pinnedConfig(reviewed, 'zizmor') };
+  } catch (e) {
+    return [{ file: files[0]?.path ?? '', check: 'actionlint', message: safeText(e instanceof Error ? e.message : 'The linter configs are missing.', 300) }];
+  }
+  const timeoutMs = deps.timeoutMs ?? LINTER_TIMEOUT_MS;
+
+  for (const repo of ['app', 'central'] as const) {
+    const mine = files.filter((f) => f.repo === repo);
+    if (mine.length === 0) continue;
+    const issue = mk(repo);
+    const copied: { path: string; kind: 'workflow' | 'action' }[] = [];
+    const seen = new Set<string>();
+    for (const f of mine) {
+      const kind = lintablePath(f.path);
+      if (kind === null) out.push(issue('actionlint', f.path, `The file ${safeText(f.path, 80)} is not a workflow file, so it was not copied for the linters and is not cleared.`));
+      else if (seen.has(f.path.toLowerCase())) out.push(issue('actionlint', f.path, `The file ${safeText(f.path, 80)} is listed twice (names are compared without case), so it was not linted and is not cleared.`));
+      else { seen.add(f.path.toLowerCase()); copied.push({ path: f.path, kind }); }
+    }
+    if (copied.length === 0) continue;
+
+    const dir = await mkdtemp(join(deps.tmp ?? tmpdir(), 'pipegen-lint-'));
+    try {
+      // the temp copy: workflow and action files only, exclusive create, no symlink followed
+      const writeOne = async (rel: string, content: string): Promise<void> => {
+        await mkdir(dirname(join(dir, rel)), { recursive: true, mode: 0o700 });
+        const fh = await open(join(dir, rel), constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600);
+        try { await fh.writeFile(content); } finally { await fh.close(); }
+      };
+      const written: typeof copied = [];
+      for (const c of copied) {
+        try {
+          await writeOne(c.path, (mine.find((f) => f.path === c.path) as CreatedFile).content);
+          written.push(c);
+        } catch {
+          out.push(issue('actionlint', c.path, `The file ${safeText(c.path, 80)} could not be copied for the linters, so it is not cleared.`));
+        }
+      }
+      if (written.length === 0) continue;
+      await writeOne('actionlint.yaml', configs.actionlint);
+      await writeOne('zizmor.yml', configs.zizmor);
+      await mkdir(join(dir, 'zizmor-cache'), { mode: 0o700 });
+      const first = written[0]?.path ?? '';
+
+      // actionlint reads workflows only
+      const workflows = written.filter((c) => c.kind === 'workflow').map((c) => c.path);
+      if (workflows.length > 0) {
+        let bin: string | null = null;
+        try {
+          bin = await linters.actionlint();
+        } catch (e) {
+          out.push(issue('actionlint', first, `actionlint could not be set up: ${e instanceof Error ? e.message : 'unknown error'} It was not run, so the files are not cleared.`));
+        }
+        if (bin !== null) {
+          const r = await spawnLinter(bin, ['-config-file', join(dir, 'actionlint.yaml'), '-shellcheck=', '-pyflakes=', '-format', '{{json .}}', ...workflows], dir, { HOME: dir, NO_COLOR: '1' }, timeoutMs);
+          if (r.code === 0) {
+            // clean: nothing printed (or an empty list)
+            const items = r.stdout.trim() === '' ? [] : parseJsonArray(r.stdout);
+            if (items === null) out.push(issue('actionlint', first, 'actionlint said it found nothing but printed output pipegen could not read, so the files are not cleared.'));
+            else out.push(...actionlintFindings(items, issue, first));
+          } else if (r.code === 1) {
+            const items = parseJsonArray(r.stdout);
+            if (items === null || items.length === 0) out.push(issue('actionlint', first, 'actionlint reported problems but its output could not be read, so the files are not cleared.'));
+            else out.push(...actionlintFindings(items, issue, first));
+          } else {
+            out.push(issue('actionlint', first, r.failed === null ? `actionlint failed (exit ${r.code}), so the files are not cleared.` : `actionlint could not run (${safeText(r.failed, 40)}), so the files are not cleared.`));
+          }
+        }
+      }
+
+      // zizmor, online: needs a token (impostor-commit and the other online audits); never a silent offline run
+      if (ghToken === null) {
+        out.push(issue('zizmor', first, 'zizmor was not run: it needs a GitHub token for its online audits (the impostor-commit check among them), and none was given, so the files are not cleared.'));
+      } else {
+        let bin: string | null = null;
+        try {
+          bin = await linters.zizmor();
+        } catch (e) {
+          out.push(issue('zizmor', first, `zizmor could not be set up: ${e instanceof Error ? e.message : 'unknown error'} It was not run, so the files are not cleared.`));
+        }
+        if (bin !== null) {
+          const r = await spawnLinter(bin, ['--config', join(dir, 'zizmor.yml'), '--format', 'json', '--no-ignores', '--strict-collection', '--cache-dir', join(dir, 'zizmor-cache'), ...written.map((c) => c.path)], dir, { GH_TOKEN: ghToken, HOME: dir, NO_COLOR: '1' }, timeoutMs);
+          if (r.code !== null && (r.code === 0 || ZIZMOR_FINDING_CODES.has(r.code))) {
+            const items = parseJsonArray(r.stdout);
+            if (items === null) out.push(issue('zizmor', first, 'zizmor printed output pipegen could not read, so the files are not cleared.'));
+            else if (items.length === 0 && r.code !== 0) out.push(issue('zizmor', first, `zizmor reported findings (exit ${r.code}) but its list was empty, so the files are not cleared.`));
+            else out.push(...zizmorFindings(items, issue, first));
+          } else {
+            out.push(issue('zizmor', first, r.failed === null ? `zizmor failed (exit ${r.code}), so the files are not cleared.` : `zizmor could not run (${safeText(r.failed, 40)}), so the files are not cleared.`));
+          }
+        }
+      }
+    } finally {
+      await rm(dir, { recursive: true, force: true }).catch(() => {});
+    }
+  }
+  return out;
 }

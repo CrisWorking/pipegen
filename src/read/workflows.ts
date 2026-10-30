@@ -202,10 +202,13 @@ const isLink = (p: string) => info(p)?.isSymbolicLink() === true;
 const isRealFile = (p: string) => info(p)?.isFile() === true;
 const isRealDir = (p: string) => info(p)?.isDirectory() === true;
 
+/** Every config name lefthook 2.2.2 reads (main and -local; checked against the real binary in the 6d review), at the root or in .config/. */
+const LEFTHOOK_FILES: readonly string[] = ['', '.config/'].flatMap((dir) => ['', '.'].flatMap((dot) => ['lefthook', 'lefthook-local'].flatMap((base) => ['yml', 'yaml', 'toml', 'json', 'jsonc'].map((ext) => `${dir}${dir === '' ? dot : ''}${base}.${ext}`))));
+
 /** Which hook manager the repo uses. A symbolic link never counts. Priority: pre-commit, husky, lefthook. */
 export function readPrecommit(dir: string): RepoProfile['precommit'] {
   if (isRealFile(join(dir, '.pre-commit-config.yaml'))) return 'pre-commit';
   if (isRealDir(join(dir, '.husky'))) return 'husky';
-  if (isRealFile(join(dir, 'lefthook.yml')) || isRealFile(join(dir, 'lefthook.yaml'))) return 'lefthook';
+  if (LEFTHOOK_FILES.some((f) => isRealFile(join(dir, f)))) return 'lefthook';
   return null;
 }

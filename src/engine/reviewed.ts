@@ -24,7 +24,7 @@
 // - Task 6 fix round 1: every cli entry's argv is checked against its allowlist (tool-flags.ts ARGV_POLICIES, by entry
 //   id; default deny, P19): its own executable, only reviewed flags and values, the flags that keep failing on (P20),
 //   pipegen's exact pinned config, no env, the policy's follow-up commands (P24). Trivy's --exit-code is exactly 1 and
-//   every severity includes CRITICAL (P20); gitleaks has the betterleaks locks (P21); action locks go by the action's
+//   every severity includes CRITICAL (P20), and the licence scan has none (S9); gitleaks has the betterleaks locks (P21); action locks go by the action's
 //   name under any owner, one spelling per input, and pypi-publish only to PyPI or TestPyPI (P22).
 // - Fix round 2: the argv allowlist covers every entry with a step.cli, images included, and binds its install method
 //   and package (P28); every action takes only the inputs its policy lists (ACTION_POLICIES by exact owner/repo,
@@ -34,7 +34,7 @@ import { parse } from 'yaml';
 import { z } from 'zod';
 import { packageDataPath } from '../util/package-data.js';
 import { safeText } from '../util/safe-text.js';
-import { NEED_CATEGORIES, PROTECTED_PATHS_BASE, type Language, type Need, type ReviewedTool, type Service } from '../types.js';
+import { NEED_CATEGORIES, type Language, type Need, type ReviewedTool, type Service } from '../types.js';
 import {
   advisoryVersion, ASSET_RE, COMMIT_SHA_RE, DIGEST_RE, IMAGE_TAG_RE, isFullSemver, isGitHubRepo, isNpmName, isPypiName, npmEscapedName, parseImageRef, pep503,
   SHA256_RE, SRI_SHA512_RE, TAG_RE,
@@ -43,9 +43,10 @@ import { NEED_ID_CATEGORY } from './need-ids.js';
 import { fetchAllowed, HttpError } from './http.js';
 import { COOLDOWN_DAYS } from './pin.js';
 import { isRealDate, isReleaseBuild, listPending, PENDING, REVIEWER_RE, reviewMarkerProblems } from './review-marker.js';
+import { expectedPins, loadNpmClosure, NpmClosureError } from './npm-closure.js';
 import { lastValue, parseArgv, type ParsedArgv } from './argv.js';
 import {
-  ACTION_POLICIES, ARGV_POLICIES, BETTERLEAKS_FORBIDDEN_FLAGS, type InputSpec, BETTERLEAKS_FORBIDDEN_SUBCOMMANDS, BETTERLEAKS_SUBCOMMANDS, type ArgvPolicy, type CommandPolicy, type FlagSpec,
+  ACTION_POLICIES, ARGV_POLICIES, DOCKER_ACTION_USES, BETTERLEAKS_FORBIDDEN_FLAGS, type InputSpec, BETTERLEAKS_FORBIDDEN_SUBCOMMANDS, BETTERLEAKS_SUBCOMMANDS, SECRETS_SCAN_CONFIG, type ArgvPolicy, type CommandPolicy, type FlagSpec,
 } from './tool-flags.js';
 import { BETTERLEAKS_GRAMMAR, NUCLEI_GRAMMAR, TRIVY_GRAMMAR, type FlagGrammar } from './tool-grammar.js';
 import { levenshtein, neverImage, neverListed } from './never-list.js';
@@ -122,6 +123,9 @@ export const SEMGREP_RULES_DIR = '/pipegen-rules';
 /** The Nuclei templates archive (catalogue §3 MG5, ruling PS30): an official nuclei-templates release tarball and its sha256. */
 export const NUCLEI_TEMPLATES_URL_ENV = 'PIPEGEN_NUCLEI_TEMPLATES_URL';
 export const NUCLEI_TEMPLATES_SHA256_ENV = 'PIPEGEN_NUCLEI_TEMPLATES_SHA256';
+/** The templates commit and its git tree (6c, ruling S12): the renderer fetches the commit and checks HEAD and HEAD^{tree} against these. */
+export const NUCLEI_TEMPLATES_COMMIT_ENV = 'PIPEGEN_NUCLEI_TEMPLATES_COMMIT';
+export const NUCLEI_TEMPLATES_TREE_ENV = 'PIPEGEN_NUCLEI_TEMPLATES_TREE';
 /** Where the renderer puts the verified templates; `-t` must name this directory, and nothing else (like Semgrep's rules, S22). */
 export const NUCLEI_TEMPLATES_DIR = '/pipegen-nuclei-templates';
 const NUCLEI_TEMPLATES_URL_RE = /^https:\/\/github\.com\/projectdiscovery\/nuclei-templates\/(?:archive\/refs\/tags\/v\d{1,4}\.\d{1,4}\.\d{1,4}\.tar\.gz|releases\/download\/v\d{1,4}\.\d{1,4}\.\d{1,4}\/[A-Za-z0-9._-]{1,100}\.tar\.gz)$/;
@@ -244,6 +248,8 @@ const entrySchema = z.strictObject({
   fixedInputs: fixedSchema,
   choices: z.record(z.string().regex(INPUT_RE), z.array(z.string().min(1).max(100).pipe(safeValue)).min(1).max(32)),
   configFiles: z.array(z.string().regex(REL_GLOB_RE)).max(32),
+  /** Names protected only at the repository root and the service roots (see ReviewedTool.rootConfigFiles); never also in configFiles. */
+  rootConfigFiles: z.array(z.string().regex(REL_GLOB_RE)).max(32).optional(),
   /**
    * Sections of shared files the tool reads (ruling P23): `<file>:<section>`, e.g. `pyproject.toml:tool.mypy`,
    * `setup.cfg:coverage:*`, `package.json:c8`. The v0.2 gate protects these sections without protecting the whole file.
@@ -263,6 +269,9 @@ const entrySchema = z.strictObject({
   for (const p of entryProblems(e)) ctx.addIssue({ code: 'custom', path: p.path, message: p.message });
 });
 
+/** pipegen's own repository (lower case, exact): the one repo whose entries skip the 7-day cooldown. */
+export const PIPEGEN_OWN_REPO = 'crisworking/pipegen';
+
 const fileSchema = z.strictObject({
   /** When the list was last pinned (an ISO timestamp); every releasedAt must be at least the cooldown before it. */
   pinnedOn: z.string().regex(ISO_RE),
@@ -276,7 +285,8 @@ const fileSchema = z.strictObject({
     if (t.reviewedAt !== PENDING && DATE_RE.test(t.reviewedAt) && t.reviewedAt < pinnedDay) {
       ctx.addIssue({ code: 'custom', path: ['tools', i, 'reviewedAt'], message: `reviewedAt is before pinnedOn (${pinnedDay}): the review must cover the pins as they are` });
     }
-    if (!(pinnedOn - Date.parse(t.releasedAt) >= COOLDOWN_DAYS * DAY_MS)) {
+    // pipegen's own repository is exempt (C6): its code is reviewed in this repository; the exact repo, nothing else
+    if (!(t.candidate.kind === 'action' && t.candidate.repo === PIPEGEN_OWN_REPO) && !(pinnedOn - Date.parse(t.releasedAt) >= COOLDOWN_DAYS * DAY_MS)) {
       ctx.addIssue({ code: 'custom', path: ['tools', i, 'releasedAt'], message: `the release must be at least ${COOLDOWN_DAYS} days older than pinnedOn (cooldown, ruling S26)` });
     }
     // PS24: the signature check must cover the pins as they are
@@ -492,6 +502,9 @@ function entryProblems(e: Entry): { message: string; path: (string | number)[] }
       }
     }
   }
+  if (e.wrappedImage === undefined && c.kind === 'action' && e.step.action !== undefined && DOCKER_ACTION_USES.has(e.step.action.uses.slice(0, e.step.action.uses.lastIndexOf('@')).toLowerCase())) {
+    bad('this action runs a docker image (runs.using: docker), so the entry must record it in wrappedImage (ruling S13)', 'wrappedImage');
+  }
   if (e.wrappedImage !== undefined) {
     if (c.kind !== 'action') bad('wrappedImage is for actions (the image their action.yml runs)', 'wrappedImage');
     const hit = neverImage(e.wrappedImage.ref) ?? neverListed(e.wrappedImage.ref);
@@ -663,7 +676,9 @@ function choiceProblems(tool: string, e: Entry, known: (name: string) => boolean
 export const TRIVY_ALLOWED_FLAGS: ReadonlySet<string> = new Set([
   'disable-telemetry', 'skip-version-check', 'skip-check-update', 'format', 'output', 'exit-code', 'severity', 'scanners', 'ignore-unfixed',
 ]);
-export const BETTERLEAKS_ALLOWED_FLAGS: ReadonlySet<string> = new Set(['report-format', 'report-path', 'no-banner', 'ignore-gitleaks-allow', 'redact', 'exit-code']);
+/** The `--exit-code` of trivy, betterleaks and gitleaks: a finding is reported with 10, a code their errors never use (an error or a betterleaks partial scan exits 1). Keep equal to their `findingsExit` in tool-flags.ts. */
+const FINDINGS_EXIT_FLAG = '10';
+export const BETTERLEAKS_ALLOWED_FLAGS: ReadonlySet<string> = new Set(['report-format', 'report-path', 'no-banner', 'ignore-gitleaks-allow', 'redact', 'exit-code', 'max-archive-depth']);
 export const NUCLEI_ALLOWED_FLAGS: ReadonlySet<string> = new Set([
   'disable-update-check', 'templates', 'severity', 'sarif-export', 'target', 'automatic-scan', 'tags', 'no-interactsh',
 ]);
@@ -682,8 +697,12 @@ function allowlistProblems(tool: string, parsed: readonly ParsedArgv[], allowed:
   return out;
 }
 
-/** Keys pipegen's pinned trivy config may set, with their only value (P13): today, the in-memory cache. */
-const TRIVY_CONFIG_ALLOWED: Readonly<Record<string, string>> = { 'cache.backend': 'memory' };
+/**
+ * The keys pipegen's pinned trivy config sets, each with its only value (P13), all required: the in-memory cache, and an empty secret config
+ * path (C5a CF1: trivy otherwise loads `trivy-secret.yaml` from its working folder, whose disable-rules / allow-rules silence secret findings;
+ * an empty path loads none, checked live on trivy 0.76.0).
+ */
+const TRIVY_CONFIG_ALLOWED: Readonly<Record<string, string>> = { 'cache.backend': 'memory', 'secret.config': '' };
 
 /**
  * Trivy's pinned config (P13): passed as --config (so the repo's trivy.yaml is never loaded), YAML (bounded: 64 KiB,
@@ -706,9 +725,13 @@ function trivyConfigProblems(e: Entry): Problem[] {
     return out;
   };
   const found = leavesOf(doc, '', []);
-  const allowed = Object.entries(TRIVY_CONFIG_ALLOWED).map(([k, v]) => `${k}: ${v}`).join(', ');
+  const shown = (v: string): string => (v === '' ? '""' : v);
+  const allowed = Object.entries(TRIVY_CONFIG_ALLOWED).map(([k, v]) => `${k}: ${shown(v)}`).join(', ');
   for (const [k, v] of found) {
-    if (TRIVY_CONFIG_ALLOWED[k] === undefined || TRIVY_CONFIG_ALLOWED[k] !== v) return bad(`trivy's pinned config may set only ${allowed}, not ${k || '(a non-mapping document)'}`);
+    if (!Object.hasOwn(TRIVY_CONFIG_ALLOWED, k) || TRIVY_CONFIG_ALLOWED[k] !== v) return bad(`trivy's pinned config may set only ${allowed}, not ${k || '(a non-mapping document)'}`);
+  }
+  for (const [k, v] of Object.entries(TRIVY_CONFIG_ALLOWED)) {
+    if (!found.some(([fk]) => fk === k)) return bad(`trivy's pinned config must set ${k}: ${shown(v)}${k === 'secret.config' ? ' (else trivy loads the repo\'s trivy-secret.yaml)' : ''}`);
   }
   return [];
 }
@@ -752,10 +775,10 @@ function trivyProblems(e: Entry): Problem[] {
   for (const k of [...Object.keys(e.step.cli?.env ?? {}), ...Object.keys(e.fixedInputs.env ?? {})]) {
     if (/^trivy_/i.test(k)) bad(`trivy gets no ${k}: a TRIVY_* variable sets a flag outside the command pipegen checks`, 'step', 'cli', 'env');
   }
-  // ruling P20 (as P18): --exit-code exactly 1, in the command and the fixed args; 0 (or 256, …) passes any finding
+  // ruling P20 (as P18): --exit-code exactly 10, in the command and the fixed args; 0 (or 256, …) passes any finding, and 1 is what trivy exits with on an error (C0a fix round 1)
   const codes = [...p.flags, ...pa.flags].filter((f) => f.name === 'exit-code').map((f) => f.value);
-  if (lastValue(p, 'exit-code') !== '1' || lastValue(pa, 'exit-code') !== '1' || codes.some((v) => v !== '1')) {
-    bad('trivy must run with --exit-code 1, exactly, in the command and fixedInputs.args (trivy exits 0 on findings by default, and 0 or 256 passes them; ruling P20)', 'fixedInputs', 'args');
+  if (lastValue(p, 'exit-code') !== FINDINGS_EXIT_FLAG || lastValue(pa, 'exit-code') !== FINDINGS_EXIT_FLAG || codes.some((v) => v !== FINDINGS_EXIT_FLAG)) {
+    bad(`trivy must run with --exit-code ${FINDINGS_EXIT_FLAG}, exactly, in the command and fixedInputs.args (trivy exits 0 on findings by default, 0 or 256 passes them, and 1 is its error exit, so a finding must not share it; ruling P20)`, 'fixedInputs', 'args');
   }
   // P20: every severity list (command, fixed args, choices) includes CRITICAL; UNKNOWN or LOW alone blocks on nothing that matters
   const severities = [...p.flags, ...pa.flags].filter((f) => f.name === 'severity').map((f) => f.value);
@@ -765,6 +788,10 @@ function trivyProblems(e: Entry): Problem[] {
     const parts = v.split(',');
     if (!parts.includes('CRITICAL') || parts.some((x) => !TRIVY_SEVERITIES.includes(x))) bad(`trivy's severity ${v} must be a list of ${TRIVY_SEVERITIES.join(', ')} that includes CRITICAL (ruling P20)`, 'step', 'cli', 'command');
   }
+  // S9 (Plan C final review fix round A, ruling 2): the licence scan reports every severity. Trivy files a licence it can not classify as
+  // UNKNOWN, so any --severity filter hides some (G11: HIGH,CRITICAL hid every Unknown licence); the gate judges the severities itself
+  const scanners = [...p.flags, ...pa.flags].filter((f) => f.name === 'scanners').flatMap((f) => f.value.split(','));
+  if (scanners.includes('license') && severities.length > 0) bad('trivy\'s licence scan must report every severity (no --severity in the command, the fixed args or a choice): a filter hides the Unknown licences a person must look at (ruling S9)', 'step', 'cli', 'command');
   out.push(...choiceProblems('trivy', e, (k) => (g.value.has(k) || g.bool.has(k)) && TRIVY_ALLOWED_FLAGS.has(k),
     (k) => (TRIVY_FORBIDDEN.has(k) || k === 'exit-code' || (TRIVY_REQUIRED_FLAGS as readonly string[]).includes(`--${k}`) ? `the AI may not choose trivy's --${k}` : null)));
   return out;
@@ -849,11 +876,11 @@ function betterleaksProblems(e: Entry): Problem[] {
       bad(`betterleaks --report-path must be the entry's output file (${outPath || 'none'}), never - or a device: anything else can print the findings, secrets included, into the CI log`, 'step', 'cli', 'command');
     }
     // --exit-code (ruling P18): fixed by the template, in the command AND the fixed args (both or neither), and every
-    // value exactly 1. 0 (or 00, +0, 0x0) passes a scan that found secrets, and so does 256, 512, … (the process exit
+    // value exactly 10. 0 (or 00, +0, 0x0) passes a scan that found secrets, and so does 256, 512, … (the process exit
     // status is the code modulo 256)
     const codes = [...p.flags, ...pa.flags].filter((f) => f.name === 'exit-code').map((f) => f.value);
-    if (lastValue(p, 'exit-code') !== '1' || lastValue(pa, 'exit-code') !== '1' || codes.some((v) => v !== '1')) {
-      bad('betterleaks --exit-code is a fixed arg: exactly 1, in the command and fixedInputs.args (0, or 256 and its multiples, would pass a scan that found secrets; ruling P18)', 'fixedInputs', 'args');
+    if (lastValue(p, 'exit-code') !== FINDINGS_EXIT_FLAG || lastValue(pa, 'exit-code') !== FINDINGS_EXIT_FLAG || codes.some((v) => v !== FINDINGS_EXIT_FLAG)) {
+      bad(`betterleaks --exit-code is a fixed arg: exactly ${FINDINGS_EXIT_FLAG}, in the command and fixedInputs.args (0, or 256 and its multiples, would pass a scan that found secrets, and 1 is the exit of an error or a partial scan; ruling P18, C0a fix round 1)`, 'fixedInputs', 'args');
     }
     // --redact (P21): findings are redacted in the report and the log, in the command and the fixed args
     if (lastValue(p, 'redact') === undefined || lastValue(pa, 'redact') === undefined) bad('betterleaks runs with --redact, in the command and fixedInputs.args (ruling P21: the secret never reaches the report or the log)', 'step', 'cli', 'command');
@@ -867,9 +894,17 @@ function betterleaksProblems(e: Entry): Problem[] {
     out.push(...choiceProblems('betterleaks', e, (k) => (g.value.has(k) || g.bool.has(k) || g.optional.has(k)) && BETTERLEAKS_ALLOWED_FLAGS.has(k),
       (k) => (k === 'config' ? pinnedMsg : forbidden.has(`--${k}`) || k.startsWith('validation') ? `betterleaks must never use --${k}`
         : k === 'exit-code' || k === 'report-path' ? `the AI may not choose betterleaks' --${k}: it is fixed by the template` : null)));
+    // --max-archive-depth 0 (C1b fix round 2, review R1-C1): betterleaks opens zip, tar and gzip files by default (depth 8) and reports their
+    // contents under the file's own name or a made-up path, so the gate would hash bytes the scanner never matched. Fixed to 0, in both places.
+    const depths = [...p.flags, ...pa.flags].filter((f) => f.name === 'max-archive-depth').map((f) => f.value);
+    if (lastValue(p, 'max-archive-depth') !== '0' || lastValue(pa, 'max-archive-depth') !== '0' || depths.some((v) => v !== '0')) {
+      bad('betterleaks --max-archive-depth is a fixed arg: exactly 0, in the command and fixedInputs.args (a deeper scan reports archive members under paths whose bytes the gate reads differently; review R1-C1)', 'fixedInputs', 'args');
+    }
   }
   const pinned = fx.config !== undefined && 'flag' in fx.config.passAs && fx.config.passAs.flag === '--config';
   if (!pinned || (fx.args ?? []).some((a) => a === '-c' || /^-c./.test(a) || flagName(a) === 'config')) bad(pinnedMsg, 'fixedInputs', 'config');
+  // C1c: exactly the reviewed config, with pipegen's canary rule (without it the scrub can not prove which staged files were read)
+  else if (fx.config?.content !== SECRETS_SCAN_CONFIG) bad(`${pinnedMsg}, with exactly the content reviewed in tool-flags.ts (SECRETS_SCAN_CONFIG: the default rules and pipegen's canary rule)`, 'fixedInputs', 'config');
   for (const k of [...Object.keys(e.step.cli?.env ?? {}), ...Object.keys(fx.env ?? {})]) {
     bad(/config/i.test(k) ? `${pinnedMsg} (not ${k})` : `betterleaks gets no env (${k}): v1.9.0 reads its config and tokens from it`, 'step', 'cli', 'env');
   }
@@ -921,15 +956,21 @@ function nucleiProblems(e: Entry): Problem[] {
   if (!reasons.has(NUCLEI_TEMPLATES) && (inCommand.length === 0 || inCommand.some((d) => d !== NUCLEI_TEMPLATES_DIR) || !dirs(a).includes(NUCLEI_TEMPLATES_DIR))) {
     bad(NUCLEI_TEMPLATES, 'step', 'cli', 'command');
   }
-  const allowedEnv = new Set([NUCLEI_TEMPLATES_URL_ENV, NUCLEI_TEMPLATES_SHA256_ENV]);
+  const allowedEnv = new Set([NUCLEI_TEMPLATES_URL_ENV, NUCLEI_TEMPLATES_SHA256_ENV, NUCLEI_TEMPLATES_COMMIT_ENV, NUCLEI_TEMPLATES_TREE_ENV]);
   for (const k of new Set([...Object.keys(e.step.cli?.env ?? {}), ...Object.keys(fx.env ?? {})])) {
-    if (!allowedEnv.has(k)) bad(`nuclei gets only ${NUCLEI_TEMPLATES_URL_ENV} and ${NUCLEI_TEMPLATES_SHA256_ENV} in its env, not ${k} (nuclei reads PDCP_*, ENABLE_CLOUD_UPLOAD and template sources from it)`, 'step', 'cli', 'env');
+    if (!allowedEnv.has(k)) bad(`nuclei gets only its four template variables (${NUCLEI_TEMPLATES_URL_ENV}, …) in its env, not ${k} (nuclei reads PDCP_*, ENABLE_CLOUD_UPLOAD and template sources from it)`, 'step', 'cli', 'env');
   }
   const env = fx.env ?? {};
   if (!NUCLEI_TEMPLATES_URL_RE.test(env[NUCLEI_TEMPLATES_URL_ENV] ?? '')) {
     bad(`nuclei needs fixedInputs.env.${NUCLEI_TEMPLATES_URL_ENV}: an official projectdiscovery/nuclei-templates release tarball (a vX.Y.Z tag)`, 'fixedInputs', 'env');
   }
   if (!SHA256_RE.test(env[NUCLEI_TEMPLATES_SHA256_ENV] ?? '')) bad(`nuclei needs fixedInputs.env.${NUCLEI_TEMPLATES_SHA256_ENV}: the templates archive's sha256`, 'fixedInputs', 'env');
+  for (const [k, what] of [[NUCLEI_TEMPLATES_COMMIT_ENV, 'the templates commit (40 hex)'], [NUCLEI_TEMPLATES_TREE_ENV, "the templates commit's git tree (40 hex)"]] as const) {
+    if (!COMMIT_SHA_RE.test(env[k] ?? '')) bad(`nuclei needs fixedInputs.env.${k}: ${what}`, 'fixedInputs', 'env');
+  }
+  for (const k of [NUCLEI_TEMPLATES_COMMIT_ENV, NUCLEI_TEMPLATES_TREE_ENV]) {
+    if ((e.step.cli?.env ?? {})[k] !== env[k]) bad(`nuclei step.cli.env.${k} must equal fixedInputs.env.${k}`, 'step', 'cli', 'env');
+  }
   // the allowlist last, so a more specific refusal (-duc swallowed, templates) is the one reported first
   out.push(...allowlistProblems('nuclei', [p, a], NUCLEI_ALLOWED_FLAGS, '-', (n) => NUCLEI_FORBIDDEN[n] !== undefined));
   const long = (k: string) => NUCLEI_GRAMMAR.shorts[k] ?? k;
@@ -1066,7 +1107,8 @@ export function argvPolicyProblems(e: ReviewedEntry, policies: Readonly<Record<s
 }
 
 /**
- * Ruling P29: an action entry's inputs against its policy (tool-flags.ts ACTION_POLICIES, by the exact owner/repo).
+ * Ruling P29: an action entry's inputs against its policy (tool-flags.ts ACTION_POLICIES, by the exact owner/repo[/path]
+ * of its `uses:`, ruling S14: `github/codeql-action/init` has no policy just because `.../upload-sarif` has one).
  * No policy → refused. Every input in step.action.with, fixedInputs.with and choices is listed (exact spelling); a
  * fixed one has the same allowed value in both withs, a chosen one only allowed values; required ones are fixed.
  */
@@ -1075,10 +1117,11 @@ export function actionPolicyProblems(e: ReviewedEntry, policies: Readonly<Record
   const action = e.step.action;
   if (e.candidate.kind !== 'action' && action === undefined) return out;
   const bad = (message: string, ...path: (string | number)[]) => out.push({ message, path });
-  const repo = lower(e.candidate.repo);
+  const at = action?.uses.lastIndexOf('@') ?? -1;
+  const repo = lower(action === undefined ? e.candidate.repo : at < 0 ? action.uses : action.uses.slice(0, at));
   const pol = Object.hasOwn(policies, repo) ? policies[repo] : undefined;
   if (pol === undefined) {
-    bad(`the action ${e.candidate.repo} has no input policy (tool-flags.ts ACTION_POLICIES, by exact owner/repo): pipegen runs no action whose every input wasn't reviewed (default deny, ruling P29)`, 'candidate', 'repo');
+    bad(`the action ${repo} has no input policy (tool-flags.ts ACTION_POLICIES, by exact owner/repo[/path]): pipegen runs no action whose every input wasn't reviewed (default deny, ruling P29, S14)`, ...(action === undefined ? ['candidate', 'repo'] : ['step', 'action', 'uses']));
     return out;
   }
   const stepWith = action?.with ?? {};
@@ -1188,7 +1231,7 @@ function isSubsequence(needle: readonly string[], hay: readonly string[]): boole
  */
 export function loadReviewed(
   path: string = packageDataPath('reviewed-tools.yml'),
-  opts: { argvPolicies?: Readonly<Record<string, ArgvPolicy>>; actionPolicies?: Readonly<Record<string, Readonly<Record<string, InputSpec>>>> } = {},
+  opts: { argvPolicies?: Readonly<Record<string, ArgvPolicy>>; actionPolicies?: Readonly<Record<string, Readonly<Record<string, InputSpec>>>>; closureReader?: (id: string) => string } = {},
 ): ReviewedTool[] {
   let raw: unknown;
   try {
@@ -1213,6 +1256,17 @@ export function loadReviewed(
     if (problem !== undefined) {
       const where = ` (entry ${t.id}) at ${['tools', i, ...problem.path].join('.')}: ${problem.message}`;
       throw new ReviewedListError(`pipegen's reviewed tool list is invalid${where}`, { reason: `it is invalid${where}` });
+    }
+  }
+  // DECISIONS #107: a checker's npm closure lock must exist and be a plain registry lock of exactly its pins
+  for (const t of entries) {
+    const pol = Object.hasOwn(opts.argvPolicies ?? ARGV_POLICIES, t.id) ? (opts.argvPolicies ?? ARGV_POLICIES)[t.id] : undefined;
+    if (pol?.method !== 'npm' || pol.npmBin === undefined || pol.runsRepoCode === true) continue;
+    try {
+      loadNpmClosure(t.id, expectedPins(toReviewedTool(t)), opts.closureReader);
+    } catch (e) {
+      const reason = e instanceof NpmClosureError ? e.message : `the npm closure lock of ${t.id} could not be checked`;
+      throw new ReviewedListError(`pipegen's reviewed tool list is invalid (entry ${t.id}): ${reason}`, { cause: e, reason: `it is invalid (entry ${t.id}): ${reason}` });
     }
   }
   const ids = entries.map((t) => t.id);
@@ -1249,10 +1303,8 @@ export function reviewedFor(need: Need, language: Language, list: ReviewedTool[]
     && (mode === 'audit' || t.proofs >= 1));
 }
 
-/** PROTECTED_PATHS_BASE, then every configFiles entry of the tools in use, each once, in order. */
-export function effectiveProtectedPaths(inUse: ReviewedTool[]): string[] {
-  return [...new Set([...PROTECTED_PATHS_BASE, ...inUse.flatMap((t) => t.configFiles)])];
-}
+// effectiveProtectedPaths lives in the leaf protected-paths.ts (the gate bundles it without this loader); re-exported for the engine.
+export { effectiveProtectedPaths } from './protected-paths.js';
 
 /**
  * The typosquat check. Both names lowercased, the FULL `owner/name` compared: a reviewed repo within Levenshtein

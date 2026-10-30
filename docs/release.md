@@ -125,7 +125,7 @@ Work through it in order. Tick a step only after Cristiano said go and the resul
 - [ ] **B6. Rulesets on `main`, just before the first release, not during the build** (ask Cristiano first): pull requests
       required, required checks of `ci`: `test (node 24)` and `test (node 26)` (they carry the secret-scanner live tests,
       `node scripts/scanner-live.ts`), `cooldown`, `pins-upstream` (every pin re-tied to upstream), `no-runtime-deps`,
-      `notices-fresh` and `workflow-lint`; no force-push, no deletion, signed commits required, and code-owner review of
+      `notices-fresh`, `gate-dist` (the committed gate bundle equals its source) and `workflow-lint`; no force-push, no deletion, signed commits required, and code-owner review of
       every path in `.github/CODEOWNERS` (`/.github/`, `/scripts/`, `/data/`, `/src/ai/`, and the trust-root tests and
       test helpers under `/test/`: this is what makes the cooldown, the trust-root lists and the scanner checklist more
       than advisory, see [cooldown.md](cooldown.md)). A solo owner cannot approve their own PRs, so the owner needs a

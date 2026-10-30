@@ -498,8 +498,8 @@ ${extra}`;
   const ntSumsUrl = `https://github.com/${NT}/releases/download/v10.5.0/nuclei-templates-10.5.0_checksums.txt`;
   const nuclei = (o: { url?: string; sha?: string; fixedUrl?: string } = {}): string => `  - id: nu
     candidate: { id: nu, kind: cli, repo: o/r, version: "v1", pin: { checksum: "${HEX}" } }
-    step: { cli: { install: { method: github-release, package: "tool.tar.gz", version: "v1" }, command: [], env: { PIPEGEN_NUCLEI_TEMPLATES_URL: "${o.url ?? ntArchive}", PIPEGEN_NUCLEI_TEMPLATES_SHA256: "${o.sha ?? HEX2}" } } }
-    fixedInputs: { env: { PIPEGEN_NUCLEI_TEMPLATES_URL: "${o.fixedUrl ?? o.url ?? ntArchive}", PIPEGEN_NUCLEI_TEMPLATES_SHA256: "${o.sha ?? HEX2}" } }
+    step: { cli: { install: { method: github-release, package: "tool.tar.gz", version: "v1" }, command: [], env: { PIPEGEN_NUCLEI_TEMPLATES_URL: "${o.url ?? ntArchive}", PIPEGEN_NUCLEI_TEMPLATES_SHA256: "${o.sha ?? HEX2}", PIPEGEN_NUCLEI_TEMPLATES_COMMIT: "${NT_COMMIT}", PIPEGEN_NUCLEI_TEMPLATES_TREE: "${SHA2}" } } }
+    fixedInputs: { env: { PIPEGEN_NUCLEI_TEMPLATES_URL: "${o.fixedUrl ?? o.url ?? ntArchive}", PIPEGEN_NUCLEI_TEMPLATES_SHA256: "${o.sha ?? HEX2}", PIPEGEN_NUCLEI_TEMPLATES_COMMIT: "${NT_COMMIT}", PIPEGEN_NUCLEI_TEMPLATES_TREE: "${SHA2}" } }
 `;
   const ntRoutes = (o: { published?: string; listed?: string; text?: string; badDigest?: boolean; assetAt?: string; noAsset?: boolean; tarball?: string } = {}): Routes => {
     const text = o.text ?? `${'9'.repeat(64)}  nuclei-templates-10.5.0.zip\n${o.listed ?? HEX2}  nuclei-templates-10.5.0.tar.gz\n`;
@@ -510,6 +510,7 @@ ${extra}`;
       ...rel('v1', daysAgo(400), HEX),
       ...onDefault(NT, NT_COMMIT, 'main'),
       [gh(`${NT}/git/ref/tags/v10.5.0`)]: { object: { type: 'commit', sha: NT_COMMIT } },
+      [gh(`${NT}/git/commits/${NT_COMMIT}`)]: { sha: NT_COMMIT, tree: { sha: SHA2 } },
       [gh(`${NT}/releases/tags/v10.5.0`)]: { tag_name: 'v10.5.0', published_at: o.published ?? daysAgo(30), assets },
       [ntSumsUrl]: () => new Response(text, { status: 200 }),
     };
@@ -529,6 +530,14 @@ ${extra}`;
     expect(problems(await run({}, head, router(ntRoutes({ badDigest: true }))))).toContain('digest');
     expect(problems(await run({}, head, router(ntRoutes({ noAsset: true }))))).toContain('needs owner review');
     expect(problems(await run({}, head, router({ ...rel('v1', daysAgo(400), HEX) })))).toContain('404');
+  });
+
+  it('S12: the templates commit must be the tag\'s commit and its tree the pinned tree', async () => {
+    const head = { 'data/reviewed-tools.yml': rtFile(nuclei()) };
+    const wrongTree = { ...ntRoutes(), [gh(`${NT}/git/commits/${NT_COMMIT}`)]: { sha: NT_COMMIT, tree: { sha: 'a'.repeat(40) } } };
+    expect(problems(await run({}, head, router(wrongTree)))).toContain('TREE');
+    const movedTag = { ...ntRoutes(), [gh(`${NT}/git/ref/tags/v10.5.0`)]: { object: { type: 'commit', sha: 'b'.repeat(40) } }, ...onDefault(NT, 'b'.repeat(40), 'main') };
+    expect(problems(await run({}, head, router(movedTag)))).toContain('COMMIT');
   });
 
   it('P41: nuclei templates as a release asset are tied to its digest; odd URLs or env copies that disagree fail', async () => {
@@ -1002,5 +1011,44 @@ describe('cooldown: security-fix emergency path', () => {
     const out = formatReport(await run({}, head, router({})));
     expect(out).not.toContain('\u001b');
     expect(out.split('\n').some((l) => l.trimStart().startsWith('::'))).toBe(false);
+  });
+});
+
+describe('cooldown: npm closure locks (Plan B 6b fix round 1)', () => {
+  const CLOSURE = 'data/npm-closures/eslint.json';
+  const META = 'data/npm-closures/eslint.meta.json';
+  const meta = (before: string): string => JSON.stringify({ generatedAt: daysAgo(0), before, npm: '11.9.0' });
+  const files = (pkgs: Record<string, Pkg | string>, before = daysAgo(8)): Files => ({ [CLOSURE]: lock(pkgs), [META]: meta(before) });
+
+  it('checks every package of a new closure like a lockfile entry (age and registry integrity)', async () => {
+    const r = await run({}, files({ a: '1.0.0', b: '1.0.0' }, daysAgo(0)), router({ ...npmDoc('a', { '1.0.0': daysAgo(30) }), ...npmDoc('b', { '1.0.0': daysAgo(2) }) }));
+    expect(r.findings.map((x) => x.name)).toEqual(['b']);
+  });
+
+  it('fails a package published after the closure\'s own `before` date, even when it is old enough', async () => {
+    const r = await run({}, files({ a: '1.0.0' }, daysAgo(20)), router(npmDoc('a', { '1.0.0': daysAgo(10) })));
+    expect(r.ok).toBe(false);
+    expect(problems(r)).toMatch(/before/);
+  });
+
+  it('a closure with no readable meta file fails closed', async () => {
+    const r = await run({}, { [CLOSURE]: lock({ a: '1.0.0' }) }, router(npmDoc('a', { '1.0.0': daysAgo(30) })));
+    expect(r.ok).toBe(false);
+    expect(problems(r)).toMatch(/meta/);
+  });
+
+  it('an unchanged closure makes no request on a pull request, and `all` checks it anyway (the weekly job)', async () => {
+    const f = files({ a: '1.0.0' });
+    const calls: string[] = [];
+    expect((await run(f, f, router({}, calls))).ok).toBe(true);
+    expect(calls).toEqual([]);
+    const weekly = await run(f, f, router(npmDoc('a', { '1.0.0': daysAgo(30) }), calls), { all: true });
+    expect(weekly.ok).toBe(true);
+    expect(calls.length).toBeGreaterThan(0);
+  });
+
+  it('a link or a non-registry source in a closure is a finding', async () => {
+    const r = await run({}, files({ a: { v: '1.0.0', extra: { link: true } } }), router({}));
+    expect(r.ok).toBe(false);
   });
 });

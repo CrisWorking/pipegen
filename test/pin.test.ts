@@ -2,7 +2,7 @@ import { createHash } from 'node:crypto';
 import { describe, expect, it, vi } from 'vitest';
 import { GitHubRateLimitError, isRateStop, newRateBudget } from '../src/engine/github-rate.js';
 import {
-  COOLDOWN_DAYS, PinError, PinMovedWarning, PLATFORM_ACTION_IDS, platformActions, resolvePin, type PinDeps, type PlatformActions,
+  COOLDOWN_DAYS, PinError, PinMovedWarning, PLATFORM_ACTION_IDS, platformActions, readActionRuns, resolvePin, type PinDeps, type PlatformActions,
 } from '../src/engine/pin.js';
 import type { Candidate, InstallSpec, ReviewedTool } from '../src/types.js';
 import { fakeFetch, fakeOctokit, type Reply, type Routes } from './helpers/fake-http.js';
@@ -812,16 +812,30 @@ describe('platformActions', () => {
     const out: PlatformActions = await platformActions(list(), deps);
     expect(Object.keys(out).sort()).toEqual(Object.keys(PLATFORM_ACTION_IDS).sort());
     expect(Object.keys(out)).not.toContain('cache');
-    expect(Object.values(out).some((c) => /cache/i.test(c.id) || /actions\/cache/i.test(c.repo))).toBe(false);
+    expect(Object.values(out).some((t) => /cache/i.test(t.id) || /actions\/cache/i.test(t.candidate.repo))).toBe(false);
     expect(alert).toHaveBeenCalledTimes(1);
     expect(alert.mock.calls[0][0]).toMatchObject({ repo: repoOf('actions-checkout'), storedSha: shaOf(1), liveSha: LIVE_SHA });
-    expect(out.checkout.pin).toEqual({ sha: shaOf(1) });
+    expect(out.checkout.candidate.pin).toEqual({ sha: shaOf(1) });
     expect(JSON.stringify(out)).not.toContain(LIVE_SHA);
     Object.values(PLATFORM_ACTION_IDS).forEach((id, i) => {
       const key = (Object.keys(PLATFORM_ACTION_IDS) as (keyof PlatformActions)[])[i];
       expect(out[key].id).toBe(id);
-      expect(out[key].pin.sha).toBe(shaOf(i + 1));
+      expect(out[key].candidate.pin.sha).toBe(shaOf(i + 1));
     });
+  });
+
+  it('platformActions: returns ReviewedTool entries; the sub-path, fixed inputs and choices are kept', async () => {
+    const l = list().map((t) => (t.id === 'codeql-upload-sarif'
+      ? { ...t, step: { ...t.step, action: { uses: `github/codeql-action/upload-sarif@${shaOf(9)}`, with: {} } }, fixedInputs: { with: { x: 'y' } }, choices: { z: ['1'] }, candidate: { ...t.candidate, pin: { sha: shaOf(9) } } }
+      : t));
+    const { deps } = setup({ ...refs(), [`GET ${GH}/repos/${repoOf('codeql-upload-sarif')}/git/ref/tags/v4.1.0`]: ref('v4.1.0', 'commit', shaOf(9)) });
+    const out = await platformActions(l, deps);
+    expect(out['upload-sarif'].step.action?.uses).toBe(`github/codeql-action/upload-sarif@${shaOf(9)}`);
+    expect(out['upload-sarif'].fixedInputs).toEqual({ with: { x: 'y' } });
+    expect(out['upload-sarif'].choices).toEqual({ z: ['1'] });
+    expect(out['upload-sarif'].candidate).toMatchObject({ reviewed: true, source: 'reviewed', pin: { sha: shaOf(9) } });
+    // the entry's candidate is the re-verified one, and the input list is not edited
+    expect(l.find((t) => t.id === 'codeql-upload-sarif')?.candidate.pin.sha).toBe(shaOf(9));
   });
 
   it('platformActions: a missing, duplicated or unpinned entry is an error', async () => {
@@ -829,7 +843,7 @@ describe('platformActions', () => {
     const dup = [...list(), list()[0]];
     const unpinned = list().map((t) => (t.id === 'actions-setup-node' ? { ...t, candidate: { ...t.candidate, pin: {} } } : t));
     const notReviewed = list().map((t) => (t.id === 'actions-setup-node' ? { ...t, candidate: { ...t.candidate, reviewed: false, source: 'discovery' as const } } : t));
-    for (const l of [missing, dup, unpinned, notReviewed]) {
+    for (const l of [missing, dup, unpinned, notReviewed] as ReviewedTool[][]) {
       const { deps } = setup(refs());
       await expect(platformActions(l, deps)).rejects.toThrow(PinError);
     }
@@ -841,5 +855,99 @@ describe('PinMovedWarning', () => {
     const w = new PinMovedWarning('o/r', 'v1\u001b[2J', SHA, LIVE_SHA);
     expect(w.message).not.toContain('\u001b');
     expect(w.tag).toBe('v1\u001b[2J'); // the field stays raw; only display text is cleaned
+  });
+});
+
+// ---------- container actions (6c, ruling S13) ----------
+describe('pin: container actions read action.yml at the pinned SHA (S13)', () => {
+  const file = (path: string, text: string): Routes => ({
+    [`GET ${GH}/repos/o/r/contents/${path}`]: { body: { type: 'file', encoding: 'base64', content: Buffer.from(text).toString('base64'), size: text.length, path } },
+  });
+  const withYml = (text: string, path = 'action.yml', extra: Routes = {}): Routes => github({ ...file(path, text), ...extra });
+  const IMAGE_DIGEST = `sha256:${'9'.repeat(64)}`;
+
+  it('runs.using docker with a digest-pinned docker:// image: wrappedImage is filled from it', async () => {
+    const { deps, ghCalls } = setup(withYml(`name: x\nruns:\n  using: docker\n  image: docker://ghcr.io/o/img@${IMAGE_DIGEST}\n`));
+    const out = await resolvePin(stored(), deps, undefined, { readActionImage: true });
+    expect(out.wrappedImage).toEqual({ ref: `ghcr.io/o/img@${IMAGE_DIGEST}`, digest: IMAGE_DIGEST });
+    expect(ghCalls.some((c) => c.url.pathname === '/repos/o/r/contents/action.yml' && c.url.searchParams.get('ref') === SHA)).toBe(true);
+  });
+  it('action.yaml is read when there is no action.yml', async () => {
+    const { deps } = setup(withYml(`runs:\n  using: docker\n  image: docker://ghcr.io/o/img@${IMAGE_DIGEST}\n`, 'action.yaml'));
+    expect((await resolvePin(stored(), deps, undefined, { readActionImage: true })).wrappedImage?.digest).toBe(IMAGE_DIGEST);
+  });
+  it('a node or composite action has no wrappedImage', async () => {
+    for (const using of ['node24', 'composite']) {
+      const { deps } = setup(withYml(`runs:\n  using: ${using}\n  main: index.js\n`));
+      expect((await resolvePin(stored(), deps, undefined, { readActionImage: true })).wrappedImage, using).toBeUndefined();
+    }
+  });
+  it('a Dockerfile-built action, a tag-only image, a different registry or a malformed file fails closed', async () => {
+    for (const body of [
+      'runs:\n  using: docker\n  image: Dockerfile\n', 'runs:\n  using: docker\n  image: docker://ghcr.io/o/img:v1\n', 'runs:\n  using: docker\n  image: ghcr.io/o/img\n',
+      `runs:\n  using: docker\n  image: docker://evil.example/o/img@${IMAGE_DIGEST}\n`, `runs:\n  using: docker\n  image: docker://ghcr.io/o/img:v1@${IMAGE_DIGEST}\n`,
+      'runs: [1, 2\n', 'name: nothing\n', 'runs:\n  using: docker\n',
+    ]) {
+      const { deps } = setup(withYml(body));
+      await expect(resolvePin(stored(), deps, undefined, { readActionImage: true }), body).rejects.toThrow(PinError);
+    }
+  });
+  it('no action file, a folder instead of a file, or a huge file is refused', async () => {
+    const none = setup(github());
+    await expect(resolvePin(stored(), none.deps, undefined, { readActionImage: true })).rejects.toThrow(PinError);
+    const dir = setup(github({ [`GET ${GH}/repos/o/r/contents/action.yml`]: { body: [{ name: 'x' }] } }));
+    await expect(resolvePin(stored(), dir.deps, undefined, { readActionImage: true })).rejects.toThrow(PinError);
+    const big = setup(withYml(`runs:\n  using: node24\n#${'x'.repeat(200_000)}\n`));
+    await expect(resolvePin(stored(), big.deps, undefined, { readActionImage: true })).rejects.toThrow(PinError);
+  });
+  it('without the option nothing is read (existing callers are unchanged)', async () => {
+    const { deps, ghCalls } = setup(github());
+    await resolvePin(stored(), deps);
+    expect(ghCalls.some((c) => c.url.pathname.includes('/contents/'))).toBe(false);
+  });
+});
+
+describe('pin: a sub-path action is judged by its own action.yml (6c fix round 1, finding 2)', () => {
+  const D = `sha256:${'9'.repeat(64)}`;
+  const f = (path: string, text: string): Routes => ({ [`GET ${GH}/repos/o/r/contents/${path}`]: { body: { type: 'file', encoding: 'base64', content: Buffer.from(text).toString('base64'), size: text.length, path } } });
+  const root = f('action.yml', 'runs:\n  using: composite\n  steps: []\n');
+  it('the root action is composite and the sub-path action is docker: the sub-path image is returned', async () => {
+    const { deps, ghCalls } = setup(github({ ...root, ...f('sub/dir/action.yml', `runs:\n  using: docker\n  image: docker://ghcr.io/o/img@${D}\n`) }));
+    const out = await resolvePin(stored(), deps, undefined, { readActionImage: true, subPath: 'sub/dir' });
+    expect(out.wrappedImage).toEqual({ ref: `ghcr.io/o/img@${D}`, digest: D });
+    expect(ghCalls.some((c) => c.url.pathname === '/repos/o/r/contents/action.yml')).toBe(false);
+  });
+  it('the root action is composite and the sub-path action is docker by tag: refused (the root stub is not what runs)', async () => {
+    const { deps } = setup(github({ ...root, ...f('sub/action.yml', 'runs:\n  using: docker\n  image: docker://ghcr.io/o/img:v1\n') }));
+    await expect(resolvePin(stored(), deps, undefined, { readActionImage: true, subPath: 'sub' })).rejects.toThrow(PinError);
+  });
+  it('action.yaml of the sub-path is the fallback; hostile sub-paths are refused', async () => {
+    const { deps } = setup(github(f('sub/action.yaml', `runs:\n  using: docker\n  image: docker://ghcr.io/o/img@${D}\n`)));
+    expect((await resolvePin(stored(), deps, undefined, { readActionImage: true, subPath: 'sub' })).wrappedImage?.digest).toBe(D);
+    for (const bad of ['../x', '/abs', '-x', 'a b', 'a/../b']) await expect(resolvePin(stored(), setup(github(root)).deps, undefined, { readActionImage: true, subPath: bad }), bad).rejects.toThrow(PinError);
+  });
+  it('M32: a hostile sub-path is refused by the plain-path guard even when a digest-pinned action.yml answers at every path', async () => {
+    // every action.yml/action.yaml request, wherever URL normalisation sends it, gets a valid digest-pinned docker action:
+    // without the guard the resolve would succeed, so only the guard can make this fail
+    const docker = f('x', `runs:\n  using: docker\n  image: docker://ghcr.io/o/img@${D}\n`)[`GET ${GH}/repos/o/r/contents/x`] as Reply;
+    const everywhere = (): Routes => new Proxy(github(), {
+      get: (target, key) => (typeof key === 'string' && !(key in target) && /\/action\.ya?ml$/.test(key) ? docker : Reflect.get(target, key)),
+    });
+    // the catch-all works: a plain sub-path resolves through it
+    expect((await resolvePin(stored(), setup(everywhere()).deps, undefined, { readActionImage: true, subPath: 'ok/dir' })).wrappedImage?.digest).toBe(D);
+    for (const bad of ['../x', '../../../repos/evil/x/contents', '/abs', '-x', 'a/../b', 'a/..', '..']) {
+      await expect(resolvePin(stored(), setup(everywhere()).deps, undefined, { readActionImage: true, subPath: bad }), bad).rejects.toThrow(/isn't a plain path inside the repository/);
+    }
+  });
+  it('readActionRuns tells the kinds apart (the live check of the container lists uses it)', async () => {
+    const kinds: [string, string][] = [
+      ['runs:\n  using: node24\n  main: i.js\n', 'node'], ['runs:\n  using: composite\n  steps: []\n', 'composite'],
+      [`runs:\n  using: docker\n  image: docker://ghcr.io/o/img@${D}\n`, 'docker-digest'], ['runs:\n  using: docker\n  image: docker://ghcr.io/o/img:v1\n', 'docker-tag'], ['runs:\n  using: docker\n  image: Dockerfile\n', 'docker-build'],
+    ];
+    for (const [yml, kind] of kinds) {
+      const r = await readActionRuns(stored(), setup(github(f('action.yml', yml))).deps);
+      expect(r.kind, kind).toBe(kind);
+      expect(r.text).toContain('runs:');
+    }
   });
 });

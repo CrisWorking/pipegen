@@ -30,6 +30,10 @@
 /test/helpers/         @CrisWorking
 /tsup.config.ts        @CrisWorking
 /tsup.dev.config.ts    @CrisWorking
+/tsup.gate.config.ts   @CrisWorking
+# The gate action's reviewed entry and bundle checks (self-pin state, own-repo rule, no child_process, view = list).
+/test/gate-entry.test.ts @CrisWorking
+/test/gate-bundle.test.ts @CrisWorking
 /tsconfig.json         @CrisWorking
 /vitest.config.ts      @CrisWorking
 /package.json          @CrisWorking

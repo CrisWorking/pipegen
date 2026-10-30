@@ -23,7 +23,9 @@
 # MUST_VERIFY repos in src/engine/reviewed.ts); fixedInputs (set by the
 # template, the AI can never change them; config is pipegen's own pinned config, so repo config files are never
 # picked up silently); choices (the only inputs the AI may set, each limited to these values); configFiles (files
-# the tool would load from a repo by itself; added to the protected paths); configSections (`<file>:<section>` of shared
+# the tool would load from a repo by itself, protected at ANY depth ('nested'); rootConfigFiles: the same, but protected only at the
+# repository root and the service roots; each entry says which and why in a '# Config scope' comment, and when unsure it is
+# nested); configSections (`<file>:<section>` of shared
 # files the tool reads, e.g. pyproject.toml:tool.mypy; ruling P23); wrappedImage (the image an action's action.yml runs,
 # with the digest it resolved to when pinned; ruling P26); step.cli.then (follow-up commands of the same tool; a
 # `{choice}` word is the AI's choice, named after the flag it fills, ruling P24); proofs (passed Plan E runs). Every
@@ -71,7 +73,7 @@ tools:
     reviewedAt: "2026-10-28"
     proofs: 0
 
-  # Installs Node.js. Its automatic package-manager cache is off (pipegen uses no caches, spec §19). Node 24 and 26 only (DECISIONS #92).
+  # Installs Node.js. Its automatic package-manager cache is off (pipegen uses no caches, spec §19). Node 22 (maintenance until 2027-04-30), 24 and 26 only (DECISIONS #92, widened 2026-10-29).
   # Source: git ref refs/tags/v7.1.0 of actions/setup-node (GitHub API), release published_at. Released 2026-10-08T02:52:34Z.
   - id: actions-setup-node
     categories: ["platform"]
@@ -97,10 +99,10 @@ tools:
       with:
         package-manager-cache: "false"
     choices:
-      node-version: ["24", "26"]
+      node-version: ["22", "24", "26"]
     configFiles: []
-    reviewedBy: Cristiano
-    reviewedAt: "2026-10-28"
+    reviewedBy: Claude delegated DECISIONS 105
+    reviewedAt: "2026-10-29"
     proofs: 0
 
   # Installs Python. No cache input is set or offered (pipegen uses no caches, spec §19).
@@ -134,6 +136,8 @@ tools:
 
   # Uploads scan results for the gate. Hidden files (.env and the like) are never included.
   # Source: git ref refs/tags/v7.0.2 of actions/upload-artifact (GitHub API), release published_at. Released 2026-10-07T10:08:14Z.
+  # archive "true" (C5a fix round 1): the pinned action.yml (cf430e0) has `archive`, default true; false would upload one file unzipped
+  #   under its own name, which the gate never reads. Pinned, so a changed default can not move it. Reviewed by delegation (DECISIONS 105), 2026-10-30.
   - id: actions-upload-artifact
     categories: ["platform"]
     languages: ["any"]
@@ -154,15 +158,17 @@ tools:
         with:
           include-hidden-files: "false"
           if-no-files-found: "error"
+          archive: "true"
       output: { path: "", format: none }
     fixedInputs:
       with:
         include-hidden-files: "false"
         if-no-files-found: "error"
+        archive: "true"
     choices: {}
     configFiles: []
-    reviewedBy: Cristiano
-    reviewedAt: "2026-10-28"
+    reviewedBy: Claude delegated DECISIONS 105
+    reviewedAt: "2026-10-30"
     proofs: 0
 
   # Downloads scan results in the gate job (exact artifact names are set by the renderer).
@@ -219,10 +225,10 @@ tools:
       with:
         logout: "true"
     choices:
-      registry: ["ghcr.io", "docker.io"]
+      registry: ["ghcr.io"]
     configFiles: []
-    reviewedBy: Cristiano
-    reviewedAt: "2026-10-28"
+    reviewedBy: Claude delegated DECISIONS 105
+    reviewedAt: "2026-10-29"
     proofs: 0
 
   # Sets up Docker Buildx. Its binary cache is off (pipegen uses no caches, spec §19).
@@ -474,18 +480,22 @@ tools:
     step:
       cli:
         install: { method: github-release, package: "trivy_0.76.0_Linux-64bit.tar.gz", version: "v0.76.0" }
-        command: ["trivy", "config", "--disable-telemetry", "--skip-version-check", "--skip-check-update", "--format", "sarif", "--output", "trivy-config.sarif", "--exit-code", "1", "."]
+        command: ["trivy", "config", "--disable-telemetry", "--skip-version-check", "--skip-check-update", "--format", "sarif", "--output", "trivy-config.sarif", "--exit-code", "10", "."]
       output: { path: "trivy-config.sarif", format: sarif }
     fixedInputs:
-      args: ["--disable-telemetry", "--skip-version-check", "--skip-check-update", "--format", "sarif", "--exit-code", "1"]
+      args: ["--disable-telemetry", "--skip-version-check", "--skip-check-update", "--format", "sarif", "--exit-code", "10"]
       config:
-        content: "# pipegen's pinned trivy config: no cache kept between runs\ncache:\n  backend: memory\n"
+        content: "# pipegen's pinned trivy config: no cache kept between runs, and no repository trivy-secret.yaml (an empty path loads none)\ncache:\n  backend: memory\nsecret:\n  config: \"\"\n"
         passAs: { flag: "--config" }
     choices:
       severity: ["CRITICAL", "HIGH,CRITICAL", "MEDIUM,HIGH,CRITICAL"]
-    configFiles: ["trivy.yaml", ".trivyignore", ".trivyignore.yaml"]
-    reviewedBy: Cristiano
-    reviewedAt: "2026-10-28"
+    # Config scope: root. trivy runs with its pinned --config (it never loads the repo's trivy.yaml), and reads .trivyignore / .trivyignore.yaml from the working folder only (--ignorefile defaults to ./.trivyignore).
+    # trivy-secret.yaml (C5a CF1): the pinned config sets secret.config to "", so trivy loads none (checked live on 0.76.0: without it, a
+    #   trivy-secret.yaml in the working folder with disable-rules silenced a secret finding); the name stays protected as a belt.
+    configFiles: []
+    rootConfigFiles: ["trivy.yaml", ".trivyignore", ".trivyignore.yaml", "trivy-secret.yaml"]
+    reviewedBy: Claude delegated DECISIONS 105
+    reviewedAt: "2026-10-30"
     proofs: 0
     verifiedWith:
       method: cosign-bundle
@@ -520,19 +530,23 @@ tools:
     step:
       cli:
         install: { method: github-release, package: "trivy_0.76.0_Linux-64bit.tar.gz", version: "v0.76.0" }
-        command: ["trivy", "image", "--disable-telemetry", "--skip-version-check", "--skip-check-update", "--format", "sarif", "--output", "trivy-image.sarif", "--exit-code", "1"]
+        command: ["trivy", "image", "--disable-telemetry", "--skip-version-check", "--skip-check-update", "--format", "sarif", "--output", "trivy-image.sarif", "--exit-code", "10"]
       output: { path: "trivy-image.sarif", format: sarif }
     fixedInputs:
-      args: ["--disable-telemetry", "--skip-version-check", "--skip-check-update", "--format", "sarif", "--exit-code", "1"]
+      args: ["--disable-telemetry", "--skip-version-check", "--skip-check-update", "--format", "sarif", "--exit-code", "10"]
       config:
-        content: "# pipegen's pinned trivy config: no cache kept between runs\ncache:\n  backend: memory\n"
+        content: "# pipegen's pinned trivy config: no cache kept between runs, and no repository trivy-secret.yaml (an empty path loads none)\ncache:\n  backend: memory\nsecret:\n  config: \"\"\n"
         passAs: { flag: "--config" }
     choices:
       severity: ["CRITICAL", "HIGH,CRITICAL", "MEDIUM,HIGH,CRITICAL"]
       ignore-unfixed: ["false", "true"]
-    configFiles: ["trivy.yaml", ".trivyignore", ".trivyignore.yaml"]
-    reviewedBy: Cristiano
-    reviewedAt: "2026-10-28"
+    # Config scope: root. trivy runs with its pinned --config (it never loads the repo's trivy.yaml), and reads .trivyignore / .trivyignore.yaml from the working folder only (--ignorefile defaults to ./.trivyignore).
+    # trivy-secret.yaml (C5a CF1): the pinned config sets secret.config to "", so trivy loads none (checked live on 0.76.0: without it, a
+    #   trivy-secret.yaml in the working folder with disable-rules silenced a secret finding); the name stays protected as a belt.
+    configFiles: []
+    rootConfigFiles: ["trivy.yaml", ".trivyignore", ".trivyignore.yaml", "trivy-secret.yaml"]
+    reviewedBy: Claude delegated DECISIONS 105
+    reviewedAt: "2026-10-30"
     proofs: 0
     verifiedWith:
       method: cosign-bundle
@@ -548,6 +562,8 @@ tools:
   #   --certificate-oidc-issuer https://token.actions.githubusercontent.com checksums.txt`: "Verified OK" (2026-10-28T00:00:14Z; the
   #   same check with @refs/tags/v1.8.0 fails). checksums.txt lists the pinned sha256 above.
   # --redact (ruling P21): the secret never reaches the report or the CI log. --ignore-gitleaks-allow: inline allow comments can't hide a secret.
+  # C1c: the scan runs on pipegen's stage folder (neutral file names, cwd inside it), and the pinned config adds the pipegen-canary rule: a
+  #   staged file whose canary is not reported was not scanned (gate/src/stage.ts). Reviewed by delegation (DECISIONS 105), 2026-10-30.
   # Only pipegen's pinned --config (never the repo's .betterleaks.toml or .gitleaks.toml); no validation flags (they send
   #   candidate secrets to provider APIs); --report-path is the SARIF file, never - (the findings would reach the CI log).
   - id: betterleaks
@@ -567,17 +583,19 @@ tools:
     step:
       cli:
         install: { method: github-release, package: "betterleaks_1.9.0_linux_x64.tar.gz", version: "v1.9.0" }
-        command: ["betterleaks", "git", "--no-banner", "--ignore-gitleaks-allow", "--redact", "--report-format", "sarif", "--report-path", "betterleaks.sarif", "--exit-code", "1", "."]
+        command: ["betterleaks", "dir", "--no-banner", "--ignore-gitleaks-allow", "--redact", "--report-format", "sarif", "--report-path", "betterleaks.sarif", "--exit-code", "10", "--max-archive-depth", "0", "."]
       output: { path: "betterleaks.sarif", format: sarif }
     fixedInputs:
-      args: ["--ignore-gitleaks-allow", "--redact", "--report-format", "sarif", "--report-path", "betterleaks.sarif", "--exit-code", "1"]
+      args: ["--ignore-gitleaks-allow", "--redact", "--report-format", "sarif", "--report-path", "betterleaks.sarif", "--exit-code", "10", "--max-archive-depth", "0"]
       config:
-        content: "[extend]\nuseDefault = true\n"
+        content: "[extend]\nuseDefault = true\n\n[[rules]]\nid = \"pipegen-canary\"\ndescription = \"pipegen scan marker (proves the file was read)\"\nregex = '''(?m)^pipegen-canary-[0-9a-f]{32}$'''\nkeywords = [\"pipegen-canary-\"]\n"
         passAs: { flag: "--config" }
     choices: {}
-    configFiles: [".betterleaks.toml", ".gitleaks.toml", ".gitleaksignore", ".betterleaksignore"]
-    reviewedBy: Cristiano
-    reviewedAt: "2026-10-28"
+    # Config scope: root. the scan runs on the stage folder with its pinned --config; the stage folder holds no config or ignore file (the run refuses one), so nothing below the root is read.
+    configFiles: []
+    rootConfigFiles: [".betterleaks.toml", ".gitleaks.toml", ".gitleaksignore", ".betterleaksignore"]
+    reviewedBy: Claude delegated DECISIONS 105
+    reviewedAt: "2026-10-30"
     proofs: 0
     verifiedWith:
       method: cosign-bundle
@@ -587,7 +605,8 @@ tools:
       verifiedOn: "2026-10-28"
 
   # Secret scan, the fallback listed after betterleaks. Same release as data/pinned-binaries.yml (ruling S25).
-  # The same locks as betterleaks (ruling P21): --redact, --report-path its own SARIF file only, --exit-code 1, the pinned --config, no verbose output.
+  # The same locks as betterleaks (ruling P21): --redact, --report-path its own SARIF file only, --exit-code 10 (C0a fix round 1: their errors exit 1), the pinned --config, no verbose output.
+  # C1c: the same stage folder and the same pinned config with the pipegen-canary rule as betterleaks. Reviewed by delegation (DECISIONS 105), 2026-10-30.
   # Source: release v8.30.1 of gitleaks/gitleaks: gitleaks_8.30.1_linux_x64.tar.gz sha256 from the release checksums file. Released 2026-03-21T02:17:58Z.
   - id: gitleaks
     categories: ["secrets"]
@@ -606,17 +625,19 @@ tools:
     step:
       cli:
         install: { method: github-release, package: "gitleaks_8.30.1_linux_x64.tar.gz", version: "v8.30.1" }
-        command: ["gitleaks", "git", "--no-banner", "--ignore-gitleaks-allow", "--redact", "--report-format", "sarif", "--report-path", "gitleaks.sarif", "--exit-code", "1", "."]
+        command: ["gitleaks", "dir", "--no-banner", "--ignore-gitleaks-allow", "--redact", "--report-format", "sarif", "--report-path", "gitleaks.sarif", "--exit-code", "10", "--max-archive-depth", "0", "."]
       output: { path: "gitleaks.sarif", format: sarif }
     fixedInputs:
-      args: ["--ignore-gitleaks-allow", "--redact", "--report-format", "sarif", "--report-path", "gitleaks.sarif", "--exit-code", "1"]
+      args: ["--ignore-gitleaks-allow", "--redact", "--report-format", "sarif", "--report-path", "gitleaks.sarif", "--exit-code", "10", "--max-archive-depth", "0"]
       config:
-        content: "[extend]\nuseDefault = true\n"
+        content: "[extend]\nuseDefault = true\n\n[[rules]]\nid = \"pipegen-canary\"\ndescription = \"pipegen scan marker (proves the file was read)\"\nregex = '''(?m)^pipegen-canary-[0-9a-f]{32}$'''\nkeywords = [\"pipegen-canary-\"]\n"
         passAs: { flag: "--config" }
     choices: {}
-    configFiles: [".gitleaks.toml", ".gitleaksignore"]
-    reviewedBy: Cristiano
-    reviewedAt: "2026-10-28"
+    # Config scope: root. the scan runs on the stage folder with its pinned --config; the stage folder holds no config or ignore file (the run refuses one), so nothing below the root is read.
+    configFiles: []
+    rootConfigFiles: [".gitleaks.toml", ".gitleaksignore"]
+    reviewedBy: Claude delegated DECISIONS 105
+    reviewedAt: "2026-10-30"
     proofs: 0
 
   # Semgrep CE (image). Rules come only from a pinned semgrep-rules archive, never the registry (ruling S22).
@@ -642,23 +663,25 @@ tools:
     step:
       cli:
         install: { method: docker, package: "semgrep/semgrep", version: "1.181.0" }
-        command: ["semgrep", "scan", "--metrics=off", "--disable-version-check", "--config", "/pipegen-rules", "--sarif", "--output", "semgrep.sarif"]
+        command: ["semgrep", "scan", "--metrics=off", "--disable-version-check", "--max-target-bytes=0", "--config", "/pipegen-rules", "--sarif", "--output", "semgrep.sarif"]
         env:
           PIPEGEN_RULES_URL: "https://github.com/semgrep/semgrep-rules/archive/17e31e11ebac99fb7dfe1cd288f7a32151b6f3f9.tar.gz"
           PIPEGEN_RULES_SHA256: "9dfe6866fbecd557f507078cb79721a9eb8f4764fc2f6163648ea1320be25933"
           PIPEGEN_RULES_TREE: "dd3179667faf14717e05c33b1916b0d2c349673d"
       output: { path: "semgrep.sarif", format: sarif }
     fixedInputs:
-      args: ["--metrics=off", "--disable-version-check", "--config", "/pipegen-rules"]
+      args: ["--metrics=off", "--disable-version-check", "--max-target-bytes=0", "--config", "/pipegen-rules"]
       env:
         PIPEGEN_RULES_URL: "https://github.com/semgrep/semgrep-rules/archive/17e31e11ebac99fb7dfe1cd288f7a32151b6f3f9.tar.gz"
         PIPEGEN_RULES_SHA256: "9dfe6866fbecd557f507078cb79721a9eb8f4764fc2f6163648ea1320be25933"
         PIPEGEN_RULES_TREE: "dd3179667faf14717e05c33b1916b0d2c349673d"
     choices:
       rules: ["javascript", "typescript", "python"]
-    configFiles: [".semgrepignore"]
-    reviewedBy: Cristiano
-    reviewedAt: "2026-10-28"
+    # Config scope: root. the renderer deletes every .semgrepignore in the tree and writes pipegen's own at the scan root (scopeIgnore), so nothing is read from the repository.
+    configFiles: []
+    rootConfigFiles: [".semgrepignore"]
+    reviewedBy: Claude delegated DECISIONS 105
+    reviewedAt: "2026-10-30"
     proofs: 0
 
   # Dependency scan against the OSV database. Release binary. Also the dependency-review check (Plan P Task 6): comparing
@@ -681,17 +704,17 @@ tools:
     step:
       cli:
         install: { method: github-release, package: "osv-scanner_linux_amd64", version: "v2.7.0" }
-        command: ["osv-scanner", "scan", "source", "--recursive", "--format", "sarif", "--output", "osv.sarif", "."]
+        command: ["osv-scanner", "scan", "source", "--recursive", "--no-ignore", "--format", "sarif", "--output", "osv.sarif", "."]
       output: { path: "osv.sarif", format: sarif }
     fixedInputs:
-      args: ["--format", "sarif", "--output", "osv.sarif"]
+      args: ["--no-ignore", "--format", "sarif", "--output", "osv.sarif"]
       config:
         content: "# pipegen's pinned osv-scanner config: no ignored vulnerabilities\n"
         passAs: { flag: "--config" }
     choices: {}
     configFiles: ["**/osv-scanner.toml"]
-    reviewedBy: Cristiano
-    reviewedAt: "2026-10-28"
+    reviewedBy: Claude delegated DECISIONS 105
+    reviewedAt: "2026-10-30"
     proofs: 0
 
   # Git hook manager: sets up the pre-commit hooks, and runs them in CI on all files.
@@ -718,9 +741,11 @@ tools:
     fixedInputs:
       args: ["--all-files"]
     choices: {}
-    configFiles: ["lefthook.yml", "lefthook.yaml", ".lefthook.yml", ".lefthook.yaml", "lefthook-local.yml", "lefthook-local.yaml", ".lefthook-local.yml", ".lefthook-local.yaml", ".lefthook/**", ".lefthook-local/**"]
-    reviewedBy: Cristiano
-    reviewedAt: "2026-10-28"
+    # Config scope: root. lefthook reads its config from the repository root (the git top level), never from a sub-folder; the hook folders .lefthook/** are anchored paths.
+    configFiles: [".lefthook/**", ".lefthook-local/**"]
+    rootConfigFiles: ["lefthook.yml", "lefthook.yaml", ".lefthook.yml", ".lefthook.yaml", "lefthook-local.yml", "lefthook-local.yaml", ".lefthook-local.yml", ".lefthook-local.yaml"]
+    reviewedBy: Claude delegated DECISIONS 105
+    reviewedAt: "2026-10-30"
     proofs: 0
 
   # Lists every component of the built image (SBOM, SPDX JSON). Release binary.
@@ -750,9 +775,11 @@ tools:
         content: "check-for-app-update: false\n"
         passAs: { flag: "--config" }
     choices: {}
-    configFiles: [".syft.yaml", ".syft.yml", ".syft/**", "syft.yaml"]
-    reviewedBy: Cristiano
-    reviewedAt: "2026-10-28"
+    # Config scope: root. syft looks for .syft.yaml in the working folder (then the home folder), not in sub-folders; .syft/** is an anchored path.
+    configFiles: [".syft/**"]
+    rootConfigFiles: [".syft.yaml", ".syft.yml", "syft.yaml"]
+    reviewedBy: Claude delegated DECISIONS 105
+    reviewedAt: "2026-10-30"
     proofs: 0
 
   # Signs the built image. Same release as data/pinned-binaries.yml (ruling S25).
@@ -845,9 +872,11 @@ tools:
         content: "rules: {}\n"
         passAs: { flag: "--config" }
     choices: {}
-    configFiles: ["zizmor.yml", "zizmor.yaml", ".github/zizmor.yml", ".github/zizmor.yaml"]
-    reviewedBy: Cristiano
-    reviewedAt: "2026-10-28"
+    # Config scope: root. zizmor reads zizmor.yml from the repository root or .github/ (the latter are anchored paths below), not from sub-folders.
+    configFiles: [".github/zizmor.yml", ".github/zizmor.yaml"]
+    rootConfigFiles: ["zizmor.yml", "zizmor.yaml"]
+    reviewedBy: Claude delegated DECISIONS 105
+    reviewedAt: "2026-10-30"
     proofs: 0
 
   # ---------- Plan P Task 6 (pin day): the catalogue's tools (catalogue §4, verification.md R1) ----------
@@ -886,12 +915,16 @@ tools:
         content: "{\n  \"linter\": {\n    \"rules\": {\n      \"complexity\": {\n        \"noExcessiveCognitiveComplexity\": { \"level\": \"error\", \"options\": { \"maxAllowedComplexity\": 15 } }\n      }\n    }\n  }\n}\n"
         passAs: { flag: "--config-path" }
     choices: {}
+    # Config scope: nested (protected at any depth). biome 2 may load nested biome.json files (nested roots) even with --config-path; unsure, so nested.
     configFiles: ["biome.json", "biome.jsonc", ".biome.json", ".biome.jsonc", "**/biome.json", "**/biome.jsonc", ".editorconfig"]
     reviewedBy: Cristiano
     reviewedAt: "2026-10-28"
     proofs: 0
 
   # ESLint for JavaScript repos whose framework needs ESLint plugins (catalogue §2). Flat config only.
+  # 6c (ruling S11): plugin @eslint/js@10.0.1 (npm dist.integrity, the tarball hashes to it; published 2026-02-06T22:34:56Z, peer eslint ^10) for js.configs.recommended.
+  #   The config is written into pipegen's isolated closure folder (DECISIONS #107), so '@eslint/js' resolves there and the repo's copy is never read.
+  #   Re-reviewed by delegation on 2026-10-29 (DECISIONS #105); same for eslint-typescript below.
   # Source: npm eslint@10.13.0 dist.integrity (the downloaded tarball hashes to it), published 2026-10-16T14:24:10.765Z; npm provenance: no.
   # pipegen's pinned flat config sets complexity 15; never eslint-config-prettier or eslint-plugin-prettier (CVE-2025-54313).
   # It lints .jsx and the framework files too (ruling P25): without their ESLint parser (not pinned here; owner review), a
@@ -913,17 +946,21 @@ tools:
     step:
       cli:
         install: { method: npm, package: "eslint", version: "10.13.0" }
+        plugins:
+          - { method: npm, package: "@eslint/js", version: "10.0.1", checksum: "sha512-zeR9k5pd4gxjZ0abRoIaxdc7I3nDktoXZk2qOv9gCNWx3mVwEn32VRhyLaRsDiJjTs0xq/T8mfPtyuXu7GWBcA==" }
         command: ["eslint", "--max-warnings", "0", "."]
       output: { path: "", format: none }
     fixedInputs:
       args: ["--max-warnings", "0"]
       config:
-        content: "export default [{ files: ['**/*.{js,mjs,cjs,jsx,vue,svelte,astro}'], languageOptions: { parserOptions: { ecmaFeatures: { jsx: true } } }, rules: { complexity: ['error', 15] } }];\n"
+        content: "import js from '@eslint/js';\nexport default [js.configs.recommended, { files: ['**/*.{js,mjs,cjs,jsx,vue,svelte,astro}'], languageOptions: { parserOptions: { ecmaFeatures: { jsx: true } } }, rules: { complexity: ['error', 15] } }];\n"
         passAs: { flag: "--config" }
     choices: {}
-    configFiles: ["eslint.config.js", "eslint.config.mjs", "eslint.config.cjs", "eslint.config.ts", "eslint.config.mts", "eslint.config.cts"]
-    reviewedBy: Cristiano
-    reviewedAt: "2026-10-28"
+    # Config scope: root. eslint runs with its pinned --config, which turns off the flat-config lookup (a package's own eslint.config.* is never read).
+    configFiles: []
+    rootConfigFiles: ["eslint.config.js", "eslint.config.mjs", "eslint.config.cjs", "eslint.config.ts", "eslint.config.mts", "eslint.config.cts"]
+    reviewedBy: Claude delegated DECISIONS 105
+    reviewedAt: "2026-10-30"
     proofs: 0
 
   # ESLint with typescript-eslint, for TypeScript before 7 (typescript-eslint 8.72.0 peers: typescript >=4.8.4 <6.1.0).
@@ -948,17 +985,20 @@ tools:
         install: { method: npm, package: "eslint", version: "10.13.0" }
         plugins:
           - { method: npm, package: "typescript-eslint", version: "8.72.0", checksum: "sha512-r26Fkc8As+mZvqp7SLsMmNFyYUup/6CjK7/eHBHmhOw6GH6n6YFxHVFrG0jN1c5CMpDzelLPxvgeCOzx7BjN+A==" }
+          - { method: npm, package: "@eslint/js", version: "10.0.1", checksum: "sha512-zeR9k5pd4gxjZ0abRoIaxdc7I3nDktoXZk2qOv9gCNWx3mVwEn32VRhyLaRsDiJjTs0xq/T8mfPtyuXu7GWBcA==" }
         command: ["eslint", "--max-warnings", "0", "."]
       output: { path: "", format: none }
     fixedInputs:
       args: ["--max-warnings", "0"]
       config:
-        content: "import tseslint from 'typescript-eslint';\nexport default [...tseslint.configs.recommended, { files: ['**/*.{js,mjs,cjs,jsx,ts,mts,cts,tsx,vue,svelte,astro}'], rules: { complexity: ['error', 15] } }];\n"
+        content: "import js from '@eslint/js';\nimport tseslint from 'typescript-eslint';\nexport default [js.configs.recommended, ...tseslint.configs.recommended, { files: ['**/*.{js,mjs,cjs,jsx,ts,mts,cts,tsx,vue,svelte,astro}'], rules: { complexity: ['error', 15] } }];\n"
         passAs: { flag: "--config" }
     choices: {}
-    configFiles: ["eslint.config.js", "eslint.config.mjs", "eslint.config.cjs", "eslint.config.ts", "eslint.config.mts", "eslint.config.cts"]
-    reviewedBy: Cristiano
-    reviewedAt: "2026-10-28"
+    # Config scope: root. eslint runs with its pinned --config, which turns off the flat-config lookup (a package's own eslint.config.* is never read).
+    configFiles: []
+    rootConfigFiles: ["eslint.config.js", "eslint.config.mjs", "eslint.config.cjs", "eslint.config.ts", "eslint.config.mts", "eslint.config.cts"]
+    reviewedBy: Claude delegated DECISIONS 105
+    reviewedAt: "2026-10-30"
     proofs: 0
 
   # Oxlint's type-aware rules (tsgolint), next to ESLint for TypeScript 7 and later (typescript-eslint doesn't support it).
@@ -988,17 +1028,18 @@ tools:
           - { method: npm, package: "@oxlint/binding-linux-x64-gnu", version: "1.89.0", checksum: "sha512-hqjwIj5KOYM8Wjef/p7IruNi1iByLhSzbMBk62y22P/E8q7Jj0Pp+DeUTKTRYyZYCDtU1wEGlnWOnttHbyNIww==" }
           - { method: npm, package: "oxlint-tsgolint", version: "7.0.2004", checksum: "sha512-vQ9WDF3fiZJvRdSDosNOflerOCOpwol6vWzVDxW76RcU19cjTh7engvkHLvmv+tzedR8fAiJUVUGr6IVZdkzXQ==" }
           - { method: npm, package: "@oxlint-tsgolint/linux-x64", version: "7.0.2004", checksum: "sha512-LPunZvm6ZbWPfHMAyfZf9ci3HHvNEzLejO8zdqO3GoVGoSEHqqufHUD7+OgeatVSaJP7uXDJ2HaNOHIoH7go4Q==" }
-        command: ["oxlint", "--type-aware", "--deny-warnings"]
+        command: ["oxlint", "--type-aware", "--deny-warnings", "--no-ignore"]
       output: { path: "", format: none }
     fixedInputs:
-      args: ["--type-aware", "--deny-warnings"]
+      args: ["--type-aware", "--deny-warnings", "--no-ignore"]
       config:
         content: "{ \"categories\": { \"correctness\": \"error\" } }\n"
         passAs: { flag: "--config" }
     choices: {}
-    configFiles: [".oxlintrc.json", "oxlint.config.ts", "**/.oxlintrc.json", ".eslintignore", ".gitignore"]
-    reviewedBy: Cristiano
-    reviewedAt: "2026-10-28"
+    # Config scope: nested (protected at any depth). oxlint loads nested .oxlintrc.json files unless --disable-nested-config is given (1.89.0 --help); nested.
+    configFiles: [".oxlintrc.json", "oxlint.config.ts", "**/.oxlintrc.json"]
+    reviewedBy: Claude delegated DECISIONS 105
+    reviewedAt: "2026-10-30"
     proofs: 0
 
   # Prettier format check (no writes). A Prettier config already in the repo is used (catalogue §2), so it is protected.
@@ -1020,15 +1061,21 @@ tools:
     step:
       cli:
         install: { method: npm, package: "prettier", version: "3.9.10" }
-        command: ["prettier", "--check", "."]
+        command: ["prettier", "--check", "--ignore-path", ".prettierignore", "."]
       output: { path: "", format: none }
     fixedInputs:
-      args: ["--check"]
+      args: ["--check", "--ignore-path", ".prettierignore"]
+      config:
+        content: "# pipegen's pinned prettier ignore file: nothing is ignored here, so a .gitignore in the checkout hides no file\n"
+        passAs: { flag: "--ignore-path" }
     choices: {}
-    configFiles: [".prettierrc", ".prettierrc.*", "prettier.config.*", ".prettierignore", "**/.prettierrc", "**/.prettierrc.*", ".editorconfig", ".gitignore"]
+    # Config scope: root. the run names --ignore-path .prettierignore, which is relative to the working folder; a nested .prettierignore is never read (checked on 3.9.10).
+    # Config scope: nested (protected at any depth). prettier looks for .prettierrc* and .editorconfig upward from each file, so a nested one changes how a file is checked; nested.
+    configFiles: [".prettierrc", ".prettierrc.*", "prettier.config.*", "**/.prettierrc", "**/.prettierrc.*", ".editorconfig"]
+    rootConfigFiles: [".prettierignore"]
     configSections: ["package.json:prettier"]
-    reviewedBy: Cristiano
-    reviewedAt: "2026-10-28"
+    reviewedBy: Claude delegated DECISIONS 105
+    reviewedAt: "2026-10-30"
     proofs: 0
 
   # Vitest coverage (v8), when Vitest is the test runner. The minimum of lines is a fixed flag whose value the AI chooses
@@ -1060,6 +1107,7 @@ tools:
       args: ["--coverage", "--coverage.thresholds.lines={coverage-thresholds-lines}"]
     choices:
       coverage-thresholds-lines: ["60", "70", "80", "90"]
+    # Config scope: nested (protected at any depth). vitest workspaces reference per-package configs, so a nested config can change the run; nested.
     configFiles: ["vitest.config.*", "vite.config.*", "vitest.workspace.*", "**/vitest.config.*"]
     reviewedBy: Cristiano
     reviewedAt: "2026-10-28"
@@ -1089,6 +1137,7 @@ tools:
     fixedInputs:
       args: ["--check-coverage"]
     choices: {}
+    # Config scope: nested (protected at any depth). c8 reads its rc file from the working folder; unsure about parents, so nested.
     configFiles: [".c8rc", ".c8rc.*", ".nycrc", ".nycrc.*"]
     configSections: ["package.json:c8"]
     reviewedBy: Cristiano
@@ -1114,14 +1163,16 @@ tools:
     step:
       cli:
         install: { method: npm, package: "knip", version: "6.42.1" }
-        command: ["knip", "--no-progress"]
+        command: ["knip", "--no-progress", "--no-gitignore"]
       output: { path: "", format: none }
-    fixedInputs: {}
+    fixedInputs:
+      args: ["--no-progress", "--no-gitignore"]
     choices: {}
+    # Config scope: nested (protected at any depth). knip reads its config from the working folder; workspaces are configured in the root file; unsure, so nested.
     configFiles: ["knip.json", "knip.jsonc", ".knip.json", ".knip.jsonc", "knip.config.*", "knip.ts", "knip.js"]
     configSections: ["package.json:knip"]
-    reviewedBy: Cristiano
-    reviewedAt: "2026-10-28"
+    reviewedBy: Claude delegated DECISIONS 105
+    reviewedAt: "2026-10-30"
     proofs: 0
 
   # jscpd: copy-paste detection, warning only (DECISIONS #93); new copy-paste in the pull request only.
@@ -1148,21 +1199,26 @@ tools:
     step:
       cli:
         install: { method: github-release, package: "jscpd-linux-x64-gnu.tar.gz", version: "v5.4.2" }
-        command: ["jscpd", "--baseline-from-ref", "origin/main", "--fail-on-new-clones", "--reporters", "sarif", "--output", "jscpd-report", "."]
+        command: ["jscpd", "--baseline-from-ref", "origin/main", "--fail-on-new-clones", "--no-gitignore", "--reporters", "sarif", "--output", "jscpd-report", "."]
       output: { path: "", format: none }
     fixedInputs:
-      args: ["--baseline-from-ref", "origin/main", "--fail-on-new-clones"]
+      args: ["--baseline-from-ref", "origin/main", "--fail-on-new-clones", "--no-gitignore"]
       config:
         content: "{}\n"
         passAs: { flag: "--config" }
     choices: {}
-    configFiles: [".jscpd.json"]
+    # Config scope: root. jscpd runs with its pinned --config, which replaces the .jscpd.json of the working folder.
+    configFiles: []
+    rootConfigFiles: [".jscpd.json"]
     configSections: ["package.json:jscpd"]
-    reviewedBy: Cristiano
-    reviewedAt: "2026-10-28"
+    reviewedBy: Claude delegated DECISIONS 105
+    reviewedAt: "2026-10-30"
     proofs: 0
 
-  # Trivy licence scan of the dependencies (catalogue §3): blocks on HIGH and CRITICAL licence findings. Same binary as trivy-config.
+  # Trivy licence scan of the dependencies (catalogue §3). Same binary as trivy-config. It reports EVERY severity (ruling S9, Plan C final review
+  #   fix round A, delegated review DECISIONS 105, 2026-10-30): no --severity, so Unknown licences reach the SARIF (G11: HIGH,CRITICAL hid all 6
+  #   on the DoD repos). The gate judges by severity: Forbidden (CRITICAL) and Restricted (HIGH) block, an Unknown licence is a warning that
+  #   needs a human. Any licence finding exits 10 (findingsExit); 1 stays trivy's error exit.
   # Source: release v0.76.0 of aquasecurity/trivy: trivy_0.76.0_Linux-64bit.tar.gz sha256 from the release checksums file. Released 2026-10-14T11:45:44Z.
   # Signature: pipegen's pinned cosign 3.1.3 ran `cosign verify-blob --bundle trivy_0.76.0_checksums.txt.sigstore.json
   #   --certificate-identity https://github.com/aquasecurity/trivy/.github/workflows/reusable-release.yaml@refs/tags/v0.76.0
@@ -1185,17 +1241,21 @@ tools:
     step:
       cli:
         install: { method: github-release, package: "trivy_0.76.0_Linux-64bit.tar.gz", version: "v0.76.0" }
-        command: ["trivy", "fs", "--disable-telemetry", "--skip-version-check", "--skip-check-update", "--scanners", "license", "--severity", "HIGH,CRITICAL", "--format", "sarif", "--output", "trivy-licence.sarif", "--exit-code", "1", "."]
+        command: ["trivy", "fs", "--disable-telemetry", "--skip-version-check", "--skip-check-update", "--scanners", "license", "--format", "sarif", "--output", "trivy-licence.sarif", "--exit-code", "10", "."]
       output: { path: "trivy-licence.sarif", format: sarif }
     fixedInputs:
-      args: ["--disable-telemetry", "--skip-version-check", "--skip-check-update", "--scanners", "license", "--severity", "HIGH,CRITICAL", "--format", "sarif", "--output", "trivy-licence.sarif", "--exit-code", "1"]
+      args: ["--disable-telemetry", "--skip-version-check", "--skip-check-update", "--scanners", "license", "--format", "sarif", "--output", "trivy-licence.sarif", "--exit-code", "10"]
       config:
-        content: "# pipegen's pinned trivy config: no cache kept between runs\ncache:\n  backend: memory\n"
+        content: "# pipegen's pinned trivy config: no cache kept between runs, and no repository trivy-secret.yaml (an empty path loads none)\ncache:\n  backend: memory\nsecret:\n  config: \"\"\n"
         passAs: { flag: "--config" }
     choices: {}
-    configFiles: ["trivy.yaml", ".trivyignore", ".trivyignore.yaml"]
-    reviewedBy: Cristiano
-    reviewedAt: "2026-10-28"
+    # Config scope: root. trivy runs with its pinned --config (it never loads the repo's trivy.yaml), and reads .trivyignore / .trivyignore.yaml from the working folder only (--ignorefile defaults to ./.trivyignore).
+    # trivy-secret.yaml (C5a CF1): the pinned config sets secret.config to "", so trivy loads none (checked live on 0.76.0: without it, a
+    #   trivy-secret.yaml in the working folder with disable-rules silenced a secret finding); the name stays protected as a belt.
+    configFiles: []
+    rootConfigFiles: ["trivy.yaml", ".trivyignore", ".trivyignore.yaml", "trivy-secret.yaml"]
+    reviewedBy: Claude delegated DECISIONS 105
+    reviewedAt: "2026-10-30"
     proofs: 0
     verifiedWith:
       method: cosign-bundle
@@ -1269,9 +1329,11 @@ tools:
         content: "# pipegen's pinned hadolint config: every rule at its default level, nothing ignored\nignored: []\n"
         passAs: { flag: "--config" }
     choices: {}
-    configFiles: [".hadolint.yaml", ".hadolint.yml"]
-    reviewedBy: Cristiano
-    reviewedAt: "2026-10-28"
+    # Config scope: root. hadolint runs with its pinned --config; it then reads no .hadolint.yaml (the review of C4 confirmed this).
+    configFiles: []
+    rootConfigFiles: [".hadolint.yaml", ".hadolint.yml"]
+    reviewedBy: Claude delegated DECISIONS 105
+    reviewedAt: "2026-10-30"
     proofs: 0
 
   # kube-linter: lints Kubernetes manifests and Helm charts, next to Trivy config. pipegen's pinned config (the default checks).
@@ -1308,9 +1370,11 @@ tools:
         content: "# pipegen's pinned kube-linter config: the default checks\nchecks:\n  doNotAutoAddDefaults: false\n"
         passAs: { flag: "--config" }
     choices: {}
-    configFiles: [".kube-linter.yaml", ".kube-linter.yml"]
-    reviewedBy: Cristiano
-    reviewedAt: "2026-10-28"
+    # Config scope: root. kube-linter runs with its pinned --config and reads no other config.
+    configFiles: []
+    rootConfigFiles: [".kube-linter.yaml", ".kube-linter.yml"]
+    reviewedBy: Claude delegated DECISIONS 105
+    reviewedAt: "2026-10-30"
     proofs: 0
     verifiedWith:
       kind: cosign-key
@@ -1342,6 +1406,7 @@ tools:
     fixedInputs:
       args: ["--max-examples", "25", "--report", "junit", "--report-junit-path", "schemathesis.xml"]
     choices: {}
+    # Config scope: nested (protected at any depth). schemathesis.toml: not rendered (pip tool); unsure where it is read, so nested.
     configFiles: ["schemathesis.toml"]
     reviewedBy: Cristiano
     reviewedAt: "2026-10-28"
@@ -1353,6 +1418,9 @@ tools:
   # Templates (G4, rulings PS30 and P3): nuclei-templates v10.5.0 (released 2026-10-05T07:27:40Z; tag commit
   #   f8b8b8dcd70d93826c3767e1829ef8243af9f03b). On pin day GitHub's tag archive (the URL below) hashed to exactly the
   #   sha256 the release's nuclei-templates-10.5.0_checksums.txt lists for nuclei-templates-10.5.0.tar.gz.
+  # 6c (ruling S12): PIPEGEN_NUCLEI_TEMPLATES_COMMIT is that tag commit (GitHub API refs/tags/v10.5.0 -> commit, read 2026-10-29) and
+  #   PIPEGEN_NUCLEI_TEMPLATES_TREE its git tree (GitHub API git/commits/<sha> .tree.sha, read 2026-10-29). The renderer fetches the commit
+  #   with git and checks HEAD and HEAD^{tree} against them. Re-reviewed by delegation on 2026-10-29 (DECISIONS #105).
   # -duc: no update check; -t: only the verified templates; -ni: no interactsh callbacks to ProjectDiscovery's servers.
   - id: nuclei
     categories: ["dast"]
@@ -1375,16 +1443,20 @@ tools:
         env:
           PIPEGEN_NUCLEI_TEMPLATES_URL: "https://github.com/projectdiscovery/nuclei-templates/archive/refs/tags/v10.5.0.tar.gz"
           PIPEGEN_NUCLEI_TEMPLATES_SHA256: "80fbabceca095fac40afecc7f023748df22b9576b9ff10a4422bd2fbf81f9a41"
+          PIPEGEN_NUCLEI_TEMPLATES_COMMIT: "f8b8b8dcd70d93826c3767e1829ef8243af9f03b"
+          PIPEGEN_NUCLEI_TEMPLATES_TREE: "041a8a68269d2408f0853060f3f5e793938fdbf6"
       output: { path: "nuclei.sarif", format: sarif }
     fixedInputs:
       args: ["-duc", "-t", "/pipegen-nuclei-templates", "-severity", "medium,high,critical", "-ni"]
       env:
         PIPEGEN_NUCLEI_TEMPLATES_URL: "https://github.com/projectdiscovery/nuclei-templates/archive/refs/tags/v10.5.0.tar.gz"
         PIPEGEN_NUCLEI_TEMPLATES_SHA256: "80fbabceca095fac40afecc7f023748df22b9576b9ff10a4422bd2fbf81f9a41"
+        PIPEGEN_NUCLEI_TEMPLATES_COMMIT: "f8b8b8dcd70d93826c3767e1829ef8243af9f03b"
+        PIPEGEN_NUCLEI_TEMPLATES_TREE: "041a8a68269d2408f0853060f3f5e793938fdbf6"
     choices: {}
     configFiles: []
-    reviewedBy: Cristiano
-    reviewedAt: "2026-10-28"
+    reviewedBy: Claude delegated DECISIONS 105
+    reviewedAt: "2026-10-29"
     proofs: 0
 
   # OpenSSF Scorecard, weekly; reported, never gated. Results are never published (publish_results false; catalogue §3 SD5).
@@ -1457,6 +1529,7 @@ tools:
     fixedInputs:
       args: ["--check", "--verify-comment"]
     choices: {}
+    # Config scope: nested (protected at any depth). pinact reads its config without a pinned one; unsure of the lookup, so nested.
     configFiles: [".pinact.yaml", ".pinact.yml", ".github/pinact.yaml", ".github/pinact.yml"]
     reviewedBy: Cristiano
     reviewedAt: "2026-10-28"
@@ -1491,9 +1564,11 @@ tools:
         content: "# pipegen's pinned poutine config: no skipped rules\nskip: []\n"
         passAs: { flag: "--config" }
     choices: {}
-    configFiles: [".poutine.yml", ".poutine.yaml", ".github/poutine.yml", ".github/poutine.yaml"]
-    reviewedBy: Cristiano
-    reviewedAt: "2026-10-28"
+    # Config scope: root. poutine runs with its pinned --config and reads no other config.
+    configFiles: [".github/poutine.yml", ".github/poutine.yaml"]
+    rootConfigFiles: [".poutine.yml", ".poutine.yaml"]
+    reviewedBy: Claude delegated DECISIONS 105
+    reviewedAt: "2026-10-30"
     proofs: 0
 
   # gosec: Go security checks (SARIF). No AI flags (-ai-*) and no config from the repo. #nosec comments stay allowed (they
@@ -1536,7 +1611,7 @@ tools:
 
   # Ruff lint for Python (C901 complexity at 15), with pipegen's pinned ruff.toml (--config with a file: the repo's ruff
   #   settings are not read; the pyproject.toml section is still listed, ruling P23). No cache (spec §19). Ruff skips
-  #   files in .gitignore/.ignore, so those are protected too.
+  #   files in .gitignore/.ignore, so the pinned config sets respect-gitignore = false (checked on 0.17.1: it covers .ignore too).
   # Source: release 0.17.1 of astral-sh/ruff (the tag has no v): ruff-x86_64-unknown-linux-gnu.tar.gz sha256 from sha256.sum
   #   (and the asset's own .sha256; also GitHub's asset digest and the sha256 of the downloaded archive). Released 2026-10-15T15:24:28Z. Immutable release.
   - id: ruff
@@ -1561,13 +1636,15 @@ tools:
     fixedInputs:
       args: ["--no-cache", "--output-format", "sarif", "--output-file", "ruff.sarif"]
       config:
-        content: "[lint]\nextend-select = [\"C901\"]\n\n[lint.mccabe]\nmax-complexity = 15\n"
+        content: "respect-gitignore = false\n\n[lint]\nextend-select = [\"C901\"]\n\n[lint.mccabe]\nmax-complexity = 15\n"
         passAs: { flag: "--config" }
     choices: {}
-    configFiles: ["ruff.toml", ".ruff.toml", ".gitignore", ".ignore"]
+    # Config scope: root. ruff runs with its pinned --config, so it reads no ruff.toml or .ruff.toml (checked on 0.17.1: --config with a file replaces discovery).
+    configFiles: []
+    rootConfigFiles: ["ruff.toml", ".ruff.toml"]
     configSections: ["pyproject.toml:tool.ruff"]
-    reviewedBy: Cristiano
-    reviewedAt: "2026-10-28"
+    reviewedBy: Claude delegated DECISIONS 105
+    reviewedAt: "2026-10-30"
     proofs: 0
 
   # Ruff format check for Python (no writes). Same binary and pin as ruff.
@@ -1593,13 +1670,15 @@ tools:
     fixedInputs:
       args: ["--check", "--no-cache"]
       config:
-        content: "# pipegen's pinned ruff config: the default format\n"
+        content: "# pipegen's pinned ruff config: the default format, and files hidden by a .gitignore are still checked\nrespect-gitignore = false\n"
         passAs: { flag: "--config" }
     choices: {}
-    configFiles: ["ruff.toml", ".ruff.toml", ".gitignore", ".ignore"]
+    # Config scope: root. ruff runs with its pinned --config, so it reads no ruff.toml or .ruff.toml (checked on 0.17.1: --config with a file replaces discovery).
+    configFiles: []
+    rootConfigFiles: ["ruff.toml", ".ruff.toml"]
     configSections: ["pyproject.toml:tool.ruff"]
-    reviewedBy: Cristiano
-    reviewedAt: "2026-10-28"
+    reviewedBy: Claude delegated DECISIONS 105
+    reviewedAt: "2026-10-30"
     proofs: 0
 
   # mypy for Python repos that configured type checking (DECISIONS #95: no config and no py.typed → skipped).
@@ -1626,6 +1705,7 @@ tools:
     fixedInputs:
       args: ["--no-incremental"]
     choices: {}
+    # Config scope: nested (protected at any depth). mypy: unsure whether a parent or sub-folder config is read, so nested.
     configFiles: ["mypy.ini", ".mypy.ini"]
     configSections: ["pyproject.toml:tool.mypy", "setup.cfg:mypy", "setup.cfg:mypy-*"]
     reviewedBy: Cristiano
@@ -1660,6 +1740,7 @@ tools:
       args: ["--module"]
     choices:
       fail-under: ["60", "70", "80", "90"]
+    # Config scope: nested (protected at any depth). coverage reads .coveragerc from the working folder; unsure about parents, so nested.
     configFiles: [".coveragerc"]
     configSections: ["pyproject.toml:tool.coverage", "setup.cfg:coverage:*", "tox.ini:coverage:*"]
     reviewedBy: Cristiano
@@ -1753,11 +1834,15 @@ tools:
       output: { path: "bandit.sarif", format: sarif }
     fixedInputs:
       args: ["--recursive", "--format", "sarif", "--output", "bandit.sarif"]
+      config:
+        content: "[bandit]\n"
+        passAs: { flag: "--ini" }
     choices: {}
+    # Config scope: nested (protected at any depth). bandit walks every target and loads the only .bandit it finds, wherever it is (1.9.4 cli/main.py; the pinned --ini now replaces that, but the name stays nested).
     configFiles: [".bandit"]
     configSections: ["pyproject.toml:tool.bandit"]
-    reviewedBy: Cristiano
-    reviewedAt: "2026-10-28"
+    reviewedBy: Claude delegated DECISIONS 105
+    reviewedAt: "2026-10-30"
     proofs: 0
 
   # PyPI trusted publishing (OIDC) with attestations; never a password input (no long-lived token).
@@ -1789,4 +1874,41 @@ tools:
     configFiles: []
     reviewedBy: Cristiano
     reviewedAt: "2026-10-28"
+    proofs: 0
+
+  # pipegen's own gate action (Plan C): scrubs scanner results, stages the checkout for the secrets scan, decides pass, warn or block,
+  # and looks up the trusted baseline. It is pipegen's own code, reviewed in this repository, so the 7-day cooldown does not apply to
+  # it (loader and scripts/cooldown.ts exempt exactly `crisworking/pipegen`, nothing else). Every input is the renderer's (RENDERER_INPUTS);
+  # the entry fixes none and offers no choice (ACTION_POLICIES row: none).
+  # Reach (ruling S6, DECISIONS #83): the repository stays private until v0.4, so in v0.2 only CrisWorking-owned repositories can use it.
+  # Self-pin (C6 scheme, done 2026-10-30): pinned to a174da8 (the last commit that changes gate/dist and gate/action.yml, Plan C
+  #   final, bundle sha256 b4ab0a4f2bd94df5a867eecd8c761d175fa1d47c5e00dd7c1c1d584293860e80), which is the commit of the annotated tag
+  #   gate-v0.2.0. scripts/cooldown.ts requires that tag to resolve to the pin; release-check requires the pin's gate/dist and action.yml
+  #   to equal HEAD's and the pin to be on the default branch. Never rewrite history at or before the pin; merge with merge commits only.
+  # Source: commit a174da8fa0015f45c6d126ab981b49198e76776c of CrisWorking/pipegen (committed 2026-10-30T16:35:31Z), tag gate-v0.2.0.
+  - id: pipegen-gate
+    categories: ["gate"]
+    languages: ["any"]
+    releasedAt: "2026-10-30T16:35:31Z"
+    candidate:
+      id: pipegen-gate
+      name: "pipegen-gate"
+      kind: action
+      repo: crisworking/pipegen
+      version: "0.2.0"
+      pin: { sha: "a174da8fa0015f45c6d126ab981b49198e76776c" }
+      source: reviewed
+      reviewed: true
+      categories: ["gate"]
+    step:
+      action:
+        uses: crisworking/pipegen/gate@a174da8fa0015f45c6d126ab981b49198e76776c
+        with: {}
+      output: { path: "", format: none }
+    fixedInputs:
+      with: {}
+    choices: {}
+    configFiles: []
+    reviewedBy: Claude delegated DECISIONS 105
+    reviewedAt: "2026-10-30"
     proofs: 0

@@ -13,7 +13,8 @@
 export type Language = 'node' | 'python' | 'go' | 'java' | 'dotnet' | 'ruby' | 'php' | 'other';
 export type PackageManager = 'npm' | 'pnpm' | 'yarn' | 'bun' | 'pip' | 'poetry' | 'uv' | 'other';
 export type Monorepo = 'none' | 'npm-workspaces' | 'pnpm-workspaces' | 'yarn-workspaces' | 'turbo' | 'nx' | 'folders';
-export type DependencyKind = 'postgres' | 'mysql' | 'redis' | 'mongodb' | 'rabbitmq' | 'external';
+export const DEPENDENCY_KINDS = ['postgres', 'mysql', 'redis', 'mongodb', 'rabbitmq', 'external'] as const;
+export type DependencyKind = typeof DEPENDENCY_KINDS[number];
 
 export interface Dependency { kind: DependencyKind; name: string; evidence: string; envVars: string[] }   // external = SaaS (Stripe, Auth0…)
 /** P55 (batch B): a one-shot script, a folder built into another service's image, or an email-template package. */
@@ -22,6 +23,13 @@ export interface Service {
   name: string; path: string; language: Language; packageManager?: PackageManager; runtimeVersion?: string;
   /** P60 (R4): other languages the folder also holds (a Python app with a package.json for its asset build): tools of these cover it too. Set only when not empty. */
   alsoLanguages?: Language[];
+  /**
+   * Final review r1-3: the package manager of each language in alsoLanguages that has one (a Python lockfile or requirements file beside a
+   * package.json: poetry, uv or pip), in that order, so the licence coverage lists that lockfile too. Set only when not empty.
+   */
+  alsoPackageManagers?: PackageManager[];
+  /** Final review r1-3: the `lockfileVersion` of the service's package-lock.json (packageManager npm), when the reader could read it. */
+  npmLockfileVersion?: number;
   dockerfile?: string; port?: number; hasTests: boolean; testFramework?: string;
   envVars: string[]; dependsOn: Dependency[];
   scripts: string[];      // script names from package.json `scripts` / pyproject `[project.scripts]` + `[tool.poetry.scripts]` (names only, never the commands)
@@ -51,12 +59,17 @@ export interface ExistingWorkflow {
   publishes?: ('npm' | 'pypi')[];   // Plan U Task 5: registries a step publishes to (a run line that starts with a publish command, or the PyPI publish action). Absent = none
 }
 export type Plan = 'free' | 'pro' | 'team' | 'enterprise' | 'unknown';
+export type OtherHookManager = 'simple-git-hooks' | 'githooks' | 'husky-v4' | 'yorkie' | 'pre-commit-npm' | 'overcommit' | 'linked-config';
 export interface RepoProfile {
   owner: string; repo: string; defaultBranch: string; private: boolean;
   ownerType: 'User' | 'Organization'; plan: Plan;
   monorepo: Monorepo; services: Service[]; terraformDirs: string[]; hasCompose: boolean;
   existingWorkflows: ExistingWorkflow[]; precommit: 'pre-commit' | 'husky' | 'lefthook' | null;
   repoFiles: RepoFiles;   // Plan P Task 1: repo-level config files, read once
+  /** Plan B 6d (DECISIONS #108): folders pipegen itself detected as vendored or generated (node_modules, vendor, dist, target, .next, .venv, or a folder named generated or __generated__), repo-relative and plain, sorted. Never a service folder, and never a folder that holds one. Per-repo tuning may skip them for lint and SAST only. Absent when none */
+  generatedDirs?: string[];
+  /** Plan B 6d fix rounds 1 and 2: hook managers other than the three `precommit` names (simple-git-hooks: a config file or a package.json key; githooks: a .githooks folder or core.hooksPath in .git/config; husky-v4: a `husky` key or a .huskyrc/husky.config file; yorkie: a `gitHooks` key; pre-commit-npm: the npm `pre-commit` package as a key or a dependency; overcommit: .overcommit.yml; linked-config: a symbolic link at the name of any hook manager's config, never followed). Per-repo tuning offers generated lefthook hooks only when `precommit` is null and this is absent. Absent when none */
+  otherHookManagers?: OtherHookManager[];
 }
 // ---------- GitHub access (moved here from Plan A Task 6 in round 4: Plan U uses it too) ----------
 export interface Auth {
@@ -84,19 +97,42 @@ export interface Candidate {
   source: 'reviewed' | 'discovery' | 'memory'; reviewed: boolean;   // only reviewed tools may block
   stats?: ToolStats; categories: string[];
 }
+/** A candidate that comes from the reviewed list. The only kind a step may carry (B1): a discovery or memory Candidate does not fit. */
+export type ReviewedCandidate = Candidate & { source: 'reviewed'; reviewed: true };
 export type OutputFormat = 'sarif' | 'junit' | 'zap-json' | 'none';   // zap-json is converted by pipegen's parser
 export interface InstallSpec { method: 'npm' | 'pip' | 'github-release' | 'docker'; package: string; version: string; checksum?: string; digest?: string }
+/**
+ * Per-repo tuning picks (Plan B 6d, DECISIONS #84 and #108): tuning option id → the values chosen, each from the enum the
+ * renderer builds for that call from the profile (src/engine/tuning.ts). Enum values only, never free text.
+ */
+export type TuningPicks = Record<string, string[]>;
+/** `StepSpec.choices`: the tool's own choices (name → one listed value) and, under `tuning`, the per-repo tuning picks. */
+export interface StepChoices { [name: string]: string | TuningPicks | undefined; tuning?: TuningPicks }
 export interface StepSpec {
-  needId: string; tool: Candidate;
+  needId: string; service?: string;   // service: the Service.name the step is for (absent for repo-wide needs)
+  tool: ReviewedCandidate;            // only a reviewed entry's candidate; renderStep checks it equals the entry it is given
+  choices: StepChoices;               // the AI's picks among the entry's `choices` (Plan F fills them); a missing one takes the first listed value. `tuning` (6d) holds the per-repo tuning picks, enum values only
+  // action/cli/output are copies of the reviewed template (memory or the AI may send them back): when present they must
+  // deep-equal the template, and nothing renders from them. Rendering uses tool.step + tool.fixedInputs + choices only.
   action?: { uses: string; with: Record<string, string> };
-  cli?: { install: InstallSpec; plugins?: InstallSpec[]; command: string[]; then?: string[][]; env?: Record<string, string> };   // plugins (Plan P Task 5): npm or pip packages installed next to the tool, each an exact version with its checksum; at most 4. then (Task 6, P24): follow-up commands of the same tool. The one rendering rule for choices (review M-R1): a `{name}` word in command/then is replaced by the chosen value of choice `name`, and `name` is the flag it fills with dots as dashes (`--fail-under={fail-under}`, `--coverage.thresholds.lines={coverage-thresholds-lines}`); dedicated tools (trivy, betterleaks, nuclei) instead get `--<choice> <value>` appended; action choices are `with:` inputs
+  cli?: { install: InstallSpec; plugins?: InstallSpec[]; command: string[]; then?: string[][]; env?: Record<string, string> };   // plugins (Plan P Task 5): npm or pip packages installed next to the tool, each an exact version with its checksum; at most 4. then (Task 6, P24): follow-up commands of the same tool. The one rendering rule for choices (review M-R1): a `{name}` word in command/then is replaced by the chosen value of choice `name`, and `name` is the flag it fills with dots as dashes (`--fail-under={fail-under}`, `--coverage.thresholds.lines={coverage-thresholds-lines}`); dedicated tools (trivy, betterleaks, nuclei) instead get `--<choice> <value>` appended, and a bool choice (one whose values are exactly `false` and `true`) is written `--<choice>=<value>` (review M8, 6b: `--ignore-unfixed=true`, never a bare flag that a later word could swallow). The renderer never writes a chosen value into the shell text: it goes in a step env variable `PIPEGEN_ARG_<n>` and is quoted as `"$PIPEGEN_ARG_<n>"` (also inside a word, `--fail-under="$PIPEGEN_ARG_0"`); action choices are `with:` inputs
   output: { path: string; format: OutputFormat };
   workingDir?: string; needsServices?: DependencyKind[]; secrets?: string[];   // names only, never values
 }
 
 // ---------- created files, decisions ----------
 export type Part = 'pipeline' | 'precommit' | 'docker' | 'compose' | 'tests' | 'test-migration' | 'codeowners' | 'deploy-verify' | 'docs';
-export interface CreatedFile { path: string; content: string; part: Part; reason: string; repo: 'app' | 'central'; needsConfirm?: boolean }   // needsConfirm: AI change to package.json scripts/dependencies → own preview section + own yes (Plan D Task 5, Plan E Task 5, Plan G)
+export interface CreatedFile { path: string; content: string; part: Part; reason: string; repo: 'app' | 'central'; needsConfirm?: boolean; inserted?: PipegenInserted }   // needsConfirm: AI change to package.json scripts/dependencies → own preview section + own yes (Plan D Task 5, Plan E Task 5, Plan G)
+/**
+ * The marker convention for an edited user workflow (Plan B 7a, for Plan G's insertVerify): a CreatedFile field, set by
+ * pipegen's own code and never by the AI or read from the file text, so no content can forge it. `original` is the user's
+ * file exactly as it was before the edit; `jobs` are the jobs pipegen added (the referee judges them like any job of its
+ * own); `needs` are the entries pipegen added to the user's own jobs. The referee checks that the edited file, without
+ * those jobs and needs entries, is the original (anything else pipegen changed is an issue), and judges nothing else of
+ * the user's. Linter findings on lines outside the added jobs and needs become notes (referee.ts `pipegenLines`).
+ * A file without this field was written by pipegen whole, and every line is judged.
+ */
+export interface PipegenInserted { original: string; jobs: string[]; needs: { job: string; added: string[] }[] }
 export interface NotProven { part: Part; needId?: string; reason: string; missingSecrets: string[] }
 export interface TestDecision { service: string; current?: string; proposed?: string; reasons: string[]; choice: 'keep' | 'switch' | 'none' }
 export interface PipelineDraft {
@@ -106,6 +142,23 @@ export interface PipelineDraft {
   requireDeployApproval: boolean;   // set by the judge (Plan F); used by Plan G environments
   skipped: { part: SkippablePart; reason: string }[];   // from --skip
   suggestions: { name: string; repo: string; why: string }[];   // unreviewed tools: MENTION-ONLY in PIPEGEN.md, never run
+  centralPin?: { repo: string; sha: string };   // Plan B 7a fix round 1 (ruling 2): the central `<owner>/pipelines` repo and the commit pipegen itself resolved and wrote; the referee accepts a central `uses` only at this SHA (none recorded: every central `uses` is unknown-pin). Plan G fills it
+  /**
+   * Plan C final review, fix round A (ruling 1): the gate settings pipegen itself records, the only source of these gate step inputs
+   * (gateStepInputs, src/engine/gate-inputs.ts; the referee holds the file to it). `blockFromRecorded` (YYYY-MM-DD): the block date recorded at
+   * setup (`block-from-recorded`, S13: the earlier of it and PIPEGEN_BLOCK_FROM wins); `policy`: a private repository's own policy (`policy`;
+   * the gate ignores it on a public one); `protectedPaths`: extra protected path globs (`protected-paths`; inputs only add). Absent = none
+   * rendered. Plan G fills it.
+   */
+  gateSettings?: { blockFromRecorded?: string; policy?: { block: string[]; warn: string[] }; protectedPaths?: string[] };
+  /**
+   * Warn-first checks (DECISIONS #96, Plan C ruling S12; final review fix round A, ruling 3), by need id: the set of needs whose checks start in
+   * warn mode, each with the date it started (YYYY-MM-DD). gateJobList puts `warnFirst: { since }` on every job list entry of such a need (a
+   * floor need is refused); while it is there, the check's failures and old or medium findings warn, and a new critical, high or secret still
+   * blocks. The nightly opens a "switch to blocking" issue 14 days after the later of `since` and the setup merge. Absent = none. Plan G fills
+   * it from the strictness level; `pipegen update` removes a need when it is switched to blocking.
+   */
+  warnFirst?: Readonly<Record<string, { since: string }>>;
 }
 
 // ---------- install record (written by Plan G deliver/finish, read by Plan V and `pipegen verify`) ----------
@@ -129,7 +182,11 @@ export const GATE_CHECK_INTEGRATION_ID = 15368;   // GitHub Actions app id — s
 export const RESULT_ARTIFACT_PREFIX = 'pipegen-out-';          // read by the gate (exact names only)
 export const DEFAULT_MODEL = 'claude-opus-5-5';               // user may override with --model
 export const FLOOR_NEEDS = ['secrets', 'sast', 'deps', 'unit-tests', 'full-tests', 'gate'];   // can never be NOT-PROVEN. secrets + gate can never be skipped; tests may only be skipped explicitly with --skip tests (recorded)
-export const PROTECTED_PATHS_BASE = ['.github/workflows/**', '.github/CODEOWNERS', 'CODEOWNERS', '.pre-commit-config.yaml', '.husky/**', 'lefthook.yml', 'docker-compose.pipegen.yml', '.gitleaksignore', '.semgrepignore', '.trivyignore', '.zap/**', '.github/actions/**', 'docs/CODEOWNERS', '.github/dependabot.yml'];
+export const PROTECTED_PATHS_BASE = ['.github/workflows/**', '.github/CODEOWNERS', 'CODEOWNERS', '.pre-commit-config.yaml', '.husky/**', 'lefthook.yml', 'docker-compose.pipegen.yml', '.gitleaksignore', '.semgrepignore', '.trivyignore', '.zap/**', '.github/actions/**', 'docs/CODEOWNERS', '.github/dependabot.yml',
+  // Renovate (Plan P carry-forward; C4 review 15): its config decides which dependency updates land
+  'renovate.json', 'renovate.json5', '.renovaterc', '.renovaterc.json', '.renovaterc.json5', '.github/renovate.json', '.github/renovate.json5'];
+/** Sections of shared files the gate always protects (`<file>:<section>`, as ReviewedTool.configSections): Renovate's key in package.json. */
+export const PROTECTED_SECTIONS_BASE = ['package.json:renovate'];
 // Effective protected paths = PROTECTED_PATHS_BASE + every config/ignore file declared by the reviewed tools in use (ReviewedTool.configFiles)
 export type SkippablePart = 'tests' | 'precommit' | 'docker' | 'compose' | 'deploy' | 'locks' | 'slack' | 'test-migration';   // never: secrets scan, gate
 export type SupportLevel = 'full' | 'audit-only';
@@ -149,14 +206,15 @@ export interface AiProvider { name: 'claude' | 'openai' | 'ollama'; model: strin
 // Loaded from data/reviewed-tools.yml by Plan B Task 8 (`loadReviewed`). Only these tools ever run in a user's CI.
 export interface ReviewedTool {
   id: string; categories: string[]; languages: (Language | 'any')[];
-  candidate: Candidate;                                    // pinned exactly; reviewed: true
-  step: Omit<StepSpec, 'needId' | 'tool'>;                 // the reviewed step template
+  candidate: ReviewedCandidate;                            // pinned exactly; reviewed: true
+  step: Omit<StepSpec, 'needId' | 'service' | 'tool' | 'choices'>;   // the reviewed step template
   fixedInputs: {                                           // security-relevant inputs, set by the template; the AI can never change them
     with?: Record<string, string>; args?: string[]; env?: Record<string, string>;
     config?: { content: string; passAs: { flag: string } | { input: string } };   // explicit pinned config, so repo config files are never picked up silently
   };
   choices: Record<string, string[]>;                       // the only inputs the AI may set, each limited to these enum values
-  configFiles: string[];                                   // config/ignore files the tool auto-loads from a repo (e.g. '.gitleaks.toml', '.trivyignore'); added to the protected paths
+  configFiles: string[];                                   // config/ignore files the tool auto-loads from a repo (e.g. 'mypy.ini', '.bandit'); added to the protected paths, a name without a slash at ANY depth (C4 review: tools find configs in sub-folders)
+  rootConfigFiles?: string[];                              // config/ignore files that count only at the repository root and the service roots: the tool has a pinned config and reads nothing below it (C4 fix round 2); each entry in the data file says why
   configSections?: string[];                               // Plan P Task 6 (P23): '<file>:<section>' of shared files the tool reads (e.g. 'pyproject.toml:tool.mypy'); the v0.2 gate protects them. Matching (review M-R5): <file> is a repo-relative path or glob (as configFiles); <section> is the dotted table path (TOML), the INI section name or the top-level JSON key, where `*` matches any run of characters (`setup.cfg:mypy-*`, `setup.cfg:coverage:*`); a change inside a matching section, or to the section itself, counts
   wrappedImage?: { ref: string; digest: string };          // Plan P Task 6 (P26): the image an action's action.yml runs, and the digest that ref resolved to when pinned
   reviewedBy: string; reviewedAt: string; proofs: number;  // proofs = passed Plan E runs; full runs need proofs >= 1

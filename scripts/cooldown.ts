@@ -34,7 +34,7 @@
 // judges it. Keep it dependency-free apart from `yaml`, and keep to syntax Node's type stripping can run
 // (no enums, no parameter properties, no namespaces): `node scripts/cooldown.ts`.
 import { createHash } from 'node:crypto';
-import { lstat, readFile } from 'node:fs/promises';
+import { lstat, readdir, readFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { parse as parseYaml } from 'yaml';
 
@@ -45,6 +45,8 @@ export const MAX_BODY_BYTES = 32 * 1024 * 1024;
 const DAY_MS = 86_400_000;
 const CONCURRENCY = 6;
 
+/** pipegen's own repository (lower case, exact; same value as reviewed.ts PIPEGEN_OWN_REPO, which a test ties): its action entry skips the 7-day rule. */
+export const PIPEGEN_OWN_REPO = 'crisworking/pipegen';
 export const WATCHED_FILES = ['package.json', 'package-lock.json', 'data/reviewed-tools.yml', 'data/pinned-binaries.yml'] as const;
 /** Read from the base checkout only: it names who may grant the emergency path. */
 export const CODEOWNERS_FILE = '.github/CODEOWNERS';
@@ -99,6 +101,10 @@ export interface CooldownOptions {
   githubToken?: string;
   pr?: PrContext;
   maxLookups?: number;
+  /** A release check: pipegen's own gate pin must also be on the default branch (C6 fix round 1). */
+  release?: boolean;
+  /** The weekly job: check every package of every closure lock, changed or not (a pull request checks only the changed ones). */
+  all?: boolean;
   timeoutMs?: number;
 }
 
@@ -374,7 +380,8 @@ async function pool<T>(items: T[], limit: number, fn: (item: T) => Promise<void>
 // --- tying a pin to an upstream date ------------------------------------------------------------------------------
 
 /** A date (upstream, trusted) or a reason the pin can't be tied to one. */
-type Outcome = { date: string } | { problem: string; lookupFailed?: boolean };
+/** `exempt`: tied to upstream, but with no date to judge (pipegen's own gate commit: the age rule does not apply to it). */
+type Outcome = { date: string } | { exempt: true } | { problem: string; lookupFailed?: boolean };
 const fail = (problem: string): Outcome => ({ problem });
 
 async function guard(fn: () => Promise<Outcome>): Promise<Outcome> {
@@ -506,8 +513,10 @@ function youngest(dates: unknown[], what: string): Outcome {
  * What a tag of `r` (an encoded repo path) points to, following annotated tags (at most 3 hops). taggerDate is the
  * youngest tagger date seen, or 'none' for a lightweight tag.
  */
-async function tagTarget(ctx: Ctx, r: string, t: string): Promise<{ obj: Obj; taggerDate: unknown }> {
+async function tagTarget(ctx: Ctx, r: string, t: string, exactRef = false): Promise<{ obj: Obj; taggerDate: unknown }> {
   let ref = await ctx.get(`https://api.github.com/repos/${r}/git/ref/tags/${t}`, ctx.gh);
+  // review-C6-r1 m5: the singular endpoint is exact, but one line pins it: the answer must be for the tag asked for
+  if (exactRef && !(isObj(ref) && ref.ref === `refs/tags/${t}`)) return { obj: {}, taggerDate: 'none' };
   let obj = isObj(ref) && isObj(ref.object) ? ref.object : {};
   let taggerDate: unknown = 'none';
   for (let hops = 0; obj.type === 'tag' && hops < 3; hops++) {
@@ -545,6 +554,26 @@ async function onDefaultBranch(ctx: Ctx, repo: string, sha: string): Promise<Out
   }
   const on = isObj(cmp) && (cmp.status === 'ahead' || cmp.status === 'identical') && cmp.behind_by === 0 && isObj(cmp.merge_base_commit) && cmp.merge_base_commit.sha === sha;
   return on ? undefined : fail(`commit ${sha.slice(0, 12)} is not on the default branch (${branch}) of ${repo} (a fork's commit, or another branch); needs owner review`);
+}
+
+/**
+ * pipegen's own gate action (C6 fix round 1). No release and no age; the tie to upstream stays: the tag `gate-v<version>` of the repo
+ * (an exact ref lookup, annotated tags followed) must point to the pinned commit; a 404, a mismatch or an error fails. In release mode
+ * the commit must also be on the default branch (before the merge it is on the branch under review, so the tag is the check).
+ */
+async function ownGateOutcome(ctx: Ctx, repo: string, version: string, sha: string, release: boolean): Promise<Outcome> {
+  if (!/^\d{1,6}\.\d{1,6}\.\d{1,6}$/.test(version)) return fail('the gate entry\'s version is not a bare semver (the tag is gate-v<version>)');
+  return guard(async () => {
+    const r = repoPath(repo);
+    if (!r) return fail('repo is not a plain name');
+    const { obj } = await tagTarget(ctx, r, `gate-v${version}`, true);
+    if (obj.type !== 'commit' || obj.sha !== sha) return fail(`the pinned sha is not the commit of the tag gate-v${version}`);
+    if (release) {
+      const off = await onDefaultBranch(ctx, repo, sha);
+      if (off) return off;
+    }
+    return { exempt: true };
+  });
 }
 
 /** An action: the pinned SHA must be the commit its tag points to; date = the tag's release published_at. */
@@ -593,9 +622,11 @@ const NT_REPO = 'projectdiscovery/nuclei-templates';
 const NT_ARCHIVE = /^https:\/\/github\.com\/projectdiscovery\/nuclei-templates\/archive\/refs\/tags\/(v(\d{1,4}\.\d{1,4}\.\d{1,4}))\.tar\.gz$/;
 const NT_ASSET = /^https:\/\/github\.com\/projectdiscovery\/nuclei-templates\/releases\/download\/(v\d{1,4}\.\d{1,4}\.\d{1,4})\/([A-Za-z0-9._-]{1,100}\.tar\.gz)$/;
 
-async function templatesOutcome(ctx: Ctx, url: string | undefined, sha: string | undefined): Promise<Outcome> {
+async function templatesOutcome(ctx: Ctx, url: string | undefined, sha: string | undefined, commit: string | undefined, tree: string | undefined): Promise<Outcome> {
   const want = sha256Of(sha);
   if (!want) return fail('PIPEGEN_NUCLEI_TEMPLATES_SHA256 is not a sha256');
+  // 6c (S12): the renderer fetches this commit with git and checks HEAD and HEAD^{tree}
+  if (!/^[0-9a-f]{40}$/.test(commit ?? '') || !/^[0-9a-f]{40}$/.test(tree ?? '')) return fail('PIPEGEN_NUCLEI_TEMPLATES_COMMIT and _TREE must be 40-character SHAs');
   const asset = NT_ASSET.exec(url ?? '');
   const m = NT_ARCHIVE.exec(url ?? '');
   if (!asset && !m) return fail('PIPEGEN_NUCLEI_TEMPLATES_URL is not a projectdiscovery/nuclei-templates tag archive or release asset; needs owner review');
@@ -604,6 +635,9 @@ async function templatesOutcome(ctx: Ctx, url: string | undefined, sha: string |
     // The tag's commit must be on upstream's default branch (P44), whichever form the URL has.
     const { obj } = await tagTarget(ctx, NT_REPO, encodeURIComponent(tag));
     if (obj.type !== 'commit' || typeof obj.sha !== 'string') return fail(`the tag ${tag} does not point to a commit; needs owner review`);
+    if (obj.sha !== commit) return fail(`the tag ${tag} does not lead to PIPEGEN_NUCLEI_TEMPLATES_COMMIT`);
+    const c = await ctx.get(`https://api.github.com/repos/${NT_REPO}/git/commits/${obj.sha}`, ctx.gh);
+    if (!isObj(c) || c.sha !== obj.sha || !isObj(c.tree) || c.tree.sha !== tree) return fail('the templates commit tree is not PIPEGEN_NUCLEI_TEMPLATES_TREE');
     const off = await onDefaultBranch(ctx, NT_REPO, obj.sha);
     if (off) return off;
     if (asset) return assetOutcome(ctx, NT_REPO, tag, asset[2] as string, want);
@@ -676,7 +710,7 @@ function pinShapedPaths(v: unknown, path = '', out: string[] = []): string[] {
   return out;
 }
 
-const ARCHIVE_ENV = ['PIPEGEN_RULES_URL', 'PIPEGEN_RULES_SHA256', 'PIPEGEN_RULES_TREE', 'PIPEGEN_NUCLEI_TEMPLATES_URL', 'PIPEGEN_NUCLEI_TEMPLATES_SHA256'];
+const ARCHIVE_ENV = ['PIPEGEN_RULES_URL', 'PIPEGEN_RULES_SHA256', 'PIPEGEN_RULES_TREE', 'PIPEGEN_NUCLEI_TEMPLATES_URL', 'PIPEGEN_NUCLEI_TEMPLATES_SHA256', 'PIPEGEN_NUCLEI_TEMPLATES_COMMIT', 'PIPEGEN_NUCLEI_TEMPLATES_TREE'];
 /**
  * Where a reviewed entry may hold a hash or a URL: the pins checked here, plus verifiedWith (pin-time signature
  * inputs, never installed) and wrappedImage.digest (a record of the image an action's own action.yml runs; the action
@@ -726,7 +760,7 @@ function packageItem(tool: string, inst: unknown, label: string, checksum: strin
 }
 
 /** Everything to check for the added or changed entries of data/reviewed-tools.yml. */
-export function reviewedItems(base: string | null | undefined, head: string | null | undefined): Item[] {
+export function reviewedItems(base: string | null | undefined, head: string | null | undefined, release = false): Item[] {
   const items: Item[] = [];
   const problem = (name: string, text: string): void => {
     items.push({ kind: 'reviewed-tool', name, version: '', run: async () => fail(text) });
@@ -774,7 +808,16 @@ export function reviewedItems(base: string | null | undefined, head: string | nu
     // An install hash, when written, must be the candidate pin (as the loader requires), never an alternative.
     if (inst && str(inst.checksum) !== undefined && str(inst.checksum) !== str(pin.checksum)) items.push(label(async () => fail('step.cli.install.checksum differs from candidate.pin.checksum')));
     if (inst && str(inst.digest) !== undefined && str(inst.digest) !== str(pin.digest)) items.push(label(async () => fail('step.cli.install.digest differs from candidate.pin.digest')));
-    if (kind === 'action' && action) {
+    if (kind === 'action' && action && repo === PIPEGEN_OWN_REPO) {
+      // pipegen's own gate action: its code is reviewed in this repository, so there is no release or age to look up. The exact repo only
+      // (a fork, another case or another name is checked like any action). The pin must still be the one in `uses`.
+      const uses = str(action.uses) ?? '';
+      const m = /^([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)(?:\/[^@]*)?@([0-9a-f]{40})$/.exec(uses);
+      if (!m || m[1] !== repo || m[2] !== str(pin.sha)) items.push(label(async () => fail('uses: does not match the candidate repo and pin sha')));
+      // C6 fix round 1: only the AGE rule is skipped. The pin must still be the commit of the tag gate-v<version> of this repo (a tag ref
+      // belongs to the repo itself, so a fork's commit can't fake one), and, in a release check, be on the default branch.
+      else items.push(label((ctx) => ownGateOutcome(ctx, repo, version, m[2] as string, release)));
+    } else if (kind === 'action' && action) {
       items.push(label((ctx) => actionOutcome(ctx, str(action.uses), repo, version, str(pin.sha))));
     } else if (kind === 'cli' && inst && inst.method === 'github-release') {
       const tag = str(inst.version) ?? '';
@@ -814,7 +857,7 @@ export function reviewedItems(base: string | null | undefined, head: string | nu
         run: async (ctx) => (bad ? fail(bad[1].problem as string) : run(Object.fromEntries(got.map(([k, g]) => [k, g.value])), ctx)),
       });
     };
-    archive('nuclei templates', ['PIPEGEN_NUCLEI_TEMPLATES_URL', 'PIPEGEN_NUCLEI_TEMPLATES_SHA256'], (v, ctx) => templatesOutcome(ctx, v.PIPEGEN_NUCLEI_TEMPLATES_URL, v.PIPEGEN_NUCLEI_TEMPLATES_SHA256));
+    archive('nuclei templates', ['PIPEGEN_NUCLEI_TEMPLATES_URL', 'PIPEGEN_NUCLEI_TEMPLATES_SHA256', 'PIPEGEN_NUCLEI_TEMPLATES_COMMIT', 'PIPEGEN_NUCLEI_TEMPLATES_TREE'], (v, ctx) => templatesOutcome(ctx, v.PIPEGEN_NUCLEI_TEMPLATES_URL, v.PIPEGEN_NUCLEI_TEMPLATES_SHA256, v.PIPEGEN_NUCLEI_TEMPLATES_COMMIT, v.PIPEGEN_NUCLEI_TEMPLATES_TREE));
     archive('semgrep rules', ['PIPEGEN_RULES_URL', 'PIPEGEN_RULES_SHA256', 'PIPEGEN_RULES_TREE'], (v, ctx) => rulesOutcome(ctx, v.PIPEGEN_RULES_URL, v.PIPEGEN_RULES_TREE));
   }
   return items;
@@ -849,6 +892,7 @@ export function binaryItems(base: string | null | undefined, head: string | null
           if (m[2] !== `v${version}` && m[2] !== version) return fail(`${plat}: asset url is for tag ${m[2]}, not version ${version}`);
           const o = await assetOutcome(ctx, repo, m[2] as string, m[3] as string, isObj(p) ? str(p.archiveSha256) : undefined);
           if ('problem' in o) return { ...o, problem: `${plat}: ${o.problem}` };
+          if ('exempt' in o) return fail(`${plat}: an asset has no exemption`);
           if (!newest || Date.parse(o.date) > Date.parse(newest)) newest = o.date;
         }
         return newest ? { date: newest } : fail('no date');
@@ -1039,6 +1083,22 @@ export function prFromEnv(env: Record<string, string | undefined>): PrContext | 
 
 // --- the check ----------------------------------------------------------------------------------------------------
 
+/** A closure lock file (not its meta file) under data/npm-closures/. */
+const CLOSURE_FILE = /^data\/npm-closures\/[a-z0-9][a-z0-9-]*\.json$/;
+const CLOSURE_META_FILE = /^data\/npm-closures\/[a-z0-9][a-z0-9-]*\.meta\.json$/;
+
+/** The `before` date (ms) of a closure's meta file, or undefined when it is missing or not an ISO date. */
+function closureBefore(metaText: string | null | undefined): number | undefined {
+  if (!metaText) return undefined;
+  try {
+    const v: unknown = JSON.parse(metaText);
+    const b = isObj(v) ? v.before : undefined;
+    return typeof b === 'string' && ISO.test(b) && !Number.isNaN(Date.parse(b)) ? Date.parse(b) : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 const ISO = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:\d{2})$/;
 
 /** A problem when the date is too young (`young`), unreadable or in the future; otherwise undefined. */
@@ -1073,14 +1133,39 @@ export async function runCooldown(opts: CooldownOptions): Promise<CooldownResult
       run: async () => (e.bad ? fail(e.bad) : !e.resolved ? fail('entry has no resolved tarball') : npmOutcome(ctx, e.name, e.version, e.integrity, e.resolved)),
     });
   }
-  for (const i of [...reviewedItems(base['data/reviewed-tools.yml'], head['data/reviewed-tools.yml']), ...binaryItems(base['data/pinned-binaries.yml'], head['data/pinned-binaries.yml'])]) {
+  // pipegen's own npm closure locks (data/npm-closures/<id>.json, DECISIONS #107): every package must be old enough, have
+  // the registry's integrity, and have been published on or before the `before` date its meta file records
+  for (const key of Object.keys(head).filter((k) => CLOSURE_FILE.test(k))) {
+    const text = head[key];
+    const metaKey = key.replace(/\.json$/, '.meta.json');
+    const before = closureBefore(head[metaKey]);
+    if (!text) continue;
+    const problem = lockfileProblem(text);
+    if (problem || before === undefined) {
+      findings.push({ kind: 'lockfile', name: key, version: '', date: null, lookupFailed: false, problem: problem ?? `its meta file (${metaKey}) has no readable \`before\` date`, young: false });
+      continue;
+    }
+    for (const e of changedLockEntries(opts.all === true ? null : base[key], text, [], [])) {
+      jobs.push({
+        kind: 'npm', name: e.name, version: e.version,
+        run: async () => {
+          if (e.bad) return fail(e.bad);
+          if (!e.resolved) return fail('entry has no resolved tarball');
+          const o = await npmOutcome(ctx, e.name, e.version, e.integrity, e.resolved);
+          if ('date' in o && Date.parse(o.date) > before) return fail(`published ${o.date}, after the closure's \`before\` date`);
+          return o;
+        },
+      });
+    }
+  }
+  for (const i of [...reviewedItems(base['data/reviewed-tools.yml'], head['data/reviewed-tools.yml'], opts.release === true), ...binaryItems(base['data/pinned-binaries.yml'], head['data/pinned-binaries.yml'])]) {
     jobs.push({ kind: i.kind, name: i.name, version: i.version, run: () => i.run(ctx) });
   }
 
   await pool(jobs, CONCURRENCY, async (job) => {
     checked++;
     const o = await job.run();
-    const verdict = 'problem' in o ? { problem: o.problem, young: false } : judge(o.date, now);
+    const verdict = 'problem' in o ? { problem: o.problem, young: false } : 'exempt' in o ? undefined : judge(o.date, now);
     if (verdict) {
       findings.push({
         kind: job.kind, name: job.name, version: job.version, date: 'date' in o ? o.date : null,
@@ -1158,7 +1243,7 @@ async function main(argv: string[]): Promise<number> {
   const baseDir = get('--base-dir');
   const headDir = get('--head-dir');
   if (!baseDir || !headDir) {
-    console.error('usage: node cooldown.ts --base-dir <base checkout> --head-dir <PR checkout>');
+    console.error('usage: node cooldown.ts --base-dir <base checkout> --head-dir <PR checkout> [--all]');
     return 2;
   }
   const base: Files = {};
@@ -1167,9 +1252,22 @@ async function main(argv: string[]): Promise<number> {
     base[f] = await readIf(baseDir, f);
     head[f] = await readIf(headDir, f);
   }
+  // pipegen's npm closure locks and their meta files (only the head's files are judged; the base's say what is unchanged)
+  for (const [dir, files] of [[baseDir, base], [headDir, head]] as const) {
+    let names: string[] = [];
+    try {
+      names = await readdir(join(dir, 'data/npm-closures'));
+    } catch (e) {
+      if ((e as NodeJS.ErrnoException).code !== 'ENOENT') throw new FileError('data/npm-closures can not be read');
+    }
+    for (const n of names.sort()) {
+      const rel = `data/npm-closures/${n}`;
+      if (CLOSURE_FILE.test(rel) || CLOSURE_META_FILE.test(rel)) files[rel] = await readIf(dir, rel);
+    }
+  }
   base[CODEOWNERS_FILE] = await readIf(baseDir, CODEOWNERS_FILE);
   const pr = prFromEnv(process.env);
-  const result = await runCooldown({ base, head, fetch, now: new Date(), githubToken: process.env.GITHUB_TOKEN, ...(pr ? { pr } : {}) });
+  const result = await runCooldown({ base, head, fetch, now: new Date(), githubToken: process.env.GITHUB_TOKEN, ...(argv.includes('--all') ? { all: true, maxLookups: 1000 } : {}), ...(pr ? { pr } : {}) });
   const report = formatReport(result);
   console.log(report);
   return result.ok ? 0 : 1;

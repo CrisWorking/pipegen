@@ -1,0 +1,161 @@
+- id: pipegen-setup-node-24
+  name: Set up Node.js
+  uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+  with:
+    package-manager-cache: "false"
+    node-version: "24"
+- id: pipegen-npm-ci-3b4e3efd29cd131b
+  name: "pipegen: install the project dependencies (npm ci, no scripts)"
+  run: |-
+    set -euo pipefail
+    unset CDPATH
+    pg_fail() { echo "pipegen: $1" >&2; exit 1; }
+    node="$(command -v node || true)"
+    [ -n "$node" ] || pg_fail "node was not found; the Node setup step must run first"
+    nodebin="${node%/*}"
+    PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+    home="$RUNNER_TEMP/pipegen-home/pipegen-out-coverage--web"
+    mkdir -p "$RUNNER_TEMP/pipegen-home" "$home"
+    sys=(
+      /usr/bin/env -i
+      "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+      "HOME=$home"
+    )
+    case "$("${sys[@]}" "$node" --version)" in v24.*) ;; *) pg_fail "the node on PATH is not version 24, which the Node setup step installed" ;; esac
+    for d in apps apps/web; do
+      if [ -L "$d" ] || [ ! -d "$d" ]; then pg_fail "the folder $d is not a real folder inside the repository"; fi
+    done
+    cd -- ./apps/web
+    ws="$(cd "$GITHUB_WORKSPACE" && pwd -P)"
+    case "$(pwd -P)" in "$ws"/*) ;; *) pg_fail "the working folder is outside the repository" ;; esac
+    pg_env=(
+      /usr/bin/env -i
+      "HOME=$home"
+      "PATH=$nodebin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+      "RUNNER_TEMP=$RUNNER_TEMP"
+      "TMPDIR=$RUNNER_TEMP"
+    )
+    js='const fs = require("fs");
+    let sw = null;
+    try { sw = fs.lstatSync("npm-shrinkwrap.json"); } catch (e) { sw = null; }
+    if (sw) { console.error("pipegen: npm-shrinkwrap.json takes precedence over package-lock.json; pipegen will not install with it"); process.exit(1); }
+    const lock = JSON.parse(fs.readFileSync("package-lock.json", "utf8"));
+    const want = JSON.parse(process.env.PIPEGEN_NPM_EXPECT);
+    let bad = 0;
+    for (const w of want) {
+      const p = (lock.packages || {})["node_modules/" + w.name];
+      if (!p || p.link || p.inBundle || (p.name && p.name !== w.name) || p.version !== w.version || p.resolved !== w.resolved || p.integrity !== w.integrity) {
+        console.error("pipegen: " + w.name + " is not the reviewed " + w.version + " from the registry in package-lock.json (a link, an alias, another source or another hash)");
+        bad = 1;
+      }
+    }
+    process.exit(bad);'
+    "${pg_env[@]}" "PIPEGEN_NPM_EXPECT=$PIPEGEN_NPM_EXPECT" "$nodebin/node" -e "$js"
+    "${pg_env[@]}" "$nodebin/npm" ci --ignore-scripts --no-audit --no-fund --workspaces=false --registry=https://registry.npmjs.org/
+    mkdir -p "$RUNNER_TEMP/pipegen-npm-ci"
+    : > "$RUNNER_TEMP/pipegen-npm-ci/3b4e3efd29cd131b"
+  shell: bash
+  env:
+    BASH_ENV: ""
+    ENV: ""
+    PIPEGEN_NPM_EXPECT: "[{\"name\":\"vitest\",\"version\":\"5.0.5\",\"integrity\":\"sha512-cPODOMF8YnkiiYtDdHo6n4wWmBrOBBbOIYH2d33M4l3CdNn72h+qMmO6uXffUN6A5AZFXNND/d+krS9mgkXRfg==\",\"resolved\":\"https://registry.npmjs.org/vitest/-/vitest-5.0.5.tgz\"},{\"name\":\"@vitest/coverage-v8\",\"version\":\"5.0.5\",\"integrity\":\"sha512-4KpkGdIrSqBihx/JyP/e+S+IKB98etg1XDQiLAxksLfcShnwi1VReGeOT9NI43hLHbknosKp/1CCLn9Zgcs8mg==\",\"resolved\":\"https://registry.npmjs.org/@vitest/coverage-v8/-/coverage-v8-5.0.5.tgz\"}]"
+- name: "pipegen: check the installed tool against the lockfile"
+  run: |-
+    set -euo pipefail
+    unset CDPATH
+    pg_fail() { echo "pipegen: $1" >&2; exit 1; }
+    node="$(command -v node || true)"
+    [ -n "$node" ] || pg_fail "node was not found; the Node setup step must run first"
+    nodebin="${node%/*}"
+    PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+    home="$RUNNER_TEMP/pipegen-home/pipegen-out-coverage--web"
+    mkdir -p "$RUNNER_TEMP/pipegen-home" "$home"
+    sys=(
+      /usr/bin/env -i
+      "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+      "HOME=$home"
+    )
+    case "$("${sys[@]}" "$node" --version)" in v24.*) ;; *) pg_fail "the node on PATH is not version 24, which the Node setup step installed" ;; esac
+    for d in apps apps/web; do
+      if [ -L "$d" ] || [ ! -d "$d" ]; then pg_fail "the folder $d is not a real folder inside the repository"; fi
+    done
+    cd -- ./apps/web
+    ws="$(cd "$GITHUB_WORKSPACE" && pwd -P)"
+    case "$(pwd -P)" in "$ws"/*) ;; *) pg_fail "the working folder is outside the repository" ;; esac
+    pg_env=(
+      /usr/bin/env -i
+      "HOME=$home"
+      "PATH=$nodebin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+      "RUNNER_TEMP=$RUNNER_TEMP"
+      "TMPDIR=$RUNNER_TEMP"
+    )
+    [ -f "$RUNNER_TEMP/pipegen-npm-ci/3b4e3efd29cd131b" ] && [ ! -L "$RUNNER_TEMP/pipegen-npm-ci/3b4e3efd29cd131b" ] || pg_fail "the dependencies were not installed by pipegen's own npm ci step"
+    js='const fs = require("fs"), path = require("path");
+    const want = JSON.parse(process.env.PIPEGEN_NPM_EXPECT);
+    let bad = 0;
+    const fail = (m) => { console.error("pipegen: " + m); bad = 1; };
+    let top = null;
+    try { top = fs.lstatSync("node_modules"); } catch (e) { top = null; }
+    if (!top || !top.isDirectory() || top.isSymbolicLink()) { fail("node_modules is not a real folder"); process.exit(1); }
+    const root = fs.realpathSync("node_modules");
+    let hidden = {};
+    try { hidden = JSON.parse(fs.readFileSync("node_modules/.package-lock.json", "utf8")).packages || {}; } catch (e) { hidden = {}; }
+    for (const w of want) {
+      const dir = path.join("node_modules", w.name);
+      let st = null;
+      try { st = fs.lstatSync(dir); } catch (e) { st = null; }
+      if (!st || !st.isDirectory() || st.isSymbolicLink()) { fail(w.name + " is not a real folder in node_modules"); continue; }
+      if (!fs.realpathSync(dir).startsWith(root + path.sep)) { fail(w.name + " is outside node_modules"); continue; }
+      let version = null;
+      try { version = JSON.parse(fs.readFileSync(path.join(dir, "package.json"), "utf8")).version; } catch (e) { version = null; }
+      if (version !== w.version) fail(w.name + " is " + version + ", not the reviewed " + w.version);
+      const h = hidden["node_modules/" + w.name];
+      if (!h || h.integrity !== w.integrity || h.resolved !== w.resolved) fail(w.name + " was not installed from the reviewed registry tarball");
+    }
+    process.exit(bad);'
+    "${pg_env[@]}" "PIPEGEN_NPM_EXPECT=$PIPEGEN_NPM_EXPECT" "$nodebin/node" -e "$js"
+  shell: bash
+  env:
+    BASH_ENV: ""
+    ENV: ""
+    PIPEGEN_NPM_EXPECT: "[{\"name\":\"vitest\",\"version\":\"5.0.5\",\"integrity\":\"sha512-cPODOMF8YnkiiYtDdHo6n4wWmBrOBBbOIYH2d33M4l3CdNn72h+qMmO6uXffUN6A5AZFXNND/d+krS9mgkXRfg==\",\"resolved\":\"https://registry.npmjs.org/vitest/-/vitest-5.0.5.tgz\"},{\"name\":\"@vitest/coverage-v8\",\"version\":\"5.0.5\",\"integrity\":\"sha512-4KpkGdIrSqBihx/JyP/e+S+IKB98etg1XDQiLAxksLfcShnwi1VReGeOT9NI43hLHbknosKp/1CCLn9Zgcs8mg==\",\"resolved\":\"https://registry.npmjs.org/@vitest/coverage-v8/-/coverage-v8-5.0.5.tgz\"}]"
+- id: repocode-ecda9a59c1361e7c
+  name: "pipegen: run vitest"
+  run: |-
+    set -euo pipefail
+    unset CDPATH
+    pg_fail() { echo "pipegen: $1" >&2; exit 1; }
+    node="$(command -v node || true)"
+    [ -n "$node" ] || pg_fail "node was not found; the Node setup step must run first"
+    nodebin="${node%/*}"
+    PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+    home="$RUNNER_TEMP/pipegen-home/pipegen-out-coverage--web"
+    mkdir -p "$RUNNER_TEMP/pipegen-home" "$home"
+    sys=(
+      /usr/bin/env -i
+      "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+      "HOME=$home"
+    )
+    case "$("${sys[@]}" "$node" --version)" in v24.*) ;; *) pg_fail "the node on PATH is not version 24, which the Node setup step installed" ;; esac
+    for d in apps apps/web; do
+      if [ -L "$d" ] || [ ! -d "$d" ]; then pg_fail "the folder $d is not a real folder inside the repository"; fi
+    done
+    cd -- ./apps/web
+    ws="$(cd "$GITHUB_WORKSPACE" && pwd -P)"
+    case "$(pwd -P)" in "$ws"/*) ;; *) pg_fail "the working folder is outside the repository" ;; esac
+    pg_env=(
+      /usr/bin/env -i
+      "HOME=$home"
+      "PATH=$nodebin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+      "RUNNER_TEMP=$RUNNER_TEMP"
+      "TMPDIR=$RUNNER_TEMP"
+      "PIPEGEN_ARG_0=$PIPEGEN_ARG_0"
+    )
+    rc=0
+    "${pg_env[@]}" "$nodebin/node" "$PWD/node_modules/vitest/vitest.mjs" run --coverage --coverage.thresholds.lines="$PIPEGEN_ARG_0" || rc=$?
+    exit "$rc"
+  shell: bash
+  env:
+    BASH_ENV: ""
+    ENV: ""
+    PIPEGEN_ARG_0: "60"

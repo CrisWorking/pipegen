@@ -21,6 +21,7 @@
   ],
   "scripts": {
     "build": "tsup",
+    "build:gate": "tsup --config tsup.gate.config.ts && node scripts/notices.ts --gate .build/gate-meta.json gate/dist/THIRD_PARTY_NOTICES",
     "notices": "node scripts/notices.ts",
     "prepack": "npm run build && npm run notices",
     "test": "vitest run",

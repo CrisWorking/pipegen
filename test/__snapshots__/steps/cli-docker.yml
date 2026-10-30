@@ -1,0 +1,76 @@
+- id: tool-pull-5ca176964f22c29a
+  name: "pipegen: pull the zap-baseline.py image"
+  run: |-
+    set -euo pipefail
+    unset CDPATH
+    pg_fail() { echo "pipegen: $1" >&2; exit 1; }
+    PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+    home="$RUNNER_TEMP/pipegen-home/pipegen-out-dast"
+    mkdir -p "$RUNNER_TEMP/pipegen-home" "$home"
+    sys=(
+      /usr/bin/env -i
+      "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+      "HOME=$home"
+    )
+    "${sys[@]}" /usr/bin/docker pull --quiet "$PIPEGEN_IMAGE" > /dev/null
+  shell: bash
+  env:
+    BASH_ENV: ""
+    ENV: ""
+    PIPEGEN_IMAGE: zaproxy/zap-stable@sha256:5ccfff9a411743ab2615136a2edd7416bec9ce41572fa94e935df38c14adb2b6
+- id: tool-run-5ca176964f22c29a
+  name: "pipegen: run zap-baseline.py"
+  run: |-
+    set -euo pipefail
+    unset CDPATH
+    pg_fail() { echo "pipegen: $1" >&2; exit 1; }
+    PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+    home="$RUNNER_TEMP/pipegen-home/pipegen-out-dast"
+    mkdir -p "$RUNNER_TEMP/pipegen-home" "$home"
+    sys=(
+      /usr/bin/env -i
+      "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+      "HOME=$home"
+    )
+    work="$RUNNER_TEMP/pipegen-work/pipegen-out-dast"
+    mkdir -p "$RUNNER_TEMP/pipegen-work"
+    mkdir "$work"
+    chmod 0777 "$work"
+    printf '%s' "$PIPEGEN_CONFIG" > "$work/zap-baseline.conf"
+    out="$work/zap.json"
+    outdir="$work"
+    if [ -e "$out" ] || [ -L "$out" ]; then pg_fail "the result file $out exists before the tool ran, so pipegen will not use it"; fi
+    [ -d "$outdir" ] && [ ! -L "$outdir" ] || pg_fail "the folder for the result is not a real folder"
+    pg_env=(
+      /usr/bin/env -i
+      "HOME=$home"
+      "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+      "RUNNER_TEMP=$RUNNER_TEMP"
+      "TMPDIR=$RUNNER_TEMP"
+    )
+    rc=0
+    "${pg_env[@]}" /usr/bin/docker run --rm --pull=never --security-opt no-new-privileges --cap-drop ALL --network host -v "$work:/zap/wrk" "$PIPEGEN_IMAGE" zap-baseline.py -c zap-baseline.conf -J zap.json -z -silent || rc=$?
+    case "$rc" in 0|1|2) ;; *)
+      rm -rf -- "$out"
+      echo "pipegen: the tool exited with $rc, so its result is not used" >&2
+      exit "$rc" ;;
+    esac
+    if [ -f "$out" ] && [ ! -L "$out" ]; then
+      mkdir -p "$RUNNER_TEMP/pipegen-raw"
+      mkdir "$RUNNER_TEMP/pipegen-raw/pipegen-out-dast"
+      dest="$RUNNER_TEMP/pipegen-raw/pipegen-out-dast/zap.json"
+      mv -- "$out" "$dest"
+      if [ -f "$dest" ] && [ ! -L "$dest" ]; then rc=0; else rm -f -- "$dest"; rc=1; fi
+      chmod -R a-w "$RUNNER_TEMP/pipegen-raw/pipegen-out-dast"
+    else
+      echo "pipegen: the tool left no regular result file at $out" >&2
+      rm -rf -- "$out"
+      rc=1
+    fi
+    exit "$rc"
+  shell: bash
+  env:
+    BASH_ENV: ""
+    ENV: ""
+    PIPEGEN_CONFIG: "# pipegen's pinned ZAP baseline rules: the defaults, nothing ignored\n"
+    PIPEGEN_IMAGE: zaproxy/zap-stable@sha256:5ccfff9a411743ab2615136a2edd7416bec9ce41572fa94e935df38c14adb2b6

@@ -7,11 +7,12 @@
 //
 // Only a tie problem fails here. Age is the per-PR cooldown's call (with its emergency path), so a young item, which can
 // only be a pin the PR itself changed, is printed and not failed. Network: the npm registry, PyPI, Docker Hub and the
-// GitHub API (several hundred requests, so set GITHUB_TOKEN). Skipped unless PIPEGEN_LIVE_TESTS=1.
+// GitHub API (several hundred requests, so set GITHUB_TOKEN or GH_TOKEN). Skipped unless PIPEGEN_LIVE_TESTS=1.
 import { readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
 import { binaryItems, formatReport, reviewedItems, runCooldown, type CooldownOptions, type Files } from '../scripts/cooldown.js';
 import { FIRST_RELEASE_MAX_LOOKUPS } from '../scripts/release-check.js';
+import { liveToken } from './helpers/live-token.js';
 
 const live = process.env.PIPEGEN_LIVE_TESTS === '1';
 const read = (f: string): string => readFileSync(new URL(`../${f}`, import.meta.url), 'utf8');
@@ -21,7 +22,7 @@ describe.skipIf(!live)('every pin in data/ re-tied to upstream (live)', () => {
     const head: Files = { 'data/reviewed-tools.yml': read('data/reviewed-tools.yml'), 'data/pinned-binaries.yml': read('data/pinned-binaries.yml') };
     const items = reviewedItems(null, head['data/reviewed-tools.yml']).length + binaryItems(null, head['data/pinned-binaries.yml']).length;
     // the token option name is built at runtime (repo rule: nothing in test/ may look like a secret assignment)
-    const withGitHub = Object.fromEntries([['github' + 'Tok' + 'en', process.env[['GITHUB', 'TOKEN'].join('_')]]]) as Partial<CooldownOptions>;
+    const withGitHub = Object.fromEntries([['github' + 'Tok' + 'en', liveToken()]]) as Partial<CooldownOptions>;
     const r = await runCooldown({ base: {}, head, fetch, now: new Date(), maxLookups: FIRST_RELEASE_MAX_LOOKUPS, ...withGitHub });
     const young = r.findings.filter((f) => f.young);
     const untied = r.findings.filter((f) => !f.young);
