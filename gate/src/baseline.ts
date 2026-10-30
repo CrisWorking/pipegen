@@ -58,7 +58,7 @@ export const BASELINE_RETENTION_DAYS = 90;
 /** The run list is read for at most this many pages of 100, and at most this many TRUSTED runs are searched for an artifact. */
 export const MAX_RUN_PAGES = 5;
 export const RUNS_PER_PAGE = 100;
-export const MAX_TRUSTED_RUNS = 20;
+export const MAX_TRUSTED_RUNS = 15;
 /** At most this many default-history checks (two API calls each, plus the tag check) per lookup; hitting the cap fails closed. */
 export const HISTORY_CHECK_CAP = 20;
 /**

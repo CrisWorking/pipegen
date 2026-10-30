@@ -1120,3 +1120,15 @@ describe('fix round 2 (R1-I1): a finished marker search finds none, not unknown'
     }
   });
 });
+
+describe('baseline lookup within the call budget', () => {
+  it('MAX_TRUSTED_RUNS is 15; 15, 16 and 600 trusted runs with no baseline give null in at most 40 calls', async () => {
+    expect(MAX_TRUSTED_RUNS).toBe(15);
+    for (const n of [15, 16, 600]) {
+      const gh = world([], Array.from({ length: n }, (_, i) => run({ id: 10_000 - i, head_sha: (1000 + i).toString(16).padStart(40, 'a') })), []);
+      const r = await loadBaseline(gh, REPO, CTX);
+      expect(r.baseline, String(n)).toBeNull();
+      expect(gh.calls.length, `${n} runs: ${gh.calls.length} calls`).toBeLessThanOrEqual(40);
+    }
+  });
+});
