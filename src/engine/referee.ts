@@ -533,12 +533,12 @@ function triggersOf(on: unknown): string[] | null {
  * pass GitHub's owner rule again here (an empty or odd owner never makes a prefix), and `draft.centralPin` must name that
  * repo at a 40-character commit. Without it every central `uses` is unknown-pin.
  */
-function centralOf(draft: PipelineDraft): { prefix: string; sha: string } | null {
+function centralOf(draft: PipelineDraft): { prefix: string; sha: string; repo: string } | null {
   const owner = draft.profile.owner;
   const pin = draft.centralPin;
   if (typeof owner !== 'string' || !OWNER_RE.test(owner) || pin === undefined || !isObj(pin)) return null;
   if (typeof pin.repo !== 'string' || pin.repo.toLowerCase() !== `${owner.toLowerCase()}/pipelines` || typeof pin.sha !== 'string' || !COMMIT_SHA_RE.test(pin.sha)) return null;
-  return { prefix: `${owner.toLowerCase()}/pipelines/`, sha: pin.sha };
+  return { prefix: `${owner.toLowerCase()}/pipelines/`, sha: pin.sha, repo: pin.repo };
 }
 /** A `uses` path that looks like any owner's central pipelines repo. */
 const CENTRAL_LIKE_RE = /^[^/]*\/pipelines\//;
@@ -643,19 +643,25 @@ function judgeOutputs(fc: FileCtx, id: string, where: string, j: Obj, judged: re
   for (const problem of jobOutputsProblems(id, j.outputs, judged.map((x) => x.step))) fc.add(fc.file.path, 'injection', `In ${where}: ${problem}`);
 }
 
-/** The find-run step's layout, central-workflow and central-sha against the draft (centralPin set: central at exactly that commit; unset: inline, no central input). */
+/**
+ * The find-run step's layout, central-workflow and central-sha against the draft. The pin is the VALIDATED one (centralOf: `<owner>/pipelines` at a
+ * 40-hex commit), never the raw `draft.centralPin`: a pin that is set but invalid is itself an issue (it makes every central `uses` unknown-pin),
+ * and `inline` is not accepted for it. No pin at all: inline, and no central input.
+ */
 function judgeFindRunLayout(fc: FileCtx, where: string, withs: Obj): void {
   const bad = issueFor(fc);
-  const pin = fc.draft.centralPin;
-  const want = pin === undefined ? 'inline' : 'central';
+  const pin = centralOf(fc.draft);
+  if (pin === null && fc.draft.centralPin !== undefined) { bad('template', `${where}: the draft's central pin is not a valid central pin (<owner>/pipelines at a 40-character commit), so the find-run step's central layout can not be judged.`); return; }
+  const want = pin === null ? 'inline' : 'central';
   if (withs.layout !== want) { bad('template', `${where}: the find-run step's layout must be ${want} for this pipeline (it is ${show(withs.layout)}); the gate it looks for runs ${want === 'central' ? 'in the central workflow' : 'inline in pipegen.yml'}.`); return; }
-  if (want === 'inline') {
+  if (pin === null) {
     if (withs['central-workflow'] !== undefined || withs['central-sha'] !== undefined) bad('template', `${where}: layout inline takes no central-workflow or central-sha.`);
     return;
   }
   // exactly the path the renderer derives (one helper), so an @, a .., another repository or another file is refused
-  if (pin !== undefined && withs['central-workflow'] !== centralWorkflowPath(pin.repo, fc.draft.profile.repo)) bad('template', `${where}: the find-run step's central-workflow must be exactly ${show(centralWorkflowPath(pin.repo, fc.draft.profile.repo))}.`);
-  if (withs['central-sha'] !== pin?.sha) bad('template', `${where}: the find-run step's central-sha must be the commit pipegen recorded for the central repository.`);
+  const path = centralWorkflowPath(pin.repo, fc.draft.profile.repo);
+  if (withs['central-workflow'] !== path) bad('template', `${where}: the find-run step's central-workflow must be exactly ${show(path)}.`);
+  if (withs['central-sha'] !== pin.sha) bad('template', `${where}: the find-run step's central-sha must be the commit pipegen recorded for the central repository.`);
 }
 
 /**

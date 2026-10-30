@@ -582,11 +582,6 @@ export function renderGateStep(gate: ReviewedTool, entries: readonly JobListEntr
 }
 
 /**
- * The gate step in mode `baseline-check` (Plan C task C3), for the job `baseline-check`: the workflow token and the fingerprint key,
- * nothing else (the gate checks the stored baseline's signature with the key and reads artifacts with the token). Like the gate job,
- * that job holds no checkout of repo code beyond what its policy row allows, and no other step of the gate action.
- */
-/**
  * The find-run step (C8): the verify-first job and the proof's verify-lookup look for the trusted run in which the commit passed the gate.
  * `central` is set exactly when the draft has a central pin (layout central: the path is derived by centralWorkflowPath, the one helper the
  * referee uses too); otherwise the layout is inline and no central input is written. `sha` is the deployed commit's expression.
@@ -603,6 +598,11 @@ export function renderFindRunStep(gate: ReviewedTool, opts: { central?: { repo: 
   return actionStep(gate, 'pipegen: find the gated run', {}, filled);
 }
 
+/**
+ * The gate step in mode `baseline-check` (Plan C task C3), for the job `baseline-check`: the workflow token and the fingerprint key,
+ * nothing else (the gate checks the stored baseline's signature with the key and reads artifacts with the token). Like the gate job,
+ * that job holds no checkout of repo code beyond what its policy row allows, and no other step of the gate action.
+ */
 export function renderBaselineCheckStep(gate: ReviewedTool): RenderedStep {
   checkGateEntry(gate);
   return actionStep(gate, 'pipegen: check the stored baseline', {}, {

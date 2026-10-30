@@ -1232,6 +1232,18 @@ describe('C8 fix round 1: the find-run layout matches the draft', () => {
       expect(r.issues.filter((x) => /layout|central/i.test(x.message)), show(r)).toEqual([]);
     }
   });
+  it('Part 0 (review-C8-r1 r1-2): the layout is judged against the VALIDATED central pin; a pin that centralOf refuses raises an issue', async () => {
+    const evilPin = { repo: 'evil/pipelines', sha: CENTRAL.sha };
+    const evilCw = centralWorkflowPath(evilPin.repo, prof.repo);
+    const evil = draftOf([], { centralPin: evilPin });
+    // a pin of another owner, with a central-workflow and central-sha that match it: refused (it used to pass this check)
+    expect((await layoutIssues({ layout: 'central', 'central-workflow': evilCw, 'central-sha': evilPin.sha }, evil)).length).toBeGreaterThan(0);
+    // a pin whose commit is not 40-hex, and a pin that is not an object-shaped pin of the owner
+    const short = draftOf([], { centralPin: { repo: CENTRAL.repo, sha: 'abc123' } });
+    expect((await layoutIssues({ layout: 'central', 'central-workflow': CW, 'central-sha': 'abc123' }, short)).length).toBeGreaterThan(0);
+    // the inline claim for an invalid pin is refused too (it is not "no pin")
+    expect((await layoutIssues({ layout: 'inline' }, evil)).length).toBeGreaterThan(0);
+  });
   it('central needs central-workflow and a central-sha equal to the draft\'s pin; inline takes neither', async () => {
     expect((await layoutIssues({ layout: 'central', 'central-sha': CENTRAL.sha }, central)).length).toBeGreaterThan(0);
     expect((await layoutIssues({ layout: 'central', 'central-workflow': CW }, central)).length).toBeGreaterThan(0);

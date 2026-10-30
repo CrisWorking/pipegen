@@ -569,9 +569,9 @@ export interface RendererInput {
 }
 
 const rx = (re: RegExp, describe: string, whenWith?: RendererInput['whenWith']): RendererInput => ({ describe, check: (v) => re.test(v), ...(whenWith === undefined ? {} : { whenWith }) });
-/** A repo-relative file path: not absolute, not an option (`-x`), no `..`, plain characters, no `*`. Shared by the renderer's folder checks. */
 /** Whole minutes from 1 to 360 (a job's own limit): the one rule for the rendered `timeout-minutes` and the action. */
 export const TIMEOUT_MINUTES_RE = /^(?:[1-9]|[1-9][0-9]|[12][0-9]{2}|3[0-5][0-9]|360)$/;
+/** A repo-relative file path: not absolute, not an option (`-x`), no `..`, plain characters, no `*`. Shared by the renderer's folder checks. */
 export const PLAIN_REL_RE = /^(?![-/])(?!.*(?:^|\/)\.\.(?:\/|$))[A-Za-z0-9._/-]{1,200}$/;
 const GHCR_ONLY = { check: (all: Readonly<Record<string, string>>) => all.registry === 'ghcr.io', describe: 'only when the registry is ghcr.io' } as const;
 const RUNNER_TEMP_PATH = rx(/^\$\{\{ runner\.temp \}\}\/pipegen-out\/[a-z0-9][a-z0-9-]{0,120}(?:\/[A-Za-z0-9_][A-Za-z0-9._-]{0,100}){0,3}$/, 'a path under ${{ runner.temp }}/pipegen-out/<artifact>');
