@@ -1444,8 +1444,13 @@ describe('data/reviewed-tools.yml', () => {
     }
   });
 
-  it('reviewed: no gate or watcher entry in v0.1 (Plan C and Plan H add them)', () => {
+  it('reviewed: the only gate entry is pipegen\'s own pipegen-gate (C6); no watcher entry yet (Plan H adds it)', () => {
     for (const t of real()) {
+      if (t.id === 'pipegen-gate') {
+        expect(t.categories).toEqual(['gate']);
+        expect(t.candidate.repo).toBe('crisworking/pipegen');
+        continue;
+      }
       expect(t.categories, t.id).not.toContain('gate');
       expect(t.id, t.id).not.toMatch(/gate|watcher/i);
       expect(t.candidate.repo.toLowerCase(), t.id).not.toMatch(/(^|\/)pipegen/);
@@ -1831,6 +1836,7 @@ describe('data/reviewed-tools.yml', () => {
     const pinnedOn = Date.parse(file.pinnedOn);
     expect(Number.isFinite(pinnedOn)).toBe(true);
     for (const t of file.tools) {
+      if (t.candidate.repo === 'crisworking/pipegen') continue; // pipegen's own repository is exempt (C6): its code is reviewed in this repository
       const at = Date.parse(t.releasedAt);
       expect(Number.isFinite(at), t.id).toBe(true);
       expect(pinnedOn - at, t.id).toBeGreaterThanOrEqual(COOLDOWN_DAYS * DAY);

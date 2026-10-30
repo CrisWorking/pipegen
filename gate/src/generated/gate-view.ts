@@ -583,5 +583,12 @@ export const GATE_VIEW: readonly GateToolView[] = [
       "publishing"
     ],
     "configFiles": []
+  },
+  {
+    "id": "pipegen-gate",
+    "categories": [
+      "gate"
+    ],
+    "configFiles": []
   }
 ];

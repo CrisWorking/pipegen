@@ -526,6 +526,8 @@ export const ACTION_POLICIES: Readonly<Record<string, Readonly<Record<string, In
   },
   'github/codeql-action/upload-sarif': {},
   'actions/attest': {},
+  // pipegen's own gate action: no inputs of its own to fix or choose; every one is the renderer's (RENDERER_INPUTS below)
+  [PIPEGEN_GATE_USES]: {},
   'bullfrogsec/bullfrog': {
     'egress-policy': { values: ['block'], as: 'fixed', required: true },
     'dns-policy': { values: ['allowed-domains-only'], as: 'fixed', required: true },

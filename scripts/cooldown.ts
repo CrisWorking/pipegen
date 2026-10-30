@@ -45,6 +45,8 @@ export const MAX_BODY_BYTES = 32 * 1024 * 1024;
 const DAY_MS = 86_400_000;
 const CONCURRENCY = 6;
 
+/** pipegen's own repository (lower case, exact; same value as reviewed.ts PIPEGEN_OWN_REPO, which a test ties): its action entry skips the 7-day rule. */
+export const PIPEGEN_OWN_REPO = 'crisworking/pipegen';
 export const WATCHED_FILES = ['package.json', 'package-lock.json', 'data/reviewed-tools.yml', 'data/pinned-binaries.yml'] as const;
 /** Read from the base checkout only: it names who may grant the emergency path. */
 export const CODEOWNERS_FILE = '.github/CODEOWNERS';
@@ -781,7 +783,13 @@ export function reviewedItems(base: string | null | undefined, head: string | nu
     // An install hash, when written, must be the candidate pin (as the loader requires), never an alternative.
     if (inst && str(inst.checksum) !== undefined && str(inst.checksum) !== str(pin.checksum)) items.push(label(async () => fail('step.cli.install.checksum differs from candidate.pin.checksum')));
     if (inst && str(inst.digest) !== undefined && str(inst.digest) !== str(pin.digest)) items.push(label(async () => fail('step.cli.install.digest differs from candidate.pin.digest')));
-    if (kind === 'action' && action) {
+    if (kind === 'action' && action && repo === PIPEGEN_OWN_REPO) {
+      // pipegen's own gate action: its code is reviewed in this repository, so there is no release or age to look up. The exact repo only
+      // (a fork, another case or another name is checked like any action). The pin must still be the one in `uses`.
+      const uses = str(action.uses) ?? '';
+      const m = /^([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)(?:\/[^@]*)?@([0-9a-f]{40})$/.exec(uses);
+      if (!m || m[1] !== repo || m[2] !== str(pin.sha)) items.push(label(async () => fail('uses: does not match the candidate repo and pin sha')));
+    } else if (kind === 'action' && action) {
       items.push(label((ctx) => actionOutcome(ctx, str(action.uses), repo, version, str(pin.sha))));
     } else if (kind === 'cli' && inst && inst.method === 'github-release') {
       const tag = str(inst.version) ?? '';

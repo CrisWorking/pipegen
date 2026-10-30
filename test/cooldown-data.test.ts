@@ -49,6 +49,8 @@ function artifacts(): Artifact[] {
     const c = t.candidate;
     const inst = t.step?.cli?.install;
     const before = out.length;
+    // pipegen's own gate action is not dated or tied to a release (C6: the cooldown skips the exact repo crisworking/pipegen); tested in gate-entry.test.ts
+    if (c.kind === 'action' && c.repo === 'crisworking/pipegen') continue;
     if (c.kind === 'action') out.push({ type: 'action', owner: t.id, repo: c.repo, tag: c.version, sha: c.pin.sha });
     else if (c.kind === 'docker') out.push({ type: 'docker', owner: t.id, image: inst.package, tag: inst.version, digest: c.pin.digest });
     else if (c.kind === 'cli' && inst.method === 'github-release') out.push({ type: 'asset', owner: t.id, repo: c.repo, tag: inst.version, asset: inst.package, sha256: c.pin.checksum });
@@ -263,6 +265,8 @@ describe('cooldown: the real data', () => {
     // Allowed, not pins this check dates (each explained in docs/cooldown.md):
     const allowed = new Set<string>();
     for (const t of (parse(FILES['data/reviewed-tools.yml']) as Obj).tools as Obj[]) {
+      // pipegen's own gate action: its pin is a commit of this repository (not dated by the cooldown, see gate-entry.test.ts)
+      if (t.candidate.repo === 'crisworking/pipegen') allowed.add(t.candidate.pin.sha);
       // pin-time verification inputs (cosign identity/issuer, key URL and its sha256), never installed
       for (const v of Object.values((t.verifiedWith ?? {}) as Obj)) if (typeof v === 'string') allowed.add(v);
       // a record of the image an action's own action.yml runs; the action is tied by its commit SHA

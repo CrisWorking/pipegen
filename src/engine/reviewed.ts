@@ -269,6 +269,9 @@ const entrySchema = z.strictObject({
   for (const p of entryProblems(e)) ctx.addIssue({ code: 'custom', path: p.path, message: p.message });
 });
 
+/** pipegen's own repository (lower case, exact): the one repo whose entries skip the 7-day cooldown. */
+export const PIPEGEN_OWN_REPO = 'crisworking/pipegen';
+
 const fileSchema = z.strictObject({
   /** When the list was last pinned (an ISO timestamp); every releasedAt must be at least the cooldown before it. */
   pinnedOn: z.string().regex(ISO_RE),
@@ -282,7 +285,8 @@ const fileSchema = z.strictObject({
     if (t.reviewedAt !== PENDING && DATE_RE.test(t.reviewedAt) && t.reviewedAt < pinnedDay) {
       ctx.addIssue({ code: 'custom', path: ['tools', i, 'reviewedAt'], message: `reviewedAt is before pinnedOn (${pinnedDay}): the review must cover the pins as they are` });
     }
-    if (!(pinnedOn - Date.parse(t.releasedAt) >= COOLDOWN_DAYS * DAY_MS)) {
+    // pipegen's own repository is exempt (C6): its code is reviewed in this repository; the exact repo, nothing else
+    if (t.candidate.repo !== PIPEGEN_OWN_REPO && !(pinnedOn - Date.parse(t.releasedAt) >= COOLDOWN_DAYS * DAY_MS)) {
       ctx.addIssue({ code: 'custom', path: ['tools', i, 'releasedAt'], message: `the release must be at least ${COOLDOWN_DAYS} days older than pinnedOn (cooldown, ruling S26)` });
     }
     // PS24: the signature check must cover the pins as they are

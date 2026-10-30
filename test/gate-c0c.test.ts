@@ -90,7 +90,7 @@ const gateJ = (list: ReturnType<typeof gateJobList>): Job => job([renderGateStep
 const harden = (): RenderedStep[] => renderStep(specFor(entry('bullfrog'), { needId: 'egress' }), entry('bullfrog'), p, ctx).steps;
 
 describe('CF1: a spec\'s tool must cover its need', () => {
-  const ALL = (): ReviewedTool[] => [...reviewedList(), GATE];
+  const ALL = (): ReviewedTool[] => [...reviewedList().filter((t) => t.id !== GATE.id), GATE];   // the fixture stands in for the real pipegen-gate entry
   it('E: dependency-review paired with bullfrog, checkout, upload-artifact, build-push, the gate action or eslint is refused by the referee', async () => {
     for (const toolId of ['bullfrog', 'actions-checkout', 'actions-upload-artifact', 'docker-build-push-action', 'pipegen-gate', 'eslint']) {
       const t = ALL().find((x) => x.id === toolId) as ReviewedTool;

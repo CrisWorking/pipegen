@@ -124,6 +124,7 @@ describe('referee: the renderer and the referee agree', () => {
     const ctxN: RenderContext = { ...ctx, profile: profN };
     const perNeed = new Map<string, number>();
     for (const t of reviewedList()) {
+      if (t.id === 'pipegen-gate') continue;   // pipegen's own gate action is rendered by the gate helpers (renderScrub, renderGateStep), not as a tool job
       if (t.categories.includes('platform') && !t.categories.includes('image-build')) continue;   // the platform actions are rendered below, by their helpers
       const nth = (perNeed.get(needFor(t)) ?? 0) + 1;
       perNeed.set(needFor(t), nth);
