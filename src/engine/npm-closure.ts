@@ -45,6 +45,30 @@ function nameOfKey(key: string): string | null {
   return m === null ? null : (m[1] as string);
 }
 
+/**
+ * Plain-English problems with ONE entry of an npm lockfile v3 (`packages[key]`): the key is exactly `node_modules/<name>` (nested allowed),
+ * and the entry is a plain registry package: an exact version, the registry tarball of that name and version, a sha512 integrity, none of
+ * the fields that mean a link or a bundle, and only registry ranges as dependencies. Shared by the closure judge and the guard's lock diff (D1).
+ */
+export function lockEntryProblems(key: string, e: unknown): string[] {
+  const out: string[] = [];
+  const name = nameOfKey(key);
+  if (name === null || !isObj(e)) return [`"${key.slice(0, 80)}" is not a package under node_modules/`];
+  for (const f of FORBIDDEN_FIELDS) if (f in e) out.push(`${key} has ${f}, which is not a plain registry package`);
+  const version = e.version;
+  if (typeof version !== 'string' || !EXACT_RE.test(version)) return [...out, `${key} has no exact version`];
+  const base = name.slice(name.indexOf('/') + 1);
+  if (e.resolved !== `https://registry.npmjs.org/${name}/-/${base}-${version}.tgz`) out.push(`${key} is not resolved from https://registry.npmjs.org/${name}/-/${base}-${version}.tgz (an alias, path, git or other source)`);
+  if (typeof e.integrity !== 'string' || !SRI_SHA512_RE.test(e.integrity)) out.push(`${key} has no sha512 integrity`);
+  for (const f of DEP_FIELDS) {
+    const deps = e[f];
+    if (deps === undefined) continue;
+    if (!isObj(deps)) { out.push(`${key} has a malformed ${f}`); continue; }
+    for (const [d, spec] of Object.entries(deps)) if (typeof spec !== 'string' || FOREIGN_SPEC_RE.test(spec)) out.push(`${key} depends on ${d} through ${String(spec).slice(0, 40)}, not a registry range`);
+  }
+  return out;
+}
+
 /** Plain-English problems with a closure's text; empty = fine. */
 export function closureProblems(text: string, pins: readonly NpmPin[]): string[] {
   const out: string[] = [];
@@ -65,21 +89,7 @@ export function closureProblems(text: string, pins: readonly NpmPin[]): string[]
   else for (const [name, spec] of Object.entries(root.dependencies)) if (typeof spec !== 'string' || !EXACT_RE.test(spec) || !isNpmName(name)) out.push(`the root depends on ${name} at ${String(spec)}, not an exact version`);
   for (const key of keys) {
     if (key === '') continue;
-    const e = packages[key];
-    const name = nameOfKey(key);
-    if (name === null || !isObj(e)) { out.push(`"${key.slice(0, 80)}" is not a package under node_modules/`); continue; }
-    for (const f of FORBIDDEN_FIELDS) if (f in e) out.push(`${key} has ${f}, which is not a plain registry package`);
-    const version = e.version;
-    if (typeof version !== 'string' || !EXACT_RE.test(version)) { out.push(`${key} has no exact version`); continue; }
-    const base = name.slice(name.indexOf('/') + 1);
-    if (e.resolved !== `https://registry.npmjs.org/${name}/-/${base}-${version}.tgz`) out.push(`${key} is not resolved from https://registry.npmjs.org/${name}/-/${base}-${version}.tgz (an alias, path, git or other source)`);
-    if (typeof e.integrity !== 'string' || !SRI_SHA512_RE.test(e.integrity)) out.push(`${key} has no sha512 integrity`);
-    for (const f of DEP_FIELDS) {
-      const deps = e[f];
-      if (deps === undefined) continue;
-      if (!isObj(deps)) { out.push(`${key} has a malformed ${f}`); continue; }
-      for (const [d, spec] of Object.entries(deps)) if (typeof spec !== 'string' || FOREIGN_SPEC_RE.test(spec)) out.push(`${key} depends on ${d} through ${String(spec).slice(0, 40)}, not a registry range`);
-    }
+    out.push(...lockEntryProblems(key, packages[key]));
   }
   for (const p of pins) {
     const e = packages[`node_modules/${p.name}`];

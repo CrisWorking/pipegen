@@ -178,8 +178,10 @@ async function checkAfterOpen(handle: FileHandle, opened: Stats, info: Stats, pa
  * `root` the opened descriptor is verified itself: on Linux its real path (/proc/self/fd) must be inside the root's real
  * path (`link` otherwise); on macOS the open uses O_NOFOLLOW_ANY when Node exposes it. Elsewhere, or without /proc,
  * only the path checks remain (threat model T51).
+ *
+ * `maxBytes` (default READ_LIMITS.maxFileBytes) is for a caller that must read a bigger text on purpose (the D1 guard reads package-lock.json).
  */
-export async function readTextLimitedWithReason(path: string, root?: string): Promise<{ text: string } | { skipped: Skipped }> {
+export async function readTextLimitedWithReason(path: string, root?: string, maxBytes: number = READ_LIMITS.maxFileBytes): Promise<{ text: string } | { skipped: Skipped }> {
   let handle: FileHandle | undefined;
   try {
     const rel = root === undefined ? null : under(root, path);
@@ -188,7 +190,7 @@ export async function readTextLimitedWithReason(path: string, root?: string): Pr
     const info = await lstat(path);
     if (info.isSymbolicLink()) return { skipped: 'link' };
     if (!info.isFile()) return { skipped: 'not-a-file' };
-    if (info.size > READ_LIMITS.maxFileBytes) return { skipped: 'too-large' };
+    if (info.size > maxBytes) return { skipped: 'too-large' };
     try {
       handle = await open(path, OPEN_CHECKED | (root !== undefined ? NOFOLLOW_ANY : 0));
     } catch (e) {
@@ -197,11 +199,11 @@ export async function readTextLimitedWithReason(path: string, root?: string): Pr
     }
     const opened = await handle.stat();
     if (!opened.isFile()) return { skipped: 'not-a-file' };
-    if (opened.size > READ_LIMITS.maxFileBytes) return { skipped: 'too-large' };
+    if (opened.size > maxBytes) return { skipped: 'too-large' };
     const after = await checkAfterOpen(handle, opened, info, path, root, rel);
     if (after !== null) return { skipped: after };
-    const buf = await readAtMost(handle, opened.size, READ_LIMITS.maxFileBytes + 1);
-    if (buf.length > READ_LIMITS.maxFileBytes) return { skipped: 'too-large' };
+    const buf = await readAtMost(handle, opened.size, maxBytes + 1);
+    if (buf.length > maxBytes) return { skipped: 'too-large' };
     return isBinary(buf) ? { skipped: 'binary' } : { text: buf.toString('utf8') };
   } catch {
     return { skipped: 'unreadable' };
