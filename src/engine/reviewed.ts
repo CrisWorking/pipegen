@@ -24,7 +24,7 @@
 // - Task 6 fix round 1: every cli entry's argv is checked against its allowlist (tool-flags.ts ARGV_POLICIES, by entry
 //   id; default deny, P19): its own executable, only reviewed flags and values, the flags that keep failing on (P20),
 //   pipegen's exact pinned config, no env, the policy's follow-up commands (P24). Trivy's --exit-code is exactly 1 and
-//   every severity includes CRITICAL (P20); gitleaks has the betterleaks locks (P21); action locks go by the action's
+//   every severity includes CRITICAL (P20), and the licence scan has none (S9); gitleaks has the betterleaks locks (P21); action locks go by the action's
 //   name under any owner, one spelling per input, and pypi-publish only to PyPI or TestPyPI (P22).
 // - Fix round 2: the argv allowlist covers every entry with a step.cli, images included, and binds its install method
 //   and package (P28); every action takes only the inputs its policy lists (ACTION_POLICIES by exact owner/repo,
@@ -788,6 +788,10 @@ function trivyProblems(e: Entry): Problem[] {
     const parts = v.split(',');
     if (!parts.includes('CRITICAL') || parts.some((x) => !TRIVY_SEVERITIES.includes(x))) bad(`trivy's severity ${v} must be a list of ${TRIVY_SEVERITIES.join(', ')} that includes CRITICAL (ruling P20)`, 'step', 'cli', 'command');
   }
+  // S9 (Plan C final review fix round A, ruling 2): the licence scan reports every severity. Trivy files a licence it can not classify as
+  // UNKNOWN, so any --severity filter hides some (G11: HIGH,CRITICAL hid every Unknown licence); the gate judges the severities itself
+  const scanners = [...p.flags, ...pa.flags].filter((f) => f.name === 'scanners').flatMap((f) => f.value.split(','));
+  if (scanners.includes('license') && severities.length > 0) bad('trivy\'s licence scan must report every severity (no --severity in the command, the fixed args or a choice): a filter hides the Unknown licences a person must look at (ruling S9)', 'step', 'cli', 'command');
   out.push(...choiceProblems('trivy', e, (k) => (g.value.has(k) || g.bool.has(k)) && TRIVY_ALLOWED_FLAGS.has(k),
     (k) => (TRIVY_FORBIDDEN.has(k) || k === 'exit-code' || (TRIVY_REQUIRED_FLAGS as readonly string[]).includes(`--${k}`) ? `the AI may not choose trivy's --${k}` : null)));
   return out;

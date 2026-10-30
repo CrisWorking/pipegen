@@ -676,7 +676,9 @@ describe('loader rules (Plan P Task 5)', () => {
     rejects([trivyEntry({ command: ['trivy', 'plugin', 'install', 'x'], args: [] })], /trivy config\|image\|fs/);
     // shorthands read as pflag does: combined bools and glued values
     expect(load([trivyEntry({ command: ['trivy', 'image', ...TRIVY_FLAGS, '-fsarif', '-o=tool.sarif', '--exit-code', '10', '.'], args: [...TRIVY_FLAGS, '--exit-code', '10'] })])).toHaveLength(1);
-    expect(load([trivyEntry({ command: ['trivy', 'fs', ...TRIVY_FLAGS, '--scanners', 'license', '--severity', 'HIGH,CRITICAL', '--exit-code', '10', '.'], args: [...TRIVY_FLAGS, '--exit-code', '10'] })])).toHaveLength(1);
+    expect(load([trivyEntry({ command: ['trivy', 'fs', ...TRIVY_FLAGS, '--scanners', 'license', '--exit-code', '10', '.'], args: [...TRIVY_FLAGS, '--exit-code', '10'] })])).toHaveLength(1);
+    // S9 (Plan C final review fix round A): a licence scan with a severity filter does not load
+    rejects([trivyEntry({ command: ['trivy', 'fs', ...TRIVY_FLAGS, '--scanners', 'license', '--severity', 'HIGH,CRITICAL', '--exit-code', '10', '.'], args: [...TRIVY_FLAGS, '--exit-code', '10'] })], /licence scan must report every severity/);
     // the environment can set any flag: no TRIVY_* env at all
     const env = trivyEntry();
     env.step.cli.env = { ['TRIVY_DISABLE_' + 'TELEMETRY']: 'false' };
@@ -1049,8 +1051,8 @@ describe('loader rules (Plan P Task 5)', () => {
     // the fixed args are read with the same grammar
     rejects([betterleaksEntry({ command: blCmd('--no-color'), args: [...BL_ARGS, '--no-color'] })], /allowlist, ruling P13/);
     rejects([trivyEntry({ command: ['trivy', 'image', ...TRIVY_FLAGS, '--no-such', ...tail], args: [...TRIVY_FLAGS, '--no-such'] })], /unknown flag --no-such/);
-    // allowlisted flags load (the Task 6 trivy-licence, image and betterleaks shapes)
-    expect(load([trivyEntry({ command: ['trivy', 'fs', ...TRIVY_FLAGS, '--scanners', 'license', '--severity', 'HIGH,CRITICAL', '--exit-code', '10', '.'], args: [...TRIVY_FLAGS, '--exit-code', '10'] })])).toHaveLength(1);
+    // allowlisted flags load (the trivy-licence shape of fix round A, S9: no --severity; the image and betterleaks shapes)
+    expect(load([trivyEntry({ command: ['trivy', 'fs', ...TRIVY_FLAGS, '--scanners', 'license', '--exit-code', '10', '.'], args: [...TRIVY_FLAGS, '--exit-code', '10'] })])).toHaveLength(1);
     expect(load([betterleaksEntry({ command: blCmd('--no-banner', '--ignore-gitleaks-allow'), args: BL_ARGS })])).toHaveLength(1);
     expect(load([nucleiEntry({ command: nucleiCmd('-u', 'http://localhost:8080', '-ni', '-as') })])).toHaveLength(1);
   });
@@ -1780,7 +1782,8 @@ describe('data/reviewed-tools.yml', () => {
       expect(t.verifiedWith, t.id).toMatchObject({ method: 'cosign-bundle', asset: 'trivy_0.76.0_checksums.txt' });
     }
     expect(byId(list, 'trivy-image')[0]?.choices['ignore-unfixed']).toEqual(['false', 'true']);
-    expect(byId(list, 'trivy-licence')[0]?.fixedInputs.args).toEqual(expect.arrayContaining(['--scanners', 'license', '--severity', 'HIGH,CRITICAL', '--exit-code', '10']));
+    expect(byId(list, 'trivy-licence')[0]?.fixedInputs.args).toEqual(expect.arrayContaining(['--scanners', 'license', '--exit-code', '10']));
+    expect(byId(list, 'trivy-licence')[0]?.fixedInputs.args).not.toContain('--severity');   // S9: every severity, UNKNOWN included (final review fix round A)
     for (const t of list) {
       expect(neverListed(t.candidate.repo), t.id).toBeNull();
       if (t.step.action !== undefined) expect(neverListed(t.step.action.uses), t.id).toBeNull();
@@ -1990,7 +1993,7 @@ describe('Task 6 review fix round 1 (P19-P27)', () => {
     const choice = realEntry('trivy-image');
     choice.choices['exit-code'] = ['0', '1'];
     refused(choice, /exit-code/);
-    refused(both(realEntry('trivy-licence'), swap('HIGH,CRITICAL', 'UNKNOWN')), /includes CRITICAL/);
+    refused(both(realEntry('trivy-licence'), (xs) => [...xs.slice(0, xs.indexOf('--format')), '--severity', 'UNKNOWN', ...xs.slice(xs.indexOf('--format'))]), /includes CRITICAL/);
     for (const v of [['UNKNOWN'], ['HIGH'], ['LOW,MEDIUM'], ['CRITICAL', 'HIGH']]) {
       const sev = realEntry('trivy-config');
       sev.choices.severity = v;
@@ -1999,6 +2002,22 @@ describe('Task 6 review fix round 1 (P19-P27)', () => {
     const ok = realEntry('trivy-config');
     ok.choices.severity = ['CRITICAL', 'HIGH,CRITICAL'];
     expect(loadAt([ok])).toHaveLength(1);
+  });
+
+  it('S9 (Plan C final review fix round A, ruling 2): the licence scan reports every severity: no --severity in the command, the fixed args or a choice; reviewed by delegation', () => {
+    const t = realEntry('trivy-licence');
+    expect(t.step.cli.command).not.toContain('--severity');
+    expect(t.fixedInputs.args ?? []).not.toContain('--severity');
+    expect(t.step.cli.command).toEqual(expect.arrayContaining(['--scanners', 'license', '--exit-code', '10']));
+    expect(loadAt([t])).toHaveLength(1);
+    const LIC = /licence scan must report every severity/;
+    const filtered = (sev: string) => both(realEntry('trivy-licence'), (xs) => [...xs.slice(0, xs.indexOf('--format')), '--severity', sev, ...xs.slice(xs.indexOf('--format'))]);
+    for (const sev of ['HIGH,CRITICAL', 'UNKNOWN,HIGH,CRITICAL', 'UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL']) refused(filtered(sev), LIC);
+    const choice = realEntry('trivy-licence');
+    choice.choices.severity = ['HIGH,CRITICAL'];
+    refused(choice, LIC);
+    // the other trivy scans keep their severity lists (P20)
+    expect(realEntry('trivy-config').choices.severity).toContain('HIGH,CRITICAL');
   });
 
   it('P21 (I3, probe 17): gitleaks, the fallback, has the betterleaks locks', () => {

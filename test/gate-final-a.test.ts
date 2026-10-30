@@ -4,7 +4,10 @@
 import { Document } from 'yaml';
 import { describe, expect, it } from 'vitest';
 import { gateJobList, GateJobListError, type JobListEntry } from '../src/engine/gate-job-list.js';
-import { gateStepInputs } from '../src/engine/gate-inputs.js';
+import { gateStepInputs, licenceLockfilesOf } from '../src/engine/gate-inputs.js';
+import { TRIVY_LICENCE_LOCKFILES } from '../src/engine/licence-lockfiles.js';
+import { PIPEGEN_GATE_USES, rendererInputProblems } from '../src/engine/tool-flags.js';
+import { licenceCoverage } from '../gate/src/facts.js';
 import { jobOutputsFor, NO_SCANS, type ScanFact } from '../src/engine/job-rules.js';
 import { NEED_ID_CATEGORY } from '../src/engine/need-ids.js';
 import { referee, type Linters, type RefereeReport } from '../src/engine/referee.js';
@@ -14,7 +17,7 @@ import {
 } from '../src/engine/render-step.js';
 import { emptyRepoFiles } from '../src/read/quality.js';
 import { gateToolView, resolveSettings } from '../gate/src/settings.js';
-import type { Capabilities, CreatedFile, Need, NotProven, PipelineDraft, StepSpec } from '../src/types.js';
+import type { Capabilities, CreatedFile, Need, NotProven, PipelineDraft, Service, StepSpec } from '../src/types.js';
 import { entry, platform, profile, reviewedList, service, specFor } from './helpers/render.js';
 
 // object keys spelled at run time (see test/no-secret-literals.test.ts)
@@ -31,7 +34,6 @@ const GATE = entry('pipegen-gate');
 const app = service({ name: 'app', path: '.', scripts: ['test'] });
 const web = service({ name: 'web', path: 'apps/web', scripts: ['test'] });
 const prof = { ...profile([app, web]), repoFiles: emptyRepoFiles() };
-const ctx: RenderContext = { profile: prof };
 const caps: Capabilities = { branchProtection: true, environments: false, envRequiredReviewers: false, deploymentBranchPolicies: false, attestations: true, codeScanning: true, keylessSigningAllowed: true };
 const needOf = (id: string, svc?: string): Need => ({ id, layer: 'merge', category: (NEED_ID_CATEGORY as Record<string, string>)[id] ?? id, ...(svc === undefined ? {} : { service: svc }), why: 't', blocking: true, floor: true });
 const specs: StepSpec[] = [specFor(entry('betterleaks'), { needId: 'secrets' }), specFor(entry('semgrep'), { needId: 'sast', service: 'app' }), specFor(entry('osv-scanner'), { needId: 'deps', service: 'app' })];
@@ -58,6 +60,7 @@ function workflow(jobs: Record<string, Job>): CreatedFile {
 /** The whole rendered pipeline for a draft; `gateStep` replaces the rendered gate step (an edited one). */
 function jobs(d: PipelineDraft, gateStep?: RenderedStep): Record<string, Job> {
   const out: Record<string, Job> = {};
+  const ctx: RenderContext = { profile: d.profile };
   const blocks = d.steps.map((s) => renderFindingsBlock(s, entry(s.tool.id), p, ctx, GATE));
   const baseBlocks = d.steps.map((s) => renderFindingsBlock(s, entry(s.tool.id), p, { ...ctx, base: true }, GATE));
   d.steps.forEach((s, i) => {
@@ -197,5 +200,86 @@ describe('ruling 1: the referee holds the gate step to gateStepInputs(draft), ex
       expect(r.ok, `extra ${k}`).toBe(false);
       expect(show(r), k).toMatch(new RegExp(`${k}.*(?:does not give|not the)|(?:does not give|not the).*${k}`));
     }
+  });
+});
+
+// ---------- ruling 2 (Important 3): licences ----------
+
+describe('ruling 2: the licence check\'s coverage per lockfile, from the profile', () => {
+  const svc = (name: string, path: string, over: Partial<Service>): Service => service({ name, path, scripts: name === 'app' ? ['test'] : [], ...over });
+  const licProf = {
+    ...profile([
+      svc('app', '.', {}), svc('API', 'api', { language: 'python', packageManager: 'uv' }), svc('cli', 'cli', { language: 'go', packageManager: undefined as never }),
+      svc('docs', 'docs', { packageManager: undefined as never }), svc('tool', 'tool', { language: 'python', packageManager: 'pip', alsoLanguages: ['go'] }),
+    ]),
+    repoFiles: emptyRepoFiles(),
+  };
+  const licSpecs: StepSpec[] = [...specs, specFor(entry('trivy-licence'), { needId: 'licences' })];
+  const licDraft = (over: Partial<PipelineDraft> = {}): PipelineDraft => draftOf({ profile: licProf, steps: licSpecs, needs: [...needs, needOf('licences')], ...over });
+  const WANT = [
+    { service: 'app', lockfiles: [{ kind: 'npm', read: true }] },
+    { service: 'api', lockfiles: [{ kind: 'uv', read: false }] },
+    { service: 'cli', lockfiles: [{ kind: 'go', read: false }] },
+    { service: 'docs', lockfiles: [] },
+    { service: 'tool', lockfiles: [{ kind: 'pip', read: false }, { kind: 'go', read: false }] },
+  ];
+
+  it('the reviewed table (trivy v0.76.0 docs, cited in the module): only npm\'s package-lock.json carries licences by itself; yarn, pnpm, bun, pip and go need installed packages; poetry, uv and an unknown manager never', () => {
+    expect(TRIVY_LICENCE_LOCKFILES.npm.licences).toBe('lockfile');
+    for (const k of ['yarn', 'pnpm', 'bun', 'pip', 'go'] as const) expect(TRIVY_LICENCE_LOCKFILES[k].licences, k).toBe('installed');
+    for (const k of ['poetry', 'uv', 'other'] as const) expect(TRIVY_LICENCE_LOCKFILES[k].licences, k).toBe('never');
+    // every package manager the reader can find has a row
+    for (const pm of ['npm', 'pnpm', 'yarn', 'bun', 'pip', 'poetry', 'uv', 'other'] as const) expect(Object.hasOwn(TRIVY_LICENCE_LOCKFILES, pm), pm).toBe(true);
+  });
+
+  it('licenceLockfilesOf: per service (its slug), each lockfile kind the profile found and whether trivy reads it (no install step is rendered before the scan yet, so only the lockfile kind counts)', () => {
+    expect(licenceLockfilesOf(licDraft())).toEqual(WANT);
+  });
+
+  it('gateStepInputs: licence-lockfiles exactly when the job list has a licences check', () => {
+    expect(JSON.parse(gateStepInputs(licDraft())['licence-lockfiles'] as string)).toEqual(WANT);
+    expect(Object.hasOwn(gateStepInputs(draftOf()), 'licence-lockfiles')).toBe(false);
+  });
+
+  it('the referee: the honest pipeline passes; a licence-lockfiles that says uv is read, drops a service or is missing is refused', async () => {
+    const d = licDraft();
+    expect(show(await run([workflow(jobs(d))], d))).toBe('');
+    const lied = WANT.map((e) => (e.service === 'api' ? { service: 'api', lockfiles: [{ kind: 'npm', read: true }] } : e));
+    for (const edit of [
+      (w: Record<string, string>) => { w['licence-lockfiles'] = JSON.stringify(lied); },
+      (w: Record<string, string>) => { w['licence-lockfiles'] = JSON.stringify(WANT.slice(1)); },
+      (w: Record<string, string>) => { delete w['licence-lockfiles']; },
+    ]) {
+      const r = await run([workflow(withEdited(d, edit))], d);
+      expect(r.ok, show(r)).toBe(false);
+      expect(show(r)).toMatch(/licence-lockfiles/);
+    }
+  });
+
+  it('RENDERER_INPUTS / the gate: licence-lockfiles is a JSON list of { service, lockfiles: [{ kind, read }] }, mode gate only; a kind trivy never reads can not be marked read', () => {
+    const problems = (v: string, mode = 'gate'): string[] => rendererInputProblems(PIPEGEN_GATE_USES, { 'licence-lockfiles': v }, { mode, 'licence-lockfiles': v });
+    expect(problems(JSON.stringify(WANT))).toEqual([]);
+    expect(problems('[]')).toEqual([]);
+    expect(problems(JSON.stringify(WANT), 'nightly').length).toBeGreaterThan(0);
+    for (const bad of ['x', '{}', '[1]', '[{"service":"app"}]', '[{"service":"App","lockfiles":[]}]', '[{"service":"app","lockfiles":[{"kind":"cargo","read":true}]}]',
+      '[{"service":"app","lockfiles":[{"kind":"uv","read":true}]}]', '[{"service":"app","lockfiles":[{"kind":"npm","read":"yes"}]}]', '[{"service":"app","lockfiles":[{"kind":"npm","read":true,"x":1}]}]',
+      '[{"service":"app","lockfiles":[],"x":1}]']) {
+      expect(problems(bad).length, bad).toBeGreaterThan(0);
+    }
+  });
+
+  it('the gate: resolveSettings reads it, gatherGateInput\'s coverage names each service and kind that is not covered, never "clean"', () => {
+    const w = { ...(renderGateStep(GATE, licDraft()).with as Record<string, string>), jobs: '{}', 'block-from': '', [GH_IN]: 'tok', [FP_IN]: '' };
+    const s = resolveSettings(w, { private: false, reviewed: gateToolView(reviewedList()) });
+    expect(s.errors).toEqual([]);
+    expect(s.licenceLockfiles).toEqual(WANT);
+    expect(licenceCoverage(s.licenceLockfiles)).toEqual([
+      'api: uv: not covered (lockfile type)', 'cli: go: not covered (lockfile type)', 'docs: not covered (no lockfile)', 'tool: pip: not covered (lockfile type)', 'tool: go: not covered (lockfile type)',
+    ]);
+    expect(licenceCoverage([])).toEqual(['not covered (no lockfile)']);
+    expect(licenceCoverage([{ service: 'app', lockfiles: [{ kind: 'npm', read: true }] }])).toEqual([]);
+    expect(licenceCoverage(undefined)).toEqual(['coverage per lockfile not known (the gate step has no licence-lockfiles input)']);
+    const bad = resolveSettings({ ...w, 'licence-lockfiles': '[{"service":"api","lockfiles":[{"kind":"uv","read":true}]}]' }, { private: false, reviewed: gateToolView(reviewedList()) });
+    expect(bad.errors.join('\n')).toMatch(/licence-lockfiles input is refused/);
   });
 });

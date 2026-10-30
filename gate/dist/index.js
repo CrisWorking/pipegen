@@ -1894,6 +1894,21 @@ var GATE_RESULT_ARTIFACT = "pipegen-gate-result";
 var BASELINE_ARTIFACT = "pipegen-baseline";
 var CLEAN_RUN_ARTIFACT = "pipegen-clean-run";
 
+// src/engine/licence-lockfiles.ts
+var TRIVY_LICENCE_LOCKFILES = Object.freeze({
+  npm: { file: "package-lock.json", licences: "lockfile" },
+  yarn: { file: "yarn.lock", licences: "installed" },
+  pnpm: { file: "pnpm-lock.yaml", licences: "installed" },
+  bun: { file: "bun.lock", licences: "installed" },
+  pip: { file: "requirements.txt", licences: "installed" },
+  poetry: { file: "poetry.lock", licences: "never" },
+  uv: { file: "uv.lock", licences: "never" },
+  go: { file: "go.mod", licences: "installed" },
+  other: { file: "(a lockfile pipegen does not know)", licences: "never" }
+});
+var LOCKFILE_KINDS = Object.keys(TRIVY_LICENCE_LOCKFILES);
+var isLockfileKind = (k) => typeof k === "string" && Object.hasOwn(TRIVY_LICENCE_LOCKFILES, k);
+
 // gate/src/policy-default.ts
 var SEVERITIES = Object.freeze(["critical", "high", "medium", "low", "info"]);
 var POLICY_FLOOR = Object.freeze(["critical", "high"]);
@@ -2476,6 +2491,21 @@ function serviceRootsProblem(text) {
   if (!Array.isArray(list) || list.length > 100) return "a JSON list of at most 100 service folders";
   return list.every((x) => typeof x === "string" && SERVICE_ROOT_RE.test(x) && !x.includes("//")) ? null : "a JSON list of plain relative folders (or .), no glob, no .., no leading /";
 }
+function licenceLockfilesProblem(text) {
+  const list = parseJson(text);
+  const shape = 'a JSON list of at most 100 { "service", "lockfiles": [{ "kind", "read" }] } entries';
+  if (!Array.isArray(list) || list.length > 100) return shape;
+  for (const e of list) {
+    if (!isPlainObject(e) || Object.keys(e).sort().join() !== "lockfiles,service") return shape;
+    if (typeof e.service !== "string" || e.service.length > 40 || !SERVICE_SLUG_RE.test(e.service)) return `${shape}, each service a service slug`;
+    if (!Array.isArray(e.lockfiles) || e.lockfiles.length > 4) return `${shape}, at most 4 lockfiles each`;
+    for (const l of e.lockfiles) {
+      if (!isPlainObject(l) || Object.keys(l).sort().join() !== "kind,read" || !isLockfileKind(l.kind) || typeof l.read !== "boolean") return `${shape}, each lockfile a known kind (${Object.keys(TRIVY_LICENCE_LOCKFILES).join(", ")}) with read true or false`;
+      if (l.read && TRIVY_LICENCE_LOCKFILES[l.kind].licences === "never") return `${shape}; a ${l.kind} lockfile is never read by the licence scan`;
+    }
+  }
+  return null;
+}
 var NEED_ID_TEXT_RE = /^(?!base-)(?!.*--)[a-z0-9][a-z0-9-]{0,63}$/;
 var JOB_ID_TEXT_RE = /^[A-Za-z_][A-Za-z0-9_-]{0,99}$/;
 var SERVICE_SLUG_RE = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
@@ -2582,6 +2612,8 @@ var RENDERER_INPUTS = Object.freeze({
     "protected-paths": literalInput(["gate"], pathListProblem, "a JSON list of plain relative path globs"),
     // the service folders (C5a CF3): the root-scoped config names are protected at each of them too (effectiveProtectedPaths)
     "service-roots": literalInput(["gate"], serviceRootsProblem, "a JSON list of plain relative service folders"),
+    // the lockfile kinds per service and whether the licence scan reads them (final review fix round A, ruling 2): the licence check's coverage
+    "licence-lockfiles": literalInput(["gate"], licenceLockfilesProblem, "a JSON list of { service, lockfiles: [{ kind, read }] }"),
     // gate and nightly
     "block-from": modeInput(["gate", "nightly"], /^\$\{\{ vars\.PIPEGEN_BLOCK_FROM \}\}$/, "${{ vars.PIPEGEN_BLOCK_FROM }}"),
     "block-from-recorded": literalInput(["gate", "nightly"], (v) => validDate(v) === v ? null : "a real calendar date", "a real calendar date YYYY-MM-DD"),
@@ -7962,6 +7994,7 @@ var GATE_INPUTS = [
   "policy",
   "protected-paths",
   "service-roots",
+  "licence-lockfiles",
   "block-from",
   "block-from-recorded",
   "github-token",
@@ -8081,6 +8114,13 @@ function resolveSettings(raw, ctx) {
   } else if (jobList.some((e) => e.service !== void 0)) {
     errors.push("the service-roots input is missing while the job list has per-service checks: the config files each service folder holds could not be protected");
   }
+  let licenceLockfiles;
+  const ll = get("licence-lockfiles");
+  if (ll !== void 0) {
+    const p = licenceLockfilesProblem(ll);
+    if (p === null) licenceLockfiles = JSON.parse(ll).map((e) => ({ service: e.service, lockfiles: e.lockfiles.map((l) => ({ kind: l.kind, read: l.read })) }));
+    else errors.push(`the licence-lockfiles input is refused (it must be ${p})`);
+  }
   let extra = [];
   const pp = get("protected-paths");
   if (pp !== void 0) {
@@ -8119,6 +8159,7 @@ function resolveSettings(raw, ctx) {
     protectedPaths,
     protectedSections,
     serviceRoots,
+    ...licenceLockfiles === void 0 ? {} : { licenceLockfiles },
     secretsTools,
     sameRunTools,
     ...blockFrom === void 0 ? {} : { blockFrom },
@@ -8212,11 +8253,10 @@ function at2(o, ...path) {
   return v;
 }
 var sha402 = (v) => typeof v === "string" && SHA_RE5.test(v) ? v : void 0;
-var LICENCE_UNREADABLE = /* @__PURE__ */ new Set(["pnpm", "bun", "uv", "pip", "go"]);
-function licenceCoverage(kinds) {
-  if (kinds === void 0) return ["coverage per lockfile not known (the job list does not say which lockfiles the repository has)"];
-  if (kinds.length === 0) return ["not covered (no lockfile)"];
-  return [...new Set(kinds)].filter((k) => LICENCE_UNREADABLE.has(k)).sort().map((k) => `${k}: not covered (lockfile type)`);
+function licenceCoverage(list) {
+  if (list === void 0) return ["coverage per lockfile not known (the gate step has no licence-lockfiles input)"];
+  if (list.length === 0) return ["not covered (no lockfile)"];
+  return [...new Set(list.flatMap((e) => e.lockfiles.length === 0 ? [`${e.service}: not covered (no lockfile)`] : e.lockfiles.filter((l) => !l.read).map((l) => `${e.service}: ${l.kind}: not covered (lockfile type)`)))];
 }
 function repoOf(payload, repository) {
   const r = at2(payload, "repository");
@@ -8354,7 +8394,7 @@ async function gatherGateInput(ctx, client, io) {
   if (marker.note !== void 0) notes.push(marker.note);
   const mode = decideMode(settings.blockFrom, settings.blockFromRecorded, ctx.now, marker.state === "seen" ? true : marker.state === "none" ? false : "unknown");
   notes.push(mode.why);
-  const coverage = settings.jobList.filter((e) => e.category === "licences").flatMap((e) => licenceCoverage(ctx.lockfileKinds).map((text) => ({ job: e.job, text })));
+  const coverage = settings.jobList.filter((e) => e.category === "licences").flatMap((e) => licenceCoverage(settings.licenceLockfiles).map((text) => ({ job: e.job, text })));
   notes.push(...ctx.clientNotes ?? []);
   return {
     event,

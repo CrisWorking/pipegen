@@ -18,7 +18,8 @@ import { resultArtifactName } from '../../src/engine/artifact-names.js';
 import { jobIdFor, type JobListEntry } from '../../src/engine/gate-job-list.js';
 import { NEED_ID_CATEGORY } from '../../src/engine/need-ids.js';
 import { effectiveProtectedPaths } from '../../src/engine/protected-paths.js';
-import { idListProblem, JOB_LIST_KEYS, jobListLiteralProblem, pathListProblem, serviceRootsProblem } from '../../src/engine/tool-flags.js';
+import type { LicenceLockfiles } from '../../src/engine/licence-lockfiles.js';
+import { idListProblem, JOB_LIST_KEYS, jobListLiteralProblem, licenceLockfilesProblem, pathListProblem, serviceRootsProblem } from '../../src/engine/tool-flags.js';
 import { FLOOR_NEEDS, PROTECTED_SECTIONS_BASE, type ReviewedTool } from '../../src/types.js';
 import { safeText } from '../../src/util/safe-text.js';
 import { validDate } from './date.js';
@@ -56,9 +57,9 @@ const SAME_RUN_CATEGORIES = new Set(['deps', 'image-scan', 'dependency-review', 
 
 // ---------- the inputs ----------
 
-/** The inputs of the gate step in mode `gate` (the RENDERER_INPUTS row, ruling B3, plus `service-roots` of C5a). */
+/** The inputs of the gate step in mode `gate` (the RENDERER_INPUTS row, ruling B3, plus `service-roots` of C5a and `licence-lockfiles` of the final review's fix round A). */
 export const GATE_INPUTS = [
-  'mode', 'jobs', 'job-list', 'not-proven', 'skipped', 'policy', 'protected-paths', 'service-roots', 'block-from', 'block-from-recorded', 'github-token', 'fp-key',
+  'mode', 'jobs', 'job-list', 'not-proven', 'skipped', 'policy', 'protected-paths', 'service-roots', 'licence-lockfiles', 'block-from', 'block-from-recorded', 'github-token', 'fp-key',
 ] as const;
 export type GateInputName = (typeof GATE_INPUTS)[number];
 /** toJSON(needs) of a gate job is small (outputs are short texts); a bigger one is not GitHub's. */
@@ -91,6 +92,8 @@ export interface GateSettings {
   /** PROTECTED_SECTIONS_BASE + every configSections of the built-in list. */
   protectedSections: string[];
   serviceRoots: string[];
+  /** The `licence-lockfiles` literal (fix round A, ruling 2): per service, each lockfile kind and whether the licence scan reads it. Undefined when unset or refused. */
+  licenceLockfiles?: LicenceLockfiles[];
   secretsTools: string[];
   sameRunTools: string[];
   /** PIPEGEN_BLOCK_FROM when it is a real date; undefined when unset or not a date (noted). */
@@ -208,6 +211,14 @@ export function resolveSettings(raw: Readonly<Record<string, string | undefined>
   } else if (jobList.some((e) => e.service !== undefined)) {
     errors.push('the service-roots input is missing while the job list has per-service checks: the config files each service folder holds could not be protected');
   }
+  // the licence check's lockfiles (fix round A, ruling 2): read for its coverage texts only, never to make a check pass
+  let licenceLockfiles: LicenceLockfiles[] | undefined;
+  const ll = get('licence-lockfiles');
+  if (ll !== undefined) {
+    const p = licenceLockfilesProblem(ll);
+    if (p === null) licenceLockfiles = (JSON.parse(ll) as LicenceLockfiles[]).map((e) => ({ service: e.service, lockfiles: e.lockfiles.map((l) => ({ kind: l.kind, read: l.read })) }));
+    else errors.push(`the licence-lockfiles input is refused (it must be ${p})`);
+  }
   let extra: string[] = [];
   const pp = get('protected-paths');
   if (pp !== undefined) {
@@ -247,7 +258,7 @@ export function resolveSettings(raw: Readonly<Record<string, string | undefined>
   const fpKey = get('fp-key');
 
   return {
-    jobList, floorNeeds, policy, notProven, skipped, protectedPaths, protectedSections, serviceRoots, secretsTools, sameRunTools,
+    jobList, floorNeeds, policy, notProven, skipped, protectedPaths, protectedSections, serviceRoots, ...(licenceLockfiles === undefined ? {} : { licenceLockfiles }), secretsTools, sameRunTools,
     ...(blockFrom === undefined ? {} : { blockFrom }), ...(blockFromRecorded === undefined ? {} : { blockFromRecorded }),
     needs, token, ...(fpKey === undefined ? {} : { fpKey }), errors, notes,
   };

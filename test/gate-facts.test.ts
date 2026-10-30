@@ -51,7 +51,7 @@ interface Art { id: number; name: string; runId: number; size?: number; zip: Uin
 interface World {
   event: string; sha: string; payload: Record<string, unknown>; list: JobListEntry[]; needs: Record<string, unknown>; arts: Art[];
   inputs: Record<string, string | undefined>; compare: Map<string, unknown>; files: unknown[]; reviews: unknown[];
-  pull: Record<string, unknown>; contents: Map<string, unknown>; runs: unknown[]; now: Date; lockfileKinds?: string[];
+  pull: Record<string, unknown>; contents: Map<string, unknown>; runs: unknown[]; now: Date;
   /** GET /commits/{sha} answers (C5b Part 0: the merge commit's parents). */
   commits: Map<string, unknown>;
 }
@@ -152,7 +152,6 @@ function ioOf(w: World, gh: FakeGh): GateIo & { zips: number[]; lists: string[] 
 }
 const ctxOf = (w: World): GateContext => ({
   inputs: w.inputs, env: { eventName: w.event, sha: w.sha, runId: String(RUN), repository: 'acme/app' }, now: w.now, reviewed: VIEW,
-  ...(w.lockfileKinds === undefined ? {} : { lockfileKinds: w.lockfileKinds }),
 });
 async function gather(w: World): Promise<{ input: GateInput; gh: FakeGh; io: ReturnType<typeof ioOf> }> {
   const gh = new FakeGh(w);
@@ -387,11 +386,13 @@ describe('gatherGateInput: a SettingsError when the event itself can not be trus
 // ---------- licence coverage (C2 review m8, G11) ----------
 
 describe('licence coverage: lockfile types trivy can not read are "not covered (lockfile type)", never clean', () => {
-  it('licenceCoverage: pnpm, bun, uv, pip and go are not covered; npm, yarn and poetry are; no lockfile is "not covered (no lockfile)"', () => {
-    expect(licenceCoverage(['npm', 'yarn', 'poetry'])).toEqual([]);
-    expect(licenceCoverage(['npm', 'pnpm', 'uv'])).toEqual(['pnpm: not covered (lockfile type)', 'uv: not covered (lockfile type)']);
+  it('licenceCoverage (fix round A): from the licence-lockfiles input, each kind that is not read, and a service with no lockfile, is "not covered"; a read kind adds nothing', () => {
+    expect(licenceCoverage([{ service: 'web', lockfiles: [{ kind: 'npm', read: true }] }])).toEqual([]);
+    expect(licenceCoverage([{ service: 'web', lockfiles: [{ kind: 'npm', read: true }] }, { service: 'api', lockfiles: [{ kind: 'pnpm', read: false }, { kind: 'go', read: false }] }]))
+      .toEqual(['api: pnpm: not covered (lockfile type)', 'api: go: not covered (lockfile type)']);
+    expect(licenceCoverage([{ service: 'docs', lockfiles: [] }])).toEqual(['docs: not covered (no lockfile)']);
     expect(licenceCoverage([])).toEqual(['not covered (no lockfile)']);
-    expect(licenceCoverage(undefined)).toEqual(['coverage per lockfile not known (the job list does not say which lockfiles the repository has)']);
+    expect(licenceCoverage(undefined)).toEqual(['coverage per lockfile not known (the gate step has no licence-lockfiles input)']);
   });
   it('the facts carry it for the licences check, and the summary shows it on that check (its state is never only "no findings")', async () => {
     const w = world();
@@ -401,9 +402,9 @@ describe('licence coverage: lockfile types trivy can not read are "not covered (
     w.list.push(lic);
     w.needs[lic.job] = { result: 'success', outputs: { [`${lic.artifact}-sha256`]: sha256(clean), [`${lic.artifact}-status`]: 'ok' } };
     Object.assign(out(w, 'base-scan'), { [`${lic.baseArtifact}-sha256`]: sha256(clean), [`${lic.baseArtifact}-status`]: 'ok' });
-    w.lockfileKinds = ['npm', 'uv'];
+    w.inputs['licence-lockfiles'] = JSON.stringify([{ service: 'app', lockfiles: [{ kind: 'npm', read: true }] }, { service: 'api', lockfiles: [{ kind: 'uv', read: false }] }]);
     const { input } = await gather(sync(w));
-    expect(input.coverage).toEqual([{ job: 'licences', text: 'uv: not covered (lockfile type)' }]);
+    expect(input.coverage).toEqual([{ job: 'licences', text: 'api: uv: not covered (lockfile type)' }]);
     const r = decideGate(input);
     expect(r.checks.find((c) => c.job === 'licences')?.state).toMatch(/not covered \(lockfile type\)/);
     expect(r.summary).toMatch(/uv: not covered \(lockfile type\)/);

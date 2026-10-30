@@ -8,11 +8,15 @@
 //   - `job-list` is jobListLiteral(gateJobList(draft));
 //   - `service-roots` is every service folder of draft.profile (always written: an empty list when there is none);
 //   - `skipped` from draft.skipped (the parts skipped with --skip, as need ids: SKIPPED_PART_NEEDS), `not-proven` from draft.notProven;
-//   - `block-from-recorded`, `policy` and `protected-paths` from draft.gateSettings.
+//   - `block-from-recorded`, `policy` and `protected-paths` from draft.gateSettings;
+//   - `licence-lockfiles` (ruling 2), when the job list has a licences check: per service of the profile, each lockfile kind it found and
+//     whether Trivy's licence scan reads it (licence-lockfiles.ts, a reviewed table), so the gate says "not covered", never "clean".
 // An input with nothing to say is not written. Every value is checked with the gate row of RENDERER_INPUTS (the schemas the gate parses
 // with), and the floor rules the gate enforces are applied here too, so a draft the gate would refuse fails at render time (GateJobListError).
 import { FLOOR_NEEDS, type PipelineDraft, type SkippablePart } from '../types.js';
 import { gateJobList, GateJobListError, jobListLiteral, type GateJobListOptions } from './gate-job-list.js';
+import { ArtifactNameError, slug } from './artifact-names.js';
+import { licenceRead, type LicenceLockfiles, type LockfileKind } from './licence-lockfiles.js';
 import { NEED_ID_CATEGORY } from './need-ids.js';
 import { PIPEGEN_GATE_USES, rendererInputProblems } from './tool-flags.js';
 
@@ -21,7 +25,7 @@ export const GATE_STEP_EXPRESSIONS: Readonly<Record<string, string>> = Object.fr
   mode: 'gate', jobs: '${{ toJSON(needs) }}', 'block-from': '${{ vars.PIPEGEN_BLOCK_FROM }}', 'github-token': '${{ secrets.GITHUB_TOKEN }}', 'fp-key': '${{ secrets.PIPEGEN_FP_KEY }}',
 });
 /** The gate step inputs whose value is a JSON literal (the referee compares them as parsed JSON; the others as text). */
-export const GATE_JSON_INPUTS: ReadonlySet<string> = new Set(['job-list', 'not-proven', 'skipped', 'policy', 'protected-paths', 'service-roots']);
+export const GATE_JSON_INPUTS: ReadonlySet<string> = new Set(['job-list', 'not-proven', 'skipped', 'policy', 'protected-paths', 'service-roots', 'licence-lockfiles']);
 
 /**
  * The need ids a part skipped with `--skip` stands for, as the gate's `skipped` input lists them (a listed one is shown as skipped and never
@@ -44,11 +48,28 @@ export function serviceRootsOf(draft: PipelineDraft): string[] {
 }
 
 /**
+ * The `licence-lockfiles` value: per service of the profile (its slug, in order), each lockfile kind the reader found (its package manager, then
+ * `go` for a go.mod: the service's language or alsoLanguages) and whether the licence scan as pipegen renders it reads that kind (licenceRead).
+ * A service with none has an empty list (the gate shows "not covered (no lockfile)").
+ */
+export function licenceLockfilesOf(draft: PipelineDraft): LicenceLockfiles[] {
+  return draft.profile.services.map((s) => {
+    const kinds: LockfileKind[] = [];
+    if (s.packageManager !== undefined) kinds.push(s.packageManager);
+    if ((s.language === 'go' || (s.alsoLanguages ?? []).includes('go')) && !kinds.includes('go')) kinds.push('go');
+    let service: string;
+    try { service = slug(s.name); } catch (e) { if (e instanceof ArtifactNameError) throw new GateJobListError(e.message); throw e; }
+    return { service, lockfiles: kinds.map((kind) => ({ kind, read: licenceRead(kind) })) };
+  });
+}
+
+/**
  * Every input of the gate step in mode `gate`, by name, for this draft (see the header). Throws GateJobListError when the job list can not be
  * made or a value would be refused by the gate (a floor need not proven, a bad date, a service folder that is not a plain relative folder).
  */
 export function gateStepInputs(draft: PipelineDraft, opts: GateJobListOptions = {}): Record<string, string> {
-  const filled: Record<string, string> = { mode: GATE_STEP_EXPRESSIONS.mode as string, jobs: GATE_STEP_EXPRESSIONS.jobs as string, 'job-list': jobListLiteral(gateJobList(draft, opts)) };
+  const list = gateJobList(draft, opts);
+  const filled: Record<string, string> = { mode: GATE_STEP_EXPRESSIONS.mode as string, jobs: GATE_STEP_EXPRESSIONS.jobs as string, 'job-list': jobListLiteral(list) };
   const notProven = unique(draft.notProven.flatMap((n) => (typeof n.needId === 'string' ? [n.needId] : [])));
   const floor = notProven.filter(isFloorNeed);
   if (floor.length > 0) throw new GateJobListError(`The draft marks the floor check ${floor.join(', ')} as not proven, but a floor check is always required (the gate would block).`);
@@ -59,6 +80,7 @@ export function gateStepInputs(draft: PipelineDraft, opts: GateJobListOptions = 
   if (settings.policy !== undefined) filled.policy = JSON.stringify({ block: settings.policy.block, warn: settings.policy.warn });
   if (settings.protectedPaths !== undefined && settings.protectedPaths.length > 0) filled['protected-paths'] = JSON.stringify(settings.protectedPaths);
   filled['service-roots'] = JSON.stringify(serviceRootsOf(draft));
+  if (list.some((e) => e.category === 'licences')) filled['licence-lockfiles'] = JSON.stringify(licenceLockfilesOf(draft));
   filled['block-from'] = GATE_STEP_EXPRESSIONS['block-from'] as string;
   if (settings.blockFromRecorded !== undefined) filled['block-from-recorded'] = settings.blockFromRecorded;
   filled['github-token'] = GATE_STEP_EXPRESSIONS['github-token'] as string;

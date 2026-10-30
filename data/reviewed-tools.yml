@@ -1215,7 +1215,10 @@ tools:
     reviewedAt: "2026-10-30"
     proofs: 0
 
-  # Trivy licence scan of the dependencies (catalogue §3): blocks on HIGH and CRITICAL licence findings. Same binary as trivy-config.
+  # Trivy licence scan of the dependencies (catalogue §3). Same binary as trivy-config. It reports EVERY severity (ruling S9, Plan C final review
+  #   fix round A, delegated review DECISIONS 105, 2026-10-30): no --severity, so Unknown licences reach the SARIF (G11: HIGH,CRITICAL hid all 6
+  #   on the DoD repos). The gate judges by severity: Forbidden (CRITICAL) and Restricted (HIGH) block, an Unknown licence is a warning that
+  #   needs a human. Any licence finding exits 10 (findingsExit); 1 stays trivy's error exit.
   # Source: release v0.76.0 of aquasecurity/trivy: trivy_0.76.0_Linux-64bit.tar.gz sha256 from the release checksums file. Released 2026-10-14T11:45:44Z.
   # Signature: pipegen's pinned cosign 3.1.3 ran `cosign verify-blob --bundle trivy_0.76.0_checksums.txt.sigstore.json
   #   --certificate-identity https://github.com/aquasecurity/trivy/.github/workflows/reusable-release.yaml@refs/tags/v0.76.0
@@ -1238,10 +1241,10 @@ tools:
     step:
       cli:
         install: { method: github-release, package: "trivy_0.76.0_Linux-64bit.tar.gz", version: "v0.76.0" }
-        command: ["trivy", "fs", "--disable-telemetry", "--skip-version-check", "--skip-check-update", "--scanners", "license", "--severity", "HIGH,CRITICAL", "--format", "sarif", "--output", "trivy-licence.sarif", "--exit-code", "10", "."]
+        command: ["trivy", "fs", "--disable-telemetry", "--skip-version-check", "--skip-check-update", "--scanners", "license", "--format", "sarif", "--output", "trivy-licence.sarif", "--exit-code", "10", "."]
       output: { path: "trivy-licence.sarif", format: sarif }
     fixedInputs:
-      args: ["--disable-telemetry", "--skip-version-check", "--skip-check-update", "--scanners", "license", "--severity", "HIGH,CRITICAL", "--format", "sarif", "--output", "trivy-licence.sarif", "--exit-code", "10"]
+      args: ["--disable-telemetry", "--skip-version-check", "--skip-check-update", "--scanners", "license", "--format", "sarif", "--output", "trivy-licence.sarif", "--exit-code", "10"]
       config:
         content: "# pipegen's pinned trivy config: no cache kept between runs, and no repository trivy-secret.yaml (an empty path loads none)\ncache:\n  backend: memory\nsecret:\n  config: \"\"\n"
         passAs: { flag: "--config" }

@@ -50,6 +50,9 @@ inputs:
   service-roots:
     description: "gate: the service folders, as a JSON list."
     required: false
+  licence-lockfiles:
+    description: "gate: per service, each lockfile kind and whether the licence scan reads it, as a JSON list (the licence check's coverage)."
+    required: false
   block-from:
     description: "gate, nightly: the PIPEGEN_BLOCK_FROM variable."
     required: false

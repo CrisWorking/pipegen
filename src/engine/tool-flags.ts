@@ -7,6 +7,7 @@ import { createHash } from 'node:crypto';
 import { NEED_CATEGORIES, RESULT_ARTIFACT_PREFIX } from '../types.js';
 import { BASELINE_ARTIFACT, CLEAN_RUN_ARTIFACT, GATE_RESULT_ARTIFACT } from './artifact-names.js';
 import type { SlotKind } from './slots.js';
+import { isLockfileKind, TRIVY_LICENCE_LOCKFILES } from './licence-lockfiles.js';
 // the gate's policy rule (C2): a leaf that imports only types.ts, so the engine and the gate check a policy with one function
 import { policyProblem as gatePolicyProblem } from '../../gate/src/policy-default.js';
 import { validDate } from '../../gate/src/date.js';
@@ -679,6 +680,27 @@ export function serviceRootsProblem(text: string): string | null {
   return list.every((x) => typeof x === 'string' && SERVICE_ROOT_RE.test(x) && !x.includes('//')) ? null : 'a JSON list of plain relative folders (or .), no glob, no .., no leading /';
 }
 
+/**
+ * Why a text is not the gate's `licence-lockfiles` (final review fix round A, ruling 2), or null: a JSON list of at most 100 entries
+ * `{ "service": <slug>, "lockfiles": [{ "kind": <lockfile kind>, "read": <boolean> }] }` (at most 4 lockfiles each, known keys only). A kind
+ * Trivy's licence scan never reads (TRIVY_LICENCE_LOCKFILES) can never be marked read. The gate parses the input with it too.
+ */
+export function licenceLockfilesProblem(text: string): string | null {
+  const list = parseJson(text);
+  const shape = 'a JSON list of at most 100 { "service", "lockfiles": [{ "kind", "read" }] } entries';
+  if (!Array.isArray(list) || list.length > 100) return shape;
+  for (const e of list) {
+    if (!isPlainObject(e) || Object.keys(e).sort().join() !== 'lockfiles,service') return shape;
+    if (typeof e.service !== 'string' || e.service.length > 40 || !SERVICE_SLUG_RE.test(e.service)) return `${shape}, each service a service slug`;
+    if (!Array.isArray(e.lockfiles) || e.lockfiles.length > 4) return `${shape}, at most 4 lockfiles each`;
+    for (const l of e.lockfiles as unknown[]) {
+      if (!isPlainObject(l) || Object.keys(l).sort().join() !== 'kind,read' || !isLockfileKind(l.kind) || typeof l.read !== 'boolean') return `${shape}, each lockfile a known kind (${Object.keys(TRIVY_LICENCE_LOCKFILES).join(', ')}) with read true or false`;
+      if (l.read && TRIVY_LICENCE_LOCKFILES[l.kind].licences === 'never') return `${shape}; a ${l.kind} lockfile is never read by the licence scan`;
+    }
+  }
+  return null;
+}
+
 // the job list literal (rulings B4 and S4): the shape of one entry, kept here so the gate row can check it; gate-job-list.ts builds it
 const NEED_ID_TEXT_RE = /^(?!base-)(?!.*--)[a-z0-9][a-z0-9-]{0,63}$/;
 const JOB_ID_TEXT_RE = /^[A-Za-z_][A-Za-z0-9_-]{0,99}$/;
@@ -806,6 +828,8 @@ export const RENDERER_INPUTS: Readonly<Record<string, Readonly<Record<string, Re
     'protected-paths': literalInput(['gate'], pathListProblem, 'a JSON list of plain relative path globs'),
     // the service folders (C5a CF3): the root-scoped config names are protected at each of them too (effectiveProtectedPaths)
     'service-roots': literalInput(['gate'], serviceRootsProblem, 'a JSON list of plain relative service folders'),
+    // the lockfile kinds per service and whether the licence scan reads them (final review fix round A, ruling 2): the licence check's coverage
+    'licence-lockfiles': literalInput(['gate'], licenceLockfilesProblem, 'a JSON list of { service, lockfiles: [{ kind, read }] }'),
     // gate and nightly
     'block-from': modeInput(['gate', 'nightly'], /^\$\{\{ vars\.PIPEGEN_BLOCK_FROM \}\}$/, '${{ vars.PIPEGEN_BLOCK_FROM }}'),
     'block-from-recorded': literalInput(['gate', 'nightly'], (v) => (validDate(v) === v ? null : 'a real calendar date'), 'a real calendar date YYYY-MM-DD'),

@@ -15,7 +15,7 @@
 //   5. Integrity, on a pull request event only: the base's install state (baseHasInstall), CODEOWNERS of the BASE commit, and only then the
 //      pull request context (approvals are filtered by those code owners, C4 r1), the shared config sections, the findings.
 //   6. The trusted baseline (C3 loadBaseline), then the clean-run marker (cleanRunSeen) and the mode (decideMode).
-// The licence check's coverage per lockfile type (G11) is added as `coverage`, never as "clean".
+// The licence check's coverage per lockfile type (G11; the `licence-lockfiles` input, fix round A) is added as `coverage`, never as "clean".
 //
 // Which runs may decide a merge (fix round 1, I2): pull_request, pull_request_review (the approval re-run), merge_group and a push to the
 // default branch. Any other run (a push to another branch or a tag, workflow_dispatch, schedule, pull_request_target, …) sees no pull request
@@ -37,6 +37,7 @@ import { baseHasInstall, buildPrDiff, integrityFindings, loadCodeowners, readCon
 import { decideMode } from './mode.js';
 import { mapJobs, resolveSettings, type GateToolView } from './settings.js';
 import type { ScrubFormat } from './scrub.js';
+import type { LicenceLockfiles } from '../../src/engine/licence-lockfiles.js';
 import type { Finding } from '../../src/types.js';
 
 export interface GateContext {
@@ -47,8 +48,6 @@ export interface GateContext {
   now: Date;
   /** The built-in reviewed list's gate view. */
   reviewed: readonly GateToolView[];
-  /** The package managers of the repository's services, when the job list says (Plan G): for the licence check's coverage. */
-  lockfileKinds?: readonly string[];
   /** Notes the client adds while reading (rate limits): read at the end and passed on. */
   clientNotes?: readonly string[];
 }
@@ -89,15 +88,15 @@ function at(o: unknown, ...path: string[]): unknown {
 const sha40 = (v: unknown): string | undefined => (typeof v === 'string' && SHA_RE.test(v) ? v : undefined);
 
 /**
- * Lockfile types whose licences trivy can not read without installed packages (the G11 measurement, trivy 0.76.0): pnpm-lock, bun.lock,
- * uv.lock, requirements.txt and go.mod. Their licence check covers nothing.
+ * The licence check's coverage texts (G11, final review fix round A ruling 2), from the `licence-lockfiles` input: per service, every lockfile
+ * kind the licence scan does not read is "<service>: <kind>: not covered (lockfile type)", and a service with no lockfile is "<service>: not
+ * covered (no lockfile)". A kind that is read adds nothing. Unset input: coverage not known. The texts are only ever added to the check's
+ * state (never "clean"); they never make a check pass.
  */
-const LICENCE_UNREADABLE: ReadonlySet<string> = new Set(['pnpm', 'bun', 'uv', 'pip', 'go']);
-/** The licence check's coverage texts for the repository's lockfile types (package managers). */
-export function licenceCoverage(kinds: readonly string[] | undefined): string[] {
-  if (kinds === undefined) return ['coverage per lockfile not known (the job list does not say which lockfiles the repository has)'];
-  if (kinds.length === 0) return ['not covered (no lockfile)'];
-  return [...new Set(kinds)].filter((k) => LICENCE_UNREADABLE.has(k)).sort().map((k) => `${k}: not covered (lockfile type)`);
+export function licenceCoverage(list: readonly LicenceLockfiles[] | undefined): string[] {
+  if (list === undefined) return ['coverage per lockfile not known (the gate step has no licence-lockfiles input)'];
+  if (list.length === 0) return ['not covered (no lockfile)'];
+  return [...new Set(list.flatMap((e) => (e.lockfiles.length === 0 ? [`${e.service}: not covered (no lockfile)`] : e.lockfiles.filter((l) => !l.read).map((l) => `${e.service}: ${l.kind}: not covered (lockfile type)`))))];
 }
 
 /** The repository of this run, from the payload, checked against GITHUB_REPOSITORY (a text: why not). The action's baseline-check mode reads it too. */
@@ -246,7 +245,7 @@ export async function gatherGateInput(ctx: GateContext, client: GateGithub, io: 
   notes.push(mode.why);
 
   // the licence check's coverage per lockfile type
-  const coverage = settings.jobList.filter((e) => e.category === 'licences').flatMap((e) => licenceCoverage(ctx.lockfileKinds).map((text) => ({ job: e.job, text })));
+  const coverage = settings.jobList.filter((e) => e.category === 'licences').flatMap((e) => licenceCoverage(settings.licenceLockfiles).map((text) => ({ job: e.job, text })));
   notes.push(...(ctx.clientNotes ?? []));
 
   return {
