@@ -1,6 +1,6 @@
 # pipegen's gate action (Plan C). One action, one mode per step. pipegen's renderer sets every input, and RENDERER_INPUTS
 # (src/engine/tool-flags.ts) checks each one. A test keeps these inputs equal to that row. No input has a default.
-# The bundle dist/index.js is built in C6.
+# The bundle dist/index.js is generated and committed (npm run build:gate; CI job gate-dist checks it is fresh).
 name: pipegen gate
 description: Scrubs scanner results, stages the checkout for the secrets scan, decides pass, warn or block, and looks up the trusted baseline.
 author: CrisWorking

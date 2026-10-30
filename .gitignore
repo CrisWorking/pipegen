@@ -1,4 +1,6 @@
 node_modules/
 dist/
+# the gate action's bundle is committed: GitHub runs it as is (CI's gate-dist job checks it is fresh)
+!/gate/dist/
 .dev-dist/
 .build/

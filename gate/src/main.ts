@@ -21,7 +21,6 @@ import { randomUUID } from 'node:crypto';
 import { accessSync, chmodSync, closeSync, constants, fstatSync, lstatSync, mkdirSync, openSync, readSync, renameSync, unlinkSync, writeFileSync, writeSync } from 'node:fs';
 import { basename, dirname, isAbsolute, join } from 'node:path';
 import { GATE_UPLOAD_FILES, isStagedTool } from '../../src/engine/tool-flags.js';
-import { loadReviewed } from '../../src/engine/reviewed.js';
 import { safeMarkdown, safeText } from '../../src/util/safe-text.js';
 import { keyProblem } from './fingerprint.js';
 import { buildCleanRunMarker, loadBaseline, saveBaseline, type ArtifactUploader, type BaselineCheck } from './baseline.js';
@@ -29,7 +28,8 @@ import { decideGate, type DecidedFinding, type GateInput, type GateResult } from
 import { gatherGateInput, repoOf, type GateIo } from './facts.js';
 import { githubAdapter, type AdapterOptions, type GateGithubAdapter } from './github-adapter.js';
 import { scrubFile, type ScrubFileResult } from './scrub.js';
-import { GATE_INPUTS, gateToolView, type GateToolView } from './settings.js';
+import { GATE_VIEW } from './generated/gate-view.js';
+import { GATE_INPUTS, type GateToolView } from './settings.js';
 import { stageWorkspace } from './stage.js';
 
 /** The inputs of each mode (the RENDERER_INPUTS gate row split by mode; a test keeps them equal). Any other input is refused. */
@@ -582,7 +582,7 @@ async function runBaselineCheck(step: Step, deps: MainDeps, get: (n: string) => 
 
 // ---------- the reviewed view ----------
 
-/** The built-in list's gate view. C6 bundles the generated gate view instead (ruling S5); until then it is derived from the shipped list. */
+/** The built-in list's gate view: generated at build time (scripts/gate-view.ts, ruling S5), never read from disk at run time. */
 function defaultReviewed(): readonly GateToolView[] {
-  return gateToolView(loadReviewed());
+  return GATE_VIEW;
 }
