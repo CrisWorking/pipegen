@@ -65,9 +65,15 @@ export const HISTORY_CHECK_CAP = 20;
  * The clean-run marker is looked for in the newest MARKER_WINDOW field-valid runs only (fix round 2). A search that finishes without
  * error and finds none is `none`, whatever the window or the page budget was used up by: normal green pushes without a marker must
  * not push the repo out of warn mode. C5 re-writes the marker on every trusted green push once block mode has been reached through a
- * clean run, so the window always holds one. Worst case: 5 run-list pages + tag + tip + 10 x (compare + artifact list + download) = 37.
+ * clean run, so the window always holds one. Worst case: see HISTORY_FAIL_CAP (40).
  */
 export const MARKER_WINDOW = 10;
+/**
+ * Only TRUSTED runs count toward the window (fix round 3): runs that look valid but fail the default-history check never use it up.
+ * They have their own cap: reaching it is an anomaly (unknown). Worst case per marker lookup, now:
+ * 5 pages + tag + tip + 3 x MARKER_WINDOW (compare, artifact list, download) + HISTORY_FAIL_CAP compares = 40.
+ */
+export const HISTORY_FAIL_CAP = 3;
 /** The cap on the artifact (as listed) and on the file inside it. */
 export const MAX_ARTIFACT_BYTES = 8 * 1024 * 1024;
 export const MAX_COUNT_ENTRIES = 200_000;
@@ -358,8 +364,8 @@ type Use<T> = (input: { bytes: Uint8Array } | { problem: string }, meta: Artifac
  * could not tell (an API error, a malformed answer, a cap, a tag named like the default branch).
  */
 async function walk<T>(gh: GateGithub, repo: RepoRef, ctx: VerifyContext, artifactName: string, use: Use<T>, notes: string[], st: WalkState, window?: number): Promise<T | undefined> {
-  // `window` (the marker): only the newest `window` field-valid runs are looked at; using it up is a normal end (none), not a cap
-  const budget = { left: window ?? HISTORY_CHECK_CAP };
+  // `window` (the marker): only the newest `window` TRUSTED runs are looked at; a full window is a normal end (none). A list cut at the page cap before the window is full is NOT a finished search (unknown)
+  const budget = { left: window === undefined ? HISTORY_CHECK_CAP : window + HISTORY_FAIL_CAP };
   const lk: Lookup = {};
   let historyFails = 0;
   let windowFull = false;
@@ -376,12 +382,16 @@ async function walk<T>(gh: GateGithub, repo: RepoRef, ctx: VerifyContext, artifa
     if (runs === undefined) { notes.push('the list of workflow runs is not a list'); st.incomplete = true; return undefined; }
     const ordered = runs.filter((r): r is Record<string, unknown> => isPlain(r) && posInt(own(r, 'id'))).sort((x, y) => (own(y, 'id') as number) - (own(x, 'id') as number));
     for (const r of ordered) {
+      if (window !== undefined && trustedSeen >= window) { windowFull = true; break; }
       if (own(r, 'conclusion') !== 'success') { notSuccess++; continue; }
       const j = await judgeRun(gh, r, repo, budget, lk);   // an untrusted run is invisible: no artifact call, no trusted-run budget
       if (!j.ok) {
         if (j.why === 'untrusted') continue;
-        if (j.why === 'history') { historyFails++; continue; }
-        if (j.why === 'cap' && window !== undefined) { windowFull = true; break; }
+        if (j.why === 'history') {
+          historyFails++;
+          if (window !== undefined && historyFails >= HISTORY_FAIL_CAP) { notes.push(`${historyFails} runs look valid but fail the default-history check (cap ${HISTORY_FAIL_CAP})`); st.incomplete = true; return undefined; }
+          continue;
+        }
         st.incomplete = true;
         notes.push(j.why === 'tag' ? `a tag named ${repo.defaultBranch} exists; no run is trusted until it is deleted`
           : j.why === 'cap' ? `more than ${HISTORY_CHECK_CAP} runs needed a default-history check (cap)` : 'the default history of a run could not be checked');
@@ -408,11 +418,12 @@ async function walk<T>(gh: GateGithub, repo: RepoRef, ctx: VerifyContext, artifa
       const x = use({ bytes }, meta, st);
       if (x !== undefined) return x;
     }
+    if (window !== undefined && trustedSeen >= window) windowFull = true;
     if (windowFull || runs.length < RUNS_PER_PAGE) { exhausted = false; break; }
   }
   // the marker window: a finished search is a normal end, except a window with history failures and no trusted run (an anomaly)
   if (window !== undefined && trustedSeen === 0 && historyFails > 0) { notes.push(`${historyFails} run${historyFails === 1 ? '' : 's'} look valid but fail the default-history check, and none passes`); st.incomplete = true; }
-  if (exhausted && window === undefined) { notes.push(`the run list was cut after ${MAX_RUN_PAGES} pages`); st.incomplete = true; }
+  if (exhausted) { notes.push(`the run list was cut after ${MAX_RUN_PAGES} pages`); st.incomplete = true; }
   if (expired > 0 && notes.length === 0) notes.push(`the ${artifactName} artifact has expired`);
   if (notSuccess > 0) notes.push(`${notSuccess} run${notSuccess === 1 ? '' : 's'} did not have conclusion success (a red main does not refresh the baseline)`);
   return undefined;

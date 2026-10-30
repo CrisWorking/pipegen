@@ -7,7 +7,7 @@ import { describe, expect, it } from 'vitest';
 import { BASELINE_ARTIFACT, CLEAN_RUN_ARTIFACT } from '../src/engine/artifact-names.js';
 import {
   buildBaseline, buildCleanRunMarker, cleanRunSeen, inDefaultHistory, loadBaseline, saveBaseline, trustedRun, verifyBaselineArtifact, verifyCleanRunArtifact,
-  BASELINE_RETENTION_DAYS, HISTORY_CHECK_CAP, MARKER_WINDOW, MAX_COUNT_ENTRIES, MAX_RUN_PAGES, MAX_TRUSTED_RUNS, WORKFLOW_PATH, type ArtifactMeta, type ArtifactUploader, type GateGithub, type RepoRef, type RunQuery, type VerifyContext,
+  BASELINE_RETENTION_DAYS, HISTORY_CHECK_CAP, HISTORY_FAIL_CAP, MARKER_WINDOW, MAX_COUNT_ENTRIES, MAX_RUN_PAGES, MAX_TRUSTED_RUNS, WORKFLOW_PATH, type ArtifactMeta, type ArtifactUploader, type GateGithub, type RepoRef, type RunQuery, type VerifyContext,
 } from '../gate/src/baseline.js';
 import { countKeyOf } from '../gate/src/decide.js';
 import { keyId } from '../gate/src/fingerprint.js';
@@ -1027,10 +1027,10 @@ describe('fix round 1: minors', () => {
 });
 
 describe('fix round 1: a run list cut at the page cap', () => {
-  it('a full last page means the list was cut: the baseline note says so; the marker lookup is none (a page budget used up by normal runs, fix round 2)', async () => {
+  it('a full last page with no full window means the list was cut: the baseline note says so; the marker lookup is unknown (fix round 3)', async () => {
     const flood = Array.from({ length: MAX_RUN_PAGES * 100 + 50 }, (_, i) => run({ id: 90000 - i, event: 'pull_request', head_repository: { id: 8 } }));
     const gm = world([], flood, []);
-    expect((await cleanRunSeen(gm, REPO, CTX)).state).toBe('none');
+    expect((await cleanRunSeen(gm, REPO, CTX)).state).toBe('unknown');   // fix round 3: cut before a full window is not a finished search
     const gb = world([], flood, []);
     expect((await loadBaseline(gb, REPO, CTX)).note).toMatch(/cut after/);
   });
@@ -1093,7 +1093,7 @@ describe('fix round 2 (R1-I1): a finished marker search finds none, not unknown'
   });
   it('a few runs that fail the history check do not make the search unknown while trusted runs were also seen', async () => {
     const gh = busy(25);
-    for (let k = 0; k < 3; k++) gh.compares.set((1000 + k).toString(16).padStart(40, 'a'), { status: 'diverged' });
+    for (let k = 0; k < HISTORY_FAIL_CAP - 1; k++) gh.compares.set((1000 + k).toString(16).padStart(40, 'a'), { status: 'diverged' });
     expect((await cleanRunSeen(gh, REPO, CTX)).state).toBe('none');
   });
   it('a malformed or errored marker file among the window is still unknown; a wrong-MAC marker is ignored (none)', async () => {
@@ -1130,5 +1130,58 @@ describe('baseline lookup within the call budget', () => {
       expect(r.baseline, String(n)).toBeNull();
       expect(gh.calls.length, `${n} runs: ${gh.calls.length} calls`).toBeLessThanOrEqual(40);
     }
+  });
+});
+
+describe('fix round 3: history failures do not use up the marker window; a cut list is not a finished search', () => {
+  const cart = (id: number, runId: number) => art(id, runId, {}, CLEAN_RUN_ARTIFACT);
+  const sha = (i: number): string => (1000 + i).toString(16).padStart(40, 'a');
+  const markerOf = (runId: number): Record<string, unknown> => ({ runId, keyId: keyId(KEY), mac: markerMac(KEY, runId, keyId(KEY)) });
+  const runsOf = (n: number, from = 0): Record<string, unknown>[] => Array.from({ length: n }, (_, i) => run({ id: 10_000 - from - i, head_sha: sha(from + i) }));
+  it('10 history-failing runs, then 1 old trusted run with a marker → unknown (the failure cap), never none', async () => {
+    const runs = runsOf(11);
+    const gh = world([cart(1, runs[10]?.id as number)], runs, [[1, markerOf(runs[10]?.id as number)]]);
+    for (let i = 0; i < 10; i++) gh.compares.set(sha(i), { status: 'diverged' });
+    const r = await cleanRunSeen(gh, REPO, CTX);
+    expect(r.state).toBe('unknown');
+    expect(r.note).toMatch(/fail the default-history check/);
+    expect(gh.calls.filter((c) => c.startsWith('compare')).length).toBeLessThanOrEqual(HISTORY_FAIL_CAP);
+    expect(HISTORY_FAIL_CAP).toBe(3);
+  });
+  it('fewer failures than the cap do not use up the window: 2 failing runs and then 10 trusted ones, the marker in the 10th trusted run is seen', async () => {
+    const runs = runsOf(12);
+    const gh = world([cart(1, runs[11]?.id as number)], runs, [[1, markerOf(runs[11]?.id as number)]]);
+    gh.compares.set(sha(0), { status: 'diverged' }); gh.compares.set(sha(1), { status: 'behind' });
+    expect((await cleanRunSeen(gh, REPO, CTX)).state).toBe('seen');
+  });
+  it('a cut at the page cap with only 3 trusted runs and no marker → unknown; the true end of the list with 3 trusted runs → none', async () => {
+    const noise = Array.from({ length: MAX_RUN_PAGES * 100 - 3 }, (_, i) => run({ id: 90_000 - i, event: 'pull_request', head_repository: { id: 8 } }));
+    const trusted = runsOf(3).map((r, i) => ({ ...r, id: 50_000 - i }));
+    const cut = world([], [...noise, ...trusted], []);
+    const r = await cleanRunSeen(cut, REPO, CTX);
+    expect(r.state).toBe('unknown');
+    expect(cut.calls.length).toBeLessThanOrEqual(40);
+    const end = world([], trusted, []);
+    expect((await cleanRunSeen(end, REPO, CTX)).state).toBe('none');
+  });
+  it('10 trusted runs with no marker → none, even when the page cap is reached while looking (a full window is a finished search)', async () => {
+    for (const n of [10, 11]) {
+      const gh = world([], runsOf(n), []);
+      expect((await cleanRunSeen(gh, REPO, CTX)).state, String(n)).toBe('none');
+    }
+    // the 10th trusted run is the last of a full first page of 100: no second page is needed
+    const full = world([], [...runsOf(10), ...Array.from({ length: 90 }, (_, i) => run({ id: 5000 - i, event: 'pull_request', head_repository: { id: 8 } }))], []);
+    expect((await cleanRunSeen(full, REPO, CTX)).state).toBe('none');
+    expect(full.calls.filter((c) => c.startsWith('runs')).length).toBe(1);
+  });
+  it('call budget: the worst case stays within 40 (pages + tag + tip + 3 calls per trusted run + the failure cap)', async () => {
+    expect(MAX_RUN_PAGES + 2 + 3 * MARKER_WINDOW + HISTORY_FAIL_CAP).toBeLessThanOrEqual(40);
+    const runs = runsOf(12);
+    const arts = runs.slice(2).map((r, i) => cart(i + 1, r.id as number));
+    const gh = world(arts, runs, arts.map((a, i) => [i + 1, { ...markerOf((runs[i + 2] as Record<string, unknown>).id as number), mac: '0'.repeat(64) }] as [number, unknown]));
+    gh.compares.set(sha(0), { status: 'diverged' }); gh.compares.set(sha(1), { status: 'diverged' });
+    const r = await cleanRunSeen(gh, REPO, CTX);
+    expect(r.state).toBe('none');
+    expect(gh.calls.length).toBe(1 + 2 + 2 + 30);
   });
 });
