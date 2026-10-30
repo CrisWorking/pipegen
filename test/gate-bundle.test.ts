@@ -1,8 +1,8 @@
 // C6: the gate bundle gate/dist/index.js. Written first. The bundle is what GitHub runs (`runs.main`), so these tests run the BUNDLE, in a
 // child process, on the same fixtures as the C5b action tests; the network is replaced by a preloaded fetch (test/helpers/fake-github-preload.mjs).
-import { spawn } from 'node:child_process';
+import { execFileSync, spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, symlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { describe, expect, it } from 'vitest';
@@ -84,6 +84,32 @@ describe('C6 bundle: what is in it', () => {
     for (const re of shapes) expect(t, String(re)).not.toMatch(re);
     expect(t).not.toContain(CRED);
     expect(t).not.toContain(FPKEY);
+  });
+  it('gate/dist holds exactly the three generated files, committed (an extra file would ship unreviewed code)', () => {
+    const tracked = execFileSync('git', ['ls-files', 'gate/dist'], { cwd: ROOT, encoding: 'utf8' }).split('\n').filter((l) => l !== '').sort();
+    expect(tracked).toEqual(['gate/dist/README.md', 'gate/dist/THIRD_PARTY_NOTICES', 'gate/dist/index.js']);
+    expect(readdirSync(join(ROOT, 'gate/dist')).sort()).toEqual(['README.md', 'THIRD_PARTY_NOTICES', 'index.js']);
+  });
+  it('action.yml runs exactly node24 and dist/index.js: no pre, post, pre-if or post-if', () => {
+    const runs = (parse(readFileSync(join(ROOT, 'gate/action.yml'), 'utf8')) as { runs: unknown }).runs;
+    expect(runs).toEqual({ using: 'node24', main: 'dist/index.js' });
+  });
+  it('the gate THIRD_PARTY_NOTICES names the gate bundle, not the CLI\'s', () => {
+    const t = readFileSync(join(ROOT, 'gate/dist/THIRD_PARTY_NOTICES'), 'utf8');
+    expect(t).toContain('gate/dist/index.js');
+    expect(t).not.toContain('dist/cli/main.js');
+    expect(t).toContain('smol-toml@1.9.1\nLicense: BSD-3-Clause');
+  });
+  it('the trust-root files of the gate build are code-owner paths', () => {
+    const owners = readFileSync(join(ROOT, '.github/CODEOWNERS'), 'utf8');
+    for (const p of ['/tsup.gate.config.ts', '/test/gate-entry.test.ts', '/test/gate-bundle.test.ts', '/gate/', '/scripts/']) expect(owners, p).toMatch(new RegExp(`^${p.replace(/[./]/g, '\\$&')}\\s+@CrisWorking$`, 'm'));
+  });
+  it('docs/release.md lists gate-dist among the required checks', () => {
+    expect(readFileSync(join(ROOT, 'docs/release.md'), 'utf8')).toMatch(/`gate-dist`/);
+  });
+  it('CI gate-dist also fails on an extra committed file in gate/dist', () => {
+    const ci2 = parse(readFileSync(join(ROOT, '.github/workflows/ci.yml'), 'utf8')) as { jobs: Record<string, { steps: { run?: string }[] }> };
+    expect((ci2.jobs['gate-dist']?.steps ?? []).map((s) => s.run ?? '').join('\n')).toMatch(/git ls-files gate\/dist/);
   });
   it('action.yml runs it (node24, dist/index.js)', () => {
     expect(readFileSync(join(ROOT, 'gate/action.yml'), 'utf8')).toMatch(/using: node24\n\s+main: dist\/index\.js/);

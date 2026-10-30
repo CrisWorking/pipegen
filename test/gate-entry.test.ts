@@ -4,6 +4,7 @@
 // Scheme (two steps): (1) these commits pin PRE_C6_SHA (the C5b head) and mark the entry `reviewedBy: PENDING` with the YAML comment
 // `pending-self-pin`, so a release build refuses it exactly like any PENDING entry (ruling S21); (2) a follow-up controller commit re-pins to
 // the C6 commit and fills in the delegated review. This test pins both states: while PENDING the pin is PRE_C6_SHA, afterwards it never is.
+import { execFileSync } from 'node:child_process';
 import { readFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
@@ -54,6 +55,15 @@ describe('C6: the pipegen-gate reviewed entry', () => {
       expect(t.candidate.pin.sha).not.toBe(PRE_C6_SHA);
       expect(t.reviewedBy).toMatch(/delegated/);
     }
+  });
+  it('dev-time: once reviewed, the pinned commit\'s gate/dist and action.yml equal HEAD\'s (skipped while PENDING or when the commit is not fetched)', () => {
+    const t = real();
+    if (t.reviewedBy === PENDING) return;
+    const pin = t.candidate.pin.sha as string;
+    const git = (...args: string[]): boolean => { try { execFileSync('git', args, { cwd: ROOT, stdio: 'ignore' }); return true; } catch { return false; } };
+    if (!git('cat-file', '-e', `${pin}:gate/dist/index.js`)) return; // not fetched (a depth-1 checkout)
+    expect(git('merge-base', '--is-ancestor', pin, 'HEAD'), 'the pin is an ancestor of HEAD').toBe(true);
+    expect(git('diff', '--quiet', pin, 'HEAD', '--', 'gate/dist', 'gate/action.yml'), 'the pinned bundle is the shipped bundle').toBe(true);
   });
   it('a release build refuses the list while the entry is PENDING (like any PENDING entry)', () => {
     if (real().reviewedBy !== PENDING) return; // after the re-pin there is nothing to refuse

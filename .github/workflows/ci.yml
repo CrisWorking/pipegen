@@ -143,6 +143,8 @@ jobs:
           git diff --exit-code -- gate/dist gate/src/generated
           # a file the build adds that is not committed is a difference too
           test -z "$(git status --porcelain -- gate/dist gate/src/generated)"
+          # nothing but the three generated files may be committed there (an extra file would ship unreviewed code)
+          test "$(git ls-files gate/dist | sort | tr '\n' ' ')" = "gate/dist/README.md gate/dist/THIRD_PARTY_NOTICES gate/dist/index.js "
 
   workflow-lint:
     if: github.event_name != 'schedule'

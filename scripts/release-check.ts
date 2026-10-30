@@ -120,6 +120,26 @@ export function checkVersion(packageJson: string | null | undefined, tag: string
   return { name: 'package.json version matches the tag', ok: problems.length === 0, problems };
 }
 
+/**
+ * C6 fix round 1: the gate action users run is the bundle at the PINNED commit, so that commit must hold the bundle shipped here. The pin
+ * is an ancestor of HEAD, and gate/dist and gate/action.yml are the same at the pin and at HEAD. A PENDING (self-pin) entry fails. Needs
+ * full history (a missing commit fails closed). Not enforced on every PR: a PR that changes the gate can't pin itself; at release it must.
+ */
+export function checkGatePin(reviewedText: string | null | undefined, root: string): Check {
+  const name = 'the gate pin holds the shipped gate bundle';
+  const problems: string[] = [];
+  const doc = parseObj(reviewedText);
+  const e = doc === undefined ? undefined : entriesOf(doc).find(([id]) => id === 'pipegen-gate')?.[1];
+  const cand = isObj(e) && isObj(e.candidate) && isObj(e.candidate.pin) ? e.candidate.pin : undefined;
+  const sha = cand === undefined ? undefined : cand.sha;
+  if (!isObj(e)) problems.push('data/reviewed-tools.yml has no readable pipegen-gate entry');
+  else if (isPending(e.reviewedBy) || isPending(e.reviewedAt)) problems.push('the pipegen-gate entry is still PENDING (a self-pin that has not been re-pinned to the commit holding the bundle)');
+  else if (typeof sha !== 'string' || !/^[0-9a-f]{40}$/.test(sha)) problems.push('the pipegen-gate pin is not a 40-hex commit');
+  else if (git(root, ['merge-base', '--is-ancestor', sha, 'HEAD']) === null) problems.push(`the gate pin ${sha.slice(0, 12)} is not an ancestor of HEAD (or the history is not fetched)`);
+  else if (git(root, ['diff', '--quiet', sha, 'HEAD', '--', 'gate/dist', 'gate/action.yml']) === null) problems.push(`gate/dist or gate/action.yml at HEAD differs from the pinned commit ${sha.slice(0, 12)}: users would run an older gate than the one shipped; re-pin`);
+  return { name, ok: problems.length === 0, problems };
+}
+
 /** Check 6: `checkedAt` of the two data files that freeze outside facts. */
 export function checkDataFresh(files: { 'data/ai-prices.yml'?: string | null; 'data/github-plans.yml'?: string | null }, now: Date): Check {
   const problems: string[] = [];
@@ -209,6 +229,7 @@ async function main(argv: string[]): Promise<number> {
 
   const checks = [
     checkPending({ 'data/reviewed-tools.yml': read('data/reviewed-tools.yml'), 'data/pinned-binaries.yml': read('data/pinned-binaries.yml') }),
+    checkGatePin(read('data/reviewed-tools.yml'), root),
     checkNoDependencies(read('package.json')),
     checkNotices(read('THIRD_PARTY_NOTICES'), generated, buildError),
     checkVersion(read('package.json'), tag),

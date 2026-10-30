@@ -1,7 +1,10 @@
 import { execFileSync } from 'node:child_process';
 import { resolve } from 'node:path';
 import { describe, expect, it } from 'vitest';
-import { checkCooldown, checkDataFresh, checkNoDependencies, checkNotices, checkPending, checkScannerTests, checkVersion, formatChecks } from '../scripts/release-check.js';
+import { mkdtempSync, mkdirSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { checkCooldown, checkGatePin, checkDataFresh, checkNoDependencies, checkNotices, checkPending, checkScannerTests, checkVersion, formatChecks } from '../scripts/release-check.js';
 
 const NOW = new Date('2026-11-20T12:00:00Z');
 const reviewedOk = 'tools:\n  - id: a\n    reviewedBy: Cristiano\n    reviewedAt: "2026-11-01"\n  - id: b\n    reviewedBy: Cristiano\n    reviewedAt: "2026-11-01"\n';
@@ -130,5 +133,61 @@ describe('release-check: report and command line', () => {
       code = (e as { status: number }).status;
     }
     expect(code).toBe(2);
+  });
+});
+
+// ---------- C6 fix round 1: the pinned gate bundle is the shipped bundle ----------
+describe('release-check: the gate pin (C6 fix round 1)', () => {
+  const git = (cwd: string, ...args: string[]): string => execFileSync('git', ['-c', 'user.name=t', '-c', 'user.email=t@t', '-c', 'commit.gpgsign=false', ...args], { cwd, encoding: 'utf8' }).trim();
+  const entry = (sha: string, by = 'Claude delegated DECISIONS 105'): string => `tools:\n  - id: pipegen-gate\n    candidate: { pin: { sha: "${sha}" } }\n    step: { action: { uses: "crisworking/pipegen/gate@${sha}" } }\n    reviewedBy: ${by}\n    reviewedAt: ${by === 'PENDING' ? 'PENDING' : '"2026-11-01"'}\n`;
+  function repo(): { dir: string; pin: string } {
+    const dir = mkdtempSync(join(tmpdir(), 'pipegen-gatepin-'));
+    git(dir, 'init', '-q', '-b', 'main');
+    mkdirSync(join(dir, 'gate/dist'), { recursive: true });
+    writeFileSync(join(dir, 'gate/dist/index.js'), 'bundle v1\n');
+    writeFileSync(join(dir, 'gate/action.yml'), 'runs: v1\n');
+    git(dir, 'add', '-A');
+    git(dir, 'commit', '-q', '-m', 'one');
+    return { dir, pin: git(dir, 'rev-parse', 'HEAD') };
+  }
+  it('passes when the pin is an ancestor of HEAD and gate/dist and gate/action.yml are the same there', () => {
+    const { dir, pin } = repo();
+    writeFileSync(join(dir, 'other.txt'), 'x');
+    git(dir, 'add', '-A'); git(dir, 'commit', '-q', '-m', 'two');
+    expect(checkGatePin(entry(pin), dir)).toMatchObject({ ok: true, problems: [] });
+  });
+  it('fails when the bundle changed after the pin (a later commit rebuilt gate/dist)', () => {
+    const { dir, pin } = repo();
+    writeFileSync(join(dir, 'gate/dist/index.js'), 'bundle v2\n');
+    git(dir, 'add', '-A'); git(dir, 'commit', '-q', '-m', 'two');
+    const c = checkGatePin(entry(pin), dir);
+    expect(c.ok).toBe(false);
+    expect(c.problems.join('\n')).toMatch(/gate\/dist|action\.yml/);
+  });
+  it('fails when action.yml changed after the pin', () => {
+    const { dir, pin } = repo();
+    writeFileSync(join(dir, 'gate/action.yml'), 'runs: v2\n');
+    git(dir, 'add', '-A'); git(dir, 'commit', '-q', '-m', 'two');
+    expect(checkGatePin(entry(pin), dir).ok).toBe(false);
+  });
+  it('fails when the pin is not an ancestor of HEAD (another branch) or not a commit here', () => {
+    const { dir, pin } = repo();
+    git(dir, 'checkout', '-q', '-b', 'side');
+    writeFileSync(join(dir, 'side.txt'), 's');
+    git(dir, 'add', '-A'); git(dir, 'commit', '-q', '-m', 'side');
+    const sidePin = git(dir, 'rev-parse', 'HEAD');
+    git(dir, 'checkout', '-q', 'main');
+    writeFileSync(join(dir, 'main.txt'), 'm');
+    git(dir, 'add', '-A'); git(dir, 'commit', '-q', '-m', 'main');
+    expect(checkGatePin(entry(sidePin), dir).ok).toBe(false);
+    expect(checkGatePin(entry('f'.repeat(40)), dir).ok).toBe(false);
+    expect(pin).not.toBe(sidePin);
+  });
+  it('fails a PENDING self-pin, a missing entry, a missing file and a pin that is not 40 hex (fail closed)', () => {
+    const { dir, pin } = repo();
+    expect(checkGatePin(entry(pin, 'PENDING'), dir).ok).toBe(false);
+    expect(checkGatePin('tools:\n  - id: other\n', dir).ok).toBe(false);
+    expect(checkGatePin(null, dir).ok).toBe(false);
+    expect(checkGatePin(entry('--output=x'), dir).ok).toBe(false);
   });
 });

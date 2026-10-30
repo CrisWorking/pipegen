@@ -65,6 +65,12 @@ describe('buildNotices', () => {
   }
   const inputs = ['node_modules/zod/a.js', 'node_modules/picomatch/a.js', 'node_modules/micromatch/node_modules/picomatch/a.js', 'node_modules/micromatch/a.js', 'node_modules/@scope/pkg/a.js'];
 
+  it('a gate bundle names itself in the header (the CLI text stays the default)', () => {
+    const gate = buildNotices(fixture(), meta(...inputs), {}, ALLOWED_LICENSES, 'gate').text;
+    expect(gate).toContain('gate/dist/index.js');
+    expect(gate).not.toContain('dist/cli/main.js');
+    expect(buildNotices(fixture(), meta(...inputs)).text).toContain('dist/cli/main.js');
+  });
   it('writes name@version, licence id, then the text, with scoped packages, both picomatch copies and NOTICE verbatim', () => {
     const { text, count } = buildNotices(fixture(), meta(...inputs));
     expect(count).toBe(5);
