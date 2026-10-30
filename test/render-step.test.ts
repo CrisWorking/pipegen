@@ -405,7 +405,7 @@ describe('renderUpload', () => {
     expect(s.if).toBe('always()');
     expect(s.uses).toMatch(/^actions\/upload-artifact@[0-9a-f]{40}$/);
     expect(s.usesComment).toBe(platform()['upload-artifact'].candidate.version);
-    expect(s.with).toEqual({ 'include-hidden-files': 'false', 'if-no-files-found': 'error', name, path });
+    expect(s.with).toEqual({ 'include-hidden-files': 'false', 'if-no-files-found': 'error', archive: 'true', name, path });
     expect(s.run).toBeUndefined();
   });
 

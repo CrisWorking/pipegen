@@ -136,6 +136,8 @@ tools:
 
   # Uploads scan results for the gate. Hidden files (.env and the like) are never included.
   # Source: git ref refs/tags/v7.0.2 of actions/upload-artifact (GitHub API), release published_at. Released 2026-10-07T10:08:14Z.
+  # archive "true" (C5a fix round 1): the pinned action.yml (cf430e0) has `archive`, default true; false would upload one file unzipped
+  #   under its own name, which the gate never reads. Pinned, so a changed default can not move it. Reviewed by delegation (DECISIONS 105), 2026-10-30.
   - id: actions-upload-artifact
     categories: ["platform"]
     languages: ["any"]
@@ -156,15 +158,17 @@ tools:
         with:
           include-hidden-files: "false"
           if-no-files-found: "error"
+          archive: "true"
       output: { path: "", format: none }
     fixedInputs:
       with:
         include-hidden-files: "false"
         if-no-files-found: "error"
+        archive: "true"
     choices: {}
     configFiles: []
-    reviewedBy: Cristiano
-    reviewedAt: "2026-10-28"
+    reviewedBy: Claude delegated DECISIONS 105
+    reviewedAt: "2026-10-30"
     proofs: 0
 
   # Downloads scan results in the gate job (exact artifact names are set by the renderer).

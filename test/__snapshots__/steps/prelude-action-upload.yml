@@ -24,5 +24,6 @@
   with:
     include-hidden-files: "false"
     if-no-files-found: error
+    archive: "true"
     name: pipegen-out-sast--api
     path: "${{ runner.temp }}/pipegen-out/pipegen-out-sast--api/results.sarif"

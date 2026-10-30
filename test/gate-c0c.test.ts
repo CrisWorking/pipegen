@@ -157,7 +157,8 @@ describe('CF2: every action of a listed check sits in its listed job', () => {
 
 describe('CF3a: one event-switched base form', () => {
   const ZERO = '0'.repeat(40);
-  const EXPR = `\${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event_name == 'merge_group' && github.event.merge_group.base_sha || github.event_name == 'push' && github.event.before || '${ZERO}' }}`;
+  // C5a fix round 1 (I1): pull_request_review, the approval re-run, has the same base as pull_request
+  const EXPR = `\${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event_name == 'pull_request_review' && github.event.pull_request.base.sha || github.event_name == 'merge_group' && github.event.merge_group.base_sha || github.event_name == 'push' && github.event.before || '${ZERO}' }}`;
   const specs = [gitleaksSpec(), semgrepSpec('app')];
   const needs = [needOf('secrets'), needOf('sast', 'app')];
   const d = draftOf(specs, needs);
@@ -183,6 +184,24 @@ describe('CF3a: one event-switched base form', () => {
   it('C5a: the base-scan job of these layouts hands the gate base-sha (the commit its base checkout checked out)', () => {
     expect(jobs()['base-scan']?.outputs).toMatchObject({ 'base-sha': '${{ steps.pipegen-checkout.outputs.commit }}' });
   });
+  it('fix round 1 (m1): an upload step without archive: true, or with archive: false, is refused by the referee', async () => {
+    for (const v of [undefined, 'false']) {
+      const j = jobs((steps) => steps.map((s) => (s.uses?.startsWith('actions/upload-artifact@') === true ? { ...s, with: Object.fromEntries(Object.entries({ ...s.with, archive: v }).filter((x) => x[1] !== undefined)) as Record<string, string> } : s)));
+      const r = await run([wfOn('pull_request', j)], d);
+      expect(r.ok, String(v)).toBe(false);
+      expect(has(r, 'template', /archive/), String(v)).toBe(true);
+    }
+  });
+  it('fix round 1 (m8): the gate step with service-roots passes the referee; a refused value does not', async () => {
+    const withRoots = (v: string): Record<string, Job> => {
+      const j = jobs();
+      const g = j.gate as Job;
+      const step = (g.steps as RenderedStep[])[0] as RenderedStep;
+      return { ...j, gate: { ...g, steps: [{ ...step, with: { ...step.with, 'service-roots': v } }] } };
+    };
+    expect(show(await run([wfOn('pull_request', withRoots('[".", "web"]'))], d))).toBe('');
+    expect((await run([wfOn('pull_request', withRoots('["../x"]'))], d)).ok).toBe(false);
+  });
   it('the expression is the one ruled form (a commit sha as the fallback, never a ref name)', () => {
     expect(BASE_CHECKOUT_REF).toBe(EXPR);
     expect(prelude({ baseRef: true })[0]?.with?.ref).toBe(EXPR);
@@ -200,7 +219,7 @@ describe('CF3a: one event-switched base form', () => {
   it('every other ref form is refused in base-scan, in every layout', async () => {
     const forms = [
       '${{ github.event.pull_request.base.sha }}', '${{ github.event.merge_group.base_sha }}', '${{ github.event.before }}',
-      'main', ZERO, `\${{ '${ZERO}' }}`, EXPR.replace(`'${ZERO}'`, "'main'"), EXPR.replace("'push'", "'pull_request'"), EXPR.replace(' || github.event_name', ' && github.event_name'),
+      'main', ZERO, `\${{ '${ZERO}' }}`, EXPR.replace(`'${ZERO}'`, "'main'"), EXPR.replace("'push'", "'pull_request'"), EXPR.replace("'pull_request_review'", "'pull_request_target'"), EXPR.replace(' || github.event_name', ' && github.event_name'),
       `${EXPR} `, EXPR.replace('}}', "|| github.head_ref }}"), '${{ github.event.pull_request.head.sha }}', '${{ github.sha }}', '',
     ];
     for (const ref of forms) {
@@ -229,6 +248,8 @@ describe('CF3a: one event-switched base form', () => {
     const evalWith = (ev: { name: string; pr?: string; mg?: string; before?: string }): unknown => new Function('ev', `return (${js});`)(ev);
     const PR = 'a'.repeat(40); const MG = 'b'.repeat(40); const BEFORE = 'c'.repeat(40);
     expect(evalWith({ name: 'pull_request', pr: PR })).toBe(PR);
+    expect(evalWith({ name: 'pull_request_review', pr: PR })).toBe(PR);
+    expect(evalWith({ name: 'pull_request_review' })).toBe(ZERO);
     expect(evalWith({ name: 'merge_group', mg: MG })).toBe(MG);
     expect(evalWith({ name: 'push', before: BEFORE })).toBe(BEFORE);
     expect(evalWith({ name: 'push', before: ZERO })).toBe(ZERO);

@@ -6,9 +6,10 @@
 import { describe, expect, it } from 'vitest';
 import { BASE_CHECKOUT_ID, BASE_SCAN_JOB, BASE_SHA_OUTPUT, jobOutputsFor, jobOutputsProblems } from '../src/engine/job-rules.js';
 import * as gateSettings from '../gate/src/settings.js';
-import { renderGateStep, renderJobPrelude, type RenderedStep } from '../src/engine/render-step.js';
-import { PIPEGEN_GATE_USES, rendererInputProblems } from '../src/engine/tool-flags.js';
-import { gateEntry, platform } from './helpers/render.js';
+import { renderGateStep, renderJobPrelude, renderUpload, RenderError, type RenderedStep } from '../src/engine/render-step.js';
+import { ACTION_POLICIES, PIPEGEN_GATE_USES, PLATFORM_LOCKS, rendererInputProblems } from '../src/engine/tool-flags.js';
+import { RESULT_ARTIFACT_PREFIX } from '../src/types.js';
+import { gateEntry, platform, reviewedList } from './helpers/render.js';
 
 const p = platform();
 const prelude = (baseRef?: true): RenderedStep[] => renderJobPrelude(baseRef === undefined ? {} : { baseRef }, p).steps;
@@ -54,5 +55,29 @@ describe('the gate step: service-roots', () => {
     const s = renderGateStep(gateEntry(), [], { serviceRoots: ['apps/web', '.'] });
     expect(s.with?.['service-roots']).toBe('["apps/web","."]');
     expect(renderGateStep(gateEntry(), []).with?.['service-roots']).toBeUndefined();
+  });
+});
+
+describe('upload-artifact archives its result (fix round 1, m1)', () => {
+  // the pinned v7.0.2 action.yml (cf430e0…): `archive` (default 'true'); 'false' uploads one file unzipped under the file's own name
+  const NAME = `${RESULT_ARTIFACT_PREFIX}sast`;
+  const PATH = `\${{ runner.temp }}/pipegen-out/${NAME}/semgrep.sarif`;
+  it('the reviewed entry fixes archive: true; the lock and the input policy require it', () => {
+    const t = reviewedList().find((e) => e.id === 'actions-upload-artifact');
+    expect(t?.fixedInputs.with?.archive).toBe('true');
+    expect(t?.step.action?.with?.archive).toBe('true');
+    expect(PLATFORM_LOCKS['actions/upload-artifact']?.archive).toBe('true');
+    expect(ACTION_POLICIES['actions/upload-artifact']?.archive).toEqual({ values: ['true'], as: 'fixed', required: true });
+    expect(t?.reviewedBy).toBe('Claude delegated DECISIONS 105');
+    expect(t?.reviewedAt).toBe('2026-10-30');
+  });
+  it('renderUpload writes archive: true, and refuses an entry that lost it', () => {
+    expect(renderUpload(NAME, PATH, p).with?.archive).toBe('true');
+    const list = reviewedList();
+    const t = list.find((e) => e.id === 'actions-upload-artifact') as ReturnType<typeof reviewedList>[number];
+    delete (t.fixedInputs.with as Record<string, string>).archive;
+    delete (t.step.action?.with as Record<string, string>).archive;
+    expect(() => renderUpload(NAME, PATH, platform(list))).toThrow(RenderError);
+    expect(() => renderUpload(NAME, PATH, platform(list))).toThrow(/archive/);
   });
 });

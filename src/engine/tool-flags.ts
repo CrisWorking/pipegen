@@ -470,7 +470,8 @@ export const PLATFORM_USES: Readonly<Record<PlatformKey, string>> = Object.freez
 export const PLATFORM_LOCKS: Readonly<Record<string, Readonly<Record<string, string>>>> = Object.freeze({
   'actions/checkout': { 'persist-credentials': 'false', 'allow-unsafe-pr-checkout': 'false' },
   'actions/setup-node': { 'package-manager-cache': 'false' },
-  'actions/upload-artifact': { 'include-hidden-files': 'false', 'if-no-files-found': 'error' },
+  // archive (v7.0.0+, pinned v7.0.2 action.yml): 'false' uploads one file unzipped under its own name; the gate reads only a zip (C5a fix round 1)
+  'actions/upload-artifact': { 'include-hidden-files': 'false', 'if-no-files-found': 'error', archive: 'true' },
   // the docker actions' cache and credential locks (6b, review R1-5): checked here, not only by the loader
   'docker/build-push-action': { 'no-cache': 'true', 'github-token': '', context: '.' },
   'docker/setup-buildx-action': { 'cache-binary': 'false' },
@@ -513,6 +514,7 @@ export const ACTION_POLICIES: Readonly<Record<string, Readonly<Record<string, In
   'actions/upload-artifact': {
     'include-hidden-files': { values: ['false'], as: 'fixed' },
     'if-no-files-found': { values: ['error'], as: 'fixed' },
+    archive: { values: ['true'], as: 'fixed', required: true },
   },
   'actions/download-artifact': {},
   'docker/login-action': { logout: { values: ['true'], as: 'fixed', required: true }, registry: { values: ['ghcr.io'], as: 'choice' } },   // ghcr.io only: the login sends the workflow token, which must never go to another registry (review 6a)
@@ -700,12 +702,13 @@ export function jobListLiteralProblem(text: string): string | null {
 
 /**
  * The ONE base commit a base-scan checkout may name (ruling S16, C0c CF3a), switched on the event, so it holds in any file, a called
- * workflow included, whatever event starts it: a pull request's base, a merge group's base, a push's previous head. On every other event,
+ * workflow included, whatever event starts it: a pull request's base (also on pull_request_review, the approval re-run: C5a fix round 1), a merge
+ * group's base, a push's previous head. On every other event,
  * and on a push to a new branch (`before` all zeros), the value is the all-zero COMMIT sha, which can never exist: the checkout fails and
  * the base-scan job fails ("no base"), instead of an empty ref falling back to the head. Never a ref NAME as the sentinel: anyone with push
  * access can create a branch with that name. Only the job `base-scan` may use it (job-rules.ts).
  */
-export const BASE_CHECKOUT_REF = `\${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event_name == 'merge_group' && github.event.merge_group.base_sha || github.event_name == 'push' && github.event.before || '${'0'.repeat(40)}' }}`;
+export const BASE_CHECKOUT_REF = `\${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event_name == 'pull_request_review' && github.event.pull_request.base.sha || github.event_name == 'merge_group' && github.event.merge_group.base_sha || github.event_name == 'push' && github.event.before || '${'0'.repeat(40)}' }}`;
 
 /**
  * Ruling S15: the inputs the renderer sets on a platform action, by the same `owner/repo[/path]` key as ACTION_POLICIES,

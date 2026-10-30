@@ -2224,6 +2224,12 @@ describe('Task 6 review fix round 2 (P28, P29)', () => {
     const up = () => realEntry('actions-upload-artifact');
     refused(setWith(up(), 'include-hidden-files', 'true'), /include-hidden-files/);
     refused(setWith(up(), 'path', '.env'), /path/);
+    // fix round 1 (m1): the result is always zipped (archive 'false' would upload one file unzipped, which the gate refuses)
+    refused(setWith(up(), 'archive', 'false'), /archive/);
+    const noArchive = up();
+    delete noArchive.step.action.with.archive;
+    delete noArchive.fixedInputs.with.archive;
+    refused(noArchive, /archive/);
     const checkout = realEntry('actions-checkout');
     checkout.choices['ref'] = ['main'];
     refused(checkout, /ref/);
