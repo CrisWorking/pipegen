@@ -60,13 +60,13 @@ function scanRange(sb: Sandbox, range: { base: string; head: string; before?: st
   copyFileSync(bin, join(dir, 'betterleaks'));
   chmodSync(join(dir, 'betterleaks'), 0o755);
   const step = renderRangeBlock(entry('betterleaks'), p, GATE).steps[1] as RenderedStep;
-  const r = spawnSync('bash', ['--noprofile', '--norc', '-c', step.run ?? ''], { cwd: sb.ws, env: { ...stepEnv(step, sb), PIPEGEN_RANGE_BASE: range.base, PIPEGEN_RANGE_HEAD: range.head, PIPEGEN_RANGE_BEFORE: range.before ?? '0'.repeat(40) }, encoding: 'utf8' });
+  const r = spawnSync('bash', ['--noprofile', '--norc', '-c', step.run ?? ''], { cwd: sb.ws, env: { ...stepEnv(step, sb), PIPEGEN_RANGE_BASE: range.base, PIPEGEN_RANGE_HEAD: range.head, PIPEGEN_RANGE_BEFORE: range.before ?? '0'.repeat(40), PIPEGEN_RANGE_EVENT: event }, encoding: 'utf8' });
   const raw = join(sb.rt, 'pipegen-raw', A, 'betterleaks.sarif');
   const out = join(sb.rt, 'pipegen-out', A, 'betterleaks.sarif');
   const s = scrubFile({ artifact: A, tool: 'betterleaks', format: 'sarif', raw, out, fpKey: FPKEY, workspace: sb.ws, eventText: '{}' });
   const back = s.status === 'ok' ? readScrubbed(readFileSync(out), 'sarif') : undefined;
   const scan: RangeScan = back === undefined ? { tool: 'betterleaks', toolError: s.error ?? 'no detail' } : { tool: 'betterleaks', findings: back.findings };
-  return { status: r.status, stderr: r.stderr, scan, gate: decideGate(inputWith(scan, event)), skipped: back?.rangeSkipped === true };
+  return { status: r.status, stderr: r.stderr, scan, gate: decideGate(inputWith(scan, event)), skipped: back?.rangeSkipped !== undefined };
 }
 const se = { needId: 'secrets', job: 'secrets', category: 'secrets', tool: 'betterleaks', format: 'sarif', artifact: 'pipegen-out-secrets', baseArtifact: 'pipegen-out-base-secrets', blocking: true, [K_NS]: false } as JobListEntry;
 function inputWith(scan: RangeScan, event: 'pull_request' | 'push'): GateInput {
@@ -278,6 +278,57 @@ describe.skipIf(!live)('live: the commit-range secrets scan (C9), the pinned bet
     expect(o.status).toBe(0);
     expect(o.skipped).toBe(true);
   }, 60_000);
+});
+
+describe.skipIf(!live)('live: fix round 2 (review-C9-r1.md m2, m3), the pinned betterleaks 1.9.0 through the rendered step', () => {
+  beforeAll(async () => { betterleaks = await ensurePinnedBinary('betterleaks'); }, 600_000);
+
+  it('m3: an octopus merge that adds a key (removed later) is refused with why: a tool error, and the gate blocks', () => {
+    const sb = sandbox();
+    const g = gitOf(sb);
+    g('init', '-q');
+    put(sb, 'a.txt', 'base\n');
+    const base = commit(g, 'base');
+    for (const b of ['x', 'y']) { g('checkout', '-q', '-b', b, base); put(sb, `${b}.txt`, `${b}\n`); commit(g, b); }
+    g('checkout', '-q', 'main');
+    put(sb, 'm.txt', 'm\n');
+    commit(g, 'main moves on (so the octopus can not fast-forward)');
+    g('merge', '-q', '--no-commit', 'x', 'y');
+    put(sb, 'evil.js', line(17));
+    g('add', '-A');
+    g('commit', '-q', '-m', 'an octopus that adds a key');
+    g('rm', '-q', 'evil.js');
+    const head = commit(g, 'and removes it');
+    expect(g('rev-list', '--min-parents=3', '--count', `${base}..${head}`)).toBe('1');
+    const o = scanRange(sb, { base, head });
+    expect(o.status).toBe(1);
+    expect(o.stderr).toMatch(/octopus merge .*three or more parents.*merge one branch at a time/);
+    expect(o.scan.toolError).toBeDefined();
+    expect(o.gate.pass).toBe(false);
+  }, 120_000);
+
+  it('m2: a force-push to the default branch is scanned from where the old and new heads meet (a key there warns); with the old head gone, a skip that warns', () => {
+    const sb = sandbox();
+    const g = gitOf(sb);
+    g('init', '-q');
+    put(sb, 'a.txt', 'base\n');
+    commit(g, 'base');
+    put(sb, 'b.txt', 'b\n');
+    const meet = commit(g, 'where they meet');
+    put(sb, 'old.txt', 'old\n');
+    const oldHead = commit(g, 'the old head');
+    g('reset', '-q', '--hard', meet);
+    put(sb, 'config.js', line(18));
+    const rewrite = commit(g, 'the rewrite, with a key');
+    const o = scanRange(sb, { base: oldHead, head: rewrite }, betterleaks, 'push');
+    expect(o.status, o.stderr).toBe(0);
+    expect(findingsOf(o)).toEqual([{ file: 'config.js', commit: rewrite, ruleId: `${SEC}shopify-access-token` }]);
+    expect(o.gate.pass).toBe(true);
+    expect(o.gate.warnings.some((w) => w.job === 'commit range')).toBe(true);
+    const gone = scanRange(sandboxCopy(sb), { base: 'e'.repeat(40), head: rewrite }, betterleaks, 'push');
+    expect(gone.status).toBe(0);
+    expect(gone.skipped).toBe(true);
+  }, 120_000);
 });
 
 describe.skipIf(!live)('live: gitleaks 8.30.1 git mode, for comparison (why the range scan is betterleaks with no path allowlist)', () => {

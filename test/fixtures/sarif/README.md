@@ -95,7 +95,7 @@ Captured on 2026-10-30 with the pinned betterleaks 1.9.0 (`ensurePinnedBinary`'s
 commits on the head (dated last, so the tip canary is the stream's last commit), the entry's config with `prefilter = '''false'''` first,
 `--redact`, from an empty folder whose `.git` file names the repository's git folder. Each SARIF was re-indented with
 `JSON.stringify(…, null, 2)`; data and key order are unchanged. `range.json` / `clean-range.json` are the facts the step wrote beside the
-SARIF, byte for byte (`before` null: no force-push).
+SARIF, byte for byte (`before` null and `forced` false: no force-push). Captured again for fix round 2.
 
 | Fixture | Repository | Exit | Results (in stream order) |
 |---|---|---|---|

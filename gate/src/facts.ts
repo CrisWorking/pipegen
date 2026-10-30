@@ -116,7 +116,7 @@ async function rangeScanOf(tool: string, result: JobResult, outputs: JobOutputs,
   }
   const st = fileState(outputs, outputs.status === 'ok' ? await fileOf() : undefined);
   switch (st.kind) {
-    case 'ok': return st.read.rangeSkipped === true ? { tool, skipped: true } : { tool, findings: st.read.findings };
+    case 'ok': return st.read.rangeSkipped !== undefined ? { tool, skipped: st.read.rangeSkipped } : { tool, findings: st.read.findings };
     case 'absent': return { tool };
     case 'tool-error': return { tool, toolError: st.why };
     case 'tampered': return { tool, toolError: `the commit-range result is not the one the job made: ${st.why}` };
@@ -240,8 +240,11 @@ export async function gatherGateInput(ctx: GateContext, client: GateGithub, io: 
       };
       const rs = await rangeScanOf(m.entry.tool ?? RANGE_TOOL, m.result, m.outputs, fileOf);
       // fix round 1: "no commit range on this event" is not applicable only off the pull request events; on them it is a range not scanned
-      if (rs.skipped === true) {
-        if (prLike) rangeScans.push({ tool: rs.tool, toolError: 'the range scan found no commit range on this pull request event (an all-zero base or head), so the commits of the pull request are not scanned' });
+      if (rs.skipped !== undefined) {
+        if (prLike) rangeScans.push({ tool: rs.tool, toolError: 'the range scan found no commit range on this pull request event (an all-zero base or head, or a base it could not place), so the commits of the pull request are not scanned' });
+        // fix round 2 (m2): a push that rewrote the default branch with its old head gone: not scanned, which is said as a warning (decide.ts:
+        // a tool error of the range on a push only warns)
+        else if (rs.skipped === 'no-merge-base') rangeScans.push({ tool: rs.tool, toolError: 'this push rewrote the history of the default branch and its old head is not in the checkout, so its commit range was not scanned' });
         else notes.push('the range scan found no commit range on this event, so no commit range was scanned');
       } else rangeScans.push(rs);
     }

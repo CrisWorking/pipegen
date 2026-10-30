@@ -2799,41 +2799,7 @@
       "results": [
         {
           "message": {
-            "text": "pipegen-canary has detected secret for file pipegen-range-canary-1.txt at commit 79735facd7e840e68383cce461449f05b9abffb7."
-          },
-          "ruleId": "pipegen-canary",
-          "locations": [
-            {
-              "physicalLocation": {
-                "artifactLocation": {
-                  "uri": "pipegen-range-canary-1.txt"
-                },
-                "region": {
-                  "startLine": 1,
-                  "startColumn": 1,
-                  "endLine": 1,
-                  "endColumn": 47,
-                  "snippet": {
-                    "text": "REDACTED"
-                  }
-                }
-              }
-            }
-          ],
-          "partialFingerprints": {
-            "commitSha": "79735facd7e840e68383cce461449f05b9abffb7",
-            "email": "pipegen@invalid",
-            "author": "pipegen",
-            "date": "2100-01-01T00:00:00Z",
-            "commitMessage": "pipegen: commit-range canary"
-          },
-          "properties": {
-            "tags": []
-          }
-        },
-        {
-          "message": {
-            "text": "pipegen-canary has detected secret for file pipegen-range-canary-2.txt at commit 159600358147084c347374da4a357bfc54f4b12c."
+            "text": "pipegen-canary has detected secret for file pipegen-range-canary-2.txt at commit 6e576a1e84de298b7e09801b5bb6cb0cb089ba34."
           },
           "ruleId": "pipegen-canary",
           "locations": [
@@ -2855,7 +2821,41 @@
             }
           ],
           "partialFingerprints": {
-            "commitSha": "159600358147084c347374da4a357bfc54f4b12c",
+            "commitSha": "6e576a1e84de298b7e09801b5bb6cb0cb089ba34",
+            "email": "pipegen@invalid",
+            "author": "pipegen",
+            "date": "2100-01-01T00:00:00Z",
+            "commitMessage": "pipegen: commit-range canary"
+          },
+          "properties": {
+            "tags": []
+          }
+        },
+        {
+          "message": {
+            "text": "pipegen-canary has detected secret for file pipegen-range-canary-1.txt at commit 99c23c45dfea16896a062f2ee506a490c32ea70f."
+          },
+          "ruleId": "pipegen-canary",
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "pipegen-range-canary-1.txt"
+                },
+                "region": {
+                  "startLine": 1,
+                  "startColumn": 1,
+                  "endLine": 1,
+                  "endColumn": 47,
+                  "snippet": {
+                    "text": "REDACTED"
+                  }
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "commitSha": "99c23c45dfea16896a062f2ee506a490c32ea70f",
             "email": "pipegen@invalid",
             "author": "pipegen",
             "date": "2100-01-01T00:00:00Z",

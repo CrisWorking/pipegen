@@ -2597,7 +2597,8 @@ function jobListLiteralProblem(text) {
 var BASE_CHECKOUT_REF = `\${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event_name == 'pull_request_review' && github.event.pull_request.base.sha || github.event_name == 'merge_group' && github.event.merge_group.base_sha || github.event_name == 'push' && github.event.before || '${"0".repeat(40)}' }}`;
 var RANGE_HEAD_REF = `\${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.event_name == 'pull_request_review' && github.event.pull_request.head.sha || github.event_name == 'merge_group' && github.event.merge_group.head_sha || github.event_name == 'push' && github.event.after || '${"0".repeat(40)}' }}`;
 var RANGE_BEFORE_REF = `\${{ github.event_name == 'pull_request' && github.event.action == 'synchronize' && github.event.before || '${"0".repeat(40)}' }}`;
-var RANGE_STEP_ENV = Object.freeze({ PIPEGEN_RANGE_BASE: BASE_CHECKOUT_REF, PIPEGEN_RANGE_HEAD: RANGE_HEAD_REF, PIPEGEN_RANGE_BEFORE: RANGE_BEFORE_REF });
+var RANGE_EVENT_REF = "${{ github.event_name }}";
+var RANGE_STEP_ENV = Object.freeze({ PIPEGEN_RANGE_BASE: BASE_CHECKOUT_REF, PIPEGEN_RANGE_HEAD: RANGE_HEAD_REF, PIPEGEN_RANGE_BEFORE: RANGE_BEFORE_REF, PIPEGEN_RANGE_EVENT: RANGE_EVENT_REF });
 var rangeScanStepId = `checker-run-${sha16(SECRETS_RANGE_ARTIFACT)}`;
 var RENDERER_INPUTS = Object.freeze({
   // the base commit, for the base-scan job only (the job rule is in job-rules.ts); no other ref is ever set
@@ -5787,12 +5788,13 @@ function applyStage(parsed, stage, tool2) {
 import { closeSync as closeSync3, constants as constants3, fstatSync as fstatSync3, lstatSync as lstatSync3, openSync as openSync3, readSync as readSync3 } from "node:fs";
 var RangeFactsError = class extends Error {
 };
+var SKIP_REASONS = ["no-range", "no-merge-base"];
 var isRangeSkipped = (r) => Object.hasOwn(r, "skipped");
 var SHA_RE3 = /^[0-9a-f]{40}$/;
 var ZERO = "0".repeat(40);
 var MAX_FACTS_BYTES = 64 * 1024;
 var MAX_COMMITS = 1e7;
-var KEYS = ["base", "before", "canaries", "commits", "head", "pipegenRange"];
+var KEYS = ["base", "before", "canaries", "commits", "forced", "head", "pipegenRange"];
 var CANARY_RULE_ID2 = `secret:${CANARY_RULE}`;
 var isObj2 = (v) => typeof v === "object" && v !== null && !Array.isArray(v);
 function parseRangeFacts(text) {
@@ -5809,12 +5811,13 @@ function parseRangeFacts(text) {
   if (!isObj2(d)) return bad("are not in the form the range scan step writes");
   if (d.pipegenRange !== 1) bad("are of a version this gate does not read");
   if (Object.keys(d).sort().join() === "pipegenRange,skipped") {
-    if (d.skipped !== "no-range") bad("say the scan was skipped for a reason this gate does not know");
-    return { skipped: "no-range" };
+    if (!SKIP_REASONS.includes(d.skipped)) bad("say the scan was skipped for a reason this gate does not know");
+    return { skipped: d.skipped };
   }
   if (Object.keys(d).sort().join() !== KEYS.join()) return bad("are not in the form the range scan step writes");
   for (const k of ["base", "head"]) if (typeof d[k] !== "string" || !SHA_RE3.test(d[k]) || d[k] === ZERO) bad(`have a ${k} that is not a commit sha`);
   if (d.before !== null && (typeof d.before !== "string" || !SHA_RE3.test(d.before) || d.before === ZERO)) bad("have a before that is not a commit sha");
+  if (typeof d.forced !== "boolean") bad("do not say whether the push rewrote the branch");
   if (typeof d.commits !== "number" || !Number.isSafeInteger(d.commits) || d.commits < 0 || d.commits > MAX_COMMITS) bad("have a commit count that is not a whole number");
   const list = d.canaries;
   if (!Array.isArray(list) || list.length !== RANGE_CANARY_FILES.length) return bad(`do not name ${RANGE_CANARY_FILES.length} canary commits`);
@@ -5826,7 +5829,7 @@ function parseRangeFacts(text) {
     return { commit: c.commit, path };
   });
   if (new Set(canaries.map((c) => c.commit)).size !== canaries.length) bad("name one canary commit twice");
-  return { base: d.base, head: d.head, before: d.before, commits: d.commits, canaries };
+  return { base: d.base, head: d.head, before: d.before, forced: d.forced, commits: d.commits, canaries };
 }
 function readRangeFacts(path) {
   let st;
@@ -5878,10 +5881,16 @@ function applyRange(findings, facts) {
   const dropped = facts.before === null ? "" : `, and the commits the push replaced (the head before it, ${facts.before.slice(0, 12)})`;
   return {
     findings: kept,
-    notes: [`the commit range ${facts.base.slice(0, 12)}..${facts.head.slice(0, 12)} (${facts.commits} commit(s), merges included${dropped}) was scanned to its end; both canary commits were read`]
+    notes: [
+      `the commit range ${facts.base.slice(0, 12)}..${facts.head.slice(0, 12)} (${facts.commits} commit(s), merges included${dropped}) was scanned to its end; both canary commits were read`,
+      ...facts.forced ? ["this push rewrote the history of the branch: the range was scanned from where its old and new heads meet"] : []
+    ]
   };
 }
-var NO_RANGE_NOTE = "no commit range on this event (a push that made the branch, workflow_dispatch or schedule), so no commit range was scanned";
+var SKIP_NOTES = Object.freeze({
+  "no-range": "no commit range on this event (a push that made the branch, workflow_dispatch or schedule), so no commit range was scanned",
+  "no-merge-base": "this push rewrote the history of the branch and its old head is not in the checkout, so its commit range was not scanned"
+});
 
 // gate/src/scrub.ts
 var MAX_ERROR_CHARS = 300;
@@ -6012,8 +6021,9 @@ function scrubBytes(raw, opts) {
       secretsTool = SARIF_TOOLS[opts.tool].secrets;
       if (opts.range !== void 0 && (opts.tool !== SECRETS_RANGE_TOOL || opts.stage !== void 0)) return toolError(`the commit-range scan is ${SECRETS_RANGE_TOOL}'s, and it has no stage folder`, key);
       if (opts.range !== void 0 && isRangeSkipped(opts.range)) {
-        const bytes2 = Buffer.from(sarifOut(opts.tool, [], [NO_RANGE_NOTE], void 0, { pipegenRangeSkipped: true }), "utf8");
-        return { status: "ok", bytes: bytes2, sha256: sha2562(bytes2), findings: 0, notes: [NO_RANGE_NOTE], fpBy: { hash: 0, region: 0, quoted: 0, file: 0, line: 0, nokey: 0, "quoted-nokey": 0 } };
+        const note = SKIP_NOTES[opts.range.skipped];
+        const bytes2 = Buffer.from(sarifOut(opts.tool, [], [note], void 0, { pipegenRangeSkipped: opts.range.skipped }), "utf8");
+        return { status: "ok", bytes: bytes2, sha256: sha2562(bytes2), findings: 0, notes: [note], fpBy: { hash: 0, region: 0, quoted: 0, file: 0, line: 0, nokey: 0, "quoted-nokey": 0 } };
       }
       if (opts.stage !== void 0) {
         if (!secretsTool) return toolError("a stage folder is only for the secrets tools", key);
@@ -6180,8 +6190,8 @@ function readScrubbed(input, format, maxBytes = MAX_RAW_BYTES) {
         };
       });
       const skipped = getOwn(props, "pipegenRangeSkipped");
-      if (skipped !== void 0 && (skipped !== true || findings2.length > 0)) fail("the commit-range skip mark is not the scrub's");
-      return { findings: findings2, ...typeof id === "string" ? { keyId: id } : {}, notes: readNotes(getOwn(props, "pipegenNotes"), "properties"), ...skipped === true ? { rangeSkipped: true } : {} };
+      if (skipped !== void 0 && (!SKIP_REASONS.includes(skipped) || findings2.length > 0)) fail("the commit-range skip mark is not the scrub's (an unknown reason, or findings beside it)");
+      return { findings: findings2, ...typeof id === "string" ? { keyId: id } : {}, notes: readNotes(getOwn(props, "pipegenNotes"), "properties"), ...skipped === void 0 ? {} : { rangeSkipped: skipped } };
     }
     if (getOwn(doc, "pipegenScrubbed") !== true || getOwn(doc, "tool") !== ZAP_TOOL) fail("the result was not written by the scrub for ZAP");
     const alerts = getOwn(doc, "alerts");
@@ -8460,7 +8470,7 @@ async function rangeScanOf(tool2, result, outputs, fileOf) {
   const st = fileState(outputs, outputs.status === "ok" ? await fileOf() : void 0);
   switch (st.kind) {
     case "ok":
-      return st.read.rangeSkipped === true ? { tool: tool2, skipped: true } : { tool: tool2, findings: st.read.findings };
+      return st.read.rangeSkipped !== void 0 ? { tool: tool2, skipped: st.read.rangeSkipped } : { tool: tool2, findings: st.read.findings };
     case "absent":
       return { tool: tool2 };
     case "tool-error":
@@ -8580,8 +8590,9 @@ async function gatherGateInput(ctx, client, io) {
         return d.kind === "file" ? d.file : void 0;
       };
       const rs = await rangeScanOf(m.entry.tool ?? RANGE_TOOL, m.result, m.outputs, fileOf);
-      if (rs.skipped === true) {
-        if (prLike) rangeScans.push({ tool: rs.tool, toolError: "the range scan found no commit range on this pull request event (an all-zero base or head), so the commits of the pull request are not scanned" });
+      if (rs.skipped !== void 0) {
+        if (prLike) rangeScans.push({ tool: rs.tool, toolError: "the range scan found no commit range on this pull request event (an all-zero base or head, or a base it could not place), so the commits of the pull request are not scanned" });
+        else if (rs.skipped === "no-merge-base") rangeScans.push({ tool: rs.tool, toolError: "this push rewrote the history of the default branch and its old head is not in the checkout, so its commit range was not scanned" });
         else notes.push("the range scan found no commit range on this event, so no commit range was scanned");
       } else rangeScans.push(rs);
     }

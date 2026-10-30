@@ -721,6 +721,8 @@ export const RANGE_PIPEGEN_NOTE = [
   'pipegen also scans every commit a pull request pushes, not only its last one: a secret added in one commit and removed in a later one still blocks, because it was pushed and has leaked. Rotate it now.',
   'When a push rewrites the pull request (a force-push), the commits it replaced are scanned too, once, on that push. A commit replaced two or more pushes ago is no longer in the range: a secret pushed is leaked whatever later pushes do, so rotate it when pipegen first reports it.',
   'A merge from the default branch into the pull request brings that branch\'s newer commits into the range: a secret there blocks the pull request too. A merge commit is scanned for what its own resolution added.',
+  'A merge commit with three or more parents (an octopus merge) can not be shown with only its own changes, so a pull request that holds one is not scanned and blocks: merge one branch at a time.',
+  'On a push to the default branch the commit range is informational. A push that rewrote the default branch (a force-push) is scanned from where its old and new heads meet; when the old head is gone, it is not scanned (a warning).',
   'Commit messages are not scanned for secrets.',
 ].join('\n\n');
 
@@ -750,6 +752,10 @@ export const RANGE_PIPEGEN_NOTE = [
  * The dropped commits (I2): on a synchronize, `before` (the previous head) is a revision of the stream too (`^base <tip> <before>`): the
  * commits a force-push replaced. A `before` not in the checkout is fetched by sha; one that can not be fetched fails the step. Residual: a
  * commit replaced two or more pushes ago is no longer in any range (RANGE_PIPEGEN_NOTE).
+ * Fix round 2 (review-C9-r1.md): on a push (the event comes in its own exact form, RANGE_EVENT_REF), an old head that is not an ancestor of the
+ * new one (a force-push) moves the range's base to where the two meet (`git merge-base`, the facts say `forced`); with the old head gone from
+ * the checkout there is no such point, and the step skips (`no-merge-base`, a warning in the gate). A range holding an octopus merge (three or
+ * more parents, whose own changes --remerge-diff can not show) fails the step. Every git command runs with GIT_NO_REPLACE_OBJECTS=1.
  * Not scanned: commit messages and author fields (betterleaks reads the patches only; a known limit, carried to Plan P).
  * No range on this event (an all-zero base or head: a push that made the branch, workflow_dispatch, schedule): the step writes the facts
  * `{ skipped: 'no-range' }` and exits 0; the gate reads that as not applicable on those events only, and blocks on a pull request event.
@@ -785,20 +791,26 @@ export function renderRangeScan(tool: ReviewedTool): RenderResult {
     `  [ "\${#c}" -eq 40 ] || ${notCommits}`,
     'done',
     // no range on this event: a note, and facts that say so (the gate blocks on a pull request event, and notes it on the others)
-    `if [ "$base" = ${zero} ] || [ "$head" = ${zero} ]; then`,
-    '  echo "pipegen: this event has no commit range (a push that made the branch, workflow_dispatch or schedule), so no commit range is scanned"',
+    // a skip: a note, and facts that say why (the gate blocks on a pull request event, and notes or warns on the others)
+    'skip() {',
+    '  echo "pipegen: $2"',
     '  mkdir -p "$RUNNER_TEMP/pipegen-raw"',
     `  mkdir "${outDir}"`,
-    `  printf '{"pipegenRange":1,"skipped":"no-range"}\\n' > "${outDir}/${RANGE_FACTS_FILE}"`,
+    `  printf '{"pipegenRange":1,"skipped":"%s"}\\n' "$1" > "${outDir}/${RANGE_FACTS_FILE}"`,
     `  chmod -R a-w "${outDir}"`,
     '  exit 0',
-    'fi',
+    '}',
+    'event="$PIPEGEN_RANGE_EVENT"',
+    'case "$event" in pull_request|pull_request_review|merge_group|push|workflow_dispatch|schedule|workflow_call) ;; *) pg_fail "the event name is not one the range scan knows, so it is not scanned" ;; esac',
+    `if [ "$base" = ${zero} ] || [ "$head" = ${zero} ]; then skip no-range "this event has no commit range (a push that made the branch, workflow_dispatch or schedule), so no commit range is scanned"; fi`,
     'git=(',
     '  "${sys[@]}"',
     '  GIT_CONFIG_NOSYSTEM=1',
     '  GIT_CONFIG_GLOBAL=/dev/null',
     '  GIT_TERMINAL_PROMPT=0',
     '  GIT_ALLOW_PROTOCOL=https',
+    // fix round 2 (m5): the step's own git reads the same objects as the scanner's (betterleaks sets it for its git): no refs/replace
+    '  GIT_NO_REPLACE_OBJECTS=1',
     '  GIT_AUTHOR_NAME=pipegen',
     '  GIT_AUTHOR_EMAIL=pipegen@invalid',
     `  'GIT_AUTHOR_DATE=${CANARY_DATE}'`,
@@ -816,9 +828,20 @@ export function renderRangeScan(tool: ReviewedTool): RenderResult {
     'gmin="${gmin%%[!0-9]*}"',
     'case "$gmaj$gmin" in *[!0-9]*|"") pg_fail "the version of git could not be read, so merge commits can not be scanned" ;; esac',
     `if [ "$gmaj" -lt ${REMERGE_GIT[0]} ] || { [ "$gmaj" -eq ${REMERGE_GIT[0]} ] && [ "$gmin" -lt ${REMERGE_GIT[1]} ]; }; then pg_fail "git $gv can not show what a merge commit added (--remerge-diff needs git ${REMERGE_GIT.join('.')}), so the commit range is not scanned"; fi`,
-    'for c in "$base" "$head"; do',
-    '  "${git[@]}" cat-file -e "$c^{commit}" 2> /dev/null || pg_fail "the commit $c is not in the checkout: the secrets job checks out the whole history (fetch-depth: 0)"',
-    'done',
+    '"${git[@]}" cat-file -e "$head^{commit}" 2> /dev/null || pg_fail "the commit $head is not in the checkout: the secrets job checks out the whole history (fetch-depth: 0)"',
+    // fix round 2 (m2): a push that rewrote the branch (its old head is not an ancestor of the new one): scan from where they meet; when the
+    // old head is gone from the checkout, there is no such point, and the push is not scanned (on a push the range is informational)
+    'forced=false',
+    'if [ "$event" = push ] && ! "${git[@]}" merge-base --is-ancestor "$base" "$head" 2> /dev/null; then',
+    '  mb=""',
+    '  if "${git[@]}" cat-file -e "$base^{commit}" 2> /dev/null; then mb="$("${git[@]}" merge-base "$base" "$head" 2> /dev/null || true)"; fi',
+    '  case "$mb" in *[!0-9a-f]*|"") skip no-merge-base "this push rewrote the history of the branch and its old head $base is not in the checkout, so its commit range is not scanned" ;; esac',
+    '  [ "${#mb}" -eq 40 ] || skip no-merge-base "this push rewrote the history of the branch and its old head $base is not in the checkout, so its commit range is not scanned"',
+    '  echo "pipegen: this push rewrote the history of the branch (its old head $base is not an ancestor of $head); the range is scanned from where they meet, $mb"',
+    '  base="$mb"',
+    '  forced=true',
+    'fi',
+    '"${git[@]}" cat-file -e "$base^{commit}" 2> /dev/null || pg_fail "the commit $base is not in the checkout: the secrets job checks out the whole history (fetch-depth: 0)"',
     // the commits a force-push dropped: fetched by sha when the checkout does not hold them (a pushed commit stays fetchable)
     'revs=()',
     `if [ "$before" != ${zero} ]; then`,
@@ -859,6 +882,9 @@ export function renderRangeScan(tool: ReviewedTool): RenderResult {
     'tail2="$("${sys[@]}" tail -n 2 -- "$work/order.txt" | "${sys[@]}" tr \'\\n\' \' \')"',
     '[ "$tail2" = "${canaries[0]} ${canaries[1]} " ] || pg_fail "a commit of the range is dated after the canary commits, so the canary is not the last commit the scanner reads and the stream can not be proven read to its end"',
     'own=$((want - 2))',
+    // fix round 2 (m3): --remerge-diff shows nothing of a merge with three or more parents, so a range that holds one is not scanned
+    '"${git[@]}" rev-list --min-parents=3 "^$base" "$last" "${revs[@]}" > "$work/octopus.txt"',
+    'if [ -s "$work/octopus.txt" ]; then pg_fail "the commit range holds an octopus merge (commit $("${sys[@]}" head -n 1 -- "$work/octopus.txt"), three or more parents), whose own changes can not be shown, so the range is not scanned: merge one branch at a time"; fi',
     // the scanner runs from an empty folder whose .git file names the checkout's git folder (no ignore file of the checkout is read)
     'src="$work/src"',
     'mkdir "$src"',
@@ -880,7 +906,7 @@ export function renderRangeScan(tool: ReviewedTool): RenderResult {
     `  mkdir "${outDir}"`,
     '  bjson=null',
     `  [ "$before" = ${zero} ] || bjson="\\"$before\\""`,
-    `  printf '{"pipegenRange":1,"base":"%s","head":"%s","before":%s,"commits":%s,"canaries":[{"commit":"%s","path":"${c1}"},{"commit":"%s","path":"${c2}"}]}\\n' "$base" "$head" "$bjson" "$own" "\${canaries[0]}" "\${canaries[1]}" > "${outDir}/${RANGE_FACTS_FILE}"`,
+    `  printf '{"pipegenRange":1,"base":"%s","head":"%s","before":%s,"forced":%s,"commits":%s,"canaries":[{"commit":"%s","path":"${c1}"},{"commit":"%s","path":"${c2}"}]}\\n' "$base" "$head" "$bjson" "$forced" "$own" "\${canaries[0]}" "\${canaries[1]}" > "${outDir}/${RANGE_FACTS_FILE}"`,
     `  mv -- "$out" "${outDir}/${out}"`,
     `  chmod -R a-w "${outDir}"`,
     'else',

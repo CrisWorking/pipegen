@@ -77,7 +77,7 @@ export interface CheckInput {
  * A secrets scan of the PR's commit range (base..head, C1b review I2; C9: the secrets job's range scan, betterleaks `git` mode), read back
  * like a result file: `findings` (each with its commit), or `toolError`; neither = no result. facts.ts reads it.
  */
-export interface RangeScan { tool: string; findings?: ScrubbedFinding[]; toolError?: string; /** Fix round 1: the scan had no commit range on its event (facts.ts turns it into a tool error or a note). */ skipped?: true }
+export interface RangeScan { tool: string; findings?: ScrubbedFinding[]; toolError?: string; /** Fix rounds 1 and 2: the scan scanned nothing, and why (facts.ts turns it into a tool error, a warning or a note). */ skipped?: 'no-range' | 'no-merge-base' }
 /** The trusted baseline (C3): counts by countKeyOf, and the tools it covers (a tool it does not cover falls back to the base scan). */
 export interface Baseline { tools: readonly string[]; counts: ReadonlyMap<string, number> }
 /**

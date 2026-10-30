@@ -122,11 +122,11 @@ function fakeBetterleaks(sb: Sandbox, rc = 10): void {
   ].join('\n'));
   chmodSync(path, 0o755);
 }
-interface Range { base: string; head: string; before?: string }
-function tryScan(sb: Sandbox, range: Range): { status: number | null; stdout: string; stderr: string } {
+interface Range { base: string; head: string; before?: string; event?: string }
+function tryScan(sb: Sandbox, range: Range, edit: (run: string) => string = (x) => x): { status: number | null; stdout: string; stderr: string } {
   const scan = renderRangeBlock(entry('betterleaks'), p, GATE).steps[1] as RenderedStep;
-  const env = { ...stepEnv(scan, sb), PIPEGEN_RANGE_BASE: range.base, PIPEGEN_RANGE_HEAD: range.head, PIPEGEN_RANGE_BEFORE: range.before ?? ZERO };
-  const r = spawnSync('bash', ['--noprofile', '--norc', '-c', scan.run ?? ''], { cwd: sb.ws, env, encoding: 'utf8' });
+  const env = { ...stepEnv(scan, sb), PIPEGEN_RANGE_BASE: range.base, PIPEGEN_RANGE_HEAD: range.head, PIPEGEN_RANGE_BEFORE: range.before ?? ZERO, PIPEGEN_RANGE_EVENT: range.event ?? 'pull_request' };
+  const r = spawnSync('bash', ['--noprofile', '--norc', '-c', edit(scan.run ?? '')], { cwd: sb.ws, env, encoding: 'utf8' });
   return { status: r.status, stdout: r.stdout, stderr: r.status === 0 ? '' : r.stderr };
 }
 const rawDir = (sb: Sandbox): string => join(sb.rt, 'pipegen-raw', A);
@@ -162,7 +162,7 @@ describe('the range scan step (a stand-in scanner): one ordered stream, the tip 
     expect(existsSync(join(sb.ws, '.git', 'info', 'attributes'))).toBe(false);
     expect(readdirSync(rawDir(sb)).sort()).toEqual(['betterleaks.sarif', 'range.json']);
     const facts = JSON.parse(readFileSync(join(rawDir(sb), 'range.json'), 'utf8')) as Record<string, unknown>;
-    expect(facts).toEqual({ pipegenRange: 1, base: r.base, head: r.head, before: null, commits: 1, canaries: [{ commit: c1, path: 'pipegen-range-canary-1.txt' }, { commit: c2, path: 'pipegen-range-canary-2.txt' }] });
+    expect(facts).toEqual({ pipegenRange: 1, base: r.base, head: r.head, before: null, forced: false, commits: 1, canaries: [{ commit: c1, path: 'pipegen-range-canary-1.txt' }, { commit: c2, path: 'pipegen-range-canary-2.txt' }] });
   });
 
   it('merges count: a merge inside the range is in the stream (its own resolution, --remerge-diff) and in the commit count', () => {
@@ -279,6 +279,103 @@ describe('the range scan step (a stand-in scanner): one ordered stream, the tip 
       expect(x.status, what).toBe(1);
       expect(existsSync(join(sb.rt, 'fake-argv')), what).toBe(false);
     }
+  });
+});
+
+
+// ---------- fix round 2 (review-C9-r1.md m2 to m5) ----------
+
+describe('fix round 2: a force-push to the default branch, octopus merges, the git version, replace objects', () => {
+  it('m2: a push whose before is not an ancestor of after (a force-push to main) scans ^merge-base(before, after) <after>, with a note, and the facts say forced', () => {
+    const sb = sandbox();
+    const r = repo(sb, 2);
+    const oldHead = r.head;
+    const fork = git(sb.ws, 'rev-parse', 'HEAD~1');
+    git(sb.ws, 'reset', '-q', '--hard', 'HEAD~1');
+    writeFileSync(join(sb.ws, 'n.txt'), 'rewritten\n');
+    git(sb.ws, 'add', '-A');
+    git(sb.ws, 'commit', '-q', '-m', 'the rewrite');
+    const after = git(sb.ws, 'rev-parse', 'HEAD');
+    fakeBetterleaks(sb);
+    const x = tryScan(sb, { base: oldHead, head: after, event: 'push' });
+    expect(x.status, x.stderr).toBe(0);
+    expect(x.stdout).toMatch(/rewrote the history/);
+    expect(LO_RE.exec(logOpts(sb))?.[1]).toBe(fork);
+    const facts = JSON.parse(readFileSync(join(rawDir(sb), 'range.json'), 'utf8')) as { base: string; forced: boolean; commits: number };
+    expect(facts).toMatchObject({ base: fork, forced: true, commits: 1 });
+    // an ordinary push: not forced
+    const ok = sandbox();
+    const r2 = repo(ok, 2);
+    fakeBetterleaks(ok);
+    expect(tryScan(ok, { base: git(ok.ws, 'rev-parse', 'HEAD~1'), head: r2.head, event: 'push' }).status).toBe(0);
+    expect((JSON.parse(readFileSync(join(rawDir(ok), 'range.json'), 'utf8')) as { forced: boolean }).forced).toBe(false);
+  });
+
+  it('m2: a forced push whose old head is not in the checkout (no merge base can be found): the step skips with a note, and the facts say why', () => {
+    const sb = sandbox();
+    const r = repo(sb, 1);
+    fakeBetterleaks(sb);
+    const x = tryScan(sb, { base: 'e'.repeat(40), head: r.head, event: 'push' });
+    expect(x.status, x.stderr).toBe(0);
+    expect(x.stdout).toMatch(/not in the checkout/);
+    expect(existsSync(join(sb.rt, 'fake-argv'))).toBe(false);
+    expect(JSON.parse(readFileSync(join(rawDir(sb), 'range.json'), 'utf8'))).toEqual({ pipegenRange: 1, skipped: 'no-merge-base' });
+    // on a pull request a base that is not in the checkout still fails the step
+    const pr = sandbox();
+    const r2 = repo(pr, 1);
+    fakeBetterleaks(pr);
+    expect(tryScan(pr, { base: 'e'.repeat(40), head: r2.head }).status).toBe(1);
+    // an event name the step does not know is refused
+    const odd = sandbox();
+    fakeBetterleaks(odd);
+    expect(tryScan(odd, { ...repo(odd, 1), event: 'push;id' }).status).toBe(1);
+  });
+
+  it('m3: a range holding a merge with three or more parents (an octopus) fails the step with why', () => {
+    const sb = sandbox();
+    const r = repo(sb, 1);
+    for (const b of ['x', 'y']) {
+      git(sb.ws, 'checkout', '-q', '-b', b, r.base);
+      writeFileSync(join(sb.ws, `${b}.txt`), `${b}\n`);
+      git(sb.ws, 'add', '-A');
+      git(sb.ws, 'commit', '-q', '-m', b);
+    }
+    git(sb.ws, 'checkout', '-q', 'main');
+    git(sb.ws, 'merge', '-q', '--no-edit', 'x', 'y');
+    fakeBetterleaks(sb);
+    const x = tryScan(sb, { base: r.base, head: git(sb.ws, 'rev-parse', 'HEAD') });
+    expect(x.status).toBe(1);
+    expect(x.stderr).toMatch(/octopus merge .*three or more parents/);
+    expect(existsSync(join(sb.rt, 'fake-argv'))).toBe(false);
+  });
+
+  it('m4: a git older than 2.36 (no --remerge-diff) fails the step; 2.36 itself is fine', () => {
+    for (const [v, status] of [['2.35.1', 1], ['1.9.5', 1], ['2.36.0', 0], ['3.0.0', 0]] as const) {
+      const sb = sandbox();
+      const r = repo(sb, 1);
+      fakeBetterleaks(sb);
+      const fake = join(sb.dir, 'git');
+      writeFileSync(fake, ['#!/bin/bash', `if [ "$1" = version ]; then echo "git version ${v}"; exit 0; fi`, 'exec /usr/bin/git "$@"'].join('\n'));
+      chmodSync(fake, 0o755);
+      const x = tryScan(sb, r, (run) => run.replace("\n  /usr/bin/git\n", `\n  ${fake}\n`));
+      expect(x.status, v).toBe(status);
+      if (status === 1) expect(x.stderr, v).toMatch(/--remerge-diff needs git 2\.36/);
+    }
+  });
+
+  it('m5: every git command of the step runs with GIT_NO_REPLACE_OBJECTS=1; the event name comes in its own exact form', () => {
+    const scan = renderRangeBlock(entry('betterleaks'), p, GATE).steps[1] as RenderedStep;
+    expect(scan.run).toMatch(/git=\(\n  "\$\{sys\[@\]\}"\n(?:  [^\n]*\n)*  GIT_NO_REPLACE_OBJECTS=1\n(?:  [^\n]*\n)*  \/usr\/bin\/git\n\)/);
+    expect((scan.run ?? '').match(/\/usr\/bin\/git/g)).toHaveLength(1);   // the one git, always through the array
+    expect(scan.env?.PIPEGEN_RANGE_EVENT).toBe('${{ github.event_name }}');
+    expect(() => checkExpressions({ ...scan, env: { ...scan.env, PIPEGEN_RANGE_EVENT: '${{ github.event.action }}' } })).toThrow(RenderError);
+    // a replace ref in the checkout changes nothing the step sees: the order check and the stream read the real objects
+    const sb = sandbox();
+    const r = repo(sb, 2);
+    git(sb.ws, 'replace', r.head, r.base);
+    fakeBetterleaks(sb);
+    expect(tryScan(sb, r).status).toBe(0);
+    expect((JSON.parse(readFileSync(join(rawDir(sb), 'range.json'), 'utf8')) as { commits: number }).commits).toBe(2);
   });
 });
 

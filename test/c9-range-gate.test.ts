@@ -66,7 +66,7 @@ describe('the parser: the commit of each finding of a git-mode scan', () => {
 
 describe('the range facts (range.json, written by the range scan step)', () => {
   it('parses the captured facts; anything else is refused', () => {
-    expect(parseRangeFacts(LEAK_FACTS)).toEqual({ base: facts.base, head: facts.head, before: null, commits: 2, canaries: facts.canaries });
+    expect(parseRangeFacts(LEAK_FACTS)).toEqual({ base: facts.base, head: facts.head, before: null, forced: false, commits: 2, canaries: facts.canaries });
     // fix round 1 (I2): the head before a force-push, when the step read its dropped commits
     expect(parseRangeFacts(JSON.stringify({ ...JSON.parse(LEAK_FACTS) as object, before: 'e'.repeat(40) }))).toMatchObject({ before: 'e'.repeat(40) });
     // fix round 1: an event with no commit range
@@ -133,7 +133,7 @@ describe('the scrub in range mode', () => {
     if (r.status !== 'ok') throw new Error(r.error);
     expect(r.findings).toBe(0);
     const back = readScrubbed(r.bytes, 'sarif');
-    expect(back.rangeSkipped).toBe(true);
+    expect(back.rangeSkipped).toBe('no-range');
     expect(back.notes.join('\n')).toMatch(/no commit range/);
     expect(readScrubbed(scrubRange(CLEAN_SARIF, CLEAN_FACTS).status === 'ok' ? (scrubRange(CLEAN_SARIF, CLEAN_FACTS) as { bytes: Buffer }).bytes : Buffer.from(''), 'sarif').rangeSkipped).toBeUndefined();
     // scrubFile: only range.json in the raw folder (the step wrote no SARIF)
@@ -144,7 +144,7 @@ describe('the scrub in range mode', () => {
     const out = join(sb.rt, 'pipegen-out', A, 'betterleaks.sarif');
     const f = scrubFile({ artifact: A, tool: 'betterleaks', format: 'sarif', raw: join(rawDir, 'betterleaks.sarif'), out, fpKey: FPKEY, workspace: sb.ws, eventText: '{}' });
     expect(f.status, f.error).toBe('ok');
-    expect(readScrubbed(readFileSync(out), 'sarif').rangeSkipped).toBe(true);
+    expect(readScrubbed(readFileSync(out), 'sarif').rangeSkipped).toBe('no-range');
   });
 
   it('a canary-rule finding pipegen did not put there (a line of the pull request) is a real finding of the range, never a proof', () => {
@@ -276,5 +276,33 @@ describe('fix round 1: the belts, tested on their own', () => {
     for (const over of [{ artifact: 'pipegen-out-secrets' }, { tool: 'gitleaks' }, { baseArtifact: 'pipegen-out-base-secrets' }, { format: 'none' }, { needId: 'sast', job: 'sast' }]) {
       expect(entryProblem({ ...r, ...over } as JobListEntry, 0), JSON.stringify(over)).not.toBeNull();
     }
+  });
+});
+
+// ---------- fix round 2 (review-C9-r1.md m2, m4) ----------
+
+describe('fix round 2: a force-push to main, and the skip mark', () => {
+  it('m2: the facts say whether the push rewrote the branch (forced), and a skip may say the old head is not in the checkout (no-merge-base)', () => {
+    expect(parseRangeFacts(LEAK_FACTS)).toMatchObject({ forced: false });
+    expect(parseRangeFacts(JSON.stringify({ ...JSON.parse(LEAK_FACTS) as object, forced: true }))).toMatchObject({ forced: true });
+    for (const bad of [{ forced: 'yes' }, { forced: undefined }]) expect(() => parseRangeFacts(JSON.stringify({ ...JSON.parse(LEAK_FACTS) as object, ...bad })), JSON.stringify(bad)).toThrow(RangeFactsError);
+    expect(parseRangeFacts('{"pipegenRange":1,"skipped":"no-merge-base"}')).toEqual({ skipped: 'no-merge-base' });
+    const forced = scrubRange(LEAK_SARIF, JSON.stringify({ ...JSON.parse(LEAK_FACTS) as object, forced: true }));
+    expect(forced.status === 'ok' && forced.notes.join('\n')).toMatch(/rewrote the history/);
+    const skip = scrubRange(Buffer.from(''), '{"pipegenRange":1,"skipped":"no-merge-base"}');
+    if (skip.status !== 'ok') throw new Error(skip.error);
+    expect(readScrubbed(skip.bytes, 'sarif')).toMatchObject({ rangeSkipped: 'no-merge-base' });
+  });
+
+  it('m4: a scrubbed result whose skip mark comes with findings (or is not a known reason) is not the scrub\'s file', () => {
+    const skip = scrubRange(Buffer.from(''), '{"pipegenRange":1,"skipped":"no-range"}');
+    const leak = scrubRange(LEAK_SARIF, LEAK_FACTS);
+    if (skip.status !== 'ok' || leak.status !== 'ok') throw new Error('scrub');
+    const doc = JSON.parse(leak.bytes.toString('utf8')) as { runs: { properties: Record<string, unknown> }[] };
+    (doc.runs[0] as { properties: Record<string, unknown> }).properties.pipegenRangeSkipped = 'no-range';
+    expect(readScrubbed(JSON.stringify(doc), 'sarif').toolError).toMatch(/skip/);
+    const odd = JSON.parse(skip.bytes.toString('utf8')) as { runs: { properties: Record<string, unknown> }[] };
+    (odd.runs[0] as { properties: Record<string, unknown> }).properties.pipegenRangeSkipped = 'other';
+    expect(readScrubbed(JSON.stringify(odd), 'sarif').toolError).toMatch(/skip/);
   });
 });

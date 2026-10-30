@@ -22,9 +22,14 @@ export class RangeFactsError extends Error {}
  * The facts of one range scan. `before` (fix round 1, I2): on a synchronize, the head before this push, whose dropped commits the stream also
  * read; null otherwise. `commits`: the commits of the stream that are not canaries (merges included since fix round 1).
  */
-export interface RangeFacts { base: string; head: string; before: string | null; commits: number; canaries: readonly { commit: string; path: string }[] }
-/** Fix round 1: the step found no commit range on this event (an all-zero base or head) and scanned nothing. */
-export interface RangeSkipped { skipped: 'no-range' }
+export interface RangeFacts { base: string; head: string; before: string | null; forced: boolean; commits: number; canaries: readonly { commit: string; path: string }[] }
+/**
+ * Why the step scanned nothing: `no-range`, no commit range on this event (an all-zero base or head; fix round 1); `no-merge-base`, a push that
+ * rewrote the branch and whose old head is gone from the checkout (fix round 2, m2).
+ */
+export const SKIP_REASONS = ['no-range', 'no-merge-base'] as const;
+export type SkipReason = (typeof SKIP_REASONS)[number];
+export interface RangeSkipped { skipped: SkipReason }
 export type RangeRun = RangeFacts | RangeSkipped;
 export const isRangeSkipped = (r: RangeRun): r is RangeSkipped => Object.hasOwn(r, 'skipped');
 
@@ -32,7 +37,7 @@ const SHA_RE = /^[0-9a-f]{40}$/;
 const ZERO = '0'.repeat(40);
 const MAX_FACTS_BYTES = 64 * 1024;
 const MAX_COMMITS = 10_000_000;
-const KEYS = ['base', 'before', 'canaries', 'commits', 'head', 'pipegenRange'];
+const KEYS = ['base', 'before', 'canaries', 'commits', 'forced', 'head', 'pipegenRange'];
 const CANARY_RULE_ID = `secret:${CANARY_RULE}`;
 const isObj = (v: unknown): v is Record<string, unknown> => typeof v === 'object' && v !== null && !Array.isArray(v);
 
@@ -45,12 +50,13 @@ export function parseRangeFacts(text: string): RangeRun {
   if (!isObj(d)) return bad('are not in the form the range scan step writes');
   if (d.pipegenRange !== 1) bad('are of a version this gate does not read');
   if (Object.keys(d).sort().join() === 'pipegenRange,skipped') {
-    if (d.skipped !== 'no-range') bad('say the scan was skipped for a reason this gate does not know');
-    return { skipped: 'no-range' };
+    if (!(SKIP_REASONS as readonly unknown[]).includes(d.skipped)) bad('say the scan was skipped for a reason this gate does not know');
+    return { skipped: d.skipped as SkipReason };
   }
   if (Object.keys(d).sort().join() !== KEYS.join()) return bad('are not in the form the range scan step writes');
   for (const k of ['base', 'head'] as const) if (typeof d[k] !== 'string' || !SHA_RE.test(d[k] as string) || d[k] === ZERO) bad(`have a ${k} that is not a commit sha`);
   if (d.before !== null && (typeof d.before !== 'string' || !SHA_RE.test(d.before) || d.before === ZERO)) bad('have a before that is not a commit sha');
+  if (typeof d.forced !== 'boolean') bad('do not say whether the push rewrote the branch');
   if (typeof d.commits !== 'number' || !Number.isSafeInteger(d.commits) || d.commits < 0 || d.commits > MAX_COMMITS) bad('have a commit count that is not a whole number');
   const list = d.canaries;
   if (!Array.isArray(list) || list.length !== RANGE_CANARY_FILES.length) return bad(`do not name ${RANGE_CANARY_FILES.length} canary commits`);
@@ -62,7 +68,7 @@ export function parseRangeFacts(text: string): RangeRun {
     return { commit: c.commit, path };
   });
   if (new Set(canaries.map((c) => c.commit)).size !== canaries.length) bad('name one canary commit twice');
-  return { base: d.base as string, head: d.head as string, before: d.before as string | null, commits: d.commits as number, canaries };
+  return { base: d.base as string, head: d.head as string, before: d.before as string | null, forced: d.forced as boolean, commits: d.commits as number, canaries };
 }
 
 /** Reads the facts file at `path`: never through a link, a regular file, never blocking, at most 64 KiB. Throws RangeFactsError. */
@@ -109,9 +115,15 @@ export function applyRange(findings: readonly ParsedFinding[], facts: RangeFacts
   const dropped = facts.before === null ? '' : `, and the commits the push replaced (the head before it, ${facts.before.slice(0, 12)})`;
   return {
     findings: kept,
-    notes: [`the commit range ${facts.base.slice(0, 12)}..${facts.head.slice(0, 12)} (${facts.commits} commit(s), merges included${dropped}) was scanned to its end; both canary commits were read`],
+    notes: [
+      `the commit range ${facts.base.slice(0, 12)}..${facts.head.slice(0, 12)} (${facts.commits} commit(s), merges included${dropped}) was scanned to its end; both canary commits were read`,
+      ...(facts.forced ? ['this push rewrote the history of the branch: the range was scanned from where its old and new heads meet'] : []),
+    ],
   };
 }
 
-/** The note of a range scan that had no commit range on its event (fix round 1). */
-export const NO_RANGE_NOTE = 'no commit range on this event (a push that made the branch, workflow_dispatch or schedule), so no commit range was scanned';
+/** The note of a range scan that scanned nothing, by its reason (fix rounds 1 and 2). */
+export const SKIP_NOTES: Readonly<Record<SkipReason, string>> = Object.freeze({
+  'no-range': 'no commit range on this event (a push that made the branch, workflow_dispatch or schedule), so no commit range was scanned',
+  'no-merge-base': 'this push rewrote the history of the branch and its old head is not in the checkout, so its commit range was not scanned',
+});

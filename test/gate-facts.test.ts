@@ -38,9 +38,9 @@ const TESTS = ((): JobListEntry => { const e = ent({ needId: 'unit-tests', servi
 /** C9: the secrets job's commit-range scan (the entry gateJobList writes after the secrets check). */
 const RANGE = ((): JobListEntry => { const e = ent({ needId: 'secrets', tool: 'betterleaks', artifact: 'pipegen-out-secrets-range', range: true }); delete e.baseArtifact; return e; })();
 /** A real scrubbed commit-range result (the range scan step's raw SARIF and range facts, captured with the pinned betterleaks). */
-function scrubbedRange(kind: 'clean' | 'leak' | 'skipped'): Uint8Array {
+function scrubbedRange(kind: 'clean' | 'leak' | 'skipped' | 'no-merge-base'): Uint8Array {
   const [sarif, factsFile] = kind === 'leak' ? ['betterleaks.sarif', 'range.json'] : ['clean.sarif', 'clean-range.json'];
-  const factsText = kind === 'skipped' ? '{"pipegenRange":1,"skipped":"no-range"}' : readFileSync(`test/fixtures/sarif/betterleaks-range/${factsFile}`, 'utf8');
+  const factsText = kind === 'skipped' ? '{"pipegenRange":1,"skipped":"no-range"}' : kind === 'no-merge-base' ? '{"pipegenRange":1,"skipped":"no-merge-base"}' : readFileSync(`test/fixtures/sarif/betterleaks-range/${factsFile}`, 'utf8');
   const r = scrubBytes(readFileSync(`test/fixtures/sarif/betterleaks-range/${sarif}`), { tool: 'betterleaks', format: 'sarif', fpKey: FPKEY, eventText: '{}', range: parseRangeFacts(factsText) });
   if (r.status !== 'ok') throw new Error(r.error);
   return new Uint8Array(r.bytes);
@@ -731,5 +731,18 @@ describe('gatherGateInput: the secrets job\'s commit-range scan (C9)', () => {
     const d = decideGate(input);
     expect(d.pass).toBe(true);
     expect(d.warnings.some((w) => w.job === 'commit range')).toBe(false);
+  });
+  it('fix round 2 (m2): a push to main that rewrote its history with the old head gone (no merge base): a warning, never a block; the same mark on a pull request blocks', async () => {
+    const p = world();
+    p.event = 'push'; p.sha = HEAD;
+    p.payload = { before: BASE, after: HEAD, forced: true, ref: 'refs/heads/main', repository: p.payload.repository };
+    setRange(p, scrubbedRange('no-merge-base'));
+    const d = decideGate((await gather(p)).input);
+    expect(d.pass).toBe(true);
+    expect(d.warnReasons.join('\n')).toMatch(/commit range/);
+    expect(d.toolErrors.map((t) => [t.job, t.blocks, t.reason])).toEqual([['commit range', false, expect.stringMatching(/rewrote .*history/)]]);
+    const pr = world();
+    setRange(pr, scrubbedRange('no-merge-base'));
+    expect(decideGate((await gather(pr)).input).pass).toBe(false);
   });
 });

@@ -817,8 +817,13 @@ export const RANGE_HEAD_REF = `\${{ github.event_name == 'pull_request' && githu
  * base..head, but they were pushed (a secret in them has leaked), so the range scan reads them too. Any other event: the all-zero commit.
  */
 export const RANGE_BEFORE_REF = `\${{ github.event_name == 'pull_request' && github.event.action == 'synchronize' && github.event.before || '${'0'.repeat(40)}' }}`;
-/** C9: the env of the commit-range scan step that holds an expression: exactly these three names, each exactly its form, on that step only. */
-export const RANGE_STEP_ENV: Readonly<Record<string, string>> = Object.freeze({ PIPEGEN_RANGE_BASE: BASE_CHECKOUT_REF, PIPEGEN_RANGE_HEAD: RANGE_HEAD_REF, PIPEGEN_RANGE_BEFORE: RANGE_BEFORE_REF });
+/**
+ * C9 fix round 2 (review m2): the event's name, so the range scan knows a push (whose base, `before`, a force-push may have rewritten away)
+ * from a pull request event (whose base must be in the checkout). The step accepts only the names it knows.
+ */
+export const RANGE_EVENT_REF = '${{ github.event_name }}';
+/** C9: the env of the commit-range scan step that holds an expression: exactly these four names, each exactly its form, on that step only. */
+export const RANGE_STEP_ENV: Readonly<Record<string, string>> = Object.freeze({ PIPEGEN_RANGE_BASE: BASE_CHECKOUT_REF, PIPEGEN_RANGE_HEAD: RANGE_HEAD_REF, PIPEGEN_RANGE_BEFORE: RANGE_BEFORE_REF, PIPEGEN_RANGE_EVENT: RANGE_EVENT_REF });
 /** C9: the id of the commit-range scan step (a checker step: the hash of the range artifact). */
 export const rangeScanStepId = `checker-run-${sha16(SECRETS_RANGE_ARTIFACT)}`;
 

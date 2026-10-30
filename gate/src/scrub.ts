@@ -31,7 +31,7 @@ import { CONTENT_FORMS, fingerprintAll, isQuotingFinding, keyId, keyProblem, mas
 import { fail, getOwn, isObj, MAX_RAW_BYTES, ReadError, readJson, type ParsedFinding, type ParseResult } from './parse-common.js';
 import { MAX_ADVISORY_IDS, SARIF_TOOLS, parseSarifText } from './sarif.js';
 import { applyStage, readStage, StageError, STAGED_NAME_RE, type Stage, type StagedFindings } from './stage.js';
-import { applyRange, isRangeSkipped, NO_RANGE_NOTE, RANGE_FACTS_FILE, RangeFactsError, readRangeFacts, SECRETS_RANGE_ARTIFACT, SECRETS_RANGE_TOOL, type RangeRun } from './range.js';
+import { applyRange, isRangeSkipped, RANGE_FACTS_FILE, SKIP_NOTES, SKIP_REASONS, RangeFactsError, readRangeFacts, SECRETS_RANGE_ARTIFACT, SECRETS_RANGE_TOOL, type RangeRun } from './range.js';
 import { ZAP_TOOL, parseZapJsonText } from './zap.js';
 
 export type ScrubFormat = 'sarif' | 'zap-json';
@@ -122,7 +122,7 @@ function withholder(): (file: string | undefined) => boolean {
   };
 }
 
-function sarifOut(tool: string, findings: readonly FingerprintedFinding[], notes: readonly string[], key: string | undefined, extra: Record<string, true> = {}): string {
+function sarifOut(tool: string, findings: readonly FingerprintedFinding[], notes: readonly string[], key: string | undefined, extra: Record<string, string> = {}): string {
   const info = SARIF_TOOLS[tool];
   const withheld = withholder();
   const results = findings.map((f) => {
@@ -202,8 +202,9 @@ export function scrubBytes(raw: Uint8Array, opts: ScrubOptions): ScrubOutcome {
       if (opts.range !== undefined && (opts.tool !== SECRETS_RANGE_TOOL || opts.stage !== undefined)) return toolError(`the commit-range scan is ${SECRETS_RANGE_TOOL}'s, and it has no stage folder`, key);
       // fix round 1: no commit range on this event; nothing was scanned, and the result says so (the gate decides what that means)
       if (opts.range !== undefined && isRangeSkipped(opts.range)) {
-        const bytes = Buffer.from(sarifOut(opts.tool, [], [NO_RANGE_NOTE], undefined, { pipegenRangeSkipped: true }), 'utf8');
-        return { status: 'ok', bytes, sha256: sha256(bytes), findings: 0, notes: [NO_RANGE_NOTE], fpBy: { hash: 0, region: 0, quoted: 0, file: 0, line: 0, nokey: 0, 'quoted-nokey': 0 } };
+        const note = SKIP_NOTES[opts.range.skipped];
+        const bytes = Buffer.from(sarifOut(opts.tool, [], [note], undefined, { pipegenRangeSkipped: opts.range.skipped }), 'utf8');
+        return { status: 'ok', bytes, sha256: sha256(bytes), findings: 0, notes: [note], fpBy: { hash: 0, region: 0, quoted: 0, file: 0, line: 0, nokey: 0, 'quoted-nokey': 0 } };
       }
       if (opts.stage !== undefined) {
         if (!secretsTool) return toolError('a stage folder is only for the secrets tools', key);
@@ -292,8 +293,8 @@ export interface ScrubbedFinding {
 }
 export interface ScrubbedResult {
   findings: ScrubbedFinding[]; keyId?: string; notes: string[]; toolError?: string;
-  /** C9 fix round 1: the commit-range scan had no commit range on its event (nothing was scanned). */
-  rangeSkipped?: true;
+  /** C9 fix rounds 1 and 2: the commit-range scan scanned nothing, and why (range.ts SKIP_REASONS). */
+  rangeSkipped?: (typeof SKIP_REASONS)[number];
 }
 
 const str = (o: Record<string, unknown>, k: string, where: string): string => {
@@ -389,8 +390,8 @@ export function readScrubbed(input: string | Uint8Array, format: ScrubFormat, ma
         };
       });
       const skipped = getOwn(props, 'pipegenRangeSkipped');
-      if (skipped !== undefined && (skipped !== true || findings.length > 0)) fail('the commit-range skip mark is not the scrub\'s');
-      return { findings, ...(typeof id === 'string' ? { keyId: id } : {}), notes: readNotes(getOwn(props, 'pipegenNotes'), 'properties'), ...(skipped === true ? { rangeSkipped: true as const } : {}) };
+      if (skipped !== undefined && (!(SKIP_REASONS as readonly unknown[]).includes(skipped) || findings.length > 0)) fail('the commit-range skip mark is not the scrub\'s (an unknown reason, or findings beside it)');
+      return { findings, ...(typeof id === 'string' ? { keyId: id } : {}), notes: readNotes(getOwn(props, 'pipegenNotes'), 'properties'), ...(skipped === undefined ? {} : { rangeSkipped: skipped as (typeof SKIP_REASONS)[number] }) };
     }
     if (getOwn(doc, 'pipegenScrubbed') !== true || getOwn(doc, 'tool') !== ZAP_TOOL) fail('the result was not written by the scrub for ZAP');
     const alerts = getOwn(doc, 'alerts');
