@@ -545,10 +545,10 @@ const containsKnownValue = (t: string): boolean => vault(t) !== t;
 const docInputs = (over: Partial<NonNullable<CreatedEnv['inputs']['pipegenDoc']>> = {}): CreatedEnv['inputs'] => ({ pipegenDoc: { baseSha: null, recordSha: null, ...over }, containsKnownValue });
 const docFile = (content: string, over: Partial<CreatedFile> = {}): CreatedFile => ({ path: 'PIPEGEN.md', content, part: 'docs', reason: 't', repo: 'app', ...over });
 const docText = (content: string, inputs = docInputs(), d = draft): string => text(docFile(content), d, env(inputs));
-const DOC_OK = '# Pipeline\n\nThis repo uses pipegen. See [the repo](https://github.com/o/r/blob/main/.github/workflows/pipegen.yml) and [GitHub docs](https://docs.github.com/en/actions).\n\n```yaml\n- run: echo "<div> @octocat ![x](y.png) https://evil.example"\n```\n\nCode owners: `@alice` and `@bob`.\n';
+const DOC_OK = '# Pipeline\n\nThis repo uses pipegen. See [the repo](https://github.com/o/r/blob/main/.github/workflows/pipegen.yml) and [GitHub docs](https://docs.github.com/en/actions).\n\n```yaml\n- run: echo "<div> @octocat ![x](y.png) https://evil.example"\n```\n\nCode owners: `alice` and `bob`.\n';
 
 describe('pipegen-doc judge', () => {
-  it('a plain document passes; fenced code may hold HTML, mentions, images and any URL', () => {
+  it('a document in the allowed forms passes; fenced code may hold HTML, mentions, images and any URL', () => {
     expect(docText(DOC_OK)).toBe('');
   });
   it('the path is exactly PIPEGEN.md at the root', () => {
@@ -561,87 +561,102 @@ describe('pipegen-doc judge', () => {
     expect(docText(pad(limit + 1))).toMatch(/256 KiB|too large|size/i);
     expect(docText(`# t\n\n${'\u00e9'.repeat(limit / 2)}\n`)).toMatch(/256 KiB|too large|size/i);
   });
-  it('raw HTML outside fences is refused: tags, closing tags, comments, doctype, processing instructions, autolinks', () => {
-    for (const html of ['<div>x</div>', '<img src=x onerror=alert(1)>', 'a </p> b', '<!-- c -->', '<!DOCTYPE html>', '<?php echo 1 ?>', '<a href="https://github.com/o/r">x</a>', '<https://github.com/o/r>', 'x<b>y', '<script>', '<SCRIPT>', '<details><summary>x</summary></details>']) {
-      expect(docText(`# t\n\n${html}\n`), html).toMatch(/HTML|<|tag/i);
+  it('the allowed line forms: empty, heading, list (two levels), table, separator row, fence with info, plain text with inline code and allowed links', () => {
+    const doc = [
+      '# Title', '## Section 2', '### Three', '#### Four', '', 'Plain text, with: punctuation. (Yes!) It\'s "fine"; 100% a/b - c_d + e = f & g * h ~ i?',
+      '- item one', '  - nested item', '- item with `code` and [a link](https://github.com/o/r/blob/main/x.md?a=b&c=d)', '| name | value |', '|---|:--:|', '| a | `b` |', '| [docs](https://docs.github.com/en/x) |  |',
+      '', '```yaml', 'anything: <here> @all [x]: y ${ no', '```', '```', 'no info', '```', '```c-2', 'x', '```', '1. numbered', '--- ', 'Text with https://github.com/o/r/issues and https://docs.github.com/en/x.', '',
+    ].join('\n');
+    expect(docText(doc)).toBe('');
+  });
+  const REFUSED: [string, RegExp][] = [
+    ['<div>x</div>', /HTML/], ['<img src=x onerror=alert(1)>', /HTML/], ['a </p> b', /HTML/], ['<!-- c -->', /HTML/], ['<?php echo 1 ?>', /HTML/], ['<https://github.com/o/r>', /HTML/], ['a < b', /HTML/], ['1<2', /HTML/],
+    ['a > b', /HTML|quote/], ['> quote', /HTML|quote/], ['>> x', /HTML|quote/], ['- > x', /HTML|quote/],
+    ['@octocat', /mention/], ['cc @octocat please', /mention/], ['a@b.example', /mention/], ['`@octocat`', /mention/], ['@org/team', /mention/], ['an @ alone', /mention/], ['- @x', /mention/],
+    ['[x][ref]', /link/], ['[x]', /link/], ['a ] b', /link/], ['a [ b', /link/], ['[ref]: https://docs.github.com/en/x', /link/], ['[ref]:', /link/], ['[ref]: <>', /./], ['> [ref]: https://github.com/o/r', /./], ['- [ref]: https://github.com/o/r', /link/],
+    ['  - [ref]: https://github.com/o/r', /link/], ['\\[ref\\]: https://github.com/o/r', /backslash/], ['[a\\]: x', /backslash|link/], ['   [ref]: https://github.com/o/r', /./], ['[^note]: text', /link/],
+    ['![a](https://github.com/o/r/raw/main/x.png)', /image/], ['![a][r]', /image/], ['![](x)', /image/], ['- ![a](https://github.com/o/r/x.png)', /image/],
+    ['[a](https://evil.example)', /link/], ['[a]()', /link/], ['[a](<>)', /./], ['[a]( )', /link/], ['[a](#x)', /link/], ['[a](relative.md)', /link/], ['[a](javascript:alert(1))', /link/], ['[a](//evil.example)', /link/], ['[a](http://github.com/o/r)', /link/],
+    ['[a](https://github.com@evil.example/o/r)', /link/], ['[a](https://github.com/o/r/../../evil/x)', /link/], ['[a](https://github.com/o/rx)', /link/], ['[a](https://github.com/other/repo)', /link/], ['[a](https://github.com:444/o/r)', /link/], ['[a](https://user@github.com/o/r)', /link/],
+    ['[a](https://github.com/o/r "title")', /link/], ['[a [b]](https://github.com/o/r)', /link/], ['[`a`](https://github.com/o/r)', /link/], ['[https://evil.example](https://github.com/o/r)', /link/],
+    ['x https://evil.example', /link/], ['www.evil.example', /link/], ['x https://evil.example/a.', /link/], ['HTTPS://EVIL.EXAMPLE', /link/],
+    ['back\\slash', /backslash/], ['\\`x`', /backslash/], ['a \\* b', /backslash/], ['${{ secrets.X }}', /\$\{\{/], ['cost $5', /not allowed/], ['a # b', /not allowed/], ['#hash', /not allowed/], ['##### five', /not allowed/], ['#  x', /./], ['#', /not allowed/],
+    ['| a | <b> |', /HTML/], ['| a | [x] |', /link/], ['| a |\t', /./], ['a{b}', /not allowed/], ['a b', /not allowed|control|character/],
+    ['    indented', /./], [' leading space', /./], ['\ttab', /./], ['- ~~~', /fence/],
+    ['`unclosed', /./], ['``double``', /./], ['```', /fence/], ['a ``` b', /./], ['`a``b`', /./], ['``a``', /./],
+    ['~~~', /fence/], ['~~~~', /fence/], ['   ```', /fence/], ['   ``` x', /fence/], ['```Yaml', /fence/], ['``` yaml', /fence/], ['```yaml extra', /fence/], ['````', /fence/], ['```a`b', /fence/], ['- ```', /./], ['1. ```', /./], ['> ```', /./], ['+ ~~~', /fence/], ['* ~~~', /fence/], ['x ~~~', /fence/], ['  ~~~', /./], ['- - ~~~', /fence/],
+  ];
+  it('every scan bypass and every character outside the grammar is refused, as plain text, in a heading, a list item and a table cell', () => {
+    for (const [line, why] of REFUSED) {
+      if (line === '') continue;
+      expect(docText(`# t\n\n${line}\n`), line).toMatch(why);
+      expect(docText(`# t\n\n- ${line}\n`), `- ${line}`).not.toBe('');
+      if (!line.startsWith(' ')) expect(docText(`# t\n\n| ${line} |\n`), `| ${line} |`).not.toBe('');   // a table cell is trimmed of spaces
+      expect(docText(`# ${line}\n`), `# ${line}`).not.toBe('');
     }
   });
-  it('a < that starts no tag is fine', () => {
-    for (const ok of ['a < b', '1<2', 'x <= y', '<3', 'a <- b', '< b', 'a&lt;div&gt;', 'a <\n']) expect(docText(`# t\n\n${ok}\n`), ok).toBe('');
+  it('a pipe outside a table row, and a table row that is not closed, are refused', () => {
+    for (const l of ['a | b', '|a|b', '| a | b', 'x | y |']) expect(docText(`# t\n\n${l}\n`), l).not.toBe('');
+    for (const l of ['| a |', '|a|b|', '| |', '||']) expect(docText(`# t\n\n${l}\n`), l).toBe('');
   });
-  it('HTML inside a fence is fine; after the fence closes it is checked again', () => {
-    expect(docText('# t\n\n```html\n<div>x</div>\n```\n')).toBe('');
-    expect(docText('# t\n\n```\n<div>x</div>\n```\n<div>y</div>\n')).toMatch(/HTML/i);
-    expect(docText('# t\n\n```\n~~~\n<div>x</div>\n```\n')).toBe('');   // a tilde line inside a backtick fence is content
-    expect(docText('# t\n\n```\n````\n```\n')).toBe('');
+  it('fence rules: inside a fence a line that starts 3+ backticks or tildes and is not exactly three backticks is refused; the fence closes only on an exact line; unclosed is refused', () => {
+    const closers = ['   ````', ' ```', '```  ', '```x', '````', '~~~', '   ~~~~', '\t```', '```\t', '``` y', '  ```'];
+    for (const c of closers) {
+      expect(docText(`# t\n\n\`\`\`\nx\n${c}\n[a](https://evil.example)\n\`\`\`\n`), JSON.stringify(c)).toMatch(/fence/);
+      expect(docText(`# t\n\n\`\`\`\nx\n${c}\n<img src=x>\n`), JSON.stringify(c)).toMatch(/fence/);
+    }
+    expect(docText('# t\n\n```\nx\n')).toMatch(/never closed|fence/);
+    expect(docText('# t\n\n```\nx\n``` \n')).toMatch(/fence/);
+    expect(docText('# t\n\n```\n<div>x</div>\n```\n<div>y</div>\n')).toMatch(/HTML/);
+    expect(docText('# t\n\n```\n<div> `single` ``in`` text ~ tilde\n```\n')).toBe('');
+    expect(docText('# t\n\n```\r\nx\r\n```\r\n')).toBe('');
+    expect(docText('# t\n\n```\nx\n```\n```\ny\n```\n')).toBe('');
   });
-  it('restricted Markdown: a fence opens and closes at column 0 with exactly three backticks; every other fence form is refused', () => {
-    const bad = [
-      '- ```\n<div>x</div>\n```', '> ```\n<div>x</div>\n```', '* ```\n[a](https://evil.example)\n```', '1. ```\n<img src=x>\n```', '- > ```\n<div>', '> ```\nplain\n> ```', '- ```\nplain\n- ```', '1) ```\nplain\n1) ```', '+ ~~~\nplain\n+ ~~~',
-      '    ```\n<div>x</div>\n    ```', ' ```\nx\n ```', '   ```\n<div>x</div>\n   ```', '\t```\nx\n```',
-      '~~~\n<div>x</div>\n~~~', '````\nx\n````', '``` a`b\n<div>x</div>\n```', '~~~~\nx\n~~~~',
-      '```\n<div>x</div>\n', '```\nx\n', '```\nx\n```\n```\n<img src=x>\n', '```\nx\n````\n[a](https://evil.example)\n', '```\nx\n ```\n<img src=x>\n', '```\nx\n``` y\n<img src=x>\n',
-    ];
-    for (const b of bad) expect(docText(`# t\n\n${b}\n`), b).toMatch(/fence/i);
+  it('fuzz: a line built from allowed words with one forbidden character in it is always refused', () => {
+    let seed = 12345;
+    const rnd = (n: number) => { seed = (seed * 1103515245 + 12345) & 0x7fffffff; return seed % n; };
+    const ALPHA = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 .,;:!?\'"()/-_+=%&*~';
+    const word = () => { let w = ''; for (let i = 0, n = 1 + rnd(8); i < n; i++) w += ALPHA[rnd(ALPHA.length)]; return w; };
+    const clean = () => { let l = 'x' + Array.from({ length: 1 + rnd(5) }, word).join(' '); l = l.replace(/https?|www|~{3,}/gi, 'q').replace(/[()]/g, ''); return l; };
+    const FORBIDDEN = ['<', '>', '[', ']', '\\', '@', '${{', '#', '$', '{', '}', '^', '`'];
+    const wrap = [(l: string) => l, (l: string) => `# ${l}`, (l: string) => `- ${l}`, (l: string) => `  - ${l}`, (l: string) => `| ${l} |`, (l: string) => `| a | ${l} | b |`];
+    for (let k = 0; k < 600; k++) {
+      const base = clean();
+      const bad = FORBIDDEN[rnd(FORBIDDEN.length)] as string;
+      const at = 1 + rnd(base.length);
+      const line = wrap[rnd(wrap.length)]?.(`${base.slice(0, at)}${bad}${base.slice(at)}`) as string;
+      expect(docText(`# t\n\n${line}\n`), JSON.stringify(line)).not.toBe('');
+    }
   });
-  it('an unclosed fence can not hide a link or an image after it', () => {
-    expect(docText('# t\n\n```\nx\n[a](https://evil.example)\n<img src=x>\n')).toMatch(/fence/i);
+  it('fuzz: lines of allowed characters only are accepted', () => {
+    let seed = 777;
+    const rnd = (n: number) => { seed = (seed * 1103515245 + 12345) & 0x7fffffff; return seed % n; };
+    const ALPHA = 'abcdefghijklmnopqrstuvwxyz0123456789 .,;:!?\'"/-_+=%&*~';
+    for (let k = 0; k < 300; k++) {
+      let l = 'a'; for (let i = 0, n = rnd(40); i < n; i++) l += ALPHA[rnd(ALPHA.length)];
+      l = l.replace(/https?|www|~{3,}/gi, 'q');
+      expect(docText(`# t\n\n${l}\n\n- ${l}\n\n| ${l} | ${l} |\n`), l).toBe('');
+    }
   });
-  it('images are refused, inline and by reference, but not inside a fence', () => {
-    for (const img of ['![a](https://github.com/o/r/raw/main/x.png)', '![a][r]\n\n[r]: https://github.com/o/r', '![](x)', '! [a](b)'.replace('! ', '!')]) expect(docText(`# t\n\n${img}\n`), img).toMatch(/image/i);
-    expect(docText('# t\n\n```\n![a](x)\n```\n')).toBe('');
-  });
-  it('links: only this repo, docs.github.com and the pipegen repo; anchors are fine', () => {
-    for (const ok of ['[a](https://github.com/o/r)', '[a](https://github.com/o/r/)', '[a](https://github.com/o/r/blob/main/x.md#y)', '[a](https://github.com/O/R/x)', '[a](https://docs.github.com/en/x)', '[a](https://github.com/CrisWorking/pipegen)', '[a](https://github.com/CrisWorking/pipegen/blob/main/docs/x.md)', '[a](#section)', 'see https://github.com/o/r/issues', '[a](https://github.com/o/r "title")']) {
+  it('links: only this repository, docs.github.com and the pipegen repository, as inline links or bare URLs', () => {
+    for (const ok of ['[a](https://github.com/o/r)', '[a](https://github.com/o/r/)', '[a](https://github.com/o/r/blob/main/x.md#y)', '[a](https://github.com/O/R/x)', '[a](https://docs.github.com/en/x)', '[a](https://github.com/CrisWorking/pipegen)', '[a](https://github.com/CrisWorking/pipegen/blob/main/docs/x.md)', 'see https://github.com/o/r/issues', 'see https://docs.github.com/en/x.', '- [a](https://github.com/o/r) and [b](https://docs.github.com/en/y)']) {
       expect(docText(`# t\n\n${ok}\n`), ok).toBe('');
     }
   });
-  it('links to anywhere else are refused', () => {
-    const bads = ['[a](https://evil.example)', '[a](http://github.com/o/r)', '[a](javascript:alert(1))', '[a](//evil.example)', '[a](relative.md)', '[a](mailto:x@y.zz)', '[a](https://github.com@evil.example/o/r)',
-      '[a](https://github.com/o/r/../../evil/x)', '[a](https://github.com/o/r/%2e%2e/%2e%2e/evil)', '[a](https://github.com/other/repo)', '[a](https://github.com/o/rx)', '[a](https://github.com/o)', '[a](https://github.com/)', '[a](https://github.com.evil.example/o/r)', '[a](https://evil.example/https://github.com/o/r)',
-      '[a](https://docs.github.com.evil.example/x)', '[a](https://gist.github.com/x)', '[a](https://raw.githubusercontent.com/o/r/main/x)', '[a](https://github.com:444/o/r)', '[a](https://user@github.com/o/r)', '[a](data:text/html,x)', '[a]( https://evil.example )', '[a](\nhttps://evil.example)',
-      'https://evil.example', 'www.evil.example', 'x https://evil.example/a.', '[a]: https://evil.example', '[a]:https://evil.example', '[a](https://github.com\\@evil.example/)', '[a](HTTPS://EVIL.EXAMPLE)', '[a](&#104;ttps://evil.example)', '[a](https://github.com/o/r/\u202e)'];
-    for (const b of bads) expect(docText(`# t\n\n${b}\n`), b).toMatch(/link|URL|control|character/i);
-  });
-  it('link reference definitions are refused outright, whatever the destination; an empty destination is foreign', () => {
-    const defs = ['[a]: javascript:alert(1)', '[a]: relative.md', '  [a]: mailto:x@y.zz', '[a]: https://docs.github.com/en/x', '[a]: https://github.com/o/r', '[a]:', '[a]: <>', '[a]:\n', '[]:', '[a b]: #x', '   [a]: https://github.com/o/r', '[a]: ', '[^note]: text'];
-    for (const d of defs) expect(docText(`# t\n\n${d}\n\n[a]\n`), d).toMatch(/link/i);
-    expect(docText('# t\n\n[x][ref]\n\n[ref]:\n')).toMatch(/link/i);
-    expect(docText('# t\n\n[x][ref]\n\n[ref]: <>\n')).toMatch(/link/i);
-    expect(docText('# t\n\nsee [a]: not at line start\n')).toBe('');
-    expect(docText('# t\n\n    [a]: indented code\n')).toBe('');
-  });
-  it('an inline link with an empty destination is foreign', () => {
-    expect(docText('# t\n\n[a]()\n')).toMatch(/link/i);
-    expect(docText('# t\n\n[a](<>)\n')).toMatch(/link/i);
-    expect(docText('# t\n\n[a]( )\n')).toMatch(/link/i);
-  });
   it('the pipegen repo link follows the package repository', () => {
-    // the one place the own-repo name lives is the judge; this test pins it to package.json
     const pkg = JSON.parse(readPkg()) as { repository: { url: string } };
     expect(pkg.repository.url).toContain('github.com/CrisWorking/pipegen');
-  });
-  it('@mentions outside code are refused (also e-mail forms and teams); inside a fence or an inline code span they are fine', () => {
-    for (const m of ['@octocat', 'cc @octocat please', '@org/team', 'mail a@b.example', '(@octocat)', '**@octocat**', '@_x', '@1']) expect(docText(`# t\n\n${m}\n`), m).toMatch(/@|mention/i);
-    expect(docText('# t\n\n`@octocat`\n')).toBe('');
-    expect(docText('# t\n\n``a ` @octocat``\n')).toBe('');
-    expect(docText('# t\n\n```\n@octocat\n```\n')).toBe('');
-    expect(docText('# t\n\nan @ alone and user@ and @\n')).toBe('');
-  });
-  it('an inline code span does not reach across paragraphs, and an escaped backtick opens nothing', () => {
-    expect(docText('# t\n\n`start\n\n@octocat `end`\n')).toMatch(/mention|@/i);
-    expect(docText('# t\n\n\\`@octocat`\n')).toMatch(/mention|@/i);
-    expect(docText('# t\n\n`@octocat\n')).toMatch(/mention|@/i);
-    expect(docText('# t\n\n``@octocat`\n')).toMatch(/mention|@/i);
   });
   it('${{ is refused everywhere, fenced or not', () => {
     expect(docText('# t\n\n${{ secrets.X }}\n')).toMatch(/\$\{\{/);
     expect(docText('# t\n\n```\nrun: ${{ github.event.pull_request.title }}\n```\n')).toMatch(/\$\{\{/);
     expect(docText('# t\n\n`${{ x }}`\n')).toMatch(/\$\{\{/);
+    expect(docText('# t\n\n- ${{ x }}\n')).toMatch(/\$\{\{/);
   });
   it('control and invisible characters are refused: NUL, ESC, bidi overrides, zero-width, BOM in the body', () => {
     for (const c of ['\u0000', '\u001b', '\u202e', '\u2066', '\u200b', '\ufeff', '\u007f', '\u0085']) expect(docText(`# t\n\nab${c}cd\n`), JSON.stringify(c)).toMatch(/control|invisible|character/i);
-    expect(docText('# t\n\nTabs\tand\r\nCRLF are fine\n')).toBe('');
+    expect(docText('# t\n\nCRLF line ends\r\nare fine\r\n')).toBe('');
+    expect(docText('# t\n\n```\nTabs\tin a fence\n```\n')).toBe('');
   });
   it('a vault value (or its base64 / URL form) is refused, in prose and in a fence', () => {
     const v = 'correct-horse-battery-staple-9';
