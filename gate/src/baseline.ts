@@ -4,8 +4,8 @@
 // "old" and does not block, so a poisoned baseline pre-approves a future finding. Two locks, both needed:
 //   1. WHERE it came from (trustedRun): a run of this repository's own pipegen.yml, event push, on the default branch, whose
 //      commit is in the default branch's history. A fork PR can upload an artifact with the same name (S4); its run has the wrong
-//      event and head repository, so it is never read. Facts about a run come from `GET /actions/runs/{id}`, never from the
-//      artifact listing, and are compared by repository id, never by name.
+//      event and head repository, so it is never read. Facts about a run come from the run list (never from an artifact's
+//      own claims) and are compared by repository id, never by name.
 //   2. WHO wrote it (B6): any job of a trusted run could upload an artifact called pipegen-baseline, including jobs that run the
 //      repository's own code. So the file carries an HMAC under PIPEGEN_FP_KEY, which repo-code steps never get. It is loaded
 //      only when the MAC verifies, the key id is the current key's, and its run id is the run of the artifact. A fork PR has no key,
@@ -17,10 +17,14 @@
 // pages), each run is judged by trustedRun, and artifacts are listed only for a trusted run. An untrusted run never costs more
 // than the list entry it came in, and never any artifact call.
 //
+// The default history (fix round 1, I1): `inDefaultHistory` resolves the default branch's commit itself on every call (GET
+// /git/ref/heads/{branch}: the ref must be exactly refs/heads/<branch>, the object a commit with a 40-hex sha) and compares
+// sha...tipSha. The branch NAME is never sent to compare (git resolves an ambiguous name tag-first), and nothing is cached.
+//
 // A tag named like the default branch: for a tag push `head_branch` is the tag name, so a tag called `main` on an old commit that is in
 // the default history would pass every field check. The runs API has no field that tells a branch push from a tag push, so
-// trustedRun also refuses every run while a tag with the default branch's name exists (GET /git/ref/tags/{name}; any answer but a
-// clear "no" fails closed). Residual: a tag deleted afterwards leaves its runs (same repository, same workflow file, a commit that is
+// trustedRun also refuses every run while a tag with the default branch's name exists (GET /git/ref/tags/{name}, asked fresh for every
+// run; any answer but a clear "no" fails closed). Since the tip ref above, this is a belt for the old-commit case below, not the I1 barrier. Residual: a tag deleted afterwards leaves its runs (same repository, same workflow file, a commit that is
 // in the default history, still needing the MAC) trusted. The real fix is Plan G's: the push trigger of pipegen.yml is
 // `branches: [<default>]` only, no tags, which the referee checks.
 //
@@ -31,11 +35,16 @@
 //
 // File formats (JSON, exactly these fields, nothing else):
 //   pipegen-baseline:  { runId, keyId, counts, mac }      counts: { [countKeyOf(job, finding)]: whole number >= 0 }
-//     mac = hex HMAC-SHA256(PIPEGEN_FP_KEY, JSON.stringify(['pipegen-baseline-v1', runId, keyId, [[key, count], ...sorted by key]]))
+//     mac = hex HMAC-SHA256(macKey, JSON.stringify(['pipegen-baseline-v1', runId, keyId, [[key, count], ...sorted by key]]))
 //   pipegen-clean-run: { runId, keyId, mac }
-//     mac = hex HMAC-SHA256(PIPEGEN_FP_KEY, JSON.stringify(['pipegen-clean-run-v1', runId, keyId]))
+//     mac = hex HMAC-SHA256(macKey, JSON.stringify(['pipegen-clean-run-v1', runId, keyId]))
+//   macKey = hex HMAC-SHA256(PIPEGEN_FP_KEY, 'pipegen-artifact-mac-v1'): a sub-key, so a fingerprint (made with the key itself) can never
+//   double as an artifact MAC (review-C3 m10).
 //   keyId = the public id of the key (fingerprint.ts keyId). The two formats differ in their first element, so one can't pass as
 //   the other. JSON.stringify of an array of strings and numbers is an unambiguous encoding (no field can run into the next).
+// The clean-run marker differs in one way (fix round 1, I2): a forged or lost marker can only make the gate STRICTER (block mode is at
+// least as strict as warn), so with no usable key (a fork PR) a well-formed marker of a trusted run counts on run trust alone, and
+// the MAC and key id are checked only when a key is present. A lookup that can't be completed is `unknown`, and the mode blocks.
 // Tool errors, results with no coverage, and dependency and image findings (always compared with the same-run base scan) are
 // never stored. Secret fingerprints made under another key id are never stored.
 import { createHmac, timingSafeEqual } from 'node:crypto';
@@ -50,9 +59,11 @@ export const BASELINE_RETENTION_DAYS = 90;
 export const MAX_RUN_PAGES = 5;
 export const RUNS_PER_PAGE = 100;
 export const MAX_TRUSTED_RUNS = 20;
+/** At most this many default-history checks (two API calls each, plus the tag check) per lookup; hitting the cap fails closed. */
+export const HISTORY_CHECK_CAP = 20;
 /** The cap on the artifact (as listed) and on the file inside it. */
 export const MAX_ARTIFACT_BYTES = 8 * 1024 * 1024;
-const MAX_COUNT_ENTRIES = 200_000;
+export const MAX_COUNT_ENTRIES = 200_000;
 const MAX_COUNT_KEY = 4096;
 const BASELINE_FORMAT = 'pipegen-baseline-v1';
 const CLEAN_RUN_FORMAT = 'pipegen-clean-run-v1';
@@ -67,13 +78,10 @@ const MAC_RE = /^[0-9a-f]{64}$/;
  * Any call may throw (404, 403, 5xx, network): that is treated as "not trusted". C5 wires Octokit to this; owner/name are always
  * the repository the gate runs in.
  */
+/** `status: 'success'` is the API's filter; the walk checks `conclusion === 'success'` itself. */
 export interface RunQuery { workflow: string; branch: string; event: 'push'; status: 'success'; page: number; perPage: number }
 export interface GateGithub {
-  /**
-   * `GET /repos/{owner}/{name}/compare/{base}...{head}`; the answer must carry `status`. `head` is the default BRANCH name: the client
-   * must resolve it as a branch and never as a tag (for example by `GET /repos/{owner}/{name}/branches/{head}` and comparing with that
-   * commit, or `heads/{head}`).
-   */
+  /** `GET /repos/{owner}/{name}/compare/{base}...{head}`; both are 40-hex commit shas, never a name; the answer must carry `status`. */
   compare(owner: string, name: string, base: string, head: string): Promise<unknown>;
   /**
    * `GET /repos/{owner}/{name}/actions/workflows/{workflow}/runs?event=push&branch={branch}&status=success&per_page={perPage}&page={page}`
@@ -84,6 +92,8 @@ export interface GateGithub {
   listRunArtifacts(owner: string, name: string, runId: number, artifactName: string): Promise<unknown>;
   /** The bytes of the one file in the artifact (`GET .../actions/artifacts/{id}/zip`, then C5's zip checks: one entry, no path, no link). */
   downloadArtifact(owner: string, name: string, artifactId: number): Promise<Uint8Array>;
+  /** `GET /repos/{owner}/{name}/git/ref/heads/{branch}` → `{ ref, object: { type, sha } }`; validated here (see inDefaultHistory). */
+  branchHead(owner: string, name: string, branch: string): Promise<unknown>;
   /** Whether a tag called `tag` exists: `GET /repos/{owner}/{name}/git/ref/tags/{tag}` (200 → true, 404 → false, any other error is thrown). */
   tagExists(owner: string, name: string, tag: string): Promise<boolean>;
 }
@@ -97,7 +107,9 @@ export interface ArtifactMeta { runId: number; name: string; expired: boolean; e
 /** `key`: PIPEGEN_FP_KEY (undefined on a fork PR); `now`: the clock. */
 export interface VerifyContext { key: string | undefined; now: Date }
 export interface LoadResult { baseline: Baseline | null; note?: string }
-export interface CleanRunResult { seen: boolean; note?: string }
+/** seen; none (the lookup finished and found no valid marker); unknown (it could not be completed, so the mode blocks). */
+export type CleanRunState = 'seen' | 'none' | 'unknown';
+export interface CleanRunResult { state: CleanRunState; seen: boolean; note?: string }
 
 // ---------- reading hostile data ----------
 
@@ -107,53 +119,67 @@ const posInt = (v: unknown): v is number => typeof v === 'number' && Number.isSa
 
 // ---------- inDefaultHistory and trustedRun ----------
 
+type History = 'in' | 'out' | 'error';
+/** The default history, three-valued: `error` is an API failure or an answer that is not what the API gives. */
+async function historyState(gh: GateGithub, repo: RepoRef, sha: string): Promise<History> {
+  if (typeof sha !== 'string' || !SHA_RE.test(sha)) return 'out';
+  try {
+    const ref = await gh.branchHead(repo.owner, repo.name, repo.defaultBranch);
+    if (!isPlain(ref) || own(ref, 'ref') !== `refs/heads/${repo.defaultBranch}`) return 'error';
+    const obj = own(ref, 'object');
+    const tip = isPlain(obj) && own(obj, 'type') === 'commit' ? own(obj, 'sha') : undefined;
+    if (typeof tip !== 'string' || !SHA_RE.test(tip)) return 'error';
+    const answer = await gh.compare(repo.owner, repo.name, sha, tip);
+    const status = isPlain(answer) ? own(answer, 'status') : undefined;
+    if (typeof status !== 'string') return 'error';
+    return status === 'ahead' || status === 'identical' ? 'in' : 'out';
+  } catch {
+    return 'error';
+  }
+}
+
 /**
- * Whether `sha` is in the default branch's history: compare `sha...defaultBranch` says `ahead` (the branch is ahead of the sha, so
- * the sha is an ancestor) or `identical`. Behind, diverged, 404, any error, any other answer: false (fail closed).
+ * Whether `sha` is in the default branch's history. The branch's commit is resolved here on every call (never cached, never a name
+ * sent to compare), then `compare sha...tip` must say `ahead` (the tip is ahead of the sha, so the sha is an ancestor) or `identical`.
+ * Behind, diverged, 404, any error, any other answer: false (fail closed).
  */
 export async function inDefaultHistory(gh: GateGithub, repo: RepoRef, sha: string): Promise<boolean> {
-  if (typeof sha !== 'string' || !SHA_RE.test(sha)) return false;
-  try {
-    const answer = await gh.compare(repo.owner, repo.name, sha, repo.defaultBranch);
-    if (!isPlain(answer)) return false;
-    const status = own(answer, 'status');
-    return status === 'ahead' || status === 'identical';
-  } catch {
-    return false;
-  }
+  return (await historyState(gh, repo, sha)) === 'in';
+}
+
+type Judged = { ok: true } | { ok: false; why: 'untrusted' | 'tag' | 'error' | 'cap' };
+/**
+ * trustedRun with the reason it said no. `untrusted` is a clean no (wrong field, not in the history); `tag`, `error` and `cap` are
+ * "could not tell or can't be trusted now" (the marker lookup treats them as unknown). `budget` counts history checks (m4).
+ */
+async function judgeRun(gh: GateGithub, run: unknown, repo: RepoRef, budget?: { left: number }): Promise<Judged> {
+  const no = (why: 'untrusted'): Judged => ({ ok: false, why });
+  if (!isPlain(run)) return no('untrusted');
+  if (!posInt(own(run, 'id'))) return no('untrusted');
+  if (own(run, 'event') !== 'push') return no('untrusted');
+  if (own(run, 'path') !== WORKFLOW_PATH) return no('untrusted');
+  const head = own(run, 'head_repository');
+  if (!isPlain(head) || own(head, 'id') !== repo.id) return no('untrusted');
+  if (own(run, 'head_branch') !== repo.defaultBranch) return no('untrusted');
+  const sha = own(run, 'head_sha');
+  if (typeof sha !== 'string' || !SHA_RE.test(sha)) return no('untrusted');
+  if (budget !== undefined) { if (budget.left <= 0) return { ok: false, why: 'cap' }; budget.left--; }
+  // a tag named like the default branch (fresh for every run): see the header; anything but a clear "no" fails closed
+  let tag: unknown;
+  try { tag = await gh.tagExists(repo.owner, repo.name, repo.defaultBranch); } catch { return { ok: false, why: 'error' }; }
+  if (tag === true) return { ok: false, why: 'tag' };
+  if (tag !== false) return { ok: false, why: 'error' };
+  const h = await historyState(gh, repo, sha);
+  return h === 'in' ? { ok: true } : { ok: false, why: h === 'out' ? 'untrusted' : 'error' };
 }
 
 /**
  * A run pipegen trusts for baselines and clean-run markers (and, in Task 8, for findGatedRun): event `push`, the exact workflow
- * path, this repository's own head repository (by id), the default branch, and a head_sha in the default branch's history. The cheap
- * checks come first; the history check is one API call. `run` is the answer of `GET /actions/runs/{id}`.
+ * path, this repository's own head repository (by id), the default branch, no tag named like it, and a head_sha in the default
+ * branch's history. The cheap checks come first. `run` is an entry of the run list.
  */
 export async function trustedRun(gh: GateGithub, run: unknown, repo: RepoRef): Promise<boolean> {
-  if (!isPlain(run)) return false;
-  if (!posInt(own(run, 'id'))) return false;
-  if (own(run, 'event') !== 'push') return false;
-  if (own(run, 'path') !== WORKFLOW_PATH) return false;
-  const head = own(run, 'head_repository');
-  if (!isPlain(head) || own(head, 'id') !== repo.id) return false;
-  if (own(run, 'head_branch') !== repo.defaultBranch) return false;
-  const sha = own(run, 'head_sha');
-  if (typeof sha !== 'string' || !SHA_RE.test(sha)) return false;
-  if (!(await noDefaultBranchTag(gh, repo))) return false;
-  return inDefaultHistory(gh, repo, sha);
-}
-
-/** True only when the API clearly says no tag has the default branch's name. Asked once per client and branch. */
-const TAG_ASKED = new WeakMap<GateGithub, Map<string, Promise<boolean>>>();
-function noDefaultBranchTag(gh: GateGithub, repo: RepoRef): Promise<boolean> {
-  let per = TAG_ASKED.get(gh);
-  if (per === undefined) { per = new Map(); TAG_ASKED.set(gh, per); }
-  const k = `${repo.owner}/${repo.name}\0${repo.defaultBranch}`;
-  let p = per.get(k);
-  if (p === undefined) {
-    p = gh.tagExists(repo.owner, repo.name, repo.defaultBranch).then((exists) => exists === false, () => false);
-    per.set(k, p);
-  }
-  return p;
+  return (await judgeRun(gh, run, repo)).ok;
 }
 
 // ---------- verifying one artifact (pure) ----------
@@ -187,8 +213,11 @@ function parseDoc(bytes: unknown): Record<string, unknown> | string {
 }
 
 const hmac = (key: string, text: string): string => createHmac('sha256', key).update(text).digest('hex');
+/** The key the artifact MACs use: a sub-key of PIPEGEN_FP_KEY (review-C3 m10). */
+const macKey = (key: string): string => hmac(key, 'pipegen-artifact-mac-v1');
+const sign = (key: string, text: string): string => hmac(macKey(key), text);
 function macMatches(key: string, text: string, mac: string): boolean {
-  const a = Buffer.from(hmac(key, text), 'hex');
+  const a = Buffer.from(sign(key, text), 'hex');
   const b = Buffer.from(mac, 'hex');
   return a.length === b.length && timingSafeEqual(a, b);
 }
@@ -243,25 +272,33 @@ export function verifyBaselineArtifact(bytes: Uint8Array, meta: ArtifactMeta, ct
   return { baseline: { tools: [...tools].sort(), counts } };
 }
 
-/** Verify the bytes of a pipegen-clean-run artifact: the same rules, with the marker's own MAC format. */
-export function verifyCleanRunArtifact(bytes: Uint8Array, meta: ArtifactMeta, ctx: VerifyContext): CleanRunResult {
-  const no = (note: string): CleanRunResult => ({ seen: false, note: `clean-run marker not trusted: ${note}` });
-  const early = metaProblem(meta, ctx, CLEAN_RUN_ARTIFACT);
-  if (early !== undefined) return no(early);
-  const key = ctx.key as string;
+/**
+ * Verify the bytes of a pipegen-clean-run artifact. With a usable key: the same rules as the baseline (MAC, key id, run id). With none
+ * (a fork PR): the name, expiry, exact fields and run id only, because a marker can only make the gate stricter (I2). `malformed` is
+ * true when the file is not a well-formed marker of this artifact (the lookup is then unknown); a MAC or key-id mismatch is a clean "not
+ * a marker of ours" (ignored).
+ */
+export function verifyCleanRunArtifact(bytes: Uint8Array, meta: ArtifactMeta, ctx: VerifyContext): { seen: boolean; malformed: boolean; note?: string } {
+  const no = (note: string, malformed: boolean): { seen: false; malformed: boolean; note: string } => ({ seen: false, malformed, note: `clean-run marker not trusted: ${note}` });
+  if (!isPlain(meta) || meta.name !== CLEAN_RUN_ARTIFACT) return no(`the artifact is not named ${CLEAN_RUN_ARTIFACT}`, true);
+  if (!posInt(meta.runId)) return no('the artifact has no valid run id', true);
+  const exp = expiryProblem(meta, ctx.now);
+  if (exp !== undefined) return no(exp, false);
+  const key = keyNote(ctx.key) === undefined ? (ctx.key as string) : undefined;
   const doc = parseDoc(bytes);
-  if (typeof doc === 'string') return no(doc);
-  if (Object.keys(doc).sort().join() !== 'keyId,mac,runId') return no('the file does not have exactly runId, keyId and MAC');
+  if (typeof doc === 'string') return no(doc, true);
+  if (Object.keys(doc).sort().join() !== 'keyId,mac,runId') return no('the file does not have exactly runId, keyId and MAC', true);
   const runId = own(doc, 'runId');
   const kid = own(doc, 'keyId');
   const mac = own(doc, 'mac');
-  if (!posInt(runId)) return no('runId is not a positive whole number');
-  if (typeof kid !== 'string' || !KEY_ID_RE.test(kid)) return no('keyId is not a key id');
-  if (typeof mac !== 'string' || !MAC_RE.test(mac)) return no('the MAC is missing or not 64 lower-case hex characters');
-  if (runId !== meta.runId) return no(`the file is for run ${runId}, not the run of the artifact (${meta.runId})`);
-  if (kid !== keyId(key)) return no('its key id is not the current PIPEGEN_FP_KEY\'s');
-  if (!macMatches(key, canonicalMarker(runId, kid), mac)) return no('the MAC does not match');
-  return { seen: true };
+  if (!posInt(runId)) return no('runId is not a positive whole number', true);
+  if (typeof kid !== 'string' || !KEY_ID_RE.test(kid)) return no('keyId is not a key id', true);
+  if (typeof mac !== 'string' || !MAC_RE.test(mac)) return no('the MAC is missing or not 64 lower-case hex characters', true);
+  if (runId !== meta.runId) return no(`the file is for run ${runId}, not the run of the artifact (${meta.runId})`, true);
+  if (key === undefined) return { seen: true, malformed: false };   // no key to check with: run trust alone (a forged marker only blocks sooner)
+  if (kid !== keyId(key)) return no('its key id is not the current PIPEGEN_FP_KEY\'s', false);
+  if (!macMatches(key, canonicalMarker(runId, kid), mac)) return no('the MAC does not match', false);
+  return { seen: true, malformed: false };
 }
 
 // ---------- loading through the client ----------
@@ -291,32 +328,46 @@ function candidatesOf(listing: unknown, artifactName: string, runId: number): Ca
   return out.sort((x, y) => y.createdMs - x.createdMs || y.id - x.id);
 }
 
+interface WalkState { incomplete: boolean }
+type Use<T> = (input: { bytes: Uint8Array } | { problem: string }, meta: ArtifactMeta, st: WalkState) => T | undefined;
+
 /**
- * Walk the successful push runs of the workflow on the default branch, newest first (by run id), at most MAX_RUN_PAGES pages: judge
- * each with trustedRun and skip the rest at no further cost; for a trusted run list ITS artifacts of this name (at most
- * MAX_TRUSTED_RUNS trusted runs are searched), skip the expired, and hand the bytes of the newest to `use`. `use` returns a result to
- * stop with, or undefined to go on to the next trusted run. An error on one step skips with a note.
+ * Walk the successful push runs of the workflow on the default branch, newest first (by run id), at most MAX_RUN_PAGES pages: skip a
+ * run whose `conclusion` is not `success` (the API filter is not trusted, and a red main must not refresh the baseline), judge each
+ * of the rest with the trust check (at most HISTORY_CHECK_CAP history checks), and skip the untrusted at no further cost. For a
+ * trusted run list ITS artifacts of this name (at most MAX_TRUSTED_RUNS trusted runs are searched), skip the expired, and hand the
+ * bytes of the newest to `use`. `use` returns a result to stop with, or undefined to go on. `st.incomplete` is set whenever the walk
+ * could not tell (an API error, a malformed answer, a cap, a tag named like the default branch).
  */
-async function walk<T>(
-  gh: GateGithub, repo: RepoRef, ctx: VerifyContext, artifactName: string,
-  use: (bytes: Uint8Array, meta: ArtifactMeta) => T | undefined, notes: string[],
-): Promise<T | undefined> {
+async function walk<T>(gh: GateGithub, repo: RepoRef, ctx: VerifyContext, artifactName: string, use: Use<T>, notes: string[], st: WalkState): Promise<T | undefined> {
+  const budget = { left: HISTORY_CHECK_CAP };
   let trustedSeen = 0;
   let expired = 0;
+  let notSuccess = 0;
+  let exhausted = true;
   for (let page = 1; page <= MAX_RUN_PAGES; page++) {
     let listing: unknown;
     try {
       listing = await gh.listRuns(repo.owner, repo.name, { workflow: 'pipegen.yml', branch: repo.defaultBranch, event: 'push', status: 'success', page, perPage: RUNS_PER_PAGE });
-    } catch { notes.push('the list of workflow runs could not be read'); return undefined; }
+    } catch { notes.push('the list of workflow runs could not be read'); st.incomplete = true; return undefined; }
     const runs = isPlain(listing) && Array.isArray(own(listing, 'workflow_runs')) ? (own(listing, 'workflow_runs') as unknown[]) : undefined;
-    if (runs === undefined) { notes.push('the list of workflow runs is not a list'); return undefined; }
+    if (runs === undefined) { notes.push('the list of workflow runs is not a list'); st.incomplete = true; return undefined; }
     const ordered = runs.filter((r): r is Record<string, unknown> => isPlain(r) && posInt(own(r, 'id'))).sort((x, y) => (own(y, 'id') as number) - (own(x, 'id') as number));
     for (const r of ordered) {
-      if (!(await trustedRun(gh, r, repo))) continue;   // an untrusted run is invisible: no artifact call, no budget
-      if (++trustedSeen > MAX_TRUSTED_RUNS) { notes.push('too many runs without a usable artifact'); return undefined; }
+      if (own(r, 'conclusion') !== 'success') { notSuccess++; continue; }
+      const j = await judgeRun(gh, r, repo, budget);   // an untrusted run is invisible: no artifact call, no trusted-run budget
+      if (!j.ok) {
+        if (j.why === 'untrusted') continue;
+        st.incomplete = true;
+        notes.push(j.why === 'tag' ? `a tag named ${repo.defaultBranch} exists; no run is trusted until it is deleted`
+          : j.why === 'cap' ? `more than ${HISTORY_CHECK_CAP} runs needed a default-history check (cap)` : 'the default history of a run could not be checked');
+        if (j.why === 'tag' || j.why === 'cap') return undefined;
+        continue;
+      }
+      if (++trustedSeen > MAX_TRUSTED_RUNS) { notes.push('too many runs without a usable artifact'); st.incomplete = true; return undefined; }
       const runId = own(r, 'id') as number;
       let found: Candidate[];
-      try { found = candidatesOf(await gh.listRunArtifacts(repo.owner, repo.name, runId, artifactName), artifactName, runId); } catch { notes.push(`the artifacts of run ${runId} could not be read`); continue; }
+      try { found = candidatesOf(await gh.listRunArtifacts(repo.owner, repo.name, runId, artifactName), artifactName, runId); } catch { notes.push(`the artifacts of run ${runId} could not be read`); st.incomplete = true; continue; }
       const live = found.filter((c) => {
         const gone = expiryProblem({ runId, name: artifactName, expired: c.expired, expiresAt: c.expiresAt }, ctx.now) !== undefined;
         if (gone) expired++;
@@ -325,47 +376,58 @@ async function walk<T>(
       const c = live[0];
       if (c === undefined) continue;
       const meta: ArtifactMeta = { runId, name: artifactName, expired: false, expiresAt: c.expiresAt };
-      const stop = (note: string): T | undefined => { notes.push(note); return use(new Uint8Array(0), meta); };
-      if (c.size > MAX_ARTIFACT_BYTES) { const x = stop(`the ${artifactName} artifact of run ${runId} is over the size cap`); if (x !== undefined) return x; continue; }
+      const problem = (note: string): T | undefined => { notes.push(note); st.incomplete = true; return use({ problem: note }, meta, st); };
+      if (c.size > MAX_ARTIFACT_BYTES) { const x = problem(`the ${artifactName} artifact of run ${runId} is over the size cap`); if (x !== undefined) return x; continue; }
       let bytes: unknown;
-      try { bytes = await gh.downloadArtifact(repo.owner, repo.name, c.id); } catch { const x = stop(`the ${artifactName} artifact of run ${runId} could not be downloaded (deleted?)`); if (x !== undefined) return x; continue; }
-      if (!(bytes instanceof Uint8Array)) { const x = stop(`the ${artifactName} artifact of run ${runId} is not bytes`); if (x !== undefined) return x; continue; }
-      const x = use(bytes, meta);
+      try { bytes = await gh.downloadArtifact(repo.owner, repo.name, c.id); } catch { const x = problem(`the ${artifactName} artifact of run ${runId} could not be downloaded (deleted?)`); if (x !== undefined) return x; continue; }
+      if (!(bytes instanceof Uint8Array)) { const x = problem(`the ${artifactName} artifact of run ${runId} is not bytes`); if (x !== undefined) return x; continue; }
+      const x = use({ bytes }, meta, st);
       if (x !== undefined) return x;
     }
-    if (runs.length < RUNS_PER_PAGE) break;
+    if (runs.length < RUNS_PER_PAGE) { exhausted = false; break; }
   }
+  if (exhausted) { notes.push(`the run list was cut after ${MAX_RUN_PAGES} pages`); st.incomplete = true; }
   if (expired > 0 && notes.length === 0) notes.push(`the ${artifactName} artifact has expired`);
+  if (notSuccess > 0) notes.push(`${notSuccess} run${notSuccess === 1 ? '' : 's'} did not have conclusion success (a red main does not refresh the baseline)`);
   return undefined;
 }
 
 /**
- * The newest non-expired `pipegen-baseline` artifact of a trusted run, verified (verifyBaselineArtifact). The first TRUSTED artifact
- * decides: if it does not verify there is no baseline (the base scan is used), and an older one is not tried. Untrusted artifacts
- * (a fork PR's, a PR run's, a tag run's) are skipped. Without a usable key (a fork PR) nothing can be verified: null, and no API call.
+ * The newest non-expired `pipegen-baseline` artifact of a trusted run, verified (verifyBaselineArtifact). The first TRUSTED run that
+ * has a live artifact decides: if it does not verify there is no baseline (the base scan is used), and an older one is not tried.
+ * Untrusted runs are skipped. Without a usable key (a fork PR) nothing can be verified: null, and no API call.
  */
 export async function loadBaseline(gh: GateGithub, repo: RepoRef, ctx: VerifyContext): Promise<LoadResult> {
   const kn = keyNote(ctx.key);
   if (kn !== undefined) return { baseline: null, note: `no trusted baseline: ${kn}; the base scan decides` };
   const notes: string[] = [];
-  const result = await walk<LoadResult>(gh, repo, ctx, BASELINE_ARTIFACT, (bytes, meta) => (bytes.length === 0 ? { baseline: null, note: `no trusted baseline: ${notes[notes.length - 1] ?? 'unreadable'}` } : verifyBaselineArtifact(bytes, meta, ctx)), notes);
+  const st: WalkState = { incomplete: false };
+  const result = await walk<LoadResult>(gh, repo, ctx, BASELINE_ARTIFACT, (input, meta) => ('problem' in input ? { baseline: null, note: `no trusted baseline: ${input.problem}` } : verifyBaselineArtifact(input.bytes, meta, ctx)), notes, st);
   if (result !== undefined) return result;
   return { baseline: null, note: `no trusted baseline: ${notes.join('; ') || `no ${BASELINE_ARTIFACT} artifact from a trusted run`}; the base scan decides` };
 }
 
-/** Whether a valid, signed `pipegen-clean-run` marker from a trusted run exists (any one counts). No key: false, no API call. */
+/**
+ * Whether a clean-run marker exists (any valid one of a trusted run counts). Three answers (I2): `seen`; `none` (the lookup finished
+ * and found no valid marker); `unknown` (it could not be completed, or a trusted run's marker is malformed): the mode blocks on unknown.
+ * Works without a key too (a fork PR): see verifyCleanRunArtifact.
+ */
 export async function cleanRunSeen(gh: GateGithub, repo: RepoRef, ctx: VerifyContext): Promise<CleanRunResult> {
-  const kn = keyNote(ctx.key);
-  if (kn !== undefined) return { seen: false, note: `clean-run marker not trusted: ${kn}` };
   const notes: string[] = [];
-  const result = await walk<CleanRunResult>(gh, repo, ctx, CLEAN_RUN_ARTIFACT, (bytes, meta) => {
-    if (bytes.length === 0) return undefined;
-    const r = verifyCleanRunArtifact(bytes, meta, ctx);
-    if (r.seen) return r;
+  const st: WalkState = { incomplete: false };
+  const result = await walk<CleanRunResult>(gh, repo, ctx, CLEAN_RUN_ARTIFACT, (input, meta, s) => {
+    if ('problem' in input) return undefined;   // the walk already marked the lookup incomplete
+    const r = verifyCleanRunArtifact(input.bytes, meta, ctx);
+    if (r.seen) return { state: 'seen', seen: true };
+    if (r.malformed) s.incomplete = true;
     if (r.note !== undefined) notes.push(r.note);
     return undefined;
-  }, notes);
-  return result ?? { seen: false, note: `clean-run marker not trusted: ${notes.join('; ') || 'none from a trusted run'}` };
+  }, notes, st);
+  if (result !== undefined) return result;
+  const why = notes.join('; ');
+  return st.incomplete
+    ? { state: 'unknown', seen: false, note: `clean-run marker could not be checked: ${why || 'unknown'}` }
+    : { state: 'none', seen: false, note: `no clean-run marker from a trusted run${why === '' ? '' : `: ${why}`}` };
 }
 
 // ---------- building and saving ----------
@@ -402,6 +464,9 @@ function requireRunId(runId: number): number {
   return runId;
 }
 
+/** Fingerprint forms made with PIPEGEN_FP_KEY (review-C3 m10): all need the key id of the current key. */
+const KEYED_FORMS: readonly string[] = ['region', 'quoted', 'file', 'line'];
+
 /**
  * The signed baseline file of a trusted run's results. A check is left out (and listed in `skipped`) when it is a tool error, proves
  * no coverage, is a same-run tool, or holds secret fingerprints made under another key id (or with none recorded). Counts are
@@ -419,12 +484,18 @@ export function buildBaseline(input: BaselineInput): BuiltBaseline {
     if (c.status !== 'ok') { skip('tool error: never stored'); continue; }
     if (c.noCoverage === true) { skip('no coverage: not proven clean, so not stored'); continue; }
     if (sameRun.has(c.tool)) { skip('compared with the same-run base scan, never with a stored baseline'); continue; }
-    if (c.findings.some((f) => f.secret) && c.keyId !== kid) { skip('its secret fingerprints are not under the current key id'); continue; }
+    if (c.findings.some((f) => f.secret || KEYED_FORMS.includes(f.fpBy)) && c.keyId !== kid) { skip('its secret fingerprints are not under the current key id'); continue; }
     for (const f of c.findings) { const k = countKeyOf(c.job, f); counts.set(k, (counts.get(k) ?? 0) + 1); }
   }
+  // the reader's caps (review-C3 m8): never write a baseline the reader would refuse without saying so
+  if (counts.size > MAX_COUNT_ENTRIES) throw new Error(`can not write the baseline: too many distinct findings (${counts.size}; the reader takes at most ${MAX_COUNT_ENTRIES})`);
+  for (const k of counts.keys()) {
+    if (k.length > MAX_COUNT_KEY) throw new Error(`can not write the baseline: a count key is longer than ${MAX_COUNT_KEY} characters (the reader would refuse the file)`);
+  }
   const sorted = [...counts].sort(([a], [b]) => code(a, b));
-  const mac = hmac(key, canonicalBaseline(runId, kid, counts));
+  const mac = sign(key, canonicalBaseline(runId, kid, counts));
   const bytes = new TextEncoder().encode(JSON.stringify({ runId, keyId: kid, counts: Object.fromEntries(sorted), mac }));
+  if (bytes.length > MAX_ARTIFACT_BYTES) throw new Error(`can not write the baseline: it is over the size cap (${bytes.length} bytes; the reader takes at most ${MAX_ARTIFACT_BYTES})`);
   return { bytes, counts: new Map(sorted), skipped };
 }
 
@@ -440,5 +511,5 @@ export function buildCleanRunMarker(runId: number, key: string | undefined): Uin
   const k = requireKey(key);
   const id = requireRunId(runId);
   const kid = keyId(k);
-  return new TextEncoder().encode(JSON.stringify({ runId: id, keyId: kid, mac: hmac(k, canonicalMarker(id, kid)) }));
+  return new TextEncoder().encode(JSON.stringify({ runId: id, keyId: kid, mac: sign(k, canonicalMarker(id, kid)) }));
 }

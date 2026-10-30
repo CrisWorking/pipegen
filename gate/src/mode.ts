@@ -9,26 +9,28 @@
 // real calendar date in the form YYYY-MM-DD counts as absent. A trusted clean run (the marker, verified in baseline.ts) ends
 // warn mode on its own. No date at all and no clean run: warn (a repo that has not finished setup).
 //
-// "Today" is the UTC day: the date counts from 00:00 UTC. A clock that is not a date fails closed (block).
+// A clean-run lookup has three answers: `true` (a valid marker of a trusted run), `false` (the lookup finished and found none) and
+// `'unknown'` (it could not be completed: an API error, a malformed answer, the call cap, a tag named like the default branch). A
+// forged or lost marker can only move the gate toward block, so the strict side is taken: `'unknown'` blocks, with or without dates.
+//
+// "Today" is the UTC day: the date counts from 00:00 UTC. A clock that is not a date, or outside the years 1 to 9999, fails closed (block).
 import type { GateMode } from './decide.js';
+import { validDate } from './date.js';
 
-/** A real calendar date `YYYY-MM-DD` (year 0001 to 9999), as the same text; otherwise undefined. */
-export function validDate(text: string | undefined): string | undefined {
-  if (typeof text !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(text)) return undefined;
-  const [y, m, d] = text.split('-').map(Number) as [number, number, number];
-  if (y < 1) return undefined;
-  const t = new Date(Date.UTC(y, m - 1, d));
-  t.setUTCFullYear(y);   // years 0 to 99 would otherwise map to 1900 to 1999
-  return t.getUTCFullYear() === y && t.getUTCMonth() === m - 1 && t.getUTCDate() === d ? text : undefined;
-}
+export { validDate };
 
 export interface ModeDecision { mode: GateMode; /** One line for the summary and the notes: why. */ why: string }
 
+/** The clean-run lookup: seen, not seen, or could not be checked (see the header). */
+export type CleanRun = boolean | 'unknown';
+
 /** resolveMode with the reason. */
-export function decideMode(blockFrom: string | undefined, recorded: string | undefined, today: Date, cleanRunSeen: boolean): ModeDecision {
-  if (cleanRunSeen) return { mode: 'block', why: 'block mode: a trusted clean run has been seen' };
+export function decideMode(blockFrom: string | undefined, recorded: string | undefined, today: Date, cleanRunSeen: CleanRun): ModeDecision {
+  if (cleanRunSeen === 'unknown') return { mode: 'block', why: 'block mode: the clean-run marker could not be checked, so the gate takes the strict side' };
+  if (cleanRunSeen === true) return { mode: 'block', why: 'block mode: a trusted clean run has been seen' };
   if (!(today instanceof Date) || Number.isNaN(today.getTime())) return { mode: 'block', why: 'block mode: the clock is not a date, so the gate fails closed' };
   const day = today.toISOString().slice(0, 10);
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(day) || day < '0001-01-01') return { mode: 'block', why: 'block mode: the clock is outside the years 1 to 9999, so the gate fails closed' };
   const v = validDate(blockFrom);
   const r = validDate(recorded);
   const dates = [v, r].filter((x): x is string => x !== undefined).sort();
@@ -46,6 +48,6 @@ export function decideMode(blockFrom: string | undefined, recorded: string | und
  * @param today the current time (the UTC day counts)
  * @param cleanRunSeen a trusted, signed clean-run marker exists (baseline.ts cleanRunSeen)
  */
-export function resolveMode(blockFrom: string | undefined, recorded: string | undefined, today: Date, cleanRunSeen: boolean): GateMode {
+export function resolveMode(blockFrom: string | undefined, recorded: string | undefined, today: Date, cleanRunSeen: CleanRun): GateMode {
   return decideMode(blockFrom, recorded, today, cleanRunSeen).mode;
 }

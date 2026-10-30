@@ -7,11 +7,11 @@ import { describe, expect, it } from 'vitest';
 import { BASELINE_ARTIFACT, CLEAN_RUN_ARTIFACT } from '../src/engine/artifact-names.js';
 import {
   buildBaseline, buildCleanRunMarker, cleanRunSeen, inDefaultHistory, loadBaseline, saveBaseline, trustedRun, verifyBaselineArtifact, verifyCleanRunArtifact,
-  BASELINE_RETENTION_DAYS, MAX_RUN_PAGES, MAX_TRUSTED_RUNS, WORKFLOW_PATH, type ArtifactMeta, type ArtifactUploader, type GateGithub, type RepoRef, type RunQuery, type VerifyContext,
+  BASELINE_RETENTION_DAYS, HISTORY_CHECK_CAP, MAX_COUNT_ENTRIES, MAX_RUN_PAGES, MAX_TRUSTED_RUNS, WORKFLOW_PATH, type ArtifactMeta, type ArtifactUploader, type GateGithub, type RepoRef, type RunQuery, type VerifyContext,
 } from '../gate/src/baseline.js';
 import { countKeyOf } from '../gate/src/decide.js';
 import { keyId } from '../gate/src/fingerprint.js';
-import { resolveMode } from '../gate/src/mode.js';
+import { decideMode, resolveMode } from '../gate/src/mode.js';
 import type { ScrubbedFinding } from '../gate/src/scrub.js';
 
 // ---------- builders ----------
@@ -22,6 +22,7 @@ const NOW = new Date('2026-10-30T12:00:00Z');
 const REPO: RepoRef = { owner: 'acme', name: 'app', id: 7, defaultBranch: 'main' };
 const SHA = (c: string): string => c.repeat(40);
 const S1 = SHA('1');
+const TIP = SHA('f');   // the default branch's commit, as the ref answer gives it
 const CTX: VerifyContext = { key: KEY, now: NOW };
 const FUTURE = '2027-01-20T00:00:00Z';
 const PAST = '2026-10-01T00:00:00Z';
@@ -36,9 +37,10 @@ const leak = (seed: string): ScrubbedFinding => fnd({ tool: 'betterleaks', ruleI
 
 /** The MAC spelled out here, independently of baseline.ts: pins the canonical encoding. */
 const sortedPairs = (counts: Record<string, number>): [string, number][] => Object.entries(counts).sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
+const subKey = (key: string): string => createHmac('sha256', key).update('pipegen-artifact-mac-v1').digest('hex');
 const macOf = (key: string, runId: number, kid: string, counts: Record<string, number>, format = 'pipegen-baseline-v1'): string =>
-  createHmac('sha256', key).update(JSON.stringify([format, runId, kid, sortedPairs(counts)])).digest('hex');
-const markerMac = (key: string, runId: number, kid: string): string => createHmac('sha256', key).update(JSON.stringify(['pipegen-clean-run-v1', runId, kid])).digest('hex');
+  createHmac('sha256', subKey(key)).update(JSON.stringify([format, runId, kid, sortedPairs(counts)])).digest('hex');
+const markerMac = (key: string, runId: number, kid: string): string => createHmac('sha256', subKey(key)).update(JSON.stringify(['pipegen-clean-run-v1', runId, kid])).digest('hex');
 
 const COUNTS = { [`fp\0semgrep\0semgrep\0${hex('a')}`]: 2, [`fp\0secrets\0betterleaks\0${SEC}${hex('s')}`]: 1, [`unmapped\0iac\0trivy-config\0AVD-1`]: 3 };
 interface Doc { runId: number; keyId: string; counts: Record<string, number>; mac: string }
@@ -62,6 +64,7 @@ class FakeGh implements GateGithub {
   blobs = new Map<number, Answer>();
   fallbackCompare: Answer = { status: 'ahead' };
   tagAnswer: Answer = false;                 // does a tag named like the default branch exist?
+  branchAnswer: Answer = { ref: 'refs/heads/main', object: { type: 'commit', sha: SHA('f') } };
   private out(a: Answer): unknown { if (a instanceof Error) throw a; return a; }
   async compare(_o: string, _n: string, base: string, head: string): Promise<unknown> { this.calls.push(`compare ${base}...${head}`); return this.out(this.compares.has(base) ? this.compares.get(base) : this.fallbackCompare); }
   async listRuns(_o: string, _n: string, q: RunQuery): Promise<unknown> {
@@ -73,10 +76,11 @@ class FakeGh implements GateGithub {
   lastQuery: RunQuery | undefined;
   async listRunArtifacts(_o: string, _n: string, runId: number, name: string): Promise<unknown> { this.calls.push(`artifacts ${runId} ${name}`); return this.out(this.runArtifacts.has(runId) ? this.runArtifacts.get(runId) : { artifacts: [] }); }
   async downloadArtifact(_o: string, _n: string, id: number): Promise<Uint8Array> { this.calls.push(`download ${id}`); return this.out(this.blobs.has(id) ? this.blobs.get(id) : new Error('404')) as Uint8Array; }
+  async branchHead(_o: string, _n: string, branch: string): Promise<unknown> { this.calls.push(`branch ${branch}`); return this.out(this.branchAnswer); }
   async tagExists(_o: string, _n: string, tag: string): Promise<boolean> { this.calls.push(`tag ${tag}`); return this.out(this.tagAnswer) as boolean; }
 }
 const run = (over: Record<string, unknown> = {}): Record<string, unknown> => ({
-  id: 100, event: 'push', path: WORKFLOW_PATH, head_branch: 'main', head_sha: S1, head_repository: { id: 7 }, ...over,
+  id: 100, event: 'push', conclusion: 'success', path: WORKFLOW_PATH, head_branch: 'main', head_sha: S1, head_repository: { id: 7 }, ...over,
 });
 const art = (id: number, runId: number, over: Record<string, unknown> = {}, name: string = BASELINE_ARTIFACT): Record<string, unknown> => ({
   id, name, expired: false, expires_at: FUTURE, created_at: `2026-10-${String(10 + id).padStart(2, '0')}T00:00:00Z`, size_in_bytes: 500,
@@ -104,7 +108,7 @@ describe('inDefaultHistory (compare semantics)', () => {
       const gh = new FakeGh();
       gh.fallbackCompare = { status };
       expect(await inDefaultHistory(gh, REPO, S1), status).toBe(want);
-      expect(gh.calls).toEqual([`compare ${S1}...main`]);   // base = the sha, head = the default branch
+      expect(gh.calls).toEqual(['branch main', `compare ${S1}...${TIP}`]);   // the tip is resolved first; base = the sha, head = the tip commit, never a name
     }
     for (const err of [new Error('404 Not Found'), new Error('500'), new Error('rate limited')]) {
       const gh = new FakeGh();
@@ -163,7 +167,7 @@ describe('trustedRun', () => {
     const gh = new FakeGh();
     gh.compares.set(S1, { status: 'diverged' });
     expect(await trusted(run({ head_branch: 'main' }), gh)).toBe(false);
-    expect(gh.calls).toContain(`compare ${S1}...main`);
+    expect(gh.calls).toContain(`compare ${S1}...${TIP}`);
   });
   it('trustedRun: head_sha not in default history (behind, diverged, API error, hostile answer) → rejected', async () => {
     for (const a of [{ status: 'behind' }, { status: 'diverged' }, new Error('404'), null, {}]) {
@@ -326,8 +330,13 @@ describe('verifyCleanRunArtifact', () => {
     expect(seen(marker(), meta({ name: BASELINE_ARTIFACT })).seen).toBe(false);
     expect(seen(marker(), meta({ expired: true })).seen).toBe(false);
     expect(seen(marker(), meta({ expiresAt: PAST })).seen).toBe(false);
-    expect(seen(marker(), meta(), { key: undefined, now: NOW }).seen).toBe(false);
-    expect(seen(marker(), meta(), { key: 'short', now: NOW }).seen).toBe(false);
+    // fix round 1 (I2): no usable key (a fork PR) → the marker counts on run trust alone; a bad shape never does
+    expect(seen(marker(), meta(), { key: undefined, now: NOW }).seen).toBe(true);
+    expect(seen(marker(), meta(), { key: 'short', now: NOW }).seen).toBe(true);
+    expect(seen(marker(100, KEY2), meta(), { key: undefined, now: NOW }).seen).toBe(true);   // not checked without a key
+    expect(seen({ ...marker(), extra: 1 }, meta(), { key: undefined, now: NOW }).seen).toBe(false);
+    expect(seen(marker(99), meta(), { key: undefined, now: NOW }).seen).toBe(false);   // still the artifact's own run
+    expect(seen(marker(), meta({ expired: true }), { key: undefined, now: NOW }).seen).toBe(false);
     expect(seen({ ...marker(), extra: 1 }).seen).toBe(false);
     expect(seen('not json').seen).toBe(false);
     expect(seen(marker()).note).toBeUndefined();
@@ -514,9 +523,9 @@ describe('loadBaseline (trusted runs only)', () => {
     for (const odd of [undefined, null, 'true', 1]) { const g = new FakeGh(); g.tagAnswer = odd; expect(await trustedRun(g, run(), REPO), String(odd)).toBe(false); }
     const none = new FakeGh();
     expect(await trustedRun(none, run(), REPO)).toBe(true);
-    // asked once per client and branch, however many runs are judged
+    // fix round 1 (I1): asked fresh for every run, never cached
     await trustedRun(none, run({ id: 101 }), REPO); await trustedRun(none, run({ id: 102 }), REPO);
-    expect(none.calls.filter((c) => c.startsWith('tag')).length).toBe(1);
+    expect(none.calls.filter((c) => c.startsWith('tag')).length).toBe(3);
   });
   it('baseline: with a tag named like the default branch, no baseline and no clean-run marker is trusted', async () => {
     const gh = world([art(2, 200)], [run({ id: 200 })], [[2, signed(200)]]); gh.tagAnswer = true;
@@ -563,9 +572,10 @@ describe('cleanRunSeen (trusted runs only)', () => {
     }
     expect((await clean(world([cart(2, 200, { expired: true })], [run({ id: 200 })], [[2, marker(200)]]))).seen).toBe(false);
     expect((await clean(world([cart(2, 200)], [run({ id: 200 })], [[2, new Error('404')]]))).seen).toBe(false);
+    // no key (a fork PR): the marker of a trusted run still counts (I2); the API is used
     const gh = world([cart(2, 200)], [run({ id: 200 })], [[2, marker(200)]]);
-    expect((await clean(gh, { key: undefined, now: NOW })).seen).toBe(false);
-    expect(gh.calls).toEqual([]);
+    expect((await clean(gh, { key: undefined, now: NOW })).seen).toBe(true);
+    expect(gh.calls.length).toBeGreaterThan(0);
     const err = new FakeGh(); err.runsAnswer = new Error('500');
     expect((await clean(err)).seen).toBe(false);
   });
@@ -837,5 +847,190 @@ describe('resolveMode (S13, #96)', () => {
     for (const v of [undefined, '', '2027-06-01', '9999-12-31', 'never', '2026-11-02', '2026-11-01']) {
       expect(resolveMode(v, recorded, TODAY, false), String(v)).toBe('block');
     }
+  });
+});
+
+// ---------- fix round 1 (review-C3) ----------
+
+describe('fix round 1, I1: the default history is checked against the branch COMMIT, resolved on every call', () => {
+  it('inDefaultHistory: resolves refs/heads/<branch> itself, then compares sha...tip; the name never goes to compare; nothing is cached', async () => {
+    const gh = new FakeGh();
+    expect(await inDefaultHistory(gh, REPO, S1)).toBe(true);
+    expect(await inDefaultHistory(gh, REPO, S1)).toBe(true);
+    expect(gh.calls).toEqual(['branch main', `compare ${S1}...${TIP}`, 'branch main', `compare ${S1}...${TIP}`]);
+    expect(gh.calls.some((c) => c.endsWith('...main'))).toBe(false);
+  });
+  it('inDefaultHistory: a ref answer that is not exactly the branch head commit gives false and no compare (tag ref, wrong name, tag object, bad sha, junk, error)', async () => {
+    const answers: unknown[] = [
+      { ref: 'refs/tags/main', object: { type: 'commit', sha: TIP } }, { ref: 'refs/heads/other', object: { type: 'commit', sha: TIP } }, { ref: 'main', object: { type: 'commit', sha: TIP } },
+      { ref: 'refs/heads/main', object: { type: 'tag', sha: TIP } }, { ref: 'refs/heads/main', object: { type: 'commit', sha: 'A'.repeat(40) } }, { ref: 'refs/heads/main', object: { type: 'commit', sha: 'f'.repeat(39) } },
+      { ref: 'refs/heads/main' }, { object: { type: 'commit', sha: TIP } }, null, 'x', [], [{ ref: 'refs/heads/main', object: { type: 'commit', sha: TIP } }], new Error('404'),
+    ];
+    for (const a of answers) {
+      const gh = new FakeGh(); gh.branchAnswer = a;
+      expect(await inDefaultHistory(gh, REPO, S1), JSON.stringify(a)).toBe(false);
+      expect(gh.calls.some((c) => c.startsWith('compare')), JSON.stringify(a)).toBe(false);
+    }
+  });
+  it('inDefaultHistory: a client whose compare resolves the NAME main to a tag commit cannot make a tag commit pass (the tip sha is sent instead)', async () => {
+    const gh = new FakeGh();
+    gh.compares.set(S1, { status: 'diverged' });   // S1 is the tag commit: not an ancestor of the real tip
+    const nameCompare = gh.compare.bind(gh);
+    gh.compare = async (o, n, base, head) => (head === 'main' ? { status: 'identical' } : nameCompare(o, n, base, head));   // the tag-first resolution
+    expect(await inDefaultHistory(gh, REPO, S1)).toBe(false);
+    expect(await trustedRun(gh, run(), REPO)).toBe(false);
+  });
+  it('trustedRun: the reviewer\'s race — the tag is re-created after an earlier check — is caught, because the tag and the tip are asked fresh per run', async () => {
+    const gh = new FakeGh();
+    expect(await trustedRun(gh, run({ id: 1 }), REPO)).toBe(true);
+    gh.tagAnswer = true;   // the writer pushes the tag again
+    gh.compare = async () => ({ status: 'identical' });   // and the name now resolves to the tag commit
+    expect(await trustedRun(gh, run({ id: 2 }), REPO)).toBe(false);
+    expect(gh.calls.filter((c) => c === 'tag main').length).toBe(2);
+    expect(gh.calls.filter((c) => c === 'branch main').length).toBe(1);   // the second run stopped at the tag
+  });
+  it('inDefaultHistory: ahead or identical still true; behind, diverged, error false (against the tip)', async () => {
+    for (const [status, want] of [['ahead', true], ['identical', true], ['behind', false], ['diverged', false]] as const) {
+      const gh = new FakeGh(); gh.fallbackCompare = { status };
+      expect(await inDefaultHistory(gh, REPO, S1), status).toBe(want);
+    }
+  });
+});
+
+describe('fix round 1, I2: the clean-run marker fails toward block', () => {
+  const marker = (runId: number, key = KEY): Record<string, unknown> => ({ runId, keyId: keyId(key), mac: markerMac(key, runId, keyId(key)) });
+  const cart = (id: number, runId: number, over: Record<string, unknown> = {}) => art(id, runId, over, CLEAN_RUN_ARTIFACT);
+  const clean = (gh: GateGithub, ctx: VerifyContext = CTX) => cleanRunSeen(gh, REPO, ctx);
+  const good = (): FakeGh => world([cart(2, 200)], [run({ id: 200 })], [[2, marker(200)]]);
+  it('state: a valid trusted marker is seen; a clean lookup that finds none is none', async () => {
+    expect((await clean(good())).state).toBe('seen');
+    expect((await clean(world([], [run({ id: 200 })], []))).state).toBe('none');
+    expect((await clean(world([cart(2, 200)], [run({ id: 200, event: 'pull_request' })], [[2, marker(200)]]))).state).toBe('none');   // untrusted runs are just ignored
+  });
+  it('state: a fork PR (no key) after a clean run is seen — it does not drop back to warn', async () => {
+    expect((await clean(good(), { key: undefined, now: NOW })).state).toBe('seen');
+    expect(resolveMode(undefined, undefined, NOW, (await clean(good(), { key: undefined, now: NOW })).seen)).toBe('block');
+  });
+  it('state: every lookup that errors or cannot be completed is unknown (run list error, malformed list, artifact list error, download error, bad file, tag error, tag exists, history error, cap)', async () => {
+    const e = new Error('500');
+    const cases: [string, FakeGh][] = [];
+    const a = good(); a.runsAnswer = e; cases.push(['run list error', a]);
+    const b = good(); b.runsAnswer = { workflow_runs: 'x' }; cases.push(['malformed run list', b]);
+    const c = good(); c.runArtifacts.set(200, e); cases.push(['artifact list error', c]);
+    const d = good(); d.blobs.set(2, e); cases.push(['download error', d]);
+    const f = good(); f.blobs.set(2, bytesOf('{')); cases.push(['bad marker file', f]);
+    const g = good(); g.tagAnswer = e; cases.push(['tag lookup error', g]);
+    const h = good(); h.tagAnswer = true; cases.push(['a tag named like the branch exists', h]);
+    const i = good(); i.fallbackCompare = e; cases.push(['history compare error', i]);
+    const j = good(); j.branchAnswer = e; cases.push(['branch ref error', j]);
+    const k = good(); k.branchAnswer = { junk: 1 }; cases.push(['malformed branch ref', k]);
+    for (const [why, gh] of cases) {
+      const r = await clean(gh);
+      expect(r.state, why).toBe('unknown');
+      expect(r.seen, why).toBe(false);
+      expect(r.note, why).toBeTruthy();
+      expect(resolveMode(undefined, undefined, NOW, 'unknown'), why).toBe('block');
+    }
+  });
+  it('state: a marker with a wrong MAC (a key is present) is ignored, not seen — but another valid marker still counts', async () => {
+    const gh = world([cart(2, 200), cart(3, 300)], [run({ id: 200 }), run({ id: 300 })], [[2, marker(200)], [3, { ...marker(300), mac: '0'.repeat(64) }]]);
+    expect((await clean(gh)).state).toBe('seen');
+    const bad = world([cart(3, 300)], [run({ id: 300 })], [[3, { ...marker(300), mac: '0'.repeat(64) }]]);
+    expect((await clean(bad)).state).toBe('none');
+  });
+  it('mode table: unknown always blocks, with or without dates', () => {
+    const t = new Date('2026-11-05T10:00:00Z');
+    for (const [v, r] of [[undefined, undefined], ['2027-01-01', undefined], [undefined, '2027-01-01'], ['2027-01-01', '2027-02-01'], ['soon', 'x'], ['2026-11-01', '2026-11-01']] as const) {
+      expect(resolveMode(v, r, t, 'unknown'), `${v} ${r}`).toBe('block');
+    }
+    expect(resolveMode(undefined, undefined, t, true)).toBe('block');
+    expect(resolveMode(undefined, undefined, t, false)).toBe('warn');
+    expect(decideMode(undefined, undefined, t, 'unknown').why).toMatch(/could not be checked/);
+  });
+});
+
+describe('fix round 1: minors', () => {
+  it('m1: a clock outside years 1 to 9999 blocks', () => {
+    for (const d of ['+010000-01-01T00:00:00Z', '+275000-01-01T00:00:00Z', '-000001-01-01T00:00:00Z']) {
+      expect(resolveMode(undefined, '2099-01-01', new Date(d), false), d).toBe('block');
+      expect(resolveMode(undefined, undefined, new Date(d), false), d).toBe('block');
+    }
+    expect(resolveMode(undefined, '2099-01-01', new Date('2026-11-05T00:00:00Z'), false)).toBe('warn');
+  });
+  it('m3: only a run whose conclusion is success counts (the status filter is checked in code); a stale baseline falls back with a note', async () => {
+    const real = { [`fp\0a\0t\0${hex('green')}`]: 1 };
+    const red = { [`fp\0a\0t\0${hex('red')}`]: 9 };
+    for (const conclusion of ['failure', 'cancelled', 'skipped', 'neutral', undefined, null, 'Success']) {
+      const gh = world([art(1, 100), art(2, 200)], [run({ id: 100 }), run({ id: 200, conclusion })], [[1, goodDoc({ runId: 100 }, KEY, real)], [2, goodDoc({ runId: 200 }, KEY, red)]]);
+      expect(countsOf((await loadBaseline(gh, REPO, CTX)).baseline?.counts), String(conclusion)).toEqual(real);
+    }
+    const only = world([art(2, 200)], [run({ id: 200, conclusion: 'failure' })], [[2, goodDoc({ runId: 200 }, KEY, red)]]);
+    const r = await loadBaseline(only, REPO, CTX);
+    expect(r.baseline).toBeNull();
+    expect(r.note).toMatch(/not successful|success/);
+    expect(only.calls.some((c) => c.startsWith('artifacts'))).toBe(false);
+  });
+  it('m4: history checks are capped per lookup (HISTORY_CHECK_CAP); hitting the cap: baseline null with a note, marker unknown', async () => {
+    const runs = Array.from({ length: 40 }, (_, i) => run({ id: 1000 - i }));
+    const make = (): FakeGh => { const g = world([], runs, []); g.fallbackCompare = { status: 'diverged' }; return g; };
+    const gb = make();
+    const r = await loadBaseline(gb, REPO, CTX);
+    expect(r.baseline).toBeNull();
+    expect(r.note).toMatch(/cap/);
+    expect(gb.calls.filter((c) => c.startsWith('compare')).length).toBeLessThanOrEqual(HISTORY_CHECK_CAP);
+    expect(HISTORY_CHECK_CAP).toBe(20);
+    const gm = make();
+    expect((await cleanRunSeen(gm, REPO, CTX)).state).toBe('unknown');
+    expect(gm.calls.filter((c) => c.startsWith('compare')).length).toBeLessThanOrEqual(HISTORY_CHECK_CAP);
+  });
+  it('m5: with a tag named like the default branch the note says so', async () => {
+    const gh = world([art(2, 200)], [run({ id: 200 })], [[2, goodDoc({ runId: 200 })]]); gh.tagAnswer = true;
+    const r = await loadBaseline(gh, REPO, CTX);
+    expect(r.baseline).toBeNull();
+    expect(r.note).toMatch(/a tag named main exists; no run is trusted until it is deleted/);
+  });
+  it('m6: the verifiers refuse an artifact whose expired flag is not exactly false (undefined, null, "false", 0)', () => {
+    for (const expired of [undefined, null, 'false', 0, ''] as unknown[]) {
+      const meta = { ...META(), expired } as unknown as ArtifactMeta;
+      expect(verifyBaselineArtifact(bytesOf(goodDoc()), meta, CTX).baseline, String(expired)).toBeNull();
+      const cm = { ...META({ name: CLEAN_RUN_ARTIFACT }), expired } as unknown as ArtifactMeta;
+      expect(verifyCleanRunArtifact(buildCleanRunMarker(100, KEY), cm, CTX).seen, String(expired)).toBe(false);
+    }
+  });
+  it('m8: buildBaseline refuses to write a baseline the reader would refuse (too many entries, too many bytes, a key over the cap)', () => {
+    const many = Array.from({ length: MAX_COUNT_ENTRIES + 1 }, (_, i) => fnd({ fingerprint: `f${i}` }));
+    expect(() => buildBaseline({ runId: 100, key: KEY, sameRunTools: [], checks: [{ job: 'sast', tool: 'semgrep', status: 'ok', findings: many }] })).toThrow(/too many/);
+    const fat = Array.from({ length: 2900 }, (_, i) => fnd({ tool: 'trivy-config', ruleId: `${i}-${'r'.repeat(3000)}`, fingerprint: 'x', file: undefined, uriUnmapped: true }));
+    expect(() => buildBaseline({ runId: 100, key: KEY, sameRunTools: [], checks: [{ job: 'iac', tool: 'trivy-config', status: 'ok', findings: fat }] })).toThrow(/size/);
+    const longKey = fnd({ tool: 'trivy-config', ruleId: 'r'.repeat(5000), fingerprint: 'x', file: undefined, uriUnmapped: true });
+    expect(() => buildBaseline({ runId: 100, key: KEY, sameRunTools: [], checks: [{ job: 'iac', tool: 'trivy-config', status: 'ok', findings: [longKey] }] })).toThrow(/key/i);
+    // a large but allowed baseline round-trips
+    const ok = Array.from({ length: 2000 }, (_, i) => fnd({ fingerprint: hex(`n${i}`) }));
+    const b = buildBaseline({ runId: 100, key: KEY, sameRunTools: [], checks: [{ job: 'sast', tool: 'semgrep', status: 'ok', findings: ok }] });
+    expect(verifyBaselineArtifact(b.bytes, META({ runId: 100 }), CTX).baseline?.counts.size).toBe(2000);
+  });
+  it('m10: every keyed fingerprint form (region, quoted, file, line) needs the current key id; the MAC key is a derived sub-key, not the fingerprint key', () => {
+    for (const fpBy of ['quoted', 'region', 'file', 'line'] as const) {
+      const f = fnd({ fpBy, fingerprint: `${SEC}${hex(fpBy)}`, ['sec' + 'ret']: false } as Partial<ScrubbedFinding>);
+      const other = buildBaseline({ runId: 100, key: KEY, sameRunTools: [], checks: [{ job: 'j', tool: 'bandit', status: 'ok', keyId: keyId(KEY2), findings: [f] }] });
+      expect(other.skipped.map((x) => x.job), fpBy).toEqual(['j']);
+      const same = buildBaseline({ runId: 100, key: KEY, sameRunTools: [], checks: [{ job: 'j', tool: 'bandit', status: 'ok', keyId: keyId(KEY), findings: [f] }] });
+      expect(same.skipped, fpBy).toEqual([]);
+    }
+    // a fingerprint-style HMAC of the same key over the same text is NOT the artifact MAC
+    const doc = JSON.parse(new TextDecoder().decode(buildBaseline({ runId: 100, key: KEY, sameRunTools: [], checks: [] }).bytes)) as Doc;
+    const direct = createHmac('sha256', KEY).update(JSON.stringify(['pipegen-baseline-v1', 100, keyId(KEY), []])).digest('hex');
+    expect(doc.mac).not.toBe(direct);
+    expect(doc.mac).toBe(macOf(KEY, 100, keyId(KEY), {}));
+  });
+});
+
+describe('fix round 1: a run list cut at the page cap', () => {
+  it('a full last page means the list was cut: the marker lookup is unknown and the baseline note says so', async () => {
+    const flood = Array.from({ length: MAX_RUN_PAGES * 100 + 50 }, (_, i) => run({ id: 90000 - i, event: 'pull_request', head_repository: { id: 8 } }));
+    const gm = world([], flood, []);
+    expect((await cleanRunSeen(gm, REPO, CTX)).state).toBe('unknown');
+    const gb = world([], flood, []);
+    expect((await loadBaseline(gb, REPO, CTX)).note).toMatch(/cut after/);
   });
 });
