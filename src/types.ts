@@ -23,6 +23,13 @@ export interface Service {
   name: string; path: string; language: Language; packageManager?: PackageManager; runtimeVersion?: string;
   /** P60 (R4): other languages the folder also holds (a Python app with a package.json for its asset build): tools of these cover it too. Set only when not empty. */
   alsoLanguages?: Language[];
+  /**
+   * Final review r1-3: the package manager of each language in alsoLanguages that has one (a Python lockfile or requirements file beside a
+   * package.json: poetry, uv or pip), in that order, so the licence coverage lists that lockfile too. Set only when not empty.
+   */
+  alsoPackageManagers?: PackageManager[];
+  /** Final review r1-3: the `lockfileVersion` of the service's package-lock.json (packageManager npm), when the reader could read it. */
+  npmLockfileVersion?: number;
   dockerfile?: string; port?: number; hasTests: boolean; testFramework?: string;
   envVars: string[]; dependsOn: Dependency[];
   scripts: string[];      // script names from package.json `scripts` / pyproject `[project.scripts]` + `[tool.poetry.scripts]` (names only, never the commands)

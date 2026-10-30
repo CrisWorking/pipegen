@@ -22,6 +22,9 @@ export interface RenderedStep {
 const DANGEROUS_NAMES: readonly { family: string; match: RegExp }[] = [
   { family: 'shell and process', match: /^(?:CI|PATH|HOME|BASH_ENV|ENV|SHELLOPTS|PS4|IFS|SHELL|PROMPT_COMMAND|TMPDIR|TMP|TEMP|LANG|LANGUAGE|TZ|TERM[A-Z0-9_]*)$/ },
   { family: 'runner, CI and pipegen', match: /^(?:GITHUB|RUNNER|ACTIONS|PIPEGEN)_/ },
+  // an action reads its inputs from INPUT_<name> (the gate action reads every INPUT_* it finds, gate/src/main.ts readInputs), so an env of any
+  // level, the job's or the workflow's too, could hand an action an input its `with` never gave (final review r1-1); in any case of the prefix
+  { family: 'action inputs', match: /^INPUT_/i },
   { family: 'loader and libc', match: /^(?:LD_|DYLD_|MALLOC_|LC_)|^(?:GCONV_PATH|GLIBC_TUNABLES|HOSTALIASES|RES_OPTIONS|LOCALDOMAIN)$/ },
   { family: 'proxy and TLS', match: /_PROXY$|^(?:SSL_|CURL_|OPENSSL_)|^REQUESTS_CA_BUNDLE$/i },
   { family: 'node, npm, python and package indexes', match: /^(?:NODE_|NPM_CONFIG_|PYTHON|PIP_|UV_)|^npm_config_/ },

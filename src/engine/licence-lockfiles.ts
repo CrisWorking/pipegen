@@ -15,7 +15,7 @@
 // `licences`: 'lockfile' = the lockfile itself carries the licences; 'installed' = only once the packages are installed next to it (pipegen
 // v0.2 renders no install step before the licence scan: Plan G's G11 carry-forward); 'never' = Trivy has no licence data for it at all.
 // A new Trivy pin re-reads these pages: change this table only with them.
-import type { PackageManager } from '../types.js';
+import type { PackageManager, Service } from '../types.js';
 
 /** A lockfile kind: the package manager the reader found (Service.packageManager), or `go` (a go.mod; the service's language or alsoLanguages). */
 export type LockfileKind = PackageManager | 'go';
@@ -44,3 +44,11 @@ export interface LicenceLockfiles { service: string; lockfiles: { kind: Lockfile
  * step is rendered before the scan). A kind Trivy never reads is never read.
  */
 export const licenceRead = (kind: LockfileKind): boolean => TRIVY_LICENCE_LOCKFILES[kind].licences === 'lockfile';
+
+/**
+ * licenceRead for one service's lockfile (final review r1-3): npm's package-lock.json carries licences only from lockfileVersion 2 (the nodejs
+ * page above: "from the lock file (starting with v2)"; v1 falls back to node_modules, which is not installed), so npm counts as read only
+ * when the reader proved a version of 2 or more. An unknown version is not read (never "covered" on a guess).
+ */
+export const licenceReadFor = (kind: LockfileKind, service: Pick<Service, 'npmLockfileVersion'>): boolean =>
+  licenceRead(kind) && (kind !== 'npm' || (service.npmLockfileVersion !== undefined && service.npmLockfileVersion >= 2));

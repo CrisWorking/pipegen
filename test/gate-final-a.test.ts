@@ -214,7 +214,8 @@ describe('ruling 2: the licence check\'s coverage per lockfile, from the profile
   const svc = (name: string, path: string, over: Partial<Service>): Service => service({ name, path, scripts: name === 'app' ? ['test'] : [], ...over });
   const licProf = {
     ...profile([
-      svc('app', '.', {}), svc('API', 'api', { language: 'python', packageManager: 'uv' }), svc('cli', 'cli', { language: 'go', packageManager: undefined as never }),
+      // C9 Part 0 (r1-3): npm counts as read only with a proven lockfileVersion of 2 or more
+      svc('app', '.', { npmLockfileVersion: 3 }), svc('API', 'api', { language: 'python', packageManager: 'uv' }), svc('cli', 'cli', { language: 'go', packageManager: undefined as never }),
       svc('docs', 'docs', { packageManager: undefined as never }), svc('tool', 'tool', { language: 'python', packageManager: 'pip', alsoLanguages: ['go'] }),
     ]),
     repoFiles: emptyRepoFiles(),

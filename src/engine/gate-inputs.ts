@@ -16,7 +16,7 @@
 import { FLOOR_NEEDS, type PipelineDraft, type SkippablePart } from '../types.js';
 import { gateJobList, GateJobListError, jobListLiteral, type GateJobListOptions } from './gate-job-list.js';
 import { ArtifactNameError, slug } from './artifact-names.js';
-import { licenceRead, type LicenceLockfiles, type LockfileKind } from './licence-lockfiles.js';
+import { licenceReadFor, type LicenceLockfiles, type LockfileKind } from './licence-lockfiles.js';
 import { NEED_ID_CATEGORY } from './need-ids.js';
 import { PIPEGEN_GATE_USES, rendererInputProblems } from './tool-flags.js';
 
@@ -48,18 +48,21 @@ export function serviceRootsOf(draft: PipelineDraft): string[] {
 }
 
 /**
- * The `licence-lockfiles` value: per service of the profile (its slug, in order), each lockfile kind the reader found (its package manager, then
- * `go` for a go.mod: the service's language or alsoLanguages) and whether the licence scan as pipegen renders it reads that kind (licenceRead).
- * A service with none has an empty list (the gate shows "not covered (no lockfile)").
+ * The `licence-lockfiles` value: per service of the profile (its slug, in order), each lockfile kind the reader found (its package manager, the
+ * package managers of its other languages (final review r1-3: a requirements.txt beside a package.json), then `go` for a go.mod: the service's
+ * language or alsoLanguages), each once, and whether the licence scan as pipegen renders it reads that kind (licenceReadFor: an npm lockfile
+ * only from lockfileVersion 2). A service with none has an empty list (the gate shows "not covered (no lockfile)").
  */
 export function licenceLockfilesOf(draft: PipelineDraft): LicenceLockfiles[] {
   return draft.profile.services.map((s) => {
     const kinds: LockfileKind[] = [];
-    if (s.packageManager !== undefined) kinds.push(s.packageManager);
-    if ((s.language === 'go' || (s.alsoLanguages ?? []).includes('go')) && !kinds.includes('go')) kinds.push('go');
+    const add = (k: LockfileKind): void => { if (!kinds.includes(k)) kinds.push(k); };
+    if (s.packageManager !== undefined) add(s.packageManager);
+    for (const pm of s.alsoPackageManagers ?? []) add(pm);
+    if (s.language === 'go' || (s.alsoLanguages ?? []).includes('go')) add('go');
     let service: string;
     try { service = slug(s.name); } catch (e) { if (e instanceof ArtifactNameError) throw new GateJobListError(e.message); throw e; }
-    return { service, lockfiles: kinds.map((kind) => ({ kind, read: licenceRead(kind) })) };
+    return { service, lockfiles: kinds.map((kind) => ({ kind, read: licenceReadFor(kind, s) })) };
   });
 }
 

@@ -7,7 +7,7 @@ import { PATH_SHOWN_MAX, safeText } from '../util/safe-text.js';
 import { CODE_FILE_RE, REQUIREMENTS_FILE_RE, asObj, asString, asStrings, baseOf, dirOf, inDir, isTestFile, pythonNames, readPyproject, requirementLines, type Obj } from './manifest.js';
 import { readEnv } from './env.js';
 import { copySources, dockerfilesOf, notStandaloneOf, type DockerCopy } from './service-kind.js';
-import { newQualityRun, readRepoFiles, readServiceQuality, type QualityRun } from './quality.js';
+import { newQualityRun, npmLockfileVersion as npmLockfileVersionOf, readRepoFiles, readServiceQuality, type QualityRun } from './quality.js';
 import { readPrecommit, readWorkflows } from './workflows.js';
 import { IGNORED_DIRS, MAX_FILES_TEXT, SKIP_REASON, listFiles, parseYamlLimited, readTextLimitedWithReason, regexLines, regexSafe } from './limits.js';
 
@@ -227,8 +227,16 @@ async function readService(ctx: Ctx, dir: string, shared: Shared): Promise<Servi
   const testFiles = owned.filter((f) => isTestFile(relTo(f)));
 
   const scope = dir === '.' ? ['.'] : [dir, '.'];
-  const lockfile = (locks: [string, PackageManager][]) => scope.flatMap((d) => locks.filter(([name]) => ctx.fileSet.has(inDir(d, name)))).map(([, pm]) => pm)[0];
-  const packageManager = language === 'node' ? lockfile(NODE_LOCKS) : language === 'python' ? lockfile(PYTHON_LOCKS) ?? (requirementFiles.length > 0 ? 'pip' : undefined) : undefined;
+  // the first lockfile of the scope (the service's own folder, then the root): its package manager and its path
+  const lockfileAt = (locks: [string, PackageManager][]) => scope.flatMap((d) => locks.filter(([name]) => ctx.fileSet.has(inDir(d, name))).map(([name, pm]) => ({ pm, rel: inDir(d, name) })))[0];
+  const lockfile = (locks: [string, PackageManager][]) => lockfileAt(locks)?.pm;
+  const pythonManager = (): PackageManager | undefined => lockfile(PYTHON_LOCKS) ?? (requirementFiles.length > 0 ? 'pip' : undefined);
+  const packageManager = language === 'node' ? lockfile(NODE_LOCKS) : language === 'python' ? pythonManager() : undefined;
+  // final review r1-3: the licence coverage reads which npm lockfile version it is (Trivy reads licences from it only from v2) and the
+  // lockfile of a second language (a requirements.txt beside a package.json), so neither reads as covered when it is not
+  const npmLock = packageManager === 'npm' ? lockfileAt(NODE_LOCKS) : undefined;
+  const npmLockfileVersion = npmLock === undefined ? undefined : await npmLockfileVersionOf(shared.quality, npmLock.rel);
+  const alsoPackageManagers = alsoLanguages.flatMap((l) => { const pm = l === 'python' ? pythonManager() : undefined; return pm === undefined ? [] : [pm]; });
 
   const firstLine = async (rels: string[]) => {
     for (const rel of rels) {
@@ -282,7 +290,11 @@ async function readService(ctx: Ctx, dir: string, shared: Shared): Promise<Servi
     dir, read: (rel) => readFile(ctx, rel), fileSet: ctx.fileSet, copies: shared.copies, scripts: pkgScripts, deps, devDeps, frameworks,
     hasDockerfile: dockerfile !== undefined, port, language, serviceDirs: shared.serviceDirs,
   });
-  return { name, path: dir, language, ...(alsoLanguages.length === 0 ? {} : { alsoLanguages }), packageManager, runtimeVersion, dockerfile, port, hasTests, testFramework, ...env, scripts, frameworks, quality, ...(notStandalone === undefined ? {} : { notStandalone }) };
+  return {
+    name, path: dir, language, ...(alsoLanguages.length === 0 ? {} : { alsoLanguages }), ...(alsoPackageManagers.length === 0 ? {} : { alsoPackageManagers }), packageManager,
+    ...(npmLockfileVersion === undefined ? {} : { npmLockfileVersion }), runtimeVersion, dockerfile, port, hasTests, testFramework, ...env, scripts, frameworks, quality,
+    ...(notStandalone === undefined ? {} : { notStandalone }),
+  };
 }
 
 async function anyFileHasLine(ctx: Ctx, files: string[], re: RegExp): Promise<boolean> {

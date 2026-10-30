@@ -35,8 +35,11 @@ export const emptyRepoFiles = (): RepoFiles => ({ dependabot: null, renovate: nu
 // ---------- the run ----------
 
 type LockKind = 'npm' | 'pnpm' | 'yarn' | 'bun' | 'bun-binary';
-/** Per lockfile: entries for the QUALITY_PACKAGES (key encoding per kind, see lockScanner) and the workspace members it lists. */
-interface LockIndex { kind: LockKind; entries: Map<string, string>; members: Set<string> }
+/**
+ * Per lockfile: entries for the QUALITY_PACKAGES (key encoding per kind, see lockScanner) and the workspace members it lists; for npm also
+ * its `lockfileVersion` (the first whole number given to that key, the top-level one: npm writes it before any package).
+ */
+interface LockIndex { kind: LockKind; entries: Map<string, string>; members: Set<string>; lockfileVersion?: number }
 type LockState = { index: LockIndex } | { unread: string };
 
 /**
@@ -189,6 +192,11 @@ function lockScanner(kind: Exclude<LockKind, 'bun-binary'>): { onLine: (line: st
   if (kind === 'npm') {
     return {
       index, onLine: (line) => {
+        // pretty or compact JSON (`{ "lockfileVersion": 3 }`); a number only (a dependency named lockfileVersion would map to an object or a range text)
+        if (index.lockfileVersion === undefined) {
+          const v = /"lockfileVersion"\s*:\s*(\d{1,3})(?![\d.])/.exec(line);
+          if (v) index.lockfileVersion = Number(v[1]);
+        }
         const top = /^ {2}"([^"\\]{1,64})":/.exec(line);
         if (top) section = top[1] ?? '';
         const key = /^( *)"([^"\\]{1,1024})": \{\s*$/.exec(line);
@@ -304,6 +312,18 @@ async function lockState(run: QualityRun, rel: string, kind: LockKind, found: 'f
   }
   run.locks.set(rel, state);
   return state;
+}
+
+/**
+ * The `lockfileVersion` of the npm lockfile at `rel` (final review r1-3: Trivy reads licences from package-lock.json only from v2), from the
+ * run's one scan of that file (shared with the version lookup, within the same caps and budget); undefined when it is missing, could not be
+ * read or names no version.
+ */
+export async function npmLockfileVersion(run: QualityRun, rel: string): Promise<number | undefined> {
+  const found = await presence(run, rel);
+  if (found === null) return undefined;
+  const state = await lockState(run, rel, 'npm', found);
+  return 'index' in state ? state.index.lockfileVersion : undefined;
 }
 
 /** The lockfile that applies to a service: its own folder's first, else the root's. */
