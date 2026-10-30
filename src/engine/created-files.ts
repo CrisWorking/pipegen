@@ -17,6 +17,7 @@
 // `.trivyignore`, `.prettierignore`, `lefthook.yml`, `.pre-commit-config.yaml`, `.husky/*`. Those are protected paths; a created copy
 // could only shadow or weaken the pinned one. Plan G registers its hook, central and install-record files as it builds them.
 import type { CreatedFile, Part, PipelineDraft } from '../types.js';
+import { createdPathProblem } from './job-rules.js';
 
 /** What a judge gets besides the file: the draft the files belong to. */
 export interface CreatedCtx { draft: PipelineDraft }
@@ -74,6 +75,9 @@ export const CREATED_RULES: readonly CreatedRule[] = [
 
 /** The verdict on one file: `claimed` false means no rule matched; `problems` are the reasons to refuse it. */
 export function createdFileProblems(file: CreatedFile, draft: PipelineDraft, rules: readonly CreatedRule[] = CREATED_RULES): { claimed: boolean; problems: string[] } {
+  // the path rule runs here, so no caller (the referee, the D1 guard, Plan G's deliver) can skip it; a matcher may claim a path it refuses
+  const pathProblem = createdPathProblem(file.path);
+  if (pathProblem !== null) return { claimed: true, problems: [`The file path is refused: ${pathProblem}; pipegen writes only plain, normalized paths.`] };
   let matching: CreatedRule[];
   try { matching = rules.filter((r) => r.repo === file.repo && r.match(file.path, draft)); } catch { return { claimed: true, problems: ['a rule for this kind of file failed to read the path'] }; }
   if (matching.length === 0) return { claimed: false, problems: [] };

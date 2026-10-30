@@ -3,7 +3,7 @@
 import { describe, expect, it } from 'vitest';
 import { referee, type Linters } from '../src/engine/referee.js';
 import { createdPathProblem } from '../src/engine/job-rules.js';
-import { CREATED_RULES, duplicatePathProblems, type CreatedRule } from '../src/engine/created-files.js';
+import { CREATED_RULES, createdFileProblems, duplicatePathProblems, type CreatedRule } from '../src/engine/created-files.js';
 import type { Capabilities, CreatedFile, PipelineDraft } from '../src/types.js';
 import { PROTECTED_PATHS_BASE } from '../src/types.js';
 import { renderJobPrelude, renderStep, stepsToYaml, type RenderContext } from '../src/engine/render-step.js';
@@ -247,7 +247,7 @@ describe('fix round 1: matchers claim only their own files', () => {
     expect(bad).toEqual([]);
   });
   it('the reviewer\'s attack paths are unclaimed', () => {
-    for (const path of ['api/tests/biome.json', 'test/eslint.config.js', 'test/vitest.config.ts', '__tests__/.gitleaksignore', 'test/lefthook.yml', '.husky/test/x', '.github/test/x.yml', '.github/workflows/tests/x.yml', '.github/actions/x/tests/run.sh', '.github/Dockerfile', '.github/workflows/Dockerfile', '.github/actions/x/Dockerfile', '.github/.dockerignore', '.github/package.json', 'node_modules/x/package.json', 'a/b/c/Dockerfile', 'a/package.json', 'x/api/package.json', 'api/tests/helper.ts', 'api/tests/x.test.json', 'api/tests/a.json.ts', 'api/tests/a.test.d.ts', 'api/tests/.hidden.test.ts', 'api/tests/.x/a.test.ts', 'api/src/a.test.ts', 'api/tests/a.test.ts.bak', 'dockerfile', 'api/Dockerfile.prod', 'API/Dockerfile']) expect(claim(path), path).toEqual([]);
+    for (const path of ['api/tests/biome.json', 'test/eslint.config.js', 'test/vitest.config.ts', '__tests__/.gitleaksignore', 'test/lefthook.yml', '.husky/test/x', '.github/test/x.yml', '.github/workflows/tests/x.yml', '.github/actions/x/tests/run.sh', '.github/Dockerfile', '.github/workflows/Dockerfile', '.github/actions/x/Dockerfile', '.github/.dockerignore', '.github/package.json', 'node_modules/x/package.json', 'a/b/c/Dockerfile', 'a/package.json', 'x/api/package.json', 'api/tests/helper.ts', 'api/tests/x.test.json', 'api/tests/a.json.ts', 'api/tests/a.test.d.ts', 'api/tests/.hidden.test.ts', 'api/tests/.x/a.test.ts', 'api/src/a.test.ts', 'api/tests/a.test.ts.bak', 'dockerfile', 'api/Dockerfile.prod', 'API/Dockerfile', 'src/tests/a.test.ts', 'api/src/tests/a.test.ts', 'x/tests/a.test.ts']) expect(claim(path), path).toEqual([]);
   });
   it('the real forms are still claimed by exactly one rule', () => {
     const want: Record<string, string> = { Dockerfile: 'dockerfile', 'api/Dockerfile': 'dockerfile', '.dockerignore': 'dockerignore', 'api/.dockerignore': 'dockerignore', 'package.json': 'package-json', 'api/package.json': 'package-json', 'package-lock.json': 'package-lock', 'api/package-lock.json': 'package-lock', 'tests/a.test.ts': 'starter-tests', 'api/tests/a.test.ts': 'starter-tests', 'api/test/sub/b.spec.mjs': 'starter-tests', 'api/__tests__/c.test.tsx': 'starter-tests', 'test/x.test.cjs': 'starter-tests', 'docker-compose.pipegen.yml': 'compose', 'PIPEGEN.md': 'pipegen-doc', '.github/dependabot.yml': 'dependabot', '.github/dependabot.yaml': 'dependabot' };
@@ -299,6 +299,7 @@ describe('fix round 1: minors', () => {
     expect(duplicatePathProblems([file('a/b'), file('a')])).toHaveLength(1);
     expect(duplicatePathProblems([file('a'), file('a/b', 'x', { repo: 'central' })])).toEqual([]);
     expect(duplicatePathProblems([file('ab'), file('a/b')])).toEqual([]);
+    expect(duplicatePathProblems([file('a'), file('A/b')])).toHaveLength(1);
   });
   it('the referee refuses the file/folder clash', async () => {
     expect((await run([file('a'), file('a/b')], [{ ...any, mode: 'new' }])).ok).toBe(false);
@@ -311,5 +312,21 @@ describe('fix round 1: minors', () => {
   it('registry problems on a wrong-part file still carry the repo', async () => {
     const r = await run([file('NOTES.md', 'x', { part: 'tests' })], [{ ...any, mode: 'new', match: (x) => x === 'NOTES.md' }]);
     expect(r.issues.every((i) => i.repo === 'app')).toBe(true);
+  });
+});
+
+describe('D0b part 0: createdFileProblems runs the path rule itself', () => {
+  const hostile: PipelineDraft = { ...draft, profile: profile([service({ name: 'abs', path: '/abs' }), service({ name: 'dot', path: 'a.' })]) };
+  it('a path the path rule refuses is a problem even when a matcher claims it', () => {
+    for (const path of ['/abs/Dockerfile', 'a./package.json']) {
+      expect(CREATED_RULES.some((r) => r.match(path, hostile)), path).toBe(true);
+      const v = createdFileProblems(file(path, 'x', { part: path.endsWith('Dockerfile') ? 'docker' : 'tests' }), hostile);
+      expect(v.claimed, path).toBe(true);
+      expect(v.problems.join(' '), path).toMatch(/path is refused/);
+    }
+  });
+  it('an unclaimed bad path is also refused (claimed, with the path problem)', () => {
+    const v = createdFileProblems(file('a b/x.txt'), draft);
+    expect(v.problems.length).toBeGreaterThan(0);
   });
 });
