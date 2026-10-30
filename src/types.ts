@@ -122,7 +122,13 @@ export interface StepSpec {
 
 // ---------- created files, decisions ----------
 export type Part = 'pipeline' | 'precommit' | 'docker' | 'compose' | 'tests' | 'test-migration' | 'codeowners' | 'deploy-verify' | 'docs';
-export interface CreatedFile { path: string; content: string; part: Part; reason: string; repo: 'app' | 'central'; needsConfirm?: boolean; inserted?: PipegenInserted }   // needsConfirm: AI change to package.json scripts/dependencies → own preview section + own yes (Plan D Task 5, Plan E Task 5, Plan G)
+export interface CreatedFile { path: string; content: string; part: Part; reason: string; repo: 'app' | 'central'; needsConfirm?: boolean; inserted?: PipegenInserted; edited?: CreatedEdit }   // needsConfirm: AI change to package.json scripts/dependencies → own preview section + own yes (Plan D Task 5, Plan E Task 5, Plan G)
+/**
+ * The marker for an edit to an existing NON-workflow file (D0a, preflight S11): set by pipegen's own code, never read from the file
+ * text. `original` is the file exactly as it was before the edit ('' for a new file whose rule works as an edit). It is valid only on
+ * a path a created-file rule claims (src/engine/created-files.ts); `inserted` stays workflow-only.
+ */
+export interface CreatedEdit { original: string }
 /**
  * The marker convention for an edited user workflow (Plan B 7a, for Plan G's insertVerify): a CreatedFile field, set by
  * pipegen's own code and never by the AI or read from the file text, so no content can forge it. `original` is the user's

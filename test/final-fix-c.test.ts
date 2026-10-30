@@ -47,9 +47,9 @@ describe('R1: every created file path is judged or refused', () => {
     for (const ok of ['.github/workflows/pipegen.yml', '.github/actions/x/action.yml', 'docs/CODEOWNERS', 'Dockerfile', '.pre-commit-config.yaml', '.zap/rules.tsv']) expect(createdPathProblem(ok), ok).toBeNull();
     for (const bad of ['', '.', '..', 'a/./b', 'a/../b', 'a//b', '/a', './a', 'a\\b', 'a\u0000b', 'café', 'a/']) expect(createdPathProblem(bad), JSON.stringify(bad)).not.toBeNull();
   });
-  it('a normalized path outside .github/ is not judged (no issue, no change)', async () => {
+  it('a normalized path outside .github/ that no created-file rule claims is refused (D0a, B1)', async () => {
     const r = await run([file('docs/notes.txt', hostile)], draftOf([], []));
-    expect(r.issues).toEqual([]);
+    expect(r.issues.some((i) => i.check === 'template' && /no file of this kind/.test(i.message))).toBe(true);
   });
   it('a valid workflow path is still judged (the hostile file is refused for its content)', async () => {
     const r = await run([file('.github/workflows/x.yml', hostile)], draftOf([], []));

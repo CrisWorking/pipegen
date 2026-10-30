@@ -41,6 +41,7 @@ import { NEED_ID_CATEGORY, toolCoversNeed } from './need-ids.js';
 import { PLATFORM_ACTION_IDS, type PlatformActions } from './pin.js';
 import { APP_RUNNING_CATEGORIES, renderRangeScan, TRIVY_LAUNCH_RE } from './render-cli.js';
 import { EXPR, own, show } from './render-error.js';
+import { createdFileProblems, duplicatePathProblems, type CreatedRule } from './created-files.js';
 import { ACTION_PATH_RE, checkExpressions, createdPathProblem, checkJobOrder, gateResultUploadProblems, IF_VALUES, isDangerousName, isReviewed, isScrubStep, isStageStep, jobOutputsProblems, SECRET_REF_RE, STEP_KEYS as STEP_KEY_LIST, WORKFLOW_PATH_RE, type RenderedStep, type ScanFact } from './job-rules.js';
 import { containerRefusal, RenderError, renderProjectScript, renderStep, sameDedupeContent, type RenderContext } from './render-step.js';
 import { centralWorkflowPath } from './central-path.js';
@@ -71,7 +72,7 @@ export interface Linters { actionlint: () => Promise<string>; zizmor: () => Prom
 /** The linter run (7b's runLinters): actionlint and zizmor over the workflow files, findings as issues. */
 export type RunLinters = (files: CreatedFile[], linters: Linters, ghToken: string | null) => Promise<RefereeIssue[]>;
 /** The injectable parts. `runLinters` defaults to the real one (linters.ts); a throwing runner is an issue. */
-export interface RefereeDeps { runLinters?: RunLinters }
+export interface RefereeDeps { runLinters?: RunLinters; /** the created-file rules (default: CREATED_RULES); tests inject their own */ createdRules?: readonly CreatedRule[] }
 
 // ---------- the tables ----------
 
@@ -1430,6 +1431,8 @@ export async function referee(files: CreatedFile[], draft: PipelineDraft, platfo
     if (hits.length > 0) add(f.path, 'secret-value', `The file holds text that looks like a secret value (${hits.join(', ')}); pipegen never writes one into a file.`);
   }
 
+  for (const d of duplicatePathProblems(files)) add(d.file.path, 'template', d.message, undefined, d.file.repo);
+
   const ex = expectations(draft, platform, reviewed, add, notes);
   const parsed = new Map<string, Parsed>();
   const lintable: CreatedFile[] = [];
@@ -1439,14 +1442,18 @@ export async function referee(files: CreatedFile[], draft: PipelineDraft, platfo
     const pathProblem = createdPathProblem(f.path);
     if (pathProblem !== null) { add(f.path, 'template', `The file path is refused: ${pathProblem}; pipegen writes only plain, normalized paths.`); continue; }
     const kind = fileKind(f);
-    if (kind === null && /^\.github\//i.test(f.path)) {
-      add(f.path, 'template', 'The file path is in .github/ but is not a workflow (.github/workflows/<name>.yml) or a composite action (.github/actions/<folder>/action.yml) pipegen can judge, so it is not written.');
-      continue;
-    }
     if (kind === null) {
-      if (f.inserted !== undefined) add(f.path, 'template', 'Only a workflow file can carry the mark of an edited user workflow.');
+      // not a workflow or action: a created-file rule (src/engine/created-files.ts) must claim it, else it is refused (D0a, B1)
+      const v = createdFileProblems(f, draft, deps.createdRules);
+      if (!v.claimed) {
+        add(f.path, 'template', /^\.github\//i.test(f.path)
+          ? 'The file path is in .github/ but is not a workflow (.github/workflows/<name>.yml) or a composite action (.github/actions/<folder>/action.yml) pipegen can judge, so it is not written.'
+          : 'pipegen writes no file of this kind (no rule claims this path), so it is not written.');
+      }
+      for (const m of v.problems) add(f.path, 'template', `pipegen refuses this file: ${m.replace(/\.$/, '')}.`, undefined, f.repo);
       continue;
     }
+    if (f.edited !== undefined) add(f.path, 'template', 'Only a file of a registered kind can carry the edited marker; an edit to a workflow uses the inserted mark.');
     lintable.push(f);
     const r = parseYaml(f.content, f.inserted === undefined ? 'strict' : 'user');
     if ('problems' in r) {

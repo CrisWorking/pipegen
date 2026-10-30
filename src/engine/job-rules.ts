@@ -51,17 +51,35 @@ export const STEP_KEYS = ['id', 'name', 'if', 'uses', 'with', 'run', 'shell', 'e
 const SEG = '(?!\\.{1,2}(?:/|$))[A-Za-z0-9._-]+';
 /** A workflow file pipegen may write or lint. The file name has no `/`, so it can not hold a `..` segment. */
 export const WORKFLOW_PATH_RE = /^\.github\/workflows\/[A-Za-z0-9._-]{1,100}\.ya?ml$/;
+/** The Windows device names: a file with one of these as its base name (before the first `.`) can not be created or read there. */
+const WINDOWS_RESERVED_RE = /^(?:CON|PRN|AUX|NUL|COM[0-9]|LPT[0-9])$/i;
+const MAX_PATH_SEGMENT = 100;
+const MAX_PATH_TOTAL = 200;
 /**
- * Why a created file's path is not a plain, normalized repo-relative path, or null (final review r1, R1): ASCII only, no
- * backslash or NUL, no leading `/`, and no empty, `.` or `..` segment (so `./x`, `a/../b`, `a//b` and a trailing `/` are all refused).
- * Joined onto a folder, any of those could land in `.github/workflows/` although the text looks like another place.
+ * Why a created file's path is not a plain, normalized repo-relative path, or null (final review r1, R1; CF-1 / preflight S1): only
+ * `A-Z a-z 0-9 . _ - /` (so no space, `%`, `?`, `#`, `:`, `@`, `+`, `~`, backslash, control character or non-ASCII letter); no leading
+ * `/`; no empty, `.` or `..` segment (so `./x`, `a/../b`, `a//b` and a trailing `/` are refused); no segment that starts with `-`
+ * (an option for any tool that gets the path as an argument), ends with `.` (Windows drops the dot), is `.git` in any letter case, or
+ * has a Windows device name as its base name (`CON`, `PRN`, `AUX`, `NUL`, `COM0-9`, `LPT0-9`, any case, any extension); at most 100
+ * characters in a segment and 200 in all. One rule for every producer. Joined onto a folder, a path that passes can not land
+ * in `.github/workflows/` unless it says so.
  */
 export function createdPathProblem(path: string): string | null {
   if (typeof path !== 'string' || path === '') return 'the path is empty';
   if (!/^[\x20-\x7e]+$/.test(path)) return 'the path has a character other than printable ASCII (a control character, NUL or non-ASCII letter)';
   if (path.includes('\\')) return 'the path has a backslash';
   if (path.startsWith('/')) return 'the path is absolute';
-  if (path.split('/').some((seg) => seg === '' || seg === '.' || seg === '..')) return 'the path has an empty, . or .. segment';
+  const segs = path.split('/');
+  if (segs.some((seg) => seg === '' || seg === '.' || seg === '..')) return 'the path has an empty, . or .. segment';
+  if (!/^[A-Za-z0-9._/-]+$/.test(path)) return 'the path has a character other than letters, digits, . _ - and /';
+  if (path.length > MAX_PATH_TOTAL) return `the path is longer than ${MAX_PATH_TOTAL} characters`;
+  for (const seg of segs) {
+    if (seg.length > MAX_PATH_SEGMENT) return `a path segment is longer than ${MAX_PATH_SEGMENT} characters`;
+    if (seg.startsWith('-')) return 'a path segment starts with a dash';
+    if (seg.endsWith('.')) return 'a path segment ends with a dot';
+    if (seg.toLowerCase() === '.git') return 'the path has a .git segment';
+    if (WINDOWS_RESERVED_RE.test(seg.split('.')[0] ?? '')) return 'a path segment is a Windows device name';
+  }
   return null;
 }
 
