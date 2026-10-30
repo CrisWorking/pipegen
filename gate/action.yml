@@ -1,8 +1,8 @@
 # pipegen's gate action (Plan C). One action, one mode per step. pipegen's renderer sets every input, and RENDERER_INPUTS
-# (src/engine/tool-flags.ts) checks each one. A test keeps these inputs equal to that row. No input has a default.
+# (src/engine/tool-flags.ts) checks each one. A test keeps these inputs equal to that row. No input has a default (find-run's 30 minute wait is in the code).
 # The bundle dist/index.js is generated and committed (npm run build:gate; CI job gate-dist checks it is fresh).
 name: pipegen gate
-description: Scrubs scanner results, stages the checkout for the secrets scan, decides pass, warn or block, and looks up the trusted baseline.
+description: Scrubs scanner results, stages the checkout for the secrets scan, decides pass, warn or block, looks up the trusted baseline, and finds the trusted run in which a commit passed the gate.
 author: CrisWorking
 inputs:
   mode:
@@ -68,6 +68,9 @@ inputs:
   central-sha:
     description: "find-run: the commit of the central workflow."
     required: false
+  timeout-minutes:
+    description: "find-run: how long to wait for a run in progress, in whole minutes from 1 to 360. When unset it is 30."
+    required: false
   merged-at:
     description: "nightly: when the install was merged."
     required: false
@@ -82,6 +85,10 @@ outputs:
     description: "baseline-check: found or missing (a verified trusted baseline exists or not)."
   result:
     description: "gate: pass, warn or block."
+  run-id:
+    description: "find-run: the id of the trusted run in which the commit passed the gate (empty when not found)."
+  run-url:
+    description: "find-run: the web address of that run (empty when not found)."
 runs:
   using: node24
   main: dist/index.js

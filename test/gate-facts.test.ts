@@ -127,6 +127,7 @@ class FakeGh implements GateGithub {
     const a = this.w.compare.get(`${base}...${head}`); if (a === undefined) throw new Error('404'); return a;
   }
   async collaboratorPermission(_o: string, _n: string, login: string): Promise<unknown> { this.log(`perm ${login}`); return { permission: 'write' }; }
+  async listAttemptJobs(): Promise<unknown> { throw new Error('not used'); }
   async rawFileAt(): Promise<unknown> { return null; }
   async getCommit(_o: string, _n: string, sha: string): Promise<unknown> {
     this.log(`commit ${sha.slice(0, 1)}`);

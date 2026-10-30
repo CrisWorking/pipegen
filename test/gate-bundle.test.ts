@@ -167,12 +167,12 @@ describe('C6 bundle: node gate/dist/index.js, end to end', () => {
     expect(x.code).toBe(0);
     expect(outputsOf(r.output).found).toBe('missing');
   });
-  it('modes find-run and nightly fail closed until C8 and C7', async () => {
+  it('mode nightly fails closed until C7; find-run without its inputs fails closed too', async () => {
     for (const mode of ['find-run', 'nightly']) {
       const r = runner({ mode });
       const x = await runNode(BUNDLE, r.env);
       expect(x.code, mode).toBe(1);
-      expect(x.stdout).toMatch(/::error::.*not available yet/);
+      expect(x.stdout, mode).toMatch(mode === 'nightly' ? /::error::.*not available yet/ : /::error::.*sha/);
     }
   });
   it('a missing or unknown mode fails closed (exit 1)', async () => {

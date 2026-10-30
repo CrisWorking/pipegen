@@ -104,7 +104,14 @@ const MAC_RE = /^[0-9a-f]{64}$/;
  * the repository the gate runs in.
  */
 /** `status: 'success'` is the API's filter; the walk checks `conclusion === 'success'` itself. */
-export interface RunQuery { workflow: string; branch: string; event: 'push'; status: 'success'; page: number; perPage: number }
+export interface RunQuery {
+  workflow: string; branch: string; event: 'push';
+  /** Absent: runs in every state (find-run waits for runs in progress). C3's walks always ask for `success`. */
+  status?: 'success';
+  /** C8: only the runs of this commit (`head_sha`, a 40-hex sha). */
+  headSha?: string;
+  page: number; perPage: number;
+}
 export interface GateGithub {
   /** `GET /repos/{owner}/{name}/compare/{base}...{head}`; both are 40-hex commit shas, never a name; the answer must carry `status`. */
   compare(owner: string, name: string, base: string, head: string): Promise<unknown>;
@@ -117,6 +124,11 @@ export interface GateGithub {
   listRunArtifacts(owner: string, name: string, runId: number, artifactName: string): Promise<unknown>;
   /** The bytes of the one file in the artifact (`GET .../actions/artifacts/{id}/zip`, then C5's zip checks: one entry, no path, no link). */
   downloadArtifact(owner: string, name: string, artifactId: number): Promise<Uint8Array>;
+  /**
+   * C8: `GET /repos/{owner}/{name}/actions/runs/{runId}/attempts/{attempt}/jobs?per_page&page` → `{ total_count, jobs: [...] }`: the jobs of ONE
+   * attempt of a run (never the run's jobs filtered "latest", which can mix attempts). `runId` and `attempt` are positive whole numbers.
+   */
+  listAttemptJobs(owner: string, name: string, runId: number, attempt: number, page: number, perPage: number): Promise<unknown>;
   /** `GET /repos/{owner}/{name}/git/ref/heads/{branch}` → `{ ref, object: { type, sha } }`; validated here (see inDefaultHistory). */
   branchHead(owner: string, name: string, branch: string): Promise<unknown>;
   /** Whether a tag called `tag` exists: `GET /repos/{owner}/{name}/git/ref/tags/{tag}` (200 → true, 404 → false, any other error is thrown). */
@@ -170,7 +182,7 @@ const posInt = (v: unknown): v is number => typeof v === 'number' && Number.isSa
 // ---------- inDefaultHistory and trustedRun ----------
 
 /** Per-lookup memo (never across lookups): the branch tip and the tag answer are asked once per walk. A tip that moves meanwhile is harmless: ancestry only grows. */
-interface Lookup { tip?: Promise<string | undefined>; tag?: Promise<'none' | 'tag' | 'error'> }
+export interface Lookup { tip?: Promise<string | undefined>; tag?: Promise<'none' | 'tag' | 'error'> }
 type History = 'in' | 'out' | 'error';
 /** The default history, three-valued: `error` is an API failure or an answer that is not what the API gives. */
 async function resolveTip(gh: GateGithub, repo: RepoRef): Promise<string | undefined> {
@@ -206,22 +218,30 @@ export async function inDefaultHistory(gh: GateGithub, repo: RepoRef, sha: strin
   return (await historyState(gh, repo, sha)) === 'in';
 }
 
-type Judged = { ok: true } | { ok: false; why: 'untrusted' | 'history' | 'tag' | 'error' | 'cap' };
+export type Judged = { ok: true } | { ok: false; why: 'untrusted' | 'history' | 'tag' | 'error' | 'cap' };
+
+/**
+ * The cheap, local part of the run trust: event `push`, the exact workflow path, this repository's own head repository (by id), the default
+ * branch, a 40-hex head_sha, a positive run id. Nothing here asks GitHub. findGatedRun (C8) reuses it, never its own copy.
+ */
+export function runFieldsTrusted(run: unknown, repo: RepoRef): run is Record<string, unknown> {
+  if (!isPlain(run)) return false;
+  if (!posInt(own(run, 'id'))) return false;
+  if (own(run, 'event') !== 'push') return false;
+  if (own(run, 'path') !== WORKFLOW_PATH) return false;
+  const head = own(run, 'head_repository');
+  if (!isPlain(head) || own(head, 'id') !== repo.id) return false;
+  if (own(run, 'head_branch') !== repo.defaultBranch) return false;
+  const sha = own(run, 'head_sha');
+  return typeof sha === 'string' && SHA_RE.test(sha);
+}
 /**
  * trustedRun with the reason it said no. `untrusted` is a clean no (wrong field, not in the history); `tag`, `error` and `cap` are
  * "could not tell or can't be trusted now" (the marker lookup treats them as unknown). `budget` counts history checks (m4).
  */
-async function judgeRun(gh: GateGithub, run: unknown, repo: RepoRef, budget?: { left: number }, lk?: Lookup): Promise<Judged> {
-  const no = (why: 'untrusted'): Judged => ({ ok: false, why });
-  if (!isPlain(run)) return no('untrusted');
-  if (!posInt(own(run, 'id'))) return no('untrusted');
-  if (own(run, 'event') !== 'push') return no('untrusted');
-  if (own(run, 'path') !== WORKFLOW_PATH) return no('untrusted');
-  const head = own(run, 'head_repository');
-  if (!isPlain(head) || own(head, 'id') !== repo.id) return no('untrusted');
-  if (own(run, 'head_branch') !== repo.defaultBranch) return no('untrusted');
-  const sha = own(run, 'head_sha');
-  if (typeof sha !== 'string' || !SHA_RE.test(sha)) return no('untrusted');
+export async function judgeRun(gh: GateGithub, run: unknown, repo: RepoRef, budget?: { left: number }, lk?: Lookup): Promise<Judged> {
+  if (!runFieldsTrusted(run, repo)) return { ok: false, why: 'untrusted' };
+  const sha = own(run, 'head_sha') as string;
   if (budget !== undefined) { if (budget.left <= 0) return { ok: false, why: 'cap' }; budget.left--; }
   // a tag named like the default branch (once per lookup, fresh for every trustedRun call): see the header; anything but a clear "no" fails closed
   const askTag = async (): Promise<'none' | 'tag' | 'error'> => {

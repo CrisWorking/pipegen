@@ -57,7 +57,7 @@ describe('action.yml', () => {
     for (const t of ['pieceBytes', 'overlap', 'maxFiles', 'maxBytes', 'maxStagedBytes', 'piece-bytes', 'report-only', 'workspace', 'event-path']) expect(Object.keys(ACTION.inputs)).not.toContain(t);
   });
   it('outputs: the scrub\'s sha256, status and error, the lookup\'s found, the gate\'s result; runs node24 dist/index.js', () => {
-    expect(Object.keys(ACTION.outputs).sort()).toEqual(['error', 'found', 'result', 'sha256', 'status']);
+    expect(Object.keys(ACTION.outputs).sort()).toEqual(['error', 'found', 'result', 'run-id', 'run-url', 'sha256', 'status']);
     expect(ACTION.runs).toEqual({ using: 'node24', main: 'dist/index.js' });
   });
   it('MODE_INPUTS: one list per gate mode; together they are the row; each mode-only input is allowed by the row in exactly its modes', () => {
@@ -85,10 +85,10 @@ describe('main: the common rules', () => {
       expect(x.outputs).toEqual({});
     }
   });
-  it('find-run and nightly are stubs that fail closed (built in C8 / C7)', async () => {
+  it('nightly is a stub that fails closed (built in C7); find-run is real since C8 (test/gate-gated-run.test.ts) and fails closed without its inputs', async () => {
     const f = await go({ mode: 'find-run', [GH_IN]: CRED });
     expect(f.code).toBe(1);
-    expect(f.out).toMatch(/::error::.*built in C8/);
+    expect(f.out).not.toMatch(/built in C8/);
     const n = await go({ mode: 'nightly', [GH_IN]: CRED });
     expect(n.code).toBe(1);
     expect(n.out).toMatch(/::error::.*built in C7/);

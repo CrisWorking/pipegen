@@ -1847,6 +1847,7 @@ var NEED_CATEGORIES = [
   "scorecard",
   "fuzzing"
 ];
+var GATE_CHECK_NAME = "pipegen / gate";
 var RESULT_ARTIFACT_PREFIX = "pipegen-out-";
 var FLOOR_NEEDS = ["secrets", "sast", "deps", "unit-tests", "full-tests", "gate"];
 var PROTECTED_PATHS_BASE = [
@@ -2590,6 +2591,8 @@ var RENDERER_INPUTS = Object.freeze({
     sha: modeInput(["find-run"], /^\$\{\{ (?:github\.sha|github\.event\.workflow_run\.head_sha) \}\}$/, "${{ github.sha }} or ${{ github.event.workflow_run.head_sha }}"),
     "central-workflow": modeInput(["find-run"], PLAIN_REL_RE, "a plain relative path of the central workflow"),
     "central-sha": modeInput(["find-run"], /^[0-9a-f]{40}$/, "a 40-character commit"),
+    // how long find-run waits for a run in progress (C8): whole minutes, 1 to 360 (a job's own limit)
+    "timeout-minutes": modeInput(["find-run"], /^(?:[1-9]|[1-9][0-9]|[12][0-9]{2}|3[0-5][0-9]|360)$/, "whole minutes, 1 to 360"),
     // nightly
     "merged-at": modeInput(["nightly"], /^\d{4}-(?:0[1-9]|1[0-2])-(?:0[1-9]|[12]\d|3[01])(?:T\d{2}:\d{2}:\d{2}(?:\.\d{1,3})?Z)?$/, "a date or an ISO time in UTC")
   }
@@ -3389,8 +3392,8 @@ function keyProblem(key, fork, needed) {
 }
 var maskSecretShapes = (text) => maskText(text);
 function normaliseMessage(message, lines) {
-  const own5 = new Set(lines);
-  return message.replace(/(?<![\w.])\d+(?!\w|\.\d)/g, (m) => own5.has(Number(m)) ? "" : m).replace(/\s+/g, " ").trim();
+  const own6 = new Set(lines);
+  return message.replace(/(?<![\w.])\d+(?!\w|\.\d)/g, (m) => own6.has(Number(m)) ? "" : m).replace(/\s+/g, " ").trim();
 }
 var COLUMN_RULES = Object.freeze(Object.assign(/* @__PURE__ */ Object.create(null), {
   betterleaks: { shiftAfterFirstLine: 0 },
@@ -3551,24 +3554,24 @@ function fingerprintFinding(f, ctx) {
   const fileHash = ctx.fileHashOf?.(f);
   if (fileHash !== void 0) return { fingerprint: `secret:${hmac(key, ["file", ...where, field(fileHash)].join("\0"))}`, by: "file" };
   const staged = ctx.regionOf?.(f);
-  let why;
+  let why2;
   if (staged !== void 0) {
     if (staged.ok) {
       ctx.onRegion?.(staged.bytes);
       return { fingerprint: `secret:${hmac(key, Buffer.concat([Buffer.from(`${where.join("\0")}\0`), staged.bytes]))}`, by: "region" };
     }
-    why = staged.reason;
-  } else if (f.file === void 0) why = "the finding has no file in the workspace";
-  else if (ctx.workspace === void 0 || ctx.workspace === "") why = "no workspace to read the region from";
+    why2 = staged.reason;
+  } else if (f.file === void 0) why2 = "the finding has no file in the workspace";
+  else if (ctx.workspace === void 0 || ctx.workspace === "") why2 = "no workspace to read the region from";
   else {
     const region = readRegion(ctx.workspace, f, ctx.cache);
     if (region.ok) {
       ctx.onRegion?.(region.bytes);
       return { fingerprint: `secret:${hmac(key, Buffer.concat([Buffer.from(`${where.join("\0")}\0`), region.bytes]))}`, by: "region" };
     }
-    why = region.reason;
+    why2 = region.reason;
   }
-  return { fingerprint: `secret:${hmac(key, ["line", ...where, uriSlot(f), field(f.line)].join("\0"))}`, by: "line", note: `fingerprint by line: ${why}` };
+  return { fingerprint: `secret:${hmac(key, ["line", ...where, uriSlot(f), field(f.line)].join("\0"))}`, by: "line", note: `fingerprint by line: ${why2}` };
 }
 function uriSlotZap(f) {
   return f.file !== void 0 ? field(f.file) : f.uriUnmapped ? `unmapped:${field(f.uriId)}` : "";
@@ -3965,12 +3968,12 @@ function baseFolder(baseId, run, workspace, encoding, where) {
   return path.startsWith(`${ws}/`) ? normaliseUri(path.slice(ws.length + 1), { encoding }) : void 0;
 }
 function mapUri(uri, baseId, run, bases, workspace, encoding, where) {
-  const own5 = normaliseUri(uri, { workspace, encoding });
-  if (baseId === void 0 || uri.startsWith("/") || SCHEME.test(uri)) return own5;
+  const own6 = normaliseUri(uri, { workspace, encoding });
+  if (baseId === void 0 || uri.startsWith("/") || SCHEME.test(uri)) return own6;
   if (!bases.has(baseId)) bases.set(baseId, baseFolder(baseId, run, workspace, encoding, where));
   const base = bases.get(baseId);
-  if (base === void 0 || own5 === void 0) return void 0;
-  return base === "" ? own5 : `${base}/${own5}`;
+  if (base === void 0 || own6 === void 0) return void 0;
+  return base === "" ? own6 : `${base}/${own6}`;
 }
 function readRun(run, index, toolId, info, opts, limits, notes) {
   const where = `run ${index}`;
@@ -4401,16 +4404,16 @@ function decideGate(i) {
       checks.push({ needId: e.needId, job: e.job, ...e.tool === void 0 ? {} : { tool: e.tool }, judgedBy: findings ? "findings" : "job status", state: uncovered.length === 0 ? s : `${s}; ${uncovered.join("; ")}` });
     };
     if (level === "not-proven") notProven.push(ref2(zapUnverified && !notProvenSet.has(e.needId) ? "ZAP results are not verified yet, so this DAST check is judged as not proven (warnings only)" : "not proven: warnings only"));
-    const toolError2 = (why, base) => {
+    const toolError2 = (why2, base) => {
       const blocks = level === "required";
-      toolErrors.push({ ...ref2(why), base, blocks });
+      toolErrors.push({ ...ref2(why2), base, blocks });
       const text = `tool error in ${name}${base ? " on the base commit" : ""}: re-run the job`;
       if (blocks) block(text);
       else if (level === "not-proven") warn(`${text} (not proven: a warning only)`);
       else note(`${text} (a non-blocking check)`);
     };
-    const tampered = (what, why) => {
-      block(`result tampered or missing: ${e.job} (${what}: ${why})`);
+    const tampered = (what, why2) => {
+      block(`result tampered or missing: ${e.job} (${what}: ${why2})`);
     };
     const didNotReport = () => {
       const text = `scanner ${name} did not report`;
@@ -4559,8 +4562,8 @@ function decideGate(i) {
       if (d.ruleId === NOT_SCANNED_RULE_ID) notScanned.push(d);
       const licenceUnknown = e.category === "licences" && d.severity === "info";
       const shown2 = serious(d) || d.severity === "medium" || licenceUnknown;
-      const put = (to, why) => {
-        if (why !== void 0) d.reason = `${d.reason}; ${why}`;
+      const put = (to, why2) => {
+        if (why2 !== void 0) d.reason = `${d.reason}; ${why2}`;
         if (to === "block") blocking.push(d);
         else if (to === "warn") warnings.push(d);
         else counted[d.severity]++;
@@ -4770,17 +4773,20 @@ async function historyState(gh, repo2, sha3, lk) {
     return "error";
   }
 }
-async function judgeRun(gh, run, repo2, budget, lk) {
-  const no2 = (why) => ({ ok: false, why });
-  if (!isPlain2(run)) return no2("untrusted");
-  if (!posInt(own(run, "id"))) return no2("untrusted");
-  if (own(run, "event") !== "push") return no2("untrusted");
-  if (own(run, "path") !== WORKFLOW_PATH) return no2("untrusted");
+function runFieldsTrusted(run, repo2) {
+  if (!isPlain2(run)) return false;
+  if (!posInt(own(run, "id"))) return false;
+  if (own(run, "event") !== "push") return false;
+  if (own(run, "path") !== WORKFLOW_PATH) return false;
   const head = own(run, "head_repository");
-  if (!isPlain2(head) || own(head, "id") !== repo2.id) return no2("untrusted");
-  if (own(run, "head_branch") !== repo2.defaultBranch) return no2("untrusted");
+  if (!isPlain2(head) || own(head, "id") !== repo2.id) return false;
+  if (own(run, "head_branch") !== repo2.defaultBranch) return false;
   const sha3 = own(run, "head_sha");
-  if (typeof sha3 !== "string" || !SHA_RE2.test(sha3)) return no2("untrusted");
+  return typeof sha3 === "string" && SHA_RE2.test(sha3);
+}
+async function judgeRun(gh, run, repo2, budget, lk) {
+  if (!runFieldsTrusted(run, repo2)) return { ok: false, why: "untrusted" };
+  const sha3 = own(run, "head_sha");
   if (budget !== void 0) {
     if (budget.left <= 0) return { ok: false, why: "cap" };
     budget.left--;
@@ -5060,8 +5066,8 @@ async function cleanRunSeen(gh, repo2, ctx) {
     return void 0;
   }, notes, st, MARKER_WINDOW);
   if (result !== void 0) return result;
-  const why = notes.join("; ");
-  return st.incomplete ? { state: "unknown", seen: false, note: `clean-run marker could not be checked: ${why || "unknown"}` } : { state: "none", seen: false, note: `no clean-run marker from a trusted run${why === "" ? "" : `: ${why}`}` };
+  const why2 = notes.join("; ");
+  return st.incomplete ? { state: "unknown", seen: false, note: `clean-run marker could not be checked: ${why2 || "unknown"}` } : { state: "none", seen: false, note: `no clean-run marker from a trusted run${why2 === "" ? "" : `: ${why2}`}` };
 }
 function requireKey(key) {
   const problem = key === void 0 ? "PIPEGEN_FP_KEY is missing" : keyProblem(key, false, true);
@@ -8377,7 +8383,7 @@ var API_VERSION = "2022-11-28";
 var TIMEOUT_MS = 3e4;
 var MAX_JSON_BYTES = 32 * 1024 * 1024;
 var MAX_RAW_BYTES2 = 3 * 1024 * 1024;
-var PAGE_CAP = { files: 30, reviews: 31, runs: 5 };
+var PAGE_CAP = { files: 30, reviews: 31, runs: 5, jobs: 5 };
 var MAX_PER_PAGE = 100;
 var STORE_HOST_RE = /^(?:[a-z0-9-]{1,63}\.blob\.core\.windows\.net|[a-z0-9-]{1,63}\.actions\.githubusercontent\.com)$/;
 var GitHubApiError = class extends Error {
@@ -8559,10 +8565,19 @@ function githubAdapter(opts) {
     listRuns: async (owner, name, q) => {
       if (typeof q.workflow !== "string" || !WORKFLOW_RE.test(q.workflow)) fail2("a workflow file name that is not one");
       if (typeof q.branch !== "string" || !BRANCH_QUERY_RE.test(q.branch)) fail2("a branch name that is not one");
-      if (q.event !== "push" || q.status !== "success") fail2("a run filter the gate does not use");
-      const query = new URLSearchParams({ event: q.event, branch: q.branch, status: q.status, per_page: perPage(q.perPage), page: page(q.page, PAGE_CAP.runs) });
+      if (q.event !== "push" || q.status !== void 0 && q.status !== "success") fail2("a run filter the gate does not use");
+      if (q.headSha !== void 0) sha2(q.headSha);
+      const query = new URLSearchParams({
+        event: q.event,
+        branch: q.branch,
+        ...q.status === void 0 ? {} : { status: q.status },
+        ...q.headSha === void 0 ? {} : { head_sha: q.headSha },
+        per_page: perPage(q.perPage),
+        page: page(q.page, PAGE_CAP.runs)
+      });
       return getJson(`${repo(owner, name)}/actions/workflows/${encodeURIComponent(q.workflow)}/runs?${query.toString()}`);
     },
+    listAttemptJobs: async (owner, name, runId, attempt, p, per) => getJson(`${repo(owner, name)}/actions/runs/${num(runId)}/attempts/${num(attempt)}/jobs?per_page=${perPage(per)}&page=${page(p, PAGE_CAP.jobs)}`),
     listRunArtifacts: async (owner, name, runId, artifactName) => {
       if (typeof artifactName !== "string" || !ARTIFACT_NAME_RE.test(artifactName)) fail2("an artifact name that is not one");
       const path = `${repo(owner, name)}/actions/runs/${num(runId)}/artifacts?${new URLSearchParams({ name: artifactName, per_page: String(MAX_PER_PAGE) }).toString()}`;
@@ -8603,6 +8618,186 @@ function githubAdapter(opts) {
       return getJson(`${repo(owner, name)}/collaborators/${encodeURIComponent(login)}/permission`);
     }
   };
+}
+
+// gate/src/gated-run.ts
+var DEFAULT_WAIT_MS = 30 * 6e4;
+var DEFAULT_POLL_MS = 2e4;
+var MAX_POLLS = 300;
+var DEFAULT_MAX_CALLS = 400;
+var MAX_CANDIDATES = 20;
+var JOBS_PER_PAGE = 100;
+var JOB_PAGE_CAP = 5;
+var SHA_RE7 = /^[0-9a-f]{40}$/;
+var ACTIVE = /* @__PURE__ */ new Set(["queued", "in_progress", "waiting", "pending", "requested"]);
+var isPlain7 = (v) => typeof v === "object" && v !== null && !Array.isArray(v);
+var own5 = (o, k) => Object.hasOwn(o, k) ? o[k] : void 0;
+var posInt4 = (v) => typeof v === "number" && Number.isSafeInteger(v) && v > 0;
+var realSleep = (ms) => new Promise((r) => setTimeout(r, ms));
+var BudgetError = class extends Error {
+};
+var why = (what, e) => e instanceof BudgetError ? `${what}: the call budget is used up` : e instanceof GitHubApiError ? `${what}: ${e.message}` : `${what}: the request failed`;
+async function attemptVerdict(gh, repo2, runId, attempt, gateJobName) {
+  const what = `the jobs of run ${runId} attempt ${attempt}`;
+  const jobs = [];
+  let total = -1;
+  try {
+    for (let page2 = 1; page2 <= JOB_PAGE_CAP; page2++) {
+      const answer = await gh.listAttemptJobs(repo2.owner, repo2.name, runId, attempt, page2, JOBS_PER_PAGE);
+      const t = isPlain7(answer) ? own5(answer, "total_count") : void 0;
+      const list = isPlain7(answer) ? own5(answer, "jobs") : void 0;
+      if (typeof t !== "number" || !Number.isSafeInteger(t) || t < 0 || !Array.isArray(list)) return { kind: "error", detail: `${what} could not be read (the answer is not a job list)` };
+      if (total !== -1 && t !== total) return { kind: "error", detail: `${what} changed while they were read` };
+      total = t;
+      jobs.push(...list);
+      if (jobs.length >= total) break;
+      if (list.length === 0) return { kind: "error", detail: `${what} could not be read (the list is cut short)` };
+    }
+  } catch (e) {
+    return { kind: "error", detail: why(`${what} could not be read`, e) };
+  }
+  if (jobs.length < total) return { kind: "error", detail: `${what} are more than the ${JOB_PAGE_CAP * JOBS_PER_PAGE} that are read, so a second gate job could hide` };
+  if (jobs.length > total) return { kind: "error", detail: `${what} could not be read (more jobs than the total)` };
+  const gate = [];
+  for (const j of jobs) {
+    if (!isPlain7(j)) return { kind: "error", detail: `${what} could not be read (a job is not an object)` };
+    if (own5(j, "run_id") !== runId) return { kind: "error", detail: `${what} could not be read (a job belongs to another run)` };
+    const a = own5(j, "run_attempt");
+    if (a !== void 0 && a !== attempt) return { kind: "error", detail: `${what} could not be read (a job belongs to another attempt)` };
+    if (own5(j, "name") === gateJobName) gate.push(j);
+  }
+  if (gate.length === 0) return { kind: "failed", detail: `run ${runId} has no job named ${gateJobName} in its latest attempt` };
+  if (gate.length > 1) return { kind: "failed", detail: `in the latest attempt of run ${runId} more than one job reports as the gate` };
+  const g = gate[0];
+  const conclusion = own5(g, "conclusion");
+  const shown2 = typeof conclusion === "string" && /^[a-z_]{1,30}$/.test(conclusion) ? conclusion : "not readable";
+  if (own5(g, "status") !== "completed" || conclusion !== "success") return { kind: "failed", detail: `the gate job of run ${runId} did not succeed in its latest attempt (${shown2})` };
+  return { kind: "ok" };
+}
+function centralProblem(run, central) {
+  const refs = own5(run, "referenced_workflows");
+  if (!Array.isArray(refs)) return `run ${String(own5(run, "id"))} lists no referenced workflows`;
+  const mine = refs.filter((e) => isPlain7(e) && typeof own5(e, "path") === "string" && own5(e, "path").startsWith(`${central.pathPrefix}@`));
+  if (mine.length === 0) return `run ${String(own5(run, "id"))} did not call the central workflow`;
+  if (mine.some((e) => own5(e, "sha") !== central.sha)) return `run ${String(own5(run, "id"))} called the central workflow at a different commit than the expected one`;
+  return void 0;
+}
+async function findGatedRun(gh0, repo2, sha3, o) {
+  const error = (detail) => ({ ok: false, reason: "error", detail });
+  if (typeof sha3 !== "string" || !SHA_RE7.test(sha3)) return error("the commit is not a 40-character lower-case sha");
+  if (!isPlain7(repo2) || !posInt4(repo2.id) || typeof repo2.owner !== "string" || typeof repo2.name !== "string" || typeof repo2.defaultBranch !== "string" || repo2.defaultBranch === "") return error("the repository is not known");
+  if (o.workflowPath !== WORKFLOW_PATH) return error("run trust is defined for .github/workflows/pipegen.yml only");
+  const central = o.central;
+  if (central !== void 0 && (!SHA_RE7.test(central.sha) || typeof central.pathPrefix !== "string" || central.pathPrefix === "" || central.pathPrefix.includes("@"))) return error("the central workflow or its commit is not usable");
+  const waitMs = o.waitMs ?? DEFAULT_WAIT_MS;
+  if (typeof waitMs !== "number" || !Number.isFinite(waitMs) || waitMs < 0) return error("the wait time is not usable");
+  const pollMs = Math.max(1, o.pollMs ?? DEFAULT_POLL_MS, Math.ceil(waitMs / MAX_POLLS));
+  const now = o.now ?? Date.now;
+  const sleep = o.sleep ?? realSleep;
+  const budget = { left: o.maxCalls ?? DEFAULT_MAX_CALLS, spent: false };
+  const spend = () => {
+    if (budget.left <= 0) {
+      budget.spent = true;
+      throw new BudgetError();
+    }
+    budget.left--;
+  };
+  const gh = {
+    compare: (...a) => {
+      spend();
+      return gh0.compare(...a);
+    },
+    branchHead: (...a) => {
+      spend();
+      return gh0.branchHead(...a);
+    },
+    tagExists: (...a) => {
+      spend();
+      return gh0.tagExists(...a);
+    },
+    listRuns: (...a) => {
+      spend();
+      return gh0.listRuns(...a);
+    },
+    listAttemptJobs: (...a) => {
+      spend();
+      return gh0.listAttemptJobs(...a);
+    }
+  };
+  const url = (id) => `https://github.com/${repo2.owner}/${repo2.name}/actions/runs/${id}`;
+  const start = now();
+  const waitingFor = /* @__PURE__ */ new Set();
+  for (; ; ) {
+    let listed;
+    try {
+      listed = await gh.listRuns(repo2.owner, repo2.name, { workflow: "pipegen.yml", branch: repo2.defaultBranch, event: "push", headSha: sha3, page: 1, perPage: 100 });
+    } catch (e) {
+      return error(why("the runs of this commit could not be listed", e));
+    }
+    const runs = isPlain7(listed) ? own5(listed, "workflow_runs") : void 0;
+    if (!Array.isArray(runs)) return error("the runs of this commit could not be read (the answer is not a run list)");
+    const lk = {};
+    const errors = [];
+    const failed = [];
+    const wrongCentral = [];
+    let active = 0;
+    let considered = 0;
+    for (const r of runs) {
+      if (!runFieldsTrusted(r, repo2) || own5(r, "head_sha") !== sha3) continue;
+      if (++considered > MAX_CANDIDATES) {
+        errors.push(`more than ${MAX_CANDIDATES} runs for this commit`);
+        break;
+      }
+      const id = own5(r, "id");
+      if (central !== void 0) {
+        const c = centralProblem(r, central);
+        if (c !== void 0) {
+          wrongCentral.push(c);
+          continue;
+        }
+      }
+      const attempt = own5(r, "run_attempt");
+      if (!posInt4(attempt)) {
+        errors.push(`run ${id} has no usable run_attempt`);
+        continue;
+      }
+      const status = own5(r, "status");
+      const isActive = typeof status === "string" && ACTIVE.has(status);
+      if (!isActive && status !== "completed") {
+        errors.push(`run ${id} has a status this search does not know`);
+        continue;
+      }
+      if (isActive && waitingFor.has(id)) {
+        active++;
+        continue;
+      }
+      const j = await judgeRun(gh, r, repo2, void 0, lk);
+      if (!j.ok) {
+        if (j.why === "untrusted" || j.why === "history") continue;
+        errors.push(j.why === "tag" ? "a tag named like the default branch exists, so no run is trusted until it is deleted" : `run ${id} could not be checked against the default branch`);
+        continue;
+      }
+      if (isActive) {
+        waitingFor.add(id);
+        active++;
+        continue;
+      }
+      const v = await attemptVerdict(gh, repo2, id, attempt, o.gateJobName);
+      if (v.kind === "ok") return { ok: true, runId: id, url: url(id) };
+      (v.kind === "failed" ? failed : errors).push(v.detail);
+    }
+    if (budget.spent) return error(`the call budget of ${o.maxCalls ?? DEFAULT_MAX_CALLS} calls is used up, so the gated run could not be found`);
+    if (errors.length > 0) return error(errors[0]);
+    if (active > 0) {
+      const left = waitMs - (now() - start);
+      if (left <= 0) return { ok: false, reason: "timeout", detail: `a run for this commit was still running after ${Math.round(waitMs / 6e4)} minutes` };
+      await sleep(Math.min(pollMs, left));
+      continue;
+    }
+    if (failed.length > 0) return { ok: false, reason: "gate-failed", detail: failed[0] };
+    if (wrongCentral.length > 0) return { ok: false, reason: "wrong-central", detail: wrongCentral[0] };
+    return { ok: false, reason: "none", detail: `no trusted push run of pipegen.yml on ${repo2.defaultBranch} was found for this commit; re-run the pipeline on this commit (runs older than the retention period no longer exist)` };
+  }
 }
 
 // gate/src/generated/gate-view.ts
@@ -9203,7 +9398,7 @@ var MODE_INPUTS = {
   stage: ["mode", "artifact", "tool", "stage"],
   gate: [...GATE_INPUTS],
   "baseline-check": ["mode", "github-token", "fp-key"],
-  "find-run": ["mode", "sha", "central-workflow", "central-sha", "github-token"],
+  "find-run": ["mode", "sha", "central-workflow", "central-sha", "timeout-minutes", "github-token"],
   nightly: ["mode", "block-from", "block-from-recorded", "github-token", "merged-at"]
 };
 var isMode = (m) => Object.hasOwn(MODE_INPUTS, m);
@@ -9455,8 +9650,7 @@ async function main(deps) {
       case "baseline-check":
         return await runBaselineCheck(step, deps, get);
       case "find-run":
-        step.error("mode find-run is not available yet (built in C8), so the step fails closed");
-        return 1;
+        return await runFindRun(step, deps, get);
       case "nightly":
         step.error("mode nightly is not available yet (built in C7), so the step fails closed");
         return 1;
@@ -9795,6 +9989,59 @@ async function runBaselineCheck(step, deps, get) {
   }
   step.setOutput("found", found ? "found" : "missing");
   step.log(`stored baseline: ${found ? "found" : "missing"}`);
+  return 0;
+}
+var SHA_RE8 = /^[0-9a-f]{40}$/;
+var TIMEOUT_RE = /^(?:[1-9]|[1-9][0-9]|[12][0-9]{2}|3[0-5][0-9]|360)$/;
+var FIND_RUN_DEFAULT_MINUTES = 30;
+async function runFindRun(step, deps, get) {
+  const fail3 = (text) => {
+    step.error(`find-run: ${text}`);
+    step.setOutput("run-id", "");
+    step.setOutput("run-url", "");
+    return 1;
+  };
+  const sha3 = get("sha");
+  if (sha3 === void 0 || !SHA_RE8.test(sha3)) return fail3("the sha input is not a 40-character lower-case commit sha, so the step fails closed");
+  const workflow = get("central-workflow");
+  const centralSha = get("central-sha");
+  if (workflow === void 0 !== (centralSha === void 0)) return fail3("central-workflow and central-sha go together, so the step fails closed");
+  if (workflow !== void 0 && (!PLAIN_REL_RE.test(workflow) || workflow.includes("@"))) return fail3("the central-workflow input is not a plain path of the central workflow, so the step fails closed");
+  if (centralSha !== void 0 && !SHA_RE8.test(centralSha)) return fail3("the central-sha input is not a 40-character lower-case commit sha, so the step fails closed");
+  const minutes = get("timeout-minutes");
+  if (minutes !== void 0 && !TIMEOUT_RE.test(minutes)) return fail3("the timeout-minutes input is not a whole number of minutes from 1 to 360, so the step fails closed");
+  const token = get("github-token");
+  if (token === void 0) return fail3("the github-token input is missing, so the step fails closed");
+  let repo2;
+  try {
+    repo2 = repoOf(JSON.parse(readRunnerFile(step.env("GITHUB_EVENT_PATH"), "the event payload (GITHUB_EVENT_PATH)")), step.env("GITHUB_REPOSITORY") ?? "");
+  } catch (e) {
+    return fail3(e instanceof StepError ? `${e.message}, so the step fails closed` : "the event payload could not be read, so the step fails closed");
+  }
+  if (typeof repo2 === "string") return fail3(`${repo2}, so the step fails closed`);
+  if (workflow === void 0 && repo2.private !== false) return fail3("a private repository needs the central-workflow and central-sha inputs, so the step fails closed");
+  const notes = [];
+  const clock = deps.now ?? (() => /* @__PURE__ */ new Date());
+  const opts = {
+    workflowPath: WORKFLOW_PATH,
+    gateJobName: GATE_CHECK_NAME,
+    waitMs: Number(minutes ?? FIND_RUN_DEFAULT_MINUTES) * 6e4,
+    now: () => clock().getTime(),
+    ...workflow === void 0 || centralSha === void 0 ? {} : { central: { pathPrefix: workflow, sha: centralSha } },
+    ...deps.sleep === void 0 ? {} : { sleep: deps.sleep }
+  };
+  let found;
+  try {
+    const gh = (deps.github ?? githubAdapter)({ token, mask: () => void 0, notes });
+    found = await findGatedRun(gh, repo2, sha3, opts);
+  } catch {
+    return fail3("GitHub could not be reached or set up, so the step fails closed");
+  }
+  for (const n of notes) step.warn(n);
+  if (!found.ok) return fail3(`no gated run for this commit (${found.reason}): ${found.detail}`);
+  step.setOutput("run-id", String(found.runId));
+  step.setOutput("run-url", found.url);
+  step.log(`the gate passed for this commit in run ${found.runId}`);
   return 0;
 }
 function defaultReviewed() {

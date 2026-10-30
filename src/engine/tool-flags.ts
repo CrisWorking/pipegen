@@ -814,6 +814,8 @@ export const RENDERER_INPUTS: Readonly<Record<string, Readonly<Record<string, Re
     sha: modeInput(['find-run'], /^\$\{\{ (?:github\.sha|github\.event\.workflow_run\.head_sha) \}\}$/, '${{ github.sha }} or ${{ github.event.workflow_run.head_sha }}'),
     'central-workflow': modeInput(['find-run'], PLAIN_REL_RE, 'a plain relative path of the central workflow'),
     'central-sha': modeInput(['find-run'], /^[0-9a-f]{40}$/, 'a 40-character commit'),
+    // how long find-run waits for a run in progress (C8): whole minutes, 1 to 360 (a job's own limit)
+    'timeout-minutes': modeInput(['find-run'], /^(?:[1-9]|[1-9][0-9]|[12][0-9]{2}|3[0-5][0-9]|360)$/, 'whole minutes, 1 to 360'),
     // nightly
     'merged-at': modeInput(['nightly'], /^\d{4}-(?:0[1-9]|1[0-2])-(?:0[1-9]|[12]\d|3[01])(?:T\d{2}:\d{2}:\d{2}(?:\.\d{1,3})?Z)?$/, 'a date or an ISO time in UTC'),
   },

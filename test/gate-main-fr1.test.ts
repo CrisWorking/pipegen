@@ -358,6 +358,10 @@ describe('fix round 1, minor 8: action.yml parity beyond the inputs', () => {
     for (const x of [await go({}, { r: scrubRunner(FPKEY) }), await go(world().inputs, { w: world() }), await go({ mode: 'baseline-check', [GH_IN]: CRED, [FP_IN]: FPKEY }, { w: world() })]) {
       for (const k of Object.keys(x.outputs)) written.add(k);
     }
+    // find-run (C8): its two outputs, on a failing step too
+    const fr = runner({ mode: 'find-run', sha: 'a'.repeat(40), [GH_IN]: CRED }, { event: 'workflow_run', payload: { repository: { id: 7, name: 'app', full_name: 'acme/app', owner: { login: 'acme' }, default_branch: 'main', private: false } } });
+    await main({ env: fr.env, write: () => undefined, github: () => ({ listRuns: async () => ({ workflow_runs: [] }) }) as never });
+    for (const k of Object.keys(outputsOf(fr.output))) written.add(k);
     const st = runner({});
     writeFileSync(join(st.workspace, 'a.txt'), 'x\n');
     for (const [k, v] of Object.entries({ mode: 'stage', artifact: 'pipegen-out-secrets', tool: 'betterleaks', stage: `${st.temp}/pipegen-stage/pipegen-out-secrets` })) st.env[`INPUT_${k.toUpperCase()}`] = v;

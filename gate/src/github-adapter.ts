@@ -26,7 +26,7 @@ const MAX_JSON_BYTES = 32 * 1024 * 1024;
 /** Raw file contents (CODEOWNERS up to GitHub's 3 MiB). */
 const MAX_RAW_BYTES = 3 * 1024 * 1024;
 /** The page caps of the callers: pull files and reviews (integrity.ts, 3,000 files / 100), runs (baseline.ts MAX_RUN_PAGES). */
-const PAGE_CAP = { files: 30, reviews: 31, runs: 5 } as const;
+const PAGE_CAP = { files: 30, reviews: 31, runs: 5, jobs: 5 } as const;
 const MAX_PER_PAGE = 100;
 
 /** Blob storage hosts the artifact download redirects to. */
@@ -200,10 +200,15 @@ export function githubAdapter(opts: AdapterOptions): GateGithubAdapter {
     listRuns: async (owner, name, q: RunQuery) => {
       if (typeof q.workflow !== 'string' || !WORKFLOW_RE.test(q.workflow)) fail('a workflow file name that is not one');
       if (typeof q.branch !== 'string' || !BRANCH_QUERY_RE.test(q.branch)) fail('a branch name that is not one');
-      if (q.event !== 'push' || q.status !== 'success') fail('a run filter the gate does not use');
-      const query = new URLSearchParams({ event: q.event, branch: q.branch, status: q.status, per_page: perPage(q.perPage), page: page(q.page, PAGE_CAP.runs) });
+      if (q.event !== 'push' || (q.status !== undefined && q.status !== 'success')) fail('a run filter the gate does not use');
+      if (q.headSha !== undefined) sha(q.headSha);
+      const query = new URLSearchParams({
+        event: q.event, branch: q.branch, ...(q.status === undefined ? {} : { status: q.status }), ...(q.headSha === undefined ? {} : { head_sha: q.headSha }),
+        per_page: perPage(q.perPage), page: page(q.page, PAGE_CAP.runs),
+      });
       return getJson(`${repo(owner, name)}/actions/workflows/${encodeURIComponent(q.workflow)}/runs?${query.toString()}`);
     },
+    listAttemptJobs: async (owner, name, runId, attempt, p, per) => getJson(`${repo(owner, name)}/actions/runs/${num(runId)}/attempts/${num(attempt)}/jobs?per_page=${perPage(per)}&page=${page(p, PAGE_CAP.jobs)}`),
     listRunArtifacts: async (owner, name, runId, artifactName) => {
       if (typeof artifactName !== 'string' || !ARTIFACT_NAME_RE.test(artifactName)) fail('an artifact name that is not one');
       const path = `${repo(owner, name)}/actions/runs/${num(runId)}/artifacts?${new URLSearchParams({ name: artifactName, per_page: String(MAX_PER_PAGE) }).toString()}`;

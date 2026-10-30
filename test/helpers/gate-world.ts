@@ -148,6 +148,7 @@ export class FakeGh implements GateGithubAdapter {
   async fileAt(_o: string, _n: string, path: string, ref: string): Promise<unknown> { this.log(`file ${ref.slice(0, 1)}:${path}`); return this.w.contents.get(`${ref}:${path}`) ?? null; }
   async collaboratorPermission(_o: string, _n: string, login: string): Promise<unknown> { this.log(`perm ${login}`); return { permission: 'write' }; }
   async rawFileAt(): Promise<unknown> { return null; }
+  async listAttemptJobs(): Promise<unknown> { throw new Error('not used'); }
   async getCommit(_o: string, _n: string, sha: string): Promise<unknown> { this.log(`commit ${sha.slice(0, 1)}`); const a = this.w.commits.get(sha); if (a === undefined) throw new Error('404'); return a; }
 }
 

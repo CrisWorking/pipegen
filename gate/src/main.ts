@@ -7,7 +7,9 @@
 //                     the output `result`, and only THEN the exit status. On a trusted green push to the default branch it also writes
 //                     the signed baseline (C3) and the clean-run marker there (ruling A of task-C5b-rulings.md);
 //   - baseline-check  (C3, ruling A): the lookup: a verified trusted baseline exists or not → output `found` (found | missing);
-//   - find-run, nightly: stubs that fail closed (C8, C7).
+//   - find-run        (C8): the proof that the exact commit passed the gate in a trusted push run on the default branch (gated-run.ts) →
+//                     outputs run-id and run-url on success, a failing status with the reason otherwise;
+//   - nightly: a stub that fails closed (C7).
 // The rules for every mode:
 //   - the token and the key come from the inputs only, and each is masked (`::add-mask::`, ruling 4) before anything else is written;
 //   - an input that is not of the mode is refused (so a test-only option, such as the stage piece size, can never become an input);
@@ -20,12 +22,14 @@
 import { randomUUID } from 'node:crypto';
 import { accessSync, chmodSync, closeSync, constants, fstatSync, lstatSync, mkdirSync, openSync, readSync, renameSync, unlinkSync, writeFileSync, writeSync } from 'node:fs';
 import { basename, dirname, isAbsolute, join } from 'node:path';
-import { GATE_UPLOAD_FILES, isStagedTool } from '../../src/engine/tool-flags.js';
+import { GATE_UPLOAD_FILES, isStagedTool, PLAIN_REL_RE } from '../../src/engine/tool-flags.js';
+import { GATE_CHECK_NAME } from '../../src/types.js';
 import { safeMarkdown, safeText } from '../../src/util/safe-text.js';
 import { keyProblem } from './fingerprint.js';
-import { buildCleanRunMarker, loadBaseline, saveBaseline, type ArtifactUploader, type BaselineCheck } from './baseline.js';
+import { buildCleanRunMarker, loadBaseline, saveBaseline, WORKFLOW_PATH, type ArtifactUploader, type BaselineCheck } from './baseline.js';
 import { decideGate, type DecidedFinding, type GateInput, type GateResult } from './decide.js';
 import { gatherGateInput, repoOf, type GateIo } from './facts.js';
+import { findGatedRun, type GatedRunOpts } from './gated-run.js';
 import { githubAdapter, type AdapterOptions, type GateGithubAdapter } from './github-adapter.js';
 import { scrubFile, type ScrubFileResult } from './scrub.js';
 import { GATE_VIEW } from './generated/gate-view.js';
@@ -38,7 +42,7 @@ export const MODE_INPUTS = {
   stage: ['mode', 'artifact', 'tool', 'stage'],
   gate: [...GATE_INPUTS],
   'baseline-check': ['mode', 'github-token', 'fp-key'],
-  'find-run': ['mode', 'sha', 'central-workflow', 'central-sha', 'github-token'],
+  'find-run': ['mode', 'sha', 'central-workflow', 'central-sha', 'timeout-minutes', 'github-token'],
   nightly: ['mode', 'block-from', 'block-from-recorded', 'github-token', 'merged-at'],
 } as const;
 type Mode = keyof typeof MODE_INPUTS;
@@ -50,6 +54,8 @@ export interface MainDeps {
   /** stdout: workflow commands and the log. */
   write: (text: string) => void;
   now?: () => Date;
+  /** Sleeping between polls of find-run (tests inject one that moves their clock). */
+  sleep?: (ms: number) => Promise<void>;
   /** The GitHub client (tests inject a fake); the REST adapter by default. */
   github?: (opts: AdapterOptions) => GateGithubAdapter;
   /** The built-in reviewed list's gate view. C6 replaces the default with the generated view it bundles (ruling S5). */
@@ -263,7 +269,7 @@ export async function main(deps: MainDeps): Promise<number> {
       case 'stage': return runStage(step, get);
       case 'gate': return await runGate(step, deps, inputs);
       case 'baseline-check': return await runBaselineCheck(step, deps, get);
-      case 'find-run': step.error('mode find-run is not available yet (built in C8), so the step fails closed'); return 1;
+      case 'find-run': return await runFindRun(step, deps, get);
       case 'nightly': step.error('mode nightly is not available yet (built in C7), so the step fails closed'); return 1;
     }
   } catch (e) {
@@ -577,6 +583,66 @@ async function runBaselineCheck(step: Step, deps: MainDeps, get: (n: string) => 
   }
   step.setOutput('found', found ? 'found' : 'missing');
   step.log(`stored baseline: ${found ? 'found' : 'missing'}`);
+  return 0;
+}
+
+// ---------- find-run ----------
+
+const SHA_RE = /^[0-9a-f]{40}$/;
+const TIMEOUT_RE = /^(?:[1-9]|[1-9][0-9]|[12][0-9]{2}|3[0-5][0-9]|360)$/;
+/** The default wait of find-run, in minutes. There is no default in action.yml (no input has one); the code says it. */
+export const FIND_RUN_DEFAULT_MINUTES = 30;
+
+/**
+ * Mode find-run (C8): looks for the trusted run in which `sha` passed the gate. Fails closed on every error: the outputs run-id and run-url
+ * are empty and the step exits 1 with the reason (none, wrong-central, gate-failed, timeout or error). The token was masked first by main.
+ */
+async function runFindRun(step: Step, deps: MainDeps, get: (n: string) => string | undefined): Promise<number> {
+  const fail = (text: string): number => {
+    step.error(`find-run: ${text}`);
+    step.setOutput('run-id', '');
+    step.setOutput('run-url', '');
+    return 1;
+  };
+  const sha = get('sha');
+  if (sha === undefined || !SHA_RE.test(sha)) return fail('the sha input is not a 40-character lower-case commit sha, so the step fails closed');
+  const workflow = get('central-workflow');
+  const centralSha = get('central-sha');
+  if ((workflow === undefined) !== (centralSha === undefined)) return fail('central-workflow and central-sha go together, so the step fails closed');
+  if (workflow !== undefined && (!PLAIN_REL_RE.test(workflow) || workflow.includes('@'))) return fail('the central-workflow input is not a plain path of the central workflow, so the step fails closed');
+  if (centralSha !== undefined && !SHA_RE.test(centralSha)) return fail('the central-sha input is not a 40-character lower-case commit sha, so the step fails closed');
+  const minutes = get('timeout-minutes');
+  if (minutes !== undefined && !TIMEOUT_RE.test(minutes)) return fail('the timeout-minutes input is not a whole number of minutes from 1 to 360, so the step fails closed');
+  const token = get('github-token');
+  if (token === undefined) return fail('the github-token input is missing, so the step fails closed');
+  let repo: ReturnType<typeof repoOf>;
+  try {
+    repo = repoOf(JSON.parse(readRunnerFile(step.env('GITHUB_EVENT_PATH'), 'the event payload (GITHUB_EVENT_PATH)')) as unknown, step.env('GITHUB_REPOSITORY') ?? '');
+  } catch (e) {
+    return fail(e instanceof StepError ? `${e.message}, so the step fails closed` : 'the event payload could not be read, so the step fails closed');
+  }
+  if (typeof repo === 'string') return fail(`${repo}, so the step fails closed`);
+  // the central workflow is what a pull request can not edit: a private repository (or one that does not say) must name it
+  if (workflow === undefined && repo.private !== false) return fail('a private repository needs the central-workflow and central-sha inputs, so the step fails closed');
+  const notes: string[] = [];
+  const clock = deps.now ?? (() => new Date());
+  const opts: GatedRunOpts = {
+    workflowPath: WORKFLOW_PATH, gateJobName: GATE_CHECK_NAME, waitMs: Number(minutes ?? FIND_RUN_DEFAULT_MINUTES) * 60_000, now: () => clock().getTime(),
+    ...(workflow === undefined || centralSha === undefined ? {} : { central: { pathPrefix: workflow, sha: centralSha } }),
+    ...(deps.sleep === undefined ? {} : { sleep: deps.sleep }),
+  };
+  let found;
+  try {
+    const gh = (deps.github ?? githubAdapter)({ token, mask: () => undefined, notes });
+    found = await findGatedRun(gh, repo, sha, opts);
+  } catch {
+    return fail('GitHub could not be reached or set up, so the step fails closed');
+  }
+  for (const n of notes) step.warn(n);
+  if (!found.ok) return fail(`no gated run for this commit (${found.reason}): ${found.detail}`);
+  step.setOutput('run-id', String(found.runId));
+  step.setOutput('run-url', found.url);
+  step.log(`the gate passed for this commit in run ${found.runId}`);
   return 0;
 }
 

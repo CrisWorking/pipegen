@@ -48,6 +48,7 @@ class Gh implements GateGithub {
     this.calls.push(`perm ${login}`);
     return this.out(this.perms.has(login) ? this.perms.get(login) : { permission: 'write' });
   }
+  async listAttemptJobs(): Promise<unknown> { throw new Error('not used'); }
   async rawFileAt(_o: string, _n: string, path: string, ref: string): Promise<unknown> {
     this.calls.push(`raw ${ref.slice(0, 1)}:${path}`);
     const k = `${ref}:${path}`;
