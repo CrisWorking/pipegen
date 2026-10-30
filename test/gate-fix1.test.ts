@@ -116,7 +116,7 @@ describe('the baseline: the attack harness draft is clean', () => {
 });
 
 describe('finding 1: the job gate decides (ruling 1)', () => {
-  const FR = (j: Record<string, Job>): RenderedStep => ({ ...gs(j), with: { mode: 'find-run', sha: '${{ github.sha }}', [GH_IN]: sref('GITHUB_TOKEN') } });
+  const FR = (j: Record<string, Job>): RenderedStep => ({ ...gs(j), with: { mode: 'find-run', layout: 'inline', sha: '${{ github.sha }}', [GH_IN]: sref('GITHUB_TOKEN') } });
   const NI = (j: Record<string, Job>): RenderedStep => ({ ...gs(j), with: { mode: 'nightly', [GH_IN]: sref('GITHUB_TOKEN') } });
   it('A6: no gate step, a find-run step or a nightly step in the job gate → not-gate-readable', async () => {
     const j = jobs();
@@ -328,7 +328,7 @@ describe('C3: mode baseline-check runs in the job baseline-check and nowhere els
   });
   it('the job baseline-check runs only mode baseline-check, exactly once (no gate, nightly or find-run step; not two)', async () => {
     const j = jobs();
-    const FR = { ...gs(j), with: { mode: 'find-run', sha: '${{ github.sha }}', [GH_IN]: sref('GITHUB_TOKEN') } };
+    const FR = { ...gs(j), with: { mode: 'find-run', layout: 'inline', sha: '${{ github.sha }}', [GH_IN]: sref('GITHUB_TOKEN') } };
     const NI = { ...gs(j), with: { mode: 'nightly', [GH_IN]: sref('GITHUB_TOKEN') } };
     for (const [name, steps] of [['gate', [gs(j)]], ['find-run', [FR]], ['nightly', [NI]], ['two', [BC(j), BC(j)]], ['none', []], ['baseline-check and find-run', [BC(j), FR]]] as const) {
       const r = await run([workflow({ ...j, 'baseline-check': BC_JOB([...steps]) }, true)], d);

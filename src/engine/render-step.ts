@@ -18,6 +18,7 @@ import { Scalar, YAMLMap, YAMLSeq } from 'yaml';
 import { safeText } from '../util/safe-text.js';
 import { DEPENDENCY_KINDS, type OutputFormat, type RepoProfile, type ReviewedTool, type Service, type StepSpec } from '../types.js';
 import { COMMIT_SHA_RE } from './names.js';
+import { centralWorkflowPath } from './central-path.js';
 import { NEED_IDS, toolCoversNeed } from './need-ids.js';
 import type { PlatformActions } from './pin.js';
 import { tuningProblems } from './tuning.js';
@@ -585,6 +586,23 @@ export function renderGateStep(gate: ReviewedTool, entries: readonly JobListEntr
  * nothing else (the gate checks the stored baseline's signature with the key and reads artifacts with the token). Like the gate job,
  * that job holds no checkout of repo code beyond what its policy row allows, and no other step of the gate action.
  */
+/**
+ * The find-run step (C8): the verify-first job and the proof's verify-lookup look for the trusted run in which the commit passed the gate.
+ * `central` is set exactly when the draft has a central pin (layout central: the path is derived by centralWorkflowPath, the one helper the
+ * referee uses too); otherwise the layout is inline and no central input is written. `sha` is the deployed commit's expression.
+ */
+export function renderFindRunStep(gate: ReviewedTool, opts: { central?: { repo: string; sha: string; project: string }; sha?: 'github.sha' | 'workflow_run'; timeoutMinutes?: number }): RenderedStep {
+  checkGateEntry(gate);
+  const filled: Record<string, string> = {
+    mode: 'find-run', layout: opts.central === undefined ? 'inline' : 'central',
+    sha: opts.sha === 'workflow_run' ? '${{ github.event.workflow_run.head_sha }}' : '${{ github.sha }}',
+    'github-token': '${{ secrets.GITHUB_TOKEN }}',
+  };
+  if (opts.central !== undefined) { filled['central-workflow'] = centralWorkflowPath(opts.central.repo, opts.central.project); filled['central-sha'] = opts.central.sha; }
+  if (opts.timeoutMinutes !== undefined) filled['timeout-minutes'] = String(opts.timeoutMinutes);
+  return actionStep(gate, 'pipegen: find the gated run', {}, filled);
+}
+
 export function renderBaselineCheckStep(gate: ReviewedTool): RenderedStep {
   checkGateEntry(gate);
   return actionStep(gate, 'pipegen: check the stored baseline', {}, {

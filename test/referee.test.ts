@@ -1,13 +1,14 @@
 // Plan B Task 7 Part 2, sub-task 7a: the referee's static checks. Written first (strict test-first).
 // The referee reads the finished files, never the renderer's intentions: every test hands it YAML text, most of it made by
 // the real renderer and stepsToYaml, some of it hand-written and hostile.
+import { centralWorkflowPath } from '../src/engine/central-path.js';
 import { Document, parseDocument } from 'yaml';
 import { NO_SCANS } from '../src/engine/job-rules.js';
 import { describe, expect, it } from 'vitest';
 import { JOB_PERMISSIONS, JOB_STEP_POLICY, pipegenLines, referee, type Linters, type RefereeDeps, type RefereeIssue, type RefereeReport } from '../src/engine/referee.js';
 import { gateJobList, jobIdFor } from '../src/engine/gate-job-list.js';
 import { jobOutputsFor } from '../src/engine/job-rules.js';
-import { dedupeJobSteps, RenderError, renderGateStep, renderJobPrelude, renderPlatformStep, renderProjectScript, renderScrub, renderStep, renderUpload, scrubbedPath, stepsToYaml, type RenderContext, type RenderedStep, type RenderResult } from '../src/engine/render-step.js';
+import { dedupeJobSteps, RenderError, renderFindRunStep, renderGateStep, renderJobPrelude, renderPlatformStep, renderProjectScript, renderScrub, renderStep, renderUpload, scrubbedPath, stepsToYaml, type RenderContext, type RenderedStep, type RenderResult } from '../src/engine/render-step.js';
 import { resultArtifactName } from '../src/engine/artifact-names.js';
 import { NEED_ID_CATEGORY, NEED_IDS } from '../src/engine/need-ids.js';
 import { emptyRepoFiles } from '../src/read/quality.js';
@@ -154,7 +155,7 @@ describe('referee: the renderer and the referee agree', () => {
     const download = (): RenderedStep => renderPlatformStep('download-artifact', p, { name: 'pipegen-out-sast--app', path: '${{ runner.temp }}/pipegen-out/pipegen-out-sast--app' });
     const harden = renderStep(specFor(entry('bullfrog'), { needId: 'egress' }), entry('bullfrog'), p, ctx).steps;
     // each mode of the gate action in the job that runs it (Plan C ruling B3); baseline-check has its own gate mode since C3
-    const gateAct = (mode: string): RenderedStep => ({ name: 'gate', uses: GATE.step.action?.uses as string, with: { mode } });
+    const gateAct = (mode: string): RenderedStep => ({ name: 'gate', uses: GATE.step.action?.uses as string, with: { mode, ...(mode === 'find-run' ? { layout: 'inline' } : {}) } });
     const watchAct: RenderedStep = { name: 'watch', uses: WATCHER.step.action?.uses as string, with: { mode: 'watcher' } };
     const [checkout] = prelude();
     const co = checkout as RenderedStep;
@@ -720,7 +721,7 @@ describe('referee: an edited user workflow is judged only where pipegen inserted
     '      - run: ./deploy.sh',
     '',
   ].join('\n');
-  const verifySteps = (): RenderedStep[] => [{ name: 'verify', uses: (GATE.step.action?.uses as string), with: { mode: 'find-run' } }];
+  const verifySteps = (): RenderedStep[] => [{ name: 'verify', uses: (GATE.step.action?.uses as string), with: { mode: 'find-run', layout: 'inline' } }];
   /** The user's file as insertVerify would leave it: `needs: [pipegen-verify]` on deploy, and the pipegen-verify job (steps through stepsToYaml). */
   const edited = (steps = verifySteps(), extra: (doc: Document) => void = () => {}): string => {
     const src = original.replace('  deploy:\n    runs-on: ubuntu-latest', '  deploy:\n    needs: [pipegen-verify]\n    runs-on: ubuntu-latest');
@@ -793,7 +794,7 @@ describe('fix round 1: the reviewer\'s attacks are refused', () => {
   const dScripts = (over: Partial<PipelineDraft> = {}): PipelineDraft => draftOf([], { needs: [needOf('unit-tests', true, 'app')], ...over });
   // the gate job's step (mode gate, an empty job list: these drafts have no check the gate waits for) and the verify job's step (mode find-run)
   const gateStep = (): RenderedStep => renderGateStep(GATE, []);
-  const verifyStep = (): RenderedStep => ({ name: 'verify', uses: GATE.step.action?.uses as string, with: { mode: 'find-run' } });
+  const verifyStep = (): RenderedStep => ({ name: 'verify', uses: GATE.step.action?.uses as string, with: { mode: 'find-run', layout: 'inline' } });
   const CENTRAL = { repo: 'o/pipelines', sha: sha('c') };
   const existing = (path: string, triggers: string[]): ExistingWorkflow => ({ path, triggers, deploys: true, [`${SEC_FIELD}Used`]: [], jobs: ['deploy'] } as unknown as ExistingWorkflow);
 
@@ -984,7 +985,7 @@ describe('fix round 1: an edited user workflow\'s own top level is judged where 
   const VERIFYP = { contents: 'read', actions: 'read', packages: 'read', attestations: 'read' };
   // the gate job's step (mode gate, an empty job list: these drafts have no check the gate waits for) and the verify job's step (mode find-run)
   const gateStep = (): RenderedStep => renderGateStep(GATE, []);
-  const verifyStep = (): RenderedStep => ({ name: 'verify', uses: GATE.step.action?.uses as string, with: { mode: 'find-run' } });
+  const verifyStep = (): RenderedStep => ({ name: 'verify', uses: GATE.step.action?.uses as string, with: { mode: 'find-run', layout: 'inline' } });
   const build = (original: string, steps: RenderedStep[] = [verifyStep()]): CreatedFile => {
     const src = original.replace('  deploy:\n', '  deploy:\n    needs: [pipegen-verify]\n');
     const doc = parseDocument(`${src}  pipegen-verify:\n    runs-on: ubuntu-latest\n    permissions:\n${Object.entries(VERIFYP).map(([k, v]) => `      ${k}: ${v}\n`).join('')}    cache-mode: none\n    steps: []\n`);
@@ -1059,7 +1060,7 @@ describe('fix round 2: the re-review probes are refused', () => {
   const CENTRAL = { repo: 'o/pipelines', sha: sha('c') };
   // the gate job's step (mode gate, an empty job list: these drafts have no check the gate waits for) and the verify job's step (mode find-run)
   const gateStep = (): RenderedStep => renderGateStep(GATE, []);
-  const verifyStep = (): RenderedStep => ({ name: 'verify', uses: GATE.step.action?.uses as string, with: { mode: 'find-run' } });
+  const verifyStep = (): RenderedStep => ({ name: 'verify', uses: GATE.step.action?.uses as string, with: { mode: 'find-run', layout: 'inline' } });
   const g = gitleaks();
   const base = (): string => wf({ scan: job(g.steps) }).content;
   const editedWith = (cond: string | undefined): { f: CreatedFile; d: PipelineDraft } => {
@@ -1186,5 +1187,56 @@ describe('fix round 2: the re-review probes are refused', () => {
     expect(text).not.toBe(f.content);
     const r = await run([{ ...f, content: text, inserted: { ...(f.inserted as NonNullable<CreatedFile['inserted']>), original } }], d, { list: LIST });
     expect(r.issues.some((i) => /workflow_run/.test(i.message)), show(r)).toBe(true);
+  });
+});
+
+describe('C8 fix round 1: the find-run layout matches the draft', () => {
+  const LIST = [...reviewedList(), GATE];
+  const CENTRAL = { repo: 'o/pipelines', sha: sha('c') };
+  const V = { contents: 'read', actions: 'read', packages: 'read', attestations: 'read' };
+  const CW = centralWorkflowPath(CENTRAL.repo, prof.repo);
+  const verify = (w: Record<string, string>): RenderedStep => ({ name: 'verify', uses: GATE.step.action?.uses as string, with: { mode: 'find-run', sha: '${{ github.sha }}', ...w } });
+  const layoutIssues = async (w: Record<string, string>, d: PipelineDraft): Promise<string[]> =>
+    (await run([wf({ 'pipegen-verify': job([verify(w)], { permissions: V }) })], d, { list: LIST })).issues.filter((i) => /layout|central/i.test(i.message)).map((i) => i.message);
+  const inline = draftOf([]);
+  const central = draftOf([], { centralPin: CENTRAL });
+  it('inline for a draft without a central pin, and central for one with it, are accepted', async () => {
+    expect(await layoutIssues({ layout: 'inline' }, inline)).toEqual([]);
+    expect(await layoutIssues({ layout: 'central', 'central-workflow': CW, 'central-sha': CENTRAL.sha }, central)).toEqual([]);
+  });
+  it('a layout that does not match the draft is refused, both ways', async () => {
+    expect((await layoutIssues({ layout: 'central', 'central-workflow': CW, 'central-sha': CENTRAL.sha }, inline)).length).toBeGreaterThan(0);
+    expect((await layoutIssues({ layout: 'inline' }, central)).length).toBeGreaterThan(0);
+  });
+  it('a missing or odd layout is refused', async () => {
+    expect((await layoutIssues({}, inline)).length).toBeGreaterThan(0);
+    expect((await layoutIssues({ layout: 'private' }, inline)).length).toBeGreaterThan(0);
+  });
+  it('central-workflow must be exactly the path the renderer derives (<pin repo>/.github/workflows/<project>--merge.yml)', async () => {
+    expect(CW).toBe(`o/pipelines/.github/workflows/${prof.repo}--merge.yml`);
+    const w = (v: string): Record<string, string> => ({ layout: 'central', 'central-workflow': v, 'central-sha': CENTRAL.sha });
+    for (const bad of [`${CW}@refs/heads/main`, `${CW}@${CENTRAL.sha}`, `o/pipelines/.github/workflows/../${prof.repo}--merge.yml`, `o/pipelines/.github/workflows/${prof.repo}--merge.yml/../x`,
+      `evil/pipelines/.github/workflows/${prof.repo}--merge.yml`, 'o/pipelines/.github/workflows/other--merge.yml', `o/pipelines/.github/workflows/${prof.repo}--merge.yaml`, `${CW} `, CW.toUpperCase(), '']) {
+      expect((await layoutIssues(w(bad), central)).length, bad).toBeGreaterThan(0);
+    }
+    expect(await layoutIssues(w(CW), central)).toEqual([]);
+  });
+  it('the renderer\'s find-run step is accepted by the referee, inline and central, and uses the same path', async () => {
+    const i = renderFindRunStep(GATE, {});
+    expect(i.with).toMatchObject({ mode: 'find-run', layout: 'inline', sha: '${{ github.sha }}' });
+    expect(i.with?.['central-workflow']).toBeUndefined();
+    const c = renderFindRunStep(GATE, { central: { repo: CENTRAL.repo, sha: CENTRAL.sha, project: prof.repo } });
+    expect(c.with).toMatchObject({ layout: 'central', 'central-workflow': CW, 'central-sha': CENTRAL.sha });
+    for (const [s, d] of [[i, inline], [c, central]] as const) {
+      const r = await run([wf({ 'pipegen-verify': job([s], { permissions: V }) })], d, { list: LIST });
+      expect(r.issues.filter((x) => /layout|central/i.test(x.message)), show(r)).toEqual([]);
+    }
+  });
+  it('central needs central-workflow and a central-sha equal to the draft\'s pin; inline takes neither', async () => {
+    expect((await layoutIssues({ layout: 'central', 'central-sha': CENTRAL.sha }, central)).length).toBeGreaterThan(0);
+    expect((await layoutIssues({ layout: 'central', 'central-workflow': CW }, central)).length).toBeGreaterThan(0);
+    expect((await layoutIssues({ layout: 'central', 'central-workflow': CW, 'central-sha': sha('d') }, central)).length).toBeGreaterThan(0);
+    expect((await layoutIssues({ layout: 'inline', 'central-workflow': CW }, inline)).length).toBeGreaterThan(0);
+    expect((await layoutIssues({ layout: 'inline', 'central-sha': CENTRAL.sha }, inline)).length).toBeGreaterThan(0);
   });
 });

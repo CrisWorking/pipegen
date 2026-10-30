@@ -41,6 +41,7 @@ import { APP_RUNNING_CATEGORIES, TRIVY_LAUNCH_RE } from './render-cli.js';
 import { EXPR, own, show } from './render-error.js';
 import { ACTION_PATH_RE, checkExpressions, createdPathProblem, checkJobOrder, gateResultUploadProblems, IF_VALUES, isDangerousName, isReviewed, isScrubStep, isStageStep, jobOutputsProblems, SECRET_REF_RE, STEP_KEYS as STEP_KEY_LIST, WORKFLOW_PATH_RE, type RenderedStep, type ScanFact } from './job-rules.js';
 import { containerRefusal, RenderError, renderProjectScript, renderStep, sameDedupeContent, type RenderContext } from './render-step.js';
+import { centralWorkflowPath } from './central-path.js';
 import { projectScriptFor } from './reviewed.js';
 import { slotProblem, type SlotKind } from './slots.js';
 import { ARGV_POLICIES, CACHE_LOCKS, GATE_OPTIONAL_UPLOADS, PLAIN_REL_RE, PLATFORM_USES, RENDERER_INPUTS, rendererInputProblems, SCRUB_SECRET, uploadIfNoFiles } from './tool-flags.js';
@@ -642,6 +643,21 @@ function judgeOutputs(fc: FileCtx, id: string, where: string, j: Obj, judged: re
   for (const problem of jobOutputsProblems(id, j.outputs, judged.map((x) => x.step))) fc.add(fc.file.path, 'injection', `In ${where}: ${problem}`);
 }
 
+/** The find-run step's layout, central-workflow and central-sha against the draft (centralPin set: central at exactly that commit; unset: inline, no central input). */
+function judgeFindRunLayout(fc: FileCtx, where: string, withs: Obj): void {
+  const bad = issueFor(fc);
+  const pin = fc.draft.centralPin;
+  const want = pin === undefined ? 'inline' : 'central';
+  if (withs.layout !== want) { bad('template', `${where}: the find-run step's layout must be ${want} for this pipeline (it is ${show(withs.layout)}); the gate it looks for runs ${want === 'central' ? 'in the central workflow' : 'inline in pipegen.yml'}.`); return; }
+  if (want === 'inline') {
+    if (withs['central-workflow'] !== undefined || withs['central-sha'] !== undefined) bad('template', `${where}: layout inline takes no central-workflow or central-sha.`);
+    return;
+  }
+  // exactly the path the renderer derives (one helper), so an @, a .., another repository or another file is refused
+  if (pin !== undefined && withs['central-workflow'] !== centralWorkflowPath(pin.repo, fc.draft.profile.repo)) bad('template', `${where}: the find-run step's central-workflow must be exactly ${show(centralWorkflowPath(pin.repo, fc.draft.profile.repo))}.`);
+  if (withs['central-sha'] !== pin?.sha) bad('template', `${where}: the find-run step's central-sha must be the commit pipegen recorded for the central repository.`);
+}
+
 /**
  * The job `gate` decides (C0b fix round 1, rulings 1 to 3). It runs the gate action exactly once, in mode `gate` (whatever the
  * draft holds: with no checks the gate still has to run), and has `if: always()` (a skipped required check counts as passed). The
@@ -663,6 +679,8 @@ function judgeGateSteps(fc: FileCtx, id: string, where: string, j: Obj, judged: 
     return;
   }
   if (baselineSteps.length > 0) bad('permissions', `${where} runs the gate action in mode baseline-check, which only the job baseline-check does.`);
+  // C8 fix round 1: a find-run step names where the gate runs, and that must be what the draft says: `central` exactly when pipegen recorded a central pin
+  for (const x of gateKind.filter((k) => k.step.with?.mode === 'find-run')) judgeFindRunLayout(fc, where, x.step.with ?? {});
   if (id !== 'gate') {
     if (gates.length > 0) bad('not-gate-readable', `${where} runs the gate action in mode gate, which only the job gate does (the required check ${GATE_CHECK_NAME} is its result).`);
     return;

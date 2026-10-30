@@ -170,7 +170,7 @@ describe('RENDERER_INPUTS: the gate action, per mode (ruling B3)', () => {
     mode: 'gate', jobs: '${{ toJSON(needs) }}', 'job-list': list, 'not-proven': '["lint"]', skipped: '[]', policy: '{"block":["critical","high"],"warn":["medium"]}',
     'protected-paths': '[".github/workflows/**","docs/*.md"]', 'block-from-recorded': '2026-11-01', 'block-from': '${{ vars.PIPEGEN_BLOCK_FROM }}', [GH_IN]: GH, [FP_IN]: sref('PIPEGEN_FP_KEY'),
   };
-  const findRunWith: Record<string, string> = { mode: 'find-run', sha: '${{ github.sha }}', 'central-workflow': 'acme/pipelines/.github/workflows/acme--merge.yml', 'central-sha': 'a'.repeat(40), 'timeout-minutes': '30', [GH_IN]: GH };
+  const findRunWith: Record<string, string> = { mode: 'find-run', layout: 'central', sha: '${{ github.sha }}', 'central-workflow': 'acme/pipelines/.github/workflows/acme--merge.yml', 'central-sha': 'a'.repeat(40), 'timeout-minutes': '30', [GH_IN]: GH };
   const nightlyWith: Record<string, string> = { mode: 'nightly', [GH_IN]: GH, 'block-from': '${{ vars.PIPEGEN_BLOCK_FROM }}', 'block-from-recorded': '2026-11-01', 'merged-at': '2026-10-29T12:00:00Z' };
   const problems = (w: Record<string, string>): string[] => rendererInputProblems(U, w, w);
   const SCRUB_SAMPLE_FOR_BASELINE: Record<string, string> = { artifact: 'pipegen-out-secrets', tool: 'gitleaks', format: 'sarif', raw: '${{ runner.temp }}/pipegen-raw/pipegen-out-secrets/x.sarif', out: '${{ runner.temp }}/pipegen-out/pipegen-out-secrets/x.sarif' };
@@ -228,7 +228,7 @@ describe('RENDERER_INPUTS: the gate action, per mode (ruling B3)', () => {
   it('RENDERER_INPUTS gate, mode baseline-check: no gate, find-run or nightly input is allowed under it (whenWith)', () => {
     const others: Record<string, string> = {
       jobs: '${{ toJSON(needs) }}', 'job-list': list, 'not-proven': '[]', skipped: '[]', policy: '{"block":["critical","high"],"warn":["medium"]}', 'protected-paths': '[".github/workflows/**"]',
-      'block-from': '${{ vars.PIPEGEN_BLOCK_FROM }}', 'block-from-recorded': '2026-11-01', sha: '${{ github.sha }}', 'central-workflow': 'acme/pipelines/.github/workflows/acme--merge.yml', 'central-sha': 'a'.repeat(40), 'timeout-minutes': '30',
+      'block-from': '${{ vars.PIPEGEN_BLOCK_FROM }}', 'block-from-recorded': '2026-11-01', layout: 'central', sha: '${{ github.sha }}', 'central-workflow': 'acme/pipelines/.github/workflows/acme--merge.yml', 'central-sha': 'a'.repeat(40), 'timeout-minutes': '30',
       'merged-at': '2026-10-29T12:00:00Z', ...SCRUB_SAMPLE_FOR_BASELINE,
     };
     for (const [input, value] of Object.entries(others)) {
@@ -250,7 +250,7 @@ describe('RENDERER_INPUTS: the gate action, per mode (ruling B3)', () => {
   it('a mode\'s inputs are refused under another mode (whenWith on mode)', () => {
     const own: Record<string, string[]> = {
       gate: ['jobs', 'job-list', 'not-proven', 'skipped', 'policy', 'protected-paths'],
-      'find-run': ['sha', 'central-workflow', 'central-sha', 'timeout-minutes'],
+      'find-run': ['layout', 'sha', 'central-workflow', 'central-sha', 'timeout-minutes'],
       nightly: ['merged-at'],
       scrub: ['artifact', 'tool', 'format', 'raw', 'out'],
     };

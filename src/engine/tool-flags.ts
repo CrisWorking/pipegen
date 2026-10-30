@@ -570,6 +570,8 @@ export interface RendererInput {
 
 const rx = (re: RegExp, describe: string, whenWith?: RendererInput['whenWith']): RendererInput => ({ describe, check: (v) => re.test(v), ...(whenWith === undefined ? {} : { whenWith }) });
 /** A repo-relative file path: not absolute, not an option (`-x`), no `..`, plain characters, no `*`. Shared by the renderer's folder checks. */
+/** Whole minutes from 1 to 360 (a job's own limit): the one rule for the rendered `timeout-minutes` and the action. */
+export const TIMEOUT_MINUTES_RE = /^(?:[1-9]|[1-9][0-9]|[12][0-9]{2}|3[0-5][0-9]|360)$/;
 export const PLAIN_REL_RE = /^(?![-/])(?!.*(?:^|\/)\.\.(?:\/|$))[A-Za-z0-9._/-]{1,200}$/;
 const GHCR_ONLY = { check: (all: Readonly<Record<string, string>>) => all.registry === 'ghcr.io', describe: 'only when the registry is ghcr.io' } as const;
 const RUNNER_TEMP_PATH = rx(/^\$\{\{ runner\.temp \}\}\/pipegen-out\/[a-z0-9][a-z0-9-]{0,120}(?:\/[A-Za-z0-9_][A-Za-z0-9._-]{0,100}){0,3}$/, 'a path under ${{ runner.temp }}/pipegen-out/<artifact>');
@@ -815,7 +817,10 @@ export const RENDERER_INPUTS: Readonly<Record<string, Readonly<Record<string, Re
     'central-workflow': modeInput(['find-run'], PLAIN_REL_RE, 'a plain relative path of the central workflow'),
     'central-sha': modeInput(['find-run'], /^[0-9a-f]{40}$/, 'a 40-character commit'),
     // how long find-run waits for a run in progress (C8): whole minutes, 1 to 360 (a job's own limit)
-    'timeout-minutes': modeInput(['find-run'], /^(?:[1-9]|[1-9][0-9]|[12][0-9]{2}|3[0-5][0-9]|360)$/, 'whole minutes, 1 to 360'),
+    'timeout-minutes': modeInput(['find-run'], TIMEOUT_MINUTES_RE, 'whole minutes, 1 to 360'),
+    // where the gate runs (C8 fix round 1): `inline` (the gate job is in pipegen.yml) or `central` (the per-project central workflow); the renderer
+    // knows it from the draft and the referee checks it. find-run never guesses it from the repository's visibility.
+    layout: modeInput(['find-run'], /^(?:inline|central)$/, 'inline or central'),
     // nightly
     'merged-at': modeInput(['nightly'], /^\d{4}-(?:0[1-9]|1[0-2])-(?:0[1-9]|[12]\d|3[01])(?:T\d{2}:\d{2}:\d{2}(?:\.\d{1,3})?Z)?$/, 'a date or an ISO time in UTC'),
   },
