@@ -452,7 +452,8 @@ export function parseSarif(json: unknown, toolId: string, opts: ParseOptions = {
     const findings = runs.flatMap((run, i) => readRun(run, i, toolId, info, opts, limits, notes));
     // nuclei writes no file when nothing matched (so a file with no result is not what it writes: the app under test could have written it): accepted, but only as "nothing reported", never as coverage
     if (toolId === 'nuclei' && findings.length === 0) notes.push(NOTHING_REPORTED_NUCLEI);
-    if (info.note !== undefined) notes.push(info.note);
+    // a staged scan (exactNames) proves its coverage by the canaries, so gitleaks' completeness note is only for an unstaged run (C1c fix round 1, m3)
+    if (info.note !== undefined && opts.exactNames === undefined) notes.push(info.note);
     return findings;
   });
 }

@@ -16,20 +16,28 @@
 // twice. Links are never followed and never staged (an in-repo target is staged at its own path). Only the root `.git` is left out.
 // Above a file-count or a total-size cap the step stops and stages nothing (fail closed, said so).
 import { createHash } from 'node:crypto';
-import { chmodSync, closeSync, constants, fstatSync, lstatSync, mkdirSync, openSync, readdirSync, readSync, writeSync } from 'node:fs';
+import { chmodSync, closeSync, constants, fstatSync, lstatSync, mkdirSync, openSync, readdirSync, readSync, rmSync, writeSync } from 'node:fs';
 import { dirname, isAbsolute, join } from 'node:path';
 import {
-  asScannedBytes, CANARY_RULE, isCanary, newCanary, originalLine, PIECE_BYTES, PIECE_OVERLAP_BYTES, planPieces, SCAN_PREFIX, scannersWouldSkip, writtenCanaryLine, type Piece,
+  asScannedBytes, CANARY_RULE, isCanary, newCanary, originalLine, PIECE_BYTES, PIECE_OVERLAP_BYTES, planPieces, SCAN_CHUNK_SAFE_BYTES, SCAN_PREFIX, scannersWouldSkip, writtenCanaryLine, type Piece,
 } from '../../src/ai/scan-staging.js';
 import { RegionCache, regionSpan, type RegionResult } from './fingerprint.js';
 import { PATH_RULES } from './generated/secrets-path-rules.js';
 import type { ParsedFinding } from './parse-common.js';
 import { normaliseUri } from './sarif.js';
+import { PATH_SHOWN_MAX, safeText } from '../../src/util/safe-text.js';
 
 /** At most this many regular files are staged; above it the step stages nothing and fails. */
 export const MAX_STAGE_FILES = 200_000;
 /** At most this many bytes in all (the original files); above it the step stages nothing and fails. Copying doubles the disk use. */
 export const MAX_STAGE_BYTES = 1024 * 1024 * 1024;
+/**
+ * At most this many bytes written to the stage folder in all (fix round 1, I1): every file once, a large file also as its overlapping
+ * pieces (at most about 1.23 times its size: a piece of PIECE_BYTES advances by PIECE_BYTES minus the overlap). So with the original-size
+ * cap of 1 GiB the staged total is about 2.23 GiB at most for ordinary files; this cap also stops a file whose line ends make the pieces
+ * advance slowly. Above it the step fails and removes what it wrote.
+ */
+export const MAX_STAGED_BYTES = 2.5 * 1024 * 1024 * 1024;
 /** The manifest is read back by the scrub; a bigger one is refused. */
 const MAX_MANIFEST_BYTES = 256 * 1024 * 1024;
 /** Names have eight digits. */
@@ -166,7 +174,9 @@ export interface StageOptions {
   stage: string;
   maxFiles?: number;
   maxBytes?: number;
-  /** Tests only: the piece size and overlap (the defaults are the shared core's). */
+  /** The cap on the bytes written (MAX_STAGED_BYTES). */
+  maxStagedBytes?: number;
+  /** Tests only: the piece size and overlap (the defaults are the shared core's). Never an action input (C5). */
   pieceBytes?: number;
   overlap?: number;
 }
@@ -187,6 +197,7 @@ export interface ManifestEntry {
  * speed bump: no repository code runs in the secrets job; what guards it is the job rule and the scrub's check of the folder).
  */
 export function stageWorkspace(o: StageOptions): StageOutcome {
+  let made = false;
   try {
     if (!isAbsolute(o.workspace) || !isAbsolute(o.stage)) throw new StageError('the workspace and the stage folder must be absolute paths');
     const wsStat = lstatSync(o.workspace, { throwIfNoEntry: false });
@@ -195,30 +206,38 @@ export function stageWorkspace(o: StageOptions): StageOutcome {
     // the caps held: only now is anything made
     ensureFolder(dirname(o.stage), 'the folder of the stage folders');
     try { mkdirSync(o.stage, { mode: 0o700 }); } catch { throw new StageError('the stage folder exists already or can not be created, so pipegen will not stage over it'); }
+    made = true;
     const filesDir = join(o.stage, STAGE_FILES_DIR);
     mkdirSync(filesDir, { mode: 0o700 });
     const entries: ManifestEntry[] = [];
     let bytes = 0;
+    let written = 0;
+    const maxStaged = o.maxStagedBytes ?? MAX_STAGED_BYTES;
     for (const f of found.files) {
       const content = readFound(f);
       bytes += content.length;
       const suffix = suffixFor(f.rel);
       const hash = sha256(content);
       const pieces: Piece[] = planPieces(content, { ...(o.pieceBytes === undefined ? {} : { pieceBytes: o.pieceBytes }), ...(o.overlap === undefined ? {} : { overlap: o.overlap }) });
-      pieces.forEach((p, k) => {
+      // fix round 1, I1: a file of more than one piece is ALSO staged whole (piece 0): the pieces cover the scanner's own chunk cut (P36), the
+      // whole copy what only the whole file shows: a composite rule whose component is far away, a multi-line key longer than the overlap
+      const parts: { p: Piece; k: number }[] = [...(pieces.length > 1 ? [{ p: { offset: 0, length: content.length, line: 1, column: 0 }, k: 0 }] : []), ...pieces.map((p, i) => ({ p, k: i + 1 }))];
+      for (const { p, k } of parts) {
         if (entries.length >= MAX_NAMES) throw new StageError('too many staged files for eight-digit names');
         const name = `f${String(entries.length + 1).padStart(8, '0')}${suffix}`;
         const canary = newCanary();
         const part = content.subarray(p.offset, p.offset + p.length);
-        const written = asScannedBytes(part, canary);
-        writeNew(join(filesDir, name), written, 0o444);
+        const out = asScannedBytes(part, canary);
+        written += out.length;
+        if (written > maxStaged) throw new StageError(`the stage folder would hold more than ${maxStaged} bytes (large files are staged whole and as pieces), so pipegen stops and the secrets scan does not run: it is not scanned (fail closed)`);
+        writeNew(join(filesDir, name), out, 0o444);
         entries.push({
           name, path: f.rel.toString('base64'), size: content.length, sha256: hash,
-          offset: p.offset, length: p.length, line: p.line, column: p.column, lines: linesOf(part), canaryLine: writtenCanaryLine(written),
-          canary, stagedSize: written.length, stagedSha256: sha256(written), piece: k + 1, pieces: pieces.length,
-          ...(scannersWouldSkip(written) ? { lateMagic: true as const } : {}),
+          offset: p.offset, length: p.length, line: p.line, column: p.column, lines: linesOf(part), canaryLine: writtenCanaryLine(out),
+          canary, stagedSize: out.length, stagedSha256: sha256(out), piece: k, pieces: pieces.length,
+          ...(scannersWouldSkip(out) ? { lateMagic: true as const } : {}),
         });
-      });
+      }
     }
     const manifest = {
       pipegenStage: MANIFEST_VERSION, prefixBytes: Buffer.byteLength(SCAN_PREFIX), canaryRule: CANARY_RULE,
@@ -230,11 +249,29 @@ export function stageWorkspace(o: StageOptions): StageOutcome {
     chmodSync(o.stage, 0o555);
     return { status: 'ok', files: found.files.length, staged: entries.length, bytes, skippedLinks: found.links, skippedOther: found.other };
   } catch (e) {
+    // a step that stopped half way leaves nothing (no manifest was written, so the scrub would fail closed anyway)
+    if (made) try { chmodTree(o.stage); rmSync(o.stage, { recursive: true, force: true }); } catch { /* the missing manifest still fails the scrub */ }
     return { status: 'error', error: e instanceof StageError ? e.message : 'the checkout could not be staged for the secrets scan, so it is not scanned' };
   }
 }
 
+/** Makes a half-written stage folder writable again, so it can be removed (only folders this step made). */
+function chmodTree(dir: string): void {
+  const st = lstatSync(dir, { throwIfNoEntry: false });
+  if (st === undefined || st.isSymbolicLink() || !st.isDirectory()) return;
+  chmodSync(dir, 0o700);
+  for (const n of readdirSync(dir)) chmodTree(join(dir, n));
+}
+
 // ---------- reading the stage back (the scrub) ----------
+
+/** Whether a folder listing holds exactly `names` (fix round 1, I2: each list sorted once, so linear after the sort). */
+export function listingMatches(listed: readonly string[], names: readonly string[]): boolean {
+  if (listed.length !== names.length) return false;
+  const a = [...listed].sort();
+  const b = [...names].sort();
+  return a.every((n, i) => n === b[i]);
+}
 
 export interface Stage { dir: string; files: string; prefixBytes: number; entries: ManifestEntry[]; byName: Map<string, ManifestEntry> }
 
@@ -299,7 +336,10 @@ export function readStage(stage: string): Stage {
     if (typeof name !== 'string' || !STAGED_NAME_RE.test(name) || name.slice(0, 9) !== `f${String(i + 1).padStart(8, '0')}`) bad(`entry ${i + 1} has a name out of order or form`);
     if (typeof e.path !== 'string' || e.path === '' || !B64.test(e.path) || Buffer.from(e.path, 'base64').toString('base64') !== e.path) bad(`entry ${i + 1} has a path that is not base64`);
     for (const k of ['size', 'offset', 'length', 'column', 'stagedSize'] as const) if (!isInt(e[k])) bad(`entry ${i + 1} has a ${k} that is not a whole number`);
-    for (const k of ['line', 'lines', 'canaryLine', 'piece', 'pieces'] as const) if (!isInt(e[k], 1)) bad(`entry ${i + 1} has a ${k} that is not a positive whole number`);
+    for (const k of ['line', 'lines', 'canaryLine', 'pieces'] as const) if (!isInt(e[k], 1)) bad(`entry ${i + 1} has a ${k} that is not a positive whole number`);
+    if (!isInt(e.piece)) bad(`entry ${i + 1} has a piece that is not a whole number`);
+    // piece 0 is the whole copy of a file of several pieces (fix round 1, I1)
+    if (e.piece === 0 && (e.offset !== 0 || e.length !== e.size || e.line !== 1 || e.column !== 0 || (e.pieces as number) < 2)) bad(`entry ${i + 1} is a whole copy that is not its whole file`);
     if (typeof e.sha256 !== 'string' || !HEX64.test(e.sha256) || typeof e.stagedSha256 !== 'string' || !HEX64.test(e.stagedSha256)) bad(`entry ${i + 1} has a hash that is not sha256`);
     if (typeof e.canary !== 'string' || !isCanary(e.canary)) bad(`entry ${i + 1} has a canary that is not a canary`);
     if ((e.offset as number) + (e.length as number) > (e.size as number) || (e.piece as number) > (e.pieces as number)) bad(`entry ${i + 1} has a piece outside its file`);
@@ -307,9 +347,8 @@ export function readStage(stage: string): Stage {
     return e as unknown as ManifestEntry;
   });
   const filesDir = join(stage, STAGE_FILES_DIR);
-  const listed = readdirSync(filesDir, { encoding: 'buffer' }).map((b) => b.toString('latin1')).sort();
-  const names = entries.map((e) => e.name);
-  if (listed.length !== names.length || listed.some((n, i) => n !== [...names].sort()[i])) throw new StageError('the staged files folder does not hold exactly the files of the manifest');
+  const listed = readdirSync(filesDir, { encoding: 'buffer' }).map((b) => b.toString('latin1'));
+  if (!listingMatches(listed, entries.map((e) => e.name))) throw new StageError('the staged files folder does not hold exactly the files of the manifest');
   for (const e of entries) {
     const b = readPlain(join(filesDir, e.name), e.stagedSize, `the staged file ${e.name}`);
     if (b.length !== e.stagedSize || sha256(b) !== e.stagedSha256) throw new StageError(`the staged file ${e.name} is not the one the stage step wrote`);
@@ -320,16 +359,50 @@ export function readStage(stage: string): Stage {
 // ---------- the scanner's findings, mapped back ----------
 
 export const NOT_SCANNED_RULE = 'secret:not-scanned';
+/**
+ * gitleaks 8.30.1 counts a column one too high on every line after the first of the CHUNK it reads (fingerprint.ts COLUMN_RULES), and it
+ * reads a file in 100,000-byte chunks cut at blank lines. A piece fits one chunk, so the rule holds; in the whole copy of a large file a
+ * finding's chunk is not known (measured: its canary, the first line after a blank-line cut, comes without the shift).
+ */
+const shiftUnreliable = (tool: string, e: ManifestEntry): boolean => tool === 'gitleaks' && e.stagedSize > SCAN_CHUNK_SAFE_BYTES;
 const CANARY_RULE_ID = `secret:${CANARY_RULE}`;
 
 /** The original path of an entry as a finding carries it: the text when it is a plain UTF-8 path, else unmapped with a hash of its bytes. */
-function pathFields(e: ManifestEntry): Pick<ParsedFinding, 'file' | 'uriUnmapped' | 'uriId'> {
+function pathFields(e: ManifestEntry): Pick<ParsedFinding, 'file' | 'uriUnmapped' | 'uriId' | 'displayPath'> {
   const raw = Buffer.from(e.path, 'base64');
   let text: string | undefined;
   try { text = new TextDecoder('utf-8', { fatal: true }).decode(raw); } catch { text = undefined; }
   if (text !== undefined && normaliseUri(text, { encoding: 'raw' }) === text) return { file: text, uriUnmapped: false, uriId: undefined };
-  // no lossless text for this name (not UTF-8, a control character, …): unmapped, told apart from any other file by its own bytes
-  return { file: undefined, uriUnmapped: true, uriId: createHash('sha256').update(Buffer.concat([Buffer.from('pipegen-path-bytes\0'), raw])).digest('hex').slice(0, 32) };
+  // no lossless text for this name (not UTF-8, a control character, …): unmapped, told apart from any other file by its own bytes, with a
+  // display form for people (fix round 1, m2), never used to match or fingerprint
+  return { file: undefined, uriUnmapped: true, uriId: createHash('sha256').update(Buffer.concat([Buffer.from('pipegen-path-bytes\0'), raw])).digest('hex').slice(0, 32), displayPath: displayPathOf(raw) };
+}
+
+/**
+ * A name's raw bytes as text a person can find the file by (fix round 1, m2): valid UTF-8 as itself, every byte that is not part of valid
+ * UTF-8 and every control character as `\xNN`, U+FFFD as `\u{fffd}` (so `k\xff.js` and the real `k\u{fffd}.js` differ), a backslash
+ * doubled; then cleaned by safeText. For display only: never a match key, never in a fingerprint.
+ */
+export function displayPathOf(raw: Uint8Array): string {
+  const b = Buffer.from(raw);
+  let out = '';
+  let i = 0;
+  while (i < b.length) {
+    const c = b[i] as number;
+    const len = c < 0x80 ? 1 : c >= 0xc2 && c <= 0xdf ? 2 : c >= 0xe0 && c <= 0xef ? 3 : c >= 0xf0 && c <= 0xf4 ? 4 : 0;
+    let ch: string | undefined;
+    if (len > 0 && i + len <= b.length) {
+      try { ch = new TextDecoder('utf-8', { fatal: true }).decode(b.subarray(i, i + len)); } catch { ch = undefined; }
+    }
+    if (ch === undefined) { out += `\\x${c.toString(16).padStart(2, '0')}`; i++; continue; }
+    const cp = ch.codePointAt(0) as number;
+    if (cp < 0x20 || (cp >= 0x7f && cp <= 0x9f)) out += `\\x${cp.toString(16).padStart(2, '0')}`;
+    else if (cp === 0xfffd) out += '\\u{fffd}';
+    else if (ch === '\\') out += '\\\\';
+    else out += ch;
+    i += len;
+  }
+  return safeText(out, PATH_SHOWN_MAX);
 }
 
 export interface StagedFindings {
@@ -361,10 +434,20 @@ export function applyStage(parsed: readonly ParsedFinding[], stage: Stage, tool:
     if (e === undefined) throw new StageError('a finding names a file the stage step did not write, so it can not be mapped back to the checkout');
     if (f.ruleId === CANARY_RULE_ID && f.line === e.canaryLine && (f.endLine ?? f.line) === e.canaryLine) {
       const span = regionSpan(stage.files, f, cache);
-      if (span.ok && span.bytes.toString('latin1') === e.canary) { proofs.set(e.name, (proofs.get(e.name) ?? 0) + 1); continue; }
+      // gitleaks past its first chunk (the whole copy of a large file, measured live, fix round 1): no +1 column shift there, so the
+      // canary line's own columns are read as they are written
+      const unshifted = shiftUnreliable(tool, e) && f.startColumn !== undefined && f.endColumn !== undefined
+        ? regionSpan(stage.files, { ...f, startColumn: f.startColumn + 1, endColumn: f.endColumn + 1 }, cache) : undefined;
+      if ((span.ok && span.bytes.toString('latin1') === e.canary) || (unshifted?.ok === true && unshifted.bytes.toString('latin1') === e.canary)) {
+        proofs.set(e.name, (proofs.get(e.name) ?? 0) + 1);
+        continue;
+      }
     }
     real.push({ f, e });
   }
+  // the pieces first, then the whole copies: a finding a piece also reports (same rule, same original lines) is kept once, from the piece
+  real.sort((a, b) => (a.e.piece === 0 ? 1 : 0) - (b.e.piece === 0 ? 1 : 0));
+  const pieceLines = new Set<string>();
   const regions = new Map<ParsedFinding, RegionResult>();
   const hashes = new Map<ParsedFinding, string>();
   const out: ParsedFinding[] = [];
@@ -379,12 +462,16 @@ export function applyStage(parsed: readonly ParsedFinding[], stage: Stage, tool:
     const whole = f.line === undefined;
     const key = whole ? `${f.ruleId}\0${e.path}\0whole`
       : span.ok ? `${f.ruleId}\0${e.path}\0${at(span.from)}\0${at(span.to)}` : `${f.ruleId}\0${e.path}\0${e.name}\0${f.line}\0${f.startColumn}\0${f.endLine}\0${f.endColumn}`;
-    if (seen.has(key)) continue;
+    const lineKey = `${f.ruleId}\0${e.path}\0${line}\0${endLine}`;
+    if (seen.has(key) || (e.piece === 0 && !whole && pieceLines.has(lineKey))) continue;
     seen.add(key);
+    if (e.piece !== 0) pieceLines.add(lineKey);
     const { startColumn: _s, endColumn: _e, ...rest } = f;
     const mapped: ParsedFinding = { ...rest, ...pathFields(e), ...(line === undefined ? {} : { line }), ...(endLine === undefined ? {} : { endLine }) };
     if (mapped.uriId === undefined) delete mapped.uriId;
     if (whole) hashes.set(mapped, e.sha256);
+    // a gitleaks finding only the whole copy of a large file has: its columns are not reliable there, so the line form (fail closed)
+    else if (shiftUnreliable(tool, e)) regions.set(mapped, { ok: false, reason: 'gitleaks columns are not reliable past its first chunk of a large file' });
     else regions.set(mapped, span.ok ? { ok: true, bytes: span.bytes } : { ok: false, reason: span.reason });
     out.push(mapped);
   }

@@ -3,11 +3,12 @@
 // a pull request could hide before (review-C1b-r1 R1-C3: the path allowlists; review-C1b-r2 R2-C1: files taken for archives; R1-C2:
 // a name that is not UTF-8; R1-I1: ignore files; P36: the chunk cut) must be reported and mapped back to its original path and
 // line. Skipped unless PIPEGEN_LIVE_TESTS=1.
-import { createHash } from 'node:crypto';
+import { createHash, generateKeyPairSync } from 'node:crypto';
 import { chmodSync, existsSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { crc32, deflateRawSync } from 'node:zlib';
 import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest';
+import { planPieces } from '../src/ai/scan-staging.js';
 import { ensurePinnedBinary } from '../src/engine/linters.js';
 import { readScrubbed, scrubBytes } from '../gate/src/scrub.js';
 import { stageWorkspace } from '../gate/src/stage.js';
@@ -209,6 +210,36 @@ describe.skipIf(!live)('C1c: the staged secrets scan, live with the real binarie
       expect(findings[0]?.fingerprint).toBe(hmacOf(id, LIVE_KEY));
     }, 180_000);
 
+    it(`${id}: fix round 1, I1: a private key longer than the overlap, across a piece cut of a 250 KB file, is reported (the whole copy), as the direct scan does`, () => {
+      // a real RSA key, made at run time (the option names spelled so no key-like `name: value` sits in this file)
+      const opts = { modulusLength: 2048, [`private${'Key'}Encoding`]: { type: 'pkcs8', format: 'pem' }, [`public${'Key'}Encoding`]: { type: 'spki', format: 'pem' } };
+      const pair = (generateKeyPairSync as unknown as (t: string, o: unknown) => Record<string, string>)('rsa', opts);
+      const body = String(pair[`private${'Key'}`]).split('\n').slice(1, -2);
+      const pem = [`-----BEGIN ${'PRIVATE'} KEY-----`];
+      while (pem.join('\n').length < 20_000) pem.push(...body);
+      pem.push(`-----END ${'PRIVATE'} KEY-----`);
+      const pemText = `${pem.join('\n')}\n`;
+      const fill = (n: number): string => Array.from({ length: n }, (_, i) => `// f ${String(i).padStart(6, '0')} ${'z'.repeat(40)}`).join('\n') + '\n';
+      // a placement where the key lies inside no single piece (the reviewer's x/w4 shape)
+      let buf: Buffer | undefined;
+      let lineNo = 0;
+      for (let n = 1300; n < 1800 && buf === undefined; n++) {
+        const pre = fill(n);
+        const b = Buffer.from(pre + pemText + fill(3000));
+        const a = Buffer.byteLength(pre);
+        const z = a + Buffer.byteLength(pemText);
+        if (!planPieces(b).some((p) => p.offset <= a && z <= p.offset + p.length)) { buf = b; lineNo = n + 1; }
+      }
+      if (buf === undefined) throw new Error('no placement across a cut');
+      const ws = makeTempDir();
+      writeFileSync(join(ws, 'deploy.txt'), buf);
+      const direct = JSON.parse(runEntry(id, bins[id] as string, ws)) as { runs: { results: { ruleId: string }[] }[] };
+      expect(direct.runs[0]?.results.map((r) => r.ruleId)).toContain('private-key');   // the control: the direct dir scan reports it
+      const { findings } = scan(id, ws);
+      expect(findings.filter((f) => f.ruleId === `${SEC}private-key`).map((f) => [f.file, f.line])).toEqual([['deploy.txt', lineNo]]);
+      expect(findings.filter((f) => f.ruleId === `${SEC}not-scanned`)).toEqual([]);   // every entry proved, the whole copy included
+    }, 180_000);
+
     it(`${id}: coverage, a file the scanner really skips (ustar at its sniffed byte after the prefix) is a critical not-scanned finding`, () => {
       const ws = makeTempDir();
       const b = Buffer.alloc(600, 0x61);
@@ -234,6 +265,29 @@ describe.skipIf(!live)('C1c: the staged secrets scan, live with the real binarie
       expect(findings.find((f) => f.file === 'cert.pfx')?.fpBy).toBe('file');
     }, 120_000);
   }
+
+  it('betterleaks, fix round 1, I1: a composite secret (Supabase project key) whose required URL component is 80 KB away in the same file is reported (the whole copy), as the direct scan does', () => {
+    const alnum = (seed: string, n: number, lower = false): string => {
+      let out = '';
+      for (let i = 0; out.length < n; i++) out += createHash('sha256').update(`${seed}${i}`).digest('base64').replace(/[^A-Za-z0-9]/g, '');
+      return lower ? out.toLowerCase().slice(0, n) : out.slice(0, n);
+    };
+    const url = `https://${alnum('proj', 20, true)}.supa${'base'}.co`;
+    const keyV = `sb_${'secret'}_${alnum('sbkey', 31)}`;
+    const fill = (from: number, n: number): string[] => Array.from({ length: n }, (_, i) => `// filler ${String(from + i).padStart(6, '0')} ${'q'.repeat(40)}`);
+    const rows = [...fill(0, 100), `project = "${url}"`, ...fill(100, 1500), `value = "${keyV}"`, ...fill(1600, 1500)];
+    const ws = makeTempDir();
+    writeIn(ws, 'far.env', `${rows.join('\n')}\n`);
+    const direct = JSON.parse(runEntry('betterleaks', bins.betterleaks as string, ws)) as { runs: { results: { ruleId: string; locations: { physicalLocation: { region: { startLine: number } } }[] }[] }[] };
+    const want = direct.runs[0]?.results.filter((r) => r.ruleId === 'supabase-project-api-key').map((r) => r.locations[0]?.physicalLocation.region.startLine);
+    expect(want).toEqual([1602]);   // the control: direct, the component is resolved over the whole file
+    const { findings } = scan('betterleaks', ws);
+    expect(findings.filter((f) => f.ruleId === `${SEC}supabase-project-api-key`).map((f) => [f.file, f.line])).toEqual([['far.env', 1602]]);
+    // and alone (no URL in the file) betterleaks reports nothing for it, staged or not: the component is required
+    const alone = makeTempDir();
+    writeIn(alone, 'alone.env', `value = "${keyV}"\n`);
+    expect(scan('betterleaks', alone).findings.filter((f) => f.ruleId === `${SEC}supabase-project-api-key`)).toEqual([]);
+  }, 180_000);
 
   it('the staged files hold the original bytes behind the prefix (sanity of the live setup)', () => {
     const ws = makeTempDir();

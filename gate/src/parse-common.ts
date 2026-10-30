@@ -35,6 +35,8 @@ export function limitsFrom(partial: Partial<ParseLimits> | undefined): ParseLimi
  */
 export interface ParsedFinding extends Omit<Finding, 'fingerprint'> {
   uriUnmapped: boolean; method?: string; secret: boolean; startColumn?: number; endLine?: number; endColumn?: number; uriId?: string;
+  /** C1c fix round 1: a staged file whose name has no lossless text: its raw bytes in a display form, for people only (never matched or hashed). */
+  displayPath?: string;
 }
 
 /** `toolError` is set when the scan cannot be called clean (then `findings` is empty). `notes` are for people. */

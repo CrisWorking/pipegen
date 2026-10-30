@@ -128,7 +128,11 @@ function sarifOut(tool: string, findings: readonly FingerprintedFinding[], notes
       message: { text: writtenMessage(f) },
       ...(Object.keys(loc).length === 0 ? {} : { locations: [{ physicalLocation: loc }] }),
       partialFingerprints: { pipegenFingerprint: f.fingerprint },
-      properties: { pipegenSeverity: f.severity, pipegenSecret: f.secret, pipegenUnmapped: f.uriUnmapped || hide, pipegenPathWithheld: hide, pipegenFpBy: f.fpBy },
+      properties: {
+        pipegenSeverity: f.severity, pipegenSecret: f.secret, pipegenUnmapped: f.uriUnmapped || hide, pipegenPathWithheld: hide, pipegenFpBy: f.fpBy,
+        // C1c fix round 1: the display form of a staged name with no lossless text (withheld like a path when it looks like a secret)
+        ...(f.file === undefined && f.displayPath !== undefined && !withheld(f.displayPath) ? { pipegenDisplayPath: clip(f.displayPath, 4096) } : {}),
+      },
     };
   });
   return JSON.stringify({
@@ -248,6 +252,8 @@ export interface ScrubbedFinding {
   secret: boolean; fpBy: FpBy; uriUnmapped: boolean;
   /** The path looked like a secret and was not written (`file` is then absent and `uriUnmapped` is true). */
   pathWithheld: boolean;
+  /** C1c fix round 1: for a staged file whose name has no lossless text, a display form of its bytes (people only; never a match key). */
+  displayPath?: string;
   method?: string;
 }
 export interface ScrubbedResult { findings: ScrubbedFinding[]; keyId?: string; notes: string[]; toolError?: string }
@@ -329,6 +335,7 @@ export function readScrubbed(input: string | Uint8Array, format: ScrubFormat, ma
         return {
           tool, ruleId: str(r, 'ruleId', at), severity: severity as Severity, ...(file === undefined ? {} : { file }), ...(line === undefined ? {} : { line }), ...(endLine === undefined ? {} : { endLine }),
           message: str(msg, 'text', at), fingerprint, secret: bool(p, 'pipegenSecret', at), fpBy: fpBy as FpBy, uriUnmapped: bool(p, 'pipegenUnmapped', at), pathWithheld: optBool(p, 'pipegenPathWithheld', at),
+          ...(getOwn(p, 'pipegenDisplayPath') === undefined ? {} : { displayPath: str(p, 'pipegenDisplayPath', at) }),
         };
       });
       return { findings, ...(typeof id === 'string' ? { keyId: id } : {}), notes: readNotes(getOwn(props, 'pipegenNotes'), 'properties') };
