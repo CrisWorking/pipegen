@@ -136,6 +136,9 @@ export interface GateGithub {
    * includes up to 300 changed files for the entire comparison" (page/per_page page the commits). 300 files or more is incomplete.
    */
   compareFiles(owner: string, name: string, base: string, head: string): Promise<unknown>;
+  // NOTE (review-C5a-r1 r1-m1): compare and compareFiles are the SAME endpoint and must give the same answer for one range: facts.ts
+  // (compareOnce) asks each range once and hands that one answer to both. A client that pages or filters one of them differently must
+  // change compareOnce too.
   /** `GET .../collaborators/{login}/permission` → `{ permission, role_name }`; any error (404, 403, 5xx) is thrown. */
   collaboratorPermission(owner: string, name: string, login: string): Promise<unknown>;
   /** The raw text of a file (`GET .../contents/{path}?ref=` with `Accept: application/vnd.github.raw+json`), for files over 1 MiB; a 404 is `null`, any other error is thrown. */

@@ -22,6 +22,9 @@
 // and so no integrity check: it gets a settings error and never reports pass, because its same-named check could otherwise stand in for the
 // pull request's. (Plan G keeps the gate job out of such runs; this is the belt.)
 //
+// The head (fix round 2): on pull_request, pull_request_review and merge_group, the event's head commit must be github.sha or an ancestor of
+// it (compare head...github.sha: ahead or identical), else a settings error: the check lands on the head, so the head must have been scanned.
+//
 // One range is compared once (fix round 1, m6): the ancestry and the diff both read GET /compare/{base}...{github.sha} on a pull request, so
 // the answer is fetched once and both read it.
 import { expectedBaseOf, type CheckInput, type GateEvent, type GateInput, type PrDiff } from './decide.js';
@@ -136,6 +139,23 @@ export async function gatherGateInput(ctx: GateContext, client: GateGithub, io: 
   // only runs that see the pull request (or the queue, or the default branch itself) may decide a merge (I2)
   const pushToDefault = event.name === 'push' && at(payload, 'ref') === `refs/heads/${repo.defaultBranch}`;
   if (!(PR_EVENTS.has(event.name) || event.name === 'merge_group' || pushToDefault)) settings.errors.push(notAMergeRun(repo.defaultBranch, event.name));
+  // the scanned commit must contain the head the check lands on (fix round 2, review-C5a-r1 R1): on pull_request_review, github.sha is the
+  // PR's LAST merge commit, which can lag behind the head (a conflicted push makes no new one), so a review run could scan an old merge and
+  // put a green check on a head that was never scanned. head...github.sha must be `ahead` (a test merge is one commit past the head) or
+  // `identical` (a merge queue's head_sha is github.sha itself); anything else, or an error, blocks.
+  const eventHead = PR_EVENTS.has(event.name) ? at(payload, 'pull_request', 'head', 'sha') : event.name === 'merge_group' ? at(payload, 'merge_group', 'head_sha') : undefined;
+  if (PR_EVENTS.has(event.name) || event.name === 'merge_group') {
+    const head = sha40(eventHead);
+    const stale = 'the scanned commit does not contain the pull request\'s head: re-run the gate after GitHub has updated the merge commit';
+    if (head === undefined) settings.errors.push('the event payload has no head commit, so the scanned commit can not be tied to it');
+    else if (head !== sha) {
+      try {
+        const a = await gh.compare(repo.owner, repo.name, head, sha);
+        const status = isPlain(a) && Object.hasOwn(a, 'status') ? a.status : undefined;
+        if (status !== 'ahead' && status !== 'identical') settings.errors.push(stale);
+      } catch { settings.errors.push('whether the scanned commit contains the pull request\'s head could not be checked, so the gate fails closed'); }
+    }
+  }
   const mapped = mapJobs(settings.needs, settings.jobList);
   notes.push(...mapped.notes);
   const outputFile = new Map(ctx.reviewed.flatMap((t) => (t.outputFile === undefined ? [] : [[t.id, t.outputFile] as const])));

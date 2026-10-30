@@ -85,7 +85,9 @@ function world(): World {
       [GH_IN]: CRED, [FP_IN]: FPKEY,
     },
     // one map for compare and compareFiles: both are GET /compare/{base}...{head} (the same answer, status and files)
-    compare: new Map<string, unknown>([[`${BASE}...${MERGE}`, { status: 'ahead', files: [FILE_PATCH] }], [`${BASE}...${HEAD}`, { status: 'ahead', files: [] }]]),
+    compare: new Map<string, unknown>([[`${BASE}...${MERGE}`, { status: 'ahead', files: [FILE_PATCH] }], [`${BASE}...${HEAD}`, { status: 'ahead', files: [] }],
+      // fix round 2: the scanned merge commit contains the PR head (a test merge commit is one commit ahead of it)
+      [`${HEAD}...${MERGE}`, { status: 'ahead', files: [] }]]),
     files: [FILE_PATCH], reviews: [],
     pull: { number: 5, head: { sha: HEAD, repo: { id: 7 } }, base: { sha: BASE }, changed_files: 1, user: { login: 'author' } },
     contents: new Map<string, unknown>([[`${BASE}:.github/workflows/pipegen.yml`, b64('name: pipegen\n')], [`${BASE}:.github/CODEOWNERS`, b64('* @olga\n')]]),
@@ -294,7 +296,7 @@ describe('base facts: the base-scan commit equals this event\'s base and is an a
     const { input, gh } = await gather(w);
     // no ancestry asked for a base the scan did not check out (the one compare call left is the diff's)
     expect(input.ancestry).toBeNull();
-    expect(gh.calls.filter((c) => /^compare(?:Files)? /.test(c))).toHaveLength(1);
+    expect(gh.calls.filter((c) => /^compare(?:Files)? b\.\.\./.test(c))).toHaveLength(1);
     const r = decideGate(input);
     expect(r.notes.join(' ')).toMatch(/no base/);
   });
@@ -460,5 +462,60 @@ describe('fix round 1 (I2): only pull requests, merge queues and pushes to the d
       expect(r.pass, ev).toBe(false);
       expect(r.blockReasons.join(' '), ev).toMatch(/the gate runs on pull requests, merge queues and pushes to main; this .* run can't decide a merge/);
     }
+  });
+});
+
+// ---------- fix round 2 (review-C5a-r1 R1): the scanned commit must contain the head the check lands on ----------
+
+describe('fix round 2: the event\'s head commit is the scanned commit or an ancestor of it (compare head...github.sha)', () => {
+  const STALE = /the scanned commit does not contain the pull request's head/;
+  const blocked = async (w: World): Promise<string> => { const r = decideGate((await gather(w)).input); expect(r.pass).toBe(false); return r.blockReasons.join('\n'); };
+  it('pull_request: the head is in the merge commit (ahead) → passes, and the check was asked', async () => {
+    const { input, gh } = await gather(world());
+    expect(decideGate(input).pass).toBe(true);
+    expect(gh.calls).toContain('compare c...d');
+  });
+  it('pull_request: a merge commit that does not contain the head (behind, diverged, or an odd answer) → blocks', async () => {
+    for (const status of ['behind', 'diverged', undefined, 'AHEAD']) {
+      const w = world(); w.compare.set(`${HEAD}...${MERGE}`, { status });
+      expect(await blocked(w), String(status)).toMatch(STALE);
+    }
+  });
+  it('pull_request_review on a stale merge commit (a newer head that was never merged in) → blocks', async () => {
+    const w = reviewWorld();
+    const NEWER = 'e'.repeat(40);
+    (w.payload.pull_request as { head: { sha: string } }).head.sha = NEWER;
+    w.pull.head = { sha: NEWER, repo: { id: 7 } };
+    w.compare.set(`${NEWER}...${MERGE}`, { status: 'diverged' });
+    expect(await blocked(w)).toMatch(STALE);
+  });
+  it('pull_request_review: the head in the merge commit → passes (the control)', async () => {
+    expect(decideGate((await gather(reviewWorld())).input).pass).toBe(true);
+  });
+  it('merge_group: head_sha is github.sha (identical) → passes', async () => {
+    const w = world();
+    w.event = 'merge_group';
+    w.payload = { merge_group: { base_sha: BASE, head_sha: MERGE, base_ref: 'refs/heads/main' }, repository: w.payload.repository };
+    const { input } = await gather(w);
+    expect(decideGate(input).pass).toBe(true);
+    // and a queue head that is not in the scanned commit blocks
+    const v = world();
+    v.event = 'merge_group';
+    v.payload = { merge_group: { base_sha: BASE, head_sha: HEAD, base_ref: 'refs/heads/main' }, repository: v.payload.repository };
+    v.compare.set(`${HEAD}...${MERGE}`, { status: 'behind' });
+    expect(await blocked(v)).toMatch(STALE);
+  });
+  it('an API error on the check → blocks (the head can not be shown to be scanned)', async () => {
+    const w = world(); w.compare.delete(`${HEAD}...${MERGE}`);
+    expect(await blocked(w)).toMatch(/could not be checked|does not contain/);
+    const r = reviewWorld(); r.compare.delete(`${HEAD}...${MERGE}`);
+    expect(await blocked(r)).toMatch(/could not be checked|does not contain/);
+  });
+  it('a payload with no head commit on a pull request event → blocks', async () => {
+    const w = world(); (w.payload.pull_request as { head: { sha?: string } }).head.sha = undefined;
+    expect(await blocked(w)).toMatch(/no head commit, so the scanned commit can not be tied to it/);
+    const g = world(); g.event = 'merge_group';
+    g.payload = { merge_group: { base_sha: BASE, base_ref: 'refs/heads/main' }, repository: g.payload.repository };
+    expect(await blocked(g)).toMatch(/no head commit, so the scanned commit can not be tied to it/);
   });
 });
