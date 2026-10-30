@@ -58,6 +58,10 @@ export const BASELINE_RETENTION_DAYS = 90;
 /** The run list is read for at most this many pages of 100, and at most this many TRUSTED runs are searched for an artifact. */
 export const MAX_RUN_PAGES = 5;
 export const RUNS_PER_PAGE = 100;
+/**
+ * Baseline lookup worst case (review-C3-r2 CF5): about 43 calls = 5 run pages + tag + tip + 15 trusted runs x 2 (compare, artifact list)
+ * + up to 5 failing compares (HISTORY_CHECK_CAP 20 - 15) + 1 download. The 38 that C3 first stated left out interleaved history failures.
+ */
 export const MAX_TRUSTED_RUNS = 15;
 /** At most this many default-history checks (two API calls each, plus the tag check) per lookup; hitting the cap fails closed. */
 export const HISTORY_CHECK_CAP = 20;
@@ -70,7 +74,9 @@ export const HISTORY_CHECK_CAP = 20;
 export const MARKER_WINDOW = 10;
 /**
  * Only TRUSTED runs count toward the window (fix round 3): runs that look valid but fail the default-history check never use it up.
- * They have their own cap: reaching it is an anomaly (unknown). Worst case per marker lookup, now:
+ * They are skipped without spending the window. HISTORY_FAIL_CAP only counts them BEFORE the first trusted run, where a burst is an
+ * anomaly (unknown). Every history check, trusted or not, draws on one compare budget of MARKER_WINDOW + HISTORY_FAIL_CAP; running out
+ * before the window is full or the list ends is unknown, never none. Worst case per marker lookup, now:
  * 5 pages + tag + tip + 3 x MARKER_WINDOW (compare, artifact list, download) + HISTORY_FAIL_CAP compares = 40.
  */
 export const HISTORY_FAIL_CAP = 3;
@@ -389,7 +395,10 @@ async function walk<T>(gh: GateGithub, repo: RepoRef, ctx: VerifyContext, artifa
         if (j.why === 'untrusted') continue;
         if (j.why === 'history') {
           historyFails++;
-          if (window !== undefined && historyFails >= HISTORY_FAIL_CAP) { notes.push(`${historyFails} runs look valid but fail the default-history check (cap ${HISTORY_FAIL_CAP})`); st.incomplete = true; return undefined; }
+          // Only BEFORE the first trusted run is a burst of failures an early unknown. After one they are skipped like any untrusted run: they
+          // never end the search as `none` (a writer could hide a marker behind them) and never spend the window. The compare budget
+          // (window + HISTORY_FAIL_CAP) is the hard stop: running out before the window is full or the list ends is `unknown` (the 'cap' case).
+          if (window !== undefined && trustedSeen === 0 && historyFails >= HISTORY_FAIL_CAP) { notes.push(`${historyFails} runs look valid but fail the default-history check (cap ${HISTORY_FAIL_CAP})`); st.incomplete = true; return undefined; }
           continue;
         }
         st.incomplete = true;

@@ -1185,3 +1185,57 @@ describe('fix round 3: history failures do not use up the marker window; a cut l
     expect(gh.calls.length).toBe(1 + 2 + 2 + 30);
   });
 });
+
+describe('Part 0 (review-C3-r2 CF1, CF4; coordinator revision): failing runs are skipped, never turned into none', () => {
+  const cart = (id: number, runId: number) => art(id, runId, {}, CLEAN_RUN_ARTIFACT);
+  const sha = (i: number): string => (1000 + i).toString(16).padStart(40, 'a');
+  const markerOf = (runId: number): Record<string, unknown> => ({ runId, keyId: keyId(KEY), mac: markerMac(KEY, runId, keyId(KEY)) });
+  const runsOf = (n: number): Record<string, unknown>[] => Array.from({ length: n }, (_, i) => run({ id: 10_000 - i, head_sha: sha(i) }));
+  const orphan = (gh: FakeGh, from: number, to: number): void => { for (let i = from; i < to; i++) gh.compares.set(sha(i), { status: 'diverged' }); };
+  it('force-push leftovers after fresh trusted runs, no marker, the list ends → none (warn)', async () => {
+    for (const [fresh, orphans] of [[1, 8], [4, 8], [9, 4]] as const) {
+      const gh = world([], runsOf(fresh + orphans), []);
+      orphan(gh, fresh, fresh + orphans);
+      const r = await cleanRunSeen(gh, REPO, CTX);
+      expect(r.state, `${fresh} fresh`).toBe('none');
+      expect(resolveMode(undefined, '2099-01-01', NOW, r.seen), `${fresh} fresh`).toBe('warn');
+      expect(gh.calls.length, `${fresh} fresh`).toBeLessThanOrEqual(40);
+    }
+  });
+  it('the scan interleave: a trusted run, 3 history-failing runs, then the marker → seen (a writer cannot downgrade block to warn)', async () => {
+    const runs = runsOf(5);
+    const gh = world([cart(1, runs[4]?.id as number)], runs, [[1, markerOf(runs[4]?.id as number)]]);
+    orphan(gh, 1, 4);
+    expect((await cleanRunSeen(gh, REPO, CTX)).state).toBe('seen');
+  });
+  it('the marker in a trusted run newer than the orphans is found', async () => {
+    const runs = runsOf(10);
+    const gh = world([cart(1, runs[0]?.id as number)], runs, [[1, markerOf(runs[0]?.id as number)]]);
+    orphan(gh, 2, 10);
+    expect((await cleanRunSeen(gh, REPO, CTX)).state).toBe('seen');
+  });
+  it('many failures that use up the compare budget before the window fills → unknown, never none, within 40 calls', async () => {
+    const gh = world([], runsOf(40), []);
+    orphan(gh, 1, 40);   // run 0 is trusted, the rest fail
+    const r = await cleanRunSeen(gh, REPO, CTX);
+    expect(r.state).toBe('unknown');
+    expect(gh.calls.length).toBeLessThanOrEqual(40);
+    expect(resolveMode(undefined, '2099-01-01', NOW, r.state === 'unknown' ? 'unknown' : r.seen)).toBe('block');
+  });
+  it('a burst of HISTORY_FAIL_CAP failures BEFORE any trusted run is still unknown, even when trusted runs follow', async () => {
+    const gh = world([], runsOf(12), []);
+    orphan(gh, 0, 3);
+    const r = await cleanRunSeen(gh, REPO, CTX);
+    expect(r.state).toBe('unknown');
+    expect(r.note).toMatch(/fail the default-history check/);
+  });
+  it('CF4: a list that ends with only failing runs and no trusted run (1 or 2, a true end) → unknown, never none', async () => {
+    for (const n of [1, 2]) {
+      const gh = world([], runsOf(n), []);
+      orphan(gh, 0, n);
+      const r = await cleanRunSeen(gh, REPO, CTX);
+      expect(r.state, String(n)).toBe('unknown');
+      expect(r.note, String(n)).toMatch(/none passes/);
+    }
+  });
+});
