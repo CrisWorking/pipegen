@@ -157,6 +157,10 @@ describe('resolveSettings: every input parsed strictly (each error blocks)', () 
       expect(s.policy, v).toEqual(DEFAULT_POLICY);
     }
   });
+  it('policy (private): over 200,000 characters is refused before parsing (fix round 1, m7)', () => {
+    const big = `${JSON.stringify({ block: ['critical', 'high'], warn: ['medium'] })}${' '.repeat(200_001)}`;   // a valid policy, padded
+    expect(errs({ policy: big })).toMatch(/policy/);
+  });
   it('protected-paths and service-roots: plain relative paths only', () => {
     for (const v of ['x', '["../x"]', '["/etc"]', '["-x"]', '[1]', '["a b"]']) {
       expect(errs({ 'protected-paths': v }), v).toMatch(/protected-paths/);
@@ -201,7 +205,7 @@ describe('mapJobs: toJSON(needs) read through the trusted job list', () => {
     expect(m.checks[1]?.baseOutputs).toEqual({ status: 'ok', sha256: SHA64('f'), error: '' });
     expect(m.checks[3]?.outputs).toEqual({});
     expect(m.baseScan).toEqual({ result: 'success', commit: BASE });
-    expect(m.missingRequired).toEqual([]);
+    expect('missingRequired' in m).toBe(false);   // fix round 1 (m4): decide reads a missing job from its result alone
   });
   it('jobs: blocking and needsSecrets taken from the job list, not from the needs object', () => {
     const needs = { ...NEEDS, [SJ]: { ...NEEDS[SJ], blocking: false, [K_NS]: true, needId: 'other', tool: 'none' } };
@@ -213,9 +217,14 @@ describe('mapJobs: toJSON(needs) read through the trusted job list', () => {
     const { 'sast--app': _gone, ...rest } = NEEDS;
     const m = mapJobs(rest, LIST);
     expect(m.checks[1]?.result).toBe('missing');
-    expect(m.missingRequired).toEqual(['sast--app']);
-    const nonBlocking = mapJobs(rest, [LEAKS, { ...SAST, blocking: false }]);
-    expect(nonBlocking.missingRequired).toEqual([]);
+    const input = (checks: typeof m.checks): GateInput => ({
+      event: { name: 'push', sha: 'c'.repeat(40), payload: { before: BASE, after: 'c'.repeat(40), repository: { id: 7 } } }, checks: checks.map(({ baseOutputs: _b, ...c }) => c),
+      baseScan: null, ancestry: null, baseline: null, sameRunTools: [], installing: false, diff: null, rangeScans: [], mode: 'warn', policy: DEFAULT_POLICY,
+      notProvenNeeds: [], skipped: [], settingsErrors: [], integrity: [], floorNeeds: [],
+    });
+    expect(decideGate(input([m.checks[1] as (typeof m.checks)[number]])).failedJobs.map((f) => [f.job, f.reason])).toEqual([['sast--app', 'missing']]);
+    const nonBlocking = mapJobs(rest, [{ ...SAST, blocking: false }]);
+    expect(nonBlocking.checks[0]?.result).toBe('missing');
   });
   it('jobs: tool-error status output → tool error, not a finding', () => {
     const needs = { ...NEEDS, 'sast--app': { result: 'failure', outputs: outs('pipegen-out-sast--app', 'tool-error', '') } };

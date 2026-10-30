@@ -147,6 +147,44 @@ describe('readZipEntry: exactly one regular file of the expected name', () => {
   });
 });
 
+describe('fix round 1 (review I3 d–h): each zip guard has a case that only it refuses', () => {
+  /** A copy of a zip with the 32-bit field at the central directory entry's offset `off` set to `v`. */
+  const patchCentral = (z: Uint8Array, off: number, v: number): Uint8Array => {
+    const b = Buffer.from(z);
+    const eocd = b.lastIndexOf(Buffer.from([0x50, 0x4b, 0x05, 0x06]));
+    const cd = b.readUInt32LE(eocd + 16);
+    b.writeUInt32LE(v >>> 0, cd + off);
+    return new Uint8Array(b);
+  };
+  it('d: a directory entry that puts the file anywhere but offset 0 is refused (even when offset 0 holds it)', () => {
+    const z = zipOf('a.sarif', SARIF);
+    expect(readZipEntry(z, {}).ok).toBe(true);
+    expect(readZipEntry(patchCentral(z, 42, 5), {}).ok).toBe(false);
+  });
+  it('e: a central directory longer than its one entry (junk inside it, the end record still saying one) is refused', () => {
+    const b = Buffer.from(zipOf('a.sarif', SARIF));
+    const eocd = b.lastIndexOf(Buffer.from([0x50, 0x4b, 0x05, 0x06]));
+    const junk = Buffer.alloc(24, 0x41);
+    const out = Buffer.concat([b.subarray(0, eocd), junk, b.subarray(eocd)]);
+    const e2 = eocd + junk.length;
+    out.writeUInt32LE(out.readUInt32LE(e2 + 12) + junk.length, e2 + 12);   // the directory size now covers the junk
+    expect(readZipEntry(new Uint8Array(out), {}).ok).toBe(false);
+  });
+  it('f: a stored entry with no data descriptor and bytes before the directory is refused', () => {
+    expect(readZipEntry(makeZip({ entries: [{ name: 'a.sarif', data: SARIF, method: 0 }] }), {}).ok).toBe(true);
+    expect(readZipEntry(makeZip({ entries: [{ name: 'a.sarif', data: SARIF, method: 0 }], gap: new Uint8Array(7) }), {}).ok).toBe(false);
+  });
+  it('g: a stored entry over the caller\'s cap is refused by its declared size', () => {
+    const z = makeZip({ entries: [{ name: 'a.sarif', data: 'x'.repeat(2000), method: 0 }] });
+    expect(readZipEntry(z, { maxBytes: 2000 }).ok).toBe(true);
+    const r = readZipEntry(z, { maxBytes: 1999 });
+    expect(r.ok === false ? r.problem : '').toMatch(/size cap/);
+  });
+  it('h: the strong-encryption flag (0x40) alone is refused', () => {
+    expect(readZipEntry(makeZip({ entries: [{ name: 'a.sarif', data: SARIF, method: 0, flags: 0x40 }] }), {}).ok).toBe(false);
+  });
+});
+
 describe('downloadResult: the listing, then the zip, then the file', () => {
   const sha = (s: string): string => createHash('sha256').update(s).digest('hex');
   const io = (l: unknown, zip: Uint8Array | Error): ResultIo & { calls: string[] } => {

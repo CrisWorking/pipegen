@@ -50,7 +50,7 @@ const FILES: Record<string, { tool: string; head: string; base: string; out: str
 interface Art { id: number; name: string; runId: number; size?: number; zip: Uint8Array; expired?: boolean }
 interface World {
   event: string; sha: string; payload: Record<string, unknown>; list: JobListEntry[]; needs: Record<string, unknown>; arts: Art[];
-  inputs: Record<string, string | undefined>; compare: Map<string, unknown>; compareFiles: Map<string, unknown>; files: unknown[]; reviews: unknown[];
+  inputs: Record<string, string | undefined>; compare: Map<string, unknown>; files: unknown[]; reviews: unknown[];
   pull: Record<string, unknown>; contents: Map<string, unknown>; runs: unknown[]; now: Date; lockfileKinds?: string[];
 }
 const FILE_PATCH = { filename: 'src/a.ts', status: 'modified', changes: 2, patch: '@@ -1 +1 @@\n-a\n+b' };
@@ -84,8 +84,8 @@ function world(): World {
       mode: 'gate', jobs: JSON.stringify(needs), 'job-list': jobListLiteral(list), 'service-roots': '["apps/app"]', 'block-from': '', 'block-from-recorded': '2026-12-01',
       [GH_IN]: CRED, [FP_IN]: FPKEY,
     },
-    compare: new Map([[`${BASE}...${MERGE}`, { status: 'ahead' }], [`${BASE}...${HEAD}`, { status: 'ahead' }]]),
-    compareFiles: new Map([[`${BASE}...${MERGE}`, { status: 'ahead', files: [FILE_PATCH] }]]),
+    // one map for compare and compareFiles: both are GET /compare/{base}...{head} (the same answer, status and files)
+    compare: new Map<string, unknown>([[`${BASE}...${MERGE}`, { status: 'ahead', files: [FILE_PATCH] }], [`${BASE}...${HEAD}`, { status: 'ahead', files: [] }]]),
     files: [FILE_PATCH], reviews: [],
     pull: { number: 5, head: { sha: HEAD, repo: { id: 7 } }, base: { sha: BASE }, changed_files: 1, user: { login: 'author' } },
     contents: new Map<string, unknown>([[`${BASE}:.github/workflows/pipegen.yml`, b64('name: pipegen\n')], [`${BASE}:.github/CODEOWNERS`, b64('* @olga\n')]]),
@@ -118,7 +118,7 @@ class FakeGh implements GateGithub {
   async fileAt(_o: string, _n: string, path: string, ref: string): Promise<unknown> { this.log(`file ${ref.slice(0, 1)}:${path}`); return this.w.contents.get(`${ref}:${path}`) ?? null; }
   async compareFiles(_o: string, _n: string, base: string, head: string): Promise<unknown> {
     this.log(`compareFiles ${base.slice(0, 1)}...${head.slice(0, 1)}`);
-    const a = this.w.compareFiles.get(`${base}...${head}`); if (a === undefined) throw new Error('404'); return a;
+    const a = this.w.compare.get(`${base}...${head}`); if (a === undefined) throw new Error('404'); return a;
   }
   async collaboratorPermission(_o: string, _n: string, login: string): Promise<unknown> { this.log(`perm ${login}`); return { permission: 'write' }; }
   async rawFileAt(): Promise<unknown> { return null; }
@@ -194,7 +194,9 @@ describe('gatherGateInput: a fixture world that passes', () => {
     const { gh } = await gather(world());
     const at = (s: string): number => { const i = gh.calls.findIndex((c) => c.startsWith(s)); expect(i, s).toBeGreaterThanOrEqual(0); return i; };
     expect(at('artifacts')).toBeLessThan(at('compare b...d'));
-    expect(at('compare b...d')).toBeLessThan(at('compareFiles'));
+    expect(at('compare b...d')).toBeLessThan(at('file b:'));
+    // fix round 1 (m6): the ancestry and the diff read the same range: one call, its answer reused
+    expect(gh.calls.filter((c) => /^compare(?:Files)? b\.\.\.d$/.test(c))).toEqual(['compare b...d']);
     expect(at('file b:.github/workflows/pipegen.yml')).toBeLessThan(at('file b:.github/CODEOWNERS'));
     expect(at('file b:.github/CODEOWNERS')).toBeLessThan(at('pull 5'));
     expect(at('pull 5')).toBeLessThan(at('runs 1'));
@@ -290,7 +292,9 @@ describe('base facts: the base-scan commit equals this event\'s base and is an a
   it('wrong base: a base-sha output that is not the payload\'s base is no base, and no compare is made for it', async () => {
     const w = world(); out(w, 'base-scan')['base-sha'] = 'f'.repeat(40); sync(w);
     const { input, gh } = await gather(w);
-    expect(gh.calls.filter((c) => c.startsWith('compare '))).toEqual([]);   // no ancestry asked for a base the scan did not check out
+    // no ancestry asked for a base the scan did not check out (the one compare call left is the diff's)
+    expect(input.ancestry).toBeNull();
+    expect(gh.calls.filter((c) => /^compare(?:Files)? /.test(c))).toHaveLength(1);
     const r = decideGate(input);
     expect(r.notes.join(' ')).toMatch(/no base/);
   });
@@ -299,8 +303,7 @@ describe('base facts: the base-scan commit equals this event\'s base and is an a
     w.event = 'merge_group';
     w.payload = { merge_group: { base_sha: BASE, head_sha: MERGE, base_ref: 'refs/heads/main' }, repository: w.payload.repository };
     const { input, gh } = await gather(w);
-    expect(gh.calls).toContain('compare b...d');
-    expect(gh.calls).toContain('compareFiles b...d');
+    expect(gh.calls.filter((c) => /^compare(?:Files)? b\.\.\.d$/.test(c))).toEqual(['compare b...d']);   // ancestry and diff: one call
     expect(gh.calls.some((c) => c.startsWith('pull'))).toBe(false);
     expect(input.diff?.commit).toBe(MERGE);
     expect(input.integrity).toEqual([]);
@@ -320,7 +323,7 @@ describe('base facts: the base-scan commit equals this event\'s base and is an a
   it('push to a new branch (before all zeros): no base, no compare; every finding new', async () => {
     const w = world();
     w.event = 'push'; w.sha = HEAD;
-    w.payload = { before: '0'.repeat(40), after: HEAD, repository: w.payload.repository };
+    w.payload = { before: '0'.repeat(40), after: HEAD, ref: 'refs/heads/main', repository: w.payload.repository };
     out(w, 'base-scan')['base-sha'] = '0'.repeat(40); sync(w);
     const { input, gh } = await gather(w);
     expect(gh.calls.filter((c) => c.startsWith('compare '))).toEqual([]);
@@ -330,10 +333,10 @@ describe('base facts: the base-scan commit equals this event\'s base and is an a
   it('diff: built from compare pull_request.base.sha...github.sha (never the PR head), commit = github.sha, even when the base moved since', async () => {
     const w = world();
     // the base branch moved after the merge commit was made: the compare still uses the payload base and the scanned commit
-    w.compareFiles.set(`${BASE}...${MERGE}`, { status: 'ahead', files: [FILE_PATCH, { filename: 'base-moved.ts', status: 'added', changes: 1, patch: '@@ -0,0 +1 @@\n+x' }] });
+    w.compare.set(`${BASE}...${MERGE}`, { status: 'ahead', files: [FILE_PATCH, { filename: 'base-moved.ts', status: 'added', changes: 1, patch: '@@ -0,0 +1 @@\n+x' }] });
     const { input, gh } = await gather(w);
-    expect(gh.calls).toContain('compareFiles b...d');
-    expect(gh.calls).not.toContain('compareFiles b...c');
+    expect(gh.calls).toContain('compare b...d');
+    expect(gh.calls.some((c) => / b\.\.\.c$/.test(c))).toBe(false);
     expect(input.diff?.commit).toBe(MERGE);
     expect(input.diff?.complete).toBe(true);
     expect([...(input.diff?.added.keys() ?? [])].sort()).toEqual(['base-moved.ts', 'src/a.ts']);
@@ -354,6 +357,9 @@ describe('gatherGateInput: a SettingsError when the event itself can not be trus
     const cases: [string, (w: World, c: GateContext) => void][] = [
       ['payload not JSON', (w) => { w.payload = 'x' as never; }],
       ['repository of another name', (w) => { (w.payload.repository as { full_name: string }).full_name = 'acme/other'; }],
+      // review I3c: a payload that is consistent in itself but of another repository than GITHUB_REPOSITORY
+      ['a consistent payload of another repository', (w) => { const r = w.payload.repository as { full_name: string; name: string }; r.full_name = 'acme/other'; r.name = 'other'; }],
+      ['a consistent payload of another owner', (w) => { const r = w.payload.repository as { full_name: string; owner: { login: string } }; r.full_name = 'evil/app'; r.owner = { login: 'evil' }; }],
       ['repository without an id', (w) => { (w.payload.repository as { id?: number }).id = undefined; }],
       ['no default branch', (w) => { (w.payload.repository as { default_branch?: string }).default_branch = undefined; }],
       ['sha not 40 hex', (_w, c) => { c.env.sha = 'main'; }],
@@ -390,5 +396,69 @@ describe('licence coverage: lockfile types trivy can not read are "not covered (
     const r = decideGate(input);
     expect(r.checks.find((c) => c.job === 'licences')?.state).toMatch(/not covered \(lockfile type\)/);
     expect(r.summary).toMatch(/uv: not covered \(lockfile type\)/);
+  });
+});
+
+// ---------- fix round 1: the approval re-run has a base; runs that can't decide a merge never pass ----------
+
+const reviewWorld = (): World => {
+  const w = world();
+  w.event = 'pull_request_review';
+  w.payload = { ...w.payload, action: 'submitted', review: { state: 'approved', commit_id: HEAD, user: { login: 'olga' } } };
+  return w;
+};
+describe('fix round 1 (I1): pull_request_review is judged like pull_request, with the same base', () => {
+  it('an approval re-run passes on old findings: the base is pull_request.base.sha, verified against github.sha', async () => {
+    const { input, gh } = await gather(reviewWorld());
+    expect(input.ancestry).toEqual({ base: BASE, head: MERGE, isAncestor: true });
+    expect(gh.calls).toContain('compare b...d');
+    const r = decideGate(input);
+    expect(why(input)).toBe('');
+    expect(r.pass).toBe(true);
+    expect(r.warnings.every((f) => f.isNew === false)).toBe(true);
+    expect(r.notes.join(' ')).not.toMatch(/no base/);
+  });
+  it('the approval re-run still checks integrity, and its approval waives a protected path only from a code owner on the head', async () => {
+    const w = reviewWorld();
+    w.files = [FILE_PATCH, { filename: '.github/workflows/pipegen.yml', status: 'modified', changes: 1, patch: '@@ -1 +1 @@\n-a\n+b' }];
+    w.pull.changed_files = 2;
+    expect(decideGate((await gather(w)).input).pass).toBe(false);
+    w.reviews = [{ id: 1, user: { login: 'olga' }, state: 'APPROVED', commit_id: HEAD }];
+    expect(decideGate((await gather(w)).input).pass).toBe(true);
+  });
+  it('wrong base on the approval re-run (base-sha is not the payload\'s base): no base, old findings are new, it blocks', async () => {
+    const w = reviewWorld(); out(w, 'base-scan')['base-sha'] = 'f'.repeat(40); sync(w);
+    const { input } = await gather(w);
+    expect(input.ancestry).toBeNull();
+    expect(decideGate(input).pass).toBe(false);
+  });
+});
+
+describe('fix round 1 (I2): only pull requests, merge queues and pushes to the default branch can pass', () => {
+  const MSG = "the gate runs on pull requests, merge queues and pushes to main; this push run can't decide a merge";
+  const pushTo = (ref: string | undefined): World => {
+    const w = world();
+    w.event = 'push'; w.sha = HEAD;
+    w.payload = { before: BASE, after: HEAD, ...(ref === undefined ? {} : { ref }), repository: w.payload.repository };
+    return w;
+  };
+  it('a push to the default branch passes (the control)', async () => {
+    expect(decideGate((await gather(pushTo('refs/heads/main'))).input).pass).toBe(true);
+  });
+  it('a push to any other ref never passes, with the ruled text', async () => {
+    for (const ref of ['refs/heads/feature', 'refs/heads/main2', 'refs/heads/Main', 'refs/tags/main', 'refs/heads/main/x', 'main', '', undefined]) {
+      const { input } = await gather(pushTo(ref));
+      const r = decideGate(input);
+      expect(r.pass, String(ref)).toBe(false);
+      expect(r.blockReasons, String(ref)).toContain(MSG);
+    }
+  });
+  it('every other event never passes (workflow_dispatch, schedule, pull_request_target, workflow_run, issue_comment, an unknown name)', async () => {
+    for (const ev of ['workflow_dispatch', 'schedule', 'pull_request_target', 'workflow_run', 'issue_comment', 'push-ish']) {
+      const w = world(); w.event = ev;
+      const r = decideGate((await gather(w)).input);
+      expect(r.pass, ev).toBe(false);
+      expect(r.blockReasons.join(' '), ev).toMatch(/the gate runs on pull requests, merge queues and pushes to main; this .* run can't decide a merge/);
+    }
   });
 });

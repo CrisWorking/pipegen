@@ -16,6 +16,14 @@
 //      pull request context (approvals are filtered by those code owners, C4 r1), the shared config sections, the findings.
 //   6. The trusted baseline (C3 loadBaseline), then the clean-run marker (cleanRunSeen) and the mode (decideMode).
 // The licence check's coverage per lockfile type (G11) is added as `coverage`, never as "clean".
+//
+// Which runs may decide a merge (fix round 1, I2): pull_request, pull_request_review (the approval re-run), merge_group and a push to the
+// default branch. Any other run (a push to another branch or a tag, workflow_dispatch, schedule, pull_request_target, …) sees no pull request
+// and so no integrity check: it gets a settings error and never reports pass, because its same-named check could otherwise stand in for the
+// pull request's. (Plan G keeps the gate job out of such runs; this is the belt.)
+//
+// One range is compared once (fix round 1, m6): the ancestry and the diff both read GET /compare/{base}...{github.sha} on a pull request, so
+// the answer is fetched once and both read it.
 import { expectedBaseOf, type CheckInput, type GateEvent, type GateInput, type PrDiff } from './decide.js';
 import { cleanRunSeen, loadBaseline, type GateGithub, type RepoRef } from './baseline.js';
 import { downloadResult, type ResultIo } from './artifacts.js';
@@ -45,6 +53,27 @@ export interface SettingsError { kind: 'settings-error'; errors: string[] }
 
 const SHA_RE = /^[0-9a-f]{40}$/;
 const PR_EVENTS: ReadonlySet<string> = new Set(['pull_request', 'pull_request_review']);
+/** The text of the settings error for a run that can not decide a merge (fix round 1, I2). */
+export const notAMergeRun = (defaultBranch: string, event: string): string =>
+  `the gate runs on pull requests, merge queues and pushes to ${defaultBranch}; this ${/^[a-z_]{1,40}$/.test(event) ? event : 'other'} run can't decide a merge`;
+
+/** The client with GET /compare/{base}...{head} asked once per range (compare and compareFiles are the same endpoint). */
+function compareOnce(gh: GateGithub): GateGithub {
+  const seen = new Map<string, Promise<unknown>>();
+  const once = (owner: string, name: string, base: string, head: string): Promise<unknown> => {
+    const k = `${owner}/${name}\0${base}\0${head}`;
+    let p = seen.get(k);
+    if (p === undefined) { p = gh.compare(owner, name, base, head); seen.set(k, p); }
+    return p;
+  };
+  return new Proxy(gh, {
+    get(target, prop, receiver) {
+      if (prop === 'compare' || prop === 'compareFiles') return once;
+      const v: unknown = Reflect.get(target, prop, receiver);
+      return typeof v === 'function' ? (v as (...a: unknown[]) => unknown).bind(target) : v;
+    },
+  });
+}
 const isPlain = (v: unknown): v is Record<string, unknown> => typeof v === 'object' && v !== null && !Array.isArray(v);
 function at(o: unknown, ...path: string[]): unknown {
   let v = o;
@@ -85,7 +114,8 @@ function repoOf(payload: unknown, repository: string): (RepoRef & { private: boo
  * Every fact decideGate needs, read in the order above. A SettingsError only when the event itself can not be trusted (no read is
  * made then); every other problem is a settings error, a note or a fail-closed fact inside the GateInput.
  */
-export async function gatherGateInput(ctx: GateContext, gh: GateGithub, io: GateIo): Promise<GateInput | SettingsError> {
+export async function gatherGateInput(ctx: GateContext, client: GateGithub, io: GateIo): Promise<GateInput | SettingsError> {
+  const gh = compareOnce(client);
   // 0. the event and the repository
   let payload: unknown;
   try { payload = JSON.parse(io.readEvent()) as unknown; } catch { return { kind: 'settings-error', errors: ['the event payload could not be read'] }; }
@@ -103,6 +133,9 @@ export async function gatherGateInput(ctx: GateContext, gh: GateGithub, io: Gate
   // 1. settings and the job mapping
   const settings = resolveSettings(ctx.inputs, { private: repo.private === true, reviewed: ctx.reviewed });
   notes.push(...settings.notes);
+  // only runs that see the pull request (or the queue, or the default branch itself) may decide a merge (I2)
+  const pushToDefault = event.name === 'push' && at(payload, 'ref') === `refs/heads/${repo.defaultBranch}`;
+  if (!(PR_EVENTS.has(event.name) || event.name === 'merge_group' || pushToDefault)) settings.errors.push(notAMergeRun(repo.defaultBranch, event.name));
   const mapped = mapJobs(settings.needs, settings.jobList);
   notes.push(...mapped.notes);
   const outputFile = new Map(ctx.reviewed.flatMap((t) => (t.outputFile === undefined ? [] : [[t.id, t.outputFile] as const])));

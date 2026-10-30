@@ -450,7 +450,9 @@ describe('decideGate: the base counts only when it is the base of this event and
     const mg: GateEvent = { name: 'merge_group', sha: HEAD, payload: { repository: { id: 7 }, merge_group: { base_sha: BASE, head_sha: HEAD } } };
     expect(run({ event: mg, ancestry: { base: BASE, head: HEAD, isAncestor: true } }).pass).toBe(true);
     expect(expectedBaseOf(mg)).toMatchObject({ base: BASE });
-    expect(expectedBaseOf({ name: 'pull_request_review', sha: HEAD, payload: pr().payload }).base).toBeUndefined();
+    // C5a fix round 1 (I1): the approval re-run has its pull request's base; an event with no base of its own has none
+    expect(expectedBaseOf({ name: 'pull_request_review', sha: MERGE, payload: pr().payload }).base).toBe(BASE);
+    expect(expectedBaseOf({ name: 'workflow_dispatch', sha: HEAD, payload: pr().payload }).base).toBeUndefined();
     expect(expectedBaseOf({ name: 'pull_request', sha: MERGE, payload: { pull_request: { base: { sha: 'xyz' } } } }).base).toBeUndefined();
   });
   it('an unverified base does not touch the trusted artifact baseline of a code tool', () => {

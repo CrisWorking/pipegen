@@ -197,13 +197,14 @@ function at(o: unknown, ...path: string[]): unknown {
 const sha40 = (v: unknown): string | undefined => (typeof v === 'string' && SHA_RE.test(v) ? v : undefined);
 
 /**
- * The base commit this event compares with, from its own payload (the same switch the engine renders for the base-scan
+ * The base commit this event compares with, from its own payload (pull_request and pull_request_review: the pull request's base; the same switch the engine renders for the base-scan
  * checkout, tool-flags.ts BASE_CHECKOUT_REF), and the commits that count as its head (the payload's head and github.sha). No
  * base on any other event, for an all-zero base (a new branch), or for a base equal to a head.
  */
 export function expectedBaseOf(ev: GateEvent): { base?: string; heads: string[]; why?: string } {
   const p = ev.payload;
-  const pair = ev.name === 'pull_request' ? [at(p, 'pull_request', 'base', 'sha'), at(p, 'pull_request', 'head', 'sha')]
+  // pull_request_review (the approval re-run) has the base of its pull request, like pull_request (C5a fix round 1, I1)
+  const pair = ev.name === 'pull_request' || ev.name === 'pull_request_review' ? [at(p, 'pull_request', 'base', 'sha'), at(p, 'pull_request', 'head', 'sha')]
     : ev.name === 'merge_group' ? [at(p, 'merge_group', 'base_sha'), at(p, 'merge_group', 'head_sha')]
       : ev.name === 'push' ? [at(p, 'before'), at(p, 'after')] : undefined;
   const heads = [...new Set([sha40(pair?.[1]), sha40(ev.sha)].filter((x): x is string => x !== undefined))];

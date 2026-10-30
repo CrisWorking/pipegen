@@ -167,7 +167,10 @@ describe('raw files and artifacts', () => {
     expect(seen.map((s) => s.url)).toEqual([`${API_ROOT}/repos/acme/app/actions/artifacts/77/zip`, STORE]);
     expect(seen[1]?.headers.authorization).toBeUndefined();
     expect(seen[1]?.redirect).toBe('manual');
-    for (const loc of ['http://productionresultssa1.blob.core.windows.net/x', 'https://evil.example/x.zip', ['https://user', 'pw@x.blob.core.windows.net/x'].join(':'), 'https://blob.core.windows.net.evil.example/x', 'https://x.blob.core.windows.net:8443/x', '/relative']) {
+    for (const loc of ['http://productionresultssa1.blob.core.windows.net/x', 'https://evil.example/x.zip', ['https://user', 'pw@x.blob.core.windows.net/x'].join(':'), 'https://blob.core.windows.net.evil.example/x', 'https://x.blob.core.windows.net:8443/x', '/relative',
+      // review I3b: the anchors of the host pattern (a suffix that only looks like the store, a store name in the path, a sub-label)
+      'https://x.blob.core.windows.net.evil.com/x.zip', 'https://evil.com/x.blob.core.windows.net', 'https://a.b.blob.core.windows.net/x', 'https://x.blob.core.windows.net./x',
+      'https://evil.com%2f.blob.core.windows.net/x', 'https://x.actions.githubusercontent.com.evil.com/x', 'https://a.b.actions.githubusercontent.com/x']) {
       const m = make((url) => (url.startsWith(API_ROOT) ? { status: 302, headers: { location: loc } } : { status: 200, body: zip }));
       await expect(m.gh.downloadArtifactZip('acme', 'app', 77, 1024), loc).rejects.toThrow();
       expect(m.seen).toHaveLength(1);

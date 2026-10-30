@@ -12,7 +12,8 @@
 //
 // mapJobs reads `toJSON(needs)` (hostile shape, read by own properties) only through the trusted job list: per entry its `result` and its
 // artifact's `-sha256`, `-status` and `-error` outputs; the base-scan job's `base-sha` and base artifact outputs. needId, tool, blocking
-// and needsSecrets always come from the job list. A listed job that is absent is `missing`; a job that is not listed is ignored, with a note.
+// and needsSecrets always come from the job list. A listed job that is absent is `missing` (decide.ts blocks a required one); a job that is
+// not listed is ignored, with a note.
 import { resultArtifactName } from '../../src/engine/artifact-names.js';
 import { jobIdFor, type JobListEntry } from '../../src/engine/gate-job-list.js';
 import { NEED_ID_CATEGORY } from '../../src/engine/need-ids.js';
@@ -63,6 +64,8 @@ export type GateInputName = (typeof GATE_INPUTS)[number];
 /** toJSON(needs) of a gate job is small (outputs are short texts); a bigger one is not GitHub's. */
 export const MAX_JOBS_TEXT = 4 * 1024 * 1024;
 const SKIP_REASON = 'skipped at setup (--skip)';
+/** The cap the other JSON literals have (tool-flags.ts parseJson). */
+const MAX_POLICY_TEXT = 200_000;
 
 export interface SettingsContext {
   /** `github.event.repository.private` (the payload; a PR can't change it). */
@@ -73,7 +76,12 @@ export interface SettingsContext {
 export interface GateSettings {
   /** The trusted job list (the `job-list` literal), in its order. Empty when the literal is refused. */
   jobList: JobListEntry[];
-  /** Floor need ids the gate must find a check for: `secrets` always (every pipeline has it, repo-wide, on the merge layer), and every floor need of the job list. */
+  /**
+   * Floor need ids the gate must find a check for: `secrets` always (every pipeline has it, repo-wide, on the merge layer), and every floor
+   * need of the job list (C2 r4: the merge-layer filter of gateJobList, which IS the job list). Apart from `secrets`, a floor need taken from
+   * the list has its check by construction, so this does not catch a floor need dropped from the list: the referee's check that the
+   * `job-list` literal equals gateJobList(draft), and integrity on the file that holds the literal (a protected path), do.
+   */
   floorNeeds: string[];
   policy: Policy;
   notProven: string[];
@@ -181,6 +189,8 @@ export function resolveSettings(raw: Readonly<Record<string, string | undefined>
   const pv = get('policy');
   if (!ctx.private) {
     if (pv !== undefined) notes.push('the policy input is ignored on a public repository: the built-in default policy is used');
+  } else if (pv !== undefined && pv.length > MAX_POLICY_TEXT) {
+    errors.push('the policy input is refused (it is over the size cap), so the default policy is used');
   } else if (pv !== undefined) {
     const doc = parse(pv);
     const p = policyProblem(doc);
@@ -259,8 +269,6 @@ export interface MappedJobs {
   checks: MappedCheck[];
   /** The base-scan job's result and the commit it checked out (its base-sha output, 40 hex); null when `needs` has no base-scan job. */
   baseScan: { result: JobResult; commit?: string } | null;
-  /** Listed blocking jobs that `needs` does not hold. */
-  missingRequired: string[];
   notes: string[];
 }
 
@@ -306,6 +314,5 @@ export function mapJobs(needs: unknown, list: readonly JobListEntry[]): MappedJo
     const extra = Object.keys(needs).filter((k) => !listed.has(k));
     if (extra.length > 0) notes.push(`${extra.length} job${extra.length === 1 ? '' : 's'} the gate waits for ${extra.length === 1 ? 'is' : 'are'} not in the job list and ${extra.length === 1 ? 'was' : 'were'} not read: ${extra.slice(0, 10).map(shownName).join(', ')}`);
   }
-  const missingRequired = checks.filter((c) => c.result === 'missing' && c.entry.blocking && (jobOf(needs, c.entry.job) === undefined)).map((c) => c.entry.job);
-  return { checks, baseScan, missingRequired, notes };
+  return { checks, baseScan, notes };
 }
