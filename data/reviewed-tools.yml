@@ -548,6 +548,8 @@ tools:
   #   --certificate-oidc-issuer https://token.actions.githubusercontent.com checksums.txt`: "Verified OK" (2026-10-28T00:00:14Z; the
   #   same check with @refs/tags/v1.8.0 fails). checksums.txt lists the pinned sha256 above.
   # --redact (ruling P21): the secret never reaches the report or the CI log. --ignore-gitleaks-allow: inline allow comments can't hide a secret.
+  # C1c: the scan runs on pipegen's stage folder (neutral file names, cwd inside it), and the pinned config adds the pipegen-canary rule: a
+  #   staged file whose canary is not reported was not scanned (gate/src/stage.ts). Reviewed by delegation (DECISIONS 105), 2026-10-30.
   # Only pipegen's pinned --config (never the repo's .betterleaks.toml or .gitleaks.toml); no validation flags (they send
   #   candidate secrets to provider APIs); --report-path is the SARIF file, never - (the findings would reach the CI log).
   - id: betterleaks
@@ -572,12 +574,12 @@ tools:
     fixedInputs:
       args: ["--ignore-gitleaks-allow", "--redact", "--report-format", "sarif", "--report-path", "betterleaks.sarif", "--exit-code", "10", "--max-archive-depth", "0"]
       config:
-        content: "[extend]\nuseDefault = true\n"
+        content: "[extend]\nuseDefault = true\n\n[[rules]]\nid = \"pipegen-canary\"\ndescription = \"pipegen scan marker (proves the file was read)\"\nregex = '''(?m)^pipegen-canary-[0-9a-f]{32}$'''\nkeywords = [\"pipegen-canary-\"]\n"
         passAs: { flag: "--config" }
     choices: {}
     configFiles: [".betterleaks.toml", ".gitleaks.toml", ".gitleaksignore", ".betterleaksignore"]
     reviewedBy: Claude delegated DECISIONS 105
-    reviewedAt: "2026-10-29"
+    reviewedAt: "2026-10-30"
     proofs: 0
     verifiedWith:
       method: cosign-bundle
@@ -588,6 +590,7 @@ tools:
 
   # Secret scan, the fallback listed after betterleaks. Same release as data/pinned-binaries.yml (ruling S25).
   # The same locks as betterleaks (ruling P21): --redact, --report-path its own SARIF file only, --exit-code 10 (C0a fix round 1: their errors exit 1), the pinned --config, no verbose output.
+  # C1c: the same stage folder and the same pinned config with the pipegen-canary rule as betterleaks. Reviewed by delegation (DECISIONS 105), 2026-10-30.
   # Source: release v8.30.1 of gitleaks/gitleaks: gitleaks_8.30.1_linux_x64.tar.gz sha256 from the release checksums file. Released 2026-03-21T02:17:58Z.
   - id: gitleaks
     categories: ["secrets"]
@@ -611,12 +614,12 @@ tools:
     fixedInputs:
       args: ["--ignore-gitleaks-allow", "--redact", "--report-format", "sarif", "--report-path", "gitleaks.sarif", "--exit-code", "10", "--max-archive-depth", "0"]
       config:
-        content: "[extend]\nuseDefault = true\n"
+        content: "[extend]\nuseDefault = true\n\n[[rules]]\nid = \"pipegen-canary\"\ndescription = \"pipegen scan marker (proves the file was read)\"\nregex = '''(?m)^pipegen-canary-[0-9a-f]{32}$'''\nkeywords = [\"pipegen-canary-\"]\n"
         passAs: { flag: "--config" }
     choices: {}
     configFiles: [".gitleaks.toml", ".gitleaksignore"]
     reviewedBy: Claude delegated DECISIONS 105
-    reviewedAt: "2026-10-29"
+    reviewedAt: "2026-10-30"
     proofs: 0
 
   # Semgrep CE (image). Rules come only from a pinned semgrep-rules archive, never the registry (ruling S22).

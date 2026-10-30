@@ -10,7 +10,8 @@ import {
   BETTERLEAKS_ALLOWED_FLAGS, effectiveProtectedPaths, loadReviewed, MUST_VERIFY, nearDuplicate, NUCLEI_ALLOWED_FLAGS, TRIVY_ALLOWED_FLAGS, NEVER_IMAGES, NEVER_NAME_ALLOW, NEVER_REPOS, neverImage, neverListed, packageExists, projectScriptFor,
   ReviewedListError, reviewedFor, TOOL_CATEGORIES,
 } from '../src/engine/reviewed.js';
-import { ACTION_POLICIES, ARGV_POLICIES, BETTERLEAKS_FORBIDDEN_FLAGS, BETTERLEAKS_FORBIDDEN_SUBCOMMANDS, type ArgvPolicy, type InputSpec } from '../src/engine/tool-flags.js';
+import { ACTION_POLICIES, ARGV_POLICIES, BETTERLEAKS_FORBIDDEN_FLAGS, BETTERLEAKS_FORBIDDEN_SUBCOMMANDS, SECRETS_SCAN_CONFIG, type ArgvPolicy, type InputSpec } from '../src/engine/tool-flags.js';
+import { CANARY_RULE_TOML } from '../src/ai/scan-staging.js';
 import { BETTERLEAKS_GRAMMAR, NUCLEI_GRAMMAR, TRIVY_GRAMMAR, type FlagGrammar } from '../src/engine/tool-grammar.js';
 import { NEED_CATEGORIES, PROTECTED_PATHS_BASE, type Language, type Need, type ReviewedTool, type Service } from '../src/types.js';
 import { fakeFetch } from './helpers/fake-http.js';
@@ -94,7 +95,7 @@ function cliEntry(over: Entry = {}): Entry {
       cli: { install: { method: 'github-release', package: 'gitleaks_8.30.1_linux_x64.tar.gz', version: 'v8.30.1' }, command: ['gitleaks', 'dir', ...GITLEAKS_ARGS, '.'] },
       output: { path: 'gitleaks.sarif', format: 'sarif' },
     },
-    fixedInputs: { args: [...GITLEAKS_ARGS], config: { content: '[extend]\nuseDefault = true\n', passAs: { flag: '--config' } } },
+    fixedInputs: { args: [...GITLEAKS_ARGS], config: { content: SECRETS_SCAN_CONFIG, passAs: { flag: '--config' } } },
     choices: {},
     configFiles: ['.gitleaks.toml', '.gitleaksignore'],
     reviewedBy: 'PENDING', reviewedAt: 'PENDING', proofs: 0,
@@ -507,7 +508,7 @@ const BL_ARGS_NO_DEPTH = ['--redact', '--report-format', 'sarif', '--exit-code',
 const BL_ARGS = ['--redact', '--report-format', 'sarif', '--exit-code', '10', '--max-archive-depth', '0'];
 const betterleaksEntry = (over: BinOver = {}) => binEntry('betterleaks/betterleaks', {
   id: 'betterleaks', command: blCmd(), args: BL_ARGS,
-  config: { content: '[extend]\nuseDefault = true\n', passAs: { flag: '--config' } }, verifiedWith: verified('betterleaks/betterleaks'), ...over,
+  config: { content: SECRETS_SCAN_CONFIG, passAs: { flag: '--config' } }, verifiedWith: verified('betterleaks/betterleaks'), ...over,
 });
 const nucleiCmd = (...rest: string[]) => ['nuclei', '-duc', '-t', NUCLEI_DIR, '-severity', 'medium,high,critical', '-sarif-export', 'tool.sarif', ...rest];
 const nucleiEntry = (over: BinOver = {}) => binEntry('projectdiscovery/nuclei', {
@@ -1139,7 +1140,7 @@ describe('Task 5 review probes (fix round 1)', () => {
   });
   const pbetterleaks = () => pcli('betterleaks', 'betterleaks/betterleaks', 'v1.9.0', 'betterleaks_1.9.0_linux_x64.tar.gz', ['betterleaks', 'dir', '--redact', '--report-format', 'sarif', '--report-path', 'b.sarif', '--exit-code', '10', '--max-archive-depth', '0', '.'],
     {
-      fixedInputs: { args: ['--redact', '--report-format', 'sarif', '--exit-code', '10', '--max-archive-depth', '0'], config: { content: '[extend]\nuseDefault = true\n', passAs: { flag: '--config' } } },
+      fixedInputs: { args: ['--redact', '--report-format', 'sarif', '--exit-code', '10', '--max-archive-depth', '0'], config: { content: SECRETS_SCAN_CONFIG, passAs: { flag: '--config' } } },
       verifiedWith: vw('betterleaks/betterleaks', 'refs/tags/v1.9.0'), step: { cli: { install: { method: 'github-release', package: 'betterleaks_1.9.0_linux_x64.tar.gz', version: 'v1.9.0' }, command: ['betterleaks', 'dir', '--redact', '--report-format', 'sarif', '--report-path', 'b.sarif', '--exit-code', '10', '--max-archive-depth', '0', '.'] }, output: { path: 'b.sarif', format: 'sarif' } },
     });
   const PNUC_ENV = { ...NUCLEI_ENV, [NUCLEI_SUM_ENV]: H };
@@ -1641,7 +1642,7 @@ describe('data/reviewed-tools.yml', () => {
   });
 
   // entries re-reviewed by delegation (DECISIONS 105) after the owner's 2026-10-28 review; add an id here on purpose, never skip it
-  const DELEGATED: Record<string, string> = { 'actions-setup-node': '2026-10-29', betterleaks: '2026-10-29', gitleaks: '2026-10-29', 'trivy-config': '2026-10-29', 'trivy-image': '2026-10-29', 'trivy-licence': '2026-10-29', 'docker-login-action': '2026-10-29', eslint: '2026-10-29', 'eslint-typescript': '2026-10-29', nuclei: '2026-10-29', semgrep: '2026-10-29' };
+  const DELEGATED: Record<string, string> = { 'actions-setup-node': '2026-10-29', betterleaks: '2026-10-30', gitleaks: '2026-10-30', 'trivy-config': '2026-10-29', 'trivy-image': '2026-10-29', 'trivy-licence': '2026-10-29', 'docker-login-action': '2026-10-29', eslint: '2026-10-29', 'eslint-typescript': '2026-10-29', nuclei: '2026-10-29', semgrep: '2026-10-29' };
 
   it('data: every catalogue entry is reviewed by the owner (2026-10-28, DECISIONS #104) or by delegation (listed), with proofs 0', () => {
     const list = real();
@@ -1668,6 +1669,24 @@ describe('data/reviewed-tools.yml', () => {
     rejects([semgrepEntry(undefined, limited, (t?.fixedInputs.args ?? []).map((x) => (x === '--max-target-bytes=0' ? '--max-target-bytes=1000000' : x)))], /max-target-bytes/);
   });
 
+  it('data (C1c): betterleaks and gitleaks run with the canary rule: the pinned config is [extend] useDefault plus pipegen-canary, in the entry and in the policy, reviewed by delegation 2026-10-30', () => {
+    const want = `[extend]\nuseDefault = true\n\n${CANARY_RULE_TOML}`;
+    expect(SECRETS_SCAN_CONFIG).toBe(want);
+    for (const id of ['betterleaks', 'gitleaks']) {
+      const t = byId(real(), id)[0];
+      expect(t?.fixedInputs.config?.content, id).toBe(want);
+      expect(ARGV_POLICIES[id]?.config?.content, id).toBe(want);
+      expect(t?.reviewedBy, id).toBe('Claude delegated DECISIONS 105');
+      expect(t?.reviewedAt, id).toBe('2026-10-30');
+      expect(DELEGATED[id], id).toBe('2026-10-30');
+      // the old config (no canary rule) no longer loads: the scrub could not prove coverage with it
+      const raw = rawFile().tools.find((x) => x.id === id) as Entry;
+      const old = structuredClone(raw);
+      (old.fixedInputs as { config: { content: string } }).config.content = '[extend]\nuseDefault = true\n';
+      expect(() => loadAtReal([old]), id).toThrow();
+    }
+  });
+
   it('data (C1b fix round 1, C1): betterleaks and gitleaks scan the checked-out tree (dir mode), not the git history, reviewed by delegation', () => {
     for (const id of ['betterleaks', 'gitleaks']) {
       const t = byId(real(), id)[0];
@@ -1675,8 +1694,8 @@ describe('data/reviewed-tools.yml', () => {
       expect(t?.step.cli?.command, id).not.toContain('git');
       expect(t?.step.cli?.command.at(-1), id).toBe('.');
       expect(t?.reviewedBy, id).toBe('Claude delegated DECISIONS 105');
-      expect(t?.reviewedAt, id).toBe('2026-10-29');
-      expect(DELEGATED[id], id).toBe('2026-10-29');
+      expect(t?.reviewedAt, id).toBe(DELEGATED[id]);   // 2026-10-29 (dir mode), re-reviewed 2026-10-30 (C1c canary rule)
+      expect(DELEGATED[id], id).toBe('2026-10-30');
       // the same command with `git` does not load: gitleaks' policy allows only dir, and the real entry is read with its own policy
       const raw = rawFile().tools.find((x) => x.id === id) as Entry;
       const gitMode = structuredClone(raw);
@@ -1694,7 +1713,7 @@ describe('data/reviewed-tools.yml', () => {
       const args = t?.fixedInputs.args ?? [];
       expect(args.slice(args.indexOf('--max-archive-depth'), args.indexOf('--max-archive-depth') + 2), id).toEqual(['--max-archive-depth', '0']);
       expect(t?.reviewedBy, id).toBe('Claude delegated DECISIONS 105');
-      expect(t?.reviewedAt, id).toBe('2026-10-29');
+      expect(t?.reviewedAt, id).toBe(DELEGATED[id]);
       const raw = rawFile().tools.find((x) => x.id === id) as Entry;
       const without = (xs: string[]) => xs.filter((x, i) => !(x === '--max-archive-depth' || xs[i - 1] === '--max-archive-depth'));
       const withDepth = (xs: string[], d: string) => xs.map((x, i) => (xs[i - 1] === '--max-archive-depth' ? d : x));
@@ -1932,7 +1951,7 @@ describe('Task 6 review fix round 1 (P19-P27)', () => {
       expect(t?.fixedInputs.args, id).toEqual(expect.arrayContaining(['--exit-code', '10']));
       expect(ARGV_POLICIES[id]?.findingsExit, id).toEqual([10]);
       expect(t?.reviewedBy, id).toBe('Claude delegated DECISIONS 105');
-      expect(t?.reviewedAt, id).toBe('2026-10-29');
+      expect(t?.reviewedAt, id).toBe(id === 'betterleaks' || id === 'gitleaks' ? '2026-10-30' : '2026-10-29');   // the secrets entries were re-reviewed for C1c
       // the old value (1), also only in the command or only in the fixed args, no longer loads
       refused(both(realEntry(id), swap('10', '1')), /--exit-code 10|--exit-code is a fixed arg: exactly 10|exit-code is one of "10"/);
     }

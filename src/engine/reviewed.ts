@@ -46,7 +46,7 @@ import { isRealDate, isReleaseBuild, listPending, PENDING, REVIEWER_RE, reviewMa
 import { expectedPins, loadNpmClosure, NpmClosureError } from './npm-closure.js';
 import { lastValue, parseArgv, type ParsedArgv } from './argv.js';
 import {
-  ACTION_POLICIES, ARGV_POLICIES, DOCKER_ACTION_USES, BETTERLEAKS_FORBIDDEN_FLAGS, type InputSpec, BETTERLEAKS_FORBIDDEN_SUBCOMMANDS, BETTERLEAKS_SUBCOMMANDS, type ArgvPolicy, type CommandPolicy, type FlagSpec,
+  ACTION_POLICIES, ARGV_POLICIES, DOCKER_ACTION_USES, BETTERLEAKS_FORBIDDEN_FLAGS, type InputSpec, BETTERLEAKS_FORBIDDEN_SUBCOMMANDS, BETTERLEAKS_SUBCOMMANDS, SECRETS_SCAN_CONFIG, type ArgvPolicy, type CommandPolicy, type FlagSpec,
 } from './tool-flags.js';
 import { BETTERLEAKS_GRAMMAR, NUCLEI_GRAMMAR, TRIVY_GRAMMAR, type FlagGrammar } from './tool-grammar.js';
 import { levenshtein, neverImage, neverListed } from './never-list.js';
@@ -885,6 +885,8 @@ function betterleaksProblems(e: Entry): Problem[] {
   }
   const pinned = fx.config !== undefined && 'flag' in fx.config.passAs && fx.config.passAs.flag === '--config';
   if (!pinned || (fx.args ?? []).some((a) => a === '-c' || /^-c./.test(a) || flagName(a) === 'config')) bad(pinnedMsg, 'fixedInputs', 'config');
+  // C1c: exactly the reviewed config, with pipegen's canary rule (without it the scrub can not prove which staged files were read)
+  else if (fx.config?.content !== SECRETS_SCAN_CONFIG) bad(`${pinnedMsg}, with exactly the content reviewed in tool-flags.ts (SECRETS_SCAN_CONFIG: the default rules and pipegen's canary rule)`, 'fixedInputs', 'config');
   for (const k of [...Object.keys(e.step.cli?.env ?? {}), ...Object.keys(fx.env ?? {})]) {
     bad(/config/i.test(k) ? `${pinnedMsg} (not ${k})` : `betterleaks gets no env (${k}): v1.9.0 reads its config and tokens from it`, 'step', 'cli', 'env');
   }

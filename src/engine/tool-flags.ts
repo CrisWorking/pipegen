@@ -184,6 +184,13 @@ const FOUND_1 = [1] as const;
 /** trivy, betterleaks and gitleaks are told `--exit-code 10`: their errors, and betterleaks' partial scan, exit 1, so 1 can not also mean a finding (C0a fix round 1). */
 const FOUND_10 = [10] as const;
 const TRIVY_CONFIG = { flag: '--config', content: "# pipegen's pinned trivy config: no cache kept between runs\ncache:\n  backend: memory\n", fileName: 'trivy.yaml' } as const;
+/**
+ * The pinned config of the secrets tools (C1c): the default rules (`[extend] useDefault`), plus pipegen's canary rule. The stage step ends
+ * every staged file with a fresh `pipegen-canary-<32 hex>` line, and the scrub counts a staged file as scanned only when this rule reported
+ * its own canary exactly once (gate/src/stage.ts). The rule text is src/ai/scan-staging.ts CANARY_RULE_TOML (a test keeps them equal);
+ * written out here because this module is a leaf. The default path allowlists stay in force, but they never match a staged name.
+ */
+export const SECRETS_SCAN_CONFIG = '[extend]\nuseDefault = true\n\n[[rules]]\nid = "pipegen-canary"\ndescription = "pipegen scan marker (proves the file was read)"\nregex = \'\'\'(?m)^pipegen-canary-[0-9a-f]{32}$\'\'\'\nkeywords = ["pipegen-canary-"]\n';
 /** The ignore files betterleaks 1.9.0 and gitleaks 8.30.1 read from the scan root (`--help` of `dir`: `.betterleaksignore` or `.gitleaksignore`). */
 const SECRETS_IGNORE_FILES = ['.gitleaksignore', '.betterleaksignore'] as const;
 const GH = 'github-release' as const;
@@ -204,7 +211,7 @@ const POLICIES = {
   'trivy-config': { ...DEDICATED('trivy', TRIVY_ASSET, TRIVY_CONFIG), findingsExit: FOUND_10 },
   'trivy-image': { ...DEDICATED('trivy', TRIVY_ASSET, TRIVY_CONFIG), slots: { '': 'image-digest' }, findingsExit: FOUND_10 },
   'trivy-licence': { ...DEDICATED('trivy', TRIVY_ASSET, TRIVY_CONFIG), findingsExit: FOUND_10 },
-  betterleaks: { ...DEDICATED('betterleaks', 'betterleaks_1.9.0_linux_x64.tar.gz', { flag: '--config', content: '[extend]\nuseDefault = true\n', fileName: 'betterleaks.toml' }), findingsExit: FOUND_10, removeFiles: SECRETS_IGNORE_FILES },
+  betterleaks: { ...DEDICATED('betterleaks', 'betterleaks_1.9.0_linux_x64.tar.gz', { flag: '--config', content: SECRETS_SCAN_CONFIG, fileName: 'betterleaks.toml' }), findingsExit: FOUND_10, removeFiles: SECRETS_IGNORE_FILES },
   nuclei: { ...DEDICATED('nuclei', 'nuclei_3.11.1_linux_amd64.zip'), slots: { '-target': 'local-url' }, findingsExit: [],
     archive: { repo: 'projectdiscovery/nuclei-templates', commitEnv: 'PIPEGEN_NUCLEI_TEMPLATES_COMMIT', treeEnv: 'PIPEGEN_NUCLEI_TEMPLATES_TREE', dir: '/pipegen-nuclei-templates' } },
   // ruling P28: the image entries too. registry runs the image's own entrypoint, nothing else
@@ -232,7 +239,7 @@ const POLICIES = {
     exe: 'gitleaks', dialect: 'long', sub: ['dir'], positionals: ['.'], findingsExit: FOUND_10, removeFiles: SECRETS_IGNORE_FILES,
     flags: { 'no-banner': 'bool', 'ignore-gitleaks-allow': 'bool', redact: { values: ['', '100'], optional: true }, 'report-format': { values: ['sarif'] }, 'report-path': 'output', 'exit-code': { values: ['10'] }, 'max-archive-depth': { values: ['0'] } },
     required: { 'ignore-gitleaks-allow': 'true', redact: '', 'report-format': 'sarif', 'report-path': null, 'exit-code': '10', 'max-archive-depth': '0' },
-    config: { flag: '--config', content: '[extend]\nuseDefault = true\n', fileName: 'gitleaks.toml' },
+    config: { flag: '--config', content: SECRETS_SCAN_CONFIG, fileName: 'gitleaks.toml' },
   },
   // osv-scanner v2.7.0
   'osv-scanner': { method: GH, package: 'osv-scanner_linux_amd64',
