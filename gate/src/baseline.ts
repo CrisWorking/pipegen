@@ -11,6 +11,19 @@
 //      only when the MAC verifies, the key id is the current key's, and its run id is the run of the artifact. A fork PR has no key,
 //      so it can't verify anything and uses the same-run base scan (null).
 //
+// Where the artifacts are looked for matters as much as how they are checked (C3 review): artifacts are NOT listed repo-wide, where
+// anyone who can run a PR workflow could flood the list with newer same-name artifacts and push the trusted one out of any budget.
+// The RUNS are listed instead (push runs of pipegen.yml on the default branch that succeeded, newest first, a bounded number of
+// pages), each run is judged by trustedRun, and artifacts are listed only for a trusted run. An untrusted run never costs more
+// than the list entry it came in, and never any artifact call.
+//
+// A tag named like the default branch: for a tag push `head_branch` is the tag name, so a tag called `main` on an old commit that is in
+// the default history would pass every field check. The runs API has no field that tells a branch push from a tag push, so
+// trustedRun also refuses every run while a tag with the default branch's name exists (GET /git/ref/tags/{name}; any answer but a
+// clear "no" fails closed). Residual: a tag deleted afterwards leaves its runs (same repository, same workflow file, a commit that is
+// in the default history, still needing the MAC) trusted. The real fix is Plan G's: the push trigger of pipegen.yml is
+// `branches: [<default>]` only, no tags, which the referee checks.
+//
 // Everything outside this process is hostile: every API answer is `unknown`, read by own properties with exact types, and any
 // error, 404 or odd shape means "not trusted" (null / false), never a guess. The module touches the network only through the
 // small GateGithub interface below (C5 wires the real client; the tests give a fake). The artifact functions are pure: they take
@@ -33,8 +46,10 @@ import type { ScrubbedFinding } from './scrub.js';
 
 export const WORKFLOW_PATH = '.github/workflows/pipegen.yml';
 export const BASELINE_RETENTION_DAYS = 90;
-/** At most this many artifacts of a name are looked at per load (each costs a run lookup). */
-export const MAX_CANDIDATES = 20;
+/** The run list is read for at most this many pages of 100, and at most this many TRUSTED runs are searched for an artifact. */
+export const MAX_RUN_PAGES = 5;
+export const RUNS_PER_PAGE = 100;
+export const MAX_TRUSTED_RUNS = 20;
 /** The cap on the artifact (as listed) and on the file inside it. */
 export const MAX_ARTIFACT_BYTES = 8 * 1024 * 1024;
 const MAX_COUNT_ENTRIES = 200_000;
@@ -52,19 +67,25 @@ const MAC_RE = /^[0-9a-f]{64}$/;
  * Any call may throw (404, 403, 5xx, network): that is treated as "not trusted". C5 wires Octokit to this; owner/name are always
  * the repository the gate runs in.
  */
+export interface RunQuery { workflow: string; branch: string; event: 'push'; status: 'success'; page: number; perPage: number }
 export interface GateGithub {
   /**
    * `GET /repos/{owner}/{name}/compare/{base}...{head}`; the answer must carry `status`. `head` is the default BRANCH name: the client
-   * must resolve it as a branch and never as a tag (a tag named like the default branch must not stand for it; for example by
-   * `GET /repos/{owner}/{name}/branches/{head}` and comparing with that commit, or `heads/{head}`).
+   * must resolve it as a branch and never as a tag (for example by `GET /repos/{owner}/{name}/branches/{head}` and comparing with that
+   * commit, or `heads/{head}`).
    */
   compare(owner: string, name: string, base: string, head: string): Promise<unknown>;
-  /** `GET /repos/{owner}/{name}/actions/artifacts?name={artifactName}&per_page=100` → `{ artifacts: [...] }`. */
-  listArtifacts(owner: string, name: string, artifactName: string): Promise<unknown>;
-  /** `GET /repos/{owner}/{name}/actions/runs/{runId}` → the workflow run. */
-  getRun(owner: string, name: string, runId: number): Promise<unknown>;
+  /**
+   * `GET /repos/{owner}/{name}/actions/workflows/{workflow}/runs?event=push&branch={branch}&status=success&per_page={perPage}&page={page}`
+   * → `{ workflow_runs: [...] }`, newest first. The filters narrow the list, they are not trusted: every run is judged by trustedRun.
+   */
+  listRuns(owner: string, name: string, query: RunQuery): Promise<unknown>;
+  /** `GET /repos/{owner}/{name}/actions/runs/{runId}/artifacts?name={artifactName}` → `{ artifacts: [...] }`. */
+  listRunArtifacts(owner: string, name: string, runId: number, artifactName: string): Promise<unknown>;
   /** The bytes of the one file in the artifact (`GET .../actions/artifacts/{id}/zip`, then C5's zip checks: one entry, no path, no link). */
   downloadArtifact(owner: string, name: string, artifactId: number): Promise<Uint8Array>;
+  /** Whether a tag called `tag` exists: `GET /repos/{owner}/{name}/git/ref/tags/{tag}` (200 → true, 404 → false, any other error is thrown). */
+  tagExists(owner: string, name: string, tag: string): Promise<boolean>;
 }
 /** The write side (C5 wires `@actions/artifact`). */
 export interface ArtifactUploader {
@@ -117,7 +138,22 @@ export async function trustedRun(gh: GateGithub, run: unknown, repo: RepoRef): P
   if (own(run, 'head_branch') !== repo.defaultBranch) return false;
   const sha = own(run, 'head_sha');
   if (typeof sha !== 'string' || !SHA_RE.test(sha)) return false;
+  if (!(await noDefaultBranchTag(gh, repo))) return false;
   return inDefaultHistory(gh, repo, sha);
+}
+
+/** True only when the API clearly says no tag has the default branch's name. Asked once per client and branch. */
+const TAG_ASKED = new WeakMap<GateGithub, Map<string, Promise<boolean>>>();
+function noDefaultBranchTag(gh: GateGithub, repo: RepoRef): Promise<boolean> {
+  let per = TAG_ASKED.get(gh);
+  if (per === undefined) { per = new Map(); TAG_ASKED.set(gh, per); }
+  const k = `${repo.owner}/${repo.name}\0${repo.defaultBranch}`;
+  let p = per.get(k);
+  if (p === undefined) {
+    p = gh.tagExists(repo.owner, repo.name, repo.defaultBranch).then((exists) => exists === false, () => false);
+    per.set(k, p);
+  }
+  return p;
 }
 
 // ---------- verifying one artifact (pure) ----------
@@ -230,10 +266,10 @@ export function verifyCleanRunArtifact(bytes: Uint8Array, meta: ArtifactMeta, ct
 
 // ---------- loading through the client ----------
 
-interface Candidate { id: number; runId: number; createdMs: number; expired: boolean; expiresAt: string | null; size: number }
+interface Candidate { id: number; createdMs: number; expired: boolean; expiresAt: string | null; size: number }
 
-/** The listing entries of exactly this name that have a readable shape, newest first (the API order is not trusted). */
-function candidatesOf(listing: unknown, artifactName: string): Candidate[] {
+/** The listing entries of exactly this name that belong to run `runId` and have a readable shape, newest first. */
+function candidatesOf(listing: unknown, artifactName: string, runId: number): Candidate[] {
   if (!isPlain(listing)) return [];
   const list = own(listing, 'artifacts');
   if (!Array.isArray(list)) return [];
@@ -241,14 +277,14 @@ function candidatesOf(listing: unknown, artifactName: string): Candidate[] {
   for (const a of list) {
     if (!isPlain(a) || own(a, 'name') !== artifactName || !posInt(own(a, 'id'))) continue;
     const wr = own(a, 'workflow_run');
-    if (!isPlain(wr) || !posInt(own(wr, 'id'))) continue;
+    if (!isPlain(wr) || own(wr, 'id') !== runId) continue;
     const created = own(a, 'created_at');
     const createdMs = typeof created === 'string' && /^\d{4}-\d{2}-\d{2}T/.test(created) ? Date.parse(created) : Number.NaN;
     if (Number.isNaN(createdMs)) continue;
     const exp = own(a, 'expires_at');
     const size = own(a, 'size_in_bytes');
     out.push({
-      id: own(a, 'id') as number, runId: own(wr, 'id') as number, createdMs, expired: own(a, 'expired') !== false,
+      id: own(a, 'id') as number, createdMs, expired: own(a, 'expired') !== false,
       expiresAt: typeof exp === 'string' ? exp : null, size: typeof size === 'number' && Number.isSafeInteger(size) && size >= 0 ? size : Number.POSITIVE_INFINITY,
     });
   }
@@ -256,31 +292,48 @@ function candidatesOf(listing: unknown, artifactName: string): Candidate[] {
 }
 
 /**
- * Walk the artifacts of one name, newest first, at most MAX_CANDIDATES of them: skip the expired, look the run up (never trust the
- * listing), skip every artifact whose run is not trusted, and hand the bytes of a trusted one to `use`. `use` returns a result to
- * stop with, or undefined to go on to the next trusted artifact. An error on one candidate skips it with a note.
+ * Walk the successful push runs of the workflow on the default branch, newest first (by run id), at most MAX_RUN_PAGES pages: judge
+ * each with trustedRun and skip the rest at no further cost; for a trusted run list ITS artifacts of this name (at most
+ * MAX_TRUSTED_RUNS trusted runs are searched), skip the expired, and hand the bytes of the newest to `use`. `use` returns a result to
+ * stop with, or undefined to go on to the next trusted run. An error on one step skips with a note.
  */
 async function walk<T>(
   gh: GateGithub, repo: RepoRef, ctx: VerifyContext, artifactName: string,
   use: (bytes: Uint8Array, meta: ArtifactMeta) => T | undefined, notes: string[],
 ): Promise<T | undefined> {
-  let listing: unknown;
-  try { listing = await gh.listArtifacts(repo.owner, repo.name, artifactName); } catch { notes.push(`the list of ${artifactName} artifacts could not be read`); return undefined; }
-  const found = candidatesOf(listing, artifactName);
-  if (found.length === 0) { notes.push(`no ${artifactName} artifact`); return undefined; }
+  let trustedSeen = 0;
   let expired = 0;
-  for (const c of found.slice(0, MAX_CANDIDATES)) {
-    const meta: ArtifactMeta = { runId: c.runId, name: artifactName, expired: c.expired, expiresAt: c.expiresAt };
-    if (expiryProblem(meta, ctx.now) !== undefined) { expired++; continue; }
-    let run: unknown;
-    try { run = await gh.getRun(repo.owner, repo.name, c.runId); } catch { notes.push(`the run ${c.runId} could not be read`); continue; }
-    if (!isPlain(run) || own(run, 'id') !== c.runId || !(await trustedRun(gh, run, repo))) continue;   // an untrusted run is invisible
-    if (c.size > MAX_ARTIFACT_BYTES) { notes.push(`the ${artifactName} artifact of run ${c.runId} is over the size cap`); const stop = use(new Uint8Array(0), meta); if (stop !== undefined) return stop; continue; }
-    let bytes: unknown;
-    try { bytes = await gh.downloadArtifact(repo.owner, repo.name, c.id); } catch { notes.push(`the ${artifactName} artifact of run ${c.runId} could not be downloaded (deleted?)`); const stop = use(new Uint8Array(0), meta); if (stop !== undefined) return stop; continue; }
-    if (!(bytes instanceof Uint8Array)) { notes.push(`the ${artifactName} artifact of run ${c.runId} is not bytes`); const stop = use(new Uint8Array(0), meta); if (stop !== undefined) return stop; continue; }
-    const stop = use(bytes, meta);
-    if (stop !== undefined) return stop;
+  for (let page = 1; page <= MAX_RUN_PAGES; page++) {
+    let listing: unknown;
+    try {
+      listing = await gh.listRuns(repo.owner, repo.name, { workflow: 'pipegen.yml', branch: repo.defaultBranch, event: 'push', status: 'success', page, perPage: RUNS_PER_PAGE });
+    } catch { notes.push('the list of workflow runs could not be read'); return undefined; }
+    const runs = isPlain(listing) && Array.isArray(own(listing, 'workflow_runs')) ? (own(listing, 'workflow_runs') as unknown[]) : undefined;
+    if (runs === undefined) { notes.push('the list of workflow runs is not a list'); return undefined; }
+    const ordered = runs.filter((r): r is Record<string, unknown> => isPlain(r) && posInt(own(r, 'id'))).sort((x, y) => (own(y, 'id') as number) - (own(x, 'id') as number));
+    for (const r of ordered) {
+      if (!(await trustedRun(gh, r, repo))) continue;   // an untrusted run is invisible: no artifact call, no budget
+      if (++trustedSeen > MAX_TRUSTED_RUNS) { notes.push('too many runs without a usable artifact'); return undefined; }
+      const runId = own(r, 'id') as number;
+      let found: Candidate[];
+      try { found = candidatesOf(await gh.listRunArtifacts(repo.owner, repo.name, runId, artifactName), artifactName, runId); } catch { notes.push(`the artifacts of run ${runId} could not be read`); continue; }
+      const live = found.filter((c) => {
+        const gone = expiryProblem({ runId, name: artifactName, expired: c.expired, expiresAt: c.expiresAt }, ctx.now) !== undefined;
+        if (gone) expired++;
+        return !gone;
+      });
+      const c = live[0];
+      if (c === undefined) continue;
+      const meta: ArtifactMeta = { runId, name: artifactName, expired: false, expiresAt: c.expiresAt };
+      const stop = (note: string): T | undefined => { notes.push(note); return use(new Uint8Array(0), meta); };
+      if (c.size > MAX_ARTIFACT_BYTES) { const x = stop(`the ${artifactName} artifact of run ${runId} is over the size cap`); if (x !== undefined) return x; continue; }
+      let bytes: unknown;
+      try { bytes = await gh.downloadArtifact(repo.owner, repo.name, c.id); } catch { const x = stop(`the ${artifactName} artifact of run ${runId} could not be downloaded (deleted?)`); if (x !== undefined) return x; continue; }
+      if (!(bytes instanceof Uint8Array)) { const x = stop(`the ${artifactName} artifact of run ${runId} is not bytes`); if (x !== undefined) return x; continue; }
+      const x = use(bytes, meta);
+      if (x !== undefined) return x;
+    }
+    if (runs.length < RUNS_PER_PAGE) break;
   }
   if (expired > 0 && notes.length === 0) notes.push(`the ${artifactName} artifact has expired`);
   return undefined;

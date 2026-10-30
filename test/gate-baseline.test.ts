@@ -7,7 +7,7 @@ import { describe, expect, it } from 'vitest';
 import { BASELINE_ARTIFACT, CLEAN_RUN_ARTIFACT } from '../src/engine/artifact-names.js';
 import {
   buildBaseline, buildCleanRunMarker, cleanRunSeen, inDefaultHistory, loadBaseline, saveBaseline, trustedRun, verifyBaselineArtifact, verifyCleanRunArtifact,
-  BASELINE_RETENTION_DAYS, MAX_CANDIDATES, WORKFLOW_PATH, type ArtifactMeta, type ArtifactUploader, type GateGithub, type RepoRef, type VerifyContext,
+  BASELINE_RETENTION_DAYS, MAX_RUN_PAGES, MAX_TRUSTED_RUNS, WORKFLOW_PATH, type ArtifactMeta, type ArtifactUploader, type GateGithub, type RepoRef, type RunQuery, type VerifyContext,
 } from '../gate/src/baseline.js';
 import { countKeyOf } from '../gate/src/decide.js';
 import { keyId } from '../gate/src/fingerprint.js';
@@ -53,18 +53,27 @@ const META = (over: Partial<ArtifactMeta> = {}): ArtifactMeta => ({ runId: 100, 
 // ---------- a fake GitHub (every answer is plain data, as the REST API would give) ----------
 
 type Answer = unknown | Error;
+const PER_PAGE = 100;
 class FakeGh implements GateGithub {
   calls: string[] = [];
   compares = new Map<string, Answer>();      // sha -> compare answer (default: ahead)
-  runs = new Map<number, Answer>();
-  artifacts: Answer = { total_count: 0, artifacts: [] };
+  runsAnswer: Answer = [];                   // an array of run objects (paged by the fake) or any hostile answer
+  runArtifacts = new Map<number, Answer>();  // run id -> the artifacts answer of that run
   blobs = new Map<number, Answer>();
   fallbackCompare: Answer = { status: 'ahead' };
+  tagAnswer: Answer = false;                 // does a tag named like the default branch exist?
   private out(a: Answer): unknown { if (a instanceof Error) throw a; return a; }
   async compare(_o: string, _n: string, base: string, head: string): Promise<unknown> { this.calls.push(`compare ${base}...${head}`); return this.out(this.compares.has(base) ? this.compares.get(base) : this.fallbackCompare); }
-  async listArtifacts(_o: string, _n: string, name: string): Promise<unknown> { this.calls.push(`list ${name}`); return this.out(this.artifacts); }
-  async getRun(_o: string, _n: string, id: number): Promise<unknown> { this.calls.push(`run ${id}`); return this.out(this.runs.has(id) ? this.runs.get(id) : new Error('404')); }
+  async listRuns(_o: string, _n: string, q: RunQuery): Promise<unknown> {
+    this.calls.push(`runs ${q.page}`);
+    this.lastQuery = q;
+    const a = this.out(this.runsAnswer);
+    return Array.isArray(a) ? { workflow_runs: a.slice((q.page - 1) * q.perPage, q.page * q.perPage) } : a;
+  }
+  lastQuery: RunQuery | undefined;
+  async listRunArtifacts(_o: string, _n: string, runId: number, name: string): Promise<unknown> { this.calls.push(`artifacts ${runId} ${name}`); return this.out(this.runArtifacts.has(runId) ? this.runArtifacts.get(runId) : { artifacts: [] }); }
   async downloadArtifact(_o: string, _n: string, id: number): Promise<Uint8Array> { this.calls.push(`download ${id}`); return this.out(this.blobs.has(id) ? this.blobs.get(id) : new Error('404')) as Uint8Array; }
+  async tagExists(_o: string, _n: string, tag: string): Promise<boolean> { this.calls.push(`tag ${tag}`); return this.out(this.tagAnswer) as boolean; }
 }
 const run = (over: Record<string, unknown> = {}): Record<string, unknown> => ({
   id: 100, event: 'push', path: WORKFLOW_PATH, head_branch: 'main', head_sha: S1, head_repository: { id: 7 }, ...over,
@@ -73,10 +82,15 @@ const art = (id: number, runId: number, over: Record<string, unknown> = {}, name
   id, name, expired: false, expires_at: FUTURE, created_at: `2026-10-${String(10 + id).padStart(2, '0')}T00:00:00Z`, size_in_bytes: 500,
   workflow_run: { id: runId, head_branch: 'main', head_sha: S1, head_repository_id: 7 }, ...over,
 });
+/** The runs the (loose) server lists, the artifacts of each run (grouped by their workflow_run.id), and the file of each artifact. */
 function world(arts: Record<string, unknown>[], runs: Record<string, unknown>[], blobs: [number, unknown][]): FakeGh {
   const gh = new FakeGh();
-  gh.artifacts = { total_count: arts.length, artifacts: arts };
-  for (const r of runs) gh.runs.set(r.id as number, r);
+  gh.runsAnswer = runs;
+  for (const a of arts) {
+    const rid = ((a.workflow_run as Record<string, unknown> | undefined)?.id ?? 0) as number;
+    const cur = (gh.runArtifacts.get(rid) as { artifacts: unknown[] } | undefined) ?? { artifacts: [] };
+    gh.runArtifacts.set(rid, { artifacts: [...cur.artifacts, a] });
+  }
   for (const [id, b] of blobs) gh.blobs.set(id, b instanceof Error ? b : bytesOf(b));
   return gh;
 }
@@ -149,7 +163,7 @@ describe('trustedRun', () => {
     const gh = new FakeGh();
     gh.compares.set(S1, { status: 'diverged' });
     expect(await trusted(run({ head_branch: 'main' }), gh)).toBe(false);
-    expect(gh.calls).toEqual([`compare ${S1}...main`]);
+    expect(gh.calls).toContain(`compare ${S1}...main`);
   });
   it('trustedRun: head_sha not in default history (behind, diverged, API error, hostile answer) → rejected', async () => {
     for (const a of [{ status: 'behind' }, { status: 'diverged' }, new Error('404'), null, {}]) {
@@ -384,10 +398,11 @@ describe('loadBaseline (trusted runs only)', () => {
     const gh = world([a], [run({ id: 200, event: 'pull_request' })], [[2, signed(200)]]);
     expect((await load(gh)).baseline).toBeNull();
   });
-  it('baseline: the run the API returns must be the run the artifact belongs to', async () => {
-    const gh = world([art(2, 200)], [], [[2, signed(200)]]);
-    gh.runs.set(200, run({ id: 999 }));
+  it('baseline: an artifact listed under a run must belong to that run (its workflow_run.id)', async () => {
+    const gh = world([], [run({ id: 200 })], [[2, signed(200)]]);
+    gh.runArtifacts.set(200, { artifacts: [art(2, 999)] });
     expect((await load(gh)).baseline).toBeNull();
+    expect(gh.calls.some((c) => c.startsWith('download'))).toBe(false);
   });
   it('baseline: expired → null with note (flag, or past expiry)', async () => {
     for (const over of [{ expired: true }, { expires_at: PAST }, { expires_at: null }]) {
@@ -400,10 +415,11 @@ describe('loadBaseline (trusted runs only)', () => {
   });
   it('baseline: 404 → null, base-scan used (list, run or download fails or the artifact was deleted)', async () => {
     const e = new Error('404 Not Found');
-    const a = new FakeGh(); a.artifacts = e;
+    const a = world([art(2, 200)], [run({ id: 200 })], [[2, signed(200)]]); a.runsAnswer = e;   // the run list fails
     const b = world([art(2, 200)], [], [[2, signed(200)]]);   // the run is gone
+    const d = world([art(2, 200)], [run({ id: 200 })], [[2, signed(200)]]); d.runArtifacts.set(200, e);   // the artifact list fails
     const c = world([art(2, 200)], [run({ id: 200 })], [[2, e]]);   // the artifact was deleted
-    for (const gh of [a, b, c]) {
+    for (const gh of [a, b, c, d]) {
       const r = await load(gh);
       expect(r.baseline).toBeNull();
       expect(r.note).toBeTruthy();
@@ -415,15 +431,22 @@ describe('loadBaseline (trusted runs only)', () => {
   it('baseline: only an exact-name artifact counts', async () => {
     const gh = world([art(2, 200, {}, 'pipegen-baseline '), art(3, 300, {}, 'PIPEGEN-BASELINE'), art(4, 400, {}, CLEAN_RUN_ARTIFACT)], [run({ id: 200 }), run({ id: 300 }), run({ id: 400 })], [[2, signed(200)], [3, signed(300)], [4, signed(400)]]);
     expect((await load(gh)).baseline).toBeNull();
-    expect(gh.calls.filter((c) => c.startsWith('run'))).toEqual([]);
+    expect(gh.calls.some((c) => c.startsWith('download'))).toBe(false);
   });
   it('baseline: hostile listings are null (not an object, artifacts not a list, entries with bad ids, names or dates)', async () => {
     for (const listing of [null, 'x', [], {}, { artifacts: 'x' }, { artifacts: {} }, { artifacts: [null, 1, 'x', []] }, { artifacts: [{ id: 'x', name: BASELINE_ARTIFACT }] },
       { artifacts: [art(0, 100)] }, { artifacts: [art(1.5, 100)] }, { artifacts: [{ ...art(1, 100), workflow_run: null }] }, { artifacts: [{ ...art(1, 100), workflow_run: { id: '100' } }] }, { artifacts: [{ ...art(1, 100), created_at: 'yesterday' }] }]) {
       const gh = world([], [run()], [[1, signed(100)]]);
-      gh.artifacts = listing;
+      gh.runArtifacts.set(100, listing);
       const r = await load(gh);
       expect(r.baseline, JSON.stringify(listing)?.slice(0, 80)).toBeNull();
+    }
+  });
+  it('baseline: hostile run listings are null (not an object, workflow_runs not a list, junk entries)', async () => {
+    for (const listing of [null, 'x', 5, {}, { workflow_runs: 'x' }, { workflow_runs: {} }, { workflow_runs: [null, 1, 'x', []] }, { workflow_runs: [{ id: 'x' }] }]) {
+      const gh = world([art(2, 200)], [], [[2, signed(200)]]);
+      gh.runsAnswer = listing;
+      expect((await load(gh)).baseline, JSON.stringify(listing)).toBeNull();
     }
   });
   it('baseline: a forged newest trusted artifact (wrong MAC, missing MAC, another key, swapped run id) gives null — it does not fall back to an older one', async () => {
@@ -450,13 +473,56 @@ describe('loadBaseline (trusted runs only)', () => {
     expect(r.note).toMatch(/key/i);
     expect(gh.calls).toEqual([]);
   });
-  it('baseline: at most MAX_CANDIDATES artifacts are looked at (a flood of untrusted ones cannot cost unbounded calls or hide the trusted one past the cap)', async () => {
-    const forks = Array.from({ length: 60 }, (_, i) => art(100 + i, 1000 + i, { created_at: `2026-10-29T00:${String(i).padStart(2, '0')}:00Z` }));
-    const runs = forks.map((a, i) => run({ id: 1000 + i, event: 'pull_request', head_repository: { id: 8 } }));
-    const gh = world([...forks, art(1, 100, { created_at: '2026-10-01T00:00:00Z' })], [...runs, run({ id: 100 })], [[1, signed(100)]]);
+  it('baseline: 1,000 untrusted artifacts (PR runs, forks) do not hide the trusted one: runs are listed, artifacts only per trusted run', async () => {
+    const real = { [`fp\0a\0t\0${hex('real')}`]: 2 };
+    const gh = world([art(1, 100)], [run({ id: 100 })], [[1, signed(100, real)]]);
+    // a thousand newer artifacts of the same name, each in a PR run of a fork (they exist in the repo; the loader never lists them)
+    for (let i = 0; i < 1000; i++) gh.runArtifacts.set(5000 + i, { artifacts: [art(5000 + i, 5000 + i, { created_at: '2026-10-29T00:00:00Z' })] });
     const r = await load(gh);
+    expect(countsOf(r.baseline?.counts)).toEqual(real);
+    expect(gh.calls.filter((c) => c.startsWith('artifacts')).every((c) => c.startsWith('artifacts 100 '))).toBe(true);
+  });
+  it('baseline: the run list asks for push runs of the workflow on the default branch that succeeded, newest first, a bounded number of pages', async () => {
+    const gh = world([], [], []);
+    await load(gh);
+    expect(gh.lastQuery).toMatchObject({ workflow: 'pipegen.yml', branch: 'main', event: 'push', status: 'success', page: 1 });
+    // a flood of listed untrusted runs (a loose server) costs at most MAX_RUN_PAGES list calls and no artifact call
+    const flood = Array.from({ length: 1000 }, (_, i) => run({ id: 9000 - i, event: 'pull_request', head_repository: { id: 8 } }));
+    const g2 = world([], flood, []);
+    const r = await load(g2);
     expect(r.baseline).toBeNull();
-    expect(gh.calls.filter((c) => c.startsWith('run')).length).toBeLessThanOrEqual(MAX_CANDIDATES);
+    expect(g2.calls.filter((c) => c.startsWith('runs')).length).toBeLessThanOrEqual(MAX_RUN_PAGES);
+    expect(g2.calls.some((c) => c.startsWith('artifacts'))).toBe(false);
+  });
+  it('baseline: at most MAX_TRUSTED_RUNS trusted runs are searched for an artifact', async () => {
+    const runs = Array.from({ length: 60 }, (_, i) => run({ id: 1000 - i }));
+    const gh = world([], runs, []);
+    expect((await load(gh)).baseline).toBeNull();
+    expect(gh.calls.filter((c) => c.startsWith('artifacts')).length).toBeLessThanOrEqual(MAX_TRUSTED_RUNS);
+  });
+  it('baseline: a trusted run with no baseline artifact is skipped, the next trusted run is tried', async () => {
+    const real = { [`fp\0a\0t\0${hex('real')}`]: 3 };
+    const gh = world([art(1, 100)], [run({ id: 100 }), run({ id: 200 })], [[1, signed(100, real)]]);
+    expect(countsOf((await load(gh)).baseline?.counts)).toEqual(real);
+  });
+  it('trustedRun: a tag named like the default branch (the tag exists) makes no run trusted, even for a sha in the history; an error in the tag lookup does too', async () => {
+    const gh = new FakeGh(); gh.tagAnswer = true;
+    expect(await trustedRun(gh, run(), REPO)).toBe(false);
+    expect(gh.calls).toContain('tag main');
+    const err = new FakeGh(); err.tagAnswer = new Error('500');
+    expect(await trustedRun(err, run(), REPO)).toBe(false);
+    for (const odd of [undefined, null, 'true', 1]) { const g = new FakeGh(); g.tagAnswer = odd; expect(await trustedRun(g, run(), REPO), String(odd)).toBe(false); }
+    const none = new FakeGh();
+    expect(await trustedRun(none, run(), REPO)).toBe(true);
+    // asked once per client and branch, however many runs are judged
+    await trustedRun(none, run({ id: 101 }), REPO); await trustedRun(none, run({ id: 102 }), REPO);
+    expect(none.calls.filter((c) => c.startsWith('tag')).length).toBe(1);
+  });
+  it('baseline: with a tag named like the default branch, no baseline and no clean-run marker is trusted', async () => {
+    const gh = world([art(2, 200)], [run({ id: 200 })], [[2, signed(200)]]); gh.tagAnswer = true;
+    expect((await load(gh)).baseline).toBeNull();
+    const m = world([art(2, 200, {}, CLEAN_RUN_ARTIFACT)], [run({ id: 200 })], [[2, { runId: 200, keyId: keyId(KEY), mac: markerMac(KEY, 200, keyId(KEY)) }]]); m.tagAnswer = true;
+    expect((await cleanRunSeen(m, REPO, CTX)).seen).toBe(false);
   });
   it('baseline: a size over the cap in the listing is not downloaded', async () => {
     const gh = world([art(2, 200, { size_in_bytes: 50 * 1024 * 1024 })], [run({ id: 200 })], [[2, signed(200)]]);
@@ -478,7 +544,7 @@ describe('cleanRunSeen (trusted runs only)', () => {
   it('cleanRun: a marker from a trusted run, signed with the current key → seen', async () => {
     const gh = world([cart(2, 200)], [run({ id: 200 })], [[2, marker(200)]]);
     expect((await clean(gh)).seen).toBe(true);
-    expect(gh.calls[0]).toBe(`list ${CLEAN_RUN_ARTIFACT}`);
+    expect(gh.calls).toContain(`artifacts 200 ${CLEAN_RUN_ARTIFACT}`);
   });
   it('cleanRun: marker from untrusted run ignored (pull_request event, fork, tag named main, not in history, wrong path)', async () => {
     for (const r of [run({ id: 200, event: 'pull_request' }), run({ id: 200, head_repository: { id: 8 } }), run({ id: 200, path: '.github/workflows/other.yml' }), run({ id: 200, head_branch: 'feature' })]) {
@@ -500,8 +566,14 @@ describe('cleanRunSeen (trusted runs only)', () => {
     const gh = world([cart(2, 200)], [run({ id: 200 })], [[2, marker(200)]]);
     expect((await clean(gh, { key: undefined, now: NOW })).seen).toBe(false);
     expect(gh.calls).toEqual([]);
-    const err = new FakeGh(); err.artifacts = new Error('500');
+    const err = new FakeGh(); err.runsAnswer = new Error('500');
     expect((await clean(err)).seen).toBe(false);
+  });
+  it('cleanRun: 1,000 untrusted markers (PR runs) do not hide the trusted one', async () => {
+    const gh = world([cart(2, 200)], [run({ id: 200 })], [[2, marker(200)]]);
+    for (let i = 0; i < 1000; i++) gh.runArtifacts.set(5000 + i, { artifacts: [cart(5000 + i, 5000 + i)] });
+    expect((await clean(gh)).seen).toBe(true);
+    expect(gh.calls.filter((c) => c.startsWith('artifacts')).every((c) => c.startsWith('artifacts 200 '))).toBe(true);
   });
   it('cleanRun: any valid trusted marker counts (not only the newest)', async () => {
     const gh = world([cart(2, 200), cart(3, 300)], [run({ id: 200 }), run({ id: 300, event: 'pull_request' })], [[2, marker(200)], [3, marker(300)]]);
@@ -636,10 +708,11 @@ describe('property: no artifact or API answer that fails any check is ever retur
     { name: 'no key', apply: (w) => { w.ctx = { key: undefined, now: NOW }; } },
     { name: 'short key', apply: (w) => { w.ctx = { key: 'abc', now: NOW }; } },
     { name: 'run missing', apply: (w) => { w.dropRun = true; } },
+    { name: 'a tag named like the default branch exists', apply: (w) => { w.tag = true; } },
   ];
   interface Scenario {
     runId: number; doc: Doc; rawCount?: string; truncate?: boolean; run: Record<string, unknown>; compare: Answer; artMeta: Record<string, unknown>;
-    downloadError?: boolean; ctx: VerifyContext; dropRun?: boolean;
+    downloadError?: boolean; ctx: VerifyContext; dropRun?: boolean; tag?: boolean;
   }
   const fresh = (): Scenario => ({ runId: 100, doc: goodDoc(), run: run({ id: 100 }), compare: { status: 'ahead' }, artMeta: art(7, 100), ctx: CTX });
   async function evaluate(w: Scenario): Promise<ReturnType<typeof loadBaseline> extends Promise<infer R> ? R : never> {
@@ -650,8 +723,9 @@ describe('property: no artifact or API answer that fails any check is ever retur
     }
     if (w.truncate) text = text.slice(0, text.length - 7);
     const gh = new FakeGh();
-    gh.artifacts = { artifacts: [w.artMeta] };
-    if (!w.dropRun) gh.runs.set(100, w.run);
+    gh.runsAnswer = w.dropRun ? [] : [w.run];
+    gh.runArtifacts.set(w.run.id as number, { artifacts: [w.artMeta] });
+    gh.tagAnswer = w.tag ?? false;
     gh.fallbackCompare = w.compare;
     gh.blobs.set(7, w.downloadError ? new Error('404') : bytesOf(text));
     return loadBaseline(gh, REPO, w.ctx);
