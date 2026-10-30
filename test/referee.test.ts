@@ -15,7 +15,7 @@ import { GATE_CHECK_NAME, type Capabilities, type CreatedFile, type ExistingWork
 import { stub } from './helpers/linter-stub.js';
 import { entry, gateEntry, platform, profile, reviewedList, service, specFor, scansFor } from './helpers/render.js';
 import { fake } from './helpers/secret-repo.js';
-import { renderStage as renderStageC1c } from '../src/engine/render-step.js';
+import { renderGateUploads, renderStage as renderStageC1c } from '../src/engine/render-step.js';
 import { isStagedTool } from '../src/engine/tool-flags.js';
 
 // ---------- builders ----------
@@ -187,7 +187,7 @@ describe('referee: the renderer and the referee agree', () => {
     d.needs.push(needOf('unit-tests', true, 'script-app'), needOf('lint', true, 'script-app'));
     // the gate job: no checkout (ruling S21), the job list of this draft, and a needs entry for every job of it (ruling S4)
     const entries = gateJobList(d);
-    jobs.gate = job([...harden, download(), renderGateStep(GATE, entries)], { name: GATE_CHECK_NAME.split(' / ')[1], if: 'always()', needs: entries.map((e) => e.job), permissions: { contents: 'read', actions: 'read', 'pull-requests': 'read' } });
+    jobs.gate = job([...harden, download(), renderGateStep(GATE, entries), ...renderGateUploads(platform())], { name: GATE_CHECK_NAME.split(' / ')[1], if: 'always()', needs: entries.map((e) => e.job), permissions: { contents: 'read', actions: 'read', 'pull-requests': 'read' } });
     const r = await run([wf(jobs)], d, { list: [...reviewedList(), GATE, WATCHER] });
     for (const id of Object.keys(JOB_STEP_POLICY)) expect(Object.keys(jobs), id).toContain(id);
     expect(show(r)).toBe('');
@@ -226,7 +226,7 @@ describe('referee: pins', () => {
     const step = (t: ReviewedTool, s: string): RenderedStep => (t.id === GATE.id
       ? { ...renderGateStep(GATE, []), uses: (t.step.action?.uses as string).replace(/@.*$/, `@${s}`) }
       : { name: t.id, uses: (t.step.action?.uses as string).replace(/@.*$/, `@${s}`), with: { mode: t.fixedInputs.with?.mode as string } });
-    const ok = await run([wf({ gate: job([step(GATE, sha('1'))], { if: 'always()', permissions: { contents: 'read', actions: 'read', 'pull-requests': 'read' } }), watch: job([step(WATCHER, sha('2'))], { permissions: { contents: 'read', issues: 'write', actions: 'read' } }) })], draftOf([]), { list });
+    const ok = await run([wf({ gate: job([step(GATE, sha('1')), ...renderGateUploads(platform())], { if: 'always()', permissions: { contents: 'read', actions: 'read', 'pull-requests': 'read' } }), watch: job([step(WATCHER, sha('2'))], { permissions: { contents: 'read', issues: 'write', actions: 'read' } }) })], draftOf([]), { list });
     expect(show(ok)).toBe('');
     for (const [t, other] of [[GATE, sha('3')], [WATCHER, sha('4')]] as const) {
       const r = await run([wf({ gate: job([step(t, other)], { permissions: { contents: 'read', actions: 'read' } }) })], draftOf([]), { list });
@@ -824,7 +824,7 @@ describe('fix round 1: the reviewer\'s attacks are refused', () => {
     }
   });
   it('job-level central: accepted only at the recorded SHA with the called file in files (and judged there)', async () => {
-    const called = { ...wf({ gate: job([gateStep()], { if: 'always()', permissions: { contents: 'read', actions: 'read', 'pull-requests': 'read' } }) }, { on: { workflow_call: null } }, '.github/workflows/gate.yml'), repo: 'central' as const };
+    const called = { ...wf({ gate: job([gateStep(), ...renderGateUploads(platform())], { if: 'always()', permissions: { contents: 'read', actions: 'read', 'pull-requests': 'read' } }) }, { on: { workflow_call: null } }, '.github/workflows/gate.yml'), repo: 'central' as const };
     const caller = (at: string): CreatedFile => wf({ pipegen: { name: 'pipegen', uses: `o/pipelines/.github/workflows/gate.yml@${at}`, permissions: { contents: 'read', actions: 'read', 'pull-requests': 'read' }, [SEC_FIELD]: { PIPEGEN_FP_KEY: ref('PIPEGEN_FP_KEY') } } });
     expect(show(await run([caller(CENTRAL.sha), called], draftOf([], { centralPin: CENTRAL }), { list: LIST }))).toBe('');
     expect(has(await run([caller(sha('d')), called], draftOf([], { centralPin: CENTRAL }), { list: LIST }), 'unknown-pin')).toBe(true);

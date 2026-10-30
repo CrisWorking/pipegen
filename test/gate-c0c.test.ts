@@ -18,7 +18,7 @@ import { existsSync, mkdtempSync, writeFileSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { entry, gateEntry, platform, profile, reviewedList, service, specFor } from './helpers/render.js';
-import { renderStage as renderStageC1c } from '../src/engine/render-step.js';
+import { renderGateUploads, renderStage as renderStageC1c } from '../src/engine/render-step.js';
 import { isStagedTool } from '../src/engine/tool-flags.js';
 
 // object keys spelled at run time (see test/no-secret-literals.test.ts)
@@ -86,7 +86,7 @@ const withScrub = (steps: RenderedStep[], f: (s: RenderedStep) => RenderedStep):
 
 
 const GATE_PERM = { contents: 'read', actions: 'read', 'pull-requests': 'read' };
-const gateJ = (list: ReturnType<typeof gateJobList>): Job => job([renderGateStep(GATE, list)], { name: 'gate', if: 'always()', needs: list.map((e) => e.job), permissions: GATE_PERM });
+const gateJ = (list: ReturnType<typeof gateJobList>): Job => job([renderGateStep(GATE, list), ...renderGateUploads(p)], { name: 'gate', if: 'always()', needs: list.map((e) => e.job), permissions: GATE_PERM });
 const harden = (): RenderedStep[] => renderStep(specFor(entry('bullfrog'), { needId: 'egress' }), entry('bullfrog'), p, ctx).steps;
 
 describe('CF1: a spec\'s tool must cover its need', () => {
@@ -173,7 +173,7 @@ describe('CF3a: one event-switched base form', () => {
     const baseBlocks = specs.map((s) => block(s, { ...ctx, base: true }));
     const steps = over([...prelude({ baseRef: true }), ...baseBlocks.flatMap((b) => b.steps)]);
     out['base-scan'] = job(steps, { outputs: jobOutputsFor(steps) });   // C5a: with the base-sha output of its base checkout
-    out.gate = job([renderGateStep(GATE, entries)], { name: 'gate', if: 'always()', needs: [...entries.map((e) => e.job), 'base-scan'], permissions: GATE_PERM });
+    out.gate = job([renderGateStep(GATE, entries), ...renderGateUploads(p)], { name: 'gate', if: 'always()', needs: [...entries.map((e) => e.job), 'base-scan'], permissions: GATE_PERM });
     return out;
   }
   const wfOn = (on: unknown, j: Record<string, Job>): CreatedFile => {
@@ -197,7 +197,7 @@ describe('CF3a: one event-switched base form', () => {
       const j = jobs();
       const g = j.gate as Job;
       const step = (g.steps as RenderedStep[])[0] as RenderedStep;
-      return { ...j, gate: { ...g, steps: [{ ...step, with: { ...step.with, 'service-roots': v } }] } };
+      return { ...j, gate: { ...g, steps: [{ ...step, with: { ...step.with, 'service-roots': v } }, ...(g.steps as RenderedStep[]).slice(1)] } };
     };
     expect(show(await run([wfOn('pull_request', withRoots('[".", "web"]'))], d))).toBe('');
     expect((await run([wfOn('pull_request', withRoots('["../x"]'))], d)).ok).toBe(false);

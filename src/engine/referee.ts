@@ -39,11 +39,11 @@ import { NEED_ID_CATEGORY, toolCoversNeed } from './need-ids.js';
 import { PLATFORM_ACTION_IDS, type PlatformActions } from './pin.js';
 import { APP_RUNNING_CATEGORIES, TRIVY_LAUNCH_RE } from './render-cli.js';
 import { EXPR, own, show } from './render-error.js';
-import { ACTION_PATH_RE, checkExpressions, createdPathProblem, checkJobOrder, IF_VALUES, isDangerousName, isReviewed, isScrubStep, isStageStep, jobOutputsProblems, SECRET_REF_RE, STEP_KEYS as STEP_KEY_LIST, WORKFLOW_PATH_RE, type RenderedStep, type ScanFact } from './job-rules.js';
+import { ACTION_PATH_RE, checkExpressions, createdPathProblem, checkJobOrder, gateResultUploadProblems, IF_VALUES, isDangerousName, isReviewed, isScrubStep, isStageStep, jobOutputsProblems, SECRET_REF_RE, STEP_KEYS as STEP_KEY_LIST, WORKFLOW_PATH_RE, type RenderedStep, type ScanFact } from './job-rules.js';
 import { containerRefusal, RenderError, renderProjectScript, renderStep, sameDedupeContent, type RenderContext } from './render-step.js';
 import { projectScriptFor } from './reviewed.js';
 import { slotProblem, type SlotKind } from './slots.js';
-import { ARGV_POLICIES, CACHE_LOCKS, PLAIN_REL_RE, PLATFORM_USES, RENDERER_INPUTS, rendererInputProblems, SCRUB_SECRET, uploadIfNoFiles } from './tool-flags.js';
+import { ARGV_POLICIES, CACHE_LOCKS, GATE_OPTIONAL_UPLOADS, PLAIN_REL_RE, PLATFORM_USES, RENDERER_INPUTS, rendererInputProblems, SCRUB_SECRET, uploadIfNoFiles } from './tool-flags.js';
 
 // ---------- the report ----------
 
@@ -673,6 +673,8 @@ function judgeGateSteps(fc: FileCtx, id: string, where: string, j: Obj, judged: 
     return;
   }
   const g = gates[0] as Judged;
+  // fix round 1 (ruling 1): the result upload right after the gate step, so the job can not succeed without the gate's result
+  for (const problem of gateResultUploadProblems(judged.map((x) => x.step))) bad('not-gate-readable', `${where}: ${problem}`);
   const needs = needsList(j.needs).filter((x): x is string => typeof x === 'string');
   if (g.step.with?.jobs === undefined) bad('not-gate-readable', `${where}: the gate step has no jobs input, so it would not see the results of the jobs it needs.`);
   const literal = g.step.with?.['job-list'];
@@ -1026,7 +1028,10 @@ function judgeStep(fc: FileCtx, where: string, raw: unknown): Judged {
   }
   // ruling 4: a step that feeds the gate is never skipped on success and its failure always counts: no continue-on-error,
   // and `if:` only success(), or always() on an upload or a scrub (so a failed job still hands its result to the gate)
-  if (raw['continue-on-error'] !== undefined && raw['continue-on-error'] !== false) bad('template', at('continue-on-error would let a failed step pass; pipegen never sets it.'));
+  // fix round 1 (ruling 2): except on the gate's baseline and clean-run marker uploads, whose failure is never a gate failure; their job and
+  // place (job gate, after the gate step) are the shared order rule's (gateUploadProblems)
+  const optionalGateUpload = kind === 'upload-artifact' && typeof withs.name === 'string' && GATE_OPTIONAL_UPLOADS.has(withs.name);
+  if (raw['continue-on-error'] !== undefined && raw['continue-on-error'] !== false && !(optionalGateUpload && raw['continue-on-error'] === true)) bad('template', at('continue-on-error would let a failed step pass; pipegen sets it only on the gate\'s baseline and clean-run marker uploads.'));
   if (raw.if !== undefined && raw.if !== 'success()' && !(raw.if === 'always()' && (kind === 'upload-artifact' || kind === 'upload-sarif' || kind === 'scrub'))) {
     bad('template', at(`if: ${safeText(String(raw.if), 20)} could skip this step while the job passes (only success(), or always() on an upload or a scrub).`));
   }

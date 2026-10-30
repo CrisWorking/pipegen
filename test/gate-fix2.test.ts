@@ -14,7 +14,7 @@ import { rendererInputProblems } from '../src/engine/tool-flags.js';
 import { emptyRepoFiles } from '../src/read/quality.js';
 import type { Capabilities, CreatedFile, Need, PipelineDraft, ReviewedTool, StepSpec } from '../src/types.js';
 import { entry, gateEntry, platform, profile, reviewedList, service, specFor } from './helpers/render.js';
-import { renderStage as renderStageC1c } from '../src/engine/render-step.js';
+import { renderGateUploads, renderStage as renderStageC1c } from '../src/engine/render-step.js';
 import { isStagedTool } from '../src/engine/tool-flags.js';
 
 // object keys spelled at run time (see test/no-secret-literals.test.ts)
@@ -99,7 +99,7 @@ function jobs(baseRef: BaseRef = 'pull-request-base'): Record<string, Job> {
   const baseBlocks = specs.map((s) => block(s, { ...ctx, base: true }));
   const baseSteps = [...prelude(baseRef === 'none' ? {} : { baseRef: true }), ...baseBlocks.flatMap((b) => b.steps)];
   out['base-scan'] = job(baseSteps, { outputs: jobOutputsFor(baseBlocks.flatMap((b) => b.steps)) });
-  out.gate = job([renderGateStep(GATE, entries)], { name: 'gate', if: 'always()', needs: [...entries.map((e) => e.job), 'base-scan'], permissions: GATE_PERM });
+  out.gate = job([renderGateStep(GATE, entries), ...renderGateUploads(p)], { name: 'gate', if: 'always()', needs: [...entries.map((e) => e.job), 'base-scan'], permissions: GATE_PERM });
   return out;
 }
 function wfOn(on: unknown, jobsIn: Record<string, Job>, raw = false): CreatedFile {
@@ -121,7 +121,7 @@ describe('finding 1: action checks are bound (ruling 1)', () => {
   const dd = draftOf([drSpec()], [needOf('dependency-review')]);
   const list = gateJobList(dd);
   const dr = renderStep(drSpec(), entry('dependency-review-action'), p, ctx).steps;
-  const gateJ = (): Job => job([renderGateStep(GATE, list)], { name: 'gate', if: 'always()', needs: list.map((e) => e.job), permissions: GATE_PERM });
+  const gateJ = (): Job => job([renderGateStep(GATE, list), ...renderGateUploads(p)], { name: 'gate', if: 'always()', needs: list.map((e) => e.job), permissions: GATE_PERM });
   it('R0: the honest layout (the action in its listed job) passes', async () => {
     expect(list.map((e) => e.job)).toEqual(['dependency-review']);
     expect(show(await run([workflow({ 'dependency-review': job([...prelude(), ...dr]), gate: gateJ() })], dd))).toBe('');
@@ -164,7 +164,7 @@ describe('finding 2: the binding is judged in the gate\'s own file (ruling 2)', 
     const dd = draftOf([drSpec], [needOf('dependency-review')]);
     const list = gateJobList(dd);
     const dr = renderStep(drSpec, entry('dependency-review-action'), p, ctx).steps;
-    const f1 = workflow({ 'dependency-review': job(prelude()), gate: job([renderGateStep(GATE, list)], { name: 'gate', if: 'always()', needs: list.map((e) => e.job), permissions: GATE_PERM }) }, true);
+    const f1 = workflow({ 'dependency-review': job(prelude()), gate: job([renderGateStep(GATE, list), ...renderGateUploads(p)], { name: 'gate', if: 'always()', needs: list.map((e) => e.job), permissions: GATE_PERM }) }, true);
     const f2 = wfAt(workflow({ 'dependency-review': job([...prelude(), ...dr]) }), '.github/workflows/other.yml');
     const r = await run([f1, f2], dd);
     expect(has(r, 'not-gate-readable', /holds no step of the action check/), show(r)).toBe(true);
@@ -194,7 +194,7 @@ describe('minor (ruling 5): a listed job that holds both a reviewed tool and its
     expect(list.map((e) => e.job)).toEqual(['lint--app']);
     const tool = renderStep(spec, t, p, ctx).steps;
     const script = renderProjectScript({ kind: 'project-script', needId: 'lint', service: 'app', script: 'lint' }, p, ctx).steps;
-    const gateJ = job([renderGateStep(GATE, list)], { name: 'gate', if: 'always()', needs: list.map((e) => e.job), permissions: GATE_PERM });
+    const gateJ = job([renderGateStep(GATE, list), ...renderGateUploads(p)], { name: 'gate', if: 'always()', needs: list.map((e) => e.job), permissions: GATE_PERM });
     const both = dedupeJobSteps([...prelude(), ...tool, ...script], { id: 'lint--app', scans: new Map() });
     const ok = await run([workflow({ 'lint--app': job(both), gate: gateJ })], dd);
     expect(show(ok)).toBe('');

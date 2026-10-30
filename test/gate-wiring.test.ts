@@ -310,7 +310,7 @@ describe('referee: the gate job (rulings S4 and S21)', () => {
     'sast--app': job(dedupeJobSteps([...prelude(), ...s.steps], { id: 'sast--app', scans: facts(s) }), { outputs: jobOutputsFor(s.steps) }),
   });
   const GATE_PERM = { contents: 'read', actions: 'read', 'pull-requests': 'read' };
-  const gateJob = (step: RenderedStep, over: Job = {}): Job => job([step], { name: 'gate', if: 'always()', needs: entries.map((e) => e.job), permissions: GATE_PERM, ...over });
+  const gateJob = (step: RenderedStep, over: Job = {}): Job => job([step, ...renderGateUploads(p)], { name: 'gate', if: 'always()', needs: entries.map((e) => e.job), permissions: GATE_PERM, ...over });
   const withIn = (step: RenderedStep, w: Record<string, string>): RenderedStep => ({ ...step, with: { ...step.with, ...w } });
 
   it('referee: a gate job with the rendered gate step, the right job list and needs, and the scanner jobs → no issue', async () => {
@@ -376,7 +376,7 @@ describe('referee: the gate job (rulings S4 and S21)', () => {
     expect(JOB_STEP_POLICY.gate).toEqual(expect.arrayContaining(['harden', 'download-artifact', 'gate']));
     const r = await run([workflow({ ...scanJobs(), gate: gateJob(renderGateStep(GATE, entries)) })], d);
     expect(show(r)).toBe('');
-    const withCheckout = job([...prelude(), renderGateStep(GATE, entries)], { name: 'gate', if: 'always()', needs: entries.map((e) => e.job), permissions: GATE_PERM });
+    const withCheckout = job([...prelude(), renderGateStep(GATE, entries), ...renderGateUploads(p)], { name: 'gate', if: 'always()', needs: entries.map((e) => e.job), permissions: GATE_PERM });
     const r2 = await run([workflow({ ...scanJobs(), gate: withCheckout })], d);
     expect(has(r2, 'permissions', /checkout step/), show(r2)).toBe(true);
     // the other rows that read a workspace keep their checkout
@@ -556,7 +556,7 @@ describe('parity: a full draft (two services, scanners, base-scan, gate job) thr
     const baseBlocks = specs.map((s) => block(s, { ...ctx, base: true }));
     const baseSteps = [...prelude({ baseRef: true }), ...baseBlocks.flatMap((b) => b.steps)];
     out['base-scan'] = job(dedupeJobSteps(baseSteps, { id: 'base-scan', scans: facts(...baseBlocks) }), { outputs: jobOutputsFor(baseBlocks.flatMap((b) => b.steps)) });
-    out.gate = job([renderGateStep(GATE, entries)], { name: 'gate', if: 'always()', needs: [...entries.map((e) => e.job), 'base-scan'], permissions: GATE_PERM });
+    out.gate = job([renderGateStep(GATE, entries), ...renderGateUploads(p)], { name: 'gate', if: 'always()', needs: [...entries.map((e) => e.job), 'base-scan'], permissions: GATE_PERM });
     return out;
   }
   const files = (j: Record<string, Job>, raw = false): CreatedFile[] => [workflow(j, raw)];
@@ -738,5 +738,88 @@ describe('C5b: renderGateUploads and the reserved gate uploads', () => {
       [`${g.artifact}-sha256`]: `\${{ steps.${id}.outputs.sha256 }}`, [`${g.artifact}-status`]: `\${{ steps.${id}.outputs.status }}`, [`${g.artifact}-error`]: `\${{ steps.${id}.outputs.error }}`,
     });
     expect(jobOutputsProblems('secrets', { [`${g.artifact}-sha256`]: `\${{ steps.${id}.outputs.${g.artifact}-sha256 }}` }, g.steps).length).toBe(1);
+  });
+});
+
+// ---------- C5b fix round 1 (task-C5b-fix-round-1.md rulings 1 and 2) ----------
+// The result upload is required right after the gate step; continue-on-error is allowed on exactly the baseline and the marker
+// uploads in job gate (after the gate step), and refused everywhere else. Written first.
+import { isGateDecideStep } from '../src/engine/job-rules.js';
+
+describe('C5b fix round 1: the required result upload and the optional uploads that never fail the gate', () => {
+  const specs = [gitleaksSpec(), semgrepSpec('app')];
+  const needs = [needOf('secrets'), needOf('sast', 'app')];
+  const d = draftOf(specs, needs);
+  const entries = gateJobList(d);
+  const g = block(specs[0] as StepSpec);
+  const s = block(specs[1] as StepSpec);
+  const scanJobs = (): Record<string, Job> => ({
+    [SEC]: job(dedupeJobSteps([...prelude(), ...g.steps], { id: 'secrets', scans: facts(g) }), { outputs: jobOutputsFor(g.steps) }),
+    'sast--app': job(dedupeJobSteps([...prelude(), ...s.steps], { id: 'sast--app', scans: facts(s) }), { outputs: jobOutputsFor(s.steps) }),
+  });
+  const GATE_PERM = { contents: 'read', actions: 'read', 'pull-requests': 'read' };
+  const gateJob = (steps: RenderedStep[]): Job => job(steps, { name: 'gate', if: 'always()', needs: entries.map((e) => e.job), permissions: GATE_PERM });
+  const gateStep = (): RenderedStep => renderGateStep(GATE, entries);
+  const coe = (x: RenderedStep, v: boolean | undefined): RenderedStep => { const c = { ...x }; if (v === undefined) delete c['continue-on-error']; else c['continue-on-error'] = v; return c; };
+  const one = async (gateSteps: RenderedStep[], extra: Record<string, Job> = {}): Promise<RefereeReport> => run([workflow({ ...scanJobs(), ...extra, gate: gateJob(gateSteps) }, true)], d);
+
+  it('renderGateUploads: continue-on-error true on the baseline and the marker uploads only', () => {
+    expect(renderGateUploads(p).map((x) => x['continue-on-error'])).toEqual([undefined, true, true]);
+    expect(() => stepsToYaml([gateStep(), ...renderGateUploads(p)])).not.toThrow();
+  });
+
+  it('isGateDecideStep: the gate step with an id is not the deciding step (ids belong to other kinds)', () => {
+    expect(isGateDecideStep(gateStep())).toBe(true);
+    expect(isGateDecideStep({ ...gateStep(), id: 'gate' })).toBe(false);
+    expect(isKnownHarmless({ ...gateStep(), id: 'pipegen-gate' })).toBe(false);
+  });
+
+  it('checkJobOrder: continue-on-error only on the two optional gate uploads in job gate; on the result upload, a result upload, a tool step or elsewhere → problems', () => {
+    const [r, b, m] = renderGateUploads(p) as [RenderedStep, RenderedStep, RenderedStep];
+    expect(checkJobOrder([gateStep(), r, b, m], { id: 'gate', scans: NO_SCANS })).toEqual([]);
+    const bad = (steps: RenderedStep[], id: string, re: RegExp): void => {
+      const got = checkJobOrder(steps, { id, scans: id === 'secrets' ? facts(g) : NO_SCANS });
+      expect(got.some((x) => re.test(x)), `${id}: ${got.join(' | ')}`).toBe(true);
+    };
+    bad([gateStep(), coe(r, true), b, m], 'gate', /continue-on-error/);
+    bad([...prelude(), ...g.steps.map((x) => (x === g.upload ? coe(x, true) : x))], 'secrets', /continue-on-error/);
+    bad([...prelude(), ...g.steps.map((x) => (x === g.scrub ? coe(x, true) : x))], 'secrets', /continue-on-error/);
+    bad([gateStep(), r, b, m, coe(prelude()[0] as RenderedStep, true)], 'gate', /continue-on-error/);
+    bad([...prelude(), b], 'secrets', /only the gate job/);
+  });
+
+  it('referee: the gate job with the rendered uploads (continue-on-error on the two optional ones) → no issue', async () => {
+    const r = await one([gateStep(), ...renderGateUploads(p)]);
+    expect(show(r)).toBe('');
+  });
+
+  it('referee: no result upload, the result upload not right after the gate step, without always(), or with continue-on-error → not-gate-readable / issues', async () => {
+    const [r0, b0, m0] = renderGateUploads(p) as [RenderedStep, RenderedStep, RenderedStep];
+    const none = await one([gateStep()]);
+    expect(has(none, 'not-gate-readable', /pipegen-gate-result/), show(none)).toBe(true);
+    const later = await one([gateStep(), b0, r0, m0]);
+    expect(has(later, 'not-gate-readable', /right after the gate step/), show(later)).toBe(true);
+    const ok = await one([gateStep(), r0, b0, m0]);
+    expect(show(ok)).toBe('');
+    const noAlways = await one([gateStep(), { ...r0, if: 'success()' }, b0, m0]);
+    expect(has(noAlways, 'not-gate-readable', /pipegen-gate-result/), show(noAlways)).toBe(true);
+    const lenient = await one([gateStep(), coe(r0, true), b0, m0]);
+    // each layer on its own: the result-upload rule (not-gate-readable), the step template rule and the shared order rule (injection)
+    expect(has(lenient, 'not-gate-readable', /continue-on-error/), show(lenient)).toBe(true);
+    expect(has(lenient, 'template', /continue-on-error/), show(lenient)).toBe(true);
+    expect(has(lenient, 'injection', /continue-on-error/), show(lenient)).toBe(true);
+    // the optional ones without continue-on-error are still allowed (the ruling allows it, it does not require it)
+    expect(show(await one([gateStep(), r0, coe(b0, undefined), coe(m0, undefined)]))).toBe('');
+  });
+
+  it('referee: continue-on-error anywhere else (a scanner upload, a scrub, a tool step) is still refused', async () => {
+    const j = scanJobs();
+    const secSteps = (j[SEC] as Job).steps as RenderedStep[];
+    for (const pick of [(x: RenderedStep) => x.with?.name === g.artifact, (x: RenderedStep) => x.id?.startsWith('scrub-') === true, (x: RenderedStep) => x.run !== undefined]) {
+      const steps = secSteps.map((x) => (pick(x) ? coe(x, true) : x));
+      const r = await run([workflow({ ...j, [SEC]: { ...(j[SEC] as Job), steps }, gate: gateJob([gateStep(), ...renderGateUploads(p)]) }, true)], d);
+      expect(has(r, 'template', /continue-on-error/), show(r)).toBe(true);
+      expect(has(r, 'injection', /continue-on-error/), show(r)).toBe(true);
+    }
   });
 });

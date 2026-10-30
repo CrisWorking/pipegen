@@ -3,7 +3,8 @@
 // the referee and the linters import them from here, so no second copy can drift. It imports only the leaves render-error.ts,
 // tool-flags.ts and types.ts (test/final-fix-b.test.ts and test/module-graph.test.ts check this).
 import { EXPR, own, RenderError, show } from './render-error.js';
-import { ARGV_POLICIES, BASE_CHECKOUT_REF, isGateUploadName, CHECKER_STEP_ID_RE, GATE_USES_RE, isStagedTool, PLATFORM_USES, rendererInputProblems, RENDERER_INPUTS, scrubStepId, SCRUB_STEP_ID_RE, SETUP_STEP_ID_RE, sha16, stagePath, stageStepId, STAGE_STEP_ID_RE, TOOL_STEP_ID_RE } from './tool-flags.js';
+import { GATE_RESULT_ARTIFACT } from './artifact-names.js';
+import { ARGV_POLICIES, BASE_CHECKOUT_REF, GATE_OPTIONAL_UPLOADS, isGateUploadName, CHECKER_STEP_ID_RE, GATE_USES_RE, isStagedTool, PLATFORM_USES, rendererInputProblems, RENDERER_INPUTS, scrubStepId, SCRUB_STEP_ID_RE, SETUP_STEP_ID_RE, sha16, stagePath, stageStepId, STAGE_STEP_ID_RE, TOOL_STEP_ID_RE } from './tool-flags.js';
 
 /** One step of a job, as pipegen renders it. `usesComment` becomes the trailing `# <version>` comment on `uses:`. */
 export interface RenderedStep {
@@ -318,6 +319,11 @@ export function gateUploadProblems(steps: readonly RenderedStep[], jobId: string
   steps.forEach((s, i) => {
     if (isGateDecideStep(s)) decided = true;
     const name = gateUploadNameOf(s);
+    // fix round 1 (ruling 2): continue-on-error only on the baseline and the marker uploads (their failure is never a gate failure, C3);
+    // their job and place are the rules below. The result upload and every other step keep it off.
+    if (s['continue-on-error'] === true && (name === undefined || !GATE_OPTIONAL_UPLOADS.has(name))) {
+      problems.push(`Step ${i + 1} (${show(s.name)}) has continue-on-error, which only the gate's baseline and clean-run marker uploads may have: any other failed step must fail its job.`);
+    }
     if (name === undefined) {
       if (jobId === GATE_JOB && s.uses !== undefined && s.run === undefined && UPLOAD_USES_RE.test(s.uses)) problems.push(`Step ${i + 1} (${show(s.name)}): the gate job uploads only its own result, baseline and clean-run marker, nothing else.`);
       return;
@@ -329,6 +335,23 @@ export function gateUploadProblems(steps: readonly RenderedStep[], jobId: string
     seen.add(name);
   });
   return problems;
+}
+
+/**
+ * The gate job's result upload (fix round 1, ruling 1): the step right after the gate step uploads `pipegen-gate-result`, with
+ * `if: always()` and no continue-on-error, so the job can never succeed without its result file (a gate step that ran nothing would
+ * leave none, and the upload then fails the job). Problems, empty when held; for the job `gate` only (the referee: not-gate-readable).
+ */
+export function gateResultUploadProblems(steps: readonly RenderedStep[]): string[] {
+  const at = steps.findIndex(isGateDecideStep);
+  if (at < 0) return [];   // no gate step: judged elsewhere (the job gate runs the gate action exactly once)
+  const next = steps[at + 1];
+  if (next === undefined || gateUploadNameOf(next) === undefined) return [`The gate job must upload ${GATE_RESULT_ARTIFACT} right after the gate step (if: always()), so it can not succeed without the gate's result.`];
+  if (gateUploadNameOf(next) !== GATE_RESULT_ARTIFACT) return [`The upload of ${GATE_RESULT_ARTIFACT} must come right after the gate step, before the other gate uploads.`];
+  const out: string[] = [];
+  if (next.if !== 'always()') out.push(`The upload of ${GATE_RESULT_ARTIFACT} must have if: always(), so a blocked gate still hands on its result.`);
+  if (next['continue-on-error'] === true) out.push(`The upload of ${GATE_RESULT_ARTIFACT} may not have continue-on-error: without its result the gate job must fail.`);
+  return out;
 }
 
 // ---------- job outputs (Plan C ruling B3) ----------

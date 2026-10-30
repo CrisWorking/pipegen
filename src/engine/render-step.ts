@@ -542,7 +542,9 @@ export function renderUpload(artifact: string, path: string, platform: PlatformA
 export function renderGateUploads(platform: PlatformActions): RenderedStep[] {
   return Object.keys(GATE_UPLOAD_FILES).map((name) => {
     const step = renderPlatformStep('upload-artifact', platform, { name, path: gateUploadPath(name) });
-    return { ...step, name: `Upload ${name}`, if: 'always()', with: { ...step.with, 'if-no-files-found': uploadIfNoFiles(name) } };
+    // fix round 1 (ruling 2): a failed baseline or marker upload is never a gate failure (C3); the result upload stays strict
+    const optional = uploadIfNoFiles(name) === 'ignore';
+    return { ...step, name: `Upload ${name}`, if: 'always()', with: { ...step.with, 'if-no-files-found': uploadIfNoFiles(name) }, ...(optional ? { 'continue-on-error': true } : {}) };
   });
 }
 
