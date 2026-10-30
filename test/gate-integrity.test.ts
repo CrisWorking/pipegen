@@ -10,6 +10,9 @@ import {
   type CodeownersRule, type PrContext, type PrFile,
 } from '../gate/src/integrity.js';
 import { PROTECTED_PATHS_BASE } from '../src/types.js';
+import { NonFinite } from '../gate/src/integrity.js';
+/** Non-finite numbers are typed tags in the parsed document; the oracle writes them as {"$num": kind}. */
+const plain = (v: unknown): unknown => (v instanceof NonFinite ? { $num: v.kind } : Array.isArray(v) ? v.map(plain) : typeof v === 'object' && v !== null && !(v instanceof Date) ? Object.fromEntries(Object.entries(v).map(([k, x]) => [k, plain(x)])) : v);
 
 // ---------- builders ----------
 const SHA = (c: string): string => c.repeat(40);
@@ -817,13 +820,13 @@ describe('fix round 1 (2, 17): an approval counts only from a user with write ac
 
 describe('fix round 1 (3, 4): INI parsing is configparser (Python 3.12 oracle, test/fixtures/gate-integrity/oracle.json)', () => {
   const oracle = JSON.parse(readFileSync('test/fixtures/gate-integrity/oracle.json', 'utf8')) as {
-    ini: Record<string, { text: string; sections: Record<string, Record<string, string>> | null }>;
+    ini: Record<string, { text: string; sections: Record<string, Record<string, string>> | null; failClosed?: boolean }>;
     toml: Record<string, { text: string; value: unknown }>; toml_bad: Record<string, string>;
   };
   for (const [name, c] of Object.entries(oracle.ini)) {
-    it(`ini ${name}: ${c.sections === null ? 'configparser rejects it, so do we' : 'the same sections and values as configparser'}`, () => {
+    it(`ini ${name}: ${c.sections === null ? 'configparser rejects it, so do we' : c.failClosed === true ? 'Python reads it, JavaScript would read it differently: fail closed' : 'the same sections and values as configparser'}`, () => {
       const got = parseConfigDoc('setup.cfg', c.text);
-      if (c.sections === null) expect(got).toBeUndefined();
+      if (c.sections === null || c.failClosed === true) expect(got).toBeUndefined();
       else expect(got).toEqual(c.sections);
     });
   }
@@ -856,7 +859,7 @@ describe('fix round 1 (5): TOML keys are canonical paths (tomllib oracle)', () =
     toml: Record<string, { text: string; value: unknown }>; toml_bad: Record<string, string>;
   };
   for (const [name, c] of Object.entries(oracle.toml)) {
-    it(`toml ${name}: the same document as tomllib`, () => { expect(parseConfigDoc('pyproject.toml', c.text)).toEqual(c.value); });
+    it(`toml ${name}: the same document as tomllib`, () => { expect(plain(parseConfigDoc('pyproject.toml', c.text))).toEqual(c.value); });
   }
   for (const [name, text] of Object.entries(oracle.toml_bad)) {
     it(`toml ${name}: tomllib rejects it, so do we`, () => { expect(parseConfigDoc('pyproject.toml', text)).toBeUndefined(); });
@@ -866,10 +869,10 @@ describe('fix round 1 (5): TOML keys are canonical paths (tomllib oracle)', () =
     const g = new Gh(); put(g, BASE, 'pyproject.toml', base); put(g, HEAD, 'pyproject.toml', head);
     return readConfigSections(g, REPO, ctx({ files: [file('pyproject.toml')] }), ['pyproject.toml:tool.mypy'], []);
   };
-  it('a literal "tool.mypy" key beside the table [tool.mypy] is ambiguous and fails closed as a finding', async () => {
+  it('a literal "tool.mypy" key beside the table [tool.mypy] is a different key (fix round 2): only the table counts', async () => {
     const r = await secs('[tool.mypy]\nstrict = true\n', 'tool.x = 1\n"tool.mypy" = { strict = true }\n[tool.mypy]\nignore_errors = true\n');
-    expect(r.length).toBe(1);
-    expect(r[0]?.problem).toBeTypeOf('string');
+    expect(r).toEqual([{ file: 'pyproject.toml', section: 'tool.mypy' }]);
+    expect(await secs('[tool.mypy]\nstrict = true\n', 'tool.x = 1\n"tool.mypy" = { strict = false }\n[tool.mypy]\nstrict = true\n')).toEqual([]);
   });
   it('a dotted literal key that collides with nothing is not a problem and not a change', async () => {
     expect(await secs('[tool.mypy]\nstrict = true\n', '"a.b" = 1\n[tool.mypy]\nstrict = true\n')).toEqual([]);
@@ -953,5 +956,125 @@ describe('fix round 1 (10, 11, 12): messages, markers, next-line markers, CODEOW
       const h = new Gh(); h.contents.set(`${BASE}:.github/CODEOWNERS`, { type: 'file', encoding: 'none', size: 2_000_000, content: '' }); h.raw.set(`${BASE}:.github/CODEOWNERS`, rawBad as never);
       expect((await loadCodeowners(h, REPO, BASE)).problem, String(rawBad)).toBeTypeOf('string');
     }
+  });
+});
+
+
+// ======================= fix round 2 (review-C4-r1.md, rulings in task-C4-fix-round-2.md) =======================
+
+describe('fix round 2 (1): INI lines are Python-exact or fail closed', () => {
+  const put = (g: Gh, ref: string, path: string, text: string): void => { g.contents.set(`${ref}:${path}`, contentOf(text)); };
+  const secs = async (base: string, head: string): Promise<{ section: string; problem?: string }[]> => {
+    const g = new Gh(); put(g, BASE, 'setup.cfg', base); put(g, HEAD, 'setup.cfg', head);
+    return readConfigSections(g, REPO, ctx({ files: [file('setup.cfg')] }), ['setup.cfg:mypy'], []);
+  };
+  it("the reviewer's three inputs are findings (a problem), not a pass", async () => {
+    for (const head of ['[metadata]\n  name = x\n\r  [mypy]\n  ignore_errors = True', '[metadata]\nname = x\n\x1c[mypy] = 1\nignore_errors = True\n', '[metadata]\nname = x\n\x85[mypy] = 1\nignore_errors = True\n']) {
+      const r = await secs('[metadata]\nname = x\n', head);
+      expect(r.length, JSON.stringify(head)).toBe(1);
+      expect(r[0]?.problem, JSON.stringify(head)).toBeTypeOf('string');
+    }
+  });
+  it('every Python line boundary or control character other than \\n and \\r\\n fails closed; tab, CRLF and ordinary Unicode do not', () => {
+    for (const c of ['\r', '\x0b', '\x0c', '\x1c', '\x1d', '\x1e', '\x1f', '\x85', '\u2028', '\u2029', '\ufeff', '\x00', '\x01', '\x08', '\x0e', '\x7f', '\x80', '\x9f']) {
+      expect(parseConfigDoc('setup.cfg', `[metadata]\nname = x${c}[mypy]\nignore_errors = True\n`), JSON.stringify(c)).toBeUndefined();
+      expect(parseConfigDoc('setup.cfg', `${c}[mypy]\nignore_errors = True\n`), JSON.stringify(c)).toBeUndefined();
+    }
+    expect(parseConfigDoc('setup.cfg', '[mypy]\r\nk\t= v\r\nj = \u00e9\u4e2d\r\n')).toEqual({ mypy: { k: 'v', j: '\u00e9\u4e2d' } });
+  });
+  it('a duplicate section is rejected (N19), also after another section; a DEFAULT section twice is merged, as Python does', () => {
+    expect(parseConfigDoc('setup.cfg', '[a]\nk = 1\n[b]\nk = 1\n[a]\nj = 2\n')).toBeUndefined();
+    expect(parseConfigDoc('setup.cfg', '[DEFAULT]\na = 1\n[s]\nk = v\n[DEFAULT]\nb = 2\n')).toEqual({ s: { a: '1', b: '2', k: 'v' } });
+  });
+});
+
+describe('fix round 2 (2): TOML sections are keyed by the key path', () => {
+  const put = (g: Gh, ref: string, path: string, text: string): void => { g.contents.set(`${ref}:${path}`, contentOf(text)); };
+  const secs = async (base: string, head: string, sections = ['pyproject.toml:tool.mypy']) => {
+    const g = new Gh(); put(g, BASE, 'pyproject.toml', base); put(g, HEAD, 'pyproject.toml', head);
+    return readConfigSections(g, REPO, ctx({ files: [file('pyproject.toml')] }), sections, []);
+  };
+  it('review 2(a): ["tool.mypy"] (one key) is not [tool.mypy] (two keys): the table is gone, so it is a change', async () => {
+    const r = await secs('[tool.mypy]\nstrict = true\n', '["tool.mypy"]\nstrict = true\n');
+    expect(r.map((c) => c.section)).toEqual(['tool.mypy']);
+    expect(r[0]?.problem).toBeUndefined();
+  });
+  it('review 2(b): a key named $num or $int in a table does not stop the walk below it', async () => {
+    const base = '[tool]\n"$num" = 1\n"$int" = 2\n[tool.mypy]\nstrict = true\n';
+    expect((await secs(base, base.replace('strict = true', 'strict = false'))).map((c) => c.section)).toEqual(['tool.mypy']);
+  });
+  it('a real inf is not equal to a table that looks like it: {"$num": "inf"} differs from x = inf', async () => {
+    expect((await secs('[tool.mypy]\nx = inf\n', '[tool.mypy.x]\n"$num" = "inf"\n')).length).toBe(1);
+    expect((await secs('[tool.mypy]\nx = inf\n', '[tool.mypy]\nx = { "$num" = "inf" }\n')).length).toBe(1);
+  });
+  it('dotted keys stay allowed: Poetry-style "zope.interface" is no problem and no change', async () => {
+    const t = '[tool.poetry.dependencies]\n"zope.interface" = "^6"\npython = "^3.12"\n[tool.mypy]\nstrict = true\n';
+    expect(await secs(t, t)).toEqual([]);
+    expect((await secs(t, t.replace('^6', '^7'), ['pyproject.toml:tool.poetry'])).map((c) => c.section)).toEqual(['tool.poetry']);
+  });
+  it('a wildcard spec matches inside one segment only', async () => {
+    const base = '[tool.mypy-a]\nx = 1\n[tool.mypy.b]\nx = 1\n';
+    const head = '[tool.mypy-a]\nx = 2\n[tool.mypy.b]\nx = 2\n';
+    expect((await secs(base, head, ['pyproject.toml:tool.mypy*'])).map((c) => c.section).sort()).toEqual(['tool.mypy', 'tool.mypy-a']);
+  });
+  it('a document is not rejected for a literal dotted key that equals a table path in another document (no cross-document collision check)', async () => {
+    expect(await secs('"a.b" = 1\n[tool.mypy]\nstrict = true\n', '"a.b" = 2\n[tool.mypy]\nstrict = true\n')).toEqual([]);
+  });
+});
+
+describe('fix round 2 (4, 6): approver flood and the permission note', () => {
+  const rules = codeOwners('* @zowner\n');
+  it('30 throwaway approvers sorting before the owner do not push the owner out: only code owners get a permission check', async () => {
+    const g = ghWith([]);
+    g.reviews = [...Array.from({ length: 40 }, (_, i) => review(i + 1, `aaa${String(i).padStart(2, '0')}`, 'APPROVED')), review(100, 'zowner', 'APPROVED')];
+    const pr = await readPrContext(g, REPO, 5, { codeowners: rules });
+    expect(pr.approvals).toEqual(['zowner']);
+    expect(g.calls.filter((c) => c.startsWith('perm'))).toEqual(['perm zowner']);
+  });
+  it('the cap applies after the filter, to code owners only', async () => {
+    const many35 = codeOwners(`* ${Array.from({ length: 35 }, (_, i) => `@own${String(i).padStart(2, '0')}`).join(' ')}\n`);
+    const g = ghWith([]); g.reviews = Array.from({ length: 35 }, (_, i) => review(i + 1, `own${String(i).padStart(2, '0')}`, 'APPROVED'));
+    const pr = await readPrContext(g, REPO, 5, { codeowners: many35 });
+    expect(pr.approvals.length).toBe(30);
+    expect(pr.problems.join(' ')).toMatch(/approvers/);
+  });
+  it('without a CODEOWNERS list nothing is filtered (the old behaviour); an owner list with no owner names means no approver and no call', async () => {
+    const g = ghWith([]); g.reviews = [review(1, 'a', 'APPROVED')];
+    expect((await readPrContext(g, REPO, 5)).approvals).toEqual(['a']);
+    const h = ghWith([]); h.reviews = [review(1, 'a', 'APPROVED')];
+    expect((await readPrContext(h, REPO, 5, { codeowners: [] })).approvals).toEqual([]);
+    expect(h.calls.filter((c) => c.startsWith('perm'))).toEqual([]);
+  });
+  it('a failed permission call adds a note naming the user; a plain read-only answer does not', async () => {
+    const g = ghWith([]); g.reviews = [review(1, 'zowner', 'APPROVED')]; g.perms.set('zowner', new Error('403'));
+    const pr = await readPrContext(g, REPO, 5, { codeowners: rules });
+    expect(pr.approvals).toEqual([]);
+    expect(pr.problems).toContain('approval by zowner not counted: could not read their permission');
+    const h = ghWith([]); h.reviews = [review(1, 'zowner', 'APPROVED')]; h.perms.set('zowner', { permission: 'read' });
+    expect((await readPrContext(h, REPO, 5, { codeowners: rules })).problems.join(' ')).not.toMatch(/permission/);
+  });
+});
+
+describe('fix round 2 (m4): a copy leaves the original in place', () => {
+  it('a copied file does not need its source path approved, and a copied shared config file is no (file moved)', async () => {
+    const copy = file('src/new.yml', { status: 'copied', previous_filename: WF, changes: 0, patch: undefined });
+    expect(integrityFindings(ctx({ files: [copy] }), PROTECTED, OWNER_RULES)).toEqual([]);
+    const g = new Gh();
+    g.contents.set(`${HEAD}:copy/pyproject.toml`, contentOf('[project]\nname = "x"\n'));
+    const r = await readConfigSections(g, REPO, ctx({ files: [file('copy/pyproject.toml', { status: 'copied', previous_filename: 'pyproject.toml', changes: 0, patch: undefined })] }), ['pyproject.toml:tool.mypy'], []);
+    expect(r).toEqual([]);
+    expect(g.calls).toEqual(['file a:copy/pyproject.toml']);
+  });
+});
+
+describe('fix round 2 (5): a leading slash scopes a protected path to the root', () => {
+  it('"/ruff.toml" matches ruff.toml only at the root; "ruff.toml" matches at any depth; entries with a slash stay as written', () => {
+    const hit = (pattern: string, path: string): boolean => integrityFindings(ctx({ files: [file(path)] }), [pattern], OWNER_RULES).length > 0;
+    expect(hit('/ruff.toml', 'ruff.toml')).toBe(true);
+    expect(hit('/ruff.toml', 'Ruff.TOML')).toBe(true);
+    expect(hit('/ruff.toml', 'services/api/ruff.toml')).toBe(false);
+    expect(hit('/services/api/ruff.toml', 'services/api/ruff.toml')).toBe(true);
+    expect(hit('ruff.toml', 'services/api/ruff.toml')).toBe(true);
+    expect(hit('.github/x.yml', 'a/.github/x.yml')).toBe(false);
   });
 });

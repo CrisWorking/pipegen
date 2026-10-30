@@ -55,9 +55,10 @@ export interface SectionChange { file: string; section: string; problem?: string
 
 /**
  * A slashless protected name is protected at ANY depth (`**\/` prefix): tools find configs in sub-folders (bandit's `.bandit` anywhere in
- * the tree, `mypy.ini` in the service folder). An entry with a slash is anchored as written. Case-insensitive, dot files included.
+ * the tree, `mypy.ini` in the service folder). An entry with a slash is anchored as written, and a leading `/` scopes a name to the
+ * root (`/ruff.toml`: a tool with a pinned config that reads nothing below it; see `rootConfigFiles` in the reviewed list). Case-insensitive, dot files included.
  */
-const anyDepth = (p: string): string => (p.includes('/') ? p : `**/${p}`);
+const anyDepth = (p: string): string => (p.startsWith('/') ? p.slice(1) : p.includes('/') ? p : `**/${p}`);
 function pathMatcher(patterns: readonly string[]): (path: string) => boolean {
   if (patterns.length === 0) return () => false;
   return picomatch(patterns.map(anyDepth), { nocase: true, dot: true });
@@ -213,7 +214,7 @@ const REVIEW_STATES_IGNORED = new Set(['COMMENTED', 'PENDING']);
  * PENDING is APPROVED on exactly the head commit (DISMISSED, CHANGES_REQUESTED and any unknown state revoke), and an incomplete review
  * list gives none. `expectHeadSha` (the commit the event is about): when the pull's head has moved, nothing is approved.
  */
-export async function readPrContext(gh: GateGithub, repo: RepoId, prNumber: number, opts: { expectHeadSha?: string } = {}): Promise<PrContext> {
+export async function readPrContext(gh: GateGithub, repo: RepoId, prNumber: number, opts: { expectHeadSha?: string; codeowners?: readonly CodeownersRule[] } = {}): Promise<PrContext> {
   const pr: PrContext = { number: prNumber, headSha: '', baseSha: '', isFork: true, files: [], filesComplete: false, approvals: [], approvalsComplete: false, problems: [] };
   let pull: unknown;
   try { pull = await gh.getPull(repo.owner, repo.name, prNumber); } catch { pr.problems.push('the pull request could not be read'); return pr; }
@@ -277,8 +278,14 @@ export async function readPrContext(gh: GateGithub, repo: RepoId, prNumber: numb
     const cur = latest.get(r.login);
     if (cur === undefined || r.id > cur.id) latest.set(r.login, r);
   }
-  const candidates = [...latest].filter(([login, r]) => r.state === 'APPROVED' && r.commit === headSha && login !== (typeof author === 'string' ? author.toLowerCase() : '')).map(([login]) => login).sort();
-  if (candidates.length > MAX_APPROVERS) pr.problems.push(`more than ${MAX_APPROVERS} approvers; only the first ${MAX_APPROVERS} were checked`);
+  // Owners first: only a login that CODEOWNERS names as a user gets a permission check (so throwaway approvers cost nothing and cannot
+  // crowd the real owner out), then the cap, then the permission itself.
+  const ownerLogins = opts.codeowners === undefined ? undefined : new Set(opts.codeowners.flatMap((r) => r.owners));
+  const authorLogin = typeof author === 'string' ? author.toLowerCase() : '';
+  const candidates = [...latest]
+    .filter(([login, r]) => r.state === 'APPROVED' && r.commit === headSha && login !== authorLogin && (ownerLogins === undefined || ownerLogins.has(login)))
+    .map(([login]) => login).sort();
+  if (candidates.length > MAX_APPROVERS) pr.problems.push(`more than ${MAX_APPROVERS} code-owner approvers; only the first ${MAX_APPROVERS} were checked`);
   // an approval counts only from a user with write, maintain or admin permission (GitHub's own rule for code owners); any error means no
   for (const login of candidates.slice(0, MAX_APPROVERS)) {
     try {
@@ -286,7 +293,7 @@ export async function readPrContext(gh: GateGithub, repo: RepoId, prNumber: numb
       const perm = isPlain(a) ? own(a, 'permission') : undefined;
       const role = isPlain(a) ? own(a, 'role_name') : undefined;
       if (perm === 'admin' || perm === 'write' || role === 'maintain' || role === 'admin' || role === 'write') pr.approvals.push(login);
-    } catch { /* not approved */ }
+    } catch { pr.problems.push(`approval by ${login.replace(/[^a-z0-9-]/g, '?').slice(0, 39)} not counted: could not read their permission`); }
   }
   return pr;
 }
@@ -472,18 +479,36 @@ export async function loadCodeowners(gh: GateGithub, repo: RepoId, baseSha: stri
 
 // ---------- configSections ----------
 
-type Tree = Map<string, unknown>;
 
-/** A document as plain data, comparable by text: non-finite numbers, big integers and dates get distinct forms (JSON would make them null). */
+/** A non-finite TOML number (nan, inf, -inf). A class, so no document can produce one by spelling a key or a table. */
+export class NonFinite { constructor(readonly kind: 'nan' | 'inf' | '-inf') {} }
+/** A TOML integer beyond the safe range, by its digits. */
+export class BigInteger { constructor(readonly digits: string) {} }
+
+const isTable = (v: unknown): v is Record<string, unknown> =>
+  typeof v === 'object' && v !== null && !Array.isArray(v) && !(v instanceof NonFinite) && !(v instanceof BigInteger) && !(v instanceof Date);
+
+/** A document as plain data: non-finite numbers and big integers become typed tags, never a string or an object a document could write. */
 function norm(v: unknown): unknown {
-  if (typeof v === 'number') return Number.isFinite(v) ? v : { $num: Number.isNaN(v) ? 'nan' : v > 0 ? 'inf' : '-inf' };
-  if (typeof v === 'bigint') return Number.isSafeInteger(Number(v)) ? Number(v) : { $int: String(v) };
-  if (v instanceof Date) return v.toISOString();
+  if (typeof v === 'number') return Number.isFinite(v) ? v : new NonFinite(Number.isNaN(v) ? 'nan' : v > 0 ? 'inf' : '-inf');
+  if (typeof v === 'bigint') return Number.isSafeInteger(Number(v)) ? Number(v) : new BigInteger(String(v));
   if (Array.isArray(v)) return v.map(norm);
-  if (isPlain(v)) return Object.fromEntries(Object.keys(v).sort().map((k) => [k, norm(v[k])]));
+  if (isTable(v)) return Object.fromEntries(Object.keys(v).sort().map((k) => [k, norm(v[k])]));
   return v;
 }
-const canon = (v: unknown): string => JSON.stringify(norm(v));
+/** An injective text form: every value is typed, so no value of one type can equal another's text. */
+function canon(v: unknown): string {
+  if (v instanceof NonFinite) return `F:${v.kind}`;
+  if (v instanceof BigInteger) return `I:${v.digits}`;
+  if (v instanceof Date) return `D:${v.toISOString()}`;
+  if (typeof v === 'number') return `n:${Object.is(v, -0) ? '-0' : String(v)}`;
+  if (typeof v === 'string') return `s:${JSON.stringify(v)}`;
+  if (typeof v === 'boolean') return `b:${v}`;
+  if (v === null || v === undefined) return 'z';
+  if (Array.isArray(v)) return `[${v.map(canon).join(',')}]`;
+  if (isTable(v)) return `{${Object.keys(v).sort().map((k) => `${JSON.stringify(k)}=${canon(v[k])}`).join(',')}}`;
+  return `?:${String(v)}`;
+}
 
 /**
  * Python configparser (`RawConfigParser`, strict), ported: a header is `^\[(.+)\]` (greedy) on the stripped line and the rest of the line
@@ -491,7 +516,13 @@ const canon = (v: unknown): string => JSON.stringify(norm(v));
  * are kept; `[DEFAULT]` is merged into every section; keys are lower-cased; a duplicate section or option, an option before a header, a
  * line without `=` or `:` and an empty key are errors (undefined).
  */
+/**
+ * Python reads a file with universal newlines and `str.strip`/`\S` over its own whitespace set; JavaScript's differ (`\x1c`-`\x1f`, `\x85`,
+ * `\ufeff`, a lone `\r`, `\v`, `\f`, U+2028/9). A file with any of them, or any other C0/C1 control character, is not read at all.
+ */
+const INI_UNSAFE = /[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f\u2028\u2029\ufeff]|\r(?!\n)/;
 function parseIni(text: string): Record<string, Record<string, string>> | undefined {
+  if (INI_UNSAFE.test(text)) return undefined;
   const sections = new Map<string, Map<string, string[]>>();
   const defaults = new Map<string, string[]>();
   let cur: Map<string, string[]> | undefined;
@@ -542,40 +573,35 @@ function parseIni(text: string): Record<string, Record<string, string>> | undefi
 }
 
 /** A shared config file as plain data (JSON, TOML or INI by extension); undefined when it does not parse as the tool's parser would. */
-export function parseConfigDoc(path: string, text: string): Record<string, unknown> | undefined {
+export function parseConfigDoc(path: string, text: string): Record<string, unknown> | undefined {   // tables, TOML non-finite numbers as NonFinite
   const lower = path.toLowerCase();
   try {
-    if (lower.endsWith('.json')) { const v: unknown = JSON.parse(text); return isPlain(v) ? (norm(v) as Record<string, unknown>) : undefined; }
+    if (lower.endsWith('.json')) { const v: unknown = JSON.parse(text); return isTable(v) ? (norm(v) as Record<string, unknown>) : undefined; }
     if (lower.endsWith('.toml')) return norm(parseToml(text)) as Record<string, unknown>;
     if (lower.endsWith('.cfg') || lower.endsWith('.ini')) return parseIni(text);
   } catch { return undefined; }
   return undefined;
 }
 
+interface Section { segs: string[]; value: unknown }
 /**
- * The sections of a parsed document by name: INI sections and JSON top-level keys as they are; TOML tables by their dotted path built from
- * the parsed segments. A literal key that contains a dot and joins to the same name as another path (`"tool.mypy"` beside `[tool.mypy]`)
- * is ambiguous: undefined, so the caller fails closed.
+ * The sections of a parsed document, keyed by their key path: INI sections and JSON top-level keys are one segment (the whole name);
+ * TOML tables are the list of keys from the root (`["tool.mypy"]` is ONE segment and is not `tool` + `mypy`). Dotted literal keys are
+ * fine: they are one segment, never equal to a table path.
  */
-function sectionTree(path: string, doc: Record<string, unknown>): Tree | undefined {
-  const t: Tree = new Map();
-  if (!path.toLowerCase().endsWith('.toml')) { for (const k of Object.keys(doc)) t.set(k, doc[k]); return t; }
-  const segsOf = new Map<string, string>();
-  const walk = (v: unknown, prefix: string[], depth: number): boolean => {
-    if (!isPlain(v) || depth > 16 || '$num' in v || '$int' in v) return true;
+function sectionTree(path: string, doc: Record<string, unknown>): Map<string, Section> {
+  const t = new Map<string, Section>();
+  if (!path.toLowerCase().endsWith('.toml')) { for (const k of Object.keys(doc)) t.set(JSON.stringify([k]), { segs: [k], value: doc[k] }); return t; }
+  const walk = (v: unknown, prefix: string[], depth: number): void => {
+    if (!isTable(v) || depth > 16) return;
     for (const k of Object.keys(v)) {
       const segs = [...prefix, k];
-      const joined = segs.join('.');
-      const id = JSON.stringify(segs);
-      const prev = segsOf.get(joined);
-      if (prev !== undefined && prev !== id) return false;
-      segsOf.set(joined, id);
-      t.set(joined, v[k]);
-      if (!walk(v[k], segs, depth + 1)) return false;
+      t.set(JSON.stringify(segs), { segs, value: v[k] });
+      walk(v[k], segs, depth + 1);
     }
-    return true;
   };
-  return walk(doc, [], 0) ? t : undefined;
+  walk(doc, [], 0);
+  return t;
 }
 
 const sectionRe = (section: string): RegExp => new RegExp(`^${section.split('*').map((s) => s.replace(/[.+?^${}()|[\]\\]/g, '\\$&')).join('.*')}$`);
@@ -601,37 +627,43 @@ export async function readConfigSections(gh: GateGithub, repo: RepoId, pr: PrCon
     if (relevant.length === 0 || whole(path)) return;
     if (++checked > MAX_SECTION_FILES) { out.push({ file: path, section: '*', problem: 'too many shared config files changed to compare' }); return; }
     const fail = (): void => { out.push({ file: path, section: safeName(relevant.map((r) => r.section).join(',')), problem: 'the file could not be read, parsed or told apart at the base or the head' }); };
-    const side = async (ref: string, skip: boolean): Promise<Tree | 'fail'> => {
+    const side = async (ref: string, skip: boolean): Promise<Map<string, Section> | 'fail'> => {
       if (skip) return new Map();
       const r = await readTextAt(gh, repo, path, ref);
       if (r.kind === 'missing') return new Map();
       if (r.kind === 'problem') return 'fail';
       const doc = parseConfigDoc(path, r.text);
-      const tree = doc === undefined ? undefined : sectionTree(path, doc);
-      return tree ?? 'fail';
+      return doc === undefined ? 'fail' : sectionTree(path, doc);
     };
     const base = await side(pr.baseSha, skipBase);
     const head = await side(pr.headSha, skipHead);
     if (base === 'fail' || head === 'fail') { fail(); return; }
-    const changed = new Set<string>();
+    const toml = path.toLowerCase().endsWith('.toml');
+    const changed = new Map<string, string[]>();
     for (const r of relevant) {
-      const re = sectionRe(r.section);
-      for (const n of new Set([...base.keys(), ...head.keys()].filter((k) => re.test(k)))) {
-        const a = base.has(n) ? canon(base.get(n)) : undefined;
-        const b = head.has(n) ? canon(head.get(n)) : undefined;
-        if (a !== b) changed.add(n);
+      const want = (toml ? r.section.split('.') : [r.section]).map(sectionRe);
+      const fits = (segs: readonly string[]): boolean => segs.length === want.length && segs.every((x, i) => (want[i] as RegExp).test(x));
+      for (const key of new Set([...base.keys(), ...head.keys()])) {
+        const segs = (base.get(key) ?? head.get(key) as Section).segs;
+        if (!fits(segs)) continue;
+        const a = base.has(key) ? canon((base.get(key) as Section).value) : undefined;
+        const b = head.has(key) ? canon((head.get(key) as Section).value) : undefined;
+        if (a !== b) changed.set(key, segs);
       }
     }
     // report the shallowest changed section of a nested family once
-    for (const n of changed) if (![...changed].some((o) => o !== n && n.startsWith(`${o}.`))) out.push({ file: path, section: safeName(n) });
+    for (const [key, segs] of changed) {
+      const nested = [...changed].some(([k, o]) => k !== key && o.length < segs.length && o.every((x, i) => x === segs[i]));
+      if (!nested) out.push({ file: path, section: safeName(segs.join('.')) });
+    }
   };
   for (const f of pr.files) {
     const prev = f.previous_filename;
-    if (prev !== undefined && prev !== f.filename) {
+    if (prev !== undefined && prev !== f.filename && f.status !== 'copied') {   // a copy leaves the original where it is
       if (specs.some((s) => s.glob(prev)) && !whole(prev)) out.push({ file: prev, section: '(file moved)' });
       await compare(f.filename, true, f.status === 'removed');
     } else {
-      await compare(f.filename, f.status === 'added', f.status === 'removed');
+      await compare(f.filename, f.status === 'added' || f.status === 'copied', f.status === 'removed');
     }
   }
   return out;
@@ -704,7 +736,7 @@ export function integrityFindings(
   if (!pr.filesComplete) push('integrity:incomplete-list', 'critical', undefined, 'The list of changed files is incomplete (or is not the list of the commit being checked), so the gate cannot see every change and blocks. Split the pull request into smaller ones, or re-run if the branch moved.', 'list');
 
   for (const f of pr.files) {
-    for (const path of f.previous_filename === undefined ? [f.filename] : [f.filename, f.previous_filename]) {
+    for (const path of f.previous_filename === undefined || f.status === 'copied' ? [f.filename] : [f.filename, f.previous_filename]) {
       if (isProtected(path) && !waived(path)) push('integrity:protected-path', 'critical', path, `This file is part of the pipeline (a workflow, a tool config or an ignore file).${how(path)}`, 'path');
     }
     const hasPatch = typeof f.patch === 'string' && f.patch !== '';
