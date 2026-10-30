@@ -77,7 +77,7 @@ export interface CheckInput {
  * A secrets scan of the PR's commit range (base..head, C1b review I2; C9: the secrets job's range scan, betterleaks `git` mode), read back
  * like a result file: `findings` (each with its commit), or `toolError`; neither = no result. facts.ts reads it.
  */
-export interface RangeScan { tool: string; findings?: ScrubbedFinding[]; toolError?: string }
+export interface RangeScan { tool: string; findings?: ScrubbedFinding[]; toolError?: string; /** Fix round 1: the scan had no commit range on its event (facts.ts turns it into a tool error or a note). */ skipped?: true }
 /** The trusted baseline (C3): counts by countKeyOf, and the tools it covers (a tool it does not cover falls back to the base scan). */
 export interface Baseline { tools: readonly string[]; counts: ReadonlyMap<string, number> }
 /**
@@ -523,7 +523,7 @@ export function decideGate(i: GateInput): GateResult {
 
 /** C9: the text of a finding of the commit range (the commit's first 12 hex digits). */
 export const rangeReason = (commit: string | undefined): string =>
-  `secret added in this PR's history (commit ${commit !== undefined && /^[0-9a-f]{40}$/.test(commit) ? commit.slice(0, 12) : 'not known'}): rotate it, even if a later commit removed it`;
+  `secret added in this PR's history (commit ${commit !== undefined && /^[0-9a-f]{40}$/.test(commit) ? commit.slice(0, 12) : 'not known'}): rotate it now, even if a later commit removed it`;
 
 // ---------- the summary ----------
 

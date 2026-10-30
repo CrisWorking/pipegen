@@ -14,7 +14,8 @@ import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { decideGate, type CheckInput, type GateEvent, type GateInput } from '../gate/src/decide.js';
 import { DEFAULT_POLICY } from '../gate/src/policy-default.js';
-import { parseRangeFacts, RangeFactsError } from '../gate/src/range.js';
+import { applyRange, parseRangeFacts, RangeFactsError } from '../gate/src/range.js';
+import { entryProblem } from '../gate/src/settings.js';
 import { parseSarifText } from '../gate/src/sarif.js';
 import { readScrubbed, scrubBytes, scrubFile, type ScrubbedFinding } from '../gate/src/scrub.js';
 import { SECRETS_RANGE_ARTIFACT as A } from '../src/engine/artifact-names.js';
@@ -30,7 +31,7 @@ const FPKEY = 'r9'.repeat(20);
 const SEC = 'sec' + 'ret:';
 const K_NS = ['needs', 'Sec' + 'rets'].join('') as 'needsSecrets';
 const K_S = ('sec' + 'ret') as 'secret';
-const facts = JSON.parse(LEAK_FACTS) as { base: string; head: string; commits: number; canaries: { commit: string; path: string }[] };
+const facts = JSON.parse(LEAK_FACTS) as { base: string; head: string; before: string | null; commits: number; canaries: { commit: string; path: string }[] };
 /** The commit of the planted key in the leak fixture (c1 of base → c1 adds the key → c2 removes it). */
 const leakCommit = (): string => {
   const results = (JSON.parse(LEAK_SARIF.toString('utf8')) as { runs: { results: { ruleId: string; partialFingerprints: { commitSha: string } }[] }[] }).runs[0]?.results ?? [];
@@ -65,12 +66,18 @@ describe('the parser: the commit of each finding of a git-mode scan', () => {
 
 describe('the range facts (range.json, written by the range scan step)', () => {
   it('parses the captured facts; anything else is refused', () => {
-    expect(parseRangeFacts(LEAK_FACTS)).toEqual({ base: facts.base, head: facts.head, commits: 2, canaries: facts.canaries });
+    expect(parseRangeFacts(LEAK_FACTS)).toEqual({ base: facts.base, head: facts.head, before: null, commits: 2, canaries: facts.canaries });
+    // fix round 1 (I2): the head before a force-push, when the step read its dropped commits
+    expect(parseRangeFacts(JSON.stringify({ ...JSON.parse(LEAK_FACTS) as object, before: 'e'.repeat(40) }))).toMatchObject({ before: 'e'.repeat(40) });
+    // fix round 1: an event with no commit range
+    expect(parseRangeFacts('{"pipegenRange":1,"skipped":"no-range"}')).toEqual({ skipped: 'no-range' });
+    for (const bad of ['{"pipegenRange":1,"skipped":"other"}', '{"pipegenRange":1,"skipped":"no-range","base":"x"}']) expect(() => parseRangeFacts(bad), bad).toThrow(RangeFactsError);
     const f0 = { pipegenRange: 1, ...facts };
     const variants: unknown[] = [
       null, [], 'x', { ...f0, pipegenRange: 2 }, { ...f0, base: 'b'.repeat(39) }, { ...f0, head: '0'.repeat(40) }, { ...f0, base: 'main' }, { ...f0, commits: -1 }, { ...f0, commits: 1.5 },
       { ...f0, canaries: f0.canaries.slice(0, 1) }, { ...f0, canaries: [f0.canaries[0], f0.canaries[0]] },
       { ...f0, canaries: [{ ...f0.canaries[0], path: 'a.txt' }, f0.canaries[1]] }, { ...f0, canaries: [{ ...f0.canaries[0], commit: 'x' }, f0.canaries[1]] }, { ...f0, extra: 1 },
+      { ...f0, before: '0'.repeat(40) }, { ...f0, before: 'main' }, (({ before: _b, ...rest }) => rest)(f0),
     ];
     for (const v of variants) expect(() => parseRangeFacts(JSON.stringify(v)), JSON.stringify(v)).toThrow(RangeFactsError);
     expect(() => parseRangeFacts('{')).toThrow(RangeFactsError);
@@ -111,6 +118,33 @@ describe('the scrub in range mode', () => {
     }
     // the facts of the clean run with the leak run's SARIF: its canaries are not the ones that run made
     expect(scrubRange(LEAK_SARIF, CLEAN_FACTS).status).toBe('tool-error');
+  });
+
+  it('fix round 1 (I1): a stream cut short has no tip canary: a tool error that says the range was not read to its end; a canary reported twice (a double read) is a tool error', () => {
+    const tip = facts.canaries[1]?.commit as string;
+    const cut = scrubRange(edited((rs) => rs.filter((x) => (x.partialFingerprints as { commitSha: string }).commitSha !== tip)), LEAK_FACTS);
+    expect(cut.status === 'tool-error' ? cut.error : '').toMatch(/not read .*to its end/);
+    const twice = scrubRange(edited((rs) => [...rs, rs.find(isCanary) as Record<string, unknown>]), LEAK_FACTS);
+    expect(twice.status === 'tool-error' ? twice.error : '').toMatch(/canary/);
+  });
+
+  it('fix round 1: facts that say "no range on this event": an ok result with no finding, marked skipped, whatever the raw file (none is read)', () => {
+    const r = scrubRange(Buffer.from('not even json'), '{"pipegenRange":1,"skipped":"no-range"}');
+    if (r.status !== 'ok') throw new Error(r.error);
+    expect(r.findings).toBe(0);
+    const back = readScrubbed(r.bytes, 'sarif');
+    expect(back.rangeSkipped).toBe(true);
+    expect(back.notes.join('\n')).toMatch(/no commit range/);
+    expect(readScrubbed(scrubRange(CLEAN_SARIF, CLEAN_FACTS).status === 'ok' ? (scrubRange(CLEAN_SARIF, CLEAN_FACTS) as { bytes: Buffer }).bytes : Buffer.from(''), 'sarif').rangeSkipped).toBeUndefined();
+    // scrubFile: only range.json in the raw folder (the step wrote no SARIF)
+    const sb = sandbox();
+    const rawDir = join(sb.rt, 'pipegen-raw', A);
+    mkdirSync(rawDir, { recursive: true });
+    writeFileSync(join(rawDir, 'range.json'), '{"pipegenRange":1,"skipped":"no-range"}\n');
+    const out = join(sb.rt, 'pipegen-out', A, 'betterleaks.sarif');
+    const f = scrubFile({ artifact: A, tool: 'betterleaks', format: 'sarif', raw: join(rawDir, 'betterleaks.sarif'), out, fpKey: FPKEY, workspace: sb.ws, eventText: '{}' });
+    expect(f.status, f.error).toBe('ok');
+    expect(readScrubbed(readFileSync(out), 'sarif').rangeSkipped).toBe(true);
   });
 
   it('a canary-rule finding pipegen did not put there (a line of the pull request) is a real finding of the range, never a proof', () => {
@@ -194,7 +228,7 @@ describe('decideGate: any secret added in the pull request\'s history blocks', (
       expect(r.pass).toBe(false);
       const range = r.blocking.filter((b) => b.job === 'commit range');
       expect(range.length).toBeGreaterThanOrEqual(1);
-      expect(range.every((b) => b.reason === `secret added in this PR's history (commit ${C1.slice(0, 12)}): rotate it, even if a later commit removed it`)).toBe(true);
+      expect(range.every((b) => b.reason === `secret added in this PR's history (commit ${C1.slice(0, 12)}): rotate it now, even if a later commit removed it`)).toBe(true);
     }
     expect(decideGate(input({ rangeScans: [{ tool: 'betterleaks', findings: [leak(), leak()] }] })).blocking.filter((b) => b.job === 'commit range')).toHaveLength(2);
     // a low-severity or position-form finding blocks the same
@@ -203,7 +237,7 @@ describe('decideGate: any secret added in the pull request\'s history blocks', (
 
   it('the summary says it, under Blocking', () => {
     const r = decideGate(input({ rangeScans: [{ tool: 'betterleaks', findings: [leak()] }] }));
-    expect(r.summary).toMatch(/### Blocking[^]*secret added in this PR's history \(commit 1a1a1a1a1a1a\): rotate it, even if a later commit removed it/);
+    expect(r.summary).toMatch(/### Blocking[^]*secret added in this PR's history \(commit 1a1a1a1a1a1a\): rotate it now, even if a later commit removed it/);
     expect(r.summary).toContain('a.js:3');
   });
 
@@ -219,10 +253,28 @@ describe('decideGate: any secret added in the pull request\'s history blocks', (
   it('on a push to the default branch the range is informational: a finding or a tool error warns, never blocks', () => {
     const r = decideGate(input({ event: push, diff: null, rangeScans: [{ tool: 'betterleaks', findings: [leak()] }] }));
     expect(r.pass).toBe(true);
-    expect(r.warnings.filter((w) => w.job === 'commit range').map((w) => w.reason)).toEqual([expect.stringMatching(/^secret added in this PR's history \(commit 1a1a1a1a1a1a\): rotate it, even if a later commit removed it; on the default branch/)]);
+    expect(r.warnings.filter((w) => w.job === 'commit range').map((w) => w.reason)).toEqual([expect.stringMatching(/^secret added in this PR's history \(commit 1a1a1a1a1a1a\): rotate it now, even if a later commit removed it; on the default branch/)]);
     const te = decideGate(input({ event: push, diff: null, rangeScans: [{ tool: 'betterleaks', toolError: 'x' }] }));
     expect(te.pass).toBe(true);
     expect(te.toolErrors).toEqual([expect.objectContaining({ job: 'commit range', blocks: false })]);
     expect(decideGate(input({ event: push, diff: null, rangeScans: [{ tool: 'betterleaks' }] })).pass).toBe(true);
+  });
+});
+
+// ---------- fix round 1 (review m4): the guards behind other guards, each on its own ----------
+
+describe('fix round 1: the belts, tested on their own', () => {
+  it('applyRange: a finding with no commit is refused even when the parser was not asked for commits', () => {
+    const parsed = parseSarifText(LEAK_SARIF, 'betterleaks').findings;   // no commits read
+    const f = parseRangeFacts(LEAK_FACTS);
+    if ('skipped' in f) throw new Error('not a range');
+    expect(() => applyRange(parsed, f)).toThrow(/no commit/);
+  });
+  it('settings: a range entry that is not the secrets job\'s own form is refused by the gate\'s own entry check (beside the schema)', () => {
+    const r = { needId: 'secrets', job: 'secrets', category: 'secrets', tool: 'betterleaks', format: 'sarif', artifact: A, blocking: true, [K_NS]: false, range: true } as JobListEntry;
+    expect(entryProblem(r, 0)).toBeNull();
+    for (const over of [{ artifact: 'pipegen-out-secrets' }, { tool: 'gitleaks' }, { baseArtifact: 'pipegen-out-base-secrets' }, { format: 'none' }, { needId: 'sast', job: 'sast' }]) {
+      expect(entryProblem({ ...r, ...over } as JobListEntry, 0), JSON.stringify(over)).not.toBeNull();
+    }
   });
 });

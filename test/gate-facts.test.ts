@@ -38,9 +38,10 @@ const TESTS = ((): JobListEntry => { const e = ent({ needId: 'unit-tests', servi
 /** C9: the secrets job's commit-range scan (the entry gateJobList writes after the secrets check). */
 const RANGE = ((): JobListEntry => { const e = ent({ needId: 'secrets', tool: 'betterleaks', artifact: 'pipegen-out-secrets-range', range: true }); delete e.baseArtifact; return e; })();
 /** A real scrubbed commit-range result (the range scan step's raw SARIF and range facts, captured with the pinned betterleaks). */
-function scrubbedRange(kind: 'clean' | 'leak'): Uint8Array {
-  const [sarif, factsFile] = kind === 'clean' ? ['clean.sarif', 'clean-range.json'] : ['betterleaks.sarif', 'range.json'];
-  const r = scrubBytes(readFileSync(`test/fixtures/sarif/betterleaks-range/${sarif}`), { tool: 'betterleaks', format: 'sarif', fpKey: FPKEY, eventText: '{}', range: parseRangeFacts(readFileSync(`test/fixtures/sarif/betterleaks-range/${factsFile}`, 'utf8')) });
+function scrubbedRange(kind: 'clean' | 'leak' | 'skipped'): Uint8Array {
+  const [sarif, factsFile] = kind === 'leak' ? ['betterleaks.sarif', 'range.json'] : ['clean.sarif', 'clean-range.json'];
+  const factsText = kind === 'skipped' ? '{"pipegenRange":1,"skipped":"no-range"}' : readFileSync(`test/fixtures/sarif/betterleaks-range/${factsFile}`, 'utf8');
+  const r = scrubBytes(readFileSync(`test/fixtures/sarif/betterleaks-range/${sarif}`), { tool: 'betterleaks', format: 'sarif', fpKey: FPKEY, eventText: '{}', range: parseRangeFacts(factsText) });
   if (r.status !== 'ok') throw new Error(r.error);
   return new Uint8Array(r.bytes);
 }
@@ -659,7 +660,7 @@ describe('gatherGateInput: the secrets job\'s commit-range scan (C9)', () => {
     const { input } = await gather(w);
     const r = decideGate(input);
     expect(r.pass).toBe(false);
-    expect(r.blocking.filter((b) => b.job === 'commit range').map((b) => [b.file, b.reason])).toEqual([['config.js', expect.stringMatching(/^secret added in this PR's history \(commit [0-9a-f]{12}\): rotate it, even if a later commit removed it$/)]]);
+    expect(r.blocking.filter((b) => b.job === 'commit range').map((b) => [b.file, b.reason])).toEqual([['config.js', expect.stringMatching(/^secret added in this PR's history \(commit [0-9a-f]{12}\): rotate it now, even if a later commit removed it$/)]]);
   });
   it('a tool error, no status output, a hash that is not the job\'s output, a missing artifact or a failed secrets job: the range blocks', async () => {
     const cases: [string, (w: World) => void][] = [
@@ -708,5 +709,27 @@ describe('gatherGateInput: the secrets job\'s commit-range scan (C9)', () => {
     const { input } = await gather(nb);
     expect(rangeOf(input)).toEqual([]);
     expect((input.notes ?? []).join('\n')).toMatch(/no commit range to scan/);
+  });
+  it('fix round 1: a range scan that says "no range on this event" blocks on a pull request (and in the merge queue), and is a note on a push to the default branch', async () => {
+    const pr = world();
+    setRange(pr, scrubbedRange('skipped'));
+    const r = decideGate((await gather(pr)).input);
+    expect(r.pass).toBe(false);
+    expect(r.toolErrors.map((t) => `${t.job} ${t.reason}`).join('\n')).toMatch(/commit range .*no commit range/);
+    const mg = world();
+    mg.event = 'merge_group';
+    mg.payload = { merge_group: { base_sha: BASE, head_sha: MERGE, base_ref: 'refs/heads/main' }, repository: mg.payload.repository };
+    setRange(mg, scrubbedRange('skipped'));
+    expect(decideGate((await gather(mg)).input).pass).toBe(false);
+    const p = world();
+    p.event = 'push'; p.sha = HEAD;
+    p.payload = { before: BASE, after: HEAD, ref: 'refs/heads/main', repository: p.payload.repository };
+    setRange(p, scrubbedRange('skipped'));
+    const { input } = await gather(p);
+    expect(input.rangeScans).toEqual([]);
+    expect((input.notes ?? []).join('\n')).toMatch(/no commit range/);
+    const d = decideGate(input);
+    expect(d.pass).toBe(true);
+    expect(d.warnings.some((w) => w.job === 'commit range')).toBe(false);
   });
 });

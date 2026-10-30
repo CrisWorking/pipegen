@@ -10,7 +10,8 @@
 //      first the head result, then its base-scan twin when the base-scan job reports one (`ok`). Hash and zip checks: artifacts.ts.
 //      2b (C9). The secrets job's commit-range result (the job list's `range` entry), the same way, as the commit range (rangeScans): required
 //      on a pull request and in the merge queue (a list with a secrets check but no range entry is a tool error), informational on a push to
-//      the default branch, none on the push that made the branch.
+//      the default branch, none on the push that made the branch. Fix round 1: a range scan that found no commit range on its event (its
+//      facts say `skipped`) is not applicable off the pull request events (a note), and a tool error on them.
 //   3. The base (CF3b): the base computed from THIS event's payload (pull_request base.sha, merge_group base_sha, push before); only when
 //      the base-scan job's `base-sha` output equals it is the ancestry asked (compare base...github.sha, status `ahead` only).
 //   4. The diff the "new" rule reads (C2 review I1, r3): compare pull_request.base.sha...github.sha (the scanned merge commit), merge_group
@@ -115,7 +116,7 @@ async function rangeScanOf(tool: string, result: JobResult, outputs: JobOutputs,
   }
   const st = fileState(outputs, outputs.status === 'ok' ? await fileOf() : undefined);
   switch (st.kind) {
-    case 'ok': return { tool, findings: st.read.findings };
+    case 'ok': return st.read.rangeSkipped === true ? { tool, skipped: true } : { tool, findings: st.read.findings };
     case 'absent': return { tool };
     case 'tool-error': return { tool, toolError: st.why };
     case 'tampered': return { tool, toolError: `the commit-range result is not the one the job made: ${st.why}` };
@@ -237,7 +238,12 @@ export async function gatherGateInput(ctx: GateContext, client: GateGithub, io: 
         const d = await downloadResult(io, { owner: repo.owner, repo: repo.name, runId, name: art, format: 'sarif', ...(outputFile.has(RANGE_TOOL) ? { expectedFile: outputFile.get(RANGE_TOOL) as string } : {}) });
         return d.kind === 'file' ? d.file : undefined;
       };
-      rangeScans.push(await rangeScanOf(m.entry.tool ?? RANGE_TOOL, m.result, m.outputs, fileOf));
+      const rs = await rangeScanOf(m.entry.tool ?? RANGE_TOOL, m.result, m.outputs, fileOf);
+      // fix round 1: "no commit range on this event" is not applicable only off the pull request events; on them it is a range not scanned
+      if (rs.skipped === true) {
+        if (prLike) rangeScans.push({ tool: rs.tool, toolError: 'the range scan found no commit range on this pull request event (an all-zero base or head), so the commits of the pull request are not scanned' });
+        else notes.push('the range scan found no commit range on this event, so no commit range was scanned');
+      } else rangeScans.push(rs);
     }
   }
 

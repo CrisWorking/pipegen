@@ -4743,7 +4743,7 @@ function decideGate(i) {
   };
   return { ...result, summary: renderSummary(result, i.installing) };
 }
-var rangeReason = (commit) => `secret added in this PR's history (commit ${commit !== void 0 && /^[0-9a-f]{40}$/.test(commit) ? commit.slice(0, 12) : "not known"}): rotate it, even if a later commit removed it`;
+var rangeReason = (commit) => `secret added in this PR's history (commit ${commit !== void 0 && /^[0-9a-f]{40}$/.test(commit) ? commit.slice(0, 12) : "not known"}): rotate it now, even if a later commit removed it`;
 var md = (s, max) => {
   const v = safeMarkdown(s, max);
   return v === "" ? "(empty)" : v;
@@ -5787,11 +5787,12 @@ function applyStage(parsed, stage, tool2) {
 import { closeSync as closeSync3, constants as constants3, fstatSync as fstatSync3, lstatSync as lstatSync3, openSync as openSync3, readSync as readSync3 } from "node:fs";
 var RangeFactsError = class extends Error {
 };
+var isRangeSkipped = (r) => Object.hasOwn(r, "skipped");
 var SHA_RE3 = /^[0-9a-f]{40}$/;
 var ZERO = "0".repeat(40);
 var MAX_FACTS_BYTES = 64 * 1024;
 var MAX_COMMITS = 1e7;
-var KEYS = ["base", "canaries", "commits", "head", "pipegenRange"];
+var KEYS = ["base", "before", "canaries", "commits", "head", "pipegenRange"];
 var CANARY_RULE_ID2 = `secret:${CANARY_RULE}`;
 var isObj2 = (v) => typeof v === "object" && v !== null && !Array.isArray(v);
 function parseRangeFacts(text) {
@@ -5805,9 +5806,15 @@ function parseRangeFacts(text) {
   } catch {
     return bad("are not JSON");
   }
-  if (!isObj2(d) || Object.keys(d).sort().join() !== KEYS.join()) return bad("are not in the form the range scan step writes");
+  if (!isObj2(d)) return bad("are not in the form the range scan step writes");
   if (d.pipegenRange !== 1) bad("are of a version this gate does not read");
+  if (Object.keys(d).sort().join() === "pipegenRange,skipped") {
+    if (d.skipped !== "no-range") bad("say the scan was skipped for a reason this gate does not know");
+    return { skipped: "no-range" };
+  }
+  if (Object.keys(d).sort().join() !== KEYS.join()) return bad("are not in the form the range scan step writes");
   for (const k of ["base", "head"]) if (typeof d[k] !== "string" || !SHA_RE3.test(d[k]) || d[k] === ZERO) bad(`have a ${k} that is not a commit sha`);
+  if (d.before !== null && (typeof d.before !== "string" || !SHA_RE3.test(d.before) || d.before === ZERO)) bad("have a before that is not a commit sha");
   if (typeof d.commits !== "number" || !Number.isSafeInteger(d.commits) || d.commits < 0 || d.commits > MAX_COMMITS) bad("have a commit count that is not a whole number");
   const list = d.canaries;
   if (!Array.isArray(list) || list.length !== RANGE_CANARY_FILES.length) return bad(`do not name ${RANGE_CANARY_FILES.length} canary commits`);
@@ -5819,7 +5826,7 @@ function parseRangeFacts(text) {
     return { commit: c.commit, path };
   });
   if (new Set(canaries.map((c) => c.commit)).size !== canaries.length) bad("name one canary commit twice");
-  return { base: d.base, head: d.head, commits: d.commits, canaries };
+  return { base: d.base, head: d.head, before: d.before, commits: d.commits, canaries };
 }
 function readRangeFacts(path) {
   let st;
@@ -5864,13 +5871,17 @@ function applyRange(findings, facts) {
     }
     kept.push(f);
   }
-  const missing = facts.canaries.filter((_, i) => seen[i] !== 1);
-  if (missing.length > 0) throw new RangeFactsError(`the scanner did not report the canary of commit ${missing.map((c) => c.commit.slice(0, 12)).join(" and ")} exactly once, so it is not proven to have read the commit range`);
+  const tip = facts.canaries.length - 1;
+  if ((seen[tip] ?? 0) === 0) throw new RangeFactsError(`the scanner did not report the canary of the stream's last commit (${facts.canaries[tip].commit.slice(0, 12)}), so it has not read the commit range to its end`);
+  const wrong = facts.canaries.filter((_, i) => seen[i] !== 1);
+  if (wrong.length > 0) throw new RangeFactsError(`the scanner did not report the canary of commit ${wrong.map((c) => c.commit.slice(0, 12)).join(" and ")} exactly once, so it is not proven to have read the commit range once`);
+  const dropped = facts.before === null ? "" : `, and the commits the push replaced (the head before it, ${facts.before.slice(0, 12)})`;
   return {
     findings: kept,
-    notes: [`the commit range ${facts.base.slice(0, 12)}..${facts.head.slice(0, 12)} (${facts.commits} commit(s) of the pull request, merges not counted) was scanned; both canary commits were read`]
+    notes: [`the commit range ${facts.base.slice(0, 12)}..${facts.head.slice(0, 12)} (${facts.commits} commit(s), merges included${dropped}) was scanned to its end; both canary commits were read`]
   };
 }
+var NO_RANGE_NOTE = "no commit range on this event (a push that made the branch, workflow_dispatch or schedule), so no commit range was scanned";
 
 // gate/src/scrub.ts
 var MAX_ERROR_CHARS = 300;
@@ -5920,7 +5931,7 @@ function withholder() {
     return v;
   };
 }
-function sarifOut(tool2, findings, notes, key) {
+function sarifOut(tool2, findings, notes, key, extra = {}) {
   const info = SARIF_TOOLS[tool2];
   const withheld = withholder();
   const results = findings.map((f) => {
@@ -5953,7 +5964,7 @@ function sarifOut(tool2, findings, notes, key) {
     version: "2.1.0",
     runs: [{
       tool: { driver: { name: info.driver } },
-      properties: { pipegenScrubbed: true, pipegenTool: tool2, ...key === void 0 ? {} : { pipegenKeyId: keyId(key) }, pipegenNotes: [...notes] },
+      properties: { pipegenScrubbed: true, pipegenTool: tool2, ...key === void 0 ? {} : { pipegenKeyId: keyId(key) }, pipegenNotes: [...notes], ...extra },
       results
     }]
   });
@@ -6000,6 +6011,10 @@ function scrubBytes(raw, opts) {
       if (!Object.hasOwn(SARIF_TOOLS, opts.tool)) return toolError(`${JSON.stringify(safeText(opts.tool, 60))} is not a tool whose SARIF the gate reads`, key);
       secretsTool = SARIF_TOOLS[opts.tool].secrets;
       if (opts.range !== void 0 && (opts.tool !== SECRETS_RANGE_TOOL || opts.stage !== void 0)) return toolError(`the commit-range scan is ${SECRETS_RANGE_TOOL}'s, and it has no stage folder`, key);
+      if (opts.range !== void 0 && isRangeSkipped(opts.range)) {
+        const bytes2 = Buffer.from(sarifOut(opts.tool, [], [NO_RANGE_NOTE], void 0, { pipegenRangeSkipped: true }), "utf8");
+        return { status: "ok", bytes: bytes2, sha256: sha2562(bytes2), findings: 0, notes: [NO_RANGE_NOTE], fpBy: { hash: 0, region: 0, quoted: 0, file: 0, line: 0, nokey: 0, "quoted-nokey": 0 } };
+      }
       if (opts.stage !== void 0) {
         if (!secretsTool) return toolError("a stage folder is only for the secrets tools", key);
         try {
@@ -6026,7 +6041,7 @@ function scrubBytes(raw, opts) {
       }
       parsed = { findings: staged.findings, notes: [...parsed.notes, ...staged.notes] };
     }
-    if (opts.range !== void 0) {
+    if (opts.range !== void 0 && !isRangeSkipped(opts.range)) {
       try {
         const ranged = applyRange(parsed.findings, opts.range);
         parsed = { findings: ranged.findings, notes: [...parsed.notes, ...ranged.notes] };
@@ -6164,7 +6179,9 @@ function readScrubbed(input, format, maxBytes = MAX_RAW_BYTES) {
           ...getOwn(p, "pipegenCommit") === void 0 ? {} : { commit: commitOf(getOwn(p, "pipegenCommit"), at3) }
         };
       });
-      return { findings: findings2, ...typeof id === "string" ? { keyId: id } : {}, notes: readNotes(getOwn(props, "pipegenNotes"), "properties") };
+      const skipped = getOwn(props, "pipegenRangeSkipped");
+      if (skipped !== void 0 && (skipped !== true || findings2.length > 0)) fail("the commit-range skip mark is not the scrub's");
+      return { findings: findings2, ...typeof id === "string" ? { keyId: id } : {}, notes: readNotes(getOwn(props, "pipegenNotes"), "properties"), ...skipped === true ? { rangeSkipped: true } : {} };
     }
     if (getOwn(doc, "pipegenScrubbed") !== true || getOwn(doc, "tool") !== ZAP_TOOL) fail("the result was not written by the scrub for ZAP");
     const alerts = getOwn(doc, "alerts");
@@ -6292,7 +6309,7 @@ function scrubFile(opts) {
   }
   let raw;
   try {
-    raw = readPlainFile(opts.raw, opts.maxBytes ?? MAX_RAW_BYTES, "the raw result");
+    raw = range !== void 0 && isRangeSkipped(range) ? Buffer.alloc(0) : readPlainFile(opts.raw, opts.maxBytes ?? MAX_RAW_BYTES, "the raw result");
   } catch (e) {
     return fail1(e instanceof ScrubFileError ? e.message : "the raw result cannot be read");
   }
@@ -8443,7 +8460,7 @@ async function rangeScanOf(tool2, result, outputs, fileOf) {
   const st = fileState(outputs, outputs.status === "ok" ? await fileOf() : void 0);
   switch (st.kind) {
     case "ok":
-      return { tool: tool2, findings: st.read.findings };
+      return st.read.rangeSkipped === true ? { tool: tool2, skipped: true } : { tool: tool2, findings: st.read.findings };
     case "absent":
       return { tool: tool2 };
     case "tool-error":
@@ -8562,7 +8579,11 @@ async function gatherGateInput(ctx, client, io) {
         const d = await downloadResult(io, { owner: repo2.owner, repo: repo2.name, runId, name: art, format: "sarif", ...outputFile.has(RANGE_TOOL) ? { expectedFile: outputFile.get(RANGE_TOOL) } : {} });
         return d.kind === "file" ? d.file : void 0;
       };
-      rangeScans.push(await rangeScanOf(m.entry.tool ?? RANGE_TOOL, m.result, m.outputs, fileOf));
+      const rs = await rangeScanOf(m.entry.tool ?? RANGE_TOOL, m.result, m.outputs, fileOf);
+      if (rs.skipped === true) {
+        if (prLike) rangeScans.push({ tool: rs.tool, toolError: "the range scan found no commit range on this pull request event (an all-zero base or head), so the commits of the pull request are not scanned" });
+        else notes.push("the range scan found no commit range on this event, so no commit range was scanned");
+      } else rangeScans.push(rs);
     }
   }
   const exp = expectedBaseOf(event);

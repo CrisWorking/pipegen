@@ -3,9 +3,9 @@
 // betterleaks in a sandbox runner, scrubs its raw result with the real scrub (range mode: the step's range.json beside it) and decides with
 // decideGate, as the gate does with the artifact. The step's own count check, canary commits, info/attributes and empty scan folder all run.
 // What is proven: a key added in one commit and removed in the next blocks; a key only in base commits does not; a key in an archive, under
-// node_modules/ or in package-lock.json is reported; the commits-scanned count is checked (a mismatch, or no count, is a tool error); a merge
-// commit is excluded by --no-merges (and what that costs); the checkout's .betterleaksignore and .gitattributes hide nothing; gitleaks git
-// mode, for comparison, applies its path allowlist.
+// node_modules/ or in package-lock.json is reported; the checkout's .betterleaksignore and .gitattributes hide nothing; gitleaks git mode,
+// for comparison, applies its path allowlist. Fix round 1 (review-C9.md): a stream cut short has no tip canary (a tool error); a merge's own
+// resolution is scanned; a link turned into a file is read; the commits a force-push dropped are scanned; an event with no range skips.
 import { execFileSync, spawnSync } from 'node:child_process';
 import { chmodSync, copyFileSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
@@ -49,23 +49,24 @@ function storedZip(name: string, text: string): Buffer {
   return Buffer.concat([local, n, data, central, n, end]);
 }
 
-interface Outcome { status: number | null; stderr: string; scan: RangeScan; gate: ReturnType<typeof decideGate> }
+interface Outcome { status: number | null; stderr: string; scan: RangeScan; gate: ReturnType<typeof decideGate>; skipped: boolean }
 /**
  * Runs the rendered range scan step over base..head of the sandbox's repository with `bin` as the installed betterleaks, then the scrub and
  * the decision (a clean HEAD scan beside it). `event` 'push' makes the range informational.
  */
-function scanRange(sb: Sandbox, range: { base: string; head: string }, bin = betterleaks, event: 'pull_request' | 'push' = 'pull_request'): Outcome {
+function scanRange(sb: Sandbox, range: { base: string; head: string; before?: string }, bin = betterleaks, event: 'pull_request' | 'push' = 'pull_request'): Outcome {
   const dir = join(sb.rt, 'pipegen-bin', A);
   mkdirSync(dir, { recursive: true });
   copyFileSync(bin, join(dir, 'betterleaks'));
   chmodSync(join(dir, 'betterleaks'), 0o755);
   const step = renderRangeBlock(entry('betterleaks'), p, GATE).steps[1] as RenderedStep;
-  const r = spawnSync('bash', ['--noprofile', '--norc', '-c', step.run ?? ''], { cwd: sb.ws, env: { ...stepEnv(step, sb), PIPEGEN_RANGE_BASE: range.base, PIPEGEN_RANGE_HEAD: range.head }, encoding: 'utf8' });
+  const r = spawnSync('bash', ['--noprofile', '--norc', '-c', step.run ?? ''], { cwd: sb.ws, env: { ...stepEnv(step, sb), PIPEGEN_RANGE_BASE: range.base, PIPEGEN_RANGE_HEAD: range.head, PIPEGEN_RANGE_BEFORE: range.before ?? '0'.repeat(40) }, encoding: 'utf8' });
   const raw = join(sb.rt, 'pipegen-raw', A, 'betterleaks.sarif');
   const out = join(sb.rt, 'pipegen-out', A, 'betterleaks.sarif');
   const s = scrubFile({ artifact: A, tool: 'betterleaks', format: 'sarif', raw, out, fpKey: FPKEY, workspace: sb.ws, eventText: '{}' });
-  const scan: RangeScan = s.status !== 'ok' ? { tool: 'betterleaks', toolError: s.error ?? 'no detail' } : { tool: 'betterleaks', findings: readScrubbed(readFileSync(out), 'sarif').findings };
-  return { status: r.status, stderr: r.stderr, scan, gate: decideGate(inputWith(scan, event)) };
+  const back = s.status === 'ok' ? readScrubbed(readFileSync(out), 'sarif') : undefined;
+  const scan: RangeScan = back === undefined ? { tool: 'betterleaks', toolError: s.error ?? 'no detail' } : { tool: 'betterleaks', findings: back.findings };
+  return { status: r.status, stderr: r.stderr, scan, gate: decideGate(inputWith(scan, event)), skipped: back?.rangeSkipped === true };
 }
 const se = { needId: 'secrets', job: 'secrets', category: 'secrets', tool: 'betterleaks', format: 'sarif', artifact: 'pipegen-out-secrets', baseArtifact: 'pipegen-out-base-secrets', blocking: true, [K_NS]: false } as JobListEntry;
 function inputWith(scan: RangeScan, event: 'pull_request' | 'push'): GateInput {
@@ -99,8 +100,8 @@ describe.skipIf(!live)('live: the commit-range secrets scan (C9), the pinned bet
     expect(o.status, o.stderr).toBe(0);
     expect(findingsOf(o)).toEqual([{ file: 'config.js', commit: c1, ruleId: `${SEC}shopify-access-token` }]);
     expect(o.gate.pass).toBe(false);
-    expect(rangeBlocks(o)).toEqual([`secret added in this PR's history (commit ${c1.slice(0, 12)}): rotate it, even if a later commit removed it`]);
-    expect(o.gate.summary).toContain('rotate it, even if a later commit removed it');
+    expect(rangeBlocks(o)).toEqual([`secret added in this PR's history (commit ${c1.slice(0, 12)}): rotate it now, even if a later commit removed it`]);
+    expect(o.gate.summary).toContain('rotate it now, even if a later commit removed it');
     // on a push to the default branch the same range only warns
     const pushed = scanRange(sandboxCopy(sb), { base, head }, betterleaks, 'push');
     expect(pushed.gate.pass).toBe(true);
@@ -122,7 +123,6 @@ describe.skipIf(!live)('live: the commit-range secrets scan (C9), the pinned bet
     expect(o.status, o.stderr).toBe(0);
     expect(findingsOf(o)).toEqual([]);
     expect(o.gate.pass).toBe(true);
-    expect(o.stderr).toMatch(/commits=3 /);   // one commit of the pull request and the two canaries
   }, 120_000);
 
   it('a key inside a stored archive, under node_modules/, in package-lock.json, or behind the checkout\'s .gitattributes (-diff, binary) is reported', () => {
@@ -160,69 +160,66 @@ describe.skipIf(!live)('live: the commit-range secrets scan (C9), the pinned bet
     expect(findingsOf(o)).toEqual([{ file: 'config.js', commit: c1, ruleId: `${SEC}shopify-access-token` }]);
   }, 120_000);
 
-  it('the commits-scanned count is checked: a scanner that scans other commits (no --no-merges) or prints no count is a tool error, and the gate blocks', () => {
+  it('fix round 1 (I1): a stream cut short (the scanner\'s git log dies silently half way) has no tip canary: a tool error, and the gate blocks', () => {
     const sb = sandbox();
     const g = gitOf(sb);
     g('init', '-q');
     put(sb, 'a.txt', 'base\n');
     const base = commit(g, 'base');
-    g('checkout', '-q', '-b', 'pr');
-    put(sb, 'b.txt', 'pr\n');
-    commit(g, 'pr 1');
-    g('checkout', '-q', 'main');
-    put(sb, 'm.txt', 'main\n');
-    commit(g, 'main moves on');
-    g('checkout', '-q', 'pr');
-    g('merge', '-q', '--no-edit', 'main');
+    put(sb, 'config.js', line(15));
+    commit(g, 'a key');
+    g('rm', '-q', 'config.js');
+    for (let i = 0; i < 3; i++) { put(sb, `f${i}.txt`, `${i}\n`.repeat(50)); commit(g, `filler ${i}`); }
     const head = g('rev-parse', 'HEAD');
-    // the honest scanner: the merge is not counted (rev-list --no-merges), the count matches
-    const ok = scanRange(sb, { base, head });
+    // the honest scan: the key, both canaries, ok
+    const ok = scanRange(sandboxCopy(sb), { base, head });
     expect(ok.status, ok.stderr).toBe(0);
-    // wrappers around the real binary: one drops --no-merges from --log-opts (so it lists the merge too), one drops --git-workers (no count)
-    const wrap = (name: string, body: string): string => {
-      const path = join(sb.dir, name);
-      writeFileSync(path, ['#!/bin/bash', 'args=()', 'skip=0', 'for a in "$@"; do', '  if [ "$skip" = 1 ]; then skip=0; continue; fi', body, '  args+=("$a")', 'done', `exec ${JSON.stringify(betterleaks)} "\${args[@]}"`].join('\n'));
-      chmodSync(path, 0o755);
-      return path;
-    };
-    const merges = wrap('merges.sh', '  case "$a" in --no-merges\\ *) a="${a#--no-merges }" ;; esac');
-    const silent = wrap('silent.sh', '  if [ "$a" = --git-workers ]; then skip=1; continue; fi');
-    for (const [what, bin, re] of [['merges', merges, /scanned 5 commits, but the range has 4/], ['no count', silent, /did not report how many commits it scanned/]] as const) {
-      const o = scanRange(sandboxCopy(sb), { base, head }, bin);
-      expect(o.status, what).toBe(1);
-      expect(o.stderr, what).toMatch(re);
-      expect(o.scan.toolError, what).toBeDefined();
-      expect(o.gate.pass, what).toBe(false);
-      expect(o.gate.toolErrors.map((t) => t.job), what).toEqual(['commit range']);
-    }
+    expect(findingsOf(ok).map((f) => f.file)).toEqual(['config.js']);
+    // a stand-in git on the scanner's PATH: its `git log` prints the first 600 bytes of the real stream, then is killed with no message
+    const fake = join(sb.dir, 'fakegit');
+    mkdirSync(fake);
+    writeFileSync(join(fake, 'git'), ['#!/bin/bash', 'case " $* " in *" log "*) /usr/bin/git "$@" | head -c 600; kill -9 $$ ;; esac', 'exec /usr/bin/git "$@"'].join('\n'));
+    chmodSync(join(fake, 'git'), 0o755);
+    const wrapper = join(sb.dir, 'cut.sh');
+    writeFileSync(wrapper, ['#!/bin/bash', `PATH=${fake}:$PATH exec ${JSON.stringify(betterleaks)} "$@"`].join('\n'));
+    chmodSync(wrapper, 0o755);
+    const cut = scanRange(sandboxCopy(sb), { base, head }, wrapper);
+    expect(cut.scan.toolError).toMatch(/not read the commit range to its end/);
+    expect(cut.gate.pass).toBe(false);
+    expect(cut.gate.toolErrors.map((t) => t.job)).toEqual(['commit range']);
   }, 180_000);
 
-  it('a merge commit inside the range is excluded by --no-merges: a key only in a merge\'s own resolution is not reported (the HEAD scan sees it while it stays), while a key the merge brings from main is (a false block, fail closed)', () => {
+  it('fix round 1 (I3): merge commits are scanned for what their own resolution added (a key typed into a conflict resolution, an .env staged while resolving), and a key a merge brings from main is reported too (a false block)', () => {
     const sb = sandbox();
     const g = gitOf(sb);
     g('init', '-q');
-    put(sb, 'a.txt', 'base\n');
+    put(sb, 'conf.txt', 'a\nb\nc\n');
     const base = commit(g, 'base');
     g('checkout', '-q', '-b', 'pr');
-    put(sb, 'b.txt', 'pr\n');
+    put(sb, 'conf.txt', 'a\nPR\nc\n');
     commit(g, 'pr 1');
     g('checkout', '-q', 'main');
+    put(sb, 'conf.txt', 'a\nMAIN\nc\n');
     put(sb, 'main.js', line(10));
     const onMain = commit(g, 'main gets a key after the pull request branched');
     g('checkout', '-q', 'pr');
-    g('merge', '-q', '--no-commit', 'main');
-    put(sb, 'evil.js', line(11));
-    g('add', '-A');
+    spawnSync('git', ['-c', 'user.name=t', '-c', 'user.email=t@example.com', 'merge', '-q', '--no-edit', 'main'], { cwd: sb.ws });   // conflicts
+    put(sb, 'conf.txt', `a\nRESOLVED ${line(11)}c\n`);
+    put(sb, '.env', line(12));
+    g('add', '-A', '-f');
     g('commit', '-q', '--no-edit');
-    g('rm', '-q', 'evil.js');
-    const head = commit(g, 'remove the merge\'s key');
+    const merge = g('rev-parse', 'HEAD');
+    g('rm', '-q', '.env');
+    put(sb, 'conf.txt', 'a\nb\nc\n');
+    const head = commit(g, 'clean up after the merge');
     const o = scanRange(sb, { base, head });
     expect(o.status, o.stderr).toBe(0);
-    expect(o.stderr).toMatch(/commits=5 /);   // pr 1, main's commit, the removal, two canaries; the merge is not counted
-    expect(findingsOf(o)).toEqual([{ file: 'main.js', commit: onMain, ruleId: `${SEC}shopify-access-token` }]);
+    const got = findingsOf(o).map((f) => `${f.commit === merge ? 'merge' : f.commit === onMain ? 'main' : 'other'}:${(f.file ?? '').replace(/^b\//, '')}`).sort();
+    expect(got).toEqual(['main:main.js', 'merge:.env', 'merge:conf.txt']);
+    expect(o.gate.pass).toBe(false);
   }, 120_000);
 
-  it('a commit of the range that turns a link into a file is refused (the parallel scan does not read type changes): a tool error', () => {
+  it('fix round 1: a link that becomes a file holding a key is read (single mode reads type changes) and blocks', () => {
     const sb = sandbox();
     const g = gitOf(sb);
     g('init', '-q');
@@ -231,14 +228,56 @@ describe.skipIf(!live)('live: the commit-range secrets scan (C9), the pinned bet
     const base = commit(g, 'base');
     g('rm', '-q', 'x');
     put(sb, 'x', line(12));
-    commit(g, 'the link becomes a file with a key');
+    const tc = commit(g, 'the link becomes a file with a key');
     g('rm', '-q', 'x');
     const head = commit(g, 'and goes');
     const o = scanRange(sb, { base, head });
-    expect(o.status).toBe(1);
-    expect(o.stderr).toMatch(/type of a file/);
+    expect(o.status, o.stderr).toBe(0);
+    expect(findingsOf(o)).toEqual([{ file: 'x', commit: tc, ruleId: `${SEC}shopify-access-token` }]);
     expect(o.gate.pass).toBe(false);
   }, 120_000);
+
+  it('fix round 1 (I2): after an amend and a force-push, the commit the push dropped is scanned (before) and blocks; a normal push still passes; a before that can not be fetched is a tool error', () => {
+    const sb = sandbox();
+    const g = gitOf(sb);
+    g('init', '-q');
+    put(sb, 'a.txt', 'base\n');
+    const base = commit(g, 'base');
+    put(sb, 'config.js', line(16));
+    const pushed = commit(g, 'a key, pushed (the gate blocked)');
+    g('rm', '-q', 'config.js');
+    put(sb, 'b.txt', 'b\n');
+    g('add', '-A');
+    g('commit', '-q', '--amend', '-m', 'amended without the key');
+    const head = g('rev-parse', 'HEAD');
+    // the synchronize of the force-push: base..head no longer holds the key's commit, before does
+    const without = scanRange(sandboxCopy(sb), { base, head });
+    expect(without.gate.pass).toBe(true);
+    const o = scanRange(sandboxCopy(sb), { base, head, before: pushed });
+    expect(o.status, o.stderr).toBe(0);
+    expect(findingsOf(o)).toEqual([{ file: 'config.js', commit: pushed, ruleId: `${SEC}shopify-access-token` }]);
+    expect(rangeBlocks(o)).toEqual([`secret added in this PR's history (commit ${pushed.slice(0, 12)}): rotate it now, even if a later commit removed it`]);
+    // a normal push: before is the previous head, an ancestor of the new head
+    put(sb, 'c.txt', 'c\n');
+    const next = commit(g, 'a normal push');
+    expect(scanRange(sandboxCopy(sb), { base, head: next, before: head }).gate.pass).toBe(true);
+    // a dropped head that is not in the checkout and can not be fetched (no remote here): the step fails, the range is a tool error
+    const lost = scanRange(sandboxCopy(sb), { base, head: next, before: 'e'.repeat(40) });
+    expect(lost.status).toBe(1);
+    expect(lost.stderr).toMatch(/could not be fetched/);
+    expect(lost.gate.pass).toBe(false);
+  }, 180_000);
+
+  it('fix round 1: no commit range on this event (an all-zero base): the step skips, the scrub marks it skipped, no finding', () => {
+    const sb = sandbox();
+    const g = gitOf(sb);
+    g('init', '-q');
+    put(sb, 'a.txt', 'base\n');
+    const head = commit(g, 'base');
+    const o = scanRange(sb, { base: '0'.repeat(40), head });
+    expect(o.status).toBe(0);
+    expect(o.skipped).toBe(true);
+  }, 60_000);
 });
 
 describe.skipIf(!live)('live: gitleaks 8.30.1 git mode, for comparison (why the range scan is betterleaks with no path allowlist)', () => {

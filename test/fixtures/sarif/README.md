@@ -88,15 +88,16 @@ good one; hadolint: an unparsable Dockerfile; ruff: a file with a syntax error b
 ordinary result. The only edit is the reviewer's scratch path, replaced with `/home/runner/work/fixture/fixture` (a text substitution; `ruff-syntax-error` and
 `hadolint-parse-error` needed none or only that). The parser must read each as a tool error.
 
-## Commit-range fixtures (`betterleaks-range/`, C9)
+## Commit-range fixtures (`betterleaks-range/`, C9; captured again for its fix round 1)
 
 Captured on 2026-10-30 with the pinned betterleaks 1.9.0 (`ensurePinnedBinary`'s cache) by running the **rendered** range scan step
-(`renderRangeBlock(...).steps[1]`) in a sandbox runner, exactly as CI runs it: two canary commits on the head, `--no-merges`,
-`--git-workers 2`, the entry's config with `prefilter = '''false'''` first, `--redact`, from an empty folder whose `.git` file names the
-repository's git folder. Each SARIF was re-indented with `JSON.stringify(…, null, 2)`; data and key order are unchanged. `range.json` /
-`clean-range.json` are the facts the step wrote beside the SARIF, byte for byte.
+(`renderRangeBlock(...).steps[1]`) in a sandbox runner, exactly as CI runs it: single mode, `--reverse --remerge-diff --text`, two canary
+commits on the head (dated last, so the tip canary is the stream's last commit), the entry's config with `prefilter = '''false'''` first,
+`--redact`, from an empty folder whose `.git` file names the repository's git folder. Each SARIF was re-indented with
+`JSON.stringify(…, null, 2)`; data and key order are unchanged. `range.json` / `clean-range.json` are the facts the step wrote beside the
+SARIF, byte for byte (`before` null: no force-push).
 
-| Fixture | Repository | Exit | Results |
+| Fixture | Repository | Exit | Results (in stream order) |
 |---|---|---|---|
-| `betterleaks.sarif` + `range.json` | base, then a commit adding a planted shopify-shaped key to `config.js`, then a commit removing it | 10 | 3: the key (at its commit) and the two canaries |
+| `betterleaks.sarif` + `range.json` | base, then a commit adding a planted shopify-shaped key to `config.js`, then a commit removing it | 10 | 3: the key (at its commit), then the two canaries |
 | `clean.sarif` + `clean-range.json` | base, then one commit with no secret | 10 | 2: the two canaries |

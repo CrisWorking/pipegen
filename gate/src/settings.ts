@@ -121,7 +121,7 @@ const parse = (text: string): unknown => { try { return JSON.parse(text) as unkn
 const shownName = (k: string): string => JSON.stringify(safeText(k.replace(/[^A-Za-z0-9._-]/g, '?'), 40));
 
 /** Why one parsed job-list entry does not hold together (beyond the referee's literal schema), or null. */
-function entryProblem(e: JobListEntry, i: number): string | null {
+export function entryProblem(e: JobListEntry, i: number): string | null {
   const at = `entry ${i + 1}`;
   let job: string;
   try { job = jobIdFor(e.needId, e.service); } catch { return `${at} has a service that names no job`; }
