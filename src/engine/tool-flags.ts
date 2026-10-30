@@ -622,8 +622,8 @@ const literalInput = (modes: readonly (typeof GATE_MODES)[number][], problem: (v
 });
 
 const ID_LIST_MAX = 50;
-/** Why a text is not a JSON list of need ids (`not-proven`, `skipped`), or null. */
-function idListProblem(text: string): string | null {
+/** Why a text is not a JSON list of need ids (`not-proven`, `skipped`), or null. The gate parses the same inputs with it (C5a). */
+export function idListProblem(text: string): string | null {
   const list = parseJson(text);
   if (!Array.isArray(list) || list.length > ID_LIST_MAX) return `a JSON list of at most ${ID_LIST_MAX} need ids`;
   return list.every((x) => typeof x === 'string' && NEED_ID_TEXT_RE.test(x)) ? null : 'a JSON list of need ids (lower case letters, digits and dashes)';
@@ -634,10 +634,18 @@ function policyProblem(text: string): string | null {
 }
 /** Extra protected paths: globs without `..`, a leading `/` or an option dash, in plain characters (ruling S22). */
 const GLOB_RE = /^(?![-/])(?!.*(?:^|\/)\.\.(?:\/|$))[A-Za-z0-9._/*?-]{1,200}$/;
-function pathListProblem(text: string): string | null {
+export function pathListProblem(text: string): string | null {
   const list = parseJson(text);
   if (!Array.isArray(list) || list.length > 100) return 'a JSON list of at most 100 path globs';
   return list.every((x) => typeof x === 'string' && GLOB_RE.test(x)) ? null : 'a JSON list of plain relative path globs (no .., no leading /)';
+}
+/** A service root: `.` or a plain relative folder (no glob, no `..`, no leading `/` or `-`), with an optional trailing `/`. */
+const SERVICE_ROOT_RE = /^(?:\.|(?![-/])(?!.*(?:^|\/)\.\.(?:\/|$))[A-Za-z0-9._/-]{1,200})$/;
+/** Why a text is not the gate's `service-roots` (a JSON list of at most 100 service folders, C5a CF3), or null. */
+export function serviceRootsProblem(text: string): string | null {
+  const list = parseJson(text);
+  if (!Array.isArray(list) || list.length > 100) return 'a JSON list of at most 100 service folders';
+  return list.every((x) => typeof x === 'string' && SERVICE_ROOT_RE.test(x) && !x.includes('//')) ? null : 'a JSON list of plain relative folders (or .), no glob, no .., no leading /';
 }
 
 // the job list literal (rulings B4 and S4): the shape of one entry, kept here so the gate row can check it; gate-job-list.ts builds it
@@ -753,6 +761,8 @@ export const RENDERER_INPUTS: Readonly<Record<string, Readonly<Record<string, Re
     skipped: literalInput(['gate'], idListProblem, 'a JSON list of need ids'),
     policy: literalInput(['gate'], policyProblem, 'a JSON policy { "block": [...], "warn": [...] }'),
     'protected-paths': literalInput(['gate'], pathListProblem, 'a JSON list of plain relative path globs'),
+    // the service folders (C5a CF3): the root-scoped config names are protected at each of them too (effectiveProtectedPaths)
+    'service-roots': literalInput(['gate'], serviceRootsProblem, 'a JSON list of plain relative service folders'),
     // gate and nightly
     'block-from': modeInput(['gate', 'nightly'], /^\$\{\{ vars\.PIPEGEN_BLOCK_FROM \}\}$/, '${{ vars.PIPEGEN_BLOCK_FROM }}'),
     'block-from-recorded': literalInput(['gate', 'nightly'], (v) => (validDate(v) === v ? null : 'a real calendar date'), 'a real calendar date YYYY-MM-DD'),

@@ -123,6 +123,13 @@ export interface GateInput {
    * a check in `checks` (by need id), else it is a missing check and blocks; `gate` itself is pipegen's job, never a check.
    */
   floorNeeds: readonly string[];
+  /** C5a: what the reads found that a person should know (a rate limit, an unreadable baseline, the mode's reason, integrity read problems). Fixed texts. */
+  notes?: readonly string[];
+  /**
+   * C5a (C2 review m8, G11): coverage a check can not prove, per job (`uv: not covered (lockfile type)` for the licence check). Shown on the
+   * check and in the notes, so a check with no findings is never read as covering what it could not see. It never blocks.
+   */
+  coverage?: readonly { job: string; text: string }[];
 }
 
 /** A finding as decided: which check, new or old (`undefined`: no base to tell, an installing PR), and why. */
@@ -289,6 +296,10 @@ export function decideGate(i: GateInput): GateResult {
   const block = (r: string): void => { if (!blockReasons.includes(r)) blockReasons.push(r); };
   const warn = (r: string): void => { if (!warnReasons.includes(r)) warnReasons.push(r); };
 
+  for (const n of i.notes ?? []) note(n);
+  const coverageOf = (job: string): string[] => (i.coverage ?? []).filter((c) => c.job === job).map((c) => c.text);
+  for (const c of i.coverage ?? []) note(`${c.job}: ${c.text}`);
+
   // 1. settings
   for (const s of i.settingsErrors) block(s);
   const pp = policyProblem(i.policy);
@@ -335,7 +346,8 @@ export function decideGate(i: GateInput): GateResult {
     const tool = e.tool ?? e.needId;
     const name = `${tool} (${e.job})`;
     const ref = (reason: string): CheckRef => ({ needId: e.needId, job: e.job, ...(e.tool === undefined ? {} : { tool: e.tool }), reason });
-    const state = (s: string): void => { checks.push({ needId: e.needId, job: e.job, ...(e.tool === undefined ? {} : { tool: e.tool }), judgedBy: findings ? 'findings' : 'job status', state: s }); };
+    const uncovered = coverageOf(e.job);
+    const state = (s: string): void => { checks.push({ needId: e.needId, job: e.job, ...(e.tool === undefined ? {} : { tool: e.tool }), judgedBy: findings ? 'findings' : 'job status', state: uncovered.length === 0 ? s : `${s}; ${uncovered.join('; ')}` }); };
     if (level === 'not-proven') notProven.push(ref(zapUnverified && !notProvenSet.has(e.needId) ? 'ZAP results are not verified yet, so this DAST check is judged as not proven (warnings only)' : 'not proven: warnings only'));
     const toolError = (why: string, base: boolean): void => {
       const blocks = level === 'required';

@@ -34,7 +34,7 @@ import { parse } from 'yaml';
 import { z } from 'zod';
 import { packageDataPath } from '../util/package-data.js';
 import { safeText } from '../util/safe-text.js';
-import { NEED_CATEGORIES, PROTECTED_PATHS_BASE, type Language, type Need, type ReviewedTool, type Service } from '../types.js';
+import { NEED_CATEGORIES, type Language, type Need, type ReviewedTool, type Service } from '../types.js';
 import {
   advisoryVersion, ASSET_RE, COMMIT_SHA_RE, DIGEST_RE, IMAGE_TAG_RE, isFullSemver, isGitHubRepo, isNpmName, isPypiName, npmEscapedName, parseImageRef, pep503,
   SHA256_RE, SRI_SHA512_RE, TAG_RE,
@@ -1295,17 +1295,8 @@ export function reviewedFor(need: Need, language: Language, list: ReviewedTool[]
     && (mode === 'audit' || t.proofs >= 1));
 }
 
-/**
- * PROTECTED_PATHS_BASE, then every configFiles entry of the tools in use (a name without a slash is protected at any depth by the gate), then
- * every rootConfigFiles name as `/name` (the repository root) and `/<service>/name` for each service root other than `.`, each once, in order.
- * A leading `/` tells the gate to match the root only. `serviceRoots` is required (C5a CF3): a forgotten list would silently drop the
- * service-root copies of the root-scoped names (`services/web/.prettierignore`, which prettier reads in that folder).
- */
-export function effectiveProtectedPaths(inUse: readonly Pick<ReviewedTool, 'configFiles' | 'rootConfigFiles'>[], serviceRoots: readonly string[]): string[] {
-  const roots = [...new Set(serviceRoots.map((r) => r.replace(/^(?:\.\/)+|\/+$/g, '')).filter((r) => r !== '' && r !== '.'))];
-  const rooted = inUse.flatMap((t) => (t.rootConfigFiles ?? []).flatMap((n) => (n.includes('/') ? [n] : [`/${n}`, ...roots.map((r) => `/${r}/${n}`)])));
-  return [...new Set([...PROTECTED_PATHS_BASE, ...inUse.flatMap((t) => t.configFiles), ...rooted])];
-}
+// effectiveProtectedPaths lives in the leaf protected-paths.ts (the gate bundles it without this loader); re-exported for the engine.
+export { effectiveProtectedPaths } from './protected-paths.js';
 
 /**
  * The typosquat check. Both names lowercased, the FULL `owner/name` compared: a reviewed repo within Levenshtein

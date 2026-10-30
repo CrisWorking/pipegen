@@ -25,7 +25,7 @@ import { APP_RUNNING_CATEGORIES, projectScriptSteps, renderCliTool, sha16, type 
 import { ArtifactNameError, resultArtifactName } from './artifact-names.js';
 import type { ProjectScriptStep } from './reviewed.js';
 import { own, RenderError, show } from './render-error.js';
-import { checkExpressions, checkJobOrder, isDangerousName, isReviewed, STEP_KEYS, type JobContext, type RenderedStep, type ScanFact } from './job-rules.js';
+import { BASE_CHECKOUT_ID, checkExpressions, checkJobOrder, isDangerousName, isReviewed, STEP_KEYS, type JobContext, type RenderedStep, type ScanFact } from './job-rules.js';
 import { jobListLiteral, type JobListEntry } from './gate-job-list.js';
 import { BASE_CHECKOUT_REF, DOCKER_ACTION_USES, IMAGE_BUILT_ACTION_USES, isStagedTool, PIPEGEN_GATE_USES, PLAIN_REL_RE, PLATFORM_LOCKS, PLATFORM_USES, RENDERER_INPUTS, rendererInputProblems, scrubbedResultPath, scrubStepId, stagePath, stageStepId } from './tool-flags.js';
 
@@ -446,7 +446,9 @@ export function renderJobPrelude(opts: PreludeOptions, platform: PlatformActions
   if (!(checkout.choices['fetch-depth'] ?? []).includes(depth)) throw new RenderError(`The reviewed checkout entry doesn't offer fetch-depth ${show(depth)}.`);
   if (opts.baseRef !== undefined && opts.baseRef !== true) throw new RenderError('baseRef is true or absent: the base checkout has one form (BASE_CHECKOUT_REF).');
   const ref = opts.baseRef === true ? BASE_CHECKOUT_REF : undefined;
-  steps.push(actionStep(checkout, opts.baseRef === undefined ? 'Check out the repository' : 'Check out the base commit', { 'fetch-depth': depth }, ref === undefined ? {} : { ref }));
+  const co = actionStep(checkout, opts.baseRef === undefined ? 'Check out the repository' : 'Check out the base commit', { 'fetch-depth': depth }, ref === undefined ? {} : { ref });
+  // the base checkout carries an id, so the base-scan job can hand the gate the commit it checked out (job output base-sha, C5a CF3b)
+  steps.push(ref === undefined ? co : { ...co, id: BASE_CHECKOUT_ID });
   if (opts.node !== undefined) {
     const setup = platformEntry(platform, 'setup-node');
     const mapped = mapNodeVersion(opts.node.runtimeVersion, setup.choices['node-version'] ?? []);
@@ -536,6 +538,7 @@ export interface GateStepOptions {
   /** need ids skipped with --skip */ skipped?: readonly string[];
   policy?: { block: readonly string[]; warn: readonly string[] };
   /** extra protected path globs */ protectedPaths?: readonly string[];
+  /** the service folders (Service.path), so root-scoped config names are protected there too (C5a CF3) */ serviceRoots?: readonly string[];
   /** the date the install recorded for blocking, YYYY-MM-DD */ blockFromRecorded?: string;
 }
 
@@ -554,6 +557,7 @@ export function renderGateStep(gate: ReviewedTool, entries: readonly JobListEntr
   if (opts.skipped !== undefined) filled.skipped = JSON.stringify(opts.skipped);
   if (opts.policy !== undefined) filled.policy = JSON.stringify({ block: opts.policy.block, warn: opts.policy.warn });
   if (opts.protectedPaths !== undefined) filled['protected-paths'] = JSON.stringify(opts.protectedPaths);
+  if (opts.serviceRoots !== undefined) filled['service-roots'] = JSON.stringify(opts.serviceRoots);
   if (opts.blockFromRecorded !== undefined) filled['block-from-recorded'] = opts.blockFromRecorded;
   return actionStep(gate, 'pipegen: the merge gate', {}, filled);
 }

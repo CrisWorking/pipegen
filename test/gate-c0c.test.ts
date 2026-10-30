@@ -171,7 +171,7 @@ describe('CF3a: one event-switched base form', () => {
     }
     const baseBlocks = specs.map((s) => block(s, { ...ctx, base: true }));
     const steps = over([...prelude({ baseRef: true }), ...baseBlocks.flatMap((b) => b.steps)]);
-    out['base-scan'] = job(steps, { outputs: jobOutputsFor(baseBlocks.flatMap((b) => b.steps)) });
+    out['base-scan'] = job(steps, { outputs: jobOutputsFor(steps) });   // C5a: with the base-sha output of its base checkout
     out.gate = job([renderGateStep(GATE, entries)], { name: 'gate', if: 'always()', needs: [...entries.map((e) => e.job), 'base-scan'], permissions: GATE_PERM });
     return out;
   }
@@ -180,6 +180,9 @@ describe('CF3a: one event-switched base form', () => {
     return { ...f, content: f.content.replace(/^on:\n  pull_request: null\n/m, `on: ${JSON.stringify(on)}\n`) };
   };
 
+  it('C5a: the base-scan job of these layouts hands the gate base-sha (the commit its base checkout checked out)', () => {
+    expect(jobs()['base-scan']?.outputs).toMatchObject({ 'base-sha': '${{ steps.pipegen-checkout.outputs.commit }}' });
+  });
   it('the expression is the one ruled form (a commit sha as the fallback, never a ref name)', () => {
     expect(BASE_CHECKOUT_REF).toBe(EXPR);
     expect(prelude({ baseRef: true })[0]?.with?.ref).toBe(EXPR);

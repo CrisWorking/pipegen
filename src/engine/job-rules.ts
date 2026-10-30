@@ -290,6 +290,13 @@ export function scrubChainProblems(steps: readonly RenderedStep[], scans?: Reado
 // ---------- job outputs (Plan C ruling B3) ----------
 
 const OUTPUT_NAMES = ['sha256', 'status', 'error'] as const;
+/** The id of the base-scan job's one checkout (renderJobPrelude with baseRef), so its `commit` output can be a job output (C5a CF3b). It is the setup id of actions/checkout, which the order rule already knows as harmless. */
+export const BASE_CHECKOUT_ID = 'pipegen-checkout';
+/** The base-scan job's output naming the commit it checked out: the gate requires it to equal the base of its own event (CF3b). */
+export const BASE_SHA_OUTPUT = 'base-sha';
+const BASE_SHA_VALUE = `\${{ steps.${BASE_CHECKOUT_ID}.outputs.commit }}`;
+/** The steps that are the base checkout: a checkout of exactly BASE_CHECKOUT_REF with the id BASE_CHECKOUT_ID. */
+const baseCheckouts = (steps: readonly RenderedStep[]): RenderedStep[] => steps.filter((s) => isCheckout(s) && s.id === BASE_CHECKOUT_ID && s.with?.ref === BASE_CHECKOUT_REF);
 /**
  * The `outputs` a job with scrub steps hands the gate: for each scrubbed result `<artifact>-sha256`, `-status` and `-error`, each
  * exactly `${{ steps.<that result's scrub id>.outputs.<sha256|status|error> }}`. The renderer writes them with this function;
@@ -297,6 +304,7 @@ const OUTPUT_NAMES = ['sha256', 'status', 'error'] as const;
  */
 export function jobOutputsFor(steps: readonly RenderedStep[]): Record<string, string> {
   const out: Record<string, string> = {};
+  if (baseCheckouts(steps).length === 1) out[BASE_SHA_OUTPUT] = BASE_SHA_VALUE;
   for (const s of steps) {
     if (!isScrubStep(s) || typeof s.with?.artifact !== 'string' || s.id === undefined) continue;
     for (const n of OUTPUT_NAMES) out[`${s.with.artifact}-${n}`] = `\${{ steps.${s.id}.outputs.${n} }}`;
@@ -306,7 +314,8 @@ export function jobOutputsFor(steps: readonly RenderedStep[]): Record<string, st
 
 /**
  * Why a job's `outputs` are not allowed (Plan C ruling B3), as plain-English problems: only `<artifact>-sha256`, `-status` and
- * `-error`, for an artifact whose scrub step is in this job, each exactly `${{ steps.<that scrub's id>.outputs.<same> }}`.
+ * `-error`, for an artifact whose scrub step is in this job, each exactly `${{ steps.<that scrub's id>.outputs.<same> }}`; and on the
+ * base-scan job `base-sha`, exactly `${{ steps.pipegen-checkout.outputs.commit }}` of its one base checkout (C5a CF3b).
  * Nothing else is an output of a job that feeds the gate (no `has-pr`, no `digest`: Plan G extends this function when it adds
  * one). The emitter and the referee both call this, so they allow the same forms.
  */
@@ -320,6 +329,13 @@ export function jobOutputsProblems(jobId: string, outputs: unknown, steps: reado
   }
   const problems: string[] = [];
   for (const [key, value] of Object.entries(outputs)) {
+    if (key === BASE_SHA_OUTPUT) {
+      // C5a CF3b: the commit the base-scan job checked out, from its one base checkout, and nowhere else
+      if (jobId !== BASE_SCAN_JOB) problems.push(`${where} include ${show(key)}, which only the ${BASE_SCAN_JOB} job hands the gate (the commit its base checkout checked out).`);
+      else if (baseCheckouts(steps).length !== 1) problems.push(`${where} include ${show(key)}, but the job has no single base checkout with the id ${BASE_CHECKOUT_ID} (the checkout of the event's base commit).`);
+      else if (value !== BASE_SHA_VALUE) problems.push(`${where}: ${show(key)} must be exactly ${BASE_SHA_VALUE} (the commit of its base checkout), nothing else.`);
+      continue;
+    }
     const name = OUTPUT_NAMES.find((n) => key.endsWith(`-${n}`));
     const artifact = name === undefined ? undefined : key.slice(0, key.length - name.length - 1);
     if (name === undefined || artifact === undefined || artifact === '') {
