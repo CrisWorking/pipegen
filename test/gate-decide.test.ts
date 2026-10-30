@@ -548,11 +548,11 @@ describe('decideGate: secrets in the PR\'s commit range (C1b review I2)', () => 
     const gone = leakF({ fingerprint: `${SEC}${hex('gone')}` });
     const r = decideGate(input({ checks: [check(se, [], [gone])], rangeScans: [{ tool: 'betterleaks', findings: [gone] }] }));
     expect(r.pass).toBe(false);
-    expect(r.blocking[0]?.reason).toMatch(/pull request's commits/);
+    expect(r.blocking[0]?.reason).toMatch(/^secret added in this PR's history/);
   });
-  it('a range finding also in the HEAD scan is judged by the HEAD scan', () => {
+  it('C9: a range finding also in the HEAD scan (and its base) blocks too: any secret the pull request put into its history blocks (no matching)', () => {
     const s = leakF({ fingerprint: `${SEC}${hex('both')}` });
-    expect(decideGate(input({ checks: [check(se, [s], [s])], rangeScans: [{ tool: 'betterleaks', findings: [s] }] })).pass).toBe(true);
+    expect(decideGate(input({ checks: [check(se, [s], [s])], rangeScans: [{ tool: 'betterleaks', findings: [s] }] })).pass).toBe(false);
   });
   it('a range scan with a tool error, or with no result, blocks as a tool error', () => {
     expect(decideGate(input({ checks: [check(se, [])], rangeScans: [{ tool: 'betterleaks', toolError: 'x' }] })).pass).toBe(false);
@@ -780,11 +780,11 @@ describe('fix round 1: the minors (m1-m7) and reading 1', () => {
     const low = fnd({ severity: 'low', fingerprint: hex('low') });
     expect(decideGate(input({ mode: 'block', policy, checks: [check(entry(), [low], [low])] })).warnings.map((w) => w.severity)).toEqual(['low']);
   });
-  it('m2: two range findings with one fingerprint and one HEAD occurrence: the second blocks', () => {
+  it('m2 (C9: no count): two range findings with one fingerprint and one HEAD occurrence: both block', () => {
     const s = leakF({ fingerprint: `${SEC}${hex('twice')}` });
     const r = decideGate(input({ checks: [check(se, [s], [s])], rangeScans: [{ tool: 'betterleaks', findings: [s, s] }] }));
     expect(r.pass).toBe(false);
-    expect(r.blocking.filter((b) => b.job === 'commit range')).toHaveLength(1);
+    expect(r.blocking.filter((b) => b.job === 'commit range')).toHaveLength(2);
   });
   it('m2: a floor need by category (migration-check is full-tests) in not-proven or with warn-first blocks', () => {
     const mc = jobEntry({ needId: 'migration-check', job: 'migration-check', category: 'full-tests' });

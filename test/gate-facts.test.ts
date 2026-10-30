@@ -8,6 +8,7 @@ import type { GateGithub, RunQuery } from '../gate/src/baseline.js';
 import { decideGate, type GateInput } from '../gate/src/decide.js';
 import { gatherGateInput, licenceCoverage, type GateContext, type GateIo } from '../gate/src/facts.js';
 import { scrubBytes } from '../gate/src/scrub.js';
+import { parseRangeFacts } from '../gate/src/range.js';
 import { gateToolView } from '../gate/src/settings.js';
 import { jobListLiteral, type JobListEntry } from '../src/engine/gate-job-list.js';
 import { makeZip, zipOf } from './helpers/zip.js';
@@ -34,6 +35,22 @@ const LEAKS = ent({ needId: 'secrets', tool: 'betterleaks' });
 const SAST = ent({ needId: 'sast', service: 'app', job: 'sast--app', tool: 'semgrep', artifact: 'pipegen-out-sast--app', baseArtifact: 'pipegen-out-base-sast--app' });
 const DEPS = ent({ needId: 'deps', tool: 'osv-scanner' });
 const TESTS = ((): JobListEntry => { const e = ent({ needId: 'unit-tests', service: 'app', job: 'unit-tests--app', tool: 'vitest', format: 'none' }); delete e.artifact; delete e.baseArtifact; return e; })();
+/** C9: the secrets job's commit-range scan (the entry gateJobList writes after the secrets check). */
+const RANGE = ((): JobListEntry => { const e = ent({ needId: 'secrets', tool: 'betterleaks', artifact: 'pipegen-out-secrets-range', range: true }); delete e.baseArtifact; return e; })();
+/** A real scrubbed commit-range result (the range scan step's raw SARIF and range facts, captured with the pinned betterleaks). */
+function scrubbedRange(kind: 'clean' | 'leak'): Uint8Array {
+  const [sarif, factsFile] = kind === 'clean' ? ['clean.sarif', 'clean-range.json'] : ['betterleaks.sarif', 'range.json'];
+  const r = scrubBytes(readFileSync(`test/fixtures/sarif/betterleaks-range/${sarif}`), { tool: 'betterleaks', format: 'sarif', fpKey: FPKEY, eventText: '{}', range: parseRangeFacts(readFileSync(`test/fixtures/sarif/betterleaks-range/${factsFile}`, 'utf8')) });
+  if (r.status !== 'ok') throw new Error(r.error);
+  return new Uint8Array(r.bytes);
+}
+/** Puts this range result in the world: the artifact, and the secrets job's three outputs for it. */
+function setRange(w: World, bytes: Uint8Array, over: Record<string, string> = {}): void {
+  w.arts = w.arts.filter((a) => a.name !== RANGE.artifact);
+  w.arts.push({ id: 900, name: RANGE.artifact as string, runId: RUN, zip: zipOf('betterleaks.sarif', bytes) });
+  Object.assign(out(w, LEAKS.job), { [`${RANGE.artifact}-sha256`]: sha256(bytes), [`${RANGE.artifact}-status`]: 'ok', [`${RANGE.artifact}-error`]: '' }, over);
+  sync(w);
+}
 
 /** A real scrubbed result file (what the scrub step uploads), from a captured SARIF fixture. */
 function scrubbed(tool: string, fixture: string): Uint8Array {
@@ -71,9 +88,13 @@ function world(): World {
     needs[e.job] = { result: 'success', outputs: { [`${e.artifact}-sha256`]: sha256(head), [`${e.artifact}-status`]: 'ok', [`${e.artifact}-error`]: '' } };
     Object.assign(baseOut, { [`${e.baseArtifact}-sha256`]: sha256(base), [`${e.baseArtifact}-status`]: 'ok', [`${e.baseArtifact}-error`]: '' });
   }
+  // C9: the commit-range result of the secrets job (clean: only its two canaries, taken out by the scrub)
+  const range = scrubbedRange('clean');
+  arts.push({ id: id++, name: RANGE.artifact as string, runId: RUN, zip: zipOf('betterleaks.sarif', range) });
+  Object.assign((needs[LEAKS.job] as { outputs: Record<string, string> }).outputs, { [`${RANGE.artifact}-sha256`]: sha256(range), [`${RANGE.artifact}-status`]: 'ok', [`${RANGE.artifact}-error`]: '' });
   needs[TESTS.job] = { result: 'success', outputs: {} };
   needs['base-scan'] = { result: 'success', outputs: baseOut };
-  const list = [LEAKS, SAST, DEPS, TESTS];
+  const list = [LEAKS, RANGE, SAST, DEPS, TESTS];
   return {
     event: 'pull_request', sha: MERGE,
     payload: {
@@ -189,7 +210,7 @@ describe('gatherGateInput: a fixture world that passes', () => {
   });
   it('action: reads only expected artifact names (the job list\'s artifact and base artifact, nothing else)', async () => {
     const { io } = await gather(world());
-    expect(io.lists.sort()).toEqual(['pipegen-out-base-deps', 'pipegen-out-base-sast--app', 'pipegen-out-base-secrets', 'pipegen-out-deps', 'pipegen-out-sast--app', 'pipegen-out-secrets']);
+    expect(io.lists.sort()).toEqual(['pipegen-out-base-deps', 'pipegen-out-base-sast--app', 'pipegen-out-base-secrets', 'pipegen-out-deps', 'pipegen-out-sast--app', 'pipegen-out-secrets', 'pipegen-out-secrets-range']);
   });
   it('action: artifact with an unexpected name never downloaded (a stray same-run artifact is not even listed)', async () => {
     const w = world();
@@ -615,5 +636,77 @@ describe('C5b: gatherGateInput passes the clean-run marker state on (cleanRun)',
   it('no trusted run → none; it is the state cleanRunSeen gave, never derived from the mode', async () => {
     const { input } = await gather(world());
     expect(input.cleanRun).toBe('none');
+  });
+});
+
+// ---------- C9: the commit-range secrets scan ----------
+
+/** The secrets job's id (spelled at run time, see test/no-secret-literals.test.ts). */
+const SJ = ['sec', 'rets'].join('');
+
+describe('gatherGateInput: the secrets job\'s commit-range scan (C9)', () => {
+  const rangeOf = (i: GateInput): GateInput['rangeScans'] => i.rangeScans;
+  it('the clean world: the range entry is read as the commit range (no finding), never as a check; the old "not scanned yet" note is gone', async () => {
+    const { input } = await gather(world());
+    expect(rangeOf(input)).toEqual([{ tool: 'betterleaks', findings: [] }]);
+    expect(input.checks.some((c) => c.entry.range === true)).toBe(false);
+    expect((input.notes ?? []).join('\n')).not.toMatch(/not scanned for secrets in this pipeline yet/);
+    expect(decideGate(input).pass).toBe(true);
+  });
+  it('a secret added in one commit and removed in the next (the captured leak): the gate blocks, naming the commit', async () => {
+    const w = world();
+    setRange(w, scrubbedRange('leak'));
+    const { input } = await gather(w);
+    const r = decideGate(input);
+    expect(r.pass).toBe(false);
+    expect(r.blocking.filter((b) => b.job === 'commit range').map((b) => [b.file, b.reason])).toEqual([['config.js', expect.stringMatching(/^secret added in this PR's history \(commit [0-9a-f]{12}\): rotate it, even if a later commit removed it$/)]]);
+  });
+  it('a tool error, no status output, a hash that is not the job\'s output, a missing artifact or a failed secrets job: the range blocks', async () => {
+    const cases: [string, (w: World) => void][] = [
+      ['tool error', (w) => { Object.assign(out(w, SJ), { [`${RANGE.artifact}-status`]: 'tool-error', [`${RANGE.artifact}-error`]: 'the scanner scanned 3 commits, but the range has 4' }); sync(w); }],
+      ['no status', (w) => { delete out(w, SJ)[`${RANGE.artifact}-status`]; sync(w); }],
+      ['other hash', (w) => { out(w, SJ)[`${RANGE.artifact}-sha256`] = 'e'.repeat(64); sync(w); }],
+      ['missing artifact', (w) => { w.arts = w.arts.filter((a) => a.name !== RANGE.artifact); }],
+      ['failed job', (w) => { (w.needs[SJ] as { result: string }).result = 'failure'; sync(w); }],
+    ];
+    for (const [what, tamper] of cases) {
+      const w = world();
+      tamper(w);
+      const { input } = await gather(w);
+      const r = decideGate(input);
+      expect(r.pass, what).toBe(false);
+      expect([...r.blockReasons, ...r.toolErrors.map((t) => t.job)].join('\n'), what).toMatch(/commit range/);
+    }
+  });
+  it('a job list with a secrets check but no commit-range entry: on a pull request the range is not scanned, so the gate blocks', async () => {
+    const w = world();
+    w.list = w.list.filter((e) => e.range !== true);
+    sync(w);
+    const { input } = await gather(w);
+    const r = decideGate(input);
+    expect(r.pass).toBe(false);
+    expect(r.toolErrors.map((t) => t.reason).join('\n')).toMatch(/no commit-range scan/);
+  });
+  it('merge_group: the range is read and required; push to the default branch: informational (a leak warns); a push that made the branch: no range, a note', async () => {
+    const mg = world();
+    mg.event = 'merge_group';
+    mg.payload = { merge_group: { base_sha: BASE, head_sha: MERGE, base_ref: 'refs/heads/main' }, repository: mg.payload.repository };
+    setRange(mg, scrubbedRange('leak'));
+    expect(decideGate((await gather(mg)).input).pass).toBe(false);
+    const p = world();
+    p.event = 'push'; p.sha = HEAD;
+    p.payload = { before: BASE, after: HEAD, ref: 'refs/heads/main', repository: p.payload.repository };
+    setRange(p, scrubbedRange('leak'));
+    const pr = decideGate((await gather(p)).input);
+    expect(pr.pass).toBe(true);
+    expect(pr.warnings.some((x) => x.job === 'commit range')).toBe(true);
+    const nb = world();
+    nb.event = 'push'; nb.sha = HEAD;
+    nb.payload = { before: '0'.repeat(40), after: HEAD, ref: 'refs/heads/main', repository: nb.payload.repository };
+    out(nb, 'base-scan')['base-sha'] = '0'.repeat(40);
+    setRange(nb, scrubbedRange('leak'));
+    const { input } = await gather(nb);
+    expect(rangeOf(input)).toEqual([]);
+    expect((input.notes ?? []).join('\n')).toMatch(/no commit range to scan/);
   });
 });

@@ -9,6 +9,7 @@ import { join } from 'node:path';
 import type { RunQuery } from '../../gate/src/baseline.js';
 import type { GateGithubAdapter } from '../../gate/src/github-adapter.js';
 import { scrubBytes } from '../../gate/src/scrub.js';
+import { parseRangeFacts } from '../../gate/src/range.js';
 import { gateToolView } from '../../gate/src/settings.js';
 import { jobListLiteral, type JobListEntry } from '../../src/engine/gate-job-list.js';
 import { zipOf } from './zip.js';
@@ -36,6 +37,8 @@ const ent = (over: Partial<JobListEntry> & { needId: string }): JobListEntry => 
 export const LEAKS = ent({ needId: 'secrets', tool: 'betterleaks' });
 export const SAST = ent({ needId: 'sast', service: 'app', job: 'sast--app', tool: 'semgrep', artifact: 'pipegen-out-sast--app', baseArtifact: 'pipegen-out-base-sast--app' });
 export const DEPS = ent({ needId: 'deps', tool: 'osv-scanner' });
+/** C9: the secrets job's commit-range scan (gateJobList writes it after the secrets check, in the same job). */
+export const RANGE = ((): JobListEntry => { const e = ent({ needId: 'secrets', tool: 'betterleaks', artifact: 'pipegen-out-secrets-range', range: true }); delete e.baseArtifact; return e; })();
 export const TESTS = ((): JobListEntry => { const e = ent({ needId: 'unit-tests', service: 'app', job: 'unit-tests--app', tool: 'vitest', format: 'none' }); delete e.artifact; delete e.baseArtifact; return e; })();
 
 export function scrubbedText(tool: string, text: string | Uint8Array): Uint8Array {
@@ -81,9 +84,16 @@ export function world(results: Partial<Record<'secrets' | 'sast--app' | 'deps', 
     needs[e.job] = { result: 'success', outputs: { [`${e.artifact}-sha256`]: sha256(bytes), [`${e.artifact}-status`]: 'ok', [`${e.artifact}-error`]: '' } };
     Object.assign(baseOut, { [`${e.baseArtifact}-sha256`]: sha256(bytes), [`${e.baseArtifact}-status`]: 'ok', [`${e.baseArtifact}-error`]: '' });
   }
+  // C9: the clean commit-range result (captured with the pinned betterleaks: only its two canaries, which the scrub takes out)
+  const dir = 'test/fixtures/sarif/betterleaks-range';
+  const rs = scrubBytes(readFileSync(`${dir}/clean.sarif`), { tool: 'betterleaks', format: 'sarif', fpKey: FPKEY, eventText: '{}', range: parseRangeFacts(readFileSync(`${dir}/clean-range.json`, 'utf8')) });
+  if (rs.status !== 'ok') throw new Error(rs.error);
+  const range = new Uint8Array(rs.bytes);
+  arts.push({ id: id++, name: RANGE.artifact as string, runId: RUN, zip: zipOf('betterleaks.sarif', range) });
+  Object.assign((needs[SEC_JOB] as { outputs: Record<string, string> }).outputs, { [`${RANGE.artifact}-sha256`]: sha256(range), [`${RANGE.artifact}-status`]: 'ok', [`${RANGE.artifact}-error`]: '' });
   needs[TESTS.job] = { result: 'success', outputs: {} };
   needs['base-scan'] = { result: 'success', outputs: baseOut };
-  const list = [LEAKS, SAST, DEPS, TESTS];
+  const list = [LEAKS, RANGE, SAST, DEPS, TESTS];
   return {
     event: 'pull_request', sha: MERGE,
     payload: {

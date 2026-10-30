@@ -7,7 +7,7 @@
 //   runs[0].properties {pipegenScrubbed, pipegenTool, pipegenKeyId (only when a key made a fingerprint), pipegenNotes},
 //   per result: ruleId, level (from the severity), message.text, locations[0].physicalLocation {artifactLocation.uri (a
 //   workspace-relative path, only when mapped), region {startLine, endLine}}, partialFingerprints.pipegenFingerprint,
-//   properties {pipegenSeverity, pipegenSecret, pipegenUnmapped, pipegenFpBy}.
+//   properties {pipegenSeverity, pipegenSecret, pipegenUnmapped, pipegenFpBy, and for the commit-range scan (C9) pipegenCommit}.
 // ZAP out: pipegenScrubbed, tool, notes, alerts[] {pluginid, name, severity, fingerprint, unmapped, method, path}.
 // Never written: snippet, contextRegion, evidence, attack, param, markdown, the tool's own fingerprints, any other property,
 // artifacts, rules, invocations, the raw uri of an unmapped finding, and the message of a secrets tool (the parser already
@@ -31,6 +31,7 @@ import { CONTENT_FORMS, fingerprintAll, isQuotingFinding, keyId, keyProblem, mas
 import { fail, getOwn, isObj, MAX_RAW_BYTES, ReadError, readJson, type ParsedFinding, type ParseResult } from './parse-common.js';
 import { MAX_ADVISORY_IDS, SARIF_TOOLS, parseSarifText } from './sarif.js';
 import { applyStage, readStage, StageError, STAGED_NAME_RE, type Stage, type StagedFindings } from './stage.js';
+import { applyRange, RANGE_FACTS_FILE, RangeFactsError, readRangeFacts, SECRETS_RANGE_ARTIFACT, SECRETS_RANGE_TOOL, type RangeFacts } from './range.js';
 import { ZAP_TOOL, parseZapJsonText } from './zap.js';
 
 export type ScrubFormat = 'sarif' | 'zap-json';
@@ -54,6 +55,12 @@ export interface ScrubOptions {
    * the original path and line, reading each region from the staged copy. Only for the secrets tools.
    */
   stage?: string;
+  /**
+   * C9: the facts of a commit-range scan (gate/src/range.ts), for the result of SECRETS_RANGE_ARTIFACT only: the SARIF of betterleaks in `git`
+   * mode, every finding with its commit; the two canary commits are required and taken out. No stage folder, and no region of the checkout is
+   * read (a secret of the range is in a commit, not in HEAD's files): its secrets take the line form.
+   */
+  range?: RangeFacts;
 }
 export type ScrubOutcome =
   | { status: 'ok'; bytes: Buffer; sha256: string; findings: number; keyId?: string; notes: string[]; fpBy: Record<FpBy, number> }
@@ -130,6 +137,8 @@ function sarifOut(tool: string, findings: readonly FingerprintedFinding[], notes
       partialFingerprints: { pipegenFingerprint: f.fingerprint },
       properties: {
         pipegenSeverity: f.severity, pipegenSecret: f.secret, pipegenUnmapped: f.uriUnmapped || hide, pipegenPathWithheld: hide, pipegenFpBy: f.fpBy,
+        // C9: the commit a finding of the commit-range scan was found in (40 hex digits, read by the parser)
+        ...(f.commit === undefined ? {} : { pipegenCommit: f.commit }),
         // C1c fix round 1: the display form of a staged name with no lossless text (withheld like a path when it looks like a secret)
         ...(f.file === undefined && f.displayPath !== undefined && !withheld(f.displayPath) ? { pipegenDisplayPath: clip(f.displayPath, 4096) } : {}),
         // C2 fix round 1 (review-C2 I3): the advisory ids and aliases, so the gate sees a MAL- id whichever id the tool shows
@@ -189,6 +198,7 @@ export function scrubBytes(raw: Uint8Array, opts: ScrubOptions): ScrubOutcome {
     if (opts.format === 'sarif') {
       if (!Object.hasOwn(SARIF_TOOLS, opts.tool)) return toolError(`${JSON.stringify(safeText(opts.tool, 60))} is not a tool whose SARIF the gate reads`, key);
       secretsTool = SARIF_TOOLS[opts.tool].secrets;
+      if (opts.range !== undefined && (opts.tool !== SECRETS_RANGE_TOOL || opts.stage !== undefined)) return toolError(`the commit-range scan is ${SECRETS_RANGE_TOOL}'s, and it has no stage folder`, key);
       if (opts.stage !== undefined) {
         if (!secretsTool) return toolError('a stage folder is only for the secrets tools', key);
         try {
@@ -197,11 +207,13 @@ export function scrubBytes(raw: Uint8Array, opts: ScrubOptions): ScrubOutcome {
           return toolError(e instanceof StageError ? e.message : 'the stage folder could not be read', key);
         }
       }
-      parsed = stage === undefined
-        ? parseSarifText(raw, opts.tool, { workspace: opts.workspace, limits: { maxBytes } })
-        : parseSarifText(raw, opts.tool, { workspace: stage.files, exactNames: STAGED_NAME_RE, limits: { maxBytes } });
+      parsed = opts.range !== undefined
+        ? parseSarifText(raw, opts.tool, { commits: true, limits: { maxBytes } })   // C9: git mode writes repository paths; no workspace
+        : stage === undefined
+          ? parseSarifText(raw, opts.tool, { workspace: opts.workspace, limits: { maxBytes } })
+          : parseSarifText(raw, opts.tool, { workspace: stage.files, exactNames: STAGED_NAME_RE, limits: { maxBytes } });
     } else if (opts.format === 'zap-json') {
-      if (opts.stage !== undefined) return toolError('a stage folder is only for the secrets tools', key);
+      if (opts.stage !== undefined || opts.range !== undefined) return toolError('a stage folder or a commit range is only for the secrets tools', key);
       if (opts.tool !== ZAP_TOOL) return toolError(`${JSON.stringify(safeText(opts.tool, 60))} is not a tool whose ZAP report the gate reads`, key);
       parsed = parseZapJsonText(raw, opts.tool, { limits: { maxBytes } });
     } else {
@@ -217,6 +229,14 @@ export function scrubBytes(raw: Uint8Array, opts: ScrubOptions): ScrubOutcome {
       }
       parsed = { findings: staged.findings, notes: [...parsed.notes, ...staged.notes] };
     }
+    if (opts.range !== undefined) {
+      try {
+        const ranged = applyRange(parsed.findings, opts.range);
+        parsed = { findings: ranged.findings, notes: [...parsed.notes, ...ranged.notes] };
+      } catch (e) {
+        return toolError(e instanceof RangeFactsError ? e.message : 'the commit-range findings could not be checked', key);
+      }
+    }
 
     const needsKey = secretsTool || parsed.findings.some((f) => f.secret || isQuotingFinding(f));
     const problem = keyProblem(key, forkFromEvent(opts.eventText), needsKey);
@@ -227,6 +247,8 @@ export function scrubBytes(raw: Uint8Array, opts: ScrubOptions): ScrubOutcome {
     const findings = fingerprintAll(parsed.findings, {
       fpKey: usedKey, workspace: opts.workspace, onRegion: (b) => { regions.push(b); },
       ...(staged === undefined ? {} : { regionOf: staged.regionOf, fileHashOf: staged.fileHashOf }),
+      // C9: a secret of the commit range is in a commit, not in the checkout's file of that name: never read a region for it
+      ...(opts.range === undefined ? {} : { regionOf: () => ({ ok: false as const, reason: 'a secret in a commit of the range (the checkout\'s file is not that commit\'s)' }) }),
     });
     const notes = [...parsed.notes, ...lineNotes(findings)].slice(0, MAX_NOTES).map((n) => clip(maskSecretShapes(n), MAX_NOTE_CHARS));
     const bytes = Buffer.from(opts.format === 'sarif' ? sarifOut(opts.tool, findings, notes, usedKey) : zapOut(findings, notes), 'utf8');
@@ -259,6 +281,8 @@ export interface ScrubbedFinding {
   /** C2 fix round 1: every advisory id and alias of the finding (parse-common.ts ParsedFinding.advisoryIds), when there is more than the rule id. */
   advisoryIds?: string[];
   method?: string;
+  /** C9: the commit a finding of the commit-range scan was found in (40 hex digits). */
+  commit?: string;
 }
 export interface ScrubbedResult { findings: ScrubbedFinding[]; keyId?: string; notes: string[]; toolError?: string }
 
@@ -288,6 +312,11 @@ const lineNo = (v: unknown, where: string): number | undefined => {
 function advisoryIdsOf(v: unknown, where: string): string[] {
   if (!Array.isArray(v) || v.length > MAX_ADVISORY_IDS || !v.every((x) => typeof x === 'string')) fail(`${where}: the advisory ids are not a list of at most ${MAX_ADVISORY_IDS} strings`);
   return v as string[];
+}
+/** C9: the commit of a scrubbed finding: 40 hex digits, else the file is not the scrub's (a tool error). */
+function commitOf(v: unknown, where: string): string {
+  if (typeof v !== 'string' || !/^[0-9a-f]{40}$/.test(v)) fail(`${where}: the commit is not 40 hex digits`);
+  return v;
 }
 function readNotes(v: unknown, where: string): string[] {
   if (!Array.isArray(v)) fail(`${where}: notes is not a list`);
@@ -346,6 +375,7 @@ export function readScrubbed(input: string | Uint8Array, format: ScrubFormat, ma
           message: str(msg, 'text', at), fingerprint, secret: bool(p, 'pipegenSecret', at), fpBy: fpBy as FpBy, uriUnmapped: bool(p, 'pipegenUnmapped', at), pathWithheld: optBool(p, 'pipegenPathWithheld', at),
           ...(getOwn(p, 'pipegenDisplayPath') === undefined ? {} : { displayPath: str(p, 'pipegenDisplayPath', at) }),
           ...(getOwn(p, 'pipegenAdvisoryIds') === undefined ? {} : { advisoryIds: advisoryIdsOf(getOwn(p, 'pipegenAdvisoryIds'), at) }),
+          ...(getOwn(p, 'pipegenCommit') === undefined ? {} : { commit: commitOf(getOwn(p, 'pipegenCommit'), at) }),
         };
       });
       return { findings, ...(typeof id === 'string' ? { keyId: id } : {}), notes: readNotes(getOwn(props, 'pipegenNotes'), 'properties') };
@@ -479,8 +509,19 @@ export function scrubFile(opts: ScrubFileOptions): ScrubFileResult {
   } catch {
     return fail1('the key could not be masked in the logs, so the scrub did not run');
   }
+  // C9: the commit-range scan reads the history, not a stage folder: its coverage is proven by its count (the scan step) and its canary commits,
+  // from the facts the step wrote beside its raw result
+  let range: RangeFacts | undefined;
+  if (opts.artifact === SECRETS_RANGE_ARTIFACT) {
+    if (opts.stage !== undefined) return fail1('the commit-range scan has no stage folder');
+    try {
+      range = readRangeFacts(join(dirname(opts.raw), RANGE_FACTS_FILE));
+    } catch (e) {
+      return fail1(e instanceof RangeFactsError ? e.message : 'the commit-range facts could not be read');
+    }
+  }
   // C1c: a secrets scan always runs on the stage folder; without it its coverage can not be proven, so it is never read as clean
-  if (Object.hasOwn(SARIF_TOOLS, opts.tool) && SARIF_TOOLS[opts.tool].secrets && opts.stage === undefined) {
+  else if (Object.hasOwn(SARIF_TOOLS, opts.tool) && SARIF_TOOLS[opts.tool].secrets && opts.stage === undefined) {
     return fail1('the secrets scan has no stage folder (the stage input): pipegen stages the checkout under neutral names before every secrets scan, and without it the scan\'s coverage can not be proven');
   }
   let raw: Buffer;
@@ -497,7 +538,10 @@ export function scrubFile(opts: ScrubFileOptions): ScrubFileResult {
       eventText = undefined;   // unreadable: not a fork (the stricter rule)
     }
   }
-  const scrubbed = scrubBytes(raw, { tool: opts.tool, format: opts.format, fpKey: opts.fpKey, eventText, workspace: opts.workspace, maxBytes: opts.maxBytes, ...(opts.stage === undefined ? {} : { stage: opts.stage }) });
+  const scrubbed = scrubBytes(raw, {
+    tool: opts.tool, format: opts.format, fpKey: opts.fpKey, eventText, workspace: opts.workspace, maxBytes: opts.maxBytes,
+    ...(opts.stage === undefined ? {} : { stage: opts.stage }), ...(range === undefined ? {} : { range }),
+  });
   if (scrubbed.status !== 'ok') return { status: 'tool-error', error: scrubbed.error };
   // The result is written to a temporary file of its own in the artifact folder and published whole (a hard link that cannot replace
   // a file, then the temporary name removed): a failed write leaves no partial result for the upload step to pick up (review m5).

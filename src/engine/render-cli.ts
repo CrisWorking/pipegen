@@ -23,7 +23,7 @@
 //   tool needs at run time (image, local URL, Dockerfile, base ref) are slots from the render context (ruling B6): slots.ts.
 // Nothing here uploads (ruling B3).
 import { isDeepStrictEqual } from 'node:util';
-import { ArtifactNameError, resultArtifactName, SECRETS_RANGE_ARTIFACT } from './artifact-names.js';
+import { ArtifactNameError, RANGE_CANARY_FILES, RANGE_FACTS_FILE, resultArtifactName, SECRETS_RANGE_ARTIFACT } from './artifact-names.js';
 import { ASSET_RE, COMMIT_SHA_RE, DIGEST_RE, isGitHubRepo, isNpmName, isPypiName, parseImageRef, pep503, SHA256_RE, SRI_SHA512_RE, TAG_RE } from './names.js';
 import { closureRootDependencies, loadNpmClosure, NpmClosureError, type NpmPin } from './npm-closure.js';
 import { EXPR, own, refuse, show } from './render-error.js';
@@ -709,10 +709,6 @@ export function renderCliTool({ spec, tool, service, ctx, hooks, options }: CliA
 
 /** C9: the config of the range scan: pipegen's pinned betterleaks config (the canary rule included) with no global path allowlist. */
 export const RANGE_PREFILTER = "prefilter = '''false'''\n\n";
-/** C9: the facts the range scan step writes beside its raw result, for the scrub (gate/src/range.ts reads them). */
-export const RANGE_FACTS_FILE = 'range.json';
-/** C9: the two canary files of the range scan's canary commits. */
-export const RANGE_CANARY_FILES = ['pipegen-range-canary-1.txt', 'pipegen-range-canary-2.txt'] as const;
 
 /**
  * The commit-range secrets scan (C9, Plan C final review Important 2): the reviewed betterleaks entry's release install, then ONE checker step

@@ -43,6 +43,8 @@ export interface ParsedFinding extends Omit<Finding, 'fingerprint'> {
    * finding as malware when any of them starts with MAL-. Never part of a fingerprint.
    */
   advisoryIds?: string[];
+  /** C9: the commit a finding of the commit-range scan was found in (40 hex digits; sarif.ts ParseOptions.commits). */
+  commit?: string;
 }
 
 /** `toolError` is set when the scan cannot be called clean (then `findings` is empty). `notes` are for people. */

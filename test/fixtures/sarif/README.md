@@ -87,3 +87,16 @@ Captured by the C1a reviewer from the same pinned binaries and reviewed flags ov
 good one; hadolint: an unparsable Dockerfile; ruff: a file with a syntax error beside a good one). Each is a tool saying "I could not read this target" as an
 ordinary result. The only edit is the reviewer's scratch path, replaced with `/home/runner/work/fixture/fixture` (a text substitution; `ruff-syntax-error` and
 `hadolint-parse-error` needed none or only that). The parser must read each as a tool error.
+
+## Commit-range fixtures (`betterleaks-range/`, C9)
+
+Captured on 2026-10-30 with the pinned betterleaks 1.9.0 (`ensurePinnedBinary`'s cache) by running the **rendered** range scan step
+(`renderRangeBlock(...).steps[1]`) in a sandbox runner, exactly as CI runs it: two canary commits on the head, `--no-merges`,
+`--git-workers 2`, the entry's config with `prefilter = '''false'''` first, `--redact`, from an empty folder whose `.git` file names the
+repository's git folder. Each SARIF was re-indented with `JSON.stringify(…, null, 2)`; data and key order are unchanged. `range.json` /
+`clean-range.json` are the facts the step wrote beside the SARIF, byte for byte.
+
+| Fixture | Repository | Exit | Results |
+|---|---|---|---|
+| `betterleaks.sarif` + `range.json` | base, then a commit adding a planted shopify-shaped key to `config.js`, then a commit removing it | 10 | 3: the key (at its commit) and the two canaries |
+| `clean.sarif` + `clean-range.json` | base, then one commit with no secret | 10 | 2: the two canaries |

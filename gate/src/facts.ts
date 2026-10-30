@@ -8,6 +8,9 @@
 //   1. Settings (resolveSettings) and the job mapping (mapJobs): pure.
 //   2. The result artifacts, by their exact names from the trusted job list, only for a check whose job succeeded with status `ok`:
 //      first the head result, then its base-scan twin when the base-scan job reports one (`ok`). Hash and zip checks: artifacts.ts.
+//      2b (C9). The secrets job's commit-range result (the job list's `range` entry), the same way, as the commit range (rangeScans): required
+//      on a pull request and in the merge queue (a list with a secrets check but no range entry is a tool error), informational on a push to
+//      the default branch, none on the push that made the branch.
 //   3. The base (CF3b): the base computed from THIS event's payload (pull_request base.sha, merge_group base_sha, push before); only when
 //      the base-scan job's `base-sha` output equals it is the ancestry asked (compare base...github.sha, status `ahead` only).
 //   4. The diff the "new" rule reads (C2 review I1, r3): compare pull_request.base.sha...github.sha (the scanned merge commit), merge_group
@@ -30,7 +33,8 @@
 //
 // One range is compared once (fix round 1, m6): the ancestry and the diff both read GET /compare/{base}...{github.sha} on a pull request, so
 // the answer is fetched once and both read it.
-import { expectedBaseOf, type CheckInput, type GateEvent, type GateInput, type PrDiff } from './decide.js';
+import { expectedBaseOf, fileState, type CheckInput, type GateEvent, type GateInput, type JobOutputs, type JobResult, type PrDiff, type RangeScan } from './decide.js';
+import { RANGE_TOOL } from '../../src/engine/tool-flags.js';
 import { cleanRunSeen, loadBaseline, type GateGithub, type RepoRef } from './baseline.js';
 import { downloadResult, type ResultIo } from './artifacts.js';
 import { baseHasInstall, buildPrDiff, integrityFindings, loadCodeowners, readConfigSections, readPrContext } from './integrity.js';
@@ -97,6 +101,26 @@ export function licenceCoverage(list: readonly LicenceLockfiles[] | undefined): 
   if (list === undefined) return ['coverage per lockfile not known (the gate step has no licence-lockfiles input)'];
   if (list.length === 0) return ['not covered (no lockfile)'];
   return [...new Set(list.flatMap((e) => (e.lockfiles.length === 0 ? [`${e.service}: not covered (no lockfile)`] : e.lockfiles.filter((l) => !l.read).map((l) => `${e.service}: ${l.kind}: not covered (lockfile type)`))))];
+}
+
+const ZERO_SHA = '0'.repeat(40);
+/**
+ * C9: what the commit-range result of a run says (the same B7 file rules as a check's result, decide.ts fileState): its findings when the job
+ * succeeded and the file is the job's own and readable; else a tool error with the reason; no status output at all is "no result". The file is
+ * downloaded only for a job that succeeded with status ok.
+ */
+async function rangeScanOf(tool: string, result: JobResult, outputs: JobOutputs, fileOf: () => Promise<CheckInput['file']>): Promise<RangeScan> {
+  if (result !== 'success') {
+    return { tool, toolError: outputs.status === 'tool-error' ? (outputs.error ?? 'no detail') : `the secrets job did not succeed (${result}), so its commit-range scan has no result` };
+  }
+  const st = fileState(outputs, outputs.status === 'ok' ? await fileOf() : undefined);
+  switch (st.kind) {
+    case 'ok': return { tool, findings: st.read.findings };
+    case 'absent': return { tool };
+    case 'tool-error': return { tool, toolError: st.why };
+    case 'tampered': return { tool, toolError: `the commit-range result is not the one the job made: ${st.why}` };
+    case 'missing-file': return { tool, toolError: 'the commit-range result artifact is missing' };
+  }
 }
 
 /** The repository of this run, from the payload, checked against GITHUB_REPOSITORY (a text: why not). The action's baseline-check mode reads it too. */
@@ -193,6 +217,30 @@ export async function gatherGateInput(ctx: GateContext, client: GateGithub, io: 
     checks.push(c);
   }
 
+  // 2b. C9: the secrets job's commit-range scan, read as the commit range (decide.ts rule 7), never as a check. On a pull request and in the
+  // merge queue it is required: a job list with a secrets check but no range entry, a failed job, a tool error, no result or a result that is
+  // not the job's own all block. On a push to the default branch it is informational; a push that made the branch has no range at all.
+  const rangeScans: RangeScan[] = [];
+  const prLike = PR_EVENTS.has(event.name) || event.name === 'merge_group';
+  const before = pushToDefault ? sha40(at(payload, 'before')) : undefined;
+  if (pushToDefault && (before === undefined || before === ZERO_SHA)) {
+    if (settings.jobList.some((e) => e.range === true)) notes.push('the push made the default branch (it has no previous commit), so there is no commit range to scan for secrets');
+  } else if (prLike || pushToDefault) {
+    const ranges = mapped.checks.filter((m) => m.entry.range === true);
+    if (ranges.length === 0 && settings.jobList.some((e) => e.category === 'secrets' && e.range !== true)) {
+      const why = 'the job list has no commit-range scan for the secrets check, so the commits of the pull request are not scanned (render the pipeline again with pipegen update)';
+      if (prLike) rangeScans.push({ tool: RANGE_TOOL, toolError: why }); else notes.push(why);
+    }
+    for (const m of ranges) {
+      const art = m.entry.artifact as string;
+      const fileOf = async (): Promise<CheckInput['file']> => {
+        const d = await downloadResult(io, { owner: repo.owner, repo: repo.name, runId, name: art, format: 'sarif', ...(outputFile.has(RANGE_TOOL) ? { expectedFile: outputFile.get(RANGE_TOOL) as string } : {}) });
+        return d.kind === 'file' ? d.file : undefined;
+      };
+      rangeScans.push(await rangeScanOf(m.entry.tool ?? RANGE_TOOL, m.result, m.outputs, fileOf));
+    }
+  }
+
   // 3. the base: this event's own base, then (only if the base-scan job checked it out) its ancestry against github.sha
   const exp = expectedBaseOf(event);
   let ancestry: GateInput['ancestry'] = null;
@@ -233,7 +281,6 @@ export async function gatherGateInput(ctx: GateContext, client: GateGithub, io: 
       const sections = await readConfigSections(gh, repo, pr, settings.protectedSections, settings.protectedPaths);
       integrity = integrityFindings(pr, settings.protectedPaths, co.rules, { sectionChanges: sections, codeowners: { found: co.found, ...(co.problem === undefined ? {} : { problem: co.problem }) } });
     }
-    if (settings.jobList.some((e) => e.category === 'secrets')) notes.push('the pull request\'s commit range is not scanned for secrets in this pipeline yet: only its last commit is');
   }
 
   // 6. the trusted baseline, the clean-run marker and the mode
@@ -251,7 +298,7 @@ export async function gatherGateInput(ctx: GateContext, client: GateGithub, io: 
 
   return {
     event, checks, baseScan: mapped.baseScan, ancestry, baseline: loaded.baseline, sameRunTools: settings.sameRunTools, installing, diff,
-    rangeScans: [], mode: mode.mode, policy: settings.policy, notProvenNeeds: settings.notProven, skipped: settings.skipped,
+    rangeScans, mode: mode.mode, policy: settings.policy, notProvenNeeds: settings.notProven, skipped: settings.skipped,
     settingsErrors: settings.errors, integrity, floorNeeds: settings.floorNeeds, notes: [...new Set(notes)], coverage, cleanRun: marker.state,
   };
 }

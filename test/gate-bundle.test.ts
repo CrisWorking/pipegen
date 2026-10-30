@@ -134,7 +134,7 @@ describe('C6 bundle: node gate/dist/index.js, end to end', () => {
   it('mode gate on a clean push: exit 0, result pass, result.json written', async () => {
     const w = pushWorld(CLEAN());
     const r = runner(w.inputs, { event: w.event, sha: w.sha, payload: w.payload });
-    const table = await tableOf(w, ['pipegen-out-secrets', 'pipegen-out-base-secrets', 'pipegen-out-sast--app', 'pipegen-out-base-sast--app', 'pipegen-out-deps', 'pipegen-out-base-deps']);
+    const table = await tableOf(w, ['pipegen-out-secrets', 'pipegen-out-secrets-range', 'pipegen-out-base-secrets', 'pipegen-out-sast--app', 'pipegen-out-base-sast--app', 'pipegen-out-deps', 'pipegen-out-base-deps']);
     const x = await runNode(BUNDLE, { ...r.env, PIPEGEN_FAKE_GH: table }, PRELOAD);
     expect(x.stdout + x.stderr).not.toMatch(/::error::/);
     expect(x.code).toBe(0);

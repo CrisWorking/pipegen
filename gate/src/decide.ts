@@ -30,7 +30,9 @@
 //     (the rule id or any alias, fix round 1 I3) blocks even when old (S8). A new critical, high or secret blocks in any mode, warn-first too (rule 7, #13). A new
 //     dependency-review finding blocks. An unknown licence warns ("needs a human"). Warn-first: the rest warns. Block mode:
 //     the policy. Warn mode: critical, high and medium warn; low and info are counted.
-//  7. Secrets in the PR's commit range (C1b I2): a range finding the HEAD scan does not have is always new and blocks.
+//  7. Secrets in the PR's commit range (C1b I2, C9): ANY finding of the range blocks (no baseline, no count, no match with the HEAD
+//     scan: the commits are the pull request's own, so each finding is a secret it pushed); a tool error or no result blocks. On a push
+//     to the default branch the range is informational (warnings).
 //  8. Integrity (Task 4): blocks, or warns on an installing PR.
 //  9. Coverage honesty (C1a): a nuclei "nothing reported" or an unstaged gitleaks zero-finding result is "no coverage /
 //     completeness not provable", never clean; a required one blocks.
@@ -71,7 +73,10 @@ export interface CheckInput {
   /** Findings entries: the base-scan job's outputs for `entry.baseArtifact`, and that artifact when it could be downloaded. */
   base?: { outputs: JobOutputs; file?: ResultFile };
 }
-/** A secrets scan of the PR's commit range (base..head, C1b review I2), read back like a result file; absent `findings` = no result. */
+/**
+ * A secrets scan of the PR's commit range (base..head, C1b review I2; C9: the secrets job's range scan, betterleaks `git` mode), read back
+ * like a result file: `findings` (each with its commit), or `toolError`; neither = no result. facts.ts reads it.
+ */
 export interface RangeScan { tool: string; findings?: ScrubbedFinding[]; toolError?: string }
 /** The trusted baseline (C3): counts by countKeyOf, and the tools it covers (a tool it does not cover falls back to the base scan). */
 export interface Baseline { tools: readonly string[]; counts: ReadonlyMap<string, number> }
@@ -254,9 +259,9 @@ const serious = (f: ScrubbedFinding): boolean => f.severity === 'critical' || f.
 const isMalicious = (f: ScrubbedFinding): boolean => [f.ruleId, ...(f.advisoryIds ?? [])].some((id) => /^MAL-/i.test(id.trim()));
 const isPosition = (f: ScrubbedFinding): boolean => FORM_OF[f.fpBy] === 'position' || (f.secret && f.tool.startsWith('trivy'));
 
-type FileState = { kind: 'ok'; read: ScrubbedResult } | { kind: 'absent' } | { kind: 'tool-error'; why: string } | { kind: 'tampered'; why: string } | { kind: 'missing-file' };
+export type FileState = { kind: 'ok'; read: ScrubbedResult } | { kind: 'absent' } | { kind: 'tool-error'; why: string } | { kind: 'tampered'; why: string } | { kind: 'missing-file' };
 /** What a job's outputs and its downloaded file say: ok, no status (did not report / could not run), a tool error, tampered. */
-function fileState(outputs: JobOutputs | undefined, file: ResultFile | undefined): FileState {
+export function fileState(outputs: JobOutputs | undefined, file: ResultFile | undefined): FileState {
   const st = outputs?.status;
   if (st === undefined) return { kind: 'absent' };
   if (st === 'tool-error') return { kind: 'tool-error', why: outputs?.error ?? 'no detail' };
@@ -474,24 +479,28 @@ export function decideGate(i: GateInput): GateResult {
     state(fs.length === 0 ? 'no findings' : `${fs.length} finding(s)`);
   }
 
-  // 7. secrets in the PR's commit range
+  // 7. secrets in the PR's commit range (C9): every finding of the range is a secret this pull request put into its history, so ANY finding
+  // blocks: no baseline, no count, no match with the HEAD scan (a later commit removing it does not unleak it). A tool error or no result
+  // blocks. On a push to the default branch the range is informational: the push already happened, so it warns
+  const informational = i.event.name === 'push';
+  const onMain = 'on the default branch the commit range is informational';
   for (const rs of i.rangeScans) {
     const name = `${rs.tool} (the pull request's commit range)`;
     if (rs.toolError !== undefined) {
-      toolErrors.push({ needId: 'secrets', job: 'commit range', tool: rs.tool, reason: rs.toolError, base: false, blocks: true });
-      block(`tool error in ${name}: re-run the job`);
+      toolErrors.push({ needId: 'secrets', job: 'commit range', tool: rs.tool, reason: rs.toolError, base: false, blocks: !informational });
+      if (informational) warn(`tool error in ${name}; ${onMain}`);
+      else block(`tool error in ${name}: the pull request's commits are not proven free of secrets; re-run the job`);
       continue;
     }
-    if (rs.findings === undefined) { block(`scanner ${name} did not report`); continue; }
-    const inHead = new Map<string, number>();
-    // matched by a CONTENT-form fingerprint only: a position form names a place, not a secret, so a range finding matched only by
-    // its place is not matched (review-C2 m5)
-    for (const { f } of headFindings) if (f.tool === rs.tool && !isPosition(f)) { const k = `${f.tool}\0${f.fingerprint}`; inHead.set(k, (inHead.get(k) ?? 0) + 1); }
+    if (rs.findings === undefined) {
+      if (informational) warn(`scanner ${name} did not report; ${onMain}`);
+      else block(`scanner ${name} did not report, so the pull request's commits are not proven free of secrets`);
+      continue;
+    }
     for (const f of rs.findings) {
-      const k = `${f.tool}\0${f.fingerprint}`;
-      const left = isPosition(f) ? 0 : inHead.get(k) ?? 0;
-      if (left > 0) { inHead.set(k, left - 1); continue; }
-      blocking.push({ ...f, needId: 'secrets', job: 'commit range', isNew: true, reason: 'new: a secret in the pull request\'s commits that is not in its last commit; it was pushed, so treat it as leaked and rotate it' });
+      const reason = rangeReason(f.commit);
+      if (informational) warnings.push({ ...f, needId: 'secrets', job: 'commit range', isNew: true, reason: `${reason}; ${onMain}` });
+      else blocking.push({ ...f, needId: 'secrets', job: 'commit range', isNew: true, reason });
     }
   }
 
@@ -511,6 +520,10 @@ export function decideGate(i: GateInput): GateResult {
   };
   return { ...result, summary: renderSummary(result, i.installing) };
 }
+
+/** C9: the text of a finding of the commit range (the commit's first 12 hex digits). */
+export const rangeReason = (commit: string | undefined): string =>
+  `secret added in this PR's history (commit ${commit !== undefined && /^[0-9a-f]{40}$/.test(commit) ? commit.slice(0, 12) : 'not known'}): rotate it, even if a later commit removed it`;
 
 // ---------- the summary ----------
 

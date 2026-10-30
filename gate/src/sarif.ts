@@ -34,6 +34,11 @@ export interface ParseOptions {
    * of the stage step. Any other uri is unmapped (and the staged scrub makes that a tool error).
    */
   exactNames?: RegExp;
+  /**
+   * C9, the commit-range scan (a `git` mode SARIF): every result must carry the commit it was found in, `partialFingerprints.commitSha`, 40 hex
+   * digits (a result without one is a tool error); it is kept as `commit`. Nothing else of the tool's fingerprints is ever read.
+   */
+  commits?: true;
   limits?: Partial<ParseLimits>;
 }
 
@@ -346,6 +351,13 @@ function readRun(run: unknown, index: number, toolId: string, info: SarifToolInf
     const issue = getOwn(props, 'issue_severity');
     if (issue !== undefined && typeof issue !== 'string') fail(`${at}: issue_severity is not a string`);
     const resultAliases = optStrList(props, 'aliases', `${at} properties`);
+    let commit: string | undefined;
+    if (opts.commits === true) {
+      const pf = optObj(r, 'partialFingerprints', at);
+      const c = pf === undefined ? undefined : getOwn(pf, 'commitSha');
+      if (typeof c !== 'string' || !/^[0-9a-f]{40}$/.test(c)) fail(`${at} has no commit (partialFingerprints.commitSha of 40 hex digits), so its place in the commit range is not known`);
+      commit = c;
+    }
 
     // location: the first one, read along fixed paths
     let uri: string | undefined;
@@ -425,6 +437,7 @@ function readRun(run: unknown, index: number, toolId: string, info: SarifToolInf
       ...(endColumn === undefined ? {} : { endColumn }),
       ...(uriUnmapped && uri !== undefined ? { uriId: uriIdOf(uri) } : {}),
       ...(advisoryIds.length > 1 ? { advisoryIds } : {}),
+      ...(commit === undefined ? {} : { commit }),
     });
   }
   if (unreadable.size > 0) {

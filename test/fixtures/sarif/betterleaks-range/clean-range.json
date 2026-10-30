@@ -1,0 +1,1 @@
+{"pipegenRange":1,"base":"c7db84e13a700c436e403fdd3ac2c70e5fe36956","head":"43991d2e83577813174e29d6f5e58ade9311d373","commits":1,"canaries":[{"commit":"a917db4b7f710ad83d02d5e3e4cadb9dbc5a2cda","path":"pipegen-range-canary-1.txt"},{"commit":"98e4f227dcaec9c871fab4fd813a8fb46862bcc3","path":"pipegen-range-canary-2.txt"}]}

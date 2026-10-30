@@ -636,7 +636,7 @@ var require_scan = __commonJS({
 var require_parse = __commonJS({
   "node_modules/picomatch/lib/parse.js"(exports, module) {
     "use strict";
-    var constants5 = require_constants();
+    var constants6 = require_constants();
     var utils = require_utils();
     var {
       MAX_LENGTH,
@@ -644,7 +644,7 @@ var require_parse = __commonJS({
       REGEX_NON_SPECIAL_CHARS,
       REGEX_SPECIAL_CHARS_BACKREF,
       REPLACEMENTS
-    } = constants5;
+    } = constants6;
     var expandRange = (args, options) => {
       if (typeof options.expandRange === "function") {
         return options.expandRange(...args, options);
@@ -853,7 +853,7 @@ var require_parse = __commonJS({
       if (options.maxExtglobRecursion === false) {
         return { risky: false };
       }
-      const max = typeof options.maxExtglobRecursion === "number" ? options.maxExtglobRecursion : constants5.DEFAULT_MAX_EXTGLOB_RECURSION;
+      const max = typeof options.maxExtglobRecursion === "number" ? options.maxExtglobRecursion : constants6.DEFAULT_MAX_EXTGLOB_RECURSION;
       const branches = splitTopLevel(body).map((branch) => branch.trim());
       if (branches.length > 1) {
         if (branches.some((branch) => branch === "") || branches.some((branch) => /^[*?]+$/.test(branch)) || hasRepeatedCharPrefixOverlap(branches)) {
@@ -899,8 +899,8 @@ var require_parse = __commonJS({
       const bos = { type: "bos", value: "", output: opts.prepend || "" };
       const tokens2 = [bos];
       const capture = opts.capture ? "" : "?:";
-      const PLATFORM_CHARS = constants5.globChars(opts.windows);
-      const EXTGLOB_CHARS = constants5.extglobChars(PLATFORM_CHARS);
+      const PLATFORM_CHARS = constants6.globChars(opts.windows);
+      const EXTGLOB_CHARS = constants6.extglobChars(PLATFORM_CHARS);
       const {
         DOT_LITERAL,
         PLUS_LITERAL,
@@ -1596,7 +1596,7 @@ var require_parse = __commonJS({
         NO_DOTS_SLASH,
         STAR,
         START_ANCHOR
-      } = constants5.globChars(opts.windows);
+      } = constants6.globChars(opts.windows);
       const nodot = opts.dot ? NO_DOTS : NO_DOT;
       const slashDot = opts.dot ? NO_DOTS_SLASH : NO_DOT;
       const capture = opts.capture ? "" : "?:";
@@ -1654,7 +1654,7 @@ var require_picomatch = __commonJS({
     var scan = require_scan();
     var parse3 = require_parse();
     var utils = require_utils();
-    var constants5 = require_constants();
+    var constants6 = require_constants();
     var isObject = (val) => val && typeof val === "object" && !Array.isArray(val);
     var picomatch2 = (glob, options, returnState = false) => {
       if (Array.isArray(glob)) {
@@ -1782,7 +1782,7 @@ var require_picomatch = __commonJS({
         return /$^/;
       }
     };
-    picomatch2.constants = constants5;
+    picomatch2.constants = constants6;
     module.exports = picomatch2;
   }
 });
@@ -1806,7 +1806,7 @@ var require_picomatch2 = __commonJS({
 
 // gate/src/main.ts
 import { randomUUID } from "node:crypto";
-import { accessSync, chmodSync as chmodSync2, closeSync as closeSync4, constants as constants4, fstatSync as fstatSync4, lstatSync as lstatSync4, mkdirSync as mkdirSync3, openSync as openSync4, readSync as readSync4, renameSync, unlinkSync as unlinkSync2, writeFileSync, writeSync as writeSync3 } from "node:fs";
+import { accessSync, chmodSync as chmodSync2, closeSync as closeSync5, constants as constants5, fstatSync as fstatSync5, lstatSync as lstatSync5, mkdirSync as mkdirSync3, openSync as openSync5, readSync as readSync5, renameSync, unlinkSync as unlinkSync2, writeFileSync, writeSync as writeSync3 } from "node:fs";
 import { basename as basename2, dirname as dirname3, isAbsolute as isAbsolute3, join as join4 } from "node:path";
 
 // src/engine/tool-flags.ts
@@ -1896,6 +1896,8 @@ function resultArtifactName(needId, service, opts) {
 var SECRETS_RANGE_ID = "secrets-range";
 var SECRETS_RANGE_ARTIFACT = resultArtifactName(SECRETS_RANGE_ID);
 var SECRETS_RANGE_TOOL = "betterleaks";
+var RANGE_FACTS_FILE = "range.json";
+var RANGE_CANARY_FILES = ["pipegen-range-canary-1.txt", "pipegen-range-canary-2.txt"];
 var GATE_RESULT_ARTIFACT = "pipegen-gate-result";
 var BASELINE_ARTIFACT = "pipegen-baseline";
 var CLEAN_RUN_ARTIFACT = "pipegen-clean-run";
@@ -4093,6 +4095,13 @@ function readRun(run, index, toolId, info, opts, limits, notes) {
     const issue = getOwn(props, "issue_severity");
     if (issue !== void 0 && typeof issue !== "string") fail(`${at3}: issue_severity is not a string`);
     const resultAliases = optStrList(props, "aliases", `${at3} properties`);
+    let commit;
+    if (opts.commits === true) {
+      const pf = optObj(r, "partialFingerprints", at3);
+      const c = pf === void 0 ? void 0 : getOwn(pf, "commitSha");
+      if (typeof c !== "string" || !/^[0-9a-f]{40}$/.test(c)) fail(`${at3} has no commit (partialFingerprints.commitSha of 40 hex digits), so its place in the commit range is not known`);
+      commit = c;
+    }
     let uri;
     let baseId;
     let line;
@@ -4172,7 +4181,8 @@ function readRun(run, index, toolId, info, opts, limits, notes) {
       ...endLine === void 0 ? {} : { endLine },
       ...endColumn === void 0 ? {} : { endColumn },
       ...uriUnmapped && uri !== void 0 ? { uriId: uriIdOf(uri) } : {},
-      ...advisoryIds.length > 1 ? { advisoryIds } : {}
+      ...advisoryIds.length > 1 ? { advisoryIds } : {},
+      ...commit === void 0 ? {} : { commit }
     });
   }
   if (unreadable.size > 0) {
@@ -4680,30 +4690,25 @@ function decideGate(i) {
     }
     state(fs.length === 0 ? "no findings" : `${fs.length} finding(s)`);
   }
+  const informational = i.event.name === "push";
+  const onMain = "on the default branch the commit range is informational";
   for (const rs of i.rangeScans) {
     const name = `${rs.tool} (the pull request's commit range)`;
     if (rs.toolError !== void 0) {
-      toolErrors.push({ needId: "secrets", job: "commit range", tool: rs.tool, reason: rs.toolError, base: false, blocks: true });
-      block(`tool error in ${name}: re-run the job`);
+      toolErrors.push({ needId: "secrets", job: "commit range", tool: rs.tool, reason: rs.toolError, base: false, blocks: !informational });
+      if (informational) warn(`tool error in ${name}; ${onMain}`);
+      else block(`tool error in ${name}: the pull request's commits are not proven free of secrets; re-run the job`);
       continue;
     }
     if (rs.findings === void 0) {
-      block(`scanner ${name} did not report`);
+      if (informational) warn(`scanner ${name} did not report; ${onMain}`);
+      else block(`scanner ${name} did not report, so the pull request's commits are not proven free of secrets`);
       continue;
     }
-    const inHead = /* @__PURE__ */ new Map();
-    for (const { f } of headFindings) if (f.tool === rs.tool && !isPosition(f)) {
-      const k = `${f.tool}\0${f.fingerprint}`;
-      inHead.set(k, (inHead.get(k) ?? 0) + 1);
-    }
     for (const f of rs.findings) {
-      const k = `${f.tool}\0${f.fingerprint}`;
-      const left = isPosition(f) ? 0 : inHead.get(k) ?? 0;
-      if (left > 0) {
-        inHead.set(k, left - 1);
-        continue;
-      }
-      blocking.push({ ...f, needId: "secrets", job: "commit range", isNew: true, reason: "new: a secret in the pull request's commits that is not in its last commit; it was pushed, so treat it as leaked and rotate it" });
+      const reason = rangeReason(f.commit);
+      if (informational) warnings.push({ ...f, needId: "secrets", job: "commit range", isNew: true, reason: `${reason}; ${onMain}` });
+      else blocking.push({ ...f, needId: "secrets", job: "commit range", isNew: true, reason });
     }
   }
   const integrityBlocks = i.integrity.length > 0 && !i.installing;
@@ -4737,6 +4742,7 @@ function decideGate(i) {
   };
   return { ...result, summary: renderSummary(result, i.installing) };
 }
+var rangeReason = (commit) => `secret added in this PR's history (commit ${commit !== void 0 && /^[0-9a-f]{40}$/.test(commit) ? commit.slice(0, 12) : "not known"}): rotate it, even if a later commit removed it`;
 var md = (s, max) => {
   const v = safeMarkdown(s, max);
   return v === "" ? "(empty)" : v;
@@ -5218,7 +5224,7 @@ import { crc32, inflateRawSync } from "node:zlib";
 
 // gate/src/scrub.ts
 import { createHash as createHash4, randomBytes } from "node:crypto";
-import { closeSync as closeSync3, constants as constants3, fstatSync as fstatSync3, linkSync, lstatSync as lstatSync3, mkdirSync as mkdirSync2, openSync as openSync3, readSync as readSync3, unlinkSync, writeSync as writeSync2 } from "node:fs";
+import { closeSync as closeSync4, constants as constants4, fstatSync as fstatSync4, linkSync, lstatSync as lstatSync4, mkdirSync as mkdirSync2, openSync as openSync4, readSync as readSync4, unlinkSync, writeSync as writeSync2 } from "node:fs";
 import { basename, dirname as dirname2, isAbsolute as isAbsolute2, join as join3, sep as sep2 } from "node:path";
 
 // gate/src/stage.ts
@@ -5776,6 +5782,95 @@ function applyStage(parsed, stage, tool2) {
   return { findings: out, regionOf: (f) => regions.get(f), fileHashOf: (f) => hashes.get(f), notes };
 }
 
+// gate/src/range.ts
+import { closeSync as closeSync3, constants as constants3, fstatSync as fstatSync3, lstatSync as lstatSync3, openSync as openSync3, readSync as readSync3 } from "node:fs";
+var RangeFactsError = class extends Error {
+};
+var SHA_RE3 = /^[0-9a-f]{40}$/;
+var ZERO = "0".repeat(40);
+var MAX_FACTS_BYTES = 64 * 1024;
+var MAX_COMMITS = 1e7;
+var KEYS = ["base", "canaries", "commits", "head", "pipegenRange"];
+var CANARY_RULE_ID2 = `secret:${CANARY_RULE}`;
+var isObj2 = (v) => typeof v === "object" && v !== null && !Array.isArray(v);
+function parseRangeFacts(text) {
+  const bad = (why2) => {
+    throw new RangeFactsError(`the commit-range facts ${why2}`);
+  };
+  if (typeof text !== "string" || text.length > MAX_FACTS_BYTES) bad("are over the size cap");
+  let d;
+  try {
+    d = JSON.parse(text);
+  } catch {
+    return bad("are not JSON");
+  }
+  if (!isObj2(d) || Object.keys(d).sort().join() !== KEYS.join()) return bad("are not in the form the range scan step writes");
+  if (d.pipegenRange !== 1) bad("are of a version this gate does not read");
+  for (const k of ["base", "head"]) if (typeof d[k] !== "string" || !SHA_RE3.test(d[k]) || d[k] === ZERO) bad(`have a ${k} that is not a commit sha`);
+  if (typeof d.commits !== "number" || !Number.isSafeInteger(d.commits) || d.commits < 0 || d.commits > MAX_COMMITS) bad("have a commit count that is not a whole number");
+  const list = d.canaries;
+  if (!Array.isArray(list) || list.length !== RANGE_CANARY_FILES.length) return bad(`do not name ${RANGE_CANARY_FILES.length} canary commits`);
+  const canaries = list.map((c, i) => {
+    if (!isObj2(c) || Object.keys(c).sort().join() !== "commit,path") return bad("have a canary that is not { commit, path }");
+    if (typeof c.commit !== "string" || !SHA_RE3.test(c.commit)) return bad("have a canary commit that is not a commit sha");
+    const path = RANGE_CANARY_FILES[i];
+    if (c.path !== path) return bad("have a canary file that is not the one the step writes");
+    return { commit: c.commit, path };
+  });
+  if (new Set(canaries.map((c) => c.commit)).size !== canaries.length) bad("name one canary commit twice");
+  return { base: d.base, head: d.head, commits: d.commits, canaries };
+}
+function readRangeFacts(path) {
+  let st;
+  try {
+    st = lstatSync3(path);
+  } catch {
+    throw new RangeFactsError("the commit-range facts (range.json beside the raw result) are missing: the range scan step did not finish");
+  }
+  if (st.isSymbolicLink() || !st.isFile()) throw new RangeFactsError("the commit-range facts are a link or not a regular file");
+  let fd;
+  try {
+    fd = openSync3(path, constants3.O_RDONLY | constants3.O_NOFOLLOW | constants3.O_NONBLOCK | constants3.O_NOCTTY);
+    const opened = fstatSync3(fd);
+    if (!opened.isFile() || opened.dev !== st.dev || opened.ino !== st.ino || opened.size > MAX_FACTS_BYTES) throw new RangeFactsError("the commit-range facts changed while they were opened, or are over the size cap");
+    const buf = Buffer.alloc(opened.size);
+    let got = 0;
+    while (got < buf.length) {
+      const n = readSync3(fd, buf, got, buf.length - got, got);
+      if (n === 0) break;
+      got += n;
+    }
+    return parseRangeFacts(buf.subarray(0, got).toString("utf8"));
+  } catch (e) {
+    if (e instanceof RangeFactsError) throw e;
+    throw new RangeFactsError("the commit-range facts could not be read");
+  } finally {
+    if (fd !== void 0) try {
+      closeSync3(fd);
+    } catch {
+    }
+  }
+}
+function applyRange(findings, facts) {
+  const seen = facts.canaries.map(() => 0);
+  const kept = [];
+  for (const f of findings) {
+    if (f.commit === void 0 || !SHA_RE3.test(f.commit)) throw new RangeFactsError("a finding of the commit range has no commit");
+    const i = facts.canaries.findIndex((c) => f.ruleId === CANARY_RULE_ID2 && f.commit === c.commit && f.file === c.path && f.line === 1 && (f.endLine ?? 1) === 1);
+    if (i >= 0) {
+      seen[i] = (seen[i] ?? 0) + 1;
+      continue;
+    }
+    kept.push(f);
+  }
+  const missing = facts.canaries.filter((_, i) => seen[i] !== 1);
+  if (missing.length > 0) throw new RangeFactsError(`the scanner did not report the canary of commit ${missing.map((c) => c.commit.slice(0, 12)).join(" and ")} exactly once, so it is not proven to have read the commit range`);
+  return {
+    findings: kept,
+    notes: [`the commit range ${facts.base.slice(0, 12)}..${facts.head.slice(0, 12)} (${facts.commits} commit(s) of the pull request, merges not counted) was scanned; both canary commits were read`]
+  };
+}
+
 // gate/src/scrub.ts
 var MAX_ERROR_CHARS = 300;
 var MAX_NOTES = 50;
@@ -5844,6 +5939,8 @@ function sarifOut(tool2, findings, notes, key) {
         pipegenUnmapped: f.uriUnmapped || hide,
         pipegenPathWithheld: hide,
         pipegenFpBy: f.fpBy,
+        // C9: the commit a finding of the commit-range scan was found in (40 hex digits, read by the parser)
+        ...f.commit === void 0 ? {} : { pipegenCommit: f.commit },
         // C1c fix round 1: the display form of a staged name with no lossless text (withheld like a path when it looks like a secret)
         ...f.file === void 0 && f.displayPath !== void 0 && !withheld(f.displayPath) ? { pipegenDisplayPath: clip(f.displayPath, 4096) } : {},
         // C2 fix round 1 (review-C2 I3): the advisory ids and aliases, so the gate sees a MAL- id whichever id the tool shows
@@ -5901,6 +5998,7 @@ function scrubBytes(raw, opts) {
     if (opts.format === "sarif") {
       if (!Object.hasOwn(SARIF_TOOLS, opts.tool)) return toolError(`${JSON.stringify(safeText(opts.tool, 60))} is not a tool whose SARIF the gate reads`, key);
       secretsTool = SARIF_TOOLS[opts.tool].secrets;
+      if (opts.range !== void 0 && (opts.tool !== SECRETS_RANGE_TOOL || opts.stage !== void 0)) return toolError(`the commit-range scan is ${SECRETS_RANGE_TOOL}'s, and it has no stage folder`, key);
       if (opts.stage !== void 0) {
         if (!secretsTool) return toolError("a stage folder is only for the secrets tools", key);
         try {
@@ -5909,9 +6007,9 @@ function scrubBytes(raw, opts) {
           return toolError(e instanceof StageError ? e.message : "the stage folder could not be read", key);
         }
       }
-      parsed = stage === void 0 ? parseSarifText(raw, opts.tool, { workspace: opts.workspace, limits: { maxBytes } }) : parseSarifText(raw, opts.tool, { workspace: stage.files, exactNames: STAGED_NAME_RE, limits: { maxBytes } });
+      parsed = opts.range !== void 0 ? parseSarifText(raw, opts.tool, { commits: true, limits: { maxBytes } }) : stage === void 0 ? parseSarifText(raw, opts.tool, { workspace: opts.workspace, limits: { maxBytes } }) : parseSarifText(raw, opts.tool, { workspace: stage.files, exactNames: STAGED_NAME_RE, limits: { maxBytes } });
     } else if (opts.format === "zap-json") {
-      if (opts.stage !== void 0) return toolError("a stage folder is only for the secrets tools", key);
+      if (opts.stage !== void 0 || opts.range !== void 0) return toolError("a stage folder or a commit range is only for the secrets tools", key);
       if (opts.tool !== ZAP_TOOL) return toolError(`${JSON.stringify(safeText(opts.tool, 60))} is not a tool whose ZAP report the gate reads`, key);
       parsed = parseZapJsonText(raw, opts.tool, { limits: { maxBytes } });
     } else {
@@ -5927,6 +6025,14 @@ function scrubBytes(raw, opts) {
       }
       parsed = { findings: staged.findings, notes: [...parsed.notes, ...staged.notes] };
     }
+    if (opts.range !== void 0) {
+      try {
+        const ranged = applyRange(parsed.findings, opts.range);
+        parsed = { findings: ranged.findings, notes: [...parsed.notes, ...ranged.notes] };
+      } catch (e) {
+        return toolError(e instanceof RangeFactsError ? e.message : "the commit-range findings could not be checked", key);
+      }
+    }
     const needsKey = secretsTool || parsed.findings.some((f) => f.secret || isQuotingFinding(f));
     const problem = keyProblem(key, forkFromEvent(opts.eventText), needsKey);
     if (problem !== void 0) return toolError(problem, key);
@@ -5938,7 +6044,9 @@ function scrubBytes(raw, opts) {
       onRegion: (b) => {
         regions.push(b);
       },
-      ...staged === void 0 ? {} : { regionOf: staged.regionOf, fileHashOf: staged.fileHashOf }
+      ...staged === void 0 ? {} : { regionOf: staged.regionOf, fileHashOf: staged.fileHashOf },
+      // C9: a secret of the commit range is in a commit, not in the checkout's file of that name: never read a region for it
+      ...opts.range === void 0 ? {} : { regionOf: () => ({ ok: false, reason: "a secret in a commit of the range (the checkout's file is not that commit's)" }) }
     });
     const notes = [...parsed.notes, ...lineNotes(findings)].slice(0, MAX_NOTES).map((n) => clip(maskSecretShapes(n), MAX_NOTE_CHARS));
     const bytes = Buffer.from(opts.format === "sarif" ? sarifOut(opts.tool, findings, notes, usedKey) : zapOut(findings, notes), "utf8");
@@ -5978,6 +6086,10 @@ var lineNo = (v, where) => {
 };
 function advisoryIdsOf(v, where) {
   if (!Array.isArray(v) || v.length > MAX_ADVISORY_IDS || !v.every((x) => typeof x === "string")) fail(`${where}: the advisory ids are not a list of at most ${MAX_ADVISORY_IDS} strings`);
+  return v;
+}
+function commitOf(v, where) {
+  if (typeof v !== "string" || !/^[0-9a-f]{40}$/.test(v)) fail(`${where}: the commit is not 40 hex digits`);
   return v;
 }
 function readNotes(v, where) {
@@ -6047,7 +6159,8 @@ function readScrubbed(input, format, maxBytes = MAX_RAW_BYTES) {
           uriUnmapped: bool(p, "pipegenUnmapped", at3),
           pathWithheld: optBool(p, "pipegenPathWithheld", at3),
           ...getOwn(p, "pipegenDisplayPath") === void 0 ? {} : { displayPath: str(p, "pipegenDisplayPath", at3) },
-          ...getOwn(p, "pipegenAdvisoryIds") === void 0 ? {} : { advisoryIds: advisoryIdsOf(getOwn(p, "pipegenAdvisoryIds"), at3) }
+          ...getOwn(p, "pipegenAdvisoryIds") === void 0 ? {} : { advisoryIds: advisoryIdsOf(getOwn(p, "pipegenAdvisoryIds"), at3) },
+          ...getOwn(p, "pipegenCommit") === void 0 ? {} : { commit: commitOf(getOwn(p, "pipegenCommit"), at3) }
         };
       });
       return { findings: findings2, ...typeof id === "string" ? { keyId: id } : {}, notes: readNotes(getOwn(props, "pipegenNotes"), "properties") };
@@ -6090,7 +6203,7 @@ var FILE_RE = /^[A-Za-z0-9_][A-Za-z0-9._-]{0,100}$/;
 function ensureFolder2(path, what) {
   let made = false;
   try {
-    const st = lstatSync3(path);
+    const st = lstatSync4(path);
     if (st.isSymbolicLink()) throw new ScrubFileError(`${what} is a link, so the scrub will not write there`);
     if (!st.isDirectory()) throw new ScrubFileError(`${what} is not a folder`);
   } catch (e) {
@@ -6104,7 +6217,7 @@ function ensureFolder2(path, what) {
     }
   }
   if (made) {
-    const st = lstatSync3(path);
+    const st = lstatSync4(path);
     if (st.isSymbolicLink() || !st.isDirectory()) throw new ScrubFileError(`${what} is not the folder that was just made`);
   }
 }
@@ -6124,7 +6237,7 @@ function prepareOutFolder(out, artifact) {
 function readPlainFile(path, max, what) {
   let st;
   try {
-    st = lstatSync3(path);
+    st = lstatSync4(path);
   } catch (e) {
     throw new ScrubFileError(e.code === "ENOENT" ? `the tool left no result file (${what} is missing)` : `${what} cannot be checked`);
   }
@@ -6132,14 +6245,14 @@ function readPlainFile(path, max, what) {
   if (!st.isFile()) throw new ScrubFileError(`${what} is not a regular file`);
   let fd;
   try {
-    fd = openSync3(path, constants3.O_RDONLY | constants3.O_NOFOLLOW | constants3.O_NONBLOCK | constants3.O_NOCTTY);
-    const opened = fstatSync3(fd);
+    fd = openSync4(path, constants4.O_RDONLY | constants4.O_NOFOLLOW | constants4.O_NONBLOCK | constants4.O_NOCTTY);
+    const opened = fstatSync4(fd);
     if (!opened.isFile() || opened.dev !== st.dev || opened.ino !== st.ino) throw new ScrubFileError(`${what} changed while it was opened`);
     if (opened.size > max) throw new ScrubFileError(`${what} is over the size cap (${max} bytes)`);
     const buf = Buffer.alloc(opened.size);
     let got = 0;
     while (got < buf.length) {
-      const n = readSync3(fd, buf, got, buf.length - got, got);
+      const n = readSync4(fd, buf, got, buf.length - got, got);
       if (n === 0) break;
       got += n;
     }
@@ -6149,7 +6262,7 @@ function readPlainFile(path, max, what) {
     throw new ScrubFileError(`${what} cannot be read`);
   } finally {
     if (fd !== void 0) try {
-      closeSync3(fd);
+      closeSync4(fd);
     } catch {
     }
   }
@@ -6165,7 +6278,15 @@ function scrubFile(opts) {
   } catch {
     return fail1("the key could not be masked in the logs, so the scrub did not run");
   }
-  if (Object.hasOwn(SARIF_TOOLS, opts.tool) && SARIF_TOOLS[opts.tool].secrets && opts.stage === void 0) {
+  let range;
+  if (opts.artifact === SECRETS_RANGE_ARTIFACT) {
+    if (opts.stage !== void 0) return fail1("the commit-range scan has no stage folder");
+    try {
+      range = readRangeFacts(join3(dirname2(opts.raw), RANGE_FACTS_FILE));
+    } catch (e) {
+      return fail1(e instanceof RangeFactsError ? e.message : "the commit-range facts could not be read");
+    }
+  } else if (Object.hasOwn(SARIF_TOOLS, opts.tool) && SARIF_TOOLS[opts.tool].secrets && opts.stage === void 0) {
     return fail1("the secrets scan has no stage folder (the stage input): pipegen stages the checkout under neutral names before every secrets scan, and without it the scan's coverage can not be proven");
   }
   let raw;
@@ -6182,7 +6303,16 @@ function scrubFile(opts) {
       eventText = void 0;
     }
   }
-  const scrubbed = scrubBytes(raw, { tool: opts.tool, format: opts.format, fpKey: opts.fpKey, eventText, workspace: opts.workspace, maxBytes: opts.maxBytes, ...opts.stage === void 0 ? {} : { stage: opts.stage } });
+  const scrubbed = scrubBytes(raw, {
+    tool: opts.tool,
+    format: opts.format,
+    fpKey: opts.fpKey,
+    eventText,
+    workspace: opts.workspace,
+    maxBytes: opts.maxBytes,
+    ...opts.stage === void 0 ? {} : { stage: opts.stage },
+    ...range === void 0 ? {} : { range }
+  });
   if (scrubbed.status !== "ok") return { status: "tool-error", error: scrubbed.error };
   let fd;
   let tmp;
@@ -6190,14 +6320,14 @@ function scrubFile(opts) {
     const path = prepareOutFolder(opts.out, opts.artifact);
     tmp = join3(dirname2(path), `.${basename(path)}.${randomBytes(8).toString("hex")}.tmp`);
     try {
-      fd = openSync3(tmp, constants3.O_WRONLY | constants3.O_CREAT | constants3.O_EXCL | constants3.O_NOFOLLOW, 420);
+      fd = openSync4(tmp, constants4.O_WRONLY | constants4.O_CREAT | constants4.O_EXCL | constants4.O_NOFOLLOW, 420);
     } catch {
       tmp = void 0;
       throw new ScrubFileError("the scrubbed result file cannot be created");
     }
     let at3 = 0;
     while (at3 < scrubbed.bytes.length) at3 += writeSync2(fd, scrubbed.bytes, at3, scrubbed.bytes.length - at3);
-    closeSync3(fd);
+    closeSync4(fd);
     fd = void 0;
     try {
       linkSync(tmp, path);
@@ -6208,7 +6338,7 @@ function scrubFile(opts) {
     return fail1(e instanceof ScrubFileError ? e.message : "the scrubbed result could not be written");
   } finally {
     if (fd !== void 0) try {
-      closeSync3(fd);
+      closeSync4(fd);
     } catch {
     }
     if (tmp !== void 0) try {
@@ -7144,7 +7274,7 @@ var isPlain4 = (v) => typeof v === "object" && v !== null && !Array.isArray(v);
 var own3 = (o, k) => Object.hasOwn(o, k) ? o[k] : void 0;
 var posInt3 = (v) => typeof v === "number" && Number.isSafeInteger(v) && v > 0;
 var natInt2 = (v) => typeof v === "number" && Number.isSafeInteger(v) && v >= 0;
-var SHA_RE3 = /^[0-9a-f]{40}$/;
+var SHA_RE4 = /^[0-9a-f]{40}$/;
 var API_FILE_CAP = 3e3;
 var PER_PAGE = 100;
 var COMPARE_FILE_CAP = 300;
@@ -7415,7 +7545,7 @@ async function readPrContext(gh, repo2, prNumber, opts) {
   const headSha = isPlain4(head) ? own3(head, "sha") : void 0;
   const baseSha = isPlain4(base) ? own3(base, "sha") : void 0;
   const changed = own3(pull, "changed_files");
-  if (own3(pull, "number") !== prNumber || typeof headSha !== "string" || !SHA_RE3.test(headSha) || typeof baseSha !== "string" || !SHA_RE3.test(baseSha) || !natInt2(changed)) {
+  if (own3(pull, "number") !== prNumber || typeof headSha !== "string" || !SHA_RE4.test(headSha) || typeof baseSha !== "string" || !SHA_RE4.test(baseSha) || !natInt2(changed)) {
     pr.problems.push("the pull request answer is malformed");
     return pr;
   }
@@ -7519,7 +7649,7 @@ async function readPrContext(gh, repo2, prNumber, opts) {
 }
 async function readTextAt(gh, repo2, path, ref2, opts = {}) {
   const max = opts.max ?? MAX_FILE_BYTES;
-  if (!SHA_RE3.test(ref2)) return { kind: "problem", why: "the commit is not a commit sha" };
+  if (!SHA_RE4.test(ref2)) return { kind: "problem", why: "the commit is not a commit sha" };
   let a;
   try {
     a = await gh.fileAt(repo2.owner, repo2.name, path, ref2);
@@ -7549,7 +7679,7 @@ async function readTextAt(gh, repo2, path, ref2, opts = {}) {
   return { kind: "text", text: bytes.toString("utf8") };
 }
 async function baseHasInstall(gh, repo2, baseSha) {
-  if (typeof baseSha !== "string" || !SHA_RE3.test(baseSha)) return true;
+  if (typeof baseSha !== "string" || !SHA_RE4.test(baseSha)) return true;
   try {
     return await gh.fileAt(repo2.owner, repo2.name, WORKFLOW_PATH, baseSha) !== null;
   } catch {
@@ -7903,7 +8033,7 @@ async function readConfigSections(gh, repo2, pr, sections, protectedPaths) {
 }
 async function buildPrDiff(gh, repo2, baseSha, headSha) {
   const bad = () => ({ added: /* @__PURE__ */ new Map(), complete: false, commit: headSha });
-  if (typeof baseSha !== "string" || !SHA_RE3.test(baseSha) || typeof headSha !== "string" || !SHA_RE3.test(headSha)) return bad();
+  if (typeof baseSha !== "string" || !SHA_RE4.test(baseSha) || typeof headSha !== "string" || !SHA_RE4.test(headSha)) return bad();
   let a;
   try {
     a = await gh.compareFiles(repo2.owner, repo2.name, baseSha, headSha);
@@ -8220,7 +8350,7 @@ function resolveSettings(raw, ctx) {
 var BASE_SCAN_JOB = "base-scan";
 var BASE_SHA_OUTPUT = "base-sha";
 var RESULTS = /* @__PURE__ */ new Set(["success", "failure", "cancelled", "skipped"]);
-var SHA_RE4 = /^[0-9a-f]{40}$/;
+var SHA_RE5 = /^[0-9a-f]{40}$/;
 var MAX_OUTPUT_CHARS = 2e3;
 var isPlain5 = (v) => typeof v === "object" && v !== null && !Array.isArray(v);
 var own4 = (o, k) => Object.hasOwn(o, k) ? o[k] : void 0;
@@ -8247,7 +8377,7 @@ function mapJobs(needs, list) {
   let baseScan = null;
   if (base !== void 0) {
     const c = own4(base.outputs, BASE_SHA_OUTPUT);
-    baseScan = { result: base.result, ...typeof c === "string" && SHA_RE4.test(c) ? { commit: c } : {} };
+    baseScan = { result: base.result, ...typeof c === "string" && SHA_RE5.test(c) ? { commit: c } : {} };
   }
   const checks = list.map((entry) => {
     const j = jobOf(needs, entry.job);
@@ -8267,7 +8397,7 @@ function mapJobs(needs, list) {
 }
 
 // gate/src/facts.ts
-var SHA_RE5 = /^[0-9a-f]{40}$/;
+var SHA_RE6 = /^[0-9a-f]{40}$/;
 var PR_EVENTS = /* @__PURE__ */ new Set(["pull_request", "pull_request_review"]);
 var notAMergeRun = (defaultBranch, event) => `the gate runs on pull requests, merge queues and pushes to ${defaultBranch}; this ${/^[a-z_]{1,40}$/.test(event) ? event : "other"} run can't decide a merge`;
 function compareOnce(gh) {
@@ -8298,11 +8428,30 @@ function at2(o, ...path) {
   }
   return v;
 }
-var sha402 = (v) => typeof v === "string" && SHA_RE5.test(v) ? v : void 0;
+var sha402 = (v) => typeof v === "string" && SHA_RE6.test(v) ? v : void 0;
 function licenceCoverage(list) {
   if (list === void 0) return ["coverage per lockfile not known (the gate step has no licence-lockfiles input)"];
   if (list.length === 0) return ["not covered (no lockfile)"];
   return [...new Set(list.flatMap((e) => e.lockfiles.length === 0 ? [`${e.service}: not covered (no lockfile)`] : e.lockfiles.filter((l) => !l.read).map((l) => `${e.service}: ${l.kind}: not covered (lockfile type)`)))];
+}
+var ZERO_SHA2 = "0".repeat(40);
+async function rangeScanOf(tool2, result, outputs, fileOf) {
+  if (result !== "success") {
+    return { tool: tool2, toolError: outputs.status === "tool-error" ? outputs.error ?? "no detail" : `the secrets job did not succeed (${result}), so its commit-range scan has no result` };
+  }
+  const st = fileState(outputs, outputs.status === "ok" ? await fileOf() : void 0);
+  switch (st.kind) {
+    case "ok":
+      return { tool: tool2, findings: st.read.findings };
+    case "absent":
+      return { tool: tool2 };
+    case "tool-error":
+      return { tool: tool2, toolError: st.why };
+    case "tampered":
+      return { tool: tool2, toolError: `the commit-range result is not the one the job made: ${st.why}` };
+    case "missing-file":
+      return { tool: tool2, toolError: "the commit-range result artifact is missing" };
+  }
 }
 function repoOf(payload, repository) {
   const r = at2(payload, "repository");
@@ -8330,7 +8479,7 @@ async function gatherGateInput(ctx, client, io) {
   const repo2 = repoOf(payload, ctx.env.repository);
   if (typeof repo2 === "string") return { kind: "settings-error", errors: [repo2] };
   const sha3 = ctx.env.sha;
-  if (typeof sha3 !== "string" || !SHA_RE5.test(sha3)) return { kind: "settings-error", errors: ["GITHUB_SHA is not a commit sha"] };
+  if (typeof sha3 !== "string" || !SHA_RE6.test(sha3)) return { kind: "settings-error", errors: ["GITHUB_SHA is not a commit sha"] };
   const runId = /^[1-9][0-9]{0,15}$/.test(ctx.env.runId) ? Number(ctx.env.runId) : Number.NaN;
   if (!Number.isSafeInteger(runId)) return { kind: "settings-error", errors: ["GITHUB_RUN_ID is not a run id"] };
   const event = { name: ctx.env.eventName, sha: sha3, payload };
@@ -8394,6 +8543,27 @@ async function gatherGateInput(ctx, client, io) {
     }
     checks.push(c);
   }
+  const rangeScans = [];
+  const prLike = PR_EVENTS.has(event.name) || event.name === "merge_group";
+  const before = pushToDefault ? sha402(at2(payload, "before")) : void 0;
+  if (pushToDefault && (before === void 0 || before === ZERO_SHA2)) {
+    if (settings.jobList.some((e) => e.range === true)) notes.push("the push made the default branch (it has no previous commit), so there is no commit range to scan for secrets");
+  } else if (prLike || pushToDefault) {
+    const ranges = mapped.checks.filter((m) => m.entry.range === true);
+    if (ranges.length === 0 && settings.jobList.some((e) => e.category === "secrets" && e.range !== true)) {
+      const why2 = "the job list has no commit-range scan for the secrets check, so the commits of the pull request are not scanned (render the pipeline again with pipegen update)";
+      if (prLike) rangeScans.push({ tool: RANGE_TOOL, toolError: why2 });
+      else notes.push(why2);
+    }
+    for (const m of ranges) {
+      const art = m.entry.artifact;
+      const fileOf = async () => {
+        const d = await downloadResult(io, { owner: repo2.owner, repo: repo2.name, runId, name: art, format: "sarif", ...outputFile.has(RANGE_TOOL) ? { expectedFile: outputFile.get(RANGE_TOOL) } : {} });
+        return d.kind === "file" ? d.file : void 0;
+      };
+      rangeScans.push(await rangeScanOf(m.entry.tool ?? RANGE_TOOL, m.result, m.outputs, fileOf));
+    }
+  }
   const exp = expectedBaseOf(event);
   let ancestry = null;
   if (exp.base !== void 0 && mapped.baseScan?.commit === exp.base) {
@@ -8431,7 +8601,6 @@ async function gatherGateInput(ctx, client, io) {
       const sections = await readConfigSections(gh, repo2, pr, settings.protectedSections, settings.protectedPaths);
       integrity = integrityFindings(pr, settings.protectedPaths, co.rules, { sectionChanges: sections, codeowners: { found: co.found, ...co.problem === void 0 ? {} : { problem: co.problem } } });
     }
-    if (settings.jobList.some((e) => e.category === "secrets")) notes.push("the pull request's commit range is not scanned for secrets in this pipeline yet: only its last commit is");
   }
   const verify = { key: settings.fpKey, now: ctx.now };
   const loaded = await loadBaseline(gh, repo2, verify);
@@ -8451,7 +8620,7 @@ async function gatherGateInput(ctx, client, io) {
     sameRunTools: settings.sameRunTools,
     installing,
     diff,
-    rangeScans: [],
+    rangeScans,
     mode: mode.mode,
     policy: settings.policy,
     notProvenNeeds: settings.notProven,
@@ -8494,7 +8663,7 @@ var fail2 = (what) => {
 };
 var OWNER_RE = /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})$/;
 var REPO_RE = /^[A-Za-z0-9._-]{1,100}$/;
-var SHA_RE6 = /^[0-9a-f]{40}$/;
+var SHA_RE7 = /^[0-9a-f]{40}$/;
 var LOGIN_RE2 = /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})$/;
 var REF_PART_RE = /^[A-Za-z0-9._+@-]{1,255}$/;
 var ARTIFACT_NAME_RE = /^[A-Za-z0-9._-]{1,200}$/;
@@ -8505,7 +8674,7 @@ var repo = (owner, name) => {
   if (typeof name !== "string" || !REPO_RE.test(name) || name === "." || name === "..") fail2("a repository name that is not one");
   return `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(name)}`;
 };
-var sha2 = (s) => typeof s === "string" && SHA_RE6.test(s) ? s : fail2("a commit that is not a 40-hex sha");
+var sha2 = (s) => typeof s === "string" && SHA_RE7.test(s) ? s : fail2("a commit that is not a 40-hex sha");
 var num = (n) => typeof n === "number" && Number.isSafeInteger(n) && n > 0 ? String(n) : fail2("a number that is not a positive whole number");
 var page = (p, cap) => typeof p === "number" && Number.isSafeInteger(p) && p >= 1 && p <= cap ? String(p) : fail2(`a page past the cap of ${cap} pages`);
 var perPage = (n) => typeof n === "number" && Number.isSafeInteger(n) && n >= 1 && n <= MAX_PER_PAGE ? String(n) : fail2("a page size over 100");
@@ -8770,7 +8939,7 @@ var MAX_CANDIDATES = 20;
 var LISTING_GRACE_MS = 5 * 6e4;
 var JOBS_PER_PAGE = 100;
 var JOB_PAGE_CAP = 5;
-var SHA_RE7 = /^[0-9a-f]{40}$/;
+var SHA_RE8 = /^[0-9a-f]{40}$/;
 var ACTIVE = /* @__PURE__ */ new Set(["queued", "in_progress", "waiting", "pending", "requested"]);
 var isPlain7 = (v) => typeof v === "object" && v !== null && !Array.isArray(v);
 var own5 = (o, k) => Object.hasOwn(o, k) ? o[k] : void 0;
@@ -8826,11 +8995,11 @@ function centralProblem(run, central) {
 }
 async function findGatedRun(gh0, repo2, sha3, o) {
   const error = (detail) => ({ ok: false, reason: "error", detail });
-  if (typeof sha3 !== "string" || !SHA_RE7.test(sha3)) return error("the commit is not a 40-character lower-case sha");
+  if (typeof sha3 !== "string" || !SHA_RE8.test(sha3)) return error("the commit is not a 40-character lower-case sha");
   if (!isPlain7(repo2) || !posInt4(repo2.id) || typeof repo2.owner !== "string" || typeof repo2.name !== "string" || typeof repo2.defaultBranch !== "string" || repo2.defaultBranch === "") return error("the repository is not known");
   if (o.workflowPath !== WORKFLOW_PATH) return error("run trust is defined for .github/workflows/pipegen.yml only");
   const central = o.central;
-  if (central !== void 0 && (!SHA_RE7.test(central.sha) || typeof central.pathPrefix !== "string" || central.pathPrefix === "" || central.pathPrefix.includes("@"))) return error("the central workflow or its commit is not usable");
+  if (central !== void 0 && (!SHA_RE8.test(central.sha) || typeof central.pathPrefix !== "string" || central.pathPrefix === "" || central.pathPrefix.includes("@"))) return error("the central workflow or its commit is not usable");
   const waitMs = o.waitMs ?? DEFAULT_WAIT_MS;
   if (typeof waitMs !== "number" || !Number.isFinite(waitMs) || waitMs < 0) return error("the wait time is not usable");
   const pollMs = Math.max(1, o.pollMs ?? DEFAULT_POLL_MS, Math.ceil(waitMs / MAX_POLLS));
@@ -9556,7 +9725,7 @@ var GATE_VIEW = [
 
 // gate/src/pin-patch.ts
 var isPlain8 = (v) => typeof v === "object" && v !== null && !Array.isArray(v);
-var SHA_RE8 = /^[0-9a-f]{40}$/;
+var SHA_RE9 = /^[0-9a-f]{40}$/;
 var SEMVER_RE = /^(0|[1-9][0-9]{0,5})\.(0|[1-9][0-9]{0,5})\.(0|[1-9][0-9]{0,5})$/;
 var PatchRefused = class extends Error {
 };
@@ -9664,7 +9833,7 @@ function filePatch(file, from, to) {
 `;
 }
 function checkPin(p, which) {
-  if (!isPlain8(p) || typeof p.sha !== "string" || !SHA_RE8.test(p.sha) || typeof p.version !== "string" || !SEMVER_RE.test(p.version)) {
+  if (!isPlain8(p) || typeof p.sha !== "string" || !SHA_RE9.test(p.sha) || typeof p.version !== "string" || !SEMVER_RE.test(p.version)) {
     throw new PatchRefused(`Refused: the ${which} pin is not a 40-character lower-case commit and a plain x.y.z version.`);
   }
 }
@@ -9677,7 +9846,7 @@ function updatePatch(files, from, to) {
 // gate/src/nightly.ts
 var isPlain9 = (v) => typeof v === "object" && v !== null && !Array.isArray(v);
 var own6 = (o, k) => Object.hasOwn(o, k) ? o[k] : void 0;
-var SHA_RE9 = /^[0-9a-f]{40}$/;
+var SHA_RE10 = /^[0-9a-f]{40}$/;
 var SEMVER_RE2 = /^(0|[1-9][0-9]{0,5})\.(0|[1-9][0-9]{0,5})\.(0|[1-9][0-9]{0,5})$/;
 var GATE_TAG_RE = /^gate-v((?:0|[1-9][0-9]{0,5})\.(?:0|[1-9][0-9]{0,5})\.(?:0|[1-9][0-9]{0,5}))$/;
 var ISO_RE = /^(\d{4}-\d{2}-\d{2})T\d{2}:\d{2}:\d{2}(?:\.\d{1,3})?Z$/;
@@ -9897,7 +10066,7 @@ async function setupMergedAt(gh, repo2, now) {
         const merged = own6(pr, "merged_at");
         const t = isoTime(merged);
         const mergeSha = own6(pr, "merge_commit_sha");
-        if (t === void 0 || t > clock || typeof mergeSha !== "string" || !SHA_RE9.test(mergeSha)) continue;
+        if (t === void 0 || t > clock || typeof mergeSha !== "string" || !SHA_RE10.test(mergeSha)) continue;
         if (best === void 0 || t > best.t) best = { t, at: merged, sha: mergeSha };
       }
       if (list.length < 100) break;
@@ -9920,7 +10089,7 @@ async function resolveGateTag(gh, tag) {
     if (!isPlain9(obj)) throw new Error("the tag has no object");
     const type = own6(obj, "type");
     const sha3 = own6(obj, "sha");
-    if (typeof sha3 !== "string" || !SHA_RE9.test(sha3)) throw new Error("the tag points at something that is not a 40-hex sha");
+    if (typeof sha3 !== "string" || !SHA_RE10.test(sha3)) throw new Error("the tag points at something that is not a 40-hex sha");
     if (type === "commit") return sha3;
     if (type !== "tag") throw new Error(`the tag points at a ${typeof type === "string" && /^[a-z]{1,10}$/.test(type) ? type : "thing"}, not a commit`);
     if (seen.has(sha3) || depth === MAX_TAG_CHAIN) throw new Error("the annotated tag chain loops or is too long");
@@ -10226,10 +10395,10 @@ var REAL_FS = {
   rename: renameSync,
   chmod: chmodSync2,
   overwrite: (path, data) => {
-    writeFileSync(path, data, { flag: constants4.O_WRONLY | constants4.O_TRUNC | constants4.O_NOFOLLOW });
+    writeFileSync(path, data, { flag: constants5.O_WRONLY | constants5.O_TRUNC | constants5.O_NOFOLLOW });
   },
   access: (path) => {
-    accessSync(path, constants4.R_OK);
+    accessSync(path, constants5.R_OK);
   }
 };
 var MAX_EVENT_BYTES = 16 * 1024 * 1024;
@@ -10251,7 +10420,7 @@ function removeIfThere(fs, dir, name) {
 }
 function entryStillThere(dir, name) {
   try {
-    lstatSync4(join4(dir, name));
+    lstatSync5(join4(dir, name));
     return true;
   } catch {
     return false;
@@ -10358,14 +10527,14 @@ ${delim}
     const data = typeof bytes === "string" ? Buffer.from(this.redact(bytes)) : Buffer.from(bytes);
     let fd;
     try {
-      fd = openSync4(join4(dir, name), constants4.O_WRONLY | constants4.O_CREAT | constants4.O_EXCL | constants4.O_NOFOLLOW, 420);
+      fd = openSync5(join4(dir, name), constants5.O_WRONLY | constants5.O_CREAT | constants5.O_EXCL | constants5.O_NOFOLLOW, 420);
       let at3 = 0;
       while (at3 < data.length) at3 += writeSync3(fd, data, at3, data.length - at3);
     } catch {
       throw new StepError(`the gate file ${name} could not be written`);
     } finally {
       if (fd !== void 0) try {
-        closeSync4(fd);
+        closeSync5(fd);
       } catch {
       }
     }
@@ -10374,7 +10543,7 @@ ${delim}
 function appendFile(path, text) {
   let fd;
   try {
-    fd = openSync4(path, constants4.O_WRONLY | constants4.O_APPEND | constants4.O_NOFOLLOW);
+    fd = openSync5(path, constants5.O_WRONLY | constants5.O_APPEND | constants5.O_NOFOLLOW);
     const data = Buffer.from(text);
     let at3 = 0;
     while (at3 < data.length) at3 += writeSync3(fd, data, at3, data.length - at3);
@@ -10382,7 +10551,7 @@ function appendFile(path, text) {
     throw new StepError("a runner file (the outputs or the summary) could not be written");
   } finally {
     if (fd !== void 0) try {
-      closeSync4(fd);
+      closeSync5(fd);
     } catch {
     }
   }
@@ -10391,13 +10560,13 @@ function readRunnerFile(path, what) {
   if (path === void 0 || !isAbsolute3(path)) throw new StepError(`${what} is not set`);
   let fd;
   try {
-    fd = openSync4(path, constants4.O_RDONLY | constants4.O_NOFOLLOW | constants4.O_NONBLOCK);
-    const st = fstatSync4(fd);
+    fd = openSync5(path, constants5.O_RDONLY | constants5.O_NOFOLLOW | constants5.O_NONBLOCK);
+    const st = fstatSync5(fd);
     if (!st.isFile() || st.size > MAX_EVENT_BYTES) throw new StepError(`${what} is not a regular file within the size cap`);
     const buf = Buffer.alloc(st.size);
     let got = 0;
     while (got < buf.length) {
-      const n = readSync4(fd, buf, got, buf.length - got, got);
+      const n = readSync5(fd, buf, got, buf.length - got, got);
       if (n === 0) break;
       got += n;
     }
@@ -10406,7 +10575,7 @@ function readRunnerFile(path, what) {
     throw e instanceof StepError ? e : new StepError(`${what} could not be read`);
   } finally {
     if (fd !== void 0) try {
-      closeSync4(fd);
+      closeSync5(fd);
     } catch {
     }
   }
@@ -10560,7 +10729,7 @@ function gateFolder(step) {
   const dir = join4(runnerTemp(step), GATE_FILES_FOLDER);
   let st;
   try {
-    st = lstatSync4(dir);
+    st = lstatSync5(dir);
   } catch {
     st = void 0;
   }
@@ -10570,7 +10739,7 @@ function gateFolder(step) {
     } catch {
       throw new StepError("the gate folder could not be made");
     }
-    st = lstatSync4(dir);
+    st = lstatSync5(dir);
   }
   if (st.isSymbolicLink() || !st.isDirectory()) throw new StepError("the gate folder is a link or not a folder, so nothing is written there");
   return dir;
@@ -10807,7 +10976,7 @@ async function runBaselineCheck(step, deps, get) {
   step.log(`stored baseline: ${found ? "found" : "missing"}`);
   return 0;
 }
-var SHA_RE10 = /^[0-9a-f]{40}$/;
+var SHA_RE11 = /^[0-9a-f]{40}$/;
 var FIND_RUN_DEFAULT_MINUTES = 30;
 async function runFindRun(step, deps, get) {
   const fail3 = (text) => {
@@ -10817,7 +10986,7 @@ async function runFindRun(step, deps, get) {
     return 1;
   };
   const sha3 = get("sha");
-  if (sha3 === void 0 || !SHA_RE10.test(sha3)) return fail3("the sha input is not a 40-character lower-case commit sha, so the step fails closed");
+  if (sha3 === void 0 || !SHA_RE11.test(sha3)) return fail3("the sha input is not a 40-character lower-case commit sha, so the step fails closed");
   const layout = get("layout");
   if (layout !== "inline" && layout !== "central") return fail3("the layout input is not inline or central, so the step fails closed");
   const workflow = get("central-workflow");
@@ -10825,7 +10994,7 @@ async function runFindRun(step, deps, get) {
   if (layout === "inline" && (workflow !== void 0 || centralSha !== void 0)) return fail3("layout inline takes no central-workflow or central-sha, so the step fails closed");
   if (layout === "central" && (workflow === void 0 || centralSha === void 0)) return fail3("layout central needs both central-workflow and central-sha, so the step fails closed");
   if (workflow !== void 0 && (!PLAIN_REL_RE.test(workflow) || workflow.includes("@"))) return fail3("the central-workflow input is not a plain path of the central workflow, so the step fails closed");
-  if (centralSha !== void 0 && !SHA_RE10.test(centralSha)) return fail3("the central-sha input is not a 40-character lower-case commit sha, so the step fails closed");
+  if (centralSha !== void 0 && !SHA_RE11.test(centralSha)) return fail3("the central-sha input is not a 40-character lower-case commit sha, so the step fails closed");
   const minutes = get("timeout-minutes");
   if (minutes !== void 0 && !TIMEOUT_MINUTES_RE.test(minutes)) return fail3("the timeout-minutes input is not a whole number of minutes from 1 to 360, so the step fails closed");
   const token = get("github-token");

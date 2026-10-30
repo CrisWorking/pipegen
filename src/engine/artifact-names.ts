@@ -38,6 +38,10 @@ export const SECRETS_RANGE_ID = 'secrets-range';
 export const SECRETS_RANGE_ARTIFACT = resultArtifactName(SECRETS_RANGE_ID);
 /** The tool of the commit-range scan: betterleaks in `git` mode, whichever reviewed tool scans the HEAD tree (tool-flags.ts RANGE_TOOL). */
 export const SECRETS_RANGE_TOOL = 'betterleaks';
+/** C9: the facts the range scan step writes beside its raw result (base, head, the commit count, the canary commits); the scrub reads them (gate/src/range.ts). */
+export const RANGE_FACTS_FILE = 'range.json';
+/** C9: the file each of the range scan's two canary commits adds (one canary line each). */
+export const RANGE_CANARY_FILES = ['pipegen-range-canary-1.txt', 'pipegen-range-canary-2.txt'] as const;
 
 /** The names of many results at once; two different (need, service) pairs that give one name (slugging, the 40-character cut) throw. */
 export function resultArtifactNames(items: readonly { needId: string; service?: string; base?: true }[]): string[] {
