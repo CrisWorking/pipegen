@@ -22,8 +22,19 @@
 // workflow is pinned by SHA the entry has no `ref` (DECISIONS #78), and a path can say anything. Every entry for that prefix must carry the
 // expected sha (one central workflow, one commit); no such entry is also a refusal.
 //
+// RESIDUAL (accepted, review-C8 finding 2): the gate job is bound by its NAME only. GitHub's API gives no field that ties a job to the file or
+// the reusable call that defined it (inline and reusable jobs have identical keys; `workflow_name` is the caller run's; `external_id` changes per
+// run). So a job written inline in pipegen.yml as `name: pipegen / gate` that succeeds passes, even where the central workflow is also called.
+// Exact preconditions: a push run takes its jobs from pipegen.yml AT THE DEPLOYED COMMIT, so the forged job must already be in a commit on the
+// default branch. That needs (a) a credential that may write workflow files (the `workflow` scope or an App with workflows: write; GITHUB_TOKEN
+// can not), AND (b) either a direct push to the default branch (no ruleset, a bypass actor, an admin) or a merged PR without an independent
+// code-owner review of .github/workflows/**. C4 integrity does NOT cover this: its verdict is reported by the real gate job, and the forgery
+// renames or skips that job, so nothing requires the real one. The real guard is GitHub's own code-owner review on .github/workflows/** with no
+// bypass, and Plan H's drift check (pipegen.yml on the default branch against the install record) is the detector. The same actor could delete the
+// verify job from the deploy workflow, so no new power is added; a MAC'd marker would not help either (that actor can read PIPEGEN_FP_KEY).
+//
 // Waiting: a trusted run that is queued or in progress is waited for, polling (pollMs) up to waitMs, through the injectable sleep and clock.
-// Only the list is polled while waiting; the trust and the jobs are read fresh when a run is finished. Calls are budgeted (maxCalls): a budget
+// Only the list is polled while waiting; the trust and the jobs are read fresh when a run is finished, and a finished attempt that failed is remembered (never a pass). If no run of the commit is listed yet, the search keeps looking for min(timeout, 5 minutes) before it says none. Calls are budgeted (maxCalls): a budget
 // that runs out is an error, never a pass. Any API error (rate limit, 5xx, network) is an error with a reason: the proof cannot be made.
 import { judgeRun, runFieldsTrusted, WORKFLOW_PATH, type GateGithub, type Lookup, type RepoRef } from './baseline.js';
 import { GitHubApiError } from './github-adapter.js';
@@ -50,6 +61,8 @@ export const MAX_POLLS = 300;
 export const DEFAULT_MAX_CALLS = 400;
 /** Runs of one commit that are judged per poll; more than this and the search cannot say (error). */
 export const MAX_CANDIDATES = 20;
+/** How long find-run keeps looking for a run of the commit that is not listed yet (inside the timeout). */
+export const LISTING_GRACE_MS = 5 * 60_000;
 export const JOBS_PER_PAGE = 100;
 /** 500 jobs in one attempt at the most; more and a second gate job could hide beyond them. */
 export const JOB_PAGE_CAP = 5;
@@ -143,6 +156,8 @@ export async function findGatedRun(gh0: GateGithub, repo: RepoRef, sha: string, 
   const start = now();
   /** Runs judged trusted while still running: only the decision to keep waiting. A finished run is always judged afresh. */
   const waitingFor = new Set<number>();
+  /** Failed verdicts of finished attempts, by run and attempt. Never a pass: an ok is always found with a fresh trust check. */
+  const failedVerdicts = new Map<string, string>();
 
   for (;;) {
     let listed: unknown;
@@ -174,6 +189,9 @@ export async function findGatedRun(gh0: GateGithub, repo: RepoRef, sha: string, 
       const isActive = typeof status === 'string' && ACTIVE.has(status);
       if (!isActive && status !== 'completed') { errors.push(`run ${id} has a status this search does not know`); continue; }
       if (isActive && waitingFor.has(id)) { active++; continue; }
+      // a finished attempt's jobs are final and a failed one can never lead to ok, so its verdict is kept (the budget is for the runs still moving)
+      const kept = isActive ? undefined : failedVerdicts.get(`${id}:${attempt}`);
+      if (kept !== undefined) { failed.push(kept); continue; }
       const j = await judgeRun(gh, r, repo, undefined, lk);
       if (!j.ok) {
         if (j.why === 'untrusted' || j.why === 'history') continue;
@@ -183,7 +201,7 @@ export async function findGatedRun(gh0: GateGithub, repo: RepoRef, sha: string, 
       if (isActive) { waitingFor.add(id); active++; continue; }
       const v = await attemptVerdict(gh, repo, id, attempt, o.gateJobName);
       if (v.kind === 'ok') return { ok: true, runId: id, url: url(id) };
-      (v.kind === 'failed' ? failed : errors).push(v.detail);
+      if (v.kind === 'failed') { failedVerdicts.set(`${id}:${attempt}`, v.detail); failed.push(v.detail); } else errors.push(v.detail);
     }
 
     if (budget.spent) return error(`the call budget of ${o.maxCalls ?? DEFAULT_MAX_CALLS} calls is used up, so the gated run could not be found`);
@@ -193,6 +211,12 @@ export async function findGatedRun(gh0: GateGithub, repo: RepoRef, sha: string, 
       if (left <= 0) return { ok: false, reason: 'timeout', detail: `a run for this commit was still running after ${Math.round(waitMs / 60_000)} minutes` };
       await sleep(Math.min(pollMs, left));
       continue;
+    }
+    if (considered === 0) {
+      // listing grace: the push run of pipegen.yml and the run that asks start from the same push, and the list can lag behind. Until a run of
+      // this commit is listed, look again for min(timeout, 5 minutes); only then is it "none".
+      const left = Math.min(waitMs, LISTING_GRACE_MS) - (now() - start);
+      if (left > 0) { await sleep(Math.min(pollMs, left)); continue; }
     }
     if (failed.length > 0) return { ok: false, reason: 'gate-failed', detail: failed[0] as string };
     if (wrongCentral.length > 0) return { ok: false, reason: 'wrong-central', detail: wrongCentral[0] as string };

@@ -116,8 +116,8 @@ export interface GateGithub {
   /** `GET /repos/{owner}/{name}/compare/{base}...{head}`; both are 40-hex commit shas, never a name; the answer must carry `status`. */
   compare(owner: string, name: string, base: string, head: string): Promise<unknown>;
   /**
-   * `GET /repos/{owner}/{name}/actions/workflows/{workflow}/runs?event=push&branch={branch}&status=success&per_page={perPage}&page={page}`
-   * → `{ workflow_runs: [...] }`, newest first. The filters narrow the list, they are not trusted: every run is judged by trustedRun.
+   * `GET /repos/{owner}/{name}/actions/workflows/{workflow}/runs?event=push&branch={branch}[&status=success][&head_sha={headSha}]&per_page={perPage}&page={page}`
+   * (status and head_sha only when the query sets them) → `{ workflow_runs: [...] }`, newest first. The filters narrow the list, they are not trusted: every run is judged by trustedRun.
    */
   listRuns(owner: string, name: string, query: RunQuery): Promise<unknown>;
   /** `GET /repos/{owner}/{name}/actions/runs/{runId}/artifacts?name={artifactName}` → `{ artifacts: [...] }`. */

@@ -59,6 +59,9 @@ inputs:
   github-token:
     description: "gate, baseline-check, find-run, nightly: the workflow token (GITHUB_TOKEN). It is masked first."
     required: false
+  layout:
+    description: "find-run: inline (the gate job is in pipegen.yml) or central (it is in the central per-project workflow, which needs central-workflow and central-sha)."
+    required: false
   sha:
     description: "find-run: the commit to find the gated run for."
     required: false

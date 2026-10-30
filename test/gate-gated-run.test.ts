@@ -16,7 +16,7 @@ import { findGatedRun, type GatedRun, type GatedRunOpts } from '../gate/src/gate
 import { API_ROOT, GitHubApiError, githubAdapter, type AdapterOptions, type GateGithubAdapter } from '../gate/src/github-adapter.js';
 import { main, MODE_INPUTS, type MainDeps } from '../gate/src/main.js';
 import { GATE_CHECK_NAME } from '../src/types.js';
-import { GATE_MODES, PIPEGEN_GATE_USES, RENDERER_INPUTS, rendererInputProblems } from '../src/engine/tool-flags.js';
+import { GATE_MODES, PIPEGEN_GATE_USES, RENDERER_INPUTS, rendererInputProblems, TIMEOUT_MINUTES_RE } from '../src/engine/tool-flags.js';
 import { CRED, outputsOf, runner, type Runner } from './helpers/gate-world.js';
 
 const ROOT = resolve(import.meta.dirname, '..');
@@ -77,6 +77,7 @@ function opts(c = clock(), over: Partial<GatedRunOpts> = {}): GatedRunOpts {
 }
 const find = (f: Fake, over: Partial<GatedRunOpts> = {}, sha = SHA, repo = REPO): Promise<GatedRun> => findGatedRun(f.gh(), repo, sha, opts(clock(), over));
 const goodWorld = (): Fake => { const f = new Fake(); f.runs = [run()]; f.jobs.set('1001:1', [job()]); return f; };
+const goodWorldWith = (runs: unknown): Fake => { const f = goodWorld(); f.runs = runs; return f; };
 const okRun = (id: number, over: Obj = {}): [Obj, Obj[]] => [run({ id, ...over }), [job({ run_id: id })]];
 const reason = (r: GatedRun): string => (r.ok ? 'ok' : r.reason);
 
@@ -413,13 +414,62 @@ describe('findGatedRun: waiting', () => {
       expect(reason(await find(f)), String(status)).toBe('error');
     }
   });
-  it('no matching run (expired or never made) → none, with "re-run the pipeline on this commit", and it does not wait', async () => {
+  it('no matching run (expired or never made) → none after a listing grace of min(timeout, 5 min), with "re-run the pipeline on this commit"', async () => {
     const f = goodWorld();
     f.runs = [];
     const c = clock();
     const r = await findGatedRun(f.gh(), REPO, SHA, opts(c));
     expect(r).toMatchObject({ ok: false, reason: 'none' });
     expect(r.ok ? '' : r.detail).toMatch(/re-run the pipeline on this commit/);
+    expect(c.slept.reduce((a, b) => a + b, 0)).toBe(5 * 60_000);
+    const c2 = clock();
+    expect(reason(await findGatedRun(goodWorldWith([]).gh(), REPO, SHA, opts(c2, { waitMs: 2 * 60_000 })))).toBe('none');
+    expect(c2.slept.reduce((a, b) => a + b, 0)).toBe(2 * 60_000);
+    const c3 = clock();
+    expect(reason(await findGatedRun(goodWorldWith([]).gh(), REPO, SHA, opts(c3, { waitMs: 0 })))).toBe('none');
+    expect(c3.slept).toEqual([]);
+  });
+  it('listing grace: the run is not listed yet at the first looks → found when it appears', async () => {
+    const f = goodWorld();
+    f.runs = (p: number): unknown => (p < 4 ? [] : [run()]);
+    const c = clock();
+    expect((await findGatedRun(f.gh(), REPO, SHA, opts(c))).ok).toBe(true);
+    expect(c.slept).toEqual([20_000, 20_000, 20_000]);
+  });
+  it('listing grace: a run listed but not trusted, or with the wrong central, is answered at once (it is not a late run)', async () => {
+    const f = goodWorld();
+    f.runs = [run()];
+    f.history.set(SHA, { status: 'behind' });
+    const c = clock();
+    expect(reason(await findGatedRun(f.gh(), REPO, SHA, opts(c)))).toBe('none');
+    expect(c.slept).toEqual([]);
+  });
+});
+
+describe('findGatedRun: finished runs are judged once; errors come before waiting', () => {
+  it('one failed run beside one in-progress run still fits the budget for the full 30 minutes (the failed verdict is kept)', async () => {
+    const f = new Fake();
+    f.runs = (p: number): unknown => [run({ id: 1001 }), run({ id: 1002, status: p < 89 ? 'in_progress' : 'completed' })];
+    f.jobs.set('1001:1', [job({ conclusion: 'failure' })]);
+    f.jobs.set('1002:1', [job({ run_id: 1002 })]);
+    const r = await find(f);
+    expect(r).toMatchObject({ ok: true, runId: 1002 });
+    expect(f.count('jobs 1001')).toBe(1);
+    expect(f.calls.length).toBeLessThan(150);
+  });
+  it('the failed verdict is kept per run and attempt: a new attempt of that run is read afresh', async () => {
+    const f = new Fake();
+    f.runs = (p: number): unknown => [run({ id: 1001, run_attempt: p < 3 ? 1 : 2 }), run({ id: 1002, status: 'in_progress' })];
+    f.jobs.set('1001:1', [job({ conclusion: 'failure' })]);
+    f.jobs.set('1001:2', [job({ run_attempt: 2 })]);
+    expect(await find(f)).toMatchObject({ ok: true, runId: 1001 });
+    expect(f.count('jobs 1001 1')).toBe(1);
+  });
+  it('a finished run whose jobs could not be read next to a run in progress → error at once, no sleep', async () => {
+    const f = new Fake();
+    f.runs = [run({ id: 1001 }), run({ id: 1002, status: 'in_progress' })];   // no jobs answer for 1001: a 404
+    const c = clock();
+    expect(reason(await findGatedRun(f.gh(), REPO, SHA, opts(c)))).toBe('error');
     expect(c.slept).toEqual([]);
   });
 });
@@ -567,7 +617,9 @@ async function go(inputs: Record<string, string | undefined>, f: Fake = goodWorl
   const out = chunks.join('');
   return { code, out, lines: out.split('\n').filter((l) => l !== ''), outputs: outputsOf(r.output), r, f, github };
 }
-const FR = (over: Record<string, string | undefined> = {}): Record<string, string | undefined> => ({ mode: 'find-run', sha: SHA, 'central-workflow': PREFIX, 'central-sha': CSHA, [GH_IN]: CRED, ...over });
+/** deps with a clock that sleeping moves (the none answer waits out the listing grace) */
+const fastDeps = (): Partial<MainDeps> => { let t = 0; return { now: () => new Date(NOW.getTime() + t), sleep: async (ms: number) => { t += ms; } }; };
+const FR = (over: Record<string, string | undefined> = {}): Record<string, string | undefined> => ({ mode: 'find-run', layout: 'central', sha: SHA, 'central-workflow': PREFIX, 'central-sha': CSHA, [GH_IN]: CRED, ...over });
 const centralWorld = (): Fake => { const f = goodWorld(); f.runs = [run({ referenced_workflows: [central()] })]; return f; };
 
 describe('mode find-run', () => {
@@ -580,14 +632,14 @@ describe('mode find-run', () => {
   it('action: find-run mode fails when not ok (exit 1, ::error:: with the reason, empty outputs)', async () => {
     const f = centralWorld();
     f.jobs.set('1001:1', [job({ conclusion: 'failure' })]);
-    const x = await go(FR(), f);
+    const x = await go(FR(), f, { deps: fastDeps() });
     expect(x.code).toBe(1);
     expect(x.out).toMatch(/::error::.*gate-failed/);
     expect(x.outputs).toEqual({ 'run-id': '', 'run-url': '' });
     for (const [reasonName, setup] of [['none', (g: Fake) => { g.runs = []; }], ['wrong-central', (g: Fake) => { g.runs = [run({ referenced_workflows: [central({ sha: 'd'.repeat(40) })] })]; }], ['error', (g: Fake) => { g.runs = err(); }]] as const) {
       const g = centralWorld();
       setup(g);
-      const y = await go(FR(), g);
+      const y = await go(FR(), g, { deps: fastDeps() });
       expect(y.code, reasonName).toBe(1);
       expect(y.out, reasonName).toContain(reasonName);
       expect(y.outputs['run-id'], reasonName).toBe('');
@@ -622,15 +674,27 @@ describe('mode find-run', () => {
       expect(x.f.calls, JSON.stringify(bad)).toEqual([]);
     }
   });
-  it('a private repository (or one that does not say) needs the central inputs; a public one may go without', async () => {
-    for (const priv of [true, undefined, 'yes', null]) {
-      const x = await go(FR({ 'central-workflow': undefined, 'central-sha': undefined }), goodWorld(), { payload: PAYLOAD(priv) });
-      expect(x.code, String(priv)).toBe(1);
-      expect(x.f.calls, String(priv)).toEqual([]);
+  it('the layout is declared, never read from the repository\'s visibility: inline (no central inputs) works whatever the payload says', async () => {
+    for (const priv of [true, false, undefined, 'yes', null]) {
+      const x = await go(FR({ layout: 'inline', 'central-workflow': undefined, 'central-sha': undefined }), goodWorld(), { payload: PAYLOAD(priv) });
+      expect(x.code, String(priv)).toBe(0);
+      expect(x.outputs['run-id'], String(priv)).toBe('1001');
     }
-    const pub = await go(FR({ 'central-workflow': undefined, 'central-sha': undefined }), goodWorld(), { payload: PAYLOAD(false) });
-    expect(pub.code).toBe(0);
-    expect(pub.outputs['run-id']).toBe('1001');
+    for (const priv of [true, false]) expect((await go(FR(), centralWorld(), { payload: PAYLOAD(priv) })).code, String(priv)).toBe(0);
+  });
+  it('layout is required and is inline or central; central needs both central inputs; inline refuses both', async () => {
+    const bads: Record<string, string | undefined>[] = [
+      { layout: undefined }, { layout: 'Central' }, { layout: 'private' }, { layout: '' }, { layout: 'centrall' },
+      { layout: 'central', 'central-sha': undefined }, { layout: 'central', 'central-workflow': undefined }, { layout: 'central', 'central-workflow': undefined, 'central-sha': undefined },
+      { layout: 'inline' }, { layout: 'inline', 'central-sha': undefined }, { layout: 'inline', 'central-workflow': undefined },
+    ];
+    for (const bad of bads) {
+      const x = await go(FR(bad), centralWorld());
+      expect(x.code, JSON.stringify(bad)).toBe(1);
+      expect(x.out, JSON.stringify(bad)).toMatch(/::error::.*(layout|central)/);
+      expect(x.f.calls, JSON.stringify(bad)).toEqual([]);
+      expect(x.outputs, JSON.stringify(bad)).toEqual({ 'run-id': '', 'run-url': '' });
+    }
   });
   it('timeout-minutes: default 30; a whole number of 1 to 360; anything else is a settings error', async () => {
     for (const bad of ['0', '-1', '361', '1e2', '30.5', 'abc', '030', '99999', '1 2', '0x10']) {
@@ -696,14 +760,14 @@ describe('mode find-run', () => {
 describe('action.yml and RENDERER_INPUTS cover find-run', () => {
   const ACTION = parse(readFileSync(join(ROOT, 'gate/action.yml'), 'utf8')) as { inputs: Record<string, { description: string }>; outputs: Record<string, { description: string }> };
   const ROW = RENDERER_INPUTS[PIPEGEN_GATE_USES] as NonNullable<(typeof RENDERER_INPUTS)[string]>;
-  const FIND_RUN = ['mode', 'sha', 'central-workflow', 'central-sha', 'timeout-minutes', GH_IN];
+  const FIND_RUN = ['mode', 'layout', 'sha', 'central-workflow', 'central-sha', 'timeout-minutes', GH_IN];
   it('the find-run inputs are exactly sha, central-workflow, central-sha, timeout-minutes and github-token (plus mode), in the row, in MODE_INPUTS and in action.yml', () => {
     expect([...MODE_INPUTS['find-run']].sort()).toEqual([...FIND_RUN].sort());
     for (const n of FIND_RUN) {
       expect(Object.keys(ROW), n).toContain(n);
       expect(Object.keys(ACTION.inputs), n).toContain(n);
     }
-    for (const n of ['sha', 'central-workflow', 'central-sha', 'timeout-minutes']) {
+    for (const n of ['layout', 'sha', 'central-workflow', 'central-sha', 'timeout-minutes']) {
       expect(ACTION.inputs[n]?.description, n).toMatch(/^find-run:/);
       expect(Object.hasOwn(ACTION.inputs[n] as object, 'default'), n).toBe(false);
       for (const m of GATE_MODES) expect(ROW[n]?.whenWith?.check({ mode: m }) ?? true, `${n} in ${m}`).toBe(m === 'find-run');
@@ -715,6 +779,18 @@ describe('action.yml and RENDERER_INPUTS cover find-run', () => {
     for (const good of ['1', '30', '99', '100', '359', '360']) expect(p(good), good).toEqual([]);
     for (const bad of ['0', '361', '400', '030', '-1', '1.5', '', '${{ github.run_id }}', '30 ', 'x']) expect(p(bad).length, bad).toBeGreaterThan(0);
     expect(rendererInputProblems(PIPEGEN_GATE_USES, { mode: 'gate', 'timeout-minutes': '30' }).some((x) => /timeout-minutes/.test(x))).toBe(true);
+  });
+  it('the layout row: inline or central, find-run only', () => {
+    const p = (v: string, mode = 'find-run'): string[] => rendererInputProblems(PIPEGEN_GATE_USES, { mode, layout: v });
+    for (const good of ['inline', 'central']) expect(p(good), good).toEqual([]);
+    for (const bad of ['', 'Inline', 'private', 'central ', '${{ github.repository }}', 'inline|central']) expect(p(bad).length, bad).toBeGreaterThan(0);
+    expect(p('inline', 'gate').some((x) => /layout/.test(x))).toBe(true);
+  });
+  it('the timeout regex is one: the row and the action use TIMEOUT_MINUTES_RE from tool-flags', () => {
+    expect(TIMEOUT_MINUTES_RE.test('360')).toBe(true);
+    expect(TIMEOUT_MINUTES_RE.test('361')).toBe(false);
+    expect(readFileSync(join(ROOT, 'gate/src/main.ts'), 'utf8')).not.toMatch(/const TIMEOUT_RE/);
+    expect(readFileSync(join(ROOT, 'gate/src/main.ts'), 'utf8')).toContain('TIMEOUT_MINUTES_RE');
   });
   it('outputs run-id and run-url are declared and say they are find-run\'s', () => {
     for (const n of ['run-id', 'run-url']) expect(ACTION.outputs[n]?.description, n).toMatch(/^find-run:/);

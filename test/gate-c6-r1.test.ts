@@ -64,7 +64,9 @@ describe('r1-m2 and m4: the CI ls-files compare is the exact line, with a C-loca
   it('is a real test line (a comment can not satisfy it) with LC_ALL=C sort and exactly the three files', () => {
     expect(line).toBe('test "$(git ls-files gate/dist | LC_ALL=C sort | tr \'\\n\' \' \')" = "gate/dist/README.md gate/dist/THIRD_PARTY_NOTICES gate/dist/index.js "');
   });
-  it('holds in a non-C locale: the line, run as it stands, exits 0 on this tree', () => {
+  // an unknown LC_ALL falls back to C collation, so on a host without en_US.utf8 this test would prove nothing: it is skipped there
+  const hasLocale = spawnSync('locale', ['-a'], { encoding: 'utf8' }).stdout?.split('\n').some((l) => /^en_US\.utf-?8$/i.test(l.trim())) === true;
+  it.skipIf(!hasLocale)('holds in a non-C locale: the line, run as it stands, exits 0 on this tree', () => {
     const r = spawnSync('bash', ['-c', line as string], { cwd: ROOT, env: { PATH: process.env.PATH ?? '', LC_ALL: 'en_US.UTF-8', LANG: 'en_US.UTF-8' }, encoding: 'utf8' });
     expect(r.status).toBe(0);
   });

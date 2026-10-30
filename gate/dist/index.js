@@ -2398,6 +2398,7 @@ var ACTION_POLICIES = Object.freeze({
   }
 });
 var rx = (re, describe, whenWith) => ({ describe, check: (v) => re.test(v), ...whenWith === void 0 ? {} : { whenWith } });
+var TIMEOUT_MINUTES_RE = /^(?:[1-9]|[1-9][0-9]|[12][0-9]{2}|3[0-5][0-9]|360)$/;
 var PLAIN_REL_RE = /^(?![-/])(?!.*(?:^|\/)\.\.(?:\/|$))[A-Za-z0-9._/-]{1,200}$/;
 var GHCR_ONLY = { check: (all) => all.registry === "ghcr.io", describe: "only when the registry is ghcr.io" };
 var RUNNER_TEMP_PATH = rx(/^\$\{\{ runner\.temp \}\}\/pipegen-out\/[a-z0-9][a-z0-9-]{0,120}(?:\/[A-Za-z0-9_][A-Za-z0-9._-]{0,100}){0,3}$/, "a path under ${{ runner.temp }}/pipegen-out/<artifact>");
@@ -2592,7 +2593,10 @@ var RENDERER_INPUTS = Object.freeze({
     "central-workflow": modeInput(["find-run"], PLAIN_REL_RE, "a plain relative path of the central workflow"),
     "central-sha": modeInput(["find-run"], /^[0-9a-f]{40}$/, "a 40-character commit"),
     // how long find-run waits for a run in progress (C8): whole minutes, 1 to 360 (a job's own limit)
-    "timeout-minutes": modeInput(["find-run"], /^(?:[1-9]|[1-9][0-9]|[12][0-9]{2}|3[0-5][0-9]|360)$/, "whole minutes, 1 to 360"),
+    "timeout-minutes": modeInput(["find-run"], TIMEOUT_MINUTES_RE, "whole minutes, 1 to 360"),
+    // where the gate runs (C8 fix round 1): `inline` (the gate job is in pipegen.yml) or `central` (the per-project central workflow); the renderer
+    // knows it from the draft and the referee checks it. find-run never guesses it from the repository's visibility.
+    layout: modeInput(["find-run"], /^(?:inline|central)$/, "inline or central"),
     // nightly
     "merged-at": modeInput(["nightly"], /^\d{4}-(?:0[1-9]|1[0-2])-(?:0[1-9]|[12]\d|3[01])(?:T\d{2}:\d{2}:\d{2}(?:\.\d{1,3})?Z)?$/, "a date or an ISO time in UTC")
   }
@@ -8626,6 +8630,7 @@ var DEFAULT_POLL_MS = 2e4;
 var MAX_POLLS = 300;
 var DEFAULT_MAX_CALLS = 400;
 var MAX_CANDIDATES = 20;
+var LISTING_GRACE_MS = 5 * 6e4;
 var JOBS_PER_PAGE = 100;
 var JOB_PAGE_CAP = 5;
 var SHA_RE7 = /^[0-9a-f]{40}$/;
@@ -8727,6 +8732,7 @@ async function findGatedRun(gh0, repo2, sha3, o) {
   const url = (id) => `https://github.com/${repo2.owner}/${repo2.name}/actions/runs/${id}`;
   const start = now();
   const waitingFor = /* @__PURE__ */ new Set();
+  const failedVerdicts = /* @__PURE__ */ new Map();
   for (; ; ) {
     let listed;
     try {
@@ -8771,6 +8777,11 @@ async function findGatedRun(gh0, repo2, sha3, o) {
         active++;
         continue;
       }
+      const kept = isActive ? void 0 : failedVerdicts.get(`${id}:${attempt}`);
+      if (kept !== void 0) {
+        failed.push(kept);
+        continue;
+      }
       const j = await judgeRun(gh, r, repo2, void 0, lk);
       if (!j.ok) {
         if (j.why === "untrusted" || j.why === "history") continue;
@@ -8784,7 +8795,10 @@ async function findGatedRun(gh0, repo2, sha3, o) {
       }
       const v = await attemptVerdict(gh, repo2, id, attempt, o.gateJobName);
       if (v.kind === "ok") return { ok: true, runId: id, url: url(id) };
-      (v.kind === "failed" ? failed : errors).push(v.detail);
+      if (v.kind === "failed") {
+        failedVerdicts.set(`${id}:${attempt}`, v.detail);
+        failed.push(v.detail);
+      } else errors.push(v.detail);
     }
     if (budget.spent) return error(`the call budget of ${o.maxCalls ?? DEFAULT_MAX_CALLS} calls is used up, so the gated run could not be found`);
     if (errors.length > 0) return error(errors[0]);
@@ -8793,6 +8807,13 @@ async function findGatedRun(gh0, repo2, sha3, o) {
       if (left <= 0) return { ok: false, reason: "timeout", detail: `a run for this commit was still running after ${Math.round(waitMs / 6e4)} minutes` };
       await sleep(Math.min(pollMs, left));
       continue;
+    }
+    if (considered === 0) {
+      const left = Math.min(waitMs, LISTING_GRACE_MS) - (now() - start);
+      if (left > 0) {
+        await sleep(Math.min(pollMs, left));
+        continue;
+      }
     }
     if (failed.length > 0) return { ok: false, reason: "gate-failed", detail: failed[0] };
     if (wrongCentral.length > 0) return { ok: false, reason: "wrong-central", detail: wrongCentral[0] };
@@ -9398,7 +9419,7 @@ var MODE_INPUTS = {
   stage: ["mode", "artifact", "tool", "stage"],
   gate: [...GATE_INPUTS],
   "baseline-check": ["mode", "github-token", "fp-key"],
-  "find-run": ["mode", "sha", "central-workflow", "central-sha", "timeout-minutes", "github-token"],
+  "find-run": ["mode", "layout", "sha", "central-workflow", "central-sha", "timeout-minutes", "github-token"],
   nightly: ["mode", "block-from", "block-from-recorded", "github-token", "merged-at"]
 };
 var isMode = (m) => Object.hasOwn(MODE_INPUTS, m);
@@ -9992,7 +10013,6 @@ async function runBaselineCheck(step, deps, get) {
   return 0;
 }
 var SHA_RE8 = /^[0-9a-f]{40}$/;
-var TIMEOUT_RE = /^(?:[1-9]|[1-9][0-9]|[12][0-9]{2}|3[0-5][0-9]|360)$/;
 var FIND_RUN_DEFAULT_MINUTES = 30;
 async function runFindRun(step, deps, get) {
   const fail3 = (text) => {
@@ -10003,13 +10023,16 @@ async function runFindRun(step, deps, get) {
   };
   const sha3 = get("sha");
   if (sha3 === void 0 || !SHA_RE8.test(sha3)) return fail3("the sha input is not a 40-character lower-case commit sha, so the step fails closed");
+  const layout = get("layout");
+  if (layout !== "inline" && layout !== "central") return fail3("the layout input is not inline or central, so the step fails closed");
   const workflow = get("central-workflow");
   const centralSha = get("central-sha");
-  if (workflow === void 0 !== (centralSha === void 0)) return fail3("central-workflow and central-sha go together, so the step fails closed");
+  if (layout === "inline" && (workflow !== void 0 || centralSha !== void 0)) return fail3("layout inline takes no central-workflow or central-sha, so the step fails closed");
+  if (layout === "central" && (workflow === void 0 || centralSha === void 0)) return fail3("layout central needs both central-workflow and central-sha, so the step fails closed");
   if (workflow !== void 0 && (!PLAIN_REL_RE.test(workflow) || workflow.includes("@"))) return fail3("the central-workflow input is not a plain path of the central workflow, so the step fails closed");
   if (centralSha !== void 0 && !SHA_RE8.test(centralSha)) return fail3("the central-sha input is not a 40-character lower-case commit sha, so the step fails closed");
   const minutes = get("timeout-minutes");
-  if (minutes !== void 0 && !TIMEOUT_RE.test(minutes)) return fail3("the timeout-minutes input is not a whole number of minutes from 1 to 360, so the step fails closed");
+  if (minutes !== void 0 && !TIMEOUT_MINUTES_RE.test(minutes)) return fail3("the timeout-minutes input is not a whole number of minutes from 1 to 360, so the step fails closed");
   const token = get("github-token");
   if (token === void 0) return fail3("the github-token input is missing, so the step fails closed");
   let repo2;
@@ -10019,7 +10042,6 @@ async function runFindRun(step, deps, get) {
     return fail3(e instanceof StepError ? `${e.message}, so the step fails closed` : "the event payload could not be read, so the step fails closed");
   }
   if (typeof repo2 === "string") return fail3(`${repo2}, so the step fails closed`);
-  if (workflow === void 0 && repo2.private !== false) return fail3("a private repository needs the central-workflow and central-sha inputs, so the step fails closed");
   const notes = [];
   const clock = deps.now ?? (() => /* @__PURE__ */ new Date());
   const opts = {

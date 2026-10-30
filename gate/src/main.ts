@@ -22,7 +22,7 @@
 import { randomUUID } from 'node:crypto';
 import { accessSync, chmodSync, closeSync, constants, fstatSync, lstatSync, mkdirSync, openSync, readSync, renameSync, unlinkSync, writeFileSync, writeSync } from 'node:fs';
 import { basename, dirname, isAbsolute, join } from 'node:path';
-import { GATE_UPLOAD_FILES, isStagedTool, PLAIN_REL_RE } from '../../src/engine/tool-flags.js';
+import { GATE_UPLOAD_FILES, isStagedTool, PLAIN_REL_RE, TIMEOUT_MINUTES_RE } from '../../src/engine/tool-flags.js';
 import { GATE_CHECK_NAME } from '../../src/types.js';
 import { safeMarkdown, safeText } from '../../src/util/safe-text.js';
 import { keyProblem } from './fingerprint.js';
@@ -42,7 +42,7 @@ export const MODE_INPUTS = {
   stage: ['mode', 'artifact', 'tool', 'stage'],
   gate: [...GATE_INPUTS],
   'baseline-check': ['mode', 'github-token', 'fp-key'],
-  'find-run': ['mode', 'sha', 'central-workflow', 'central-sha', 'timeout-minutes', 'github-token'],
+  'find-run': ['mode', 'layout', 'sha', 'central-workflow', 'central-sha', 'timeout-minutes', 'github-token'],
   nightly: ['mode', 'block-from', 'block-from-recorded', 'github-token', 'merged-at'],
 } as const;
 type Mode = keyof typeof MODE_INPUTS;
@@ -589,7 +589,6 @@ async function runBaselineCheck(step: Step, deps: MainDeps, get: (n: string) => 
 // ---------- find-run ----------
 
 const SHA_RE = /^[0-9a-f]{40}$/;
-const TIMEOUT_RE = /^(?:[1-9]|[1-9][0-9]|[12][0-9]{2}|3[0-5][0-9]|360)$/;
 /** The default wait of find-run, in minutes. There is no default in action.yml (no input has one); the code says it. */
 export const FIND_RUN_DEFAULT_MINUTES = 30;
 
@@ -606,13 +605,17 @@ async function runFindRun(step: Step, deps: MainDeps, get: (n: string) => string
   };
   const sha = get('sha');
   if (sha === undefined || !SHA_RE.test(sha)) return fail('the sha input is not a 40-character lower-case commit sha, so the step fails closed');
+  // the layout is declared by the renderer (from the draft), never guessed from the repository's visibility
+  const layout = get('layout');
+  if (layout !== 'inline' && layout !== 'central') return fail('the layout input is not inline or central, so the step fails closed');
   const workflow = get('central-workflow');
   const centralSha = get('central-sha');
-  if ((workflow === undefined) !== (centralSha === undefined)) return fail('central-workflow and central-sha go together, so the step fails closed');
+  if (layout === 'inline' && (workflow !== undefined || centralSha !== undefined)) return fail('layout inline takes no central-workflow or central-sha, so the step fails closed');
+  if (layout === 'central' && (workflow === undefined || centralSha === undefined)) return fail('layout central needs both central-workflow and central-sha, so the step fails closed');
   if (workflow !== undefined && (!PLAIN_REL_RE.test(workflow) || workflow.includes('@'))) return fail('the central-workflow input is not a plain path of the central workflow, so the step fails closed');
   if (centralSha !== undefined && !SHA_RE.test(centralSha)) return fail('the central-sha input is not a 40-character lower-case commit sha, so the step fails closed');
   const minutes = get('timeout-minutes');
-  if (minutes !== undefined && !TIMEOUT_RE.test(minutes)) return fail('the timeout-minutes input is not a whole number of minutes from 1 to 360, so the step fails closed');
+  if (minutes !== undefined && !TIMEOUT_MINUTES_RE.test(minutes)) return fail('the timeout-minutes input is not a whole number of minutes from 1 to 360, so the step fails closed');
   const token = get('github-token');
   if (token === undefined) return fail('the github-token input is missing, so the step fails closed');
   let repo: ReturnType<typeof repoOf>;
@@ -622,8 +625,6 @@ async function runFindRun(step: Step, deps: MainDeps, get: (n: string) => string
     return fail(e instanceof StepError ? `${e.message}, so the step fails closed` : 'the event payload could not be read, so the step fails closed');
   }
   if (typeof repo === 'string') return fail(`${repo}, so the step fails closed`);
-  // the central workflow is what a pull request can not edit: a private repository (or one that does not say) must name it
-  if (workflow === undefined && repo.private !== false) return fail('a private repository needs the central-workflow and central-sha inputs, so the step fails closed');
   const notes: string[] = [];
   const clock = deps.now ?? (() => new Date());
   const opts: GatedRunOpts = {
