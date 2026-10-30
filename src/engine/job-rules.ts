@@ -333,7 +333,8 @@ export function gateUploadProblems(steps: readonly RenderedStep[], jobId: string
 
 // ---------- job outputs (Plan C ruling B3) ----------
 
-const OUTPUT_NAMES = ['sha256', 'status', 'error'] as const;
+/** The scrub step's declared outputs the job outputs reference (gate/action.yml declares them; a test keeps them in it). */
+export const OUTPUT_NAMES = ['sha256', 'status', 'error'] as const;
 /** The id of the base-scan job's one checkout (renderJobPrelude with baseRef), so its `commit` output can be a job output (C5a CF3b). It is the setup id of actions/checkout, which the order rule already knows as harmless. */
 export const BASE_CHECKOUT_ID = 'pipegen-checkout';
 /** The base-scan job's output naming the commit it checked out: the gate requires it to equal the base of its own event (CF3b). */
