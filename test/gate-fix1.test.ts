@@ -6,7 +6,7 @@ import { GateJobListError, gateJobList } from '../src/engine/gate-job-list.js';
 import { checkJobOrder, jobOutputsFor, jobOutputsProblems, NO_SCANS, type ScanFact } from '../src/engine/job-rules.js';
 import { referee, type Linters, type RefereeReport } from '../src/engine/referee.js';
 import {
-  dedupeJobSteps, RenderError, renderGateStep, renderJobPrelude, renderPlatformStep, renderProjectScript, renderScrub, renderStep, renderUpload, scanFactOf, scrubbedPath, stepsToYaml,
+  dedupeJobSteps, RenderError, renderBaselineCheckStep, renderGateStep, renderJobPrelude, renderPlatformStep, renderProjectScript, renderScrub, renderStep, renderUpload, scanFactOf, scrubbedPath, stepsToYaml,
   type RenderContext, type RenderedStep, type RenderResult,
 } from '../src/engine/render-step.js';
 import { NEED_ID_CATEGORY } from '../src/engine/need-ids.js';
@@ -297,5 +297,51 @@ describe('minor findings (ruling 6)', () => {
     const j = jobs();
     const r = await run([workflow({ ...j, gate: { ...(j.gate as Job), needs: [...entries.map((e) => e.job), '${{ github.ref }}'] } })], d);
     expect(has(r, 'injection', /expression .* in needs/), show(r)).toBe(true);
+  });
+});
+
+// ---------- C3: the gate action's own mode for the job baseline-check ----------
+
+describe('C3: mode baseline-check runs in the job baseline-check and nowhere else', () => {
+  // the step the renderer writes; `over` adds or replaces inputs (raw YAML only: the emitter refuses a hostile expression)
+  const BC = (_j: Record<string, Job>, over: Record<string, string | undefined> = {}): RenderedStep => {
+    const s = renderBaselineCheckStep(GATE);
+    return Object.keys(over).length === 0 ? s : { ...s, with: { ...(s.with as Record<string, string>), ...(over as Record<string, string>) } };
+  };
+  const BC_JOB = (steps: RenderedStep[]): Job => job(steps, { permissions: { contents: 'read', actions: 'read' } });
+  it('the job baseline-check with one gate step in mode baseline-check passes the referee', async () => {
+    const j = jobs();
+    expect(show(await run([workflow({ ...j, 'baseline-check': BC_JOB([BC(j)]) })], d))).toBe('');
+    expect(BC(j).with).toEqual({ mode: 'baseline-check', [GH_IN]: sref('GITHUB_TOKEN'), [FP_IN]: sref('PIPEGEN_FP_KEY') });
+  });
+  it('mode baseline-check in any other job is refused (a tool job, the gate, nightly, pipegen-verify)', async () => {
+    const j = jobs();
+    const other = (id: string, extra: Job): Record<string, Job> => ({ ...j, [id]: { ...(j[id] ?? job([])), ...extra } });
+    const r1 = await run([workflow(other('sast--app', { steps: [...((j['sast--app'] as Job).steps as RenderedStep[]), BC(j)] }), true)], d);
+    expect(has(r1, 'permissions', /gate action/), show(r1)).toBe(true);
+    const r2 = await run([workflow(withGate(j, [BC(j)]), true)], d);
+    expect(has(r2, 'not-gate-readable', /exactly once, in mode gate/), show(r2)).toBe(true);
+    const r3 = await run([workflow({ ...j, nightly: job([BC(j)], { permissions: { contents: 'read', actions: 'read', issues: 'write' } }) }, true)], d);
+    expect(has(r3, 'permissions', /baseline-check/), show(r3)).toBe(true);
+    const r4 = await run([workflow({ ...j, 'pipegen-verify': job([BC(j)], { permissions: { contents: 'read', actions: 'read', packages: 'read', attestations: 'read' }, environment: 'pipegen-signing' }) }, true)], d);
+    expect(has(r4, 'permissions', /baseline-check/), show(r4)).toBe(true);
+  });
+  it('the job baseline-check runs only mode baseline-check, exactly once (no gate, nightly or find-run step; not two)', async () => {
+    const j = jobs();
+    const FR = { ...gs(j), with: { mode: 'find-run', sha: '${{ github.sha }}', [GH_IN]: sref('GITHUB_TOKEN') } };
+    const NI = { ...gs(j), with: { mode: 'nightly', [GH_IN]: sref('GITHUB_TOKEN') } };
+    for (const [name, steps] of [['gate', [gs(j)]], ['find-run', [FR]], ['nightly', [NI]], ['two', [BC(j), BC(j)]], ['none', []], ['baseline-check and find-run', [BC(j), FR]]] as const) {
+      const r = await run([workflow({ ...j, 'baseline-check': BC_JOB([...steps]) }, true)], d);
+      expect(has(r, 'permissions', /baseline-check/), `${name}: ${show(r)}`).toBe(true);
+    }
+  });
+  it('mode baseline-check takes only its inputs: token and key, no gate or nightly input', async () => {
+    const j = jobs();
+    for (const extra of [{ jobs: '${{ toJSON(needs) }}' }, { 'block-from': '${{ vars.PIPEGEN_BLOCK_FROM }}' }, { 'merged-at': '2026-10-29T12:00:00Z' }, { sha: '${{ github.sha }}' }]) {
+      const r = await run([workflow({ ...j, 'baseline-check': BC_JOB([BC(j, extra)]) }, true)], d);
+      expect(has(r, 'template', /allowed only in mode/), `${Object.keys(extra)[0]}: ${show(r)}`).toBe(true);
+    }
+    const r = await run([workflow({ ...j, 'baseline-check': BC_JOB([BC(j, { [GH_IN]: sref('PIPEGEN_FP_KEY') })]) }, true)], d);
+    expect(r.ok).toBe(false);
   });
 });

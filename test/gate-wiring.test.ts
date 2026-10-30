@@ -13,7 +13,7 @@ import {
   type RenderContext, type RenderedStep, type RenderResult,
 } from '../src/engine/render-step.js';
 import { NEED_ID_CATEGORY } from '../src/engine/need-ids.js';
-import { BASE_CHECKOUT_REF, rendererInputProblems, scrubStepId } from '../src/engine/tool-flags.js';
+import { BASE_CHECKOUT_REF, GATE_MODES, rendererInputProblems, scrubStepId } from '../src/engine/tool-flags.js';
 import { emptyRepoFiles } from '../src/read/quality.js';
 import type { Capabilities, CreatedFile, Need, PipelineDraft, ReviewedTool, StepSpec } from '../src/types.js';
 import { entry, gateEntry, platform, profile, reviewedList, service, specFor } from './helpers/render.js';
@@ -173,6 +173,7 @@ describe('RENDERER_INPUTS: the gate action, per mode (ruling B3)', () => {
   const findRunWith: Record<string, string> = { mode: 'find-run', sha: '${{ github.sha }}', 'central-workflow': 'acme/pipelines/.github/workflows/acme--merge.yml', 'central-sha': 'a'.repeat(40), [GH_IN]: GH };
   const nightlyWith: Record<string, string> = { mode: 'nightly', [GH_IN]: GH, 'block-from': '${{ vars.PIPEGEN_BLOCK_FROM }}', 'block-from-recorded': '2026-11-01', 'merged-at': '2026-10-29T12:00:00Z' };
   const problems = (w: Record<string, string>): string[] => rendererInputProblems(U, w, w);
+  const SCRUB_SAMPLE_FOR_BASELINE: Record<string, string> = { artifact: 'pipegen-out-secrets', tool: 'gitleaks', format: 'sarif', raw: '${{ runner.temp }}/pipegen-raw/pipegen-out-secrets/x.sarif', out: '${{ runner.temp }}/pipegen-out/pipegen-out-secrets/x.sarif' };
 
   it('RENDERER_INPUTS gate, mode gate: the exact inputs pass', () => {
     expect(problems(gateWith)).toEqual([]);
@@ -214,6 +215,32 @@ describe('RENDERER_INPUTS: the gate action, per mode (ruling B3)', () => {
   it('RENDERER_INPUTS gate, mode nightly: github-token, block-from, block-from-recorded, merged-at', () => {
     expect(problems(nightlyWith)).toEqual([]);
     for (const bad of ['', 'now', '2026-10-29T12:00:00', '${{ github.event.head_commit.timestamp }}', '2026-10-29 12:00']) expect(problems({ ...nightlyWith, 'merged-at': bad }).length, bad).toBeGreaterThan(0);
+  });
+
+  // C3: the gate action's mode for the job baseline-check
+  const baselineWith: Record<string, string> = { mode: 'baseline-check', [GH_IN]: GH, [FP_IN]: sref('PIPEGEN_FP_KEY') };
+  it('RENDERER_INPUTS gate, mode baseline-check: github-token and fp-key, each only the exact expression', () => {
+    expect(problems(baselineWith)).toEqual([]);
+    expect(problems({ mode: 'baseline-check' })).toEqual([]);   // the referee decides which inputs are needed; the row decides which are allowed
+    for (const bad of [sref('PIPEGEN_FP_KEY'), sref('OTHER'), `${GH} `, 'ghp_x', '${{ github.token }}', '']) expect(problems({ ...baselineWith, [GH_IN]: bad }).length, bad).toBeGreaterThan(0);
+    for (const bad of [GH, sref('OTHER'), `${sref('PIPEGEN_FP_KEY')} `, 'k', '']) expect(problems({ ...baselineWith, [FP_IN]: bad }).length, bad).toBeGreaterThan(0);
+  });
+  it('RENDERER_INPUTS gate, mode baseline-check: no gate, find-run or nightly input is allowed under it (whenWith)', () => {
+    const others: Record<string, string> = {
+      jobs: '${{ toJSON(needs) }}', 'job-list': list, 'not-proven': '[]', skipped: '[]', policy: '{"block":["critical","high"],"warn":["medium"]}', 'protected-paths': '[".github/workflows/**"]',
+      'block-from': '${{ vars.PIPEGEN_BLOCK_FROM }}', 'block-from-recorded': '2026-11-01', sha: '${{ github.sha }}', 'central-workflow': 'acme/pipelines/.github/workflows/acme--merge.yml', 'central-sha': 'a'.repeat(40),
+      'merged-at': '2026-10-29T12:00:00Z', ...SCRUB_SAMPLE_FOR_BASELINE,
+    };
+    for (const [input, value] of Object.entries(others)) {
+      const pr = problems({ ...baselineWith, [input]: value });
+      expect(pr.some((x) => x.includes(`input ${input} `) && /allowed only in mode/.test(x)), `${input}: ${pr.join(' | ')}`).toBe(true);
+    }
+  });
+  it('RENDERER_INPUTS gate: baseline-check is one of the modes, and the other modes still refuse its sole inputs where they did', () => {
+    expect(problems({ ...gateWith, mode: 'baseline-check' }).length).toBeGreaterThan(0);   // gate inputs under baseline-check
+    expect(problems({ ...findRunWith, [FP_IN]: sref('PIPEGEN_FP_KEY') }).some((x) => /fp-key/.test(x))).toBe(true);   // fp-key still not under find-run
+    expect(problems({ ...nightlyWith, [FP_IN]: sref('PIPEGEN_FP_KEY') }).some((x) => /fp-key/.test(x))).toBe(true);   // nor under nightly
+    expect(GATE_MODES).toContain('baseline-check');
   });
 
   const SCRUB_SAMPLE: Record<string, string> = {

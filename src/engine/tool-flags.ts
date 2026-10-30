@@ -590,7 +590,7 @@ const inScrubMode = (input: RendererInput): RendererInput => ({ ...input, whenWi
 
 // ---------- the gate action's modes (Plan C ruling B3) ----------
 /** The modes of the gate action pipegen renders today (Plan I adds `merged-red` to this list and its row). */
-export const GATE_MODES = ['scrub', 'stage', 'gate', 'find-run', 'nightly'] as const;
+export const GATE_MODES = ['scrub', 'stage', 'gate', 'find-run', 'nightly', 'baseline-check'] as const;
 /** An input valid only in the listed modes: the whole `with:` must name one of them. */
 const inModes = (modes: readonly (typeof GATE_MODES)[number][]): NonNullable<RendererInput['whenWith']> => ({
   check: (all) => modes.some((m) => all.mode === m), describe: `only in mode ${modes.join(' or ')}`,
@@ -725,7 +725,7 @@ export const RENDERER_INPUTS: Readonly<Record<string, Readonly<Record<string, Re
     raw: SCRUB_RAW,
     out: SCRUB_OUT,
     // the fingerprint key: the scrub hashes with it, the gate checks the baseline's MAC with it (ruling B6)
-    'fp-key': modeInput(['scrub', 'gate'], /^\$\{\{ secrets\.PIPEGEN_FP_KEY \}\}$/, '${{ secrets.PIPEGEN_FP_KEY }}'),
+    'fp-key': modeInput(['scrub', 'gate', 'baseline-check'], /^\$\{\{ secrets\.PIPEGEN_FP_KEY \}\}$/, '${{ secrets.PIPEGEN_FP_KEY }}'),
     // gate (ruling B3)
     jobs: modeInput(['gate'], /^\$\{\{ toJSON\(needs\) \}\}$/, '${{ toJSON(needs) }}'),
     'job-list': literalInput(['gate'], jobListLiteralProblem, 'a job list literal (a JSON list of entries)'),
@@ -736,8 +736,9 @@ export const RENDERER_INPUTS: Readonly<Record<string, Readonly<Record<string, Re
     // gate and nightly
     'block-from': modeInput(['gate', 'nightly'], /^\$\{\{ vars\.PIPEGEN_BLOCK_FROM \}\}$/, '${{ vars.PIPEGEN_BLOCK_FROM }}'),
     'block-from-recorded': modeInput(['gate', 'nightly'], DATE_TEXT_RE, 'a date YYYY-MM-DD'),
-    // gate, find-run and nightly: the workflow token, nothing else
-    'github-token': modeInput(['gate', 'find-run', 'nightly'], /^\$\{\{ secrets\.GITHUB_TOKEN \}\}$/, '${{ secrets.GITHUB_TOKEN }}'),
+    // gate, find-run, nightly and baseline-check: the workflow token, nothing else
+    'github-token': modeInput(['gate', 'find-run', 'nightly', 'baseline-check'], /^\$\{\{ secrets\.GITHUB_TOKEN \}\}$/, '${{ secrets.GITHUB_TOKEN }}'),
+    // baseline-check (C3): github-token and fp-key only, above
     // find-run
     sha: modeInput(['find-run'], /^\$\{\{ (?:github\.sha|github\.event\.workflow_run\.head_sha) \}\}$/, '${{ github.sha }} or ${{ github.event.workflow_run.head_sha }}'),
     'central-workflow': modeInput(['find-run'], PLAIN_REL_RE, 'a plain relative path of the central workflow'),

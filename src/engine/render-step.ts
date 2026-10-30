@@ -559,6 +559,18 @@ export function renderGateStep(gate: ReviewedTool, entries: readonly JobListEntr
 }
 
 /**
+ * The gate step in mode `baseline-check` (Plan C task C3), for the job `baseline-check`: the workflow token and the fingerprint key,
+ * nothing else (the gate checks the stored baseline's signature with the key and reads artifacts with the token). Like the gate job,
+ * that job holds no checkout of repo code beyond what its policy row allows, and no other step of the gate action.
+ */
+export function renderBaselineCheckStep(gate: ReviewedTool): RenderedStep {
+  checkGateEntry(gate);
+  return actionStep(gate, 'pipegen: check the stored baseline', {}, {
+    mode: 'baseline-check', 'github-token': '${{ secrets.GITHUB_TOKEN }}', 'fp-key': '${{ secrets.PIPEGEN_FP_KEY }}',
+  });
+}
+
+/**
  * The scan fact of a rendered tool: the id of its run step (the last step with a `run`) and the reviewed tool id with the
  * format of its result, for the scrub cross-checks (JobContext.scans). Null when the tool writes no findings file (format none or junit).
  */

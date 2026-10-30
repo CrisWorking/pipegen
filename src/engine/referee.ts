@@ -651,6 +651,16 @@ function judgeGateSteps(fc: FileCtx, id: string, where: string, j: Obj, judged: 
   const bad = issueFor(fc);
   const gateKind = judged.filter((x) => x.kind === 'gate');
   const gates = gateKind.filter((x) => x.step.with?.mode === 'gate');
+  // C3: the gate action's mode baseline-check (it verifies the stored baseline's signature) runs in the job baseline-check, exactly
+  // once and alone, and in no other job
+  const baselineSteps = gateKind.filter((x) => x.step.with?.mode === 'baseline-check');
+  if (id === 'baseline-check') {
+    if (gateKind.length !== 1 || baselineSteps.length !== 1) {
+      bad('permissions', `${where} must run the gate action exactly once, in mode baseline-check (it has ${gateKind.length} gate step${gateKind.length === 1 ? '' : 's'}${gateKind.length === 0 ? '' : `, modes ${gateKind.map((x) => show(String(x.step.with?.mode ?? 'none'))).join(', ')}`}); this job checks the stored baseline and decides nothing else.`);
+    }
+    return;
+  }
+  if (baselineSteps.length > 0) bad('permissions', `${where} runs the gate action in mode baseline-check, which only the job baseline-check does.`);
   if (id !== 'gate') {
     if (gates.length > 0) bad('not-gate-readable', `${where} runs the gate action in mode gate, which only the job gate does (the required check ${GATE_CHECK_NAME} is its result).`);
     return;
@@ -1116,7 +1126,7 @@ function judgeTemplate(fc: FileCtx, at: (m: string) => string, t: ReviewedTool, 
   const all = Object.fromEntries(Object.entries(withs).map(([k, v]) => [k, typeof v === 'string' ? v : String(v)]));
   for (const [k, v] of Object.entries(fixed)) if (withs[k] !== v) bad('template', at(`${t.id} must have ${safeText(k, 40)}: ${show(v)} (a reviewed fixed input).`));
   // the gate action does one thing per mode and has no default: a step without a mode would run whatever the action's own default is
-  if (t.id === PIPEGEN_ACTION_IDS.gate && withs.mode === undefined) bad('template', at(`${t.id} must set its mode (scrub, stage, gate, find-run or nightly); the action has no reviewed default.`));
+  if (t.id === PIPEGEN_ACTION_IDS.gate && withs.mode === undefined) bad('template', at(`${t.id} must set its mode (scrub, stage, gate, find-run, nightly or baseline-check); the action has no reviewed default.`));
   for (const [k, values] of Object.entries(t.choices)) {
     const v = withs[k];
     if (v === undefined) bad('template', at(`${t.id} must set its choice ${show(k)} (left out, the action's own default would run, which nobody reviewed).`));

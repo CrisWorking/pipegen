@@ -152,13 +152,13 @@ describe('referee: the renderer and the referee agree', () => {
     // every job shape of JOB_STEP_POLICY, under its real job id (fix round 1): the step allowlist and the renderer agree
     const download = (): RenderedStep => renderPlatformStep('download-artifact', p, { name: 'pipegen-out-sast--app', path: '${{ runner.temp }}/pipegen-out/pipegen-out-sast--app' });
     const harden = renderStep(specFor(entry('bullfrog'), { needId: 'egress' }), entry('bullfrog'), p, ctx).steps;
-    // each mode of the gate action in the job that runs it (Plan C ruling B3); baseline-check's mode is Plan C's task 3, find-run stands in for it here
+    // each mode of the gate action in the job that runs it (Plan C ruling B3); baseline-check has its own gate mode since C3
     const gateAct = (mode: string): RenderedStep => ({ name: 'gate', uses: GATE.step.action?.uses as string, with: { mode } });
     const watchAct: RenderedStep = { name: 'watch', uses: WATCHER.step.action?.uses as string, with: { mode: 'watcher' } };
     const [checkout] = prelude();
     const co = checkout as RenderedStep;
     jobs['code-scanning'] = job([download(), renderPlatformStep('upload-sarif', p, { sarif_file: sarif, category: 'pipegen-sast' })], { permissions: { contents: 'read', 'security-events': 'write', actions: 'read' } });
-    jobs['baseline-check'] = job([download(), gateAct('find-run')], { permissions: { contents: 'read', actions: 'read' } });
+    jobs['baseline-check'] = job([download(), gateAct('baseline-check')], { permissions: { contents: 'read', actions: 'read' } });
     jobs.sign = job([
       co, download(),
       renderPlatformStep('docker-login', p, loginInputs(), { registry: 'ghcr.io' }),
