@@ -69,11 +69,12 @@ function input(over: Partial<GateInput> = {}): GateInput {
   return {
     event: pr(), checks: [], baseScan: { result: 'success', commit: BASE }, ancestry: { base: BASE, head: MERGE, isAncestor: true },
     baseline: null, sameRunTools: ['osv-scanner', 'trivy-image', 'trivy-licence'], installing: false,
-    diff: { added: new Map(), complete: true }, rangeScans: [], mode: 'warn', policy: DEFAULT_POLICY,
-    notProvenNeeds: [], skipped: [], settingsErrors: [], integrity: [], ...over,
+    diff: { added: new Map(), complete: true, commit: MERGE }, rangeScans: [], mode: 'warn', policy: DEFAULT_POLICY,
+    notProvenNeeds: [], skipped: [], settingsErrors: [], integrity: [], floorNeeds: [], ...over,
   };
 }
-const added = (m: Record<string, number[]>): GateInput['diff'] => ({ added: new Map(Object.entries(m).map(([k, v]) => [k, new Set(v)])), complete: true });
+/** Added lines of the scanned tree: the diff of base.sha against github.sha (the merge commit), so `commit` is github.sha. */
+const added = (m: Record<string, number[]>, commit = MERGE): GateInput['diff'] => ({ added: new Map(Object.entries(m).map(([k, v]) => [k, new Set(v)])), complete: true, commit });
 const blockText = (r: ReturnType<typeof decideGate>): string => [...r.blockReasons, ...r.blocking.map((b) => b.ruleId)].join('\n');
 
 // ---------- Plan C Task 2 (renamed per DECISIONS #110) ----------
@@ -170,7 +171,7 @@ describe('decideGate: the plan\'s rules', () => {
   });
   it('gate: integrity finding on installing PR → warning', () => {
     const i: Finding = { tool: 'pipegen', ruleId: 'integrity:protected-path', severity: 'high', file: '.github/workflows/pipegen.yml', message: 'changed', fingerprint: hex('i') };
-    const r = decideGate(input({ installing: true, integrity: [i] }));
+    const r = decideGate(input({ installing: true, integrity: [i], checks: [check(entry(), [])] }));   // a check: an empty job list blocks (fix round 1 m4)
     expect(r.pass).toBe(true);
     expect(r.summary).toMatch(/installing pipegen: review these files/);
   });
@@ -500,7 +501,7 @@ describe('decideGate: the decision per fingerprint form', () => {
     const s = leakF({ fpBy: 'nokey', fingerprint: `${SEC}${hex('nl')}`, line: undefined });
     expect(decideGate(input({ diff: added({ 'a.js': [1] }), checks: [check(se, [s], [s])] })).pass).toBe(false);
     const t = leakF({ fpBy: 'line', fingerprint: `${SEC}${hex('t')}`, line: 3 });
-    expect(decideGate(input({ diff: { added: new Map(), complete: false }, checks: [check(se, [t], [t])] })).pass).toBe(false);
+    expect(decideGate(input({ diff: { added: new Map(), complete: false, commit: MERGE }, checks: [check(se, [t], [t])] })).pass).toBe(false);
   });
   it('position form, untouched: the count still decides (an extra untouched copy is new)', () => {
     const s = leakF({ fpBy: 'line', fingerprint: `${SEC}${hex('u')}`, line: 3 });
@@ -692,6 +693,253 @@ describe('decideGate is pure', () => {
     const b = decideGate(i);
     expect(JSON.stringify(a)).toBe(JSON.stringify(b));
     expect(JSON.stringify(i, (_k, v: unknown) => (v instanceof Map ? [...v] : v instanceof Set ? [...v] : v))).toBe(before);
+  });
+});
+
+// ---------- C2 fix round 1 (review-C2.md, task-C2-fix-round-1.md) ----------
+
+describe('fix round 1: the diff and the findings must be on one commit; a PR without a diff fails closed (I1, I2)', () => {
+  const se = entry({ needId: 'secrets', job: 'secrets', category: 'secrets', tool: 'betterleaks' });
+  const nokey = (line: number, file = 'a.js'): ScrubbedFinding => leakF({ fpBy: 'nokey', fingerprint: `${SEC.replace(':', '-nokey:')}${hex(`${file}:${line}`)}`, file, line });
+  it('P6: a diff whose line numbers are of another commit (the PR head) than the scanned one (github.sha) is incomplete: every position form is new', () => {
+    // the base branch moved: the secret replaced in place is at merge-commit line 15, the PR files API says head line 10
+    const r = decideGate(input({ event: pr(true), diff: added({ 'a.js': [10] }, HEAD), checks: [check(se, [nokey(15)], [nokey(15)])] }));
+    expect(r.pass).toBe(false);
+    expect(r.blocking[0]?.reason).toMatch(/incomplete|another commit/);
+    expect(r.notes.join('\n')).toMatch(/not the scanned commit/);
+    // the same with the diff of the scanned tree (base.sha against github.sha): untouched line 15 stays old, touched line 15 is new
+    expect(decideGate(input({ event: pr(true), diff: added({ 'a.js': [10] }), checks: [check(se, [nokey(15)], [nokey(15)])] })).pass).toBe(true);
+    expect(decideGate(input({ event: pr(true), diff: added({ 'a.js': [15] }), checks: [check(se, [nokey(15)], [nokey(15)])] })).pass).toBe(false);
+  });
+  it('P1: a pull_request event with no diff (C5 could not build it) makes every position form new, with a note; push alone is counts only', () => {
+    const r = decideGate(input({ event: pr(true), diff: null, checks: [check(se, [nokey(10)], [nokey(10)])] }));
+    expect(r.pass).toBe(false);
+    expect(r.notes.join('\n')).toMatch(/the pull request's diff is missing/);
+    // P1b: with the diff touching the line, it blocks too
+    expect(decideGate(input({ event: pr(true), diff: added({ 'a.js': [10] }), checks: [check(se, [nokey(10)], [nokey(10)])] })).pass).toBe(false);
+    // P45: push, counts only
+    expect(decideGate(input({ event: push(), diff: null, ancestry: { base: BASE, head: HEAD, isAncestor: true }, checks: [check(se, [nokey(3)], [nokey(3)])] })).pass).toBe(true);
+    // P46: merge_group is not push: no diff means every position form is new
+    const mg: GateEvent = { name: 'merge_group', sha: HEAD, payload: { repository: { id: 7 }, merge_group: { base_sha: BASE, head_sha: HEAD } } };
+    expect(decideGate(input({ event: mg, diff: null, ancestry: { base: BASE, head: HEAD, isAncestor: true }, checks: [check(se, [nokey(3)], [nokey(3)])] })).pass).toBe(false);
+    // a content form is still counted when the diff is missing
+    const s = leakF({ fingerprint: `${SEC}${hex('content')}` });
+    expect(decideGate(input({ event: pr(), diff: null, checks: [check(se, [s], [s])] })).pass).toBe(true);
+  });
+  it('P39: a diff path spelled otherwise than the scrub maps it (./a.js) does not match: documented as the C4/C5 contract, and the finding is judged as untouched', () => {
+    expect(decideGate(input({ event: pr(true), diff: added({ './a.js': [10] }), checks: [check(se, [nokey(10)], [nokey(10)])] })).pass).toBe(true);
+    expect(readFileSync('gate/src/decide.ts', 'utf8')).toMatch(/repository paths exactly as the scrub maps them/);
+    expect(readFileSync('gate/src/decide.ts', 'utf8')).toMatch(/base\.sha.*github\.sha/s);
+  });
+});
+
+describe('fix round 1: MAL- by any advisory id or alias (I3)', () => {
+  const dep = entry({ needId: 'deps', job: 'deps', category: 'deps', tool: 'osv-scanner' });
+  const adv = (ruleId: string, advisoryIds?: string[]): ScrubbedFinding => fnd({ tool: 'osv-scanner', ruleId, severity: 'high', file: 'package-lock.json', line: undefined, fingerprint: hex(ruleId), ...(advisoryIds === undefined ? {} : { advisoryIds }) });
+  it('P4b: an old finding shown as GHSA-2v46-p5h4-248w whose alias is MAL-2025-46969 blocks in warn mode', () => {
+    const g = adv('GHSA-2v46-p5h4-248w', ['GHSA-2v46-p5h4-248w', 'MAL-2025-46969']);
+    const r = decideGate(input({ checks: [check(dep, [g], [g])] }));
+    expect(r.pass).toBe(false);
+    expect(r.blocking[0]?.reason).toMatch(/malicious package/);
+    // the same id with no MAL- alias is an old high: a warning
+    const plain = adv('GHSA-2v46-p5h4-248w', ['GHSA-2v46-p5h4-248w', 'CVE-2025-1']);
+    expect(decideGate(input({ checks: [check(dep, [plain], [plain])] })).pass).toBe(true);
+  });
+  it('P4a: the MAL- id as the rule id (the real chalk capture shows it so) blocks when old', () => {
+    const m = adv('MAL-2025-46969', ['MAL-2025-46969', 'GHSA-2v46-p5h4-248w']);
+    expect(decideGate(input({ checks: [check(dep, [m], [m])] })).pass).toBe(false);
+  });
+  it('MAL- in a warn-first check still blocks (reading 3)', () => {
+    const wf = entry({ needId: 'dependency-review', job: 'dependency-review', category: 'dependency-review', tool: 'osv-scanner', warnFirst: { since: '2026-10-01' } });
+    const m = adv('GHSA-1', ['GHSA-1', 'MAL-2026-3']);
+    expect(decideGate(input({ checks: [check(wf, [m], [m])] })).pass).toBe(false);
+  });
+});
+
+describe('fix round 1: the minors (m1-m7) and reading 1', () => {
+  const se = entry({ needId: 'secrets', job: 'secrets', category: 'secrets', tool: 'betterleaks' });
+  it('m1: a custom policy is used in the decision: block [critical, high, medium] blocks an old medium in block mode', () => {
+    const m = fnd({ severity: 'medium', fingerprint: hex('med') });
+    const policy = { block: ['critical', 'high', 'medium'], warn: ['low'] };
+    const r = decideGate(input({ mode: 'block', policy, checks: [check(entry(), [m], [m])] }));
+    expect(r.pass).toBe(false);
+    expect(r.blocking.map((b) => b.severity)).toEqual(['medium']);
+    const low = fnd({ severity: 'low', fingerprint: hex('low') });
+    expect(decideGate(input({ mode: 'block', policy, checks: [check(entry(), [low], [low])] })).warnings.map((w) => w.severity)).toEqual(['low']);
+  });
+  it('m2: two range findings with one fingerprint and one HEAD occurrence: the second blocks', () => {
+    const s = leakF({ fingerprint: `${SEC}${hex('twice')}` });
+    const r = decideGate(input({ checks: [check(se, [s], [s])], rangeScans: [{ tool: 'betterleaks', findings: [s, s] }] }));
+    expect(r.pass).toBe(false);
+    expect(r.blocking.filter((b) => b.job === 'commit range')).toHaveLength(1);
+  });
+  it('m2: a floor need by category (migration-check is full-tests) in not-proven or with warn-first blocks', () => {
+    const mc = jobEntry({ needId: 'migration-check', job: 'migration-check', category: 'full-tests' });
+    expect(decideGate(input({ notProvenNeeds: ['migration-check'], checks: [jobCheck(mc, 'success')] })).blockReasons.join()).toMatch(/floor need migration-check/);
+    expect(decideGate(input({ checks: [jobCheck({ ...mc, warnFirst: { since: '2026-10-01' } }, 'success')] })).blockReasons.join()).toMatch(/warn-first can't be set on floor need migration-check/);
+    expect(decideGate(input({ notProvenNeeds: ['migration-check'], checks: [jobCheck(mc, 'failure')] })).failedJobs).toHaveLength(1);
+  });
+  it('m2: a multi-line position form whose first line is the only added line is touched (the long-range branch)', () => {
+    const s = leakF({ fpBy: 'line', fingerprint: `${SEC}${hex('ml')}`, line: 10, endLine: 40 });
+    expect(decideGate(input({ diff: added({ 'a.js': [10] }), checks: [check(se, [s], [s])] })).pass).toBe(false);
+    expect(decideGate(input({ diff: added({ 'a.js': [40] }), checks: [check(se, [s], [s])] })).pass).toBe(false);
+    expect(decideGate(input({ diff: added({ 'a.js': [9, 41] }), checks: [check(se, [s], [s])] })).pass).toBe(true);
+  });
+  it('m2: every repo-derived field of the summary goes through safeMarkdown exactly once (tool, job, rule, file, message, notes, integrity file, not-scanned file, displayPath, skipped reason, tool-error reason, file problem)', () => {
+    const evil = 'x*y_[z](http://e.vil)<b>@me #12 $x\\';
+    const once = safeMarkdown(evil);
+    const twice = safeMarkdown(once);
+    const e = entry({ tool: evil, job: evil, needId: 'iac', category: 'iac' });
+    const r = decideGate(input({
+      checks: [
+        { ...check(e, [fnd({ tool: evil, severity: 'critical', ruleId: evil, file: evil, message: evil }), leakF({ ruleId: `${SEC}not-scanned`, fpBy: 'file', file: evil, line: 1, endLine: 2 }), leakF({ file: undefined, uriUnmapped: true, displayPath: evil })]), file: { ...fileOf([fnd({ tool: evil, severity: 'critical', ruleId: evil, file: evil, message: evil }), leakF({ ruleId: `${SEC}not-scanned`, fpBy: 'file', file: evil, line: 1, endLine: 2 }), leakF({ file: undefined, uriUnmapped: true, displayPath: evil })], [evil]) } },
+        { ...check(entry({ needId: 'sast', job: 'sast2' }), []), outputs: { status: 'tool-error', error: evil } },
+        { ...check(entry({ needId: 'deps', job: 'deps', category: 'deps', tool: 'osv-scanner' }), []), file: { ...fileOf([]), problem: evil } },
+        jobCheck(jobEntry(), 'skipped'),
+      ],
+      skipped: [{ needId: 'unit-tests', reason: evil }],
+      integrity: [{ tool: 'pipegen', ruleId: 'integrity:protected-path', severity: 'high', file: evil, message: 'm', fingerprint: hex('i') }],
+      settingsErrors: [evil],
+    }));
+    const sections: Record<string, RegExp> = {
+      heading: new RegExp(`#### ${once.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`),
+    };
+    for (const [k, re] of Object.entries(sections)) expect(r.summary, k).toMatch(re);
+    const count = (hay: string, needle: string): number => hay.split(needle).length - 1;
+    expect(count(r.summary, once)).toBeGreaterThanOrEqual(12);
+    expect(r.summary).not.toContain(twice);
+    expect(r.summary).not.toContain(evil);
+    for (const head of ['### Not scanned', '### Skipped', '### Integrity', '### Notes', '### Tool errors']) {
+      const part = r.summary.slice(r.summary.indexOf(head)).split('\n### ')[0] as string;
+      expect(part, head).toContain(once);
+    }
+  });
+  it('m3: a baseline count that is not a finite whole number ≥ 0 makes the baseline invalid: no base, every finding new', () => {
+    const crit = fnd({ severity: 'critical', fingerprint: hex('c') });
+    for (const v of [Infinity, Number.NaN, 0.5, -1, Number.MAX_VALUE]) {
+      const r = decideGate(input({ baseline: { tools: ['semgrep'], counts: new Map([[countKeyOf('sast', crit), v]]) }, checks: [check(entry(), [crit, crit, crit], [crit, crit, crit])] }));
+      expect(r.pass, String(v)).toBe(false);
+      expect(r.blocking, String(v)).toHaveLength(3);
+      expect(r.notes.join('\n')).toMatch(/baseline is invalid/);
+    }
+    expect(decideGate(input({ baseline: { tools: ['semgrep'], counts: new Map([[countKeyOf('sast', crit), 3]]) }, checks: [check(entry(), [crit, crit, crit])] })).pass).toBe(true);
+  });
+  it('m4: no checks at all blocks; a floor need of the draft with no check in the job list is missing and blocks', () => {
+    expect(decideGate(input({ checks: [] })).pass).toBe(false);
+    const lint = jobCheck(jobEntry({ needId: 'lint', job: 'lint', category: 'lint' }), 'success');
+    const r = decideGate(input({ floorNeeds: ['secrets', 'sast'], checks: [lint, check(entry(), [])] }));
+    expect(r.pass).toBe(false);
+    expect(r.failedJobs.map((f) => [f.needId, f.reason])).toEqual([['secrets', 'missing']]);
+    expect(r.blockReasons.join()).toMatch(/secrets is not in the job list/);
+    expect(decideGate(input({ floorNeeds: ['secrets', 'sast', 'gate'], checks: [check(se, []), check(entry(), [])] })).pass).toBe(true);
+    // a floor test need the user skipped (--skip tests) is shown as skipped, not missing
+    const sk = decideGate(input({ floorNeeds: ['unit-tests'], skipped: [{ needId: 'unit-tests', reason: '--skip tests' }], checks: [lint] }));
+    expect(sk.pass).toBe(true);
+    expect(sk.skipped.map((s) => s.needId)).toEqual(['unit-tests']);
+  });
+  it('m5: a commit-range finding is matched to the HEAD scan only by a content-form fingerprint: a position-form match is no match (P8)', () => {
+    const nk = leakF({ fpBy: 'nokey', fingerprint: `${SEC.replace(':', '-nokey:')}${hex('a.js:5')}`, line: 5 });
+    const r = decideGate(input({ event: pr(true), diff: added({}), checks: [check(se, [nk], [nk])], rangeScans: [{ tool: 'betterleaks', findings: [nk] }] }));
+    expect(r.pass).toBe(false);
+    expect(r.blocking.map((b) => b.job)).toEqual(['commit range']);
+    // a range content form against a HEAD position form of the same fingerprint text is no match either
+    const content = leakF({ fingerprint: `${SEC}${hex('same')}` });
+    const asLine = { ...content, fpBy: 'line' as const };
+    expect(decideGate(input({ checks: [check(se, [asLine], [asLine])], rangeScans: [{ tool: 'betterleaks', findings: [content] }] })).blocking.map((b) => b.job)).toEqual(['commit range']);
+    // and a range position form is never matched, even by a HEAD content form with the same fingerprint text
+    expect(decideGate(input({ checks: [check(se, [content], [content])], rangeScans: [{ tool: 'betterleaks', findings: [asLine] }] })).blocking.map((b) => b.job)).toEqual(['commit range']);
+  });
+  it('m6: the installing exception never applies to a leak: a new leak with no base result of the leak scanner blocks on an installing PR (P49); a non-leak finding still warns', () => {
+    expect(decideGate(input({ installing: true, checks: [check(se, [leakF()], null)] })).pass).toBe(false);
+    const e = entry({ needId: 'image-scan', job: 'image-scan--app', category: 'image-scan', tool: 'trivy-image' });
+    expect(decideGate(input({ installing: true, checks: [check(e, [fnd({ tool: 'trivy-image', severity: 'critical', file: undefined })], null)] })).pass).toBe(true);
+    // a secret finding of a non-secrets check too (a trivy-image secret)
+    expect(decideGate(input({ installing: true, checks: [check(e, [leakF({ tool: 'trivy-image', fpBy: 'line', file: undefined })], null)] })).pass).toBe(false);
+  });
+  it('m7: a missing (or skipped, cancelled) warn-first job blocks like any listed job; only a failing one warns (P30)', () => {
+    const wf = jobEntry({ needId: 'lint', job: 'lint', category: 'lint', warnFirst: { since: '2026-10-01' } });
+    for (const res of ['missing', 'skipped', 'cancelled'] as const) {
+      const r = decideGate(input({ checks: [jobCheck(wf, res)] }));
+      expect(r.pass, res).toBe(false);
+      expect(r.failedJobs[0]?.reason, res).toBe(res);
+    }
+    expect(decideGate(input({ checks: [jobCheck(wf, 'failure')] })).pass).toBe(true);
+  });
+  it('a job-status check\'s outputs are never read: a failure with a tool-error output is a failed check, not a tool error', () => {
+    const r = decideGate(input({ checks: [{ ...jobCheck(jobEntry(), 'failure'), outputs: { status: 'tool-error', error: 'x' } }] }));
+    expect(r.failedJobs).toHaveLength(1);
+    expect(r.toolErrors).toEqual([]);
+  });
+  it('reading 1: an unmapped secret blocks every run until the file is renamed or the secret removed, and the summary says so with the display path', () => {
+    const s = leakF({ file: undefined, uriUnmapped: true, displayPath: 'k\\xff.js' });
+    const r = decideGate(input({ event: push(), diff: null, ancestry: { base: BASE, head: HEAD, isAncestor: true }, checks: [check(se, [s], [s])] }));
+    expect(r.pass).toBe(false);
+    expect(r.summary).toContain('it blocks every run until the file is renamed or the secret removed');
+    expect(r.summary).toContain(safeMarkdown('k\\xff.js'));
+  });
+});
+
+// ---------- the property grid, fix round 1: the base state and the ways a secret becomes new ----------
+
+describe('fix round 1 grid: every way a secret is new, under every base state, never passes; a non-secret critical follows the decision table', () => {
+  type Way = 'fresh-region' | 'position-touched' | 'incomplete-diff' | 'pr-diff-null' | 'other-commit-diff' | 'no-repo-file' | 'unmapped' | 'range-only' | 'not-scanned' | 'not-scanned-keyless';
+  const WAYS: Way[] = ['fresh-region', 'position-touched', 'incomplete-diff', 'pr-diff-null', 'other-commit-diff', 'no-repo-file', 'unmapped', 'range-only', 'not-scanned', 'not-scanned-keyless'];
+  type BaseCase = 'verified' | 'unverified' | 'base-tool-error' | 'no-base-scan-job' | 'base-status-missing' | 'baseline';
+  const BASES: BaseCase[] = ['verified', 'unverified', 'base-tool-error', 'no-base-scan-job', 'base-status-missing', 'baseline'];
+  const se = (over: Partial<JobListEntry> = {}) => entry({ needId: 'secrets', job: 'secrets', category: 'secrets', tool: 'betterleaks', ...over });
+  const img = entry({ needId: 'image-scan', job: 'image-scan--app', category: 'image-scan', tool: 'trivy-image' });
+  function way(w: Way): { e: JobListEntry; head: ScrubbedFinding[]; base: ScrubbedFinding[]; diff: GateInput['diff']; range?: GateInput['rangeScans'] } {
+    const pos = leakF({ fpBy: 'nokey', fingerprint: `${SEC.replace(':', '-nokey:')}${hex('p')}`, line: 7 });
+    switch (w) {
+      case 'fresh-region': return { e: se(), head: [leakF({ fingerprint: `${SEC}${hex('fresh')}` })], base: [leakF({ fingerprint: `${SEC}${hex('old')}` })], diff: added({}) };
+      case 'position-touched': return { e: se(), head: [pos], base: [pos], diff: added({ 'a.js': [7] }) };
+      case 'incomplete-diff': return { e: se(), head: [pos], base: [pos], diff: { added: new Map(), complete: false, commit: MERGE } };
+      case 'pr-diff-null': return { e: se(), head: [pos], base: [pos], diff: null };
+      case 'other-commit-diff': return { e: se(), head: [pos], base: [pos], diff: added({ 'a.js': [3] }, HEAD) };
+      case 'no-repo-file': { const s = leakF({ tool: 'trivy-image', fpBy: 'line', file: undefined, line: undefined, fingerprint: `${SEC}${hex('img')}` }); return { e: img, head: [s], base: [s], diff: added({}) }; }
+      case 'unmapped': { const s = leakF({ file: undefined, uriUnmapped: true, fingerprint: `${SEC}${hex('um')}` }); return { e: se(), head: [s], base: [s], diff: added({}) }; }
+      case 'range-only': return { e: se(), head: [], base: [], diff: added({}), range: [{ tool: 'betterleaks', findings: [leakF({ fingerprint: `${SEC}${hex('gone')}` })] }] };
+      case 'not-scanned': { const n = leakF({ ruleId: `${SEC}not-scanned`, fpBy: 'file', fingerprint: `${SEC}${hex('ns-new')}`, line: 1, endLine: 4 }); return { e: se(), head: [n], base: [], diff: added({}) }; }
+      case 'not-scanned-keyless': { const n = leakF({ ruleId: `${SEC}not-scanned`, fpBy: 'nokey', fingerprint: `${SEC.replace(':', '-nokey:')}${hex('ns')}`, line: 1, endLine: 4 }); return { e: se(), head: [n], base: [n], diff: added({}) }; }
+    }
+  }
+  function withBase(c: CheckInput, b: BaseCase, base: ScrubbedFinding[]): { c: CheckInput; over: Partial<GateInput> } {
+    switch (b) {
+      case 'verified': return { c, over: {} };
+      case 'unverified': return { c, over: { baseScan: { result: 'success', commit: 'a'.repeat(40) } } };
+      case 'base-tool-error': return { c: { ...c, base: { outputs: { status: 'tool-error', error: 'x' } } }, over: {} };
+      case 'no-base-scan-job': { const { base: _b, ...rest } = c; return { c: rest, over: { baseScan: null } }; }
+      case 'base-status-missing': { const { base: _b, ...rest } = c; return { c: rest, over: {} }; }
+      case 'baseline': return { c, over: { baseline: { tools: [c.entry.tool ?? ''], counts: new Map(base.map((f) => [countKeyOf(c.entry.job, f), 1])) } } };
+    }
+  }
+  it('leaks, 10 ways × 6 base states × installing × fork × warn-first/not-proven on the check itself × a duplicate check: none passes', () => {
+    let runs = 0;
+    for (const w of WAYS) for (const b of BASES) for (let mask = 0; mask < 32; mask++) {
+      const bit = (n: number): boolean => ((mask >> n) & 1) === 1;
+      const x = way(w);
+      const target = bit(2) ? { ...x.e, warnFirst: { since: '2026-10-01' } } : x.e;   // floor: warn-first on it is itself a settings error
+      const { c, over } = withBase(check(target, x.head, x.base), b, x.base);
+      const checks = bit(4) ? [c, c] : [c];
+      const r = decideGate(input({
+        installing: bit(0), event: pr(bit(1)), diff: x.diff, rangeScans: x.range ?? [], mode: bit(3) ? 'block' : 'warn',
+        notProvenNeeds: bit(3) && x.e !== img ? [x.e.needId] : [], checks, ...over,   // not-proven on the bad check itself when it is a floor need (a settings error); image-scan is not one, and a not-proven check never blocks by design
+      }));
+      runs++;
+      if (r.pass) throw new Error(`${w} / ${b} / mask ${mask} passed: ${r.summary}`);
+    }
+    expect(runs).toBe(WAYS.length * BASES.length * 32);
+  });
+  it('a non-secret new critical: blocks under every base state, except a scanner that could not run on the base of an installing PR (a warning, by the table)', () => {
+    const crit = fnd({ tool: 'trivy-config', severity: 'critical', fingerprint: hex('nc') });
+    const iac = entry({ needId: 'iac', job: 'iac', category: 'iac', tool: 'trivy-config' });
+    for (const b of BASES) for (const installing of [false, true]) {
+      const { c, over } = withBase(check(iac, [crit], []), b, []);
+      const r = decideGate(input({ installing, checks: [c], ...over }));
+      const couldNotRun = b === 'no-base-scan-job' || b === 'base-status-missing';
+      expect(r.pass, `${b} installing=${installing}`).toBe(installing && couldNotRun);
+      if (installing && couldNotRun) expect(r.warnings.map((w) => w.isNew)).toEqual([undefined]);
+    }
   });
 });
 

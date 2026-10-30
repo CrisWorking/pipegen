@@ -22,11 +22,12 @@
 //     baseline when it covers the tool, else the base scan. A scanner that could not run on the base: warnings on an installing
 //     PR, else every finding new.
 //  5. New, per finding form (C1b I1, the brief): content forms are counted per (check, tool, fingerprint); position forms are
-//     also new when the PR touched any of their lines or they have no repository file (only with a diff; without one, counts
-//     only); an unmapped secret is always new; an unmapped non-secret is counted per (check, tool, rule); `secret:not-scanned`
+//     also new when the PR touched any of their lines or they have no repository file (only with a diff of the scanned commit;
+//     counts only on a push without one; a missing or other-commit diff on any other event makes them all new, fix round 1 I1/I2);
+//     an unmapped secret is always new; an unmapped non-secret is counted per (check, tool, rule); `secret:not-scanned`
 //     is new unless the same file hash (the `file` form) is in the base.
 //  6. What blocks: a check that is not required (not proven, ZAP while unverified, non-blocking) never blocks. A MAL- advisory
-//     blocks even when old (S8). A new critical, high or secret blocks in any mode, warn-first too (rule 7, #13). A new
+//     (the rule id or any alias, fix round 1 I3) blocks even when old (S8). A new critical, high or secret blocks in any mode, warn-first too (rule 7, #13). A new
 //     dependency-review finding blocks. An unknown licence warns ("needs a human"). Warn-first: the rest warns. Block mode:
 //     the policy. Warn mode: critical, high and medium warn; low and info are counted.
 //  7. Secrets in the PR's commit range (C1b I2): a range finding the HEAD scan does not have is always new and blocks.
@@ -74,8 +75,14 @@ export interface CheckInput {
 export interface RangeScan { tool: string; findings?: ScrubbedFinding[]; toolError?: string }
 /** The trusted baseline (C3): counts by countKeyOf, and the tools it covers (a tool it does not cover falls back to the base scan). */
 export interface Baseline { tools: readonly string[]; counts: ReadonlyMap<string, number> }
-/** The PR's added lines per repository path (C4 addedLines); `complete: false` when the file list or a patch was cut. */
-export interface PrDiff { added: ReadonlyMap<string, ReadonlySet<number>>; complete: boolean }
+/**
+ * The PR's added lines (C4/C5). `added` holds repository paths exactly as the scrub maps them, and line numbers of the SCANNED
+ * tree: C4/C5 build it by diffing `pull_request.base.sha` against `github.sha` (the merge commit the scanners checked out; its first
+ * parent is the base), never from the PR files API, whose patches number lines of the PR head (review-C2 I1). `commit` is the
+ * commit those line numbers refer to: when it is not `event.sha`, the diff counts as incomplete. `complete: false` when the file
+ * list or a patch was cut (300 or more files in a compare answer, a text file with no patch).
+ */
+export interface PrDiff { added: ReadonlyMap<string, ReadonlySet<number>>; complete: boolean; commit: string }
 
 export interface GateInput {
   /** The event (base and head commits, fork or not, all from the payload). */
@@ -92,7 +99,10 @@ export interface GateInput {
   sameRunTools: readonly string[];
   /** The base commit has no pipegen install (C4 baseHasInstall), decided by the base's files, never by the branch name. */
   installing: boolean;
-  /** The PR's added lines (C4); null on an event without a diff (push, merge_group, schedule). */
+  /**
+   * The PR's added lines of the scanned tree (see PrDiff); null when there is none. Only on `push` does null mean "counts only":
+   * on any other event a missing diff makes every position-form finding new (review-C2 I2).
+   */
   diff: PrDiff | null;
   /** Secrets scans of the PR's commit range; empty when there is none on this event. */
   rangeScans: readonly RangeScan[];
@@ -108,6 +118,11 @@ export interface GateInput {
   settingsErrors: readonly string[];
   /** C4 integrity findings, already filtered by a head-commit code-owner approval. */
   integrity: readonly Finding[];
+  /**
+   * The floor need ids the draft has (C5 takes them from the trusted job list's draft, beside the `job-list` literal). Each must have
+   * a check in `checks` (by need id), else it is a missing check and blocks; `gate` itself is pipegen's job, never a check.
+   */
+  floorNeeds: readonly string[];
 }
 
 /** A finding as decided: which check, new or old (`undefined`: no base to tell, an installing PR), and why. */
@@ -220,6 +235,8 @@ const isFloorNeed = (needId: string): boolean =>
   FLOOR.has(needId) || (Object.hasOwn(NEED_ID_CATEGORY, needId) && FLOOR.has((NEED_ID_CATEGORY as Readonly<Record<string, string>>)[needId] as string));
 const isFloorEntry = (e: JobListEntry): boolean => isFloorNeed(e.needId) || FLOOR.has(e.category);
 const serious = (f: ScrubbedFinding): boolean => f.severity === 'critical' || f.severity === 'high' || f.secret;
+/** S8, review-C2 I3: malware when the rule id or ANY advisory id or alias the scanner gave starts with MAL-. */
+const isMalicious = (f: ScrubbedFinding): boolean => [f.ruleId, ...(f.advisoryIds ?? [])].some((id) => /^MAL-/i.test(id.trim()));
 const isPosition = (f: ScrubbedFinding): boolean => FORM_OF[f.fpBy] === 'position' || (f.secret && f.tool.startsWith('trivy'));
 
 type FileState = { kind: 'ok'; read: ScrubbedResult } | { kind: 'absent' } | { kind: 'tool-error'; why: string } | { kind: 'tampered'; why: string } | { kind: 'missing-file' };
@@ -243,7 +260,7 @@ function countsOf(job: string, fs: readonly ScrubbedFinding[]): Map<string, numb
   return m;
 }
 
-function touched(diff: PrDiff, f: ScrubbedFinding): boolean {
+function touched(diff: Pick<PrDiff, 'added'>, f: ScrubbedFinding): boolean {
   const set = f.file === undefined ? undefined : diff.added.get(f.file);
   if (set === undefined || set.size === 0) return false;
   if (f.line === undefined) return true;   // no line, in a file the PR changed (C1c open point)
@@ -289,7 +306,23 @@ export function decideGate(i: GateInput): GateResult {
   const fork = isFork(i.event.payload);
   const baseState = verifyBase(i);
   if (baseState.kind === 'unverified') note(`no base: ${baseState.why}, so every finding compared with the base scan is new`);
-  if (i.diff === null) note('no diff on this event: position-based fingerprints are compared by count only');
+  // the diff (review-C2 I1, I2): counts only on a push with none; elsewhere a missing diff, or one of another commit, is incomplete
+  let diff: { added: ReadonlyMap<string, ReadonlySet<number>>; complete: boolean } | null;
+  if (i.diff === null && i.event.name === 'push') { diff = null; note('no diff on this push: position-based fingerprints are compared by count only'); }
+  else if (i.diff === null) { diff = { added: new Map(), complete: false }; note(`the pull request's diff is missing on this ${i.event.name} event, so every position-based fingerprint is new`); }
+  else if (i.diff.commit !== i.event.sha) { diff = { added: i.diff.added, complete: false }; note('the diff\'s line numbers are of a commit that is not the scanned commit (github.sha), so every position-based fingerprint is new'); }
+  else diff = i.diff;
+  // the baseline's counts (review-C2 m3): a count that is not a finite whole number >= 0 makes the whole baseline invalid
+  const baselineValid = i.baseline === null || [...i.baseline.counts.values()].every((v) => Number.isSafeInteger(v) && v >= 0);
+  if (!baselineValid) note('the baseline is invalid (a count that is not a whole number of at least 0): there is no base for the tools it covers, so their findings are new');
+  // the job list itself (review-C2 m4)
+  if (i.checks.length === 0) block('the job list is empty: no check ran, so nothing is proven');
+  for (const n of new Set(i.floorNeeds)) {
+    if (n === 'gate' || i.checks.some((c) => c.entry.needId === n)) continue;
+    if (skippedBy.has(n)) continue;
+    failedJobs.push({ needId: n, job: n, reason: 'missing' });
+    block(`required check ${n} is not in the job list (missing)`);
+  }
   const ranSkipped = new Set<string>();
   const headFindings: { job: string; f: ScrubbedFinding }[] = [];
 
@@ -329,7 +362,7 @@ export function decideGate(i: GateInput): GateResult {
       const text = `${name} did not succeed (${c.result})`;
       if (level === 'not-proven') warn(`not-proven check ${text}: a warning only`);
       else if (level === 'advisory') note(`non-blocking check ${text}`);
-      else if (e.warnFirst !== undefined && !findings) warn(`warn-first check ${text}: a warning until a reviewed pull request makes it blocking`);
+      else if (e.warnFirst !== undefined && !findings && c.result === 'failure') warn(`warn-first check ${text}: a warning until a reviewed pull request makes it blocking`);
       else { failedJobs.push(ref(c.result)); block(`required check ${text}`); }
       state(`failed (${c.result})`);
       continue;
@@ -365,7 +398,7 @@ export function decideGate(i: GateInput): GateResult {
     const sameRun = e.tool !== undefined && i.sameRunTools.includes(e.tool);
     let counts: ReadonlyMap<string, number> | undefined;
     let noBase: 'installing' | 'new' | undefined;
-    if (!sameRun && i.baseline !== null && e.tool !== undefined && i.baseline.tools.includes(e.tool)) counts = i.baseline.counts;
+    if (!sameRun && i.baseline !== null && e.tool !== undefined && i.baseline.tools.includes(e.tool)) { if (baselineValid) counts = i.baseline.counts; else noBase = 'new'; }
     else if (bf.kind === 'ok' && baseState.kind === 'verified') counts = countsOf(e.job, bf.read.findings);
     else if (bf.kind === 'absent' && baseState.kind !== 'unverified') {
       noBase = i.installing ? 'installing' : 'new';
@@ -378,13 +411,14 @@ export function decideGate(i: GateInput): GateResult {
     for (const d of decided) {
       const set = (isNew: boolean | undefined, reason: string): void => { d.isNew = isNew; d.reason = reason; };
       if (d.ruleId === NOT_SCANNED_RULE_ID && d.fpBy !== 'file') { set(true, 'new: not scanned, and without a key its file can not be matched with the base'); continue; }
-      if (d.secret && d.uriUnmapped) { set(true, 'new: a secret in a file that could not be mapped to a repository path'); continue; }
-      if (noBase === 'installing' && d.ruleId !== NOT_SCANNED_RULE_ID) { set(undefined, 'no base: the scanner couldn\'t run on the base commit (installing pipegen)'); continue; }
+      if (d.secret && d.uriUnmapped) { set(true, 'new: a secret in a file whose path could not be mapped to a repository path; it blocks every run until the file is renamed or the secret removed'); continue; }
+      // the installing exception is for a scanner with nothing to scan on the base (no Dockerfile yet); a secrets scanner always can (review-C2 m6)
+      if (noBase === 'installing' && d.ruleId !== NOT_SCANNED_RULE_ID && !d.secret && e.category !== 'secrets') { set(undefined, 'no base: the scanner couldn\'t run on the base commit (installing pipegen)'); continue; }
       if (counts === undefined) { set(true, 'new: no base to compare with'); continue; }
-      if (isPosition(d) && i.diff !== null) {
+      if (isPosition(d) && diff !== null) {
         if (d.file === undefined) { set(true, 'new: a position-based fingerprint with no repository file'); continue; }
-        if (!i.diff.complete) { set(true, 'new: the pull request\'s file list is incomplete'); continue; }
-        if (touched(i.diff, d)) { set(true, 'new: on a changed line of this pull request'); continue; }
+        if (!diff.complete) { set(true, 'new: the pull request\'s diff is missing, incomplete or of another commit'); continue; }
+        if (touched(diff, d)) { set(true, 'new: on a changed line of this pull request'); continue; }
       }
       const k = countKeyOf(e.job, d);
       const g = groups.get(k);
@@ -405,7 +439,7 @@ export function decideGate(i: GateInput): GateResult {
         if (to === 'block') blocking.push(d); else if (to === 'warn') warnings.push(d); else counted[d.severity]++;
       };
       if (level !== 'required') { put(shown ? 'warn' : 'count', level === 'advisory' ? 'a non-blocking check: never blocks' : 'not proven: never blocks'); continue; }
-      if (/^MAL-/.test(d.ruleId)) { put('block', 'a malicious package advisory (MAL-): blocks even when old'); continue; }
+      if (isMalicious(d)) { put('block', 'a malicious package advisory (MAL-): blocks even when old'); continue; }
       if (d.isNew === undefined) { put(shown ? 'warn' : 'count'); continue; }
       if (d.isNew && serious(d)) { put('block', 'a new critical, high or secret finding blocks in any mode'); continue; }
       if (e.warnFirst !== undefined) { put(shown ? 'warn' : 'count', 'warn-first: a warning until a reviewed pull request makes the check blocking'); continue; }
@@ -427,10 +461,12 @@ export function decideGate(i: GateInput): GateResult {
     }
     if (rs.findings === undefined) { block(`scanner ${name} did not report`); continue; }
     const inHead = new Map<string, number>();
-    for (const { f } of headFindings) if (f.tool === rs.tool) { const k = `${f.tool}\0${f.fingerprint}`; inHead.set(k, (inHead.get(k) ?? 0) + 1); }
+    // matched by a CONTENT-form fingerprint only: a position form names a place, not a secret, so a range finding matched only by
+    // its place is not matched (review-C2 m5)
+    for (const { f } of headFindings) if (f.tool === rs.tool && !isPosition(f)) { const k = `${f.tool}\0${f.fingerprint}`; inHead.set(k, (inHead.get(k) ?? 0) + 1); }
     for (const f of rs.findings) {
       const k = `${f.tool}\0${f.fingerprint}`;
-      const left = inHead.get(k) ?? 0;
+      const left = isPosition(f) ? 0 : inHead.get(k) ?? 0;
       if (left > 0) { inHead.set(k, left - 1); continue; }
       blocking.push({ ...f, needId: 'secrets', job: 'commit range', isNew: true, reason: 'new: a secret in the pull request\'s commits that is not in its last commit; it was pushed, so treat it as leaked and rotate it' });
     }
