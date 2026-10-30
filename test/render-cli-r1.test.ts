@@ -497,6 +497,10 @@ describe('round 2: oxlint finds the closure\'s tsgolint, never the repo\'s (ruli
     const r = render('oxlint-typeaware');
     const sb = sandbox();
     const bin = fakeNodeDir(sb, 24);
+    // the step lints a list of tracked files (C4 fix round 2): the workspace is a git repository with one
+    spawnSync('git', ['init', '-q', sb.ws]);
+    writeFileSync(join(sb.ws, 'a.js'), 'export const a = 1;\n');
+    spawnSync('git', ['-C', sb.ws, 'add', 'a.js']);
     for (const step of [lastRun(r)]) {
       const res = exec(step, sb, withNode(stepEnv(step, sb), bin));
       expect(res.status, res.stderr).toBe(0);

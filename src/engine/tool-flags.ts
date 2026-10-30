@@ -37,6 +37,9 @@ export const BETTERLEAKS_FORBIDDEN_SUBCOMMANDS = ['validate', 'analyze', 'github
 /** The only betterleaks subcommands pipegen runs: local scans. */
 export const BETTERLEAKS_SUBCOMMANDS = ['git', 'dir', 'stdin'] as const;
 
+/** The extensions oxlint reads (its docs: js, mjs, cjs, jsx, ts, mts, cts, tsx, vue, astro, svelte). */
+export const OXLINT_EXTENSIONS = ['js', 'mjs', 'cjs', 'jsx', 'ts', 'mts', 'cts', 'tsx', 'vue', 'astro', 'svelte'] as const;
+
 // ---------- argv allowlists for every cli entry (Plan P Task 6 fix round 1, rulings P19-P21, P24, P25, P27) ----------
 
 /**
@@ -131,6 +134,14 @@ export interface ArgvPolicy extends CommandPolicy {
    * file of this name under the step folder (links included, never followed) and writes pipegen's own, whose `lines` are reviewed
    * constants. A file at the scan root replaces the defaults (measured on semgrep 1.181.0).
    */
+  /**
+   * The tool lints a directory with a walker that skips files a `.gitignore` names, and has no switch to turn that off (oxlint 1.89.0:
+   * its --no-ignore covers .eslintignore only). It does lint every file it is GIVEN, so the run step builds the list itself:
+   * `git ls-files -z -s -- .` in the step's folder, regular files only (mode 100644/100755, no link), with these extensions, given to the
+   * tool through `xargs -0 -r` after `--` (C4 fix round 2, review-C4-r1; the tool's command then names no path). An empty list is
+   * "0 files checked": the step succeeds with a notice.
+   */
+  readonly fileList?: { readonly extensions: readonly string[] };
   readonly scopeIgnore?: { readonly file: string; readonly lines: readonly string[] };
   /**
    * The secrets tools (C1c, reviews C1b-r1 R1-C3 and C1b-r2 R2-C1): the tool scans pipegen's stage folder, never the checkout. The job's
@@ -282,7 +293,8 @@ const POLICIES = {
   },
   // Oxlint 1.89.0
   'oxlint-typeaware': { method: 'npm', package: 'oxlint', npmBin: 'bin/oxlint', closureEnv: { OXLINT_TSGOLINT_PATH: 'node_modules/.bin/tsgolint' },
-    exe: 'oxlint', dialect: 'long', sub: [], flags: { 'type-aware': 'bool', 'deny-warnings': 'bool' }, required: { 'type-aware': 'true', 'deny-warnings': 'true' },
+    exe: 'oxlint', dialect: 'long', sub: [], flags: { 'type-aware': 'bool', 'deny-warnings': 'bool', 'no-ignore': 'bool' }, required: { 'type-aware': 'true', 'deny-warnings': 'true', 'no-ignore': 'true' },
+    fileList: { extensions: OXLINT_EXTENSIONS },
     config: { flag: '--config', content: '{ "categories": { "correctness": "error" } }\n', fileName: 'oxlintrc.json' },
   },
   // Prettier 3.9.10: check only (never --write); the repo's own Prettier config is used (catalogue §2)

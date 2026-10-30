@@ -3,6 +3,7 @@
 // (b) the tools that honour .gitignore run with the flag that turns it off (checked against the pinned binaries' --help and by running
 // them: ruff 0.17.1, prettier 3.9.10, knip 6.42.1, osv-scanner v2.7.0, jscpd v5.4.2), and (c) bandit's discovery of a `.bandit` file is
 // replaced by an explicit empty one. oxlint 1.89.0 has no such switch (its --no-ignore only covers .eslintignore): see task-C4-report.md.
+import { readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
 import { integrityFindings, type PrFile } from '../gate/src/integrity.js';
 import { effectiveProtectedPaths } from '../src/engine/reviewed.js';
@@ -16,7 +17,7 @@ const protectedNow = (path: string): boolean => integrityFindings(pr([file(path)
 
 describe('the real reviewed list protects tool configs at any depth', () => {
   it('tests/fixtures/.bandit and services/api/mypy.ini are protected (the review-C4 probes)', () => {
-    for (const p of ['tests/fixtures/.bandit', 'services/api/.bandit', '.bandit', 'services/api/mypy.ini', 'a/b/.coveragerc', 'web/knip.json', 'web/.c8rc.json', 'web/.prettierrc.json', 'web/eslint.config.mjs', 'x/.hadolint.yaml', 'x/biome.json', 'x/.gitleaksignore', 'x/.trivyignore', 'x/.semgrepignore']) {
+    for (const p of ['tests/fixtures/.bandit', 'services/api/.bandit', '.bandit', 'services/api/mypy.ini', 'a/b/.coveragerc', 'web/knip.json', 'web/.c8rc.json', 'web/.prettierrc.json', 'x/biome.json', 'x/.gitleaksignore', 'x/.trivyignore', 'x/.semgrepignore']) {
       expect(protectedNow(p), p).toBe(true);
     }
   });
@@ -81,5 +82,49 @@ describe('the entries changed here are reviewed by delegation (DECISIONS 105) on
       expect(t.reviewedBy, id).toBe('Claude delegated DECISIONS 105');
       expect(t.reviewedAt, id).toBe('2026-10-30');
     }
+  });
+});
+
+// ======================= fix round 2 (ruling 5): a scope for every config name =======================
+import { loadReviewed } from '../src/engine/reviewed.js';
+import { PROTECTED_PATHS_BASE } from '../src/types.js';
+
+describe('configFiles are nested (any depth) or root (the root and the service roots only)', () => {
+  const list = reviewedList();
+  const protectedWith = (path: string, roots: string[] = []): boolean =>
+    integrityFindings(pr([file(path)]), effectiveProtectedPaths(list, roots), []).some((f) => f.ruleId === 'integrity:protected-path');
+  it('effectiveProtectedPaths: the base list, then nested names as written, then root names as "/name" and "/<service>/name"', () => {
+    const p = effectiveProtectedPaths(list, ['services/api', '.', 'web/']);
+    expect(p.slice(0, PROTECTED_PATHS_BASE.length)).toEqual(PROTECTED_PATHS_BASE);
+    expect(p).toContain('.bandit');            // nested
+    expect(p).toContain('/ruff.toml');         // root
+    expect(p).toContain('/services/api/ruff.toml');
+    expect(p).toContain('/web/ruff.toml');
+    expect(p).not.toContain('/./ruff.toml');
+    expect(p).not.toContain('ruff.toml');
+    expect(new Set(p).size).toBe(p.length);
+    expect(effectiveProtectedPaths([])).toEqual(PROTECTED_PATHS_BASE);
+  });
+  it('nested names (bandit, mypy, prettier configs, biome, c8, knip, vitest, coverage) are protected at any depth', () => {
+    for (const f of ['a/b/.bandit', 'a/mypy.ini', 'a/b/.prettierrc.json', 'a/biome.json', 'a/.c8rc.json', 'a/knip.json', 'a/vitest.config.ts', 'a/.coveragerc', 'a/.oxlintrc.json']) expect(protectedWith(f), f).toBe(true);
+  });
+  it('root names (the tools with a pinned config that read nothing below it) are protected at the root and at the service roots only', () => {
+    for (const f of ['ruff.toml', '.ruff.toml', 'eslint.config.mjs', '.hadolint.yaml', '.kube-linter.yaml', '.jscpd.json', '.poutine.yml', '.prettierignore', 'trivy.yaml', '.trivyignore', '.gitleaks.toml', 'lefthook.yml', '.syft.yaml', 'zizmor.yml']) {
+      expect(protectedWith(f), f).toBe(true);
+      expect(protectedWith(`pkgs/x/${f}`), `pkgs/x/${f}`).toBe(['lefthook.yml', '.trivyignore'].includes(f));   // these two are in PROTECTED_PATHS_BASE (any depth)
+      expect(protectedWith(`services/api/${f}`, ['services/api']), `services/api/${f}`).toBe(true);
+    }
+  });
+  it('no name is both nested and root, and a root name is plain (a slash entry is anchored anyway)', () => {
+    for (const t of list) {
+      const roots = t.rootConfigFiles ?? [];
+      for (const n of roots) expect(t.configFiles, `${t.id} ${n}`).not.toContain(n);
+    }
+  });
+  it('every tool with a pinned config flag has its discovery names root or nested on purpose; the tool list says why in YAML comments', () => {
+    const raw = readFileSync('data/reviewed-tools.yml', 'utf8');
+    expect(raw).toMatch(/rootConfigFiles/);
+    expect(raw).toMatch(/# Config scope/);
+    expect(loadReviewed().filter((t) => (t.rootConfigFiles ?? []).length > 0).length).toBeGreaterThanOrEqual(12);
   });
 });

@@ -248,6 +248,8 @@ const entrySchema = z.strictObject({
   fixedInputs: fixedSchema,
   choices: z.record(z.string().regex(INPUT_RE), z.array(z.string().min(1).max(100).pipe(safeValue)).min(1).max(32)),
   configFiles: z.array(z.string().regex(REL_GLOB_RE)).max(32),
+  /** Names protected only at the repository root and the service roots (see ReviewedTool.rootConfigFiles); never also in configFiles. */
+  rootConfigFiles: z.array(z.string().regex(REL_GLOB_RE)).max(32).optional(),
   /**
    * Sections of shared files the tool reads (ruling P23): `<file>:<section>`, e.g. `pyproject.toml:tool.mypy`,
    * `setup.cfg:coverage:*`, `package.json:c8`. The v0.2 gate protects these sections without protecting the whole file.
@@ -1285,9 +1287,15 @@ export function reviewedFor(need: Need, language: Language, list: ReviewedTool[]
     && (mode === 'audit' || t.proofs >= 1));
 }
 
-/** PROTECTED_PATHS_BASE, then every configFiles entry of the tools in use, each once, in order. */
-export function effectiveProtectedPaths(inUse: ReviewedTool[]): string[] {
-  return [...new Set([...PROTECTED_PATHS_BASE, ...inUse.flatMap((t) => t.configFiles)])];
+/**
+ * PROTECTED_PATHS_BASE, then every configFiles entry of the tools in use (a name without a slash is protected at any depth by the gate), then
+ * every rootConfigFiles name as `/name` (the repository root) and `/<service>/name` for each service root other than `.`, each once, in order.
+ * A leading `/` tells the gate to match the root only.
+ */
+export function effectiveProtectedPaths(inUse: ReviewedTool[], serviceRoots: readonly string[] = []): string[] {
+  const roots = [...new Set(serviceRoots.map((r) => r.replace(/^(?:\.\/)+|\/+$/g, '')).filter((r) => r !== '' && r !== '.'))];
+  const rooted = inUse.flatMap((t) => (t.rootConfigFiles ?? []).flatMap((n) => (n.includes('/') ? [n] : [`/${n}`, ...roots.map((r) => `/${r}/${n}`)])));
+  return [...new Set([...PROTECTED_PATHS_BASE, ...inUse.flatMap((t) => t.configFiles), ...rooted])];
 }
 
 /**

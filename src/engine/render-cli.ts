@@ -395,6 +395,38 @@ function rulesStep(tool: ReviewedTool, a: NonNullable<ArgvPolicy['archive']>, ar
   }, `tool-install-${sha16(`rules:${artifact}`)}`);
 }
 
+// ---------- explicit file lists (ArgvPolicy.fileList) ----------
+
+export { OXLINT_EXTENSIONS } from './tool-flags.js';
+
+/**
+ * Shell lines that write the NUL-separated list of the regular tracked files with these extensions to `list` (a quoted shell word):
+ * `git ls-files -z -s -- .` gives `mode sha stage<TAB>path`; only modes 100644 and 100755 are kept (a link is 120000, a submodule 160000);
+ * extensions are compared in lower case. Runs inside the step's folder; `sys` is the clean-env array of the prologue.
+ */
+export function fileListLines(extensions: readonly string[], list: string): string[] {
+  if (extensions.length === 0 || !extensions.every((e) => /^[a-z][a-z0-9]{0,9}$/.test(e))) throw new Error('the extensions of a file list are plain words');
+  return [
+    '"${sys[@]}" git ls-files -z -s -- . | while IFS= read -r -d \'\' rec; do',
+    '  mode="${rec%% *}"',
+    '  path="${rec#*$\'\\t\'}"',
+    '  case "$mode" in 100644|100755) ;; *) continue ;; esac',
+    `  case "\${path,,}" in ${extensions.map((e) => `*.${e}`).join('|')}) printf '%s\\0' "$path" ;; esac`,
+    `done > ${list}`,
+  ];
+}
+/** The run lines for a file list: nothing to lint is "0 files checked" (a notice, success); otherwise the tool runs through xargs, `--` before the files; its exit code (xargs gives 123 when a batch failed) is kept in rc. */
+export function fileListRun(launch: string, list: string): string[] {
+  return [
+    `if [ ! -s ${list} ]; then`,
+    '  echo "pipegen: 0 files to check (this folder has no tracked file the tool reads)"',
+    '  echo "::notice::the tool checked 0 files"',
+    'else',
+    `  xargs -0 -r -a ${list} ${launch} -- || rc=$?`,
+    'fi',
+  ];
+}
+
 // ---------- the main entry ----------
 
 /** The text a run line starts a tool with: the env -i array, then the launcher. The referee finds trivy's launch by these (final review minor 10), so a change here changes its check too. */
@@ -656,9 +688,14 @@ export function renderCliTool({ spec, tool, service, ctx, hooks, options }: CliA
   ];
   const launch = (words: readonly string[]): string => `${LAUNCH_ENV} ${prefix}${words.length === 0 ? '' : ` ${words.join(' ')}`}`;
   const chain = [launch(built.main), ...built.then.map(launch)].join(' && ');
+  const fl = pol.fileList;
+  if (fl !== undefined && (built.then.length > 0 || out !== null || staged !== undefined)) return refuse(`${show(tool.id)} lints a file list, which only a single command without a result file can.`);
+  let listLines: string[];
+  try { listLines = fl === undefined ? [] : [`list="$RUNNER_TEMP/pipegen-files/${artifact}"`, 'mkdir -p "$RUNNER_TEMP/pipegen-files"', 'rm -f -- "$list"', ...fileListLines(fl.extensions, '"$list"')]; } catch { return refuse(`The file list of ${show(tool.id)} is not a list of plain extensions.`); }
+  const runLines = fl === undefined ? [`${chain} || rc=$?`] : fileListRun(launch(built.main), '"$list"');
   const run = script([
     ...prologue(artifact, nodeMajor === undefined ? {} : { nodeMajor }), ...tuneComments, ...vars, ...installLines, ...cdLines(spec.workingDir), ...pathChecks, ...prep, ...cfgLines, ...scopeLines, ...stageLines, ...preCheck,
-    ...closureVars, ...allowlist(pathValue, passed, [], dynamicEnv), ...afterAllow, 'rc=0', `${chain} || rc=$?`, ...postCheck, 'exit "$rc"',
+    ...closureVars, ...allowlist(pathValue, passed, [], dynamicEnv), ...afterAllow, ...listLines, 'rc=0', ...runLines, ...postCheck, 'exit "$rc"',
   ]);
   // a tool that runs the repo's own code is marked, so the referee can apply its order rule (S6 c); the id is not `pipegen-…`, which a job's dedupe may drop
   // fail closed: the run is repo code unless the policy says it only reads (readsOnly), and never for an app-running category

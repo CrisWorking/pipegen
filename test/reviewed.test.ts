@@ -1642,9 +1642,14 @@ describe('data/reviewed-tools.yml', () => {
   });
 
   // entries re-reviewed by delegation (DECISIONS 105) after the owner's 2026-10-28 review; add an id here on purpose, never skip it
-  const DELEGATED: Record<string, string> = { 'actions-setup-node': '2026-10-29', betterleaks: '2026-10-30', gitleaks: '2026-10-30', 'trivy-config': '2026-10-29', 'trivy-image': '2026-10-29', 'trivy-licence': '2026-10-29', 'docker-login-action': '2026-10-29', eslint: '2026-10-29', 'eslint-typescript': '2026-10-29', nuclei: '2026-10-29', semgrep: '2026-10-29',
-    // C4 fix round 1 (review-C4 finding 1): tools that honour .gitignore run without it, bandit gets an explicit empty --ini, .gitignore is no longer a protected config
-    ruff: '2026-10-30', 'ruff-format': '2026-10-30', prettier: '2026-10-30', knip: '2026-10-30', 'osv-scanner': '2026-10-30', jscpd: '2026-10-30', bandit: '2026-10-30', 'oxlint-typeaware': '2026-10-30' };
+  const DELEGATED: Record<string, string> = {
+    'actions-setup-node': '2026-10-29', betterleaks: '2026-10-30', gitleaks: '2026-10-30', 'docker-login-action': '2026-10-29', nuclei: '2026-10-29',
+    // C4 fix rounds 1 and 2 (review-C4): tools that honour .gitignore run without it, bandit gets an explicit empty --ini, and every config name
+    // has a scope (nested or root, see rootConfigFiles in the data file); oxlint lints an explicit file list
+    semgrep: '2026-10-30', 'trivy-config': '2026-10-30', 'trivy-image': '2026-10-30', 'trivy-licence': '2026-10-30', eslint: '2026-10-30', 'eslint-typescript': '2026-10-30',
+    ruff: '2026-10-30', 'ruff-format': '2026-10-30', prettier: '2026-10-30', knip: '2026-10-30', 'osv-scanner': '2026-10-30', jscpd: '2026-10-30', bandit: '2026-10-30', 'oxlint-typeaware': '2026-10-30',
+    lefthook: '2026-10-30', syft: '2026-10-30', zizmor: '2026-10-30', hadolint: '2026-10-30', 'kube-linter': '2026-10-30', poutine: '2026-10-30',
+  };
 
   it('data: every catalogue entry is reviewed by the owner (2026-10-28, DECISIONS #104) or by delegation (listed), with proofs 0', () => {
     const list = real();
@@ -1663,7 +1668,7 @@ describe('data/reviewed-tools.yml', () => {
     expect(t?.fixedInputs.args).toContain('--max-target-bytes=0');
     expect(ARGV_POLICIES.semgrep?.required?.['max-target-bytes']).toBe('0');
     expect(t?.reviewedBy).toBe('Claude delegated DECISIONS 105');
-    expect(t?.reviewedAt).toBe('2026-10-29');
+    expect(t?.reviewedAt).toBe('2026-10-30');
     // a command without it, or with any other size limit, does not load
     const cmd = (t?.step.cli?.command ?? []).filter((x) => x !== '--max-target-bytes=0');
     rejects([semgrepEntry(undefined, cmd, (t?.fixedInputs.args ?? []).filter((x) => x !== '--max-target-bytes=0'))], /max-target-bytes/);
@@ -1953,7 +1958,7 @@ describe('Task 6 review fix round 1 (P19-P27)', () => {
       expect(t?.fixedInputs.args, id).toEqual(expect.arrayContaining(['--exit-code', '10']));
       expect(ARGV_POLICIES[id]?.findingsExit, id).toEqual([10]);
       expect(t?.reviewedBy, id).toBe('Claude delegated DECISIONS 105');
-      expect(t?.reviewedAt, id).toBe(id === 'betterleaks' || id === 'gitleaks' ? '2026-10-30' : '2026-10-29');   // the secrets entries were re-reviewed for C1c
+      expect(t?.reviewedAt, id).toBe('2026-10-30');   // re-reviewed for C1c (secrets) and for the config scopes (C4 fix round 2)
       // the old value (1), also only in the command or only in the fixed args, no longer loads
       refused(both(realEntry(id), swap('10', '1')), /--exit-code 10|--exit-code is a fixed arg: exactly 10|exit-code is one of "10"/);
     }
@@ -2047,7 +2052,7 @@ describe('Task 6 review fix round 1 (P19-P27)', () => {
     expect(t('prettier')?.configSections).toEqual(['package.json:prettier']);
     expect(t('ruff')?.configSections).toEqual(['pyproject.toml:tool.ruff']);
     expect(t('bandit')?.configSections).toEqual(['pyproject.toml:tool.bandit']);
-    expect(t('oxlint-typeaware')?.configFiles).toEqual(expect.arrayContaining(['.eslintignore', '**/.oxlintrc.json']));
+    expect(t('oxlint-typeaware')?.configFiles).toEqual(['.oxlintrc.json', 'oxlint.config.ts', '**/.oxlintrc.json']);   // no ignore files: oxlint lints an explicit list with --no-ignore (C4 fix round 2)
     expect(t('prettier')?.configFiles).toEqual(expect.arrayContaining(['**/.prettierrc', '**/.prettierrc.*', '.editorconfig']));
     expect(t('biome')?.configFiles).toEqual(expect.arrayContaining(['**/biome.json', '**/biome.jsonc']));
     expect(t('c8')?.configFiles).toEqual(expect.arrayContaining(['.c8rc.*', '.nycrc.*']));

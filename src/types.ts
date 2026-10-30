@@ -190,7 +190,8 @@ export interface ReviewedTool {
     config?: { content: string; passAs: { flag: string } | { input: string } };   // explicit pinned config, so repo config files are never picked up silently
   };
   choices: Record<string, string[]>;                       // the only inputs the AI may set, each limited to these enum values
-  configFiles: string[];                                   // config/ignore files the tool auto-loads from a repo (e.g. '.gitleaks.toml', '.trivyignore'); added to the protected paths
+  configFiles: string[];                                   // config/ignore files the tool auto-loads from a repo (e.g. 'mypy.ini', '.bandit'); added to the protected paths, a name without a slash at ANY depth (C4 review: tools find configs in sub-folders)
+  rootConfigFiles?: string[];                              // config/ignore files that count only at the repository root and the service roots: the tool has a pinned config and reads nothing below it (C4 fix round 2); each entry in the data file says why
   configSections?: string[];                               // Plan P Task 6 (P23): '<file>:<section>' of shared files the tool reads (e.g. 'pyproject.toml:tool.mypy'); the v0.2 gate protects them. Matching (review M-R5): <file> is a repo-relative path or glob (as configFiles); <section> is the dotted table path (TOML), the INI section name or the top-level JSON key, where `*` matches any run of characters (`setup.cfg:mypy-*`, `setup.cfg:coverage:*`); a change inside a matching section, or to the section itself, counts
   wrappedImage?: { ref: string; digest: string };          // Plan P Task 6 (P26): the image an action's action.yml runs, and the digest that ref resolved to when pinned
   reviewedBy: string; reviewedAt: string; proofs: number;  // proofs = passed Plan E runs; full runs need proofs >= 1
