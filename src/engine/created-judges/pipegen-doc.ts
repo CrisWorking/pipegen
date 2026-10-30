@@ -22,8 +22,9 @@ export const PIPEGEN_REPO = 'crisworking/pipegen';
 const SHA_RE = /^[0-9a-f]{40}$/;
 const OWNER_RE = /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})$/;
 const REPO_RE = /^(?!\.+$)[A-Za-z0-9._-]{1,100}$/;
-// C0 controls except tab, LF and CR; DEL and C1; zero-width, bidirectional and word-joiner controls; the BOM
-const INVISIBLE_RE = /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f\u200b-\u200f\u2028\u2029\u202a-\u202e\u2060-\u2064\u2066-\u2069\ufeff]/;
+// C0 controls except tab, LF and CR; DEL and C1 (Cc); every format character (Cf: zero-width, bidirectional, soft hyphen, BOM, the tag characters,
+// U+061C), line and paragraph separators (Zl, Zp), private use (Co), and the blank-looking Hangul fillers (Lo). All of them also inside fences.
+const INVISIBLE_RE = /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f\p{Cf}\p{Zl}\p{Zp}\p{Co}\u3164\u115f\u1160\uffa0]/u;
 
 const TEXT_CH = /^[\p{L}\p{N} .,;:!?'"()/\-_+=%*~]$/u;
 const URL_CH = /^[A-Za-z0-9._~:/?#&=%+-]+$/;
@@ -46,6 +47,7 @@ function charProblem(c: string): string | null {
 function textProblem(t: string, o: PipegenDocOpts): string | null {
   if (t === '') return 'an empty heading, list item or text';
   if (t.startsWith(' ')) return 'text that starts with a space (an indented line)';
+  if (/\p{Mn}/u.test(t)) return 'a combining mark or variation selector (not allowed outside code fences)';
   if (/~{3,}/.test(t)) return 'a run of three tildes (a code fence in a form pipegen does not write)';
   let outside = '';   // the text outside inline-link urls: no scheme:// or www. may appear there
   for (let i = 0; i < t.length;) {
@@ -77,6 +79,7 @@ function textProblem(t: string, o: PipegenDocOpts): string | null {
     outside += c;
     i++;
   }
+  if (/:[A-Za-z0-9_+-]+:/.test(outside)) return 'an emoji shortcode (:name:), which GitHub renders as an image';
   if (outside.includes('://') || /www\./i.test(outside)) return 'a bare URL (a link must be an inline [label](url) to this repository, docs.github.com or pipegen\'s own repository)';
   return null;
 }
@@ -118,8 +121,12 @@ function grammarProblems(text: string, o: PipegenDocOpts): string[] {
 
 /** An https URL to docs.github.com, to this repository or to pipegen's own, by the parsed URL (dot segments and %2e resolved, no credentials, no port). */
 function allowedUrl(raw: string, owner: string, repo: string): boolean {
+  // exactly `https://`, and the text is its own normal form: `https:/x`, `https:x`, an upper-case scheme or host, dot segments and %2e would be
+  // read by a browser differently from `new URL` without a base (D0b review finding 1)
+  if (!raw.startsWith('https://')) return false;
   let u: URL;
   try { u = new URL(raw); } catch { return false; }
+  if (u.href !== raw) return false;
   if (u.protocol !== 'https:' || u.username !== '' || u.password !== '' || u.port !== '') return false;
   if (u.hostname === 'docs.github.com') return true;
   if (u.hostname !== 'github.com') return false;

@@ -3,7 +3,7 @@
 // A repo that uses Renovate gets no file; a repo that already has a `github-actions` entry for `/` gets none either (Dependabot rejects
 // a duplicate and then stops ALL updates, so pipegen never edits the user's entry and adds nothing).
 import { isDeepStrictEqual } from 'node:util';
-import { dependabotEntry } from '../created-builders.js';
+import { dependabotEntry, dependabotFile } from '../created-builders.js';
 import type { CreatedCtx } from '../created-files.js';
 import type { CreatedFile } from '../../types.js';
 import { isObj, parseYaml, type Obj } from '../yaml-parse.js';
@@ -15,11 +15,6 @@ const WHY: Record<string, string> = {
   'target-branch': 'it moves the updates to another branch', vendor: 'it changes what is vendored', 'enable-beta-ecosystems': 'it turns on unreviewed ecosystems', ignore: 'it can switch off security updates',
   allow: 'it narrows what is updated', 'rebase-strategy': 'it can stop rebases', 'commit-message': 'it changes the commit text', labels: 'pipegen sets none', assignees: 'it assigns people', reviewers: 'it assigns people',
 };
-
-const rootish = (d: unknown): boolean => typeof d !== 'string' || /^\.?\/*$/.test(d.trim()) || d.includes('*');
-
-/** An entry that updates `/`: `directory`, or any of `directories` (a glob, or a value that is not text, counts: it may include `/`). A target branch does not make it different. */
-const coversRoot = (u: Obj): boolean => (u.directory !== undefined && rootish(u.directory)) || (u.directories !== undefined && (!Array.isArray(u.directories) || u.directories.some(rootish)));
 
 function load(text: string, label: string, out: string[]): Obj | null {
   const r = parseYaml(text, 'strict');
@@ -52,10 +47,11 @@ export function dependabotJudge(file: CreatedFile, ctx: CreatedCtx): string[] {
 
   const before = orig.updates === undefined || orig.updates === null ? [] : orig.updates;
   if (!Array.isArray(before)) return ['the existing Dependabot file has an `updates` that is not a list'];
-  // a github-actions entry for `/` already: pipegen adds nothing and never edits the user's entry
+  // ANY github-actions entry already: whatever its directory, directories or branch, Dependabot's blocks for one ecosystem must not overlap
+  // (`/` already searches /.github/workflows), and a rejected config stops ALL updates. pipegen adds nothing and never edits the user's entry.
   for (const u of before) {
-    if (isObj(u) && u['package-ecosystem'] === 'github-actions' && coversRoot(u)) {
-      return ['the repository already has a github-actions entry for /; Dependabot rejects a duplicate and then stops all updates, so pipegen adds nothing and leaves the user\'s entry alone'];
+    if (isObj(u) && u['package-ecosystem'] === 'github-actions') {
+      return ['the repository already has a github-actions entry in its Dependabot file; overlapping entries make Dependabot reject the config and stop all updates, so pipegen adds nothing and leaves the user\'s entry alone'];
     }
   }
 
@@ -74,5 +70,10 @@ export function dependabotJudge(file: CreatedFile, ctx: CreatedCtx): string[] {
     if (!(k in expected)) out.push(`pipegen's entry sets \`${k}\`${WHY[k] === undefined ? '' : ` (${WHY[k]})`}, which pipegen never sets`);
   }
   if (!isDeepStrictEqual(added, expected)) out.push('the appended entry is not the one pipegen builds (github-actions, /, weekly, 7-day cooldown, grouped minor and patch updates)');
+  if (out.length > 0) return out;
+  // the net above compares data (YAML 1.2); Dependabot reads YAML 1.1 and the user's text must survive, so the BYTES must be the builder's
+  const built = dependabotFile(original, draft);
+  if ('note' in built) return [built.note];
+  if (file.content !== built.content) return ['the file is not exactly what pipegen\'s builder writes (the user\'s bytes unchanged, then the entry text appended), so it is refused'];
   return out;
 }

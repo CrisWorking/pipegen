@@ -1,11 +1,11 @@
 // v0.2 Plan D, D0b: the judges for CODEOWNERS, dependabot.yml and PIPEGEN.md (preflight 4.2, S2, S14) and the pure builders Plan G
 // calls to produce those files (codeownersBlock, dependabotEntry).
-import { readFileSync } from 'node:fs';
+import { readdirSync, readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
-import { stringify } from 'yaml';
+import { parse as parseYaml, stringify } from 'yaml';
 import { codeOwners, ownersOf } from '../gate/src/integrity.js';
 import { knownValueScrubber } from '../src/ai/redact.js';
-import { CODEOWNERS_BEGIN, CODEOWNERS_END, CENTRAL_PROTECTED_PATHS, codeownersBlock, codeownersFile, codeownersPattern, codeownersProtectedPaths, dependabotEntry } from '../src/engine/created-builders.js';
+import { CODEOWNERS_BEGIN, CODEOWNERS_END, CENTRAL_PROTECTED_PATHS, codeownersBlock, codeownersFile, codeownersOverrides, codeownersPattern, codeownersProtectedPaths, codeownersReplace, dependabotEntry, dependabotEntryText, dependabotFile } from '../src/engine/created-builders.js';
 import { createdFileProblems, type CreatedEnv } from '../src/engine/created-files.js';
 import { codeownersJudge, codeownersProbes, codeownersSemanticProblems } from '../src/engine/created-judges/codeowners.js';
 import { effectiveProtectedPaths } from '../src/engine/protected-paths.js';
@@ -27,7 +27,9 @@ const draft = mkDraft();
 /** drafts whose repo already has a CODEOWNERS / dependabot file (an edit with an original needs one) */
 const existCo = mkDraft({}, baseProfile({}, { codeowners: '.github/CODEOWNERS' }));
 const existDep = mkDraft({}, baseProfile({}, { dependabot: '.github/dependabot.yml' }));
-const env = (inputs: CreatedEnv['inputs'] = {}, list: readonly ReviewedTool[] = reviewed): CreatedEnv => ({ reviewed: list, inputs });
+const replaceBlock = (...a: Parameters<typeof codeownersReplace>): string => codeownersReplace(...a) as string;
+const FACTS = { app: { isSymlink: false, inserted: null }, central: { isSymlink: false, inserted: null } };
+const env = (inputs: CreatedEnv['inputs'] = {}, list: readonly ReviewedTool[] = reviewed): CreatedEnv => ({ reviewed: list, inputs: { codeownersFacts: FACTS, ...inputs } });
 const verdict = (f: CreatedFile, d: PipelineDraft = draft, e: CreatedEnv = env()) => createdFileProblems(f, d, undefined, e);
 const problems = (f: CreatedFile, d: PipelineDraft = draft, e: CreatedEnv = env()) => verdict(f, d, e).problems;
 const text = (f: CreatedFile, d: PipelineDraft = draft, e: CreatedEnv = env()) => problems(f, d, e).join(' | ');
@@ -74,7 +76,7 @@ describe('codeownersBlock: the exact text', () => {
     expect(codeownersFile('* @c', block)).toBe(`* @c\n\n${block}`);
   });
   it('the central repo covers workflows and installs', () => {
-    expect([...CENTRAL_PROTECTED_PATHS]).toEqual(['.github/workflows/**', 'installs/**']);
+    expect([...CENTRAL_PROTECTED_PATHS]).toEqual(['.github/workflows/**', 'installs/**', '.github/CODEOWNERS', 'CODEOWNERS', 'docs/CODEOWNERS']);
   });
 });
 
@@ -301,7 +303,7 @@ describe('codeowners judge: the central repo', () => {
   const central = (content: string, original = '', path = '.github/CODEOWNERS'): CreatedFile => ({ path, content, part: 'codeowners', reason: 't', repo: 'central', edited: { original } });
   const cblock = codeownersBlock(CENTRAL_PROTECTED_PATHS, OWNERS);
   it('covers .github/workflows/** and installs/** with the draft owners', () => {
-    expect(cblock).toBe('# pipegen:begin\n/.github/workflows/ @alice @bob\n/installs/ @alice @bob\n# pipegen:end\n');
+    expect(cblock).toBe('# pipegen:begin\n/.github/workflows/ @alice @bob\n/installs/ @alice @bob\n/.github/CODEOWNERS @alice @bob\nCODEOWNERS @alice @bob\n/docs/CODEOWNERS @alice @bob\n# pipegen:end\n');
     expect(text(central(cblock), draft, env({ centralCodeowners: null }))).toBe('');
   });
   it('the existing central file decides the path; absent knowledge is refused', () => {
@@ -318,14 +320,87 @@ describe('codeowners judge: the central repo', () => {
     expect(text(central(codeownersFile('* @carol\n', cblock), '* @carol\n'), draft, env({ centralCodeowners: '.github/CODEOWNERS' }))).toBe('');
     expect(text(central(codeownersFile('* @carol\n', cblock), '* @dave\n'), draft, env({ centralCodeowners: '.github/CODEOWNERS' }))).toMatch(/prefix/);
   });
+  it('D0b fix round 1 (4): the central CODEOWNERS owns itself; a block without its own path is refused', () => {
+    const without = codeownersBlock(['.github/workflows/**', 'installs/**'], OWNERS);
+    expect(problems(central(without), draft, env({ centralCodeowners: null })).join(' ')).toMatch(/block|gate would not read/);
+    expect(codeownersSemanticProblems(without, [...CENTRAL_PROTECTED_PATHS], [], OWNERS).join(' ')).toMatch(/gate would not read/);
+  });
   it('the central file is owned by the same S14 rules', () => {
     const d = mkDraft({ codeOwners: { owners: ['@alice'], writers: 3 } });
     expect(problems(central(codeownersBlock(CENTRAL_PROTECTED_PATHS, ['@alice'])), d, env({ centralCodeowners: null })).length).toBeGreaterThan(0);
   });
-  it('the semantic probes for central: workflows and installs owned, others not', () => {
+  it('the semantic probes for central: workflows, installs and the CODEOWNERS files themselves owned, others not', () => {
     const rs = codeOwners(cblock);
-    for (const p of ['.github/workflows/p--merge.yml', '.github/workflows/a/b.yml', 'installs/p.json', 'installs/x/y.json']) expect(ownersOf(rs, p)?.slice().sort(), p).toEqual(['alice', 'bob']);
+    for (const p of ['.github/workflows/p--merge.yml', '.github/workflows/a/b.yml', 'installs/p.json', 'installs/x/y.json', '.github/CODEOWNERS', 'CODEOWNERS', 'docs/CODEOWNERS', 'sub/CODEOWNERS']) expect(ownersOf(rs, p)?.slice().sort(), p).toEqual(['alice', 'bob']);
     for (const p of ['README.md', 'enrolled-repos.yml', 'other/installs/x.json', 'workflows/x.yml']) expect(ownersOf(rs, p), p).toBeUndefined();
+  });
+});
+
+describe('D0b fix round 1: CODEOWNERS re-run, symlink, overrides', () => {
+  const OLD = codeownersBlock(['lefthook.yml'], ['@alice', '@bob']);   // an earlier pipegen block (an older, shorter list)
+  const withFacts = (inserted: string | null, isSymlink = false, repo: 'app' | 'central' = 'app') => env({ codeownersFacts: { ...FACTS, [repo]: { isSymlink, inserted } }, centralCodeowners: '.github/CODEOWNERS' });
+  it('a second edit form: the install record owns the old block, which is replaced in place; the bytes outside it stay equal', () => {
+    for (const [before, after] of [['* @carol\n\n', ''], ['# top\n', '\n/src/ @carol\n'], ['', ''], ['x @a\n', 'y @b\n']]) {
+      const original = `${before}${OLD}${after}`;
+      const f = coFile(replaceBlock(original, OLD, block), original);
+      expect(f.content).toBe(`${before}${block}${after}`);
+      const t = text(f, existCo, withFacts(OLD));
+      // user rules AFTER the block could override it: the whole-file semantic pass decides
+      if (after.includes('/src/') || after.includes('y @b')) expect(t).toBe('');
+      else expect(t).toBe('');
+    }
+  });
+  it('the replace form needs the record: without it, with a different old block, or with the old block twice, it is refused', () => {
+    const original = `* @carol\n\n${OLD}`;
+    const f = coFile(replaceBlock(original, OLD, block), original);
+    expect(text(f, existCo, withFacts(null))).toMatch(/marker|pipegen:begin/);
+    expect(text(f, existCo, withFacts(codeownersBlock(['other.yml'], ['@alice', '@bob'])))).toMatch(/marker|pipegen:begin|record/);
+    const twice = `${OLD}\n${OLD}`;
+    expect(text(coFile(`${block}\n${OLD}`, twice), existCo, withFacts(OLD))).toMatch(/marker|more than once|record/);
+    expect(text(coFile(block, `${OLD}x pipegen:end\n`), existCo, withFacts(OLD))).toMatch(/marker|record/);
+  });
+  it('the recorded old block must be a whole block: it starts with the begin marker and ends with the end marker', () => {
+    const original = `a${OLD}`;
+    expect(text(coFile(replaceBlock(original, original, block), original), existCo, withFacts(original))).toMatch(/marker/);
+    const tail = `${OLD}b`;
+    expect(text(coFile(replaceBlock(tail, tail, block), tail), existCo, withFacts(tail))).toMatch(/marker/);
+  });
+  it('the replace form changes nothing else: another byte outside the block is refused', () => {
+    const original = `* @carol\n\n${OLD}tail @x\n`;
+    expect(text(coFile(`* @mallory\n\n${block}tail @x\n`, original), existCo, withFacts(OLD))).toMatch(/not exactly|prefix|differs/);
+    expect(text(coFile(`* @carol\n\n${block}`, original), existCo, withFacts(OLD))).toMatch(/not exactly|prefix|differs/);
+  });
+  it('a user rule after the old block that would override the new one is refused by the whole-file pass', () => {
+    const original = `${OLD}\n/.github/workflows/ @mallory\n`;
+    expect(text(coFile(replaceBlock(original, OLD, block), original), existCo, withFacts(OLD))).toMatch(/gate would not read/);
+  });
+  it('the replace form works for the central file too', () => {
+    const cb = codeownersBlock(CENTRAL_PROTECTED_PATHS, ['@alice', '@bob']);
+    const old = codeownersBlock(['installs/**'], ['@alice', '@bob']);
+    const original = `* @carol\n\n${old}`;
+    const f: CreatedFile = { path: '.github/CODEOWNERS', content: replaceBlock(original, old, cb), part: 'codeowners', reason: 't', repo: 'central', edited: { original } };
+    expect(text(f, draft, withFacts(old, false, 'central'))).toBe('');
+  });
+  it('codeownersOverrides lists the user rules the block overrides (same pattern as a block entry)', () => {
+    const user = '# mine\n/.github/workflows/ @org/security\nlefthook.yml @carol\n/src/ @carol\n\n#/CODEOWNERS @x\nCODEOWNERS\n';
+    expect(codeownersOverrides(user, block)).toEqual(['/.github/workflows/ @org/security', 'lefthook.yml @carol', 'CODEOWNERS']);
+    expect(codeownersOverrides('', block)).toEqual([]);
+    expect(codeownersOverrides(`${OLD}`, block)).toEqual([]);   // pipegen's own old block is not the user's
+  });
+  it('a symlinked CODEOWNERS is refused (the fact is an input); facts not given are refused', () => {
+    const d = existCo;
+    const f = coFile(codeownersFile('* @carol\n', block), '* @carol\n');
+    expect(text(f, d, withFacts(null, true))).toMatch(/symbolic link/);
+    expect(text(f, d, withFacts(null, false))).toBe('');
+    expect(text(f, d, env({ codeownersFacts: undefined }))).toMatch(/was not given/);
+    const c = { ...f, repo: 'central' as const };
+    expect(text(c, draft, withFacts(null, true, 'central'))).toMatch(/symbolic link/);
+  });
+  it('a new file (none exists) needs no facts', () => {
+    expect(text(good(), draft, env({ codeownersFacts: undefined }))).toBe('');
+  });
+  it('a bare ~~~ line can not open a fence in PIPEGEN.md', () => {
+    expect(docText('# t\n\n~~~\nx\n```\n')).toMatch(/fence/);
   });
 });
 
@@ -350,6 +425,8 @@ const withEntry = (userDoc: Record<string, unknown> | null, e: unknown = entry):
   const updates = Array.isArray(base.updates) ? base.updates : [];
   return yml({ ...base, updates: [...updates, e] });
 };
+/** The file the builder writes for this original (the only accepted bytes); throws when the builder gives a note instead. */
+const okFile = (original: string, d: PipelineDraft = draft): string => { const r = dependabotFile(original, d); if (!('content' in r)) throw new Error(r.note); return r.content; };
 const privateDraft = mkDraft({ centralPin: { repo: 'o/pipelines', sha: 'a'.repeat(40) } }, baseProfile({ private: true }));
 
 describe('dependabotEntry', () => {
@@ -377,22 +454,22 @@ describe('dependabotEntry', () => {
 
 describe('dependabot judge: the file', () => {
   it('a new file with one entry passes', () => {
-    expect(text(depFile(withEntry(null)))).toBe('');
+    expect(text(depFile(okFile('')))).toBe('');
   });
   it('private repo: the entry with the ignore passes; the public entry does not', () => {
-    expect(text(depFile(withEntry(null, dependabotEntry(privateDraft))), privateDraft)).toBe('');
+    expect(text(depFile(okFile('', privateDraft)), privateDraft)).toBe('');
     expect(problems(depFile(withEntry(null)), privateDraft).length).toBeGreaterThan(0);
     expect(problems(depFile(withEntry(null, dependabotEntry(privateDraft)))).length).toBeGreaterThan(0);
   });
   it('the user content is kept as is: other ecosystems, top-level keys, registries of the user', () => {
     const user = { version: 2, registries: { npm1: { type: 'npm-registry', url: 'https://registry.npmjs.org', note: 'a ${{ b }}' } }, updates: [{ ...NPM, registries: ['npm1'] }, { 'package-ecosystem': 'pip', directory: '/py', schedule: { interval: 'weekly' } }] };
     const original = yml(user);
-    expect(text(depFile(withEntry(user), original), existDep)).toBe('');
+    expect(text(depFile(okFile(original), original), existDep)).toBe('');
   });
-  it('the user text may keep its comments (parsed data is compared)', () => {
+  it('the user text may keep its comments (the bytes are kept)', () => {
     const user = { version: 2, updates: [NPM] };
     const original = `# mine\n${yml(user)}`;
-    expect(text(depFile(withEntry(user), original), existDep)).toBe('');
+    expect(text(depFile(okFile(original), original), existDep)).toBe('');
   });
   it('a changed user entry, a removed one, a changed top-level key, an added one, a reorder: refused', () => {
     const user = { version: 2, updates: [NPM, { 'package-ecosystem': 'pip', directory: '/py', schedule: { interval: 'weekly' } }] };
@@ -417,8 +494,8 @@ describe('dependabot judge: the file', () => {
     expect(verdict(depFile(withEntry(swapped), yml(user)), existDep).problems.join(' ')).toMatch(/`registries` was changed/);
   });
   it('the user has no updates key or an empty one: still exactly one entry', () => {
-    expect(text(depFile(yml({ version: 2, updates: [entry] }), yml({ version: 2 })), existDep)).toBe('');
-    expect(text(depFile(yml({ version: 2, updates: [entry] }), yml({ version: 2, updates: [] })), existDep)).toBe('');
+    expect(text(depFile(okFile(yml({ version: 2 })), yml({ version: 2 })), existDep)).toBe('');
+    expect(text(depFile(yml({ version: 2, updates: [entry] }), yml({ version: 2, updates: [] })), existDep)).toMatch(/by hand/);
   });
   it('nothing appended, or two entries appended, is refused', () => {
     const user = { version: 2, updates: [NPM] };
@@ -467,21 +544,96 @@ describe('dependabot judge: the file', () => {
   });
 });
 
+describe('D0b fix round 1 (2): dependabotFile appends text and the judge requires its bytes', () => {
+  const ENTRY = dependabotEntryText(draft);
+  it('a new file', () => {
+    expect(okFile('')).toBe(`version: 2\nupdates:\n${ENTRY}`);
+    expect(ENTRY).toBe([
+      '  - package-ecosystem: "github-actions"', '    directory: "/"', '    schedule:', '      interval: "weekly"', '    cooldown:', '      default-days: 7',
+      '    groups:', '      github-actions-minor-patch:', '        update-types: ["minor", "patch"]', '        patterns: ["*"]', '',
+    ].join('\n'));
+  });
+  it('a private repo adds the quoted ignore', () => {
+    expect(dependabotEntryText(privateDraft)).toBe(`${ENTRY}    ignore:\n      - dependency-name: "o/pipelines/*"\n`);
+  });
+  it('the user bytes stay a byte prefix, including YAML 1.1 traps (no, on, yes, off, 0o7, 1_0, sexagesimals) and comments and odd spacing', () => {
+    const original = '# my dependabot\nversion: 2   # two\nupdates:\n  - package-ecosystem: npm   # js\n    directory: "/"\n    labels: [no, on, yes, off, y, n]\n    open-pull-requests-limit: 0o12\n    schedule: {interval: daily}\n    time: 12:30:45\n    key: 1_0\n\n# end\n';
+    const out = okFile(original);
+    expect(out.startsWith(original)).toBe(true);
+    expect(out.slice(original.length)).toBe(ENTRY);
+    expect(text(depFile(out, original), existDep)).toBe('');
+  });
+  it('an original without a final newline gets one; updates absent is added as the last key', () => {
+    expect(okFile('version: 2')).toBe(`version: 2\nupdates:\n${ENTRY}`);
+    expect(okFile('version: 2\nregistries: {}\n').startsWith('version: 2\nregistries: {}\nupdates:\n')).toBe(true);
+    expect(okFile('version: 2\nupdates:\n')).toBe(`version: 2\nupdates:\n${ENTRY}`);
+  });
+  it('the entry reads the same in YAML 1.1 and 1.2 and equals dependabotEntry(draft); every string is quoted, default-days is an integer', () => {
+    for (const d of [draft, privateDraft]) {
+      const t = dependabotEntryText(d);
+      for (const version of ['1.1', '1.2'] as const) expect(parseYaml(t, { version, uniqueKeys: true })).toEqual([dependabotEntry(d)]);
+      expect(t.split('\n').filter((l) => /:\s+\S/.test(l) && !/:\s+("|\[|\d+$)/.test(l))).toEqual([]);
+      expect(t).toMatch(/default-days: 7\n/);
+    }
+  });
+  it('only one shape: updates must be the last top-level key in a block sequence at the standard indentation; anything else is no file plus a note with the entry', () => {
+    const cases = [
+      'version: 2\nupdates:\n  - package-ecosystem: npm\n    directory: /\nregistries: {}\n',   // updates not last
+      'version: 2\nupdates: []\n', 'version: 2\nupdates: [{package-ecosystem: npm, directory: /, schedule: {interval: daily}}]\n',
+      'version: 2\nupdates:\n- package-ecosystem: npm\n  directory: /\n',                       // zero indent
+      'version: 2\nupdates:\n    - package-ecosystem: npm\n      directory: /\n',                 // four spaces
+      'version: 2\r\nupdates:\r\n  - package-ecosystem: npm\r\n',                              // CRLF
+      'version: 2\nupdates: &u\n  - package-ecosystem: npm\n', 'version: 2\n"updates":\n  - package-ecosystem: npm\n', 'version: 2\nupdates: null\n', 'version: 2\nupdates:\n\tx: 1\n',
+      '- a\n', 'a: [\n', 'version: 2\nupdates:\n  - package-ecosystem: npm\nupdates:\n  - package-ecosystem: pip\n', 'version: 2\nupdates: |\n  text\n',
+    ];
+    for (const original of cases) {
+      const r = dependabotFile(original, draft);
+      expect('note' in r, JSON.stringify(original)).toBe(true);
+      if ('note' in r) expect(r.note).toContain(ENTRY);
+    }
+  });
+  it('the judge refuses any bytes but the builder\'s: re-stringified user file, reordered, reformatted, comments dropped, 0o7, 7.0, 2.0, [no]', () => {
+    const user = { version: 2, updates: [{ ...NPM, labels: ['no'] }] };
+    const original = yml(user).replace("- no", '- "no"');
+    const ours = okFile(original);
+    expect(text(depFile(ours, original), existDep)).toBe('');
+    const e = entry as unknown as Record<string, unknown>;
+    const stringified = yml({ version: 2, updates: [{ ...NPM, labels: ['no'] }, e] });   // what Plan G would do with yaml.stringify
+    expect(text(depFile(stringified, original), existDep)).toMatch(/builder|byte|exactly/i);
+    for (const bad of [ours.replace('default-days: 7', 'default-days: 0o7'), ours.replace('default-days: 7', 'default-days: 7.0'), ours.replace('version: 2', 'version: 2.0'), ours.replace('version: 2', 'version: 0o2'), ours.replace('"no"', 'no'), ours.replace('limit: 3', 'limit: 0o3'), ours.replace('"weekly"', 'weekly'), `# c\n${ours}`, ours.replace(/\n$/, '')]) {
+      expect(text(depFile(bad, original), existDep), bad.slice(0, 60)).not.toBe('');
+    }
+  });
+  it('a builder note is the judge\'s refusal, naming the entry to add by hand', () => {
+    const original = 'version: 2\nupdates: []\n';
+    const t = text(depFile(yml({ version: 2, updates: [entry] }), original), existDep);
+    expect(t).toMatch(/by hand/);
+    expect(t).toContain('github-actions');
+  });
+});
+
 describe('dependabot judge: duplicates, Renovate, path', () => {
   const actions = (over: Record<string, unknown> = {}) => ({ 'package-ecosystem': 'github-actions', directory: '/', schedule: { interval: 'monthly' }, ...over });
-  const dup = (e: Record<string, unknown>) => { const user = { version: 2, updates: [e] }; return depFile(withEntry(user), yml(user)); };
+  const dup = (e: Record<string, unknown>) => { const user = { version: 2, updates: [e] }; const r = dependabotFile(yml(user), draft); return depFile('content' in r ? r.content : withEntry(user), yml(user)); };
   const dProblems = (f: CreatedFile) => verdict(f, existDep).problems;
   const dText = (f: CreatedFile) => dProblems(f).join(' | ');
   it('a user github-actions entry for / means pipegen adds nothing', () => {
     expect(dText(dup(actions()))).toMatch(/already|duplicate/i);
+  });
+  it('D0b fix round 1 (3): ANY existing github-actions entry means no file, whatever its directory or target branch (the reviewer\'s overlapping forms)', () => {
+    for (const e of [actions({ directory: '/.github/workflows' }), actions({ directory: '/./' }), actions({ directory: undefined, directories: ['/.github'] }), actions({ directory: '/sub' }), actions({ directory: '/sub', 'target-branch': 'dev' }), actions({ directory: undefined, directories: ['/a', '/b'] }), actions({ directory: '/.github/workflows/' })]) {
+      const plain = Object.fromEntries(Object.entries(e).filter(([, v]) => v !== undefined));
+      expect(dText(dup(plain)), JSON.stringify(e)).toMatch(/already/);
+      const user = { version: 2, updates: [plain] };
+      expect('note' in dependabotFile(yml(user), draft), JSON.stringify(e)).toBe(true);
+    }
   });
   it('the same through directories, a trailing slash, ./, a target branch', () => {
     for (const e of [actions({ directory: undefined, directories: ['/'] }), actions({ directory: undefined, directories: ['/a', '/'] }), actions({ directory: '' }), actions({ directory: './' }), actions({ directory: '.' }), actions({ 'target-branch': 'dev' }), actions({ directory: undefined, directories: ['/*'] }), actions({ directory: undefined, directories: ['**'] }), actions({ directory: undefined, directories: 'weird' })]) {
       expect(dText(dup(Object.fromEntries(Object.entries(e).filter(([, v]) => v !== undefined)))), JSON.stringify(e)).toMatch(/already/);
     }
   });
-  it('a user github-actions entry for another folder, or another ecosystem at /, is no duplicate', () => {
-    expect(dText(dup(actions({ directory: '/sub' })))).toBe('');
+  it('another ecosystem at / is no duplicate', () => {
     expect(dText(dup({ ...NPM }))).toBe('');
   });
   it('a Renovate repo gets no file', () => {
@@ -493,14 +645,14 @@ describe('dependabot judge: duplicates, Renovate, path', () => {
   it('an existing .yaml is the path to use; the .yml one is then refused', () => {
     const d = mkDraft({}, baseProfile({}, { dependabot: '.github/dependabot.yaml' }));
     const user = { version: 2, updates: [NPM] };
-    expect(text(depFile(withEntry(user), yml(user), { path: '.github/dependabot.yaml' }), d)).toBe('');
-    expect(text(depFile(withEntry(user), yml(user)), d)).toMatch(/dependabot\.yaml/);
+    expect(text(depFile(okFile(yml(user)), yml(user), { path: '.github/dependabot.yaml' }), d)).toBe('');
+    expect(text(depFile(okFile(yml(user)), yml(user)), d)).toMatch(/dependabot\.yaml/);
   });
   it('an existing .yml is the path; a .yaml file is refused; with none, only .yml', () => {
     const d = mkDraft({}, baseProfile({}, { dependabot: '.github/dependabot.yml' }));
     expect(text(depFile(withEntry(null), '', { path: '.github/dependabot.yaml' }), d)).toMatch(/dependabot\.yml/);
     expect(text(depFile(withEntry(null), '', { path: '.github/dependabot.yaml' }))).toMatch(/dependabot\.yml/);
-    expect(text(depFile(withEntry(null)))).toBe('');
+    expect(text(depFile(okFile('')))).toBe('');
   });
   it('a new file (original empty) when the repo has one is refused: the original must be the file', () => {
     // RepoFiles says a dependabot file exists, so an edit with an empty original would replace the user's file
@@ -534,7 +686,7 @@ describe('dependabot judge: strict parse', () => {
   });
   it('the registry rule exists and takes parts pipeline and docs', () => {
     expect(problems(depFile(withEntry(null), '', { part: 'tests' })).length).toBeGreaterThan(0);
-    expect(text(depFile(withEntry(null), '', { part: 'docs' }))).toBe('');
+    expect(text(depFile(okFile(''), '', { part: 'docs' }))).toBe('');
   });
 });
 
@@ -644,7 +796,7 @@ describe('pipegen-doc judge', () => {
   it('fuzz: lines of allowed characters only are accepted', () => {
     let seed = 777;
     const rnd = (n: number) => { seed = (seed * 1103515245 + 12345) & 0x7fffffff; return seed % n; };
-    const ALPHA = 'abcdefghijklmnopqrstuvwxyz0123456789 .,;:!?\'"/-_+=%*~';
+    const ALPHA = 'abcdefghijklmnopqrstuvwxyz0123456789 .,;!?\'"/-_+=%*~';   // no ':' (emoji shortcodes)
     for (let k = 0; k < 300; k++) {
       let l = 'a'; for (let i = 0, n = rnd(40); i < n; i++) l += ALPHA[rnd(ALPHA.length)];
       l = l.replace(/https?|www|~{3,}/gi, 'q');
@@ -660,6 +812,45 @@ describe('pipegen-doc judge', () => {
     for (const u of ['see https://github.com/o/r/issues', 'https://docs.github.com/en/x.', '- https://github.com/o/r', '| https://github.com/o/r |', 'www.github.com']) expect(docText(`# t\n\n${u}\n`), u).toMatch(/bare URL/);
     expect(docText('# t\n\n[https://github.com/o/r](https://github.com/o/r)\n')).toMatch(/bare URL/);
     expect(docText('# t\n\n`https://github.com/o/r`\n')).toMatch(/bare URL/);
+  });
+  it('D0b fix round 1 (1): a link url starts with exactly https:// and equals its own normalised form', () => {
+    const bad = ['https:/docs.github.com/../evil/repo', 'https:docs.github.com/../../../../../../evil/repo', 'https:/docs.github.com/x', 'https:github.com/o/r', 'https:///docs.github.com/x', 'https:\\\\docs.github.com/x',
+      'HTTPS://github.com/o/r', 'https://GITHUB.COM/o/r', 'https://Docs.GitHub.com/x', 'https://docs.github.com/a/../x', 'https://docs.github.com/./x', 'https://docs.github.com/%2e%2e/evil', 'https://docs.github.com/a/%2E%2e/x', 'https://github.com/o/r/../../evil/repo',
+      'https://github.com/o/r/./x', 'https://github.com/o/r/%2e/x', 'https://docs.github.com', 'https://docs.github.com:443/x', 'https://github.com./o/r', 'https://docs.github.com./x', ' https://docs.github.com/x', 'https://docs.github.com/x#frag ment'];
+    for (const u of bad) expect(docText(`# t\n\n[x](${u})\n`), u).toMatch(/link/);
+    for (const ok of ['https://docs.github.com/en/x', 'https://github.com/o/r', 'https://github.com/o/r/blob/main/a.md#b', 'https://github.com/O/R/x', 'https://docs.github.com/en/x?a=b&c=d']) expect(docText(`# t\n\n[x](${ok})\n`), ok).toBe('');
+  });
+  it('D0b fix round 1 (6): emoji shortcodes are refused outside fences (GitHub renders them as images), also in labels and code; fine inside a fence', () => {
+    for (const t of [':octocat:', 'Hi :octocat: and :shipit: there', ':warning:', ':+1:', ':a_b-c:', 'x:y:z', '[:octocat:](https://docs.github.com/x)', '`:octocat:`', '- :tada:', '| :tada: |']) expect(docText(`# t\n\n${t}\n`), t).toMatch(/emoji|shortcode/i);
+    for (const t of ['note: fine', 'time 10:30 ok', 'a : b : c', 'x: y']) expect(docText(`# t\n\n${t}\n`), t).toBe('');
+    expect(docText('# t\n\n```\n:octocat:\n```\n')).toBe('');
+  });
+  it('D0b fix round 1 (6): invisible and format characters are refused everywhere (fences too); marks only outside fences', () => {
+    const everywhere = ['\u3164', '\u115f', '\u1160', '\uffa0', '\u061c', '\u00ad', '\u180e', '\u2028', '\u2029', '\ue000', '\u{e0041}', '\u{e0001}', '\u{e007f}', '\u200d', '\u2060', '\ufeff', '\u202e', '\u2066', '\u200b', '\u200f'];
+    for (const c of everywhere) {
+      expect(docText(`# t\n\nBefore${c}after\n`), JSON.stringify(c)).toMatch(/invisible|control/i);
+      expect(docText('# t\n\n```\na' + c + 'b\n```\n'), `fence ${JSON.stringify(c)}`).toMatch(/invisible|control/i);
+      expect(docText(`# t\n\n- a${c}b\n`), JSON.stringify(c)).toMatch(/invisible|control/i);
+    }
+    const marks = ['\u0301', '\ufe0f', '\ufe00', '\u{e0100}', '\u0300'];   // Mn: combining accents, variation selectors
+    for (const c of marks) {
+      expect(docText(`# t\n\nBefore${c}after\n`), JSON.stringify(c)).toMatch(/not allowed/);
+      expect(docText('# t\n\n```\na' + c + 'b\n```\n'), `fence ${JSON.stringify(c)}`).toBe('');
+    }
+  });
+  it('recorded GitHub renders (test/fixtures/d0b-renders): every input whose render leaves the allowlist or adds an image or an invisible gap is refused; the baseline passes', () => {
+    const dir = new URL('./fixtures/d0b-renders/', import.meta.url);
+    const names = readdirSync(dir).filter((n) => n.endsWith('.md')).map((n) => n.slice(0, -3)).sort();
+    expect(names.length).toBeGreaterThanOrEqual(9);
+    for (const name of names) {
+      // invisible characters are stored as \u{hex} (the repo bans raw ones, test/no-raw-controls.test.ts) and decoded here
+      const md = readFileSync(new URL(`${name}.md`, dir), 'utf8').replace(/\\u\{([0-9a-f]+)\}/gi, (_, h: string) => String.fromCodePoint(parseInt(h, 16)));
+      const html = readFileSync(new URL(`${name}.markdown.html`, dir), 'utf8');
+      const hrefs = [...html.matchAll(/<a [^>]*href="([^"]*)"/g)].map((m) => m[1] as string).filter((h) => !h.startsWith('#'));   // heading anchors are GitHub's own
+      const leaves = hrefs.some((h) => !/^https:\/\/docs\.github\.com\//.test(h)) || /<img /.test(html) || /[\u3164\u115f\u1160\uffa0\u{e0000}-\u{e007f}\u061c]/u.test(md);
+      const t = docText(md);
+      if (name === 'baseline') { expect(leaves, name).toBe(false); expect(t, name).toBe(''); } else { expect(leaves, `${name} is a fixture because its render is a problem`).toBe(true); expect(t, name).not.toBe(''); }
+    }
   });
   it('the pipegen repo link follows the package repository', () => {
     const pkg = JSON.parse(readPkg()) as { repository: { url: string } };
@@ -727,7 +918,7 @@ describe('referee: the three judges run on real files', () => {
   const LINTERS: Linters = { actionlint: async () => '/x', zizmor: async () => '/x' };
   const run = (files: CreatedFile[], inputs: CreatedEnv['inputs'] = {}, d: PipelineDraft = draft) => referee(files, d, platform(), reviewed, LINTERS, 'tok', { runLinters: async () => [], createdInputs: inputs });
   it('good files pass', async () => {
-    const r = await run([good(), depFile(withEntry(null)), docFile(DOC_OK)], docInputs());
+    const r = await run([good(), depFile(okFile('')), docFile(DOC_OK)], docInputs());
     expect(r.issues).toEqual([]);
     expect(r.ok).toBe(true);
   });

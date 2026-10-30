@@ -6,8 +6,8 @@
 //    can not approve their own pull request, so a sole owner would lock every protected-path change);
 //  - the SEMANTICS are checked with the gate's own parser: every protected path, on a probe list, is owned by exactly the owners.
 import { codeOwners, MAX_CODEOWNERS_BYTES, ownersOf } from '../../../gate/src/integrity.js';
-import { CENTRAL_PROTECTED_PATHS, codeownersBlock, codeownersFile, codeownersOwnerProblem, codeownersProtectedPaths } from '../created-builders.js';
-import type { CreatedCtx, CreatedRule } from '../created-files.js';
+import { CENTRAL_PROTECTED_PATHS, CODEOWNERS_BEGIN, CODEOWNERS_END, codeownersBlock, codeownersFile, codeownersOwnerProblem, codeownersProtectedPaths, codeownersReplace } from '../created-builders.js';
+import type { CreatedCtx } from '../created-files.js';
 import type { CreatedFile } from '../../types.js';
 
 const CO_PLACES: readonly string[] = ['.github/CODEOWNERS', 'CODEOWNERS', 'docs/CODEOWNERS'];
@@ -79,17 +79,30 @@ function judge(repo: 'app' | 'central') {
     const original = file.edited?.original;
     if (typeof original !== 'string') return ['the edited marker with the original text is missing'];
     if (found === null && original !== '') return ['no CODEOWNERS file exists, but an original text was given'];
-    if (MARKER_RE.test(original)) return ['the original CODEOWNERS already holds a pipegen:begin or pipegen:end marker; a second block would be ambiguous'];
+    let facts: { isSymlink: boolean; inserted: string | null } | undefined;
+    if (found !== null) {
+      facts = ctx.inputs.codeownersFacts?.[repo];
+      if (facts === undefined) return ['whether the existing CODEOWNERS is a symbolic link, and the block the install record owns in it, was not given to the referee'];
+      if (facts.isSymlink) return ['the existing CODEOWNERS is a symbolic link, which GitHub reads but pipegen will not write through'];
+    }
     if (Buffer.byteLength(file.content, 'utf8') > MAX_CODEOWNERS_BYTES) return ['the CODEOWNERS file is over 3 MiB, which GitHub does not read'];
 
     const roots = repo === 'app' ? draft.profile.services.map((s) => s.path) : [];
     const paths = repo === 'app' ? codeownersProtectedPaths(draft, ctx.reviewed) : [...CENTRAL_PROTECTED_PATHS];
     let block: string;
     try { block = codeownersBlock(paths, co.owners); } catch (e) { return [`the block can not be built: ${e instanceof Error ? e.message : 'unknown error'}`]; }
-    if (file.content !== codeownersFile(original, block)) {
-      return [file.content.startsWith(original)
-        ? 'the text after the original is not exactly the pipegen block (the protected paths with the code owners), so it is refused'
-        : 'the original text is not a byte prefix of the file: pipegen only appends its block and never changes the user\'s lines'];
+    let expected: string;
+    if (MARKER_RE.test(original)) {
+      // a re-run: allowed only when the install record owns the old block, found exactly once and whole; it is replaced in place
+      const ins = facts?.inserted;
+      const replaced = typeof ins === 'string' && ins.startsWith(`${CODEOWNERS_BEGIN}\n`) && ins.endsWith(`${CODEOWNERS_END}\n`) ? codeownersReplace(original, ins, block) : null;
+      if (typeof ins !== 'string' || replaced === null || MARKER_RE.test(original.replace(ins, ''))) return ['the original CODEOWNERS already holds a pipegen:begin or pipegen:end marker that the install record does not own as one whole block; a second block would be ambiguous'];
+      expected = replaced;
+    } else expected = codeownersFile(original, block);
+    if (file.content !== expected) {
+      return [expected === codeownersFile(original, block) && !file.content.startsWith(original)
+        ? 'the original text is not a byte prefix of the file: pipegen only appends its block and never changes the user\'s lines'
+        : 'the file is not exactly the original plus the pipegen block (the protected paths with the code owners; on a re-run, the original with only the old block replaced), so it is refused'];
     }
     out.push(...codeownersSemanticProblems(block, paths, roots, co.owners));
     out.push(...codeownersSemanticProblems(file.content, paths, roots, co.owners, false));
@@ -99,4 +112,3 @@ function judge(repo: 'app' | 'central') {
 
 export const codeownersJudge = judge('app');
 export const codeownersCentralJudge = judge('central');
-export type { CreatedRule };

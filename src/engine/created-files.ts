@@ -31,6 +31,11 @@ export interface CreatedInputs {
   centralCodeowners?: string | null;
   /** PIPEGEN.md: its blob sha in the delivery base tree (null: no such file) and the sha the install record holds for it (null: not recorded). */
   pipegenDoc?: { baseSha: string | null; recordSha: string | null };
+  /**
+   * Per repo, for an EXISTING CODEOWNERS file (D0b fix round 1): whether the path GitHub reads is a symbolic link (D1's guard enforces it too),
+   * and `inserted`, the block text the install record says pipegen wrote there before (EditKind 'codeowners'), which a re-run may replace in place.
+   */
+  codeownersFacts?: Partial<Record<'app' | 'central', { isSymlink: boolean; inserted: string | null }>>;
   /** The vault's check: does the text hold a value the user typed, or its base64 or URL form (preflight S8)? */
   containsKnownValue?: (text: string) => boolean;
 }

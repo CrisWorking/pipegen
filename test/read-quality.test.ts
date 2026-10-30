@@ -304,6 +304,18 @@ describe('repoFiles', () => {
     expect(await co({ 'src/CODEOWNERS': '* @a\n', 'codeowners': '* @a\n' })).toBeNull();
   });
 
+  it('repoFiles: codeowners is the first path that EXISTS, of any type (a symlink at .github/CODEOWNERS is what GitHub reads, so it is recorded and noted)', async () => {
+    const dir = repo({ CODEOWNERS: '* @a\n', 'real.txt': 'x\n' });
+    mkdirSync(join(dir, '.github'), { recursive: true });
+    symlinkSync('../real.txt', join(dir, '.github/CODEOWNERS'));
+    const notes: string[] = [];
+    expect((await readRepoFiles(dir, notes)).codeowners).toBe('.github/CODEOWNERS');
+    expect(notes.join(' ')).toMatch(/CODEOWNERS/);
+    const dir2 = repo({ 'docs/CODEOWNERS': '* @a\n' });
+    mkdirSync(join(dir2, 'CODEOWNERS'));
+    expect((await readRepoFiles(dir2, [])).codeowners).toBe('CODEOWNERS');
+  });
+
   it('repoFiles: Kubernetes from YAML with top-level apiVersion and kind under a manifests folder only', async () => {
     const k8s = async (files: Record<string, string>) => (await readRepoFiles(repo(files), [])).kubernetes;
     const manifest = '# app\napiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: app\n';

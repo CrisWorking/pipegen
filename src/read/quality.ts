@@ -583,6 +583,21 @@ async function firstReal<T extends string>(run: QualityRun, rels: readonly T[], 
   return null;
 }
 
+/**
+ * The first path of `rels` that EXISTS, of any type. GitHub (and the gate's loadCodeowners) read the first CODEOWNERS path that exists, so a
+ * symbolic link or a folder there is the file in question, not a reason to look at the next path (D0b review finding 10). It is noted,
+ * and the CODEOWNERS judge refuses a link.
+ */
+async function firstExisting<T extends string>(run: QualityRun, rels: readonly T[], notes: string[]): Promise<T | null> {
+  for (const rel of rels) {
+    const found = await presence(run, rel);
+    if (found === null) continue;
+    if (found !== 'file') note(notes, `${safeText(rel, PATH_SHOWN_MAX)} is ${found === 'link' ? 'a symbolic link' : 'not a regular file'}; GitHub reads this path for code owners, so pipegen will not write CODEOWNERS over it.`);
+    return rel;
+  }
+  return null;
+}
+
 async function kubernetesOf(run: QualityRun, notes: string[]): Promise<boolean> {
   if (run.files.some((f) => baseOf(f) === 'Chart.yaml')) return true;
   const yaml = run.files.filter((f) => /\.ya?ml$/.test(f) && dirOf(f).split('/').some((seg) => K8S_DIRS.has(seg))).sort();
@@ -604,7 +619,7 @@ export async function readRepoFiles(dir: string, notes: string[], run?: QualityR
   const rootPkg = await parsedFile(r, 'package.json', notes);
   return {
     dependabot: await firstReal(r, DEPENDABOT, notes),
-    codeowners: await firstReal(r, CODEOWNERS, notes),
+    codeowners: await firstExisting(r, CODEOWNERS, notes),
     renovate: (await firstReal(r, RENOVATE, notes)) ?? (rootPkg !== null && 'renovate' in rootPkg ? 'package.json' : null),
     actionsLock: (await realFile(r, '.github/actions.lock', notes)) || r.files.some((f) => f.startsWith('.github/') && baseOf(f) === 'actions.lock'),
     kubernetes: await kubernetesOf(r, notes),
