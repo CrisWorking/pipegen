@@ -89,7 +89,7 @@ describe('renderScrub (ruling B1 part 7)', () => {
     expect(s.id).toBe(`scrub-${sha16(artifact)}`);
     expect(s.id).toMatch(SCRUB_STEP_ID_RE);
     expect(s.uses).toBe(`crisworking/pipegen/gate@${GATE_SHA}`);
-    expect(s.usesComment).toBe('v0.2.0');
+    expect(s.usesComment).toBe('0.2.0');
     expect(s.if).toBe('always()');
     expect(s.run).toBeUndefined();
     expect(s.with).toEqual({ mode: 'scrub', artifact, tool: 'gitleaks', format: 'sarif', raw, out, 'fp-key': FP, stage: `\${{ runner.temp }}/pipegen-stage/${artifact}` });   // C1c: a secrets scrub reads its stage folder

@@ -286,7 +286,7 @@ const fileSchema = z.strictObject({
       ctx.addIssue({ code: 'custom', path: ['tools', i, 'reviewedAt'], message: `reviewedAt is before pinnedOn (${pinnedDay}): the review must cover the pins as they are` });
     }
     // pipegen's own repository is exempt (C6): its code is reviewed in this repository; the exact repo, nothing else
-    if (t.candidate.repo !== PIPEGEN_OWN_REPO && !(pinnedOn - Date.parse(t.releasedAt) >= COOLDOWN_DAYS * DAY_MS)) {
+    if (!(t.candidate.kind === 'action' && t.candidate.repo === PIPEGEN_OWN_REPO) && !(pinnedOn - Date.parse(t.releasedAt) >= COOLDOWN_DAYS * DAY_MS)) {
       ctx.addIssue({ code: 'custom', path: ['tools', i, 'releasedAt'], message: `the release must be at least ${COOLDOWN_DAYS} days older than pinnedOn (cooldown, ruling S26)` });
     }
     // PS24: the signature check must cover the pins as they are

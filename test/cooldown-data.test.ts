@@ -176,6 +176,10 @@ function upstream(dateOf: (a: Artifact) => string, hashOf: (a: Artifact, pinned:
       });
     }
   }
+  // pipegen's own gate action: no age, but its pin is tied to the tag gate-v<version> of the repo (C6 fix round 1)
+  for (const t of (parse(FILES['data/reviewed-tools.yml']) as Obj).tools as Obj[]) {
+    if (t.candidate.kind === 'action' && t.candidate.repo === 'crisworking/pipegen') routes.set(gh(`${t.candidate.repo}/git/ref/tags/gate-v${t.candidate.version}`), { object: { type: 'commit', sha: t.candidate.pin.sha } });
+  }
   for (const [k, v] of Object.entries(extra)) routes.set(k, v);
   const calls: string[] = [];
   const f = (async (url: string) => {

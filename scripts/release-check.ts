@@ -136,7 +136,7 @@ export function checkDataFresh(files: { 'data/ai-prices.yml'?: string | null; 'd
 /** Check 5. `base` is the previous release's files, or empty on the first release. */
 export async function checkCooldown(base: Files, head: Files, fetchFn: typeof fetch, now: Date, githubToken?: string, firstRelease = false): Promise<Check> {
   try {
-    const r = await runCooldown({ base, head, fetch: fetchFn, now, githubToken, ...(firstRelease ? { maxLookups: FIRST_RELEASE_MAX_LOOKUPS } : {}) });
+    const r = await runCooldown({ base, head, fetch: fetchFn, now, githubToken, release: true, ...(firstRelease ? { maxLookups: FIRST_RELEASE_MAX_LOOKUPS } : {}) });
     return { name: 'cooldown', ok: r.ok, problems: r.ok ? [] : formatReport(r).split('\n').filter((l) => l.trim() !== '') };
   } catch {
     return { name: 'cooldown', ok: false, problems: ['the cooldown check could not run (failing closed)'] };

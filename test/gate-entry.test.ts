@@ -71,40 +71,86 @@ describe('C6: the pipegen-gate reviewed entry', () => {
   });
 });
 
-describe('C6: the cooldown skips the 7-day rule for pipegen\'s own repo only', () => {
+describe('C6 fix round 1: the cooldown skips the AGE rule for pipegen\'s own repo, never the tie to a gate tag', () => {
   const NOW = new Date('2026-10-30T12:00:00Z');
+  const PIN = real().candidate.pin.sha as string;
+  const TAG = 'gate-v0.2.0';
+  const API = 'https://api.github.com/repos/crisworking/pipegen';
   const onlyGate = (over: (e: Record<string, any>) => void = () => undefined): string => {
     const doc = parse(readFileSync(DATA, 'utf8')) as { pinnedOn: string; tools: Record<string, any>[] };
     const e = doc.tools.find((t) => t.id === 'pipegen-gate') as Record<string, any>;
     over(e);
     return stringify({ pinnedOn: doc.pinnedOn, tools: [e] });
   };
-  const run = async (head: string): Promise<{ ok: boolean; calls: string[]; problems: string }> => {
+  /** A stubbed upstream (no network): the routes given answer, anything else is a 404. */
+  const run = async (head: string, routes: Record<string, unknown>, release = false): Promise<{ ok: boolean; calls: string[]; problems: string }> => {
     const calls: string[] = [];
-    const f = (async (url: string) => { calls.push(String(url)); return new Response('{}', { status: 404 }); }) as typeof fetch;
-    const r = await runCooldown({ base: {}, head: { 'data/reviewed-tools.yml': head }, fetch: f, now: NOW, maxLookups: 100 });
+    const f = (async (url: string) => {
+      calls.push(String(url));
+      const body = routes[String(url)];
+      return body === undefined ? new Response('{}', { status: 404 }) : new Response(JSON.stringify(body), { status: 200 });
+    }) as typeof fetch;
+    const r = await runCooldown({ base: {}, head: { 'data/reviewed-tools.yml': head }, fetch: f, now: NOW, maxLookups: 100, ...(release ? { release: true } : {}) });
     return { ok: r.ok, calls, problems: r.findings.map((x) => x.problem).join('\n') };
   };
+  const tagRoute = (sha: string = PIN, type = 'commit'): Record<string, unknown> => ({ [`${API}/git/ref/tags/${TAG}`]: { object: { type, sha } } });
+  const onMain = (sha: string = PIN, over: Record<string, unknown> = {}): Record<string, unknown> => ({
+    [API]: { default_branch: 'main' },
+    [`${API}/compare/${sha}...main?per_page=1`]: { status: 'ahead', behind_by: 0, merge_base_commit: { sha }, ...over },
+  });
+
   it('the script and the loader exempt the same, exact repo, which is the gate action\'s repo', () => {
     expect(SCRIPT_OWN_REPO).toBe(PIPEGEN_OWN_REPO);
     expect(PIPEGEN_GATE_USES.startsWith(`${PIPEGEN_OWN_REPO}/`)).toBe(true);
   });
-  it('the own-repo gate entry passes with no lookup at all (its code is reviewed here, in this repository)', async () => {
-    const r = await run(onlyGate());
+  it('the entry\'s version is a bare semver (the tag is gate-v<version>)', () => {
+    expect(real().candidate.version).toBe('0.2.0');
+  });
+  it('tag == pin passes with no age check and no release lookup (pre-merge mode: no default-branch check)', async () => {
+    const r = await run(onlyGate(), tagRoute());
     expect(r.problems).toBe('');
     expect(r.ok).toBe(true);
+    expect(r.calls).toEqual([`${API}/git/ref/tags/${TAG}`]);
+  });
+  it('an annotated tag is followed to its commit', async () => {
+    const r = await run(onlyGate(), { ...tagRoute('b'.repeat(40), 'tag'), [`${API}/git/tags/${'b'.repeat(40)}`]: { object: { type: 'commit', sha: PIN }, tagger: { date: '2026-10-30T00:00:00Z' } } });
+    expect(r.problems).toBe('');
+    expect(r.ok).toBe(true);
+  });
+  it('an impostor or missing SHA fails: no tag (404), a tag on another commit, a tag that is not a commit', async () => {
+    const impostor = onlyGate((e) => { e.candidate.pin.sha = 'f'.repeat(40); e.step.action.uses = `crisworking/pipegen/gate@${'f'.repeat(40)}`; });
+    expect((await run(impostor, {})).ok).toBe(false);
+    expect((await run(impostor, tagRoute())).problems).toMatch(/not the commit of the tag gate-v0\.2\.0/);
+    expect((await run(onlyGate(), tagRoute('a'.repeat(40)))).ok).toBe(false);
+    expect((await run(onlyGate(), { [`${API}/git/ref/tags/${TAG}`]: { object: { type: 'tree', sha: PIN } } })).ok).toBe(false);
+    expect((await run(onlyGate(), {})).ok).toBe(false);
+  });
+  it('a version that is not a bare semver fails without a lookup (no tag name built from junk)', async () => {
+    const r = await run(onlyGate((e) => { e.candidate.version = '../x'; }), tagRoute());
+    expect(r.ok).toBe(false);
     expect(r.calls).toEqual([]);
   });
-  it('the same entry under another repo is checked as any action (and fails here: the fake upstream knows nothing)', async () => {
+  it('release mode also needs the pin on the default branch: on main passes; a fork-only commit (behind or diverged) fails', async () => {
+    expect((await run(onlyGate(), { ...tagRoute(), ...onMain() }, true)).ok).toBe(true);
+    expect((await run(onlyGate(), { ...tagRoute(), ...onMain(PIN, { status: 'diverged' }) }, true)).ok).toBe(false);
+    expect((await run(onlyGate(), { ...tagRoute(), ...onMain(PIN, { behind_by: 3 }) }, true)).ok).toBe(false);
+    expect((await run(onlyGate(), { ...tagRoute(), [API]: { default_branch: 'main' } }, true)).ok).toBe(false);
+    // the same fork-only commit passes pre-merge mode (the tag tie is the check there)
+    expect((await run(onlyGate(), { ...tagRoute(), ...onMain(PIN, { status: 'diverged' }) }, false)).ok).toBe(true);
+  });
+  it('the same entry under another repo is checked as any action', async () => {
     for (const repo of ['evil/pipegen', 'crisworking/other', 'CrisWorking/pipegen', 'crisworking/pipegen-fork']) {
-      const r = await run(onlyGate((e) => { e.candidate.repo = repo; e.step.action.uses = `${repo}/gate@${e.candidate.pin.sha}`; }));
+      const r = await run(onlyGate((e) => { e.candidate.repo = repo; e.step.action.uses = `${repo}/gate@${e.candidate.pin.sha}`; }), {});
       expect(r.ok, repo).toBe(false);
-      expect(r.calls.length, repo).toBeGreaterThan(0);
     }
   });
   it('a uses: that does not match the candidate repo and pin still fails for the own repo', async () => {
-    const r = await run(onlyGate((e) => { e.step.action.uses = `crisworking/pipegen/gate@${'a'.repeat(40)}`; }));
+    const r = await run(onlyGate((e) => { e.step.action.uses = `crisworking/pipegen/gate@${'a'.repeat(40)}`; }), tagRoute());
     expect(r.ok).toBe(false);
     expect(r.problems).toMatch(/does not match/);
+  });
+  it('the loader exempts only kind action under the exact own repo', () => {
+    const src = readFileSync(join(ROOT, 'src/engine/reviewed.ts'), 'utf8');
+    expect(src).toMatch(/!\(t\.candidate\.kind === 'action' && t\.candidate\.repo === PIPEGEN_OWN_REPO\)/);
   });
 });
