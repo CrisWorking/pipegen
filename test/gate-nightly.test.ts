@@ -16,7 +16,7 @@ import { GATE_VERSION } from '../gate/src/generated/gate-view.js';
 import { API_ROOT, githubAdapter, type AdapterOptions } from '../gate/src/github-adapter.js';
 import { main, MODE_INPUTS, type MainDeps } from '../gate/src/main.js';
 import {
-  BOT_LOGIN, effectiveBlockFrom, finishMissing, ISSUE_PAGE_CAP, runNightly, updateAvailable, updatePatch, upsertIssue, warnEnding, type NightlyAdapter,
+  BOT_LOGIN, effectiveBlockFrom, finishMissing, ISSUE_PAGE_CAP, resolveRepo, runNightly, updateAvailable, updatePatch, upsertIssue, warnEnding, type NightlyAdapter,
 } from '../gate/src/nightly.js';
 import { CRED, FPKEY, outputsOf, runner } from './helpers/gate-world.js';
 
@@ -27,6 +27,7 @@ const GH_IN = ['github', 'token'].join('-');
 const FP_IN = ['fp', 'key'].join('-');
 const SHA = (c: string): string => c.repeat(40);
 const TIP = SHA('e');
+const MERGE_SHA = SHA('7');
 const OLD = SHA('1');
 const NEW = SHA('a');
 const DAY = 86_400_000;
@@ -61,6 +62,8 @@ class FakeGh implements NightlyAdapter {
   runArtifacts = new Map<number, unknown>();
   blobs = new Map<number, Uint8Array>();
   listLimit = 100;
+  repoAnswer: unknown = { id: 7, full_name: 'acme/app', default_branch: 'main', private: false };
+  labelWrites: { number: number; labels: readonly string[] }[] = [];
   private t(name: string): void { this.calls.push(name); if (this.failing.has(name)) throw new Error(`${name} failed`); }
   // ---- the GateGithub reads nightly uses ----
   async branchHead(): Promise<unknown> { this.t('branchHead'); return this.tip; }
@@ -82,9 +85,20 @@ class FakeGh implements NightlyAdapter {
   async listReleases(): Promise<unknown> { this.t('listReleases'); if (this.releases instanceof Error) throw this.releases; return this.releases; }
   async tagRef(_o: string, _n: string, tag: string): Promise<unknown> { this.t('tagRef'); const a = this.tags.get(tag); if (a === undefined || a instanceof Error) throw (a ?? new Error('404')); return a; }
   async gitTag(_o: string, _n: string, sha: string): Promise<unknown> { this.t('gitTag'); const a = this.tagObjects.get(sha); if (a === undefined || a instanceof Error) throw (a ?? new Error('404')); return a; }
+  async getRepo(): Promise<unknown> { this.t('getRepo'); if (this.repoAnswer instanceof Error) throw this.repoAnswer; return this.repoAnswer; }
+  /** The server filters by the label `pipegen` (the adapter asks for labels=pipegen); every client check stays in nightly.ts. */
   async listIssues(_o: string, _n: string, page: number, perPage: number): Promise<unknown> {
     this.t('listIssues');
-    return this.issues.slice((page - 1) * perPage, page * perPage).slice(0, this.listLimit);
+    const labelled = this.issues.filter((i) => Array.isArray(i.labels) && (i.labels as Obj[]).some((l) => l.name === 'pipegen'));
+    return labelled.slice((page - 1) * perPage, page * perPage).slice(0, this.listLimit);
+  }
+  async addLabels(_o: string, _n: string, number: number, labels: readonly string[]): Promise<unknown> {
+    this.t('addLabels');
+    const x = this.issues.find((y) => y.number === number);
+    if (x === undefined) throw new Error('404');
+    this.labelWrites.push({ number, labels });
+    for (const name of labels) if (!(x.labels as Obj[]).some((l) => l.name === name)) (x.labels as Obj[]).push({ name });
+    return [];
   }
   // ---- the only writes ----
   async createIssue(_o: string, _n: string, i: { title: string; body: string; labels?: readonly string[] }): Promise<unknown> {
@@ -111,9 +125,9 @@ class FakeGh implements NightlyAdapter {
   async listAttemptJobs(): Promise<unknown> { throw new Error('unused'); }
   async getCommit(): Promise<unknown> { throw new Error('unused'); }
 }
-const writesOf = (gh: FakeGh): string[] => gh.calls.filter((c) => c === 'createIssue' || c === 'updateIssue');
+const writesOf = (gh: FakeGh): string[] => gh.calls.filter((c) => c === 'createIssue' || c === 'updateIssue' || c === 'addLabels');
 
-const rel = (tag: string, daysAgo: number, over: Obj = {}): Obj => ({ tag_name: tag, published_at: ago(daysAgo), draft: false, prerelease: false, body: '', ...over });
+const rel = (tag: string, daysAgo: number, over: Obj = {}): Obj => ({ tag_name: tag, published_at: ago(daysAgo), draft: false, prerelease: false, immutable: true, body: '', ...over });
 /** A gate release gate-v0.3.0 (10 days old) whose tag is a plain commit NEW. */
 function withUpdate(gh = new FakeGh(), version = '0.3.0', sha = NEW, days = 10): FakeGh {
   gh.releases = [rel(`gate-v${version}`, days), rel('v0.1.0', 40)];
@@ -322,7 +336,7 @@ describe('updatePatch', () => {
 // upsertIssue
 // ======================================================================================================
 
-const issue = (n: number, body: string, over: Obj = {}): Obj => ({ number: n, state: 'open', title: 't', body, labels: [], user: { login: BOT_LOGIN, type: 'Bot' }, ...over });
+const issue = (n: number, body: string, over: Obj = {}): Obj => ({ number: n, state: 'open', title: 't', body, labels: [{ name: 'pipegen' }], user: { login: BOT_LOGIN, type: 'Bot' }, ...over });
 const marker = (k: string): string => `<!-- pipegen:key=${k} -->`;
 
 describe('upsertIssue', () => {
@@ -332,7 +346,7 @@ describe('upsertIssue', () => {
     expect(n).toBe(100);
     expect(bodyOf(gh).split('\n')[0]).toBe(marker('finish-missing'));
     expect(bodyOf(gh)).toContain('hello');
-    expect(gh.issues[0]?.labels).toEqual([{ name: 'pipegen:patch' }]);
+    expect(gh.issues[0]?.labels).toEqual([{ name: 'pipegen' }, { name: 'pipegen:patch' }]);   // every nightly issue carries the label pipegen
   });
   it('the same key updates the same issue, never duplicates', async () => {
     const gh = new FakeGh();
@@ -459,7 +473,7 @@ describe('update available', () => {
     const g = gitApply([{ path: WORKFLOW_PATH, text: WF() }], `${diff}\n`);
     expect(g.ok, g.err).toBe(true);
     expect(g.out[WORKFLOW_PATH]).toBe(swapped(WF(), FROM, { sha: NEW, version: '0.3.0' }));
-    expect(gh.issues[0]?.labels).toEqual([{ name: 'pipegen:patch' }]);
+    expect(gh.issues[0]?.labels).toEqual([{ name: 'pipegen' }, { name: 'pipegen:patch' }]);
     expect(body).toContain(NEW);
   });
   it('baseSha is the git blob hash of the file text the patch was made from (computable offline)', async () => {
@@ -587,7 +601,7 @@ describe('update available', () => {
       expect(gh.issues.length).toBe(1);
       expect(bodyOf(gh)).toContain('npx pipegen@0.3.0 update');
       expect(bodyOf(gh)).not.toMatch(/```diff|pipegen:patch/);
-      expect(gh.issues[0]?.labels).toEqual([]);
+      expect(gh.issues[0]?.labels).toEqual([{ name: 'pipegen' }]);
       expect(bodyOf(gh)).toContain(NEW);
     }
   });
@@ -634,14 +648,14 @@ describe('update available', () => {
 });
 
 describe('finish missing', () => {
-  const pr = (over: Obj = {}): Obj => ({ number: 3, merged_at: ago(2), state: 'closed', head: { ref: 'pipegen/setup', repo: { id: 7 } }, base: { ref: 'main', repo: { id: 7 } }, ...over });
+  const pr = (over: Obj = {}): Obj => ({ number: 3, merge_commit_sha: MERGE_SHA, merged_at: ago(2), state: 'closed', head: { ref: 'pipegen/setup', repo: { id: 7 } }, base: { ref: 'main', repo: { id: 7 } }, ...over });
   const run = async (gh: FakeGh, over: Obj = {}): Promise<ReturnType<typeof runNightly>> => runNightly(gh, ctx(over));
   it('merged 2 days ago, no variable → opens the issue (key finish-missing) with the command and the merge time', async () => {
     const gh = new FakeGh(); gh.pulls = [pr()];
     const r = await run(gh);
     expect(r.errors).toEqual([]);
     expect(gh.issues.length).toBe(1);
-    expect(keyOfIssue(gh)).toBe('finish-missing');
+    expect(keyOfIssue(gh)).toBe(`finish-missing-${MERGE_SHA}`);
     expect(bodyOf(gh)).toContain('npx pipegen finish');
     expect(bodyOf(gh)).toContain(ago(2));
     expect(bodyOf(gh)).not.toMatch(/pipegen:patch|```diff/);
@@ -733,7 +747,7 @@ describe('warn mode ending', () => {
     const r = await runNightly(gh, ctx(IN_WINDOW));
     expect(r.errors).toEqual([]);
     expect(gh.issues.length).toBe(1);
-    expect(keyOfIssue(gh)).toBe('warn-ending');
+    expect(keyOfIssue(gh)).toBe('warn-ending-2026-11-01');
     expect(titleOf(gh)).toMatch(/2 days/);
     expect(bodyOf(gh)).toMatch(/5 existing findings|5 old findings/);
     expect(bodyOf(gh)).not.toMatch(/unknown/i);
@@ -805,7 +819,7 @@ describe('hostile repo and release strings', () => {
   it('the repository name, branch and notes are escaped once in every issue (no raw HTML, no mention, no link, no new line)', async () => {
     const repo: RepoRef = { owner: 'ac@me', name: HOSTILE, id: 7, defaultBranch: HOSTILE };
     const gh = withUpdate();
-    gh.pulls = [{ number: 3, merged_at: ago(2), head: { ref: 'pipegen/setup', repo: { id: 7 } }, base: { ref: HOSTILE, repo: { id: 7 } } }];
+    gh.pulls = [{ number: 3, merge_commit_sha: MERGE_SHA, merged_at: ago(2), head: { ref: 'pipegen/setup', repo: { id: 7 } }, base: { ref: HOSTILE, repo: { id: 7 } } }];
     gh.failing.add('listRuns');
     await runNightly(gh, ctx({ repo, blockFrom: undefined, recorded: '2026-11-01', key: 'k'.repeat(40) }));
     expect(gh.issues.length).toBeGreaterThanOrEqual(2);
@@ -825,7 +839,7 @@ describe('hostile repo and release strings', () => {
     const { safeMarkdown } = await import('../src/util/safe-text.js');
     const repo: RepoRef = { owner: 'acme', name: 'a_b*c', id: 7, defaultBranch: 'main' };
     const gh = new FakeGh();
-    gh.pulls = [{ number: 3, merged_at: ago(2), head: { ref: 'pipegen/setup', repo: { id: 7 } }, base: { ref: 'main', repo: { id: 7 } } }];
+    gh.pulls = [{ number: 3, merge_commit_sha: MERGE_SHA, merged_at: ago(2), head: { ref: 'pipegen/setup', repo: { id: 7 } }, base: { ref: 'main', repo: { id: 7 } } }];
     await runNightly(gh, ctx({ repo }));
     expect(bodyOf(gh)).toContain(safeMarkdown('acme/a_b*c', 200));
     expect(bodyOf(gh)).not.toContain(safeMarkdown(safeMarkdown('acme/a_b*c', 200), 200));
@@ -851,7 +865,7 @@ describe('hostile repo and release strings', () => {
 describe('nightly never writes anything but issues', () => {
   it('a full run on a world with all three issues only calls reads, listIssues, createIssue and updateIssue', async () => {
     const gh = withUpdate();
-    gh.pulls = [{ number: 3, merged_at: ago(2), head: { ref: 'pipegen/setup', repo: { id: 7 } }, base: { ref: 'main', repo: { id: 7 } } }];
+    gh.pulls = [{ number: 3, merge_commit_sha: MERGE_SHA, merged_at: ago(2), head: { ref: 'pipegen/setup', repo: { id: 7 } }, base: { ref: 'main', repo: { id: 7 } } }];
     await runNightly(gh, ctx({ blockFrom: undefined, recorded: '2026-11-01' }));
     await runNightly(gh, ctx({ blockFrom: undefined, recorded: '2026-11-01' }));
     expect(gh.issues.length).toBe(3);
@@ -871,12 +885,13 @@ describe('nightly never writes anything but issues', () => {
       if (method === 'POST' && p === '/repos/acme/app/issues') { const b = JSON.parse(String(init?.body)) as Obj; issues.unshift({ number: 41, state: 'open', ...b, labels: ((b.labels ?? []) as string[]).map((name) => ({ name })), user: { login: BOT_LOGIN, type: 'Bot' } }); return reply({ number: 41 }, 201); }
       if (method === 'PATCH' && p === '/repos/acme/app/issues/41') return reply({ number: 41 });
       if (method !== 'GET') return reply({}, 405);
+      if (p === '/repos/acme/app') return reply({ id: 7, full_name: 'acme/app', default_branch: 'main', private: false });
       if (p === '/repos/acme/app/issues') return reply(issues);
       if (p === '/repos/crisworking/pipegen/releases') return reply([rel('gate-v0.3.0', 10)]);
       if (p === '/repos/crisworking/pipegen/git/ref/tags/gate-v0.3.0') return reply({ ref: 'refs/tags/gate-v0.3.0', object: { type: 'commit', sha: NEW } });
       if (p === '/repos/acme/app/git/ref/heads/main') return reply({ ref: 'refs/heads/main', object: { type: 'commit', sha: TIP } });
       if (p.startsWith('/repos/acme/app/contents/')) return reply({ type: 'file', encoding: 'base64', size: Buffer.byteLength(WF()), content: Buffer.from(WF()).toString('base64'), sha: SHA('0') });
-      if (p === '/repos/acme/app/pulls') return reply([{ number: 3, merged_at: ago(2), head: { ref: 'pipegen/setup', repo: { id: 7 } }, base: { ref: 'main', repo: { id: 7 } } }]);
+      if (p === '/repos/acme/app/pulls') return reply([{ number: 3, merge_commit_sha: MERGE_SHA, merged_at: ago(2), head: { ref: 'pipegen/setup', repo: { id: 7 } }, base: { ref: 'main', repo: { id: 7 } } }]);
       return reply({}, 404);
     }) as typeof fetch;
     const gh = githubAdapter({ [['to', 'ken'].join('')]: CRED, fetch: fetchFn } as unknown as AdapterOptions);
@@ -888,7 +903,7 @@ describe('nightly never writes anything but issues', () => {
     expect(writes.length).toBeGreaterThan(0);
     for (const w of writes) expect(`${w.method} ${w.url}`).toMatch(/^(?:POST \/repos\/acme\/app\/issues|PATCH \/repos\/acme\/app\/issues\/41)$/);
     // the reads: only these paths (no contents write, no ref write, no PR write exists as a method)
-    for (const s of seen.filter((x) => x.method === 'GET')) expect(s.url.split('?')[0], s.url).toMatch(/^\/repos\/(?:acme\/app|crisworking\/pipegen)\/(?:issues|releases|git\/ref\/tags\/[\w.-]+|git\/tags\/[0-9a-f]{40}|git\/ref\/heads\/main|contents\/\.github\/workflows\/pipegen\.yml|pulls|actions\/workflows\/pipegen\.yml\/runs)$/);
+    for (const s of seen.filter((x) => x.method === 'GET')) expect(s.url.split('?')[0], s.url).toMatch(/^\/repos\/(?:acme\/app\/?$|(?:acme\/app|crisworking\/pipegen)\/(?:issues|releases|git\/ref\/tags\/[\w.-]+|git\/tags\/[0-9a-f]{40}|git\/ref\/heads\/main|contents\/\.github\/workflows\/pipegen\.yml|pulls|actions\/workflows\/pipegen\.yml\/runs))$/);
     expect(JSON.stringify(seen)).not.toContain(CRED);
   });
   it('the adapter has no method that writes contents, workflows, refs or pull requests, and its write path refuses any other target', () => {
@@ -914,9 +929,11 @@ describe('nightly never writes anything but issues', () => {
 // the action: main.ts mode nightly, action.yml, the row
 // ======================================================================================================
 
-const PAYLOAD = (over: Obj = {}): Obj => ({ repository: { id: 7, name: 'app', full_name: 'acme/app', owner: { login: 'acme' }, default_branch: 'main', private: false, ...over } });
+/** The real payload of a `schedule` run: the cron and nothing else (no `repository`). */
+const PAYLOAD = (): Obj => ({ schedule: '17 3 * * *' });
 async function go(inputs: Record<string, string | undefined>, gh?: FakeGh): Promise<{ code: number; out: string; lines: string[]; summary: string; r: ReturnType<typeof runner> }> {
   const r = runner(inputs, { event: 'schedule', sha: SHA('d'), payload: PAYLOAD() });
+  r.env.GITHUB_REPOSITORY_ID = '7';
   const chunks: string[] = [];
   const nightly: MainDeps['nightly'] = gh === undefined ? undefined : () => gh;
   const code = await main({ env: r.env, now: () => NOW, write: (t) => { chunks.push(t); }, ...(nightly === undefined ? {} : { nightly }) });
@@ -928,10 +945,10 @@ const NIGHT = (over: Record<string, string | undefined> = {}): Record<string, st
 describe('mode nightly in main.ts', () => {
   it('runs end to end on a fixture world: exit 0, the issues opened, the summary lists them, the token is masked first', async () => {
     const gh = withUpdate();
-    gh.pulls = [{ number: 3, merged_at: ago(2), head: { ref: 'pipegen/setup', repo: { id: 7 } }, base: { ref: 'main', repo: { id: 7 } } }];
+    gh.pulls = [{ number: 3, merge_commit_sha: MERGE_SHA, merged_at: ago(2), head: { ref: 'pipegen/setup', repo: { id: 7 } }, base: { ref: 'main', repo: { id: 7 } } }];
     const x = await go(NIGHT(), gh);
     expect(x.code, x.out).toBe(0);
-    expect(gh.issues.map((i) => String(i.body).split('\n')[0]).sort()).toEqual(['<!-- pipegen:key=finish-missing -->', '<!-- pipegen:key=update-0.3.0 -->']);
+    expect(gh.issues.map((i) => String(i.body).split('\n')[0]).sort()).toEqual([`<!-- pipegen:key=finish-missing-${MERGE_SHA} -->`, '<!-- pipegen:key=update-0.3.0 -->']);
     expect(x.lines.slice(0, 2).sort()).toEqual([`::add-mask::${CRED}`, `::add-mask::${FPKEY}`].sort());
     expect(x.summary).toMatch(/update-0\.3\.0|0\.3\.0/);
     expect(x.lines.filter((l) => !l.startsWith('::add-mask::')).join('\n')).not.toContain(CRED.slice(8));
@@ -966,7 +983,7 @@ describe('mode nightly in main.ts', () => {
     const x = await go(NIGHT({ 'block-from': '2026-11-01' }), gh);
     expect(x.code, x.out).toBe(0);
     expect(gh.issues.length).toBe(1);
-    expect(keyOfIssue(gh)).toBe('warn-ending');
+    expect(keyOfIssue(gh)).toBe('warn-ending-2026-11-01');
   });
   it('without fp-key (not a fork case: a repo without the secret) the warning is the soft one', async () => {
     const gh = new FakeGh();
@@ -976,6 +993,7 @@ describe('mode nightly in main.ts', () => {
   it('nothing else is written: no file in the runner temp folder, the workspace is not read', async () => {
     const gh = withUpdate();
     const r = runner(NIGHT(), { event: 'schedule', sha: SHA('d'), payload: PAYLOAD() });
+    r.env.GITHUB_REPOSITORY_ID = '7';
     const read: string[] = [];
     const env = new Proxy(r.env, { get(t, k) { if (typeof k === 'string') read.push(k); return Reflect.get(t, k); } });
     await main({ env, now: () => NOW, write: () => undefined, nightly: () => gh });
@@ -1047,13 +1065,15 @@ describe('the bundle runs nightly end to end on a fixture world', () => {
       routes: {
         [`${P}/releases?per_page=100&page=1`]: [{ ...rel('gate-v0.3.0', 10, { body: `crisworking/pipegen/gate@${SHA('f')}` }), published_at: real(10) }],
         [`${P}/git/ref/tags/gate-v0.3.0`]: { ref: 'refs/tags/gate-v0.3.0', object: { type: 'commit', sha: NEW } },
+        [`${A}`]: { id: 7, full_name: 'acme/app', default_branch: 'main', private: false },
         [`${A}/git/ref/heads/main`]: { ref: 'refs/heads/main', object: { type: 'commit', sha: TIP } },
         [`${A}/contents/.github/workflows/pipegen.yml?ref=${TIP}`]: { type: 'file', encoding: 'base64', size: Buffer.byteLength(WF()), content: Buffer.from(WF()).toString('base64'), sha: SHA('0') },
-        [`${A}/pulls?state=closed&head=acme%3Apipegen%2Fsetup&sort=updated&direction=desc&per_page=100&page=1`]: [{ number: 3, merged_at: real(2), head: { ref: 'pipegen/setup', repo: { id: 7 } }, base: { ref: 'main', repo: { id: 7 } } }],
+        [`${A}/pulls?state=closed&head=acme%3Apipegen%2Fsetup&sort=updated&direction=desc&per_page=100&page=1`]: [{ number: 3, merge_commit_sha: MERGE_SHA, merged_at: real(2), head: { ref: 'pipegen/setup', repo: { id: 7 } }, base: { ref: 'main', repo: { id: 7 } } }],
       },
       issues: [], zips: {}, runs: {},
     }));
     const r = runner(NIGHT(), { event: 'schedule', sha: SHA('d'), payload: PAYLOAD() });
+    r.env.GITHUB_REPOSITORY_ID = '7';
     const x = await runNode({ ...r.env, PIPEGEN_FAKE_GH: file, PIPEGEN_FAKE_GH_LOG: log });
     expect(x.code, x.stdout).toBe(0);
     const writes = readFileSync(log, 'utf8').trim().split('\n').map((l) => JSON.parse(l) as { method: string; path: string; body: { title: string; body: string; labels?: string[] } });
@@ -1061,8 +1081,8 @@ describe('the bundle runs nightly end to end on a fixture world', () => {
     const update = writes.find((w) => w.body.body.includes('pipegen:key=update-0.3.0'));
     expect(update?.body.body).toContain(NEW);
     expect(update?.body.body).not.toContain(SHA('f'));
-    expect(update?.body.labels).toEqual(['pipegen:patch']);
-    expect(writes.some((w) => w.body.body.includes('pipegen:key=finish-missing'))).toBe(true);
+    expect(update?.body.labels).toEqual(['pipegen', 'pipegen:patch']);
+    expect(writes.some((w) => w.body.body.includes(`pipegen:key=finish-missing-${MERGE_SHA}`))).toBe(true);
     expect(x.stdout.split('\n').filter((l) => !l.startsWith('::add-mask::')).join('\n')).not.toContain(CRED.slice(8));
   });
   it('the bundle has the nightly mode (no "built in C7" stub left) and no contents/ref/pull write path', () => {
@@ -1074,3 +1094,317 @@ describe('the bundle runs nightly end to end on a fixture world', () => {
 });
 
 void API_ROOT;
+
+
+// ======================================================================================================
+// fix round 1 (review-C7.md, task-C7-fix-round-1.md)
+// ======================================================================================================
+
+describe('fix round 1, ruling 1: the repository identity does not come from the event payload (a schedule payload has none)', () => {
+  it('resolveRepo: GITHUB_REPOSITORY plus GET /repos/{o}/{r}: id equals GITHUB_REPOSITORY_ID, full_name equals GITHUB_REPOSITORY (any case), default_branch from the answer', async () => {
+    const gh = new FakeGh();
+    gh.repoAnswer = { id: 7, full_name: 'Acme/App', default_branch: 'trunk', private: true };
+    expect(await resolveRepo(gh, 'acme/app', '7')).toEqual({ owner: 'acme', name: 'app', id: 7, defaultBranch: 'trunk' });
+  });
+  it('resolveRepo refuses (a string, never a RepoRef): another id, another name, no or odd id text, a missing branch, an API error, a bad GITHUB_REPOSITORY', async () => {
+    const cases: [string, (g: FakeGh) => void, string, string | undefined][] = [
+      ['other id', (g) => { g.repoAnswer = { id: 8, full_name: 'acme/app', default_branch: 'main' }; }, 'acme/app', '7'],
+      ['other name', (g) => { g.repoAnswer = { id: 7, full_name: 'evil/app', default_branch: 'main' }; }, 'acme/app', '7'],
+      ['no branch', (g) => { g.repoAnswer = { id: 7, full_name: 'acme/app' }; }, 'acme/app', '7'],
+      ['empty branch', (g) => { g.repoAnswer = { id: 7, full_name: 'acme/app', default_branch: '' }; }, 'acme/app', '7'],
+      ['id as text in the answer', (g) => { g.repoAnswer = { id: '7', full_name: 'acme/app', default_branch: 'main' }; }, 'acme/app', '7'],
+      ['inherited fields', (g) => { g.repoAnswer = Object.create({ id: 7, full_name: 'acme/app', default_branch: 'main' }); }, 'acme/app', '7'],
+      ['not an object', (g) => { g.repoAnswer = 'x'; }, 'acme/app', '7'],
+      ['api error', (g) => { g.repoAnswer = new Error('boom'); }, 'acme/app', '7'],
+      ['no id text', () => undefined, 'acme/app', undefined],
+      ['id text 7x', () => undefined, 'acme/app', '7x'],
+      ['id text 0', () => undefined, 'acme/app', '0'],
+      ['id text 1e1', () => undefined, 'acme/app', '1e1'],
+      ['bad repository', () => undefined, 'acme', '7'],
+      ['bad repository 2', () => undefined, 'a/b/c', '7'],
+      ['bad repository 3', () => undefined, '../x/app', '7'],
+    ];
+    for (const [name, set, full, id] of cases) {
+      const gh = new FakeGh(); set(gh);
+      expect(typeof (await resolveRepo(gh, full, id)), name).toBe('string');
+    }
+  });
+  it('through main() with the real schedule payload {"schedule": "<cron>"} (no repository): the issues are opened, repo identity from the API', async () => {
+    const gh = withUpdate();
+    gh.pulls = [{ number: 3, merge_commit_sha: MERGE_SHA, merged_at: ago(2), head: { ref: 'pipegen/setup', repo: { id: 7 } }, base: { ref: 'main', repo: { id: 7 } } }];
+    const x = await go(NIGHT(), gh);
+    expect(x.code, x.out).toBe(0);
+    expect(gh.issues.length).toBe(2);
+    expect(gh.calls[0]).toBe('getRepo');
+  });
+  it('workflow_dispatch: a payload with a repository is not read either; a lying default_branch in it is ignored', async () => {
+    const gh = withUpdate();
+    const r = runner(NIGHT(), { event: 'workflow_dispatch', sha: SHA('d'), payload: { inputs: {}, ref: 'refs/heads/dev', repository: { id: 7, name: 'app', full_name: 'acme/app', owner: { login: 'acme' }, default_branch: 'dev' } } });
+    r.env.GITHUB_REPOSITORY_ID = '7';
+    const code = await main({ env: r.env, now: () => NOW, write: () => undefined, nightly: () => gh });
+    expect(code).toBe(0);
+    expect(gh.issues.length).toBe(1);
+  });
+  it('an identity that does not match (id, name) or an API error: exit 1, no issue, no further call', async () => {
+    for (const set of [(g: FakeGh) => { g.repoAnswer = { id: 8, full_name: 'acme/app', default_branch: 'main' }; }, (g: FakeGh) => { g.repoAnswer = new Error('boom'); }]) {
+      const gh = withUpdate(); set(gh);
+      const x = await go(NIGHT(), gh);
+      expect(x.code).toBe(1);
+      expect(gh.calls).toEqual(['getRepo']);
+    }
+    const gh = withUpdate();
+    const r = runner(NIGHT(), { event: 'schedule', sha: SHA('d'), payload: PAYLOAD() });   // no GITHUB_REPOSITORY_ID
+    expect(await main({ env: r.env, now: () => NOW, write: () => undefined, nightly: () => gh })).toBe(1);
+    expect(gh.calls).toEqual([]);
+  });
+  it('main.ts nightly never reads `repository` from the payload', () => {
+    const src = readFileSync(join(ROOT, 'gate/src/main.ts'), 'utf8');
+    const i = src.indexOf('async function runNightlyMode');
+    const body = src.slice(i, src.indexOf('// ---------- the reviewed view'));
+    expect(body).not.toMatch(/repoOf|GITHUB_EVENT_PATH|readRunnerFile/);
+  });
+});
+
+describe('fix round 1, ruling 2: every nightly issue carries the label pipegen, and the search asks for it', () => {
+  it('600 bot pull requests and closed items without the label do not hide an existing labelled issue', async () => {
+    const gh = new FakeGh();
+    gh.issues = [
+      ...Array.from({ length: 300 }, (_, i) => issue(2000 + i, 'bot pr', { labels: [], pull_request: { url: 'u' } })),
+      ...Array.from({ length: 300 }, (_, i) => issue(3000 + i, 'closed noise', { labels: [], state: 'closed' })),
+      issue(5, `${marker('k1')}\nold`),
+    ];
+    expect(await upsertIssue(gh, REPO, 'k1', 'T', 'new')).toBe(5);
+    expect(writesOf(gh)).toEqual(['updateIssue']);
+  });
+  it('the cap still fails closed (500 labelled items without the key)', async () => {
+    const gh = new FakeGh();
+    gh.issues = Array.from({ length: ISSUE_PAGE_CAP * 100 }, (_, i) => issue(1000 + i, 'noise'));
+    await expect(upsertIssue(gh, REPO, 'k1', 'T', 'x')).rejects.toThrow();
+    expect(writesOf(gh)).toEqual([]);
+  });
+  it('someone removing the label can only cause a duplicate, never a suppression: an issue without the label is simply not found', async () => {
+    const gh = new FakeGh();
+    gh.issues = [issue(5, `${marker('k1')}\nold`, { labels: [] })];
+    expect(await upsertIssue(gh, REPO, 'k1', 'T', 'x')).toBe(100);
+  });
+  it('the adapter asks for labels=pipegen, creator and state; the label is in every create call', async () => {
+    const seen: string[] = [];
+    const bodies: Obj[] = [];
+    const fetchFn = (async (input: string | URL | Request, init?: RequestInit) => {
+      seen.push(String(input));
+      if (init?.method === 'POST') { bodies.push(JSON.parse(String(init.body)) as Obj); return new Response('{"number":9}', { status: 201 }); }
+      return new Response('[]', { status: 200 });
+    }) as typeof fetch;
+    const gh = githubAdapter({ [['to', 'ken'].join('')]: CRED, fetch: fetchFn } as unknown as AdapterOptions);
+    await upsertIssue(gh, REPO, 'k1', 'T', 'b');
+    const u = new URL(seen[0] as string);
+    expect(u.searchParams.get('labels')).toBe('pipegen');
+    expect(u.searchParams.get('creator')).toBe('github-actions[bot]');
+    expect(u.searchParams.get('state')).toBe('all');
+    expect(bodies[0]?.labels).toEqual(['pipegen']);
+  });
+});
+
+describe('fix round 1, ruling 3: only immutable releases count', () => {
+  it('a release without immutable: true gives no update and a note; so does a string "true"', async () => {
+    for (const imm of [false, undefined, 'true', 1, null]) {
+      const gh = withUpdate();
+      (gh.releases as Obj[])[0] = rel('gate-v0.3.0', 10, imm === undefined ? { immutable: undefined } : { immutable: imm });
+      const r = await runNightly(gh, ctx());
+      expect(gh.issues, String(imm)).toEqual([]);
+      expect(gh.calls, String(imm)).not.toContain('tagRef');
+      expect(r.notes.join(' '), String(imm)).toMatch(/immutable/i);
+    }
+  });
+  it('a mutable newer release does not hide an older immutable eligible one; an immutable one is offered as before', async () => {
+    const gh = new FakeGh();
+    gh.releases = [rel('gate-v0.4.0', 20, { immutable: false }), rel('gate-v0.3.0', 20)];
+    gh.tags.set('gate-v0.3.0', { ref: 'refs/tags/gate-v0.3.0', object: { type: 'commit', sha: NEW } });
+    await runNightly(gh, ctx());
+    expect(keyOfIssue(gh)).toBe('update-0.3.0');
+  });
+  it('the advisory says to compare with the pin in the reviewed list of that pipegen version, not with the tag', async () => {
+    const gh = withUpdate();
+    await runNightly(gh, ctx());
+    const body = bodyOf(gh);
+    expect(body).toMatch(/reviewed list/i);
+    expect(body).not.toMatch(/compare the commit with the tag/i);
+  });
+});
+
+describe('fix round 1, ruling 4: keys carry the instance', () => {
+  it('warn-ending-<date>: a closed issue for one date does not silence another date', async () => {
+    const gh = new FakeGh();
+    gh.issues = [issue(5, `${marker('warn-ending-2026-10-31')}\nold`, { state: 'closed' })];
+    await runNightly(gh, ctx({ blockFrom: '2026-11-01' }), { loadBaseline: async () => ({ baseline: null, note: 'n' }) });
+    expect(gh.issues.map((i) => i.number)).toContain(100);
+    expect(keyOfIssue(gh)).toBe('warn-ending-2026-11-01');
+    // the same date stays dismissed
+    const g2 = new FakeGh();
+    g2.issues = [issue(5, `${marker('warn-ending-2026-11-01')}\nold`, { state: 'closed' })];
+    await runNightly(g2, ctx({ blockFrom: '2026-11-01' }), { loadBaseline: async () => ({ baseline: null, note: 'n' }) });
+    expect(writesOf(g2)).toEqual([]);
+  });
+  it('finish-missing-<merge commit sha>: a closed issue for one setup merge does not silence another', async () => {
+    const gh = new FakeGh();
+    gh.issues = [issue(5, `${marker(`finish-missing-${SHA('6')}`)}\nold`, { state: 'closed' })];
+    gh.pulls = [{ number: 3, merge_commit_sha: MERGE_SHA, merged_at: ago(2), head: { ref: 'pipegen/setup', repo: { id: 7 } }, base: { ref: 'main', repo: { id: 7 } } }];
+    await runNightly(gh, ctx());
+    expect(keyOfIssue(gh)).toBe(`finish-missing-${MERGE_SHA}`);
+  });
+  it('a merged setup PR without a valid merge_commit_sha is not a proof', async () => {
+    for (const bad of [undefined, null, 'abc', SHA('a').toUpperCase(), 5]) {
+      const gh = new FakeGh();
+      gh.pulls = [{ number: 3, merge_commit_sha: bad, merged_at: ago(2), head: { ref: 'pipegen/setup', repo: { id: 7 } }, base: { ref: 'main', repo: { id: 7 } } }];
+      await runNightly(gh, ctx());
+      expect(gh.issues, String(bad)).toEqual([]);
+    }
+  });
+});
+
+describe('fix round 1, ruling 4: the pipegen:patch label follows the patch', () => {
+  it('an issue that gains a patch on a later night gets the label (POST .../labels), once; with the label already there nothing is added', async () => {
+    const gh = withUpdate();
+    gh.file = null;
+    await runNightly(gh, ctx());
+    expect(gh.issues[0]?.labels).toEqual([{ name: 'pipegen' }]);
+    gh.file = WF();
+    await runNightly(gh, ctx());
+    expect(bodyOf(gh)).toMatch(/pipegen:patch/);
+    expect(gh.issues[0]?.labels).toEqual([{ name: 'pipegen' }, { name: 'pipegen:patch' }]);
+    expect(gh.labelWrites).toEqual([{ number: 100, labels: ['pipegen:patch'] }]);
+    await runNightly(gh, ctx());
+    expect(gh.labelWrites.length).toBe(1);
+  });
+  it('through the real adapter the label write is POST /repos/{o}/{r}/issues/{n}/labels with the label names, and nothing else is widened', async () => {
+    const seen: { method: string; url: string; body?: string }[] = [];
+    const fetchFn = (async (input: string | URL | Request, init?: RequestInit) => {
+      seen.push({ method: init?.method ?? 'GET', url: new URL(String(input)).pathname, ...(typeof init?.body === 'string' ? { body: init.body } : {}) });
+      return new Response('[]', { status: 200 });
+    }) as typeof fetch;
+    const gh = githubAdapter({ [['to', 'ken'].join('')]: CRED, fetch: fetchFn } as unknown as AdapterOptions) as unknown as NightlyAdapter;
+    await gh.addLabels('acme', 'app', 41, ['pipegen:patch']);
+    expect(seen).toEqual([{ method: 'POST', url: '/repos/acme/app/issues/41/labels', body: '{"labels":["pipegen:patch"]}' }]);
+    for (const bad of [() => gh.addLabels('acme', 'app', 0, ['pipegen:patch']), () => gh.addLabels('acme', 'app', 41, []), () => gh.addLabels('acme', 'app', 41, ['a b']), () => gh.addLabels('acme', 'app', 41, ['x\n'])]) await expect(bad()).rejects.toThrow();
+    expect(seen.length).toBe(1);
+  });
+});
+
+describe('fix round 1, ruling 4: the pin swap knows block scalars; shown lines refuse invisible characters', () => {
+  const PATH = WORKFLOW_PATH;
+  const pinLine = (ind: string): string => `${ind}uses: ${pin(OLD, GATE_VERSION)}`;
+  it('a pin-shaped line inside a `run: |` block (and `- run: |`, `>`, `|-`, `>-`) is left alone; the real step lines around it are swapped', () => {
+    for (const head of ['      - run: |', '        run: |', '      - run: >', '        run: |-', '        run: >-', '        run: |2']) {
+      const dashed = head.includes('- ');
+      const text = ['jobs:', '  a:', '    steps:', head, `          ${'echo hi'}`, pinLine('          '), '', pinLine('            '), dashed ? '        name: after' : '      - name: after', pinLine('        '), ''].join('\n');
+      const patch = updatePatch([{ path: PATH, text }], FROM, TO);
+      const r = gitApply([{ path: PATH, text }], patch);
+      expect(r.ok, `${head}: ${r.err}`).toBe(true);
+      const lines = (r.out[PATH] as string).split('\n');
+      expect(lines[5], head).toBe(pinLine('          '));
+      expect(lines[7], head).toBe(pinLine('            '));
+      expect(lines[9], head).toBe(`        uses: ${pin(NEW, '0.3.0')}`);
+    }
+  });
+  it('a matching line only inside a block scalar gives the empty patch; a sibling key at the same column ends the block', () => {
+    const only = ['a:', '  - run: |', pinLine('      '), ''].join('\n');
+    expect(updatePatch([{ path: PATH, text: only }], FROM, TO)).toBe('');
+    const sib = ['a:', '  - run: |', '      echo', pinLine('    '), ''].join('\n');
+    expect(updatePatch([{ path: PATH, text: sib }], FROM, TO)).not.toBe('');
+  });
+  it('a block header inside a comment or a plain value that merely ends with | is not a block', () => {
+    const text = ['a:', '  # run: |', pinLine('  '), '  b: x |', pinLine('  '), ''].join('\n');
+    const r = gitApply([{ path: PATH, text }], updatePatch([{ path: PATH, text }], FROM, TO));
+    expect(r.ok, r.err).toBe(true);
+    expect(r.out[PATH]).toBe(swapped(text, FROM, TO));
+  });
+  it('invisible and format characters in a shown line are refused, class by class', () => {
+    const chars: [string, string][] = [
+      ['soft hyphen Cf', '\u00ad'], ['combining grapheme joiner', '\u034f'], ['mongolian vowel separator', '\u180e'], ['hangul filler', '\u3164'], ['variation selector', '\ufe0f'],
+      ['tag character', '\u{e0041}'], ['interlinear annotation', '\ufff9'], ['zero width space Cf', '\u200b'], ['line separator Zl', '\u2028'], ['paragraph separator Zp', '\u2029'],
+      ['private use Co', '\ue000'], ['plane 15 private use', '\u{f0000}'], ['lone surrogate Cs', '\ud800'], ['bidi override', '\u202e'], ['bidi isolate', '\u2066'], ['arabic letter mark', '\u061c'], ['bom', '\ufeff'], ['arabic number sign Cf', '\u0600'],
+    ];
+    for (const [name, c] of chars) {
+      const text = ['jobs:', `  # a${c}b`, `  - uses: ${pin(OLD, GATE_VERSION)}`, ''].join('\n');
+      expect(() => updatePatch([{ path: PATH, text }], FROM, TO), name).toThrow(/refus/i);
+    }
+    // ordinary non-ASCII text and a tab stay fine
+    const ok = ['jobs:', '  # caf\u00e9 \u65e5\u672c\u8a9e\t\u{1f600}', `  - uses: ${pin(OLD, GATE_VERSION)}`, ''].join('\n');
+    expect(() => updatePatch([{ path: PATH, text: ok }], FROM, TO)).not.toThrow();
+  });
+});
+
+describe('fix round 1: pin lines inside a block scalar are not pins, in the nightly too', () => {
+  it('a file whose only pin-shaped line is inside `run: |` gives the plain issue and a note', async () => {
+    const gh = withUpdate();
+    gh.file = ['jobs:', '  a:', '    steps:', '      - run: |', `          uses: ${pin(OLD, GATE_VERSION)}`, ''].join('\n');
+    const r = await runNightly(gh, ctx());
+    expect(bodyOf(gh)).not.toMatch(/pipegen:patch/);
+    expect(r.notes.join(' ')).toMatch(/no gate pin line/);
+  });
+});
+
+describe('fix round 1, ruling 4: older update issues are marked superseded, never closed', () => {
+  it('when the newer issue was closed by a person, older ones are left as they are', async () => {
+    const gh = withUpdate(new FakeGh(), '0.4.0', SHA('d'));
+    gh.issues = [issue(5, `${marker('update-0.3.0')}\nold`), issue(6, `${marker('update-0.4.0')}\nx`, { state: 'closed' })];
+    await runNightly(gh, ctx());
+    expect(String(gh.issues.find((i) => i.number === 5)?.body)).toBe(`${marker('update-0.3.0')}\nold`);
+  });
+  const OLD_ISSUE = (n: number, v: string, over: Obj = {}): Obj => issue(n, `${marker(`update-${v}`)}\n## pipegen gate v${v} is available\n\nbody`, over);
+  it('opening the issue for a newer version adds a "Superseded by #N" line under the marker of each older open bot update issue', async () => {
+    const gh = withUpdate(new FakeGh(), '0.4.0', SHA('d'));
+    gh.issues = [OLD_ISSUE(5, '0.3.0'), OLD_ISSUE(4, '0.2.5')];
+    await runNightly(gh, ctx());
+    const fresh = gh.issues.find((i) => String(i.body).startsWith(marker('update-0.4.0')));
+    expect(fresh).toBeDefined();
+    for (const n of [5, 4]) {
+      const b = String(gh.issues.find((i) => i.number === n)?.body).split('\n');
+      expect(b[0]).toBe(marker(`update-${n === 5 ? '0.3.0' : '0.2.5'}`));
+      expect(b[1]).toMatch(new RegExp(`^> Superseded by #${String(fresh?.number)}\\b`));
+      expect(gh.issues.find((i) => i.number === n)?.state).toBe('open');
+    }
+  });
+  it('it is idempotent, follows a still newer issue, and never touches: closed issues, a newer version, other keys, people\'s issues', async () => {
+    const gh = withUpdate(new FakeGh(), '0.4.0', SHA('d'));
+    const human = OLD_ISSUE(6, '0.3.0', { user: { login: 'mallory', type: 'User' } });
+    const closed = OLD_ISSUE(7, '0.3.1', { state: 'closed' });
+    const newer = OLD_ISSUE(8, '0.9.0');
+    const other = issue(9, `${marker(`finish-missing-${SHA('1')}`)}\nx`);
+    gh.issues = [OLD_ISSUE(5, '0.3.0'), human, closed, newer, other];
+    const before = [human, closed, newer, other].map((i) => String(i.body));
+    await runNightly(gh, ctx());
+    expect([6, 7, 8, 9].map((n) => String(gh.issues.find((i) => i.number === n)?.body))).toEqual(before);
+    const once = String(gh.issues.find((i) => i.number === 5)?.body);
+    const writes = gh.calls.filter((c) => c === 'updateIssue').length;
+    await runNightly(gh, ctx());
+    expect(String(gh.issues.find((i) => i.number === 5)?.body)).toBe(once);
+    expect(gh.calls.filter((c) => c === 'updateIssue').length).toBe(writes);
+    expect(gh.issues.every((i) => i.state === 'open' || i.number === 7)).toBe(true);
+  });
+  it('when 0.5.0 follows, the line of an already superseded issue names the newest issue', async () => {
+    const gh = withUpdate(new FakeGh(), '0.4.0', SHA('d'));
+    gh.issues = [OLD_ISSUE(5, '0.3.0')];
+    await runNightly(gh, ctx());
+    withUpdate(gh, '0.5.0', SHA('c'));
+    await runNightly(gh, ctx());
+    const n5 = String(gh.issues.find((i) => i.number === 5)?.body).split('\n');
+    const newest = gh.issues.find((i) => String(i.body).startsWith(marker('update-0.5.0')));
+    expect(n5.filter((l) => l.startsWith('> Superseded')).length).toBe(1);
+    expect(n5[1]).toContain(`#${String(newest?.number)}`);
+  });
+});
+
+describe('fix round 1, ruling 5: no issue ever carries key material', () => {
+  it('the fingerprint key and its key id appear in no issue body or title, in any of the three issues, with a trusted or a forged baseline', async () => {
+    const gh = withUpdate();
+    gh.pulls = [{ number: 3, merge_commit_sha: MERGE_SHA, merged_at: ago(2), head: { ref: 'pipegen/setup', repo: { id: 7 } }, base: { ref: 'main', repo: { id: 7 } } }];
+    const x = await go(NIGHT({ 'block-from': '', 'block-from-recorded': '2026-11-01' }), gh);
+    expect(x.code, x.out).toBe(0);
+    expect(gh.issues.length).toBe(3);
+    const all = gh.issues.map((i) => `${String(i.title)}\n${String(i.body)}`).join('\n') + x.summary;
+    expect(all).not.toContain(FPKEY);
+    expect(all).not.toContain(keyId(FPKEY));
+    expect(all).not.toContain(CRED);
+  });
+});

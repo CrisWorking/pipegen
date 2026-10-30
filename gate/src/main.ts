@@ -32,7 +32,7 @@ import { decideGate, type DecidedFinding, type GateInput, type GateResult } from
 import { gatherGateInput, repoOf, type GateIo } from './facts.js';
 import { findGatedRun, type GatedRunOpts } from './gated-run.js';
 import { githubAdapter, type AdapterOptions, type GateGithubAdapter } from './github-adapter.js';
-import { runNightly, type NightlyAdapter } from './nightly.js';
+import { resolveRepo, runNightly, type NightlyAdapter } from './nightly.js';
 import { scrubFile, type ScrubFileResult } from './scrub.js';
 import { GATE_VIEW } from './generated/gate-view.js';
 import { GATE_INPUTS, type GateToolView } from './settings.js';
@@ -655,8 +655,8 @@ async function runFindRun(step: Step, deps: MainDeps, get: (n: string) => string
 
 /**
  * Mode nightly (C7): opens or updates issues (nightly.ts). Inputs: github-token (required), fp-key (optional; without it the baseline can not
- * be trusted, so the warn-ending issue is the softer one), block-from and block-from-recorded (optional). It reads the event payload for
- * the repository and writes nothing but issues. A read that fails is a log line (the pipegen repository is private until v0.4, so "no
+ * be trusted, so the warn-ending issue is the softer one), block-from and block-from-recorded (optional). It never reads the event payload: the
+ * repository is GITHUB_REPOSITORY checked against GITHUB_REPOSITORY_ID by one `GET /repos/{o}/{r}`. It writes nothing but issues. A read that fails is a log line (the pipegen repository is private until v0.4, so "no
  * update" is the normal case); an issue that could not be written, or an issue list that can not be searched to its end, fails the step.
  */
 async function runNightlyMode(step: Step, deps: MainDeps, get: (n: string) => string | undefined): Promise<number> {
@@ -664,17 +664,13 @@ async function runNightlyMode(step: Step, deps: MainDeps, get: (n: string) => st
   const token = get('github-token');
   if (token === undefined) return fail('the github-token input is missing, so the step fails closed');
   if (badKey(get('fp-key'))) return fail(BAD_KEY);
-  let repo: ReturnType<typeof repoOf>;
-  try {
-    repo = repoOf(JSON.parse(readRunnerFile(step.env('GITHUB_EVENT_PATH'), 'the event payload (GITHUB_EVENT_PATH)')) as unknown, step.env('GITHUB_REPOSITORY') ?? '');
-  } catch (e) {
-    return fail(e instanceof StepError ? `${e.message}, so the step fails closed` : 'the event payload could not be read, so the step fails closed');
-  }
-  if (typeof repo === 'string') return fail(`${repo}, so the step fails closed`);
   const notes: string[] = [];
   let done;
   try {
     const gh = (deps.nightly ?? githubAdapter)({ token, mask: () => undefined, notes });
+    // the identity does not come from the event payload (a `schedule` run's payload is only {"schedule": "<cron>"}): GITHUB_REPOSITORY and one API read
+    const repo = await resolveRepo(gh, step.env('GITHUB_REPOSITORY'), step.env('GITHUB_REPOSITORY_ID'));
+    if (typeof repo === 'string') return fail(`${repo}, so the step fails closed`);
     done = await runNightly(gh, { repo, now: (deps.now ?? (() => new Date()))(), blockFrom: get('block-from'), recorded: get('block-from-recorded'), key: get('fp-key') });
   } catch {
     return fail('GitHub could not be reached or set up, so the step fails closed');

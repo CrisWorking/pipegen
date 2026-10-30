@@ -1,6 +1,6 @@
 // Plan C Task C7: the gate action's `nightly` mode. It runs on a schedule and opens or updates ISSUES, nothing else:
-//   - `warn-ending`    warn mode ends in 1 or 2 days and old findings exist (counted from the TRUSTED, MAC-verified baseline, S13) or are unknown;
-//   - `finish-missing` the setup pull request merged more than 24 hours ago and the PIPEGEN_BLOCK_FROM variable is still unset;
+//   - `warn-ending-<date>` warn mode ends in 1 or 2 days and old findings exist (counted from the TRUSTED, MAC-verified baseline, S13) or are unknown;
+//   - `finish-missing-<merge commit sha>` the setup pull request merged more than 24 hours ago and the PIPEGEN_BLOCK_FROM variable is still unset;
 //   - `update-<ver>`   a newer pipegen gate is out (released at least 7 days ago), with the exact patch for the pin line(s) in pipegen.yml.
 // It NEVER writes a file or a workflow (the job has `contents: read`, `actions: read`, `issues: write`): the only calls that are not reads
 // are createIssue and updateIssue, and the adapter has no other write method (test/gate-nightly.test.ts spies on all of it).
@@ -14,8 +14,8 @@
 //     can open an issue that looks exactly like pipegen's, even as github-actions[bot]. So `pipegen update` (Plan G) must re-derive the patch
 //     itself, from the reviewed list bundled with the CLI, and use the issue only as a prompt to do so. The issue text says this too.
 //
-// Update trust chain: the releases list gives candidate versions (tags `gate-v<x.y.z>` only, never the CLI's `v*` tags, never drafts or
-// prereleases) and their dates; the new SHA comes ONLY from resolving that tag through the git refs API (annotated tags followed, a limited
+// Update trust chain: the releases list gives candidate versions (tags `gate-v<x.y.z>` only, never the CLI's `v*` tags, never drafts, prereleases
+// or releases that are not IMMUTABLE: a mutable tag could be moved after the cooldown) and their dates; the new SHA comes ONLY from resolving that tag through the git refs API (annotated tags followed, a limited
 // depth), and must be a commit with a 40-hex sha. A release body is never read. The pipegen repository is private until v0.4, so any API
 // error or 404 is "no update", with a note; nothing is faked.
 import { createHash } from 'node:crypto';
@@ -29,6 +29,10 @@ import type { GateGithubAdapter } from './github-adapter.js';
 
 /** The reads and the two issue writes nightly needs on top of GateGithub. Every answer is parsed JSON and hostile (validated here). */
 export interface NightlyGithub {
+  /** `GET /repos/{o}/{r}` → `{ id, full_name, default_branch, ... }` (the repository's identity: a `schedule` event payload has none). */
+  getRepo(owner: string, name: string): Promise<unknown>;
+  /** `POST /repos/{o}/{r}/issues/{n}/labels` (adds labels; an issue endpoint). */
+  addLabels(owner: string, name: string, number: number, labels: readonly string[]): Promise<unknown>;
   /** `GET /repos/{o}/{r}/pulls?state=closed&head={o}:pipegen/setup&sort=updated&direction=desc&per_page&page` → an array. */
   listSetupPulls(owner: string, name: string, page: number, perPage: number): Promise<unknown>;
   /** `GET /repos/{o}/{r}/releases?per_page&page` → an array (newest first). */
@@ -37,7 +41,7 @@ export interface NightlyGithub {
   tagRef(owner: string, name: string, tag: string): Promise<unknown>;
   /** `GET /repos/{o}/{r}/git/tags/{sha}` → an annotated tag object `{ sha, object: { type, sha } }`. */
   gitTag(owner: string, name: string, sha: string): Promise<unknown>;
-  /** `GET /repos/{o}/{r}/issues?state=all&creator=github-actions[bot]&sort=created&direction=desc&per_page&page` → an array (pull requests included). */
+  /** `GET /repos/{o}/{r}/issues?state=all&labels=pipegen&creator=github-actions[bot]&sort=created&direction=desc&per_page&page` → an array (pull requests included). */
   listIssues(owner: string, name: string, page: number, perPage: number): Promise<unknown>;
   /** `POST /repos/{o}/{r}/issues` → `{ number }`. */
   createIssue(owner: string, name: string, issue: { title: string; body: string; labels?: readonly string[] }): Promise<unknown>;
@@ -129,8 +133,34 @@ export class PatchRefused extends Error {}
 const CONTEXT = 3;
 const MAX_SHOWN_LINE = 400;
 const PATCH_PATH_RE = /^[A-Za-z0-9._/-]{1,200}$/;
-/** Control characters (a tab is fine), DEL and C1, bidi and line-separator characters, the BOM and invisible formatting. */
-const UNSAFE_CHAR_RE = new RegExp('[\\u0000-\\u0008\\u000a-\\u001f\\u007f-\\u009f\\u200b-\\u200f\\u2028-\\u202e\\u2060-\\u2069\\ufeff\\u061c]');
+/** Control characters (a tab is fine), DEL and C1, every format, separator, private-use and surrogate character, the default-ignorable ones (soft hyphen, joiners, variation selectors, tag characters) and the bidi controls. */
+const UNSAFE_CHAR_RE = new RegExp('[\\u0000-\\u0008\\u000a-\\u001f\\u007f-\\u009f\\p{Cf}\\p{Zl}\\p{Zp}\\p{Co}\\p{Cs}\\p{Default_Ignorable_Code_Point}\\u202a-\\u202e\\u2066-\\u2069\\u061c\\ufeff\\ufff9-\\ufffb]', 'u');
+
+/** The lines that belong to a YAML block scalar (`run: |`, `>`, `|-`, `>-`, `|2`): their text is a script or a string, never a step. */
+function blockScalarLines(lines: readonly string[]): Set<number> {
+  const inside = new Set<number>();
+  let col: number | undefined;
+  lines.forEach((raw, i) => {
+    const line = raw.replace(/\r$/, '');
+    if (col !== undefined) {
+      if (line.trim() === '') { inside.add(i); return; }
+      if ((/^ */.exec(line) as RegExpExecArray)[0].length > col) { inside.add(i); return; }
+      col = undefined;
+    }
+    if (/^\s*#/.test(line)) return;
+    const m = /^( *)((?:- +)?)[^\s#:][^#]*?:[ \t]+[|>][+-]?[1-9]?[+-]?[ \t]*(?:#.*)?$/.exec(line);
+    if (m !== null) col = (m[1] as string).length + (m[2] as string).length;
+  });
+  return inside;
+}
+const pinLineRe = (sha: string, version: string): RegExp => new RegExp(`^(\\s*(?:-\\s+)?uses:\\s+)crisworking/pipegen/gate@${sha} # gate-v${version.replace(/\./g, '\\.')}(\\s*)$`);
+/** The shas the gate is pinned at, for `version`, on real step lines (not inside a block scalar). */
+export function pinnedShas(text: string, version: string): string[] {
+  const lines = text.split('\n');
+  const block = blockScalarLines(lines);
+  const re = pinLineRe('([0-9a-f]{40})', version);
+  return [...new Set(lines.map((l, i) => (block.has(i) ? undefined : re.exec(l)?.[2])).filter((x): x is string => x !== undefined))];
+}
 
 /** The diff of one file: only the lines that are exactly the pinned gate `uses:` of `from` change, to `to`. Empty when none does. */
 function filePatch(file: { path: string; text: string }, from: { sha: string; version: string }, to: { sha: string; version: string }): string {
@@ -138,11 +168,12 @@ function filePatch(file: { path: string; text: string }, from: { sha: string; ve
   const parts = file.text.split('\n');
   const endsWithNewline = parts[parts.length - 1] === '';
   const lines = endsWithNewline ? parts.slice(0, -1) : parts;
-  const re = new RegExp(`^(\\s*(?:-\\s+)?uses:\\s+)crisworking/pipegen/gate@${from.sha} # gate-v${from.version.replace(/\./g, '\\.')}(\\s*)$`);
+  const re = pinLineRe(from.sha, from.version);
+  const block = blockScalarLines(lines);
   const at: number[] = [];
   const replaced = new Map<number, string>();
   lines.forEach((line, i) => {
-    const m = re.exec(line);
+    const m = block.has(i) ? null : re.exec(line);
     if (m === null) return;
     at.push(i);
     replaced.set(i, `${m[1] as string}crisworking/pipegen/gate@${to.sha} # gate-v${to.version}${m[2] as string}`);
@@ -199,6 +230,31 @@ export function updatePatch(files: readonly { path: string; text: string }[], fr
   return files.map((f) => filePatch(f, from, to)).join('');
 }
 
+// ---------- the repository ----------
+
+const FULL_RE = /^([A-Za-z0-9](?:[A-Za-z0-9-]{0,38}))\/([A-Za-z0-9._-]{1,100})$/;
+/**
+ * The repository nightly works on, from GITHUB_REPOSITORY and GITHUB_REPOSITORY_ID plus one read, `GET /repos/{o}/{r}`: the answer's id must equal
+ * the runner's id and its full_name must equal GITHUB_REPOSITORY (any case); the default branch is the answer's. The event payload is never read:
+ * a `schedule` run's payload is only `{"schedule": "<cron>"}`. A string is the reason it could not be established (fail closed).
+ */
+export async function resolveRepo(gh: NightlyGithub, full: string | undefined, idText: string | undefined): Promise<RepoRef | string> {
+  const m = typeof full === 'string' ? FULL_RE.exec(full) : null;
+  if (m === null || m[2] === '.' || m[2] === '..') return 'GITHUB_REPOSITORY is not an owner/name';
+  if (typeof idText !== 'string' || !/^[1-9][0-9]{0,15}$/.test(idText) || !Number.isSafeInteger(Number(idText))) return 'GITHUB_REPOSITORY_ID is not a repository id';
+  const [owner, name] = [m[1] as string, m[2] as string];
+  let a: unknown;
+  try { a = await gh.getRepo(owner, name); } catch { return 'the repository could not be read (GET /repos/{owner}/{name})'; }
+  if (!isPlain(a)) return 'the repository answer is not an object';
+  const id = own(a, 'id');
+  const fullName = own(a, 'full_name');
+  const branch = own(a, 'default_branch');
+  if (id !== Number(idText)) return 'the repository id does not equal GITHUB_REPOSITORY_ID';
+  if (typeof fullName !== 'string' || fullName.toLowerCase() !== (full as string).toLowerCase()) return 'the repository name does not equal GITHUB_REPOSITORY';
+  if (typeof branch !== 'string' || branch === '' || branch.length > 255) return 'the repository answer has no default branch';
+  return { owner, name, id: Number(idText), defaultBranch: branch };
+}
+
 // ---------- issues ----------
 
 /** The author of every issue nightly opens: the workflow token's own bot. The key marker is looked for only in issues by this account. */
@@ -210,6 +266,8 @@ const MAX_TITLE = 256;
 const MAX_BODY = 60_000;
 const markerOf = (key: string): string => `<!-- pipegen:key=${key} -->`;
 
+/** The label every nightly issue carries; the issue search asks for it. */
+export const ISSUE_LABEL = 'pipegen';
 export interface UpsertOptions { labels?: readonly string[] }
 export type IssueAction = 'created' | 'updated' | 'unchanged' | 'left-closed';
 export interface IssueOutcome { key: string; number: number; action: IssueAction }
@@ -219,7 +277,8 @@ export interface IssueOutcome { key: string; number: number; action: IssueAction
  * github-actions[bot] (type Bot) count: an issue by a person, or by any other account, is never edited and never blocks ours. A closed
  * issue is left alone (a person closed it). Pull requests in the list are skipped. The list is paged up to ISSUE_PAGE_CAP pages; running
  * into the cap, a failed or malformed list all FAIL CLOSED (they throw, nothing is created: no blind duplicate).
- * The caller's title and body are already escaped; the marker line is added here.
+ * The caller's title and body are already escaped; the marker line is added here. Every issue carries the label `pipegen`, and the search asks for it (the
+ * bot's pull requests and unrelated issues then never fill the page cap; a removed label can only cause one duplicate, never a suppression).
  */
 export async function upsertIssueDetailed(gh: NightlyGithub, repo: RepoRef, key: string, title: string, body: string, opts: UpsertOptions = {}): Promise<IssueOutcome> {
   if (typeof key !== 'string' || !KEY_RE.test(key)) throw new Error('nightly: the issue key is not a plain key');
@@ -227,7 +286,7 @@ export async function upsertIssueDetailed(gh: NightlyGithub, repo: RepoRef, key:
   const text = `${markerOf(key)}\n${body}`;
   if (typeof body !== 'string' || text.length > MAX_BODY) throw new Error('nightly: the issue body is too long');
   const marker = markerOf(key);
-  let open: { number: number; title: string; body: string } | undefined;
+  let open: { number: number; title: string; body: string; labels: string[] } | undefined;
   let closed: number | undefined;
   let complete = false;
   for (let page = 1; page <= ISSUE_PAGE_CAP; page++) {
@@ -242,20 +301,28 @@ export async function upsertIssueDetailed(gh: NightlyGithub, repo: RepoRef, key:
       if (!isPlain(user) || own(user, 'login') !== BOT_LOGIN || own(user, 'type') !== 'Bot') continue;
       const b = own(raw, 'body');
       if (typeof b !== 'string' || (b.split('\n')[0] as string).replace(/\r$/, '') !== marker) continue;
-      if (own(raw, 'state') === 'open') { open = { number, title: String(own(raw, 'title') ?? ''), body: b }; break; }
+      if (own(raw, 'state') === 'open') {
+        const ls = own(raw, 'labels');
+        const names = Array.isArray(ls) ? ls.map((l) => (isPlain(l) ? own(l, 'name') : undefined)).filter((n): n is string => typeof n === 'string') : [];
+        open = { number, title: String(own(raw, 'title') ?? ''), body: b, labels: names };
+        break;
+      }
       closed ??= number;
     }
     if (open !== undefined) break;
     if (list.length < ISSUE_PER_PAGE) { complete = true; break; }
   }
   if (open !== undefined) {
-    if (open.title === title && open.body.replace(/\r\n/g, '\n') === text) return { key, number: open.number, action: 'unchanged' };
-    await gh.updateIssue(repo.owner, repo.name, open.number, { title, body: text });
-    return { key, number: open.number, action: 'updated' };
+    // an issue that gains a patch gains the label pipegen:patch too (the shared patch-issue format); a label is never removed
+    const missing = (opts.labels ?? []).filter((l) => !(open as { labels: string[] }).labels.includes(l));
+    const same = open.title === title && open.body.replace(/\r\n/g, '\n') === text;
+    if (!same) await gh.updateIssue(repo.owner, repo.name, open.number, { title, body: text });
+    if (missing.length > 0) await gh.addLabels(repo.owner, repo.name, open.number, missing);
+    return { key, number: open.number, action: same ? 'unchanged' : 'updated' };
   }
   if (closed !== undefined) return { key, number: closed, action: 'left-closed' };
   if (!complete) throw new Error(`nightly: the issue list reaches its cap of ${ISSUE_PAGE_CAP} pages without ending, so no issue is created (it might be a duplicate)`);
-  const made = await gh.createIssue(repo.owner, repo.name, { title, body: text, ...(opts.labels === undefined || opts.labels.length === 0 ? {} : { labels: opts.labels }) });
+  const made = await gh.createIssue(repo.owner, repo.name, { title, body: text, labels: [ISSUE_LABEL, ...(opts.labels ?? [])] });
   const n = isPlain(made) ? own(made, 'number') : undefined;
   if (typeof n !== 'number' || !Number.isSafeInteger(n) || n <= 0) throw new Error('nightly: GitHub did not answer with the number of the new issue');
   return { key, number: n, action: 'created' };
@@ -272,12 +339,12 @@ const PULL_PAGES = 3;
 /**
  * The merge time of the latest merged PR from `pipegen/setup` in THIS repository: the head branch is exactly that name, the head repository
  * id equals the base repository id and this repository's id (a fork is ignored), the base is the default branch, and `merged_at` is a
- * timestamp not in the future. Any API error or malformed answer is "no proof".
+ * timestamp not in the future and `merge_commit_sha` a 40-hex commit (it keys the issue: one instance per setup merge). Any API error or malformed answer is "no proof".
  */
-export async function setupMergedAt(gh: NightlyGithub, repo: RepoRef, now: Date): Promise<{ at?: string; note?: string }> {
+export async function setupMergedAt(gh: NightlyGithub, repo: RepoRef, now: Date): Promise<{ at?: string; sha?: string; note?: string }> {
   const clock = clockOf(now);
   if (clock === undefined) return { note: 'the clock is not a date, so the setup merge is not proven' };
-  let best: { t: number; at: string } | undefined;
+  let best: { t: number; at: string; sha: string } | undefined;
   try {
     for (let page = 1; page <= PULL_PAGES; page++) {
       const list = await gh.listSetupPulls(repo.owner, repo.name, page, 100);
@@ -294,15 +361,16 @@ export async function setupMergedAt(gh: NightlyGithub, repo: RepoRef, now: Date)
         if (typeof hid !== 'number' || hid !== bid || hid !== repo.id) continue;
         const merged = own(pr, 'merged_at');
         const t = isoTime(merged);
-        if (t === undefined || t > clock) continue;
-        if (best === undefined || t > best.t) best = { t, at: merged as string };
+        const mergeSha = own(pr, 'merge_commit_sha');
+        if (t === undefined || t > clock || typeof mergeSha !== 'string' || !SHA_RE.test(mergeSha)) continue;
+        if (best === undefined || t > best.t) best = { t, at: merged as string, sha: mergeSha };
       }
       if (list.length < 100) break;
     }
   } catch {
     return { note: 'the list of closed setup pull requests could not be read, so the setup merge is not proven' };
   }
-  return best === undefined ? {} : { at: best.at };
+  return best === undefined ? {} : { at: best.at, sha: best.sha };
 }
 
 // ---------- the update ----------
@@ -337,11 +405,11 @@ async function resolveGateTag(gh: NightlyGithub, tag: string): Promise<string> {
 
 /**
  * The newest gate release that is newer than `current` and past the cooldown, with its commit resolved from the TAG (never from a release
- * body). The tag scheme is C6's `gate-v<x.y.z>`; the CLI's `v*` tags, drafts and prereleases are ignored. Any API error, a malformed list
+ * body). The tag scheme is C6's `gate-v<x.y.z>`; the CLI's `v*` tags, drafts, prereleases and releases that are not immutable are ignored. Any API error, a malformed list
  * or an unresolvable tag is "no update" with a note.
  */
 export async function latestGateRelease(gh: NightlyGithub, current: string, now: Date): Promise<{ release?: GateRelease; note?: string }> {
-  const found: { version: string; ver: [number, number, number]; publishedAt: string; tag: string }[] = [];
+  const found: { version: string; ver: [number, number, number]; publishedAt: string; tag: string; immutable: boolean }[] = [];
   try {
     for (let page = 1; page <= RELEASE_PAGES; page++) {
       const list = await gh.listReleases(PIPEGEN_OWNER, PIPEGEN_NAME, page, 100);
@@ -353,7 +421,7 @@ export async function latestGateRelease(gh: NightlyGithub, current: string, now:
         const published = own(r, 'published_at');
         if (m === null || own(r, 'draft') !== false || own(r, 'prerelease') !== false || isoTime(published) === undefined) continue;
         const ver = semver(m[1] as string);
-        if (ver !== undefined) found.push({ version: m[1] as string, ver, publishedAt: published as string, tag: tag as string });
+        if (ver !== undefined) found.push({ version: m[1] as string, ver, publishedAt: published as string, tag: tag as string, immutable: own(r, 'immutable') === true });
       }
       if (list.length < 100) break;
     }
@@ -361,8 +429,10 @@ export async function latestGateRelease(gh: NightlyGithub, current: string, now:
     return { note: 'no update check: the release list of pipegen could not be read (the repository is private until v0.4, so this is expected)' };
   }
   const eligible = found.filter((f) => updateAvailable(current, { version: f.version, publishedAt: f.publishedAt }, now)).sort((a, b) => (newer(a.ver, b.ver) ? -1 : newer(b.ver, a.ver) ? 1 : 0));
-  const top = eligible[0];
-  if (top === undefined) return {};
+  // an immutable release locks its tag: without it the tag could be moved to another commit after the cooldown, and the commit resolved now
+  // would never have waited the 7 days
+  const top = eligible.find((f) => f.immutable);
+  if (top === undefined) return eligible.length === 0 ? {} : { note: `no update: ${eligible[0]?.tag ?? 'the newest release'} is not an immutable release, so its tag could be moved after the cooldown` };
   try {
     const sha = await resolveGateTag(gh, top.tag);
     return { release: { version: top.version, publishedAt: top.publishedAt, tag: top.tag, sha } };
@@ -439,7 +509,7 @@ function fenceFor(text: string): string {
 const ADVISORY = [
   '> **This issue is advisory.** Anyone with issue rights in a public repository, and any job with `issues: write`, can open an issue that looks exactly like this one, even as `github-actions[bot]`.',
   '> So `pipegen update` does not apply a patch from an issue: it re-derives the patch itself, from the reviewed list bundled with the pipegen version you run, and uses this issue only as a prompt.',
-  '> If you apply anything by hand, compare the commit with the tag `gate-v{VERSION}` in pipegen\'s repository first.',
+  '> If you apply anything by hand, compare the commit with the pin in the reviewed list of `pipegen@{VERSION}` (the list `pipegen update` uses), not with the tag: a tag is not authority.',
 ].join('\n');
 
 function updateIssue(repo: RepoRef, rel: GateRelease, patch: { diff: string; baseSha: string } | undefined, notes: readonly string[]): { title: string; body: string; labels: string[] } {
@@ -470,6 +540,41 @@ function updateIssue(repo: RepoRef, rel: GateRelease, patch: { diff: string; bas
 
 const MAX_PATCH_CHARS = 30_000;
 
+// ---------- older update issues ----------
+
+const UPDATE_KEY_RE = /^update-((?:0|[1-9][0-9]{0,5})\.(?:0|[1-9][0-9]{0,5})\.(?:0|[1-9][0-9]{0,5}))$/;
+const SUPERSEDED_RE = /^> Superseded by #/;
+/**
+ * Marks each older OPEN update issue of ours (bot, type Bot, key update-<older version>) as superseded: a line under the key marker,
+ * "> Superseded by #N", replaced if it names an older issue. Never closes anything and never touches a closed issue, a person's issue,
+ * another key or a newer version. Idempotent: an issue that already says it is not written again.
+ */
+async function supersedeOlder(gh: NightlyGithub, repo: RepoRef, version: string, newNumber: number): Promise<void> {
+  const cur = semver(version) as [number, number, number];
+  for (let page = 1; page <= ISSUE_PAGE_CAP; page++) {
+    const list = await gh.listIssues(repo.owner, repo.name, page, ISSUE_PER_PAGE);
+    if (!Array.isArray(list)) throw new Error('the issue list is not a list');
+    for (const raw of list) {
+      if (!isPlain(raw) || own(raw, 'pull_request') !== undefined || own(raw, 'state') !== 'open') continue;
+      const number = own(raw, 'number');
+      const user = own(raw, 'user');
+      const body = own(raw, 'body');
+      const title = own(raw, 'title');
+      if (typeof number !== 'number' || !Number.isSafeInteger(number) || number <= 0 || number === newNumber || typeof body !== 'string' || typeof title !== 'string' || title === '') continue;
+      if (!isPlain(user) || own(user, 'login') !== BOT_LOGIN || own(user, 'type') !== 'Bot') continue;
+      const lines = body.replace(/\r\n/g, '\n').split('\n');
+      const k = UPDATE_KEY_RE.exec((/^<!-- pipegen:key=([^ ]+) -->$/.exec(lines[0] as string) ?? [])[1] ?? '');
+      const old = k === null ? undefined : semver(k[1] as string);
+      if (old === undefined || !newer(cur, old)) continue;
+      const rest = lines.slice(1);
+      if (SUPERSEDED_RE.test(rest[0] ?? '')) rest.shift();
+      const next = [lines[0] as string, `> Superseded by #${newNumber}: pipegen gate v${version} is out.`, ...rest].join('\n');
+      if (next !== lines.join('\n')) await gh.updateIssue(repo.owner, repo.name, number, { title, body: next });
+    }
+    if (list.length < ISSUE_PER_PAGE) return;
+  }
+}
+
 // ---------- the mode ----------
 
 export interface NightlyCtx {
@@ -491,9 +596,12 @@ export interface NightlyResult { issues: IssueOutcome[]; /** Why something was n
 export async function runNightly(gh: NightlyAdapter, ctx: NightlyCtx, deps: NightlyDeps = {}): Promise<NightlyResult> {
   const result: NightlyResult = { issues: [], notes: [], errors: [] };
   const { repo, now } = ctx;
-  const upsert = async (key: string, issue: { title: string; body: string; labels?: string[] }): Promise<void> => {
-    try { result.issues.push(await upsertIssueDetailed(gh, repo, key, issue.title, issue.body, { labels: issue.labels ?? [] })); }
-    catch (e) { result.errors.push(`the issue ${key} was not written: ${e instanceof Error ? e.message : 'unknown error'}`); }
+  const upsert = async (key: string, issue: { title: string; body: string; labels?: string[] }): Promise<IssueOutcome | undefined> => {
+    try {
+      const out = await upsertIssueDetailed(gh, repo, key, issue.title, issue.body, { labels: issue.labels ?? [] });
+      result.issues.push(out);
+      return out;
+    } catch (e) { result.errors.push(`the issue ${key} was not written: ${e instanceof Error ? e.message : 'unknown error'}`); return undefined; }
   };
 
   // 1. warn mode ends. A clean-run marker is NOT consulted: it can only move the gate toward block and never suppresses a warning.
@@ -509,14 +617,14 @@ export async function runNightly(gh: NightlyAdapter, ctx: NightlyCtx, deps: Nigh
       } else note = loaded.note;
     } catch { note = 'the baseline lookup failed'; }
     const w = warnEnding(effective, now, old);
-    if (w?.open === true) await upsert('warn-ending', warnEndingIssue(repo, effective, w, old, note));
+    if (w?.open === true) await upsert(`warn-ending-${effective}`, warnEndingIssue(repo, effective, w, old, note));
   }
 
   // 2. the setup PR merged and `finish` has not run
   if (validDate(ctx.blockFrom) === undefined) {
     const merged = await setupMergedAt(gh, repo, now);
     if (merged.note !== undefined) result.notes.push(merged.note);
-    if (merged.at !== undefined && finishMissing(ctx.blockFrom, merged.at, now)) await upsert('finish-missing', finishMissingIssue(repo, merged.at));
+    if (merged.at !== undefined && merged.sha !== undefined && finishMissing(ctx.blockFrom, merged.at, now)) await upsert(`finish-missing-${merged.sha as string}`, finishMissingIssue(repo, merged.at));
   }
 
   // 3. a pipegen update
@@ -530,8 +638,7 @@ export async function runNightly(gh: NightlyAdapter, ctx: NightlyCtx, deps: Nigh
       const file = await readWorkflow(gh, repo);
       if ('why' in file) notes.push(`no patch: ${file.why}`);
       else {
-        const re = new RegExp(`^\\s*(?:-\\s+)?uses:\\s+crisworking/pipegen/gate@([0-9a-f]{40}) # gate-v${GATE_VERSION.replace(/\./g, '\\.')}\\s*$`);
-        const pinned = new Set(file.text.split('\n').map((l) => re.exec(l)?.[1]).filter((x): x is string => x !== undefined));
+        const pinned = new Set(pinnedShas(file.text, GATE_VERSION));
         if (pinned.size === 0) notes.push(`no patch: pipegen.yml has no gate pin line for v${GATE_VERSION}`);
         else if (pinned.size > 1) notes.push('no patch: pipegen.yml pins the gate at more than one commit for this version, so the swap is ambiguous');
         else {
@@ -545,7 +652,10 @@ export async function runNightly(gh: NightlyAdapter, ctx: NightlyCtx, deps: Nigh
       notes.push(e instanceof PatchRefused ? `the patch was left out: ${e.message}` : 'no patch: the workflow file could not be read');
     }
     result.notes.push(...notes);
-    await upsert(`update-${rel.version}`, updateIssue(repo, rel, patch, notes));
+    const made = await upsert(`update-${rel.version}`, updateIssue(repo, rel, patch, notes));
+    if (made !== undefined && made.action !== 'left-closed') {
+      try { await supersedeOlder(gh, repo, rel.version, made.number); } catch (e) { result.notes.push(`older update issues were not marked as superseded: ${e instanceof Error ? e.message : 'unknown error'}`); }
+    }
   }
   return result;
 }

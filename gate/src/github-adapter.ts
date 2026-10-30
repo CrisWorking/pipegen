@@ -11,8 +11,8 @@
 //   - every non-2xx answer is an error, except the documented 404 mappings (fileAt and rawFileAt → null, tagExists → false); a rate limit
 //     (429, or 403 with `x-ratelimit-remaining: 0` or `retry-after`) is an error with a note, never a wait;
 //   - every body is capped, on its declared length and on the bytes as they stream in; JSON is parsed once, and malformed JSON is an error;
-//   - writes (C7, nightly): the ONLY non-GET requests are `POST /repos/{o}/{r}/issues` and `PATCH /repos/{o}/{r}/issues/{n}`, built by createIssue and
-//     updateIssue alone (title, body and labels checked first); `send` refuses any other target. There is no method that writes a file, a workflow,
+//   - writes (C7, nightly): the ONLY non-GET requests are `POST /repos/{o}/{r}/issues`, `PATCH /repos/{o}/{r}/issues/{n}` and `POST .../issues/{n}/labels`,
+//     built by createIssue, updateIssue and addLabels alone (title, body and labels checked first); `send` refuses any other target. There is no method that writes a file, a workflow,
 //     a ref or a pull request, so the nightly job's issues: write token is all it ever uses;
 //   - pagination: each caller pages itself (C3, C4) within its own cap; the adapter refuses a page past that cap, and an artifact list cut
 //     short of its total_count.
@@ -69,7 +69,7 @@ export type FullGithubAdapter = GateGithubAdapter & NightlyGithub;
 const MAX_ISSUE_TITLE = 256;
 const MAX_ISSUE_BODY = 65_000;
 const LABEL_RE = /^[A-Za-z0-9][A-Za-z0-9:._-]{0,49}$/;
-const ISSUE_WRITE_RE = /^\/repos\/[A-Za-z0-9._-]+\/[A-Za-z0-9._-]+\/issues(?:\/[1-9][0-9]{0,14})?$/;
+const ISSUE_WRITE_RE = /^\/repos\/[A-Za-z0-9._-]+\/[A-Za-z0-9._-]+\/issues(?:\/[1-9][0-9]{0,14}(?:\/labels)?)?$/;
 
 // ---------- checked path parts ----------
 
@@ -180,11 +180,16 @@ export function githubAdapter(opts: AdapterOptions): FullGithubAdapter {
 
   /** The one write path (C7): an issue is created or edited; any other target is refused before a request. The answer must carry the issue number. */
   async function send(method: 'POST' | 'PATCH', path: string, body: Record<string, unknown>): Promise<unknown> {
-    if (!ISSUE_WRITE_RE.test(path) || (method === 'POST') !== /\/issues$/.test(path)) fail('a write that is not an issue');
+    const labels = /\/labels$/.test(path);
+    if (!ISSUE_WRITE_RE.test(path) || (method === 'POST') !== /\/issues(?:\/[0-9]+\/labels)?$/.test(path)) fail('a write that is not an issue');
     const r = await call(path, { write: { method, body: JSON.stringify(body) } });
     if (r.status === 404) throw new GitHubApiError(`${method} ${path}: not found`, { status: 404 });
     let answer: unknown;
     try { answer = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(r.body)) as unknown; } catch { throw new GitHubApiError(`${method} ${path}: the answer is not JSON`); }
+    if (labels) {
+      if (!Array.isArray(answer)) throw new GitHubApiError(`${method} ${path}: the answer is not a list of labels`);
+      return { labels: answer.length };
+    }
     const n = typeof answer === 'object' && answer !== null && Object.hasOwn(answer, 'number') ? (answer as { number: unknown }).number : undefined;
     if (typeof n !== 'number' || !Number.isSafeInteger(n) || n <= 0) throw new GitHubApiError(`${method} ${path}: the answer has no issue number`);
     return { number: n };
@@ -267,18 +272,23 @@ export function githubAdapter(opts: AdapterOptions): FullGithubAdapter {
       try { return new TextDecoder('utf-8', { fatal: true }).decode(r.body); } catch { throw new GitHubApiError('the raw file is not UTF-8 text'); }
     },
     getCommit: async (owner, name, commit) => getJson(`${repo(owner, name)}/commits/${sha(commit)}`),
-    // ---- C7 (nightly): reads, then the two issue writes ----
+    // ---- C7 (nightly): reads, then the issue writes ----
+    getRepo: async (owner, name) => getJson(repo(owner, name)),
     listSetupPulls: async (owner, name, p, per) => getJson(`${repo(owner, name)}/pulls?${new URLSearchParams({ state: 'closed', head: `${owner}:pipegen/setup`, sort: 'updated', direction: 'desc', per_page: perPage(per), page: page(p, PAGE_CAP.pulls) }).toString()}`),
     listReleases: async (owner, name, p, per) => getJson(`${repo(owner, name)}/releases?${new URLSearchParams({ per_page: perPage(per), page: page(p, PAGE_CAP.releases) }).toString()}`),
     tagRef: async (owner, name, tag) => getJson(`${repo(owner, name)}/git/ref/tags/${refPath(tag)}`),
     gitTag: async (owner, name, tagSha) => getJson(`${repo(owner, name)}/git/tags/${sha(tagSha)}`),
-    listIssues: async (owner, name, p, per) => getJson(`${repo(owner, name)}/issues?${new URLSearchParams({ state: 'all', creator: 'github-actions[bot]', sort: 'created', direction: 'desc', per_page: perPage(per), page: page(p, PAGE_CAP.issues) }).toString()}`),
+    listIssues: async (owner, name, p, per) => getJson(`${repo(owner, name)}/issues?${new URLSearchParams({ state: 'all', labels: 'pipegen', creator: 'github-actions[bot]', sort: 'created', direction: 'desc', per_page: perPage(per), page: page(p, PAGE_CAP.issues) }).toString()}`),
     createIssue: async (owner, name, issue) => {
       const labels = issue.labels ?? [];
       if (typeof issue.title !== 'string' || issue.title === '' || issue.title.length > MAX_ISSUE_TITLE) fail('an issue title that is empty or over 256 characters');
       if (typeof issue.body !== 'string' || issue.body.length > MAX_ISSUE_BODY) fail('an issue body over the size cap');
       if (!Array.isArray(labels) || labels.length > 5 || labels.some((l) => typeof l !== 'string' || !LABEL_RE.test(l))) fail('a label that is not a plain label name');
       return send('POST', `${repo(owner, name)}/issues`, { title: issue.title, body: issue.body, ...(labels.length === 0 ? {} : { labels }) });
+    },
+    addLabels: async (owner, name, n, labels) => {
+      if (!Array.isArray(labels) || labels.length === 0 || labels.length > 5 || labels.some((l) => typeof l !== 'string' || !LABEL_RE.test(l))) fail('a label that is not a plain label name');
+      return send('POST', `${repo(owner, name)}/issues/${num(n)}/labels`, { labels });
     },
     updateIssue: async (owner, name, n, issue) => {
       if (typeof issue.title !== 'string' || issue.title === '' || issue.title.length > MAX_ISSUE_TITLE) fail('an issue title that is empty or over 256 characters');

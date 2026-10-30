@@ -8402,7 +8402,7 @@ var GitHubApiError = class extends Error {
 var MAX_ISSUE_TITLE = 256;
 var MAX_ISSUE_BODY = 65e3;
 var LABEL_RE = /^[A-Za-z0-9][A-Za-z0-9:._-]{0,49}$/;
-var ISSUE_WRITE_RE = /^\/repos\/[A-Za-z0-9._-]+\/[A-Za-z0-9._-]+\/issues(?:\/[1-9][0-9]{0,14})?$/;
+var ISSUE_WRITE_RE = /^\/repos\/[A-Za-z0-9._-]+\/[A-Za-z0-9._-]+\/issues(?:\/[1-9][0-9]{0,14}(?:\/labels)?)?$/;
 var fail2 = (what) => {
   throw new GitHubApiError(`pipegen will not call GitHub with ${what}`);
 };
@@ -8525,7 +8525,8 @@ function githubAdapter(opts) {
     }
   }
   async function send(method, path, body) {
-    if (!ISSUE_WRITE_RE.test(path) || method === "POST" !== /\/issues$/.test(path)) fail2("a write that is not an issue");
+    const labels = /\/labels$/.test(path);
+    if (!ISSUE_WRITE_RE.test(path) || method === "POST" !== /\/issues(?:\/[0-9]+\/labels)?$/.test(path)) fail2("a write that is not an issue");
     const r = await call(path, { write: { method, body: JSON.stringify(body) } });
     if (r.status === 404) throw new GitHubApiError(`${method} ${path}: not found`, { status: 404 });
     let answer;
@@ -8533,6 +8534,10 @@ function githubAdapter(opts) {
       answer = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(r.body));
     } catch {
       throw new GitHubApiError(`${method} ${path}: the answer is not JSON`);
+    }
+    if (labels) {
+      if (!Array.isArray(answer)) throw new GitHubApiError(`${method} ${path}: the answer is not a list of labels`);
+      return { labels: answer.length };
     }
     const n = typeof answer === "object" && answer !== null && Object.hasOwn(answer, "number") ? answer.number : void 0;
     if (typeof n !== "number" || !Number.isSafeInteger(n) || n <= 0) throw new GitHubApiError(`${method} ${path}: the answer has no issue number`);
@@ -8636,18 +8641,23 @@ function githubAdapter(opts) {
       }
     },
     getCommit: async (owner, name, commit) => getJson(`${repo(owner, name)}/commits/${sha2(commit)}`),
-    // ---- C7 (nightly): reads, then the two issue writes ----
+    // ---- C7 (nightly): reads, then the issue writes ----
+    getRepo: async (owner, name) => getJson(repo(owner, name)),
     listSetupPulls: async (owner, name, p, per) => getJson(`${repo(owner, name)}/pulls?${new URLSearchParams({ state: "closed", head: `${owner}:pipegen/setup`, sort: "updated", direction: "desc", per_page: perPage(per), page: page(p, PAGE_CAP.pulls) }).toString()}`),
     listReleases: async (owner, name, p, per) => getJson(`${repo(owner, name)}/releases?${new URLSearchParams({ per_page: perPage(per), page: page(p, PAGE_CAP.releases) }).toString()}`),
     tagRef: async (owner, name, tag) => getJson(`${repo(owner, name)}/git/ref/tags/${refPath(tag)}`),
     gitTag: async (owner, name, tagSha) => getJson(`${repo(owner, name)}/git/tags/${sha2(tagSha)}`),
-    listIssues: async (owner, name, p, per) => getJson(`${repo(owner, name)}/issues?${new URLSearchParams({ state: "all", creator: "github-actions[bot]", sort: "created", direction: "desc", per_page: perPage(per), page: page(p, PAGE_CAP.issues) }).toString()}`),
+    listIssues: async (owner, name, p, per) => getJson(`${repo(owner, name)}/issues?${new URLSearchParams({ state: "all", labels: "pipegen", creator: "github-actions[bot]", sort: "created", direction: "desc", per_page: perPage(per), page: page(p, PAGE_CAP.issues) }).toString()}`),
     createIssue: async (owner, name, issue) => {
       const labels = issue.labels ?? [];
       if (typeof issue.title !== "string" || issue.title === "" || issue.title.length > MAX_ISSUE_TITLE) fail2("an issue title that is empty or over 256 characters");
       if (typeof issue.body !== "string" || issue.body.length > MAX_ISSUE_BODY) fail2("an issue body over the size cap");
       if (!Array.isArray(labels) || labels.length > 5 || labels.some((l) => typeof l !== "string" || !LABEL_RE.test(l))) fail2("a label that is not a plain label name");
       return send("POST", `${repo(owner, name)}/issues`, { title: issue.title, body: issue.body, ...labels.length === 0 ? {} : { labels } });
+    },
+    addLabels: async (owner, name, n, labels) => {
+      if (!Array.isArray(labels) || labels.length === 0 || labels.length > 5 || labels.some((l) => typeof l !== "string" || !LABEL_RE.test(l))) fail2("a label that is not a plain label name");
+      return send("POST", `${repo(owner, name)}/issues/${num(n)}/labels`, { labels });
     },
     updateIssue: async (owner, name, n, issue) => {
       if (typeof issue.title !== "string" || issue.title === "" || issue.title.length > MAX_ISSUE_TITLE) fail2("an issue title that is empty or over 256 characters");
@@ -9512,17 +9522,47 @@ var PatchRefused = class extends Error {
 var CONTEXT = 3;
 var MAX_SHOWN_LINE = 400;
 var PATCH_PATH_RE = /^[A-Za-z0-9._/-]{1,200}$/;
-var UNSAFE_CHAR_RE = new RegExp("[\\u0000-\\u0008\\u000a-\\u001f\\u007f-\\u009f\\u200b-\\u200f\\u2028-\\u202e\\u2060-\\u2069\\ufeff\\u061c]");
+var UNSAFE_CHAR_RE = new RegExp("[\\u0000-\\u0008\\u000a-\\u001f\\u007f-\\u009f\\p{Cf}\\p{Zl}\\p{Zp}\\p{Co}\\p{Cs}\\p{Default_Ignorable_Code_Point}\\u202a-\\u202e\\u2066-\\u2069\\u061c\\ufeff\\ufff9-\\ufffb]", "u");
+function blockScalarLines(lines) {
+  const inside = /* @__PURE__ */ new Set();
+  let col;
+  lines.forEach((raw, i) => {
+    const line = raw.replace(/\r$/, "");
+    if (col !== void 0) {
+      if (line.trim() === "") {
+        inside.add(i);
+        return;
+      }
+      if (/^ */.exec(line)[0].length > col) {
+        inside.add(i);
+        return;
+      }
+      col = void 0;
+    }
+    if (/^\s*#/.test(line)) return;
+    const m = /^( *)((?:- +)?)[^\s#:][^#]*?:[ \t]+[|>][+-]?[1-9]?[+-]?[ \t]*(?:#.*)?$/.exec(line);
+    if (m !== null) col = m[1].length + m[2].length;
+  });
+  return inside;
+}
+var pinLineRe = (sha3, version) => new RegExp(`^(\\s*(?:-\\s+)?uses:\\s+)crisworking/pipegen/gate@${sha3} # gate-v${version.replace(/\./g, "\\.")}(\\s*)$`);
+function pinnedShas(text, version) {
+  const lines = text.split("\n");
+  const block = blockScalarLines(lines);
+  const re = pinLineRe("([0-9a-f]{40})", version);
+  return [...new Set(lines.map((l, i) => block.has(i) ? void 0 : re.exec(l)?.[2]).filter((x) => x !== void 0))];
+}
 function filePatch(file, from, to) {
   if (!PATCH_PATH_RE.test(file.path) || file.path.split("/").some((p) => p === "" || p === "." || p === "..")) throw new PatchRefused("Refused: the file path is not a plain repository path.");
   const parts = file.text.split("\n");
   const endsWithNewline = parts[parts.length - 1] === "";
   const lines = endsWithNewline ? parts.slice(0, -1) : parts;
-  const re = new RegExp(`^(\\s*(?:-\\s+)?uses:\\s+)crisworking/pipegen/gate@${from.sha} # gate-v${from.version.replace(/\./g, "\\.")}(\\s*)$`);
+  const re = pinLineRe(from.sha, from.version);
+  const block = blockScalarLines(lines);
   const at3 = [];
   const replaced = /* @__PURE__ */ new Map();
   lines.forEach((line, i) => {
-    const m = re.exec(line);
+    const m = block.has(i) ? null : re.exec(line);
     if (m === null) return;
     at3.push(i);
     replaced.set(i, `${m[1]}crisworking/pipegen/gate@${to.sha} # gate-v${to.version}${m[2]}`);
@@ -9573,6 +9613,27 @@ function updatePatch(files, from, to) {
   checkPin(to, "new");
   return files.map((f) => filePatch(f, from, to)).join("");
 }
+var FULL_RE = /^([A-Za-z0-9](?:[A-Za-z0-9-]{0,38}))\/([A-Za-z0-9._-]{1,100})$/;
+async function resolveRepo(gh, full, idText) {
+  const m = typeof full === "string" ? FULL_RE.exec(full) : null;
+  if (m === null || m[2] === "." || m[2] === "..") return "GITHUB_REPOSITORY is not an owner/name";
+  if (typeof idText !== "string" || !/^[1-9][0-9]{0,15}$/.test(idText) || !Number.isSafeInteger(Number(idText))) return "GITHUB_REPOSITORY_ID is not a repository id";
+  const [owner, name] = [m[1], m[2]];
+  let a;
+  try {
+    a = await gh.getRepo(owner, name);
+  } catch {
+    return "the repository could not be read (GET /repos/{owner}/{name})";
+  }
+  if (!isPlain8(a)) return "the repository answer is not an object";
+  const id = own6(a, "id");
+  const fullName = own6(a, "full_name");
+  const branch = own6(a, "default_branch");
+  if (id !== Number(idText)) return "the repository id does not equal GITHUB_REPOSITORY_ID";
+  if (typeof fullName !== "string" || fullName.toLowerCase() !== full.toLowerCase()) return "the repository name does not equal GITHUB_REPOSITORY";
+  if (typeof branch !== "string" || branch === "" || branch.length > 255) return "the repository answer has no default branch";
+  return { owner, name, id: Number(idText), defaultBranch: branch };
+}
 var BOT_LOGIN = "github-actions[bot]";
 var ISSUE_PAGE_CAP = 5;
 var ISSUE_PER_PAGE = 100;
@@ -9580,6 +9641,7 @@ var KEY_RE = /^[a-z0-9][a-z0-9.-]{0,63}$/;
 var MAX_TITLE = 256;
 var MAX_BODY = 6e4;
 var markerOf = (key) => `<!-- pipegen:key=${key} -->`;
+var ISSUE_LABEL = "pipegen";
 async function upsertIssueDetailed(gh, repo2, key, title, body, opts = {}) {
   if (typeof key !== "string" || !KEY_RE.test(key)) throw new Error("nightly: the issue key is not a plain key");
   if (typeof title !== "string" || title === "" || title.length > MAX_TITLE) throw new Error("nightly: the issue title is empty or too long");
@@ -9603,7 +9665,9 @@ ${body}`;
       const b = own6(raw, "body");
       if (typeof b !== "string" || b.split("\n")[0].replace(/\r$/, "") !== marker) continue;
       if (own6(raw, "state") === "open") {
-        open = { number, title: String(own6(raw, "title") ?? ""), body: b };
+        const ls = own6(raw, "labels");
+        const names = Array.isArray(ls) ? ls.map((l) => isPlain8(l) ? own6(l, "name") : void 0).filter((n2) => typeof n2 === "string") : [];
+        open = { number, title: String(own6(raw, "title") ?? ""), body: b, labels: names };
         break;
       }
       closed ??= number;
@@ -9615,13 +9679,15 @@ ${body}`;
     }
   }
   if (open !== void 0) {
-    if (open.title === title && open.body.replace(/\r\n/g, "\n") === text) return { key, number: open.number, action: "unchanged" };
-    await gh.updateIssue(repo2.owner, repo2.name, open.number, { title, body: text });
-    return { key, number: open.number, action: "updated" };
+    const missing = (opts.labels ?? []).filter((l) => !open.labels.includes(l));
+    const same = open.title === title && open.body.replace(/\r\n/g, "\n") === text;
+    if (!same) await gh.updateIssue(repo2.owner, repo2.name, open.number, { title, body: text });
+    if (missing.length > 0) await gh.addLabels(repo2.owner, repo2.name, open.number, missing);
+    return { key, number: open.number, action: same ? "unchanged" : "updated" };
   }
   if (closed !== void 0) return { key, number: closed, action: "left-closed" };
   if (!complete) throw new Error(`nightly: the issue list reaches its cap of ${ISSUE_PAGE_CAP} pages without ending, so no issue is created (it might be a duplicate)`);
-  const made = await gh.createIssue(repo2.owner, repo2.name, { title, body: text, ...opts.labels === void 0 || opts.labels.length === 0 ? {} : { labels: opts.labels } });
+  const made = await gh.createIssue(repo2.owner, repo2.name, { title, body: text, labels: [ISSUE_LABEL, ...opts.labels ?? []] });
   const n = isPlain8(made) ? own6(made, "number") : void 0;
   if (typeof n !== "number" || !Number.isSafeInteger(n) || n <= 0) throw new Error("nightly: GitHub did not answer with the number of the new issue");
   return { key, number: n, action: "created" };
@@ -9648,15 +9714,16 @@ async function setupMergedAt(gh, repo2, now) {
         if (typeof hid !== "number" || hid !== bid || hid !== repo2.id) continue;
         const merged = own6(pr, "merged_at");
         const t = isoTime(merged);
-        if (t === void 0 || t > clock) continue;
-        if (best === void 0 || t > best.t) best = { t, at: merged };
+        const mergeSha = own6(pr, "merge_commit_sha");
+        if (t === void 0 || t > clock || typeof mergeSha !== "string" || !SHA_RE8.test(mergeSha)) continue;
+        if (best === void 0 || t > best.t) best = { t, at: merged, sha: mergeSha };
       }
       if (list.length < 100) break;
     }
   } catch {
     return { note: "the list of closed setup pull requests could not be read, so the setup merge is not proven" };
   }
-  return best === void 0 ? {} : { at: best.at };
+  return best === void 0 ? {} : { at: best.at, sha: best.sha };
 }
 var PIPEGEN_OWNER = "crisworking";
 var PIPEGEN_NAME = "pipegen";
@@ -9695,7 +9762,7 @@ async function latestGateRelease(gh, current, now) {
         const published = own6(r, "published_at");
         if (m === null || own6(r, "draft") !== false || own6(r, "prerelease") !== false || isoTime(published) === void 0) continue;
         const ver = semver(m[1]);
-        if (ver !== void 0) found.push({ version: m[1], ver, publishedAt: published, tag });
+        if (ver !== void 0) found.push({ version: m[1], ver, publishedAt: published, tag, immutable: own6(r, "immutable") === true });
       }
       if (list.length < 100) break;
     }
@@ -9703,8 +9770,8 @@ async function latestGateRelease(gh, current, now) {
     return { note: "no update check: the release list of pipegen could not be read (the repository is private until v0.4, so this is expected)" };
   }
   const eligible = found.filter((f) => updateAvailable(current, { version: f.version, publishedAt: f.publishedAt }, now)).sort((a, b) => newer(a.ver, b.ver) ? -1 : newer(b.ver, a.ver) ? 1 : 0);
-  const top = eligible[0];
-  if (top === void 0) return {};
+  const top = eligible.find((f) => f.immutable);
+  if (top === void 0) return eligible.length === 0 ? {} : { note: `no update: ${eligible[0]?.tag ?? "the newest release"} is not an immutable release, so its tag could be moved after the cooldown` };
   try {
     const sha3 = await resolveGateTag(gh, top.tag);
     return { release: { version: top.version, publishedAt: top.publishedAt, tag: top.tag, sha: sha3 } };
@@ -9783,7 +9850,7 @@ function fenceFor(text) {
 var ADVISORY = [
   "> **This issue is advisory.** Anyone with issue rights in a public repository, and any job with `issues: write`, can open an issue that looks exactly like this one, even as `github-actions[bot]`.",
   "> So `pipegen update` does not apply a patch from an issue: it re-derives the patch itself, from the reviewed list bundled with the pipegen version you run, and uses this issue only as a prompt.",
-  "> If you apply anything by hand, compare the commit with the tag `gate-v{VERSION}` in pipegen's repository first."
+  "> If you apply anything by hand, compare the commit with the pin in the reviewed list of `pipegen@{VERSION}` (the list `pipegen update` uses), not with the tag: a tag is not authority."
 ].join("\n");
 function updateIssue(repo2, rel, patch, notes) {
   const v = safeMarkdown(`v${rel.version}`, 40);
@@ -9822,14 +9889,44 @@ function updateIssue(repo2, rel, patch, notes) {
   return { title: `pipegen: gate v${rel.version} is available`, body: lines.join("\n"), labels: patch === void 0 ? [] : ["pipegen:patch"] };
 }
 var MAX_PATCH_CHARS2 = 3e4;
+var UPDATE_KEY_RE = /^update-((?:0|[1-9][0-9]{0,5})\.(?:0|[1-9][0-9]{0,5})\.(?:0|[1-9][0-9]{0,5}))$/;
+var SUPERSEDED_RE = /^> Superseded by #/;
+async function supersedeOlder(gh, repo2, version, newNumber) {
+  const cur = semver(version);
+  for (let page2 = 1; page2 <= ISSUE_PAGE_CAP; page2++) {
+    const list = await gh.listIssues(repo2.owner, repo2.name, page2, ISSUE_PER_PAGE);
+    if (!Array.isArray(list)) throw new Error("the issue list is not a list");
+    for (const raw of list) {
+      if (!isPlain8(raw) || own6(raw, "pull_request") !== void 0 || own6(raw, "state") !== "open") continue;
+      const number = own6(raw, "number");
+      const user = own6(raw, "user");
+      const body = own6(raw, "body");
+      const title = own6(raw, "title");
+      if (typeof number !== "number" || !Number.isSafeInteger(number) || number <= 0 || number === newNumber || typeof body !== "string" || typeof title !== "string" || title === "") continue;
+      if (!isPlain8(user) || own6(user, "login") !== BOT_LOGIN || own6(user, "type") !== "Bot") continue;
+      const lines = body.replace(/\r\n/g, "\n").split("\n");
+      const k = UPDATE_KEY_RE.exec((/^<!-- pipegen:key=([^ ]+) -->$/.exec(lines[0]) ?? [])[1] ?? "");
+      const old = k === null ? void 0 : semver(k[1]);
+      if (old === void 0 || !newer(cur, old)) continue;
+      const rest = lines.slice(1);
+      if (SUPERSEDED_RE.test(rest[0] ?? "")) rest.shift();
+      const next = [lines[0], `> Superseded by #${newNumber}: pipegen gate v${version} is out.`, ...rest].join("\n");
+      if (next !== lines.join("\n")) await gh.updateIssue(repo2.owner, repo2.name, number, { title, body: next });
+    }
+    if (list.length < ISSUE_PER_PAGE) return;
+  }
+}
 async function runNightly(gh, ctx, deps = {}) {
   const result = { issues: [], notes: [], errors: [] };
   const { repo: repo2, now } = ctx;
   const upsert = async (key, issue) => {
     try {
-      result.issues.push(await upsertIssueDetailed(gh, repo2, key, issue.title, issue.body, { labels: issue.labels ?? [] }));
+      const out = await upsertIssueDetailed(gh, repo2, key, issue.title, issue.body, { labels: issue.labels ?? [] });
+      result.issues.push(out);
+      return out;
     } catch (e) {
       result.errors.push(`the issue ${key} was not written: ${e instanceof Error ? e.message : "unknown error"}`);
+      return void 0;
     }
   };
   const effective = effectiveBlockFrom(ctx.blockFrom, ctx.recorded);
@@ -9846,12 +9943,12 @@ async function runNightly(gh, ctx, deps = {}) {
       note = "the baseline lookup failed";
     }
     const w = warnEnding(effective, now, old);
-    if (w?.open === true) await upsert("warn-ending", warnEndingIssue(repo2, effective, w, old, note));
+    if (w?.open === true) await upsert(`warn-ending-${effective}`, warnEndingIssue(repo2, effective, w, old, note));
   }
   if (validDate(ctx.blockFrom) === void 0) {
     const merged = await setupMergedAt(gh, repo2, now);
     if (merged.note !== void 0) result.notes.push(merged.note);
-    if (merged.at !== void 0 && finishMissing(ctx.blockFrom, merged.at, now)) await upsert("finish-missing", finishMissingIssue(repo2, merged.at));
+    if (merged.at !== void 0 && merged.sha !== void 0 && finishMissing(ctx.blockFrom, merged.at, now)) await upsert(`finish-missing-${merged.sha}`, finishMissingIssue(repo2, merged.at));
   }
   const latest = await latestGateRelease(gh, GATE_VERSION, now);
   if (latest.note !== void 0) result.notes.push(latest.note);
@@ -9863,8 +9960,7 @@ async function runNightly(gh, ctx, deps = {}) {
       const file = await readWorkflow(gh, repo2);
       if ("why" in file) notes.push(`no patch: ${file.why}`);
       else {
-        const re = new RegExp(`^\\s*(?:-\\s+)?uses:\\s+crisworking/pipegen/gate@([0-9a-f]{40}) # gate-v${GATE_VERSION.replace(/\./g, "\\.")}\\s*$`);
-        const pinned = new Set(file.text.split("\n").map((l) => re.exec(l)?.[1]).filter((x) => x !== void 0));
+        const pinned = new Set(pinnedShas(file.text, GATE_VERSION));
         if (pinned.size === 0) notes.push(`no patch: pipegen.yml has no gate pin line for v${GATE_VERSION}`);
         else if (pinned.size > 1) notes.push("no patch: pipegen.yml pins the gate at more than one commit for this version, so the swap is ambiguous");
         else {
@@ -9878,7 +9974,14 @@ async function runNightly(gh, ctx, deps = {}) {
       notes.push(e instanceof PatchRefused ? `the patch was left out: ${e.message}` : "no patch: the workflow file could not be read");
     }
     result.notes.push(...notes);
-    await upsert(`update-${rel.version}`, updateIssue(repo2, rel, patch, notes));
+    const made = await upsert(`update-${rel.version}`, updateIssue(repo2, rel, patch, notes));
+    if (made !== void 0 && made.action !== "left-closed") {
+      try {
+        await supersedeOlder(gh, repo2, rel.version, made.number);
+      } catch (e) {
+        result.notes.push(`older update issues were not marked as superseded: ${e instanceof Error ? e.message : "unknown error"}`);
+      }
+    }
   }
   return result;
 }
@@ -10543,17 +10646,12 @@ async function runNightlyMode(step, deps, get) {
   const token = get("github-token");
   if (token === void 0) return fail3("the github-token input is missing, so the step fails closed");
   if (badKey(get("fp-key"))) return fail3(BAD_KEY);
-  let repo2;
-  try {
-    repo2 = repoOf(JSON.parse(readRunnerFile(step.env("GITHUB_EVENT_PATH"), "the event payload (GITHUB_EVENT_PATH)")), step.env("GITHUB_REPOSITORY") ?? "");
-  } catch (e) {
-    return fail3(e instanceof StepError ? `${e.message}, so the step fails closed` : "the event payload could not be read, so the step fails closed");
-  }
-  if (typeof repo2 === "string") return fail3(`${repo2}, so the step fails closed`);
   const notes = [];
   let done;
   try {
     const gh = (deps.nightly ?? githubAdapter)({ token, mask: () => void 0, notes });
+    const repo2 = await resolveRepo(gh, step.env("GITHUB_REPOSITORY"), step.env("GITHUB_REPOSITORY_ID"));
+    if (typeof repo2 === "string") return fail3(`${repo2}, so the step fails closed`);
     done = await runNightly(gh, { repo: repo2, now: (deps.now ?? (() => /* @__PURE__ */ new Date()))(), blockFrom: get("block-from"), recorded: get("block-from-recorded"), key: get("fp-key") });
   } catch {
     return fail3("GitHub could not be reached or set up, so the step fails closed");
