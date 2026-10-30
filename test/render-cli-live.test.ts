@@ -1,6 +1,7 @@
 // LIVE (PIPEGEN_LIVE_TESTS=1, uses the network and the real npm): the rendered eslint checker steps install eslint from
 // pipegen's closure lock and run it, while the repo plants a .npmrc with `node-options=--require=./evil.js` and a
 // lockfile whose eslint entry is a `link`. Neither may have any effect (6b fix round 1, R-A). Skipped by default.
+import { execFileSync } from 'node:child_process';
 import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
@@ -39,6 +40,9 @@ describe.skipIf(!live)('live: a checker is installed from pipegen\'s closure, no
     mkdirSync(join(sb.dir, 'node_modules', 'debug'), { recursive: true });
     writeFileSync(join(sb.dir, 'node_modules', 'debug', 'index.js'), evil);
     writeFileSync(join(sb.dir, 'node_modules', 'debug', 'package.json'), '{"name":"debug","version":"0.0.1","main":"index.js"}');
+    // a checkout is a git repository: oxlint lints `git ls-files` (d1407a3), so the sandbox needs one with the files added (final review minor 4)
+    execFileSync('git', ['init', '-q'], { cwd: sb.ws });
+    execFileSync('git', ['add', '-A'], { cwd: sb.ws });
     const steps = r.steps.filter((s) => s.run !== undefined);
     for (const step of steps) {
       const res = exec(step, sb, stepEnv(step, sb));

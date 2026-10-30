@@ -592,8 +592,10 @@ const ARTIFACT_NAME = rx(new RegExp(`^${RESULT_ARTIFACT_PREFIX}[a-z0-9][a-z0-9-]
 // only on a trusted green push to the default branch. Pinned upload-artifact steps rendered AFTER the gate step (renderGateUploads, in the
 // job `gate` only: checkJobOrder) upload them under the three reserved names, each only from its own file. A pull request run uploading
 // `pipegen-baseline` or `pipegen-clean-run` this way is harmless: the C3 loader trusts only a MAC'd file from a trusted push run.
+/** The name of the folder under RUNNER_TEMP the gate step writes its files to (the gate action builds its path from it: one source). */
+export const GATE_FILES_FOLDER = 'pipegen-gate';
 /** The folder the gate step writes its files to. */
-export const GATE_FILES_DIR = `\${{ runner.temp }}/pipegen-gate`;
+export const GATE_FILES_DIR = `\${{ runner.temp }}/${GATE_FILES_FOLDER}`;
 /** Reserved artifact name → the one file of pipegen-gate it is uploaded from. */
 export const GATE_UPLOAD_FILES: Readonly<Record<string, string>> = Object.freeze({
   [GATE_RESULT_ARTIFACT]: 'result.json', [BASELINE_ARTIFACT]: 'baseline.json', [CLEAN_RUN_ARTIFACT]: 'marker.json',
@@ -722,7 +724,9 @@ const NEED_ID_TEXT_RE = /^(?!base-)(?!.*--)[a-z0-9][a-z0-9-]{0,63}$/;
 const JOB_ID_TEXT_RE = /^[A-Za-z_][A-Za-z0-9_-]{0,99}$/;
 const SERVICE_SLUG_RE = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
 const TOOL_ID_TEXT_RE = /^[a-z0-9][a-z0-9-]{0,63}$/;
-const RESULT_NAME_TEXT_RE = new RegExp(`^${RESULT_ARTIFACT_PREFIX}[a-z0-9][a-z0-9-]{0,120}$`);
+/** A result artifact name as resultArtifactName writes it (the job list schema; the gate action's scrub and stage modes check their input with it). */
+export const RESULT_ARTIFACT_NAME_RE = new RegExp(`^${RESULT_ARTIFACT_PREFIX}[a-z0-9][a-z0-9-]{0,120}$`);
+const RESULT_NAME_TEXT_RE = RESULT_ARTIFACT_NAME_RE;
 const DATE_TEXT_RE = /^\d{4}-(?:0[1-9]|1[0-2])-(?:0[1-9]|[12]\d|3[01])$/;
 /** The keys an entry of the gate's job list may have, in the order the list is written. */
 export const JOB_LIST_KEYS = ['needId', 'service', 'job', 'category', 'tool', 'format', 'artifact', 'baseArtifact', 'blocking', 'needsSecrets', 'warnFirst'] as const;

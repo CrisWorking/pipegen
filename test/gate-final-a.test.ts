@@ -6,7 +6,9 @@ import { describe, expect, it } from 'vitest';
 import { gateJobList, GateJobListError, type JobListEntry } from '../src/engine/gate-job-list.js';
 import { gateStepInputs, licenceLockfilesOf, nightlyStepInputs } from '../src/engine/gate-inputs.js';
 import { TRIVY_LICENCE_LOCKFILES } from '../src/engine/licence-lockfiles.js';
-import { PIPEGEN_GATE_USES, rendererInputProblems } from '../src/engine/tool-flags.js';
+import { GATE_FILES_DIR, GATE_FILES_FOLDER, PIPEGEN_GATE_USES, RESULT_ARTIFACT_NAME_RE, rendererInputProblems } from '../src/engine/tool-flags.js';
+import { resultArtifactName } from '../src/engine/artifact-names.js';
+import { readFileSync } from 'node:fs';
 import { licenceCoverage } from '../gate/src/facts.js';
 import { jobOutputsFor, NO_SCANS, type ScanFact } from '../src/engine/job-rules.js';
 import { NEED_ID_CATEGORY } from '../src/engine/need-ids.js';
@@ -362,5 +364,21 @@ describe('ruling 3: warn-first from the draft (#96, S12)', () => {
       '[{"needId":"lint","since":"2026-11-01"},{"needId":"lint","since":"2026-11-02"}]']) {
       expect(problems(bad).length, bad).toBeGreaterThan(0);
     }
+  });
+});
+
+// ---------- minor 5: one source for the gate folder and the result artifact name rule ----------
+
+describe('minor 5: main.ts takes the gate folder and the result artifact rule from the engine', () => {
+  it('GATE_FILES_FOLDER and RESULT_ARTIFACT_NAME_RE (tool-flags.ts) are the names the engine renders, and main.ts restates neither', () => {
+    expect(GATE_FILES_DIR).toBe(`\${{ runner.temp }}/${GATE_FILES_FOLDER}`);
+    expect(GATE_FILES_FOLDER).toBe('pipegen-gate');
+    for (const [n, s, b] of [['sast', 'app', false], ['secrets', undefined, false], ['deps', 'Web App', true]] as const) {
+      expect(RESULT_ARTIFACT_NAME_RE.test(resultArtifactName(n, s, b ? { base: true } : undefined))).toBe(true);
+    }
+    for (const bad of ['pipegen-gate-result', 'pipegen-baseline', 'pipegen-out-', 'pipegen-out-A', 'x-pipegen-out-sast']) expect(RESULT_ARTIFACT_NAME_RE.test(bad), bad).toBe(false);
+    const main = readFileSync('gate/src/main.ts', 'utf8');
+    expect(main).not.toMatch(/\/\^pipegen-out-/);
+    expect(main).not.toMatch(/'pipegen-gate'/);
   });
 });

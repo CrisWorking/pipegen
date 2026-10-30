@@ -119,8 +119,10 @@ export interface GateInput {
   /** C4 integrity findings, already filtered by a head-commit code-owner approval. */
   integrity: readonly Finding[];
   /**
-   * The floor need ids the draft has (C5 takes them from the trusted job list's draft, beside the `job-list` literal). Each must have
-   * a check in `checks` (by need id), else it is a missing check and blocks; `gate` itself is pipegen's job, never a check.
+   * The floor need ids the gate must find a check for (settings.ts resolveSettings): `secrets` always, plus every floor need of the trusted
+   * job list. Each must have a check in `checks` (by need id), else it is a missing check and blocks (a skipped one is shown as skipped);
+   * `gate` itself is pipegen's job, never a check. A floor need dropped from the list is not caught here: the referee (the `job-list` literal
+   * equals gateJobList(draft)) and integrity (the file that holds it is protected) catch that.
    */
   floorNeeds: readonly string[];
   /** C5a: what the reads found that a person should know (a rate limit, an unreadable baseline, the mode's reason, integrity read problems). Fixed texts. */

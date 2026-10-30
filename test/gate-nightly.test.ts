@@ -16,7 +16,7 @@ import { GATE_VERSION } from '../gate/src/generated/gate-view.js';
 import { API_ROOT, githubAdapter, type AdapterOptions } from '../gate/src/github-adapter.js';
 import { main, MODE_INPUTS, type MainDeps } from '../gate/src/main.js';
 import {
-  BOT_LOGIN, effectiveBlockFrom, finishMissing, ISSUE_PAGE_CAP, resolveRepo, runNightly, updateAvailable, updatePatch, upsertIssue, WARN_FIRST_DAYS, warnEnding, warnFirstEnd, type NightlyAdapter,
+  BOT_LOGIN, effectiveBlockFrom, finishMissing, ISSUE_PAGE_CAP, resolveRepo, runNightly, updateAvailable, updatePatch, upsertIssueDetailed, WARN_FIRST_DAYS, warnEnding, warnFirstEnd, type NightlyAdapter,
 } from '../gate/src/nightly.js';
 import { CRED, FPKEY, outputsOf, runner } from './helpers/gate-world.js';
 
@@ -141,6 +141,8 @@ function withUpdate(gh = new FakeGh(), version = '0.3.0', sha = NEW, days = 10):
   gh.tags.set(`gate-v${version}`, { ref: `refs/tags/gate-v${version}`, object: { type: 'commit', sha } });
   return gh;
 }
+/** The issue number of an upsert (the tests' shorthand for upsertIssueDetailed). */
+const upsertIssue = async (...a: Parameters<typeof upsertIssueDetailed>): Promise<number> => (await upsertIssueDetailed(...a)).number;
 const ctx = (over: Obj = {}): Parameters<typeof runNightly>[1] => ({ repo: REPO, now: NOW, ...over }) as Parameters<typeof runNightly>[1];
 const bodyOf = (gh: FakeGh, i = 0): string => String(gh.issues[i]?.body);
 const titleOf = (gh: FakeGh, i = 0): string => String(gh.issues[i]?.title);
@@ -1710,5 +1712,45 @@ describe('fix round A, ruling 3: warn-first checks get a "switch to blocking" is
     const action = parse(readFileSync(join(ROOT, 'gate', 'action.yml'), 'utf8')) as { inputs: Record<string, unknown> };
     expect(Object.keys(action.inputs)).toContain('warn-first');
     expect(Object.keys(RENDERER_INPUTS[PIPEGEN_GATE_USES] ?? {})).toContain('warn-first');
+  });
+});
+
+// ======================================================================================================
+// Plan C final review fix round A, minors 1 to 3 (review-C7-r2 c2, c3, c5)
+// ======================================================================================================
+
+describe('fix round A: the C7 r2 minors', () => {
+  const BOT_CLOSED = { login: 'github-actions[bot]', type: 'Bot' };
+  it('c2: an adopted (unlabelled) open issue loses a planted "> Reopened after a bot closed #N." line (derived again, never kept); our labelled one keeps its own', async () => {
+    const forged = new FakeGh(); forged.issues = [issue(5, `${marker('k1')}\n> Reopened after a bot closed #3.\n\nevil`, { labels: [] })];
+    expect((await upsertIssueDetailed(forged, REPO, 'k1', 'T', 'new')).action).toBe('updated');
+    expect(bodyOf(forged)).toBe(`${marker('k1')}\nnew`);
+    const ours = new FakeGh(); ours.issues = [issue(5, `${marker('k1')}\n> Reopened after a bot closed #3.\n\nold`)];
+    await upsertIssueDetailed(ours, REPO, 'k1', 'T', 'new');
+    expect(bodyOf(ours)).toBe(`${marker('k1')}\n> Reopened after a bot closed #3.\n\nnew`);
+  });
+  it('c3: a labelled search that reaches its cap never creates, even when its only matches are bot-closed issues (no create without a complete search)', async () => {
+    const gh = new FakeGh();
+    gh.issues = [issue(5, `${marker('k1')}\nold`, { state: 'closed', closed_by: BOT_CLOSED }), ...Array.from({ length: ISSUE_PAGE_CAP * 100 }, (_, i) => issue(1000 + i, 'noise'))];
+    await expect(upsertIssueDetailed(gh, REPO, 'k1', 'T', 'x')).rejects.toThrow(/cap/);
+    expect(writesOf(gh)).toEqual([]);
+    // a person's dismissal found in that search still holds (it creates nothing)
+    const person = new FakeGh();
+    person.issues = [issue(5, `${marker('k1')}\nold`, { state: 'closed', closed_by: PERSON }), ...Array.from({ length: ISSUE_PAGE_CAP * 100 }, (_, i) => issue(1000 + i, 'noise'))];
+    expect((await upsertIssueDetailed(person, REPO, 'k1', 'T', 'x')).action).toBe('left-closed');
+    expect(writesOf(person)).toEqual([]);
+  });
+  it('c5: a getIssue answer that is not an object fails closed: no issue is created', async () => {
+    for (const answer of ['x', null, [], 5]) {
+      const gh = new FakeGh(); gh.issues = [issue(5, `${marker('k1')}\nold`, { state: 'closed', closed_by: BOT_CLOSED })];
+      gh.getIssue = async (): Promise<unknown> => { gh.calls.push('getIssue'); return answer; };
+      await expect(upsertIssueDetailed(gh, REPO, 'k1', 'T', 'x'), JSON.stringify(answer)).rejects.toThrow(/could not be read/);
+      expect(writesOf(gh)).toEqual([]);
+    }
+  });
+  it('minor 5: upsertIssue (a wrapper only tests used) is gone; upsertIssueDetailed is the one entry', async () => {
+    const mod = await import('../gate/src/nightly.js');
+    expect(Object.hasOwn(mod, 'upsertIssue')).toBe(false);
+    expect(typeof mod.upsertIssueDetailed).toBe('function');
   });
 });

@@ -2426,7 +2426,8 @@ var OWN_ARTIFACT_FOLDER = {
 };
 var OWN_FOLDER_PATH = rx(/^\$\{\{ runner\.temp \}\}\/pipegen-out\/[a-z0-9][a-z0-9-]{0,120}(?:\/[A-Za-z0-9_][A-Za-z0-9._-]{0,100}){0,3}$/, "a path under ${{ runner.temp }}/pipegen-out/<artifact>", OWN_ARTIFACT_FOLDER);
 var ARTIFACT_NAME = rx(new RegExp(`^${RESULT_ARTIFACT_PREFIX}[a-z0-9][a-z0-9-]{0,120}$`), `a result artifact name (${RESULT_ARTIFACT_PREFIX}\u2026)`);
-var GATE_FILES_DIR = `\${{ runner.temp }}/pipegen-gate`;
+var GATE_FILES_FOLDER = "pipegen-gate";
+var GATE_FILES_DIR = `\${{ runner.temp }}/${GATE_FILES_FOLDER}`;
 var GATE_UPLOAD_FILES = Object.freeze({
   [GATE_RESULT_ARTIFACT]: "result.json",
   [BASELINE_ARTIFACT]: "baseline.json",
@@ -2521,7 +2522,8 @@ var NEED_ID_TEXT_RE = /^(?!base-)(?!.*--)[a-z0-9][a-z0-9-]{0,63}$/;
 var JOB_ID_TEXT_RE = /^[A-Za-z_][A-Za-z0-9_-]{0,99}$/;
 var SERVICE_SLUG_RE = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
 var TOOL_ID_TEXT_RE = /^[a-z0-9][a-z0-9-]{0,63}$/;
-var RESULT_NAME_TEXT_RE = new RegExp(`^${RESULT_ARTIFACT_PREFIX}[a-z0-9][a-z0-9-]{0,120}$`);
+var RESULT_ARTIFACT_NAME_RE = new RegExp(`^${RESULT_ARTIFACT_PREFIX}[a-z0-9][a-z0-9-]{0,120}$`);
+var RESULT_NAME_TEXT_RE = RESULT_ARTIFACT_NAME_RE;
 var DATE_TEXT_RE = /^\d{4}-(?:0[1-9]|1[0-2])-(?:0[1-9]|[12]\d|3[01])$/;
 var JOB_LIST_KEYS = ["needId", "service", "job", "category", "tool", "format", "artifact", "baseArtifact", "blocking", "needsSecrets", "warnFirst"];
 var JOB_LIST_MAX = 500;
@@ -9522,68 +9524,10 @@ var GATE_VIEW = [
   }
 ];
 
-// gate/src/nightly.ts
+// gate/src/pin-patch.ts
 var isPlain8 = (v) => typeof v === "object" && v !== null && !Array.isArray(v);
-var own6 = (o, k) => Object.hasOwn(o, k) ? o[k] : void 0;
 var SHA_RE8 = /^[0-9a-f]{40}$/;
 var SEMVER_RE = /^(0|[1-9][0-9]{0,5})\.(0|[1-9][0-9]{0,5})\.(0|[1-9][0-9]{0,5})$/;
-var GATE_TAG_RE = /^gate-v((?:0|[1-9][0-9]{0,5})\.(?:0|[1-9][0-9]{0,5})\.(?:0|[1-9][0-9]{0,5}))$/;
-var ISO_RE = /^(\d{4}-\d{2}-\d{2})T\d{2}:\d{2}:\d{2}(?:\.\d{1,3})?Z$/;
-var DAY_MS = 864e5;
-function isoTime(v) {
-  if (typeof v !== "string") return void 0;
-  const m = ISO_RE.exec(v);
-  if (m === null || validDate(m[1]) === void 0) return void 0;
-  const t = Date.parse(v);
-  return Number.isFinite(t) ? t : void 0;
-}
-var clockOf = (d) => d instanceof Date && Number.isFinite(d.getTime()) ? d.getTime() : void 0;
-function semver(v) {
-  const m = SEMVER_RE.exec(v);
-  return m === null ? void 0 : [Number(m[1]), Number(m[2]), Number(m[3])];
-}
-var newer = (a, b) => a[0] !== b[0] ? a[0] > b[0] : a[1] !== b[1] ? a[1] > b[1] : a[2] > b[2];
-function effectiveBlockFrom(blockFrom, recorded) {
-  const dates = [validDate(blockFrom), validDate(recorded)].filter((x) => x !== void 0).sort();
-  return dates[0];
-}
-function warnEnding(blockFrom, today, oldFindings) {
-  const date = validDate(blockFrom);
-  const now = clockOf(today);
-  if (date === void 0 || now === void 0) return null;
-  const startOfToday = Math.floor(now / DAY_MS) * DAY_MS;
-  const daysLeft = Math.round((Date.parse(`${date}T00:00:00Z`) - startOfToday) / DAY_MS);
-  if (daysLeft <= 0) return null;
-  const unknown = typeof oldFindings !== "number" || !Number.isSafeInteger(oldFindings) || oldFindings < 0;
-  if (!unknown && oldFindings === 0) return null;
-  return { open: daysLeft <= 2, daysLeft, unknown };
-}
-function finishMissing(blockFrom, setupMergedAt2, now) {
-  if (validDate(blockFrom) !== void 0) return false;
-  const merged = isoTime(setupMergedAt2);
-  const clock = clockOf(now);
-  if (merged === void 0 || clock === void 0) return false;
-  return clock - merged > DAY_MS;
-}
-var WARN_FIRST_DAYS = 14;
-var NEED_ID_RE2 = /^(?!base-)(?!.*--)[a-z0-9][a-z0-9-]{0,63}$/;
-function warnFirstEnd(since, setupMergedAt2) {
-  const start = validDate(since);
-  const merged = isoTime(setupMergedAt2);
-  if (start === void 0 || merged === void 0) return void 0;
-  const from = Math.max(Date.parse(`${start}T00:00:00Z`), Math.floor(merged / DAY_MS) * DAY_MS);
-  return new Date(from + WARN_FIRST_DAYS * DAY_MS).toISOString().slice(0, 10);
-}
-var UPDATE_COOLDOWN_DAYS = 7;
-function updateAvailable(current, latest, now) {
-  if (latest === null) return false;
-  const cur = semver(current);
-  const next = semver(latest.version);
-  const published = isoTime(latest.publishedAt);
-  const clock = clockOf(now);
-  if (cur === void 0 || next === void 0 || published === void 0 || clock === void 0) return false;
-  return newer(next, cur) && clock - published >= UPDATE_COOLDOWN_DAYS * DAY_MS;
-}
 var PatchRefused = class extends Error {
 };
 var CONTEXT = 3;
@@ -9699,6 +9643,69 @@ function updatePatch(files, from, to) {
   checkPin(to, "new");
   return files.map((f) => filePatch(f, from, to)).join("");
 }
+
+// gate/src/nightly.ts
+var isPlain9 = (v) => typeof v === "object" && v !== null && !Array.isArray(v);
+var own6 = (o, k) => Object.hasOwn(o, k) ? o[k] : void 0;
+var SHA_RE9 = /^[0-9a-f]{40}$/;
+var SEMVER_RE2 = /^(0|[1-9][0-9]{0,5})\.(0|[1-9][0-9]{0,5})\.(0|[1-9][0-9]{0,5})$/;
+var GATE_TAG_RE = /^gate-v((?:0|[1-9][0-9]{0,5})\.(?:0|[1-9][0-9]{0,5})\.(?:0|[1-9][0-9]{0,5}))$/;
+var ISO_RE = /^(\d{4}-\d{2}-\d{2})T\d{2}:\d{2}:\d{2}(?:\.\d{1,3})?Z$/;
+var DAY_MS = 864e5;
+function isoTime(v) {
+  if (typeof v !== "string") return void 0;
+  const m = ISO_RE.exec(v);
+  if (m === null || validDate(m[1]) === void 0) return void 0;
+  const t = Date.parse(v);
+  return Number.isFinite(t) ? t : void 0;
+}
+var clockOf = (d) => d instanceof Date && Number.isFinite(d.getTime()) ? d.getTime() : void 0;
+function semver(v) {
+  const m = SEMVER_RE2.exec(v);
+  return m === null ? void 0 : [Number(m[1]), Number(m[2]), Number(m[3])];
+}
+var newer = (a, b) => a[0] !== b[0] ? a[0] > b[0] : a[1] !== b[1] ? a[1] > b[1] : a[2] > b[2];
+function effectiveBlockFrom(blockFrom, recorded) {
+  const dates = [validDate(blockFrom), validDate(recorded)].filter((x) => x !== void 0).sort();
+  return dates[0];
+}
+function warnEnding(blockFrom, today, oldFindings) {
+  const date = validDate(blockFrom);
+  const now = clockOf(today);
+  if (date === void 0 || now === void 0) return null;
+  const startOfToday = Math.floor(now / DAY_MS) * DAY_MS;
+  const daysLeft = Math.round((Date.parse(`${date}T00:00:00Z`) - startOfToday) / DAY_MS);
+  if (daysLeft <= 0) return null;
+  const unknown = typeof oldFindings !== "number" || !Number.isSafeInteger(oldFindings) || oldFindings < 0;
+  if (!unknown && oldFindings === 0) return null;
+  return { open: daysLeft <= 2, daysLeft, unknown };
+}
+function finishMissing(blockFrom, setupMergedAt2, now) {
+  if (validDate(blockFrom) !== void 0) return false;
+  const merged = isoTime(setupMergedAt2);
+  const clock = clockOf(now);
+  if (merged === void 0 || clock === void 0) return false;
+  return clock - merged > DAY_MS;
+}
+var WARN_FIRST_DAYS = 14;
+var NEED_ID_RE2 = /^(?!base-)(?!.*--)[a-z0-9][a-z0-9-]{0,63}$/;
+function warnFirstEnd(since, setupMergedAt2) {
+  const start = validDate(since);
+  const merged = isoTime(setupMergedAt2);
+  if (start === void 0 || merged === void 0) return void 0;
+  const from = Math.max(Date.parse(`${start}T00:00:00Z`), Math.floor(merged / DAY_MS) * DAY_MS);
+  return new Date(from + WARN_FIRST_DAYS * DAY_MS).toISOString().slice(0, 10);
+}
+var UPDATE_COOLDOWN_DAYS = 7;
+function updateAvailable(current, latest, now) {
+  if (latest === null) return false;
+  const cur = semver(current);
+  const next = semver(latest.version);
+  const published = isoTime(latest.publishedAt);
+  const clock = clockOf(now);
+  if (cur === void 0 || next === void 0 || published === void 0 || clock === void 0) return false;
+  return newer(next, cur) && clock - published >= UPDATE_COOLDOWN_DAYS * DAY_MS;
+}
 var FULL_RE = /^([A-Za-z0-9](?:[A-Za-z0-9-]{0,38}))\/([A-Za-z0-9._-]{1,100})$/;
 async function resolveRepo(gh, full, idText) {
   const m = typeof full === "string" ? FULL_RE.exec(full) : null;
@@ -9711,7 +9718,7 @@ async function resolveRepo(gh, full, idText) {
   } catch {
     return "the repository could not be read (GET /repos/{owner}/{name})";
   }
-  if (!isPlain8(a)) return "the repository answer is not an object";
+  if (!isPlain9(a)) return "the repository answer is not an object";
   const id = own6(a, "id");
   const fullName = own6(a, "full_name");
   const branch = own6(a, "default_branch");
@@ -9735,7 +9742,7 @@ async function upsertIssueDetailed(gh, repo2, key, title, body, opts = {}) {
   const marker = markerOf(key);
   const wanted = opts.labels ?? [];
   const hitOf = (raw, strict) => {
-    if (!isPlain8(raw)) {
+    if (!isPlain9(raw)) {
       if (strict) throw new Error("nightly: the issue list holds an entry that is not an issue, so no issue is written");
       return void 0;
     }
@@ -9746,11 +9753,11 @@ async function upsertIssueDetailed(gh, repo2, key, title, body, opts = {}) {
     }
     if (own6(raw, "pull_request") !== void 0) return void 0;
     const user = own6(raw, "user");
-    if (!isPlain8(user) || own6(user, "login") !== BOT_LOGIN || own6(user, "type") !== "Bot") return void 0;
+    if (!isPlain9(user) || own6(user, "login") !== BOT_LOGIN || own6(user, "type") !== "Bot") return void 0;
     const b = own6(raw, "body");
     if (typeof b !== "string" || b.split("\n")[0].replace(/\r$/, "") !== marker) return void 0;
     const ls = own6(raw, "labels");
-    const names = Array.isArray(ls) ? ls.map((l) => isPlain8(l) ? own6(l, "name") : void 0).filter((n2) => typeof n2 === "string") : [];
+    const names = Array.isArray(ls) ? ls.map((l) => isPlain9(l) ? own6(l, "name") : void 0).filter((n2) => typeof n2 === "string") : [];
     return { number, state: String(own6(raw, "state")), title: String(own6(raw, "title") ?? ""), body: b, labels: names };
   };
   let open;
@@ -9792,7 +9799,8 @@ async function upsertIssueDetailed(gh, repo2, key, title, body, opts = {}) {
   }
   const want = adopted ? [ISSUE_LABEL, ...wanted] : wanted;
   if (open !== void 0) {
-    const kept = /^> Reopened after a bot closed #[0-9]+\./.test(open.body.replace(/\r\n/g, "\n").split("\n")[1] ?? "") ? `${open.body.replace(/\r\n/g, "\n").split("\n")[1]}
+    const second = open.body.replace(/\r\n/g, "\n").split("\n")[1] ?? "";
+    const kept = !adopted && /^> Reopened after a bot closed #[0-9]+\.$/.test(second) ? `${second}
 
 ` : "";
     const text = `${marker}
@@ -9806,32 +9814,33 @@ ${kept}${body}`;
   let botClosed;
   for (const n2 of closed) {
     const full = await gh.getIssue(repo2.owner, repo2.name, n2);
-    if (!isPlain8(full)) throw new Error(`nightly: issue #${n2} could not be read, so no issue is written`);
+    if (!isPlain9(full)) throw new Error(`nightly: issue #${n2} could not be read, so no issue is written`);
     if (isPerson(own6(full, "closed_by"))) {
       if (adopted) await ensureLabels(gh, repo2, n2, [ISSUE_LABEL]);
       return { key, number: n2, action: "left-closed" };
     }
     botClosed ??= n2;
   }
+  if (!complete) throw new Error(`nightly: the issue list reaches its cap of ${ISSUE_PAGE_CAP} pages without ending, so no issue is created (it might be a duplicate)`);
   const reopened = botClosed === void 0 ? "" : `> Reopened after a bot closed #${botClosed}.
 
 `;
   const made = await gh.createIssue(repo2.owner, repo2.name, { title, body: `${marker}
 ${reopened}${body}` });
-  const n = isPlain8(made) ? own6(made, "number") : void 0;
+  const n = isPlain9(made) ? own6(made, "number") : void 0;
   if (typeof n !== "number" || !Number.isSafeInteger(n) || n <= 0) throw new Error("nightly: GitHub did not answer with the number of the new issue");
   await ensureLabels(gh, repo2, n, [ISSUE_LABEL, ...wanted]);
   return { key, number: n, action: "created" };
 }
 var MAX_CLOSED_CHECKS = 3;
 function isPerson(closedBy) {
-  if (!isPlain8(closedBy)) return false;
+  if (!isPlain9(closedBy)) return false;
   const login = own6(closedBy, "login");
   return own6(closedBy, "type") === "User" && typeof login === "string" && login !== "" && login !== BOT_LOGIN && !login.endsWith("[bot]");
 }
 async function ensureLabels(gh, repo2, number, labels) {
   const answer = await gh.addLabels(repo2.owner, repo2.name, number, labels);
-  const names = Array.isArray(answer) ? answer.map((l) => typeof l === "string" ? l : isPlain8(l) ? own6(l, "name") : void 0) : [];
+  const names = Array.isArray(answer) ? answer.map((l) => typeof l === "string" ? l : isPlain9(l) ? own6(l, "name") : void 0) : [];
   const missing = labels.filter((l) => !names.includes(l));
   if (missing.length > 0) throw new Error(`nightly: the label ${missing.join(", ")} could not be set on issue #${number} (a token without push access drops labels), so nightly stops instead of risking a duplicate issue every night`);
 }
@@ -9846,19 +9855,19 @@ async function setupMergedAt(gh, repo2, now) {
       const list = await gh.listSetupPulls(repo2.owner, repo2.name, page2, 100);
       if (!Array.isArray(list)) return { note: "the list of closed setup pull requests could not be read (not a list), so the setup merge is not proven" };
       for (const pr of list) {
-        if (!isPlain8(pr)) continue;
+        if (!isPlain9(pr)) continue;
         const head = own6(pr, "head");
         const base = own6(pr, "base");
-        if (!isPlain8(head) || !isPlain8(base) || own6(head, "ref") !== SETUP_BRANCH || own6(base, "ref") !== repo2.defaultBranch) continue;
+        if (!isPlain9(head) || !isPlain9(base) || own6(head, "ref") !== SETUP_BRANCH || own6(base, "ref") !== repo2.defaultBranch) continue;
         const hr = own6(head, "repo");
         const br = own6(base, "repo");
-        const hid = isPlain8(hr) ? own6(hr, "id") : void 0;
-        const bid = isPlain8(br) ? own6(br, "id") : void 0;
+        const hid = isPlain9(hr) ? own6(hr, "id") : void 0;
+        const bid = isPlain9(br) ? own6(br, "id") : void 0;
         if (typeof hid !== "number" || hid !== bid || hid !== repo2.id) continue;
         const merged = own6(pr, "merged_at");
         const t = isoTime(merged);
         const mergeSha = own6(pr, "merge_commit_sha");
-        if (t === void 0 || t > clock || typeof mergeSha !== "string" || !SHA_RE8.test(mergeSha)) continue;
+        if (t === void 0 || t > clock || typeof mergeSha !== "string" || !SHA_RE9.test(mergeSha)) continue;
         if (best === void 0 || t > best.t) best = { t, at: merged, sha: mergeSha };
       }
       if (list.length < 100) break;
@@ -9874,20 +9883,20 @@ var RELEASE_PAGES = 3;
 var MAX_TAG_CHAIN = 4;
 async function resolveGateTag(gh, tag) {
   const ref2 = await gh.tagRef(PIPEGEN_OWNER, PIPEGEN_NAME, tag);
-  if (!isPlain8(ref2) || own6(ref2, "ref") !== `refs/tags/${tag}`) throw new Error("the tag ref is not the tag asked for");
+  if (!isPlain9(ref2) || own6(ref2, "ref") !== `refs/tags/${tag}`) throw new Error("the tag ref is not the tag asked for");
   let obj = own6(ref2, "object");
   const seen = /* @__PURE__ */ new Set();
   for (let depth = 0; depth <= MAX_TAG_CHAIN; depth++) {
-    if (!isPlain8(obj)) throw new Error("the tag has no object");
+    if (!isPlain9(obj)) throw new Error("the tag has no object");
     const type = own6(obj, "type");
     const sha3 = own6(obj, "sha");
-    if (typeof sha3 !== "string" || !SHA_RE8.test(sha3)) throw new Error("the tag points at something that is not a 40-hex sha");
+    if (typeof sha3 !== "string" || !SHA_RE9.test(sha3)) throw new Error("the tag points at something that is not a 40-hex sha");
     if (type === "commit") return sha3;
     if (type !== "tag") throw new Error(`the tag points at a ${typeof type === "string" && /^[a-z]{1,10}$/.test(type) ? type : "thing"}, not a commit`);
     if (seen.has(sha3) || depth === MAX_TAG_CHAIN) throw new Error("the annotated tag chain loops or is too long");
     seen.add(sha3);
     const tagObject = await gh.gitTag(PIPEGEN_OWNER, PIPEGEN_NAME, sha3);
-    if (!isPlain8(tagObject) || own6(tagObject, "sha") !== sha3) throw new Error("the annotated tag object is not the one asked for");
+    if (!isPlain9(tagObject) || own6(tagObject, "sha") !== sha3) throw new Error("the annotated tag object is not the one asked for");
     obj = own6(tagObject, "object");
   }
   throw new Error("the annotated tag chain is too long");
@@ -9899,7 +9908,7 @@ async function latestGateRelease(gh, current, now) {
       const list = await gh.listReleases(PIPEGEN_OWNER, PIPEGEN_NAME, page2, 100);
       if (!Array.isArray(list)) return { note: "no update check: the release list of pipegen could not be read (not a list)" };
       for (const r of list) {
-        if (!isPlain8(r)) continue;
+        if (!isPlain9(r)) continue;
         const tag = own6(r, "tag_name");
         const m = typeof tag === "string" ? GATE_TAG_RE.exec(tag) : null;
         const published = own6(r, "published_at");
@@ -9936,7 +9945,7 @@ async function readWorkflow(gh, repo2) {
     return { why: "the workflow file could not be read" };
   }
   if (a === null) return { why: "there is no pipegen.yml in this repository (a private repository keeps the pin in the central repository)" };
-  if (!isPlain8(a) || own6(a, "type") !== "file" || own6(a, "encoding") !== "base64" || typeof own6(a, "content") !== "string") return { why: "the workflow file answer is not a readable file" };
+  if (!isPlain9(a) || own6(a, "type") !== "file" || own6(a, "encoding") !== "base64" || typeof own6(a, "content") !== "string") return { why: "the workflow file answer is not a readable file" };
   const size = own6(a, "size");
   if (typeof size !== "number" || !Number.isSafeInteger(size) || size < 0 || size > MAX_WORKFLOW_BYTES) return { why: "the workflow file is over the size cap" };
   const bytes = Buffer.from(own6(a, "content").replace(/\s+/g, ""), "base64");
@@ -10060,13 +10069,13 @@ async function supersedeOlder(gh, repo2, version, newNumber) {
     const list = await gh.listIssues(repo2.owner, repo2.name, page2, ISSUE_PER_PAGE);
     if (!Array.isArray(list)) throw new Error("the issue list is not a list");
     for (const raw of list) {
-      if (!isPlain8(raw) || own6(raw, "pull_request") !== void 0 || own6(raw, "state") !== "open") continue;
+      if (!isPlain9(raw) || own6(raw, "pull_request") !== void 0 || own6(raw, "state") !== "open") continue;
       const number = own6(raw, "number");
       const user = own6(raw, "user");
       const body = own6(raw, "body");
       const title = own6(raw, "title");
       if (typeof number !== "number" || !Number.isSafeInteger(number) || number <= 0 || number === newNumber || typeof body !== "string" || typeof title !== "string" || title === "") continue;
-      if (!isPlain8(user) || own6(user, "login") !== BOT_LOGIN || own6(user, "type") !== "Bot") continue;
+      if (!isPlain9(user) || own6(user, "login") !== BOT_LOGIN || own6(user, "type") !== "Bot") continue;
       const lines = body.replace(/\r\n/g, "\n").split("\n");
       const k = UPDATE_KEY_RE.exec((/^<!-- pipegen:key=([^ ]+) -->$/.exec(lines[0]) ?? [])[1] ?? "");
       const old = k === null ? void 0 : semver(k[1]);
@@ -10194,10 +10203,8 @@ var REAL_FS = {
   }
 };
 var MAX_EVENT_BYTES = 16 * 1024 * 1024;
-var RESULT_ARTIFACT_RE = /^pipegen-out-[a-z0-9][a-z0-9-]{0,120}$/;
 var TOOL_RE = /^[a-z0-9][a-z0-9-]{0,63}$/;
 var FILE_RE2 = /^[A-Za-z0-9_][A-Za-z0-9._-]{0,100}$/;
-var GATE_DIR = "pipegen-gate";
 var RESULT_FILE2 = GATE_UPLOAD_FILES["pipegen-gate-result"];
 var StepError = class extends Error {
 };
@@ -10466,7 +10473,7 @@ function scrubResult(step, get) {
   const raw = get("raw");
   const out = get("out");
   const stage = get("stage");
-  if (artifact === void 0 || !RESULT_ARTIFACT_RE.test(artifact)) return bad("the artifact input is not a result artifact name");
+  if (artifact === void 0 || !RESULT_ARTIFACT_NAME_RE.test(artifact)) return bad("the artifact input is not a result artifact name");
   if (tool2 === void 0 || !TOOL_RE.test(tool2)) return bad("the tool input is not a reviewed tool id");
   if (format !== "sarif" && format !== "zap-json") return bad("the format input is not sarif or zap-json");
   const file = raw === void 0 ? "" : basename2(raw);
@@ -10510,7 +10517,7 @@ function runStage(step, get) {
   const artifact = get("artifact");
   const tool2 = get("tool");
   const stage = get("stage");
-  if (artifact === void 0 || !RESULT_ARTIFACT_RE.test(artifact)) return done("error", "the artifact input is not a result artifact name");
+  if (artifact === void 0 || !RESULT_ARTIFACT_NAME_RE.test(artifact)) return done("error", "the artifact input is not a result artifact name");
   if (tool2 === void 0 || !isStagedTool(tool2)) return done("error", "the tool input is not a tool that scans a stage folder");
   if (stage !== `${temp}/pipegen-stage/${artifact}`) return done("error", "the stage input is not RUNNER_TEMP/pipegen-stage/<artifact>");
   const workspace = step.env("GITHUB_WORKSPACE");
@@ -10520,7 +10527,7 @@ function runStage(step, get) {
   return done(r.status, r.status === "ok" ? "" : r.error);
 }
 function gateFolder(step) {
-  const dir = join4(runnerTemp(step), GATE_DIR);
+  const dir = join4(runnerTemp(step), GATE_FILES_FOLDER);
   let st;
   try {
     st = lstatSync4(dir);
@@ -10770,7 +10777,7 @@ async function runBaselineCheck(step, deps, get) {
   step.log(`stored baseline: ${found ? "found" : "missing"}`);
   return 0;
 }
-var SHA_RE9 = /^[0-9a-f]{40}$/;
+var SHA_RE10 = /^[0-9a-f]{40}$/;
 var FIND_RUN_DEFAULT_MINUTES = 30;
 async function runFindRun(step, deps, get) {
   const fail3 = (text) => {
@@ -10780,7 +10787,7 @@ async function runFindRun(step, deps, get) {
     return 1;
   };
   const sha3 = get("sha");
-  if (sha3 === void 0 || !SHA_RE9.test(sha3)) return fail3("the sha input is not a 40-character lower-case commit sha, so the step fails closed");
+  if (sha3 === void 0 || !SHA_RE10.test(sha3)) return fail3("the sha input is not a 40-character lower-case commit sha, so the step fails closed");
   const layout = get("layout");
   if (layout !== "inline" && layout !== "central") return fail3("the layout input is not inline or central, so the step fails closed");
   const workflow = get("central-workflow");
@@ -10788,7 +10795,7 @@ async function runFindRun(step, deps, get) {
   if (layout === "inline" && (workflow !== void 0 || centralSha !== void 0)) return fail3("layout inline takes no central-workflow or central-sha, so the step fails closed");
   if (layout === "central" && (workflow === void 0 || centralSha === void 0)) return fail3("layout central needs both central-workflow and central-sha, so the step fails closed");
   if (workflow !== void 0 && (!PLAIN_REL_RE.test(workflow) || workflow.includes("@"))) return fail3("the central-workflow input is not a plain path of the central workflow, so the step fails closed");
-  if (centralSha !== void 0 && !SHA_RE9.test(centralSha)) return fail3("the central-sha input is not a 40-character lower-case commit sha, so the step fails closed");
+  if (centralSha !== void 0 && !SHA_RE10.test(centralSha)) return fail3("the central-sha input is not a 40-character lower-case commit sha, so the step fails closed");
   const minutes = get("timeout-minutes");
   if (minutes !== void 0 && !TIMEOUT_MINUTES_RE.test(minutes)) return fail3("the timeout-minutes input is not a whole number of minutes from 1 to 360, so the step fails closed");
   const token = get("github-token");

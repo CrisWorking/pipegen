@@ -24,7 +24,7 @@
 import { randomUUID } from 'node:crypto';
 import { accessSync, chmodSync, closeSync, constants, fstatSync, lstatSync, mkdirSync, openSync, readSync, renameSync, unlinkSync, writeFileSync, writeSync } from 'node:fs';
 import { basename, dirname, isAbsolute, join } from 'node:path';
-import { GATE_UPLOAD_FILES, isStagedTool, PLAIN_REL_RE, TIMEOUT_MINUTES_RE, warnFirstListProblem } from '../../src/engine/tool-flags.js';
+import { GATE_FILES_FOLDER, GATE_UPLOAD_FILES, isStagedTool, PLAIN_REL_RE, RESULT_ARTIFACT_NAME_RE, TIMEOUT_MINUTES_RE, warnFirstListProblem } from '../../src/engine/tool-flags.js';
 import { GATE_CHECK_NAME } from '../../src/types.js';
 import { safeMarkdown, safeText } from '../../src/util/safe-text.js';
 import { keyProblem } from './fingerprint.js';
@@ -84,10 +84,8 @@ const REAL_FS: GateFs = {
 
 /** The event payload and other runner files are read under this cap, without following a link. */
 const MAX_EVENT_BYTES = 16 * 1024 * 1024;
-const RESULT_ARTIFACT_RE = /^pipegen-out-[a-z0-9][a-z0-9-]{0,120}$/;
 const TOOL_RE = /^[a-z0-9][a-z0-9-]{0,63}$/;
 const FILE_RE = /^[A-Za-z0-9_][A-Za-z0-9._-]{0,100}$/;
-const GATE_DIR = 'pipegen-gate';
 const RESULT_FILE = GATE_UPLOAD_FILES['pipegen-gate-result'] as string;
 
 class StepError extends Error {}
@@ -306,7 +304,7 @@ function scrubResult(step: Step, get: (n: string) => string | undefined): ScrubF
   const raw = get('raw');
   const out = get('out');
   const stage = get('stage');
-  if (artifact === undefined || !RESULT_ARTIFACT_RE.test(artifact)) return bad('the artifact input is not a result artifact name');
+  if (artifact === undefined || !RESULT_ARTIFACT_NAME_RE.test(artifact)) return bad('the artifact input is not a result artifact name');
   if (tool === undefined || !TOOL_RE.test(tool)) return bad('the tool input is not a reviewed tool id');
   if (format !== 'sarif' && format !== 'zap-json') return bad('the format input is not sarif or zap-json');
   const file = raw === undefined ? '' : basename(raw);
@@ -340,7 +338,7 @@ function runStage(step: Step, get: (n: string) => string | undefined): number {
   const artifact = get('artifact');
   const tool = get('tool');
   const stage = get('stage');
-  if (artifact === undefined || !RESULT_ARTIFACT_RE.test(artifact)) return done('error', 'the artifact input is not a result artifact name');
+  if (artifact === undefined || !RESULT_ARTIFACT_NAME_RE.test(artifact)) return done('error', 'the artifact input is not a result artifact name');
   if (tool === undefined || !isStagedTool(tool)) return done('error', 'the tool input is not a tool that scans a stage folder');
   if (stage !== `${temp}/pipegen-stage/${artifact}`) return done('error', 'the stage input is not RUNNER_TEMP/pipegen-stage/<artifact>');
   const workspace = step.env('GITHUB_WORKSPACE');
@@ -358,7 +356,7 @@ interface Decided { input?: GateInput; result?: GateResult; errors?: string[] }
 
 /** The gate folder in RUNNER_TEMP: made here (or an existing real folder), never a link. */
 function gateFolder(step: Step): string {
-  const dir = join(runnerTemp(step), GATE_DIR);
+  const dir = join(runnerTemp(step), GATE_FILES_FOLDER);
   let st;
   try { st = lstatSync(dir); } catch { st = undefined; }
   if (st === undefined) {

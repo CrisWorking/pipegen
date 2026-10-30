@@ -529,8 +529,3 @@ export function scrubFile(opts: ScrubFileOptions): ScrubFileResult {
   }
   return { status: 'ok', sha256: scrubbed.sha256, findings: scrubbed.findings, ...(scrubbed.keyId === undefined ? {} : { keyId: scrubbed.keyId }), notes: scrubbed.notes };
 }
-
-/** The step outputs of C0a: `<artifact>-sha256`, `<artifact>-status`, `<artifact>-error` (empty strings when not set). */
-export function scrubOutputs(artifact: string, r: ScrubFileResult): Record<string, string> {
-  return { [`${artifact}-sha256`]: r.sha256 ?? '', [`${artifact}-status`]: r.status, [`${artifact}-error`]: r.error ?? '' };
-}

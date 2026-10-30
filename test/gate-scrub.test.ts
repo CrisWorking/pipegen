@@ -5,7 +5,7 @@ import { chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, statSync, 
 import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { keyId } from '../gate/src/fingerprint.js';
-import { forkFromEvent, prepareOutFolder, readScrubbed, scrubBytes, scrubFile, scrubOutputs } from '../gate/src/scrub.js';
+import { forkFromEvent, prepareOutFolder, readScrubbed, scrubBytes, scrubFile } from '../gate/src/scrub.js';
 import { cleanupRepos, makeTempDir } from './helpers/make-repo.js';
 import { fake } from './helpers/secret-repo.js';
 
@@ -341,7 +341,7 @@ describe('scrub: sha256 and the written file', () => {
     expect(r.status).toBe('ok');
     expect(r.sha256).toBe(sha(readFileSync(out)));
     expect(r.sha256).toMatch(/^[0-9a-f]{64}$/);
-    expect(scrubOutputs('pipegen-out-sast', r)).toEqual({ 'pipegen-out-sast-sha256': r.sha256, 'pipegen-out-sast-status': 'ok', 'pipegen-out-sast-error': '' });
+    expect(r.error).toBeUndefined();   // the action writes plain sha256, status and error outputs (main.ts); the job's outputs map them to <artifact>-…
     expect(readdirSync(join(base, 'pipegen-out', 'pipegen-out-sast'))).toEqual(['semgrep.sarif']);
   });
 
@@ -363,7 +363,7 @@ describe('scrub: sha256 and the written file', () => {
     expect(r.error!.length).toBeLessThan(300);
     expect(existsSync(s.out)).toBe(false);
     expect(existsSync(join(s.base, 'pipegen-out'))).toBe(false);
-    expect(scrubOutputs('pipegen-out-iac', r)).toMatchObject({ 'pipegen-out-iac-status': 'tool-error', 'pipegen-out-iac-sha256': '' });
+    expect(r.sha256).toBeUndefined();
   });
 
   it('scrub: raw file empty, not JSON, not SARIF, or a tool-error SARIF → tool-error and no output file', () => {
