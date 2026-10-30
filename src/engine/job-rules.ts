@@ -3,7 +3,7 @@
 // the referee and the linters import them from here, so no second copy can drift. It imports only the leaves render-error.ts,
 // tool-flags.ts and types.ts (test/final-fix-b.test.ts and test/module-graph.test.ts check this).
 import { EXPR, own, RenderError, show } from './render-error.js';
-import { ARGV_POLICIES, BASE_CHECKOUT_REF, CHECKER_STEP_ID_RE, GATE_USES_RE, PLATFORM_USES, rendererInputProblems, RENDERER_INPUTS, scrubStepId, SCRUB_STEP_ID_RE, SETUP_STEP_ID_RE, sha16, TOOL_STEP_ID_RE } from './tool-flags.js';
+import { ARGV_POLICIES, BASE_CHECKOUT_REF, CHECKER_STEP_ID_RE, GATE_USES_RE, isStagedTool, PLATFORM_USES, rendererInputProblems, RENDERER_INPUTS, scrubStepId, SCRUB_STEP_ID_RE, SETUP_STEP_ID_RE, sha16, stagePath, stageStepId, STAGE_STEP_ID_RE, TOOL_STEP_ID_RE } from './tool-flags.js';
 
 /** One step of a job, as pipegen renders it. `usesComment` becomes the trailing `# <version>` comment on `uses:`. */
 export interface RenderedStep {
@@ -92,6 +92,15 @@ export function isScrubStep(s: RenderedStep): boolean {
 }
 
 /**
+ * Whether a step is a stage step (C1c): a `stage-<16 hex>` id on a step with no `run`, whose `uses` is the gate action pinned by a
+ * commit, in `mode: stage`. It copies the checkout into the stage folder of a secrets scan and runs no repo code. The shape only, as
+ * for a scrub step; stageChainProblems holds it to its scan.
+ */
+export function isStageStep(s: RenderedStep): boolean {
+  return s.id !== undefined && STAGE_STEP_ID_RE.test(s.id) && s.run === undefined && s.uses !== undefined && GATE_USES_RE.test(s.uses) && s.with?.mode === 'stage';
+}
+
+/**
  * Whether a step is KNOWN not to run the repo's code. Everything else is repo code (fail closed): a step with no id, an
  * unknown or renamed id, `pipegen-npm-ci-…` (the repo's own `npm ci` reads its `.npmrc`), the repo-code run steps, and any
  * action that is not a pinned checkout, setup or upload action. An id counts only on the right kind of step: a script
@@ -106,6 +115,7 @@ export function isKnownHarmless(s: RenderedStep): boolean {
     return pinnedAction && path !== undefined && (s.uses as string).startsWith(`${path}@`);
   }
   if (SCRUB_STEP_ID_RE.test(s.id)) return isScrubStep(s);   // the gate action in scrub mode: no renderer makes a scrub id on a run step
+  if (STAGE_STEP_ID_RE.test(s.id)) return isStageStep(s);   // the gate action in stage mode (C1c), likewise
   if (CHECKER_STEP_ID_RE.test(s.id) || TOOL_STEP_ID_RE.test(s.id)) return s.run !== undefined && s.uses === undefined;
   return false;   // an unknown or renamed id
 }
@@ -166,6 +176,45 @@ export function checkJobOrder(steps: readonly RenderedStep[], job: Partial<JobCo
   });
   if (job.id === BASE_SCAN_JOB) problems.push(...baseScanProblems(steps));
   problems.push(...scrubChainProblems(steps, job.scans));
+  problems.push(...stageChainProblems(steps, job.scans));
+  return problems;
+}
+
+/**
+ * The stage steps of a job (C1c). A secrets scan reads only what the stage step of its result put in the stage folder, so:
+ * - a stage step names its result (`artifact`), its id is `stage-<sha16(artifact)>`, its `stage` is that result's stage folder and its
+ *   `tool` a tool that scans one; there is one per result;
+ * - the scan step of that result comes after it in the same job, and (with `scans`) runs that very tool: a stage step is allowed only
+ *   in a secrets job and before its scan;
+ * - with `scans`: every scan step of a tool that scans a stage folder has the stage step of its result before it.
+ */
+export function stageChainProblems(steps: readonly RenderedStep[], scans?: ReadonlyMap<string, ScanFact>): string[] {
+  const problems: string[] = [];
+  const seen = new Map<string, number>();   // artifact → index of its stage step
+  steps.forEach((s, i) => {
+    if (!isStageStep(s)) return;
+    const at = `Step ${i + 1} (${show(s.name)})`;
+    const w = s.with ?? {};
+    const artifact = w.artifact;
+    if (typeof artifact !== 'string' || artifact === '') { problems.push(`${at} is a stage step that names no result.`); return; }
+    if (s.id !== stageStepId(artifact)) problems.push(`${at} is a stage step whose id is ${show(s.id ?? '')}, but the stage step of the result ${show(artifact)} is ${stageStepId(artifact)}.`);
+    if (w.stage !== stagePath(artifact)) problems.push(`${at} stages into ${show(String(w.stage ?? ''))}, but the stage folder of the result ${show(artifact)} is ${stagePath(artifact)}.`);
+    if (!isStagedTool(w.tool)) problems.push(`${at} stages for the tool ${show(String(w.tool ?? ''))}, which does not scan a stage folder.`);
+    if (seen.has(artifact)) problems.push(`${at} is a second stage step for the result ${show(artifact)}: a result has exactly one.`);
+    else seen.set(artifact, i);
+    const scanAt = steps.findIndex((x) => x.run !== undefined && x.id === `tool-run-${sha16(artifact)}`);
+    if (scanAt < 0 || scanAt < i) { problems.push(`${at} stages the result ${show(artifact)}, but no scan step of that result comes after it in this job: a stage step belongs to a secrets job, before its scan.`); return; }
+    const fact = scans?.get(`tool-run-${sha16(artifact)}`);
+    if (scans !== undefined && (fact === undefined || fact.tool !== w.tool)) problems.push(`${at} stages for ${show(String(w.tool ?? ''))}, but the scan step of the result ${show(artifact)} runs ${show(fact?.tool ?? 'no reviewed tool')}.`);
+  });
+  if (scans !== undefined) {
+    steps.forEach((s, i) => {
+      if (s.id === undefined || s.run === undefined || !isStagedTool(scans.get(s.id)?.tool)) return;
+      const stageId = s.id.replace(/^tool-run-/, 'stage-');
+      const stageAt = steps.findIndex((x) => isStageStep(x) && x.id === stageId);
+      if (stageAt < 0 || stageAt > i) problems.push(`Step ${i + 1} (${show(s.name)}) scans for secrets, but the stage step of its result does not come before it in this job: the scanner reads the stage folder, which only the stage step fills (an empty or old folder would read as clean).`);
+    });
+  }
   return problems;
 }
 
@@ -225,6 +274,8 @@ export function scrubChainProblems(steps: readonly RenderedStep[], scans?: Reado
       problems.push(`${at} scrubs the result ${show(artifact)}, but no scan step of that result comes before it in this job: the scrub must follow the tool run that wrote the raw file.`);
       return;
     }
+    const scanTool = scans?.get(steps[scanAt]?.id as string)?.tool ?? (typeof tool === 'string' ? tool : undefined);
+    if (isStagedTool(scanTool) && w.stage !== stagePath(artifact)) problems.push(`${at} scrubs a secrets scan, but does not name its stage folder (stage: ${stagePath(artifact)}): without the manifest the scrub can not map the findings or prove which files were scanned.`);
     if (scans === undefined) return;
     const scan = scans.get(steps[scanAt]?.id as string);
     if (scan === undefined) problems.push(`${at} scrubs the result ${show(artifact)}, but the step before it that carries its scan id is not a scan step pipegen renders for a reviewed tool.`);

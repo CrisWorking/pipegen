@@ -15,6 +15,8 @@ import { GATE_CHECK_NAME, type Capabilities, type CreatedFile, type ExistingWork
 import { stub } from './helpers/linter-stub.js';
 import { entry, gateEntry, platform, profile, reviewedList, service, specFor, scansFor } from './helpers/render.js';
 import { fake } from './helpers/secret-repo.js';
+import { renderStage as renderStageC1c } from '../src/engine/render-step.js';
+import { isStagedTool } from '../src/engine/tool-flags.js';
 
 // ---------- builders ----------
 
@@ -59,7 +61,8 @@ function toolJob(spec: StepSpec, c: RenderContext = ctx): RenderedStep[] {
   const upload = r.output !== null && !r.steps.some(isRepoCode)
     ? [...(r.output.format === 'sarif' || r.output.format === 'zap-json' ? [renderScrub(artifact, r.output.path, t.id, r.output.format, GATE)] : []), renderUpload(artifact, scrubbedPath(r.output.path), platform())]
     : [];
-  return [...prelude(r.fullHistory === true ? '0' : '1'), ...r.steps, ...upload];
+  const stage = upload.length > 0 && isStagedTool(t.id) ? [renderStageC1c(artifact, t.id, GATE)] : [];   // C1c
+  return [...prelude(r.fullHistory === true ? '0' : '1'), ...stage, ...r.steps, ...upload];
 }
 type Job = Record<string, unknown>;
 const job = (steps: RenderedStep[], over: Job = {}): Job => ({ 'runs-on': 'ubuntu-latest', permissions: { contents: 'read' }, 'cache-mode': 'none', steps, ...over });
@@ -173,7 +176,7 @@ describe('referee: the renderer and the referee agree', () => {
     jobs[['sec', 'rets'].join('')] = job(repoWideSteps, { outputs: jobOutputsFor(repoWideSteps) });
     const baseRun = renderStep(repoWide, entry('gitleaks'), p, { ...ctx, base: true });
     const baseArt = resultArtifactName('secrets', undefined, { base: true });
-    const baseSteps = [...renderJobPrelude({ baseRef: true }, p).steps, ...baseRun.steps, renderScrub(baseArt, baseRun.output?.path as string, 'gitleaks', 'sarif', GATE), renderUpload(baseArt, scrubbedPath(baseRun.output?.path as string), p)];
+    const baseSteps = [...renderJobPrelude({ baseRef: true }, p).steps, renderStageC1c(baseArt, 'gitleaks', GATE), ...baseRun.steps, renderScrub(baseArt, baseRun.output?.path as string, 'gitleaks', 'sarif', GATE), renderUpload(baseArt, scrubbedPath(baseRun.output?.path as string), p)];
     jobs['base-scan'] = job(baseSteps, { permissions: { contents: 'read', actions: 'read' }, outputs: jobOutputsFor(baseSteps) });
     // the project's own scripts, for a service of their own (the tools above took the first service of each need)
     const scripts = [renderProjectScript({ kind: 'project-script', needId: 'unit-tests', service: 'script-app', script: 'test' }, p, ctxN).steps,

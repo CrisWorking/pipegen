@@ -27,7 +27,7 @@ import type { ProjectScriptStep } from './reviewed.js';
 import { own, RenderError, show } from './render-error.js';
 import { checkExpressions, checkJobOrder, isDangerousName, isReviewed, STEP_KEYS, type JobContext, type RenderedStep, type ScanFact } from './job-rules.js';
 import { jobListLiteral, type JobListEntry } from './gate-job-list.js';
-import { BASE_CHECKOUT_REF, DOCKER_ACTION_USES, IMAGE_BUILT_ACTION_USES, PIPEGEN_GATE_USES, PLAIN_REL_RE, PLATFORM_LOCKS, PLATFORM_USES, RENDERER_INPUTS, rendererInputProblems, scrubbedResultPath, scrubStepId } from './tool-flags.js';
+import { BASE_CHECKOUT_REF, DOCKER_ACTION_USES, IMAGE_BUILT_ACTION_USES, isStagedTool, PIPEGEN_GATE_USES, PLAIN_REL_RE, PLATFORM_LOCKS, PLATFORM_USES, RENDERER_INPUTS, rendererInputProblems, scrubbedResultPath, scrubStepId, stagePath, stageStepId } from './tool-flags.js';
 
 export { RenderError };
 // the job rules live in job-rules.ts (one copy for the renderer, the emitter, the referee and the linters); re-exported for the callers that import them here
@@ -483,8 +483,39 @@ function checkGateEntry(gate: ReviewedTool): void {
 export function renderScrub(artifact: string, rawPath: string, tool: string, format: 'sarif' | 'zap-json', gate: ReviewedTool): RenderedStep {
   checkGateEntry(gate);
   const out = scrubbedPath(rawPath);
-  const step = actionStep(gate, 'pipegen: scrub the result', {}, { mode: 'scrub', artifact, tool, format, raw: rawPath, out, 'fp-key': '${{ secrets.PIPEGEN_FP_KEY }}' });
+  // C1c: the scrub of a secrets scan reads the stage folder's manifest, to map the findings back and to prove coverage by the canaries
+  const staged: Record<string, string> = isStagedTool(tool) ? { stage: stagePath(artifact) } : {};
+  const step = actionStep(gate, 'pipegen: scrub the result', {}, { mode: 'scrub', artifact, tool, format, raw: rawPath, out, 'fp-key': '${{ secrets.PIPEGEN_FP_KEY }}', ...staged });
   return { id: scrubStepId(artifact), ...step, if: 'always()' };
+}
+
+/**
+ * The stage step of a secrets scan (C1c): pipegen's gate action in `stage` mode copies every regular file of the checkout into
+ * `${{ runner.temp }}/pipegen-stage/<artifact>` under neutral names, each ending with a fresh canary line, and writes the manifest
+ * (gate/src/stage.ts). It comes after the checkout and before the scanner, in the secrets job only (checkJobOrder,
+ * stageChainProblems). No condition: when it fails, the scan does not run and the scrub reports a tool error.
+ */
+export function renderStage(artifact: string, tool: string, gate: ReviewedTool): RenderedStep {
+  checkGateEntry(gate);
+  if (!isStagedTool(tool)) throw new RenderError(`${show(tool)} does not scan a stage folder, so it has no stage step.`);
+  const step = actionStep(gate, 'pipegen: stage the files for the secrets scan', {}, { mode: 'stage', artifact, tool, stage: stagePath(artifact) });
+  return { id: stageStepId(artifact), ...step };
+}
+
+/**
+ * The steps of one findings check after the job's prelude, as Plan G composes a scanner job (C1c): the stage step for a tool that scans
+ * a stage folder (the secrets tools), the tool's own steps (install, run), the scrub and the upload. `scan` is the scan fact for the
+ * job rules (dedupeJobSteps). Throws RenderError for a tool that writes no findings file.
+ */
+export function renderFindingsBlock(spec: StepSpec, tool: ReviewedTool, platform: PlatformActions, ctx: RenderContext, gate: ReviewedTool): { steps: RenderedStep[]; artifact: string; scan: { stepId: string; fact: ScanFact }; result: RenderResult } {
+  const result = renderStep(spec, tool, platform, ctx);
+  const out = result.output;
+  const scan = scanFactOf(result, tool.id);
+  if (out === null || scan === null || (out.format !== 'sarif' && out.format !== 'zap-json')) throw new RenderError(`${show(tool.id)} writes no findings file, so it has no scrub and no upload.`);
+  const artifact = resultArtifactName(spec.needId, spec.service, ctx.base === true ? { base: true } : undefined);
+  const stage = isStagedTool(tool.id) ? [renderStage(artifact, tool.id, gate)] : [];
+  const scrub = renderScrub(artifact, out.path, tool.id, out.format, gate);
+  return { steps: [...stage, ...result.steps, scrub, renderUpload(artifact, scrubbedPath(out.path), platform)], artifact, scan, result };
 }
 
 /**

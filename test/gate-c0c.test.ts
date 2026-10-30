@@ -18,6 +18,8 @@ import { existsSync, mkdtempSync, writeFileSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { entry, gateEntry, platform, profile, reviewedList, service, specFor } from './helpers/render.js';
+import { renderStage as renderStageC1c } from '../src/engine/render-step.js';
+import { isStagedTool } from '../src/engine/tool-flags.js';
 
 // object keys spelled at run time (see test/no-secret-literals.test.ts)
 const NS = ['needs', 'Sec', 'rets'].join('');
@@ -72,7 +74,8 @@ function block(spec: StepSpec, c: RenderContext = ctx): Block {
   const upload = renderUpload(artifact, scrubbedPath(out.path), p);
   const scan = scanFactOf(result, t.id);
   if (scan === null) throw new Error('no scan fact');
-  return { steps: [...result.steps, scrub, upload], scrub, upload, artifact, scan, result };
+  const stage = isStagedTool(t.id) ? [renderStageC1c(artifact, t.id, GATE)] : [];   // C1c: a secrets scan reads the stage folder its stage step filled
+  return { steps: [...stage, ...result.steps, scrub, upload], scrub, upload, artifact, scan, result };
 }
 const gitleaksSpec = (): StepSpec => specFor(entry('gitleaks'), { needId: 'secrets' });
 const semgrepSpec = (svc: string): StepSpec => specFor(entry('semgrep'), { needId: 'sast', service: svc });

@@ -39,7 +39,7 @@ import { NEED_ID_CATEGORY, toolCoversNeed } from './need-ids.js';
 import { PLATFORM_ACTION_IDS, type PlatformActions } from './pin.js';
 import { APP_RUNNING_CATEGORIES, TRIVY_LAUNCH_RE } from './render-cli.js';
 import { EXPR, own, show } from './render-error.js';
-import { ACTION_PATH_RE, checkExpressions, createdPathProblem, checkJobOrder, IF_VALUES, isDangerousName, isReviewed, isScrubStep, jobOutputsProblems, SECRET_REF_RE, STEP_KEYS as STEP_KEY_LIST, WORKFLOW_PATH_RE, type RenderedStep, type ScanFact } from './job-rules.js';
+import { ACTION_PATH_RE, checkExpressions, createdPathProblem, checkJobOrder, IF_VALUES, isDangerousName, isReviewed, isScrubStep, isStageStep, jobOutputsProblems, SECRET_REF_RE, STEP_KEYS as STEP_KEY_LIST, WORKFLOW_PATH_RE, type RenderedStep, type ScanFact } from './job-rules.js';
 import { containerRefusal, RenderError, renderProjectScript, renderStep, sameDedupeContent, type RenderContext } from './render-step.js';
 import { projectScriptFor } from './reviewed.js';
 import { slotProblem, type SlotKind } from './slots.js';
@@ -105,7 +105,7 @@ export { FINDINGS_CATEGORIES };   // defined in gate-job-list.ts (the job list n
  * scripts, the repo's npm ci); `central`: an action from the central pipelines repo; `unrecognised`: anything else.
  */
 export type StepKind = 'checkout' | 'setup' | 'harden' | 'upload-artifact' | 'download-artifact' | 'upload-sarif' | 'attest' | 'docker-login' | 'setup-buildx' | 'build-push'
-  | 'gate' | 'watcher' | 'tool' | 'scrub' | 'central' | 'repo-code' | 'unrecognised';
+  | 'gate' | 'watcher' | 'tool' | 'scrub' | 'stage' | 'central' | 'repo-code' | 'unrecognised';
 /** pipegen's own actions by reviewed-entry id (Plan C adds the gate entry, Plan H the watcher entry, under these ids). */
 export const PIPEGEN_ACTION_IDS = { gate: 'pipegen-gate', watcher: 'pipegen-watcher' } as const;
 /** The step kind of each reviewed action entry that is not an ordinary tool, by entry id. The gate entry is kind `gate`, except a recognised scrub step of it (isScrubStep: judgeUses). */
@@ -130,7 +130,7 @@ export const JOB_STEP_POLICY: Readonly<Record<string, readonly StepKind[]>> = Ob
   'code-scanning': ['harden', 'download-artifact', 'upload-sarif'],
   // no checkout: the gate never reads the workspace (Plan C ruling S21); it reads the event, the job outputs and the API
   gate: ['harden', 'download-artifact', 'gate'],
-  'base-scan': ['harden', 'checkout', 'setup', 'tool', 'scrub', 'upload-artifact'],
+  'base-scan': ['harden', 'checkout', 'setup', 'stage', 'tool', 'scrub', 'upload-artifact'],
   'baseline-check': ['harden', 'checkout', 'download-artifact', 'gate'],
   'image-publish': ['harden', 'checkout', 'setup-buildx', 'docker-login', 'build-push'],
   sign: ['harden', 'checkout', 'download-artifact', 'docker-login', 'attest'],
@@ -928,7 +928,8 @@ function judgeJobSteps(fc: FileCtx, where: string, steps: unknown[], job: boolea
     if (got === null || !isDeepStrictEqual(new Set(got), want)) fc.add(fc.file.path, 'template', `In ${where}: the dependency install ${show(id)} does not check exactly the pins of the tools of its job.`);
   }
   if (job) {
-    const reader = judged.findIndex((x) => x.kind === 'tool' && x.readsWorkspace);
+    // the stage step (C1c) reads the checkout too: it copies it for the secrets scan
+    const reader = judged.findIndex((x) => (x.kind === 'tool' && x.readsWorkspace) || x.kind === 'stage');
     if (reader >= 0) {
       const co = judged.findIndex((x) => x.kind === 'checkout');
       const ok = co >= 0 && co < reader && judged.slice(0, co).every((x) => x.kind === 'harden' || x.kind === 'setup') && judged[co]?.step.if === undefined;
@@ -1101,7 +1102,10 @@ function judgeUses(fc: FileCtx, at: (m: string) => string, uses: string, withs: 
   if (raw['working-directory'] !== undefined) bad('template', at('an action step takes no working-directory.'));
   const appRunning = t.categories.some((c) => APP_RUNNING_CATEGORIES.has(c));
   // the gate action in scrub mode under a scrub id is kind scrub; in any other mode (or under another id) it is the gate (ruling B1 part 4)
-  const kind = t.id === PIPEGEN_ACTION_IDS.gate && isScrubStep(raw as unknown as RenderedStep) ? 'scrub' : own(ENTRY_KIND, t.id) ?? (appRunning ? 'repo-code' : 'tool');
+  // C1c: in stage mode under a stage id it is kind stage (the stage folder of a secrets scan)
+  const kind = t.id === PIPEGEN_ACTION_IDS.gate && isScrubStep(raw as unknown as RenderedStep) ? 'scrub'
+    : t.id === PIPEGEN_ACTION_IDS.gate && isStageStep(raw as unknown as RenderedStep) ? 'stage'
+      : own(ENTRY_KIND, t.id) ?? (appRunning ? 'repo-code' : 'tool');
   return { appRunning, kind, entryId: t.id };
 }
 
@@ -1112,7 +1116,7 @@ function judgeTemplate(fc: FileCtx, at: (m: string) => string, t: ReviewedTool, 
   const all = Object.fromEntries(Object.entries(withs).map(([k, v]) => [k, typeof v === 'string' ? v : String(v)]));
   for (const [k, v] of Object.entries(fixed)) if (withs[k] !== v) bad('template', at(`${t.id} must have ${safeText(k, 40)}: ${show(v)} (a reviewed fixed input).`));
   // the gate action does one thing per mode and has no default: a step without a mode would run whatever the action's own default is
-  if (t.id === PIPEGEN_ACTION_IDS.gate && withs.mode === undefined) bad('template', at(`${t.id} must set its mode (scrub, gate, find-run or nightly); the action has no reviewed default.`));
+  if (t.id === PIPEGEN_ACTION_IDS.gate && withs.mode === undefined) bad('template', at(`${t.id} must set its mode (scrub, stage, gate, find-run or nightly); the action has no reviewed default.`));
   for (const [k, values] of Object.entries(t.choices)) {
     const v = withs[k];
     if (v === undefined) bad('template', at(`${t.id} must set its choice ${show(k)} (left out, the action's own default would run, which nobody reviewed).`));
@@ -1139,7 +1143,7 @@ function judgeSecrets(fc: FileCtx, at: (m: string) => string, withs: Obj, env: O
     if (typeof v !== 'string') continue;
     for (const m of v.matchAll(SECRET_USE_RE)) names.add(m[1] as string);
   }
-  const ownOk = !appRunning && !['tool', 'scrub', 'repo-code', 'unrecognised', 'central'].includes(kind);
+  const ownOk = !appRunning && !['tool', 'scrub', 'stage', 'repo-code', 'unrecognised', 'central'].includes(kind);
   // a recognised scrub step names the fingerprint key and nothing else of pipegen's (ruling B1 part 6)
   const scrubOk = (n: string): boolean => kind === 'scrub' && !appRunning && n === SCRUB_SECRET;
   for (const n of names) {

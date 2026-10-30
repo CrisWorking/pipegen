@@ -11,6 +11,8 @@ import { rendererInputProblems } from '../src/engine/tool-flags.js';
 import { emptyRepoFiles } from '../src/read/quality.js';
 import type { Capabilities, CreatedFile, Need, PipelineDraft, StepSpec } from '../src/types.js';
 import { entry, gateEntry, platform, profile, reviewedList, service, specFor, scansFor } from './helpers/render.js';
+import { renderStage as renderStageC1c } from '../src/engine/render-step.js';
+import { isStagedTool } from '../src/engine/tool-flags.js';
 
 const api = service({ name: 'api', path: '.', scripts: ['test'], envVars: ['STRIPE_KEY'] });
 const prof = { ...profile([api]), repoFiles: { ...emptyRepoFiles() } };
@@ -41,7 +43,8 @@ function toolSteps(spec: StepSpec, c: RenderContext = ctx): RenderedStep[] {
   const up = r.output !== null && !r.steps.some((s) => s.id?.startsWith('repocode-'))
     ? [renderScrub(art, r.output.path, spec.tool.id, r.output.format as 'sarif', GATE), renderUpload(art, scrubbedPath(r.output.path), p)]
     : [];
-  return [...r.steps, ...up];
+  const stage = up.length > 0 && isStagedTool(spec.tool.id) ? [renderStageC1c(art, spec.tool.id, GATE)] : [];   // C1c
+  return [...stage, ...r.steps, ...up];
 }
 
 describe('finding 1: declared secrets only for app-running tools, in validateSpec', () => {
@@ -144,7 +147,7 @@ describe('finding 5: a base-scan variant of the renderer and the referee', () =>
     const scrub = renderScrub(baseArt, r0.output?.path as string, 'gitleaks', 'sarif', GATE);
     const up = renderUpload(baseArt, scrubbedPath(r0.output?.path as string), p);
     // the PR's own scan is in the file too: the base job alone would not satisfy a blocking need
-    const doc = wf({ scan: toolSteps(gl).length > 0 ? [...prelude(), ...toolSteps(gl)] : [], 'base-scan': [...renderJobPrelude({ baseRef: true }, p).steps, ...r0.steps, scrub, up] });
+    const doc = wf({ scan: toolSteps(gl).length > 0 ? [...prelude(), ...toolSteps(gl)] : [], 'base-scan': [...renderJobPrelude({ baseRef: true }, p).steps, renderStageC1c(baseArt, 'gitleaks', GATE), ...r0.steps, scrub, up] });
     const r = await run([doc], draftOf([gl], [needOf('secrets')]));
     expect(showR(r)).toBe('');
   });

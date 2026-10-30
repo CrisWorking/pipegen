@@ -593,22 +593,37 @@ export function renderCliTool({ spec, tool, service, ctx, hooks, options }: CliA
     `printf '%s\\n' ${scope.lines.join(' ')} > ${scope.file}`,
     '# pipegen scope: end',
   ];
-  // the repo's own ignore files (betterleaks, gitleaks: R1-I1) are deleted before the scan, in the same step; a link is removed, never followed
-  const dropNames = pol.removeFiles ?? [];
-  if (!dropNames.every((n) => /^\.[a-z][a-z0-9]{0,30}$/.test(n))) return refuse(`The ignore files of ${show(tool.id)} are not plain names.`);
-  const dropLines = dropNames.length === 0 ? [] : [
-    '# pipegen ignore files: begin',
-    ...dropNames.map((n) => `if [ -d ${n} ] && [ ! -L ${n} ]; then pg_fail "the repository has a folder named ${n} at the scan root, so pipegen can not remove it"; fi`),
-    ...dropNames.map((n) => `"\${sys[@]}" find . -name ${n} \\( -type f -o -type l \\) -delete`),
-    '# pipegen ignore files: end',
+  // C1c: a secrets scan runs on the stage folder its stage step filled (gate/src/stage.ts), never on the checkout: the run checks the folder
+  // and its manifest (no link), cds into the staged files (the tool's ignore-file lookup and its path allowlists see only neutral names),
+  // refuses an ignore file there (a belt: the stage step never writes one) and writes its report into a fresh work folder outside them
+  const staged = pol.staged;
+  if (staged !== undefined) {
+    if (spec.workingDir !== undefined) return refuse(`${show(tool.id)} scans the whole repository through its stage folder, so it can not run in a service folder.`);
+    if (kind !== 'github-release' || out === null) return refuse(`${show(tool.id)} scans a stage folder, which only a release binary that writes a result file can.`);
+    if (!staged.ignoreFiles.every((n) => /^\.[a-z][a-z0-9]{0,30}$/.test(n))) return refuse(`The ignore files of ${show(tool.id)} are not plain names.`);
+    const at = built.main.findIndex((w, i) => i > 0 && built.main[i - 1] === '--report-path' && w === q(out));
+    if (at < 0 || built.main.filter((w) => w === '--report-path').length !== 1) return refuse(`${show(tool.id)} scans a stage folder, so its command must name its result once, as --report-path ${show(out)}.`);
+    built.main[at] = '"$out"';
+  }
+  const stageLines = staged === undefined ? [] : [
+    `stage="$RUNNER_TEMP/pipegen-stage/${artifact}"`,
+    'for d in "$stage" "$stage/files"; do',
+    '  if [ -L "$d" ] || [ ! -d "$d" ]; then pg_fail "the stage folder $d is missing or a link: the stage step of this result must run before the scan"; fi',
+    'done',
+    'if [ -L "$stage/manifest.json" ] || [ ! -f "$stage/manifest.json" ]; then pg_fail "the stage manifest is missing or a link: the stage step of this result did not finish"; fi',
+    'cd -- "$stage/files"',
+    ...staged.ignoreFiles.map((n) => `if [ -e ${n} ] || [ -L ${n} ]; then pg_fail "the stage folder holds a file named ${n}, which the scanner would read as an ignore file"; fi`),
+    `work="$RUNNER_TEMP/pipegen-work/${artifact}"`,
+    'mkdir -p "$RUNNER_TEMP/pipegen-work"',
+    'mkdir "$work"',
   ];
   // what the tuning did, in plain words, in comment lines (describeTuning): one line of text each, nothing but printable ASCII
   const tuneComments = tuned.lines.map((l) => `# tuning: ${l.replace(/[^\x20-\x7e]/g, '?')}`);
   // the result path must be free before the tool runs and a regular file after it, also where it lands (ruling S7)
   const outDir = `$RUNNER_TEMP/pipegen-raw/${artifact}`;
   const preCheck = out === null ? [] : [
-    inWork ? `out="$work/${out}"` : `out=${q(out)}`,
-    inWork ? 'outdir="$work"' : 'outdir=.',
+    inWork || staged !== undefined ? `out="$work/${out}"` : `out=${q(out)}`,
+    inWork || staged !== undefined ? 'outdir="$work"' : 'outdir=.',
     'if [ -e "$out" ] || [ -L "$out" ]; then pg_fail "the result file $out exists before the tool ran, so pipegen will not use it"; fi',
     '[ -d "$outdir" ] && [ ! -L "$outdir" ] || pg_fail "the folder for the result is not a real folder"',
   ];
@@ -642,7 +657,7 @@ export function renderCliTool({ spec, tool, service, ctx, hooks, options }: CliA
   const launch = (words: readonly string[]): string => `${LAUNCH_ENV} ${prefix}${words.length === 0 ? '' : ` ${words.join(' ')}`}`;
   const chain = [launch(built.main), ...built.then.map(launch)].join(' && ');
   const run = script([
-    ...prologue(artifact, nodeMajor === undefined ? {} : { nodeMajor }), ...tuneComments, ...vars, ...installLines, ...cdLines(spec.workingDir), ...pathChecks, ...prep, ...cfgLines, ...scopeLines, ...dropLines, ...preCheck,
+    ...prologue(artifact, nodeMajor === undefined ? {} : { nodeMajor }), ...tuneComments, ...vars, ...installLines, ...cdLines(spec.workingDir), ...pathChecks, ...prep, ...cfgLines, ...scopeLines, ...stageLines, ...preCheck,
     ...closureVars, ...allowlist(pathValue, passed, [], dynamicEnv), ...afterAllow, 'rc=0', `${chain} || rc=$?`, ...postCheck, 'exit "$rc"',
   ]);
   // a tool that runs the repo's own code is marked, so the referee can apply its order rule (S6 c); the id is not `pipegen-…`, which a job's dedupe may drop

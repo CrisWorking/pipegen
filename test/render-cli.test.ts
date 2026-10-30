@@ -270,8 +270,8 @@ describe('6b: pinned config (S4, S3)', () => {
     for (const id of ['trivy-config', 'betterleaks', 'ruff', 'osv-scanner', 'zizmor', 'actionlint', 'poutine']) {
       const t = entry(id);
       const text = JSON.stringify(render(id).steps).replace(/\$cfg\/[A-Za-z0-9._-]+/g, '');
-      // the secrets steps name their ignore files to DELETE them (C1b fix round 2, R1-I1): that is the opposite of referencing them
-      const removed: readonly string[] = ARGV_POLICIES[id]?.removeFiles ?? [];
+      // the secrets steps name their ignore files only to REFUSE one in the stage folder (C1c belt): that is the opposite of referencing them
+      const removed: readonly string[] = ARGV_POLICIES[id]?.staged?.ignoreFiles ?? [];
       for (const f of t.configFiles.filter((x) => !removed.includes(x))) expect(text, `${id}: ${f}`).not.toContain(f);
     }
   });

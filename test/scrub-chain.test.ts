@@ -19,6 +19,9 @@ import { entry, gateEntry, GATE_SHA, platform, profile, reviewedList, service, s
 import { exec, fakeTool, sandbox, stepEnv, type Sandbox } from './helpers/step-harness.js';
 import { parseSarifText, SYNTHESIZED_NUCLEI } from '../gate/src/sarif.js';
 import { NUCLEI_EMPTY_SARIF } from '../src/engine/render-cli.js';
+import { stageWorkspace } from '../gate/src/stage.js';
+import { renderStage as renderStageC1c } from '../src/engine/render-step.js';
+import { isStagedTool } from '../src/engine/tool-flags.js';
 
 // ---------- builders ----------
 
@@ -69,7 +72,8 @@ function scannerSteps(spec: StepSpec, c: RenderContext = ctx): { steps: Rendered
   if (out === null) throw new Error('not a tool with a result');
   const artifact = resultArtifactName(spec.needId, spec.service, c.base === true ? { base: true } : undefined);
   const scrub = renderScrub(artifact, out.path, t.id, out.format as 'sarif' | 'zap-json', GATE);
-  return { steps: [...prelude(result.fullHistory === true ? '0' : '1'), ...result.steps, scrub, renderUpload(artifact, scrubbedPath(out.path), p)], result, artifact };
+  const stage = isStagedTool(t.id) ? [renderStageC1c(artifact, t.id, GATE)] : [];   // C1c
+  return { steps: [...prelude(result.fullHistory === true ? '0' : '1'), ...stage, ...result.steps, scrub, renderUpload(artifact, scrubbedPath(out.path), p)], result, artifact };
 }
 const gitleaksSpec = (): StepSpec => specFor(entry('gitleaks'), { needId: 'secrets' });
 
@@ -88,7 +92,7 @@ describe('renderScrub (ruling B1 part 7)', () => {
     expect(s.usesComment).toBe('v0.2.0');
     expect(s.if).toBe('always()');
     expect(s.run).toBeUndefined();
-    expect(s.with).toEqual({ mode: 'scrub', artifact, tool: 'gitleaks', format: 'sarif', raw, out, 'fp-key': FP });
+    expect(s.with).toEqual({ mode: 'scrub', artifact, tool: 'gitleaks', format: 'sarif', raw, out, 'fp-key': FP, stage: `\${{ runner.temp }}/pipegen-stage/${artifact}` });   // C1c: a secrets scrub reads its stage folder
     expect(s.env).toBeUndefined();
   });
 
@@ -378,6 +382,8 @@ describe('referee: the scrub chain', () => {
 // ---------- render-cli ----------
 
 const lastRun = (r: RenderResult): RenderedStep => r.steps.filter((s) => s.run !== undefined).at(-1) as RenderedStep;
+/** A stand-in secrets tool's body: it writes its (empty) report at the path its --report-path names (C1c: outside the stage folder). */
+const REPORT_AT_PATH = `prev=""\nfor a in "$@"; do if [ "$prev" = --report-path ]; then echo '{"runs":[]}' > "$a"; fi; prev="$a"; done\n`;
 const RAW_FORMATS = ['sarif', 'zap-json'];
 
 describe('render-cli: the raw result folder (ruling B1 part 1)', () => {
@@ -390,7 +396,8 @@ describe('render-cli: the raw result folder (ruling B1 part 1)', () => {
     expect(text).not.toMatch(/pipegen-out\b(?!-)/);
     // and really: the file lands in pipegen-raw, read-only, and no pipegen-out folder is made
     const sb = sandbox();
-    fakeTool(sb, 'pipegen-out-secrets', 'gitleaks', "echo '{\"runs\":[]}' > ./gitleaks.sarif");
+    expect(stageWorkspace({ workspace: sb.ws, stage: join(sb.rt, 'pipegen-stage', 'pipegen-out-secrets') }).status).toBe('ok');   // C1c: the stage step ran
+    fakeTool(sb, 'pipegen-out-secrets', 'gitleaks', REPORT_AT_PATH);
     expect(exec(lastRun(r), sb, stepEnv(lastRun(r), sb)).status).toBe(0);
     const dir = join(sb.rt, 'pipegen-raw', 'pipegen-out-secrets');
     expect(readFileSync(join(dir, 'gitleaks.sarif'), 'utf8')).toContain('"runs"');
@@ -476,6 +483,10 @@ describe('render-cli: a findings exit code is not a failed step (ruling B2), rea
     if (e.docker) {
       const docker = fakeDocker(sb, e.file, code, writeResult);
       step = { ...step, run: (step.run as string).replaceAll('/usr/bin/docker', docker) };
+    } else if (ARGV_POLICIES[e.id]?.staged !== undefined) {
+      // C1c: a secrets scan runs in the stage folder its stage step filled, and writes its report where --report-path says (outside it)
+      expect(stageWorkspace({ workspace: sb.ws, stage: join(sb.rt, 'pipegen-stage', e.art) }).status).toBe('ok');
+      fakeTool(sb, e.art, e.exe, `${writeResult ? REPORT_AT_PATH : ''}exit ${code}`);
     } else fakeTool(sb, e.art, e.exe, `${writeResult ? `echo '{"runs":[]}' > ./${e.file}\n` : ''}exit ${code}`);
     return { status: exec(step, sb, stepEnv(step, sb)).status, sb };
   }

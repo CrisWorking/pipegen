@@ -130,12 +130,14 @@ export interface ArgvPolicy extends CommandPolicy {
    */
   readonly scopeIgnore?: { readonly file: string; readonly lines: readonly string[] };
   /**
-   * Repo files the tool reads to drop findings (C1b fix round 2, review R1-I1): betterleaks and gitleaks silence a finding named by a
-   * `file:rule:line` entry of `.gitleaksignore` / `.betterleaksignore` at the scan root, and `--gitleaks-ignore-path` cannot turn that off.
-   * The renderer deletes every file of these names under the step folder (links included, never followed) before the scan and writes
-   * nothing in their place; the files stay protected paths, so a PR that changes one is still flagged.
+   * The secrets tools (C1c, reviews C1b-r1 R1-C3 and C1b-r2 R2-C1): the tool scans pipegen's stage folder, never the checkout. The job's
+   * stage step (the gate action in mode `stage`, renderStage) copies every file of the checkout under a neutral name with a canary
+   * line; the run step checks `$RUNNER_TEMP/pipegen-stage/<artifact>`, runs the tool with its cwd in the staged files (so its ignore-file
+   * lookup and its path allowlists see only neutral names), writes the report into a fresh work folder outside them, and refuses a stage
+   * folder that holds a file named like one of `ignoreFiles` (a belt: the stage step never writes one). The repo's own ignore files are
+   * staged as content, so a key in them is scanned; they stay protected paths for C2. Nothing in the checkout is changed.
    */
-  readonly removeFiles?: readonly string[];
+  readonly staged?: { readonly ignoreFiles: readonly string[] };
   readonly env?: readonly string[];
   readonly then?: readonly CommandPolicy[];
   readonly dedicated?: true;
@@ -191,8 +193,9 @@ const TRIVY_CONFIG = { flag: '--config', content: "# pipegen's pinned trivy conf
  * written out here because this module is a leaf. The default path allowlists stay in force, but they never match a staged name.
  */
 export const SECRETS_SCAN_CONFIG = '[extend]\nuseDefault = true\n\n[[rules]]\nid = "pipegen-canary"\ndescription = "pipegen scan marker (proves the file was read)"\nregex = \'\'\'(?m)^pipegen-canary-[0-9a-f]{32}$\'\'\'\nkeywords = ["pipegen-canary-"]\n';
-/** The ignore files betterleaks 1.9.0 and gitleaks 8.30.1 read from the scan root (`--help` of `dir`: `.betterleaksignore` or `.gitleaksignore`). */
+/** The ignore files betterleaks 1.9.0 and gitleaks 8.30.1 read from their cwd (`--help` of `dir`: `.betterleaksignore` or `.gitleaksignore`): the stage folder never holds one. */
 const SECRETS_IGNORE_FILES = ['.gitleaksignore', '.betterleaksignore'] as const;
+const STAGED = { ignoreFiles: SECRETS_IGNORE_FILES } as const;
 const GH = 'github-release' as const;
 const TRIVY_ASSET = 'trivy_0.76.0_Linux-64bit.tar.gz';
 const RUFF_ASSET = 'ruff-x86_64-unknown-linux-gnu.tar.gz';
@@ -211,7 +214,7 @@ const POLICIES = {
   'trivy-config': { ...DEDICATED('trivy', TRIVY_ASSET, TRIVY_CONFIG), findingsExit: FOUND_10 },
   'trivy-image': { ...DEDICATED('trivy', TRIVY_ASSET, TRIVY_CONFIG), slots: { '': 'image-digest' }, findingsExit: FOUND_10 },
   'trivy-licence': { ...DEDICATED('trivy', TRIVY_ASSET, TRIVY_CONFIG), findingsExit: FOUND_10 },
-  betterleaks: { ...DEDICATED('betterleaks', 'betterleaks_1.9.0_linux_x64.tar.gz', { flag: '--config', content: SECRETS_SCAN_CONFIG, fileName: 'betterleaks.toml' }), findingsExit: FOUND_10, removeFiles: SECRETS_IGNORE_FILES },
+  betterleaks: { ...DEDICATED('betterleaks', 'betterleaks_1.9.0_linux_x64.tar.gz', { flag: '--config', content: SECRETS_SCAN_CONFIG, fileName: 'betterleaks.toml' }), findingsExit: FOUND_10, staged: STAGED },
   nuclei: { ...DEDICATED('nuclei', 'nuclei_3.11.1_linux_amd64.zip'), slots: { '-target': 'local-url' }, findingsExit: [],
     archive: { repo: 'projectdiscovery/nuclei-templates', commitEnv: 'PIPEGEN_NUCLEI_TEMPLATES_COMMIT', treeEnv: 'PIPEGEN_NUCLEI_TEMPLATES_TREE', dir: '/pipegen-nuclei-templates' } },
   // ruling P28: the image entries too. registry runs the image's own entrypoint, nothing else
@@ -236,7 +239,7 @@ const POLICIES = {
   },
   // gitleaks 8.30.1 (`gitleaks dir --help`; dir mode since C1b fix round 1, so the scanner reads the bytes the scrub reads), the secrets fallback (P21): the same locks as betterleaks
   gitleaks: { method: GH, package: 'gitleaks_8.30.1_linux_x64.tar.gz',
-    exe: 'gitleaks', dialect: 'long', sub: ['dir'], positionals: ['.'], findingsExit: FOUND_10, removeFiles: SECRETS_IGNORE_FILES,
+    exe: 'gitleaks', dialect: 'long', sub: ['dir'], positionals: ['.'], findingsExit: FOUND_10, staged: STAGED,
     flags: { 'no-banner': 'bool', 'ignore-gitleaks-allow': 'bool', redact: { values: ['', '100'], optional: true }, 'report-format': { values: ['sarif'] }, 'report-path': 'output', 'exit-code': { values: ['10'] }, 'max-archive-depth': { values: ['0'] } },
     required: { 'ignore-gitleaks-allow': 'true', redact: '', 'report-format': 'sarif', 'report-path': null, 'exit-code': '10', 'max-archive-depth': '0' },
     config: { flag: '--config', content: SECRETS_SCAN_CONFIG, fileName: 'gitleaks.toml' },
@@ -397,10 +400,18 @@ export const TOOL_STEP_ID_RE = /^tool-(?:install|pull|run)-[0-9a-f]{16}$/;
 export const SETUP_STEP_ID_RE = /^pipegen-(?:checkout|setup-node-\d{1,3}|setup-python)$/;
 /** The id of a scrub step (Plan C's gate action in `scrub` mode, ruling B1) in a job: the order rule treats it like an upload. */
 export const SCRUB_STEP_ID_RE = /^scrub-[0-9a-f]{16}$/;
+/** The id of a stage step (C1c: the gate action in `stage` mode, before a secrets scan): `stage-<sha16(artifact)>`. */
+export const STAGE_STEP_ID_RE = /^stage-[0-9a-f]{16}$/;
 /** The first 16 hex digits of the SHA-256 of a text: the short, stable part of the ids that tie a result's steps together (scan, scrub). */
 export const sha16 = (text: string): string => createHash('sha256').update(text).digest('hex').slice(0, 16);
 /** The id of the scrub step of a result artifact: `scrub-<sha16(artifact)>`. The job outputs and the scrub cross-checks name a scrub by this id. */
 export const scrubStepId = (artifact: string): string => `scrub-${sha16(artifact)}`;
+/** The id of the stage step of a result artifact (C1c): `stage-<sha16(artifact)>`. */
+export const stageStepId = (artifact: string): string => `stage-${sha16(artifact)}`;
+/** The stage folder of a result artifact, as a step input (C1c): `${{ runner.temp }}/pipegen-stage/<artifact>`; the run step names the same folder as `$RUNNER_TEMP/pipegen-stage/<artifact>`. */
+export const stagePath = (artifact: string): string => `\${{ runner.temp }}/pipegen-stage/${artifact}`;
+/** The reviewed entries whose scan runs on a stage folder (ArgvPolicy.staged): betterleaks and gitleaks. */
+export const isStagedTool = (tool: string | undefined): boolean => tool !== undefined && Object.hasOwn(ARGV_POLICIES, tool) && ARGV_POLICIES[tool]?.staged !== undefined;
 /** The `uses` path of pipegen's own gate action (a leaf constant: the renderer, the order rule and the referee all name it from here). */
 export const PIPEGEN_GATE_USES = 'crisworking/pipegen/gate';
 /** A pinned use of the gate action: the path, `@`, a 40-character commit. The reviewed pin itself is the referee's question. */
@@ -577,7 +588,7 @@ const inScrubMode = (input: RendererInput): RendererInput => ({ ...input, whenWi
 
 // ---------- the gate action's modes (Plan C ruling B3) ----------
 /** The modes of the gate action pipegen renders today (Plan I adds `merged-red` to this list and its row). */
-export const GATE_MODES = ['scrub', 'gate', 'find-run', 'nightly'] as const;
+export const GATE_MODES = ['scrub', 'stage', 'gate', 'find-run', 'nightly'] as const;
 /** An input valid only in the listed modes: the whole `with:` must name one of them. */
 const inModes = (modes: readonly (typeof GATE_MODES)[number][]): NonNullable<RendererInput['whenWith']> => ({
   check: (all) => modes.some((m) => all.mode === m), describe: `only in mode ${modes.join(' or ')}`,
@@ -706,9 +717,17 @@ export const RENDERER_INPUTS: Readonly<Record<string, Readonly<Record<string, Re
   // own inputs, checked with `whenWith` on `mode`, so a mode's input is refused under another mode (Plan C rulings B1 and B3).
   [PIPEGEN_GATE_USES]: {
     mode: rx(new RegExp(`^(?:${GATE_MODES.join('|')})$`), `one of ${GATE_MODES.join(', ')}`),
-    // scrub (ruling B1)
-    artifact: inScrubMode(ARTIFACT_NAME),
-    tool: inScrubMode(rx(/^[a-z0-9][a-z0-9-]{0,63}$/, 'a reviewed tool id')),
+    // scrub (ruling B1) and stage (C1c)
+    artifact: { ...ARTIFACT_NAME, whenWith: inModes(['scrub', 'stage']) },
+    tool: rx(/^[a-z0-9][a-z0-9-]{0,63}$/, 'a reviewed tool id', {
+      check: (all) => all.mode === 'scrub' || (all.mode === 'stage' && isStagedTool(all.tool)),
+      describe: 'only in mode scrub, or in mode stage for a tool that scans a stage folder (betterleaks, gitleaks)',
+    }),
+    // stage (C1c): the stage folder of the artifact named, in mode stage, and in mode scrub for a tool that scans one
+    stage: rx(/^\$\{\{ runner\.temp \}\}\/pipegen-stage\/[a-z0-9][a-z0-9-]{0,120}$/, 'the stage folder ${{ runner.temp }}/pipegen-stage/<artifact>', {
+      check: (all) => (all.mode === 'stage' || all.mode === 'scrub') && isStagedTool(all.tool) && typeof all.artifact === 'string' && all.stage === stagePath(all.artifact),
+      describe: 'only in mode stage or scrub, for a tool that scans a stage folder, as the stage folder of the artifact it names',
+    }),
     format: inScrubMode(rx(/^(?:sarif|zap-json)$/, 'sarif or zap-json')),
     raw: SCRUB_RAW,
     out: SCRUB_OUT,
