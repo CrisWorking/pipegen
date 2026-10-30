@@ -189,7 +189,7 @@ describe('referee: the renderer and the referee agree', () => {
     d.needs.push(needOf('unit-tests', true, 'script-app'), needOf('lint', true, 'script-app'));
     // the gate job: no checkout (ruling S21), the job list of this draft, and a needs entry for every job of it (ruling S4)
     const entries = gateJobList(d);
-    jobs.gate = job([...harden, download(), renderGateStep(GATE, entries), ...renderGateUploads(platform())], { name: GATE_CHECK_NAME.split(' / ')[1], if: 'always()', needs: entries.map((e) => e.job), permissions: { contents: 'read', actions: 'read', 'pull-requests': 'read' } });
+    jobs.gate = job([...harden, download(), renderGateStep(GATE, d), ...renderGateUploads(platform())], { name: GATE_CHECK_NAME.split(' / ')[1], if: 'always()', needs: entries.map((e) => e.job), permissions: { contents: 'read', actions: 'read', 'pull-requests': 'read' } });
     const r = await run([wf(jobs)], d, { list: [...reviewedList(), GATE, WATCHER] });
     for (const id of Object.keys(JOB_STEP_POLICY)) expect(Object.keys(jobs), id).toContain(id);
     expect(show(r)).toBe('');
@@ -226,7 +226,7 @@ describe('referee: pins', () => {
   it('referee: pipegen gate and watcher actions at the reviewed sha allowed; at another sha → unknown-pin', async () => {
     const list = [...reviewedList(), GATE, WATCHER];
     const step = (t: ReviewedTool, s: string): RenderedStep => (t.id === GATE.id
-      ? { ...renderGateStep(GATE, []), uses: (t.step.action?.uses as string).replace(/@.*$/, `@${s}`) }
+      ? { ...renderGateStep(GATE, draftOf([])), uses: (t.step.action?.uses as string).replace(/@.*$/, `@${s}`) }
       : { name: t.id, uses: (t.step.action?.uses as string).replace(/@.*$/, `@${s}`), with: { mode: t.fixedInputs.with?.mode as string } });
     const ok = await run([wf({ gate: job([step(GATE, sha('1')), ...renderGateUploads(platform())], { if: 'always()', permissions: { contents: 'read', actions: 'read', 'pull-requests': 'read' } }), watch: job([step(WATCHER, sha('2'))], { permissions: { contents: 'read', issues: 'write', actions: 'read' } }) })], draftOf([]), { list });
     expect(show(ok)).toBe('');
@@ -793,7 +793,7 @@ describe('fix round 1: the reviewer\'s attacks are refused', () => {
   const scriptSteps = (): RenderedStep[] => renderProjectScript({ kind: 'project-script', needId: 'unit-tests', service: 'app', script: 'test' }, p, ctx).steps;
   const dScripts = (over: Partial<PipelineDraft> = {}): PipelineDraft => draftOf([], { needs: [needOf('unit-tests', true, 'app')], ...over });
   // the gate job's step (mode gate, an empty job list: these drafts have no check the gate waits for) and the verify job's step (mode find-run)
-  const gateStep = (): RenderedStep => renderGateStep(GATE, []);
+  const gateStep = (): RenderedStep => renderGateStep(GATE, draftOf([]));
   const verifyStep = (): RenderedStep => ({ name: 'verify', uses: GATE.step.action?.uses as string, with: { mode: 'find-run', layout: 'inline' } });
   const CENTRAL = { repo: 'o/pipelines', sha: sha('c') };
   const existing = (path: string, triggers: string[]): ExistingWorkflow => ({ path, triggers, deploys: true, [`${SEC_FIELD}Used`]: [], jobs: ['deploy'] } as unknown as ExistingWorkflow);
@@ -984,7 +984,7 @@ describe('fix round 1: the reviewer\'s attacks are refused', () => {
 describe('fix round 1: an edited user workflow\'s own top level is judged where it reaches pipegen\'s job', () => {
   const VERIFYP = { contents: 'read', actions: 'read', packages: 'read', attestations: 'read' };
   // the gate job's step (mode gate, an empty job list: these drafts have no check the gate waits for) and the verify job's step (mode find-run)
-  const gateStep = (): RenderedStep => renderGateStep(GATE, []);
+  const gateStep = (): RenderedStep => renderGateStep(GATE, draftOf([]));
   const verifyStep = (): RenderedStep => ({ name: 'verify', uses: GATE.step.action?.uses as string, with: { mode: 'find-run', layout: 'inline' } });
   const build = (original: string, steps: RenderedStep[] = [verifyStep()]): CreatedFile => {
     const src = original.replace('  deploy:\n', '  deploy:\n    needs: [pipegen-verify]\n');
@@ -1059,7 +1059,7 @@ describe('fix round 2: the re-review probes are refused', () => {
   const LIST = [...reviewedList(), GATE, WATCHER];
   const CENTRAL = { repo: 'o/pipelines', sha: sha('c') };
   // the gate job's step (mode gate, an empty job list: these drafts have no check the gate waits for) and the verify job's step (mode find-run)
-  const gateStep = (): RenderedStep => renderGateStep(GATE, []);
+  const gateStep = (): RenderedStep => renderGateStep(GATE, draftOf([]));
   const verifyStep = (): RenderedStep => ({ name: 'verify', uses: GATE.step.action?.uses as string, with: { mode: 'find-run', layout: 'inline' } });
   const g = gitleaks();
   const base = (): string => wf({ scan: job(g.steps) }).content;

@@ -282,17 +282,17 @@ describe('RENDERER_INPUTS: the gate action, per mode (ruling B3)', () => {
   it('renderGateStep: the gate step the renderer writes passes the row, uses the job list literal, and the YAML emitter accepts it', () => {
     const d = draftOf([gitleaksSpec()], [needOf('secrets')]);
     const entries = gateJobList(d);
-    const s = renderGateStep(GATE, entries);
+    const s = renderGateStep(GATE, d);
     expect(s.with?.mode).toBe('gate');
     expect(s.with?.jobs).toBe('${{ toJSON(needs) }}');
     expect(s.with?.['job-list']).toBe(jobListLiteral(entries));
     expect(s.run).toBeUndefined();
     expect(() => stepsToYaml([s])).not.toThrow();
-    expect(() => renderGateStep(entry('gitleaks'), entries)).toThrow(RenderError);
+    expect(() => renderGateStep(entry('gitleaks'), d)).toThrow(RenderError);
     const fixed = gateEntry();
     fixed.fixedInputs = { with: { mode: 'gate' } };
     (fixed.step.action as { with: Record<string, string> }).with = { mode: 'gate' };
-    expect(() => renderGateStep(fixed, entries)).toThrow(RenderError);
+    expect(() => renderGateStep(fixed, d)).toThrow(RenderError);
   });
 });
 
@@ -314,12 +314,12 @@ describe('referee: the gate job (rulings S4 and S21)', () => {
   const withIn = (step: RenderedStep, w: Record<string, string>): RenderedStep => ({ ...step, with: { ...step.with, ...w } });
 
   it('referee: a gate job with the rendered gate step, the right job list and needs, and the scanner jobs → no issue', async () => {
-    const r = await run([workflow({ ...scanJobs(), gate: gateJob(renderGateStep(GATE, entries)) })], d);
+    const r = await run([workflow({ ...scanJobs(), gate: gateJob(renderGateStep(GATE, d)) })], d);
     expect(show(r)).toBe('');
   });
 
   it('referee: gate job-list literal ≠ gateJobList(draft) → not-gate-readable (a dropped entry, a flipped blocking, an extra entry, a changed artifact, bad JSON, none at all)', async () => {
-    const step = renderGateStep(GATE, entries);
+    const step = renderGateStep(GATE, d);
     const list = JSON.parse(step.with?.['job-list'] as string) as JobListEntry[];
     const variants: Record<string, string | null> = {
       dropped: JSON.stringify(list.slice(1)),
@@ -340,7 +340,7 @@ describe('referee: the gate job (rulings S4 and S21)', () => {
   });
 
   it('referee: gate needs ⊉ the job list jobs → not-gate-readable (a missing job, no needs at all, a string that names one)', async () => {
-    const step = renderGateStep(GATE, entries);
+    const step = renderGateStep(GATE, d);
     for (const needsList of [['secrets'], [], undefined, 'secrets', ['sast--app']]) {
       const j = gateJob(step, needsList === undefined ? { needs: undefined } : { needs: needsList });
       const r = await run([workflow({ ...scanJobs(), gate: j })], d);
@@ -352,7 +352,7 @@ describe('referee: the gate job (rulings S4 and S21)', () => {
   });
 
   it('referee: the gate step without jobs or without mode, or with mode gate outside the gate job → refused', async () => {
-    const step = renderGateStep(GATE, entries);
+    const step = renderGateStep(GATE, d);
     const noJobs = { ...step, with: Object.fromEntries(Object.entries(step.with ?? {}).filter(([k]) => k !== 'jobs')) };
     const noMode = { ...step, with: Object.fromEntries(Object.entries(step.with ?? {}).filter(([k]) => k !== 'mode')) };
     const r1 = await run([workflow({ ...scanJobs(), gate: gateJob(noJobs) }, true)], d);
@@ -364,7 +364,7 @@ describe('referee: the gate job (rulings S4 and S21)', () => {
   });
 
   it('referee: a gate step input from another mode (sha under mode gate), or an expression in job-list, is refused', async () => {
-    const step = renderGateStep(GATE, entries);
+    const step = renderGateStep(GATE, d);
     const r = await run([workflow({ ...scanJobs(), gate: gateJob(withIn(step, { sha: '${{ github.sha }}' })) }, true)], d);
     expect(has(r, 'template', /sha/), show(r)).toBe(true);
     const r2 = await run([workflow({ ...scanJobs(), gate: gateJob(withIn(step, { 'job-list': '${{ toJSON(needs) }}' })) }, true)], d);
@@ -374,9 +374,9 @@ describe('referee: the gate job (rulings S4 and S21)', () => {
   it('referee: gate row without checkout (the gate never reads the workspace, ruling S21)', async () => {
     expect(JOB_STEP_POLICY.gate).not.toContain('checkout');
     expect(JOB_STEP_POLICY.gate).toEqual(expect.arrayContaining(['harden', 'download-artifact', 'gate']));
-    const r = await run([workflow({ ...scanJobs(), gate: gateJob(renderGateStep(GATE, entries)) })], d);
+    const r = await run([workflow({ ...scanJobs(), gate: gateJob(renderGateStep(GATE, d)) })], d);
     expect(show(r)).toBe('');
-    const withCheckout = job([...prelude(), renderGateStep(GATE, entries), ...renderGateUploads(p)], { name: 'gate', if: 'always()', needs: entries.map((e) => e.job), permissions: GATE_PERM });
+    const withCheckout = job([...prelude(), renderGateStep(GATE, d), ...renderGateUploads(p)], { name: 'gate', if: 'always()', needs: entries.map((e) => e.job), permissions: GATE_PERM });
     const r2 = await run([workflow({ ...scanJobs(), gate: withCheckout })], d);
     expect(has(r2, 'permissions', /checkout step/), show(r2)).toBe(true);
     // the other rows that read a workspace keep their checkout
@@ -556,7 +556,7 @@ describe('parity: a full draft (two services, scanners, base-scan, gate job) thr
     const baseBlocks = specs.map((s) => block(s, { ...ctx, base: true }));
     const baseSteps = [...prelude({ baseRef: true }), ...baseBlocks.flatMap((b) => b.steps)];
     out['base-scan'] = job(dedupeJobSteps(baseSteps, { id: 'base-scan', scans: facts(...baseBlocks) }), { outputs: jobOutputsFor(baseBlocks.flatMap((b) => b.steps)) });
-    out.gate = job([renderGateStep(GATE, entries), ...renderGateUploads(p)], { name: 'gate', if: 'always()', needs: [...entries.map((e) => e.job), 'base-scan'], permissions: GATE_PERM });
+    out.gate = job([renderGateStep(GATE, d), ...renderGateUploads(p)], { name: 'gate', if: 'always()', needs: [...entries.map((e) => e.job), 'base-scan'], permissions: GATE_PERM });
     return out;
   }
   const files = (j: Record<string, Job>, raw = false): CreatedFile[] => [workflow(j, raw)];
@@ -644,7 +644,7 @@ describe('C5b: renderGateUploads and the reserved gate uploads', () => {
   });
   const GATE_PERM = { contents: 'read', actions: 'read', 'pull-requests': 'read' };
   const gateJob = (steps: RenderedStep[], over: Job = {}): Job => job(steps, { name: 'gate', if: 'always()', needs: entries.map((e) => e.job), permissions: GATE_PERM, ...over });
-  const gateStep = (): RenderedStep => renderGateStep(GATE, entries);
+  const gateStep = (): RenderedStep => renderGateStep(GATE, d);
   const uploads = (): RenderedStep[] => renderGateUploads(p);
 
   it('renderGateUploads: three uploads, each if: always(), at its own file in pipegen-gate; only the baseline and the marker ignore a missing file', () => {
@@ -759,7 +759,7 @@ describe('C5b fix round 1: the required result upload and the optional uploads t
   });
   const GATE_PERM = { contents: 'read', actions: 'read', 'pull-requests': 'read' };
   const gateJob = (steps: RenderedStep[]): Job => job(steps, { name: 'gate', if: 'always()', needs: entries.map((e) => e.job), permissions: GATE_PERM });
-  const gateStep = (): RenderedStep => renderGateStep(GATE, entries);
+  const gateStep = (): RenderedStep => renderGateStep(GATE, d);
   const coe = (x: RenderedStep, v: boolean | undefined): RenderedStep => { const c = { ...x }; if (v === undefined) delete c['continue-on-error']; else c['continue-on-error'] = v; return c; };
   const one = async (gateSteps: RenderedStep[], extra: Record<string, Job> = {}): Promise<RefereeReport> => run([workflow({ ...scanJobs(), ...extra, gate: gateJob(gateSteps) }, true)], d);
 
@@ -835,7 +835,7 @@ describe('C5b fix round 2: the referee judges the gate step it found; an id on i
   const scan = (): Record<string, Job> => ({ [SEC]: job(dedupeJobSteps([...prelude(), ...g.steps], { id: 'secrets', scans: facts(g) }), { outputs: jobOutputsFor(g.steps) }) });
   const GATE_PERM = { contents: 'read', actions: 'read', 'pull-requests': 'read' };
   const gateJob = (steps: RenderedStep[]): Job => job(steps, { name: 'gate', if: 'always()', needs: entries.map((e) => e.job), permissions: GATE_PERM });
-  const withId = (): RenderedStep => ({ ...renderGateStep(GATE, entries), id: 'pipegen-gate' });
+  const withId = (): RenderedStep => ({ ...renderGateStep(GATE, d), id: 'pipegen-gate' });
 
   it('a gate step with an id and no uploads → not-gate-readable (the id, and the missing result upload)', async () => {
     const r = await run([workflow({ ...scan(), gate: gateJob([withId()]) }, true)], d);
@@ -847,12 +847,12 @@ describe('C5b fix round 2: the referee judges the gate step it found; an id on i
     expect(has(r, 'not-gate-readable', /gate step .*id/), show(r)).toBe(true);
   });
   it('a gate step with no uploads (no id) → not-gate-readable; the rendered job passes', async () => {
-    expect(has(await run([workflow({ ...scan(), gate: gateJob([renderGateStep(GATE, entries)]) }, true)], d), 'not-gate-readable', /pipegen-gate-result/)).toBe(true);
-    expect(show(await run([workflow({ ...scan(), gate: gateJob([renderGateStep(GATE, entries), ...renderGateUploads(p)]) }, true)], d))).toBe('');
+    expect(has(await run([workflow({ ...scan(), gate: gateJob([renderGateStep(GATE, d)]) }, true)], d), 'not-gate-readable', /pipegen-gate-result/)).toBe(true);
+    expect(show(await run([workflow({ ...scan(), gate: gateJob([renderGateStep(GATE, d), ...renderGateUploads(p)]) }, true)], d))).toBe('');
   });
   it('gateResultUploadProblems with the index the caller found: an id\'d gate step still needs the result upload after it', () => {
     expect(gateResultUploadProblems([withId()], 0).length).toBe(1);
     expect(gateResultUploadProblems([withId(), ...renderGateUploads(p)], 0)).toEqual([]);
-    expect(gateResultUploadProblems([renderGateStep(GATE, entries)]).length).toBe(1);
+    expect(gateResultUploadProblems([renderGateStep(GATE, d)]).length).toBe(1);
   });
 });

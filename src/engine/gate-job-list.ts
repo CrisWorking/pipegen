@@ -2,7 +2,7 @@
 // The list is what the gate trusts: one entry per rendered result and per blocking job-status need, with the artifact names
 // the gate downloads (computed here, from resultArtifactName; the gate never builds a name) and `needsSecrets`, which Plan C's
 // decision uses on a fork PR (decision 110: a required check that needs a secret and did not run blocks).
-// Plan G renders the gate step's `job-list` literal from gateJobList(draft); the referee checks the literal equals
+// The gate step's `job-list` literal is jobListLiteral(gateJobList(draft)), written by gateStepInputs (gate-inputs.ts); the referee checks it equals
 // gateJobList(draft) and that the gate job's `needs` include every entry's job (else `not-gate-readable`).
 import type { NeedCategory, OutputFormat, PipelineDraft, StepSpec } from '../types.js';
 import { ArtifactNameError, resultArtifactName, slug } from './artifact-names.js';

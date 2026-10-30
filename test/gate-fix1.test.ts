@@ -99,7 +99,7 @@ function jobs(baseRef: BaseRef = 'pull-request-base'): Record<string, Job> {
   const baseBlocks = specs.map((s) => block(s, { ...ctx, base: true }));
   const baseSteps = [...prelude(baseRef === 'none' ? {} : { baseRef: true }), ...baseBlocks.flatMap((b) => b.steps)];
   out['base-scan'] = job(baseSteps, { outputs: jobOutputsFor(baseBlocks.flatMap((b) => b.steps)) });
-  out.gate = job([renderGateStep(GATE, entries), ...renderGateUploads(p)], { name: 'gate', if: 'always()', needs: [...entries.map((e) => e.job), 'base-scan'], permissions: GATE_PERM });
+  out.gate = job([renderGateStep(GATE, d), ...renderGateUploads(p)], { name: 'gate', if: 'always()', needs: [...entries.map((e) => e.job), 'base-scan'], permissions: GATE_PERM });
   return out;
 }
 function wfOn(on: unknown, jobsIn: Record<string, Job>, raw = false): CreatedFile {
@@ -129,7 +129,7 @@ describe('finding 1: the job gate decides (ruling 1)', () => {
     const dd = draftOf([], []);
     const noStep = job([], { name: 'gate', if: 'always()', permissions: GATE_PERM });
     expect(has(await run([workflow({ gate: noStep })], dd), 'not-gate-readable', /exactly once, in mode gate/)).toBe(true);
-    const ok = job([renderGateStep(GATE, []), ...renderGateUploads(p)], { name: 'gate', if: 'always()', permissions: GATE_PERM });
+    const ok = job([renderGateStep(GATE, dd), ...renderGateUploads(p)], { name: 'gate', if: 'always()', permissions: GATE_PERM });
     expect(show(await run([workflow({ gate: ok })], dd))).toBe('');
   });
   it('A9: two gate steps (mode gate twice, or mode gate and find-run) → not-gate-readable', async () => {
@@ -227,7 +227,7 @@ describe('finding 4: no silent drop in the job list (ruling 4)', () => {
   it('A8s/A8r: through the referee, a collision is not-gate-readable', async () => {
     const dd = dupe('Web App', 'web-app');
     const ok = draftOf([], [needOf('unit-tests', 'app')]);
-    const step = renderGateStep(GATE, gateJobList(ok));
+    const step = renderGateStep(GATE, ok);
     const r = await run([workflow({ gate: job([step], { name: 'gate', if: 'always()', permissions: GATE_PERM }) })], dd);
     expect(has(r, 'not-gate-readable', /same job/), show(r)).toBe(true);
   });

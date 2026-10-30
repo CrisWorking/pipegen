@@ -86,7 +86,9 @@ const withScrub = (steps: RenderedStep[], f: (s: RenderedStep) => RenderedStep):
 
 
 const GATE_PERM = { contents: 'read', actions: 'read', 'pull-requests': 'read' };
-const gateJ = (list: ReturnType<typeof gateJobList>): Job => job([renderGateStep(GATE, list), ...renderGateUploads(p)], { name: 'gate', if: 'always()', needs: list.map((e) => e.job), permissions: GATE_PERM });
+/** The gate job of a draft (fix round A: the gate step is gateStepInputs(draft)); NO_CHECKS is the draft whose job list is empty. */
+const gateJ = (dd: PipelineDraft): Job => job([renderGateStep(GATE, dd), ...renderGateUploads(p)], { name: 'gate', if: 'always()', needs: gateJobList(dd).map((e) => e.job), permissions: GATE_PERM });
+const NO_CHECKS = draftOf([], []);
 const harden = (): RenderedStep[] => renderStep(specFor(entry('bullfrog'), { needId: 'egress' }), entry('bullfrog'), p, ctx).steps;
 
 describe('CF1: a spec\'s tool must cover its need', () => {
@@ -97,7 +99,7 @@ describe('CF1: a spec\'s tool must cover its need', () => {
       expect(t, toolId).toBeDefined();
       const spec = specFor(t, { needId: 'dependency-review' });
       const dd = draftOf([spec], [needOf('dependency-review')]);
-      const r = await run([workflow({ 'dependency-review': job(prelude()), gate: gateJ([]) }, true)], dd);
+      const r = await run([workflow({ 'dependency-review': job(prelude()), gate: gateJ(NO_CHECKS) }, true)], dd);
       expect(has(r, 'unreviewed', /does not cover the check "dependency-review"/), `${toolId}: ${show(r)}`).toBe(true);
     }
   });
@@ -115,7 +117,7 @@ describe('CF1: a spec\'s tool must cover its need', () => {
         n++;
         const spec = specFor(t, { needId });
         expect(validateSpec(spec, t, ctx).join('\n'), `${t.id} for ${needId}`).not.toMatch(/does not cover/);
-        const r = await run([workflow({ gate: gateJ([]) })], draftOf([spec], [needOf(needId)]));
+        const r = await run([workflow({ gate: gateJ(NO_CHECKS) })], draftOf([spec], [needOf(needId)]));
         expect(r.issues.some((i) => /does not cover/.test(i.message)), `${t.id} for ${needId}`).toBe(false);
       }
     }
@@ -129,14 +131,14 @@ describe('CF2: every action of a listed check sits in its listed job', () => {
     const dd = draftOf([buildSpec()], [needOf('image-build', 'app')]);
     const list = gateJobList(dd);
     expect(list.map((e) => e.job)).toEqual(['image-build--app']);
-    const r = await run([workflow({ 'image-build--app': job(prelude()), gate: gateJ(list) }, true)], dd);
+    const r = await run([workflow({ 'image-build--app': job(prelude()), gate: gateJ(dd) }, true)], dd);
     expect(has(r, 'not-gate-readable', /holds no step of the action check "docker-build-push-action"/), show(r)).toBe(true);
   });
   it('EG: an egress job without bullfrog is refused', async () => {
     const spec = specFor(entry('bullfrog'), { needId: 'egress' });
     const dd = draftOf([spec], [needOf('egress')]);
     const list = gateJobList(dd);
-    const r = await run([workflow({ egress: job(prelude()), gate: gateJ(list) }, true)], dd);
+    const r = await run([workflow({ egress: job(prelude()), gate: gateJ(dd) }, true)], dd);
     expect(has(r, 'not-gate-readable', /holds no step of the action check "bullfrog"/), show(r)).toBe(true);
   });
   it('the honest layout passes: the build in image-build--app (push false), the harden step in egress and in every other job', async () => {
@@ -149,7 +151,7 @@ describe('CF2: every action of a listed check sits in its listed job', () => {
       'image-build--app': job([...prelude(), ...build]),
       egress: job([...harden(), ...prelude()]),
       'unit-tests--app': job(dedupeJobSteps([...harden(), ...script], { id: 'unit-tests--app', scans: NO_SCANS })),
-      gate: gateJ(list),
+      gate: gateJ(dd),
     };
     expect(show(await run([workflow(jobsMap)], dd))).toBe('');
   });
@@ -173,7 +175,7 @@ describe('CF3a: one event-switched base form', () => {
     const baseBlocks = specs.map((s) => block(s, { ...ctx, base: true }));
     const steps = over([...prelude({ baseRef: true }), ...baseBlocks.flatMap((b) => b.steps)]);
     out['base-scan'] = job(steps, { outputs: jobOutputsFor(steps) });   // C5a: with the base-sha output of its base checkout
-    out.gate = job([renderGateStep(GATE, entries), ...renderGateUploads(p)], { name: 'gate', if: 'always()', needs: [...entries.map((e) => e.job), 'base-scan'], permissions: GATE_PERM });
+    out.gate = job([renderGateStep(GATE, d), ...renderGateUploads(p)], { name: 'gate', if: 'always()', needs: [...entries.map((e) => e.job), 'base-scan'], permissions: GATE_PERM });
     return out;
   }
   const wfOn = (on: unknown, j: Record<string, Job>): CreatedFile => {

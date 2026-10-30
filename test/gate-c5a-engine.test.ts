@@ -8,8 +8,8 @@ import { BASE_CHECKOUT_ID, BASE_SCAN_JOB, BASE_SHA_OUTPUT, jobOutputsFor, jobOut
 import * as gateSettings from '../gate/src/settings.js';
 import { renderGateStep, renderJobPrelude, renderUpload, RenderError, type RenderedStep } from '../src/engine/render-step.js';
 import { ACTION_POLICIES, PIPEGEN_GATE_USES, PLATFORM_LOCKS, rendererInputProblems } from '../src/engine/tool-flags.js';
-import { RESULT_ARTIFACT_PREFIX } from '../src/types.js';
-import { gateEntry, platform, reviewedList } from './helpers/render.js';
+import { RESULT_ARTIFACT_PREFIX, type PipelineDraft } from '../src/types.js';
+import { gateEntry, platform, profile, reviewedList, service } from './helpers/render.js';
 
 const p = platform();
 const prelude = (baseRef?: true): RenderedStep[] => renderJobPrelude(baseRef === undefined ? {} : { baseRef }, p).steps;
@@ -51,10 +51,14 @@ describe('the gate step: service-roots', () => {
     for (const v of ['x', '["../x"]', '["/x"]', '["a/*"]', '["-x"]', '[1]', '["a b"]', JSON.stringify(Array.from({ length: 101 }, (_, i) => `s${i}`))]) expect(ok(v).length, v).toBeGreaterThan(0);
     expect(rendererInputProblems(PIPEGEN_GATE_USES, { 'service-roots': '[]' }, { mode: 'scrub', 'service-roots': '[]' }).length).toBeGreaterThan(0);
   });
-  it('renderGateStep writes it when given', () => {
-    const s = renderGateStep(gateEntry(), [], { serviceRoots: ['apps/web', '.'] });
+  it('renderGateStep writes it from the profile\'s service folders, always (fix round A: an empty list when there is no service)', () => {
+    const d = (services: ReturnType<typeof service>[]): PipelineDraft => ({
+      profile: profile(services), capabilities: { branchProtection: true, environments: false, envRequiredReviewers: false, deploymentBranchPolicies: false, attestations: true, codeScanning: true, keylessSigningAllowed: true },
+      needs: [], steps: [], created: [], notProven: [], testDecisions: [], layersSkipped: [], scoreboard: [], requireDeployApproval: false, skipped: [], suggestions: [],
+    });
+    const s = renderGateStep(gateEntry(), d([service({ name: 'web', path: 'apps/web' }), service({ name: 'app', path: '.' })]));
     expect(s.with?.['service-roots']).toBe('["apps/web","."]');
-    expect(renderGateStep(gateEntry(), []).with?.['service-roots']).toBeUndefined();
+    expect(renderGateStep(gateEntry(), d([])).with?.['service-roots']).toBe('[]');
   });
 });
 

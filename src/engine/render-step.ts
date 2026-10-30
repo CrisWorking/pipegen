@@ -16,7 +16,7 @@
 import { isDeepStrictEqual } from 'node:util';
 import { Scalar, YAMLMap, YAMLSeq } from 'yaml';
 import { safeText } from '../util/safe-text.js';
-import { DEPENDENCY_KINDS, type OutputFormat, type RepoProfile, type ReviewedTool, type Service, type StepSpec } from '../types.js';
+import { DEPENDENCY_KINDS, type OutputFormat, type PipelineDraft, type RepoProfile, type ReviewedTool, type Service, type StepSpec } from '../types.js';
 import { COMMIT_SHA_RE } from './names.js';
 import { centralWorkflowPath } from './central-path.js';
 import { NEED_IDS, toolCoversNeed } from './need-ids.js';
@@ -27,7 +27,8 @@ import { ArtifactNameError, resultArtifactName } from './artifact-names.js';
 import type { ProjectScriptStep } from './reviewed.js';
 import { own, RenderError, show } from './render-error.js';
 import { BASE_CHECKOUT_ID, checkExpressions, checkJobOrder, isDangerousName, isReviewed, STEP_KEYS, type JobContext, type RenderedStep, type ScanFact } from './job-rules.js';
-import { jobListLiteral, type JobListEntry } from './gate-job-list.js';
+import { GateJobListError } from './gate-job-list.js';
+import { gateStepInputs } from './gate-inputs.js';
 import { BASE_CHECKOUT_REF, DOCKER_ACTION_USES, GATE_UPLOAD_FILES, gateUploadPath, uploadIfNoFiles, IMAGE_BUILT_ACTION_USES, isStagedTool, PIPEGEN_GATE_USES, PLAIN_REL_RE, PLATFORM_LOCKS, PLATFORM_USES, RENDERER_INPUTS, rendererInputProblems, scrubbedResultPath, scrubStepId, stagePath, stageStepId } from './tool-flags.js';
 
 export { RenderError };
@@ -551,33 +552,21 @@ export function renderGateUploads(platform: PlatformActions): RenderedStep[] {
   });
 }
 
-/** The optional literal inputs of the gate step in mode `gate` (each is checked by its schema in RENDERER_INPUTS). */
-export interface GateStepOptions {
-  /** need ids the user chose not to prove */ notProven?: readonly string[];
-  /** need ids skipped with --skip */ skipped?: readonly string[];
-  policy?: { block: readonly string[]; warn: readonly string[] };
-  /** extra protected path globs */ protectedPaths?: readonly string[];
-  /** the service folders (Service.path), so root-scoped config names are protected there too (C5a CF3) */ serviceRoots?: readonly string[];
-  /** the date the install recorded for blocking, YYYY-MM-DD */ blockFromRecorded?: string;
-}
-
 /**
- * The gate step in mode `gate` (Plan C ruling B3): the job list literal from gateJobList, the needs of the gate job as
- * `${{ toJSON(needs) }}`, the block-from variable, the workflow token and the fingerprint key. The gate job holds this step
- * and no checkout (the gate never reads the workspace, ruling S21), and its `needs` include every job of the list.
+ * The gate step in mode `gate` (Plan C ruling B3): exactly gateStepInputs(draft) (src/engine/gate-inputs.ts, final review fix round A ruling 1),
+ * the one source the referee also holds the file to: the job list literal from gateJobList, the needs of the gate job as `${{ toJSON(needs) }}`,
+ * the block-from variable, the workflow token, the fingerprint key, the service folders and the settings the draft records. The gate job holds
+ * this step and no checkout (the gate never reads the workspace, ruling S21), and its `needs` include every job of the list.
  */
-export function renderGateStep(gate: ReviewedTool, entries: readonly JobListEntry[], opts: GateStepOptions = {}): RenderedStep {
+export function renderGateStep(gate: ReviewedTool, draft: PipelineDraft): RenderedStep {
   checkGateEntry(gate);
-  const filled: Record<string, string> = {
-    mode: 'gate', jobs: '${{ toJSON(needs) }}', 'job-list': jobListLiteral(entries),
-    'block-from': '${{ vars.PIPEGEN_BLOCK_FROM }}', 'github-token': '${{ secrets.GITHUB_TOKEN }}', 'fp-key': '${{ secrets.PIPEGEN_FP_KEY }}',
-  };
-  if (opts.notProven !== undefined) filled['not-proven'] = JSON.stringify(opts.notProven);
-  if (opts.skipped !== undefined) filled.skipped = JSON.stringify(opts.skipped);
-  if (opts.policy !== undefined) filled.policy = JSON.stringify({ block: opts.policy.block, warn: opts.policy.warn });
-  if (opts.protectedPaths !== undefined) filled['protected-paths'] = JSON.stringify(opts.protectedPaths);
-  if (opts.serviceRoots !== undefined) filled['service-roots'] = JSON.stringify(opts.serviceRoots);
-  if (opts.blockFromRecorded !== undefined) filled['block-from-recorded'] = opts.blockFromRecorded;
+  let filled: Record<string, string>;
+  try {
+    filled = gateStepInputs(draft);
+  } catch (e) {
+    if (e instanceof GateJobListError || e instanceof ArtifactNameError) throw new RenderError(e.message);
+    throw e;
+  }
   return actionStep(gate, 'pipegen: the merge gate', {}, filled);
 }
 

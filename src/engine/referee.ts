@@ -21,7 +21,8 @@
 // - Order (S6 c): the renderer's own checkJobOrder runs over every parsed job; a run step not recognised by content counts
 //   as repo code whatever its id says.
 // - The gate's wiring (Plan C C0b): job `outputs` only in the forms of jobOutputsProblems (job-rules.ts); the gate step in mode gate only in
-//   the job `gate`, with a `job-list` literal equal to gateJobList(draft) and `needs` covering every listed job (else `not-gate-readable`);
+//   the job `gate`, with its `with` equal to gateStepInputs(draft) (the `job-list` literal = gateJobList(draft), every other input from the draft too;
+//   final review fix round A) and `needs` covering every listed job (else `not-gate-readable`);
 //   each scrub step equal to its scan step (tool, format, id; job-rules.ts scrubChainProblems); a checkout `ref` only in `base-scan`.
 // - The gate's check name comes from GATE_CHECK_NAME; the blocking rule (B7) demotes a findings check whose tool writes no
 //   SARIF; findSecretLike runs over every file (S18). The workflow linters (actionlint, zizmor) run through `deps.runLinters`
@@ -33,6 +34,7 @@ import { safeText } from '../util/safe-text.js';
 import { GATE_CHECK_NAME, type CreatedFile, type OutputFormat, type PipegenInserted, type PipelineDraft, type ReviewedTool, type StepSpec } from '../types.js';
 import { ArtifactNameError, slug } from './artifact-names.js';
 import { FINDINGS_CATEGORIES, gateJobList, GateJobListError, jobIdFor, PIPEGEN_JOB_CATEGORIES, readableFormat, type JobListEntry } from './gate-job-list.js';
+import { GATE_JSON_INPUTS, gateStepInputs } from './gate-inputs.js';
 import { runLinters } from './linters.js';
 import { COMMIT_SHA_RE } from './names.js';
 import { NEED_ID_CATEGORY, toolCoversNeed } from './need-ids.js';
@@ -706,10 +708,13 @@ function judgeGateSteps(fc: FileCtx, id: string, where: string, j: Obj, judged: 
   const needs = needsList(j.needs).filter((x): x is string => typeof x === 'string');
   if (g.step.with?.jobs === undefined) bad('not-gate-readable', `${where}: the gate step has no jobs input, so it would not see the results of the jobs it needs.`);
   const literal = g.step.with?.['job-list'];
+  const withs: Record<string, unknown> = isObj(g.step.with) ? g.step.with : {};
   fc.ex.deferred.push(() => {
     let expected: JobListEntry[];
+    let want: Record<string, string>;
     try {
       expected = gateJobList(fc.draft, { formatOf: reviewedFormatOf(fc.ex) });
+      want = gateStepInputs(fc.draft, { formatOf: reviewedFormatOf(fc.ex) });
     } catch (e) {
       if (!(e instanceof GateJobListError || e instanceof ArtifactNameError)) throw e;
       bad('not-gate-readable', `${where}: the job list of this pipeline can not be made (${safeText(e.message, 300)}), so the gate has no list to read.`);
@@ -723,11 +728,27 @@ function judgeGateSteps(fc: FileCtx, id: string, where: string, j: Obj, judged: 
       const diff = [...want.filter((x) => !listed.includes(x)).map((x) => `${x} is missing`), ...listed.filter((x) => !want.includes(x)).map((x) => `${x} is extra`)];
       bad('not-gate-readable', `${where}: the gate's job-list is not the list this pipeline needs (${safeText(diff.length > 0 ? diff.join(', ') : 'an entry differs', 200)}), so the gate would read other checks than the pipeline runs.`);
     }
+    // final review fix round A (ruling 1): every other input equals gateStepInputs(draft) exactly, none missing, none extra (a skipped,
+    // not-proven, service-roots, policy, protected-paths or recorded date the draft never gave would change what the gate decides)
+    for (const k of [...new Set([...Object.keys(want), ...Object.keys(withs)])]) {
+      if (k === 'job-list') continue;
+      const name = show(safeText(k, 40));
+      if (!Object.hasOwn(want, k)) bad('not-gate-readable', `${where}: the gate step has the input ${name}, which this pipeline's draft does not give it, so the gate would decide on a setting pipegen never recorded.`);
+      else if (!Object.hasOwn(withs, k)) bad('not-gate-readable', `${where}: the gate step has no ${name} input, which this pipeline's draft gives it, so the gate would decide without it.`);
+      else if (!sameGateInput(k, withs[k], want[k] as string)) bad('not-gate-readable', `${where}: the gate step's ${name} input is not the value this pipeline's draft gives it, so the gate would decide on another setting.`);
+    }
     for (const e of expected) {
       if (!needs.includes(e.job)) bad('not-gate-readable', `${where} does not need the job ${show(e.job)} of its job list, so the gate would not wait for that check (needs must include every listed job).`);
     }
     judgeListedJobs(fc.ex, fc.draft, expected, fileKey(fc.file), bad);
   });
+}
+
+/** One gate step input against its value from gateStepInputs: JSON literals as parsed JSON (spacing does not count), the others as text. */
+function sameGateInput(name: string, have: unknown, want: string): boolean {
+  if (typeof have !== 'string') return false;
+  if (!GATE_JSON_INPUTS.has(name)) return have === want;
+  try { return isDeepStrictEqual(JSON.parse(have), JSON.parse(want)); } catch { return false; }
 }
 
 /**

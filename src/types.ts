@@ -136,6 +136,14 @@ export interface PipelineDraft {
   skipped: { part: SkippablePart; reason: string }[];   // from --skip
   suggestions: { name: string; repo: string; why: string }[];   // unreviewed tools: MENTION-ONLY in PIPEGEN.md, never run
   centralPin?: { repo: string; sha: string };   // Plan B 7a fix round 1 (ruling 2): the central `<owner>/pipelines` repo and the commit pipegen itself resolved and wrote; the referee accepts a central `uses` only at this SHA (none recorded: every central `uses` is unknown-pin). Plan G fills it
+  /**
+   * Plan C final review, fix round A (ruling 1): the gate settings pipegen itself records, the only source of these gate step inputs
+   * (gateStepInputs, src/engine/gate-inputs.ts; the referee holds the file to it). `blockFromRecorded` (YYYY-MM-DD): the block date recorded at
+   * setup (`block-from-recorded`, S13: the earlier of it and PIPEGEN_BLOCK_FROM wins); `policy`: a private repository's own policy (`policy`;
+   * the gate ignores it on a public one); `protectedPaths`: extra protected path globs (`protected-paths`; inputs only add). Absent = none
+   * rendered. Plan G fills it.
+   */
+  gateSettings?: { blockFromRecorded?: string; policy?: { block: string[]; warn: string[] }; protectedPaths?: string[] };
 }
 
 // ---------- install record (written by Plan G deliver/finish, read by Plan V and `pipegen verify`) ----------
