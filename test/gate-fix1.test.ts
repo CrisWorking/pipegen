@@ -345,3 +345,25 @@ describe('C3: mode baseline-check runs in the job baseline-check and nowhere els
     expect(r.ok).toBe(false);
   });
 });
+
+// ---------- C3 fix round 1 (review-C3 m2, m9) ----------
+
+describe('C3 fix round 1: baseline-check row and recorded-date checks', () => {
+  it('m9: the job baseline-check holds the key, so its row allows no checkout (nor any step but harden, download-artifact and the gate step)', async () => {
+    const j = jobs();
+    const co = prelude()[0] as RenderedStep;
+    const bc = renderBaselineCheckStep(GATE);
+    const perm = { contents: 'read', actions: 'read' };
+    const r = await run([workflow({ ...j, 'baseline-check': job([co, bc], { permissions: perm }) })], d);
+    expect(has(r, 'permissions', /checkout/), show(r)).toBe(true);
+    expect(show(await run([workflow({ ...j, 'baseline-check': job([bc], { permissions: perm }) })], d))).toBe('');
+  });
+  it('m2: block-from-recorded must be a real calendar date (no 2026-02-30, 2026-04-31, 0000-01-01) in the renderer row and so in the referee', () => {
+    const base: Record<string, string> = { mode: 'nightly', [GH_IN]: sref('GITHUB_TOKEN'), 'block-from': '${{ vars.PIPEGEN_BLOCK_FROM }}', 'merged-at': '2026-10-29T12:00:00Z' };
+    expect(rendererInputProblems('crisworking/pipegen/gate', { ...base, 'block-from-recorded': '2028-02-29' }, { ...base, 'block-from-recorded': '2028-02-29' })).toEqual([]);
+    for (const bad of ['2026-02-30', '2026-04-31', '2027-02-29', '0000-01-01', '2026-13-01', '2026-00-10']) {
+      const w = { ...base, 'block-from-recorded': bad };
+      expect(rendererInputProblems('crisworking/pipegen/gate', w, w).some((x) => /block-from-recorded/.test(x)), bad).toBe(true);
+    }
+  });
+});

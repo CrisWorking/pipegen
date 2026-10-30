@@ -131,7 +131,8 @@ export const JOB_STEP_POLICY: Readonly<Record<string, readonly StepKind[]>> = Ob
   // no checkout: the gate never reads the workspace (Plan C ruling S21); it reads the event, the job outputs and the API
   gate: ['harden', 'download-artifact', 'gate'],
   'base-scan': ['harden', 'checkout', 'setup', 'stage', 'tool', 'scrub', 'upload-artifact'],
-  'baseline-check': ['harden', 'checkout', 'download-artifact', 'gate'],
+  // no checkout: this job holds PIPEGEN_FP_KEY and reads only the API and artifacts (C3 review m9, like the gate job's S21)
+  'baseline-check': ['harden', 'download-artifact', 'gate'],
   'image-publish': ['harden', 'checkout', 'setup-buildx', 'docker-login', 'build-push'],
   sign: ['harden', 'checkout', 'download-artifact', 'docker-login', 'attest'],
   nightly: ['harden', 'checkout', 'download-artifact', 'gate'],
