@@ -30,7 +30,7 @@ const MAX_SPEC_DEPTH = 4; // folders inside the service
 const MAX_LOCK_ENTRIES = 50_000;
 
 export const emptyServiceQuality = (): ServiceQuality => ({ tsconfig: false, versions: {}, fromRange: [], eslintConfig: 'none', configs: [], uiFrameworks: [], pythonTyped: false, fuzzTargets: false, apiSpec: null });
-export const emptyRepoFiles = (): RepoFiles => ({ dependabot: null, renovate: null, actionsLock: false, kubernetes: false, licenceConfig: null, secretsBaseline: false });
+export const emptyRepoFiles = (): RepoFiles => ({ dependabot: null, codeowners: null, renovate: null, actionsLock: false, kubernetes: false, licenceConfig: null, secretsBaseline: false });
 
 // ---------- the run ----------
 
@@ -563,6 +563,8 @@ export async function readServiceQuality(dir: string, s: Pick<Service, 'path' | 
 // ---------- repo files ----------
 
 const DEPENDABOT = ['.github/dependabot.yml', '.github/dependabot.yaml'];
+/** The places GitHub (and the gate, integrity.ts loadCodeowners) looks for CODEOWNERS, in order: the first that exists is the file. */
+const CODEOWNERS = ['.github/CODEOWNERS', 'CODEOWNERS', 'docs/CODEOWNERS'] as const;
 const RENOVATE = ['renovate.json', 'renovate.json5', '.github/renovate.json', '.github/renovate.json5', '.gitlab/renovate.json', '.gitlab/renovate.json5', '.renovaterc', '.renovaterc.json', '.renovaterc.json5'];
 const LICENCE_CONFIGS = ['deny.toml', '.grant.yaml', '.fossa.yml'] as const;
 /** The only folders whose YAML is read for Kubernetes manifests (also named in the report's "can't see" list). */
@@ -602,6 +604,7 @@ export async function readRepoFiles(dir: string, notes: string[], run?: QualityR
   const rootPkg = await parsedFile(r, 'package.json', notes);
   return {
     dependabot: await firstReal(r, DEPENDABOT, notes),
+    codeowners: await firstReal(r, CODEOWNERS, notes),
     renovate: (await firstReal(r, RENOVATE, notes)) ?? (rootPkg !== null && 'renovate' in rootPkg ? 'package.json' : null),
     actionsLock: (await realFile(r, '.github/actions.lock', notes)) || r.files.some((f) => f.startsWith('.github/') && baseOf(f) === 'actions.lock'),
     kubernetes: await kubernetesOf(r, notes),

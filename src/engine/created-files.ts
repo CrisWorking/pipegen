@@ -16,11 +16,29 @@
 // Deliberately NO rule (B4, #108): biome/eslint/hadolint/c8/vitest/knip/prettier configs, `.gitleaksignore`, `.semgrepignore`,
 // `.trivyignore`, `.prettierignore`, `lefthook.yml`, `.pre-commit-config.yaml`, `.husky/*`. Those are protected paths; a created copy
 // could only shadow or weaken the pinned one. Plan G registers its hook, central and install-record files as it builds them.
-import type { CreatedFile, Part, PipelineDraft } from '../types.js';
+import type { CreatedFile, Part, PipelineDraft, ReviewedTool } from '../types.js';
+import { codeownersCentralJudge, codeownersJudge } from './created-judges/codeowners.js';
+import { dependabotJudge } from './created-judges/dependabot.js';
+import { pipegenDocJudge } from './created-judges/pipegen-doc.js';
 import { createdPathProblem } from './job-rules.js';
 
-/** What a judge gets besides the file: the draft the files belong to. */
-export interface CreatedCtx { draft: PipelineDraft }
+/**
+ * What the delivery side knows that the draft does not (D0b). A judge that needs one of these and does not get it refuses the file:
+ * a missing input never reads as "nothing there".
+ */
+export interface CreatedInputs {
+  /** The central repo's existing CODEOWNERS path (the first of .github/CODEOWNERS, CODEOWNERS, docs/CODEOWNERS), or null when it has none. */
+  centralCodeowners?: string | null;
+  /** PIPEGEN.md: its blob sha in the delivery base tree (null: no such file) and the sha the install record holds for it (null: not recorded). */
+  pipegenDoc?: { baseSha: string | null; recordSha: string | null };
+  /** The vault's check: does the text hold a value the user typed, or its base64 or URL form (preflight S8)? */
+  containsKnownValue?: (text: string) => boolean;
+}
+/** The reviewed list the gate protects from (the whole built-in list) and the delivery inputs. */
+export interface CreatedEnv { reviewed: readonly ReviewedTool[]; inputs: CreatedInputs }
+/** What a judge gets besides the file: the draft the files belong to, the reviewed list and the delivery inputs. */
+export interface CreatedCtx extends CreatedEnv { draft: PipelineDraft }
+const NO_ENV: CreatedEnv = { reviewed: [], inputs: {} };
 
 export interface CreatedRule {
   id: string;
@@ -59,10 +77,10 @@ const isStarterTest = (path: string, draft: PipelineDraft): boolean =>
 
 export const CREATED_RULES: readonly CreatedRule[] = [
   // D0b (CF-2): the judges for Plan G's files. Plan G produces them.
-  { id: 'codeowners', repo: 'app', parts: ['codeowners'], mode: 'edit', match: (p) => p === 'CODEOWNERS' || p === 'docs/CODEOWNERS' || p === '.github/CODEOWNERS', judge: refuseUntilBuilt('D0b') },
-  { id: 'codeowners-central', repo: 'central', parts: ['codeowners'], mode: 'edit', match: (p) => p === 'CODEOWNERS' || p === 'docs/CODEOWNERS' || p === '.github/CODEOWNERS', judge: refuseUntilBuilt('D0b') },
-  { id: 'dependabot', repo: 'app', parts: ['pipeline', 'docs'], mode: 'edit', match: (p) => p === '.github/dependabot.yml' || p === '.github/dependabot.yaml', judge: refuseUntilBuilt('D0b') },
-  { id: 'pipegen-doc', repo: 'app', parts: ['docs'], mode: 'new', match: (p) => p === 'PIPEGEN.md', judge: refuseUntilBuilt('D0b') },
+  { id: 'codeowners', repo: 'app', parts: ['codeowners'], mode: 'edit', match: (p) => p === 'CODEOWNERS' || p === 'docs/CODEOWNERS' || p === '.github/CODEOWNERS', judge: codeownersJudge },
+  { id: 'codeowners-central', repo: 'central', parts: ['codeowners'], mode: 'edit', match: (p) => p === 'CODEOWNERS' || p === 'docs/CODEOWNERS' || p === '.github/CODEOWNERS', judge: codeownersCentralJudge },
+  { id: 'dependabot', repo: 'app', parts: ['pipeline', 'docs'], mode: 'edit', match: (p) => p === '.github/dependabot.yml' || p === '.github/dependabot.yaml', judge: dependabotJudge },
+  { id: 'pipegen-doc', repo: 'app', parts: ['docs'], mode: 'new', match: (p) => p === 'PIPEGEN.md', judge: pipegenDocJudge },
   // D1-D4: the Docker files
   { id: 'dockerfile', repo: 'app', parts: ['docker'], mode: 'new', match: (p, d) => claimable(p, d, 'Dockerfile'), judge: refuseUntilBuilt('D3') },
   { id: 'dockerignore', repo: 'app', parts: ['docker'], mode: 'new', match: (p, d) => !p.split('/').slice(0, -1).some((x) => x.startsWith('.') || x === 'node_modules') && atServiceRoot(p, d, '.dockerignore'), judge: refuseUntilBuilt('D3') },
@@ -74,7 +92,7 @@ export const CREATED_RULES: readonly CreatedRule[] = [
 ];
 
 /** The verdict on one file: `claimed` false means no rule matched; `problems` are the reasons to refuse it. */
-export function createdFileProblems(file: CreatedFile, draft: PipelineDraft, rules: readonly CreatedRule[] = CREATED_RULES): { claimed: boolean; problems: string[] } {
+export function createdFileProblems(file: CreatedFile, draft: PipelineDraft, rules: readonly CreatedRule[] = CREATED_RULES, env: CreatedEnv = NO_ENV): { claimed: boolean; problems: string[] } {
   // the path rule runs here, so no caller (the referee, the D1 guard, Plan G's deliver) can skip it; a matcher may claim a path it refuses
   const pathProblem = createdPathProblem(file.path);
   if (pathProblem !== null) return { claimed: true, problems: [`The file path is refused: ${pathProblem}; pipegen writes only plain, normalized paths.`] };
@@ -91,7 +109,7 @@ export function createdFileProblems(file: CreatedFile, draft: PipelineDraft, rul
   if (rule.mode === 'new' && file.edited !== undefined) problems.push(`this kind of file (${rule.id}) is written whole, not edited`);
   if (rule.mode === 'edit' && file.edited === undefined) problems.push(`this kind of file (${rule.id}) is an edit and needs the edited marker with the original text`);
   if (rule.needsConfirm === true && file.needsConfirm !== true) problems.push(`this kind of file (${rule.id}) changes scripts or dependencies, so it needs the user's own confirmation (needsConfirm) and has none`);
-  try { problems.push(...rule.judge(file, { draft })); } catch { problems.push(`the judge for ${rule.id} failed on this file, so pipegen does not write it`); }
+  try { problems.push(...rule.judge(file, { draft, reviewed: env.reviewed, inputs: env.inputs })); } catch { problems.push(`the judge for ${rule.id} failed on this file, so pipegen does not write it`); }
   return { claimed: true, problems };
 }
 

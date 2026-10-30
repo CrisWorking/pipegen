@@ -353,10 +353,10 @@ export async function baseHasInstall(gh: GateGithub, repo: RepoId, baseSha: stri
 // ---------- CODEOWNERS ----------
 
 const MAX_RULES = 100_000;
-const MAX_LINE = 4096;
+export const MAX_LINE = 4096;
 const TEAM_RE = /^@[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?\/[A-Za-z0-9._-]+$/;
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-const LOGIN_RE = /^@([A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?)$/;
+export const LOGIN_RE = /^@([A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?)$/;
 
 /** Split a line into tokens on unescaped whitespace; `\ ` is a space inside a token. Stops at a token that starts with `#`. */
 function tokens(line: string): string[] {

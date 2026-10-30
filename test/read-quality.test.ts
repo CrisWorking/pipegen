@@ -278,7 +278,7 @@ describe('repoFiles', () => {
       '.github/dependabot.yml': 'version: 2\n', 'renovate.json': '{}\n', '.github/actions.lock': '\n',
       'charts/app/Chart.yaml': 'apiVersion: v2\nname: app\n', 'deny.toml': '\n', [BASELINE]: '{}\n',
     }), []);
-    expect(all).toEqual({ dependabot: '.github/dependabot.yml', renovate: 'renovate.json', actionsLock: true, kubernetes: true, licenceConfig: 'deny.toml', [BASELINE_FACT]: true });
+    expect(all).toEqual({ dependabot: '.github/dependabot.yml', codeowners: null, renovate: 'renovate.json', actionsLock: true, kubernetes: true, licenceConfig: 'deny.toml', [BASELINE_FACT]: true });
     expect('rego' in all).toBe(false); // PS5: no task reads it
 
     expect((await readRepoFiles(repo({ '.github/dependabot.yaml': 'version: 2\n' }), [])).dependabot).toBe('.github/dependabot.yaml');
@@ -293,6 +293,15 @@ describe('repoFiles', () => {
     expect((await readRepoFiles(repo({ '.fossa.yml': 'version: 3\n' }), [])).licenceConfig).toBe('.fossa.yml');
     expect((await readRepoFiles(repo({ '.github/workflows/actions.lock': '\n' }), [])).actionsLock).toBe(true);
     expect((await readRepoFiles(repo({ 'actions.lock': '\n' }), [])).actionsLock).toBe(false);
+  });
+
+  it('repoFiles: codeowners is the first of .github/CODEOWNERS, CODEOWNERS, docs/CODEOWNERS (the gate\'s order), else null', async () => {
+    const co = async (files: Record<string, string>) => (await readRepoFiles(repo(files), [])).codeowners;
+    expect(await co({})).toBeNull();
+    expect(await co({ 'docs/CODEOWNERS': '* @a\n' })).toBe('docs/CODEOWNERS');
+    expect(await co({ 'docs/CODEOWNERS': '* @a\n', CODEOWNERS: '* @a\n' })).toBe('CODEOWNERS');
+    expect(await co({ 'docs/CODEOWNERS': '* @a\n', CODEOWNERS: '* @a\n', '.github/CODEOWNERS': '* @a\n' })).toBe('.github/CODEOWNERS');
+    expect(await co({ 'src/CODEOWNERS': '* @a\n', 'codeowners': '* @a\n' })).toBeNull();
   });
 
   it('repoFiles: Kubernetes from YAML with top-level apiVersion and kind under a manifests folder only', async () => {

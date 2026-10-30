@@ -42,7 +42,7 @@ import { PLATFORM_ACTION_IDS, type PlatformActions } from './pin.js';
 import { APP_RUNNING_CATEGORIES, renderRangeScan, TRIVY_LAUNCH_RE } from './render-cli.js';
 import { EXPR, own, show } from './render-error.js';
 import { isObj, parseYaml, uniq, type Obj, type Parsed } from './yaml-parse.js';
-import { createdFileProblems, duplicatePathProblems, type CreatedRule } from './created-files.js';
+import { createdFileProblems, duplicatePathProblems, type CreatedInputs, type CreatedRule } from './created-files.js';
 import { ACTION_PATH_RE, checkExpressions, createdPathProblem, checkJobOrder, gateResultUploadProblems, IF_VALUES, isDangerousName, isReviewed, isScrubStep, isStageStep, jobOutputsProblems, SECRET_REF_RE, STEP_KEYS as STEP_KEY_LIST, WORKFLOW_PATH_RE, type RenderedStep, type ScanFact } from './job-rules.js';
 import { containerRefusal, RenderError, renderProjectScript, renderStep, sameDedupeContent, type RenderContext } from './render-step.js';
 import { centralWorkflowPath } from './central-path.js';
@@ -73,7 +73,7 @@ export interface Linters { actionlint: () => Promise<string>; zizmor: () => Prom
 /** The linter run (7b's runLinters): actionlint and zizmor over the workflow files, findings as issues. */
 export type RunLinters = (files: CreatedFile[], linters: Linters, ghToken: string | null) => Promise<RefereeIssue[]>;
 /** The injectable parts. `runLinters` defaults to the real one (linters.ts); a throwing runner is an issue. */
-export interface RefereeDeps { runLinters?: RunLinters; /** the created-file rules (default: CREATED_RULES); tests inject their own */ createdRules?: readonly CreatedRule[] }
+export interface RefereeDeps { runLinters?: RunLinters; /** the created-file rules (default: CREATED_RULES); tests inject their own */ createdRules?: readonly CreatedRule[]; /** what delivery knows (D0b): the central CODEOWNERS path, PIPEGEN.md's shas, the vault check */ createdInputs?: CreatedInputs }
 
 // ---------- the tables ----------
 
@@ -1393,7 +1393,7 @@ export async function referee(files: CreatedFile[], draft: PipelineDraft, platfo
     const kind = fileKind(f);
     if (kind === null) {
       // not a workflow or action: a created-file rule (src/engine/created-files.ts) must claim it, else it is refused (D0a, B1)
-      const v = createdFileProblems(f, draft, deps.createdRules);
+      const v = createdFileProblems(f, draft, deps.createdRules, { reviewed, inputs: deps.createdInputs ?? {} });
       if (!v.claimed) {
         add(f.path, 'template', /^\.github\//i.test(f.path)
           ? 'The file path is in .github/ but is not a workflow (.github/workflows/<name>.yml) or a composite action (.github/actions/<folder>/action.yml) pipegen can judge, so it is not written.'

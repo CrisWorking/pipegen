@@ -49,7 +49,7 @@ export interface ServiceQuality {
   apiSpec: { kind: 'file'; path: string } | { kind: 'served'; by: 'fastapi' | '@nestjs/swagger' } | null;   // path: repo-relative, raw (unchanged by safeText, else not kept); clean it at output
 }
 export interface RepoFiles {
-  dependabot: string | null; renovate: string | null; actionsLock: boolean; kubernetes: boolean;   // dependabot, renovate: the repo-relative path of the config file found ('package.json' for its `renovate` key)
+  dependabot: string | null; codeowners: string | null; renovate: string | null; actionsLock: boolean; kubernetes: boolean;   // dependabot, codeowners, renovate: the repo-relative path of the file found ('package.json' for the `renovate` key; codeowners is the first of .github/CODEOWNERS, CODEOWNERS, docs/CODEOWNERS, the order GitHub uses)
   licenceConfig: 'deny.toml' | '.grant.yaml' | '.fossa.yml' | null; secretsBaseline: boolean;
 }
 export interface ExistingWorkflow {
@@ -146,6 +146,12 @@ export interface PipelineDraft {
   created: CreatedFile[]; notProven: NotProven[]; testDecisions: TestDecision[];
   layersSkipped: { layer: Layer; reason: string }[]; scoreboard: string[];
   requireDeployApproval: boolean;   // set by the judge (Plan F); used by Plan G environments
+  /**
+   * The code owners Plan G probed (D0b, preflight 4.2 and S14): `owners` are user logins with a leading `@` (never a team, e-mail or bot),
+   * `writers` is how many users with write access the probe found. The CODEOWNERS judge (src/engine/created-judges/codeowners.ts) holds the
+   * file to it. Absent = no probe was made, so no CODEOWNERS file is written.
+   */
+  codeOwners?: { owners: string[]; writers: number };
   skipped: { part: SkippablePart; reason: string }[];   // from --skip
   suggestions: { name: string; repo: string; why: string }[];   // unreviewed tools: MENTION-ONLY in PIPEGEN.md, never run
   centralPin?: { repo: string; sha: string };   // Plan B 7a fix round 1 (ruling 2): the central `<owner>/pipelines` repo and the commit pipegen itself resolved and wrote; the referee accepts a central `uses` only at this SHA (none recorded: every central `uses` is unknown-pin). Plan G fills it
