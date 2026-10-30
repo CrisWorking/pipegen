@@ -749,6 +749,17 @@ describe('fix round 1: MAL- by any advisory id or alias (I3)', () => {
     const m = adv('MAL-2025-46969', ['MAL-2025-46969', 'GHSA-2v46-p5h4-248w']);
     expect(decideGate(input({ checks: [check(dep, [m], [m])] })).pass).toBe(false);
   });
+  it('r2 (review-C2): a lower-case, space-padded or tab-padded mal- alias blocks like MAL-', () => {
+    for (const alias of ['mal-2026-5', ' MAL-2026-5', 'MAL-2026-5 ', '  mal-2026-5\t', 'Mal-2026-5']) {
+      const g = adv('GHSA-2', ['GHSA-2', alias]);
+      expect(decideGate(input({ checks: [check(dep, [g], [g])] })).pass, JSON.stringify(alias)).toBe(false);
+    }
+    // not at the start of the id, or another prefix: not malware
+    for (const alias of ['GHSA-mal-1', 'MALWARE-1', 'MA L-1', '']) {
+      const g = adv('GHSA-2', ['GHSA-2', alias]);
+      expect(decideGate(input({ checks: [check(dep, [g], [g])] })).pass, JSON.stringify(alias)).toBe(true);
+    }
+  });
   it('MAL- in a warn-first check still blocks (reading 3)', () => {
     const wf = entry({ needId: 'dependency-review', job: 'dependency-review', category: 'dependency-review', tool: 'osv-scanner', warnFirst: { since: '2026-10-01' } });
     const m = adv('GHSA-1', ['GHSA-1', 'MAL-2026-3']);
@@ -778,6 +789,16 @@ describe('fix round 1: the minors (m1-m7) and reading 1', () => {
     expect(decideGate(input({ notProvenNeeds: ['migration-check'], checks: [jobCheck(mc, 'success')] })).blockReasons.join()).toMatch(/floor need migration-check/);
     expect(decideGate(input({ checks: [jobCheck({ ...mc, warnFirst: { since: '2026-10-01' } }, 'success')] })).blockReasons.join()).toMatch(/warn-first can't be set on floor need migration-check/);
     expect(decideGate(input({ notProvenNeeds: ['migration-check'], checks: [jobCheck(mc, 'failure')] })).failedJobs).toHaveLength(1);
+  });
+  it('r2 (review-C2): a migration-check (category full-tests) present while floorNeeds holds full-tests does not stand in for it: blocks as missing', () => {
+    const mc = jobEntry({ needId: 'migration-check', job: 'migration-check', category: 'full-tests' });
+    const r = decideGate(input({ floorNeeds: ['full-tests'], checks: [jobCheck(mc, 'success')] }));
+    expect(r.pass).toBe(false);
+    expect(r.failedJobs.map((f) => [f.needId, f.reason])).toEqual([['full-tests', 'missing']]);
+    expect(r.blockReasons.join()).toMatch(/required check full-tests is not in the job list/);
+    // the real one present: passes
+    const ft = jobEntry({ needId: 'full-tests', job: 'full-tests', category: 'full-tests' });
+    expect(decideGate(input({ floorNeeds: ['full-tests'], checks: [jobCheck(mc, 'success'), jobCheck(ft, 'success')] })).pass).toBe(true);
   });
   it('m2: a multi-line position form whose first line is the only added line is touched (the long-range branch)', () => {
     const s = leakF({ fpBy: 'line', fingerprint: `${SEC}${hex('ml')}`, line: 10, endLine: 40 });
@@ -940,6 +961,8 @@ describe('fix round 1 grid: every way a secret is new, under every base state, n
       }));
       runs++;
       if (r.pass) throw new Error(`${w} / ${b} / mask ${mask} passed: ${r.summary}`);
+      // review-C2 r1: not only blocked (a settings error alone would block): the secret itself is in `blocking`
+      if (!r.blocking.some((f) => f.secret)) throw new Error(`${w} / ${b} / mask ${mask} blocked, but the secret is not in blocking: ${r.summary}`);
     }
     expect(runs).toBe(WAYS.length * BASES.length * 32);
   });

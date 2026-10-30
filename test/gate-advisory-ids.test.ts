@@ -53,6 +53,16 @@ describe('advisory ids and aliases (review-C2 I3)', () => {
     const many = Array.from({ length: MAX_ADVISORY_IDS + 1 }, (_, i) => `CVE-${i}`);
     expect(parseSarif(doc({ deprecatedIds: many }), 'osv-scanner').toolError).toMatch(/more than/);
   });
+  it('r2 (review-C2): an alias over 1,024 characters is a tool error; exactly 1,024 is kept', () => {
+    const doc = (ids: string[]) => ({
+      version: '2.1.0',
+      runs: [{ tool: { driver: { name: 'osv-scanner', rules: [{ id: 'A-1', deprecatedIds: ids }] } }, invocations: [], results: [{ ruleId: 'A-1', message: { text: 'm' } }] }],
+    });
+    expect(parseSarif(doc(['A-1', 'MAL-' + 'x'.repeat(1021)]), 'osv-scanner').toolError).toMatch(/longer than 1024/);
+    expect(parseSarif(doc(['A-1', 'MAL-' + 'x'.repeat(1020)]), 'osv-scanner').toolError).toBeUndefined();
+    const same = { version: '2.1.0', runs: [{ tool: { driver: { name: 'osv-scanner', rules: [{ id: 'A-1' }] } }, invocations: [], results: [{ ruleId: 'A-1', message: { text: 'm' }, properties: { aliases: ['MAL-' + 'x'.repeat(1021)] } }] }] };
+    expect(parseSarif(same, 'osv-scanner').toolError).toMatch(/longer than 1024/);
+  });
   it('two rules with one id and different aliases are a tool error (no side is picked silently)', () => {
     const doc = {
       version: '2.1.0',
