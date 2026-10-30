@@ -185,7 +185,7 @@ const posInt = (v: unknown): v is number => typeof v === 'number' && Number.isSa
 export interface Lookup { tip?: Promise<string | undefined>; tag?: Promise<'none' | 'tag' | 'error'> }
 type History = 'in' | 'out' | 'error';
 /** The default history, three-valued: `error` is an API failure or an answer that is not what the API gives. */
-async function resolveTip(gh: GateGithub, repo: RepoRef): Promise<string | undefined> {
+export async function resolveTip(gh: GateGithub, repo: RepoRef): Promise<string | undefined> {
   try {
     const ref = await gh.branchHead(repo.owner, repo.name, repo.defaultBranch);
     if (!isPlain(ref) || own(ref, 'ref') !== `refs/heads/${repo.defaultBranch}`) return undefined;

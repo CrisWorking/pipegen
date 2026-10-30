@@ -2,6 +2,9 @@
 // The gate's built-in view of the reviewed list (ruling S5): no pins, nothing read from disk at run time.
 import type { GateToolView } from '../settings.js';
 
+/** The version of this gate (nightly compares it with the newest gate-v<version> release). */
+export const GATE_VERSION = "0.2.0";
+
 export const GATE_VIEW: readonly GateToolView[] = [
   {
     "id": "actions-checkout",

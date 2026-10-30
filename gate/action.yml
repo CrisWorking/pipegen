@@ -2,7 +2,7 @@
 # (src/engine/tool-flags.ts) checks each one. A test keeps these inputs equal to that row. No input has a default (find-run's 30 minute wait is in the code).
 # The bundle dist/index.js is generated and committed (npm run build:gate; CI job gate-dist checks it is fresh).
 name: pipegen gate
-description: Scrubs scanner results, stages the checkout for the secrets scan, decides pass, warn or block, looks up the trusted baseline, and finds the trusted run in which a commit passed the gate.
+description: Scrubs scanner results, stages the checkout for the secrets scan, decides pass, warn or block, looks up the trusted baseline, finds the trusted run in which a commit passed the gate, and (nightly) opens issues about the end of warn mode, a missing finish and a pipegen update.
 author: CrisWorking
 inputs:
   mode:
@@ -27,7 +27,7 @@ inputs:
     description: "scrub: where the scrubbed copy goes, RUNNER_TEMP/pipegen-out/<artifact>/<file>."
     required: false
   fp-key:
-    description: "scrub, gate, baseline-check: the PIPEGEN_FP_KEY secret. It is masked first, and is empty on a fork pull request."
+    description: "scrub, gate, baseline-check, nightly: the PIPEGEN_FP_KEY secret. It is masked first, and is empty on a fork pull request."
     required: false
   jobs:
     description: "gate: toJSON(needs)."
@@ -73,9 +73,6 @@ inputs:
     required: false
   timeout-minutes:
     description: "find-run: how long to wait for a run in progress, in whole minutes from 1 to 360. When unset it is 30."
-    required: false
-  merged-at:
-    description: "nightly: when the install was merged."
     required: false
 outputs:
   sha256:

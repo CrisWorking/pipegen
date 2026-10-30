@@ -337,7 +337,7 @@ describe('C3: mode baseline-check runs in the job baseline-check and nowhere els
   });
   it('mode baseline-check takes only its inputs: token and key, no gate or nightly input', async () => {
     const j = jobs();
-    for (const extra of [{ jobs: '${{ toJSON(needs) }}' }, { 'block-from': '${{ vars.PIPEGEN_BLOCK_FROM }}' }, { 'merged-at': '2026-10-29T12:00:00Z' }, { sha: '${{ github.sha }}' }]) {
+    for (const extra of [{ jobs: '${{ toJSON(needs) }}' }, { 'block-from': '${{ vars.PIPEGEN_BLOCK_FROM }}' }, { sha: '${{ github.sha }}' }]) {
       const r = await run([workflow({ ...j, 'baseline-check': BC_JOB([BC(j, extra)]) }, true)], d);
       expect(has(r, 'template', /allowed only in mode/), `${Object.keys(extra)[0]}: ${show(r)}`).toBe(true);
     }
@@ -359,7 +359,7 @@ describe('C3 fix round 1: baseline-check row and recorded-date checks', () => {
     expect(show(await run([workflow({ ...j, 'baseline-check': job([bc], { permissions: perm }) })], d))).toBe('');
   });
   it('m2: block-from-recorded must be a real calendar date (no 2026-02-30, 2026-04-31, 0000-01-01) in the renderer row and so in the referee', () => {
-    const base: Record<string, string> = { mode: 'nightly', [GH_IN]: sref('GITHUB_TOKEN'), 'block-from': '${{ vars.PIPEGEN_BLOCK_FROM }}', 'merged-at': '2026-10-29T12:00:00Z' };
+    const base: Record<string, string> = { mode: 'nightly', [GH_IN]: sref('GITHUB_TOKEN'), 'block-from': '${{ vars.PIPEGEN_BLOCK_FROM }}' };
     expect(rendererInputProblems('crisworking/pipegen/gate', { ...base, 'block-from-recorded': '2028-02-29' }, { ...base, 'block-from-recorded': '2028-02-29' })).toEqual([]);
     for (const bad of ['2026-02-30', '2026-04-31', '2027-02-29', '0000-01-01', '2026-13-01', '2026-00-10']) {
       const w = { ...base, 'block-from-recorded': bad };

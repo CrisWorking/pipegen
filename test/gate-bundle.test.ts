@@ -167,12 +167,12 @@ describe('C6 bundle: node gate/dist/index.js, end to end', () => {
     expect(x.code).toBe(0);
     expect(outputsOf(r.output).found).toBe('missing');
   });
-  it('mode nightly fails closed until C7; find-run without its inputs fails closed too', async () => {
+  it('find-run and nightly without their inputs fail closed (nightly is real since C7: test/gate-nightly.test.ts runs it end to end)', async () => {
     for (const mode of ['find-run', 'nightly']) {
       const r = runner({ mode });
       const x = await runNode(BUNDLE, r.env);
       expect(x.code, mode).toBe(1);
-      expect(x.stdout, mode).toMatch(mode === 'nightly' ? /::error::.*not available yet/ : /::error::.*sha/);
+      expect(x.stdout, mode).toMatch(mode === 'nightly' ? /::error::nightly: the github-token input is missing/ : /::error::.*sha/);
     }
   });
   it('a missing or unknown mode fails closed (exit 1)', async () => {

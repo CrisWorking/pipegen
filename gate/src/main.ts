@@ -9,7 +9,8 @@
 //   - baseline-check  (C3, ruling A): the lookup: a verified trusted baseline exists or not → output `found` (found | missing);
 //   - find-run        (C8): the proof that the exact commit passed the gate in a trusted push run on the default branch (gated-run.ts) →
 //                     outputs run-id and run-url on success, a failing status with the reason otherwise;
-//   - nightly: a stub that fails closed (C7).
+//   - nightly         (C7): opens or updates ISSUES (warn mode ending, finish missing, a pipegen update with its patch); never writes a file or a
+//                     workflow (nightly.ts). No outputs. A failed read is a log line; a failed issue write is an error exit;
 // The rules for every mode:
 //   - the token and the key come from the inputs only, and each is masked (`::add-mask::`, ruling 4) before anything else is written;
 //   - an input that is not of the mode is refused (so a test-only option, such as the stage piece size, can never become an input);
@@ -31,6 +32,7 @@ import { decideGate, type DecidedFinding, type GateInput, type GateResult } from
 import { gatherGateInput, repoOf, type GateIo } from './facts.js';
 import { findGatedRun, type GatedRunOpts } from './gated-run.js';
 import { githubAdapter, type AdapterOptions, type GateGithubAdapter } from './github-adapter.js';
+import { runNightly, type NightlyAdapter } from './nightly.js';
 import { scrubFile, type ScrubFileResult } from './scrub.js';
 import { GATE_VIEW } from './generated/gate-view.js';
 import { GATE_INPUTS, type GateToolView } from './settings.js';
@@ -43,7 +45,7 @@ export const MODE_INPUTS = {
   gate: [...GATE_INPUTS],
   'baseline-check': ['mode', 'github-token', 'fp-key'],
   'find-run': ['mode', 'layout', 'sha', 'central-workflow', 'central-sha', 'timeout-minutes', 'github-token'],
-  nightly: ['mode', 'block-from', 'block-from-recorded', 'github-token', 'merged-at'],
+  nightly: ['mode', 'block-from', 'block-from-recorded', 'github-token', 'fp-key'],
 } as const;
 type Mode = keyof typeof MODE_INPUTS;
 const isMode = (m: string): m is Mode => Object.hasOwn(MODE_INPUTS, m);
@@ -58,6 +60,8 @@ export interface MainDeps {
   sleep?: (ms: number) => Promise<void>;
   /** The GitHub client (tests inject a fake); the REST adapter by default. */
   github?: (opts: AdapterOptions) => GateGithubAdapter;
+  /** The client of mode nightly (tests inject a fake); the REST adapter by default (it implements the reads and the two issue writes). */
+  nightly?: (opts: AdapterOptions) => NightlyAdapter;
   /** The built-in reviewed list's gate view. C6 replaces the default with the generated view it bundles (ruling S5). */
   reviewed?: () => readonly GateToolView[];
   /** The file system calls that remove, move aside or lock gate files (tests inject failures; the real calls by default). */
@@ -270,7 +274,7 @@ export async function main(deps: MainDeps): Promise<number> {
       case 'gate': return await runGate(step, deps, inputs);
       case 'baseline-check': return await runBaselineCheck(step, deps, get);
       case 'find-run': return await runFindRun(step, deps, get);
-      case 'nightly': step.error('mode nightly is not available yet (built in C7), so the step fails closed'); return 1;
+      case 'nightly': return await runNightlyMode(step, deps, get);
     }
   } catch (e) {
     step.error(e instanceof StepError ? `the gate action failed closed: ${e.message}` : 'the gate action failed unexpectedly, so it fails closed');
@@ -645,6 +649,43 @@ async function runFindRun(step: Step, deps: MainDeps, get: (n: string) => string
   step.setOutput('run-url', found.url);
   step.log(`the gate passed for this commit in run ${found.runId}`);
   return 0;
+}
+
+// ---------- nightly ----------
+
+/**
+ * Mode nightly (C7): opens or updates issues (nightly.ts). Inputs: github-token (required), fp-key (optional; without it the baseline can not
+ * be trusted, so the warn-ending issue is the softer one), block-from and block-from-recorded (optional). It reads the event payload for
+ * the repository and writes nothing but issues. A read that fails is a log line (the pipegen repository is private until v0.4, so "no
+ * update" is the normal case); an issue that could not be written, or an issue list that can not be searched to its end, fails the step.
+ */
+async function runNightlyMode(step: Step, deps: MainDeps, get: (n: string) => string | undefined): Promise<number> {
+  const fail = (text: string): number => { step.error(`nightly: ${text}`); return 1; };
+  const token = get('github-token');
+  if (token === undefined) return fail('the github-token input is missing, so the step fails closed');
+  if (badKey(get('fp-key'))) return fail(BAD_KEY);
+  let repo: ReturnType<typeof repoOf>;
+  try {
+    repo = repoOf(JSON.parse(readRunnerFile(step.env('GITHUB_EVENT_PATH'), 'the event payload (GITHUB_EVENT_PATH)')) as unknown, step.env('GITHUB_REPOSITORY') ?? '');
+  } catch (e) {
+    return fail(e instanceof StepError ? `${e.message}, so the step fails closed` : 'the event payload could not be read, so the step fails closed');
+  }
+  if (typeof repo === 'string') return fail(`${repo}, so the step fails closed`);
+  const notes: string[] = [];
+  let done;
+  try {
+    const gh = (deps.nightly ?? githubAdapter)({ token, mask: () => undefined, notes });
+    done = await runNightly(gh, { repo, now: (deps.now ?? (() => new Date()))(), blockFrom: get('block-from'), recorded: get('block-from-recorded'), key: get('fp-key') });
+  } catch {
+    return fail('GitHub could not be reached or set up, so the step fails closed');
+  }
+  const summary = ['### pipegen nightly', ''];
+  for (const i of done.issues) { step.log(`issue ${i.key}: #${i.number} ${i.action}`); summary.push(`- \`${i.key}\`: issue #${i.number} ${i.action}`); }
+  if (done.issues.length === 0) summary.push('- no issue to open or update tonight');
+  for (const n of [...notes, ...done.notes]) { step.log(n); summary.push(`- note: ${safeMarkdown(n, 300)}`); }
+  for (const e of done.errors) { step.error(e); summary.push(`- error: ${safeMarkdown(e, 300)}`); }
+  step.summary(`${summary.join('\n')}\n`);
+  return done.errors.length === 0 ? 0 : 1;
 }
 
 // ---------- the reviewed view ----------

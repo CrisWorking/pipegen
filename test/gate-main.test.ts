@@ -85,13 +85,14 @@ describe('main: the common rules', () => {
       expect(x.outputs).toEqual({});
     }
   });
-  it('nightly is a stub that fails closed (built in C7); find-run is real since C8 (test/gate-gated-run.test.ts) and fails closed without its inputs', async () => {
+  it('find-run is real since C8 (test/gate-gated-run.test.ts) and nightly since C7 (test/gate-nightly.test.ts): each fails closed without its inputs or event', async () => {
     const f = await go({ mode: 'find-run', [GH_IN]: CRED });
     expect(f.code).toBe(1);
     expect(f.out).not.toMatch(/built in C8/);
     const n = await go({ mode: 'nightly', [GH_IN]: CRED });
     expect(n.code).toBe(1);
-    expect(n.out).toMatch(/::error::.*built in C7/);
+    expect(n.out).not.toMatch(/built in C7/);
+    expect(n.out).toMatch(/::error::nightly:/);
   });
   it('each secret input is masked first: its ::add-mask:: line is the first thing written for it, before any other line', async () => {
     for (const mode of ['gate', 'baseline-check', 'scrub', 'find-run', 'nightly']) {

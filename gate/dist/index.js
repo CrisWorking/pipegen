@@ -2572,7 +2572,7 @@ var RENDERER_INPUTS = Object.freeze({
     raw: SCRUB_RAW,
     out: SCRUB_OUT,
     // the fingerprint key: the scrub hashes with it, the gate checks the baseline's MAC with it (ruling B6)
-    "fp-key": modeInput(["scrub", "gate", "baseline-check"], /^\$\{\{ secrets\.PIPEGEN_FP_KEY \}\}$/, "${{ secrets.PIPEGEN_FP_KEY }}"),
+    "fp-key": modeInput(["scrub", "gate", "baseline-check", "nightly"], /^\$\{\{ secrets\.PIPEGEN_FP_KEY \}\}$/, "${{ secrets.PIPEGEN_FP_KEY }}"),
     // gate (ruling B3)
     jobs: modeInput(["gate"], /^\$\{\{ toJSON\(needs\) \}\}$/, "${{ toJSON(needs) }}"),
     "job-list": literalInput(["gate"], jobListLiteralProblem, "a job list literal (a JSON list of entries)"),
@@ -2596,9 +2596,8 @@ var RENDERER_INPUTS = Object.freeze({
     "timeout-minutes": modeInput(["find-run"], TIMEOUT_MINUTES_RE, "whole minutes, 1 to 360"),
     // where the gate runs (C8 fix round 1): `inline` (the gate job is in pipegen.yml) or `central` (the per-project central workflow); the renderer
     // knows it from the draft and the referee checks it. find-run never guesses it from the repository's visibility.
-    layout: modeInput(["find-run"], /^(?:inline|central)$/, "inline or central"),
-    // nightly
-    "merged-at": modeInput(["nightly"], /^\d{4}-(?:0[1-9]|1[0-2])-(?:0[1-9]|[12]\d|3[01])(?:T\d{2}:\d{2}:\d{2}(?:\.\d{1,3})?Z)?$/, "a date or an ISO time in UTC")
+    layout: modeInput(["find-run"], /^(?:inline|central)$/, "inline or central")
+    // nightly (C7): block-from, block-from-recorded, github-token and fp-key (to verify the baseline) above; the setup merge time is read from the API, which proves it
   }
 });
 
@@ -3396,8 +3395,8 @@ function keyProblem(key, fork, needed) {
 }
 var maskSecretShapes = (text) => maskText(text);
 function normaliseMessage(message, lines) {
-  const own6 = new Set(lines);
-  return message.replace(/(?<![\w.])\d+(?!\w|\.\d)/g, (m) => own6.has(Number(m)) ? "" : m).replace(/\s+/g, " ").trim();
+  const own7 = new Set(lines);
+  return message.replace(/(?<![\w.])\d+(?!\w|\.\d)/g, (m) => own7.has(Number(m)) ? "" : m).replace(/\s+/g, " ").trim();
 }
 var COLUMN_RULES = Object.freeze(Object.assign(/* @__PURE__ */ Object.create(null), {
   betterleaks: { shiftAfterFirstLine: 0 },
@@ -3972,12 +3971,12 @@ function baseFolder(baseId, run, workspace, encoding, where) {
   return path.startsWith(`${ws}/`) ? normaliseUri(path.slice(ws.length + 1), { encoding }) : void 0;
 }
 function mapUri(uri, baseId, run, bases, workspace, encoding, where) {
-  const own6 = normaliseUri(uri, { workspace, encoding });
-  if (baseId === void 0 || uri.startsWith("/") || SCHEME.test(uri)) return own6;
+  const own7 = normaliseUri(uri, { workspace, encoding });
+  if (baseId === void 0 || uri.startsWith("/") || SCHEME.test(uri)) return own7;
   if (!bases.has(baseId)) bases.set(baseId, baseFolder(baseId, run, workspace, encoding, where));
   const base = bases.get(baseId);
-  if (base === void 0 || own6 === void 0) return void 0;
-  return base === "" ? own6 : `${base}/${own6}`;
+  if (base === void 0 || own7 === void 0) return void 0;
+  return base === "" ? own7 : `${base}/${own7}`;
 }
 function readRun(run, index, toolId, info, opts, limits, notes) {
   const where = `run ${index}`;
@@ -8387,7 +8386,7 @@ var API_VERSION = "2022-11-28";
 var TIMEOUT_MS = 3e4;
 var MAX_JSON_BYTES = 32 * 1024 * 1024;
 var MAX_RAW_BYTES2 = 3 * 1024 * 1024;
-var PAGE_CAP = { files: 30, reviews: 31, runs: 5, jobs: 5 };
+var PAGE_CAP = { files: 30, reviews: 31, runs: 5, jobs: 5, pulls: 3, releases: 3, issues: 5 };
 var MAX_PER_PAGE = 100;
 var STORE_HOST_RE = /^(?:[a-z0-9-]{1,63}\.blob\.core\.windows\.net|[a-z0-9-]{1,63}\.actions\.githubusercontent\.com)$/;
 var GitHubApiError = class extends Error {
@@ -8400,6 +8399,10 @@ var GitHubApiError = class extends Error {
     this.rateLimited = opts.rateLimited ?? false;
   }
 };
+var MAX_ISSUE_TITLE = 256;
+var MAX_ISSUE_BODY = 65e3;
+var LABEL_RE = /^[A-Za-z0-9][A-Za-z0-9:._-]{0,49}$/;
+var ISSUE_WRITE_RE = /^\/repos\/[A-Za-z0-9._-]+\/[A-Za-z0-9._-]+\/issues(?:\/[1-9][0-9]{0,14})?$/;
 var fail2 = (what) => {
   throw new GitHubApiError(`pipegen will not call GitHub with ${what}`);
 };
@@ -8475,14 +8478,16 @@ function githubAdapter(opts) {
   async function call(path, o = {}) {
     mask();
     const url = `${API_ROOT}${path}`;
-    const what = `GET ${path.replace(/\?.*$/, "")}`;
+    const method = o.write?.method ?? "GET";
+    const what = `${method} ${path.replace(/\?.*$/, "")}`;
     let res;
     try {
       res = await fetchFn(url, {
-        method: "GET",
+        method,
         redirect: "manual",
         signal: AbortSignal.timeout(timeoutMs),
-        headers: { authorization: `Bearer ${token}`, accept: o.accept ?? "application/vnd.github+json", "x-github-api-version": API_VERSION, "user-agent": "pipegen-gate" }
+        headers: { authorization: `Bearer ${token}`, accept: o.accept ?? "application/vnd.github+json", "x-github-api-version": API_VERSION, "user-agent": "pipegen-gate", ...o.write === void 0 ? {} : { "content-type": "application/json" } },
+        ...o.write === void 0 ? {} : { body: o.write.body }
       });
     } catch {
       throw new GitHubApiError(`${what}: the request failed (network or timeout)`);
@@ -8518,6 +8523,20 @@ function githubAdapter(opts) {
     } catch {
       throw new GitHubApiError(`GET ${path.replace(/\?.*$/, "")}: the answer is not JSON`);
     }
+  }
+  async function send(method, path, body) {
+    if (!ISSUE_WRITE_RE.test(path) || method === "POST" !== /\/issues$/.test(path)) fail2("a write that is not an issue");
+    const r = await call(path, { write: { method, body: JSON.stringify(body) } });
+    if (r.status === 404) throw new GitHubApiError(`${method} ${path}: not found`, { status: 404 });
+    let answer;
+    try {
+      answer = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(r.body));
+    } catch {
+      throw new GitHubApiError(`${method} ${path}: the answer is not JSON`);
+    }
+    const n = typeof answer === "object" && answer !== null && Object.hasOwn(answer, "number") ? answer.number : void 0;
+    if (typeof n !== "number" || !Number.isSafeInteger(n) || n <= 0) throw new GitHubApiError(`${method} ${path}: the answer has no issue number`);
+    return { number: n };
   }
   async function downloadArtifactZip(owner, name, artifactId, maxBytes) {
     const path = `${repo(owner, name)}/actions/artifacts/${num(artifactId)}/zip`;
@@ -8617,6 +8636,24 @@ function githubAdapter(opts) {
       }
     },
     getCommit: async (owner, name, commit) => getJson(`${repo(owner, name)}/commits/${sha2(commit)}`),
+    // ---- C7 (nightly): reads, then the two issue writes ----
+    listSetupPulls: async (owner, name, p, per) => getJson(`${repo(owner, name)}/pulls?${new URLSearchParams({ state: "closed", head: `${owner}:pipegen/setup`, sort: "updated", direction: "desc", per_page: perPage(per), page: page(p, PAGE_CAP.pulls) }).toString()}`),
+    listReleases: async (owner, name, p, per) => getJson(`${repo(owner, name)}/releases?${new URLSearchParams({ per_page: perPage(per), page: page(p, PAGE_CAP.releases) }).toString()}`),
+    tagRef: async (owner, name, tag) => getJson(`${repo(owner, name)}/git/ref/tags/${refPath(tag)}`),
+    gitTag: async (owner, name, tagSha) => getJson(`${repo(owner, name)}/git/tags/${sha2(tagSha)}`),
+    listIssues: async (owner, name, p, per) => getJson(`${repo(owner, name)}/issues?${new URLSearchParams({ state: "all", creator: "github-actions[bot]", sort: "created", direction: "desc", per_page: perPage(per), page: page(p, PAGE_CAP.issues) }).toString()}`),
+    createIssue: async (owner, name, issue) => {
+      const labels = issue.labels ?? [];
+      if (typeof issue.title !== "string" || issue.title === "" || issue.title.length > MAX_ISSUE_TITLE) fail2("an issue title that is empty or over 256 characters");
+      if (typeof issue.body !== "string" || issue.body.length > MAX_ISSUE_BODY) fail2("an issue body over the size cap");
+      if (!Array.isArray(labels) || labels.length > 5 || labels.some((l) => typeof l !== "string" || !LABEL_RE.test(l))) fail2("a label that is not a plain label name");
+      return send("POST", `${repo(owner, name)}/issues`, { title: issue.title, body: issue.body, ...labels.length === 0 ? {} : { labels } });
+    },
+    updateIssue: async (owner, name, n, issue) => {
+      if (typeof issue.title !== "string" || issue.title === "" || issue.title.length > MAX_ISSUE_TITLE) fail2("an issue title that is empty or over 256 characters");
+      if (typeof issue.body !== "string" || issue.body.length > MAX_ISSUE_BODY) fail2("an issue body over the size cap");
+      return send("PATCH", `${repo(owner, name)}/issues/${num(n)}`, { title: issue.title, body: issue.body });
+    },
     collaboratorPermission: async (owner, name, login) => {
       if (typeof login !== "string" || !LOGIN_RE2.test(login)) fail2("a login that is not a GitHub login");
       return getJson(`${repo(owner, name)}/collaborators/${encodeURIComponent(login)}/permission`);
@@ -8821,7 +8858,11 @@ async function findGatedRun(gh0, repo2, sha3, o) {
   }
 }
 
+// gate/src/nightly.ts
+import { createHash as createHash6 } from "node:crypto";
+
 // gate/src/generated/gate-view.ts
+var GATE_VERSION = "0.2.0";
 var GATE_VIEW = [
   {
     "id": "actions-checkout",
@@ -9413,6 +9454,435 @@ var GATE_VIEW = [
   }
 ];
 
+// gate/src/nightly.ts
+var isPlain8 = (v) => typeof v === "object" && v !== null && !Array.isArray(v);
+var own6 = (o, k) => Object.hasOwn(o, k) ? o[k] : void 0;
+var SHA_RE8 = /^[0-9a-f]{40}$/;
+var SEMVER_RE = /^(0|[1-9][0-9]{0,5})\.(0|[1-9][0-9]{0,5})\.(0|[1-9][0-9]{0,5})$/;
+var GATE_TAG_RE = /^gate-v((?:0|[1-9][0-9]{0,5})\.(?:0|[1-9][0-9]{0,5})\.(?:0|[1-9][0-9]{0,5}))$/;
+var ISO_RE = /^(\d{4}-\d{2}-\d{2})T\d{2}:\d{2}:\d{2}(?:\.\d{1,3})?Z$/;
+var DAY_MS = 864e5;
+function isoTime(v) {
+  if (typeof v !== "string") return void 0;
+  const m = ISO_RE.exec(v);
+  if (m === null || validDate(m[1]) === void 0) return void 0;
+  const t = Date.parse(v);
+  return Number.isFinite(t) ? t : void 0;
+}
+var clockOf = (d) => d instanceof Date && Number.isFinite(d.getTime()) ? d.getTime() : void 0;
+function semver(v) {
+  const m = SEMVER_RE.exec(v);
+  return m === null ? void 0 : [Number(m[1]), Number(m[2]), Number(m[3])];
+}
+var newer = (a, b) => a[0] !== b[0] ? a[0] > b[0] : a[1] !== b[1] ? a[1] > b[1] : a[2] > b[2];
+function effectiveBlockFrom(blockFrom, recorded) {
+  const dates = [validDate(blockFrom), validDate(recorded)].filter((x) => x !== void 0).sort();
+  return dates[0];
+}
+function warnEnding(blockFrom, today, oldFindings) {
+  const date = validDate(blockFrom);
+  const now = clockOf(today);
+  if (date === void 0 || now === void 0) return null;
+  const startOfToday = Math.floor(now / DAY_MS) * DAY_MS;
+  const daysLeft = Math.round((Date.parse(`${date}T00:00:00Z`) - startOfToday) / DAY_MS);
+  if (daysLeft <= 0) return null;
+  const unknown = typeof oldFindings !== "number" || !Number.isSafeInteger(oldFindings) || oldFindings < 0;
+  if (!unknown && oldFindings === 0) return null;
+  return { open: daysLeft <= 2, daysLeft, unknown };
+}
+function finishMissing(blockFrom, setupMergedAt2, now) {
+  if (validDate(blockFrom) !== void 0) return false;
+  const merged = isoTime(setupMergedAt2);
+  const clock = clockOf(now);
+  if (merged === void 0 || clock === void 0) return false;
+  return clock - merged > DAY_MS;
+}
+var UPDATE_COOLDOWN_DAYS = 7;
+function updateAvailable(current, latest, now) {
+  if (latest === null) return false;
+  const cur = semver(current);
+  const next = semver(latest.version);
+  const published = isoTime(latest.publishedAt);
+  const clock = clockOf(now);
+  if (cur === void 0 || next === void 0 || published === void 0 || clock === void 0) return false;
+  return newer(next, cur) && clock - published >= UPDATE_COOLDOWN_DAYS * DAY_MS;
+}
+var PatchRefused = class extends Error {
+};
+var CONTEXT = 3;
+var MAX_SHOWN_LINE = 400;
+var PATCH_PATH_RE = /^[A-Za-z0-9._/-]{1,200}$/;
+var UNSAFE_CHAR_RE = new RegExp("[\\u0000-\\u0008\\u000a-\\u001f\\u007f-\\u009f\\u200b-\\u200f\\u2028-\\u202e\\u2060-\\u2069\\ufeff\\u061c]");
+function filePatch(file, from, to) {
+  if (!PATCH_PATH_RE.test(file.path) || file.path.split("/").some((p) => p === "" || p === "." || p === "..")) throw new PatchRefused("Refused: the file path is not a plain repository path.");
+  const parts = file.text.split("\n");
+  const endsWithNewline = parts[parts.length - 1] === "";
+  const lines = endsWithNewline ? parts.slice(0, -1) : parts;
+  const re = new RegExp(`^(\\s*(?:-\\s+)?uses:\\s+)crisworking/pipegen/gate@${from.sha} # gate-v${from.version.replace(/\./g, "\\.")}(\\s*)$`);
+  const at3 = [];
+  const replaced = /* @__PURE__ */ new Map();
+  lines.forEach((line, i) => {
+    const m = re.exec(line);
+    if (m === null) return;
+    at3.push(i);
+    replaced.set(i, `${m[1]}crisworking/pipegen/gate@${to.sha} # gate-v${to.version}${m[2]}`);
+  });
+  if (at3.length === 0) return "";
+  const ranges = [];
+  for (const i of at3) {
+    const start = Math.max(0, i - CONTEXT);
+    const end = Math.min(lines.length - 1, i + CONTEXT);
+    const last = ranges[ranges.length - 1];
+    if (last !== void 0 && start <= last.end + 1) last.end = end;
+    else ranges.push({ start, end });
+  }
+  const out = [`--- a/${file.path}`, `+++ b/${file.path}`];
+  const noNewlineAtEnd = (i) => !endsWithNewline && i === lines.length - 1;
+  for (const r of ranges) {
+    const count = r.end - r.start + 1;
+    out.push(`@@ -${r.start + 1},${count} +${r.start + 1},${count} @@`);
+    for (let i = r.start; i <= r.end; i++) {
+      const line = lines[i];
+      const shown2 = (text) => {
+        const bare = text.endsWith("\r") ? text.slice(0, -1) : text;
+        if (UNSAFE_CHAR_RE.test(bare) || bare.length > MAX_SHOWN_LINE || bare.includes("<!--") || bare.includes("-->") || bare.includes("\r")) {
+          throw new PatchRefused(`Refused: line ${i + 1} of ${file.path} holds text the issue format can not carry safely (a control or invisible character, a very long line, or an HTML comment marker).`);
+        }
+      };
+      shown2(line);
+      const mark = noNewlineAtEnd(i) ? ["\\ No newline at end of file"] : [];
+      const swap = replaced.get(i);
+      if (swap === void 0) {
+        out.push(` ${line}`, ...mark);
+        continue;
+      }
+      shown2(swap);
+      out.push(`-${line}`, ...mark, `+${swap}`, ...mark);
+    }
+  }
+  return `${out.join("\n")}
+`;
+}
+function checkPin(p, which) {
+  if (!isPlain8(p) || typeof p.sha !== "string" || !SHA_RE8.test(p.sha) || typeof p.version !== "string" || !SEMVER_RE.test(p.version)) {
+    throw new PatchRefused(`Refused: the ${which} pin is not a 40-character lower-case commit and a plain x.y.z version.`);
+  }
+}
+function updatePatch(files, from, to) {
+  checkPin(from, "old");
+  checkPin(to, "new");
+  return files.map((f) => filePatch(f, from, to)).join("");
+}
+var BOT_LOGIN = "github-actions[bot]";
+var ISSUE_PAGE_CAP = 5;
+var ISSUE_PER_PAGE = 100;
+var KEY_RE = /^[a-z0-9][a-z0-9.-]{0,63}$/;
+var MAX_TITLE = 256;
+var MAX_BODY = 6e4;
+var markerOf = (key) => `<!-- pipegen:key=${key} -->`;
+async function upsertIssueDetailed(gh, repo2, key, title, body, opts = {}) {
+  if (typeof key !== "string" || !KEY_RE.test(key)) throw new Error("nightly: the issue key is not a plain key");
+  if (typeof title !== "string" || title === "" || title.length > MAX_TITLE) throw new Error("nightly: the issue title is empty or too long");
+  const text = `${markerOf(key)}
+${body}`;
+  if (typeof body !== "string" || text.length > MAX_BODY) throw new Error("nightly: the issue body is too long");
+  const marker = markerOf(key);
+  let open;
+  let closed;
+  let complete = false;
+  for (let page2 = 1; page2 <= ISSUE_PAGE_CAP; page2++) {
+    const list = await gh.listIssues(repo2.owner, repo2.name, page2, ISSUE_PER_PAGE);
+    if (!Array.isArray(list)) throw new Error("nightly: the issue list is not a list, so no issue is written");
+    for (const raw of list) {
+      if (!isPlain8(raw)) throw new Error("nightly: the issue list holds an entry that is not an issue, so no issue is written");
+      const number = own6(raw, "number");
+      if (typeof number !== "number" || !Number.isSafeInteger(number) || number <= 0) throw new Error("nightly: the issue list holds an entry with no issue number, so no issue is written");
+      if (own6(raw, "pull_request") !== void 0) continue;
+      const user = own6(raw, "user");
+      if (!isPlain8(user) || own6(user, "login") !== BOT_LOGIN || own6(user, "type") !== "Bot") continue;
+      const b = own6(raw, "body");
+      if (typeof b !== "string" || b.split("\n")[0].replace(/\r$/, "") !== marker) continue;
+      if (own6(raw, "state") === "open") {
+        open = { number, title: String(own6(raw, "title") ?? ""), body: b };
+        break;
+      }
+      closed ??= number;
+    }
+    if (open !== void 0) break;
+    if (list.length < ISSUE_PER_PAGE) {
+      complete = true;
+      break;
+    }
+  }
+  if (open !== void 0) {
+    if (open.title === title && open.body.replace(/\r\n/g, "\n") === text) return { key, number: open.number, action: "unchanged" };
+    await gh.updateIssue(repo2.owner, repo2.name, open.number, { title, body: text });
+    return { key, number: open.number, action: "updated" };
+  }
+  if (closed !== void 0) return { key, number: closed, action: "left-closed" };
+  if (!complete) throw new Error(`nightly: the issue list reaches its cap of ${ISSUE_PAGE_CAP} pages without ending, so no issue is created (it might be a duplicate)`);
+  const made = await gh.createIssue(repo2.owner, repo2.name, { title, body: text, ...opts.labels === void 0 || opts.labels.length === 0 ? {} : { labels: opts.labels } });
+  const n = isPlain8(made) ? own6(made, "number") : void 0;
+  if (typeof n !== "number" || !Number.isSafeInteger(n) || n <= 0) throw new Error("nightly: GitHub did not answer with the number of the new issue");
+  return { key, number: n, action: "created" };
+}
+var SETUP_BRANCH = "pipegen/setup";
+var PULL_PAGES = 3;
+async function setupMergedAt(gh, repo2, now) {
+  const clock = clockOf(now);
+  if (clock === void 0) return { note: "the clock is not a date, so the setup merge is not proven" };
+  let best;
+  try {
+    for (let page2 = 1; page2 <= PULL_PAGES; page2++) {
+      const list = await gh.listSetupPulls(repo2.owner, repo2.name, page2, 100);
+      if (!Array.isArray(list)) return { note: "the list of closed setup pull requests could not be read (not a list), so the setup merge is not proven" };
+      for (const pr of list) {
+        if (!isPlain8(pr)) continue;
+        const head = own6(pr, "head");
+        const base = own6(pr, "base");
+        if (!isPlain8(head) || !isPlain8(base) || own6(head, "ref") !== SETUP_BRANCH || own6(base, "ref") !== repo2.defaultBranch) continue;
+        const hr = own6(head, "repo");
+        const br = own6(base, "repo");
+        const hid = isPlain8(hr) ? own6(hr, "id") : void 0;
+        const bid = isPlain8(br) ? own6(br, "id") : void 0;
+        if (typeof hid !== "number" || hid !== bid || hid !== repo2.id) continue;
+        const merged = own6(pr, "merged_at");
+        const t = isoTime(merged);
+        if (t === void 0 || t > clock) continue;
+        if (best === void 0 || t > best.t) best = { t, at: merged };
+      }
+      if (list.length < 100) break;
+    }
+  } catch {
+    return { note: "the list of closed setup pull requests could not be read, so the setup merge is not proven" };
+  }
+  return best === void 0 ? {} : { at: best.at };
+}
+var PIPEGEN_OWNER = "crisworking";
+var PIPEGEN_NAME = "pipegen";
+var RELEASE_PAGES = 3;
+var MAX_TAG_CHAIN = 4;
+async function resolveGateTag(gh, tag) {
+  const ref2 = await gh.tagRef(PIPEGEN_OWNER, PIPEGEN_NAME, tag);
+  if (!isPlain8(ref2) || own6(ref2, "ref") !== `refs/tags/${tag}`) throw new Error("the tag ref is not the tag asked for");
+  let obj = own6(ref2, "object");
+  const seen = /* @__PURE__ */ new Set();
+  for (let depth = 0; depth <= MAX_TAG_CHAIN; depth++) {
+    if (!isPlain8(obj)) throw new Error("the tag has no object");
+    const type = own6(obj, "type");
+    const sha3 = own6(obj, "sha");
+    if (typeof sha3 !== "string" || !SHA_RE8.test(sha3)) throw new Error("the tag points at something that is not a 40-hex sha");
+    if (type === "commit") return sha3;
+    if (type !== "tag") throw new Error(`the tag points at a ${typeof type === "string" && /^[a-z]{1,10}$/.test(type) ? type : "thing"}, not a commit`);
+    if (seen.has(sha3) || depth === MAX_TAG_CHAIN) throw new Error("the annotated tag chain loops or is too long");
+    seen.add(sha3);
+    const tagObject = await gh.gitTag(PIPEGEN_OWNER, PIPEGEN_NAME, sha3);
+    if (!isPlain8(tagObject) || own6(tagObject, "sha") !== sha3) throw new Error("the annotated tag object is not the one asked for");
+    obj = own6(tagObject, "object");
+  }
+  throw new Error("the annotated tag chain is too long");
+}
+async function latestGateRelease(gh, current, now) {
+  const found = [];
+  try {
+    for (let page2 = 1; page2 <= RELEASE_PAGES; page2++) {
+      const list = await gh.listReleases(PIPEGEN_OWNER, PIPEGEN_NAME, page2, 100);
+      if (!Array.isArray(list)) return { note: "no update check: the release list of pipegen could not be read (not a list)" };
+      for (const r of list) {
+        if (!isPlain8(r)) continue;
+        const tag = own6(r, "tag_name");
+        const m = typeof tag === "string" ? GATE_TAG_RE.exec(tag) : null;
+        const published = own6(r, "published_at");
+        if (m === null || own6(r, "draft") !== false || own6(r, "prerelease") !== false || isoTime(published) === void 0) continue;
+        const ver = semver(m[1]);
+        if (ver !== void 0) found.push({ version: m[1], ver, publishedAt: published, tag });
+      }
+      if (list.length < 100) break;
+    }
+  } catch {
+    return { note: "no update check: the release list of pipegen could not be read (the repository is private until v0.4, so this is expected)" };
+  }
+  const eligible = found.filter((f) => updateAvailable(current, { version: f.version, publishedAt: f.publishedAt }, now)).sort((a, b) => newer(a.ver, b.ver) ? -1 : newer(b.ver, a.ver) ? 1 : 0);
+  const top = eligible[0];
+  if (top === void 0) return {};
+  try {
+    const sha3 = await resolveGateTag(gh, top.tag);
+    return { release: { version: top.version, publishedAt: top.publishedAt, tag: top.tag, sha: sha3 } };
+  } catch (e) {
+    return { note: `no update: the tag ${top.tag} could not be resolved to a commit (${e instanceof Error ? e.message : "unknown"})` };
+  }
+}
+function blobSha(bytes) {
+  return createHash6("sha1").update(`blob ${bytes.length}\0`).update(bytes).digest("hex");
+}
+var MAX_WORKFLOW_BYTES = 1024 * 1024;
+async function readWorkflow(gh, repo2) {
+  const tip = await resolveTip(gh, repo2);
+  if (tip === void 0) return { why: "the default branch could not be resolved" };
+  let a;
+  try {
+    a = await gh.fileAt(repo2.owner, repo2.name, WORKFLOW_PATH, tip);
+  } catch {
+    return { why: "the workflow file could not be read" };
+  }
+  if (a === null) return { why: "there is no pipegen.yml in this repository (a private repository keeps the pin in the central repository)" };
+  if (!isPlain8(a) || own6(a, "type") !== "file" || own6(a, "encoding") !== "base64" || typeof own6(a, "content") !== "string") return { why: "the workflow file answer is not a readable file" };
+  const size = own6(a, "size");
+  if (typeof size !== "number" || !Number.isSafeInteger(size) || size < 0 || size > MAX_WORKFLOW_BYTES) return { why: "the workflow file is over the size cap" };
+  const bytes = Buffer.from(own6(a, "content").replace(/\s+/g, ""), "base64");
+  if (bytes.length > MAX_WORKFLOW_BYTES) return { why: "the workflow file is over the size cap" };
+  let text;
+  try {
+    text = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+  } catch {
+    return { why: "the workflow file is not UTF-8 text" };
+  }
+  return { text, baseSha: blobSha(bytes) };
+}
+var repoName = (repo2) => safeMarkdown(`${repo2.owner}/${repo2.name}`, 200);
+var branchName = (repo2) => safeMarkdown(repo2.defaultBranch, 100);
+var plural = (n, one, many) => `${n} ${n === 1 ? one : many}`;
+function warnEndingIssue(repo2, date, w, old, note) {
+  const days = plural(w.daysLeft, "day", "days");
+  const count = typeof old === "number" ? `There are ${plural(old, "existing finding", "existing findings")} on ${branchName(repo2)} in the trusted baseline (signed by this repository's own pipegen run). In block mode they follow the policy and can block merges.` : `Old findings unknown: pipegen found no trusted baseline for ${branchName(repo2)}${note === void 0 ? "" : ` (${safeMarkdown(note, 300)})`}, so it can not count the findings that block mode would start to judge. Do not read this as "none".`;
+  return {
+    title: `pipegen: warn mode ends in ${days}${w.unknown ? "; old findings unknown" : ""}`,
+    body: [
+      `## Warn mode ends in ${days}`,
+      "",
+      `In ${repoName(repo2)}, old findings only warn until \`${date}\` (00:00 UTC). From that day the pipegen gate runs in block mode.`,
+      "",
+      count,
+      "",
+      "What to do: fix the old findings, or accept them knowingly before that day. The date is the earlier of the repository variable `PIPEGEN_BLOCK_FROM` and the date recorded at setup; moving the variable later does not postpone a recorded date.",
+      "",
+      "This issue is opened by pipegen's nightly job and updated in place every night. pipegen does not close it."
+    ].join("\n")
+  };
+}
+function finishMissingIssue(repo2, mergedAt) {
+  return {
+    title: "pipegen: setup was merged but finish has not run",
+    body: [
+      "## `pipegen finish` has not run",
+      "",
+      `The pipegen setup pull request for ${repoName(repo2)} was merged at \`${mergedAt}\`, more than 24 hours ago, but the repository variable \`PIPEGEN_BLOCK_FROM\` is still not set. That variable is set by \`finish\`, which also applies the repository settings.`,
+      "",
+      "Run it from a machine where you are signed in to GitHub:",
+      "",
+      "`npx pipegen finish`",
+      "",
+      "This issue is opened by pipegen's nightly job and updated in place every night. pipegen does not close it."
+    ].join("\n")
+  };
+}
+function fenceFor(text) {
+  const longest = Math.max(0, ...(text.match(/`+/g) ?? []).map((r) => r.length));
+  return "`".repeat(Math.max(3, longest + 1));
+}
+var ADVISORY = [
+  "> **This issue is advisory.** Anyone with issue rights in a public repository, and any job with `issues: write`, can open an issue that looks exactly like this one, even as `github-actions[bot]`.",
+  "> So `pipegen update` does not apply a patch from an issue: it re-derives the patch itself, from the reviewed list bundled with the pipegen version you run, and uses this issue only as a prompt.",
+  "> If you apply anything by hand, compare the commit with the tag `gate-v{VERSION}` in pipegen's repository first."
+].join("\n");
+function updateIssue(repo2, rel, patch, notes) {
+  const v = safeMarkdown(`v${rel.version}`, 40);
+  const cur = safeMarkdown(`v${GATE_VERSION}`, 40);
+  const lines = [
+    `## pipegen gate ${v} is available`,
+    "",
+    `${repoName(repo2)} runs pipegen gate ${cur}. Version ${v} was released at \`${rel.publishedAt}\`, at least ${UPDATE_COOLDOWN_DAYS} days ago.`,
+    "",
+    `- release tag: \`${rel.tag}\``,
+    `- the commit that tag resolves to (the new pin): \`${rel.sha}\``,
+    "",
+    "The commit comes from resolving the tag through the git refs API, never from the release text.",
+    "",
+    "To update, run:",
+    "",
+    `\`npx pipegen@${rel.version} update\``,
+    ""
+  ];
+  if (patch !== void 0) {
+    const fence = fenceFor(patch.diff);
+    lines.push(
+      "The patch below swaps only the pinned gate line or lines in `.github/workflows/pipegen.yml`; every other byte stays the same.",
+      "",
+      `${fence}diff`,
+      patch.diff.replace(/\n$/, ""),
+      fence,
+      `<!-- pipegen:patch ${JSON.stringify({ repo: "app", path: WORKFLOW_PATH, baseSha: patch.baseSha })} -->`,
+      ""
+    );
+  } else {
+    lines.push("There is no patch in this issue: pipegen could not read a pin line to swap here (a private repository keeps the pin in the central repository, which `pipegen update` changes with your token).", "");
+  }
+  for (const n of notes) lines.push(`Note: ${safeMarkdown(n, 300)}`, "");
+  lines.push(ADVISORY.replace("{VERSION}", rel.version), "", "This issue is opened by pipegen's nightly job. pipegen does not close it.");
+  return { title: `pipegen: gate v${rel.version} is available`, body: lines.join("\n"), labels: patch === void 0 ? [] : ["pipegen:patch"] };
+}
+var MAX_PATCH_CHARS2 = 3e4;
+async function runNightly(gh, ctx, deps = {}) {
+  const result = { issues: [], notes: [], errors: [] };
+  const { repo: repo2, now } = ctx;
+  const upsert = async (key, issue) => {
+    try {
+      result.issues.push(await upsertIssueDetailed(gh, repo2, key, issue.title, issue.body, { labels: issue.labels ?? [] }));
+    } catch (e) {
+      result.errors.push(`the issue ${key} was not written: ${e instanceof Error ? e.message : "unknown error"}`);
+    }
+  };
+  const effective = effectiveBlockFrom(ctx.blockFrom, ctx.recorded);
+  if (effective !== void 0 && warnEnding(effective, now, "unknown")?.open === true) {
+    let old = "unknown";
+    let note;
+    try {
+      const loaded = await (deps.loadBaseline ?? loadBaseline)(gh, repo2, { key: ctx.key, now });
+      if (loaded.baseline !== null) {
+        old = 0;
+        for (const n of loaded.baseline.counts.values()) old += n;
+      } else note = loaded.note;
+    } catch {
+      note = "the baseline lookup failed";
+    }
+    const w = warnEnding(effective, now, old);
+    if (w?.open === true) await upsert("warn-ending", warnEndingIssue(repo2, effective, w, old, note));
+  }
+  if (validDate(ctx.blockFrom) === void 0) {
+    const merged = await setupMergedAt(gh, repo2, now);
+    if (merged.note !== void 0) result.notes.push(merged.note);
+    if (merged.at !== void 0 && finishMissing(ctx.blockFrom, merged.at, now)) await upsert("finish-missing", finishMissingIssue(repo2, merged.at));
+  }
+  const latest = await latestGateRelease(gh, GATE_VERSION, now);
+  if (latest.note !== void 0) result.notes.push(latest.note);
+  if (latest.release !== void 0) {
+    const rel = latest.release;
+    const notes = [];
+    let patch;
+    try {
+      const file = await readWorkflow(gh, repo2);
+      if ("why" in file) notes.push(`no patch: ${file.why}`);
+      else {
+        const re = new RegExp(`^\\s*(?:-\\s+)?uses:\\s+crisworking/pipegen/gate@([0-9a-f]{40}) # gate-v${GATE_VERSION.replace(/\./g, "\\.")}\\s*$`);
+        const pinned = new Set(file.text.split("\n").map((l) => re.exec(l)?.[1]).filter((x) => x !== void 0));
+        if (pinned.size === 0) notes.push(`no patch: pipegen.yml has no gate pin line for v${GATE_VERSION}`);
+        else if (pinned.size > 1) notes.push("no patch: pipegen.yml pins the gate at more than one commit for this version, so the swap is ambiguous");
+        else {
+          const diff = updatePatch([{ path: WORKFLOW_PATH, text: file.text }], { sha: [...pinned][0], version: GATE_VERSION }, { sha: rel.sha, version: rel.version });
+          if (diff === "") notes.push("no patch: nothing to swap");
+          else if (diff.length > MAX_PATCH_CHARS2) notes.push("no patch: the patch is too large for an issue");
+          else patch = { diff, baseSha: file.baseSha };
+        }
+      }
+    } catch (e) {
+      notes.push(e instanceof PatchRefused ? `the patch was left out: ${e.message}` : "no patch: the workflow file could not be read");
+    }
+    result.notes.push(...notes);
+    await upsert(`update-${rel.version}`, updateIssue(repo2, rel, patch, notes));
+  }
+  return result;
+}
+
 // gate/src/main.ts
 var MODE_INPUTS = {
   scrub: ["mode", "artifact", "tool", "stage", "format", "raw", "out", "fp-key"],
@@ -9420,7 +9890,7 @@ var MODE_INPUTS = {
   gate: [...GATE_INPUTS],
   "baseline-check": ["mode", "github-token", "fp-key"],
   "find-run": ["mode", "layout", "sha", "central-workflow", "central-sha", "timeout-minutes", "github-token"],
-  nightly: ["mode", "block-from", "block-from-recorded", "github-token", "merged-at"]
+  nightly: ["mode", "block-from", "block-from-recorded", "github-token", "fp-key"]
 };
 var isMode = (m) => Object.hasOwn(MODE_INPUTS, m);
 var REAL_FS = {
@@ -9673,8 +10143,7 @@ async function main(deps) {
       case "find-run":
         return await runFindRun(step, deps, get);
       case "nightly":
-        step.error("mode nightly is not available yet (built in C7), so the step fails closed");
-        return 1;
+        return await runNightlyMode(step, deps, get);
     }
   } catch (e) {
     step.error(e instanceof StepError ? `the gate action failed closed: ${e.message}` : "the gate action failed unexpectedly, so it fails closed");
@@ -10012,7 +10481,7 @@ async function runBaselineCheck(step, deps, get) {
   step.log(`stored baseline: ${found ? "found" : "missing"}`);
   return 0;
 }
-var SHA_RE8 = /^[0-9a-f]{40}$/;
+var SHA_RE9 = /^[0-9a-f]{40}$/;
 var FIND_RUN_DEFAULT_MINUTES = 30;
 async function runFindRun(step, deps, get) {
   const fail3 = (text) => {
@@ -10022,7 +10491,7 @@ async function runFindRun(step, deps, get) {
     return 1;
   };
   const sha3 = get("sha");
-  if (sha3 === void 0 || !SHA_RE8.test(sha3)) return fail3("the sha input is not a 40-character lower-case commit sha, so the step fails closed");
+  if (sha3 === void 0 || !SHA_RE9.test(sha3)) return fail3("the sha input is not a 40-character lower-case commit sha, so the step fails closed");
   const layout = get("layout");
   if (layout !== "inline" && layout !== "central") return fail3("the layout input is not inline or central, so the step fails closed");
   const workflow = get("central-workflow");
@@ -10030,7 +10499,7 @@ async function runFindRun(step, deps, get) {
   if (layout === "inline" && (workflow !== void 0 || centralSha !== void 0)) return fail3("layout inline takes no central-workflow or central-sha, so the step fails closed");
   if (layout === "central" && (workflow === void 0 || centralSha === void 0)) return fail3("layout central needs both central-workflow and central-sha, so the step fails closed");
   if (workflow !== void 0 && (!PLAIN_REL_RE.test(workflow) || workflow.includes("@"))) return fail3("the central-workflow input is not a plain path of the central workflow, so the step fails closed");
-  if (centralSha !== void 0 && !SHA_RE8.test(centralSha)) return fail3("the central-sha input is not a 40-character lower-case commit sha, so the step fails closed");
+  if (centralSha !== void 0 && !SHA_RE9.test(centralSha)) return fail3("the central-sha input is not a 40-character lower-case commit sha, so the step fails closed");
   const minutes = get("timeout-minutes");
   if (minutes !== void 0 && !TIMEOUT_MINUTES_RE.test(minutes)) return fail3("the timeout-minutes input is not a whole number of minutes from 1 to 360, so the step fails closed");
   const token = get("github-token");
@@ -10065,6 +10534,47 @@ async function runFindRun(step, deps, get) {
   step.setOutput("run-url", found.url);
   step.log(`the gate passed for this commit in run ${found.runId}`);
   return 0;
+}
+async function runNightlyMode(step, deps, get) {
+  const fail3 = (text) => {
+    step.error(`nightly: ${text}`);
+    return 1;
+  };
+  const token = get("github-token");
+  if (token === void 0) return fail3("the github-token input is missing, so the step fails closed");
+  if (badKey(get("fp-key"))) return fail3(BAD_KEY);
+  let repo2;
+  try {
+    repo2 = repoOf(JSON.parse(readRunnerFile(step.env("GITHUB_EVENT_PATH"), "the event payload (GITHUB_EVENT_PATH)")), step.env("GITHUB_REPOSITORY") ?? "");
+  } catch (e) {
+    return fail3(e instanceof StepError ? `${e.message}, so the step fails closed` : "the event payload could not be read, so the step fails closed");
+  }
+  if (typeof repo2 === "string") return fail3(`${repo2}, so the step fails closed`);
+  const notes = [];
+  let done;
+  try {
+    const gh = (deps.nightly ?? githubAdapter)({ token, mask: () => void 0, notes });
+    done = await runNightly(gh, { repo: repo2, now: (deps.now ?? (() => /* @__PURE__ */ new Date()))(), blockFrom: get("block-from"), recorded: get("block-from-recorded"), key: get("fp-key") });
+  } catch {
+    return fail3("GitHub could not be reached or set up, so the step fails closed");
+  }
+  const summary = ["### pipegen nightly", ""];
+  for (const i of done.issues) {
+    step.log(`issue ${i.key}: #${i.number} ${i.action}`);
+    summary.push(`- \`${i.key}\`: issue #${i.number} ${i.action}`);
+  }
+  if (done.issues.length === 0) summary.push("- no issue to open or update tonight");
+  for (const n of [...notes, ...done.notes]) {
+    step.log(n);
+    summary.push(`- note: ${safeMarkdown(n, 300)}`);
+  }
+  for (const e of done.errors) {
+    step.error(e);
+    summary.push(`- error: ${safeMarkdown(e, 300)}`);
+  }
+  step.summary(`${summary.join("\n")}
+`);
+  return done.errors.length === 0 ? 0 : 1;
 }
 function defaultReviewed() {
   return GATE_VIEW;

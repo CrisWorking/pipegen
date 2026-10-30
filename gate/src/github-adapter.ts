@@ -11,11 +11,15 @@
 //   - every non-2xx answer is an error, except the documented 404 mappings (fileAt and rawFileAt → null, tagExists → false); a rate limit
 //     (429, or 403 with `x-ratelimit-remaining: 0` or `retry-after`) is an error with a note, never a wait;
 //   - every body is capped, on its declared length and on the bytes as they stream in; JSON is parsed once, and malformed JSON is an error;
+//   - writes (C7, nightly): the ONLY non-GET requests are `POST /repos/{o}/{r}/issues` and `PATCH /repos/{o}/{r}/issues/{n}`, built by createIssue and
+//     updateIssue alone (title, body and labels checked first); `send` refuses any other target. There is no method that writes a file, a workflow,
+//     a ref or a pull request, so the nightly job's issues: write token is all it ever uses;
 //   - pagination: each caller pages itself (C3, C4) within its own cap; the adapter refuses a page past that cap, and an artifact list cut
 //     short of its total_count.
 import type { GateGithub, RunQuery } from './baseline.js';
 import { MAX_ARTIFACT_BYTES } from './baseline.js';
 import { readZipEntry } from './artifacts.js';
+import type { NightlyGithub } from './nightly.js';
 
 export const API_ROOT = 'https://api.github.com';
 const API_HOST = 'api.github.com';
@@ -26,7 +30,7 @@ const MAX_JSON_BYTES = 32 * 1024 * 1024;
 /** Raw file contents (CODEOWNERS up to GitHub's 3 MiB). */
 const MAX_RAW_BYTES = 3 * 1024 * 1024;
 /** The page caps of the callers: pull files and reviews (integrity.ts, 3,000 files / 100), runs (baseline.ts MAX_RUN_PAGES). */
-const PAGE_CAP = { files: 30, reviews: 31, runs: 5, jobs: 5 } as const;
+const PAGE_CAP = { files: 30, reviews: 31, runs: 5, jobs: 5, pulls: 3, releases: 3, issues: 5 } as const;
 const MAX_PER_PAGE = 100;
 
 /** Blob storage hosts the artifact download redirects to. */
@@ -58,6 +62,14 @@ export interface AdapterOptions {
 export interface GateGithubAdapter extends GateGithub {
   downloadArtifactZip(owner: string, name: string, artifactId: number, maxBytes: number): Promise<Uint8Array>;
 }
+/** What the nightly mode needs on top: the real adapter is both (a test fake may implement either half). */
+export type FullGithubAdapter = GateGithubAdapter & NightlyGithub;
+
+/** GitHub's limits for an issue: a title of at most 256 characters, a body of at most 65,536. */
+const MAX_ISSUE_TITLE = 256;
+const MAX_ISSUE_BODY = 65_000;
+const LABEL_RE = /^[A-Za-z0-9][A-Za-z0-9:._-]{0,49}$/;
+const ISSUE_WRITE_RE = /^\/repos\/[A-Za-z0-9._-]+\/[A-Za-z0-9._-]+\/issues(?:\/[1-9][0-9]{0,14})?$/;
 
 // ---------- checked path parts ----------
 
@@ -119,7 +131,7 @@ async function readCapped(res: Response, max: number, what: string): Promise<Uin
 // ---------- the adapter ----------
 
 /** The real GateGithub over the REST API. Throws at once for an empty token. */
-export function githubAdapter(opts: AdapterOptions): GateGithubAdapter {
+export function githubAdapter(opts: AdapterOptions): FullGithubAdapter {
   const token = opts.token;
   if (typeof token !== 'string' || token === '' || /[\s\x00-\x1f]/.test(token)) throw new GitHubApiError('the github-token input is empty or not a token');
   const fetchFn = opts.fetch ?? globalThis.fetch;
@@ -128,15 +140,17 @@ export function githubAdapter(opts: AdapterOptions): GateGithubAdapter {
   const mask = (): void => { if (!masked) { masked = true; opts.mask?.(token); } };
 
   type NotFound = 'throw' | 'null';
-  async function call(path: string, o: { accept?: string; notFound?: NotFound; max?: number; raw?: boolean } = {}): Promise<{ status: 404 } | { status: 200; body: Uint8Array; res: Response }> {
+  async function call(path: string, o: { accept?: string; notFound?: NotFound; max?: number; raw?: boolean; write?: { method: 'POST' | 'PATCH'; body: string } } = {}): Promise<{ status: 404 } | { status: 200; body: Uint8Array; res: Response }> {
     mask();
     const url = `${API_ROOT}${path}`;
-    const what = `GET ${path.replace(/\?.*$/, '')}`;
+    const method = o.write?.method ?? 'GET';
+    const what = `${method} ${path.replace(/\?.*$/, '')}`;
     let res: Response;
     try {
       res = await fetchFn(url, {
-        method: 'GET', redirect: 'manual', signal: AbortSignal.timeout(timeoutMs),
-        headers: { authorization: `Bearer ${token}`, accept: o.accept ?? 'application/vnd.github+json', 'x-github-api-version': API_VERSION, 'user-agent': 'pipegen-gate' },
+        method, redirect: 'manual', signal: AbortSignal.timeout(timeoutMs),
+        headers: { authorization: `Bearer ${token}`, accept: o.accept ?? 'application/vnd.github+json', 'x-github-api-version': API_VERSION, 'user-agent': 'pipegen-gate', ...(o.write === undefined ? {} : { 'content-type': 'application/json' }) },
+        ...(o.write === undefined ? {} : { body: o.write.body }),
       });
     } catch {
       throw new GitHubApiError(`${what}: the request failed (network or timeout)`);
@@ -162,6 +176,18 @@ export function githubAdapter(opts: AdapterOptions): GateGithubAdapter {
     const r = await call(path, { notFound });
     if (r.status === 404) return null;
     try { return JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(r.body)) as unknown; } catch { throw new GitHubApiError(`GET ${path.replace(/\?.*$/, '')}: the answer is not JSON`); }
+  }
+
+  /** The one write path (C7): an issue is created or edited; any other target is refused before a request. The answer must carry the issue number. */
+  async function send(method: 'POST' | 'PATCH', path: string, body: Record<string, unknown>): Promise<unknown> {
+    if (!ISSUE_WRITE_RE.test(path) || (method === 'POST') !== /\/issues$/.test(path)) fail('a write that is not an issue');
+    const r = await call(path, { write: { method, body: JSON.stringify(body) } });
+    if (r.status === 404) throw new GitHubApiError(`${method} ${path}: not found`, { status: 404 });
+    let answer: unknown;
+    try { answer = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(r.body)) as unknown; } catch { throw new GitHubApiError(`${method} ${path}: the answer is not JSON`); }
+    const n = typeof answer === 'object' && answer !== null && Object.hasOwn(answer, 'number') ? (answer as { number: unknown }).number : undefined;
+    if (typeof n !== 'number' || !Number.isSafeInteger(n) || n <= 0) throw new GitHubApiError(`${method} ${path}: the answer has no issue number`);
+    return { number: n };
   }
 
   async function downloadArtifactZip(owner: string, name: string, artifactId: number, maxBytes: number): Promise<Uint8Array> {
@@ -241,6 +267,24 @@ export function githubAdapter(opts: AdapterOptions): GateGithubAdapter {
       try { return new TextDecoder('utf-8', { fatal: true }).decode(r.body); } catch { throw new GitHubApiError('the raw file is not UTF-8 text'); }
     },
     getCommit: async (owner, name, commit) => getJson(`${repo(owner, name)}/commits/${sha(commit)}`),
+    // ---- C7 (nightly): reads, then the two issue writes ----
+    listSetupPulls: async (owner, name, p, per) => getJson(`${repo(owner, name)}/pulls?${new URLSearchParams({ state: 'closed', head: `${owner}:pipegen/setup`, sort: 'updated', direction: 'desc', per_page: perPage(per), page: page(p, PAGE_CAP.pulls) }).toString()}`),
+    listReleases: async (owner, name, p, per) => getJson(`${repo(owner, name)}/releases?${new URLSearchParams({ per_page: perPage(per), page: page(p, PAGE_CAP.releases) }).toString()}`),
+    tagRef: async (owner, name, tag) => getJson(`${repo(owner, name)}/git/ref/tags/${refPath(tag)}`),
+    gitTag: async (owner, name, tagSha) => getJson(`${repo(owner, name)}/git/tags/${sha(tagSha)}`),
+    listIssues: async (owner, name, p, per) => getJson(`${repo(owner, name)}/issues?${new URLSearchParams({ state: 'all', creator: 'github-actions[bot]', sort: 'created', direction: 'desc', per_page: perPage(per), page: page(p, PAGE_CAP.issues) }).toString()}`),
+    createIssue: async (owner, name, issue) => {
+      const labels = issue.labels ?? [];
+      if (typeof issue.title !== 'string' || issue.title === '' || issue.title.length > MAX_ISSUE_TITLE) fail('an issue title that is empty or over 256 characters');
+      if (typeof issue.body !== 'string' || issue.body.length > MAX_ISSUE_BODY) fail('an issue body over the size cap');
+      if (!Array.isArray(labels) || labels.length > 5 || labels.some((l) => typeof l !== 'string' || !LABEL_RE.test(l))) fail('a label that is not a plain label name');
+      return send('POST', `${repo(owner, name)}/issues`, { title: issue.title, body: issue.body, ...(labels.length === 0 ? {} : { labels }) });
+    },
+    updateIssue: async (owner, name, n, issue) => {
+      if (typeof issue.title !== 'string' || issue.title === '' || issue.title.length > MAX_ISSUE_TITLE) fail('an issue title that is empty or over 256 characters');
+      if (typeof issue.body !== 'string' || issue.body.length > MAX_ISSUE_BODY) fail('an issue body over the size cap');
+      return send('PATCH', `${repo(owner, name)}/issues/${num(n)}`, { title: issue.title, body: issue.body });
+    },
     collaboratorPermission: async (owner, name, login) => {
       if (typeof login !== 'string' || !LOGIN_RE.test(login)) fail('a login that is not a GitHub login');
       return getJson(`${repo(owner, name)}/collaborators/${encodeURIComponent(login)}/permission`);

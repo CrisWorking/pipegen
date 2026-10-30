@@ -796,7 +796,7 @@ export const RENDERER_INPUTS: Readonly<Record<string, Readonly<Record<string, Re
     raw: SCRUB_RAW,
     out: SCRUB_OUT,
     // the fingerprint key: the scrub hashes with it, the gate checks the baseline's MAC with it (ruling B6)
-    'fp-key': modeInput(['scrub', 'gate', 'baseline-check'], /^\$\{\{ secrets\.PIPEGEN_FP_KEY \}\}$/, '${{ secrets.PIPEGEN_FP_KEY }}'),
+    'fp-key': modeInput(['scrub', 'gate', 'baseline-check', 'nightly'], /^\$\{\{ secrets\.PIPEGEN_FP_KEY \}\}$/, '${{ secrets.PIPEGEN_FP_KEY }}'),
     // gate (ruling B3)
     jobs: modeInput(['gate'], /^\$\{\{ toJSON\(needs\) \}\}$/, '${{ toJSON(needs) }}'),
     'job-list': literalInput(['gate'], jobListLiteralProblem, 'a job list literal (a JSON list of entries)'),
@@ -821,8 +821,7 @@ export const RENDERER_INPUTS: Readonly<Record<string, Readonly<Record<string, Re
     // where the gate runs (C8 fix round 1): `inline` (the gate job is in pipegen.yml) or `central` (the per-project central workflow); the renderer
     // knows it from the draft and the referee checks it. find-run never guesses it from the repository's visibility.
     layout: modeInput(['find-run'], /^(?:inline|central)$/, 'inline or central'),
-    // nightly
-    'merged-at': modeInput(['nightly'], /^\d{4}-(?:0[1-9]|1[0-2])-(?:0[1-9]|[12]\d|3[01])(?:T\d{2}:\d{2}:\d{2}(?:\.\d{1,3})?Z)?$/, 'a date or an ISO time in UTC'),
+    // nightly (C7): block-from, block-from-recorded, github-token and fp-key (to verify the baseline) above; the setup merge time is read from the API, which proves it
   },
 } satisfies Record<string, Record<string, RendererInput>>);
 

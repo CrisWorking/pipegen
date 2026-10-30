@@ -171,7 +171,7 @@ describe('RENDERER_INPUTS: the gate action, per mode (ruling B3)', () => {
     'protected-paths': '[".github/workflows/**","docs/*.md"]', 'block-from-recorded': '2026-11-01', 'block-from': '${{ vars.PIPEGEN_BLOCK_FROM }}', [GH_IN]: GH, [FP_IN]: sref('PIPEGEN_FP_KEY'),
   };
   const findRunWith: Record<string, string> = { mode: 'find-run', layout: 'central', sha: '${{ github.sha }}', 'central-workflow': 'acme/pipelines/.github/workflows/acme--merge.yml', 'central-sha': 'a'.repeat(40), 'timeout-minutes': '30', [GH_IN]: GH };
-  const nightlyWith: Record<string, string> = { mode: 'nightly', [GH_IN]: GH, 'block-from': '${{ vars.PIPEGEN_BLOCK_FROM }}', 'block-from-recorded': '2026-11-01', 'merged-at': '2026-10-29T12:00:00Z' };
+  const nightlyWith: Record<string, string> = { mode: 'nightly', [GH_IN]: GH, 'block-from': '${{ vars.PIPEGEN_BLOCK_FROM }}', 'block-from-recorded': '2026-11-01', [FP_IN]: sref('PIPEGEN_FP_KEY') };
   const problems = (w: Record<string, string>): string[] => rendererInputProblems(U, w, w);
   const SCRUB_SAMPLE_FOR_BASELINE: Record<string, string> = { artifact: 'pipegen-out-secrets', tool: 'gitleaks', format: 'sarif', raw: '${{ runner.temp }}/pipegen-raw/pipegen-out-secrets/x.sarif', out: '${{ runner.temp }}/pipegen-out/pipegen-out-secrets/x.sarif' };
 
@@ -212,9 +212,10 @@ describe('RENDERER_INPUTS: the gate action, per mode (ruling B3)', () => {
     for (const bad of ['', 'main', 'A'.repeat(40), 'a'.repeat(39), '${{ github.sha }}']) expect(problems({ ...findRunWith, 'central-sha': bad }).length, bad).toBeGreaterThan(0);
   });
 
-  it('RENDERER_INPUTS gate, mode nightly: github-token, block-from, block-from-recorded, merged-at', () => {
+  it('RENDERER_INPUTS gate, mode nightly: github-token, block-from, block-from-recorded and fp-key (C7); merged-at is gone', () => {
     expect(problems(nightlyWith)).toEqual([]);
-    for (const bad of ['', 'now', '2026-10-29T12:00:00', '${{ github.event.head_commit.timestamp }}', '2026-10-29 12:00']) expect(problems({ ...nightlyWith, 'merged-at': bad }).length, bad).toBeGreaterThan(0);
+    expect(problems({ ...nightlyWith, 'merged-at': '2026-10-29T12:00:00Z' }).some((x) => /merged-at/.test(x))).toBe(true);
+    for (const bad of [GH, sref('OTHER'), `${sref('PIPEGEN_FP_KEY')} `, 'k', '']) expect(problems({ ...nightlyWith, [FP_IN]: bad }).length, bad).toBeGreaterThan(0);
   });
 
   // C3: the gate action's mode for the job baseline-check
@@ -229,7 +230,7 @@ describe('RENDERER_INPUTS: the gate action, per mode (ruling B3)', () => {
     const others: Record<string, string> = {
       jobs: '${{ toJSON(needs) }}', 'job-list': list, 'not-proven': '[]', skipped: '[]', policy: '{"block":["critical","high"],"warn":["medium"]}', 'protected-paths': '[".github/workflows/**"]',
       'block-from': '${{ vars.PIPEGEN_BLOCK_FROM }}', 'block-from-recorded': '2026-11-01', layout: 'central', sha: '${{ github.sha }}', 'central-workflow': 'acme/pipelines/.github/workflows/acme--merge.yml', 'central-sha': 'a'.repeat(40), 'timeout-minutes': '30',
-      'merged-at': '2026-10-29T12:00:00Z', ...SCRUB_SAMPLE_FOR_BASELINE,
+      ...SCRUB_SAMPLE_FOR_BASELINE,
     };
     for (const [input, value] of Object.entries(others)) {
       const pr = problems({ ...baselineWith, [input]: value });
@@ -239,7 +240,7 @@ describe('RENDERER_INPUTS: the gate action, per mode (ruling B3)', () => {
   it('RENDERER_INPUTS gate: baseline-check is one of the modes, and the other modes still refuse its sole inputs where they did', () => {
     expect(problems({ ...gateWith, mode: 'baseline-check' }).length).toBeGreaterThan(0);   // gate inputs under baseline-check
     expect(problems({ ...findRunWith, [FP_IN]: sref('PIPEGEN_FP_KEY') }).some((x) => /fp-key/.test(x))).toBe(true);   // fp-key still not under find-run
-    expect(problems({ ...nightlyWith, [FP_IN]: sref('PIPEGEN_FP_KEY') }).some((x) => /fp-key/.test(x))).toBe(true);   // nor under nightly
+    expect(problems({ ...nightlyWith, [FP_IN]: sref('PIPEGEN_FP_KEY') }).some((x) => /fp-key/.test(x))).toBe(false);   // nightly verifies the baseline too (C7)
     expect(GATE_MODES).toContain('baseline-check');
   });
 
@@ -251,7 +252,6 @@ describe('RENDERER_INPUTS: the gate action, per mode (ruling B3)', () => {
     const own: Record<string, string[]> = {
       gate: ['jobs', 'job-list', 'not-proven', 'skipped', 'policy', 'protected-paths'],
       'find-run': ['layout', 'sha', 'central-workflow', 'central-sha', 'timeout-minutes'],
-      nightly: ['merged-at'],
       scrub: ['artifact', 'tool', 'format', 'raw', 'out'],
     };
     const all: Record<string, Record<string, string>> = { gate: gateWith, 'find-run': findRunWith, nightly: nightlyWith };
@@ -266,10 +266,10 @@ describe('RENDERER_INPUTS: the gate action, per mode (ruling B3)', () => {
         }
       }
     }
-    // block-from and block-from-recorded: gate and nightly, not find-run; fp-key: scrub and gate, not nightly or find-run; the workflow credential is never a scrub input
+    // block-from and block-from-recorded: gate and nightly, not find-run; fp-key: scrub, gate, baseline-check and nightly, not find-run; the workflow credential is never a scrub input
     expect(problems({ ...findRunWith, 'block-from': '${{ vars.PIPEGEN_BLOCK_FROM }}' }).some((x) => /block-from/.test(x))).toBe(true);
     expect(problems({ ...findRunWith, 'block-from-recorded': '2026-11-01' }).some((x) => /block-from-recorded/.test(x))).toBe(true);
-    expect(problems({ ...nightlyWith, [FP_IN]: sref('PIPEGEN_FP_KEY') }).some((x) => /fp-key/.test(x))).toBe(true);
+    expect(problems({ ...nightlyWith, [FP_IN]: sref('PIPEGEN_FP_KEY') }).some((x) => /fp-key/.test(x))).toBe(false);
     expect(problems({ ...findRunWith, [FP_IN]: sref('PIPEGEN_FP_KEY') }).some((x) => /fp-key/.test(x))).toBe(true);
     const scrubW = { mode: 'scrub', [GH_IN]: GH };
     expect(problems(scrubW).some((x) => /github-token/.test(x))).toBe(true);

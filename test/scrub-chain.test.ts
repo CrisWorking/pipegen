@@ -191,9 +191,9 @@ describe('RENDERER_INPUTS: the gate action in scrub mode (ruling B1 part 2)', ()
       const all = { ...good, mode: 'gate' };
       expect(rendererInputProblems(GATE_USES, { [k]: good[k] as string }, all), k).not.toEqual([]);
     }
-    // the key is also a gate input (it checks the baseline's MAC, ruling B6): allowed under mode gate, refused under the other modes
+    // the key is also a gate input (it checks the baseline's MAC, ruling B6): allowed under mode gate, refused under find-run (nightly verifies the baseline too since C7)
     expect(rendererInputProblems(GATE_USES, { 'fp-key': good['fp-key'] as string }, { ...good, mode: 'gate' }), 'fp-key under gate').toEqual([]);
-    for (const mode of ['nightly', 'find-run']) expect(rendererInputProblems(GATE_USES, { 'fp-key': good['fp-key'] as string }, { ...good, mode }), `fp-key under ${mode}`).not.toEqual([]);
+    for (const mode of ['find-run']) expect(rendererInputProblems(GATE_USES, { 'fp-key': good['fp-key'] as string }, { ...good, mode }), `fp-key under ${mode}`).not.toEqual([]);
     expect(rendererInputProblems(GATE_USES, { mode: 'gate' }, { mode: 'gate' })).toEqual([]);
   });
 });
