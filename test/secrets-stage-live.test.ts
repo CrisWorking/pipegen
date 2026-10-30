@@ -289,6 +289,28 @@ describe.skipIf(!live)('C1c: the staged secrets scan, live with the real binarie
     expect(scan('betterleaks', alone).findings.filter((f) => f.ruleId === `${SEC}supabase-project-api-key`)).toEqual([]);
   }, 180_000);
 
+  it('betterleaks, C2 Part 0 (review-C1c-r1 n1, the reviewer\'s mid.json): two Supabase keys on one 160 KB line, the URL and the first in piece 1, the second only in the whole copy: both are reported on line 2', () => {
+    const alnum = (seed: string, n: number, lower = false): string => {
+      let out = '';
+      for (let i = 0; out.length < n; i++) out += createHash('sha256').update(`${seed}${i}`).digest('base64').replace(/[^A-Za-z0-9]/g, '');
+      return lower ? out.toLowerCase().slice(0, n) : out.slice(0, n);
+    };
+    const url = `https://${alnum('mid-proj', 20, true)}.supa${'base'}.co`;
+    const keyA = `sb_${'secret'}_${alnum('mid-a', 31)}`;
+    const keyB = `sb_${'secret'}_${alnum('mid-b', 31)}`;
+    const pad = (n: number): string => Array.from({ length: n }, (_, i) => `w${String(i).padStart(5, '0')}`).join(' ');
+    const text = `{"url": "${url}",\n"a": "${keyA}", "pad": "${pad(13800)}", "b": "${keyB}", "pad2": "${pad(9000)}"}\n`;
+    const ws = makeTempDir();
+    writeIn(ws, 'mid.json', text);
+    const direct = JSON.parse(runEntry('betterleaks', bins.betterleaks as string, ws)) as { runs: { results: { ruleId: string; locations: { physicalLocation: { region: { startLine: number } } }[] }[] }[] };
+    const want = direct.runs[0]?.results.filter((r) => r.ruleId === 'supabase-project-api-key').map((r) => r.locations[0]?.physicalLocation.region.startLine);
+    expect(want).toEqual([2, 2]);   // the control: direct, both keys
+    const { findings } = scan('betterleaks', ws);
+    const got = findings.filter((f) => f.ruleId === `${SEC}supabase-project-api-key`);
+    expect(got.map((f) => [f.file, f.line])).toEqual([['mid.json', 2], ['mid.json', 2]]);
+    expect(new Set(got.map((f) => f.fingerprint)).size).toBe(2);
+  }, 180_000);
+
   it('the staged files hold the original bytes behind the prefix (sanity of the live setup)', () => {
     const ws = makeTempDir();
     writeIn(ws, 'a.js', line());

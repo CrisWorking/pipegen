@@ -496,6 +496,21 @@ describe('scrub with a stage: findings map back to the original file and line; t
       expect(nc.map((f) => [f.ruleId, f.file, f.line, f.endLine])).toEqual([[`${SEC}not-scanned`, 'big.js', 1, 3750]]);
     });
 
+    it(`${tool}: C2 Part 0 (review-C1c-r1 n1): two keys of one rule on one long line, the first also in a piece, the second only in the whole copy: both are kept (the whole copy is deduped by byte range, never by line)`, () => {
+      const pad = (n: number): string => Array.from({ length: n }, (_, i) => `w${String(i).padStart(5, '0')}`).join(' ');
+      const text = `{"url": "x",\n"a": "${KEY_A}", "pad": "${pad(13800)}", "b": "${KEY_B}", "pad2": "${pad(9000)}"}\n`;
+      const { stage } = setup({ 'mid.json': text });
+      const es = byPath(stage, 'mid.json');
+      const whole = es.find((e) => e.piece === 0) as Entry;
+      const first = es.find((e) => e.piece === 1) as Entry;
+      expect(readFileSync(join(stage, 'files', first.name)).includes(KEY_A)).toBe(true);
+      expect(readFileSync(join(stage, 'files', first.name)).includes(KEY_B)).toBe(false);
+      const hits = [...canaries(tool, stage), hitFor(tool, stage, first.name, KEY_A), hitFor(tool, stage, whole.name, KEY_A), hitFor(tool, stage, whole.name, KEY_B)];
+      const { back } = okFindings(scrub(tool, stage, sarif(tool, hits)));
+      expect(back.findings.map((f) => [f.file, f.line, f.ruleId]).sort()).toEqual([['mid.json', 2, `${SEC}${STRIPE_RULE}`], ['mid.json', 2, `${SEC}${STRIPE_RULE}`]]);
+      expect(new Set(back.findings.map((f) => f.fingerprint)).size).toBe(2);
+    });
+
     it(`${tool}: two rules on the same bytes stay two findings (the dedupe key holds the rule)`, () => {
       const { stage } = setup({ 'a.js': `stripe = "${KEY_A}"\n` });
       const a = one(stage, 'a.js');
@@ -523,7 +538,7 @@ describe('scrub with a stage: findings map back to the original file and line; t
     });
   }
 
-  it('gitleaks in the whole copy of a large file (measured live): past its first chunk the +1 column shift is gone, so the canary there counts at either column; a finding only the whole copy has takes the line form; one a piece also has is kept once, from the piece', () => {
+  it('gitleaks in the whole copy of a large file (measured live): on the first line of each chunk the +1 column shift is gone, so the canary there counts at either column; a finding only the whole copy has takes the line form; one a piece also has is kept once, from the piece', () => {
     const rows = Array.from({ length: 3750 }, (_, i) => `${String(i + 1).padStart(6, '0')}${'x'.repeat(73)}\n`);
     rows[2999] = `stripe = "${KEY_A}"\n`;
     rows[99] = `stripe = "${KEY_B}"\n`;
@@ -538,6 +553,27 @@ describe('scrub with a stage: findings map back to the original file and line; t
     const both = [unshift(hitFor('gitleaks', stage, whole.name, KEY_B)), hitFor('gitleaks', stage, piece.name, KEY_B)];
     const f = okFindings(scrub('gitleaks', stage, sarif('gitleaks', [...cs, wholeOnly, ...both]))).back.findings;
     expect(f.map((x) => [x.line, x.fpBy]).sort()).toEqual([[100, 'region'], [3000, 'line']]);
+  });
+
+  it('gitleaks, C2 Part 0 (review-C1c-r1 n1): a whole-copy finding is dropped only when one of its two column readings is a piece finding\'s byte range; another key of the same rule on the same line is kept, in the line form', () => {
+    const pad = (n: number): string => Array.from({ length: n }, (_, i) => `w${String(i).padStart(5, '0')}`).join(' ');
+    const text = `{"url": "x",\n"a": "${KEY_A}", "pad": "${pad(13800)}", "b": "${KEY_B}", "pad2": "${pad(9000)}"}\n`;
+    const { stage } = setup({ 'mid.json': text });
+    const es = byPath(stage, 'mid.json');
+    const whole = es.find((e) => e.piece === 0) as Entry;
+    const first = es.find((e) => e.piece === 1) as Entry;
+    const unshift = (h: Hit): Hit => ({ ...h, startColumn: h.startColumn - 1, endColumn: h.endColumn - 1 });
+    const cs = canaries('gitleaks', stage);
+    for (const read of [(h: Hit): Hit => h, unshift]) {
+      const hits = [...cs, hitFor('gitleaks', stage, first.name, KEY_A), read(hitFor('gitleaks', stage, whole.name, KEY_A)), read(hitFor('gitleaks', stage, whole.name, KEY_B))];
+      const f = okFindings(scrub('gitleaks', stage, sarif('gitleaks', hits))).back.findings;
+      expect(f.map((x) => [x.line, x.fpBy]).sort()).toEqual([[2, 'line'], [2, 'region']]);
+    }
+    // a whole-copy finding one byte off a piece's range at both readings is not that piece's finding: kept
+    const off = hitFor('gitleaks', stage, whole.name, KEY_A);
+    const shifted = { ...off, startColumn: off.startColumn + 2, endColumn: off.endColumn + 2 };
+    const f = okFindings(scrub('gitleaks', stage, sarif('gitleaks', [...cs, hitFor('gitleaks', stage, first.name, KEY_A), shifted]))).back.findings;
+    expect(f).toHaveLength(2);
   });
 
   it('a stage is only for the secrets tools, and the step entry (scrubFile) refuses a secrets result without one', () => {

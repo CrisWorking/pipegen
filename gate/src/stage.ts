@@ -33,9 +33,10 @@ export const MAX_STAGE_FILES = 200_000;
 export const MAX_STAGE_BYTES = 1024 * 1024 * 1024;
 /**
  * At most this many bytes written to the stage folder in all (fix round 1, I1): every file once, a large file also as its overlapping
- * pieces (at most about 1.23 times its size: a piece of PIECE_BYTES advances by PIECE_BYTES minus the overlap). So with the original-size
- * cap of 1 GiB the staged total is about 2.23 GiB at most for ordinary files; this cap also stops a file whose line ends make the pieces
- * advance slowly. Above it the step fails and removes what it wrote.
+ * pieces. The pieces write about 1.23 times the file for short lines (a piece of PIECE_BYTES advances by PIECE_BYTES minus the overlap),
+ * but cuts fall on line ends, so with long regular lines a piece advances less: measured worst case (review-C1c-r1 n2) 2.31 times the
+ * file at lines of about 46 KB (minified bundles), so up to about 3.3 times with the whole copy. The effective checkout cap for such
+ * content is therefore about 750 MB, not 1 GiB; above it the step fails closed (a tool error) and removes what it wrote.
  */
 export const MAX_STAGED_BYTES = 2.5 * 1024 * 1024 * 1024;
 /** The manifest is read back by the scrub; a bigger one is refused. */
@@ -361,8 +362,9 @@ export function readStage(stage: string): Stage {
 export const NOT_SCANNED_RULE = 'secret:not-scanned';
 /**
  * gitleaks 8.30.1 counts a column one too high on every line after the first of the CHUNK it reads (fingerprint.ts COLUMN_RULES), and it
- * reads a file in 100,000-byte chunks cut at blank lines. A piece fits one chunk, so the rule holds; in the whole copy of a large file a
- * finding's chunk is not known (measured: its canary, the first line after a blank-line cut, comes without the shift).
+ * reads a file in 100,000-byte chunks cut at blank lines: on the FIRST line of each chunk (the line after a blank-line cut) the +1 is
+ * dropped (measured, review-C1c-r1 n3). A piece fits one chunk, so the rule holds there; in the whole copy of a large file a finding's
+ * chunk is not known, so no gitleaks column there is trusted: both readings are tried, and a region is never read from them.
  */
 const shiftUnreliable = (tool: string, e: ManifestEntry): boolean => tool === 'gitleaks' && e.stagedSize > SCAN_CHUNK_SAFE_BYTES;
 const CANARY_RULE_ID = `secret:${CANARY_RULE}`;
@@ -434,8 +436,8 @@ export function applyStage(parsed: readonly ParsedFinding[], stage: Stage, tool:
     if (e === undefined) throw new StageError('a finding names a file the stage step did not write, so it can not be mapped back to the checkout');
     if (f.ruleId === CANARY_RULE_ID && f.line === e.canaryLine && (f.endLine ?? f.line) === e.canaryLine) {
       const span = regionSpan(stage.files, f, cache);
-      // gitleaks past its first chunk (the whole copy of a large file, measured live, fix round 1): no +1 column shift there, so the
-      // canary line's own columns are read as they are written
+      // gitleaks in the whole copy of a large file (measured live, fix round 1): the canary line follows a blank-line cut, so it may be
+      // the first line of a chunk, where gitleaks drops its +1; its columns count at either reading
       const unshifted = shiftUnreliable(tool, e) && f.startColumn !== undefined && f.endColumn !== undefined
         ? regionSpan(stage.files, { ...f, startColumn: f.startColumn + 1, endColumn: f.endColumn + 1 }, cache) : undefined;
       if ((span.ok && span.bytes.toString('latin1') === e.canary) || (unshifted?.ok === true && unshifted.bytes.toString('latin1') === e.canary)) {
@@ -445,9 +447,10 @@ export function applyStage(parsed: readonly ParsedFinding[], stage: Stage, tool:
     }
     real.push({ f, e });
   }
-  // the pieces first, then the whole copies: a finding a piece also reports (same rule, same original lines) is kept once, from the piece
+  // the pieces first, then the whole copies: a whole-copy finding a piece also reports (same rule, same ORIGINAL BYTE RANGE) is kept once,
+  // from the piece. Never by line: two keys of one rule on one long line are two findings (review-C1c-r1 n1).
   real.sort((a, b) => (a.e.piece === 0 ? 1 : 0) - (b.e.piece === 0 ? 1 : 0));
-  const pieceLines = new Set<string>();
+  const pieceKeys = new Set<string>();
   const regions = new Map<ParsedFinding, RegionResult>();
   const hashes = new Map<ParsedFinding, string>();
   const out: ParsedFinding[] = [];
@@ -462,16 +465,20 @@ export function applyStage(parsed: readonly ParsedFinding[], stage: Stage, tool:
     const whole = f.line === undefined;
     const key = whole ? `${f.ruleId}\0${e.path}\0whole`
       : span.ok ? `${f.ruleId}\0${e.path}\0${at(span.from)}\0${at(span.to)}` : `${f.ruleId}\0${e.path}\0${e.name}\0${f.line}\0${f.startColumn}\0${f.endLine}\0${f.endColumn}`;
-    const lineKey = `${f.ruleId}\0${e.path}\0${line}\0${endLine}`;
-    if (seen.has(key) || (e.piece === 0 && !whole && pieceLines.has(lineKey))) continue;
+    // gitleaks columns in a whole copy may be read either way (shiftUnreliable): the other reading (+1 on both columns) is that of a
+    // first line of a chunk. Dropped only when that reading is exactly a piece finding's byte range; otherwise kept, in the line form.
+    const alt = !whole && shiftUnreliable(tool, e) && f.startColumn !== undefined && f.endColumn !== undefined
+      ? regionSpan(stage.files, { ...f, startColumn: f.startColumn + 1, endColumn: f.endColumn + 1 }, cache) : undefined;
+    const altKey = alt?.ok === true ? `${f.ruleId}\0${e.path}\0${at(alt.from)}\0${at(alt.to)}` : undefined;
+    if (seen.has(key) || (altKey !== undefined && pieceKeys.has(altKey))) continue;
     seen.add(key);
-    if (e.piece !== 0) pieceLines.add(lineKey);
+    if (e.piece !== 0 && !whole) pieceKeys.add(key);
     const { startColumn: _s, endColumn: _e, ...rest } = f;
     const mapped: ParsedFinding = { ...rest, ...pathFields(e), ...(line === undefined ? {} : { line }), ...(endLine === undefined ? {} : { endLine }) };
     if (mapped.uriId === undefined) delete mapped.uriId;
     if (whole) hashes.set(mapped, e.sha256);
     // a gitleaks finding only the whole copy of a large file has: its columns are not reliable there, so the line form (fail closed)
-    else if (shiftUnreliable(tool, e)) regions.set(mapped, { ok: false, reason: 'gitleaks columns are not reliable past its first chunk of a large file' });
+    else if (shiftUnreliable(tool, e)) regions.set(mapped, { ok: false, reason: 'gitleaks columns are not reliable in the whole copy of a large file (its +1 is dropped on the first line of each chunk)' });
     else regions.set(mapped, span.ok ? { ok: true, bytes: span.bytes } : { ok: false, reason: span.reason });
     out.push(mapped);
   }

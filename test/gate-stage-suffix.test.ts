@@ -5,6 +5,7 @@
 import { readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
 import { PIECE_OVERLAP_BYTES } from '../src/ai/scan-staging.js';
+import { ensurePinnedBinary } from '../src/engine/linters.js';
 import { LONGEST_BOUNDED_MATCH, PATH_FILTERS, PATH_RULES, PINNED_CONFIGS, UNBOUNDED_RULES } from '../gate/src/generated/secrets-path-rules.js';
 import { STAGE_SUFFIXES, STAGED_NAME_RE, suffixFor } from '../gate/src/stage.js';
 import { extract, fetchPinned, GENERATED_PATH, KNOWN_PATH_RULES, maxMatchBytes, render } from '../scripts/secrets-path-rules.js';
@@ -135,4 +136,17 @@ describe('scripts/secrets-path-rules.ts', () => {
     for (const c of PINNED_CONFIGS) texts[c.tool] = await fetchPinned(c);
     expect(render(extract(texts))).toBe(readFileSync(GENERATED_PATH, 'utf8'));
   }, 120_000);
+
+  // C2 Part 0 (review-C1c m4): the proof reads the configs at the release tags; the binaries the scan really runs must hold exactly
+  // those bytes as their built-in default (go:embed), or the proof is about some other config. Protects the premise on a binary upgrade.
+  it.skipIf(!live)('live: each pinned binary embeds, byte for byte, the default config the table was built from', async () => {
+    for (const c of PINNED_CONFIGS) {
+      const text = await fetchPinned(c);
+      const bin = readFileSync(await ensurePinnedBinary(c.tool));
+      expect(bin.includes(Buffer.from(text, 'utf8')), `${c.tool} ${c.version} embeds its pinned config`).toBe(true);
+      // and once only: one built-in config, not this one next to another
+      const at = bin.indexOf(Buffer.from(text, 'utf8'));
+      expect(bin.indexOf(Buffer.from(text, 'utf8'), at + 1), `${c.tool}: one embedded copy`).toBe(-1);
+    }
+  }, 600_000);
 });
