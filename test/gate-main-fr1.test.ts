@@ -1,6 +1,6 @@
 // C5b fix round 1 (review-C5b.md, rulings in task-C5b-fix-round-1.md): the entry always runs, and every guard the brief names has a test
 // that fails without it. The reviewer's probes (tmp-C5b-review/copy/test/probe-c5b.test.ts, P1-P15) are regression tests here. Written first.
-import { existsSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { parse } from 'yaml';
@@ -369,3 +369,37 @@ describe('fix round 1, minor 8: action.yml parity beyond the inputs', () => {
   });
 });
 
+
+// ---------- C5b fix round 2 (review-C5b-r1 r1-2, r1-3): no stale result survives ----------
+describe('fix round 2: no stale result survives a late failure', () => {
+  it('r1-3: result.json can not be written → the baseline and the marker are removed too (block, exit 1)', async () => {
+    const w = pushWorld(CLEAN());
+    const r = runner(w.inputs, { event: w.event, sha: w.sha, payload: w.payload });
+    mkdirSync(join(r.temp, 'pipegen-gate', 'result.json'), { recursive: true });
+    const x = await go(w.inputs, { w, r });
+    expect(x.code).toBe(1);
+    expect(x.outputs.result).toBe('block');
+    expect(existsSync(gateFile(r, 'baseline.json'))).toBe(false);
+    expect(existsSync(gateFile(r, 'marker.json'))).toBe(false);
+  });
+  it('r1-2: the late replacement works by rename: result.json is a block document (no unlink window)', async () => {
+    const w = pushWorld(CLEAN());
+    const x = await go(w.inputs, { w, env: (e) => { delete e.GITHUB_OUTPUT; } });
+    expect(x.code).toBe(1);
+    expect(readJson(gateFile(x.r, 'result.json'))).toMatchObject({ result: 'block' });
+    expect(existsSync(gateFile(x.r, 'baseline.json'))).toBe(false);
+  });
+  it('r1-2: when nothing in the gate folder can be changed any more, the step exits with the distinct status 2 and says the result may be stale', async () => {
+    const w = pushWorld(CLEAN());
+    const r = runner(w.inputs, { event: w.event, sha: w.sha, payload: w.payload });
+    const dir = join(r.temp, 'pipegen-gate');
+    // the folder turns read-only the moment the action reads GITHUB_OUTPUT (after result.json, the baseline and the marker were written)
+    const env = new Proxy(r.env, { get(t, k) { if (k === 'GITHUB_OUTPUT' && existsSync(join(dir, 'result.json'))) { chmodSync(dir, 0o555); return undefined; } return Reflect.get(t, k); } });
+    const chunks: string[] = [];
+    const gh = new FakeGh(w);
+    const code = await main({ env, now: () => NOW, reviewed: () => VIEW, write: (t) => { chunks.push(t); }, github: () => gh });
+    chmodSync(dir, 0o755);
+    expect(code).toBe(2);
+    expect(chunks.join('')).toMatch(/::error::.*result file may be stale/);
+  });
+});

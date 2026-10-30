@@ -674,7 +674,10 @@ function judgeGateSteps(fc: FileCtx, id: string, where: string, j: Obj, judged: 
   }
   const g = gates[0] as Judged;
   // fix round 1 (ruling 1): the result upload right after the gate step, so the job can not succeed without the gate's result
-  for (const problem of gateResultUploadProblems(judged.map((x) => x.step))) bad('not-gate-readable', `${where}: ${problem}`);
+  // fix round 2 (review-C5b-r1 r1-1): with the gate step found here, never searched again; and no id on it, so the job rules (which know the
+  // gate step by content, without an id) and this judge can never disagree about which step it is
+  if (g.step.id !== undefined) bad('not-gate-readable', `${where}: the gate step has an id, which pipegen never gives it; the job rules know the gate step by its content, so an id would make them miss it.`);
+  for (const problem of gateResultUploadProblems(judged.map((x) => x.step), judged.indexOf(g))) bad('not-gate-readable', `${where}: ${problem}`);
   const needs = needsList(j.needs).filter((x): x is string => typeof x === 'string');
   if (g.step.with?.jobs === undefined) bad('not-gate-readable', `${where}: the gate step has no jobs input, so it would not see the results of the jobs it needs.`);
   const literal = g.step.with?.['job-list'];

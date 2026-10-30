@@ -342,8 +342,10 @@ export function gateUploadProblems(steps: readonly RenderedStep[], jobId: string
  * `if: always()` and no continue-on-error, so the job can never succeed without its result file (a gate step that ran nothing would
  * leave none, and the upload then fails the job). Problems, empty when held; for the job `gate` only (the referee: not-gate-readable).
  */
-export function gateResultUploadProblems(steps: readonly RenderedStep[]): string[] {
-  const at = steps.findIndex(isGateDecideStep);
+export function gateResultUploadProblems(steps: readonly RenderedStep[], gateIndex?: number): string[] {
+  // fix round 2 (review-C5b-r1 r1-1): the referee passes the index of the gate step it judged, so a step this rule's own search would
+  // miss (one with an id) can not switch the rule off; the referee also refuses an id on the gate step
+  const at = gateIndex ?? steps.findIndex(isGateDecideStep);
   if (at < 0) return [];   // no gate step: judged elsewhere (the job gate runs the gate action exactly once)
   const next = steps[at + 1];
   if (next === undefined || gateUploadNameOf(next) === undefined) return [`The gate job must upload ${GATE_RESULT_ARTIFACT} right after the gate step (if: always()), so it can not succeed without the gate's result.`];

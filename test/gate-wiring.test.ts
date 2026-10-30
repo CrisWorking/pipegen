@@ -823,3 +823,36 @@ describe('C5b fix round 1: the required result upload and the optional uploads t
     }
   });
 });
+
+// ---------- C5b fix round 2 (review-C5b-r1 r1-1): the gate step is found once ----------
+import { gateResultUploadProblems } from '../src/engine/job-rules.js';
+
+describe('C5b fix round 2: the referee judges the gate step it found; an id on it is refused', () => {
+  const specs = [gitleaksSpec()];
+  const d = draftOf(specs, [needOf('secrets')]);
+  const entries = gateJobList(d);
+  const g = block(specs[0] as StepSpec);
+  const scan = (): Record<string, Job> => ({ [SEC]: job(dedupeJobSteps([...prelude(), ...g.steps], { id: 'secrets', scans: facts(g) }), { outputs: jobOutputsFor(g.steps) }) });
+  const GATE_PERM = { contents: 'read', actions: 'read', 'pull-requests': 'read' };
+  const gateJob = (steps: RenderedStep[]): Job => job(steps, { name: 'gate', if: 'always()', needs: entries.map((e) => e.job), permissions: GATE_PERM });
+  const withId = (): RenderedStep => ({ ...renderGateStep(GATE, entries), id: 'pipegen-gate' });
+
+  it('a gate step with an id and no uploads → not-gate-readable (the id, and the missing result upload)', async () => {
+    const r = await run([workflow({ ...scan(), gate: gateJob([withId()]) }, true)], d);
+    expect(has(r, 'not-gate-readable', /gate step .*id/), show(r)).toBe(true);
+    expect(has(r, 'not-gate-readable', /pipegen-gate-result/), show(r)).toBe(true);
+  });
+  it('a gate step with an id and the uploads → not-gate-readable (the id)', async () => {
+    const r = await run([workflow({ ...scan(), gate: gateJob([withId(), ...renderGateUploads(p)]) }, true)], d);
+    expect(has(r, 'not-gate-readable', /gate step .*id/), show(r)).toBe(true);
+  });
+  it('a gate step with no uploads (no id) → not-gate-readable; the rendered job passes', async () => {
+    expect(has(await run([workflow({ ...scan(), gate: gateJob([renderGateStep(GATE, entries)]) }, true)], d), 'not-gate-readable', /pipegen-gate-result/)).toBe(true);
+    expect(show(await run([workflow({ ...scan(), gate: gateJob([renderGateStep(GATE, entries), ...renderGateUploads(p)]) }, true)], d))).toBe('');
+  });
+  it('gateResultUploadProblems with the index the caller found: an id\'d gate step still needs the result upload after it', () => {
+    expect(gateResultUploadProblems([withId()], 0).length).toBe(1);
+    expect(gateResultUploadProblems([withId(), ...renderGateUploads(p)], 0)).toEqual([]);
+    expect(gateResultUploadProblems([renderGateStep(GATE, entries)]).length).toBe(1);
+  });
+});
