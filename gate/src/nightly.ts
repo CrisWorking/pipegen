@@ -41,8 +41,10 @@ export interface NightlyGithub {
   tagRef(owner: string, name: string, tag: string): Promise<unknown>;
   /** `GET /repos/{o}/{r}/git/tags/{sha}` → an annotated tag object `{ sha, object: { type, sha } }`. */
   gitTag(owner: string, name: string, sha: string): Promise<unknown>;
-  /** `GET /repos/{o}/{r}/issues?state=all&labels=pipegen&creator=github-actions[bot]&sort=created&direction=desc&per_page&page` → an array (pull requests included). */
-  listIssues(owner: string, name: string, page: number, perPage: number): Promise<unknown>;
+  /** `GET /repos/{o}/{r}/issues?state=all&labels=pipegen&creator=github-actions[bot]&sort=created&direction=desc&per_page&page` → an array (pull requests included). `labelled: false` drops the label filter (the fallback page). */
+  listIssues(owner: string, name: string, page: number, perPage: number, labelled?: boolean): Promise<unknown>;
+  /** `GET /repos/{o}/{r}/issues/{n}` (for `closed_by`). */
+  getIssue(owner: string, name: string, number: number): Promise<unknown>;
   /** `POST /repos/{o}/{r}/issues` → `{ number }`. */
   createIssue(owner: string, name: string, issue: { title: string; body: string; labels?: readonly string[] }): Promise<unknown>;
   /** `PATCH /repos/{o}/{r}/issues/{n}` (title and body only) → `{ number }`. */
@@ -153,6 +155,30 @@ function blockScalarLines(lines: readonly string[]): Set<number> {
   });
   return inside;
 }
+/**
+ * Rarer YAML forms whose text can hold a pin-shaped line without being a step, which the block-scalar skip does not know: an anchor or a tag on a
+ * block scalar header (`run: &a |`, `run: !!str |`), a block scalar as a list item (`- |`), an explicit key (`? run`), and a quoted scalar that
+ * runs over several lines. They are NOT parsed (the bundle has no YAML parser): a file with one of them within RARE_WINDOW lines above a
+ * pin-shaped line gets no patch. `pipegen update` re-derives the patch with a real parser.
+ */
+const RARE_WINDOW = 50;
+const RARE_FORMS: readonly RegExp[] = [
+  /:[ \t]+(?:[&!]\S*[ \t]+)+[|>]/,
+  /^\s*-\s+(?:[&!]\S*\s+)*[|>][+-]?[0-9]?[+-]?\s*(?:#.*)?$/,
+  /^\s*\?(?:\s|$)/,
+  /(?:^\s*-\s+|:[ \t]+)"(?:[^"\\]|\\.)*$/,
+  /(?:^\s*-\s+|:[ \t]+)'(?:[^']|'')*$/,
+];
+function refuseRareForms(lines: readonly string[], pinRe: RegExp, path: string): void {
+  lines.forEach((line, i) => {
+    if (!pinRe.test(line)) return;
+    for (let k = Math.max(0, i - RARE_WINDOW); k < i; k++) {
+      const above = (lines[k] as string).replace(/\r$/, '');
+      if (/^\s*#/.test(above)) continue;
+      if (RARE_FORMS.some((f) => f.test(above))) throw new PatchRefused(`Refused: ${path} uses a YAML form (an anchor or tag on a block scalar, a block scalar as a list item, an explicit key, or a quoted scalar over several lines) near line ${i + 1}, which this patch maker does not parse.`);
+    }
+  });
+}
 const pinLineRe = (sha: string, version: string): RegExp => new RegExp(`^(\\s*(?:-\\s+)?uses:\\s+)crisworking/pipegen/gate@${sha} # gate-v${version.replace(/\./g, '\\.')}(\\s*)$`);
 /** The shas the gate is pinned at, for `version`, on real step lines (not inside a block scalar). */
 export function pinnedShas(text: string, version: string): string[] {
@@ -170,6 +196,7 @@ function filePatch(file: { path: string; text: string }, from: { sha: string; ve
   const lines = endsWithNewline ? parts.slice(0, -1) : parts;
   const re = pinLineRe(from.sha, from.version);
   const block = blockScalarLines(lines);
+  refuseRareForms(lines, re, file.path);
   const at: number[] = [];
   const replaced = new Map<number, string>();
   lines.forEach((line, i) => {
@@ -274,8 +301,8 @@ export interface IssueOutcome { key: string; number: number; action: IssueAction
 
 /**
  * Opens the issue with this key, or updates the one that has it. The key marker must be the FIRST line of the body, and only issues by
- * github-actions[bot] (type Bot) count: an issue by a person, or by any other account, is never edited and never blocks ours. A closed
- * issue is left alone (a person closed it). Pull requests in the list are skipped. The list is paged up to ISSUE_PAGE_CAP pages; running
+* github-actions[bot] (type Bot) count: an issue by a person, or by any other account, is never edited and never blocks ours. A closed
+ * issue is left alone only when a PERSON closed it (closed_by); one closed by a bot is treated as missing and a new one is opened. Pull requests in the list are skipped. The list is paged up to ISSUE_PAGE_CAP pages; running
  * into the cap, a failed or malformed list all FAIL CLOSED (they throw, nothing is created: no blind duplicate).
  * The caller's title and body are already escaped; the marker line is added here. Every issue carries the label `pipegen`, and the search asks for it (the
  * bot's pull requests and unrelated issues then never fill the page cap; a removed label can only cause one duplicate, never a suppression).
@@ -283,50 +310,100 @@ export interface IssueOutcome { key: string; number: number; action: IssueAction
 export async function upsertIssueDetailed(gh: NightlyGithub, repo: RepoRef, key: string, title: string, body: string, opts: UpsertOptions = {}): Promise<IssueOutcome> {
   if (typeof key !== 'string' || !KEY_RE.test(key)) throw new Error('nightly: the issue key is not a plain key');
   if (typeof title !== 'string' || title === '' || title.length > MAX_TITLE) throw new Error('nightly: the issue title is empty or too long');
-  const text = `${markerOf(key)}\n${body}`;
-  if (typeof body !== 'string' || text.length > MAX_BODY) throw new Error('nightly: the issue body is too long');
+  if (typeof body !== 'string' || markerOf(key).length + 1 + body.length > MAX_BODY) throw new Error('nightly: the issue body is too long');
   const marker = markerOf(key);
-  let open: { number: number; title: string; body: string; labels: string[] } | undefined;
-  let closed: number | undefined;
+  const wanted = opts.labels ?? [];
+  // Our issues: github-actions[bot] of type Bot, first line the key marker, never a pull request. `strict` (the labelled search) throws on an entry
+  // that is not an issue; the fallback page is best effort and skips such entries.
+  const hitOf = (raw: unknown, strict: boolean): { number: number; state: string; title: string; body: string; labels: string[] } | undefined => {
+    if (!isPlain(raw)) { if (strict) throw new Error('nightly: the issue list holds an entry that is not an issue, so no issue is written'); return undefined; }
+    const number = own(raw, 'number');
+    if (typeof number !== 'number' || !Number.isSafeInteger(number) || number <= 0) { if (strict) throw new Error('nightly: the issue list holds an entry with no issue number, so no issue is written'); return undefined; }
+    if (own(raw, 'pull_request') !== undefined) return undefined;
+    const user = own(raw, 'user');
+    if (!isPlain(user) || own(user, 'login') !== BOT_LOGIN || own(user, 'type') !== 'Bot') return undefined;
+    const b = own(raw, 'body');
+    if (typeof b !== 'string' || (b.split('\n')[0] as string).replace(/\r$/, '') !== marker) return undefined;
+    const ls = own(raw, 'labels');
+    const names = Array.isArray(ls) ? ls.map((l) => (isPlain(l) ? own(l, 'name') : undefined)).filter((n): n is string => typeof n === 'string') : [];
+    return { number, state: String(own(raw, 'state')), title: String(own(raw, 'title') ?? ''), body: b, labels: names };
+  };
+  let open: ReturnType<typeof hitOf>;
+  const closed: number[] = [];
   let complete = false;
   for (let page = 1; page <= ISSUE_PAGE_CAP; page++) {
     const list = await gh.listIssues(repo.owner, repo.name, page, ISSUE_PER_PAGE);
     if (!Array.isArray(list)) throw new Error('nightly: the issue list is not a list, so no issue is written');
     for (const raw of list) {
-      if (!isPlain(raw)) throw new Error('nightly: the issue list holds an entry that is not an issue, so no issue is written');
-      const number = own(raw, 'number');
-      if (typeof number !== 'number' || !Number.isSafeInteger(number) || number <= 0) throw new Error('nightly: the issue list holds an entry with no issue number, so no issue is written');
-      if (own(raw, 'pull_request') !== undefined) continue;
-      const user = own(raw, 'user');
-      if (!isPlain(user) || own(user, 'login') !== BOT_LOGIN || own(user, 'type') !== 'Bot') continue;
-      const b = own(raw, 'body');
-      if (typeof b !== 'string' || (b.split('\n')[0] as string).replace(/\r$/, '') !== marker) continue;
-      if (own(raw, 'state') === 'open') {
-        const ls = own(raw, 'labels');
-        const names = Array.isArray(ls) ? ls.map((l) => (isPlain(l) ? own(l, 'name') : undefined)).filter((n): n is string => typeof n === 'string') : [];
-        open = { number, title: String(own(raw, 'title') ?? ''), body: b, labels: names };
-        break;
-      }
-      closed ??= number;
+      const h = hitOf(raw, true);
+      if (h === undefined) continue;
+      if (h.state === 'open') { open = h; break; }
+      if (closed.length < MAX_CLOSED_CHECKS) closed.push(h.number);
     }
     if (open !== undefined) break;
     if (list.length < ISSUE_PER_PAGE) { complete = true; break; }
   }
+  // The label may have been dropped (GitHub drops labels for a token without push access): one page of the bot's newest issues, with no label
+  // filter, so a dropped label can not turn into a duplicate every night. Best effort: a full page does not fail closed; an API error does.
+  let adopted = false;
+  if (open === undefined && closed.length === 0) {
+    if (!complete) throw new Error(`nightly: the issue list reaches its cap of ${ISSUE_PAGE_CAP} pages without ending, so no issue is created (it might be a duplicate)`);
+    const list = await gh.listIssues(repo.owner, repo.name, 1, ISSUE_PER_PAGE, false);
+    if (!Array.isArray(list)) throw new Error('nightly: the unlabelled issue list is not a list, so no issue is written');
+    for (const raw of list) {
+      const h = hitOf(raw, false);
+      if (h === undefined) continue;
+      adopted = true;
+      if (h.state === 'open') { open = h; break; }
+      if (closed.length < MAX_CLOSED_CHECKS) closed.push(h.number);
+    }
+  }
+  const want = adopted ? [ISSUE_LABEL, ...wanted] : wanted;
   if (open !== undefined) {
-    // an issue that gains a patch gains the label pipegen:patch too (the shared patch-issue format); a label is never removed
-    const missing = (opts.labels ?? []).filter((l) => !(open as { labels: string[] }).labels.includes(l));
+    // a line that says the issue was re-opened after a bot closed one stays; a patch label is added when the issue gains a patch, never removed
+    const kept = /^> Reopened after a bot closed #[0-9]+\./.test(open.body.replace(/\r\n/g, '\n').split('\n')[1] ?? '') ? `${open.body.replace(/\r\n/g, '\n').split('\n')[1] as string}\n\n` : '';
+    const text = `${marker}\n${kept}${body}`;
+    const missing = want.filter((l) => !(open as { labels: string[] }).labels.includes(l));
     const same = open.title === title && open.body.replace(/\r\n/g, '\n') === text;
     if (!same) await gh.updateIssue(repo.owner, repo.name, open.number, { title, body: text });
-    if (missing.length > 0) await gh.addLabels(repo.owner, repo.name, open.number, missing);
+    if (missing.length > 0) await ensureLabels(gh, repo, open.number, missing);
     return { key, number: open.number, action: same ? 'unchanged' : 'updated' };
   }
-  if (closed !== undefined) return { key, number: closed, action: 'left-closed' };
-  if (!complete) throw new Error(`nightly: the issue list reaches its cap of ${ISSUE_PAGE_CAP} pages without ending, so no issue is created (it might be a duplicate)`);
-  const made = await gh.createIssue(repo.owner, repo.name, { title, body: text, labels: [ISSUE_LABEL, ...(opts.labels ?? [])] });
+  // A closed issue dismisses the key only when a PERSON closed it. One closed by a bot (any workflow with issues: write can do that) counts as missing.
+  let botClosed: number | undefined;
+  for (const n of closed) {
+    const full = await gh.getIssue(repo.owner, repo.name, n);
+    if (!isPlain(full)) throw new Error(`nightly: issue #${n} could not be read, so no issue is written`);
+    if (isPerson(own(full, 'closed_by'))) {
+      if (adopted) await ensureLabels(gh, repo, n, [ISSUE_LABEL]);
+      return { key, number: n, action: 'left-closed' };
+    }
+    botClosed ??= n;
+  }
+  const reopened = botClosed === undefined ? '' : `> Reopened after a bot closed #${botClosed}.\n\n`;
+  const made = await gh.createIssue(repo.owner, repo.name, { title, body: `${marker}\n${reopened}${body}` });
   const n = isPlain(made) ? own(made, 'number') : undefined;
   if (typeof n !== 'number' || !Number.isSafeInteger(n) || n <= 0) throw new Error('nightly: GitHub did not answer with the number of the new issue');
+  // never trust the create call for labels: set them and check the answer (a dropped label would turn into a duplicate issue every night)
+  await ensureLabels(gh, repo, n, [ISSUE_LABEL, ...wanted]);
   return { key, number: n, action: 'created' };
 }
+
+const MAX_CLOSED_CHECKS = 3;
+/** A person: a user account that is not a bot (the login of a bot ends in [bot], and github-actions[bot] is one). */
+function isPerson(closedBy: unknown): boolean {
+  if (!isPlain(closedBy)) return false;
+  const login = own(closedBy, 'login');
+  return own(closedBy, 'type') === 'User' && typeof login === 'string' && login !== '' && login !== BOT_LOGIN && !login.endsWith('[bot]');
+}
+/** Sets labels and checks the answer: every one must be in the list GitHub returns, or this throws (a token without push access drops labels silently). */
+async function ensureLabels(gh: NightlyGithub, repo: RepoRef, number: number, labels: readonly string[]): Promise<void> {
+  const answer = await gh.addLabels(repo.owner, repo.name, number, labels);
+  const names = Array.isArray(answer) ? answer.map((l) => (typeof l === 'string' ? l : isPlain(l) ? own(l, 'name') : undefined)) : [];
+  const missing = labels.filter((l) => !names.includes(l));
+  if (missing.length > 0) throw new Error(`nightly: the label ${missing.join(', ')} could not be set on issue #${number} (a token without push access drops labels), so nightly stops instead of risking a duplicate issue every night`);
+}
+
 /** upsertIssueDetailed, the number only (the plan's interface). */
 export async function upsertIssue(gh: NightlyGithub, repo: RepoRef, key: string, title: string, body: string, opts: UpsertOptions = {}): Promise<number> {
   return (await upsertIssueDetailed(gh, repo, key, title, body, opts)).number;

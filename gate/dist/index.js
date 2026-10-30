@@ -8537,7 +8537,9 @@ function githubAdapter(opts) {
     }
     if (labels) {
       if (!Array.isArray(answer)) throw new GitHubApiError(`${method} ${path}: the answer is not a list of labels`);
-      return { labels: answer.length };
+      const names = answer.map((l) => typeof l === "object" && l !== null && !Array.isArray(l) && Object.hasOwn(l, "name") && typeof l.name === "string" ? l.name : void 0);
+      if (names.some((n2) => n2 === void 0)) throw new GitHubApiError(`${method} ${path}: the answer has a label with no name`);
+      return names;
     }
     const n = typeof answer === "object" && answer !== null && Object.hasOwn(answer, "number") ? answer.number : void 0;
     if (typeof n !== "number" || !Number.isSafeInteger(n) || n <= 0) throw new GitHubApiError(`${method} ${path}: the answer has no issue number`);
@@ -8647,7 +8649,9 @@ function githubAdapter(opts) {
     listReleases: async (owner, name, p, per) => getJson(`${repo(owner, name)}/releases?${new URLSearchParams({ per_page: perPage(per), page: page(p, PAGE_CAP.releases) }).toString()}`),
     tagRef: async (owner, name, tag) => getJson(`${repo(owner, name)}/git/ref/tags/${refPath(tag)}`),
     gitTag: async (owner, name, tagSha) => getJson(`${repo(owner, name)}/git/tags/${sha2(tagSha)}`),
-    listIssues: async (owner, name, p, per) => getJson(`${repo(owner, name)}/issues?${new URLSearchParams({ state: "all", labels: "pipegen", creator: "github-actions[bot]", sort: "created", direction: "desc", per_page: perPage(per), page: page(p, PAGE_CAP.issues) }).toString()}`),
+    // labelled (default): the search by the label pipegen; labelled false: the best-effort fallback page, which does not depend on a label that may have been dropped
+    listIssues: async (owner, name, p, per, labelled = true) => getJson(`${repo(owner, name)}/issues?${new URLSearchParams({ state: "all", ...labelled ? { labels: "pipegen" } : {}, creator: "github-actions[bot]", sort: "created", direction: "desc", per_page: perPage(per), page: page(p, PAGE_CAP.issues) }).toString()}`),
+    getIssue: async (owner, name, n) => getJson(`${repo(owner, name)}/issues/${num(n)}`),
     createIssue: async (owner, name, issue) => {
       const labels = issue.labels ?? [];
       if (typeof issue.title !== "string" || issue.title === "" || issue.title.length > MAX_ISSUE_TITLE) fail2("an issue title that is empty or over 256 characters");
@@ -9545,6 +9549,24 @@ function blockScalarLines(lines) {
   });
   return inside;
 }
+var RARE_WINDOW = 50;
+var RARE_FORMS = [
+  /:[ \t]+(?:[&!]\S*[ \t]+)+[|>]/,
+  /^\s*-\s+(?:[&!]\S*\s+)*[|>][+-]?[0-9]?[+-]?\s*(?:#.*)?$/,
+  /^\s*\?(?:\s|$)/,
+  /(?:^\s*-\s+|:[ \t]+)"(?:[^"\\]|\\.)*$/,
+  /(?:^\s*-\s+|:[ \t]+)'(?:[^']|'')*$/
+];
+function refuseRareForms(lines, pinRe, path) {
+  lines.forEach((line, i) => {
+    if (!pinRe.test(line)) return;
+    for (let k = Math.max(0, i - RARE_WINDOW); k < i; k++) {
+      const above = lines[k].replace(/\r$/, "");
+      if (/^\s*#/.test(above)) continue;
+      if (RARE_FORMS.some((f) => f.test(above))) throw new PatchRefused(`Refused: ${path} uses a YAML form (an anchor or tag on a block scalar, a block scalar as a list item, an explicit key, or a quoted scalar over several lines) near line ${i + 1}, which this patch maker does not parse.`);
+    }
+  });
+}
 var pinLineRe = (sha3, version) => new RegExp(`^(\\s*(?:-\\s+)?uses:\\s+)crisworking/pipegen/gate@${sha3} # gate-v${version.replace(/\./g, "\\.")}(\\s*)$`);
 function pinnedShas(text, version) {
   const lines = text.split("\n");
@@ -9559,6 +9581,7 @@ function filePatch(file, from, to) {
   const lines = endsWithNewline ? parts.slice(0, -1) : parts;
   const re = pinLineRe(from.sha, from.version);
   const block = blockScalarLines(lines);
+  refuseRareForms(lines, re, file.path);
   const at3 = [];
   const replaced = /* @__PURE__ */ new Map();
   lines.forEach((line, i) => {
@@ -9645,32 +9668,42 @@ var ISSUE_LABEL = "pipegen";
 async function upsertIssueDetailed(gh, repo2, key, title, body, opts = {}) {
   if (typeof key !== "string" || !KEY_RE.test(key)) throw new Error("nightly: the issue key is not a plain key");
   if (typeof title !== "string" || title === "" || title.length > MAX_TITLE) throw new Error("nightly: the issue title is empty or too long");
-  const text = `${markerOf(key)}
-${body}`;
-  if (typeof body !== "string" || text.length > MAX_BODY) throw new Error("nightly: the issue body is too long");
+  if (typeof body !== "string" || markerOf(key).length + 1 + body.length > MAX_BODY) throw new Error("nightly: the issue body is too long");
   const marker = markerOf(key);
+  const wanted = opts.labels ?? [];
+  const hitOf = (raw, strict) => {
+    if (!isPlain8(raw)) {
+      if (strict) throw new Error("nightly: the issue list holds an entry that is not an issue, so no issue is written");
+      return void 0;
+    }
+    const number = own6(raw, "number");
+    if (typeof number !== "number" || !Number.isSafeInteger(number) || number <= 0) {
+      if (strict) throw new Error("nightly: the issue list holds an entry with no issue number, so no issue is written");
+      return void 0;
+    }
+    if (own6(raw, "pull_request") !== void 0) return void 0;
+    const user = own6(raw, "user");
+    if (!isPlain8(user) || own6(user, "login") !== BOT_LOGIN || own6(user, "type") !== "Bot") return void 0;
+    const b = own6(raw, "body");
+    if (typeof b !== "string" || b.split("\n")[0].replace(/\r$/, "") !== marker) return void 0;
+    const ls = own6(raw, "labels");
+    const names = Array.isArray(ls) ? ls.map((l) => isPlain8(l) ? own6(l, "name") : void 0).filter((n2) => typeof n2 === "string") : [];
+    return { number, state: String(own6(raw, "state")), title: String(own6(raw, "title") ?? ""), body: b, labels: names };
+  };
   let open;
-  let closed;
+  const closed = [];
   let complete = false;
   for (let page2 = 1; page2 <= ISSUE_PAGE_CAP; page2++) {
     const list = await gh.listIssues(repo2.owner, repo2.name, page2, ISSUE_PER_PAGE);
     if (!Array.isArray(list)) throw new Error("nightly: the issue list is not a list, so no issue is written");
     for (const raw of list) {
-      if (!isPlain8(raw)) throw new Error("nightly: the issue list holds an entry that is not an issue, so no issue is written");
-      const number = own6(raw, "number");
-      if (typeof number !== "number" || !Number.isSafeInteger(number) || number <= 0) throw new Error("nightly: the issue list holds an entry with no issue number, so no issue is written");
-      if (own6(raw, "pull_request") !== void 0) continue;
-      const user = own6(raw, "user");
-      if (!isPlain8(user) || own6(user, "login") !== BOT_LOGIN || own6(user, "type") !== "Bot") continue;
-      const b = own6(raw, "body");
-      if (typeof b !== "string" || b.split("\n")[0].replace(/\r$/, "") !== marker) continue;
-      if (own6(raw, "state") === "open") {
-        const ls = own6(raw, "labels");
-        const names = Array.isArray(ls) ? ls.map((l) => isPlain8(l) ? own6(l, "name") : void 0).filter((n2) => typeof n2 === "string") : [];
-        open = { number, title: String(own6(raw, "title") ?? ""), body: b, labels: names };
+      const h = hitOf(raw, true);
+      if (h === void 0) continue;
+      if (h.state === "open") {
+        open = h;
         break;
       }
-      closed ??= number;
+      if (closed.length < MAX_CLOSED_CHECKS) closed.push(h.number);
     }
     if (open !== void 0) break;
     if (list.length < ISSUE_PER_PAGE) {
@@ -9678,19 +9711,66 @@ ${body}`;
       break;
     }
   }
+  let adopted = false;
+  if (open === void 0 && closed.length === 0) {
+    if (!complete) throw new Error(`nightly: the issue list reaches its cap of ${ISSUE_PAGE_CAP} pages without ending, so no issue is created (it might be a duplicate)`);
+    const list = await gh.listIssues(repo2.owner, repo2.name, 1, ISSUE_PER_PAGE, false);
+    if (!Array.isArray(list)) throw new Error("nightly: the unlabelled issue list is not a list, so no issue is written");
+    for (const raw of list) {
+      const h = hitOf(raw, false);
+      if (h === void 0) continue;
+      adopted = true;
+      if (h.state === "open") {
+        open = h;
+        break;
+      }
+      if (closed.length < MAX_CLOSED_CHECKS) closed.push(h.number);
+    }
+  }
+  const want = adopted ? [ISSUE_LABEL, ...wanted] : wanted;
   if (open !== void 0) {
-    const missing = (opts.labels ?? []).filter((l) => !open.labels.includes(l));
+    const kept = /^> Reopened after a bot closed #[0-9]+\./.test(open.body.replace(/\r\n/g, "\n").split("\n")[1] ?? "") ? `${open.body.replace(/\r\n/g, "\n").split("\n")[1]}
+
+` : "";
+    const text = `${marker}
+${kept}${body}`;
+    const missing = want.filter((l) => !open.labels.includes(l));
     const same = open.title === title && open.body.replace(/\r\n/g, "\n") === text;
     if (!same) await gh.updateIssue(repo2.owner, repo2.name, open.number, { title, body: text });
-    if (missing.length > 0) await gh.addLabels(repo2.owner, repo2.name, open.number, missing);
+    if (missing.length > 0) await ensureLabels(gh, repo2, open.number, missing);
     return { key, number: open.number, action: same ? "unchanged" : "updated" };
   }
-  if (closed !== void 0) return { key, number: closed, action: "left-closed" };
-  if (!complete) throw new Error(`nightly: the issue list reaches its cap of ${ISSUE_PAGE_CAP} pages without ending, so no issue is created (it might be a duplicate)`);
-  const made = await gh.createIssue(repo2.owner, repo2.name, { title, body: text, labels: [ISSUE_LABEL, ...opts.labels ?? []] });
+  let botClosed;
+  for (const n2 of closed) {
+    const full = await gh.getIssue(repo2.owner, repo2.name, n2);
+    if (!isPlain8(full)) throw new Error(`nightly: issue #${n2} could not be read, so no issue is written`);
+    if (isPerson(own6(full, "closed_by"))) {
+      if (adopted) await ensureLabels(gh, repo2, n2, [ISSUE_LABEL]);
+      return { key, number: n2, action: "left-closed" };
+    }
+    botClosed ??= n2;
+  }
+  const reopened = botClosed === void 0 ? "" : `> Reopened after a bot closed #${botClosed}.
+
+`;
+  const made = await gh.createIssue(repo2.owner, repo2.name, { title, body: `${marker}
+${reopened}${body}` });
   const n = isPlain8(made) ? own6(made, "number") : void 0;
   if (typeof n !== "number" || !Number.isSafeInteger(n) || n <= 0) throw new Error("nightly: GitHub did not answer with the number of the new issue");
+  await ensureLabels(gh, repo2, n, [ISSUE_LABEL, ...wanted]);
   return { key, number: n, action: "created" };
+}
+var MAX_CLOSED_CHECKS = 3;
+function isPerson(closedBy) {
+  if (!isPlain8(closedBy)) return false;
+  const login = own6(closedBy, "login");
+  return own6(closedBy, "type") === "User" && typeof login === "string" && login !== "" && login !== BOT_LOGIN && !login.endsWith("[bot]");
+}
+async function ensureLabels(gh, repo2, number, labels) {
+  const answer = await gh.addLabels(repo2.owner, repo2.name, number, labels);
+  const names = Array.isArray(answer) ? answer.map((l) => typeof l === "string" ? l : isPlain8(l) ? own6(l, "name") : void 0) : [];
+  const missing = labels.filter((l) => !names.includes(l));
+  if (missing.length > 0) throw new Error(`nightly: the label ${missing.join(", ")} could not be set on issue #${number} (a token without push access drops labels), so nightly stops instead of risking a duplicate issue every night`);
 }
 var SETUP_BRANCH = "pipegen/setup";
 var PULL_PAGES = 3;

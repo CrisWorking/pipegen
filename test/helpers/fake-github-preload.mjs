@@ -9,6 +9,7 @@ globalThis.fetch = async (url, init) => {
   // C7: the issue writes are recorded (PIPEGEN_FAKE_GH_LOG, one JSON line each) and answered with a number; the issue list is table.issues
   if (u.hostname === 'api.github.com' && init?.method !== undefined && init.method !== 'GET') {
     if (process.env.PIPEGEN_FAKE_GH_LOG) appendFileSync(process.env.PIPEGEN_FAKE_GH_LOG, `${JSON.stringify({ method: init.method, path: u.pathname, body: JSON.parse(String(init.body ?? 'null')) })}\n`);
+    if (u.pathname.endsWith('/labels')) return json(((JSON.parse(String(init.body ?? 'null')) ?? {}).labels ?? []).map((name) => ({ name })));
     return new Response(JSON.stringify({ number: ++issueNumber }), { status: 201, headers: { 'content-type': 'application/json' } });
   }
   if (u.hostname === 'api.github.com' && /\/issues$/.test(u.pathname)) return json(table.issues ?? []);

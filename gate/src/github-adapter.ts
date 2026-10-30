@@ -188,7 +188,9 @@ export function githubAdapter(opts: AdapterOptions): FullGithubAdapter {
     try { answer = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(r.body)) as unknown; } catch { throw new GitHubApiError(`${method} ${path}: the answer is not JSON`); }
     if (labels) {
       if (!Array.isArray(answer)) throw new GitHubApiError(`${method} ${path}: the answer is not a list of labels`);
-      return { labels: answer.length };
+      const names = answer.map((l) => (typeof l === 'object' && l !== null && !Array.isArray(l) && Object.hasOwn(l, 'name') && typeof (l as { name: unknown }).name === 'string' ? (l as { name: string }).name : undefined));
+      if (names.some((n) => n === undefined)) throw new GitHubApiError(`${method} ${path}: the answer has a label with no name`);
+      return names;
     }
     const n = typeof answer === 'object' && answer !== null && Object.hasOwn(answer, 'number') ? (answer as { number: unknown }).number : undefined;
     if (typeof n !== 'number' || !Number.isSafeInteger(n) || n <= 0) throw new GitHubApiError(`${method} ${path}: the answer has no issue number`);
@@ -278,7 +280,9 @@ export function githubAdapter(opts: AdapterOptions): FullGithubAdapter {
     listReleases: async (owner, name, p, per) => getJson(`${repo(owner, name)}/releases?${new URLSearchParams({ per_page: perPage(per), page: page(p, PAGE_CAP.releases) }).toString()}`),
     tagRef: async (owner, name, tag) => getJson(`${repo(owner, name)}/git/ref/tags/${refPath(tag)}`),
     gitTag: async (owner, name, tagSha) => getJson(`${repo(owner, name)}/git/tags/${sha(tagSha)}`),
-    listIssues: async (owner, name, p, per) => getJson(`${repo(owner, name)}/issues?${new URLSearchParams({ state: 'all', labels: 'pipegen', creator: 'github-actions[bot]', sort: 'created', direction: 'desc', per_page: perPage(per), page: page(p, PAGE_CAP.issues) }).toString()}`),
+    // labelled (default): the search by the label pipegen; labelled false: the best-effort fallback page, which does not depend on a label that may have been dropped
+    listIssues: async (owner, name, p, per, labelled = true) => getJson(`${repo(owner, name)}/issues?${new URLSearchParams({ state: 'all', ...(labelled ? { labels: 'pipegen' } : {}), creator: 'github-actions[bot]', sort: 'created', direction: 'desc', per_page: perPage(per), page: page(p, PAGE_CAP.issues) }).toString()}`),
+    getIssue: async (owner, name, n) => getJson(`${repo(owner, name)}/issues/${num(n)}`),
     createIssue: async (owner, name, issue) => {
       const labels = issue.labels ?? [];
       if (typeof issue.title !== 'string' || issue.title === '' || issue.title.length > MAX_ISSUE_TITLE) fail('an issue title that is empty or over 256 characters');
