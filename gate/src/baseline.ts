@@ -115,6 +115,17 @@ export interface GateGithub {
   branchHead(owner: string, name: string, branch: string): Promise<unknown>;
   /** Whether a tag called `tag` exists: `GET /repos/{owner}/{name}/git/ref/tags/{tag}` (200 → true, 404 → false, any other error is thrown). */
   tagExists(owner: string, name: string, tag: string): Promise<boolean>;
+  // ---- C4 (pipeline integrity). Every answer is hostile and validated by integrity.ts. ----
+  /** `GET /repos/{owner}/{name}/pulls/{number}`. */
+  getPull(owner: string, name: string, number: number): Promise<unknown>;
+  /** `GET .../pulls/{number}/files?per_page&page` → an array (at most 3,000 files in all). */
+  listPullFiles(owner: string, name: string, number: number, page: number, perPage: number): Promise<unknown>;
+  /** `GET .../pulls/{number}/reviews?per_page&page` → an array, oldest first. */
+  listPullReviews(owner: string, name: string, number: number, page: number, perPage: number): Promise<unknown>;
+  /** `GET .../contents/{path}?ref={sha}` → the JSON answer; a 404 (no such file at that commit) is `null`, any other error is thrown. `ref` is a 40-hex commit sha. */
+  fileAt(owner: string, name: string, path: string, ref: string): Promise<unknown>;
+  /** `GET .../compare/{base}...{head}?per_page&page`: the answer carries `status` and one page of `files` (with their patches). Both are 40-hex shas. */
+  compareFiles(owner: string, name: string, base: string, head: string, page: number, perPage: number): Promise<unknown>;
 }
 /** The write side (C5 wires `@actions/artifact`). */
 export interface ArtifactUploader {

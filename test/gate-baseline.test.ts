@@ -78,6 +78,11 @@ class FakeGh implements GateGithub {
   async downloadArtifact(_o: string, _n: string, id: number): Promise<Uint8Array> { this.calls.push(`download ${id}`); return this.out(this.blobs.has(id) ? this.blobs.get(id) : new Error('404')) as Uint8Array; }
   async branchHead(_o: string, _n: string, branch: string): Promise<unknown> { this.calls.push(`branch ${branch}`); return this.out(this.branchAnswer); }
   async tagExists(_o: string, _n: string, tag: string): Promise<boolean> { this.calls.push(`tag ${tag}`); return this.out(this.tagAnswer) as boolean; }
+  async getPull(): Promise<unknown> { throw new Error('not used'); }
+  async listPullFiles(): Promise<unknown> { throw new Error('not used'); }
+  async listPullReviews(): Promise<unknown> { throw new Error('not used'); }
+  async fileAt(): Promise<unknown> { throw new Error('not used'); }
+  async compareFiles(): Promise<unknown> { throw new Error('not used'); }
 }
 const run = (over: Record<string, unknown> = {}): Record<string, unknown> => ({
   id: 100, event: 'push', conclusion: 'success', path: WORKFLOW_PATH, head_branch: 'main', head_sha: S1, head_repository: { id: 7 }, ...over,
