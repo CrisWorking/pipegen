@@ -23,13 +23,19 @@ const SHA_RE = /^[0-9a-f]{40}$/;
 
 export interface RepoId { owner: string; name: string; id: number }
 
-/** The API caps the pull files and the compare files at 3,000; 100 per page. */
+/** The pull files API caps at 3,000 files, 100 per page. */
 export const API_FILE_CAP = 3000;
 export const PER_PAGE = 100;
 /** A patch longer than this is not parsed (the API omits huge ones; a longer one is hostile). */
+/** The compare API lists at most this many files, on its first page only. */
+export const COMPARE_FILE_CAP = 300;
 export const MAX_PATCH_CHARS = 2 * 1024 * 1024;
 /** A file read through the contents API (CODEOWNERS, a shared config file) over this size is not read. */
 export const MAX_FILE_BYTES = 1024 * 1024;
+/** GitHub's own limit for a CODEOWNERS file; 1 to 3 MiB is read through the raw media type. */
+export const MAX_CODEOWNERS_BYTES = 3 * 1024 * 1024;
+/** At most this many approvers get a permission check. */
+const MAX_APPROVERS = 30;
 
 // ---------- types ----------
 
@@ -44,6 +50,18 @@ export interface PrContext {
 }
 export interface CodeownersRule { pattern: string; owners: string[] }
 export interface SectionChange { file: string; section: string; problem?: string }
+
+// ---------- paths ----------
+
+/**
+ * A slashless protected name is protected at ANY depth (`**\/` prefix): tools find configs in sub-folders (bandit's `.bandit` anywhere in
+ * the tree, `mypy.ini` in the service folder). An entry with a slash is anchored as written. Case-insensitive, dot files included.
+ */
+const anyDepth = (p: string): string => (p.includes('/') ? p : `**/${p}`);
+function pathMatcher(patterns: readonly string[]): (path: string) => boolean {
+  if (patterns.length === 0) return () => false;
+  return picomatch(patterns.map(anyDepth), { nocase: true, dot: true });
+}
 
 // ---------- files and markers ----------
 
@@ -72,13 +90,23 @@ const MARKERS: { name: string; re: RegExp }[] = [
   { name: 'nosec', re: /\bnosec\b/i },
   { name: 'checkov:skip', re: /checkov:skip/i },
   { name: 'tfsec:ignore', re: /tfsec:ignore/i },
+  { name: 'betterleaks:allow', re: /betterleaks:allow/i },
+  { name: 'biome-ignore', re: /biome-ignore/i },
+  { name: 'oxlint-disable', re: /oxlint-disable/i },
+  { name: 'ruff suppression', re: /#\s*ruff:\s*(?:noqa|disable)/i },
+  { name: 'coverage ignore', re: /(?:istanbul|c8|v8)\s+ignore|pragma:\s*no\s*cover/i },
+  { name: 'type ignore', re: /#\s*type:\s*ignore|@ts-(?:ignore|expect-error|nocheck)/i },
+  { name: 'zizmor ignore', re: /zizmor:\s*ignore/i },
 ];
+/** Markers that apply to the NEXT line (or block): an existing one directly above a changed line suppresses that line too. */
+const NEXT_LINE_RE = /nosem|eslint-disable-next-line|oxlint-disable-next-line|hadolint\s+ignore|trivy:ignore|@ts-ignore|@ts-expect-error|biome-ignore|(?:istanbul|c8|v8)\s+ignore\s+next|checkov:skip|tfsec:ignore/i;
 /** `noqa: E501, W291` (codes none of which starts with S) is a style suppression, not a security one. */
 function noqaIsSecurity(line: string): boolean {
-  const m = /\bnoqa\b(?:\s*:\s*([A-Za-z0-9, \t]*))?/i.exec(line);
-  if (m === null) return false;
-  if (m[1] === undefined || m[1].trim() === '') return true;   // blanket noqa suppresses the security rules too
-  return /(^|[\s,])S\d/i.test(m[1]);
+  for (const m of line.matchAll(/\bnoqa\b(?:\s*:\s*([A-Za-z0-9, \t]*))?/gi)) {
+    if (m[1] === undefined || m[1].trim() === '') return true;   // blanket noqa suppresses the security rules too
+    if (/(^|[\s,])S\d/i.test(m[1])) return true;
+  }
+  return false;
 }
 function markersOf(line: string): string[] {
   const out: string[] = [];
@@ -93,7 +121,7 @@ function markersOf(line: string): string[] {
 // ---------- patches ----------
 
 const HUNK_RE = /^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@/;
-interface ParsedPatch { added: { no: number; text: string }[] }
+interface ParsedPatch { added: { no: number; text: string }[]; context: Map<number, string> }
 
 /**
  * Parse a unified-diff body (GitHub's `patch`, hunks only). The hunk header's counts decide where a hunk ends, so a line in a hunk body
@@ -104,6 +132,7 @@ function parsePatch(patch: string): ParsedPatch | null {
   const lines = patch.split('\n');
   if (lines[lines.length - 1] === '') lines.pop();
   const added: { no: number; text: string }[] = [];
+  const context = new Map<number, string>();
   let i = 0;
   while (i < lines.length) {
     const m = HUNK_RE.exec(lines[i] as string);
@@ -118,13 +147,13 @@ function parsePatch(patch: string): ParsedPatch | null {
       const c = l[0];
       if (c === '+') { if (newLeft <= 0) return null; added.push({ no: newNo, text: l.slice(1) }); newNo++; newLeft--; }
       else if (c === '-') { if (oldLeft <= 0) return null; oldLeft--; }
-      else if (c === ' ') { if (oldLeft <= 0 || newLeft <= 0) return null; oldLeft--; newLeft--; newNo++; }
+      else if (c === ' ') { if (oldLeft <= 0 || newLeft <= 0) return null; context.set(newNo, l.slice(1)); oldLeft--; newLeft--; newNo++; }
       else if (c === '\\') continue;   // "\ No newline at end of file"
       else return null;
     }
     while (i < lines.length && (lines[i] as string)[0] === '\\') i++;
   }
-  return { added };
+  return { added, context };
 }
 
 /** The `+` lines of a patch by plain prefix: in a well-formed patch these are exactly the added lines. Used when the patch does not parse. */
@@ -134,7 +163,10 @@ function plusLines(patch: string): string[] {
   return out;
 }
 
-const needsPatch = (f: PrFile): boolean => f.changes > 0 && !isBinary(f.filename);
+/** Integrity: a text file whose changes could hide a marker. A deletion adds nothing; a binary-looking name is exempt. */
+const needsPatch = (f: PrFile): boolean => f.changes > 0 && f.status !== 'removed' && !isBinary(f.filename);
+/** The diff: the name is the author's choice, so any file with added content needs its patch. */
+const needsPatchForDiff = (f: PrFile): boolean => f.changes > 0 && f.status !== 'removed';
 
 /**
  * The added lines of each file as new-file line numbers. `complete` is false when a patch is missing (a text file with changes) or
@@ -146,7 +178,7 @@ export function addedLinesOf(files: readonly PrFile[]): { added: Map<string, Set
   let complete = true;
   for (const f of files) {
     if (typeof f.patch !== 'string' || f.patch === '') {
-      if (needsPatch(f)) { complete = false; problems.push('a changed text file has no patch'); }
+      if (needsPatchForDiff(f)) { complete = false; problems.push('a changed file has no patch'); }
       continue;
     }
     const parsed = parsePatch(f.patch);
@@ -197,6 +229,7 @@ export async function readPrContext(gh: GateGithub, repo: RepoId, prNumber: numb
   pr.headSha = headSha; pr.baseSha = baseSha;
   const headRepo = isPlain(head) ? own(head, 'repo') : undefined;
   pr.isFork = !(isPlain(headRepo) && own(headRepo, 'id') === repo.id);
+  const author = isPlain(own(pull, 'user')) ? own(own(pull, 'user') as Record<string, unknown>, 'login') : undefined;
 
   // files
   let filesOk = true;
@@ -212,6 +245,8 @@ export async function readPrContext(gh: GateGithub, repo: RepoId, prNumber: numb
   }
   if (filesOk && pr.files.length >= API_FILE_CAP) { filesOk = false; pr.problems.push(`the pull request has ${API_FILE_CAP} files or more, the most the API lists`); }
   if (filesOk && pr.files.length !== changed) { filesOk = false; pr.problems.push(`the list has ${pr.files.length} files, the pull request says ${changed}`); }
+  // the files are the pull's CURRENT head; if the event was about another commit they are not the files of that commit
+  if (opts.expectHeadSha !== undefined && opts.expectHeadSha !== headSha) { filesOk = false; pr.problems.push('the pull request head moved since the event; re-run the gate'); }
   pr.filesComplete = filesOk;
   pr.problems = [...new Set(pr.problems)];
 
@@ -235,21 +270,32 @@ export async function readPrContext(gh: GateGithub, repo: RepoId, prNumber: numb
   }
   pr.approvalsComplete = reviewsOk;
   if (!reviewsOk) return pr;
-  if (opts.expectHeadSha !== undefined && opts.expectHeadSha !== headSha) { pr.problems.push('the pull request head moved since the event; nothing is approved'); return pr; }
+  if (opts.expectHeadSha !== undefined && opts.expectHeadSha !== headSha) return pr;   // nothing is approved
   const latest = new Map<string, { id: number; state: string; commit: unknown }>();
   for (const r of reviews) {
     if (REVIEW_STATES_IGNORED.has(r.state)) continue;
     const cur = latest.get(r.login);
     if (cur === undefined || r.id > cur.id) latest.set(r.login, r);
   }
-  pr.approvals = [...latest].filter(([, r]) => r.state === 'APPROVED' && r.commit === headSha).map(([login]) => login).sort();
+  const candidates = [...latest].filter(([login, r]) => r.state === 'APPROVED' && r.commit === headSha && login !== (typeof author === 'string' ? author.toLowerCase() : '')).map(([login]) => login).sort();
+  if (candidates.length > MAX_APPROVERS) pr.problems.push(`more than ${MAX_APPROVERS} approvers; only the first ${MAX_APPROVERS} were checked`);
+  // an approval counts only from a user with write, maintain or admin permission (GitHub's own rule for code owners); any error means no
+  for (const login of candidates.slice(0, MAX_APPROVERS)) {
+    try {
+      const a = await gh.collaboratorPermission(repo.owner, repo.name, login);
+      const perm = isPlain(a) ? own(a, 'permission') : undefined;
+      const role = isPlain(a) ? own(a, 'role_name') : undefined;
+      if (perm === 'admin' || perm === 'write' || role === 'maintain' || role === 'admin' || role === 'write') pr.approvals.push(login);
+    } catch { /* not approved */ }
+  }
   return pr;
 }
 
 // ---------- reading a file at a commit ----------
 
 type Read = { kind: 'missing' } | { kind: 'text'; text: string } | { kind: 'problem'; why: string };
-async function readTextAt(gh: GateGithub, repo: RepoId, path: string, ref: string): Promise<Read> {
+async function readTextAt(gh: GateGithub, repo: RepoId, path: string, ref: string, opts: { max?: number; raw?: boolean } = {}): Promise<Read> {
+  const max = opts.max ?? MAX_FILE_BYTES;
   if (!SHA_RE.test(ref)) return { kind: 'problem', why: 'the commit is not a commit sha' };
   let a: unknown;
   try { a = await gh.fileAt(repo.owner, repo.name, path, ref); } catch { return { kind: 'problem', why: 'the file could not be read' }; }
@@ -257,8 +303,16 @@ async function readTextAt(gh: GateGithub, repo: RepoId, path: string, ref: strin
   if (!isPlain(a) || own(a, 'type') !== 'file') return { kind: 'problem', why: 'the answer is not a file' };
   const size = own(a, 'size');
   const content = own(a, 'content');
-  if (!natInt(size) || size > MAX_FILE_BYTES) return { kind: 'problem', why: 'the file is over the size cap' };
-  if (own(a, 'encoding') !== 'base64' || typeof content !== 'string') return { kind: 'problem', why: 'the file content is not readable' };
+  if (!natInt(size) || size > max) return { kind: 'problem', why: 'the file is over the size cap' };
+  if (own(a, 'encoding') === 'none' && opts.raw === true && size > MAX_FILE_BYTES) {
+    let raw: unknown;
+    try { raw = await gh.rawFileAt(repo.owner, repo.name, path, ref); } catch { return { kind: 'problem', why: 'the file could not be read' }; }
+    const bytes = typeof raw === 'string' ? Buffer.from(raw, 'utf8') : raw instanceof Uint8Array ? raw : undefined;
+    if (bytes === undefined) return { kind: 'problem', why: 'the file content is not readable' };
+    if (bytes.length > max) return { kind: 'problem', why: 'the file is over the size cap' };
+    return { kind: 'text', text: Buffer.from(bytes).toString('utf8') };
+  }
+  if (own(a, 'encoding') !== 'base64' || typeof content !== 'string' || size > MAX_FILE_BYTES) return { kind: 'problem', why: size > MAX_FILE_BYTES ? 'the file is over the size cap' : 'the file content is not readable' };
   const bytes = Buffer.from(content.replace(/\s+/g, ''), 'base64');
   if (bytes.length > MAX_FILE_BYTES) return { kind: 'problem', why: 'the file is over the size cap' };
   return { kind: 'text', text: bytes.toString('utf8') };
@@ -274,6 +328,8 @@ export async function baseHasInstall(gh: GateGithub, repo: RepoId, baseSha: stri
 
 const MAX_RULES = 100_000;
 const MAX_LINE = 4096;
+const TEAM_RE = /^@[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?\/[A-Za-z0-9._-]+$/;
+const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 const LOGIN_RE = /^@([A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?)$/;
 
 /** Split a line into tokens on unescaped whitespace; `\ ` is a space inside a token. Stops at a token that starts with `#`. */
@@ -309,8 +365,13 @@ export function codeOwners(text: string | null): CodeownersRule[] {
     if (pattern.startsWith('!') || pattern.startsWith('\\#') || /[[\]]/.test(pattern)) continue;
     if (pattern.replace(/\//g, '') === '' || pattern.includes('//')) continue;
     const owners: string[] = [];
-    for (const o of t.slice(1)) { const m = LOGIN_RE.exec(o); if (m !== null) owners.push((m[1] as string).toLowerCase()); }
-    rules.push({ pattern, owners });
+    let valid = true;
+    for (const o of t.slice(1)) {
+      const m = LOGIN_RE.exec(o);
+      if (m !== null) owners.push((m[1] as string).toLowerCase());
+      else if (!TEAM_RE.test(o) && !EMAIL_RE.test(o)) { valid = false; break; }   // a team or an e-mail is valid but has no user to count
+    }
+    if (valid) rules.push({ pattern, owners });   // GitHub skips a line with an invalid owner whole
   }
   return rules;
 }
@@ -401,7 +462,7 @@ export function ownersOf(rules: readonly CodeownersRule[], path: string): string
 /** CODEOWNERS of the BASE commit: `.github/CODEOWNERS`, then `CODEOWNERS`, then `docs/CODEOWNERS`; the first that exists is the file. Never the head. */
 export async function loadCodeowners(gh: GateGithub, repo: RepoId, baseSha: string): Promise<{ rules: CodeownersRule[]; found: string | null; problem?: string }> {
   for (const path of ['.github/CODEOWNERS', 'CODEOWNERS', 'docs/CODEOWNERS']) {
-    const r = await readTextAt(gh, repo, path, baseSha);
+    const r = await readTextAt(gh, repo, path, baseSha, { max: MAX_CODEOWNERS_BYTES, raw: true });
     if (r.kind === 'missing') continue;
     if (r.kind === 'problem') return { rules: [], found: null, problem: `CODEOWNERS of the base commit could not be read (${r.why}); nobody can approve` };
     return { rules: codeOwners(r.text), found: path };
@@ -412,100 +473,166 @@ export async function loadCodeowners(gh: GateGithub, repo: RepoId, baseSha: stri
 // ---------- configSections ----------
 
 type Tree = Map<string, unknown>;
-const canon = (v: unknown): string => JSON.stringify(v, (_k, x: unknown) => {
-  if (typeof x === 'bigint') return `${x}n`;
-  if (isPlain(x) && !(x instanceof Date)) return Object.fromEntries(Object.keys(x).sort().map((k) => [k, x[k]]));
-  return x;
-});
 
-function flattenTables(v: unknown, prefix: string, out: Tree, depth: number): void {
-  if (!isPlain(v) || v instanceof Date || depth > 16) return;
-  for (const k of Object.keys(v)) {
-    const path = prefix === '' ? k : `${prefix}.${k}`;
-    out.set(path, v[k]);
-    flattenTables(v[k], path, out, depth + 1);
-  }
+/** A document as plain data, comparable by text: non-finite numbers, big integers and dates get distinct forms (JSON would make them null). */
+function norm(v: unknown): unknown {
+  if (typeof v === 'number') return Number.isFinite(v) ? v : { $num: Number.isNaN(v) ? 'nan' : v > 0 ? 'inf' : '-inf' };
+  if (typeof v === 'bigint') return Number.isSafeInteger(Number(v)) ? Number(v) : { $int: String(v) };
+  if (v instanceof Date) return v.toISOString();
+  if (Array.isArray(v)) return v.map(norm);
+  if (isPlain(v)) return Object.fromEntries(Object.keys(v).sort().map((k) => [k, norm(v[k])]));
+  return v;
 }
+const canon = (v: unknown): string => JSON.stringify(norm(v));
 
-function parseIni(text: string): Tree | undefined {
-  const tree = new Map<string, [string, string][]>();
-  let cur: [string, string][] | undefined;
-  let last: [string, string] | undefined;
+/**
+ * Python configparser (`RawConfigParser`, strict), ported: a header is `^\[(.+)\]` (greedy) on the stripped line and the rest of the line
+ * is ignored; an indented line after an option continues it; `#` and `;` lines are comments (not inline ones); blank lines inside a value
+ * are kept; `[DEFAULT]` is merged into every section; keys are lower-cased; a duplicate section or option, an option before a header, a
+ * line without `=` or `:` and an empty key are errors (undefined).
+ */
+function parseIni(text: string): Record<string, Record<string, string>> | undefined {
+  const sections = new Map<string, Map<string, string[]>>();
+  const defaults = new Map<string, string[]>();
+  let cur: Map<string, string[]> | undefined;
+  let curName = '';
+  let opt: string | undefined;
+  let indentLevel = 0;
+  const seen = new Set<string>();
   for (const line of text.split(/\r?\n/)) {
-    if (line.trim() === '' || /^\s*[#;]/.test(line)) continue;
-    const sec = /^\[(.+)\]\s*$/.exec(line.trim());
-    if (sec !== null && !/^\s/.test(line)) { const name = sec[1] as string; cur = tree.get(name) ?? []; tree.set(name, cur); last = undefined; continue; }
-    if (/^\s/.test(line) && last !== undefined) { last[1] += `\n${line.trim()}`; continue; }
-    const kv = /^([^=:\s][^=:]*?)\s*[=:]\s*(.*)$/.exec(line);
-    if (kv === null || cur === undefined) return undefined;
-    last = [kv[1] as string, kv[2] as string];
-    cur.push(last);
+    const stripped = line.trim();
+    const comment = stripped.startsWith('#') || stripped.startsWith(';');
+    const value = comment ? '' : stripped;
+    if (value === '') {
+      if (!comment && cur !== undefined && opt !== undefined) cur.get(opt)?.push('');
+      continue;
+    }
+    const indent = line.length - line.trimStart().length;
+    if (cur !== undefined && opt !== undefined && indent > indentLevel) { cur.get(opt)?.push(value); continue; }
+    indentLevel = indent;
+    const h = /^\[(.+)\]/.exec(value);
+    if (h !== null) {
+      const name = h[1] as string;
+      if (name === 'DEFAULT') { cur = defaults; curName = name; }
+      else { if (sections.has(name)) return undefined; cur = new Map(); sections.set(name, cur); curName = name; }
+      opt = undefined;
+      continue;
+    }
+    if (cur === undefined) return undefined;
+    const o = /^(.*?)\s*[=:]\s*(.*)$/.exec(value);
+    if (o === null) return undefined;
+    const key = (o[1] as string).trimEnd().toLowerCase();
+    if (key === '') return undefined;
+    const id = `${curName}\0${key}`;
+    if (seen.has(id)) return undefined;
+    seen.add(id);
+    const first = (o[2] as string).trim();
+    cur.set(key, [first === '""' ? '' : first]);
+    opt = key;
   }
-  return tree;
+  const done = (lines: string[]): string => lines.join('\n').trimEnd();
+  const out: Record<string, Record<string, string>> = {};
+  for (const [name, entries] of sections) {
+    const merged: Record<string, string> = {};
+    for (const [k, v] of defaults) merged[k] = done(v);
+    for (const [k, v] of entries) merged[k] = done(v);
+    out[name] = merged;
+  }
+  return out;
 }
 
-function parseShared(path: string, text: string): Tree | undefined {
+/** A shared config file as plain data (JSON, TOML or INI by extension); undefined when it does not parse as the tool's parser would. */
+export function parseConfigDoc(path: string, text: string): Record<string, unknown> | undefined {
   const lower = path.toLowerCase();
   try {
-    if (lower.endsWith('.json')) {
-      const v: unknown = JSON.parse(text);
-      if (!isPlain(v)) return undefined;
-      const t: Tree = new Map();
-      for (const k of Object.keys(v)) t.set(k, v[k]);
-      return t;
-    }
-    if (lower.endsWith('.toml')) { const t: Tree = new Map(); flattenTables(parseToml(text), '', t, 0); return t; }
+    if (lower.endsWith('.json')) { const v: unknown = JSON.parse(text); return isPlain(v) ? (norm(v) as Record<string, unknown>) : undefined; }
+    if (lower.endsWith('.toml')) return norm(parseToml(text)) as Record<string, unknown>;
     if (lower.endsWith('.cfg') || lower.endsWith('.ini')) return parseIni(text);
   } catch { return undefined; }
   return undefined;
 }
 
+/**
+ * The sections of a parsed document by name: INI sections and JSON top-level keys as they are; TOML tables by their dotted path built from
+ * the parsed segments. A literal key that contains a dot and joins to the same name as another path (`"tool.mypy"` beside `[tool.mypy]`)
+ * is ambiguous: undefined, so the caller fails closed.
+ */
+function sectionTree(path: string, doc: Record<string, unknown>): Tree | undefined {
+  const t: Tree = new Map();
+  if (!path.toLowerCase().endsWith('.toml')) { for (const k of Object.keys(doc)) t.set(k, doc[k]); return t; }
+  const segsOf = new Map<string, string>();
+  const walk = (v: unknown, prefix: string[], depth: number): boolean => {
+    if (!isPlain(v) || depth > 16 || '$num' in v || '$int' in v) return true;
+    for (const k of Object.keys(v)) {
+      const segs = [...prefix, k];
+      const joined = segs.join('.');
+      const id = JSON.stringify(segs);
+      const prev = segsOf.get(joined);
+      if (prev !== undefined && prev !== id) return false;
+      segsOf.set(joined, id);
+      t.set(joined, v[k]);
+      if (!walk(v[k], segs, depth + 1)) return false;
+    }
+    return true;
+  };
+  return walk(doc, [], 0) ? t : undefined;
+}
+
 const sectionRe = (section: string): RegExp => new RegExp(`^${section.split('*').map((s) => s.replace(/[.+?^${}()|[\]\\]/g, '\\$&')).join('.*')}$`);
-const safeName = (s: string): string => s.replace(/[^A-Za-z0-9._:*/-]/g, '?').slice(0, 80);
+const safeName = (s: string): string => s.replace(/[^A-Za-z0-9._:*/() -]/g, '?').slice(0, 80);
 const MAX_SECTION_FILES = 20;
 
 /**
  * For each changed file that is a shared file of a reviewed tool (`<file>:<section>`, see ReviewedTool.configSections): read it at the
- * base and at the head (≤ 1 MiB), parse (JSON, TOML, INI) and deep-compare each matching section. A change inside a matching section, or to
- * the section itself, is a SectionChange; a change elsewhere in the file is not. An unreadable or unparsable file is a change with a
- * `problem`. A file already protected as a whole is skipped.
+ * base and at the head (≤ 1 MiB), parse (JSON, TOML, INI as the tools' parsers do) and deep-compare each matching section. A change inside
+ * a matching section, or to the section itself, is a SectionChange; a change elsewhere in the file is not. An unreadable, unparsable or
+ * ambiguous file is a change with a `problem`. A file already protected as a whole is skipped. A rename is the removal of the old path
+ * plus the addition of the new one: moving the file out of the place the tool reads it from is a `(file moved)` change on the old path
+ * even when the content is the same, and the new path is compared as an added file; each path is waived by its own owners.
  */
 export async function readConfigSections(gh: GateGithub, repo: RepoId, pr: PrContext, sections: readonly string[], protectedPaths: readonly string[]): Promise<SectionChange[]> {
-  const specs = sections.flatMap((s) => { const i = s.indexOf(':'); return i > 0 ? [{ glob: picomatch(s.slice(0, i), { nocase: true, dot: true }), section: s.slice(i + 1) }] : []; });
+  const specs = sections.flatMap((s) => { const i = s.indexOf(':'); return i > 0 ? [{ glob: pathMatcher([s.slice(0, i)]), section: s.slice(i + 1) }] : []; });
   if (specs.length === 0) return [];
-  const whole = protectedPaths.length === 0 ? () => false : picomatch([...protectedPaths], { nocase: true, dot: true });
+  const whole = pathMatcher(protectedPaths);
   const out: SectionChange[] = [];
   let checked = 0;
-  for (const f of pr.files) {
-    const basePath = f.previous_filename ?? f.filename;
-    const headPath = f.filename;
-    if (whole(headPath) || whole(basePath)) continue;
-    const relevant = specs.filter((s) => s.glob(headPath) || s.glob(basePath));
-    if (relevant.length === 0) continue;
-    if (++checked > MAX_SECTION_FILES) { out.push({ file: headPath, section: '*', problem: 'too many shared config files changed to compare' }); continue; }
-    const fail = (why: string): void => { out.push({ file: headPath, section: safeName(relevant.map((r) => r.section).join(',')), problem: why }); };
-    const side = async (path: string, ref: string, skip: boolean): Promise<Tree | undefined | 'fail'> => {
+  const compare = async (path: string, skipBase: boolean, skipHead: boolean): Promise<void> => {
+    const relevant = specs.filter((s) => s.glob(path));
+    if (relevant.length === 0 || whole(path)) return;
+    if (++checked > MAX_SECTION_FILES) { out.push({ file: path, section: '*', problem: 'too many shared config files changed to compare' }); return; }
+    const fail = (): void => { out.push({ file: path, section: safeName(relevant.map((r) => r.section).join(',')), problem: 'the file could not be read, parsed or told apart at the base or the head' }); };
+    const side = async (ref: string, skip: boolean): Promise<Tree | 'fail'> => {
       if (skip) return new Map();
       const r = await readTextAt(gh, repo, path, ref);
       if (r.kind === 'missing') return new Map();
       if (r.kind === 'problem') return 'fail';
-      return parseShared(path, r.text) ?? 'fail';
+      const doc = parseConfigDoc(path, r.text);
+      const tree = doc === undefined ? undefined : sectionTree(path, doc);
+      return tree ?? 'fail';
     };
-    const base = await side(basePath, pr.baseSha, f.status === 'added');
-    const head = await side(headPath, pr.headSha, f.status === 'removed');
-    if (base === 'fail' || head === 'fail' || base === undefined || head === undefined) { fail('the file could not be read or parsed at the base or the head'); continue; }
+    const base = await side(pr.baseSha, skipBase);
+    const head = await side(pr.headSha, skipHead);
+    if (base === 'fail' || head === 'fail') { fail(); return; }
     const changed = new Set<string>();
     for (const r of relevant) {
       const re = sectionRe(r.section);
-      const names = new Set([...base.keys(), ...head.keys()].filter((k) => re.test(k)));
-      for (const n of names) {
+      for (const n of new Set([...base.keys(), ...head.keys()].filter((k) => re.test(k)))) {
         const a = base.has(n) ? canon(base.get(n)) : undefined;
         const b = head.has(n) ? canon(head.get(n)) : undefined;
         if (a !== b) changed.add(n);
       }
     }
     // report the shallowest changed section of a nested family once
-    for (const n of changed) if (![...changed].some((o) => o !== n && n.startsWith(`${o}.`))) out.push({ file: headPath, section: safeName(n) });
+    for (const n of changed) if (![...changed].some((o) => o !== n && n.startsWith(`${o}.`))) out.push({ file: path, section: safeName(n) });
+  };
+  for (const f of pr.files) {
+    const prev = f.previous_filename;
+    if (prev !== undefined && prev !== f.filename) {
+      if (specs.some((s) => s.glob(prev)) && !whole(prev)) out.push({ file: prev, section: '(file moved)' });
+      await compare(f.filename, true, f.status === 'removed');
+    } else {
+      await compare(f.filename, f.status === 'added', f.status === 'removed');
+    }
   }
   return out;
 }
@@ -515,25 +642,20 @@ export async function readConfigSections(gh: GateGithub, repo: RepoId, pr: PrCon
 /**
  * The PR's added lines of the SCANNED tree: the compare API's patches for `base...head` where head is the scanned commit (github.sha;
  * for merge_group `base_sha...head_sha`), never the PR files API's patches (that numbering is the PR head's). `commit` is the head.
- * An incomplete compare (an error, a status other than ahead/identical, the 3,000-file cap, a missing or malformed patch) is
+ * An incomplete compare (an error, a status other than ahead/identical, 300 files or more, a missing or malformed patch) is
  * `complete: false`, and the gate then treats every position-form finding as new.
  */
 export async function buildPrDiff(gh: GateGithub, repo: RepoId, baseSha: string, headSha: string): Promise<PrDiff> {
-  const bad = (added = new Map<string, Set<number>>()): PrDiff => ({ added, complete: false, commit: headSha });
+  const bad = (): PrDiff => ({ added: new Map(), complete: false, commit: headSha });
   if (typeof baseSha !== 'string' || !SHA_RE.test(baseSha) || typeof headSha !== 'string' || !SHA_RE.test(headSha)) return bad();
+  let a: unknown;
+  try { a = await gh.compareFiles(repo.owner, repo.name, baseSha, headSha); } catch { return bad(); }
+  const status = isPlain(a) ? own(a, 'status') : undefined;
+  const list = isPlain(a) ? own(a, 'files') : undefined;
+  if ((status !== 'ahead' && status !== 'identical') || !Array.isArray(list)) return bad();
+  let ok = list.length < COMPARE_FILE_CAP;   // 300 files is the most the API lists; at the cap a truncation cannot be told from a full list
   const files: PrFile[] = [];
-  let ok = true;
-  const pages = API_FILE_CAP / PER_PAGE;
-  for (let page = 1; page <= pages; page++) {
-    let a: unknown;
-    try { a = await gh.compareFiles(repo.owner, repo.name, baseSha, headSha, page, PER_PAGE); } catch { ok = false; break; }
-    const status = isPlain(a) ? own(a, 'status') : undefined;
-    const list = isPlain(a) ? own(a, 'files') : undefined;
-    if ((status !== 'ahead' && status !== 'identical') || !Array.isArray(list)) { ok = false; break; }
-    for (const e of list) { const f = readFile(e); if (f === undefined) ok = false; else files.push(f); }
-    if (list.length < PER_PAGE) break;
-    if (page === pages) ok = false;   // the cap: more files may exist
-  }
+  for (const e of list) { const f = readFile(e); if (f === undefined) ok = false; else files.push(f); }
   const r = addedLinesOf(files);
   return { added: r.added, complete: ok && r.complete, commit: headSha };
 }
@@ -549,11 +671,14 @@ const fp = (...parts: string[]): string => createHash('sha256').update(parts.joi
  * exempt), high `integrity:suppression` (an added suppression marker, or any added line in a declared ignore file). All but the first are
  * waived by an approval, on the head commit, of a code owner (a user) of the path (last matching CODEOWNERS rule of the base commit).
  */
-export function integrityFindings(pr: PrContext, protectedPaths: readonly string[], rules: readonly CodeownersRule[], extra: { sectionChanges?: readonly SectionChange[] } = {}): Finding[] {
+export function integrityFindings(
+  pr: PrContext, protectedPaths: readonly string[], rules: readonly CodeownersRule[],
+  extra: { sectionChanges?: readonly SectionChange[]; codeowners?: { found: string | null; problem?: string } } = {},
+): Finding[] {
   const out: Finding[] = [];
   const seen = new Set<string>();
   const approvals = new Set(pr.approvals.map((a) => a.toLowerCase()));
-  const isProtected = protectedPaths.length === 0 ? (): boolean => false : picomatch([...protectedPaths], { nocase: true, dot: true });
+  const isProtected = pathMatcher(protectedPaths);
   const waived = (path: string): boolean => (ownersOf(rules, path) ?? []).some((o) => approvals.has(o));
   const push = (ruleId: string, severity: Finding['severity'], file: string | undefined, message: string, key: string, line?: number): void => {
     const k = `${ruleId}\0${file ?? ''}\0${key}`;
@@ -561,43 +686,59 @@ export function integrityFindings(pr: PrContext, protectedPaths: readonly string
     seen.add(k);
     out.push({ tool: 'pipegen', ruleId, severity, ...(file === undefined ? {} : { file }), ...(line === undefined ? {} : { line }), message, fingerprint: fp(ruleId, file ?? '', key) });
   };
-  const how = rules.length === 0
-    ? ' The base commit has no CODEOWNERS, so nobody can approve: add one (user owners, not only teams), or merge with an administrator bypass.'
-    : ' A code owner of this path (a user, not only a team) must approve the pull request on its current head commit.';
+  /** How the author gets this path approved, by why nobody can. Fixed texts only. */
+  const how = (path: string): string => {
+    if (extra.codeowners?.problem !== undefined) return ' CODEOWNERS of the base commit could not be read, so nobody can approve: re-run the gate, or merge with an administrator bypass.';
+    if (rules.length === 0) {
+      return extra.codeowners?.found != null
+        ? ' CODEOWNERS of the base commit has no rule that names a user, so nobody can approve: add one, or merge with an administrator bypass.'
+        : ' The base commit has no CODEOWNERS, so nobody can approve: add one (user owners, not only teams), or merge with an administrator bypass.';
+    }
+    const o = ownersOf(rules, path);
+    if (o === undefined || o.length === 0) {
+      return ' No user is a code owner of this path (a team-only entry cannot approve: the gate cannot read team membership, so name a user as an owner in CODEOWNERS), or merge with an administrator bypass.';
+    }
+    return ' A code owner of this path (a user, not only a team) with write access must approve the pull request on its current head commit.';
+  };
 
-  if (!pr.filesComplete) push('integrity:incomplete-list', 'critical', undefined, 'The list of changed files is incomplete, so the gate cannot see every change and blocks. Split the pull request into smaller ones.', 'list');
+  if (!pr.filesComplete) push('integrity:incomplete-list', 'critical', undefined, 'The list of changed files is incomplete (or is not the list of the commit being checked), so the gate cannot see every change and blocks. Split the pull request into smaller ones, or re-run if the branch moved.', 'list');
 
   for (const f of pr.files) {
     for (const path of f.previous_filename === undefined ? [f.filename] : [f.filename, f.previous_filename]) {
-      if (isProtected(path) && !waived(path)) push('integrity:protected-path', 'critical', path, `This file is part of the pipeline (a workflow, a tool config or an ignore file).${how}`, 'path');
+      if (isProtected(path) && !waived(path)) push('integrity:protected-path', 'critical', path, `This file is part of the pipeline (a workflow, a tool config or an ignore file).${how(path)}`, 'path');
     }
     const hasPatch = typeof f.patch === 'string' && f.patch !== '';
     const parsed = hasPatch ? parsePatch(f.patch as string) : undefined;
     if (!hasPatch ? needsPatch(f) && !isLockfile(f.filename) : parsed === null) {
-      if (!waived(f.filename)) push('integrity:no-patch', 'critical', f.filename, `The gate cannot read this file's changes (no patch, or a patch it cannot parse), so it cannot check them for suppressions.${how}`, 'patch');
+      if (!waived(f.filename)) push('integrity:no-patch', 'critical', f.filename, `The gate cannot read this file's changes (no patch, or a patch it cannot parse), so it cannot check them for suppressions.${how(f.filename)}`, 'patch');
     }
     if (!hasPatch) continue;
     const ignoreFile = isProtected(f.filename) && IGNORE_FILE_RE.test(baseName(f.filename));
-    const texts = parsed === undefined || parsed === null ? plusLines(f.patch as string).map((text) => ({ no: undefined as number | undefined, text })) : parsed.added;
+    const texts: { no: number | undefined; text: string; above?: string }[] = parsed === undefined || parsed === null
+      ? plusLines(f.patch as string).map((text) => ({ no: undefined, text }))
+      : parsed.added.map((a) => ({ no: a.no, text: a.text, ...(parsed.context.has(a.no - 1) ? { above: parsed.context.get(a.no - 1) as string } : {}) }));
     const kinds = new Set<string>();
     let first: number | undefined;
     let hits = 0;
     for (const a of texts) {
-      const m = ignoreFile ? ['ignore file entry'] : markersOf(a.text);
+      let m = ignoreFile ? ['ignore file entry'] : markersOf(a.text);
+      if (m.length === 0 && a.above !== undefined && NEXT_LINE_RE.test(a.above)) m = ['existing marker above a changed line'];
       if (m.length === 0) continue;
       hits++;
       for (const k of m) kinds.add(k);
       if (first === undefined && a.no !== undefined) first = a.no;
     }
     if (hits > 0 && !waived(f.filename)) {
-      push('integrity:suppression', 'high', f.filename, `${hits} added line${hits === 1 ? '' : 's'} suppress${hits === 1 ? 'es' : ''} a check (${[...kinds].sort().join(', ')}).${how}`, 'suppression', first);
+      push('integrity:suppression', 'high', f.filename, `${hits} added line${hits === 1 ? '' : 's'} suppress${hits === 1 ? 'es' : ''} a check (${[...kinds].sort().join(', ')}).${how(f.filename)}`, 'suppression', first);
     }
   }
 
   for (const c of extra.sectionChanges ?? []) {
     if (waived(c.file)) continue;
     push('integrity:protected-path', 'critical', c.file,
-      c.problem === undefined ? `The section ${safeName(c.section)} of this shared config file changed.${how}` : `This shared config file (section ${safeName(c.section)}) could not be compared: ${c.problem}.${how}`, `section:${c.section}`);
+      c.problem === undefined
+        ? (c.section === '(file moved)' ? `This shared config file was renamed or moved away from where its tool reads it.${how(c.file)}` : `The section ${safeName(c.section)} of this shared config file changed.${how(c.file)}`)
+        : `This shared config file (section ${safeName(c.section)}) could not be compared: ${c.problem}.${how(c.file)}`, `section:${c.section}`);
   }
   return out;
 }

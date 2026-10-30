@@ -159,7 +159,11 @@ export const GATE_CHECK_INTEGRATION_ID = 15368;   // GitHub Actions app id — s
 export const RESULT_ARTIFACT_PREFIX = 'pipegen-out-';          // read by the gate (exact names only)
 export const DEFAULT_MODEL = 'claude-opus-5-5';               // user may override with --model
 export const FLOOR_NEEDS = ['secrets', 'sast', 'deps', 'unit-tests', 'full-tests', 'gate'];   // can never be NOT-PROVEN. secrets + gate can never be skipped; tests may only be skipped explicitly with --skip tests (recorded)
-export const PROTECTED_PATHS_BASE = ['.github/workflows/**', '.github/CODEOWNERS', 'CODEOWNERS', '.pre-commit-config.yaml', '.husky/**', 'lefthook.yml', 'docker-compose.pipegen.yml', '.gitleaksignore', '.semgrepignore', '.trivyignore', '.zap/**', '.github/actions/**', 'docs/CODEOWNERS', '.github/dependabot.yml'];
+export const PROTECTED_PATHS_BASE = ['.github/workflows/**', '.github/CODEOWNERS', 'CODEOWNERS', '.pre-commit-config.yaml', '.husky/**', 'lefthook.yml', 'docker-compose.pipegen.yml', '.gitleaksignore', '.semgrepignore', '.trivyignore', '.zap/**', '.github/actions/**', 'docs/CODEOWNERS', '.github/dependabot.yml',
+  // Renovate (Plan P carry-forward; C4 review 15): its config decides which dependency updates land
+  'renovate.json', 'renovate.json5', '.renovaterc', '.renovaterc.json', '.renovaterc.json5', '.github/renovate.json', '.github/renovate.json5'];
+/** Sections of shared files the gate always protects (`<file>:<section>`, as ReviewedTool.configSections): Renovate's key in package.json. */
+export const PROTECTED_SECTIONS_BASE = ['package.json:renovate'];
 // Effective protected paths = PROTECTED_PATHS_BASE + every config/ignore file declared by the reviewed tools in use (ReviewedTool.configFiles)
 export type SkippablePart = 'tests' | 'precommit' | 'docker' | 'compose' | 'deploy' | 'locks' | 'slack' | 'test-migration';   // never: secrets scan, gate
 export type SupportLevel = 'full' | 'audit-only';

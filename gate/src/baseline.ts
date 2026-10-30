@@ -80,6 +80,12 @@ export const MARKER_WINDOW = 10;
  * 5 pages + tag + tip + 3 x MARKER_WINDOW (compare, artifact list, download) + HISTORY_FAIL_CAP compares = 40.
  */
 export const HISTORY_FAIL_CAP = 3;
+/**
+ * Accepted residual risk (C4 fix round 1, ruling 9): a history rewrite of the default branch (a force-push) leaves orphaned green runs that
+ * share the compare budget, so the marker lookup can end `unknown` and the gate blocks until MARKER_WINDOW green pushes follow. It fails
+ * closed. The text for PIPEGEN.md (Plan G renders it):
+ */
+export const HISTORY_REWRITE_NOTE = 'After rewriting main\'s history (a force-push), the gate may stay in block mode until 10 green pushes to main have followed.';
 /** The cap on the artifact (as listed) and on the file inside it. */
 export const MAX_ARTIFACT_BYTES = 8 * 1024 * 1024;
 export const MAX_COUNT_ENTRIES = 200_000;
@@ -124,8 +130,16 @@ export interface GateGithub {
   listPullReviews(owner: string, name: string, number: number, page: number, perPage: number): Promise<unknown>;
   /** `GET .../contents/{path}?ref={sha}` → the JSON answer; a 404 (no such file at that commit) is `null`, any other error is thrown. `ref` is a 40-hex commit sha. */
   fileAt(owner: string, name: string, path: string, ref: string): Promise<unknown>;
-  /** `GET .../compare/{base}...{head}?per_page&page`: the answer carries `status` and one page of `files` (with their patches). Both are 40-hex shas. */
-  compareFiles(owner: string, name: string, base: string, head: string, page: number, perPage: number): Promise<unknown>;
+  /**
+   * `GET .../compare/{base}...{head}`: the answer carries `status` and `files` (with their patches). Both are 40-hex shas. ONE call, never
+   * paged: GitHub's REST docs ("Compare two commits") say the list of changed files "is only shown on the first page of results, and it
+   * includes up to 300 changed files for the entire comparison" (page/per_page page the commits). 300 files or more is incomplete.
+   */
+  compareFiles(owner: string, name: string, base: string, head: string): Promise<unknown>;
+  /** `GET .../collaborators/{login}/permission` → `{ permission, role_name }`; any error (404, 403, 5xx) is thrown. */
+  collaboratorPermission(owner: string, name: string, login: string): Promise<unknown>;
+  /** The raw text of a file (`GET .../contents/{path}?ref=` with `Accept: application/vnd.github.raw+json`), for files over 1 MiB; a 404 is `null`, any other error is thrown. */
+  rawFileAt(owner: string, name: string, path: string, ref: string): Promise<unknown>;
 }
 /** The write side (C5 wires `@actions/artifact`). */
 export interface ArtifactUploader {
@@ -414,7 +428,7 @@ async function walk<T>(gh: GateGithub, repo: RepoRef, ctx: VerifyContext, artifa
         }
         st.incomplete = true;
         notes.push(j.why === 'tag' ? `a tag named ${repo.defaultBranch} exists; no run is trusted until it is deleted`
-          : j.why === 'cap' ? `more than ${HISTORY_CHECK_CAP} runs needed a default-history check (cap)` : 'the default history of a run could not be checked');
+          : j.why === 'cap' ? `more than ${window === undefined ? HISTORY_CHECK_CAP : window + HISTORY_FAIL_CAP} runs needed a default-history check (cap)` : 'the default history of a run could not be checked');
         if (j.why === 'tag' || j.why === 'cap') return undefined;
         continue;
       }

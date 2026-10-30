@@ -1,0 +1,230 @@
+{
+ "ini": {
+  "colon-and-equals": {
+   "sections": {
+    "s": {
+     "a": "1",
+     "b": "2",
+     "c": "3",
+     "d": "4"
+    }
+   },
+   "text": "[s]\na: 1\nb = 2\nc=3\nd :4\n"
+  },
+  "comments": {
+   "sections": {
+    "mypy": {
+     "k": "v ; not stripped"
+    }
+   },
+   "text": "# c\n; c\n[mypy]\n# c\nk = v ; not stripped\n"
+  },
+  "continuation": {
+   "sections": {
+    "mypy": {
+     "plugins": "a\nb\n\nc",
+     "x": "1"
+    }
+   },
+   "text": "[mypy]\nplugins = a\n  b\n\n  c\nx: 1\n"
+  },
+  "default-merge": {
+   "sections": {
+    "mypy": {
+     "ignore_errors": "True",
+     "strict": "True"
+    },
+    "other": {
+     "ignore_errors": "False"
+    }
+   },
+   "text": "[DEFAULT]\nignore_errors = True\n[mypy]\nstrict = True\n[other]\nignore_errors = False\n"
+  },
+  "duplicate-option": {
+   "sections": null,
+   "text": "[a]\nk = 1\nk = 2\n"
+  },
+  "duplicate-section": {
+   "sections": null,
+   "text": "[a]\nk = 1\n[a]\nk = 2\n"
+  },
+  "empty-key": {
+   "sections": null,
+   "text": "[a]\n= v\n"
+  },
+  "empty-section": {
+   "sections": {
+    "mypy": {}
+   },
+   "text": "[mypy]\n"
+  },
+  "header-bracket-in-name": {
+   "sections": {
+    "a]b": {
+     "k": "v"
+    }
+   },
+   "text": "[a]b]\nk = v\n"
+  },
+  "header-comment": {
+   "sections": {
+    "metadata": {
+     "name": "x"
+    },
+    "mypy": {
+     "ignore_errors": "True"
+    }
+   },
+   "text": "[metadata]\nname = x\n[mypy] ; c\nignore_errors = True\n"
+  },
+  "header-tab": {
+   "sections": {
+    "mypy": {
+     "strict": "True"
+    }
+   },
+   "text": "[mypy]\t\nstrict = True\n"
+  },
+  "header-trailing-text": {
+   "sections": {
+    "metadata": {
+     "name": "x"
+    },
+    "mypy": {
+     "ignore_errors": "True"
+    }
+   },
+   "text": "[metadata]\nname = x\n[mypy]x = 1\nignore_errors = True\n"
+  },
+  "indented-header-no-option": {
+   "sections": {
+    "s": {},
+    "t": {
+     "k": "v"
+    }
+   },
+   "text": "[s]\n  [t]\nk = v\n"
+  },
+  "keys-lowercased": {
+   "sections": {
+    "mypy": {
+     "strict": "True"
+    }
+   },
+   "text": "[mypy]\nStrict = True\n"
+  },
+  "no-delimiter": {
+   "sections": null,
+   "text": "[a]\nbare\n"
+  },
+  "no-header": {
+   "sections": null,
+   "text": "k = v\n"
+  }
+ },
+ "ini_bad": [
+  "duplicate-section",
+  "duplicate-option",
+  "no-header",
+  "no-delimiter",
+  "empty-key"
+ ],
+ "toml": {
+  "array-of-tables": {
+   "text": "[[tool.mypy.overrides]]\nmodule = 'a'\n[[tool.mypy.overrides]]\nmodule = 'b'\n",
+   "value": {
+    "tool": {
+     "mypy": {
+      "overrides": [
+       {
+        "module": "a"
+       },
+       {
+        "module": "b"
+       }
+      ]
+     }
+    }
+   }
+  },
+  "collision": {
+   "text": "tool.x = 1\n\"tool.mypy\" = { strict = true }\n[tool.mypy]\nignore_errors = true\n",
+   "value": {
+    "tool": {
+     "mypy": {
+      "ignore_errors": true
+     },
+     "x": 1
+    },
+    "tool.mypy": {
+     "strict": true
+    }
+   }
+  },
+  "dotted-root": {
+   "text": "tool.mypy.strict = true\ntool.mypy.ignore_errors = true\n",
+   "value": {
+    "tool": {
+     "mypy": {
+      "ignore_errors": true,
+      "strict": true
+     }
+    }
+   }
+  },
+  "inline": {
+   "text": "[tool]\nmypy = { strict = true, ignore_errors = true }\n",
+   "value": {
+    "tool": {
+     "mypy": {
+      "ignore_errors": true,
+      "strict": true
+     }
+    }
+   }
+  },
+  "nan-inf": {
+   "text": "[tool.mypy]\na = inf\nb = nan\nc = -inf\n",
+   "value": {
+    "tool": {
+     "mypy": {
+      "a": {
+       "$num": "inf"
+      },
+      "b": {
+       "$num": "nan"
+      },
+      "c": {
+       "$num": "-inf"
+      }
+     }
+    }
+   }
+  },
+  "quoted": {
+   "text": "[\"tool\".\"mypy\"]\nstrict = true\n",
+   "value": {
+    "tool": {
+     "mypy": {
+      "strict": true
+     }
+    }
+   }
+  },
+  "unicode-key": {
+   "text": "[tool.\"my\\u0070y\"]\nstrict = true\n",
+   "value": {
+    "tool": {
+     "mypy": {
+      "strict": true
+     }
+    }
+   }
+  }
+ },
+ "toml_bad": {
+  "duplicate-key": "a = 1\na = 2\n",
+  "duplicate-table": "[tool.mypy]\na = 1\n[tool.mypy]\nb = 2\n",
+  "unterminated": "[tool.mypy\nx = 1\n"
+ }
+}

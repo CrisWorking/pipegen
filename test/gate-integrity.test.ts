@@ -6,9 +6,10 @@
 import { describe, expect, it } from 'vitest';
 import type { GateGithub } from '../gate/src/baseline.js';
 import {
-  addedLinesOf, baseHasInstall, buildPrDiff, codeOwners, integrityFindings, loadCodeowners, ownersOf, readConfigSections, readPrContext,
+  addedLinesOf, baseHasInstall, buildPrDiff, codeOwners, integrityFindings, loadCodeowners, ownersOf, parseConfigDoc, readConfigSections, readPrContext,
   type CodeownersRule, type PrContext, type PrFile,
 } from '../gate/src/integrity.js';
+import { PROTECTED_PATHS_BASE } from '../src/types.js';
 
 // ---------- builders ----------
 const SHA = (c: string): string => c.repeat(40);
@@ -38,6 +39,17 @@ class Gh implements GateGithub {
   cmp: Answer = { status: 'ahead', files: [] };   // an object whose files the fake pages, or any hostile answer
   private out(a: Answer): unknown { if (a instanceof Error) throw a; return a; }
   async getPull(_o: string, _n: string, n: number): Promise<unknown> { this.calls.push(`pull ${n}`); return this.out(this.pull); }
+  perms = new Map<string, Answer>();   // login -> permission answer (default: write)
+  raw = new Map<string, Answer>();     // `${ref}:${path}` -> raw text (default: 404)
+  async collaboratorPermission(_o: string, _n: string, login: string): Promise<unknown> {
+    this.calls.push(`perm ${login}`);
+    return this.out(this.perms.has(login) ? this.perms.get(login) : { permission: 'write' });
+  }
+  async rawFileAt(_o: string, _n: string, path: string, ref: string): Promise<unknown> {
+    this.calls.push(`raw ${ref.slice(0, 1)}:${path}`);
+    const k = `${ref}:${path}`;
+    return this.raw.has(k) ? this.out(this.raw.get(k)) : null;
+  }
   async listPullFiles(_o: string, _n: string, _num: number, page: number, perPage: number): Promise<unknown> {
     this.calls.push(`files ${page}`); const a = this.out(this.files); return Array.isArray(a) ? a.slice((page - 1) * perPage, page * perPage) : a;
   }
@@ -49,14 +61,11 @@ class Gh implements GateGithub {
     const k = `${ref}:${path}`;
     return this.contents.has(k) ? this.out(this.contents.get(k)) : null;
   }
-  async compareFiles(_o: string, _n: string, base: string, head: string, page: number, perPage: number): Promise<unknown> {
-    this.calls.push(`compare ${base.slice(0, 1)}...${head.slice(0, 1)} ${page}`);
-    const a = this.out(this.cmp);
-    if (typeof a === 'object' && a !== null && Array.isArray((a as { files?: unknown }).files)) {
-      const all = (a as { files: unknown[] }).files;
-      return { ...a, files: all.slice((page - 1) * perPage, page * perPage) };
-    }
-    return a;
+  // GitHub's REST "Compare two commits": "the list of changed files is only shown on the first page of results, and it includes up to
+  // 300 changed files for the entire comparison" (page/per_page page the COMMITS). The adapter makes one call and never pages the files.
+  async compareFiles(_o: string, _n: string, base: string, head: string): Promise<unknown> {
+    this.calls.push(`compare ${base.slice(0, 1)}...${head.slice(0, 1)}`);
+    return this.out(this.cmp);
   }
   // GateGithub members the integrity code never uses
   async compare(): Promise<unknown> { throw new Error('not used'); }
@@ -85,8 +94,9 @@ describe('codeowners: parsing', () => {
     expect(codeOwners('')).toEqual([]);
     expect(codeOwners('!x @a\n/y[ab] @a\n\\#z @a\n/ok @a\n')).toEqual([{ pattern: '/ok', owners: ['a'] }]);
   });
-  it('an owner that is not a valid login is dropped, not trusted', () => {
-    expect(codeOwners('/a @ok @-bad @bad- @a_b @' + 'x'.repeat(40) + ' @fine-1\n')[0]?.owners).toEqual(['ok', 'fine-1']);
+  it('a line with any owner token that is not a valid login, team or e-mail is skipped whole, as GitHub does (fix round 1, review 14)', () => {
+    for (const bad of ['@-bad', '@bad-', '@a_b', '@' + 'x'.repeat(40), 'plain', '@']) expect(codeOwners(`/a @ok ${bad} @fine-1\n`), bad).toEqual([]);
+    expect(codeOwners('/a @fine-1 @org/team user@example.com\n')).toEqual([{ pattern: '/a', owners: ['fine-1'] }]);
   });
   it('a hostile huge file is bounded: only the first 100,000 rules count and a line over 4096 characters is skipped', () => {
     const rules = codeOwners(`${'/' + 'a'.repeat(5000)} @a\n` + Array.from({ length: 100_050 }, (_, i) => `/p${i} @a`).join('\n'));
@@ -197,7 +207,7 @@ const review = (id: number, login: string, state: string, commit = HEAD): Record
 const many = (n: number, mk: (i: number) => unknown): unknown[] => Array.from({ length: n }, (_, i) => mk(i));
 const ghWith = (files: unknown[], over: Record<string, unknown> = {}): Gh => {
   const g = new Gh();
-  g.pull = { number: 5, head: { sha: HEAD, repo: { id: 7 } }, base: { sha: BASE }, changed_files: files.length, ...over };
+  g.pull = { number: 5, head: { sha: HEAD, repo: { id: 7 } }, base: { sha: BASE }, user: { login: 'author' }, changed_files: files.length, ...over };
   g.files = files;
   return g;
 };
@@ -308,7 +318,10 @@ describe('readPrContext: approvals', () => {
     expect(big.calls.filter((c) => c.startsWith('reviews')).length).toBeLessThanOrEqual(31);
   });
   it('approvals: when the pull head is not the commit the caller expects (the head moved), nothing is approved', async () => {
-    expect((await approvalsOf([review(1, 'a', 'APPROVED')], { expectHeadSha: SHA('d') })).approvals).toEqual([]);
+    const moved = await approvalsOf([review(1, 'a', 'APPROVED')], { expectHeadSha: SHA('d') });
+    expect(moved.approvals).toEqual([]);
+    expect(moved.filesComplete).toBe(false);   // fix round 1 (7): the files are another commit's, so the list cannot be judged complete
+    expect(ids(integrityFindings(moved, PROTECTED, OWNER_RULES))).toContain('integrity:incomplete-list');
     expect((await approvalsOf([review(1, 'a', 'APPROVED')], { expectHeadSha: HEAD })).approvals).toEqual(['a']);
   });
 });
@@ -451,7 +464,7 @@ describe('integrityFindings: suppressions', () => {
     expect(found('const a = 1;')).toEqual([]);
     expect(found('x = 1  # noqa: E501')).toEqual([]);
     const removed = file('src/a.ts', { patch: '@@ -1,3 +1,2 @@\n keep\n- // nosemgrep\n keep2' });
-    const context = file('src/a.ts', { patch: '@@ -1,2 +1,3 @@\n // nosemgrep\n+new\n keep2' });
+    const context = file('src/a.ts', { patch: '@@ -1,2 +1,3 @@\n keep\n+new\n // nosemgrep' });
     expect(integrityFindings(ctx({ files: [removed, context] }), PROTECTED, OWNER_RULES)).toEqual([]);
   });
   it('a suppression hidden deep in a multi-line patch hunk is found, with its new-file line number', () => {
@@ -556,6 +569,8 @@ describe('addedLines', () => {
   it('a text file with changes and no patch makes it incomplete; a binary file does not; a removed file adds nothing', () => {
     expect(addedLinesOf([file('big.ts', { changes: 9, patch: undefined })]).complete).toBe(false);
     expect(addedLinesOf([file('logo.png', { changes: 0, patch: undefined })]).complete).toBe(true);
+    expect(addedLinesOf([file('logo.png', { changes: 9, patch: undefined })]).complete).toBe(false);   // the name is the author's choice (review 16)
+    expect(addedLinesOf([file('huge.ts', { status: 'removed', changes: 90000, patch: undefined })]).complete).toBe(true);
     const r = addedLinesOf([file('gone.ts', { status: 'removed', patch: '@@ -1,2 +0,0 @@\n-a\n-b' })]);
     expect(r.complete).toBe(true);
     expect(r.added.get('gone.ts')).toBeUndefined();
@@ -575,7 +590,7 @@ describe('buildPrDiff: the diff of the scanned commit, from the compare API', ()
   it('compares base...github.sha, takes the lines of THAT compare, and sets commit = the head sha', async () => {
     const g = new Gh(); g.cmp = { status: 'ahead', files: [entry('a.ts')] };
     const d = await buildPrDiff(g, REPO, BASE, HEAD);
-    expect(g.calls).toEqual(['compare b...a 1']);
+    expect(g.calls).toEqual(['compare b...a']);
     expect(d.commit).toBe(HEAD);
     expect(d.complete).toBe(true);
     expect([...(d.added.get('a.ts') ?? [])]).toEqual([2]);
@@ -583,23 +598,23 @@ describe('buildPrDiff: the diff of the scanned commit, from the compare API', ()
   it('merge_group: the same call with base_sha and head_sha', async () => {
     const g = new Gh(); g.cmp = { status: 'ahead', files: [entry('a.ts')] };
     const d = await buildPrDiff(g, REPO, SHA('c'), SHA('d'));
-    expect(g.calls).toEqual(['compare c...d 1']);
+    expect(g.calls).toEqual(['compare c...d']);
     expect(d.commit).toBe(SHA('d'));
   });
-  it('pages the files: 250 files take 3 pages', async () => {
-    const g = new Gh(); g.cmp = { status: 'ahead', files: many(250, (i) => entry(`f${i}.ts`)) };
+  it('one call only: the API shows the files on the first page, up to 300; 299 files are complete and the compare is never paged', async () => {
+    const g = new Gh(); g.cmp = { status: 'ahead', files: many(299, (i) => entry(`f${i}.ts`)) };
     const d = await buildPrDiff(g, REPO, BASE, HEAD);
     expect(d.complete).toBe(true);
-    expect(d.added.size).toBe(250);
-    expect(g.calls.length).toBe(3);
+    expect(d.added.size).toBe(299);
+    expect(g.calls.length).toBe(1);
   });
-  it('a compare whose file list is truncated (the 3,000-file cap) is incomplete', async () => {
-    const g = new Gh(); g.cmp = { status: 'ahead', files: many(3000, (i) => entry(`f${i}.ts`)) };
-    const d = await buildPrDiff(g, REPO, BASE, HEAD);
-    expect(d.complete).toBe(false);
-    expect(g.calls.length).toBeLessThanOrEqual(31);
-    const h = new Gh(); h.cmp = { status: 'ahead', files: many(4000, (i) => entry(`f${i}.ts`)) };
-    expect((await buildPrDiff(h, REPO, BASE, HEAD)).complete).toBe(false);
+  it('300 files or more is the API cap: incomplete (a truncation cannot pass as complete)', async () => {
+    for (const n of [300, 301, 3000]) {
+      const g = new Gh(); g.cmp = { status: 'ahead', files: many(n, (i) => entry(`f${i}.ts`)) };
+      const d = await buildPrDiff(g, REPO, BASE, HEAD);
+      expect(d.complete, String(n)).toBe(false);
+      expect(g.calls.length, String(n)).toBe(1);
+    }
   });
   it('missing patches, a malformed file, a non-array, an error, a missing status, or a head that is not ahead of the base → incomplete', async () => {
     const cases: unknown[] = [
@@ -686,13 +701,26 @@ describe('configSections: a change inside a section of a shared file is protecte
     await readConfigSections(g, REPO, ctx({ files: [file('src/a.ts'), file('mypy.ini'), file('pyproject.toml')] }), ['pyproject.toml:tool.mypy'], ['pyproject.toml']);
     expect(g.calls).toEqual([]);
   });
-  it('a rename of the file is checked against the previous path at base and the new path at head; a deleted file reads no head', async () => {
+  it('a rename OUT of the place a tool reads a shared config file from is a finding even when the file is unchanged; the new path is compared as an addition (fix round 1, review 6)', async () => {
     const g = new Gh(); put(g, BASE, 'pyproject.toml', PY0); put(g, HEAD, 'other/p.toml', '[project]\nname="x"\n');
     const r = await run(g, [file('other/p.toml', { status: 'renamed', previous_filename: 'pyproject.toml', changes: 0, patch: undefined })]);
-    expect(r.map((c) => c.section)).toEqual(['tool.mypy']);
+    expect(r).toEqual([{ file: 'pyproject.toml', section: '(file moved)' }]);
+    const same = new Gh(); put(same, BASE, 'setup.cfg', '[mypy]\nstrict = True\n'); put(same, HEAD, 'old/setup.cfg', '[mypy]\nstrict = True\n');
+    const r2 = await run(same, [file('old/setup.cfg', { status: 'renamed', previous_filename: 'setup.cfg', changes: 0, patch: undefined })]);
+    expect(r2.map((c) => [c.file, c.section]).sort()).toEqual([['old/setup.cfg', 'mypy'], ['setup.cfg', '(file moved)']]);
     const d = new Gh(); put(d, BASE, 'pyproject.toml', PY0);
     expect((await run(d, [file('pyproject.toml', { status: 'removed' })])).length).toBe(1);
     expect(d.calls).toEqual(['file b:pyproject.toml']);
+  });
+  it('a renamed config file with a change needs BOTH owners: the owner of the new path alone does not waive it', async () => {
+    const same = new Gh(); put(same, BASE, 'setup.cfg', '[mypy]\nstrict = True\n'); put(same, HEAD, 'old/setup.cfg', '[mypy]\nignore_errors = True\n');
+    const files = [file('old/setup.cfg', { status: 'renamed', previous_filename: 'setup.cfg' })];
+    const changes = await run(same, files);
+    const rules = owners('/old/ @mallory\n/setup.cfg @admin\n');
+    const by = (who: string[]) => integrityFindings(ctx({ files, approvals: who }), PROTECTED, rules, { sectionChanges: changes }).map((f) => f.file);
+    expect(by(['mallory'])).toEqual(['setup.cfg']);
+    expect(by(['admin'])).toEqual(['old/setup.cfg']);
+    expect(by(['admin', 'mallory'])).toEqual([]);
   });
   it('a mutation hidden by the matching being case-insensitive: PyProject.TOML is checked too', async () => {
     const g = new Gh(); put(g, BASE, 'PyProject.TOML', PY0); put(g, HEAD, 'PyProject.TOML', PY0.replace('true', 'false'));
@@ -719,6 +747,211 @@ describe('hostile input never throws', () => {
       expect(() => integrityFindings(ctx({ files, approvals: ['a'] }), PROTECTED, rules)).not.toThrow();
       expect(() => ownersOf(rules, junk(30))).not.toThrow();
       expect(() => addedLinesOf(files)).not.toThrow();
+    }
+  });
+});
+
+// ======================= fix round 1 (review-C4.md, rulings in task-C4-fix-round-1.md) =======================
+import { readFileSync } from 'node:fs';
+
+describe('fix round 1 (1): a slashless protected name is protected at any depth', () => {
+  const P = [...PROTECTED, '.bandit', 'mypy.ini', '.coveragerc', 'ruff.toml'];
+  it('tests/fixtures/.bandit, services/api/mypy.ini and the rest are protected', () => {
+    for (const f of ['tests/fixtures/.bandit', '.bandit', 'services/api/mypy.ini', 'a/b/c/.coveragerc', 'x/.gitleaksignore', 'x/Eslint.Config.mjs', 'web/.prettierrc.json', 'a/Knip.JSON']) {
+      expect(ids(integrityFindings(ctx({ files: [file(f)] }), P, OWNER_RULES)), f).toContain('integrity:protected-path');
+    }
+  });
+  it('an entry with a slash stays anchored: x/.github/workflows/a.yml is not the workflow folder; .gitignore is not in the list', () => {
+    expect(integrityFindings(ctx({ files: [file('x/.github/workflows/a.yml'), file('src/.gitignore')] }), P, OWNER_RULES)).toEqual([]);
+  });
+  it('the shared-file part of a configSection also matches at any depth', async () => {
+    const g = new Gh();
+    g.contents.set(`${BASE}:services/api/pyproject.toml`, contentOf('[tool.mypy]\nstrict = true\n'));
+    g.contents.set(`${HEAD}:services/api/pyproject.toml`, contentOf('[tool.mypy]\nstrict = false\n'));
+    const r = await readConfigSections(g, REPO, ctx({ files: [file('services/api/pyproject.toml')] }), ['pyproject.toml:tool.mypy'], []);
+    expect(r).toEqual([{ file: 'services/api/pyproject.toml', section: 'tool.mypy' }]);
+  });
+  it('the base list protects the Renovate files (review 15)', () => {
+    for (const f of ['renovate.json', 'renovate.json5', '.renovaterc', '.renovaterc.json', '.renovaterc.json5', '.github/renovate.json', '.github/renovate.json5']) {
+      expect(ids(integrityFindings(ctx({ files: [file(f)] }), PROTECTED_PATHS_BASE, OWNER_RULES)), f).toContain('integrity:protected-path');
+    }
+  });
+});
+
+describe('fix round 1 (2, 17): an approval counts only from a user with write access, never from the author', () => {
+  const run = async (perm: Answer, who = 'alice'): Promise<PrContext> => {
+    const g = ghWith([]); g.reviews = [review(1, who, 'APPROVED')]; g.perms.set(who, perm);
+    return readPrContext(g, REPO, 5);
+  };
+  it('write, admin and maintain count', async () => {
+    expect((await run({ permission: 'write' })).approvals).toEqual(['alice']);
+    expect((await run({ permission: 'admin' })).approvals).toEqual(['alice']);
+    expect((await run({ permission: 'read', role_name: 'maintain' })).approvals).toEqual(['alice']);
+  });
+  it('a read-only owner, a non-collaborator (a renamed-owner squatter), triage and a malformed answer do not', async () => {
+    for (const a of [{ permission: 'read' }, { permission: 'none' }, { permission: 'read', role_name: 'triage' }, {}, 'write', null, { permission: 'WRITE' }]) {
+      expect((await run(a)).approvals, JSON.stringify(a)).toEqual([]);
+    }
+  });
+  it('an API error (404, 403, 5xx) means the approval does not count', async () => {
+    for (const e of [new Error('404'), new Error('403'), new Error('500')]) expect((await run(e)).approvals).toEqual([]);
+  });
+  it('end to end: the squatter approves the workflow change and it still blocks', async () => {
+    const g = ghWith([file(WF)]); g.reviews = [review(1, 'alice', 'APPROVED')]; g.perms.set('alice', { permission: 'none' });
+    const pr = await readPrContext(g, REPO, 5);
+    expect(ids(integrityFindings(pr, PROTECTED, OWNER_RULES))).toEqual(['integrity:protected-path']);
+  });
+  it('each approver is checked once, only approvers are checked, and no check is made when the reviews are incomplete', async () => {
+    const g = ghWith([]); g.reviews = [review(1, 'a', 'APPROVED'), review(2, 'a', 'COMMENTED'), review(3, 'b', 'COMMENTED'), review(4, 'c', 'CHANGES_REQUESTED'), review(5, 'd', 'APPROVED')];
+    await readPrContext(g, REPO, 5);
+    expect(g.calls.filter((c) => c.startsWith('perm')).sort()).toEqual(['perm a', 'perm d']);
+    const e = ghWith([]); e.reviews = new Error('500');
+    await readPrContext(e, REPO, 5);
+    expect(e.calls.filter((c) => c.startsWith('perm'))).toEqual([]);
+  });
+  it('the author is never an approver, whatever the review says (review 17)', async () => {
+    const g = ghWith([]); g.reviews = [review(1, 'Author', 'APPROVED'), review(2, 'alice', 'APPROVED')];
+    expect((await readPrContext(g, REPO, 5)).approvals).toEqual(['alice']);
+  });
+});
+
+describe('fix round 1 (3, 4): INI parsing is configparser (Python 3.12 oracle, test/fixtures/gate-integrity/oracle.json)', () => {
+  const oracle = JSON.parse(readFileSync('test/fixtures/gate-integrity/oracle.json', 'utf8')) as {
+    ini: Record<string, { text: string; sections: Record<string, Record<string, string>> | null }>;
+    toml: Record<string, { text: string; value: unknown }>; toml_bad: Record<string, string>;
+  };
+  for (const [name, c] of Object.entries(oracle.ini)) {
+    it(`ini ${name}: ${c.sections === null ? 'configparser rejects it, so do we' : 'the same sections and values as configparser'}`, () => {
+      const got = parseConfigDoc('setup.cfg', c.text);
+      if (c.sections === null) expect(got).toBeUndefined();
+      else expect(got).toEqual(c.sections);
+    });
+  }
+  const put = (g: Gh, ref: string, path: string, text: string): void => { g.contents.set(`${ref}:${path}`, contentOf(text)); };
+  const secs = async (base: string, head: string): Promise<{ section: string; problem?: string }[]> => {
+    const g = new Gh(); put(g, BASE, 'setup.cfg', base); put(g, HEAD, 'setup.cfg', head);
+    return readConfigSections(g, REPO, ctx({ files: [file('setup.cfg')] }), ['setup.cfg:mypy', 'setup.cfg:mypy-*'], []);
+  };
+  it('review 3: [mypy]x = 1 is the header of section mypy (the rest of the line is ignored): the change is seen', async () => {
+    const r = await secs('[metadata]\nname = x\n', '[metadata]\nname = x\n[mypy]x = 1\nignore_errors = True\n');
+    expect(r.map((c) => c.section)).toEqual(['mypy']);
+  });
+  it('review 3: [mypy] ; c is a header too, not a parse failure', async () => {
+    const r = await secs('[metadata]\nname = x\n', '[metadata]\nname = x\n[mypy] ; c\nignore_errors = True\n');
+    expect(r).toEqual([{ file: 'setup.cfg', section: 'mypy' }]);
+  });
+  it('review 4: a change to [DEFAULT] is a change to every watched section', async () => {
+    const r = await secs('[mypy]\nstrict = True\n', '[DEFAULT]\nignore_errors = True\n[mypy]\nstrict = True\n');
+    expect(r).toEqual([{ file: 'setup.cfg', section: 'mypy' }]);
+    expect(await secs('[mypy]\nstrict = True\n[other]\nx = 1\n', '[DEFAULT]\nignore_errors = True\n[mypy]\nstrict = True\n[other]\nx = 1\n')).toHaveLength(1);
+  });
+  it('review 4: a DEFAULT change with no watched section in either file is nothing; an own key overrides the default value', async () => {
+    expect(await secs('[flake8]\nx = 1\n', '[DEFAULT]\nignore_errors = True\n[flake8]\nx = 1\n')).toEqual([]);
+    expect(await secs('[mypy]\nignore_errors = False\n', '[DEFAULT]\nignore_errors = True\n[mypy]\nignore_errors = False\n')).toEqual([]);
+  });
+});
+
+describe('fix round 1 (5): TOML keys are canonical paths (tomllib oracle)', () => {
+  const oracle = JSON.parse(readFileSync('test/fixtures/gate-integrity/oracle.json', 'utf8')) as {
+    toml: Record<string, { text: string; value: unknown }>; toml_bad: Record<string, string>;
+  };
+  for (const [name, c] of Object.entries(oracle.toml)) {
+    it(`toml ${name}: the same document as tomllib`, () => { expect(parseConfigDoc('pyproject.toml', c.text)).toEqual(c.value); });
+  }
+  for (const [name, text] of Object.entries(oracle.toml_bad)) {
+    it(`toml ${name}: tomllib rejects it, so do we`, () => { expect(parseConfigDoc('pyproject.toml', text)).toBeUndefined(); });
+  }
+  const put = (g: Gh, ref: string, path: string, text: string): void => { g.contents.set(`${ref}:${path}`, contentOf(text)); };
+  const secs = async (base: string, head: string) => {
+    const g = new Gh(); put(g, BASE, 'pyproject.toml', base); put(g, HEAD, 'pyproject.toml', head);
+    return readConfigSections(g, REPO, ctx({ files: [file('pyproject.toml')] }), ['pyproject.toml:tool.mypy'], []);
+  };
+  it('a literal "tool.mypy" key beside the table [tool.mypy] is ambiguous and fails closed as a finding', async () => {
+    const r = await secs('[tool.mypy]\nstrict = true\n', 'tool.x = 1\n"tool.mypy" = { strict = true }\n[tool.mypy]\nignore_errors = true\n');
+    expect(r.length).toBe(1);
+    expect(r[0]?.problem).toBeTypeOf('string');
+  });
+  it('a dotted literal key that collides with nothing is not a problem and not a change', async () => {
+    expect(await secs('[tool.mypy]\nstrict = true\n', '"a.b" = 1\n[tool.mypy]\nstrict = true\n')).toEqual([]);
+  });
+  it('x = inf to x = nan is a change; so is -inf', async () => {
+    expect((await secs('[tool.mypy]\nx = inf\n', '[tool.mypy]\nx = nan\n')).map((c) => c.section)).toEqual(['tool.mypy']);
+    expect((await secs('[tool.mypy]\nx = inf\n', '[tool.mypy]\nx = -inf\n')).length).toBe(1);
+    expect(await secs('[tool.mypy]\nx = inf\n', '[tool.mypy]\nx = inf\n')).toEqual([]);
+  });
+  it('dotted keys, inline tables, quoted keys, \\u escapes and arrays of tables all reach [tool.mypy]', async () => {
+    const base = '[tool.mypy]\nstrict = true\n';
+    for (const head of ['tool.mypy.strict = true\ntool.mypy.ignore_errors = true\n', '[tool]\nmypy = { strict = true, ignore_errors = true }\n', '["tool"."mypy"]\nstrict = true\nignore_errors = true\n',
+      '[tool."my\\u0070y"]\nstrict = true\nignore_errors = true\n', '[tool.mypy]\nstrict = true\n[[tool.mypy.overrides]]\nmodule = "a"\n']) {
+      expect((await secs(base, head)).map((c) => c.section), head).toEqual(['tool.mypy']);
+    }
+  });
+});
+
+describe('fix round 1 (8, 7): compare is not paged; a moved head is incomplete', () => {
+  it('a file with a binary-looking name but changes and no patch makes the diff incomplete (the author picks the name)', async () => {
+    const g = new Gh(); g.cmp = { status: 'ahead', files: [{ filename: 'x.png', status: 'modified', changes: 5 }] };
+    expect((await buildPrDiff(g, REPO, BASE, HEAD)).complete).toBe(false);
+  });
+  it('the integrity side keeps the binary exemption, and a removed file with no patch needs none', () => {
+    expect(integrityFindings(ctx({ files: [file('x.png', { changes: 5, patch: undefined }), file('big.ts', { status: 'removed', changes: 99999, patch: undefined })] }), PROTECTED, OWNER_RULES)).toEqual([]);
+  });
+});
+
+describe('fix round 1 (10, 11, 12): messages, markers, next-line markers, CODEOWNERS size', () => {
+  const add = (text: string, filename = 'src/a.py'): PrFile => file(filename, { patch: `@@ -1,2 +1,3 @@\n keep\n+${text}\n keep2` });
+  const found = (text: string): string[] => ids(integrityFindings(ctx({ files: [add(text)] }), PROTECTED, OWNER_RULES));
+  it('a path owned only by a team says so and tells the author to name a user; no CODEOWNERS and unreadable CODEOWNERS say different things', () => {
+    const team = integrityFindings(ctx({ files: [file(WF)] }), PROTECTED, owners('* @org/team\n'));
+    expect(team[0]?.message).toMatch(/team/i);
+    expect(team[0]?.message).toMatch(/name a user/i);
+    const none = integrityFindings(ctx({ files: [file(WF)] }), PROTECTED, [], { codeowners: { found: null } });
+    expect(none[0]?.message).toMatch(/no CODEOWNERS/i);
+    const bad = integrityFindings(ctx({ files: [file(WF)] }), PROTECTED, [], { codeowners: { found: null, problem: 'CODEOWNERS of the base commit could not be read (x)' } });
+    expect(bad[0]?.message).toMatch(/could not be read/i);
+    expect(bad[0]?.message).not.toMatch(/has no CODEOWNERS/i);
+    const empty = integrityFindings(ctx({ files: [file(WF)] }), PROTECTED, [], { codeowners: { found: '.github/CODEOWNERS' } });
+    expect(empty[0]?.message).toMatch(/no rule/i);
+  });
+  it('more suppression markers', () => {
+    for (const t of ['// betterleaks:allow', '// biome-ignore lint/security/noGlobalEval: x', '// biome-ignore-all lint: x', '// oxlint-disable-next-line', '// oxlint-disable', '# ruff: disable[S101]', '# ruff: noqa',
+      '# pragma: no cover', '/* istanbul ignore next */', '/* c8 ignore next */', '/* v8 ignore next */', '# zizmor: ignore[artipacked]', '# type: ignore', '// @ts-ignore', '// @ts-expect-error', '// @ts-nocheck',
+      '// eslint-disable-next-line no-eval', '# noqa: E501 # noqa: S101', '# noqa:E501,S608', '# noqa:S101', '# noqa : S101', '# nosem : rule', '// #nosec G101']) {
+      expect(found(t), t).toEqual(['integrity:suppression']);
+    }
+    expect(found('x = 1  # noqa: E501 # noqa: W291')).toEqual([]);
+  });
+  it('an existing next-line marker directly above a changed line counts as added; a marker far above, or on the line itself unchanged, does not', () => {
+    const above = (marker: string): PrFile => file('src/a.ts', { patch: `@@ -1,4 +1,4 @@\n keep\n ${marker}\n-old()\n+evil()\n keep2` });
+    for (const m of ['// nosemgrep', '// eslint-disable-next-line no-eval', '# hadolint ignore=DL3008', '#trivy:ignore:AVD-1', '// @ts-ignore', '// biome-ignore lint: x']) {
+      const f = integrityFindings(ctx({ files: [above(m)] }), PROTECTED, OWNER_RULES);
+      expect(ids(f), m).toEqual(['integrity:suppression']);
+      expect(f[0]?.line, m).toBe(3);
+    }
+    // two lines above (a blank between): the marker no longer applies to the changed line
+    const far = file('src/a.ts', { patch: '@@ -1,4 +1,4 @@\n // nosemgrep\n ok()\n-old()\n+evil()\n keep2' });
+    expect(integrityFindings(ctx({ files: [far] }), PROTECTED, OWNER_RULES)).toEqual([]);
+    // a marker that is itself a removed line is gone
+    const gone = file('src/a.ts', { patch: '@@ -1,2 +1,2 @@\n keep\n-// nosemgrep\n+evil()' });
+    expect(ids(integrityFindings(ctx({ files: [gone] }), PROTECTED, OWNER_RULES))).toEqual([]);
+  });
+  it('CODEOWNERS up to 3 MB is read (through the raw media type above 1 MiB); over 3 MB or an unreadable raw answer fails closed', async () => {
+    const big = '* @alice\n' + '#'.repeat(2_000_000) + '\n';
+    const g = new Gh();
+    g.contents.set(`${BASE}:.github/CODEOWNERS`, { type: 'file', encoding: 'none', size: Buffer.byteLength(big), content: '' });
+    g.raw.set(`${BASE}:.github/CODEOWNERS`, big);
+    const r = await loadCodeowners(g, REPO, BASE);
+    expect(r.problem).toBeUndefined();
+    expect(ownersOf(r.rules, 'x')).toEqual(['alice']);
+    expect(g.calls).toEqual(['file b:.github/CODEOWNERS', 'raw b:.github/CODEOWNERS']);
+    for (const bad of [{ type: 'file', encoding: 'none', size: 3 * 1024 * 1024 + 1, content: '' }]) {
+      const h = new Gh(); h.contents.set(`${BASE}:.github/CODEOWNERS`, bad);
+      expect((await loadCodeowners(h, REPO, BASE)).problem).toBeTypeOf('string');
+      expect(h.calls).toEqual(['file b:.github/CODEOWNERS']);
+    }
+    for (const rawBad of [new Error('500'), 5, { x: 1 }]) {
+      const h = new Gh(); h.contents.set(`${BASE}:.github/CODEOWNERS`, { type: 'file', encoding: 'none', size: 2_000_000, content: '' }); h.raw.set(`${BASE}:.github/CODEOWNERS`, rawBad as never);
+      expect((await loadCodeowners(h, REPO, BASE)).problem, String(rawBad)).toBeTypeOf('string');
     }
   });
 });

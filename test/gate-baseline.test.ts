@@ -7,7 +7,7 @@ import { describe, expect, it } from 'vitest';
 import { BASELINE_ARTIFACT, CLEAN_RUN_ARTIFACT } from '../src/engine/artifact-names.js';
 import {
   buildBaseline, buildCleanRunMarker, cleanRunSeen, inDefaultHistory, loadBaseline, saveBaseline, trustedRun, verifyBaselineArtifact, verifyCleanRunArtifact,
-  BASELINE_RETENTION_DAYS, HISTORY_CHECK_CAP, HISTORY_FAIL_CAP, MARKER_WINDOW, MAX_COUNT_ENTRIES, MAX_RUN_PAGES, MAX_TRUSTED_RUNS, WORKFLOW_PATH, type ArtifactMeta, type ArtifactUploader, type GateGithub, type RepoRef, type RunQuery, type VerifyContext,
+  BASELINE_RETENTION_DAYS, HISTORY_CHECK_CAP, HISTORY_FAIL_CAP, HISTORY_REWRITE_NOTE, MARKER_WINDOW, MAX_COUNT_ENTRIES, MAX_RUN_PAGES, MAX_TRUSTED_RUNS, WORKFLOW_PATH, type ArtifactMeta, type ArtifactUploader, type GateGithub, type RepoRef, type RunQuery, type VerifyContext,
 } from '../gate/src/baseline.js';
 import { countKeyOf } from '../gate/src/decide.js';
 import { keyId } from '../gate/src/fingerprint.js';
@@ -83,6 +83,8 @@ class FakeGh implements GateGithub {
   async listPullReviews(): Promise<unknown> { throw new Error('not used'); }
   async fileAt(): Promise<unknown> { throw new Error('not used'); }
   async compareFiles(): Promise<unknown> { throw new Error('not used'); }
+  async collaboratorPermission(): Promise<unknown> { throw new Error('not used'); }
+  async rawFileAt(): Promise<unknown> { throw new Error('not used'); }
 }
 const run = (over: Record<string, unknown> = {}): Record<string, unknown> => ({
   id: 100, event: 'push', conclusion: 'success', path: WORKFLOW_PATH, head_branch: 'main', head_sha: S1, head_repository: { id: 7 }, ...over,
@@ -1242,5 +1244,20 @@ describe('Part 0 (review-C3-r2 CF1, CF4; coordinator revision): failing runs are
       expect(r.state, String(n)).toBe('unknown');
       expect(r.note, String(n)).toMatch(/none passes/);
     }
+  });
+});
+
+describe('C4 fix round 1 (9): the C3-r2 CF1 lock-in is an accepted residual risk, pinned here', () => {
+  it('the PIPEGEN.md text for it exists', () => { expect(HISTORY_REWRITE_NOTE).toMatch(/force-push.*block mode until 10 green pushes/); });
+  const sha = (i: number): string => (1000 + i).toString(16).padStart(40, 'a');
+  it('a history rewrite with 600 orphaned green runs behind 4 fresh ones → unknown (block), within 40 calls, and the note names the marker budget', async () => {
+    const runs = Array.from({ length: 604 }, (_, i) => run({ id: 100_000 - i, head_sha: sha(i) }));
+    const gh = world([], runs, []);
+    for (let i = 4; i < 604; i++) gh.compares.set(sha(i), { status: 'diverged' });
+    const r = await cleanRunSeen(gh, REPO, CTX);
+    expect(r.state).toBe('unknown');
+    expect(gh.calls.length).toBeLessThanOrEqual(40);
+    expect(r.note).toContain(`${MARKER_WINDOW + HISTORY_FAIL_CAP}`);
+    expect(r.note).not.toContain(`more than ${HISTORY_CHECK_CAP} `);
   });
 });
