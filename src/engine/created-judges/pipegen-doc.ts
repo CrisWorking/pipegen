@@ -3,9 +3,11 @@
 // pipegen writes this file itself, so the judge accepts a RESTRICTED MARKDOWN SUBSET by a line allowlist and fails closed on all else
 // (a denylist always leaks: Markdown renderers differ on fences, reference definitions and HTML). Outside a fence every line is exactly one of:
 //   empty | heading `#{1,4} text` | list item `- text` or `  - text` | table row `| ... |` or a separator row of `| - :` and spaces |
-//   a fence opener (exactly three backticks and an optional [a-z0-9-]* info string, at column 0) | plain text.
-// `text` has only letters, digits, space and  . , ; : ! ? ' " ( ) / - _ + = % & * ~  plus inline code (`...`, same characters) and inline links
-// [label](url) whose url is this repository, docs.github.com or pipegen's repository; `<` `>` `[` `]` `\` `@` `${{` `#` `|` `$` and the rest are refused.
+//   a fence opener (exactly three backticks at column 0, then nothing or one of yaml sh bash json text) | plain text.
+// `text` has only letters, digits, space and  . , ; : ! ? ' " ( ) / - _ + = % * ~  (no `&`: character references can decode into forbidden
+// characters), plus inline code (`...`, same characters) and inline links [label](url) whose url is this repository, docs.github.com or
+// pipegen's repository. A bare URL (any scheme:// , found as "://" so the scan is linear, or www.) is refused: a link is always inline. `<` `>` `[` `]` `\` `@` `${{` `#` `|` `$` and
+// every other character are refused.
 // Inside a fence a line is free text, except one that starts 3+ backticks or tildes and is not exactly three backticks; the fence closes only on an
 // exact three-backtick line, and an unclosed fence is refused. Also: size, control and invisible characters, the vault's values and findSecretLike.
 // Plan G must produce the file with a pure builder, and the referee must recompute it and require equality (this judge is the net under that).
@@ -23,10 +25,11 @@ const REPO_RE = /^(?!\.+$)[A-Za-z0-9._-]{1,100}$/;
 // C0 controls except tab, LF and CR; DEL and C1; zero-width, bidirectional and word-joiner controls; the BOM
 const INVISIBLE_RE = /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f\u200b-\u200f\u2028\u2029\u202a-\u202e\u2060-\u2064\u2066-\u2069\ufeff]/;
 
-const TEXT_CH = /^[\p{L}\p{N} .,;:!?'"()/\-_+=%&*~]$/u;
+const TEXT_CH = /^[\p{L}\p{N} .,;:!?'"()/\-_+=%*~]$/u;
 const URL_CH = /^[A-Za-z0-9._~:/?#&=%+-]+$/;
 const FENCE_START_RE = /^\s*(?:`{3,}|~{3,})/;
-const OPENER_RE = /^```[a-z0-9-]*$/;
+/** The only info strings: GitHub renders mermaid, math, geojson, topojson, stl and others as active content. */
+const OPENER_RE = /^```(?:yaml|sh|bash|json|text)?$/;
 const LINK_RE = /^\[([^[\]`]*)\]\(([^\s()<>[\]`]*)\)/;
 
 /** The reason a character may not appear in text (`null` if it may). */
@@ -44,9 +47,7 @@ function textProblem(t: string, o: PipegenDocOpts): string | null {
   if (t === '') return 'an empty heading, list item or text';
   if (t.startsWith(' ')) return 'text that starts with a space (an indented line)';
   if (/~{3,}/.test(t)) return 'a run of three tildes (a code fence in a form pipegen does not write)';
-  for (const m of t.matchAll(/(?:https?:\/\/|www\.)[^\s<>]*/gi)) {
-    if (!allowedUrl((m[0] as string).replace(/[.,;:!?)*_~'"\]]+$/, ''), o.owner, o.repo)) return 'a link that is not this repository, docs.github.com or pipegen\'s own repository';
-  }
+  let outside = '';   // the text outside inline-link urls: no scheme:// or www. may appear there
   for (let i = 0; i < t.length;) {
     const c = t[i] as string;
     if (c === '`') {
@@ -56,6 +57,7 @@ function textProblem(t: string, o: PipegenDocOpts): string | null {
       const j = t.indexOf('`', i + 1);
       if (j < 0 || t[j + 1] === '`') return 'an inline code span that is not closed';
       for (const ch of t.slice(i + 1, j)) { const bad = charProblem(ch); if (bad !== null) return bad; }
+      outside += ` ${t.slice(i + 1, j)} `;
       i = j + 1;
       continue;
     }
@@ -66,13 +68,16 @@ function textProblem(t: string, o: PipegenDocOpts): string | null {
       const label = m[1] as string, url = m[2] as string;
       for (const ch of label) { const bad = charProblem(ch); if (bad !== null) return bad; }
       if (label === '' || !URL_CH.test(url) || !allowedUrl(url, o.owner, o.repo)) return 'a link that is not this repository, docs.github.com or pipegen\'s own repository';
+      outside += ` ${label} `;
       i += m[0].length;
       continue;
     }
     const bad = charProblem(c);
     if (bad !== null) return bad;
+    outside += c;
     i++;
   }
+  if (outside.includes('://') || /www\./i.test(outside)) return 'a bare URL (a link must be an inline [label](url) to this repository, docs.github.com or pipegen\'s own repository)';
   return null;
 }
 
@@ -89,7 +94,7 @@ function grammarProblems(text: string, o: PipegenDocOpts): string[] {
     }
     if (line === '') continue;
     if (OPENER_RE.test(line)) { inFence = true; continue; }
-    if (FENCE_START_RE.test(line)) { say('a code fence in a form pipegen does not write (it must be exactly three backticks at the start of a line, with a lower-case info string)'); continue; }
+    if (FENCE_START_RE.test(line)) { say('a code fence in a form pipegen does not write (it must be exactly three backticks at the start of a line, with no info string or one of yaml, sh, bash, json, text)'); continue; }
     let why: string | null;
     const h = /^#{1,4} (.*)$/.exec(line);
     const li = /^(?:- |  - )(.*)$/.exec(line);

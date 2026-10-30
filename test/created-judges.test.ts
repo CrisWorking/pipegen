@@ -563,9 +563,9 @@ describe('pipegen-doc judge', () => {
   });
   it('the allowed line forms: empty, heading, list (two levels), table, separator row, fence with info, plain text with inline code and allowed links', () => {
     const doc = [
-      '# Title', '## Section 2', '### Three', '#### Four', '', 'Plain text, with: punctuation. (Yes!) It\'s "fine"; 100% a/b - c_d + e = f & g * h ~ i?',
+      '# Title', '## Section 2', '### Three', '#### Four', '', 'Plain text, with: punctuation. (Yes!) It\'s "fine"; 100% a/b - c_d + e = f * h ~ i?',
       '- item one', '  - nested item', '- item with `code` and [a link](https://github.com/o/r/blob/main/x.md?a=b&c=d)', '| name | value |', '|---|:--:|', '| a | `b` |', '| [docs](https://docs.github.com/en/x) |  |',
-      '', '```yaml', 'anything: <here> @all [x]: y ${ no', '```', '```', 'no info', '```', '```c-2', 'x', '```', '1. numbered', '--- ', 'Text with https://github.com/o/r/issues and https://docs.github.com/en/x.', '',
+      '', '```yaml', 'anything: <here> @all [x]: y ${ no', '```', '```', 'no info', '```', '```sh', 'x', '```', '```text', 'x', '```', '```json', '{}', '```', '```bash', 'x', '```', '1. numbered', '--- ', 'Text with a [link](https://github.com/o/r/issues) and [docs](https://docs.github.com/en/x).', '',
     ].join('\n');
     expect(docText(doc)).toBe('');
   });
@@ -584,6 +584,8 @@ describe('pipegen-doc judge', () => {
     ['| a | <b> |', /HTML/], ['| a | [x] |', /link/], ['| a |\t', /./], ['a{b}', /not allowed/], ['a b', /not allowed|control|character/],
     ['    indented', /./], [' leading space', /./], ['\ttab', /./], ['- ~~~', /fence/],
     ['`unclosed', /./], ['``double``', /./], ['```', /fence/], ['a ``` b', /./], ['`a``b`', /./], ['``a``', /./],
+    ['a &lt; b', /not allowed/], ['&#106;avascript', /not allowed/], ['&#x3c;b&#x3e;', /not allowed/], ['x & y', /not allowed/], ['`&lt;`', /not allowed/], ['[a&amp;b](https://github.com/o/r)', /not allowed/],
+    ['ftp://github.com/o/r', /link/], ['file:///etc/passwd', /link/], ['mailto://x', /link/], ['javascript://x', /link/], ['see s3+x.y://bucket', /link/], ['a ssh://gitx', /link/], ['HTTP://GITHUB.COM.EVIL', /link/], ['[x](ftp://github.com/o/r)', /link/], ['[x](file:///etc/passwd)', /link/],
     ['~~~', /fence/], ['~~~~', /fence/], ['   ```', /fence/], ['   ``` x', /fence/], ['```Yaml', /fence/], ['``` yaml', /fence/], ['```yaml extra', /fence/], ['````', /fence/], ['```a`b', /fence/], ['- ```', /./], ['1. ```', /./], ['> ```', /./], ['+ ~~~', /fence/], ['* ~~~', /fence/], ['x ~~~', /fence/], ['  ~~~', /./], ['- - ~~~', /fence/],
   ];
   it('every scan bypass and every character outside the grammar is refused, as plain text, in a heading, a list item and a table cell', () => {
@@ -594,6 +596,10 @@ describe('pipegen-doc judge', () => {
       if (!line.startsWith(' ')) expect(docText(`# t\n\n| ${line} |\n`), `| ${line} |`).not.toBe('');   // a table cell is trimmed of spaces
       expect(docText(`# ${line}\n`), `# ${line}`).not.toBe('');
     }
+  });
+  it('fence info strings: only none, yaml, sh, bash, json and text (GitHub renders the others as active content)', () => {
+    for (const info of ['', 'yaml', 'sh', 'bash', 'json', 'text']) expect(docText('# t\n\n' + '```' + info + '\nx\n```\n'), info).toBe('');
+    for (const info of ['mermaid', 'math', 'geojson', 'topojson', 'stl', 'Yaml', 'js', 'html', 'svg', 'a-b', 'yml', 'diff', 'yaml2']) expect(docText('# t\n\n' + '```' + info + '\nx\n```\n'), info).toMatch(/fence/);
   });
   it('a pipe outside a table row, and a table row that is not closed, are refused', () => {
     for (const l of ['a | b', '|a|b', '| a | b', 'x | y |']) expect(docText(`# t\n\n${l}\n`), l).not.toBe('');
@@ -615,10 +621,10 @@ describe('pipegen-doc judge', () => {
   it('fuzz: a line built from allowed words with one forbidden character in it is always refused', () => {
     let seed = 12345;
     const rnd = (n: number) => { seed = (seed * 1103515245 + 12345) & 0x7fffffff; return seed % n; };
-    const ALPHA = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 .,;:!?\'"()/-_+=%&*~';
+    const ALPHA = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 .,;:!?\'"()/-_+=%*~';
     const word = () => { let w = ''; for (let i = 0, n = 1 + rnd(8); i < n; i++) w += ALPHA[rnd(ALPHA.length)]; return w; };
     const clean = () => { let l = 'x' + Array.from({ length: 1 + rnd(5) }, word).join(' '); l = l.replace(/https?|www|~{3,}/gi, 'q').replace(/[()]/g, ''); return l; };
-    const FORBIDDEN = ['<', '>', '[', ']', '\\', '@', '${{', '#', '$', '{', '}', '^', '`'];
+    const FORBIDDEN = ['<', '>', '[', ']', '\\', '@', '${{', '#', '&', '&lt;', '&#106;', '$', '{', '}', '^', '`'];
     const wrap = [(l: string) => l, (l: string) => `# ${l}`, (l: string) => `- ${l}`, (l: string) => `  - ${l}`, (l: string) => `| ${l} |`, (l: string) => `| a | ${l} | b |`];
     for (let k = 0; k < 600; k++) {
       const base = clean();
@@ -631,17 +637,22 @@ describe('pipegen-doc judge', () => {
   it('fuzz: lines of allowed characters only are accepted', () => {
     let seed = 777;
     const rnd = (n: number) => { seed = (seed * 1103515245 + 12345) & 0x7fffffff; return seed % n; };
-    const ALPHA = 'abcdefghijklmnopqrstuvwxyz0123456789 .,;:!?\'"/-_+=%&*~';
+    const ALPHA = 'abcdefghijklmnopqrstuvwxyz0123456789 .,;:!?\'"/-_+=%*~';
     for (let k = 0; k < 300; k++) {
       let l = 'a'; for (let i = 0, n = rnd(40); i < n; i++) l += ALPHA[rnd(ALPHA.length)];
       l = l.replace(/https?|www|~{3,}/gi, 'q');
       expect(docText(`# t\n\n${l}\n\n- ${l}\n\n| ${l} | ${l} |\n`), l).toBe('');
     }
   });
-  it('links: only this repository, docs.github.com and the pipegen repository, as inline links or bare URLs', () => {
-    for (const ok of ['[a](https://github.com/o/r)', '[a](https://github.com/o/r/)', '[a](https://github.com/o/r/blob/main/x.md#y)', '[a](https://github.com/O/R/x)', '[a](https://docs.github.com/en/x)', '[a](https://github.com/CrisWorking/pipegen)', '[a](https://github.com/CrisWorking/pipegen/blob/main/docs/x.md)', 'see https://github.com/o/r/issues', 'see https://docs.github.com/en/x.', '- [a](https://github.com/o/r) and [b](https://docs.github.com/en/y)']) {
+  it('links: only this repository, docs.github.com and the pipegen repository, as inline links; a bare URL is refused even to an allowed address', () => {
+    for (const ok of ['[a](https://github.com/o/r)', '[a](https://github.com/o/r/)', '[a](https://github.com/o/r/blob/main/x.md#y)', '[a](https://github.com/O/R/x)', '[a](https://docs.github.com/en/x)', '[a](https://github.com/CrisWorking/pipegen)', '[a](https://github.com/CrisWorking/pipegen/blob/main/docs/x.md)', '- [a](https://github.com/o/r) and [b](https://docs.github.com/en/y)']) {
       expect(docText(`# t\n\n${ok}\n`), ok).toBe('');
     }
+  });
+  it('a bare URL is refused even when it points at an allowed address', () => {
+    for (const u of ['see https://github.com/o/r/issues', 'https://docs.github.com/en/x.', '- https://github.com/o/r', '| https://github.com/o/r |', 'www.github.com']) expect(docText(`# t\n\n${u}\n`), u).toMatch(/bare URL/);
+    expect(docText('# t\n\n[https://github.com/o/r](https://github.com/o/r)\n')).toMatch(/bare URL/);
+    expect(docText('# t\n\n`https://github.com/o/r`\n')).toMatch(/bare URL/);
   });
   it('the pipegen repo link follows the package repository', () => {
     const pkg = JSON.parse(readPkg()) as { repository: { url: string } };
