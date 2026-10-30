@@ -569,28 +569,30 @@ describe('pipegen-doc judge', () => {
   it('a < that starts no tag is fine', () => {
     for (const ok of ['a < b', '1<2', 'x <= y', '<3', 'a <- b', '< b', 'a&lt;div&gt;', 'a <\n']) expect(docText(`# t\n\n${ok}\n`), ok).toBe('');
   });
-  it('HTML inside a fence is fine, after the fence closes it is checked again, and an unclosed fence runs to the end', () => {
+  it('HTML inside a fence is fine; after the fence closes it is checked again', () => {
     expect(docText('# t\n\n```html\n<div>x</div>\n```\n')).toBe('');
-    expect(docText('# t\n\n~~~\n<div>x</div>\n~~~\n')).toBe('');
     expect(docText('# t\n\n```\n<div>x</div>\n```\n<div>y</div>\n')).toMatch(/HTML/i);
-    expect(docText('# t\n\n```\n<div>x</div>\n')).toBe('');
-    expect(docText('# t\n\n````\n```\n<div>x</div>\n````\n')).toBe('');
-    expect(docText('# t\n\n````\n```\n````\n<div>x</div>\n')).toMatch(/HTML/i);
+    expect(docText('# t\n\n```\n~~~\n<div>x</div>\n```\n')).toBe('');   // a tilde line inside a backtick fence is content
+    expect(docText('# t\n\n```\n````\n```\n')).toBe('');
   });
-  it('a fence that is not one does not hide HTML: four spaces, a backtick in the info string, a tilde closing a backtick fence, text after the closer', () => {
-    expect(docText('# t\n\n    ```\n<div>x</div>\n')).toMatch(/HTML/i);
-    expect(docText('# t\n\n``` a`b\n<div>x</div>\n')).toMatch(/HTML/i);
-    expect(docText('# t\n\n```\n~~~\n<div>x</div>\n') ).toBe('');   // still inside the backtick fence
-    expect(docText('# t\n\n```\nx\n``` y\n<div>x</div>\n')).toBe('');   // "``` y" does not close, so we are still in the fence
-    expect(docText('# t\n\n```\nx\n```\n<div>x</div>\n')).toMatch(/HTML/i);
-    expect(docText('# t\n\n   ```\n<div>x</div>\n   ```\n')).toBe('');
+  it('restricted Markdown: a fence opens and closes at column 0 with exactly three backticks; every other fence form is refused', () => {
+    const bad = [
+      '- ```\n<div>x</div>\n```', '> ```\n<div>x</div>\n```', '* ```\n[a](https://evil.example)\n```', '1. ```\n<img src=x>\n```', '- > ```\n<div>', '> ```\nplain\n> ```', '- ```\nplain\n- ```', '1) ```\nplain\n1) ```', '+ ~~~\nplain\n+ ~~~',
+      '    ```\n<div>x</div>\n    ```', ' ```\nx\n ```', '   ```\n<div>x</div>\n   ```', '\t```\nx\n```',
+      '~~~\n<div>x</div>\n~~~', '````\nx\n````', '``` a`b\n<div>x</div>\n```', '~~~~\nx\n~~~~',
+      '```\n<div>x</div>\n', '```\nx\n', '```\nx\n```\n```\n<img src=x>\n', '```\nx\n````\n[a](https://evil.example)\n', '```\nx\n ```\n<img src=x>\n', '```\nx\n``` y\n<img src=x>\n',
+    ];
+    for (const b of bad) expect(docText(`# t\n\n${b}\n`), b).toMatch(/fence/i);
+  });
+  it('an unclosed fence can not hide a link or an image after it', () => {
+    expect(docText('# t\n\n```\nx\n[a](https://evil.example)\n<img src=x>\n')).toMatch(/fence/i);
   });
   it('images are refused, inline and by reference, but not inside a fence', () => {
     for (const img of ['![a](https://github.com/o/r/raw/main/x.png)', '![a][r]\n\n[r]: https://github.com/o/r', '![](x)', '! [a](b)'.replace('! ', '!')]) expect(docText(`# t\n\n${img}\n`), img).toMatch(/image/i);
     expect(docText('# t\n\n```\n![a](x)\n```\n')).toBe('');
   });
   it('links: only this repo, docs.github.com and the pipegen repo; anchors are fine', () => {
-    for (const ok of ['[a](https://github.com/o/r)', '[a](https://github.com/o/r/)', '[a](https://github.com/o/r/blob/main/x.md#y)', '[a](https://github.com/O/R/x)', '[a](https://docs.github.com/en/x)', '[a](https://github.com/CrisWorking/pipegen)', '[a](https://github.com/CrisWorking/pipegen/blob/main/docs/x.md)', '[a](#section)', '[a]()', 'see https://github.com/o/r/issues', '[a](https://github.com/o/r "title")', '[a]: https://docs.github.com/en/x']) {
+    for (const ok of ['[a](https://github.com/o/r)', '[a](https://github.com/o/r/)', '[a](https://github.com/o/r/blob/main/x.md#y)', '[a](https://github.com/O/R/x)', '[a](https://docs.github.com/en/x)', '[a](https://github.com/CrisWorking/pipegen)', '[a](https://github.com/CrisWorking/pipegen/blob/main/docs/x.md)', '[a](#section)', 'see https://github.com/o/r/issues', '[a](https://github.com/o/r "title")']) {
       expect(docText(`# t\n\n${ok}\n`), ok).toBe('');
     }
   });
@@ -601,9 +603,18 @@ describe('pipegen-doc judge', () => {
       'https://evil.example', 'www.evil.example', 'x https://evil.example/a.', '[a]: https://evil.example', '[a]:https://evil.example', '[a](https://github.com\\@evil.example/)', '[a](HTTPS://EVIL.EXAMPLE)', '[a](&#104;ttps://evil.example)', '[a](https://github.com/o/r/\u202e)'];
     for (const b of bads) expect(docText(`# t\n\n${b}\n`), b).toMatch(/link|URL|control|character/i);
   });
-  it('reference definitions are links too: a scheme or a relative path with no https:// in it', () => {
-    for (const b of ['[a]: javascript:alert(1)\n\n[a]', '[a]: relative.md', '  [a]: mailto:x@y.zz']) expect(docText(`# t\n\n${b}\n`), b).toMatch(/link/i);
-    expect(docText('# t\n\n[a]: https://docs.github.com/en/x\n\n[a]\n')).toBe('');
+  it('link reference definitions are refused outright, whatever the destination; an empty destination is foreign', () => {
+    const defs = ['[a]: javascript:alert(1)', '[a]: relative.md', '  [a]: mailto:x@y.zz', '[a]: https://docs.github.com/en/x', '[a]: https://github.com/o/r', '[a]:', '[a]: <>', '[a]:\n', '[]:', '[a b]: #x', '   [a]: https://github.com/o/r', '[a]: ', '[^note]: text'];
+    for (const d of defs) expect(docText(`# t\n\n${d}\n\n[a]\n`), d).toMatch(/link/i);
+    expect(docText('# t\n\n[x][ref]\n\n[ref]:\n')).toMatch(/link/i);
+    expect(docText('# t\n\n[x][ref]\n\n[ref]: <>\n')).toMatch(/link/i);
+    expect(docText('# t\n\nsee [a]: not at line start\n')).toBe('');
+    expect(docText('# t\n\n    [a]: indented code\n')).toBe('');
+  });
+  it('an inline link with an empty destination is foreign', () => {
+    expect(docText('# t\n\n[a]()\n')).toMatch(/link/i);
+    expect(docText('# t\n\n[a](<>)\n')).toMatch(/link/i);
+    expect(docText('# t\n\n[a]( )\n')).toMatch(/link/i);
   });
   it('the pipegen repo link follows the package repository', () => {
     // the one place the own-repo name lives is the judge; this test pins it to package.json

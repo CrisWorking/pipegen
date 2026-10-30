@@ -3,6 +3,7 @@
 // the path is exactly PIPEGEN.md at the root; it is a new file, or one the install record owns at an unchanged blob sha; at most
 // 256 KiB; no raw HTML, no image, no `@mention` outside code, no `${{`, no control or invisible character; links only to this
 // repository, docs.github.com and pipegen's own repository; none of the vault's values; and nothing findSecretLike reports.
+// Restricted Markdown (the file is pipegen's own): one fence form, no reference definitions, an empty link target is foreign.
 // Fenced code is exempt from the HTML, image, link and mention rules (it renders as text); inline code only from the mention rule.
 // Every ambiguity is resolved toward refusing: a construct this scanner does not understand is treated as prose.
 import { findSecretLike } from '../../ai/redact-core.js';
@@ -19,21 +20,27 @@ const REPO_RE = /^(?!\.+$)[A-Za-z0-9._-]{1,100}$/;
 // C0 controls except tab, LF and CR; DEL and C1; zero-width, bidirectional and word-joiner controls; the BOM
 const INVISIBLE_RE = /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f\u200b-\u200f\u2028\u2029\u202a-\u202e\u2060-\u2064\u2066-\u2069\ufeff]/;
 
-/** The lines outside fenced code (each fenced block, and its fence lines, becomes one blank line). A fence is 3+ backticks or tildes, indented at most 3 spaces; an unclosed one runs to the end. */
-function proseLines(text: string): string[] {
-  const out: string[] = [];
-  let fence: { ch: string; len: number } | null = null;
+/** Anything after optional indentation, quote and list markers that starts 3+ backticks or tildes: a fence in a form pipegen never writes. */
+const FENCE_LOOKALIKE_RE = /^[\s>\-+*]*(?:\d+[.)][\s>\-+*]*)?(?:`{3,}|~{3,})/;
+
+/**
+ * Restricted Markdown: pipegen writes this file itself, so only one fence form is accepted. A fence opens on a line that is exactly three
+ * backticks at column 0 (an info string without backticks may follow) and closes on a line that is exactly three backticks at column 0.
+ * Indented, tilde, longer, quoted or listed fences, a line outside a fence that looks like one, and a fence never closed are problems.
+ * Returns the lines outside fences (each fenced block, with its fence lines, becomes one blank line).
+ */
+function proseLines(text: string): { lines: string[]; problems: string[] } {
+  const lines: string[] = [];
+  const problems: string[] = [];
+  let inFence = false;
   for (const line of text.split(/\r\n|\r|\n/)) {
-    if (fence !== null) {
-      const m = /^ {0,3}(`+|~+)[ \t]*$/.exec(line);
-      if (m !== null && (m[1] as string)[0] === fence.ch && (m[1] as string).length >= fence.len) { fence = null; out.push(''); }
-      continue;
-    }
-    const open = /^ {0,3}(`{3,}|~{3,})(.*)$/.exec(line);
-    if (open !== null && !((open[1] as string)[0] === '`' && (open[2] as string).includes('`'))) { fence = { ch: (open[1] as string)[0] as string, len: (open[1] as string).length }; out.push(''); continue; }
-    out.push(line);
+    if (inFence) { if (line === '```') { inFence = false; lines.push(''); } continue; }
+    if (/^```[^`]*$/.test(line)) { inFence = true; continue; }
+    if (FENCE_LOOKALIKE_RE.test(line)) problems.push('PIPEGEN.md holds a code fence in a form pipegen does not write (it must open and close at the start of a line with exactly three backticks), so what it hides can not be checked');
+    lines.push(line);
   }
-  return out;
+  if (inFence) problems.push('PIPEGEN.md has a code fence that is never closed, so what follows it can not be checked');
+  return { lines, problems: [...new Set(problems)] };
 }
 
 /** One line without its inline code spans: a backtick run closes at the next run of exactly its length on the same line; a backslash escapes the next character. */
@@ -77,15 +84,17 @@ export function pipegenDocProblems(text: string, o: PipegenDocOpts): string[] {
   if (Buffer.byteLength(text, 'utf8') > PIPEGEN_DOC_MAX_BYTES) out.push('PIPEGEN.md is over 256 KiB');
   if (INVISIBLE_RE.test(text)) out.push('PIPEGEN.md holds a control or invisible character (NUL, escape, zero-width or bidirectional control)');
   if (text.includes('${{')) out.push('PIPEGEN.md holds ${{, a workflow expression');
-  const prose = proseLines(text);
+  const fenced = proseLines(text);
+  out.push(...fenced.problems);
+  const prose = fenced.lines;
   const body = prose.join('\n');
   if (/<[A-Za-z/!?]/.test(body)) out.push('PIPEGEN.md holds raw HTML outside fenced code (a < followed by a letter, /, ! or ?)');
   if (/!\[/.test(body)) out.push('PIPEGEN.md holds an image (![), which could load a remote file');
   const dests: string[] = [];
   for (const m of body.matchAll(/\]\(\s*(<[^>\n]*>|[^\s)]*)/g)) dests.push((m[1] as string).replace(/^<|>$/g, ''));
-  for (const m of body.matchAll(/^ {0,3}\[[^\]\n]+\]:[ \t]*(\S*)/gm)) dests.push((m[1] as string).replace(/^<|>$/g, ''));
+  if (/^ {0,3}\[[^\]]*\]:/m.test(body)) out.push('PIPEGEN.md holds a link reference definition ([name]: url), which pipegen never writes; use an inline link');
   for (const m of body.matchAll(/(?:https?:\/\/|www\.)[^\s<>]*/gi)) dests.push((m[0] as string).replace(/[.,;:!?)*_~'"\]]+$/, ''));
-  const foreign = dests.filter((d) => d !== '' && !d.startsWith('#') && !allowedUrl(d, o.owner, o.repo));
+  const foreign = dests.filter((d) => !d.startsWith('#') && !allowedUrl(d, o.owner, o.repo));
   if (foreign.length > 0) out.push(`PIPEGEN.md links to somewhere that is not this repository, docs.github.com or pipegen's own repository (for example ${JSON.stringify(foreign[0]?.slice(0, 60))})`);
   if (prose.some((l) => /@[\p{L}\p{N}_]/u.test(withoutCodeSpans(l)))) out.push('PIPEGEN.md holds an @mention outside code, which would notify someone');
   try { if (o.containsKnownValue(text)) out.push('PIPEGEN.md holds a secret value the user typed (or its encoded form)'); } catch { out.push('the check for typed secret values failed, so PIPEGEN.md is not written'); }
