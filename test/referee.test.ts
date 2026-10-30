@@ -8,7 +8,7 @@ import { describe, expect, it } from 'vitest';
 import { JOB_PERMISSIONS, JOB_STEP_POLICY, pipegenLines, referee, type Linters, type RefereeDeps, type RefereeIssue, type RefereeReport } from '../src/engine/referee.js';
 import { gateJobList, jobIdFor } from '../src/engine/gate-job-list.js';
 import { jobOutputsFor } from '../src/engine/job-rules.js';
-import { dedupeJobSteps, RenderError, renderFindRunStep, renderGateStep, renderJobPrelude, renderPlatformStep, renderProjectScript, renderScrub, renderStep, renderUpload, scrubbedPath, stepsToYaml, type RenderContext, type RenderedStep, type RenderResult } from '../src/engine/render-step.js';
+import { dedupeJobSteps, RenderError, renderFindRunStep, renderGateStep, renderJobPrelude, renderNightlyStep, renderPlatformStep, renderProjectScript, renderScrub, renderStep, renderUpload, scrubbedPath, stepsToYaml, type RenderContext, type RenderedStep, type RenderResult } from '../src/engine/render-step.js';
 import { resultArtifactName } from '../src/engine/artifact-names.js';
 import { NEED_ID_CATEGORY, NEED_IDS } from '../src/engine/need-ids.js';
 import { emptyRepoFiles } from '../src/read/quality.js';
@@ -167,7 +167,6 @@ describe('referee: the renderer and the referee agree', () => {
       renderPlatformStep('attest', p, { 'subject-name': 'ghcr.io/o/app', 'subject-digest': `sha256:${'a'.repeat(64)}` }),
     ], { permissions: { contents: 'read', [OIDC]: 'write', packages: 'write', attestations: 'write' }, environment: 'pipegen-signing' });
     jobs['pipegen-verify'] = job([co, download(), gateAct('find-run')], { permissions: { contents: 'read', actions: 'read', packages: 'read', attestations: 'read' }, environment: 'pipegen-signing' });
-    jobs.nightly = job([download(), gateAct('nightly')], { permissions: { contents: 'read', actions: 'read', issues: 'write' } });
     jobs.watch = job([co, watchAct], { permissions: { contents: 'read', issues: 'write', actions: 'read' } });
     jobs.notify = job([download()], { permissions: { contents: 'read', 'pull-requests': 'read', checks: 'read' } });
     jobs['merged-red'] = job([download()], { permissions: { contents: 'read', 'pull-requests': 'read', checks: 'read' } });
@@ -187,6 +186,8 @@ describe('referee: the renderer and the referee agree', () => {
     jobs['lint--script-app'] = job(scripts[1] as RenderedStep[]);
     const d = draftOf([...specs, repoWide], { profile: profN });
     d.needs.push(needOf('unit-tests', true, 'script-app'), needOf('lint', true, 'script-app'));
+    // the nightly job: its step is nightlyStepInputs(draft) (final review fix round A, ruling 3)
+    jobs.nightly = job([download(), renderNightlyStep(GATE, d)], { permissions: { contents: 'read', actions: 'read', issues: 'write' } });
     // the gate job: no checkout (ruling S21), the job list of this draft, and a needs entry for every job of it (ruling S4)
     const entries = gateJobList(d);
     jobs.gate = job([...harden, download(), renderGateStep(GATE, d), ...renderGateUploads(platform())], { name: GATE_CHECK_NAME.split(' / ')[1], if: 'always()', needs: entries.map((e) => e.job), permissions: { contents: 'read', actions: 'read', 'pull-requests': 'read' } });

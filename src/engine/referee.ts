@@ -34,7 +34,7 @@ import { safeText } from '../util/safe-text.js';
 import { GATE_CHECK_NAME, type CreatedFile, type OutputFormat, type PipegenInserted, type PipelineDraft, type ReviewedTool, type StepSpec } from '../types.js';
 import { ArtifactNameError, slug } from './artifact-names.js';
 import { FINDINGS_CATEGORIES, gateJobList, GateJobListError, jobIdFor, PIPEGEN_JOB_CATEGORIES, readableFormat, type JobListEntry } from './gate-job-list.js';
-import { GATE_JSON_INPUTS, gateStepInputs } from './gate-inputs.js';
+import { GATE_JSON_INPUTS, gateStepInputs, NIGHTLY_JSON_INPUTS, nightlyStepInputs } from './gate-inputs.js';
 import { runLinters } from './linters.js';
 import { COMMIT_SHA_RE } from './names.js';
 import { NEED_ID_CATEGORY, toolCoversNeed } from './need-ids.js';
@@ -668,6 +668,31 @@ function judgeFindRunLayout(fc: FileCtx, where: string, withs: Obj): void {
 }
 
 /**
+ * A nightly step (mode nightly) holds exactly nightlyStepInputs(draft) (final review fix round A, ruling 3): no missing, extra or other input. Its
+ * `warn-first` list must be the warn-first checks of this draft's job list, so the nightly never opens a "switch to blocking" issue for another
+ * check, and never misses one. Deferred: the job list counts only the steps the parsed files hold.
+ */
+function judgeNightlyInputs(fc: FileCtx, where: string, withs: Record<string, unknown>): void {
+  const bad = issueFor(fc);
+  fc.ex.deferred.push(() => {
+    let want: Record<string, string>;
+    try {
+      want = nightlyStepInputs(fc.draft, { formatOf: reviewedFormatOf(fc.ex) });
+    } catch (e) {
+      if (!(e instanceof GateJobListError || e instanceof ArtifactNameError)) throw e;
+      bad('template', `${where}: the nightly step's inputs for this pipeline can not be made (${safeText(e.message, 300)}).`);
+      return;
+    }
+    for (const k of [...new Set([...Object.keys(want), ...Object.keys(withs)])]) {
+      const name = show(safeText(k, 40));
+      if (!Object.hasOwn(want, k)) bad('template', `${where}: the nightly step has the input ${name}, which this pipeline's draft does not give it.`);
+      else if (!Object.hasOwn(withs, k)) bad('template', `${where}: the nightly step has no ${name} input, which this pipeline's draft gives it.`);
+      else if (!sameInput(NIGHTLY_JSON_INPUTS, withs[k], want[k] as string, k)) bad('template', `${where}: the nightly step's ${name} input is not the value this pipeline's draft gives it.`);
+    }
+  });
+}
+
+/**
  * The job `gate` decides (C0b fix round 1, rulings 1 to 3). It runs the gate action exactly once, in mode `gate` (whatever the
  * draft holds: with no checks the gate still has to run), and has `if: always()` (a skipped required check counts as passed). The
  * gate action in mode `gate` runs in no other job. Its `job-list` literal must equal gateJobList(draft) with `needs` covering every
@@ -690,6 +715,8 @@ function judgeGateSteps(fc: FileCtx, id: string, where: string, j: Obj, judged: 
   if (baselineSteps.length > 0) bad('permissions', `${where} runs the gate action in mode baseline-check, which only the job baseline-check does.`);
   // C8 fix round 1: a find-run step names where the gate runs, and that must be what the draft says: `central` exactly when pipegen recorded a central pin
   for (const x of gateKind.filter((k) => k.step.with?.mode === 'find-run')) judgeFindRunLayout(fc, where, x.step.with ?? {});
+  // final review fix round A (ruling 3): a nightly step's inputs are nightlyStepInputs(draft) exactly (its warn-first list and recorded date come from the draft)
+  for (const x of gateKind.filter((k) => k.step.with?.mode === 'nightly')) judgeNightlyInputs(fc, where, isObj(x.step.with) ? x.step.with : {});
   if (id !== 'gate') {
     if (gates.length > 0) bad('not-gate-readable', `${where} runs the gate action in mode gate, which only the job gate does (the required check ${GATE_CHECK_NAME} is its result).`);
     return;
@@ -735,7 +762,7 @@ function judgeGateSteps(fc: FileCtx, id: string, where: string, j: Obj, judged: 
       const name = show(safeText(k, 40));
       if (!Object.hasOwn(want, k)) bad('not-gate-readable', `${where}: the gate step has the input ${name}, which this pipeline's draft does not give it, so the gate would decide on a setting pipegen never recorded.`);
       else if (!Object.hasOwn(withs, k)) bad('not-gate-readable', `${where}: the gate step has no ${name} input, which this pipeline's draft gives it, so the gate would decide without it.`);
-      else if (!sameGateInput(k, withs[k], want[k] as string)) bad('not-gate-readable', `${where}: the gate step's ${name} input is not the value this pipeline's draft gives it, so the gate would decide on another setting.`);
+      else if (!sameInput(GATE_JSON_INPUTS, withs[k], want[k] as string, k)) bad('not-gate-readable', `${where}: the gate step's ${name} input is not the value this pipeline's draft gives it, so the gate would decide on another setting.`);
     }
     for (const e of expected) {
       if (!needs.includes(e.job)) bad('not-gate-readable', `${where} does not need the job ${show(e.job)} of its job list, so the gate would not wait for that check (needs must include every listed job).`);
@@ -744,10 +771,10 @@ function judgeGateSteps(fc: FileCtx, id: string, where: string, j: Obj, judged: 
   });
 }
 
-/** One gate step input against its value from gateStepInputs: JSON literals as parsed JSON (spacing does not count), the others as text. */
-function sameGateInput(name: string, have: unknown, want: string): boolean {
+/** One step input against its value from gateStepInputs or nightlyStepInputs: JSON literals as parsed JSON (spacing does not count), the others as text. */
+function sameInput(json: ReadonlySet<string>, have: unknown, want: string, name: string): boolean {
   if (typeof have !== 'string') return false;
-  if (!GATE_JSON_INPUTS.has(name)) return have === want;
+  if (!json.has(name)) return have === want;
   try { return isDeepStrictEqual(JSON.parse(have), JSON.parse(want)); } catch { return false; }
 }
 

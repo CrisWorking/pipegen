@@ -2,7 +2,7 @@
 # (src/engine/tool-flags.ts) checks each one. A test keeps these inputs equal to that row. No input has a default (find-run's 30 minute wait is in the code).
 # The bundle dist/index.js is generated and committed (npm run build:gate; CI job gate-dist checks it is fresh).
 name: pipegen gate
-description: Scrubs scanner results, stages the checkout for the secrets scan, decides pass, warn or block, looks up the trusted baseline, finds the trusted run in which a commit passed the gate, and (nightly) opens issues about the end of warn mode, a missing finish and a pipegen update.
+description: Scrubs scanner results, stages the checkout for the secrets scan, decides pass, warn or block, looks up the trusted baseline, finds the trusted run in which a commit passed the gate, and (nightly) opens issues about the end of warn mode, a missing finish, a pipegen update and a warn-first check to make blocking.
 author: CrisWorking
 inputs:
   mode:
@@ -58,6 +58,9 @@ inputs:
     required: false
   block-from-recorded:
     description: "gate, nightly: the date the install recorded for blocking (YYYY-MM-DD)."
+    required: false
+  warn-first:
+    description: "nightly: the warn-first checks and the day each started, as a JSON list of { needId, since } (the switch-to-blocking issues)."
     required: false
   github-token:
     description: "gate, baseline-check, find-run, nightly: the workflow token (GITHUB_TOKEN). It is masked first."

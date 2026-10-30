@@ -9,7 +9,8 @@
 //   - baseline-check  (C3, ruling A): the lookup: a verified trusted baseline exists or not → output `found` (found | missing);
 //   - find-run        (C8): the proof that the exact commit passed the gate in a trusted push run on the default branch (gated-run.ts) →
 //                     outputs run-id and run-url on success, a failing status with the reason otherwise;
-//   - nightly         (C7): opens or updates ISSUES (warn mode ending, finish missing, a pipegen update with its patch); never writes a file or a
+//   - nightly         (C7): opens or updates ISSUES (warn mode ending, finish missing, a pipegen update with its patch, a warn-first check to switch to
+//                     blocking); never writes a file or a
 //                     workflow (nightly.ts). No outputs. A failed read is a log line; a failed issue write is an error exit;
 // The rules for every mode:
 //   - the token and the key come from the inputs only, and each is masked (`::add-mask::`, ruling 4) before anything else is written;
@@ -23,7 +24,7 @@
 import { randomUUID } from 'node:crypto';
 import { accessSync, chmodSync, closeSync, constants, fstatSync, lstatSync, mkdirSync, openSync, readSync, renameSync, unlinkSync, writeFileSync, writeSync } from 'node:fs';
 import { basename, dirname, isAbsolute, join } from 'node:path';
-import { GATE_UPLOAD_FILES, isStagedTool, PLAIN_REL_RE, TIMEOUT_MINUTES_RE } from '../../src/engine/tool-flags.js';
+import { GATE_UPLOAD_FILES, isStagedTool, PLAIN_REL_RE, TIMEOUT_MINUTES_RE, warnFirstListProblem } from '../../src/engine/tool-flags.js';
 import { GATE_CHECK_NAME } from '../../src/types.js';
 import { safeMarkdown, safeText } from '../../src/util/safe-text.js';
 import { keyProblem } from './fingerprint.js';
@@ -45,7 +46,7 @@ export const MODE_INPUTS = {
   gate: [...GATE_INPUTS],
   'baseline-check': ['mode', 'github-token', 'fp-key'],
   'find-run': ['mode', 'layout', 'sha', 'central-workflow', 'central-sha', 'timeout-minutes', 'github-token'],
-  nightly: ['mode', 'block-from', 'block-from-recorded', 'github-token', 'fp-key'],
+  nightly: ['mode', 'block-from', 'block-from-recorded', 'warn-first', 'github-token', 'fp-key'],
 } as const;
 type Mode = keyof typeof MODE_INPUTS;
 const isMode = (m: string): m is Mode => Object.hasOwn(MODE_INPUTS, m);
@@ -655,7 +656,7 @@ async function runFindRun(step: Step, deps: MainDeps, get: (n: string) => string
 
 /**
  * Mode nightly (C7): opens or updates issues (nightly.ts). Inputs: github-token (required), fp-key (optional; without it the baseline can not
- * be trusted, so the warn-ending issue is the softer one), block-from and block-from-recorded (optional). It never reads the event payload: the
+ * be trusted, so the warn-ending issue is the softer one), block-from, block-from-recorded and warn-first (optional; a refused warn-first fails). It never reads the event payload: the
  * repository is GITHUB_REPOSITORY checked against GITHUB_REPOSITORY_ID by one `GET /repos/{o}/{r}`. It writes nothing but issues. A read that fails is a log line (the pipegen repository is private until v0.4, so "no
  * update" is the normal case); an issue that could not be written, or an issue list that can not be searched to its end, fails the step.
  */
@@ -664,6 +665,11 @@ async function runNightlyMode(step: Step, deps: MainDeps, get: (n: string) => st
   const token = get('github-token');
   if (token === undefined) return fail('the github-token input is missing, so the step fails closed');
   if (badKey(get('fp-key'))) return fail(BAD_KEY);
+  // the warn-first checks (fix round A, ruling 3): the literal the referee bound to the draft, read with the same schema
+  const wf = get('warn-first');
+  const wfProblem = wf === undefined ? null : warnFirstListProblem(wf);
+  if (wfProblem !== null) return fail(`the warn-first input is refused (it must be ${wfProblem}), so the step fails closed`);
+  const warnFirst = wf === undefined ? [] : (JSON.parse(wf) as { needId: string; since: string }[]).map((e) => ({ needId: e.needId, since: e.since }));
   const notes: string[] = [];
   let done;
   try {
@@ -671,7 +677,7 @@ async function runNightlyMode(step: Step, deps: MainDeps, get: (n: string) => st
     // the identity does not come from the event payload (a `schedule` run's payload is only {"schedule": "<cron>"}): GITHUB_REPOSITORY and one API read
     const repo = await resolveRepo(gh, step.env('GITHUB_REPOSITORY'), step.env('GITHUB_REPOSITORY_ID'));
     if (typeof repo === 'string') return fail(`${repo}, so the step fails closed`);
-    done = await runNightly(gh, { repo, now: (deps.now ?? (() => new Date()))(), blockFrom: get('block-from'), recorded: get('block-from-recorded'), key: get('fp-key') });
+    done = await runNightly(gh, { repo, now: (deps.now ?? (() => new Date()))(), blockFrom: get('block-from'), recorded: get('block-from-recorded'), key: get('fp-key'), warnFirst });
   } catch {
     return fail('GitHub could not be reached or set up, so the step fails closed');
   }

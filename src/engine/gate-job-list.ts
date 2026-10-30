@@ -4,7 +4,7 @@
 // decision uses on a fork PR (decision 110: a required check that needs a secret and did not run blocks).
 // The gate step's `job-list` literal is jobListLiteral(gateJobList(draft)), written by gateStepInputs (gate-inputs.ts); the referee checks it equals
 // gateJobList(draft) and that the gate job's `needs` include every entry's job (else `not-gate-readable`).
-import type { NeedCategory, OutputFormat, PipelineDraft, StepSpec } from '../types.js';
+import { FLOOR_NEEDS, type NeedCategory, type OutputFormat, type PipelineDraft, type StepSpec } from '../types.js';
 import { ArtifactNameError, resultArtifactName, slug } from './artifact-names.js';
 import { NEED_ID_CATEGORY, SCHEDULED_CATEGORIES } from './need-ids.js';
 
@@ -30,6 +30,7 @@ export interface JobListEntry {
 }
 
 export class GateJobListError extends Error {}
+const FLOOR: ReadonlySet<string> = new Set(FLOOR_NEEDS);
 
 /** The job id of a need's check: the need id, then `--` and the service slug for a per-service need (the same key as its result artifact). */
 export function jobIdFor(needId: string, service?: string): string {
@@ -61,6 +62,14 @@ export interface GateJobListOptions {
 export function gateJobList(draft: PipelineDraft, opts: GateJobListOptions = {}): JobListEntry[] {
   const formatOf = opts.formatOf ?? ((s: StepSpec): OutputFormat | undefined => s.output.format);
   const out: JobListEntry[] = [];
+  // warn-first (#96, S12; final review fix round A, ruling 3): on every entry of a need in draft.warnFirst, never on a floor need (#13)
+  const warnFirst = draft.warnFirst ?? {};
+  const warnFirstOf = (needId: string, category: string): { warnFirst?: { since: string } } => {
+    if (!Object.hasOwn(warnFirst, needId)) return {};
+    if (FLOOR.has(needId) || FLOOR.has(category)) throw new GateJobListError(`The floor check ${needId} can not be warn-first: a floor check always blocks (decision 13).`);
+    const w = (warnFirst as Readonly<Record<string, { since: string }>>)[needId] as { since: string };
+    return { warnFirst: { since: w.since } };
+  };
   const seen = new Map<string, string>();   // job id → the (need id, service) that owns it
   for (const need of draft.needs) {
     if (need.layer !== 'merge') continue;
@@ -86,7 +95,7 @@ export function gateJobList(draft: PipelineDraft, opts: GateJobListOptions = {})
     if (result !== undefined) {
       out.push({
         needId: need.id, ...service, job: key, category, tool: result.spec.tool.id, format: result.format,
-        artifact: nameOf(need.id, need.service), baseArtifact: nameOf(need.id, need.service, true), blocking: need.blocking, needsSecrets,
+        artifact: nameOf(need.id, need.service), baseArtifact: nameOf(need.id, need.service, true), blocking: need.blocking, needsSecrets, ...warnFirstOf(need.id, category),
       });
       continue;
     }
@@ -95,7 +104,7 @@ export function gateJobList(draft: PipelineDraft, opts: GateJobListOptions = {})
     if (!need.blocking || demoted) continue;
     const tools = [...new Set(specs.map((x) => x.spec.tool.id))];
     out.push({
-      needId: need.id, ...service, job: key, category, ...(tools.length === 1 ? { tool: tools[0] as string } : {}), format: specs[0]?.format ?? 'none', blocking: true, needsSecrets,
+      needId: need.id, ...service, job: key, category, ...(tools.length === 1 ? { tool: tools[0] as string } : {}), format: specs[0]?.format ?? 'none', blocking: true, needsSecrets, ...warnFirstOf(need.id, category),
     });
   }
   return out;

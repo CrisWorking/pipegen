@@ -4,7 +4,7 @@
 import { Document } from 'yaml';
 import { describe, expect, it } from 'vitest';
 import { gateJobList, GateJobListError, type JobListEntry } from '../src/engine/gate-job-list.js';
-import { gateStepInputs, licenceLockfilesOf } from '../src/engine/gate-inputs.js';
+import { gateStepInputs, licenceLockfilesOf, nightlyStepInputs } from '../src/engine/gate-inputs.js';
 import { TRIVY_LICENCE_LOCKFILES } from '../src/engine/licence-lockfiles.js';
 import { PIPEGEN_GATE_USES, rendererInputProblems } from '../src/engine/tool-flags.js';
 import { licenceCoverage } from '../gate/src/facts.js';
@@ -12,7 +12,7 @@ import { jobOutputsFor, NO_SCANS, type ScanFact } from '../src/engine/job-rules.
 import { NEED_ID_CATEGORY } from '../src/engine/need-ids.js';
 import { referee, type Linters, type RefereeReport } from '../src/engine/referee.js';
 import {
-  dedupeJobSteps, RenderError, renderFindingsBlock, renderGateStep, renderGateUploads, renderJobPrelude, renderProjectScript, stepsToYaml,
+  dedupeJobSteps, RenderError, renderFindingsBlock, renderGateStep, renderGateUploads, renderJobPrelude, renderNightlyStep, renderProjectScript, renderStep, stepsToYaml,
   type RenderContext, type RenderedStep,
 } from '../src/engine/render-step.js';
 import { emptyRepoFiles } from '../src/read/quality.js';
@@ -61,9 +61,10 @@ function workflow(jobs: Record<string, Job>): CreatedFile {
 function jobs(d: PipelineDraft, gateStep?: RenderedStep): Record<string, Job> {
   const out: Record<string, Job> = {};
   const ctx: RenderContext = { profile: d.profile };
-  const blocks = d.steps.map((s) => renderFindingsBlock(s, entry(s.tool.id), p, ctx, GATE));
-  const baseBlocks = d.steps.map((s) => renderFindingsBlock(s, entry(s.tool.id), p, { ...ctx, base: true }, GATE));
-  d.steps.forEach((s, i) => {
+  const findings = d.steps.filter((s) => s.output.format === 'sarif');   // the other specs' jobs are the caller's
+  const blocks = findings.map((s) => renderFindingsBlock(s, entry(s.tool.id), p, ctx, GATE));
+  const baseBlocks = findings.map((s) => renderFindingsBlock(s, entry(s.tool.id), p, { ...ctx, base: true }, GATE));
+  findings.forEach((s, i) => {
     const b = blocks[i] as NonNullable<(typeof blocks)[number]>;
     const id = `${s.needId}${s.service === undefined ? '' : `--${s.service}`}`;
     out[id] = job(dedupeJobSteps([...renderJobPrelude({}, p).steps, ...b.steps], { id, scans: new Map([[b.scan.stepId, b.scan.fact]]) }), { outputs: jobOutputsFor(b.steps) });
@@ -82,6 +83,8 @@ const withEdited = (d: PipelineDraft, edit: (w: Record<string, string>) => void)
   edit(w);
   return jobs(d, { ...honest, with: w });
 };
+/** A tool's own rendered steps (no prelude), with the draft's profile. */
+const renderStepFor = (spec: StepSpec, d: PipelineDraft): RenderedStep[] => renderStep(spec, entry(spec.tool.id), p, { profile: d.profile }).steps;
 const refusedForGateInputs = (r: RefereeReport): boolean => !r.ok && r.issues.some((i) => i.check === 'not-gate-readable' || i.check === 'template' || i.check === 'unreviewed');
 
 describe('ruling 1: gateStepInputs, the one source of every input of the gate step', () => {
@@ -281,5 +284,83 @@ describe('ruling 2: the licence check\'s coverage per lockfile, from the profile
     expect(licenceCoverage(undefined)).toEqual(['coverage per lockfile not known (the gate step has no licence-lockfiles input)']);
     const bad = resolveSettings({ ...w, 'licence-lockfiles': '[{"service":"api","lockfiles":[{"kind":"uv","read":true}]}]' }, { private: false, reviewed: gateToolView(reviewedList()) });
     expect(bad.errors.join('\n')).toMatch(/licence-lockfiles input is refused/);
+  });
+});
+
+// ---------- ruling 3 (Important 5): warn-first from the draft ----------
+
+describe('ruling 3: warn-first from the draft (#96, S12)', () => {
+  const lintSpec = (): StepSpec => specFor(entry('eslint'), { needId: 'lint', service: 'app' });
+  const wfDraft = (warnFirst: PipelineDraft['warnFirst'], over: Partial<PipelineDraft> = {}): PipelineDraft =>
+    draftOf({ steps: [...specs, lintSpec()], needs: [...needs, { ...needOf('lint', 'app'), floor: false }], ...(warnFirst === undefined ? {} : { warnFirst }), ...over });
+
+  it('gateJobList sets warnFirst { since } on every entry of a need in draft.warnFirst, and on no other', () => {
+    const list = gateJobList(wfDraft({ lint: { since: '2026-11-01' } }));
+    expect(list.find((e) => e.needId === 'lint')?.warnFirst).toEqual({ since: '2026-11-01' });
+    for (const e of list.filter((x) => x.needId !== 'lint')) expect(e.warnFirst, e.job).toBeUndefined();
+    expect(gateJobList(wfDraft(undefined)).some((e) => e.warnFirst !== undefined)).toBe(false);
+  });
+
+  it('a floor need in draft.warnFirst is a GateJobListError (the gate would block: warn-first never reaches a floor check, #13); a bad date fails the job-list schema', () => {
+    for (const id of ['secrets', 'sast', 'deps', 'unit-tests']) expect(() => gateJobList(wfDraft({ [id]: { since: '2026-11-01' } })), id).toThrow(GateJobListError);
+    expect(() => gateStepInputs(wfDraft({ lint: { since: '2026-13-01' } }))).toThrow(GateJobListError);
+  });
+
+  it('the referee: the honest pipeline with a warn-first check passes; the job list without the warnFirst (or with another since) is refused', async () => {
+    const lintJob = (d: PipelineDraft): Job => job(dedupeJobSteps([...renderJobPrelude({ node: {} }, p).steps, ...renderStepFor(lintSpec(), d)], { id: 'lint--app', scans: NO_SCANS }));
+    const d = wfDraft({ lint: { since: '2026-11-01' } });
+    const all: Record<string, Job> = { ...jobs(d), 'lint--app': lintJob(d) };
+    expect(show(await run([workflow(all)], d))).toBe('');
+    const plain = gateStepInputs(wfDraft(undefined))['job-list'] as string;
+    const later = (gateStepInputs(d)['job-list'] as string).replace('"since":"2026-11-01"', '"since":"2026-12-01"');
+    for (const literal of [plain, later]) {
+      const honest = renderGateStep(GATE, d);
+      const edited = { ...all, gate: { ...(all.gate as Job), steps: [{ ...honest, with: { ...honest.with, 'job-list': literal } }, ...renderGateUploads(p)] } };
+      const r = await run([workflow(edited)], d);
+      expect(r.ok).toBe(false);
+      expect(show(r)).toMatch(/job-list is not the list this pipeline needs/);
+    }
+  });
+
+  it('nightlyStepInputs: the nightly step\'s inputs, with warn-first = the warn-first needs of the job list, once each, and the recorded date', () => {
+    const d = wfDraft({ lint: { since: '2026-11-01' } }, { gateSettings: { blockFromRecorded: '2026-11-14' } });
+    const w = nightlyStepInputs(d);
+    expect(w).toEqual({
+      mode: 'nightly', 'block-from': '${{ vars.PIPEGEN_BLOCK_FROM }}', 'block-from-recorded': '2026-11-14', 'warn-first': '[{"needId":"lint","since":"2026-11-01"}]',
+      [GH_IN]: '${{ secrets.GITHUB_TOKEN }}', [FP_IN]: '${{ secrets.PIPEGEN_FP_KEY }}',
+    });
+    expect(Object.hasOwn(nightlyStepInputs(draftOf()), 'warn-first')).toBe(false);
+    expect(renderNightlyStep(GATE, d).with).toEqual(w);
+  });
+
+  it('the referee: a nightly step must equal nightlyStepInputs(draft): no warn-first, another since or an extra input is refused', async () => {
+    const d = wfDraft({ lint: { since: '2026-11-01' } });
+    const nightlyJob = (step: RenderedStep): Job => job([step], { permissions: { contents: 'read', actions: 'read', issues: 'write' } });
+    const base: Record<string, Job> = { ...jobs(d), 'lint--app': job(dedupeJobSteps([...renderJobPrelude({ node: {} }, p).steps, ...renderStepFor(lintSpec(), d)], { id: 'lint--app', scans: NO_SCANS })) };
+    const honest = renderNightlyStep(GATE, d);
+    expect(show(await run([workflow({ ...base, nightly: nightlyJob(honest) })], d))).toBe('');
+    const edits: ((w: Record<string, string>) => void)[] = [
+      (w) => { delete w['warn-first']; },
+      (w) => { w['warn-first'] = '[{"needId":"lint","since":"2026-12-01"}]'; },
+      (w) => { w['block-from-recorded'] = '2026-11-14'; },
+    ];
+    for (const edit of edits) {
+      const w = { ...(honest.with as Record<string, string>) };
+      edit(w);
+      const r = await run([workflow({ ...base, nightly: nightlyJob({ ...honest, with: w }) })], d);
+      expect(r.ok, JSON.stringify(w)).toBe(false);
+      expect(show(r)).toMatch(/nightly step/);
+    }
+  });
+
+  it('RENDERER_INPUTS: warn-first in mode nightly only, a JSON list of { needId, since } (a real date, each need once)', () => {
+    const problems = (v: string, mode = 'nightly'): string[] => rendererInputProblems(PIPEGEN_GATE_USES, { 'warn-first': v }, { mode, 'warn-first': v });
+    expect(problems('[{"needId":"lint","since":"2026-11-01"}]')).toEqual([]);
+    expect(problems('[]')).toEqual([]);
+    expect(problems('[{"needId":"lint","since":"2026-11-01"}]', 'gate').length).toBeGreaterThan(0);
+    for (const bad of ['x', '{}', '[{"needId":"lint"}]', '[{"needId":"Lint","since":"2026-11-01"}]', '[{"needId":"lint","since":"2026-02-30"}]', '[{"needId":"lint","since":"2026-11-01","x":1}]',
+      '[{"needId":"lint","since":"2026-11-01"},{"needId":"lint","since":"2026-11-02"}]']) {
+      expect(problems(bad).length, bad).toBeGreaterThan(0);
+    }
   });
 });

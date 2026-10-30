@@ -16,7 +16,7 @@ import { GATE_VERSION } from '../gate/src/generated/gate-view.js';
 import { API_ROOT, githubAdapter, type AdapterOptions } from '../gate/src/github-adapter.js';
 import { main, MODE_INPUTS, type MainDeps } from '../gate/src/main.js';
 import {
-  BOT_LOGIN, effectiveBlockFrom, finishMissing, ISSUE_PAGE_CAP, resolveRepo, runNightly, updateAvailable, updatePatch, upsertIssue, warnEnding, type NightlyAdapter,
+  BOT_LOGIN, effectiveBlockFrom, finishMissing, ISSUE_PAGE_CAP, resolveRepo, runNightly, updateAvailable, updatePatch, upsertIssue, WARN_FIRST_DAYS, warnEnding, warnFirstEnd, type NightlyAdapter,
 } from '../gate/src/nightly.js';
 import { CRED, FPKEY, outputsOf, runner } from './helpers/gate-world.js';
 
@@ -440,7 +440,8 @@ describe('upsertIssue', () => {
   });
   it('a key that is not plain (text in a marker) is refused before any call', async () => {
     const gh = new FakeGh();
-    for (const k of ['', 'a b', 'a-->b', '<!--', 'A', 'k\n', 'x'.repeat(100)]) await expect(upsertIssue(gh, REPO, k, 'T', 'b'), k).rejects.toThrow();
+    // at most 100 characters (fix round A: warn-first-<need id>-<date> is up to 86)
+    for (const k of ['', 'a b', 'a-->b', '<!--', 'A', 'k\n', 'x'.repeat(101)]) await expect(upsertIssue(gh, REPO, k, 'T', 'b'), k).rejects.toThrow();
     expect(gh.calls).toEqual([]);
   });
   it('if the title or body would be over GitHub\'s limit it is refused', async () => {
@@ -1013,8 +1014,8 @@ describe('mode nightly in main.ts', () => {
 describe('action.yml and the renderer row for nightly agree', () => {
   const ROW = RENDERER_INPUTS[PIPEGEN_GATE_USES] as Record<string, { whenWith?: { check: (a: Record<string, string>) => boolean } }>;
   const ACTION = parse(readFileSync(join(ROOT, 'gate/action.yml'), 'utf8')) as { inputs: Record<string, { description: string }>; runs: Obj };
-  it('MODE_INPUTS.nightly is mode, block-from, block-from-recorded, github-token, fp-key', () => {
-    expect([...MODE_INPUTS.nightly].sort()).toEqual(['block-from', 'block-from-recorded', 'fp-key', 'github-token', 'mode'].sort());
+  it('MODE_INPUTS.nightly is mode, block-from, block-from-recorded, warn-first (fix round A), github-token, fp-key', () => {
+    expect([...MODE_INPUTS.nightly].sort()).toEqual(['block-from', 'block-from-recorded', 'fp-key', 'github-token', 'mode', 'warn-first'].sort());
   });
   it('every input of the action is a row input and the other way round, and the row says nightly for exactly the inputs of MODE_INPUTS.nightly', () => {
     expect(Object.keys(ACTION.inputs).sort()).toEqual(Object.keys(ROW).sort());
@@ -1621,5 +1622,93 @@ describe('fix round 2, ruling 4: the rarer YAML forms near a pin-shaped line giv
     expect(updatePatch([{ path: PATH, text: 'a:\n  - run: &s |\n      echo\n' }], FROM, TO)).toBe('');
     const plain = ['jobs:', '  - name: "it\'s ok"', "  - name: 'a ''b'' c'", '  - if: "${{ github.ref == \'refs/heads/main\' }}"', `  - uses: ${pin(OLD, GATE_VERSION)}`, ''].join('\n');
     expect(updatePatch([{ path: PATH, text: plain }], FROM, TO)).not.toBe('');
+  });
+});
+
+// ======================================================================================================
+// Plan C final review fix round A, ruling 3 (Important 5, #96, S12): the "switch to blocking" issue for warn-first checks
+// ======================================================================================================
+
+describe('fix round A, ruling 3: warn-first checks get a "switch to blocking" issue when their warn period ends', () => {
+  const setup = (mergedAt: string): Obj => ({ number: 3, merge_commit_sha: MERGE_SHA, merged_at: mergedAt, head: { ref: 'pipegen/setup', repo: { id: 7 } }, base: { ref: 'main', repo: { id: 7 } } });
+  const LINT = { needId: 'lint', since: '2026-10-10' };
+  const run = (gh: FakeGh, warnFirst: { needId: string; since: string }[], over: Obj = {}): ReturnType<typeof runNightly> => runNightly(gh, ctx({ blockFrom: '2026-12-01', warnFirst, ...over }));
+  const wfIssues = (gh: FakeGh): Obj[] => gh.issues.filter((i) => /^<!-- pipegen:key=warn-first-/.test(String(i.body)));
+
+  it('warnFirstEnd: 14 days (WARN_FIRST_DAYS, #96) after the later of since and the proven setup merge day; nothing without a proven merge or with a bad date', () => {
+    expect(WARN_FIRST_DAYS).toBe(14);
+    expect(warnFirstEnd('2026-10-10', '2026-10-12T09:30:00Z')).toBe('2026-10-26');   // the merge is later: it counts
+    expect(warnFirstEnd('2026-10-20', '2026-10-12T09:30:00Z')).toBe('2026-11-03');   // a check made warn-first after setup: its own date counts
+    expect(warnFirstEnd('2026-10-10', undefined)).toBeUndefined();
+    expect(warnFirstEnd('2026-02-30', '2026-10-12T09:30:00Z')).toBeUndefined();
+    expect(warnFirstEnd('2026-10-10', 'yesterday')).toBeUndefined();
+  });
+
+  it('the period has ended: one issue per need, keyed warn-first-<need>-<end date>, with the check, the dates and the way to switch (pipegen update), never a patch', async () => {
+    const gh = new FakeGh(); gh.pulls = [setup(ago(20))];   // merged 2026-10-10: ends 2026-10-24, before NOW (2026-10-30)
+    const r = await run(gh, [LINT, { needId: 'format', since: '2026-10-01' }]);
+    expect(r.errors).toEqual([]);
+    const made = wfIssues(gh);
+    expect(made.map((i) => String(i.body).split('\n')[0]).sort()).toEqual(['<!-- pipegen:key=warn-first-format-2026-10-24 -->', '<!-- pipegen:key=warn-first-lint-2026-10-24 -->']);
+    const lint = made.find((i) => String(i.body).includes('warn-first-lint')) as Obj;
+    expect(String(lint.title)).toBe('pipegen: make the lint check blocking (its warn-first period ended 2026-10-24)');
+    const body = String(lint.body);
+    expect(body).toContain('`lint`');
+    expect(body).toContain('`2026-10-24`');
+    expect(body).toContain('npx pipegen update');
+    expect(body).toMatch(/advisory/i);
+    expect(body).not.toMatch(/pipegen:patch|```diff/);
+    expect(lint.labels).toEqual([{ name: 'pipegen' }]);
+  });
+
+  it('not yet ended (the end day is still ahead), no warn-first check, or no proven setup merge (a note): no issue', async () => {
+    const early = new FakeGh(); early.pulls = [setup(ago(5))];   // ends 2026-11-08
+    await run(early, [LINT]);
+    expect(wfIssues(early)).toEqual([]);
+    const none = new FakeGh(); none.pulls = [setup(ago(20))];
+    await run(none, []);
+    expect(wfIssues(none)).toEqual([]);
+    const unproven = new FakeGh(); unproven.pulls = [];
+    const r = await run(unproven, [LINT]);
+    expect(wfIssues(unproven)).toEqual([]);
+    expect(r.notes.join('\n')).toMatch(/warn-first.*setup merge is not proven/);
+  });
+
+  it('the end day itself opens it (block from 00:00 UTC of that day); the next night updates the same issue; a person who closes it dismisses it', async () => {
+    const gh = new FakeGh(); gh.pulls = [setup('2026-10-16T08:00:00Z')];   // ends 2026-10-30 = NOW's day
+    await run(gh, [LINT]);
+    expect(wfIssues(gh).length).toBe(1);
+    await run(gh, [LINT], { now: new Date(NOW.getTime() + DAY) });
+    expect(wfIssues(gh).length).toBe(1);
+    const closed = wfIssues(gh)[0] as Obj;
+    closed.state = 'closed'; closed.closed_by = PERSON;
+    await run(gh, [LINT], { now: new Date(NOW.getTime() + 2 * DAY) });
+    expect(wfIssues(gh).length).toBe(1);
+  });
+
+  it('a need id or date that is not in the form pipegen writes is skipped with a note (runNightly is called with checked input only; this is the belt)', async () => {
+    const gh = new FakeGh(); gh.pulls = [setup(ago(20))];
+    const r = await run(gh, [{ needId: 'Lint<script>', since: '2026-10-10' }, { needId: 'lint', since: 'soon' }]);
+    expect(wfIssues(gh)).toEqual([]);
+    expect(r.notes.join('\n')).toMatch(/warn-first/);
+  });
+
+  it('main: the warn-first input (mode nightly) is read with its schema; a refused value fails closed with no GitHub call', async () => {
+    const gh = new FakeGh(); gh.pulls = [setup(ago(20))];
+    const x = await go(NIGHT({ 'block-from': '2026-12-01', 'warn-first': JSON.stringify([LINT]) }), gh);
+    expect(x.code, x.out).toBe(0);
+    expect(wfIssues(gh).length).toBe(1);
+    const bad = new FakeGh();
+    const y = await go(NIGHT({ 'warn-first': '[{"needId":"lint"}]' }), bad);
+    expect(y.code).toBe(1);
+    expect(y.out).toMatch(/warn-first input is refused/);
+    expect(bad.calls).toEqual([]);
+  });
+
+  it('MODE_INPUTS nightly and action.yml hold warn-first (the RENDERER_INPUTS gate row: mode nightly only)', () => {
+    expect(MODE_INPUTS.nightly).toContain('warn-first');
+    const action = parse(readFileSync(join(ROOT, 'gate', 'action.yml'), 'utf8')) as { inputs: Record<string, unknown> };
+    expect(Object.keys(action.inputs)).toContain('warn-first');
+    expect(Object.keys(RENDERER_INPUTS[PIPEGEN_GATE_USES] ?? {})).toContain('warn-first');
   });
 });

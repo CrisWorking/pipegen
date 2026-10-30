@@ -2506,6 +2506,17 @@ function licenceLockfilesProblem(text) {
   }
   return null;
 }
+function warnFirstListProblem(text) {
+  const list = parseJson(text);
+  const shape = 'a JSON list of at most 50 { "needId", "since": "YYYY-MM-DD" } entries, each need once';
+  if (!Array.isArray(list) || list.length > ID_LIST_MAX) return shape;
+  const seen = /* @__PURE__ */ new Set();
+  for (const e of list) {
+    if (!isPlainObject(e) || Object.keys(e).sort().join() !== "needId,since" || typeof e.needId !== "string" || !NEED_ID_TEXT_RE.test(e.needId) || typeof e.since !== "string" || validDate(e.since) !== e.since || seen.has(e.needId)) return shape;
+    seen.add(e.needId);
+  }
+  return null;
+}
 var NEED_ID_TEXT_RE = /^(?!base-)(?!.*--)[a-z0-9][a-z0-9-]{0,63}$/;
 var JOB_ID_TEXT_RE = /^[A-Za-z_][A-Za-z0-9_-]{0,99}$/;
 var SERVICE_SLUG_RE = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
@@ -2628,8 +2639,10 @@ var RENDERER_INPUTS = Object.freeze({
     "timeout-minutes": modeInput(["find-run"], TIMEOUT_MINUTES_RE, "whole minutes, 1 to 360"),
     // where the gate runs (C8 fix round 1): `inline` (the gate job is in pipegen.yml) or `central` (the per-project central workflow); the renderer
     // knows it from the draft and the referee checks it. find-run never guesses it from the repository's visibility.
-    layout: modeInput(["find-run"], /^(?:inline|central)$/, "inline or central")
+    layout: modeInput(["find-run"], /^(?:inline|central)$/, "inline or central"),
     // nightly (C7): block-from, block-from-recorded, github-token and fp-key (to verify the baseline) above; the setup merge time is read from the API, which proves it
+    // the warn-first checks and their dates (final review fix round A, ruling 3): the nightly's "switch to blocking" issues
+    "warn-first": literalInput(["nightly"], warnFirstListProblem, "a JSON list of { needId, since }")
   }
 });
 
@@ -7966,6 +7979,7 @@ function decideMode(blockFrom, recorded, today, cleanRunSeen2) {
 // src/engine/gate-job-list.ts
 var GateJobListError = class extends Error {
 };
+var FLOOR2 = new Set(FLOOR_NEEDS);
 function jobIdFor(needId, service) {
   try {
     return `${needId}${service === void 0 ? "" : `--${slug(service)}`}`;
@@ -8003,9 +8017,9 @@ var GATE_INPUTS = [
 var MAX_JOBS_TEXT = 4 * 1024 * 1024;
 var SKIP_REASON = "skipped at setup (--skip)";
 var MAX_POLICY_TEXT = 2e5;
-var FLOOR2 = new Set(FLOOR_NEEDS);
+var FLOOR3 = new Set(FLOOR_NEEDS);
 var categoryOf = (needId) => Object.hasOwn(NEED_ID_CATEGORY, needId) ? NEED_ID_CATEGORY[needId] : void 0;
-var isFloorNeed2 = (needId) => FLOOR2.has(needId) || FLOOR2.has(categoryOf(needId) ?? "");
+var isFloorNeed2 = (needId) => FLOOR3.has(needId) || FLOOR3.has(categoryOf(needId) ?? "");
 var isFindingsFormat = (f) => f === "sarif" || f === "zap-json";
 var parse2 = (text) => {
   try {
@@ -8076,7 +8090,7 @@ function resolveSettings(raw, ctx) {
   }
   if (get("mode") !== "gate") errors.push("the mode input is not gate");
   const jobList = readJobList(get("job-list"), errors);
-  const floorNeeds = [.../* @__PURE__ */ new Set(["secrets", ...jobList.filter((e) => isFloorNeed2(e.needId) || FLOOR2.has(e.category)).map((e) => e.needId)])];
+  const floorNeeds = [.../* @__PURE__ */ new Set(["secrets", ...jobList.filter((e) => isFloorNeed2(e.needId) || FLOOR3.has(e.category)).map((e) => e.needId)])];
   const idList = (name) => {
     const v = get(name);
     if (v === void 0) return [];
@@ -9551,6 +9565,15 @@ function finishMissing(blockFrom, setupMergedAt2, now) {
   if (merged === void 0 || clock === void 0) return false;
   return clock - merged > DAY_MS;
 }
+var WARN_FIRST_DAYS = 14;
+var NEED_ID_RE2 = /^(?!base-)(?!.*--)[a-z0-9][a-z0-9-]{0,63}$/;
+function warnFirstEnd(since, setupMergedAt2) {
+  const start = validDate(since);
+  const merged = isoTime(setupMergedAt2);
+  if (start === void 0 || merged === void 0) return void 0;
+  const from = Math.max(Date.parse(`${start}T00:00:00Z`), Math.floor(merged / DAY_MS) * DAY_MS);
+  return new Date(from + WARN_FIRST_DAYS * DAY_MS).toISOString().slice(0, 10);
+}
 var UPDATE_COOLDOWN_DAYS = 7;
 function updateAvailable(current, latest, now) {
   if (latest === null) return false;
@@ -9700,7 +9723,7 @@ async function resolveRepo(gh, full, idText) {
 var BOT_LOGIN = "github-actions[bot]";
 var ISSUE_PAGE_CAP = 5;
 var ISSUE_PER_PAGE = 100;
-var KEY_RE = /^[a-z0-9][a-z0-9.-]{0,63}$/;
+var KEY_RE = /^[a-z0-9][a-z0-9.-]{0,99}$/;
 var MAX_TITLE = 256;
 var MAX_BODY = 6e4;
 var markerOf = (key) => `<!-- pipegen:key=${key} -->`;
@@ -9963,6 +9986,26 @@ function finishMissingIssue(repo2, mergedAt) {
     ].join("\n")
   };
 }
+function warnFirstIssue(repo2, needId, since, end) {
+  return {
+    title: `pipegen: make the ${needId} check blocking (its warn-first period ended ${end})`,
+    body: [
+      `## The \`${needId}\` check can block now`,
+      "",
+      `In ${repoName(repo2)}, the pipegen gate has run the \`${needId}\` check as warn-first since \`${since}\`: its failures and its old or medium findings only warn. A new critical, high or secret finding already blocks. The warn period (${WARN_FIRST_DAYS} days after setup) ended on \`${end}\`.`,
+      "",
+      "To make the check blocking, run:",
+      "",
+      "`npx pipegen update`",
+      "",
+      "It removes warn-first from this check in a pull request you review: `pipegen.yml` is a protected file, and CI never edits a workflow. To keep the check warn-first, close this issue: pipegen does not open it again for this check and date.",
+      "",
+      "> **This issue is advisory.** Anyone with issue rights in a public repository, and any job with `issues: write`, can open an issue that looks like this one. `pipegen update` reads the checks from your pipeline, not from this issue.",
+      "",
+      "This issue is opened by pipegen's nightly job and updated in place every night. pipegen does not close it."
+    ].join("\n")
+  };
+}
 function fenceFor(text) {
   const longest = Math.max(0, ...(text.match(/`+/g) ?? []).map((r) => r.length));
   return "`".repeat(Math.max(3, longest + 1));
@@ -10065,10 +10108,32 @@ async function runNightly(gh, ctx, deps = {}) {
     const w = warnEnding(effective, now, old);
     if (w?.open === true) await upsert(`warn-ending-${effective}`, warnEndingIssue(repo2, effective, w, old, note));
   }
+  let mergedOnce;
+  const merge = () => {
+    mergedOnce ??= setupMergedAt(gh, repo2, now).then((m) => {
+      if (m.note !== void 0) result.notes.push(m.note);
+      return m;
+    });
+    return mergedOnce;
+  };
   if (validDate(ctx.blockFrom) === void 0) {
-    const merged = await setupMergedAt(gh, repo2, now);
-    if (merged.note !== void 0) result.notes.push(merged.note);
+    const merged = await merge();
     if (merged.at !== void 0 && merged.sha !== void 0 && finishMissing(ctx.blockFrom, merged.at, now)) await upsert(`finish-missing-${merged.sha}`, finishMissingIssue(repo2, merged.at));
+  }
+  const switches = [];
+  const clock = clockOf(now);
+  for (const w of ctx.warnFirst ?? []) {
+    if (typeof w?.needId !== "string" || !NEED_ID_RE2.test(w.needId) || validDate(w.since) !== w.since) {
+      result.notes.push("a warn-first entry is not in the form pipegen writes, so it was skipped");
+      continue;
+    }
+    const merged = await merge();
+    const end = warnFirstEnd(w.since, merged.at);
+    if (end === void 0) {
+      result.notes.push(`warn-first ${w.needId}: the setup merge is not proven, so its warn period can not be counted and no switch issue is opened`);
+      continue;
+    }
+    if (clock !== void 0 && clock >= Date.parse(`${end}T00:00:00Z`)) switches.push({ needId: w.needId, since: w.since, end });
   }
   const latest = await latestGateRelease(gh, GATE_VERSION, now);
   if (latest.note !== void 0) result.notes.push(latest.note);
@@ -10103,6 +10168,7 @@ async function runNightly(gh, ctx, deps = {}) {
       }
     }
   }
+  for (const s of switches) await upsert(`warn-first-${s.needId}-${s.end}`, warnFirstIssue(repo2, s.needId, s.since, s.end));
   return result;
 }
 
@@ -10113,7 +10179,7 @@ var MODE_INPUTS = {
   gate: [...GATE_INPUTS],
   "baseline-check": ["mode", "github-token", "fp-key"],
   "find-run": ["mode", "layout", "sha", "central-workflow", "central-sha", "timeout-minutes", "github-token"],
-  nightly: ["mode", "block-from", "block-from-recorded", "github-token", "fp-key"]
+  nightly: ["mode", "block-from", "block-from-recorded", "warn-first", "github-token", "fp-key"]
 };
 var isMode = (m) => Object.hasOwn(MODE_INPUTS, m);
 var REAL_FS = {
@@ -10766,13 +10832,17 @@ async function runNightlyMode(step, deps, get) {
   const token = get("github-token");
   if (token === void 0) return fail3("the github-token input is missing, so the step fails closed");
   if (badKey(get("fp-key"))) return fail3(BAD_KEY);
+  const wf = get("warn-first");
+  const wfProblem = wf === void 0 ? null : warnFirstListProblem(wf);
+  if (wfProblem !== null) return fail3(`the warn-first input is refused (it must be ${wfProblem}), so the step fails closed`);
+  const warnFirst = wf === void 0 ? [] : JSON.parse(wf).map((e) => ({ needId: e.needId, since: e.since }));
   const notes = [];
   let done;
   try {
     const gh = (deps.nightly ?? githubAdapter)({ token, mask: () => void 0, notes });
     const repo2 = await resolveRepo(gh, step.env("GITHUB_REPOSITORY"), step.env("GITHUB_REPOSITORY_ID"));
     if (typeof repo2 === "string") return fail3(`${repo2}, so the step fails closed`);
-    done = await runNightly(gh, { repo: repo2, now: (deps.now ?? (() => /* @__PURE__ */ new Date()))(), blockFrom: get("block-from"), recorded: get("block-from-recorded"), key: get("fp-key") });
+    done = await runNightly(gh, { repo: repo2, now: (deps.now ?? (() => /* @__PURE__ */ new Date()))(), blockFrom: get("block-from"), recorded: get("block-from-recorded"), key: get("fp-key"), warnFirst });
   } catch {
     return fail3("GitHub could not be reached or set up, so the step fails closed");
   }

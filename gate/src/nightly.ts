@@ -1,7 +1,9 @@
 // Plan C Task C7: the gate action's `nightly` mode. It runs on a schedule and opens or updates ISSUES, nothing else:
 //   - `warn-ending-<date>` warn mode ends in 1 or 2 days and old findings exist (counted from the TRUSTED, MAC-verified baseline, S13) or are unknown;
 //   - `finish-missing-<merge commit sha>` the setup pull request merged more than 24 hours ago and the PIPEGEN_BLOCK_FROM variable is still unset;
-//   - `update-<ver>`   a newer pipegen gate is out (released at least 7 days ago), with the exact patch for the pin line(s) in pipegen.yml.
+//   - `update-<ver>`   a newer pipegen gate is out (released at least 7 days ago), with the exact patch for the pin line(s) in pipegen.yml;
+//   - `warn-first-<need>-<date>` a warn-first check's warn period ended (WARN_FIRST_DAYS after the later of its start and the setup merge,
+//                      #96, S12; final review fix round A): make it blocking with `pipegen update` (a reviewed pull request; CI never edits a workflow).
 // It NEVER writes a file or a workflow (the job has `contents: read`, `actions: read`, `issues: write`): the only calls that are not reads
 // are createIssue and updateIssue, and the adapter has no other write method (test/gate-nightly.test.ts spies on all of it).
 //
@@ -113,6 +115,22 @@ export function finishMissing(blockFrom: string | undefined, setupMergedAt: stri
   const clock = clockOf(now);
   if (merged === undefined || clock === undefined) return false;
   return clock - merged > DAY_MS;
+}
+
+/** How long a warn-first check only warns (DECISIONS #96): 14 days. */
+export const WARN_FIRST_DAYS = 14;
+const NEED_ID_RE = /^(?!base-)(?!.*--)[a-z0-9][a-z0-9-]{0,63}$/;
+/**
+ * The day a warn-first check's warn period ends (YYYY-MM-DD): WARN_FIRST_DAYS after the later of `since` (the day it became warn-first) and the
+ * day the setup pull request merged (a check can not leave warn mode before pipegen is installed). Undefined without a real `since` or a proven
+ * merge time (nothing is opened on a doubt).
+ */
+export function warnFirstEnd(since: string, setupMergedAt: string | undefined): string | undefined {
+  const start = validDate(since);
+  const merged = isoTime(setupMergedAt);
+  if (start === undefined || merged === undefined) return undefined;
+  const from = Math.max(Date.parse(`${start}T00:00:00Z`), Math.floor(merged / DAY_MS) * DAY_MS);
+  return new Date(from + WARN_FIRST_DAYS * DAY_MS).toISOString().slice(0, 10);
 }
 
 /** The cooldown before a release counts: 7 days (the same rule as for every pinned action). */
@@ -288,7 +306,7 @@ export async function resolveRepo(gh: NightlyGithub, full: string | undefined, i
 export const BOT_LOGIN = 'github-actions[bot]';
 export const ISSUE_PAGE_CAP = 5;
 const ISSUE_PER_PAGE = 100;
-const KEY_RE = /^[a-z0-9][a-z0-9.-]{0,63}$/;
+const KEY_RE = /^[a-z0-9][a-z0-9.-]{0,99}$/;
 const MAX_TITLE = 256;
 const MAX_BODY = 60_000;
 const markerOf = (key: string): string => `<!-- pipegen:key=${key} -->`;
@@ -577,6 +595,20 @@ function finishMissingIssue(repo: RepoRef, mergedAt: string): { title: string; b
   };
 }
 
+function warnFirstIssue(repo: RepoRef, needId: string, since: string, end: string): { title: string; body: string } {
+  return {
+    title: `pipegen: make the ${needId} check blocking (its warn-first period ended ${end})`,
+    body: [
+      `## The \`${needId}\` check can block now`, '',
+      `In ${repoName(repo)}, the pipegen gate has run the \`${needId}\` check as warn-first since \`${since}\`: its failures and its old or medium findings only warn. A new critical, high or secret finding already blocks. The warn period (${WARN_FIRST_DAYS} days after setup) ended on \`${end}\`.`, '',
+      'To make the check blocking, run:', '', '`npx pipegen update`', '',
+      'It removes warn-first from this check in a pull request you review: `pipegen.yml` is a protected file, and CI never edits a workflow. To keep the check warn-first, close this issue: pipegen does not open it again for this check and date.', '',
+      '> **This issue is advisory.** Anyone with issue rights in a public repository, and any job with `issues: write`, can open an issue that looks like this one. `pipegen update` reads the checks from your pipeline, not from this issue.',
+      '', 'This issue is opened by pipegen\'s nightly job and updated in place every night. pipegen does not close it.',
+    ].join('\n'),
+  };
+}
+
 /** A fence longer than any run of backticks in the text. */
 function fenceFor(text: string): string {
   const longest = Math.max(0, ...(text.match(/`+/g) ?? []).map((r) => r.length));
@@ -662,12 +694,14 @@ export interface NightlyCtx {
   recorded?: string | undefined;
   /** PIPEGEN_FP_KEY, to verify the baseline (absent: the baseline can not be trusted). */
   key?: string | undefined;
+  /** The warn-first checks and the day each became warn-first (the `warn-first` input, fix round A). */
+  warnFirst?: readonly { needId: string; since: string }[] | undefined;
 }
 export interface NightlyDeps { loadBaseline?: (gh: NightlyAdapter, repo: RepoRef, ctx: VerifyContext) => Promise<LoadResult> }
 export interface NightlyResult { issues: IssueOutcome[]; /** Why something was not done (reads that failed, a patch left out): logged, never an error. */ notes: string[]; /** Writes that failed or could not be made safe: the step fails. */ errors: string[] }
 
 /**
- * Runs the three checks, each on its own: one failing never hides another. Read failures are notes (nothing is opened on a doubt); a failed
+ * Runs the four checks, each on its own: one failing never hides another. Read failures are notes (nothing is opened on a doubt); a failed
  * issue write, or an issue list that can not be searched to its end, is an error.
  */
 export async function runNightly(gh: NightlyAdapter, ctx: NightlyCtx, deps: NightlyDeps = {}): Promise<NightlyResult> {
@@ -697,11 +731,26 @@ export async function runNightly(gh: NightlyAdapter, ctx: NightlyCtx, deps: Nigh
     if (w?.open === true) await upsert(`warn-ending-${effective}`, warnEndingIssue(repo, effective, w, old, note));
   }
 
-  // 2. the setup PR merged and `finish` has not run
+  // 2. the setup PR merged and `finish` has not run (the merge is read once, for 2 and 4)
+  let mergedOnce: Promise<Awaited<ReturnType<typeof setupMergedAt>>> | undefined;
+  const merge = (): Promise<Awaited<ReturnType<typeof setupMergedAt>>> => {
+    mergedOnce ??= setupMergedAt(gh, repo, now).then((m) => { if (m.note !== undefined) result.notes.push(m.note); return m; });
+    return mergedOnce;
+  };
   if (validDate(ctx.blockFrom) === undefined) {
-    const merged = await setupMergedAt(gh, repo, now);
-    if (merged.note !== undefined) result.notes.push(merged.note);
+    const merged = await merge();
     if (merged.at !== undefined && merged.sha !== undefined && finishMissing(ctx.blockFrom, merged.at, now)) await upsert(`finish-missing-${merged.sha as string}`, finishMissingIssue(repo, merged.at));
+  }
+
+  // 4 (read here, written after the update): warn-first checks whose warn period has ended (#96, S12). One issue per check and end date.
+  const switches: { needId: string; since: string; end: string }[] = [];
+  const clock = clockOf(now);
+  for (const w of ctx.warnFirst ?? []) {
+    if (typeof w?.needId !== 'string' || !NEED_ID_RE.test(w.needId) || validDate(w.since) !== w.since) { result.notes.push('a warn-first entry is not in the form pipegen writes, so it was skipped'); continue; }
+    const merged = await merge();
+    const end = warnFirstEnd(w.since, merged.at);
+    if (end === undefined) { result.notes.push(`warn-first ${w.needId}: the setup merge is not proven, so its warn period can not be counted and no switch issue is opened`); continue; }
+    if (clock !== undefined && clock >= Date.parse(`${end}T00:00:00Z`)) switches.push({ needId: w.needId, since: w.since, end });
   }
 
   // 3. a pipegen update
@@ -734,5 +783,8 @@ export async function runNightly(gh: NightlyAdapter, ctx: NightlyCtx, deps: Nigh
       try { await supersedeOlder(gh, repo, rel.version, made.number); } catch (e) { result.notes.push(`older update issues were not marked as superseded: ${e instanceof Error ? e.message : 'unknown error'}`); }
     }
   }
+
+  // 4. the "switch to blocking" issues
+  for (const s of switches) await upsert(`warn-first-${s.needId}-${s.end}`, warnFirstIssue(repo, s.needId, s.since, s.end));
   return result;
 }

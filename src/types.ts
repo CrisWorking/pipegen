@@ -144,6 +144,14 @@ export interface PipelineDraft {
    * rendered. Plan G fills it.
    */
   gateSettings?: { blockFromRecorded?: string; policy?: { block: string[]; warn: string[] }; protectedPaths?: string[] };
+  /**
+   * Warn-first checks (DECISIONS #96, Plan C ruling S12; final review fix round A, ruling 3), by need id: the set of needs whose checks start in
+   * warn mode, each with the date it started (YYYY-MM-DD). gateJobList puts `warnFirst: { since }` on every job list entry of such a need (a
+   * floor need is refused); while it is there, the check's failures and old or medium findings warn, and a new critical, high or secret still
+   * blocks. The nightly opens a "switch to blocking" issue 14 days after the later of `since` and the setup merge. Absent = none. Plan G fills
+   * it from the strictness level; `pipegen update` removes a need when it is switched to blocking.
+   */
+  warnFirst?: Readonly<Record<string, { since: string }>>;
 }
 
 // ---------- install record (written by Plan G deliver/finish, read by Plan V and `pipegen verify`) ----------

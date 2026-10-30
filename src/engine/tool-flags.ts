@@ -701,6 +701,22 @@ export function licenceLockfilesProblem(text: string): string | null {
   return null;
 }
 
+/**
+ * Why a text is not the nightly's `warn-first` (final review fix round A, ruling 3), or null: a JSON list of at most 50 `{ "needId", "since" }`
+ * (a need id, a real calendar date YYYY-MM-DD), each need once. The nightly parses the input with it too.
+ */
+export function warnFirstListProblem(text: string): string | null {
+  const list = parseJson(text);
+  const shape = 'a JSON list of at most 50 { "needId", "since": "YYYY-MM-DD" } entries, each need once';
+  if (!Array.isArray(list) || list.length > ID_LIST_MAX) return shape;
+  const seen = new Set<string>();
+  for (const e of list) {
+    if (!isPlainObject(e) || Object.keys(e).sort().join() !== 'needId,since' || typeof e.needId !== 'string' || !NEED_ID_TEXT_RE.test(e.needId) || typeof e.since !== 'string' || validDate(e.since) !== e.since || seen.has(e.needId)) return shape;
+    seen.add(e.needId);
+  }
+  return null;
+}
+
 // the job list literal (rulings B4 and S4): the shape of one entry, kept here so the gate row can check it; gate-job-list.ts builds it
 const NEED_ID_TEXT_RE = /^(?!base-)(?!.*--)[a-z0-9][a-z0-9-]{0,63}$/;
 const JOB_ID_TEXT_RE = /^[A-Za-z_][A-Za-z0-9_-]{0,99}$/;
@@ -846,6 +862,8 @@ export const RENDERER_INPUTS: Readonly<Record<string, Readonly<Record<string, Re
     // knows it from the draft and the referee checks it. find-run never guesses it from the repository's visibility.
     layout: modeInput(['find-run'], /^(?:inline|central)$/, 'inline or central'),
     // nightly (C7): block-from, block-from-recorded, github-token and fp-key (to verify the baseline) above; the setup merge time is read from the API, which proves it
+    // the warn-first checks and their dates (final review fix round A, ruling 3): the nightly's "switch to blocking" issues
+    'warn-first': literalInput(['nightly'], warnFirstListProblem, 'a JSON list of { needId, since }'),
   },
 } satisfies Record<string, Record<string, RendererInput>>);
 

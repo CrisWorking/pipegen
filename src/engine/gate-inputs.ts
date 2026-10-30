@@ -90,3 +90,30 @@ export function gateStepInputs(draft: PipelineDraft, opts: GateJobListOptions = 
   if (problems.length > 0) throw new GateJobListError(`The draft gives the gate step a value the gate would refuse: ${problems[0] as string}.`);
   return filled;
 }
+
+/** The expression inputs of the nightly step (mode nightly): the same text in every pipeline. */
+export const NIGHTLY_STEP_EXPRESSIONS: Readonly<Record<string, string>> = Object.freeze({
+  mode: 'nightly', 'block-from': '${{ vars.PIPEGEN_BLOCK_FROM }}', 'github-token': '${{ secrets.GITHUB_TOKEN }}', 'fp-key': '${{ secrets.PIPEGEN_FP_KEY }}',
+});
+/** The nightly step inputs whose value is a JSON literal (compared as parsed JSON by the referee). */
+export const NIGHTLY_JSON_INPUTS: ReadonlySet<string> = new Set(['warn-first']);
+
+/**
+ * Every input of the nightly step (mode `nightly`, final review fix round A, ruling 3), by name, for this draft: the expressions, the recorded
+ * block date (draft.gateSettings) and `warn-first`, the warn-first needs of the job list (each once, in list order, with its date), so the
+ * nightly opens the "switch to blocking" issue for exactly the checks the gate treats as warn-first. The referee holds the file's nightly step
+ * to it. Throws GateJobListError like gateStepInputs.
+ */
+export function nightlyStepInputs(draft: PipelineDraft, opts: GateJobListOptions = {}): Record<string, string> {
+  const filled: Record<string, string> = { mode: NIGHTLY_STEP_EXPRESSIONS.mode as string, 'block-from': NIGHTLY_STEP_EXPRESSIONS['block-from'] as string };
+  const recorded = draft.gateSettings?.blockFromRecorded;
+  if (recorded !== undefined) filled['block-from-recorded'] = recorded;
+  const warnFirst = new Map<string, string>();
+  for (const e of gateJobList(draft, opts)) if (e.warnFirst !== undefined && !warnFirst.has(e.needId)) warnFirst.set(e.needId, e.warnFirst.since);
+  if (warnFirst.size > 0) filled['warn-first'] = JSON.stringify([...warnFirst].map(([needId, since]) => ({ needId, since })));
+  filled['github-token'] = NIGHTLY_STEP_EXPRESSIONS['github-token'] as string;
+  filled['fp-key'] = NIGHTLY_STEP_EXPRESSIONS['fp-key'] as string;
+  const problems = rendererInputProblems(PIPEGEN_GATE_USES, filled, filled);
+  if (problems.length > 0) throw new GateJobListError(`The draft gives the nightly step a value the gate would refuse: ${problems[0] as string}.`);
+  return filled;
+}

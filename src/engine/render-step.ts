@@ -28,7 +28,7 @@ import type { ProjectScriptStep } from './reviewed.js';
 import { own, RenderError, show } from './render-error.js';
 import { BASE_CHECKOUT_ID, checkExpressions, checkJobOrder, isDangerousName, isReviewed, STEP_KEYS, type JobContext, type RenderedStep, type ScanFact } from './job-rules.js';
 import { GateJobListError } from './gate-job-list.js';
-import { gateStepInputs } from './gate-inputs.js';
+import { gateStepInputs, nightlyStepInputs } from './gate-inputs.js';
 import { BASE_CHECKOUT_REF, DOCKER_ACTION_USES, GATE_UPLOAD_FILES, gateUploadPath, uploadIfNoFiles, IMAGE_BUILT_ACTION_USES, isStagedTool, PIPEGEN_GATE_USES, PLAIN_REL_RE, PLATFORM_LOCKS, PLATFORM_USES, RENDERER_INPUTS, rendererInputProblems, scrubbedResultPath, scrubStepId, stagePath, stageStepId } from './tool-flags.js';
 
 export { RenderError };
@@ -568,6 +568,23 @@ export function renderGateStep(gate: ReviewedTool, draft: PipelineDraft): Render
     throw e;
   }
   return actionStep(gate, 'pipegen: the merge gate', {}, filled);
+}
+
+/**
+ * The nightly step (mode `nightly`, C7; final review fix round A, ruling 3): exactly nightlyStepInputs(draft), which the referee holds the file to
+ * (the warn-first checks for the "switch to blocking" issue, the recorded block date, the variable, the token and the key). The nightly job
+ * holds no checkout (JOB_STEP_POLICY).
+ */
+export function renderNightlyStep(gate: ReviewedTool, draft: PipelineDraft): RenderedStep {
+  checkGateEntry(gate);
+  let filled: Record<string, string>;
+  try {
+    filled = nightlyStepInputs(draft);
+  } catch (e) {
+    if (e instanceof GateJobListError || e instanceof ArtifactNameError) throw new RenderError(e.message);
+    throw e;
+  }
+  return actionStep(gate, 'pipegen: nightly issues', {}, filled);
 }
 
 /**
