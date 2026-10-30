@@ -44,6 +44,7 @@
     cd -- ./apps/web
     ws="$(cd "$GITHUB_WORKSPACE" && pwd -P)"
     case "$(pwd -P)" in "$ws"/*) ;; *) pg_fail "the working folder is outside the repository" ;; esac
+    printf '%s' "$PIPEGEN_CONFIG" > "$npmdir/prettierignore"
     pg_env=(
       /usr/bin/env -i
       "HOME=$home"
@@ -77,12 +78,13 @@
     ( cd -- "$npmdir" && "${pg_env[@]}" "PIPEGEN_NPM_EXPECT=$PIPEGEN_NPM_EXPECT" "$nodebin/node" -e "$js" )
     chmod -R a-w "$npmdir"
     rc=0
-    "${pg_env[@]}" "$nodebin/node" "$npmdir/node_modules/prettier/bin/prettier.cjs" --check . || rc=$?
+    "${pg_env[@]}" "$nodebin/node" "$npmdir/node_modules/prettier/bin/prettier.cjs" --ignore-path "$npmdir/prettierignore" --check --ignore-path .prettierignore . || rc=$?
     exit "$rc"
   shell: bash
   env:
     BASH_ENV: ""
     ENV: ""
+    PIPEGEN_CONFIG: "# pipegen's pinned prettier ignore file: nothing is ignored here, so a .gitignore in the checkout hides no file\n"
     PIPEGEN_NPM_LOCK: "{\"name\":\"pipegen-closure\",\"version\":\"0.0.0\",\"lockfileVersion\":3,\"requires\":true,\"packages\":{\"\":{\"name\":\"pipegen-closure\",\"version\":\"0.0.0\",\"dependencies\":{\"prettier\":\"3.9.10\"}},\"node_modules/prettier\":{\"version\":\"3.9.10\",\"resolved\":\"https://registry.npmjs.org/prettier/-/prettier-3.9.10.tgz\",\"integrity\":\"sha512-skGHTH1Yb9QvaTC4hWnRTzEYtCpApF0UMBPz+t/0ZPzP8ihefo/btKd+QA7pUE0fEwA1SbS/NmhyEcstdXOIdA==\",\"license\":\"MIT\",\"bin\":{\"prettier\":\"bin/prettier.cjs\"},\"engines\":{\"node\":\">=14\"},\"funding\":{\"url\":\"https://github.com/prettier/prettier?sponsor=1\"}}}}"
     PIPEGEN_NPM_PACKAGE: "{\"name\":\"pipegen-closure\",\"version\":\"0.0.0\",\"private\":true,\"dependencies\":{\"prettier\":\"3.9.10\"}}"
     PIPEGEN_NPM_EXPECT: "[{\"name\":\"prettier\",\"version\":\"3.9.10\",\"integrity\":\"sha512-skGHTH1Yb9QvaTC4hWnRTzEYtCpApF0UMBPz+t/0ZPzP8ihefo/btKd+QA7pUE0fEwA1SbS/NmhyEcstdXOIdA==\",\"resolved\":\"https://registry.npmjs.org/prettier/-/prettier-3.9.10.tgz\"}]"

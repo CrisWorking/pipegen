@@ -493,7 +493,7 @@ function trivyEntry(over: { command?: string[]; args?: string[]; verifiedWith?: 
     ...(over.choices === undefined ? {} : { choices: over.choices }),
   });
 }
-const JSCPD_ARGS = ['--baseline-from-ref', 'origin/main', '--fail-on-new-clones'];
+const JSCPD_ARGS = ['--baseline-from-ref', 'origin/main', '--fail-on-new-clones', '--no-gitignore'];
 const jscpdEntry = (over: BinOver = {}) => {
   const e = binEntry('kucherenko/jscpd', {
     id: 'jscpd', command: ['jscpd', ...JSCPD_ARGS, '--reporters', 'sarif', '--output', 'jscpd-report', '.'], args: JSCPD_ARGS,
@@ -1642,7 +1642,9 @@ describe('data/reviewed-tools.yml', () => {
   });
 
   // entries re-reviewed by delegation (DECISIONS 105) after the owner's 2026-10-28 review; add an id here on purpose, never skip it
-  const DELEGATED: Record<string, string> = { 'actions-setup-node': '2026-10-29', betterleaks: '2026-10-30', gitleaks: '2026-10-30', 'trivy-config': '2026-10-29', 'trivy-image': '2026-10-29', 'trivy-licence': '2026-10-29', 'docker-login-action': '2026-10-29', eslint: '2026-10-29', 'eslint-typescript': '2026-10-29', nuclei: '2026-10-29', semgrep: '2026-10-29' };
+  const DELEGATED: Record<string, string> = { 'actions-setup-node': '2026-10-29', betterleaks: '2026-10-30', gitleaks: '2026-10-30', 'trivy-config': '2026-10-29', 'trivy-image': '2026-10-29', 'trivy-licence': '2026-10-29', 'docker-login-action': '2026-10-29', eslint: '2026-10-29', 'eslint-typescript': '2026-10-29', nuclei: '2026-10-29', semgrep: '2026-10-29',
+    // C4 fix round 1 (review-C4 finding 1): tools that honour .gitignore run without it, bandit gets an explicit empty --ini, .gitignore is no longer a protected config
+    ruff: '2026-10-30', 'ruff-format': '2026-10-30', prettier: '2026-10-30', knip: '2026-10-30', 'osv-scanner': '2026-10-30', jscpd: '2026-10-30', bandit: '2026-10-30', 'oxlint-typeaware': '2026-10-30' };
 
   it('data: every catalogue entry is reviewed by the owner (2026-10-28, DECISIONS #104) or by delegation (listed), with proofs 0', () => {
     const list = real();

@@ -250,7 +250,7 @@ const POLICIES = {
   // osv-scanner v2.7.0
   'osv-scanner': { method: GH, package: 'osv-scanner_linux_amd64',
     exe: 'osv-scanner', dialect: 'long', sub: ['scan', 'source'], positionals: ['.'], findingsExit: FOUND_1,
-    flags: { recursive: 'bool', format: { values: ['sarif'] }, output: 'output' }, required: { format: 'sarif', output: null },
+    flags: { recursive: 'bool', 'no-ignore': 'bool', format: { values: ['sarif'] }, output: 'output' }, required: { 'no-ignore': 'true', format: 'sarif', output: null },
     config: { flag: '--config', content: "# pipegen's pinned osv-scanner config: no ignored vulnerabilities\n", fileName: 'osv-scanner.toml' },
   },
   lefthook: { method: GH, runsRepoCode: true, package: 'lefthook_2.2.2_Linux_x86_64', exe: 'lefthook', dialect: 'long', sub: ['run', 'pre-commit'], flags: { 'all-files': 'bool' }, required: { 'all-files': 'true' } },
@@ -286,7 +286,9 @@ const POLICIES = {
     config: { flag: '--config', content: '{ "categories": { "correctness": "error" } }\n', fileName: 'oxlintrc.json' },
   },
   // Prettier 3.9.10: check only (never --write); the repo's own Prettier config is used (catalogue §2)
-  prettier: { method: 'npm', package: 'prettier', npmBin: 'bin/prettier.cjs', loadsRepoConfig: true, exe: 'prettier', dialect: 'long', sub: [], positionals: ['.'], flags: { check: 'bool' }, required: { check: 'true' } },
+  prettier: { method: 'npm', package: 'prettier', npmBin: 'bin/prettier.cjs', loadsRepoConfig: true, exe: 'prettier', dialect: 'long', sub: [], positionals: ['.'], flags: { check: 'bool', 'ignore-path': { values: ['.prettierignore'] } }, required: { check: 'true', 'ignore-path': '.prettierignore' },
+    // the checkout's .prettierignore stays; the pinned (empty) ignore file is the second --ignore-path, so no .gitignore is read (C4 fix round 1; prettier 3.9.10 reads .gitignore and .prettierignore by default)
+    config: { flag: '--ignore-path', content: "# pipegen's pinned prettier ignore file: nothing is ignored here, so a .gitignore in the checkout hides no file\n", fileName: 'prettierignore' } },
   // Vitest 5.0.5: coverage on, with a minimum the AI chooses (P24)
   'vitest-coverage': { method: 'npm', package: 'vitest', npmBin: 'vitest.mjs', runsRepoCode: true,
     exe: 'vitest', dialect: 'long', sub: ['run'], flags: { coverage: 'bool', 'coverage.thresholds.lines': { values: COVERAGE_MINIMUMS } },
@@ -295,12 +297,12 @@ const POLICIES = {
   // c8 12.0.0
   c8: { method: 'npm', package: 'c8', npmBin: 'bin/c8.js', runsRepoCode: true, exe: 'c8', dialect: 'long', sub: [], flags: { 'check-coverage': 'bool' }, required: { 'check-coverage': 'true' } },
   // Knip 6.42.1
-  knip: { method: 'npm', package: 'knip', npmBin: 'bin/knip.js', loadsRepoConfig: true, exe: 'knip', dialect: 'long', sub: [], flags: { 'no-progress': 'bool' } },
+  knip: { method: 'npm', package: 'knip', npmBin: 'bin/knip.js', loadsRepoConfig: true, exe: 'knip', dialect: 'long', sub: [], flags: { 'no-progress': 'bool', 'no-gitignore': 'bool' }, required: { 'no-gitignore': 'true' } },
   // jscpd 5.4.2 (the release binary): new copy-paste against the base only; no semantic mode (jscpdProblems)
   jscpd: { method: GH, slots: { '--baseline-from-ref': 'git-ref' }, package: 'jscpd-linux-x64-gnu.tar.gz',
     exe: 'jscpd', dialect: 'long', sub: [], positionals: ['.'],
-    flags: { 'baseline-from-ref': { values: ['origin/main'] }, 'fail-on-new-clones': { values: [''], optional: true }, reporters: { values: ['sarif'] }, output: { values: ['jscpd-report'] } },
-    required: { 'baseline-from-ref': 'origin/main', 'fail-on-new-clones': '' },
+    flags: { 'baseline-from-ref': { values: ['origin/main'] }, 'fail-on-new-clones': { values: [''], optional: true }, 'no-gitignore': 'bool', reporters: { values: ['sarif'] }, output: { values: ['jscpd-report'] } },
+    required: { 'baseline-from-ref': 'origin/main', 'fail-on-new-clones': '', 'no-gitignore': 'true' },
     config: { flag: '--config', content: '{}\n', fileName: 'jscpd.json' },
   },
   // hadolint 2.15.1: fails on warnings and errors (never --no-fail or a lower threshold)
@@ -338,11 +340,11 @@ const POLICIES = {
   ruff: { method: GH, package: RUFF_ASSET,
     exe: 'ruff', dialect: 'long', sub: ['check'], findingsExit: FOUND_1, flags: { 'no-cache': 'bool', 'output-format': { values: ['sarif'] }, 'output-file': 'output' },
     required: { 'no-cache': 'true', 'output-format': 'sarif', 'output-file': null },
-    config: { flag: '--config', content: '[lint]\nextend-select = ["C901"]\n\n[lint.mccabe]\nmax-complexity = 15\n', fileName: 'ruff.toml' },
+    config: { flag: '--config', content: 'respect-gitignore = false\n\n[lint]\nextend-select = ["C901"]\n\n[lint.mccabe]\nmax-complexity = 15\n', fileName: 'ruff.toml' },
   },
   'ruff-format': { method: GH, package: RUFF_ASSET,
     exe: 'ruff', dialect: 'long', sub: ['format'], flags: { check: 'bool', 'no-cache': 'bool' }, required: { check: 'true', 'no-cache': 'true' },
-    config: { flag: '--config', content: "# pipegen's pinned ruff config: the default format\n", fileName: 'ruff.toml' },
+    config: { flag: '--config', content: "# pipegen's pinned ruff config: the default format, and files hidden by a .gitignore are still checked\nrespect-gitignore = false\n", fileName: 'ruff.toml' },
   },
   // mypy 2.4.0 (never --install-types: it installs unpinned stub packages)
   mypy: { method: 'pip', package: 'mypy', exe: 'mypy', dialect: 'long', sub: [], positionals: ['.'], flags: { 'no-incremental': 'bool' } },
@@ -357,6 +359,8 @@ const POLICIES = {
   bandit: { method: 'pip', package: 'bandit',
     exe: 'bandit', dialect: 'long', sub: [], positionals: ['.'], findingsExit: FOUND_1, flags: { recursive: 'bool', format: { values: ['sarif'] }, output: 'output' },
     required: { recursive: 'true', format: 'sarif', output: null },
+    // pipegen's own (empty) .bandit: without --ini bandit walks the targets and loads the only `.bandit` it finds, wherever it is (C4 review 1; bandit 1.9.4 cli/main.py)
+    config: { flag: '--ini', content: '[bandit]\n', fileName: 'bandit.ini' },
   },
 } satisfies Record<string, ArgvPolicy>;
 

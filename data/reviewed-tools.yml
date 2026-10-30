@@ -684,17 +684,17 @@ tools:
     step:
       cli:
         install: { method: github-release, package: "osv-scanner_linux_amd64", version: "v2.7.0" }
-        command: ["osv-scanner", "scan", "source", "--recursive", "--format", "sarif", "--output", "osv.sarif", "."]
+        command: ["osv-scanner", "scan", "source", "--recursive", "--no-ignore", "--format", "sarif", "--output", "osv.sarif", "."]
       output: { path: "osv.sarif", format: sarif }
     fixedInputs:
-      args: ["--format", "sarif", "--output", "osv.sarif"]
+      args: ["--no-ignore", "--format", "sarif", "--output", "osv.sarif"]
       config:
         content: "# pipegen's pinned osv-scanner config: no ignored vulnerabilities\n"
         passAs: { flag: "--config" }
     choices: {}
     configFiles: ["**/osv-scanner.toml"]
-    reviewedBy: Cristiano
-    reviewedAt: "2026-10-28"
+    reviewedBy: Claude delegated DECISIONS 105
+    reviewedAt: "2026-10-30"
     proofs: 0
 
   # Git hook manager: sets up the pre-commit hooks, and runs them in CI on all files.
@@ -1005,9 +1005,9 @@ tools:
         content: "{ \"categories\": { \"correctness\": \"error\" } }\n"
         passAs: { flag: "--config" }
     choices: {}
-    configFiles: [".oxlintrc.json", "oxlint.config.ts", "**/.oxlintrc.json", ".eslintignore", ".gitignore"]
-    reviewedBy: Cristiano
-    reviewedAt: "2026-10-28"
+    configFiles: [".oxlintrc.json", "oxlint.config.ts", "**/.oxlintrc.json", ".eslintignore"]
+    reviewedBy: Claude delegated DECISIONS 105
+    reviewedAt: "2026-10-30"
     proofs: 0
 
   # Prettier format check (no writes). A Prettier config already in the repo is used (catalogue §2), so it is protected.
@@ -1029,15 +1029,18 @@ tools:
     step:
       cli:
         install: { method: npm, package: "prettier", version: "3.9.10" }
-        command: ["prettier", "--check", "."]
+        command: ["prettier", "--check", "--ignore-path", ".prettierignore", "."]
       output: { path: "", format: none }
     fixedInputs:
-      args: ["--check"]
+      args: ["--check", "--ignore-path", ".prettierignore"]
+      config:
+        content: "# pipegen's pinned prettier ignore file: nothing is ignored here, so a .gitignore in the checkout hides no file\n"
+        passAs: { flag: "--ignore-path" }
     choices: {}
-    configFiles: [".prettierrc", ".prettierrc.*", "prettier.config.*", ".prettierignore", "**/.prettierrc", "**/.prettierrc.*", ".editorconfig", ".gitignore"]
+    configFiles: [".prettierrc", ".prettierrc.*", "prettier.config.*", ".prettierignore", "**/.prettierrc", "**/.prettierrc.*", ".editorconfig"]
     configSections: ["package.json:prettier"]
-    reviewedBy: Cristiano
-    reviewedAt: "2026-10-28"
+    reviewedBy: Claude delegated DECISIONS 105
+    reviewedAt: "2026-10-30"
     proofs: 0
 
   # Vitest coverage (v8), when Vitest is the test runner. The minimum of lines is a fixed flag whose value the AI chooses
@@ -1123,14 +1126,15 @@ tools:
     step:
       cli:
         install: { method: npm, package: "knip", version: "6.42.1" }
-        command: ["knip", "--no-progress"]
+        command: ["knip", "--no-progress", "--no-gitignore"]
       output: { path: "", format: none }
-    fixedInputs: {}
+    fixedInputs:
+      args: ["--no-progress", "--no-gitignore"]
     choices: {}
     configFiles: ["knip.json", "knip.jsonc", ".knip.json", ".knip.jsonc", "knip.config.*", "knip.ts", "knip.js"]
     configSections: ["package.json:knip"]
-    reviewedBy: Cristiano
-    reviewedAt: "2026-10-28"
+    reviewedBy: Claude delegated DECISIONS 105
+    reviewedAt: "2026-10-30"
     proofs: 0
 
   # jscpd: copy-paste detection, warning only (DECISIONS #93); new copy-paste in the pull request only.
@@ -1157,18 +1161,18 @@ tools:
     step:
       cli:
         install: { method: github-release, package: "jscpd-linux-x64-gnu.tar.gz", version: "v5.4.2" }
-        command: ["jscpd", "--baseline-from-ref", "origin/main", "--fail-on-new-clones", "--reporters", "sarif", "--output", "jscpd-report", "."]
+        command: ["jscpd", "--baseline-from-ref", "origin/main", "--fail-on-new-clones", "--no-gitignore", "--reporters", "sarif", "--output", "jscpd-report", "."]
       output: { path: "", format: none }
     fixedInputs:
-      args: ["--baseline-from-ref", "origin/main", "--fail-on-new-clones"]
+      args: ["--baseline-from-ref", "origin/main", "--fail-on-new-clones", "--no-gitignore"]
       config:
         content: "{}\n"
         passAs: { flag: "--config" }
     choices: {}
     configFiles: [".jscpd.json"]
     configSections: ["package.json:jscpd"]
-    reviewedBy: Cristiano
-    reviewedAt: "2026-10-28"
+    reviewedBy: Claude delegated DECISIONS 105
+    reviewedAt: "2026-10-30"
     proofs: 0
 
   # Trivy licence scan of the dependencies (catalogue §3): blocks on HIGH and CRITICAL licence findings. Same binary as trivy-config.
@@ -1552,7 +1556,7 @@ tools:
 
   # Ruff lint for Python (C901 complexity at 15), with pipegen's pinned ruff.toml (--config with a file: the repo's ruff
   #   settings are not read; the pyproject.toml section is still listed, ruling P23). No cache (spec §19). Ruff skips
-  #   files in .gitignore/.ignore, so those are protected too.
+  #   files in .gitignore/.ignore, so the pinned config sets respect-gitignore = false (checked on 0.17.1: it covers .ignore too).
   # Source: release 0.17.1 of astral-sh/ruff (the tag has no v): ruff-x86_64-unknown-linux-gnu.tar.gz sha256 from sha256.sum
   #   (and the asset's own .sha256; also GitHub's asset digest and the sha256 of the downloaded archive). Released 2026-10-15T15:24:28Z. Immutable release.
   - id: ruff
@@ -1577,13 +1581,13 @@ tools:
     fixedInputs:
       args: ["--no-cache", "--output-format", "sarif", "--output-file", "ruff.sarif"]
       config:
-        content: "[lint]\nextend-select = [\"C901\"]\n\n[lint.mccabe]\nmax-complexity = 15\n"
+        content: "respect-gitignore = false\n\n[lint]\nextend-select = [\"C901\"]\n\n[lint.mccabe]\nmax-complexity = 15\n"
         passAs: { flag: "--config" }
     choices: {}
-    configFiles: ["ruff.toml", ".ruff.toml", ".gitignore", ".ignore"]
+    configFiles: ["ruff.toml", ".ruff.toml"]
     configSections: ["pyproject.toml:tool.ruff"]
-    reviewedBy: Cristiano
-    reviewedAt: "2026-10-28"
+    reviewedBy: Claude delegated DECISIONS 105
+    reviewedAt: "2026-10-30"
     proofs: 0
 
   # Ruff format check for Python (no writes). Same binary and pin as ruff.
@@ -1609,13 +1613,13 @@ tools:
     fixedInputs:
       args: ["--check", "--no-cache"]
       config:
-        content: "# pipegen's pinned ruff config: the default format\n"
+        content: "# pipegen's pinned ruff config: the default format, and files hidden by a .gitignore are still checked\nrespect-gitignore = false\n"
         passAs: { flag: "--config" }
     choices: {}
-    configFiles: ["ruff.toml", ".ruff.toml", ".gitignore", ".ignore"]
+    configFiles: ["ruff.toml", ".ruff.toml"]
     configSections: ["pyproject.toml:tool.ruff"]
-    reviewedBy: Cristiano
-    reviewedAt: "2026-10-28"
+    reviewedBy: Claude delegated DECISIONS 105
+    reviewedAt: "2026-10-30"
     proofs: 0
 
   # mypy for Python repos that configured type checking (DECISIONS #95: no config and no py.typed → skipped).
@@ -1769,11 +1773,14 @@ tools:
       output: { path: "bandit.sarif", format: sarif }
     fixedInputs:
       args: ["--recursive", "--format", "sarif", "--output", "bandit.sarif"]
+      config:
+        content: "[bandit]\n"
+        passAs: { flag: "--ini" }
     choices: {}
     configFiles: [".bandit"]
     configSections: ["pyproject.toml:tool.bandit"]
-    reviewedBy: Cristiano
-    reviewedAt: "2026-10-28"
+    reviewedBy: Claude delegated DECISIONS 105
+    reviewedAt: "2026-10-30"
     proofs: 0
 
   # PyPI trusted publishing (OIDC) with attestations; never a password input (no long-lived token).
