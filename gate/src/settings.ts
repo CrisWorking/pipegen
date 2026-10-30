@@ -14,12 +14,12 @@
 // artifact's `-sha256`, `-status` and `-error` outputs; the base-scan job's `base-sha` and base artifact outputs. needId, tool, blocking
 // and needsSecrets always come from the job list. A listed job that is absent is `missing` (decide.ts blocks a required one); a job that is
 // not listed is ignored, with a note.
-import { resultArtifactName } from '../../src/engine/artifact-names.js';
+import { resultArtifactName, SECRETS_RANGE_ARTIFACT } from '../../src/engine/artifact-names.js';
 import { jobIdFor, type JobListEntry } from '../../src/engine/gate-job-list.js';
 import { NEED_ID_CATEGORY } from '../../src/engine/need-ids.js';
 import { effectiveProtectedPaths } from '../../src/engine/protected-paths.js';
 import type { LicenceLockfiles } from '../../src/engine/licence-lockfiles.js';
-import { idListProblem, JOB_LIST_KEYS, jobListLiteralProblem, licenceLockfilesProblem, pathListProblem, serviceRootsProblem } from '../../src/engine/tool-flags.js';
+import { idListProblem, JOB_LIST_KEYS, jobListLiteralProblem, licenceLockfilesProblem, pathListProblem, RANGE_TOOL, serviceRootsProblem } from '../../src/engine/tool-flags.js';
 import { FLOOR_NEEDS, PROTECTED_SECTIONS_BASE, type ReviewedTool } from '../../src/types.js';
 import { safeText } from '../../src/util/safe-text.js';
 import { validDate } from './date.js';
@@ -126,6 +126,9 @@ function entryProblem(e: JobListEntry, i: number): string | null {
   let job: string;
   try { job = jobIdFor(e.needId, e.service); } catch { return `${at} has a service that names no job`; }
   if (e.job !== job) return `${at} has the job ${shownName(e.job)}, but its need and service give ${shownName(job)}`;
+  // C9: the secrets job's commit-range scan: its own artifact, no base twin (the schema, jobListLiteralProblem, holds the rest of its form)
+  if (e.range === true) return e.needId === 'secrets' && e.service === undefined && e.artifact === SECRETS_RANGE_ARTIFACT && e.baseArtifact === undefined && e.tool === RANGE_TOOL && e.format === 'sarif'
+    ? null : `${at} is a commit-range entry that is not the one of the secrets job`;
   if (isFindingsFormat(e.format)) {
     if (e.artifact === undefined || e.baseArtifact === undefined || e.tool === undefined) return `${at} is a findings check without its tool, artifact or base artifact`;
     let head: string; let base: string;

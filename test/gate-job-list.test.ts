@@ -31,8 +31,10 @@ describe('gateJobList (rulings S4 and B4)', () => {
       [spec('gitleaks', 'secrets'), spec('semgrep', 'sast', 'app'), spec('semgrep', 'sast', 'Web App!')],
     );
     const list = gateJobList(d);
-    expect(list.map((e) => e.job)).toEqual(['secrets', 'sast--app', 'sast--web-app']);
-    const [secrets, app, web] = list as [JobListEntry, JobListEntry, JobListEntry];
+    // C9: the secrets check is followed by its commit-range scan, in the same job
+    expect(list.map((e) => e.job)).toEqual(['secrets', 'secrets', 'sast--app', 'sast--web-app']);
+    expect(list[1]?.range).toBe(true);
+    const [secrets, , app, web] = list as [JobListEntry, JobListEntry, JobListEntry, JobListEntry];
     expect(secrets).toEqual({
       needId: 'secrets', job: 'secrets', category: 'secrets', tool: 'gitleaks', format: 'sarif',
       artifact: resultArtifactName('secrets'), baseArtifact: resultArtifactName('secrets', undefined, { base: true }), blocking: true, [NS]: false,
@@ -101,7 +103,7 @@ describe('gateJobList (rulings S4 and B4)', () => {
   it('gateJobList: the same need on two layers is one entry; the order follows draft.needs; the literal is JSON of the list', () => {
     const d = draftOf([needOf('secrets'), needOf('secrets', { layer: 'push' }), needOf('sast', { service: 'app' })], [spec('gitleaks', 'secrets'), spec('semgrep', 'sast', 'app')]);
     const list = gateJobList(d);
-    expect(list.map((e) => e.job)).toEqual(['secrets', 'sast--app']);
+    expect(list.map((e) => e.job)).toEqual(['secrets', 'secrets', 'sast--app']);   // C9: the second is the commit-range entry
     expect(JSON.parse(jobListLiteral(list))).toEqual(JSON.parse(JSON.stringify(list)));
     expect(jobListLiteral(list)).toBe(jobListLiteral(gateJobList(d)));
   });

@@ -1809,6 +1809,9 @@ import { randomUUID } from "node:crypto";
 import { accessSync, chmodSync as chmodSync2, closeSync as closeSync4, constants as constants4, fstatSync as fstatSync4, lstatSync as lstatSync4, mkdirSync as mkdirSync3, openSync as openSync4, readSync as readSync4, renameSync, unlinkSync as unlinkSync2, writeFileSync, writeSync as writeSync3 } from "node:fs";
 import { basename as basename2, dirname as dirname3, isAbsolute as isAbsolute3, join as join4 } from "node:path";
 
+// src/engine/tool-flags.ts
+import { createHash } from "node:crypto";
+
 // src/types.ts
 var NEED_CATEGORIES = [
   "secrets",
@@ -1890,6 +1893,9 @@ function resultArtifactName(needId, service, opts) {
   if (!NEED_ID_RE.test(needId)) throw new ArtifactNameError("A need id for an artifact name must be lower case letters, digits and dashes.");
   return `${RESULT_ARTIFACT_PREFIX}${opts?.base === true ? "base-" : ""}${needId}${service === void 0 ? "" : `--${slug(service)}`}`;
 }
+var SECRETS_RANGE_ID = "secrets-range";
+var SECRETS_RANGE_ARTIFACT = resultArtifactName(SECRETS_RANGE_ID);
+var SECRETS_RANGE_TOOL = "betterleaks";
 var GATE_RESULT_ARTIFACT = "pipegen-gate-result";
 var BASELINE_ARTIFACT = "pipegen-baseline";
 var CLEAN_RUN_ARTIFACT = "pipegen-clean-run";
@@ -2319,6 +2325,7 @@ var READS_ONLY = [
 var ARGV_POLICIES = Object.freeze(Object.fromEntries(
   Object.entries(POLICIES).map(([id, pol]) => [id, READS_ONLY.includes(id) ? { ...pol, readsOnly: true } : pol])
 ));
+var sha16 = (text) => createHash("sha256").update(text).digest("hex").slice(0, 16);
 var stagePath = (artifact) => `\${{ runner.temp }}/pipegen-stage/${artifact}`;
 var isStagedTool = (tool2) => tool2 !== void 0 && Object.hasOwn(ARGV_POLICIES, tool2) && ARGV_POLICIES[tool2]?.staged !== void 0;
 var PIPEGEN_GATE_USES = "crisworking/pipegen/gate";
@@ -2525,7 +2532,7 @@ var TOOL_ID_TEXT_RE = /^[a-z0-9][a-z0-9-]{0,63}$/;
 var RESULT_ARTIFACT_NAME_RE = new RegExp(`^${RESULT_ARTIFACT_PREFIX}[a-z0-9][a-z0-9-]{0,120}$`);
 var RESULT_NAME_TEXT_RE = RESULT_ARTIFACT_NAME_RE;
 var DATE_TEXT_RE = /^\d{4}-(?:0[1-9]|1[0-2])-(?:0[1-9]|[12]\d|3[01])$/;
-var JOB_LIST_KEYS = ["needId", "service", "job", "category", "tool", "format", "artifact", "baseArtifact", "blocking", "needsSecrets", "warnFirst"];
+var JOB_LIST_KEYS = ["needId", "service", "job", "category", "tool", "format", "artifact", "baseArtifact", "blocking", "needsSecrets", "warnFirst", "range"];
 var JOB_LIST_MAX = 500;
 var JOB_LIST_MAX_TEXT = 2e5;
 var isPlainObject = (v) => typeof v === "object" && v !== null && !Array.isArray(v);
@@ -2548,25 +2555,47 @@ var FIELD_CHECKS = {
   baseArtifact: (v) => typeof v === "string" && RESULT_NAME_TEXT_RE.test(v),
   blocking: (v) => typeof v === "boolean",
   needsSecrets: (v) => typeof v === "boolean",
-  warnFirst: (v) => isPlainObject(v) && Object.keys(v).join() === "since" && typeof v.since === "string" && DATE_TEXT_RE.test(v.since)
+  warnFirst: (v) => isPlainObject(v) && Object.keys(v).join() === "since" && typeof v.since === "string" && DATE_TEXT_RE.test(v.since),
+  range: (v) => v === true
 };
+var RANGE_TOOL = SECRETS_RANGE_TOOL;
+function rangeEntryProblem(e) {
+  const want = { needId: "secrets", category: "secrets", tool: RANGE_TOOL, format: "sarif", artifact: SECRETS_RANGE_ARTIFACT, blocking: true };
+  for (const [k, v] of Object.entries(want)) if (e[k] !== v) return `its ${k} is not the one of the commit-range scan`;
+  if (Object.hasOwn(e, "baseArtifact") || Object.hasOwn(e, "service") || Object.hasOwn(e, "warnFirst")) return "it names a base artifact, a service or warn-first, which the commit-range scan never has";
+  return null;
+}
 var JOB_LIST_REQUIRED = ["needId", "job", "category", "format", "blocking", "needsSecrets"];
 function jobListLiteralProblem(text) {
   const list = parseJson(text);
   if (!Array.isArray(list)) return "it is not a JSON list";
   if (list.length > JOB_LIST_MAX) return `it has more than ${JOB_LIST_MAX} entries`;
   const jobs = /* @__PURE__ */ new Set();
+  const secretsJobs = /* @__PURE__ */ new Set();
+  const ranges = [];
   for (const [i, e] of list.entries()) {
     if (!isPlainObject(e)) return `entry ${i + 1} is not an object`;
     for (const k of Object.keys(e)) if (!JOB_LIST_KEYS.includes(k)) return `entry ${i + 1} has the key ${JSON.stringify(k.slice(0, 40))}, which a job list entry never has`;
     for (const k of JOB_LIST_REQUIRED) if (!Object.hasOwn(e, k)) return `entry ${i + 1} has no ${k}`;
     for (const k of JOB_LIST_KEYS) if (Object.hasOwn(e, k) && !FIELD_CHECKS[k](e[k])) return `entry ${i + 1} has a ${k} that is not in the form pipegen writes`;
+    if (e.range === true) {
+      const p = rangeEntryProblem(e);
+      if (p !== null) return `entry ${i + 1} is marked range, but ${p}`;
+      ranges.push(e.job);
+      continue;
+    }
     if (jobs.has(e.job)) return `the job ${JSON.stringify(e.job)} is listed twice`;
     jobs.add(e.job);
+    if (e.needId === "secrets" && e.category === "secrets") secretsJobs.add(e.job);
   }
+  if (ranges.length > 1) return "it has more than one commit-range entry";
+  for (const job of ranges) if (!secretsJobs.has(job)) return `its commit-range entry names the job ${JSON.stringify(job)}, which is not the job of its secrets check`;
   return null;
 }
 var BASE_CHECKOUT_REF = `\${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event_name == 'pull_request_review' && github.event.pull_request.base.sha || github.event_name == 'merge_group' && github.event.merge_group.base_sha || github.event_name == 'push' && github.event.before || '${"0".repeat(40)}' }}`;
+var RANGE_HEAD_REF = `\${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.event_name == 'pull_request_review' && github.event.pull_request.head.sha || github.event_name == 'merge_group' && github.event.merge_group.head_sha || github.event_name == 'push' && github.event.after || '${"0".repeat(40)}' }}`;
+var RANGE_STEP_ENV = Object.freeze({ PIPEGEN_RANGE_BASE: BASE_CHECKOUT_REF, PIPEGEN_RANGE_HEAD: RANGE_HEAD_REF });
+var rangeScanStepId = `checker-run-${sha16(SECRETS_RANGE_ARTIFACT)}`;
 var RENDERER_INPUTS = Object.freeze({
   // the base commit, for the base-scan job only (the job rule is in job-rules.ts); no other ref is ever set
   "actions/checkout": { ref: { describe: "the event-switched base commit (BASE_CHECKOUT_REF) and nothing else", check: (v) => v === BASE_CHECKOUT_REF } },
@@ -2686,7 +2715,7 @@ function dropHalfEscape(body) {
 }
 
 // gate/src/fingerprint.ts
-import { createHash, createHmac } from "node:crypto";
+import { createHash as createHash2, createHmac } from "node:crypto";
 import { closeSync, constants, fstatSync, lstatSync, openSync, readlinkSync, readSync, realpathSync } from "node:fs";
 import { join, sep } from "node:path";
 
@@ -3426,7 +3455,7 @@ var REGION_MAX_BYTES = 64 * 1024;
 var FILE_SCAN_MAX = 16 * 1024 * 1024;
 var CONTENT_FORMS = Object.freeze(["hash", "region", "quoted", "file"]);
 var POSITION_FORMS = Object.freeze(["line", "nokey", "quoted-nokey"]);
-var sha = (s) => createHash("sha256").update(s).digest("hex");
+var sha = (s) => createHash2("sha256").update(s).digest("hex");
 var hmac = (key, data) => createHmac("sha256", key).update(data).digest("hex");
 var field = (s) => s === void 0 ? "" : String(s).replaceAll("\0", "\uFFFD");
 function keyId(key) {
@@ -5184,16 +5213,16 @@ function buildCleanRunMarker(runId, key) {
 }
 
 // gate/src/artifacts.ts
-import { createHash as createHash4 } from "node:crypto";
+import { createHash as createHash5 } from "node:crypto";
 import { crc32, inflateRawSync } from "node:zlib";
 
 // gate/src/scrub.ts
-import { createHash as createHash3, randomBytes } from "node:crypto";
+import { createHash as createHash4, randomBytes } from "node:crypto";
 import { closeSync as closeSync3, constants as constants3, fstatSync as fstatSync3, linkSync, lstatSync as lstatSync3, mkdirSync as mkdirSync2, openSync as openSync3, readSync as readSync3, unlinkSync, writeSync as writeSync2 } from "node:fs";
 import { basename, dirname as dirname2, isAbsolute as isAbsolute2, join as join3, sep as sep2 } from "node:path";
 
 // gate/src/stage.ts
-import { createHash as createHash2 } from "node:crypto";
+import { createHash as createHash3 } from "node:crypto";
 import { chmodSync, closeSync as closeSync2, constants as constants2, fstatSync as fstatSync2, lstatSync as lstatSync2, mkdirSync, openSync as openSync2, readdirSync, readSync as readSync2, rmSync, writeSync } from "node:fs";
 import { dirname, isAbsolute, join as join2 } from "node:path";
 
@@ -5453,7 +5482,7 @@ function writeNew(path, bytes, mode) {
     closeSync2(fd);
   }
 }
-var sha256 = (b) => createHash2("sha256").update(b).digest("hex");
+var sha256 = (b) => createHash3("sha256").update(b).digest("hex");
 var linesOf = (b) => {
   let n = 0;
   for (const c of b) if (c === 10) n++;
@@ -5651,7 +5680,7 @@ function pathFields(e) {
     text = void 0;
   }
   if (text !== void 0 && normaliseUri(text, { encoding: "raw" }) === text) return { file: text, uriUnmapped: false, uriId: void 0 };
-  return { file: void 0, uriUnmapped: true, uriId: createHash2("sha256").update(Buffer.concat([Buffer.from("pipegen-path-bytes\0"), raw])).digest("hex").slice(0, 32), displayPath: displayPathOf(raw) };
+  return { file: void 0, uriUnmapped: true, uriId: createHash3("sha256").update(Buffer.concat([Buffer.from("pipegen-path-bytes\0"), raw])).digest("hex").slice(0, 32), displayPath: displayPathOf(raw) };
 }
 function displayPathOf(raw) {
   const b = Buffer.from(raw);
@@ -5752,7 +5781,7 @@ var MAX_ERROR_CHARS = 300;
 var MAX_NOTES = 50;
 var MAX_NOTE_CHARS = 300;
 var MAX_FIELD = 1024;
-var sha2562 = (b) => createHash3("sha256").update(b).digest("hex");
+var sha2562 = (b) => createHash4("sha256").update(b).digest("hex");
 var LEVEL = { critical: "error", high: "error", medium: "warning", low: "note", info: "note" };
 var SEVERITIES2 = ["critical", "high", "medium", "low", "info"];
 var FP_BYS = [...CONTENT_FORMS, ...POSITION_FORMS];
@@ -6325,7 +6354,7 @@ function readZip(zip, maxBytes, expectedFile) {
   if (crc32(data) !== crc) return bad("the CRC does not match");
   return { ok: true, name, bytes: new Uint8Array(data) };
 }
-var sha2563 = (b) => createHash4("sha256").update(b).digest("hex");
+var sha2563 = (b) => createHash5("sha256").update(b).digest("hex");
 var tamperedFile = (problem) => ({ kind: "file", file: { sha256: "", read: { findings: [], notes: [] }, problem } });
 async function downloadResult(io, want) {
   let listing;
@@ -6350,7 +6379,7 @@ async function downloadResult(io, want) {
 
 // gate/src/integrity.ts
 var import_picomatch = __toESM(require_picomatch2(), 1);
-import { createHash as createHash5 } from "node:crypto";
+import { createHash as createHash6 } from "node:crypto";
 
 // node_modules/smol-toml/dist/error.js
 function getLineColFromPtr(string, ptr) {
@@ -7894,7 +7923,7 @@ async function buildPrDiff(gh, repo2, baseSha, headSha) {
   const r = addedLinesOf(files);
   return { added: r.added, complete: ok && r.complete, commit: headSha };
 }
-var fp = (...parts) => createHash5("sha256").update(parts.join("\0")).digest("hex");
+var fp = (...parts) => createHash6("sha256").update(parts.join("\0")).digest("hex");
 function integrityFindings(pr, protectedPaths, rules, extra = {}) {
   const out = [];
   const seen = /* @__PURE__ */ new Set();
@@ -8040,6 +8069,7 @@ function entryProblem(e, i) {
     return `${at3} has a service that names no job`;
   }
   if (e.job !== job) return `${at3} has the job ${shownName(e.job)}, but its need and service give ${shownName(job)}`;
+  if (e.range === true) return e.needId === "secrets" && e.service === void 0 && e.artifact === SECRETS_RANGE_ARTIFACT && e.baseArtifact === void 0 && e.tool === RANGE_TOOL && e.format === "sarif" ? null : `${at3} is a commit-range entry that is not the one of the secrets job`;
   if (isFindingsFormat(e.format)) {
     if (e.artifact === void 0 || e.baseArtifact === void 0 || e.tool === void 0) return `${at3} is a findings check without its tool, artifact or base artifact`;
     let head;
@@ -8340,7 +8370,7 @@ async function gatherGateInput(ctx, client, io) {
   notes.push(...mapped.notes);
   const outputFile = new Map(ctx.reviewed.flatMap((t) => t.outputFile === void 0 ? [] : [[t.id, t.outputFile]]));
   const checks = [];
-  for (const m of mapped.checks) {
+  for (const m of mapped.checks.filter((x) => x.entry.range !== true)) {
     const e = m.entry;
     const c = { entry: e, result: m.result, outputs: m.outputs };
     if ((e.format === "sarif" || e.format === "zap-json") && e.artifact !== void 0) {
@@ -8929,7 +8959,7 @@ async function findGatedRun(gh0, repo2, sha3, o) {
 }
 
 // gate/src/nightly.ts
-import { createHash as createHash6 } from "node:crypto";
+import { createHash as createHash7 } from "node:crypto";
 
 // gate/src/generated/gate-view.ts
 var GATE_VERSION = "0.2.0";
@@ -9932,7 +9962,7 @@ async function latestGateRelease(gh, current, now) {
   }
 }
 function blobSha(bytes) {
-  return createHash6("sha1").update(`blob ${bytes.length}\0`).update(bytes).digest("hex");
+  return createHash7("sha1").update(`blob ${bytes.length}\0`).update(bytes).digest("hex");
 }
 var MAX_WORKFLOW_BYTES = 1024 * 1024;
 async function readWorkflow(gh, repo2) {

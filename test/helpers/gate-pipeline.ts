@@ -7,11 +7,11 @@ import { jobOutputsFor, NO_SCANS, type ScanFact } from '../../src/engine/job-rul
 import { NEED_ID_CATEGORY } from '../../src/engine/need-ids.js';
 import { referee, type Linters, type RefereeReport } from '../../src/engine/referee.js';
 import {
-  dedupeJobSteps, renderFindingsBlock, renderGateStep, renderGateUploads, renderJobPrelude, renderProjectScript, stepsToYaml,
+  dedupeJobSteps, renderFindingsBlock, renderGateStep, renderGateUploads, renderJobPrelude, renderProjectScript, renderRangeBlock, stepsToYaml,
   type RenderContext, type RenderedStep,
 } from '../../src/engine/render-step.js';
 import { emptyRepoFiles } from '../../src/read/quality.js';
-import type { Capabilities, CreatedFile, Need, PipelineDraft, StepSpec } from '../../src/types.js';
+import type { Capabilities, CreatedFile, Need, PipelineDraft, ReviewedTool, StepSpec } from '../../src/types.js';
 import { entry, platform, profile, reviewedList, service, specFor } from './render.js';
 
 export const p = platform();
@@ -47,11 +47,20 @@ export function workflow(jobs: Record<string, Job>, top: Record<string, unknown>
 export interface JobsOptions {
   /** Replaces the rendered gate step (an edited one). */
   gateStep?: RenderedStep;
-  /** The steps of a findings job after its prelude and its findings block (C9: the commit-range block of the secrets job). */
-  extra?: (spec: StepSpec) => { steps: RenderedStep[]; scans: [string, ScanFact][] } | undefined;
-  /** The fetch depth of a findings job's checkout (C9: the secrets job reads the history). */
-  fetchDepth?: (spec: StepSpec) => '0' | '1';
+  /** C9: the secrets job's commit-range block (renderRangeBlock, after a full-history checkout) is rendered unless this is false. */
+  range?: boolean;
 }
+/** C9: the job id of the secrets check (spelled at run time, see test/no-secret-literals.test.ts). */
+export const SEC_JOB = ['sec', 'rets'].join('');
+/** C9: the honest secrets job ends with the commit-range block, and its checkout takes the whole history. */
+export function rangeExtra(spec: StepSpec, gate: ReviewedTool = GATE): { steps: RenderedStep[]; scans: [string, ScanFact][]; fetchDepth: '0' } | undefined {
+  if (spec.needId !== SEC_JOB || spec.service !== undefined) return undefined;
+  const b = renderRangeBlock(entry('betterleaks'), p, gate);
+  return { steps: b.steps, scans: [[b.scan.stepId, b.scan.fact]], fetchDepth: '0' };
+}
+/** A job of these jobs with its steps changed by `edit`. */
+export const editSteps = (jobs: Record<string, Job>, id: string, edit: (s: RenderedStep) => RenderedStep): Record<string, Job> =>
+  ({ ...jobs, [id]: { ...(jobs[id] as Job), steps: ((jobs[id] as Job).steps as RenderedStep[]).map(edit) } });
 
 /** The whole rendered pipeline for a draft. */
 export function jobsOf(d: PipelineDraft, o: JobsOptions = {}): Record<string, Job> {
@@ -63,8 +72,8 @@ export function jobsOf(d: PipelineDraft, o: JobsOptions = {}): Record<string, Jo
   findings.forEach((s, i) => {
     const b = blocks[i] as NonNullable<(typeof blocks)[number]>;
     const id = `${s.needId}${s.service === undefined ? '' : `--${s.service}`}`;
-    const extra = o.extra?.(s);
-    const steps = [...renderJobPrelude(o.fetchDepth === undefined ? {} : { fetchDepth: o.fetchDepth(s) }, p).steps, ...b.steps, ...(extra?.steps ?? [])];
+    const extra = o.range === false ? undefined : rangeExtra(s);
+    const steps = [...renderJobPrelude(extra === undefined ? {} : { fetchDepth: extra.fetchDepth }, p).steps, ...b.steps, ...(extra?.steps ?? [])];
     out[id] = job(dedupeJobSteps(steps, { id, scans: new Map([[b.scan.stepId, b.scan.fact], ...(extra?.scans ?? [])]) }), { outputs: jobOutputsFor(steps) });
   });
   out['unit-tests--app'] = job(dedupeJobSteps(renderProjectScript({ kind: 'project-script', needId: 'unit-tests', service: 'app', script: 'test' }, p, ctx).steps, { id: 'unit-tests--app', scans: NO_SCANS }));

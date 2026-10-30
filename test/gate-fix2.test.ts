@@ -16,6 +16,7 @@ import type { Capabilities, CreatedFile, Need, PipelineDraft, ReviewedTool, Step
 import { entry, gateEntry, platform, profile, reviewedList, service, specFor } from './helpers/render.js';
 import { renderGateUploads, renderStage as renderStageC1c } from '../src/engine/render-step.js';
 import { isStagedTool } from '../src/engine/tool-flags.js';
+import { rangeExtra } from './helpers/gate-pipeline.js';
 
 // object keys spelled at run time (see test/no-secret-literals.test.ts)
 const NS = ['needs', 'Sec', 'rets'].join('');
@@ -92,7 +93,9 @@ function jobs(baseRef: BaseRef = 'pull-request-base'): Record<string, Job> {
   for (const spec of specs) {
     const b = block(spec);
     const id = `${spec.needId}${spec.service === undefined ? '' : `--${spec.service}`}`;
-    out[id] = job(dedupeJobSteps([...prelude(), ...b.steps], { id, scans: facts(b) }), { outputs: jobOutputsFor(b.steps) });
+    const ext = rangeExtra(spec, GATE);   // C9: the secrets job's commit-range block, after a full-history checkout
+    const all = [...b.steps, ...(ext?.steps ?? [])];
+    out[id] = job(dedupeJobSteps([...prelude(ext === undefined ? {} : { fetchDepth: '0' }), ...all], { id, scans: new Map([...facts(b), ...(ext?.scans ?? [])]) }), { outputs: jobOutputsFor(all) });
   }
   const script = renderProjectScript({ kind: 'project-script', needId: 'unit-tests', service: 'app', script: 'test' }, p, ctx).steps;
   out['unit-tests--app'] = job(dedupeJobSteps(script, { id: 'unit-tests--app', scans: NO_SCANS }));

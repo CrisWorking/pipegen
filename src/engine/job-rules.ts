@@ -3,8 +3,8 @@
 // the referee and the linters import them from here, so no second copy can drift. It imports only the leaves render-error.ts,
 // tool-flags.ts and types.ts (test/final-fix-b.test.ts and test/module-graph.test.ts check this).
 import { EXPR, own, RenderError, show } from './render-error.js';
-import { GATE_RESULT_ARTIFACT } from './artifact-names.js';
-import { ARGV_POLICIES, BASE_CHECKOUT_REF, GATE_OPTIONAL_UPLOADS, isGateUploadName, CHECKER_STEP_ID_RE, GATE_USES_RE, isStagedTool, PLATFORM_USES, rendererInputProblems, RENDERER_INPUTS, scrubStepId, SCRUB_STEP_ID_RE, SETUP_STEP_ID_RE, sha16, stagePath, stageStepId, STAGE_STEP_ID_RE, TOOL_STEP_ID_RE } from './tool-flags.js';
+import { GATE_RESULT_ARTIFACT, SECRETS_RANGE_ARTIFACT } from './artifact-names.js';
+import { ARGV_POLICIES, BASE_CHECKOUT_REF, GATE_OPTIONAL_UPLOADS, RANGE_STEP_ENV, RANGE_TOOL, rangeScanStepId, isGateUploadName, CHECKER_STEP_ID_RE, GATE_USES_RE, isStagedTool, PLATFORM_USES, rendererInputProblems, RENDERER_INPUTS, scrubStepId, SCRUB_STEP_ID_RE, SETUP_STEP_ID_RE, sha16, stagePath, stageStepId, STAGE_STEP_ID_RE, TOOL_STEP_ID_RE } from './tool-flags.js';
 
 /** One step of a job, as pipegen renders it. `usesComment` becomes the trailing `# <version>` comment on `uses:`. */
 export interface RenderedStep {
@@ -191,6 +191,27 @@ export function checkJobOrder(steps: readonly RenderedStep[], job: Partial<JobCo
   problems.push(...gateUploadProblems(steps, job.id));
   problems.push(...scrubChainProblems(steps, job.scans));
   problems.push(...stageChainProblems(steps, job.scans));
+  problems.push(...rangeChainProblems(steps, job.scans));
+  return problems;
+}
+
+/**
+ * The commit-range scan of a job (C9): its step (the id rangeScanStepId) reads the git history, so the job's checkout comes before it and
+ * takes the whole history (exactly one checkout, `fetch-depth: '0'`): a shallow checkout has no base commit, and the scan would fail on every
+ * run. With `scans`, the step is the range tool's scan. One range scan per job.
+ */
+export function rangeChainProblems(steps: readonly RenderedStep[], scans?: ReadonlyMap<string, ScanFact>): string[] {
+  const at = steps.flatMap((s, i) => (s.id === rangeScanStepId && s.run !== undefined ? [i] : []));
+  if (at.length === 0) return [];
+  if (at.length > 1) return [`The job holds ${at.length} commit-range scan steps; it has one.`];
+  const i = at[0] as number;
+  const problems: string[] = [];
+  const checkouts = steps.flatMap((s, k) => (isCheckout(s) ? [k] : []));
+  if (checkouts.length !== 1 || (checkouts[0] as number) > i || steps[checkouts[0] as number]?.with?.['fetch-depth'] !== '0') {
+    problems.push(`Step ${i + 1} (${show(steps[i]?.name ?? '')}) scans the pull request's commits, so the job needs exactly one checkout before it, with fetch-depth: '0' (the whole history): a shallow checkout has no base commit to scan from.`);
+  }
+  const fact = scans?.get(rangeScanStepId);
+  if (scans !== undefined && (fact === undefined || fact.tool !== RANGE_TOOL || fact.format !== 'sarif')) problems.push(`Step ${i + 1} (${show(steps[i]?.name ?? '')}) is the commit-range scan, but its scan fact is not ${RANGE_TOOL} writing SARIF.`);
   return problems;
 }
 
@@ -223,7 +244,7 @@ export function stageChainProblems(steps: readonly RenderedStep[], scans?: Reado
   });
   if (scans !== undefined) {
     steps.forEach((s, i) => {
-      if (s.id === undefined || s.run === undefined || !isStagedTool(scans.get(s.id)?.tool)) return;
+      if (s.id === undefined || s.run === undefined || s.id === rangeScanStepId || !isStagedTool(scans.get(s.id)?.tool)) return;
       const stageId = s.id.replace(/^tool-run-/, 'stage-');
       const stageAt = steps.findIndex((x) => isStageStep(x) && x.id === stageId);
       if (stageAt < 0 || stageAt > i) problems.push(`Step ${i + 1} (${show(s.name)}) scans for secrets, but the stage step of its result does not come before it in this job: the scanner reads the stage folder, which only the stage step fills (an empty or old folder would read as clean).`);
@@ -289,7 +310,11 @@ export function scrubChainProblems(steps: readonly RenderedStep[], scans?: Reado
       return;
     }
     const scanTool = scans?.get(steps[scanAt]?.id as string)?.tool ?? (typeof tool === 'string' ? tool : undefined);
-    if (isStagedTool(scanTool) && w.stage !== stagePath(artifact)) problems.push(`${at} scrubs a secrets scan, but does not name its stage folder (stage: ${stagePath(artifact)}): without the manifest the scrub can not map the findings or prove which files were scanned.`);
+    if (artifact === SECRETS_RANGE_ARTIFACT) {
+      // C9: the commit-range scan reads the history, never a stage folder; its scrub names none, and it scrubs the range tool's result
+      if (w.stage !== undefined) problems.push(`${at} scrubs the commit-range scan, which reads the history and has no stage folder: its scrub names none.`);
+      if (typeof tool === 'string' && tool !== RANGE_TOOL) problems.push(`${at} scrubs the commit-range scan as the tool ${show(tool)}, but that scan runs ${RANGE_TOOL}.`);
+    } else if (isStagedTool(scanTool) && w.stage !== stagePath(artifact)) problems.push(`${at} scrubs a secrets scan, but does not name its stage folder (stage: ${stagePath(artifact)}): without the manifest the scrub can not map the findings or prove which files were scanned.`);
     if (scans === undefined) return;
     const scan = scans.get(steps[scanAt]?.id as string);
     if (scan === undefined) problems.push(`${at} scrubs the result ${show(artifact)}, but the step before it that carries its scan id is not a scan step pipegen renders for a reviewed tool.`);
@@ -478,6 +503,8 @@ export function checkExpressions(step: RenderedStep): void {
       if (typeof v !== 'string') odd(`${group} value ${show(k)}`);
       if (!v.includes(EXPR)) continue;
       if (group === 'env') {
+        // C9: the commit-range scan step (its id, a run step) carries this event's base and head commits, each exactly its form
+        if (step.id === rangeScanStepId && step.run !== undefined && step.uses === undefined && Object.hasOwn(RANGE_STEP_ENV, k) && RANGE_STEP_ENV[k] === v) continue;
         const m = SECRET_REF_RE.exec(v);
         if (m === null || m[1] !== k || isDangerousName(k)) bad(`env value ${show(k)}`);
       } else if (usesPath === undefined || table === undefined || own(table, k) === undefined || rendererInputProblems(usesPath, { [k]: v }, step.with ?? {}).length > 0) {

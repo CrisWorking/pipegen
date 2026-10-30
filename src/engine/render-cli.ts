@@ -23,13 +23,13 @@
 //   tool needs at run time (image, local URL, Dockerfile, base ref) are slots from the render context (ruling B6): slots.ts.
 // Nothing here uploads (ruling B3).
 import { isDeepStrictEqual } from 'node:util';
-import { ArtifactNameError, resultArtifactName } from './artifact-names.js';
+import { ArtifactNameError, resultArtifactName, SECRETS_RANGE_ARTIFACT } from './artifact-names.js';
 import { ASSET_RE, COMMIT_SHA_RE, DIGEST_RE, isGitHubRepo, isNpmName, isPypiName, parseImageRef, pep503, SHA256_RE, SRI_SHA512_RE, TAG_RE } from './names.js';
 import { closureRootDependencies, loadNpmClosure, NpmClosureError, type NpmPin } from './npm-closure.js';
 import { EXPR, own, refuse, show } from './render-error.js';
 import type { RenderContext, RenderedStep, RenderResult } from './render-step.js';
 import { slotProblem, type SlotKind } from './slots.js';
-import { ARGV_POLICIES, PIP_CLOSURES, PLAIN_REL_RE, runsRepoCode, sha16, type ArgvPolicy } from './tool-flags.js';
+import { ARGV_POLICIES, PIP_CLOSURES, PLAIN_REL_RE, RANGE_STEP_ENV, RANGE_TOOL, rangeScanStepId, runsRepoCode, sha16, type ArgvPolicy } from './tool-flags.js';
 
 export { sha16 };   // defined in tool-flags.ts (the job rules need it too); re-exported for the callers that import it from here
 import { EXTRA_RULES_AT, tuningEffects, type TuningEffects } from './tuning.js';
@@ -703,6 +703,155 @@ export function renderCliTool({ spec, tool, service, ctx, hooks, options }: CliA
   const runId = runsRepoCode(pol, appRunning) ? `repocode-${sha16(artifact)}` : checker ? `checker-run-${sha16(artifact)}` : `tool-run-${sha16(artifact)}`;
   steps.push(runStep(`pipegen: run ${exe}`, run, env, runId));
   return { steps, output: out === null ? null : { path: `\${{ runner.temp }}/pipegen-raw/${artifact}/${out}`, format: tool.step.output.format }, ...(built.fullHistory ? { fullHistory: true as const } : {}) };
+}
+
+// ---------- the commit-range secrets scan (C9) ----------
+
+/** C9: the config of the range scan: pipegen's pinned betterleaks config (the canary rule included) with no global path allowlist. */
+export const RANGE_PREFILTER = "prefilter = '''false'''\n\n";
+/** C9: the facts the range scan step writes beside its raw result, for the scrub (gate/src/range.ts reads them). */
+export const RANGE_FACTS_FILE = 'range.json';
+/** C9: the two canary files of the range scan's canary commits. */
+export const RANGE_CANARY_FILES = ['pipegen-range-canary-1.txt', 'pipegen-range-canary-2.txt'] as const;
+
+/**
+ * The commit-range secrets scan (C9, Plan C final review Important 2): the reviewed betterleaks entry's release install, then ONE checker step
+ * that scans the pull request's own commits in `git` mode. Every word is a reviewed constant; the only values from outside are this event's
+ * base and head commits, which come in the step env (the event-switched forms RANGE_STEP_ENV) and must be 40 hex digits, never all zero.
+ *
+ * Measured with the pinned betterleaks 1.9.0 (the C9 report has the logs):
+ * - git mode applies the config's global path allowlist (node_modules/, package-lock.json, …), so the config is the entry's own with
+ *   `prefilter = '''false'''` put first (a prefilter after [extend] is read as extend.prefilter and changes nothing);
+ * - betterleaks reads `.betterleaksignore` / `.gitleaksignore` from the folder it scans whatever --gitleaks-ignore-path says, so it runs from
+ *   an empty folder whose `.git` file names the checkout's git folder;
+ * - the count of the commits it scans is printed only in its parallel mode (`--git-workers 2`) and only for two commits or more
+ *   (`parallel git scan chunk_size=… commits=N workers=…`), so two canary commits (each adding one canary line, local objects that no ref
+ *   names and nothing pushes) sit on the head: the range is base..<second canary>, always two commits or more, and the canaries prove the
+ *   scanner read the commits with pipegen's config (the scrub requires both, at their commits);
+ * - the parallel mode runs `git log -p -U0 --no-walk --stdin --diff-filter=tuxdb` per chunk: our --log-opts reach only the commit list, so
+ *   `--text` is lost (binary files, archives included, would be skipped) and type changes (a link that becomes a file) are never read.
+ *   `* diff` in the git folder's info/attributes (which wins over the repository's .gitattributes) makes every file text to the diff, and a
+ *   range with a type change is refused (not scanned, the gate blocks).
+ * Completeness: the step counts the range with `git rev-list --count --no-merges` and requires the scanner's own count to equal it; a
+ * mismatch, no count, a partial scan (betterleaks exits 1) or any other exit than 0 and 10 fails the step, and no raw result is left (the
+ * scrub then reports a tool error). `--no-merges`: a merge commit is not scanned (its parents are); a merge from the default branch into the
+ * pull request brings that branch's newer commits into base..head, so a secret there blocks too (false blocks only, fail closed).
+ */
+export function renderRangeScan(tool: ReviewedTool): RenderResult {
+  const pol = own(ARGV_POLICIES, tool.id);
+  if (tool.id !== RANGE_TOOL || pol === undefined || pol.method !== 'github-release') return refuse(`The commit-range scan runs the reviewed ${RANGE_TOOL} entry only, not ${show(tool.id)}.`);
+  const install = checkInstall(tool, pol);
+  const config = configOf(tool, pol);
+  if (config === null || !config.content.startsWith('[extend]\n')) return refuse(`The pinned config of ${show(tool.id)} does not start with its [extend] table, so the range scan can not put its prefilter first.`);
+  const out = tool.step.output.path;
+  if (!PLAIN_OUT_RE.test(out) || tool.step.output.format !== 'sarif') return refuse(`${show(tool.id)} does not write a SARIF file with a plain name.`);
+  const artifact = SECRETS_RANGE_ARTIFACT;
+  const exe = pol.exe;
+  const outDir = `$RUNNER_TEMP/pipegen-raw/${artifact}`;
+  const zero = '0'.repeat(40);
+  const [c1, c2] = RANGE_CANARY_FILES;
+  const notCommits = 'pg_fail "the commit range is not two commit shas, so it is not scanned"';
+  const run = script([
+    ...prologue(artifact),
+    `bin="$RUNNER_TEMP/pipegen-bin/${artifact}"`,
+    `work="$RUNNER_TEMP/pipegen-work/${artifact}"`,
+    'mkdir -p "$RUNNER_TEMP/pipegen-work"',
+    'mkdir "$work"',
+    // the range: this event's base and head (the event-switched forms), each a commit sha, never the all-zero commit (no range on this event)
+    'base="$PIPEGEN_RANGE_BASE"',
+    'head="$PIPEGEN_RANGE_HEAD"',
+    'for c in "$base" "$head"; do',
+    `  case "$c" in *[!0-9a-f]*|"") ${notCommits} ;; esac`,
+    `  [ "\${#c}" -eq 40 ] || ${notCommits}`,
+    `  [ "$c" != ${zero} ] || pg_fail "this event has no commit range (a new branch, or an event that is not a pull request, a merge queue or a push), so it is not scanned"`,
+    'done',
+    'git=(',
+    '  "${sys[@]}"',
+    '  GIT_CONFIG_NOSYSTEM=1',
+    '  GIT_CONFIG_GLOBAL=/dev/null',
+    '  GIT_TERMINAL_PROMPT=0',
+    '  GIT_AUTHOR_NAME=pipegen',
+    '  GIT_AUTHOR_EMAIL=pipegen@invalid',
+    "  'GIT_AUTHOR_DATE=@0 +0000'",
+    '  GIT_COMMITTER_NAME=pipegen',
+    '  GIT_COMMITTER_EMAIL=pipegen@invalid',
+    "  'GIT_COMMITTER_DATE=@0 +0000'",
+    '  /usr/bin/git',
+    ')',
+    'for c in "$base" "$head"; do',
+    '  "${git[@]}" cat-file -e "$c^{commit}" 2> /dev/null || pg_fail "the commit $c is not in the checkout: the secrets job checks out the whole history (fetch-depth: 0)"',
+    'done',
+    'gitdir="$("${git[@]}" rev-parse --absolute-git-dir)"',
+    'if [ -L "$gitdir" ] || [ ! -d "$gitdir" ]; then pg_fail "the git folder of the checkout is not a real folder"; fi',
+    // every file is text to the diff: the git folder's info/attributes wins over the repository's .gitattributes (`-diff`, `binary`)
+    'mkdir -p -- "$gitdir/info"',
+    'if [ -L "$gitdir/info" ] || [ ! -d "$gitdir/info" ]; then pg_fail "the info folder of the git folder is not a real folder"; fi',
+    'rm -f -- "$gitdir/info/attributes"',
+    'printf \'* diff\\n\' > "$gitdir/info/attributes"',
+    // a type change is never read by the scanner's parallel mode (--diff-filter=tuxdb, measured): such a range is not scanned
+    '"${git[@]}" log --no-merges --format= --name-status "$base..$head" > "$work/changes.txt"',
+    'set +e',
+    '"${sys[@]}" grep -q "^T"$\'\\t\' -- "$work/changes.txt"',
+    'tc=$?',
+    'set -e',
+    'case "$tc" in 1) ;; 0) pg_fail "a commit of the range changes the type of a file (a link that becomes a file), which the scanner does not read, so the range is not scanned" ;; *) pg_fail "the changes of the range could not be read" ;; esac',
+    // two canary commits on the head (local objects only): the scanner then always reports its count, and must report both canaries
+    'canary() { printf \'pipegen-canary-%s\' "$("${sys[@]}" od -An -N16 -tx1 /dev/urandom | "${sys[@]}" tr -d \' \\n\')"; }',
+    'parent="$head"',
+    'commits=()',
+    `for f in ${c1} ${c2}; do`,
+    '  line="$(canary)"',
+    '  case "$line" in pipegen-canary-*[!0-9a-f]*) pg_fail "a canary could not be made" ;; esac',
+    '  [ "${#line}" -eq 47 ] || pg_fail "a canary could not be made"',
+    '  blob="$(printf \'%s\\n\' "$line" | "${git[@]}" hash-object -w --stdin)"',
+    '  tree="$(printf \'100644 blob %s\\t%s\\0\' "$blob" "$f" | "${git[@]}" mktree -z)"',
+    '  parent="$("${git[@]}" commit-tree "$tree" -p "$parent" -m \'pipegen: commit-range canary\' < /dev/null)"',
+    `  case "$parent" in *[!0-9a-f]*|"") pg_fail "a canary commit could not be made" ;; esac`,
+    '  [ "${#parent}" -eq 40 ] || pg_fail "a canary commit could not be made"',
+    '  commits+=("$parent")',
+    'done',
+    'last="$parent"',
+    'want="$("${git[@]}" rev-list --count --no-merges "$base..$last")"',
+    'case "$want" in *[!0-9]*|"") pg_fail "the commits of the range could not be counted" ;; esac',
+    '[ "$want" -ge 2 ] || pg_fail "the commits of the range could not be counted"',
+    'own=$((want - 2))',
+    // the scanner runs from an empty folder whose .git file names the checkout's git folder (no ignore file of the checkout is read)
+    'src="$work/src"',
+    'mkdir "$src"',
+    'printf \'gitdir: %s\\n\' "$gitdir" > "$src/.git"',
+    `printf '%s' "$PIPEGEN_CONFIG" > "$work/${config.fileName}"`,
+    `out="$work/${out}"`,
+    'log="$work/scan.log"',
+    'cd -- "$src"',
+    ...allowlist(FIXED_PATH, []),
+    'rc=0',
+    `${LAUNCH_ENV} ${releaseLauncher(exe)} git --no-banner --no-color --log-level info --ignore-gitleaks-allow --redact --report-format sarif --report-path "$out" --exit-code 10 --max-archive-depth 0 --git-workers 2 ${config.flag} "$work/${config.fileName}" --log-opts "--no-merges $base..$last" . 2> "$log" || rc=$?`,
+    '"${sys[@]}" cat -- "$log" >&2',
+    'case "$rc" in 0|10) ;; *)',
+    '  rm -rf -- "$out"',
+    '  echo "pipegen: the tool exited with $rc, so its result is not used" >&2',
+    '  exit "$rc" ;;',
+    'esac',
+    // completeness: the scanner's own count of the commits it scanned equals the range's (once, in its own log line)
+    'got="$("${sys[@]}" sed -nE \'s/^[^ ]+ INF parallel git scan chunk_size=[0-9]+ commits=([0-9]+) workers=[0-9]+$/\\1/p\' -- "$log")"',
+    'case "$got" in *[!0-9]*|"") pg_fail "the scanner did not report how many commits it scanned (once), so the range is not proven scanned" ;; esac',
+    '[ "$got" -eq "$want" ] || pg_fail "the scanner scanned $got commits, but the range has $want ($own of the pull request and the 2 canary commits), so the range is not proven scanned"',
+    'if [ -f "$out" ] && [ ! -L "$out" ]; then',
+    '  mkdir -p "$RUNNER_TEMP/pipegen-raw"',
+    `  mkdir "${outDir}"`,
+    `  printf '{"pipegenRange":1,"base":"%s","head":"%s","commits":%s,"canaries":[{"commit":"%s","path":"${c1}"},{"commit":"%s","path":"${c2}"}]}\\n' "$base" "$head" "$own" "\${commits[0]}" "\${commits[1]}" > "${outDir}/${RANGE_FACTS_FILE}"`,
+    `  mv -- "$out" "${outDir}/${out}"`,
+    `  chmod -R a-w "${outDir}"`,
+    'else',
+    '  pg_fail "the tool left no regular result file"',
+    'fi',
+  ]);
+  const env: Record<string, string> = { ...RANGE_STEP_ENV, PIPEGEN_CONFIG: RANGE_PREFILTER + config.content };
+  return {
+    steps: [releaseInstall(tool, install, exe, artifact), runStep('pipegen: scan the pull request\'s commits for secrets', run, env, rangeScanStepId)],
+    output: { path: `\${{ runner.temp }}/pipegen-raw/${artifact}/${out}`, format: 'sarif' },
+    fullHistory: true,
+  };
 }
 
 /** The marked empty result of a nuclei run that wrote no file (gate/src/sarif.ts SYNTHESIZED_NUCLEI is the same text; a test compares). */

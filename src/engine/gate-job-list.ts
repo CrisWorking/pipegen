@@ -5,7 +5,7 @@
 // The gate step's `job-list` literal is jobListLiteral(gateJobList(draft)), written by gateStepInputs (gate-inputs.ts); the referee checks it equals
 // gateJobList(draft) and that the gate job's `needs` include every entry's job (else `not-gate-readable`).
 import { FLOOR_NEEDS, type NeedCategory, type OutputFormat, type PipelineDraft, type StepSpec } from '../types.js';
-import { ArtifactNameError, resultArtifactName, slug } from './artifact-names.js';
+import { ArtifactNameError, resultArtifactName, SECRETS_RANGE_ARTIFACT, SECRETS_RANGE_TOOL, slug } from './artifact-names.js';
 import { NEED_ID_CATEGORY, SCHEDULED_CATEGORIES } from './need-ids.js';
 
 /** Ruling B7 of Plan B: the checks the gate judges by their findings; their tool must write SARIF (DAST: ZAP's JSON too). Every other category is judged by job status. */
@@ -27,6 +27,11 @@ export const isResultFormat = (format: OutputFormat): boolean => format === 'sar
 export interface JobListEntry {
   needId: string; service?: string; job: string; category: NeedCategory; tool?: string; format: OutputFormat;
   artifact?: string; baseArtifact?: string; blocking: boolean; needsSecrets: boolean; warnFirst?: { since: string };
+  /**
+   * C9: the secrets job's scan of the pull request's own commits (SECRETS_RANGE_ARTIFACT, betterleaks `git` mode, no base twin). It follows
+   * the secrets entry, in the same job; the gate reads it as the commit range (any finding blocks), never as a check of its own.
+   */
+  range?: true;
 }
 
 export class GateJobListError extends Error {}
@@ -97,6 +102,10 @@ export function gateJobList(draft: PipelineDraft, opts: GateJobListOptions = {})
         needId: need.id, ...service, job: key, category, tool: result.spec.tool.id, format: result.format,
         artifact: nameOf(need.id, need.service), baseArtifact: nameOf(need.id, need.service, true), blocking: need.blocking, needsSecrets, ...warnFirstOf(need.id, category),
       });
+      // C9: the secrets job also scans the pull request's own commits (the range block, render-step.ts renderRangeBlock); a repo-wide check only
+      if (need.id === 'secrets' && category === 'secrets' && need.service === undefined) {
+        out.push({ needId: need.id, job: key, category, tool: SECRETS_RANGE_TOOL, format: 'sarif', artifact: SECRETS_RANGE_ARTIFACT, blocking: true, needsSecrets, range: true });
+      }
       continue;
     }
     // job status: only a blocking need, and not a findings category that nothing readable backs (the referee demotes it)

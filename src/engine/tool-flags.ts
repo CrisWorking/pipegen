@@ -5,7 +5,7 @@
 
 import { createHash } from 'node:crypto';
 import { NEED_CATEGORIES, RESULT_ARTIFACT_PREFIX } from '../types.js';
-import { BASELINE_ARTIFACT, CLEAN_RUN_ARTIFACT, GATE_RESULT_ARTIFACT } from './artifact-names.js';
+import { BASELINE_ARTIFACT, CLEAN_RUN_ARTIFACT, GATE_RESULT_ARTIFACT, SECRETS_RANGE_ARTIFACT, SECRETS_RANGE_TOOL } from './artifact-names.js';
 import type { SlotKind } from './slots.js';
 import { isLockfileKind, TRIVY_LICENCE_LOCKFILES } from './licence-lockfiles.js';
 // the gate's policy rule (C2): a leaf that imports only types.ts, so the engine and the gate check a policy with one function
@@ -729,7 +729,7 @@ export const RESULT_ARTIFACT_NAME_RE = new RegExp(`^${RESULT_ARTIFACT_PREFIX}[a-
 const RESULT_NAME_TEXT_RE = RESULT_ARTIFACT_NAME_RE;
 const DATE_TEXT_RE = /^\d{4}-(?:0[1-9]|1[0-2])-(?:0[1-9]|[12]\d|3[01])$/;
 /** The keys an entry of the gate's job list may have, in the order the list is written. */
-export const JOB_LIST_KEYS = ['needId', 'service', 'job', 'category', 'tool', 'format', 'artifact', 'baseArtifact', 'blocking', 'needsSecrets', 'warnFirst'] as const;
+export const JOB_LIST_KEYS = ['needId', 'service', 'job', 'category', 'tool', 'format', 'artifact', 'baseArtifact', 'blocking', 'needsSecrets', 'warnFirst', 'range'] as const;
 const JOB_LIST_MAX = 500;
 const JOB_LIST_MAX_TEXT = 200_000;
 const isPlainObject = (v: unknown): v is Record<string, unknown> => typeof v === 'object' && v !== null && !Array.isArray(v);
@@ -749,7 +749,20 @@ const FIELD_CHECKS: Readonly<Record<(typeof JOB_LIST_KEYS)[number], (v: unknown)
   blocking: (v) => typeof v === 'boolean',
   needsSecrets: (v) => typeof v === 'boolean',
   warnFirst: (v) => isPlainObject(v) && Object.keys(v).join() === 'since' && typeof v.since === 'string' && DATE_TEXT_RE.test(v.since),
+  range: (v) => v === true,
 };
+/** The tool of the commit-range secrets scan (C9): always betterleaks in `git` mode, whichever tool scans the HEAD tree. */
+export const RANGE_TOOL = SECRETS_RANGE_TOOL;
+/**
+ * Why a job-list entry marked `range` (C9) is not the range entry pipegen writes, or null: the secrets need (no service), category secrets, the
+ * range tool, SARIF, the range artifact, no base artifact (the range has no base twin), blocking.
+ */
+function rangeEntryProblem(e: Record<string, unknown>): string | null {
+  const want: Record<string, unknown> = { needId: 'secrets', category: 'secrets', tool: RANGE_TOOL, format: 'sarif', artifact: SECRETS_RANGE_ARTIFACT, blocking: true };
+  for (const [k, v] of Object.entries(want)) if (e[k] !== v) return `its ${k} is not the one of the commit-range scan`;
+  if (Object.hasOwn(e, 'baseArtifact') || Object.hasOwn(e, 'service') || Object.hasOwn(e, 'warnFirst')) return 'it names a base artifact, a service or warn-first, which the commit-range scan never has';
+  return null;
+}
 const JOB_LIST_REQUIRED: readonly (typeof JOB_LIST_KEYS)[number][] = ['needId', 'job', 'category', 'format', 'blocking', 'needsSecrets'];
 /**
  * Why a text is not a job list the gate may read (a JSON list of entries: known keys only, each field of its shape, the
@@ -760,14 +773,26 @@ export function jobListLiteralProblem(text: string): string | null {
   if (!Array.isArray(list)) return 'it is not a JSON list';
   if (list.length > JOB_LIST_MAX) return `it has more than ${JOB_LIST_MAX} entries`;
   const jobs = new Set<string>();
+  const secretsJobs = new Set<string>();
+  const ranges: string[] = [];
   for (const [i, e] of list.entries()) {
     if (!isPlainObject(e)) return `entry ${i + 1} is not an object`;
     for (const k of Object.keys(e)) if (!(JOB_LIST_KEYS as readonly string[]).includes(k)) return `entry ${i + 1} has the key ${JSON.stringify(k.slice(0, 40))}, which a job list entry never has`;
     for (const k of JOB_LIST_REQUIRED) if (!Object.hasOwn(e, k)) return `entry ${i + 1} has no ${k}`;
     for (const k of JOB_LIST_KEYS) if (Object.hasOwn(e, k) && !FIELD_CHECKS[k](e[k])) return `entry ${i + 1} has a ${k} that is not in the form pipegen writes`;
+    if (e.range === true) {
+      // C9: the commit-range scan runs in the secrets job, so its entry names that job a second time (checked below)
+      const p = rangeEntryProblem(e);
+      if (p !== null) return `entry ${i + 1} is marked range, but ${p}`;
+      ranges.push(e.job as string);
+      continue;
+    }
     if (jobs.has(e.job as string)) return `the job ${JSON.stringify(e.job)} is listed twice`;
     jobs.add(e.job as string);
+    if (e.needId === 'secrets' && e.category === 'secrets') secretsJobs.add(e.job as string);
   }
+  if (ranges.length > 1) return 'it has more than one commit-range entry';
+  for (const job of ranges) if (!secretsJobs.has(job)) return `its commit-range entry names the job ${JSON.stringify(job)}, which is not the job of its secrets check`;
   return null;
 }
 
@@ -780,6 +805,17 @@ export function jobListLiteralProblem(text: string): string | null {
  * access can create a branch with that name. Only the job `base-scan` may use it (job-rules.ts).
  */
 export const BASE_CHECKOUT_REF = `\${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event_name == 'pull_request_review' && github.event.pull_request.base.sha || github.event_name == 'merge_group' && github.event.merge_group.base_sha || github.event_name == 'push' && github.event.before || '${'0'.repeat(40)}' }}`;
+
+/**
+ * C9: the head commit of this event, switched on the event like BASE_CHECKOUT_REF, for the commit-range secrets scan (base..head): a pull
+ * request's head (also on pull_request_review), a merge group's head, a push's new head. On any other event the all-zero commit, which the
+ * range scan refuses (no range). Only the range scan step carries it (job-rules.ts checkExpressions).
+ */
+export const RANGE_HEAD_REF = `\${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.event_name == 'pull_request_review' && github.event.pull_request.head.sha || github.event_name == 'merge_group' && github.event.merge_group.head_sha || github.event_name == 'push' && github.event.after || '${'0'.repeat(40)}' }}`;
+/** C9: the env of the commit-range scan step that holds an expression: exactly these two names, each exactly its form, on that step only. */
+export const RANGE_STEP_ENV: Readonly<Record<string, string>> = Object.freeze({ PIPEGEN_RANGE_BASE: BASE_CHECKOUT_REF, PIPEGEN_RANGE_HEAD: RANGE_HEAD_REF });
+/** C9: the id of the commit-range scan step (a checker step: the hash of the range artifact). */
+export const rangeScanStepId = `checker-run-${sha16(SECRETS_RANGE_ARTIFACT)}`;
 
 /**
  * Ruling S15: the inputs the renderer sets on a platform action, by the same `owner/repo[/path]` key as ACTION_POLICIES,

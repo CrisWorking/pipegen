@@ -39,14 +39,14 @@ import { runLinters } from './linters.js';
 import { COMMIT_SHA_RE } from './names.js';
 import { NEED_ID_CATEGORY, toolCoversNeed } from './need-ids.js';
 import { PLATFORM_ACTION_IDS, type PlatformActions } from './pin.js';
-import { APP_RUNNING_CATEGORIES, TRIVY_LAUNCH_RE } from './render-cli.js';
+import { APP_RUNNING_CATEGORIES, renderRangeScan, TRIVY_LAUNCH_RE } from './render-cli.js';
 import { EXPR, own, show } from './render-error.js';
 import { ACTION_PATH_RE, checkExpressions, createdPathProblem, checkJobOrder, gateResultUploadProblems, IF_VALUES, isDangerousName, isReviewed, isScrubStep, isStageStep, jobOutputsProblems, SECRET_REF_RE, STEP_KEYS as STEP_KEY_LIST, WORKFLOW_PATH_RE, type RenderedStep, type ScanFact } from './job-rules.js';
 import { containerRefusal, RenderError, renderProjectScript, renderStep, sameDedupeContent, type RenderContext } from './render-step.js';
 import { centralWorkflowPath } from './central-path.js';
 import { projectScriptFor } from './reviewed.js';
 import { slotProblem, type SlotKind } from './slots.js';
-import { ARGV_POLICIES, CACHE_LOCKS, GATE_OPTIONAL_UPLOADS, PLAIN_REL_RE, PLATFORM_USES, RENDERER_INPUTS, rendererInputProblems, SCRUB_SECRET, uploadIfNoFiles } from './tool-flags.js';
+import { ARGV_POLICIES, CACHE_LOCKS, GATE_OPTIONAL_UPLOADS, PLAIN_REL_RE, PLATFORM_USES, RANGE_TOOL, RENDERER_INPUTS, rendererInputProblems, SCRUB_SECRET, uploadIfNoFiles } from './tool-flags.js';
 
 // ---------- the report ----------
 
@@ -497,6 +497,18 @@ function expectations(draft: PipelineDraft, platform: PlatformActions, reviewed:
     }
   });
   for (const v of ex.declared) ex.allowed.add(v);
+  // C9: the secrets job's commit-range scan (the reviewed betterleaks entry in git mode), whichever tool scans the HEAD tree: its install and
+  // its one checker step belong to the secrets job (the gate's job list has its range entry exactly when the draft has a repo-wide secrets check)
+  const rangeTool = byId.get(RANGE_TOOL);
+  if (draft.steps.some((s) => isObj(s) && s.needId === 'secrets' && s.service === undefined) && rangeTool !== undefined && isReviewed(rangeTool.candidate)) {
+    try {
+      const need = keyOf('secrets', undefined);
+      record('range:secrets', ctxs.map(() => renderRangeScan(rangeTool).steps), false, true, true, need, need);
+    } catch (e) {
+      if (!(e instanceof RenderError)) throw e;
+      notes.push(`The commit-range secrets scan can not be rendered, so no step may claim to be it: ${safeText(e.message, 200)}`);
+    }
+  }
   // the project's own scripts its needs call for (ruling S10): the only other run steps pipegen makes
   for (const need of draft.needs) {
     for (const s of draft.profile.services) {
@@ -1006,6 +1018,8 @@ function judgeJobSteps(fc: FileCtx, where: string, steps: unknown[], job: boolea
     const spec = m === null ? undefined : fc.draft.steps[Number(m[1])];
     const format = spec === undefined || !isObj(spec) || !isObj(spec.tool) ? undefined : fc.ex.byId.get(spec.tool.id)?.step.output.format;
     if (spec !== undefined && x.step.id !== undefined && (format === 'sarif' || format === 'zap-json')) scans.set(x.step.id, { tool: spec.tool.id, format });
+    // C9: the commit-range scan, recognised by content as the range source's own step
+    if (x.match?.source === 'range:secrets' && x.match.final && x.kind === 'tool' && x.harmlessId && x.step.id !== undefined) scans.set(x.step.id, { tool: RANGE_TOOL, format: 'sarif' });
   }
   for (const problem of checkJobOrder(forOrder, { ...(jobId === undefined ? {} : { id: jobId }), scans })) fc.add(fc.file.path, 'injection', `In ${where}: ${problem}`);
   // a merged repo `npm ci` (dedupeJobSteps) carries exactly the pins of the tools of this job that need it

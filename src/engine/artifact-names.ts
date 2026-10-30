@@ -29,6 +29,16 @@ export function resultArtifactName(needId: string, service?: string, opts?: { ba
   return `${RESULT_ARTIFACT_PREFIX}${opts?.base === true ? 'base-' : ''}${needId}${service === undefined ? '' : `--${slug(service)}`}`;
 }
 
+/**
+ * C9 (Plan C final review, Important 2): the result of the secrets job's second scan, over the pull request's own commits (betterleaks `git`
+ * mode, base..head). Its own artifact, beside the secrets check's: `pipegen-out-secrets-range`. It has no base twin (the commits of the range
+ * are the pull request's own, so there is nothing to compare with).
+ */
+export const SECRETS_RANGE_ID = 'secrets-range';
+export const SECRETS_RANGE_ARTIFACT = resultArtifactName(SECRETS_RANGE_ID);
+/** The tool of the commit-range scan: betterleaks in `git` mode, whichever reviewed tool scans the HEAD tree (tool-flags.ts RANGE_TOOL). */
+export const SECRETS_RANGE_TOOL = 'betterleaks';
+
 /** The names of many results at once; two different (need, service) pairs that give one name (slugging, the 40-character cut) throw. */
 export function resultArtifactNames(items: readonly { needId: string; service?: string; base?: true }[]): string[] {
   const seen = new Map<string, number>();

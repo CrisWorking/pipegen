@@ -17,7 +17,7 @@ import { BASE_CHECKOUT_REF, GATE_MODES, rendererInputProblems, scrubStepId } fro
 import { emptyRepoFiles } from '../src/read/quality.js';
 import type { Capabilities, CreatedFile, Need, PipelineDraft, ReviewedTool, StepSpec } from '../src/types.js';
 import { entry, gateEntry, platform, profile, reviewedList, service, specFor } from './helpers/render.js';
-import { renderStage as renderStageC1c } from '../src/engine/render-step.js';
+import { renderRangeBlock, renderStage as renderStageC1c } from '../src/engine/render-step.js';
 import { isStagedTool } from '../src/engine/tool-flags.js';
 
 // object keys spelled at run time (see test/no-secret-literals.test.ts)
@@ -79,6 +79,9 @@ function block(spec: StepSpec, c: RenderContext = ctx): Block {
   return { steps: [...stage, ...result.steps, scrub, upload], scrub, upload, artifact, scan, result };
 }
 const gitleaksSpec = (): StepSpec => specFor(entry('gitleaks'), { needId: 'secrets' });
+/** C9: the secrets job's commit-range block (after a full-history checkout) and its scan fact. */
+const rangeB = renderRangeBlock(entry('betterleaks'), p, GATE);
+const rangeFact: [string, ScanFact] = [rangeB.scan.stepId, rangeB.scan.fact];
 const semgrepSpec = (svc: string): StepSpec => specFor(entry('semgrep'), { needId: 'sast', service: svc });
 const facts = (...bs: Block[]): ReadonlyMap<string, ScanFact> => new Map(bs.map((b) => [b.scan.stepId, b.scan.fact]));
 const scrubOf = (steps: RenderedStep[]): RenderedStep => steps.find((s) => s.id?.startsWith('scrub-')) as RenderedStep;
@@ -306,7 +309,7 @@ describe('referee: the gate job (rulings S4 and S21)', () => {
   const g = block(specs[0] as StepSpec);
   const s = block(specs[1] as StepSpec);
   const scanJobs = (): Record<string, Job> => ({
-    [SEC]: job(dedupeJobSteps([...prelude(), ...g.steps], { id: 'secrets', scans: facts(g) }), { outputs: jobOutputsFor(g.steps) }),
+    [SEC]: job(dedupeJobSteps([...prelude({ fetchDepth: '0' }), ...g.steps, ...rangeB.steps], { id: 'secrets', scans: new Map([...facts(g), rangeFact]) }), { outputs: jobOutputsFor([...g.steps, ...rangeB.steps]) }),
     'sast--app': job(dedupeJobSteps([...prelude(), ...s.steps], { id: 'sast--app', scans: facts(s) }), { outputs: jobOutputsFor(s.steps) }),
   });
   const GATE_PERM = { contents: 'read', actions: 'read', 'pull-requests': 'read' };
@@ -548,7 +551,10 @@ describe('parity: a full draft (two services, scanners, base-scan, gate job) thr
     for (const spec of specs) {
       const b = block(spec);
       const id = `${spec.needId}${spec.service === undefined ? '' : `--${spec.service}`}`;
-      out[id] = job(dedupeJobSteps([...prelude(), ...b.steps], { id, scans: facts(b) }), { outputs: jobOutputsFor(b.steps) });
+      // C9: the secrets job also scans the pull request's commits (after a full-history checkout)
+      const extra = spec.needId === 'secrets' ? rangeB.steps : [];
+      const steps = [...b.steps, ...extra];
+      out[id] = job(dedupeJobSteps([...prelude(extra.length > 0 ? { fetchDepth: '0' } : {}), ...steps], { id, scans: new Map([...facts(b), ...(extra.length > 0 ? [rangeFact] : [])]) }), { outputs: jobOutputsFor(steps) });
     }
     const script = renderProjectScript({ kind: 'project-script', needId: 'unit-tests', service: 'app', script: 'test' }, p, ctx).steps;
     out['unit-tests--app'] = job(dedupeJobSteps(script, { id: 'unit-tests--app' , scans: NO_SCANS }));
@@ -562,8 +568,9 @@ describe('parity: a full draft (two services, scanners, base-scan, gate job) thr
   const files = (j: Record<string, Job>, raw = false): CreatedFile[] => [workflow(j, raw)];
 
   it('the job list has one entry per findings result and one for the blocking script need', () => {
-    expect(entries.map((e) => e.job)).toEqual(['secrets', 'sast--app', 'sast--web', 'unit-tests--app']);
-    expect(entries.map((e) => e.artifact)).toEqual([resultArtifactName('secrets'), resultArtifactName('sast', 'app'), resultArtifactName('sast', 'web'), undefined]);
+    // C9: the secrets check is followed by its commit-range scan, in the same job
+    expect(entries.map((e) => e.job)).toEqual(['secrets', 'secrets', 'sast--app', 'sast--web', 'unit-tests--app']);
+    expect(entries.map((e) => e.artifact)).toEqual([resultArtifactName('secrets'), resultArtifactName('secrets-range'), resultArtifactName('sast', 'app'), resultArtifactName('sast', 'web'), undefined]);
   });
 
   it('a full draft passes dedupeJobSteps, stepsToYaml and the referee with 0 issues', async () => {
@@ -639,7 +646,7 @@ describe('C5b: renderGateUploads and the reserved gate uploads', () => {
   const g = block(specs[0] as StepSpec);
   const s = block(specs[1] as StepSpec);
   const scanJobs = (): Record<string, Job> => ({
-    [SEC]: job(dedupeJobSteps([...prelude(), ...g.steps], { id: 'secrets', scans: facts(g) }), { outputs: jobOutputsFor(g.steps) }),
+    [SEC]: job(dedupeJobSteps([...prelude({ fetchDepth: '0' }), ...g.steps, ...rangeB.steps], { id: 'secrets', scans: new Map([...facts(g), rangeFact]) }), { outputs: jobOutputsFor([...g.steps, ...rangeB.steps]) }),
     'sast--app': job(dedupeJobSteps([...prelude(), ...s.steps], { id: 'sast--app', scans: facts(s) }), { outputs: jobOutputsFor(s.steps) }),
   });
   const GATE_PERM = { contents: 'read', actions: 'read', 'pull-requests': 'read' };
@@ -754,7 +761,7 @@ describe('C5b fix round 1: the required result upload and the optional uploads t
   const g = block(specs[0] as StepSpec);
   const s = block(specs[1] as StepSpec);
   const scanJobs = (): Record<string, Job> => ({
-    [SEC]: job(dedupeJobSteps([...prelude(), ...g.steps], { id: 'secrets', scans: facts(g) }), { outputs: jobOutputsFor(g.steps) }),
+    [SEC]: job(dedupeJobSteps([...prelude({ fetchDepth: '0' }), ...g.steps, ...rangeB.steps], { id: 'secrets', scans: new Map([...facts(g), rangeFact]) }), { outputs: jobOutputsFor([...g.steps, ...rangeB.steps]) }),
     'sast--app': job(dedupeJobSteps([...prelude(), ...s.steps], { id: 'sast--app', scans: facts(s) }), { outputs: jobOutputsFor(s.steps) }),
   });
   const GATE_PERM = { contents: 'read', actions: 'read', 'pull-requests': 'read' };
@@ -832,7 +839,8 @@ describe('C5b fix round 2: the referee judges the gate step it found; an id on i
   const d = draftOf(specs, [needOf('secrets')]);
   const entries = gateJobList(d);
   const g = block(specs[0] as StepSpec);
-  const scan = (): Record<string, Job> => ({ [SEC]: job(dedupeJobSteps([...prelude(), ...g.steps], { id: 'secrets', scans: facts(g) }), { outputs: jobOutputsFor(g.steps) }) });
+  // C9: with the secrets job's commit-range block
+  const scan = (): Record<string, Job> => ({ [SEC]: job(dedupeJobSteps([...prelude({ fetchDepth: '0' }), ...g.steps, ...rangeB.steps], { id: 'secrets', scans: new Map([...facts(g), rangeFact]) }), { outputs: jobOutputsFor([...g.steps, ...rangeB.steps]) }) });
   const GATE_PERM = { contents: 'read', actions: 'read', 'pull-requests': 'read' };
   const gateJob = (steps: RenderedStep[]): Job => job(steps, { name: 'gate', if: 'always()', needs: entries.map((e) => e.job), permissions: GATE_PERM });
   const withId = (): RenderedStep => ({ ...renderGateStep(GATE, d), id: 'pipegen-gate' });

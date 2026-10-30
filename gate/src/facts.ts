@@ -173,7 +173,8 @@ export async function gatherGateInput(ctx: GateContext, client: GateGithub, io: 
 
   // 2. the result artifacts, by exact name
   const checks: CheckInput[] = [];
-  for (const m of mapped.checks) {
+  // C9: the commit-range entry is no check of its own (it is read as the range below), so it never counts as the secrets check
+  for (const m of mapped.checks.filter((x) => x.entry.range !== true)) {
     const e = m.entry;
     const c: CheckInput = { entry: e, result: m.result, outputs: m.outputs };
     if ((e.format === 'sarif' || e.format === 'zap-json') && e.artifact !== undefined) {

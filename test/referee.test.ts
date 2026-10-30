@@ -16,7 +16,7 @@ import { GATE_CHECK_NAME, type Capabilities, type CreatedFile, type ExistingWork
 import { stub } from './helpers/linter-stub.js';
 import { entry, gateEntry, platform, profile, reviewedList, service, specFor, scansFor } from './helpers/render.js';
 import { fake } from './helpers/secret-repo.js';
-import { renderGateUploads, renderStage as renderStageC1c } from '../src/engine/render-step.js';
+import { renderGateUploads, renderRangeBlock, renderStage as renderStageC1c } from '../src/engine/render-step.js';
 import { isStagedTool } from '../src/engine/tool-flags.js';
 
 // ---------- builders ----------
@@ -173,7 +173,9 @@ describe('referee: the renderer and the referee agree', () => {
     jobs['pr-check'] = job([co], { permissions: { 'pull-requests': 'read' } });
     // the repo-wide secrets check: its job, and its base twin in base-scan (which checks out the base commit first, ruling 5)
     const repoWide = specOf('gitleaks', { needId: 'secrets', service: undefined });
-    const repoWideSteps = toolJob(repoWide);
+    // C9: the secrets job also scans the pull request's commits (the range block, after a full-history checkout)
+    const tw = toolJob(repoWide);
+    const repoWideSteps = [...prelude('0'), ...tw.slice(prelude('1').length), ...renderRangeBlock(entry('betterleaks'), p, GATE).steps];
     jobs[['sec', 'rets'].join('')] = job(repoWideSteps, { outputs: jobOutputsFor(repoWideSteps) });
     const baseRun = renderStep(repoWide, entry('gitleaks'), p, { ...ctx, base: true });
     const baseArt = resultArtifactName('secrets', undefined, { base: true });

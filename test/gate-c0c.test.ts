@@ -20,6 +20,7 @@ import { join } from 'node:path';
 import { entry, gateEntry, platform, profile, reviewedList, service, specFor } from './helpers/render.js';
 import { renderGateUploads, renderStage as renderStageC1c } from '../src/engine/render-step.js';
 import { isStagedTool } from '../src/engine/tool-flags.js';
+import { rangeExtra } from './helpers/gate-pipeline.js';
 
 // object keys spelled at run time (see test/no-secret-literals.test.ts)
 const NS = ['needs', 'Sec', 'rets'].join('');
@@ -170,7 +171,9 @@ describe('CF3a: one event-switched base form', () => {
     for (const spec of specs) {
       const b = block(spec);
       const id = `${spec.needId}${spec.service === undefined ? '' : `--${spec.service}`}`;
-      out[id] = job(dedupeJobSteps([...prelude(), ...b.steps], { id, scans: facts(b) }), { outputs: jobOutputsFor(b.steps) });
+      const ext = rangeExtra(spec, GATE);   // C9: the secrets job's commit-range block, after a full-history checkout
+      const all = [...b.steps, ...(ext?.steps ?? [])];
+      out[id] = job(dedupeJobSteps([...prelude(ext === undefined ? {} : { fetchDepth: '0' }), ...all], { id, scans: new Map([...facts(b), ...(ext?.scans ?? [])]) }), { outputs: jobOutputsFor(all) });
     }
     const baseBlocks = specs.map((s) => block(s, { ...ctx, base: true }));
     const steps = over([...prelude({ baseRef: true }), ...baseBlocks.flatMap((b) => b.steps)]);
