@@ -870,6 +870,19 @@ describe('fix round 1: the minors (m1-m7) and reading 1', () => {
     expect(r.failedJobs).toHaveLength(1);
     expect(r.toolErrors).toEqual([]);
   });
+  it('P5: an unknown or odd-case severity counts as high (fail closed, as parser ruling S8), with a note', () => {
+    const odd = (sev: string, seed: string): ScrubbedFinding => fnd({ severity: sev as Severity, fingerprint: hex(seed) });
+    const n = decideGate(input({ checks: [check(entry(), [odd('CRITICAL', 'n')])] }));
+    expect(n.pass).toBe(false);
+    expect(n.blocking.map((b) => b.severity)).toEqual(['high']);
+    expect(n.notes.join('\n')).toMatch(/unknown severity .*counted as high/);
+    const o = odd('urgent', 'o');
+    const w = decideGate(input({ checks: [check(entry(), [o], [o])] }));
+    expect(w.pass).toBe(true);
+    expect(w.warnings.map((x) => x.severity)).toEqual(['high']);
+    expect(Object.values(w.counted).every((v) => Number.isInteger(v))).toBe(true);
+    expect(decideGate(input({ mode: 'block', checks: [check(entry(), [o], [o])] })).pass).toBe(false);
+  });
   it('reading 1: an unmapped secret blocks every run until the file is renamed or the secret removed, and the summary says so with the display path', () => {
     const s = leakF({ file: undefined, uriUnmapped: true, displayPath: 'k\\xff.js' });
     const r = decideGate(input({ event: push(), diff: null, ancestry: { base: BASE, head: HEAD, isAncestor: true }, checks: [check(se, [s], [s])] }));

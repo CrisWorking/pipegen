@@ -406,7 +406,10 @@ export function decideGate(i: GateInput): GateResult {
     } else noBase = 'new';
 
     // 5. new or old, per finding form
-    const decided: DecidedFinding[] = fs.map((f) => ({ ...f, needId: e.needId, job: e.job, isNew: undefined, reason: '' }));
+    // an unknown or odd-case severity counts as high (fail closed, as parser ruling S8; review-C2 P5)
+    const odd = fs.filter((f) => !(SEVERITIES as readonly string[]).includes(f.severity)).length;
+    if (odd > 0) note(`${e.job}: ${odd} finding(s) had an unknown severity and are counted as high`);
+    const decided: DecidedFinding[] = fs.map((f) => ({ ...f, severity: (SEVERITIES as readonly string[]).includes(f.severity) ? f.severity : 'high', needId: e.needId, job: e.job, isNew: undefined, reason: '' }));
     const groups = new Map<string, DecidedFinding[]>();
     for (const d of decided) {
       const set = (isNew: boolean | undefined, reason: string): void => { d.isNew = isNew; d.reason = reason; };
