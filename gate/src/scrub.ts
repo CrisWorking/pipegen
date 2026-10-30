@@ -29,7 +29,7 @@ import type { Severity } from '../../src/types.js';
 import { safeText } from '../../src/util/safe-text.js';
 import { CONTENT_FORMS, fingerprintAll, isQuotingFinding, keyId, keyProblem, maskSecretShapes, POSITION_FORMS, type FpBy, type FingerprintedFinding } from './fingerprint.js';
 import { fail, getOwn, isObj, MAX_RAW_BYTES, ReadError, readJson, type ParsedFinding, type ParseResult } from './parse-common.js';
-import { SARIF_TOOLS, parseSarifText } from './sarif.js';
+import { MAX_ADVISORY_IDS, SARIF_TOOLS, parseSarifText } from './sarif.js';
 import { applyStage, readStage, StageError, STAGED_NAME_RE, type Stage, type StagedFindings } from './stage.js';
 import { ZAP_TOOL, parseZapJsonText } from './zap.js';
 
@@ -132,6 +132,8 @@ function sarifOut(tool: string, findings: readonly FingerprintedFinding[], notes
         pipegenSeverity: f.severity, pipegenSecret: f.secret, pipegenUnmapped: f.uriUnmapped || hide, pipegenPathWithheld: hide, pipegenFpBy: f.fpBy,
         // C1c fix round 1: the display form of a staged name with no lossless text (withheld like a path when it looks like a secret)
         ...(f.file === undefined && f.displayPath !== undefined && !withheld(f.displayPath) ? { pipegenDisplayPath: clip(f.displayPath, 4096) } : {}),
+        // C2 fix round 1 (review-C2 I3): the advisory ids and aliases, so the gate sees a MAL- id whichever id the tool shows
+        ...(f.advisoryIds === undefined || f.secret ? {} : { pipegenAdvisoryIds: f.advisoryIds.map((id) => outText(id)) }),
       },
     };
   });
@@ -254,6 +256,8 @@ export interface ScrubbedFinding {
   pathWithheld: boolean;
   /** C1c fix round 1: for a staged file whose name has no lossless text, a display form of its bytes (people only; never a match key). */
   displayPath?: string;
+  /** C2 fix round 1: every advisory id and alias of the finding (parse-common.ts ParsedFinding.advisoryIds), when there is more than the rule id. */
+  advisoryIds?: string[];
   method?: string;
 }
 export interface ScrubbedResult { findings: ScrubbedFinding[]; keyId?: string; notes: string[]; toolError?: string }
@@ -280,6 +284,11 @@ const lineNo = (v: unknown, where: string): number | undefined => {
   if (typeof v !== 'number' || !Number.isInteger(v) || v < 1) fail(`${where}: a line is not a whole number`);
   return v;
 };
+/** The advisory ids of a scrubbed result: a list of at most MAX_ADVISORY_IDS strings, else the file is not the scrub's (a tool error). */
+function advisoryIdsOf(v: unknown, where: string): string[] {
+  if (!Array.isArray(v) || v.length > MAX_ADVISORY_IDS || !v.every((x) => typeof x === 'string')) fail(`${where}: the advisory ids are not a list of at most ${MAX_ADVISORY_IDS} strings`);
+  return v as string[];
+}
 function readNotes(v: unknown, where: string): string[] {
   if (!Array.isArray(v)) fail(`${where}: notes is not a list`);
   return v.map((n) => { if (typeof n !== 'string') fail(`${where}: a note is not a string`); return n; });
@@ -336,6 +345,7 @@ export function readScrubbed(input: string | Uint8Array, format: ScrubFormat, ma
           tool, ruleId: str(r, 'ruleId', at), severity: severity as Severity, ...(file === undefined ? {} : { file }), ...(line === undefined ? {} : { line }), ...(endLine === undefined ? {} : { endLine }),
           message: str(msg, 'text', at), fingerprint, secret: bool(p, 'pipegenSecret', at), fpBy: fpBy as FpBy, uriUnmapped: bool(p, 'pipegenUnmapped', at), pathWithheld: optBool(p, 'pipegenPathWithheld', at),
           ...(getOwn(p, 'pipegenDisplayPath') === undefined ? {} : { displayPath: str(p, 'pipegenDisplayPath', at) }),
+          ...(getOwn(p, 'pipegenAdvisoryIds') === undefined ? {} : { advisoryIds: advisoryIdsOf(getOwn(p, 'pipegenAdvisoryIds'), at) }),
         };
       });
       return { findings, ...(typeof id === 'string' ? { keyId: id } : {}), notes: readNotes(getOwn(props, 'pipegenNotes'), 'properties') };

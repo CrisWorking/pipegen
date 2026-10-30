@@ -180,9 +180,29 @@ function fromLevel(v: string | undefined): Severity | undefined {
 // ---------- the reader ----------
 
 const MAX_TAGS = 256;
-const SAME = (a: Rule, b: Rule): boolean => a.level === b.level && String(a.score) === String(b.score) && a.tags.join('\0') === b.tags.join('\0') && a.template === b.template;
+/** C2 fix round 1 (review-C2 I3): at most this many advisory ids and aliases per finding; more is a tool error. */
+export const MAX_ADVISORY_IDS = 64;
+const SAME = (a: Rule, b: Rule): boolean => a.level === b.level && String(a.score) === String(b.score) && a.tags.join('\0') === b.tags.join('\0') && a.template === b.template && a.aliases.join('\0') === b.aliases.join('\0');
 
-interface Rule { id: string; level?: string; score?: unknown; tags: string[]; secret: boolean; word?: Severity; template?: string }
+interface Rule { id: string; level?: string; score?: unknown; tags: string[]; secret: boolean; word?: Severity; template?: string; aliases: string[] }
+
+/**
+ * The advisory ids and aliases a rule or a result carries (C2 fix round 1, review-C2 I3): SARIF's `deprecatedIds` on a rule
+ * (osv-scanner lists a group's aliases there and shows one of them as the rule id) and an `aliases` list in the properties. A list
+ * of the wrong type, an id over the id cap, or more than MAX_ADVISORY_IDS is a tool error, never a silent drop: the gate blocks on
+ * a MAL- id wherever it stands.
+ */
+function readAliases(lists: readonly (string[] | undefined)[], where: string): string[] {
+  const out: string[] = [];
+  for (const list of lists) {
+    for (const id of list ?? []) {
+      if (id.length > MAX_ID_CHARS) fail(`${where}: an advisory id is longer than ${MAX_ID_CHARS}`);
+      if (!out.includes(id)) out.push(id);
+      if (out.length > MAX_ADVISORY_IDS) fail(`${where}: more than ${MAX_ADVISORY_IDS} advisory ids and aliases`);
+    }
+  }
+  return out;
+}
 
 /** The tag facts of a rule or a result, computed once: a secret tag, and the highest severity word (gosec). */
 function tagFacts(tags: readonly string[]): { secret: boolean; word?: Severity } {
@@ -216,7 +236,8 @@ function readRules(driver: Obj, where: string): { list: Rule[]; byId: Map<string
     if (score !== undefined && typeof score !== 'string' && typeof score !== 'number') fail(`${at}: security-severity is not a string or a number`);
     const tags = readTags(props, `${at} properties`);
     const template = optStr(optObj(r, 'fullDescription', at) ?? {}, 'text', `${at} fullDescription`);
-    const rule: Rule = { id, level, score, tags, ...tagFacts(tags), ...(template === undefined ? {} : { template }) };
+    const aliases = readAliases([optStrList(r, 'deprecatedIds', at), optStrList(props, 'aliases', `${at} properties`)], at);
+    const rule: Rule = { id, level, score, tags, ...tagFacts(tags), ...(template === undefined ? {} : { template }), aliases };
     list.push(rule);
     const same = byId.get(id);
     if (same === undefined) byId.set(id, rule);
@@ -324,6 +345,7 @@ function readRun(run: unknown, index: number, toolId: string, info: SarifToolInf
     if (score !== undefined && typeof score !== 'string' && typeof score !== 'number') fail(`${at}: security-severity is not a string or a number`);
     const issue = getOwn(props, 'issue_severity');
     if (issue !== undefined && typeof issue !== 'string') fail(`${at}: issue_severity is not a string`);
+    const resultAliases = optStrList(props, 'aliases', `${at} properties`);
 
     // location: the first one, read along fixed paths
     let uri: string | undefined;
@@ -387,6 +409,8 @@ function readRun(run: unknown, index: number, toolId: string, info: SarifToolInf
       severity = 'high';
       noSeverity++;
     }
+    // every advisory id and alias of a non-secret finding, its own rule id first (a secrets tool's rules carry none worth keeping)
+    const advisoryIds = isSecret ? [] : readAliases([[rawId], rule?.aliases, resultAliases], at);
     findings.push({
       tool: toolId,
       ruleId: isSecret ? `secret:${rawId}` : rawId,
@@ -400,6 +424,7 @@ function readRun(run: unknown, index: number, toolId: string, info: SarifToolInf
       ...(endLine === undefined ? {} : { endLine }),
       ...(endColumn === undefined ? {} : { endColumn }),
       ...(uriUnmapped && uri !== undefined ? { uriId: uriIdOf(uri) } : {}),
+      ...(advisoryIds.length > 1 ? { advisoryIds } : {}),
     });
   }
   if (unreadable.size > 0) {

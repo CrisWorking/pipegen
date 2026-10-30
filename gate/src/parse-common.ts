@@ -37,6 +37,12 @@ export interface ParsedFinding extends Omit<Finding, 'fingerprint'> {
   uriUnmapped: boolean; method?: string; secret: boolean; startColumn?: number; endLine?: number; endColumn?: number; uriId?: string;
   /** C1c fix round 1: a staged file whose name has no lossless text: its raw bytes in a display form, for people only (never matched or hashed). */
   displayPath?: string;
+  /**
+   * C2 fix round 1 (review-C2 I3): every advisory id and alias the SARIF carries for a non-secret finding (its rule id first, then the
+   * rule's `deprecatedIds` and `aliases`, then the result's `aliases`), set when there is more than the rule id. The gate treats the
+   * finding as malware when any of them starts with MAL-. Never part of a fingerprint.
+   */
+  advisoryIds?: string[];
 }
 
 /** `toolError` is set when the scan cannot be called clean (then `findings` is empty). `notes` are for people. */
