@@ -41,9 +41,18 @@ const INVISIBLE = /[\p{Default_Ignorable_Code_Point}\ufff9-\ufffb]/gu;
 // Unicode line and paragraph separators: some editors break the line there.
 const LINE_SEP = /[\u2028\u2029]/g;
 
+/**
+ * The text as safeText shows it before it cuts: escapes and controls, bidi marks and every invisible code point removed, U+2028/U+2029 a space.
+ * Nothing is cut and non-ASCII letters stay. A secret value split by an invisible character is whole again here (D5, B1), so a value check
+ * must look at this form too.
+ */
+export function displayForm(s: string): string {
+  return clean(s).replace(INVISIBLE, '').replace(LINE_SEP, ' ');
+}
+
 /** Makes a repo-, GitHub- or AI-derived string safe to print to a terminal: one line of visible text, cut to `max` code points. */
 export function safeText(s: string, max: number = DEFAULT_MAX): string {
-  return cut(clean(s).replace(INVISIBLE, '').replace(LINE_SEP, ' '), max);
+  return cut(displayForm(s), max);
 }
 
 const ZWSP = '\u200b';

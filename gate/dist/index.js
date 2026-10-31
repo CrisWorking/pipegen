@@ -2700,8 +2700,11 @@ function cut(s, max) {
 }
 var INVISIBLE = /[\p{Default_Ignorable_Code_Point}\ufff9-\ufffb]/gu;
 var LINE_SEP = /[\u2028\u2029]/g;
+function displayForm(s) {
+  return clean(s).replace(INVISIBLE, "").replace(LINE_SEP, " ");
+}
 function safeText(s, max = DEFAULT_MAX) {
-  return cut(clean(s).replace(INVISIBLE, "").replace(LINE_SEP, " "), max);
+  return cut(displayForm(s), max);
 }
 var ZWSP = "\u200B";
 function safeMarkdown(s, max = DEFAULT_MAX) {

@@ -9,6 +9,8 @@ import {
   TEST_KEYS_ONLY, type SecretRequest,
 } from '../src/create/secrets.js';
 import { isDangerousName } from '../src/engine/job-rules.js';
+import { displayForm } from '../src/util/safe-text.js';
+import { scrubForDisplay } from '../src/util/known-values.js';
 import { runExitHooks } from '../src/util/exit-hooks.js';
 import type { CreatedFile, Dependency, DependencyKind, Service } from '../src/types.js';
 import { makeOctokit } from '../src/github/client.js';
@@ -105,8 +107,8 @@ describe('requests', () => {
     expect(r.cantMap).toEqual([]);
   });
 
-  it('requests: NPM_TOKEN, GH_TOKEN, GH_HOST and GH_ENTERPRISE_TOKEN are dangerous names', () => {
-    for (const n of ['NPM_TOKEN', 'GH_TOKEN', 'GH_HOST', 'GH_ENTERPRISE_TOKEN']) expect(isDangerousName(n), n).toBe(true);
+  it('requests: NPM_TOKEN and the gh CLI variables (GH_TOKEN, GH_HOST, GH_REPO, GH_CONFIG_DIR, ...) are dangerous names', () => {
+    for (const n of ['NPM_TOKEN', 'GH_TOKEN', 'GH_HOST', 'GH_ENTERPRISE_TOKEN', 'GH_REPO', 'GH_CONFIG_DIR', 'GH_DEBUG', 'GH_PROMPT_DISABLED', 'GH_NO_UPDATE_NOTIFIER']) expect(isDangerousName(n), n).toBe(true);
     for (const n of ['STRIPE_KEY', 'NPM_REGISTRY_NAME', 'GHOST_KEY', 'MY_GH_TOKEN']) expect(isDangerousName(n), n).toBe(false);
   });
 
@@ -630,5 +632,101 @@ describe('generateFpKey', () => {
     const v = new SecretVault();
     generateFpKey(v);
     expect(Buffer.from(v.get('PIPEGEN_FP_KEY') as string, 'hex')).toHaveLength(32);
+  });
+});
+
+describe('value validation (B3): code points, well-formed, nothing invisible', () => {
+  const INV = '\u200b';
+  const bad: [string, string][] = [
+    ['four two-byte letters (8 bytes, 4 code points)', 'éééé'],
+    ['four emoji (4 code points, 8 UTF-16 units)', '😀😀😀😀'],
+    ['abc and 5 invisible characters', 'abc' + INV.repeat(5)],
+    ['8 lone surrogates', '\ud800'.repeat(8)],
+    ['a soft hyphen inside', 'abcdefg\u00adh'],
+    ['a newline inside', 'abcdefg\nhijk'],
+    ['a bidi mark inside', 'abcdefg\u202ehijk'],
+    ['U+2028 inside', 'abcdefg\u2028hijk'],
+  ];
+  const good = ['éééééééé', '😀😀😀😀😀😀😀😀', 'e\u0301e\u0301e\u0301e\u0301', 'abcdefgh'];
+
+  it('vault.set refuses them with a fixed message that holds no part of the value, and accepts 8 code points', () => {
+    for (const [why, value] of bad) {
+      const v = new SecretVault();
+      const err = (() => { try { v.set('A_KEY', value); return null; } catch (e) { return e as Error; } })();
+      expect(err, why).toBeInstanceOf(Error);
+      expect(err?.message, why).toContain('A_KEY');
+      expect(err?.message, why).not.toContain('abcdefg');
+      expect(v.has('A_KEY'), why).toBe(false);
+    }
+    for (const value of good) {
+      const v = new SecretVault();
+      v.set('A_KEY', value);
+      expect(v.get('A_KEY')).toBe(value);
+    }
+  });
+
+  it('askSecrets refuses them (asked once more, then missing) and takes 8 code points', async () => {
+    for (const [why, value] of bad) {
+      const io = scriptedPrompter([value, value]);
+      const v = new SecretVault();
+      const r = await askSecrets(io, [req('A_KEY')], v);
+      expect(r.missing, why).toEqual(['A_KEY']);
+      expect(io.asked, why).toHaveLength(2);
+      expect(v.names()).toEqual([]);
+    }
+    for (const value of good) {
+      const io = scriptedPrompter([value]);
+      const v = new SecretVault();
+      expect((await askSecrets(io, [req('A_KEY')], v)).missing).toEqual([]);
+    }
+    const io = scriptedPrompter(['abc' + INV.repeat(5), 'abcdefgh']);
+    await askSecrets(io, [req('A_KEY')], new SecretVault());
+    expect(io.asked[1]?.msg).toMatch(/invisible or control characters/);
+  });
+
+  it('storeEnvSecret applies the same validation to its value, before any request', async () => {
+    const { gh, calls } = fakeOctokit({});
+    for (const [why, value] of bad) await expect(storeEnvSecret(gh, { owner: 'o', repo: 'r' }, 'pipegen-signing', 'K_ONE', value), why).rejects.toThrow();
+    expect(calls).toHaveLength(0);
+  });
+});
+
+describe('displayForm, containsKnownValue and scrubForDisplay (B1)', () => {
+  const VAL = 'Zq7Rk2mW9xLp4Tn8Hy6Vb3Nc';
+  const split = (ch: string): string => `${VAL.slice(0, 6)}${ch}${VAL.slice(6)}`;
+  const classes: [string, string][] = [['ZWSP', '\u200b'], ['word joiner', '\u2060'], ['BOM', '\ufeff'], ['bidi override', '\u202e'], ['soft hyphen', '\u00ad'], ['ESC sequence', '\u001b[0m'], ['newline', '\n']];
+
+  it('displayForm is what safeText shows before it cuts: invisible, control and bidi removed, U+2028 a space', () => {
+    expect(displayForm('a\u200bb\u2060c\ufeffd\u202ee\u00adf\n')).toBe('abcdef');
+    expect(displayForm('a\u2028b')).toBe('a b');
+    expect(displayForm('éabc')).toBe('éabc');
+  });
+
+  it('a value split by any invisible class is found, and scrubForDisplay removes it before any cut', () => {
+    const v = new SecretVault();
+    v.set('K_LONG', VAL);
+    for (const [name, ch] of classes) {
+      const text = `${'j'.repeat(40)}${split(ch)}`;
+      expect(v.containsKnownValue(text), name).toBe(true);
+      const shown = scrubForDisplay(v, text, (t) => t.slice(0, 50));
+      expect(shown, name).not.toContain(VAL.slice(0, 8));
+      expect(shown, name).toContain('[REDACTED]');
+    }
+    expect(v.containsKnownValue('j'.repeat(40))).toBe(false);
+  });
+
+  it('scrubForDisplay: a value that the display pass itself would destroy (an escape sequence eats its first characters) is scrubbed from the raw text first', () => {
+    const v = new SecretVault();
+    v.set('K_ESC', 'Aabcdefg');
+    const text = '\u001b[Aabcdefg';   // displayForm drops "ESC [ A", leaving "abcdefg"
+    expect(displayForm(text)).toBe('abcdefg');
+    expect(scrubForDisplay(v, text)).not.toContain('abcdefg');
+  });
+
+  it('scrubForDisplay scrubs the raw text first, then the display form, then cuts (default cut: safeText)', () => {
+    const v = new SecretVault();
+    v.set('K_LONG', VAL);
+    expect(scrubForDisplay(v, `x ${VAL} y`)).toBe('x [REDACTED] y');
+    expect(scrubForDisplay(v, `${'j'.repeat(195)}${split('\u200b')}`).includes(VAL.slice(0, 4))).toBe(false);
   });
 });

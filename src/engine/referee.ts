@@ -30,6 +30,7 @@
 import { isDeepStrictEqual } from 'node:util';
 import { isMap, isScalar, LineCounter, visit, type Document, type Node as YamlNode, type Pair } from 'yaml';
 import { findSecretLike } from '../ai/redact.js';
+import { scrubForDisplay } from '../util/known-values.js';
 import { safeText } from '../util/safe-text.js';
 import { GATE_CHECK_NAME, type CreatedFile, type KnownValueCheck, type OutputFormat, type PipegenInserted, type PipelineDraft, type ReviewedTool, type RuntimeEnv, type StepSpec } from '../types.js';
 import { ArtifactNameError, slug } from './artifact-names.js';
@@ -1404,18 +1405,27 @@ const fileKind = (f: CreatedFile): 'workflow' | 'action' | null => (WORKFLOW_PAT
 export async function referee(allFiles: CreatedFile[], draft: PipelineDraft, platform: PlatformActions, reviewed: ReviewedTool[], linters: Linters, ghToken: string | null, deps: RefereeDeps = {}): Promise<RefereeReport> {
   const issues: RefereeIssue[] = [];
   const notes: string[] = [];
-  // D5: with a vault, whatever is shown (a path may be the carrier of a value) first passes its scrubber
-  const shown = deps.vault === undefined ? (t: string): string => t : deps.vault.scrubber();
-  const add: Add = (file, check, message, line, repo) => { issues.push({ file: safeText(shown(file), 200), check, message: shown(message), ...(line === undefined ? {} : { line }), ...(repo === undefined ? {} : { repo }) }); };
+  // D5 (B1): with a vault, everything shown is checked and cleaned AS DISPLAYED (safeText joins a value split by an invisible character back
+  // together) and BEFORE any cut: the one place issues and notes are built. Without a vault nothing changes.
+  const vault = deps.vault;
+  const cleanText = (t: string): string => (vault === undefined ? t : scrubForDisplay(vault, t, (x) => x));
+  const add: Add = (file, check, message, line, repo) => { issues.push({ file: vault === undefined ? safeText(file, 200) : scrubForDisplay(vault, file, (x) => safeText(x, 200)), check, message: cleanText(message), ...(line === undefined ? {} : { line }), ...(repo === undefined ? {} : { repo: cleanText(repo) as typeof repo }) }); };
 
-  // D5 (S8, I1): a file whose path, text or reason holds a value the user gave pipegen (or its base64 or URL form) gets ONE fixed issue and is judged no further:
-  // no other check reads it, so no other message can quote a piece of the value (a cut by safeText would leave a prefix the scrubber can't match)
-  const holdsValue = (f: CreatedFile): boolean => deps.vault !== undefined && [f?.path, f?.content, f?.reason].some((t) => typeof t === 'string' && deps.vault?.containsKnownValue(t) === true);
-  const files = allFiles.filter((f) => !holdsValue(f));
-  for (const f of allFiles) {
-    if (!holdsValue(f)) continue;
-    add(f.path, 'secret-value', 'The file holds a value you gave pipegen as a secret (or its base64 or URL form); pipegen never writes one into a file.', undefined, f.repo);
+  // D5 (S8, I1, B1): a file whose path, text, reason or repo holds a value the user gave pipegen (in any form, or only once displayed) gets ONE fixed
+  // issue, and so does a draft that holds one. The WHOLE draft is then refused and nothing else is judged: no other check reads the text, so no
+  // other message can quote a piece of the value.
+  const holds = (t: unknown): boolean => vault !== undefined && typeof t === 'string' && vault.containsKnownValue(t);
+  const holdsValue = (f: CreatedFile): boolean => [f?.path, f?.content, f?.reason, f?.repo].some(holds);
+  const taintedFiles = allFiles.filter(holdsValue);
+  let draftText = '';
+  try { draftText = JSON.stringify(draft) ?? ''; } catch { /* a draft that can't be written out holds no text to check */ }
+  const draftHolds = holds(draftText);
+  if (taintedFiles.length > 0 || draftHolds) {
+    for (const f of taintedFiles) add(f.path, 'secret-value', 'The file holds a value you gave pipegen as a secret (or its base64 or URL form); pipegen never writes one into a file.', undefined, f.repo);
+    if (draftHolds) add('(draft)', 'secret-value', 'The draft holds a value you gave pipegen as a secret (or its base64 or URL form); pipegen never writes one into a file.');
+    return { ok: false, issues, demoted: [], notes: [] };
   }
+  const files = allFiles;
 
   // S18: no secret value in any file (rule names only, never the value)
   for (const f of files) {
@@ -1511,9 +1521,9 @@ export async function referee(allFiles: CreatedFile[], draft: PipelineDraft, pla
       const hit = lintable.filter((x) => x.path === i.file && (i.repo === undefined || x.repo === i.repo));
       const f = hit.length === 1 ? hit[0] : undefined;
       const lines = f === undefined ? null : pipegenLines(f);
-      if (lines !== null && i.line !== undefined && !lines.has(i.line)) notes.push(`${safeText(i.file, 200)}:${i.line}: ${safeText(i.message, 300)} (on the user's own lines, not pipegen's)`);
+      if (lines !== null && i.line !== undefined && !lines.has(i.line)) notes.push(`${safeText(cleanText(i.file), 200)}:${i.line}: ${safeText(cleanText(i.message), 300)} (on the user's own lines, not pipegen's)`);
       else add(i.file, i.check, i.message, i.line, i.repo);
     }
   }
-  return { ok: issues.length === 0, issues, demoted, notes };
+  return { ok: issues.length === 0, issues, demoted: demoted.map(cleanText), notes: notes.map(cleanText) };
 }

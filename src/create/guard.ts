@@ -33,6 +33,7 @@ import { createdPathProblem } from '../engine/job-rules.js';
 import { CODE_FILE_RE, isTestFile } from '../read/manifest.js';
 import { readTextLimitedWithReason, SKIP_REASON, READ_LIMITS } from '../read/limits.js';
 import type { CreatedFile, InstallRecord, KnownValueCheck, PipelineDraft, RepoProfile } from '../types.js';
+import { scrubForDisplay } from '../util/known-values.js';
 import { lockProblems, packageJsonProblems } from './package-rules.js';
 import type { ReviewedClosure } from './reviewed-closure.js';
 
@@ -83,6 +84,8 @@ const baseName = (p: string): string => p.slice(p.lastIndexOf('/') + 1);
 /** A repo-derived string made safe for a message: printable ASCII only, short. */
 const safe = (s: unknown): string => String(s).replace(/[^\x20-\x7e]/g, '?').slice(0, 80);
 const q = (p: string): string => `\`${safe(p)}\``;
+const plainSafe = safe;
+const qDefault = q;
 const rootPrefix = (svcPath: string): string => svcPath.replace(/^(?:\.\/)+/, '').replace(/\/+$/, '').replace(/^\.$/, '');
 
 type Verdict = { kind: 'ok'; note?: string } | { kind: 'refuse'; reason: string } | { kind: 'keep'; note: string };
@@ -93,7 +96,7 @@ const refuse = (reason: string): Verdict => ({ kind: 'refuse', reason });
 type Local = { kind: 'absent' } | { kind: 'file' } | { kind: 'dir' } | { kind: 'refuse'; reason: string };
 
 /** Walks `segs` down from `root` with readdir and lstat on every level (no realpath, nothing followed, nothing opened). */
-async function probeLocal(root: string, segs: readonly string[]): Promise<Local> {
+async function probeLocal(root: string, segs: readonly string[], q: (p: string) => string = qDefault): Promise<Local> {
   let dir = root;
   for (let i = 0; i < segs.length; i++) {
     const seg = segs[i] as string;
@@ -131,7 +134,7 @@ function indexBase(tree: BaseTree): BaseIndex {
 }
 
 type Remote = { kind: 'absent' } | { kind: 'file'; entry: BaseEntry } | { kind: 'refuse'; reason: string };
-function probeBase(ix: BaseIndex, segs: readonly string[]): Remote {
+function probeBase(ix: BaseIndex, segs: readonly string[], q: (p: string) => string = qDefault): Remote {
   for (let i = 1; i <= segs.length; i++) {
     const x = segs.slice(0, i).join('/');
     const last = i === segs.length;
@@ -175,7 +178,12 @@ function batchClashes(files: readonly CreatedFile[], repo: 'app' | 'central'): S
 
 export async function guardCreatedFiles(files: readonly CreatedFile[], ctx: GuardCtx): Promise<GuardResult> {
   const result: GuardResult = { ok: [], refused: [], notes: [] };
-  const scr = ctx.vault === undefined ? (t: string): string => t : ctx.vault.scrubber();   // D5: what is shown never holds a vault value (a path may carry one)
+  // D5 (B1, B2): what is shown never holds a vault value. `safe` and `q` are shadowed here by versions that clean the text as it will be displayed
+  // BEFORE they cut it to 80 characters or turn non-ASCII into `?`; the module-level probes get this `q` as a parameter.
+  const vault = ctx.vault;
+  const scr = vault === undefined ? (t: string): string => t : (t: string): string => scrubForDisplay(vault, t, (x) => x);
+  const safe = (s: unknown): string => (vault === undefined ? plainSafe(s) : scrubForDisplay(vault, String(s), plainSafe));
+  const q = (p: string): string => `\`${safe(p)}\``;
   const repo = ctx.repo ?? 'app';
   const ix = indexBase(ctx.baseTree);
   const clashes = batchClashes(files, repo);
@@ -187,7 +195,7 @@ export async function guardCreatedFiles(files: readonly CreatedFile[], ctx: Guar
 
   async function judge(f: CreatedFile, i: number): Promise<Verdict> {
     if (typeof f !== 'object' || f === null) return refuse('this is not a file description');
-    if (ctx.vault !== undefined && [f.path, f.content, f.reason].some((t) => typeof t === 'string' && ctx.vault?.containsKnownValue(t) === true)) return refuse('the file holds a value you gave pipegen as a secret (or its base64 or URL form); pipegen never writes one into a file');
+    if (ctx.vault !== undefined && [f.path, f.content, f.reason, f.repo].some((t) => typeof t === 'string' && ctx.vault?.containsKnownValue(t) === true)) return refuse('the file holds a value you gave pipegen as a secret (or its base64 or URL form); pipegen never writes one into a file');
     if (typeof f.path !== 'string') return refuse('the path is empty');
     if (f.repo !== repo) return refuse(`this file belongs to the ${safe(f.repo)} repository, but the guard checks the ${repo} repository`);
     const pathProblem = createdPathProblem(f.path);
@@ -201,10 +209,10 @@ export async function guardCreatedFiles(files: readonly CreatedFile[], ctx: Guar
     if (!rootOk) return refuse('the repository folder could not be read, so pipegen can not check the file against it');
 
     const segs = f.path.split('/');
-    const local = await probeLocal(ctx.root, segs);
+    const local = await probeLocal(ctx.root, segs, q);
     if (local.kind === 'refuse') return refuse(local.reason);
     if (local.kind === 'dir') return refuse(`${q(f.path)} is an existing folder, so a file can not be created at that path`);
-    const remote = probeBase(ix, segs);
+    const remote = probeBase(ix, segs, q);
     if (remote.kind === 'refuse') return refuse(remote.reason);
 
     if (f.edited !== undefined && f.inserted !== undefined) return refuse('the file carries both the edit marker and the workflow insert marker; it can be only one');
@@ -280,7 +288,7 @@ export async function guardCreatedFiles(files: readonly CreatedFile[], ctx: Guar
       if (sibling(name === 'package.json' ? 'package-lock.json' : 'package.json')?.edited === undefined) return refuse(`${q(f.path)} is edited together with ${q(`${pre}${name === 'package.json' ? 'package-lock.json' : 'package.json'}`)} in the same batch, or not at all: either one alone makes \`npm ci\` fail`);
       const svc = ctx.profile.services.find((s) => rootPrefix(s.path) === dir);
       if (svc === undefined || svc.packageManager !== 'npm') return refuse(`the service in ${q(dir === '' ? '.' : dir)} is not npm, and pipegen edits only npm packages in this version`);
-      for (const other of OTHER_LOCKS) if (ix.files.has(`${pre}${other}`) || (await probeLocal(ctx.root, `${pre}${other}`.split('/'))).kind !== 'absent') return refuse(`${q(`${pre}${other}`)} exists beside this package.json, so this is not a plain npm package; pipegen edits only those in this version`);
+      for (const other of OTHER_LOCKS) if (ix.files.has(`${pre}${other}`) || (await probeLocal(ctx.root, `${pre}${other}`.split('/'), q)).kind !== 'absent') return refuse(`${q(`${pre}${other}`)} exists beside this package.json, so this is not a plain npm package; pipegen edits only those in this version`);
     }
     return { kind: 'ok' };
   }
@@ -290,7 +298,7 @@ export async function guardCreatedFiles(files: readonly CreatedFile[], ctx: Guar
     let v: Verdict;
     try { v = await judge(f, i); } catch { v = refuse('the file could not be checked, so pipegen does not write it'); }
     if (v.kind === 'ok') { result.ok.push(f); if (v.note !== undefined) result.notes.push(scr(v.note)); }
-    else if (v.kind === 'refuse') result.refused.push({ path: typeof f?.path === 'string' ? safe(scr(f.path)) : '', reason: scr(v.reason) });
+    else if (v.kind === 'refuse') result.refused.push({ path: typeof f?.path === 'string' ? safe(f.path) : '', reason: scr(v.reason) });
     else result.notes.push(scr(v.note));
   }
   // a package.json and its package-lock.json travel together: if either is not ok, its partner goes too (one alone makes `npm ci` fail)
@@ -301,7 +309,7 @@ export async function guardCreatedFiles(files: readonly CreatedFile[], ctx: Guar
     const partnerPath = `${f.path.slice(0, f.path.length - baseName(f.path).length)}${partner}`;
     if (result.ok.some((x) => x.path === partnerPath)) continue;
     result.ok.splice(result.ok.indexOf(f), 1);
-    result.refused.push({ path: safe(scr(f.path)), reason: scr(`its partner ${q(partnerPath)} was refused or is not written, and ${q(f.path)} alone makes \`npm ci\` fail in your CI, so pipegen writes neither`) });
+    result.refused.push({ path: safe(f.path), reason: scr(`its partner ${q(partnerPath)} was refused or is not written, and ${q(f.path)} alone makes \`npm ci\` fail in your CI, so pipegen writes neither`) });
   }
   return result;
 }

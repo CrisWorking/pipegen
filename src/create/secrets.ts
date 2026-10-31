@@ -19,7 +19,7 @@ import { isDangerousName } from '../engine/job-rules.js';
 import { NAME_RE } from '../read/manifest.js';
 import type { CreatedFile, Dependency, KnownValueCheck, RepoProfile } from '../types.js';
 import { onExit } from '../util/exit-hooks.js';
-import { safeText } from '../util/safe-text.js';
+import { displayForm, safeText } from '../util/safe-text.js';
 import { composeCoveredNames } from './compose.js';
 import { ENV_TABLE, isDepKey } from './compose-tables.js';
 
@@ -95,6 +95,20 @@ export function secretRequests(profile: RepoProfile, ctx: { covered: Set<string>
  * The values the user typed (and PIPEGEN_FP_KEY), in memory only. `get` returns a string and exists for sealing; nothing lists the values.
  * Held values register `wipe` with the exit-hook registry (exit, SIGINT, SIGTERM); wipe unregisters it.
  */
+/**
+ * Why a typed value can't be kept, or null (the text never holds the value). Well-formed Unicode only (a lone surrogate is stored as U+FFFD, so
+ * it would not match what the user typed); nothing that the display changes (invisible, control and bidi characters, line separators: a needle
+ * that vanishes on screen can't be matched or scrubbed); at least MIN_VALUE_LENGTH code points (not bytes, not UTF-16 units).
+ */
+export function valueProblem(value: unknown): string | null {
+  if (typeof value !== 'string') return 'is not text';
+  // a lone surrogate (String.prototype.isWellFormed is newer than the project's lib setting)
+  if (/[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\udbff])[\udc00-\udfff]/.test(value)) return 'is not well-formed text';
+  if (displayForm(value) !== value) return 'contains invisible or control characters';
+  if ([...value].length < MIN_VALUE_LENGTH) return `is too short to protect: pipegen needs at least ${MIN_VALUE_LENGTH} characters`;
+  return null;
+}
+
 /** The shortest value pipegen keeps (a shorter one would make the scrubber and the file check flag ordinary text, and its place in a text would give it away). */
 export const MIN_VALUE_LENGTH = 8;
 let putReserved: (v: SecretVault, name: string, value: string) => void;
@@ -110,7 +124,8 @@ export class SecretVault implements KnownValueCheck {
   /** The one write path. Buffers are allocated with Buffer.alloc (never a slice of Node's shared pool) and filled in place. */
   #put(name: string, value: string): void {
     if (typeof name !== 'string' || !NAME_RE.test(name)) throw new Error('a secret name must be a plain environment variable name');
-    if (typeof value !== 'string' || [...value].length < MIN_VALUE_LENGTH) throw new Error(`the value for ${safeText(name, 80)} is too short to protect: pipegen needs at least ${MIN_VALUE_LENGTH} characters`);
+    const problem = valueProblem(value);
+    if (problem !== null) throw new Error(`the value for ${safeText(name, 80)} ${problem}`);
     this.#values.get(name)?.fill(0);
     const buf = Buffer.alloc(Buffer.byteLength(value, 'utf8'));
     buf.write(value, 'utf8');
@@ -144,7 +159,9 @@ export class SecretVault implements KnownValueCheck {
   /** Whether `text` holds a value (or its base64 or URL form). Used by the guard and the referee on every created file. */
   containsKnownValue(text: string): boolean {
     if (this.#values.size === 0 || typeof text !== 'string') return false;
-    return this.scrubber()(text) !== text;
+    const scrub = this.scrubber();
+    const shown = displayForm(text);   // a value split by an invisible character is whole again on screen
+    return scrub(text) !== text || scrub(shown) !== shown;
   }
   toJSON(): string { return '[vault]'; }
   toString(): string { return '[vault]'; }
@@ -156,6 +173,7 @@ export class SecretVault implements KnownValueCheck {
 export const TEST_KEYS_ONLY = "Use TEST keys only (never production). They're used for the proof and deleted from the test repo afterwards.";
 const LIVE_REFUSED = 'That looks like a LIVE (production) key, so pipegen did not take it. Paste a TEST key instead, or press Enter to skip.';
 const TOO_SHORT = `That value is too short to protect: pipegen needs at least ${MIN_VALUE_LENGTH} characters. Paste the full value, or press Enter to skip and set it yourself.`;
+const BAD_VALUE = (problem: string): string => (problem.startsWith('is too short') ? TOO_SHORT : `That value ${problem}, so pipegen can not keep it out of logs and files. Paste it again without them, or press Enter to skip and set it yourself.`);
 /** Live-key prefixes of payment providers (Stripe sk/rk/pk_live_, Razorpay rzp_live_, Mollie live_). Test keys never carry them. */
 const LIVE_KEY_RE = /(?:^|[^A-Za-z0-9])(?:sk|rk|pk|rzp)_live_|^live_/i;
 
@@ -170,7 +188,7 @@ export async function askSecrets(io: Prompter, reqs: readonly SecretRequest[], v
     if (typeof r?.name !== 'string' || mapProblem(r.name)) { missing.push(String(r?.name)); continue; }
     const what = `${r.name} (${r.why})${r.example === undefined ? '' : ` ${r.example}`}`;
     let value = (await io.text(`${TEST_KEYS_ONLY}\n${what}`, { secret: true })).trim();
-    const refusal = (v: string): string | null => (v === '' ? null : LIVE_KEY_RE.test(v) ? LIVE_REFUSED : [...v].length < MIN_VALUE_LENGTH ? TOO_SHORT : null);
+    const refusal = (v: string): string | null => (v === '' ? null : LIVE_KEY_RE.test(v) ? LIVE_REFUSED : ((p) => (p === null ? null : BAD_VALUE(p)))(valueProblem(v)));
     const first = refusal(value);
     if (first !== null) value = (await io.text(`${TEST_KEYS_ONLY}\n${first}\n${what}`, { secret: true })).trim();
     if (value === '' || refusal(value) !== null) { missing.push(r.name); continue; }
@@ -263,7 +281,8 @@ export async function storeEnvSecret(gh: Octokit, repo: { owner: string; repo: s
   if (!PART_RE.test(String(repo?.owner)) || !PART_RE.test(String(repo?.repo))) throw new SecretStoreError('the repository owner or name is not a plain name');
   if (typeof env !== 'string' || !ENV_RE.test(env)) throw new SecretStoreError('the environment name is not a plain name');
   const up = secretName(name);
-  if (typeof value !== 'string' || value === '') throw new SecretStoreError(`the value for ${safeText(up, 80)} is empty`);
+  const problem = valueProblem(value);
+  if (problem !== null) throw new SecretStoreError(`the value for ${safeText(up, 80)} ${problem}`);
   const params = { owner: repo.owner, repo: repo.repo, environment_name: env };
   const key = await fetchKey(gh, () => gh.request('GET /repos/{owner}/{repo}/environments/{environment_name}/secrets/public-key', params));
   const encrypted = seal(value, key.key);
