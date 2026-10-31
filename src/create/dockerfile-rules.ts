@@ -43,6 +43,8 @@ export const DOCKERIGNORE_LINES: readonly string[] = Object.freeze([
   '.git', '.env*', '**/.env*', '**/*.pem', '**/*.key', '**/.npmrc', '**/.netrc', '**/*.tfstate', '**/*.tfvars', '**/id_rsa*', '**/node_modules', '.venv',
   // fix round 1 (S6 amendment, m2): nested .git, ssh/cloud/docker credentials, more key and keystore files, tfstate backups
   '**/.git', '**/.ssh', '**/.aws', '**/.docker', '**/.git-credentials', '**/id_ed25519*', '**/id_ecdsa*', '**/id_dsa*', '**/*.p12', '**/*.pfx', '**/*.jks', '**/*.tfstate.backup', '**/*.tfvars.json',
+  // fix round 2 (S6 amendment): kube config, the _netrc spelling, pip credentials, terraform working folders, nested virtualenvs
+  '**/.kube', '**/_netrc', '**/.pypirc', '**/.terraform', '**/.venv',
 ]);
 
 /** The fixed .dockerignore text: no `!` line, no comment, no repo text; `dist` only when the Dockerfile builds inside. */
@@ -121,9 +123,6 @@ const ALLOWED = new Set(['FROM', 'WORKDIR', 'COPY', 'RUN', 'ENV', 'ARG', 'USER',
 const HIDDEN_KEYWORDS = new Set(['ADD', 'ONBUILD', 'FROM', 'USER', 'SHELL', 'VOLUME', 'STOPSIGNAL']);
 /** ARG/ENV names that hold a secret (S5). */
 export const SECRET_NAME_RE = /(KEY|SECRET|TOKEN|PASS|PWD|CREDENTIAL|AUTH|PRIVATE|DSN|DATABASE_URL)/i;
-/** ARG/ENV names that change where packages or code come from, or how the tools load code or check TLS. */
-const RISKY_NAME_RE = /^(?:NPM_CONFIG_.*|LD_.*|BASH_ENV|NODE_OPTIONS|NODE_EXTRA_CA_CERTS|NODE_TLS_REJECT_UNAUTHORIZED|(?:HTTP|HTTPS|ALL|NO)_PROXY)$/i;
-const NAME_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
 const ALIAS_RE = /^[a-z][a-z0-9_.-]{0,63}$/;
 const q = (s: string): string => safeText(s, 60);
 
@@ -204,19 +203,31 @@ export function envPairs(kw: 'ENV' | 'ARG', args: string): { name: string; value
   return out.length > 0 ? out : null;
 }
 
+// ---------- ENV and ARG: the allowlist ----------
+
+/** The only ENV/ARG names, and their only values (B1): NODE_ENV (three words), PORT (the service port), three npm notices switched off. Case-sensitive. */
+function ENV_ALLOWED(name: string, port: number): { value?: string; oneOf?: string[] } | undefined {
+  if (name === 'NODE_ENV') return { oneOf: ['production', 'development', 'test'] };
+  if (name === 'PORT') return { value: String(port) };
+  if (name === 'NPM_CONFIG_UPDATE_NOTIFIER' || name === 'NPM_CONFIG_FUND' || name === 'NPM_CONFIG_AUDIT') return { value: 'false' };
+  return undefined;
+}
+
 // ---------- RUN and CMD: the allowlist ----------
 
 const WORD_RE = /^[A-Za-z0-9._/@=:,+-]+$/;
 const PATH_RE = /^[A-Za-z0-9._/-]+$/;
-const SCRIPT_RE = /^[A-Za-z0-9:._-]+$/;
+const SCRIPT_RE = /^[A-Za-z0-9][A-Za-z0-9:._-]*$/;
 const NPM_CI_FLAGS = new Set(['--ignore-scripts', '--omit=dev', '--omit=optional', '--no-audit', '--no-fund']);
 /** A plain path: no `..` segment, no leading dash. */
 const plainPath = (p: string): boolean => PATH_RE.test(p) && !p.startsWith('-') && !p.split('/').includes('..');
+/** A path pipegen may create or chown: plain and relative (the app folder is the working directory), or `/app` and plain paths below it. */
+const appPath = (p: string): boolean => plainPath(p) && (!p.startsWith('/') || p === '/app' || (p.startsWith('/app/') && !p.includes('//') && !p.split('/').includes('.')));
 
 /** The words of a RUN command: the elements of the JSON form (each one plain word), or the shell text with blanks collapsed. Null when it is neither. */
 function runWords(rest: string): string[] | null {
   const e = execForm(rest);
-  if (e !== null) return e.length > 0 && e.every((w) => w === '&&' || WORD_RE.test(w)) ? e : null;
+  if (e !== null) return e.length > 0 && e.every((w) => WORD_RE.test(w)) ? e : null   // exactly one command: an && element is not a plain word;
   const text = rest.trim().replace(/[ \t]+/g, ' ');
   return text === '' ? null : text.split(' ');
 }
@@ -236,10 +247,10 @@ function runCommandProblem(words: readonly string[], ctx: DockerfileCtx, counts:
       counts.npmCi++;
     } else if (a === 'npm' && b === 'run') {
       if (more.length !== 1 || !SCRIPT_RE.test(more[0] as string) || !ctx.scripts.includes(more[0] as string)) return `npm run needs exactly one script name that is a script of this service (not ${q(more.join(' '))})`;
-    } else if (a === 'npm' && b === 'prune' && more.join(' ') === '--omit=dev') { /* allowed */ } else if (a === 'npm' && b === 'cache' && more.join(' ') === 'clean --force') { /* allowed */ } else if (a === 'mkdir' && b === '-p' && more.length === 1 && plainPath(more[0] as string)) { /* allowed */ } else if (a === 'chown') {
+    } else if (a === 'npm' && b === 'prune' && more.join(' ') === '--omit=dev') { /* allowed */ } else if (a === 'npm' && b === 'cache' && more.join(' ') === 'clean --force') { /* allowed */ } else if (a === 'mkdir' && b === '-p' && more.length === 1 && appPath(more[0] as string)) { /* allowed */ } else if (a === 'chown') {
       const args = [b, ...more].filter((x): x is string => x !== undefined);
       const rest = args[0] === '-R' ? args.slice(1) : args;
-      if (!(rest.length === 2 && rest[0] === 'node:node' && plainPath(rest[1] as string))) return 'chown is only allowed as chown [-R] node:node <plain path>';
+      if (!(rest.length === 2 && rest[0] === 'node:node' && appPath(rest[1] as string))) return 'chown is only allowed as chown [-R] node:node <relative path or a path under /app>';
     } else return `${q(c.join(' '))} is not one of the commands pipegen allows (npm ci --ignore-scripts, npm run <script>, npm prune --omit=dev, npm cache clean --force, mkdir -p <path>, chown [-R] node:node <path>)`;
   }
   return '';
@@ -364,7 +375,8 @@ function rules(text: string, svc: Pick<Service, 'language' | 'packageManager'>, 
       case 'HEALTHCHECK': add(`${where}: HEALTHCHECK is not allowed (the health of the service is checked by the compose file)`); break;
       case 'WORKDIR': {
         const w = shellWords(ins.args);
-        if (w === null || w.length !== 1 || !/^[A-Za-z0-9._/-]+$/.test(w[0] as string)) add(`${where} needs one plain path (letters, digits, . _ - and /; no variable)`);
+        const dir = w?.length === 1 ? (w[0] as string) : '';
+        if (!/^\/app(?:\/[A-Za-z0-9._-]+)*$/.test(dir) || dir.split('/').some((seg) => seg === '.' || seg === '..')) add(`${where} must be /app or a plain path under /app/`);
         break;
       }
       case 'LABEL': {
@@ -392,9 +404,9 @@ function rules(text: string, svc: Pick<Service, 'language' | 'packageManager'>, 
         const pairs = envPairs(ins.kw, ins.args);
         if (pairs === null) { add(`${where} is malformed`); break; }
         for (const p of pairs) {
-          if (!NAME_RE.test(p.name)) { add(`${where}: ${q(p.name)} is not a valid name`); continue; }
-          if (RISKY_NAME_RE.test(p.name)) add(`${where}: ${p.name} changes where packages come from or how code is loaded, and is not allowed`);
-          if (SECRET_NAME_RE.test(p.name) && p.value !== undefined && p.value !== '') add(`${where}: ${p.name} looks like a secret and has a value (the value would be in the image and its history)`);
+          const allowed = ENV_ALLOWED(p.name, ctx.port);
+          if (allowed === undefined) add(`${where}: ${q(p.name)} is not a name pipegen allows (only NODE_ENV, PORT, NPM_CONFIG_UPDATE_NOTIFIER, NPM_CONFIG_FUND and NPM_CONFIG_AUDIT)`);
+          else if (p.value === undefined || (p.value !== allowed.value && !(allowed.oneOf ?? []).includes(p.value))) add(`${where}: ${p.name} may only be ${allowed.oneOf?.join(', ') ?? allowed.value}`);
         }
         break;
       }

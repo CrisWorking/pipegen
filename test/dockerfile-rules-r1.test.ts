@@ -168,9 +168,7 @@ describe('R3', () => {
       '.git', '.env*', '**/.env*', '**/*.pem', '**/*.key', '**/.npmrc', '**/.netrc', '**/*.tfstate', '**/*.tfvars', '**/id_rsa*', '**/node_modules', '.venv',
       '**/.git', '**/.ssh', '**/.aws', '**/.docker', '**/.git-credentials', '**/id_ed25519*', '**/id_ecdsa*', '**/id_dsa*', '**/*.p12', '**/*.pfx', '**/*.jks', '**/*.tfstate.backup', '**/*.tfvars.json',
     ];
-    expect([...DOCKERIGNORE_LINES]).toEqual(lines);
-    expect(dockerignoreText(svc(), false)).toBe(`${lines.join('\n')}\n`);
-    expect(dockerignoreText(svc(), true)).toBe(`${[...lines, 'dist'].join('\n')}\n`);
+    expect([...DOCKERIGNORE_LINES].slice(0, lines.length)).toEqual(lines);   // round 2 adds five more (dockerfile-rules-r2.test.ts pins the whole text)
     expect(buildsInsideOf(svc())).toBe(true);
   });
 });

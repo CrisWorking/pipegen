@@ -162,7 +162,7 @@ describe('dockerfile rules: supply chain', () => {
     for (const line of ['SHELL ["/bin/sh", "-c"]', 'VOLUME /data', 'VOLUME ["/data"]', 'STOPSIGNAL SIGKILL', 'MAINTAINER me', 'ADD x y', 'ONBUILD RUN x', 'FOO bar', 'RUN', 'COPY', 'WORKDIR', 'run-it x', 'ＡＤＤ x y', 'ADD\u00a0x y', 'ARG', 'ENV', 'USER', '1', '"', '--from=x']) {
       refused(swap(SINGLE, 'COPY . .', line), /instruction|ADD|ONBUILD|RUN|COPY|WORKDIR|ARG|ENV|USER|character/i);
     }
-    for (const line of ['LABEL version=1.0', 'ARG BUILD_ID', 'ARG PORT=3000', 'RUN --mount=type=cache,target=/root/.npm npm ci --ignore-scripts']) {
+    for (const line of ['LABEL version=1.0', 'ARG PORT=3000', 'RUN --mount=type=cache,target=/root/.npm npm ci --ignore-scripts']) {
       expect(problems(swap(SINGLE, 'COPY . .', `COPY . .\n${line}`)), line).toEqual([]);
     }
     for (const line of ['RUN --mount=type=bind,from=evil,target=/x true', 'RUN --mount=type=cache,target=/x,from=evil npm ci --ignore-scripts', 'RUN --mount=type=cache,target=/x,source=/etc true', 'RUN --mount=type=cache,target=/x,bogus=1 true', 'RUN --mount=type=secret,id=x true', 'RUN --network=host npm run build', 'RUN --security=insecure true', 'RUN --device=x true', 'COPY --parents . .', 'HEALTHCHECK --evil=1 CMD x', 'HEALTHCHECK CMD']) {
@@ -207,9 +207,9 @@ describe('dockerfile rules: users, secrets, ports, installs', () => {
       refused(swap(SINGLE, 'ENV NODE_ENV=production', `ARG OK=1 ${kv(name, 'abc')}`), /ARG|secret/i);
       refused(swap(SINGLE, 'ENV NODE_ENV=production', `ENV ${kv(name, '${OTHER}')}`), /ENV|secret/i);
     }
-    // a name alone, without a value, is not a value
-    expect(problems(swap(SINGLE, 'ENV NODE_ENV=production', `ARG ${apiName}`))).toEqual([]);
-    expect(problems(swap(SINGLE, 'ENV NODE_ENV=production', `ENV ${apiName}=`))).toEqual([]);
+    // a name alone is refused too: only the allowlisted names exist (fix round 2, B1)
+    refused(swap(SINGLE, 'ENV NODE_ENV=production', `ARG ${apiName}`), /ARG/);
+    refused(swap(SINGLE, 'ENV NODE_ENV=production', `ENV ${apiName}=`), /ENV/);
     // secret-shaped text anywhere, in any instruction or a comment, is refused by findSecretLike
     for (const secret of [fake.githubClassic(), fake.awsKey(), fake.jwt(), fake.stripeKey(), 'postgresql://app:' + 'hunter2' + '@db:5432/app', fake.keyBegin()]) {
       refused(swap(SINGLE, 'ENV NODE_ENV=production', `ENV NODE_ENV=${secret}`), /secret/i);
@@ -226,7 +226,7 @@ describe('dockerfile rules: users, secrets, ports, installs', () => {
     for (const line of ['ENV NPM_CONFIG_REGISTRY=https://evil.example', 'ENV npm_config_ignore_scripts=false', 'ARG NPM_CONFIG_USERCONFIG=x', 'ENV LD_PRELOAD=/x.so', 'ENV NODE_OPTIONS=--require=/x.js', 'ENV BASH_ENV=/x', 'ENV NODE_TLS_REJECT_UNAUTHORIZED=0', 'ENV HTTPS_PROXY=http://evil:3128', 'ENV https_proxy=http://evil:3128']) {
       refused(swap(SINGLE, 'ENV NODE_ENV=production', line), /ENV|ARG/);
     }
-    expect(problems(swap(SINGLE, 'ENV NODE_ENV=production', 'ENV NODE_ENV=production PORT=3000 PATH=/app/node_modules/.bin:$PATH'))).toEqual([]);
+    expect(problems(swap(SINGLE, 'ENV NODE_ENV=production', 'ENV NODE_ENV=production PORT=3000'))).toEqual([]);
   });
 
   it('dockerfile: EXPOSE ≠ port, port outside 1..65535 → violation', () => {
@@ -275,7 +275,7 @@ describe('dockerfile rules: users, secrets, ports, installs', () => {
   });
 
   it('WORKDIR and LABEL arguments are plain', () => {
-    for (const wd of ['WORKDIR /app', 'WORKDIR app', 'WORKDIR /app/sub-dir_1.0']) expect(problems(swap(SINGLE, 'WORKDIR /app', wd)), wd).toEqual([]);
+    for (const wd of ['WORKDIR /app', 'WORKDIR /app/sub-dir_1.0']) expect(problems(swap(SINGLE, 'WORKDIR /app', wd)), wd).toEqual([]);
     for (const wd of ['WORKDIR $HOME', 'WORKDIR /a b', 'WORKDIR', 'WORKDIR /a;b']) refused(swap(SINGLE, 'WORKDIR /app', wd), /WORKDIR/);
   });
 });

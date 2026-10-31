@@ -203,7 +203,7 @@ describe('createDockerfile: violations, one retry with the list, then a throw', 
     const withKey = SINGLE().replace('ENV NODE_ENV=production', `ENV ${fake.assign('API_' + 'KEY', 'abc')}`);
     const m = make([ans(withKey), ans(SINGLE())]);
     const out = await m.run();
-    expect(m.ai.calls[1]?.user).toMatch(/API_.*looks like a secret/);
+    expect(m.ai.calls[1]?.user).toMatch(/API_.*not a name pipegen allows/);
     expect(out.files[0]?.content).not.toMatch(/API_/);
   });
 

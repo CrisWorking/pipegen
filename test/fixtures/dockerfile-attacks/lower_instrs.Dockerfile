@@ -5,6 +5,6 @@ RUN npm ci --omit=dev --ignore-scripts
 COPY . .
 EXPOSE 3000
 run npm run build
-env A=1
+env NODE_ENV=test
 USER node
 CMD ["node", "index.js"]

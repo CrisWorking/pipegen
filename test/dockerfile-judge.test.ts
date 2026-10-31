@@ -78,6 +78,17 @@ describe('dockerfile judge', () => {
     expect(problems(df(run('start')), mkDraft([svc({ scripts: ['start'] })]))).toEqual([]);
   });
 
+  it('C1: the judge takes the scripts from the draft\'s service, so npm run <name> with a name the service lacks is refused', () => {
+    const run = (name: string): string => SINGLE.replace('COPY . .', `COPY . .\nRUN npm run ${name}`);
+    // the same file passes the leaf only for the scripts the service has
+    expect(problems(df(run('lint')), mkDraft([svc({ scripts: ['start'] })])).join()).toMatch(/npm run/);
+    expect(problems(df(run('lint')), mkDraft([svc({ scripts: ['start', 'lint'] })]))).toEqual([]);
+    expect(problems(df(run('lint')), mkDraft([svc({ scripts: [] })])).join()).toMatch(/npm run/);
+    // and CMD
+    expect(problems(df(SINGLE.replace('CMD ["npm", "start"]', 'CMD ["npm", "run", "serve"]')), mkDraft([svc({ scripts: ['start'] })])).join()).toMatch(/CMD/);
+    expect(problems(df(SINGLE.replace('CMD ["npm", "start"]', 'CMD ["npm", "run", "serve"]')), mkDraft([svc({ scripts: ['start', 'serve'] })]))).toEqual([]);
+  });
+
   it('refuses a Dockerfile of a folder no service owns, an edit, and the wrong part', () => {
     expect(createdFileProblems(df(SINGLE, 'other/Dockerfile'), mkDraft()).claimed).toBe(false);
     expect(problems({ ...df(), edited: { original: '' } }).join()).toMatch(/written whole/);
