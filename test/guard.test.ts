@@ -6,6 +6,7 @@ import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { guardCreatedFiles, gitBlobSha, type BaseTree, type GuardCtx } from '../src/create/guard.js';
+import { closureFromLocks, type ReviewedClosure } from '../src/create/reviewed-closure.js';
 import { emptyRepoFiles } from '../src/read/quality.js';
 import type { CreatedFile, RepoProfile } from '../src/types.js';
 import { profile, service } from './helpers/render.js';
@@ -19,7 +20,7 @@ function repo(files: Record<string, string> = {}): string {
   for (const [p, t] of Object.entries(files)) { mkdirSync(join(dir, dirname(p)), { recursive: true }); writeFileSync(join(dir, p), t); }
   return dir;
 }
-const base = (files: Record<string, string> = {}): BaseTree => new Map(Object.entries(files).map(([p, t]) => [p, { sha: gitBlobSha(t), read: async () => t }]));
+const base = (files: Record<string, string> = {}, modes: Record<string, string> = {}, complete = true): BaseTree => ({ complete, entries: new Map(Object.entries(files).map(([p, t]) => [p, { sha: gitBlobSha(t), mode: modes[p] ?? '100644', read: async () => t }])) });
 const prof = (paths: string[] = ['.']): RepoProfile => ({ ...profile(paths.map((p, i) => service({ name: `s${i}`, path: p }))), repoFiles: emptyRepoFiles() });
 const ctx = (root: string, over: Partial<GuardCtx> = {}): GuardCtx => ({ root, baseTree: base(), installRecord: null, profile: prof(), ...over });
 const file = (path: string, content = 'x\n', over: Partial<CreatedFile> = {}): CreatedFile => ({ path, content, part: 'docker', reason: 't', repo: 'app', ...over });
@@ -93,9 +94,9 @@ describe('guard: create-only (#97)', () => {
 
 describe('guard: edits through edited.original', () => {
   it('original equal to disk and base tree: ok', async () => {
-    const root = repo({ 'package.json': PJ });
-    const c = ctx(root, { baseTree: base({ 'package.json': PJ }) });
-    expect(await okPaths([edit('package.json', PJ, PJ_NEW, { needsConfirm: true })], c)).toEqual(['package.json']);
+    const root = repo({ CODEOWNERS: 'a\n' });
+    const c = ctx(root, { baseTree: base({ CODEOWNERS: 'a\n' }) });
+    expect(await okPaths([edit('CODEOWNERS', 'a\n', 'a\nb\n', { part: 'codeowners' })], c)).toEqual(['CODEOWNERS']);
   });
   it('original different from the disk: refused', async () => {
     const root = repo({ 'package.json': `${PJ}\n` });
@@ -131,9 +132,9 @@ describe('guard: edits through edited.original', () => {
   });
   it('a base tree entry that can not be read as text, or a malformed marker, is refused', async () => {
     const root = repo({ CODEOWNERS: 'a\n' });
-    const unreadable: BaseTree = new Map([['CODEOWNERS', { sha: gitBlobSha('a\n'), read: async () => null }]]);
+    const unreadable: BaseTree = { complete: true, entries: new Map([['CODEOWNERS', { sha: gitBlobSha('a\n'), mode: '100644', read: async () => null }]]) };
     expect(await reasons([edit('CODEOWNERS', 'a\n', 'a\nb\n', { part: 'codeowners' })], ctx(root, { baseTree: unreadable }))).toMatch(/default branch could not be read/);
-    const throwing: BaseTree = new Map([['CODEOWNERS', { sha: gitBlobSha('a\n'), read: async () => { throw new Error('boom'); } }]]);
+    const throwing: BaseTree = { complete: true, entries: new Map([['CODEOWNERS', { sha: gitBlobSha('a\n'), mode: '100644', read: async () => { throw new Error('boom'); } }]]) };
     expect(await reasons([edit('CODEOWNERS', 'a\n', 'a\nb\n', { part: 'codeowners' })], ctx(root, { baseTree: throwing }))).toMatch(/default branch could not be read/);
     const bad = edit('CODEOWNERS', 'a\n', 'a\nb\n', { part: 'codeowners', edited: { original: 5 } as unknown as { original: string } });
     expect(await reasons([bad], ctx(repo(), {}))).toMatch(/malformed/);
@@ -323,14 +324,37 @@ describe('guard: v0.2 edits', () => {
   });
 });
 
+// ---------- the B2 pair: package.json + package-lock.json ----------
+
+const sri = (seed: string): string => `sha512-${createHash('sha512').update(seed).digest('base64')}`;
+const ent = (name: string, version: string, extra: object = {}): Record<string, unknown> => ({ version, resolved: `https://registry.npmjs.org/${name}/-/${name.slice(name.indexOf('/') + 1)}-${version}.tgz`, integrity: sri(`${name}@${version}`), ...extra });
+const lockText = (dev: object, pkgs: object): string => JSON.stringify({ name: 'app', version: '1.0.0', lockfileVersion: 3, requires: true, packages: { '': { name: 'app', version: '1.0.0', devDependencies: dev }, ...pkgs } }, null, 2);
+const TS = { 'node_modules/typescript': ent('typescript', '5.6.0', { dev: true }) };
+const ADDED = { 'node_modules/vitest': ent('vitest', '5.0.5', { dev: true }), 'node_modules/@vitest/coverage-v8': ent('@vitest/coverage-v8', '5.0.5', { dev: true }), 'node_modules/c8': ent('c8', '12.0.0', { dev: true }) };
+const LOCK_OLD = lockText({ typescript: '5.6.0' }, TS);
+const LOCK_NEW = lockText({ typescript: '5.6.0', vitest: '5.0.5', '@vitest/coverage-v8': '5.0.5', c8: '12.0.0' }, { ...TS, ...ADDED });
+const pin = (name: string, version: string) => ({ name, version, integrity: sri(`${name}@${version}`) });
+const closureLock = (root: object, pkgs: object): string => JSON.stringify({ name: 'closure', version: '1.0.0', lockfileVersion: 3, requires: true, packages: { '': { name: 'closure', version: '1.0.0', dependencies: root }, ...pkgs } });
+const CLOSURE: ReviewedClosure = closureFromLocks([
+  { text: closureLock({ vitest: '5.0.5', '@vitest/coverage-v8': '5.0.5' }, { 'node_modules/vitest': ADDED['node_modules/vitest'], 'node_modules/@vitest/coverage-v8': ADDED['node_modules/@vitest/coverage-v8'] }), pins: [pin('vitest', '5.0.5'), pin('@vitest/coverage-v8', '5.0.5')] },
+  { text: closureLock({ c8: '12.0.0' }, { 'node_modules/c8': ADDED['node_modules/c8'] }), pins: [pin('c8', '12.0.0')] },
+]);
+/** Both files of a service folder (`dir` '' = the root), on disk and in the base tree. */
+const pairRepo = (dir = '', over: { pj?: string; lock?: string; extra?: Record<string, string> } = {}) => {
+  const pre = dir === '' ? '' : `${dir}/`;
+  const files = { [`${pre}package.json`]: over.pj ?? PJ, [`${pre}package-lock.json`]: over.lock ?? LOCK_OLD, ...(over.extra ?? {}) };
+  return { root: repo(files), baseTree: base(files), pre };
+};
+const pairEdits = (pre: string, pjNew: string, lockNew: string, pjOld = PJ, lockOld = LOCK_OLD): CreatedFile[] => [edit(`${pre}package.json`, pjOld, pjNew, { needsConfirm: true }), edit(`${pre}package-lock.json`, lockOld, lockNew, { needsConfirm: true })];
+
 describe('guard: package.json (B2)', () => {
-  const run = async (next: object | string, original: string = PJ) => {
-    const root = repo({ 'package.json': original });
+  const run = async (next: object | string, original: string = PJ, over: Partial<GuardCtx> = {}) => {
+    const r = pairRepo('', { pj: original });
     const content = typeof next === 'string' ? next : JSON.stringify(next, null, 2);
-    return reasons([edit('package.json', original, content, { needsConfirm: true })], ctx(root, { baseTree: base({ 'package.json': original }) }));
+    return reasons(pairEdits('', content, LOCK_NEW, original), ctx(r.root, { baseTree: r.baseTree, closure: CLOSURE, ...over }));
   };
   const pj = JSON.parse(PJ) as Record<string, Record<string, string>>;
-  it('the B2 additions with scripts.test are ok', async () => {
+  it('the B2 additions with scripts.test, with their lock, are ok', async () => {
     expect(await run(PJ_NEW)).toBe('');
   });
   it('a change to scripts.build, a lifecycle script, c8/prettier/renovate or dependencies is refused', async () => {
@@ -345,62 +369,97 @@ describe('guard: package.json (B2)', () => {
     const withJest = JSON.stringify({ ...pj, scripts: { ...pj.scripts, test: 'jest' } }, null, 2);
     expect(await run({ ...pj, scripts: { ...pj.scripts, test: 'vitest run' } }, withJest)).toMatch(/scripts\.test/);
     const dflt = JSON.stringify({ ...pj, scripts: { ...pj.scripts, test: 'echo "Error: no test specified" && exit 1' } }, null, 2);
-    expect(await run({ ...pj, scripts: { ...pj.scripts, test: 'vitest run' } }, dflt)).toBe('');
+    expect(await run({ ...pj, scripts: { ...pj.scripts, test: 'vitest run' }, devDependencies: JSON.parse(PJ_NEW).devDependencies }, dflt)).toBe('');
   });
   it('devDependencies only from the B2 table at exact versions', async () => {
     expect(await run({ ...pj, devDependencies: { ...pj.devDependencies, vitest: '^5.0.5' } })).toMatch(/devDependencies/);
     expect(await run({ ...pj, devDependencies: { ...pj.devDependencies, eslint: '9.0.0' } })).toMatch(/devDependencies/);
     expect(await run({ ...pj, devDependencies: { ...pj.devDependencies, typescript: '5.7.0' } })).toMatch(/typescript/);
   });
-  it('a package.json in a service folder is judged the same', async () => {
-    const root = repo({ 'api/package.json': PJ });
-    const c = ctx(root, { profile: prof(['api']), baseTree: base({ 'api/package.json': PJ }) });
-    expect(await okPaths([edit('api/package.json', PJ, PJ_NEW, { needsConfirm: true })], c)).toEqual(['api/package.json']);
-    expect(await reasons([edit('api/package.json', PJ, PJ_NEW.replace('tsc', 'evil'), { needsConfirm: true })], c)).toMatch(/scripts\.build/);
+  it('fix round 1 (2): a reordered exports or typesVersions in package.json is refused', async () => {
+    const o = { ...pj, exports: { '.': { import: './a.mjs', default: './evil.js' } } };
+    const pjOld = JSON.stringify(o, null, 2);
+    const next = { ...JSON.parse(PJ_NEW), exports: { '.': { default: './evil.js', import: './a.mjs' } } };
+    expect(await run(next, pjOld)).toMatch(/changes `exports`/);
+  });
+  it('a package.json in a service folder is judged the same, with its own lock', async () => {
+    const r = pairRepo('api');
+    const c = ctx(r.root, { profile: prof(['api']), baseTree: r.baseTree, closure: CLOSURE });
+    expect(await okPaths(pairEdits('api/', PJ_NEW, LOCK_NEW), c)).toEqual(['api/package.json', 'api/package-lock.json']);
+    expect(await reasons(pairEdits('api/', PJ_NEW.replace('tsc', 'evil'), LOCK_NEW), c)).toMatch(/scripts\.build/);
+  });
+  it('fix round 1 (8): B2 scope: the lock must be edited with it, the service must be npm, no other manager\'s lock, no workspaces', async () => {
+    const r = pairRepo('');
+    const c = ctx(r.root, { baseTree: r.baseTree, closure: CLOSURE });
+    expect(await reasons([edit('package.json', PJ, PJ_NEW, { needsConfirm: true })], c)).toMatch(/package-lock\.json.*same batch|edited together/);
+    const pnpm = ctx(r.root, { baseTree: r.baseTree, closure: CLOSURE, profile: { ...prof(), services: [service({ name: 'a', path: '.', packageManager: 'pnpm' })] } });
+    expect(await reasons(pairEdits('', PJ_NEW, LOCK_NEW), pnpm)).toMatch(/not npm/);
+    for (const other of ['pnpm-lock.yaml', 'yarn.lock', 'bun.lock', 'bun.lockb', 'npm-shrinkwrap.json']) {
+      const withOther = pairRepo('', { extra: { [other]: 'x' } });
+      expect(await reasons(pairEdits('', PJ_NEW, LOCK_NEW), ctx(withOther.root, { baseTree: withOther.baseTree, closure: CLOSURE })), other).toMatch(new RegExp(other.replace('.', '\\.')));
+    }
+    // a foreign lock only on the disk counts too
+    const localOnly = pairRepo('');
+    writeFileSync(join(localOnly.root, 'pnpm-lock.yaml'), 'x');
+    expect(await reasons(pairEdits('', PJ_NEW, LOCK_NEW), ctx(localOnly.root, { baseTree: localOnly.baseTree, closure: CLOSURE }))).toMatch(/pnpm-lock\.yaml/);
+    // a foreign lock only in the base tree counts too
+    const remoteOnly = pairRepo('');
+    expect(await reasons(pairEdits('', PJ_NEW, LOCK_NEW), ctx(remoteOnly.root, { baseTree: base({ 'package.json': PJ, 'package-lock.json': LOCK_OLD, 'yarn.lock': 'x' }), closure: CLOSURE }))).toMatch(/yarn\.lock/);
+    const ws = JSON.stringify({ ...pj, workspaces: ['a'] }, null, 2);
+    expect(await run({ ...JSON.parse(PJ_NEW), workspaces: ['a'] }, ws)).toMatch(/workspaces/);
   });
 });
 
-describe('guard: package-lock.json (B2)', () => {
-  const sri = (seed: string): string => `sha512-${createHash('sha512').update(seed).digest('base64')}`;
-  const ent = (name: string, version: string, extra: object = {}): Record<string, unknown> => ({ version, resolved: `https://registry.npmjs.org/${name}/-/${name.slice(name.indexOf('/') + 1)}-${version}.tgz`, integrity: sri(`${name}@${version}`), ...extra });
-  const lock = (dev: object, pkgs: object): string => JSON.stringify({ name: 'app', version: '1.0.0', lockfileVersion: 3, requires: true, packages: { '': { name: 'app', version: '1.0.0', devDependencies: dev }, ...pkgs } }, null, 2);
-  const OLD = lock({ typescript: '5.6.0' }, { 'node_modules/typescript': ent('typescript', '5.6.0', { dev: true }) });
-  const NEW = lock({ typescript: '5.6.0', vitest: '5.0.5', '@vitest/coverage-v8': '5.0.5', c8: '12.0.0' }, {
-    'node_modules/typescript': ent('typescript', '5.6.0', { dev: true }),
-    'node_modules/vitest': ent('vitest', '5.0.5', { dev: true }), 'node_modules/@vitest/coverage-v8': ent('@vitest/coverage-v8', '5.0.5', { dev: true }), 'node_modules/c8': ent('c8', '12.0.0', { dev: true }),
-  });
-  const run = async (next: string, original = OLD, extra: Partial<GuardCtx> = {}) => {
-    const root = repo({ 'package-lock.json': original, 'package.json': PJ });
-    return reasons([edit('package-lock.json', original, next, { needsConfirm: true })], ctx(root, { baseTree: base({ 'package-lock.json': original, 'package.json': PJ }), ...extra }));
+describe('guard: package-lock.json (B2, reviewed closure)', () => {
+  const run = async (next: string, original = LOCK_OLD, over: Partial<GuardCtx> = {}) => {
+    const r = pairRepo('', { lock: original });
+    return reasons(pairEdits('', PJ_NEW, next, PJ, original), ctx(r.root, { baseTree: r.baseTree, closure: CLOSURE, ...over }));
   };
-  it('a lock change explained by the added devDependencies is ok', async () => {
-    expect(await run(NEW)).toBe('');
+  it('a lock change whose added entries are the reviewed ones is ok', async () => {
+    expect(await run(LOCK_NEW)).toBe('');
+  });
+  it('without a reviewed closure (the state until D6 makes the data) every lock edit is refused', async () => {
+    expect(await run(LOCK_NEW, LOCK_OLD, { closure: undefined })).toMatch(/no reviewed closure/);
+    expect(await run(LOCK_NEW, LOCK_OLD, { closure: null })).toMatch(/no reviewed closure/);
   });
   it('a change to any other entry is refused', async () => {
-    const changed = JSON.parse(NEW) as { packages: Record<string, Record<string, unknown>> };
+    const changed = JSON.parse(LOCK_NEW) as { packages: Record<string, Record<string, unknown>> };
     changed.packages['node_modules/typescript'].version = '5.9.9';
     expect(await run(JSON.stringify(changed, null, 2))).toMatch(/typescript/);
   });
-  it('a new entry outside the closure is refused', async () => {
-    const extra = JSON.parse(NEW) as { packages: Record<string, unknown> };
-    extra.packages['node_modules/left-pad'] = ent('left-pad', '1.3.0');
+  it('a new entry that is not reviewed is refused; a reviewed one with a forged field too', async () => {
+    const extra = JSON.parse(LOCK_NEW) as { packages: Record<string, unknown> };
+    extra.packages['node_modules/left-pad'] = ent('left-pad', '1.3.0', { dev: true });
     expect(await run(JSON.stringify(extra, null, 2))).toMatch(/left-pad/);
+    const forged = JSON.parse(LOCK_NEW) as { packages: Record<string, Record<string, unknown>> };
+    forged.packages['node_modules/vitest'].hasInstallScript = true;
+    expect(await run(JSON.stringify(forged, null, 2))).toMatch(/vitest/);
   });
   it('the lock and package.json in one batch must agree on devDependencies', async () => {
-    const root = repo({ 'package-lock.json': OLD, 'package.json': PJ });
-    const c = ctx(root, { baseTree: base({ 'package-lock.json': OLD, 'package.json': PJ }) });
-    const both = [edit('package.json', PJ, PJ_NEW, { needsConfirm: true }), edit('package-lock.json', OLD, NEW, { needsConfirm: true })];
-    expect(await reasons(both, c)).toBe('');
+    const r = pairRepo('');
+    const c = ctx(r.root, { baseTree: r.baseTree, closure: CLOSURE });
     const onlyVitest = PJ_NEW.replace(/,\s*"c8": "12.0.0"/, '');
-    expect(await reasons([edit('package.json', PJ, onlyVitest, { needsConfirm: true }), edit('package-lock.json', OLD, NEW, { needsConfirm: true })], c)).toMatch(/package\.json/);
+    expect(await reasons(pairEdits('', onlyVitest, LOCK_NEW), c)).toMatch(/package\.json/);
+  });
+  it('fix round 1 (8): a lock edit without its package.json edit in the batch is refused', async () => {
+    const r = pairRepo('');
+    expect(await reasons([edit('package-lock.json', LOCK_OLD, LOCK_NEW, { needsConfirm: true })], ctx(r.root, { baseTree: r.baseTree, closure: CLOSURE }))).toMatch(/package\.json.*same batch|edited together/);
   });
   it('a lock larger than 1 MB is read (lockfiles are big)', async () => {
-    const pkgs: Record<string, object> = { 'node_modules/typescript': ent('typescript', '5.6.0', { dev: true }) };
+    const pkgs: Record<string, object> = { ...TS };
     for (let i = 0; i < 6000; i++) pkgs[`node_modules/pkg-${i}`] = ent(`pkg-${i}`, '1.0.0', { dev: true });
-    const old = lock({ typescript: '5.6.0' }, pkgs);
+    const old = lockText({ typescript: '5.6.0' }, pkgs);
     expect(old.length).toBeGreaterThan(1_000_000);
-    const next = lock({ typescript: '5.6.0', c8: '12.0.0' }, { ...pkgs, 'node_modules/c8': ent('c8', '12.0.0', { dev: true }) });
+    const next = lockText({ typescript: '5.6.0', vitest: '5.0.5', '@vitest/coverage-v8': '5.0.5', c8: '12.0.0' }, { ...pkgs, ...ADDED });
     expect(await run(next, old)).toBe('');
+  });
+  it('fix round 1 (11): the 8 MiB cap counts bytes, not UTF-16 units', async () => {
+    const big = JSON.parse(LOCK_NEW) as { packages: Record<string, Record<string, unknown>> } & Record<string, unknown>;
+    big.padding = 'é'.repeat(4_300_000);   // 4.3M characters, 8.6 MB in UTF-8
+    const text = JSON.stringify(big, null, 2);
+    expect(text.length).toBeLessThan(8 * 1024 * 1024);
+    expect(Buffer.byteLength(text)).toBeGreaterThan(8 * 1024 * 1024);
+    expect(await run(text)).toMatch(/over 8 MiB/);
   });
 });
 
@@ -457,5 +516,63 @@ describe('guard: the result', () => {
   it('gitBlobSha is git\'s blob sha', () => {
     expect(gitBlobSha('hello\n')).toBe('ce013625030ba8dba906f756967f9e9ca394464a');
     expect(gitBlobSha('')).toBe('e69de29bb2d1d6434b8b29ae775ad8c2e48c5391');
+  });
+});
+
+describe('guard: fix round 1 minors', () => {
+  it('(3) a NEW file with edited {original: ""} still gets the app-source check, and needs a registry edit rule', async () => {
+    const c = ctx(repo(), { profile: prof(['.', 'api']) });
+    expect(await reasons([edit('api/src/evil.ts', '', 'x')], c)).toMatch(/source code|does not edit/);
+    expect(await reasons([file('api/src/evil.ts', 'x')], c)).toMatch(/source code/);
+    expect(await reasons([edit('tools/note.txt', '', 'x')], c)).toMatch(/does not edit/);
+    expect(await okPaths([edit('.github/CODEOWNERS', '', '# x\n', { part: 'codeowners' })], c)).toEqual(['.github/CODEOWNERS']);
+  });
+  it('(4) full Unicode case folding: dotless i, long s and the Kelvin sign clash with their ASCII forms, local and base, files and folders', async () => {
+    const cases: [string, string][] = [['Dockerfıle', 'Dockerfile'], ['ſrc/a.txt', 'src/b.txt'], ['K.txt', 'k.txt'], ['Docﬀ.md', 'Docff.md'], ['DocKerfile', 'Dockerfile']];
+    for (const [existing, created] of cases) {
+      expect(await reasons([file(created)], ctx(repo({ [existing]: 'x' }))), `local ${existing}`).toMatch(/letter case/);
+      expect(await reasons([file(created)], ctx(repo(), { baseTree: base({ [existing]: 'x' }) })), `base ${existing}`).toMatch(/letter case/);
+    }
+    expect(await reasons([file('a/Dockerfile'), file('A/Dockerfıle')], ctx(repo()))).toMatch(/ignoring letter case/);
+  });
+  it('(5) clashes are checked per repo: the app and the central CODEOWNERS do not refuse each other', async () => {
+    const files = [edit('.github/CODEOWNERS', '', '# x\n', { part: 'codeowners' }), edit('.github/CODEOWNERS', '', '# y\n', { part: 'codeowners', repo: 'central' })];
+    const app = await guardCreatedFiles(files, ctx(repo()));
+    expect(app.ok.map((f) => f.repo)).toEqual(['app']);
+    const central = await guardCreatedFiles(files, ctx(repo(), { repo: 'central' }));
+    expect(central.ok.map((f) => f.repo)).toEqual(['central']);
+    // two app files that clash still do
+    expect((await guardCreatedFiles([file('X.txt'), file('x.txt')], ctx(repo()))).ok).toEqual([]);
+  });
+  it('(6) a replacement needs the record\'s part, a registry rule of mode new on the path, and the app repo', async () => {
+    const user = 'FROM node:22\n';
+    const root = repo({ Dockerfile: user, 'README.md': 'r', 'CODEOWNERS': 'o' });
+    const b = base({ Dockerfile: user, 'README.md': 'r', CODEOWNERS: 'o' });
+    const rec = (path: string, text: string, part: 'docker' | 'tests' | 'docs' = 'docker') => ({ files: [{ path, part, sha: gitBlobSha(text), created: true }] });
+    expect(await okPaths([file('Dockerfile', 'FROM pipegen\n')], ctx(root, { baseTree: b, installRecord: rec('Dockerfile', user) }))).toEqual(['Dockerfile']);
+    expect(await reasons([file('Dockerfile', 'FROM pipegen\n')], ctx(root, { baseTree: b, installRecord: rec('Dockerfile', user, 'tests') }))).toMatch(/already exists/);
+    expect(await reasons([file('README.md', 'n', { part: 'docs' })], ctx(root, { baseTree: b, installRecord: rec('README.md', 'r', 'docs') }))).toMatch(/already exists/);
+    expect(await reasons([file('CODEOWNERS', 'n', { part: 'codeowners' })], ctx(root, { baseTree: b, installRecord: rec('CODEOWNERS', 'o', 'docs') }))).toMatch(/already exists/);
+    expect(await reasons([file('Dockerfile', 'x', { repo: 'central' })], ctx(root, { baseTree: b, repo: 'central', installRecord: rec('Dockerfile', user) }))).toMatch(/already exists/);
+  });
+  it('(7) the base tree carries modes: a symlink or a submodule at or above a path is refused, and a truncated listing refuses everything', async () => {
+    const lnk = ctx(repo(), { baseTree: base({ CODEOWNERS: 'target\n' }, { CODEOWNERS: '120000' }) });
+    expect(await reasons([edit('CODEOWNERS', 'target\n', 'x', { part: 'codeowners' })], { ...lnk, root: repo({ CODEOWNERS: 'target\n' }) })).toMatch(/symbolic link on the default branch/);
+    expect(await reasons([file('CODEOWNERS', 'x')], lnk)).toMatch(/symbolic link on the default branch/);
+    const sub = ctx(repo(), { baseTree: base({ 'vendor/lib': 'a'.repeat(40) }, { 'vendor/lib': '160000' }) });
+    expect(await reasons([file('vendor/lib/x.txt')], sub)).toMatch(/submodule/);
+    expect(await reasons([file('vendor/lib')], sub)).toMatch(/submodule/);
+    const link2 = ctx(repo(), { baseTree: base({ 'a/b': 'x' }, { 'a/b': '120000' }) });
+    expect(await reasons([file('a/b/c.txt')], link2)).toMatch(/symbolic link on the default branch/);
+    const cut = ctx(repo(), { baseTree: base({}, {}, false) });
+    expect(await reasons([file('Dockerfile')], cut)).toMatch(/truncated/);
+    expect((await guardCreatedFiles([file('Dockerfile')], cut)).ok).toEqual([]);
+  });
+  it('(11) an owned file is read with the ordinary 1 MB cap: a bigger one is kept, not replaced', async () => {
+    const text = 'y'.repeat(2 * 1024 * 1024);
+    const root = repo({ Dockerfile: text });
+    const r = await guardCreatedFiles([file('Dockerfile', 'FROM x\n')], ctx(root, { baseTree: base({ Dockerfile: text }), installRecord: { files: [{ path: 'Dockerfile', part: 'docker', sha: gitBlobSha(text), created: true }] } }));
+    expect(r.ok).toEqual([]);
+    expect(r.notes.join(' ')).toMatch(/changed since/);
   });
 });

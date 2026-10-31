@@ -20,6 +20,9 @@
 //                    replaced (with a note). If the user changed it, it is KEPT with a note (neither ok nor refused);
 //   new files    package.json and package-lock.json must already exist; new app source (a code file inside a service folder that is not
 //                a test and that no registry rule claims) is refused.
+// The install record is VERIFIED INPUT: Plan G must check it (that pipegen wrote it: its sha against the local state and the setup PR) before it is
+// passed in. The guard still allows a replacement only on a path a registry rule of mode `new` claims, with the part the record gives, in the app repo.
+// The base tree carries modes (a symlink 120000 or a submodule 160000 at or above a path is refused) and says whether it is complete.
 // The guard checks a moment in time. Delivery (Plan G) writes through the Git Data API and repeats the create-only check against the base
 // tree it writes onto; the local check here is advice for the person running pipegen, not a lock.
 import { createHash } from 'node:crypto';
@@ -31,11 +34,15 @@ import { CODE_FILE_RE, isTestFile } from '../read/manifest.js';
 import { readTextLimitedWithReason, SKIP_REASON, READ_LIMITS } from '../read/limits.js';
 import type { CreatedFile, InstallRecord, PipelineDraft, RepoProfile } from '../types.js';
 import { lockProblems, packageJsonProblems } from './package-rules.js';
+import type { ReviewedClosure } from './reviewed-closure.js';
 
-/** One file of the delivery base tree (the default branch head): its blob sha and its text (null: not readable as text). */
-export interface BaseEntry { sha: string; read(): Promise<string | null> }
-/** The delivery base tree: blob path to entry. Plan G builds it from `GET /git/trees/<head>?recursive=1`; a submodule counts as a path too. */
-export type BaseTree = ReadonlyMap<string, BaseEntry>;
+/** One entry of the delivery base tree (the default branch head): its git mode (`100644`, `120000` symlink, `160000` submodule), blob sha and text (null: not readable as text). */
+export interface BaseEntry { sha: string; mode: string; read(): Promise<string | null> }
+/**
+ * The delivery base tree: blob path to entry (Plan G builds it from `GET /git/trees/<head>?recursive=1`; submodules and symlinks are entries too).
+ * `complete` is false when GitHub truncated the listing: nothing can then be proven absent, so every file is refused.
+ */
+export interface BaseTree { complete: boolean; entries: ReadonlyMap<string, BaseEntry> }
 
 export interface GuardCtx {
   /** The repository folder on disk. */
@@ -48,8 +55,8 @@ export interface GuardCtx {
   repo?: 'app' | 'central';
   /** Existing workflow paths pipegen may edit through `inserted`. */
   allowWorkflowInsert?: readonly string[];
-  /** The reviewed integrity of the B2 pins (name to `sha512-...`), checked in a lock edit when given. */
-  integrity?: Readonly<Record<string, string>>;
+  /** The reviewed closure of the B2 packages (reviewed-closure.ts). Without it every package-lock.json edit is refused. */
+  closure?: ReviewedClosure | null;
 }
 export interface GuardResult {
   ok: CreatedFile[];
@@ -58,6 +65,8 @@ export interface GuardResult {
 }
 
 const LOCK_MAX_BYTES = 8 * 1024 * 1024;
+/** Lock files of other package managers: with one beside a package.json, pipegen edits nothing there (B2 scope: npm only). */
+const OTHER_LOCKS: readonly string[] = ['pnpm-lock.yaml', 'yarn.lock', 'bun.lock', 'bun.lockb', 'npm-shrinkwrap.json'];
 const PYTHON_NAMES: readonly string[] = ['pyproject.toml', 'requirements-dev.txt'];
 
 /** git's blob sha of a text (what the install record and the trees API hold). */
@@ -66,6 +75,8 @@ export function gitBlobSha(text: string): string {
   return createHash('sha1').update(`blob ${body.length}\0`).update(body).digest('hex');
 }
 
+/** Letter-case folding as a filesystem may do it: NFKC, then upper and back to lower case (maps dotless i, long s, the Kelvin sign and ligatures to ASCII). */
+const fold = (s: string): string => s.normalize('NFKC').toUpperCase().toLowerCase();
 const baseName = (p: string): string => p.slice(p.lastIndexOf('/') + 1);
 /** A repo-derived string made safe for a message: printable ASCII only, short. */
 const safe = (s: unknown): string => String(s).replace(/[^\x20-\x7e]/g, '?').slice(0, 80);
@@ -89,7 +100,7 @@ async function probeLocal(root: string, segs: readonly string[]): Promise<Local>
     let names: string[];
     try { names = await readdir(dir); } catch { return { kind: 'refuse', reason: `the folder of ${q(rel)} could not be listed, so pipegen can not tell what is there` }; }
     if (!names.includes(seg)) {
-      const clash = names.find((n) => n.toLowerCase() === seg.toLowerCase());
+      const clash = names.find((n) => fold(n) === fold(seg));
       return clash === undefined ? { kind: 'absent' } : { kind: 'refuse', reason: `${q(rel)} equals the existing ${q(clash)} ignoring letter case (a macOS or Windows checkout would merge them)` };
     }
     const path = join(dir, seg);
@@ -110,11 +121,11 @@ function indexBase(tree: BaseTree): BaseIndex {
   const lowerFiles = new Map<string, string>();
   const dirs = new Set<string>();
   const lowerDirs = new Map<string, string>();
-  for (const p of tree.keys()) {
-    lowerFiles.set(p.toLowerCase(), p);
-    for (let i = p.indexOf('/'); i >= 0; i = p.indexOf('/', i + 1)) { const d = p.slice(0, i); dirs.add(d); lowerDirs.set(d.toLowerCase(), d); }
+  for (const p of tree.entries.keys()) {
+    lowerFiles.set(fold(p), p);
+    for (let i = p.indexOf('/'); i >= 0; i = p.indexOf('/', i + 1)) { const d = p.slice(0, i); dirs.add(d); lowerDirs.set(fold(d), d); }
   }
-  return { files: tree, lowerFiles, dirs, lowerDirs };
+  return { files: tree.entries, lowerFiles, dirs, lowerDirs };
 }
 
 type Remote = { kind: 'absent' } | { kind: 'file'; entry: BaseEntry } | { kind: 'refuse'; reason: string };
@@ -123,9 +134,11 @@ function probeBase(ix: BaseIndex, segs: readonly string[]): Remote {
     const x = segs.slice(0, i).join('/');
     const last = i === segs.length;
     const entry = ix.files.get(x);
+    if (entry !== undefined && entry.mode === '120000') return { kind: 'refuse', reason: `${q(x)} is a symbolic link on the default branch, and pipegen never writes through or over one` };
+    if (entry !== undefined && entry.mode === '160000') return { kind: 'refuse', reason: `${q(x)} is a submodule on the default branch, and pipegen writes nothing in or over one` };
     if (entry !== undefined) return last ? { kind: 'file', entry } : { kind: 'refuse', reason: `a file can not be created under ${q(x)}, which is an existing file on the default branch` };
     if (ix.dirs.has(x)) { if (last) return { kind: 'refuse', reason: `${q(x)} is an existing folder on the default branch, so a file can not be created at that path` }; continue; }
-    const other = ix.lowerFiles.get(x.toLowerCase()) ?? ix.lowerDirs.get(x.toLowerCase());
+    const other = ix.lowerFiles.get(fold(x)) ?? ix.lowerDirs.get(fold(x));
     if (other !== undefined) return { kind: 'refuse', reason: `${q(x)} equals ${q(other)} on the default branch ignoring letter case (a macOS or Windows checkout would merge them)` };
     return { kind: 'absent' };
   }
@@ -144,14 +157,15 @@ function claimingRules(path: string, repo: 'app' | 'central', profile: RepoProfi
 const planeService = (raw: string): boolean => { const n = rootPrefix(raw); return n === '' || createdPathProblem(n) === null; };
 
 /** Created files in one batch that share a path ignoring case, or where one is the folder of another: all of them. */
-function batchClashes(files: readonly CreatedFile[]): Set<number> {
+function batchClashes(files: readonly CreatedFile[], repo: 'app' | 'central'): Set<number> {
   const bad = new Set<number>();
   const byLower = new Map<string, number[]>();
-  files.forEach((f, i) => { if (typeof f?.path === 'string') { const k = f.path.toLowerCase(); byLower.set(k, [...(byLower.get(k) ?? []), i]); } });
+  const mine = (f: CreatedFile): boolean => typeof f?.path === 'string' && f.repo === repo;   // the other repository's files are checked in their own call
+  files.forEach((f, i) => { if (mine(f)) { const k = fold(f.path); byLower.set(k, [...(byLower.get(k) ?? []), i]); } });
   for (const idx of byLower.values()) if (idx.length > 1) idx.forEach((i) => bad.add(i));
   files.forEach((f, i) => {
-    if (typeof f?.path !== 'string') return;
-    const segs = f.path.toLowerCase().split('/');
+    if (!mine(f)) return;
+    const segs = fold(f.path).split('/');
     for (let k = 1; k < segs.length; k++) for (const j of byLower.get(segs.slice(0, k).join('/')) ?? []) { bad.add(i); bad.add(j); }
   });
   return bad;
@@ -161,17 +175,12 @@ export async function guardCreatedFiles(files: readonly CreatedFile[], ctx: Guar
   const result: GuardResult = { ok: [], refused: [], notes: [] };
   const repo = ctx.repo ?? 'app';
   const ix = indexBase(ctx.baseTree);
-  const clashes = batchClashes(files);
+  const clashes = batchClashes(files, repo);
   const badServices = ctx.profile.services.map((s) => s.path).filter((p) => !planeService(p));
   for (const raw of badServices) result.notes.push(`The service folder ${JSON.stringify(safe(raw))} has characters or a shape pipegen does not write into (letters, digits, . _ - and / only), so pipegen creates no file there; add what that service needs by hand.`);
-  const lenient = badServices.map((p) => p.split('/').filter((s) => s !== '' && s !== '.').join('/').toLowerCase()).filter((p) => p !== '');
+  const lenient = badServices.map((p) => fold(p.split('/').filter((s) => s !== '' && s !== '.').join('/'))).filter((p) => p !== '');
   let rootOk = true;
   try { rootOk = (await stat(ctx.root)).isDirectory(); } catch { rootOk = false; }
-
-  const siblingPackageJson = (lockPath: string): string | undefined => {
-    const dir = lockPath.includes('/') ? lockPath.slice(0, lockPath.lastIndexOf('/') + 1) : '';
-    return files.find((f) => f?.repo === repo && f.path === `${dir}package.json`)?.content;
-  };
 
   async function judge(f: CreatedFile, i: number): Promise<Verdict> {
     if (typeof f !== 'object' || f === null) return refuse('this is not a file description');
@@ -182,8 +191,9 @@ export async function guardCreatedFiles(files: readonly CreatedFile[], ctx: Guar
     if (typeof f.content !== 'string') return refuse('the file has no text');
     if (clashes.has(i)) return refuse('another created file has the same path ignoring letter case, or is the folder of this one, and a path can not be both');
     if (PYTHON_NAMES.includes(baseName(f.path).toLowerCase())) return refuse('pipegen does not create or edit pyproject.toml or requirements-dev.txt in this version (Python support comes later)');
-    const lower = f.path.toLowerCase();
+    const lower = fold(f.path);
     if (lenient.some((p) => lower === p || lower.startsWith(`${p}/`))) return refuse('this file is inside a service folder whose name is outside the plain set of characters pipegen writes into, so it gets a note instead of a file');
+    if (!ctx.baseTree.complete) return refuse('the listing of the default branch was truncated by GitHub, so pipegen can not prove that this path is free there');
     if (!rootOk) return refuse('the repository folder could not be read, so pipegen can not check the file against it');
 
     const segs = f.path.split('/');
@@ -206,25 +216,26 @@ export async function guardCreatedFiles(files: readonly CreatedFile[], ctx: Guar
       if (f.inserted !== undefined) return refuse('the file marks an edit of an existing workflow, but that workflow does not exist');
       if (original !== undefined && original !== '') return refuse(`the file claims to edit an original text, but ${q(f.path)} does not exist`);
       if (isPkg) return refuse(`${q(f.path)} must already exist: pipegen edits a package.json or package-lock.json and never creates one`);
-      if (marker === undefined) {
-        const prefix = (r: string): boolean => r === '' || f.path.startsWith(`${r}/`);
-        const inService = ctx.profile.services.map((s) => rootPrefix(s.path)).filter(prefix).some((r) => {
-          const rel = r === '' ? f.path : f.path.slice(r.length + 1);
-          return CODE_FILE_RE.test(rel) && !isTestFile(rel);
-        });
-        if (inService && claimingRules(f.path, repo, ctx.profile).length === 0) return refuse(`${q(f.path)} would be new source code of your service, and pipegen writes tests, Docker files and pipeline files, never your application's source`);
-      }
+      const prefix = (r: string): boolean => r === '' || f.path.startsWith(`${r}/`);
+      const inService = ctx.profile.services.map((s) => rootPrefix(s.path)).filter(prefix).some((r) => {
+        const rel = r === '' ? f.path : f.path.slice(r.length + 1);
+        return CODE_FILE_RE.test(rel) && !isTestFile(rel);
+      });
+      const rules = claimingRules(f.path, repo, ctx.profile);
+      if (inService && rules.length === 0) return refuse(`${q(f.path)} would be new source code of your service, and pipegen writes tests, Docker files and pipeline files, never your application's source`);
+      if (f.edited !== undefined && !rules.some((r) => r.mode === 'edit')) return refuse(`pipegen does not edit ${q(f.path)}: it edits only the files it has a rule for (package.json, package-lock.json, CODEOWNERS, dependabot)`);
       return { kind: 'ok' };
     }
 
     // the path exists somewhere
     const where = onDisk ? 'in your repository' : 'on the default branch (the delivery base)';
     if (marker === undefined) {
-      const rec = isPkg ? undefined : ctx.installRecord?.files.find((r) => r.path === f.path && r.created === true);
+      const replaceable = !isPkg && repo === 'app' && claimingRules(f.path, repo, ctx.profile).some((r) => r.mode === 'new');
+      const rec = replaceable ? ctx.installRecord?.files.find((r) => r.path === f.path && r.created === true && r.part === f.part) : undefined;
       if (rec === undefined) return refuse(`${q(f.path)} already exists ${where}; pipegen never overwrites your files`);
       const same: boolean[] = [];
       if (onDisk) {
-        const r = await readTextLimitedWithReason(join(ctx.root, ...segs), ctx.root, LOCK_MAX_BYTES);
+        const r = await readTextLimitedWithReason(join(ctx.root, ...segs), ctx.root);
         same.push('text' in r && gitBlobSha(r.text) === rec.sha);
       }
       if (onBase) same.push((remote as { entry: BaseEntry }).entry.sha === rec.sha);
@@ -248,14 +259,24 @@ export async function guardCreatedFiles(files: readonly CreatedFile[], ctx: Guar
     if (baseText === null) return refuse(`${q(f.path)} on the default branch could not be read to compare it with its original`);
     if (baseText !== original) return refuse(`the original text pipegen worked from differs from ${q(f.path)} on the default branch`);
 
-    if (name === 'package.json') {
-      const p = packageJsonProblems(original as string, f.content);
-      if (p.length > 0) return refuse(p.join('; '));
-    } else if (name === 'package-lock.json') {
-      if (f.content.length > LOCK_MAX_BYTES) return refuse('the new package-lock.json is over 8 MiB');
-      const pkg = siblingPackageJson(f.path);
-      const p = lockProblems(original as string, f.content, { ...(pkg === undefined ? {} : { packageJson: pkg }), ...(ctx.integrity === undefined ? {} : { integrity: ctx.integrity }) });
-      if (p.length > 0) return refuse(p.slice(0, 5).join('; '));
+    if (name === 'package.json' || name === 'package-lock.json') {
+      const dir = f.path.includes('/') ? f.path.slice(0, f.path.lastIndexOf('/')) : '';
+      const pre = dir === '' ? '' : `${dir}/`;
+      const sibling = (n: string): CreatedFile | undefined => files.find((x) => x?.repo === repo && x.path === `${pre}${n}`);
+      if (name === 'package.json') {
+        const p = packageJsonProblems(original as string, f.content);
+        if (p.length > 0) return refuse(p.join('; '));
+      } else {
+        if (Buffer.byteLength(f.content, 'utf8') > LOCK_MAX_BYTES) return refuse('the new package-lock.json is over 8 MiB');
+        const pkg = sibling('package.json');
+        const p = lockProblems(original as string, f.content, { ...(pkg === undefined ? {} : { packageJson: pkg.content }), ...(ctx.closure === undefined ? {} : { closure: ctx.closure }) });
+        if (p.length > 0) return refuse(p.slice(0, 5).join('; '));
+      }
+      // B2 scope: one npm package with its own lock, edited together
+      if (sibling(name === 'package.json' ? 'package-lock.json' : 'package.json')?.edited === undefined) return refuse(`${q(f.path)} is edited together with ${q(`${pre}${name === 'package.json' ? 'package-lock.json' : 'package.json'}`)} in the same batch, or not at all: either one alone makes \`npm ci\` fail`);
+      const svc = ctx.profile.services.find((s) => rootPrefix(s.path) === dir);
+      if (svc === undefined || svc.packageManager !== 'npm') return refuse(`the service in ${q(dir === '' ? '.' : dir)} is not npm, and pipegen edits only npm packages in this version`);
+      for (const other of OTHER_LOCKS) if (ix.files.has(`${pre}${other}`) || (await probeLocal(ctx.root, `${pre}${other}`.split('/'))).kind !== 'absent') return refuse(`${q(`${pre}${other}`)} exists beside this package.json, so this is not a plain npm package; pipegen edits only those in this version`);
     }
     return { kind: 'ok' };
   }

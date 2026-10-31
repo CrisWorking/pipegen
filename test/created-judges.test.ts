@@ -393,6 +393,15 @@ describe('D0b fix round 1: CODEOWNERS re-run, symlink, overrides', () => {
     expect(codeownersLaterOverrides(after, paths, ['@alice', '@bob'])).toEqual(['/.github/workflows/deploy.yml @dev']);
     expect(codeownersLaterOverrides('', paths, ['@alice', '@bob'])).toEqual([]);
   });
+  it('D1 fix round 1 (10): wildcard user rules after the block that reach a protected path through the gate matcher are listed and refused', () => {
+    const PROT = ['.github/workflows/**', '.github/CODEOWNERS', 'CODEOWNERS'];
+    const hits = ['/.github/workflows/deploy.yml @dev', '/.github/workflows/de*.yml @dev', '/.github/work*/deploy.yml @dev', '/.github/w?rkflows/deploy.yml @dev', '/.github/**/deploy.yml @dev', '.github/*/deploy.yml @dev', '/.github/workflows/*.yml @dev', '**/deploy.yml @dev', 'de*.yml @dev', '/.github/work*/ @dev', '/.github/workflows/deploy.yml'];
+    for (const line of hits) expect(codeownersLaterOverrides(`${line}\n`, PROT, ['@alice', '@bob']), line).toEqual([line]);
+    // not protected, same owners, comments, or invalid lines GitHub skips (a bracket pattern is not read at all)
+    for (const line of ['/docs/*.md @dev', '/src/work*/x.ts @dev', '/.github/workflows/deploy.yml @alice @bob', '# /.github/workflows/x @dev', '/.github/workflows/[d]eploy.yml @dev', '/.githubs/work*/deploy.yml @dev']) expect(codeownersLaterOverrides(`${line}\n`, PROT, ['@alice', '@bob']), line).toEqual([]);
+    const original = `${OLD}/.github/work*/deploy.yml @dev\n`;
+    expect(text(coFile(replaceBlock(original, OLD, block), original), existCo, withFacts(OLD))).toMatch(/after the pipegen block/);
+  });
   it('D0b re-review m3: the recorded old block must start at a line start', () => {
     expect(codeownersReplace(`x ${OLD}`, OLD, block)).toBeNull();
     expect(codeownersReplace(`x\n${OLD}`, OLD, block)).toBe(`x\n${block}`);

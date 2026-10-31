@@ -4,19 +4,26 @@
 // package.json: a SEMANTIC diff against the original. The only changes allowed:
 //   - `scripts.test`, when the original has none or still npm's default, and then only to `vitest run`;
 //   - `devDependencies` gains entries from the B2 table (B2_DEVDEPS) at exactly the table's version, each only when the package is absent
-//     from the repo's dependencies. An existing devDependency is never changed, removed or re-pinned.
-//   Every other key is compared whole: `scripts.build`, any other script (lifecycle ones by name), `dependencies`, and the gate's
-//   `c8`, `prettier` and `renovate` sections included. Formatting and key order are not changes. A repeated key anywhere is refused
-//   (npm keeps the last, a reviewer reading the diff sees the first).
-// package-lock.json (lockfileVersion 3): EVERY change must be explained by the added devDependencies and their closure.
+//     from the repo's dependencies, and @vitest/coverage-v8 only beside vitest 5.0.5. An existing devDependency is never changed, removed or re-pinned.
+//   Every other key is compared whole AND ORDER-EXACT (key order is meaning in `exports`, `imports` and `typesVersions`: the first matching key wins):
+//   `scripts.build`, any other script (lifecycle ones by name), `dependencies`, and the gate's `c8`, `prettier` and `renovate` sections included.
+//   The existing keys of the top level, of `scripts` and of `devDependencies` keep their relative order; only the added entries and the `test` slot may
+//   sit anywhere. Whitespace is not compared. A repeated key anywhere is refused. B2 scope: a package.json with `workspaces`, or a `packageManager`
+//   other than npm, is not edited. (D6's judge should rebuild the exact expected text and compare bytes, as the CODEOWNERS and dependabot judges do.)
+// package-lock.json (lockfileVersion 3): added code must be REVIEWED code (see reviewed-closure.ts).
 //   - every top-level key but `packages` is equal; the root entry is equal but for devDependencies, which follow the package.json rule;
 //   - every pre-existing entry is present and deep-equal (nothing removed, nothing changed);
-//   - every new entry is a plain registry package (lockEntryProblems: exact version, the registry tarball, sha512, no link or bundle,
-//     registry ranges only), AND is reachable from an added package through dependencies, optionalDependencies and peerDependencies
-//     (npm's own lookup: the nearest node_modules folder up the tree). An entry nobody reaches is refused;
-//   - every added package sits at `node_modules/<name>` at the table's version; the reviewed integrity is checked when given.
+//   - every new entry is a plain registry package (lockEntryProblems), equals one reviewed entry (name@version) but for npm's placement flags, and
+//     carries `dev: true` (`optional` may sit beside it; `devOptional` and `peer` are refused). The reviewed entry carries the resolved URL, the
+//     integrity, hasInstallScript and all dependency maps, so a forged edge or install script is not equal to it;
+//   - every non-optional edge of a new entry resolves (npm's nearest node_modules) to a new entry or an entry the user already has, and that
+//     version satisfies the range; a range that can not be read is refused. A new entry no added package reaches is refused;
+//   - each added root devDependency is a reviewed pin at the table's version, at `node_modules/<name>`.
+//   Without a reviewed closure every lock edit is refused.
 import { isDeepStrictEqual } from 'node:util';
 import { lockEntryProblems } from '../engine/npm-closure.js';
+import { nameOfLockKey, withoutPlacement, type ReviewedClosure } from './reviewed-closure.js';
+import { satisfies } from './semver-min.js';
 
 /** The only devDependencies pipegen adds (B2): the reviewed repo-code pins. */
 export const B2_DEVDEPS: Readonly<Record<string, string>> = Object.freeze({ vitest: '5.0.5', '@vitest/coverage-v8': '5.0.5', c8: '12.0.0' });
@@ -33,6 +40,10 @@ type Rec = Record<string, unknown>;
 const isObj = (v: unknown): v is Rec => typeof v === 'object' && v !== null && !Array.isArray(v);
 const has = (o: Rec, k: string): boolean => Object.hasOwn(o, k);
 const same = (a: unknown, b: unknown): boolean => isDeepStrictEqual(a, b);
+/** Equal including the key order of every object (JSON.stringify keeps insertion order). */
+const exact = (a: unknown, b: unknown): boolean => JSON.stringify(a) === JSON.stringify(b);
+/** Whether the keys of `o` that `n` also has come in the same relative order as in `o` (added keys may sit anywhere). */
+const keepsOrder = (o: Rec, n: Rec): boolean => Object.keys(n).filter((k) => has(o, k)).join('\0') === Object.keys(o).join('\0');
 const show = (s: string): string => (s.length > 60 ? `${s.slice(0, 57)}...` : s);
 
 /**
@@ -118,6 +129,7 @@ function devDependencyProblems(oldDev: unknown, newDev: unknown, owner: Rec, whe
   if (newDev !== undefined && !isObj(newDev)) return [`${where} devDependencies is not an object, so it is refused`];
   const o: Rec = oldDev ?? {};
   const n: Rec = newDev ?? {};
+  if (!keepsOrder(o, n)) out.push(`${where} changes the order of devDependencies; the existing entries keep their order`);
   for (const k of Object.keys(o)) {
     if (!has(n, k)) out.push(`${where} removes devDependencies.${show(k)}; an existing devDependency is never removed`);
     else if (!same(o[k], n[k])) out.push(`${where} changes devDependencies.${show(k)}; an existing version is never changed`);
@@ -128,6 +140,7 @@ function devDependencyProblems(oldDev: unknown, newDev: unknown, owner: Rec, whe
     else if (n[k] !== B2_DEVDEPS[k]) out.push(`${where} adds devDependencies.${k} at ${JSON.stringify(show(String(n[k])))}; only the exact reviewed version ${B2_DEVDEPS[k]} is allowed`);
     else if (['dependencies', 'optionalDependencies', 'peerDependencies'].some((f) => isObj(owner[f]) && has(owner[f] as Rec, k))) out.push(`${where} adds devDependencies.${k}, but the repository already lists it in dependencies, optionalDependencies or peerDependencies`);
   }
+  if (has(n, '@vitest/coverage-v8') && !has(o, '@vitest/coverage-v8') && n.vitest !== B2_DEVDEPS.vitest) out.push(`${where} adds @vitest/coverage-v8, which peers on vitest ${B2_DEVDEPS.vitest} exactly, but vitest is not ${B2_DEVDEPS.vitest} there`);
   return out;
 }
 
@@ -142,17 +155,21 @@ export function packageJsonProblems(original: string, content: string): string[]
   if ('problem' in n) return [n.problem];
   const out: string[] = [];
   for (const k of new Set([...Object.keys(o.v), ...Object.keys(n.v)])) {
-    if (k === 'scripts' || k === 'devDependencies' || same(o.v[k], n.v[k])) continue;
+    if (k === 'scripts' || k === 'devDependencies' || exact(o.v[k], n.v[k])) continue;
     out.push(GATE_SECTIONS.includes(k)
       ? `pipegen changes \`${k}\` in package.json, a section the gate protects (a tool's own settings); pipegen never edits it`
       : `pipegen changes \`${show(k)}\` in package.json; its edit is limited to scripts.test and the reviewed devDependencies`);
   }
+  if (!keepsOrder(o.v, n.v)) out.push('pipegen changes the order of the keys of package.json; the existing keys keep their order');
+  if (has(o.v, 'workspaces')) out.push('this package.json has `workspaces`; pipegen edits only a single npm package with its own lockfile in this version');
+  if (has(o.v, 'packageManager') && !(typeof o.v.packageManager === 'string' && /^npm@/.test(o.v.packageManager))) out.push('this package.json names a packageManager other than npm; pipegen edits only npm packages in this version');
   const os = o.v.scripts;
   const ns = n.v.scripts;
   if ((os !== undefined && !isObj(os)) || (ns !== undefined && !isObj(ns))) out.push('scripts in package.json is not an object, so pipegen can not judge a change to it');
   else {
     const so: Rec = os ?? {};
     const sn: Rec = ns ?? {};
+    if (!keepsOrder(so, sn)) out.push('pipegen changes the order of scripts; the existing scripts keep their order');
     for (const k of new Set([...Object.keys(so), ...Object.keys(sn)])) {
       if (k === 'test' || same(so[k], sn[k])) continue;
       out.push(isLifecycle(k)
@@ -173,8 +190,8 @@ export function packageJsonProblems(original: string, content: string): string[]
 export interface LockOpts {
   /** The NEW package.json text of the same folder: the lock's root devDependencies must equal its devDependencies. */
   packageJson?: string;
-  /** The reviewed integrity of a pinned package (name to `sha512-...`): when given, the lock entry must carry exactly it. */
-  integrity?: Readonly<Record<string, string>>;
+  /** The reviewed closure (reviewed-closure.ts). Without it every lock edit is refused. */
+  closure?: ReviewedClosure | null;
 }
 
 /** The `node_modules/<name>` key where npm looks for `dep` when `from` (a lock key) requires it: the nearest folder up the tree, else null. */
@@ -190,10 +207,12 @@ function resolveKey(packages: Rec, from: string, dep: string): string | null {
 }
 
 /**
- * The reasons a change of a package-lock.json (`original` to `content`) is refused (B2); empty = every change is explained by the added
- * devDependencies and their closure. Pure; the caller bounds the text size.
+ * The reasons a change of a package-lock.json (`original` to `content`) is refused (B2); empty = every added entry is reviewed code, wired only to
+ * added or already-present entries. Pure; the caller bounds the text size.
  */
 export function lockProblems(original: string, content: string, opts: LockOpts = {}): string[] {
+  const closure = opts.closure;
+  if (closure === undefined || closure === null) return ['there is no reviewed closure of the packages pipegen adds (vitest, @vitest/coverage-v8, c8), so a lock change can not be proven and pipegen does not write one'];
   const o = parseObj(original, 'the original package-lock.json');
   if ('problem' in o) return [o.problem];
   const n = parseObj(content, 'the new package-lock.json');
@@ -221,17 +240,28 @@ export function lockProblems(original: string, content: string, opts: LockOpts =
     else if (!same(op[key], np[key])) out.push(`the lock changes ${show(key)}; an existing entry is never changed`);
   }
   const fresh = Object.keys(np).filter((k) => k !== '' && !has(op, k));
-  for (const key of fresh) out.push(...lockEntryProblems(key, np[key]));
-
-  for (const name of addedOk) {
-    const e = np[`node_modules/${name}`];
-    if (!isObj(e)) { out.push(`the lock does not hold ${name} at node_modules/${name}`); continue; }
-    if (e.version !== B2_DEVDEPS[name]) out.push(`the lock holds ${name} ${show(String(e.version))}, not the reviewed ${B2_DEVDEPS[name]}`);
-    const want = opts.integrity?.[name];
-    if (want !== undefined && e.integrity !== want) out.push(`the lock holds ${name} with another integrity than the reviewed one`);
+  for (const key of fresh) {
+    const shape = lockEntryProblems(key, np[key]);
+    out.push(...shape);
+    if (shape.length > 0) continue;
+    const e = np[key] as Rec;
+    const id = `${nameOfLockKey(key)}@${String(e.version)}`;
+    const reviewed = closure.entries.get(id);
+    if (reviewed === undefined) { out.push(`${show(key)} (${show(id)}) is not in the reviewed closure, so pipegen does not add it`); continue; }
+    if (!same(sortedDeep(withoutPlacement(e)), sortedDeep(withoutPlacement(reviewed)))) out.push(`${show(key)} is not the reviewed ${show(id)}: its resolved address, integrity, install script or dependencies differ from the reviewed entry`);
+    if (e.dev !== true || e.devOptional !== undefined || e.peer !== undefined) out.push(`${show(key)} must be marked dev (and not devOptional or peer), so it never reaches a production install`);
   }
 
-  // closure: a new entry must be reached from an added package through new entries only
+  for (const name of addedOk) {
+    const pinned = closure.pins[name];
+    if (pinned === undefined) { out.push(`there is no reviewed closure for ${name}, so pipegen does not add it to the lock`); continue; }
+    const e = np[`node_modules/${name}`];
+    if (!isObj(e)) { out.push(`the lock does not hold ${name} at node_modules/${name}`); continue; }
+    if (e.version !== B2_DEVDEPS[name] || pinned.version !== B2_DEVDEPS[name]) out.push(`the lock holds ${name} ${show(String(e.version))}, not the reviewed ${B2_DEVDEPS[name]}`);
+    if (e.integrity !== pinned.integrity) out.push(`the lock holds ${name} with another integrity than the reviewed one`);
+  }
+
+  // edges: every non-optional edge of a new entry lands on a new or an existing entry whose version satisfies the range; new entries must be reached
   const reached = new Set<string>();
   const queue: string[] = [];
   const reach = (key: string): void => { if (!has(op, key) && has(np, key) && !reached.has(key)) { reached.add(key); queue.push(key); } };
@@ -246,13 +276,21 @@ export function lockProblems(original: string, content: string, opts: LockOpts =
       if (!isObj(deps)) continue;
       for (const d of Object.keys(deps)) {
         const at = resolveKey(np, key, d);
-        if (at !== null) { reach(at); continue; }
         const optional = field === 'optionalDependencies' || (field === 'peerDependencies' && isObj(meta[d]) && (meta[d] as Rec).optional === true);
-        if (!optional) out.push(`${show(key)} needs ${show(d)}, which the lock does not hold, so the closure of the added packages is incomplete`);
+        if (at === null) {
+          if (!optional) out.push(`${show(key)} needs ${show(d)}, which the lock does not hold, so the added packages are incomplete`);
+          continue;
+        }
+        reach(at);
+        const target = np[at];
+        const ver = isObj(target) && typeof target.version === 'string' ? target.version : null;
+        const ok = ver === null ? null : satisfies(ver, String(deps[d]));
+        if (ok === null) out.push(`${show(key)} needs ${show(d)} at a range pipegen can not read (${show(String(deps[d]))}), so the edge can not be checked`);
+        else if (!ok) out.push(`${show(key)} needs ${show(d)} ${show(String(deps[d]))}, but the lock resolves ${show(at)} to ${show(String(ver))}, which does not satisfy ${show(String(deps[d]))}`);
       }
     }
   }
-  for (const key of fresh) if (!reached.has(key)) out.push(`${show(key)} is not part of the closure of the added devDependencies (${Object.keys(B2_DEVDEPS).join(', ')}), so pipegen does not add it`);
+  for (const key of fresh) if (!reached.has(key)) out.push(`${show(key)} is not reached by any added devDependency (${Object.keys(B2_DEVDEPS).join(', ')}), so pipegen does not add it`);
 
   if (opts.packageJson !== undefined) {
     const p = parseObj(opts.packageJson, 'the new package.json');
@@ -260,4 +298,11 @@ export function lockProblems(original: string, content: string, opts: LockOpts =
     else if (!same(p.v.devDependencies ?? {}, nroot.devDependencies ?? {})) out.push('the root devDependencies of the lock differ from the devDependencies of the new package.json, so the two files do not agree');
   }
   return out;
+}
+
+/** A plain copy with every object's keys sorted (so two entries compare by content, not by key order). */
+function sortedDeep(v: unknown): unknown {
+  if (Array.isArray(v)) return v.map(sortedDeep);
+  if (isObj(v)) return Object.fromEntries(Object.keys(v).sort().map((k) => [k, sortedDeep(v[k])]));
+  return v;
 }

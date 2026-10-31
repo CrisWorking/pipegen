@@ -2,6 +2,8 @@
 import { createHash } from 'node:crypto';
 import { describe, expect, it } from 'vitest';
 import { B2_DEVDEPS, lockProblems, packageJsonProblems, parseJsonStrict } from '../src/create/package-rules.js';
+import { closureFromLocks, type ReviewedClosure } from '../src/create/reviewed-closure.js';
+import { satisfies } from '../src/create/semver-min.js';
 
 const pj = (o: object): string => JSON.stringify(o, null, 2);
 const BASE = { name: 'app', version: '1.0.0', scripts: { build: 'tsc', start: 'node index.js' }, dependencies: { express: '4.21.0' }, devDependencies: { typescript: '5.6.0' } };
@@ -36,8 +38,8 @@ describe('packageJsonProblems (B2)', () => {
     expect(p(BASE, BASE)).toBe('');
     expect(p(BASE, withTest)).toBe('');
   });
-  it('formatting and key order are not changes (semantic diff)', () => {
-    expect(packageJsonProblems(JSON.stringify(BASE), pj({ devDependencies: BASE.devDependencies, scripts: BASE.scripts, dependencies: BASE.dependencies, version: '1.0.0', name: 'app' }))).toEqual([]);
+  it('formatting is not a change (key order is: fix round 1)', () => {
+    expect(packageJsonProblems(JSON.stringify(BASE), pj({ name: 'app', version: '1.0.0', scripts: BASE.scripts, dependencies: BASE.dependencies, devDependencies: BASE.devDependencies }).replace(/\n\s*/g, ' '))).toEqual([]);
   });
   it('scripts.build changed, added or removed is refused', () => {
     expect(p(BASE, { ...BASE, scripts: { ...BASE.scripts, build: 'tsc && curl x' } })).toMatch(/scripts\.build/);
@@ -117,6 +119,32 @@ describe('packageJsonProblems (B2)', () => {
     expect(p(BASE, { ...BASE, devDependencies: ['vitest'] })).toMatch(/devDependencies/);
     expect(p(BASE, { ...BASE, devDependencies: null })).toMatch(/devDependencies/);
   });
+  it('fix round 1 (2): key order is semantic in exports, imports and typesVersions; a reorder is a change', () => {
+    const o = { ...BASE, exports: { '.': { import: './a.mjs', require: './a.cjs', default: './evil.js' } }, typesVersions: { '>=5': { '*': ['a'] }, '*': { '*': ['b'] } } };
+    expect(p(o, o)).toBe('');
+    expect(p(o, { ...o, exports: { '.': { default: './evil.js', import: './a.mjs', require: './a.cjs' } } })).toMatch(/changes `exports`/);
+    expect(p(o, { ...o, typesVersions: { '*': { '*': ['b'] }, '>=5': { '*': ['a'] } } })).toMatch(/changes `typesVersions`/);
+    expect(p({ ...BASE, files: ['a', 'b'] }, { ...BASE, files: ['b', 'a'] })).toMatch(/changes `files`/);
+  });
+  it('fix round 1 (2): a reorder of the top-level keys, of scripts or of existing devDependencies is a change; additions may sit anywhere', () => {
+    const rev = (x: Record<string, unknown>): Record<string, unknown> => Object.fromEntries(Object.entries(x).reverse());
+    expect(p(BASE, rev(BASE))).toMatch(/order/);
+    const two = { ...BASE, scripts: { build: 'tsc', start: 'node i.js' }, devDependencies: { typescript: '5.6.0', eslint: '9.0.0' } };
+    expect(p(two, { ...two, scripts: { start: 'node i.js', build: 'tsc' } })).toMatch(/order of scripts/);
+    expect(p(two, { ...two, devDependencies: { eslint: '9.0.0', typescript: '5.6.0' } })).toMatch(/order of devDependencies/);
+    // the test slot and the added devDependencies may sit anywhere
+    expect(p(two, { ...two, scripts: { test: 'vitest run', build: 'tsc', start: 'node i.js' } })).toBe('');
+    expect(p(two, { ...two, scripts: { build: 'tsc', test: 'vitest run', start: 'node i.js' }, devDependencies: { vitest: '5.0.5', typescript: '5.6.0', eslint: '9.0.0' } })).toBe('');
+  });
+  it('fix round 1 (8): B2 scope in package.json: workspaces and a non-npm packageManager are refused; coverage-v8 only with vitest 5.0.5', () => {
+    expect(p({ ...BASE, workspaces: ['a'] }, { ...BASE, workspaces: ['a'], devDependencies: { ...BASE.devDependencies, vitest: '5.0.5' } })).toMatch(/workspaces/);
+    expect(p({ ...BASE, packageManager: 'pnpm@9.0.0' }, { ...BASE, packageManager: 'pnpm@9.0.0', devDependencies: { ...BASE.devDependencies, vitest: '5.0.5' } })).toMatch(/packageManager/);
+    expect(p({ ...BASE, packageManager: 'npm@10.8.0' }, { ...BASE, packageManager: 'npm@10.8.0', devDependencies: { ...BASE.devDependencies, vitest: '5.0.5' } })).toBe('');
+    const v4 = { ...BASE, devDependencies: { ...BASE.devDependencies, vitest: '4.0.0' } };
+    expect(p(v4, { ...v4, devDependencies: { ...v4.devDependencies, '@vitest/coverage-v8': '5.0.5' } })).toMatch(/coverage-v8.*vitest 5\.0\.5/);
+    expect(p(BASE, { ...BASE, devDependencies: { ...BASE.devDependencies, '@vitest/coverage-v8': '5.0.5' } })).toMatch(/coverage-v8.*vitest 5\.0\.5/);
+    expect(p(BASE, withTest)).toBe('');
+  });
   it('bad text: not JSON, not an object, a repeated key (in either file), a prototype key trick', () => {
     expect(packageJsonProblems('{', pj(BASE)).join(' ')).toMatch(/original/);
     expect(packageJsonProblems(pj(BASE), '[1]').join(' ')).toMatch(/object|new/);
@@ -135,27 +163,90 @@ const lockOf = (root: object, pkgs: Record<string, object>, top: object = {}): s
 const OLD_PKGS = { 'node_modules/express': ent('express', '4.21.0', { dependencies: { accepts: '~1.3.8' } }), 'node_modules/accepts': ent('accepts', '1.3.8'), 'node_modules/typescript': ent('typescript', '5.6.0', { dev: true }) };
 const OLD_ROOT = { dependencies: { express: '4.21.0' }, devDependencies: { typescript: '5.6.0' } };
 const OLD = lockOf(OLD_ROOT, OLD_PKGS);
-const NEW_PKGS = {
-  'node_modules/vitest': ent('vitest', '5.0.5', { dev: true, dependencies: { tinyspy: '^3.0.0' } }),
-  'node_modules/@vitest/coverage-v8': ent('@vitest/coverage-v8', '5.0.5', { dev: true, peerDependencies: { vitest: '5.0.5' } }),
-  'node_modules/tinyspy': ent('tinyspy', '3.0.2', { dev: true }),
-};
+/** The reviewed entries (as D6's closure lock would hold them, hoisted in an empty folder). */
+const VITEST = ent('vitest', '5.0.5', { dev: true, dependencies: { tinyspy: '^3.0.0' }, optionalDependencies: { fsevents: '^2.3.0' }, peerDependencies: { jsdom: '*' }, peerDependenciesMeta: { jsdom: { optional: true } } });
+const COV = ent('@vitest/coverage-v8', '5.0.5', { dev: true, peerDependencies: { vitest: '5.0.5' } });
+const TINYSPY = ent('tinyspy', '3.0.2', { dev: true });
+const C8 = ent('c8', '12.0.0', { dev: true });
+const NEW_PKGS = { 'node_modules/vitest': VITEST, 'node_modules/@vitest/coverage-v8': COV, 'node_modules/tinyspy': TINYSPY };
+const closureLock = (root: Record<string, string>, pkgs: Record<string, object>): string => pj({ name: 'closure', version: '1.0.0', lockfileVersion: 3, requires: true, packages: { '': { name: 'closure', version: '1.0.0', dependencies: root }, ...pkgs } });
+const pin = (name: string, version: string) => ({ name, version, integrity: sri(`${name}@${version}`) });
+const CLOSURE: ReviewedClosure = closureFromLocks([
+  { text: closureLock({ vitest: '5.0.5', '@vitest/coverage-v8': '5.0.5' }, { ...NEW_PKGS }), pins: [pin('vitest', '5.0.5'), pin('@vitest/coverage-v8', '5.0.5')] },
+  { text: closureLock({ c8: '12.0.0' }, { 'node_modules/c8': C8 }), pins: [pin('c8', '12.0.0')] },
+]);
 const NEW_ROOT = { ...OLD_ROOT, devDependencies: { typescript: '5.6.0', vitest: '5.0.5', '@vitest/coverage-v8': '5.0.5' } };
 const GOOD = lockOf(NEW_ROOT, { ...OLD_PKGS, ...NEW_PKGS });
-const lp = (o: string, n: string, opts?: Parameters<typeof lockProblems>[2]): string => lockProblems(o, n, opts).join(' | ');
+const lp = (o: string, n: string, opts: Parameters<typeof lockProblems>[2] = { closure: CLOSURE }): string => lockProblems(o, n, opts).join(' | ');
 const edit = (mut: (l: { packages: Record<string, Record<string, unknown>> } & Record<string, unknown>) => void, from: string = GOOD): string => {
   const l = JSON.parse(from) as { packages: Record<string, Record<string, unknown>> } & Record<string, unknown>;
   mut(l);
   return pj(l);
 };
 
-describe('lockProblems (B2): every change is explained by the added devDependencies and their closure', () => {
-  it('unchanged passes; the B2 additions with their closure pass', () => {
+describe('semver-min', () => {
+  it('reads exact, caret, tilde, comparators, wildcards, hyphen ranges and ||', () => {
+    const t: [string, string, boolean][] = [['1.2.3', '1.2.3', true], ['1.2.4', '1.2.3', false], ['1.4.0', '^1.2.3', true], ['2.0.0', '^1.2.3', false], ['0.2.5', '^0.2.3', true], ['0.3.0', '^0.2.3', false], ['0.0.3', '^0.0.3', true], ['0.0.4', '^0.0.3', false],
+      ['1.2.9', '~1.2.3', true], ['1.3.0', '~1.2.3', false], ['5.0.5', '>=5', true], ['4.9.9', '>=5', false], ['3.1.0', '*', true], ['3.1.0', 'x', true], ['3.1.0', '', true], ['1.9.0', '1.x', true], ['2.0.0', '1.x', false], ['1.2.5', '1.2', true],
+      ['18.0.0', '^16 || ^18', true], ['17.0.0', '^16 || ^18', false], ['1.5.0', '1.2.3 - 2.0.0', true], ['2.1.0', '1.2.3 - 2.0.0', false], ['2.0.0', '>=1 <2', false], ['1.9.9', '>= 1 < 2', true], ['5.0.5', '=5.0.5', true], ['1.0.0-beta.1', '1.0.0-beta.1', true], ['1.0.0-beta.1', '^1.0.0', false]];
+    for (const [v, r, want] of t) expect(satisfies(v, r), `${v} ${r}`).toBe(want);
+  });
+  it('a range or version it can not read gives null (the caller refuses)', () => {
+    for (const r of ['npm:evil@1', 'github:a/b', '^^1', 'latest', 'a.b.c', '>=1 <=x.y']) expect(satisfies('1.0.0', r), r).toBeNull();
+    expect(satisfies('not-a-version', '^1')).toBeNull();
+  });
+});
+
+describe('lockProblems (B2, fix round 1): added entries must be reviewed code', () => {
+  it('unchanged passes; the B2 additions with their reviewed closure pass', () => {
     expect(lp(OLD, OLD)).toBe('');
     expect(lp(OLD, GOOD)).toBe('');
   });
+  it('without a reviewed closure every lock edit is refused (the safe default until D6 makes the data)', () => {
+    expect(lp(OLD, GOOD, {})).toMatch(/no reviewed closure/);
+    expect(lp(OLD, GOOD, { closure: null })).toMatch(/no reviewed closure/);
+    expect(lp(OLD, OLD, {})).toMatch(/no reviewed closure/);
+  });
+  it('a pin the closure does not hold (c8 before D6 adds it) is refused', () => {
+    const only: ReviewedClosure = closureFromLocks([{ text: closureLock({ vitest: '5.0.5', '@vitest/coverage-v8': '5.0.5' }, { ...NEW_PKGS }), pins: [pin('vitest', '5.0.5'), pin('@vitest/coverage-v8', '5.0.5')] }]);
+    const withC8 = lockOf({ ...OLD_ROOT, devDependencies: { typescript: '5.6.0', c8: '12.0.0' } }, { ...OLD_PKGS, 'node_modules/c8': C8 });
+    expect(lp(OLD, withC8, { closure: only })).toMatch(/c8.*no reviewed/);
+    expect(lp(OLD, withC8)).toBe('');
+  });
   it('a pretty-printing or key-order change alone is no change', () => {
     expect(lp(OLD, JSON.stringify(JSON.parse(GOOD)))).toBe('');
+  });
+  it('P14: an added entry whose dependency map differs from the reviewed one (a forged edge to an arbitrary package) is refused', () => {
+    const forged = edit((l) => {
+      l.packages['node_modules/vitest'] = { ...VITEST, dependencies: { tinyspy: '^3.0.0', 'evil-pkg': '^1.0.0' } };
+      l.packages['node_modules/evil-pkg'] = ent('evil-pkg', '1.0.0', { dev: true, hasInstallScript: true });
+    });
+    const out = lp(OLD, forged);
+    expect(out).toMatch(/node_modules\/vitest.*reviewed/);
+    expect(out).toMatch(/evil-pkg.*not in the reviewed/);
+  });
+  it('P15: an entry with another version, no dev flag, devOptional, an install script the reviewed entry lacks, or another integrity is refused', () => {
+    const cases: [string, (l: { packages: Record<string, Record<string, unknown>> }) => void, RegExp][] = [
+      ['another version', (l) => { l.packages['node_modules/tinyspy'] = ent('tinyspy', '3.0.9', { dev: true }); }, /tinyspy.*not in the reviewed/],
+      ['no dev flag', (l) => { delete l.packages['node_modules/tinyspy'].dev; }, /tinyspy.*dev/],
+      ['devOptional', (l) => { delete l.packages['node_modules/tinyspy'].dev; l.packages['node_modules/tinyspy'].devOptional = true; }, /tinyspy.*dev/],
+      ['dev beside devOptional', (l) => { l.packages['node_modules/tinyspy'].devOptional = true; }, /tinyspy.*dev/],
+      ['peer flag', (l) => { l.packages['node_modules/tinyspy'].peer = true; }, /tinyspy.*dev/],
+      ['install script', (l) => { l.packages['node_modules/tinyspy'].hasInstallScript = true; }, /tinyspy.*reviewed/],
+      ['integrity', (l) => { l.packages['node_modules/tinyspy'].integrity = sri('other'); }, /tinyspy.*reviewed/],
+      ['bin added', (l) => { l.packages['node_modules/tinyspy'].bin = { x: 'evil.js' }; }, /tinyspy.*reviewed/],
+      ['os', (l) => { l.packages['node_modules/tinyspy'].os = ['linux']; }, /tinyspy.*reviewed/],
+    ];
+    for (const [what, mut, re] of cases) expect(lp(OLD, edit(mut)), what).toMatch(re);
+  });
+  it('the placement flags may differ from the reviewed entry: optional beside dev, and a nested placement', () => {
+    expect(lp(OLD, edit((l) => { l.packages['node_modules/tinyspy'].optional = true; }))).toBe('');
+    const nested = edit((l) => { l.packages['node_modules/vitest/node_modules/tinyspy'] = l.packages['node_modules/tinyspy']; delete l.packages['node_modules/tinyspy']; });
+    expect(lp(OLD, nested)).toBe('');
+  });
+  it('the reviewed entry is matched by name@version, not by where it sits', () => {
+    const hoistedElsewhere = edit((l) => { l.packages['node_modules/vitest/node_modules/tinyspy'] = ent('tinyspy', '3.0.2', { dev: true }); delete l.packages['node_modules/tinyspy']; });
+    expect(lp(OLD, hoistedElsewhere)).toBe('');
   });
   it('a pre-existing entry that changes is refused: version, resolved, integrity, dev flag, a dependency range, a new field', () => {
     for (const [what, mut] of [
@@ -170,91 +261,127 @@ describe('lockProblems (B2): every change is explained by the added devDependenc
   it('a pre-existing entry removed is refused', () => {
     expect(lp(OLD, edit((l) => { delete l.packages['node_modules/accepts']; }))).toMatch(/removes node_modules\/accepts/);
   });
-  it('a new entry that is not part of the closure of the added packages is refused', () => {
-    expect(lp(OLD, edit((l) => { l.packages['node_modules/left-pad'] = ent('left-pad', '1.3.0'); }))).toMatch(/left-pad.*closure/);
-    expect(lp(OLD, edit((l) => { l.packages['node_modules/vitest/node_modules/evil'] = ent('evil', '1.0.0'); }))).toMatch(/evil.*closure/);
+  it('a new entry that is not a reviewed one is refused, wherever it sits', () => {
+    expect(lp(OLD, edit((l) => { l.packages['node_modules/left-pad'] = ent('left-pad', '1.3.0', { dev: true }); }))).toMatch(/left-pad.*not in the reviewed/);
+    expect(lp(OLD, edit((l) => { l.packages['node_modules/vitest/node_modules/evil'] = ent('evil', '1.0.0', { dev: true }); }))).toMatch(/evil.*not in the reviewed/);
   });
-  it('a dependency of an added package that the lock does not hold is refused (an incomplete closure)', () => {
+  it('a reviewed entry nested under an existing package, where no added package reaches it, is refused (it would shadow)', () => {
+    expect(lp(OLD, edit((l) => { l.packages['node_modules/express/node_modules/tinyspy'] = TINYSPY; }))).toMatch(/express\/node_modules\/tinyspy.*not reached/);
+  });
+  it('edge completeness: an edge of an added entry that the lock does not hold is refused (optional edges and optional peers are not needed)', () => {
     expect(lp(OLD, edit((l) => { delete l.packages['node_modules/tinyspy']; }))).toMatch(/tinyspy/);
+    expect(lp(OLD, GOOD)).toBe('');   // fsevents (optional) and jsdom (optional peer) are absent: fine
+    const hard = closureFromLocks([{ text: closureLock({ vitest: '5.0.5' }, { 'node_modules/vitest': { ...VITEST, peerDependenciesMeta: undefined }, 'node_modules/tinyspy': TINYSPY }), pins: [pin('vitest', '5.0.5')] }]);
+    const next = lockOf({ ...OLD_ROOT, devDependencies: { typescript: '5.6.0', vitest: '5.0.5' } }, { ...OLD_PKGS, 'node_modules/vitest': { ...VITEST, peerDependenciesMeta: undefined }, 'node_modules/tinyspy': TINYSPY });
+    expect(lp(OLD, next, { closure: hard })).toMatch(/jsdom/);
   });
-  it('a missing optional or optional-peer dependency is fine', () => {
-    const g = edit((l) => { l.packages['node_modules/vitest'].optionalDependencies = { fsevents: '^2' }; l.packages['node_modules/vitest'].peerDependencies = { jsdom: '*' }; l.packages['node_modules/vitest'].peerDependenciesMeta = { jsdom: { optional: true } }; });
-    expect(lp(OLD, g)).toBe('');
+  it('an edge may land on an entry the user already has, when its version satisfies the range', () => {
+    const user = lockOf({ ...OLD_ROOT }, { ...OLD_PKGS, 'node_modules/tinyspy': ent('tinyspy', '3.0.2', { dev: true }) });
+    const next = edit((l) => { l.packages['node_modules/tinyspy'] = ent('tinyspy', '3.0.2', { dev: true }); }, GOOD);
+    expect(lp(user, next)).toBe('');
+    const old2 = lockOf({ ...OLD_ROOT }, { ...OLD_PKGS, 'node_modules/tinyspy': ent('tinyspy', '2.0.0', { dev: true }) });
+    const next2 = edit((l) => { l.packages['node_modules/tinyspy'] = ent('tinyspy', '2.0.0', { dev: true }); });
+    expect(lp(old2, next2)).toMatch(/resolves .* to 2\.0\.0, which does not satisfy \^3\.0\.0/);
   });
-  it('a nested entry that is in the closure is fine', () => {
-    const g = edit((l) => {
-      l.packages['node_modules/vitest'].dependencies = { tinyspy: '^3.0.0', ms: '^2' };
-      l.packages['node_modules/vitest/node_modules/ms'] = ent('ms', '2.1.3', { dev: true });
-    });
-    expect(lp(OLD, g)).toBe('');
+  it('an edge range it can not read is refused (fail closed)', () => {
+    const odd = { ...VITEST, dependencies: { tinyspy: 'latest' } };
+    const c = closureFromLocks([{ text: closureLock({ vitest: '5.0.5' }, { 'node_modules/vitest': odd, 'node_modules/tinyspy': TINYSPY }), pins: [pin('vitest', '5.0.5')] }]);
+    const next = lockOf({ ...OLD_ROOT, devDependencies: { typescript: '5.6.0', vitest: '5.0.5' } }, { ...OLD_PKGS, 'node_modules/vitest': odd, 'node_modules/tinyspy': TINYSPY });
+    expect(lp(OLD, next, { closure: c })).toMatch(/range/);
   });
-  it('the root devDependencies gain exactly the B2 names at exact versions; a range, another name or a changed root field is refused', () => {
+  it('resolution takes the nearest node_modules: an edge from a nested entry lands on a sibling at an intermediate level, not on the user\'s top-level package', () => {
+    const v = { ...VITEST, dependencies: { b: '^1.0.0', c: '^2.0.0' }, optionalDependencies: undefined, peerDependencies: undefined, peerDependenciesMeta: undefined };
+    const b = ent('b', '1.0.0', { dev: true, dependencies: { c: '^2.0.0' } });
+    const c2 = ent('c', '2.0.0', { dev: true });
+    const closure = closureFromLocks([{ text: closureLock({ vitest: '5.0.5' }, { 'node_modules/vitest': v, 'node_modules/b': b, 'node_modules/c': c2 }), pins: [pin('vitest', '5.0.5')] }]);
+    const user = lockOf(OLD_ROOT, { ...OLD_PKGS, 'node_modules/c': ent('c', '9.0.0', { dev: true }) });
+    const next = lockOf({ ...OLD_ROOT, devDependencies: { typescript: '5.6.0', vitest: '5.0.5' } }, { ...OLD_PKGS, 'node_modules/c': ent('c', '9.0.0', { dev: true }), 'node_modules/vitest': v, 'node_modules/vitest/node_modules/b': b, 'node_modules/vitest/node_modules/c': c2 });
+    expect(lp(user, next, { closure })).toBe('');
+  });
+  it('the root devDependencies gain exactly the reviewed pins at exact versions; a range, another name or a changed root field is refused', () => {
     expect(lp(OLD, edit((l) => { (l.packages[''].devDependencies as Record<string, string>).vitest = '^5.0.5'; }))).toMatch(/devDependencies/);
-    expect(lp(OLD, edit((l) => { (l.packages[''].devDependencies as Record<string, string>)['left-pad'] = '1.3.0'; l.packages['node_modules/left-pad'] = ent('left-pad', '1.3.0'); }))).toMatch(/left-pad/);
+    expect(lp(OLD, edit((l) => { (l.packages[''].devDependencies as Record<string, string>)['left-pad'] = '1.3.0'; l.packages['node_modules/left-pad'] = ent('left-pad', '1.3.0', { dev: true }); }))).toMatch(/left-pad/);
     expect(lp(OLD, edit((l) => { l.packages[''].dependencies = { express: '4.21.0', evil: '1' }; }))).toMatch(/root/);
     expect(lp(OLD, edit((l) => { l.packages[''].name = 'other'; }))).toMatch(/root/);
     expect(lp(OLD, edit((l) => { l.packages[''].scripts = { x: 'y' }; }))).toMatch(/root/);
     expect(lp(OLD, edit((l) => { (l.packages[''].devDependencies as Record<string, string>).typescript = '5.7.0'; }))).toMatch(/typescript/);
     expect(lp(OLD, edit((l) => { delete (l.packages[''].devDependencies as Record<string, string>).typescript; }))).toMatch(/typescript/);
   });
-  it('each added package sits at node_modules/<name> at the B2 version; a root addition with no entry, or another version, is refused', () => {
+  it('each added package sits at node_modules/<name> at the reviewed version; a root addition with no entry is refused', () => {
     expect(lp(OLD, edit((l) => { delete l.packages['node_modules/vitest']; }))).toMatch(/vitest/);
-    expect(lp(OLD, edit((l) => { l.packages['node_modules/vitest'].version = '5.0.4'; l.packages['node_modules/vitest'].resolved = 'https://registry.npmjs.org/vitest/-/vitest-5.0.4.tgz'; }))).toMatch(/vitest/);
   });
-  it('a new entry is a plain registry package: exact version, the registry tarball, sha512, no link/inBundle/hasShrinkwrap/bundled', () => {
+  it('a new entry that is not a plain registry package is refused (shape): link, bundle, another registry, a foreign dependency', () => {
     for (const [what, mut] of [
-      ['version range', (e) => { e.version = '^3.0.2'; }],
       ['resolved elsewhere', (e) => { e.resolved = 'https://evil.example/tinyspy/-/tinyspy-3.0.2.tgz'; }],
-      ['resolved http', (e) => { e.resolved = 'http://registry.npmjs.org/tinyspy/-/tinyspy-3.0.2.tgz'; }],
-      ['resolved git', (e) => { e.resolved = 'git+ssh://git@github.com/x/tinyspy.git'; }],
-      ['resolved other file', (e) => { e.resolved = 'https://registry.npmjs.org/tinyspy/-/evil-3.0.2.tgz'; }],
       ['no integrity', (e) => { delete e.integrity; }],
-      ['sha1', (e) => { e.integrity = 'sha1-2jmsmO3Jpi3F+xWR2LJ5GBN5/qs='; }],
       ['link', (e) => { e.link = true; }],
       ['inBundle', (e) => { e.inBundle = true; }],
       ['hasShrinkwrap', (e) => { e.hasShrinkwrap = true; }],
-      ['bundled', (e) => { e.bundleDependencies = ['x']; }],
       ['alias dependency', (e) => { e.dependencies = { x: 'npm:evil@1.0.0' }; }],
-      ['git dependency', (e) => { e.dependencies = { x: 'github:evil/x' }; }],
-      ['url dependency', (e) => { e.dependencies = { x: 'https://evil.example/x.tgz' }; }],
-      ['file dependency', (e) => { e.dependencies = { x: 'file:../x' }; }],
     ] as [string, (e: Record<string, unknown>) => void][]) expect(lp(OLD, edit((l) => { mut(l.packages['node_modules/tinyspy'] as Record<string, unknown>); })), what).toMatch(/tinyspy/);
   });
-  it('a key that is not node_modules/<name>[/node_modules/<name>]... is refused (no path, link target, dot segment, other folder)', () => {
+  it('a key that is not node_modules/<name>[/node_modules/<name>]... is refused', () => {
     for (const key of ['packages/evil', 'node_modules/../x', 'node_modules/a/b', '../x', 'node_modules/vitest/../../x', 'node_modules/', 'node_modules/Evil', 'evil']) {
-      expect(lp(OLD, edit((l) => { l.packages[key] = ent('evil', '1.0.0'); })), key).toMatch(/not a package under node_modules|closure/);
+      expect(lp(OLD, edit((l) => { l.packages[key] = ent('evil', '1.0.0', { dev: true }); })), key).toMatch(/not a package under node_modules/);
     }
   });
-  it('lockfileVersion must be 3; any top-level key but packages must be unchanged; the old file must be v3 too', () => {
+  it('lockfileVersion must be 3 on both sides; any top-level key but packages must be unchanged', () => {
     expect(lp(OLD, edit((l) => { l.lockfileVersion = 2; }))).toMatch(/lockfileVersion/);
-    expect(lp(OLD, edit((l) => { l.dependencies = {}; }))).toMatch(/dependencies|top level/);
-    expect(lp(OLD, edit((l) => { l.name = 'other'; }))).toMatch(/top level|name/);
+    expect(lp(OLD, edit((l) => { l.dependencies = {}; }))).toMatch(/top level/);
+    expect(lp(OLD, edit((l) => { l.name = 'other'; }))).toMatch(/top level/);
     expect(lp(edit((l) => { l.lockfileVersion = 2; }, OLD), GOOD)).toMatch(/lockfileVersion/);
     const v2 = (t: string): string => edit((l) => { l.lockfileVersion = 2; }, t);
     expect(lp(v2(OLD), v2(OLD))).toMatch(/not lockfileVersion 3/);
     expect(lp(v2(OLD), v2(GOOD))).toMatch(/not lockfileVersion 3/);
   });
-  it('bad text: not JSON, packages missing, a repeated key, a repeated entry key', () => {
+  it('bad text: not JSON, packages missing, a repeated key', () => {
     expect(lp('{', GOOD)).toMatch(/original/);
     expect(lp(OLD, 'x')).toMatch(/new/);
     expect(lp(OLD, '{"lockfileVersion":3}')).toMatch(/packages/);
     const dup = GOOD.replace('"node_modules/tinyspy": {', '"node_modules/tinyspy": {"version":"3.0.2","version":"9.9.9"},\n"node_modules/tinyspy": {');
     expect(lp(OLD, dup)).toMatch(/repeated/);
   });
-  it('an added package that is already in the lock at the B2 version, with no change to existing entries, passes', () => {
-    const old = lockOf(OLD_ROOT, { ...OLD_PKGS, 'node_modules/c8': ent('c8', '12.0.0', { dev: true }) });
-    const next = lockOf({ ...OLD_ROOT, devDependencies: { typescript: '5.6.0', c8: '12.0.0' } }, { ...OLD_PKGS, 'node_modules/c8': ent('c8', '12.0.0', { dev: true }) });
+  it('an added package that is already in the lock at the reviewed version, with no change to existing entries, passes', () => {
+    const old = lockOf(OLD_ROOT, { ...OLD_PKGS, 'node_modules/c8': C8 });
+    const next = lockOf({ ...OLD_ROOT, devDependencies: { typescript: '5.6.0', c8: '12.0.0' } }, { ...OLD_PKGS, 'node_modules/c8': C8 });
     expect(lp(old, next)).toBe('');
-  });
-  it('the reviewed integrity of a pin, when given, must match', () => {
-    const integrity = { vitest: sri('vitest@5.0.5'), '@vitest/coverage-v8': sri('@vitest/coverage-v8@5.0.5') };
-    expect(lp(OLD, GOOD, { integrity })).toBe('');
-    expect(lp(OLD, GOOD, { integrity: { ...integrity, vitest: sri('other') } })).toMatch(/vitest.*reviewed/);
   });
   it('with the new package.json given, the lock root devDependencies must equal it', () => {
     const pkg = pj({ ...BASE, devDependencies: { typescript: '5.6.0', vitest: '5.0.5', '@vitest/coverage-v8': '5.0.5' } });
-    expect(lp(OLD, GOOD, { packageJson: pkg })).toBe('');
-    expect(lp(OLD, GOOD, { packageJson: pj({ ...BASE, devDependencies: { typescript: '5.6.0', vitest: '5.0.5' } }) })).toMatch(/package\.json/);
-    expect(lp(OLD, GOOD, { packageJson: '{' })).toMatch(/package\.json/);
+    expect(lp(OLD, GOOD, { closure: CLOSURE, packageJson: pkg })).toBe('');
+    expect(lp(OLD, GOOD, { closure: CLOSURE, packageJson: pj({ ...BASE, devDependencies: { typescript: '5.6.0', vitest: '5.0.5' } }) })).toMatch(/package\.json/);
+    expect(lp(OLD, GOOD, { closure: CLOSURE, packageJson: '{' })).toMatch(/package\.json/);
+  });
+});
+
+describe('reviewed closure loader', () => {
+  it('gives null while the data files do not exist (D6 has not made them): every lock edit stays refused', async () => {
+    const { loadReviewedClosure } = await import('../src/create/reviewed-closure.js');
+    const { reviewedList } = await import('./helpers/render.js');
+    expect(loadReviewedClosure(reviewedList())).toBeNull();
+  });
+  it('reads closure locks through an injected reader, and refuses a lock that fails the closure judge', async () => {
+    const { loadReviewedClosure } = await import('../src/create/reviewed-closure.js');
+    const { reviewedList } = await import('./helpers/render.js');
+    expect(loadReviewedClosure(reviewedList(), () => { throw new Error('missing'); })).toBeNull();
+    expect(loadReviewedClosure(reviewedList(), () => '{"not":"a lock"}')).toBeNull();
+  });
+});
+
+describe('closureFromLocks', () => {
+  const lockA = closureLockFor({ x: '1.0.0' }, { 'node_modules/x': ent('x', '1.0.0', { dev: true }) });
+  function closureLockFor(root: Record<string, string>, pkgs: Record<string, object>): string { return pj({ name: 'c', version: '1.0.0', lockfileVersion: 3, requires: true, packages: { '': { name: 'c', version: '1.0.0', dependencies: root }, ...pkgs } }); }
+  it('throws for a lock that fails the closure judge (a wrong pin, a bad entry)', () => {
+    expect(() => closureFromLocks([{ text: lockA, pins: [pin('x', '2.0.0')] }])).toThrow(/refused/);
+    expect(() => closureFromLocks([{ text: closureLockFor({ x: '1.0.0' }, { 'node_modules/x': { ...ent('x', '1.0.0'), link: true } }), pins: [pin('x', '1.0.0')] }])).toThrow(/refused/);
+    expect(closureFromLocks([{ text: lockA, pins: [pin('x', '1.0.0')] }]).entries.has('x@1.0.0')).toBe(true);
+  });
+  it('two locks that define the same name@version differently leave it out (it is not reviewed)', () => {
+    const other = closureLockFor({ x: '1.0.0' }, { 'node_modules/x': ent('x', '1.0.0', { dev: true, hasInstallScript: true }) });
+    const c = closureFromLocks([{ text: lockA, pins: [pin('x', '1.0.0')] }, { text: other, pins: [pin('x', '1.0.0')] }]);
+    expect(c.entries.has('x@1.0.0')).toBe(false);
+    // the same entry twice, or differing only in placement flags, is kept
+    const same = closureLockFor({ x: '1.0.0' }, { 'node_modules/x': ent('x', '1.0.0', { dev: true, optional: true }) });
+    expect(closureFromLocks([{ text: lockA, pins: [pin('x', '1.0.0')] }, { text: same, pins: [pin('x', '1.0.0')] }]).entries.has('x@1.0.0')).toBe(true);
   });
 });

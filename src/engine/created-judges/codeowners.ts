@@ -45,6 +45,35 @@ const protectedMatcher = (paths: readonly string[]): ((p: string) => boolean) =>
 };
 
 /**
+ * Concrete paths for a rule pattern, lined up with each protected directory or path: a wildcard segment of the rule takes the protected path's
+ * literal segment at the same position when it matches it (`work*` against `.github/workflows/**` gives `.github/workflows`), and `**` takes the
+ * rest of the protected directory. So `/.github/work*\/deploy.yml` and `/.github/**\/deploy.yml` are tried on `.github/workflows/deploy.yml`.
+ */
+function alignedCandidates(pattern: string, protectedPaths: readonly string[]): string[] {
+  const dirOnly = pattern.endsWith('/');
+  const body = dirOnly ? pattern.slice(0, -1) : pattern;
+  const anchored = body.startsWith('/') || body.includes('/');
+  const rule = body.replace(/^\//, '').split('/');
+  if (!anchored && /[*?]/.test(body)) rule.unshift('**');   // a bare literal name is not lined up with a directory: it names a file nobody has
+  const out: string[] = [];
+  for (const pp of protectedPaths) {
+    if (pp.startsWith('**/')) continue;
+    const prot = pp.replace(/^\//, '').replace(/\/\*\*$/, '').split('/');
+    if (prot.some((x) => x === '' || x === '**')) continue;
+    const segs: string[] = [];
+    let j = 0;
+    for (const r of rule) {
+      if (r === '**') { segs.push(...prot.slice(j)); j = prot.length; continue; }
+      const lit = j < prot.length ? (prot[j] as string) : undefined;
+      segs.push(/[*?]/.test(r) ? (lit !== undefined && picomatch.isMatch(lit, r, { dot: true, nocase: true }) ? lit : concrete(r)) : r);
+      j++;
+    }
+    out.push(segs.join('/'), `${segs.join('/')}/x`);
+  }
+  return out;
+}
+
+/**
  * The user rules AFTER pipegen's block (`after` is the text following it) that own a protected path differently from the block's owners:
  * the last matching rule wins, so such a rule silently takes the path back. Each rule line is tried on the concrete paths its pattern names
  * (the pattern itself, something under it, and at depth for a slashless name); a path counts when the gate treats it as protected and the
@@ -60,7 +89,7 @@ export function codeownersLaterOverrides(after: string, protectedPaths: readonly
     if (rules.length === 0) continue;
     const pat = (rules[0] as { pattern: string }).pattern;
     const c = concrete(pat.replace(/^\//, '').replace(/\/$/, ''));
-    const cands = [c, `${c}/x`, ...(pat.includes('/') ? [] : [`sub/dir/${c}`])];
+    const cands = [c, `${c}/x`, ...(pat.includes('/') ? [] : [`sub/dir/${c}`]), ...alignedCandidates(pat, protectedPaths)];
     const hit = cands.some((p) => isProtected(p) && (ownersOf(rules, p)?.slice().sort().join(',') ?? '\0') !== want);
     if (hit) out.push(line.trim());
   }
@@ -99,6 +128,7 @@ function judge(repo: 'app' | 'central') {
     if (ownerBad !== null) return [`${ownerBad}, so pipegen writes no CODEOWNERS`];
     if (typeof co.writers !== 'number' || !Number.isSafeInteger(co.writers) || co.writers < 0) return ['the count of users with write access is not a whole number, so pipegen writes no CODEOWNERS'];
     if (co.writers >= 2 && co.owners.length < 2) return [`${co.writers} users can write but there is one code owner: that owner could not approve their own pull request, so every protected-path change would be locked (add a second owner, or use the single-writer layout)`];
+
 
     const found = repo === 'app' ? draft.profile.repoFiles.codeowners : ctx.inputs.centralCodeowners;
     if (found === undefined) return ['the central repository\'s existing CODEOWNERS was not given to the referee, so the file path can not be checked'];
