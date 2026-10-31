@@ -37,6 +37,7 @@
     "@types/picomatch": "^4.0.3",
     "execa": "^10.2.0",
     "fast-glob": "^3.3.3",
+    "libsodium-wrappers": "0.8.4",
     "picomatch": "^4.0.7",
     "smol-toml": "^1.9.1",
     "tsup": "^9.0.0",
