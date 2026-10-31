@@ -52,4 +52,14 @@ describe('cooldown: data/base-images.yml', () => {
     expect((await run({}, { 'data/base-images.yml': 'images: nope\n' }, fetchFor({}))).ok).toBe(false);
     expect((await run({}, { 'data/base-images.yml': file([row, row]) }, fetchFor({ [hub('redis', '7.4.5')]: { digest: D1, tag_last_pushed: daysAgo(10) } }))).ok).toBe(false);
   });
+
+  it('M1: an unquoted number tag (tag: 17.10 is the number 17.1) fails and is never looked up as 17.1', async () => {
+    const text = file([{ id: 'postgres-17', image: 'postgres', tag: '"17.10"', digest: D1 }]).replace('tag: "17.10"', 'tag: 17.10');
+    expect(text).toContain('tag: 17.10\n');
+    const seen: string[] = [];
+    const f = (async (input: string | URL | Request) => { seen.push(String(input)); return new Response('{}', { status: 404 }); }) as typeof fetch;
+    const r = await run({}, { 'data/base-images.yml': text }, f);
+    expect(r.ok).toBe(false);
+    expect(seen.some((u) => u.endsWith('/17.1'))).toBe(false);
+  });
 });

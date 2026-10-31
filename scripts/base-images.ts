@@ -125,6 +125,7 @@ export async function refreshBaseImages(deps: RefreshDeps): Promise<RefreshResul
       } catch (e) {
         if (!(e instanceof PinError)) throw e;
         refused.push(`${row.tag}: ${e.message}`);
+        notes.push(`${id} skipped ${row.tag}: ${e.message}`);   // the reviewer sees why an older patch was pinned (D2 review M4)
       }
     }
     if (!done) throw new Error(`${id}: no exact patch tag of ${line.image} could be pinned (needs a tag matching ${line.tagRe.source}, pushed at least ${COOLDOWN_DAYS} days ago, multi-platform). ${refused.join(' | ')}`.trim());

@@ -48,6 +48,8 @@ A security fix that cannot wait 7 days can pass the age rule, but only with the 
 
 The job re-runs when the label is added or removed, when the PR body is edited and on every push. Reviews do not re-run it: after the review, re-run the `cooldown` job.
 
+The path does not apply to `data/base-images.yml`: the loader (`src/engine/base-images.ts`) has its own 7 day rule (`releasedAt` at least 7 days before `pinnedOn`), which the label does not lift. A security fix to a base image waits 7 days or needs a code change.
+
 What it does not change: the path only lifts the age rule. Every other check (registry identity, integrity, SHA and digest match, an upstream date that exists and is not in the future, the lookup cap) still applies, and the path is not considered at all while any other problem remains. Any error reading the PR, its events or its reviews fails the job. When the job passes this way, it says so and lists each young item that passed only because of the label, so the exception stays visible.
 
 Its limits: with one owner, nobody but the owner looks at the PR, so read the listed items before writing the review. And like the rest of this check it is only as strong as enforced code-owner review (next section): a PR can still edit the workflow, and only code-owner review, not enforced yet, stops that.

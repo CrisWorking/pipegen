@@ -32,7 +32,7 @@ export interface BaseImageLine { image: string; tagRe: RegExp }
  * The ids pipegen offers, in file order. `tagRe` demands a fully specified version for the id's major (X.Y.Z; PostgreSQL
  * numbers its releases X.Y) and the variant suffix, so a rolling tag (`22-bookworm-slim`, `latest`) never matches.
  */
-export const BASE_IMAGE_LINES: Readonly<Record<string, BaseImageLine>> = {
+const LINES: Record<string, BaseImageLine> = {
   'node-22-bookworm-slim': { image: 'node', tagRe: /^22\.\d+\.\d+-bookworm-slim$/ },
   'node-24-bookworm-slim': { image: 'node', tagRe: /^24\.\d+\.\d+-bookworm-slim$/ },
   'node-26-bookworm-slim': { image: 'node', tagRe: /^26\.\d+\.\d+-bookworm-slim$/ },
@@ -43,6 +43,8 @@ export const BASE_IMAGE_LINES: Readonly<Record<string, BaseImageLine>> = {
   'mongo-8': { image: 'mongo', tagRe: /^8\.0\.\d+$/ },
   'rabbitmq-4-management': { image: 'rabbitmq', tagRe: /^4\.\d+\.\d+-management$/ },
 };
+for (const line of Object.values(LINES)) Object.freeze(line);
+export const BASE_IMAGE_LINES: Readonly<Record<string, BaseImageLine>> = Object.freeze(LINES);
 
 const DAY_MS = 86_400_000;
 /** A bare official Docker Hub image name: lower case words joined by `.`, `_` or `-`; no registry, namespace, tag or digest. */
@@ -100,7 +102,7 @@ export function parseBaseImages(raw: unknown): BaseImage[] {
     if (seen.has(e.id)) throw new BaseImageError(`data/base-images.yml has a duplicate id: ${e.id}`);
     seen.add(e.id);
   }
-  return res.data.images;
+  return Object.freeze(res.data.images.map((e) => Object.freeze(e))) as BaseImage[];   // frozen: a holder of an entry can not change what baseImageRef returns (D2 review M9)
 }
 
 let cached: { path: string; list: BaseImage[] } | undefined;

@@ -3,7 +3,7 @@
 import { readFileSync } from 'node:fs';
 import { parse } from 'yaml';
 import { describe, expect, it } from 'vitest';
-import { BASE_IMAGE_LINES, baseImageIds, baseImageRef, BaseImageError, nodeBaseImageId, parseBaseImages } from '../src/engine/base-images.js';
+import { BASE_IMAGE_LINES, baseImageIds, baseImageRef, BaseImageError, loadBaseImages, nodeBaseImageId, parseBaseImages } from '../src/engine/base-images.js';
 import { newRateBudget } from '../src/engine/github-rate.js';
 import { PinError } from '../src/engine/pin.js';
 import { mapNodeVersion } from '../src/engine/render-step.js';
@@ -80,6 +80,55 @@ describe('base-images (loader)', () => {
     const list = parseBaseImages(goodList());
     expect(baseImageRef('postgres-17', list)).toBe(`postgres:17.6@${digestOf(Object.keys(BASE_IMAGE_LINES).indexOf('postgres-17') + 1)}`);
     for (const id of ['', 'postgres', 'postgres-18', 'latest', 'node:22', '../node', 'POSTGRES-17', 'constructor', '__proto__', 'toString']) expect(() => baseImageRef(id, list), id).toThrow(BaseImageError);
+  });
+
+  it('M1: an unquoted YAML number tag (17.10 is the number 17.1) is refused, never loaded as 17.1', () => {
+    const text = readFileSync(new URL('../data/base-images.yml', import.meta.url), 'utf8');
+    expect(text).toContain('tag: "17.10"');
+    const unquoted = text.replace('tag: "17.10"', 'tag: 17.10');
+    expect(unquoted).not.toBe(text);
+    expect(refusal((parse(unquoted) as { images: unknown }).images)).toMatch(/tag/);
+    expect(() => parseBaseImages(parse(unquoted))).toThrow(BaseImageError);
+  });
+
+  it('M2: every id refuses a rolling tag, a missing variant, an extra suffix and a prefix', () => {
+    for (const [id, good] of Object.entries(TAGS)) {
+      const m = /^(\d+)\.(\d+)(?:\.(\d+))?(-.+)?$/.exec(good) as RegExpExecArray;
+      const [, major, minor, patch, variant = ''] = m;
+      const bad = new Set<string>([
+        major as string, `${major}.`, `${major}.x`, `${major}${variant}`, `${major}.${minor}${variant}`, `${major}.${minor}.${patch ?? '0'}.1${variant}`,
+        `${major}.${minor}.${patch ?? '0'}${variant}-alpine`, `${good}-alpine`, `${good} x`, `${good}x`, `x${good}`, ` ${good}`, `${good}\n`, `v${good}`, `latest`,
+        ...(variant === '' ? [] : [`${major}.${minor}${patch === undefined ? '' : `.${patch}`}`, variant.slice(1)]),
+      ]);
+      bad.delete(good);
+      for (const tag of bad) expect(refusal(edited(id, { tag })), `${id} ${JSON.stringify(tag)}`).toMatch(/tag/);
+      expect(parseBaseImages(edited(id, { tag: good })), id).toHaveLength(8);
+    }
+  });
+
+  it('M3: the 7 day rule at 7 d (accepted), 7 d minus one second, 6 d 23 h and 6 d (refused)', () => {
+    expect(parseBaseImages(edited('mongo-8', { releasedAt: '2026-10-24T10:00:00Z' }))).toHaveLength(8);
+    for (const releasedAt of ['2026-10-24T10:00:01Z', '2026-10-24T11:00:00Z', '2026-10-25T10:00:00Z']) expect(refusal(edited('mongo-8', { releasedAt })), releasedAt).toMatch(/7 days/);
+  });
+
+  it('M9: the loaded entries, the list, BASE_IMAGE_LINES and its lines are frozen; a mutation throws and baseImageRef is unchanged', () => {
+    const list = parseBaseImages(goodList());
+    const before = baseImageRef('redis-7', list);
+    expect(Object.isFrozen(list)).toBe(true);
+    for (const e of list) expect(Object.isFrozen(e), e.id).toBe(true);
+    expect(() => { (list.find((e) => e.id === 'redis-7') as { tag: string }).tag = 'latest'; }).toThrow(TypeError);
+    expect(() => { (list as unknown as unknown[]).push({}); }).toThrow(TypeError);
+    expect(() => { (list as unknown as unknown[]).length = 0; }).toThrow(TypeError);
+    expect(baseImageRef('redis-7', list)).toBe(before);
+    expect(Object.isFrozen(BASE_IMAGE_LINES)).toBe(true);
+    for (const l of Object.values(BASE_IMAGE_LINES)) expect(Object.isFrozen(l)).toBe(true);
+    expect(() => { (BASE_IMAGE_LINES as Record<string, unknown>).evil = { image: 'evil', tagRe: /./ }; }).toThrow(TypeError);
+    expect(() => { (BASE_IMAGE_LINES['redis-7'] as { image: string }).image = 'evil'; }).toThrow(TypeError);
+    expect(() => parseBaseImages(goodList().concat([entryFor('redis-7', 5)]))).toThrow(/duplicate/);
+    const real = loadBaseImages();
+    expect(Object.isFrozen(real)).toBe(true);
+    for (const e of real) expect(Object.isFrozen(e), e.id).toBe(true);
+    expect(() => { (real[0] as { digest: string }).digest = 'x'; }).toThrow(TypeError);
   });
 });
 
@@ -243,5 +292,26 @@ describe('base-images (refresh)', () => {
     const out = await refreshBaseImages(h.deps as never);
     expect(out.entries.find((e) => e.id === 'redis-7')?.tag).toBe('7.4.4');
     expect(h.calls.filter((c) => c.url.pathname.endsWith('/redis/tags')).length).toBeGreaterThan(1);
+  });
+
+  it('M4: the newest tag wins whatever order Docker Hub lists the tags in (the version sort is asserted)', async () => {
+    const expected = { 'node-22-bookworm-slim': '22.20.1-bookworm-slim', 'node-24-bookworm-slim': '24.10.2-bookworm-slim', 'node-26-bookworm-slim': '26.0.3-bookworm-slim', 'postgres-17': '17.6', 'mysql-8.4': '8.4.6', 'redis-7': '7.4.5', 'mongo-8': '8.0.11', 'rabbitmq-4-management': '4.1.3-management' };
+    const orders: ((r: HubTag[]) => HubTag[])[] = [(r) => [...r].reverse(), (r) => [...r].sort((a, b) => a.name.localeCompare(b.name))];
+    for (const order of orders) {
+      const out = await refreshBaseImages(harness({ rows: (image) => order(hubFor(image)) }).deps as never);
+      expect(Object.fromEntries(out.entries.map((e) => [e.id, e.tag]))).toEqual(expected);
+    }
+    // 10 sorts after 9 as a number, not as text
+    const ten = (image: string): HubTag[] => (image === 'redis' ? [tagRow('7.4.9', 10), tagRow('7.4.10', 10), tagRow('7.4.2', 10)] : hubFor(image));
+    expect((await refreshBaseImages(harness({ rows: ten }).deps as never)).entries.find((e) => e.id === 'redis-7')?.tag).toBe('7.4.10');
+  });
+
+  it('M4: every skipped tag and its reason goes into the notes (main prints them)', async () => {
+    const h = harness({ reject: (r) => r === 'node:24.10.2-bookworm-slim' });
+    const out = await refreshBaseImages(h.deps as never);
+    expect(out.entries.find((e) => e.id === 'node-24-bookworm-slim')?.tag).toBe('24.10.1-bookworm-slim');
+    expect(out.notes.some((n) => n.includes('24.10.2-bookworm-slim: Docker Hub says that moved less than 7 days ago'))).toBe(true);
+    const text = readFileSync(new URL('../scripts/base-images.ts', import.meta.url), 'utf8');
+    expect(text).toMatch(/for \(const n of out\.notes\) console\.log/);
   });
 });
