@@ -20,6 +20,7 @@ describe('base-images (data file)', () => {
       expect(e.reviewedBy, e.id).toMatch(REVIEWER_RE);
       expect(e.reviewedBy, e.id).toBe('Claude delegated DECISIONS 105');
       expect(e.reviewedAt >= e.pinnedOn.slice(0, 10), e.id).toBe(true);
+      expect(e.platforms, e.id).toEqual(expect.arrayContaining(['linux/amd64', 'linux/arm64']));
     }
     // the raw file: no unknown keys, ids unique, and the data file is the one the loader reads
     const raw = parse(readFileSync(packageDataPath('base-images.yml'), 'utf8')) as { images: Record<string, unknown>[] };
@@ -31,7 +32,7 @@ describe('base-images (data file)', () => {
     const byId = new Map(real.map((e) => [e.id, e]));
     for (const [id, image, re] of [
       ['postgres-17', 'postgres', /^17\.\d+$/], ['mysql-8.4', 'mysql', /^8\.4\.\d+$/], ['redis-7', 'redis', /^7\.\d+\.\d+$/],
-      ['mongo-8', 'mongo', /^8\.0\.\d+$/], ['rabbitmq-4-management', 'rabbitmq', /^4\.\d+\.\d+-management$/],
+      ['mongo-8.0', 'mongo', /^8\.0\.\d+$/], ['rabbitmq-4-management', 'rabbitmq', /^4\.\d+\.\d+-management$/],
     ] as const) {
       expect(byId.get(id)?.image, id).toBe(image);
       expect(byId.get(id)?.tag, id).toMatch(re);

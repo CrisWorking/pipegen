@@ -7,6 +7,7 @@
 #   tag         an exact patch tag of that major/variant (never a rolling tag or latest)
 #   digest      the digest of that tag's multi-platform index (resolvePin)
 #   releasedAt  Docker Hub's tag_last_pushed; at least 7 days before pinnedOn (ruling S26)
+#   platforms   the linux platforms the tag's index lists; linux/amd64 and linux/arm64 are both required
 #   pinnedOn    when scripts/base-images.ts pinned it
 #   reviewedBy / reviewedAt  the human review (review-marker.ts). The refresh script writes PENDING and the loader
 #               refuses PENDING in every build, so a refreshed list always needs a review before it is used.
@@ -14,7 +15,8 @@
 # Refresh: see scripts/base-images.ts. Then review every tag and digest and set reviewedBy and reviewedAt in a PR.
 
 # Pinned 2026-10-31 by scripts/base-images.ts (one run; resolvePin checked each digest is the multi-platform index and the Docker Hub
-# record of that very tag, pushed at least 7 days before). mongo 8 is the 8.0.x stable line (8.1 and later are rapid releases).
+# record of that very tag, pushed at least 7 days before). The mongo id is mongo-8.0: the 8.0.x stable line
+# (8.1 and later are rapid releases; upstream's `mongo:8` is 8.3.x). `platforms` is from each tag's registry index (D2 review, 2026-10-31).
 # Review delegated (DECISIONS 105).
 
 images:
@@ -23,6 +25,7 @@ images:
     tag: 22.23.3-bookworm-slim
     digest: sha256:3ed98443660ff48413b5af19ecefce3b9d50845a901a43420d47cc63a9fddbe9
     releasedAt: 2026-10-21T05:39:43.153Z
+    platforms: [linux/amd64, linux/arm, linux/arm64, linux/ppc64le]
     pinnedOn: 2026-10-31T00:42:19.654Z
     reviewedBy: Claude delegated DECISIONS 105
     reviewedAt: 2026-10-31
@@ -31,6 +34,7 @@ images:
     tag: 24.22.0-bookworm-slim
     digest: sha256:91acba91b842bec0bf7ea6f5e09c644c7ccad72c4996ed9616d861d1c7cd60d4
     releasedAt: 2026-10-21T05:41:08.835Z
+    platforms: [linux/amd64, linux/arm64, linux/ppc64le]
     pinnedOn: 2026-10-31T00:42:19.654Z
     reviewedBy: Claude delegated DECISIONS 105
     reviewedAt: 2026-10-31
@@ -39,6 +43,7 @@ images:
     tag: 26.12.0-bookworm-slim
     digest: sha256:742a0fe7320e09e0321222b68165e6ac731d30470e7ea7f98f9bfc3a6e1034fe
     releasedAt: 2026-10-21T05:42:31.142Z
+    platforms: [linux/amd64, linux/arm64, linux/ppc64le]
     pinnedOn: 2026-10-31T00:42:19.654Z
     reviewedBy: Claude delegated DECISIONS 105
     reviewedAt: 2026-10-31
@@ -47,6 +52,7 @@ images:
     tag: "17.10"
     digest: sha256:7958605b474b3d264a969cb3a123d6aa00ad1e1fe9da8a69984dabb704d93317
     releasedAt: 2026-08-05T07:08:57.635Z
+    platforms: [linux/386, linux/amd64, linux/arm, linux/arm64, linux/ppc64le, linux/riscv64, linux/s390x]
     pinnedOn: 2026-10-31T00:42:19.654Z
     reviewedBy: Claude delegated DECISIONS 105
     reviewedAt: 2026-10-31
@@ -55,6 +61,7 @@ images:
     tag: 8.4.11
     digest: sha256:0f51e63e537a1f176423fa03ef559aabe6fa4372a53160a44bc7e75da7d15364
     releasedAt: 2026-10-19T23:02:53.335Z
+    platforms: [linux/amd64, linux/arm64]
     pinnedOn: 2026-10-31T00:42:19.654Z
     reviewedBy: Claude delegated DECISIONS 105
     reviewedAt: 2026-10-31
@@ -63,14 +70,16 @@ images:
     tag: 7.4.11
     digest: sha256:44960b3100c48159a66d28c18b0588c193492e25f7551d60e51dd464fc3eca5b
     releasedAt: 2026-10-21T06:05:34.887Z
+    platforms: [linux/386, linux/amd64, linux/arm, linux/arm64, linux/ppc64le]
     pinnedOn: 2026-10-31T00:42:19.654Z
     reviewedBy: Claude delegated DECISIONS 105
     reviewedAt: 2026-10-31
-  - id: mongo-8
+  - id: mongo-8.0
     image: mongo
     tag: 8.0.32
     digest: sha256:d0d926f94df099bff534b7ee5b5986458131a22489dfff8664509af0c1e2ca9c
     releasedAt: 2026-10-02T06:08:01.739Z
+    platforms: [linux/amd64, linux/arm64]
     pinnedOn: 2026-10-31T00:42:19.654Z
     reviewedBy: Claude delegated DECISIONS 105
     reviewedAt: 2026-10-31
@@ -79,6 +88,7 @@ images:
     tag: 4.3.6-management
     digest: sha256:54cb013d76cd1fd6c0a0708f34062ad61c452bb6f016b434c6c33f1a765d2b58
     releasedAt: 2026-10-17T23:53:13.510Z
+    platforms: [linux/amd64, linux/arm, linux/arm64, linux/ppc64le, linux/riscv64, linux/s390x]
     pinnedOn: 2026-10-31T00:42:19.654Z
     reviewedBy: Claude delegated DECISIONS 105
     reviewedAt: 2026-10-31

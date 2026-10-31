@@ -18,7 +18,7 @@ import { pathToFileURL } from 'node:url';
 import { Octokit } from '@octokit/rest';
 import { stringify } from 'yaml';
 import { z } from 'zod';
-import { BASE_IMAGE_LINES, type BaseImage } from '../src/engine/base-images.js';
+import { BASE_IMAGE_LINES, REQUIRED_PLATFORMS, type BaseImage } from '../src/engine/base-images.js';
 import { newRateBudget } from '../src/engine/github-rate.js';
 import { COOLDOWN_DAYS, PinError, resolvePin, type PinDeps } from '../src/engine/pin.js';
 import { PENDING } from '../src/engine/review-marker.js';
@@ -36,7 +36,7 @@ const MAX_TRIES = 5;
 /** The substring Docker Hub's tag search is asked for; the exact shape is still judged locally by the id's tagRe. */
 const HUB_SEARCH: Readonly<Record<string, string>> = {
   'node-22-bookworm-slim': '22.', 'node-24-bookworm-slim': '24.', 'node-26-bookworm-slim': '26.',
-  'postgres-17': '17.', 'mysql-8.4': '8.4.', 'redis-7': '7.', 'mongo-8': '8.0.', 'rabbitmq-4-management': '4.',
+  'postgres-17': '17.', 'mysql-8.4': '8.4.', 'redis-7': '7.', 'mongo-8.0': '8.0.', 'rabbitmq-4-management': '4.',
 };
 
 const pageSchema = z.object({
@@ -105,7 +105,7 @@ export async function refreshBaseImages(deps: RefreshDeps): Promise<RefreshResul
       const pushed = Date.parse(r.tag_last_pushed ?? '');
       if (!Number.isFinite(pushed) || now() - pushed < COOLDOWN_DAYS * DAY_MS) continue;
       const set = [...new Set((r.images ?? []).filter((i) => i.os === 'linux' && typeof i.architecture === 'string' && i.architecture !== 'unknown').map((i) => `linux/${i.architecture as string}`))].sort();
-      if (set.length < 2) continue;   // not a multi-platform list (resolvePin checks the registry's own answer as well)
+      if (!REQUIRED_PLATFORMS.every((p) => set.includes(p))) continue;   // linux/amd64 and linux/arm64 are both required (resolvePin checks the registry's own answer as well)
       rows.push({ tag: r.name, pushed, platforms: set });
     }
     rows.sort(newerFirst);
@@ -118,7 +118,7 @@ export async function refreshBaseImages(deps: RefreshDeps): Promise<RefreshResul
         const pinned = await pin(cand, pinDeps, install);
         const digest = pinned.pin.digest;
         if (digest === undefined) throw new PinError(`resolvePin gave no digest for ${line.image}:${row.tag}.`);
-        entries.push({ id, image: line.image, tag: row.tag, digest, releasedAt: new Date(row.pushed).toISOString(), pinnedOn, reviewedBy: PENDING, reviewedAt: PENDING });
+        entries.push({ id, image: line.image, tag: row.tag, digest, releasedAt: new Date(row.pushed).toISOString(), platforms: row.platforms, pinnedOn, reviewedBy: PENDING, reviewedAt: PENDING });
         platforms[id] = row.platforms;
         done = true;
         break;
@@ -142,6 +142,7 @@ const HEADER = `# pipegen's reviewed base-image list (v0.2 Plan D, D2, ruling B3
 #   tag         an exact patch tag of that major/variant (never a rolling tag or latest)
 #   digest      the digest of that tag's multi-platform index (resolvePin)
 #   releasedAt  Docker Hub's tag_last_pushed; at least 7 days before pinnedOn (ruling S26)
+#   platforms   the linux platforms Docker Hub lists for the tag; linux/amd64 and linux/arm64 are both required
 #   pinnedOn    when scripts/base-images.ts pinned it
 #   reviewedBy / reviewedAt  the human review (review-marker.ts). The refresh script writes PENDING and the loader
 #               refuses PENDING in every build, so a refreshed list always needs a review before it is used.

@@ -15,12 +15,12 @@ const PINNED = '2026-10-31T10:00:00Z';
 const digestOf = (n: number): string => `sha256:${n.toString(16).padStart(64, '0')}`;
 const TAGS: Record<string, string> = {
   'node-22-bookworm-slim': '22.20.1-bookworm-slim', 'node-24-bookworm-slim': '24.10.2-bookworm-slim', 'node-26-bookworm-slim': '26.0.3-bookworm-slim',
-  'postgres-17': '17.6', 'mysql-8.4': '8.4.6', 'redis-7': '7.4.5', 'mongo-8': '8.0.12', 'rabbitmq-4-management': '4.1.3-management',
+  'postgres-17': '17.6', 'mysql-8.4': '8.4.6', 'redis-7': '7.4.5', 'mongo-8.0': '8.0.12', 'rabbitmq-4-management': '4.1.3-management',
 };
 function entryFor(id: string, n: number): Record<string, unknown> {
   return {
     id, image: BASE_IMAGE_LINES[id]?.image, tag: TAGS[id], digest: digestOf(n), releasedAt: '2026-10-10T08:00:00Z', pinnedOn: PINNED,
-    reviewedBy: 'Claude delegated DECISIONS 105', reviewedAt: '2026-10-31',
+    reviewedBy: 'Claude delegated DECISIONS 105', reviewedAt: '2026-10-31', platforms: ['linux/amd64', 'linux/arm64'],
   };
 }
 const goodList = (): Record<string, unknown>[] => Object.keys(BASE_IMAGE_LINES).map((id, i) => entryFor(id, i + 1));
@@ -37,7 +37,7 @@ describe('base-images (loader)', () => {
     for (const tag of ['22-bookworm-slim', '22.20-bookworm-slim', 'latest', 'lts-bookworm-slim', '22.20.1', '22.20.1-bookworm-slim\n', '22.20.1-bookworm-slim latest']) expect(refusal(edited('node-22-bookworm-slim', { tag })), tag).toMatch(/tag/);
     expect(refusal(edited('postgres-17', { tag: '17' }))).toMatch(/tag/);
     // mongo 8: the stable 8.0 line only; 8.1+ are rapid releases
-    for (const tag of ['8.3.11', '8.1.0', '8.0', '8']) expect(refusal(edited('mongo-8', { tag })), tag).toMatch(/tag/);
+    for (const tag of ['8.3.11', '8.1.0', '8.0', '8']) expect(refusal(edited('mongo-8.0', { tag })), tag).toMatch(/tag/);
     expect(refusal(edited('postgres-17', { tag: 'latest' }))).toMatch(/tag/);
     for (const digest of [undefined, '', 'sha256:abc', `sha256:${'a'.repeat(63)}`, `sha256:${'A'.repeat(64)}`, 'a'.repeat(64), `sha512:${'a'.repeat(64)}`]) expect(refusal(edited('redis-7', { digest })), String(digest)).toMatch(/digest/);
   });
@@ -57,10 +57,10 @@ describe('base-images (loader)', () => {
   });
 
   it('refuses releasedAt less than 7 days before pinnedOn, and an unreadable date', () => {
-    expect(refusal(edited('mongo-8', { releasedAt: '2026-10-25T10:00:01Z' }))).toMatch(/7 days/);
-    expect(parseBaseImages(edited('mongo-8', { releasedAt: '2026-10-24T10:00:00Z' }))).toHaveLength(8);
-    expect(refusal(edited('mongo-8', { releasedAt: '2026-11-30T10:00:00Z' }))).toMatch(/7 days/);
-    expect(refusal(edited('mongo-8', { releasedAt: 'yesterday' }))).not.toBe('');
+    expect(refusal(edited('mongo-8.0', { releasedAt: '2026-10-25T10:00:01Z' }))).toMatch(/7 days/);
+    expect(parseBaseImages(edited('mongo-8.0', { releasedAt: '2026-10-24T10:00:00Z' }))).toHaveLength(8);
+    expect(refusal(edited('mongo-8.0', { releasedAt: '2026-11-30T10:00:00Z' }))).toMatch(/7 days/);
+    expect(refusal(edited('mongo-8.0', { releasedAt: 'yesterday' }))).not.toBe('');
   });
 
   it('refuses a bad reviewedBy: REVIEWER_RE plus the shared marker rules', () => {
@@ -91,6 +91,20 @@ describe('base-images (loader)', () => {
     expect(() => parseBaseImages(parse(unquoted))).toThrow(BaseImageError);
   });
 
+  it('M6: platforms must hold linux/amd64 and linux/arm64 (an amd64 + 386 index, a lone amd64, an empty or a missing list is refused)', () => {
+    for (const platforms of [['linux/amd64', 'linux/386'], ['linux/amd64'], ['linux/arm64'], [], undefined, 'linux/amd64', ['linux/amd64', 'linux/arm64\n'], ['windows/amd64', 'linux/arm64'], [1, 2]]) {
+      expect(refusal(edited('redis-7', { platforms })), JSON.stringify(platforms)).toMatch(/platforms/);
+    }
+    expect(parseBaseImages(edited('redis-7', { platforms: ['linux/386', 'linux/amd64', 'linux/arm', 'linux/arm64'] }))).toHaveLength(8);
+  });
+
+  it('M5: the mongo id is mongo-8.0 (upstream mongo:8 is 8.3.x, a different line); no mongo-8 id', () => {
+    expect(Object.keys(BASE_IMAGE_LINES)).toContain('mongo-8.0');
+    expect(Object.keys(BASE_IMAGE_LINES)).not.toContain('mongo-8');
+    expect(() => baseImageRef('mongo-8', parseBaseImages(goodList()))).toThrow(BaseImageError);
+    expect(baseImageIds()).toContain('mongo-8.0');
+  });
+
   it('M2: every id refuses a rolling tag, a missing variant, an extra suffix and a prefix', () => {
     for (const [id, good] of Object.entries(TAGS)) {
       const m = /^(\d+)\.(\d+)(?:\.(\d+))?(-.+)?$/.exec(good) as RegExpExecArray;
@@ -107,8 +121,8 @@ describe('base-images (loader)', () => {
   });
 
   it('M3: the 7 day rule at 7 d (accepted), 7 d minus one second, 6 d 23 h and 6 d (refused)', () => {
-    expect(parseBaseImages(edited('mongo-8', { releasedAt: '2026-10-24T10:00:00Z' }))).toHaveLength(8);
-    for (const releasedAt of ['2026-10-24T10:00:01Z', '2026-10-24T11:00:00Z', '2026-10-25T10:00:00Z']) expect(refusal(edited('mongo-8', { releasedAt })), releasedAt).toMatch(/7 days/);
+    expect(parseBaseImages(edited('mongo-8.0', { releasedAt: '2026-10-24T10:00:00Z' }))).toHaveLength(8);
+    for (const releasedAt of ['2026-10-24T10:00:01Z', '2026-10-24T11:00:00Z', '2026-10-25T10:00:00Z']) expect(refusal(edited('mongo-8.0', { releasedAt })), releasedAt).toMatch(/7 days/);
   });
 
   it('M9: the loaded entries, the list, BASE_IMAGE_LINES and its lines are frozen; a mutation throws and baseImageRef is unchanged', () => {
@@ -243,7 +257,7 @@ describe('base-images (refresh)', () => {
     const tags = Object.fromEntries(out.entries.map((e) => [e.id, e.tag]));
     expect(tags).toEqual({
       'node-22-bookworm-slim': '22.20.1-bookworm-slim', 'node-24-bookworm-slim': '24.10.2-bookworm-slim', 'node-26-bookworm-slim': '26.0.3-bookworm-slim',
-      'postgres-17': '17.6', 'mysql-8.4': '8.4.6', 'redis-7': '7.4.5', 'mongo-8': '8.0.11', 'rabbitmq-4-management': '4.1.3-management',
+      'postgres-17': '17.6', 'mysql-8.4': '8.4.6', 'redis-7': '7.4.5', 'mongo-8.0': '8.0.11', 'rabbitmq-4-management': '4.1.3-management',
     });
     expect(out.entries.map((e) => e.id)).toEqual(Object.keys(BASE_IMAGE_LINES));
     // every pin went through resolvePin with the image name and the exact tag; nothing else decides the digest
@@ -253,7 +267,8 @@ describe('base-images (refresh)', () => {
       expect(e.pinnedOn).toBe('2026-10-31T10:00:00.000Z');
       expect(Date.parse(e.pinnedOn) - Date.parse(e.releasedAt)).toBeGreaterThanOrEqual(7 * DAY);
     }
-    expect(out.platforms['mongo-8']).toEqual(['linux/amd64', 'linux/arm64']);
+    expect(out.platforms['mongo-8.0']).toEqual(['linux/amd64', 'linux/arm64']);
+    for (const e of out.entries) expect(e.platforms, e.id).toEqual(out.platforms[e.id]);   // recorded in each entry, so the reviewer sees them
     for (const call of h.calls) expect(call.url.hostname).toBe('hub.docker.com');
   });
 
@@ -286,6 +301,16 @@ describe('base-images (refresh)', () => {
     await expect(refreshBaseImages({ ...h.deps, fetch: down.fetch } as never)).rejects.toThrow(/Docker Hub's tag list for node answered 404/);
   });
 
+  it('M6: a tag listed for linux/amd64 and linux/386 (or amd64 and arm/v7 only) is skipped: both amd64 and arm64 are required', async () => {
+    const odd = (image: string): HubTag[] => (image === 'redis'
+      ? [tagRow('7.4.5', 10, [{ architecture: 'amd64', os: 'linux' }, { architecture: '386', os: 'linux' }]), tagRow('7.4.4', 10, [{ architecture: 'amd64', os: 'linux' }, { architecture: 'arm', os: 'linux' }]), tagRow('7.4.3', 10, [{ architecture: 'arm64', os: 'linux' }, { architecture: 'amd64', os: 'windows' }]), tagRow('7.4.2', 10, [{ architecture: 'arm64', os: 'linux' }, { architecture: 'amd64', os: 'linux' }, { architecture: '386', os: 'linux' }])]
+      : hubFor(image));
+    const out = await refreshBaseImages(harness({ rows: odd }).deps as never);
+    const redis = out.entries.find((e) => e.id === 'redis-7');
+    expect(redis?.tag).toBe('7.4.2');
+    expect(redis?.platforms).toEqual(['linux/386', 'linux/amd64', 'linux/arm64']);
+  });
+
   it('pages through the Docker Hub list and ignores a tag whose list is single-platform or absent', async () => {
     const many = (image: string): HubTag[] => (image === 'redis' ? [...Array.from({ length: 150 }, (_, i) => tagRow(`7.4.${200 - i}-alpine`, 20)), tagRow('7.4.5', 10, [{ architecture: 'amd64', os: 'linux' }]), tagRow('7.4.4', 20)] : hubFor(image));
     const h = harness({ rows: many });
@@ -295,7 +320,7 @@ describe('base-images (refresh)', () => {
   });
 
   it('M4: the newest tag wins whatever order Docker Hub lists the tags in (the version sort is asserted)', async () => {
-    const expected = { 'node-22-bookworm-slim': '22.20.1-bookworm-slim', 'node-24-bookworm-slim': '24.10.2-bookworm-slim', 'node-26-bookworm-slim': '26.0.3-bookworm-slim', 'postgres-17': '17.6', 'mysql-8.4': '8.4.6', 'redis-7': '7.4.5', 'mongo-8': '8.0.11', 'rabbitmq-4-management': '4.1.3-management' };
+    const expected = { 'node-22-bookworm-slim': '22.20.1-bookworm-slim', 'node-24-bookworm-slim': '24.10.2-bookworm-slim', 'node-26-bookworm-slim': '26.0.3-bookworm-slim', 'postgres-17': '17.6', 'mysql-8.4': '8.4.6', 'redis-7': '7.4.5', 'mongo-8.0': '8.0.11', 'rabbitmq-4-management': '4.1.3-management' };
     const orders: ((r: HubTag[]) => HubTag[])[] = [(r) => [...r].reverse(), (r) => [...r].sort((a, b) => a.name.localeCompare(b.name))];
     for (const order of orders) {
       const out = await refreshBaseImages(harness({ rows: (image) => order(hubFor(image)) }).deps as never);

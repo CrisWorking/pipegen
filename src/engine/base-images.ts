@@ -39,13 +39,15 @@ const LINES: Record<string, BaseImageLine> = {
   'postgres-17': { image: 'postgres', tagRe: /^17\.\d+$/ },
   'mysql-8.4': { image: 'mysql', tagRe: /^8\.4\.\d+$/ },
   'redis-7': { image: 'redis', tagRe: /^7\.\d+\.\d+$/ },
-  // 8.0.x only: 8.1 and later minors are MongoDB rapid releases, not the stable line
-  'mongo-8': { image: 'mongo', tagRe: /^8\.0\.\d+$/ },
+  // 8.0.x only: 8.1 and later minors are MongoDB rapid releases, not the stable line. The id says so (upstream `mongo:8` is 8.3.x, a different line)
+  'mongo-8.0': { image: 'mongo', tagRe: /^8\.0\.\d+$/ },
   'rabbitmq-4-management': { image: 'rabbitmq', tagRe: /^4\.\d+\.\d+-management$/ },
 };
 for (const line of Object.values(LINES)) Object.freeze(line);
 export const BASE_IMAGE_LINES: Readonly<Record<string, BaseImageLine>> = Object.freeze(LINES);
 
+/** Platforms every base image must offer. */
+export const REQUIRED_PLATFORMS: readonly string[] = Object.freeze(['linux/amd64', 'linux/arm64']);
 const DAY_MS = 86_400_000;
 /** A bare official Docker Hub image name: lower case words joined by `.`, `_` or `-`; no registry, namespace, tag or digest. */
 const BARE_NAME_RE = /^[a-z0-9]+(?:[._-][a-z0-9]+)*$/;
@@ -61,6 +63,8 @@ const entrySchema = z.object({
   /** The digest of the tag's multi-platform index. */
   digest: z.string().regex(DIGEST_RE, 'digest must be sha256:<64 lower-case hex>'),
   releasedAt: z.string().regex(ISO_DATE_RE),
+  /** The linux platforms the index lists. linux/amd64 and linux/arm64 are both required (CI runs on one, developers on the other). */
+  platforms: z.array(z.string().max(32)).max(32).refine((p) => REQUIRED_PLATFORMS.every((r) => p.includes(r)), `platforms must list ${REQUIRED_PLATFORMS.join(' and ')}`),
   /** When the entry was pinned; releasedAt must be at least the cooldown before it (ruling S26). */
   pinnedOn: z.string().regex(ISO_DATE_RE),
   reviewedBy: z.string().max(100),
