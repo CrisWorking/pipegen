@@ -17,7 +17,9 @@
 //     the semgrep rules commit's tree must be PIPEGEN_RULES_TREE, dated by GitHub's signature verified_at (the git
 //     dates are the pusher's). A hash- or URL-shaped value at any field this script doesn't know fails, and so do a
 //     duplicate or missing id;
-//   - pinned binaries: every platform url and sha256 must belong to the GitHub release of that version.
+//   - pinned binaries: every platform url and sha256 must belong to the GitHub release of that version;
+//   - base images (data/base-images.yml, changed entries): a bare official Docker Hub image whose digest is the tag's digest on
+//     Docker Hub; date = the tag's last push.
 // Anything that can't be tied and dated (lookup failed, 404, no digest, unreadable date, date in the future,
 // a kind this script doesn't know) fails closed. A docker pin it can't date says "needs owner review".
 //
@@ -47,14 +49,14 @@ const CONCURRENCY = 6;
 
 /** pipegen's own repository (lower case, exact; same value as reviewed.ts PIPEGEN_OWN_REPO, which a test ties): its action entry skips the 7-day rule. */
 export const PIPEGEN_OWN_REPO = 'crisworking/pipegen';
-export const WATCHED_FILES = ['package.json', 'package-lock.json', 'data/reviewed-tools.yml', 'data/pinned-binaries.yml'] as const;
+export const WATCHED_FILES = ['package.json', 'package-lock.json', 'data/reviewed-tools.yml', 'data/pinned-binaries.yml', 'data/base-images.yml'] as const;
 /** Read from the base checkout only: it names who may grant the emergency path. */
 export const CODEOWNERS_FILE = '.github/CODEOWNERS';
 /** File contents by repo-relative path; a missing file is absent or null. */
 export type Files = Partial<Record<string, string | null>>;
 
 export interface Finding {
-  kind: 'npm' | 'pypi' | 'reviewed-tool' | 'pinned-binary' | 'lockfile' | 'security-fix';
+  kind: 'npm' | 'pypi' | 'reviewed-tool' | 'pinned-binary' | 'base-image' | 'lockfile' | 'security-fix';
   name: string;
   version: string;
   /** ISO publish date used for the decision, or null when none could be found. */
@@ -902,6 +904,40 @@ export function binaryItems(base: string | null | undefined, head: string | null
   return items;
 }
 
+/**
+ * Everything to check for the added or changed entries of data/base-images.yml (D2): the image must be a bare official
+ * Docker Hub name, and its digest must be the Docker Hub tag's digest (dockerOutcome); the date is the tag's push date.
+ * The review marker is not part of what is judged. A file that is not a list, or has a duplicate or unreadable id, fails.
+ */
+export function baseImageItems(base: string | null | undefined, head: string | null | undefined): Item[] {
+  const rowsOf = (text: string | null | undefined): unknown[] | undefined => {
+    const doc = yamlObj('data/base-images.yml', text);
+    return Array.isArray(doc.images) ? doc.images : undefined;
+  };
+  const was = new Map<string, string>();
+  for (const r of rowsOf(base) ?? []) if (isObj(r) && str(r.id)) was.set(str(r.id) as string, canon(r, BINARY_SKIP));
+  const now = rowsOf(head);
+  if (head && now === undefined) return [{ kind: 'base-image', name: 'data/base-images.yml', version: '', run: async () => fail('images is not a list') }];
+  const items: Item[] = [];
+  const seen = new Set<string>();
+  for (const r of now ?? []) {
+    const id = isObj(r) ? str(r.id) : undefined;
+    if (!isObj(r) || id === undefined || seen.has(id)) {
+      items.push({ kind: 'base-image', name: id ?? '?', version: '', run: async () => fail('not an entry with a unique id') });
+      continue;
+    }
+    seen.add(id);
+    if (was.get(id) === canon(r, BINARY_SKIP)) continue;
+    const image = str(r.image) ?? '';
+    const tag = str(r.tag) ?? '';
+    items.push({
+      kind: 'base-image', name: id, version: tag,
+      run: async (ctx) => (/^[a-z0-9][a-z0-9._-]*$/.test(image) ? dockerOutcome(ctx, image, tag, str(r.digest)) : fail('image is not a bare official Docker Hub name; needs owner review')),
+    });
+  }
+  return items;
+}
+
 // --- the security-fix emergency path ------------------------------------------------------------------------------
 
 export const SECURITY_FIX_LABEL = 'security-fix';
@@ -1158,7 +1194,7 @@ export async function runCooldown(opts: CooldownOptions): Promise<CooldownResult
       });
     }
   }
-  for (const i of [...reviewedItems(base['data/reviewed-tools.yml'], head['data/reviewed-tools.yml'], opts.release === true), ...binaryItems(base['data/pinned-binaries.yml'], head['data/pinned-binaries.yml'])]) {
+  for (const i of [...reviewedItems(base['data/reviewed-tools.yml'], head['data/reviewed-tools.yml'], opts.release === true), ...binaryItems(base['data/pinned-binaries.yml'], head['data/pinned-binaries.yml']), ...baseImageItems(base['data/base-images.yml'], head['data/base-images.yml'])]) {
     jobs.push({ kind: i.kind, name: i.name, version: i.version, run: () => i.run(ctx) });
   }
 
