@@ -22,7 +22,7 @@ import { isRunnable } from '../engine/needs.js';
 import { NAME_RE } from '../read/manifest.js';
 import { SERVICE_NAME_RE } from '../read/project.js';
 import type { CreatedFile, Dependency, RepoProfile, RuntimeEnv, Service } from '../types.js';
-import { safeText } from '../util/safe-text.js';
+import { activeSafeText as safeText } from '../util/known-values.js';
 import { APP_PREFIX, DB_PASSWORD_BYTES, DB_PASSWORD_NAME, DEP_KEYS, DEP_TABLE, ENV_TABLE, isDepKey, VALUE_TABLE, type DepKey, type VarKind } from './compose-tables.js';
 
 export { DEP_TABLE, ENV_TABLE, VALUE_TABLE };

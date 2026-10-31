@@ -5,6 +5,7 @@ import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { guardCreatedFiles, type GuardCtx } from '../src/create/guard.js';
 import { SecretVault } from '../src/create/secrets.js';
+import { activeSafeText } from '../src/util/known-values.js';
 import { CREATED_RULES } from '../src/engine/created-files.js';
 import { referee, type Linters } from '../src/engine/referee.js';
 import type { CreatedFile, PipelineDraft } from '../src/types.js';
@@ -247,5 +248,87 @@ describe('B2: the guard cleans before it cuts or escapes', () => {
       expect(r.refused.length + r.notes.length, value).toBeGreaterThan(0);
       expect(JSON.stringify(r), value).not.toMatch(/Abcdefgh12345678|\?bcdefgh12345678|\uff41/);
     }
+  });
+});
+
+describe('B4 layer 1 in the judges: decoded text (YAML escapes, JSON escapes, draft strings) is checked', () => {
+  const PRE = 'j'.repeat(40);
+  const fixedOnly = (r: Awaited<ReturnType<typeof ref>>): void => {
+    expect(r.ok).toBe(false);
+    expect(r.issues.length).toBeGreaterThan(0);
+    expect(r.issues.every((i) => i.check === 'secret-value')).toBe(true);
+    const shown = JSON.stringify(r);
+    for (let k = 0; k + 4 <= VAL.length; k++) expect(shown, VAL.slice(k, k + 4)).not.toContain(VAL.slice(k, k + 4));
+  };
+  const wfFile = (body: string): CreatedFile => ({ path: '.github/workflows/ci.yml', content: `name: ci\non: [push]\njobs:\n${body}`, part: 'pipeline', reason: 'r', repo: 'central' });
+  // the value with one character written as a YAML escape: the raw text does not hold it, the parsed text does
+  const esc = `${VAL.slice(0, 6)}\\x6d${VAL.slice(7)}`;   // \x6d is "m"
+
+  it('referee: a YAML \\x escape in a step name and in a job id', async () => {
+    fixedOnly(await ref([wfFile(`  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n        name: "${PRE}${esc}"\n`)], vaultOf(VAL)));
+    fixedOnly(await ref([wfFile(`  "${PRE}${esc}":\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n`)], vaultOf(VAL)));
+  });
+
+  it('referee: a YAML escaped line break (a folded double-quoted scalar) in a step name', async () => {
+    const folded = `${VAL.slice(0, 6)}\\\n            ${VAL.slice(6)}`;
+    fixedOnly(await ref([wfFile(`  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n        name: "${PRE}${folded}"\n`)], vaultOf(VAL)));
+  });
+
+  it('referee: ESC inside a raw file (the display would eat it and a character)', async () => {
+    fixedOnly(await ref([file(`FROM node:24\nENV X=${VAL.slice(0, 6)}\u001b${VAL.slice(6)}\n`)], vaultOf(VAL)));
+  });
+
+  it('referee: draft strings and keys split by BEL, NUL or ESC (JSON.stringify would write them as \\u escapes)', async () => {
+    for (const ch of ['\u0007', '\u0000', '\u001b']) {
+      const d = mkDraft();
+      (d as unknown as { steps: unknown[] }).steps = [{ needId: `${PRE}${VAL.slice(0, 6)}${ch}${VAL.slice(6)}` }];
+      fixedOnly(await referee([file('FROM node:24\n')], d, platform(), reviewedList(), LINTERS, 'tok', { runLinters: async () => [], vault: vaultOf(VAL) }));
+      const k = mkDraft();
+      (k as unknown as { notProven: unknown[] }).notProven = [{ [`${VAL.slice(0, 6)}${ch}${VAL.slice(6)}`]: 1 }];
+      fixedOnly(await referee([file('FROM node:24\n')], k, platform(), reviewedList(), LINTERS, 'tok', { runLinters: async () => [], vault: vaultOf(VAL) }));
+    }
+  });
+
+  it('referee: a custom judge that cuts a value with the shared cutter is scrubbed first (the vault is active inside the referee)', async () => {
+    const quoting = CREATED_RULES.map((r) => (r.id === 'dockerfile' ? { ...r, judge: () => [`base ${activeSafeText(`${'j'.repeat(180)}${VAL}`, 200)}`] } : r));
+    const r = await referee([file('FROM node:24\n')], mkDraft(), platform(), reviewedList(), LINTERS, 'tok', { runLinters: async () => [], vault: vaultOf(VAL), createdRules: quoting });
+    expect(r.issues.length).toBeGreaterThan(0);
+    const shown = JSON.stringify(r);
+    for (let k = 0; k + 4 <= VAL.length; k++) expect(shown, VAL.slice(k, k + 4)).not.toContain(VAL.slice(k, k + 4));
+  });
+
+  it('referee: JSON escapes in a package file and YAML escapes in a compose file are checked decoded', async () => {
+    const enc = `${VAL.slice(0, 6)}\\u006d${VAL.slice(7)}`;
+    fixedOnly(await ref([file(`{"devDependencies": {"${PRE}${enc}": "1.0.0"}}`, { path: 'api/package.json', part: 'tests', edited: { original: '{}' } })], vaultOf(VAL)));
+    fixedOnly(await ref([file(`services:\n  "${PRE}${esc}":\n    image: x\n`, { path: 'docker-compose.pipegen.yml', part: 'compose' })], vaultOf(VAL)));
+  });
+
+  it('referee: NFD value, NFC text', async () => {
+    const nfc = 'caf\u00e9-key-12345';
+    const v = new SecretVault();
+    v.set('K_UNI', nfc.normalize('NFD'));
+    const r = await ref([file(`FROM node:24\nENV X=${nfc}\n`)], v);
+    expect(r.issues.map((i) => i.check)).toEqual(['secret-value']);
+  });
+
+  it('guard: a JSON \\u escape in a package.json key, a lock key and a script name is refused before any judge reads it', async () => {
+    const enc = `${VAL.slice(0, 6)}\\u006d${VAL.slice(7)}`;   // the key as written holds a \u006d escape
+    for (const [path, text] of [
+      ['api/package.json', `{"devDependencies": {"${PRE}${enc}": "1.0.0"}}`],
+      ['api/package.json', `{"scripts": {"${enc}": "x"}}`],
+      ['api/package-lock.json', `{"packages": {"node_modules/${enc}": {"version": "1.0.0"}}}`],
+    ] as const) {
+      const f = file(text, { path, part: 'tests', edited: { original: '{}' } });
+      const r = await guardCreatedFiles([f], guardCtx(vaultOf(VAL)));
+      expect(r.ok, path).toEqual([]);
+      expect(r.refused[0]?.reason, path).toMatch(/value you gave pipegen/);
+      const shown = JSON.stringify(r);
+      for (let k = 0; k + 4 <= VAL.length; k++) expect(shown, VAL.slice(k, k + 4)).not.toContain(VAL.slice(k, k + 4));
+    }
+  });
+
+  it('guard: ESC in a raw Dockerfile', async () => {
+    const r = await guardCreatedFiles([file(`FROM node:24\nENV X=${VAL.slice(0, 6)}\u001b${VAL.slice(6)}\n`)], guardCtx(vaultOf(VAL)));
+    expect(r.ok).toEqual([]);
   });
 });

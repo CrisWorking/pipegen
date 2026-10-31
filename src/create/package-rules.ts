@@ -20,6 +20,7 @@
 //     version satisfies the range; a range that can not be read is refused. A new entry no added package reaches is refused;
 //   - each added root devDependency is a reviewed pin at the table's version, at `node_modules/<name>`.
 //   Without a reviewed closure every lock edit is refused.
+import { scrubActive } from '../util/known-values.js';
 import { isDeepStrictEqual } from 'node:util';
 import { lockEntryProblems } from '../engine/npm-closure.js';
 import { nameOfLockKey, withoutPlacement, type ReviewedClosure } from './reviewed-closure.js';
@@ -44,7 +45,7 @@ const same = (a: unknown, b: unknown): boolean => isDeepStrictEqual(a, b);
 const exact = (a: unknown, b: unknown): boolean => JSON.stringify(a) === JSON.stringify(b);
 /** Whether the keys of `o` that `n` also has come in the same relative order as in `o` (added keys may sit anywhere). */
 const keepsOrder = (o: Rec, n: Rec): boolean => Object.keys(n).filter((k) => has(o, k)).join('\0') === Object.keys(o).join('\0');
-const show = (s: string): string => (s.length > 60 ? `${s.slice(0, 57)}...` : s);
+const show = (s: string): string => { const t = scrubActive(s); return t.length > 60 ? `${t.slice(0, 57)}...` : t; };   // scrubbed with the active vault BEFORE the cut (D5)
 
 /**
  * JSON.parse that also refuses a repeated key at any depth and nesting over 64 levels. Objects have no prototype, so a `__proto__` key

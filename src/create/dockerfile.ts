@@ -17,7 +17,7 @@ import { aiSchema, type AiSchema } from '../ai/schema.js';
 import { baseImageRef, BaseImageError, loadBaseImages, nodeBaseImageId } from '../engine/base-images.js';
 import { createdPathProblem } from '../engine/job-rules.js';
 import type { AiProvider, AiRequest, AiUsage, CreatedFile, RepoProfile, Service } from '../types.js';
-import { safeText } from '../util/safe-text.js';
+import { activeSafeText as safeText } from '../util/known-values.js';
 import { buildsInsideOf, dockerfileProblems, dockerignoreText, envPairs, parseDockerfile, SECRET_NAME_RE, userIsRoot, type DockerfileCtx } from './dockerfile-rules.js';
 
 const TIMEOUT_MS = 180_000;

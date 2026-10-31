@@ -15,7 +15,7 @@
 //   archives, the run-time slots (slots.ts), container actions and renderProjectScript.
 import { isDeepStrictEqual } from 'node:util';
 import { Scalar, YAMLMap, YAMLSeq } from 'yaml';
-import { safeText } from '../util/safe-text.js';
+import { activeSafeText as safeText } from '../util/known-values.js';
 import { DEPENDENCY_KINDS, type OutputFormat, type PipelineDraft, type RepoProfile, type ReviewedTool, type RuntimeEnv, type Service, type StepSpec } from '../types.js';
 import { APP_PREFIX, containerValue, DB_PASSWORD_BYTES, DB_PASSWORD_NAME, DB_USER, ENV_TABLE, isDepKey, VALUE_TABLE, VAR_KINDS } from '../create/compose-tables.js';
 import { COMMIT_SHA_RE } from './names.js';

@@ -10,7 +10,9 @@ import {
 } from '../src/create/secrets.js';
 import { isDangerousName } from '../src/engine/job-rules.js';
 import { displayForm } from '../src/util/safe-text.js';
-import { scrubForDisplay } from '../src/util/known-values.js';
+import { activeSafeText, anyString, scrubForDisplay, withActiveVault } from '../src/util/known-values.js';
+import { show } from '../src/engine/render-error.js';
+import { packageJsonProblems } from '../src/create/package-rules.js';
 import { runExitHooks } from '../src/util/exit-hooks.js';
 import type { CreatedFile, Dependency, DependencyKind, Service } from '../src/types.js';
 import { makeOctokit } from '../src/github/client.js';
@@ -728,5 +730,99 @@ describe('displayForm, containsKnownValue and scrubForDisplay (B1)', () => {
     v.set('K_LONG', VAL);
     expect(scrubForDisplay(v, `x ${VAL} y`)).toBe('x [REDACTED] y');
     expect(scrubForDisplay(v, `${'j'.repeat(195)}${split('\u200b')}`).includes(VAL.slice(0, 4))).toBe(false);
+  });
+});
+
+describe('B4 layer 1: containsKnownValue sees decoded and altered forms', () => {
+  const VAL = 'Zq7Rk2mW9xLp4Tn8Hy6Vb3Nc';
+  function vault(value: string = VAL): SecretVault {
+    const v = new SecretVault();
+    v.set('K_LONG', value);
+    return v;
+  }
+
+  it('ESC inserted before one of the characters (the display eats ESC and that character) is found, in a raw text', () => {
+    const v = vault();
+    const text = `${VAL.slice(0, 6)}\u001b${VAL.slice(6)}`;
+    expect(displayForm(text)).not.toContain(VAL.slice(0, 8));   // the display alone would miss it
+    expect(v.containsKnownValue(text)).toBe(true);
+  });
+
+  it('a value split by BEL, NUL, TAB or DEL, one character at a time, is found', () => {
+    const v = vault();
+    for (const ch of ['\u0007', '\u0000', '\t', '\u007f', '\u0085']) expect(v.containsKnownValue(`${VAL.slice(0, 9)}${ch}${VAL.slice(9)}`), JSON.stringify(ch)).toBe(true);
+  });
+
+  it('NFC and NFD: a value typed one way is found, and scrubbed, when the text holds the other form', () => {
+    const nfc = 'caf\u00e9-key-12345';
+    const nfd = nfc.normalize('NFD');
+    expect(nfd).not.toBe(nfc);
+    for (const [value, text] of [[nfc, nfd], [nfd, nfc]]) {
+      const v = new SecretVault();
+      v.set('K_UNI', value as string);
+      expect(v.containsKnownValue(`x ${text} y`)).toBe(true);
+      expect(v.scrubber()(`x ${text} y`)).toBe('x [REDACTED] y');
+    }
+  });
+
+  it('anyString walks every key and string leaf (nested, arrays), iteratively, with a depth cap', () => {
+    const seen: string[] = [];
+    anyString({ a: ['x', { 'k-1': 'y', n: 5, z: null }], 'top-key': { deep: 'w' } }, (t) => { seen.push(t); return false; });
+    expect(seen.sort()).toEqual(['a', 'deep', 'k-1', 'n', 'top-key', 'w', 'x', 'y', 'z']);
+    expect(anyString({ a: { b: 'needle' } }, (t) => t === 'needle')).toBe(true);
+    expect(anyString({ ['needle']: 1 }, (t) => t === 'needle')).toBe(true);
+    let deep: unknown = 'needle';
+    for (let i = 0; i < 100_000; i++) deep = [deep];
+    expect(anyString(deep, (t) => t === 'needle')).toBe(false);   // no stack overflow; beyond the 64-level cap it stops looking
+    let near: unknown = 'needle';
+    for (let i = 0; i < 30; i++) near = { k: [near] };
+    expect(anyString(near, (t) => t === 'needle')).toBe(true);
+    const cyc: Record<string, unknown> = { a: 'x' };
+    cyc.self = cyc;
+    let calls = 0;
+    expect(anyString(cyc, () => { calls++; return false; })).toBe(false);
+    expect(calls).toBeLessThanOrEqual(4);   // each node is visited once
+  });
+});
+
+describe('B4 layer 2: every cutter scrubs with the active vault before it cuts', () => {
+  const VAL = 'Zq7Rk2mW9xLp4Tn8Hy6Vb3Nc';
+  const noPiece = (shown: string): void => { for (let k = 0; k + 4 <= VAL.length; k++) expect(shown, VAL.slice(k, k + 4)).not.toContain(VAL.slice(k, k + 4)); };
+  function v(): SecretVault {
+    const x = new SecretVault();
+    x.set('K_LONG', VAL);
+    return x;
+  }
+
+  it('without an active vault the cutters behave as before', () => {
+    expect(show('x'.repeat(100))).toBe(JSON.stringify(`${'x'.repeat(59)}…`));
+    expect(activeSafeText('a\u200bb', 10)).toBe('ab');
+  });
+
+  it('show (render-error) and activeSafeText: a value placed across the cut never shows, also split or decoded', () => {
+    const vault = v();
+    withActiveVault(vault, () => {
+      for (const lead of [40, 55, 58, 59, 60, 61, 100]) {
+        for (const raw of [`${'j'.repeat(lead)}${VAL}`, `${'j'.repeat(lead)}${VAL.slice(0, 6)}\u200b${VAL.slice(6)}`, `${'j'.repeat(lead)}${VAL.slice(0, 6)}\u001b${VAL.slice(6)}`]) {
+          noPiece(show(raw));
+          noPiece(activeSafeText(raw, 60));
+        }
+      }
+    });
+  });
+
+  it('package-rules: a devDependency key holding the value across the 57-character cut never shows in the problem text', () => {
+    const vault = v();
+    const key = `${'p'.repeat(50)}${VAL}`;
+    const problems = withActiveVault(vault, () => packageJsonProblems('{"devDependencies":{}}', JSON.stringify({ devDependencies: { [key]: '1.0.0' } })));
+    expect(problems.length).toBeGreaterThan(0);
+    noPiece(problems.join('\n'));
+  });
+
+  it('the active vault is restored afterwards, also when the function throws, and nests', () => {
+    const vault = v();
+    expect(() => withActiveVault(vault, () => { throw new Error('x'); })).toThrow();
+    expect(show(`${'j'.repeat(50)}${VAL}`)).toContain(VAL.slice(0, 4));
+    withActiveVault(vault, () => withActiveVault(undefined, () => expect(show(`${'j'.repeat(50)}${VAL}`)).toContain(VAL.slice(0, 4))));
   });
 });

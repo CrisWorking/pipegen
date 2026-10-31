@@ -30,8 +30,8 @@
 import { isDeepStrictEqual } from 'node:util';
 import { isMap, isScalar, LineCounter, visit, type Document, type Node as YamlNode, type Pair } from 'yaml';
 import { findSecretLike } from '../ai/redact.js';
-import { scrubForDisplay } from '../util/known-values.js';
-import { safeText } from '../util/safe-text.js';
+import { parse as parseYamlPlain } from 'yaml';
+import { activeSafeText as safeText, anyString, scrubForDisplay, withActiveVault } from '../util/known-values.js';
 import { GATE_CHECK_NAME, type CreatedFile, type KnownValueCheck, type OutputFormat, type PipegenInserted, type PipelineDraft, type ReviewedTool, type RuntimeEnv, type StepSpec } from '../types.js';
 import { ArtifactNameError, slug } from './artifact-names.js';
 import { FINDINGS_CATEGORIES, gateJobList, GateJobListError, jobIdFor, PIPEGEN_JOB_CATEGORIES, readableFormat, type JobListEntry } from './gate-job-list.js';
@@ -1402,7 +1402,12 @@ const fileKind = (f: CreatedFile): 'workflow' | 'action' | null => (WORKFLOW_PAT
  * ensureLinters and `ghToken` the read-only token zizmor's online audits use (7b); `deps.runLinters` runs the linters (default:
  * the real runLinters). Never throws for anything in the files.
  */
-export async function referee(allFiles: CreatedFile[], draft: PipelineDraft, platform: PlatformActions, reviewed: ReviewedTool[], linters: Linters, ghToken: string | null, deps: RefereeDeps = {}): Promise<RefereeReport> {
+export function referee(allFiles: CreatedFile[], draft: PipelineDraft, platform: PlatformActions, reviewed: ReviewedTool[], linters: Linters, ghToken: string | null, deps: RefereeDeps = {}): Promise<RefereeReport> {
+  // D5 (fix round 3): with a vault, every cutter below scrubs with it before it cuts
+  return withActiveVault(deps.vault, () => judgeFiles(allFiles, draft, platform, reviewed, linters, ghToken, deps));
+}
+
+async function judgeFiles(allFiles: CreatedFile[], draft: PipelineDraft, platform: PlatformActions, reviewed: ReviewedTool[], linters: Linters, ghToken: string | null, deps: RefereeDeps): Promise<RefereeReport> {
   const issues: RefereeIssue[] = [];
   const notes: string[] = [];
   // D5 (B1): with a vault, everything shown is checked and cleaned AS DISPLAYED (safeText joins a value split by an invisible character back
@@ -1415,11 +1420,22 @@ export async function referee(allFiles: CreatedFile[], draft: PipelineDraft, pla
   // issue, and so does a draft that holds one. The WHOLE draft is then refused and nothing else is judged: no other check reads the text, so no
   // other message can quote a piece of the value.
   const holds = (t: unknown): boolean => vault !== undefined && typeof t === 'string' && vault.containsKnownValue(t);
-  const holdsValue = (f: CreatedFile): boolean => [f?.path, f?.content, f?.reason, f?.repo].some(holds);
+  // the text a file shows AFTER it is decoded: YAML escapes in a workflow or action, JSON escapes in a package file (parsed, then every key and string checked)
+  const decodedHolds = (f: CreatedFile): boolean => {
+    if (vault === undefined || typeof f?.content !== 'string' || typeof f.path !== 'string') return false;
+    try {
+      if (fileKind(f) !== null) {
+        const r = parseYaml(f.content, f.inserted === undefined ? 'strict' : 'user');
+        return 'parsed' in r && anyString(r.parsed.js, holds);
+      }
+      if (/(?:^|\/)package(?:-lock)?\.json$/.test(f.path)) return anyString(JSON.parse(f.content), holds);
+      if (/\.ya?ml$/i.test(f.path)) return anyString(parseYamlPlain(f.content, { maxAliasCount: 50 }), holds);
+    } catch { /* unreadable text is checked as written only */ }
+    return false;
+  };
+  const holdsValue = (f: CreatedFile): boolean => [f?.path, f?.content, f?.reason, f?.repo].some(holds) || decodedHolds(f);
   const taintedFiles = allFiles.filter(holdsValue);
-  let draftText = '';
-  try { draftText = JSON.stringify(draft) ?? ''; } catch { /* a draft that can't be written out holds no text to check */ }
-  const draftHolds = holds(draftText);
+  const draftHolds = vault !== undefined && anyString(draft, holds);
   if (taintedFiles.length > 0 || draftHolds) {
     for (const f of taintedFiles) add(f.path, 'secret-value', 'The file holds a value you gave pipegen as a secret (or its base64 or URL form); pipegen never writes one into a file.', undefined, f.repo);
     if (draftHolds) add('(draft)', 'secret-value', 'The draft holds a value you gave pipegen as a secret (or its base64 or URL form); pipegen never writes one into a file.');

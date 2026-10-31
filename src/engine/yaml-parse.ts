@@ -1,7 +1,7 @@
 // One YAML document as plain data, or the reasons pipegen refuses it (S29). A leaf shared by the referee and the created-file judges
 // (dependabot.yml), so no second parser can drift from the first.
 import { isScalar, LineCounter, parseAllDocuments, visit, type Document } from 'yaml';
-import { safeText } from '../util/safe-text.js';
+import { activeSafeText as safeText } from '../util/known-values.js';
 
 export type Obj = Record<string, unknown>;
 export const isObj = (v: unknown): v is Obj => typeof v === 'object' && v !== null && !Array.isArray(v);

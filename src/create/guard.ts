@@ -33,7 +33,7 @@ import { createdPathProblem } from '../engine/job-rules.js';
 import { CODE_FILE_RE, isTestFile } from '../read/manifest.js';
 import { readTextLimitedWithReason, SKIP_REASON, READ_LIMITS } from '../read/limits.js';
 import type { CreatedFile, InstallRecord, KnownValueCheck, PipelineDraft, RepoProfile } from '../types.js';
-import { scrubForDisplay } from '../util/known-values.js';
+import { anyString, scrubActive, scrubForDisplay, withActiveVault } from '../util/known-values.js';
 import { lockProblems, packageJsonProblems } from './package-rules.js';
 import type { ReviewedClosure } from './reviewed-closure.js';
 
@@ -82,7 +82,7 @@ export function gitBlobSha(text: string): string {
 const fold = (s: string): string => s.normalize('NFKC').toUpperCase().toLowerCase();
 const baseName = (p: string): string => p.slice(p.lastIndexOf('/') + 1);
 /** A repo-derived string made safe for a message: printable ASCII only, short. */
-const safe = (s: unknown): string => String(s).replace(/[^\x20-\x7e]/g, '?').slice(0, 80);
+const safe = (s: unknown): string => scrubActive(String(s)).replace(/[^\x20-\x7e]/g, '?').slice(0, 80);   // scrubbed with the active vault BEFORE the cut (D5)
 const q = (p: string): string => `\`${safe(p)}\``;
 const plainSafe = safe;
 const qDefault = q;
@@ -176,7 +176,12 @@ function batchClashes(files: readonly CreatedFile[], repo: 'app' | 'central'): S
   return bad;
 }
 
-export async function guardCreatedFiles(files: readonly CreatedFile[], ctx: GuardCtx): Promise<GuardResult> {
+export function guardCreatedFiles(files: readonly CreatedFile[], ctx: GuardCtx): Promise<GuardResult> {
+  // D5 (fix round 3): with a vault, every cutter below scrubs with it before it cuts
+  return withActiveVault(ctx.vault, () => guardFiles(files, ctx));
+}
+
+async function guardFiles(files: readonly CreatedFile[], ctx: GuardCtx): Promise<GuardResult> {
   const result: GuardResult = { ok: [], refused: [], notes: [] };
   // D5 (B1, B2): what is shown never holds a vault value. `safe` and `q` are shadowed here by versions that clean the text as it will be displayed
   // BEFORE they cut it to 80 characters or turn non-ASCII into `?`; the module-level probes get this `q` as a parameter.
@@ -193,9 +198,16 @@ export async function guardCreatedFiles(files: readonly CreatedFile[], ctx: Guar
   let rootOk = true;
   try { rootOk = (await stat(ctx.root)).isDirectory(); } catch { rootOk = false; }
 
+  const holds = (t: unknown): boolean => typeof t === 'string' && ctx.vault?.containsKnownValue(t) === true;
+  // a package file shows its keys and strings AFTER JSON decoding (a \\u escape): every parsed key and string is checked before any judge reads it
+  const decodedHolds = (f: CreatedFile): boolean => {
+    if (ctx.vault === undefined || typeof f.content !== 'string' || typeof f.path !== 'string' || !/(?:^|\/)package(?:-lock)?\.json$/.test(f.path)) return false;
+    try { return anyString(JSON.parse(f.content), holds); } catch { return false; }
+  };
+
   async function judge(f: CreatedFile, i: number): Promise<Verdict> {
     if (typeof f !== 'object' || f === null) return refuse('this is not a file description');
-    if (ctx.vault !== undefined && [f.path, f.content, f.reason, f.repo].some((t) => typeof t === 'string' && ctx.vault?.containsKnownValue(t) === true)) return refuse('the file holds a value you gave pipegen as a secret (or its base64 or URL form); pipegen never writes one into a file');
+    if (ctx.vault !== undefined && [f.path, f.content, f.reason, f.repo].some(holds) || decodedHolds(f)) return refuse('the file holds a value you gave pipegen as a secret (or its base64 or URL form); pipegen never writes one into a file');
     if (typeof f.path !== 'string') return refuse('the path is empty');
     if (f.repo !== repo) return refuse(`this file belongs to the ${safe(f.repo)} repository, but the guard checks the ${repo} repository`);
     const pathProblem = createdPathProblem(f.path);

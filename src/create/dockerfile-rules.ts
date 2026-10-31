@@ -20,7 +20,7 @@
 import { findSecretLike } from '../ai/redact-core.js';
 import { baseImageRef, type BaseImage } from '../engine/base-images.js';
 import type { Service } from '../types.js';
-import { safeText } from '../util/safe-text.js';
+import { activeSafeText as safeText } from '../util/known-values.js';
 
 export interface DockerfileCtx {
   /** The one port the service listens on (1..65535). */

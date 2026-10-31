@@ -41,18 +41,9 @@ const INVISIBLE = /[\p{Default_Ignorable_Code_Point}\ufff9-\ufffb]/gu;
 // Unicode line and paragraph separators: some editors break the line there.
 const LINE_SEP = /[\u2028\u2029]/g;
 
-/**
- * The text as safeText shows it before it cuts: escapes and controls, bidi marks and every invisible code point removed, U+2028/U+2029 a space.
- * Nothing is cut and non-ASCII letters stay. A secret value split by an invisible character is whole again here (D5, B1), so a value check
- * must look at this form too.
- */
-export function displayForm(s: string): string {
-  return clean(s).replace(INVISIBLE, '').replace(LINE_SEP, ' ');
-}
-
 /** Makes a repo-, GitHub- or AI-derived string safe to print to a terminal: one line of visible text, cut to `max` code points. */
 export function safeText(s: string, max: number = DEFAULT_MAX): string {
-  return cut(displayForm(s), max);
+  return cut(clean(s).replace(INVISIBLE, '').replace(LINE_SEP, ' '), max);
 }
 
 const ZWSP = '\u200b';
@@ -128,4 +119,14 @@ function dropHalfEscape(body: string): string {
   while (n < body.length && body[body.length - 1 - n] === '\\') n++;
   if (n % 2 === 1) return body.slice(0, -1);
   return body.replace(/&[a-z]{0,3}$/, '');
+}
+
+/**
+ * The text as safeText shows it before it cuts (D5, B1): escapes and controls, bidi marks and every invisible code point removed, U+2028/U+2029
+ * a space; nothing cut, non-ASCII letters kept. A secret value split by an invisible character is whole again here, so a value check must look
+ * at this form too. It is safeText with no limit (`cut` returns its input when it fits), so there is one code path and the gate bundle,
+ * which tree-shakes this unused export, stays byte-identical to the reviewed pin.
+ */
+export function displayForm(s: string): string {
+  return safeText(s, Number.POSITIVE_INFINITY);
 }

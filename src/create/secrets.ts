@@ -19,6 +19,7 @@ import { isDangerousName } from '../engine/job-rules.js';
 import { NAME_RE } from '../read/manifest.js';
 import type { CreatedFile, Dependency, KnownValueCheck, RepoProfile } from '../types.js';
 import { onExit } from '../util/exit-hooks.js';
+import { textForms } from '../util/known-values.js';
 import { displayForm, safeText } from '../util/safe-text.js';
 import { composeCoveredNames } from './compose.js';
 import { ENV_TABLE, isDepKey } from './compose-tables.js';
@@ -116,6 +117,7 @@ let putReserved: (v: SecretVault, name: string, value: string) => void;
 export class SecretVault implements KnownValueCheck {
   readonly #values = new Map<string, Buffer>();
   #unhook: (() => void) | null = null;
+  #scrub: ((text: string) => string) | null = null;
 
   set(name: string, value: string): void {
     if (typeof name === 'string' && reserved(name)) throw new Error(`${safeText(name, 80)} is a name pipegen reserves for itself, so it can not hold a value you typed`);
@@ -130,6 +132,7 @@ export class SecretVault implements KnownValueCheck {
     const buf = Buffer.alloc(Buffer.byteLength(value, 'utf8'));
     buf.write(value, 'utf8');
     this.#values.set(name, buf);
+    this.#scrub = null;
     this.#unhook ??= onExit(() => this.wipe());
   }
   static {
@@ -148,20 +151,24 @@ export class SecretVault implements KnownValueCheck {
   wipe(): void {
     for (const b of this.#values.values()) b.fill(0);
     this.#values.clear();
+    this.#scrub = null;
     const off = this.#unhook;
     this.#unhook = null;
     off?.();
   }
-  /** A function that replaces each value, its base64 forms and its URL forms with [REDACTED]. It holds the values as of now: call again after a `set`. */
+  /**
+   * A function that replaces each value, its base64 forms and its URL forms with [REDACTED], also when the text holds the value in the other
+   * Unicode normalisation (NFC or NFD). Built once and kept until the next `set` or `wipe`.
+   */
   scrubber(): (text: string) => string {
-    return knownValueScrubber([...this.#values.values()].map((b) => b.toString('utf8')));
+    this.#scrub ??= knownValueScrubber([...new Set([...this.#values.values()].flatMap((b) => { const v = b.toString('utf8'); return [v, v.normalize('NFC'), v.normalize('NFD')]; }))]);
+    return this.#scrub;
   }
-  /** Whether `text` holds a value (or its base64 or URL form). Used by the guard and the referee on every created file. */
+  /** Whether `text` holds a value (or its base64 or URL form): as written, as displayed, with controls and invisibles removed, or in NFC form. Used by the guard and the referee. */
   containsKnownValue(text: string): boolean {
     if (this.#values.size === 0 || typeof text !== 'string') return false;
     const scrub = this.scrubber();
-    const shown = displayForm(text);   // a value split by an invisible character is whole again on screen
-    return scrub(text) !== text || scrub(shown) !== shown;
+    return textForms(text).some((t) => scrub(t) !== t);
   }
   toJSON(): string { return '[vault]'; }
   toString(): string { return '[vault]'; }
