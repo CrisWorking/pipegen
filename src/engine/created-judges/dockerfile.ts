@@ -33,7 +33,7 @@ export function dockerfileJudge(file: CreatedFile, ctx: CreatedCtx): string[] {
   const svc = serviceOf(file, ctx.draft);
   if (typeof svc === 'string') return [svc];
   const port = validPort(svc.port) ? svc.port : exposedPort(file.content);
-  return dockerfileProblems(file.content, svc, { port, baseImages: loadBaseImages(), buildsInside: buildsInsideOf(svc) });
+  return dockerfileProblems(file.content, svc, { port, baseImages: loadBaseImages(), buildsInside: buildsInsideOf(svc), scripts: svc.scripts });
 }
 
 export function dockerignoreJudge(file: CreatedFile, ctx: CreatedCtx): string[] {

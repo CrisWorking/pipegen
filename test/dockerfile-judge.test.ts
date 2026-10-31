@@ -58,9 +58,24 @@ describe('dockerfile judge', () => {
     const s = svc({ scripts: ['start', 'build'], port: 3000 });
     const d = mkDraft([s]);
     for (const t of [SINGLE, MULTI, MULTI.replace('USER node', 'USER 0'), MULTI.replace(REF, 'evil'), `${MULTI}ADD x y\n`, MULTI.replace('EXPOSE 3000', 'EXPOSE 4000')]) {
-      const direct = dockerfileProblems(t, s, { port: 3000, baseImages: list, buildsInside: buildsInsideOf(s) });
+      const direct = dockerfileProblems(t, s, { port: 3000, baseImages: list, buildsInside: buildsInsideOf(s), scripts: s.scripts });
       expect(problems(df(t), d).length === 0, t).toBe(direct.length === 0);
     }
+  });
+
+  it('without a port in the service the judge takes the one the file exposes (not a fixed one) and holds it to a single port', () => {
+    expect(problems(df(SINGLE.replace('EXPOSE 3000', 'EXPOSE 8081')))).toEqual([]);
+    expect(problems(df(SINGLE.replace('EXPOSE 3000', 'EXPOSE 8081 22'))).join()).toMatch(/EXPOSE/);
+    expect(problems(df(SINGLE.replace('EXPOSE 3000\n', ''))).join()).toMatch(/EXPOSE/);
+    expect(problems(df(SINGLE.replace('EXPOSE 3000', 'EXPOSE 0'))).join()).toMatch(/EXPOSE|port/);
+    expect(problems(df(SINGLE.replace('EXPOSE 3000', 'EXPOSE 99999'))).join()).toMatch(/EXPOSE|port/);
+  });
+
+  it('npm run needs a script of the draft\'s service (the scripts come from the draft, not the file)', () => {
+    const run = (name: string): string => SINGLE.replace('COPY . .', `COPY . .\nRUN npm run ${name}`);
+    expect(problems(df(run('build')), mkDraft([svc({ scripts: ['start', 'build'] })])).join()).toMatch(/multi-stage/);   // only the build rule, no RUN problem
+    expect(problems(df(run('lint')), mkDraft([svc({ scripts: ['start'] })])).join()).toMatch(/npm run/);
+    expect(problems(df(run('start')), mkDraft([svc({ scripts: ['start'] })]))).toEqual([]);
   });
 
   it('refuses a Dockerfile of a folder no service owns, an edit, and the wrong part', () => {

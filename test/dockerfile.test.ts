@@ -66,7 +66,7 @@ const make = (answers: unknown[], s: Service = svc(), f = facts(), prof: RepoPro
   const ai = mockAi(answers);
   return { ai, run: () => createDockerfile(s, prof, bundle, ai.p, f) };
 };
-const ctxOf = (s: Service, port = 3000) => ({ port, baseImages: LIST, buildsInside: buildsInsideOf(s) });
+const ctxOf = (s: Service, port = 3000) => ({ port, baseImages: LIST, buildsInside: buildsInsideOf(s), scripts: s.scripts });
 
 describe('createDockerfile: what is written', () => {
   it('writes api/Dockerfile and api/.dockerignore (new files, part docker, app repo), the .dockerignore from the fixed text', async () => {
@@ -105,9 +105,12 @@ describe('createDockerfile: what is written', () => {
     const o22 = await make([ans(SINGLE('node:24'))], s22, facts(), profile([s22])).run();
     expect(o22.files[0]?.content).toContain(`FROM ${REF22}\n`);
     // a stage that starts from an earlier stage keeps its alias
-    const chain = [`FROM node:1 AS base`, 'WORKDIR /app', 'COPY package.json package-lock.json ./', 'RUN npm ci --ignore-scripts', 'USER node', 'FROM BASE AS run', 'EXPOSE 3000', 'CMD ["npm", "start"]', ''].join('\n');
+    const chain = [`FROM node:1 AS base`, 'WORKDIR /app', 'COPY package.json package-lock.json ./', 'RUN npm ci --ignore-scripts', 'USER node', 'FROM base AS run', 'EXPOSE 3000', 'CMD ["npm", "start"]', ''].join('\n');
     const o = await make([ans(chain)]).run();
-    expect(o.files[0]?.content.split('\n').filter((l) => /^from /i.test(l))).toEqual([`FROM ${REF24} AS base`, 'FROM BASE AS run']);
+    expect(o.files[0]?.content.split('\n').filter((l) => /^from /i.test(l))).toEqual([`FROM ${REF24} AS base`, 'FROM base AS run']);
+    // a stage name in another letter case is not the stage: pipegen's FROM replaces it
+    const upper = await make([ans(chain.replace('FROM base AS run', 'FROM BASE AS run'))]).run().catch((e: unknown) => e);
+    expect(upper).toBeInstanceOf(DockerfileError);   // the rewritten final stage has no USER of its own
   });
 
   it('a FROM written across continuation lines is replaced whole', async () => {
@@ -220,7 +223,7 @@ describe('createDockerfile: violations, one retry with the list, then a throw', 
       expect(m.ai.calls).toHaveLength(2);
     }
     // an extra stage from an unlisted image is rewritten to the list image, so what is written never names it
-    const extra = [`FROM evil.example/img:1 AS tool`, 'RUN true', SINGLE().replace('COPY . .', 'COPY --from=tool /x /x')].join('\n');
+    const extra = [`FROM evil.example/img:1 AS tool`, 'RUN npm ci --ignore-scripts', SINGLE().replace('COPY . .', 'COPY --from=tool /x /x')].join('\n');
     const out = await make([ans(extra)]).run();
     expect(out.files[0]?.content).not.toMatch(/evil/);
     expect(out.files[0]?.content.split('\n').filter((l) => /^from /i.test(l))).toEqual([`FROM ${REF24} AS tool`, `FROM ${REF24}`]);

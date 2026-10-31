@@ -64,10 +64,10 @@ export function reviewExistingCodes(text: string): ExistingNote[] {
       if (ins.kw === 'FROM') {
         const w = ins.args.replace(/^(?:--\S+\s+)+/, '').split(/\s+/).filter((x) => x !== '');
         const image = w[0] ?? '';
-        const parent = aliases.get(image.toLowerCase());
+        const parent = aliases.get(image);
         if (parent === undefined && image.toLowerCase() !== 'scratch' && !/@sha256:[0-9a-f]{64}$/.test(image)) out.push({ code: 'unpinned-base', line: ins.line });
         stages.push({ ...(parent === undefined ? {} : { parent }), users: [], line: ins.line });
-        if (w[1]?.toLowerCase() === 'as' && w[2] !== undefined) aliases.set(w[2].toLowerCase(), stages.length - 1);
+        if (w[1]?.toLowerCase() === 'as' && w[2] !== undefined) aliases.set(w[2], stages.length - 1);
       } else if (ins.kw === 'USER' && stages.length > 0) {
         (stages[stages.length - 1] as { users: { value: string; line: number }[] }).users.push({ value: ins.args.trim(), line: ins.line });
       } else if (ins.kw === 'ADD' && /(?:^|\s)(?:https?:\/\/|git(?:@|:\/\/|\+)|ssh:\/\/)/i.test(ins.args)) {
@@ -112,9 +112,9 @@ export function ownFromLines(text: string, ref: string): string {
     const image = w[0] ?? '';
     const named = w.length === 3 && w[1]?.toLowerCase() === 'as' ? (w[2] as string) : undefined;
     const fine = w.length === 1 || named !== undefined;
-    const isAlias = aliases.has(image.toLowerCase()) && !/[:@$]/.test(image);
-    if (named !== undefined) aliases.add(named.toLowerCase());
-    if (isAlias || !fine || (named !== undefined && !/^[A-Za-z][A-Za-z0-9_.-]{0,63}$/.test(named))) continue;   // left as written: the rules judge it
+    const isAlias = aliases.has(image);
+    if (named !== undefined) aliases.add(named);
+    if (isAlias || !fine || (named !== undefined && !/^[a-z][a-z0-9_.-]{0,63}$/.test(named))) continue;   // left as written: the rules judge it
     edits.push({ from: ins.line - 1, to: ins.end - 1, line: `FROM ${ref}${named === undefined ? '' : ` AS ${named}`}` });
   }
   for (const e of edits.reverse()) lines.splice(e.from, e.to - e.from + 1, e.line as string);
@@ -192,7 +192,7 @@ export async function createDockerfile(svc: Service, _profile: RepoProfile, bund
     const port = knownPort ?? data.port;
     const body = data.dockerfile.replace(/\r\n/g, '\n');
     const text = ownFromLines(body.endsWith('\n') ? body : `${body}\n`, ref);
-    const ctx: DockerfileCtx = { port, baseImages: list, buildsInside: builds };
+    const ctx: DockerfileCtx = { port, baseImages: list, buildsInside: builds, scripts: svc.scripts };
     return { answer: data, text, port, problems: dockerfileProblems(text, svc, ctx) };
   };
   const tell = (e: unknown): never => { if (e instanceof Error && 'usage' in e) addUsage((e as { usage?: AiUsage }).usage ?? { inputTokens: 0, outputTokens: 0 }); throw e; };

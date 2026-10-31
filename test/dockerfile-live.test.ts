@@ -40,7 +40,6 @@ const MULTI = [
   'FROM node:24 AS build', 'WORKDIR /app', 'COPY package.json package-lock.json ./', 'RUN npm ci --ignore-scripts', 'COPY . .', 'RUN npm run build',
   'FROM node:24', 'WORKDIR /app', 'ENV NODE_ENV=production', 'COPY --from=build --chown=node:node /app/package.json /app/package-lock.json ./',
   'RUN npm ci --omit=dev --ignore-scripts && npm cache clean --force', 'COPY --from=build --chown=node:node /app/dist ./dist', 'EXPOSE 3000', 'USER node',
-  'HEALTHCHECK --interval=30s --timeout=3s CMD ["node", "-e", "fetch(\'http://localhost:3000\').then(() => process.exit(0), () => process.exit(1))"]', 'CMD ["node", "dist/index.js"]', '',
 ].join('\n');
 
 describe.skipIf(!live)('live: hadolint 2.15.1 under pipegen\'s pinned config', () => {

@@ -30,11 +30,16 @@ ${from}
 2. ${f.buildsInside
     ? 'The service has a build step. Use two stages: the first (named build) runs npm ci --ignore-scripts and npm run build; the last starts from a clean FROM and copies only what it needs with COPY --from=build (only a stage you named earlier may follow --from=).'
     : 'The service has no build step. One stage is enough.'}
-3. Install dependencies only with npm ci --ignore-scripts (add --omit=dev in the stage that runs the app), after copying package.json and package-lock.json. No npm install, npx, yarn, pnpm or bun, and no curl, wget or any download.
-4. Use only these instructions: FROM, WORKDIR, COPY, RUN, ENV, ARG, USER, EXPOSE, CMD, ENTRYPOINT, HEALTHCHECK, LABEL. No ADD (use COPY), ONBUILD, SHELL, VOLUME, STOPSIGNAL, heredocs (<<) or parser directives such as # syntax=. Do not write comments. Use printable ASCII only. Never start a continuation line with an instruction word.
-5. The last stage sets a non-root user (USER node) after the files are copied, and EXPOSE ${f.port === null ? 'the port the service listens on' : String(f.port)}. ${f.port === null ? 'Put that same number in "port".' : `Put ${f.port} in "port".`}
+3. RUN may only join these commands with " && ", written as plain words (no quote, variable, pipe, redirect, substitution or semicolon):
+   - npm ci --ignore-scripts, optionally with --omit=dev, --omit=optional, --no-audit or --no-fund, each at most once (run it after copying package.json and package-lock.json; --ignore-scripts is required);
+   - npm run <name>, only for a script that package.json defines;
+   - npm prune --omit=dev and npm cache clean --force;
+   - mkdir -p <path> and chown [-R] node:node <path>, with a plain path (no .. segment).
+   RUN may have the flag --mount=type=cache,target=/root/.npm or --network=none, and no other flag. Nothing else is accepted: no npm install, npx, yarn, pnpm, node -e, shell, curl, wget or git.
+4. Use only these instructions: FROM, WORKDIR, COPY, RUN, ENV, ARG, USER, EXPOSE, CMD and LABEL. No ADD (use COPY), ONBUILD, ENTRYPOINT, HEALTHCHECK, SHELL, VOLUME, STOPSIGNAL, heredocs (<<) or parser directives such as # syntax=. Do not write comments. Use printable ASCII only. Never start a continuation line with an instruction word. Name stages in lower case and write COPY --from=<name> in the same case. COPY flags are --from=<earlier stage>, --link, --chmod=<3 octal digits> and --chown=node:node.
+5. Every USER is exactly node. The last stage sets USER node after the files are copied, and EXPOSE ${f.port === null ? 'the port the service listens on' : String(f.port)}. ${f.port === null ? 'Put that same number in "port".' : `Put ${f.port} in "port".`}
 6. Do not put secrets in ENV or ARG; no value for a name that holds KEY, SECRET, TOKEN, PASSWORD or the like. pipegen writes a .dockerignore for the build context, so COPY . . is fine.
-7. Start the service with ${f.hasStartScript ? 'CMD ["npm", "start"] (the package has a start script)' : 'CMD ["node", "<the entry file the bundle shows>"]'}.
+7. Start the service with exactly one CMD in exec form: ${f.hasStartScript ? 'CMD ["npm", "start"] (the package has a start script)' : 'CMD ["node", "<the entry file the bundle shows, a relative .js, .mjs or .cjs path>"]'}. The other accepted forms are CMD ["node", "<path>.js"] and CMD ["npm", "run", "<script>"].
 
 Answer with "dockerfile" (the whole file, one instruction per line), "port" (the service port as a whole number) and "reasoning" (one or two plain sentences for the developer: no links, no code, no markdown).`;
 }
