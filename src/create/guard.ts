@@ -289,5 +289,15 @@ export async function guardCreatedFiles(files: readonly CreatedFile[], ctx: Guar
     else if (v.kind === 'refuse') result.refused.push({ path: typeof f?.path === 'string' ? safe(f.path) : '', reason: v.reason });
     else result.notes.push(v.note);
   }
+  // a package.json and its package-lock.json travel together: if either is not ok, its partner goes too (one alone makes `npm ci` fail)
+  const pairName = (p: string): string | null => (baseName(p) === 'package.json' ? 'package-lock.json' : baseName(p) === 'package-lock.json' ? 'package.json' : null);
+  for (const f of [...result.ok]) {
+    const partner = pairName(f.path);
+    if (partner === null) continue;
+    const partnerPath = `${f.path.slice(0, f.path.length - baseName(f.path).length)}${partner}`;
+    if (result.ok.some((x) => x.path === partnerPath)) continue;
+    result.ok.splice(result.ok.indexOf(f), 1);
+    result.refused.push({ path: safe(f.path), reason: `its partner ${q(partnerPath)} was refused or is not written, and ${q(f.path)} alone makes \`npm ci\` fail in your CI, so pipegen writes neither` });
+  }
   return result;
 }

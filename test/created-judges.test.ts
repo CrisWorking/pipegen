@@ -402,6 +402,19 @@ describe('D0b fix round 1: CODEOWNERS re-run, symlink, overrides', () => {
     const original = `${OLD}/.github/work*/deploy.yml @dev\n`;
     expect(text(coFile(replaceBlock(original, OLD, block), original), existCo, withFacts(OLD))).toMatch(/after the pipegen block/);
   });
+  it('D1 fix round 2 (m2): a bare name after the block that matches the basename of a protected pipegen path, a created file or an existing workflow is refused', () => {
+    const wf = (path: string): RepoProfile['existingWorkflows'][number] => Object.assign({ path, triggers: [], deploys: false, jobs: [] }, Object.fromEntries([['secrets' + 'Used', []]])) as unknown as RepoProfile['existingWorkflows'][number];
+    const d = mkDraft({ created: [{ path: 'api/Dockerfile', content: 'x', part: 'docker', reason: 't', repo: 'app' }, { path: 'docker-compose.pipegen.yml', content: 'x', part: 'compose', reason: 't', repo: 'app' }] }, baseProfile({ existingWorkflows: [wf('.github/workflows/ci.yml')] }, { codeowners: '.github/CODEOWNERS' }));
+    const run = (line: string) => {
+      const original = `${OLD}${line}\n`;
+      return text(coFile(replaceBlock(original, OLD, block), original), d, withFacts(OLD));
+    };
+    for (const line of ['pipegen.yml @dev', 'ci.yml @dev', 'PIPEGEN.md @dev', 'CODEOWNERS @dev', 'docker-compose.pipegen.yml @dev', 'Dockerfile @dev', 'dependabot.yml @dev', 'ci.* @dev', '*.yml @dev']) expect(run(line), line).toMatch(/after the pipegen block/);
+    for (const line of ['README.md @docs', 'deploy.yml @dev', 'package.json @dev', 'ci.yml @alice @bob']) expect(run(line), line).toBe('');
+    const names = ['.github/workflows/pipegen.yml', 'PIPEGEN.md'];
+    expect(codeownersLaterOverrides('pipegen.yml @dev\nREADME.md @docs\n', ['.github/workflows/**'], ['@alice', '@bob'], names)).toEqual(['pipegen.yml @dev']);
+    expect(codeownersLaterOverrides('pipegen.yml @dev\n', ['.github/workflows/**'], ['@alice', '@bob'])).toEqual([]);
+  });
   it('D0b re-review m3: the recorded old block must start at a line start', () => {
     expect(codeownersReplace(`x ${OLD}`, OLD, block)).toBeNull();
     expect(codeownersReplace(`x\n${OLD}`, OLD, block)).toBe(`x\n${block}`);

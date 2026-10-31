@@ -1,74 +1,71 @@
-// A minimal semver range check (D1 fix round 1), with no dependency: enough to hold a lock edge to its range. It reads exact versions, `^`, `~`,
-// comparators (`>= > <= < =`), partial versions and `x`/`*`, hyphen ranges and `||`. A prerelease version satisfies only a range that names that
-// exact version. A range it can not read gives `null` (the caller refuses: fail closed).
+// A minimal semver range check (D1 fix rounds 1-2), with no dependency, built as an ALLOWLIST GRAMMAR: anything outside it gives `null`, and the
+// caller refuses the edge. Nothing is guessed or dropped, so a range this module reads is read as npm reads it.
+//   version  plain MAJOR.MINOR.PATCH, digits only (no leading zero, no prerelease, no build tag)
+//   range    sets joined by " || "; the empty range means "any"
+//   set      comparators joined by a single space, or one hyphen range "X.Y.Z - A.B.C"
+//   compare  [op]X.Y.Z with op one of ^ ~ >= > <= < = (or none), attached to the version; or an x-range: X, X.x, X.Y.x, X.*, X.Y.*, *, x, X
+//            (nothing follows a wildcard)
+// No prerelease or build tag is accepted anywhere in a range, not even as an exact match: the reviewed closure has none.
 type V = [number, number, number];
-const NUM = /^(?:0|[1-9]\d{0,14})$/;
-const WILD = (s: string | undefined): boolean => s === undefined || s === '' || s === 'x' || s === 'X' || s === '*';
+const N = '(0|[1-9]\\d{0,14})';
+const VERSION = new RegExp(`^${N}\\.${N}\\.${N}$`);
+const FULL = new RegExp(`^(\\^|~|>=|>|<=|<|=)?${N}\\.${N}\\.${N}$`);
+const MAJOR_X = new RegExp(`^${N}(?:\\.[xX*])?$`);
+const MINOR_X = new RegExp(`^${N}\\.${N}\\.[xX*]$`);
+const HYPHEN = new RegExp(`^${N}\\.${N}\\.${N} - ${N}\\.${N}\\.${N}$`);
 
-/** `1.2.3` to a tuple (a build suffix ignored); null if it is not a plain version, `pre` true for a prerelease. */
-function parseVersion(v: string): { t: V; pre: boolean } | null {
-  const m = /^v?(\d+)\.(\d+)\.(\d+)(-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$/.exec(v);
-  if (m === null || ![m[1], m[2], m[3]].every((x) => NUM.test(x as string))) return null;
-  return { t: [Number(m[1]), Number(m[2]), Number(m[3])], pre: m[4] !== undefined };
-}
 const cmp = (a: V, b: V): number => a[0] - b[0] || a[1] - b[1] || a[2] - b[2];
+const tuple = (m: RegExpExecArray, at: number): V => [Number(m[at]), Number(m[at + 1]), Number(m[at + 2])];
 
-/** A possibly partial version (`1`, `1.2`, `1.x`) as its parts, undefined for a wildcard part; null if unreadable. */
-function parsePartial(s: string): (number | undefined)[] | null {
-  const m = /^v?([0-9xX*]+)(?:\.([0-9xX*]+))?(?:\.([0-9xX*]+))?(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$/.exec(s);
-  if (m === null) return null;
-  const out: (number | undefined)[] = [];
-  for (const p of [m[1], m[2], m[3]]) {
-    if (WILD(p)) out.push(undefined);
-    else if (NUM.test(p as string)) out.push(Number(p));
-    else return null;
+/** Whether the tuple `v` satisfies one comparator; null if the comparator is outside the grammar. */
+function comparator(v: V, tok: string): boolean | null {
+  if (tok === '*' || tok === 'x' || tok === 'X') return true;
+  let m = FULL.exec(tok);
+  if (m !== null) {
+    const op = m[1] ?? '';
+    const t = tuple(m, 2);
+    const c = cmp(v, t);
+    switch (op) {
+      case '': case '=': return c === 0;
+      case '>': return c > 0;
+      case '>=': return c >= 0;
+      case '<': return c < 0;
+      case '<=': return c <= 0;
+      case '~': return c >= 0 && cmp(v, [t[0], t[1] + 1, 0]) < 0;
+      default: {   // ^
+        const up: V = t[0] > 0 ? [t[0] + 1, 0, 0] : t[1] > 0 ? [0, t[1] + 1, 0] : [0, 0, t[2] + 1];
+        return c >= 0 && cmp(v, up) < 0;
+      }
+    }
   }
-  return out;
-}
-const fill = (p: (number | undefined)[]): V => [p[0] ?? 0, p[1] ?? 0, p[2] ?? 0];
-
-/** A comparator as [min inclusive, max exclusive] bounds (either may be absent). */
-function bounds(op: string, raw: string): { lo?: V; loIncl?: boolean; hi?: V; hiIncl?: boolean } | null {
-  const p = parsePartial(raw);
-  if (p === null) return null;
-  const [a, b, c] = p;
-  if (a === undefined) return op === '' || op === '=' || op === '>=' || op === '<=' ? {} : null;
-  const lowT = fill(p);
-  const upTilde: V = b === undefined ? [a + 1, 0, 0] : [a, b + 1, 0];
-  if (op === '^') {
-    if (b === undefined) return { lo: lowT, loIncl: true, hi: [a + 1, 0, 0] };
-    const up: V = a > 0 ? [a + 1, 0, 0] : c === undefined ? [0, b + 1, 0] : b > 0 ? [0, b + 1, 0] : [0, 0, c + 1];
-    return { lo: lowT, loIncl: true, hi: up };
-  }
-  if (op === '~') return { lo: lowT, loIncl: true, hi: upTilde };
-  if (op === '' || op === '=') return c !== undefined ? { lo: lowT, loIncl: true, hi: lowT, hiIncl: true } : { lo: lowT, loIncl: true, hi: upTilde };
-  if (op === '>=') return { lo: lowT, loIncl: true };
-  if (op === '>') return c !== undefined ? { lo: lowT, loIncl: false } : { lo: upTilde, loIncl: true };
-  if (op === '<') return { hi: lowT, hiIncl: false };
-  if (op === '<=') return c !== undefined ? { hi: lowT, hiIncl: true } : { hi: upTilde, hiIncl: false };
+  m = MAJOR_X.exec(tok);
+  if (m !== null) return v[0] === Number(m[1]);
+  m = MINOR_X.exec(tok);
+  if (m !== null) return v[0] === Number(m[1]) && v[1] === Number(m[2]);
   return null;
 }
 
-/** Whether `version` satisfies `range`; null when the range can not be read. */
+/** Whether `version` satisfies `range`; null when either is outside the grammar. */
 export function satisfies(version: string, range: string): boolean | null {
-  const v = parseVersion(version);
-  if (v === null || typeof range !== 'string' || range.length > 200) return null;
-  let readable = true;
+  if (typeof version !== 'string' || typeof range !== 'string' || range.length > 200) return null;
+  const vm = VERSION.exec(version);
+  if (vm === null) return null;
+  const v = tuple(vm, 1);
+  if (range === '') return true;
   let any = false;
-  for (const alt of range.split('||')) {
-    let text = alt.trim().replace(/([<>=~^])\s+/g, '$1');
-    const hy = /^(\S+)\s+-\s+(\S+)$/.exec(text);
-    if (hy !== null) text = `>=${hy[1]} <=${hy[2]}`;
+  for (const set of range.split(' || ')) {
+    const h = HYPHEN.exec(set);
+    if (h !== null) {
+      if (cmp(v, tuple(h, 1)) >= 0 && cmp(v, tuple(h, 4)) <= 0) any = true;
+      continue;
+    }
     let ok = true;
-    for (const tok of text === '' ? ['*'] : text.split(/\s+/)) {
-      const m = /^(\^|~>?|>=|<=|>|<|=)?(.*)$/.exec(tok);
-      const b = bounds(m?.[1] === '~>' ? '~' : (m?.[1] ?? ''), m?.[2] ?? '');
-      if (b === null) { readable = false; ok = false; break; }
-      if (v.pre && !(range.includes(version))) ok = false;
-      if (b.lo !== undefined && (b.loIncl ? cmp(v.t, b.lo) < 0 : cmp(v.t, b.lo) <= 0)) ok = false;
-      if (b.hi !== undefined && (b.hiIncl ? cmp(v.t, b.hi) > 0 : cmp(v.t, b.hi) >= 0)) ok = false;
+    for (const tok of set.split(' ')) {
+      const r = comparator(v, tok);
+      if (r === null) return null;
+      if (!r) ok = false;
     }
     if (ok) any = true;
   }
-  return readable ? any : null;
+  return any;
 }

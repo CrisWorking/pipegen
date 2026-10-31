@@ -184,16 +184,34 @@ const edit = (mut: (l: { packages: Record<string, Record<string, unknown>> } & R
   return pj(l);
 };
 
-describe('semver-min', () => {
-  it('reads exact, caret, tilde, comparators, wildcards, hyphen ranges and ||', () => {
-    const t: [string, string, boolean][] = [['1.2.3', '1.2.3', true], ['1.2.4', '1.2.3', false], ['1.4.0', '^1.2.3', true], ['2.0.0', '^1.2.3', false], ['0.2.5', '^0.2.3', true], ['0.3.0', '^0.2.3', false], ['0.0.3', '^0.0.3', true], ['0.0.4', '^0.0.3', false],
-      ['1.2.9', '~1.2.3', true], ['1.3.0', '~1.2.3', false], ['5.0.5', '>=5', true], ['4.9.9', '>=5', false], ['3.1.0', '*', true], ['3.1.0', 'x', true], ['3.1.0', '', true], ['1.9.0', '1.x', true], ['2.0.0', '1.x', false], ['1.2.5', '1.2', true],
-      ['18.0.0', '^16 || ^18', true], ['17.0.0', '^16 || ^18', false], ['1.5.0', '1.2.3 - 2.0.0', true], ['2.1.0', '1.2.3 - 2.0.0', false], ['2.0.0', '>=1 <2', false], ['1.9.9', '>= 1 < 2', true], ['5.0.5', '=5.0.5', true], ['1.0.0-beta.1', '1.0.0-beta.1', true], ['1.0.0-beta.1', '^1.0.0', false]];
-    for (const [v, r, want] of t) expect(satisfies(v, r), `${v} ${r}`).toBe(want);
+describe('semver-min (allowlist grammar, fix round 2)', () => {
+  it('accepted forms: [op]X.Y.Z, x-ranges, hyphen ranges, sets joined by " || "', () => {
+    const t: [string, string, boolean][] = [['1.2.3', '1.2.3', true], ['1.2.4', '1.2.3', false], ['1.2.3', '=1.2.3', true], ['1.4.0', '^1.2.3', true], ['2.0.0', '^1.2.3', false], ['1.2.2', '^1.2.3', false], ['0.2.5', '^0.2.3', true], ['0.3.0', '^0.2.3', false], ['0.0.3', '^0.0.3', true], ['0.0.4', '^0.0.3', false],
+      ['1.2.9', '~1.2.3', true], ['1.3.0', '~1.2.3', false], ['1.2.2', '~1.2.3', false], ['5.0.5', '>=5.0.0', true], ['4.9.9', '>=5.0.0', false], ['5.0.0', '>5.0.0', false], ['5.0.1', '>5.0.0', true], ['1.2.3', '<=1.2.3', true], ['1.2.4', '<=1.2.3', false], ['1.2.2', '<1.2.3', true], ['1.2.3', '<1.2.3', false],
+      ['3.1.0', '*', true], ['3.1.0', 'x', true], ['3.1.0', 'X', true], ['3.1.0', '', true], ['1.9.0', '1', true], ['2.0.0', '1', false], ['1.9.0', '1.x', true], ['2.0.0', '1.x', false], ['1.9.0', '1.*', true], ['1.2.9', '1.2.x', true], ['1.3.0', '1.2.x', false], ['1.2.9', '1.2.*', true],
+      ['18.0.0', '^16.0.0 || ^18.0.0', true], ['17.0.0', '^16.0.0 || ^18.0.0', false], ['1.5.0', '1.2.3 - 2.0.0', true], ['2.0.0', '1.2.3 - 2.0.0', true], ['2.0.1', '1.2.3 - 2.0.0', false], ['1.2.2', '1.2.3 - 2.0.0', false], ['1.9.9', '>=1.0.0 <2.0.0', true], ['2.0.0', '>=1.0.0 <2.0.0', false], ['1.0.0', '>=1.0.0 <2.0.0 || 3.x', true], ['3.4.5', '>=1.0.0 <2.0.0 || 3.x', true]];
+    for (const [v, r, want] of t) expect(satisfies(v, r), `${v} in ${JSON.stringify(r)}`).toBe(want);
   });
-  it('a range or version it can not read gives null (the caller refuses)', () => {
-    for (const r of ['npm:evil@1', 'github:a/b', '^^1', 'latest', 'a.b.c', '>=1 <=x.y']) expect(satisfies('1.0.0', r), r).toBeNull();
-    expect(satisfies('not-a-version', '^1')).toBeNull();
+  it('anything outside the grammar gives null: partial versions with an operator, tags, build tags, stray text, odd spacing, unknown schemes', () => {
+    for (const r of ['>=5', '^16', '~1.2', '>1.2', '<=1.2', '>=1.2', '1.2', '^1', '>=1', '<2', 'npm:evil@1', 'github:a/b', '^^1.0.0', 'latest', 'a.b.c', '>=1.0.0 <=x.y.z', '>= 1.0.0', '1.0.0  2.0.0', '^1.0.0||^2.0.0', '^1.0.0 ||', '|| ^1.0.0', '1.0.0 -2.0.0', '1.0.0 - 2', '1 - 2', '01.2.3', '1.2.3.4', 'v1.2.3', '<*', '^*', '~*', '>*', '1.x.3', '^1.x.3', '~1.x.3', '<=1.x.3', '>=1.x.3', '>1.x.3', '<1.x.3', '*-0', 'x-0', '1.x-0', '1.2.x-0', '*.1', 'x.2.3', '1.2.3-beta', '1.2.3+build', '^1.2.3-beta.1', '>=1.2.3-beta.1', '>1.2.3-beta', '<1.2.3-beta', '~1.2.3-beta', '=1.2.3-beta', '1.2.3-beta || 1.2.3', '1.0.0-ab || 1.0.0-a', '1.2.3-0 - 2.0.0', '1.2.3 - 2.0.0-0', '1.x - 2.0.0', '', ]) {
+      if (r === '') continue;   // the empty range is the x-range "any"
+      expect(satisfies('1.2.3', r), JSON.stringify(r)).toBeNull();
+    }
+  });
+  it('a version that is not plain MAJOR.MINOR.PATCH gives null: prerelease, build tag, v prefix, leading zero, stray text', () => {
+    for (const v of ['1.0.0-a', '1.2.3-beta', '1.2.3-beta.1', '1.0.0+build', '1.0.0-a+b', 'v1.2.3', '01.2.3', '1.2', '1', 'x', 'not-a-version', '1.2.3 ', '']) {
+      for (const r of ['*', '1.2.3', '^1.0.0', '', '1.x']) expect(satisfies(v, r), `${JSON.stringify(v)} in ${JSON.stringify(r)}`).toBeNull();
+    }
+  });
+  it('the 37 differential cases of review-D1-r1 (tmp-D1-review/r1/semver.txt): npm says false or invalid, so the answer is never true', () => {
+    const cases: [string, string][] = [];
+    for (const v of ['1.0.5', '1.2.0', '1.2.3', '1.2.4', '1.3.0', '1.5.0', '1.9.9']) cases.push([v, '>1.x.3']);
+    for (const v of ['1.0.0', '1.0.1']) cases.push([v, '<1.x.3']);
+    cases.push(['1.2.3-beta', '>=1.2.3-beta.1'], ['1.2.3', '1.2.3-beta'], ['1.2.3-beta', '^1.2.3-beta.1'], ['1.0.0-a', '>=1.0.0-ab'], ['1.0.0', '1.0.0-ab || 1.0.0-a']);
+    for (const v of ['0.0.0', '0.0.1', '0.0.3', '0.0.4', '0.1.0', '0.2.3', '0.2.9', '0.3.0', '1.0.0', '1.0.1', '1.0.3', '1.0.5', '1.2.0', '1.2.3', '1.2.4', '1.3.0', '1.5.0', '1.9.9', '2.0.0', '2.3.4', '2.4.0', '3.0.0', '10.0.0']) cases.push([v, '*-0']);
+    expect(cases.length).toBe(37);
+    for (const [v, r] of cases) expect(satisfies(v, r), `${v} in ${JSON.stringify(r)}`).not.toBe(true);
+    for (const [v, r] of cases) expect(satisfies(v, r), `${v} in ${JSON.stringify(r)}`).toBeNull();
   });
 });
 
@@ -345,6 +363,14 @@ describe('lockProblems (B2, fix round 1): added entries must be reviewed code', 
     const old = lockOf(OLD_ROOT, { ...OLD_PKGS, 'node_modules/c8': C8 });
     const next = lockOf({ ...OLD_ROOT, devDependencies: { typescript: '5.6.0', c8: '12.0.0' } }, { ...OLD_PKGS, 'node_modules/c8': C8 });
     expect(lp(old, next)).toBe('');
+  });
+  it('fix round 2 (m1): an EXISTING entry of an added pin with another integrity than the reviewed one is refused (the entry deep-equal never runs on it)', () => {
+    const mirror = { ...VITEST, integrity: sri('a mirror tarball') };
+    const old = lockOf(OLD_ROOT, { ...OLD_PKGS, 'node_modules/vitest': mirror });
+    const next = lockOf({ ...OLD_ROOT, devDependencies: { typescript: '5.6.0', vitest: '5.0.5' } }, { ...OLD_PKGS, 'node_modules/vitest': mirror, 'node_modules/tinyspy': TINYSPY });
+    expect(lp(old, next)).toMatch(/vitest with another integrity than the reviewed one/);
+    const same = lockOf(OLD_ROOT, { ...OLD_PKGS, 'node_modules/vitest': VITEST, 'node_modules/tinyspy': TINYSPY });
+    expect(lp(same, lockOf({ ...OLD_ROOT, devDependencies: { typescript: '5.6.0', vitest: '5.0.5' } }, { ...OLD_PKGS, 'node_modules/vitest': VITEST, 'node_modules/tinyspy': TINYSPY }))).toBe('');
   });
   it('with the new package.json given, the lock root devDependencies must equal it', () => {
     const pkg = pj({ ...BASE, devDependencies: { typescript: '5.6.0', vitest: '5.0.5', '@vitest/coverage-v8': '5.0.5' } });

@@ -6,6 +6,7 @@
 //    can not approve their own pull request, so a sole owner would lock every protected-path change);
 //  - the SEMANTICS are checked with the gate's own parser: every protected path, on a probe list, is owned by exactly the owners.
 import picomatch from 'picomatch';
+import { WORKFLOW_PATH } from '../../../gate/src/baseline.js';
 import { codeOwners, MAX_CODEOWNERS_BYTES, ownersOf } from '../../../gate/src/integrity.js';
 import { CENTRAL_PROTECTED_PATHS, CODEOWNERS_BEGIN, CODEOWNERS_END, codeownersBlock, codeownersFile, codeownersOwnerProblem, codeownersProtectedPaths, codeownersReplace } from '../created-builders.js';
 import type { CreatedCtx } from '../created-files.js';
@@ -77,9 +78,10 @@ function alignedCandidates(pattern: string, protectedPaths: readonly string[]): 
  * The user rules AFTER pipegen's block (`after` is the text following it) that own a protected path differently from the block's owners:
  * the last matching rule wins, so such a rule silently takes the path back. Each rule line is tried on the concrete paths its pattern names
  * (the pattern itself, something under it, and at depth for a slashless name); a path counts when the gate treats it as protected and the
- * owners it reads, with the block in front of the rule, are not exactly `owners`. Returns the rule lines (for the refusal and for Plan G's note).
+ * owners it reads, with the block in front of the rule, are not exactly `owners`. `names` are real file paths that must stay owned (pipegen's own
+ * workflow, PIPEGEN.md, the created files, the workflows that exist): a rule, bare names included, that owns one of them is listed too. Returns the rule lines (for the refusal and for Plan G's note).
  */
-export function codeownersLaterOverrides(after: string, protectedPaths: readonly string[], owners: readonly string[]): string[] {
+export function codeownersLaterOverrides(after: string, protectedPaths: readonly string[], owners: readonly string[], names: readonly string[] = []): string[] {
   if (after.trim() === '') return [];
   const isProtected = protectedMatcher(protectedPaths);
   const want = owners.map((o) => o.replace(/^@/, '').toLowerCase()).sort().join(',');
@@ -90,7 +92,9 @@ export function codeownersLaterOverrides(after: string, protectedPaths: readonly
     const pat = (rules[0] as { pattern: string }).pattern;
     const c = concrete(pat.replace(/^\//, '').replace(/\/$/, ''));
     const cands = [c, `${c}/x`, ...(pat.includes('/') ? [] : [`sub/dir/${c}`]), ...alignedCandidates(pat, protectedPaths)];
-    const hit = cands.some((p) => isProtected(p) && (ownersOf(rules, p)?.slice().sort().join(',') ?? '\0') !== want);
+    const differs = (p: string): boolean => (ownersOf(rules, p)?.slice().sort().join(',') ?? '\0') !== want;
+    // the real files: a rule (a bare name matches at any depth) that owns one of them takes it back
+    const hit = cands.some((p) => isProtected(p) && differs(p)) || names.some((p) => differs(p) && ownersOf(rules, p) !== undefined);
     if (hit) out.push(line.trim());
   }
   return out;
@@ -160,7 +164,7 @@ function judge(repo: 'app' | 'central') {
       expected = replaced;
       const at = expected.indexOf(block);
       if (at >= 0) {
-        const later = codeownersLaterOverrides(expected.slice(at + block.length), paths, co.owners);
+        const later = codeownersLaterOverrides(expected.slice(at + block.length), paths, co.owners, [WORKFLOW_PATH, 'PIPEGEN.md', ...paths.filter((x) => !/[*?]/.test(x)).map((x) => x.replace(/^\//, '')), ...draft.created.map((c) => c.path), ...draft.profile.existingWorkflows.map((w) => w.path)]);
         if (later.length > 0) out.push(`${later.length} rule${later.length === 1 ? '' : 's'} after the pipegen block take${later.length === 1 ? 's' : ''} a protected path back from the code owners (${later.slice(0, 3).join(' | ')}); the last matching rule wins, so the block would not own it`);
       }
     } else expected = codeownersFile(original, block);

@@ -410,6 +410,41 @@ describe('guard: package.json (B2)', () => {
   });
 });
 
+describe('guard: fix round 2 (I1) a refused member refuses its partner', () => {
+  it('package.json refused (scripts.build changed), lock good: both are refused, the lock\'s reason names the partner', async () => {
+    const r = pairRepo('');
+    const bad = PJ_NEW.replace('"build": "tsc"', '"build": "evil"');
+    const out = await guardCreatedFiles(pairEdits('', bad, LOCK_NEW), ctx(r.root, { baseTree: r.baseTree, closure: CLOSURE }));
+    expect(out.ok).toEqual([]);
+    expect(out.refused.map((x) => x.path).sort()).toEqual(['package-lock.json', 'package.json']);
+    expect(out.refused.find((x) => x.path === 'package-lock.json')?.reason).toMatch(/`package\.json`.*refused.*npm ci/);
+  });
+  it('lock refused (a forged entry), package.json good: both are refused, the package.json reason names the partner', async () => {
+    const r = pairRepo('');
+    const forged = JSON.parse(LOCK_NEW) as { packages: Record<string, Record<string, unknown>> };
+    forged.packages['node_modules/vitest'].hasInstallScript = true;
+    const out = await guardCreatedFiles(pairEdits('', PJ_NEW, JSON.stringify(forged, null, 2)), ctx(r.root, { baseTree: r.baseTree, closure: CLOSURE }));
+    expect(out.ok).toEqual([]);
+    expect(out.refused.map((x) => x.path).sort()).toEqual(['package-lock.json', 'package.json']);
+    expect(out.refused.find((x) => x.path === 'package.json')?.reason).toMatch(/`package-lock\.json`.*refused.*npm ci/);
+  });
+  it('a partner that the guard keeps or refuses for a reason of its own (no closure) also takes the other down; unrelated files stay ok', async () => {
+    const r = pairRepo('');
+    const out = await guardCreatedFiles([...pairEdits('', PJ_NEW, LOCK_NEW), file('Dockerfile')], ctx(r.root, { baseTree: r.baseTree }));
+    expect(out.ok.map((f) => f.path)).toEqual(['Dockerfile']);
+    expect(out.refused.length).toBe(2);
+  });
+  it('pairs are per folder: a bad pair in api/ does not refuse a good pair at the root', async () => {
+    const files = { 'package.json': PJ, 'package-lock.json': LOCK_OLD, 'api/package.json': PJ, 'api/package-lock.json': LOCK_OLD };
+    const root = repo(files);
+    const c = ctx(root, { baseTree: base(files), closure: CLOSURE, profile: prof(['.', 'api']) });
+    const bad = PJ_NEW.replace('"build": "tsc"', '"build": "evil"');
+    const out = await guardCreatedFiles([...pairEdits('', PJ_NEW, LOCK_NEW), ...pairEdits('api/', bad, LOCK_NEW)], c);
+    expect(out.ok.map((f) => f.path)).toEqual(['package.json', 'package-lock.json']);
+    expect(out.refused.map((x) => x.path).sort()).toEqual(['api/package-lock.json', 'api/package.json']);
+  });
+});
+
 describe('guard: package-lock.json (B2, reviewed closure)', () => {
   const run = async (next: string, original = LOCK_OLD, over: Partial<GuardCtx> = {}) => {
     const r = pairRepo('', { lock: original });
