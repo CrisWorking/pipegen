@@ -143,6 +143,11 @@ export interface CreatedFile { path: string; content: string; part: Part; reason
  */
 export interface CreatedEdit { original: string }
 /**
+ * What the guard and the referee need from the secret vault (D5, S8): whether a text holds a value the user gave pipegen (or its base64 or URL form).
+ * The vault (src/create/secrets.ts) implements it; the judges never see the values, only the answer.
+ */
+export interface KnownValueCheck { containsKnownValue(text: string): boolean; /** replaces each such value, and its base64 and URL forms, with [REDACTED] (for text that must be shown) */ scrubber(): (text: string) => string }
+/**
  * The marker convention for an edited user workflow (Plan B 7a, for Plan G's insertVerify): a CreatedFile field, set by
  * pipegen's own code and never by the AI or read from the file text, so no content can forge it. `original` is the user's
  * file exactly as it was before the edit; `jobs` are the jobs pipegen added (the referee judges them like any job of its

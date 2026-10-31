@@ -31,7 +31,7 @@ import { isDeepStrictEqual } from 'node:util';
 import { isMap, isScalar, LineCounter, visit, type Document, type Node as YamlNode, type Pair } from 'yaml';
 import { findSecretLike } from '../ai/redact.js';
 import { safeText } from '../util/safe-text.js';
-import { GATE_CHECK_NAME, type CreatedFile, type OutputFormat, type PipegenInserted, type PipelineDraft, type ReviewedTool, type RuntimeEnv, type StepSpec } from '../types.js';
+import { GATE_CHECK_NAME, type CreatedFile, type KnownValueCheck, type OutputFormat, type PipegenInserted, type PipelineDraft, type ReviewedTool, type RuntimeEnv, type StepSpec } from '../types.js';
 import { ArtifactNameError, slug } from './artifact-names.js';
 import { FINDINGS_CATEGORIES, gateJobList, GateJobListError, jobIdFor, PIPEGEN_JOB_CATEGORIES, readableFormat, type JobListEntry } from './gate-job-list.js';
 import { GATE_JSON_INPUTS, gateStepInputs, NIGHTLY_JSON_INPUTS, nightlyStepInputs } from './gate-inputs.js';
@@ -76,7 +76,7 @@ export interface Linters { actionlint: () => Promise<string>; zizmor: () => Prom
 /** The linter run (7b's runLinters): actionlint and zizmor over the workflow files, findings as issues. */
 export type RunLinters = (files: CreatedFile[], linters: Linters, ghToken: string | null) => Promise<RefereeIssue[]>;
 /** The injectable parts. `runLinters` defaults to the real one (linters.ts); a throwing runner is an issue. */
-export interface RefereeDeps { runLinters?: RunLinters; /** the created-file rules (default: CREATED_RULES); tests inject their own */ createdRules?: readonly CreatedRule[]; /** what delivery knows (D0b): the central CODEOWNERS path, PIPEGEN.md's shas, the vault check */ createdInputs?: CreatedInputs }
+export interface RefereeDeps { runLinters?: RunLinters; /** the created-file rules (default: CREATED_RULES); tests inject their own */ createdRules?: readonly CreatedRule[]; /** what delivery knows (D0b): the central CODEOWNERS path, PIPEGEN.md's shas, the vault check */ createdInputs?: CreatedInputs; /** the secret vault (D5): a value the user gave pipegen inside any file is an issue */ vault?: KnownValueCheck }
 
 // ---------- the tables ----------
 
@@ -1404,12 +1404,23 @@ const fileKind = (f: CreatedFile): 'workflow' | 'action' | null => (WORKFLOW_PAT
 export async function referee(files: CreatedFile[], draft: PipelineDraft, platform: PlatformActions, reviewed: ReviewedTool[], linters: Linters, ghToken: string | null, deps: RefereeDeps = {}): Promise<RefereeReport> {
   const issues: RefereeIssue[] = [];
   const notes: string[] = [];
-  const add: Add = (file, check, message, line, repo) => { issues.push({ file: safeText(file, 200), check, message, ...(line === undefined ? {} : { line }), ...(repo === undefined ? {} : { repo }) }); };
+  // D5: with a vault, whatever is shown (a path may be the carrier of a value) first passes its scrubber
+  const shown = deps.vault === undefined ? (t: string): string => t : deps.vault.scrubber();
+  const add: Add = (file, check, message, line, repo) => { issues.push({ file: safeText(shown(file), 200), check, message: shown(message), ...(line === undefined ? {} : { line }), ...(repo === undefined ? {} : { repo }) }); };
 
   // S18: no secret value in any file (rule names only, never the value)
   for (const f of files) {
     const hits = findSecretLike(f.content);
     if (hits.length > 0) add(f.path, 'secret-value', `The file holds text that looks like a secret value (${hits.join(', ')}); pipegen never writes one into a file.`);
+  }
+
+  // D5 (S8): no value the user gave pipegen (nor its base64 or URL form) in any created file; the message never holds the value
+  if (deps.vault !== undefined) {
+    for (const f of files) {
+      if ([f.path, f.content, f.reason].some((t) => typeof t === 'string' && deps.vault?.containsKnownValue(t) === true)) {
+        add(f.path, 'secret-value', 'The file holds a value you gave pipegen as a secret (or its base64 or URL form); pipegen never writes one into a file.', undefined, f.repo);
+      }
+    }
   }
 
   for (const d of duplicatePathProblems(files)) add(d.file.path, 'template', d.message, undefined, d.file.repo);

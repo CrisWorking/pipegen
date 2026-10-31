@@ -32,7 +32,7 @@ import { CREATED_RULES } from '../engine/created-files.js';
 import { createdPathProblem } from '../engine/job-rules.js';
 import { CODE_FILE_RE, isTestFile } from '../read/manifest.js';
 import { readTextLimitedWithReason, SKIP_REASON, READ_LIMITS } from '../read/limits.js';
-import type { CreatedFile, InstallRecord, PipelineDraft, RepoProfile } from '../types.js';
+import type { CreatedFile, InstallRecord, KnownValueCheck, PipelineDraft, RepoProfile } from '../types.js';
 import { lockProblems, packageJsonProblems } from './package-rules.js';
 import type { ReviewedClosure } from './reviewed-closure.js';
 
@@ -57,6 +57,8 @@ export interface GuardCtx {
   allowWorkflowInsert?: readonly string[];
   /** The reviewed closure of the B2 packages (reviewed-closure.ts). Without it every package-lock.json edit is refused. */
   closure?: ReviewedClosure | null;
+  /** The secret vault (D5): a created file whose path, text or reason holds a value the user gave pipegen (or its base64 or URL form) is refused. Without it nothing changes. */
+  vault?: KnownValueCheck;
 }
 export interface GuardResult {
   ok: CreatedFile[];
@@ -173,6 +175,7 @@ function batchClashes(files: readonly CreatedFile[], repo: 'app' | 'central'): S
 
 export async function guardCreatedFiles(files: readonly CreatedFile[], ctx: GuardCtx): Promise<GuardResult> {
   const result: GuardResult = { ok: [], refused: [], notes: [] };
+  const scr = ctx.vault === undefined ? (t: string): string => t : ctx.vault.scrubber();   // D5: what is shown never holds a vault value (a path may carry one)
   const repo = ctx.repo ?? 'app';
   const ix = indexBase(ctx.baseTree);
   const clashes = batchClashes(files, repo);
@@ -189,6 +192,7 @@ export async function guardCreatedFiles(files: readonly CreatedFile[], ctx: Guar
     const pathProblem = createdPathProblem(f.path);
     if (pathProblem !== null) return refuse(`The file path is refused: ${pathProblem}; pipegen writes only plain, normalized paths.`);
     if (typeof f.content !== 'string') return refuse('the file has no text');
+    if (ctx.vault !== undefined && [f.path, f.content, f.reason].some((t) => typeof t === 'string' && ctx.vault?.containsKnownValue(t) === true)) return refuse('the file holds a value you gave pipegen as a secret (or its base64 or URL form); pipegen never writes one into a file');
     if (clashes.has(i)) return refuse('another created file has the same path ignoring letter case, or is the folder of this one, and a path can not be both');
     if (PYTHON_NAMES.includes(baseName(f.path).toLowerCase())) return refuse('pipegen does not create or edit pyproject.toml or requirements-dev.txt in this version (Python support comes later)');
     const lower = fold(f.path);
@@ -285,9 +289,9 @@ export async function guardCreatedFiles(files: readonly CreatedFile[], ctx: Guar
     const f = files[i] as CreatedFile;
     let v: Verdict;
     try { v = await judge(f, i); } catch { v = refuse('the file could not be checked, so pipegen does not write it'); }
-    if (v.kind === 'ok') { result.ok.push(f); if (v.note !== undefined) result.notes.push(v.note); }
-    else if (v.kind === 'refuse') result.refused.push({ path: typeof f?.path === 'string' ? safe(f.path) : '', reason: v.reason });
-    else result.notes.push(v.note);
+    if (v.kind === 'ok') { result.ok.push(f); if (v.note !== undefined) result.notes.push(scr(v.note)); }
+    else if (v.kind === 'refuse') result.refused.push({ path: typeof f?.path === 'string' ? safe(scr(f.path)) : '', reason: scr(v.reason) });
+    else result.notes.push(scr(v.note));
   }
   // a package.json and its package-lock.json travel together: if either is not ok, its partner goes too (one alone makes `npm ci` fail)
   const pairName = (p: string): string | null => (baseName(p) === 'package.json' ? 'package-lock.json' : baseName(p) === 'package-lock.json' ? 'package.json' : null);

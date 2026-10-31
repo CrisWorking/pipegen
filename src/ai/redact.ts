@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os';
 import { isAbsolute, join, relative, resolve, sep } from 'node:path';
 import picomatch from 'picomatch';
 import { IGNORED_DIRS, MAX_FILES_TEXT, listFiles, readTextLimitedWithReason, regexSafe, type Skipped } from '../read/limits.js';
+import { onExit } from '../util/exit-hooks.js';
 import { PATH_SHOWN_MAX, safeText } from '../util/safe-text.js';
 import { LONG_LINE, R, code, decodedNamePieces, findSecretLike, highEntropyRuns, isDigit, isLetter, redact, replaceSpans, type Span } from './redact-core.js';
 import { asScanned, CANARY_RULE, canaryLine, newCanary, PREFIX_LINES, SCAN_CHUNK_SAFE_BYTES, scannersWouldSkip } from './scan-staging.js';
@@ -526,38 +527,18 @@ function unprefixed(f: Finding): Finding {
 
 /**
  * Review M1: while the scan runs, its temp folder (the redacted copies and the raw report) is removed if the process is
- * stopped by SIGINT or SIGTERM, or exits, before `finally` can run; the scanner is killed first. After cleaning up, a
- * signal is raised again when no other handler is there, so the process still stops by it. `release` removes the hooks.
+ * stopped by SIGINT or SIGTERM, or exits, before `finally` can run; the scanner is killed first. The hook lives in the one
+ * exit-hook registry (D5, S8), which raises the signal again when no other handler is there, so the process still stops by
+ * it. `release` unregisters the hook.
  */
 function guardTempDir(dir: string): { child: ChildProcess | null; release: () => void } {
   const guard = { child: null as ChildProcess | null, release: () => {} };
-  const clean = () => {
+  guard.release = onExit(() => {
     try {
       guard.child?.kill('SIGKILL');
     } catch { /* already gone */ }
     rmSync(dir, { recursive: true, force: true });
-  };
-  const onSignal = (sig: NodeJS.Signals) => {
-    try {
-      clean();
-    } finally {
-      guard.release();
-      if (process.listenerCount(sig) === 0) process.kill(process.pid, sig);
-    }
-  };
-  const onExit = () => {
-    try {
-      clean();
-    } catch { /* best effort while exiting */ }
-  };
-  process.once('SIGINT', onSignal);
-  process.once('SIGTERM', onSignal);
-  process.once('exit', onExit);
-  guard.release = () => {
-    process.removeListener('SIGINT', onSignal);
-    process.removeListener('SIGTERM', onSignal);
-    process.removeListener('exit', onExit);
-  };
+  });
   return guard;
 }
 
