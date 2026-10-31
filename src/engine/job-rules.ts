@@ -35,6 +35,8 @@ const DANGEROUS_NAMES: readonly { family: string; match: RegExp }[] = [
   // build toolchains (6b, review R1-7): a compiler, linker, make or package-manager setting changes what a build runs
   { family: 'C, C++ and Go build', match: /^(?:CGO_|PKG_CONFIG_)|^(?:CC|CXX|AR|CFLAGS|CXXFLAGS|CPPFLAGS|LDFLAGS|MAKEFLAGS)$/ },
   { family: 'js package managers and runtimes', match: /^(?:YARN_|PNPM_|BUN_|DENO_|COREPACK_)/ },
+  // credentials that change what a tool does or where it talks (npm publish auth, the gh CLI's token and host): never mapped from a user-supplied secret
+  { family: 'registry and gh CLI credentials', match: /^(?:NPM_TOKEN|GH_TOKEN|GH_HOST|GH_ENTERPRISE_TOKEN)$/i },
   { family: 'jvm, .NET, php, conda, rust compiler', match: /^(?:COMPOSER_|CONDA_|DOTNET_|NUGET_|RUSTC)|^(?:MAVEN_OPTS|GRADLE_OPTS|GRADLE_USER_HOME|PHPRC|PHP_INI_SCAN_DIR|SSH_ASKPASS)$/ },
 ];
 /** Whether a variable name is one a mapped secret (or a job-level variable) must never take. Shared with the referee. */

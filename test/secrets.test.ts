@@ -8,9 +8,11 @@ import {
   askSecrets, coveredNames, generateFpKey, secretRequests, SecretVault, storeEnvSecret, storeSecrets,
   TEST_KEYS_ONLY, type SecretRequest,
 } from '../src/create/secrets.js';
+import { isDangerousName } from '../src/engine/job-rules.js';
 import { runExitHooks } from '../src/util/exit-hooks.js';
 import type { CreatedFile, Dependency, DependencyKind, Service } from '../src/types.js';
-import { fakeOctokit, type Call, type Routes } from './helpers/fake-http.js';
+import { makeOctokit } from '../src/github/client.js';
+import { fakeFetch, fakeOctokit, type Call, type Routes } from './helpers/fake-http.js';
 import { profile, service } from './helpers/render.js';
 
 // provider-key prefixes are built at runtime: no secret-looking literal is committed (test/no-secret-literals.test.ts)
@@ -66,12 +68,12 @@ describe('requests', () => {
   });
 
   it('requests: dangerous or case-colliding names never asked, listed as can\'t-map', () => {
-    const p = profile([svc({ envVars: ['NODE_OPTIONS', 'LD_PRELOAD', 'GITHUB_TOKEN', 'github_foo', 'PIPEGEN_FP_KEY', 'pipegen_x', 'api_key', 'API_KEY', 'OK_KEY', 'bad-name', 'DOCKER_HOST'] })]);
+    const p = profile([svc({ envVars: ['NODE_OPTIONS', 'LD_PRELOAD', 'node_options', 'ld_preload', 'GITHUB_TOKEN', 'github_foo', 'PIPEGEN_FP_KEY', 'pipegen_x', 'api_key', 'API_KEY', 'OK_KEY', 'bad-name', 'DOCKER_HOST', 'NPM_TOKEN', 'GH_TOKEN', 'GH_HOST', 'GH_ENTERPRISE_TOKEN', 'npm_token'] })]);
     const r = secretRequests(p, NONE);
     expect(names(r)).toEqual(['OK_KEY']);
     const all = r.cantMap.join('\n');
-    for (const n of ['NODE_OPTIONS', 'LD_PRELOAD', 'GITHUB_TOKEN', 'github_foo', 'PIPEGEN_FP_KEY', 'pipegen_x', 'api_key', 'API_KEY', 'bad-name', 'DOCKER_HOST']) expect(all, n).toContain(n);
-    expect(r.cantMap).toHaveLength(10);
+    for (const n of ['NODE_OPTIONS', 'LD_PRELOAD', 'node_options', 'ld_preload', 'GITHUB_TOKEN', 'github_foo', 'PIPEGEN_FP_KEY', 'pipegen_x', 'api_key', 'API_KEY', 'bad-name', 'DOCKER_HOST', 'NPM_TOKEN', 'GH_TOKEN', 'GH_HOST', 'GH_ENTERPRISE_TOKEN', 'npm_token']) expect(all, n).toContain(n);
+    expect(r.cantMap).toHaveLength(17);
     expect(r.cantMap.every((l) => /pipegen can't map this name into a step: rename it/.test(l))).toBe(true);
   });
 
@@ -90,12 +92,38 @@ describe('requests', () => {
     expect(JSON.stringify(r)).not.toContain('\u001b');
   });
 
+  it('requests: a lowercase name from the dangerous table (alone, no upper-case twin) is can\'t-map', () => {
+    const r = secretRequests(profile([svc({ envVars: ['node_options', 'ld_preload', 'npm_token', 'gh_host', 'docker_host', 'ok_key'] })]), NONE);
+    expect(names(r)).toEqual(['ok_key']);
+    expect(r.cantMap).toHaveLength(5);
+  });
+
+  it('requests: covered and non-secret names match in any letter case (database_url is not asked when DATABASE_URL is covered)', () => {
+    const p = profile([svc({ envVars: ['database_url', 'Port', 'host', 'node_env', 'log_level', 'REAL_KEY'] }), svc({ name: 'b', path: 'b', envVars: ['Database_Url'] })]);
+    const r = secretRequests(p, { covered: new Set(['DATABASE_URL']) });
+    expect(names(r)).toEqual(['REAL_KEY']);
+    expect(r.cantMap).toEqual([]);
+  });
+
+  it('requests: NPM_TOKEN, GH_TOKEN, GH_HOST and GH_ENTERPRISE_TOKEN are dangerous names', () => {
+    for (const n of ['NPM_TOKEN', 'GH_TOKEN', 'GH_HOST', 'GH_ENTERPRISE_TOKEN']) expect(isDangerousName(n), n).toBe(true);
+    for (const n of ['STRIPE_KEY', 'NPM_REGISTRY_NAME', 'GHOST_KEY', 'MY_GH_TOKEN']) expect(isDangerousName(n), n).toBe(false);
+  });
+
   it('requests: non-string and malformed entries are ignored without throwing', () => {
     const p = profile([svc({ envVars: [null as unknown as string, 7 as unknown as string, 'OK'] }), null as unknown as Service]);
     expect(() => secretRequests(p, NONE)).not.toThrow();
     expect(names(secretRequests(p, NONE))).toEqual(['OK']);
   });
 });
+
+/** Collects every Buffer.alloc result (the vault and the sealing step allocate their value Buffers with it). */
+function captureAllocs(): { made: Buffer[] } {
+  const made: Buffer[] = [];
+  const real = Buffer.alloc;
+  vi.spyOn(Buffer, 'alloc').mockImplementation(((...a: Parameters<typeof Buffer.alloc>) => { const b = real(...a); made.push(b); return b; }) as typeof Buffer.alloc);
+  return { made };
+}
 
 describe('vault', () => {
   it('vault: set/get/names/has; get returns a string; wipe zeroes every Buffer and clears; wipe twice is safe', () => {
@@ -106,9 +134,9 @@ describe('vault', () => {
     expect(v.names().sort()).toEqual(['A_KEY', 'B_KEY']);
     expect(v.has('A_KEY')).toBe(true);
     // catch the Buffer the vault makes for a value, to prove wipe() zeroes it (the vault has no accessor for its Buffers)
-    const spy = vi.spyOn(Buffer, 'from');
+    const cap = captureAllocs();
     v.set('C_KEY', 'value-three-0');
-    const made = spy.mock.results.map((x) => x.value as Buffer).filter((b) => Buffer.isBuffer(b) && b.toString() === 'value-three-0');
+    const made = cap.made.filter((b) => b.toString() === 'value-three-0');
     expect(made.length).toBeGreaterThan(0);
     v.wipe();
     expect(made.every((b) => b.every((x) => x === 0))).toBe(true);
@@ -120,18 +148,49 @@ describe('vault', () => {
 
   it('vault: set replaces and zeroes the old value; empty value and bad names are refused', () => {
     const v = new SecretVault();
-    const spy = vi.spyOn(Buffer, 'from');
+    const cap = captureAllocs();
     v.set('A_KEY', 'old-value-1234');
-    const old = spy.mock.results.map((x) => x.value as Buffer).filter((b) => Buffer.isBuffer(b) && b.toString() === 'old-value-1234');
+    const old = cap.made.filter((b) => b.toString() === 'old-value-1234');
     expect(old.length).toBeGreaterThan(0);
     v.set('A_KEY', 'new-value-1234');
     expect(old.every((b) => b.every((x) => x === 0))).toBe(true);
-    spy.mockRestore();
+    vi.restoreAllMocks();
     expect(v.get('A_KEY')).toBe('new-value-1234');
     expect(() => v.set('A_KEY', '')).toThrow();
     expect(() => v.set('bad name', 'x')).toThrow();
-    expect(() => v.set('__proto__', 'x')).not.toThrow();   // a Map key, never an object key
+    expect(() => v.set('__proto__', 'xxxxxxxx')).not.toThrow();   // a Map key, never an object key
     expect(({} as Record<string, unknown>).polluted).toBeUndefined();
+  });
+
+  it('vault: a value under 8 characters is refused (the error names the variable, never the value); 8 is accepted', () => {
+    const v = new SecretVault();
+    for (const short of ['a', 'true', '1', 'abcdefg']) {
+      const err = (() => { try { v.set('A_KEY', short); return null; } catch (e) { return e as Error; } })();
+      expect(err, short).toBeInstanceOf(Error);
+      expect(err?.message).toContain('A_KEY');
+      expect(err?.message).not.toContain(`"${short}"`);
+    }
+    expect(v.has('A_KEY')).toBe(false);
+    v.set('A_KEY', 'abcdefgh');
+    expect(v.has('A_KEY')).toBe(true);
+  });
+
+  it('vault: PIPEGEN_* and GITHUB_* are refused by set (any case); only generateFpKey sets PIPEGEN_FP_KEY', () => {
+    const v = new SecretVault();
+    for (const n of ['PIPEGEN_FP_KEY', 'pipegen_x', 'GITHUB_TOKEN', 'github_x']) expect(() => v.set(n, 'value-12345678'), n).toThrow();
+    expect(v.names()).toEqual([]);
+    generateFpKey(v);
+    expect(v.names()).toEqual(['PIPEGEN_FP_KEY']);
+  });
+
+  it('vault: values live in unpooled Buffers (never a slice of Node\'s shared 8 KiB pool)', () => {
+    const { made } = captureAllocs();
+    const v = new SecretVault();
+    v.set('A_KEY', 'value-12345678');
+    const mine = made.filter((b) => b.length === 'value-12345678'.length);
+    expect(mine.length).toBeGreaterThan(0);
+    expect(mine.every((b) => b.buffer.byteLength === b.length)).toBe(true);
+    expect(mine.some((b) => b.toString() === 'value-12345678')).toBe(true);
   });
 
   it('vault: no values() method; inspect, JSON.stringify and a template literal show no value', () => {
@@ -259,6 +318,35 @@ describe('askSecrets', () => {
     expect((await askSecrets(io, [req('A_KEY'), req('B_KEY')], v)).missing).toEqual([]);
   });
 
+  it('ask: a value under 8 characters is refused with a fixed message, asked once more, then missing; 8 characters is taken', async () => {
+    for (const short of ['a', 'true', '1', 'abcdefg']) {
+      const io = scriptedPrompter([short, short]);
+      const v = new SecretVault();
+      const r = await askSecrets(io, [req('A_KEY')], v);
+      expect(r.missing, short).toEqual(['A_KEY']);
+      expect(v.names()).toEqual([]);
+      expect(io.asked).toHaveLength(2);
+      expect(io.asked[1]?.msg.startsWith(TEST_KEYS_ONLY)).toBe(true);
+      expect(io.asked[1]?.msg).toMatch(/too short to protect: pipegen needs at least 8 characters/);
+      expect(io.asked[1]?.msg).not.toContain(`\n${short}\n`);
+    }
+    const io = scriptedPrompter(['abc', 'abcdefgh']);
+    const v = new SecretVault();
+    expect((await askSecrets(io, [req('A_KEY')], v)).missing).toEqual([]);
+    expect(v.get('A_KEY')).toBe('abcdefgh');
+    const io8 = scriptedPrompter(['abcdefgh']);
+    expect((await askSecrets(io8, [req('B_KEY')], new SecretVault())).missing).toEqual([]);
+  });
+
+  it('ask: a request with a reserved or unmappable name (PIPEGEN_*, GITHUB_*, dangerous) is never asked and counts as missing', async () => {
+    const io = scriptedPrompter(['value-12345678']);
+    const v = new SecretVault();
+    const r = await askSecrets(io, [req('PIPEGEN_FP_KEY'), req('github_x'), req('NODE_OPTIONS'), req('bad-name'), req('OK_KEY')], v);
+    expect(r.missing).toEqual(['PIPEGEN_FP_KEY', 'github_x', 'NODE_OPTIONS', 'bad-name']);
+    expect(io.asked).toHaveLength(1);
+    expect(v.names()).toEqual(['OK_KEY']);
+  });
+
   it('ask: no prompt text, missing list or error holds a typed value', async () => {
     const io = scriptedPrompter([SKL + 'TOPSECRET99999', SKL + 'TOPSECRET99999']);
     const v = new SecretVault();
@@ -278,6 +366,13 @@ function repoRoutes(kp: Pair, puts: Call[], over: { keyReply?: Routes[string]; p
     ...Object.fromEntries(['STRIPE_KEY', 'K_ONE', 'API_KEY', 'MIXED_CASE'].map((n) => [`PUT https://api.github.com/repos/o/r/actions/secrets/${n}`, over.putReply ?? ((c: Call) => { puts.push(c); return { status: 201, body: {} }; })])),
   };
 }
+/** GitHub wants standard base64 with padding. Buffer.from(x, 'base64') also takes the URL alphabet, so check the text itself and the sealed length. */
+function expectStandardBase64(text: string, plaintextBytes: number): void {
+  expect(text).toMatch(/^[A-Za-z0-9+/]*={0,2}$/);
+  expect(text.length % 4).toBe(0);
+  expect(Buffer.from(text, 'base64').toString('base64')).toBe(text);   // canonical: re-encoding gives the same text
+  expect(Buffer.from(text, 'base64')).toHaveLength(plaintextBytes + sodium.crypto_box_SEALBYTES);
+}
 const open = (kp: Pair, sealed: string): string => sodium.to_string(sodium.crypto_box_seal_open(Buffer.from(sealed, 'base64'), kp.publicKey, kp.privateKey));
 
 describe('storeSecrets', () => {
@@ -295,6 +390,7 @@ describe('storeSecrets', () => {
     const body = JSON.parse(puts[0]?.body as string) as Record<string, string>;
     expect(Object.keys(body).sort()).toEqual(['encrypted_value', 'key_id']);
     expect(body.key_id).toBe('key-123');
+    expectStandardBase64(body.encrypted_value as string, (SKT + 'PLAINTEXTVALUE').length);
     expect(open(kp, body.encrypted_value as string)).toBe(SKT + 'PLAINTEXTVALUE');
     for (const c of calls) {
       expect(c.body ?? '').not.toContain('PLAINTEXTVALUE');
@@ -322,8 +418,6 @@ describe('storeSecrets', () => {
     const { gh, calls } = fakeOctokit(repoRoutes(kp, puts));
     const v = new SecretVault();
     v.set('mixed_case', 'value-12345678');
-    v.set('GITHUB_TOKEN', 'value-12345678');
-    v.set('github_x', 'value-12345678');
     expect(await storeSecrets(gh, { owner: 'o', repo: 'r' }, v, ['mixed_case'])).toEqual(['MIXED_CASE']);
     expect(puts[0]?.url.pathname).toBe('/repos/o/r/actions/secrets/MIXED_CASE');
     const n = calls.length;
@@ -337,9 +431,32 @@ describe('storeSecrets', () => {
     const { gh, calls } = fakeOctokit(repoRoutes(kp, puts));
     const v = new SecretVault();
     v.set('K_ONE', 'value-12345678');
-    v.set('GITHUB_X', 'value-12345678');
     await expect(storeSecrets(gh, { owner: 'o', repo: 'r' }, v, ['K_ONE', 'GITHUB_X'])).rejects.toThrow();
     expect(calls).toHaveLength(0);
+  });
+
+  it('store: two vault names that are the same after upper-casing send nothing (one would overwrite the other)', async () => {
+    const kp = keypair();
+    const puts: Call[] = [];
+    const { gh, calls } = fakeOctokit(repoRoutes(kp, puts));
+    const v = new SecretVault();
+    v.set('api_key', 'value-aaaaaaaa');
+    v.set('API_KEY', 'value-bbbbbbbb');
+    await expect(storeSecrets(gh, { owner: 'o', repo: 'r' }, v, ['api_key', 'API_KEY'])).rejects.toThrow(/same/);
+    expect(calls).toHaveLength(0);
+  });
+
+  it('store: every sealed text is standard padded base64 whatever the value length (all three padding cases)', async () => {
+    const kp = keypair();
+    const puts: Call[] = [];
+    const { gh } = fakeOctokit(repoRoutes(kp, puts));
+    const v = new SecretVault();
+    const lens = [8, 9, 10, 11, 40];
+    for (const n of lens) {
+      v.set('K_ONE', 'x'.repeat(n));
+      await storeSecrets(gh, { owner: 'o', repo: 'r' }, v, ['K_ONE']);
+    }
+    puts.forEach((c, i) => expectStandardBase64((JSON.parse(c.body as string) as { encrypted_value: string }).encrypted_value, lens[i] as number));
   });
 
   it('store: owner and repo are validated before any request', async () => {
@@ -360,6 +477,10 @@ describe('storeSecrets', () => {
       { key: b64(kp.publicKey) },
       { key_id: '', key: b64(kp.publicKey) },
       { key_id: 'k', key: 12 },
+      { key_id: 'a\nb', key: b64(kp.publicKey) },
+      { key_id: 'a b', key: b64(kp.publicKey) },
+      { key_id: 'a\u0000b', key: b64(kp.publicKey) },
+      { key_id: 'x'.repeat(129), key: b64(kp.publicKey) },
       {},
     ];
     for (const body of bads) {
@@ -391,6 +512,24 @@ describe('storeSecrets', () => {
     expect((err as Error).message).toMatch(/422/);
   });
 
+  it('store: pipegen\'s Octokit with debug on logs no request body (no encrypted_value, no plaintext)', async () => {
+    const kp = keypair();
+    const puts: Call[] = [];
+    const { fetch } = fakeFetch(repoRoutes(kp, puts));
+    const lines: string[] = [];
+    const gh = makeOctokit(null, { debug: true, fetch, log: (l) => lines.push(l) });
+    const v = new SecretVault();
+    v.set('STRIPE_KEY', SKT + 'PLAINTEXTVALUE');
+    await storeSecrets(gh, { owner: 'o', repo: 'r' }, v, ['STRIPE_KEY']);
+    expect(puts).toHaveLength(1);
+    expect(lines.length).toBeGreaterThan(0);   // the debug log was on
+    const sealed = (JSON.parse(puts[0]?.body as string) as { encrypted_value: string }).encrypted_value;
+    const all = lines.join('\n');
+    expect(all).not.toContain('encrypted_value');
+    expect(all).not.toContain(sealed);
+    expect(all).not.toContain('PLAINTEXTVALUE');
+  });
+
   it('store: a failing key fetch is an error with no value in it', async () => {
     const kp = keypair();
     const { gh } = fakeOctokit(repoRoutes(kp, [], { keyReply: { status: 403, body: { message: 'Resource not accessible' } } }));
@@ -405,21 +544,22 @@ describe('storeSecrets', () => {
 describe('storeEnvSecret (environment)', () => {
   beforeEach(async () => { await sodium.ready; });
   const envRoutes = (kp: Pair, puts: Call[]): Routes => ({
-    'GET https://api.github.com/repositories/42/environments/pipegen-signing/secrets/public-key': { body: { key_id: 'env-key', key: b64(kp.publicKey) } },
-    'PUT https://api.github.com/repositories/42/environments/pipegen-signing/secrets/PIPEGEN_COSIGN_KEY': (c) => { puts.push(c); return { status: 201, body: {} }; },
+    'GET https://api.github.com/repos/o/r/environments/pipegen-signing/secrets/public-key': { body: { key_id: 'env-key', key: b64(kp.publicKey) } },
+    'PUT https://api.github.com/repos/o/r/environments/pipegen-signing/secrets/PIPEGEN_COSIGN_KEY': (c) => { puts.push(c); return { status: 201, body: {} }; },
   });
 
   it('env store: uses the environment public key endpoint, seals, sends key_id', async () => {
     const kp = keypair();
     const puts: Call[] = [];
     const { gh, calls } = fakeOctokit(envRoutes(kp, puts));
-    await storeEnvSecret(gh, { owner: 'o', repo: 'r', id: 42 }, 'pipegen-signing', 'pipegen_cosign_key', 'cosign-PLAIN-1234');
+    await storeEnvSecret(gh, { owner: 'o', repo: 'r' }, 'pipegen-signing', 'pipegen_cosign_key', 'cosign-PLAIN-1234');
     expect(calls.map((c) => `${c.method} ${c.url.pathname}`)).toEqual([
-      'GET /repositories/42/environments/pipegen-signing/secrets/public-key',
-      'PUT /repositories/42/environments/pipegen-signing/secrets/PIPEGEN_COSIGN_KEY',
+      'GET /repos/o/r/environments/pipegen-signing/secrets/public-key',
+      'PUT /repos/o/r/environments/pipegen-signing/secrets/PIPEGEN_COSIGN_KEY',
     ]);
     const body = JSON.parse(puts[0]?.body as string) as Record<string, string>;
     expect(body.key_id).toBe('env-key');
+    expectStandardBase64(body.encrypted_value as string, 'cosign-PLAIN-1234'.length);
     expect(open(kp, body.encrypted_value as string)).toBe('cosign-PLAIN-1234');
     expect(calls.every((c) => !(c.body ?? '').includes('PLAIN'))).toBe(true);
   });
@@ -428,31 +568,42 @@ describe('storeEnvSecret (environment)', () => {
     const kp = keypair();
     const { gh, calls } = fakeOctokit(envRoutes(kp, []));
     const v = new SecretVault();
-    v.set('PIPEGEN_COSIGN_KEY', 'value-12345678');
-    await storeSecrets(gh, { owner: 'o', repo: 'r' }, v, ['PIPEGEN_COSIGN_KEY']).catch(() => undefined);
+    v.set('COSIGN_KEY', 'value-12345678');
+    await storeSecrets(gh, { owner: 'o', repo: 'r' }, v, ['COSIGN_KEY']).catch(() => undefined);
     expect(calls.some((c) => c.url.pathname.includes('/environments/'))).toBe(false);
     expect(calls.every((c) => c.url.pathname.startsWith('/repos/o/r/actions/secrets/'))).toBe(true);
   });
 
-  it('env store: env, name, id and value are validated before any request', async () => {
+  it('env store: owner, repo, env, name and value are validated before any request', async () => {
     const { gh, calls } = fakeOctokit({});
-    const ok = { owner: 'o', repo: 'r', id: 42 };
+    const ok = { owner: 'o', repo: 'r' };
     const cases: [typeof ok, string, string, string][] = [
       [ok, '../x', 'K_ONE', 'v1234567'], [ok, 'a/b', 'K_ONE', 'v1234567'], [ok, '', 'K_ONE', 'v1234567'], [ok, 'env', 'GITHUB_TOKEN', 'v1234567'],
-      [ok, 'env', 'bad-name', 'v1234567'], [ok, 'env', 'K_ONE', ''], [{ ...ok, id: 0 }, 'env', 'K_ONE', 'v1234567'], [{ ...ok, id: 1.5 }, 'env', 'K_ONE', 'v1234567'],
-      [{ ...ok, id: Number.NaN }, 'env', 'K_ONE', 'v1234567'],
+      [ok, 'env', 'bad-name', 'v1234567'], [ok, 'env', 'K_ONE', ''], [{ owner: 'o/x', repo: 'r' }, 'env', 'K_ONE', 'v1234567'], [{ owner: 'o', repo: '..' }, 'env', 'K_ONE', 'v1234567'], [{ owner: '', repo: 'r' }, 'env', 'K_ONE', 'v1234567'],
+      [ok, 'prod env', 'K_ONE', 'v1234567'], [ok, 'a?b', 'K_ONE', 'v1234567'],
     ];
     for (const [r, e, n, val] of cases) await expect(storeEnvSecret(gh, r, e, n, val), `${e} ${n}`).rejects.toThrow();
     expect(calls).toHaveLength(0);
+  });
+
+  it('env store: the plaintext Buffer made for sealing is zeroed afterwards', async () => {
+    const kp = keypair();
+    const { gh } = fakeOctokit(envRoutes(kp, []));
+    const value = 'zeroing-check-value';
+    const { made } = captureAllocs();
+    await storeEnvSecret(gh, { owner: 'o', repo: 'r' }, 'pipegen-signing', 'PIPEGEN_COSIGN_KEY', value);
+    const mine = made.filter((b) => b.length === value.length);
+    expect(mine.length).toBeGreaterThan(0);
+    expect(mine.every((b) => b.every((x) => x === 0))).toBe(true);
   });
 
   it('env store: an invalid key is refused and nothing is sent; errors carry no value', async () => {
     const kp = keypair();
     const puts: Call[] = [];
     const routes = envRoutes(kp, puts);
-    routes['GET https://api.github.com/repositories/42/environments/pipegen-signing/secrets/public-key'] = { body: { key_id: 'k', key: b64(new Uint8Array(5)) } };
+    routes['GET https://api.github.com/repos/o/r/environments/pipegen-signing/secrets/public-key'] = { body: { key_id: 'k', key: b64(new Uint8Array(5)) } };
     const { gh } = fakeOctokit(routes);
-    const err = await storeEnvSecret(gh, { owner: 'o', repo: 'r', id: 42 }, 'pipegen-signing', 'PIPEGEN_COSIGN_KEY', 'cosign-PLAIN-1234').then(() => null, (e: unknown) => e);
+    const err = await storeEnvSecret(gh, { owner: 'o', repo: 'r' }, 'pipegen-signing', 'PIPEGEN_COSIGN_KEY', 'cosign-PLAIN-1234').then(() => null, (e: unknown) => e);
     expect((err as Error).message).toMatch(/public key/);
     expect(puts).toHaveLength(0);
     expect(inspect(err, { depth: 6 })).not.toContain('PLAIN');

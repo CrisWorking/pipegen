@@ -1401,26 +1401,26 @@ const fileKind = (f: CreatedFile): 'workflow' | 'action' | null => (WORKFLOW_PAT
  * ensureLinters and `ghToken` the read-only token zizmor's online audits use (7b); `deps.runLinters` runs the linters (default:
  * the real runLinters). Never throws for anything in the files.
  */
-export async function referee(files: CreatedFile[], draft: PipelineDraft, platform: PlatformActions, reviewed: ReviewedTool[], linters: Linters, ghToken: string | null, deps: RefereeDeps = {}): Promise<RefereeReport> {
+export async function referee(allFiles: CreatedFile[], draft: PipelineDraft, platform: PlatformActions, reviewed: ReviewedTool[], linters: Linters, ghToken: string | null, deps: RefereeDeps = {}): Promise<RefereeReport> {
   const issues: RefereeIssue[] = [];
   const notes: string[] = [];
   // D5: with a vault, whatever is shown (a path may be the carrier of a value) first passes its scrubber
   const shown = deps.vault === undefined ? (t: string): string => t : deps.vault.scrubber();
   const add: Add = (file, check, message, line, repo) => { issues.push({ file: safeText(shown(file), 200), check, message: shown(message), ...(line === undefined ? {} : { line }), ...(repo === undefined ? {} : { repo }) }); };
 
+  // D5 (S8, I1): a file whose path, text or reason holds a value the user gave pipegen (or its base64 or URL form) gets ONE fixed issue and is judged no further:
+  // no other check reads it, so no other message can quote a piece of the value (a cut by safeText would leave a prefix the scrubber can't match)
+  const holdsValue = (f: CreatedFile): boolean => deps.vault !== undefined && [f?.path, f?.content, f?.reason].some((t) => typeof t === 'string' && deps.vault?.containsKnownValue(t) === true);
+  const files = allFiles.filter((f) => !holdsValue(f));
+  for (const f of allFiles) {
+    if (!holdsValue(f)) continue;
+    add(f.path, 'secret-value', 'The file holds a value you gave pipegen as a secret (or its base64 or URL form); pipegen never writes one into a file.', undefined, f.repo);
+  }
+
   // S18: no secret value in any file (rule names only, never the value)
   for (const f of files) {
     const hits = findSecretLike(f.content);
     if (hits.length > 0) add(f.path, 'secret-value', `The file holds text that looks like a secret value (${hits.join(', ')}); pipegen never writes one into a file.`);
-  }
-
-  // D5 (S8): no value the user gave pipegen (nor its base64 or URL form) in any created file; the message never holds the value
-  if (deps.vault !== undefined) {
-    for (const f of files) {
-      if ([f.path, f.content, f.reason].some((t) => typeof t === 'string' && deps.vault?.containsKnownValue(t) === true)) {
-        add(f.path, 'secret-value', 'The file holds a value you gave pipegen as a secret (or its base64 or URL form); pipegen never writes one into a file.', undefined, f.repo);
-      }
-    }
   }
 
   for (const d of duplicatePathProblems(files)) add(d.file.path, 'template', d.message, undefined, d.file.repo);

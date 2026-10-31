@@ -180,19 +180,19 @@ export async function guardCreatedFiles(files: readonly CreatedFile[], ctx: Guar
   const ix = indexBase(ctx.baseTree);
   const clashes = batchClashes(files, repo);
   const badServices = ctx.profile.services.map((s) => s.path).filter((p) => !planeService(p));
-  for (const raw of badServices) result.notes.push(`The service folder ${JSON.stringify(safe(raw))} has characters or a shape pipegen does not write into (letters, digits, . _ - and / only), so pipegen creates no file there; add what that service needs by hand.`);
+  for (const raw of badServices) result.notes.push(scr(`The service folder ${JSON.stringify(safe(raw))} has characters or a shape pipegen does not write into (letters, digits, . _ - and / only), so pipegen creates no file there; add what that service needs by hand.`));
   const lenient = badServices.map((p) => fold(p.split('/').filter((s) => s !== '' && s !== '.').join('/'))).filter((p) => p !== '');
   let rootOk = true;
   try { rootOk = (await stat(ctx.root)).isDirectory(); } catch { rootOk = false; }
 
   async function judge(f: CreatedFile, i: number): Promise<Verdict> {
     if (typeof f !== 'object' || f === null) return refuse('this is not a file description');
+    if (ctx.vault !== undefined && [f.path, f.content, f.reason].some((t) => typeof t === 'string' && ctx.vault?.containsKnownValue(t) === true)) return refuse('the file holds a value you gave pipegen as a secret (or its base64 or URL form); pipegen never writes one into a file');
     if (typeof f.path !== 'string') return refuse('the path is empty');
     if (f.repo !== repo) return refuse(`this file belongs to the ${safe(f.repo)} repository, but the guard checks the ${repo} repository`);
     const pathProblem = createdPathProblem(f.path);
     if (pathProblem !== null) return refuse(`The file path is refused: ${pathProblem}; pipegen writes only plain, normalized paths.`);
     if (typeof f.content !== 'string') return refuse('the file has no text');
-    if (ctx.vault !== undefined && [f.path, f.content, f.reason].some((t) => typeof t === 'string' && ctx.vault?.containsKnownValue(t) === true)) return refuse('the file holds a value you gave pipegen as a secret (or its base64 or URL form); pipegen never writes one into a file');
     if (clashes.has(i)) return refuse('another created file has the same path ignoring letter case, or is the folder of this one, and a path can not be both');
     if (PYTHON_NAMES.includes(baseName(f.path).toLowerCase())) return refuse('pipegen does not create or edit pyproject.toml or requirements-dev.txt in this version (Python support comes later)');
     const lower = fold(f.path);
@@ -301,7 +301,7 @@ export async function guardCreatedFiles(files: readonly CreatedFile[], ctx: Guar
     const partnerPath = `${f.path.slice(0, f.path.length - baseName(f.path).length)}${partner}`;
     if (result.ok.some((x) => x.path === partnerPath)) continue;
     result.ok.splice(result.ok.indexOf(f), 1);
-    result.refused.push({ path: safe(f.path), reason: `its partner ${q(partnerPath)} was refused or is not written, and ${q(f.path)} alone makes \`npm ci\` fail in your CI, so pipegen writes neither` });
+    result.refused.push({ path: safe(scr(f.path)), reason: scr(`its partner ${q(partnerPath)} was refused or is not written, and ${q(f.path)} alone makes \`npm ci\` fail in your CI, so pipegen writes neither`) });
   }
   return result;
 }

@@ -5,6 +5,7 @@ import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { guardCreatedFiles, type GuardCtx } from '../src/create/guard.js';
 import { SecretVault } from '../src/create/secrets.js';
+import { CREATED_RULES } from '../src/engine/created-files.js';
 import { referee, type Linters } from '../src/engine/referee.js';
 import type { CreatedFile, PipelineDraft } from '../src/types.js';
 import { platform, profile, reviewedList, service } from './helpers/render.js';
@@ -84,5 +85,67 @@ describe('referee: vault values', () => {
     expect(a.issues.some((i) => /you gave pipegen/.test(i.message))).toBe(false);
     const b = await ref([file('FROM node:24\n')], vault());
     expect(b.issues.some((i) => /you gave pipegen/.test(i.message))).toBe(false);
+  });
+});
+
+describe('referee: a file holding a value gets only the fixed secret-value issue (I1)', () => {
+  const LONG = 'Zq7Rk2mW9xLp4Tn8Hy6Vb3Nc';   // 24 characters: a cut by safeText must never leave a piece of it
+  const PRE = 'j'.repeat(40);
+  const wf = (path: string, content: string): CreatedFile => ({ path, content, part: 'pipeline', reason: 'r', repo: 'central' });
+
+  it('a value straddling the safeText cut in a job id, a step name, broken YAML or a compose service: one fixed issue per file, no piece of the value anywhere', async () => {
+    const v = new SecretVault();
+    v.set('K_LONG', LONG);
+    const files: CreatedFile[] = [
+      wf('.github/workflows/ci.yml', `name: ci\non: [push]\njobs:\n  ${PRE + LONG}:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo ${LONG}\n        name: ${PRE + PRE + LONG}\n`),
+      wf('.github/workflows/bad.yml', `on: [push\n  ${LONG}: : :\n`),
+      { path: 'docker-compose.pipegen.yml', content: `services:\n  ${LONG}:\n    image: x\n`, part: 'docker', reason: 'r', repo: 'app' },
+    ];
+    const r = await ref(files, v);
+    expect(r.issues.length).toBe(3);
+    expect(r.issues.every((i) => i.check === 'secret-value' && /you gave pipegen/.test(i.message))).toBe(true);
+    const shown = JSON.stringify(r);
+    for (let k = 0; k + 8 <= LONG.length; k++) expect(shown, LONG.slice(k, k + 8)).not.toContain(LONG.slice(k, k + 8));
+  });
+
+  it('a value in the reason alone makes the file a secret-value issue', async () => {
+    const v = new SecretVault();
+    v.set('K_LONG', LONG);
+    const r = await ref([file('FROM node:24\n', { reason: `because ${LONG}` })], v);
+    expect(r.issues.map((i) => i.check)).toEqual(['secret-value']);
+    expect(JSON.stringify(r)).not.toContain(LONG.slice(0, 8));
+  });
+
+  it('every issue text is scrubbed where issues are built: a judge that quotes a value is shown redacted (the whole text, before any cut)', async () => {
+    const v = new SecretVault();
+    v.set('K_LONG', LONG);
+    const quoting = CREATED_RULES.map((r) => (r.id === 'dockerfile' ? { ...r, judge: () => [`the base image ${LONG} is not allowed`] } : r));
+    const r = await referee([file('FROM node:24\n')], mkDraft(), platform(), reviewedList(), LINTERS, 'tok', { runLinters: async () => [], vault: v, createdRules: quoting });
+    expect(r.issues.length).toBeGreaterThan(0);
+    expect(JSON.stringify(r)).not.toContain(LONG);
+    expect(r.issues.some((i) => i.message.includes('[REDACTED]'))).toBe(true);
+  });
+});
+
+describe('guard: the service-folder note is scrubbed', () => {
+  it('a service folder name that holds a value is shown redacted in the note', async () => {
+    const v = new SecretVault();
+    v.set('K_ONE', 'abcdefgh12345678');
+    const ctx = guardCtx(v);
+    ctx.profile = profile([service({ name: 'api', path: 'bad folder abcdefgh12345678' })]);
+    const r = await guardCreatedFiles([file('FROM node:24\n')], ctx);
+    expect(r.notes.join('\n')).toMatch(/service folder/);
+    expect(JSON.stringify(r)).not.toContain('abcdefgh12345678');
+  });
+});
+
+describe('guard: a file holding a value gets only the fixed refusal (I1)', () => {
+  it('even when other rules would also refuse it (a bad path), the reason is the fixed one and the path is scrubbed', async () => {
+    const v = new SecretVault();
+    v.set('K_ONE', 'abcdefgh12345678');
+    const r = await guardCreatedFiles([file('FROM node:24\n', { path: '../abcdefgh12345678/Dockerfile' })], guardCtx(v));
+    expect(r.refused).toHaveLength(1);
+    expect(r.refused[0]?.reason).toMatch(/value you gave pipegen/);
+    expect(JSON.stringify(r)).not.toContain('abcdefgh12345678');
   });
 });

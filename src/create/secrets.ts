@@ -36,11 +36,14 @@ export function coveredNames(profile: RepoProfile, files: readonly CreatedFile[]
   return new Set(composeCoveredNames(profile, { createdDockerfiles: dockerfilesOf(files) }));
 }
 
+/** PIPEGEN_* and GITHUB_* (any case): reserved, never taken from a request or a caller. */
+const reserved = (name: string): boolean => /^(?:PIPEGEN|GITHUB)_/i.test(name);
+
 /** Why a name can't be mapped into a step (it becomes `${{ secrets.NAME }}` in an env), or null. The secret is stored under the upper-case name. */
 function mapProblem(name: string): boolean {
   if (!NAME_RE.test(name)) return true;
   const up = name.toUpperCase();
-  return isDangerousName(name) || isDangerousName(up) || up.startsWith('GITHUB_') || up.startsWith('PIPEGEN_');
+  return isDangerousName(name) || isDangerousName(up) || reserved(name);
 }
 
 /**
@@ -52,13 +55,14 @@ function mapProblem(name: string): boolean {
 export function secretRequests(profile: RepoProfile, ctx: { covered: Set<string> }): { requests: SecretRequest[]; cantMap: string[]; notes: string[] } {
   const out = { requests: [] as SecretRequest[], cantMap: [] as string[], notes: [] as string[] };
   const services = Array.isArray(profile?.services) ? profile.services : [];
+  const covered = new Set([...ctx.covered].map((n) => n.toUpperCase()));   // compose reads the names as written, but a spelling that differs only in case is the same secret
   interface Seen { service: string; owners: Dependency[] }
   const seen = new Map<string, Seen>();
   for (const s of services) {
     if (s === null || typeof s !== 'object' || !Array.isArray(s.envVars)) continue;
     const deps = Array.isArray(s.dependsOn) ? s.dependsOn.filter((d): d is Dependency => d !== null && typeof d === 'object' && Array.isArray(d.envVars)) : [];
     for (const name of s.envVars) {
-      if (typeof name !== 'string' || name === '' || NON_SECRETS.has(name.toUpperCase()) || ctx.covered.has(name)) continue;
+      if (typeof name !== 'string' || name === '' || NON_SECRETS.has(name.toUpperCase()) || covered.has(name.toUpperCase())) continue;
       const entry = seen.get(name) ?? { service: typeof s.name === 'string' ? s.name : 'app', owners: [] };
       entry.owners.push(...deps.filter((d) => d.envVars.includes(name)));
       seen.set(name, entry);
@@ -91,16 +95,30 @@ export function secretRequests(profile: RepoProfile, ctx: { covered: Set<string>
  * The values the user typed (and PIPEGEN_FP_KEY), in memory only. `get` returns a string and exists for sealing; nothing lists the values.
  * Held values register `wipe` with the exit-hook registry (exit, SIGINT, SIGTERM); wipe unregisters it.
  */
+/** The shortest value pipegen keeps (a shorter one would make the scrubber and the file check flag ordinary text, and its place in a text would give it away). */
+export const MIN_VALUE_LENGTH = 8;
+let putReserved: (v: SecretVault, name: string, value: string) => void;
+
 export class SecretVault implements KnownValueCheck {
   readonly #values = new Map<string, Buffer>();
   #unhook: (() => void) | null = null;
 
   set(name: string, value: string): void {
+    if (typeof name === 'string' && reserved(name)) throw new Error(`${safeText(name, 80)} is a name pipegen reserves for itself, so it can not hold a value you typed`);
+    this.#put(name, value);
+  }
+  /** The one write path. Buffers are allocated with Buffer.alloc (never a slice of Node's shared pool) and filled in place. */
+  #put(name: string, value: string): void {
     if (typeof name !== 'string' || !NAME_RE.test(name)) throw new Error('a secret name must be a plain environment variable name');
-    if (typeof value !== 'string' || value === '') throw new Error(`the value for ${safeText(String(name), 80)} is empty`);
+    if (typeof value !== 'string' || [...value].length < MIN_VALUE_LENGTH) throw new Error(`the value for ${safeText(name, 80)} is too short to protect: pipegen needs at least ${MIN_VALUE_LENGTH} characters`);
     this.#values.get(name)?.fill(0);
-    this.#values.set(name, Buffer.from(value, 'utf8'));
+    const buf = Buffer.alloc(Buffer.byteLength(value, 'utf8'));
+    buf.write(value, 'utf8');
+    this.#values.set(name, buf);
     this.#unhook ??= onExit(() => this.wipe());
+  }
+  static {
+    putReserved = (v, name, value) => v.#put(name, value);
   }
   get(name: string): string | undefined {
     return this.#values.get(name)?.toString('utf8');
@@ -137,6 +155,7 @@ export class SecretVault implements KnownValueCheck {
 
 export const TEST_KEYS_ONLY = "Use TEST keys only (never production). They're used for the proof and deleted from the test repo afterwards.";
 const LIVE_REFUSED = 'That looks like a LIVE (production) key, so pipegen did not take it. Paste a TEST key instead, or press Enter to skip.';
+const TOO_SHORT = `That value is too short to protect: pipegen needs at least ${MIN_VALUE_LENGTH} characters. Paste the full value, or press Enter to skip and set it yourself.`;
 /** Live-key prefixes of payment providers (Stripe sk/rk/pk_live_, Razorpay rzp_live_, Mollie live_). Test keys never carry them. */
 const LIVE_KEY_RE = /(?:^|[^A-Za-z0-9])(?:sk|rk|pk|rzp)_live_|^live_/i;
 
@@ -147,10 +166,14 @@ const LIVE_KEY_RE = /(?:^|[^A-Za-z0-9])(?:sk|rk|pk|rzp)_live_|^live_/i;
 export async function askSecrets(io: Prompter, reqs: readonly SecretRequest[], vault: SecretVault): Promise<{ missing: string[] }> {
   const missing: string[] = [];
   for (const r of reqs) {
+    // a name pipegen could not map into a step (reserved, dangerous, not plain) is never asked: whoever built the request, the vault does not take it
+    if (typeof r?.name !== 'string' || mapProblem(r.name)) { missing.push(String(r?.name)); continue; }
     const what = `${r.name} (${r.why})${r.example === undefined ? '' : ` ${r.example}`}`;
     let value = (await io.text(`${TEST_KEYS_ONLY}\n${what}`, { secret: true })).trim();
-    if (value !== '' && LIVE_KEY_RE.test(value)) value = (await io.text(`${TEST_KEYS_ONLY}\n${LIVE_REFUSED}\n${what}`, { secret: true })).trim();
-    if (value === '' || LIVE_KEY_RE.test(value)) { missing.push(r.name); continue; }
+    const refusal = (v: string): string | null => (v === '' ? null : LIVE_KEY_RE.test(v) ? LIVE_REFUSED : [...v].length < MIN_VALUE_LENGTH ? TOO_SHORT : null);
+    const first = refusal(value);
+    if (first !== null) value = (await io.text(`${TEST_KEYS_ONLY}\n${first}\n${what}`, { secret: true })).trim();
+    if (value === '' || refusal(value) !== null) { missing.push(r.name); continue; }
     vault.set(r.name, value);
   }
   return { missing };
@@ -200,7 +223,8 @@ async function fetchKey(gh: Octokit, fn: () => Promise<{ data: unknown }>): Prom
 
 /** crypto_box_seal of `value` to `key`, base64. The plaintext Buffer made here is zeroed. */
 function seal(value: string, key: Uint8Array): string {
-  const plain = Buffer.from(value, 'utf8');
+  const plain = Buffer.alloc(Buffer.byteLength(value, 'utf8'));
+  plain.write(value, 'utf8');
   try { return Buffer.from(sodium.crypto_box_seal(plain, key)).toString('base64'); } finally { plain.fill(0); }
 }
 
@@ -232,22 +256,23 @@ export async function storeSecrets(gh: Octokit, repo: { owner: string; repo: str
 
 /**
  * THE way to store an environment secret (for example PIPEGEN_COSIGN_KEY in `pipegen-signing`): GET the environment's public key
- * (/repositories/{id}/environments/{env}/secrets/public-key), seal, PUT. `env`, `name` and the repo id are validated first.
+ * (/repos/{owner}/{repo}/environments/{env}/secrets/public-key, the path in GitHub's current API description; S8 amended, DECISIONS #105),
+ * seal, PUT. `owner`, `repo`, `env` and `name` are validated first; Octokit URL-encodes the path parts.
  */
-export async function storeEnvSecret(gh: Octokit, repo: { owner: string; repo: string; id: number }, env: string, name: string, value: string): Promise<void> {
-  if (!Number.isSafeInteger(repo?.id) || repo.id <= 0) throw new SecretStoreError('the repository id is not a positive integer');
+export async function storeEnvSecret(gh: Octokit, repo: { owner: string; repo: string }, env: string, name: string, value: string): Promise<void> {
+  if (!PART_RE.test(String(repo?.owner)) || !PART_RE.test(String(repo?.repo))) throw new SecretStoreError('the repository owner or name is not a plain name');
   if (typeof env !== 'string' || !ENV_RE.test(env)) throw new SecretStoreError('the environment name is not a plain name');
   const up = secretName(name);
   if (typeof value !== 'string' || value === '') throw new SecretStoreError(`the value for ${safeText(up, 80)} is empty`);
-  const params = { repository_id: repo.id, environment_name: env };
-  const key = await fetchKey(gh, () => gh.request('GET /repositories/{repository_id}/environments/{environment_name}/secrets/public-key', params));
+  const params = { owner: repo.owner, repo: repo.repo, environment_name: env };
+  const key = await fetchKey(gh, () => gh.request('GET /repos/{owner}/{repo}/environments/{environment_name}/secrets/public-key', params));
   const encrypted = seal(value, key.key);
-  await put(() => gh.request('PUT /repositories/{repository_id}/environments/{environment_name}/secrets/{secret_name}', { ...params, secret_name: up, encrypted_value: encrypted, key_id: key.keyId }), up);
+  await put(() => gh.request('PUT /repos/{owner}/{repo}/environments/{environment_name}/secrets/{secret_name}', { ...params, secret_name: up, encrypted_value: encrypted, key_id: key.keyId }), up);
 }
 
 // ---------- the fingerprint key ----------
 
 /** PIPEGEN_FP_KEY (the HMAC key for secret fingerprints, spec §19): 32 bytes from crypto.randomBytes, hex, kept in the vault. Never shown, logged or sent to the AI. */
 export function generateFpKey(vault: SecretVault): void {
-  vault.set('PIPEGEN_FP_KEY', randomBytes(32).toString('hex'));
+  putReserved(vault, 'PIPEGEN_FP_KEY', randomBytes(32).toString('hex'));
 }
