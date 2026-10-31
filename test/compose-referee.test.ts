@@ -4,7 +4,7 @@ import { Document, parseDocument } from 'yaml';
 import { describe, expect, it } from 'vitest';
 import { composeText, createCompose, runtimeEnv } from '../src/create/compose.js';
 import { loadBaseImages } from '../src/engine/base-images.js';
-import { createdFileProblems } from '../src/engine/created-files.js';
+import { CREATED_RULES, createdFileProblems } from '../src/engine/created-files.js';
 import { referee, type Linters, type RefereeReport } from '../src/engine/referee.js';
 import { renderComposeUp, renderJobPrelude, renderRuntimeEnv, stepsToYaml, type RenderedStep } from '../src/engine/render-step.js';
 import type { CreatedFile, Dependency, ExistingWorkflow, DependencyKind, PipelineDraft, Service } from '../src/types.js';
@@ -201,5 +201,15 @@ describe('referee: the password name in an edited user workflow', () => {
     expect(has(r, 'injection'), show(r)).toBe(true);
     // the user's own step may spell it (pipegen does not judge the user's text); the added job is clean
     expect(has(await run([inserted(userWf(` ${DBPW}`), [...prelude(), RT, UP])], dU), 'injection')).toBe(false);
+  });
+});
+
+describe('D4 carry C1: the steps are recognised only for a compose file a rule claims', () => {
+  it('without a registry row that claims the compose path, the runtime-env step is not recognised (injection)', async () => {
+    const createdRules = CREATED_RULES.filter((r) => r.id !== 'compose');
+    const files = withCompose([wf([...prelude(), RT, UP])], d0);
+    const r = await referee(files, d0, platform(), reviewedList(), LINTERS, 'tok', { runLinters: async () => [], createdRules });
+    expect(has(r, 'injection'), show(r)).toBe(true);
+    expect(r.issues.some((i) => /no rule claims/.test(i.message)), show(r)).toBe(true);
   });
 });

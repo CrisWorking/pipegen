@@ -1418,7 +1418,9 @@ export async function referee(files: CreatedFile[], draft: PipelineDraft, platfo
   const judgeEnv0 = { reviewed, inputs: deps.createdInputs ?? {}, files };
   const composeFile = files.find((f) => f.repo === 'app' && f.path === COMPOSE_PATH);
   let composeEnv: RuntimeEnv | null = null;
-  if (composeFile !== undefined && createdFileProblems(composeFile, draft, deps.createdRules, judgeEnv0).problems.length === 0) {
+  const composeVerdict = composeFile === undefined ? null : createdFileProblems(composeFile, draft, deps.createdRules, judgeEnv0);
+  // D4 carry C1: claimed AND free of problems (an unclaimed file has no problems, but it is no judged compose file)
+  if (composeVerdict !== null && composeVerdict.claimed && composeVerdict.problems.length === 0) {
     const plan = planCompose(draft.profile, loadBaseImages(), dockerfilesOf(files));
     if (plan.text !== null) composeEnv = plan.env;
   }
