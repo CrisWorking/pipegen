@@ -19,6 +19,7 @@
 import type { CreatedFile, Part, PipelineDraft, ReviewedTool } from '../types.js';
 import { codeownersCentralJudge, codeownersJudge } from './created-judges/codeowners.js';
 import { dependabotJudge } from './created-judges/dependabot.js';
+import { dockerfileJudge, dockerignoreJudge } from './created-judges/dockerfile.js';
 import { pipegenDocJudge } from './created-judges/pipegen-doc.js';
 import { createdPathProblem } from './job-rules.js';
 
@@ -87,8 +88,8 @@ export const CREATED_RULES: readonly CreatedRule[] = [
   { id: 'dependabot', repo: 'app', parts: ['pipeline', 'docs'], mode: 'edit', match: (p) => p === '.github/dependabot.yml' || p === '.github/dependabot.yaml', judge: dependabotJudge },
   { id: 'pipegen-doc', repo: 'app', parts: ['docs'], mode: 'new', match: (p) => p === 'PIPEGEN.md', judge: pipegenDocJudge },
   // D1-D4: the Docker files
-  { id: 'dockerfile', repo: 'app', parts: ['docker'], mode: 'new', match: (p, d) => claimable(p, d, 'Dockerfile'), judge: refuseUntilBuilt('D3') },
-  { id: 'dockerignore', repo: 'app', parts: ['docker'], mode: 'new', match: (p, d) => !p.split('/').slice(0, -1).some((x) => x.startsWith('.') || x === 'node_modules') && atServiceRoot(p, d, '.dockerignore'), judge: refuseUntilBuilt('D3') },
+  { id: 'dockerfile', repo: 'app', parts: ['docker'], mode: 'new', match: (p, d) => claimable(p, d, 'Dockerfile'), judge: dockerfileJudge },
+  { id: 'dockerignore', repo: 'app', parts: ['docker'], mode: 'new', match: (p, d) => !p.split('/').slice(0, -1).some((x) => x.startsWith('.') || x === 'node_modules') && atServiceRoot(p, d, '.dockerignore'), judge: dockerignoreJudge },
   { id: 'compose', repo: 'app', parts: ['compose'], mode: 'new', match: (p) => p === 'docker-compose.pipegen.yml', judge: refuseUntilBuilt('D4') },
   // D5-D7: starter tests, and the package edits (every package change needs the user's own yes)
   { id: 'starter-tests', repo: 'app', parts: ['tests'], mode: 'new', match: (p, d) => isStarterTest(p, d), judge: refuseUntilBuilt('D7') },
