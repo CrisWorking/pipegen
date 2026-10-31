@@ -30,7 +30,8 @@ ${from}
 2. ${f.buildsInside
     ? 'The service has a build step. Use two stages: the first (named build) runs npm ci --ignore-scripts and npm run build; the last starts from a clean FROM and copies only what it needs with COPY --from=build (only a stage you named earlier may follow --from=).'
     : 'The service has no build step. One stage is enough.'}
-3. RUN may only join these commands with " && ", written as plain words (no quote, variable, pipe, redirect, substitution or semicolon):
+3. The first instruction after every FROM line (in every stage) must be WORKDIR /app (or a plain path under /app/), because the base image sets no working directory.
+   RUN may only join these commands with " && ", written as plain words (no quote, variable, pipe, redirect, substitution or semicolon):
    - npm ci --ignore-scripts, optionally with --omit=dev, --omit=optional, --no-audit or --no-fund, each at most once (run it after copying package.json and package-lock.json; --ignore-scripts is required);
    - npm run <name>, only for a script that package.json defines;
    - npm prune --omit=dev and npm cache clean --force;

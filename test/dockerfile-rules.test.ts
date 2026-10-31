@@ -139,7 +139,7 @@ describe('dockerfile rules: supply chain', () => {
     refused(swap(SINGLE, `FROM ${REF}`, `FROM ${REF} X build`), /FROM/);
     // stage names match in exact case (fix round 1, m5): see dockerfile-rules-r1.test.ts
     // a stage may start from an earlier stage; a stage alias that shadows an image name only ever names the stage
-    expect(problems([`FROM ${REF} AS node`, 'WORKDIR /app', 'COPY package.json package-lock.json ./', 'RUN npm ci --ignore-scripts', 'RUN npm run build', 'FROM node', 'EXPOSE 3000', 'USER node', 'CMD ["node", "x.js"]', ''].join('\n'), { buildsInside: false })).toEqual([]);
+    expect(problems([`FROM ${REF} AS node`, 'WORKDIR /app', 'COPY package.json package-lock.json ./', 'RUN npm ci --ignore-scripts', 'RUN npm run build', 'FROM node', 'WORKDIR /app', 'EXPOSE 3000', 'USER node', 'CMD ["node", "x.js"]', ''].join('\n'), { buildsInside: false })).toEqual([]);
     refused([`FROM ${REF} AS node`, 'RUN npm ci --ignore-scripts', 'FROM node:24', 'EXPOSE 3000', 'USER node', ''].join('\n'), /FROM/);   // `node:24` is not the stage `node`
     refused([`FROM ${REF} AS node`, 'RUN npm ci --ignore-scripts', 'FROM nodejs', 'EXPOSE 3000', 'USER node', ''].join('\n'), /FROM/);
     refused([`FROM later`, `FROM ${REF} AS later`, 'EXPOSE 3000', 'USER node', ''].join('\n'), /FROM/);   // an alias counts only after its FROM
@@ -178,7 +178,7 @@ describe('dockerfile rules: users, secrets, ports, installs', () => {
     refused(swap(MULTI, 'EXPOSE 3000\nUSER node', 'EXPOSE 3000'), /USER/);
     refused(swap(MULTI, 'RUN npm run build\n', 'RUN npm run build\nUSER node\n').replace('\nUSER node\nCMD', '\nCMD'), /USER/);
     // a final stage that starts from an earlier stage inherits that stage's user
-    expect(problems([`FROM ${REF} AS base`, 'RUN npm ci --ignore-scripts', 'USER node', 'FROM base', 'EXPOSE 3000', ''].join('\n'))).toEqual([]);
+    expect(problems([`FROM ${REF} AS base`, 'WORKDIR /app', 'RUN npm ci --ignore-scripts', 'USER node', 'FROM base', 'WORKDIR /app', 'EXPOSE 3000', ''].join('\n'))).toEqual([]);
     refused([`FROM ${REF} AS base`, 'RUN npm ci --ignore-scripts', 'FROM base', 'EXPOSE 3000', ''].join('\n'), /USER/);
   });
 

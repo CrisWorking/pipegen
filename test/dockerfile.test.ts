@@ -105,7 +105,7 @@ describe('createDockerfile: what is written', () => {
     const o22 = await make([ans(SINGLE('node:24'))], s22, facts(), profile([s22])).run();
     expect(o22.files[0]?.content).toContain(`FROM ${REF22}\n`);
     // a stage that starts from an earlier stage keeps its alias
-    const chain = [`FROM node:1 AS base`, 'WORKDIR /app', 'COPY package.json package-lock.json ./', 'RUN npm ci --ignore-scripts', 'USER node', 'FROM base AS run', 'EXPOSE 3000', 'CMD ["npm", "start"]', ''].join('\n');
+    const chain = [`FROM node:1 AS base`, 'WORKDIR /app', 'COPY package.json package-lock.json ./', 'RUN npm ci --ignore-scripts', 'USER node', 'FROM base AS run', 'WORKDIR /app', 'EXPOSE 3000', 'CMD ["npm", "start"]', ''].join('\n');
     const o = await make([ans(chain)]).run();
     expect(o.files[0]?.content.split('\n').filter((l) => /^from /i.test(l))).toEqual([`FROM ${REF24} AS base`, 'FROM base AS run']);
     // a stage name in another letter case is not the stage: pipegen's FROM replaces it
@@ -114,9 +114,9 @@ describe('createDockerfile: what is written', () => {
   });
 
   it('a FROM written across continuation lines is replaced whole', async () => {
-    const spread = ['FROM --platform=linux/amd64 \\', '  node:22-alpine \\', '# a comment', '  AS build', 'RUN npm ci --ignore-scripts', 'FROM \\', 'node:22', 'EXPOSE 3000', 'USER node', ''].join('\n');
+    const spread = ['FROM --platform=linux/amd64 \\', '  node:22-alpine \\', '# a comment', '  AS build', 'WORKDIR /app', 'RUN npm ci --ignore-scripts', 'FROM \\', 'node:22', 'WORKDIR /app', 'EXPOSE 3000', 'USER node', ''].join('\n');
     const out = await make([ans(spread)]).run();
-    expect(out.files[0]?.content).toBe([`FROM ${REF24} AS build`, 'RUN npm ci --ignore-scripts', `FROM ${REF24}`, 'EXPOSE 3000', 'USER node', ''].join('\n'));
+    expect(out.files[0]?.content).toBe([`FROM ${REF24} AS build`, 'WORKDIR /app', 'RUN npm ci --ignore-scripts', `FROM ${REF24}`, 'WORKDIR /app', 'EXPOSE 3000', 'USER node', ''].join('\n'));
   });
 
   it('the prompt carries the exact FROM lines, no repo text but the scanned bundle, and a strict schema', async () => {
@@ -223,7 +223,7 @@ describe('createDockerfile: violations, one retry with the list, then a throw', 
       expect(m.ai.calls).toHaveLength(2);
     }
     // an extra stage from an unlisted image is rewritten to the list image, so what is written never names it
-    const extra = [`FROM evil.example/img:1 AS tool`, 'RUN npm ci --ignore-scripts', SINGLE().replace('COPY . .', 'COPY --from=tool /x /x')].join('\n');
+    const extra = [`FROM evil.example/img:1 AS tool`, 'WORKDIR /app', 'RUN npm ci --ignore-scripts', SINGLE().replace('COPY . .', 'COPY --from=tool /x /x')].join('\n');
     const out = await make([ans(extra)]).run();
     expect(out.files[0]?.content).not.toMatch(/evil/);
     expect(out.files[0]?.content.split('\n').filter((l) => /^from /i.test(l))).toEqual([`FROM ${REF24} AS tool`, `FROM ${REF24}`]);

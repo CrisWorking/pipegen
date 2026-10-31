@@ -134,7 +134,7 @@ describe('R2: USER is node, node:node, 1000 or 1000:1000 in every stage', () => 
     refused(swap(MULTI, 'RUN npm run build', 'USER app\nRUN npm run build'), /USER/);
     // the final stage needs one (own, or inherited from the stage it starts from)
     refused(swap(SINGLE, 'USER node\n', ''), /USER/);
-    expect(problems([`FROM ${REF} AS base`, 'RUN npm ci --ignore-scripts', 'USER node', 'FROM base', 'EXPOSE 3000', ''].join('\n'))).toEqual([]);
+    expect(problems([`FROM ${REF} AS base`, 'WORKDIR /app', 'RUN npm ci --ignore-scripts', 'USER node', 'FROM base', 'WORKDIR /app', 'EXPOSE 3000', ''].join('\n'))).toEqual([]);
   });
   it('reviewExisting flags every spelling of root: -0, +0, 00, any :0 group', () => {
     for (const u of ['-0', '+0', '00', '0', 'root', '0:0', 'node:0', '-0:-0', '1000:00', '$X']) expect(reviewExistingCodes(`FROM ${REF}\nUSER ${u}\n`).map((c) => c.code), u).toContain('root-user');
@@ -153,7 +153,7 @@ describe('R3', () => {
 
   it('m4: with a build step the final stage starts from a list reference, not from an earlier stage', () => {
     refused([`FROM ${REF} AS build`, 'RUN npm ci --ignore-scripts', 'RUN npm run build', 'FROM build', 'EXPOSE 3000', 'USER node', 'CMD ["node", "dist/index.js"]', ''].join('\n'), /final stage/, { buildsInside: true });
-    expect(problems([`FROM ${REF} AS base`, 'RUN npm ci --ignore-scripts', 'USER node', 'FROM base', 'EXPOSE 3000', ''].join('\n'), { buildsInside: false })).toEqual([]);
+    expect(problems([`FROM ${REF} AS base`, 'WORKDIR /app', 'RUN npm ci --ignore-scripts', 'USER node', 'FROM base', 'WORKDIR /app', 'EXPOSE 3000', ''].join('\n'), { buildsInside: false })).toEqual([]);
   });
 
   it('m5: stage names match in exact case, in FROM and in COPY --from', () => {

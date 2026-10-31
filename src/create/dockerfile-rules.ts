@@ -303,9 +303,14 @@ function rules(text: string, svc: Pick<Service, 'language' | 'packageManager'>, 
   const stages: { alias?: string; parent?: number; users: string[]; expose: number; cmds: number }[] = [];
   const counts = { npmCi: 0 };
   let stage = -1;
+  let needWorkdir = 0;   // line of the FROM whose stage has no instruction yet (X1: the first one must be WORKDIR)
 
   for (const ins of parsed.instructions) {
     const where = `${ins.kw} on line ${ins.line}`;
+    // X1: the pinned Node images set no working directory, so every stage starts by pinning one under /app (a relative mkdir, chown or COPY
+    // target would otherwise resolve under `/`)
+    if (needWorkdir > 0 && ins.kw !== 'WORKDIR') add(`${ins.kw === 'FROM' ? 'FROM' : where}: the stage whose FROM is on line ${needWorkdir} must start with WORKDIR /app (or a path under /app/) right after the FROM`);
+    needWorkdir = 0;
     if (ins.kw === 'ONBUILD') { add(`${where}: ONBUILD is not allowed`); continue; }
     if (!ALLOWED.has(ins.kw)) {
       add(ins.kw === 'ADD' ? `line ${ins.line}: ADD is not allowed (use COPY)` : `line ${ins.line}: ${q(ins.kw)} isn't an instruction pipegen allows (only FROM, WORKDIR, COPY, RUN, ENV, ARG, USER, EXPOSE, CMD, ENTRYPOINT, HEALTHCHECK and LABEL)`);
@@ -333,6 +338,7 @@ function rules(text: string, svc: Pick<Service, 'language' | 'packageManager'>, 
         else if (aliasStage.has(image)) parent = aliasStage.get(image);
         else add(`${where}: FROM ${q(image)} is not a reference from pipegen's reviewed base-image list or an earlier stage name`);
         stage++;
+        needWorkdir = ins.line;
         stages.push({ ...(alias !== undefined && ALIAS_RE.test(alias) ? { alias } : {}), ...(parent === undefined ? {} : { parent }), users: [], expose: 0, cmds: 0 });
         if (alias !== undefined && ALIAS_RE.test(alias) && alias !== 'scratch' && !aliasStage.has(alias)) aliasStage.set(alias, stage);
         break;
@@ -414,6 +420,7 @@ function rules(text: string, svc: Pick<Service, 'language' | 'packageManager'>, 
     }
   }
 
+  if (needWorkdir > 0) add(`the stage whose FROM is on line ${needWorkdir} has no instruction after it, so no WORKDIR /app`);
   if (stage === -1) { add('the Dockerfile has no FROM'); return out; }
   if (stages.length < 2 && ctx.buildsInside) add('the service has a build step, so the Dockerfile must be multi-stage (build in one stage, run from a clean one)');
   const finalStage = stages[stage] as { parent?: number; users: string[]; expose: number };

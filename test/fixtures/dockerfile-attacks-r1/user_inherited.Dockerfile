@@ -6,5 +6,6 @@ COPY . .
 RUN npm run build
 USER node
 FROM build AS x
+WORKDIR /app
 EXPOSE 3000
 CMD ["node", "dist/index.js"]
