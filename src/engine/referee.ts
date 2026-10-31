@@ -44,7 +44,9 @@ import { EXPR, own, show } from './render-error.js';
 import { isObj, parseYaml, uniq, type Obj, type Parsed } from './yaml-parse.js';
 import { createdFileProblems, duplicatePathProblems, type CreatedInputs, type CreatedRule } from './created-files.js';
 import { ACTION_PATH_RE, checkExpressions, createdPathProblem, checkJobOrder, gateResultUploadProblems, IF_VALUES, isDangerousName, isReviewed, isScrubStep, isStageStep, jobOutputsProblems, SECRET_REF_RE, STEP_KEYS as STEP_KEY_LIST, WORKFLOW_PATH_RE, type RenderedStep, type ScanFact } from './job-rules.js';
-import { containerRefusal, RenderError, renderProjectScript, renderStep, sameDedupeContent, type RenderContext } from './render-step.js';
+import { containerRefusal, RenderError, renderComposeUp, renderProjectScript, renderRuntimeEnv, renderStep, sameDedupeContent, type RenderContext } from './render-step.js';
+import { needsCompose, runtimeEnv } from '../create/compose.js';
+import { DB_PASSWORD_NAME } from '../create/compose-tables.js';
 import { centralWorkflowPath } from './central-path.js';
 import { projectScriptFor } from './reviewed.js';
 import { slotProblem, type SlotKind } from './slots.js';
@@ -472,6 +474,18 @@ function expectations(draft: PipelineDraft, platform: PlatformActions, reviewed:
       }
     }
   }
+  // D4 (ruling B6): when a service runs and needs a database or broker, the two steps that start them: the runtime-env step (rendered from the draft's
+  // RuntimeEnv, exact content) and the compose-up step. Nothing else in a file may hold the name of the generated password.
+  if (needsCompose(draft.profile)) {
+    try {
+      const rt = renderRuntimeEnv(runtimeEnv(draft.profile));
+      record(RUNTIME_ENV_SOURCE, ctxs.map(() => [rt]), false, true, false, undefined, undefined);
+      record('compose-up', ctxs.map(() => [renderComposeUp()]), false, true, false, undefined, undefined);
+    } catch (e) {
+      if (!(e instanceof RenderError)) throw e;
+      notes.push(`The runtime environment for the test services can not be rendered, so no step may claim to be it: ${safeText(e.message, 200)}`);
+    }
+  }
   return ex;
 }
 
@@ -481,6 +495,8 @@ interface FileCtx {
   file: CreatedFile; add: Add; ex: Expectations; draft: PipelineDraft;
   /** every parsed workflow and action file, by `<repo>:<path>` */
   others: Map<string, Parsed>;
+  /** how many times the name PIPEGEN_DB_PASSWORD sits inside runtime-env steps recognised by content (D4): the only place it may be */
+  dbPwOk: number;
 }
 
 const issueFor = (fc: FileCtx) => (check: RefereeCheck, message: string): void => fc.add(fc.file.path, check, message);
@@ -1009,6 +1025,11 @@ function judgeList(fc: FileCtx, where: string, steps: unknown[]): Judged[] {
   });
 }
 
+/** The source name of the runtime-env step among the expected run steps. */
+const RUNTIME_ENV_SOURCE = 'runtime-env';
+const DB_PW_MESSAGE = `The name ${DB_PASSWORD_NAME} (pipegen's generated database password) appears outside the runtime-env step pipegen renders. It may be used only there, in exactly the form pipegen writes.`;
+const dbPwCount = (text: string): number => (text.match(new RegExp(DB_PASSWORD_NAME, 'gi')) ?? []).length;
+
 function judgeStep(fc: FileCtx, where: string, raw: unknown): Judged {
   const bad = issueFor(fc);
   const at = (m: string): string => `In ${where}: ${m}`;
@@ -1049,6 +1070,7 @@ function judgeStep(fc: FileCtx, where: string, raw: unknown): Judged {
     else if (r === null) { bad('unreviewed', at(`the run step ${show(raw.name ?? raw.id ?? '')} is not a step pipegen renders for this pipeline (a reviewed tool or a project script), so it is not run.`)); harmlessId = false; }
     else {
       match = r;
+      if (r.source === RUNTIME_ENV_SOURCE) fc.dbPwOk += dbPwCount(JSON.stringify(raw));
       if (r.final) fc.ex.matched.add(r.source);
       appRunning = r.appRunning;
       const id = r.step.id ?? '';
@@ -1075,6 +1097,7 @@ function judgeStep(fc: FileCtx, where: string, raw: unknown): Judged {
   if (raw.if !== undefined && raw.if !== 'success()' && !(raw.if === 'always()' && (kind === 'upload-artifact' || kind === 'upload-sarif' || kind === 'scrub'))) {
     bad('template', at(`if: ${safeText(String(raw.if), 20)} could skip this step while the job passes (only success(), or always() on an upload or a scrub).`));
   }
+  if (fc.file.inserted !== undefined && match?.source !== RUNTIME_ENV_SOURCE && dbPwCount(JSON.stringify(raw)) > 0) bad('injection', at(DB_PW_MESSAGE));
   const secrets = judgeSecrets(fc, at, withs, env, kind, appRunning);
   return { step, ...(match === undefined ? {} : { match }), kind, harmlessId, secrets, readsWorkspace: reads, ...(entryId === undefined ? {} : { entryId }) };
 }
@@ -1422,13 +1445,17 @@ export async function referee(files: CreatedFile[], draft: PipelineDraft, platfo
   for (const f of files) {
     const p = parsed.get(`${f.repo}:${f.path}`);
     if (p === undefined) continue;
-    const fc: FileCtx = { file: f, add, ex, draft, others: parsed };
+    const fc: FileCtx = { file: f, add, ex, draft, others: parsed, dbPwOk: 0 };
     if (fileKind(f) === 'action') judgeAction(fc, p.js);
     else if (f.inserted !== undefined) judgeEdited(fc, p, f.inserted);
     else {
       judgeTop(fc, p.js);
       judgeJobs(fc, p.js.jobs);
     }
+    // D4 (ruling B6): the generated database password's name is allowed only in the runtime-env step pipegen renders (recognised by exact content).
+    // A file pipegen wrote whole is counted as a whole (any key, value, name or env of it); in an edited user workflow the user's own text is not judged,
+    // so judgeStep checks the steps of the jobs pipegen added.
+    if (f.inserted === undefined && dbPwCount(JSON.stringify(p.js)) > fc.dbPwOk) add(f.path, 'injection', DB_PW_MESSAGE, undefined, f.repo);
   }
 
   for (const check of ex.deferred) check();

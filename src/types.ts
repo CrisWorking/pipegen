@@ -16,7 +16,20 @@ export type Monorepo = 'none' | 'npm-workspaces' | 'pnpm-workspaces' | 'yarn-wor
 export const DEPENDENCY_KINDS = ['postgres', 'mysql', 'redis', 'mongodb', 'rabbitmq', 'external'] as const;
 export type DependencyKind = typeof DEPENDENCY_KINDS[number];
 
-export interface Dependency { kind: DependencyKind; name: string; evidence: string; envVars: string[] }   // external = SaaS (Stripe, Auth0…)
+/**
+ * external = SaaS (Stripe, Auth0…). `version` (D4) is the version the repo asks for, when a reader found one: digits and dots only (`16`, `8.3`, `7.2.4`),
+ * kept raw but VALIDATED (compose.ts reads it only when it matches that shape; anything else counts as unreadable). No reader fills it yet.
+ */
+export interface Dependency { kind: DependencyKind; name: string; evidence: string; envVars: string[]; version?: string }
+/**
+ * The runtime environment of a pipeline run that starts the compose file (D4, preflight B6): STRUCTURED data, never shell text. `password` is the
+ * one generated DB password (name fixed, `bytes` random bytes in hex); each `vars` entry is an env var of a covered dependency that pipegen can fill,
+ * with what it holds (`kind`) and the dependency it points at. renderRuntimeEnv turns it into the step; the values come from a fixed table.
+ */
+export interface RuntimeEnv {
+  password: { name: 'PIPEGEN_DB_PASSWORD'; bytes: 16 };
+  vars: { name: string; kind: 'url' | 'host' | 'port' | 'user' | 'password' | 'db'; dep: DependencyKind }[];
+}
 /** P55 (batch B): a one-shot script, a folder built into another service's image, or an email-template package. */
 export type NotStandalone = 'one-shot' | 'built-in-image' | 'email-templates';
 export interface Service {

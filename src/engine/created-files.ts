@@ -18,6 +18,7 @@
 // could only shadow or weaken the pinned one. Plan G registers its hook, central and install-record files as it builds them.
 import type { CreatedFile, Part, PipelineDraft, ReviewedTool } from '../types.js';
 import { codeownersCentralJudge, codeownersJudge } from './created-judges/codeowners.js';
+import { composeJudge } from './created-judges/compose.js';
 import { dependabotJudge } from './created-judges/dependabot.js';
 import { dockerfileJudge, dockerignoreJudge } from './created-judges/dockerfile.js';
 import { pipegenDocJudge } from './created-judges/pipegen-doc.js';
@@ -90,7 +91,7 @@ export const CREATED_RULES: readonly CreatedRule[] = [
   // D1-D4: the Docker files
   { id: 'dockerfile', repo: 'app', parts: ['docker'], mode: 'new', match: (p, d) => claimable(p, d, 'Dockerfile'), judge: dockerfileJudge },
   { id: 'dockerignore', repo: 'app', parts: ['docker'], mode: 'new', match: (p, d) => !p.split('/').slice(0, -1).some((x) => x.startsWith('.') || x === 'node_modules') && atServiceRoot(p, d, '.dockerignore'), judge: dockerignoreJudge },
-  { id: 'compose', repo: 'app', parts: ['compose'], mode: 'new', match: (p) => p === 'docker-compose.pipegen.yml', judge: refuseUntilBuilt('D4') },
+  { id: 'compose', repo: 'app', parts: ['compose'], mode: 'new', match: (p) => p === 'docker-compose.pipegen.yml', judge: composeJudge },
   // D5-D7: starter tests, and the package edits (every package change needs the user's own yes)
   { id: 'starter-tests', repo: 'app', parts: ['tests'], mode: 'new', match: (p, d) => isStarterTest(p, d), judge: refuseUntilBuilt('D7') },
   { id: 'package-json', repo: 'app', parts: ['tests'], mode: 'edit', needsConfirm: true, match: (p, d) => claimable(p, d, 'package.json'), judge: refuseUntilBuilt('D6') },

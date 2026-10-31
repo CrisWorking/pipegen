@@ -16,7 +16,8 @@
 import { isDeepStrictEqual } from 'node:util';
 import { Scalar, YAMLMap, YAMLSeq } from 'yaml';
 import { safeText } from '../util/safe-text.js';
-import { DEPENDENCY_KINDS, type OutputFormat, type PipelineDraft, type RepoProfile, type ReviewedTool, type Service, type StepSpec } from '../types.js';
+import { DEPENDENCY_KINDS, type OutputFormat, type PipelineDraft, type RepoProfile, type ReviewedTool, type RuntimeEnv, type Service, type StepSpec } from '../types.js';
+import { DB_PASSWORD_BYTES, DB_PASSWORD_NAME, DB_USER, ENV_TABLE, isDepKey, VALUE_TABLE, VAR_KINDS } from '../create/compose-tables.js';
 import { COMMIT_SHA_RE } from './names.js';
 import { centralWorkflowPath } from './central-path.js';
 import { NEED_IDS, toolCoversNeed } from './need-ids.js';
@@ -677,6 +678,58 @@ export function renderProjectScript(step: ProjectScriptStep, platform: PlatformA
   const nodeMajor = setup.with?.['node-version'];
   if (nodeMajor === undefined || !/^\d{1,3}$/.test(nodeMajor)) throw new RenderError('The Node setup step has no plain node-version.');
   return { steps: [{ ...(prelude[0] as RenderedStep), id: 'pipegen-checkout' }, { ...setup, id: `pipegen-setup-node-${nodeMajor}` }, ...projectScriptSteps(artifact, step.script, nodeMajor, expected)], output: null };
+}
+
+// ---------- the compose steps (D4, ruling B6) ----------
+
+const RT_NAME_RE = /^[A-Za-z_][A-Za-z0-9_]{0,127}$/;
+/** The step's own shell setup, like the other run steps: bash, and the two startup-file variables empty so no ambient file runs before the script. */
+const bashStep = (name: string, run: string, id: string): RenderedStep => ({ id, name, run, shell: 'bash', env: { BASH_ENV: '', ENV: '' } });
+
+/**
+ * The runtime-env step (B6): generates the database password, masks it, and writes the password and each URL or part to `$GITHUB_ENV` for the steps
+ * after it (the compose file reads `${PIPEGEN_DB_PASSWORD}`, the app reads the rest). It is rendered from STRUCTURED data (RuntimeEnv); every value
+ * comes from the fixed tables of compose-tables.ts, so no repo text, no expression and no secret literal is in it. The URLs are built through
+ * `auth="pipegen:${pw}"`, which keeps `user:password@` out of the file text (and so out of the secret scan). The referee recognises the step by
+ * re-rendering it from the draft's RuntimeEnv, and allows PIPEGEN_DB_PASSWORD in no other step. Throws RenderError for anything that is not a
+ * valid RuntimeEnv: a name that is not in the table for its dependency, a dangerous or GITHUB_ name, a kind the dependency has no value for.
+ */
+export function renderRuntimeEnv(rt: RuntimeEnv): RenderedStep {
+  const bad = (m: string): never => { throw new RenderError(`The runtime environment is not one pipegen writes: ${m}`); };
+  if (typeof rt !== 'object' || rt === null || !Array.isArray(rt.vars)) return bad('it is not the structured form.');
+  const pw = rt.password;
+  if (typeof pw !== 'object' || pw === null || pw.name !== DB_PASSWORD_NAME || pw.bytes !== DB_PASSWORD_BYTES || Object.keys(pw).length !== 2) return bad('the password is not the one fixed password.');
+  const seen = new Set<string>();
+  const lines = [
+    'set -euo pipefail',
+    `pw="$(openssl rand -hex ${DB_PASSWORD_BYTES})"`,
+    'echo "::add-mask::$pw"',
+    `auth="${DB_USER}:\${pw}"`,
+    `printf '%s=%s\\n' '${DB_PASSWORD_NAME}' "$pw" >> "$GITHUB_ENV"`,
+  ];
+  for (const v of rt.vars) {
+    if (typeof v !== 'object' || v === null || Object.keys(v).sort().join() !== 'dep,kind,name') return bad('a variable is not { name, kind, dep }.');
+    const { name, kind, dep } = v;
+    if (typeof name !== 'string' || !RT_NAME_RE.test(name) || name.startsWith('GITHUB_') || name === DB_PASSWORD_NAME || isDangerousName(name)) return bad(`${show(name)} is not a name pipegen sets.`);
+    if (!isDepKey(dep) || !(VAR_KINDS as readonly unknown[]).includes(kind)) return bad(`${show(name)} has a dependency or kind pipegen does not know.`);
+    if (!Object.hasOwn(ENV_TABLE[dep], name) || ENV_TABLE[dep][name] !== kind) return bad(`${show(name)} is not a ${kind} variable of the ${dep} dependency in pipegen's table.`);
+    const value = VALUE_TABLE[dep][kind];
+    if (value === undefined) return bad(`the ${dep} dependency has no ${kind} value.`);
+    if (seen.has(name)) return bad(`${show(name)} is set twice.`);
+    seen.add(name);
+    lines.push(`printf '%s=%s\\n' '${name}' "${value}" >> "$GITHUB_ENV"`);
+  }
+  const id = `runtime-env-${sha16(JSON.stringify(rt.vars.map((v) => [v.name, v.kind, v.dep])))}`;
+  return bashStep('pipegen: set the test database environment', lines.join('\n'), id);
+}
+
+/**
+ * The compose-up step (B6): starts the dependencies and the services built from the repo's Dockerfiles. It builds the repo's image, so it is a
+ * repo-code step (a `repocode-` id; the order rule treats it as repo code). `--env-file /dev/null` keeps a `.env` of the repo from filling the
+ * ${NAME} references. Plan E's app-start and Plan G's dependency jobs use it after renderRuntimeEnv.
+ */
+export function renderComposeUp(): RenderedStep {
+  return bashStep('pipegen: start the services with docker compose', 'set -euo pipefail\ndocker compose --env-file /dev/null -f docker-compose.pipegen.yml up -d --wait', `repocode-${sha16('compose-up')}`);
 }
 
 /** Put on every job that feeds the gate, builds, signs or verifies (Plan G): no cache of any kind. */
