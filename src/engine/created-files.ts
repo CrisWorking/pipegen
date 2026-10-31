@@ -42,7 +42,11 @@ export interface CreatedInputs {
   containsKnownValue?: (text: string) => boolean;
 }
 /** The reviewed list the gate protects from (the whole built-in list) and the delivery inputs. */
-export interface CreatedEnv { reviewed: readonly ReviewedTool[]; inputs: CreatedInputs }
+export interface CreatedEnv {
+  reviewed: readonly ReviewedTool[]; inputs: CreatedInputs;
+  /** The files being judged and delivered together (the referee's `files`). A judge that refers to another file (compose builds a created Dockerfile) reads it here, not from the draft (D4 M4). */
+  files?: readonly CreatedFile[];
+}
 /** What a judge gets besides the file: the draft the files belong to, the reviewed list and the delivery inputs. */
 export interface CreatedCtx extends CreatedEnv { draft: PipelineDraft }
 const NO_ENV: CreatedEnv = { reviewed: [], inputs: {} };
@@ -116,7 +120,7 @@ export function createdFileProblems(file: CreatedFile, draft: PipelineDraft, rul
   if (rule.mode === 'new' && file.edited !== undefined) problems.push(`this kind of file (${rule.id}) is written whole, not edited`);
   if (rule.mode === 'edit' && file.edited === undefined) problems.push(`this kind of file (${rule.id}) is an edit and needs the edited marker with the original text`);
   if (rule.needsConfirm === true && file.needsConfirm !== true) problems.push(`this kind of file (${rule.id}) changes scripts or dependencies, so it needs the user's own confirmation (needsConfirm) and has none`);
-  try { problems.push(...rule.judge(file, { draft, reviewed: env.reviewed, inputs: env.inputs })); } catch { problems.push(`the judge for ${rule.id} failed on this file, so pipegen does not write it`); }
+  try { problems.push(...rule.judge(file, { draft, reviewed: env.reviewed, inputs: env.inputs, ...(env.files === undefined ? {} : { files: env.files }) })); } catch { problems.push(`the judge for ${rule.id} failed on this file, so pipegen does not write it`); }
   return { claimed: true, problems };
 }
 

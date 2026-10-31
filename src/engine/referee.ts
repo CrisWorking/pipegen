@@ -31,7 +31,7 @@ import { isDeepStrictEqual } from 'node:util';
 import { isMap, isScalar, LineCounter, visit, type Document, type Node as YamlNode, type Pair } from 'yaml';
 import { findSecretLike } from '../ai/redact.js';
 import { safeText } from '../util/safe-text.js';
-import { GATE_CHECK_NAME, type CreatedFile, type OutputFormat, type PipegenInserted, type PipelineDraft, type ReviewedTool, type StepSpec } from '../types.js';
+import { GATE_CHECK_NAME, type CreatedFile, type OutputFormat, type PipegenInserted, type PipelineDraft, type ReviewedTool, type RuntimeEnv, type StepSpec } from '../types.js';
 import { ArtifactNameError, slug } from './artifact-names.js';
 import { FINDINGS_CATEGORIES, gateJobList, GateJobListError, jobIdFor, PIPEGEN_JOB_CATEGORIES, readableFormat, type JobListEntry } from './gate-job-list.js';
 import { GATE_JSON_INPUTS, gateStepInputs, NIGHTLY_JSON_INPUTS, nightlyStepInputs } from './gate-inputs.js';
@@ -45,8 +45,9 @@ import { isObj, parseYaml, uniq, type Obj, type Parsed } from './yaml-parse.js';
 import { createdFileProblems, duplicatePathProblems, type CreatedInputs, type CreatedRule } from './created-files.js';
 import { ACTION_PATH_RE, checkExpressions, createdPathProblem, checkJobOrder, gateResultUploadProblems, IF_VALUES, isDangerousName, isReviewed, isScrubStep, isStageStep, jobOutputsProblems, SECRET_REF_RE, STEP_KEYS as STEP_KEY_LIST, WORKFLOW_PATH_RE, type RenderedStep, type ScanFact } from './job-rules.js';
 import { containerRefusal, RenderError, renderComposeUp, renderProjectScript, renderRuntimeEnv, renderStep, sameDedupeContent, type RenderContext } from './render-step.js';
-import { needsCompose, runtimeEnv } from '../create/compose.js';
-import { DB_PASSWORD_NAME } from '../create/compose-tables.js';
+import { COMPOSE_PATH, planCompose } from '../create/compose.js';
+import { dockerfilesOf } from './created-judges/compose.js';
+import { loadBaseImages } from './base-images.js';
 import { centralWorkflowPath } from './central-path.js';
 import { projectScriptFor } from './reviewed.js';
 import { slotProblem, type SlotKind } from './slots.js';
@@ -379,7 +380,7 @@ function keyOf(needId: string, service: string | undefined): string | undefined 
   try { return jobIdFor(needId, service); } catch (e) { if (e instanceof GateJobListError) return undefined; throw e; }
 }
 
-function expectations(draft: PipelineDraft, platform: PlatformActions, reviewed: readonly ReviewedTool[], add: Add, notes: string[]): Expectations {
+function expectations(draft: PipelineDraft, platform: PlatformActions, reviewed: readonly ReviewedTool[], add: Add, notes: string[], composeEnv: RuntimeEnv | null): Expectations {
   const byId = new Map(reviewed.map((t) => [t.id, t]));
   const actions = new Map<string, ReviewedTool>();
   const images = new Set<string>();
@@ -474,11 +475,12 @@ function expectations(draft: PipelineDraft, platform: PlatformActions, reviewed:
       }
     }
   }
-  // D4 (ruling B6): when a service runs and needs a database or broker, the two steps that start them: the runtime-env step (rendered from the draft's
-  // RuntimeEnv, exact content) and the compose-up step. Nothing else in a file may hold the name of the generated password.
-  if (needsCompose(draft.profile)) {
+  // D4 (rulings B6, I1): the runtime-env and compose-up steps, only when pipegen computes a compose file, that file is among the files judged together and
+  // it passed the compose judge (composeEnv is that plan's runtime env, else null). The runtime-env step is the exact re-render of it. Without the file
+  // compose-up would run a compose file pipegen did not judge (an unowned one, S3), so neither step is recognised.
+  if (composeEnv !== null) {
     try {
-      const rt = renderRuntimeEnv(runtimeEnv(draft.profile));
+      const rt = renderRuntimeEnv(composeEnv);
       record(RUNTIME_ENV_SOURCE, ctxs.map(() => [rt]), false, true, false, undefined, undefined);
       record('compose-up', ctxs.map(() => [renderComposeUp()]), false, true, false, undefined, undefined);
     } catch (e) {
@@ -987,6 +989,12 @@ function judgeJobSteps(fc: FileCtx, where: string, steps: unknown[], job: boolea
     // C9: the commit-range scan, recognised by content as the range source's own step
     if (x.match?.source === 'range:secrets' && x.match.final && x.kind === 'tool' && x.harmlessId && x.step.id !== undefined) scans.set(x.step.id, { tool: RANGE_TOOL, format: 'sarif' });
   }
+  // D4 M1: compose-up reads the password the runtime-env step generated, so each compose-up has exactly one runtime-env step before it in its job (and a job has one)
+  const rtAt = judged.flatMap((x, i) => (x.match?.source === RUNTIME_ENV_SOURCE ? [i] : []));
+  if (rtAt.length > 1) fc.add(fc.file.path, 'template', `In ${where}: the job holds ${rtAt.length} runtime-env steps; it holds one, because a second would generate a second password.`);
+  judged.forEach((x, i) => {
+    if (x.match?.source === 'compose-up' && rtAt.filter((r) => r < i).length !== 1) fc.add(fc.file.path, 'template', `In ${where}, step ${i + 1}: compose-up needs exactly one runtime-env step before it in the same job (it reads the password that step generates).`);
+  });
   for (const problem of checkJobOrder(forOrder, { ...(jobId === undefined ? {} : { id: jobId }), scans })) fc.add(fc.file.path, 'injection', `In ${where}: ${problem}`);
   // a merged repo `npm ci` (dedupeJobSteps) carries exactly the pins of the tools of this job that need it
   const sources = new Set(judged.flatMap((x) => (x.match === undefined ? [] : [x.match.source])));
@@ -1027,8 +1035,10 @@ function judgeList(fc: FileCtx, where: string, steps: unknown[]): Judged[] {
 
 /** The source name of the runtime-env step among the expected run steps. */
 const RUNTIME_ENV_SOURCE = 'runtime-env';
-const DB_PW_MESSAGE = `The name ${DB_PASSWORD_NAME} (pipegen's generated database password) appears outside the runtime-env step pipegen renders. It may be used only there, in exactly the form pipegen writes.`;
-const dbPwCount = (text: string): number => (text.match(new RegExp(DB_PASSWORD_NAME, 'gi')) ?? []).length;
+/** The names only the runtime-env step may spell: the generated password and the container copies of the runtime variables (PIPEGEN_APP_*). */
+const RESERVED_NAME_RE = /PIPEGEN_(?:DB_PASSWORD|APP_[A-Z0-9_]+)/gi;
+const DB_PW_MESSAGE = "A name pipegen reserves for its runtime-env step (PIPEGEN_DB_PASSWORD, the generated database password, or PIPEGEN_APP_*, the container copies of the test variables) appears outside that step. It may be used only there, in exactly the form pipegen writes.";
+const dbPwCount = (text: string): number => (text.match(RESERVED_NAME_RE) ?? []).length;
 
 function judgeStep(fc: FileCtx, where: string, raw: unknown): Judged {
   const bad = issueFor(fc);
@@ -1097,7 +1107,6 @@ function judgeStep(fc: FileCtx, where: string, raw: unknown): Judged {
   if (raw.if !== undefined && raw.if !== 'success()' && !(raw.if === 'always()' && (kind === 'upload-artifact' || kind === 'upload-sarif' || kind === 'scrub'))) {
     bad('template', at(`if: ${safeText(String(raw.if), 20)} could skip this step while the job passes (only success(), or always() on an upload or a scrub).`));
   }
-  if (fc.file.inserted !== undefined && match?.source !== RUNTIME_ENV_SOURCE && dbPwCount(JSON.stringify(raw)) > 0) bad('injection', at(DB_PW_MESSAGE));
   const secrets = judgeSecrets(fc, at, withs, env, kind, appRunning);
   return { step, ...(match === undefined ? {} : { match }), kind, harmlessId, secrets, readsWorkspace: reads, ...(entryId === undefined ? {} : { entryId }) };
 }
@@ -1405,7 +1414,15 @@ export async function referee(files: CreatedFile[], draft: PipelineDraft, platfo
 
   for (const d of duplicatePathProblems(files)) add(d.file.path, 'template', d.message, undefined, d.file.repo);
 
-  const ex = expectations(draft, platform, reviewed, add, notes);
+  // D4 I1: the compose plan is the one source. Its runtime env counts only when the file it computes is among the files judged together and passes its judge.
+  const judgeEnv0 = { reviewed, inputs: deps.createdInputs ?? {}, files };
+  const composeFile = files.find((f) => f.repo === 'app' && f.path === COMPOSE_PATH);
+  let composeEnv: RuntimeEnv | null = null;
+  if (composeFile !== undefined && createdFileProblems(composeFile, draft, deps.createdRules, judgeEnv0).problems.length === 0) {
+    const plan = planCompose(draft.profile, loadBaseImages(), dockerfilesOf(files));
+    if (plan.text !== null) composeEnv = plan.env;
+  }
+  const ex = expectations(draft, platform, reviewed, add, notes, composeEnv);
   const parsed = new Map<string, Parsed>();
   const lintable: CreatedFile[] = [];
   for (const f of files) {
@@ -1416,7 +1433,7 @@ export async function referee(files: CreatedFile[], draft: PipelineDraft, platfo
     const kind = fileKind(f);
     if (kind === null) {
       // not a workflow or action: a created-file rule (src/engine/created-files.ts) must claim it, else it is refused (D0a, B1)
-      const v = createdFileProblems(f, draft, deps.createdRules, { reviewed, inputs: deps.createdInputs ?? {} });
+      const v = createdFileProblems(f, draft, deps.createdRules, judgeEnv0);
       if (!v.claimed) {
         add(f.path, 'template', /^\.github\//i.test(f.path)
           ? 'The file path is in .github/ but is not a workflow (.github/workflows/<name>.yml) or a composite action (.github/actions/<folder>/action.yml) pipegen can judge, so it is not written.'
@@ -1456,6 +1473,12 @@ export async function referee(files: CreatedFile[], draft: PipelineDraft, platfo
     // A file pipegen wrote whole is counted as a whole (any key, value, name or env of it); in an edited user workflow the user's own text is not judged,
     // so judgeStep checks the steps of the jobs pipegen added.
     if (f.inserted === undefined && dbPwCount(JSON.stringify(p.js)) > fc.dbPwOk) add(f.path, 'injection', DB_PW_MESSAGE, undefined, f.repo);
+    else if (f.inserted !== undefined) {
+      // an edited user workflow: the user's own text is not judged, but each job pipegen added is counted whole (steps, env, outputs, everything)
+      const jobs = isObj(p.js.jobs) ? p.js.jobs : {};
+      const total = f.inserted.jobs.reduce((n, id) => n + (Object.hasOwn(jobs, id) ? dbPwCount(JSON.stringify(jobs[id])) : 0), 0);
+      if (total > fc.dbPwOk) add(f.path, 'injection', DB_PW_MESSAGE, undefined, f.repo);
+    }
   }
 
   for (const check of ex.deferred) check();

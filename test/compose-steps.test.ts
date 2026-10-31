@@ -47,11 +47,17 @@ describe('renderRuntimeEnv', () => {
       'set -euo pipefail', 'pw="$(openssl rand -hex 16)"', 'echo "::add-mask::$pw"', CRED_LINE,
       "printf '%s=%s\\n' 'PIPEGEN_DB_PASSWORD' \"$pw\" >> \"$GITHUB_ENV\"",
       "printf '%s=%s\\n' 'DATABASE_URL' \"postgresql://${auth}@127.0.0.1:5432/pipegen\" >> \"$GITHUB_ENV\"",
+      "printf '%s=%s\\n' 'PIPEGEN_APP_DATABASE_URL' \"postgresql://${auth}@postgres:5432/pipegen\" >> \"$GITHUB_ENV\"",
       "printf '%s=%s\\n' 'PGHOST' \"127.0.0.1\" >> \"$GITHUB_ENV\"",
+      "printf '%s=%s\\n' 'PIPEGEN_APP_PGHOST' \"postgres\" >> \"$GITHUB_ENV\"",
       "printf '%s=%s\\n' 'PGPORT' \"5432\" >> \"$GITHUB_ENV\"",
+      "printf '%s=%s\\n' 'PIPEGEN_APP_PGPORT' \"5432\" >> \"$GITHUB_ENV\"",
       "printf '%s=%s\\n' 'PGUSER' \"pipegen\" >> \"$GITHUB_ENV\"",
+      "printf '%s=%s\\n' 'PIPEGEN_APP_PGUSER' \"pipegen\" >> \"$GITHUB_ENV\"",
       "printf '%s=%s\\n' 'PGPASSWORD' \"${pw}\" >> \"$GITHUB_ENV\"",
+      "printf '%s=%s\\n' 'PIPEGEN_APP_PGPASSWORD' \"${pw}\" >> \"$GITHUB_ENV\"",
       "printf '%s=%s\\n' 'PGDATABASE' \"pipegen\" >> \"$GITHUB_ENV\"",
+      "printf '%s=%s\\n' 'PIPEGEN_APP_PGDATABASE' \"pipegen\" >> \"$GITHUB_ENV\"",
     ].join('\n');
     expect(renderRuntimeEnv(PG).run).toBe(want);
     expect(renderRuntimeEnv(PG).name).toBe('pipegen: set the test database environment');
@@ -116,7 +122,7 @@ describe('renderRuntimeEnv', () => {
       expect(m.PGPASSWORD).toBe(m.PIPEGEN_DB_PASSWORD);
       expect(m.DATABASE_URL).toBe(['postgresql://pipegen', ':', m.PIPEGEN_DB_PASSWORD, '@127.0.0.1:5432/pipegen'].join(''));
       expect([m.PGHOST, m.PGPORT, m.PGUSER, m.PGDATABASE]).toEqual(['127.0.0.1', '5432', 'pipegen', 'pipegen']);
-      expect(lines.length).toBe(PG.vars.length + 1);
+      expect(lines.length).toBe(PG.vars.length * 2 + 1);
       expect(r.stdout.split('\n')[0]).toBe(`::add-mask::${m.PIPEGEN_DB_PASSWORD}`);
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
@@ -126,7 +132,7 @@ describe('renderRuntimeEnv', () => {
   });
 
   it('renders from runtimeEnv(profile)', () => {
-    const p = profile([service({ name: 'api', path: 'api', dependsOn: [{ kind: 'postgres', name: 'postgres', evidence: 'x', envVars: ['DATABASE_URL'] }], scripts: ['start'] })]);
+    const p = profile([service({ name: 'api', path: 'api', dockerfile: 'api/Dockerfile', port: 3000, dependsOn: [{ kind: 'postgres', name: 'postgres', evidence: 'x', envVars: ['DATABASE_URL'] }], scripts: ['start'] })]);
     expect((renderRuntimeEnv(runtimeEnv(p)).run as string)).toContain('postgresql://${auth}@127.0.0.1:5432/pipegen');
   });
 });

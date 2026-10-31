@@ -30,7 +30,7 @@ const DANGEROUS_NAMES: readonly { family: string; match: RegExp }[] = [
   { family: 'node, npm, python and package indexes', match: /^(?:NODE_|NPM_CONFIG_|PYTHON|PIP_|UV_)|^npm_config_/ },
   { family: 'java, perl, ruby', match: /^(?:JAVA_TOOL_OPTIONS|_JAVA_OPTIONS|JDK_JAVA_OPTIONS|PERLLIB)$|^(?:PERL5|RUBY|GEM_|BUNDLE_)/ },
   { family: 'rust and go', match: /^(?:CARGO_|RUSTUP_|RUSTFLAGS$)|^GO[A-Z0-9]*$/ },
-  { family: 'git, docker, XDG', match: /^(?:GIT_|DOCKER_|XDG_)/ },
+  { family: 'git, docker, compose, buildx, XDG', match: /^(?:GIT_|DOCKER_|COMPOSE_|BUILDX_|BUILDKIT_|XDG_)/ },
   { family: 'the reviewed tools', match: /^(?:TRIVY_|HADOLINT_|PINACT_|SEMGREP_|COVERAGE_)/ },
   // build toolchains (6b, review R1-7): a compiler, linker, make or package-manager setting changes what a build runs
   { family: 'C, C++ and Go build', match: /^(?:CGO_|PKG_CONFIG_)|^(?:CC|CXX|AR|CFLAGS|CXXFLAGS|CPPFLAGS|LDFLAGS|MAKEFLAGS)$/ },

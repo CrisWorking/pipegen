@@ -14,7 +14,10 @@ export const DB_PASSWORD_BYTES = 16;
 export const DB_USER = 'pipegen';
 export const DB_NAME = 'pipegen';
 export const LOCAL_HOST = '127.0.0.1';
-const PASSWORD_REF = '${PIPEGEN_DB_PASSWORD}';
+/** `:?` makes Compose stop with an error instead of starting a container with an empty password when the runtime-env step did not run. */
+const PASSWORD_REF = '${PIPEGEN_DB_PASSWORD:?}';
+/** The prefix of the container-network copy of each runtime variable (written by the runtime-env step, read by the app service in the compose file). */
+export const APP_PREFIX = 'PIPEGEN_APP_';
 
 export interface Healthcheck { test: readonly string[]; interval: string; timeout: string; retries: number; start_period?: string }
 export interface DepSpec {
@@ -71,6 +74,16 @@ export const VALUE_TABLE: Readonly<Record<DepKey, Readonly<Partial<Record<VarKin
   mongodb: { url: `mongodb://\${auth}@${LOCAL_HOST}:27017/${DB_NAME}?authSource=admin`, host: LOCAL_HOST, port: '27017', user: DB_USER, password: '${pw}', db: DB_NAME },
   rabbitmq: { url: `amqp://\${auth}@${LOCAL_HOST}:5672`, host: LOCAL_HOST, port: '5672', user: DB_USER, password: '${pw}' },
 });
+
+/**
+ * The value the APP container sees (P6): the runner values reach a container as its own localhost, so the host of a url or a host var is the
+ * dependency's compose key (`postgres`, `redis`, ...), which resolves on the compose network at the same port. Port, user, password and db are
+ * the runner values. One rule for every kind, from the same table, so nothing runner-side reaches a container.
+ */
+export function containerValue(dep: DepKey, kind: VarKind): string | undefined {
+  const v = VALUE_TABLE[dep][kind];
+  return v === undefined ? undefined : kind === 'url' || kind === 'host' ? v.replace(LOCAL_HOST, dep) : v;
+}
 
 const DB_GENERIC: Readonly<Record<string, VarKind>> = { DB_HOST: 'host', DB_PORT: 'port', DB_USER: 'user', DB_PASSWORD: 'password', DB_NAME: 'db' };
 

@@ -16,14 +16,14 @@
 // "pipegen uses <id>; your repo asks for <v>". Another major (postgres 16, redis 6, mongo 7): no file, the same note plus the reason. In CI the
 // containers are throw-away and keep no data, so a series difference within a major can only change behaviour, which the note tells.
 import { ArtifactNameError, slug } from '../engine/artifact-names.js';
-import { type BaseImage, BaseImageError, baseImageRef } from '../engine/base-images.js';
+import { type BaseImage, BaseImageError, baseImageRef, loadBaseImages } from '../engine/base-images.js';
 import { createdPathProblem, isDangerousName } from '../engine/job-rules.js';
 import { isRunnable } from '../engine/needs.js';
 import { NAME_RE } from '../read/manifest.js';
 import { SERVICE_NAME_RE } from '../read/project.js';
 import type { CreatedFile, Dependency, RepoProfile, RuntimeEnv, Service } from '../types.js';
 import { safeText } from '../util/safe-text.js';
-import { DB_PASSWORD_BYTES, DB_PASSWORD_NAME, DEP_KEYS, DEP_TABLE, ENV_TABLE, isDepKey, VALUE_TABLE, type DepKey, type VarKind } from './compose-tables.js';
+import { APP_PREFIX, DB_PASSWORD_BYTES, DB_PASSWORD_NAME, DEP_KEYS, DEP_TABLE, ENV_TABLE, isDepKey, VALUE_TABLE, type DepKey, type VarKind } from './compose-tables.js';
 
 export { DEP_TABLE, ENV_TABLE, VALUE_TABLE };
 export const COMPOSE_PATH = 'docker-compose.pipegen.yml';
@@ -51,29 +51,43 @@ const nameProblem = (name: unknown): string | null => {
 };
 
 interface EnvPlan { vars: RuntimeEnv['vars']; notes: string[] }
+type PlanApp = { depObjs: (Dependency & { kind: DepKey })[] };
 
-/** The services whose dependencies the runtime env covers: the ones that run. */
-const covered = (p: RepoProfile): Service[] => (Array.isArray(p?.services) ? p.services.filter((s) => s !== null && typeof s === 'object' && Array.isArray(s.dependsOn) && isRunnable(s)) : []);
+/** The services whose dependencies could be started: the ones that run. */
+const runnableOf = (p: RepoProfile): Service[] => (Array.isArray(p?.services) ? p.services.filter((s) => s !== null && typeof s === 'object' && Array.isArray(s.dependsOn) && isRunnable(s)) : []);
 const depsOf = (s: Service): (Dependency & { kind: DepKey })[] => s.dependsOn.filter((d): d is Dependency & { kind: DepKey } => d !== null && typeof d === 'object' && isDepKey(d.kind));
 
-function planEnv(p: RepoProfile): EnvPlan {
+/** The names pipegen fills for the services that GET a container (the compose plan's apps); the mapped names of the others get a note and nothing else. */
+function planEnv(apps: readonly PlanApp[], left: readonly Service[]): EnvPlan {
   const notes: string[] = [];
   const claims = new Map<string, Map<DepKey, VarKind>>();
   const seenNote = new Set<string>();
   const note = (m: string): void => { if (!seenNote.has(m)) { seenNote.add(m); notes.push(m); } };
-  for (const s of covered(p)) {
-    for (const d of depsOf(s)) {
+  const mapped = (d: Dependency & { kind: DepKey }, name: unknown): VarKind | undefined => {
+    const kind = typeof name === 'string' && Object.hasOwn(ENV_TABLE[d.kind], name) ? ENV_TABLE[d.kind][name as string] : undefined;
+    return kind === undefined || VALUE_TABLE[d.kind][kind] === undefined ? undefined : kind;
+  };
+  for (const a of apps) {
+    for (const d of a.depObjs) {
       for (const name of Array.isArray(d.envVars) ? d.envVars : []) {
         const bad = nameProblem(name);
         if (bad !== null) { note(`The variable ${show(name)} of the ${d.kind} dependency ${bad}, so pipegen does not fill it.`); continue; }
-        const kind = Object.hasOwn(ENV_TABLE[d.kind], name) ? ENV_TABLE[d.kind][name] : undefined;
-        if (kind === undefined || VALUE_TABLE[d.kind][kind] === undefined) {
+        const kind = mapped(d, name);
+        if (kind === undefined) {
           note(`The variable ${show(name)} belongs to the ${d.kind} dependency, but pipegen does not know what it holds, so it fills nothing for it and does not ask for it; set it yourself if the test run needs it.`);
           continue;
         }
         const by = claims.get(name) ?? new Map<DepKey, VarKind>();
         by.set(d.kind, kind);
         claims.set(name, by);
+      }
+    }
+  }
+  // the dependencies of runnable services that get no container: pipegen starts nothing for them, so nothing is filled
+  for (const s of left) {
+    for (const d of depsOf(s)) {
+      for (const name of Array.isArray(d.envVars) ? d.envVars : []) {
+        if (nameProblem(name) === null && mapped(d, name) !== undefined) note(`The variable ${show(name)} belongs to the ${d.kind} dependency of the service ${show(s.name)}, which gets no container, so pipegen starts no ${d.kind} for it and fills nothing for the variable.`);
       }
     }
   }
@@ -87,15 +101,25 @@ function planEnv(p: RepoProfile): EnvPlan {
   return { vars, notes };
 }
 
-/** Whether the profile has a running service with a database or broker dependency pipegen starts (so the runtime-env and compose-up steps can be expected). */
-export function needsCompose(p: RepoProfile): boolean { return covered(p).some((s) => depsOf(s).length > 0); }
+const noEnv = (): RuntimeEnv => ({ password: { name: DB_PASSWORD_NAME, bytes: DB_PASSWORD_BYTES }, vars: [] });
 
-/** The runtime env of a run that starts the compose file (B6): the generated password and the variables pipegen fills. Structured data, never shell text. */
-export function runtimeEnv(p: RepoProfile): RuntimeEnv {
-  return { password: { name: DB_PASSWORD_NAME, bytes: DB_PASSWORD_BYTES }, vars: planEnv(p).vars };
+export interface PlanOptions { baseImages?: readonly BaseImage[]; createdDockerfiles?: readonly string[] }
+
+/**
+ * The runtime env of a run that starts the compose file (B6). It comes from the COMPOSE PLAN (the one source): only dependencies that get a container,
+ * of only the services that get an app container, and nothing at all when the plan yields no file. Structured data, never shell text.
+ */
+export function runtimeEnv(p: RepoProfile, opts: PlanOptions = {}): RuntimeEnv {
+  return planCompose(p, opts.baseImages ?? loadBaseImages(), opts.createdDockerfiles ?? []).env;
 }
-/** The notes that go with runtimeEnv: names of a covered dependency that pipegen does not fill (never guessed, never asked). */
-export function runtimeEnvNotes(p: RepoProfile): string[] { return planEnv(p).notes; }
+/** The notes that go with runtimeEnv: names of a dependency that pipegen does not fill (never guessed, never asked). */
+export function runtimeEnvNotes(p: RepoProfile, opts: PlanOptions = {}): string[] {
+  return planCompose(p, opts.baseImages ?? loadBaseImages(), opts.createdDockerfiles ?? []).envNotes;
+}
+/** For D5 (secrets): the names the compose plan covers, so they are not asked for. Exactly `runtimeEnv(...).vars` names. */
+export function composeCoveredNames(p: RepoProfile, opts: PlanOptions = {}): string[] {
+  return runtimeEnv(p, opts).vars.map((v) => v.name);
+}
 
 // ---------- versions ----------
 
@@ -106,15 +130,17 @@ function versionCheck(kind: DepKey, version: unknown): { note?: string; fatal?: 
   if (typeof version !== 'string' || !VERSION_RE.test(version)) return { note: `The ${kind} version in your repo is not a plain version number, so the test run starts ${spec.id}.` };
   const want = version.split('.').map(Number);
   const have = spec.series.split('.').map(Number);
-  if (want.slice(0, have.length).every((x, i) => x === have[i])) return {};   // inside the series: 17.2 for 17, 7.2.4 for 7, and a short 8 for 8.4
+  // a major alone ("mysql 8") does not say which series: it maps to the list's series in that major, and the note names it (M7)
+  if (want.length === 1 && want[0] === have[0]) return { note: `pipegen uses ${spec.id}; your repo says ${version}. The test run uses the series pipegen has reviewed.` };
+  if (want.slice(0, have.length).every((x, i) => x === have[i])) return {};   // inside the series: 17.2 for 17, 7.2.4 for 7, 8.0.3 for 8.0
   if (want[0] === have[0]) return { note: `pipegen uses ${spec.id}; your repo asks for ${version}. The test run uses the version pipegen has reviewed.` };
   return { note: `pipegen uses ${spec.id}; your repo asks for ${version}. A different major version can not be proven with it (data and behaviour differ, and pipegen never downgrades or upgrades silently), so pipegen writes no compose file.`, fatal: true };
 }
 
 // ---------- the plan ----------
 
-interface App { key: string; context: string; port: number; deps: DepKey[]; env: string[] }
-export interface ComposePlan { text: string | null; notes: string[] }
+interface App { key: string; context: string; port: number; deps: DepKey[]; env: string[]; svc: Service; depObjs: (Dependency & { kind: DepKey })[] }
+export interface ComposePlan { text: string | null; notes: string[]; /** the runtime env of the apps in the file (empty when there is no file) */ env: RuntimeEnv; envNotes: string[] }
 
 /** Whether `<dir>/Dockerfile` exists (the reader found it) or is created in this draft. Only that exact file name is the one `dockerfile: Dockerfile` builds. */
 function hasDockerfile(s: Service, dir: string, created: ReadonlySet<string>): boolean {
@@ -123,12 +149,14 @@ function hasDockerfile(s: Service, dir: string, created: ReadonlySet<string>): b
 }
 
 /**
- * The compose text for a profile, or null with the reasons. `createdDockerfiles` are the service Dockerfile paths (`api/Dockerfile`) pipegen creates in the
- * same draft; the creator and the referee's judge pass the same list, so they compute the same text.
+ * The compose text for a profile, or null with the reasons; and the runtime env of exactly what the file starts. `createdDockerfiles` are the service
+ * Dockerfile paths (`api/Dockerfile`) pipegen creates in the same draft; the creator and the referee's judge pass the same list (the files being judged),
+ * so they compute the same text.
  */
 export function planCompose(p: RepoProfile, baseImages: readonly BaseImage[], createdDockerfiles: readonly string[] = []): ComposePlan {
   const notes: string[] = [];
   const note = (m: string): void => { const t = safeText(m, MAX_NOTE * 2); if (!notes.includes(t)) notes.push(t); };
+  const fail = (): ComposePlan => ({ text: null, notes, env: noEnv(), envNotes: [] });
   const services = Array.isArray(p?.services) ? p.services.filter((s) => s !== null && typeof s === 'object') : [];
   const created = new Set(createdDockerfiles);
 
@@ -137,70 +165,85 @@ export function planCompose(p: RepoProfile, baseImages: readonly BaseImage[], cr
     for (const d of Array.isArray(s.dependsOn) ? s.dependsOn : []) {
       if (d === null || typeof d !== 'object' || (d.kind !== 'external' && !isDepKey(d.kind))) {
         note(`The service ${show(s.name)} has a dependency of a kind pipegen does not know (${show((d as { kind?: unknown } | null)?.kind)}), so it can not prove a compose file for it.`);
-        return { text: null, notes };
+        return fail();
       }
+    }
+  }
+  // a service folder outside the plain set: no compose file at all (the brief), however good the others are
+  for (const s of services) {
+    if (typeof s.path !== 'string' || !plainFolder(rootPrefix(s.path))) {
+      note(`The folder ${show(s.path)} of the service ${show(s.name)} is not a plain folder path, so pipegen can not prove a compose file for this repository.`);
+      return fail();
     }
   }
 
   const apps: App[] = [];
-  const env = runtimeEnv(p);
+  const left: Service[] = [];   // runnable services with a dependency that get no container
   for (const s of services) {
-    const deps = [...new Set(depsOf(s).map((d) => d.kind))];
+    const depObjs = depsOf(s);
+    const deps = [...new Set(depObjs.map((d) => d.kind))];
     if (deps.length === 0) continue;   // nothing to containerise for this service
     const who = show(s.name);
+    const skip = (m: string): void => { note(m); if (isRunnable(s)) left.push(s); };
     if (!isRunnable(s)) { note(`The service ${who} does not run as a server, so it gets no container.`); continue; }
-    if (s.language !== 'node' || s.packageManager !== 'npm') { note(`The service ${who} is not an npm project, and pipegen starts npm services only in this version, so it gets no container.`); continue; }
-    if (typeof s.name !== 'string' || !SERVICE_NAME_RE.test(s.name)) { note(`The service name ${who} is not a plain name, so pipegen can not name a container for it.`); continue; }
+    if (s.language !== 'node' || s.packageManager !== 'npm') { skip(`The service ${who} is not an npm project, and pipegen starts npm services only in this version, so it gets no container.`); continue; }
+    if (typeof s.name !== 'string' || !SERVICE_NAME_RE.test(s.name)) { skip(`The service name ${who} is not a plain name, so pipegen can not name a container for it.`); continue; }
     let key: string;
-    try { key = `app-${slug(s.name)}`; } catch (e) { if (!(e instanceof ArtifactNameError)) throw e; note(`The service name ${who} has no letters or digits, so pipegen can not name a container for it.`); continue; }
-    const dir = typeof s.path === 'string' ? rootPrefix(s.path) : null;
-    if (dir === null || !plainFolder(dir)) { note(`The folder ${show(s.path)} of the service ${who} is not a plain folder path, so pipegen does not build it in a container.`); continue; }
-    if (!validPort(s.port)) { note(`The service ${who} has no usable port (an integer from 1 to 65535), so pipegen can not publish it.`); continue; }
-    if (!hasDockerfile(s, dir, created)) { note(`The service ${who} has no Dockerfile at ${dir === '' ? '' : `${dir}/`}Dockerfile (existing or created now), so it gets no container.`); continue; }
-    const names = new Set<string>();
-    for (const d of depsOf(s)) for (const n of Array.isArray(d.envVars) ? d.envVars : []) if (env.vars.some((v) => v.name === n && v.dep === d.kind)) names.add(n);
-    apps.push({ key, context: dir === '' ? '.' : dir, port: s.port, deps, env: [...names].sort() });
+    try { key = `app-${slug(s.name)}`; } catch (e) { if (!(e instanceof ArtifactNameError)) throw e; skip(`The service name ${who} has no letters or digits, so pipegen can not name a container for it.`); continue; }
+    const dir = rootPrefix(s.path);
+    if (!validPort(s.port)) { skip(`The service ${who} has no usable port (an integer from 1 to 65535), so pipegen can not publish it.`); continue; }
+    if (!hasDockerfile(s, dir, created)) { skip(`The service ${who} has no Dockerfile at ${dir === '' ? '' : `${dir}/`}Dockerfile (existing or created now), so it gets no container.`); continue; }
+    // `./<dir>`: a bare `github.com/acme/api` would be read as a remote Git context, so every context is explicitly local (I2)
+    apps.push({ key, context: dir === '' ? '.' : `./${dir}`, port: s.port, deps, env: [], svc: s, depObjs });
   }
   if (apps.length === 0) {
     if (services.some((s) => depsOf(s).length > 0)) note('No service with a database or broker dependency can run in a container here, so pipegen writes no compose file.');
-    return { text: null, notes };
+    return fail();
   }
 
-  // collisions: two services that give one key, or want one port, could not both be started
+  const kinds = DEP_KEYS.filter((k) => apps.some((a) => a.deps.includes(k)));
+
+  // collisions: two services that give one key, or an app on a port another app or a started dependency publishes, could not all be started
   const keys = new Map<string, number>();
   const ports = new Map<number, number>();
   for (const a of apps) { keys.set(a.key, (keys.get(a.key) ?? 0) + 1); ports.set(a.port, (ports.get(a.port) ?? 0) + 1); }
+  for (const k of kinds) ports.set(DEP_TABLE[k].port, (ports.get(DEP_TABLE[k].port) ?? 0) + 1);
   for (const [k, n] of keys) if (n > 1) note(`${n} services give the same container key ${k} (their names collide once cleaned), so pipegen writes no compose file.`);
-  for (const [port, n] of ports) if (n > 1) note(`${n} services use port ${port}, and they could not all be published on it, so pipegen writes no compose file.`);
-  if ([...keys.values(), ...ports.values()].some((n) => n > 1)) return { text: null, notes };
+  for (const [port, n] of ports) if (n > 1) note(`${n} containers would publish port ${port} (a service and another service or a database it starts), so pipegen writes no compose file.`);
+  if ([...keys.values(), ...ports.values()].some((n) => n > 1)) return fail();
 
-  // which dependency kinds, and their versions
-  const kinds = DEP_KEYS.filter((k) => apps.some((a) => a.deps.includes(k)));
+  // versions
   let fatal = false;
   for (const k of kinds) {
     const versions = new Set<unknown>();
-    for (const s of covered(p)) for (const d of depsOf(s)) if (d.kind === k && apps.some((a) => a.key === `app-${safeSlug(s.name)}`)) versions.add(d.version);
+    for (const a of apps) for (const d of a.depObjs) if (d.kind === k) versions.add(d.version);
     for (const v of versions.size === 0 ? [undefined] : versions) {
       const r = versionCheck(k, v);
       if (r.note !== undefined) note(r.note);
       if (r.fatal) fatal = true;
     }
   }
-  if (fatal) return { text: null, notes };
+  if (fatal) return fail();
 
   // the images, from the list
   const refs = new Map<DepKey, string>();
   try { for (const k of kinds) refs.set(k, baseImageRef(DEP_TABLE[k].id, baseImages)); } catch (e) {
     if (!(e instanceof BaseImageError)) throw e;
     note(`pipegen's base-image list has no image for ${e.message}, so it writes no compose file.`);
-    return { text: null, notes };
+    return fail();
   }
 
+  // the runtime env of exactly these apps, and each app's names
+  const envPlan = planEnv(apps, left);
+  for (const a of apps) {
+    const names = new Set<string>();
+    for (const d of a.depObjs) for (const n of Array.isArray(d.envVars) ? d.envVars : []) if (envPlan.vars.some((v) => v.name === n && v.dep === d.kind)) names.add(n);
+    a.env = [...names].sort();
+  }
+  for (const m of envPlan.notes) note(m);
   apps.sort((a, b) => (a.key < b.key ? -1 : a.key > b.key ? 1 : 0));
-  return { text: emit(kinds, refs, apps), notes };
+  return { text: emit(kinds, refs, apps), notes, env: { password: { name: DB_PASSWORD_NAME, bytes: DB_PASSWORD_BYTES }, vars: envPlan.vars }, envNotes: envPlan.notes };
 }
-
-const safeSlug = (name: string): string | null => { try { return slug(name); } catch { return null; } };
 
 /** The compose text for a profile, or null when pipegen proves nothing (see planCompose for the reasons). */
 export function composeText(p: RepoProfile, baseImages: readonly BaseImage[], createdDockerfiles: readonly string[] = []): string | null {
@@ -228,7 +271,7 @@ function emit(kinds: readonly DepKey[], refs: ReadonlyMap<DepKey, string>, apps:
   }
   for (const a of apps) {
     out.push(`  ${a.key}:`, '    build:', `      context: ${q(a.context)}`, '      dockerfile: "Dockerfile"');
-    if (a.env.length > 0) { out.push('    environment:'); for (const n of a.env) out.push(`      ${n}: ${q('${' + n + '}')}`); }
+    if (a.env.length > 0) { out.push('    environment:'); for (const n of a.env) out.push(`      ${n}: ${q('${' + APP_PREFIX + n + ':?}')}`); }
     out.push('    ports:', `      - ${q(`127.0.0.1:${a.port}:${a.port}`)}`, '    depends_on:');
     for (const k of DEP_KEYS) if (a.deps.includes(k)) out.push(`      ${k}:`, '        condition: service_healthy');
   }

@@ -23,12 +23,17 @@ describe('compose (live)', () => {
   it.skipIf(!wanted)('docker compose config accepts every kind and shows no privilege, volume or foreign port', () => {
     if (!dockerUp()) { console.warn('compose live check skipped: docker compose is not available here'); return; }
     const dep = (kind: 'postgres' | 'mysql' | 'redis' | 'mongodb' | 'rabbitmq') => ({ kind, name: kind, evidence: 'x', envVars: [] });
-    const p = profile([service({ name: 'api', path: 'api', dockerfile: 'api/Dockerfile', port: 3000, scripts: ['start'], dependsOn: (['postgres', 'mysql', 'redis', 'mongodb', 'rabbitmq'] as const).map(dep) })]);
-    const { file } = createCompose(p, { repoPaths: new Set(['api/Dockerfile']), baseImages: loadBaseImages() });
+    const p = profile([
+      service({ name: 'api', path: 'api', dockerfile: 'api/Dockerfile', port: 3000, scripts: ['start'], dependsOn: (['postgres', 'mysql', 'redis', 'mongodb', 'rabbitmq'] as const).map(dep) }),
+      service({ name: 'gh', path: 'github.com/acme/api', dockerfile: 'github.com/acme/api/Dockerfile', port: 3001, scripts: ['start'], dependsOn: [dep('postgres')] }),
+    ]);
+    const { file } = createCompose(p, { repoPaths: new Set(['api/Dockerfile', 'github.com/acme/api/Dockerfile']), baseImages: loadBaseImages() });
     expect(file).not.toBeNull();
     writeFileSync(join(work, 'docker-compose.pipegen.yml'), file?.content ?? '');
     const r = spawnSync('docker', ['compose', '--env-file', '/dev/null', '-f', join(work, 'docker-compose.pipegen.yml'), 'config', '--format', 'json'], { encoding: 'utf8', timeout: 60_000, env: { ...process.env, [DBPW]: 'x'.repeat(32) } });
     expect(r.status, r.stderr).toBe(0);
+    // both ./api and ./github.com/acme/api must resolve to local folders, never a remote Git context
+    for (const ctxDir of ['api', 'github.com/acme/api']) expect(r.stdout).toContain(JSON.stringify(join(work, ctxDir)).slice(1, -1));
     const cfg = JSON.parse(r.stdout) as { services: Record<string, { ports?: { host_ip?: string }[]; privileged?: boolean; volumes?: unknown[] }> };
     for (const s of Object.values(cfg.services)) {
       expect(s.privileged).toBeUndefined();

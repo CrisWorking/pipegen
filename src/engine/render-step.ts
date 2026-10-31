@@ -17,7 +17,7 @@ import { isDeepStrictEqual } from 'node:util';
 import { Scalar, YAMLMap, YAMLSeq } from 'yaml';
 import { safeText } from '../util/safe-text.js';
 import { DEPENDENCY_KINDS, type OutputFormat, type PipelineDraft, type RepoProfile, type ReviewedTool, type RuntimeEnv, type Service, type StepSpec } from '../types.js';
-import { DB_PASSWORD_BYTES, DB_PASSWORD_NAME, DB_USER, ENV_TABLE, isDepKey, VALUE_TABLE, VAR_KINDS } from '../create/compose-tables.js';
+import { APP_PREFIX, containerValue, DB_PASSWORD_BYTES, DB_PASSWORD_NAME, DB_USER, ENV_TABLE, isDepKey, VALUE_TABLE, VAR_KINDS } from '../create/compose-tables.js';
 import { COMMIT_SHA_RE } from './names.js';
 import { centralWorkflowPath } from './central-path.js';
 import { NEED_IDS, toolCoversNeed } from './need-ids.js';
@@ -691,7 +691,8 @@ const bashStep = (name: string, run: string, id: string): RenderedStep => ({ id,
  * after it (the compose file reads `${PIPEGEN_DB_PASSWORD}`, the app reads the rest). It is rendered from STRUCTURED data (RuntimeEnv); every value
  * comes from the fixed tables of compose-tables.ts, so no repo text, no expression and no secret literal is in it. The URLs are built through
  * `auth="pipegen:${pw}"`, which keeps `user:password@` out of the file text (and so out of the secret scan). The referee recognises the step by
- * re-rendering it from the draft's RuntimeEnv, and allows PIPEGEN_DB_PASSWORD in no other step. Throws RenderError for anything that is not a
+ * re-rendering it from the compose plan's RuntimeEnv, and allows PIPEGEN_DB_PASSWORD and PIPEGEN_APP_* in no other step. Each variable is written twice: the runner value
+ * (127.0.0.1) and `PIPEGEN_APP_<NAME>`, the value the app container sees (the dependency's compose key as host), which the compose file's app service reads. Throws RenderError for anything that is not a
  * valid RuntimeEnv: a name that is not in the table for its dependency, a dangerous or GITHUB_ name, a kind the dependency has no value for.
  */
 export function renderRuntimeEnv(rt: RuntimeEnv): RenderedStep {
@@ -718,6 +719,8 @@ export function renderRuntimeEnv(rt: RuntimeEnv): RenderedStep {
     if (seen.has(name)) return bad(`${show(name)} is set twice.`);
     seen.add(name);
     lines.push(`printf '%s=%s\\n' '${name}' "${value}" >> "$GITHUB_ENV"`);
+    // the same variable as the app CONTAINER must see it (P6): the dependency's compose key as host; the compose file's app service reads PIPEGEN_APP_<NAME>
+    lines.push(`printf '%s=%s\\n' '${APP_PREFIX}${name}' "${containerValue(dep, kind)}" >> "$GITHUB_ENV"`);
   }
   const id = `runtime-env-${sha16(JSON.stringify(rt.vars.map((v) => [v.name, v.kind, v.dep])))}`;
   return bashStep('pipegen: set the test database environment', lines.join('\n'), id);

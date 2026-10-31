@@ -79,7 +79,12 @@ describe('compose judge', () => {
 });
 
 const LINTERS: Linters = { actionlint: async () => '/x', zizmor: async () => '/x' };
-const run = (files: CreatedFile[], d: PipelineDraft): Promise<RefereeReport> => referee(files, d, platform(), reviewedList(), LINTERS, 'tok', { runLinters: async () => [] });
+// the compose file pipegen computes for the draft rides along (the steps are recognised only beside it, D4 I1) unless the test brings its own
+const withCompose = (files: CreatedFile[], d: PipelineDraft): CreatedFile[] => {
+  const t = composeText(d.profile, list);
+  return t === null || files.some((f) => f.path === 'docker-compose.pipegen.yml') ? files : [...files, cf(t)];
+};
+const run = (files: CreatedFile[], d: PipelineDraft): Promise<RefereeReport> => referee(withCompose(files, d), d, platform(), reviewedList(), LINTERS, 'tok', { runLinters: async () => [] });
 const show = (r: RefereeReport): string => r.issues.map((i) => `${i.check}: ${i.message}`).join('\n');
 const has = (r: RefereeReport, check: string): boolean => r.issues.some((i) => i.check === check);
 const wfText = (steps: RenderedStep[], top: Record<string, unknown> = {}, jobOver: Record<string, unknown> = {}): string => {

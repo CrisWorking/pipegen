@@ -8,4 +8,4 @@ export const PW_FIELD = ['pass', 'word'].join('') as 'password';
 export const runtimeOf = (vars: RuntimeEnv['vars'], bytes: number = 16): RuntimeEnv => ({ [PW_FIELD]: { name: DBPW, bytes }, vars }) as RuntimeEnv;
 export const PG_PW_FIELD = ['POSTGRES', 'PASSWORD'].join('_');
 /** The postgres container's password entry: `<POSTGRES password name>: ${<generated password name>}`. */
-export const PG_PW_ENTRY: Record<string, string> = { [PG_PW_FIELD]: `\${${DBPW}}` };
+export const PG_PW_ENTRY: Record<string, string> = { [PG_PW_FIELD]: `\${${DBPW}:?}` };

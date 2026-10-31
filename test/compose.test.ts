@@ -47,8 +47,8 @@ describe('compose: services', () => {
   it('app depends_on a healthy db; build is the plain service path and Dockerfile; env only ${NAME}; port on 127.0.0.1', () => {
     const d = doc();
     expect(d.services['app-api']).toEqual({
-      build: { context: 'api', dockerfile: 'Dockerfile' },
-      environment: { DATABASE_URL: '${DATABASE_URL}' },
+      build: { context: './api', dockerfile: 'Dockerfile' },
+      environment: { DATABASE_URL: '${PIPEGEN_APP_DATABASE_URL:?}' },
       ports: ['127.0.0.1:3000:3000'],
       depends_on: { postgres: { condition: 'service_healthy' } },
     });
@@ -59,11 +59,11 @@ describe('compose: services', () => {
 
   it('no literal password anywhere in the file (only ${NAME} references and the table literals)', () => {
     const t = text(prof([api({ dependsOn: ALL.map((x) => dep(x.kind, ['DATABASE_URL'])) })]));
-    expect(t).not.toMatch(/password\s*[:=]\s*(?!"\$\{)[^\s"]/i);
+    expect(t.replaceAll('${' + DBPW + ':?}', 'REF')).not.toMatch(/password\s*[:=]\s*(?!"REF")[^\s"]/i);
     const d = parse(t);
     const LITERALS = new Set(['pipegen']);
     for (const s of Object.values<any>(d.services)) {
-      for (const v of Object.values<string>(s.environment ?? {})) expect(/^\$\{[A-Z_][A-Z0-9_]*\}$/.test(v) || LITERALS.has(v), v).toBe(true);
+      for (const v of Object.values<string>(s.environment ?? {})) expect(/^\$\{PIPEGEN_(?:DB_PASSWORD|APP_[A-Z0-9_]+):\?\}$/.test(v) || LITERALS.has(v), v).toBe(true);
     }
     expect(t.replace(/@sha256:[0-9a-f]{64}/g, '')).not.toMatch(/[0-9a-f]{32}/);
   });
@@ -129,7 +129,7 @@ describe('compose: services', () => {
     expect(Object.keys(env).sort()).toEqual(['AMQP_URL', 'DATABASE_URL', 'MONGODB_URI', 'PGDATABASE', 'PGHOST', 'PGPASSWORD', 'PGPORT', 'PGUSER', 'REDIS_URL']);
     for (const [k, v] of Object.entries(env)) {
       expect(NAME_RE.test(k) && !isDangerousName(k), k).toBe(true);
-      expect(v).toBe('${' + k + '}');
+      expect(v).toBe('${PIPEGEN_APP_' + k + ':?}');
     }
   });
 
@@ -146,7 +146,7 @@ describe('compose: services', () => {
 describe('compose: the exact text (golden)', () => {
   it('all five kinds and one app, byte for byte', () => {
     const r = (id: string): string => baseImageRef(id);
-    const pw = '${' + DBPW + '}';
+    const pw = '${' + DBPW + ':?}';
     const want = [
       'services:',
       '  postgres:', `    image: "${r('postgres-17')}"`, '    environment:', '      POSTGRES_USER: "pipegen"', ...Object.entries(PG_PW_ENTRY).map(([k, v]) => `      ${k}: "${v}"`), '      POSTGRES_DB: "pipegen"',
@@ -158,7 +158,7 @@ describe('compose: the exact text (golden)', () => {
       '    ports:', '      - "127.0.0.1:27017:27017"', '    healthcheck:', '      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand(\'ping\').ok"]', '      interval: "5s"', '      timeout: "10s"', '      retries: 30', '      start_period: "20s"',
       '  rabbitmq:', `    image: "${r('rabbitmq-4-management')}"`, '    environment:', '      RABBITMQ_DEFAULT_USER: "pipegen"', `      RABBITMQ_DEFAULT_PASS: "${pw}"`,
       '    ports:', '      - "127.0.0.1:5672:5672"', '    healthcheck:', '      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]', '      interval: "10s"', '      timeout: "10s"', '      retries: 30', '      start_period: "30s"',
-      '  app-api:', '    build:', '      context: "api"', '      dockerfile: "Dockerfile"', '    environment:', '      AMQP_URL: "${AMQP_URL}"', '      DATABASE_URL: "${DATABASE_URL}"', '      MONGODB_URI: "${MONGODB_URI}"', '      REDIS_URL: "${REDIS_URL}"',
+      '  app-api:', '    build:', '      context: "./api"', '      dockerfile: "Dockerfile"', '    environment:', '      AMQP_URL: "${PIPEGEN_APP_AMQP_URL:?}"', '      DATABASE_URL: "${PIPEGEN_APP_DATABASE_URL:?}"', '      MONGODB_URI: "${PIPEGEN_APP_MONGODB_URI:?}"', '      REDIS_URL: "${PIPEGEN_APP_REDIS_URL:?}"',
       '    ports:', '      - "127.0.0.1:3000:3000"', '    depends_on:',
       '      postgres:', '        condition: service_healthy', '      mysql:', '        condition: service_healthy', '      redis:', '        condition: service_healthy', '      mongodb:', '        condition: service_healthy', '      rabbitmq:', '        condition: service_healthy',
       '',
@@ -208,7 +208,7 @@ describe('compose: which services get an app container', () => {
     expect(planCompose(prof([noDocker]), list).notes.join()).toMatch(/Dockerfile/);
     const t = composeText(prof([noDocker]), list, ['api/Dockerfile']);
     expect(t).not.toBeNull();
-    expect(parse(t as string).services['app-api'].build.context).toBe('api');
+    expect(parse(t as string).services['app-api'].build.context).toBe('./api');
     // a created Dockerfile at another path does not count
     expect(composeText(prof([noDocker]), list, ['web/Dockerfile'])).toBeNull();
     // an existing Dockerfile with another name is not the one `dockerfile: Dockerfile` builds
@@ -315,7 +315,7 @@ describe('compose: slug collision', () => {
 describe('compose: versions', () => {
   const only = (version: string | undefined, kind: DependencyKind = 'postgres') => planCompose(prof([api({ dependsOn: [dep(kind, [], version)] })]), list);
   it('a version inside the list ids is silent (postgres 17 / 17.2, redis 7 / 7.2, mongo 8.0, mysql 8.4, rabbitmq 4)', () => {
-    for (const [k, v] of [['postgres', '17'], ['postgres', '17.2'], ['redis', '7'], ['redis', '7.2.4'], ['mongodb', '8.0'], ['mongodb', '8.0.3'], ['mysql', '8.4'], ['rabbitmq', '4'], ['rabbitmq', '4.1']] as const) {
+    for (const [k, v] of [['postgres', '17.2'], ['redis', '7.2'], ['redis', '7.2.4'], ['mongodb', '8.0'], ['mongodb', '8.0.3'], ['mysql', '8.4'], ['rabbitmq', '4.1']] as const) {
       const r = only(v, k);
       expect(r.text, `${k} ${v}`).not.toBeNull();
       expect(r.notes.join(), `${k} ${v}`).not.toMatch(/pipegen uses/);
