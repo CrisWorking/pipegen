@@ -3,7 +3,7 @@
 // and clean it BEFORE anything that cuts or escapes it (a cut leaves a prefix no scrubber can match).
 //
 // Two layers (fix round 3):
-//   1. the judges check every decoded key and string of what they read (anyString over a parsed workflow, package.json or draft), and
+//   1. the judges check every decoded key and scalar of what they read (anyString over a parsed workflow, package.json or draft), and
 //      containsKnownValue looks at the raw text, its display form, its characters-removed form and the NFC form of each;
 //   2. every helper that CUTS text for display scrubs its input first, with the vault that is active for the duration of a referee or guard call
 //      (withActiveVault). With no active vault the helpers behave exactly as without this file.
@@ -107,7 +107,9 @@ function scalarHolds(v: unknown, pred: (text: string) => boolean): boolean | nul
   if (typeof v === 'number') {
     if (!Number.isFinite(v) || (Number.isInteger(v) && !Number.isSafeInteger(v))) return true;
     const text = String(v);
-    return (!Number.isInteger(v) && text.replace(/\D/g, '').length >= LONG_NUMBER_DIGITS) || pred(text);
+    if (!Number.isInteger(v)) return text.replace(/\D/g, '').length >= LONG_NUMBER_DIGITS || pred(text);
+    // an all-digit value with leading zeros decodes from another integer form without them (0o57060516 is 12345678): also check it zero-padded
+    return pred(text) || pred(`${'0'.repeat(64)}${text.replace('-', '')}`);
   }
   if (typeof v === 'bigint' || typeof v === 'boolean') return pred(String(v));
   return null;

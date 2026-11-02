@@ -769,7 +769,7 @@ describe('B4 layer 1: containsKnownValue sees decoded and altered forms', () => 
   it('anyString walks every key and string leaf (nested, arrays), iteratively, with a depth cap', () => {
     const seen: string[] = [];
     anyString({ a: ['x', { 'k-1': 'y', n: 5, z: null }], 'top-key': { deep: 'w' } }, (t) => { seen.push(t); return false; });
-    expect(seen.sort()).toEqual(['5', 'a', 'deep', 'k-1', 'n', 'top-key', 'w', 'x', 'y', 'z']);   // the number 5 as its text (fix round 5)
+    expect(seen.sort()).toEqual(['00000000000000000000000000000000000000000000000000000000000000005', '5', 'a', 'deep', 'k-1', 'n', 'top-key', 'w', 'x', 'y', 'z']);   // the number 5 as its text (fix round 5)
     expect(anyString({ a: { b: 'needle' } }, (t) => t === 'needle')).toBe(true);
     expect(anyString({ ['needle']: 1 }, (t) => t === 'needle')).toBe(true);
     let deep: unknown = 'needle';
@@ -925,8 +925,20 @@ describe('fix round 5 (O1): anyString and anyYamlScalar check non-string scalars
     expect(anyString({ a: 1234.5678 }, never)).toBe(true);   // 8 digits
     const seen: string[] = [];
     anyString({ a: 12345678, b: 7n, c: true, d: null }, (t) => { seen.push(t); return false; });
-    expect(seen.sort()).toEqual(['12345678', '7', 'a', 'b', 'c', 'd', 'true']);
+    expect(seen.sort()).toEqual(['000000000000000000000000000000000000000000000000000000000000000012345678', '12345678', '7', 'a', 'b', 'c', 'd', 'true']);   // an integer number is also checked zero-padded (D5 r5, R1)
     expect(anyString(12345678, (t) => t === '12345678')).toBe(true);
+  });
+
+  it('D5 r5 R1: an all-digit vault value with leading zeros written as an octal or hex integer is caught', () => {
+    const vault = new SecretVault();
+    vault.set('K_PIN', '00012345678');
+    expect(vault.containsKnownValue('12345678')).toBe(false);   // the bare integer is a substring the vault does not cover on its own
+    const pred = (t: string): boolean => vault.containsKnownValue(t);
+    expect(anyString({ run: 0o57060516 }, pred)).toBe(true);
+    expect(anyYamlScalar('name: 0o57060516\n', pred)).toBe(true);
+    expect(anyYamlScalar('name: 0xBC614E\n', pred)).toBe(true);
+    expect(anyString({ run: 0o57060517 }, pred)).toBe(false);
+    expect(anyString({ run: -0o57060516 }, pred)).toBe(true);
   });
 
   it('anyYamlScalar: number keys and values are checked the same way', () => {
