@@ -93,14 +93,22 @@ export function activeSafeText(s: string, max?: number): string {
 const MAX_DEPTH = 64;
 const MAX_NODES = 1_000_000;
 
+/** Digits from which a fractional number fails closed: the vault's shortest value (secrets.ts MIN_VALUE_LENGTH; a test keeps them equal). */
+export const LONG_NUMBER_DIGITS = 8;
+
 /**
  * Whether a decoded scalar holds a value, or null when `v` is no scalar (fix round 5, O1). A string is checked as it is; a number, bigint or
- * boolean as its text (`0xBC614E` decodes to 12345678). A number that is not a safe integer (rounded, fractional, NaN or infinite) holds: its
- * text may be a rounded piece of a value (`0xab54a98ceb1f0ad2` decodes to 12345678901234567000), and pipegen writes no such number.
+ * boolean as its text (`0xBC614E` decodes to 12345678). An integer beyond the safe range, NaN or an infinity holds: its text may be a rounded
+ * piece of a value (`0xab54a98ceb1f0ad2` decodes to 12345678901234567000), and pipegen writes no such number. A fractional number (amendment)
+ * is checked as its text, and holds when that text has LONG_NUMBER_DIGITS digits or more (it may be rounded), so `3.11` or `22.5` pass.
  */
 function scalarHolds(v: unknown, pred: (text: string) => boolean): boolean | null {
   if (typeof v === 'string') return pred(v);
-  if (typeof v === 'number') return !Number.isSafeInteger(v) || pred(String(v));
+  if (typeof v === 'number') {
+    if (!Number.isFinite(v) || (Number.isInteger(v) && !Number.isSafeInteger(v))) return true;
+    const text = String(v);
+    return (!Number.isInteger(v) && text.replace(/\D/g, '').length >= LONG_NUMBER_DIGITS) || pred(text);
+  }
   if (typeof v === 'bigint' || typeof v === 'boolean') return pred(String(v));
   return null;
 }

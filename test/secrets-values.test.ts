@@ -496,7 +496,7 @@ describe('fix round 5 (O1): decoded number leaves and keys are checked against t
       (d as unknown as { steps: unknown[] }).steps = [{ needId: n }];
       fixed(value, await referee([file('FROM node:24\n')], d, platform(), reviewedList(), LINTERS, 'tok', { runLinters: async () => [], vault: vaultOf(value) }));
     }
-    for (const n of [Number.NaN, Number.POSITIVE_INFINITY, 0.5]) {
+    for (const n of [Number.NaN, Number.POSITIVE_INFINITY, 1234.56789]) {
       const d = mkDraft();
       (d as unknown as { steps: unknown[] }).steps = [{ needId: n }];
       const r = await referee([file('FROM node:24\n')], d, platform(), reviewedList(), LINTERS, 'tok', { runLinters: async () => [], vault: new SecretVault() });
@@ -513,6 +513,24 @@ describe('fix round 5 (O1): decoded number leaves and keys are checked against t
       noPieceOf(value, g);
       fixed(value, await ref([f], vaultOf(value)));
     }
+  });
+
+  it('round 5 amendment: short fractional numbers (3.11, 22.5, 0.5) are no hit; one with 8 or more digits fails closed; one whose text is a value is a hit', async () => {
+    for (const n of ['3.11', '22.5', '0.5']) {
+      const r = await ref([step(n)], vaultOf(DIG));
+      expect(r.issues.some((i) => i.check === 'secret-value'), n).toBe(false);
+      const d = mkDraft();
+      (d as unknown as { steps: unknown[] }).steps = [{ needId: Number(n) }];
+      const rd = await referee([file('FROM node:24\n')], d, platform(), reviewedList(), LINTERS, 'tok', { runLinters: async () => [], vault: vaultOf(DIG) });
+      expect(rd.issues.some((i) => i.check === 'secret-value'), n).toBe(false);
+    }
+    fixed(DIG, await ref([step('1234.56789')], vaultOf(DIG)));
+    // the value "1.234567" (8 characters, 7 digits): written as 0.1234567e1, the raw text does not hold it, the decoded number's text does
+    const DOT = '1.234567';
+    fixed(DOT, await ref([step('0.1234567e1')], vaultOf(DOT)));
+    const d = mkDraft();
+    (d as unknown as { steps: unknown[] }).steps = [{ needId: 1.234567 }];
+    fixed(DOT, await referee([file('FROM node:24\n')], d, platform(), reviewedList(), LINTERS, 'tok', { runLinters: async () => [], vault: vaultOf(DOT) }));
   });
 
   it('with no vault, numbers are judged as before; with a vault, ordinary safe integers are not a hit', async () => {

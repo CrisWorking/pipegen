@@ -5,12 +5,12 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { Prompter } from '../src/cli/io.js';
 import { composeCoveredNames } from '../src/create/compose.js';
 import {
-  askSecrets, coveredNames, generateFpKey, secretRequests, SecretVault, storeEnvSecret, storeSecrets,
+  askSecrets, coveredNames, generateFpKey, MIN_VALUE_LENGTH, secretRequests, SecretVault, storeEnvSecret, storeSecrets,
   TEST_KEYS_ONLY, type SecretRequest,
 } from '../src/create/secrets.js';
 import { isDangerousName } from '../src/engine/job-rules.js';
 import { displayForm } from '../src/util/safe-text.js';
-import { activeSafeText, anyString, anyYamlScalar, scrubForDisplay, withActiveVault } from '../src/util/known-values.js';
+import { activeSafeText, anyString, anyYamlScalar, LONG_NUMBER_DIGITS, scrubForDisplay, withActiveVault } from '../src/util/known-values.js';
 import { show } from '../src/engine/render-error.js';
 import { packageJsonProblems } from '../src/create/package-rules.js';
 import { runExitHooks } from '../src/util/exit-hooks.js';
@@ -917,8 +917,12 @@ describe('fix round 4: fail closed on ESC and C1 (B6), anyString caps (m1), ever
 describe('fix round 5 (O1): anyString and anyYamlScalar check non-string scalars', () => {
   it('anyString: a number that is not a safe integer (or not finite) holds; a safe integer, a bigint or a boolean is checked as its text', () => {
     const never = (): boolean => false;
-    for (const n of [12345678901234567000, 0.5, -1.5, Number.NaN, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY, 2 ** 53]) expect(anyString({ a: [n] }, never), String(n)).toBe(true);
-    for (const n of [0, -0, 3000, Number.MAX_SAFE_INTEGER, -Number.MAX_SAFE_INTEGER]) expect(anyString({ a: [n] }, never), String(n)).toBe(false);
+    for (const n of [12345678901234567000, Number.NaN, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY, 2 ** 53, 1234.56789, -0.12345678]) expect(anyString({ a: [n] }, never), String(n)).toBe(true);
+    for (const n of [0, -0, 3000, Number.MAX_SAFE_INTEGER, -Number.MAX_SAFE_INTEGER, 0.5, -1.5, 3.11, 22.5, 1.234567]) expect(anyString({ a: [n] }, never), String(n)).toBe(false);
+    expect(anyString({ a: 1.234567 }, (t) => t === '1.234567')).toBe(true);   // a short fractional is checked as its text
+    expect(LONG_NUMBER_DIGITS).toBe(MIN_VALUE_LENGTH);
+    expect(anyString({ a: 123.4567 }, never)).toBe(false);   // 7 digits
+    expect(anyString({ a: 1234.5678 }, never)).toBe(true);   // 8 digits
     const seen: string[] = [];
     anyString({ a: 12345678, b: 7n, c: true, d: null }, (t) => { seen.push(t); return false; });
     expect(seen.sort()).toEqual(['12345678', '7', 'a', 'b', 'c', 'd', 'true']);
