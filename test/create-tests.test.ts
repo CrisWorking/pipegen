@@ -111,6 +111,12 @@ describe('tests: the plan', () => {
     expect(m.ai.calls[0]?.user).toContain('"version": "5.0.5"');
     expect(strictProblems(testsSchema.jsonSchema)).toEqual([]);
   });
+  it('tests: a file without a final newline gets one, and CRLF becomes LF; helpers do not count as tests or assertions', async () => {
+    const plan = await make([ans([{ path: 'test/add.test.js', content: GOOD.replace(/\n$/, '').replace(/\n/g, '\r\n') }])]).run();
+    expect(plan.files[0]?.content).toBe(GOOD);
+    expect(countAssertions([cf('api/test/helpers/h.js', GOOD)])).toBe(0);
+    expect(countAssertions([cf('api/test/a.test.js', GOOD)])).toBe(3);
+  });
   it('tests: config edits limited to devDependencies and scripts (guard passes)', async () => {
     const plan = await make([ans([{ path: 'test/add.test.js', content: GOOD }])]).run();
     expect(plan.configEdits.map((f) => f.path)).toEqual(['api/package.json', 'api/package-lock.json']);

@@ -459,7 +459,7 @@ function analyzeProgram(rel: string, program: N, script: boolean, deps: readonly
     }
     return ident(c) && assertNames.has(c.name) && (e.arguments as N[]).some((a) => isNode(a) && !isLiteralish(a));
   };
-  const isDescribeCall = (n: unknown): boolean => isNode(n) && n.type === 'CallExpression' && (ident(n.callee, 'describe') || ident(n.callee, 'suite')
+  const isDescribeCall = (n: unknown): boolean => isNode(n) && n.type === 'CallExpression' && (ident(n.callee, 'describe')
     || (isNode(n.callee) && n.callee.type === 'MemberExpression' && !n.callee.computed && ident(n.callee.object, 'describe') && ident(n.callee.property, 'concurrent')));
   /** A test call must stand alone as a statement: at the top of the file, or directly in a describe body (never in a loop, condition or function). */
   const placedOk = (anc: readonly N[]): boolean => {

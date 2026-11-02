@@ -605,3 +605,62 @@ describe('security scan round 3 / 2: the API exemption is keyed on module and na
     expect(probs(`const { it, expect } = require('vitest');\nconst { test } = require('node:test');\nconst assert = require('node:assert');\nconst f = () => 1;\n${T2}`, 'test/a.test.cjs')).toEqual([]);
   });
 });
+
+// ---- mutation survivors: shape of a test, assertion forms, placement, union of readings ----
+describe('mutation survivors: tests and assertions', () => {
+  it('a test call must be an expression statement of its own', () => {
+    refused(ok("const r = it('a', () => { expect(f()).toBe(1); });"), /own in the file/);
+    refused(ok("f(it('a', () => { expect(f()).toBe(1); }));"), /own in the file/);
+    refused(ok("void it('a', () => { expect(f()).toBe(1); });"), /own in the file/);
+    expect(probs(ok("describe('g', () => { it('a', () => { expect(f()).toBe(1); }); });"))).toEqual([]);
+  });
+  it('the timeout is at most one number: a fourth argument is refused', () => {
+    refused(ok("it('a', () => { expect(f()).toBe(1); }, 5, 6);"), /written as it/);
+    refused(ok("it('a', () => { expect(f()).toBe(1); }, 5, () => {});"), /written as it/);
+  });
+  it('assertion forms that count: return, await, expect.soft, expect.poll, assert calls on real values; assert.fail and bare literals do not', () => {
+    const one = (code: string, head = ''): number => analyzeTestFile('test/a.test.js', `${head}import { it, expect } from 'vitest';\nimport assert, { ok as okk } from 'node:assert';\nconst f = () => 1;\nit('a', async () => { ${code} });\n`, []).assertions;
+    expect(one('return expect(f()).toBe(1);')).toBe(1);
+    expect(one('await expect(f()).resolves.toBe(1);')).toBe(1);
+    expect(one('expect.soft(f()).toBe(1);')).toBe(1);
+    expect(one('await expect.poll(() => f()).toBe(1);')).toBe(1);
+    expect(one('assert.equal(f(), 1);')).toBe(1);
+    expect(one('okk(f());')).toBe(1);
+    expect(one('assert(f());')).toBe(1);
+    expect(one('assert.fail(f());')).toBe(0);
+    expect(one("assert.equal(1, 1);")).toBe(0);
+    expect(one("okk(true);")).toBe(0);
+    expect(one("assert(1);")).toBe(0);
+    expect(one('expect.assertions(1); expect.hasAssertions();')).toBe(0);
+    expect(one('expect(f()).toBe(1); expect(f()).not.toBe(2); await expect(f()).resolves.toBe(1);')).toBe(3);
+  });
+  it('a CommonJS destructured require of node:assert binds its names', () => {
+    const src = "const { it, expect } = require('vitest');\nconst { strictEqual: eq, ok } = require('node:assert');\nconst f = () => 1;\nit('a', () => { eq(f(), 1); ok(f()); });\n";
+    expect(analyzeTestFile('test/a.test.cjs', src, [])).toMatchObject({ problems: [], tests: 1, assertions: 2 });
+  });
+  it('a TypeScript class with a private field is read, and its name is not a skip', () => {
+    expect(probs(ok("class K { #skip = 1; m() { return this.#skip; } }\nit('a', () => { expect(new K().m()).toBe(1); });"))).toEqual([]);
+  });
+  it('a computed template key with a hole is not statically readable; arithmetic keys fold', () => {
+    refused(ok("it('a', () => { const o = {}; o[`a${f()}`]; expect(f()).toBe(1); });"), /computed property access whose key can not be read/);
+    expect(probs(ok("it('a', () => { const o = {}; o[2 * 3]; o[5 - 1]; o[-2 * -3]; expect(f()).toBe(1); });"))).toEqual([]);
+  });
+  it('new.target is not import.meta', () => {
+    expect(probs(ok("function g() { return new.target; }\nit('a', () => { expect(g()).toBe(1); });")).join(' ')).not.toMatch(/import\.meta/);
+  });
+  it('a member call that http does not offer is refused by its name', () => {
+    refused(`${HEAD}import http from 'node:http';\nit('a', () => { http.foo(1); expect(f()).toBe(1); });\n`, /http\.foo is refused/);
+  });
+  it('the owner of a path is the deepest service that holds it', () => {
+    expect(starterOwner('api/test/test/a.test.ts', ['api', 'api/test'])).toEqual({ root: 'api/test', rel: 'test/a.test.ts' });
+    expect(starterOwner('api/test/test/a.test.ts', ['api/test', 'api'])).toEqual({ root: 'api/test', rel: 'test/a.test.ts' });
+  });
+  it('the union of the script and the module reading: counts are the smaller, problems are all', () => {
+    const hidden = `${CJS}const a = 1, b = 1;\na <!-- b; it('x', () => { expect(f()).toBe(1); });\n${T}\n`;
+    const r = analyzeTestFile('test/a.test.js', hidden, [], 'commonjs');
+    expect(r).toMatchObject({ problems: [], tests: 1, assertions: 1, parsed: true });   // the script reading hides one test
+    const evil = `${CJS}const a = 1, b = 1;\na <!-- b; globalThis;\n${T}\n`;
+    expect(analyzeTestFile('test/a.test.js', evil, [], 'commonjs').problems.join(' ')).toMatch(/globalThis/);
+    expect(analyzeTestFile('test/a.test.js', evil, [], 'module').problems.join(' ')).toMatch(/does not parse|globalThis/);
+  });
+});
