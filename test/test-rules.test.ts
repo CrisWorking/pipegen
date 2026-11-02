@@ -482,3 +482,89 @@ describe('security scan round 2 / 4: scheme, host and port are written out, and 
     for (const a of ["'http://example.com/x'", "'http://localhost.evil.net/'", "'http://localhost%2eevil.net/'", "`http://localhost:${f()}/x`", "'//localhost/x'", "'localhost'", "'ftp://localhost/'"]) refused(body(a), /local address|URL|built/);
   });
 });
+
+// ---- every entry of every rule table is probed (written out here, not read from the module, so a deleted entry is caught) ----
+describe('rule tables: every name', () => {
+  const body = (code: string): string => ok(`it('a', () => { const o = {}; ${code}; expect(1 + f()).toBe(2); });`);
+  const IDENTS = ['eval', 'Function', 'globalThis', 'global', 'window', 'self', 'Reflect', 'WebAssembly', 'Worker', 'SharedWorker', 'module', 'XMLHttpRequest', 'importScripts', 'fetch', 'WebSocket', 'EventSource', 'Symbol', 'Proxy'];
+  const SKIP_IDENTS = ['xit', 'xtest', 'xdescribe', 'fit', 'ftest', 'fdescribe'];
+  const SKIP_PROPS = ['skip', 'only', 'todo', 'skipIf', 'runIf', 'fails', 'each', 'for', 'fixme', 'retry', 'repeats'];
+  const BAD_PROPS = ['constructor', '__proto__', '__defineGetter__', '__defineSetter__', '__lookupGetter__', '__lookupSetter__', 'caller', 'callee', 'mainModule', 'binding', 'dlopen', '_load', '_linkedBinding', 'createRequire', 'require', 'getBuiltinModule', 'eval', 'Function',
+    'toMatchSnapshot', 'toMatchInlineSnapshot', 'toMatchFileSnapshot', 'toThrowErrorMatchingSnapshot', 'toThrowErrorMatchingInlineSnapshot', 'getOwnPropertyDescriptor', 'getOwnPropertyDescriptors', 'getOwnPropertyNames', 'getOwnPropertySymbols', 'getPrototypeOf', 'setPrototypeOf', 'defineProperty', 'defineProperties', 'fromCharCode', 'fromCodePoint'];
+  const BAD_STRINGS = ['constructor', '__proto__', 'eval', 'Function', 'binding', 'dlopen', 'mainModule', 'createRequire', 'getBuiltinModule', 'child_process'];
+  it('banned identifiers are refused by name', () => { for (const n of IDENTS) refused(body(`${n};`), /can run code or reach what the checks cover/); });
+  it('skip and focus identifiers are refused by name', () => { for (const n of SKIP_IDENTS) refused(body(`${n}('a', () => {});`), /skips or focuses tests/); });
+  it('skip members are refused as a member, as a computed key and as an option', () => {
+    for (const n of SKIP_PROPS) {
+      refused(body(`o.${n};`), new RegExp(`\\.${n} skips, focuses or repeats`));
+      refused(body(`o['${n}'];`), new RegExp(`\\.${n} skips, focuses or repeats`));
+      refused(body(`const w = { ${n}: 1 };`), new RegExp(`the name "${n}" is refused`));
+      refused(body(`const w = { '${n}': 1 };`), new RegExp(`the name "${n}" is refused`));
+    }
+  });
+  it('banned members are refused as a member, as a computed key and as an object key', () => {
+    for (const n of BAD_PROPS) {
+      refused(body(`o.${n};`), new RegExp(`\\.${n} is refused`));
+      refused(body(`o['${n}'];`), new RegExp(`\\.${n} is refused`));
+      refused(body(`const w = { ${n}: 1 };`), new RegExp(`the name "${n}" is refused`));
+    }
+  });
+  it('banned strings are refused as a literal and as a template', () => {
+    for (const n of BAD_STRINGS) { refused(body(`const w = '${n}';`), new RegExp(`the string "${n}" is refused`)); refused(body(`const w = \`${n}\`;`), new RegExp(`the string "${n}" is refused`)); }
+  });
+  it('process: exactly six members', () => {
+    for (const n of ['env', 'cwd', 'platform', 'nextTick', 'hrtime', 'uptime']) expect(probs(body(`process.${n};`)), n).toEqual([]);
+    for (const n of ['exit', 'argv', 'version', 'versions', 'pid', 'stdout', 'kill', 'binding', 'dlopen', 'emit', 'on', 'chdir', 'umask', 'memoryUsage']) refused(body(`process.${n};`), new RegExp(`process\\.${n} is refused`));
+  });
+  it('vi: exactly the listed helpers', () => {
+    for (const n of ['fn', 'spyOn', 'useFakeTimers', 'useRealTimers', 'advanceTimersByTime', 'advanceTimersToNextTimer', 'runAllTimers', 'runOnlyPendingTimers', 'setSystemTime', 'getMockedSystemTime', 'clearAllMocks', 'resetAllMocks', 'restoreAllMocks', 'isMockFunction', 'stubEnv', 'unstubAllEnvs']) expect(probs(body(`vi.${n};`)), n).toEqual([]);
+    for (const n of ['stubGlobal', 'unstubAllGlobals', 'doMock', 'importActual', 'importMock', 'hoisted', 'resetModules', 'unmock', 'doUnmock', 'waitFor', 'dynamicImportSettled', 'mocked']) refused(body(`vi.${n};`), new RegExp(`vi\\.${n} is refused`));
+  });
+  it('import.meta: url, dirname and filename only', () => {
+    for (const n of ['url', 'dirname', 'filename']) expect(probs(body(`import.meta.${n};`)), n).toEqual([]);
+    for (const n of ['resolve', 'glob', 'env', 'hot', 'main']) refused(body(`import.meta.${n};`), /import\.meta can only/);
+    refused(body('import.meta;'), /import\.meta can only/);
+    expect(probs(body('const u = new.target;'))).not.toEqual(expect.arrayContaining([expect.stringMatching(/import\.meta/)]));
+  });
+  it('the members of each global: the allowed ones pass, the rest are refused', () => {
+    const OK: Record<string, string[]> = {
+      JSON: ['parse', 'stringify'], Math: ['max', 'min', 'floor', 'random', 'PI', 'abs'],
+      Number: ['isInteger', 'isFinite', 'isNaN', 'isSafeInteger', 'parseFloat', 'parseInt', 'MAX_SAFE_INTEGER', 'MIN_SAFE_INTEGER', 'EPSILON', 'MAX_VALUE', 'MIN_VALUE', 'POSITIVE_INFINITY', 'NEGATIVE_INFINITY', 'NaN'],
+      String: ['raw'], Boolean: [], Array: ['isArray', 'from', 'of'], Object: ['keys', 'values', 'entries', 'assign', 'freeze', 'fromEntries', 'is', 'hasOwn'],
+      Promise: ['resolve', 'reject', 'all', 'allSettled', 'race', 'any', 'withResolvers'], Date: ['now', 'UTC', 'parse'], URL: [],
+    };
+    for (const [g, names] of Object.entries(OK)) {
+      for (const n of names) expect(probs(body(`${g}.${n};`)), `${g}.${n}`).toEqual([]);
+      if (g !== 'Math') refused(body(`${g}.zzNotListed;`), new RegExp(`${g}\\.zzNotListed is not on the list`));
+    }
+  });
+  it('every listed free global is accepted, and an unlisted one is refused', () => {
+    for (const n of ['undefined', 'NaN', 'Infinity', 'console', 'setTimeout', 'clearTimeout', 'setInterval', 'clearInterval', 'setImmediate', 'clearImmediate', 'queueMicrotask', 'structuredClone', 'Buffer', 'URLSearchParams', 'TextEncoder', 'TextDecoder', 'AbortController', 'AbortSignal', 'Headers', 'Request', 'Response', 'FormData', 'Blob', 'Map', 'Set', 'WeakMap', 'WeakSet', 'RegExp', 'Error', 'TypeError', 'RangeError', 'SyntaxError', 'ReferenceError', 'AggregateError', 'parseInt', 'parseFloat', 'isNaN', 'isFinite', 'encodeURIComponent', 'decodeURIComponent', 'encodeURI', 'decodeURI', 'BigInt', 'Uint8Array', 'Uint16Array', 'Uint32Array', 'Int8Array', 'Int16Array', 'Int32Array', 'Float32Array', 'Float64Array', 'ArrayBuffer', 'DataView', 'performance', '__dirname', '__filename']) {
+      expect(probs(body(`const w = ${n};`)), n).toEqual([]);
+    }
+    for (const n of ['Atomics', 'Intl', 'Iterator', 'Deno', 'Bun', 'navigator', 'crypto', 'SharedArrayBuffer', 'FinalizationRegistry', 'WeakRef', 'MessageChannel', 'BroadcastChannel', 'Worker2', 'zzz']) refused(body(`const w = ${n};`), new RegExp(`${n} is a global pipegen does not list`));
+  });
+  it('a global used as a bare value (not as an object, a callee, an argument or an instanceof operand) is refused', () => {
+    for (const g of ['Object', 'Math', 'JSON', 'Number', 'String', 'Boolean', 'Array', 'Promise', 'Date', 'URL']) {
+      refused(body(`const w = ${g};`), new RegExp(`${g} can only be used as`));
+      refused(body(`const w = [${g}];`), new RegExp(`${g} can only be used as`));
+      expect(probs(body(`f(${g}); const q = o instanceof ${g}; new ${g}(); ${g}(1);`)), g).toEqual([]);
+    }
+  });
+  it('the size cap is exact: 50 KB passes, one byte more does not', () => {
+    const pad = (n: number): string => `${ok(T)}//${'x'.repeat(Math.max(0, n - Buffer.byteLength(`${ok(T)}//`)))}`;
+    const exact = pad(50 * 1024);
+    expect(Buffer.byteLength(exact)).toBe(50 * 1024);
+    expect(analyzeTestFile('test/a.test.ts', exact, []).parsed).toBe(true);
+    expect(probs(`${exact}x`)).toEqual([expect.stringMatching(/over 50 KB/)]);
+  });
+  it('a builtin name in dependencies never allows a bare import, and .. at the service root leaves it', () => {
+    refused(ok(`import x from 'punycode';\n${T}`), /punycode/, 'test/a.test.ts', ['punycode']);
+    refused(ok(`import x from 'assert';\n${T}`), /"assert"/, 'test/a.test.ts', ['assert']);
+    expect(analyzeTestFile('a.test.js', ok("import x from '..';\nit('a', () => { expect(x).toBe(1); });").replace(HEAD, "import { it, expect } from 'vitest';\n"), []).problems.join(' ')).toMatch(/leaves the service folder/);
+    expect(analyzeTestFile('a.test.js', "import { it, expect } from 'vitest';\nimport x from '../x.js';\nit('a', () => { expect(x).toBe(1); });\n", [], 'module').problems.join(' ')).toMatch(/leaves the service folder/);
+  });
+  it('a with statement is refused in a script', () => {
+    refused(`${CJS}const o = {};\nwith (o) { f(); }\nit('a', () => { expect(f()).toBe(1); });`, /with statement/, 'test/a.test.cjs');
+  });
+});
