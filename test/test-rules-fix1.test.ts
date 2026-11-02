@@ -23,7 +23,7 @@ describe('C1: node:test is not allowed, and a vitest binding has a fixed member 
     refused("import { it, expect } from 'vitest';\nconst nt = require('node:test');\nit('runs', async () => { await nt.run({}).toArray(); expect(nt).toBeTruthy(); });\n", /node:test|require/, 'test/a.test.js');
     for (const spec of ["import { run } from 'node:test';", "import test from 'node:test';", "import * as nt from 'node:test';", "import { it as t } from 'node:test';", "import 'node:test';", "export * from 'node:test';"]) refused(`${HEAD}${spec}\nit('b', () => { expect(f()).toBe(1); });\n`, /node:test|may not export/);
     refused("const { it, expect } = require('vitest');\nconst { run } = require('node:test');\nconst f = () => 1;\nit('a', () => { expect(f()).toBe(1); });\n", /node:test/, 'test/a.test.cjs');
-    refused(body("await import('node:test')"), /node:test/);
+    refused(body("await import('node:test')"), /node:test|import\(\)/);
   });
   it('a vitest binding can only be called, or used with a listed member', () => {
     for (const code of ['it.run', 'test.run', 'it.mock', 'it.extend({})', 'it.scoped', "it['run']", "it['ru' + 'n']", 'expect.extend({})', 'expect.unreachable()', 'expect.getState()', 'expect.addSnapshotSerializer', 'describe.runIf(1)', 'beforeEach.run', 'const go = it', 'const go = expect', 'const go = describe', 'const t = [test]', 'f(it)', 'const { run } = it', 'const { extend } = expect', 'const { importActual } = vi', 'const v = vi', "vi['importActual']"]) {
@@ -78,7 +78,7 @@ describe('I2: describe has the shape of it, and callbacks take no parameters', (
     for (const d of ["describe('g', {}, () => { it('a', () => { expect(f()).toBe(1); }); });", "describe(name, () => { it('a', () => { expect(f()).toBe(1); }); });", "describe('g', handler);", "describe('g', (ctx) => { it('a', () => { expect(f()).toBe(1); }); });", "describe('g', () => { it('a', () => { expect(f()).toBe(1); }); }, 5, 6);", "describe('g', () => { it('a', () => { expect(f()).toBe(1); }); }, 'x');", "describe();", "describe.concurrent('g', {}, () => { it('a', () => { expect(f()).toBe(1); }); });", "describe('', () => { it('a', () => { expect(f()).toBe(1); }); });"]) {
       refused(`${HEAD}const name = 'x', handler = () => 1;\n${d}\n`, /describe is written as|no parameters|plain string/);
     }
-    expect(probs(`${HEAD}describe('g', () => { it('a', () => { expect(f()).toBe(1); }); });\ndescribe.concurrent('h', async function () { it('b', () => { expect(f()).toBe(1); }); }, 5000);\n`)).toEqual([]);
+    expect(probs(`${HEAD}describe('g', () => { it('a', () => { expect(f()).toBe(1); }); });\ndescribe.concurrent('h', async () => { it('b', () => { expect(f()).toBe(1); }); }, 5000);\n`)).toEqual([]);
   });
   it('test and hook callbacks take no parameters, and a hook is an inline function', () => {
     for (const code of ["it('a', (ctx) => { expect(f()).toBe(1); });", "it('a', async function (done) { expect(f()).toBe(1); });", "it('a', ({ skip }) => { expect(f()).toBe(1); });", "it('a', (...r) => { expect(f()).toBe(1); });", "beforeEach((ctx) => {});", "beforeEach(handler);", "beforeEach(() => {}, 1, 2);", "beforeEach();", "beforeEach(() => {}, 'x');"]) {
