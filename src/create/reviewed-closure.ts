@@ -1,7 +1,7 @@
 // The reviewed lock entries a lock edit may add (D1 fix round 1, B2): the closure of the pinned repo-code packages (vitest + @vitest/coverage-v8,
 // and c8), made and reviewed like the checker closures in data/npm-closures/ (#107): a complete npm lockfile v3 for one fixed package.json, dated
 // and cooldown-checked once. The guard checks MEMBERSHIP: every entry a lock edit adds must equal one reviewed entry (name@version), so the added
-// code is a subset of the reviewed code. D6 generates the data files (`npm install` is needed); until they exist `loadReviewedClosure` gives null and
+// code is a subset of the reviewed code. D6 generated the data files (scripts/npm-closure.ts, B2_CLOSURES); when they are missing `loadReviewedClosure` gives null and
 // the guard refuses every lock edit (fail closed).
 import { readFileSync } from 'node:fs';
 import { closureProblems, expectedPins, NpmClosureError, type NpmPin } from '../engine/npm-closure.js';

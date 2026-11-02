@@ -42,9 +42,10 @@
     const lock = JSON.parse(fs.readFileSync("package-lock.json", "utf8"));
     const want = JSON.parse(process.env.PIPEGEN_NPM_EXPECT);
     let bad = 0;
+    const pinOk = function(p, w) { return !(!p || p.link || p.inBundle || p.name && p.name !== w.name || p.version !== w.version || p.resolved !== w.resolved || p.integrity !== w.integrity); };
     for (const w of want) {
       const p = (lock.packages || {})["node_modules/" + w.name];
-      if (!p || p.link || p.inBundle || (p.name && p.name !== w.name) || p.version !== w.version || p.resolved !== w.resolved || p.integrity !== w.integrity) {
+      if (!pinOk(p, w)) {
         console.error("pipegen: " + w.name + " is not the reviewed " + w.version + " from the registry in package-lock.json (a link, an alias, another source or another hash)");
         bad = 1;
       }

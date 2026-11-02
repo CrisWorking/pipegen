@@ -21,6 +21,7 @@ import { codeownersCentralJudge, codeownersJudge } from './created-judges/codeow
 import { composeJudge } from './created-judges/compose.js';
 import { dependabotJudge } from './created-judges/dependabot.js';
 import { dockerfileJudge, dockerignoreJudge } from './created-judges/dockerfile.js';
+import { packageJsonJudge, packageLockJudge } from './created-judges/package.js';
 import { pipegenDocJudge } from './created-judges/pipegen-doc.js';
 import { createdPathProblem } from './job-rules.js';
 
@@ -98,8 +99,8 @@ export const CREATED_RULES: readonly CreatedRule[] = [
   { id: 'compose', repo: 'app', parts: ['compose'], mode: 'new', match: (p) => p === 'docker-compose.pipegen.yml', judge: composeJudge },
   // D5-D7: starter tests, and the package edits (every package change needs the user's own yes)
   { id: 'starter-tests', repo: 'app', parts: ['tests'], mode: 'new', match: (p, d) => isStarterTest(p, d), judge: refuseUntilBuilt('D7') },
-  { id: 'package-json', repo: 'app', parts: ['tests'], mode: 'edit', needsConfirm: true, match: (p, d) => claimable(p, d, 'package.json'), judge: refuseUntilBuilt('D6') },
-  { id: 'package-lock', repo: 'app', parts: ['tests'], mode: 'edit', needsConfirm: true, match: (p, d) => claimable(p, d, 'package-lock.json'), judge: refuseUntilBuilt('D6') },
+  { id: 'package-json', repo: 'app', parts: ['tests'], mode: 'edit', needsConfirm: true, match: (p, d) => claimable(p, d, 'package.json'), judge: packageJsonJudge },
+  { id: 'package-lock', repo: 'app', parts: ['tests'], mode: 'edit', needsConfirm: true, match: (p, d) => claimable(p, d, 'package-lock.json'), judge: packageLockJudge },
 ];
 
 /** The verdict on one file: `claimed` false means no rule matched; `problems` are the reasons to refuse it. */

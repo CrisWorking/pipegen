@@ -9,12 +9,12 @@
 //   `scripts.build`, any other script (lifecycle ones by name), `dependencies`, and the gate's `c8`, `prettier` and `renovate` sections included.
 //   The existing keys of the top level, of `scripts` and of `devDependencies` keep their relative order; only the added entries and the `test` slot may
 //   sit anywhere. Whitespace is not compared. A repeated key anywhere is refused. B2 scope: a package.json with `workspaces`, or a `packageManager`
-//   other than npm, is not edited. (D6's judge should rebuild the exact expected text and compare bytes, as the CODEOWNERS and dependabot judges do.)
+//   other than npm, is not edited. (D6: the judge in src/engine/created-judges/package.ts also rebuilds the exact expected text, package-edit.ts, and compares bytes.)
 // package-lock.json (lockfileVersion 3): added code must be REVIEWED code (see reviewed-closure.ts).
 //   - every top-level key but `packages` is equal; the root entry is equal but for devDependencies, which follow the package.json rule;
 //   - every pre-existing entry is present and deep-equal (nothing removed, nothing changed);
 //   - every new entry is a plain registry package (lockEntryProblems), equals one reviewed entry (name@version) but for npm's placement flags, and
-//     carries `dev: true` (`optional` may sit beside it; `devOptional` and `peer` are refused). The reviewed entry carries the resolved URL, the
+//     carries `dev: true` (`optional` and `peer` may sit beside it: npm marks the packages vitest reaches through its peer `vite` that way; `devOptional` is refused). The reviewed entry carries the resolved URL, the
 //     integrity, hasInstallScript and all dependency maps, so a forged edge or install script is not equal to it;
 //   - every non-optional edge of a new entry resolves (npm's nearest node_modules) to a new entry or an entry the user already has, and that
 //     version satisfies the range; a range that can not be read is refused. A new entry no added package reaches is refused;
@@ -22,7 +22,7 @@
 //   Without a reviewed closure every lock edit is refused.
 import { scrubActive } from '../util/known-values.js';
 import { isDeepStrictEqual } from 'node:util';
-import { lockEntryProblems } from '../engine/npm-closure.js';
+import { lockEntryProblems, pinOk } from '../engine/npm-closure.js';
 import { nameOfLockKey, withoutPlacement, type ReviewedClosure } from './reviewed-closure.js';
 import { satisfies } from './semver-min.js';
 
@@ -250,7 +250,7 @@ export function lockProblems(original: string, content: string, opts: LockOpts =
     const reviewed = closure.entries.get(id);
     if (reviewed === undefined) { out.push(`${show(key)} (${show(id)}) is not in the reviewed closure, so pipegen does not add it`); continue; }
     if (!same(sortedDeep(withoutPlacement(e)), sortedDeep(withoutPlacement(reviewed)))) out.push(`${show(key)} is not the reviewed ${show(id)}: its resolved address, integrity, install script or dependencies differ from the reviewed entry`);
-    if (e.dev !== true || e.devOptional !== undefined || e.peer !== undefined) out.push(`${show(key)} must be marked dev (and not devOptional or peer), so it never reaches a production install`);
+    if (e.dev !== true || e.devOptional !== undefined) out.push(`${show(key)} must be marked dev (and not devOptional), so it never reaches a production install`);
   }
 
   for (const name of addedOk) {
@@ -260,6 +260,11 @@ export function lockProblems(original: string, content: string, opts: LockOpts =
     if (!isObj(e)) { out.push(`the lock does not hold ${name} at node_modules/${name}`); continue; }
     if (e.version !== B2_DEVDEPS[name] || pinned.version !== B2_DEVDEPS[name]) out.push(`the lock holds ${name} ${show(String(e.version))}, not the reviewed ${B2_DEVDEPS[name]}`);
     if (e.integrity !== pinned.integrity) out.push(`the lock holds ${name} with another integrity than the reviewed one`);
+    // the same predicate the CI precheck runs (npm-closure.ts pinOk): a plain registry package at the reviewed version, tarball and integrity
+    const version = B2_DEVDEPS[name] as string;
+    if (e.version === version && e.integrity === pinned.integrity && !pinOk(e, { name, version, resolved: `https://registry.npmjs.org/${name}/-/${name.slice(name.indexOf('/') + 1)}-${version}.tgz`, integrity: pinned.integrity })) {
+      out.push(`the lock holds ${name} in a form the CI precheck refuses (a link, an alias, another source or another tarball)`);
+    }
   }
 
   // edges: every non-optional edge of a new entry lands on a new or an existing entry whose version satisfies the range; new entries must be reached

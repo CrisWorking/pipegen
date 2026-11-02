@@ -306,13 +306,18 @@ describe('lockProblems (B2, fix round 1): added entries must be reviewed code', 
     expect(out).toMatch(/node_modules\/vitest.*reviewed/);
     expect(out).toMatch(/evil-pkg.*not in the reviewed/);
   });
+  it('D6 (live npm 11.9): a dev entry that npm also marks peer (reached through vite, a peer of vitest) is accepted; devOptional stays refused', () => {
+    expect(lp(OLD, edit((l) => { l.packages['node_modules/tinyspy'].peer = true; }))).toBe('');
+    expect(lp(OLD, edit((l) => { l.packages['node_modules/tinyspy'].peer = true; l.packages['node_modules/tinyspy'].optional = true; }))).toBe('');
+    expect(lp(OLD, edit((l) => { l.packages['node_modules/tinyspy'].devOptional = true; l.packages['node_modules/tinyspy'].peer = true; }))).toMatch(/tinyspy.*dev/);
+  });
   it('P15: an entry with another version, no dev flag, devOptional, an install script the reviewed entry lacks, or another integrity is refused', () => {
     const cases: [string, (l: { packages: Record<string, Record<string, unknown>> }) => void, RegExp][] = [
       ['another version', (l) => { l.packages['node_modules/tinyspy'] = ent('tinyspy', '3.0.9', { dev: true }); }, /tinyspy.*not in the reviewed/],
       ['no dev flag', (l) => { delete l.packages['node_modules/tinyspy'].dev; }, /tinyspy.*dev/],
       ['devOptional', (l) => { delete l.packages['node_modules/tinyspy'].dev; l.packages['node_modules/tinyspy'].devOptional = true; }, /tinyspy.*dev/],
       ['dev beside devOptional', (l) => { l.packages['node_modules/tinyspy'].devOptional = true; }, /tinyspy.*dev/],
-      ['peer flag', (l) => { l.packages['node_modules/tinyspy'].peer = true; }, /tinyspy.*dev/],
+      ['peer flag without dev', (l) => { delete l.packages['node_modules/tinyspy'].dev; l.packages['node_modules/tinyspy'].peer = true; }, /tinyspy.*dev/],
       ['install script', (l) => { l.packages['node_modules/tinyspy'].hasInstallScript = true; }, /tinyspy.*reviewed/],
       ['integrity', (l) => { l.packages['node_modules/tinyspy'].integrity = sri('other'); }, /tinyspy.*reviewed/],
       ['bin added', (l) => { l.packages['node_modules/tinyspy'].bin = { x: 'evil.js' }; }, /tinyspy.*reviewed/],

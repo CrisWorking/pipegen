@@ -25,7 +25,7 @@
 import { isDeepStrictEqual } from 'node:util';
 import { ArtifactNameError, RANGE_CANARY_FILES, RANGE_FACTS_FILE, resultArtifactName, SECRETS_RANGE_ARTIFACT } from './artifact-names.js';
 import { ASSET_RE, COMMIT_SHA_RE, DIGEST_RE, isGitHubRepo, isNpmName, isPypiName, parseImageRef, pep503, SHA256_RE, SRI_SHA512_RE, TAG_RE } from './names.js';
-import { closureRootDependencies, loadNpmClosure, NpmClosureError, type NpmPin } from './npm-closure.js';
+import { closureRootDependencies, loadNpmClosure, NpmClosureError, pinOk, type NpmPin } from './npm-closure.js';
 import { EXPR, own, refuse, show } from './render-error.js';
 import type { RenderContext, RenderedStep, RenderResult } from './render-step.js';
 import { slotProblem, type SlotKind } from './slots.js';
@@ -1026,9 +1026,10 @@ const NPM_PRECHECK_JS = [
   'const lock = JSON.parse(fs.readFileSync("package-lock.json", "utf8"));',
   'const want = JSON.parse(process.env.PIPEGEN_NPM_EXPECT);',
   'let bad = 0;',
+  `const pinOk = ${pinOk.toString().replace(/^function pinOk/, 'function').replace(/\s*\n\s*/g, ' ')};`,
   'for (const w of want) {',
   '  const p = (lock.packages || {})["node_modules/" + w.name];',
-  '  if (!p || p.link || p.inBundle || (p.name && p.name !== w.name) || p.version !== w.version || p.resolved !== w.resolved || p.integrity !== w.integrity) {',
+  '  if (!pinOk(p, w)) {',
   '    console.error("pipegen: " + w.name + " is not the reviewed " + w.version + " from the registry in package-lock.json (a link, an alias, another source or another hash)");',
   '    bad = 1;',
   '  }',

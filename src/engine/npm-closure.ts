@@ -35,6 +35,17 @@ export function expectedPins(tool: ReviewedTool): NpmPin[] {
   ];
 }
 
+/** What a lock entry of a reviewed pin must be, as the CI precheck and the lock judge both read it. */
+export interface PinWant { name: string; version: string; resolved: string; integrity: string }
+/**
+ * The ONE predicate for "this lock entry is the reviewed pin" (B2, D6): a plain registry package (no link, no bundle, no alias) at the reviewed
+ * version, tarball and integrity. The CI precheck (render-cli.ts NPM_PRECHECK_JS) embeds this function's own source and runs it with `node -e`,
+ * and the lock judge (package-rules.ts) calls it, so the two can not drift. Keep it to plain JS with double-quoted strings: its text is embedded.
+ */
+export function pinOk(p: Record<string, unknown> | undefined, w: PinWant): boolean {
+  return !(!p || p.link || p.inBundle || (p.name && p.name !== w.name) || p.version !== w.version || p.resolved !== w.resolved || p.integrity !== w.integrity);
+}
+
 const NAME = '(?:@[a-z0-9][a-z0-9._-]*/)?[a-z0-9][a-z0-9._-]*';
 /** `node_modules/<name>` or `node_modules/<name>/node_modules/<name>…`: nothing else (no `.` or `..` segment, no absolute path, no other folder). */
 const KEY_RE = new RegExp(`^node_modules/(?:${NAME}/node_modules/)*(${NAME})$`);
