@@ -34,7 +34,8 @@ import { parse } from 'yaml';
 import { z } from 'zod';
 import type { CreatedFile, ReviewedTool } from '../types.js';
 import { packageDataPath } from '../util/package-data.js';
-import { safeText } from '../util/safe-text.js';
+// fix round 4 (B7): every cut of linter output (and of the files' paths) scrubs with the active vault first (the referee's)
+import { activeSafeText as safeText } from '../util/known-values.js';
 import { prepareTrustedDir, type TrustedDirKind } from '../util/trusted-dir.js';
 import { TarError, readTarMember } from '../util/tar.js';
 import { COOLDOWN_DAYS, downloadRelease } from './pin.js';

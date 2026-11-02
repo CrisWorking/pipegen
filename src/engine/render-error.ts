@@ -1,5 +1,5 @@
 // The renderer's shared leaf: its error type and the few helpers both renderers use (render-step.ts and render-cli.ts).
-// It imports only safe-text, so neither renderer has to import the other for them.
+// It imports only known-values (the cutter that scrubs with the active vault), so neither renderer has to import the other for them.
 import { activeSafeText as safeText } from '../util/known-values.js';
 
 export class RenderError extends Error {}

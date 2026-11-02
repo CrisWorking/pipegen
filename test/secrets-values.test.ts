@@ -1,14 +1,16 @@
 // D5: a vault value (or its base64 or URL form) inside any created file is an issue, in the guard and in the referee.
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { guardCreatedFiles, type GuardCtx } from '../src/create/guard.js';
 import { SecretVault } from '../src/create/secrets.js';
-import { activeSafeText } from '../src/util/known-values.js';
+import { activeSafeText, withActiveVault } from '../src/util/known-values.js';
+import { displayForm } from '../src/util/safe-text.js';
+import { runLinters } from '../src/engine/linters.js';
 import { CREATED_RULES } from '../src/engine/created-files.js';
-import { referee, type Linters } from '../src/engine/referee.js';
-import type { CreatedFile, PipelineDraft } from '../src/types.js';
+import { referee, type Linters, type RefereeDeps } from '../src/engine/referee.js';
+import type { CreatedFile, KnownValueCheck, PipelineDraft } from '../src/types.js';
 import { platform, profile, reviewedList, service } from './helpers/render.js';
 
 const dirs: string[] = [];
@@ -330,5 +332,120 @@ describe('B4 layer 1 in the judges: decoded text (YAML escapes, JSON escapes, dr
   it('guard: ESC in a raw Dockerfile', async () => {
     const r = await guardCreatedFiles([file(`FROM node:24\nENV X=${VAL.slice(0, 6)}\u001b${VAL.slice(6)}\n`)], guardCtx(vaultOf(VAL)));
     expect(r.ok).toEqual([]);
+  });
+});
+
+describe('fix round 4: ESC and C1 fail closed under a vault (B6), unparsed workflows (B7), linter output scrubbed', () => {
+  // every string of a result, as written (JSON) and as displayed: no four-character piece of the value
+  const strings = (r: unknown): string[] => { const out: string[] = []; const walk = (x: unknown): void => { if (typeof x === 'string') out.push(x); else if (Array.isArray(x)) x.forEach(walk); else if (typeof x === 'object' && x !== null) Object.values(x).forEach(walk); }; walk(r); return out; };
+  const noPiece = (r: unknown): void => {
+    const shown = [JSON.stringify(r), ...strings(r).map(displayForm)].join('\n');
+    for (let k = 0; k + 4 <= VAL.length; k++) expect(shown, VAL.slice(k, k + 4)).not.toContain(VAL.slice(k, k + 4));
+  };
+  const fixedOnly = (r: Awaited<ReturnType<typeof referee>>): void => {
+    expect(r.ok).toBe(false);
+    expect(r.issues.length).toBeGreaterThan(0);
+    expect(r.issues.every((i) => i.check === 'secret-value' && /you gave pipegen/.test(i.message))).toBe(true);
+    noPiece(r);
+  };
+  // the reviewer's B6 repro: ESC eats the first character, a CSI / OSC / C1 CSI splits the rest
+  const combos: [string, string][] = [
+    ['ESC + CSI', `\u001b${VAL.slice(0, 11)}\u001b[0m${VAL.slice(11)}`],
+    ['ESC + OSC', `\u001b${VAL.slice(0, 11)}\u001b]0;t\u0007${VAL.slice(11)}`],
+    ['ESC + C1 CSI', `\u001b${VAL.slice(0, 11)}\u009b0m${VAL.slice(11)}`],
+  ];
+  const wf = (body: string, over: Partial<CreatedFile> = {}): CreatedFile => ({ path: '.github/workflows/ci.yml', content: body, part: 'pipeline', reason: 'r', repo: 'central', ...over });
+  const deps = (v: KnownValueCheck | undefined, runL: RefereeDeps['runLinters'] = async () => []) => ({ runLinters: runL, ...(v === undefined ? {} : { vault: v }) });
+
+  for (const [name, combo] of combos) {
+    it(`B6 ${name}: draft string, draft key, job id, step name (decoded YAML) and a raw file give the fixed issue, 0 pieces shown`, async () => {
+      const d = mkDraft();
+      (d as unknown as { steps: unknown[] }).steps = [{ needId: combo }];
+      fixedOnly(await referee([file('FROM node:24\n')], d, platform(), reviewedList(), LINTERS, 'tok', deps(vaultOf(VAL))));
+      const k = mkDraft();
+      (k as unknown as { notProven: unknown[] }).notProven = [{ [combo]: 1 }];
+      fixedOnly(await referee([file('FROM node:24\n')], k, platform(), reviewedList(), LINTERS, 'tok', deps(vaultOf(VAL))));
+      // written as YAML double-quoted escapes (\u001b, \x9b): the raw text holds no ESC or C1, the decoded job id and step name do
+      const yq = (t: string): string => JSON.stringify(t).replace(/[\u0080-\u009f]/g, (c) => `\\x${c.charCodeAt(0).toString(16)}`);
+      const w = wf(`name: ci\non: [push]\njobs:\n  ${yq(combo)}:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n        name: ${yq(combo)}\n`);
+      expect(w.content).not.toMatch(/[\u001b\u0080-\u009f]/);
+      fixedOnly(await ref([w], vaultOf(VAL)));
+      fixedOnly(await ref([file(`FROM node:24\nENV X=${combo}\n`)], vaultOf(VAL)));
+      // a decoded YAML string in another .yml (compose)
+      fixedOnly(await ref([file(`services:\n  api:\n    image: ${yq(combo)}\n`, { path: 'docker-compose.pipegen.yml', part: 'compose' })], vaultOf(VAL)));
+    });
+
+    it(`B6 ${name}: the guard refuses a raw file holding it with the fixed reason, 0 pieces shown`, async () => {
+      const r = await guardCreatedFiles([file(`FROM node:24\nENV X=${combo}\n`)], guardCtx(vaultOf(VAL)));
+      expect(r.ok).toEqual([]);
+      expect(r.refused[0]?.reason).toMatch(/value you gave pipegen/);
+      noPiece(r);
+    });
+  }
+
+  it('B6: the taint passes fail closed themselves, also with a check that only matches the value as written', async () => {
+    const plain: KnownValueCheck = { containsKnownValue: (t) => t.includes(VAL), scrubber: () => (t) => t.split(VAL).join('[REDACTED]') };
+    const r = await referee([file(`FROM node:24\n# \u001b[0m\n`)], mkDraft(), platform(), reviewedList(), LINTERS, 'tok', deps(plain));
+    expect(r.issues.map((i) => i.check)).toEqual(['secret-value']);
+    const d = mkDraft();
+    (d as unknown as { steps: unknown[] }).steps = [{ needId: 'x\u0085y' }];
+    expect((await referee([file('FROM node:24\n')], d, platform(), reviewedList(), LINTERS, 'tok', deps(plain))).issues.map((i) => i.check)).toEqual(['secret-value']);
+    const g = await guardCreatedFiles([file('FROM node:24\n# \u009b0m\n')], { ...guardCtx(), vault: plain });
+    expect(g.ok).toEqual([]);
+    expect(g.refused[0]?.reason).toMatch(/value you gave pipegen/);
+  });
+
+  it('B6: with no vault, a file holding ESC is judged as before (no secret-value issue, the guard does not refuse it for that)', async () => {
+    const r = await ref([file('FROM node:24\n# \u001b[0m\n')]);
+    expect(r.issues.some((i) => i.check === 'secret-value')).toBe(false);
+    const g = await guardCreatedFiles([file('FROM node:24\n# \u001b[0m\n')], guardCtx());
+    expect(g.refused.some((x) => /value you gave pipegen/.test(x.reason))).toBe(false);
+  });
+
+  // B7: the value written with every second character as a YAML \x escape (the raw text holds runs of 2), in a file the strict parse refuses
+  const enc = [...VAL].map((c, i) => (i % 2 === 1 ? `\\x${c.charCodeAt(0).toString(16)}` : c)).join('');
+  const lintBait = (pre: string): string => `${pre}\non: [push]\npermissions: {}\njobs:\n  build:\n    runs-on: "${'j'.repeat(272)}${enc}"\n    steps:\n      - run: echo hi\n`;
+
+  it('B7: a workflow or action the strict parse refuses is decoded leniently in the taint pass (a tag, an anchor, two documents)', async () => {
+    for (const pre of ['name: !!str ci', 'name: &a ci', '---\nname: ci\n---\nname: ci']) fixedOnly(await ref([wf(lintBait(pre))], vaultOf(VAL)));
+    const action = `name: !!str a\ndescription: "${enc}"\nruns:\n  using: composite\n  steps:\n    - run: echo hi\n      shell: bash\n`;
+    fixedOnly(await ref([wf(action, { path: '.github/actions/x/action.yml' })], vaultOf(VAL)));
+    // another .yml file with two documents (the plain one-document parse throws on it)
+    fixedOnly(await ref([file(`services: {}\n---\nx: "${enc}"\n`, { path: 'docker-compose.pipegen.yml', part: 'compose' })], vaultOf(VAL)));
+  });
+
+  it('B7: with a vault, a workflow the strict parse refuses is not sent to the linters; it gets the parse-failure issue only. Without a vault it is linted as before', async () => {
+    const bad = wf('name: !!str ci\non: [push]\npermissions: {}\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n');
+    const seen: string[][] = [];
+    const spy = async (files: CreatedFile[]) => { seen.push(files.map((f) => f.path)); return [{ file: bad.path, check: 'actionlint' as const, message: 'linted' }]; };
+    const r = await referee([bad], mkDraft(), platform(), reviewedList(), LINTERS, 'tok', deps(vaultOf(VAL), spy));
+    expect(seen).toEqual([]);
+    expect(r.issues.some((i) => i.check === 'injection' && /pipegen refuses this file/.test(i.message))).toBe(true);
+    expect(r.issues.some((i) => i.message === 'linted')).toBe(false);
+    const n = await referee([bad], mkDraft(), platform(), reviewedList(), LINTERS, 'tok', deps(undefined, spy));
+    expect(seen).toEqual([[bad.path]]);
+    expect(n.issues.some((i) => i.message === 'linted')).toBe(true);
+  });
+
+  const AL = join(homedir(), '.cache/pipegen/tools/actionlint-1.7.12/actionlint');
+  it.skipIf(!existsSync(AL))('B7 repro with the real actionlint (a tag or an anchor plus the escaped value): 0 pieces shown', async () => {
+    const real: Linters = { actionlint: async () => AL, zizmor: async () => '/nonexistent/zizmor' };
+    for (const pre of ['name: !!str ci', 'name: &a ci']) {
+      const r = await referee([wf(lintBait(pre))], mkDraft(), platform(), reviewedList(), real, null, { vault: vaultOf(VAL) });
+      fixedOnly(r);
+    }
+  }, 120_000);
+
+  it('B7: linters.ts cuts its output with the active vault: a value across the 80- and the 300-character cuts never shows', async () => {
+    const odd = file('FROM node:24\n', { path: `x/${'j'.repeat(60)}${VAL}.txt`, repo: 'central' });
+    const good = wf('name: ci\non: [push]\njobs: {}\n');
+    const failing: Linters = { actionlint: async () => { throw new Error(`${'j'.repeat(260)}${VAL}`); }, zizmor: async () => '/nonexistent/zizmor' };
+    const plain = await runLinters([odd, good], failing, null);
+    // the control: without an active vault both cuts leave a piece of the value
+    expect(plain.some((i) => i.message.includes(VAL.slice(0, 4)))).toBe(true);
+    expect(plain.filter((i) => i.message.includes(VAL.slice(0, 4))).length).toBe(2);
+    const scrubbed = await withActiveVault(vaultOf(VAL), () => runLinters([odd, good], failing, null));
+    expect(scrubbed.length).toBe(plain.length);
+    noPiece(scrubbed);
   });
 });

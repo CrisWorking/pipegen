@@ -33,7 +33,7 @@ import { createdPathProblem } from '../engine/job-rules.js';
 import { CODE_FILE_RE, isTestFile } from '../read/manifest.js';
 import { readTextLimitedWithReason, SKIP_REASON, READ_LIMITS } from '../read/limits.js';
 import type { CreatedFile, InstallRecord, KnownValueCheck, PipelineDraft, RepoProfile } from '../types.js';
-import { anyString, scrubActive, scrubForDisplay, withActiveVault } from '../util/known-values.js';
+import { anyString, scrubActive, scrubForDisplay, vaultHolds, withActiveVault } from '../util/known-values.js';
 import { lockProblems, packageJsonProblems } from './package-rules.js';
 import type { ReviewedClosure } from './reviewed-closure.js';
 
@@ -198,7 +198,8 @@ async function guardFiles(files: readonly CreatedFile[], ctx: GuardCtx): Promise
   let rootOk = true;
   try { rootOk = (await stat(ctx.root)).isDirectory(); } catch { rootOk = false; }
 
-  const holds = (t: unknown): boolean => typeof t === 'string' && ctx.vault?.containsKnownValue(t) === true;
+  // fix round 4 (B6): ESC or a C1 control counts as a value (vaultHolds), whatever the check does
+  const holds = (t: unknown): boolean => typeof t === 'string' && vault !== undefined && vaultHolds(vault, t);
   // a package file shows its keys and strings AFTER JSON decoding (a \\u escape): every parsed key and string is checked before any judge reads it
   const decodedHolds = (f: CreatedFile): boolean => {
     if (ctx.vault === undefined || typeof f.content !== 'string' || typeof f.path !== 'string' || !/(?:^|\/)package(?:-lock)?\.json$/.test(f.path)) return false;

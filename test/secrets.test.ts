@@ -14,6 +14,7 @@ import { activeSafeText, anyString, scrubForDisplay, withActiveVault } from '../
 import { show } from '../src/engine/render-error.js';
 import { packageJsonProblems } from '../src/create/package-rules.js';
 import { runExitHooks } from '../src/util/exit-hooks.js';
+import { R } from '../src/ai/redact-core.js';
 import type { CreatedFile, Dependency, DependencyKind, Service } from '../src/types.js';
 import { makeOctokit } from '../src/github/client.js';
 import { fakeFetch, fakeOctokit, type Call, type Routes } from './helpers/fake-http.js';
@@ -773,7 +774,7 @@ describe('B4 layer 1: containsKnownValue sees decoded and altered forms', () => 
     expect(anyString({ ['needle']: 1 }, (t) => t === 'needle')).toBe(true);
     let deep: unknown = 'needle';
     for (let i = 0; i < 100_000; i++) deep = [deep];
-    expect(anyString(deep, (t) => t === 'needle')).toBe(false);   // no stack overflow; beyond the 64-level cap it stops looking
+    expect(anyString(deep, () => false)).toBe(true);   // no stack overflow; beyond the 64-level cap it stops looking and fails closed (fix round 4, m1)
     let near: unknown = 'needle';
     for (let i = 0; i < 30; i++) near = { k: [near] };
     expect(anyString(near, (t) => t === 'needle')).toBe(true);
@@ -824,5 +825,91 @@ describe('B4 layer 2: every cutter scrubs with the active vault before it cuts',
     expect(() => withActiveVault(vault, () => { throw new Error('x'); })).toThrow();
     expect(show(`${'j'.repeat(50)}${VAL}`)).toContain(VAL.slice(0, 4));
     withActiveVault(vault, () => withActiveVault(undefined, () => expect(show(`${'j'.repeat(50)}${VAL}`)).toContain(VAL.slice(0, 4))));
+  });
+});
+
+describe('fix round 4: fail closed on ESC and C1 (B6), anyString caps (m1), every form scrubbed (m2)', () => {
+  const VAL = 'Zq7Rk2mW9xLp4Tn8Hy6Vb3Nc';
+  const noPiece = (shown: string): void => { for (let k = 0; k + 4 <= VAL.length; k++) expect(shown, VAL.slice(k, k + 4)).not.toContain(VAL.slice(k, k + 4)); };
+  // the reviewer's B6 repro: ESC eats the value's first character, a CSI (or OSC, or a C1 CSI) splits the rest
+  const combos: [string, string][] = [
+    ['ESC + CSI', `\u001b${VAL.slice(0, 11)}\u001b[0m${VAL.slice(11)}`],
+    ['ESC + OSC', `\u001b${VAL.slice(0, 11)}\u001b]0;t\u0007${VAL.slice(11)}`],
+    ['ESC + C1 CSI', `\u001b${VAL.slice(0, 11)}\u009b0m${VAL.slice(11)}`],
+  ];
+  function v(): SecretVault {
+    const x = new SecretVault();
+    x.set('K_LONG', VAL);
+    return x;
+  }
+
+  it('the repro beats every decoding form: the display shows 23 characters', () => {
+    expect(displayForm(combos[0][1])).toBe(VAL.slice(1));
+  });
+
+  it('layer 1: with a vault, a text holding ESC or any C1 control counts as holding a value', () => {
+    const vault = v();
+    for (const [name, text] of combos) expect(vault.containsKnownValue(`x ${text} y`), name).toBe(true);
+    for (const ch of ['\u001b', '\u0080', '\u0085', '\u009b', '\u009d', '\u009f']) expect(vault.containsKnownValue(`plain ${ch} text`), JSON.stringify(ch)).toBe(true);
+    expect(vault.containsKnownValue('plain text with \u007f and \u00a0 only')).toBe(false);   // DEL and U+00A0 are outside the rule
+    expect(new SecretVault().containsKnownValue('plain \u001b[0m text')).toBe(true);   // a vault given, even an empty one: fail closed
+    expect(new SecretVault().containsKnownValue('anything')).toBe(false);
+  });
+
+  it('layer 2: with an active vault, every cutter shows the whole text as [REDACTED] when it holds ESC or a C1 control', () => {
+    const vault = v();
+    withActiveVault(vault, () => {
+      for (const [name, text] of combos) {
+        for (const lead of [0, 40, 59]) {
+          const raw = `${'j'.repeat(lead)}${text}`;
+          expect(activeSafeText(raw), name).toBe('[REDACTED]');
+          expect(activeSafeText(raw, 60), name).toBe('[REDACTED]');
+          expect(show(raw), name).toBe(JSON.stringify('[REDACTED]'));
+          noPiece(show(raw));
+        }
+      }
+      expect(activeSafeText('no value, just \u001b[1mbold')).toBe('[REDACTED]');
+      expect(activeSafeText('x\u0090y')).toBe('[REDACTED]');
+      expect(activeSafeText('plain text')).toBe('plain text');
+    });
+    expect(R).toBe('[REDACTED]');   // the placeholder is the scrubber's own marker
+    for (const [name, text] of combos) expect(scrubForDisplay(vault, `pre ${text} post`), name).toBe('[REDACTED]');
+    expect(scrubForDisplay(new SecretVault(), 'a \u001b b')).toBe('[REDACTED]');
+  });
+
+  it('with no active vault the cutters are unchanged (the display still eats the sequence)', () => {
+    expect(activeSafeText(combos[0][1])).toBe(VAL.slice(1));
+    expect(activeSafeText('a\u001b[1mb')).toBe('ab');
+    withActiveVault(v(), () => withActiveVault(undefined, () => expect(activeSafeText('a\u001b[1mb')).toBe('ab')));
+  });
+
+  it('m1: anyString fails closed when its node cap or depth cap is hit', () => {
+    expect(anyString(new Array(1_000_001).fill('a'), () => false)).toBe(true);   // 1,000,002 nodes
+    expect(anyString(new Array(999_998).fill('a'), () => false)).toBe(false);    // 999,999 nodes: under the cap
+    const nest = (n: number): unknown => { let x: unknown = 'a'; for (let i = 0; i < n; i++) x = [x]; return x; };
+    expect(anyString(nest(64), () => false)).toBe(false);   // the innermost array is at depth 63
+    expect(anyString(nest(65), () => false)).toBe(true);    // an object at depth 64: not looked into, so it counts as holding
+    const obj = (n: number): unknown => { let x: unknown = 'a'; for (let i = 0; i < n; i++) x = { k: x }; return x; };
+    expect(anyString(obj(64), () => false)).toBe(false);
+    expect(anyString(obj(65), () => false)).toBe(true);
+  });
+
+  it('layer 2 fails closed when the scrub does not settle: a scrubber that changes the text every round gives one [REDACTED]', () => {
+    const restless = { scrubber: () => (t: string): string => `${t}.` };
+    expect(scrubForDisplay(restless, 'abc', (t) => t)).toBe('[REDACTED]');
+    withActiveVault(restless, () => expect(activeSafeText('abc')).toBe('[REDACTED]'));
+  });
+
+  it('m2: layer 2 scrubs every form layer 1 checks: a value split by a ZWSP and in mixed NFC/NFD', () => {
+    const value = 'caf\u00e9-cl\u00e9-12345-xyz';   // NFC
+    const vault = new SecretVault();
+    vault.set('K_UNI', value);
+    // the first é composed, the second decomposed, and a ZWSP inside: neither the NFC nor the NFD value is in the raw or stripped text
+    const mixed = `caf\u00e9-\u200bcle\u0301-12345-xyz`;
+    expect(mixed.normalize('NFC')).not.toBe(value);
+    expect(vault.containsKnownValue(`x ${mixed} y`)).toBe(true);
+    const pieces = (shown: string): void => { const n = shown.normalize('NFC'); for (let k = 0; k + 4 <= value.length; k++) expect(n, value.slice(k, k + 4)).not.toContain(value.slice(k, k + 4)); };
+    pieces(scrubForDisplay(vault, `x ${mixed} y`, (t) => t));
+    withActiveVault(vault, () => pieces(activeSafeText(`x ${mixed} y`)));
   });
 });

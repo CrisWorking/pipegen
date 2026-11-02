@@ -19,7 +19,7 @@ import { isDangerousName } from '../engine/job-rules.js';
 import { NAME_RE } from '../read/manifest.js';
 import type { CreatedFile, Dependency, KnownValueCheck, RepoProfile } from '../types.js';
 import { onExit } from '../util/exit-hooks.js';
-import { textForms } from '../util/known-values.js';
+import { holdsEscape, textForms } from '../util/known-values.js';
 import { displayForm, safeText } from '../util/safe-text.js';
 import { composeCoveredNames } from './compose.js';
 import { ENV_TABLE, isDepKey } from './compose-tables.js';
@@ -164,9 +164,15 @@ export class SecretVault implements KnownValueCheck {
     this.#scrub ??= knownValueScrubber([...new Set([...this.#values.values()].flatMap((b) => { const v = b.toString('utf8'); return [v, v.normalize('NFC'), v.normalize('NFD')]; }))]);
     return this.#scrub;
   }
-  /** Whether `text` holds a value (or its base64 or URL form): as written, as displayed, with controls and invisibles removed, or in NFC form. Used by the guard and the referee. */
+  /**
+   * Whether `text` holds a value (or its base64 or URL form): as written, as displayed, with controls and invisibles removed, or in NFC form.
+   * Fails closed: a text with ESC or a C1 control counts as holding one, even in an empty vault (an escape sequence can eat and split a value
+   * so that no form shows it). Used by the guard and the referee.
+   */
   containsKnownValue(text: string): boolean {
-    if (this.#values.size === 0 || typeof text !== 'string') return false;
+    if (typeof text !== 'string') return false;
+    if (holdsEscape(text)) return true;
+    if (this.#values.size === 0) return false;
     const scrub = this.scrubber();
     return textForms(text).some((t) => scrub(t) !== t);
   }

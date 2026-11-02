@@ -30,8 +30,7 @@
 import { isDeepStrictEqual } from 'node:util';
 import { isMap, isScalar, LineCounter, visit, type Document, type Node as YamlNode, type Pair } from 'yaml';
 import { findSecretLike } from '../ai/redact.js';
-import { parse as parseYamlPlain } from 'yaml';
-import { activeSafeText as safeText, anyString, scrubForDisplay, withActiveVault } from '../util/known-values.js';
+import { activeSafeText as safeText, anyString, anyYamlScalar, scrubForDisplay, vaultHolds, withActiveVault } from '../util/known-values.js';
 import { GATE_CHECK_NAME, type CreatedFile, type KnownValueCheck, type OutputFormat, type PipegenInserted, type PipelineDraft, type ReviewedTool, type RuntimeEnv, type StepSpec } from '../types.js';
 import { ArtifactNameError, slug } from './artifact-names.js';
 import { FINDINGS_CATEGORIES, gateJobList, GateJobListError, jobIdFor, PIPEGEN_JOB_CATEGORIES, readableFormat, type JobListEntry } from './gate-job-list.js';
@@ -1419,17 +1418,19 @@ async function judgeFiles(allFiles: CreatedFile[], draft: PipelineDraft, platfor
   // D5 (S8, I1, B1): a file whose path, text, reason or repo holds a value the user gave pipegen (in any form, or only once displayed) gets ONE fixed
   // issue, and so does a draft that holds one. The WHOLE draft is then refused and nothing else is judged: no other check reads the text, so no
   // other message can quote a piece of the value.
-  const holds = (t: unknown): boolean => vault !== undefined && typeof t === 'string' && vault.containsKnownValue(t);
+  // fix round 4 (B6): ESC or a C1 control counts as a value (vaultHolds), whatever the check does
+  const holds = (t: unknown): boolean => vault !== undefined && typeof t === 'string' && vaultHolds(vault, t);
   // the text a file shows AFTER it is decoded: YAML escapes in a workflow or action, JSON escapes in a package file (parsed, then every key and string checked)
   const decodedHolds = (f: CreatedFile): boolean => {
     if (vault === undefined || typeof f?.content !== 'string' || typeof f.path !== 'string') return false;
     try {
       if (fileKind(f) !== null) {
         const r = parseYaml(f.content, f.inserted === undefined ? 'strict' : 'user');
-        return 'parsed' in r && anyString(r.parsed.js, holds);
+        // fix round 4 (B7): a file the strict parse refuses is still decoded, leniently (a linter or a judge may decode it its own way)
+        return 'parsed' in r ? anyString(r.parsed.js, holds) : anyYamlScalar(f.content, holds);
       }
       if (/(?:^|\/)package(?:-lock)?\.json$/.test(f.path)) return anyString(JSON.parse(f.content), holds);
-      if (/\.ya?ml$/i.test(f.path)) return anyString(parseYamlPlain(f.content, { maxAliasCount: 50 }), holds);
+      if (/\.ya?ml$/i.test(f.path)) return anyYamlScalar(f.content, holds);
     } catch { /* unreadable text is checked as written only */ }
     return false;
   };
@@ -1484,8 +1485,9 @@ async function judgeFiles(allFiles: CreatedFile[], draft: PipelineDraft, platfor
     if (f.edited !== undefined) add(f.path, 'template', 'Only a file of a registered kind can carry the edited marker; an edit to a workflow uses the inserted mark.', undefined, f.repo);
     // `inserted` marks an edited user WORKFLOW only; on a composite action it would relax the strict parse (anchors, aliases), so it is refused before the parse
     if (kind === 'action' && f.inserted !== undefined) { add(f.path, 'template', 'Only a workflow file can carry the mark of an edited user workflow.', undefined, f.repo); continue; }
-    lintable.push(f);
     const r = parseYaml(f.content, f.inserted === undefined ? 'strict' : 'user');
+    // fix round 4 (B7): with a vault, a file pipegen can not parse is not linted (a linter decodes and quotes it its own way); the parse issue says enough
+    if (vault === undefined || !('problems' in r)) lintable.push(f);
     if ('problems' in r) {
       for (const p of r.problems) add(f.path, 'injection', `pipegen refuses this file: ${p}.`);
       continue;
