@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<testsuites name="jest tests" tests="5" failures="1" errors="0" time="0.413">
+  <testsuite name="math" errors="0" failures="1" skipped="1" timestamp="2026-11-02T23:39:49" time="0.27" tests="5">
+    <testcase classname="math adds" name="math adds" time="0.002">
+    </testcase>
+    <testcase classname="math fails on purpose" name="math fails on purpose" time="0.002">
+      <failure>Error: expect(received).toBe(expected) // Object.is equality
+
+Expected: 3
+Received: 2
+      </failure>
+    </testcase>
+    <testcase classname="math is skipped" name="math is skipped" time="0">
+      <skipped/>
+    </testcase>
+    <testcase classname="math nested deeper multiplies" name="math nested deeper multiplies" time="0">
+    </testcase>
+    <testcase classname="math nested __proto__" name="math nested __proto__" time="0.001">
+    </testcase>
+  </testsuite>
+</testsuites>

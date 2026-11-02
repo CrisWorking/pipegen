@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<testsuites name="vitest tests" tests="5" failures="1" errors="0" time="0.010454313">
+    <testsuite name="test/math.test.js" timestamp="2026-11-02T23:39:48.907Z" hostname="host" tests="5" failures="1" errors="0" skipped="1" time="0.010454313">
+        <testcase classname="test/math.test.js" name="math &gt; adds" time="0.00162618">
+        </testcase>
+        <testcase classname="test/math.test.js" name="math &gt; fails on purpose" time="0.006592885">
+            <failure message="expected 2 to be 3 // Object.is equality" type="AssertionError">
+AssertionError: expected 2 to be 3 // Object.is equality
+
+- Expected
++ Received
+
+- 3
++ 2
+
+ ❯ test/math.test.js:3:48
+            </failure>
+        </testcase>
+        <testcase classname="test/math.test.js" name="math &gt; is skipped" time="0">
+            <skipped/>
+        </testcase>
+        <testcase classname="test/math.test.js" name="math &gt; nested &gt; deeper &gt; multiplies" time="0.000255005">
+        </testcase>
+        <testcase classname="test/math.test.js" name="math &gt; nested &gt; __proto__" time="0.000199659">
+        </testcase>
+    </testsuite>
+</testsuites>
