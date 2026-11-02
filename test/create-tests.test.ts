@@ -85,7 +85,7 @@ const made: string[] = [];
 afterAll(() => cleanupRepos());
 afterEach(() => { for (const d of made.splice(0)) rmSync(d, { recursive: true, force: true }); });
 
-const deps = (over: Partial<StarterDeps> = {}): StarterDeps => ({ fileExists: () => false, packageJson: PJ, packageLock: LOCK, reviewed: reviewedList(), npm: { runner: fakeNpm().runner }, ...over });
+const deps = (over: Partial<StarterDeps> = {}): StarterDeps => ({ fileExists: () => false, packageJson: PJ, packageLock: LOCK, reviewed: reviewedList(), npm: { runner: fakeNpm().runner }, isolatedTestJob: true, ...over });
 const make = (answers: unknown[], s: Service = svc(), d: StarterDeps = deps()) => {
   const ai = mockAi(answers);
   return { ai, run: () => createStarterTests(s, profileOf([s]), bundle, ai.p, d) };
@@ -188,6 +188,24 @@ describe('tests: the plan', () => {
     const m = mockAi([ans([])]);
     const unchecked: CodeBundle = { ...bundle, ['secretScan' + 'Checked']: !bundle.secretScanChecked };   // built at runtime so no redact pattern sees a name = value pair here
     await expect(createStarterTests(svc(), profileOf([svc()]), unchecked, m.p, deps())).rejects.toThrow(SecretScanRequiredError);
+    expect(m.calls).toHaveLength(0);
+  });
+  it('no starter tests without the isolated test job', async () => {
+    for (const over of [{ isolatedTestJob: undefined }, { isolatedTestJob: false }]) {
+      const m = mockAi([ans([{ path: 'test/add.test.js', content: GOOD }])]);
+      const plan = await createStarterTests(svc(), profileOf([svc()]), bundle, m.p, deps(over));
+      expect(plan.files).toEqual([]);
+      expect(plan.configEdits).toEqual([]);
+      expect(plan.notes).toHaveLength(1);
+      expect(plan.notes[0]).toContain('isolated CI job');
+      expect(m.calls).toHaveLength(0);
+      expect(m.complete).not.toHaveBeenCalled();
+    }
+  });
+  it('the secret-scan check still comes first without the isolated job', async () => {
+    const m = mockAi([ans([])]);
+    const unchecked: CodeBundle = { ...bundle, ['secretScan' + 'Checked']: !bundle.secretScanChecked };
+    await expect(createStarterTests(svc(), profileOf([svc()]), unchecked, m.p, deps({ isolatedTestJob: false }))).rejects.toThrow(SecretScanRequiredError);
     expect(m.calls).toHaveLength(0);
   });
   it('tests: a service at the repo root writes under test/, and tsconfig picks .ts in the prompt', async () => {

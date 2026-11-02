@@ -51,6 +51,8 @@ export interface StarterDeps {
   reviewed: readonly ReviewedTool[];
   /** Test hooks for planNpmDeps (the npm runner, the closure). */
   npm?: Pick<NpmDepsInput, 'runner' | 'closureBefore' | 'closure'>;
+  /** true only when Plan G's isolated starter-test job exists (no secrets, egress blocked, read-only token); the validator alone is not a boundary (D7-R7). */
+  isolatedTestJob?: boolean;
 }
 
 /** The second answer was refused too. Plan E makes the tests part failed. `usage` is the AI cost of both attempts. */
@@ -141,6 +143,9 @@ export function checkAttempt(prev: TestPlan | null, next: TestPlan): string[] {
  */
 export async function createStarterTests(s: Service, _p: RepoProfile, bundle: CodeBundle, ai: AiProvider, deps: StarterDeps): Promise<TestPlan> {
   const code = bundleText(bundle);   // first: throws SecretScanRequiredError before anything else happens
+  if (deps.isolatedTestJob !== true) {
+    return notProven(`No starter tests for ${show(s)}: pipegen runs AI-written tests only in an isolated CI job (no secrets, no network, read-only token), and that job is not set up in this version, so its tests are not proven.`);
+  }
   const dir = rootPrefix(s.path);
   const at = (name: string): string => (dir === '' ? name : `${dir}/${name}`);
 
