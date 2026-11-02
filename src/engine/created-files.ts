@@ -47,6 +47,8 @@ export interface CreatedInputs {
    * a package only from its own service's list; a service that is missing here has none, so such an import is refused.
    */
   serviceDeps?: Readonly<Record<string, readonly string[]>>;
+  /** D7: the package.json `type` of each service ('module' or 'commonjs'; same keys). A missing service is read as commonjs, which checks a .js file both ways. */
+  serviceTypes?: Readonly<Record<string, 'module' | 'commonjs'>>;
   /** The vault's check: does the text hold a value the user typed, or its base64 or URL form (preflight S8)? */
   containsKnownValue?: (text: string) => boolean;
 }

@@ -16,6 +16,21 @@
 //   assertions   a test is `it('name', () => {...})` written in the file or in `describe`, never in a loop or a condition; each test needs an
 //                assertion written directly in its body (`expect(x).matcher(...)` or an assert call; one on a literal does not count).
 //   urls         a string with `scheme://host` may only name localhost, 127.0.0.1 or example.com (a host that is not static is refused).
+//   globals      (security scan) calls and member access on globals are an ALLOWLIST, not a list of bad names: a test may use
+//                  - the imports of the allowed modules, expect, assert calls, and the vitest API: describe, it, test, the hooks, and vi.fn, vi.spyOn, vi.mock
+//                    (a literal relative path only), the fake-timer helpers, vi.stubEnv;
+//                  - JSON.parse and JSON.stringify; Math.*; Number.isInteger/isFinite/isNaN/isSafeInteger/parseFloat/parseInt and its constants; String.raw;
+//                    Array.isArray/from/of; Object.keys/values/entries/assign/freeze/fromEntries/is/hasOwn; Promise.resolve/reject/all/allSettled/race/any/withResolvers;
+//                    Date.now/UTC/parse; new URL(...) and the plain constructors (Map, Set, Error, Date, RegExp, typed arrays, Buffer ...); timers, console;
+//                  - process.env, .cwd(), .platform, .nextTick, .hrtime, .uptime;
+//                  and nothing else: a free name that is declared nowhere in the file and not on these lists is refused, so are Reflect, Symbol, Proxy, Function,
+//                  globalThis and the reflection members of any object (getOwnPropertyDescriptor(s), getOwnPropertyNames/Symbols, getPrototypeOf, setPrototypeOf,
+//                  defineProperty, fromCharCode ...). A computed key must fold to a plain name; one that can not be read statically is refused.
+//   network      fetch, WebSocket, EventSource and XMLHttpRequest are refused. node:http: createServer, request, get, STATUS_CODES, METHODS only; request and get
+//                  must name a literal local target (a string starting with http://127.0.0.1 or localhost, or an options object with a literal local host or none,
+//                  e.g. the port of a server the test started with listen(0)). Joined strings (`'ht' + 'tp://x'`) are read whole before the URL check.
+//   this         `this` in a plain (non-arrow, non-class) function is refused, and at the top of a script. A .js file is parsed by the service's package.json
+//                  "type" ("module": as a module; otherwise both as a script and as a module, with the problems of each), .cjs as a script, .mjs/.ts as a module.
 // A file that does not parse is refused. The real boundary stays the CI job (repo-code job, no pipegen secrets, egress block): this is the first layer.
 //
 // TypeScript caveat: sucrase silently drops a `namespace`/`module` block, which a real compiler would run, so a TypeScript file that has one is refused.
@@ -80,6 +95,10 @@ export function dependencyNames(packageJson: string): string[] {
     return Object.keys(deps).filter((n) => NPM_NAME_RE.test(n));
   } catch { return []; }
 }
+/** The module type of a package.json text: `module` only when "type" is exactly "module"; an unreadable text is `commonjs` (both readings are then checked). */
+export function packageModuleType(packageJson: string): 'module' | 'commonjs' {
+  try { const pkg = JSON.parse(packageJson) as { type?: unknown } | null; return typeof pkg === 'object' && pkg !== null && pkg.type === 'module' ? 'module' : 'commonjs'; } catch { return 'commonjs'; }
+}
 const NPM_NAME_RE = /^(?:@[a-z0-9][a-z0-9._-]{0,213}\/)?[a-z0-9][a-z0-9._-]{0,213}$/;
 
 // ---------- the tables ----------
@@ -87,20 +106,47 @@ const NPM_NAME_RE = /^(?:@[a-z0-9][a-z0-9._-]{0,213}\/)?[a-z0-9][a-z0-9._-]{0,21
 const ALLOWED_BUILTINS: ReadonlySet<string> = new Set(['vitest', 'node:assert', 'node:assert/strict', 'node:test', 'node:path', 'node:url', 'node:util', 'node:http']);
 const ASSERT_MODULES: ReadonlySet<string> = new Set(['node:assert', 'node:assert/strict']);
 const VITEST_NAMES: ReadonlySet<string> = new Set(['describe', 'it', 'test', 'expect', 'vi', 'beforeAll', 'afterAll', 'beforeEach', 'afterEach']);
+const HTTP_NAMES: ReadonlySet<string> = new Set(['createServer', 'request', 'get', 'STATUS_CODES', 'METHODS']);
 const NODE_TEST_NAMES: ReadonlySet<string> = new Set(['describe', 'it', 'test', 'before', 'after', 'beforeEach', 'afterEach']);
-const VI_OK: ReadonlySet<string> = new Set(['fn', 'spyOn', 'useFakeTimers', 'useRealTimers', 'advanceTimersByTime', 'advanceTimersToNextTimer', 'runAllTimers', 'runOnlyPendingTimers', 'setSystemTime', 'getMockedSystemTime', 'clearAllMocks', 'resetAllMocks', 'restoreAllMocks', 'isMockFunction', 'stubEnv', 'unstubAllEnvs']);
+const VI_OK: ReadonlySet<string> = new Set(['fn', 'spyOn', 'useFakeTimers', 'useRealTimers', 'advanceTimersByTime', 'advanceTimersToNextTimer', 'runAllTimers', 'runOnlyPendingTimers', 'setSystemTime', 'getMockedSystemTime', 'clearAllMocks', 'resetAllMocks', 'restoreAllMocks', 'isMockFunction', 'stubEnv', 'unstubAllEnvs', 'mock']);
 const PROCESS_OK: ReadonlySet<string> = new Set(['env', 'cwd', 'platform', 'nextTick', 'hrtime', 'uptime']);
 const META_OK: ReadonlySet<string> = new Set(['url', 'dirname', 'filename']);
 /** Names that give code execution or a way around the checks. */
-const BANNED_IDENT: ReadonlySet<string> = new Set(['eval', 'Function', 'globalThis', 'global', 'window', 'self', 'Reflect', 'WebAssembly', 'Worker', 'SharedWorker', 'module', 'XMLHttpRequest', 'importScripts']);
+const BANNED_IDENT: ReadonlySet<string> = new Set(['eval', 'Function', 'globalThis', 'global', 'window', 'self', 'Reflect', 'WebAssembly', 'Worker', 'SharedWorker', 'module', 'XMLHttpRequest', 'importScripts',
+  // the network and the reflection globals (security scan: no fetch or sockets of its own, no way to build a name at run time and reach code)
+  'fetch', 'WebSocket', 'EventSource', 'Symbol', 'Proxy']);
 const BANNED_PROP: ReadonlySet<string> = new Set(['constructor', '__proto__', '__defineGetter__', '__defineSetter__', '__lookupGetter__', '__lookupSetter__', 'caller', 'callee', 'mainModule', 'binding', 'dlopen', '_load', '_linkedBinding', 'createRequire', 'require', 'getBuiltinModule', 'eval', 'Function',
   // snapshots write files
-  'toMatchSnapshot', 'toMatchInlineSnapshot', 'toMatchFileSnapshot', 'toThrowErrorMatchingSnapshot', 'toThrowErrorMatchingInlineSnapshot']);
+  'toMatchSnapshot', 'toMatchInlineSnapshot', 'toMatchFileSnapshot', 'toThrowErrorMatchingSnapshot', 'toThrowErrorMatchingInlineSnapshot',
+  // reflection: ways to read or change what a name hides, on any object (also through an alias of Object)
+  'getOwnPropertyDescriptor', 'getOwnPropertyDescriptors', 'getOwnPropertyNames', 'getOwnPropertySymbols', 'getPrototypeOf', 'setPrototypeOf', 'defineProperty', 'defineProperties', 'fromCharCode', 'fromCodePoint']);
 /** A skipped, focused, conditional or unrepeatable test, as a member or an option. */
 const SKIP_PROP: ReadonlySet<string> = new Set(['skip', 'only', 'todo', 'skipIf', 'runIf', 'fails', 'each', 'for', 'fixme', 'retry', 'repeats']);
 const SKIP_IDENT: ReadonlySet<string> = new Set(['xit', 'xtest', 'xdescribe', 'fit', 'ftest', 'fdescribe']);
 const BANNED_STRING: ReadonlySet<string> = new Set(['constructor', '__proto__', 'eval', 'Function', 'binding', 'dlopen', 'mainModule', 'createRequire', 'getBuiltinModule', 'child_process']);
 const DANGEROUS_MODULES = /^(?:node:)?(?:child_process|vm|worker_threads|cluster|dgram|net|tls|http2|https|module|process|inspector|repl|v8|fs|fs\/promises|os|dns|readline|zlib|crypto|stream|events)$/;
+/** The globals a test may use as an object, and the members it may take from each (`*`: any). Anything else on them is refused. */
+const GLOBAL_MEMBERS: Readonly<Record<string, ReadonlySet<string>>> = {
+  JSON: new Set(['parse', 'stringify']),
+  Math: new Set(['*']),
+  Number: new Set(['isInteger', 'isFinite', 'isNaN', 'isSafeInteger', 'parseFloat', 'parseInt', 'MAX_SAFE_INTEGER', 'MIN_SAFE_INTEGER', 'EPSILON', 'MAX_VALUE', 'MIN_VALUE', 'POSITIVE_INFINITY', 'NEGATIVE_INFINITY', 'NaN']),
+  String: new Set(['raw']),
+  Boolean: new Set([]),
+  Array: new Set(['isArray', 'from', 'of']),
+  Object: new Set(['keys', 'values', 'entries', 'assign', 'freeze', 'fromEntries', 'is', 'hasOwn']),
+  Promise: new Set(['resolve', 'reject', 'all', 'allSettled', 'race', 'any', 'withResolvers']),
+  Date: new Set(['now', 'UTC', 'parse']),
+  URL: new Set([]),
+};
+/** Other free names a test may use (constructors, timers, console). A free name that is not declared in the file and not here (or above) is refused. */
+const ALLOWED_GLOBALS: ReadonlySet<string> = new Set(['undefined', 'NaN', 'Infinity', 'arguments', 'console', 'setTimeout', 'clearTimeout', 'setInterval', 'clearInterval', 'setImmediate', 'clearImmediate', 'queueMicrotask', 'structuredClone', 'Buffer', 'URLSearchParams', 'TextEncoder', 'TextDecoder',
+  'AbortController', 'AbortSignal', 'Headers', 'Request', 'Response', 'FormData', 'Blob', 'Map', 'Set', 'WeakMap', 'WeakSet', 'RegExp', 'Error', 'TypeError', 'RangeError', 'SyntaxError', 'ReferenceError', 'AggregateError', 'parseInt', 'parseFloat', 'isNaN', 'isFinite',
+  'encodeURIComponent', 'decodeURIComponent', 'encodeURI', 'decodeURI', 'BigInt', 'Uint8Array', 'Uint16Array', 'Uint32Array', 'Int8Array', 'Int16Array', 'Int32Array', 'Float32Array', 'Float64Array', 'ArrayBuffer', 'DataView', 'performance', '__dirname', '__filename']);
+/** node:http: the members a test may take, and the two that open a connection (their target must be a literal local address). */
+const HTTP_OK: ReadonlySet<string> = new Set(['createServer', 'request', 'get', 'STATUS_CODES', 'METHODS']);
+const HTTP_CALLS: ReadonlySet<string> = new Set(['request', 'get']);
+const HTTP_OPTION_KEYS: ReadonlySet<string> = new Set(['method', 'path', 'port', 'headers', 'host', 'hostname', 'timeout']);
+const LOCAL_HOSTS: ReadonlySet<string> = new Set(['127.0.0.1', 'localhost', '::1']);
 const URL_HOSTS: ReadonlySet<string> = new Set(['localhost', '127.0.0.1', 'example.com']);
 const TS_NAMESPACE_RE = /(?:^|[;{}/])\s*(?:export\s+)?(?:declare\s+)?(?:namespace|module)\s+[A-Za-z_$"']/m;
 const TS_ENUM_RE = /(?:^|[;{}/])\s*(?:export\s+)?(?:declare\s+)?(?:const\s+)?enum\s+[A-Za-z_$]/m;
@@ -156,6 +202,12 @@ function fold(n: N): string | number | undefined {
 /** A string written out in one piece: a string literal or a template without `${}`. Module specifiers must be this (a `+` of two literals is not). */
 const literalString = (n: N | undefined): string | undefined => (n !== undefined && ((n.type === 'Literal' && typeof n.value === 'string') || (n.type === 'TemplateLiteral' && n.expressions.length === 0)) ? staticString(n) : undefined);
 const staticString = (n: N | undefined): string | undefined => { const v = n === undefined ? undefined : fold(n); return typeof v === 'string' ? v : undefined; };
+/** A template literal as text: its quasis joined with the value of each `${}` that folds to a string or number, and a sentinel for the rest. */
+const templateText = (n: N): string => (n.quasis as N[]).map((q, i) => {
+  const e: unknown = (n.expressions as unknown[])[i];
+  const v = i < (n.expressions as unknown[]).length && isNode(e) ? fold(e) : undefined;
+  return `${String(q.value?.cooked ?? '')}${i < (n.expressions as unknown[]).length ? (v === undefined ? '\uFFFF' : String(v)) : ''}`;
+}).join('');
 const isLiteralish = (n: N): boolean => n.type === 'Literal' || (n.type === 'TemplateLiteral' && n.expressions.length === 0) || (n.type === 'UnaryExpression' && isNode(n.argument) && isLiteralish(n.argument));
 const isFn = (n: unknown): n is N => isNode(n) && (n.type === 'ArrowFunctionExpression' || n.type === 'FunctionExpression');
 const ident = (n: unknown, name?: string): boolean => isNode(n) && n.type === 'Identifier' && (name === undefined || n.name === name);
@@ -178,8 +230,7 @@ const show = (s: string, max = 60): string => activeSafeText(s, max);
  * Judges one file of a service. `rel` is the path inside the service (its folder resolves the relative imports; its name says whether tests are required),
  * `deps` the service's own `dependencies` names. Never throws for any content.
  */
-export function analyzeTestFile(rel: string, content: string, deps: readonly string[]): TestFileReport {
-  const problems = new Set<string>();
+export function analyzeTestFile(rel: string, content: string, deps: readonly string[], moduleType: 'module' | 'commonjs' = 'commonjs'): TestFileReport {
   const fail = (why: string): TestFileReport => ({ problems: [why], tests: 0, assertions: 0, parsed: false });
   if (typeof content !== 'string') return fail('the file is not text');
   if (Buffer.byteLength(content, 'utf8') > MAX_TEST_FILE_BYTES) return fail(`the file is over ${MAX_TEST_FILE_BYTES / 1024} KB`);
@@ -191,14 +242,32 @@ export function analyzeTestFile(rel: string, content: string, deps: readonly str
     if (TS_ENUM_RE.test(content)) return fail('the file has a TypeScript enum, which compiles to computed code pipegen can not check (use a plain object)');
     try { code = transform(content, { transforms: ['typescript'], disableESTransforms: true, keepUnusedImports: true, filePath: rel }).code; } catch { return fail('the file can not be read as TypeScript'); }
   }
-  let program: N;
-  try {
-    program = parse(code, { ecmaVersion: 'latest', sourceType: ext === 'cjs' ? 'script' : 'module', locations: true, allowHashBang: true }) as unknown as N;
-  } catch (e) {
-    const line = typeof e === 'object' && e !== null && 'loc' in e && typeof (e as { loc?: { line?: unknown } }).loc?.line === 'number' ? ` near line ${(e as { loc: { line: number } }).loc.line}` : '';
-    return fail(`the file does not parse as ${ext === 'ts' ? 'TypeScript' : 'JavaScript'}${line}`);
+  // Strict and sloppy parsing differ (`<!--` is a comment in a script and an operator in a module), and the runner may take a file either way. So:
+  // .cjs is a script, .mjs and .ts are modules, and a .js follows the service's package.json "type" ("module": a module; otherwise BOTH readings must
+  // be checked, and the problems of each are reported).
+  const modes: boolean[] = ext === 'cjs' ? [true] : ext === 'js' && moduleType === 'commonjs' ? [true, false] : [false];
+  const reports: TestFileReport[] = [];
+  let parseError = '';
+  for (const script of modes) {
+    let program: N;
+    try {
+      program = parse(code, { ecmaVersion: 'latest', sourceType: script ? 'script' : 'module', locations: true, allowHashBang: true }) as unknown as N;
+    } catch (e) {
+      const line = typeof e === 'object' && e !== null && 'loc' in e && typeof (e as { loc?: { line?: unknown } }).loc?.line === 'number' ? ` near line ${(e as { loc: { line: number } }).loc.line}` : '';
+      parseError = `the file does not parse as ${ext === 'ts' ? 'TypeScript' : 'JavaScript'}${line}`;
+      continue;
+    }
+    reports.push(analyzeProgram(rel, program, script, deps));
   }
+  if (reports.length === 0) return fail(parseError);
+  const first = reports[0] as TestFileReport;
+  if (reports.some((r) => !r.parsed)) return reports.find((r) => !r.parsed) as TestFileReport;
+  return { problems: [...new Set(reports.flatMap((r) => r.problems))], tests: Math.min(...reports.map((r) => r.tests)), assertions: Math.min(...reports.map((r) => r.assertions)), parsed: first.parsed };
+}
 
+function analyzeProgram(rel: string, program: N, script: boolean, deps: readonly string[]): TestFileReport {
+  const problems = new Set<string>();
+  const fail = (why: string): TestFileReport => ({ problems: [why], tests: 0, assertions: 0, parsed: false });
   const depSet = new Set(deps.filter((d) => NPM_NAME_RE.test(d) && !isBuiltin(d)));
   const dir = posix.dirname(rel);
   const add = (n: N | undefined, why: string): void => { if (problems.size < MAX_PROBLEMS) problems.add(`${n?.loc === undefined ? '' : `line ${n.loc.start.line}: `}${why}`); };
@@ -216,6 +285,76 @@ export function analyzeTestFile(rel: string, content: string, deps: readonly str
       }
     }
   }
+
+  // every name the file declares anywhere (a free name that is declared nowhere is a global, and only listed globals may be used)
+  const declared = new Set<string>();
+  const declare = (t: unknown): void => {
+    if (!isNode(t)) return;
+    if (t.type === 'Identifier') declared.add(t.name);
+    else if (t.type === 'ObjectPattern') { for (const q of t.properties as N[]) declare(q.type === 'Property' ? q.value : q.argument); }
+    else if (t.type === 'ArrayPattern') { for (const q of t.elements as unknown[]) declare(q); }
+    else if (t.type === 'AssignmentPattern') declare(t.left);
+    else if (t.type === 'RestElement') declare(t.argument);
+  };
+  // the names bound to node:http, whole (`http.get`) or by name (`get`), so a connection's target can be checked
+  const httpNames = new Set<string>();
+  const httpNamed = new Map<string, string>();
+  try {
+    walk(program, [], (n) => {
+      if (n.type === 'VariableDeclarator') declare(n.id);
+      else if (n.type === 'FunctionDeclaration' || n.type === 'FunctionExpression' || n.type === 'ArrowFunctionExpression') { declare(n.id); for (const q of n.params as unknown[]) declare(q); }
+      else if (n.type === 'ClassDeclaration' || n.type === 'ClassExpression') declare(n.id);
+      else if (n.type === 'CatchClause') declare(n.param);
+      else if (n.type === 'ImportDeclaration') {
+        for (const sp of n.specifiers as N[]) {
+          declare(sp.local);
+          if (String(n.source?.value) !== 'node:http' || !ident(sp.local)) continue;
+          if (sp.type === 'ImportSpecifier') httpNamed.set(sp.local.name, String(sp.imported?.name ?? sp.imported?.value)); else httpNames.add(sp.local.name);
+        }
+      }
+    });
+  } catch { return fail('the file is nested too deeply to check'); }
+  for (const s of program.body as N[]) {
+    if (s.type !== 'VariableDeclaration') continue;
+    for (const d of s.declarations as N[]) {
+      const init = d.init;
+      if (!isNode(init) || init.type !== 'CallExpression' || !ident(init.callee, 'require') || literalString(init.arguments?.[0]) !== 'node:http') continue;
+      if (ident(d.id)) httpNames.add(d.id.name);
+      else if (isNode(d.id) && d.id.type === 'ObjectPattern') for (const q of d.id.properties as N[]) { if (q.type === 'Property' && ident(q.value) && ident(q.key)) httpNamed.set(q.value.name, q.key.name); }
+    }
+  }
+  /** Why `this` is refused here, or null. Outside strict code `this` in a plain function is the global object; class bodies are always strict. */
+  const thisProblem = (anc: readonly N[], isScript: boolean): string | null => {
+    for (let i = anc.length - 1; i >= 0; i--) {
+      const a = anc[i] as N;
+      if (a.type === 'ArrowFunctionExpression') continue;
+      if (a.type === 'PropertyDefinition' || a.type === 'StaticBlock' || a.type === 'ClassBody') return null;
+      if (a.type === 'FunctionDeclaration' || a.type === 'FunctionExpression') {
+        const owner = anc[i - 1];
+        return owner?.type === 'MethodDefinition' ? null : 'this inside a plain function is refused (outside strict mode it is the global object); use an arrow function or a class method';
+      }
+    }
+    return isScript ? 'this at the top of a script is the global object, so it is refused' : null;
+  };
+  /** Why a call of node:http request/get is refused: its target must be a literal local address. */
+  const httpCallProblem = (call: N): string | null => {
+    const a0: N | undefined = call.arguments[0];
+    const why = 'an http request must name its target as a literal 127.0.0.1, localhost or ::1 (a string starting with http://, or an options object whose host is such a literal or absent)';
+    if (a0 === undefined) return why;
+    const lit = literalString(a0);
+    if (lit !== undefined) return /^https?:\/\//.test(lit) ? null : why;
+    if (a0.type === 'TemplateLiteral') return typeof a0.quasis[0]?.value?.cooked === 'string' && /^https?:\/\//.test(a0.quasis[0].value.cooked as string) ? null : why;
+    if (a0.type === 'ObjectExpression') {
+      for (const q of a0.properties as N[]) {
+        if (q.type !== 'Property' || q.computed) return why;
+        const key = ident(q.key) ? q.key.name : isNode(q.key) && q.key.type === 'Literal' ? String(q.key.value) : '';
+        if (!HTTP_OPTION_KEYS.has(key)) return why;
+        if ((key === 'host' || key === 'hostname') && !LOCAL_HOSTS.has(literalString(q.value) ?? '')) return why;
+      }
+      return null;
+    }
+    return why;
+  };
 
   /** Why a module specifier is refused, or null. */
   const specProblem = (spec: string): string | null => {
@@ -243,9 +382,10 @@ export function analyzeTestFile(rel: string, content: string, deps: readonly str
     else if (relativeOnly && !/^\.\.?(?:\/|$)/.test(spec)) add(n, `re-exports ${JSON.stringify(show(spec))}; only relative files may be re-exported`);
   };
   const checkSpecifiers = (n: N, spec: string): void => {
-    const names = spec === 'vitest' ? VITEST_NAMES : spec === 'node:test' ? NODE_TEST_NAMES : null;
+    const names = spec === 'vitest' ? VITEST_NAMES : spec === 'node:test' ? NODE_TEST_NAMES : spec === 'node:http' ? HTTP_NAMES : null;
     if (names === null) return;
     for (const sp of n.specifiers as N[]) {
+      if (spec === 'node:http' && sp.type !== 'ImportSpecifier') continue;   // the whole module is fine: its members are checked where they are used
       const imported = sp.type === 'ImportSpecifier' ? (isNode(sp.imported) ? (sp.imported.name ?? sp.imported.value) : undefined) : undefined;
       if (typeof imported !== 'string' || !names.has(imported)) { add(n, `imports from ${JSON.stringify(spec)} only ${[...names].join(', ')}, written as named imports`); return; }
       if (!ident(sp.local, imported)) { add(n, `imports ${imported} from ${JSON.stringify(spec)} under another name; pipegen needs the plain name`); return; }
@@ -308,7 +448,8 @@ export function analyzeTestFile(rel: string, content: string, deps: readonly str
   };
 
   const urlProblem = (text: string): string | null => {
-    const re = /([A-Za-z][A-Za-z0-9+.-]*):\/\/([^/\s?#'"`<>\\]*)/g;
+    const re = /([A-Za-z\uFFFF][A-Za-z0-9+.\uFFFF-]*):\/\/([^/\s?#'"`<>\\]*)/g;
+    if (/^(?:https?|wss?|ftp):\/{0,2}$/i.test(text)) return 'a bare URL scheme can not be checked';
     const hosts: string[] = [];
     for (let m = re.exec(text); m !== null; m = re.exec(text)) hosts.push(m[2] as string);
     const rel2 = /^\/\/([^/\s?#'"`<>\\]+)/.exec(text);
@@ -340,10 +481,29 @@ export function analyzeTestFile(rel: string, content: string, deps: readonly str
         if (isNode(n.options)) add(n, 'import() with options is not accepted');
         checkSource(n, n.source, false);
         return;
-      case 'ThisExpression': if (ext === 'cjs') add(n, 'this is not accepted in a CommonJS file (outside strict mode it can be the global object)'); return;
+      case 'ThisExpression': { const w = thisProblem(anc, script); if (w !== null) add(n, w); return; }
+      case 'BinaryExpression': {
+        // a URL built by joining pieces is read whole before the host check (the pieces of 'ht' + 'tp://x' are not URLs, the sum is)
+        if (n.operator !== '+' || (parent?.type === 'BinaryExpression' && parent.operator === '+')) return;
+        const parts: string[] = [];
+        const flat = (x: N): void => {
+          if (x.type === 'BinaryExpression' && x.operator === '+') { flat(x.left); flat(x.right); return; }
+          const f = fold(x);
+          parts.push(typeof f === 'string' ? f : typeof f === 'number' ? String(f) : x.type === 'TemplateLiteral' ? templateText(x) : '\uFFFF');
+        };
+        flat(n);
+        const u = urlProblem(parts.join(''));
+        if (u !== null) add(n, u);
+        return;
+      }
       case 'WithStatement': add(n, 'a with statement is not accepted'); return;
       case 'CallExpression': {
         const c: N = n.callee;
+        if (isNode(c) && c.type === 'MemberExpression' && ident(c.object, 'vi') && (c.computed ? fold(c.property) === 'mock' : ident(c.property, 'mock'))) {
+          const m = literalString(n.arguments[0]);
+          if (m === undefined || !/^\.\.?\//.test(m)) add(n, 'vi.mock may name only a relative path inside the service, written as one string');
+          else { const w = specProblem(m); if (w !== null) add(n, w); }
+        }
         if (ident(c, 'require')) {
           if ((n.arguments as unknown[]).length !== 1) add(n, 'require() takes one plain string');
           else checkSource(n, n.arguments[0], false);
@@ -359,7 +519,7 @@ export function analyzeTestFile(rel: string, content: string, deps: readonly str
           const t = parent.type;
           if (t === 'MemberExpression' && parent.property === n && !parent.computed) return;
           if ((t === 'Property' || t === 'MethodDefinition' || t === 'PropertyDefinition') && parent.key === n && !parent.computed) return;
-          if (t === 'LabeledStatement' || t === 'BreakStatement' || t === 'ContinueStatement' || t === 'ImportSpecifier' || t === 'ImportDefaultSpecifier' || t === 'ImportNamespaceSpecifier' || t === 'ExportSpecifier') return;
+          if (t === 'MetaProperty' || t === 'LabeledStatement' || t === 'BreakStatement' || t === 'ContinueStatement' || t === 'ImportSpecifier' || t === 'ImportDefaultSpecifier' || t === 'ImportNamespaceSpecifier' || t === 'ExportSpecifier') return;
         }
         const name = n.name as string;
         if (BANNED_IDENT.has(name)) add(n, `${name} can run code or reach what the checks cover, so it is refused`);
@@ -367,6 +527,15 @@ export function analyzeTestFile(rel: string, content: string, deps: readonly str
         else if (name === 'require') { if (!(parent?.type === 'CallExpression' && parent.callee === n)) add(n, 'require can only be called with a plain string, never passed around'); }
         else if (name === 'process') { if (!(parent?.type === 'MemberExpression' && parent.object === n)) add(n, 'process can only be used as process.env, process.cwd(), process.platform, process.nextTick, process.hrtime or process.uptime'); }
         else if (name === 'vi') { if (!(parent?.type === 'MemberExpression' && parent.object === n)) add(n, 'vi can only be used as vi.<helper>(...)'); }
+        else if (GLOBAL_MEMBERS[name] !== undefined && !declared.has(name)) {
+          const asValue = parent?.type === 'MemberExpression' && parent.object === n;
+          const asCallee = (parent?.type === 'CallExpression' || parent?.type === 'NewExpression') && parent.callee === n;
+          const asArg = parent?.type === 'CallExpression' && parent.callee !== n;
+          const asInstanceof = parent?.type === 'BinaryExpression' && parent.operator === 'instanceof' && parent.right === n;
+          if (!(asValue || asCallee || asArg || asInstanceof)) add(n, `${name} can only be used as ${name}.<member>, called, or checked with instanceof`);
+        } else if (httpNamed.has(name) && HTTP_CALLS.has(httpNamed.get(name) as string)) {
+          if (parent?.type === 'CallExpression' && parent.callee === n) { const w = httpCallProblem(parent); if (w !== null) add(n, w); } else add(n, 'http request and get can only be called');
+        } else if (!declared.has(name) && !ALLOWED_GLOBALS.has(name)) add(n, `${name} is a global pipegen does not list for tests, so it is refused`);
         return;
       }
       case 'MetaProperty': {
@@ -385,6 +554,17 @@ export function analyzeTestFile(rel: string, content: string, deps: readonly str
         } else name = String(n.property?.name);
         if (SKIP_PROP.has(name)) add(n, `.${show(name)} skips, focuses or repeats tests, which pipegen does not accept`);
         else if (BANNED_PROP.has(name)) add(n, `.${show(name)} is refused (it reaches code execution, other modules or files outside the test)`);
+        if (isNode(n.object) && n.object.type === 'Identifier') {
+          const g = GLOBAL_MEMBERS[n.object.name as string];
+          if (g !== undefined && !declared.has(n.object.name) && !g.has('*') && !g.has(name)) add(n, `${n.object.name}.${show(name)} is not on the list of members tests may use (${[...g].join(', ') || 'none'})`);
+          if (httpNames.has(n.object.name)) {
+            if (!HTTP_OK.has(name)) add(n, `http.${show(name)} is refused (createServer, request, get, STATUS_CODES and METHODS are accepted)`);
+            else if (HTTP_CALLS.has(name)) {
+              const call = anc[anc.length - 1];
+              if (call?.type === 'CallExpression' && call.callee === n) { const w = httpCallProblem(call); if (w !== null) add(n, w); } else add(n, `http.${name} can only be called`);
+            }
+          }
+        }
         if (ident(n.object, 'process') && !PROCESS_OK.has(name)) add(n, `process.${show(name)} is refused`);
         if (ident(n.object, 'vi') && !VI_OK.has(name)) add(n, `vi.${show(name)} is refused (only fn, spyOn, the timer helpers and stubEnv are accepted)`);
         return;
@@ -427,10 +607,10 @@ export function analyzeTestFile(rel: string, content: string, deps: readonly str
  * The problems of one created file at repo path `path`, for the judge and the guard: the path must be a starter-test path of a service in `roots`
  * (the deepest service that holds it), and the content must pass analyzeTestFile with that service's own dependency names (`depsOf`).
  */
-export function starterTestFileProblems(path: string, content: string, o: { roots: readonly string[]; depsOf: (root: string) => readonly string[] | undefined }): string[] {
+export function starterTestFileProblems(path: string, content: string, o: { roots: readonly string[]; depsOf: (root: string) => readonly string[] | undefined; typeOf?: (root: string) => 'module' | 'commonjs' | undefined }): string[] {
   const owner = starterOwner(path, o.roots);
   if (owner === null) return [`${show(path, 80)} is not a path starter tests may use (${starterTestPathProblem(path) ?? 'it is not inside a service folder'})`];
-  return analyzeTestFile(owner.rel, content, o.depsOf(owner.root) ?? []).problems;
+  return analyzeTestFile(owner.rel, content, o.depsOf(owner.root) ?? [], o.typeOf?.(owner.root) ?? 'commonjs').problems;
 }
 
 /** The tests and the assertions of one file; null when it does not parse. */

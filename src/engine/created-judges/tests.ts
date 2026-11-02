@@ -23,7 +23,7 @@ export function starterTestsJudge(file: CreatedFile, ctx: CreatedCtx): string[] 
   const svc = owners[0] as Service;
   if (svc.language !== 'node') return ['starter tests are written for Node services in this version (Python comes in v0.4)'];
   if (svc.packageManager !== 'npm') return ['starter tests are written for npm services in this version (the reviewed Vitest is added through npm)'];
-  const out = starterTestFileProblems(file.path, file.content, { roots, depsOf: (root) => ctx.inputs.serviceDeps?.[root] });
+  const out = starterTestFileProblems(file.path, file.content, { roots, depsOf: (root) => ctx.inputs.serviceDeps?.[root], typeOf: (root) => ctx.inputs.serviceTypes?.[root] });
   const batch = (ctx.files ?? []).filter((f) => f.repo === file.repo && starterOwner(f.path, roots)?.root === owner.root).length;
   if (batch > MAX_TEST_FILES) out.push(`the batch has ${batch} test files for this service, and pipegen writes at most ${MAX_TEST_FILES}`);
   return out;

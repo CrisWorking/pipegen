@@ -36,7 +36,7 @@ import type { CreatedFile, InstallRecord, KnownValueCheck, PipelineDraft, RepoPr
 import { anyString, scrubActive, scrubForDisplay, vaultHolds, withActiveVault } from '../util/known-values.js';
 import { lockProblems, packageJsonProblems } from './package-rules.js';
 import type { ReviewedClosure } from './reviewed-closure.js';
-import { dependencyNames, MAX_TEST_FILES, starterOwner, starterTestFileProblems } from './test-rules.js';
+import { dependencyNames, MAX_TEST_FILES, packageModuleType, starterOwner, starterTestFileProblems } from './test-rules.js';
 
 /** One entry of the delivery base tree (the default branch head): its git mode (`100644`, `120000` symlink, `160000` submodule), blob sha and text (null: not readable as text). */
 export interface BaseEntry { sha: string; mode: string; read(): Promise<string | null> }
@@ -217,7 +217,8 @@ async function guardFiles(files: readonly CreatedFile[], ctx: GuardCtx): Promise
     if (svc.language !== 'node' || svc.packageManager !== 'npm') return `starter tests are written for npm services in this version, and the service in ${q(owner.root === '' ? '.' : owner.root)} is not one`;
     const pj = await readTextLimitedWithReason(join(ctx.root, ...(owner.root === '' ? [] : owner.root.split('/')), 'package.json'), ctx.root);
     const deps = 'text' in pj ? dependencyNames(pj.text) : [];
-    const bad = starterTestFileProblems(f.path, f.content, { roots, depsOf: () => deps });
+    const type = 'text' in pj ? packageModuleType(pj.text) : 'commonjs';
+    const bad = starterTestFileProblems(f.path, f.content, { roots, depsOf: () => deps, typeOf: () => type });
     const same = files.filter((x) => x?.repo === repo && typeof x.path === 'string' && starterOwner(x.path, roots)?.root === owner.root).length;
     if (same > MAX_TEST_FILES) bad.push(`the batch has ${same} test files for this service, and pipegen writes at most ${MAX_TEST_FILES}`);
     return bad.length > 0 ? bad.slice(0, 5).join('; ') : null;

@@ -264,7 +264,7 @@ describe('validate: what may be delivered', () => {
     expect(v([cf('api/test/a.test.mjs', "import cp from 'node:child_process';\nimport { it, expect } from 'vitest';\nit('a', () => { expect(cp).toBeTruthy(); });\n")]).rejected[0]?.why).toMatch(/"node:child_process", which can run commands/);
   });
   it('validate: external URL rejected, localhost allowed', () => {
-    const t = (url: string): string => `import { it, expect } from 'vitest';\nit('a', () => { expect(f('${url}')).toBeTruthy(); });\n`;
+    const t = (url: string): string => `import { it, expect } from 'vitest';\nconst f = (x) => x;\nit('a', () => { expect(f('${url}')).toBeTruthy(); });\n`;
     expect(v([cf('api/test/a.test.js', t('https://evil.example/x'))]).rejected[0]?.why).toMatch(/evil\.example/);
     expect(v([cf('api/test/a.test.js', t('http://localhost:3000/x'))]).rejected).toEqual([]);
     expect(v([cf('api/test/a.test.js', t('http://127.0.0.1/x'))]).rejected).toEqual([]);
@@ -283,7 +283,7 @@ describe('validate: what may be delivered', () => {
   });
   it('validate: .skip and .only rejected', () => {
     for (const form of ['it.skip', 'it.only', 'describe.skip', 'test.todo', "it['sk' + 'ip']", 'xit', 'fit']) {
-      const r = v([cf('api/test/a.test.js', `import { it, test, describe, expect } from 'vitest';\n${GOOD.split('\n').slice(2).join('\n')}\n${form}('b', () => { expect(f()).toBe(1); });\n`)]);
+      const r = v([cf('api/test/a.test.js', `import { it, test, describe, expect } from 'vitest';\nconst f = () => 1, add = f;\n${GOOD.split('\n').slice(2).join('\n')}\n${form}('b', () => { expect(f()).toBe(1); });\n`)]);
       expect(r.accepted, form).toEqual([]);
       expect(r.rejected[0]?.why, form).toMatch(/skip|only|todo|focus/i);
     }
@@ -318,7 +318,7 @@ describe('validate: what may be delivered', () => {
   });
   it('validate: eval, new Function, process.binding, module.createRequire rejected', () => {
     for (const code of ['eval("1")', 'new Function("return 1")()', 'process.binding("fs")', "process['bind' + 'ing']('fs')", "module.createRequire('x')", "globalThis['ev' + 'al']('1')"]) {
-      const r = v([cf('api/test/a.test.js', `import { it, expect } from 'vitest';\nit('a', () => { ${code}; expect(f()).toBe(1); });\n`)]);
+      const r = v([cf('api/test/a.test.js', `import { it, expect } from 'vitest';\nconst f = () => 1;\nit('a', () => { ${code}; expect(f()).toBe(1); });\n`)]);
       expect(r.accepted, code).toEqual([]);
     }
   });
