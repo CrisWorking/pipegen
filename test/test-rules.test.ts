@@ -664,3 +664,14 @@ describe('mutation survivors: tests and assertions', () => {
     expect(analyzeTestFile('test/a.test.js', evil, [], 'module').problems.join(' ')).toMatch(/does not parse|globalThis/);
   });
 });
+
+describe('mutation survivors: tracked API locals, node:test hooks, module type', () => {
+  it('a CommonJS require of node:assert or node:http binds a tracked name that can not be declared again', () => {
+    refused(`${CJS}const assert = require('node:assert');\nit('a', (assert) => { assert(f()); });`, /declared again/, 'test/a.test.cjs');
+    refused(`${CJS}const http = require('node:http');\nit('a', (http) => { http.get(u); expect(f()).toBe(1); });`, /declared again/, 'test/a.test.cjs');
+    refused(`${CJS}const { get } = require('node:http');\nit('a', (get) => { get(u); expect(f()).toBe(1); });`, /declared again/, 'test/a.test.cjs');
+  });
+  it('the node:test hook names are reserved too', () => {
+    for (const n of ['before', 'after', 'beforeEach', 'afterEach']) refused(ok(`it('a', () => { const ${n} = f; expect(f()).toBe(1); });`), /reserves/);
+  });
+});

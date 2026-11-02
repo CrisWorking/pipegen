@@ -347,6 +347,21 @@ describe('validate: what may be delivered', () => {
   });
 });
 
+describe('module type', () => {
+  it('the module type reaches the validator and the creator: a script-only file is refused in a "type": "module" package', async () => {
+    const src = "const { it, expect } = require('vitest');\nvar o = 010;\nit('a', () => { expect(o).toBe(8); });\n";
+    const file: CreatedFile = { path: 'api/test/a.test.js', content: src, part: 'tests', reason: 't', repo: 'app' };
+    expect(validateGeneratedTests([file], svc(), () => false, [], 'module').rejected[0]?.why).toMatch(/does not parse/);
+    expect(validateGeneratedTests([file], svc(), () => false, [], 'commonjs').rejected).toEqual([]);
+    expect(validateGeneratedTests([file], svc(), () => false).rejected).toEqual([]);
+    const asModule = deps({ packageJson: PJ.replace('"version": "1.0.0",', '"version": "1.0.0",\n  "type": "module",') });
+    const bad = await make([ans([{ path: 'test/a.test.js', content: src }])], svc(), asModule).run().catch((e: unknown) => e);
+    expect(bad).toBeInstanceOf(StarterTestsError);
+    const fine = await make([ans([{ path: 'test/a.test.js', content: src }])]).run();
+    expect(fine.files).toHaveLength(1);
+  });
+});
+
 describe('attempt: the count can not drop between attempts', () => {
   const plan = (files: CreatedFile[]): TestPlan => ({ framework: 'vitest 5.0.5', reasons: [], files, configEdits: [], notes: [] });
   const two = cf('api/test/a.test.js', GOOD);   // 3 tests? no: 2 tests, 3 assertions
