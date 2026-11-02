@@ -449,3 +449,76 @@ describe('fix round 4: ESC and C1 fail closed under a vault (B6), unparsed workf
     noPiece(scrubbed);
   });
 });
+
+describe('fix round 5 (O1): decoded number leaves and keys are checked against the vault', () => {
+  const DIG = '12345678901234567890';   // an all-digit value (valueProblem accepts it)
+  const D8 = '12345678';
+  const noPieceOf = (value: string, r: unknown): void => {
+    const all: string[] = [];
+    const walk = (x: unknown): void => { if (typeof x === 'string') all.push(x); else if (Array.isArray(x)) x.forEach(walk); else if (typeof x === 'object' && x !== null) Object.values(x).forEach(walk); };
+    walk(r);
+    const shown = [JSON.stringify(r), ...all.map(displayForm)].join('\n');
+    for (let k = 0; k + 4 <= value.length; k++) expect(shown, value.slice(k, k + 4)).not.toContain(value.slice(k, k + 4));
+  };
+  const fixed = (value: string, r: Awaited<ReturnType<typeof referee>>): void => {
+    expect(r.ok).toBe(false);
+    expect(r.issues.length).toBeGreaterThan(0);
+    expect(r.issues.every((i) => i.check === 'secret-value' && /you gave pipegen/.test(i.message))).toBe(true);
+    noPieceOf(value, r);
+  };
+  const step = (name: string, pre = 'name: ci'): CreatedFile => ({ path: '.github/workflows/ci.yml', content: `${pre}\non: [push]\npermissions: {}\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n        name: ${name}\n`, part: 'pipeline', reason: 'r', repo: 'central' });
+
+  it('the reviewer\'s repro: a hex step name that decodes to a rounded number (not a safe integer) gives the fixed issue, 0 pieces', async () => {
+    expect(String(0xab54a98ceb1f0ad2)).toBe('12345678901234567000');
+    fixed(DIG, await ref([step('0xab54a98ceb1f0ad2')], vaultOf(DIG)));
+  });
+
+  it('a safe integer written as hex or octal is checked as its decimal text', async () => {
+    fixed(D8, await ref([step(`0x${(12345678).toString(16).toUpperCase()}`)], vaultOf(D8)));
+    fixed(D8, await ref([step(`0o${(12345678).toString(8)}`)], vaultOf(D8)));
+  });
+
+  it('float exponent forms: a rounded one fails closed, an exact one is checked as its decimal text', async () => {
+    fixed(DIG, await ref([step('1.2345678901234567890e19')], vaultOf(DIG)));
+    fixed(D8, await ref([step('1.2345678e7')], vaultOf(D8)));
+  });
+
+  it('a number as a mapping key (the strict parse refuses it, the lenient decode checks it), in a workflow and in another .yml', async () => {
+    const keyed = (k: string): CreatedFile => ({ path: '.github/workflows/ci.yml', content: `name: ci\non: [push]\npermissions: {}\njobs:\n  build:\n    runs-on: ubuntu-latest\n    env:\n      ${k}: x\n    steps:\n      - run: echo hi\n`, part: 'pipeline', reason: 'r', repo: 'central' });
+    fixed(D8, await ref([keyed('0xBC614E')], vaultOf(D8)));
+    fixed(DIG, await ref([keyed('0xab54a98ceb1f0ad2')], vaultOf(DIG)));
+    fixed(D8, await ref([file('services:\n  0xBC614E:\n    image: x\n', { path: 'docker-compose.pipegen.yml', part: 'compose' })], vaultOf(D8)));
+  });
+
+  it('a draft number leaf: a rounded number fails closed, a safe integer is checked as its decimal text', async () => {
+    for (const [value, n] of [[DIG, 12345678901234567000], [D8, 12345678]] as const) {
+      const d = mkDraft();
+      (d as unknown as { steps: unknown[] }).steps = [{ needId: n }];
+      fixed(value, await referee([file('FROM node:24\n')], d, platform(), reviewedList(), LINTERS, 'tok', { runLinters: async () => [], vault: vaultOf(value) }));
+    }
+    for (const n of [Number.NaN, Number.POSITIVE_INFINITY, 0.5]) {
+      const d = mkDraft();
+      (d as unknown as { steps: unknown[] }).steps = [{ needId: n }];
+      const r = await referee([file('FROM node:24\n')], d, platform(), reviewedList(), LINTERS, 'tok', { runLinters: async () => [], vault: new SecretVault() });
+      expect(r.issues.map((i) => i.check), String(n)).toEqual(['secret-value']);   // a vault given, even an empty one: fail closed
+    }
+  });
+
+  it('package files: a JSON number that is not a safe integer, or a safe one that is the value, is refused by the guard and the referee', async () => {
+    for (const [value, text] of [[DIG, '{"version": "1.0.0", "x": 12345678901234567890}'], [D8, '{"version": "1.0.0", "x": 1.2345678e7}']] as const) {
+      const f = file(text, { path: 'api/package.json', part: 'tests', edited: { original: '{}' } });
+      const g = await guardCreatedFiles([f], guardCtx(vaultOf(value)));
+      expect(g.ok).toEqual([]);
+      expect(g.refused[0]?.reason).toMatch(/value you gave pipegen/);
+      noPieceOf(value, g);
+      fixed(value, await ref([f], vaultOf(value)));
+    }
+  });
+
+  it('with no vault, numbers are judged as before; with a vault, ordinary safe integers are not a hit', async () => {
+    const r = await ref([step('0xab54a98ceb1f0ad2')]);
+    expect(r.issues.some((i) => i.check === 'secret-value')).toBe(false);
+    const ok = await ref([file('{"version": "1.0.0", "lockfileVersion": 3}', { path: 'api/package-lock.json', part: 'tests', edited: { original: '{}' } })], vaultOf(D8));
+    expect(ok.issues.some((i) => i.check === 'secret-value')).toBe(false);
+  });
+});

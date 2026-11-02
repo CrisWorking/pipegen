@@ -10,7 +10,7 @@ import {
 } from '../src/create/secrets.js';
 import { isDangerousName } from '../src/engine/job-rules.js';
 import { displayForm } from '../src/util/safe-text.js';
-import { activeSafeText, anyString, scrubForDisplay, withActiveVault } from '../src/util/known-values.js';
+import { activeSafeText, anyString, anyYamlScalar, scrubForDisplay, withActiveVault } from '../src/util/known-values.js';
 import { show } from '../src/engine/render-error.js';
 import { packageJsonProblems } from '../src/create/package-rules.js';
 import { runExitHooks } from '../src/util/exit-hooks.js';
@@ -769,7 +769,7 @@ describe('B4 layer 1: containsKnownValue sees decoded and altered forms', () => 
   it('anyString walks every key and string leaf (nested, arrays), iteratively, with a depth cap', () => {
     const seen: string[] = [];
     anyString({ a: ['x', { 'k-1': 'y', n: 5, z: null }], 'top-key': { deep: 'w' } }, (t) => { seen.push(t); return false; });
-    expect(seen.sort()).toEqual(['a', 'deep', 'k-1', 'n', 'top-key', 'w', 'x', 'y', 'z']);
+    expect(seen.sort()).toEqual(['5', 'a', 'deep', 'k-1', 'n', 'top-key', 'w', 'x', 'y', 'z']);   // the number 5 as its text (fix round 5)
     expect(anyString({ a: { b: 'needle' } }, (t) => t === 'needle')).toBe(true);
     expect(anyString({ ['needle']: 1 }, (t) => t === 'needle')).toBe(true);
     let deep: unknown = 'needle';
@@ -911,5 +911,25 @@ describe('fix round 4: fail closed on ESC and C1 (B6), anyString caps (m1), ever
     const pieces = (shown: string): void => { const n = shown.normalize('NFC'); for (let k = 0; k + 4 <= value.length; k++) expect(n, value.slice(k, k + 4)).not.toContain(value.slice(k, k + 4)); };
     pieces(scrubForDisplay(vault, `x ${mixed} y`, (t) => t));
     withActiveVault(vault, () => pieces(activeSafeText(`x ${mixed} y`)));
+  });
+});
+
+describe('fix round 5 (O1): anyString and anyYamlScalar check non-string scalars', () => {
+  it('anyString: a number that is not a safe integer (or not finite) holds; a safe integer, a bigint or a boolean is checked as its text', () => {
+    const never = (): boolean => false;
+    for (const n of [12345678901234567000, 0.5, -1.5, Number.NaN, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY, 2 ** 53]) expect(anyString({ a: [n] }, never), String(n)).toBe(true);
+    for (const n of [0, -0, 3000, Number.MAX_SAFE_INTEGER, -Number.MAX_SAFE_INTEGER]) expect(anyString({ a: [n] }, never), String(n)).toBe(false);
+    const seen: string[] = [];
+    anyString({ a: 12345678, b: 7n, c: true, d: null }, (t) => { seen.push(t); return false; });
+    expect(seen.sort()).toEqual(['12345678', '7', 'a', 'b', 'c', 'd', 'true']);
+    expect(anyString(12345678, (t) => t === '12345678')).toBe(true);
+  });
+
+  it('anyYamlScalar: number keys and values are checked the same way', () => {
+    expect(anyYamlScalar('a: 0xab54a98ceb1f0ad2\n', () => false)).toBe(true);
+    expect(anyYamlScalar('0xab54a98ceb1f0ad2: x\n', () => false)).toBe(true);
+    expect(anyYamlScalar('a: 0xBC614E\n', (t) => t === '12345678')).toBe(true);
+    expect(anyYamlScalar('0xBC614E: x\n', (t) => t === '12345678')).toBe(true);
+    expect(anyYamlScalar('a: 3000\nb: true\n', () => false)).toBe(false);
   });
 });

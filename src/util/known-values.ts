@@ -94,8 +94,21 @@ const MAX_DEPTH = 64;
 const MAX_NODES = 1_000_000;
 
 /**
- * Whether `pred` holds for any KEY or string leaf of `root`. Iterative (no stack overflow), cycle-safe. Fails closed: an object deeper than
- * 64 levels, or more than a million nodes, counts as holding (fix round 4, m1), since what it would not look at could hold a value.
+ * Whether a decoded scalar holds a value, or null when `v` is no scalar (fix round 5, O1). A string is checked as it is; a number, bigint or
+ * boolean as its text (`0xBC614E` decodes to 12345678). A number that is not a safe integer (rounded, fractional, NaN or infinite) holds: its
+ * text may be a rounded piece of a value (`0xab54a98ceb1f0ad2` decodes to 12345678901234567000), and pipegen writes no such number.
+ */
+function scalarHolds(v: unknown, pred: (text: string) => boolean): boolean | null {
+  if (typeof v === 'string') return pred(v);
+  if (typeof v === 'number') return !Number.isSafeInteger(v) || pred(String(v));
+  if (typeof v === 'bigint' || typeof v === 'boolean') return pred(String(v));
+  return null;
+}
+
+/**
+ * Whether `pred` holds for any KEY or scalar leaf of `root` (strings as they are, other scalars through scalarHolds). Iterative (no stack
+ * overflow), cycle-safe. Fails closed: an object deeper than 64 levels, or more than a million nodes, counts as holding (fix round 4, m1),
+ * since what it would not look at could hold a value.
  */
 export function anyString(root: unknown, pred: (text: string) => boolean): boolean {
   const seen = new Set<object>();
@@ -104,7 +117,8 @@ export function anyString(root: unknown, pred: (text: string) => boolean): boole
   while (stack.length > 0) {
     const [v, depth] = stack.pop() as [unknown, number];
     if (++nodes > MAX_NODES) return true;
-    if (typeof v === 'string') { if (pred(v)) return true; continue; }
+    const leaf = scalarHolds(v, pred);
+    if (leaf !== null) { if (leaf) return true; continue; }
     if (typeof v !== 'object' || v === null || seen.has(v)) continue;
     if (depth >= MAX_DEPTH) return true;
     seen.add(v);
@@ -118,7 +132,7 @@ export function anyString(root: unknown, pred: (text: string) => boolean): boole
 }
 
 /**
- * Whether `pred` holds for any decoded scalar (key or value) of a YAML text, read leniently: every document, tags and anchors allowed,
+ * Whether `pred` holds for any decoded scalar (key or value; numbers through scalarHolds) of a YAML text, read leniently: every document, tags and anchors allowed,
  * aliases NOT expanded (each scalar is visited once, where it is written), parse errors tolerated. For a file the strict parse refuses
  * (fix round 4, B7) and for other .yml files. No alias is expanded, so no alias cap is needed. A text the lenient parse can not read at all is false here: the caller checks it as written.
  */
@@ -127,7 +141,7 @@ export function anyYamlScalar(text: string, pred: (text: string) => boolean): bo
   try {
     // uniqueKeys off: duplicate keys are no error here (lenient), and the duplicate-key check is quadratic in the number of keys
     for (const doc of parseAllDocuments(text, { uniqueKeys: false })) {
-      visit(doc, { Scalar(_, node) { if (typeof node.value === 'string' && pred(node.value)) { found = true; return visit.BREAK; } return undefined; } });
+      visit(doc, { Scalar(_, node) { if (scalarHolds(node.value, pred) === true) { found = true; return visit.BREAK; } return undefined; } });
       if (found) return true;
     }
   } catch { /* unreadable: the caller checks the text as written */ }
