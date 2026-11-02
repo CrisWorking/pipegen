@@ -62,8 +62,8 @@ describe('a good file passes, with its counts', () => {
     expect(probs("export const make = (n) => ({ n });\n", 'test/helpers/h.js')).toEqual([]);
     refused("import fs from 'node:fs';\nexport const x = fs;\n", /node:fs/, 'test/helpers/h.js');
   });
-  it('urls to localhost, 127.0.0.1 and example.com pass (with ports and templates with a port)', () => {
-    expect(probs(ok("it('u', () => { const port = 3000; expect(`http://localhost:${port}/x`).toBe('http://127.0.0.1:8080/a?b=https://example.com'.length ? 'a' : 'b'); expect('https://example.com/a').toBeTruthy(); });"))).toEqual([]);
+  it('urls to localhost, 127.0.0.1 and example.com pass (with a literal port)', () => {
+    expect(probs(ok("it('u', () => { const port = 3000; expect(f('http://localhost:3000/x')).toBe(f('http://127.0.0.1:8080/a?b=https://example.com', 'http://[::1]:1/')); expect('https://example.com/a').toBeTruthy(); });"))).toEqual([]);
   });
 });
 
@@ -171,10 +171,10 @@ describe('validate: urls', () => {
     refused(t("'http://' + host"), /URL host|bare URL scheme|built at run time/);
     refused(t('`http://${host}/x`'), /built at run time/);
     refused(t("'h\\x74tp://evil.net'"), /evil\.net/);
-    refused(t("'http://[::1]:3000/'"), /URL host/);
-    expect(probs(t("'http://localhost:3000/x'"))).toEqual([]);
+        expect(probs(t("'http://localhost:3000/x'"))).toEqual([]);
     expect(probs(t("'http://127.0.0.1/x'"))).toEqual([]);
-    expect(probs(t('`http://localhost:${port}/x`'))).toEqual([]);
+    refused(t('`http://localhost:${port}/x`'), /built at run time/);   // a run-time port can not be proven to be the test's own server
+    expect(probs(t("'http://[::1]:3000/x'"))).toEqual([]);
   });
   it('a url in a comment is not code and does not count', () => {
     expect(probs(ok(`// see https://evil.example/doc\n${T}`))).toEqual([]);
@@ -343,7 +343,7 @@ describe('security scan 2: no network of its own', () => {
     for (const code of ["await fetch('http://localhost:1/')", "new WebSocket('ws://localhost:1')", "new EventSource('http://localhost:1')", 'new XMLHttpRequest()', "globalThis.fetch('http://localhost:1')", 'const g = fetch']) refused(body(code), /fetch|WebSocket|EventSource|XMLHttpRequest|globalThis/);
   });
   it('node:http: a server and requests to a literal local address pass', () => {
-    const code = "const s = http.createServer((req, res) => { res.end('x'); }); s.listen(0); http.get('http://127.0.0.1:1/x'); http.get(`http://localhost:${1}/x`); http.get({ port: 1, path: '/' }); http.request({ hostname: 'localhost', port: 1, method: 'POST', headers: {} }); http.request({ host: '127.0.0.1', port: 1 }); http.request({ hostname: '::1' }); http.STATUS_CODES[200]";
+    const code = "const s = http.createServer((req, res) => { res.end('x'); }); s.listen(0); http.get('http://127.0.0.1:1/x'); http.get(`http://localhost:${1}/x`); http.get({ port: 1, path: '/' }); http.request({ hostname: 'localhost', port: 1, method: 'POST', headers: {} }); http.request({ host: '127.0.0.1', port: 1 }); http.request({ hostname: '::1' })";
     expect(probs(body(code))).toEqual([]);
   });
   it('node:http: any other target, an unreadable one, or any other member is refused', () => {
@@ -354,12 +354,12 @@ describe('security scan 2: no network of its own', () => {
   it('node:http by name and by require follows the same rule', () => {
     expect(probs(body("get('http://127.0.0.1:1/'); request({ port: 1 });", "import { get, request, createServer } from 'node:http';\n"))).toEqual([]);
     refused(body("get('http://evil.net/')", "import { get } from 'node:http';\n"), /evil\.net/);
-    refused(body("get(u)", "import { get } from 'node:http';\n"), /literal 127/);
+    refused(body("get(u)", "import { get } from 'node:http';\n"), /literal local address/);
     refused(body("const r = get", "import { get } from 'node:http';\n"), /can only be called/);
     refused(body("", "import { Agent } from 'node:http';\n"), /node:http/);
-    refused(`${CJS}const http = require('node:http');\nit('a', () => { http.get(u); expect(f()).toBe(1); });`, /literal 127/, 'test/a.test.cjs');
+    refused(`${CJS}const http = require('node:http');\nit('a', () => { http.get(u); expect(f()).toBe(1); });`, /literal local address/, 'test/a.test.cjs');
     expect(probs(`${CJS}const http = require('node:http');\nit('a', () => { http.get({ port: 1 }); expect(f()).toBe(1); });`, 'test/a.test.cjs')).toEqual([]);
-    refused(`${CJS}const { get } = require('node:http');\nit('a', () => { get(u); expect(f()).toBe(1); });`, /literal 127/, 'test/a.test.cjs');
+    refused(`${CJS}const { get } = require('node:http');\nit('a', () => { get(u); expect(f()).toBe(1); });`, /literal local address/, 'test/a.test.cjs');
   });
   it('joined strings are read whole before the URL check', () => {
     const t = (e: string): string => ok(`it('u', () => { const hh = f(); expect(f(${e})).toBeTruthy(); });`);
@@ -403,5 +403,82 @@ describe('security scan 3: parse by the package type, and no `this` in plain fun
     expect(starterTestFileProblems('api/test/a.test.js', sloppy, { ...o, typeOf: () => 'module' }).join(' ')).toMatch(/parse/);
     expect(starterTestFileProblems('api/test/a.test.js', sloppy, { ...o, typeOf: () => 'commonjs' })).toEqual([]);
     expect(starterTestFileProblems('api/test/a.test.js', sloppy, o)).toEqual([]);
+  });
+});
+
+// ---- security scan, round 2 ----
+describe('security scan round 2 / 1: the http binding is only ever the object of a member call', () => {
+  const body = (code: string, head = "import http from 'node:http';\n"): string => `${HEAD}${head}it('a', async () => { const o = {}; ${code}; expect(1 + f()).toBe(2); });\n`;
+  it('as a value, alias, argument, element, spread, destructuring, computed member or bare statement it is refused', () => {
+    for (const code of ['const h2 = http', 'f(http)', 'const l = [http]', 'const m = { ...http }', 'const m = { http }', 'const { get } = http', "http['get']('http://127.0.0.1:1/')", "(0, http.get)('http://127.0.0.1:1/')", 'http', "const g = http.get", "http.get.call(o, 'http://127.0.0.1:1/')", 'f(http.get)', 'const e = http.createServer', 'return http', 'new http.Agent()', 'http.get ? 1 : 2']) {
+      refused(body(code), /node:http|http\./);
+    }
+    expect(probs(body("http.get('http://127.0.0.1:1/', () => 1); http.request({ port: 1 }); const srv = http.createServer(() => {}); srv.listen(0)"))).toEqual([]);
+    expect(probs(body("ns.get('http://127.0.0.1:1/')", "import * as ns from 'node:http';\n"))).toEqual([]);
+    refused(body('f(ns)', "import * as ns from 'node:http';\n"), /never as a value/);
+  });
+  it('named imports and require destructuring can only be called directly', () => {
+    for (const code of ['const g = get', 'f(get)', 'const l = [request]', 'createServer']) refused(body(code, "import { get, request, createServer } from 'node:http';\n"), /only be called|node:http/);
+    refused(`${CJS}const { get: g } = require('node:http');\nit('a', () => { f(g); expect(f()).toBe(1); });`, /only be called/, 'test/a.test.cjs');
+    refused(`${CJS}const { get: g } = require('node:http');\nit('a', () => { g(u); expect(f()).toBe(1); });`, /local address/, 'test/a.test.cjs');
+  });
+  it('require is only the init of a top-level const, and import() never takes node:http', () => {
+    refused(`${CJS}it('a', () => { const h = require('node:path'); expect(h.sep).toBe('/'); });`, /top of the file/, 'test/a.test.cjs');
+    refused(`${CJS}it('a', () => { expect(require('node:path').sep).toBe('/'); });`, /top of the file/, 'test/a.test.cjs');
+    refused(`${CJS}const x = f() || require('node:path');\nit('a', () => { expect(x).toBe(1); });`, /top of the file/, 'test/a.test.cjs');
+    refused(`${CJS}if (f()) { var q = require('node:path'); }\nit('a', () => { expect(q).toBe(1); });`, /top of the file/, 'test/a.test.cjs');
+    refused(body("const m = await import('node:http'); m.get(u)", ''), /import\(\)/);
+    refused(body("const m = await import(`node:http`)", ''), /import\(\)/);
+    expect(probs(`${CJS}const pth = require('node:path');\nit('a', () => { expect(pth.sep).toBe('/'); });`, 'test/a.test.cjs')).toEqual([]);
+    expect(probs(body("const m = await import('node:path'); expect(m.sep).toBe('/')", ''))).toEqual([]);
+  });
+});
+
+describe('security scan round 2 / 2: the other arguments of an http call', () => {
+  const body = (code: string): string => `${HEAD}import http from 'node:http';\nit('a', async () => { const o = {}; const args = []; ${code}; expect(1 + f()).toBe(2); });\n`;
+  const L = "'http://127.0.0.1:1/'";
+  it('after a URL only options (with the same rules) and a callback may follow', () => {
+    for (const code of [`http.get(${L}, () => 1)`, `http.get(${L}, (res) => { res.resume(); })`, `http.get(${L}, { headers: {}, method: 'GET' }, () => 1)`, `http.get(${L}, { hostname: 'localhost' })`, 'http.get({ port: 1 }, () => 1)', 'http.get({ port: 1 })']) expect(probs(body(code)), code).toEqual([]);
+    for (const code of [`http.get(${L}, { hostname: 'evil.net' })`, `http.get(${L}, { host: 'evil.net' }, () => 1)`, `http.get(${L}, { agent: o })`, `http.get(${L}, { ...o })`, `http.get(${L}, o)`, `http.get(${L}, 5)`, `http.get(${L}, 'http://evil.net/')`, `http.get(${L}, () => 1, 1)`, `http.get(${L}, () => 1, () => 1)`, `http.get(${L}, ...args)`, `http.get(${L}, {}, {})`,
+      'http.get({ port: 1 }, { host: "evil.net" })', 'http.get({ port: 1 }, o)', 'http.get({ port: 1 }, () => 1, 1)', 'http.get({ port: 1 }, 5)', 'http.get({ port: 1 }, ...args)', "http.get('http://example.com/')"]) refused(body(code), /local address|http/);
+  });
+});
+
+describe('security scan round 2 / 3: reserved names can not be declared, so no scope can shadow a listed global', () => {
+  const body = (code: string, head = ''): string => `${HEAD}${head}it('a', async () => { const o = {}; ${code}; expect(1 + f()).toBe(2); });\n`;
+  it('a nested variable, function, class, parameter, catch or destructured name that is listed is refused', () => {
+    for (const code of ['function g(fetch) { return fetch(1); } g(f)', 'const g = (Object) => Object.getPrototypeOf(1); g(f)', 'try { f(); } catch (Reflect) { Reflect.ownKeys(o); }', '{ const Object = o; Object.getPrototypeOf(1); }', 'class Map {}', 'const { JSON } = o', 'let process = 1', 'function Math() {}', 'const [Symbol] = [1]', 'const { a: Date = 1 } = o', 'function g(...Buffer) {} g()', 'const __dirname = 1', 'const __x = 1', 'const Function = 1', 'const globalThis = 1', 'const fetch = f', 'const require = f', 'const vi = f', 'const expect = f', 'const it = f', 'const describe = f', 'const test = f', 'const module = 1', 'const exports = 1', 'const constructor = 1', 'const undefined = 1', 'const console = f', 'const URL = f', 'const Promise = f', 'const parseInt = f']) {
+      refused(body(code), /reserves|declares/);
+    }
+    refused(body('', "import Object from 'express';\n"), /reserves/, 'test/a.test.ts', ['express']);
+    refused(body('', "import { Map } from 'express';\n"), /reserves/, 'test/a.test.ts', ['express']);
+  });
+  it('an API name is bound once, by importing it; declaring it again anywhere is refused', () => {
+    refused(body('function g(expect) { return expect; } g(f)'), /declared again/);
+    refused(body('const http = f', "import http from 'node:http';\n"), /declared again/);
+    refused(body('function g(http) { return http; } g(f)', "import http from 'node:http';\n"), /declared again/);
+    refused(`import assert from 'node:assert';\nimport { it, expect } from 'vitest';\nconst f = () => 1;\nit('a', () => { const assert = f; assert(f()); expect(f()).toBe(1); });\n`, /declared again|reserves/);
+    refused(`${CJS}const { it: it2 } = require('vitest');\nfunction g(describe) { return describe; }\nit('a', () => { expect(f()).toBe(1); });`, /declared again|reserves/, 'test/a.test.cjs');
+    expect(probs(`import assert, { strictEqual } from 'node:assert';\nimport { it } from 'vitest';\nconst f = () => 1;\nit('a', () => { assert.equal(f(), 1); strictEqual(f(), 1); });\n`)).toEqual([]);
+  });
+  it('an ordinary name is fine, in any scope', () => {
+    expect(probs(body('const name = 1, status = 2, items = [3]; function helper(count, ...rest) { return count; } try { f(); } catch (err) { err.x; } class Box { m(v) { return v; } } helper(name + status + items.length + new Box().m(1))'))).toEqual([]);
+  });
+});
+
+describe('security scan round 2 / 4: scheme, host and port are written out, and parsed as a URL', () => {
+  const t = (e: string): string => ok(`it('u', () => { const port = f(), host = f(), scheme = f(), p = f(); expect(f(${e})).toBeTruthy(); });`);
+  it('a run-time piece in the scheme, the host or the port is refused; in the path it is fine', () => {
+    for (const e of ['`http://localhost:${port}/x`', '`http://${host}/x`', '`http://localhost${port}/x`', '`${scheme}://localhost/x`', '`http://127.0.0.1:${port}`', "'http://localhost:' + port", "'http://localhost' + ':' + port + '/x'", "'http://' + host + '/x'", '`http://[::1]:${port}/`', '`http://localhost:80${port}/`']) refused(t(e), /built at run time|URL host|can not read|bare URL/);
+    for (const e of ['`http://localhost:3000/${p}`', "'http://localhost:3000/' + p", '`http://127.0.0.1/a?b=${p}#${p}`']) expect(probs(t(e)), e).toEqual([]);
+  });
+  it('the host is what the URL parser reads: localhost, 127.0.0.1, [::1] (and example.com in a plain string), nothing else', () => {
+    for (const e of ["'http://localhost:3000/x'", "'http://LOCALHOST/x'", "'http://[::1]:80/x'", "'https://127.0.0.1:8443/x'", "'http://127.1/x'", "'http://0x7f.0.0.1/x'", "'http://example.com/x'"]) expect(probs(t(e)), e).toEqual([]);
+    for (const e of ["'http://localhost%2eevil.net/x'", "'http://localhost.evil.net/x'", "'http://localhost:abc/x'", "'http://localhost:99999/x'", "'http://[::2]/x'", "'http://10.0.0.1/x'", "'http://169.254.169.254/'", "'http://evil.net:80" + "@localhost/x'", "'http://localhost@evil.net/x'", "'http://u" + ":p@localhost/x'", "'http://localhost\\\\@evil.net/x'", "'http://2130706434/x'", "'http://[::ffff:10.0.0.1]/x'", "'http:///evil.net'", "'http://'"]) refused(t(e), /URL|scheme/);
+  });
+  it('an http call takes only a local host, example.com included is not local', () => {
+    const body = (a: string): string => `${HEAD}import http from 'node:http';\nit('a', () => { http.get(${a}); expect(f()).toBe(1); });\n`;
+    for (const a of ["'http://localhost:1/x'", "'http://[::1]:1/x'", "'https://127.0.0.1:1/x'", "'http://LOCALHOST:1'"]) expect(probs(body(a)), a).toEqual([]);
+    for (const a of ["'http://example.com/x'", "'http://localhost.evil.net/'", "'http://localhost%2eevil.net/'", "`http://localhost:${f()}/x`", "'//localhost/x'", "'localhost'", "'ftp://localhost/'"]) refused(body(a), /local address|URL|built/);
   });
 });
