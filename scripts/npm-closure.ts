@@ -7,6 +7,7 @@
 // folder under runner temp.
 //
 //   node scripts/npm-closure.ts [--only id,id] [--before <ISO date>]
+// (also the B2 closures, vitest-coverage and c8: see B2_CLOSURES)
 //
 // For each entry it runs, in an empty temp dir with empty user and global npmrc files:
 //   npm install --package-lock-only --ignore-scripts --no-audit --no-fund --before=<date 7 days ago>
@@ -34,6 +35,18 @@ export const CLOSURES: Readonly<Record<string, { extra?: Readonly<Record<string,
   'oxlint-typeaware': {},
   prettier: {},
   knip: { extra: { typescript: '6.0.3' } },
+};
+
+/**
+ * The B2 closures (v0.2 Plan D, D6): the reviewed repo-code pins pipegen adds to a user's devDependencies (vitest + @vitest/coverage-v8, c8).
+ * A different class from CLOSURES: the renderer never installs from them. They are only the reviewed set the lock judge
+ * (src/create/reviewed-closure.ts) holds a user's lock edit against, and their `before` date is the one the producer
+ * (src/create/npm-deps.ts) passes to npm, so npm picks the same transitive versions. Kept apart so the test that pins CLOSURES to the
+ * argv policies stays true.
+ */
+export const B2_CLOSURES: Readonly<Record<string, { extra?: Readonly<Record<string, string>> }>> = {
+  'vitest-coverage': {},
+  c8: {},
 };
 
 const DAY_MS = 86_400_000;
@@ -95,7 +108,7 @@ function main(argv: string[]): number {
   const before = arg(argv, '--before') ?? new Date(Date.now() - 7 * DAY_MS).toISOString();
   const data = parse(readFileSync(resolve('data/reviewed-tools.yml'), 'utf8')) as { tools: Record<string, unknown>[] };
   const outDir = resolve('data/npm-closures');
-  for (const [id, c] of Object.entries(CLOSURES)) {
+  for (const [id, c] of Object.entries({ ...CLOSURES, ...B2_CLOSURES })) {
     if (only !== undefined && !only.includes(id)) continue;
     const entry = data.tools.find((t) => t.id === id);
     if (entry === undefined) throw new Error(`no reviewed entry ${id}`);
