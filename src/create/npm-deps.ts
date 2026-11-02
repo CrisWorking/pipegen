@@ -153,11 +153,17 @@ export function planNpmDeps(input: NpmDepsInput): NpmDepsResult {
   const prefix = rootPrefix(service.path);
   const at = (n: string): string => (prefix === '' ? n : `${prefix}/${n}`);
   const names = Object.keys(add).join(' and ');
-  const reason = `Adds ${names} at the reviewed version${setTest ? ' and sets the test script to vitest run' : ''} so tests and coverage can run.`;
+  const onlyScript = names === '';   // the pins are already there: only scripts.test changes, the lock stays as it is
+  const reason = onlyScript
+    ? 'Sets the test script to vitest run so tests and coverage can run.'
+    : `Adds ${names} at the reviewed version${setTest ? ' and sets the test script to vitest run' : ''} so tests and coverage can run.`;
+  const lockReason = onlyScript
+    ? 'Unchanged; edited together with package.json (npm ci needs both).'
+    : `Records ${names} and what it needs in the lockfile, from the registry, at the reviewed versions.`;
   return {
     files: [
       { path: at('package.json'), content: newJson, part: 'tests', reason, repo: 'app', needsConfirm: true, edited: { original: input.packageJson } },
-      { path: at('package-lock.json'), content: newLock, part: 'tests', reason: `Records ${names} and what it needs in the lockfile, from the registry, at the reviewed versions.`, repo: 'app', needsConfirm: true, edited: { original: input.packageLock } },
+      { path: at('package-lock.json'), content: newLock, part: 'tests', reason: lockReason, repo: 'app', needsConfirm: true, edited: { original: input.packageLock } },
     ],
     notes,
   };

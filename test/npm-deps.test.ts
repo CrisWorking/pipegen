@@ -229,6 +229,9 @@ describe('D6 fix round 1', () => {
     expect(JSON.parse((r.files[0] as CreatedFile).content).scripts.test).toBe('vitest run');
     expect((r.files[0] as CreatedFile).content).toBe(both.replace('"test": "echo \\"Error: no test specified\\" && exit 1"', '"test": "vitest run"'));
     expect((r.files[1] as CreatedFile).content).toBe(lockText);
+    // N1: the reasons are true on this path (no empty name list, no claim that the lock changed)
+    expect((r.files[0] as CreatedFile).reason).toBe('Sets the test script to vitest run so tests and coverage can run.');
+    expect((r.files[1] as CreatedFile).reason).toBe('Unchanged; edited together with package.json (npm ci needs both).');
     expect((await refereeOf(r.files)).issues.map((i) => i.message)).toEqual([]);
     const { root, base } = repoDir({ 'package.json': both, 'package-lock.json': lockText });
     expect((await guardCreatedFiles(r.files, { root, baseTree: base, installRecord: null, profile: mkDraft().profile, closure: loadReviewedClosure(reviewedList()) })).refused).toEqual([]);
