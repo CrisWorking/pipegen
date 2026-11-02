@@ -37,11 +37,15 @@ export function coverageChoice(measured: number, existing: number | null): (type
 export interface CoverageDecision { choice: (typeof COVERAGE_MINIMUMS)[number] | null; blocking: boolean; notes: string[] }
 
 export function coverageNotes(measured: number, existing: number | null): CoverageDecision {
+  if (typeof measured !== 'number' || !Number.isFinite(measured) || measured < 0 || measured > 100) {
+    return { choice: null, blocking: false, notes: ['the measured coverage could not be read, so the coverage check is not blocking'] };
+  }
   const choice = coverageChoice(measured, existing);
   const notes: string[] = [];
   if (choice === null) {
-    const why = existing !== null && existing < LOWEST ? `; your own config asks for only ${existing}%` : '';
-    notes.push(`coverage is ${Math.floor(measured * 100) / 100}%, below pipegen's lowest minimum (${LOWEST}%)${why}, so the coverage check is not blocking`);
+    // the measurement is the cause only when it is below the lowest minimum; otherwise the repo's own (lower) minimum is
+    if (Math.floor(measured) - 1 >= LOWEST && existing !== null && existing < LOWEST) notes.push(`your own config asks for only ${existing}%, below pipegen's lowest minimum (${LOWEST}%), so the coverage check is not blocking`);
+    else notes.push(`coverage is ${Math.floor(measured * 100) / 100}%, below pipegen's lowest minimum (${LOWEST}%), so the coverage check is not blocking`);
     return { choice: null, blocking: false, notes };
   }
   if (existing !== null && existing > Number(choice)) notes.push(`your own config still requires ${existing}% in your test job; pipegen's check uses ${choice}% and never edits your config`);
@@ -62,11 +66,28 @@ export interface ExistingMinimumInput {
 const pct = (v: unknown): number | null => (typeof v === 'number' && Number.isFinite(v) && v >= 0 && v <= 100 ? v : null);
 /** `thresholds: { ... lines: N ... }` inside one flat block (no nested brace, at most 400 characters), N a plain number. */
 const THRESHOLDS_RE = /\bthresholds\s*:\s*\{([^{}]{0,400})\}/g;
-const LINES_RE = /(?:^|[\s,])lines\s*:\s*([^,}]{1,40})/;
+const LINES_RE = /(?:^|[\s,])(?:lines|'lines'|"lines")\s*:\s*([^,}]{1,40})/;
 const NUMBER_RE = /^(\d{1,3})(?:\.\d{1,4})?$/;
 
 /** From one vitest/vite config text: the `lines` minima found, and whether something was there that could not be read. */
-function fromVitestConfig(text: string): { values: number[]; unreadable: boolean } {
+/** `text` without `// …` line comments and `/* … *\/` block comments (bounded by the caller's size cap; no regex backtracking). */
+function stripComments(text: string): string {
+  let out = '';
+  let i = 0;
+  let quote = '';
+  while (i < text.length) {
+    const c = text[i] as string;
+    if (quote !== '') { out += c; if (c === '\\') { out += text[i + 1] ?? ''; i += 2; continue; } if (c === quote) quote = ''; i++; continue; }
+    if (c === '"' || c === "'" || c === '`') { quote = c; out += c; i++; continue; }
+    if (c === '/' && text[i + 1] === '/') { while (i < text.length && text[i] !== '\n') i++; continue; }
+    if (c === '/' && text[i + 1] === '*') { const end = text.indexOf('*/', i + 2); i = end < 0 ? text.length : end + 2; out += ' '; continue; }
+    out += c; i++;
+  }
+  return out;
+}
+
+function fromVitestConfig(raw: string): { values: number[]; unreadable: boolean } {
+  const text = stripComments(raw);
   const values: number[] = [];
   let unreadable = false;
   for (const m of text.matchAll(THRESHOLDS_RE)) {
@@ -83,8 +104,7 @@ function fromVitestConfig(text: string): { values: number[]; unreadable: boolean
 }
 
 /**
- * The repo's own `lines` minimum: the smallest one found (the conservative reading when several configs exist), or null when none is
- * configured or one could not be read; `notes` say what could not be read. Bounded: a text over 256 KiB is not read.
+ * The repo's own `lines` minimum, or null when none is configured, one could not be read, or several disagree; `notes` say what could not be read. Bounded: a text over 256 KiB is not read.
  */
 export function readExistingMinimum(input: ExistingMinimumInput): { minimum: number | null; notes: string[] } {
   const values: number[] = [];
@@ -93,8 +113,7 @@ export function readExistingMinimum(input: ExistingMinimumInput): { minimum: num
   for (const f of input.vitestConfigs ?? []) {
     if (f.text.length > MAX_TEXT) { bad(f.path, 'the file is too large'); continue; }
     const r = fromVitestConfig(f.text);
-    values.push(...r.values);
-    if (r.unreadable) bad(f.path, 'the thresholds are not a plain number');
+    if (r.unreadable) bad(f.path, 'the thresholds are not a plain number'); else values.push(...r.values);
   }
   const json = (where: string, text: string, pick: (v: Record<string, unknown>) => unknown): void => {
     if (text.length > MAX_TEXT) { bad(where, 'the file is too large'); return; }
@@ -111,7 +130,9 @@ export function readExistingMinimum(input: ExistingMinimumInput): { minimum: num
   };
   for (const f of input.c8rcs ?? []) json(f.path, f.text, (o) => o);
   if (input.packageJson !== undefined) json('package.json', input.packageJson, (o) => o.c8);
-  return { minimum: values.length === 0 ? null : Math.min(...values), notes };
+  // several different minima (several configs, or a config and a c8 section): none is chosen, and the note says so
+  if (new Set(values).size > 1) { notes.push(`pipegen found different coverage minimums in your configuration (${[...new Set(values)].sort((a, b) => a - b).join('%, ')}%) that disagree, so it assumes none`); return { minimum: null, notes }; }
+  return { minimum: values[0] ?? null, notes };
 }
 
 // ---------- the measured value ----------
@@ -123,7 +144,7 @@ export function readExistingMinimum(input: ExistingMinimumInput): { minimum: num
 export function measuredLines(output: string): number | null {
   for (const line of output.slice(0, 1024 * 1024).split('\n')) {
     if (line.length > 400) continue;
-    const m = /^\s*All files\s*\|(.*)$/.exec(line);
+    const m = /^\s*All files\s*\|([^\r]*)\r?$/.exec(line);
     if (m === null) continue;
     const cells = (m[1] as string).split('|').map((c) => c.trim());
     const raw = cells[3];

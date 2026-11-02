@@ -11,7 +11,7 @@ import { gitBlobSha, guardCreatedFiles, type BaseTree } from '../src/create/guar
 import { buildPackageJson } from '../src/create/package-edit.js';
 import { planNpmDeps, type NpmRunner } from '../src/create/npm-deps.js';
 import { loadReviewedClosure } from '../src/create/reviewed-closure.js';
-import { pinOk } from '../src/engine/npm-closure.js';
+import { lockEntryProblems, pinOk } from '../src/engine/npm-closure.js';
 import { emptyRepoFiles } from '../src/read/quality.js';
 import type { Capabilities, CreatedFile, PipelineDraft } from '../src/types.js';
 import { packageDataPath } from '../src/util/package-data.js';
@@ -79,7 +79,7 @@ describe('npm-deps: the producer', () => {
     const only = plan({ packageJson: withVitest });
     expect(only.notes).toEqual([]);
     expect(JSON.parse((only.files[0] as CreatedFile).content).devDependencies).toEqual({ typescript: '5.6.0', vitest: '5.0.5', '@vitest/coverage-v8': '5.0.5' });
-    expect(plan({ packageJson: withVitest.replace('"vitest": "5.0.5"', '"vitest": "5.0.5",\n    "@vitest/coverage-v8": "5.0.5"') })).toEqual({ files: [], notes: [] });
+    expect(plan({ packageJson: withVitest.replace('"vitest": "5.0.5"', '"vitest": "5.0.5",\n    "@vitest/coverage-v8": "5.0.5"').replace('echo \\"Error: no test specified\\" && exit 1', 'jest') })).toEqual({ files: [], notes: [] });
     expect(plan({ tool: 'c8', packageJson: PJ.replace('"typescript": "5.6.0"', '"c8": "12.0.0"') })).toEqual({ files: [], notes: [] });
     // another vitest / c8 / coverage plugin: never changed, a not-proven note
     for (const [pjText, tool, re] of [
@@ -176,6 +176,65 @@ describe('npm-deps: the producer', () => {
     // c8 as well
     const c = plan({ tool: 'c8' });
     expect((await refereeOf(c.files)).ok).toBe(true);
+  });
+});
+
+describe('D6 fix round 1', () => {
+  it('m4: lockEntryProblems scrubs with the active vault before it cuts: 0 four-char pieces of a value across a cut point', () => {
+    const value = 'zzvaultvalue98765qwerty';
+    const vault = new SecretVault();
+    vault.set('K_LOCK', value);
+    const pieces = (shown: string): void => { for (let k = 0; k + 4 <= value.length; k++) expect(shown, value.slice(k, k + 4)).not.toContain(value.slice(k, k + 4)); };
+    const ok = { version: '1.0.0', resolved: 'https://registry.npmjs.org/a/-/a-1.0.0.tgz', integrity: `sha512-${Buffer.from('a'.repeat(64)).toString('base64')}` };
+    for (const pad of [0, 30, 55, 66, 70, 75]) {
+      const key = `node_modules/${'k'.repeat(pad)}${value}`;
+      const shown = withActiveVault(vault, () => lockEntryProblems(key, 42).join(' | '));
+      expect(shown.length).toBeGreaterThan(0);
+      pieces(shown);
+      const keyed = withActiveVault(vault, () => lockEntryProblems(key, { ...ok, version: 'x' }).join(' | '));
+      pieces(keyed);
+      const bundled = withActiveVault(vault, () => lockEntryProblems(key, { ...ok, link: true }).join(' | '));
+      pieces(bundled);
+    }
+    for (const pad of [0, 10, 25, 33, 38, 45]) {
+      const spec = `${'s'.repeat(pad)}${value}`;
+      const shown = withActiveVault(vault, () => lockEntryProblems('node_modules/a', { ...ok, dependencies: { b: `git+https://x/${spec}` } }).join(' | '));
+      expect(shown.length).toBeGreaterThan(0);
+      pieces(shown);
+    }
+    // without a vault nothing changes
+    expect(lockEntryProblems('node_modules/a', { ...ok, dependencies: { b: 'npm:evil@1' } }).join(' ')).toMatch(/npm:evil@1/);
+  });
+  it('m4: the producer\'s not-proven notes quote no judge text (a fixed sentence)', () => {
+    const value = 'zzvaultvalue98765qwerty';
+    const vault = new SecretVault();
+    vault.set('K_LOCK', value);
+    const evil = plan({ runner: (cwd) => { const l = JSON.parse(readFileSync(join(cwd, 'package-lock.json'), 'utf8')) as { packages: Record<string, unknown> }; l.packages[`node_modules/${value}`] = { version: '1.0.0' }; writeFileSync(join(cwd, 'package-lock.json'), JSON.stringify(l)); return { status: 0, output: '' }; } });
+    const note = withActiveVault(vault, () => evil.notes.join(' '));
+    expect(evil.files).toEqual([]);
+    expect(note).toMatch(/not provably the reviewed one/);
+    expect(note).not.toContain(value.slice(0, 8));
+  });
+  it('m8: vitest and the coverage plugin already at 5.0.5 with npm\'s default scripts.test: scripts.test is set (package.json edit, lock unchanged), through the referee and the guard', async () => {
+    const both = PJ.replace('"typescript": "5.6.0"', '"typescript": "5.6.0",\n    "vitest": "5.0.5",\n    "@vitest/coverage-v8": "5.0.5"');
+    const lock = JSON.parse(LOCK) as { packages: Record<string, Record<string, unknown>> };
+    lock.packages[''] = { ...lock.packages[''], devDependencies: { typescript: '5.6.0', vitest: '5.0.5', '@vitest/coverage-v8': '5.0.5' } };
+    for (const [id] of [['vitest-coverage']]) for (const [k, e] of Object.entries(closureLock(id as string).packages)) if (k !== '' && lock.packages[k] === undefined) lock.packages[k] = { ...e, dev: true };
+    const lockText = `${JSON.stringify(lock, null, 2)}\n`;
+    const calls: number[] = [];
+    const r = plan({ packageJson: both, packageLock: lockText, runner: () => { calls.push(1); return { status: 1, output: '' }; } });
+    expect(calls).toEqual([]);   // npm is not needed: only a script changes
+    expect(r.notes).toEqual([]);
+    expect(r.files.map((f) => f.path)).toEqual(['package.json', 'package-lock.json']);
+    expect(JSON.parse((r.files[0] as CreatedFile).content).scripts.test).toBe('vitest run');
+    expect((r.files[0] as CreatedFile).content).toBe(both.replace('"test": "echo \\"Error: no test specified\\" && exit 1"', '"test": "vitest run"'));
+    expect((r.files[1] as CreatedFile).content).toBe(lockText);
+    expect((await refereeOf(r.files)).issues.map((i) => i.message)).toEqual([]);
+    const { root, base } = repoDir({ 'package.json': both, 'package-lock.json': lockText });
+    expect((await guardCreatedFiles(r.files, { root, baseTree: base, installRecord: null, profile: mkDraft().profile, closure: loadReviewedClosure(reviewedList()) })).refused).toEqual([]);
+    // already set to something else, or already vitest run: nothing to do
+    expect(plan({ packageJson: both.replace('echo \\"Error: no test specified\\" && exit 1', 'jest'), packageLock: lockText })).toEqual({ files: [], notes: [] });
+    expect(plan({ packageJson: both.replace('echo \\"Error: no test specified\\" && exit 1', 'vitest run'), packageLock: lockText })).toEqual({ files: [], notes: [] });
   });
 });
 

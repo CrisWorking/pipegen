@@ -250,6 +250,7 @@ export function lockProblems(original: string, content: string, opts: LockOpts =
     const reviewed = closure.entries.get(id);
     if (reviewed === undefined) { out.push(`${show(key)} (${show(id)}) is not in the reviewed closure, so pipegen does not add it`); continue; }
     if (!same(sortedDeep(withoutPlacement(e)), sortedDeep(withoutPlacement(reviewed)))) out.push(`${show(key)} is not the reviewed ${show(id)}: its resolved address, integrity, install script or dependencies differ from the reviewed entry`);
+    for (const f of ['peer', 'optional'] as const) if (e[f] !== undefined && e[f] !== true) out.push(`${show(key)} has an odd placement flag (${f}); npm writes it only as true`);
     if (e.dev !== true || e.devOptional !== undefined) out.push(`${show(key)} must be marked dev (and not devOptional), so it never reaches a production install`);
   }
 

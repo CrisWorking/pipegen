@@ -1,4 +1,4 @@
-// v0.2 Plan D, D6 (ruling B5): the coverage minimum is computed by code. Written first.
+// v0.2 Plan D, D6 (ruling B5): the coverage minimum is computed by code. (Written after the code; fix round 1 added its cases first.)
 import { execFileSync, spawnSync } from 'node:child_process';
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -31,7 +31,13 @@ describe('coverageChoice (B5)', () => {
     expect(coverageNotes(100, 65)).toEqual({ choice: '60', blocking: true, notes: ["your own config still requires 65% in your test job; pipegen's check uses 60% and never edits your config"] });
     expect(coverageNotes(100, 70).notes).toEqual([]);
     expect(coverageNotes(100, 50).blocking).toBe(false);
-    expect(coverageNotes(100, 50).notes[0]).toMatch(/only 50%/);
+    expect(coverageNotes(100, 50).notes[0]).toBe("your own config asks for only 50%, below pipegen's lowest minimum (60%), so the coverage check is not blocking");
+    expect(coverageNotes(95, 50).notes.join(' ')).not.toMatch(/coverage is 95%/);
+    for (const m of [Number.NaN, Number.POSITIVE_INFINITY, -1, 100.5]) {
+      const r = coverageNotes(m, null);
+      expect(r).toEqual({ choice: null, blocking: false, notes: ['the measured coverage could not be read, so the coverage check is not blocking'] });
+    }
+    expect(coverageNotes(42.5, 50).notes[0]).toMatch(/coverage is 42\.5%, below pipegen's lowest minimum \(60%\)/);
   });
 
   it('coverage: existing minimum read from vitest/vite config (bounded regex), .c8rc*, package.json c8 (smol JSON parse); unreadable → note', () => {
@@ -40,8 +46,19 @@ describe('coverageChoice (B5)', () => {
     expect(v('thresholds: {\n  statements: 50,\n  lines: 72.5,\n}', 'vite.config.js').minimum).toBe(72.5);
     expect(v('export default {}')).toEqual({ minimum: null, notes: [] });
     expect(v('thresholds: { branches: 70 }')).toEqual({ minimum: null, notes: [] });
-    // the smallest of several (the conservative reading)
-    expect(v('a = { thresholds: { lines: 90 } }; b = { thresholds: { lines: 75 } }').minimum).toBe(75);
+    // several that disagree: none is chosen, and a note says so (fix round 1, m2); equal ones are fine
+    const dis = v('a = { thresholds: { lines: 90 } }; b = { thresholds: { lines: 75 } }');
+    expect(dis.minimum).toBeNull();
+    expect(dis.notes[0]).toMatch(/disagree/);
+    expect(v('a = { thresholds: { lines: 75 } }; b = { thresholds: { lines: 75 } }').minimum).toBe(75);
+    // quoted keys are read; comments are not; a spread beside a number gives no minimum (not both a value and "assumes none")
+    expect(v("thresholds: { 'lines': 80 }").minimum).toBe(80);
+    expect(v('thresholds: { "lines": 81 }').minimum).toBe(81);
+    expect(v('// thresholds: { lines: 0 }\nexport default { test: { coverage: { thresholds: { lines: 80 } } } }')).toEqual({ minimum: 80, notes: [] });
+    expect(v('/* thresholds: { lines: 0 } */ thresholds: { lines: 80 }').minimum).toBe(80);
+    const spread = v('thresholds: { ...base, lines: 80 }');
+    expect(spread.minimum).toBeNull();
+    expect(spread.notes).toHaveLength(1);
     // unreadable: a variable, a nested object, a spread, a huge number, a huge file
     for (const bad of ['thresholds: { lines: MIN }', 'thresholds: { lines: 80 + 5 }', 'thresholds: { lines: 101 }', 'thresholds: { lines: -1 }', 'thresholds: { lines: 0x50 }', 'thresholds: base', 'thresholds: { ...base }', 'thresholds: { perFile: { lines: 80 }, lines: 90 }', 'thresholds: { lines: "80" }']) {
       const r = v(bad);
@@ -78,14 +95,16 @@ describe('coverageChoice (B5)', () => {
     expect(p('{"name":"x","c8":[]}').notes).toHaveLength(1);
     expect(p('{"name":"x","c8":{"lines":"a"}}').notes[0]).toMatch(/package\.json/);
     expect(p('{"name":').notes).toHaveLength(1);
-    // all three sources together: the smallest
-    expect(readExistingMinimum({ vitestConfigs: [{ path: 'vitest.config.ts', text: 'thresholds: { lines: 95 }' }], c8rcs: [{ path: '.c8rc.json', text: '{"lines": 85}' }], packageJson: '{"c8":{"lines":88}}' }).minimum).toBe(85);
+    // all three sources together: equal -> that value; different -> none, with a note
+    expect(readExistingMinimum({ vitestConfigs: [{ path: 'vitest.config.ts', text: 'thresholds: { lines: 85 }' }], c8rcs: [{ path: '.c8rc.json', text: '{"lines": 85}' }], packageJson: '{"c8":{"lines":85}}' })).toEqual({ minimum: 85, notes: [] });
+    expect(readExistingMinimum({ vitestConfigs: [{ path: 'vitest.config.ts', text: 'thresholds: { lines: 95 }' }], c8rcs: [{ path: '.c8rc.json', text: '{"lines": 85}' }], packageJson: '{"c8":{"lines":88}}' }).minimum).toBeNull();
     // a path the repo chose is shown cut and on one line
     expect(readExistingMinimum({ c8rcs: [{ path: `.c8rc\nx${'y'.repeat(300)}`, text: 'nope' }] }).notes[0]).not.toMatch(/\n/);
   });
 
   it('coverage: measured lines are read by code from the `All files` row of the text summary', () => {
     expect(measuredLines(VITEST_TABLE)).toBe(60);
+    expect(measuredLines(VITEST_TABLE.replace(/\n/g, '\r\n'))).toBe(60);   // CRLF logs
     expect(measuredLines('noise\nAll files  |   92.3 |   85.7 |   100 |   91.25 |\n')).toBe(91.25);
     for (const bad of ['', 'no table', 'All files | a | b | c | d |', 'All files | 1 | 2 | 3 |', 'All files | 1 | 2 | 3 | 101 |', ' a.js | 1 | 2 | 3 | 4 |', `All files |${' 1 |'.repeat(200)}`]) expect(measuredLines(bad), bad).toBeNull();
     expect(measuredLines(`${'x'.repeat(2_000_000)}\nAll files | 1 | 2 | 3 | 90 |`)).toBeNull();   // only the first MiB is read

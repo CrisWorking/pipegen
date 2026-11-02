@@ -310,6 +310,11 @@ describe('lockProblems (B2, fix round 1): added entries must be reviewed code', 
     expect(lp(OLD, edit((l) => { l.packages['node_modules/tinyspy'].peer = true; }))).toBe('');
     expect(lp(OLD, edit((l) => { l.packages['node_modules/tinyspy'].peer = true; l.packages['node_modules/tinyspy'].optional = true; }))).toBe('');
     expect(lp(OLD, edit((l) => { l.packages['node_modules/tinyspy'].devOptional = true; l.packages['node_modules/tinyspy'].peer = true; }))).toMatch(/tinyspy.*dev/);
+    // m5 (D6 fix round 1): npm writes `peer` and `optional` only as true; any other value is refused
+    for (const v of [false, 'x', 1, null, {}]) {
+      expect(lp(OLD, edit((l) => { l.packages['node_modules/tinyspy'].peer = v; })), `peer ${JSON.stringify(v)}`).toMatch(/tinyspy.*(placement|flag)/);
+      expect(lp(OLD, edit((l) => { l.packages['node_modules/tinyspy'].optional = v; })), `optional ${JSON.stringify(v)}`).toMatch(/tinyspy.*(placement|flag)/);
+    }
   });
   it('P15: an entry with another version, no dev flag, devOptional, an install script the reviewed entry lacks, or another integrity is refused', () => {
     const cases: [string, (l: { packages: Record<string, Record<string, unknown>> }) => void, RegExp][] = [
@@ -449,7 +454,7 @@ describe('lockProblems (B2, fix round 1): added entries must be reviewed code', 
 });
 
 describe('reviewed closure loader', () => {
-  it('loads the real closure data (D6): the three reviewed pins at the reviewed integrity, and every closure edge is readable by semver-min', async () => {
+  it('loads the real closure data (D6): the three reviewed pins at the reviewed integrity, and every closure edge that resolves is readable and satisfied; of all 180 declared edges exactly one is null (D6-I1)', async () => {
     const { loadReviewedClosure } = await import('../src/create/reviewed-closure.js');
     const { reviewedList } = await import('./helpers/render.js');
     const c = loadReviewedClosure(reviewedList());
@@ -472,6 +477,15 @@ describe('reviewed closure loader', () => {
       }
     }
     expect(edges).toBe(155);   // 180 declared edges, 25 of them optional peers the lock does not hold
+    // ALL 180 declared edges, resolved or not: exactly one is outside the grammar (ruling D6-I1: a prerelease range stays null; the lock judge checks that
+    // optional peer only when the user's lock holds @vitest/browser-webdriverio, which means a repo with its own vitest, so it is refused: fail closed)
+    const nulls: string[] = []; let declared = 0;
+    for (const id of ['vitest-coverage', 'c8']) {
+      const pk = (JSON.parse(readFileSync(packageDataPath(`npm-closures/${id}.json`), 'utf8')) as { packages: Record<string, Record<string, Record<string, string> | string>> }).packages;
+      for (const [key, e] of Object.entries(pk)) for (const f of ['dependencies', 'optionalDependencies', 'peerDependencies']) for (const [d, r] of Object.entries((e[f] ?? {}) as Record<string, string>)) { declared++; if (satisfies('1.0.0', r) === null) nulls.push(`${id} ${key} ${f} ${d} ${r}`); }
+    }
+    expect(declared).toBe(180);
+    expect(nulls).toEqual(['vitest-coverage node_modules/vitest peerDependencies @vitest/browser-webdriverio ^5.0.0-beta.5 || >=5.0.0']);
   });
   it('gives null when the data is not there: every lock edit stays refused', async () => {
     const { loadReviewedClosure } = await import('../src/create/reviewed-closure.js');

@@ -54,6 +54,7 @@ export interface NpmDepsInput {
 }
 export interface NpmDepsResult { files: CreatedFile[]; notes: string[] }
 
+class SkipNpm extends Error {}
 const isObj = (v: unknown): v is Record<string, unknown> => typeof v === 'object' && v !== null && !Array.isArray(v);
 const notProven = (reason: string): NpmDepsResult => ({ files: [], notes: [reason] });
 
@@ -92,7 +93,7 @@ export function planNpmDeps(input: NpmDepsInput): NpmDepsResult {
     if (vitestIn !== null) {
       if (vitestIn !== 'devDependencies' || dev.vitest !== B2_DEVDEPS.vitest) return notProven(`${where} has its own Vitest (${activeSafeText(String((pkg[vitestIn] as Record<string, unknown>).vitest), 40)}); its tests run with it, but pipegen's reviewed Vitest is ${B2_DEVDEPS.vitest}, so coverage is not proven`);
       if (declaredIn(pkg, '@vitest/coverage-v8') === null) add['@vitest/coverage-v8'] = B2_DEVDEPS['@vitest/coverage-v8'] as string;
-      else return { files: [], notes: [] };   // both there at the reviewed version: nothing to add
+      // both there at the reviewed version: nothing to add, but scripts.test is set when it is absent or npm's default (B2)
     } else {
       if (declaredIn(pkg, '@vitest/coverage-v8') !== null) return notProven(`${where} lists @vitest/coverage-v8 without Vitest ${B2_DEVDEPS.vitest}, and pipegen does not change an existing version, so coverage is not proven`);
       for (const n of VITEST_PAIR) add[n] = B2_DEVDEPS[n] as string;
@@ -107,10 +108,11 @@ export function planNpmDeps(input: NpmDepsInput): NpmDepsResult {
   }
   const scripts = isObj(pkg.scripts) ? pkg.scripts : {};
   const setTest = tool === 'vitest' && (scripts.test === undefined || scripts.test === 'echo "Error: no test specified" && exit 1');
+  if (Object.keys(add).length === 0 && !setTest) return { files: [], notes: [] };   // everything is already there
   const newJson = buildPackageJson(input.packageJson, { add, setTest });
   if (newJson === null) return notProven(`package.json of ${where} has a shape pipegen can not edit in place, so no test tools were added`);
   const problems = packageJsonProblems(input.packageJson, newJson);
-  if (problems.length > 0) return notProven(`the package.json edit for ${where} did not pass pipegen's own check (${problems[0]}), so it is not written`);
+  if (problems.length > 0) return notProven(`the package.json edit for ${where} did not pass pipegen's own check, so it is not written`);
 
   // the lock, generated in a temp folder with only these two files
   const closureId = CLOSURE_OF[tool];
@@ -121,6 +123,7 @@ export function planNpmDeps(input: NpmDepsInput): NpmDepsResult {
   const dir = mkdtempSync(join(tmpdir(), 'pipegen-npm-deps-'));
   let newLock: string;
   try {
+    if (Object.keys(add).length === 0) throw new SkipNpm();   // only scripts.test changes: the lock stays as it is
     const empty1 = join(dir, 'user.npmrc');
     const empty2 = join(dir, 'global.npmrc');
     const home = join(dir, 'home');
@@ -138,13 +141,14 @@ export function planNpmDeps(input: NpmDepsInput): NpmDepsResult {
     if (text.length > MAX_LOCK_BYTES) return notProven(`the generated lockfile for ${where} is too large`);
     // npm may have rewritten package.json too; pipegen writes its own text, and the lock must agree with it
     newLock = text;
-  } catch {
-    return notProven(`the lockfile for ${where} could not be generated, so no test tools were added`);
+  } catch (e) {
+    if (!(e instanceof SkipNpm)) return notProven(`the lockfile for ${where} could not be generated, so no test tools were added`);
+    newLock = input.packageLock;
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
   const lp = lockProblems(input.packageLock, newLock, { packageJson: newJson, closure });
-  if (lp.length > 0) return notProven(`the generated lockfile for ${where} is not provably the reviewed one (${lp[0]}), so no test tools were added`);
+  if (lp.length > 0) return notProven(`the generated lockfile for ${where} is not provably the reviewed one, so no test tools were added`);
 
   const prefix = rootPrefix(service.path);
   const at = (n: string): string => (prefix === '' ? n : `${prefix}/${n}`);
