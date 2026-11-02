@@ -49,6 +49,10 @@ describe('coverageChoice (B5)', () => {
       expect(r.notes.length, bad).toBe(1);
       expect(r.notes[0]).toMatch(/could not read the coverage minimum in vitest\.config\.ts/);
     }
+    // a block longer than the bound is not read (and says so)
+    const long = v(`thresholds: { ${'branches: 1, '.repeat(60)}lines: 80 }`);
+    expect(long.minimum).toBeNull();
+    expect(long.notes).toHaveLength(1);
     const big = v(`thresholds: { lines: 80 }${' '.repeat(300 * 1024)}`);
     expect(big.minimum).toBeNull();
     expect(big.notes[0]).toMatch(/too large/);
@@ -67,6 +71,7 @@ describe('coverageChoice (B5)', () => {
       expect(r.minimum, bad).toBeNull();
       expect(r.notes, bad).toHaveLength(1);
     }
+    expect(c(`{"lines": 85}${' '.repeat(300 * 1024)}`).notes[0]).toMatch(/too large/);
     const p = (text: string) => readExistingMinimum({ packageJson: text });
     expect(p('{"name":"x","c8":{"lines":90}}')).toEqual({ minimum: 90, notes: [] });
     expect(p('{"name":"x"}')).toEqual({ minimum: null, notes: [] });

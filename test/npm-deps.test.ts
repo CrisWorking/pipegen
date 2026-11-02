@@ -197,6 +197,12 @@ describe('npm-deps: the package.json judge rebuilds the exact text', () => {
       expect(judge(original, (out as string).replace(/\n$/, '') + (original.endsWith('\n') ? '\n' : ''))).toEqual(judge(original, out as string));
     }
   });
+  it('buildPackageJson gives null where it can not edit in place: not an object, empty, a non-default test value, an odd layout', () => {
+    const add = { vitest: '5.0.5' };
+    for (const bad of ['', '[]', '{}', '{ }', 'null', '"x"', '{"a":1,"a":2}', '{"name":"a","scripts":{"test":"jest"}}', '{"name":"a","scripts":[]}', '{"name":"a","devDependencies":[]}', '{"name":"a","devDependencies":"x"}', '/*c*/{"name":"a"}']) expect(buildPackageJson(bad, { add, setTest: bad.includes('jest') || bad.includes('scripts') }), bad).toBeNull();
+    expect(buildPackageJson('{"name":"a"}', { add: { evil: '1.0.0' }, setTest: false })).toBeNull();
+    expect(buildPackageJson('{"name":"a"}', { add, setTest: false })).toBe('{"name":"a","devDependencies":{"vitest":"5.0.5"}}');
+  });
   it('anything but that exact text is refused: spacing, a reordered devDependencies, a changed byte elsewhere, a no-op', () => {
     const variants: [string, string][] = [
       ['reformatted (4 spaces)', JSON.stringify(JSON.parse(good), null, 4) + '\n'],
@@ -258,6 +264,12 @@ describe('npm-deps: the lock judge', () => {
     expect(judge(edit((l) => { (l.packages['node_modules/vitest'] as Record<string, unknown>).devOptional = true; }))).toMatch(/vitest/);
     // the root devDependencies must be the package.json's
     expect(judge(edit((l) => { delete (l.packages[''] as { devDependencies: Record<string, string> }).devDependencies.vitest; }))).toMatch(/vitest|agree/);
+    // the lock must agree with the package.json of the batch (here the package.json lacks the coverage plugin the lock adds)
+    const pkgLess = { ...pkgFile, content: pkgFile.content.replace('    "@vitest/coverage-v8": "5.0.5",\n', '') };
+    expect(pkgLess.content).not.toBe(pkgFile.content);
+    expect(judge(lockFile.content, [pkgLess])).toMatch(/do not agree/);
+    // a pin that is an alias of another package (name field) is refused with the CI precheck's own words, whatever else differs
+    expect(judge(edit((l) => { (l.packages['node_modules/vitest'] as Record<string, unknown>).name = 'other'; }))).toMatch(/CI precheck/);
     // without the package.json in the batch, or without the original, or in a non-npm service
     expect(judge(lockFile.content, [])).toMatch(/same batch/);
     expect(judge(lockFile.content, [pkgFile], { edited: { original: '' } })).toMatch(/original text is missing/);
