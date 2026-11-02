@@ -1,9 +1,13 @@
 // v0.2 Plan D, D1: the package.json and package-lock.json rules of ruling B2, as pure functions (the guard, and D6's judges, call them).
 import { createHash } from 'node:crypto';
+import { readFileSync } from 'node:fs';
+import { createRequire } from 'node:module';
+import { dirname, join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { B2_DEVDEPS, lockProblems, packageJsonProblems, parseJsonStrict } from '../src/create/package-rules.js';
 import { closureFromLocks, type ReviewedClosure } from '../src/create/reviewed-closure.js';
 import { satisfies } from '../src/create/semver-min.js';
+import { packageDataPath } from '../src/util/package-data.js';
 
 const pj = (o: object): string => JSON.stringify(o, null, 2);
 const BASE = { name: 'app', version: '1.0.0', scripts: { build: 'tsc', start: 'node index.js' }, dependencies: { express: '4.21.0' }, devDependencies: { typescript: '5.6.0' } };
@@ -193,7 +197,7 @@ describe('semver-min (allowlist grammar, fix round 2)', () => {
     for (const [v, r, want] of t) expect(satisfies(v, r), `${v} in ${JSON.stringify(r)}`).toBe(want);
   });
   it('anything outside the grammar gives null: partial versions with an operator, tags, build tags, stray text, odd spacing, unknown schemes', () => {
-    for (const r of ['>=5', '^16', '~1.2', '>1.2', '<=1.2', '>=1.2', '1.2', '^1', '>=1', '<2', 'npm:evil@1', 'github:a/b', '^^1.0.0', 'latest', 'a.b.c', '>=1.0.0 <=x.y.z', '>= 1.0.0', '1.0.0  2.0.0', '^1.0.0||^2.0.0', '^1.0.0 ||', '|| ^1.0.0', '1.0.0 -2.0.0', '1.0.0 - 2', '1 - 2', '01.2.3', '1.2.3.4', 'v1.2.3', '<*', '^*', '~*', '>*', '1.x.3', '^1.x.3', '~1.x.3', '<=1.x.3', '>=1.x.3', '>1.x.3', '<1.x.3', '*-0', 'x-0', '1.x-0', '1.2.x-0', '*.1', 'x.2.3', '1.2.3-beta', '1.2.3+build', '^1.2.3-beta.1', '>=1.2.3-beta.1', '>1.2.3-beta', '<1.2.3-beta', '~1.2.3-beta', '=1.2.3-beta', '1.2.3-beta || 1.2.3', '1.0.0-ab || 1.0.0-a', '1.2.3-0 - 2.0.0', '1.2.3 - 2.0.0-0', '1.x - 2.0.0', '', ]) {
+    for (const r of ['>=5', '>1.2', '<=1.2', '>=1.2', '1.2', '>=1', '<2', 'npm:evil@1', 'github:a/b', '^^1.0.0', 'latest', 'a.b.c', '>=1.0.0 <=x.y.z', '>= 1.0.0', '1.0.0  2.0.0', '^1.0.0||^2.0.0', '^1.0.0 ||', '|| ^1.0.0', '1.0.0 -2.0.0', '1.0.0 - 2', '1 - 2', '01.2.3', '1.2.3.4', 'v1.2.3', '<*', '^*', '~*', '>*', '1.x.3', '^1.x.3', '~1.x.3', '<=1.x.3', '>=1.x.3', '>1.x.3', '<1.x.3', '*-0', 'x-0', '1.x-0', '1.2.x-0', '*.1', 'x.2.3', '1.2.3-beta', '1.2.3+build', '^1.2.3-beta.1', '>=1.2.3-beta.1', '>1.2.3-beta', '<1.2.3-beta', '~1.2.3-beta', '=1.2.3-beta', '1.2.3-beta || 1.2.3', '1.2.x3', '1.2.*0', '^1.x', '~1.x', '^1.2.x3', '^1.2.', '~', '^', '^1.', '^01', '~1.02', '^1.2 - 2', '>=^1', '^~1', '~>1', '^1.2.3.4', '1.0.0-ab || 1.0.0-a', '1.2.3-0 - 2.0.0', '1.2.3 - 2.0.0-0', '1.x - 2.0.0', '', ]) {
       if (r === '') continue;   // the empty range is the x-range "any"
       expect(satisfies('1.2.3', r), JSON.stringify(r)).toBeNull();
     }
@@ -212,6 +216,65 @@ describe('semver-min (allowlist grammar, fix round 2)', () => {
     expect(cases.length).toBe(37);
     for (const [v, r] of cases) expect(satisfies(v, r), `${v} in ${JSON.stringify(r)}`).not.toBe(true);
     for (const [v, r] of cases) expect(satisfies(v, r), `${v} in ${JSON.stringify(r)}`).toBeNull();
+  });
+});
+
+describe('semver-min: partial versions with ^ or ~ (D6-B1)', () => {
+  // generated with npm 11.9.0's own `semver` (semver.satisfies over these versions); the live differential below re-checks it when that package is found
+  const VERSIONS = ["0.0.0", "0.0.1", "0.0.3", "0.0.4", "0.1.0", "0.1.5", "0.2.3", "0.2.9", "0.3.0", "0.9.9", "1.0.0", "1.2.0", "1.2.3", "1.9.9", "2.0.0", "2.3.4", "3.0.0", "3.9.9", "4.0.0", "4.0.7", "10.0.0"];
+  const TABLE: [string, string[]][] = [
+      ["^0", ["0.0.0", "0.0.1", "0.0.3", "0.0.4", "0.1.0", "0.1.5", "0.2.3", "0.2.9", "0.3.0", "0.9.9"]],
+      ["^0.0", ["0.0.0", "0.0.1", "0.0.3", "0.0.4"]],
+      ["^0.1", ["0.1.0", "0.1.5"]],
+      ["^0.2", ["0.2.3", "0.2.9"]],
+      ["^0.3", ["0.3.0"]],
+      ["^1", ["1.0.0", "1.2.0", "1.2.3", "1.9.9"]],
+      ["^1.0", ["1.0.0", "1.2.0", "1.2.3", "1.9.9"]],
+      ["^1.2", ["1.2.0", "1.2.3", "1.9.9"]],
+      ["^3", ["3.0.0", "3.9.9"]],
+      ["^4", ["4.0.0", "4.0.7"]],
+      ["^10", ["10.0.0"]],
+      ["~0", ["0.0.0", "0.0.1", "0.0.3", "0.0.4", "0.1.0", "0.1.5", "0.2.3", "0.2.9", "0.3.0", "0.9.9"]],
+      ["~0.0", ["0.0.0", "0.0.1", "0.0.3", "0.0.4"]],
+      ["~0.1", ["0.1.0", "0.1.5"]],
+      ["~0.2", ["0.2.3", "0.2.9"]],
+      ["~1", ["1.0.0", "1.2.0", "1.2.3", "1.9.9"]],
+      ["~1.0", ["1.0.0"]],
+      ["~1.2", ["1.2.0", "1.2.3"]],
+      ["~3", ["3.0.0", "3.9.9"]],
+      ["~4", ["4.0.0", "4.0.7"]],
+      ["^3 || ^4", ["3.0.0", "3.9.9", "4.0.0", "4.0.7"]],
+      ["~1 || ^4", ["1.0.0", "1.2.0", "1.2.3", "1.9.9", "4.0.0", "4.0.7"]],
+      ["^0.0 || ^2", ["0.0.0", "0.0.1", "0.0.3", "0.0.4", "2.0.0", "2.3.4"]],
+      [">=1.0.0 <2.0.0 || ~0.2", ["0.2.3", "0.2.9", "1.0.0", "1.2.0", "1.2.3", "1.9.9"]],
+      ["^1.2 ^1.0", ["1.2.0", "1.2.3", "1.9.9"]],
+      ["~1.2 >=1.2.3", ["1.2.3"]],
+      ["^1 <1.5.0", ["1.0.0", "1.2.0", "1.2.3"]],
+  ];
+  it('^N, ^N.M, ~N and ~N.M (also inside || sets and beside other comparators) give what the semver package gives, 0.x cases included', () => {
+    for (const [range, yes] of TABLE) for (const v of VERSIONS) expect(satisfies(v, range), `${v} in ${range}`).toBe(yes.includes(v));
+  });
+  it('nothing else is partial: >=5, >1.2, 1.2.x3, 1.2.*0 and a tail after a wildcard stay null', () => {
+    for (const r of ['>=5', '>1.2', '<=1', '1.2.x3', '1.2.*0', '^1.x', '~1.x', '^1.2.x3', '^1.2.', '^1.', '~', '^', '^01', '~1.02', '^1.2.3.4', '^1 - 2']) expect(satisfies('1.2.3', r), r).toBeNull();
+  });
+  it('live differential against the semver package (when npm\'s copy is found): 20000 random ^/~ partial ranges, never a different answer', () => {
+    let semver: { satisfies: (v: string, r: string) => boolean } | undefined;
+    for (const dir of [join(dirname(process.execPath), '..', 'lib', 'node_modules', 'npm', 'node_modules', 'semver'), '/usr/lib/node_modules/npm/node_modules/semver']) {
+      try { semver = createRequire(import.meta.url)(dir) as typeof semver; break; } catch { /* try the next place */ }
+    }
+    if (semver === undefined) return;
+    const pick = (a: string[]): string => a[Math.floor(Math.random() * a.length)] as string;
+    const num = ['0', '1', '2', '3', '10'];
+    const bad: string[] = [];
+    for (let i = 0; i < 20000; i++) {
+      const one = (): string => `${pick(['^', '~', ''])}${pick(num)}${Math.random() < 0.5 ? `.${pick(num)}` : ''}`;
+      const range = Array.from({ length: 1 + Math.floor(Math.random() * 2) }, () => Array.from({ length: 1 + Math.floor(Math.random() * 2) }, one).join(' ')).join(' || ');
+      for (const v of VERSIONS) {
+        const mine = satisfies(v, range);
+        if (mine !== null && mine !== semver.satisfies(v, range)) bad.push(`${v} in ${range}`);
+      }
+    }
+    expect(bad.slice(0, 5)).toEqual([]);
   });
 });
 
@@ -381,10 +444,34 @@ describe('lockProblems (B2, fix round 1): added entries must be reviewed code', 
 });
 
 describe('reviewed closure loader', () => {
-  it('gives null while the data files do not exist (D6 has not made them): every lock edit stays refused', async () => {
+  it('loads the real closure data (D6): the three reviewed pins at the reviewed integrity, and every closure edge is readable by semver-min', async () => {
     const { loadReviewedClosure } = await import('../src/create/reviewed-closure.js');
     const { reviewedList } = await import('./helpers/render.js');
-    expect(loadReviewedClosure(reviewedList())).toBeNull();
+    const c = loadReviewedClosure(reviewedList());
+    expect(c).not.toBeNull();
+    expect(Object.keys(c?.pins ?? {}).sort()).toEqual(['@vitest/coverage-v8', 'c8', 'vitest']);
+    // every edge the lock judge would check (a dependency the lock holds, found by npm's nearest-folder rule) has a range semver-min reads, and the resolved version satisfies it
+    let edges = 0;
+    for (const id of ['vitest-coverage', 'c8']) {
+      const pk = (JSON.parse(readFileSync(packageDataPath(`npm-closures/${id}.json`), 'utf8')) as { packages: Record<string, Record<string, Record<string, string> | string>> }).packages;
+      for (const [key, e] of Object.entries(pk)) {
+        for (const f of ['dependencies', 'optionalDependencies', 'peerDependencies']) {
+          for (const [d, r] of Object.entries((e[f] ?? {}) as Record<string, string>)) {
+            let scope = key; let at: string | null = null;
+            for (;;) { const cand = `${scope === '' ? '' : `${scope}/`}node_modules/${d}`; if (pk[cand] !== undefined) { at = cand; break; } if (scope === '') break; const m = /^(.*)\/node_modules\/(?:@[^/]+\/)?[^/]+$/.exec(scope); scope = m === null ? '' : (m[1] as string); }
+            if (at === null) continue;
+            edges++;
+            expect(satisfies(String(pk[at]?.version), r), `${key} ${d} ${r}`).toBe(true);
+          }
+        }
+      }
+    }
+    expect(edges).toBe(155);   // 180 declared edges, 25 of them optional peers the lock does not hold
+  });
+  it('gives null when the data is not there: every lock edit stays refused', async () => {
+    const { loadReviewedClosure } = await import('../src/create/reviewed-closure.js');
+    const { reviewedList } = await import('./helpers/render.js');
+    expect(loadReviewedClosure(reviewedList(), () => { throw new Error('missing'); })).toBeNull();
   });
   it('reads closure locks through an injected reader, and refuses a lock that fails the closure judge', async () => {
     const { loadReviewedClosure } = await import('../src/create/reviewed-closure.js');
