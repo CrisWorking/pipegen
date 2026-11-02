@@ -38,6 +38,7 @@
     "acorn": "8.19.0",
     "execa": "^10.2.0",
     "fast-glob": "^3.3.3",
+    "fast-xml-parser": "5.11.2",
     "libsodium-wrappers": "0.8.4",
     "picomatch": "^4.0.7",
     "smol-toml": "^1.9.1",
