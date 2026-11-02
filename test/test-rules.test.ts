@@ -81,7 +81,7 @@ describe('validate: imports are an allowlist with string-literal specifiers', ()
   it('an import outside the allowlist is refused, whatever the form', () => {
     for (const spec of ['node:fs', 'fs', 'child_process', 'node:child_process', 'node:vm', 'worker_threads', 'node:worker_threads', 'node:net', 'node:module', 'node:os', 'http', 'node:https', 'lodash', 'file:///etc/passwd', '/etc/passwd', 'data:text/javascript,1', 'vitest/config', 'vitest/node', '../../outside.js', '../../../x', './a?worker', './a?raw', '../node_modules/x/index.js', './.hidden/x.js', '..\\x']) {
       refused(ok(`import x from ${JSON.stringify(spec)};\n${T}`), /imports|allowlist|dependencies/, 'test/a.test.ts', []);
-      refused(ok(`export * from ${JSON.stringify(spec)};\n${T}`), /imports|re-exports/, 'test/a.test.ts', []);
+      refused(ok(`export * from ${JSON.stringify(spec)};\n${T}`), /imports|may not export/, 'test/a.test.ts', []);
       refused(ok(`it('a', async () => { const m = await import(${JSON.stringify(spec)}); expect(m).toBe(1); });`), /imports/, 'test/a.test.ts', []);
       refused(`${CJS}it('a', () => { const m = require(${JSON.stringify(spec)}); expect(m).toBe(1); });`, /imports/, 'test/a.test.cjs', []);
     }
@@ -92,9 +92,9 @@ describe('validate: imports are an allowlist with string-literal specifiers', ()
     refused(ok(`import x from 'express-evil';\n${T}`), /express-evil/, 'test/a.test.ts', ['express']);
     refused(ok(`import x from 'express/../../x';\n${T}`), /imports/, 'test/a.test.ts', ['express']);
   });
-  it('re-exports of a package are refused; relative re-exports pass', () => {
-    refused(ok(`export { join } from 'node:path';\n${T}`), /re-exports/);
-    expect(probs(ok(`export * from './helpers/h.js';\n${T}`))).toEqual([]);
+  it('no re-export at all in a test file', () => {
+    refused(ok(`export { join } from 'node:path';\n${T}`), /may not export/);
+    refused(ok(`export * from './helpers/h.js';\n${T}`), /may not export/);
   });
   it('named imports of vitest are a fixed set, with no alias, no namespace and no default', () => {
     refused(`import { it, expect, onTestFinished } from 'vitest';\nit('a', () => { expect(f()).toBe(1); });`, /vitest/);
@@ -566,5 +566,42 @@ describe('rule tables: every name', () => {
   });
   it('a with statement is refused in a script', () => {
     refused(`${CJS}const o = {};\nwith (o) { f(); }\nit('a', () => { expect(f()).toBe(1); });`, /with statement/, 'test/a.test.cjs');
+  });
+});
+
+// ---- security scan, round 3 ----
+describe('security scan round 3 / 1: exports', () => {
+  const T2 = "it('a', () => { expect(f()).toBe(1); });\n";
+  const test = (code: string, head = "import http from 'node:http';\nimport { get } from 'node:http';\nimport express from 'express';\n"): string => `${HEAD}${head}${code}\n${T2}`;
+  it('a test file may not contain any export statement', () => {
+    for (const code of ['export { http };', 'export { get };', 'export { http as default };', 'export default http;', 'export const x = 1;', 'export default 1;', "export * from './x.js';", "export { a } from './x.js';", 'export function g() {}', 'export class K {}', 'export default function () {}', 'export { f as default };', 'export {};']) {
+      refused(test(code), /may not export anything/, 'test/a.test.ts', ['express']);
+      refused(test(code), /may not export anything/, 'test/a.test.mjs', ['express']);
+    }
+  });
+  it('a helper may export its own bindings but never an import, nor re-export', () => {
+    const helper = (code: string, head = "import http from 'node:http';\nimport { get } from 'node:http';\nimport express from 'express';\n"): string[] => probs(`${head}const own = 1;\n${code}\n`, 'test/helpers/h.js', ['express']);
+    for (const code of ['export const x = 1;', 'export { own };', 'export { own as default };', 'export default own;', 'export function g() { return 1; }', 'export default function () {}', 'export default 1;']) expect(helper(code), code).toEqual([]);
+    for (const code of ['export { http };', 'export { get };', 'export { http as default };', 'export { get as g };', 'export default http;', 'export default get;', 'export { express };', "export * from './x.js';", "export { a } from './x.js';", "export * as ns from './x.js';", "export { default } from './x.js';"]) {
+      expect(helper(code).join(' '), code).toMatch(/may not export|may not re-export/);
+    }
+  });
+});
+
+describe('security scan round 3 / 2: the API exemption is keyed on module and name together', () => {
+  const T2 = "it('a', () => { expect(f()).toBe(1); });\n";
+  it('a vitest, node:test or assert name imported from the wrong module, or under another name, is a reserved declaration', () => {
+    for (const head of ["import { expect as fetch } from 'vitest';", "import { expect as e } from 'vitest';\nimport { it as describe } from 'vitest';", "import { describe } from 'node:assert';", "import { it } from 'node:assert';", "import { strictEqual as expect } from 'node:assert';", "import { get as describe } from 'node:http';", "import describe from 'node:http';", "import * as Map from 'node:assert';", "import * as expect from 'node:assert';", "import expect from 'node:assert';", "import { test as it } from 'node:test';", "import { it as Object } from 'node:test';", "import { describe } from 'express';", "import vi from 'express';", "import { expect } from 'express';"]) {
+      refused(`const f = () => 1;\n${head}\n${T2}`, /reserves|declared again|vitest|another name/, 'test/a.test.ts', ['express']);
+    }
+    refused(`${CJS}const { expect: fetch } = require('vitest');\n${T2}`, /reserves|declared again/, 'test/a.test.cjs');
+    refused(`const { it, expect } = require('vitest');\nconst { describe } = require('node:assert');\nconst f = () => 1;\n${T2}`, /reserves|declared again/, 'test/a.test.cjs');
+    refused(`const { it, expect } = require('vitest');\nconst { get: describe } = require('node:http');\nconst f = () => 1;\n${T2}`, /reserves|declared again/, 'test/a.test.cjs');
+    refused(`const { it, expect } = require('vitest');\nconst expect2 = require('node:assert');\nconst { vi } = require('node:test');\nconst f = () => 1;\n${T2}`, /reserves|declared again|vi/, 'test/a.test.cjs');
+  });
+  it('the real forms still pass: own names from their own module, default and namespace imports of node:assert and node:http with plain names', () => {
+    expect(probs(`import { it, expect, describe, vi, beforeAll } from 'vitest';\nimport assert, { strictEqual } from 'node:assert';\nimport * as http from 'node:http';\nimport { test } from 'node:test';\nconst f = () => 1;\n${T2}`)).toEqual([]);
+    expect(probs(`import { describe, it, test, before, after, beforeEach, afterEach } from 'node:test';\nimport { expect } from 'vitest';\nconst f = () => 1;\n${T2}`)).toEqual([]);
+    expect(probs(`const { it, expect } = require('vitest');\nconst { test } = require('node:test');\nconst assert = require('node:assert');\nconst f = () => 1;\n${T2}`, 'test/a.test.cjs')).toEqual([]);
   });
 });

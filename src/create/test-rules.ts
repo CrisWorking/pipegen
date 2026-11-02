@@ -155,7 +155,7 @@ const URL_HOSTS: ReadonlySet<string> = new Set(['localhost', '127.0.0.1', '[::1]
  * the vitest and node:test API names, process, vi, require, and anything starting with `__`. So no inner scope can shadow what the checks rely on, and
  * the flat set of declared names is enough (no scope analysis). The API names may only be bound by importing them from their own module, once.
  */
-const RESERVED: ReadonlySet<string> = new Set([...Object.keys(GLOBAL_MEMBERS), ...ALLOWED_GLOBALS, ...BANNED_IDENT, ...BANNED_PROP, ...VITEST_NAMES, ...NODE_TEST_NAMES, 'process', 'vi', 'require', 'exports', 'module', 'assert']);
+const RESERVED: ReadonlySet<string> = new Set([...Object.keys(GLOBAL_MEMBERS), ...ALLOWED_GLOBALS, ...BANNED_IDENT, ...BANNED_PROP, ...VITEST_NAMES, ...NODE_TEST_NAMES, 'process', 'vi', 'require', 'exports', 'module']);
 const API_MODULES: ReadonlySet<string> = new Set(['vitest', 'node:test', 'node:assert', 'node:assert/strict', 'node:http']);
 const TS_NAMESPACE_RE = /(?:^|[;{}/])\s*(?:export\s+)?(?:declare\s+)?(?:namespace|module)\s+[A-Za-z_$"']/m;
 const TS_ENUM_RE = /(?:^|[;{}/])\s*(?:export\s+)?(?:declare\s+)?(?:const\s+)?enum\s+[A-Za-z_$]/m;
@@ -299,20 +299,25 @@ function analyzeProgram(rel: string, program: N, script: boolean, deps: readonly
   const declared = new Set<string>();
   const declCount = new Map<string, number>();
   const apiLocals = new Set<string>();
-  const declare = (t: unknown, site: N, api = false): void => {
+  const importLocals = new Set<string>();
+  const isTestFile = isTestName(posix.basename(rel));
+  /** `exempt`: the name is an API name imported from its own module under its own name, so it may be a reserved name. `track`: the name is bound to an API module (declaring it again is refused). */
+  const declare = (t: unknown, site: N, exempt = false, track = false): void => {
     if (!isNode(t)) return;
     if (t.type === 'Identifier') {
       const name = t.name as string;
       declared.add(name);
       declCount.set(name, (declCount.get(name) ?? 0) + 1);
-      if (api) apiLocals.add(name);
-      else if (RESERVED.has(name) || name.startsWith('__')) add(site, `it declares ${show(name)}, a name pipegen reserves (a listed global, an API name, or one starting with __), which could hide what the checks rely on`);
+      if (track) apiLocals.add(name);
+      if (!exempt && (RESERVED.has(name) || name.startsWith('__'))) add(site, `it declares ${show(name)}, a name pipegen reserves (a listed global, an API name, or one starting with __), which could hide what the checks rely on`);
     }
-    else if (t.type === 'ObjectPattern') { for (const q of t.properties as N[]) declare(q.type === 'Property' ? q.value : q.argument, site, api); }
-    else if (t.type === 'ArrayPattern') { for (const q of t.elements as unknown[]) declare(q, site, api); }
-    else if (t.type === 'AssignmentPattern') declare(t.left, site, api);
-    else if (t.type === 'RestElement') declare(t.argument, site, api);
+    else if (t.type === 'ObjectPattern') { for (const q of t.properties as N[]) declare(q.type === 'Property' ? q.value : q.argument, site, exempt, track); }
+    else if (t.type === 'ArrayPattern') { for (const q of t.elements as unknown[]) declare(q, site, exempt, track); }
+    else if (t.type === 'AssignmentPattern') declare(t.left, site, exempt, track);
+    else if (t.type === 'RestElement') declare(t.argument, site, exempt, track);
   };
+  /** The names a module of the API set offers as its own (the exemption is keyed on module and name together). */
+  const ownNames = (src: string): ReadonlySet<string> | null => (src === 'vitest' ? VITEST_NAMES : src === 'node:test' ? NODE_TEST_NAMES : null);
   // the names bound to node:http, whole (`http.get`) or by name (`get`), so a connection's target can be checked
   const httpNames = new Set<string>();
   const httpNamed = new Map<string, string>();
@@ -321,7 +326,12 @@ function analyzeProgram(rel: string, program: N, script: boolean, deps: readonly
       if (n.type === 'VariableDeclarator') {
         const init = n.init;
         const top = anc[anc.length - 1]?.type === 'VariableDeclaration' && anc[anc.length - 2]?.type === 'Program';
-        declare(n.id, n, top && isNode(init) && init.type === 'CallExpression' && ident(init.callee, 'require') && API_MODULES.has(literalString(init.arguments?.[0]) ?? ''));
+        const mod = top && isNode(init) && init.type === 'CallExpression' && ident(init.callee, 'require') ? literalString(init.arguments?.[0]) ?? '' : '';
+        const track = API_MODULES.has(mod);
+        const own = ownNames(mod);
+        if (own !== null && isNode(n.id) && n.id.type === 'ObjectPattern') {
+          for (const q of n.id.properties as N[]) declare(q.type === 'Property' ? q.value : q.argument, n, q.type === 'Property' && ident(q.key) && !q.computed && ident(q.value) && q.key.name === q.value.name && own.has(q.key.name), true);
+        } else declare(n.id, n, false, track);
       }
       else if (n.type === 'FunctionDeclaration' || n.type === 'FunctionExpression' || n.type === 'ArrowFunctionExpression') { declare(n.id, n); for (const q of n.params as unknown[]) declare(q, n); }
       else if (n.type === 'ClassDeclaration' || n.type === 'ClassExpression') declare(n.id, n);
@@ -329,7 +339,10 @@ function analyzeProgram(rel: string, program: N, script: boolean, deps: readonly
       else if (n.type === 'ImportDeclaration') {
         const src = String(n.source?.value);
         for (const sp of n.specifiers as N[]) {
-          declare(sp.local, n, API_MODULES.has(src));
+          const own = ownNames(src);
+          const imported = sp.type === 'ImportSpecifier' ? String(sp.imported?.name ?? sp.imported?.value) : '';
+          if (ident(sp.local)) importLocals.add(sp.local.name);
+          declare(sp.local, n, own !== null && sp.type === 'ImportSpecifier' && own.has(imported) && ident(sp.local, imported), API_MODULES.has(src));
           if (src !== 'node:http' || !ident(sp.local)) continue;
           if (sp.type === 'ImportSpecifier') httpNamed.set(sp.local.name, String(sp.imported?.name ?? sp.imported?.value)); else httpNames.add(sp.local.name);
         }
@@ -511,8 +524,14 @@ function analyzeProgram(rel: string, program: N, script: boolean, deps: readonly
       }
       case 'ExportAllDeclaration':
       case 'ExportNamedDeclaration':
-        if (isNode(n.source)) { if (Array.isArray(n.attributes) && n.attributes.length > 0) add(n, 'import attributes are not accepted'); checkSource(n, n.source, true); }
+      case 'ExportDefaultDeclaration': {
+        // a test file exports nothing; a helper may export its own bindings, never an import (a re-export would carry node:http or a package out of the checks)
+        if (isTestFile) { add(n, 'a test file may not export anything'); return; }
+        if (isNode(n.source)) { add(n, 'a helper may not re-export from another module (export ... from)'); return; }
+        for (const sp of (n.specifiers ?? []) as N[]) { if (ident(sp.local) && importLocals.has(sp.local.name)) add(n, `a helper may not export ${show(sp.local.name)}, which comes from an import`); }
+        if (n.type === 'ExportDefaultDeclaration' && ident(n.declaration) && importLocals.has(n.declaration.name)) add(n, `a helper may not export ${show(n.declaration.name)}, which comes from an import`);
         return;
+      }
       case 'ImportExpression':
         if (isNode(n.options)) add(n, 'import() with options is not accepted');
         if (literalString(n.source) === 'node:http') add(n, 'node:http can only be imported at the top of the file, never with import()');
