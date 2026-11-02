@@ -31,7 +31,7 @@ describe('(1) B1/S4: an expect chain leaves a function only from the test or hoo
     for (const code of ['const h = (v) => expect(v).not.toBe(2);', 'const h = async (v) => await expect(Promise.resolve(v)).resolves.toBe(v);', 'const h = (v) => expect.soft(v).toBe(v);',
       'const h = (v) => expect.poll(() => v).toBe(v);', 'const h = async (v) => { return await expect(v).resolves.toBe(1); };', 'const h = function (v) { return expect(v).toBe(1); };',
       'const o = { m(v) { return expect(v).toBe(1); } };', 'class C { m(v) { return expect(v).toBe(1); } }']) {
-      refused(`${HEAD}${code}${TAIL}`, /expect\(/);
+      refused(`${HEAD}${code}${TAIL}`, /expect\(|expect \(from vitest\)/);   // the poll helper is refused outright since D7-R5
     }
     // inside a test, a nested function still may not hand the result out
     for (const code of ['const h = () => expect(f()).toBe(1); h();', '[1].forEach((x) => expect(x).toBe(1));', 'const h = () => { return expect(f()).toBe(1); }; h();', 'f(() => expect(f()).toBe(1));',
@@ -87,7 +87,7 @@ describe('(2) OOS-1: expect has a member allowlist; asymmetric-matcher results a
   });
 });
 
-describe('(3) S3: the results of vi.* calls other than vi.fn and vi.spyOn may only be statements', () => {
+describe('(3) S3: the results of vi.* calls other than vi.fn (and vi.spyOn, dropped in D7-R5) may only be statements', () => {
   it('the scan repro: vi.useFakeTimers() returns vi, which reaches importActual', () => {
     refused(`${VI}it('a', async () => {\n  const v = vi.useFakeTimers();\n  const cp = await v.importActual('node:child' + '_process');\n  expect(cp).toBeDefined();\n});\n`, /vi\.useFakeTimers|statement|importActual/);
   });
@@ -97,8 +97,8 @@ describe('(3) S3: the results of vi.* calls other than vi.fn and vi.spyOn may on
     }
     refused(`${HEAD}afterEach(() => vi.restoreAllMocks());${TAIL}`, /vi\.restoreAllMocks|statement/);
   });
-  it('positive control: vi calls as statements, and vi.fn / vi.spyOn results used freely', () => {
-    expect(probs(`${HEAD}import * as mod from '../src/a.js';\nvi.mock('../src/a.js');\nbeforeEach(() => { vi.useFakeTimers(); });\nafterEach(() => { vi.useRealTimers(); vi.restoreAllMocks(); });\nit('a', () => {\n  vi.useFakeTimers();\n  vi.advanceTimersByTime(10);\n  vi.runAllTimers();\n  vi.clearAllMocks();\n  vi.resetAllMocks();\n  const m = vi.fn().mockReturnValue(1);\n  const s = vi.spyOn(mod, 'run');\n  f(vi.fn());\n  expect(m()).toBe(1);\n  expect(s).not.toHaveBeenCalled();\n});\n`)).toEqual([]);
+  it('positive control: vi calls as statements, and vi.fn results used freely', () => {
+    expect(probs(`${HEAD}import * as mod from '../src/a.js';\nvi.mock('../src/a.js');\nbeforeEach(() => { vi.useFakeTimers(); });\nafterEach(() => { vi.useRealTimers(); vi.restoreAllMocks(); });\nit('a', () => {\n  vi.useFakeTimers();\n  vi.advanceTimersByTime(10);\n  vi.runAllTimers();\n  vi.clearAllMocks();\n  vi.resetAllMocks();\n  const m = vi.fn().mockReturnValue(1);\n  f(vi.fn());\n  expect(m()).toBe(1);\n  expect(mod.run).toBeDefined();\n});\n`)).toEqual([]);
   });
 });
 

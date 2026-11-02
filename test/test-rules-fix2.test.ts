@@ -45,7 +45,7 @@ describe('(a) every dynamic import() is refused', () => {
 
 describe('(b) vi has a member allowlist, and so does expect', () => {
   it('the listed vi members pass; every other member is refused (importActual, importMock, doMock, stubGlobal, stubEnv, hoisted ...)', () => {
-    for (const n of ['fn', 'spyOn', 'clearAllMocks', 'resetAllMocks', 'restoreAllMocks', 'useFakeTimers', 'useRealTimers', 'advanceTimersByTime', 'runAllTimers']) expect(probs(body(`vi.${n}()`)), n).toEqual([]);
+    for (const n of ['fn', 'clearAllMocks', 'resetAllMocks', 'restoreAllMocks', 'useFakeTimers', 'useRealTimers', 'advanceTimersByTime', 'runAllTimers']) expect(probs(body(`vi.${n}()`)), n).toEqual([]);
     expect(probs(body("vi.mock('../src/add.js'); vi.mock('./x.js', () => ({ x: vi.fn() }))"))).toEqual([]);
     for (const n of ['importActual', 'importMock', 'doMock', 'doUnmock', 'unmock', 'stubGlobal', 'stubEnv', 'unstubAllEnvs', 'unstubAllGlobals', 'hoisted', 'resetModules', 'waitFor', 'waitUntil', 'mocked', 'advanceTimersToNextTimer', 'runOnlyPendingTimers', 'setSystemTime', 'getMockedSystemTime', 'isMockFunction', 'isFakeTimers', 'getTimerCount', 'dynamicImportSettled', 'setConfig']) {
       refused(body(`vi.${n}()`), new RegExp(`vi\\.${n} is refused`));
@@ -55,7 +55,8 @@ describe('(b) vi has a member allowlist, and so does expect', () => {
     refused(body("vi.mock('./a.js', () => { eval('1'); return {}; })"), /eval/);   // the factory body is judged by the same rules
   });
   it('the listed expect members pass; extend, addSnapshotSerializer and the rest are refused', () => {
-    for (const n of ['soft', 'poll']) expect(probs(body(`expect.${n}(f()).toBe(1)`)), n).toEqual([]);
+    expect(probs(body('expect.soft(f()).toBe(1)'))).toEqual([]);
+    refused(body('await expect.poll(() => f()).toBe(1)'), /expect \(from vitest\)/);   // D7-R5: poll dropped
     // D7-R4: an asymmetric matcher only as a call argument, expect.assertions/hasAssertions only as statements
     for (const n of ['any', 'anything', 'objectContaining', 'arrayContaining', 'stringContaining', 'stringMatching', 'closeTo']) expect(probs(body(`expect(f()).toEqual(expect.${n}(1))`)), n).toEqual([]);
     for (const n of ['assertions', 'hasAssertions']) expect(probs(body(`expect.${n}(1)`)), n).toEqual([]);

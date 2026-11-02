@@ -17,17 +17,21 @@
 //                assertion written directly in its body (`expect(x).matcher(...)` or an assert call; one on a literal does not count).
 //   urls         a string with `scheme://host` may only name localhost, 127.0.0.1 or example.com (a host that is not static is refused).
 //   globals      (security scan) calls and member access on globals are an ALLOWLIST, not a list of bad names: a test may use
-//                  - the imports of the allowed modules, expect, assert calls, and the vitest API: describe, it, test, the hooks, and vi.fn, vi.spyOn, vi.mock
+//                  - the imports of the allowed modules, expect, assert calls, and the vitest API: describe, it, test, the hooks, and vi.fn, vi.mock
 //                    (a literal relative path; its factory is judged like any code), vi.clearAllMocks/resetAllMocks/restoreAllMocks,
-//                    vi.useFakeTimers/useRealTimers/advanceTimersByTime/runAllTimers (an ALLOWLIST: importActual, doMock, stubGlobal, stubEnv, hoisted ... are refused);
-//                    expect and its members soft, poll, assertions, hasAssertions and the asymmetric matchers any, anything, objectContaining, arrayContaining,
-//                    stringContaining, stringMatching, closeTo, also as expect.not.<asymmetric> (an ALLOWLIST: extend, getState, addSnapshotSerializer ... are refused).
+//                    vi.useFakeTimers/useRealTimers/advanceTimersByTime/runAllTimers (an ALLOWLIST: spyOn, importActual, doMock, stubGlobal, stubEnv, hoisted ... are refused);
+//                    expect and its members soft, assertions, hasAssertions and the asymmetric matchers any, anything, objectContaining, arrayContaining,
+//                    stringContaining, stringMatching, closeTo, also as expect.not.<asymmetric> (an ALLOWLIST: poll, extend, getState, addSnapshotSerializer ... are refused;
+//                    D7-R5 dropped vi.spyOn, whose key reached the Function constructor, and expect.poll, which binds its callback to the running test).
 //                    Every member of a chain rooted at a vitest binding is checked: the only chains are it/test/describe.concurrent and expect.not.<asymmetric>,
 //                    and each member must be called. The bindings themselves are never values (stored, passed, spread, returned, destructured);
 //                  - (D7-R4) what vitest calls return is held too: an expect(...) chain is a statement (optionally awaited), and is returned or is a concise
-//                    arrow body only in the test or hook callback itself; an asymmetric matcher's result is only a call argument (directly or inside array
-//                    and object literals); expect.assertions/hasAssertions and every vi.* call other than vi.fn and vi.spyOn are statements. Members that
-//                    reach vitest's internals (importActual, getMatcherContext, snapshotState, getState, extend ...) are refused on ANY object;
+//                    arrow body only in the test or hook callback itself; an asymmetric matcher's result is only an argument of the matcher call that ends
+//                    an expect chain, or of another asymmetric matcher (directly or inside array and object literals there; D7-R5: never expect()'s own
+//                    argument, a vi.* argument or any other call's, which could hand it back); expect.assertions/hasAssertions and every vi.* call other
+//                    than vi.fn are statements. Members that reach vitest's internals (importActual, getMatcherContext, snapshotState, getState, extend ...)
+//                    are refused on ANY object: that name ban is defence in depth, not a boundary (Object.values reaches a member without
+//                    naming it once an internal object is out); the boundary is the value rules above;
 //                  - the callbacks of test, describe and the hooks are ARROW functions with no parameters (a plain function has `arguments`, which is the test context);
 //                  - JSON.parse and JSON.stringify; Math.*; Number.isInteger/isFinite/isNaN/isSafeInteger/parseFloat/parseInt and its constants; String.raw;
 //                    Array.isArray/from/of; Object.keys/values/entries/assign/freeze/fromEntries/is/hasOwn; Promise.resolve/reject/all/allSettled/race/any/withResolvers;
@@ -114,13 +118,17 @@ const NPM_NAME_RE = /^(?:@[a-z0-9][a-z0-9._-]{0,213}\/)?[a-z0-9][a-z0-9._-]{0,21
 const ALLOWED_BUILTINS: ReadonlySet<string> = new Set(['vitest', 'node:assert', 'node:assert/strict', 'node:path', 'node:url', 'node:util']);
 const ASSERT_MODULES: ReadonlySet<string> = new Set(['node:assert', 'node:assert/strict']);
 const VITEST_NAMES: ReadonlySet<string> = new Set(['describe', 'it', 'test', 'expect', 'vi', 'beforeAll', 'afterAll', 'beforeEach', 'afterEach']);
-const VI_OK: ReadonlySet<string> = new Set(['fn', 'spyOn', 'mock', 'clearAllMocks', 'resetAllMocks', 'restoreAllMocks', 'useFakeTimers', 'useRealTimers', 'advanceTimersByTime', 'runAllTimers']);
-/** The vi calls whose result a test may keep (a mock); every other vi call returns vi itself or nothing, so it may only be a statement (D7-R4 3). */
-const VI_VALUE: ReadonlySet<string> = new Set(['fn', 'spyOn']);
+const VI_OK: ReadonlySet<string> = new Set(['fn', 'mock', 'clearAllMocks', 'resetAllMocks', 'restoreAllMocks', 'useFakeTimers', 'useRealTimers', 'advanceTimersByTime', 'runAllTimers']);
+/** The vi calls whose result a test may keep (a mock); every other vi call returns vi itself or nothing, so it may only be a statement (D7-R4 3). spyOn is gone (D7-R5). */
+const VI_VALUE: ReadonlySet<string> = new Set(['fn']);
 /** The asymmetric matchers (D7-R4 2): `expect.<name>(...)` and `expect.not.<name>(...)`. Their result holds getMatcherContext(), which reaches the snapshot state. */
 const ASYMMETRIC: ReadonlySet<string> = new Set(['any', 'anything', 'objectContaining', 'arrayContaining', 'stringContaining', 'stringMatching', 'closeTo']);
-/** The members of expect (an allowlist, D7-R4 2). `not` only as expect.not.<asymmetric>(...). */
-const EXPECT_OK: ReadonlySet<string> = new Set([...ASYMMETRIC, 'not', 'assertions', 'hasAssertions', 'soft', 'poll']);
+/** The members of expect (an allowlist, D7-R4 2). `not` only as expect.not.<asymmetric>(...). No poll (D7-R5: it binds its callback to the running test's Assertion). */
+const EXPECT_OK: ReadonlySet<string> = new Set([...ASYMMETRIC, 'not', 'assertions', 'hasAssertions', 'soft']);
+/** The members between expect(...) and the matcher whose call may take an asymmetric matcher (D7-R5 2). */
+const CHAIN_MODIFIERS: ReadonlySet<string> = new Set(['not', 'resolves', 'rejects']);
+/** Members of a function, never a matcher: through them the matcher's arguments go elsewhere (`.toBe.call(m)` makes m the matcher's `this`). */
+const FUNCTION_MEMBERS: ReadonlySet<string> = new Set(['call', 'apply', 'bind']);
 /** Members that reach vitest's module loader, globals, config or expect state: refused on ANY object, dot or static computed, and destructured (D7-R4 4). */
 const VITEST_ESCAPE: ReadonlySet<string> = new Set(['importActual', 'importMock', 'doMock', 'doUnmock', 'stubGlobal', 'stubEnv', 'unstubAllGlobals', 'unstubAllEnvs', 'hoisted', 'dynamicImportSettled', 'mocked',
   'setConfig', 'resetConfig', 'getMatcherContext', 'snapshotState', 'getState', 'setState', 'extend', 'addSnapshotSerializer', 'addEqualityTesters']);
@@ -418,7 +426,7 @@ function analyzeProgram(rel: string, program: N, script: boolean): TestFileRepor
       while (isNode(o) && o.type === 'MemberExpression') o = o.object;
       if (isNode(o) && o.type === 'CallExpression') {
         const oc: N = o.callee;
-        const isExpect = ident(oc, 'expect') || (isNode(oc) && oc.type === 'MemberExpression' && !oc.computed && ident(oc.object, 'expect') && ident(oc.property) && (oc.property.name === 'soft' || oc.property.name === 'poll'));
+        const isExpect = ident(oc, 'expect') || (isNode(oc) && oc.type === 'MemberExpression' && !oc.computed && ident(oc.object, 'expect') && ident(oc.property) && oc.property.name === 'soft');
         if (isExpect) return o.arguments.length >= 1 && isNode(o.arguments[0]) && !isLiteralish(o.arguments[0]);
       }
       let root: N = c;
@@ -532,7 +540,21 @@ function analyzeProgram(rel: string, program: N, script: boolean): TestFileRepor
     const o: unknown = c.object;
     return ident(o, 'expect') || (isNode(o) && o.type === 'MemberExpression' && !o.computed && ident(o.object, 'expect') && ident(o.property, 'not'));
   };
-  /** Why an asymmetric matcher's result is used wrongly (D7-R4 2): only as a call argument, directly or as a value inside array and object literals that are. */
+  /** Whether `n` is the matcher call that ends an expect chain: `expect(...)` or `expect.soft(...)`, then only not/resolves/rejects, then the called matcher. */
+  const isMatcherCall = (n: N): boolean => {
+    const c: unknown = n.callee;
+    if (!isNode(c) || c.type !== 'MemberExpression' || c.computed || !ident(c.property) || FUNCTION_MEMBERS.has(c.property.name as string) || CHAIN_MODIFIERS.has(c.property.name as string)) return false;
+    let o: unknown = c.object;
+    while (isNode(o) && o.type === 'MemberExpression' && !o.computed && ident(o.property) && CHAIN_MODIFIERS.has(o.property.name as string)) o = o.object;
+    if (!isNode(o) || o.type !== 'CallExpression') return false;
+    const h: unknown = o.callee;
+    return ident(h, 'expect') || (isNode(h) && h.type === 'MemberExpression' && !h.computed && ident(h.object, 'expect') && ident(h.property, 'soft'));
+  };
+  /**
+   * Why an asymmetric matcher's result is used wrongly (D7-R4 2, narrowed by D7-R5 2): only as an argument of the matcher call that ends an expect chain,
+   * or of another asymmetric call, directly or as a value inside array and object literals there. Any other call could hand it back (a helper, Array.of,
+   * vi.fn, expect(m).toSatisfy(cb)), and its prototype then fakes passes or reaches the snapshot state.
+   */
   const asymmetricProblem = (call: N, anc: readonly N[]): string | null => {
     let cur: N = call;
     let i = anc.length - 1;
@@ -543,8 +565,8 @@ function analyzeProgram(rel: string, program: N, script: boolean): TestFileRepor
       break;
     }
     const p = anc[i];
-    return p?.type === 'CallExpression' && p.callee !== cur && (p.arguments as unknown[]).includes(cur) ? null
-      : 'an asymmetric matcher (expect.any(...), expect.objectContaining(...) ...) may only be written as an argument of a call, directly or inside an array or object literal there (expect(x).toEqual(expect.objectContaining({ a: expect.any(Number) }))); it may not be stored, read, spread or returned';
+    return p?.type === 'CallExpression' && p.callee !== cur && (p.arguments as unknown[]).includes(cur) && (isMatcherCall(p) || isAsymmetricCall(p)) ? null
+      : 'an asymmetric matcher (expect.any(...), expect.objectContaining(...) ...) may only be written as an argument of the matcher that ends an expect chain, or of another asymmetric matcher, directly or inside an array or object literal there (expect(x).toEqual(expect.objectContaining({ a: expect.any(Number) }))); never as the value given to expect(...), an argument of vi or of any other function, and never stored, read, spread or returned';
   };
 
   const visit = (n: N, anc: readonly N[]): void => {
@@ -588,7 +610,7 @@ function analyzeProgram(rel: string, program: N, script: boolean): TestFileRepor
       case 'WithStatement': add(n, 'a with statement is not accepted'); return;
       case 'CallExpression': {
         const c: N = n.callee;
-        if (ident(c, 'expect') || (isNode(c) && c.type === 'MemberExpression' && !c.computed && ident(c.object, 'expect') && (ident(c.property, 'soft') || ident(c.property, 'poll')))) {
+        if (ident(c, 'expect') || (isNode(c) && c.type === 'MemberExpression' && !c.computed && ident(c.object, 'expect') && ident(c.property, 'soft'))) {
           const w = expectChainProblem(n, anc);
           if (w !== null) add(n, w);
         }
@@ -598,7 +620,7 @@ function analyzeProgram(rel: string, program: N, script: boolean): TestFileRepor
           add(n, `expect.${c.property.name as string}(...) may only be written as a statement`);
         }
         if (isNode(c) && c.type === 'MemberExpression' && !c.computed && ident(c.object, 'vi') && ident(c.property) && !VI_VALUE.has(c.property.name as string) && !standsAlone) {
-          add(n, `the result of vi.${show(c.property.name as string)}(...) may not be used (it is vi itself): write the call as a statement (only vi.fn and vi.spyOn give a value to keep)`);
+          add(n, `the result of vi.${show(c.property.name as string)}(...) may not be used (it is vi itself): write the call as a statement (only vi.fn gives a value to keep)`);
         }
         if (isNode(c) && c.type === 'MemberExpression' && ident(c.object, 'vi') && (c.computed ? fold(c.property) === 'mock' : ident(c.property, 'mock'))) {
           const m = literalString(n.arguments[0]);
@@ -696,7 +718,7 @@ function analyzeProgram(rel: string, program: N, script: boolean): TestFileRepor
           if (g !== undefined && !g.has('*') && !g.has(name)) add(n, `${n.object.name}.${show(name)} is not on the list of members tests may use (${[...g].join(', ') || 'none'})`);
         }
         if (ident(n.object, 'process') && !PROCESS_OK.has(name)) add(n, `process.${show(name)} is refused`);
-        if (ident(n.object, 'vi') && !VI_OK.has(name)) add(n, `vi.${show(name)} is refused (only fn, spyOn, mock, the mock-reset helpers and the fake-timer helpers are accepted)`);
+        if (ident(n.object, 'vi') && !VI_OK.has(name)) add(n, `vi.${show(name)} is refused (only fn, mock, the mock-reset helpers and the fake-timer helpers are accepted)`);
         return;
       }
       case 'Property': {

@@ -148,7 +148,8 @@ describe('validate: eval, new Function, node:vm, worker_threads, process.binding
     expect(probs(body('const u = import.meta.url; const d = import.meta.dirname;'))).toEqual([]);
     expect(probs(body("vi.mock('../src/add.js'); vi.mock('./x.js', () => ({}));"))).toEqual([]);
     for (const c of ["vi.mock('child_process');", "vi.mock('node:fs');", "vi.mock(name);", "vi.mock('../../outside');", "vi.mock();", "vi.doMock('x');", "await vi.importActual('child_process');", "vi.resetModules();", 'const v = vi;', "vi['mock']('x');"]) refused(body(c), /vi/);
-    expect(probs(body('const fn = vi.fn(); vi.spyOn(a, "b"); vi.useFakeTimers(); vi.advanceTimersByTime(5); vi.useRealTimers();'))).toEqual([]);
+    expect(probs(body('const fn = vi.fn(); vi.useFakeTimers(); vi.advanceTimersByTime(5); vi.useRealTimers();'))).toEqual([]);
+    refused(body('vi.spyOn(a, "b");'), /vi\.spyOn is refused/);   // D7-R5: spyOn dropped
   });
   it('setTimeout with a string, new Worker, WebAssembly, XMLHttpRequest are refused or harmless', () => {
     refused(body('new Worker("x");'), /Worker/);
@@ -422,8 +423,8 @@ describe('rule tables: every name', () => {
     for (const n of ['exit', 'argv', 'version', 'versions', 'pid', 'stdout', 'kill', 'binding', 'dlopen', 'emit', 'on', 'chdir', 'umask', 'memoryUsage']) refused(body(`process.${n};`), new RegExp(`process\\.${n} is refused`));
   });
   it('vi: exactly the listed helpers', () => {
-    for (const n of ['fn', 'spyOn', 'useFakeTimers', 'useRealTimers', 'advanceTimersByTime', 'runAllTimers', 'clearAllMocks', 'resetAllMocks', 'restoreAllMocks']) expect(probs(body(`vi.${n}();`)), n).toEqual([]);
-    for (const n of ['stubGlobal', 'unstubAllGlobals', 'doMock', 'importActual', 'importMock', 'hoisted', 'resetModules', 'unmock', 'doUnmock', 'waitFor', 'dynamicImportSettled', 'mocked', 'stubEnv', 'unstubAllEnvs', 'advanceTimersToNextTimer', 'runOnlyPendingTimers', 'setSystemTime', 'getMockedSystemTime', 'isMockFunction']) refused(body(`vi.${n}();`), new RegExp(`vi\\.${n} is refused`));
+    for (const n of ['fn', 'useFakeTimers', 'useRealTimers', 'advanceTimersByTime', 'runAllTimers', 'clearAllMocks', 'resetAllMocks', 'restoreAllMocks']) expect(probs(body(`vi.${n}();`)), n).toEqual([]);
+    for (const n of ['spyOn', 'stubGlobal', 'unstubAllGlobals', 'doMock', 'importActual', 'importMock', 'hoisted', 'resetModules', 'unmock', 'doUnmock', 'waitFor', 'dynamicImportSettled', 'mocked', 'stubEnv', 'unstubAllEnvs', 'advanceTimersToNextTimer', 'runOnlyPendingTimers', 'setSystemTime', 'getMockedSystemTime', 'isMockFunction']) refused(body(`vi.${n}();`), new RegExp(`vi\\.${n} is refused`));
   });
   it('import.meta: url, dirname and filename only', () => {
     for (const n of ['url', 'dirname', 'filename']) expect(probs(body(`import.meta.${n};`)), n).toEqual([]);
@@ -522,12 +523,12 @@ describe('mutation survivors: tests and assertions', () => {
     refused(ok("it('a', () => { expect(f()).toBe(1); }, 5, 6);"), /written as it/);
     refused(ok("it('a', () => { expect(f()).toBe(1); }, 5, () => {});"), /written as it/);
   });
-  it('assertion forms that count: return, await, expect.soft, expect.poll, assert calls on real values; assert.fail and bare literals do not', () => {
+  it('assertion forms that count: return, await, expect.soft, assert calls on real values; assert.fail, bare literals and expect.poll (dropped, D7-R5) do not', () => {
     const one = (code: string, head = ''): number => analyzeTestFile('test/a.test.js', `${head}import { it, expect } from 'vitest';\nimport assert, { ok as okk } from 'node:assert';\nconst f = () => 1;\nit('a', async () => { ${code} });\n`, []).assertions;
     expect(one('return expect(f()).toBe(1);')).toBe(1);
     expect(one('await expect(f()).resolves.toBe(1);')).toBe(1);
     expect(one('expect.soft(f()).toBe(1);')).toBe(1);
-    expect(one('await expect.poll(() => f()).toBe(1);')).toBe(1);
+    expect(one('await expect.poll(() => f()).toBe(1);')).toBe(0);
     expect(one('assert.equal(f(), 1);')).toBe(1);
     expect(one('okk(f());')).toBe(1);
     expect(one('assert(f());')).toBe(1);
