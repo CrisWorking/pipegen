@@ -36,6 +36,7 @@ import type { CreatedFile, InstallRecord, KnownValueCheck, PipelineDraft, RepoPr
 import { anyString, scrubActive, scrubForDisplay, vaultHolds, withActiveVault } from '../util/known-values.js';
 import { lockProblems, packageJsonProblems } from './package-rules.js';
 import type { ReviewedClosure } from './reviewed-closure.js';
+import { dependencyNames, MAX_TEST_FILES, starterOwner, starterTestFileProblems } from './test-rules.js';
 
 /** One entry of the delivery base tree (the default branch head): its git mode (`100644`, `120000` symlink, `160000` submodule), blob sha and text (null: not readable as text). */
 export interface BaseEntry { sha: string; mode: string; read(): Promise<string | null> }
@@ -206,6 +207,22 @@ async function guardFiles(files: readonly CreatedFile[], ctx: GuardCtx): Promise
     try { return anyString(JSON.parse(f.content), holds); } catch { return false; }
   };
 
+  /** D7: a starter test is judged by the same rules leaf the referee's judge and the creator use (a real parse; S9), with the service's own dependencies read from its package.json. Null: fine. */
+  async function starterProblem(f: CreatedFile): Promise<string | null> {
+    if (!claimingRules(f.path, repo, ctx.profile).some((r) => r.id === 'starter-tests')) return null;
+    const roots = ctx.profile.services.map((s) => rootPrefix(s.path));
+    const owner = starterOwner(f.path, roots);
+    const svc = owner === null ? undefined : ctx.profile.services.find((s) => rootPrefix(s.path) === owner.root);
+    if (owner === null || svc === undefined) return `${q(f.path)} is not a path starter tests may use`;
+    if (svc.language !== 'node' || svc.packageManager !== 'npm') return `starter tests are written for npm services in this version, and the service in ${q(owner.root === '' ? '.' : owner.root)} is not one`;
+    const pj = await readTextLimitedWithReason(join(ctx.root, ...(owner.root === '' ? [] : owner.root.split('/')), 'package.json'), ctx.root);
+    const deps = 'text' in pj ? dependencyNames(pj.text) : [];
+    const bad = starterTestFileProblems(f.path, f.content, { roots, depsOf: () => deps });
+    const same = files.filter((x) => x?.repo === repo && typeof x.path === 'string' && starterOwner(x.path, roots)?.root === owner.root).length;
+    if (same > MAX_TEST_FILES) bad.push(`the batch has ${same} test files for this service, and pipegen writes at most ${MAX_TEST_FILES}`);
+    return bad.length > 0 ? bad.slice(0, 5).join('; ') : null;
+  }
+
   async function judge(f: CreatedFile, i: number): Promise<Verdict> {
     if (typeof f !== 'object' || f === null) return refuse('this is not a file description');
     if (ctx.vault !== undefined && [f.path, f.content, f.reason, f.repo].some(holds) || decodedHolds(f)) return refuse('the file holds a value you gave pipegen as a secret (or its base64 or URL form); pipegen never writes one into a file');
@@ -249,6 +266,8 @@ async function guardFiles(files: readonly CreatedFile[], ctx: GuardCtx): Promise
       const rules = claimingRules(f.path, repo, ctx.profile);
       if (inService && rules.length === 0) return refuse(`${q(f.path)} would be new source code of your service, and pipegen writes tests, Docker files and pipeline files, never your application's source`);
       if (f.edited !== undefined && !rules.some((r) => r.mode === 'edit')) return refuse(`pipegen does not edit ${q(f.path)}: it edits only the files it has a rule for (package.json, package-lock.json, CODEOWNERS, dependabot)`);
+      const starter = await starterProblem(f);
+      if (starter !== null) return refuse(starter);
       return { kind: 'ok' };
     }
 
@@ -264,7 +283,11 @@ async function guardFiles(files: readonly CreatedFile[], ctx: GuardCtx): Promise
         same.push('text' in r && gitBlobSha(r.text) === rec.sha);
       }
       if (onBase) same.push((remote as { entry: BaseEntry }).entry.sha === rec.sha);
-      if (same.every(Boolean)) return { kind: 'ok', note: `${q(f.path)} is a file pipegen wrote earlier and nobody has changed, so it is replaced.` };
+      if (same.every(Boolean)) {
+        const starter = await starterProblem(f);   // pipegen's own earlier file is replaced: the new text is judged like any new one
+        if (starter !== null) return refuse(starter);
+        return { kind: 'ok', note: `${q(f.path)} is a file pipegen wrote earlier and nobody has changed, so it is replaced.` };
+      }
       return { kind: 'keep', note: `${q(f.path)} was written by pipegen earlier but has been changed since, so pipegen keeps your version and writes nothing there.` };
     }
 

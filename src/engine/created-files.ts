@@ -5,8 +5,8 @@
 // a file pipegen computes is recomputed by its judge and compared byte for byte; a file an AI writes is judged by rules. Later
 // sub-tasks (D0b judges, D1-D6 creators, Plan G's hook/central/record files) fill in or add their entries in this one place.
 //
-// The entries below that have no judge yet are STUBS: they claim their path and refuse, so a file of that kind can not pass
-// unjudged while its sub-task is unbuilt. Replace the stub's judge with the real one; do not widen `match`.
+// A kind whose sub-task is not built yet is registered as a STUB: it claims its path and refuses, so a file of that kind can not pass
+// unjudged. (D7 built the last one, the starter tests.) A real judge replaces the stub's; `match` is never widened.
 //
 // Each sub-task that fills in a judge also RE-CHECKS its matcher: a matcher claims only the files of its own kind and never a
 // protected path or a tool config. No rule claims anything under `.github/`, `.husky/`, `.zap/` or `node_modules/`, or any path with a
@@ -24,6 +24,9 @@ import { dockerfileJudge, dockerignoreJudge } from './created-judges/dockerfile.
 import { packageJsonJudge, packageLockJudge } from './created-judges/package.js';
 import { pipegenDocJudge } from './created-judges/pipegen-doc.js';
 import { createdPathProblem } from './job-rules.js';
+import { starterTestsJudge } from './created-judges/tests.js';
+import { isProtectedPath } from './protected-match.js';
+import { starterOwner } from '../create/test-rules.js';
 
 /**
  * What the delivery side knows that the draft does not (D0b). A judge that needs one of these and does not get it refuses the file:
@@ -39,6 +42,11 @@ export interface CreatedInputs {
    * and `inserted`, the block text the install record says pipegen wrote there before (EditKind 'codeowners'), which a re-run may replace in place.
    */
   codeownersFacts?: Partial<Record<'app' | 'central', { isSymlink: boolean; inserted: string | null }>>;
+  /**
+   * D7: the names under `dependencies` of each service's package.json, by service root ('' is the repo root; no `./`, no trailing `/`). A starter test may import
+   * a package only from its own service's list; a service that is missing here has none, so such an import is refused.
+   */
+  serviceDeps?: Readonly<Record<string, readonly string[]>>;
   /** The vault's check: does the text hold a value the user typed, or its base64 or URL form (preflight S8)? */
   containsKnownValue?: (text: string) => boolean;
 }
@@ -67,9 +75,6 @@ export interface CreatedRule {
   judge: (file: CreatedFile, ctx: CreatedCtx) => string[];
 }
 
-/** A judge that refuses everything, for a kind whose sub-task is not built yet. */
-const refuseUntilBuilt = (task: string) => (): string[] => [`the judge for this kind of file is not built yet (${task}), so pipegen can not prove it and does not write it`];
-
 /** A service folder as a path prefix: '.' and './' are the repo root (''), a trailing '/' is dropped. */
 const rootPrefix = (svcPath: string): string => svcPath.replace(/^(?:\.\/)+/, '').replace(/\/+$/, '').replace(/^\.$/, '');
 const serviceRoots = (draft: PipelineDraft): string[] => draft.profile.services.map((s) => rootPrefix(s.path));
@@ -82,10 +87,14 @@ const atServiceRoot = (path: string, draft: PipelineDraft, name: string): boolea
   return serviceRoots(draft).includes(dir);
 };
 const claimable = (path: string, draft: PipelineDraft, name: string): boolean => !hidden(path) && atServiceRoot(path, draft, name);
-/** A test file: `<service>/(test|tests|__tests__)/…/<name>.test.<ext>` or `.spec.<ext>` with a code extension (D5, D7). */
-const TEST_FILE_RE = /^(?:test|tests|__tests__)\/(?:[^/]+\/)*[^/]+\.(?:test|spec)\.(?:ts|js|mjs|cjs|tsx|jsx)$/;
-const isStarterTest = (path: string, draft: PipelineDraft): boolean =>
-  !hidden(path) && serviceRoots(draft).some((r) => (r === '' ? TEST_FILE_RE.test(path) : path.startsWith(`${r}/`) && TEST_FILE_RE.test(path.slice(r.length + 1))));
+/**
+ * A starter test (D7, S9): `<service>/{test,tests,__tests__}/**` `/*.test.{ts,js,mjs,cjs}` or `<service>/test/helpers/**` at a service root, and
+ * never a path the gate protects (the gate's own matcher, shared in protected-match.ts: `test/vitest.config.test.ts` matches `vitest.config.*`).
+ */
+const isStarterTest = (path: string, draft: PipelineDraft): boolean => {
+  const roots = serviceRoots(draft);
+  return !hidden(path) && starterOwner(path, roots) !== null && !isProtectedPath(path, roots);
+};
 
 export const CREATED_RULES: readonly CreatedRule[] = [
   // D0b (CF-2): the judges for Plan G's files. Plan G produces them.
@@ -98,7 +107,7 @@ export const CREATED_RULES: readonly CreatedRule[] = [
   { id: 'dockerignore', repo: 'app', parts: ['docker'], mode: 'new', match: (p, d) => !p.split('/').slice(0, -1).some((x) => x.startsWith('.') || x === 'node_modules') && atServiceRoot(p, d, '.dockerignore'), judge: dockerignoreJudge },
   { id: 'compose', repo: 'app', parts: ['compose'], mode: 'new', match: (p) => p === 'docker-compose.pipegen.yml', judge: composeJudge },
   // D5-D7: starter tests, and the package edits (every package change needs the user's own yes)
-  { id: 'starter-tests', repo: 'app', parts: ['tests'], mode: 'new', match: (p, d) => isStarterTest(p, d), judge: refuseUntilBuilt('D7') },
+  { id: 'starter-tests', repo: 'app', parts: ['tests'], mode: 'new', match: (p, d) => isStarterTest(p, d), judge: starterTestsJudge },
   { id: 'package-json', repo: 'app', parts: ['tests'], mode: 'edit', needsConfirm: true, match: (p, d) => claimable(p, d, 'package.json'), judge: packageJsonJudge },
   { id: 'package-lock', repo: 'app', parts: ['tests'], mode: 'edit', needsConfirm: true, match: (p, d) => claimable(p, d, 'package-lock.json'), judge: packageLockJudge },
 ];

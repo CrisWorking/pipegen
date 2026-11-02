@@ -57,7 +57,7 @@ describe('guard: new files', () => {
     expect(await reasons([file('api/src/x.py')], c)).toMatch(/source code/);
     expect(await reasons([file('app.js')], c)).toMatch(/source code/);
     // a starter test (a registry rule claims it) and non-code files are not app source
-    expect(await okPaths([file('api/test/smoke.test.ts', 'x', { part: 'tests' }), file('api/README.md'), file('api/Dockerfile')], c)).toEqual(['api/test/smoke.test.ts', 'api/README.md', 'api/Dockerfile']);
+    expect(await okPaths([file('api/test/smoke.test.ts', "import { expect, it } from 'vitest';\nit('a', () => { expect(f()).toBe(1); });\n", { part: 'tests' }), file('api/README.md'), file('api/Dockerfile')], c)).toEqual(['api/test/smoke.test.ts', 'api/README.md', 'api/Dockerfile']);
     // outside every service folder it is not "app source" (the registry decides)
     expect(await okPaths([file('tools/x.ts')], ctx(repo(), { profile: prof(['api']) }))).toEqual(['tools/x.ts']);
   });

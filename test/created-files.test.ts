@@ -6,6 +6,9 @@ import { createdPathProblem } from '../src/engine/job-rules.js';
 import { CREATED_RULES, createdFileProblems, duplicatePathProblems, type CreatedRule } from '../src/engine/created-files.js';
 import type { Capabilities, CreatedFile, PipelineDraft } from '../src/types.js';
 import { PROTECTED_PATHS_BASE } from '../src/types.js';
+import { effectiveProtectedPaths } from '../src/engine/protected-paths.js';
+import { isProtectedPath } from '../src/engine/protected-match.js';
+import { starterOwner } from '../src/create/test-rules.js';
 import { renderJobPrelude, renderStep, stepsToYaml, type RenderContext } from '../src/engine/render-step.js';
 import { Document } from 'yaml';
 import { entry, platform, profile, reviewedList, service, specFor } from './helpers/render.js';
@@ -247,10 +250,33 @@ describe('fix round 1: matchers claim only their own files', () => {
     expect(bad).toEqual([]);
   });
   it('the reviewer\'s attack paths are unclaimed', () => {
-    for (const path of ['api/tests/biome.json', 'test/eslint.config.js', 'test/vitest.config.ts', '__tests__/.gitleaksignore', 'test/lefthook.yml', '.husky/test/x', '.github/test/x.yml', '.github/workflows/tests/x.yml', '.github/actions/x/tests/run.sh', '.github/Dockerfile', '.github/workflows/Dockerfile', '.github/actions/x/Dockerfile', '.github/.dockerignore', '.github/package.json', 'node_modules/x/package.json', 'a/b/c/Dockerfile', 'a/package.json', 'x/api/package.json', 'api/tests/helper.ts', 'api/tests/x.test.json', 'api/tests/a.json.ts', 'api/tests/a.test.d.ts', 'api/tests/.hidden.test.ts', 'api/tests/.x/a.test.ts', 'api/src/a.test.ts', 'api/tests/a.test.ts.bak', 'dockerfile', 'api/Dockerfile.prod', 'API/Dockerfile', 'src/tests/a.test.ts', 'api/src/tests/a.test.ts', 'x/tests/a.test.ts']) expect(claim(path), path).toEqual([]);
+    for (const path of ['api/tests/biome.json', 'test/eslint.config.js', 'test/vitest.config.ts', '__tests__/.gitleaksignore', 'test/lefthook.yml', '.husky/test/x', '.github/test/x.yml', '.github/workflows/tests/x.yml', '.github/actions/x/tests/run.sh', '.github/Dockerfile', '.github/workflows/Dockerfile', '.github/actions/x/Dockerfile', '.github/.dockerignore', '.github/package.json', 'node_modules/x/package.json', 'a/b/c/Dockerfile', 'a/package.json', 'x/api/package.json', 'api/tests/helper.ts', 'api/tests/x.test.json', 'api/tests/a.json.ts', 'api/tests/a.test.d.ts', 'api/tests/.hidden.test.ts', 'api/tests/.x/a.test.ts', 'api/src/a.test.ts', 'api/tests/a.test.ts.bak', 'api/test/a.spec.ts', 'api/test/a.test.tsx', 'api/test/a.test.jsx', 'api/tests/a.spec.js', 'api/test/a.test.mts', 'api/tests/helpers/h.ts', 'api/__tests__/helpers/h.ts', 'api/test/helpers/h.json', 'api/test/a.ts', 'api/test/vitest.config.test.ts', 'api/tests/vite.config.spec.js', 'api/__tests__/vitest.workspace.test.mjs', 'api/tests/prettier.config.test.ts', 'api/test/knip.config.spec.cjs', 'dockerfile', 'api/Dockerfile.prod', 'API/Dockerfile', 'src/tests/a.test.ts', 'api/src/tests/a.test.ts', 'x/tests/a.test.ts']) expect(claim(path), path).toEqual([]);
+  });
+  it('D0a/D0b m1: no starter-test path is claimed when the gate\'s own matcher protects it (every protected glob made concrete, in every test folder)', () => {
+    const roots = ['', 'api'];
+    const globs = effectiveProtectedPaths(reviewedList(), roots);
+    const concreteName = (g: string): string => g.replace(/^\//, '').replace(/^\*\*\//, '').replace(/\*\*/g, 'a/b').replace(/\*$/, 'test.ts').replace(/\*/g, 'x');
+    const folders = ['test/', 'tests/', '__tests__/', 'test/helpers/', 'api/test/', 'api/tests/', 'api/__tests__/', 'api/test/helpers/', 'test/sub/', 'api/tests/sub/deep/'];
+    let shapeOk = 0;
+    const bad: string[] = [];
+    for (const g of globs) for (const dir of folders) for (const suffix of ['', '.test.ts', '.test.mjs', '.test']) {
+      const path = `${dir}${concreteName(g)}${suffix}`;
+      const protectedByGate = isProtectedPath(path, roots);
+      if (starterOwner(path, roots) !== null && protectedByGate) shapeOk++;
+      if (protectedByGate && claim(path).includes('starter-tests')) bad.push(path);
+    }
+    expect(bad).toEqual([]);
+    expect(shapeOk).toBeGreaterThan(50);   // the check is not vacuous: many names have the starter-test shape AND are protected (vitest.config.*, vite.config.*, prettier.config.*, knip.config.*, vitest.workspace.*)
+    for (const path of ['test/vitest.config.test.ts', 'tests/vite.config.spec.js', '__tests__/vitest.workspace.test.mjs', 'tests/prettier.config.test.ts', 'api/test/knip.config.spec.cjs', 'api/test/vitest.config.test.mjs']) {
+      expect(isProtectedPath(path, roots), path).toBe(true);
+      expect(claim(path), path).toEqual([]);
+    }
+    // the matcher is the same one the CODEOWNERS judge uses
+    expect(isProtectedPath('.github/workflows/x.yml', roots)).toBe(true);
+    expect(isProtectedPath('api/test/a.test.ts', roots)).toBe(false);
   });
   it('the real forms are still claimed by exactly one rule', () => {
-    const want: Record<string, string> = { Dockerfile: 'dockerfile', 'api/Dockerfile': 'dockerfile', '.dockerignore': 'dockerignore', 'api/.dockerignore': 'dockerignore', 'package.json': 'package-json', 'api/package.json': 'package-json', 'package-lock.json': 'package-lock', 'api/package-lock.json': 'package-lock', 'tests/a.test.ts': 'starter-tests', 'api/tests/a.test.ts': 'starter-tests', 'api/test/sub/b.spec.mjs': 'starter-tests', 'api/__tests__/c.test.tsx': 'starter-tests', 'test/x.test.cjs': 'starter-tests', 'docker-compose.pipegen.yml': 'compose', 'PIPEGEN.md': 'pipegen-doc', '.github/dependabot.yml': 'dependabot', '.github/dependabot.yaml': 'dependabot' };
+    const want: Record<string, string> = { Dockerfile: 'dockerfile', 'api/Dockerfile': 'dockerfile', '.dockerignore': 'dockerignore', 'api/.dockerignore': 'dockerignore', 'package.json': 'package-json', 'api/package.json': 'package-json', 'package-lock.json': 'package-lock', 'api/package-lock.json': 'package-lock', 'tests/a.test.ts': 'starter-tests', 'api/tests/a.test.ts': 'starter-tests', 'api/test/sub/b.test.mjs': 'starter-tests', 'api/__tests__/c.test.cjs': 'starter-tests', 'test/x.test.cjs': 'starter-tests', 'api/test/helpers/h.ts': 'starter-tests', 'test/helpers/deep/h.mjs': 'starter-tests', 'docker-compose.pipegen.yml': 'compose', 'PIPEGEN.md': 'pipegen-doc', '.github/dependabot.yml': 'dependabot', '.github/dependabot.yaml': 'dependabot' };
     for (const [path, id] of Object.entries(want)) expect(claim(path), path).toEqual([id]);
   });
   it('a service folder named test is claimed once (no double claim)', () => {
@@ -298,6 +324,7 @@ describe('fix round 1: minors', () => {
     expect(duplicatePathProblems([file('A'), file('a/b/c')])).toHaveLength(1);
     expect(duplicatePathProblems([file('a/b'), file('a')])).toHaveLength(1);
     expect(duplicatePathProblems([file('a'), file('a/b', 'x', { repo: 'central' })])).toEqual([]);
+    expect(duplicatePathProblems([file('a'), file('A/b')])).toHaveLength(1);   // R16: the folder clash is compared ignoring case, the file in lower case, the folder in upper
     expect(duplicatePathProblems([file('ab'), file('a/b')])).toEqual([]);
     expect(duplicatePathProblems([file('a'), file('A/b')])).toHaveLength(1);
   });

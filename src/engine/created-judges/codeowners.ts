@@ -6,6 +6,7 @@
 //    can not approve their own pull request, so a sole owner would lock every protected-path change);
 //  - the SEMANTICS are checked with the gate's own parser: every protected path, on a probe list, is owned by exactly the owners.
 import picomatch from 'picomatch';
+import { protectedMatcher } from '../protected-match.js';
 import { WORKFLOW_PATH } from '../../../gate/src/baseline.js';
 import { codeOwners, MAX_CODEOWNERS_BYTES, ownersOf } from '../../../gate/src/integrity.js';
 import { CENTRAL_PROTECTED_PATHS, CODEOWNERS_BEGIN, CODEOWNERS_END, codeownersBlock, codeownersFile, codeownersOwnerProblem, codeownersProtectedPaths, codeownersReplace } from '../created-builders.js';
@@ -39,11 +40,6 @@ export function codeownersProbes(protectedPaths: readonly string[], serviceRoots
   return [...out];
 }
 
-/** The gate's matching of a protected path (integrity.ts pathMatcher): a name without a slash at any depth, a leading `/` the root only, case-insensitive. */
-const protectedMatcher = (paths: readonly string[]): ((p: string) => boolean) => {
-  const m = picomatch(paths.map((p) => (p.startsWith('/') ? p.slice(1) : p.includes('/') ? p : `**/${p}`)), { nocase: true, dot: true });
-  return (p) => paths.length > 0 && m(p);
-};
 
 /**
  * Concrete paths for a rule pattern, lined up with each protected directory or path: a wildcard segment of the rule takes the protected path's
