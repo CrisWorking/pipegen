@@ -6,7 +6,7 @@
 // `eval` and `process.binding` walk straight past one). The file is PARSED (acorn; TypeScript is first reduced to JavaScript with sucrase) and the
 // syntax tree is walked:
 //   imports      every import, `export ... from`, `require()` and `import()` has a string-literal specifier that is on the allowlist: `vitest` (named
-//                imports from a fixed set, no alias), node:assert, node:assert/strict, node:test, node:path, node:url, node:util, node:http, a relative
+//                imports from a fixed set, no alias), node:assert, node:assert/strict, node:path, node:url, node:util, node:http, a relative
 //                path that stays inside the service, or a name in the service's own `dependencies`. Nothing else.
 //   code reach   eval, Function, globalThis and friends, Reflect, module, `require` used as a value, `process` other than a few reads, import.meta
 //                other than url/dirname/filename, `.constructor`, `__proto__` and the other ways to get at the Function constructor are refused,
@@ -26,11 +26,11 @@
 //                  and nothing else: a free name that is declared nowhere in the file and not on these lists is refused, so are Reflect, Symbol, Proxy, Function,
 //                  globalThis and the reflection members of any object (getOwnPropertyDescriptor(s), getOwnPropertyNames/Symbols, getPrototypeOf, setPrototypeOf,
 //                  defineProperty, fromCharCode ...). A computed key must fold to a plain name; one that can not be read statically is refused.
-//   network      fetch, WebSocket, EventSource and XMLHttpRequest are refused. node:http: createServer, request, get, STATUS_CODES, METHODS only; request and get
+//   network      fetch, WebSocket, EventSource and XMLHttpRequest are refused. node:http: createServer, request, get only; request and get
 //                  must name a literal local target (a string starting with http://127.0.0.1 or localhost, or an options object with a literal local host or none,
 //                  e.g. the port of a server the test started with listen(0)). Joined strings (`'ht' + 'tp://x'`) are read whole before the URL check.
 //   this         `this` in a plain (non-arrow, non-class) function is refused, and at the top of a script. A .js file is parsed by the service's package.json
-//                  "type" ("module": as a module; otherwise both as a script and as a module, with the problems of each), .cjs as a script, .mjs/.ts as a module.
+//                  "type" ("module": as a module; otherwise both as a script and as a module, with the problems of each), .cjs both ways (the runner takes it as a module), .mjs/.ts as a module.
 // A file that does not parse is refused. The real boundary stays the CI job (repo-code job, no pipegen secrets, egress block): this is the first layer.
 //
 // TypeScript caveat: sucrase silently drops a `namespace`/`module` block, which a real compiler would run, so a TypeScript file that has one is refused.
@@ -103,10 +103,9 @@ const NPM_NAME_RE = /^(?:@[a-z0-9][a-z0-9._-]{0,213}\/)?[a-z0-9][a-z0-9._-]{0,21
 
 // ---------- the tables ----------
 
-const ALLOWED_BUILTINS: ReadonlySet<string> = new Set(['vitest', 'node:assert', 'node:assert/strict', 'node:test', 'node:path', 'node:url', 'node:util', 'node:http']);
+const ALLOWED_BUILTINS: ReadonlySet<string> = new Set(['vitest', 'node:assert', 'node:assert/strict', 'node:path', 'node:url', 'node:util', 'node:http']);
 const ASSERT_MODULES: ReadonlySet<string> = new Set(['node:assert', 'node:assert/strict']);
 const VITEST_NAMES: ReadonlySet<string> = new Set(['describe', 'it', 'test', 'expect', 'vi', 'beforeAll', 'afterAll', 'beforeEach', 'afterEach']);
-const NODE_TEST_NAMES: ReadonlySet<string> = new Set(['describe', 'it', 'test', 'before', 'after', 'beforeEach', 'afterEach']);
 const VI_OK: ReadonlySet<string> = new Set(['fn', 'spyOn', 'useFakeTimers', 'useRealTimers', 'advanceTimersByTime', 'advanceTimersToNextTimer', 'runAllTimers', 'runOnlyPendingTimers', 'setSystemTime', 'getMockedSystemTime', 'clearAllMocks', 'resetAllMocks', 'restoreAllMocks', 'isMockFunction', 'stubEnv', 'unstubAllEnvs', 'mock']);
 const PROCESS_OK: ReadonlySet<string> = new Set(['env', 'cwd', 'platform', 'nextTick', 'hrtime', 'uptime']);
 const META_OK: ReadonlySet<string> = new Set(['url', 'dirname', 'filename']);
@@ -114,7 +113,7 @@ const META_OK: ReadonlySet<string> = new Set(['url', 'dirname', 'filename']);
 const BANNED_IDENT: ReadonlySet<string> = new Set(['eval', 'Function', 'globalThis', 'global', 'window', 'self', 'Reflect', 'WebAssembly', 'Worker', 'SharedWorker', 'module', 'XMLHttpRequest', 'importScripts',
   // the network and the reflection globals (security scan: no fetch or sockets of its own, no way to build a name at run time and reach code)
   'fetch', 'WebSocket', 'EventSource', 'Symbol', 'Proxy']);
-const BANNED_PROP: ReadonlySet<string> = new Set(['constructor', '__proto__', '__defineGetter__', '__defineSetter__', '__lookupGetter__', '__lookupSetter__', 'caller', 'callee', 'mainModule', 'binding', 'dlopen', '_load', '_linkedBinding', 'createRequire', 'require', 'getBuiltinModule', 'eval', 'Function',
+const BANNED_PROP: ReadonlySet<string> = new Set(['constructor', '__proto__', '__defineGetter__', '__defineSetter__', '__lookupGetter__', '__lookupSetter__', 'caller', 'callee', 'mainModule', 'binding', 'dlopen', '_load', '_linkedBinding', 'createRequire', 'require', 'getBuiltinModule', 'eval', 'Function', 'connect',
   // snapshots write files
   'toMatchSnapshot', 'toMatchInlineSnapshot', 'toMatchFileSnapshot', 'toThrowErrorMatchingSnapshot', 'toThrowErrorMatchingInlineSnapshot',
   // reflection: ways to read or change what a name hides, on any object (also through an alias of Object)
@@ -123,7 +122,7 @@ const BANNED_PROP: ReadonlySet<string> = new Set(['constructor', '__proto__', '_
 const SKIP_PROP: ReadonlySet<string> = new Set(['skip', 'only', 'todo', 'skipIf', 'runIf', 'fails', 'each', 'for', 'fixme', 'retry', 'repeats']);
 const SKIP_IDENT: ReadonlySet<string> = new Set(['xit', 'xtest', 'xdescribe', 'fit', 'ftest', 'fdescribe']);
 const BANNED_STRING: ReadonlySet<string> = new Set(['constructor', '__proto__', 'eval', 'Function', 'binding', 'dlopen', 'mainModule', 'createRequire', 'getBuiltinModule', 'child_process']);
-const DANGEROUS_MODULES = /^(?:node:)?(?:child_process|vm|worker_threads|cluster|dgram|net|tls|http2|https|module|process|inspector|repl|v8|fs|fs\/promises|os|dns|readline|zlib|crypto|stream|events)$/;
+const DANGEROUS_MODULES = /^(?:node:test|(?:node:)?(?:child_process|vm|worker_threads|cluster|dgram|net|tls|http2|https|module|process|inspector|repl|v8|fs|fs\/promises|os|dns|readline|zlib|crypto|stream|events))$/;
 /** The globals a test may use as an object, and the members it may take from each (`*`: any). Anything else on them is refused. */
 const GLOBAL_MEMBERS: Readonly<Record<string, ReadonlySet<string>>> = {
   JSON: new Set(['parse', 'stringify']),
@@ -138,9 +137,19 @@ const GLOBAL_MEMBERS: Readonly<Record<string, ReadonlySet<string>>> = {
   URL: new Set([]),
 };
 /** Other free names a test may use (constructors, timers, console). A free name that is not declared in the file and not here (or above) is refused. */
-const ALLOWED_GLOBALS: ReadonlySet<string> = new Set(['undefined', 'NaN', 'Infinity', 'arguments', 'console', 'setTimeout', 'clearTimeout', 'setInterval', 'clearInterval', 'setImmediate', 'clearImmediate', 'queueMicrotask', 'structuredClone', 'Buffer', 'URLSearchParams', 'TextEncoder', 'TextDecoder',
+const ALLOWED_GLOBALS: ReadonlySet<string> = new Set(['undefined', 'NaN', 'Infinity', 'console', 'setTimeout', 'clearTimeout', 'setInterval', 'clearInterval', 'setImmediate', 'clearImmediate', 'queueMicrotask', 'structuredClone', 'Buffer', 'URLSearchParams', 'TextEncoder', 'TextDecoder',
   'AbortController', 'AbortSignal', 'Headers', 'Request', 'Response', 'FormData', 'Blob', 'Map', 'Set', 'WeakMap', 'WeakSet', 'RegExp', 'Error', 'TypeError', 'RangeError', 'SyntaxError', 'ReferenceError', 'AggregateError', 'parseInt', 'parseFloat', 'isNaN', 'isFinite',
   'encodeURIComponent', 'decodeURIComponent', 'encodeURI', 'decodeURI', 'BigInt', 'Uint8Array', 'Uint16Array', 'Uint32Array', 'Int8Array', 'Int16Array', 'Int32Array', 'Float32Array', 'Float64Array', 'ArrayBuffer', 'DataView', 'performance', '__dirname', '__filename']);
+/**
+ * The members a test may take from a binding it imported from vitest (anything else, `run`, `extend`, `mock`, `unreachable` ..., is refused in every form:
+ * member, computed, destructured or aliased). A name not listed here may only be called. `vi` has its own list, VI_OK.
+ */
+const VITEST_MEMBERS: Readonly<Record<string, ReadonlySet<string>>> = {
+  describe: new Set(['concurrent']), it: new Set(['concurrent']), test: new Set(['concurrent']),
+  expect: new Set(['soft', 'poll', 'assertions', 'hasAssertions', 'any', 'anything', 'objectContaining', 'arrayContaining', 'stringContaining', 'stringMatching']),
+};
+const HOOKS: ReadonlySet<string> = new Set(['beforeAll', 'afterAll', 'beforeEach', 'afterEach']);
+const PARAM_MSG = 'the function of a test, describe or hook takes no parameters (the test context can skip a test)';
 /** node:http: the members a test may take, and the two that open a connection (their target must be a literal local address). */
 const HTTP_OK: ReadonlySet<string> = new Set(['createServer', 'request', 'get']);
 const HTTP_NAMES: ReadonlySet<string> = HTTP_OK;
@@ -152,16 +161,16 @@ const LOCAL_URL_HOSTS: ReadonlySet<string> = new Set(['127.0.0.1', 'localhost', 
 const URL_HOSTS: ReadonlySet<string> = new Set(['localhost', '127.0.0.1', '[::1]', 'example.com']);
 /**
  * Names a file may not DECLARE (variable, function, class, parameter, catch, destructuring, import of another module): the listed globals, the banned names,
- * the vitest and node:test API names, process, vi, require, and anything starting with `__`. So no inner scope can shadow what the checks rely on, and
+ * the vitest API names, process, vi, require, and anything starting with `__`. So no inner scope can shadow what the checks rely on, and
  * the flat set of declared names is enough (no scope analysis). The API names may only be bound by importing them from their own module, once.
  */
-const RESERVED: ReadonlySet<string> = new Set([...Object.keys(GLOBAL_MEMBERS), ...ALLOWED_GLOBALS, ...BANNED_IDENT, ...BANNED_PROP, ...VITEST_NAMES, ...NODE_TEST_NAMES, 'process', 'vi', 'require', 'exports', 'module']);
-const API_MODULES: ReadonlySet<string> = new Set(['vitest', 'node:test', 'node:assert', 'node:assert/strict', 'node:http']);
-const TS_NAMESPACE_RE = /(?:^|[;{}/])\s*(?:export\s+)?(?:declare\s+)?(?:namespace|module)\s+[A-Za-z_$"']/m;
+const RESERVED: ReadonlySet<string> = new Set([...Object.keys(GLOBAL_MEMBERS), ...ALLOWED_GLOBALS, ...BANNED_IDENT, ...BANNED_PROP, ...VITEST_NAMES, 'process', 'vi', 'require', 'exports', 'module', 'arguments']);
+const API_MODULES: ReadonlySet<string> = new Set(['vitest', 'node:assert', 'node:assert/strict', 'node:http']);
+const TS_NAMESPACE_RE = /\b(?:namespace|module)\b/;
 const TS_ENUM_RE = /(?:^|[;{}/])\s*(?:export\s+)?(?:declare\s+)?(?:const\s+)?enum\s+[A-Za-z_$]/m;
 const RELATIVE_RE = /^\.{1,2}(?:\/[A-Za-z0-9_@.+~-]+)*\/?$/;
 const BARE_RE = /^(?:@[a-z0-9][a-z0-9._-]{0,213}\/)?[a-z0-9][a-z0-9._-]{0,213}(?:\/[A-Za-z0-9_@+-][A-Za-z0-9_@.+-]*)*$/;
-const ALLOW_TEXT = "vitest, node:assert, node:assert/strict, node:test, node:path, node:url, node:util, node:http, a relative path inside the service, or a package in the service's dependencies";
+const ALLOW_TEXT = "vitest, node:assert, node:assert/strict, node:path, node:url, node:util, node:http, a relative path inside the service, or a package in the service's dependencies";
 
 // ---------- the tree ----------
 
@@ -247,14 +256,14 @@ export function analyzeTestFile(rel: string, content: string, deps: readonly str
   const ext = rel.slice(rel.lastIndexOf('.') + 1);
   let code = content;
   if (ext === 'ts') {
-    if (TS_NAMESPACE_RE.test(content)) return fail('the file has a TypeScript namespace or module block, which pipegen can not check (write plain functions)');
+    if (TS_NAMESPACE_RE.test(content)) return fail('a TypeScript file may not contain the word namespace or module anywhere (a namespace block is dropped by the checker\'s transformer but run by the test runner; write plain functions and avoid the words in comments and strings)');
     if (TS_ENUM_RE.test(content)) return fail('the file has a TypeScript enum, which compiles to computed code pipegen can not check (use a plain object)');
     try { code = transform(content, { transforms: ['typescript'], disableESTransforms: true, keepUnusedImports: true, filePath: rel }).code; } catch { return fail('the file can not be read as TypeScript'); }
   }
   // Strict and sloppy parsing differ (`<!--` is a comment in a script and an operator in a module), and the runner may take a file either way. So:
   // .cjs is a script, .mjs and .ts are modules, and a .js follows the service's package.json "type" ("module": a module; otherwise BOTH readings must
   // be checked, and the problems of each are reported).
-  const modes: boolean[] = ext === 'cjs' ? [true] : ext === 'js' && moduleType === 'commonjs' ? [true, false] : [false];
+  const modes: boolean[] = ext === 'cjs' || (ext === 'js' && moduleType === 'commonjs') ? [true, false] : [false];
   const reports: TestFileReport[] = [];
   let parseError = '';
   for (const script of modes) {
@@ -317,7 +326,7 @@ function analyzeProgram(rel: string, program: N, script: boolean, deps: readonly
     else if (t.type === 'RestElement') declare(t.argument, site, exempt, track);
   };
   /** The names a module of the API set offers as its own (the exemption is keyed on module and name together). */
-  const ownNames = (src: string): ReadonlySet<string> | null => (src === 'vitest' ? VITEST_NAMES : src === 'node:test' ? NODE_TEST_NAMES : null);
+  const ownNames = (src: string): ReadonlySet<string> | null => (src === 'vitest' ? VITEST_NAMES : null);
   // the names bound to node:http, whole (`http.get`) or by name (`get`), so a connection's target can be checked
   const httpNames = new Set<string>();
   const httpNamed = new Map<string, string>();
@@ -349,7 +358,7 @@ function analyzeProgram(rel: string, program: N, script: boolean, deps: readonly
       }
     });
   } catch { return fail('the file is nested too deeply to check'); }
-  for (const name of apiLocals) if ((declCount.get(name) ?? 0) > 1) add(undefined, `${show(name)} is bound to an API module (vitest, node:test, node:assert or node:http) and is declared again, which could shadow it`);
+  for (const name of apiLocals) if ((declCount.get(name) ?? 0) > 1) add(undefined, `${show(name)} is bound to an API module (vitest, node:assert or node:http) and is declared again, which could shadow it`);
   for (const s of program.body as N[]) {
     if (s.type !== 'VariableDeclaration') continue;
     for (const d of s.declarations as N[]) {
@@ -428,7 +437,7 @@ function analyzeProgram(rel: string, program: N, script: boolean, deps: readonly
     else if (relativeOnly && !/^\.\.?(?:\/|$)/.test(spec)) add(n, `re-exports ${JSON.stringify(show(spec))}; only relative files may be re-exported`);
   };
   const checkSpecifiers = (n: N, spec: string): void => {
-    const names = spec === 'vitest' ? VITEST_NAMES : spec === 'node:test' ? NODE_TEST_NAMES : spec === 'node:http' ? HTTP_NAMES : null;
+    const names = spec === 'vitest' ? VITEST_NAMES : spec === 'node:http' ? HTTP_NAMES : null;
     if (names === null) return;
     for (const sp of n.specifiers as N[]) {
       if (spec === 'node:http' && sp.type !== 'ImportSpecifier') continue;   // the whole module is fine: its members are checked where they are used
@@ -487,8 +496,13 @@ function analyzeProgram(rel: string, program: N, script: boolean, deps: readonly
       add(n, "a test is written as it('name', () => { ... }), with the body in place and at most a number as the timeout");
       return;
     }
+    if (body.params.length > 0) add(n, PARAM_MSG);
     const stmts: N[] = body.body.type === 'BlockStatement' ? body.body.body as N[] : [{ type: 'ExpressionStatement', start: body.start, expression: body.body }];
-    const direct = stmts.filter(isAssertionStatement).length;
+    let direct = 0;
+    for (const st of stmts) {   // an assertion after a return or throw never runs, so it does not count
+      if (isAssertionStatement(st)) direct++;
+      if (st.type === 'ReturnStatement' || st.type === 'ThrowStatement') break;
+    }
     assertions += direct;
     if (direct === 0) add(n, `the test ${JSON.stringify(show(name ?? ''))} has no assertion written directly in its body (an expect(value).matcher(...) or an assert call on a real value)`);
   };
@@ -511,6 +525,12 @@ function analyzeProgram(rel: string, program: N, script: boolean, deps: readonly
     }
     return null;
   };
+
+  /** Whether the identifier `n` is where a name is declared (a declarator id, a parameter, a destructuring target, a catch or class name), not a use. */
+  const isDeclSite = (n: N, parent: N | undefined, anc: readonly N[]): boolean => (parent?.type === 'VariableDeclarator' && parent.id === n) || (parent?.type === 'Property' && anc[anc.length - 2]?.type === 'ObjectPattern' && parent.value === n)
+    || ((parent?.type === 'FunctionDeclaration' || parent?.type === 'FunctionExpression' || parent?.type === 'ArrowFunctionExpression') && (parent.id === n || (parent.params as unknown[]).includes(n)))
+    || (parent?.type === 'CatchClause' && parent.param === n) || ((parent?.type === 'ClassDeclaration' || parent?.type === 'ClassExpression') && parent.id === n)
+    || (parent?.type === 'AssignmentPattern' && parent.left === n) || parent?.type === 'RestElement' || parent?.type === 'ArrayPattern';
 
   const visit = (n: N, anc: readonly N[]): void => {
     const parent = anc[anc.length - 1];
@@ -563,12 +583,28 @@ function analyzeProgram(rel: string, program: N, script: boolean, deps: readonly
         if (ident(c, 'require')) {
           const topLevel = parent?.type === 'VariableDeclarator' && parent.init === n && anc[anc.length - 2]?.type === 'VariableDeclaration' && anc[anc.length - 3]?.type === 'Program';
           if (!topLevel) add(n, "require() is accepted only at the top of the file, as const x = require('...')");
+          if (literalString(n.arguments[0]) === 'vitest') {
+            const id: N | undefined = parent?.type === 'VariableDeclarator' ? parent.id : undefined;
+            const plain = isNode(id) && id.type === 'ObjectPattern' && (id.properties as N[]).every((q) => q.type === 'Property' && !q.computed && ident(q.key) && ident(q.value) && q.key.name === q.value.name && VITEST_NAMES.has(q.key.name));
+            if (!plain) add(n, "require('vitest') is accepted only as const { describe, it, expect, ... } = require('vitest'): own names, no alias, no rest");
+          }
           if ((n.arguments as unknown[]).length !== 1) add(n, 'require() takes one plain string');
           else checkSource(n, n.arguments[0], false);
         } else if (ident(c, 'it') || ident(c, 'test') || (isNode(c) && c.type === 'MemberExpression' && !c.computed && (ident(c.object, 'it') || ident(c.object, 'test')) && ident(c.property, 'concurrent'))) {
           testCall(n, anc);
+        } else if (isDescribeCall(n)) {
+          const [title, fn, extra] = n.arguments as (N | undefined)[];
+          const nm = staticString(title);
+          if (nm === undefined || nm.trim() === '' || !isFn(fn) || (n.arguments as unknown[]).length > 3 || (extra !== undefined && !(isNode(extra) && extra.type === 'Literal' && typeof extra.value === 'number'))) {
+            add(n, "describe is written as describe('name', () => { ... }): a plain string name, the body in place and at most a number as the timeout");
+          } else if (fn.params.length > 0) add(n, PARAM_MSG);
+        } else if (isNode(c) && c.type === 'Identifier' && HOOKS.has(c.name) && declared.has(c.name)) {
+          const [fn, extra] = n.arguments as (N | undefined)[];
+          if (!isFn(fn) || (n.arguments as unknown[]).length > 2 || (extra !== undefined && !(isNode(extra) && extra.type === 'Literal' && typeof extra.value === 'number'))) {
+            add(n, `a hook is written as ${c.name}(() => { ... }): the function in place and at most a number as the timeout`);
+          } else if (fn.params.length > 0) add(n, PARAM_MSG);
         } else if (isNode(c) && c.type === 'MemberExpression' && !c.computed && (ident(c.object, 'it') || ident(c.object, 'test')) && ident(c.property) && !SKIP_PROP.has(c.property.name)) {
-          add(n, `${c.object.name}.${c.property.name} is a test form pipegen can not count`);
+          add(n, `${c.object.name}.${show(c.property.name)} is a test form pipegen can not count`);
         }
         return;
       }
@@ -584,7 +620,7 @@ function analyzeProgram(rel: string, program: N, script: boolean, deps: readonly
         else if (SKIP_IDENT.has(name)) add(n, `${name} skips or focuses tests, which pipegen does not accept`);
         else if (name === 'require') { if (!(parent?.type === 'CallExpression' && parent.callee === n)) add(n, 'require can only be called with a plain string, never passed around'); }
         else if (httpNames.has(name) || httpNamed.has(name)) {
-          const declSite = (parent?.type === 'VariableDeclarator' && parent.id === n) || (parent?.type === 'Property' && anc[anc.length - 2]?.type === 'ObjectPattern' && parent.value === n) || ((parent?.type === 'FunctionDeclaration' || parent?.type === 'FunctionExpression' || parent?.type === 'ArrowFunctionExpression') && (parent.id === n || (parent.params as unknown[]).includes(n))) || (parent?.type === 'CatchClause' && parent.param === n) || ((parent?.type === 'ClassDeclaration' || parent?.type === 'ClassExpression') && parent.id === n) || (parent?.type === 'AssignmentPattern' && parent.left === n) || parent?.type === 'RestElement' || parent?.type === 'ArrayPattern';
+          const declSite = isDeclSite(n, parent, anc);
           if (httpNames.has(name)) {
             const call = anc[anc.length - 2];
             const asObject = parent?.type === 'MemberExpression' && parent.object === n && !parent.computed && call?.type === 'CallExpression' && call.callee === parent;
@@ -593,14 +629,24 @@ function analyzeProgram(rel: string, program: N, script: boolean, deps: readonly
           else if (parent?.type === 'CallExpression' && parent.callee === n && HTTP_CALLS.has(httpNamed.get(name) as string)) { const w = httpCallProblem(parent); if (w !== null) add(n, w); }
         }
         else if (name === 'process') { if (!(parent?.type === 'MemberExpression' && parent.object === n)) add(n, 'process can only be used as process.env, process.cwd(), process.platform, process.nextTick, process.hrtime or process.uptime'); }
-        else if (name === 'vi') { if (!(parent?.type === 'MemberExpression' && parent.object === n)) add(n, 'vi can only be used as vi.<helper>(...)'); }
+        else if (name === 'arguments') { if (!anc.some((a) => a.type === 'FunctionDeclaration' || a.type === 'FunctionExpression')) add(n, 'arguments is accepted only inside a plain function (at the top of a file it is the loader\'s)'); }
+        else if (name === 'vi') { if (!isDeclSite(n, parent, anc) && !(parent?.type === 'MemberExpression' && parent.object === n)) add(n, 'vi can only be used as vi.<helper>(...)'); }
+        else if (VITEST_NAMES.has(name) && declared.has(name)) {
+          if (!isDeclSite(n, parent, anc)) {
+            const key = parent?.type === 'MemberExpression' && parent.object === n ? (parent.computed ? fold(parent.property) : parent.property?.name) : undefined;
+            const members = VITEST_MEMBERS[name];
+            if (!((parent?.type === 'CallExpression' && parent.callee === n) || (typeof key === 'string' && members?.has(key) === true))) {
+              add(n, `${name} (from vitest) can only be called${members === undefined ? '' : `, or used as ${name}.${[...members].join('/')}`}; never as a value, an alias or with another member`);
+            }
+          }
+        }
         else if (GLOBAL_MEMBERS[name] !== undefined) {
           const asValue = parent?.type === 'MemberExpression' && parent.object === n;
           const asCallee = (parent?.type === 'CallExpression' || parent?.type === 'NewExpression') && parent.callee === n;
           const asArg = parent?.type === 'CallExpression' && parent.callee !== n;
           const asInstanceof = parent?.type === 'BinaryExpression' && parent.operator === 'instanceof' && parent.right === n;
           if (!(asValue || asCallee || asArg || asInstanceof)) add(n, `${name} can only be used as ${name}.<member>, called, or checked with instanceof`);
-        } else if (!declared.has(name) && !ALLOWED_GLOBALS.has(name)) add(n, `${name} is a global pipegen does not list for tests, so it is refused`);
+        } else if (!declared.has(name) && !ALLOWED_GLOBALS.has(name)) add(n, `${show(name)} is a global pipegen does not list for tests, so it is refused`);
         return;
       }
       case 'MetaProperty': {
@@ -618,12 +664,12 @@ function analyzeProgram(rel: string, program: N, script: boolean, deps: readonly
           name = String(k);
         } else name = String(n.property?.name);
         if (SKIP_PROP.has(name)) add(n, `.${show(name)} skips, focuses or repeats tests, which pipegen does not accept`);
-        else if (BANNED_PROP.has(name)) add(n, `.${show(name)} is refused (it reaches code execution, other modules or files outside the test)`);
+        else if (BANNED_PROP.has(name) || name.startsWith('_')) add(n, `.${show(name)} is refused (it reaches code execution, other hosts, internals or files outside the test)`);
         if (isNode(n.object) && n.object.type === 'Identifier') {
           const g = GLOBAL_MEMBERS[n.object.name as string];
           if (g !== undefined && !g.has('*') && !g.has(name)) add(n, `${n.object.name}.${show(name)} is not on the list of members tests may use (${[...g].join(', ') || 'none'})`);
           if (httpNames.has(n.object.name)) {
-            if (!HTTP_OK.has(name)) add(n, `http.${show(name)} is refused (createServer, request, get, STATUS_CODES and METHODS are accepted)`);
+            if (!HTTP_OK.has(name)) add(n, `http.${show(name)} is refused (createServer, request and get are accepted)`);
             else if (HTTP_CALLS.has(name)) {
               const call = anc[anc.length - 1];
               if (call?.type === 'CallExpression' && call.callee === n) { const w = httpCallProblem(call); if (w !== null) add(n, w); } else add(n, `http.${name} can only be called`);
@@ -639,7 +685,7 @@ function analyzeProgram(rel: string, program: N, script: boolean, deps: readonly
         let name: string | undefined;
         if (n.computed) { const k = isNode(n.key) ? fold(n.key) : undefined; name = k === undefined ? undefined : String(k); if (name === undefined && parent.type === 'ObjectPattern') add(n, 'a destructured key that can not be read statically is not accepted'); }
         else name = ident(n.key) ? n.key.name : isNode(n.key) && n.key.type === 'Literal' ? String(n.key.value) : undefined;
-        if (name !== undefined && (SKIP_PROP.has(name) || BANNED_PROP.has(name))) add(n, `the name ${JSON.stringify(show(name))} is refused (skipping, focusing, retrying and code-reaching names)`);
+        if (name !== undefined && (SKIP_PROP.has(name) || BANNED_PROP.has(name) || (parent.type === 'ObjectPattern' && name.startsWith('_')))) add(n, `the name ${JSON.stringify(show(name))} is refused (skipping, focusing, retrying and code-reaching names)`);
         return;
       }
       case 'Literal':

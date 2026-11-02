@@ -267,6 +267,7 @@ async function guardFiles(files: readonly CreatedFile[], ctx: GuardCtx): Promise
       const rules = claimingRules(f.path, repo, ctx.profile);
       if (inService && rules.length === 0) return refuse(`${q(f.path)} would be new source code of your service, and pipegen writes tests, Docker files and pipeline files, never your application's source`);
       if (f.edited !== undefined && !rules.some((r) => r.mode === 'edit')) return refuse(`pipegen does not edit ${q(f.path)}: it edits only the files it has a rule for (package.json, package-lock.json, CODEOWNERS, dependabot)`);
+      if (f.part === 'tests' && !rules.some((r) => r.id === 'starter-tests')) return refuse(`${q(f.path)} is a file of the tests part that the starter-test rule does not claim; pipegen writes starter tests only at {test,tests,__tests__}/**/*.test.{ts,js,mjs,cjs} and test/helpers/** of a service, and judges them with the same rules as the referee`);
       const starter = await starterProblem(f);
       if (starter !== null) return refuse(starter);
       return { kind: 'ok' };

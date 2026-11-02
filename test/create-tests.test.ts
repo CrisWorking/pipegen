@@ -134,7 +134,7 @@ describe('tests: the plan', () => {
     for (const f of plan.configEdits) expect(f.needsConfirm).toBe(true);
     for (const f of plan.files) expect(f.needsConfirm).toBeUndefined();
   });
-  it('tests: framework is vitest 5.0.5 for node; python -> not-proven "v0.4"; the AI is never asked in the other cases', async () => {
+  it('tests: framework is vitest 5.0.5 for node; python → not-proven "v0.4"', async () => {
     const py = make([ans([])], svc({ language: 'python', packageManager: 'pip' }));
     const r = await py.run();
     expect(r).toMatchObject({ framework: '', files: [], configEdits: [] });
@@ -300,7 +300,7 @@ describe('validate: what may be delivered', () => {
     expect(r.rejected).toHaveLength(2);
     expect(r.rejected[0]?.why).toMatch(/test, tests or __tests__|named/);
   });
-  it('validate: vitest.config.* / vite.config.* path rejected, also under test folders and as a helper', () => {
+  it('validate: vitest.config.* / vite.config.* path → rejected', () => {
     for (const path of ['api/vitest.config.ts', 'api/vite.config.js', 'api/test/vitest.config.test.ts', 'api/tests/vite.config.spec.test.js', 'api/test/helpers/vitest.config.ts', 'api/test/helpers/vitest.workspace.js']) {
       const r = v([cf(path)]);
       expect(r.accepted, path).toEqual([]);
@@ -327,6 +327,14 @@ describe('validate: what may be delivered', () => {
       const r = v([cf('api/test/a.test.js', `import { it, expect } from 'vitest';\nconst f = () => 1;\nit('a', () => { ${code}; expect(f()).toBe(1); });\n`)]);
       expect(r.accepted, code).toEqual([]);
     }
+  });
+  it("validate: a test with no expect/assert → rejected; assertion count can't drop between attempts", () => {
+    const none = cf('api/test/a.test.js', "import { it } from 'vitest';\nit('a', () => { 1 + 1; });\n");
+    expect(v([none]).rejected[0]?.why).toMatch(/no assertion/);
+    const plan = (files: CreatedFile[]): TestPlan => ({ framework: 'vitest 5.0.5', reasons: [], files, configEdits: [], notes: [] });
+    const strong = cf('api/test/a.test.js', GOOD);
+    const weak = cf('api/test/a.test.js', GOOD.replace('expect(add(0, 5)).toBe(5);', '').replace('expect(add(5, 0)).toBe(5);', 'add(5, 0);'));
+    expect(checkAttempt(plan([strong]), plan([weak])).join(' ')).toMatch(/fewer/);
   });
   it('validate: a test with no expect/assert rejected', () => {
     const r = v([cf('api/test/a.test.js', "import { it } from 'vitest';\nit('a', () => { f(); });\n")]);
@@ -441,6 +449,19 @@ describe('the producer\'s real output passes the referee and the guard', () => {
     expect(dep.refused).toEqual([]);
     const nodep = await run([cf('api/test/d.test.js', GOOD2.replaceAll('express', 'lodash'))]);
     expect(nodep.refused[0]?.reason).toMatch(/lodash/);
+  });
+  it('M1: the guard refuses a new tests-part file at a test-shaped path the starter rule does not claim, whatever its content', async () => {
+    const s = svc();
+    const { root, base } = repoDir({ 'api/package.json': PJ });
+    const evil = "import { it, expect } from 'vitest';\nimport { execSync } from 'node:child_process';\nit('a', () => { expect(execSync('id').length).toBeGreaterThan(0); });\n";
+    const paths = ['api/test/a.spec.ts', 'api/test/vitest.config.test.ts', 'api/src/a.test.ts', 'api/test/a.test.ts', 'api/tests/helpers/h.ts', 'api/other/a.txt'];
+    const g = await guardCreatedFiles(paths.map((p) => cf(p, evil)), { root, baseTree: base, installRecord: null, profile: profileOf([s]), closure: null });
+    expect(g.ok).toEqual([]);
+    expect(g.refused.map((r) => r.path).sort()).toEqual([...paths].sort());
+    expect(g.refused.find((r) => r.path === 'api/test/a.spec.ts')?.reason).toMatch(/starter test|tests part|not a path/);
+    // a good file at a claimed path, and the package edits (part tests, claimed by their own rules), still pass
+    const good = await guardCreatedFiles([cf('api/test/a.test.js')], { root, baseTree: base, installRecord: null, profile: profileOf([s]), closure: null });
+    expect(good.refused).toEqual([]);
   });
   it('the registry judge: a python or pnpm service, and a service folder named test, are refused or handled', async () => {
     const files = [cf('api/test/a.test.js')];
