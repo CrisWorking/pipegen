@@ -38,7 +38,6 @@
 // A file that does not parse is refused. The real boundary stays the CI job (repo-code job, no pipegen secrets, egress block): this is the first layer.
 //
 // TypeScript caveat: sucrase silently drops a `namespace`/`module` block, which a real compiler would run, so a TypeScript file that has one is refused.
-import { isBuiltin } from 'node:module';
 import { posix } from 'node:path';
 import { parse } from 'acorn';
 import { transform } from 'sucrase';
@@ -166,8 +165,7 @@ const API_MODULES: ReadonlySet<string> = new Set(['vitest', 'node:assert', 'node
 const TS_NAMESPACE_RE = /\b(?:namespace|module)\b/;
 const TS_ENUM_RE = /(?:^|[;{}/])\s*(?:export\s+)?(?:declare\s+)?(?:const\s+)?enum\s+[A-Za-z_$]/m;
 const RELATIVE_RE = /^\.{1,2}(?:\/[A-Za-z0-9_@.+~-]+)*\/?$/;
-const BARE_RE = /^(?:@[a-z0-9][a-z0-9._-]{0,213}\/)?[a-z0-9][a-z0-9._-]{0,213}(?:\/[A-Za-z0-9_@+-][A-Za-z0-9_@.+-]*)*$/;
-const ALLOW_TEXT = "vitest, node:assert, node:assert/strict, node:path, node:url, node:util, a relative path inside the service, or a package in the service's dependencies";
+const ALLOW_TEXT = "vitest, node:assert, node:assert/strict, node:path, node:url, node:util, or a relative path inside the service (no package, not even one the service depends on)";
 
 // ---------- the tree ----------
 
@@ -244,7 +242,7 @@ const show = (s: string, max = 60): string => activeSafeText(s, max);
 
 /**
  * Judges one file of a service. `rel` is the path inside the service (its folder resolves the relative imports; its name says whether tests are required),
- * `deps` the service's own `dependencies` names. Never throws for any content.
+ * `deps` is ignored: a package is never importable, not even a dependency of the service (S9 amended, D7 round 3). Never throws for any content.
  */
 export function analyzeTestFile(rel: string, content: string, deps: readonly string[], moduleType: 'module' | 'commonjs' = 'commonjs'): TestFileReport {
   const fail = (why: string): TestFileReport => ({ problems: [why], tests: 0, assertions: 0, parsed: false });
@@ -273,7 +271,7 @@ export function analyzeTestFile(rel: string, content: string, deps: readonly str
       parseError = `the file does not parse as ${ext === 'ts' ? 'TypeScript' : 'JavaScript'}${line}`;
       continue;
     }
-    reports.push(analyzeProgram(rel, program, script, deps));
+    reports.push(analyzeProgram(rel, program, script));
   }
   if (reports.length === 0) return fail(parseError);
   const first = reports[0] as TestFileReport;
@@ -281,10 +279,9 @@ export function analyzeTestFile(rel: string, content: string, deps: readonly str
   return { problems: [...new Set(reports.flatMap((r) => r.problems))], tests: Math.min(...reports.map((r) => r.tests)), assertions: Math.min(...reports.map((r) => r.assertions)), parsed: first.parsed };
 }
 
-function analyzeProgram(rel: string, program: N, script: boolean, deps: readonly string[]): TestFileReport {
+function analyzeProgram(rel: string, program: N, script: boolean): TestFileReport {
   const problems = new Set<string>();
   const fail = (why: string): TestFileReport => ({ problems: [why], tests: 0, assertions: 0, parsed: false });
-  const depSet = new Set(deps.filter((d) => NPM_NAME_RE.test(d) && !isBuiltin(d)));
   const dir = posix.dirname(rel);
   const add = (n: N | undefined, why: string): void => { if (problems.size < MAX_PROBLEMS) problems.add(`${n?.loc === undefined ? '' : `line ${n.loc.start.line}: `}${why}`); };
 
@@ -376,11 +373,6 @@ function analyzeProgram(rel: string, program: N, script: boolean, deps: readonly
       return null;
     }
     if (DANGEROUS_MODULES.test(spec)) return `imports ${JSON.stringify(show(spec))}, which can run commands, open sockets, read or delete files or load code outside the test`;
-    if (BARE_RE.test(spec) && !spec.split('/').includes('..') && !spec.split('/').includes('.')) {
-      const parts = spec.split('/');
-      const name = spec.startsWith('@') ? parts.slice(0, 2).join('/') : (parts[0] as string);
-      if (depSet.has(name)) return null;
-    }
     return `imports ${JSON.stringify(show(spec))}, which is not on the allowlist (${ALLOW_TEXT})`;
   };
   const checkSource = (n: N, source: unknown, relativeOnly: boolean): void => {
@@ -469,7 +461,7 @@ function analyzeProgram(rel: string, program: N, script: boolean, deps: readonly
     if (rel2 !== null) found.push(`http://${rel2[1]}`);
     for (const u of found) {
       const authority = /^[^:]*:\/\/[^/?#]*/.exec(u)?.[0] ?? u;
-      if (authority.includes('￿')) return 'a URL whose scheme, host or port is built at run time can not be checked (write them out; to use a server port, pass it in an http options object)';
+      if (authority.includes('￿')) return 'a URL whose scheme, host or port is built at run time can not be checked (write them out)';
       if (/[\\@]/.test(authority)) return 'a URL with a user name or a backslash before its path is refused';
       let url: URL;
       try { url = new URL(u.replaceAll('￿', 'x')); } catch { return `a URL pipegen can not read (${show(u, 40)})`; }
@@ -485,6 +477,22 @@ function analyzeProgram(rel: string, program: N, script: boolean, deps: readonly
     || (parent?.type === 'CatchClause' && parent.param === n) || ((parent?.type === 'ClassDeclaration' || parent?.type === 'ClassExpression') && parent.id === n)
     || (parent?.type === 'AssignmentPattern' && parent.left === n) || parent?.type === 'RestElement' || parent?.type === 'ArrayPattern';
 
+  /** Why the result of an `expect(...)` call is used wrongly: it is the test runner's own object (its flags hold the running test), so it may only start a matcher chain that ends in a call. */
+  const expectChainProblem = (call: N, anc: readonly N[]): string | null => {
+    const why = 'the value of expect(...) may only be the start of a matcher chain that ends in a call, written as a statement, awaited or returned (expect(x).toBe(y)); it may not be stored, passed, read or spread';
+    let cur: N = call;
+    let i = anc.length - 1;
+    let members = 0;
+    while (i >= 0 && anc[i]?.type === 'MemberExpression' && (anc[i] as N).object === cur && !(anc[i] as N).computed) { cur = anc[i] as N; i--; members++; }
+    const end = anc[i];
+    if (members === 0 || end?.type !== 'CallExpression' || end.callee !== cur) return why;
+    cur = end;
+    i--;
+    let p = anc[i];
+    if (p?.type === 'AwaitExpression' && p.argument === cur) { cur = p; i--; p = anc[i]; }
+    return p?.type === 'ExpressionStatement' || p?.type === 'ReturnStatement' || (p?.type === 'ArrowFunctionExpression' && p.body === cur) ? null : why;
+  };
+
   const visit = (n: N, anc: readonly N[]): void => {
     const parent = anc[anc.length - 1];
     switch (n.type) {
@@ -498,7 +506,7 @@ function analyzeProgram(rel: string, program: N, script: boolean, deps: readonly
       case 'ExportAllDeclaration':
       case 'ExportNamedDeclaration':
       case 'ExportDefaultDeclaration': {
-        // a test file exports nothing; a helper may export its own bindings, never an import (a re-export would carry node:http or a package out of the checks)
+        // a test file exports nothing; a helper may export its own bindings, never an import (a re-export would carry a module out of the checks)
         if (isTestFile) { add(n, 'a test file may not export anything'); return; }
         if (isNode(n.source)) { add(n, 'a helper may not re-export from another module (export ... from)'); return; }
         for (const sp of (n.specifiers ?? []) as N[]) { if (ident(sp.local) && importLocals.has(sp.local.name)) add(n, `a helper may not export ${show(sp.local.name)}, which comes from an import`); }
@@ -526,6 +534,10 @@ function analyzeProgram(rel: string, program: N, script: boolean, deps: readonly
       case 'WithStatement': add(n, 'a with statement is not accepted'); return;
       case 'CallExpression': {
         const c: N = n.callee;
+        if (ident(c, 'expect') || (isNode(c) && c.type === 'MemberExpression' && !c.computed && ident(c.object, 'expect') && (ident(c.property, 'soft') || ident(c.property, 'poll')))) {
+          const w = expectChainProblem(n, anc);
+          if (w !== null) add(n, w);
+        }
         if (isNode(c) && c.type === 'MemberExpression' && ident(c.object, 'vi') && (c.computed ? fold(c.property) === 'mock' : ident(c.property, 'mock'))) {
           const m = literalString(n.arguments[0]);
           if (m === undefined || !/^\.\.?\//.test(m)) add(n, 'vi.mock may name only a relative path inside the service, written as one string');
@@ -544,6 +556,7 @@ function analyzeProgram(rel: string, program: N, script: boolean, deps: readonly
         } else if (ident(c, 'it') || ident(c, 'test') || (isNode(c) && c.type === 'MemberExpression' && !c.computed && (ident(c.object, 'it') || ident(c.object, 'test')) && ident(c.property, 'concurrent'))) {
           testCall(n, anc);
         } else if (isDescribeCall(n)) {
+          if (parent?.type !== 'ExpressionStatement') add(n, 'the result of describe(...) may not be used (it is the suite object, which reaches the test runner): write describe(...) as a statement');
           const [title, fn, extra] = n.arguments as (N | undefined)[];
           const nm = staticString(title);
           if (nm === undefined || nm.trim() === '' || !isArrow(fn) || (n.arguments as unknown[]).length > 3 || (extra !== undefined && !(isNode(extra) && extra.type === 'Literal' && typeof extra.value === 'number'))) {
@@ -575,13 +588,13 @@ function analyzeProgram(rel: string, program: N, script: boolean, deps: readonly
         else if (VITEST_NAMES.has(name) && declared.has(name)) {
           if (!isDeclSite(n, parent, anc)) {
             const m = parent?.type === 'MemberExpression' && parent.object === n ? parent : undefined;
-            const key = m === undefined ? undefined : m.computed ? fold(m.property) : m.property?.name;
+            const key = m === undefined || m.computed ? undefined : m.property?.name;   // a computed key is never accepted, even a literal one (it['concurrent'] hides the call from the shape checks)
             const members = VITEST_MEMBERS[name];
             const call = anc[anc.length - 2];
             const asCallee = parent?.type === 'CallExpression' && parent.callee === n && name !== 'vi';
             const memberCalled = m !== undefined && typeof key === 'string' && members?.has(key) === true && call?.type === 'CallExpression' && call.callee === m;
             if (!asCallee && !memberCalled) {
-              add(n, `${name} (from vitest) can only be called${members === undefined || members.size === 0 ? '' : `, or used as a called ${name}.${[...members].join('/')}`}; never as a value, an alias, with another member or in a longer chain`);
+              add(n, `${name} (from vitest) can only be called${members === undefined || members.size === 0 ? '' : `, or used as a called ${name}.${[...members].join('/')}`}; never as a value, an alias, with a computed key, with another member or in a longer chain`);
             }
           }
         }

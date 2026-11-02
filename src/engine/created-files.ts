@@ -43,8 +43,8 @@ export interface CreatedInputs {
    */
   codeownersFacts?: Partial<Record<'app' | 'central', { isSymlink: boolean; inserted: string | null }>>;
   /**
-   * D7: the names under `dependencies` of each service's package.json, by service root ('' is the repo root; no `./`, no trailing `/`). A starter test may import
-   * a package only from its own service's list; a service that is missing here has none, so such an import is refused.
+   * D7: no longer used. The service's own `dependencies` are NOT importable from a starter test (S9 amended in D7 round 3), so the judge ignores this;
+   * the field stays so Plan G's callers need not change.
    */
   serviceDeps?: Readonly<Record<string, readonly string[]>>;
   /** D7: the package.json `type` of each service ('module' or 'commonjs'; same keys). A missing service is read as commonjs, which checks a .js file both ways. */

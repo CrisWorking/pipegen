@@ -54,9 +54,10 @@ describe('a good file passes, with its counts', () => {
     const src = "const assert = require('node:assert');\nconst { it } = require('vitest');\nconst f = () => 1;\nit('a', () => { assert.strictEqual(f(), 1); });\n";
     expect(probs(src, 'test/a.test.cjs')).toEqual([]);
   });
-  it('relative imports inside the service, the service\'s own dependencies and the allowed built-ins pass', () => {
-    const src = ok("import path from 'node:path';\nimport { fileURLToPath } from 'node:url';\nimport util from 'node:util';\nimport express from 'express';\nimport request from 'supertest/lib/x';\nimport { sub } from '../src/add.js';\nimport hh from './helpers/h.js';\nimport { s } from '@scope/pkg/sub';\nit('a', () => { expect(sub(1, 1)).toBe(2); });");
+  it('relative imports inside the service and the allowed built-ins pass (a dependency of the service does not)', () => {
+    const src = ok("import path from 'node:path';\nimport { fileURLToPath } from 'node:url';\nimport util from 'node:util';\nimport { sub } from '../src/add.js';\nimport hh from './helpers/h.js';\nit('a', () => { expect(sub(1, 1)).toBe(2); });");
     expect(probs(src, 'test/a.test.ts', ['express', 'supertest', '@scope/pkg'])).toEqual([]);
+    refused(ok("import express from 'express';\nit('a', () => { expect(express).toBe(f()); });"), /express/, 'test/a.test.ts', ['express']);
   });
   it('helpers need no test; a helper with an import outside the allowlist is still refused', () => {
     expect(probs("export const make = (n) => ({ n });\n", 'test/helpers/h.js')).toEqual([]);
@@ -307,10 +308,11 @@ describe('what the rules show goes through the vault', () => {
 
 describe('starterTestFileProblems (judge and guard share it)', () => {
   const o = { roots: ['', 'api'], depsOf: (r: string) => (r === 'api' ? ['express'] : []) };
-  it('refuses a path that is not a starter-test path and uses the owning service\'s dependencies', () => {
+  it('refuses a path that is not a starter-test path, and a package import in any service', () => {
     expect(starterTestFileProblems('src/a.test.ts', ok(T), o)[0]).toMatch(/not a path starter tests may use/);
-    expect(starterTestFileProblems('api/test/a.test.ts', ok(`import e from 'express';\n${T}`), o)).toEqual([]);
+    expect(starterTestFileProblems('api/test/a.test.ts', ok(`import e from 'express';\n${T}`), o).join(' ')).toMatch(/express/);   // even a dependency of the owning service
     expect(starterTestFileProblems('test/a.test.ts', ok(`import e from 'express';\n${T}`), o).join(' ')).toMatch(/express/);
+    expect(starterTestFileProblems('api/test/a.test.ts', ok(`import pth from 'node:path';\n${T}`), o)).toEqual([]);
   });
 });
 
@@ -379,6 +381,10 @@ describe('security scan round 2 / 4: scheme, host and port are written out, and 
   it('a run-time piece in the scheme, the host or the port is refused; in the path it is fine', () => {
     for (const e of ['`http://localhost:${port}/x`', '`http://${host}/x`', '`http://localhost${port}/x`', '`${scheme}://localhost/x`', '`http://127.0.0.1:${port}`', "'http://localhost:' + port", "'http://localhost' + ':' + port + '/x'", "'http://' + host + '/x'", '`http://[::1]:${port}/`', '`http://localhost:80${port}/`']) refused(t(e), /built at run time|URL host|can not read|bare URL/);
     for (const e of ['`http://localhost:3000/${p}`', "'http://localhost:3000/' + p", '`http://127.0.0.1/a?b=${p}#${p}`']) expect(probs(t(e)), e).toEqual([]);
+  });
+  it('the host is what the URL parser reads: localhost, 127.0.0.1, [::1] (and example.com in a plain string), nothing else', () => {
+    for (const e of ["'http://localhost:3000/x'", "'http://LOCALHOST/x'", "'http://[::1]:80/x'", "'https://127.0.0.1:8443/x'", "'http://127.1/x'", "'http://0x7f.0.0.1/x'", "'http://example.com/x'"]) expect(probs(t(e)), e).toEqual([]);
+    for (const e of ["'http://localhost%2eevil.net/x'", "'http://localhost.evil.net/x'", "'http://localhost:abc/x'", "'http://localhost:99999/x'", "'http://[::2]/x'", "'http://10.0.0.1/x'", "'http://169.254.169.254/'", "'http://evil.net:80" + "@localhost/x'", "'http://localhost@evil.net/x'", "'http://u" + ":p@localhost/x'", "'http://localhost\\\\@evil.net/x'", "'http://2130706434/x'", "'http://[::ffff:10.0.0.1]/x'", "'http:///evil.net'", "'http://'"]) refused(t(e), /URL|scheme/);
   });
 });
 
@@ -471,17 +477,17 @@ describe('rule tables: every name', () => {
 // ---- security scan, round 3 ----
 describe('security scan round 3 / 1: exports', () => {
   const T2 = "it('a', () => { expect(f()).toBe(1); });\n";
-  const test = (code: string, head = "import { join } from 'node:path';\nimport express from 'express';\n"): string => `${HEAD}${head}${code}\n${T2}`;
+  const test = (code: string, head = "import { join } from 'node:path';\nimport util from 'node:util';\n"): string => `${HEAD}${head}${code}\n${T2}`;
   it('a test file may not contain any export statement', () => {
-    for (const code of ['export { join };', 'export { express };', 'export { join as default };', 'export default express;', 'export const x = 1;', 'export default 1;', "export * from './x.js';", "export { a } from './x.js';", 'export function g() {}', 'export class K {}', 'export default function () {}', 'export { f as default };', 'export {};']) {
+    for (const code of ['export { join };', 'export { util };', 'export { join as default };', 'export default util;', 'export const x = 1;', 'export default 1;', "export * from './x.js';", "export { a } from './x.js';", 'export function g() {}', 'export class K {}', 'export default function () {}', 'export { f as default };', 'export {};']) {
       refused(test(code), /may not export anything/, 'test/a.test.ts', ['express']);
       refused(test(code), /may not export anything/, 'test/a.test.mjs', ['express']);
     }
   });
   it('a helper may export its own bindings but never an import, nor re-export', () => {
-    const helper = (code: string, head = "import { join } from 'node:path';\nimport express from 'express';\n"): string[] => probs(`${head}const own = 1;\n${code}\n`, 'test/helpers/h.js', ['express']);
+    const helper = (code: string, head = "import { join } from 'node:path';\nimport util from 'node:util';\n"): string[] => probs(`${head}const own = 1;\n${code}\n`, 'test/helpers/h.js', ['express']);
     for (const code of ['export const x = 1;', 'export { own };', 'export { own as default };', 'export default own;', 'export function g() { return 1; }', 'export default function () {}', 'export default 1;']) expect(helper(code), code).toEqual([]);
-    for (const code of ['export { join };', 'export { join as j };', 'export { join as default };', 'export default join;', 'export default express;', 'export { express };', "export * from './x.js';", "export { a } from './x.js';", "export * as ns from './x.js';", "export { default } from './x.js';"]) {
+    for (const code of ['export { join };', 'export { join as j };', 'export { join as default };', 'export default join;', 'export default util;', 'export { util };', "export * from './x.js';", "export { a } from './x.js';", "export * as ns from './x.js';", "export { default } from './x.js';"]) {
       expect(helper(code).join(' '), code).toMatch(/may not export|may not re-export/);
     }
   });
@@ -563,5 +569,43 @@ describe('mutation survivors: tracked API locals, node:test hooks, module type',
   });
   it('the hook names are reserved too', () => {
     for (const n of ['beforeEach', 'afterEach', 'beforeAll', 'afterAll']) refused(ok(`it('a', () => { const ${n} = f; expect(f()).toBe(1); });`), /reserves/);
+  });
+});
+
+// ---- restored in D7 fix round 3 (they covered no removed behaviour) ----
+describe('security scan 3: parse by the package type, and no `this` in plain functions', () => {
+  const body = (code: string): string => ok(`it('a', () => { ${code}; expect(f()).toBe(1); });`);
+  it('this in a plain function is refused in every extension; arrows, class members and a module top level are fine', () => {
+    for (const rel of ['test/a.test.ts', 'test/a.test.js', 'test/a.test.mjs']) {
+      refused(body('const g = (function () { return this; })()'), /this inside a plain function/, rel);
+      refused(`${HEAD}function t() { return this; }\nit('a', () => { expect(t()).toBe(1); });`, /this inside a plain function/, rel);
+      refused(body('const o = { m() { return this; } }'), /this inside a plain function/, rel);
+      refused(body('const o = { m: function () { return this; } }'), /this inside a plain function/, rel);
+    }
+    refused(`${CJS}const t = this;\nit('a', () => { expect(t).toBe(1); });`, /this at the top of a script/, 'test/a.test.cjs');
+    refused(`${CJS}it('a', () => { const g = (() => this)(); expect(g).toBe(1); });`, /top of a script/, 'test/a.test.cjs');
+    expect(probs(body('const g = () => this; class K { m() { return this; } static s = this; x = this; static { this.q = 1; } }'), 'test/a.test.mjs')).toEqual([]);
+  });
+  it('.js follows the package.json type: a module, or both readings (a script-only reading is not trusted alone)', () => {
+    const hidden = `${HEAD}const a = 1, b = 1;\na <!-- globalThis\nit('a', () => { expect(f()).toBe(1); });\n`;
+    const r = (src: string, type: 'module' | 'commonjs') => analyzeTestFile('test/a.test.js', src, [], type);
+    expect(r(hidden, 'module').problems.join(' ')).toMatch(/globalThis/);
+    expect(r(hidden, 'commonjs').problems.join(' ')).toMatch(/globalThis/);   // the module reading sees what the script reading hides
+    const sloppy = `${CJS}var o = 010;\nit('a', () => { expect(f()).toBe(o); });\n`;
+    expect(r(sloppy, 'module').problems.join(' ')).toMatch(/does not parse/);
+    expect(r(sloppy, 'commonjs').problems).toEqual([]);
+    expect(r(HEAD + "it('a', () => { expect(f()).toBe(1); });\n", 'commonjs')).toMatchObject({ problems: [], tests: 1, assertions: 1 });
+    expect(analyzeTestFile('test/a.test.cjs', `${CJS}const a = 1, b = 1;\na <!-- globalThis\nit('a', () => { expect(f()).toBe(1); });\n`, [], 'module').problems.join(' ')).toMatch(/globalThis/);   // .cjs is read both ways (the runner takes it as a module)
+  });
+  it('packageModuleType reads "type" exactly', () => {
+    expect(packageModuleType('{"type":"module"}')).toBe('module');
+    for (const t of ['{"type":"commonjs"}', '{}', '{"type":"Module"}', 'x', 'null', '[]']) expect(packageModuleType(t), t).toBe('commonjs');
+  });
+  it('starterTestFileProblems passes the service type to the parse', () => {
+    const sloppy = `${CJS}var o = 010;\nit('a', () => { expect(f()).toBe(o); });\n`;
+    const o = { roots: ['api'], depsOf: () => [] as string[] };
+    expect(starterTestFileProblems('api/test/a.test.js', sloppy, { ...o, typeOf: () => 'module' }).join(' ')).toMatch(/parse/);
+    expect(starterTestFileProblems('api/test/a.test.js', sloppy, { ...o, typeOf: () => 'commonjs' })).toEqual([]);
+    expect(starterTestFileProblems('api/test/a.test.js', sloppy, o)).toEqual([]);
   });
 });

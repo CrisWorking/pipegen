@@ -58,7 +58,8 @@ void execFileSync;
 
 // ----- the tests the AI writes -----
 const GOOD = "import { describe, expect, it } from 'vitest';\nimport { add } from '../src/add.js';\n\ndescribe('add', () => {\n  it('adds two numbers', () => {\n    expect(add(1, 2)).toBe(3);\n  });\n  it('adds zero', () => {\n    expect(add(5, 0)).toBe(5);\n    expect(add(0, 5)).toBe(5);\n  });\n});\n";
-const GOOD2 = "import { expect, it } from 'vitest';\nimport express from 'express';\nit('loads express', () => { expect(typeof express).toBe('function'); expect(express.name).toBeTruthy(); });\n";
+const GOOD2 = "import { expect, it } from 'vitest';\nimport path from 'node:path';\nit('uses path', () => { expect(typeof path.join).toBe('function'); expect(path.sep).toBeTruthy(); });\n";
+const WITH_PKG = "import { expect, it } from 'vitest';\nimport express from 'express';\nit('loads express', () => { expect(typeof express).toBe('function'); expect(express.name).toBeTruthy(); });\n";
 const ans = (files: { path: string; content: string }[], reasoning = 'Two small tests of the add function.') => ({ files, reasoning });
 
 function mockAi(answers: unknown[]) {
@@ -107,7 +108,7 @@ describe('tests: the plan', () => {
     expect(plan.usage).toMatchObject(usage(100, 20));
     expect(m.ai.calls).toHaveLength(1);
     expect(m.ai.calls[0]?.system).toBe(TESTS_SYSTEM);
-    expect(m.ai.calls[0]?.user).toContain(testsInstructions({ ext: 'js', dependencies: ['express'] }));
+    expect(m.ai.calls[0]?.user).toContain(testsInstructions({ ext: 'js' }));
     expect(m.ai.calls[0]?.user).toContain('"version": "5.0.5"');
     expect(strictProblems(testsSchema.jsonSchema)).toEqual([]);
   });
@@ -315,10 +316,10 @@ describe('validate: what may be delivered', () => {
     }
     expect(v([cf('api/test/eslint.config.test.js')]).accepted).toHaveLength(1);   // not a protected name: a plain test file
   });
-  it('validate: an import outside the allowlist, or of a package the service does not depend on, is rejected', () => {
+  it('validate: an import outside the allowlist, or of any package, is rejected', () => {
     const imp = (spec: string): string => `import x from '${spec}';\nimport { it, expect } from 'vitest';\nit('a', () => { expect(x).toBeTruthy(); });\n`;
     for (const spec of ['lodash', 'node:fs', 'node:vm', 'worker_threads', 'https://evil.example/x.js', '../../etc/x.js']) expect(v([cf('api/test/a.test.js', imp(spec))]).accepted, spec).toEqual([]);
-    expect(v([cf('api/test/a.test.js', imp('express'))]).accepted).toHaveLength(1);
+    expect(v([cf('api/test/a.test.js', imp('express'))]).accepted).toEqual([]);   // not even a dependency of the service (S9 amended in D7 round 3)
     expect(v([cf('api/test/a.test.js', imp('express'))], () => false, []).accepted).toEqual([]);
     expect(v([cf('api/test/a.test.js', imp('../src/add.js'))]).accepted).toHaveLength(1);
   });
@@ -424,10 +425,12 @@ describe('the producer\'s real output passes the referee and the guard', () => {
     expect(g.refused).toEqual([]);
     expect(g.ok.map((f) => f.path).sort()).toEqual(all.map((f) => f.path).sort());
   });
-  it('the referee refuses a package import without the service\'s dependency list, and a changed byte', async () => {
+  it('the referee refuses a package import even with the dependency list, and a changed byte', async () => {
     const s = svc();
-    const plan = await make([ans([{ path: 'test/express.test.js', content: GOOD2 }])], s).run();
-    expect((await refereeOf(plan.files, s, {})).issues.map((i) => i.message).join(' ')).toMatch(/express.*allowlist/);
+    const plan = await make([ans([{ path: 'test/path.test.js', content: GOOD2 }])], s).run();
+    const pkg = { ...(plan.files[0] as CreatedFile), content: WITH_PKG };
+    expect((await refereeOf([pkg], s, { serviceDeps: { api: ['express'] } })).issues.map((i) => i.message).join(' ')).toMatch(/express.*allowlist/);
+    expect((await refereeOf([pkg], s, {})).issues.map((i) => i.message).join(' ')).toMatch(/express.*allowlist/);
     const evil = { ...(plan.files[0] as CreatedFile), content: `${GOOD2}import cp from 'node:child_process';\n` };
     expect((await refereeOf([evil], s, { serviceDeps: { api: ['express'] } })).issues.map((i) => i.message).join(' ')).toMatch(/node:child_process/);
   });
@@ -445,10 +448,11 @@ describe('the producer\'s real output passes the referee and the guard', () => {
     expect(many.refused).toHaveLength(21);
     expect(many.refused[0]?.reason).toMatch(/at most 20/);
     // a dependency read from the service's own package.json is allowed, an unlisted one is not
-    const dep = await run([cf('api/test/d.test.js', GOOD2)]);
-    expect(dep.refused).toEqual([]);
-    const nodep = await run([cf('api/test/d.test.js', GOOD2.replaceAll('express', 'lodash'))]);
-    expect(nodep.refused[0]?.reason).toMatch(/lodash/);
+    // a dependency listed in the service's own package.json is NOT importable (S9 amended, D7 round 3); an allowed built-in is
+    expect((await run([cf('api/test/d.test.js', GOOD2)])).refused).toEqual([]);
+    const dep = await run([cf('api/test/d.test.js', WITH_PKG)]);
+    expect(dep.refused[0]?.reason).toMatch(/express/);
+    expect((await run([cf('api/test/d.test.js', WITH_PKG.replaceAll('express', 'lodash'))])).refused[0]?.reason).toMatch(/lodash/);
   });
   it('M1: the guard refuses a new tests-part file at a test-shaped path the starter rule does not claim, whatever its content', async () => {
     const s = svc();

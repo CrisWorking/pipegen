@@ -55,7 +55,8 @@ describe('(b) vi has a member allowlist, and so does expect', () => {
     refused(body("vi.mock('./a.js', () => { eval('1'); return {}; })"), /eval/);   // the factory body is judged by the same rules
   });
   it('the listed expect members pass; extend, addSnapshotSerializer and the rest are refused', () => {
-    for (const n of ['soft', 'poll', 'any', 'anything', 'objectContaining', 'arrayContaining', 'stringContaining', 'stringMatching', 'assertions', 'hasAssertions']) expect(probs(body(`expect.${n}(1)`)), n).toEqual([]);
+    for (const n of ['soft', 'poll']) expect(probs(body(`expect.${n}(f()).toBe(1)`)), n).toEqual([]);
+    for (const n of ['any', 'anything', 'objectContaining', 'arrayContaining', 'stringContaining', 'stringMatching', 'assertions', 'hasAssertions']) expect(probs(body(`expect.${n}(1)`)), n).toEqual([]);
     for (const n of ['extend', 'addSnapshotSerializer', 'unreachable', 'getState', 'setState', 'addEqualityTesters', 'toBe', 'fail']) refused(body(`expect.${n}({})`), /expect \(from vitest\)/);
   });
 });
@@ -69,7 +70,7 @@ describe('(c) node:http is not importable, and no http machinery is left', () =>
     refused(`${HEAD}import x from 'http';\nit('b', () => { expect(f()).toBe(1); });\n`, /"http"/);
   });
   it('the texts do not offer http', () => {
-    expect(testsInstructions({ ext: 'ts', dependencies: [] })).not.toMatch(/http\.get|http\.request|createServer|sockets? .*port/);
+    expect(testsInstructions({ ext: 'ts' })).not.toMatch(/http\.get|http\.request|createServer|sockets? .*port/);
   });
 });
 
@@ -78,6 +79,6 @@ describe('(e) every member of a chain rooted at a vitest binding is checked', ()
     for (const code of ["it.concurrent.foo('a', () => { expect(f()).toBe(1); });", "it.concurrent.skip('a', () => { expect(f()).toBe(1); });", "it.concurrent.concurrent('a', () => { expect(f()).toBe(1); });", "test.concurrent.only('a', () => { expect(f()).toBe(1); });", "describe.concurrent.x('g', () => {});", "describe.concurrent['skip']('g', () => {});", 'const g = it.concurrent;', 'f(test.concurrent);', 'const k = Object.keys(it.concurrent);', "expect.soft.x(1);", "expect.any.constructor", 'expect.poll.call', 'vi.fn.x()', 'vi.fn.call()', 'const g = vi.fn;', 'const g = expect.soft;', "it.concurrent.each([1])('a', () => {});", "it.concurrent['sk' + 'ip']('a', () => {});"]) {
       refused(`${HEAD}${code}\nit('b', () => { expect(f()).toBe(1); });\n`, /can only be called|skips, focuses|is refused|can not count/);
     }
-    expect(probs(`${HEAD}it.concurrent('a', () => { expect(f()).toBe(1); });\ntest['concurrent']('b', () => { expect(f()).toBe(1); });\ndescribe.concurrent('g', () => { it('c', () => { expect.soft(f()).toBe(1); expect(f()).toEqual(expect.any(Array)); vi.fn().mockReturnValue(1); }); });\n`)).toEqual([]);
+    expect(probs(`${HEAD}it.concurrent('a', () => { expect(f()).toBe(1); });\ntest.concurrent('b', () => { expect(f()).toBe(1); });\ndescribe.concurrent('g', () => { it('c', () => { expect.soft(f()).toBe(1); expect(f()).toEqual(expect.any(Array)); vi.fn().mockReturnValue(1); }); });\n`)).toEqual([]);
   });
 });

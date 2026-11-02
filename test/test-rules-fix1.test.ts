@@ -134,7 +134,7 @@ describe('M5: assertions after an early return or throw do not count', () => {
 
 describe('M6: no text offers STATUS_CODES or METHODS', () => {
   it('the prompt, the leaf header and the messages', () => {
-    expect(testsInstructions({ ext: 'ts', dependencies: [] })).not.toMatch(/STATUS_CODES|METHODS/);
+    expect(testsInstructions({ ext: 'ts' })).not.toMatch(/STATUS_CODES|METHODS/);
     expect(readFileSync(join(import.meta.dirname, '..', 'src', 'create', 'test-rules.ts'), 'utf8')).not.toMatch(/STATUS_CODES|METHODS/);
     expect(probs(`${HEAD}import http from 'node:http';\nit('a', () => { http.foo(1); expect(f()).toBe(1); });\n`).join(' ')).not.toMatch(/STATUS_CODES|METHODS/);
   });
