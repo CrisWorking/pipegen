@@ -56,7 +56,9 @@ describe('(b) vi has a member allowlist, and so does expect', () => {
   });
   it('the listed expect members pass; extend, addSnapshotSerializer and the rest are refused', () => {
     for (const n of ['soft', 'poll']) expect(probs(body(`expect.${n}(f()).toBe(1)`)), n).toEqual([]);
-    for (const n of ['any', 'anything', 'objectContaining', 'arrayContaining', 'stringContaining', 'stringMatching', 'assertions', 'hasAssertions']) expect(probs(body(`expect.${n}(1)`)), n).toEqual([]);
+    // D7-R4: an asymmetric matcher only as a call argument, expect.assertions/hasAssertions only as statements
+    for (const n of ['any', 'anything', 'objectContaining', 'arrayContaining', 'stringContaining', 'stringMatching', 'closeTo']) expect(probs(body(`expect(f()).toEqual(expect.${n}(1))`)), n).toEqual([]);
+    for (const n of ['assertions', 'hasAssertions']) expect(probs(body(`expect.${n}(1)`)), n).toEqual([]);
     for (const n of ['extend', 'addSnapshotSerializer', 'unreachable', 'getState', 'setState', 'addEqualityTesters', 'toBe', 'fail']) refused(body(`expect.${n}({})`), /expect \(from vitest\)/);
   });
 });

@@ -7,7 +7,7 @@
 // syntax tree is walked:
 //   imports      every import, `export ... from`, `require()` and `import()` has a string-literal specifier that is on the allowlist: `vitest` (named
 //                imports from a fixed set, no alias), node:assert, node:assert/strict, node:path, node:url, node:util, a relative
-//                path that stays inside the service, or a name in the service's own `dependencies`. Nothing else.
+//                path that stays inside the service. No package at all, not even one the service depends on (S9 amended, D7-R3). Nothing else.
 //   code reach   eval, Function, globalThis and friends, Reflect, module, `require` used as a value, `process` other than a few reads, import.meta
 //                other than url/dirname/filename, `.constructor`, `__proto__` and the other ways to get at the Function constructor are refused,
 //                computed forms (`globalThis['ev' + 'al']`) included when the key can be read statically, and a computed key that can not be read
@@ -20,9 +20,14 @@
 //                  - the imports of the allowed modules, expect, assert calls, and the vitest API: describe, it, test, the hooks, and vi.fn, vi.spyOn, vi.mock
 //                    (a literal relative path; its factory is judged like any code), vi.clearAllMocks/resetAllMocks/restoreAllMocks,
 //                    vi.useFakeTimers/useRealTimers/advanceTimersByTime/runAllTimers (an ALLOWLIST: importActual, doMock, stubGlobal, stubEnv, hoisted ... are refused);
-//                    expect and its members soft, poll, assertions, hasAssertions, any, anything, objectContaining, arrayContaining, stringContaining, stringMatching
-//                    (extend and addSnapshotSerializer are refused). Every member of a chain rooted at a vitest binding is checked: the only chains are
-//                    it/test/describe.concurrent, and each member must be called;
+//                    expect and its members soft, poll, assertions, hasAssertions and the asymmetric matchers any, anything, objectContaining, arrayContaining,
+//                    stringContaining, stringMatching, closeTo, also as expect.not.<asymmetric> (an ALLOWLIST: extend, getState, addSnapshotSerializer ... are refused).
+//                    Every member of a chain rooted at a vitest binding is checked: the only chains are it/test/describe.concurrent and expect.not.<asymmetric>,
+//                    and each member must be called. The bindings themselves are never values (stored, passed, spread, returned, destructured);
+//                  - (D7-R4) what vitest calls return is held too: an expect(...) chain is a statement (optionally awaited), and is returned or is a concise
+//                    arrow body only in the test or hook callback itself; an asymmetric matcher's result is only a call argument (directly or inside array
+//                    and object literals); expect.assertions/hasAssertions and every vi.* call other than vi.fn and vi.spyOn are statements. Members that
+//                    reach vitest's internals (importActual, getMatcherContext, snapshotState, getState, extend ...) are refused on ANY object;
 //                  - the callbacks of test, describe and the hooks are ARROW functions with no parameters (a plain function has `arguments`, which is the test context);
 //                  - JSON.parse and JSON.stringify; Math.*; Number.isInteger/isFinite/isNaN/isSafeInteger/parseFloat/parseInt and its constants; String.raw;
 //                    Array.isArray/from/of; Object.keys/values/entries/assign/freeze/fromEntries/is/hasOwn; Promise.resolve/reject/all/allSettled/race/any/withResolvers;
@@ -110,6 +115,15 @@ const ALLOWED_BUILTINS: ReadonlySet<string> = new Set(['vitest', 'node:assert', 
 const ASSERT_MODULES: ReadonlySet<string> = new Set(['node:assert', 'node:assert/strict']);
 const VITEST_NAMES: ReadonlySet<string> = new Set(['describe', 'it', 'test', 'expect', 'vi', 'beforeAll', 'afterAll', 'beforeEach', 'afterEach']);
 const VI_OK: ReadonlySet<string> = new Set(['fn', 'spyOn', 'mock', 'clearAllMocks', 'resetAllMocks', 'restoreAllMocks', 'useFakeTimers', 'useRealTimers', 'advanceTimersByTime', 'runAllTimers']);
+/** The vi calls whose result a test may keep (a mock); every other vi call returns vi itself or nothing, so it may only be a statement (D7-R4 3). */
+const VI_VALUE: ReadonlySet<string> = new Set(['fn', 'spyOn']);
+/** The asymmetric matchers (D7-R4 2): `expect.<name>(...)` and `expect.not.<name>(...)`. Their result holds getMatcherContext(), which reaches the snapshot state. */
+const ASYMMETRIC: ReadonlySet<string> = new Set(['any', 'anything', 'objectContaining', 'arrayContaining', 'stringContaining', 'stringMatching', 'closeTo']);
+/** The members of expect (an allowlist, D7-R4 2). `not` only as expect.not.<asymmetric>(...). */
+const EXPECT_OK: ReadonlySet<string> = new Set([...ASYMMETRIC, 'not', 'assertions', 'hasAssertions', 'soft', 'poll']);
+/** Members that reach vitest's module loader, globals, config or expect state: refused on ANY object, dot or static computed, and destructured (D7-R4 4). */
+const VITEST_ESCAPE: ReadonlySet<string> = new Set(['importActual', 'importMock', 'doMock', 'doUnmock', 'stubGlobal', 'stubEnv', 'unstubAllGlobals', 'unstubAllEnvs', 'hoisted', 'dynamicImportSettled', 'mocked',
+  'setConfig', 'resetConfig', 'getMatcherContext', 'snapshotState', 'getState', 'setState', 'extend', 'addSnapshotSerializer', 'addEqualityTesters']);
 const PROCESS_OK: ReadonlySet<string> = new Set(['env', 'cwd', 'platform', 'nextTick', 'hrtime', 'uptime']);
 const META_OK: ReadonlySet<string> = new Set(['url', 'dirname', 'filename']);
 /** Names that give code execution or a way around the checks. */
@@ -150,7 +164,7 @@ const ALLOWED_GLOBALS: ReadonlySet<string> = new Set(['undefined', 'NaN', 'Infin
 const VITEST_MEMBERS: Readonly<Record<string, ReadonlySet<string>>> = {
   describe: new Set(['concurrent']), it: new Set(['concurrent']), test: new Set(['concurrent']),
   vi: VI_OK,
-  expect: new Set(['soft', 'poll', 'assertions', 'hasAssertions', 'any', 'anything', 'objectContaining', 'arrayContaining', 'stringContaining', 'stringMatching']),
+  expect: EXPECT_OK,
 };
 const HOOKS: ReadonlySet<string> = new Set(['beforeAll', 'afterAll', 'beforeEach', 'afterEach']);
 const PARAM_MSG = 'the function of a test, describe or hook takes no parameters (the test context can skip a test)';
@@ -223,6 +237,7 @@ const templateText = (n: N): string => (n.quasis as N[]).map((q, i) => {
 }).join('');
 const isLiteralish = (n: N): boolean => n.type === 'Literal' || (n.type === 'TemplateLiteral' && n.expressions.length === 0) || (n.type === 'UnaryExpression' && isNode(n.argument) && isLiteralish(n.argument));
 const isArrow = (n: unknown): n is N => isNode(n) && n.type === 'ArrowFunctionExpression';
+const FUNCTION_TYPES: ReadonlySet<string> = new Set(['ArrowFunctionExpression', 'FunctionExpression', 'FunctionDeclaration']);
 const isFn = (n: unknown): n is N => isNode(n) && (n.type === 'ArrowFunctionExpression' || n.type === 'FunctionExpression');
 const ident = (n: unknown, name?: string): boolean => isNode(n) && n.type === 'Identifier' && (name === undefined || n.name === name);
 
@@ -413,6 +428,11 @@ function analyzeProgram(rel: string, program: N, script: boolean): TestFileRepor
     }
     return ident(c) && assertNames.has(c.name) && (e.arguments as N[]).some((a) => isNode(a) && !isLiteralish(a));
   };
+  /** `it`, `test`, `it.concurrent` or `test.concurrent` as a callee. */
+  const isTestCallee = (c: unknown): boolean => ident(c, 'it') || ident(c, 'test') || (isNode(c) && c.type === 'MemberExpression' && !c.computed && (ident(c.object, 'it') || ident(c.object, 'test')) && ident(c.property, 'concurrent'));
+  /** Whether `fn` is the arrow written in place as the callback of a test call (its 2nd argument) or of a hook (its 1st). */
+  const isTestOrHookCallback = (fn: N | undefined, call: N | undefined): boolean => isArrow(fn) && isNode(call) && call.type === 'CallExpression'
+    && ((isTestCallee(call.callee) && call.arguments[1] === fn) || (ident(call.callee) && HOOKS.has(call.callee.name as string) && declared.has(call.callee.name as string) && call.arguments[0] === fn));
   const isDescribeCall = (n: unknown): boolean => isNode(n) && n.type === 'CallExpression' && (ident(n.callee, 'describe')
     || (isNode(n.callee) && n.callee.type === 'MemberExpression' && !n.callee.computed && ident(n.callee.object, 'describe') && ident(n.callee.property, 'concurrent')));
   /** A test call must stand alone as a statement: at the top of the file, or directly in a describe body (never in a loop, condition or function). */
@@ -477,9 +497,15 @@ function analyzeProgram(rel: string, program: N, script: boolean): TestFileRepor
     || (parent?.type === 'CatchClause' && parent.param === n) || ((parent?.type === 'ClassDeclaration' || parent?.type === 'ClassExpression') && parent.id === n)
     || (parent?.type === 'AssignmentPattern' && parent.left === n) || parent?.type === 'RestElement' || parent?.type === 'ArrayPattern';
 
-  /** Why the result of an `expect(...)` call is used wrongly: it is the test runner's own object (its flags hold the running test), so it may only start a matcher chain that ends in a call. */
+  /**
+   * Why the result of an `expect(...)` call is used wrongly: it is the test runner's own object (its flags hold the running test), and so is the value
+   * of the matcher call at the end of its chain. So it may only start a matcher chain that ends in a call, written as a statement (optionally awaited);
+   * it may be returned, or be a concise arrow body, only in the arrow written in place as a test or hook callback, where vitest itself takes the value
+   * (D7-R4 1: a helper that returns it hands the running test to the file).
+   */
   const expectChainProblem = (call: N, anc: readonly N[]): string | null => {
-    const why = 'the value of expect(...) may only be the start of a matcher chain that ends in a call, written as a statement, awaited or returned (expect(x).toBe(y)); it may not be stored, passed, read or spread';
+    const why = 'the value of expect(...) may only be the start of a matcher chain that ends in a call, written as a statement, optionally awaited (expect(x).toBe(y)); it may not be stored, passed, read or spread';
+    const whyOut = 'an expect(...) chain may be returned, or be the body of an arrow without braces, only from the test or hook function itself; in a helper or any other function write it as a statement (its value holds the running test)';
     let cur: N = call;
     let i = anc.length - 1;
     let members = 0;
@@ -490,7 +516,35 @@ function analyzeProgram(rel: string, program: N, script: boolean): TestFileRepor
     i--;
     let p = anc[i];
     if (p?.type === 'AwaitExpression' && p.argument === cur) { cur = p; i--; p = anc[i]; }
-    return p?.type === 'ExpressionStatement' || p?.type === 'ReturnStatement' || (p?.type === 'ArrowFunctionExpression' && p.body === cur) ? null : why;
+    if (p?.type === 'ExpressionStatement') return null;
+    if (p?.type === 'ArrowFunctionExpression' && p.body === cur) return isTestOrHookCallback(p, anc[i - 1]) ? null : whyOut;
+    if (p?.type === 'ReturnStatement') {
+      let j = i - 1;
+      while (j >= 0 && !FUNCTION_TYPES.has((anc[j] as N).type)) j--;
+      return j >= 0 && isTestOrHookCallback(anc[j], anc[j - 1]) ? null : whyOut;
+    }
+    return why;
+  };
+  /** Whether `n` is `expect.<asymmetric>(...)` or `expect.not.<asymmetric>(...)`. */
+  const isAsymmetricCall = (n: N): boolean => {
+    const c: unknown = n.callee;
+    if (!isNode(c) || c.type !== 'MemberExpression' || c.computed || !ident(c.property) || !ASYMMETRIC.has(c.property.name as string)) return false;
+    const o: unknown = c.object;
+    return ident(o, 'expect') || (isNode(o) && o.type === 'MemberExpression' && !o.computed && ident(o.object, 'expect') && ident(o.property, 'not'));
+  };
+  /** Why an asymmetric matcher's result is used wrongly (D7-R4 2): only as a call argument, directly or as a value inside array and object literals that are. */
+  const asymmetricProblem = (call: N, anc: readonly N[]): string | null => {
+    let cur: N = call;
+    let i = anc.length - 1;
+    for (;;) {
+      const p = anc[i];
+      if (p?.type === 'ArrayExpression' && (p.elements as unknown[]).includes(cur)) { cur = p; i--; continue; }
+      if (p?.type === 'Property' && p.value === cur && p.kind === 'init' && anc[i - 1]?.type === 'ObjectExpression') { cur = anc[i - 1] as N; i -= 2; continue; }
+      break;
+    }
+    const p = anc[i];
+    return p?.type === 'CallExpression' && p.callee !== cur && (p.arguments as unknown[]).includes(cur) ? null
+      : 'an asymmetric matcher (expect.any(...), expect.objectContaining(...) ...) may only be written as an argument of a call, directly or inside an array or object literal there (expect(x).toEqual(expect.objectContaining({ a: expect.any(Number) }))); it may not be stored, read, spread or returned';
   };
 
   const visit = (n: N, anc: readonly N[]): void => {
@@ -538,6 +592,14 @@ function analyzeProgram(rel: string, program: N, script: boolean): TestFileRepor
           const w = expectChainProblem(n, anc);
           if (w !== null) add(n, w);
         }
+        if (isAsymmetricCall(n)) { const w = asymmetricProblem(n, anc); if (w !== null) add(n, w); }
+        const standsAlone = parent?.type === 'ExpressionStatement' && parent.expression === n;
+        if (isNode(c) && c.type === 'MemberExpression' && !c.computed && ident(c.object, 'expect') && (ident(c.property, 'assertions') || ident(c.property, 'hasAssertions')) && !standsAlone) {
+          add(n, `expect.${c.property.name as string}(...) may only be written as a statement`);
+        }
+        if (isNode(c) && c.type === 'MemberExpression' && !c.computed && ident(c.object, 'vi') && ident(c.property) && !VI_VALUE.has(c.property.name as string) && !standsAlone) {
+          add(n, `the result of vi.${show(c.property.name as string)}(...) may not be used (it is vi itself): write the call as a statement (only vi.fn and vi.spyOn give a value to keep)`);
+        }
         if (isNode(c) && c.type === 'MemberExpression' && ident(c.object, 'vi') && (c.computed ? fold(c.property) === 'mock' : ident(c.property, 'mock'))) {
           const m = literalString(n.arguments[0]);
           if (m === undefined || !/^\.\.?\//.test(m)) add(n, 'vi.mock may name only a relative path inside the service, written as one string');
@@ -553,7 +615,7 @@ function analyzeProgram(rel: string, program: N, script: boolean): TestFileRepor
           }
           if ((n.arguments as unknown[]).length !== 1) add(n, 'require() takes one plain string');
           else checkSource(n, n.arguments[0], false);
-        } else if (ident(c, 'it') || ident(c, 'test') || (isNode(c) && c.type === 'MemberExpression' && !c.computed && (ident(c.object, 'it') || ident(c.object, 'test')) && ident(c.property, 'concurrent'))) {
+        } else if (isTestCallee(c)) {
           testCall(n, anc);
         } else if (isDescribeCall(n)) {
           if (parent?.type !== 'ExpressionStatement') add(n, 'the result of describe(...) may not be used (it is the suite object, which reaches the test runner): write describe(...) as a statement');
@@ -592,9 +654,14 @@ function analyzeProgram(rel: string, program: N, script: boolean): TestFileRepor
             const members = VITEST_MEMBERS[name];
             const call = anc[anc.length - 2];
             const asCallee = parent?.type === 'CallExpression' && parent.callee === n && name !== 'vi';
-            const memberCalled = m !== undefined && typeof key === 'string' && members?.has(key) === true && call?.type === 'CallExpression' && call.callee === m;
-            if (!asCallee && !memberCalled) {
-              add(n, `${name} (from vitest) can only be called${members === undefined || members.size === 0 ? '' : `, or used as a called ${name}.${[...members].join('/')}`}; never as a value, an alias, with a computed key, with another member or in a longer chain`);
+            const memberCalled = m !== undefined && typeof key === 'string' && key !== 'not' && members?.has(key) === true && call?.type === 'CallExpression' && call.callee === m;
+            // expect.not only as expect.not.<asymmetric>(...)
+            const outer = anc[anc.length - 3];
+            const notAsymmetric = name === 'expect' && key === 'not' && call?.type === 'MemberExpression' && call.object === m && !call.computed && ident(call.property) && ASYMMETRIC.has(call.property.name as string)
+              && outer?.type === 'CallExpression' && outer.callee === call;
+            if (!asCallee && !memberCalled && !notAsymmetric) {
+              const list = members === undefined || members.size === 0 ? '' : `, or used as a called ${name}.${[...members].filter((x) => x !== 'not').join('/')}${name === 'expect' ? ' or expect.not.<asymmetric matcher>' : ''}`;
+              add(n, `${name} (from vitest) can only be called${list}; never as a value, an alias, with a computed key, with another member or in a longer chain`);
             }
           }
         }
@@ -623,6 +690,7 @@ function analyzeProgram(rel: string, program: N, script: boolean): TestFileRepor
         } else name = String(n.property?.name);
         if (SKIP_PROP.has(name)) add(n, `.${show(name)} skips, focuses or repeats tests, which pipegen does not accept`);
         else if (BANNED_PROP.has(name) || name.startsWith('_')) add(n, `.${show(name)} is refused (it reaches code execution, other hosts, internals or files outside the test)`);
+        else if (VITEST_ESCAPE.has(name)) add(n, `.${show(name)} is refused on any object (it reaches vitest's module loader, globals, config or expect state)`);
         if (isNode(n.object) && n.object.type === 'Identifier') {
           const g = GLOBAL_MEMBERS[n.object.name as string];
           if (g !== undefined && !g.has('*') && !g.has(name)) add(n, `${n.object.name}.${show(name)} is not on the list of members tests may use (${[...g].join(', ') || 'none'})`);
@@ -636,7 +704,7 @@ function analyzeProgram(rel: string, program: N, script: boolean): TestFileRepor
         let name: string | undefined;
         if (n.computed) { const k = isNode(n.key) ? fold(n.key) : undefined; name = k === undefined ? undefined : String(k); if (name === undefined && parent.type === 'ObjectPattern') add(n, 'a destructured key that can not be read statically is not accepted'); }
         else name = ident(n.key) ? n.key.name : isNode(n.key) && n.key.type === 'Literal' ? String(n.key.value) : undefined;
-        if (name !== undefined && (SKIP_PROP.has(name) || BANNED_PROP.has(name) || (parent.type === 'ObjectPattern' && name.startsWith('_')))) add(n, `the name ${JSON.stringify(show(name))} is refused (skipping, focusing, retrying and code-reaching names)`);
+        if (name !== undefined && (SKIP_PROP.has(name) || BANNED_PROP.has(name) || (parent.type === 'ObjectPattern' && (name.startsWith('_') || VITEST_ESCAPE.has(name))))) add(n, `the name ${JSON.stringify(show(name))} is refused (skipping, focusing, retrying and code-reaching names)`);
         return;
       }
       case 'Literal':
@@ -667,7 +735,8 @@ function analyzeProgram(rel: string, program: N, script: boolean): TestFileRepor
 
 /**
  * The problems of one created file at repo path `path`, for the judge and the guard: the path must be a starter-test path of a service in `roots`
- * (the deepest service that holds it), and the content must pass analyzeTestFile with that service's own dependency names (`depsOf`).
+ * (the deepest service that holds it), and the content must pass analyzeTestFile, read with that service's module type (`typeOf`). `depsOf` is still
+ * passed through but no longer changes anything: no package is importable (S9 amended, D7-R3).
  */
 export function starterTestFileProblems(path: string, content: string, o: { roots: readonly string[]; depsOf: (root: string) => readonly string[] | undefined; typeOf?: (root: string) => 'module' | 'commonjs' | undefined }): string[] {
   const owner = starterOwner(path, o.roots);
