@@ -447,7 +447,7 @@ export function unscannedExcerpt(logs: string, scrub: (text: string) => string, 
   //   split or change any word past repair, so shape decides, not name;
   // - the parent of every suspect line (the nearest earlier line indented less) is probed as well, so a block it opens goes on through
   //   a line whose readings disagree on its indentation; a line continues an open block when any reading is more indented or blank, or
-  //   when garbage stands before its first printable character (INDENT_UNSURE); only a clean header ends a section; a suspect line
+  //   when garbage stands before its first printable character (INDENT_UNSURE); only a header that is not messy ends a section; a suspect line
   //   whose scrubbed readings hold a long base64 run goes on with armor;
   // - one that opens a private key, or a messy line that names one (PRIVATE or KEY in any reading):
   //   hidden up to the next END marker line (to the end of the log when a reading opened a key and no END follows), else while the
@@ -512,7 +512,7 @@ export function unscannedExcerpt(logs: string, scrub: (text: string) => string, 
       else blockCols = -1;
     }
     if (section) {
-      if (r.header && !r.suspect) section = false;
+      if (r.header && !r.messy) section = false;
       else hidden = true;
     }
     // scan 4: the armor check comes first, so an armor line is hidden even when it also starts a key hide. A suspect line whose
