@@ -92,7 +92,10 @@ export function planNpmDeps(input: NpmDepsInput): NpmDepsResult {
     const dev = isObj(pkg.devDependencies) ? pkg.devDependencies : {};
     if (vitestIn !== null) {
       if (vitestIn !== 'devDependencies' || dev.vitest !== B2_DEVDEPS.vitest) return notProven(`${where} has its own Vitest (${activeSafeText(String((pkg[vitestIn] as Record<string, unknown>).vitest), 40)}); its tests run with it, but pipegen's reviewed Vitest is ${B2_DEVDEPS.vitest}, so coverage is not proven`);
-      if (declaredIn(pkg, '@vitest/coverage-v8') === null) add['@vitest/coverage-v8'] = B2_DEVDEPS['@vitest/coverage-v8'] as string;
+      const covIn = declaredIn(pkg, '@vitest/coverage-v8');
+      if (covIn === null) add['@vitest/coverage-v8'] = B2_DEVDEPS['@vitest/coverage-v8'] as string;
+      // final review m2: the plugin at another version (or outside devDependencies) would fail the CI precheck on every run, so say so now
+      else if (covIn !== 'devDependencies' || dev['@vitest/coverage-v8'] !== B2_DEVDEPS['@vitest/coverage-v8']) return notProven(`${where} has its own @vitest/coverage-v8 (${activeSafeText(String((pkg[covIn] as Record<string, unknown>)['@vitest/coverage-v8']), 40)}); pipegen's reviewed @vitest/coverage-v8 is ${B2_DEVDEPS['@vitest/coverage-v8']} and it does not change an existing version, so coverage is not proven`);
       // both there at the reviewed version: nothing to add, but scripts.test is set when it is absent or npm's default (B2)
     } else {
       if (declaredIn(pkg, '@vitest/coverage-v8') !== null) return notProven(`${where} lists @vitest/coverage-v8 without Vitest ${B2_DEVDEPS.vitest}, and pipegen does not change an existing version, so coverage is not proven`);

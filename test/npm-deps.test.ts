@@ -87,6 +87,10 @@ describe('npm-deps: the producer', () => {
       [PJ.replace('"express": "4.21.0"', '"vitest": "5.0.5"'), 'vitest', /pipegen's reviewed Vitest is 5\.0\.5/],
       [PJ.replace('"typescript": "5.6.0"', '"@vitest/coverage-v8": "5.0.4"'), 'vitest', /coverage-v8/],
       [PJ.replace('"typescript": "5.6.0"', '"c8": "10.0.0"'), 'c8', /reviewed c8 is 12\.0\.0/],
+      // final review m2: the reviewed Vitest beside a coverage plugin at another version (or outside devDependencies) is not silently "all there"
+      [PJ.replace('"typescript": "5.6.0"', '"vitest": "5.0.5",\n    "@vitest/coverage-v8": "4.0.1"'), 'vitest', /@vitest\/coverage-v8 \(4\.0\.1\).*reviewed @vitest\/coverage-v8 is 5\.0\.5.*not proven/],
+      [PJ.replace('"typescript": "5.6.0"', '"vitest": "5.0.5",\n    "@vitest/coverage-v8": "^5.0.5"'), 'vitest', /reviewed @vitest\/coverage-v8 is 5\.0\.5/],
+      [PJ.replace('"express": "4.21.0"', '"express": "4.21.0",\n    "@vitest/coverage-v8": "5.0.5"').replace('"typescript": "5.6.0"', '"vitest": "5.0.5"'), 'vitest', /reviewed @vitest\/coverage-v8 is 5\.0\.5/],
     ] as const) {
       const r = plan({ packageJson: pjText, tool });
       expect(r.files, pjText).toEqual([]);

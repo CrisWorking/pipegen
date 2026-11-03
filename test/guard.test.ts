@@ -34,8 +34,8 @@ const PJ_NEW = JSON.stringify({ name: 'app', version: '1.0.0', scripts: { build:
 describe('guard: new files', () => {
   it('a new Dockerfile is ok; the guard writes nothing', async () => {
     const root = repo({ 'package.json': PJ });
-    const r = await guardCreatedFiles([file('Dockerfile', 'FROM x\n')], ctx(root));
-    expect(r.ok.map((f) => f.path)).toEqual(['Dockerfile']);
+    const r = await guardCreatedFiles([file('Dockerfile', 'FROM x\n'), file('.dockerignore', '.env\n')], ctx(root));
+    expect(r.ok.map((f) => f.path)).toEqual(['Dockerfile', '.dockerignore']);
     expect(r.refused).toEqual([]);
     const { readdirSync } = await import('node:fs');
     expect(readdirSync(root).sort()).toEqual(['package.json']);
@@ -57,7 +57,7 @@ describe('guard: new files', () => {
     expect(await reasons([file('api/src/x.py')], c)).toMatch(/source code/);
     expect(await reasons([file('app.js')], c)).toMatch(/source code/);
     // a starter test (a registry rule claims it) and non-code files are not app source
-    expect(await okPaths([file('api/test/smoke.test.ts', "import { expect, it } from 'vitest';\nconst f = () => 1;\nit('a', () => { expect(f()).toBe(1); });\n", { part: 'tests' }), file('api/README.md'), file('api/Dockerfile')], c)).toEqual(['api/test/smoke.test.ts', 'api/README.md', 'api/Dockerfile']);
+    expect(await okPaths([file('api/test/smoke.test.ts', "import { expect, it } from 'vitest';\nconst f = () => 1;\nit('a', () => { expect(f()).toBe(1); });\n", { part: 'tests' }), file('api/README.md'), file('api/Dockerfile'), file('api/.dockerignore')], c)).toEqual(['api/test/smoke.test.ts', 'api/README.md', 'api/Dockerfile', 'api/.dockerignore']);
     // outside every service folder it is not "app source" (the registry decides)
     expect(await okPaths([file('tools/x.ts')], ctx(repo(), { profile: prof(['api']) }))).toEqual(['tools/x.ts']);
   });
@@ -160,8 +160,8 @@ describe('guard: re-runs (#97), the install record', () => {
   it('an owned file whose sha is unchanged is replaced', async () => {
     const root = repo({ Dockerfile: 'FROM old\n' });
     const c = ctx(root, { baseTree: base({ Dockerfile: 'FROM old\n' }), installRecord: rec('Dockerfile', 'FROM old\n') });
-    const r = await guardCreatedFiles([file('Dockerfile', 'FROM new\n')], c);
-    expect(r.ok.map((f) => f.path)).toEqual(['Dockerfile']);
+    const r = await guardCreatedFiles([file('Dockerfile', 'FROM new\n'), file('.dockerignore')], c);
+    expect(r.ok.map((f) => f.path)).toEqual(['Dockerfile', '.dockerignore']);
     expect(r.notes.join(' ')).toMatch(/Dockerfile.*earlier|replac/);
   });
   it('an owner-edited file (disk sha differs) is kept, with a note: neither ok nor refused', async () => {
@@ -188,7 +188,7 @@ describe('guard: re-runs (#97), the install record', () => {
   });
   it('a file on the disk only (not in the base tree) that the record owns unchanged is replaced; changed, kept', async () => {
     const root = repo({ Dockerfile: 'FROM old\n' });
-    expect(await okPaths([file('Dockerfile')], ctx(root, { installRecord: rec('Dockerfile', 'FROM old\n') }))).toEqual(['Dockerfile']);
+    expect(await okPaths([file('Dockerfile'), file('.dockerignore')], ctx(root, { installRecord: rec('Dockerfile', 'FROM old\n') }))).toEqual(['Dockerfile', '.dockerignore']);
     expect(await okPaths([file('Dockerfile')], ctx(repo({ Dockerfile: 'FROM mine\n' }), { installRecord: rec('Dockerfile', 'FROM old\n') }))).toEqual([]);
   });
   it('package.json and package-lock.json are never replaced as "owned": only an edit with its original, judged by B2', async () => {
@@ -289,7 +289,7 @@ describe('guard: symlinks (lstat on every component, no realpath)', () => {
     const real = repo();
     const holder = repo();
     symlinkSync(real, join(holder, 'link'));
-    expect(await okPaths([file('Dockerfile')], ctx(join(holder, 'link')))).toEqual(['Dockerfile']);
+    expect(await okPaths([file('Dockerfile'), file('.dockerignore')], ctx(join(holder, 'link')))).toEqual(['Dockerfile', '.dockerignore']);
   });
   it('a root that is not a folder is refused with a reason', async () => {
     expect(await reasons([file('Dockerfile')], ctx(join(repo(), 'missing')))).toMatch(/repository folder|root/);
@@ -430,8 +430,8 @@ describe('guard: fix round 2 (I1) a refused member refuses its partner', () => {
   });
   it('a partner that the guard keeps or refuses for a reason of its own (no closure) also takes the other down; unrelated files stay ok', async () => {
     const r = pairRepo('');
-    const out = await guardCreatedFiles([...pairEdits('', PJ_NEW, LOCK_NEW), file('Dockerfile')], ctx(r.root, { baseTree: r.baseTree }));
-    expect(out.ok.map((f) => f.path)).toEqual(['Dockerfile']);
+    const out = await guardCreatedFiles([...pairEdits('', PJ_NEW, LOCK_NEW), file('Dockerfile'), file('.dockerignore')], ctx(r.root, { baseTree: r.baseTree }));
+    expect(out.ok.map((f) => f.path)).toEqual(['Dockerfile', '.dockerignore']);
     expect(out.refused.length).toBe(2);
   });
   it('pairs are per folder: a bad pair in api/ does not refuse a good pair at the root', async () => {
@@ -502,15 +502,15 @@ describe('guard: service paths (S4)', () => {
   it('a service folder outside the plain set gets no created file, only a note', async () => {
     const root = repo();
     const c = ctx(root, { profile: prof(['web//api', 'ok']) });
-    const r = await guardCreatedFiles([file('web/api/Dockerfile'), file('ok/Dockerfile')], c);
-    expect(r.ok.map((f) => f.path)).toEqual(['ok/Dockerfile']);
+    const r = await guardCreatedFiles([file('web/api/Dockerfile'), file('ok/Dockerfile'), file('ok/.dockerignore')], c);
+    expect(r.ok.map((f) => f.path)).toEqual(['ok/Dockerfile', 'ok/.dockerignore']);
     expect(r.refused.map((x) => x.path)).toEqual(['web/api/Dockerfile']);
     expect(r.refused[0]?.reason).toMatch(/service folder/);
     expect(r.notes.join(' ')).toMatch(/service folder/);
   });
   it('services whose paths are plain (including ./ and a trailing slash) pass', async () => {
     const c = ctx(repo(), { profile: prof(['./api/', '.', 'a/b-c_d.e']) });
-    expect(await okPaths([file('api/Dockerfile'), file('a/b-c_d.e/Dockerfile')], c)).toEqual(['api/Dockerfile', 'a/b-c_d.e/Dockerfile']);
+    expect(await okPaths([file('api/Dockerfile'), file('api/.dockerignore'), file('a/b-c_d.e/Dockerfile'), file('a/b-c_d.e/.dockerignore')], c)).toEqual(['api/Dockerfile', 'api/.dockerignore', 'a/b-c_d.e/Dockerfile', 'a/b-c_d.e/.dockerignore']);
   });
   it('a folder with a space, a dot-dot, a dash start, an @ or a reserved name never reaches a file (note only)', async () => {
     const bad = ['my app', '../up', '-dash', 'a@b', 'aux', 'x/./y', 'sp ace/api', 'a/b+c'];
@@ -584,7 +584,7 @@ describe('guard: fix round 1 minors', () => {
     const root = repo({ Dockerfile: user, 'README.md': 'r', 'CODEOWNERS': 'o' });
     const b = base({ Dockerfile: user, 'README.md': 'r', CODEOWNERS: 'o' });
     const rec = (path: string, text: string, part: 'docker' | 'tests' | 'docs' = 'docker') => ({ files: [{ path, part, sha: gitBlobSha(text), created: true }] });
-    expect(await okPaths([file('Dockerfile', 'FROM pipegen\n')], ctx(root, { baseTree: b, installRecord: rec('Dockerfile', user) }))).toEqual(['Dockerfile']);
+    expect(await okPaths([file('Dockerfile', 'FROM pipegen\n'), file('.dockerignore')], ctx(root, { baseTree: b, installRecord: rec('Dockerfile', user) }))).toEqual(['Dockerfile', '.dockerignore']);
     expect(await reasons([file('Dockerfile', 'FROM pipegen\n')], ctx(root, { baseTree: b, installRecord: rec('Dockerfile', user, 'tests') }))).toMatch(/already exists/);
     expect(await reasons([file('README.md', 'n', { part: 'docs' })], ctx(root, { baseTree: b, installRecord: rec('README.md', 'r', 'docs') }))).toMatch(/already exists/);
     expect(await reasons([file('CODEOWNERS', 'n', { part: 'codeowners' })], ctx(root, { baseTree: b, installRecord: rec('CODEOWNERS', 'o', 'docs') }))).toMatch(/already exists/);
@@ -609,5 +609,55 @@ describe('guard: fix round 1 minors', () => {
     const r = await guardCreatedFiles([file('Dockerfile', 'FROM x\n')], ctx(root, { baseTree: base({ Dockerfile: text }), installRecord: { files: [{ path: 'Dockerfile', part: 'docker', sha: gitBlobSha(text), created: true }] } }));
     expect(r.ok).toEqual([]);
     expect(r.notes.join(' ')).toMatch(/changed since/);
+  });
+});
+
+// final review m1: a Dockerfile is delivered only with pipegen's .dockerignore beside it, and never next to a Dockerfile.dockerignore (Docker reads
+// that one first). The creator checks both (dockerfile.ts); the guard now does too, for the fix loop and re-runs that do not go through the creator.
+describe('guard: the Dockerfile and its .dockerignore go together', () => {
+  const api = (over: Partial<GuardCtx> = {}, files: Record<string, string> = { 'api/package.json': PJ }) => ctx(repo(files), { profile: prof(['api']), ...over });
+  const pair = [file('api/Dockerfile', 'FROM x\n'), file('api/.dockerignore', '.env\n')];
+  it('a Dockerfile alone is refused; with its .dockerignore both pass', async () => {
+    const r = await guardCreatedFiles([file('api/Dockerfile', 'FROM x\n')], api());
+    expect(r.ok).toEqual([]);
+    expect(r.refused[0]?.reason).toMatch(/api\/\.dockerignore/);
+    expect(await okPaths(pair, api())).toEqual(['api/Dockerfile', 'api/.dockerignore']);
+    // the .dockerignore of another folder does not count
+    expect(await okPaths([file('api/Dockerfile', 'FROM x\n'), file('.dockerignore', '.env\n')], api({ profile: prof(['.', 'api']) }))).toEqual(['.dockerignore']);
+  });
+  it('a Dockerfile whose .dockerignore is refused or kept is refused too', async () => {
+    const r = await guardCreatedFiles(pair, api({}, { 'api/package.json': PJ, 'api/.dockerignore': 'mine\n' }));
+    expect(r.ok).toEqual([]);
+    expect(r.refused.map((x) => x.path).sort()).toEqual(['api/.dockerignore', 'api/Dockerfile']);
+    expect(r.refused.find((x) => x.path === 'api/Dockerfile')?.reason).toMatch(/\.dockerignore/);
+    const kept = await guardCreatedFiles(pair, api({ baseTree: base({ 'api/.dockerignore': 'mine\n' }), installRecord: { files: [{ path: 'api/.dockerignore', part: 'docker', sha: gitBlobSha('old\n'), created: true }] } }, { 'api/package.json': PJ, 'api/.dockerignore': 'mine\n' }));
+    expect(kept.ok).toEqual([]);
+    expect(kept.refused.map((x) => x.path)).toEqual(['api/Dockerfile']);
+  });
+  it('a user Dockerfile.dockerignore (local, on the default branch, any letter case, or in the batch) refuses both files', async () => {
+    const userRules = '# user rules, no .env exclusion\n';
+    const cases: GuardCtx[] = [
+      api({}, { 'api/package.json': PJ, 'api/Dockerfile.dockerignore': userRules, 'api/.env': 'x\n' }),   // the reviewer's probe
+      api({ baseTree: base({ 'api/Dockerfile.dockerignore': userRules }) }),
+      api({}, { 'api/package.json': PJ, 'api/dockerfile.DOCKERIGNORE': userRules }),
+    ];
+    for (const c of cases) {
+      const r = await guardCreatedFiles(pair, c);
+      expect(r.ok).toEqual([]);
+      expect(r.refused.map((x) => x.path).sort()).toEqual(['api/.dockerignore', 'api/Dockerfile']);
+      for (const x of r.refused) expect(x.reason).toMatch(/Dockerfile\.dockerignore/);
+    }
+    const batch = await guardCreatedFiles([...pair, file('api/Dockerfile.dockerignore', '!.env\n')], api());
+    expect(batch.ok.map((f) => f.path)).not.toContain('api/Dockerfile');
+    expect(batch.ok.map((f) => f.path)).not.toContain('api/.dockerignore');
+  });
+  it('a re-run may replace the Dockerfile alone when pipegen\'s own .dockerignore is there unchanged', async () => {
+    const files = { 'api/package.json': PJ, 'api/Dockerfile': 'FROM old\n', 'api/.dockerignore': '.env\n' };
+    const record = (ignore: string) => ({ files: [{ path: 'api/Dockerfile', part: 'docker' as const, sha: gitBlobSha('FROM old\n'), created: true }, { path: 'api/.dockerignore', part: 'docker' as const, sha: gitBlobSha(ignore), created: true }] });
+    const c = (ignore: string) => api({ baseTree: base(files), installRecord: record(ignore) }, files);
+    expect(await okPaths([file('api/Dockerfile', 'FROM new\n')], c('.env\n'))).toEqual(['api/Dockerfile']);
+    // changed since pipegen wrote it, or not pipegen's: refused
+    expect(await reasons([file('api/Dockerfile', 'FROM new\n')], c('other\n'))).toMatch(/\.dockerignore/);
+    expect(await reasons([file('api/Dockerfile', 'FROM new\n')], api({ baseTree: base(files), installRecord: { files: [record('.env\n').files[0] as never] } }, files))).toMatch(/\.dockerignore/);
   });
 });

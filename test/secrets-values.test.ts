@@ -61,10 +61,10 @@ describe('guard: vault values', () => {
   });
 
   it('with no vault, or a vault without the value, nothing changes', async () => {
-    const plain = file('FROM node:24\n');
-    expect((await guardCreatedFiles([plain], guardCtx())).ok).toHaveLength(1);
-    expect((await guardCreatedFiles([plain], guardCtx(new SecretVault()))).ok).toHaveLength(1);
-    expect((await guardCreatedFiles([plain], guardCtx(vault()))).ok).toHaveLength(1);
+    const plain = [file('FROM node:24\n'), file('.env\n', { path: 'api/.dockerignore' })];   // a Dockerfile goes with its .dockerignore (final review m1)
+    expect((await guardCreatedFiles(plain, guardCtx())).ok).toHaveLength(2);
+    expect((await guardCreatedFiles(plain, guardCtx(new SecretVault()))).ok).toHaveLength(2);
+    expect((await guardCreatedFiles(plain, guardCtx(vault()))).ok).toHaveLength(2);
   });
 });
 

@@ -245,7 +245,7 @@ function checkKey(data: unknown): PublicKey {
   return key.length === sodium.crypto_box_PUBLICKEYBYTES ? { keyId: d.key_id, key: new Uint8Array(key) } : bad();
 }
 
-async function fetchKey(gh: Octokit, fn: () => Promise<{ data: unknown }>): Promise<PublicKey> {
+async function fetchKey(fn: () => Promise<{ data: unknown }>): Promise<PublicKey> {
   let reply: { data: unknown };
   try { reply = await fn(); } catch (e) { throw new SecretStoreError(`Could not read GitHub's public key for secrets${statusOf(e)}.`); }
   await sodium.ready;
@@ -275,7 +275,7 @@ export async function storeSecrets(gh: Octokit, repo: { owner: string; repo: str
   for (const t of todo) if (!vault.has(t.from)) throw new SecretStoreError(`there is no value for ${safeText(t.up, 80)} in the vault`);
   if (todo.length === 0) return [];
   const { owner, repo: name } = repo;
-  const key = await fetchKey(gh, () => gh.request('GET /repos/{owner}/{repo}/actions/secrets/public-key', { owner, repo: name }));
+  const key = await fetchKey(() => gh.request('GET /repos/{owner}/{repo}/actions/secrets/public-key', { owner, repo: name }));
   const done: string[] = [];
   for (const t of todo) {
     const encrypted = seal(vault.get(t.from) as string, key.key);
@@ -297,7 +297,7 @@ export async function storeEnvSecret(gh: Octokit, repo: { owner: string; repo: s
   const problem = valueProblem(value);
   if (problem !== null) throw new SecretStoreError(`the value for ${safeText(up, 80)} ${problem}`);
   const params = { owner: repo.owner, repo: repo.repo, environment_name: env };
-  const key = await fetchKey(gh, () => gh.request('GET /repos/{owner}/{repo}/environments/{environment_name}/secrets/public-key', params));
+  const key = await fetchKey(() => gh.request('GET /repos/{owner}/{repo}/environments/{environment_name}/secrets/public-key', params));
   const encrypted = seal(value, key.key);
   await put(() => gh.request('PUT /repos/{owner}/{repo}/environments/{environment_name}/secrets/{secret_name}', { ...params, secret_name: up, encrypted_value: encrypted, key_id: key.keyId }), up);
 }

@@ -53,8 +53,7 @@ const nameProblem = (name: unknown): string | null => {
 interface EnvPlan { vars: RuntimeEnv['vars']; notes: string[] }
 type PlanApp = { depObjs: (Dependency & { kind: DepKey })[] };
 
-/** The services whose dependencies could be started: the ones that run. */
-const runnableOf = (p: RepoProfile): Service[] => (Array.isArray(p?.services) ? p.services.filter((s) => s !== null && typeof s === 'object' && Array.isArray(s.dependsOn) && isRunnable(s)) : []);
+/** The dependencies of a service whose kind pipegen knows how to start. */
 const depsOf = (s: Service): (Dependency & { kind: DepKey })[] => s.dependsOn.filter((d): d is Dependency & { kind: DepKey } => d !== null && typeof d === 'object' && isDepKey(d.kind));
 
 /** The names pipegen fills for the services that GET a container (the compose plan's apps); the mapped names of the others get a note and nothing else. */

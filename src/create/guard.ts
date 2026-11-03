@@ -19,7 +19,10 @@
 //                (b) the install record owns it (`created`) at a blob sha equal to what is now on the disk and in the base tree: it is
 //                    replaced (with a note). If the user changed it, it is KEPT with a note (neither ok nor refused);
 //   new files    package.json and package-lock.json must already exist; new app source (a code file inside a service folder that is not
-//                a test and that no registry rule claims) is refused.
+//                a test and that no registry rule claims) is refused;
+//   Docker pair  a Dockerfile goes out only with pipegen's .dockerignore beside it (in the batch and accepted, or pipegen's own, unchanged), and
+//                a `<dir>/Dockerfile.dockerignore` (which Docker reads instead) refuses both (final review m1);
+//   starter tests refused unless `isolatedTestJob` is true (D7-R7), then judged by the same rules leaf as the referee.
 // The install record is VERIFIED INPUT: Plan G must check it (that pipegen wrote it: its sha against the local state and the setup PR) before it is
 // passed in. The guard still allows a replacement only on a path a registry rule of mode `new` claims, with the part the record gives, in the app repo.
 // The base tree carries modes (a symlink 120000 or a submodule 160000 at or above a path is refused) and says whether it is complete.
@@ -339,10 +342,63 @@ async function guardFiles(files: readonly CreatedFile[], ctx: GuardCtx): Promise
     return { kind: 'ok' };
   }
 
+  /** A file at `path` (any letter case) in this batch, in the local folder or on the default branch; anything unclear counts as there. */
+  async function present(path: string): Promise<boolean> {
+    if (files.some((x) => x?.repo === repo && typeof x.path === 'string' && fold(x.path) === fold(path))) return true;
+    const segs = path.split('/');
+    return (await probeLocal(ctx.root, segs, q)).kind !== 'absent' || probeBase(ix, segs, q).kind !== 'absent';
+  }
+  /** pipegen's own earlier file at `path`, unchanged in the local folder AND on the default branch (the install record's sha). */
+  async function ownedUnchanged(path: string): Promise<boolean> {
+    const rec = ctx.installRecord?.files.find((r) => r.path === path && r.created === true);
+    if (rec === undefined) return false;
+    const segs = path.split('/');
+    if ((await probeLocal(ctx.root, segs, q)).kind !== 'file') return false;
+    const disk = await readTextLimitedWithReason(join(ctx.root, ...segs), ctx.root);
+    const remote = probeBase(ix, segs, q);
+    return 'text' in disk && gitBlobSha(disk.text) === rec.sha && remote.kind === 'file' && remote.entry.sha === rec.sha;
+  }
+  /**
+   * Final review m1: a Dockerfile goes out only with pipegen's .dockerignore beside it (in this batch and accepted, or pipegen's own earlier one,
+   * unchanged), because the build context is the service folder and the Dockerfile's `COPY . .` is safe only with it. A
+   * `<dir>/Dockerfile.dockerignore` anywhere (Docker reads it INSTEAD of `.dockerignore`) refuses both files.
+   */
+  async function dockerPairs(verdicts: Verdict[]): Promise<void> {
+    const kindOf = (f: CreatedFile): 'dockerfile' | 'dockerignore' | null => {
+      if (typeof f?.path !== 'string' || f.repo !== repo) return null;
+      const ids = claimingRules(f.path, repo, ctx.profile).map((r) => r.id);
+      return ids.includes('dockerfile') ? 'dockerfile' : ids.includes('dockerignore') ? 'dockerignore' : null;
+    };
+    const dirOf = (p: string): string => (p.includes('/') ? p.slice(0, p.lastIndexOf('/')) : '');
+    const inDir = (dir: string, name: string): string => (dir === '' ? name : `${dir}/${name}`);
+    for (let i = 0; i < files.length; i++) {
+      const f = files[i] as CreatedFile;
+      if (verdicts[i]?.kind !== 'ok' || kindOf(f) === null) continue;
+      const dir = dirOf(f.path);
+      const own = inDir(dir, 'Dockerfile.dockerignore');
+      if (await present(own)) verdicts[i] = refuse(`${q(own)} is there, and Docker reads it instead of the .dockerignore beside the Dockerfile, so pipegen's .dockerignore (it keeps .env files, keys and .git out of the image) would not apply; pipegen writes no Dockerfile or .dockerignore in ${q(dir === '' ? '.' : dir)}`);
+    }
+    for (let i = 0; i < files.length; i++) {
+      const f = files[i] as CreatedFile;
+      if (verdicts[i]?.kind !== 'ok' || kindOf(f) !== 'dockerfile') continue;
+      const ignore = inDir(dirOf(f.path), '.dockerignore');
+      const why = `${q(f.path)} is written only together with pipegen's ${q(ignore)} (it keeps .env files, keys and .git out of the image build)`;
+      const j = files.findIndex((x) => x?.repo === repo && x.path === ignore);
+      if (j >= 0) { if (verdicts[j]?.kind !== 'ok') verdicts[i] = refuse(`${why}, and that file was refused or kept, so the Dockerfile is not written either`); continue; }
+      if (!(await ownedUnchanged(ignore))) verdicts[i] = refuse(`${why}, and that file is neither in this batch nor pipegen's own earlier one, unchanged`);
+    }
+  }
+
+  const verdicts: Verdict[] = [];
+  for (let i = 0; i < files.length; i++) {
+    let v: Verdict;
+    try { v = await judge(files[i] as CreatedFile, i); } catch { v = refuse('the file could not be checked, so pipegen does not write it'); }
+    verdicts.push(v);
+  }
+  try { await dockerPairs(verdicts); } catch { for (let i = 0; i < files.length; i++) if (verdicts[i]?.kind === 'ok' && /(?:^|\/)(?:Dockerfile|\.dockerignore)$/.test(String(files[i]?.path))) verdicts[i] = refuse('the Dockerfile and its .dockerignore could not be checked together, so pipegen does not write them'); }
   for (let i = 0; i < files.length; i++) {
     const f = files[i] as CreatedFile;
-    let v: Verdict;
-    try { v = await judge(f, i); } catch { v = refuse('the file could not be checked, so pipegen does not write it'); }
+    const v = verdicts[i] as Verdict;
     if (v.kind === 'ok') { result.ok.push(f); if (v.note !== undefined) result.notes.push(scr(v.note)); }
     else if (v.kind === 'refuse') result.refused.push({ path: typeof f?.path === 'string' ? safe(f.path) : '', reason: scr(v.reason) });
     else result.notes.push(scr(v.note));
