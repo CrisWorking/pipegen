@@ -316,6 +316,32 @@ describe('errorExcerpt: scrub before cutting (E0a)', () => {
     v.wipe();
   });
 
+  it('excerpt: scan 6: the shape checks stay linear on hostile lines just under 4 KB', async () => {
+    const v = vault();
+    // a messy line (an OSC) with a `:` then blanks: the block-opener check; a line of blanks then one other character: the armor check
+    const opener = `${ESC}]0;t\u0007:${' '.repeat(4080)}x`;
+    const blanks = `${' '.repeat(4090)}!`;
+    for (const log of [`Error: x\n${Array.from({ length: 300 }, () => opener).join('\n')}`, `${ESC}(B\n${Array.from({ length: 300 }, () => blanks).join('\n')}\nError: y`]) {
+      const t0 = performance.now();
+      await errorExcerpt(log, composed(v), clean());
+      expect(performance.now() - t0).toBeLessThan(3000);
+    }
+    v.wipe();
+  });
+
+  it('excerpt: scan 6: a line with a control or an invisible character (not only SGR codes) gets the fail-closed name rules', async () => {
+    const v = vault();
+    const valueRun = ['Qx7', 'Lm2Wv9Rt4Zp8Kd3Hs'].join('');
+    for (const ch of ['\u0001', '\u007f', '\u200b', '\u202e', '\u2066', '\ufeff', '\u00ad']) {
+      // the character before the indentation hides nothing by itself; inside the name it splits it: shape decides
+      const log = [`${TS}  db_pa${ch}${ch}word:`, `${TS}    ${valueRun}`, `${TS}Error: bad config`].join('\n');
+      const out = await errorExcerpt(log, composed(v), clean());
+      expect(out, JSON.stringify(ch)).toContain('Error: bad config');
+      expect(out, JSON.stringify(ch)).not.toContain(valueRun);
+    }
+    v.wipe();
+  });
+
   it('excerpt: ruling E0a-R1: unterminated C1 OSC introducers stay linear (64 KiB line, and many 4 KB lines)', async () => {
     const v = vault();
     for (const log of [`Error: x\n${'\u009d'.repeat(64 * 1024)}`, `Error: x\n${Array.from({ length: 256 }, () => '\u009d'.repeat(4000)).join('\n')}`]) {

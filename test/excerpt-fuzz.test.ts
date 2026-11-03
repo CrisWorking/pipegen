@@ -2,7 +2,7 @@
 // Plan A redact hides (an indented value after `key:`, a YAML literal block, a TOML/INI secret section, a .env value over lines, a JSON
 // value list), plus a connection string split over lines and PEM private-key blocks of 1-300 body
 // lines (RSA, EC, DSA, OPENSSH, PKCS#8, ENCRYPTED; Proc-Type/DEK-Info headers and blank lines) get random CSI, OSC and C1 sequences, stray
-// ESC bytes and LS/PS/CR at random places, the BEGIN and END markers included; normal log lines go around them, and some logs are cut so
+// ESC bytes, LS/PS/CR, C0 controls, DEL and zero-width/bidi invisibles at random places, the BEGIN and END markers included; normal log lines go around them, and some logs are cut so
 // the cut falls inside the block. No 16-character base64 run of the key body may reach the excerpt. The secret scan (step 7) only removes
 // lines, so unscannedExcerpt (steps 1-6) is what is checked; no scanner process runs here.
 // Fixed seed. PIPEGEN_E0A_FUZZ_CASES and PIPEGEN_E0A_FUZZ_SEED change the count and the seed for a one-off longer run.
@@ -98,6 +98,9 @@ function makeCase(rnd: () => number): Case {
     () => '\u2028',
     () => '\u2029',
     () => '\r',
+    // scan 6: C0 controls (not LF, which ends a line), DEL, and the zero-width, bidi and other invisible characters
+    () => String.fromCharCode(pick([...Array.from({ length: 10 }, (_, k) => k), ...Array.from({ length: 21 }, (_, k) => 11 + k), 0x7f])),
+    () => pick(['\u200b', '\u200c', '\u200d', '\u200e', '\u200f', '\u202a', '\u202b', '\u202c', '\u202d', '\u202e', '\u2060', '\u2066', '\u2067', '\u2068', '\u2069', '\ufeff', '\u00ad', '\u180e', '\ufe0f']),
   ];
   for (let k = int(9); k > 0; k--) {
     const at = rnd() < 0.4 ? pick([0, blockLines.length - 1]) : int(blockLines.length);
