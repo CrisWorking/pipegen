@@ -132,6 +132,17 @@ describe('fix round 2: the brief', () => {
     expect(flat(proofWorkflowsProblems([file('.github/workflows/pipegen.yml', caller('CrisWorking/pipelines/.github/workflows/shop--merge.yml@main'))], { reviewed, central: 'later' }))).toMatch(/reusable/);
   });
 
+  it('fix round 2 (mutants): a reached central file\'s missing local callee, a compat file\'s call, a lowercase empty bash_env, a call job without permissions', () => {
+    const app = [file('.github/workflows/pipegen.yml', caller(`CrisWorking/pipelines/.github/workflows/shop--merge.yml@${SHA}`))];
+    expect(flat(proofWorkflowsProblems(app, { reviewed, central: { sha: SHA, workflows: [{ path: '.github/workflows/shop--merge.yml', content: 'on: workflow_call\npermissions: {}\njobs:\n  s:\n    uses: ./.github/workflows/missing.yml\n' }] } }))).toMatch(/missing\.yml/);
+    // a compat file never makes a callee: workflow_call on the file it names stays refused
+    expect(flat(proofWorkflowsProblems([file('.github/workflows/c.yml', caller('./.github/workflows/x.yml'), 'compat'), file('.github/workflows/x.yml', callee())], { reviewed }))).toMatch(/x\.yml: .*workflow_call/);
+    // only the exact upper-case BASH_ENV and ENV may be emptied
+    expect(P(wf('pull_request', steps('', '      - run: make\n        env: { bash_env: "" }\n'))).join(' ')).toMatch(/bash_env/);
+    // a reusable call job is held to the permissions rule too
+    expect(flat(proofWorkflowsProblems([file('.github/workflows/pipegen.yml', 'on: [push, pull_request]\njobs:\n  p:\n    uses: ./.github/workflows/m.yml\n'), file('.github/workflows/m.yml', callee())], { reviewed }))).toMatch(/pipegen\.yml: .*permissions/);
+  });
+
   it('I1-r1 (b): env names that change a runtime are refused at every level of a key-holding job; empty BASH_ENV/ENV is the renderer\'s own guard', () => {
     const names = ['NODE_OPTIONS', 'LD_PRELOAD', 'LD_LIBRARY_PATH', 'BASH_ENV', 'ENV', 'PYTHONSTARTUP', 'PYTHONPATH', 'PERL5OPT', 'RUBYOPT', 'JAVA_TOOL_OPTIONS', '_JAVA_OPTIONS', 'GIT_SSH_COMMAND', 'HTTPS_PROXY', 'HTTP_PROXY', 'ALL_PROXY'];
     for (const n of [...names, ...names.map((x) => x.toLowerCase()), 'Node_Options']) {

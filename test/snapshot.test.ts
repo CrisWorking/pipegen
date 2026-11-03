@@ -695,6 +695,9 @@ describe('E2 base snapshot, central draft, proof branches (Task 2 first half)', 
     const f = await fixture();
     const noEgress = created('.github/workflows/pipegen-extra.yml', 'on: pull_request\npermissions: {}\njobs:\n  a:\n    runs-on: ubuntu-latest\n    steps:\n      - run: make\n');
     await expect(pushProofSetup(input(f, { appFiles: (sha) => [...centralCaller(sha), noEgress] }), deps(f).d)).rejects.toThrow(/pipegen-extra\.yml.*egress/);
+    // a file that merely names itself like a compat copy is key-holding at the seam (the marker is identity, never a path)
+    const fakeCompat = created('.github/workflows/pipegen-compat-ci.yml', 'on: pull_request\njobs:\n  t:\n    runs-on: ubuntu-latest\n    steps:\n      - run: make\n');
+    await expect(pushProofSetup(input(f, { appFiles: (sha) => [...centralCaller(sha), fakeCompat] }), deps(f).d)).rejects.toThrow(/pipegen-compat-ci\.yml.*egress/);
     expect(f.events.some((e) => e.startsWith('push'))).toBe(false);
     expect(f.events).not.toContain('store-secrets');
     await f.close();
