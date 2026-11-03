@@ -752,9 +752,14 @@ export async function buildProofBranch(s: ProofSession, variant: Variant, commit
   const parent = deps.parent ?? st.base.sha;
   const start = st.commits.get(parent);
   if (start === undefined || start.kind === 'central') throw new GitTransportError('The parent commit is not a scratch commit pipegen made in this proof session.');
+  // review r1-m2: main never builds on planted (or dispute) commits; planted on base, main or planted; a dispute on base,
+  // main or its own branch
+  const branch = `proof/${t.runId}/${variant}`;
+  const mainBranch = `proof/${t.runId}/main`;
+  const okParent = start.kind === 'base' || start.branch === branch || (variant !== 'main' && start.branch === mainBranch);
+  if (!okParent) throw new GitTransportError(`The parent commit is on ${start.branch}; a ${variant} commit builds only on the base${variant === 'main' ? ' or main' : `, main or ${variant}`}.`);
   const allowed = new Set([...deps.pipegenWorkflows].map((p) => p.toLowerCase()));
   for (const p of allowed) if (!isWorkflowPath(p)) throw new GitTransportError(`${safeText(p, 120)} is not a workflow path.`);
-  const branch = `proof/${t.runId}/${variant}`;
   let cur = parent;
   let entries = start.entries;
   const made: string[] = [];
@@ -999,26 +1004,41 @@ export function checkCentralPins(files: readonly ProofFile[], t: ProofTarget, ce
 }
 
 /**
- * The proof branch's files from the assembled ones (E2-R5): every non-`inserted` workflow of the draft is pipegen's own and
- * goes in with the draft's content, also at a path HEAD holds (HEAD's copy, maybe edited by the user, stays out of every
- * tree). pipegen's edits of user workflows (`inserted`) and bot configs are left out; central files are refused.
+ * E2-R7 (allowlist): the CreatedFile keys of a workflow pipegen rendered whole and fresh. Any other key on a workflow
+ * file (`inserted`, `edited`, a merge marker, any marker added later) means it may hold the user's content: it is left
+ * out of every proof tree and its part is not-proven.
  */
-function prepareAppFiles(files: readonly CreatedFile[]): { proof: ProofFile[]; leftOut: LeftOut[]; workflows: Set<string> } {
+const RENDERED_WORKFLOW_KEYS: ReadonlySet<string> = new Set(['path', 'content', 'part', 'reason', 'repo', 'needsConfirm']);
+const isFreshlyRendered = (f: CreatedFile): boolean => Object.keys(f).every((k) => RENDERED_WORKFLOW_KEYS.has(k) || (f as unknown as Record<string, unknown>)[k] === undefined);
+
+/**
+ * The proof branch's files from the assembled ones (E2-R5, E2-R7): a draft workflow pipegen rendered whole and fresh (no
+ * marker beyond RENDERED_WORKFLOW_KEYS) goes in with the draft's content, also at a path HEAD holds (HEAD's copy, maybe
+ * edited by the user, stays out of every tree). A workflow with any other marker (`inserted`, `edited`, merged, unknown)
+ * is left out and reported not-proven; bot configs are left out; central files are refused.
+ */
+function prepareAppFiles(files: readonly CreatedFile[]): { proof: ProofFile[]; leftOut: LeftOut[]; workflows: Set<string>; notProven: NotProven[] } {
   if (!Array.isArray(files)) throw new ProofStopError('The assembled proof files are not a list.');
   const proof: ProofFile[] = [];
   const leftOut: LeftOut[] = [];
+  const notProven: NotProven[] = [];
   const workflows = new Set<string>();
   for (const f of files) {
     if (f.repo !== 'app') throw new ProofStopError(`${safeText(String(f.path), 120)} is a central file; the proof branch takes only the app's files (central files go to pipelines).`);
     pathBytes(f.path);
     if (isBotConfig(f.path)) { leftOut.push({ path: f.path, why: 'a Dependabot or Renovate config: left out of the proof (S5)' }); continue; }
     if (isWorkflowPath(f.path)) {
-      if (f.inserted !== undefined) { leftOut.push({ path: f.path, why: 'pipegen\'s edit of one of your workflows: your workflows never run in the scratch repo' }); continue; }
+      if (!isFreshlyRendered(f)) {
+        const why = `pipegen's change to ${safeText(f.path, 120)} edits or merges a workflow that may hold your content, so it isn't run in the scratch repo (your workflows never run next to your test keys)`;
+        leftOut.push({ path: f.path, why });
+        notProven.push({ part: f.part, missingSecrets: [], reason: `${why}; not proven.` });
+        continue;
+      }
       workflows.add(f.path);
     }
     proof.push({ path: f.path, content: f.content });
   }
-  return { proof, leftOut, workflows };
+  return { proof, leftOut, workflows, notProven };
 }
 
 // ---------- the order (plan Task 2) ----------
@@ -1124,7 +1144,7 @@ export async function pushProofSetup(input: ProofSetupInput, deps: ProofSetupDep
     await pushCommit(s, planted, deps.transport);
     return {
       session: s, ...(centralSha === undefined ? {} : { centralSha }), base, branches: { main: branchOf(main), planted: branchOf(planted) }, planted: c1b.expected, disabled,
-      notProven: base.notProven, leftOut: [...base.leftOut, ...prepared.leftOut], warnings, ...(defaultBranchState === undefined ? {} : { defaultBranchState }),
+      notProven: [...base.notProven, ...prepared.notProven], leftOut: [...base.leftOut, ...prepared.leftOut], warnings, ...(defaultBranchState === undefined ? {} : { defaultBranchState }),
     };
   } catch (e) {
     await s.remove();

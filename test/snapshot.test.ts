@@ -407,7 +407,7 @@ describe('E2 base snapshot, central draft, proof branches (Task 2 first half)', 
         expect(pipegenOwn.has(p) || ['.github/workflows/pipegen--sign.yml', '.github/workflows/shop--merge.yml'].includes(p), p).toBe(true);
       }
     }
-    expect(r.leftOut.filter((l) => /edit of one of your workflows/.test(l.why)).map((l) => l.path).sort()).toEqual(['.github/workflows/ci.yml', '.github/workflows/deploy.yml']);
+    expect(r.leftOut.filter((l) => /isn't run in the scratch repo/.test(l.why)).map((l) => l.path).sort()).toEqual(['.github/workflows/ci.yml', '.github/workflows/deploy.yml']);
     expect(show(f.scratchGit, r.branches.main.sha, '.github/workflows/Nested/DEEP.yaml')).toBe('on: pull_request\njobs: {}');
     // the last line: pushProofBranch itself refuses a tree with a workflow pipegen didn't list
     const s = r.session;
@@ -1124,6 +1124,63 @@ describe('E2 fix round 1 (review-E2)', () => {
     const m = (err as Error).message;
     for (const part of ['workflow run started', '4242', '"CodeQL"', 'event dynamic', 'workflow dynamic/github-code-scanning/codeql', 'branch main', 'and 1 more', 'Disable or remove that workflow']) expect(m, part).toContain(part);
     expect(f.events).not.toContain('store-secrets');
+    await f.close();
+  });
+});
+
+describe('E2 fix round 2 (review-E2-r1)', () => {
+  it('markers (r1-m1, E2-R7): only a freshly rendered draft workflow goes in; edited, inserted or unknown markers are left out and not-proven', async () => {
+    const f = await fixture();
+    const MARK = 'owner-edited-merged-pipegen';
+    const files = (sha: string | undefined) => [
+      ...centralCaller(sha),
+      created('.github/workflows/pipegen-nightly.yml', `on: schedule\njobs:\n  n:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo ${MARK}\n`, { edited: { original: 'on: schedule\n' } }),
+      created('.github/workflows/pipegen-extra.yml', `on: push\njobs: {}\n# ${MARK}-unknown\n`, { merged: { base: 'x' } } as Partial<CreatedFile>),
+      created('.github/workflows/deploy.yml', `on: push\njobs: {}\n# ${MARK}-inserted\n`, { part: 'deploy-verify', inserted: { original: USER_CI, jobs: [], needs: [] } }),
+      // a non-workflow edit (CODEOWNERS-like) is not a workflow: it goes in as before
+      created('docs/OWNERS', 'x\n', { edited: { original: '' }, part: 'codeowners' }),
+    ];
+    const r = await pushProofSetup(input(f, { appFiles: files }), deps(f).d);
+    expect(everyObject(f.scratchGit)).not.toContain(MARK);
+    for (const sha of [r.branches.main.sha, r.branches.planted.sha]) {
+      const t = treeOf(f.scratchGit, sha);
+      for (const p of ['.github/workflows/pipegen-nightly.yml', '.github/workflows/pipegen-extra.yml', '.github/workflows/deploy.yml']) expect(t[p], p).toBeUndefined();
+      expect(t['docs/OWNERS']).toBe('100644');
+      expect(t['.github/workflows/pipegen.yml']).toBe('100644');
+    }
+    const np = r.notProven.filter((x) => /isn't run in the scratch repo/.test(x.reason));
+    expect(np.map((x) => x.part).sort()).toEqual(['deploy-verify', 'pipeline', 'pipeline']);
+    for (const p of ['pipegen-nightly.yml', 'pipegen-extra.yml', 'deploy.yml']) expect(np.some((x) => x.reason.includes(p)), p).toBe(true);
+    expect(r.leftOut.map((l) => l.path)).toEqual(expect.arrayContaining(['.github/workflows/pipegen-nightly.yml', '.github/workflows/pipegen-extra.yml', '.github/workflows/deploy.yml']));
+    await r.session.remove();
+    await f.close();
+  });
+
+  it('parents (r1-m2): main builds only on the base or an earlier main; planted on base, main or planted; others refused before any write', async () => {
+    const f = await fixture();
+    const r = await pushProofSetup(input(f), deps(f).d);
+    const own = new Set(['.github/workflows/pipegen.yml']);
+    const before = heads(f.scratchGit);
+    const pushesBefore = f.events.length;
+    await expect(buildProofBranch(r.session, 'main', [[{ path: 'm.txt', content: 'm' }]], { pipegenWorkflows: own, parent: r.branches.planted.sha })).rejects.toThrow(/parent/);
+    await expect(pushProofBranch(r.session, 'main', [[{ path: 'm.txt', content: 'm' }]], { transport: f.transport, pipegenWorkflows: own, parent: r.branches.planted.sha })).rejects.toThrow(/parent/);
+    expect(f.events.length).toBe(pushesBefore);
+    expect(heads(f.scratchGit)).toEqual(before);
+    // the allowed chains
+    const m2 = await buildProofBranch(r.session, 'main', [[{ path: 'm.txt', content: 'm' }]], { pipegenWorkflows: own, parent: r.branches.main.sha });
+    const m3 = await buildProofBranch(r.session, 'main', [[{ path: 'm2.txt', content: 'm' }]], { pipegenWorkflows: own, parent: m2.sha });
+    expect(m3.branch).toBe(`proof/${RUN_ID}/main`);
+    await buildProofBranch(r.session, 'main', [[{ path: 'b.txt', content: 'b' }]], { pipegenWorkflows: own });
+    await buildProofBranch(r.session, 'planted', [[{ path: 'p.txt', content: 'p' }]], { pipegenWorkflows: own, parent: r.branches.planted.sha });
+    await buildProofBranch(r.session, 'planted', [[{ path: 'p.txt', content: 'p' }]], { pipegenWorkflows: own, parent: m3.sha });
+    await buildProofBranch(r.session, 'planted', [[{ path: 'p.txt', content: 'p' }]], { pipegenWorkflows: own });
+    // a dispute variant never builds on planted's or another dispute's commits, only on base, main or its own
+    const d = await buildProofBranch(r.session, 'dispute-x-a', [[{ path: 'd.txt', content: 'd' }]], { pipegenWorkflows: own, parent: r.branches.main.sha });
+    await buildProofBranch(r.session, 'dispute-x-a', [[{ path: 'd2.txt', content: 'd' }]], { pipegenWorkflows: own, parent: d.sha });
+    await expect(buildProofBranch(r.session, 'dispute-x-b', [[{ path: 'd.txt', content: 'd' }]], { pipegenWorkflows: own, parent: d.sha })).rejects.toThrow(/parent/);
+    await expect(buildProofBranch(r.session, 'dispute-x-b', [[{ path: 'd.txt', content: 'd' }]], { pipegenWorkflows: own, parent: r.branches.planted.sha })).rejects.toThrow(/parent/);
+    expect(heads(f.scratchGit)).toEqual(before);
+    await r.session.remove();
     await f.close();
   });
 });
