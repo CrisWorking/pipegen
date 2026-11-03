@@ -65,8 +65,8 @@ const EGRESS_STEP = (() => {
   d.contents = stepsToYaml([renderEgressStep([], { dockerNetworks: false })]);
   return d.toString().trimEnd().split('\n').map((l) => `      ${l}`).join('\n');
 })();
-const SHARED_SIGN = `on:\n  workflow_call: {}\njobs:\n  s:\n    runs-on: ubuntu-latest\n    steps:\n${EGRESS_STEP}\n      - run: "true"\n`;
-const CENTRAL_MERGE = `on:\n  workflow_call: {}\njobs:\n  gate:\n    runs-on: ubuntu-latest\n    steps:\n${EGRESS_STEP}\n      - run: "true"\n`;
+const SHARED_SIGN = `on:\n  workflow_call: {}\npermissions: {}\njobs:\n  s:\n    runs-on: ubuntu-latest\n    steps:\n${EGRESS_STEP}\n      - run: "true"\n`;
+const CENTRAL_MERGE = `on:\n  workflow_call: {}\npermissions: {}\njobs:\n  gate:\n    runs-on: ubuntu-latest\n    steps:\n${EGRESS_STEP}\n      - run: "true"\n`;
 
 /** The user's repo: three commits of history; HEAD holds workflows, Dependabot and Renovate configs, an export-ignore file. */
 function userRepo(): string {
@@ -248,11 +248,11 @@ async function fixture(o: { appDefault?: string; scratchEmpty?: boolean; runs?: 
 const created = (path: string, content: string, o: Partial<CreatedFile> = {}): CreatedFile => ({ path, content, part: 'pipeline', reason: 'test', repo: 'app', ...o });
 /** The assembled proof files of a central layout: the caller pinned to the central commit and a non-workflow file. */
 const centralCaller = (sha: string | undefined, o: { sha?: string } = {}): CreatedFile[] => [
-  created('.github/workflows/pipegen.yml', `on:\n  push: {}\n  pull_request: {}\njobs:\n  pipegen:\n    uses: ${OWNER}/pipelines/.github/workflows/shop--merge.yml@${o.sha ?? sha ?? 'none'}\n`),
+  created('.github/workflows/pipegen.yml', `on:\n  push: {}\n  pull_request: {}\npermissions: {}\njobs:\n  pipegen:\n    uses: ${OWNER}/pipelines/.github/workflows/shop--merge.yml@${o.sha ?? sha ?? 'none'}\n`),
   created('Dockerfile', 'FROM scratch\n', { part: 'docker' }),
 ];
 const localLayout = (): CreatedFile[] => [
-  created('.github/workflows/pipegen.yml', 'on:\n  push: {}\n  pull_request: {}\njobs:\n  pipegen:\n    uses: ./.github/workflows/pipegen-merge.yml\n'),
+  created('.github/workflows/pipegen.yml', 'on:\n  push: {}\n  pull_request: {}\npermissions: {}\njobs:\n  pipegen:\n    uses: ./.github/workflows/pipegen-merge.yml\n'),
   created('.github/workflows/pipegen-merge.yml', CENTRAL_MERGE),
 ];
 const centralDraft = () => ({ files: [created('.github/workflows/shop--merge.yml', CENTRAL_MERGE, { repo: 'central' })] });
@@ -471,7 +471,7 @@ describe('E2 base snapshot, central draft, proof branches (Task 2 first half)', 
     expect(show(f.scratchGit, r.branches.main.sha, '.github/workflows/pipegen.yml')).toContain('uses: ./.github/workflows/pipegen-merge.yml');
     // a central `uses` without a central layout is refused
     const g = await fixture();
-    await expect(pushProofSetup(input(g, { central: undefined, appFiles: () => centralCaller('c'.repeat(40)) }), deps(g).d)).rejects.toThrow(/no central pin/);
+    await expect(pushProofSetup(input(g, { central: undefined, appFiles: () => centralCaller('c'.repeat(40)) }), deps(g).d)).rejects.toThrow(/no central pin|no central tree/);
     await g.close();
     await f.close();
   });
@@ -653,7 +653,7 @@ describe('E2 base snapshot, central draft, proof branches (Task 2 first half)', 
   });
 
   it('central: no central workflow has a push or pull_request trigger', async () => {
-    const yml = (on: string) => `on: ${on}\njobs:\n  a:\n    runs-on: ubuntu-latest\n    steps:\n${EGRESS_STEP}\n      - run: "true"\n`;
+    const yml = (on: string) => `on: ${on}\npermissions: {}\njobs:\n  a:\n    runs-on: ubuntu-latest\n    steps:\n${EGRESS_STEP}\n      - run: "true"\n`;
     const bad = ['push', '[push]', '{ pull_request: {} }', '[workflow_call, pull_request_target]', '{ create: {} }', '{ workflow_run: { workflows: [x] } }', '{ merge_group: {} }', 'issues', '"not yaml'];
     for (const on of bad) {
       expect(checkCentralTriggers([{ path: '.github/workflows/x.yml', content: yml(on) }]), on).not.toEqual([]);
@@ -681,13 +681,36 @@ describe('E2 base snapshot, central draft, proof branches (Task 2 first half)', 
   it('central (E3 I1): this project\'s central workflows pass checkProofWorkflows before anything is read or pushed', async () => {
     const noEgress = 'on:\n  workflow_call: {}\njobs:\n  gate:\n    runs-on: ubuntu-latest\n    steps:\n      - run: "true"\n';
     const unpinned = `on:\n  workflow_call: {}\njobs:\n  gate:\n    runs-on: ubuntu-latest\n    steps:\n${EGRESS_STEP}\n      - uses: actions/checkout@v4\n`;
-    for (const [content, why] of [[noEgress, /egress/], [unpinned, /not pinned/]] as const) {
+    for (const [content, why] of [[noEgress, /egress/], [unpinned, /reviewed/]] as const) {
       const f = await fixture();
       await expect(pushProofSetup(input(f, { central: { files: [created('.github/workflows/shop--merge.yml', content, { repo: 'central' })] } }), deps(f).d)).rejects.toThrow(why);
       expect(heads(f.pipelinesGit)[`proof/${RUN_ID}`]).toBeUndefined();
       expect(f.events.some((e) => e.startsWith('push'))).toBe(false);
       await f.close();
     }
+  });
+
+  it('central (E3 r1 I1-r1 a, m3): an appFiles callback that bypasses proofAppFiles is still checked at the push seam; callees resolve in the pushed central tree', async () => {
+    // a Plan G-style callback: an app workflow with no egress step → refused before any write
+    const f = await fixture();
+    const noEgress = created('.github/workflows/pipegen-extra.yml', 'on: pull_request\npermissions: {}\njobs:\n  a:\n    runs-on: ubuntu-latest\n    steps:\n      - run: make\n');
+    await expect(pushProofSetup(input(f, { appFiles: (sha) => [...centralCaller(sha), noEgress] }), deps(f).d)).rejects.toThrow(/pipegen-extra\.yml.*egress/);
+    expect(f.events.some((e) => e.startsWith('push'))).toBe(false);
+    expect(f.events).not.toContain('store-secrets');
+    await f.close();
+    // a caller reaching an INHERITED pipelines file (in the default head, rendered before Bullfrog) → refused; unreached ones are fine
+    const old = 'on:\n  workflow_call: {}\njobs:\n  s:\n    runs-on: ubuntu-latest\n    steps:\n      - run: sign\n';
+    const g = await fixture({ pipelinesFiles: { '.github/workflows/old-sign.yml': old } });
+    const reach = (sha: string | undefined) => [created('.github/workflows/pipegen.yml', `on: [push, pull_request]\npermissions: {}\njobs:\n  s:\n    uses: ${OWNER}/pipelines/.github/workflows/old-sign.yml@${sha ?? ''}\n`)];
+    await expect(pushProofSetup(input(g, { appFiles: reach }), deps(g).d)).rejects.toThrow(/old-sign\.yml.*egress/);
+    expect(g.events.filter((e) => e.startsWith('push') && !e.includes('pipelines'))).toEqual([]);
+    expect(g.events).not.toContain('store-secrets');
+    await g.close();
+    const h = await fixture({ pipelinesFiles: { '.github/workflows/old-sign.yml': old } });
+    const r = await pushProofSetup(input(h), deps(h).d);
+    expect(r.branches.main.sha).toMatch(/^[0-9a-f]{40}$/);
+    await r.session.remove();
+    await h.close();
   });
 
   it('planted: C1b placements outside pipegen-planted/, each listed as expected', async () => {
@@ -1161,7 +1184,7 @@ describe('E2 fix round 2 (review-E2-r1)', () => {
       // a non-workflow edit (CODEOWNERS-like) is not a workflow: it goes in as before
       created('docs/OWNERS', 'x\n', { edited: { original: '' }, part: 'codeowners' }),
       // a fresh render whose marker keys are present but undefined is still fresh
-      created('.github/workflows/pipegen-fresh.yml', 'on: pull_request\njobs: {}\n', { edited: undefined, inserted: undefined, needsConfirm: false }),
+      created('.github/workflows/pipegen-fresh.yml', `on: pull_request\npermissions: {}\njobs:\n  f:\n    runs-on: ubuntu-latest\n    steps:\n${EGRESS_STEP}\n`, { edited: undefined, inserted: undefined, needsConfirm: false }),
     ];
     const r = await pushProofSetup(input(f, { appFiles: files }), deps(f).d);
     expect(everyObject(f.scratchGit)).not.toContain(MARK);

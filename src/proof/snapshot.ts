@@ -53,7 +53,7 @@ import {
   createPushRepo, gitPush, GitTransportError, isDirty, readSnapshot, runGit, type DroppedEntry, type PushRef, type PushRepoHandle,
 } from './git.js';
 import { setScratchDefaultBranch, type DefaultBranchState } from './repos.js';
-import { checkProofWorkflows } from './workflow-check.js';
+import { checkProofWorkflows, isCompatCopy, type ProofCheckOptions } from './workflow-check.js';
 import {
   assertCentral, assertScratch, githubRead, guardedWrite, isProofTarget, ProofStopError, requireGuarded, ScratchGuardError, scratchPushUrl,
   validBranchName, type GuardedRepo, type ProofTarget,
@@ -1019,12 +1019,13 @@ const isFreshlyRendered = (f: CreatedFile): boolean => Object.keys(f).every((k) 
  * edited by the user, stays out of every tree). A workflow with any other marker (`inserted`, `edited`, merged, unknown)
  * is left out and reported not-proven; bot configs are left out; central files are refused.
  */
-function prepareAppFiles(files: readonly CreatedFile[]): { proof: ProofFile[]; leftOut: LeftOut[]; workflows: Set<string>; notProven: NotProven[] } {
+function prepareAppFiles(files: readonly CreatedFile[], central: ProofCheckOptions['central']): { proof: ProofFile[]; leftOut: LeftOut[]; workflows: Set<string>; notProven: NotProven[] } {
   if (!Array.isArray(files)) throw new ProofStopError('The assembled proof files are not a list.');
   const proof: ProofFile[] = [];
   const leftOut: LeftOut[] = [];
   const notProven: NotProven[] = [];
   const workflows = new Set<string>();
+  const kept: CreatedFile[] = [];
   for (const f of files) {
     if (f.repo !== 'app') throw new ProofStopError(`${safeText(String(f.path), 120)} is a central file; the proof branch takes only the app's files (central files go to pipelines).`);
     pathBytes(f.path);
@@ -1039,7 +1040,11 @@ function prepareAppFiles(files: readonly CreatedFile[]): { proof: ProofFile[]; l
       workflows.add(f.path);
     }
     proof.push({ path: f.path, content: f.content });
+    kept.push(f);
   }
+  // E3 review-r1 m3: the proof rules at the push seam too, whatever produced appFiles; the compat kind only by the marker
+  // harness.ts sets (identity), every other workflow as key-holding; central callees resolved in the pushed central tree
+  checkProofWorkflows(kept.map((f) => ({ path: f.path, content: f.content, kind: isCompatCopy(f) ? 'compat' as const : 'proof' as const })), { central });
   return { proof, leftOut, workflows, notProven };
 }
 
@@ -1107,7 +1112,7 @@ export async function pushProofSetup(input: ProofSetupInput, deps: ProofSetupDep
   if (input.central !== undefined) {
     checkCentralDraft(input.central);
     // E3 review I1: this project's central workflows run (called from the proof) next to the keys: the proof rules, before any read
-    checkProofWorkflows(input.central.files.map((f) => ({ path: f.path, content: f.content, kind: 'central' as const })));
+    checkProofWorkflows(input.central.files.map((f) => ({ path: f.path, content: f.content, kind: 'central' as const })), { central: 'later' });
   }
   for (const f of input.plantedFiles) {
     const p = shown(pathBytes(f.path));
@@ -1120,7 +1125,9 @@ export async function pushProofSetup(input: ProofSetupInput, deps: ProofSetupDep
     const centralSha = central?.sha;
     const base = await buildBase(s, input.dir, { io: deps.io, ...(input.dockerServices === undefined ? {} : { dockerServices: input.dockerServices }) });
     warnings.push(...base.warnings);
-    const prepared = prepareAppFiles(await input.appFiles(centralSha));
+    const centralRec = central === undefined ? undefined : live(s).commits.get(central.sha);
+    const centralTree = central === undefined || centralRec?.centralWorkflows === undefined ? undefined : { sha: central.sha, workflows: centralRec.centralWorkflows };
+    const prepared = prepareAppFiles(await input.appFiles(centralSha), centralTree);
     checkCentralPins(prepared.proof, t, centralSha, live(s).central?.paths);
     const c1b = plantedSecretPlacements(base.paths, { existingIgnore: base.gitleaksIgnore, ...(deps.random === undefined ? {} : { random: deps.random }) });
     const branchDeps = { pipegenWorkflows: prepared.workflows };

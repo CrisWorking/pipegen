@@ -31,10 +31,13 @@
 //   model, a `<owner>/pipelines` reference, when it deploys, or when it needs a job that isn't compared.
 //   Ruling E3-R2: a compat copy keeps the user's own actions as the user pinned them (often by tag). The user already runs
 //   them, and in the copy they get no secret, a contents: read token and their own VM. That exemption is for compat copies
-//   only; a job using actions/cache is still not compared (no proof job restores or saves a cache).
+//   only; a job using actions/cache is still not compared. A compat job may keep a setup-* `cache:` input (ruling E3-R5:
+//   "no proof job restores a cache" means the KEY-HOLDING jobs; none of them reads any cache, so a compat job's cache
+//   reaches nothing that holds keys). The compat kind is a marker set here (markCompatCopy), never a path (review-r1 m3).
 // - proofAppFiles: the `appFiles(centralSha)` callback pushProofSetup (E2) takes: the injected Plan G assemble, always called
 //   with signing mode `none` (no public log from the scratch repo), plus the harness and the compat copies. Every workflow of
-//   them passes checkProofWorkflows (workflow-check.ts) before it is returned (review I1).
+//   them passes checkProofWorkflows (workflow-check.ts) before it is returned (review I1), central callees by shape only;
+//   pushProofSetup checks again at the push seam with the central tree (review-r1 I1-r1 a, m3).
 // - Known and harmless (review M5): sign-roundtrip also builds with `docker build --network host` (B7's reason, S8: the build's
 //   package installs fail on the bridge network under Bullfrog). The host network is still under the job's Bullfrog list, and
 //   the job maps no secret. Its job service (the reviewed registry image, pinned by digest) starts at job setup, before the
@@ -64,7 +67,7 @@ import type { CreatedFile, PipelineDraft, RepoProfile, ReviewedTool, Service } f
 import { safeText } from '../util/safe-text.js';
 import { readSnapshot } from './git.js';
 import { ProofStopError, validBranchName } from './target.js';
-import { checkProofWorkflows } from './workflow-check.js';
+import { checkProofWorkflows, isCompatCopy, markCompatCopy } from './workflow-check.js';
 
 export const HARNESS_PATH = '.github/workflows/pipegen-proof-harness.yml';
 export const COMPAT_PREFIX = '.github/workflows/pipegen-compat-';
@@ -584,7 +587,7 @@ export function compatCopiesFrom(workflows: readonly { path: string; content: st
       continue;
     }
     taken.add(target.toLowerCase());
-    files.push({ path: target, content: text, part: 'pipeline', reason: `A read-only copy of ${path} (build and test jobs only), to compare its result before and after pipegen's changes.`, repo: 'app' });
+    files.push(markCompatCopy({ path: target, content: text, part: 'pipeline' as const, reason: `A read-only copy of ${path} (build and test jobs only), to compare its result before and after pipegen's changes.`, repo: 'app' as const }));
   }
   return { files, notCompared };
 }
@@ -638,8 +641,11 @@ export function proofAppFiles(draft: PipelineDraft, deps: { assemble: ProofAssem
       }
       // I1: every proof workflow, the assembled ones included, passes the proof rules (egress first, no dispatch-like trigger,
       // pinned actions, no cache); the compat copies under ruling E3-R2
-      const compatPaths = new Set(compat.files.map((f) => f.path));
-      checkProofWorkflows(all.map((f) => ({ path: f.path, content: f.content, kind: compatPaths.has(f.path) ? 'compat' as const : 'proof' as const })), deps.harness.reviewed);
+      // m3: the compat kind comes only from the marker compatCopiesFrom sets (identity), never from a path; central callees
+      // are checked for their shape here and resolved against the central tree when pushProofSetup checks again
+      checkProofWorkflows(all.map((f) => ({ path: f.path, content: f.content, kind: isCompatCopy(f) ? 'compat' as const : 'proof' as const })), {
+        ...(deps.harness.reviewed === undefined ? {} : { reviewed: deps.harness.reviewed }), central: 'later',
+      });
       last = { harness, compat };
       return all;
     },

@@ -15,7 +15,8 @@ import { RenderError } from '../src/engine/render-error.js';
 import { releaseInstallStep, renderStarterTestRun } from '../src/engine/render-cli.js';
 import { PROOF_OVERRIDE_PATH, renderComposeUp, renderFindRunStep, renderRuntimeEnv, stepsToYaml } from '../src/engine/render-step.js';
 import { parseYaml } from '../src/engine/yaml-parse.js';
-import { harnessWorkflow, HARNESS_PATH, PROOF_SIGNING_MODE, proofAppFiles, proofOverrideText, type HarnessOptions } from '../src/proof/harness.js';
+import { compatCopies, harnessWorkflow, HARNESS_PATH, PROOF_SIGNING_MODE, proofAppFiles, proofOverrideText, type HarnessOptions } from '../src/proof/harness.js';
+import { isCompatCopy } from '../src/proof/workflow-check.js';
 import { checkCentralPins } from '../src/proof/snapshot.js';
 import { proofTarget } from '../src/proof/target.js';
 import type { Capabilities, CreatedFile, Dependency, DependencyKind, PipelineDraft, Service } from '../src/types.js';
@@ -338,12 +339,28 @@ describe('proofAppFiles: every proof workflow is checked (I1)', () => {
     await expect(run([assembled({ first: 'after' })])).rejects.toThrow(/first step/);
     await expect(run([assembled({ first: 'sudo' })])).rejects.toThrow(/egress step/);
     await expect(run([assembled({ container: true })])).rejects.toThrow(/container/);
-    await expect(run([assembled({ uses: 'actions/setup-node@v4' })])).rejects.toThrow(/not pinned/);
+    await expect(run([assembled({ uses: 'actions/setup-node@v4' })])).rejects.toThrow(/reviewed/);
     await expect(run([assembled({ uses: `actions/cache@${'a'.repeat(40)}` })])).rejects.toThrow(/cache/);
     // also a second assembled workflow, and a non-workflow file is not judged
     await expect(run([assembled({}), assembled({ first: 'none', path: '.github/workflows/pipegen-merge.yml' })])).rejects.toThrow(/pipegen-merge\.yml/);
     await expect(run([assembled({}), { path: 'docker-compose.pipegen.yml', content: 'services: {}\n', part: 'compose', reason: 'r', repo: 'app' }])).resolves.toBeDefined();
   });
+  it('proofAppFiles (m3): a file named like a compat copy but not rendered by compatCopiesFrom is checked as key-holding', async () => {
+    const fake = { path: '.github/workflows/pipegen-compat-ci.yml', content: 'on: pull_request\njobs:\n  t:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/checkout@v4\n', part: 'pipeline' as const, reason: 'r', repo: 'app' as const };
+    await expect(run([assembled({}), fake])).rejects.toThrow(/pipegen-compat-ci\.yml.*egress/);
+    // a copy of a real compat copy loses the marker too
+    const dir = gitRepoWith({ '.github/workflows/ci.yml': 'on: pull_request\njobs:\n  t:\n    runs-on: ubuntu-latest\n    steps:\n      - run: make\n' });
+    const real = await compatCopies(profile(), dir);
+    expect(isCompatCopy(real.files[0])).toBe(true);
+    expect(isCompatCopy({ ...real.files[0]! })).toBe(false);
+  });
+
+  it('m3: only harness.ts marks a compat copy (source scan)', () => {
+    const scan = (d: string): string[] => readdirSync(d, { withFileTypes: true }).flatMap((e) => e.isDirectory() ? scan(join(d, e.name)) : [join(d, e.name)]);
+    const callers = scan(join(import.meta.dirname, '../src')).filter((f) => f.endsWith('.ts') && /\bmarkCompatCopy\s*\(/.test(readFileSync(f, 'utf8')));
+    expect(callers.map((f) => f.slice(f.indexOf('src/')))).toEqual(['src/proof/harness.ts']);
+  });
+
   it('proofAppFiles: the harness and the compat copies pass the same check (compat under E3-R2)', async () => {
     const dir = gitRepoWith({ '.github/workflows/ci.yml': 'on: pull_request\njobs:\n  t:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/checkout@v4\n      - run: make\n' });
     const files = await proofAppFiles(draft([api()], {}, startedTests()), { assemble: () => [assembled({})], harness: { platform: PLATFORM, reviewed, createdTests: true, signing: 'key-env' }, dir }).appFiles(CENTRAL_SHA);

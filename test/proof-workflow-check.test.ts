@@ -4,7 +4,7 @@
 import { describe, expect, it } from 'vitest';
 import { EGRESS_DOMAIN_SETS, renderEgressStep } from '../src/engine/egress.js';
 import { stepsToYaml } from '../src/engine/render-step.js';
-import { checkProofWorkflows, FORBIDDEN_PROOF_TRIGGERS, proofWorkflowProblems, type ProofWorkflowKind } from '../src/proof/workflow-check.js';
+import { checkProofWorkflows, PROOF_TRIGGERS, proofWorkflowProblems, type ProofWorkflowKind } from '../src/proof/workflow-check.js';
 import { ProofStopError } from '../src/proof/target.js';
 import { Document } from 'yaml';
 import { reviewedList } from './helpers/render.js';
@@ -14,6 +14,7 @@ const BULLFROG = reviewed.find((t) => t.id === 'bullfrog')!;
 const CHECKOUT = reviewed.find((t) => t.id === 'actions-checkout')!.step.action!.uses;
 const SETUP_NODE = reviewed.find((t) => t.id === 'actions-setup-node')!.step.action!.uses;
 const SHA = 'a'.repeat(40);
+const BUILD_PUSH = reviewed.find((t) => t.id === 'docker-build-push-action')!.step.action!.uses;
 
 /** The egress step as YAML lines at a job's steps indent. */
 const egress = (sets: Parameters<typeof renderEgressStep>[0] = ['npm'], dockerNetworks = false): string => {
@@ -39,10 +40,10 @@ describe('proof workflow check (I1)', () => {
     expect(problems(wf())).toEqual([]);
     expect(problems(wf({ on: '{ push: { branches: [main] }, pull_request: {} }' }))).toEqual([]);
     expect(problems(wf({ first: egress(['dockerhub', 'npm'], true) }))).toEqual([]);
-    expect(() => checkProofWorkflows([{ path: '.github/workflows/pipegen-x.yml', content: wf({ on: 'workflow_dispatch' }), kind: 'proof' }], reviewed)).toThrow(ProofStopError);
-    expect(() => checkProofWorkflows([{ path: '.github/workflows/pipegen-x.yml', content: wf({ on: 'workflow_dispatch' }), kind: 'proof' }], reviewed)).toThrow(/pipegen-x\.yml/);
+    expect(() => checkProofWorkflows([{ path: '.github/workflows/pipegen-x.yml', content: wf({ on: 'workflow_dispatch' }), kind: 'proof' }], { reviewed })).toThrow(ProofStopError);
+    expect(() => checkProofWorkflows([{ path: '.github/workflows/pipegen-x.yml', content: wf({ on: 'workflow_dispatch' }), kind: 'proof' }], { reviewed })).toThrow(/pipegen-x\.yml/);
     // files outside .github/workflows are not workflows
-    expect(() => checkProofWorkflows([{ path: 'docs/x.yml', content: 'on: workflow_dispatch\n', kind: 'proof' }], reviewed)).not.toThrow();
+    expect(() => checkProofWorkflows([{ path: 'docs/x.yml', content: 'on: workflow_dispatch\n', kind: 'proof' }], { reviewed })).not.toThrow();
   });
 
   it('proof workflow: the egress step is the first step of every job, with the reviewed pin and fixed inputs', () => {
@@ -66,28 +67,27 @@ describe('proof workflow check (I1)', () => {
 
   it('proof workflow: no workflow_dispatch, schedule, workflow_run, repository_dispatch or issue_comment trigger', () => {
     for (const t of ['workflow_dispatch', 'schedule', 'workflow_run', 'repository_dispatch', 'issue_comment']) {
-      expect(FORBIDDEN_PROOF_TRIGGERS).toContain(t);
+      expect(PROOF_TRIGGERS).not.toContain(t);
       for (const on of [t, `[pull_request, ${t}]`, `{ pull_request: {}, ${t}: {} }`]) {
         for (const kind of ['proof', 'compat'] as const) expect(problems(wf({ on }), kind).join(' '), `${kind} ${on}`).toMatch(new RegExp(t));
       }
     }
-    // central files keep E2-R3's own trigger rule (checkCentralTriggers): not judged here
+    // central files keep E2-R3's own trigger allowlist (round 2: judged here too, the same list)
     expect(problems(wf({ on: 'workflow_call' }), 'central')).toEqual([]);
   });
 
   it('proof workflow: every uses is pinned by sha, a job container or a reusable call elsewhere is refused', () => {
-    expect(problems(wf({ steps: '      - uses: actions/setup-node@v4\n' })).join(' ')).toMatch(/not pinned/);
-    expect(problems(wf({ steps: '      - uses: docker://alpine:3\n' })).join(' ')).toMatch(/not pinned/);
-    expect(problems(wf({ steps: `      - uses: docker://alpine@sha256:${'b'.repeat(64)}\n` }))).toEqual([]);
-    expect(problems(wf({ steps: '      - uses: ./.github/actions/pipegen-x\n' }))).toEqual([]);
+    expect(problems(wf({ steps: '      - uses: actions/setup-node@v4\n' })).join(' ')).toMatch(/reviewed/);
+    expect(problems(wf({ steps: '      - uses: docker://alpine:3\n' })).join(' ')).toMatch(/reviewed/);
+    // round 2 (I1-r1 d): a sha-shaped pin is not enough; an unreviewed image or a local action pipegen doesn't render is refused
+    expect(problems(wf({ steps: `      - uses: docker://alpine@sha256:${'b'.repeat(64)}\n` })).join(' ')).toMatch(/reviewed/);
+    expect(problems(wf({ steps: '      - uses: ./.github/actions/pipegen-x\n' })).join(' ')).toMatch(/reviewed/);
     expect(problems(wf({ job: '    container: node:24\n' })).join(' ')).toMatch(/container/);
     expect(problems(wf({ job: '    services:\n      db:\n        image: postgres:17\n' })).join(' ')).toMatch(/digest/);
     expect(problems(wf({ job: `    services:\n      db:\n        image: postgres:17@sha256:${'c'.repeat(64)}\n        options: --privileged\n` })).join(' ')).toMatch(/services/);
     expect(problems(wf({ job: `    services:\n      db:\n        image: postgres:17@sha256:${'c'.repeat(64)}\n        volumes: ["/:/host"]\n` })).join(' ')).toMatch(/services/);
-    // a reusable-workflow call job is checked in its callee: a local file or the central draft at a sha
-    const call = (uses: string) => `on: pull_request\njobs:\n  merge:\n    uses: ${uses}\n`;
-    expect(problems(call('./.github/workflows/pipegen-merge.yml'))).toEqual([]);
-    expect(problems(call(`CrisWorking/pipelines/.github/workflows/shop--merge.yml@${SHA}`))).toEqual([]);
+    // a reusable call: its shape here; whether the callee is a checked file is round 2's (proof-workflow-check-r2.test.ts)
+    const call = (uses: string) => `on: pull_request\npermissions: {}\njobs:\n  merge:\n    uses: ${uses}\n`;
     expect(problems(call('CrisWorking/pipelines/.github/workflows/shop--merge.yml@main')).join(' ')).toMatch(/reusable/);
     expect(problems(call('evil/x/.github/workflows/y.yml@' + SHA)).join(' ')).toMatch(/reusable/);
     // compat copies may keep the user's tag-pinned actions (ruling E3-R2), and have no egress step (S17)
@@ -104,8 +104,8 @@ describe('proof workflow check (I1)', () => {
     expect(problems(wf({ steps: `      - uses: ${SETUP_NODE}\n        with:\n          package-manager-cache: "false"\n          cache: npm\n` })).join(' ')).toMatch(/cache/);
     expect(problems(wf({ steps: `      - uses: ${SETUP_NODE}\n        with:\n          node-version: "24"\n` })).join(' ')).toMatch(/package-manager-cache/);
     expect(problems(wf({ steps: `      - uses: ${SETUP_NODE}\n        with:\n          package-manager-cache: "false"\n          node-version: "24"\n` }))).toEqual([]);
-    expect(problems(wf({ steps: `      - uses: docker/build-push-action@${SHA}\n        with:\n          cache-from: type=gha\n` })).join(' ')).toMatch(/cache/);
-    expect(problems(wf({ steps: `      - uses: docker/build-push-action@${SHA}\n        with:\n          no-cache: "true"\n` }))).toEqual([]);
+    expect(problems(wf({ steps: `      - uses: ${BUILD_PUSH}\n        with:\n          cache-from: type=gha\n` })).join(' ')).toMatch(/cache/);
+    expect(problems(wf({ steps: `      - uses: ${BUILD_PUSH}\n        with:\n          no-cache: "true"\n` }))).toEqual([]);
     // a compat copy holds no key, so a setup cache there is the user's own and can poison nothing that holds keys
     expect(problems(wf({ first: '      - run: echo', steps: '      - uses: actions/setup-node@v4\n        with:\n          cache: npm\n' }), 'compat')).toEqual([]);
   });
