@@ -114,5 +114,10 @@ describe('proof workflow check (I1)', () => {
     expect(problems('on: pull_request\njobs:\n  a: &x\n    runs-on: ubuntu-24.04\n').join(' ')).toMatch(/can't read/);
     expect(problems('"not yaml').join(' ')).toMatch(/can't read/);
     expect(problems('on: pull_request\njobs:\n  a:\n    runs-on: ubuntu-24.04\n').join(' ')).toMatch(/steps/);
+    // an empty jobs map, or a job with an empty step list, is not a workflow pipegen pushes (compat included)
+    for (const kind of ['proof', 'compat', 'central'] as const) {
+      expect(problems('on: pull_request\njobs: {}\n', kind).join(' '), kind).toMatch(/no jobs/);
+      expect(problems('on: pull_request\njobs:\n  a:\n    runs-on: ubuntu-24.04\n    steps: []\n', kind).join(' '), kind).toMatch(/no steps/);
+    }
   });
 });
