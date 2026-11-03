@@ -1665,6 +1665,8 @@ describe('data/reviewed-tools.yml', () => {
     semgrep: '2026-10-30', 'trivy-config': '2026-10-30', 'trivy-image': '2026-10-30', 'trivy-licence': '2026-10-30', eslint: '2026-10-30', 'eslint-typescript': '2026-10-30',
     ruff: '2026-10-30', 'ruff-format': '2026-10-30', prettier: '2026-10-30', knip: '2026-10-30', 'osv-scanner': '2026-10-30', jscpd: '2026-10-30', bandit: '2026-10-30', 'oxlint-typeaware': '2026-10-30',
     lefthook: '2026-10-30', syft: '2026-10-30', zizmor: '2026-10-30', hadolint: '2026-10-30', 'kube-linter': '2026-10-30', poutine: '2026-10-30',
+    // D9 (ruling B5): c8 runs the service's tests (fixed table, after --) with the code-filled --lines={lines}
+    c8: '2026-11-03',
   };
 
   it('data: every catalogue entry is reviewed by the owner (2026-10-28, DECISIONS #104) or by delegation (listed), with proofs 0', () => {
@@ -2122,8 +2124,8 @@ describe('Task 6 review fix round 1 (P19-P27)', () => {
     refused(both(realEntry('vitest-coverage'), without('--coverage.thresholds.lines={coverage-thresholds-lines}')), /in effect/);
     // a choice no placeholder uses is refused (the AI sets only what the template names)
     const unused = realEntry('c8');
-    unused.choices = { lines: ['60'] };
-    refused(unused, /only a \{lines\} placeholder/);
+    unused.choices = { ...unused.choices, 'per-file': ['true'] };   // D9: c8 now uses {lines}; a choice with no placeholder is still refused
+    refused(unused, /only a \{per-file\} placeholder/);
   });
 
   it('P25 (I7): kube-linter fails on no objects and invalid resources; the ESLint configs lint the framework files', () => {

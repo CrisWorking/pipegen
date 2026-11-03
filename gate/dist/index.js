@@ -1973,6 +1973,9 @@ var GH = "github-release";
 var TRIVY_ASSET = "trivy_0.76.0_Linux-64bit.tar.gz";
 var RUFF_ASSET = "ruff-x86_64-unknown-linux-gnu.tar.gz";
 var COVERAGE_MINIMUMS = ["60", "70", "80", "90"];
+var TEST_COMMANDS = Object.freeze({
+  npm: Object.freeze({ exe: "npm", args: Object.freeze(["test"]) })
+});
 var ESLINT_FILES = "files: ['**/*.{js,mjs,cjs,jsx,vue,svelte,astro}']";
 var ESLINT_TS_FILES = "files: ['**/*.{js,mjs,cjs,jsx,ts,mts,cts,tsx,vue,svelte,astro}']";
 var POLICIES = {
@@ -2163,8 +2166,20 @@ export default [js.configs.recommended, ...tseslint.configs.recommended, { ${ESL
     flags: { coverage: "bool", "coverage.thresholds.lines": { values: COVERAGE_MINIMUMS } },
     required: { coverage: "true", "coverage.thresholds.lines": null }
   },
-  // c8 12.0.0
-  c8: { method: "npm", package: "c8", npmBin: "bin/c8.js", runsRepoCode: true, exe: "c8", dialect: "long", sub: [], flags: { "check-coverage": "bool" }, required: { "check-coverage": "true" } },
+  // c8 12.0.0: the service's tests (TEST_COMMANDS, after `--`) with a line minimum pipegen's code fills (D9, ruling B5); with no command c8 12.0.0
+  // refuses every run ("Not enough non-option arguments", measured), and without --lines its default minimum is 90
+  c8: {
+    method: "npm",
+    package: "c8",
+    npmBin: "bin/c8.js",
+    runsRepoCode: true,
+    testCommand: true,
+    exe: "c8",
+    dialect: "long",
+    sub: [],
+    flags: { "check-coverage": "bool", lines: { values: COVERAGE_MINIMUMS } },
+    required: { "check-coverage": "true", lines: null }
+  },
   // Knip 6.42.1
   knip: { method: "npm", package: "knip", npmBin: "bin/knip.js", loadsRepoConfig: true, exe: "knip", dialect: "long", sub: [], flags: { "no-progress": "bool", "no-gitignore": "bool" }, required: { "no-gitignore": "true" } },
   // jscpd 5.4.2 (the release binary): new copy-paste against the base only; no semantic mode (jscpdProblems)

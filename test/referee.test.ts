@@ -17,7 +17,7 @@ import { stub } from './helpers/linter-stub.js';
 import { entry, gateEntry, platform, profile, reviewedList, service, specFor, scansFor } from './helpers/render.js';
 import { fake } from './helpers/secret-repo.js';
 import { renderGateUploads, renderRangeBlock, renderStage as renderStageC1c } from '../src/engine/render-step.js';
-import { isStagedTool } from '../src/engine/tool-flags.js';
+import { ARGV_POLICIES, isStagedTool } from '../src/engine/tool-flags.js';
 
 // ---------- builders ----------
 
@@ -129,7 +129,8 @@ describe('referee: the renderer and the referee agree', () => {
       if (t.categories.includes('platform') && !t.categories.includes('image-build')) continue;   // the platform actions are rendered below, by their helpers
       const nth = (perNeed.get(needFor(t)) ?? 0) + 1;
       perNeed.set(needFor(t), nth);
-      const spec = specFor(t, { needId: needFor(t), service: nth === 1 ? 'app' : `app${nth}` });
+      // D9: a tool that runs the service's test command (c8) runs in a service that has a test script
+      const spec = specFor(t, { needId: needFor(t), service: ARGV_POLICIES[t.id]?.testCommand === true ? 'script-app' : nth === 1 ? 'app' : `app${nth}` });
       let steps: RenderedStep[];
       try {
         steps = t.id === 'docker-build-push-action'

@@ -29,7 +29,7 @@ import { closureRootDependencies, loadNpmClosure, NpmClosureError, pinOk, type N
 import { EXPR, own, refuse, show } from './render-error.js';
 import type { RenderContext, RenderedStep, RenderResult } from './render-step.js';
 import { slotProblem, type SlotKind } from './slots.js';
-import { ARGV_POLICIES, PIP_CLOSURES, PLAIN_REL_RE, RANGE_STEP_ENV, RANGE_TOOL, rangeScanStepId, runsRepoCode, sha16, type ArgvPolicy } from './tool-flags.js';
+import { ARGV_POLICIES, PIP_CLOSURES, PLAIN_REL_RE, RANGE_STEP_ENV, RANGE_TOOL, rangeScanStepId, runsRepoCode, sha16, TEST_COMMANDS, type ArgvPolicy } from './tool-flags.js';
 
 export { sha16 };   // defined in tool-flags.ts (the job rules need it too); re-exported for the callers that import it from here
 import { EXTRA_RULES_AT, tuningEffects, type TuningEffects } from './tuning.js';
@@ -686,6 +686,23 @@ export function renderCliTool({ spec, tool, service, ctx, hooks, options }: CliA
     '  rc=1',
     'fi',
   ];
+  // D9 (ruling B5): a tool that runs the service's tests (c8) gets the test command from the fixed table only, after `--`: never repo text,
+  // never words of the entry (the loader refuses both). The executable is the Node setup step's own (`"$nodebin/npm"`), like the project scripts,
+  // and the run gets their constant CI=true.
+  const constants: string[] = [];
+  if (pol.testCommand === true) {
+    if (kind !== 'npm' || pol.runsRepoCode !== true || checker) return refuse(`${show(tool.id)} asks for a test command, which only an npm tool that runs repo code can run.`);
+    if (service === undefined) return refuse(`${show(tool.id)} runs the tests of one service, and this step names none.`);
+    const pm = service.packageManager;
+    const row = typeof pm === 'string' && Object.hasOwn(TEST_COMMANDS, pm) ? TEST_COMMANDS[pm] : undefined;
+    if (row === undefined) {
+      return refuse(`${show(tool.id)} runs the service's tests with a fixed command, which pipegen has for npm services only in this version; the service ${show(service.name)} uses ${show(pm ?? 'no recognised package manager')}, so its coverage is not measured.`);
+    }
+    if (!service.scripts.includes('test')) return refuse(`The service ${show(service.name)} has no test script, so ${show(tool.id)} has no tests to run (npm test would only fail).`);
+    if (!EXE_RE.test(row.exe)) return refuse(`The test command of ${show(tool.id)} is not a plain executable name.`);
+    built.main.push('--', `"$nodebin/${row.exe}"`, ...row.args.map(q));
+    constants.push('CI=true');
+  }
   const launch = (words: readonly string[]): string => `${LAUNCH_ENV} ${prefix}${words.length === 0 ? '' : ` ${words.join(' ')}`}`;
   const chain = [launch(built.main), ...built.then.map(launch)].join(' && ');
   const fl = pol.fileList;
@@ -695,7 +712,7 @@ export function renderCliTool({ spec, tool, service, ctx, hooks, options }: CliA
   const runLines = fl === undefined ? [`${chain} || rc=$?`] : fileListRun(launch(built.main), '"$list"');
   const run = script([
     ...prologue(artifact, nodeMajor === undefined ? {} : { nodeMajor }), ...tuneComments, ...vars, ...installLines, ...cdLines(spec.workingDir), ...pathChecks, ...prep, ...cfgLines, ...scopeLines, ...stageLines, ...preCheck,
-    ...closureVars, ...allowlist(pathValue, passed, [], dynamicEnv), ...afterAllow, ...listLines, 'rc=0', ...runLines, ...postCheck, 'exit "$rc"',
+    ...closureVars, ...allowlist(pathValue, passed, constants, dynamicEnv), ...afterAllow, ...listLines, 'rc=0', ...runLines, ...postCheck, 'exit "$rc"',
   ]);
   // a tool that runs the repo's own code is marked, so the referee can apply its order rule (S6 c); the id is not `pipegen-…`, which a job's dedupe may drop
   // fail closed: the run is repo code unless the policy says it only reads (readsOnly), and never for an app-running category

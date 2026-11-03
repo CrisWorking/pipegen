@@ -4,7 +4,7 @@
 // patterns, the pip closures and the renderer-filled inputs (RENDERER_INPUTS with their checkers).
 
 import { createHash } from 'node:crypto';
-import { NEED_CATEGORIES, RESULT_ARTIFACT_PREFIX } from '../types.js';
+import { NEED_CATEGORIES, RESULT_ARTIFACT_PREFIX, type PackageManager } from '../types.js';
 import { BASELINE_ARTIFACT, CLEAN_RUN_ARTIFACT, GATE_RESULT_ARTIFACT, SECRETS_RANGE_ARTIFACT, SECRETS_RANGE_TOOL } from './artifact-names.js';
 import type { SlotKind } from './slots.js';
 import { isLockfileKind, TRIVY_LICENCE_LOCKFILES } from './licence-lockfiles.js';
@@ -169,6 +169,13 @@ export interface ArgvPolicy extends CommandPolicy {
    */
   readonly runsRepoCode?: true;
   /**
+   * D9 (ruling B5): the tool runs the service's own test command, which the renderer appends after `--` from TEST_COMMANDS by the service's
+   * package manager (never repo text, never words of the entry: the loader refuses any other word and any `--` in it). Only an npm tool that
+   * runs repo code (c8); a service whose package manager has no row, or with no `test` script, is refused with a note. The run gets the
+   * project scripts' constant `CI=true` (render-cli.ts projectScriptSteps).
+   */
+  readonly testCommand?: true;
+  /**
    * The tool only reads code and can not load repo plugins or hooks (see READS_ONLY for the reason per entry). Without it
    * the run step is a repo-code step (`repocode-…`): the default fails closed.
    */
@@ -220,6 +227,16 @@ const TRIVY_ASSET = 'trivy_0.76.0_Linux-64bit.tar.gz';
 const RUFF_ASSET = 'ruff-x86_64-unknown-linux-gnu.tar.gz';
 /** Coverage minimums the AI may choose (P24): never 0. */
 export const COVERAGE_MINIMUMS = ['60', '70', '80', '90'] as const;
+
+/**
+ * D9 (ruling B5): the test command a `testCommand` tool (c8) runs after `--`, by the service's package manager. A fixed table, never repo
+ * text: `exe` is run from the Node setup step's folder (`"$nodebin/<exe>"`, never a PATH lookup or npx), `args` are reviewed constants.
+ * npm only in v0.2: pipegen installs a service's dependencies with `npm ci` (render-cli.ts repoInstall), so pnpm, yarn and bun services have
+ * no tree to run in; every package manager not listed here is refused with a note.
+ */
+export const TEST_COMMANDS: Readonly<Partial<Record<PackageManager, { readonly exe: string; readonly args: readonly string[] }>>> = Object.freeze({
+  npm: Object.freeze({ exe: 'npm', args: Object.freeze(['test']) }),
+});
 const ESLINT_FILES = "files: ['**/*.{js,mjs,cjs,jsx,vue,svelte,astro}']";
 const ESLINT_TS_FILES = "files: ['**/*.{js,mjs,cjs,jsx,ts,mts,cts,tsx,vue,svelte,astro}']";
 
@@ -311,8 +328,10 @@ const POLICIES = {
     exe: 'vitest', dialect: 'long', sub: ['run'], flags: { coverage: 'bool', 'coverage.thresholds.lines': { values: COVERAGE_MINIMUMS } },
     required: { coverage: 'true', 'coverage.thresholds.lines': null },
   },
-  // c8 12.0.0
-  c8: { method: 'npm', package: 'c8', npmBin: 'bin/c8.js', runsRepoCode: true, exe: 'c8', dialect: 'long', sub: [], flags: { 'check-coverage': 'bool' }, required: { 'check-coverage': 'true' } },
+  // c8 12.0.0: the service's tests (TEST_COMMANDS, after `--`) with a line minimum pipegen's code fills (D9, ruling B5); with no command c8 12.0.0
+  // refuses every run ("Not enough non-option arguments", measured), and without --lines its default minimum is 90
+  c8: { method: 'npm', package: 'c8', npmBin: 'bin/c8.js', runsRepoCode: true, testCommand: true, exe: 'c8', dialect: 'long', sub: [],
+    flags: { 'check-coverage': 'bool', lines: { values: COVERAGE_MINIMUMS } }, required: { 'check-coverage': 'true', lines: null } },
   // Knip 6.42.1
   knip: { method: 'npm', package: 'knip', npmBin: 'bin/knip.js', loadsRepoConfig: true, exe: 'knip', dialect: 'long', sub: [], flags: { 'no-progress': 'bool', 'no-gitignore': 'bool' }, required: { 'no-gitignore': 'true' } },
   // jscpd 5.4.2 (the release binary): new copy-paste against the base only; no semantic mode (jscpdProblems)

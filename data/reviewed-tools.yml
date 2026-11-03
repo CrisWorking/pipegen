@@ -1113,7 +1113,11 @@ tools:
     reviewedAt: "2026-10-28"
     proofs: 0
 
-  # c8 coverage for test runners without their own (node:test and others; catalogue D7). The minimum goes into .c8rc.json (Plan D).
+  # c8 coverage for test runners without their own (node:test and others; catalogue D7). The minimum is the `lines` choice, rendered as
+  # --lines={lines} and filled by pipegen's code (coverageChoice, ruling B5), never by the AI; pipegen writes no .c8rc* (ruling B4).
+  # The renderer adds the command after `--` from its fixed table (TEST_COMMANDS): `npm test` through the Node setup step's npm, for npm
+  # services with a test script only; nothing here or in the repo names it. Measured with c8 12.0.0 (task D9): with no command c8 refuses
+  # every run ("Not enough non-option arguments", exit 1); `--check-coverage --lines=60 -- npm test` measures and fails below 60%.
   # Source: npm c8@12.0.0 dist.integrity (tarball hashes to it), published 2026-07-14T13:51:32.917Z; npm provenance: no.
   - id: c8
     categories: ["coverage"]
@@ -1132,16 +1136,17 @@ tools:
     step:
       cli:
         install: { method: npm, package: "c8", version: "12.0.0" }
-        command: ["c8", "--check-coverage"]
+        command: ["c8", "--check-coverage", "--lines={lines}"]
       output: { path: "", format: none }
     fixedInputs:
-      args: ["--check-coverage"]
-    choices: {}
+      args: ["--check-coverage", "--lines={lines}"]
+    choices:
+      lines: ["60", "70", "80", "90"]
     # Config scope: nested (protected at any depth). c8 reads its rc file from the working folder; unsure about parents, so nested.
     configFiles: [".c8rc", ".c8rc.*", ".nycrc", ".nycrc.*"]
     configSections: ["package.json:c8"]
-    reviewedBy: Cristiano
-    reviewedAt: "2026-10-28"
+    reviewedBy: Claude delegated DECISIONS 105
+    reviewedAt: "2026-11-03"
     proofs: 0
 
   # Knip: unused files, exports and dependencies. Report-only on the first run; blocking only with the repo's own knip config (pipegen never writes one).

@@ -17,7 +17,8 @@ import { ctxFor, entry, platform, reviewedList, service, specFor } from './helpe
 import { argvOf, envNames, exec, fakeTool, FIXED_PATH, sandbox, stepEnv, type Sandbox } from './helpers/step-harness.js';
 
 const needFor = (t: ReviewedTool): string => t.categories.find((c) => (NEED_IDS as readonly string[]).includes(c) && c !== 'platform') ?? 'sast';
-const ctx = ctxFor([service({ name: 'app', path: '.' })], { image: `ghcr.io/o/app@sha256:${'a'.repeat(64)}`, url: 'http://localhost:8080' });
+// D9: c8 runs the service's test script, so the service has one
+const ctx = ctxFor([service({ name: 'app', path: '.', scripts: ['test'] })], { image: `ghcr.io/o/app@sha256:${'a'.repeat(64)}`, url: 'http://localhost:8080' });
 // declared-name lists are set through Reflect: the fixture scan (no-secret-literals) treats a keyword key with a value as a leak
 const withNames = (spec: StepSpec, names: string[]): StepSpec => {
   const copy = { ...spec };
@@ -572,7 +573,8 @@ describe('6b: every reviewed CLI entry', () => {
     for (const t of reviewedList()) {
       if (t.step.cli === undefined) continue;
       try {
-        const r = renderStepWith(spec(t), t, platform(), ctx);
+        // D9: a tool that runs the service's test command (c8) needs the step's service
+        const r = renderStepWith(ARGV_POLICIES[t.id]?.testCommand === true ? spec(t, { service: 'app' }) : spec(t), t, platform(), ctx);
         rendered++;
         outcome[t.id] = 'rendered';
         for (const s of runs(r)) {

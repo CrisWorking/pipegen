@@ -9,7 +9,8 @@ import type { ReviewedTool, StepSpec } from '../src/types.js';
 import { ctxFor, entry, gateEntry, platform, reviewedList, service, specFor } from './helpers/render.js';
 
 const needFor = (t: ReviewedTool): string => t.categories.find((c) => (NEED_IDS as readonly string[]).includes(c) && c !== 'platform') ?? 'sast';
-const ctx = ctxFor([service({ name: 'app', path: '.' })]);
+// D9: c8 runs the service's test script, so the service has one
+const ctx = ctxFor([service({ name: 'app', path: '.', scripts: ['test'] })]);
 const render = (id: string, over: Partial<StepSpec> = {}, opts?: Parameters<typeof renderStepWith>[4]): RenderResult => {
   const t = entry(id);
   return renderStepWith(specFor(t, { needId: needFor(t), ...over }), t, platform(), ctx, opts);
@@ -52,7 +53,7 @@ describe('C1: checkJobOrder is an allowlist that fails closed (the reviewer\'s p
     const scrub = renderScrub('pipegen-out-secrets', '${{ runner.temp }}/pipegen-raw/pipegen-out-secrets/gitleaks.sarif', 'gitleaks', 'sarif', gateEntry());
     expect(checkJobOrder([...vitest, upload]).length).toBeGreaterThan(0);
     expect(checkJobOrder([...vitest, scrub]).length).toBeGreaterThan(0);
-    expect(checkJobOrder(dedupeJobSteps([...vitest, ...steps('c8')], { scans: NO_SCANS }))).toEqual([]);
+    expect(checkJobOrder(dedupeJobSteps([...vitest, ...render('c8', { service: 'app' }).steps], { scans: NO_SCANS }))).toEqual([]);
     expect(checkJobOrder([...vitest, { name: 'mine', run: 'true' }]).length).toBe(0);
   });
   it('[checkers, then repo code] passes, with the prelude (checkout, setup-node) in front', () => {

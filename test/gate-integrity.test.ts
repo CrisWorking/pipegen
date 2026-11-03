@@ -1128,13 +1128,14 @@ describe('gate-v0.2.1: an owner in pipegen\'s CODEOWNERS block waives a finding 
     expect(pipegenBlockOwners(BLOCK_FILE)).toEqual(['alice', 'bob']);
     expect(pipegenBlockOwners(BLOCK_FILE.replace(/\n/g, '\r\n'))).toEqual(['alice', 'bob']);
     expect(pipegenBlockOwners('# pipegen:begin\n* @org/team ops@example.com\n# pipegen:end\n')).toEqual([]);
+    expect(pipegenBlockOwners('# pipegen:begin\n/x/ @zed @Alice\n/y/ @alice @bea\n# pipegen:end\n')).toEqual(['alice', 'bea', 'zed']);
   });
   it('pipegenBlockOwners: no block, two blocks, a block with no end, an end before the begin, or a marker that is not the exact line gives nobody', () => {
     const one = '# pipegen:begin\n/x/ @alice\n# pipegen:end\n';
     expect(pipegenBlockOwners(one)).toEqual(['alice']);
     for (const bad of [null, '', '/x/ @alice\n', `${one}${one}`, '# pipegen:begin\n/x/ @alice\n', '/x/ @alice\n# pipegen:end\n', '# pipegen:end\n/x/ @alice\n# pipegen:begin\n',
       '# pipegen:begin \n/x/ @alice\n# pipegen:end\n', ' # pipegen:begin\n/x/ @alice\n# pipegen:end\n', '# pipegen:begin\n/x/ @alice\n# pipegen:end x\n', '#pipegen:begin\n/x/ @alice\n#pipegen:end\n',
-      '# pipegen:begin\n/x/ @alice\n# pipegen:begin\n# pipegen:end\n']) {
+      '# pipegen:begin\n/x/ @alice\n# pipegen:begin\n# pipegen:end\n', '# pipegen:begin\n/x/ @alice\n# pipegen:end\n# pipegen:end\n', '# pipegen:begin\n/x/ @alice\n# pipegen:end\n/y/ @bob\n# pipegen:end\n']) {
       expect(pipegenBlockOwners(bad), JSON.stringify(bad)).toEqual([]);
     }
   });
@@ -1159,6 +1160,10 @@ describe('gate-v0.2.1: an owner in pipegen\'s CODEOWNERS block waives a finding 
     expect(find([sup('src/a.ts')], ['alice'], null)).toEqual(['integrity:suppression']);
     expect(find([sup('src/a.ts')], ['alice'], { found: '.github/CODEOWNERS' })).toEqual(['integrity:suppression']);
     expect(find([sup('src/a.ts')], ['alice'], { found: null, problem: 'x', blockOwners: [] })).toEqual(['integrity:suppression']);
+    // a CODEOWNERS problem wins over any block owners a caller passes (loadCodeowners gives none then anyway)
+    expect(find([sup('src/a.ts')], ['alice'], { found: '.github/CODEOWNERS', problem: 'x', blockOwners: ['alice'] })).toEqual(['integrity:suppression']);
+    // block owners are compared like approvals, ignoring letter case
+    expect(find([sup('src/a.ts')], ['alice'], { found: '.github/CODEOWNERS', blockOwners: ['ALICE'] })).toEqual([]);
   });
   it('a file a rule DOES cover keeps its own owners: a user rule, a team-only rule, and a rule that clears ownership are not "uncovered"', () => {
     expect(find([sup('docs/a.md')], ['alice'])).toEqual(['integrity:suppression']);

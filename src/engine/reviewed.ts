@@ -418,9 +418,16 @@ function entryProblems(e: Entry): { message: string; path: (string | number)[] }
   }
   // fixed keys: inputs and env set by the template, the config input, and every fixed flag (by name, without dashes)
   const fixedName = (a: string) => a.replace(/^-+/, '').split('=')[0] as string;
+  // D9: a fixed arg that is exactly `--flag={flag}` (the placeholder named after its own flag, dots as dashes, review M-R1) is the slot its
+  // choice fills, not a fixed value: c8's `--lines={lines}`. (vitest's `--coverage.thresholds.lines={coverage-thresholds-lines}` passed only
+  // because its dotted flag name differs from its choice name.) argvPolicyProblems still checks every value of that choice against the policy.
+  const choiceSlot = (a: string): boolean => {
+    const m = /^--?([^=]+)=(.*)$/s.exec(a);
+    return m !== null && PLACEHOLDER_RE.exec(m[2] as string)?.[1] === placeholderName(m[1] as string);
+  };
   const fixedKeys = new Set([
     ...Object.keys(stepWith), ...Object.keys(fx.with ?? {}), ...Object.keys(fx.env ?? {}), ...Object.keys(cli?.env ?? {}),
-    ...(fx.args ?? []).filter((a) => a.startsWith('-')).map(fixedName),
+    ...(fx.args ?? []).filter((a) => a.startsWith('-') && !choiceSlot(a)).map(fixedName),
     ...(fx.config === undefined ? [] : ['input' in fx.config.passAs ? fx.config.passAs.input : fixedName(fx.config.passAs.flag)]),
   ]);
   for (const [k, vs] of Object.entries(e.choices)) {
@@ -1052,6 +1059,9 @@ export function argvPolicyProblems(e: ReviewedEntry, policies: Readonly<Record<s
     return vs !== undefined && vs.every((x) => spec.values.includes(x));
   };
   const check = (c: CommandPolicy, words: readonly string[], where: (string | number)[], kind: 'command' | 'fixed'): ParsedArgv => {
+    // D9: no `--` in a reviewed command or args. It ends the flags, so words after it are read as a command to run; the only command after
+    // `--` is the service's test command, which the renderer adds from TEST_COMMANDS (tool-flags.ts), never the entry
+    if (words.includes('--')) bad(`${e.id} may not hold \`--\`: a command after it is never the entry's (a test command comes from pipegen's fixed table)`, ...where);
     const p = parseArgv(words, policyGrammar(c), pol.dialect === 'goflags' ? 'goflags' : 'pflag');
     const allowed = Object.keys(c.flags).map((f) => `${pol.dialect === 'goflags' ? '-' : '--'}${f}`).join(', ') || 'no flags';
     if (p.errors.length > 0) bad(`${e.id} may use only ${allowed} (allowlist, ruling P19): ${p.errors[0]}`, ...where);

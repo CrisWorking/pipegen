@@ -175,7 +175,8 @@ describe('permanent refusals say why (no "6c" is left)', () => {
     for (const t of reviewedList()) {
       if (t.step.cli === undefined) continue;
       try {
-        renderStepWith(specFor(t, { needId: needFor(t), service: 'app' }), t, platform(), ctxWith({ image: IMG, url: 'http://localhost:8080' }));
+        // D9: c8 runs the service's test script, so the service has one
+        renderStepWith(specFor(t, { needId: needFor(t), service: 'app' }), t, platform(), ctxWith({ image: IMG, url: 'http://localhost:8080' }, service({ name: 'app', path: '.', dockerfile: 'Dockerfile', scripts: ['test'] })));
         outcome[t.id] = 'rendered';
       } catch (e) {
         expect(e, t.id).toBeInstanceOf(RenderError);
