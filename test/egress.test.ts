@@ -106,7 +106,7 @@ describe('egress-check step', () => {
       chmodSync(join(dir, 'curl'), 0o755);
     }
     symlinkSync(spawnSync('which', ['bash']).stdout.toString().trim(), join(dir, 'bash'));
-    const r = spawnSync(join(dir, 'bash'), ['-e', '-c', step.run!], { env: { PATH: dir, ...env }, encoding: 'utf8' });
+    const r = spawnSync(join(dir, 'bash'), ['-e', '-c', step.run!], { env: { PATH: dir, ...env }, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
     const log = existsSync(join(dir, 'log')) ? readFileSync(join(dir, 'log'), 'utf8').trim().split('\n') : [];
     return { status: r.status, out: r.stdout + r.stderr, log };
   };
@@ -146,6 +146,16 @@ describe('egress-check step', () => {
     const r = run(null);
     expect(r.status).not.toBe(0);
     expect(r.out).toMatch(/::error::.*curl is missing/);
+  });
+  it('egress: a curl shell function from BASH_ENV is ignored; the PATH curl runs', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'egress-env-'));
+    dirs.push(dir);
+    writeFileSync(join(dir, 'env.sh'), 'curl() { return 7; }\nexport -f curl\n');
+    // the fake PATH curl answers 0 (open): if the function stood in, the step would pass
+    const r = run({ a: 0, b: 0 }, { BASH_ENV: join(dir, 'env.sh') });
+    expect(r.status).toBe(1);
+    expect(r.out).toMatch(/::error::egress is open/);
+    expect(r.log.length).toBeGreaterThan(0);
   });
   it('egress: curl runs with -q first, --noproxy, and the proxy variables unset', () => {
     const r = run({ a: 7, b: 7 }, { HTTPS_PROXY: 'http://p:1', https_proxy: 'http://p:1', ALL_PROXY: 'http://p:1' });

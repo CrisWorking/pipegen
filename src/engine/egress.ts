@@ -19,9 +19,11 @@ export type EgressSet = 'github-core' | 'npm' | 'pypi' | 'dockerhub' | 'ghcr';
  * Reviewed by Claude (delegated by Cristiano, DECISIONS #105). Every host is an exact lowercase hostname: no wildcard, scheme,
  * port, path or trailing dot. Spike files are in ~/Code/pipegen-internal/spikes/.
  * Source per host (S8 = S8-egress.md; wf/ = spikes/scripts/S8/wf/; S5 = spikes/scripts/S5/wf-egress/jobs.yml):
- * - github-core: github.com, api.github.com, codeload.github.com: in the Bullfrog allowlist sketch S8 l. 183-185 and in every spike
- *   workflow list; the runs that passed checkout and `npm ci` (S8 l. 147). objects.githubusercontent.com: S5 jobs.yml l. 15, in the
- *   run that passed checkout, setup-node and `npm ci` (S8 l. 147).
+ * - github-core: github.com, api.github.com, codeload.github.com: the Bullfrog allowlist sketch S8 l. 183-185. By workflow:
+ *   github.com and api.github.com are in wf/egress.yml l. 56-57, 80-81, wf/egress2.yml l. 29-30, wf/egress3.yml l. 32-33 and
+ *   S5 jobs.yml l. 12-13; codeload.github.com is in wf/egress.yml l. 58, 82, wf/egress2.yml l. 31 and S5 jobs.yml l. 14 (NOT in
+ *   wf/egress3.yml, which only pulled images). The S5 run passed checkout, setup-node and `npm ci` (S8 l. 147).
+ *   objects.githubusercontent.com: S5 jobs.yml l. 15 only (the same run).
  *   Left out on purpose (least privilege, controller ruling M1): pipelines.actions.githubusercontent.com and
  *   results-receiver.actions.githubusercontent.com. No spike run needed them (S4 and S8 name no artifact or results host), and
  *   artifacts can not work without the per-account blob host, which is excluded anyway. The live checklist decides.
@@ -84,6 +86,8 @@ export function renderEgressStep(sets: readonly EgressSet[], opts: { dockerNetwo
  */
 export function renderEgressCheckStep(): RenderedStep {
   const run = [
+    '# a BASH_ENV or env-defined shell function named curl must not stand in for the real one',
+    'unset -f curl',
     'unset http_proxy https_proxy all_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY',
     'if ! command -v curl >/dev/null 2>&1; then',
     '  echo "::error::egress check could not run: curl is missing, so the block was not verified"',
@@ -92,7 +96,7 @@ export function renderEgressCheckStep(): RenderedStep {
     'probe() {',
     '  url="$1"; shift',
     '  rc=0',
-    `  curl -q --noproxy '*' --silent --max-time 10 --output /dev/null "$url" || rc=$?`,
+    `  command curl -q --noproxy '*' --silent --max-time 10 --output /dev/null "$url" || rc=$?`,
     '  if [ "$rc" -eq 0 ]; then',
     '    echo "::error::egress is open: $url answered, so the allowlist is not blocking"',
     '    exit 1',
