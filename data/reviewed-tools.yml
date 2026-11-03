@@ -1886,28 +1886,30 @@ tools:
   # it (loader and scripts/cooldown.ts exempt exactly `crisworking/pipegen`, nothing else). Every input is the renderer's (RENDERER_INPUTS);
   # the entry fixes none and offers no choice (ACTION_POLICIES row: none).
   # Reach (ruling S6, DECISIONS #83): the repository stays private until v0.4, so in v0.2 only CrisWorking-owned repositories can use it.
-  # Self-pin (C6 scheme, done 2026-10-30): pinned to a174da8 (the last commit that changes gate/dist and gate/action.yml, Plan C
-  #   final, bundle sha256 b4ab0a4f2bd94df5a867eecd8c761d175fa1d47c5e00dd7c1c1d584293860e80), which is the commit of the annotated tag
-  #   gate-v0.2.0. scripts/cooldown.ts requires that tag to resolve to the pin; release-check requires the pin's gate/dist and action.yml
+  # Self-pin (C6 scheme; re-pinned 2026-11-03, Plan D task D9): pinned to 99a0abe (the last commit that changes gate/dist and
+  #   gate/action.yml, bundle sha256 0903dde8e5761d77d94ded57cec39912649aa6ceeb72d0e511f04da5ab60f946), which is the commit of the
+  #   annotated tag gate-v0.2.1. The version is bundle content (GATE_VERSION in the gate view), so it changes before the tag, never in the
+  #   re-pin commit. Previous pin: a174da8, tag gate-v0.2.0 (Plan C). scripts/cooldown.ts requires the tag gate-v<version> to resolve to the
+  #   pin; release-check requires the pin's gate/dist and action.yml
   #   to equal HEAD's and the pin to be on the default branch. Never rewrite history at or before the pin; merge with merge commits only.
-  # Source: commit a174da8fa0015f45c6d126ab981b49198e76776c of CrisWorking/pipegen (committed 2026-10-30T16:35:31Z), tag gate-v0.2.0.
+  # Source: commit 99a0abec03b3410fbf769ac9bce6516f760e0b57 of CrisWorking/pipegen (committed 2026-11-03T01:21:55Z), tag gate-v0.2.1.
   - id: pipegen-gate
     categories: ["gate"]
     languages: ["any"]
-    releasedAt: "2026-10-30T16:35:31Z"
+    releasedAt: "2026-11-03T01:21:55Z"
     candidate:
       id: pipegen-gate
       name: "pipegen-gate"
       kind: action
       repo: crisworking/pipegen
       version: "0.2.1"
-      pin: { sha: "a174da8fa0015f45c6d126ab981b49198e76776c" }
+      pin: { sha: "99a0abec03b3410fbf769ac9bce6516f760e0b57" }
       source: reviewed
       reviewed: true
       categories: ["gate"]
     step:
       action:
-        uses: crisworking/pipegen/gate@a174da8fa0015f45c6d126ab981b49198e76776c
+        uses: crisworking/pipegen/gate@99a0abec03b3410fbf769ac9bce6516f760e0b57
         with: {}
       output: { path: "", format: none }
     fixedInputs:
@@ -1915,5 +1917,5 @@ tools:
     choices: {}
     configFiles: []
     reviewedBy: Claude delegated DECISIONS 105
-    reviewedAt: "2026-10-30"
+    reviewedAt: "2026-11-03"
     proofs: 0
