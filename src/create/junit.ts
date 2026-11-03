@@ -11,7 +11,7 @@
 //   - XMLValidator.validate runs first: a truncated, mismatched or spoofed report (an element named like `@_name`) is refused.
 //   - counts a testsuite carries (tests, failures + errors, skipped) must not be higher than what was parsed under it, so a report whose cases
 //     were not recognised (another tag name, a namespace) is refused instead of reading as an empty pass.
-//   - at most 600,000 `<` characters and 250,000 attribute-shaped texts outside comments and CDATA (the parser's time is linear in them: about 1.6 s at the cap; the slowest accepted shapes, one huge attribute
+//   - at most 600,000 `<` characters and 250,000 attribute-shaped texts in the whole text (the parser's time is linear in them: about 1.6 s at the cap; the slowest accepted shapes, one huge attribute
 //     value or name, cost the validator about 2 s and 700 MB, and 3 s in all at 16 MiB).
 //   - at most 16 MiB (UTF-8 bytes) and 50,000 test cases. The cases are counted in the text before a tree is built, and again
 //     while walking.
@@ -43,10 +43,10 @@ const MAX_SUITE_DEPTH = 64;
 const FORBIDDEN = /<!\s*(?:doctype|entity)/i;
 /** `<!` that starts anything but a comment or a CDATA section. */
 const DECLARATION = /<!(?!--|\[CDATA\[)/;
-/** Attribute-shaped texts outside comments and CDATA. Real vitest writes 3 per case and 2 more per failure (50,000 cases at 10% failing: 160,000). */
+/** Attribute-shaped texts in the whole text. Real vitest writes 3 per case and 2 more per failure (50,000 cases at 10% failing: 160,000). */
 export const MAX_JUNIT_ATTRIBUTES = 250_000;
 /**
- * `<` characters outside comments and CDATA (each of those counts one). Real vitest 5.0.5 needs about 3 per passing case and 6 per
+ * `<` characters in the whole text (comments and CDATA included). Real vitest 5.0.5 needs about 3 per passing case and 6 per
  * failing case with output (50,000 cases: 125,000 to 215,000 here), and the 16 MiB size cap binds first.
  */
 export const MAX_JUNIT_TAGS = 600_000;
@@ -77,33 +77,17 @@ function countCaseTags(xml: string): number {
   return n;
 }
 
-const PROTECTED_START = /<!--|<!\[CDATA\[/g;
-
 /**
- * Which cap the text is over, if any. Comments and CDATA sections are skipped: the parser reads their body in time linear in its
- * bytes (the 16 MiB cap bounds that), whatever `<` or quotes it holds, and a jest report with console output can hold much HTML. Each
- * section still counts as one tag, so a flood of tiny ones can't pass. An unclosed one runs to the end (the validator refuses it).
+ * Which cap the text is over, if any. The WHOLE text is counted, comments and CDATA sections included: the validator accepts `<!--` and
+ * `<![CDATA[` inside an attribute value or a processing instruction, so skipping those regions would let an opener that is never closed
+ * hide the rest of the file from the caps (D8-R3). A report with a great deal of console HTML is refused; that fails closed.
  */
 function capsExceeded(xml: string): 'tags' | 'attributes' | null {
   let tags = 0;
+  for (let at = xml.indexOf('<'); at !== -1; at = xml.indexOf('<', at + 1)) if (++tags > MAX_JUNIT_TAGS) return 'tags';
   let attributes = 0;
-  const count = (text: string): 'tags' | 'attributes' | null => {
-    for (let at = text.indexOf('<'); at !== -1; at = text.indexOf('<', at + 1)) if (++tags > MAX_JUNIT_TAGS) return 'tags';
-    for (const _ of text.matchAll(ATTRIBUTE_LIKE)) if (++attributes > MAX_JUNIT_ATTRIBUTES) return 'attributes';
-    return null;
-  };
-  let from = 0;
-  PROTECTED_START.lastIndex = 0;
-  for (let m = PROTECTED_START.exec(xml); m !== null; m = PROTECTED_START.exec(xml)) {
-    const over = count(xml.slice(from, m.index));
-    if (over) return over;
-    if (++tags > MAX_JUNIT_TAGS) return 'tags';
-    const close = xml.indexOf(m[0] === '<!--' ? '-->' : ']]>', m.index + m[0].length);
-    if (close === -1) return null;
-    from = close + 3;
-    PROTECTED_START.lastIndex = from;
-  }
-  return count(xml.slice(from));
+  for (const _ of xml.matchAll(ATTRIBUTE_LIKE)) if (++attributes > MAX_JUNIT_ATTRIBUTES) return 'attributes';
+  return null;
 }
 
 const ENTITY = /&(?:#x([0-9a-fA-F]+)|#([0-9]+)|(amp|lt|gt|quot|apos));/g;

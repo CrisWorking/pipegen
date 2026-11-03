@@ -199,29 +199,33 @@ describe('junit', () => {
     expect(sameResults(run, run).ok).toBe(false); // it has a failure
   });
 
-  it('junit: the caps do not count inside CDATA sections or comments (review m1)', () => {
-    // a jest report that logs a lot of HTML: 3 MB of tags, and 2 MB of quoted attributes, in CDATA sections
-    const html = '<ul><li>y</li></ul>'.repeat(160_000);
-    expect(html.match(/</g)!.length).toBeGreaterThan(MAX_JUNIT_TAGS);
-    const attrs = `<i a='1' b="2" c='3'/>`.repeat(100_000);
-    expect(attrs.match(/=\s*["']/g)!.length).toBeGreaterThan(MAX_JUNIT_ATTRIBUTES);
-    const out = (body: string): string => `<testsuites tests="1"><testsuite tests="1"><testcase classname="a.test.ts" name="x"><system-out><![CDATA[${body}]]></system-out></testcase></testsuite></testsuites>`;
-    expect(parseJunit(out(html))).toEqual([r('a.test > x')]);
-    expect(parseJunit(out(attrs))).toEqual([r('a.test > x')]);
-    expect(parseJunit(`<testsuites><testsuite><testcase classname="a.test.ts" name="x"/><!--${html}${attrs}--></testsuite></testsuites>`)).toEqual([r('a.test > x')]);
-    // two sections in a row, and the text after them is still counted
-    const two = `<testsuites><testsuite><testcase classname="a.test.ts" name="x"><system-out><![CDATA[${html}]]><![CDATA[${attrs}]]>${'<b/>'.repeat(MAX_JUNIT_TAGS)}</system-out></testcase></testsuite></testsuites>`;
-    expect(() => parseJunit(two)).toThrow(/tags/);
-    // many tiny comments or sections are counted one tag each, so they cannot flood the parser
-    expect(() => parseJunit(`<testsuites>${'<!---->'.repeat(MAX_JUNIT_TAGS + 1)}</testsuites>`)).toThrow(/tags/);
-    expect(() => parseJunit(`<testsuites>${'<![CDATA[]]>'.repeat(MAX_JUNIT_TAGS + 1)}</testsuites>`)).toThrow(/tags/);
-    // the text in front of the first section is counted too, and a comment start inside CDATA does not end the skipping
-    expect(() => parseJunit(`<testsuites>${'<b/>'.repeat(MAX_JUNIT_TAGS)}<!----></testsuites>`)).toThrow(/tags/);
-    expect(parseJunit(out(`<!--${html}`))).toEqual([r('a.test > x')]);
-    expect(parseJunit(`<testsuites><testsuite><testcase classname="a.test.ts" name="x"/><!-- <![CDATA[ ${html} --></testsuite></testsuites>`)).toEqual([r('a.test > x')]);
-    expect(() => parseJunit(`<testsuites><![CDATA[<!--]]>${'<b/>'.repeat(MAX_JUNIT_TAGS)}</testsuites>`)).toThrow(/tags/);
-    // an unclosed section runs to the end of the text and is not counted; the validator refuses it
-    expect(() => parseJunit(`<testsuites><![CDATA[${'<a/>'.repeat(MAX_JUNIT_TAGS)}`)).toThrow(/not well-formed/);
+  it('junit: the caps count the whole text, so an opener the validator lets through cannot hide a flood (D8-R3)', () => {
+    const tags = '<b/>'.repeat(MAX_JUNIT_TAGS);
+    const attrs = 'a="" '.repeat(MAX_JUNIT_ATTRIBUTES + 1);
+    const frame = (inside: string): string => `<testsuites><testsuite><testcase classname="a.test.ts" name="x"${inside}`;
+    // an opener held in a processing instruction (the validator accepts it there)
+    for (const flood of [attrs, tags]) {
+      for (const opener of ['<!--', '<![CDATA[']) {
+        const t = performance.now();
+        expect(() => parseJunit(`<testsuites><?x ${opener} ?>${flood}</testsuites>`), `PI ${opener}`).toThrow(/tags|attributes/);
+        expect(performance.now() - t).toBeLessThan(2000);
+      }
+    }
+    // an opener held in an attribute value
+    for (const flood of [attrs, tags]) {
+      for (const opener of ['<!--', '<![CDATA[']) {
+        const t = performance.now();
+        expect(() => parseJunit(`${frame(` x="${opener}"/>`)}${flood}</testsuite></testsuites>`), `attr ${opener}`).toThrow(/tags|attributes/);
+        expect(performance.now() - t).toBeLessThan(2000);
+      }
+    }
+    // text inside a CDATA section or a comment counts too (a jest report with a great deal of console HTML is refused, which fails closed)
+    expect(() => parseJunit(`<testsuites><![CDATA[${tags}]]></testsuites>`)).toThrow(/tags/);
+    expect(() => parseJunit(`<testsuites><!--${tags}--></testsuites>`)).toThrow(/tags/);
+    expect(() => parseJunit(`<testsuites><![CDATA[${attrs}]]></testsuites>`)).toThrow(/attributes/);
+    // an unclosed opener hides nothing
+    expect(() => parseJunit(`<testsuites><![CDATA[${tags}`)).toThrow(/tags/);
+    expect(() => parseJunit(`<testsuites><!--${attrs}`)).toThrow(/attributes/);
   });
 
   it('junit: the cap values are pinned and shown in the messages (review m1)', () => {
