@@ -26,6 +26,7 @@ import { fakeFetch, type Call, type Reply } from './helpers/fake-http.js';
 import { startGitHttp, type GitHttpServer } from './helpers/git-http.js';
 import { makeGitRecorder, REAL_GIT } from './helpers/git-recorder.js';
 import { fake } from './helpers/secret-repo.js';
+import { compatCopiesFrom } from '../src/proof/harness.js';
 
 vi.mock(import('../src/util/exit-hooks.js'), async (orig) => ({ ...(await orig()), interrupting: vi.fn(() => false) }));
 
@@ -822,6 +823,34 @@ describe('E2 base snapshot, central draft, proof branches (Task 2 first half)', 
     await expect(pushProofBranch(s, 'main', [[{ path: '.github/workflows/PIPEGEN.yml', content: good }]], { ...opts, pipegenWorkflows: new Set([...own, '.github/workflows/PIPEGEN.yml']) })).rejects.toThrow(/case/);
     expect(heads(f.scratchGit)[mainRef]).toBe(before);
     expect(pushes()).toBe(n0);
+    await s.remove();
+    await f.close();
+  });
+
+  it('L1 (mutants): marked compat copies keep their kind across commits and pushes; an unmarked compat name or non-UTF-8 workflow is refused', async () => {
+    const f = await fixture();
+    const compat = compatCopiesFrom([{ path: '.github/workflows/ci.yml', content: 'on: pull_request\njobs:\n  t:\n    runs-on: ubuntu-latest\n    steps:\n      - run: make\n' }]).files;
+    expect(compat).toHaveLength(1);
+    const r = await pushProofSetup(input(f, { appFiles: (sha) => [...centralCaller(sha), ...compat] }), deps(f).d);
+    const s = r.session;
+    const own = new Set(['.github/workflows/pipegen.yml', '.github/workflows/pipegen-compat-ci.yml', '.github/workflows/pipegen-compat-x.yml', '.github/workflows/pipegen-fix.yml']);
+    const opts = { transport: f.transport, pipegenWorkflows: own, parent: r.branches.main.sha };
+    // the compat copy (no egress step, by S17) stays compat in a two-commit push and in a later push on that tip
+    const two = await pushProofBranch(s, 'main', [[{ path: 'a.txt', content: 'a\n' }], [{ path: 'b.txt', content: 'b\n' }]], opts);
+    const later = await pushProofBranch(s, 'main', [[{ path: 'c.txt', content: 'c\n' }]], { ...opts, parent: two.sha });
+    expect(heads(f.scratchGit)[`proof/${RUN_ID}/main`]).toBe(later.sha);
+    // a compat copy added in the first commit of a push keeps its kind in the next commit of the same push
+    const lint = compatCopiesFrom([{ path: '.github/workflows/lint.yml', content: 'on: pull_request\njobs:\n  l:\n    runs-on: ubuntu-latest\n    steps:\n      - run: make lint\n' }]).files;
+    own.add('.github/workflows/pipegen-compat-lint.yml');
+    const withLint = await pushProofBranch(s, 'main', [lint, [{ path: 'd.txt', content: 'd\n' }]], { ...opts, parent: later.sha });
+    expect(withLint.commits).toHaveLength(2);
+    // a file only named like a compat copy is key-holding
+    await expect(pushProofBranch(s, 'main', [[{ path: '.github/workflows/pipegen-compat-x.yml', content: 'on: pull_request\njobs:\n  t:\n    runs-on: ubuntu-latest\n    steps:\n      - run: make\n' }]], { ...opts, parent: withLint.sha })).rejects.toThrow(/pipegen-compat-x\.yml.*egress/);
+    // a workflow that isn't UTF-8 text is refused (GitHub reads it as UTF-8; a lossy reading could differ)
+    const good = `on: pull_request\npermissions: {}\njobs:\n  a:\n    runs-on: ubuntu-latest\n    steps:\n${EGRESS_STEP}\n      - run: make # `;
+    const bytes = Buffer.concat([Buffer.from(good, 'utf8'), Buffer.from([0xff, 0xfe]), Buffer.from('\n')]);
+    await expect(pushProofBranch(s, 'main', [[{ path: '.github/workflows/pipegen-fix.yml', content: bytes }]], { ...opts, parent: withLint.sha })).rejects.toThrow(/UTF-8/);
+    expect(heads(f.scratchGit)[`proof/${RUN_ID}/main`]).toBe(withLint.sha);
     await s.remove();
     await f.close();
   });
