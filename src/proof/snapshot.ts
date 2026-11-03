@@ -53,7 +53,7 @@ import {
   createPushRepo, gitPush, GitTransportError, isDirty, readSnapshot, runGit, type DroppedEntry, type PushRef, type PushRepoHandle,
 } from './git.js';
 import { setScratchDefaultBranch, type DefaultBranchState } from './repos.js';
-import { checkProofWorkflows, isCompatCopy, type ProofCheckFile, type ProofCheckOptions } from './workflow-check.js';
+import { checkProofWorkflows, isCompatCopy, type ProofCheckFile, type ProofCheckOptions, type ProofWorkflowKind } from './workflow-check.js';
 import {
   assertCentral, assertScratch, githubRead, guardedWrite, isProofTarget, ProofStopError, requireGuarded, ScratchGuardError, scratchPushUrl,
   validBranchName, type GuardedRepo, type ProofTarget,
@@ -115,6 +115,7 @@ const LFS_POINTER = 'version https://git-lfs.github.com/spec/v1\n';
 
 const text = (b: Uint8Array): string => Buffer.from(b).toString('utf8').trim();
 const lossy = new TextDecoder('utf-8', { ignoreBOM: true });
+const strictUtf8 = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true });
 const shown = (b: Uint8Array): string => lossy.decode(b);
 const keyOf = (b: Uint8Array): string => Buffer.from(b).toString('latin1');
 const bytesOfKey = (k: string): Buffer => Buffer.from(k, 'latin1');
@@ -198,8 +199,8 @@ interface CommitRec {
   allowed: ReadonlySet<string>;
   /** Central only: the tree's workflow files, judged by checkCentralTriggers again before the push. */
   centralWorkflows?: readonly { path: string; content: string }[];
-  /** Proof only (E3 fix round 3, L1): the tree's workflow files with their check kind, so a later commit is checked as a whole set. */
-  workflows?: ReadonlyMap<string, ProofCheckFile>;
+  /** Proof only (E3 fix round 3, L1): the check kind of each workflow entry of the tree, by its exact entry key (compat only by the marker). */
+  workflowKinds?: ReadonlyMap<string, ProofWorkflowKind>;
 }
 
 interface SessionState {
@@ -766,25 +767,20 @@ export async function buildProofBranch(s: ProofSession, variant: Variant, commit
   for (const p of allowed) if (!isWorkflowPath(p)) throw new GitTransportError(`${safeText(p, 120)} is not a workflow path.`);
   let cur = parent;
   let entries = start.entries;
-  let workflowSet: ReadonlyMap<string, ProofCheckFile> = start.workflows ?? new Map();
+  let kinds: ReadonlyMap<string, ProofWorkflowKind> = start.workflowKinds ?? new Map();
   const centralRec = st.central === null ? undefined : st.commits.get(st.central.sha);
   const centralTree = st.central === null || centralRec?.centralWorkflows === undefined ? undefined : { sha: st.central.sha, workflows: centralRec.centralWorkflows };
   const made: string[] = [];
   for (const [i, files] of commits.entries()) {
-    // E3 fix round 3 (L1, DECISIONS #108): every proof commit, whoever builds it (setup, the fix loop, a dispute), holds a
-    // workflow set that passes checkProofWorkflows as a whole (its parent's workflows plus this commit's), with the central
-    // callees it reaches; the compat kind only by the marker. Checked before anything of this commit is written.
-    const nextSet = new Map(workflowSet);
-    for (const f of files) {
-      if (typeof f.path !== 'string' || !isWorkflowPath(f.path)) continue;
-      const content = typeof f.content === 'string' ? f.content : Buffer.from(f.content).toString('utf8');
-      nextSet.set(f.path.toLowerCase(), { path: f.path, content, kind: isCompatCopy(f) ? 'compat' : 'proof' });
-    }
-    checkProofWorkflows([...nextSet.values()], { central: centralTree });
+    const nextKinds = new Map(kinds);
     const next: Entries = new Map(entries);
     const add = files.map((f) => {
+      if (typeof f.path !== 'string' && !(f.path instanceof Uint8Array)) throw new GitTransportError('A proof file has a path that is neither text nor bytes; not pushing it.');
       const name = pathBytes(f.path);
       const p = shown(name);
+      // security scan (L1): a workflow path is text, never bytes that only decode to one
+      if (typeof f.path !== 'string' && isWorkflowPath(p)) throw new GitTransportError(`${safeText(p, 120)} is a workflow path given as bytes; a workflow path must be text.`);
+      nextKinds.set(keyOf(name), isCompatCopy(f) ? 'compat' : 'proof');
       if (isWorkflowPath(p) && !allowed.has(p.toLowerCase())) throw new GitTransportError(`${safeText(p, 120)} is a workflow pipegen didn't list as its own; not pushing it.`);
       if (isBotConfig(p)) throw new GitTransportError(`${safeText(p, 120)} is a Dependabot or Renovate config; it stays out of the scratch repo.`);
       const mode = f.mode ?? '100644';
@@ -797,13 +793,36 @@ export async function buildProofBranch(s: ProofSession, variant: Variant, commit
       const p = shown(bytesOfKey(k));
       if (isWorkflowPath(p) && !allowed.has(p.toLowerCase())) throw new GitTransportError(`${safeText(p, 120)} is a workflow pipegen didn't list as its own; not pushing.`);
     }
+    // E3 fix round 3 (L1, DECISIONS #108; security scan): every proof commit, whoever builds it (setup, the fix loop, a
+    // dispute), holds a workflow set that passes checkProofWorkflows as a whole. The set is read from the FINAL tree of this
+    // commit (every entry whose path is a workflow path, its content read back from the blob), so nothing written can skip
+    // it; two workflow paths that differ only by case are refused; the compat kind only by the marker; central callees in
+    // the session's central tree. Checked before the tree, the commit or any push exists.
+    const lower = new Map<string, string>();
+    const set: ProofCheckFile[] = [];
+    for (const [k, e] of next) {
+      const p = shown(bytesOfKey(k));
+      if (!isWorkflowPath(p)) continue;
+      const seen = lower.get(p.toLowerCase());
+      if (seen !== undefined) throw new GitTransportError(`${safeText(seen, 120)} and ${safeText(p, 120)} are workflow paths that differ only by case; not pushing.`);
+      lower.set(p.toLowerCase(), p);
+      if (e.type !== 'blob') throw new GitTransportError(`${safeText(p, 120)} is not a file; not pushing.`);
+      let content: string;
+      try { content = strictUtf8.decode(await runGit(st.repo, ['cat-file', 'blob', e.sha])); } catch (err) {
+        if (err instanceof TypeError) throw new GitTransportError(`${safeText(p, 120)} is not UTF-8 text; not pushing.`);
+        throw err;
+      }
+      set.push({ path: p, content, kind: nextKinds.get(k) ?? 'proof' });
+    }
+    for (const k of [...nextKinds.keys()]) if (!next.has(k) || !isWorkflowPath(shown(bytesOfKey(k)))) nextKinds.delete(k);
+    checkProofWorkflows(set, { central: centralTree });
     const tree = await writeTree(st, next.values());
     const sha = await commitTree(st, tree, cur, `pipegen proof ${t.runId}: ${variant} (${i + 1}/${commits.length})`);
-    record(st, sha, { kind: 'proof', branch, parent: cur, entries: next, allowed, workflows: nextSet });
+    record(st, sha, { kind: 'proof', branch, parent: cur, entries: next, allowed, workflowKinds: nextKinds });
     cur = sha;
     made.push(sha);
     entries = next;
-    workflowSet = nextSet;
+    kinds = nextKinds;
   }
   if (made.length === 0) throw new GitTransportError('A proof branch needs at least one commit.');
   return proofCommit(st, { kind: 'proof', sha: cur, branch, variant, commits: made });

@@ -800,6 +800,32 @@ describe('E2 base snapshot, central draft, proof branches (Task 2 first half)', 
     await f.close();
   });
 
+  it('L1 (security scan): the check reads the final tree: a non-string path and two workflow paths that differ only by case are refused', async () => {
+    const f = await fixture();
+    const r = await pushProofSetup(input(f), deps(f).d);
+    const s = r.session;
+    const mainRef = `proof/${RUN_ID}/main`;
+    const before = heads(f.scratchGit)[mainRef];
+    const pushes = () => recorder.calls().filter((x) => x.argv.includes('push')).length;
+    const n0 = pushes();
+    const own = new Set(['.github/workflows/pipegen.yml', '.github/workflows/pipegen-fix.yml', '.github/workflows/a.yml']);
+    const opts = { transport: f.transport, pipegenWorkflows: own, parent: r.branches.main.sha };
+    const bad = 'on: pull_request\npermissions: {}\njobs:\n  a:\n    runs-on: ubuntu-latest\n    steps:\n      - run: make\n';
+    const good = `on: pull_request\npermissions: {}\njobs:\n  a:\n    runs-on: ubuntu-latest\n    steps:\n${EGRESS_STEP}\n      - run: make\n`;
+    // a workflow path given as bytes, or a path that isn't text at all
+    await expect(pushProofBranch(s, 'main', [[{ path: Buffer.from('.github/workflows/pipegen-fix.yml'), content: bad }]], opts)).rejects.toThrow(/pipegen-fix\.yml/);
+    await expect(pushProofBranch(s, 'main', [[{ path: Buffer.from('.github/workflows/pipegen-fix.yml'), content: good }]], opts)).rejects.toThrow(/text/);
+    await expect(pushProofBranch(s, 'main', [[{ path: {} as unknown as string, content: good }]], opts)).rejects.toThrow(/path/);
+    // two workflow paths that differ only by case: in one commit, or against the tree the commit builds on
+    await expect(pushProofBranch(s, 'main', [[{ path: '.github/workflows/A.yml', content: good }, { path: '.github/workflows/a.yml', content: good }]], opts)).rejects.toThrow(/case/);
+    await expect(pushProofBranch(s, 'main', [[{ path: '.github/workflows/A.yml', content: bad }, { path: '.github/workflows/a.yml', content: good }]], opts)).rejects.toThrow(/case|A\.yml/);
+    await expect(pushProofBranch(s, 'main', [[{ path: '.github/workflows/PIPEGEN.yml', content: good }]], { ...opts, pipegenWorkflows: new Set([...own, '.github/workflows/PIPEGEN.yml']) })).rejects.toThrow(/case/);
+    expect(heads(f.scratchGit)[mainRef]).toBe(before);
+    expect(pushes()).toBe(n0);
+    await s.remove();
+    await f.close();
+  });
+
   it('planted: variant may carry more than one commit (fast-forward)', async () => {
     const f = await fixture();
     const r = await pushProofSetup(input(f), deps(f).d);
