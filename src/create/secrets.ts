@@ -157,8 +157,9 @@ export class SecretVault implements KnownValueCheck {
     off?.();
   }
   /**
-   * A function that replaces each value, its base64 forms and its URL forms with [REDACTED], also when the text holds the value in the other
-   * Unicode normalisation (NFC or NFD). Built once and kept until the next `set` or `wipe`.
+   * A function that replaces each value, its base64 forms (also inside a longer base64 text), its hex and its URL forms with [REDACTED], also
+   * across line breaks and when the text holds the value in the other Unicode normalisation (NFC or NFD); see knownValueScrubber. Built once
+   * and kept until the next `set` or `wipe`.
    */
   scrubber(): (text: string) => string {
     this.#scrub ??= knownValueScrubber([...new Set([...this.#values.values()].flatMap((b) => { const v = b.toString('utf8'); return [v, v.normalize('NFC'), v.normalize('NFD')]; }))]);

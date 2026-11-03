@@ -185,6 +185,29 @@ function upperPercent(s: string): string {
   return out + s.slice(pos);
 }
 
+/**
+ * Plan E E0a (ruling B1): the hex and shifted-base64 forms are looked for only from this many UTF-8 bytes of a value, the vault's
+ * shortest value (secrets.ts MIN_VALUE_LENGTH; a test keeps them equal). A shorter known value would give needles of a few
+ * characters that ordinary hex or base64 text holds by chance.
+ */
+export const MIN_ENCODED_FORM_BYTES = 8;
+
+/**
+ * Plan E E0a (ruling B1): the base64 characters that depend only on `bytes` when they start at byte offset 0, 1 or 2 of a
+ * longer encoded text (`user:value` in Basic auth, `value:` in Stripe's, a value inside a JSON blob). Sextet j covers bits
+ * [6j, 6j+6) of the whole text, so with the value at bits [8k, 8k+8n) the characters ceil(8k/6) to floor((8k+8n)/6) are the
+ * value's own, whatever comes before or after it; the GitHub runner masks the same core. At most 4 bits of the value stay in
+ * the character on each side of the core.
+ */
+function base64Cores(bytes: Buffer): string[] {
+  const cores: string[] = [];
+  for (const k of [0, 1, 2]) {
+    const enc = Buffer.concat([Buffer.alloc(k), bytes]).toString('base64');
+    cores.push(enc.slice(Math.ceil((8 * k) / 6), Math.floor((8 * k + 8 * bytes.length) / 6)));
+  }
+  return cores;
+}
+
 /** Every form of a typed value that is looked for (see scrubKnownValues). */
 function knownForms(values: string[]): string[] {
   const forms = new Set<string>();
@@ -195,9 +218,16 @@ function knownForms(values: string[]): string[] {
     const lf = crlfOnly.split('\r').join('\n');
     for (const v of new Set([raw, raw.trim(), crlfOnly, crlfOnly.trim(), lf, lf.trim()])) {
       if (v.trim() === '') continue;
-      const b64 = Buffer.from(v, 'utf8').toString('base64');
+      const bytes = Buffer.from(v, 'utf8');
+      const b64 = bytes.toString('base64');
       const urlSafe = b64.replaceAll('+', '-').replaceAll('/', '_');
       forms.add(v).add(b64).add(stripPadding(b64)).add(urlSafe).add(stripPadding(urlSafe));
+      if (bytes.length >= MIN_ENCODED_FORM_BYTES) {
+        // E0a: hex in either case, and the base64 core at byte offsets 0, 1 and 2 (both alphabets)
+        const h = bytes.toString('hex');
+        forms.add(h).add(h.toUpperCase());
+        for (const core of base64Cores(bytes)) forms.add(core).add(core.replaceAll('+', '-').replaceAll('/', '_'));
+      }
       const json = JSON.stringify(v).slice(1, -1); // as written inside a JSON string
       forms.add(json).add(json.replace(/[\u007f-\uffff]/g, (ch) => `\\u${ch.charCodeAt(0).toString(16).padStart(4, '0')}`)); // and ASCII-only JSON
       try {
@@ -220,9 +250,13 @@ function knownForms(values: string[]): string[] {
  * overlapping or touching matches are merged, and each merged span becomes one [REDACTED], so overlapping
  * values cannot leave a piece behind.
  * Percent escapes match in any hex case (`%2f` = `%2F`); encodeURI and ASCII-only JSON (`\u00e9`) forms count too.
- * Known limits (the secret scan is the second line of defence there): the base64 of a value embedded at a
- * non-aligned offset inside a longer base64 blob (e.g. base64 of "user:value"); a value whose own letters
- * changed case; HTML-entity or language-specific escapes (Python `\xe9`).
+ * Plan E E0a (ruling B1), for a value of MIN_ENCODED_FORM_BYTES or more: its hex (lower and upper case) and the base64 core
+ * of the value at byte offset 0, 1 or 2 inside a longer base64 text (`user:value`), both alphabets. Every form is also looked
+ * for across line breaks (LF, CRLF, CR, U+2028, U+2029, with the spaces and tabs next to them): a value split over lines,
+ * and base64 or hex wrapped at fixed columns, is found and replaced together with the breaks inside it.
+ * Known limits (the secret scan is the second line of defence there): a value whose own letters changed case; hex in mixed
+ * case or with separators (`de:ad`); HTML-entity or language-specific escapes (Python `\xe9`); a value split by some other
+ * character (the vault's fullScrub also tries the forms with every control and invisible removed).
  */
 export function scrubKnownValues(text: string, values: string[]): string {
   return knownValueScrubber(values)(text);
@@ -239,17 +273,61 @@ export function knownValueScrubber(values: readonly string[]): (text: string) =>
   return (text) => scrubWith(text, forms, upperForms, anyPercent);
 }
 
+const isBreak = (c: number) => c === 10 || c === 13 || c === 0x2028 || c === 0x2029;
+const isBlank = (c: number) => c === 32 || c === 9;
+
+/**
+ * E0a (ruling B1): `text` with its line breaks taken out (LF, CR, U+2028, U+2029; with `blanks`, also the spaces and tabs
+ * next to each break), and for each character of that view its index in `text`. Null when `text` has no line break. Linear:
+ * each character is kept, skipped or taken back once.
+ */
+function joinedView(text: string, blanks: boolean): { view: string; at: Int32Array } | null {
+  let i = 0;
+  while (i < text.length && !isBreak(code(text, i))) i++;
+  if (i === text.length) return null;
+  const at = new Int32Array(text.length);
+  let n = 0;
+  for (let j = 0; j < text.length; j++) {
+    if (!isBreak(code(text, j))) {
+      at[n++] = j;
+      continue;
+    }
+    if (!blanks) continue;
+    while (n > 0 && isBlank(code(text, at[n - 1] as number))) n--;
+    while (j + 1 < text.length && isBlank(code(text, j + 1))) j++;
+  }
+  let view = '';
+  for (let k = 0; k < n;) {
+    let e = k + 1;
+    while (e < n && at[e] === (at[e - 1] as number) + 1) e++;
+    view += text.slice(at[k], (at[e - 1] as number) + 1);
+    k = e;
+  }
+  return { view, at: at.subarray(0, n) };
+}
+
 function scrubWith(text: string, forms: string[], upperForms: Set<string>, anyPercent: boolean): string {
   const spans: [number, number][] = [];
-  // Spans are found twice and united: on the text as it is (forms as they are), and on a copy with every
-  // %xx in upper case (same length, so the spans apply to the original) against forms normalised the same
-  // way, so percent escapes match in any hex case and a value right after a literal '%' is still found.
-  const hay = upperPercent(text);
-  const searches: [string, Iterable<string>][] = [[text, forms]];
-  if (hay !== text || anyPercent) searches.push([hay, upperForms]);
-  for (const [h, fs] of searches) {
-    for (const f of fs) {
-      for (let i = h.indexOf(f); i >= 0; i = h.indexOf(f, i + 1)) spans.push([i, i + f.length]);
+  // Spans are found on the text as it is (forms as they are), and on a copy with every %xx in upper case (same
+  // length, so the spans apply to the original) against forms normalised the same way, so percent escapes match
+  // in any hex case and a value right after a literal '%' is still found. E0a (ruling B1): both are also searched
+  // in the text with its line breaks taken out (with and without the blanks next to them), and a span found there
+  // is mapped back to the original, line breaks included.
+  const views: { view: string; at: Int32Array | null }[] = [{ view: text, at: null }];
+  for (const blanks of [false, true]) {
+    const j = joinedView(text, blanks);
+    if (j !== null && !views.some((v) => v.view === j.view)) views.push(j);
+  }
+  for (const { view, at } of views) {
+    const hay = upperPercent(view);
+    const searches: [string, Iterable<string>][] = [[view, forms]];
+    if (hay !== view || anyPercent) searches.push([hay, upperForms]);
+    for (const [h, fs] of searches) {
+      for (const f of fs) {
+        for (let i = h.indexOf(f); i >= 0; i = h.indexOf(f, i + 1)) {
+          spans.push(at === null ? [i, i + f.length] : [at[i] as number, (at[i + f.length - 1] as number) + 1]);
+        }
+      }
     }
   }
   if (spans.length === 0) return text;
