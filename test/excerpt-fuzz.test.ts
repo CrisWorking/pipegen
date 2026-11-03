@@ -265,3 +265,95 @@ describe('excerpt fuzz, vault mode (E0a fix round 1)', () => {
     expect(byForm.size).toBe(8);
   }, 900_000);
 });
+
+// ---------- wide vault mode (fix round 2, review-E0a-r1.md) ----------
+
+const PUNCT = '_-+/=.~!@#$%^*:;,?';
+const PREFIXES: ((i: number) => string)[] = [(i) => `#7 0.${300 + i} `, () => 'api-1  | ', () => 'app:build: '];
+
+interface WideCase { log: string; value: string; windows: string[]; form: string; pieces: number; prefixed: boolean; inserted: number }
+
+/**
+ * The reviewer's shapes: values of 8-48 characters with punctuation (12 %), as typed, URL-encoded, JSON-escaped, in a Basic auth header
+ * (split into 1-3 pieces over lines), or as the base64 or hex of a longer text that holds the value at any byte offset, wrapped at
+ * 32/60/64/76 columns; a per-line prefix (buildkit, docker compose, turbo) on 40 % of logs; insertions in half of them; the error line
+ * 0-8 lines away. `windows`: 8 characters of the value, or 12 of its encoded core (its edges aside).
+ */
+function makeWideCase(rnd: () => number): WideCase {
+  const int = (n: number) => Math.floor(rnd() * n);
+  const pick = <T>(xs: readonly T[]): T => xs[int(xs.length)] as T;
+  const value = Array.from({ length: 8 + int(41) }, () => (rnd() < 0.12 ? PUNCT[int(PUNCT.length)] : VALUE_CHARS[int(62)])).join('');
+  const form = pick(['raw', 'url', 'json', 'basic', 'b64blob', 'hexblob'] as const);
+  let lines: string[];
+  let windows: string[];
+  let pieces = 1;
+  if (form === 'b64blob' || form === 'hexblob') {
+    const before = Array.from({ length: int(40) }, () => VALUE_CHARS[int(62)]).join('');
+    const blob = Buffer.from(`${before}${value}${'x'.repeat(int(30))}`, 'utf8');
+    const off = Buffer.byteLength(before);
+    const n = Buffer.byteLength(value);
+    const enc = form === 'b64blob' ? blob.toString('base64') : blob.toString('hex');
+    const core = form === 'b64blob' ? enc.slice(Math.ceil((8 * off) / 6) + 1, Math.floor((8 * (off + n)) / 6) - 1) : enc.slice(2 * off + 2, 2 * (off + n) - 2);
+    lines = enc.match(new RegExp(`.{1,${pick([32, 60, 64, 76])}}`, 'g')) as string[];
+    pieces = lines.length;
+    windows = Array.from({ length: Math.max(0, core.length - 11) }, (_, i) => core.slice(i, i + 12));
+  } else {
+    const text = form === 'url' ? encodeURIComponent(value) : form === 'json' ? JSON.stringify(value).slice(1, -1) : value;
+    const head = form === 'basic' ? ['Authori', 'zation: Bas', 'ic '].join('') : pick(VALUE_PREFIXES);
+    const whole = form === 'basic' ? `${head}${Buffer.from(`user:${value}`).toString('base64')}` : `${head}${text} rejected`;
+    pieces = 1 + int(3);
+    const cuts = Array.from({ length: pieces - 1 }, () => head.length + 1 + int(Math.max(1, whole.length - head.length - 2))).sort((a, b) => a - b);
+    lines = [];
+    let at = 0;
+    for (const c of [...cuts, whole.length]) { lines.push(whole.slice(at, Math.max(at, c))); at = Math.max(at, c); }
+    const basicCore = Buffer.from(`user:${value}`).toString('base64');
+    windows = form === 'basic' ? Array.from({ length: Math.max(0, basicCore.length - 21) }, (_, i) => basicCore.slice(i + 8, i + 20))
+      : Array.from({ length: Math.max(0, value.length - 7) }, (_, i) => value.slice(i, i + 8));
+  }
+  let inserted = 0;
+  if (rnd() < 0.5) {
+    const ins = insertionPieces(rnd);
+    for (let k = 1 + int(3); k > 0; k--, inserted++) {
+      const i = int(lines.length);
+      const l = lines[i] as string;
+      const pos = int(l.length + 1);
+      lines[i] = l.slice(0, pos) + pick(ins)() + l.slice(pos);
+    }
+  }
+  const prefixed = rnd() < 0.4;
+  const prefix = pick(PREFIXES);
+  const filler = (n: number, tag: string) => Array.from({ length: n }, (_, i) => `${tag} step ${i} ok`);
+  const d = int(9);
+  const errorFirst = rnd() < 0.5;
+  const before = errorFirst ? [...filler(int(8), 'a'), 'Error: request failed', ...filler(d, 'b')] : filler(int(8), 'a');
+  const after = errorFirst ? filler(int(8), 'c') : [...filler(d, 'c'), 'Error: request failed', ...filler(int(8), 'd')];
+  const all = [...before, ...lines, ...after].map((l, i) => (prefixed ? prefix(i) + l : l));
+  return { log: all.join('\n'), value, windows, form, pieces, prefixed, inserted };
+}
+
+describe('excerpt fuzz, wide vault mode (E0a fix round 2)', () => {
+  it(`excerpt fuzz: no structural split leaks (prefixes, 3 pieces, wrapped blobs, punctuation); split + insertion leaks are counted (${CASES} cases, seed ${SEED + 2})`, () => {
+    const rnd = mulberry32(SEED + 2);
+    const counts = new Map<string, { cases: number; leaks: number }>();
+    for (let c = 0; c < CASES; c++) {
+      const kase = makeWideCase(rnd);
+      const cls = `${kase.form}/${kase.pieces > 2 ? '3+' : kase.pieces} pieces/${kase.prefixed ? 'prefixed' : 'plain'}/${kase.inserted > 0 ? 'inserted' : 'clean'}`;
+      const st = counts.get(cls) ?? { cases: 0, leaks: 0 };
+      counts.set(cls, st);
+      st.cases++;
+      const v = new SecretVault();
+      v.set('K_VALUE', kase.value);
+      const out = unscannedExcerpt(kase.log, v.scrubber()).join('\n');
+      v.wipe();
+      const hits = kase.windows.filter((w) => out.includes(w));
+      if (hits.length === 0) continue;
+      st.leaks++;
+      // structure alone (no inserted character) must never leak; with insertions the leaks are recorded limits (ruling E0a-R5)
+      if (kase.inserted === 0) expect.fail(`wide case ${c} (${cls}, seed ${SEED + 2}) leaked ${JSON.stringify(hits.slice(0, 3))}; log ${JSON.stringify(kase.log.slice(-900))}; excerpt ${JSON.stringify(out.slice(0, 600))}`);
+    }
+    if (process.env.PIPEGEN_E0A_FUZZ_REPORT !== undefined) {
+      writeFileSync(`${process.env.PIPEGEN_E0A_FUZZ_REPORT}.wide`, `${[...counts].sort().map(([k, s]) => `${k}: ${s.cases} cases, ${s.leaks} leaked`).join('\n')}\n`);
+    }
+    expect(counts.size).toBeGreaterThan(20);
+  }, 900_000);
+});

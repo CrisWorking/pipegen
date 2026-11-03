@@ -20,7 +20,9 @@
 // is picked. Where a line can't be read for sure, it is hidden rather than read again in a new way (ruling E0a-R4): less context for
 // the AI, never a leak.
 // The secret scan runs a process, so errorExcerpt is async and takes the pinned scanner (ruling E0a-R3); any throw means nothing may be
-// sent.
+// sent. The boundary that keeps typed values out is structural (ruling E0a-R5, DECISIONS #113): errorExcerpt requires evidence that the
+// run held only placeholders or throwaway keys, so no typed value is in the log at all; the rules below are defence in depth, and the
+// shapes they still miss are recorded limits.
 import { createHash, randomBytes } from 'node:crypto';
 import { MAX_REGEX_LINE_BYTES } from '../ai/redact-core.js';
 import { redact, secretScanText, type SecretScanner } from '../ai/redact.js';
@@ -44,7 +46,7 @@ export const EXCERPT_WITHHELD = '[log excerpt withheld: the secret scan found so
  * is hidden up to the block's END line, or with no END while it looks like armor; armor-shaped lines at the start of a tail are hidden
  * anyway. The caller (E7) must also bound the log it holds: this cap applies to what it passes.
  */
-export const MAX_LOG_CHARS = 4 * 1024 * 1024;
+export const MAX_LOG_CHARS = 1024 * 1024;
 const HEAD_GUARD_LINES = 64;
 const HEAD_KEY_LINES = 1024;
 /** Readings probed with redact at most: past this many, the log is mostly garbage and the excerpt is empty (fail closed). */
@@ -185,6 +187,12 @@ function readings(line: string): string[] {
 }
 /** A word of a key name in a reading of a messy line, either one, any case (ruling E0a-R1). */
 const NAMES_KEY = /private|key/i;
+/**
+ * Fix round 2 (q3): a messy line whose reading starts with `[` and holds a word of a secret name (redact-core's isSecretName words, a
+ * superset) before its first `]`, or with no `]` at all, opens a secret section: an escape can eat the header's `]` or `[`. Anchored, one
+ * `[^\]]*` run before the words: linear (lines within MAX_REGEX_LINE_BYTES only).
+ */
+const SECRET_IN_HEADER = /^[ \t]*\[[^\]]*(?:password|passwd|pwd|secret|token|api[_-]?key|private[_-]?key|access[_-]?key|client[_-]?secret|auth|credential)/i;
 // Garbage before the first printable character: past the leading blanks and SGR colour codes (a colour code before the text is the
 // usual case, and swallows nothing; another CSI's intermediates can be the indentation's spaces), a character that isn't printable: an
 // OSC or another sequence, a C1, a control, LS/PS or an invisible, any of which can have swallowed the indentation. The prefix is taken
@@ -328,8 +336,8 @@ interface Read {
   header: boolean;
   /** Garbage before its first printable character: its indentation can't be trusted (an inserted sequence can swallow it). */
   indentUnsure: boolean;
-  /** A messy line that may open a secret section: a reading shaped like a header, a `[` in one reading and a `]` ending one, or
-   *  (dropped) any `[...]`. */
+  /** A messy line that may open a secret section: a reading shaped like a header or starting with `[` and a secret word before any
+   *  `]` (SECRET_IN_HEADER), a `[` in one reading and a `]` ending one, or (dropped) any `[...]`. */
   bracket: boolean;
 }
 
@@ -376,7 +384,7 @@ function readLine(raw: string): Read {
     blank: all.length === 0 || all.some((r) => r.trim() === ''),
     header: all.length > 0 && all.every((r) => SECTION_HEADER.test(r)),
     indentUnsure: suspect && indentIsUnsure(c.before ?? c.line),
-    bracket: messy && (all.some((r) => (bytesOf(r) <= MAX_REGEX_LINE_BYTES && SECTION_HEADER.test(r)) || (c.drop && bracketPair(r)))
+    bracket: messy && (all.some((r) => (bytesOf(r) <= MAX_REGEX_LINE_BYTES && (SECTION_HEADER.test(r) || SECRET_IN_HEADER.test(r))) || (c.drop && bracketPair(r)))
       || (all.some((r) => r.includes('[')) && all.some((r) => r.trimEnd().endsWith(']')))),
   };
 }
@@ -509,6 +517,37 @@ function headLeavesKeyOpen(head: string): 'opened' | 'named' | null {
   return open;
 }
 
+/** `line` with its first `n` blank-separated tokens (and the blanks after them) taken off. Linear. */
+function dropTokens(line: string, n: number): string {
+  let i = 0;
+  const blank = (k: number) => line[k] === ' ' || line[k] === '\t';
+  while (i < line.length && blank(i)) i++;
+  for (let t = 0; t < n && i < line.length; t++) {
+    while (i < line.length && !blank(i)) i++;
+    while (i < line.length && blank(i)) i++;
+  }
+  return line.slice(i);
+}
+/** Leading tokens the canonical passes drop at most: a per-line prefix such as buildkit's `#7 0.300`, `api-1  |` or `app:build:`. */
+const MAX_PREFIX_TOKENS = 3;
+
+/**
+ * Fix round 2 (q1, q5): the canonical passes. Every line as shown (a dropped line as its first reading), with every non-printable taken
+ * out (tabs, invisibles, LS/PS), is scrubbed over the whole log across lines, as it is and with its first 1 to MAX_PREFIX_TOKENS tokens
+ * dropped (a container or monorepo tool's per-line prefix between two pieces of a wrapped value). Every line of a merged group is hidden.
+ * Null when a pass can't map its output (fail closed).
+ */
+function canonicalPasses(lines0: Read[], scrub: (text: string) => string): Uint8Array | null {
+  const hide = new Uint8Array(lines0.length);
+  const canon = lines0.map((r) => stripChars(r.shown ?? r.rep).replace(LINE_SEPS, ''));
+  for (let n = 0; n <= MAX_PREFIX_TOKENS; n++) {
+    const res = scrubLines(n === 0 ? canon : canon.map((l) => dropTokens(l, n)), scrub);
+    if (res === null) return null;
+    for (const group of res.from) if (group.length > 1) for (const i of group) hide[i] = 1;
+  }
+  return hide;
+}
+
 /** Whether `text` ends inside a private key block: its last key marker is a BEGIN. Each line is looked at once, from the end. */
 function endsInsideKey(text: string): boolean {
   for (let to = text.length; to > 0;) {
@@ -551,6 +590,8 @@ export function unscannedExcerpt(logs: string, scrub: (text: string) => string, 
   //   payload can stand between two pieces of a value, the value passes pair forms index by index), so a value split across the two
   //   lines can't be checked;
   // - a value pass (valuePasses) finds part of a value in it, alone or with a neighbour (fix round 1, C1(a) and I1);
+  // - a canonical pass (canonicalPasses) finds a value across it and other lines, with non-printables out and up to MAX_PREFIX_TOKENS
+  //   leading tokens dropped (fix round 2: a value wrapped under per-line prefixes, or over 3 or more lines);
   // - redact, on one of its readings apart from the log (probeReadings), hides something on it;
   // - it is in a block, section or key a line before it opened:
   //   - an indented-value block: opened by a reading redact sees as one, or by any messy line (an inserted sequence can swallow a
@@ -594,7 +635,8 @@ export function unscannedExcerpt(logs: string, scrub: (text: string) => string, 
   if (jobs.length > MAX_PROBES) return [];
   const probes = probeReadings(jobs);
   const valueHide = valuePasses(lines0, scrub);
-  if (valueHide === null) return [];
+  const canonHide = canonicalPasses(lines0, scrub);
+  if (valueHide === null || canonHide === null) return [];
   // armor-shaped in some reading, or (a suspect line) its scrubbed readings hold a long base64 run (a sequence can leave a body line's
   // rest in no shape)
   const armorish = Uint8Array.from(lines0, (r, i) => (r.armor || (r.suspect && (jobOf[i] as number[]).some((j) => LONG_RUN.test(jobs[j] as string))) ? 1 : 0));
@@ -618,7 +660,7 @@ export function unscannedExcerpt(logs: string, scrub: (text: string) => string, 
     else armor = true;
   }
   const hiddenAt = lines0.map((r, i) => {
-    let hidden = r.shown === null || i <= hideTo || i < guard || valueHide[i] === 1
+    let hidden = r.shown === null || i <= hideTo || i < guard || valueHide[i] === 1 || canonHide[i] === 1
       || [i - 1, i + 1].some((j) => {
         // a messy (or dropped) line, or a messy neighbour: no reading of a messy line can be trusted (two insertions can need opposite
         // readings, a sequence's payload can stand between two pieces of a value), so a long enough token at the shared edge may be a piece
@@ -683,11 +725,28 @@ export function unscannedExcerpt(logs: string, scrub: (text: string) => string, 
 }
 
 /**
- * The excerpt of a failing CI log that the fix loop may send to the AI (ruling B1; the steps are in this file's header). `scrub` is the
- * composed known-value scrubber. Throws SecretScanError when the secret scan can't run or does not confirm it read the excerpt: then
- * nothing may be sent.
+ * Ruling E0a-R5 (DECISIONS #113), the structural boundary: an excerpt is only ever built from a run whose scratch secrets were all
+ * placeholders or pipegen's throwaway keys, never from a run that held a value the user typed. E4/E7 supply this from the ScratchKeys
+ * state of the run the log comes from; a part that fails only once real keys are in place is classified locally and never goes to the
+ * AI. The literal type is the evidence; errorExcerpt checks it at run time too, so a cast can't get past it.
  */
-export async function errorExcerpt(logs: string, scrub: (text: string) => string, scanner: SecretScanner, opts: { timeoutMs?: number } = {}): Promise<string> {
+export interface ExcerptEvidence { readonly secretsMode: 'placeholders' }
+
+/** Throws unless `evidence` is a plain object whose own `secretsMode` is exactly 'placeholders' (E0a-R5). */
+function checkEvidence(evidence: unknown): void {
+  const ok = typeof evidence === 'object' && evidence !== null && Object.prototype.hasOwnProperty.call(evidence, 'secretsMode')
+    && (evidence as { secretsMode: unknown }).secretsMode === 'placeholders';
+  if (!ok) throw new Error('errorExcerpt needs evidence that the run held only placeholders or throwaway keys ({ secretsMode: \'placeholders\' }, ruling E0a-R5); nothing was built.');
+}
+
+/**
+ * The excerpt of a failing CI log that the fix loop may send to the AI (ruling B1; the steps are in this file's header). `scrub` is the
+ * composed known-value scrubber; `evidence` is ruling E0a-R5's (checked first, before any work). The vault scrub, redact and the secret
+ * scan stay as defence in depth. Throws when the evidence is wrong, or SecretScanError when the secret scan can't run or does not confirm
+ * it read the excerpt: on any throw nothing may be sent.
+ */
+export async function errorExcerpt(logs: string, scrub: (text: string) => string, scanner: SecretScanner, evidence: ExcerptEvidence, opts: { timeoutMs?: number } = {}): Promise<string> {
+  checkEvidence(evidence);
   let lines = unscannedExcerpt(logs, scrub);
   if (lines.length === 0) return '';
   // step 7

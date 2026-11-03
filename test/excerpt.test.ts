@@ -6,12 +6,20 @@ import { createHash } from 'node:crypto';
 import { afterEach, describe, expect, it } from 'vitest';
 import { knownValueScrubber, LONG_LINE, SecretScanError, secretScanText } from '../src/ai/redact.js';
 import { SecretVault } from '../src/create/secrets.js';
-import { EXCERPT_CONTEXT_LINES, EXCERPT_MAX_BYTES, EXCERPT_MAX_LINES, EXCERPT_WITHHELD, errorExcerpt, errorSignature, MAX_LOG_CHARS, unscannedExcerpt } from '../src/proof/excerpt.js';
+import {
+  EXCERPT_CONTEXT_LINES, EXCERPT_MAX_BYTES, EXCERPT_MAX_LINES, EXCERPT_WITHHELD, errorExcerpt as errorExcerptWithEvidence, type ExcerptEvidence, errorSignature,
+  MAX_LOG_CHARS, unscannedExcerpt,
+} from '../src/proof/excerpt.js';
 import { betterleaksAt, CLEAN, gitleaksAt, makeStub } from './helpers/gitleaks-stub.js';
 import { cleanupRepos } from './helpers/make-repo.js';
 import { fake } from './helpers/secret-repo.js';
 
 afterEach(() => cleanupRepos());
+
+// ruling E0a-R5: every excerpt here is built from a placeholders-only run (the key is built at runtime: test/no-secret-literals.test.ts)
+const PLACEHOLDERS_ONLY = { [['secrets', 'Mode'].join('')]: 'placeholders' } as unknown as ExcerptEvidence;
+const errorExcerpt = (logs: string, scrub: (t: string) => string, scanner: Parameters<typeof errorExcerptWithEvidence>[2], opts?: { timeoutMs?: number }) =>
+  errorExcerptWithEvidence(logs, scrub, scanner, PLACEHOLDERS_ONLY, opts);
 
 const R = '[REDACTED]';
 // built at runtime: no secret-looking literal is committed (test/no-secret-literals.test.ts)
@@ -345,7 +353,7 @@ describe('errorExcerpt: scrub before cutting (E0a)', () => {
   it('excerpt: ruling E0a-R1: unterminated C1 OSC introducers stay linear (64 KiB line, and many 4 KB lines)', async () => {
     const v = vault();
     // 2,040 of them are 4,080 UTF-8 bytes: under the 4 KB guard, so the whole-sequence reading does run on them
-    for (const log of [`Error: x\n${'\u009d'.repeat(64 * 1024)}`, `Error: x\n${Array.from({ length: 1000 }, () => '\u009d'.repeat(2040)).join('\n')}`]) {
+    for (const log of [`Error: x\n${'\u009d'.repeat(64 * 1024)}`, `Error: x\n${Array.from({ length: 400 }, () => '\u009d'.repeat(2040)).join('\n')}`]) {
       const t0 = performance.now();
       const out = await errorExcerpt(log, composed(v), clean());
       expect(performance.now() - t0).toBeLessThan(2000);
