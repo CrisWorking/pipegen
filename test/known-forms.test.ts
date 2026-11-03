@@ -68,9 +68,17 @@ describe('known-values: forms for the log excerpt (E0a, B1)', () => {
         }
       }
     }
-    // the URL-safe alphabet too
-    const urlSafe = b64(`user:${VALUE}?`).replaceAll('+', '-').replaceAll('/', '_');
-    expect(decodablePieces(v.scrubber()(`t=${urlSafe}`), VALUE)).toEqual([]);
+    // the URL-safe alphabet too, with a value whose base64 core holds + and / at every offset
+    const odd = 'Zq7Rk2mW?>~Hy6Vb3Nc>>?';
+    const w = vault(odd);
+    for (const prefix of ['', 'u', 'us']) {
+      const urlSafe = b64(`${prefix}${odd}!`).replaceAll('+', '-').replaceAll('/', '_');
+      expect(urlSafe).toMatch(/[-_]/);
+      const out = w.scrubber()(`t=${urlSafe}`);
+      expect(out, prefix).toContain(R);
+      expect(decodablePieces(out.replaceAll('-', '+').replaceAll('_', '/'), odd), prefix).toEqual([]);
+    }
+    w.wipe();
     v.wipe();
   });
 

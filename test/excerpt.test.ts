@@ -20,6 +20,7 @@ const PLACEHOLDER = 'pipegen-placeholder-' + 'STRIPE_SECRET_KEY-0f3a9c';
 const THROWAWAY = 'b'.repeat(8) + '9e1d7c55aa04f3b2c8d6e0f1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5';
 const TS = '2026-11-03T10:00:00.1234567Z ';
 const ESC = '\u001b';
+const CFG_LINE = ['pass', 'word', ':'].join('');
 
 function vault(): SecretVault {
   const v = new SecretVault();
@@ -189,6 +190,39 @@ describe('errorExcerpt: scrub before cutting (E0a)', () => {
     const v = vault();
     const body = Array.from({ length: 20 }, (_, i) => `${fake.keyBody()}${String(i).padStart(2, '0')}`);
     const log = [`${TS}${fake.keyBegin()}`, ...body.map((b) => `${TS}${b}`), `${TS}${fake.keyEnd()}`, `${TS}Error: key rejected`].join('\n');
+    const out = await errorExcerpt(log, composed(v), clean());
+    expect(out).toContain('Error: key rejected');
+    for (const b of body) expect(out).not.toContain(b);
+    v.wipe();
+  });
+
+  it('excerpt: an ESC on a key\'s BEGIN line does not uncover the key body (lines are dropped after redact, not before)', async () => {
+    const v = vault();
+    const body = Array.from({ length: 12 }, (_, i) => `${fake.keyBody()}${String(i).padStart(2, '0')}`);
+    const begin = fake.keyBegin();
+    const cut = begin.indexOf(' ') + 1;
+    for (const first of [`${ESC}(B${begin}`, `${begin}${ESC}7`, `${begin.slice(0, cut)}${ESC}(B${begin.slice(cut)}`, `\u009b${begin}`]) {
+      const log = [`${TS}${first}`, ...body.map((b) => `${TS}${b}`), `${TS}${fake.keyEnd()}`, `${TS}Error: key rejected`].join('\n');
+      const out = await errorExcerpt(log, composed(v), clean());
+      expect(out, JSON.stringify(first)).toContain('Error: key rejected');
+      for (const b of body) expect(out, JSON.stringify(first)).not.toContain(b);
+    }
+    // an ESC inside an indented secret block keeps the block hidden (redact's indent rule still sees the line)
+    const block = [`${TS}${CFG_LINE}`, `${TS}  ${ESC}(Bfirst-hidden-line`, `${TS}  second-hidden-line`, `${TS}Error: bad config`].join('\n');
+    const blockOut = await errorExcerpt(block, composed(v), clean());
+    expect(blockOut).toContain('Error: bad config');
+    expect(blockOut).not.toContain('second-hidden-line');
+    v.wipe();
+  });
+
+  it('excerpt: a cut inside a 200-line key block hides the block up to its END, whatever the head guard', async () => {
+    const v = vault();
+    const body = Array.from({ length: 200 }, (_, i) => `${fake.keyBody()}${String(i).padStart(3, '0')}`);
+    const after = [fake.keyEnd(), 'Error: key rejected'];
+    // the cut lands after body line 49: lines 50-199 (150 lines, past the 64-line guard) are in the tail
+    const kept = [...body.slice(50), ...after].join('\n');
+    const filler = 'f'.repeat(MAX_LOG_CHARS - kept.length - 2);
+    const log = ['ok start', fake.keyBegin(), ...body, ...after, filler].join('\n');
     const out = await errorExcerpt(log, composed(v), clean());
     expect(out).toContain('Error: key rejected');
     for (const b of body) expect(out).not.toContain(b);

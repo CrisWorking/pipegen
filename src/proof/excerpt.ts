@@ -5,7 +5,10 @@
 // errorExcerpt runs the ruling's seven steps in order:
 //   1. the GitHub timestamp prefix (and a leading BOM) is taken off each line;
 //   2. whole ANSI CSI and OSC sequences are removed;
-//   3. a line that still holds ESC or a C1 control is dropped (with a vault, fullScrub would show the whole excerpt as one [REDACTED]);
+//   3. a line that still holds ESC or a C1 control is dropped (with a vault, fullScrub would show the whole excerpt as one [REDACTED]),
+//      and so are the armor-shaped lines right after it (a private key body). A dropped line stays in place, tagged, through the
+//      whole-log scrub and redact below and goes only after them, so redact still sees a BEGIN line or a `password:` line that held
+//      an ESC (security scan finding 1);
 //   4. the error lines and EXCERPT_CONTEXT_LINES around each are picked, at most EXCERPT_MAX_LINES lines and EXCERPT_MAX_BYTES;
 //   5. Plan A redact;
 //   6. the composed scrubber (the caller's: vault.scrubber() then knownValueScrubber over the placeholders and the throwaway scratch
@@ -17,7 +20,7 @@
 // the edge of a picked window, or a private key whose BEGIN line is outside it, is gone before any line is picked.
 // The secret scan runs a process, so errorExcerpt is async and takes the pinned scanner: the ruling's `(logs, scrub): string` can't
 // run step 7.
-import { createHash } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
 import { MAX_REGEX_LINE_BYTES } from '../ai/redact-core.js';
 import { redact, secretScanText, type SecretScanner } from '../ai/redact.js';
 import { LATE_MAGIC, SCAN_PREFIX, scannersWouldSkip } from '../ai/scan-staging.js';
@@ -35,7 +38,9 @@ export const EXCERPT_TAIL_LINES = 30;
 export const EXCERPT_WITHHELD = '[log excerpt withheld: the secret scan found something it could not place on a line]';
 /**
  * Only the last this many UTF-16 units of a log are read (cut at a line start). The first HEAD_GUARD_LINES lines after such a cut are
- * never shown: a value or key block split across the cut has its other part outside what the scrubber and redact saw.
+ * never shown: a value split across the cut has its other part outside what the scrubber saw. A private key block is not left to that
+ * count (security scan finding 2): when the cut-off head ends inside a key block, the tail is hidden up to the block's END line (with no
+ * END in the tail, up to the first line that isn't armor-shaped), and armor-shaped lines at the start of the tail are hidden anyway.
  */
 export const MAX_LOG_CHARS = 4 * 1024 * 1024;
 const HEAD_GUARD_LINES = 64;
@@ -57,14 +62,50 @@ const marker = (n: number) => `[… ${n} line${n === 1 ? '' : 's'} not shown …
 /** The largest a marker line can be (it counts toward the byte cap before the real one is known). */
 const MARKER_BYTES = bytesOf(marker(Number.MAX_SAFE_INTEGER)) + 1;
 
-/** Steps 1-3 on one line: null when the line is dropped. */
-function cleanLine(raw: string): string | null {
+/** Steps 1-2 on one line, and whether step 3 drops it (it still holds ESC or a C1 control). */
+function cleanLine(raw: string): { line: string; drop: boolean } {
   let line = raw.endsWith('\r') ? raw.slice(0, -1) : raw;
   if (line.startsWith('\ufeff')) line = line.slice(1);
   line = line.replace(TIMESTAMP, '');
   if (line.includes('\u001b')) line = line.replace(OSC, '').replace(CSI, '');
-  return holdsEscape(line) ? null : line;
+  return { line, drop: holdsEscape(line) };
 }
+
+// Private key markers as Plan A redact finds them (redact-core.ts findKeyMarker: `-----BEGIN [A-Z ]*PRIVATE KEY-----`, or `PRIVATE KEY
+// BLOCK`, or END). A copy: that function is not exported, and redact-core.ts is in the gate bundle, so it is left untouched.
+const KEY_TAILS = ['PRIVATE KEY', 'PRIVATE KEY BLOCK'];
+/** The start of the last `kind` key marker in `line`, or -1. Linear: each `-----BEGIN ` is looked at once. */
+function lastKeyMarker(line: string, kind: 'BEGIN' | 'END'): number {
+  const head = `-----${kind} `;
+  let last = -1;
+  for (let i = line.indexOf(head); i >= 0; i = line.indexOf(head, i + 1)) {
+    let j = i + head.length;
+    while (j < line.length && (line[j] === ' ' || (line[j] as string >= 'A' && line[j] as string <= 'Z'))) j++;
+    if (KEY_TAILS.some((t) => line.slice(i + head.length, j).endsWith(t)) && line.startsWith('-----', j)) last = i;
+  }
+  return last;
+}
+
+/** Whether `text` ends inside a private key block: its last key marker is a BEGIN. Each line is looked at once, from the end. */
+function endsInsideKey(text: string): boolean {
+  for (let to = text.length; to > 0;) {
+    const k = text.lastIndexOf('PRIVATE KEY', to - 1);
+    if (k < 0) return false;
+    const from = text.lastIndexOf('\n', k) + 1;
+    const end = text.indexOf('\n', k);
+    const line = text.slice(from, end < 0 ? text.length : end);
+    const begin = lastKeyMarker(line, 'BEGIN');
+    const close = lastKeyMarker(line, 'END');
+    if (begin >= 0 || close >= 0) return begin > close;
+    to = from;
+  }
+  return false;
+}
+
+// A line of a private key body as PEM or PGP armor writes it: base64 (64 columns; the last line shorter, maybe with padding), or one of
+// its headers. Anchored, one class per run: linear.
+const ARMOR = /^[ \t]*(?:[A-Za-z0-9+/]{16,}={0,2}|[A-Za-z0-9+/]+={1,2}|(?:Proc-Type|DEK-Info|Version|Comment|Hash):.*)[ \t]*$/;
+const isArmor = (line: string) => bytesOf(line) > MAX_REGEX_LINE_BYTES || ARMOR.test(line) || lastKeyMarker(line, 'END') >= 0;
 
 /**
  * Step 4: the error windows (or the end of the log), in line order, with a marker for every gap between two of them. A window that
@@ -157,19 +198,38 @@ function lineAtMagic(lines: string[]): number {
 export async function errorExcerpt(logs: string, scrub: (text: string) => string, scanner: SecretScanner, opts: { timeoutMs?: number } = {}): Promise<string> {
   let text = String(logs);
   let guard = 0;
+  let cut = false;
+  let insideKey = false;
   if (text.length > MAX_LOG_CHARS) {
     const from = text.indexOf('\n', text.length - MAX_LOG_CHARS);
+    insideKey = endsInsideKey(from < 0 ? text : text.slice(0, from));
     text = from < 0 ? '' : text.slice(from + 1);
     guard = HEAD_GUARD_LINES;
+    cut = true;
   }
-  // steps 1-3
-  const cleaned: string[] = [];
-  for (const raw of text.split('\n')) {
-    const line = cleanLine(raw);
-    if (line !== null) cleaned.push(line);
-  }
-  // scrub before cutting: the whole cleaned log, before any line is picked (merged lines only lower the count, so the guard still covers)
-  const whole = redact(scrub(cleaned.join('\n'))).split('\n').slice(guard);
+  // steps 1-3. A dropped line is kept in place for now, with ESC and C1 taken out and a random tag after its indentation and at its end
+  // (so redact's indent and key rules still see it, and every piece of it redact keeps carries a tag); it goes after the whole-log pass.
+  const tag = `\u0000pipegen-dropped-${randomBytes(8).toString('hex')}\u0000`;
+  const rawLines = text.split('\n');
+  // a cut inside a key block: hidden up to its END line, or (no END in the tail) while the lines look like armor
+  let hideTo = -1;
+  if (insideKey) hideTo = rawLines.findIndex((l) => lastKeyMarker(l, 'END') >= 0);
+  let armor = cut && hideTo < 0;
+  const cleaned = rawLines.map((raw, i) => {
+    const { line, drop } = cleanLine(raw);
+    let hidden = drop || i <= hideTo;
+    if (drop) armor = true;
+    else if (armor && i > hideTo) {
+      if (isArmor(line)) hidden = true;
+      if (!isArmor(line) || lastKeyMarker(line, 'END') >= 0) armor = false;
+    }
+    if (!hidden) return line;
+    const indent = /^[ \t]*/.exec(line)?.[0] ?? '';
+    return `${indent}${tag}${line.slice(indent.length).replace(/[\u001b\u0080-\u009f]/g, '')}${tag}`;
+  });
+  // scrub before cutting: the whole cleaned log, before any line is picked (merged lines only lower the count, so the guard still covers);
+  // then every line that still carries the tag goes
+  const whole = redact(scrub(cleaned.join('\n'))).split('\n').slice(guard).filter((l) => !l.includes(tag));
   // step 4
   const picked = pick(whole);
   if (picked.length === 0) return '';
