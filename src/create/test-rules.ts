@@ -98,20 +98,18 @@ export function starterOwner(path: string, serviceRoots: readonly string[]): { r
   return best;
 }
 
-/** The names under `dependencies` of a package.json text (valid npm names only); an unreadable text gives none (fail closed). */
-export function dependencyNames(packageJson: string): string[] {
-  try {
-    const pkg = JSON.parse(packageJson) as unknown;
-    const deps = typeof pkg === 'object' && pkg !== null ? (pkg as { dependencies?: unknown }).dependencies : undefined;
-    if (typeof deps !== 'object' || deps === null || Array.isArray(deps)) return [];
-    return Object.keys(deps).filter((n) => NPM_NAME_RE.test(n));
-  } catch { return []; }
-}
+/**
+ * D7-R7: why no AI-written test runs yet. The validator is defense in depth, not the boundary; the boundary is Plan G's isolated starter-test job. The
+ * producer (tests.ts), the referee's judge (created-judges/tests.ts) and the guard all refuse a starter test unless their caller passes
+ * `isolatedTestJob: true`, and they say it with these words.
+ */
+export const STARTER_TESTS_NOT_ISOLATED = 'pipegen runs AI-written tests only in an isolated CI job (no secrets, no network, read-only token), and that job is not set up in this version';
+/** The judge's and the guard's refusal of one starter-test file without the isolated job. */
+export const STARTER_TEST_FILE_NOT_ISOLATED = `${STARTER_TESTS_NOT_ISOLATED}, so this starter test is not written (its tests are not proven)`;
 /** The module type of a package.json text: `module` only when "type" is exactly "module"; an unreadable text is `commonjs` (both readings are then checked). */
 export function packageModuleType(packageJson: string): 'module' | 'commonjs' {
   try { const pkg = JSON.parse(packageJson) as { type?: unknown } | null; return typeof pkg === 'object' && pkg !== null && pkg.type === 'module' ? 'module' : 'commonjs'; } catch { return 'commonjs'; }
 }
-const NPM_NAME_RE = /^(?:@[a-z0-9][a-z0-9._-]{0,213}\/)?[a-z0-9][a-z0-9._-]{0,213}$/;
 
 // ---------- the tables ----------
 
@@ -264,10 +262,10 @@ export interface TestFileReport {
 const show = (s: string, max = 60): string => activeSafeText(s, max);
 
 /**
- * Judges one file of a service. `rel` is the path inside the service (its folder resolves the relative imports; its name says whether tests are required),
- * `deps` is ignored: a package is never importable, not even a dependency of the service (S9 amended, D7 round 3). Never throws for any content.
+ * Judges one file of a service. `rel` is the path inside the service (its folder resolves the relative imports; its name says whether tests are required).
+ * No package is importable, not even a dependency of the service (S9 amended, D7 round 3). Never throws for any content.
  */
-export function analyzeTestFile(rel: string, content: string, deps: readonly string[], moduleType: 'module' | 'commonjs' = 'commonjs'): TestFileReport {
+export function analyzeTestFile(rel: string, content: string, moduleType: 'module' | 'commonjs' = 'commonjs'): TestFileReport {
   const fail = (why: string): TestFileReport => ({ problems: [why], tests: 0, assertions: 0, parsed: false });
   if (typeof content !== 'string') return fail('the file is not text');
   if (Buffer.byteLength(content, 'utf8') > MAX_TEST_FILE_BYTES) return fail(`the file is over ${MAX_TEST_FILE_BYTES / 1024} KB`);
@@ -757,17 +755,17 @@ function analyzeProgram(rel: string, program: N, script: boolean): TestFileRepor
 
 /**
  * The problems of one created file at repo path `path`, for the judge and the guard: the path must be a starter-test path of a service in `roots`
- * (the deepest service that holds it), and the content must pass analyzeTestFile, read with that service's module type (`typeOf`). `depsOf` is still
- * passed through but no longer changes anything: no package is importable (S9 amended, D7-R3).
+ * (the deepest service that holds it), and the content must pass analyzeTestFile, read with that service's module type (`typeOf`). It does not check
+ * the D7-R7 switch: the judge and the guard refuse first (STARTER_TEST_FILE_NOT_ISOLATED) unless their caller says the isolated job exists.
  */
-export function starterTestFileProblems(path: string, content: string, o: { roots: readonly string[]; depsOf: (root: string) => readonly string[] | undefined; typeOf?: (root: string) => 'module' | 'commonjs' | undefined }): string[] {
+export function starterTestFileProblems(path: string, content: string, o: { roots: readonly string[]; typeOf?: (root: string) => 'module' | 'commonjs' | undefined }): string[] {
   const owner = starterOwner(path, o.roots);
   if (owner === null) return [`${show(path, 80)} is not a path starter tests may use (${starterTestPathProblem(path) ?? 'it is not inside a service folder'})`];
-  return analyzeTestFile(owner.rel, content, o.depsOf(owner.root) ?? [], o.typeOf?.(owner.root) ?? 'commonjs').problems;
+  return analyzeTestFile(owner.rel, content, o.typeOf?.(owner.root) ?? 'commonjs').problems;
 }
 
 /** The tests and the assertions of one file; null when it does not parse. */
 export function fileStats(rel: string, content: string): { tests: number; assertions: number } | null {
-  const r = analyzeTestFile(rel, content, []);
+  const r = analyzeTestFile(rel, content);
   return r.parsed ? { tests: r.tests, assertions: r.assertions } : null;
 }

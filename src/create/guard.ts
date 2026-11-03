@@ -36,7 +36,7 @@ import type { CreatedFile, InstallRecord, KnownValueCheck, PipelineDraft, RepoPr
 import { anyString, scrubActive, scrubForDisplay, vaultHolds, withActiveVault } from '../util/known-values.js';
 import { lockProblems, packageJsonProblems } from './package-rules.js';
 import type { ReviewedClosure } from './reviewed-closure.js';
-import { dependencyNames, MAX_TEST_FILES, packageModuleType, starterOwner, starterTestFileProblems } from './test-rules.js';
+import { MAX_TEST_FILES, packageModuleType, STARTER_TEST_FILE_NOT_ISOLATED, starterOwner, starterTestFileProblems } from './test-rules.js';
 
 /** One entry of the delivery base tree (the default branch head): its git mode (`100644`, `120000` symlink, `160000` submodule), blob sha and text (null: not readable as text). */
 export interface BaseEntry { sha: string; mode: string; read(): Promise<string | null> }
@@ -61,6 +61,11 @@ export interface GuardCtx {
   closure?: ReviewedClosure | null;
   /** The secret vault (D5): a created file whose path, text or reason holds a value the user gave pipegen (or its base64 or URL form) is refused. Without it nothing changes. */
   vault?: KnownValueCheck;
+  /**
+   * D7-R7 (final review I1): true only when Plan G's isolated starter-test job exists. Anything else refuses every starter-test file, new or a
+   * replacement of pipegen's own earlier one, with the producer's words.
+   */
+  isolatedTestJob?: boolean;
 }
 export interface GuardResult {
   ok: CreatedFile[];
@@ -207,18 +212,21 @@ async function guardFiles(files: readonly CreatedFile[], ctx: GuardCtx): Promise
     try { return anyString(JSON.parse(f.content), holds); } catch { return false; }
   };
 
-  /** D7: a starter test is judged by the same rules leaf the referee's judge and the creator use (a real parse; S9), with the service's own dependencies read from its package.json. Null: fine. */
+  /**
+   * D7: a starter test is refused unless the isolated test job exists (D7-R7), then judged by the same rules leaf the referee's judge and the creator
+   * use (a real parse; S9), with the module type read from the service's package.json. Null: fine.
+   */
   async function starterProblem(f: CreatedFile): Promise<string | null> {
     if (!claimingRules(f.path, repo, ctx.profile).some((r) => r.id === 'starter-tests')) return null;
+    if (ctx.isolatedTestJob !== true) return STARTER_TEST_FILE_NOT_ISOLATED;
     const roots = ctx.profile.services.map((s) => rootPrefix(s.path));
     const owner = starterOwner(f.path, roots);
     const svc = owner === null ? undefined : ctx.profile.services.find((s) => rootPrefix(s.path) === owner.root);
     if (owner === null || svc === undefined) return `${q(f.path)} is not a path starter tests may use`;
     if (svc.language !== 'node' || svc.packageManager !== 'npm') return `starter tests are written for npm services in this version, and the service in ${q(owner.root === '' ? '.' : owner.root)} is not one`;
     const pj = await readTextLimitedWithReason(join(ctx.root, ...(owner.root === '' ? [] : owner.root.split('/')), 'package.json'), ctx.root);
-    const deps = 'text' in pj ? dependencyNames(pj.text) : [];
     const type = 'text' in pj ? packageModuleType(pj.text) : 'commonjs';
-    const bad = starterTestFileProblems(f.path, f.content, { roots, depsOf: () => deps, typeOf: () => type });
+    const bad = starterTestFileProblems(f.path, f.content, { roots, typeOf: () => type });
     const same = files.filter((x) => x?.repo === repo && typeof x.path === 'string' && starterOwner(x.path, roots)?.root === owner.root).length;
     if (same > MAX_TEST_FILES) bad.push(`the batch has ${same} test files for this service, and pipegen writes at most ${MAX_TEST_FILES}`);
     return bad.length > 0 ? bad.slice(0, 5).join('; ') : null;

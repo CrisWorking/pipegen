@@ -20,7 +20,7 @@ import type { AiProvider, AiRequest, AiUsage, CreatedFile, RepoProfile, Reviewed
 import { activeSafeText as safeText } from '../util/known-values.js';
 import { planNpmDeps, type NpmDepsInput } from './npm-deps.js';
 import { VITEST_TEST_SCRIPT } from './package-rules.js';
-import { analyzeTestFile, packageModuleType, fileStats, isTestName, MAX_TEST_FILE_BYTES, MAX_TEST_FILES, STARTER_FRAMEWORK, STARTER_VITEST_VERSION, starterOwner, starterTestPathProblem } from './test-rules.js';
+import { analyzeTestFile, packageModuleType, fileStats, isTestName, MAX_TEST_FILE_BYTES, MAX_TEST_FILES, STARTER_FRAMEWORK, STARTER_TESTS_NOT_ISOLATED, STARTER_VITEST_VERSION, starterOwner, starterTestPathProblem } from './test-rules.js';
 
 const TIMEOUT_MS = 240_000;
 const MAX_OUTPUT_TOKENS = 16_000;
@@ -79,9 +79,9 @@ const notProven = (message: string): TestPlan => ({ framework: '', reasons: [], 
 /**
  * Judges the files the AI wrote for service `s`. `files` carry repo paths (the service folder first). A file is accepted only if its path is a starter-test
  * path of `s` that the gate does not protect, it does not exist yet (`fileExists`, a repo-relative path), it is among the first 20, and the rules leaf
- * (size, a real parse, the import allowlist, the banned forms, the assertions) finds nothing. `ownDeps` is ignored (the service's dependencies are not importable, S9 amended in D7 round 3); it is kept so callers need not change.
+ * (size, a real parse, the import allowlist, the banned forms, the assertions) finds nothing. No package is importable, not even a dependency of the service (S9 amended in D7 round 3).
  */
-export function validateGeneratedTests(files: CreatedFile[], s: Service, fileExists: (path: string) => boolean, ownDeps: readonly string[] = [], moduleType: 'module' | 'commonjs' = 'commonjs'): { accepted: CreatedFile[]; rejected: { path: string; why: string }[] } {
+export function validateGeneratedTests(files: CreatedFile[], s: Service, fileExists: (path: string) => boolean, moduleType: 'module' | 'commonjs' = 'commonjs'): { accepted: CreatedFile[]; rejected: { path: string; why: string }[] } {
   const dir = rootPrefix(s.path);
   const accepted: CreatedFile[] = [];
   const rejected: { path: string; why: string }[] = [];
@@ -104,7 +104,7 @@ export function validateGeneratedTests(files: CreatedFile[], s: Service, fileExi
     if (dup !== undefined) { reject(f, dup); continue; }
     if (seen >= MAX_TEST_FILES) { reject(f, `pipegen writes at most ${MAX_TEST_FILES} test files per service`); continue; }
     seen++;
-    const report = analyzeTestFile(owner.rel, f.content, ownDeps, moduleType);
+    const report = analyzeTestFile(owner.rel, f.content, moduleType);
     if (report.problems.length > 0) { reject(f, report.problems.slice(0, 4).join('; ')); continue; }
     accepted.push(f);
   }
@@ -144,7 +144,7 @@ export function checkAttempt(prev: TestPlan | null, next: TestPlan): string[] {
 export async function createStarterTests(s: Service, _p: RepoProfile, bundle: CodeBundle, ai: AiProvider, deps: StarterDeps): Promise<TestPlan> {
   const code = bundleText(bundle);   // first: throws SecretScanRequiredError before anything else happens
   if (deps.isolatedTestJob !== true) {
-    return notProven(`No starter tests for ${show(s)}: pipegen runs AI-written tests only in an isolated CI job (no secrets, no network, read-only token), and that job is not set up in this version, so its tests are not proven.`);
+    return notProven(`No starter tests for ${show(s)}: ${STARTER_TESTS_NOT_ISOLATED}, so its tests are not proven.`);
   }
   const dir = rootPrefix(s.path);
   const at = (name: string): string => (dir === '' ? name : `${dir}/${name}`);
@@ -186,7 +186,7 @@ export async function createStarterTests(s: Service, _p: RepoProfile, bundle: Co
       const body = f.content.replace(/\r\n/g, '\n');
       return { path: at(f.path), content: body.endsWith('\n') ? body : `${body}\n`, part: 'tests', repo: 'app', reason };
     });
-    const { accepted, rejected } = validateGeneratedTests(made, s, deps.fileExists, [], packageModuleType(deps.packageJson));
+    const { accepted, rejected } = validateGeneratedTests(made, s, deps.fileExists, packageModuleType(deps.packageJson));
     const problems = rejected.map((r) => `${r.path === '' ? 'a file' : r.path}: ${r.why}`);
     if (made.length === 0) problems.push('no test file was written');
     else if (rejected.length === 0 && !accepted.some((f) => isTestName(f.path.slice(f.path.lastIndexOf('/') + 1)))) problems.push('no test file (<name>.test.ts or .js) was written, only helpers');

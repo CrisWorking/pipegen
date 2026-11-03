@@ -7,9 +7,9 @@ import { describe, expect, it } from 'vitest';
 import { testsInstructions } from '../src/ai/prompts/tests.js';
 import { analyzeTestFile } from '../src/create/test-rules.js';
 
-const probs = (src: string, rel = 'test/a.test.ts', deps: string[] = []): string[] => analyzeTestFile(rel, src, deps).problems;
-const refused = (src: string, re: RegExp, rel = 'test/a.test.ts', deps: string[] = []): void => {
-  const p = probs(src, rel, deps);
+const probs = (src: string, rel = 'test/a.test.ts'): string[] => analyzeTestFile(rel, src).problems;
+const refused = (src: string, re: RegExp, rel = 'test/a.test.ts'): void => {
+  const p = probs(src, rel);
   expect(p.length, src).toBeGreaterThan(0);
   expect(p.join(' | '), src).toMatch(re);
 };
@@ -51,12 +51,12 @@ describe('(3) the result of expect(...) is only the head of a matcher chain that
 
 describe('(4) the service\'s own dependencies are not importable', () => {
   it('the review repro a5 (execa) and every package, whatever the dependency list says', () => {
-    refused("import { it, expect } from 'vitest';\nimport { execaSync } from 'execa';\nit('runs', () => {\n  const r = execaSync('sh', ['-c', 'echo x']);\n  expect(r.exitCode).toBe(0);\n});\n", /execa/, 'test/a.test.mjs', ['execa']);
+    refused("import { it, expect } from 'vitest';\nimport { execaSync } from 'execa';\nit('runs', () => {\n  const r = execaSync('sh', ['-c', 'echo x']);\n  expect(r.exitCode).toBe(0);\n});\n", /execa/, 'test/a.test.mjs');
     for (const spec of ['execa', 'express', 'lodash/template', '@scope/pkg', '@scope/pkg/sub', 'axios']) {
-      refused(`${HEAD}import x from '${spec}';\nit('b', () => { expect(x).toBe(f()); });\n`, new RegExp(spec.replace('/', '\\/')), 'test/a.test.ts', ['execa', 'express', 'lodash', '@scope/pkg', 'axios']);
-      refused(`${HEAD}export * from '${spec}';\nit('b', () => { expect(f()).toBe(1); });\n`, /may not export|allowlist|imports/, 'test/a.test.ts', ['execa', 'express', 'lodash', '@scope/pkg', 'axios']);
+      refused(`${HEAD}import x from '${spec}';\nit('b', () => { expect(x).toBe(f()); });\n`, new RegExp(spec.replace('/', '\\/')), 'test/a.test.ts');
+      refused(`${HEAD}export * from '${spec}';\nit('b', () => { expect(f()).toBe(1); });\n`, /may not export|allowlist|imports/, 'test/a.test.ts');
     }
-    refused("const { it, expect } = require('vitest');\nconst x = require('express');\nconst f = () => 1;\nit('a', () => { expect(x).toBe(f()); });\n", /express/, 'test/a.test.cjs', ['express']);
+    refused("const { it, expect } = require('vitest');\nconst x = require('express');\nconst f = () => 1;\nit('a', () => { expect(x).toBe(f()); });\n", /express/, 'test/a.test.cjs');
   });
   it('the allowed modules and relative paths inside the service still pass; the message lists them without dependencies', () => {
     expect(probs(`${HEAD}import path from 'node:path';\nimport { fileURLToPath } from 'node:url';\nimport util from 'node:util';\nimport assert from 'node:assert/strict';\nimport { sub } from '../src/add.js';\nit('b', () => { assert.equal(path.sep, f()); expect(util.format('a') + fileURLToPath(import.meta.url) + sub(1)).toBe(1); });\n`)).toEqual([]);

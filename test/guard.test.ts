@@ -52,7 +52,7 @@ describe('guard: new files', () => {
     expect(await okPaths([file('a.txt', 'x', { repo: 'central' })], ctx(repo(), { repo: 'central' }))).toEqual(['a.txt']);
   });
   it('new app source (a code file in a service folder that is not a test and has no registry rule) is refused', async () => {
-    const c = ctx(repo(), { profile: prof(['.', 'api']) });
+    const c = ctx(repo(), { profile: prof(['.', 'api']), isolatedTestJob: true });
     expect(await reasons([file('src/helper.ts')], c)).toMatch(/source code/);
     expect(await reasons([file('api/src/x.py')], c)).toMatch(/source code/);
     expect(await reasons([file('app.js')], c)).toMatch(/source code/);

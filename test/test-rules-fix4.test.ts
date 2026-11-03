@@ -9,7 +9,7 @@ import { describe, expect, it } from 'vitest';
 import { testsInstructions } from '../src/ai/prompts/tests.js';
 import { analyzeTestFile } from '../src/create/test-rules.js';
 
-const probs = (src: string, rel = 'test/a.test.ts'): string[] => analyzeTestFile(rel, src, []).problems;
+const probs = (src: string, rel = 'test/a.test.ts'): string[] => analyzeTestFile(rel, src).problems;
 const refused = (src: string, re: RegExp, rel = 'test/a.test.ts'): void => {
   const p = probs(src, rel);
   expect(p.length, src).toBeGreaterThan(0);

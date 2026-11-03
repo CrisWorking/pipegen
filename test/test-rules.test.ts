@@ -1,16 +1,16 @@
 // v0.2 Plan D, D7 (preflight S9, item 9): the rules for AI-written starter tests are a real parse and a tree walk, not a denylist of words.
 import { describe, expect, it } from 'vitest';
 import { SecretVault } from '../src/create/secrets.js';
-import { analyzeTestFile, dependencyNames, packageModuleType, fileStats, starterOwner, starterTestFileProblems, starterTestPathProblem } from '../src/create/test-rules.js';
+import { analyzeTestFile, packageModuleType, fileStats, starterOwner, starterTestFileProblems, starterTestPathProblem } from '../src/create/test-rules.js';
 import { withActiveVault } from '../src/util/known-values.js';
 
 const HEAD = "import { describe, it, expect, vi } from 'vitest';\nconst f = (...a) => a, h = f, add = f, p = f;\n";
 const ok = (body: string, head = HEAD): string => `${head}${body}\n`;
 const CJS = "const { describe, it, expect } = require('vitest');\nconst f = (...a) => a, h = f, add = f, p = f;\n";
 const T = "it('works', () => { expect(add(1, 2)).toBe(3); });";
-const probs = (src: string, rel = 'test/a.test.ts', deps: string[] = []): string[] => analyzeTestFile(rel, src, deps).problems;
-const refused = (src: string, re: RegExp, rel = 'test/a.test.ts', deps: string[] = []): void => {
-  const p = probs(src, rel, deps);
+const probs = (src: string, rel = 'test/a.test.ts'): string[] => analyzeTestFile(rel, src).problems;
+const refused = (src: string, re: RegExp, rel = 'test/a.test.ts'): void => {
+  const p = probs(src, rel);
   expect(p.length, src).toBeGreaterThan(0);
   expect(p.join(' | '), src).toMatch(re);
 };
@@ -30,25 +30,20 @@ describe('paths (S9)', () => {
     expect(starterOwner('web/src/test/a.test.ts', ['web'])).toBeNull();
     expect(starterOwner('x/tests/a.test.ts', ['api'])).toBeNull();
   });
-  it('dependencyNames reads only valid names under dependencies, never devDependencies', () => {
-    expect(dependencyNames('{"dependencies":{"express":"^4","@a/b":"1","BAD NAME":"1","../x":"1"},"devDependencies":{"vitest":"5"}}')).toEqual(['express', '@a/b']);
-    expect(dependencyNames('not json')).toEqual([]);
-    expect(dependencyNames('{"dependencies":[1]}')).toEqual([]);
-  });
 });
 
 describe('a good file passes, with its counts', () => {
   it('counts tests and the assertions written directly in them', () => {
-    const r = analyzeTestFile('test/a.test.ts', ok(`const x = f, y = f;\n${T}\ndescribe('g', () => {\n  it('a', async () => { await expect(p()).resolves.toBe(1); expect(2).toBe(2); expect(x).not.toBe(2); });\n  it.concurrent('b', () => expect(y()).toEqual({ a: 1 }));\n});`), []);
+    const r = analyzeTestFile('test/a.test.ts', ok(`const x = f, y = f;\n${T}\ndescribe('g', () => {\n  it('a', async () => { await expect(p()).resolves.toBe(1); expect(2).toBe(2); expect(x).not.toBe(2); });\n  it.concurrent('b', () => expect(y()).toEqual({ a: 1 }));\n});`));
     expect(r).toEqual({ problems: [], tests: 3, assertions: 4, parsed: true });   // expect(2).toBe(2) is on a literal and does not count
   });
   it('TypeScript syntax (types, as, !, generics, interfaces) is read', () => {
     const src = ok("import type { Foo } from '../src/foo.js';\ninterface I { a: number }\ntype K = keyof I;\nconst x: Foo = { a: 1 } as Foo;\nfunction id<T extends object>(v: T, w?: string): T { return v; }\nit('t', () => { expect(id<I>(x!).a as number).toBe(1); });");
-    expect(probs(src, 'test/a.test.ts', [])).toEqual([]);
+    expect(probs(src, 'test/a.test.ts')).toEqual([]);
   });
   it('node:assert and vitest files count assert calls', () => {
     const src = "import assert from 'node:assert/strict';\nimport { strictEqual } from 'node:assert';\nimport { test } from 'vitest';\nconst f = () => 1;\ntest('a', () => { assert.equal(f(), 1); });\ntest('b', () => { strictEqual(f(), 2); assert(f()); });\n";
-    expect(analyzeTestFile('test/a.test.js', src, [])).toMatchObject({ problems: [], tests: 2, assertions: 3 });
+    expect(analyzeTestFile('test/a.test.js', src)).toMatchObject({ problems: [], tests: 2, assertions: 3 });
   });
   it('a CommonJS file with require of an allowed module passes', () => {
     const src = "const assert = require('node:assert');\nconst { it } = require('vitest');\nconst f = () => 1;\nit('a', () => { assert.strictEqual(f(), 1); });\n";
@@ -56,8 +51,8 @@ describe('a good file passes, with its counts', () => {
   });
   it('relative imports inside the service and the allowed built-ins pass (a dependency of the service does not)', () => {
     const src = ok("import path from 'node:path';\nimport { fileURLToPath } from 'node:url';\nimport util from 'node:util';\nimport { sub } from '../src/add.js';\nimport hh from './helpers/h.js';\nit('a', () => { expect(sub(1, 1)).toBe(2); });");
-    expect(probs(src, 'test/a.test.ts', ['express', 'supertest', '@scope/pkg'])).toEqual([]);
-    refused(ok("import express from 'express';\nit('a', () => { expect(express).toBe(f()); });"), /express/, 'test/a.test.ts', ['express']);
+    expect(probs(src, 'test/a.test.ts')).toEqual([]);
+    refused(ok("import express from 'express';\nit('a', () => { expect(express).toBe(f()); });"), /express/, 'test/a.test.ts');
   });
   it('helpers need no test; a helper with an import outside the allowlist is still refused', () => {
     expect(probs("export const make = (n) => ({ n });\n", 'test/helpers/h.js')).toEqual([]);
@@ -83,17 +78,17 @@ describe('validate: imports are an allowlist with string-literal specifiers', ()
   it("validate: import outside the allowlist (framework, node:assert*, node:test, node:path, node:url, node:util, node:http, relative inside the service, the service's own dependencies) → rejected", () => {
     for (const spec of ['node:fs', 'fs', 'child_process', 'node:child_process', 'node:vm', 'node:test', 'worker_threads', 'node:worker_threads', 'node:net', 'node:module', 'node:os', 'http', 'node:https', 'lodash', 'file:///etc/passwd', '/etc/passwd', 'data:text/javascript,1', 'vitest/config', 'vitest/node', '../../outside.js', '../../../x', './a?worker', './a?raw', '../node_modules/x/index.js', './.hidden/x.js', '..\\x']) {
       const esm = /module/.test(spec) ? 'test/a.test.js' : 'test/a.test.ts';   // the words namespace and module are refused in a .ts file whatever the import
-      refused(ok(`import x from ${JSON.stringify(spec)};\n${T}`), /imports|allowlist|dependencies/, esm, []);
-      refused(ok(`export * from ${JSON.stringify(spec)};\n${T}`), /imports|may not export/, esm, []);
-      refused(ok(`it('a', async () => { const m = await import(${JSON.stringify(spec)}); expect(m).toBe(1); });`), /imports|import\(\)/, esm, []);
-      refused(`${CJS}it('a', () => { const m = require(${JSON.stringify(spec)}); expect(m).toBe(1); });`, /imports/, 'test/a.test.cjs', []);
+      refused(ok(`import x from ${JSON.stringify(spec)};\n${T}`), /imports|allowlist|dependencies/, esm);
+      refused(ok(`export * from ${JSON.stringify(spec)};\n${T}`), /imports|may not export/, esm);
+      refused(ok(`it('a', async () => { const m = await import(${JSON.stringify(spec)}); expect(m).toBe(1); });`), /imports|import\(\)/, esm);
+      refused(`${CJS}it('a', () => { const m = require(${JSON.stringify(spec)}); expect(m).toBe(1); });`, /imports/, 'test/a.test.cjs');
     }
   });
   it('a package that is not in the service\'s dependencies is refused; a builtin name in dependencies does not help', () => {
-    refused(ok(`import x from 'lodash';\n${T}`), /lodash.*allowlist/, 'test/a.test.ts', ['express']);
-    refused(ok(`import x from 'fs';\n${T}`), /"fs"/, 'test/a.test.ts', ['fs']);
-    refused(ok(`import x from 'express-evil';\n${T}`), /express-evil/, 'test/a.test.ts', ['express']);
-    refused(ok(`import x from 'express/../../x';\n${T}`), /imports/, 'test/a.test.ts', ['express']);
+    refused(ok(`import x from 'lodash';\n${T}`), /lodash.*allowlist/, 'test/a.test.ts');
+    refused(ok(`import x from 'fs';\n${T}`), /"fs"/, 'test/a.test.ts');
+    refused(ok(`import x from 'express-evil';\n${T}`), /express-evil/, 'test/a.test.ts');
+    refused(ok(`import x from 'express/../../x';\n${T}`), /imports/, 'test/a.test.ts');
   });
   it('no re-export at all in a test file', () => {
     refused(ok(`export { join } from 'node:path';\n${T}`), /may not export/);
@@ -299,7 +294,7 @@ describe('what the rules show goes through the vault', () => {
       ...probs(ok(`it('u', () => { expect(a['${value}']).toBeTruthy(); a.${value}.skip; });`)),
       ...probs(ok(`it('u', () => { const o = { ${value}: 1, skip: 2 }; expect(o).toBe(1); });`)),
       ...probs(ok(`import x from '../${value}/../../x.js';\n${T}`)),
-      ...starterTestFileProblems(`api/test/${value}.js`, 'x', { roots: ['api'], depsOf: () => [] }),
+      ...starterTestFileProblems(`api/test/${value}.js`, 'x', { roots: ['api'] }),
     ].join(' | '));
     expect(shown.length).toBeGreaterThan(0);
     expect(shown).not.toContain(value);
@@ -308,7 +303,7 @@ describe('what the rules show goes through the vault', () => {
 });
 
 describe('starterTestFileProblems (judge and guard share it)', () => {
-  const o = { roots: ['', 'api'], depsOf: (r: string) => (r === 'api' ? ['express'] : []) };
+  const o = { roots: ['', 'api'] };
   it('refuses a path that is not a starter-test path, and a package import in any service', () => {
     expect(starterTestFileProblems('src/a.test.ts', ok(T), o)[0]).toMatch(/not a path starter tests may use/);
     expect(starterTestFileProblems('api/test/a.test.ts', ok(`import e from 'express';\n${T}`), o).join(' ')).toMatch(/express/);   // even a dependency of the owning service
@@ -363,8 +358,8 @@ describe('security scan round 2 / 3: reserved names can not be declared, so no s
     for (const code of ['function g(fetch) { return fetch(1); } g(f)', 'const g = (Object) => Object.getPrototypeOf(1); g(f)', 'try { f(); } catch (Reflect) { Reflect.ownKeys(o); }', '{ const Object = o; Object.getPrototypeOf(1); }', 'class Map {}', 'const { JSON } = o', 'let process = 1', 'function Math() {}', 'const [Symbol] = [1]', 'const { a: Date = 1 } = o', 'function g(...Buffer) {} g()', 'const __dirname = 1', 'const __x = 1', 'const Function = 1', 'const globalThis = 1', 'const fetch = f', 'const require = f', 'const vi = f', 'const expect = f', 'const it = f', 'const describe = f', 'const test = f', 'const module = 1', 'const exports = 1', 'const constructor = 1', 'const undefined = 1', 'const console = f', 'const URL = f', 'const Promise = f', 'const parseInt = f']) {
       refused(body(code), /reserves|declares/, /\bmodule\b/.test(code) ? 'test/a.test.js' : 'test/a.test.ts');
     }
-    refused(body('', "import Object from 'express';\n"), /reserves/, 'test/a.test.ts', ['express']);
-    refused(body('', "import { Map } from 'express';\n"), /reserves/, 'test/a.test.ts', ['express']);
+    refused(body('', "import Object from 'express';\n"), /reserves/, 'test/a.test.ts');
+    refused(body('', "import { Map } from 'express';\n"), /reserves/, 'test/a.test.ts');
   });
   it('an API name is bound once, by importing it; declaring it again anywhere is refused', () => {
     refused(body('function g(expect) { return expect; } g(f)'), /declared again/);
@@ -461,14 +456,14 @@ describe('rule tables: every name', () => {
     const pad = (n: number): string => `${ok(T)}//${'x'.repeat(Math.max(0, n - Buffer.byteLength(`${ok(T)}//`)))}`;
     const exact = pad(50 * 1024);
     expect(Buffer.byteLength(exact)).toBe(50 * 1024);
-    expect(analyzeTestFile('test/a.test.ts', exact, []).parsed).toBe(true);
+    expect(analyzeTestFile('test/a.test.ts', exact).parsed).toBe(true);
     expect(probs(`${exact}x`)).toEqual([expect.stringMatching(/over 50 KB/)]);
   });
   it('a builtin name in dependencies never allows a bare import, and .. at the service root leaves it', () => {
-    refused(ok(`import x from 'punycode';\n${T}`), /punycode/, 'test/a.test.ts', ['punycode']);
-    refused(ok(`import x from 'assert';\n${T}`), /"assert"/, 'test/a.test.ts', ['assert']);
-    expect(analyzeTestFile('a.test.js', ok("import x from '..';\nit('a', () => { expect(x).toBe(1); });").replace(HEAD, "import { it, expect } from 'vitest';\n"), []).problems.join(' ')).toMatch(/leaves the service folder/);
-    expect(analyzeTestFile('a.test.js', "import { it, expect } from 'vitest';\nimport x from '../x.js';\nit('a', () => { expect(x).toBe(1); });\n", [], 'module').problems.join(' ')).toMatch(/leaves the service folder/);
+    refused(ok(`import x from 'punycode';\n${T}`), /punycode/, 'test/a.test.ts');
+    refused(ok(`import x from 'assert';\n${T}`), /"assert"/, 'test/a.test.ts');
+    expect(analyzeTestFile('a.test.js', ok("import x from '..';\nit('a', () => { expect(x).toBe(1); });").replace(HEAD, "import { it, expect } from 'vitest';\n")).problems.join(' ')).toMatch(/leaves the service folder/);
+    expect(analyzeTestFile('a.test.js', "import { it, expect } from 'vitest';\nimport x from '../x.js';\nit('a', () => { expect(x).toBe(1); });\n", 'module').problems.join(' ')).toMatch(/leaves the service folder/);
   });
   it('a with statement is refused in a script', () => {
     refused(`${CJS}const o = {};\nwith (o) { f(); }\nit('a', () => { expect(f()).toBe(1); });`, /with statement/, 'test/a.test.cjs');
@@ -481,12 +476,12 @@ describe('security scan round 3 / 1: exports', () => {
   const test = (code: string, head = "import { join } from 'node:path';\nimport util from 'node:util';\n"): string => `${HEAD}${head}${code}\n${T2}`;
   it('a test file may not contain any export statement', () => {
     for (const code of ['export { join };', 'export { util };', 'export { join as default };', 'export default util;', 'export const x = 1;', 'export default 1;', "export * from './x.js';", "export { a } from './x.js';", 'export function g() {}', 'export class K {}', 'export default function () {}', 'export { f as default };', 'export {};']) {
-      refused(test(code), /may not export anything/, 'test/a.test.ts', ['express']);
-      refused(test(code), /may not export anything/, 'test/a.test.mjs', ['express']);
+      refused(test(code), /may not export anything/, 'test/a.test.ts');
+      refused(test(code), /may not export anything/, 'test/a.test.mjs');
     }
   });
   it('a helper may export its own bindings but never an import, nor re-export', () => {
-    const helper = (code: string, head = "import { join } from 'node:path';\nimport util from 'node:util';\n"): string[] => probs(`${head}const own = 1;\n${code}\n`, 'test/helpers/h.js', ['express']);
+    const helper = (code: string, head = "import { join } from 'node:path';\nimport util from 'node:util';\n"): string[] => probs(`${head}const own = 1;\n${code}\n`, 'test/helpers/h.js');
     for (const code of ['export const x = 1;', 'export { own };', 'export { own as default };', 'export default own;', 'export function g() { return 1; }', 'export default function () {}', 'export default 1;']) expect(helper(code), code).toEqual([]);
     for (const code of ['export { join };', 'export { join as j };', 'export { join as default };', 'export default join;', 'export default util;', 'export { util };', "export * from './x.js';", "export { a } from './x.js';", "export * as ns from './x.js';", "export { default } from './x.js';"]) {
       expect(helper(code).join(' '), code).toMatch(/may not export|may not re-export/);
@@ -498,7 +493,7 @@ describe('security scan round 3 / 2: the API exemption is keyed on module and na
   const T2 = "it('a', () => { expect(f()).toBe(1); });\n";
   it('a vitest, node:test or assert name imported from the wrong module, or under another name, is a reserved declaration', () => {
     for (const head of ["import { expect as fetch } from 'vitest';", "import { expect as e } from 'vitest';\nimport { it as describe } from 'vitest';", "import { describe } from 'node:assert';", "import { it } from 'node:assert';", "import { strictEqual as expect } from 'node:assert';", "import * as Map from 'node:assert';", "import * as expect from 'node:assert';", "import expect from 'node:assert';", "import { test as it } from 'node:test';", "import { it as Object } from 'node:test';", "import { describe } from 'express';", "import vi from 'express';", "import { expect } from 'express';"]) {
-      refused(`const f = () => 1;\n${head}\n${T2}`, /reserves|declared again|vitest|another name/, 'test/a.test.ts', ['express']);
+      refused(`const f = () => 1;\n${head}\n${T2}`, /reserves|declared again|vitest|another name/, 'test/a.test.ts');
     }
     refused(`${CJS}const { expect: fetch } = require('vitest');\n${T2}`, /reserves|declared again/, 'test/a.test.cjs');
     refused(`const { it, expect } = require('vitest');\nconst { describe } = require('node:assert');\nconst f = () => 1;\n${T2}`, /reserves|declared again/, 'test/a.test.cjs');
@@ -524,7 +519,7 @@ describe('mutation survivors: tests and assertions', () => {
     refused(ok("it('a', () => { expect(f()).toBe(1); }, 5, () => {});"), /written as it/);
   });
   it('assertion forms that count: return, await, expect.soft, assert calls on real values; assert.fail, bare literals and expect.poll (dropped, D7-R5) do not', () => {
-    const one = (code: string, head = ''): number => analyzeTestFile('test/a.test.js', `${head}import { it, expect } from 'vitest';\nimport assert, { ok as okk } from 'node:assert';\nconst f = () => 1;\nit('a', async () => { ${code} });\n`, []).assertions;
+    const one = (code: string, head = ''): number => analyzeTestFile('test/a.test.js', `${head}import { it, expect } from 'vitest';\nimport assert, { ok as okk } from 'node:assert';\nconst f = () => 1;\nit('a', async () => { ${code} });\n`).assertions;
     expect(one('return expect(f()).toBe(1);')).toBe(1);
     expect(one('await expect(f()).resolves.toBe(1);')).toBe(1);
     expect(one('expect.soft(f()).toBe(1);')).toBe(1);
@@ -541,7 +536,7 @@ describe('mutation survivors: tests and assertions', () => {
   });
   it('a CommonJS destructured require of node:assert binds its names', () => {
     const src = "const { it, expect } = require('vitest');\nconst { strictEqual: eq, ok } = require('node:assert');\nconst f = () => 1;\nit('a', () => { eq(f(), 1); ok(f()); });\n";
-    expect(analyzeTestFile('test/a.test.cjs', src, [])).toMatchObject({ problems: [], tests: 1, assertions: 2 });
+    expect(analyzeTestFile('test/a.test.cjs', src)).toMatchObject({ problems: [], tests: 1, assertions: 2 });
   });
   it('a TypeScript class with a private field is read, and its name is not a skip', () => {
     expect(probs(ok("class K { #skip = 1; m() { return this.#skip; } }\nit('a', () => { expect(new K().m()).toBe(1); });"))).toEqual([]);
@@ -556,11 +551,11 @@ describe('mutation survivors: tests and assertions', () => {
   });
   it('the union of the script and the module reading: counts are the smaller, problems are all', () => {
     const hidden = `${CJS}const a = 1, b = 1;\na <!-- b; it('x', () => { expect(f()).toBe(1); });\n${T}\n`;
-    const r = analyzeTestFile('test/a.test.js', hidden, [], 'commonjs');
+    const r = analyzeTestFile('test/a.test.js', hidden, 'commonjs');
     expect(r).toMatchObject({ problems: [], tests: 1, assertions: 1, parsed: true });   // the script reading hides one test
     const evil = `${CJS}const a = 1, b = 1;\na <!-- b; globalThis;\n${T}\n`;
-    expect(analyzeTestFile('test/a.test.js', evil, [], 'commonjs').problems.join(' ')).toMatch(/globalThis/);
-    expect(analyzeTestFile('test/a.test.js', evil, [], 'module').problems.join(' ')).toMatch(/does not parse|globalThis/);
+    expect(analyzeTestFile('test/a.test.js', evil, 'commonjs').problems.join(' ')).toMatch(/globalThis/);
+    expect(analyzeTestFile('test/a.test.js', evil, 'module').problems.join(' ')).toMatch(/does not parse|globalThis/);
   });
 });
 
@@ -589,14 +584,14 @@ describe('security scan 3: parse by the package type, and no `this` in plain fun
   });
   it('.js follows the package.json type: a module, or both readings (a script-only reading is not trusted alone)', () => {
     const hidden = `${HEAD}const a = 1, b = 1;\na <!-- globalThis\nit('a', () => { expect(f()).toBe(1); });\n`;
-    const r = (src: string, type: 'module' | 'commonjs') => analyzeTestFile('test/a.test.js', src, [], type);
+    const r = (src: string, type: 'module' | 'commonjs') => analyzeTestFile('test/a.test.js', src, type);
     expect(r(hidden, 'module').problems.join(' ')).toMatch(/globalThis/);
     expect(r(hidden, 'commonjs').problems.join(' ')).toMatch(/globalThis/);   // the module reading sees what the script reading hides
     const sloppy = `${CJS}var o = 010;\nit('a', () => { expect(f()).toBe(o); });\n`;
     expect(r(sloppy, 'module').problems.join(' ')).toMatch(/does not parse/);
     expect(r(sloppy, 'commonjs').problems).toEqual([]);
     expect(r(HEAD + "it('a', () => { expect(f()).toBe(1); });\n", 'commonjs')).toMatchObject({ problems: [], tests: 1, assertions: 1 });
-    expect(analyzeTestFile('test/a.test.cjs', `${CJS}const a = 1, b = 1;\na <!-- globalThis\nit('a', () => { expect(f()).toBe(1); });\n`, [], 'module').problems.join(' ')).toMatch(/globalThis/);   // .cjs is read both ways (the runner takes it as a module)
+    expect(analyzeTestFile('test/a.test.cjs', `${CJS}const a = 1, b = 1;\na <!-- globalThis\nit('a', () => { expect(f()).toBe(1); });\n`, 'module').problems.join(' ')).toMatch(/globalThis/);   // .cjs is read both ways (the runner takes it as a module)
   });
   it('packageModuleType reads "type" exactly', () => {
     expect(packageModuleType('{"type":"module"}')).toBe('module');
@@ -604,7 +599,7 @@ describe('security scan 3: parse by the package type, and no `this` in plain fun
   });
   it('starterTestFileProblems passes the service type to the parse', () => {
     const sloppy = `${CJS}var o = 010;\nit('a', () => { expect(f()).toBe(o); });\n`;
-    const o = { roots: ['api'], depsOf: () => [] as string[] };
+    const o = { roots: ['api'] };
     expect(starterTestFileProblems('api/test/a.test.js', sloppy, { ...o, typeOf: () => 'module' }).join(' ')).toMatch(/parse/);
     expect(starterTestFileProblems('api/test/a.test.js', sloppy, { ...o, typeOf: () => 'commonjs' })).toEqual([]);
     expect(starterTestFileProblems('api/test/a.test.js', sloppy, o)).toEqual([]);

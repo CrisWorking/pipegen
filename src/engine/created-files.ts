@@ -42,15 +42,15 @@ export interface CreatedInputs {
    * and `inserted`, the block text the install record says pipegen wrote there before (EditKind 'codeowners'), which a re-run may replace in place.
    */
   codeownersFacts?: Partial<Record<'app' | 'central', { isSymlink: boolean; inserted: string | null }>>;
-  /**
-   * D7: no longer used. The service's own `dependencies` are NOT importable from a starter test (S9 amended in D7 round 3), so the judge ignores this;
-   * the field stays so Plan G's callers need not change.
-   */
-  serviceDeps?: Readonly<Record<string, readonly string[]>>;
   /** D7: the package.json `type` of each service ('module' or 'commonjs'; same keys). A missing service is read as commonjs, which checks a .js file both ways. */
   serviceTypes?: Readonly<Record<string, 'module' | 'commonjs'>>;
   /** The vault's check: does the text hold a value the user typed, or its base64 or URL form (preflight S8)? */
   containsKnownValue?: (text: string) => boolean;
+  /**
+   * D7-R7 (final review I1): true only when Plan G's isolated starter-test job exists (no secrets, egress blocked, read-only token, no persisted
+   * checkout credentials, outputs not consumed by later jobs). Anything else, absent included, refuses every starter-test file.
+   */
+  isolatedTestJob?: boolean;
 }
 /** The reviewed list the gate protects from (the whole built-in list) and the delivery inputs. */
 export interface CreatedEnv {

@@ -261,7 +261,7 @@ describe('tests: refused answers are asked again once, then the part fails', () 
 
 describe('validate: what may be delivered', () => {
   const s = svc();
-  const v = (files: CreatedFile[], exists: (p: string) => boolean = () => false, d: string[] = ['express']) => validateGeneratedTests(files, s, exists, d);
+  const v = (files: CreatedFile[], exists: (p: string) => boolean = () => false) => validateGeneratedTests(files, s, exists);
   it('validate: path traversal rejected', () => {
     for (const path of ['api/test/../../x.test.js', 'api/../test/a.test.js', '/etc/a.test.js', 'api//test/a.test.js', 'api/test/../a.test.js', 'api/test/./a.test.js', '../api/test/a.test.js', 'api\\test\\a.test.js', 'other/test/a.test.js', 'test/a.test.js', 'api/src/a.test.js', 'api/test/a.js']) {
       const r = v([cf(path)]);
@@ -338,7 +338,7 @@ describe('validate: what may be delivered', () => {
     const imp = (spec: string): string => `import x from '${spec}';\nimport { it, expect } from 'vitest';\nit('a', () => { expect(x).toBeTruthy(); });\n`;
     for (const spec of ['lodash', 'node:fs', 'node:vm', 'worker_threads', 'https://evil.example/x.js', '../../etc/x.js']) expect(v([cf('api/test/a.test.js', imp(spec))]).accepted, spec).toEqual([]);
     expect(v([cf('api/test/a.test.js', imp('express'))]).accepted).toEqual([]);   // not even a dependency of the service (S9 amended in D7 round 3)
-    expect(v([cf('api/test/a.test.js', imp('express'))], () => false, []).accepted).toEqual([]);
+    expect(v([cf('api/test/a.test.js', imp('express'))], () => false).accepted).toEqual([]);
     expect(v([cf('api/test/a.test.js', imp('../src/add.js'))]).accepted).toHaveLength(1);
   });
   it('validate: eval, new Function, process.binding, module.createRequire rejected', () => {
@@ -378,8 +378,8 @@ describe('module type', () => {
   it('the module type reaches the validator and the creator: a script-only file is refused in a "type": "module" package', async () => {
     const src = "const { it, expect } = require('vitest');\nvar o = 010;\nit('a', () => { expect(o).toBe(8); });\n";
     const file: CreatedFile = { path: 'api/test/a.test.js', content: src, part: 'tests', reason: 't', repo: 'app' };
-    expect(validateGeneratedTests([file], svc(), () => false, [], 'module').rejected[0]?.why).toMatch(/does not parse/);
-    expect(validateGeneratedTests([file], svc(), () => false, [], 'commonjs').rejected).toEqual([]);
+    expect(validateGeneratedTests([file], svc(), () => false, 'module').rejected[0]?.why).toMatch(/does not parse/);
+    expect(validateGeneratedTests([file], svc(), () => false, 'commonjs').rejected).toEqual([]);
     expect(validateGeneratedTests([file], svc(), () => false).rejected).toEqual([]);
     const asModule = deps({ packageJson: PJ.replace('"version": "1.0.0",', '"version": "1.0.0",\n  "type": "module",') });
     const bad = await make([ans([{ path: 'test/a.test.js', content: src }])], svc(), asModule).run().catch((e: unknown) => e);
@@ -436,26 +436,25 @@ describe('the producer\'s real output passes the referee and the guard', () => {
     const s = svc();
     const plan = await make([ans([{ path: 'test/add.test.js', content: GOOD }, { path: 'test/helpers/h.js', content: 'export const h = (n) => n * 2;\n' }, { path: 'tests/express.test.js', content: GOOD2 }])], s).run();
     const all = [...plan.files, ...plan.configEdits];
-    const r = await refereeOf(all, s, { serviceDeps: { api: ['express'] } });
+    const r = await refereeOf(all, s, { isolatedTestJob: true });
     expect(r.issues.map((i) => `${i.file}: ${i.message}`)).toEqual([]);
     const { root, base } = repoDir({ 'api/package.json': PJ, 'api/package-lock.json': LOCK, 'api/src/add.js': 'export const add = (a, b) => a + b;\n' });
-    const g = await guardCreatedFiles(all, { root, baseTree: base, installRecord: null, profile: profileOf([s]), closure: loadReviewedClosure(reviewedList()) });
+    const g = await guardCreatedFiles(all, { root, baseTree: base, installRecord: null, profile: profileOf([s]), closure: loadReviewedClosure(reviewedList()), isolatedTestJob: true });
     expect(g.refused).toEqual([]);
     expect(g.ok.map((f) => f.path).sort()).toEqual(all.map((f) => f.path).sort());
   });
-  it('the referee refuses a package import even with the dependency list, and a changed byte', async () => {
+  it('the referee refuses a package import, even of a dependency of the service, and a changed byte', async () => {
     const s = svc();
     const plan = await make([ans([{ path: 'test/path.test.js', content: GOOD2 }])], s).run();
     const pkg = { ...(plan.files[0] as CreatedFile), content: WITH_PKG };
-    expect((await refereeOf([pkg], s, { serviceDeps: { api: ['express'] } })).issues.map((i) => i.message).join(' ')).toMatch(/express.*allowlist/);
-    expect((await refereeOf([pkg], s, {})).issues.map((i) => i.message).join(' ')).toMatch(/express.*allowlist/);
+    expect((await refereeOf([pkg], s, { isolatedTestJob: true })).issues.map((i) => i.message).join(' ')).toMatch(/express.*allowlist/);
     const evil = { ...(plan.files[0] as CreatedFile), content: `${GOOD2}import cp from 'node:child_process';\n` };
-    expect((await refereeOf([evil], s, { serviceDeps: { api: ['express'] } })).issues.map((i) => i.message).join(' ')).toMatch(/node:child_process/);
+    expect((await refereeOf([evil], s, { isolatedTestJob: true })).issues.map((i) => i.message).join(' ')).toMatch(/node:child_process/);
   });
   it('the guard refuses what the leaf refuses, an overwrite, and more than 20 files', async () => {
     const s = svc();
     const { root, base } = repoDir({ 'api/package.json': PJ, 'api/test/old.test.js': GOOD });
-    const run = (files: CreatedFile[]) => guardCreatedFiles(files, { root, baseTree: base, installRecord: null, profile: profileOf([s]), closure: null });
+    const run = (files: CreatedFile[]) => guardCreatedFiles(files, { root, baseTree: base, installRecord: null, profile: profileOf([s]), closure: null, isolatedTestJob: true });
     const evil = cf('api/test/e.test.js', "import { it, expect } from 'vitest';\nimport cp from 'node:child_process';\nit('a', () => { expect(cp).toBeTruthy(); });\n");
     const g = await run([evil, cf('api/test/old.test.js'), cf('api/test/ok.test.js')]);
     expect(g.ok.map((f) => f.path)).toEqual(['api/test/ok.test.js']);
@@ -477,18 +476,18 @@ describe('the producer\'s real output passes the referee and the guard', () => {
     const { root, base } = repoDir({ 'api/package.json': PJ });
     const evil = "import { it, expect } from 'vitest';\nimport { execSync } from 'node:child_process';\nit('a', () => { expect(execSync('id').length).toBeGreaterThan(0); });\n";
     const paths = ['api/test/a.spec.ts', 'api/test/vitest.config.test.ts', 'api/src/a.test.ts', 'api/test/a.test.ts', 'api/tests/helpers/h.ts', 'api/other/a.txt'];
-    const g = await guardCreatedFiles(paths.map((p) => cf(p, evil)), { root, baseTree: base, installRecord: null, profile: profileOf([s]), closure: null });
+    const g = await guardCreatedFiles(paths.map((p) => cf(p, evil)), { root, baseTree: base, installRecord: null, profile: profileOf([s]), closure: null, isolatedTestJob: true });
     expect(g.ok).toEqual([]);
     expect(g.refused.map((r) => r.path).sort()).toEqual([...paths].sort());
     expect(g.refused.find((r) => r.path === 'api/test/a.spec.ts')?.reason).toMatch(/starter test|tests part|not a path/);
     // a good file at a claimed path, and the package edits (part tests, claimed by their own rules), still pass
-    const good = await guardCreatedFiles([cf('api/test/a.test.js')], { root, baseTree: base, installRecord: null, profile: profileOf([s]), closure: null });
+    const good = await guardCreatedFiles([cf('api/test/a.test.js')], { root, baseTree: base, installRecord: null, profile: profileOf([s]), closure: null, isolatedTestJob: true });
     expect(good.refused).toEqual([]);
   });
   it('the registry judge: a python or pnpm service, and a service folder named test, are refused or handled', async () => {
     const files = [cf('api/test/a.test.js')];
     for (const s of [svc({ language: 'python', packageManager: 'pip' }), svc({ packageManager: 'pnpm' })]) {
-      expect((await refereeOf(files, s, {})).issues.map((i) => i.message).join(' ')).toMatch(/Python comes in v0\.4|npm services/);
+      expect((await refereeOf(files, s, { isolatedTestJob: true })).issues.map((i) => i.message).join(' ')).toMatch(/Python comes in v0\.4|npm services/);
     }
   });
   it('the registry rule claims exactly the starter-test paths: no more than the creator may write', () => {
@@ -496,5 +495,65 @@ describe('the producer\'s real output passes the referee and the guard', () => {
     const claim = (p: string) => CREATED_RULES.filter((r) => r.match(p, d)).map((r) => r.id);
     expect(claim('api/test/a.test.ts')).toEqual(['starter-tests']);
     for (const p of ['api/test/a.spec.ts', 'api/test/a.test.tsx', 'api/test/a.test.jsx', 'api/test/vitest.config.test.ts', 'api/tests/prettier.config.test.ts', 'api/test/x.json', 'api/tests/helpers/h.ts']) expect(claim(p), p).toEqual([]);
+  });
+});
+
+// ---- final review I1: D7-R7 holds at the referee and the guard too, not only in the producer ----
+describe('D7-R7 at the referee and the guard: no starter-test file without the isolated test job', () => {
+  // r5's f3 probe (it ran `id` in the D7 r5 review): the validator is not the boundary, so the switch must hold wherever a test file can enter
+  const F3 = "import { it, expect } from 'vitest';\nlet got: any;\nconst k = ['constr', 'uctor'].join('');\nit('a', () => {\n  const f = () => 1;\n  expect(f).toEqual(expect.objectContaining({ [k]: { asymmetricMatch: (v: any) => { got = v; return true; } } }));\n  const src = 'return process.getBuilt' + 'inModule(\"child' + '_process\").execSync(\"id\").toString()';\n  console.log('F3', got(src)());\n  expect(1 + 1).toBe(2);\n});\n";
+  const ISOLATED = /isolated CI job \(no secrets, no network, read-only token\), and that job is not set up in this version/;
+  const refereeWith = (files: CreatedFile[], s: Service, inputs: Record<string, unknown>) => referee(files, draftOf([s]), platform(), reviewedList(), LINTERS, 'tok', { runLinters: async () => [], createdInputs: inputs as never });
+  function repo(files: Record<string, string>): { root: string; base: BaseTree } {
+    const root = mkdtempSync(join(tmpdir(), 'pipegen-i1-'));
+    made.push(root);
+    for (const [p, t] of Object.entries(files)) { mkdirSync(join(root, dirname(p)), { recursive: true }); writeFileSync(join(root, p), t); }
+    return { root, base: { complete: true, entries: new Map(Object.entries(files).map(([p, t]) => [p, { sha: gitBlobSha(t), mode: '100644', read: async () => t }])) } };
+  }
+
+  it('the referee refuses f3, and a harmless test, unless createdInputs.isolatedTestJob is true', async () => {
+    const s = svc();
+    for (const inputs of [{}, { isolatedTestJob: false }, { isolatedTestJob: 'true' }]) {
+      for (const content of [F3, GOOD]) {
+        const r = await refereeWith([cf('api/test/f3.test.ts', content)], s, inputs);
+        expect(r.ok, JSON.stringify(inputs)).toBe(false);
+        expect(r.issues.map((i) => i.message).join(' ')).toMatch(ISOLATED);
+      }
+    }
+    // with the flag the harmless file passes (the validator still runs as defense in depth)
+    expect((await refereeWith([cf('api/test/ok.test.js', GOOD2)], s, { isolatedTestJob: true })).issues).toEqual([]);
+  });
+  it('the guard refuses f3, and a harmless test, unless GuardCtx.isolatedTestJob is true', async () => {
+    const s = svc();
+    const { root, base } = repo({ 'api/package.json': '{"name":"api"}\n' });
+    for (const flag of [undefined, false]) {
+      const g = await guardCreatedFiles([cf('api/test/f3.test.ts', F3), cf('api/test/ok.test.js', GOOD2)], { root, baseTree: base, installRecord: null, profile: profileOf([s]), ...(flag === undefined ? {} : { isolatedTestJob: flag }) });
+      expect(g.ok).toEqual([]);
+      expect(g.refused.map((r) => r.path).sort()).toEqual(['api/test/f3.test.ts', 'api/test/ok.test.js']);
+      for (const r of g.refused) expect(r.reason).toMatch(ISOLATED);
+    }
+    const on = await guardCreatedFiles([cf('api/test/ok.test.js', GOOD2)], { root, baseTree: base, installRecord: null, profile: profileOf([s]), isolatedTestJob: true });
+    expect(on.refused).toEqual([]);
+  });
+  it('the guard refuses the replacement of pipegen\'s own earlier starter test without the flag (a Plan G re-run)', async () => {
+    const s = svc();
+    const { root, base } = repo({ 'api/package.json': '{"name":"api"}\n', 'api/test/ok.test.js': GOOD2 });
+    const installRecord = { files: [{ path: 'api/test/ok.test.js', part: 'tests' as const, sha: gitBlobSha(GOOD2), created: true }] };
+    const off = await guardCreatedFiles([cf('api/test/ok.test.js', F3)], { root, baseTree: base, installRecord, profile: profileOf([s]) });
+    expect(off.ok).toEqual([]);
+    expect(off.refused[0]?.reason).toMatch(ISOLATED);
+    const on = await guardCreatedFiles([cf('api/test/ok.test.js', GOOD)], { root, baseTree: base, installRecord, profile: profileOf([s]), isolatedTestJob: true });
+    expect(on.ok.map((f) => f.path)).toEqual(['api/test/ok.test.js']);
+  });
+  it('the referee, the guard and the producer say it with the same words', async () => {
+    const s = svc();
+    const r = await refereeWith([cf('api/test/a.test.js')], s, {});
+    const { root, base } = repo({ 'api/package.json': '{"name":"api"}\n' });
+    const g = await guardCreatedFiles([cf('api/test/a.test.js')], { root, baseTree: base, installRecord: null, profile: profileOf([s]) });
+    const p = await createStarterTests(s, profileOf([s]), bundle, mockAi([ans([])]).p, deps({ isolatedTestJob: false }));
+    const words = (t: string): string => (ISOLATED.exec(t) ?? [''])[0];
+    expect(words(r.issues[0]?.message ?? '')).not.toBe('');
+    expect(words(g.refused[0]?.reason ?? '')).toBe(words(r.issues[0]?.message ?? ''));
+    expect(words(p.notes[0] ?? '')).toBe(words(r.issues[0]?.message ?? ''));
   });
 });

@@ -8,7 +8,7 @@ import { SecretVault } from '../src/create/secrets.js';
 import { analyzeTestFile } from '../src/create/test-rules.js';
 import { withActiveVault } from '../src/util/known-values.js';
 
-const probs = (src: string, rel = 'test/a.test.ts', deps: string[] = []): string[] => analyzeTestFile(rel, src, deps).problems;
+const probs = (src: string, rel = 'test/a.test.ts'): string[] => analyzeTestFile(rel, src).problems;
 const refused = (src: string, re: RegExp, rel = 'test/a.test.ts'): void => {
   const p = probs(src, rel);
   expect(p.length, src).toBeGreaterThan(0);
@@ -123,12 +123,12 @@ describe('M4: arguments only inside a non-arrow function', () => {
 
 describe('M5: assertions after an early return or throw do not count', () => {
   it('the review repro (0 assertions run, 1 counted)', () => {
-    const r = analyzeTestFile('test/a.test.ts', "import { it, expect } from 'vitest';\nconst v = 1;\nit('c', () => {\n  return;\n  expect(v).toBe(2);\n});\n", []);
+    const r = analyzeTestFile('test/a.test.ts', "import { it, expect } from 'vitest';\nconst v = 1;\nit('c', () => {\n  return;\n  expect(v).toBe(2);\n});\n");
     expect(r.assertions).toBe(0);
     expect(r.problems.join(' ')).toMatch(/no assertion/);
-    const t = analyzeTestFile('test/a.test.ts', "import { it, expect } from 'vitest';\nconst v = 1;\nit('c', () => {\n  throw new Error('x');\n  expect(v).toBe(2);\n});\n", []);
+    const t = analyzeTestFile('test/a.test.ts', "import { it, expect } from 'vitest';\nconst v = 1;\nit('c', () => {\n  throw new Error('x');\n  expect(v).toBe(2);\n});\n");
     expect(t.assertions).toBe(0);
-    expect(analyzeTestFile('test/a.test.ts', "import { it, expect } from 'vitest';\nconst v = 1;\nit('c', () => {\n  expect(v).toBe(1);\n  return expect(v).toBe(1);\n  expect(v).toBe(2);\n});\n", []).assertions).toBe(2);
+    expect(analyzeTestFile('test/a.test.ts', "import { it, expect } from 'vitest';\nconst v = 1;\nit('c', () => {\n  expect(v).toBe(1);\n  return expect(v).toBe(1);\n  expect(v).toBe(2);\n});\n").assertions).toBe(2);
   });
 });
 
