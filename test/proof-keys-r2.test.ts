@@ -113,6 +113,9 @@ describe('R2: environment secrets and variables', () => {
     expect(isExcerptEvidence(await brand())).toBe(true);
     w.s.environments = { prod: { held: [], vars: [{ name: 'API_TOKEN', value: TYPED }] } };
     expect(await brand()).toBeNull();
+    w.s.environments = { prod: { held: [], vars: [{ name: 'OTHER_CONFIG', value: '2026-11-03' }] } };   // undeclared, even holding a date
+    expect(await brand()).toBeNull();
+    expect(K.lastRefusal).toMatch(/OTHER_CONFIG.*doesn't declare/);
     w.s.environments = { prod: { held: [], vars: [{ name: 'PIPEGEN_BLOCK_FROM', value: TYPED }] } };
     expect(await brand()).toBeNull();
     // unreadable: the environment list, one environment's secrets, one environment's variables
