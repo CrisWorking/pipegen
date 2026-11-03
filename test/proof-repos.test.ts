@@ -435,7 +435,23 @@ describe('E1 repos (plan Task 1, preflight S1/S13/S19)', () => {
     await expect(guardedWrite(g.gh, okCentral, 'PUT /repos/{owner}/{repo}/actions/secrets/{secret_name}', { [SN_KEY]: 'X', encrypted_value: 'x', key_id: '1' })).rejects.toThrow(ScratchGuardError);
     expect(g.calls).toEqual([]);
 
-    // and the source: no GitHub write in src/proof outside target.ts (every write goes through the guard)
+    // and the source: no GitHub write in src/proof outside target.ts. This scan is a lint, not the boundary: the real
+    // guard is at run time (guardedWrite takes registered handles and write rules; githubRead takes GET routes only).
+    // It catches the obvious ways around them: Octokit write calls, a non-literal or spaced route, an aliased or
+    // destructured request/graphql, bracket access on a client, .request.bind/call/apply, fetch( and @octokit/request.
+    const FETCH_ALLOWED: string[] = [];   // no file in src/proof needs fetch
+    for (const f of readdirSync(join(import.meta.dirname, '..', 'src', 'proof')).filter((x) => x.endsWith('.ts'))) {
+      const src = readFileSync(join(import.meta.dirname, '..', 'src', 'proof', f), 'utf8');
+      if (!FETCH_ALLOWED.includes(f)) expect(src, f).not.toMatch(/\bfetch\s*\(/);
+      expect(src, f).not.toMatch(/@octokit\/(?:request|graphql|core)\b/);
+      expect(src, f).not.toMatch(/\{[^{}]*\b(?:request|graphql)\b[^{}]*\}\s*=\s*[\w.]+/);   // const { request } = gh
+      expect(src, f).not.toMatch(/\b(?:gh|octokit)\s*\[/);   // gh['request'], gh[x] (src/proof names its client gh)
+      expect(src, f).not.toMatch(/\[\s*['"`](?:request|graphql|rest)['"`]\s*\]/);
+      expect(src, f).not.toMatch(/\.(?:request|graphql)\s*\.(?:bind|call|apply)\b/);
+      expect(src, f).not.toMatch(/=\s*[\w.]+\.(?:request|graphql)\s*[;,)\n]/);              // const r = gh.request;
+      if (f !== 'target.ts') expect(src, f).not.toMatch(/\.request\s+\(/);
+    }
+    // the obvious ways around the guard
     const dir = join(import.meta.dirname, '..', 'src', 'proof');
     for (const f of readdirSync(dir).filter((x) => x.endsWith('.ts') && x !== 'target.ts')) {
       const src = readFileSync(join(dir, f), 'utf8');

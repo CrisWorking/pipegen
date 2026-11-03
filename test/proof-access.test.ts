@@ -50,6 +50,7 @@ describe('checkScratchAccess (E1 fix round 1, I2)', () => {
       `GET /repos/${OWNER}/${SCRATCH}`,
       'GET /user',
       `GET /repos/${OWNER}/${SCRATCH}/collaborators?affiliation=all&per_page=100&page=1`,
+      `GET /repos/${OWNER}/${SCRATCH}/invitations?per_page=100&page=1`,
       `GET /repos/${OWNER}/${SCRATCH}/keys?per_page=100&page=1`,
     ]);
     expect(pushUnsurePrompt(r.scratch)).toBe(PUSH_PROMPT);
@@ -67,6 +68,7 @@ describe('checkScratchAccess (E1 fix round 1, I2)', () => {
       'GET /user',
       `GET /orgs/${ORG}/members?role=admin&per_page=100&page=1`,
       `GET /repos/${ORG}/${SCRATCH}/collaborators?affiliation=all&per_page=100&page=1`,
+      `GET /repos/${ORG}/${SCRATCH}/invitations?per_page=100&page=1`,
       `GET /repos/${ORG}/${SCRATCH}/teams?per_page=100&page=1`,
       `GET /repos/${ORG}/${SCRATCH}/keys?per_page=100&page=1`,
     ]);
@@ -206,7 +208,7 @@ describe('checkScratchAccess (E1 fix round 1, I2)', () => {
     custom.role_name = 'security-manager';
     const yes = check({ collaborators: [person(OWNER, 1, 'admin'), custom] }, {}, app(), [true]);
     expect((await yes.result).accepted).toEqual([expect.stringMatching(/^pushers: /)]);
-    expect(yes.io.all()).toMatch(/auditor.*security-manager/);
+    expect(yes.io.all()).toMatch(/auditor#4 has the custom role security-manager/);
     const no = check({ collaborators: [person(OWNER, 1, 'admin'), custom] }, {}, app(), [false]);
     await expect(no.result).rejects.toThrow(ProofStopError);
   });
@@ -276,8 +278,12 @@ describe('checkScratchAccess (E1 fix round 1, I2)', () => {
   });
 
   it('push is judged by every flag: maintain or admin alone counts; an org login is never "the owner" of an org repo; an unreadable list shape → prompt', async () => {
-    for (const permissions of [{ pull: true, push: false, maintain: true, admin: false }, { pull: true, push: false, maintain: false, admin: true }]) {
-      const odd = { login: 'odd', id: 9, type: 'User', role_name: 'write', permissions };
+    // each flag on its own, under a role that doesn't mean push (read, or a custom one): the flag decides
+    for (const [role, permissions] of [
+      ['read', { pull: true, push: true, maintain: false, admin: false }], ['read', { pull: true, push: false, maintain: true, admin: false }],
+      ['read', { pull: true, push: false, maintain: false, admin: true }], ['custom-x', { pull: true, push: true, maintain: false, admin: false }],
+    ] as const) {
+      const odd = { login: 'odd', id: 9, type: 'User', role_name: role, permissions };
       const { result } = check({ collaborators: [person(OWNER, 1, 'admin'), odd] });
       await expect(result, JSON.stringify(permissions)).rejects.toThrow(/push to CrisWorking\/pipegen-proof-shop: odd\./);
     }
@@ -302,7 +308,7 @@ describe('checkScratchAccess (E1 fix round 1, I2)', () => {
   it('teams fail closed (security scan): a missing or unknown permission → prompt; a permissions object with push, maintain or admin → stop', async () => {
     for (const team of [{ slug: 'ghost' }, { slug: 'custom', permission: 'security-manager' }, { slug: 'nul', permission: null }]) {
       const yes = check({ teams: [team] }, {}, orgApp(), [true]);
-      expect((await yes.result).accepted, JSON.stringify(team)).toEqual([expect.stringMatching(new RegExp(`^pushers: the team ${team.slug} has the permission`))]);
+      expect((await yes.result).accepted, JSON.stringify(team)).toEqual([expect.stringMatching(new RegExp(`^pushers: \\["the team ${team.slug}#\\? has the permission`))]);
       const no = check({ teams: [team] }, {}, orgApp(), [false]);
       await expect(no.result, JSON.stringify(team)).rejects.toThrow(ProofStopError);
       expect(no.io.prompt.asked.map((a) => a.msg)).toEqual([`pipegen could not confirm who can push to ${ORG}/${SCRATCH}. Anyone who can push can read your real test keys stored there. Continue?`]);
@@ -318,11 +324,11 @@ describe('checkScratchAccess (E1 fix round 1, I2)', () => {
 
   it('collaborators fail closed (security scan): no permissions object → prompt', async () => {
     for (const permissions of [undefined, null, 'write']) {
-      const p = { login: 'shadow', id: 5, type: 'User', role_name: 'write', permissions } as never;
+      const p = { login: 'shadow', id: 5, type: 'User', role_name: 'read', permissions } as never;   // role write would be push (N1)
       const no = check({ collaborators: [person(OWNER, 1, 'admin'), p] }, {}, app(), [false]);
       await expect(no.result, String(permissions)).rejects.toThrow(ProofStopError);
       expect(no.io.prompt.asked.map((a) => a.msg)).toEqual([PUSH_PROMPT]);
-      expect(no.io.all()).toContain("GitHub didn't say what shadow may do");
+      expect(no.io.all()).toContain("GitHub didn't say what shadow#5 may do");
     }
   });
 
@@ -330,7 +336,7 @@ describe('checkScratchAccess (E1 fix round 1, I2)', () => {
     const g = world({ repos: { [SCRATCH]: { private: true, keys: null } } });
     const t = proofTarget(app());
     const first = await checkScratchAccess(g.gh, t, ioWith(true));
-    expect(first.accepted).toEqual([`pushers: pipegen couldn't read the deploy keys of ${OWNER}/${SCRATCH}`]);
+    expect(first.accepted).toEqual([`pushers: ${JSON.stringify([`pipegen couldn't read the deploy keys of ${OWNER}/${SCRATCH}`])}`]);
     // the same doubt again: not asked
     const same = ioWith();
     expect((await checkScratchAccess(g.gh, t, same, { accepted: first.accepted })).accepted).toEqual(first.accepted);
@@ -347,10 +353,82 @@ describe('checkScratchAccess (E1 fix round 1, I2)', () => {
     const other = ioWith(true);
     const r = await checkScratchAccess(g.gh, t, other, { accepted: first.accepted });
     expect(other.prompt.asked).toHaveLength(1);
-    expect(r.accepted).toEqual([expect.stringContaining('auditor has the custom role security-manager')]);
+    expect(r.accepted).toEqual([expect.stringContaining('auditor#4 has the custom role security-manager')]);
     // the key is the sorted reasons, whatever order they were found in
     const two = world({ repos: { [SCRATCH]: { private: true, keys: null } }, me: null });
     const k = await checkScratchAccess(two.gh, proofTarget(app()), ioWith(true));
-    expect(k.accepted).toEqual([`pushers: pipegen couldn't read the deploy keys of ${OWNER}/${SCRATCH}; pipegen couldn't read which GitHub user it acts as`]);
+    expect(k.accepted).toEqual([`pushers: ${JSON.stringify([`pipegen couldn't read the deploy keys of ${OWNER}/${SCRATCH}`, "pipegen couldn't read which GitHub user it acts as"])}`]);
+  });
+
+  it('N1: a write, maintain or admin role_name is push whatever the flags; flags that are missing or not booleans are unsure', async () => {
+    const shaped = (role: string, permissions: unknown) => ({ login: 'odd', id: 9, type: 'User', role_name: role, permissions }) as never;
+    for (const [role, permissions] of [['write', {}], ['maintain', { push: 'true' }], ['admin', { pull: true }], ['write', { push: false, maintain: false, admin: false }]] as const) {
+      const { result } = check({ collaborators: [person(OWNER, 1, 'admin'), shaped(role, permissions)] });
+      await expect(result, `${role} ${JSON.stringify(permissions)}`).rejects.toThrow(/push to CrisWorking\/pipegen-proof-shop: odd\./);
+    }
+    for (const permissions of [{}, { pull: true }, { push: 'true', maintain: false, admin: false }, { push: false, maintain: null, admin: false }, { push: false, maintain: false }]) {
+      const no = check({ collaborators: [person(OWNER, 1, 'admin'), shaped('read', permissions)] }, {}, app(), [false]);
+      await expect(no.result, JSON.stringify(permissions)).rejects.toThrow(ProofStopError);
+      expect(no.io.prompt.asked.map((a) => a.msg), JSON.stringify(permissions)).toEqual([PUSH_PROMPT]);
+      expect(no.io.all()).toContain("GitHub didn't say what odd#9 may do");
+    }
+    // an org admin by role name alone, with the owners list unreadable: can't be told from an owner → prompt, not a stop
+    const roleAdmin = check({ collaborators: [person('me', 1, 'admin'), shaped('admin', {})] }, { me: { login: 'me', id: 1 }, owners: null }, orgApp(), [true]);
+    expect((await roleAdmin.result).accepted[0]).toContain('odd#9 has admin access');
+    // flags given as an array: unsure
+    const arr = check({ collaborators: [person(OWNER, 1, 'admin'), shaped('read', [true, true])] }, {}, app(), [false]);
+    await expect(arr.result).rejects.toThrow(ProofStopError);
+    // well-formed read flags with a standard role: fine, no prompt
+    const fine = check({ collaborators: [person(OWNER, 1, 'admin'), shaped('read', { pull: true, triage: false, push: false, maintain: false, admin: false })] });
+    await expect(fine.result).resolves.toBeDefined();
+    expect(fine.io.prompt.asked).toEqual([]);
+  });
+
+  it('N2: every reason carries the id; the key is JSON of the sorted, de-duplicated reasons', async () => {
+    const nameless = (id: number) => ({ id, type: 'User', role_name: 'custom-x', permissions: { pull: true, triage: false, push: false, maintain: false, admin: false } }) as never;
+    const two = check({ collaborators: [person(OWNER, 1, 'admin'), nameless(7), nameless(8)] }, {}, app(), [true]);
+    const key = (await two.result).accepted[0] as string;
+    expect(key.startsWith('pushers: ')).toBe(true);
+    expect(JSON.parse(key.slice('pushers: '.length))).toEqual(['(unnamed)#7 has the custom role custom-x, which may allow pushing', '(unnamed)#8 has the custom role custom-x, which may allow pushing']);
+    // a role name holding "; " stays one reason, and can't be mistaken for two
+    const semi = person('auditor', 4, 'read');
+    semi.role_name = 'a; b';
+    const one = check({ collaborators: [person(OWNER, 1, 'admin'), semi] }, {}, app(), [true]);
+    const k1 = (await one.result).accepted[0] as string;
+    expect(JSON.parse(k1.slice('pushers: '.length))).toEqual(['auditor#4 has the custom role a; b, which may allow pushing']);
+    const a = person('auditor', 4, 'read'); a.role_name = 'a';
+    const b = person('b', 5, 'read'); b.role_name = 'x';
+    const split = check({ collaborators: [person(OWNER, 1, 'admin'), a, b] }, {}, app(), [true]);
+    expect((await split.result).accepted[0]).not.toBe(k1);
+    // teams carry their id too
+    const team = check({ teams: [{ id: 42, slug: 'ghost' }] }, {}, orgApp(), [true]);
+    expect((await team.result).accepted[0]).toContain('the team ghost#42 has the permission');
+    // the same reason twice counts once
+    const dup = check({ collaborators: [person(OWNER, 1, 'admin'), nameless(7), nameless(7)] }, {}, app(), [true]);
+    expect(JSON.parse(((await dup.result).accepted[0] as string).slice('pushers: '.length))).toHaveLength(1);
+  });
+
+  it('N4: a pending invitation with write, maintain or admin → stop listing the invitee; read/triage fine; unknown value or unreadable → prompt', async () => {
+    const invite = (login: string, id: number, permissions: unknown) => ({ id: 100 + id, invitee: { login, id }, permissions });
+    for (const level of ['write', 'maintain', 'admin']) {
+      const { g, result } = check({ invitations: [invite('newbie', 3, level), invite('watcher', 4, 'read')] });
+      await expect(result, level).rejects.toThrow(/invited to push to CrisWorking\/pipegen-proof-shop: newbie\./);
+      await expect(result).rejects.not.toThrow(/watcher/);
+      expect(g.writes()).toEqual([]);
+    }
+    const reads = check({ invitations: [invite('watcher', 4, 'read'), invite('tri', 5, 'triage')] });
+    await expect(reads.result).resolves.toBeDefined();
+    expect(reads.io.prompt.asked).toEqual([]);
+    for (const permissions of ['custom-role', undefined, null, 3]) {
+      const no = check({ invitations: [invite('who', 6, permissions)] }, {}, app(), [false]);
+      await expect(no.result, String(permissions)).rejects.toThrow(ProofStopError);
+      expect(no.io.prompt.asked.map((a) => a.msg)).toEqual([PUSH_PROMPT]);
+      expect(no.io.all()).toContain('who#6');
+    }
+    const unread = check({ invitations: null }, {}, app(), [true]);
+    expect(JSON.parse(((await unread.result).accepted[0] as string).slice('pushers: '.length))).toEqual([`pipegen couldn't read the pending invitations to ${OWNER}/${SCRATCH}`]);
+    // an org repo too
+    const org = check({ invitations: [invite('newbie', 3, 'admin')] }, {}, orgApp());
+    await expect(org.result).rejects.toThrow(/newbie/);
   });
 });

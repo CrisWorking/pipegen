@@ -32,6 +32,8 @@ export interface FakeRepo {
   collaboratorsBody?: unknown;
   teams?: Record<string, unknown>[] | null;
   keys?: Record<string, unknown>[] | null;
+  /** Pending invitations (GET …/invitations; `permissions` is a string there). null: 403. Default []. */
+  invitations?: Record<string, unknown>[] | null;
 }
 
 export interface Person { login: string; id: number; type?: string; permissions?: Record<string, boolean>; role_name?: string }
@@ -175,6 +177,7 @@ export function world(opts: WorldOptions = {}): World {
       return list === null ? forbidden() : page(c, list);
     }
     if (m === 'GET' && rest === 'teams') return r.teams === null ? forbidden() : page(c, r.teams ?? []);
+    if (m === 'GET' && rest === 'invitations') return r.invitations === null ? forbidden() : page(c, r.invitations ?? []);
     if (m === 'GET' && rest === 'keys') return r.keys === null ? forbidden() : page(c, r.keys ?? []);
     if (rest === 'actions/permissions' && m === 'GET') {
       const a = opts.actions?.[name];
