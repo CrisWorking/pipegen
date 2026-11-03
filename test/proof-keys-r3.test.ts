@@ -68,7 +68,7 @@ describe('N1: the brand covers only runs that started after the ticket (GitHub s
     expect(await K.evidence(await K.ticket(), [7])).toBeNull();
     expect(K.lastRefusal).toMatch(/server time/);
     w.s.dateHeader = undefined;
-    for (const started of [null, 'yesterday', '']) {
+    for (const started of [null, 'yesterday', '', 'Tue, 03 Nov 2026 23:00:00 GMT']) {   // the last: a date, but not GitHub's ISO form
       w.s.runs.set(7, { status: 'completed', run_attempt: 1, run_started_at: started });
       expect(await K.evidence(await K.ticket(), [7]), String(started)).toBeNull();
       expect(K.lastRefusal).toMatch(/start time for run 7/);
