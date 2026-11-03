@@ -256,6 +256,17 @@ describe('errorExcerpt: scrub before cutting (E0a)', () => {
     v.wipe();
   });
 
+  it('excerpt: scan 4: an armor line that also names a key is hidden while armor mode lasts (the armor check comes first)', async () => {
+    const v = vault();
+    // after a dropped line, no END anywhere: armor mode. The second body line holds KEY and a CR, so it also starts a key hide.
+    const body = [`${fake.keyBody()}A1`, `MIIEKEYw\r${'w'.repeat(56)}B2`, `${fake.keyBody()}C3`];
+    const log = [`${TS}${ESC}(Bdumping`, ...body.map((b) => `${TS}${b}`), `${TS}Error: done`].join('\n');
+    const out = await errorExcerpt(log, composed(v), clean());
+    expect(out).toContain('Error: done');
+    for (const b of body) expect(out).not.toContain(b.replace('\r', '').slice(-20));
+    v.wipe();
+  });
+
   it('excerpt: ruling E0a-R1: unterminated C1 OSC introducers stay linear (64 KiB line, and many 4 KB lines)', async () => {
     const v = vault();
     for (const log of [`Error: x\n${'\u009d'.repeat(64 * 1024)}`, `Error: x\n${Array.from({ length: 256 }, () => '\u009d'.repeat(4000)).join('\n')}`]) {

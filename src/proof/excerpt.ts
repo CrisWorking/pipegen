@@ -119,15 +119,25 @@ const DROPPED_CSI = /(?:\u001b\[|\u009b)[\u0030-\u003f]*[\u0020-\u002f]*[\u0040-
 const DROPPED_ESC = /\u001b[\u0020-\u002f]*[\u0030-\u007e]?/g;
 const ESC_C1 = /[\u001b\u0080-\u009f]/g;
 const withoutSequences = (line: string) => line.replace(DROPPED_OSC, '').replace(DROPPED_CSI, '').replace(DROPPED_ESC, '').replace(ESC_C1, '');
+// the sequences again, with their final byte kept: a final byte can be a letter the sequence "ate" from a key marker
+const keepFinal = (m: string) => {
+  const last = m.charCodeAt(m.length - 1);
+  return m.length > 1 && last >= 0x40 && last <= 0x7e && !(m.length === 2 && (last === 0x5b || last === 0x5d)) ? m[m.length - 1] as string : '';
+};
+const withFinals = (line: string) => line.replace(DROPPED_CSI, keepFinal).replace(DROPPED_ESC, keepFinal).replace(ESC_C1, '');
+const LINE_SEPS = /[\u2028\u2029]/g;
+
 /**
- * Ruling E0a-R1 (a): the readings of a dropped line, since no one way of taking escapes out is right for every line (a sequence's final
- * byte can be a letter of the marker): whole sequences removed (lines within MAX_REGEX_LINE_BYTES only), only the ESC and C1 characters
- * removed, and every non-printable character removed (stripChars: controls, bidi, invisibles). Duplicates once.
+ * Ruling E0a-R1 (a), widened by scan 4: the readings of a line, since no one way of taking escapes and invisible characters out is right
+ * for every line (a sequence's final byte can be a letter of the marker; a CR, LS or tab can split it): escape sequences removed whole, the
+ * same with their final bytes kept (both for lines within MAX_REGEX_LINE_BYTES only), and only the ESC and C1 characters removed; and each
+ * of those with every non-printable character removed too (stripChars: controls, bidi, invisibles; and LS/PS). Duplicates once.
  */
 function readings(line: string): string[] {
-  const chars = line.replace(ESC_C1, '');
-  const all = [...(bytesOf(line) <= MAX_REGEX_LINE_BYTES ? [withoutSequences(line)] : []), chars, stripChars(line)];
-  return [...new Set(all)];
+  const guarded = bytesOf(line) <= MAX_REGEX_LINE_BYTES ? [withoutSequences(line), withFinals(line)] : [];
+  const base = [...guarded, line.replace(ESC_C1, '')];
+  // fuzz (scan 4): a sequence and an LS in one line need both taken out, so each reading also has its non-printable-free form
+  return [...new Set([...base, ...base.map((r) => stripChars(r).replace(LINE_SEPS, ''))])];
 }
 /** Ruling E0a-R1 (a): a word of a key name in a reading, either one, any case. */
 const NAMES_KEY = /private|key/i;
@@ -215,45 +225,68 @@ function lineAtMagic(lines: string[]): number {
   return -1;
 }
 
+interface Read {
+  /** The line as shown (steps 1-2), or null when step 3 drops it. */
+  shown: string | null;
+  /** Its other readings, each redacted on its own as a tagged copy next to it (scan 4: never joined into one line). */
+  copies: string[];
+  /** OR across the line and its readings: an END key marker; a word of a key name (only for a line step 2 changed, dropped or holding
+   *  a character stripChars or LS/PS would take out); armor-shaped. */
+  ends: boolean;
+  namesKey: boolean;
+  armor: boolean;
+}
+
+function readLine(raw: string): Read {
+  const c = cleanLine(raw);
+  const base = c.drop ? null : c.line;
+  const suspect = c.drop || c.before !== null || stripChars(c.line).replace(LINE_SEPS, '') !== c.line;
+  const rs = suspect ? readings(c.before ?? c.line) : [];
+  const all = base === null ? rs : [base, ...rs];
+  return {
+    shown: base,
+    copies: rs.filter((r) => r !== base),
+    ends: all.some((r) => lastKeyMarker(r, 'END') >= 0),
+    namesKey: suspect && all.some((r) => NAMES_KEY.test(r)),
+    armor: all.some(isArmor),
+  };
+}
+
 /**
- * The excerpt of a failing CI log that the fix loop may send to the AI (ruling B1; the steps are in this file's header). `scrub` is the
- * composed known-value scrubber. Throws SecretScanError when the secret scan can't run or does not confirm it read the excerpt: then
- * nothing may be sent.
+ * Steps 1-6 of errorExcerpt, without the secret scan: NOT safe to send. Exported for the excerpt's fuzz test (the scan only removes
+ * lines, so what holds here holds for errorExcerpt). `maxLogChars` replaces MAX_LOG_CHARS in tests only.
  */
-export async function errorExcerpt(logs: string, scrub: (text: string) => string, scanner: SecretScanner, opts: { timeoutMs?: number } = {}): Promise<string> {
+export function unscannedExcerpt(logs: string, scrub: (text: string) => string, testOpts: { maxLogChars?: number } = {}): string[] {
+  const maxLogChars = testOpts.maxLogChars ?? MAX_LOG_CHARS;
   let text = String(logs);
   let guard = 0;
   let cut = false;
   let insideKey = false;
-  if (text.length > MAX_LOG_CHARS) {
-    const from = text.indexOf('\n', text.length - MAX_LOG_CHARS);
+  if (text.length > maxLogChars) {
+    const from = text.indexOf('\n', text.length - maxLogChars);
     insideKey = endsInsideKey(from < 0 ? text : text.slice(0, from));
     text = from < 0 ? '' : text.slice(from + 1);
     guard = HEAD_GUARD_LINES;
     cut = true;
   }
-  // steps 1-3. A dropped line is kept in place for now, with its escape sequences removed whole and a random tag after its indentation
-  // and at its end (so redact's indent and key rules still see it, and every piece of it redact keeps carries a tag); it goes after the
-  // whole-log pass. Lines that may be a private key body are hidden the same way:
-  // - up to the next END marker line, after a cut inside a key block or after a dropped line that names a private key (fail closed: its
-  //   marker may be unreadable);
-  // - with no END marker ahead, or after any other dropped line, while the lines look like armor (base64, armor headers, blank lines).
+  // steps 1-3. A hidden line (dropped by step 3, in the head guard, or maybe part of a private key body) is kept in place for now as
+  // tagged copies, one per reading, each with a random tag after its indentation and at its end, so redact's indent and key rules
+  // still see it and every piece of it redact keeps carries a tag; they go after the whole-log pass. A shown line whose readings differ
+  // from it gets the same tagged copies right after it (so a BEGIN marker any reading kept whole starts redact's key block). A possible
+  // key body is hidden:
+  // - up to the next END marker line, after a cut inside a key block, or after a line that names a private key in any reading
+  //   (fail closed: its marker may be unreadable);
+  // - with no END marker ahead, after any other dropped line, and at the start of a cut tail: while the lines look like armor
+  //   (base64, armor headers, blank lines) in any reading. A line that is armor while that lasts is always hidden.
   const tag = `\u0000pipegen-dropped-${randomBytes(8).toString('hex')}\u0000`;
-  // a dropped line's copy for redact holds all its readings, one after another (redact finds a marker in whichever kept it whole)
-  const lines0 = text.split('\n').map((raw) => {
-    const c = cleanLine(raw);
-    // a line step 2 changed is shown as step 2 left it, but its readings still decide the key hide (a CSI's final byte can be a letter
-    // of the marker: `PRIVATE ESC[1;3KEY` reads as `PRIVATE EY` once the sequence is gone)
-    if (!c.drop) {
-      const rs = c.before === null ? [c.line] : [c.line, ...readings(c.before)];
-      return { line: c.line, drop: false, ends: rs.some((r) => lastKeyMarker(r, 'END') >= 0), namesKey: c.before !== null && rs.some((r) => NAMES_KEY.test(r)) };
-    }
-    const rs = readings(c.line);
-    return { line: rs.join(' '), drop: true, ends: rs.some((r) => lastKeyMarker(r, 'END') >= 0), namesKey: rs.some((r) => NAMES_KEY.test(r)) };
-  });
+  const tagged = (r: string) => {
+    const indent = /^[ \t]*/.exec(r)?.[0] ?? '';
+    return `${indent}${tag}${r.slice(indent.length)}${tag}`;
+  };
+  const lines0 = text.split('\n').map(readLine);
   const nextEnd = new Int32Array(lines0.length);
   for (let i = lines0.length - 1, next = -1; i >= 0; i--) {
-    if ((lines0[i] as { ends: boolean }).ends) next = i;
+    if ((lines0[i] as Read).ends) next = i;
     nextEnd[i] = next;
   }
   let hideTo = -1;
@@ -267,30 +300,42 @@ export async function errorExcerpt(logs: string, scrub: (text: string) => string
     if (insideKey) startKeyHide(0);
     else armor = true;
   }
-  const cleaned = lines0.map(({ line, drop, ends, namesKey }, i) => {
-    let hidden = drop || i <= hideTo;
-    if (namesKey && !ends && i >= hideTo) startKeyHide(i + 1);
-    else if (drop && i >= hideTo) armor = true;
-    else if (armor && i > hideTo) {
-      if (isArmor(line)) hidden = true;
-      if (!isArmor(line) || lastKeyMarker(line, 'END') >= 0) armor = false;
+  const cleaned = lines0.map((r, i) => {
+    let hidden = r.shown === null || i <= hideTo || i < guard;
+    // scan 4: the armor check comes first, so an armor line is hidden even when it also starts a key hide
+    if (armor && i > hideTo) {
+      if (r.armor) hidden = true;
+      if (!r.armor || r.ends) armor = false;
     }
-    if (!hidden) return line;
-    const indent = /^[ \t]*/.exec(line)?.[0] ?? '';
-    return `${indent}${tag}${line.slice(indent.length)}${tag}`;
+    if (i >= hideTo) {
+      if (r.namesKey && !r.ends) startKeyHide(i + 1);
+      else if (r.shown === null) armor = true;
+    }
+    const out = hidden ? [] : [r.shown as string];
+    for (const x of hidden && r.shown !== null ? [r.shown, ...r.copies] : r.copies) out.push(tagged(x));
+    return out.join('\n');
   });
-  // scrub before cutting: the whole cleaned log, before any line is picked (merged lines only lower the count, so the guard still covers);
-  // then every line that still carries the tag goes
-  const whole = redact(scrub(cleaned.join('\n'))).split('\n').slice(guard).filter((l) => !l.includes(tag));
+  // scrub before cutting: the whole cleaned log, before any line is picked; then every line that still carries the tag goes
+  const whole = redact(scrub(cleaned.join('\n'))).split('\n').filter((l) => !l.includes(tag));
   // step 4
   const picked = pick(whole);
-  if (picked.length === 0) return '';
+  if (picked.length === 0) return [];
   // step 5
   const redacted = redact(picked.join('\n'));
   // step 6: per line first, so a hit in one line's display or stripped form doesn't flatten the others; then the whole text
   const check = { scrubber: () => scrub };
   const perLine = redacted.split('\n').map((l) => scrubForDisplay(check, l, identity)).join('\n');
-  let lines = capLines(scrubForDisplay(check, perLine, identity).split('\n'));
+  return capLines(scrubForDisplay(check, perLine, identity).split('\n'));
+}
+
+/**
+ * The excerpt of a failing CI log that the fix loop may send to the AI (ruling B1; the steps are in this file's header). `scrub` is the
+ * composed known-value scrubber. Throws SecretScanError when the secret scan can't run or does not confirm it read the excerpt: then
+ * nothing may be sent.
+ */
+export async function errorExcerpt(logs: string, scrub: (text: string) => string, scanner: SecretScanner, opts: { timeoutMs?: number } = {}): Promise<string> {
+  let lines = unscannedExcerpt(logs, scrub);
+  if (lines.length === 0) return '';
   // step 7
   for (let k = 0; k < LATE_MAGIC.length && scannersWouldSkip(SCAN_PREFIX + lines.join('\n')); k++) {
     const at = lineAtMagic(lines);
