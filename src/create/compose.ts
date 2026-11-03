@@ -139,7 +139,13 @@ function versionCheck(kind: DepKey, version: unknown): { note?: string; fatal?: 
 // ---------- the plan ----------
 
 interface App { key: string; context: string; port: number; deps: DepKey[]; env: string[]; svc: Service; depObjs: (Dependency & { kind: DepKey })[] }
-export interface ComposePlan { text: string | null; notes: string[]; /** the runtime env of the apps in the file (empty when there is no file) */ env: RuntimeEnv; envNotes: string[] }
+/** One app container of the file (E3: the proof harness's app-start builds each and probes its port). */
+export interface ComposeApp { key: string; context: string; port: number; service: string }
+export interface ComposePlan {
+  text: string | null; notes: string[]; /** the runtime env of the apps in the file (empty when there is no file) */ env: RuntimeEnv; envNotes: string[];
+  /** The app containers of the file, sorted by key (empty when there is no file). */
+  apps: ComposeApp[];
+}
 
 /** Whether `<dir>/Dockerfile` exists (the reader found it) or is created in this draft. Only that exact file name is the one `dockerfile: Dockerfile` builds. */
 function hasDockerfile(s: Service, dir: string, created: ReadonlySet<string>): boolean {
@@ -155,7 +161,7 @@ function hasDockerfile(s: Service, dir: string, created: ReadonlySet<string>): b
 export function planCompose(p: RepoProfile, baseImages: readonly BaseImage[], createdDockerfiles: readonly string[] = []): ComposePlan {
   const notes: string[] = [];
   const note = (m: string): void => { const t = safeText(m, MAX_NOTE * 2); if (!notes.includes(t)) notes.push(t); };
-  const fail = (): ComposePlan => ({ text: null, notes, env: noEnv(), envNotes: [] });
+  const fail = (): ComposePlan => ({ text: null, notes, env: noEnv(), envNotes: [], apps: [] });
   const services = Array.isArray(p?.services) ? p.services.filter((s) => s !== null && typeof s === 'object') : [];
   const created = new Set(createdDockerfiles);
 
@@ -241,7 +247,10 @@ export function planCompose(p: RepoProfile, baseImages: readonly BaseImage[], cr
   }
   for (const m of envPlan.notes) note(m);
   apps.sort((a, b) => (a.key < b.key ? -1 : a.key > b.key ? 1 : 0));
-  return { text: emit(kinds, refs, apps), notes, env: { password: { name: DB_PASSWORD_NAME, bytes: DB_PASSWORD_BYTES }, vars: envPlan.vars }, envNotes: envPlan.notes };
+  return {
+    text: emit(kinds, refs, apps), notes, env: { password: { name: DB_PASSWORD_NAME, bytes: DB_PASSWORD_BYTES }, vars: envPlan.vars }, envNotes: envPlan.notes,
+    apps: apps.map((a) => ({ key: a.key, context: a.context, port: a.port, service: a.svc.name })),
+  };
 }
 
 /** The compose text for a profile, or null when pipegen proves nothing (see planCompose for the reasons). */

@@ -726,12 +726,23 @@ export function renderRuntimeEnv(rt: RuntimeEnv): RenderedStep {
   return bashStep('pipegen: set the test database environment', lines.join('\n'), id);
 }
 
+/** Where the proof harness's app-start writes its compose override (E3, ruling B7): in runner temp, never in the checkout. */
+export const PROOF_OVERRIDE_PATH = '$RUNNER_TEMP/pipegen-proof/docker-compose.pipegen.proof.yml';
+
 /**
  * The compose-up step (B6): starts the dependencies and the services built from the repo's Dockerfiles. It builds the repo's image, so it is a
  * repo-code step (a `repocode-` id; the order rule treats it as repo code). `--env-file /dev/null` keeps a `.env` of the repo from filling the
  * ${NAME} references. Plan E's app-start and Plan G's dependency jobs use it after renderRuntimeEnv.
+ * `proofOverride` (Plan E E3, ruling B7; the scratch-only harness, never delivered): adds the override file at PROOF_OVERRIDE_PATH, which
+ * only sets each app service's `image:` to the one app-start built with `docker build --network host`, and `--no-build`, so compose
+ * never builds on the bridge network (where Bullfrog blocks the package registries, spike S8). Without it the step is unchanged.
  */
-export function renderComposeUp(): RenderedStep {
+export function renderComposeUp(opts: { proofOverride?: true } = {}): RenderedStep {
+  if (opts.proofOverride === true) {
+    return bashStep('pipegen: start the services with docker compose (proof images, no build)',
+      `set -euo pipefail\ndocker compose --env-file /dev/null -f docker-compose.pipegen.yml -f "${PROOF_OVERRIDE_PATH}" up -d --wait --no-build`, `repocode-${sha16('compose-up-proof')}`);
+  }
+  if (opts.proofOverride !== undefined) throw new RenderError('proofOverride is true or absent.');
   return bashStep('pipegen: start the services with docker compose', 'set -euo pipefail\ndocker compose --env-file /dev/null -f docker-compose.pipegen.yml up -d --wait', `repocode-${sha16('compose-up')}`);
 }
 

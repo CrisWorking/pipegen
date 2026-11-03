@@ -1158,6 +1158,66 @@ export function projectScriptSteps(artifact: string, which: 'test' | 'lint', nod
   return [ci, runStep(`pipegen: run the project's ${which} script`, run, {}, `repocode-${sha16(`project-script:${artifact}:${which}`)}`)];
 }
 
+// ---------- the proof harness's helpers (Plan E E3) ----------
+
+const IMAGE_PIN_RE = /^[a-z0-9][a-z0-9._/-]{0,200}:[A-Za-z0-9._-]{1,128}@sha256:[0-9a-f]{64}$/;
+const RESULT_NAME_RE = /^pipegen-out-[a-z0-9][a-z0-9-]{0,120}$/;
+
+/**
+ * Plan E E3: the reviewed release install of a github-release tool (the same step renderCliTool uses: download over https only,
+ * sha256 checked, one regular file), for a harness job that runs the tool itself (cosign in sign-roundtrip). The binary is at
+ * `$RUNNER_TEMP/pipegen-bin/<artifact>/<exe>`, exe = the tool's first command word.
+ */
+export function releaseInstallStep(tool: ReviewedTool, artifact: string): { step: RenderedStep; bin: string } {
+  const cli = tool.step.cli;
+  if (cli === undefined || cli.install.method !== 'github-release' || tool.candidate.source !== 'reviewed' || tool.candidate.reviewed !== true) return refuse(`${show(tool.id)} is not a reviewed release binary.`);
+  const exe = cli.command[0];
+  if (exe === undefined || !EXE_RE.test(exe)) return refuse(`The executable of ${show(tool.id)} is not a plain name.`);
+  if (!RESULT_NAME_RE.test(`pipegen-out-${artifact}`)) return refuse(`${show(artifact)} is not a plain folder name.`);
+  return { step: releaseInstall(tool, cli.install, exe, artifact), bin: `$RUNNER_TEMP/pipegen-bin/${artifact}/${exe}` };
+}
+
+/**
+ * Plan E E3 (ruling S6, D7-R7): one run of a service's created (starter) tests, for the proof harness's tests-repeat (and, wrapped
+ * into its isolated job, Plan G). The repo's guarded `npm ci` (no scripts) with the static and installed check that `vitest` is the
+ * reviewed version, then the run in a container with NO network (spike S8: created tests never reach the internet, not even an
+ * allowed host): the service folder goes in with `docker cp -a` (no bind mount: Bullfrog refuses host paths while sudo is off), the
+ * container runs as the runner's user with no capabilities, and `vitest run --isolate --reporter=junit` writes the JUnit report,
+ * copied out to `${RUNNER_TEMP}/pipegen-out/<artifact>/junit.xml`. Never `--passWithNoTests` or `--allowOnly`. `image` is a base
+ * image pinned by digest (the Node line of the base-image list), `nodeMajor` the setup-node major of the job's prelude.
+ */
+export function renderStarterTestRun(svc: Service, opts: { vitest: ReviewedTool; image: string; nodeMajor: string; artifact: string }): RenderedStep[] {
+  const { vitest, image, nodeMajor, artifact } = opts;
+  const install = vitest.step.cli?.install;
+  if (vitest.id !== 'vitest-coverage' || vitest.candidate.source !== 'reviewed' || vitest.candidate.reviewed !== true || install === undefined || install.method !== 'npm' || install.package !== 'vitest') {
+    return refuse('The starter tests run only with the reviewed vitest entry.');
+  }
+  if (typeof image !== 'string' || !IMAGE_PIN_RE.test(image)) return refuse(`${show(image)} is not an image pinned by digest.`);
+  if (!/^\d{1,3}$/.test(nodeMajor)) return refuse('The Node major is not a plain number.');
+  if (!RESULT_NAME_RE.test(artifact)) return refuse(`${show(artifact)} is not a result artifact name.`);
+  if (typeof svc.path !== 'string' || (svc.path !== '' && svc.path !== '.' && !PLAIN_REL_RE.test(svc.path))) return refuse(`The folder of ${show(svc.name)} is not a plain folder.`);
+  const workingDir = svc.path === '' || svc.path === '.' ? undefined : svc.path;
+  const pins = npmPins(vitest, install).filter((p) => p.name === 'vitest');
+  const [ci, verify] = repoInstall(pins, artifact, nodeMajor, workingDir) as [RenderedStep, RenderedStep];
+  const out = `$RUNNER_TEMP/pipegen-out/${artifact}`;
+  const name = `pipegen-tests-${sha16(artifact)}`;
+  const run = script([
+    ...prologue(artifact), ...cdLines(workingDir),
+    `"\${sys[@]}" /usr/bin/docker rm -f ${name} > /dev/null 2>&1 || true`,
+    // no network, no capabilities, no new privileges, the runner's own user: the created tests can reach nothing
+    `"\${sys[@]}" /usr/bin/docker create --name ${name} --network none --user "$(id -u):$(id -g)" --security-opt no-new-privileges --cap-drop ALL --pull=never -e CI=true -e HOME=/tmp -w /pipegen-src "$PIPEGEN_IMAGE" node node_modules/vitest/vitest.mjs run --isolate --reporter=junit --outputFile.junit=/tmp/pipegen-junit/junit.xml > /dev/null`,
+    `"\${sys[@]}" /usr/bin/docker cp -a . ${name}:/pipegen-src`,
+    'rc=0',
+    `"\${sys[@]}" /usr/bin/docker start -a ${name} || rc=$?`,
+    `mkdir -p "${out}"`,
+    `"\${sys[@]}" /usr/bin/docker cp ${name}:/tmp/pipegen-junit/junit.xml "${out}/junit.xml" || echo "pipegen: the tests wrote no JUnit report" >&2`,
+    `"\${sys[@]}" /usr/bin/docker rm -f ${name} > /dev/null`,
+    'exit "$rc"',
+  ]);
+  const pull = runStep('pipegen: pull the Node image for the starter tests', script([...prologue(artifact), '"${sys[@]}" /usr/bin/docker pull --quiet "$PIPEGEN_IMAGE" > /dev/null']), { PIPEGEN_IMAGE: image }, `tool-pull-${sha16(`starter:${artifact}`)}`);
+  return [ci, verify, pull, runStep('pipegen: run the created tests (no network, isolated)', run, { PIPEGEN_IMAGE: image }, `repocode-${sha16(`starter-tests:${artifact}`)}`)];
+}
+
 // ---------- pip (ruling B5; R-C) ----------
 
 const REQUIREMENT_RE = /^([A-Za-z0-9][A-Za-z0-9._-]{0,100})==([0-9][0-9A-Za-z.+!_-]{0,40})((?: --hash=sha256:[0-9a-f]{64}){1,8})$/;

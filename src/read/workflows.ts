@@ -55,18 +55,28 @@ function secretsOf(text: string): string[] {
   return [...found].sort();
 }
 
+/**
+ * One job by the deploy rule of deploysOf (the same checks, exported for Plan E's compat copies, E3): an environment, a
+ * reusable workflow call or a step whose `uses` or `run` looks like a deploy.
+ */
+export function jobDeploys(job: unknown): boolean {
+  const j = asObj(job);
+  if ('environment' in j && j.environment !== null && j.environment !== undefined) return true;
+  if (strings(j.uses).some((u) => looksLikeDeploy(u, DEPLOY_RE))) return true; // reusable workflow call
+  for (const step of Array.isArray(j.steps) ? j.steps : []) {
+    const s = asObj(step);
+    if ([...strings(s.uses), ...strings(s.run)].some((t) => looksLikeDeploy(t, DEPLOY_RE))) return true;
+  }
+  return false;
+}
+
+/** A workflow's file path or a name (the workflow's or a job's) that says deploy, release or publish (E3 uses it per job). */
+export const namesDeploy = (text: unknown): boolean => typeof text === 'string' && looksLikeDeploy(text, NAME_OR_FILE_RE);
+
 function deploysOf(doc: Record<string, unknown>, path: string): boolean {
   if (regexSafe(path) && NAME_OR_FILE_RE.test(path)) return true;
   if (typeof doc.name === 'string' && looksLikeDeploy(doc.name, NAME_OR_FILE_RE)) return true;
-  for (const job of Object.values(asObj(doc.jobs))) {
-    const j = asObj(job);
-    if ('environment' in j && j.environment !== null && j.environment !== undefined) return true;
-    if (strings(j.uses).some((u) => looksLikeDeploy(u, DEPLOY_RE))) return true; // reusable workflow call
-    for (const step of Array.isArray(j.steps) ? j.steps : []) {
-      const s = asObj(step);
-      if ([...strings(s.uses), ...strings(s.run)].some((t) => looksLikeDeploy(t, DEPLOY_RE))) return true;
-    }
-  }
+  for (const job of Object.values(asObj(doc.jobs))) if (jobDeploys(job)) return true;
   return false;
 }
 
