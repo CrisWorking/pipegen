@@ -8,6 +8,7 @@
 // Fixed seed. PIPEGEN_E0A_FUZZ_CASES and PIPEGEN_E0A_FUZZ_SEED change the count and the seed for a one-off longer run.
 import { writeFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
+import { redact } from '../src/ai/redact.js';
 import { unscannedExcerpt } from '../src/proof/excerpt.js';
 
 const CASES = Number(process.env.PIPEGEN_E0A_FUZZ_CASES ?? 5000);
@@ -34,7 +35,7 @@ const NORMAL = [
   'Received: 500', 'Tests: 3 failed, 41 passed', 'error: the key could not be read', 'done in 4.2s',
 ];
 
-interface Case { shape: string; log: string; clean: string; runs: string[]; maxLogChars?: number; cleanMaxLogChars?: number }
+interface Case { shape: string; log: string; bare: string; runs: string[]; maxLogChars?: number }
 
 // secret-bearing names, built at runtime (test/no-secret-literals.test.ts)
 const VALUE_NAMES = [['pass', 'word'], ['client', '_sec', 'ret'], ['api', '_key'], ['to', 'ken'], ['db_pass', 'word'], ['sec', 'ret']].map((p) => p.join(''));
@@ -110,24 +111,17 @@ function makeCase(rnd: () => number): Case {
   if (rnd() < 0.7) before.push('Error: signing failed');
   if (rnd() < 0.7) after.unshift('Error: key rejected');
   const stamp = rnd() < 0.5;
-  const build = (block: string[]) => [...before, ...block, ...after].map((l) => (stamp ? TS + l : l));
-  const all = build(blockLines);
-  const allClean = build(cleanBlock);
+  const all = [...before, ...blockLines, ...after].map((l) => (stamp ? TS + l : l));
   const log = all.join('\n');
-  const clean = allClean.join('\n');
+  // the clean block, whole, without timestamps: what the coverage check gives redact
+  const bare = [...before, ...cleanBlock, ...after].join('\n');
   if (rnd() < 0.3 && blockLines.length > 1) {
     // cut inside the block: the tail starts on a line after a random point of a random block line after the first
     const line = before.length + 1 + int(blockLines.length - 1);
-    const f = rnd();
-    const cutAt = (xs: string[], text: string) => {
-      const pos = xs.slice(0, line).reduce((s, l) => s + l.length + 1, 0) + Math.floor(f * ((xs[line] as string).length + 1));
-      return text.length - pos;
-    };
-    const m = cutAt(all, log);
-    const cm = cutAt(allClean, clean);
-    if (m > 0 && cm > 0) return { shape, log, clean, runs, maxLogChars: m, cleanMaxLogChars: cm };
+    const pos = all.slice(0, line).reduce((n, l) => n + l.length + 1, 0) + Math.floor(rnd() * ((all[line] as string).length + 1));
+    if (log.length - pos > 0) return { shape, log, bare, runs, maxLogChars: log.length - pos };
   }
-  return { shape, log, clean, runs };
+  return { shape, log, bare, runs };
 }
 
 /** The 16-character runs of the case's runs that are in `excerpt`. */
@@ -152,9 +146,9 @@ describe('excerpt fuzz (E0a, scans 4 and 5)', () => {
       stats.set(kase.shape, st);
       st.cases++;
       if (kase.maxLogChars !== undefined) st.cuts++;
-      // a shape redact itself does not hide, even without a single inserted character, is Plan A's gap, not the excerpt's: counted
-      const cleanOut = unscannedExcerpt(kase.clean, scrub, kase.cleanMaxLogChars === undefined ? {} : { maxLogChars: kase.cleanMaxLogChars }).join('\n');
-      if (leaked(cleanOut, kase.runs).length > 0) {
+      // a case redact itself does not hide in the clean text (no inserted character, no timestamps, whole) is Plan A's gap, not the
+      // excerpt's: counted, not checked. Window-independent: the excerpt's windows move when it hides a line
+      if (leaked(redact(kase.bare), kase.runs).length > 0) {
         st.notCoveredClean++;
         continue;
       }
@@ -167,11 +161,11 @@ describe('excerpt fuzz (E0a, scans 4 and 5)', () => {
     }
     const report = [...stats].map(([k, v]) => `${k}: ${v.cases} cases, ${v.checked} checked, ${v.notCoveredClean} not covered by redact even clean, ${v.cuts} cut`).join('\n');
     if (process.env.PIPEGEN_E0A_FUZZ_REPORT !== undefined) writeFileSync(process.env.PIPEGEN_E0A_FUZZ_REPORT, `${report}\n`);
-    // the shapes redact covers must be checked in nearly every case (the clean run leaks only with a cut past the 64-line guard)
+    // the shapes redact covers must be checked in every case
     for (const shape of ['pem', 'yaml-block', 'yaml-literal', 'toml-section']) {
       const st = stats.get(shape);
       expect(st, report).toBeDefined();
-      expect((st as { checked: number }).checked, report).toBeGreaterThan((st as { cases: number }).cases * 0.9);
+      expect((st as { checked: number }).checked, report).toBe((st as { cases: number }).cases);
     }
   }, 900_000);
 });
