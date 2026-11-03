@@ -212,7 +212,7 @@ describe('snapshot read (E0c, S4)', () => {
     put(d, 'ok.txt', 'ok\n');
     commitAll(d);
     const blob = git(d, 'hash-object', '-w', 'ok.txt');
-    const odd = ['.git.', '.git ', '.GIT. .', '.Git..', 'git~1', 'GIT~1', 'Git~1', '.git::$DATA', '.git:stream', 'a:b', '.g\u200cit', '.git\u200d', '\ufeff.git', '.gi\u200et'];
+    const odd = ['.git.', '.git ', '.GIT. .', '.Git..', 'git~1', 'GIT~1', 'Git~1', '.git::$DATA', '.git:stream', 'a:b', '.g\u200cit', '.git\u200d', '\ufeff.git', '.gi\u200et', '...', ' ', '. .'];
     const fine = ['.gitignore', '.github', 'git~2', 'git~10', 'xgit~1', '.gitx', '.git-x', 'git', '.g.it'];
     const entries = [...odd, ...fine, 'ok.txt'].map((name) => Buffer.from(`100644 blob ${blob}\t${name}\0`));
     const tree = execFileSync(REAL_GIT, ['mktree', '-z'], { cwd: d, env: ENV, input: Buffer.concat(entries) }).toString().trim();
