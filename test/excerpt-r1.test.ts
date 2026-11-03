@@ -10,6 +10,8 @@ import { repoFiles, root } from './helpers/repo-files.js';
 import { fake } from './helpers/secret-repo.js';
 
 const V = 'Qz7mK2pW9xLr4TbN8vYc3HsJ6dFa1GeU';
+// built at runtime: no secret-looking literal is committed (test/no-secret-literals.test.ts)
+const SKT = ['sk', '_test_'].join('');
 const ESC = '\u001b';
 const vaultScrub = (value = V) => {
   const v = new SecretVault();
@@ -86,6 +88,63 @@ describe('excerpt fix round 1: a key open across a cut (I2)', () => {
       for (const out of [excerpt(all, (t) => t, all.length - cutAt), excerpt(all, (t) => t)]) {
         expect(body.filter((l) => out.includes(l.slice(10, 26))), JSON.stringify(beginLine)).toEqual([]);
       }
+    }
+  });
+});
+
+describe('excerpt fix round 1: rules the mutation run showed untested', () => {
+  it('excerpt r1: the value passes catch a value an escape cut in the middle of a messy line, also when the line shows another copy', () => {
+    const v = vaultScrub();
+    // the value is in the middle (no edge rule applies): only the reading that keeps the CSI's final byte holds it whole
+    expect(runs9(excerpt(['ok', `Error: token ${ESC}[${V} (401) retry`, 'ok'].join('\n'), v.scrubber())), 'mid').toEqual([]);
+    // the line also shows the value whole once, so its shown form has a hit too: a messy line is hidden all the same
+    expect(runs9(excerpt(['ok', `key ${V} and token ${ESC}[${V} (401) retry`, 'ok'].join('\n'), v.scrubber())), 'both').toEqual([]);
+    v.wipe();
+  });
+
+  it('excerpt r1: a value split over lines with a tab inside one piece (not messy) is found by the value passes', () => {
+    const v = vaultScrub();
+    const out = excerpt(['ok', 'Error: x', `value=${V.slice(0, 6)}\t${V.slice(6, 16)}`, `${V.slice(16)} tail`, 'ok'].join('\n'), v.scrubber());
+    expect(runs9(out)).toEqual([]);
+    expect(out.includes('pW9xLr4T')).toBe(false);
+    v.wipe();
+  });
+
+  it('excerpt r1: a merged line built from a hidden line goes even when its first line is shown (p9, short first piece)', () => {
+    const v = vaultScrub();
+    const mid = 'HIDDENMIDDLEbodyAAAABBBBCCCCDDDD';
+    const log = ['Error: a', `ok ${V.slice(0, 6)}`, `${V.slice(6)}${mid}${V.slice(0, 12)}${ESC}(B`, `${V.slice(12)} ok`, 'next'].join('\n');
+    expect(excerpt(log, v.scrubber())).not.toContain('HIDDENMIDDLE');
+    v.wipe();
+  });
+
+  it('excerpt r1: a head that opened a key (in a reading) hides a non-armor tail up to END, or to the end of the log with none', () => {
+    const begin = fake.keyBegin();
+    const at = begin.lastIndexOf(' ');
+    const broken = `${begin.slice(0, at)}${ESC}${begin.slice(at)}`;
+    const body = Array.from({ length: 80 }, (_, i) => `> ${fake.keyBody()}${String(i).padStart(2, '0')}`);
+    for (const end of [[fake.keyEnd()], [] as string[]]) {
+      const head = ['setup ok', broken, ...body.slice(0, 5)];
+      const all = [...head, ...body.slice(5), ...end, 'Error: key rejected', 'done'].join('\n');
+      const out = excerpt(all, (t) => t, all.length - head.join('\n').length - 1);
+      expect(body.filter((b) => out.includes(b.slice(2))), `END ${end.length}`).toEqual([]);
+    }
+  });
+
+  it('excerpt r1: 200k vault fuzz cases: a messy pair of lines each holding a piece of a split value hides both', () => {
+    const cases: [string, string[]][] = [
+      // seed 57508 case 37529: a CSI at the end of one piece, invisibles in the other
+      ['8FC7SCTW-RWy/kO', ['url=postgres:/' + '/app:8FC7SCTW-RWy/' + `${ESC}[P`, '\t\ufe0fkO@db.internal:5432/a\ufeffpp']],
+      // seed 57510 case 52778: an OSC payload between the pieces
+      ['b4ZZbkQ7dxQ3g4aFmklcN', ['url=postgres:/' + '/app:b4ZZbkQ7dx', `  ${ESC}]0y+LwFWVtn\u0007;IdXA7IPUk\u0007  Q3g4aFmklcN@db.internal:5432/app`]],
+      // seed 57510 case 60159: an unterminated C1 OSC in one piece, a tab splitting the other (the edge token counts without the tab)
+      [`${SKT}66O4FXMxUaSu=3au4Fw-7IKNM5INAb`, [`${SKT}66O4FXMxUa\u009d+JQYIcmSu%3D3a`, 'u4Fw-7I\tKNM5INAb"']],
+    ];
+    for (const [value, lines] of cases) {
+      const v = vaultScrub(value);
+      const out = excerpt(['a step 0 ok', ...lines, 'c step 0 ok', 'Error: request failed'].join('\n'), v.scrubber());
+      expect(Array.from({ length: value.length - 7 }, (_, i) => value.slice(i, i + 8)).filter((w) => out.includes(w)), value).toEqual([]);
+      v.wipe();
     }
   });
 });

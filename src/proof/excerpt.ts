@@ -25,7 +25,7 @@ import { createHash, randomBytes } from 'node:crypto';
 import { MAX_REGEX_LINE_BYTES } from '../ai/redact-core.js';
 import { redact, secretScanText, type SecretScanner } from '../ai/redact.js';
 import { LATE_MAGIC, SCAN_PREFIX, scannersWouldSkip } from '../ai/scan-staging.js';
-import { holdsEscape, scrubForDisplay, stripChars, textForms } from '../util/known-values.js';
+import { holdsEscape, scrubForDisplay, stripChars } from '../util/known-values.js';
 
 /** Lines shown before and after each error line. */
 export const EXCERPT_CONTEXT_LINES = 5;
@@ -212,7 +212,7 @@ function edgeRun(line: string, atEnd: boolean): number {
   return n;
 }
 const MIN_SPLIT_PIECE = 8;
-/** edgeRun of a shown line, as shown and with its invisible characters taken out (one can split the token), the longer. */
+/** edgeRun of a shown line, as shown and with every non-printable taken out (a tab or an invisible can split the token), the longer. */
 const edgeOf = (r: { shown: string | null }, atEnd: boolean) =>
   (r.shown === null ? 0 : Math.max(edgeRun(r.shown, atEnd), edgeRun(stripChars(r.shown).replace(LINE_SEPS, ''), atEnd)));
 /** A `[` and a `]` after it (by hand: a regex here is quadratic on a line of `[`). */
@@ -312,7 +312,7 @@ interface Read {
   messy: boolean;
   /** Its readings that differ from the shown line (all of them for a dropped line): each is redacted on its own (scan 5). */
   probe: string[];
-  /** Every form the value passes scrub it in (a suspect line): the line and its readings, each through known-values' textForms. */
+  /** Every form the value passes scrub it in (a suspect line): the line and its readings (which include the invisible-free forms). */
   forms: string[];
   /** OR across the line and its readings: an END key marker; a key opened and not closed; armor-shaped. */
   ends: boolean;
@@ -366,7 +366,7 @@ function readLine(raw: string): Read {
     suspect,
     messy,
     probe: rs.filter((r) => r !== base && r.trim() !== ''),
-    forms: suspect ? [...new Set([base ?? c.line, ...rs].flatMap((r) => textForms(r)))] : [],
+    forms: suspect ? [...new Set([base ?? c.line, ...rs])] : [],
     ends: all.some((r) => lastKeyMarker(r, 'END') >= 0),
     opensKey: all.some((r) => lastKeyMarker(r, 'BEGIN') > lastKeyMarker(r, 'END')),
     armor: all.some(isArmor),
