@@ -330,10 +330,55 @@ jobs:
     expect(by('.github/workflows/ci.yml', 'a')).toMatch(/pipelines/);
     expect(by('.github/workflows/ci.yml', 'b')).toMatch(/snapshot/);
     expect(by('.github/workflows/ci.yml', 'c')).toMatch(/odd/);
+    // a job with no steps is not compared (the proof's own check would otherwise stop on it)
+    expect(why(wf('on: pull_request\njobs:\n  e:\n    runs-on: ubuntu-latest\n    steps: []\n'), 'e')).toMatch(/no steps/);
     expect(by('.github/workflows/pipegen.yml', '*')).toMatch(/pipegen's own/);
     expect(by('.github/workflows/pipegen-compat-x.yml', '*')).toMatch(/pipegen's own/);
     expect(by('.github/workflows/sub/ci.yml', '*')).toMatch(/not a top-level/);
     expect(by('.github/workflows/my ci.yml', '*')).toMatch(/not plain/);
+  });
+
+  it('compat (E3-R2): a job using actions/cache is not compared; the user\'s tag-pinned actions are kept', () => {
+    const r = wf(`on: pull_request
+jobs:
+  cached:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/cache@v4
+        with: { path: ~/.npm, key: k }
+      - run: make
+  restore:
+    runs-on: ubuntu-latest
+    steps: [{ uses: actions/cache/restore@v4, with: { path: x, key: k } }, { run: make }]
+  plain:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { cache: npm }
+      - run: make
+`);
+    expect(Object.keys(copyOf(r).jobs)).toEqual(['plain']);
+    expect(why(r, 'cached')).toMatch(/actions\/cache/);
+    expect(why(r, 'restore')).toMatch(/actions\/cache/);
+    expect(copyOf(r).jobs.plain!.steps).toEqual([{ uses: 'actions/checkout@v4' }, { uses: 'actions/setup-node@v4', with: { cache: 'npm' } }, { run: 'make' }]);
+  });
+
+  it('compat (M3): an alias inside one job value is copied without an anchor and the job is kept', () => {
+    const r = wf(`on: pull_request
+jobs:
+  a:
+    runs-on: ubuntu-latest
+    steps:
+      - run: x
+        env: &e { A: "1", B: "2" }
+      - run: y
+        env: *e
+`);
+    expect(r.notCompared).toEqual([]);
+    const text = r.files[0]!.content;
+    expect(text).not.toMatch(/(?:^|\s)[&*][A-Za-z]/m);
+    expect(copyOf(r).jobs.a!.steps).toEqual([{ run: 'x', env: { A: '1', B: '2' } }, { run: 'y', env: { A: '1', B: '2' } }]);
   });
 
   it('compat: copies are read from HEAD, never the working tree', async () => {

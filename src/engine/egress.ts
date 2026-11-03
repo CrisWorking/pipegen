@@ -89,12 +89,42 @@ const RUNTIME_SETS: Readonly<Record<string, readonly EgressSet[]>> = Object.free
 });
 
 /**
- * The egress sets a reviewed tool's step needs, sorted (github-core is always added by renderEgressStep): its install
- * (github-release → github-releases, npm → npm, pip → pypi, docker → the image's registry) and RUNTIME_SETS. An action
- * needs none: the runner fetches actions (and the images they wrap) before the first step. Throws RenderError for an
- * install method or image registry it can not map (never a guess).
+ * What each reviewed ACTION reaches at run time (E3 review M1), beyond github-core. The runner fetches an action (and an image
+ * its action.yml wraps) before the first step, so this is only what the action itself does once it runs. `verified`: the
+ * hosts are known from a measured run or the action's own code path; false means the list is the best reading of its docs
+ * and `liveCheck` says what the live session must confirm (an action missing here is refused, never mapped to nothing).
+ */
+export interface ActionEgress { sets: readonly EgressSet[]; verified: boolean; source: string; liveCheck?: string }
+export const ACTION_EGRESS: Readonly<Record<string, ActionEgress>> = Object.freeze({
+  'actions-checkout': { sets: [], verified: true, source: 'git fetch over https://github.com; S5 jobs.yml checkout passed under Bullfrog (S8 l. 147)' },
+  bullfrog: { sets: [], verified: true, source: 'it downloads its agent from github.com releases before the block is on (S8 l. 16); measured in every S8 Bullfrog job' },
+  'dependency-review-action': { sets: [], verified: true, source: 'it reads the dependency graph compare API on api.github.com (the action\'s documented API; no other host)' },
+  'codeql-upload-sarif': { sets: [], verified: true, source: 'it posts the SARIF to the code scanning API on api.github.com; not rendered in the scratch repo (ruling S18)' },
+  'docker-login-action': { sets: ['ghcr'], verified: true, source: 'the reviewed choice registry is ghcr.io only (reviewed-tools.yml docker-login-action); it logs in to ghcr.io' },
+  'actions-setup-node': { sets: [], verified: false, source: 'the runner tool cache when the version is there (S5 setup-node 24 passed); else a download from the actions/node-versions manifest (raw.githubusercontent.com, left out by ruling E0d-4) and nodejs.org', liveCheck: 'setup-node with a Node version not in the runner cache (E0d-4)' },
+  'actions-setup-python': { sets: [], verified: false, source: 'the runner tool cache when the version is there; else the actions/python-versions manifest and release download (E0d-4)', liveCheck: 'setup-python with a version not in the runner cache (E0d-4)' },
+  'actions-upload-artifact': { sets: [], verified: false, source: 'the results service and the per-account blob store host (E0d-2: the blob host can not be listed exactly); S8 l. 151: the secrets and image-build jobs, each with an upload step, passed under Bullfrog without it (suggestive only)', liveCheck: 'artifact upload under Bullfrog (E0d-2)' },
+  'actions-download-artifact': { sets: [], verified: false, source: 'as upload-artifact: the results service and the blob store (E0d-2)', liveCheck: 'artifact download under Bullfrog (E0d-2)' },
+  'docker-setup-buildx-action': { sets: ['dockerhub'], verified: false, source: 'the default docker-container driver pulls moby/buildkit from Docker Hub (buildx driver docs; review-E3 M1)', liveCheck: 'setup-buildx under Bullfrog pulls moby/buildkit with the dockerhub set' },
+  'docker-build-push-action': { sets: [], verified: false, source: 'it reaches what the Dockerfile and the push target need (base images, package registries, ghcr); the job adds those sets for its own build', liveCheck: 'build-push of a created Dockerfile under Bullfrog' },
+  'scorecard-action': { sets: ['osv'], verified: false, source: 'the Vulnerabilities check queries api.osv.dev even with publish_results false (review-E3 M1, Scorecard docs); its other checks use api.github.com', liveCheck: 'scorecard under Bullfrog: any host beyond api.osv.dev and github-core' },
+  'actions-attest': { sets: [], verified: false, source: 'it needs the OIDC token URL (a per-run actions.githubusercontent.com host that can not be listed exactly) and Sigstore or GitHub\'s signing hosts: attestation stays not-proven under Bullfrog', liveCheck: 'attestation can not run under an exact-host list; keep not-proven' },
+  'pypi-publish': { sets: [], verified: false, source: 'it uploads to upload.pypi.org with an OIDC token; publishing never runs in the proof', liveCheck: 'none: never proven in the scratch repo' },
+  'pipegen-gate': { sets: [], verified: false, source: 'api.github.com (github-core) for runs and artifacts, plus the artifact zip redirect to the blob store (gate STORE_HOST_RE; E0d-2)', liveCheck: 'the gate\'s artifact downloads under Bullfrog (E0d-2)' },
+});
+
+/**
+ * The egress sets a reviewed tool's step needs, sorted (github-core is always added by renderEgressStep): for an action its
+ * ACTION_EGRESS entry (an action not there is refused); else its install (github-release → github-releases, npm → npm,
+ * pip → pypi, docker → the image's registry) and RUNTIME_SETS. Throws RenderError for an install method, image registry or
+ * action it can not map (never a guess).
  */
 export function egressSetsForTool(tool: ReviewedTool): EgressSet[] {
+  if (tool.step.action !== undefined) {
+    const a = Object.hasOwn(ACTION_EGRESS, tool.id) ? ACTION_EGRESS[tool.id] : undefined;
+    if (a === undefined) return refuse(`The action ${show(tool.id)} has no reviewed egress entry; add one with its source.`);
+    return [...a.sets].sort();
+  }
   const out = new Set<EgressSet>(Object.hasOwn(RUNTIME_SETS, tool.id) ? RUNTIME_SETS[tool.id] : []);
   const cli = tool.step.cli;
   const installs = cli === undefined ? [] : [cli.install, ...(cli.plugins ?? [])];

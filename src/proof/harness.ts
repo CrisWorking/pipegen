@@ -29,8 +29,17 @@
 //   secret other than GITHUB_TOKEN, an environment, id-token or any write permission, a runner that isn't a plain
 //   GitHub-hosted label (an expression, a matrix value, self-hosted, a group), a reusable workflow, a key pipegen can't
 //   model, a `<owner>/pipelines` reference, when it deploys, or when it needs a job that isn't compared.
+//   Ruling E3-R2: a compat copy keeps the user's own actions as the user pinned them (often by tag). The user already runs
+//   them, and in the copy they get no secret, a contents: read token and their own VM. That exemption is for compat copies
+//   only; a job using actions/cache is still not compared (no proof job restores or saves a cache).
 // - proofAppFiles: the `appFiles(centralSha)` callback pushProofSetup (E2) takes: the injected Plan G assemble, always called
-//   with signing mode `none` (no public log from the scratch repo), plus the harness and the compat copies.
+//   with signing mode `none` (no public log from the scratch repo), plus the harness and the compat copies. Every workflow of
+//   them passes checkProofWorkflows (workflow-check.ts) before it is returned (review I1).
+// - Known and harmless (review M5): sign-roundtrip also builds with `docker build --network host` (B7's reason, S8: the build's
+//   package installs fail on the bridge network under Bullfrog). The host network is still under the job's Bullfrog list, and
+//   the job maps no secret. Its job service (the reviewed registry image, pinned by digest) starts at job setup, before the
+//   egress step: no repo code runs in it, and checkProofWorkflows allows a service only as a digest-pinned image without
+//   options or volumes.
 import { Document, isScalar, Scalar, visit, YAMLMap } from 'yaml';
 import { isDeepStrictEqual } from 'node:util';
 import { dockerfilesOf } from '../engine/created-judges/compose.js';
@@ -55,6 +64,7 @@ import type { CreatedFile, PipelineDraft, RepoProfile, ReviewedTool, Service } f
 import { safeText } from '../util/safe-text.js';
 import { readSnapshot } from './git.js';
 import { ProofStopError, validBranchName } from './target.js';
+import { checkProofWorkflows } from './workflow-check.js';
 
 export const HARNESS_PATH = '.github/workflows/pipegen-proof-harness.yml';
 export const COMPAT_PREFIX = '.github/workflows/pipegen-compat-';
@@ -471,11 +481,13 @@ function jobProblem(id: string, job: unknown, wfPerms: unknown): string | null {
   if (typeof label !== 'string' || label.includes('${{') || !HOSTED_RE.test(label)) {
     return typeof label === 'string' && label.includes('${{') ? 'its runs-on is an expression or a matrix value' : 'it does not run on a plain GitHub-hosted runner (ubuntu-*, windows-*, macos-*)';
   }
-  if (!Array.isArray(job.steps)) return 'it has no list of steps';
+  if (!Array.isArray(job.steps) || job.steps.length === 0) return 'it has no steps';
   for (const s of job.steps) {
     if (!isObj(s)) return 'a step is not a map of keys';
     for (const k of Object.keys(s)) if (!STEP_KEYS.has(k)) return `a step has the key ${safeText(k, 40)}, which pipegen does not copy`;
     if (namesPipelines(s.uses)) return 'a step uses a pipelines repository (the proof checks every such reference against the central draft)';
+    // E3-R2: no proof job restores or saves a cache (a compat job could write the pull request's cache scope)
+    if (typeof s.uses === 'string' && /^actions\/cache(?:\/|@|$)/i.test(s.uses)) return 'it uses actions/cache (no proof job restores or saves a cache)';
   }
   if (jobDeploys(job) || namesDeploy(id) || namesDeploy(job.name)) return 'it deploys, releases or publishes';
   return null;
@@ -504,6 +516,9 @@ function renderCompat(path: string, wf: Obj, jobs: [string, Obj][]): string {
     out[id] = copy;
   }
   model.jobs = out;
+  // aliasDuplicateObjects: false is what keeps anchors out: a value the user shared through an alias stays shared inside one
+  // job even after structuredClone, and the default would write it as &a1/*a1. The strict parse-back below is the fail-safe:
+  // an anchor that ever reached the text would make these jobs not compared, never pushed.
   const doc = new Document(model, { version: '1.2', aliasDuplicateObjects: false });
   doc.commentBefore = ` pipegen compat copy of ${path} (scratch only, never delivered): read-only, no secrets, pull_request only.`;
   quoteStrings(doc);
@@ -621,6 +636,10 @@ export function proofAppFiles(draft: PipelineDraft, deps: { assemble: ProofAssem
         if (seen.has(k)) throw new ProofStopError(`Two proof files have the path ${safeText(f.path, 120)}; pipegen won't guess which one to push.`);
         seen.add(k);
       }
+      // I1: every proof workflow, the assembled ones included, passes the proof rules (egress first, no dispatch-like trigger,
+      // pinned actions, no cache); the compat copies under ruling E3-R2
+      const compatPaths = new Set(compat.files.map((f) => f.path));
+      checkProofWorkflows(all.map((f) => ({ path: f.path, content: f.content, kind: compatPaths.has(f.path) ? 'compat' as const : 'proof' as const })), deps.harness.reviewed);
       last = { harness, compat };
       return all;
     },

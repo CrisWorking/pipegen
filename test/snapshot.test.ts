@@ -18,6 +18,9 @@ import {
 } from '../src/proof/snapshot.js';
 import { assertCentral, assertScratch, proofTarget, ProofStopError, ScratchGuardError, type GuardedRepo, type ProofTarget } from '../src/proof/target.js';
 import type { CreatedFile } from '../src/types.js';
+import { Document } from 'yaml';
+import { renderEgressStep } from '../src/engine/egress.js';
+import { stepsToYaml } from '../src/engine/render-step.js';
 import { interrupting } from '../src/util/exit-hooks.js';
 import { fakeFetch, type Call, type Reply } from './helpers/fake-http.js';
 import { startGitHttp, type GitHttpServer } from './helpers/git-http.js';
@@ -56,8 +59,14 @@ const commitAll = (dir: string, msg = 'c') => {
 };
 
 const USER_CI = 'on: push\njobs:\n  t:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo "$" && env\n';
-const SHARED_SIGN = 'on:\n  workflow_call: {}\njobs:\n  s:\n    runs-on: ubuntu-latest\n    steps:\n      - run: "true"\n';
-const CENTRAL_MERGE = 'on:\n  workflow_call: {}\njobs:\n  gate:\n    runs-on: ubuntu-latest\n    steps:\n      - run: "true"\n';
+// E3 fix round 1 (I1): this project's central files are proof workflows, held to checkProofWorkflows: the egress step first
+const EGRESS_STEP = (() => {
+  const d = new Document();
+  d.contents = stepsToYaml([renderEgressStep([], { dockerNetworks: false })]);
+  return d.toString().trimEnd().split('\n').map((l) => `      ${l}`).join('\n');
+})();
+const SHARED_SIGN = `on:\n  workflow_call: {}\njobs:\n  s:\n    runs-on: ubuntu-latest\n    steps:\n${EGRESS_STEP}\n      - run: "true"\n`;
+const CENTRAL_MERGE = `on:\n  workflow_call: {}\njobs:\n  gate:\n    runs-on: ubuntu-latest\n    steps:\n${EGRESS_STEP}\n      - run: "true"\n`;
 
 /** The user's repo: three commits of history; HEAD holds workflows, Dependabot and Renovate configs, an export-ignore file. */
 function userRepo(): string {
@@ -644,7 +653,7 @@ describe('E2 base snapshot, central draft, proof branches (Task 2 first half)', 
   });
 
   it('central: no central workflow has a push or pull_request trigger', async () => {
-    const yml = (on: string) => `on: ${on}\njobs:\n  a:\n    runs-on: ubuntu-latest\n    steps:\n      - run: "true"\n`;
+    const yml = (on: string) => `on: ${on}\njobs:\n  a:\n    runs-on: ubuntu-latest\n    steps:\n${EGRESS_STEP}\n      - run: "true"\n`;
     const bad = ['push', '[push]', '{ pull_request: {} }', '[workflow_call, pull_request_target]', '{ create: {} }', '{ workflow_run: { workflows: [x] } }', '{ merge_group: {} }', 'issues', '"not yaml'];
     for (const on of bad) {
       expect(checkCentralTriggers([{ path: '.github/workflows/x.yml', content: yml(on) }]), on).not.toEqual([]);
@@ -667,6 +676,18 @@ describe('E2 base snapshot, central draft, proof branches (Task 2 first half)', 
     const h = await fixture();
     await expect(pushProofSetup(input(h, { central: { files: [created('.github/workflows/shop--merge.yml', CENTRAL_MERGE)] } }), deps(h).d)).rejects.toThrow(/central/);
     for (const x of [f, g, h]) await x.close();
+  });
+
+  it('central (E3 I1): this project\'s central workflows pass checkProofWorkflows before anything is read or pushed', async () => {
+    const noEgress = 'on:\n  workflow_call: {}\njobs:\n  gate:\n    runs-on: ubuntu-latest\n    steps:\n      - run: "true"\n';
+    const unpinned = `on:\n  workflow_call: {}\njobs:\n  gate:\n    runs-on: ubuntu-latest\n    steps:\n${EGRESS_STEP}\n      - uses: actions/checkout@v4\n`;
+    for (const [content, why] of [[noEgress, /egress/], [unpinned, /not pinned/]] as const) {
+      const f = await fixture();
+      await expect(pushProofSetup(input(f, { central: { files: [created('.github/workflows/shop--merge.yml', content, { repo: 'central' })] } }), deps(f).d)).rejects.toThrow(why);
+      expect(heads(f.pipelinesGit)[`proof/${RUN_ID}`]).toBeUndefined();
+      expect(f.events.some((e) => e.startsWith('push'))).toBe(false);
+      await f.close();
+    }
   });
 
   it('planted: C1b placements outside pipegen-planted/, each listed as expected', async () => {

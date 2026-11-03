@@ -1209,9 +1209,17 @@ export function renderStarterTestRun(svc: Service, opts: { vitest: ReviewedTool;
     `"\${sys[@]}" /usr/bin/docker cp -a . ${name}:/pipegen-src`,
     'rc=0',
     `"\${sys[@]}" /usr/bin/docker start -a ${name} || rc=$?`,
-    `mkdir -p "${out}"`,
-    `"\${sys[@]}" /usr/bin/docker cp ${name}:/tmp/pipegen-junit/junit.xml "${out}/junit.xml" || echo "pipegen: the tests wrote no JUnit report" >&2`,
+    // review-E3 M2: the report folder comes out whole into a fresh folder, and only a single regular junit.xml goes on to the
+    // upload. A symlink (docker cp copies it as a link; upload-artifact would follow it to a runner file), a folder, a fifo or
+    // any other entry fails the step: the created tests are hostile until proven otherwise
+    'got="$(mktemp -d "$RUNNER_TEMP/pipegen-junit.XXXXXX")"',
+    `"\${sys[@]}" /usr/bin/docker cp ${name}:/tmp/pipegen-junit/. "$got" || pg_fail "the tests wrote no JUnit report"`,
     `"\${sys[@]}" /usr/bin/docker rm -f ${name} > /dev/null`,
+    'odd="$("${sys[@]}" find "$got" -mindepth 1 \\( ! -type f -o ! -name junit.xml \\) -print -quit)"',
+    '[ -z "$odd" ] || pg_fail "the JUnit folder holds something that is not the one regular file junit.xml"',
+    '[ -f "$got/junit.xml" ] && [ ! -L "$got/junit.xml" ] || pg_fail "the tests wrote no regular JUnit report"',
+    `mkdir -p "${out}"`,
+    `mv -- "$got/junit.xml" "${out}/junit.xml"`,
     'exit "$rc"',
   ]);
   const pull = runStep('pipegen: pull the Node image for the starter tests', script([...prologue(artifact), '"${sys[@]}" /usr/bin/docker pull --quiet "$PIPEGEN_IMAGE" > /dev/null']), { PIPEGEN_IMAGE: image }, `tool-pull-${sha16(`starter:${artifact}`)}`);

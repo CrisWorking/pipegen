@@ -25,7 +25,8 @@
 //   in the plan's order: Dependabot security updates off (S5) → central → base → the scratch default branch again when
 //   the repo was empty (E1 carry) → every listed workflow that isn't pipegen's disabled → no run for the base sha (else a
 //   stop naming the run) → the injected secret store (E4: it must call checkScratchAccess again first) → main, planted.
-//   A refusal of any build or check comes before any write, store or push (review M1).
+//   A refusal of any build or check comes before any write, store or push (review M1). This project's central workflows
+//   pass checkProofWorkflows first (E3 review I1: egress step first, pinned actions, no cache).
 //
 // Pushes go only through the ProofTransport (gitTransport: E0c's gitPush with the token in a closure, never in argv, a URL
 // or output) and only to a GuardedRepo (target.ts). Every API write is guardedWrite. No push and no write starts once a
@@ -52,6 +53,7 @@ import {
   createPushRepo, gitPush, GitTransportError, isDirty, readSnapshot, runGit, type DroppedEntry, type PushRef, type PushRepoHandle,
 } from './git.js';
 import { setScratchDefaultBranch, type DefaultBranchState } from './repos.js';
+import { checkProofWorkflows } from './workflow-check.js';
 import {
   assertCentral, assertScratch, githubRead, guardedWrite, isProofTarget, ProofStopError, requireGuarded, ScratchGuardError, scratchPushUrl,
   validBranchName, type GuardedRepo, type ProofTarget,
@@ -1102,7 +1104,11 @@ export async function pushProofSetup(input: ProofSetupInput, deps: ProofSetupDep
   const clock = deps.clock ?? clockOf(deps.gh);
   const warnings: string[] = [];
   const warn = (w: string) => { warnings.push(w); deps.io.err(w); };
-  if (input.central !== undefined) checkCentralDraft(input.central);
+  if (input.central !== undefined) {
+    checkCentralDraft(input.central);
+    // E3 review I1: this project's central workflows run (called from the proof) next to the keys: the proof rules, before any read
+    checkProofWorkflows(input.central.files.map((f) => ({ path: f.path, content: f.content, kind: 'central' as const })));
+  }
   for (const f of input.plantedFiles) {
     const p = shown(pathBytes(f.path));
     if (isWorkflowPath(p) || isBotConfig(p)) throw new ProofStopError(`The planted file ${safeText(p, 120)} is a workflow or bot config; planted files never are.`);

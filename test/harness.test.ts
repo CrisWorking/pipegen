@@ -6,14 +6,14 @@ import { execFileSync } from 'node:child_process';
 import { readdirSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
-import { parse } from 'yaml';
+import { Document, parse } from 'yaml';
 import { COMPOSE_PATH, planCompose } from '../src/create/compose.js';
 import { loadBaseImages } from '../src/engine/base-images.js';
 import { EGRESS_DOMAIN_SETS, renderEgressCheckStep, renderEgressStep } from '../src/engine/egress.js';
 import { PLATFORM_ACTION_IDS } from '../src/engine/pin.js';
 import { RenderError } from '../src/engine/render-error.js';
 import { releaseInstallStep, renderStarterTestRun } from '../src/engine/render-cli.js';
-import { PROOF_OVERRIDE_PATH, renderComposeUp, renderFindRunStep, renderRuntimeEnv } from '../src/engine/render-step.js';
+import { PROOF_OVERRIDE_PATH, renderComposeUp, renderFindRunStep, renderRuntimeEnv, stepsToYaml } from '../src/engine/render-step.js';
 import { parseYaml } from '../src/engine/yaml-parse.js';
 import { harnessWorkflow, HARNESS_PATH, PROOF_SIGNING_MODE, proofAppFiles, proofOverrideText, type HarnessOptions } from '../src/proof/harness.js';
 import { checkCentralPins } from '../src/proof/snapshot.js';
@@ -44,6 +44,19 @@ function draft(services: Service[] = [api()], over: Partial<PipelineDraft> = {},
 }
 const opts = (over: Partial<HarnessOptions> = {}): HarnessOptions => ({ platform: PLATFORM, reviewed, centralSha: CENTRAL_SHA, createdTests: false, signing: 'key-env', ...over });
 
+/** A pipegen proof workflow as Plan G's assemble would render it: the egress step first in every job (or broken on purpose). */
+function assembled(o: { on?: string; first?: 'none' | 'after' | 'sudo'; uses?: string; path?: string; container?: true }): CreatedFile {
+  const d = new Document();
+  d.contents = stepsToYaml([renderEgressStep(['npm'], { dockerNetworks: false })]);
+  let egress = d.toString().trimEnd().split('\n').map((l) => `      ${l}`).join('\n');
+  if (o.first === 'sudo') egress = egress.replace('enable-sudo: "false"', 'enable-sudo: "true"');
+  const run = '      - run: npm test';
+  const steps = o.first === 'none' ? run : o.first === 'after' ? `${run}\n${egress}` : `${egress}\n${run}`;
+  const extra = o.uses === undefined ? '' : `\n      - uses: ${o.uses}`;
+  const content = `on: ${o.on ?? 'pull_request'}\npermissions: {}\njobs:\n  unit:\n    runs-on: ubuntu-24.04\n${o.container ? '    container: node:24\n' : ''}    steps:\n${steps}${extra}\n`;
+  return { path: o.path ?? '.github/workflows/pipegen.yml', content, part: 'pipeline', reason: 'r', repo: 'app' };
+}
+
 type Step = { id?: string; name: string; uses?: string; with?: Record<string, string>; run?: string; env?: Record<string, string>; if?: string };
 type Job = { if?: string; 'runs-on': string; permissions: Record<string, string>; steps: Step[]; services?: Record<string, { image: string; ports: string[] }> };
 type Wf = { on: Record<string, { branches: string[] }>; permissions: Record<string, string>; jobs: Record<string, Job> };
@@ -65,7 +78,8 @@ describe('harness: jobs, triggers, permissions', () => {
         expect(first.with, id).toMatchObject(bullfrog.fixedInputs.with!);
         expect(first.with!['enable-sudo'], id).toBe('false');
         expect(first.with!['egress-policy'], id).toBe('block');
-        // nothing runs before it: no job-level env, no container, no other step
+        // no step runs before it, and no job env or container; a job service (sign-roundtrip's registry) starts at job setup,
+        // before any step: it must be a reviewed image pinned by digest (checked below), and no repo code runs in it
         expect(Object.keys(job), id).not.toContain('env');
         expect(Object.keys(job), id).not.toContain('container');
         expect(job.steps.filter((s) => s.uses === bullfrog.step.action!.uses), id).toHaveLength(1);
@@ -90,7 +104,23 @@ describe('harness: jobs, triggers, permissions', () => {
     expect(h.file.content).not.toContain('mirror.gcr.io');
   });
 
-  it('harness: no workflow_dispatch trigger in any proof workflow', () => {
+  it('harness (M5): every job service is a reviewed image pinned by digest', () => {
+    const wf = wfOf(draft([api(), web()], {}, startedTests()), opts({ createdTests: true }));
+    const registry = reviewed.find((t) => t.id === 'registry')!;
+    const allowed = new Set([`${registry.step.cli!.install.package}:${registry.step.cli!.install.version}@${registry.candidate.pin.digest}`]);
+    let n = 0;
+    for (const [id, job] of Object.entries(wf.jobs)) for (const svc of Object.values(job.services ?? {})) { n++; expect(allowed.has(svc.image), id).toBe(true); }
+    expect(n).toBe(1);
+  });
+
+  it('harness: no workflow_dispatch trigger in any proof workflow', async () => {
+    // the assembled files go through the same check (I1): an assemble that renders a dispatch trigger stops the proof
+    for (const on of ['workflow_dispatch', 'schedule', 'workflow_run', 'repository_dispatch', 'issue_comment', '[push, workflow_dispatch]']) {
+      const bad = proofAppFiles(draft(), { assemble: () => [assembled({ on })], harness: { platform: PLATFORM, reviewed, createdTests: false, signing: 'none' }, dir: gitRepoWith({}) });
+      await expect(bad.appFiles(CENTRAL_SHA), on).rejects.toThrow(/trigger/);
+    }
+    const good = proofAppFiles(draft(), { assemble: () => [assembled({})], harness: { platform: PLATFORM, reviewed, createdTests: false, signing: 'none' }, dir: gitRepoWith({}) });
+    for (const f of (await good.appFiles(CENTRAL_SHA)).filter((x) => x.path.startsWith('.github/workflows/'))) expect(f.content, f.path).not.toMatch(/workflow_dispatch|schedule|workflow_run|repository_dispatch|issue_comment/);
     const h = harnessWorkflow(draft(), opts());
     const wf = parse(h.file.content) as Wf;
     expect(Object.keys(wf.on).sort()).toEqual(['pull_request', 'push']);
@@ -283,7 +313,7 @@ describe('harness: sign-roundtrip', () => {
     const d = draft();
     const dir = gitRepoWith({});
     const files = proofAppFiles(d, {
-      assemble: (mode, sha) => { modes.push(mode); shas.push(sha); return [{ path: '.github/workflows/pipegen.yml', content: 'on: push\njobs: {}\n', part: 'pipeline', reason: 'r', repo: 'app' }]; },
+      assemble: (mode, sha) => { modes.push(mode); shas.push(sha); return [assembled({})]; },
       harness: { platform: PLATFORM, reviewed, createdTests: false, signing: 'key-env' },
       dir,
     });
@@ -297,6 +327,27 @@ describe('harness: sign-roundtrip', () => {
     // a path given twice is a stop
     const twice = proofAppFiles(d, { assemble: () => [{ path: HARNESS_PATH, content: 'x', part: 'pipeline', reason: 'r', repo: 'app' }], harness: { platform: PLATFORM, reviewed, createdTests: false, signing: 'none' }, dir });
     await expect(twice.appFiles(CENTRAL_SHA)).rejects.toThrow(/Two proof files/);
+  });
+});
+
+describe('proofAppFiles: every proof workflow is checked (I1)', () => {
+  const run = (files: CreatedFile[]) => proofAppFiles(draft(), { assemble: () => files, harness: { platform: PLATFORM, reviewed, createdTests: false, signing: 'none' }, dir: gitRepoWith({}) }).appFiles(CENTRAL_SHA);
+  it('proofAppFiles: an assembled job without the egress step first, with sudo, a container, an unpinned or cache action → stop', async () => {
+    await expect(run([assembled({})])).resolves.toBeDefined();
+    await expect(run([assembled({ first: 'none' })])).rejects.toThrow(/egress/);
+    await expect(run([assembled({ first: 'after' })])).rejects.toThrow(/first step/);
+    await expect(run([assembled({ first: 'sudo' })])).rejects.toThrow(/egress step/);
+    await expect(run([assembled({ container: true })])).rejects.toThrow(/container/);
+    await expect(run([assembled({ uses: 'actions/setup-node@v4' })])).rejects.toThrow(/not pinned/);
+    await expect(run([assembled({ uses: `actions/cache@${'a'.repeat(40)}` })])).rejects.toThrow(/cache/);
+    // also a second assembled workflow, and a non-workflow file is not judged
+    await expect(run([assembled({}), assembled({ first: 'none', path: '.github/workflows/pipegen-merge.yml' })])).rejects.toThrow(/pipegen-merge\.yml/);
+    await expect(run([assembled({}), { path: 'docker-compose.pipegen.yml', content: 'services: {}\n', part: 'compose', reason: 'r', repo: 'app' }])).resolves.toBeDefined();
+  });
+  it('proofAppFiles: the harness and the compat copies pass the same check (compat under E3-R2)', async () => {
+    const dir = gitRepoWith({ '.github/workflows/ci.yml': 'on: pull_request\njobs:\n  t:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/checkout@v4\n      - run: make\n' });
+    const files = await proofAppFiles(draft([api()], {}, startedTests()), { assemble: () => [assembled({})], harness: { platform: PLATFORM, reviewed, createdTests: true, signing: 'key-env' }, dir }).appFiles(CENTRAL_SHA);
+    expect(files.map((f) => f.path)).toEqual(['.github/workflows/pipegen.yml', HARNESS_PATH, '.github/workflows/pipegen-compat-ci.yml']);
   });
 });
 
@@ -361,6 +412,32 @@ describe('harness: tests-repeat (S6, D7-R7)', () => {
     // the default compose-up is unchanged (Plan G's referee recognises it exactly)
     expect(renderComposeUp().run).toBe('set -euo pipefail\ndocker compose --env-file /dev/null -f docker-compose.pipegen.yml up -d --wait');
     expect(() => renderComposeUp({ proofOverride: false as unknown as true })).toThrow(RenderError);
+  });
+
+  it('harness (M2): the JUnit copy-out takes only regular files: a symlink or a missing report fails the step', () => {
+    const vitest = reviewed.find((t) => t.id === 'vitest-coverage')!;
+    const steps = renderStarterTestRun(api({ path: '.' }), { vitest, image: `node:24-bookworm-slim@sha256:${'a'.repeat(64)}`, nodeMajor: '24', artifact: 'pipegen-out-junit-repeat-api' });
+    const script = steps.at(-1)!.run!;
+    const root = execFileSync('mktemp', ['-d']).toString().trim();
+    /** A fake docker (by absolute path: the script runs docker as /usr/bin/docker under env -i) whose `cp <ctr>:<dir>/. <dest>` writes `tree`. */
+    const runWith = (tree: string) => {
+      const dir = execFileSync('mktemp', ['-d', '-p', root]).toString().trim();
+      const fake = join(dir, 'docker');
+      execFileSync('bash', ['-c', `cat > "$1" && chmod +x "$1"`, '_', fake], { input: `#!/bin/bash\nif [ "$1" = cp ] && [[ "$2" == *:* ]]; then d="$3"; mkdir -p "$d"; ${tree}; fi\nexit 0\n` });
+      execFileSync('mkdir', ['-p', join(dir, 'tmp')]);
+      try {
+        execFileSync('bash', ['-c', script.replaceAll('/usr/bin/docker', fake)], { cwd: dir, stdio: 'pipe', env: { PATH: process.env.PATH, RUNNER_TEMP: join(dir, 'tmp'), GITHUB_WORKSPACE: dir, PIPEGEN_IMAGE: 'img' } });
+        return { status: 0, out: execFileSync('bash', ['-c', `find "$1" -path '*pipegen-out*' | sort; for f in $(find "$1" -path '*pipegen-out*' -type l); do echo LINK; done`, '_', join(dir, 'tmp')]).toString() };
+      } catch (e) { return { status: (e as { status: number }).status, out: String((e as { stderr: Buffer }).stderr) }; }
+    };
+    const ok = runWith('echo "<testsuites/>" > "$d/junit.xml"');
+    expect(ok.status).toBe(0);
+    expect(ok.out).toContain('pipegen-out-junit-repeat-api/junit.xml');
+    for (const bad of ['ln -s /etc/hostname "$d/junit.xml"', 'echo x > "$d/junit.xml"; ln -s /etc "$d/more"', 'mkdir "$d/sub"; echo x > "$d/junit.xml"', 'mkfifo "$d/junit.xml"', ':']) {
+      const r = runWith(bad);
+      expect(r.status, bad).not.toBe(0);
+      expect(r.out, bad).not.toContain('LINK');
+    }
   });
 
   it('harness (S6): src/proof never sets isolatedTestJob', () => {

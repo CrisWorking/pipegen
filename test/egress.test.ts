@@ -3,7 +3,7 @@ import { spawnSync } from 'node:child_process';
 import { mkdtempSync, writeFileSync, chmodSync, symlinkSync, readFileSync, rmSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { E3_EGRESS_SETS, EGRESS_DOMAIN_SETS, egressSetsForTool, renderEgressCheckStep, renderEgressStep, REVIEWED_EGRESS_LABELS, type EgressSet } from '../src/engine/egress.js';
+import { ACTION_EGRESS, E3_EGRESS_SETS, EGRESS_DOMAIN_SETS, egressSetsForTool, renderEgressCheckStep, renderEgressStep, REVIEWED_EGRESS_LABELS, type EgressSet } from '../src/engine/egress.js';
 import { RenderError } from '../src/engine/render-error.js';
 import { stepsToYaml } from '../src/engine/render-step.js';
 import { Document, parse } from 'yaml';
@@ -108,14 +108,37 @@ describe('egress', () => {
     expect(of('biome')).toEqual(['npm']);
     expect(of('schemathesis')).toEqual(['pypi']);
     expect(of('registry')).toEqual(['dockerhub']);
-    expect(of('actions-checkout')).toEqual([]);                  // actions are fetched before the first step
-    expect(of('bullfrog')).toEqual([]);
+    expect(of('actions-checkout')).toEqual([]);                  // github.com only (github-core, always on)
+    expect(of('bullfrog')).toEqual([]);                          // it downloads its agent before the block is on
+    expect(of('docker-setup-buildx-action')).toEqual(['dockerhub']);   // the docker-container driver pulls moby/buildkit (M1)
+    expect(of('scorecard-action')).toEqual(['osv']);
     // every reviewed entry maps without throwing, to known set names only, sorted and unique
     for (const t of list) {
       const sets = egressSetsForTool(t);
       expect(sets, t.id).toEqual([...new Set(sets)].sort());
       for (const s of sets) expect(Object.hasOwn(EGRESS_DOMAIN_SETS, s), `${t.id} ${s}`).toBe(true);
     }
+  });
+
+  it('egress (M1): every reviewed action has an explicit entry with its source; unverified ones are visible, unknown ones refused', () => {
+    const list = loadReviewed();
+    const actions = list.filter((t) => t.step.action !== undefined).map((t) => t.id).sort();
+    expect(Object.keys(ACTION_EGRESS).sort()).toEqual(actions);
+    for (const id of actions) {
+      const e = ACTION_EGRESS[id]!;
+      expect(e.source.length, id).toBeGreaterThan(10);
+      expect(typeof e.verified, id).toBe('boolean');
+      if (!e.verified) expect(e.liveCheck, id).toMatch(/\S/);
+    }
+    // the unverified list is what the live checklist must confirm (test-visible, never a silent empty list)
+    expect(actions.filter((id) => !ACTION_EGRESS[id]!.verified).sort()).toEqual([
+      'actions-attest', 'actions-download-artifact', 'actions-setup-node', 'actions-setup-python', 'actions-upload-artifact',
+      'docker-build-push-action', 'docker-setup-buildx-action', 'pipegen-gate', 'pypi-publish', 'scorecard-action',
+    ]);
+    // an action the table doesn't know is refused, never mapped to nothing
+    const odd = structuredClone(list.find((t) => t.id === 'actions-checkout')!);
+    odd.id = 'some-new-action';
+    expect(() => egressSetsForTool(odd)).toThrow(RenderError);
   });
 
   it('egress (E3-R1): egressSetsForTool reads the image registry; an unknown install method or image is refused', () => {
