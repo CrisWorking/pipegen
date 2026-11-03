@@ -20,6 +20,8 @@ const onlyGate = (): string => {
   const doc = parse(readFileSync(DATA, 'utf8')) as { pinnedOn: string; tools: Record<string, any>[] };
   return stringify({ pinnedOn: doc.pinnedOn, tools: [doc.tools.find((t) => t.id === 'pipegen-gate')] });
 };
+/** The real entry's gate tag (gate-v<version>; gate-v0.2.1 since D9). */
+const TAG = `gate-v${real().candidate.version}`;
 const stub = (routes: Record<string, unknown>, calls: string[]): typeof fetch => (async (url: string) => {
   calls.push(String(url));
   const body = routes[String(url)];
@@ -28,17 +30,17 @@ const stub = (routes: Record<string, unknown>, calls: string[]): typeof fetch =>
 
 describe('r1-m2: checkCooldown is a release check (the gate pin must be on the default branch)', () => {
   const PIN = real().candidate.pin.sha as string;
-  const tag = { ref: 'refs/tags/gate-v0.2.0', object: { type: 'commit', sha: PIN } };
+  const tag = { ref: `refs/tags/${TAG}`, object: { type: 'commit', sha: PIN } };
   it('checkCooldown makes the default-branch compare call for the gate entry, and fails when the pin is not on main', async () => {
     const calls: string[] = [];
-    const routes = { [`${API}/git/ref/tags/gate-v0.2.0`]: tag, [API]: { default_branch: 'main' }, [`${API}/compare/${PIN}...main?per_page=1`]: { status: 'diverged', behind_by: 1, merge_base_commit: { sha: 'a'.repeat(40) } } };
+    const routes = { [`${API}/git/ref/tags/${TAG}`]: tag, [API]: { default_branch: 'main' }, [`${API}/compare/${PIN}...main?per_page=1`]: { status: 'diverged', behind_by: 1, merge_base_commit: { sha: 'a'.repeat(40) } } };
     const c = await checkCooldown({}, { 'data/reviewed-tools.yml': onlyGate() }, stub(routes, calls), NOW);
     expect(calls.some((u) => u.includes('/compare/'))).toBe(true);
     expect(c.ok).toBe(false);
   });
   it('and passes when it is on main', async () => {
     const calls: string[] = [];
-    const routes = { [`${API}/git/ref/tags/gate-v0.2.0`]: tag, [API]: { default_branch: 'main' }, [`${API}/compare/${PIN}...main?per_page=1`]: { status: 'ahead', behind_by: 0, merge_base_commit: { sha: PIN } } };
+    const routes = { [`${API}/git/ref/tags/${TAG}`]: tag, [API]: { default_branch: 'main' }, [`${API}/compare/${PIN}...main?per_page=1`]: { status: 'ahead', behind_by: 0, merge_base_commit: { sha: PIN } } };
     const c = await checkCooldown({}, { 'data/reviewed-tools.yml': onlyGate() }, stub(routes, calls), NOW);
     expect(c.problems).toEqual([]);
     expect(c.ok).toBe(true);
@@ -75,13 +77,13 @@ describe('r1-m2 and m4: the CI ls-files compare is the exact line, with a C-loca
 describe('r1-m5: the tag lookup checks the returned ref name', () => {
   const PIN = real().candidate.pin.sha as string;
   const run = async (answer: unknown): Promise<{ ok: boolean; problems: string }> => {
-    const routes = { [`${API}/git/ref/tags/gate-v0.2.0`]: answer, [API]: { default_branch: 'main' } };
+    const routes = { [`${API}/git/ref/tags/${TAG}`]: answer, [API]: { default_branch: 'main' } };
     const r = await runCooldown({ base: {}, head: { 'data/reviewed-tools.yml': onlyGate() }, fetch: stub(routes, []), now: NOW, maxLookups: 100 });
     return { ok: r.ok, problems: r.findings.map((x) => x.problem).join('\n') };
   };
   it('the right ref name passes; another tag, a branch ref or a missing name fails', async () => {
-    expect((await run({ ref: 'refs/tags/gate-v0.2.0', object: { type: 'commit', sha: PIN } })).ok).toBe(true);
-    for (const ref of ['refs/tags/gate-v0.2.0-rc1', 'refs/tags/gate-v0.2', 'refs/heads/gate-v0.2.0', 'gate-v0.2.0', undefined, 5]) {
+    expect((await run({ ref: `refs/tags/${TAG}`, object: { type: 'commit', sha: PIN } })).ok).toBe(true);
+    for (const ref of [`refs/tags/${TAG}-rc1`, 'refs/tags/gate-v0.2', `refs/heads/${TAG}`, TAG, undefined, 5]) {
       const r = await run({ ...(ref === undefined ? {} : { ref }), object: { type: 'commit', sha: PIN } });
       expect(r.ok, String(ref)).toBe(false);
     }
@@ -89,7 +91,7 @@ describe('r1-m5: the tag lookup checks the returned ref name', () => {
 });
 
 describe('r1-m6: the rendered uses comment names the real tag of pipegen\'s own gate', () => {
-  it('# gate-v0.2.0 for the own gate entry (the fixture and the real entry)', () => {
+  it('# gate-v<version> for the own gate entry (the fixture: gate-v0.2.0; the real entry: its own version)', () => {
     const raw = '${{ runner.temp }}/pipegen-raw/pipegen-out-sast--app/semgrep.sarif';
     expect(renderScrub('pipegen-out-sast--app', raw, 'semgrep', 'sarif', gateEntry()).usesComment).toBe('gate-v0.2.0');
     expect(renderScrub('pipegen-out-sast--app', raw, 'semgrep', 'sarif', real()).usesComment).toBe(`gate-v${real().candidate.version}`);
