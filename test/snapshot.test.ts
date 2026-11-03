@@ -1139,6 +1139,8 @@ describe('E2 fix round 2 (review-E2-r1)', () => {
       created('.github/workflows/deploy.yml', `on: push\njobs: {}\n# ${MARK}-inserted\n`, { part: 'deploy-verify', inserted: { original: USER_CI, jobs: [], needs: [] } }),
       // a non-workflow edit (CODEOWNERS-like) is not a workflow: it goes in as before
       created('docs/OWNERS', 'x\n', { edited: { original: '' }, part: 'codeowners' }),
+      // a fresh render whose marker keys are present but undefined is still fresh
+      created('.github/workflows/pipegen-fresh.yml', 'on: pull_request\njobs: {}\n', { edited: undefined, inserted: undefined, needsConfirm: false }),
     ];
     const r = await pushProofSetup(input(f, { appFiles: files }), deps(f).d);
     expect(everyObject(f.scratchGit)).not.toContain(MARK);
@@ -1147,6 +1149,7 @@ describe('E2 fix round 2 (review-E2-r1)', () => {
       for (const p of ['.github/workflows/pipegen-nightly.yml', '.github/workflows/pipegen-extra.yml', '.github/workflows/deploy.yml']) expect(t[p], p).toBeUndefined();
       expect(t['docs/OWNERS']).toBe('100644');
       expect(t['.github/workflows/pipegen.yml']).toBe('100644');
+      expect(t['.github/workflows/pipegen-fresh.yml']).toBe('100644');
     }
     const np = r.notProven.filter((x) => /isn't run in the scratch repo/.test(x.reason));
     expect(np.map((x) => x.part).sort()).toEqual(['deploy-verify', 'pipeline', 'pipeline']);
