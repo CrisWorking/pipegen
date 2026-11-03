@@ -3,7 +3,7 @@ import { spawnSync } from 'node:child_process';
 import { mkdtempSync, writeFileSync, chmodSync, symlinkSync, readFileSync, rmSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { EGRESS_DOMAIN_SETS, renderEgressCheckStep, renderEgressStep, type EgressSet } from '../src/engine/egress.js';
+import { E3_EGRESS_SETS, EGRESS_DOMAIN_SETS, egressSetsForTool, renderEgressCheckStep, renderEgressStep, REVIEWED_EGRESS_LABELS, type EgressSet } from '../src/engine/egress.js';
 import { RenderError } from '../src/engine/render-error.js';
 import { stepsToYaml } from '../src/engine/render-step.js';
 import { Document, parse } from 'yaml';
@@ -15,9 +15,11 @@ const HOST_RE = /^(?!-)[a-z0-9-]+(\.[a-z0-9-]+)+$/;
 
 describe('egress', () => {
   it('egress: sets github-core, npm, pypi, dockerhub (with production.cloudfront.docker.com and the R2 host), ghcr', () => {
-    expect(Object.keys(EGRESS_DOMAIN_SETS).sort()).toEqual(['dockerhub', 'ghcr', 'github-core', 'npm', 'pypi']);
-    // the set names equal the reviewed choices
-    expect(Object.keys(EGRESS_DOMAIN_SETS).sort()).toEqual([...bullfrog().choices['allowed-domains']!].sort());
+    // the five reviewed choices, plus the E3-R1 exact-host sets (E9 adds their labels to the bullfrog choices)
+    expect(Object.keys(EGRESS_DOMAIN_SETS).sort()).toEqual(['dockerhub', 'ghcr', 'github-core', 'github-releases', 'npm', 'osv', 'pypi', 'trivy-db']);
+    expect([...REVIEWED_EGRESS_LABELS].sort()).toEqual([...bullfrog().choices['allowed-domains']!].sort());
+    expect([...E3_EGRESS_SETS].sort()).toEqual(['github-releases', 'osv', 'trivy-db']);
+    expect([...REVIEWED_EGRESS_LABELS, ...E3_EGRESS_SETS].sort()).toEqual(Object.keys(EGRESS_DOMAIN_SETS).sort());
     const s = EGRESS_DOMAIN_SETS;
     expect(s['github-core']).toEqual(expect.arrayContaining(['github.com', 'api.github.com', 'codeload.github.com', 'objects.githubusercontent.com']));
     expect(s.npm).toEqual(['registry.npmjs.org']);
@@ -78,6 +80,54 @@ describe('egress', () => {
     expect(back[0]!.with).toEqual(step.with);
     expect(back[0]!.uses).toBe(step.uses);
     expect(back[1]!.run).toBe(renderEgressCheckStep().run);
+  });
+
+  it('egress (E3-R1): new exact-host sets github-releases, trivy-db and osv, no wildcard', () => {
+    expect([...EGRESS_DOMAIN_SETS['github-releases']]).toEqual(['release-assets.githubusercontent.com']);
+    expect([...EGRESS_DOMAIN_SETS['trivy-db']]).toEqual(['mirror.gcr.io']);
+    expect([...EGRESS_DOMAIN_SETS.osv]).toEqual(['api.osv.dev']);
+    for (const h of Object.values(EGRESS_DOMAIN_SETS).flat()) expect(h).not.toMatch(/[*?\s/:]/);
+    // a host is in one set only (a set is the unit a job asks for)
+    const all = Object.values(EGRESS_DOMAIN_SETS).flat();
+    expect(new Set(all).size).toBe(all.length);
+    const step = renderEgressStep(['trivy-db', 'osv', 'github-releases'], { dockerNetworks: false });
+    expect(lines(step)).toEqual([...new Set([...EGRESS_DOMAIN_SETS['github-core'], 'mirror.gcr.io', 'api.osv.dev', 'release-assets.githubusercontent.com'])].sort());
+  });
+
+  it('egress (E3-R1): egressSetsForTool lists exactly the sets a reviewed tool needs', () => {
+    const list = loadReviewed();
+    const of = (id: string) => egressSetsForTool(list.find((t) => t.id === id)!);
+    expect(of('trivy-image')).toEqual(['ghcr', 'github-releases', 'trivy-db']);
+    expect(of('trivy-config')).toEqual(['github-releases']);   // --skip-check-update: no checks bundle download
+    expect(of('trivy-licence')).toEqual(['github-releases']);
+    expect(of('osv-scanner')).toEqual(['github-releases', 'osv']);
+    expect(of('cosign')).toEqual(['github-releases']);
+    expect(of('semgrep')).toEqual(['dockerhub']);                // the rules come from github.com (github-core, always on)
+    expect(of('zap-baseline')).toEqual(['dockerhub']);
+    expect(of('vitest-coverage')).toEqual(['npm']);
+    expect(of('biome')).toEqual(['npm']);
+    expect(of('schemathesis')).toEqual(['pypi']);
+    expect(of('registry')).toEqual(['dockerhub']);
+    expect(of('actions-checkout')).toEqual([]);                  // actions are fetched before the first step
+    expect(of('bullfrog')).toEqual([]);
+    // every reviewed entry maps without throwing, to known set names only, sorted and unique
+    for (const t of list) {
+      const sets = egressSetsForTool(t);
+      expect(sets, t.id).toEqual([...new Set(sets)].sort());
+      for (const s of sets) expect(Object.hasOwn(EGRESS_DOMAIN_SETS, s), `${t.id} ${s}`).toBe(true);
+    }
+  });
+
+  it('egress (E3-R1): egressSetsForTool reads the image registry; an unknown install method or image is refused', () => {
+    const list = loadReviewed();
+    const semgrep = structuredClone(list.find((t) => t.id === 'semgrep')!);
+    semgrep.step.cli!.install.package = 'ghcr.io/semgrep/semgrep';
+    expect(egressSetsForTool(semgrep)).toEqual(['ghcr']);
+    semgrep.step.cli!.install.package = 'quay.io/semgrep/semgrep';
+    expect(() => egressSetsForTool(semgrep)).toThrow(RenderError);
+    const odd = structuredClone(list.find((t) => t.id === 'cosign')!);
+    (odd.step.cli!.install as { method: string }).method = 'curl';
+    expect(() => egressSetsForTool(odd)).toThrow(RenderError);
   });
 
   it('egress: the actions.githubusercontent.com hosts are not listed (least privilege; live checklist decides)', () => {
