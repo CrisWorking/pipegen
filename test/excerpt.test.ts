@@ -42,7 +42,7 @@ describe('errorExcerpt (E0a, B1)', () => {
       `\ufeff${TS}##[group]Run npm test`,
       `${TS}${ESC}[31m${ESC}[1mError: Invalid API key provided: ${VALUE}${ESC}[0m`,
       // the value split by a colour code: only whole once the code is gone
-      `${TS}${ESC}[33mwarn${ESC}[39m key ${VALUE.slice(0, 9)}${ESC}[1;31m${VALUE.slice(9)}${ESC}[0m in config`,
+      `${TS}${ESC}[33mwarn${ESC}[39m key ${VALUE.slice(0, 3)}${ESC}[1;31m${VALUE.slice(3)}${ESC}[0m in config`,
       // an OSC 8 hyperlink (BEL- and ST-terminated) and an OSC title
       `${TS}see ${ESC}]8;;https://example.test/docs${ESC}\\the docs${ESC}]8;;${ESC}\\ ${ESC}]0;title\u0007for help`,
       `${TS}##[error]Process completed with exit code 1.`,
@@ -57,6 +57,10 @@ describe('errorExcerpt (E0a, B1)', () => {
     ]);
     expect(out).not.toMatch(/[\u001b\u0080-\u009f]/);
     expect(out).not.toContain('2026-11-03T');
+    // split where the reading that keeps the code's final byte is shaped like a Stripe key: hidden whole, never shown in part
+    const keyShaped = await errorExcerpt(`${TS}warn key ${VALUE.slice(0, 9)}${ESC}[1;31m${VALUE.slice(9)}${ESC}[0m\n${TS}Error: x`, composed(v), clean());
+    expect(keyShaped).toContain('Error: x');
+    for (const piece of [VALUE.slice(0, 9), VALUE.slice(9)]) expect(keyShaped).not.toContain(piece);
     v.wipe();
   });
 
@@ -270,6 +274,24 @@ describe('errorExcerpt: scrub before cutting (E0a)', () => {
     const out = await errorExcerpt(log, composed(v), clean());
     expect(out).toContain('Error: done');
     for (const b of body) expect(out).not.toContain(b.replace('\r', '').slice(-20));
+    v.wipe();
+  });
+
+  it('excerpt: scan 5: a key line with an escape inside its name still hides its indented value and its secret section', async () => {
+    const v = vault();
+    const valueRun = ['Qx7', 'Lm2Wv9Rt4Zp8Kd3Hs'].join('');
+    const name = ['pass', 'word'];
+    for (const key of [`${name[0]}${ESC}[0m${name[1]}:`, `${name[0]}${ESC}[1;3${name[1]}:`, `${name[0]}\t${name[1]}:`, `${name[0]}${ESC}Z${name[1]}:`]) {
+      const log = [`${TS}config:`, `${TS}  ${key}`, `${TS}    ${valueRun}`, `${TS}    more-${valueRun}`, `${TS}Error: bad config`].join('\n');
+      const out = await errorExcerpt(log, composed(v), clean());
+      expect(out, JSON.stringify(key)).toContain('Error: bad config');
+      expect(out, JSON.stringify(key)).not.toContain(valueRun);
+    }
+    // a TOML secret section whose header holds an escape
+    const toml = [`${TS}[data${ESC}[1;3base.${name.join('')}]`, `${TS}url = ${valueRun}`, `${TS}[other]`, `${TS}Error: done`].join('\n');
+    const tomlOut = await errorExcerpt(toml, composed(v), clean());
+    expect(tomlOut).toContain('Error: done');
+    expect(tomlOut).not.toContain(valueRun);
     v.wipe();
   });
 

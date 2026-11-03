@@ -78,6 +78,51 @@ function cleanLine(raw: string): { line: string; drop: boolean; before: string |
 // Private key markers as Plan A redact finds them (redact-core.ts findKeyMarker: `-----BEGIN [A-Z ]*PRIVATE KEY-----`, or `PRIVATE KEY
 // BLOCK`, or END). A copy: that function is not exported, and redact-core.ts is in the gate bundle, so it is left untouched.
 const KEY_TAILS = ['PRIVATE KEY', 'PRIVATE KEY BLOCK'];
+/** findKeyMarker itself (copied): the first `kind` key marker in `line` from `from`, or null. */
+function keyMarkerFrom(line: string, kind: 'BEGIN' | 'END', from: number): { start: number; end: number } | null {
+  const head = `-----${kind} `;
+  for (let i = line.indexOf(head, from); i >= 0; i = line.indexOf(head, i + 1)) {
+    let j = i + head.length;
+    while (j < line.length && (line[j] === ' ' || (line[j] as string >= 'A' && line[j] as string <= 'Z'))) j++;
+    if (KEY_TAILS.some((t) => line.slice(i + head.length, j).endsWith(t)) && line.startsWith('-----', j)) return { start: i, end: j + 5 };
+  }
+  return null;
+}
+
+/**
+ * Which lines of `lines` redact's output keeps, in order: redact drops a line only when it starts inside a key block, opens none, and
+ * holds nothing outside key blocks (redact-core.ts, the first rule of its line loop; replayed here with the same marker rules).
+ */
+function redactKeeps(lines: string[]): number[] {
+  const kept: number[] = [];
+  let inKey = false;
+  lines.forEach((raw, i) => {
+    let end = raw.length;
+    while (end > 0 && raw.charCodeAt(end - 1) === 13) end--;
+    const line = raw.slice(0, end);
+    const started = inKey;
+    let opens = false;
+    let empty = true;
+    for (let pos = 0; ;) {
+      if (inKey) {
+        const m = keyMarkerFrom(line, 'END', pos);
+        if (m === null) break;
+        pos = m.end;
+        inKey = false;
+      } else {
+        const m = keyMarkerFrom(line, 'BEGIN', pos);
+        if (line.slice(pos, m === null ? line.length : m.start) !== '') empty = false;
+        if (m === null) break;
+        opens = true;
+        pos = m.end;
+        inKey = true;
+      }
+    }
+    if (!(started && !opens && empty)) kept.push(i);
+  });
+  return kept;
+}
+
 /** The start of the last `kind` key marker in `line`, or -1. Linear: each `-----BEGIN ` is looked at once. */
 function lastKeyMarker(line: string, kind: 'BEGIN' | 'END'): number {
   const head = `-----${kind} `;
@@ -141,6 +186,12 @@ function readings(line: string): string[] {
 }
 /** Ruling E0a-R1 (a): a word of a key name in a reading, either one, any case. */
 const NAMES_KEY = /private|key/i;
+/**
+ * Scan 5 fuzz, failing closed the same way: a word of a secret name as redact-core's isSecretName knows them (its KEYWORD, `auth` and
+ * `credential`; a superset, any case). Garbage nested inside a sequence can leave a key name no reading puts back together, so a
+ * suspect line holding one opens an indented-value block (and a section, when it is a `[` line) whatever redact says of its readings.
+ */
+const NAMES_SECRET = /password|passwd|pwd|secret|token|api[_-]?key|private[_-]?key|access[_-]?key|client[_-]?secret|auth|credential/i;
 
 /**
  * Step 4: the error windows (or the end of the log), in line order, with a marker for every gap between two of them. A window that
@@ -228,14 +279,40 @@ function lineAtMagic(lines: string[]): number {
 interface Read {
   /** The line as shown (steps 1-2), or null when step 3 drops it. */
   shown: string | null;
-  /** Its other readings, each redacted on its own as a tagged copy next to it (scan 4: never joined into one line). */
-  copies: string[];
+  /** Its readings that differ from the shown line (all of them for a dropped line): each is redacted on its own (scan 5). */
+  probe: string[];
   /** OR across the line and its readings: an END key marker; a word of a key name (only for a line step 2 changed, dropped or holding
    *  a character stripChars or LS/PS would take out); armor-shaped. */
   ends: boolean;
   namesKey: boolean;
   armor: boolean;
+  /** The smallest indentation (redact's columns) of the line and its readings (where a block it opens starts), and the largest (a line
+   *  continues an open block when any reading of it is more indented); whether any reading is blank; whether every one is a section header. */
+  cols: number;
+  colsMax: number;
+  blank: boolean;
+  header: boolean;
+  /** What stands for a dropped line in the log text redact reads: its first reading. */
+  rep: string;
+  /** Whether the line was read more than one way (step 2 changed it, step 3 drops it, or it holds a non-printable). */
+  suspect: boolean;
+  /** A suspect line (as for namesKey) with a word of a secret name in any reading; and whether a reading starts with `[`. */
+  namesSecret: boolean;
+  bracket: boolean;
 }
+
+/** redact-core's indentOf columns (a tab goes to the next multiple of 8). A copy: that function is not exported. */
+function indentCols(line: string): number {
+  let cols = 0;
+  for (const ch of line) {
+    if (ch === ' ') cols++;
+    else if (ch === '\t') cols = (Math.floor(cols / 8) + 1) * 8;
+    else break;
+  }
+  return cols;
+}
+// redact-core's sectionName shape: `[name]` or `[[name]]`, then only blanks or a comment
+const SECTION_HEADER = /^[ \t]*\[\[?[^\]]*\]\]?[ \t]*(?:[#;].*)?$/;
 
 function readLine(raw: string): Read {
   const c = cleanLine(raw);
@@ -245,11 +322,47 @@ function readLine(raw: string): Read {
   const all = base === null ? rs : [base, ...rs];
   return {
     shown: base,
-    copies: rs.filter((r) => r !== base),
+    probe: rs.filter((r) => r !== base && r.trim() !== ''),
     ends: all.some((r) => lastKeyMarker(r, 'END') >= 0),
     namesKey: suspect && all.some((r) => NAMES_KEY.test(r)),
     armor: all.some(isArmor),
+    cols: all.length === 0 ? 0 : Math.min(...all.map(indentCols)),
+    colsMax: all.length === 0 ? 0 : Math.max(...all.map(indentCols)),
+    blank: all.length === 0 || all.some((r) => r.trim() === ''),
+    header: all.length > 0 && all.every((r) => SECTION_HEADER.test(r)),
+    rep: rs[0] ?? '',
+    suspect,
+    namesSecret: suspect && all.some((r) => NAMES_SECRET.test(r)),
+    // a header in some reading, or (a dropped line: garbage can stand before the `[`) a `[` and a later `]` anywhere
+    bracket: all.some((r) => /^[ \t]*\[/.test(r) || (c.drop && /\[[^\]]*\]/.test(r))),
   };
+}
+
+/** What redact does with one reading of a line, on its own (scan 5). */
+interface Probe { hit: boolean; block: boolean; section: boolean; key: boolean }
+
+/**
+ * Scan 5: each reading is redacted apart from the log, so a reading never sits between two real lines. All readings go in one text,
+ * each as a group: a marker line, the reading, a more-indented probe line (hidden when the reading starts an indented-value block), a
+ * `key = value` probe line at indent 0 (hidden when it starts a secret section), then an END key marker and a plain section header that
+ * reset redact's key and section state. The probe lines carry a random nonce, so log text can't pose as them.
+ */
+function probeReadings(jobs: string[]): Probe[] {
+  if (jobs.length === 0) return [];
+  const nonce = randomBytes(6).toString('hex');
+  const reset = `-----END RSA ${KEY_TAILS[0]}-----\n[pgreset${nonce}]`;
+  const lineB = (g: number, r: string) => `${' '.repeat(indentCols(r))}  zz${nonce}p${g}b`;
+  const lineC = (g: number) => `zz${nonce}p${g}c = v`;
+  const text = jobs.map((r, g) => `zz${nonce}p${g}a\n${r}\n${lineB(g, r)}\n${lineC(g)}\n${reset}`).join('\n');
+  const out = redact(text).split('\n');
+  const at = new Map<string, number>();
+  out.forEach((l, i) => at.set(l, i));
+  return jobs.map((r, g) => {
+    const m = at.get(`zz${nonce}p${g}a`);
+    // a reading that opens a key hides both probe lines by itself: that is the key hide, not a block or a section
+    const key = lastKeyMarker(r, 'BEGIN') > lastKeyMarker(r, 'END');
+    return { hit: m === undefined || out[m + 1] !== r, block: !key && !at.has(lineB(g, r)), section: !key && !at.has(lineC(g)), key };
+  });
 }
 
 /**
@@ -269,21 +382,47 @@ export function unscannedExcerpt(logs: string, scrub: (text: string) => string, 
     guard = HEAD_GUARD_LINES;
     cut = true;
   }
-  // steps 1-3. A hidden line (dropped by step 3, in the head guard, or maybe part of a private key body) is kept in place for now as
-  // tagged copies, one per reading, each with a random tag after its indentation and at its end, so redact's indent and key rules
-  // still see it and every piece of it redact keeps carries a tag; they go after the whole-log pass. A shown line whose readings differ
-  // from it gets the same tagged copies right after it (so a BEGIN marker any reading kept whole starts redact's key block). A possible
-  // key body is hidden:
-  // - up to the next END marker line, after a cut inside a key block, or after a line that names a private key in any reading
-  //   (fail closed: its marker may be unreadable);
-  // - with no END marker ahead, after any other dropped line, and at the start of a cut tail: while the lines look like armor
-  //   (base64, armor headers, blank lines) in any reading. A line that is armor while that lasts is always hidden.
-  const tag = `\u0000pipegen-dropped-${randomBytes(8).toString('hex')}\u0000`;
-  const tagged = (r: string) => {
-    const indent = /^[ \t]*/.exec(r)?.[0] ?? '';
-    return `${indent}${tag}${r.slice(indent.length)}${tag}`;
-  };
+  // steps 1-3. Each real line stays in the log text redact reads once, in place and untagged (scan 5: nothing may sit between two real
+  // lines or change one, or redact's block rules stop linking them). A dropped line is there as its first reading. The readings of a
+  // line are redacted apart (probeReadings), and their verdicts are ORed:
+  // - a reading in which redact hides something on the line itself: the line is hidden;
+  // - one that starts an indented-value block: the more-indented (and blank) lines after it are hidden;
+  // - one that starts a secret section: the lines after it are hidden up to the next section header;
+  // - a dropped line, or a suspect one with a word of a secret name in a reading (NAMES_SECRET), does both (a section only for a `[`
+  //   line): its words may be split past repair;
+  // - the parent of every suspect line (the nearest earlier line indented less) is probed as well, so a block it opens goes on through
+  //   a line whose readings disagree on its indentation; a line continues an open block when any reading is more indented or blank;
+  // - one that opens a private key, or names one (PRIVATE or KEY in a line step 2 changed or dropped, or that holds a non-printable):
+  //   hidden up to the next END marker line (to the end of the log when a reading opened a key and no END follows), else while the
+  //   lines look like armor (base64, armor headers, blank lines). The same after a cut inside a key block, and armor mode after any
+  //   other dropped line and at the start of a cut tail. A line that is armor while that lasts is always hidden.
+  // Dropped lines and the head guard's are hidden too.
   const lines0 = text.split('\n').map(readLine);
+  // scan 5 fuzz: a suspect line can end redact's own block early (an LS in its indentation), so the block's parent is probed too: the
+  // nearest earlier non-blank line indented less than any reading of the suspect line (a monotonic stack: linear)
+  const parents = new Set<number>();
+  const stack: { cols: number; i: number }[] = [];
+  lines0.forEach((r, i) => {
+    const own = r.shown ?? r.rep;
+    if (r.suspect) {
+      for (let k = stack.length - 1; k >= 0; k--) {
+        const e = stack[k] as { cols: number; i: number };
+        if (e.cols < r.colsMax) {
+          if (!(lines0[e.i] as Read).suspect) parents.add(e.i);
+          break;
+        }
+      }
+    }
+    if (own.trim() === '') return;
+    const cols = indentCols(own);
+    while (stack.length > 0 && (stack[stack.length - 1] as { cols: number }).cols >= cols) stack.pop();
+    stack.push({ cols, i });
+  });
+  const jobs: string[] = [];
+  // each reading scrubbed first, as the log text is before redact, so a known value doesn't count as a hit
+  const jobOf: number[][] = lines0.map((r, i) =>
+    [...r.probe, ...(parents.has(i) ? [r.shown ?? r.rep] : [])].map((x) => jobs.push(scrub(x).split('\n').join(' ')) - 1));
+  const probes = probeReadings(jobs);
   const nextEnd = new Int32Array(lines0.length);
   for (let i = lines0.length - 1, next = -1; i >= 0; i--) {
     if ((lines0[i] as Read).ends) next = i;
@@ -291,32 +430,62 @@ export function unscannedExcerpt(logs: string, scrub: (text: string) => string, 
   }
   let hideTo = -1;
   let armor = false;
-  const startKeyHide = (from: number) => {
+  let blockCols = -1;
+  let section = false;
+  const startKeyHide = (from: number, opened: boolean) => {
     const end = from < lines0.length ? (nextEnd[from] as number) : -1;
     if (end >= 0) hideTo = Math.max(hideTo, end);
+    else if (opened) hideTo = lines0.length - 1;
     else armor = true;
   };
   if (cut) {
-    if (insideKey) startKeyHide(0);
+    if (insideKey) startKeyHide(0, false);
     else armor = true;
   }
-  const cleaned = lines0.map((r, i) => {
+  const hiddenAt = lines0.map((r, i) => {
     let hidden = r.shown === null || i <= hideTo || i < guard;
+    if (blockCols >= 0) {
+      if (r.blank || r.colsMax > blockCols) hidden = true;
+      else blockCols = -1;
+    }
+    if (section) {
+      if (r.header) section = false;
+      else hidden = true;
+    }
     // scan 4: the armor check comes first, so an armor line is hidden even when it also starts a key hide
     if (armor && i > hideTo) {
       if (r.armor) hidden = true;
       if (!r.armor || r.ends) armor = false;
     }
+    const verdict = (jobOf[i] as number[]).map((j) => probes[j] as Probe);
+    if (verdict.some((p) => p.hit)) hidden = true;
+    // a dropped line can't be read for sure (garbage nested in a sequence splits any word), so it fails closed on every multi-line rule
+    const unreadable = r.shown === null || r.namesSecret;
+    if (verdict.some((p) => p.block) || unreadable) blockCols = blockCols < 0 ? r.cols : Math.min(blockCols, r.cols);
+    if (verdict.some((p) => p.section) || (unreadable && r.bracket)) section = true;
+    const opened = verdict.some((p) => p.key);
     if (i >= hideTo) {
-      if (r.namesKey && !r.ends) startKeyHide(i + 1);
+      if ((r.namesKey || opened) && !r.ends) startKeyHide(i + 1, opened);
       else if (r.shown === null) armor = true;
     }
-    const out = hidden ? [] : [r.shown as string];
-    for (const x of hidden && r.shown !== null ? [r.shown, ...r.copies] : r.copies) out.push(tagged(x));
-    return out.join('\n');
+    return hidden;
   });
-  // scrub before cutting: the whole cleaned log, before any line is picked; then every line that still carries the tag goes
-  const whole = redact(scrub(cleaned.join('\n'))).split('\n').filter((l) => !l.includes(tag));
+  // scrub before cutting, and before redact can cut a value: each line on its own (no line count changes), then redact over the whole
+  // log. redactKeeps tells which input line each output line is; a count that doesn't match fails closed.
+  const mainLines = lines0.map((r) => scrub(r.shown ?? r.rep).split('\n').join(' '));
+  const redactedLines = redact(mainLines.join('\n')).split('\n');
+  const kept = redactKeeps(mainLines);
+  if (redactedLines.length !== kept.length) return [];
+  // then the hidden lines get a random tag at both ends, made only of line-break characters (the scrubber's joined views take them
+  // out, so a value split across a hidden line is still found), the whole log is scrubbed across lines, and every line that still
+  // carries a tag goes: a value span that swallows one tag of a hidden line keeps the other in the merged line
+  const tag = `\r${Array.from(randomBytes(6), (b) => Array.from({ length: 8 }, (_, k) => ((b >> k) & 1 ? '\u2029' : '\u2028')).join('')).join('')}\r`;
+  const tagged = redactedLines.map((l, j) => {
+    if (!(hiddenAt[kept[j] as number] as boolean)) return l;
+    const indent = /^[ \t]*/.exec(l)?.[0] ?? '';
+    return `${indent}${tag}${l.slice(indent.length)}${tag}`;
+  });
+  const whole = scrub(tagged.join('\n')).split('\n').filter((l) => !l.includes(tag));
   // step 4
   const picked = pick(whole);
   if (picked.length === 0) return [];
