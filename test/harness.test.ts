@@ -321,6 +321,9 @@ describe('harness: tests-repeat (S6, D7-R7)', () => {
     expect(harnessWorkflow(withFiles, opts({ createdTests: false })).jobs.map((j) => j.id)).not.toContain('tests-repeat');
     // createdTests true without a created test file: no job
     expect(harnessWorkflow(draft(), opts({ createdTests: true })).jobs.map((j) => j.id)).not.toContain('tests-repeat');
+    // other created files in a service folder (a Dockerfile) are not created tests
+    const docker = draft([api()], {}, [{ path: 'api/Dockerfile', content: 'FROM x', part: 'docker', reason: 'r', repo: 'app' }]);
+    expect(harnessWorkflow(docker, opts({ createdTests: true })).jobs.map((j) => j.id)).not.toContain('tests-repeat');
     expect(() => harnessWorkflow(withFiles, opts({ createdTests: 'yes' as unknown as boolean }))).toThrow(RenderError);
     const text = runs(wfOf(withFiles, opts({ createdTests: true })).jobs['tests-repeat']!);
     expect(text).toMatch(/vitest\.mjs run --isolate --reporter=junit --outputFile\.junit=\S+/);

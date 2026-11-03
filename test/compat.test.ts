@@ -123,7 +123,10 @@ jobs:
     expect(c.jobs.lint!.concurrency).toBeUndefined();
     expect(r.files[0]!.content).not.toMatch(/id-token|environment|write/);
     expect(why(r, 'oidc')).toMatch(/id-token/);
-    expect(why(r, 'env')).toMatch(/environment/);
+    expect(why(r, 'env')).toMatch(/uses an environment/);
+    // the id-token permission at read (not a value GitHub takes) is still never copied
+    const idRead = wf(`on: pull_request\njobs:\n  a:\n    runs-on: ubuntu-latest\n    permissions:\n      ${IDT}: read\n    steps: [{ run: make }]\n`);
+    expect(why(idRead, 'a')).toMatch(/id-token/);
     expect(why(r, 'writes')).toMatch(/contents: write/);
     expect(why(r, 'all')).toMatch(/write-all/);
     // a workflow-level write permission reaches every job that has none of its own
@@ -176,7 +179,7 @@ jobs:
     runs-on: self-hosted
     steps: [{ run: make }]
   labels:
-    runs-on: [self-hosted, linux]
+    runs-on: [self-hosted, ubuntu-latest]
     steps: [{ run: make }]
   group:
     runs-on: { group: big }
@@ -218,6 +221,26 @@ jobs:
     expect(why(r, 'setup')).toMatch(/secret/);
     expect(why(r, 'build')).toMatch(/needs the job setup/);
     expect(why(r, 'test')).toMatch(/needs the job build/);
+    // in any order of the file: a needs chain written backwards is followed to the end
+    const back = wf(`on: pull_request
+jobs:
+  c:
+    needs: b
+    runs-on: ubuntu-latest
+    steps: [{ run: make }]
+  b:
+    needs: a
+    runs-on: ubuntu-latest
+    steps: [{ run: make }]
+  a:
+    runs-on: ubuntu-latest
+    steps: [{ run: make, env: { K: "${S('KEY')}" } }]
+  d:
+    runs-on: ubuntu-latest
+    steps: [{ run: make }]
+`);
+    expect(Object.keys(copyOf(back).jobs)).toEqual(['d']);
+    expect(why(back, 'c')).toMatch(/needs the job b/);
   });
 
   it('compat: matrix or expression runs-on → not compared', () => {
