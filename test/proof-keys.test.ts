@@ -149,8 +149,8 @@ describe('E4 scratch keys: deleteAll (S14)', () => {
     expect(deleted.sort()).toEqual(['LEFT_BY_HAND', 'OLD_ONE', 'OLD_TWO']);
     expect(s.values.size).toBe(0);
     expect(g.seen()).toEqual([
-      `GET /repos/${OWNER}/${SCRATCH}`,   // the repo id: the key of the shared key state (fix round 1, E4-R1)
       `GET ${S_PATH}`, `DELETE ${S_PATH}/LEFT_BY_HAND`, `DELETE ${S_PATH}/OLD_ONE`, `DELETE ${S_PATH}/OLD_TWO`, `GET ${S_PATH}`,
+      `GET /repos/${OWNER}/${SCRATCH}`,   // then the repo id: the key of the shared key state (E4-R1), read after the deletes (fix round 2, R6)
     ]);
     expect(keys.mode).toBe('none');
     // pages: 150 secrets are read on two pages, all deleted

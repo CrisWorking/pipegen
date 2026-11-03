@@ -37,10 +37,16 @@
 //   - an organisation secret visible to the repo, whose name a proof workflow reads (case-insensitive; every name when
 //     `readByWorkflows` isn't given), isn't shadowed by a placeholder or throwaway pipegen wrote under that name;
 //   - a repo Actions variable isn't one of the declared non-secret names (target.ts SCRATCH_VARIABLES) holding its config;
+//   - an environment of the repo holds any secret (they override repo secrets for a job that names the environment, and
+//     pipegen never writes one), or an environment variable that isn't a declared name holding its config (fix round 2, R2);
 //   - any of those lists can't be read (unknown fails closed).
-// Recorded residuals: environment secrets and variables, and organisation variables, are not listed (no proof job takes an
-// environment's secrets, and E1's guard refuses environment writes of both); a value changed by hand in the instant between
-// pipegen's PUT and its own list would be recorded as pipegen's.
+// At evidence() each run is also read: it must be finished, and the brand names each run's (id, attempt) as GitHub gives it,
+// so a later re-run attempt of the same run id is not covered; and a store of a user value anywhere in the repo's state after
+// the mint revokes the brand (evidenceCovers checks the state's real-store count; fix round 2, R1).
+// Recorded residuals: organisation variables are not listed (the one `vars.` a proof workflow reads is PIPEGEN_BLOCK_FROM, a
+// date); a value changed by hand between pipegen's PUT and its own list (or in the same second after it: GitHub's updated_at
+// has whole-second precision) is recorded as pipegen's; a secret added and deleted again inside one ticket→evidence window,
+// by hand or by a second pipegen process on the same scratch repo, leaves no trace (E8/S20: a scratch-repo lease).
 import { randomBytes } from 'node:crypto';
 import type { Octokit } from '@octokit/rest';
 import { knownValueScrubber } from '../ai/redact.js';
@@ -65,6 +71,10 @@ export const SCRATCH_FP_KEY = 'PIPEGEN_FP_KEY';
 /** Secrets listed per page, and the most pages deleteAll reads (1,000 secrets; GitHub allows 100 per repo). */
 export const SECRET_LIST_PAGES = 10;
 const NAME_RE = /^[A-Z_][A-Z0-9_]{0,199}$/;
+/** A secret or variable name as GitHub lists it. */
+const PLAIN_NAME_RE = /^[A-Za-z0-9_]{1,200}$/;
+/** An environment name as GitHub lists it: up to 255 characters, no control character. */
+const ENV_NAME_RE = /^[^\u0000-\u001f\u007f]{1,255}$/;
 
 type ProofIO = Pick<CliIO, 'prompt' | 'out' | 'err'>;
 type Kind = 'placeholder' | 'throwaway' | 'real';
@@ -88,11 +98,18 @@ const minted = new WeakSet<object>();
 /** True only for an object ScratchKeys.evidence made. A copy, a look-alike or an object made from one is not evidence. */
 export const isExcerptEvidence = (x: unknown): x is ExcerptEvidence => typeof x === 'object' && x !== null && minted.has(x);
 
-/** The run ids each brand was minted for (M1): errorExcerpt takes a log only of one of them. */
-const coveredRuns = new WeakMap<object, ReadonlySet<number>>();
-/** True only when `e` is evidence ScratchKeys minted for a set of runs that holds `runId`. */
-export const evidenceCovers = (e: unknown, runId: unknown): boolean =>
-  isExcerptEvidence(e) && typeof runId === 'number' && (coveredRuns.get(e)?.has(runId) ?? false);
+/** What each brand covers (M1, R1): the finished (run id, attempt) pairs, and the repo state's real-store count at the mint. */
+const covered = new WeakMap<object, { pairs: ReadonlySet<string>; state: KeyState; seq: number }>();
+const pairKey = (runId: number, attempt: number): string => `${runId}#${attempt}`;
+/**
+ * True only when `e` is evidence ScratchKeys minted for runs that include this exact (run id, attempt), and no value the user
+ * typed has been stored in that repo's state since the mint (fix round 2, R1: a re-run attempt with real keys is not covered).
+ */
+export function evidenceCovers(e: unknown, runId: unknown, attempt?: unknown): boolean {
+  if (!isExcerptEvidence(e) || typeof runId !== 'number' || typeof attempt !== 'number') return false;
+  const c = covered.get(e);
+  return c !== undefined && c.state.realSeq === c.seq && c.pairs.has(pairKey(runId, attempt));
+}
 
 /** An opaque ticket (see the file comment). */
 export interface RunTicket { readonly ticket: true }
@@ -215,38 +232,69 @@ export class ScratchKeys {
   }
 
   /**
-   * Every secret of the scratch repo, listed from the API, deleted one by one, then listed again (S14). Runs before the first
-   * store and in E8's cleanup (also while a stop is under way). It first waits for the repo's stores in flight, at most
+   * Every secret of the scratch repo, listed from the API, deleted one by one by the guarded scratch names, then listed again
+   * (S14); the repo-id bookkeeping comes after, and if the id can't be read the deletes still happen and that is a leftover
+   * (R6). Runs before the first store and in E8's cleanup (also while a stop is under way). It first waits for the repo's stores in flight, at most
    * `waitMs` (default deps.deleteWaitMs, DELETE_WAIT_MS; M4), then deletes anyway; a store still in flight is reported
    * through `leftover` (E0b's callback) and keeps the state unverified. Returns the names deleted; throws ScratchKeysError
    * naming the leftovers when the list can't be read or a secret stays.
    */
   async deleteAll(opts: { waitMs?: number; leftover?: (item: string) => void } = {}): Promise<string[]> {
-    const st = await this.#state();
+    const report = opts.leftover ?? this.#leftover;
+    // R6: the deletes go by the guarded scratch names first; the id-based bookkeeping comes after, and its failure is a leftover
+    const known = this.#st;
     const waitMs = opts.waitMs ?? this.#deleteWaitMs;
-    if (st.busy.size > 0) {
+    if (known !== null && known.busy.size > 0) {
       let timer: ReturnType<typeof setTimeout> | undefined;
-      await Promise.race([Promise.allSettled([...st.busy.keys()]), new Promise((ok) => { timer = setTimeout(ok, Math.max(0, waitMs)); })]);
+      await Promise.race([Promise.allSettled([...known.busy.keys()]), new Promise((ok) => { timer = setTimeout(ok, Math.max(0, waitMs)); })]);
       clearTimeout(timer);
     }
-    const still = [...st.busy.values()];
+    if (known !== null) known.clean = false;
+    let purge: { deleted: string[]; leftovers: string[] } | null = null;
+    let failure: unknown = null;
     try {
-      return await this.#deleteAll(st);
-    } finally {
+      purge = await this.#purge();
+    } catch (e) {
+      failure = e;
+    }
+    let st = known;
+    if (st === null) {
+      try {
+        st = await this.#state();
+      } catch {
+        report(`pipegen couldn't read ${this.#scratch.fullName} after deleting its secrets, so its key state is not verified (no log excerpt goes to the AI until a later delete is booked)`);
+      }
+    }
+    if (st !== null) {
+      if (purge !== null) this.#book(st, purge.leftovers);
+      else st.clean = false;
+      const still = [...st.busy.values()];
       if (still.length > 0) {
         st.clean = false;
         if (still.some((b) => b.real)) st.realSinceClean = true;
-        const report = opts.leftover ?? this.#leftover;
         for (const b of still) {
           report(`a store of ${b.names.map((n) => safeText(n, 80)).join(', ')} to ${this.#scratch.fullName} was still in flight when its secrets were deleted; `
             + `it may have landed after (check ${this.#scratch.fullName} → Settings → Secrets and variables → Actions)`);
         }
       }
     }
+    if (failure !== null) throw failure;
+    const done = purge as { deleted: string[]; leftovers: string[] };
+    if (done.leftovers.length > 0) throw this.#leftoverError(done.leftovers);
+    return done.deleted;
   }
 
+  /** The store path's deleteAll (its own batch is in flight): purge, book, throw on leftovers. */
   async #deleteAll(st: KeyState): Promise<string[]> {
     st.clean = false;
+    const { deleted, leftovers } = await this.#purge();
+    this.#book(st, leftovers);
+    if (leftovers.length > 0) throw this.#leftoverError(leftovers);
+    return deleted;
+  }
+
+  /** List, delete each by name, list again (the guarded scratch target only; no state). Throws when a list can't be read. */
+  async #purge(): Promise<{ deleted: string[]; leftovers: string[] }> {
     const first = (await this.#list()).map((e) => e.name);
     const deleted: string[] = [];
     const failed: string[] = [];
@@ -260,18 +308,26 @@ export class ScratchKeys {
       }
     }
     const left = (await this.#list()).map((e) => e.name);
-    const leftovers = [...new Set([...failed, ...left])];
+    return { deleted, leftovers: [...new Set([...failed, ...left])] };
+  }
+
+  /** The shared state after a purge: verified clean, or (with leftovers) holding unknown values. */
+  #book(st: KeyState, leftovers: readonly string[]): void {
     if (leftovers.length > 0) {
       // a leftover's value is unknown to pipegen: it counts as a user value (no evidence while it is there)
       for (const n of leftovers) st.stored.set(n, { kind: 'real', updatedAt: null });
       st.realSinceClean = true;
-      throw new ScratchKeysError(`pipegen couldn't delete every secret of ${this.#scratch.fullName}: ${leftovers.map((n) => safeText(n, 80)).join(', ')} `
-        + `${leftovers.length === 1 ? 'is' : 'are'} still there. Delete ${leftovers.length === 1 ? 'it' : 'them'} in ${this.#scratch.fullName} → Settings → Secrets and variables → Actions.`, leftovers);
+      st.clean = false;
+      return;
     }
     st.stored.clear();
     st.clean = true;
     st.realSinceClean = false;
-    return deleted;
+  }
+
+  #leftoverError(leftovers: readonly string[]): ScratchKeysError {
+    return new ScratchKeysError(`pipegen couldn't delete every secret of ${this.#scratch.fullName}: ${leftovers.map((n) => safeText(n, 80)).join(', ')} `
+      + `${leftovers.length === 1 ? 'is' : 'are'} still there. Delete ${leftovers.length === 1 ? 'it' : 'them'} in ${this.#scratch.fullName} → Settings → Secrets and variables → Actions.`, leftovers);
   }
 
   /**
@@ -328,11 +384,27 @@ export class ScratchKeys {
     }
     if (rec.state !== st) return refuse('the ticket is for another scratch repo');
     if (rec.seq !== st.realSeq) return refuse(`a value you typed was stored in ${this.#scratch.fullName} after the ticket`);
+    // R1: each run finished, its attempt as GitHub gives it
+    const pairs = new Set<string>();
+    for (const id of runIds) {
+      let d: { id?: unknown; status?: unknown; run_attempt?: unknown } | null;
+      try {
+        d = (await githubRead(this.#gh, 'GET /repos/{owner}/{repo}/actions/runs/{run_id}', { owner: this.#scratch.owner, repo: this.#scratch.repo, run_id: id }, this.#clock)).data as typeof d;
+      } catch (e) {
+        if (isTokenRejected(this.#gh, e)) throw githubTokenRejected();
+        return refuse(`pipegen couldn't read run ${id} of ${this.#scratch.fullName}`);
+      }
+      if (d === null || d.id !== id || typeof d.run_attempt !== 'number' || !Number.isSafeInteger(d.run_attempt) || d.run_attempt <= 0) return refuse(`GitHub's answer about run ${id} could not be read`);
+      if (d.status !== 'completed') return refuse(`run ${id} is not finished, so jobs of it may still start (with whatever is stored then)`);
+      pairs.add(pairKey(id, d.run_attempt));
+    }
     const now = await this.#verify(st);
     if (now !== null) return refuse(now);
+    // a store that began during the reads above
+    if (rec.seq !== st.realSeq) return refuse(`a value you typed was stored in ${this.#scratch.fullName} after the ticket`);
     const e = Object.freeze(Object.create(null) as object) as ExcerptEvidence;
     minted.add(e);
-    coveredRuns.set(e, new Set(runIds));
+    covered.set(e, { pairs, state: st, seq: st.realSeq });
     this.#why = undefined;
     return e;
   }
@@ -407,6 +479,31 @@ export class ScratchKeys {
       if (!SCRATCH_VARIABLES.includes(v.name)) return `the Actions variable ${safeText(v.name, 80)} of ${repo} is not one pipegen declares`;
       if (typeof v.value !== 'string' || validDate(v.value) === undefined) return `the Actions variable ${safeText(v.name, 80)} of ${repo} doesn't hold its date`;
     }
+    // R2: environment secrets override repo secrets (and environment variables repo variables) for a job in that environment
+    let envs: { name: string }[];
+    try {
+      envs = await this.#listOf('GET /repos/{owner}/{repo}/environments', 'environments', {}, ENV_NAME_RE);
+    } catch (e) {
+      if (isTokenRejected(this.#gh, e)) throw githubTokenRejected();
+      return `pipegen couldn't read the environments of ${repo}`;
+    }
+    for (const env of envs) {
+      const where = `the environment ${safeText(env.name, 100)} of ${repo}`;
+      let es: { name: string }[];
+      let ev: { name: string; value?: unknown }[];
+      try {
+        es = await this.#listOf('GET /repos/{owner}/{repo}/environments/{environment_name}/secrets', 'secrets', { environment_name: env.name });
+        ev = await this.#listOf('GET /repos/{owner}/{repo}/environments/{environment_name}/variables', 'variables', { environment_name: env.name });
+      } catch (e) {
+        if (isTokenRejected(this.#gh, e)) throw githubTokenRejected();
+        return `pipegen couldn't read the secrets and variables of ${where}`;
+      }
+      if (es.length > 0) return `${where} holds the secret ${safeText((es[0] as { name: string }).name, 80)}, which pipegen never writes`;
+      for (const v of ev) {
+        if (!SCRATCH_VARIABLES.includes(v.name)) return `${where} holds the variable ${safeText(v.name, 80)}, which pipegen doesn't declare`;
+        if (typeof v.value !== 'string' || validDate(v.value) === undefined) return `the variable ${safeText(v.name, 80)} of ${where} doesn't hold its date`;
+      }
+    }
     return null;
   }
 
@@ -441,7 +538,8 @@ export class ScratchKeys {
     if (entries.length === 0) return;
     if (new Set(entries.map((e) => e.name)).size !== entries.length) throw new ScratchKeysError('two of the secret names are the same after upper-casing.');
     if (interrupting()) throw new ScratchGuardError('pipegen is stopping; no secret is stored.');
-    const st = await this.#state();
+    // a known state is taken without an await, so the batch is registered as in flight in the same tick (deleteAll sees it)
+    const st = this.#st ?? await this.#state();
     if (interrupting()) throw new ScratchGuardError('pipegen is stopping; no secret is stored.');
     const run = this.#storeBatch(st, entries);
     st.busy.set(run, { names: entries.map((e) => e.name), real: entries.some((e) => e.kind === 'real') });
@@ -523,17 +621,17 @@ export class ScratchKeys {
   }
 
   /** One whole list (every page up to its total_count, no skip), each item with a plain name; throws when it can't be read. */
-  async #listOf(route: string, key: 'secrets' | 'variables'): Promise<{ name: string; updated_at?: unknown; value?: unknown }[]> {
+  async #listOf(route: string, key: 'secrets' | 'variables' | 'environments', params: Record<string, unknown> = {}, nameRe: RegExp = PLAIN_NAME_RE): Promise<{ name: string; updated_at?: unknown; value?: unknown }[]> {
     const items: { name: string; updated_at?: unknown; value?: unknown }[] = [];
     const bad = () => new ScratchKeysError(`the list ${route} could not be read`);
     for (let page = 1; ; page++) {
       if (page > SECRET_LIST_PAGES) throw bad();
-      const d = (await githubRead(this.#gh, route, { owner: this.#scratch.owner, repo: this.#scratch.repo, per_page: 100, page }, this.#clock)).data as Record<string, unknown> | null;
+      const d = (await githubRead(this.#gh, route, { ...params, owner: this.#scratch.owner, repo: this.#scratch.repo, per_page: 100, page }, this.#clock)).data as Record<string, unknown> | null;
       const list = d?.[key];
       if (typeof d?.total_count !== 'number' || !Number.isSafeInteger(d.total_count) || d.total_count < 0 || !Array.isArray(list)) throw bad();
       for (const x of list as unknown[]) {
         const n = (x as { name?: unknown } | null)?.name;
-        if (typeof n !== 'string' || !/^[A-Za-z0-9_]{1,200}$/.test(n)) throw bad();
+        if (typeof n !== 'string' || !nameRe.test(n)) throw bad();
         items.push({ ...(x as object), name: n });
       }
       if (items.length >= d.total_count) break;

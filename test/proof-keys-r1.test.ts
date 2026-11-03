@@ -192,10 +192,10 @@ describe('E4 fix round 1: bound brand, live scrubber, deleteAll deadline (review
     const K = keysFor(w);
     await K.placeholders(['A_KEY']);
     const e = await K.evidence(await K.ticket(), [11, 12]);
-    expect(evidenceCovers(e, 11)).toBe(true);
-    expect(evidenceCovers(e, 12)).toBe(true);
-    expect(evidenceCovers(e, 13)).toBe(false);
-    expect(evidenceCovers({ ...e }, 11)).toBe(false);
+    expect(evidenceCovers(e, 11, 1)).toBe(true);
+    expect(evidenceCovers(e, 12, 1)).toBe(true);
+    expect(evidenceCovers(e, 13, 1)).toBe(false);
+    expect(evidenceCovers({ ...e }, 11, 1)).toBe(false);
     for (const bad of [[], [0], [-1], [1.5], ['7']]) expect(await K.evidence(await K.ticket(), bad as number[]), JSON.stringify(bad)).toBeNull();
   });
 

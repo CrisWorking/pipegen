@@ -7,7 +7,7 @@ import { SecretVault } from '../src/create/secrets.js';
 import { errorExcerpt, type ExcerptEvidence, MAX_LOG_CHARS, unscannedExcerpt } from '../src/proof/excerpt.js';
 import { betterleaksAt, CLEAN, makeStub } from './helpers/gitleaks-stub.js';
 import { cleanupRepos } from './helpers/make-repo.js';
-import { EVIDENCE_RUN, placeholderEvidence } from './helpers/scratch-secrets.js';
+import { EVIDENCE_ATTEMPT, EVIDENCE_RUN, placeholderEvidence } from './helpers/scratch-secrets.js';
 
 afterEach(() => cleanupRepos());
 
@@ -36,16 +36,18 @@ describe('errorExcerpt: the evidence boundary (ruling E0a-R5; E4: the ScratchKey
       { ...real }, Object.create(real), Object.freeze({}), Object.create(null)];
     for (const e of bad) {
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      await expect(errorExcerpt('Error: x', scrub, scanner, e as any, { runId: EVIDENCE_RUN })).rejects.toThrow(/placeholders/);
+      await expect(errorExcerpt('Error: x', scrub, scanner, e as any, { runId: EVIDENCE_RUN, attempt: EVIDENCE_ATTEMPT })).rejects.toThrow(/placeholders/);
     }
     // E4 fix round 1 (M1): the brand is bound to its run ids; a log of another run, or none named, is refused
-    await expect(errorExcerpt('Error: x', scrub, scanner, real, { runId: EVIDENCE_RUN + 1 })).rejects.toThrow(/run/);
+    await expect(errorExcerpt('Error: x', scrub, scanner, real, { runId: EVIDENCE_RUN + 1, attempt: EVIDENCE_ATTEMPT })).rejects.toThrow(/run/);
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     await expect(errorExcerpt('Error: x', scrub, scanner, real, {} as any)).rejects.toThrow(/run/);
+    // fix round 2 (R1): the attempt must match too
+    await expect(errorExcerpt('Error: x', scrub, scanner, real, { runId: EVIDENCE_RUN, attempt: EVIDENCE_ATTEMPT + 1 })).rejects.toThrow(/run/);
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     await expect((errorExcerpt as any)('Error: x', scrub, scanner, real)).rejects.toThrow(/run/);
     expect(existsSync(record)).toBe(false); // the scanner never ran
-    expect(await errorExcerpt('Error: x', scrub, scanner, real, { runId: EVIDENCE_RUN })).toBe('Error: x');
+    expect(await errorExcerpt('Error: x', scrub, scanner, real, { runId: EVIDENCE_RUN, attempt: EVIDENCE_ATTEMPT })).toBe('Error: x');
     expect(existsSync(record)).toBe(true);
   });
 });

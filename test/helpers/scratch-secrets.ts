@@ -34,6 +34,10 @@ export interface KeysFake {
   orgShared: string[] | null;
   /** Repo Actions variables (GET …/actions/variables). null: 403. */
   variables: { name: string; value: string }[] | null;
+  /** Environments (GET …/environments), each with its secret names and variables (a null list: 403). null: the environment list answers 403. */
+  environments: Record<string, { held: string[] | null; vars: { name: string; value: string }[] | null }> | null;
+  /** Workflow runs as GET …/actions/runs/{id} answers them (fix round 2, R1). A run not listed: completed, attempt 1. */
+  runs: Map<number, { status: string; run_attempt: number }>;
   handler: (c: Call) => Reply | undefined;
 }
 
@@ -44,7 +48,7 @@ export function secretsFake(owner: string, repo: string, keep: Record<string, st
   const base = `/repos/${owner}/${repo}/actions/secrets`;
   const f: KeysFake = {
     values: new Map(Object.entries(keep)), failPut: new Map(), failDelete: new Map(), sticky: new Set(),
-    updated: new Map(Object.keys(keep).map((k) => [k, stamp()])), orgShared: [], variables: [],
+    updated: new Map(Object.keys(keep).map((k) => [k, stamp()])), orgShared: [], variables: [], environments: {}, runs: new Map(),
     touch: (name, value) => { f.values.set(name, value); f.updated.set(name, stamp()); },
     handler: (c) => {
       const path = decodeURIComponent(c.url.pathname);
@@ -58,6 +62,29 @@ export function secretsFake(owner: string, repo: string, keep: Record<string, st
         return { body: { total_count: all.length, [LIST]: all.slice((n - 1) * per, n * per).map((name) => ({ name, created_at: '2026-11-03T10:00:00Z', updated_at: f.updated.get(name) ?? '2026-11-03T10:00:00Z' })) } };
       }
       const repoBase = base.slice(0, -'/actions/secrets'.length);
+      const forbidden = { status: 403, body: { message: 'Resource not accessible by personal access token' } };
+      const runM = new RegExp(`^${repoBase}/actions/runs/(\\d+)$`).exec(path);
+      if (runM && c.method === 'GET') {
+        const id = Number(runM[1]);
+        const r = f.runs.get(id) ?? { status: 'completed', run_attempt: 1 };
+        return { body: { id, ...r, conclusion: r.status === 'completed' ? 'failure' : null } };
+      }
+      if (path === `${repoBase}/environments` && c.method === 'GET') {
+        if (f.environments === null) return forbidden;
+        const names = Object.keys(f.environments);
+        return { body: { total_count: names.length, environments: names.map((name, i) => ({ id: 900 + i, name })) } };
+      }
+      const envM = new RegExp(`^${repoBase}/environments/([^/]+)/(secrets|variables)$`).exec(path);
+      if (envM && c.method === 'GET') {
+        const env = f.environments?.[envM[1] as string];
+        if (env === undefined) return { status: 404, body: { message: 'Not Found' } };
+        if (envM[2] === 'secrets') {
+          if (env.held === null) return forbidden;
+          return { body: { total_count: env.held.length, [LIST]: env.held.map((name) => ({ name, created_at: '2026-11-03T10:00:00Z', updated_at: '2026-11-03T10:00:00Z' })) } };
+        }
+        if (env.vars === null) return forbidden;
+        return { body: { total_count: env.vars.length, variables: env.vars.map((v) => ({ ...v, created_at: '2026-11-03T10:00:00Z', updated_at: '2026-11-03T10:00:00Z' })) } };
+      }
       if (path === `${repoBase}/actions/organization-secrets` && c.method === 'GET') {
         if (f.orgShared === null) return { status: 403, body: { message: 'Resource not accessible by personal access token' } };
         return { body: { total_count: f.orgShared.length, [LIST]: f.orgShared.map((name) => ({ name, created_at: '2026-11-03T10:00:00Z', updated_at: '2026-11-03T10:00:00Z', visibility: 'all' })) } };
@@ -111,6 +138,8 @@ export function keysWorld(w: WorldOptions = {}, keep: Record<string, string> = {
 
 /** The run id placeholderEvidence's brand names. */
 export const EVIDENCE_RUN = 4242;
+/** The attempt of EVIDENCE_RUN the brand names (the fake's default for a run it doesn't list). */
+export const EVIDENCE_ATTEMPT = 1;
 /**
  * Real excerpt evidence (DECISIONS #113) for tests of errorExcerpt: a ScratchKeys over the fake stores one placeholder, a
  * ticket is taken (the repo listed), and the evidence minted for run EVIDENCE_RUN. Nothing else can make one.
@@ -119,7 +148,7 @@ export async function placeholderEvidence(): Promise<ExcerptEvidence> {
   const { g } = keysWorld();
   const keys = new ScratchKeys(g.gh, proofTarget(app()), new SecretVault(), { io: quietIo, readByWorkflows: ['STRIPE_SECRET_KEY'] });
   await keys.placeholders(['STRIPE_SECRET_KEY']);
-  const e = await keys.evidence(await keys.ticket(), [EVIDENCE_RUN]);
+  const e = await keys.evidence(await keys.ticket(), [EVIDENCE_RUN]);   // the fake answers: completed, attempt EVIDENCE_ATTEMPT
   if (e === null) throw new Error(`no evidence: ${keys.lastRefusal ?? '?'}`);
   return e;
 }
