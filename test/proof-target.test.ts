@@ -8,6 +8,7 @@ import {
   assertCentral, assertScratch, createHelperRepo, guardedWrite, isProofTarget, newRunId, proofTarget, ScratchGuardError, scratchPushUrl,
   ProofStopError, type ProofApp,
 } from '../src/proof/target.js';
+import { newRateBudget } from '../src/engine/github-rate.js';
 import { interrupting } from '../src/util/exit-hooks.js';
 import { world, SHA_MAIN } from './helpers/proof-github.js';
 
@@ -106,7 +107,6 @@ describe('E1 guardedWrite (S3)', () => {
     const c = assertCentral(t, app());
     const allowed: [string, Record<string, unknown>][] = [
       ['PATCH /repos/{owner}/{repo}', { private: true }],
-      ['PATCH /repos/{owner}/{repo}', { visibility: 'private' }],
       ['PUT /repos/{owner}/{repo}/actions/permissions/access', { access_level: 'user' }],
       ['POST /repos/{owner}/{repo}/git/refs', { ref: 'refs/heads/proof/20261103-120000-abcdef', sha: SHA_MAIN }],
       ['PATCH /repos/{owner}/{repo}/git/refs/{ref}', { ref: 'heads/proof/20261103-120000-abcdef', sha: SHA_MAIN, force: true }],
@@ -117,6 +117,9 @@ describe('E1 guardedWrite (S3)', () => {
 
     const refused: [string, Record<string, unknown>][] = [
       ['PATCH /repos/{owner}/{repo}', { default_branch: 'main' }],
+      ['PATCH /repos/{owner}/{repo}', { visibility: 'private' }],   // ruling M1: { private: true } only
+      ['PATCH /repos/{owner}/{repo}', { allow_forking: false }],
+      ['PATCH /repos/{owner}/{repo}', { description: 'pipegen central workflows and install records' }],
       ['PATCH /repos/{owner}/{repo}', { private: true, default_branch: 'main' }],
       ['PUT /repos/{owner}/{repo}/actions/permissions/access', { access_level: 'organization' }],
       ['PUT /repos/{owner}/{repo}/actions/permissions/access', { access_level: 'none' }],
@@ -148,6 +151,23 @@ describe('E1 guardedWrite (S3)', () => {
     await expect(guardedWrite(g.gh, assertScratch(t, app()), 'PATCH /repos/{owner}/{repo}', { private: true })).rejects.toThrow(/stopping/);
     await expect(createHelperRepo(g.gh, assertScratch(t, app()), OWNER)).rejects.toThrow(/stopping/);
     expect(g.calls).toEqual([]);
+  });
+
+  it('the stop is checked before every attempt: a stop that begins during the rate-limit wait sends no retry (I1)', async () => {
+    const t = proofTarget(app());
+    const clock = () => ({ budget: newRateBudget(), sleep: async () => { vi.mocked(interrupting).mockReturnValue(true); } });
+    const g = world({ repos: both, rateLimitOnce: `PATCH /repos/${OWNER}/${SCRATCH}` });
+    await expect(guardedWrite(g.gh, assertScratch(t, app()), 'PATCH /repos/{owner}/{repo}', { private: true }, clock())).rejects.toThrow(/refused a GitHub write: pipegen is stopping/);
+    expect(g.seen()).toEqual([`PATCH /repos/${OWNER}/${SCRATCH}`]);
+    vi.mocked(interrupting).mockReturnValue(false);
+    const c = world({ repos: {}, rateLimitOnce: 'POST /user/repos' });
+    await expect(createHelperRepo(c.gh, assertScratch(t, app()), OWNER, clock())).rejects.toThrow(ScratchGuardError);
+    expect(c.seen()).toEqual(['POST /user/repos']);
+    // without the stop, the same wait retries once and the write goes through
+    vi.mocked(interrupting).mockReturnValue(false);
+    const ok = world({ repos: both, rateLimitOnce: `PATCH /repos/${OWNER}/${SCRATCH}` });
+    await guardedWrite(ok.gh, assertScratch(t, app()), 'PATCH /repos/{owner}/{repo}', { private: true }, { budget: newRateBudget(), sleep: async () => {} });
+    expect(ok.seen()).toEqual([`PATCH /repos/${OWNER}/${SCRATCH}`, `PATCH /repos/${OWNER}/${SCRATCH}`]);
   });
 
   it('createHelperRepo: only the two helper names, under the owner, checked private in GitHub\'s answer', async () => {

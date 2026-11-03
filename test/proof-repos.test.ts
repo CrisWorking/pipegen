@@ -11,7 +11,7 @@ import {
   visibilityOf, type ProofRepoOptions,
 } from '../src/proof/repos.js';
 import {
-  assertCentral, assertScratch, createHelperRepo, guardedWrite, makeRepoPrivate, proofTarget, ProofStopError, ScratchGuardError,
+  assertCentral, assertScratch, createHelperRepo, githubRead, guardedWrite, makeRepoPrivate, proofTarget, ProofStopError, ScratchGuardError,
   type GuardedRepo, type ProofApp,
 } from '../src/proof/target.js';
 import { world, SHA_MAIN, type WorldOptions } from './helpers/proof-github.js';
@@ -147,6 +147,11 @@ describe('E1 repos (plan Task 1, preflight S1/S13/S19)', () => {
     expect(JSON.parse(internal.g.writes()[0]?.body ?? '{}')).toEqual({ visibility: 'private' });
     const internalNo = run({ repos: { pipelines: { private: true }, [SCRATCH]: { private: true, visibility: 'internal' } } }, app(), {}, false);
     await expect(internalNo.result).rejects.toThrow(ProofStopError);
+    // an internal pipelines (ruling M1: its make-private PATCH is { private: true } only, which can't change an internal repo): the command, no prompt
+    const central = run({ repos: { pipelines: { private: true, visibility: 'internal' }, [SCRATCH]: { private: true } } });
+    await expect(central.result).rejects.toThrow(`gh repo edit ${OWNER}/pipelines --visibility private --accept-visibility-change-consequences`);
+    expect(central.i.prompt.asked).toEqual([]);
+    expect(central.g.writes()).toEqual([]);
   });
 
   it('repos: public project → pipelines still checked (records only), scratch named pipegen-proof-<repo>', async () => {
@@ -174,12 +179,13 @@ describe('E1 repos (plan Task 1, preflight S1/S13/S19)', () => {
     const seen = r.g.seen();
     expect(seen.indexOf('GET /orgs/AcmeOrg')).toBeGreaterThanOrEqual(0);
     expect(seen.indexOf('GET /orgs/AcmeOrg')).toBeLessThan(seen.indexOf(`GET /repos/AcmeOrg/${SCRATCH}`));
-    // write or admin: code owners may get review requests too (ruling S5)
+    // write or admin: a hard stop now (fix round 1, ruling E1-R2), no warning
     for (const level of ['write', 'admin'] as const) {
       const w = world({ owner: 'AcmeOrg', ownerType: 'Organization', org: { default_repository_permission: level } });
       const got = await checkOrgBasePermission(w.gh, 'AcmeOrg', SCRATCH);
       expect(got.level).toBe(level);
-      expect(got.warning).toBe(`${warning} Code owners may get review requests from the proof PRs.`);
+      expect(got.warning).toBeUndefined();
+      expect(got.stop).toMatch(/^Every member of AcmeOrg can push to pipegen-proof-shop/);
     }
     // a personal account has no org base permission: not asked
     const user = run({ repos: both, access: 'user' });
@@ -436,7 +442,9 @@ describe('E1 repos (plan Task 1, preflight S1/S13/S19)', () => {
       expect(src, f).not.toMatch(/\.request\(\s*['"`](?:POST|PUT|PATCH|DELETE)\b/);
       expect(src, f).not.toMatch(/\.rest\.[a-zA-Z]+\.(?!get\b|list|check)[a-zA-Z]+\(/);
       expect(src, f).not.toMatch(/\bmethod\s*:\s*['"`](?:POST|PUT|PATCH|DELETE)/);
+      expect(src, f).not.toMatch(/\.request\(\s*[^'"`\s]/);   // a route that isn't a literal can't be checked here
     }
+    for (const f of readdirSync(dir).filter((x) => x.endsWith('.ts'))) expect(readFileSync(join(dir, f), 'utf8'), f).not.toMatch(/\.graphql\s*[(.`]/);
   });
 });
 
@@ -510,5 +518,51 @@ describe('E1 repos: answers GitHub may give (mutation-driven)', () => {
     for (const p of ['bullfrog/*', 'bullfrogsec/bullfrog@v1', `bullfrogsec/bullfrog@${'B'.repeat(40)}`, 'bullfrogsec/bull', '', '@*']) expect(patternCovers(p, u), p).toBe(false);
     expect(patternCovers('github/codeql-action/*', `github/codeql-action/init@${'d'.repeat(40)}`)).toBe(true);
     expect(patternCovers('a.b/*', 'axb/c@1')).toBe(false);   // a pattern's dots are literal
+  });
+});
+
+describe('E1 fix round 1: marker (M5), default-branch failures (M4), reads are GET only (M3)', () => {
+  const MARKER = 'pipegen proof runs (private scratch repo)';
+  it('a reused scratch repo without pipegen\'s description: asked, default No; No → stop, no write; Yes → the marker is set through the guard', async () => {
+    const msg = `${SCRATCH} exists but pipegen didn't create it. pipegen will overwrite its branches and secrets. Use it?`;
+    const no = run({ repos: { pipelines: { private: true }, [SCRATCH]: { private: true, description: 'my old repo' } }, access: 'user' }, app(), {}, false);
+    await expect(no.result).rejects.toThrow(ProofStopError);
+    expect(no.i.prompt.asked).toEqual([msg]);
+    expect(no.g.writes()).toEqual([]);
+    const yes = run({ repos: { pipelines: { private: true }, [SCRATCH]: { private: true, description: '' } }, access: 'user' });
+    expect((await yes.result).ready).toBe(true);
+    expect(yes.i.prompt.asked).toEqual([msg]);
+    expect(writePaths(yes.g)).toEqual([`PATCH /repos/${OWNER}/${SCRATCH}`]);
+    expect(JSON.parse(yes.g.writes()[0]?.body ?? '{}')).toEqual({ description: MARKER });
+    // the marker is the description createCommands and the create call use
+    expect(createCommands(OWNER, [SCRATCH])[0]).toContain(`--description "${MARKER}"`);
+    const created = run({ repos: { pipelines: { private: true } }, access: 'user' }, app(), by(appMode));
+    await created.result;
+    expect(JSON.parse(created.g.calls.find((c) => c.method === 'POST')?.body ?? '{}').description).toBe(MARKER);
+    expect(created.i.prompt.asked).toEqual([]);
+    // the guard takes only the marker as a description
+    const g = world({ repos: both });
+    const s = assertScratch(proofTarget(app()), app());
+    for (const p of [{ description: 'x' }, { description: MARKER, name: 'y' }, { allow_forking: true }]) {
+      await expect(guardedWrite(g.gh, s, 'PATCH /repos/{owner}/{repo}', p), JSON.stringify(p)).rejects.toThrow(ScratchGuardError);
+    }
+    expect(g.calls).toEqual([]);
+  });
+
+  it('a default-branch write GitHub refuses → a stop that says what to change', async () => {
+    const r = run({ repos: { pipelines: { private: true }, [SCRATCH]: { private: true, refs: { main: SHA_MAIN, develop: SHA_MAIN } } }, access: 'user', patchStatus: 403 }, app({ defaultBranch: 'develop' }));
+    await expect(r.result).rejects.toThrow(ProofStopError);
+    await expect(r.result).rejects.toThrow(/couldn't set develop as the default branch of CrisWorking\/pipegen-proof-shop \(HTTP 403\).*Settings → General → Default branch/s);
+  });
+
+  it('githubRead takes GET routes only', async () => {
+    const g = world({ repos: both });
+    for (const route of ['POST /user/repos', 'PATCH /repos/{owner}/{repo}', 'get /user', 'DELETE /repos/{owner}/{repo}', ' GET /user']) {
+      await expect(githubRead(g.gh, route, { owner: OWNER, repo: SCRATCH }), route).rejects.toThrow(ScratchGuardError);
+    }
+    await expect(githubRead(g.gh, 'GET /user', { baseUrl: 'https://example.com' })).rejects.toThrow(ScratchGuardError);
+    await expect(githubRead(g.gh, 'GET /user', { headers: {} })).rejects.toThrow(ScratchGuardError);
+    expect(g.calls).toEqual([]);
+    expect((await githubRead(g.gh, 'GET /user', {})).data).toMatchObject({ login: OWNER });
   });
 });

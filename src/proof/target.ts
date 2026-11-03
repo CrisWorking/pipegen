@@ -17,8 +17,12 @@
 //     scratch: the sections in SCRATCH_SECTIONS; never the repo delete (E8 adds it with the exact name and the
 //       "pipegen created it" marker, ruling S3), never a visibility change but to private, never a transfer, fork,
 //       collaborator, webhook, deploy key, dispatch (no workflow_dispatch, plan Global Constraints) or Actions access change;
-//     central: make it private, set its Actions access level to this owner type's (the plan's ensureActionsAccess), and
-//       create, move or delete refs/heads/proof/<runId> (S3, S21). Nothing else.
+//     central: make it private (the literal { private: true }, ruling M1), set its Actions access level to this owner
+//       type's (the plan's ensureActionsAccess; ruling E1-R1), and create, move or delete refs/heads/proof/<runId>
+//       (S3, S21). Nothing else.
+//   The stop gate is checked again inside the call withRateLimit retries (review I1), so a stop that begins during a
+//   rate-limit wait sends nothing more.
+// - githubRead is the one generic read (GET routes only, review M3).
 // - createHelperRepo(gh, repo, login) is the one repo create (App mode only, decided by the caller; ruling S19): the
 //   name is the guarded one, a personal account's create needs the token's login to be the owner (POST /user/repos
 //   makes the repo under the login), and GitHub's answer must name that repo and say private.
@@ -194,8 +198,11 @@ const PATH_VALUE_RE = /^[A-Za-z0-9._/-]{1,255}$/;
  */
 const SCRATCH_SECTIONS = new Set(['git', 'pulls', 'actions', 'code-scanning', 'automated-security-fixes', 'vulnerability-alerts', 'environments', 'contents']);
 const SCRATCH_ACTIONS_DENIED = /\/dispatches$|^\/actions\/permissions(?:\/|$)|^\/actions\/runners|^\/actions\/oidc/;
-/** PATCH /repos/{owner}/{repo} on the scratch repo: only these keys, and visibility only towards private. */
-const SCRATCH_REPO_PATCH = new Set(['private', 'visibility', 'default_branch']);
+/**
+ * PATCH /repos/{owner}/{repo} on the scratch repo: only these keys; visibility only towards private, forking only off
+ * (fix round 1, G4), and the description only pipegen's marker (M5).
+ */
+const SCRATCH_REPO_PATCH = new Set(['private', 'visibility', 'default_branch', 'allow_forking', 'description']);
 
 type Params = Record<string, unknown>;
 
@@ -203,15 +210,21 @@ function refuse(why: string): never {
   throw new ScratchGuardError(why);
 }
 
+/** The sticky stop gate (E0b): no GitHub write starts, or is retried, once a stop has begun. */
+function notStopping(): void {
+  if (interrupting()) refuse('pipegen is stopping; no new GitHub write starts.');
+}
+
 const onlyKeys = (p: Params, keys: readonly string[]) => Object.keys(p).every((k) => keys.includes(k));
-const towardsPrivate = (p: Params) => (p.private === undefined || p.private === true) && (p.visibility === undefined || p.visibility === 'private');
+const towardsPrivate = (p: Params) => (p.private === undefined || p.private === true) && (p.visibility === undefined || p.visibility === 'private')
+  && (p.allow_forking === undefined || p.allow_forking === false) && (p.description === undefined || p.description === SCRATCH_MARKER);
 
 function checkCentral(r: GuardedRepo, method: string, path: string, p: Params): void {
   const t = r.target;
   const proofRef = `heads/proof/${t.runId}`;
   if (method === 'PATCH' && path === '') {
-    if ((onlyKeys(p, ['private']) && p.private === true) || (onlyKeys(p, ['visibility']) && p.visibility === 'private')) return;
-    refuse(`${r.fullName} may only be made private.`);
+    if (onlyKeys(p, ['private']) && p.private === true) return;   // ruling M1: the literal { private: true } only
+    refuse(`${r.fullName} may only be made private ({ private: true }).`);
   }
   if (method === 'PUT' && path === '/actions/permissions/access') {
     const level = t.ownerType === 'Organization' ? 'organization' : 'user';
@@ -233,7 +246,7 @@ function checkScratch(r: GuardedRepo, method: string, path: string, p: Params): 
   if (path === '') {
     if (method === 'PATCH' && Object.keys(p).length > 0 && onlyKeys(p, [...SCRATCH_REPO_PATCH]) && towardsPrivate(p)) return;
     refuse(method === 'DELETE' ? `deleting ${r.fullName} needs the exact name and pipegen's created marker (cleanup).`
-      : `${method} on ${r.fullName} may only make it private or set its default branch.`);
+      : `${method} on ${r.fullName} may only make it private, turn forking off, set its default branch or pipegen's marker.`);
   }
   const section = path.split('/')[1] ?? '';
   if (!SCRATCH_SECTIONS.has(section)) refuse(`${method} ${path} is not a write pipegen makes to ${r.fullName}.`);
@@ -250,7 +263,7 @@ function checkScratch(r: GuardedRepo, method: string, path: string, p: Params): 
 export async function guardedWrite(gh: Octokit, r: GuardedRepo, route: string, params: Params = {}, clock: RateClock = clockOf(gh)): Promise<{ status: number; data: unknown }> {
   requireGuarded(r);
   checkTarget(r.target, { owner: r.target.owner, repo: r.target.appRepo });
-  if (interrupting()) refuse('pipegen is stopping; no new GitHub write starts.');
+  notStopping();
   const m = ROUTE_RE.exec(route);
   if (m === null) refuse(`"${safeText(route, 120)}" is not a write under /repos/{owner}/{repo}.`);
   const method = m[1] as string;
@@ -268,7 +281,8 @@ export async function guardedWrite(gh: Octokit, r: GuardedRepo, route: string, p
   if (r.kind === 'central') checkCentral(r, method, path, params);
   else checkScratch(r, method, path, params);
   try {
-    const res = await withRateLimit(() => gh.request(route, { ...params, owner: r.owner, repo: r.repo }), clock);
+    // checked again before every attempt (review I1): withRateLimit may wait up to 60 s, then send the call again
+    const res = await withRateLimit(() => { notStopping(); return gh.request(route, { ...params, owner: r.owner, repo: r.repo }); }, clock);
     return { status: res.status, data: res.data };
   } catch (e) {
     if (isRateStop(e)) throw e;
@@ -277,11 +291,30 @@ export async function guardedWrite(gh: Octokit, r: GuardedRepo, route: string, p
   }
 }
 
+// ---------- reads ----------
+
+const READ_ROUTE_RE = /^GET \/[A-Za-z0-9_./{}-]*$/;
+/**
+ * The one generic GitHub read of src/proof (review M3): GET routes only, no Octokit option from the caller (owner and
+ * repo are path values here). Errors pass through; the caller decides what a refusal means.
+ */
+export async function githubRead(gh: Octokit, route: string, params: Params = {}, clock: RateClock = clockOf(gh)): Promise<{ data: unknown; headers: Record<string, unknown> }> {
+  if (typeof route !== 'string' || !READ_ROUTE_RE.test(route)) refuse(`"${safeText(String(route), 120)}" is not a GET route; reads take GET only.`);
+  for (const k of Object.keys(params)) if (RESERVED.has(k) && k !== 'owner' && k !== 'repo') refuse(`the parameter "${safeText(k, 40)}" is not taken from a caller.`);
+  const res = await withRateLimit(() => gh.request(route, params), clock);
+  return { data: res.data, headers: res.headers as Record<string, unknown> };
+}
+
 // ---------- creating a helper repo (App mode only, S19) ----------
 
+/**
+ * The marker that pipegen made (or adopted) the scratch repo (ruling M5): its description, set by the create call and by
+ * the printed `gh repo create` command alike. A reused scratch repo without it is asked about; E8's delete requires it.
+ */
+export const SCRATCH_MARKER = 'pipegen proof runs (private scratch repo)';
 const DESCRIPTIONS: Record<GuardedRepo['kind'], string> = {
   central: 'pipegen central workflows and install records',
-  scratch: 'pipegen proof runs (private scratch repo)',
+  scratch: SCRATCH_MARKER,
 };
 export const helperDescription = (kind: GuardedRepo['kind']): string => DESCRIPTIONS[kind];
 
@@ -295,7 +328,7 @@ export async function createHelperRepo(gh: Octokit, r: GuardedRepo, login: strin
   requireGuarded(r);
   const t = r.target;
   checkTarget(t, { owner: t.owner, repo: t.appRepo });
-  if (interrupting()) refuse('pipegen is stopping; no new GitHub write starts.');
+  notStopping();
   const org = t.ownerType === 'Organization';
   if (!org && (login === null || login.toLowerCase() !== t.owner.toLowerCase())) {
     refuse(`a repo for ${t.owner} can only be created by ${t.owner} (the token belongs to ${safeText(login ?? 'nobody known', 40)}).`);
@@ -303,9 +336,10 @@ export async function createHelperRepo(gh: Octokit, r: GuardedRepo, login: strin
   const body = { name: r.repo, private: true, auto_init: true, description: DESCRIPTIONS[r.kind] };
   let data: unknown;
   try {
-    data = (await withRateLimit(() => (org
-      ? gh.request('POST /orgs/{org}/repos', { org: t.owner, ...body })
-      : gh.request('POST /user/repos', body)), clock)).data;
+    data = (await withRateLimit(() => {
+      notStopping();
+      return org ? gh.request('POST /orgs/{org}/repos', { org: t.owner, ...body }) : gh.request('POST /user/repos', body);
+    }, clock)).data;
   } catch (e) {
     if (isRateStop(e)) throw e;
     if ((e as { status?: unknown } | null)?.status === 401 && !isAnonymousClient(gh)) throw githubTokenRejected();
@@ -323,7 +357,8 @@ export async function createHelperRepo(gh: Octokit, r: GuardedRepo, login: strin
 
 /**
  * Makes the guarded repo private (plan Task 1, after the user said yes): `{ private: true }` for a public repo,
- * `{ visibility: 'private' }` for an internal one. GitHub's answer must say private, else ProofStopError.
+ * `{ visibility: 'private' }` for an internal one (scratch only: ruling M1 allows the central repo `{ private: true }`
+ * only, so an internal `pipelines` is a stop with the `gh repo edit` command). GitHub's answer must say private, else ProofStopError.
  */
 export async function makeRepoPrivate(gh: Octokit, r: GuardedRepo, from: 'public' | 'internal', clock: RateClock = clockOf(gh)): Promise<void> {
   const res = await guardedWrite(gh, r, 'PATCH /repos/{owner}/{repo}', from === 'internal' ? { visibility: 'private' } : { private: true }, clock);
