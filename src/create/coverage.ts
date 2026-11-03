@@ -109,7 +109,9 @@ function fromVitestConfig(raw: string): { values: number[]; unreadable: boolean 
 export function readExistingMinimum(input: ExistingMinimumInput): { minimum: number | null; notes: string[] } {
   const values: number[] = [];
   const notes: string[] = [];
-  const bad = (where: string, why: string): void => { notes.push(`pipegen could not read the coverage minimum in ${activeSafeText(where, 80)} (${why}), so it assumes none`); };
+  // the notes are written at the end (D6 N2): with a minimum read elsewhere, that one is used, and the note must not say "assumes none"
+  const unread: string[] = [];
+  const bad = (where: string, why: string): void => { unread.push(`pipegen could not read the coverage minimum in ${activeSafeText(where, 80)} (${why})`); };
   for (const f of input.vitestConfigs ?? []) {
     if (f.text.length > MAX_TEXT) { bad(f.path, 'the file is too large'); continue; }
     const r = fromVitestConfig(f.text);
@@ -131,8 +133,10 @@ export function readExistingMinimum(input: ExistingMinimumInput): { minimum: num
   for (const f of input.c8rcs ?? []) json(f.path, f.text, (o) => o);
   if (input.packageJson !== undefined) json('package.json', input.packageJson, (o) => o.c8);
   // several different minima (several configs, or a config and a c8 section): none is chosen, and the note says so
+  const minimum = new Set(values).size > 1 ? null : values[0] ?? null;
+  for (const u of unread) notes.push(minimum === null ? `${u}, so it assumes none` : `${u}, so pipegen uses the minimum it could read elsewhere`);
   if (new Set(values).size > 1) { notes.push(`pipegen found different coverage minimums in your configuration (${[...new Set(values)].sort((a, b) => a - b).join('%, ')}%) that disagree, so it assumes none`); return { minimum: null, notes }; }
-  return { minimum: values[0] ?? null, notes };
+  return { minimum, notes };
 }
 
 // ---------- the measured value ----------

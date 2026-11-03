@@ -1886,12 +1886,12 @@ tools:
   # it (loader and scripts/cooldown.ts exempt exactly `crisworking/pipegen`, nothing else). Every input is the renderer's (RENDERER_INPUTS);
   # the entry fixes none and offers no choice (ACTION_POLICIES row: none).
   # Reach (ruling S6, DECISIONS #83): the repository stays private until v0.4, so in v0.2 only CrisWorking-owned repositories can use it.
-  # Self-pin (C6 scheme; re-pinned 2026-11-03, Plan D task D9): pinned to 99a0abe (the last commit that changes gate/dist and
+  # Self-pin (C6 scheme; re-pinned 2026-11-03, Plan D task D9): pinned to 99a0abe (the last commit that changes gate/dist or
   #   gate/action.yml, bundle sha256 0903dde8e5761d77d94ded57cec39912649aa6ceeb72d0e511f04da5ab60f946), which is the commit of the
   #   annotated tag gate-v0.2.1. The version is bundle content (GATE_VERSION in the gate view), so it changes before the tag, never in the
   #   re-pin commit. Previous pin: a174da8, tag gate-v0.2.0 (Plan C). scripts/cooldown.ts requires the tag gate-v<version> to resolve to the
-  #   pin; release-check requires the pin's gate/dist and action.yml
-  #   to equal HEAD's and the pin to be on the default branch. Never rewrite history at or before the pin; merge with merge commits only.
+  #   pin; release-check requires the pin's gate/dist and action.yml to equal HEAD's and the pin to be on the default branch. Never rewrite
+  #   history at or before the pin; merge with merge commits only.
   # Source: commit 99a0abec03b3410fbf769ac9bce6516f760e0b57 of CrisWorking/pipegen (committed 2026-11-03T01:21:55Z), tag gate-v0.2.1.
   - id: pipegen-gate
     categories: ["gate"]

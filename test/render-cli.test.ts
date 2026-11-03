@@ -666,4 +666,13 @@ describe('D9 (review-D6 m6): the lock precheck embeds pinOk as an anonymous func
     expect(() => functionSource(class X {} as unknown as (...a: never[]) => unknown)).toThrow(/plain function/);
     expect(() => functionSource({ m(a: number): number { return a; } }.m as (...a: never[]) => unknown)).toThrow(/plain function/);
   });
+  it('D9 m4: functionSource refuses a function with a comment (`//` would swallow the rest of the one-line script, `/*` is refused too)', () => {
+    // built with new Function so the comment is surely in the text, whatever the test transform keeps
+    const line = new Function('a', '// a note\nreturn a;') as (...a: never[]) => unknown;
+    const block = new Function('a', 'return /* a note */ a;') as (...a: never[]) => unknown;
+    expect(() => functionSource(line)).toThrow(/comment/);
+    expect(() => functionSource(block)).toThrow(/comment/);
+    expect(functionSource(new Function('a', 'return a + 1;') as (...a: never[]) => unknown)).toBe('function(a ) { return a + 1; }');
+    expect(() => functionSource(pinOk)).not.toThrow();
+  });
 });

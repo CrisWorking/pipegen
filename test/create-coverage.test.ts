@@ -102,6 +102,19 @@ describe('coverageChoice (B5)', () => {
     expect(readExistingMinimum({ c8rcs: [{ path: `.c8rc\nx${'y'.repeat(300)}`, text: 'nope' }] }).notes[0]).not.toMatch(/\n/);
   });
 
+  it('D6 N2: one config unreadable and another read: the note says the read minimum is used, not "assumes none"', () => {
+    const r = readExistingMinimum({ vitestConfigs: [{ path: 'v0.config.ts', text: 'thresholds: { lines: MIN }' }, { path: 'v1.config.ts', text: 'thresholds: { lines: 75 }' }] });
+    expect(r.minimum).toBe(75);
+    expect(r.notes).toHaveLength(1);
+    expect(r.notes[0]).toMatch(/could not read the coverage minimum in v0\.config\.ts .*so pipegen uses the minimum it could read elsewhere/);
+    expect(r.notes[0]).not.toMatch(/assumes none/);
+    // nothing read anywhere: still "assumes none"; several read that disagree: none, with both notes
+    expect(readExistingMinimum({ vitestConfigs: [{ path: 'v0.config.ts', text: 'thresholds: { lines: MIN }' }] }).notes[0]).toMatch(/so it assumes none$/);
+    const dis = readExistingMinimum({ vitestConfigs: [{ path: 'v0.config.ts', text: 'thresholds: { lines: MIN }' }, { path: 'a.ts', text: 'thresholds: { lines: 70 }' }], packageJson: '{"c8":{"lines":80}}' });
+    expect(dis.minimum).toBeNull();
+    expect(dis.notes[0]).toMatch(/assumes none$/);
+    expect(dis.notes[1]).toMatch(/disagree/);
+  });
   it('coverage: measured lines are read by code from the `All files` row of the text summary', () => {
     expect(measuredLines(VITEST_TABLE)).toBe(60);
     expect(measuredLines(VITEST_TABLE.replace(/\n/g, '\r\n'))).toBe(60);   // CRLF logs

@@ -41,7 +41,8 @@ export interface PinWant { name: string; version: string; resolved: string; inte
 /**
  * The ONE predicate for "this lock entry is the reviewed pin" (B2, D6): a plain registry package (no link, no bundle, no alias) at the reviewed
  * version, tarball and integrity. The CI precheck (render-cli.ts NPM_PRECHECK_JS) embeds this function's own source and runs it with `node -e`,
- * and the lock judge (package-rules.ts) calls it, so the two can not drift. Keep it to plain JS with double-quoted strings: its text is embedded.
+ * and the lock judge (package-rules.ts) calls it, so the two can not drift. Keep it to plain JS with double-quoted strings and no comments: its text is
+ * embedded on one line (functionSource refuses `//` and `/*`).
  */
 export function pinOk(p: Record<string, unknown> | undefined, w: PinWant): boolean {
   return !(!p || p.link || p.inBundle || (p.name && p.name !== w.name) || p.version !== w.version || p.resolved !== w.resolved || p.integrity !== w.integrity);

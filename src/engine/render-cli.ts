@@ -1038,12 +1038,14 @@ const NPM_VERIFY_JS = [
  * A plain `function name(...) {...}` as an anonymous function expression on one line, to embed in a step script (review-D6 m6). The name is
  * dropped whatever it is: a bundler renames a top-level function on a collision (esbuild: `pinOk2`), and the old fixed `function pinOk`
  * match then left `function 2(p, w)`, a syntax error in every npm precheck. Anything that is not a plain function (an arrow, a class, a
- * method, an async or generator function) is refused at load, never embedded half-rewritten.
+ * method, an async or generator function) is refused at load, never embedded half-rewritten. So is any text holding `//` or `/*` (D9 m4).
  */
 export function functionSource(f: (...a: never[]) => unknown): string {
   const text = Function.prototype.toString.call(f);
   const re = /^function\s*[\w$]*\s*\(/;
   if (!re.test(text)) throw new Error('functionSource takes a plain function (function name(...) { ... }) only');
+  // D9 m4: the text is folded onto one line, so a `//` comment would swallow the rest of the embedded script; no comment of either kind is embedded
+  if (/\/[/*]/.test(text)) throw new Error('functionSource refuses a function whose text holds a comment (// or /*): it is folded onto one line');
   return text.replace(re, 'function(').replace(/\s*\n\s*/g, ' ');
 }
 
