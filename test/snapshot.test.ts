@@ -762,6 +762,44 @@ describe('E2 base snapshot, central draft, proof branches (Task 2 first half)', 
     await f.close();
   });
 
+  it('L1 (fix round 3): a direct buildProofBranch or pushProofBranch checks the whole workflow set of each commit; nothing is pushed on a refusal', async () => {
+    const f = await fixture();
+    const r = await pushProofSetup(input(f), deps(f).d);
+    const s = r.session;
+    const own = new Set(['.github/workflows/pipegen.yml', '.github/workflows/pipegen-fix.yml']);
+    const mainRef = `proof/${RUN_ID}/main`;
+    const before = heads(f.scratchGit)[mainRef];
+    const pushes = () => recorder.calls().filter((x) => x.argv.includes('push')).length;
+    const n0 = pushes();
+    const noEgress = { path: '.github/workflows/pipegen-fix.yml', content: 'on: pull_request\npermissions: {}\njobs:\n  a:\n    runs-on: ubuntu-latest\n    steps:\n      - run: make\n' };
+    const opts = { transport: f.transport, pipegenWorkflows: own, parent: r.branches.main.sha };
+    await expect(pushProofBranch(s, 'main', [[noEgress]], opts)).rejects.toThrow(/pipegen-fix\.yml.*egress/);
+    await expect(buildProofBranch(s, 'main', [[noEgress]], { pipegenWorkflows: own, parent: r.branches.main.sha })).rejects.toThrow(/pipegen-fix\.yml.*egress/);
+    // an edit at an allowed path that breaks a rule (a dispatch trigger on the caller), also in a later commit of the same push
+    const caller = (centralCaller(r.centralSha)[0] as CreatedFile).content;
+    const dispatch = { path: '.github/workflows/pipegen.yml', content: caller.replace('  pull_request: {}\n', '  pull_request: {}\n  workflow_dispatch: {}\n') };
+    await expect(pushProofBranch(s, 'main', [[{ path: 'x.txt', content: 'x\n' }], [dispatch]], opts)).rejects.toThrow(/pipegen\.yml.*workflow_dispatch/);
+    // a caller edited to reach a central file the tree doesn't hold
+    const elsewhere = { path: '.github/workflows/pipegen.yml', content: caller.replace('shop--merge.yml', 'nope.yml') };
+    await expect(pushProofBranch(s, 'main', [[elsewhere]], opts)).rejects.toThrow(/nope\.yml/);
+    // a file named like a compat copy is key-holding (no marker)
+    const fakeCompat = { path: '.github/workflows/pipegen-fix.yml', content: 'on: pull_request\njobs:\n  t:\n    runs-on: ubuntu-latest\n    steps:\n      - run: make\n' };
+    await expect(pushProofBranch(s, 'main', [[fakeCompat]], opts)).rejects.toThrow(/egress/);
+    expect(heads(f.scratchGit)[mainRef]).toBe(before);
+    expect(pushes()).toBe(n0);
+    // an allowed edit passes: a new workflow with the egress step first, and the caller re-rendered within the rules
+    const fixed = { path: '.github/workflows/pipegen-fix.yml', content: `on: pull_request\npermissions: {}\njobs:\n  a:\n    runs-on: ubuntu-latest\n    steps:\n${EGRESS_STEP}\n      - run: make\n` };
+    const ok = await pushProofBranch(s, 'main', [[fixed], [{ path: '.github/workflows/pipegen.yml', content: caller.replace('  push: {}\n', '') }]], opts);
+    expect(heads(f.scratchGit)[mainRef]).toBe(ok.sha);
+    const t = treeOf(f.scratchGit, ok.sha);
+    expect(t['.github/workflows/pipegen-fix.yml']).toBe('100644');
+    // and a later commit on that tip is checked against the whole set it inherits (the earlier files stay valid)
+    const later = await pushProofBranch(s, 'main', [[{ path: 'notes.txt', content: 'n\n' }]], { ...opts, parent: ok.sha });
+    expect(heads(f.scratchGit)[mainRef]).toBe(later.sha);
+    await s.remove();
+    await f.close();
+  });
+
   it('planted: variant may carry more than one commit (fast-forward)', async () => {
     const f = await fixture();
     const r = await pushProofSetup(input(f), deps(f).d);

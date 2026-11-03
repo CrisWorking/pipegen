@@ -53,7 +53,7 @@ import {
   createPushRepo, gitPush, GitTransportError, isDirty, readSnapshot, runGit, type DroppedEntry, type PushRef, type PushRepoHandle,
 } from './git.js';
 import { setScratchDefaultBranch, type DefaultBranchState } from './repos.js';
-import { checkProofWorkflows, isCompatCopy, type ProofCheckOptions } from './workflow-check.js';
+import { checkProofWorkflows, isCompatCopy, type ProofCheckFile, type ProofCheckOptions } from './workflow-check.js';
 import {
   assertCentral, assertScratch, githubRead, guardedWrite, isProofTarget, ProofStopError, requireGuarded, ScratchGuardError, scratchPushUrl,
   validBranchName, type GuardedRepo, type ProofTarget,
@@ -198,6 +198,8 @@ interface CommitRec {
   allowed: ReadonlySet<string>;
   /** Central only: the tree's workflow files, judged by checkCentralTriggers again before the push. */
   centralWorkflows?: readonly { path: string; content: string }[];
+  /** Proof only (E3 fix round 3, L1): the tree's workflow files with their check kind, so a later commit is checked as a whole set. */
+  workflows?: ReadonlyMap<string, ProofCheckFile>;
 }
 
 interface SessionState {
@@ -764,8 +766,21 @@ export async function buildProofBranch(s: ProofSession, variant: Variant, commit
   for (const p of allowed) if (!isWorkflowPath(p)) throw new GitTransportError(`${safeText(p, 120)} is not a workflow path.`);
   let cur = parent;
   let entries = start.entries;
+  let workflowSet: ReadonlyMap<string, ProofCheckFile> = start.workflows ?? new Map();
+  const centralRec = st.central === null ? undefined : st.commits.get(st.central.sha);
+  const centralTree = st.central === null || centralRec?.centralWorkflows === undefined ? undefined : { sha: st.central.sha, workflows: centralRec.centralWorkflows };
   const made: string[] = [];
   for (const [i, files] of commits.entries()) {
+    // E3 fix round 3 (L1, DECISIONS #108): every proof commit, whoever builds it (setup, the fix loop, a dispute), holds a
+    // workflow set that passes checkProofWorkflows as a whole (its parent's workflows plus this commit's), with the central
+    // callees it reaches; the compat kind only by the marker. Checked before anything of this commit is written.
+    const nextSet = new Map(workflowSet);
+    for (const f of files) {
+      if (typeof f.path !== 'string' || !isWorkflowPath(f.path)) continue;
+      const content = typeof f.content === 'string' ? f.content : Buffer.from(f.content).toString('utf8');
+      nextSet.set(f.path.toLowerCase(), { path: f.path, content, kind: isCompatCopy(f) ? 'compat' : 'proof' });
+    }
+    checkProofWorkflows([...nextSet.values()], { central: centralTree });
     const next: Entries = new Map(entries);
     const add = files.map((f) => {
       const name = pathBytes(f.path);
@@ -784,10 +799,11 @@ export async function buildProofBranch(s: ProofSession, variant: Variant, commit
     }
     const tree = await writeTree(st, next.values());
     const sha = await commitTree(st, tree, cur, `pipegen proof ${t.runId}: ${variant} (${i + 1}/${commits.length})`);
-    record(st, sha, { kind: 'proof', branch, parent: cur, entries: next, allowed });
+    record(st, sha, { kind: 'proof', branch, parent: cur, entries: next, allowed, workflows: nextSet });
     cur = sha;
     made.push(sha);
     entries = next;
+    workflowSet = nextSet;
   }
   if (made.length === 0) throw new GitTransportError('A proof branch needs at least one commit.');
   return proofCommit(st, { kind: 'proof', sha: cur, branch, variant, commits: made });
@@ -1039,7 +1055,8 @@ function prepareAppFiles(files: readonly CreatedFile[], central: ProofCheckOptio
       }
       workflows.add(f.path);
     }
-    proof.push({ path: f.path, content: f.content });
+    // the CreatedFile itself (not a copy): its identity carries the compat marker into buildProofBranch (L1)
+    proof.push(f);
     kept.push(f);
   }
   // E3 review-r1 m3: the proof rules at the push seam too, whatever produced appFiles; the compat kind only by the marker
