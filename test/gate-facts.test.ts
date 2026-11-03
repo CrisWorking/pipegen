@@ -746,3 +746,29 @@ describe('gatherGateInput: the secrets job\'s commit-range scan (C9)', () => {
     expect(decideGate((await gather(pr)).input).pass).toBe(false);
   });
 });
+
+describe('gate-v0.2.1 (D9): pipegen\'s CODEOWNERS block owners waive a suppression in a file no rule covers', () => {
+  const BLOCK = '# pipegen:begin\n/.github/workflows/ @olga\n# pipegen:end\n';
+  const supWorld = (): World => {
+    const w = world();
+    w.contents.set(`${BASE}:.github/CODEOWNERS`, b64(BLOCK));
+    w.files = [{ ...FILE_PATCH, patch: '@@ -1 +1 @@\n-a\n+x = 1 // nosemgrep' }];
+    return w;
+  };
+  it('the base file\'s block owner approving the head commit waives it; nobody else does, and without approval it blocks', async () => {
+    const w = supWorld();
+    let { input } = await gather(w);
+    expect(input.integrity.map((f) => f.ruleId)).toEqual(['integrity:suppression']);
+    expect(decideGate(input).pass).toBe(false);
+    w.reviews = [{ id: 1, user: { login: 'olga' }, state: 'APPROVED', commit_id: HEAD }];
+    ({ input } = await gather(w));
+    expect(input.integrity).toEqual([]);
+    expect(decideGate(input).pass).toBe(true);
+    // on an older commit, or by the author, it does not count
+    w.reviews = [{ id: 1, user: { login: 'olga' }, state: 'APPROVED', commit_id: BASE }];
+    expect((await gather(w)).input.integrity.map((f) => f.ruleId)).toEqual(['integrity:suppression']);
+    w.reviews = [{ id: 1, user: { login: 'olga' }, state: 'APPROVED', commit_id: HEAD }];
+    w.pull.user = { login: 'olga' };
+    expect((await gather(w)).input.integrity.map((f) => f.ruleId)).toEqual(['integrity:suppression']);
+  });
+});

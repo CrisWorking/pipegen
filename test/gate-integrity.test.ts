@@ -6,10 +6,11 @@
 import { describe, expect, it } from 'vitest';
 import type { GateGithub } from '../gate/src/baseline.js';
 import {
-  addedLinesOf, baseHasInstall, buildPrDiff, codeOwners, integrityFindings, loadCodeowners, ownersOf, parseConfigDoc, readConfigSections, readPrContext as readPrContextStrict,
-  type CodeownersRule, type PrContext, type PrFile,
+  addedLinesOf, baseHasInstall, buildPrDiff, codeOwners, integrityFindings, loadCodeowners, ownersOf, parseConfigDoc, PIPEGEN_BLOCK_BEGIN, PIPEGEN_BLOCK_END, pipegenBlockOwners,
+  readConfigSections, readPrContext as readPrContextStrict, type CodeownersRule, type PrContext, type PrFile,
 } from '../gate/src/integrity.js';
 import { PROTECTED_PATHS_BASE } from '../src/types.js';
+import { CODEOWNERS_BEGIN, CODEOWNERS_END, codeownersBlock } from '../src/engine/created-builders.js';
 import { BigInteger, NonFinite } from '../gate/src/integrity.js';
 /** Non-finite numbers are typed tags in the parsed document; the oracle writes them as {"$num": kind}. TOML integers are BigInteger (C5a CF4); the oracle writes them as JSON numbers. */
 const plain = (v: unknown): unknown => (v instanceof NonFinite ? { $num: v.kind } : v instanceof BigInteger ? Number(v.digits) : Array.isArray(v) ? v.map(plain) : typeof v === 'object' && v !== null && !(v instanceof Date) ? Object.fromEntries(Object.entries(v).map(([k, x]) => [k, plain(x)])) : v);
@@ -188,7 +189,7 @@ describe('loadCodeowners: from the BASE commit, .github/ then root then docs/', 
   });
   it('none of the three exists → no rules, no problem', async () => {
     const r = await loadCodeowners(new Gh(), REPO, BASE);
-    expect(r).toEqual({ rules: [], found: null });
+    expect(r).toEqual({ rules: [], found: null, blockOwners: [] });
   });
   it('an API error other than 404, a malformed answer, a directory, or a file over 1 MiB → no rules and a problem (never a guess)', async () => {
     for (const bad of [new Error('500'), 'x', { type: 'dir' }, [], { type: 'file', encoding: 'none', size: 2_000_000, content: '' }, { type: 'file', encoding: 'base64', size: 5, content: 5 }]) {
@@ -1090,5 +1091,128 @@ describe('fix round 2 (5): a leading slash scopes a protected path to the root',
     expect(hit('/services/api/ruff.toml', 'services/api/ruff.toml')).toBe(true);
     expect(hit('ruff.toml', 'services/api/ruff.toml')).toBe(true);
     expect(hit('.github/x.yml', 'a/.github/x.yml')).toBe(false);
+  });
+});
+
+// ---------- gate-v0.2.1 (Plan C MUST-DO, Plan D D0b review important 5; task D9) ----------
+//
+// A suppression, no-patch or case-extension finding in a file that NO CODEOWNERS rule covers could be waived by nobody (pipegen's block
+// owns only the pipeline's paths, and with no administrator bypass the pull request never merged). The rule: such a finding is waived by
+// an approval from any owner listed in pipegen's own CODEOWNERS block (`# pipegen:begin` … `# pipegen:end` of the BASE commit's file).
+// The approval itself is what readPrContext already counts: APPROVED on exactly the head commit, not by the pull request's author, from a
+// user with write access. A path some rule covers (a user, a team, or a rule that clears ownership) keeps its own owners; protected paths
+// keep theirs too.
+describe('gate-v0.2.1: an owner in pipegen\'s CODEOWNERS block waives a finding in a file no rule covers', () => {
+  const BLOCK_FILE = [
+    '# the repository\'s own rules',
+    '/docs/ @dora',
+    '/team/ @org/team',
+    '/cleared/ @dora',
+    '/cleared/x.ts',
+    '',
+    '# pipegen:begin',
+    '/.github/workflows/ @alice @Bob',
+    '.gitleaksignore @alice @Bob @org/sec',
+    '# pipegen:end',
+    '',
+  ].join('\n');
+  const RULES = codeOwners(BLOCK_FILE);
+  const CO = { found: '.github/CODEOWNERS', blockOwners: pipegenBlockOwners(BLOCK_FILE) };
+  const sup = (name: string, over: Partial<PrFile> = {}): PrFile => file(name, { patch: '@@ -1,2 +1,3 @@\n keep\n+x() // nosemgrep\n keep2', ...over });
+  const noPatch = (name: string): PrFile => file(name, { changes: 50, patch: undefined });
+  const caseExt = (name: string): PrFile => file(name, { status: 'added' });
+  const find = (files: PrFile[], approvals: string[], co: Record<string, unknown> | null = CO): string[] =>
+    ids(integrityFindings(ctx({ files, approvals }), PROTECTED, RULES, co === null ? {} : { codeowners: co as { found: string | null } }));
+
+  it('pipegenBlockOwners: the user owners of the rules inside the one block, lower-cased, sorted, once each; teams and e-mails are not users', () => {
+    expect(pipegenBlockOwners(BLOCK_FILE)).toEqual(['alice', 'bob']);
+    expect(pipegenBlockOwners(BLOCK_FILE.replace(/\n/g, '\r\n'))).toEqual(['alice', 'bob']);
+    expect(pipegenBlockOwners('# pipegen:begin\n* @org/team ops@example.com\n# pipegen:end\n')).toEqual([]);
+  });
+  it('pipegenBlockOwners: no block, two blocks, a block with no end, an end before the begin, or a marker that is not the exact line gives nobody', () => {
+    const one = '# pipegen:begin\n/x/ @alice\n# pipegen:end\n';
+    expect(pipegenBlockOwners(one)).toEqual(['alice']);
+    for (const bad of [null, '', '/x/ @alice\n', `${one}${one}`, '# pipegen:begin\n/x/ @alice\n', '/x/ @alice\n# pipegen:end\n', '# pipegen:end\n/x/ @alice\n# pipegen:begin\n',
+      '# pipegen:begin \n/x/ @alice\n# pipegen:end\n', ' # pipegen:begin\n/x/ @alice\n# pipegen:end\n', '# pipegen:begin\n/x/ @alice\n# pipegen:end x\n', '#pipegen:begin\n/x/ @alice\n#pipegen:end\n',
+      '# pipegen:begin\n/x/ @alice\n# pipegen:begin\n# pipegen:end\n']) {
+      expect(pipegenBlockOwners(bad), JSON.stringify(bad)).toEqual([]);
+    }
+  });
+  it('the markers are the ones the CODEOWNERS builder writes (one constant, no drift)', () => {
+    expect(PIPEGEN_BLOCK_BEGIN).toBe(CODEOWNERS_BEGIN);
+    expect(PIPEGEN_BLOCK_END).toBe(CODEOWNERS_END);
+    expect(pipegenBlockOwners(codeownersBlock(['.github/workflows/**'], ['@Alice', '@bob']))).toEqual(['alice', 'bob']);
+  });
+  it('a suppression, a no-patch file and a case-extension file that no rule covers: blocked without approval, waived by a block owner', () => {
+    for (const f of [sup('src/a.ts'), noPatch('src/big.ts'), caseExt('src/B.JS')]) {
+      expect(find([f], []).length, f.filename).toBe(1);
+      expect(find([f], ['alice']), f.filename).toEqual([]);
+      expect(find([f], ['bob']), f.filename).toEqual([]);
+    }
+  });
+  it('an approval from someone who is not in the block (an owner of another path, a stranger) does not waive it', () => {
+    for (const f of [sup('src/a.ts'), noPatch('src/big.ts'), caseExt('src/B.JS')]) {
+      expect(find([f], ['dora', 'mallory', 'org', 'team', 'sec']).length, f.filename).toBe(1);
+    }
+  });
+  it('without the block owners (an older caller, an unreadable CODEOWNERS) nothing changes: nobody waives it', () => {
+    expect(find([sup('src/a.ts')], ['alice'], null)).toEqual(['integrity:suppression']);
+    expect(find([sup('src/a.ts')], ['alice'], { found: '.github/CODEOWNERS' })).toEqual(['integrity:suppression']);
+    expect(find([sup('src/a.ts')], ['alice'], { found: null, problem: 'x', blockOwners: [] })).toEqual(['integrity:suppression']);
+  });
+  it('a file a rule DOES cover keeps its own owners: a user rule, a team-only rule, and a rule that clears ownership are not "uncovered"', () => {
+    expect(find([sup('docs/a.md')], ['alice'])).toEqual(['integrity:suppression']);
+    expect(find([sup('docs/a.md')], ['dora'])).toEqual([]);
+    expect(find([sup('team/a.ts')], ['alice', 'bob'])).toEqual(['integrity:suppression']);
+    expect(find([sup('cleared/x.ts')], ['alice', 'dora'])).toEqual(['integrity:suppression']);
+  });
+  it('a protected path is never waived by the fallback: only an owner of that path (here a protected file no rule covers stays blocked)', () => {
+    expect(find([file('knip.json')], ['alice', 'bob'])).toEqual(['integrity:protected-path']);
+    expect(find([file(WF)], ['alice'])).toEqual([]);
+    // a section change of a shared file no rule covers: no fallback either
+    const f = integrityFindings(ctx({ approvals: ['alice'] }), PROTECTED, RULES, { codeowners: CO, sectionChanges: [{ file: 'pyproject.toml', section: 'tool.ruff' }] });
+    expect(ids(f)).toEqual(['integrity:protected-path']);
+  });
+  it('the message says who can approve: an owner in pipegen\'s block, with write access, on the head commit; nobody when the block lists no user', () => {
+    const msg = (co: Record<string, unknown>): string => integrityFindings(ctx({ files: [sup('src/a.ts')] }), PROTECTED, RULES, { codeowners: co as { found: string | null } })[0]?.message ?? '';
+    expect(msg(CO)).toMatch(/No CODEOWNERS rule covers this file, so an owner listed in pipegen's CODEOWNERS block .*write access.* must approve the pull request on its current head commit\./);
+    expect(msg({ found: '.github/CODEOWNERS', blockOwners: [] })).toMatch(/No user is a code owner of this path/);
+    // a protected path no rule covers keeps the old message
+    expect(integrityFindings(ctx({ files: [file('knip.json')] }), PROTECTED, RULES, { codeowners: CO })[0]?.message).toMatch(/No user is a code owner of this path/);
+  });
+  it('through readPrContext: a block owner\'s approval counts only on the head commit, not from the author, and only with write access', async () => {
+    const run = async (reviews: unknown[], over: { author?: string; perms?: [string, unknown][] } = {}): Promise<string[]> => {
+      const g = ghWith([sup('src/a.ts')], { user: { login: over.author ?? 'author' } });
+      g.reviews = reviews;
+      for (const [l, p] of over.perms ?? []) g.perms.set(l, p);
+      const pr = await readPrContextStrict(g, REPO, 5, { expectHeadSha: HEAD, codeowners: RULES });
+      return ids(integrityFindings(pr, PROTECTED, RULES, { codeowners: CO }));
+    };
+    expect(await run([review(1, 'alice', 'APPROVED')])).toEqual([]);
+    expect(await run([review(1, 'Bob', 'APPROVED')])).toEqual([]);
+    // stale: approved an older commit
+    expect(await run([review(1, 'alice', 'APPROVED', SHA('c'))])).toEqual(['integrity:suppression']);
+    // a later CHANGES_REQUESTED or DISMISSED revokes it
+    expect(await run([review(1, 'alice', 'APPROVED'), review(2, 'alice', 'DISMISSED')])).toEqual(['integrity:suppression']);
+    // the author's own approval never counts, block owner or not
+    expect(await run([review(1, 'alice', 'APPROVED')], { author: 'Alice' })).toEqual(['integrity:suppression']);
+    // no write access: read or triage permission, an unreadable permission
+    expect(await run([review(1, 'alice', 'APPROVED')], { perms: [['alice', { permission: 'read', role_name: 'triage' }]] })).toEqual(['integrity:suppression']);
+    expect(await run([review(1, 'alice', 'APPROVED')], { perms: [['alice', new Error('500')]] })).toEqual(['integrity:suppression']);
+    // maintain counts, like GitHub's own rule
+    expect(await run([review(1, 'alice', 'APPROVED')], { perms: [['alice', { permission: 'read', role_name: 'maintain' }]] })).toEqual([]);
+    // a stranger's approval on the head commit never counts
+    expect(await run([review(1, 'mallory', 'APPROVED')])).toEqual(['integrity:suppression']);
+  });
+  it('loadCodeowners: the block owners come from the BASE commit\'s file; a block the pull request adds at the head is never read', async () => {
+    const g = new Gh();
+    g.contents.set(`${BASE}:.github/CODEOWNERS`, contentOf(BLOCK_FILE));
+    g.contents.set(`${HEAD}:.github/CODEOWNERS`, contentOf('# pipegen:begin\n/x/ @mallory\n# pipegen:end\n'));
+    const r = await loadCodeowners(g, REPO, BASE);
+    expect(r.blockOwners).toEqual(['alice', 'bob']);
+    expect(r.found).toBe('.github/CODEOWNERS');
+    expect((await loadCodeowners(new Gh(), REPO, BASE)).blockOwners).toEqual([]);
+    const bad = new Gh(); bad.contents.set(`${BASE}:.github/CODEOWNERS`, new Error('500'));
+    expect((await loadCodeowners(bad, REPO, BASE)).blockOwners).toEqual([]);
   });
 });

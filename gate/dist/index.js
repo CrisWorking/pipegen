@@ -7861,14 +7861,25 @@ function ownersOf(rules, path) {
   for (const r of rules) if (ruleMatches(r, parts)) owners = r.owners;
   return owners;
 }
+var PIPEGEN_BLOCK_BEGIN = "# pipegen:begin";
+var PIPEGEN_BLOCK_END = "# pipegen:end";
+function pipegenBlockOwners(text) {
+  if (typeof text !== "string") return [];
+  const lines = text.split(/\r?\n/);
+  const begins = lines.flatMap((l, i) => l === PIPEGEN_BLOCK_BEGIN ? [i] : []);
+  const ends = lines.flatMap((l, i) => l === PIPEGEN_BLOCK_END ? [i] : []);
+  if (begins.length !== 1 || ends.length !== 1 || ends[0] < begins[0]) return [];
+  const inside = codeOwners(lines.slice(begins[0] + 1, ends[0]).join("\n"));
+  return [...new Set(inside.flatMap((r) => r.owners))].sort();
+}
 async function loadCodeowners(gh, repo2, baseSha) {
   for (const path of [".github/CODEOWNERS", "CODEOWNERS", "docs/CODEOWNERS"]) {
     const r = await readTextAt(gh, repo2, path, baseSha, { max: MAX_CODEOWNERS_BYTES, raw: true });
     if (r.kind === "missing") continue;
-    if (r.kind === "problem") return { rules: [], found: null, problem: `CODEOWNERS of the base commit could not be read (${r.why}); nobody can approve` };
-    return { rules: codeOwners(r.text), found: path };
+    if (r.kind === "problem") return { rules: [], found: null, blockOwners: [], problem: `CODEOWNERS of the base commit could not be read (${r.why}); nobody can approve` };
+    return { rules: codeOwners(r.text), found: path, blockOwners: pipegenBlockOwners(r.text) };
   }
-  return { rules: [], found: null };
+  return { rules: [], found: null, blockOwners: [] };
 }
 var NonFinite = class {
   constructor(kind) {
@@ -8087,19 +8098,27 @@ function integrityFindings(pr, protectedPaths, rules, extra = {}) {
   const seen = /* @__PURE__ */ new Set();
   const approvals = new Set(pr.approvals.map((a) => a.toLowerCase()));
   const isProtected = pathMatcher(protectedPaths);
+  const blockOwners = extra.codeowners?.problem === void 0 && Array.isArray(extra.codeowners?.blockOwners) ? extra.codeowners.blockOwners.map((o) => String(o).toLowerCase()) : [];
   const waived = (path) => (ownersOf(rules, path) ?? []).some((o) => approvals.has(o));
+  const waivedFile = (path) => {
+    const o = ownersOf(rules, path);
+    return (o === void 0 ? blockOwners : o).some((x) => approvals.has(x));
+  };
   const push = (ruleId, severity, file, message, key, line) => {
     const k = `${ruleId}\0${file ?? ""}\0${key}`;
     if (seen.has(k)) return;
     seen.add(k);
     out.push({ tool: "pipegen", ruleId, severity, ...file === void 0 ? {} : { file }, ...line === void 0 ? {} : { line }, message, fingerprint: fp(ruleId, file ?? "", key) });
   };
-  const how = (path) => {
+  const how = (path, file = false) => {
     if (extra.codeowners?.problem !== void 0) return " CODEOWNERS of the base commit could not be read, so nobody can approve: re-run the gate, or merge with an administrator bypass.";
     if (rules.length === 0) {
       return extra.codeowners?.found != null ? " CODEOWNERS of the base commit has no rule that names a user, so nobody can approve: add one, or merge with an administrator bypass." : " The base commit has no CODEOWNERS, so nobody can approve: add one (user owners, not only teams), or merge with an administrator bypass.";
     }
     const o = ownersOf(rules, path);
+    if (o === void 0 && file && blockOwners.length > 0) {
+      return " No CODEOWNERS rule covers this file, so an owner listed in pipegen's CODEOWNERS block (a user with write access, not the author) must approve the pull request on its current head commit.";
+    }
     if (o === void 0 || o.length === 0) {
       return " No user is a code owner of this path (a team-only entry cannot approve: the gate cannot read team membership, so name a user as an owner in CODEOWNERS), or merge with an administrator bypass.";
     }
@@ -8110,13 +8129,13 @@ function integrityFindings(pr, protectedPaths, rules, extra = {}) {
     for (const path of f.previous_filename === void 0 || f.status === "copied" ? [f.filename] : [f.filename, f.previous_filename]) {
       if (isProtected(path) && !waived(path)) push("integrity:protected-path", "critical", path, `This file is part of the pipeline (a workflow, a tool config or an ignore file).${how(path)}`, "path");
     }
-    if ((f.status === "added" || f.status === "renamed" || f.status === "copied") && caseVariantExtension(f.filename) !== void 0 && !waived(f.filename)) {
-      push("integrity:case-extension", "high", f.filename, `This new file name has a scanned language's extension written in another letter case, so the scanners skip the file while a runtime may still load it. Rename it to the lower-case extension.${how(f.filename)}`, "case-extension");
+    if ((f.status === "added" || f.status === "renamed" || f.status === "copied") && caseVariantExtension(f.filename) !== void 0 && !waivedFile(f.filename)) {
+      push("integrity:case-extension", "high", f.filename, `This new file name has a scanned language's extension written in another letter case, so the scanners skip the file while a runtime may still load it. Rename it to the lower-case extension.${how(f.filename, true)}`, "case-extension");
     }
     const hasPatch = typeof f.patch === "string" && f.patch !== "";
     const parsed = hasPatch ? parsePatch(f.patch) : void 0;
     if (!hasPatch ? needsPatch(f) && !isLockfile(f.filename) : parsed === null) {
-      if (!waived(f.filename)) push("integrity:no-patch", "critical", f.filename, `The gate cannot read this file's changes (no patch, or a patch it cannot parse), so it cannot check them for suppressions.${how(f.filename)}`, "patch");
+      if (!waivedFile(f.filename)) push("integrity:no-patch", "critical", f.filename, `The gate cannot read this file's changes (no patch, or a patch it cannot parse), so it cannot check them for suppressions.${how(f.filename, true)}`, "patch");
     }
     if (!hasPatch) continue;
     const ignoreFile = isProtected(f.filename) && IGNORE_FILE_RE.test(baseName(f.filename));
@@ -8132,8 +8151,8 @@ function integrityFindings(pr, protectedPaths, rules, extra = {}) {
       for (const k of m) kinds.add(k);
       if (first === void 0 && a.no !== void 0) first = a.no;
     }
-    if (hits > 0 && !waived(f.filename)) {
-      push("integrity:suppression", "high", f.filename, `${hits} added line${hits === 1 ? "" : "s"} suppress${hits === 1 ? "es" : ""} a check (${[...kinds].sort().join(", ")}).${how(f.filename)}`, "suppression", first);
+    if (hits > 0 && !waivedFile(f.filename)) {
+      push("integrity:suppression", "high", f.filename, `${hits} added line${hits === 1 ? "" : "s"} suppress${hits === 1 ? "es" : ""} a check (${[...kinds].sort().join(", ")}).${how(f.filename, true)}`, "suppression", first);
     }
   }
   for (const c of extra.sectionChanges ?? []) {
@@ -8632,7 +8651,7 @@ async function gatherGateInput(ctx, client, io) {
       const pr = await readPrContext(gh, repo2, number, { expectHeadSha: headSha, codeowners: co.rules });
       notes.push(...pr.problems);
       const sections = await readConfigSections(gh, repo2, pr, settings.protectedSections, settings.protectedPaths);
-      integrity = integrityFindings(pr, settings.protectedPaths, co.rules, { sectionChanges: sections, codeowners: { found: co.found, ...co.problem === void 0 ? {} : { problem: co.problem } } });
+      integrity = integrityFindings(pr, settings.protectedPaths, co.rules, { sectionChanges: sections, codeowners: { found: co.found, blockOwners: co.blockOwners, ...co.problem === void 0 ? {} : { problem: co.problem } } });
     }
   }
   const verify = { key: settings.fpKey, now: ctx.now };

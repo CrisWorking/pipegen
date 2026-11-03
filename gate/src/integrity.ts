@@ -485,15 +485,38 @@ export function ownersOf(rules: readonly CodeownersRule[], path: string): string
   return owners;
 }
 
-/** CODEOWNERS of the BASE commit: `.github/CODEOWNERS`, then `CODEOWNERS`, then `docs/CODEOWNERS`; the first that exists is the file. Never the head. */
-export async function loadCodeowners(gh: GateGithub, repo: RepoId, baseSha: string): Promise<{ rules: CodeownersRule[]; found: string | null; problem?: string }> {
+/** The lines that open and close pipegen's own block in a CODEOWNERS file (the builder, src/engine/created-builders.ts, writes these). */
+export const PIPEGEN_BLOCK_BEGIN = '# pipegen:begin';
+export const PIPEGEN_BLOCK_END = '# pipegen:end';
+
+/**
+ * gate-v0.2.1 (Plan C MUST-DO, Plan D D0b review important 5): the user owners listed in pipegen's own CODEOWNERS block, lower-cased, sorted,
+ * once each. The block is the lines between a line that is exactly PIPEGEN_BLOCK_BEGIN and one that is exactly PIPEGEN_BLOCK_END (a CR
+ * before the newline is allowed), read with the same parser as the whole file. Fail closed: no block, more than one begin or end line, or
+ * an end before the begin gives nobody.
+ */
+export function pipegenBlockOwners(text: string | null): string[] {
+  if (typeof text !== 'string') return [];
+  const lines = text.split(/\r?\n/);
+  const begins = lines.flatMap((l, i) => (l === PIPEGEN_BLOCK_BEGIN ? [i] : []));
+  const ends = lines.flatMap((l, i) => (l === PIPEGEN_BLOCK_END ? [i] : []));
+  if (begins.length !== 1 || ends.length !== 1 || (ends[0] as number) < (begins[0] as number)) return [];
+  const inside = codeOwners(lines.slice((begins[0] as number) + 1, ends[0] as number).join('\n'));
+  return [...new Set(inside.flatMap((r) => r.owners))].sort();
+}
+
+/**
+ * CODEOWNERS of the BASE commit: `.github/CODEOWNERS`, then `CODEOWNERS`, then `docs/CODEOWNERS`; the first that exists is the file. Never the head.
+ * `blockOwners`: the owners of pipegen's own block in that file (pipegenBlockOwners); none when there is no file or it can not be read.
+ */
+export async function loadCodeowners(gh: GateGithub, repo: RepoId, baseSha: string): Promise<{ rules: CodeownersRule[]; found: string | null; blockOwners: string[]; problem?: string }> {
   for (const path of ['.github/CODEOWNERS', 'CODEOWNERS', 'docs/CODEOWNERS']) {
     const r = await readTextAt(gh, repo, path, baseSha, { max: MAX_CODEOWNERS_BYTES, raw: true });
     if (r.kind === 'missing') continue;
-    if (r.kind === 'problem') return { rules: [], found: null, problem: `CODEOWNERS of the base commit could not be read (${r.why}); nobody can approve` };
-    return { rules: codeOwners(r.text), found: path };
+    if (r.kind === 'problem') return { rules: [], found: null, blockOwners: [], problem: `CODEOWNERS of the base commit could not be read (${r.why}); nobody can approve` };
+    return { rules: codeOwners(r.text), found: path, blockOwners: pipegenBlockOwners(r.text) };
   }
-  return { rules: [], found: null };
+  return { rules: [], found: null, blockOwners: [] };
 }
 
 // ---------- configSections ----------
@@ -722,24 +745,34 @@ const fp = (...parts: string[]): string => createHash('sha256').update(parts.joi
  * exempt), high `integrity:suppression` (an added suppression marker, or any added line in a declared ignore file), high
  * `integrity:case-extension` (a new file name whose extension is a scanned one in another letter case, C5a CF2). All but the first are
  * waived by an approval, on the head commit, of a code owner (a user) of the path (last matching CODEOWNERS rule of the base commit).
+ * gate-v0.2.1: a suppression, no-patch or case-extension finding in a file that NO rule covers (ownersOf is undefined) is also waived by an
+ * approval from any owner listed in pipegen's own block (`codeowners.blockOwners`, from loadCodeowners); without it nobody could waive one.
+ * A covered file (a user rule, a team-only rule, a rule that clears ownership) and every protected path keep their own owners only. The
+ * approvals are readPrContext's: on exactly the head commit, never the author's, only from a user with write access.
  */
 export function integrityFindings(
   pr: PrContext, protectedPaths: readonly string[], rules: readonly CodeownersRule[],
-  extra: { sectionChanges?: readonly SectionChange[]; codeowners?: { found: string | null; problem?: string } } = {},
+  extra: { sectionChanges?: readonly SectionChange[]; codeowners?: { found: string | null; problem?: string; blockOwners?: readonly string[] } } = {},
 ): Finding[] {
   const out: Finding[] = [];
   const seen = new Set<string>();
   const approvals = new Set(pr.approvals.map((a) => a.toLowerCase()));
   const isProtected = pathMatcher(protectedPaths);
+  const blockOwners = extra.codeowners?.problem === undefined && Array.isArray(extra.codeowners?.blockOwners) ? extra.codeowners.blockOwners.map((o) => String(o).toLowerCase()) : [];
   const waived = (path: string): boolean => (ownersOf(rules, path) ?? []).some((o) => approvals.has(o));
+  /** For the file findings only (suppression, no-patch, case-extension): a file no rule covers is waived by an owner in pipegen's block. */
+  const waivedFile = (path: string): boolean => {
+    const o = ownersOf(rules, path);
+    return (o === undefined ? blockOwners : o).some((x) => approvals.has(x));
+  };
   const push = (ruleId: string, severity: Finding['severity'], file: string | undefined, message: string, key: string, line?: number): void => {
     const k = `${ruleId}\0${file ?? ''}\0${key}`;
     if (seen.has(k)) return;
     seen.add(k);
     out.push({ tool: 'pipegen', ruleId, severity, ...(file === undefined ? {} : { file }), ...(line === undefined ? {} : { line }), message, fingerprint: fp(ruleId, file ?? '', key) });
   };
-  /** How the author gets this path approved, by why nobody can. Fixed texts only. */
-  const how = (path: string): string => {
+  /** How the author gets this path approved, by why nobody can. Fixed texts only. `file`: a file finding, where pipegen's block owners count. */
+  const how = (path: string, file = false): string => {
     if (extra.codeowners?.problem !== undefined) return ' CODEOWNERS of the base commit could not be read, so nobody can approve: re-run the gate, or merge with an administrator bypass.';
     if (rules.length === 0) {
       return extra.codeowners?.found != null
@@ -747,6 +780,9 @@ export function integrityFindings(
         : ' The base commit has no CODEOWNERS, so nobody can approve: add one (user owners, not only teams), or merge with an administrator bypass.';
     }
     const o = ownersOf(rules, path);
+    if (o === undefined && file && blockOwners.length > 0) {
+      return ' No CODEOWNERS rule covers this file, so an owner listed in pipegen\'s CODEOWNERS block (a user with write access, not the author) must approve the pull request on its current head commit.';
+    }
     if (o === undefined || o.length === 0) {
       return ' No user is a code owner of this path (a team-only entry cannot approve: the gate cannot read team membership, so name a user as an owner in CODEOWNERS), or merge with an administrator bypass.';
     }
@@ -760,13 +796,13 @@ export function integrityFindings(
       if (isProtected(path) && !waived(path)) push('integrity:protected-path', 'critical', path, `This file is part of the pipeline (a workflow, a tool config or an ignore file).${how(path)}`, 'path');
     }
     // a new name (added, renamed, copied) with a scanned extension in another letter case: the scanners skip it (CF2)
-    if ((f.status === 'added' || f.status === 'renamed' || f.status === 'copied') && caseVariantExtension(f.filename) !== undefined && !waived(f.filename)) {
-      push('integrity:case-extension', 'high', f.filename, `This new file name has a scanned language's extension written in another letter case, so the scanners skip the file while a runtime may still load it. Rename it to the lower-case extension.${how(f.filename)}`, 'case-extension');
+    if ((f.status === 'added' || f.status === 'renamed' || f.status === 'copied') && caseVariantExtension(f.filename) !== undefined && !waivedFile(f.filename)) {
+      push('integrity:case-extension', 'high', f.filename, `This new file name has a scanned language's extension written in another letter case, so the scanners skip the file while a runtime may still load it. Rename it to the lower-case extension.${how(f.filename, true)}`, 'case-extension');
     }
     const hasPatch = typeof f.patch === 'string' && f.patch !== '';
     const parsed = hasPatch ? parsePatch(f.patch as string) : undefined;
     if (!hasPatch ? needsPatch(f) && !isLockfile(f.filename) : parsed === null) {
-      if (!waived(f.filename)) push('integrity:no-patch', 'critical', f.filename, `The gate cannot read this file's changes (no patch, or a patch it cannot parse), so it cannot check them for suppressions.${how(f.filename)}`, 'patch');
+      if (!waivedFile(f.filename)) push('integrity:no-patch', 'critical', f.filename, `The gate cannot read this file's changes (no patch, or a patch it cannot parse), so it cannot check them for suppressions.${how(f.filename, true)}`, 'patch');
     }
     if (!hasPatch) continue;
     const ignoreFile = isProtected(f.filename) && IGNORE_FILE_RE.test(baseName(f.filename));
@@ -784,8 +820,8 @@ export function integrityFindings(
       for (const k of m) kinds.add(k);
       if (first === undefined && a.no !== undefined) first = a.no;
     }
-    if (hits > 0 && !waived(f.filename)) {
-      push('integrity:suppression', 'high', f.filename, `${hits} added line${hits === 1 ? '' : 's'} suppress${hits === 1 ? 'es' : ''} a check (${[...kinds].sort().join(', ')}).${how(f.filename)}`, 'suppression', first);
+    if (hits > 0 && !waivedFile(f.filename)) {
+      push('integrity:suppression', 'high', f.filename, `${hits} added line${hits === 1 ? '' : 's'} suppress${hits === 1 ? 'es' : ''} a check (${[...kinds].sort().join(', ')}).${how(f.filename, true)}`, 'suppression', first);
     }
   }
 

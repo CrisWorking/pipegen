@@ -288,7 +288,7 @@ export async function gatherGateInput(ctx: GateContext, client: GateGithub, io: 
       const pr = await readPrContext(gh, repo, number, { expectHeadSha: headSha, codeowners: co.rules });
       notes.push(...pr.problems);
       const sections = await readConfigSections(gh, repo, pr, settings.protectedSections, settings.protectedPaths);
-      integrity = integrityFindings(pr, settings.protectedPaths, co.rules, { sectionChanges: sections, codeowners: { found: co.found, ...(co.problem === undefined ? {} : { problem: co.problem }) } });
+      integrity = integrityFindings(pr, settings.protectedPaths, co.rules, { sectionChanges: sections, codeowners: { found: co.found, blockOwners: co.blockOwners, ...(co.problem === undefined ? {} : { problem: co.problem }) } });
     }
   }
 

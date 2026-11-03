@@ -1,15 +1,16 @@
 // The pure builders for the files Plan G writes and the D0b judges re-check (v0.2 Plan D, D0b; preflight 4.2). Plan G calls these to
 // produce a CODEOWNERS block and a dependabot entry; the judges call the same functions and compare byte for byte (or value for value),
 // so the producer and the referee can not drift. A leaf: types, the protected-path leaf and the gate's LOGIN_RE only.
-import { LOGIN_RE, MAX_LINE } from '../../gate/src/integrity.js';
+import { LOGIN_RE, MAX_LINE, PIPEGEN_BLOCK_BEGIN, PIPEGEN_BLOCK_END } from '../../gate/src/integrity.js';
 import type { PipelineDraft, ReviewedTool } from '../types.js';
 import { effectiveProtectedPaths } from './protected-paths.js';
 import { isObj, parseYaml } from './yaml-parse.js';
 
 // ---------- CODEOWNERS ----------
 
-export const CODEOWNERS_BEGIN = '# pipegen:begin';
-export const CODEOWNERS_END = '# pipegen:end';
+// the gate reads the block by these exact lines (gate-v0.2.1: its owners waive findings in files no rule covers), so they are the gate's own constants
+export const CODEOWNERS_BEGIN = PIPEGEN_BLOCK_BEGIN;
+export const CODEOWNERS_END = PIPEGEN_BLOCK_END;
 /**
  * The central repo's CODEOWNERS covers the workflows (project files), the install records and the CODEOWNERS files themselves (D0b fix round 1,
  * review finding 3): otherwise any writer could re-own the workflows in one pull request and change them in the next.
