@@ -30,7 +30,8 @@
 // isDirty runs `git --no-optional-locks status` (it never rewrites the index). Reads never fetch: every transport is turned
 // off by name on the command line and GIT_NO_LAZY_FETCH is set, so a partial clone's missing blobs are an error, not a download. The folder
 // must be the top of its repo: GIT_CEILING_DIRECTORIES stops git from looking above it, and `rev-parse --show-toplevel` is
-// compared with it anyway (the ceiling is a list split at ':', so a parent path holding one escapes it).
+// compared with it anyway (the ceiling is a list split at ':', so a parent path holding one escapes it). A repo configured
+// as a partial clone (extensions.partialclone, remote.<name>.promisor) is refused before the read (E0c-R2, E2).
 // Git LFS: the files read are the pointer files (no filter runs).
 import { mkdtempSync, rmSync, chmodSync, lstatSync, realpathSync, writeFileSync } from 'node:fs';
 import { rm } from 'node:fs/promises';
@@ -447,6 +448,20 @@ async function readGit(s: Session, dir: string, args: readonly string[], o: Omit
   }
 }
 
+/**
+ * E0c-R2 (carried to E2): a partial clone is refused before anything is read. Its missing objects can't be read without
+ * a fetch, which pipegen never makes, and an old git with the user's own `protocol.<helper>.allow=always` could still
+ * fetch through a custom remote helper. So `extensions.partialclone` or any `remote.<name>.promisor` (whatever its value)
+ * in the repo's config is a stop that asks for a full clone.
+ */
+async function refusePartialClone(s: Session, dir: string): Promise<void> {
+  const out = Buffer.from((await readGit(s, dir, ['config', '--list', '-z'], { maxBuffer: 4 * 1024 * 1024 })).stdout).toString('utf8');
+  const keys = out.split('\0').map((kv) => kv.split('\n')[0]?.toLowerCase() ?? '');
+  if (keys.some((k) => k === 'extensions.partialclone' || /^remote\..+\.promisor$/.test(k))) {
+    throw new GitTransportError('This folder is a partial clone (extensions.partialclone or a remote.<name>.promisor is set): pipegen reads only what is on disk and fetches nothing. Run the proof from a full clone of the repo.');
+  }
+}
+
 /** The folder must be its repo's top: git may have found a repo above it when the ceiling list was split at a ':'. */
 function checkTopLevel(dir: string, top: string): void {
   let real: string;
@@ -488,6 +503,7 @@ export async function readSnapshot(dir: string, opts: { maxBytes?: number; maxFi
   return inSession('pipegen-git-', async (s) => {
     const [top = '', commit = ''] = Buffer.from((await readGit(s, repo, ['rev-parse', '--show-toplevel', '--verify', '--end-of-options', 'HEAD^{commit}'])).stdout).toString('utf8').split('\n');
     checkTopLevel(repo, top);
+    await refusePartialClone(s, repo);
     if (!SHA_RE.test(commit)) throw new GitTransportError('HEAD is not a commit pipegen can read.');
     const listing = Buffer.from((await readGit(s, repo, ['ls-tree', '-r', '-z', '-l', '--full-tree', commit], { maxBuffer: 256 * 1024 * 1024 })).stdout);
     const wanted: { path: string; mode: SnapshotFile['mode']; sha: string; size: number }[] = [];

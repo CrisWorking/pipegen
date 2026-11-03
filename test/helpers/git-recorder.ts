@@ -26,8 +26,11 @@ export interface GitRecorder {
   calls(): GitCall[];
   /** Forgets the recorded calls and the route. */
   clear(): void;
-  /** Sends github.com pushes to the loopback server on `port` (until clear()). */
-  route(port: number): void;
+  /**
+   * Sends github.com pushes to the loopback server on `port` (until clear()): to its app.git, or, with `byName`, to the
+   * repo of the same name there (https://github.com/<owner>/<name>.git → http://127.0.0.1:<port>/<name>.git, E2).
+   */
+  route(port: number, opts?: { byName?: boolean }): void;
   /** Drops GIT_NO_LAZY_FETCH before git starts, as a git older than that variable ignores it (until clear()). */
   oldGit(): void;
 }
@@ -40,6 +43,7 @@ export function makeGitRecorder(root: string): GitRecorder {
   const q = (s: string) => `'${s.replace(/'/g, `'\\''`)}'`;
   const routeFile = join(root, 'route');
   const oldGitFile = join(root, 'old-git');
+  const byNameFile = join(root, 'route-by-name');
   const shim = join(bin, 'askpass-shim');
   writeFileSync(shim, [
     '#!/bin/sh',
@@ -66,7 +70,11 @@ export function makeGitRecorder(root: string): GitRecorder {
     'case "$*" in *github.com*)',
     `  if [ -f ${q(routeFile)} ]; then`,
     `    port=$(cat ${q(routeFile)})`,
-    '    for a do shift; case "$a" in https://github.com/*) a="http://127.0.0.1:$port/app.git" ;; esac; set -- "$@" "$a"; done',
+    `    if [ -f ${q(byNameFile)} ]; then`,
+    '      for a do shift; case "$a" in https://github.com/*) a="http://127.0.0.1:$port/${a##*/}" ;; esac; set -- "$@" "$a"; done',
+    '    else',
+    '      for a do shift; case "$a" in https://github.com/*) a="http://127.0.0.1:$port/app.git" ;; esac; set -- "$@" "$a"; done',
+    '    fi',
     // Anything still naming github.com after the rewrite (http://github.com/..., github.com.evil, a -c value) is refused too.
     '    case "$*" in *github.com*) echo "git recorder: refused to reach github.com" >&2; exit 97 ;; esac',
     `    if [ -n "$GIT_ASKPASS" ]; then PIPEGEN_TEST_REAL_ASKPASS="$GIT_ASKPASS"; GIT_ASKPASS=${q(shim)}; export PIPEGEN_TEST_REAL_ASKPASS GIT_ASKPASS; fi`,
@@ -81,11 +89,16 @@ export function makeGitRecorder(root: string): GitRecorder {
   const read = (f: string) => readFileSync(join(rec, f), 'utf8');
   return {
     bin,
-    route: (port: number) => writeFileSync(routeFile, String(port)),
+    route: (port: number, opts: { byName?: boolean } = {}) => {
+      writeFileSync(routeFile, String(port));
+      if (opts.byName === true) writeFileSync(byNameFile, '');
+      else rmSync(byNameFile, { force: true });
+    },
     oldGit: () => writeFileSync(oldGitFile, ''),
     clear: () => {
       rmSync(routeFile, { force: true });
       rmSync(oldGitFile, { force: true });
+      rmSync(byNameFile, { force: true });
       rmSync(rec, { recursive: true, force: true });
       mkdirSync(rec, { recursive: true });
     },

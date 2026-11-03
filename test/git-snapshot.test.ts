@@ -8,8 +8,9 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterAll, afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { GitTransportError, HARDENED_CONFIG, isDirty, readSnapshot } from '../src/proof/git.js';
-const NO_TRANSPORT = ['file', 'git', 'ssh', 'http', 'https', 'ext'].flatMap((p) => ['-c', `protocol.${p}.allow=never`]);
 import { makeGitRecorder, REAL_GIT } from './helpers/git-recorder.js';
+
+const NO_TRANSPORT = ['file', 'git', 'ssh', 'http', 'https', 'ext'].flatMap((p) => ['-c', `protocol.${p}.allow=never`]);
 
 const root = mkdtempSync(join(tmpdir(), 'pg-e0c-snap-'));
 const recorder = makeGitRecorder(root);
@@ -82,15 +83,16 @@ describe('snapshot read (E0c, S4)', () => {
 
     const calls = recorder.calls();
     const cmds = calls.map((c) => c.argv[c.argv.indexOf(d) + 1]);
-    expect(cmds).toEqual(['rev-parse', 'ls-tree', 'cat-file']);
+    expect(cmds).toEqual(['rev-parse', 'config', 'ls-tree', 'cat-file']);   // config: the partial-clone check (E0c-R2, E2)
     for (const c of calls) {
       expect(c.argv.slice(0, HARDENED_CONFIG.length)).toEqual([...HARDENED_CONFIG]);
       expect(c.argv).toContain('--no-replace-objects');
       expect(c.argv).not.toContain('archive');
       expect(c.env.GIT_CEILING_DIRECTORIES).toBe(join(d, '..'));
     }
-    expect(calls[1].argv.slice(-5)).toEqual(['ls-tree', '-r', '-z', '-l', '--full-tree', head].slice(-5));
-    expect(calls[2].argv.slice(-2)).toEqual(['cat-file', '--batch']);
+    expect(calls[1].argv.slice(-3)).toEqual(['config', '--list', '-z']);
+    expect(calls[2].argv.slice(-5)).toEqual(['ls-tree', '-r', '-z', '-l', '--full-tree', head].slice(-5));
+    expect(calls[3].argv.slice(-2)).toEqual(['cat-file', '--batch']);
   });
 
   it('snapshot read: symlinks and submodules dropped and listed', async () => {
@@ -178,6 +180,31 @@ describe('snapshot read (E0c, S4)', () => {
       expect(c.argv.slice(0, i), c.argv.join(' ')).toEqual([...HARDENED_CONFIG, ...NO_TRANSPORT, '--no-replace-objects', ...(c.argv.includes('status') ? ['--no-optional-locks'] : [])]);
       expect(c.env.GIT_NO_LAZY_FETCH).toBe('1');
     }
+  });
+
+  it('snapshot read: a repo configured as a partial clone (extensions.partialclone or remote.*.promisor) is refused before any read (E0c-R2)', async () => {
+    // every object is on disk here, so only the config check can refuse it: a run from a full clone is asked for
+    const promisor = fresh();
+    put(promisor, 'a.txt', 'a\n');
+    commitAll(promisor);
+    git(promisor, 'config', 'remote.origin.url', 'https://example.invalid/x.git');
+    git(promisor, 'config', 'remote.origin.promisor', 'true');
+    await expect(readSnapshot(promisor)).rejects.toThrow(/partial clone.*full clone/s);
+    expect(recorder.calls().some((c) => c.argv.includes('ls-tree') || c.argv.includes('cat-file'))).toBe(false);
+    git(promisor, 'config', '--unset', 'remote.origin.promisor');
+    expect(filesOf(await readSnapshot(promisor))).toEqual({ 'a.txt': 'a\n' });
+    // a second remote's promisor counts too
+    git(promisor, 'config', 'remote.backup.promisor', 'false');
+    await expect(readSnapshot(promisor)).rejects.toThrow(/partial clone/);
+    git(promisor, 'config', '--unset', 'remote.backup.promisor');
+    // extensions.partialclone (with the format version that extension needs)
+    git(promisor, 'config', 'core.repositoryformatversion', '1');
+    git(promisor, 'config', 'extensions.partialclone', 'origin');
+    recorder.clear();
+    await expect(readSnapshot(promisor)).rejects.toThrow(/partial clone.*full clone/s);
+    expect(recorder.calls().some((c) => c.argv.includes('ls-tree') || c.argv.includes('cat-file'))).toBe(false);
+    // the check is a hardened read like the others
+    for (const c of recorder.calls()) expect(c.env.GIT_NO_LAZY_FETCH).toBe('1');
   });
 
   it('snapshot read: no transport on any git, even with protocol.file.allow=always in the repo config (no GIT_NO_LAZY_FETCH)', async () => {
