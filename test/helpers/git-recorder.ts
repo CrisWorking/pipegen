@@ -11,6 +11,8 @@ export const REAL_GIT = execFileSync('sh', ['-c', 'command -v git'], { encoding:
 export interface GitCall {
   argv: string[];
   env: Record<string, string>;
+  /** The working directory git was started in. */
+  cwd: string;
   askpass?: { script: string; path: string; fileMode: string; dirMode: string };
 }
 
@@ -31,6 +33,7 @@ export function makeGitRecorder(root: string): GitRecorder {
     `n=$(date +%s%N)-$$`,
     `printf '%s\\0' "$@" > ${q(rec)}/argv.$n`,
     `cat /proc/$$/environ > ${q(rec)}/env.$n 2>/dev/null`,
+    `pwd -P > ${q(rec)}/cwd.$n`,
     'if [ -n "$GIT_ASKPASS" ]; then',
     `  cp "$GIT_ASKPASS" ${q(rec)}/askpass.$n`,
     `  printf '%s' "$GIT_ASKPASS" > ${q(rec)}/askpath.$n`,
@@ -61,7 +64,7 @@ export function makeGitRecorder(root: string): GitRecorder {
           const i = kv.indexOf('=');
           env[kv.slice(0, i)] = kv.slice(i + 1);
         }
-        const call: GitCall = { argv, env };
+        const call: GitCall = { argv, env, cwd: read(`cwd.${id}`).trim() };
         if (existsSync(join(rec, `askpass.${id}`))) {
           call.askpass = { script: read(`askpass.${id}`), path: read(`askpath.${id}`), fileMode: read(`askmode.${id}`).trim(), dirMode: read(`askdir.${id}`).trim() };
         }

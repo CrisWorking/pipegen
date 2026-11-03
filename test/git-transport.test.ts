@@ -114,11 +114,23 @@ describe('git transport (E0c, B6)', () => {
       expect(c.env.PATH).toBe(process.env.PATH);
       expect(c.env.HOME.startsWith(join(tmp, 'pipegen-git-'))).toBe(true);
       expect(existsSync(c.env.HOME)).toBe(false);   // removed after the call
+      expect(c.cwd, c.argv.join(' ')).toBe(c.env.HOME);   // never the user's repo (Windows looks for the program there first)
       if (isPush) expect(c.env.PIPEGEN_GIT_TOKEN).toBe(token);
       else expect(Object.values(c.env).join('\n')).not.toContain(token);
     }
-    expect(calls.filter((c) => c.argv.includes('push'))).toHaveLength(1);
+    const push = calls.filter((c) => c.argv.includes('push'));
+    expect(push).toHaveLength(1);
+    expect(push[0].argv.slice(push[0].argv.indexOf('push'))).toEqual(['push', '--atomic', '--no-verify', '--no-follow-tags', '--recurse-submodules=no', `http://127.0.0.1:${s.port}/app.git`, `${repo.sha}:refs/heads/main`]);
     expect(leftovers()).toEqual([]);
+
+    // force: the refspecs get a +, and the branch is replaced.
+    recorder.clear();
+    const other = await pushRepoWithCommit();
+    await pushToLoopbackForTests({ gitDir: other.gitDir, port: s.port, repoPath: 'app.git', token, refs: [{ sha: other.sha, branch: 'main' }, { sha: other.sha, branch: 'proof/x' }], force: true });
+    await other.remove();
+    const forced = recorder.calls().find((c) => c.argv.includes('push'))!;
+    expect(forced.argv.slice(-2)).toEqual([`+${other.sha}:refs/heads/main`, `+${other.sha}:refs/heads/proof/x`]);
+    expect(git(join(srv, 'app.git'), 'rev-parse', 'refs/heads/main')).toBe(other.sha);
   });
 
   it('git: credential.helper reset, hooksPath /dev/null, fsmonitor off on every call', async () => {
@@ -214,6 +226,8 @@ describe('git transport (E0c, B6)', () => {
     expect(checkPushUrl('https://github.com/acme/pipegen-proof-shop.git', 'acme', 'shop')).toBe('scratch');
     expect(checkPushUrl('https://github.com/acme/pipelines.git', 'acme', 'shop')).toBe('central');
     expect(checkPushUrl('https://github.com/a-b/pipegen-proof-my.app_1.git', 'a-b', 'my.app_1')).toBe('scratch');
+    // A dot in a name is a dot, not any character.
+    expect(() => checkPushUrl('https://github.com/a-b/pipegen-proof-myXapp_1.git', 'a-b', 'my.app_1')).toThrow(GitTransportError);
     expect(pushUrl('acme', 'shop', 'scratch')).toBe('https://github.com/acme/pipegen-proof-shop.git');
     expect(pushUrl('acme', 'shop', 'central')).toBe('https://github.com/acme/pipelines.git');
     const refused = [
@@ -304,6 +318,11 @@ describe('git transport (E0c, B6)', () => {
       { ...cred('acme_x'.repeat(4)), refs: [{ sha: SHA, branch: `x/${'acme_x'.repeat(4)}` }] },
     ];
     for (const b of bad) await expect(gitPush({ ...req, ...b }), JSON.stringify(b)).rejects.toThrow(GitTransportError);
+    // A refused name is shown, but never a GitHub token shape in it (GitTransportError hides every message).
+    const shaped = ['gh', 'p_', 'B'.repeat(36)].join('');
+    const named = await gitPush({ ...req, refs: [{ sha: SHA, branch: `${shaped} x` }] }).catch((e: unknown) => e);
+    expect((named as Error).message).toContain('***');
+    expect((named as Error).message).not.toContain(shaped);
     await expect(gitPush({ ...req, gitDir: 'relative/dir' })).rejects.toThrow(GitTransportError);
     expect(recorder.calls()).toEqual([]);
     await repo.remove();
@@ -443,6 +462,8 @@ describe('git transport (E0c, B6)', () => {
     expect(shownGitOutput(`a ${token.slice(0, 5)}\x1b[31m${token.slice(5)}`, token)).toBe('a ***');
     expect(shownGitOutput(`a ${token.slice(0, 5)}\x07${token.slice(5)}`, token)).toBe('a ***');
     expect(shownGitOutput(`x ghp_${'A'.repeat(36)} y`)).toBe('x *** y');
+    // An escape that eats the token's first character: hidden on the raw text, before cleaning.
+    expect(shownGitOutput(`a \x1b${token}`, token)).not.toContain(token.slice(1));
     expect(shownGitOutput('one\ntwo\r\nthree\rfour')).toBe('one | two | three | four');
     expect(shownGitOutput(Array.from({ length: 30 }, (_, i) => `line ${i}`).join('\n'))).toBe(Array.from({ length: 8 }, (_, i) => `line ${i + 22}`).join(' | '));
     expect(shownGitOutput('x'.repeat(5000)).length).toBeLessThanOrEqual(600);
