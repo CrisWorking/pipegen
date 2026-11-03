@@ -495,6 +495,20 @@ describe('errorExcerpt: regressions from the mutation run and the 200k fuzz runs
     v.wipe();
   });
 
+  it('excerpt: only a clean header ends a secret section (a messy line that reads as one does not)', async () => {
+    const v = vault();
+    const sec = ['[sec', 'rets]'].join('');
+    const out = await errorExcerpt([sec, `a = ${run}`, `${ESC}]0;x${BEL}[other]`, `b = more-${run}`, '[plain]', 'Error: x'].join('\n'), composed(v), clean());
+    expect(out).toContain('Error: x');
+    expect(out).not.toContain(run);
+    v.wipe();
+  });
+
+  it('excerpt: a log needing more probes than the budget gives an empty excerpt (fail closed)', () => {
+    const log = Array.from({ length: 310_000 }, (_, i) => (i === 5 ? 'Error: x' : '\tx')).join('\n');
+    expect(unscannedExcerpt(log, (t) => t)).toEqual([]);
+  });
+
   it('excerpt: 200k fuzz regressions: an OSC that ate the `:`, a blank line inside the block, an OSC or a CSI that ate the indentation', async () => {
     const v = vault();
     const cases = [
