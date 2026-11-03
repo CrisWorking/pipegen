@@ -104,7 +104,8 @@ describe('excerpt fix round 1: rules the mutation run showed untested', () => {
 
   it('excerpt r1: a value split over lines with a tab inside one piece (not messy) is found by the value passes', () => {
     const v = vaultScrub();
-    const out = excerpt(['ok', 'Error: x', `value=${V.slice(0, 6)}\t${V.slice(6, 16)}`, `${V.slice(16)} tail`, 'ok'].join('\n'), v.scrubber());
+    // the error window ends on the tab line: step 6 sees only that piece, so only the value pass can tell
+    const out = excerpt([...pad(3), 'Error: x', ...pad(4), `value=${V.slice(0, 6)}\t${V.slice(6, 16)}`, `${V.slice(16)} tail`, ...pad(10)].join('\n'), v.scrubber());
     expect(runs9(out)).toEqual([]);
     expect(out.includes('pW9xLr4T')).toBe(false);
     v.wipe();
