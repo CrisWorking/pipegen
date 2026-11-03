@@ -322,11 +322,22 @@ function scrubWith(text: string, forms: string[], upperForms: Set<string>, anyPe
     const hay = upperPercent(view);
     const searches: [string, Iterable<string>][] = [[view, forms]];
     if (hay !== view || anyPercent) searches.push([hay, upperForms]);
+    const add = (s: number, e: number) => spans.push(at === null ? [s, e] : [at[s] as number, (at[e - 1] as number) + 1]);
     for (const [h, fs] of searches) {
       for (const f of fs) {
+        // overlapping or touching matches of one form are one span (the same union, without a span per character of a
+        // repeated pattern: a hostile log of 'aaaa…' would give millions)
+        let s = -1;
+        let e = -1;
         for (let i = h.indexOf(f); i >= 0; i = h.indexOf(f, i + 1)) {
-          spans.push(at === null ? [i, i + f.length] : [at[i] as number, (at[i + f.length - 1] as number) + 1]);
+          if (i <= e) {
+            e = Math.max(e, i + f.length);
+            continue;
+          }
+          if (s >= 0) add(s, e);
+          [s, e] = [i, i + f.length];
         }
+        if (s >= 0) add(s, e);
       }
     }
   }
