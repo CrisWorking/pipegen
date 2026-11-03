@@ -6,10 +6,12 @@
 //   1. the GitHub timestamp prefix (and a leading BOM) is taken off each line;
 //   2. whole ANSI CSI and OSC sequences are removed;
 //   3. a line that still holds ESC or a C1 control is dropped (with a vault, fullScrub would show the whole excerpt as one [REDACTED]),
-//      and so is what may be a private key body after it: up to the next END marker when the dropped line names a private key, else
-//      while the lines look like armor (base64, armor headers, blank lines). A dropped line has its escape sequences removed whole and
-//      stays in place, tagged, through the whole-log scrub and redact below, going only after them, so redact still sees a BEGIN line
-//      or a `password:` line that held an escape (security scan findings);
+//      and so is what may be a private key body after it: up to the next END marker when any reading of the dropped line (ruling
+//      E0a-R1: escape sequences removed whole, ESC and C1 removed, every non-printable removed) says PRIVATE or KEY, else while the
+//      lines look like armor (base64, armor headers, blank lines); a line step 2 changed starts the same hide when one of its
+//      readings says PRIVATE or KEY, but stays shown. A dropped line stays in place, as all its readings and tagged,
+//      through the whole-log scrub and redact below, going only after them, so redact still sees a BEGIN line or a `password:` line
+//      that held an escape (security scan findings);
 //   4. the error lines and EXCERPT_CONTEXT_LINES around each are picked, at most EXCERPT_MAX_LINES lines and EXCERPT_MAX_BYTES;
 //   5. Plan A redact;
 //   6. the composed scrubber (the caller's: vault.scrubber() then knownValueScrubber over the placeholders and the throwaway scratch
@@ -25,7 +27,7 @@ import { createHash, randomBytes } from 'node:crypto';
 import { MAX_REGEX_LINE_BYTES } from '../ai/redact-core.js';
 import { redact, secretScanText, type SecretScanner } from '../ai/redact.js';
 import { LATE_MAGIC, SCAN_PREFIX, scannersWouldSkip } from '../ai/scan-staging.js';
-import { holdsEscape, scrubForDisplay } from '../util/known-values.js';
+import { holdsEscape, scrubForDisplay, stripChars } from '../util/known-values.js';
 
 /** Lines shown before and after each error line. */
 export const EXCERPT_CONTEXT_LINES = 5;
@@ -63,13 +65,14 @@ const marker = (n: number) => `[… ${n} line${n === 1 ? '' : 's'} not shown …
 /** The largest a marker line can be (it counts toward the byte cap before the real one is known). */
 const MARKER_BYTES = bytesOf(marker(Number.MAX_SAFE_INTEGER)) + 1;
 
-/** Steps 1-2 on one line, and whether step 3 drops it (it still holds ESC or a C1 control). */
-function cleanLine(raw: string): { line: string; drop: boolean } {
+/** Steps 1-2 on one line, whether step 3 drops it (it still holds ESC or a C1 control), and the line before step 2 when step 2 changed it. */
+function cleanLine(raw: string): { line: string; drop: boolean; before: string | null } {
   let line = raw.endsWith('\r') ? raw.slice(0, -1) : raw;
   if (line.startsWith('\ufeff')) line = line.slice(1);
   line = line.replace(TIMESTAMP, '');
+  const before = line;
   if (line.includes('\u001b')) line = line.replace(OSC, '').replace(CSI, '');
-  return { line, drop: holdsEscape(line) };
+  return { line, drop: holdsEscape(line), before: line === before ? null : before };
 }
 
 // Private key markers as Plan A redact finds them (redact-core.ts findKeyMarker: `-----BEGIN [A-Z ]*PRIVATE KEY-----`, or `PRIVATE KEY
@@ -109,13 +112,25 @@ const ARMOR = /^[ \t]*(?:[A-Za-z0-9+/]{16,}={0,2}|[A-Za-z0-9+/]+={1,2}|(?:Proc-T
 const isArmor = (line: string) => bytesOf(line) > MAX_REGEX_LINE_BYTES || ARMOR.test(line) || lastKeyMarker(line, 'END') >= 0;
 
 // A dropped line's escape sequences, removed whole (follow-up scan finding): OSC (ESC ] or C1 OSC, ended by BEL, ST or ESC \), CSI (ESC [
-// or C1 CSI), any other ESC sequence (intermediates and one final byte), then any ESC or C1 left. So the parameter and final bytes of
-// `\u009b31m` don't stay inside a key marker. The classes are disjoint per run: linear.
-const DROPPED_OSC = /(?:\u001b\]|\u009d)[^\u0007\u001b\u009c]*(?:\u0007|\u009c|\u001b\\)/g;
+// or C1 CSI), any other ESC sequence (intermediates and one final byte), then any ESC or C1 left. Ruling E0a-R1 (b): the OSC body
+// excludes both introducers, so an unterminated run of them is read once (linear), and lines over MAX_REGEX_LINE_BYTES skip this reading.
+const DROPPED_OSC = /(?:\u001b\]|\u009d)[^\u0007\u001b\u009c\u009d]*(?:\u0007|\u009c|\u001b\\)/g;
 const DROPPED_CSI = /(?:\u001b\[|\u009b)[\u0030-\u003f]*[\u0020-\u002f]*[\u0040-\u007e]?/g;
 const DROPPED_ESC = /\u001b[\u0020-\u002f]*[\u0030-\u007e]?/g;
-const withoutSequences = (line: string) => line.replace(DROPPED_OSC, '').replace(DROPPED_CSI, '').replace(DROPPED_ESC, '').replace(/[\u001b\u0080-\u009f]/g, '');
-const NAMES_KEY = /private[ _-]?key/i;
+const ESC_C1 = /[\u001b\u0080-\u009f]/g;
+const withoutSequences = (line: string) => line.replace(DROPPED_OSC, '').replace(DROPPED_CSI, '').replace(DROPPED_ESC, '').replace(ESC_C1, '');
+/**
+ * Ruling E0a-R1 (a): the readings of a dropped line, since no one way of taking escapes out is right for every line (a sequence's final
+ * byte can be a letter of the marker): whole sequences removed (lines within MAX_REGEX_LINE_BYTES only), only the ESC and C1 characters
+ * removed, and every non-printable character removed (stripChars: controls, bidi, invisibles). Duplicates once.
+ */
+function readings(line: string): string[] {
+  const chars = line.replace(ESC_C1, '');
+  const all = [...(bytesOf(line) <= MAX_REGEX_LINE_BYTES ? [withoutSequences(line)] : []), chars, stripChars(line)];
+  return [...new Set(all)];
+}
+/** Ruling E0a-R1 (a): a word of a key name in a reading, either one, any case. */
+const NAMES_KEY = /private|key/i;
 
 /**
  * Step 4: the error windows (or the end of the log), in line order, with a marker for every gap between two of them. A window that
@@ -224,13 +239,21 @@ export async function errorExcerpt(logs: string, scrub: (text: string) => string
   //   marker may be unreadable);
   // - with no END marker ahead, or after any other dropped line, while the lines look like armor (base64, armor headers, blank lines).
   const tag = `\u0000pipegen-dropped-${randomBytes(8).toString('hex')}\u0000`;
+  // a dropped line's copy for redact holds all its readings, one after another (redact finds a marker in whichever kept it whole)
   const lines0 = text.split('\n').map((raw) => {
     const c = cleanLine(raw);
-    return c.drop ? { line: withoutSequences(c.line), drop: true } : c;
+    // a line step 2 changed is shown as step 2 left it, but its readings still decide the key hide (a CSI's final byte can be a letter
+    // of the marker: `PRIVATE ESC[1;3KEY` reads as `PRIVATE EY` once the sequence is gone)
+    if (!c.drop) {
+      const rs = c.before === null ? [c.line] : [c.line, ...readings(c.before)];
+      return { line: c.line, drop: false, ends: rs.some((r) => lastKeyMarker(r, 'END') >= 0), namesKey: c.before !== null && rs.some((r) => NAMES_KEY.test(r)) };
+    }
+    const rs = readings(c.line);
+    return { line: rs.join(' '), drop: true, ends: rs.some((r) => lastKeyMarker(r, 'END') >= 0), namesKey: rs.some((r) => NAMES_KEY.test(r)) };
   });
   const nextEnd = new Int32Array(lines0.length);
   for (let i = lines0.length - 1, next = -1; i >= 0; i--) {
-    if (lastKeyMarker((lines0[i] as { line: string }).line, 'END') >= 0) next = i;
+    if ((lines0[i] as { ends: boolean }).ends) next = i;
     nextEnd[i] = next;
   }
   let hideTo = -1;
@@ -244,12 +267,11 @@ export async function errorExcerpt(logs: string, scrub: (text: string) => string
     if (insideKey) startKeyHide(0);
     else armor = true;
   }
-  const cleaned = lines0.map(({ line, drop }, i) => {
+  const cleaned = lines0.map(({ line, drop, ends, namesKey }, i) => {
     let hidden = drop || i <= hideTo;
-    if (drop && i >= hideTo) {
-      if (NAMES_KEY.test(line) && lastKeyMarker(line, 'END') < 0) startKeyHide(i + 1);
-      else armor = true;
-    } else if (armor && i > hideTo) {
+    if (namesKey && !ends && i >= hideTo) startKeyHide(i + 1);
+    else if (drop && i >= hideTo) armor = true;
+    else if (armor && i > hideTo) {
       if (isArmor(line)) hidden = true;
       if (!isArmor(line) || lastKeyMarker(line, 'END') >= 0) armor = false;
     }

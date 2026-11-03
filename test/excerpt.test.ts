@@ -236,6 +236,37 @@ describe('errorExcerpt: scrub before cutting (E0a)', () => {
     v.wipe();
   });
 
+  it('excerpt: ruling E0a-R1: a dropped line is read three ways, and PRIVATE or KEY in any reading starts the key hide', async () => {
+    const v = vault();
+    const begin = fake.keyBegin();
+    const body = Array.from({ length: 6 }, (_, i) => `${fake.keyBody()}${i}`);
+    const at = begin.indexOf(' ') + 1;
+    const keyAt = begin.lastIndexOf('KEY');
+    for (const first of [
+      `${begin.slice(0, at)}${ESC}[1;31${begin.slice(at)}`, // the first letter of the label eaten as a CSI final byte
+      `${begin.slice(0, keyAt)}${ESC}[1;3${begin.slice(keyAt)}`, // the K of KEY eaten: only the character-stripped reading says KEY
+      `${begin.slice(0, keyAt)}\u009b9${begin.slice(keyAt)}`,
+      `pri\u200bvate ${ESC}(Bk\u00adey follows`, // invisible characters split the words: the third reading joins them
+    ]) {
+      const log = [`${TS}${first}`, ...body.map((b) => `${TS}> ${b}`), `${TS}${fake.keyEnd()}`, `${TS}Error: key rejected`].join('\n');
+      const out = await errorExcerpt(log, composed(v), clean());
+      expect(out, JSON.stringify(first)).toContain('Error: key rejected');
+      for (const b of body) expect(out, JSON.stringify(first)).not.toContain(b);
+    }
+    v.wipe();
+  });
+
+  it('excerpt: ruling E0a-R1: unterminated C1 OSC introducers stay linear (64 KiB line, and many 4 KB lines)', async () => {
+    const v = vault();
+    for (const log of [`Error: x\n${'\u009d'.repeat(64 * 1024)}`, `Error: x\n${Array.from({ length: 256 }, () => '\u009d'.repeat(4000)).join('\n')}`]) {
+      const t0 = performance.now();
+      const out = await errorExcerpt(log, composed(v), clean());
+      expect(performance.now() - t0).toBeLessThan(2000);
+      expect(out).toBe('Error: x');
+    }
+    v.wipe();
+  });
+
   it('excerpt: an armor body with headers and blank lines stays hidden until its END (or the first non-armor line)', async () => {
     const v = vault();
     const body = Array.from({ length: 6 }, (_, i) => `${fake.keyBody()}${i}`);
