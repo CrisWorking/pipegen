@@ -4,8 +4,14 @@
 // `__proto__`, duplicate ids. This module is pure (no file, no network, no process) and nothing in the gate imports it.
 //
 // Hardening, all of it tested:
-//   - `<!DOCTYPE` and `<!ENTITY` (any case, anywhere) are refused; the parser also runs with processEntities: false, so no
+//   - every `<!` that does not start a comment or a CDATA section is refused (`<!DOCTYPE`, `<!ENTITY` and the rest, any case,
+//     with or without a space; the parser reads a bare `<! ` as an element and 5.6M of them cost 1.8 GB), and `<!DOCTYPE` and
+//     `<!ENTITY` are refused even inside a comment or CDATA; the parser also runs with processEntities: false, so no
 //     entity is ever expanded. The five XML entities and number references in names are decoded here, in one pass.
+//   - XMLValidator.validate runs first: a truncated, mismatched or spoofed report (an element named like `@_name`) is refused.
+//   - counts a testsuite carries (tests, failures, errors, skipped) must equal what was parsed under it, so a report whose cases
+//     were not recognised (another tag name, a namespace) is refused instead of reading as an empty pass.
+//   - at most 600,000 `<` characters and 250,000 attribute-shaped texts (the parser's time is linear in them: about 1.6 s at the cap).
 //   - at most 16 MiB (UTF-8 bytes) and 50,000 test cases. The cases are counted in the text before a tree is built, and again
 //     while walking.
 //   - names are data: anything keyed by a test id is a Map; an element named __proto__, constructor or prototype is refused
@@ -21,7 +27,7 @@
 //                    file part and no suite path; it is the whole name. (It can't equal a vitest id: nothing says which file.)
 // So: file = @file, else @classname when it looks like a test file; suite path = @classname split on " > " (not when it
 // equals @name, which is the jest-junit default), or the front of @name split on " > " when @classname was the file.
-import { XMLParser } from 'fast-xml-parser';
+import { XMLParser, XMLValidator } from 'fast-xml-parser';
 import { safeText } from '../util/safe-text.js';
 
 export interface TestCaseResult { id: string; status: 'pass' | 'fail' | 'skip' }
@@ -34,6 +40,12 @@ const SEP = ' > ';
 const MAX_SUITE_DEPTH = 64;
 
 const FORBIDDEN = /<!\s*(?:doctype|entity)/i;
+/** `<!` that starts anything but a comment or a CDATA section. */
+const DECLARATION = /<!(?!--|\[CDATA\[)/;
+export const MAX_JUNIT_ATTRIBUTES = 250_000;
+/** `<` characters in the whole text (tags, comments, CDATA starts and stray ones). 50,000 cases with a failure and output need about 400,000. */
+export const MAX_JUNIT_TAGS = 600_000;
+const ATTRIBUTE_LIKE = /=\s*["']/g;
 const FILE_LIKE = /\.[cm]?[jt]sx?$/i;
 
 function safeParser(): XMLParser {
@@ -58,6 +70,19 @@ function countCaseTags(xml: string): number {
     if (++n > MAX_JUNIT_CASES) return n;
   }
   return n;
+}
+
+function tagsOverCap(xml: string): boolean {
+  let n = 0;
+  for (let at = xml.indexOf('<'); at !== -1; at = xml.indexOf('<', at + 1)) if (++n > MAX_JUNIT_TAGS) return true;
+  return false;
+}
+
+/** Counts attribute-shaped text (`=` and a quote), stopping above the cap. */
+function attributesOverCap(xml: string): boolean {
+  let n = 0;
+  for (const _ of xml.matchAll(ATTRIBUTE_LIKE)) if (++n > MAX_JUNIT_ATTRIBUTES) return true;
+  return false;
 }
 
 const ENTITY = /&(?:#x([0-9a-fA-F]+)|#([0-9]+)|(amp|lt|gt|quot|apos));/g;
@@ -117,8 +142,15 @@ export function normaliseTestId(file: string, suitePath: string[], name: string)
 /** Reads a JUnit report (vitest's junit reporter or jest-junit) into one result per test case. Throws on hostile or unreadable input. */
 export function parseJunit(xml: string): TestCaseResult[] {
   if (Buffer.byteLength(xml, 'utf8') > MAX_JUNIT_BYTES) throw new Error('The JUnit report is over 16 MiB; pipegen won\'t read it.');
-  if (FORBIDDEN.test(xml)) throw new Error('The JUnit report has a DOCTYPE or ENTITY declaration; pipegen refuses it (entity expansion).');
+  if (FORBIDDEN.test(xml) || DECLARATION.test(xml)) throw new Error('The JUnit report has a DOCTYPE, ENTITY or other markup declaration; pipegen refuses it (entity expansion).');
   if (countCaseTags(xml) > MAX_JUNIT_CASES) throw new Error('The JUnit report has more than 50,000 test cases; pipegen won\'t read it.');
+  if (tagsOverCap(xml)) throw new Error('The JUnit report has more than 600,000 tags; pipegen won\'t read it.');
+  if (attributesOverCap(xml)) throw new Error('The JUnit report has more than 250,000 attributes; pipegen won\'t read it.');
+  const valid = XMLValidator.validate(xml);
+  if (valid !== true) { // the validator's message carries XML text, so only the line number (a number) is kept
+    const line = typeof valid.err?.line === 'number' ? ` (near line ${valid.err.line})` : '';
+    throw new Error(`The JUnit report is not well-formed XML${line}; it may be cut short.`);
+  }
 
   let tree: unknown;
   try {
@@ -133,22 +165,60 @@ export function parseJunit(xml: string): TestCaseResult[] {
   if (start.length === 0) throw new Error('The JUnit report has no testsuite element.');
 
   const results: TestCaseResult[] = [];
-  const stack: Array<{ node: unknown; depth: number }> = start.reverse().map((node) => ({ node, depth: 0 }));
+  const counted: Array<{ node: Node; tally: Tally }> = [];
+  const stack: Frame[] = start.reverse().map((node) => ({ node, depth: 0, parent: null }));
   while (stack.length > 0) {
-    const { node, depth } = stack.pop()!;
+    const { node, depth, parent } = stack.pop()!;
     if (!isNode(node)) continue;
     if (depth > MAX_SUITE_DEPTH) throw new Error('The JUnit report nests test suites deeper than pipegen reads.');
-    for (const child of list(own(node, 'testsuite')).reverse()) stack.push({ node: child, depth: depth + 1 });
+    const tally: Tally = { tests: 0, fails: 0, skips: 0, parent };
+    counted.push({ node, tally });
+    for (const child of list(own(node, 'testsuite')).reverse()) stack.push({ node: child, depth: depth + 1, parent: tally });
     for (const raw of list(own(node, 'testcase'))) {
       if (results.length >= MAX_JUNIT_CASES) throw new Error('The JUnit report has more than 50,000 test cases; pipegen won\'t read it.');
       const tc = isNode(raw) ? raw : {};
       const { file, suite, name } = locate(tc);
       if (name.trim() === '') throw new Error(`A test case in "${safeText(file || attr(tc, 'classname'), 80)}" has no name.`);
-      results.push({ id: normaliseTestId(file, suite, name), status: statusOf(tc) });
+      const status = statusOf(tc);
+      results.push({ id: normaliseTestId(file, suite, name), status });
+      for (let t: Tally | null = tally; t; t = t.parent) {
+        t.tests++;
+        if (status === 'fail') t.fails++;
+        if (status === 'skip') t.skips++;
+      }
     }
   }
+  for (const { node, tally } of counted) checkCounts(node, tally);
   return results;
 }
+
+interface Tally { tests: number; fails: number; skips: number; parent: Tally | null }
+interface Frame { node: unknown; depth: number; parent: Tally | null }
+
+/** The counts a suite carries must equal what was parsed under it (nested suites included). A report that fails this was misread or edited. */
+function checkCounts(node: Node, tally: Tally): void {
+  const declared = (name: string): number | undefined => {
+    const raw = own(node, `@_${name}`);
+    if (raw === undefined) return undefined;
+    if (typeof raw !== 'string' || !/^\d{1,9}$/.test(raw.trim())) throw new Error(`The JUnit report's "${name}" count is not a number.`);
+    return Number(raw.trim());
+  };
+  const tests = declared('tests');
+  const skipped = declared('skipped');
+  const failures = declared('failures');
+  const errors = declared('errors');
+  const bad = (what: string, said: number, found: number): never => {
+    throw new Error(`The JUnit report's ${what} count (${said}) does not match the test cases pipegen read (${found}).`);
+  };
+  if (tests !== undefined && tests !== tally.tests) bad('tests', tests, tally.tests);
+  if (skipped !== undefined && skipped !== tally.skips) bad('skipped', skipped, tally.skips);
+  if (failures !== undefined || errors !== undefined) {
+    const said = (failures ?? 0) + (errors ?? 0);
+    if (said !== tally.fails) bad('failures and errors', said, tally.fails);
+  }
+}
+
+const DUPLICATE_REASON = 'A test id appears more than once in a run; test names that differ only in case or spacing count as the same test.';
 
 function byId(run: TestCaseResult[]): Map<string, TestCaseResult['status'][]> {
   const map = new Map<string, TestCaseResult['status'][]>();
@@ -161,21 +231,27 @@ function byId(run: TestCaseResult[]): Map<string, TestCaseResult['status'][]> {
 
 /**
  * ok: both runs have the same ids, every id passes in both, and no id is repeated inside a run (a repeat can hide a failure behind a pass).
+ * A run with no test case is never ok: nothing ran, or nothing was recognised, which proves nothing.
+ * reason: set when ok is false because of that or because of a repeated id, so the caller can say why.
  * flaky: the ids that pass in one run and fail in the other, sorted, as safe text.
  */
-export function sameResults(first: TestCaseResult[], second: TestCaseResult[]): { ok: boolean; flaky: string[] } {
+export function sameResults(first: TestCaseResult[], second: TestCaseResult[]): { ok: boolean; flaky: string[]; reason?: string } {
   const a = byId(first);
   const b = byId(second);
-  let ok = a.size === b.size;
+  let ok = a.size > 0 && a.size === b.size;
+  let reason: string | undefined = a.size === 0 || b.size === 0 ? 'A run has no test case, so it proves nothing.' : undefined;
   const flaky: string[] = [];
   for (const [id, one] of a) {
     const two = b.get(id);
     if (two === undefined) { ok = false; continue; }
-    if (one.length !== 1 || two.length !== 1) ok = false;
+    if (one.length !== 1 || two.length !== 1) {
+      ok = false;
+      reason ??= DUPLICATE_REASON;
+    }
     if (one.some((s) => s !== 'pass') || two.some((s) => s !== 'pass')) ok = false;
     const passFail = one.every((s) => s === 'pass') && two.includes('fail');
     const failPass = one.includes('fail') && two.every((s) => s === 'pass');
     if (passFail || failPass) flaky.push(safeText(id, ID_MAX));
   }
-  return { ok, flaky: flaky.sort() };
+  return reason === undefined ? { ok, flaky: flaky.sort() } : { ok, flaky: flaky.sort(), reason };
 }

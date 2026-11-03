@@ -1,7 +1,7 @@
 // v0.2 Plan D, D8 (plan Task 6; rulings S10, S12): JUnit parsing. The XML comes from repo code, so it is hostile input.
 import { readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
-import { normaliseTestId, parseJunit, sameResults, type TestCaseResult } from '../src/create/junit.js';
+import { MAX_JUNIT_ATTRIBUTES, MAX_JUNIT_TAGS, normaliseTestId, parseJunit, sameResults, type TestCaseResult } from '../src/create/junit.js';
 
 const fixture = (name: string): string => readFileSync(new URL(`./fixtures/junit/${name}`, import.meta.url), 'utf8');
 const VITEST = 'vitest-5.0.5.xml';
@@ -33,7 +33,11 @@ describe('junit', () => {
       r('math nested deeper multiplies'),
       r('math nested __proto__'),
     ]);
+    const vitest = parseJunit(fixture(VITEST));
     expect(fixture(VITEST)).toContain('vitest tests');
+    expect(vitest).toHaveLength(5);
+    expect(vitest.map((c) => c.status)).toEqual(['pass', 'fail', 'skip', 'pass', 'pass']);
+    expect(vitest.at(-1)?.id).toBe('math.test > math > nested > __proto__');
     expect(fixture(JEST_DEFAULT)).toContain('jest tests');
   });
 
@@ -99,6 +103,113 @@ describe('junit', () => {
     const nest = (n: number): string => `<testsuites>${'<testsuite name="s">'.repeat(n)}<testcase name="t" classname="a.test.ts"/>${'</testsuite>'.repeat(n)}</testsuites>`;
     expect(parseJunit(nest(60))).toEqual([r('a.test > t')]);
     expect(() => parseJunit(nest(70))).toThrow(/deeper/);
+  });
+
+  it('junit: every markup declaration is refused, not only DOCTYPE and ENTITY (review I1)', () => {
+    for (const bad of ['<! x>', '<!\tENTITY x "y">', '<!ELEMENT a ANY>', '<!ATTLIST a b CDATA #IMPLIED>', '<!NOTATION n SYSTEM "x">', '<!>', '<! DOCTYPE x>', '<!-x>', '<![IGNORE[x]]>']) {
+      expect(() => parseJunit(`<testsuites><testsuite name="s"><testcase classname="a.test.ts" name="x">${bad}</testcase></testsuite></testsuites>`), bad).toThrow(/declaration/);
+    }
+    // a comment and a CDATA section are fine
+    expect(parseJunit('<testsuites><testsuite name="s"><!-- c --><testcase classname="a.test.ts" name="x"><system-out><![CDATA[ok]]></system-out></testcase></testsuite></testsuites>')).toEqual([r('a.test > x')]);
+    // the flood that used to cost 1.8 GB is refused before any parsing, fast
+    const flood = `<testsuites><testsuite name="s"><testcase classname="a.test.ts" name="x">${'<! '.repeat(5_000_000)}</testcase></testsuite></testsuites>`;
+    const t = performance.now();
+    expect(() => parseJunit(flood)).toThrow(/declaration/);
+    expect(performance.now() - t).toBeLessThan(1000);
+  });
+
+  it('junit: a report that is not well-formed XML is refused (review M1)', () => {
+    const tc = '<testcase classname="a.test.ts" name="y"/>';
+    for (const bad of [
+      `<testsuites><testsuite>${tc}`, // truncated
+      `<testsuites><testsuite><testcase classname="a.test.ts" name="y"><failure></testcase></testsuite></testsuites>`, // mismatched close
+      `<testsuites><testsuite><testcase classname="a.test.ts" name="y" name="z"/></testsuite></testsuites>`, // repeated attribute
+      `<testsuites><testsuite><testcase classname="a.test.ts"><@_name>spoofed</@_name></testcase></testsuite></testsuites>`, // element posing as an attribute
+      `<testsuites><testsuite><testcase classname="a.test.ts"><@_file>x.test.ts</@_file></testcase></testsuite></testsuites>`,
+    ]) expect(() => parseJunit(bad), bad).toThrow(/not well-formed XML/);
+    const m = messageOf(() => parseJunit(`<testsuites><testsuite><\u001b[31mEVIL\u202e`));
+    expect(m).toMatch(/not well-formed XML/);
+    expect(m).not.toMatch(/EVIL|[\u001b\u202e]/);
+    expect(parseJunit(fixture(VITEST))).toHaveLength(5);
+  });
+
+  it('junit: counts on a testsuite that contradict what was parsed are refused (review I2)', () => {
+    const t = '<testcase classname="a.test.ts" name="n"/>';
+    const f = '<testcase classname="a.test.ts" name="f"><failure/></testcase>';
+    const sk = '<testcase classname="a.test.ts" name="s"><skipped/></testcase>';
+    const bad = [
+      `<testsuites failures="3"><testsuite failures="3">${t}</testsuite></testsuites>`, // the reviewer's repro
+      `<testsuites tests="3"/>`,
+      `<testsuites tests="3"><testsuite name="x">text only</testsuite></testsuites>`,
+      `<testsuites tests="2"><testsuite>${t}</testsuite></testsuites>`,
+      `<testsuite tests="1" failures="1">${t}</testsuite>`,
+      `<testsuite tests="2" skipped="0">${t}${sk}</testsuite>`,
+      `<testsuite tests="2" errors="1">${t}${t.replace('"n"', '"m"')}</testsuite>`,
+      `<testsuite tests="1" failures="0" errors="0">${f}</testsuite>`,
+      `<testsuite tests="two">${t}</testsuite>`,
+      `<testsuite tests="-1">${t}</testsuite>`,
+      `<testsuites tests="1"><testsuite tests="1"><j:testcase classname="a.test.ts" name="n"/></testsuite></testsuites>`, // namespaced tag
+      `<testsuites tests="1"><testsuite><TESTCASE classname="a.test.ts" name="n"/></testsuite></testsuites>`, // upper case
+      `<testsuites tests="1"><testsuite><testsuites><testcase classname="a.test.ts" name="n"/></testsuites></testsuite></testsuites>`, // nested testsuites
+      `<testsuites tests="2"><testsuite tests="1">${t}</testsuite></testsuites>`, // a child suite is outside the count of the other
+    ];
+    for (const xml of bad) expect(() => parseJunit(xml), xml).toThrow(/count|number/);
+    expect(() => parseJunit(`<testsuite tests="two">${t}</testsuite>`)).toThrow(/not a number/);
+    expect(() => parseJunit(`<testsuite tests="-1">${t}</testsuite>`)).toThrow(/not a number/);
+    expect(() => parseJunit(`<testsuite failures="1.5">${f}</testsuite>`)).toThrow(/not a number/);
+    const ok = [
+      `<testsuites tests="3" failures="1" errors="0" skipped="1"><testsuite tests="3" failures="1" skipped="1">${t}${f}${sk}</testsuite></testsuites>`,
+      `<testsuite tests="2" failures="0" errors="1">${t}<testcase classname="a.test.ts" name="e"><error/></testcase></testsuite>`,
+      `<testsuites tests="2"><testsuite tests="1">${t}</testsuite><testsuite tests="1">${t.replace('"n"', '"m"')}</testsuite></testsuites>`,
+      `<testsuites tests="2"><testsuite><testsuite tests="1">${t}</testsuite>${t.replace('"n"', '"m"')}</testsuite></testsuites>`, // counts include nested suites
+      `<testsuite name="no counts">${t}</testsuite>`,
+    ];
+    for (const xml of ok) expect(parseJunit(xml).length, xml).toBeGreaterThan(0);
+    expect(parseJunit(fixture(VITEST))).toHaveLength(5);
+    expect(parseJunit(fixture(JEST))).toHaveLength(5);
+    expect(parseJunit(fixture(JEST_DEFAULT))).toHaveLength(5);
+  });
+
+  it('junit: reports that parse to nothing never give a pass (review I2)', () => {
+    const empties = [
+      '<testsuites/>',
+      '<testsuites>hello</testsuites>',
+      '<testsuites><testsuite>txt</testsuite></testsuites>',
+      '<testsuites><testsuite><j:testcase classname="a.test.ts" name="n"/></testsuite></testsuites>',
+      '<testsuites><testsuite><TESTCASE classname="a.test.ts" name="n"/></testsuite></testsuites>',
+      '<testsuites><testsuite><testsuites><testcase classname="a.test.ts" name="n"/></testsuites></testsuite></testsuites>',
+    ];
+    for (const xml of empties) {
+      const run = parseJunit(xml);
+      expect(run, xml).toEqual([]);
+      expect(sameResults(run, run).ok, xml).toBe(false);
+    }
+  });
+
+  it('junit: many attributes are capped, so the slowest input stays fast (review M2)', () => {
+    const attrs = (n: number): string => Array.from({ length: n }, (_, i) => `a${i}=""`).join(' ');
+    const doc = (n: number): string => `<testsuites><testsuite name="s"><testcase classname="a.test.ts" name="x" ${attrs(n)}/></testsuite></testsuites>`;
+    expect(parseJunit(doc(1000))).toHaveLength(1);
+    // the cap counts attribute-shaped text (name="..."), with spaces around the = too
+    expect(parseJunit(doc(MAX_JUNIT_ATTRIBUTES - 3))).toHaveLength(1); // 3 more in the frame
+    expect(() => parseJunit(doc(MAX_JUNIT_ATTRIBUTES - 2))).toThrow(/attributes/);
+    expect(() => parseJunit(`<testsuites><!--${"a = '' ".repeat(MAX_JUNIT_ATTRIBUTES + 1)}--></testsuites>`)).toThrow(/attributes/);
+    expect(() => parseJunit(`<testsuites><!--${'a = "" '.repeat(MAX_JUNIT_ATTRIBUTES + 1)}--></testsuites>`)).toThrow(/attributes/);
+    const t = performance.now();
+    expect(() => parseJunit(doc(MAX_JUNIT_ATTRIBUTES - 10))).not.toThrow();
+    expect(performance.now() - t).toBeLessThan(10_000); // measured about 1.5 s here; the margin is for slow CI machines
+  });
+
+  it('junit: too many tags are capped too (review M2)', () => {
+    const doc = (n: number): string => `<testsuites><testsuite name="s"><testcase classname="a.test.ts" name="x">${'<a/>'.repeat(n)}</testcase></testsuite></testsuites>`;
+    expect(parseJunit(doc(1000))).toHaveLength(1);
+    // exactly at the cap: the frame has 6 '<', each <a/> one
+    expect(parseJunit(doc(MAX_JUNIT_TAGS - 6))).toHaveLength(1);
+    expect(() => parseJunit(doc(MAX_JUNIT_TAGS - 5))).toThrow(/tags/);
+    expect(() => parseJunit(`<testsuites>${'<'.repeat(MAX_JUNIT_TAGS + 1)}</testsuites>`)).toThrow(/tags/);
+    // the largest legal shape (50,000 cases, each with a failure and output) is well under the cap
+    const big = suite(Array.from({ length: 50_000 }, (_, i) => `<testcase classname="a.test.ts" name="t${i}"><failure message="m"/><system-out>o</system-out></testcase>`).join(''));
+    expect(parseJunit(big)).toHaveLength(50_000);
   });
 
   it('junit: __proto__/constructor names parse as data', () => {
@@ -210,7 +321,8 @@ describe('sameResults', () => {
 
   it('sameResults: both pass with the same ids → ok; fail in both or skip is not ok and not flaky', () => {
     expect(sameResults([r('a'), r('b')], [r('b'), r('a')])).toEqual({ ok: true, flaky: [] });
-    expect(sameResults([], [])).toEqual({ ok: true, flaky: [] });
+    expect(Object.hasOwn(sameResults([r('a')], [r('a')]), 'reason')).toBe(false);
+    expect(sameResults([], [])).toMatchObject({ ok: false, flaky: [], reason: expect.stringMatching(/no test case/) }); // nothing run is not a proven pass
     expect(sameResults([r('a', 'fail')], [r('a', 'fail')])).toEqual({ ok: false, flaky: [] });
     expect(sameResults([r('a', 'skip')], [r('a', 'skip')])).toEqual({ ok: false, flaky: [] });
     expect(sameResults([r('a')], [r('a', 'skip')])).toEqual({ ok: false, flaky: [] });
@@ -218,17 +330,21 @@ describe('sameResults', () => {
   });
 
   it('junit: duplicate normalised id in one run → sameResults not ok', () => {
-    expect(sameResults([r('a'), r('a')], [r('a')])).toEqual({ ok: false, flaky: [] });
-    expect(sameResults([r('a')], [r('a'), r('a')])).toEqual({ ok: false, flaky: [] });
+    expect(sameResults([r('a'), r('a')], [r('a')])).toMatchObject({ ok: false, flaky: [] });
+    expect(sameResults([r('a')], [r('a'), r('a')])).toMatchObject({ ok: false, flaky: [] });
+    // the refusal says why, including that case and spacing differences do not make two tests
+    const why = sameResults([r('a'), r('a')], [r('a')]).reason ?? '';
+    expect(why).toMatch(/more than once/);
+    expect(why).toMatch(/differ only in case or spacing count as the same test/);
     expect(sameResults([r('a'), r('a')], [r('a'), r('a')]).ok).toBe(false);
     // two XML names that normalise to the same id are a duplicate
     const xml = suite('<testcase classname="a.test.ts" name="Same  Name"/><testcase classname="a.test.ts" name="same name"/>');
     const run = parseJunit(xml);
     expect(run).toHaveLength(2);
     expect(sameResults(run, run).ok).toBe(false);
-    expect(sameResults([r('a'), r('a', 'fail')], [r('a', 'fail')])).toEqual({ ok: false, flaky: [] });
+    expect(sameResults([r('a'), r('a', 'fail')], [r('a', 'fail')])).toMatchObject({ ok: false, flaky: [] });
     // a duplicate that differs in status still reports flaky ids from the other run
-    expect(sameResults([r('a'), r('a', 'fail'), r('b')], [r('a'), r('b', 'fail')])).toEqual({ ok: false, flaky: ['a', 'b'] });
+    expect(sameResults([r('a'), r('a', 'fail'), r('b')], [r('a'), r('b', 'fail')])).toMatchObject({ ok: false, flaky: ['a', 'b'] });
   });
 
   it('sameResults: flaky is sorted, listed once and safe text', () => {
