@@ -10,6 +10,8 @@ import { resultArtifactName } from '../src/engine/artifact-names.js';
 import { NEED_IDS } from '../src/engine/need-ids.js';
 import { dedupeJobSteps, RenderError, renderStepWith, renderUpload, scrubbedPath, stepsToYaml, type RenderedStep, type RenderResult } from '../src/engine/render-step.js';
 import { ARGV_POLICIES, PIP_CLOSURES, type ArgvPolicy } from '../src/engine/tool-flags.js';
+import { functionSource } from '../src/engine/render-cli.js';
+import { pinOk } from '../src/engine/npm-closure.js';
 import type { ReviewedTool, StepSpec } from '../src/types.js';
 import { ctxFor, entry, platform, reviewedList, service, specFor } from './helpers/render.js';
 import { argvOf, envNames, exec, fakeTool, FIXED_PATH, sandbox, stepEnv, type Sandbox } from './helpers/step-harness.js';
@@ -626,5 +628,40 @@ describe('6b: snapshots', () => {
     const t = entry('mypy');
     const closureText = `mypy==2.4.0 --hash=sha256:${'a'.repeat(64)}\ntyping-extensions==4.12.2 --hash=sha256:${'b'.repeat(64)}\n`;
     await expect(yamlOf(renderStepWith(spec(t), t, platform(), ctx, { pipClosures: { mypy: closureText } }).steps)).toMatchFileSnapshot('__snapshots__/steps/cli-pip.yml');
+  });
+});
+
+describe('D9 (review-D6 m6): the lock precheck embeds pinOk as an anonymous function, whatever name a bundler gives it', () => {
+  const ciStep = (r: RenderResult): RenderedStep => r.steps.find((s) => s.id?.startsWith('pipegen-npm-ci-')) as RenderedStep;
+  const embeddedJs = (run: string): string => {
+    const m = /^js='((?:[^']|'\\'')*)'$/m.exec(run);
+    if (m === null) throw new Error('no js= line');
+    return (m[1] as string).replace(/'\\''/g, "'");
+  };
+  it('the rendered precheck script compiles (new Function accepts it) and holds pinOk as `const pinOk = function(...)`', () => {
+    const js = embeddedJs(ciStep(render('vitest-coverage', { service: 'app' })).run as string);
+    expect(() => new Function('require', 'process', js)).not.toThrow();
+    expect(js).toMatch(/^const pinOk = function\(p, w\) \{ return /m);
+  });
+  it('functionSource: any function name (pinOk2 after an esbuild rename, $x, none) becomes `function(`, and the text is a working expression', () => {
+    // a name esbuild gives on a top-level collision, and other legal names
+    const named = { pinOk2: function pinOk2(p: number, w: number): boolean { return p === w; } }.pinOk2;
+    // eslint-disable-next-line prefer-arrow-callback
+    const dollar = function $x_9(a: number): number { return a + 1; };
+    const anon = [function (a: number): number { return a * 2; }][0] as (a: number) => number;
+    for (const [f, arg, want] of [[named, [1, 1], true], [dollar, [1], 2], [anon, [3], 6]] as const) {
+      const src = functionSource(f as (...a: never[]) => unknown);
+      expect(src.startsWith('function('), src).toBe(true);
+      expect(src).not.toContain('\n');
+      const back = new Function(`return ${src};`)() as (...a: unknown[]) => unknown;
+      expect(back(...arg)).toBe(want);
+    }
+    // the real pinOk renders exactly as before the fix (no change to any rendered step)
+    expect(functionSource(pinOk)).toBe(pinOk.toString().replace(/^function pinOk/, 'function').replace(/\s*\n\s*/g, ' '));
+  });
+  it('functionSource refuses what is not a plain function (an arrow, a class, a method), so a changed predicate can not slip in unparsed', () => {
+    expect(() => functionSource(((a: number) => a) as (...a: never[]) => unknown)).toThrow(/plain function/);
+    expect(() => functionSource(class X {} as unknown as (...a: never[]) => unknown)).toThrow(/plain function/);
+    expect(() => functionSource({ m(a: number): number { return a; } }.m as (...a: never[]) => unknown)).toThrow(/plain function/);
   });
 });

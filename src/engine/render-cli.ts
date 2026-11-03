@@ -1017,6 +1017,19 @@ const NPM_VERIFY_JS = [
   'process.exit(bad);',
 ].join('\n');
 
+/**
+ * A plain `function name(...) {...}` as an anonymous function expression on one line, to embed in a step script (review-D6 m6). The name is
+ * dropped whatever it is: a bundler renames a top-level function on a collision (esbuild: `pinOk2`), and the old fixed `function pinOk`
+ * match then left `function 2(p, w)`, a syntax error in every npm precheck. Anything that is not a plain function (an arrow, a class, a
+ * method, an async or generator function) is refused at load, never embedded half-rewritten.
+ */
+export function functionSource(f: (...a: never[]) => unknown): string {
+  const text = Function.prototype.toString.call(f);
+  const re = /^function\s*[\w$]*\s*\(/;
+  if (!re.test(text)) throw new Error('functionSource takes a plain function (function name(...) { ... }) only');
+  return text.replace(re, 'function(').replace(/\s*\n\s*/g, ' ');
+}
+
 /** The static check of a repo lockfile, run BEFORE `npm ci`: the tool and its plugins are plain registry packages at the reviewed version and integrity, and no shrinkwrap overrides the lockfile. */
 const NPM_PRECHECK_JS = [
   'const fs = require("fs");',
@@ -1026,7 +1039,7 @@ const NPM_PRECHECK_JS = [
   'const lock = JSON.parse(fs.readFileSync("package-lock.json", "utf8"));',
   'const want = JSON.parse(process.env.PIPEGEN_NPM_EXPECT);',
   'let bad = 0;',
-  `const pinOk = ${pinOk.toString().replace(/^function pinOk/, 'function').replace(/\s*\n\s*/g, ' ')};`,
+  `const pinOk = ${functionSource(pinOk)};`,
   'for (const w of want) {',
   '  const p = (lock.packages || {})["node_modules/" + w.name];',
   '  if (!pinOk(p, w)) {',
