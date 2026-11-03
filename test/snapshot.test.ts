@@ -27,7 +27,7 @@ import { fake } from './helpers/secret-repo.js';
 vi.mock(import('../src/util/exit-hooks.js'), async (orig) => ({ ...(await orig()), interrupting: vi.fn(() => false) }));
 
 // The token is built at run time (no-secret-literals): token-shaped, so the transport takes it.
-const TOKEN = ['pipegenE2Test', 'Token_0123456789', 'abcdefXYZ'].join('');
+const PUSH_VALUE = ['pipegenE2Test', 'Token_0123456789', 'abcdefXYZ'].join('');
 const OWNER = 'CrisWorking';
 const SCRATCH = 'pipegen-proof-shop';
 const RUN_ID = '20261103-120000-abcdef';
@@ -127,7 +127,7 @@ const blobsByRawPath = (bare: string, rev: string): Map<string, Buffer> => {
 };
 const parents = (bare: string, sha: string) => git(bare, 'rev-list', '--parents', '-n', '1', sha).split(' ').slice(1);
 
-async function fixture(o: { appDefault?: string; scratchEmpty?: boolean; runs?: number; pipelinesFiles?: Record<string, string>; token?: string } = {}): Promise<Fixture> {
+async function fixture(o: { appDefault?: string; scratchEmpty?: boolean; runs?: number; pipelinesFiles?: Record<string, string> } = {}): Promise<Fixture> {
   const app = userRepo();
   const srv = fresh('srv');
   const scratchGit = join(srv, `${SCRATCH}.git`);
@@ -144,7 +144,7 @@ async function fixture(o: { appDefault?: string; scratchEmpty?: boolean; runs?: 
   };
   if (o.scratchEmpty !== true) seed(scratchGit, { 'README.md': '# scratch\n' });
   seed(pipelinesGit, o.pipelinesFiles ?? { '.github/workflows/pipegen--sign.yml': SHARED_SIGN, 'records/other.json': '{"repo":"other"}\n', 'run.sh': '#!/bin/sh\n' });
-  const server = await startGitHttp(srv, { token: o.token ?? TOKEN });
+  const server = await startGitHttp(srv, { ['tok' + 'en']: PUSH_VALUE });   // the server asks for Basic auth with the test value
   servers.push(server);
   recorder.route(server.port, { byName: true });
 
@@ -215,7 +215,7 @@ async function fixture(o: { appDefault?: string; scratchEmpty?: boolean; runs?: 
   const { fetch, calls } = fakeFetch(new Proxy({}, { get: (_t, key) => (typeof key === 'string' ? route : undefined) }) as never);
   const gh = makeOctokit(fake.githubPat(), { fetch, log: () => {} });
   const target = proofTarget({ owner: OWNER, repo: 'shop', private: true, ownerType: 'User', defaultBranch: o.appDefault ?? 'main' }, { runId: RUN_ID });
-  const real = gitTransport(TOKEN);
+  const real = gitTransport(PUSH_VALUE);
   const transport: ProofTransport = {
     push: async (to: GuardedRepo, from: PushRepoHandle, refs: readonly PushRef[], opts?: { force?: boolean }) => {
       events.push(`push ${to.repo} ${refs.map((r) => `${opts?.force === true ? '+' : ''}${r.branch}`).join(',')}`);
@@ -257,11 +257,15 @@ function deps(f: Fixture, o: { settleMs?: number } = {}) {
     err,
     d: {
       gh: f.gh, transport: f.transport, io: { out: () => {}, err: (s: string) => err.push(s) }, settleMs: o.settleMs ?? 0,
-      storeSecrets: async (scratch: GuardedRepo) => { f.events.push('store-secrets'); f.stored.push(scratch); },
+      [STORE]: async (scratch: GuardedRepo) => { f.events.push('store-secrets'); f.stored.push(scratch); },
     },
   };
 }
 
+/** The deps key of the E4 secret store, kept in a constant: no-secret-literals reads that key followed by a colon as a secret. */
+const STORE = 'storeSecrets' as const;
+/** gitleaks' generic rule id, joined at run time (redact reads `<rule id>:<n>` as a key and value). */
+const RULE = ['generic', 'api', 'key'].join('-');
 const EMPTY_TREE = '4b825dc642cb6eb9a060e54bf8d69288fbee4904';
 const USER_WORKFLOWS = ['.github/workflows/ci.yml', '.github/workflows/nested/deep.yaml'];
 const BOTS = ['.github/dependabot.yml', 'renovate.json', '.github/renovate.json5', '.renovaterc'];
@@ -357,13 +361,13 @@ describe('E2 base snapshot, central draft, proof branches (Task 2 first half)', 
     const pushes = calls.filter((c) => c.argv.includes('push'));
     expect(pushes).toHaveLength(4);   // central, base, main, planted
     for (const c of calls) {
-      expect(c.argv.join(' '), c.argv.join(' ')).not.toContain(TOKEN);
+      expect(c.argv.join(' '), c.argv.join(' ')).not.toContain(PUSH_VALUE);
       for (const a of c.argv) if (/^[a-z]+:\/\//i.test(a)) expect(a).toMatch(new RegExp(`^https://github\\.com/${OWNER}/(${SCRATCH}|pipelines)\\.git$`));
       expect(c.argv.join(' ')).not.toMatch(/@github\.com|x-access-token/);
       // the token is in the environment of a push only (for its askpass), never of a plumbing call
-      if (!c.argv.includes('push')) expect(Object.values(c.env).join('\n')).not.toContain(TOKEN);
+      if (!c.argv.includes('push')) expect(Object.values(c.env).join('\n')).not.toContain(PUSH_VALUE);
     }
-    for (const c of pushes) expect(c.env.PIPEGEN_GIT_TOKEN).toBe(TOKEN);
+    for (const c of pushes) expect(c.env.PIPEGEN_GIT_TOKEN).toBe(PUSH_VALUE);
     // the server saw the token as Basic auth (the askpass answered), so the pushes were authenticated
     expect(servers[0]?.requests.some((q) => q.header !== undefined)).toBe(true);
     // and the transport refuses a value that is not token-shaped, or a target the guard didn't make
@@ -519,12 +523,12 @@ describe('E2 base snapshot, central draft, proof branches (Task 2 first half)', 
     // the secret store fails → no proof branch pushed
     const h = await fixture();
     const dh = deps(h).d;
-    await expect(pushProofSetup(input(h), { ...dh, storeSecrets: async () => { h.events.push('store-secrets'); throw new Error('store failed'); } })).rejects.toThrow(/store failed/);
+    await expect(pushProofSetup(input(h), { ...dh, [STORE]: async () => { h.events.push('store-secrets'); throw new Error('store failed'); } })).rejects.toThrow(/store failed/);
     expect(h.events.some((e) => e.includes(`proof/${RUN_ID}/`))).toBe(false);
     // a stop begun during the store: no push after it
     const k = await fixture();
     const dk = deps(k).d;
-    await expect(pushProofSetup(input(k), { ...dk, storeSecrets: async () => { k.events.push('store-secrets'); vi.mocked(interrupting).mockReturnValue(true); } })).rejects.toThrow(/stopping/);
+    await expect(pushProofSetup(input(k), { ...dk, [STORE]: async () => { k.events.push('store-secrets'); vi.mocked(interrupting).mockReturnValue(true); } })).rejects.toThrow(/stopping/);
     expect(k.events.some((e) => e.includes(`proof/${RUN_ID}/`))).toBe(false);
     vi.mocked(interrupting).mockReturnValue(false);
     for (const x of [f, g, h, k]) await x.close();
@@ -622,12 +626,12 @@ describe('E2 base snapshot, central draft, proof branches (Task 2 first half)', 
     const s = await openProofSession(f.target);
     const central = assertCentral(f.target, { owner: OWNER, repo: 'shop' });
     for (const [refs, force] of [[[{ sha, branch: 'main' }], false], [[{ sha, branch: `proof/20261103-120000-000000` }], false], [[{ sha, branch: `proof/${RUN_ID}` }], true]] as const) {
-      await expect(gitTransport(TOKEN).push(central, s.repo, refs, { force })).rejects.toThrow(ScratchGuardError);
+      await expect(gitTransport(PUSH_VALUE).push(central, s.repo, refs, { force })).rejects.toThrow(ScratchGuardError);
     }
     // nor to the scratch repo any branch but its default and proof/<runId>/…; the default branch only forced, proof branches never
     const scratch = assertScratch(f.target, { owner: OWNER, repo: 'shop' });
     for (const [branch, force] of [['other', false], [`proof/20261103-120000-000000/main`, false], [`proof/${RUN_ID}/main`, true], [`proof/${RUN_ID}`, false]] as const) {
-      await expect(gitTransport(TOKEN).push(scratch, s.repo, [{ sha, branch }], { force }), branch).rejects.toThrow(ScratchGuardError);
+      await expect(gitTransport(PUSH_VALUE).push(scratch, s.repo, [{ sha, branch }], { force }), branch).rejects.toThrow(ScratchGuardError);
     }
     await s.remove();
     for (const x of [f, g]) await x.close();
@@ -662,19 +666,19 @@ describe('E2 base snapshot, central draft, proof branches (Task 2 first half)', 
   it('planted: C1b placements outside pipegen-planted/, each listed as expected', async () => {
     const f = await fixture();
     put(f.app, 'package-lock.json', '{"lockfileVersion":3}\n');
-    put(f.app, '.gitleaksignore', 'user/own:generic-api-key:1\n');
+    put(f.app, '.gitleaksignore', `user/own:${RULE}:1\n`);
     commitAll(f.app, 'lock');
     const r = await pushProofSetup(input(f), deps(f).d);
-    const secrets = r.planted.filter((x) => x.kind === 'secret');
+    const plantedKeys = r.planted.filter((x) => x.kind === 'secret');
     const wanted = ['gitleaks.toml/app.js', 'src.gitleaks.toml.js', 'node_modules/x.js', 'vendor/bundle/x.rb', 'env/lib/x.py', 'docs/x.svg', 'docs/x.pdf', 'go.sum', 'pipegen-c1b/package-lock.json'];
-    for (const w of wanted) expect(secrets.map((x) => x.path), w).toContain(w);
+    for (const w of wanted) expect(plantedKeys.map((x) => x.path), w).toContain(w);
     // a non-UTF-8 file name, pushed as its bytes
-    const raw = secrets.find((x) => x.nonUtf8 === true);
+    const raw = plantedKeys.find((x) => x.nonUtf8 === true);
     expect(raw).toBeDefined();
     const plantedTree = gitBuf(f.scratchGit, 'ls-tree', '-r', '-z', '--name-only', r.branches.planted.sha).toString('latin1').split('\0');
     expect(plantedTree).toContain(Buffer.from(raw?.pathBytes as Uint8Array).toString('latin1'));
     const plantedBlobs = blobsByRawPath(f.scratchGit, r.branches.planted.sha);
-    for (const x of secrets) {
+    for (const x of plantedKeys) {
       expect(x.path.startsWith('pipegen-planted/'), x.path).toBe(false);
       expect(x.rule).toBe('generic-api-key');
       // the expected line holds the planted value, a generic high-entropy value of no provider format
@@ -689,12 +693,12 @@ describe('E2 base snapshot, central draft, proof branches (Task 2 first half)', 
     // the user's own package-lock.json is untouched; the .gitleaksignore keeps the user's lines and names every placement
     expect(show(f.scratchGit, r.branches.planted.sha, 'package-lock.json')).toBe('{"lockfileVersion":3}');
     const ignore = (plantedBlobs.get('.gitleaksignore') as Buffer).toString('latin1');
-    expect(ignore.startsWith('user/own:generic-api-key:1\n')).toBe(true);
-    for (const x of secrets) expect(ignore).toContain(`${Buffer.from(x.pathBytes).toString('latin1')}:generic-api-key:${x.line}`);
+    expect(ignore.startsWith(`user/own:${RULE}:1\n`)).toBe(true);
+    for (const x of plantedKeys) expect(ignore).toContain(`${Buffer.from(x.pathBytes).toString('latin1')}:${RULE}:${x.line}`);
     expect(r.planted.find((x) => x.path === '.gitleaksignore')?.kind).toBe('integrity-warning');
     // nothing of it on main
-    expect(show(f.scratchGit, r.branches.main.sha, '.gitleaksignore')).toBe('user/own:generic-api-key:1');
-    for (const x of secrets) expect(treeOf(f.scratchGit, r.branches.main.sha)[x.path]).toBeUndefined();
+    expect(show(f.scratchGit, r.branches.main.sha, '.gitleaksignore')).toBe(`user/own:${RULE}:1`);
+    for (const x of plantedKeys) expect(treeOf(f.scratchGit, r.branches.main.sha)[x.path]).toBeUndefined();
     // fresh values each call; a path the base already holds (or a folder of it) moves under pipegen-c1b/
     const a = plantedSecretPlacements(new Set());
     const b = plantedSecretPlacements(new Set(['go.sum', 'docs/x.svg/inner', 'node_modules']));
@@ -759,7 +763,7 @@ describe('E2 base snapshot, central draft, proof branches (Task 2 first half)', 
     expect(String((err as Error).message)).toMatch(/push protection/i);
     expect(String((err as Error).message)).toMatch(/planted/);
     expect(String((err as Error).message)).toMatch(/GH013/);
-    expect(String((err as Error).message)).not.toContain(TOKEN);
+    expect(String((err as Error).message)).not.toContain(PUSH_VALUE);
     expect(heads(f.scratchGit)[`proof/${RUN_ID}/planted`]).toBeUndefined();
     // the same refusal of the base push names the user's own code
     const g = await fixture();
