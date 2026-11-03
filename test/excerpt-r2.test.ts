@@ -7,6 +7,7 @@ import { SecretVault } from '../src/create/secrets.js';
 import { errorExcerpt, type ExcerptEvidence, MAX_LOG_CHARS, unscannedExcerpt } from '../src/proof/excerpt.js';
 import { betterleaksAt, CLEAN, makeStub } from './helpers/gitleaks-stub.js';
 import { cleanupRepos } from './helpers/make-repo.js';
+import { placeholderEvidence } from './helpers/scratch-secrets.js';
 
 afterEach(() => cleanupRepos());
 
@@ -23,21 +24,22 @@ const MODE_KEY = ['secrets', 'Mode'].join('');
 const evidence = (mode: unknown) => ({ [MODE_KEY]: mode }) as unknown as ExcerptEvidence;
 const pad = (n: number, tag = 'step') => Array.from({ length: n }, (_, i) => `${tag} ${i} ok`);
 
-describe('errorExcerpt: the evidence boundary (ruling E0a-R5)', () => {
-  it('excerpt r2: errorExcerpt runs only with the placeholders-only evidence; anything else throws before any work', async () => {
+describe('errorExcerpt: the evidence boundary (ruling E0a-R5; E4: the ScratchKeys brand)', () => {
+  it('excerpt r2: errorExcerpt runs only with evidence ScratchKeys minted; anything else throws before any work', async () => {
     const stub = makeStub(CLEAN);
     const scanner = betterleaksAt(stub.bin);
     const record = join(stub.bin, '..', 'record.json');
     const scrub = (t: string) => t;
-    const bad: unknown[] = [undefined, null, {}, evidence('real'), evidence('Placeholders'), evidence(['placeholders']), 'placeholders', 1];
-    for (const evidence of bad) {
+    const real = await placeholderEvidence();
+    // the old literal evidence, look-alikes, copies and objects made from the real one: none is evidence
+    const bad: unknown[] = [undefined, null, {}, evidence('real'), evidence('placeholders'), evidence(['placeholders']), 'placeholders', 1,
+      { ...real }, Object.create(real), Object.freeze({}), Object.create(null)];
+    for (const e of bad) {
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      await expect(errorExcerpt('Error: x', scrub, scanner, evidence as any), JSON.stringify(evidence)).rejects.toThrow(/placeholders/);
+      await expect(errorExcerpt('Error: x', scrub, scanner, e as any)).rejects.toThrow(/placeholders/);
     }
-    // an inherited property is not the evidence's own
-    await expect(errorExcerpt('Error: x', scrub, scanner, Object.create(evidence('placeholders')))).rejects.toThrow(/placeholders/);
     expect(existsSync(record)).toBe(false); // the scanner never ran
-    expect(await errorExcerpt('Error: x', scrub, scanner, evidence('placeholders'))).toBe('Error: x');
+    expect(await errorExcerpt('Error: x', scrub, scanner, real)).toBe('Error: x');
     expect(existsSync(record)).toBe(true);
   });
 });

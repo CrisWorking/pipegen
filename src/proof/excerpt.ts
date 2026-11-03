@@ -21,13 +21,14 @@
 // the AI, never a leak.
 // The secret scan runs a process, so errorExcerpt is async and takes the pinned scanner (ruling E0a-R3); any throw means nothing may be
 // sent. The boundary that keeps typed values out is structural (ruling E0a-R5, DECISIONS #113): errorExcerpt requires evidence that the
-// run held only placeholders or throwaway keys, so no typed value is in the log at all; the rules below are defence in depth, and the
+// run held only placeholders or throwaway keys (ScratchKeys' brand, E4), so no typed value is in the log at all; the rules below are defence in depth, and the
 // shapes they still miss are recorded limits.
 import { createHash, randomBytes } from 'node:crypto';
 import { MAX_REGEX_LINE_BYTES } from '../ai/redact-core.js';
 import { redact, secretScanText, type SecretScanner } from '../ai/redact.js';
 import { LATE_MAGIC, SCAN_PREFIX, scannersWouldSkip } from '../ai/scan-staging.js';
 import { holdsEscape, scrubForDisplay, stripChars } from '../util/known-values.js';
+import { isExcerptEvidence, type ExcerptEvidence } from './keys.js';
 
 /** Lines shown before and after each error line. */
 export const EXCERPT_CONTEXT_LINES = 5;
@@ -727,17 +728,18 @@ export function unscannedExcerpt(logs: string, scrub: (text: string) => string, 
 
 /**
  * Ruling E0a-R5 (DECISIONS #113), the structural boundary: an excerpt is only ever built from a run whose scratch secrets were all
- * placeholders or pipegen's throwaway keys, never from a run that held a value the user typed. E4/E7 supply this from the ScratchKeys
- * state of the run the log comes from; a part that fails only once real keys are in place is classified locally and never goes to the
- * AI. The literal type is the evidence; errorExcerpt checks it at run time too, so a cast can't get past it.
+ * placeholders or pipegen's throwaway keys, never from a run that held a value the user typed. The evidence is an unforgeable brand
+ * that only ScratchKeys (keys.ts) mints, through a ticket that brackets the run (E4 carry); a part that fails only once real keys
+ * are in place is classified locally and never goes to the AI. errorExcerpt checks the brand at run time, so a cast, a copy or a
+ * look-alike object can't get past it.
  */
-export interface ExcerptEvidence { readonly secretsMode: 'placeholders' }
+export type { ExcerptEvidence };
 
-/** Throws unless `evidence` is a plain object whose own `secretsMode` is exactly 'placeholders' (E0a-R5). */
+/** Throws unless `evidence` is an object ScratchKeys.evidence minted (E0a-R5). */
 function checkEvidence(evidence: unknown): void {
-  const ok = typeof evidence === 'object' && evidence !== null && Object.prototype.hasOwnProperty.call(evidence, 'secretsMode')
-    && (evidence as { secretsMode: unknown }).secretsMode === 'placeholders';
-  if (!ok) throw new Error('errorExcerpt needs evidence that the run held only placeholders or throwaway keys ({ secretsMode: \'placeholders\' }, ruling E0a-R5); nothing was built.');
+  if (!isExcerptEvidence(evidence)) {
+    throw new Error('errorExcerpt needs the evidence ScratchKeys mints for a run that held only placeholders or throwaway keys (ruling E0a-R5); nothing was built.');
+  }
 }
 
 /**

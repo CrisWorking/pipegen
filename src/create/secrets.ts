@@ -265,22 +265,72 @@ async function put(fn: () => Promise<unknown>, name: string): Promise<void> {
 }
 
 /**
+ * Where sealed repo secrets go (E4): GitHub's public key for the repo's secrets, and one PUT of a sealed value. storeSecrets and
+ * storeRepoSecret use the plain repo; the proof uses src/proof/target.ts scratchSecretSink, which is reachable only right after
+ * checkScratchAccess (so proof code never stores a secret with a plain repo string; test/proof-repos.test.ts checks the source).
+ */
+export interface SecretSink {
+  publicKey(): Promise<{ data: unknown }>;
+  put(name: string, encryptedValue: string, keyId: string): Promise<unknown>;
+}
+
+function repoSink(gh: Octokit, repo: { owner: string; repo: string }): SecretSink {
+  if (!PART_RE.test(String(repo?.owner)) || !PART_RE.test(String(repo?.repo))) throw new SecretStoreError('the repository owner or name is not a plain name');
+  const { owner, repo: name } = repo;
+  return {
+    publicKey: () => gh.request('GET /repos/{owner}/{repo}/actions/secrets/public-key', { owner, repo: name }),
+    put: (secretName, encrypted, keyId) => gh.request('PUT /repos/{owner}/{repo}/actions/secrets/{secret_name}', { owner, repo: name, secret_name: secretName, encrypted_value: encrypted, key_id: keyId }),
+  };
+}
+
+/**
  * Stores the vault's `names` as repo secrets: GET the repo's public key, seal each value (crypto_box_seal), PUT `encrypted_value` + `key_id`.
  * Names are upper-cased; GITHUB_* is refused. All names are checked before anything is sent. Does NOT wipe the vault (the caller wipes after delivery).
  * Environment secrets never go through here (storeEnvSecret). Returns the stored (upper-case) names.
  */
 export async function storeSecrets(gh: Octokit, repo: { owner: string; repo: string }, vault: SecretVault, names: readonly string[]): Promise<string[]> {
-  if (!PART_RE.test(String(repo?.owner)) || !PART_RE.test(String(repo?.repo))) throw new SecretStoreError('the repository owner or name is not a plain name');
+  return storeSecretsVia(repoSink(gh, repo), vault, names);
+}
+
+/** storeSecrets through a sink (the proof's scratch sink, E4). The same checks, in the same order, before anything is sent. */
+export async function storeSecretsVia(sink: SecretSink, vault: SecretVault, names: readonly string[]): Promise<string[]> {
   const todo = names.map((n) => ({ from: n, up: secretName(n) }));
   if (new Set(todo.map((t) => t.up)).size !== todo.length) throw new SecretStoreError('two of the secret names are the same after upper-casing');
   for (const t of todo) if (!vault.has(t.from)) throw new SecretStoreError(`there is no value for ${safeText(t.up, 80)} in the vault`);
   if (todo.length === 0) return [];
-  const { owner, repo: name } = repo;
-  const key = await fetchKey(() => gh.request('GET /repos/{owner}/{repo}/actions/secrets/public-key', { owner, repo: name }));
+  const key = await fetchKey(() => sink.publicKey());
   const done: string[] = [];
   for (const t of todo) {
     const encrypted = seal(vault.get(t.from) as string, key.key);
-    await put(() => gh.request('PUT /repos/{owner}/{repo}/actions/secrets/{secret_name}', { owner, repo: name, secret_name: t.up, encrypted_value: encrypted, key_id: key.keyId }), t.up);
+    await put(() => sink.put(t.up, encrypted, key.keyId), t.up);
+    done.push(t.up);
+  }
+  return done;
+}
+
+/**
+ * Ruling S14: stores one value that is NOT the user's (a placeholder, or the proof's throwaway PIPEGEN_FP_KEY) as a repo secret, sealed the
+ * same way. The name rules (upper-cased, never GITHUB_*) and valueProblem apply. These values never go through the vault.
+ */
+export async function storeRepoSecret(gh: Octokit, repo: { owner: string; repo: string }, name: string, value: string): Promise<void> {
+  await storeRepoSecretsVia(repoSink(gh, repo), [{ name, value }]);
+}
+
+/** storeRepoSecret for several values through a sink (one public-key read). Every name and value is checked before anything is sent. */
+export async function storeRepoSecretsVia(sink: SecretSink, entries: readonly { name: string; value: string }[]): Promise<string[]> {
+  const todo = entries.map((e) => {
+    const up = secretName(e?.name);
+    const problem = valueProblem(e?.value);
+    if (problem !== null) throw new SecretStoreError(`the value for ${safeText(up, 80)} ${problem}`);
+    return { up, value: e.value };
+  });
+  if (new Set(todo.map((t) => t.up)).size !== todo.length) throw new SecretStoreError('two of the secret names are the same after upper-casing');
+  if (todo.length === 0) return [];
+  const key = await fetchKey(() => sink.publicKey());
+  const done: string[] = [];
+  for (const t of todo) {
+    const encrypted = seal(t.value, key.key);
+    await put(() => sink.put(t.up, encrypted, key.keyId), t.up);
     done.push(t.up);
   }
   return done;

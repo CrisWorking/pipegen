@@ -81,6 +81,8 @@ export interface WorldOptions {
   owners?: Person[] | null;
   /** A status for the first request to a route ("METHOD /path"), with GitHub's rate-limit headers when 403/429. */
   rateLimitOnce?: string;
+  /** E4: answers routes this fake doesn't know (secrets, PRs, runs, artifacts), before its own 404. undefined: not handled. */
+  extra?: (c: Call) => Reply | undefined;
 }
 
 export interface World {
@@ -132,6 +134,8 @@ export function world(opts: WorldOptions = {}): World {
       limited.add(key);
       return { status: 403, body: { message: 'API rate limit exceeded' }, headers: { 'x-ratelimit-remaining': '0', 'retry-after': '1' } };
     }
+    const more = opts.extra?.(c);
+    if (more !== undefined) return more;
     if (m === 'GET' && path === '/user') return me === null ? forbidden() : json(200, me);
     if (m === 'GET' && parts[0] === 'orgs' && parts[2] === 'members' && c.url.searchParams.get('role') === 'admin') {
       return opts.owners === null ? forbidden() : page(c, opts.owners ?? []);

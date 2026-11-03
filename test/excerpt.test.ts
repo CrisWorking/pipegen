@@ -3,7 +3,7 @@
 // (at most 150 lines and 64 KiB), Plan A redact, the composed known-value scrubber through fullScrub, and the secret scan.
 // The scanner is the shared stub (test/helpers/gitleaks-stub.ts), so no real binary runs here.
 import { createHash } from 'node:crypto';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeAll, describe, expect, it } from 'vitest';
 import { knownValueScrubber, LONG_LINE, SecretScanError, secretScanText } from '../src/ai/redact.js';
 import { SecretVault } from '../src/create/secrets.js';
 import {
@@ -12,12 +12,14 @@ import {
 } from '../src/proof/excerpt.js';
 import { betterleaksAt, CLEAN, gitleaksAt, makeStub } from './helpers/gitleaks-stub.js';
 import { cleanupRepos } from './helpers/make-repo.js';
+import { placeholderEvidence } from './helpers/scratch-secrets.js';
 import { fake } from './helpers/secret-repo.js';
 
 afterEach(() => cleanupRepos());
 
-// ruling E0a-R5: every excerpt here is built from a placeholders-only run (the key is built at runtime: test/no-secret-literals.test.ts)
-const PLACEHOLDERS_ONLY = { [['secrets', 'Mode'].join('')]: 'placeholders' } as unknown as ExcerptEvidence;
+// ruling E0a-R5: every excerpt here is built from a placeholders-only run: real evidence, minted by ScratchKeys over the fake (E4)
+let PLACEHOLDERS_ONLY: ExcerptEvidence;
+beforeAll(async () => { PLACEHOLDERS_ONLY = await placeholderEvidence(); });
 const errorExcerpt = (logs: string, scrub: (t: string) => string, scanner: Parameters<typeof errorExcerptWithEvidence>[2], opts?: { timeoutMs?: number }) =>
   errorExcerptWithEvidence(logs, scrub, scanner, PLACEHOLDERS_ONLY, opts);
 

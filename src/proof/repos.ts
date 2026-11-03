@@ -40,8 +40,11 @@ import type { Auth } from '../types.js';
 import { safeText } from '../util/safe-text.js';
 import {
   assertCentral, assertScratch, CENTRAL_REPO, createHelperRepo, githubRead, guardedWrite, helperDescription, makeRepoPrivate, proofTarget, ProofStopError,
-  requireGuarded, SCRATCH_MARKER, ScratchGuardError, type GuardedRepo, type ProofApp, type ProofTarget,
+  requireGuarded, SCRATCH_MARKER, ScratchGuardError, takeAccessIssuer, type GuardedRepo, type ProofApp, type ProofTarget,
 } from './target.js';
+
+/** E4: the brand target.ts's scratchSecretSink requires; only checkScratchAccess's result gets it (taken once, at load). */
+const issueAccess = takeAccessIssuer();
 
 export interface RepoCheck { name: string; exists: boolean; private?: boolean; createCommand?: string }
 /** `stop`: write or admin, a hard stop (ruling E1-R2); `warning`: read (and unknown, which decides nothing on its own). */
@@ -400,6 +403,8 @@ export async function checkScratchAccess(gh: Octokit, t: ProofTarget, io: ProofI
     await ask(`pushers: ${JSON.stringify([...new Set(unsure)].sort())}`, pushUnsurePrompt(scratch));
   }
   if (forkOn) await ask(`forking: ${scratch.fullName}`, forkPrompt(scratch));
+  // E4: branded as a finished check, so the secret store can require it (target.ts scratchSecretSink)
+  issueAccess(result, scratch);
   return result;
 }
 

@@ -26,6 +26,12 @@
 // - createHelperRepo(gh, repo, login) is the one repo create (App mode only, decided by the caller; ruling S19): the
 //   name is the guarded one, a personal account's create needs the token's login to be the owner (POST /user/repos
 //   makes the repo under the login), and GitHub's answer must name that repo and say private.
+// - Secrets (E4; threat T12; carries G1 and E1-R5): guardedWrite refuses every secret write (any non-DELETE route with a
+//   /secrets path part). The ONE way a secret value reaches the scratch repo is scratchSecretSink(gh, access), which takes
+//   the result of checkScratchAccess (repos.ts) as a branded argument: only that function brands a result (it takes the
+//   issuer below once, at load), a brand is used for one store batch only, and it is good for ACCESS_CHECK_MAX_AGE_MS. So
+//   the pre-store re-check can't be skipped or reused. deleteScratchSecret is the one write allowed while stopping: it
+//   only removes a key (E8's Ctrl-C cleanup).
 // Later tasks extend SCRATCH_SECTIONS (or add a dedicated function here) under review; they never call Octokit writes
 // themselves (a source scan in test/proof-repos.test.ts checks src/proof).
 import { randomBytes } from 'node:crypto';
@@ -35,6 +41,7 @@ import { checkRepoNames, clockOf, githubTokenRejected, isAnonymousClient } from 
 import type { RepoProfile } from '../types.js';
 import { interrupting } from '../util/exit-hooks.js';
 import { safeText } from '../util/safe-text.js';
+import type { SecretSink } from '../create/secrets.js';
 import { pushUrl } from './git.js';
 
 export const SCRATCH_PREFIX = 'pipegen-proof-';
@@ -242,7 +249,16 @@ function checkCentral(r: GuardedRepo, method: string, path: string, p: Params): 
   refuse(`${method} ${path || '/'} is not a write pipegen makes to ${r.fullName}.`);
 }
 
+/** How a write is sent: a plain guardedWrite, the secret sink's store, or the secret delete (allowed while stopping). */
+type WriteMode = 'plain' | 'secret-store' | 'secret-delete';
+const SECRET_STORE_ROUTE = 'PUT /repos/{owner}/{repo}/actions/secrets/{secret_name}';
+const SECRET_DELETE_ROUTE = 'DELETE /repos/{owner}/{repo}/actions/secrets/{secret_name}';
+/** Any path with a `secrets` part (repo, environment, Dependabot, Codespaces secrets). */
+const SECRETS_PATH_RE = /(?:^|\/)secrets(?:\/|$)/;
+
 function checkScratch(r: GuardedRepo, method: string, path: string, p: Params): void {
+  // E4 (T12): no secret is written through a plain guardedWrite; scratchSecretSink is the one way (after checkScratchAccess)
+  if (method !== 'DELETE' && SECRETS_PATH_RE.test(path)) refuse(`a secret of ${r.fullName} is stored only through scratchSecretSink, right after checkScratchAccess.`);
   if (path === '') {
     if (method === 'PATCH' && Object.keys(p).length > 0 && onlyKeys(p, [...SCRATCH_REPO_PATCH]) && towardsPrivate(p)) return;
     refuse(method === 'DELETE' ? `deleting ${r.fullName} needs the exact name and pipegen's created marker (cleanup).`
@@ -261,9 +277,23 @@ function checkScratch(r: GuardedRepo, method: string, path: string, p: Params): 
  * pass through (a 401 as githubTokenRejected).
  */
 export async function guardedWrite(gh: Octokit, r: GuardedRepo, route: string, params: Params = {}, clock: RateClock = clockOf(gh)): Promise<{ status: number; data: unknown }> {
+  return writeChecked(gh, r, route, params, clock, 'plain');
+}
+
+/**
+ * guardedWrite's body. `mode` 'secret-store' takes only SECRET_STORE_ROUTE on the scratch repo (scratchSecretSink, after
+ * the access check); 'secret-delete' takes only SECRET_DELETE_ROUTE on the scratch repo and is the one write sent while a
+ * stop is under way (it only removes a key). Neither is exported.
+ */
+async function writeChecked(gh: Octokit, r: GuardedRepo, route: string, params: Params, clock: RateClock, mode: WriteMode): Promise<{ status: number; data: unknown }> {
   requireGuarded(r);
   checkTarget(r.target, { owner: r.target.owner, repo: r.target.appRepo });
-  notStopping();
+  const stopGate = mode === 'secret-delete' ? () => {} : notStopping;
+  stopGate();
+  if (mode !== 'plain') {
+    const want = mode === 'secret-store' ? SECRET_STORE_ROUTE : SECRET_DELETE_ROUTE;
+    if (r.kind !== 'scratch' || route !== want) refuse(`only ${want} on the scratch repo goes this way.`);
+  }
   const m = ROUTE_RE.exec(route);
   if (m === null) refuse(`"${safeText(route, 120)}" is not a write under /repos/{owner}/{repo}.`);
   const method = m[1] as string;
@@ -279,10 +309,14 @@ export async function guardedWrite(gh: Octokit, r: GuardedRepo, route: string, p
     }
   }
   if (r.kind === 'central') checkCentral(r, method, path, params);
-  else checkScratch(r, method, path, params);
+  else if (mode === 'secret-store') {
+    if (!onlyKeys(params, ['secret_name', 'encrypted_value', 'key_id'])) refuse('a secret store takes only secret_name, encrypted_value and key_id.');
+  } else if (mode === 'secret-delete') {
+    if (!onlyKeys(params, ['secret_name'])) refuse('a secret delete takes only secret_name.');
+  } else checkScratch(r, method, path, params);
   try {
     // checked again before every attempt (review I1): withRateLimit may wait up to 60 s, then send the call again
-    const res = await withRateLimit(() => { notStopping(); return gh.request(route, { ...params, owner: r.owner, repo: r.repo }); }, clock);
+    const res = await withRateLimit(() => { stopGate(); return gh.request(route, { ...params, owner: r.owner, repo: r.repo }); }, clock);
     return { status: res.status, data: res.data };
   } catch (e) {
     if (isRateStop(e)) throw e;
@@ -366,4 +400,61 @@ export async function makeRepoPrivate(gh: Octokit, r: GuardedRepo, from: 'public
   if (d.private !== true || (d.visibility !== undefined && d.visibility !== 'private')) {
     throw new ProofStopError(`GitHub didn't confirm ${r.fullName} is private now, so pipegen won't use it.`);
   }
+}
+
+// ---------- secrets: the store after the access check, the delete (E4) ----------
+
+/** How long checkScratchAccess's result stays good for a store (the re-check must come right before it). */
+export const ACCESS_CHECK_MAX_AGE_MS = 60_000;
+interface AccessRecord { scratch: GuardedRepo; at: number; used: boolean }
+/** checkScratchAccess results, branded when made (by repos.ts, through the issuer). Module-private. */
+const accessChecks = new WeakMap<object, AccessRecord>();
+type AccessIssuer = (result: object, scratch: GuardedRepo) => void;
+let accessIssuer: AccessIssuer | null = (result, scratch) => {
+  requireGuarded(scratch, 'scratch');
+  accessChecks.set(result, { scratch, at: Date.now(), used: false });
+};
+
+/**
+ * The brand maker for checkScratchAccess's result, handed out ONCE: repos.ts takes it when it loads (it imports this module,
+ * so it loads right after it). Any later call throws, so nothing else can brand an object as an access check.
+ */
+export function takeAccessIssuer(): AccessIssuer {
+  const f = accessIssuer;
+  if (f === null) throw new ScratchGuardError('the access-check issuer was already taken.');
+  accessIssuer = null;
+  return f;
+}
+
+/**
+ * The one way a secret value reaches the scratch repo (E4; T12). `access` must be a result checkScratchAccess made (the
+ * brand), not used for a store before, at most ACCESS_CHECK_MAX_AGE_MS old, for a scratch repo; the brand is spent here, so
+ * every store batch needs a fresh check. The sink reads the scratch repo's public key and PUTs sealed values only
+ * (secrets.ts storeSecretsVia / storeRepoSecretsVia seal them); nothing is sent once a stop has begun.
+ */
+export function scratchSecretSink(gh: Octokit, access: object, clock: RateClock = clockOf(gh)): SecretSink {
+  const rec = typeof access === 'object' && access !== null ? accessChecks.get(access) : undefined;
+  if (rec === undefined) refuse('a secret is stored only with the result of checkScratchAccess, made right before the store.');
+  if (rec.used) refuse('that access check was already used for a store; pipegen checks again before each store.');
+  const age = Date.now() - rec.at;
+  if (!(age >= 0 && age <= ACCESS_CHECK_MAX_AGE_MS)) refuse('the access check is too old for a store; pipegen checks again right before it.');
+  const r = rec.scratch;
+  requireGuarded(r, 'scratch');
+  checkTarget(r.target, { owner: r.target.owner, repo: r.target.appRepo });
+  notStopping();
+  rec.used = true;
+  return Object.freeze({
+    publicKey: async () => {
+      notStopping();
+      return githubRead(gh, 'GET /repos/{owner}/{repo}/actions/secrets/public-key', { owner: r.owner, repo: r.repo }, clock);
+    },
+    put: (name: string, encrypted: string, keyId: string) =>
+      writeChecked(gh, r, SECRET_STORE_ROUTE, { secret_name: name, encrypted_value: encrypted, key_id: keyId }, clock, 'secret-store'),
+  });
+}
+
+/** Deletes one repo secret of the scratch repo. The one write sent while a stop is under way (it only removes a key; E8). */
+export async function deleteScratchSecret(gh: Octokit, scratch: GuardedRepo, name: string, clock: RateClock = clockOf(gh)): Promise<void> {
+  requireGuarded(scratch, 'scratch');
+  await writeChecked(gh, scratch, SECRET_DELETE_ROUTE, { secret_name: name }, clock, 'secret-delete');
 }
