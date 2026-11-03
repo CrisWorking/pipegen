@@ -86,7 +86,7 @@ export interface RepoProfile {
 }
 // ---------- GitHub access (moved here from Plan A Task 6 in round 4: Plan U uses it too) ----------
 export interface Auth {
-  token: string | null;   // null only when kind is 'anonymous'. Sent only to https://api.github.com, never printed
+  token: string | null;   // null only when kind is 'anonymous'. Sent only to https://api.github.com, never printed. One exception (DECISIONS #111): Plan E's git pushes (src/proof/git.ts) send it to https://github.com/<owner>/pipegen-proof-<repo>.git and https://github.com/<owner>/pipelines.git only, through GIT_ASKPASS from the git child's environment: never in argv, a URL, a credential helper or a file
   kind: 'app' | 'fine-grained' | 'classic' | 'installation' | 'anonymous';   // anonymous = public repo, no token (read mode only, rate-limited); installation = an Actions GITHUB_TOKEN (ghs_), read mode only
   repos: string[] | 'all'; canCreateRepos: boolean; canDeleteRepos: boolean;
 }
