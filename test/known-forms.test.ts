@@ -125,6 +125,20 @@ describe('known-values: forms for the log excerpt (E0a, B1)', () => {
     v.wipe();
   });
 
+  it('known-values: a split next to a space, and a lowercase percent form split across lines, are scrubbed too', () => {
+    // the space belongs to the value: only the view that takes out the break alone (not the blanks next to it) holds it
+    const spaced = vault('Zq7Rk2mW 9xLp4Tn8');
+    expect(spaced.scrubber()('a Zq7Rk2mW \n9xLp4Tn8 b')).toBe(`a ${R} b`);
+    spaced.wipe();
+    // the URL form with lowercase escapes, split by a line break: the joined view is searched with its %xx in upper case too
+    const typed = 'p%ss w\u00f6rd/+=Zq7Rk2';
+    const v = vault(typed);
+    const enc = encodeURIComponent(typed).replace(/%[0-9A-F]{2}/g, (m) => m.toLowerCase());
+    const cut = enc.indexOf('%2f') + 2;
+    expect(v.scrubber()(`u=${enc.slice(0, cut)}\n${enc.slice(cut)} end`)).toBe(`u=${R} end`);
+    v.wipe();
+  });
+
   it('known-values: the encoded forms start at the vault minimum (8 bytes); shorter known values keep only the old forms', () => {
     expect(MIN_ENCODED_FORM_BYTES).toBe(MIN_VALUE_LENGTH);
     // a 3-byte known value (the audit's own known values can be short): its hex and shifted base64 are not looked for

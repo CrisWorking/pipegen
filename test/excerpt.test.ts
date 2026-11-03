@@ -4,7 +4,7 @@
 // The scanner is the shared stub (test/helpers/gitleaks-stub.ts), so no real binary runs here.
 import { createHash } from 'node:crypto';
 import { afterEach, describe, expect, it } from 'vitest';
-import { knownValueScrubber, LONG_LINE, SecretScanError } from '../src/ai/redact.js';
+import { knownValueScrubber, LONG_LINE, SecretScanError, secretScanText } from '../src/ai/redact.js';
 import { SecretVault } from '../src/create/secrets.js';
 import { EXCERPT_CONTEXT_LINES, EXCERPT_MAX_BYTES, EXCERPT_MAX_LINES, EXCERPT_WITHHELD, errorExcerpt, errorSignature, MAX_LOG_CHARS } from '../src/proof/excerpt.js';
 import { betterleaksAt, CLEAN, gitleaksAt, makeStub } from './helpers/gitleaks-stub.js';
@@ -181,6 +181,12 @@ describe('errorExcerpt (E0a, B1)', () => {
     // a scan that did not confirm it read the excerpt: nothing
     const unread = makeStub(`canary = 'none'; writeReport('[]'); process.exit(0);`);
     await expect(errorExcerpt(log, composed(v), betterleaksAt(unread.bin))).rejects.toThrow(SecretScanError);
+    // the canary reported on another line than its own: nothing either
+    const moved = makeStub(`canary = 'none'; writeReport(JSON.stringify(canaryFindings().map((f) => ({ ...f, StartLine: 2, EndLine: 2 })))); process.exit(1);`);
+    await expect(errorExcerpt(log, composed(v), betterleaksAt(moved.bin))).rejects.toThrow(SecretScanError);
+    // secretScanText itself refuses a text the scanners would skip (errorExcerpt drops such a line first)
+    const late = `${'a'.repeat(255)}\nustar rest`;
+    await expect(secretScanText(late, clean())).rejects.toThrow(/would skip it/);
     v.wipe();
   });
 });
