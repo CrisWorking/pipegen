@@ -1085,7 +1085,7 @@ describe('E2 fix round 1 (review-E2)', () => {
       ['no ref', `jobs:\n  p:\n    uses: ${OWNER}/pipelines/.github/workflows/shop--merge.yml\n`],
       ['another owner', `${caller}  o:\n    uses: Other/pipelines/.github/workflows/shop--merge.yml@${SHA}\n`],
       ['a file the commit lacks', `jobs:\n  p:\n    uses: ${OWNER}/pipelines/.github/workflows/nope.yml@${SHA}\n`],
-      ['uses not text', `jobs:\n  p:\n    uses: [a]\n`],
+      ['uses not text (beside a good caller)', `${caller}  p2:\n    uses: [a]\n`],
       ['not YAML', `jobs: [\n`],
       ['no caller at all', `jobs:\n  p:\n    uses: ./.github/workflows/pipegen-merge.yml\n`],
     ];
@@ -1104,6 +1104,11 @@ describe('E2 fix round 1 (review-E2)', () => {
     const total = ['.github/workflows/pipegen--sign.yml', 'records/other.json', 'run.sh'].reduce((n, p) => n + gitBuf(f.pipelinesGit, 'cat-file', 'blob', `main:${p}`).length, 0);
     await expect(pushProofSetup(input(f), { ...deps(f).d, centralLimits: { bytes: total - 1 } })).rejects.toThrow(new RegExp(`more than ${total - 1} bytes`));
     expect(f.events).toEqual([]);
+    // sizes GitHub gives stop it before any blob is read
+    const h = await fixture();
+    await expect(pushProofSetup(input(h), { ...deps(h).d, centralLimits: { bytes: total - 1 } })).rejects.toThrow(new RegExp(`more than ${total - 1} bytes`));
+    expect(h.calls.filter((c) => c.url.pathname.includes('/git/blobs/'))).toEqual([]);
+    await h.close();
     const g = await fixture({ noSizes: true });
     const r = await pushProofSetup(input(g), { ...deps(g).d, centralLimits: { bytes: total } });
     expect(r.centralSha).toMatch(/^[0-9a-f]{40}$/);
