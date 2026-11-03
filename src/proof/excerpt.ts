@@ -6,9 +6,10 @@
 //   1. the GitHub timestamp prefix (and a leading BOM) is taken off each line;
 //   2. whole ANSI CSI and OSC sequences are removed;
 //   3. a line that still holds ESC or a C1 control is dropped (with a vault, fullScrub would show the whole excerpt as one [REDACTED]),
-//      and so are the armor-shaped lines right after it (a private key body). A dropped line stays in place, tagged, through the
-//      whole-log scrub and redact below and goes only after them, so redact still sees a BEGIN line or a `password:` line that held
-//      an ESC (security scan finding 1);
+//      and so is what may be a private key body after it: up to the next END marker when the dropped line names a private key, else
+//      while the lines look like armor (base64, armor headers, blank lines). A dropped line has its escape sequences removed whole and
+//      stays in place, tagged, through the whole-log scrub and redact below, going only after them, so redact still sees a BEGIN line
+//      or a `password:` line that held an escape (security scan findings);
 //   4. the error lines and EXCERPT_CONTEXT_LINES around each are picked, at most EXCERPT_MAX_LINES lines and EXCERPT_MAX_BYTES;
 //   5. Plan A redact;
 //   6. the composed scrubber (the caller's: vault.scrubber() then knownValueScrubber over the placeholders and the throwaway scratch
@@ -102,10 +103,19 @@ function endsInsideKey(text: string): boolean {
   return false;
 }
 
-// A line of a private key body as PEM or PGP armor writes it: base64 (64 columns; the last line shorter, maybe with padding), or one of
-// its headers. Anchored, one class per run: linear.
-const ARMOR = /^[ \t]*(?:[A-Za-z0-9+/]{16,}={0,2}|[A-Za-z0-9+/]+={1,2}|(?:Proc-Type|DEK-Info|Version|Comment|Hash):.*)[ \t]*$/;
+// A line of a private key body as PEM or PGP armor writes it: base64 (64 columns; the last line shorter, maybe with padding), one of its
+// headers, or a blank line (between the headers and the body, or anywhere in a pasted key). Anchored, one class per run: linear.
+const ARMOR = /^[ \t]*(?:[A-Za-z0-9+/]{16,}={0,2}|[A-Za-z0-9+/]+={1,2}|(?:Proc-Type|DEK-Info|Version|Comment|Hash|Charset|MessageID):.*|)[ \t]*$/;
 const isArmor = (line: string) => bytesOf(line) > MAX_REGEX_LINE_BYTES || ARMOR.test(line) || lastKeyMarker(line, 'END') >= 0;
+
+// A dropped line's escape sequences, removed whole (follow-up scan finding): OSC (ESC ] or C1 OSC, ended by BEL, ST or ESC \), CSI (ESC [
+// or C1 CSI), any other ESC sequence (intermediates and one final byte), then any ESC or C1 left. So the parameter and final bytes of
+// `\u009b31m` don't stay inside a key marker. The classes are disjoint per run: linear.
+const DROPPED_OSC = /(?:\u001b\]|\u009d)[^\u0007\u001b\u009c]*(?:\u0007|\u009c|\u001b\\)/g;
+const DROPPED_CSI = /(?:\u001b\[|\u009b)[\u0030-\u003f]*[\u0020-\u002f]*[\u0040-\u007e]?/g;
+const DROPPED_ESC = /\u001b[\u0020-\u002f]*[\u0030-\u007e]?/g;
+const withoutSequences = (line: string) => line.replace(DROPPED_OSC, '').replace(DROPPED_CSI, '').replace(DROPPED_ESC, '').replace(/[\u001b\u0080-\u009f]/g, '');
+const NAMES_KEY = /private[ _-]?key/i;
 
 /**
  * Step 4: the error windows (or the end of the log), in line order, with a marker for every gap between two of them. A window that
@@ -207,25 +217,45 @@ export async function errorExcerpt(logs: string, scrub: (text: string) => string
     guard = HEAD_GUARD_LINES;
     cut = true;
   }
-  // steps 1-3. A dropped line is kept in place for now, with ESC and C1 taken out and a random tag after its indentation and at its end
-  // (so redact's indent and key rules still see it, and every piece of it redact keeps carries a tag); it goes after the whole-log pass.
+  // steps 1-3. A dropped line is kept in place for now, with its escape sequences removed whole and a random tag after its indentation
+  // and at its end (so redact's indent and key rules still see it, and every piece of it redact keeps carries a tag); it goes after the
+  // whole-log pass. Lines that may be a private key body are hidden the same way:
+  // - up to the next END marker line, after a cut inside a key block or after a dropped line that names a private key (fail closed: its
+  //   marker may be unreadable);
+  // - with no END marker ahead, or after any other dropped line, while the lines look like armor (base64, armor headers, blank lines).
   const tag = `\u0000pipegen-dropped-${randomBytes(8).toString('hex')}\u0000`;
-  const rawLines = text.split('\n');
-  // a cut inside a key block: hidden up to its END line, or (no END in the tail) while the lines look like armor
+  const lines0 = text.split('\n').map((raw) => {
+    const c = cleanLine(raw);
+    return c.drop ? { line: withoutSequences(c.line), drop: true } : c;
+  });
+  const nextEnd = new Int32Array(lines0.length);
+  for (let i = lines0.length - 1, next = -1; i >= 0; i--) {
+    if (lastKeyMarker((lines0[i] as { line: string }).line, 'END') >= 0) next = i;
+    nextEnd[i] = next;
+  }
   let hideTo = -1;
-  if (insideKey) hideTo = rawLines.findIndex((l) => lastKeyMarker(l, 'END') >= 0);
-  let armor = cut && hideTo < 0;
-  const cleaned = rawLines.map((raw, i) => {
-    const { line, drop } = cleanLine(raw);
+  let armor = false;
+  const startKeyHide = (from: number) => {
+    const end = from < lines0.length ? (nextEnd[from] as number) : -1;
+    if (end >= 0) hideTo = Math.max(hideTo, end);
+    else armor = true;
+  };
+  if (cut) {
+    if (insideKey) startKeyHide(0);
+    else armor = true;
+  }
+  const cleaned = lines0.map(({ line, drop }, i) => {
     let hidden = drop || i <= hideTo;
-    if (drop) armor = true;
-    else if (armor && i > hideTo) {
+    if (drop && i >= hideTo) {
+      if (NAMES_KEY.test(line) && lastKeyMarker(line, 'END') < 0) startKeyHide(i + 1);
+      else armor = true;
+    } else if (armor && i > hideTo) {
       if (isArmor(line)) hidden = true;
       if (!isArmor(line) || lastKeyMarker(line, 'END') >= 0) armor = false;
     }
     if (!hidden) return line;
     const indent = /^[ \t]*/.exec(line)?.[0] ?? '';
-    return `${indent}${tag}${line.slice(indent.length).replace(/[\u001b\u0080-\u009f]/g, '')}${tag}`;
+    return `${indent}${tag}${line.slice(indent.length)}${tag}`;
   });
   // scrub before cutting: the whole cleaned log, before any line is picked (merged lines only lower the count, so the guard still covers);
   // then every line that still carries the tag goes

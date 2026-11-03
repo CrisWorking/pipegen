@@ -215,6 +215,44 @@ describe('errorExcerpt: scrub before cutting (E0a)', () => {
     v.wipe();
   });
 
+  it('excerpt: a dropped BEGIN line split by an escape sequence still hides the key up to its END (whole sequences removed first)', async () => {
+    const v = vault();
+    const begin = fake.keyBegin();
+    const at = begin.indexOf(' ') + 1;
+    const body = Array.from({ length: 6 }, (_, i) => `${fake.keyBody()}${i}`);
+    for (const split of [`\u009b31m`, `${ESC}(B`, `\u009b1;31m`, `${ESC}#8`]) {
+      const first = `${begin.slice(0, at)}${split}${begin.slice(at)}`;
+      // the body quoted, so it is not armor-shaped: only the marker can tell it is a key
+      const log = [`${TS}${first}`, ...body.map((b) => `${TS}> ${b}`), `${TS}${fake.keyEnd()}`, `${TS}Error: key rejected`].join('\n');
+      const out = await errorExcerpt(log, composed(v), clean());
+      expect(out, JSON.stringify(split)).toContain('Error: key rejected');
+      for (const b of body) expect(out, JSON.stringify(split)).not.toContain(b);
+    }
+    // fail closed: a dropped line that names a private key, in any case, starts a hidden block up to the END
+    const named = [`${TS}${ESC}(Bloading private key:`, ...body.map((b) => `${TS}| ${b}`), `${TS}${fake.keyEnd()}`, `${TS}Error: done`].join('\n');
+    const namedOut = await errorExcerpt(named, composed(v), clean());
+    expect(namedOut).toContain('Error: done');
+    for (const b of body) expect(namedOut).not.toContain(b);
+    v.wipe();
+  });
+
+  it('excerpt: an armor body with headers and blank lines stays hidden until its END (or the first non-armor line)', async () => {
+    const v = vault();
+    const body = Array.from({ length: 6 }, (_, i) => `${fake.keyBody()}${i}`);
+    const armored = ['Proc-Type: 4,ENCRYPTED', 'DEK-Info: AES-128-CBC,0123456789ABCDEF', '', body[0], '', ...body.slice(1, 4), '   ', ...body.slice(4)];
+    // a dropped line that names a key, and no END anywhere: armor mode (an intact BEGIN with no END is redact's: it hides the rest)
+    const noEnd = [`${TS}${ESC}(BWriting new Private Key to stdout`, ...armored.map((l) => `${TS}${l}`), `${TS}Error: key rejected`].join('\n');
+    const out = await errorExcerpt(noEnd, composed(v), clean());
+    expect(out).toContain('Error: key rejected');
+    for (const b of body) expect(out).not.toContain(b);
+    // a cut inside a key block with no END in the tail: the same
+    const kept = [...armored, 'Error: key rejected'].join('\n');
+    const log = ['ok start', fake.keyBegin(), ...body, ...armored, 'Error: key rejected', 'f'.repeat(MAX_LOG_CHARS - kept.length - 2)].join('\n');
+    const cutOut = await errorExcerpt(log, composed(v), clean());
+    for (const b of body) expect(cutOut).not.toContain(b);
+    v.wipe();
+  });
+
   it('excerpt: a cut inside a 200-line key block hides the block up to its END, whatever the head guard', async () => {
     const v = vault();
     const body = Array.from({ length: 200 }, (_, i) => `${fake.keyBody()}${String(i).padStart(3, '0')}`);
