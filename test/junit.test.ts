@@ -133,7 +133,7 @@ describe('junit', () => {
     expect(parseJunit(fixture(VITEST))).toHaveLength(5);
   });
 
-  it('junit: counts on a testsuite that contradict what was parsed are refused (review I2)', () => {
+  it('junit: counts that claim more than was parsed are refused (review I2, round 2)', () => {
     const t = '<testcase classname="a.test.ts" name="n"/>';
     const f = '<testcase classname="a.test.ts" name="f"><failure/></testcase>';
     const sk = '<testcase classname="a.test.ts" name="s"><skipped/></testcase>';
@@ -143,9 +143,7 @@ describe('junit', () => {
       `<testsuites tests="3"><testsuite name="x">text only</testsuite></testsuites>`,
       `<testsuites tests="2"><testsuite>${t}</testsuite></testsuites>`,
       `<testsuite tests="1" failures="1">${t}</testsuite>`,
-      `<testsuite tests="2" skipped="0">${t}${sk}</testsuite>`,
       `<testsuite tests="2" errors="1">${t}${t.replace('"n"', '"m"')}</testsuite>`,
-      `<testsuite tests="1" failures="0" errors="0">${f}</testsuite>`,
       `<testsuite tests="two">${t}</testsuite>`,
       `<testsuite tests="-1">${t}</testsuite>`,
       `<testsuites tests="1"><testsuite tests="1"><j:testcase classname="a.test.ts" name="n"/></testsuite></testsuites>`, // namespaced tag
@@ -157,6 +155,22 @@ describe('junit', () => {
     expect(() => parseJunit(`<testsuite tests="two">${t}</testsuite>`)).toThrow(/not a number/);
     expect(() => parseJunit(`<testsuite tests="-1">${t}</testsuite>`)).toThrow(/not a number/);
     expect(() => parseJunit(`<testsuite failures="1.5">${f}</testsuite>`)).toThrow(/not a number/);
+    // fewer claimed than parsed is accepted (jest-junit leaves test.todo and hook failures out of its counts), and never reads as a pass
+    const fewer = [
+      `<testsuite tests="2" skipped="0">${t}${sk}</testsuite>`,
+      `<testsuite tests="1" failures="0" errors="0">${f}</testsuite>`,
+      `<testsuite tests="1">${t}${f}</testsuite>`,
+      `<testsuite skipped="0" tests="2">${t}${sk}</testsuite>`,
+    ];
+    for (const xml of fewer.slice(0, 3)) {
+      const run = parseJunit(xml);
+      expect(run.length, xml).toBeGreaterThan(0);
+      expect(run.some((c) => c.status !== 'pass'), xml).toBe(true);
+      expect(sameResults(run, run).ok, xml).toBe(false);
+    }
+    expect(parseJunit(fewer[3]!)).toHaveLength(2);
+    // a case with both skipped and failure is in both counts, so a suite that says so is consistent
+    expect(parseJunit(`<testsuite tests="1" skipped="1" failures="1"><testcase classname="a.test.ts" name="b"><skipped/><failure/></testcase></testsuite>`)).toEqual([r('a.test > b', 'fail')]);
     const ok = [
       `<testsuites tests="3" failures="1" errors="0" skipped="1"><testsuite tests="3" failures="1" skipped="1">${t}${f}${sk}</testsuite></testsuites>`,
       `<testsuite tests="2" failures="0" errors="1">${t}<testcase classname="a.test.ts" name="e"><error/></testcase></testsuite>`,
@@ -168,6 +182,52 @@ describe('junit', () => {
     expect(parseJunit(fixture(VITEST))).toHaveLength(5);
     expect(parseJunit(fixture(JEST))).toHaveLength(5);
     expect(parseJunit(fixture(JEST_DEFAULT))).toHaveLength(5);
+  });
+
+  it('junit: a real jest-junit report with a test.todo and an afterAll failure parses (review R1)', () => {
+    const xml = fixture('jest-junit-17.0.0-todo-and-hook-error.xml');
+    expect(xml).toContain('tests="4"'); // jest-junit counts four; it writes six cases
+    const run = parseJunit(xml);
+    expect(run).toEqual([
+      r('cart.test > cart > adds'),
+      r('cart.test > cart > fails on purpose', 'fail'),
+      r('cart.test > cart > is skipped', 'skip'),
+      r('cart.test > cart > handles coupons'), // jest-junit writes a todo as a plain case
+      r('cart.test > cart > nested > removes'),
+      r("cart.test > test execution failure: could be caused by test hooks like 'afterall'.", 'fail'),
+    ]);
+    expect(sameResults(run, run).ok).toBe(false); // it has a failure
+  });
+
+  it('junit: the caps do not count inside CDATA sections or comments (review m1)', () => {
+    // a jest report that logs a lot of HTML: 3 MB of tags, and 2 MB of quoted attributes, in CDATA sections
+    const html = '<ul><li>y</li></ul>'.repeat(160_000);
+    expect(html.match(/</g)!.length).toBeGreaterThan(MAX_JUNIT_TAGS);
+    const attrs = `<i a='1' b="2" c='3'/>`.repeat(100_000);
+    expect(attrs.match(/=\s*["']/g)!.length).toBeGreaterThan(MAX_JUNIT_ATTRIBUTES);
+    const out = (body: string): string => `<testsuites tests="1"><testsuite tests="1"><testcase classname="a.test.ts" name="x"><system-out><![CDATA[${body}]]></system-out></testcase></testsuite></testsuites>`;
+    expect(parseJunit(out(html))).toEqual([r('a.test > x')]);
+    expect(parseJunit(out(attrs))).toEqual([r('a.test > x')]);
+    expect(parseJunit(`<testsuites><testsuite><testcase classname="a.test.ts" name="x"/><!--${html}${attrs}--></testsuite></testsuites>`)).toEqual([r('a.test > x')]);
+    // two sections in a row, and the text after them is still counted
+    const two = `<testsuites><testsuite><testcase classname="a.test.ts" name="x"><system-out><![CDATA[${html}]]><![CDATA[${attrs}]]>${'<b/>'.repeat(MAX_JUNIT_TAGS)}</system-out></testcase></testsuite></testsuites>`;
+    expect(() => parseJunit(two)).toThrow(/tags/);
+    // many tiny comments or sections are counted one tag each, so they cannot flood the parser
+    expect(() => parseJunit(`<testsuites>${'<!---->'.repeat(MAX_JUNIT_TAGS + 1)}</testsuites>`)).toThrow(/tags/);
+    expect(() => parseJunit(`<testsuites>${'<![CDATA[]]>'.repeat(MAX_JUNIT_TAGS + 1)}</testsuites>`)).toThrow(/tags/);
+    // the text in front of the first section is counted too, and a comment start inside CDATA does not end the skipping
+    expect(() => parseJunit(`<testsuites>${'<b/>'.repeat(MAX_JUNIT_TAGS)}<!----></testsuites>`)).toThrow(/tags/);
+    expect(parseJunit(out(`<!--${html}`))).toEqual([r('a.test > x')]);
+    expect(parseJunit(`<testsuites><testsuite><testcase classname="a.test.ts" name="x"/><!-- <![CDATA[ ${html} --></testsuite></testsuites>`)).toEqual([r('a.test > x')]);
+    expect(() => parseJunit(`<testsuites><![CDATA[<!--]]>${'<b/>'.repeat(MAX_JUNIT_TAGS)}</testsuites>`)).toThrow(/tags/);
+    // an unclosed section runs to the end of the text and is not counted; the validator refuses it
+    expect(() => parseJunit(`<testsuites><![CDATA[${'<a/>'.repeat(MAX_JUNIT_TAGS)}`)).toThrow(/not well-formed/);
+  });
+
+  it('junit: the cap values are pinned and shown in the messages (review m1)', () => {
+    expect([MAX_JUNIT_TAGS, MAX_JUNIT_ATTRIBUTES]).toEqual([600_000, 250_000]);
+    expect(messageOf(() => parseJunit(`<testsuites>${'<'.repeat(600_001)}</testsuites>`))).toContain('600,000 tags');
+    expect(messageOf(() => parseJunit(`<testsuites>${'a="" '.repeat(250_001)}</testsuites>`))).toContain('250,000 attributes');
   });
 
   it('junit: reports that parse to nothing never give a pass (review I2)', () => {
@@ -193,8 +253,8 @@ describe('junit', () => {
     // the cap counts attribute-shaped text (name="..."), with spaces around the = too
     expect(parseJunit(doc(MAX_JUNIT_ATTRIBUTES - 3))).toHaveLength(1); // 3 more in the frame
     expect(() => parseJunit(doc(MAX_JUNIT_ATTRIBUTES - 2))).toThrow(/attributes/);
-    expect(() => parseJunit(`<testsuites><!--${"a = '' ".repeat(MAX_JUNIT_ATTRIBUTES + 1)}--></testsuites>`)).toThrow(/attributes/);
-    expect(() => parseJunit(`<testsuites><!--${'a = "" '.repeat(MAX_JUNIT_ATTRIBUTES + 1)}--></testsuites>`)).toThrow(/attributes/);
+    expect(() => parseJunit(`<testsuites>${"a = '' ".repeat(MAX_JUNIT_ATTRIBUTES + 1)}</testsuites>`)).toThrow(/attributes/);
+    expect(() => parseJunit(`<testsuites>${'a = "" '.repeat(MAX_JUNIT_ATTRIBUTES + 1)}</testsuites>`)).toThrow(/attributes/);
     const t = performance.now();
     expect(() => parseJunit(doc(MAX_JUNIT_ATTRIBUTES - 10))).not.toThrow();
     expect(performance.now() - t).toBeLessThan(10_000); // measured about 1.5 s here; the margin is for slow CI machines

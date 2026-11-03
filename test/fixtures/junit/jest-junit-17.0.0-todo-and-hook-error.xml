@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<testsuites name="jest tests" tests="4" failures="1" errors="0" time="0.339">
+  <testsuite name="cart" errors="0" failures="1" skipped="1" timestamp="2026-11-03T00:26:57" time="0.217" tests="4">
+    <testcase classname="cart" name="adds" time="0.002" file="test/cart.test.js">
+    </testcase>
+    <testcase classname="cart" name="fails on purpose" time="0.002" file="test/cart.test.js">
+      <failure>Error: expect(received).toBe(expected) // Object.is equality
+
+Expected: 3
+Received: 2
+      </failure>
+    </testcase>
+    <testcase classname="cart" name="is skipped" time="0" file="test/cart.test.js">
+      <skipped/>
+    </testcase>
+    <testcase classname="cart" name="handles coupons" time="0" file="test/cart.test.js">
+    </testcase>
+    <testcase classname="cart &gt; nested" name="removes" time="0" file="test/cart.test.js">
+    </testcase>
+    <testcase classname="" name="Test execution failure: could be caused by test hooks like &apos;afterAll&apos;." time="0" file="test/cart.test.js">
+      <failure>{&quot;message&quot;:&quot;&quot;,&quot;stack&quot;:&quot;Error: afterAll hook boom\n    at (paths removed)&quot;}</failure>
+    </testcase>
+  </testsuite>
+</testsuites>

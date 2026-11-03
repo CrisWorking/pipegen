@@ -9,9 +9,10 @@
 //     `<!ENTITY` are refused even inside a comment or CDATA; the parser also runs with processEntities: false, so no
 //     entity is ever expanded. The five XML entities and number references in names are decoded here, in one pass.
 //   - XMLValidator.validate runs first: a truncated, mismatched or spoofed report (an element named like `@_name`) is refused.
-//   - counts a testsuite carries (tests, failures, errors, skipped) must equal what was parsed under it, so a report whose cases
+//   - counts a testsuite carries (tests, failures + errors, skipped) must not be higher than what was parsed under it, so a report whose cases
 //     were not recognised (another tag name, a namespace) is refused instead of reading as an empty pass.
-//   - at most 600,000 `<` characters and 250,000 attribute-shaped texts (the parser's time is linear in them: about 1.6 s at the cap).
+//   - at most 600,000 `<` characters and 250,000 attribute-shaped texts outside comments and CDATA (the parser's time is linear in them: about 1.6 s at the cap; the slowest accepted shapes, one huge attribute
+//     value or name, cost the validator about 2 s and 700 MB, and 3 s in all at 16 MiB).
 //   - at most 16 MiB (UTF-8 bytes) and 50,000 test cases. The cases are counted in the text before a tree is built, and again
 //     while walking.
 //   - names are data: anything keyed by a test id is a Map; an element named __proto__, constructor or prototype is refused
@@ -42,8 +43,12 @@ const MAX_SUITE_DEPTH = 64;
 const FORBIDDEN = /<!\s*(?:doctype|entity)/i;
 /** `<!` that starts anything but a comment or a CDATA section. */
 const DECLARATION = /<!(?!--|\[CDATA\[)/;
+/** Attribute-shaped texts outside comments and CDATA. Real vitest writes 3 per case and 2 more per failure (50,000 cases at 10% failing: 160,000). */
 export const MAX_JUNIT_ATTRIBUTES = 250_000;
-/** `<` characters in the whole text (tags, comments, CDATA starts and stray ones). 50,000 cases with a failure and output need about 400,000. */
+/**
+ * `<` characters outside comments and CDATA (each of those counts one). Real vitest 5.0.5 needs about 3 per passing case and 6 per
+ * failing case with output (50,000 cases: 125,000 to 215,000 here), and the 16 MiB size cap binds first.
+ */
 export const MAX_JUNIT_TAGS = 600_000;
 const ATTRIBUTE_LIKE = /=\s*["']/g;
 const FILE_LIKE = /\.[cm]?[jt]sx?$/i;
@@ -72,17 +77,33 @@ function countCaseTags(xml: string): number {
   return n;
 }
 
-function tagsOverCap(xml: string): boolean {
-  let n = 0;
-  for (let at = xml.indexOf('<'); at !== -1; at = xml.indexOf('<', at + 1)) if (++n > MAX_JUNIT_TAGS) return true;
-  return false;
-}
+const PROTECTED_START = /<!--|<!\[CDATA\[/g;
 
-/** Counts attribute-shaped text (`=` and a quote), stopping above the cap. */
-function attributesOverCap(xml: string): boolean {
-  let n = 0;
-  for (const _ of xml.matchAll(ATTRIBUTE_LIKE)) if (++n > MAX_JUNIT_ATTRIBUTES) return true;
-  return false;
+/**
+ * Which cap the text is over, if any. Comments and CDATA sections are skipped: the parser reads their body in time linear in its
+ * bytes (the 16 MiB cap bounds that), whatever `<` or quotes it holds, and a jest report with console output can hold much HTML. Each
+ * section still counts as one tag, so a flood of tiny ones can't pass. An unclosed one runs to the end (the validator refuses it).
+ */
+function capsExceeded(xml: string): 'tags' | 'attributes' | null {
+  let tags = 0;
+  let attributes = 0;
+  const count = (text: string): 'tags' | 'attributes' | null => {
+    for (let at = text.indexOf('<'); at !== -1; at = text.indexOf('<', at + 1)) if (++tags > MAX_JUNIT_TAGS) return 'tags';
+    for (const _ of text.matchAll(ATTRIBUTE_LIKE)) if (++attributes > MAX_JUNIT_ATTRIBUTES) return 'attributes';
+    return null;
+  };
+  let from = 0;
+  PROTECTED_START.lastIndex = 0;
+  for (let m = PROTECTED_START.exec(xml); m !== null; m = PROTECTED_START.exec(xml)) {
+    const over = count(xml.slice(from, m.index));
+    if (over) return over;
+    if (++tags > MAX_JUNIT_TAGS) return 'tags';
+    const close = xml.indexOf(m[0] === '<!--' ? '-->' : ']]>', m.index + m[0].length);
+    if (close === -1) return null;
+    from = close + 3;
+    PROTECTED_START.lastIndex = from;
+  }
+  return count(xml.slice(from));
 }
 
 const ENTITY = /&(?:#x([0-9a-fA-F]+)|#([0-9]+)|(amp|lt|gt|quot|apos));/g;
@@ -144,8 +165,9 @@ export function parseJunit(xml: string): TestCaseResult[] {
   if (Buffer.byteLength(xml, 'utf8') > MAX_JUNIT_BYTES) throw new Error('The JUnit report is over 16 MiB; pipegen won\'t read it.');
   if (FORBIDDEN.test(xml) || DECLARATION.test(xml)) throw new Error('The JUnit report has a DOCTYPE, ENTITY or other markup declaration; pipegen refuses it (entity expansion).');
   if (countCaseTags(xml) > MAX_JUNIT_CASES) throw new Error('The JUnit report has more than 50,000 test cases; pipegen won\'t read it.');
-  if (tagsOverCap(xml)) throw new Error('The JUnit report has more than 600,000 tags; pipegen won\'t read it.');
-  if (attributesOverCap(xml)) throw new Error('The JUnit report has more than 250,000 attributes; pipegen won\'t read it.');
+  const over = capsExceeded(xml);
+  if (over === 'tags') throw new Error(`The JUnit report has more than ${MAX_JUNIT_TAGS.toLocaleString('en-US')} tags; pipegen won't read it.`);
+  if (over === 'attributes') throw new Error(`The JUnit report has more than ${MAX_JUNIT_ATTRIBUTES.toLocaleString('en-US')} attributes; pipegen won't read it.`);
   const valid = XMLValidator.validate(xml);
   if (valid !== true) { // the validator's message carries XML text, so only the line number (a number) is kept
     const line = typeof valid.err?.line === 'number' ? ` (near line ${valid.err.line})` : '';
@@ -184,7 +206,7 @@ export function parseJunit(xml: string): TestCaseResult[] {
       for (let t: Tally | null = tally; t; t = t.parent) {
         t.tests++;
         if (status === 'fail') t.fails++;
-        if (status === 'skip') t.skips++;
+        if (Object.hasOwn(tc, 'skipped')) t.skips++;
       }
     }
   }
@@ -195,7 +217,12 @@ export function parseJunit(xml: string): TestCaseResult[] {
 interface Tally { tests: number; fails: number; skips: number; parent: Tally | null }
 interface Frame { node: unknown; depth: number; parent: Tally | null }
 
-/** The counts a suite carries must equal what was parsed under it (nested suites included). A report that fails this was misread or edited. */
+/**
+ * A suite must not claim more tests, skips or failures than were parsed under it (nested suites included): that is a report whose cases
+ * were not recognised, or one that was cut or edited. Claiming FEWER is accepted: jest-junit writes test.todo cases and afterAll hook
+ * failures as cases and leaves them out of its counts. More cases parsed than claimed can't make a run ok (an extra fail or skip only
+ * makes it less ok).
+ */
 function checkCounts(node: Node, tally: Tally): void {
   const declared = (name: string): number | undefined => {
     const raw = own(node, `@_${name}`);
@@ -210,11 +237,11 @@ function checkCounts(node: Node, tally: Tally): void {
   const bad = (what: string, said: number, found: number): never => {
     throw new Error(`The JUnit report's ${what} count (${said}) does not match the test cases pipegen read (${found}).`);
   };
-  if (tests !== undefined && tests !== tally.tests) bad('tests', tests, tally.tests);
-  if (skipped !== undefined && skipped !== tally.skips) bad('skipped', skipped, tally.skips);
+  if (tests !== undefined && tests > tally.tests) bad('tests', tests, tally.tests);
+  if (skipped !== undefined && skipped > tally.skips) bad('skipped', skipped, tally.skips);
   if (failures !== undefined || errors !== undefined) {
     const said = (failures ?? 0) + (errors ?? 0);
-    if (said !== tally.fails) bad('failures and errors', said, tally.fails);
+    if (said > tally.fails) bad('failures and errors', said, tally.fails);
   }
 }
 
