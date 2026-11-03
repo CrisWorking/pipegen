@@ -1,16 +1,16 @@
-// Plan E E0c (rulings B6 and S4; DECISIONS #111): the git transport. Pushes go to local bare repos behind a loopback
-// smart-HTTP server (test/helpers/git-http.ts) through pushToLoopbackForTests, which is gitPush with only the remote
-// swapped; nothing touches the network. The github.com URL rule is tested on checkPushUrl directly. A `git` wrapper
-// first on PATH (test/helpers/git-recorder.ts) records every call's argv and environment.
+// Plan E E0c (rulings B6 and S4; DECISIONS #111): the git transport. Every push is the real gitPush to a github.com URL.
+// A `git` wrapper first on PATH (test/helpers/git-recorder.ts) records each call's argv, environment and working dir as
+// pipegen started it, then either refuses (exit 97: nothing reaches github.com) or, when a test routes it, swaps the
+// github.com URL for a loopback smart-HTTP server (test/helpers/git-http.ts) serving local bare repos, and maps git's
+// 127.0.0.1 prompts back to the github.com ones for pipegen's own askpass script. Nothing touches the network.
 import { execFileSync } from 'node:child_process';
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync, chmodSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterAll, afterEach, beforeEach, describe, expect, it } from 'vitest';
 import {
-  checkPushUrl, createPushRepo, gitEnv, gitPush, GitTransportError, HARDENED_CONFIG, isDirty, pushToLoopbackForTests, pushUrl, runGit,
-  shownGitOutput,
-  type PushRequest,
+  checkPushUrl, createPushRepo, gitEnv, gitPush, GitTransportError, HARDENED_CONFIG, isDirty, pushUrl, runGit, shownGitOutput,
+  type PushRepoHandle, type PushRequest,
 } from '../src/proof/git.js';
 import { runExitHooks } from '../src/util/exit-hooks.js';
 import { startGitHttp, type GitHttpServer } from './helpers/git-http.js';
@@ -49,14 +49,23 @@ async function serve(srv: string, opts: Parameters<typeof startGitHttp>[1] = {})
   servers.push(s);
   return s;
 }
+interface Made { handle: PushRepoHandle; gitDir: string; sha: string; remove: () => Promise<void> }
 /** A push repo holding one commit with hello.txt. */
-async function pushRepoWithCommit(): Promise<{ gitDir: string; sha: string; remove: () => Promise<void> }> {
-  const repo = await createPushRepo();
-  const blob = text(await runGit(repo.gitDir, ['hash-object', '-w', '--stdin'], { input: 'hello\n' }));
-  const tree = text(await runGit(repo.gitDir, ['mktree'], { input: `100644 blob ${blob}\thello.txt\n` }));
-  const sha = text(await runGit(repo.gitDir, ['commit-tree', tree, '-m', 'base'], { identity: { name: 'pipegen', email: 'pipegen@example.invalid' } }));
-  return { ...repo, sha };
+async function pushRepoWithCommit(): Promise<Made> {
+  const handle = await createPushRepo();
+  const blob = text(await runGit(handle, ['hash-object', '-w', '--stdin'], { input: 'hello\n' }));
+  const tree = text(await runGit(handle, ['mktree'], { input: `100644 blob ${blob}\thello.txt\n` }));
+  const sha = text(await runGit(handle, ['commit-tree', tree, '-m', 'base'], { identity: { name: 'pipegen', email: 'pipegen@example.invalid' } }));
+  return { handle, gitDir: handle.gitDir, sha, remove: handle.remove };
 }
+const SCRATCH_URL = 'https://github.com/acme/pipegen-proof-shop.git';
+/** A scratch push of `m`'s commit to main, changed by `extra`. */
+const req = (m: Made, extra: Partial<PushRequest> = {}): PushRequest => ({ repo: m.handle, url: SCRATCH_URL, owner: 'acme', appRepo: 'shop', ...cred(token), refs: [{ sha: m.sha, branch: 'main' }], ...extra });
+/** gitPush with the recorder routing github.com to the loopback server on `port`. */
+const routedPush = (port: number, r: PushRequest) => {
+  recorder.route(port);
+  return gitPush(r);
+};
 const leftovers = () => readdirSync(tmp);
 
 beforeEach(() => {
@@ -92,7 +101,7 @@ describe('git transport (E0c, B6)', () => {
     const srv = serverRoot();
     const s = await serve(srv, { token });
     const repo = await pushRepoWithCommit();
-    await pushToLoopbackForTests({ gitDir: repo.gitDir, port: s.port, repoPath: 'app.git', token, refs: [{ sha: repo.sha, branch: 'main' }] });
+    await routedPush(s.port, req(repo));
     await repo.remove();
     expect(git(join(srv, 'app.git'), 'rev-parse', 'refs/heads/main')).toBe(repo.sha);
 
@@ -101,9 +110,9 @@ describe('git transport (E0c, B6)', () => {
     const base = ['PATH', 'HOME', 'LANG', 'GIT_TERMINAL_PROMPT', 'GCM_INTERACTIVE', 'GIT_CONFIG_NOSYSTEM', 'GIT_CONFIG_GLOBAL'];
     for (const c of calls) {
       const isPush = c.argv.includes('push');
-      const isRead = c.argv.includes('status');
+      const isRead = c.argv.includes('-C');
       const isCommit = c.argv.includes('commit-tree');
-      const extra = isPush ? ASKPASS_VARS : isRead ? ['GIT_CEILING_DIRECTORIES']
+      const extra = isPush ? ASKPASS_VARS : isRead ? ['GIT_CEILING_DIRECTORIES', 'GIT_NO_LAZY_FETCH']
         : isCommit ? ['GIT_AUTHOR_NAME', 'GIT_AUTHOR_EMAIL', 'GIT_COMMITTER_NAME', 'GIT_COMMITTER_EMAIL'] : [];
       expect(Object.keys(c.env).sort(), c.argv.join(' ')).toEqual([...base, ...extra].sort());
       expect(c.env.LANG).toBe('C');
@@ -120,13 +129,13 @@ describe('git transport (E0c, B6)', () => {
     }
     const push = calls.filter((c) => c.argv.includes('push'));
     expect(push).toHaveLength(1);
-    expect(push[0].argv.slice(push[0].argv.indexOf('push'))).toEqual(['push', '--atomic', '--no-verify', '--no-follow-tags', '--recurse-submodules=no', `http://127.0.0.1:${s.port}/app.git`, `${repo.sha}:refs/heads/main`]);
+    expect(push[0].argv.slice(push[0].argv.indexOf('push'))).toEqual(['push', '--atomic', '--no-verify', '--no-follow-tags', '--recurse-submodules=no', SCRATCH_URL, `${repo.sha}:refs/heads/main`]);
     expect(leftovers()).toEqual([]);
 
     // force: the refspecs get a +, and the branch is replaced.
     recorder.clear();
     const other = await pushRepoWithCommit();
-    await pushToLoopbackForTests({ gitDir: other.gitDir, port: s.port, repoPath: 'app.git', token, refs: [{ sha: other.sha, branch: 'main' }, { sha: other.sha, branch: 'proof/x' }], force: true });
+    await routedPush(s.port, req(other, { refs: [{ sha: other.sha, branch: 'main' }, { sha: other.sha, branch: 'proof/x' }], force: true }));
     await other.remove();
     const forced = recorder.calls().find((c) => c.argv.includes('push'))!;
     expect(forced.argv.slice(-2)).toEqual([`+${other.sha}:refs/heads/main`, `+${other.sha}:refs/heads/proof/x`]);
@@ -159,7 +168,7 @@ describe('git transport (E0c, B6)', () => {
       writeFileSync(join(repo.gitDir, 'hooks', h), `#!/bin/sh\necho ${h} >> '${hookMarker}'\n`);
       chmodSync(join(repo.gitDir, 'hooks', h), 0o755);
     }
-    await pushToLoopbackForTests({ gitDir: repo.gitDir, port: s.port, repoPath: 'app.git', token, refs: [{ sha: repo.sha, branch: 'main' }] });
+    await routedPush(s.port, req(repo));
     await repo.remove();
     expect(existsSync(hookMarker)).toBe(false);
     const work = fresh('work');
@@ -180,7 +189,7 @@ describe('git transport (E0c, B6)', () => {
     const srv = serverRoot();
     const s = await serve(srv, { token });
     const repo = await pushRepoWithCommit();
-    await pushToLoopbackForTests({ gitDir: repo.gitDir, port: s.port, repoPath: 'app.git', token, refs: [{ sha: repo.sha, branch: 'main' }] });
+    await routedPush(s.port, req(repo));
     const basic = ['Basic', Buffer.from(['x-access-token', token].join(':')).toString('base64')].join(' ');
     expect(s.requests.map((r) => r.header)).toContain(basic);
     const push = recorder.calls().find((c) => c.argv.includes('push'));
@@ -205,17 +214,17 @@ describe('git transport (E0c, B6)', () => {
         return { out: String((e as { stdout?: unknown }).stdout ?? ''), ok: false };
       }
     };
-    const origin = `http://127.0.0.1:${s.port}`;
-    expect(ask(`Username for '${origin}': `)).toEqual({ out: 'x-access-token\n', ok: true });
-    expect(ask(`Password for 'http://x-access-token@127.0.0.1:${s.port}': `)).toEqual({ out: `${token}\n`, ok: true });
-    const otherPrompts = [`Password for 'https://x-access-token@evil.example': `, `Password for 'http://x-access-token@127.0.0.1:${s.port + 1}': `, `Username for 'https://github.com.evil': `, 'Pass' + 'word: ', ''];
+    expect(ask(`Username for 'https://github.com': `)).toEqual({ out: 'x-access-token\n', ok: true });
+    expect(ask(`Password for 'https://x-access-token@github.com': `)).toEqual({ out: `${token}\n`, ok: true });
+    const otherPrompts = [`Password for 'https://x-access-token@evil.example': `, `Password for 'http://x-access-token@127.0.0.1:${s.port}': `, `Username for 'http://127.0.0.1:${s.port}': `,
+      `Password for 'https://x-access-token@github.com.evil': `, `Username for 'https://github.com.evil': `, `Password for 'https://x-access-token@github.com:443': `, 'Pass' + 'word: ', ''];
     for (const p of otherPrompts) {
       expect(ask(p), p).toEqual({ out: '', ok: false });
     }
 
     // Removed after a failed push too (a wrong token, which the server refuses).
     recorder.clear();
-    await expect(pushToLoopbackForTests({ gitDir: repo.gitDir, port: s.port, repoPath: 'app.git', ...cred(`${token}Wrong`), refs: [{ sha: repo.sha, branch: 'other' }] })).rejects.toThrow(GitTransportError);
+    await expect(routedPush(s.port, req(repo, { ...cred(`${token}Wrong`), refs: [{ sha: repo.sha, branch: 'other' }] }))).rejects.toThrow(GitTransportError);
     const failed = recorder.calls().find((c) => c.argv.includes('push'));
     expect(existsSync(failed!.askpass!.path)).toBe(false);
     await repo.remove();
@@ -282,21 +291,93 @@ describe('git transport (E0c, B6)', () => {
     const repo = await pushRepoWithCommit();
     recorder.clear();
     for (const url of ['https://github.com/acme/shop.git', 'http://127.0.0.1:9/app.git']) {
-      await expect(gitPush({ gitDir: repo.gitDir, url, owner: 'acme', appRepo: 'shop', token, refs: [{ sha: repo.sha, branch: 'main' }] })).rejects.toThrow(GitTransportError);
+      await expect(gitPush(req(repo, { url }))).rejects.toThrow(GitTransportError);
     }
     // Central takes only refs/heads/proof/<runId>.
-    await expect(gitPush({ gitDir: repo.gitDir, url: pushUrl('acme', 'shop', 'central'), owner: 'acme', appRepo: 'shop', token, refs: [{ sha: repo.sha, branch: 'main' }] })).rejects.toThrow(/proof\/<runId>/);
-    await expect(gitPush({ gitDir: repo.gitDir, url: pushUrl('acme', 'shop', 'central'), owner: 'acme', appRepo: 'shop', token, refs: [{ sha: repo.sha, branch: 'proof/20261103-120000-abc123/main' }] })).rejects.toThrow(/proof\/<runId>/);
+    await expect(gitPush(req(repo, { url: pushUrl('acme', 'shop', 'central') }))).rejects.toThrow(/proof\/<runId>/);
+    await expect(gitPush(req(repo, { url: pushUrl('acme', 'shop', 'central'), refs: [{ sha: repo.sha, branch: 'proof/20261103-120000-abc123/main' }] }))).rejects.toThrow(/proof\/<runId>/);
     expect(recorder.calls()).toEqual([]);
     await repo.remove();
     expect(leftovers()).toEqual([]);
   });
 
+  it('git: the production push, offline: exact argv and -c flags, env from scratch, github.com askpass, no token in argv', async () => {
+    // Unrouted, the recorder exits 97 on github.com: this is gitPush's own remote, flags and askpass, as they ship.
+    const repo = await pushRepoWithCommit();
+    const cases = [
+      { url: SCRATCH_URL, branch: 'main', force: true, spec: `+${repo.sha}:refs/heads/main` },
+      { url: 'https://github.com/acme/pipelines.git', branch: 'proof/20261103-120000-abcdef', force: false, spec: `${repo.sha}:refs/heads/proof/20261103-120000-abcdef` },
+    ];
+    for (const c of cases) {
+      recorder.clear();
+      const err = await gitPush(req(repo, { url: c.url, refs: [{ sha: repo.sha, branch: c.branch }], force: c.force })).catch((e: unknown) => e);
+      expect(err).toBeInstanceOf(GitTransportError);
+      expect((err as Error).message).toMatch(/exit 97/);
+      const calls = recorder.calls();
+      expect(calls.map((k) => k.argv)).toEqual([
+        [...HARDENED, `--git-dir=${repo.gitDir}`, 'config', '--list', '--show-scope', '-z'],
+        [...HARDENED, `--git-dir=${repo.gitDir}`, 'push', '--atomic', '--no-verify', '--no-follow-tags', '--recurse-submodules=no', c.url, c.spec],
+      ]);
+      const push = calls[1];
+      expect(Object.keys(push.env).sort()).toEqual(['GCM_INTERACTIVE', 'GIT_ASKPASS', 'GIT_CONFIG_GLOBAL', 'GIT_CONFIG_NOSYSTEM', 'GIT_TERMINAL_PROMPT', 'HOME', 'LANG', 'PATH', 'PIPEGEN_GIT_TOKEN']);
+      expect(push.env).toMatchObject({ LANG: 'C', GIT_TERMINAL_PROMPT: '0', GCM_INTERACTIVE: 'never', GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: '/dev/null' });
+      expect(push.env[ASKPASS_VARS[1]]).toBe(token);
+      expect(push.argv.join('\0')).not.toContain(token);
+      expect(calls[0].env.PIPEGEN_GIT_TOKEN).toBeUndefined();
+      // The askpass script as shipped answers github.com's two prompts and nothing else.
+      const scriptPath = join(fresh('ask'), 'askpass');
+      writeFileSync(scriptPath, push.askpass!.script);
+      chmodSync(scriptPath, 0o700);
+      const ask = (prompt: string) => {
+        try {
+          return execFileSync(scriptPath, [prompt], { encoding: 'utf8', env: { PATH: savedEnv.PATH ?? '', ...Object.fromEntries([[ASKPASS_VARS[1], token]]) } });
+        } catch {
+          return null;
+        }
+      };
+      expect(ask(`Username for 'https://github.com': `)).toBe('x-access-token\n');
+      expect(ask(`Password for 'https://x-access-token@github.com': `)).toBe(`${token}\n`);
+      expect(ask(`Password for 'https://x-access-token@evil.example': `)).toBeNull();
+      expect(push.askpass!.dirMode).toBe('700');
+      expect(existsSync(push.askpass!.path)).toBe(false);
+    }
+    await repo.remove();
+    expect(leftovers()).toEqual([]);
+  });
+
+  it('git: gitPush and runGit take only a live createPushRepo handle', async () => {
+    const repo = await pushRepoWithCommit();
+    recorder.clear();
+    const forged = [
+      { gitDir: repo.gitDir, remove: repo.remove },
+      { ...repo.handle },
+      Object.create(repo.handle) as PushRepoHandle,
+      null,
+      repo.gitDir,
+    ] as unknown as PushRepoHandle[];
+    for (const f of forged) {
+      await expect(gitPush(req(repo, { repo: f })), String(f)).rejects.toThrow(/createPushRepo/);
+      await expect(runGit(f, ['cat-file', '-t', repo.sha]), String(f)).rejects.toThrow(/createPushRepo/);
+    }
+    expect(recorder.calls()).toEqual([]);
+    expect(Object.isFrozen(repo.handle)).toBe(true);
+    await repo.remove();
+    // A removed repo's handle is dead.
+    await expect(gitPush(req(repo))).rejects.toThrow(/createPushRepo/);
+    await expect(runGit(repo.handle, ['cat-file', '-t', repo.sha])).rejects.toThrow(/createPushRepo/);
+    // So is one whose folder the exit hook removed.
+    const other = await createPushRepo();
+    runExitHooks();
+    recorder.clear();
+    await expect(runGit(other, ['rev-parse', 'HEAD'])).rejects.toThrow(/createPushRepo/);
+    expect(recorder.calls()).toEqual([]);
+  });
+
   it('git: refs, token and options are checked before git runs', async () => {
     const repo = await pushRepoWithCommit();
     recorder.clear();
-    const req = { gitDir: repo.gitDir, url: pushUrl('acme', 'shop', 'scratch'), owner: 'acme', appRepo: 'shop', token, refs: [{ sha: repo.sha, branch: 'main' }] };
-    const bad: Array<Partial<typeof req>> = [
+    const base = req(repo);
+    const bad: Array<Partial<PushRequest>> = [
       { refs: [] },
       { refs: [{ sha: 'abc', branch: 'main' }] },
       { refs: [{ sha: 'A'.repeat(40), branch: 'main' }] },
@@ -317,13 +398,12 @@ describe('git transport (E0c, B6)', () => {
       { ...cred('main_branch_name_is_the_token'), refs: [{ sha: SHA, branch: 'main_branch_name_is_the_token' }] },
       { ...cred('acme_x'.repeat(4)), refs: [{ sha: SHA, branch: `x/${'acme_x'.repeat(4)}` }] },
     ];
-    for (const b of bad) await expect(gitPush({ ...req, ...b }), JSON.stringify(b)).rejects.toThrow(GitTransportError);
+    for (const b of bad) await expect(gitPush({ ...base, ...b }), JSON.stringify(b)).rejects.toThrow(GitTransportError);
     // A refused name is shown, but never a GitHub token shape in it (GitTransportError hides every message).
     const shaped = ['gh', 'p_', 'B'.repeat(36)].join('');
-    const named = await gitPush({ ...req, refs: [{ sha: SHA, branch: `${shaped} x` }] }).catch((e: unknown) => e);
+    const named = await gitPush({ ...base, refs: [{ sha: SHA, branch: `${shaped} x` }] }).catch((e: unknown) => e);
     expect((named as Error).message).toContain('***');
     expect((named as Error).message).not.toContain(shaped);
-    await expect(gitPush({ ...req, gitDir: 'relative/dir' })).rejects.toThrow(GitTransportError);
     expect(recorder.calls()).toEqual([]);
     await repo.remove();
   });
@@ -345,10 +425,10 @@ describe('git transport (E0c, B6)', () => {
       const repo = await pushRepoWithCommit();
       const empty = join(fresh('inc'), 'empty.cfg');
       writeFileSync(empty, '');
-      const value = extra === 'EMPTY' ? empty : extra ?? (key.startsWith('url.') ? `http://127.0.0.1:${good.port}/` : '/bin/false');
+      const value = extra === 'EMPTY' ? empty : extra ?? (key.startsWith('url.') ? 'https://github.com/' : '/bin/false');
       git(repo.gitDir, 'config', key, value);
       recorder.clear();
-      const err = await pushToLoopbackForTests({ gitDir: repo.gitDir, port: good.port, repoPath: 'app.git', token, refs: [{ sha: repo.sha, branch: 'main' }] }).catch((e: unknown) => e);
+      const err = await routedPush(good.port, req(repo)).catch((e: unknown) => e);
       expect(err, key).toBeInstanceOf(GitTransportError);
       expect((err as Error).message).toMatch(/config/);
       expect((err as Error).message).not.toContain(value);
@@ -370,6 +450,7 @@ describe('git transport (E0c, B6)', () => {
     // A helper that would store (approve) or give a credential; it logs every call and everything it reads.
     writeFileSync(helper, `#!/bin/sh\necho "call $*" >> '${helperLog}'\ncat >> '${helperLog}'\n`);
     chmodSync(helper, 0o755);
+    // The URL git sees once the recorder has routed the push: a leaked insteadOf on it would send the push to the evil server.
     const goodBase = `http://127.0.0.1:${good.port}/`;
     const evilBase = `http://127.0.0.1:${evil.port}/`;
     const cfg = `[credential]\n\thelper = ${helper}\n[url "${evilBase}"]\n\tinsteadOf = ${goodBase}\n\tpushInsteadOf = ${goodBase}\n[http]\n\tproxy = http://127.0.0.1:${evil.port}\n`;
@@ -389,7 +470,7 @@ describe('git transport (E0c, B6)', () => {
     expect(execFileSync(REAL_GIT, ['config', '--get-all', 'credential.helper'], { encoding: 'utf8', cwd: home })).toContain(helper);
 
     const repo = await pushRepoWithCommit();
-    await pushToLoopbackForTests({ gitDir: repo.gitDir, port: good.port, repoPath: 'app.git', token, refs: [{ sha: repo.sha, branch: 'main' }] });
+    await routedPush(good.port, req(repo));
     await repo.remove();
     expect(git(join(srv, 'app.git'), 'rev-parse', 'refs/heads/main')).toBe(repo.sha);
     expect(evil.requests).toEqual([]);
@@ -402,7 +483,7 @@ describe('git transport (E0c, B6)', () => {
     const srv = serverRoot();
     const redirecting = await serve(srv, { redirectTo: target.port });
     const repo = await pushRepoWithCommit();
-    await expect(pushToLoopbackForTests({ gitDir: repo.gitDir, port: redirecting.port, repoPath: 'app.git', token, refs: [{ sha: repo.sha, branch: 'main' }] })).rejects.toThrow(GitTransportError);
+    await expect(routedPush(redirecting.port, req(repo))).rejects.toThrow(GitTransportError);
     await repo.remove();
     expect(redirecting.requests.length).toBeGreaterThan(0);
     expect(target.requests).toEqual([]);
@@ -426,7 +507,7 @@ describe('git transport (E0c, B6)', () => {
     };
     const timer = setInterval(scan, 2);
     try {
-      await pushToLoopbackForTests({ gitDir: repo.gitDir, port: s.port, repoPath: 'app.git', token, refs: [{ sha: repo.sha, branch: 'main' }] });
+      await routedPush(s.port, req(repo));
     } finally {
       clearInterval(timer);
     }
@@ -435,7 +516,7 @@ describe('git transport (E0c, B6)', () => {
     expect([...seen].some((c) => c.includes('remote-http'))).toBe(true);   // the scan saw the push's own processes
     const push = recorder.calls().find((c) => c.argv.includes('push'))!;
     expect(push.argv.join('\0')).not.toContain(token);
-    expect(push.argv).toContain(`http://127.0.0.1:${s.port}/app.git`);
+    expect(push.argv).toContain(SCRATCH_URL);
     for (const r of s.requests) expect(r.url).not.toContain(token);
   });
 
@@ -447,7 +528,7 @@ describe('git transport (E0c, B6)', () => {
     chmodSync(hook, 0o755);
     const s = await serve(srv, { token });
     const repo = await pushRepoWithCommit();
-    const err = await pushToLoopbackForTests({ gitDir: repo.gitDir, port: s.port, repoPath: 'app.git', token, refs: [{ sha: repo.sha, branch: 'main' }] }).catch((e: unknown) => e);
+    const err = await routedPush(s.port, req(repo)).catch((e: unknown) => e);
     await repo.remove();
     expect(err).toBeInstanceOf(GitTransportError);
     const msg = (err as Error).message;
@@ -474,7 +555,7 @@ describe('git transport (E0c, B6)', () => {
     const s = await serve(srv, { token, holdPushMs: 1500 });
     const repo = await pushRepoWithCommit();
     const started = Date.now();
-    const p = pushToLoopbackForTests({ gitDir: repo.gitDir, port: s.port, repoPath: 'app.git', token, refs: [{ sha: repo.sha, branch: 'main' }] }).catch((e: unknown) => e);
+    const p = routedPush(s.port, req(repo)).catch((e: unknown) => e);
     await new Promise((r) => setTimeout(r, 400));
     const ask = recorder.calls().find((c) => c.argv.includes('push'))!.askpass!.path;
     expect(existsSync(ask)).toBe(true);
@@ -490,7 +571,7 @@ describe('git transport (E0c, B6)', () => {
     const s = await serve(serverRoot(), { ...cred(token), holdPushMs: 3000 });
     const repo = await pushRepoWithCommit();
     const started = Date.now();
-    const err = await pushToLoopbackForTests({ gitDir: repo.gitDir, port: s.port, repoPath: 'app.git', token, refs: [{ sha: repo.sha, branch: 'main' }], timeoutMs: 500 }).catch((e: unknown) => e);
+    const err = await routedPush(s.port, req(repo, { timeoutMs: 500 })).catch((e: unknown) => e);
     expect(err).toBeInstanceOf(GitTransportError);
     expect((err as Error).message).toMatch(/took longer than 1 s/);
     expect(Date.now() - started).toBeLessThan(2000);
@@ -498,27 +579,17 @@ describe('git transport (E0c, B6)', () => {
     expect(leftovers()).toEqual([]);
   });
 
-  it('git: a push to the loopback seam goes only to 127.0.0.1 with a plain path', async () => {
-    const repo = await pushRepoWithCommit();
-    recorder.clear();
-    for (const [port, repoPath] of [[0, 'app.git'], [70000, 'app.git'], [1.5, 'app.git'], [9, '../app.git'], [9, 'app'], [9, 'a b.git'], [9, '@evil/app.git']] as const) {
-      await expect(pushToLoopbackForTests({ gitDir: repo.gitDir, port, repoPath, token, refs: [{ sha: repo.sha, branch: 'main' }] }), `${port} ${repoPath}`).rejects.toThrow(GitTransportError);
-    }
-    expect(recorder.calls()).toEqual([]);
-    await repo.remove();
-  });
-
   it('git: runGit runs only the plumbing commands the proof needs, in a pipegen push repo', async () => {
     const repo = await pushRepoWithCommit();
-    expect(text(await runGit(repo.gitDir, ['cat-file', '-t', repo.sha]))).toBe('commit');
+    expect(text(await runGit(repo.handle, ['cat-file', '-t', repo.sha]))).toBe('commit');
     for (const args of [['push', 'x'], ['-c', 'a=b', 'status'], ['config', 'x.y', 'z'], ['fetch'], ['credential', 'fill'], ['remote', 'add', 'o', 'x'], ['--exec-path=/tmp', 'cat-file'], [], ['submodule', 'update']]) {
-      await expect(runGit(repo.gitDir, args), args.join(' ')).rejects.toThrow(GitTransportError);
+      await expect(runGit(repo.handle, args), args.join(' ')).rejects.toThrow(GitTransportError);
     }
-    await expect(runGit('relative', ['cat-file', '-t', repo.sha])).rejects.toThrow(GitTransportError);
+    await expect(runGit({ gitDir: repo.gitDir, remove: repo.remove } as PushRepoHandle, ['cat-file', '-t', repo.sha])).rejects.toThrow(GitTransportError);
     // A failing git call is an error with git's (cleaned) message.
-    await expect(runGit(repo.gitDir, ['cat-file', '-t', SHA])).rejects.toThrow(/cat-file/);
+    await expect(runGit(repo.handle, ['cat-file', '-t', SHA])).rejects.toThrow(/cat-file/);
     // The identity sets author and committer.
-    const raw = text(await runGit(repo.gitDir, ['cat-file', '-p', repo.sha]));
+    const raw = text(await runGit(repo.handle, ['cat-file', '-p', repo.sha]));
     expect(raw).toMatch(/^author pipegen <pipegen@example\.invalid> /m);
     expect(raw).toMatch(/^committer pipegen <pipegen@example\.invalid> /m);
     const gitDir = repo.gitDir;
@@ -536,13 +607,5 @@ describe('git transport (E0c, B6)', () => {
     runExitHooks();
     expect(existsSync(parent)).toBe(false);
     await repo.remove();   // safe after the exit hook
-  });
-});
-
-describe('git transport: the loopback seam stays test-only', () => {
-  it('git: no file under src/ but git.ts names pushToLoopbackForTests', () => {
-    const srcDir = join(import.meta.dirname, '..', 'src');
-    const users = (execFileSync('grep', ['-rl', 'pushToLoopbackForTests', srcDir], { encoding: 'utf8' }).trim().split('\n')).map((f) => f.slice(srcDir.length + 1));
-    expect(users).toEqual(['proof/git.ts']);
   });
 });

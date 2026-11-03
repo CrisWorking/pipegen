@@ -3,6 +3,7 @@
 // are dropped and listed; the dirty check runs `git --no-optional-locks status` with fsmonitor off.
 import { execFileSync } from 'node:child_process';
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
+import { createServer, type AddressInfo } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterAll, afterEach, beforeEach, describe, expect, it } from 'vitest';
@@ -151,6 +152,78 @@ describe('snapshot read (E0c, S4)', () => {
     expect((await readSnapshot(d, { maxBytes: 1002 })).files).toHaveLength(2);
   });
 
+  it('snapshot read: a partial clone is refused, never fetched from its remote', async () => {
+    const up = fresh();
+    put(up, 'a.txt', 'a\n');
+    put(up, 'b/c.txt', 'c\n');
+    commitAll(up);
+    git(up, 'config', 'uploadpack.allowFilter', 'true');
+    const pc = join(root, `partial-${++n}`);
+    execFileSync(REAL_GIT, ['clone', '-q', '--no-local', '--no-checkout', '--filter=blob:none', `file://${up}`, pc], { env: ENV });
+    // The promisor remote: an https server on loopback that counts connections (a lazy fetch would connect to it).
+    let connections = 0;
+    const server = createServer((sock) => { connections++; sock.destroy(); });
+    await new Promise<void>((ok) => server.listen(0, '127.0.0.1', () => ok()));
+    git(pc, 'remote', 'set-url', 'origin', `https://127.0.0.1:${(server.address() as AddressInfo).port}/x.git`);
+    try {
+      await expect(readSnapshot(pc)).rejects.toThrow(/partial clone/);
+      await expect(isDirty(pc)).resolves.toBe(true);   // no checkout: every file is "deleted"
+    } finally {
+      await new Promise<void>((ok) => server.close(() => ok()));
+    }
+    expect(connections).toBe(0);
+    for (const c of recorder.calls()) {
+      const i = c.argv.indexOf('-C');
+      expect(c.argv.slice(0, i), c.argv.join(' ')).toEqual([...HARDENED_CONFIG, '-c', 'protocol.https.allow=never', '--no-replace-objects', ...(c.argv.includes('status') ? ['--no-optional-locks'] : [])]);
+      expect(c.env.GIT_NO_LAZY_FETCH).toBe('1');
+    }
+  });
+
+  it('snapshot read: a folder below a repo whose path holds the list separator (:) is still not a repo', async () => {
+    const d = fresh();
+    put(d, 'top.txt', 'top\n');
+    commitAll(d);
+    const sub = join(d, 'a:b', 'proj');
+    mkdirSync(sub, { recursive: true });
+    put(sub, 'x.txt', 'x\n');
+    await expect(readSnapshot(sub)).rejects.toThrow(/not the top of a git repo/);
+    await expect(isDirty(sub)).rejects.toThrow(/not the top of a git repo/);
+    // A repo whose own path holds a colon is read normally.
+    const colon = join(root, `c:olon-${++n}`);
+    mkdirSync(colon);
+    git(colon, 'init', '-q');
+    put(colon, 'k.txt', 'k\n');
+    commitAll(colon);
+    expect(filesOf(await readSnapshot(colon))).toEqual({ 'k.txt': 'k\n' });
+    expect(await isDirty(colon)).toBe(false);
+  });
+
+  it('snapshot read: a file over the per-file cap → error', async () => {
+    const d = fresh();
+    put(d, 'big.txt', 'x'.repeat(1000));
+    put(d, 'small.txt', 's\n');
+    commitAll(d);
+    await expect(readSnapshot(d, { maxFileBytes: 999 })).rejects.toThrow(/big\.txt is over 999 bytes/);
+    expect((await readSnapshot(d, { maxFileBytes: 1000 })).files).toHaveLength(2);
+  });
+
+  it('snapshot read: Windows and macOS .git look-alikes are unsafe paths', async () => {
+    const d = fresh();
+    put(d, 'ok.txt', 'ok\n');
+    commitAll(d);
+    const blob = git(d, 'hash-object', '-w', 'ok.txt');
+    const odd = ['.git.', '.git ', '.GIT. .', '.Git..', 'git~1', 'GIT~1', 'Git~1', '.git::$DATA', '.git:stream', 'a:b', '.g\u200cit', '.git\u200d', '\ufeff.git', '.gi\u200et'];
+    const fine = ['.gitignore', '.github', 'git~2', 'git~10', 'xgit~1', '.gitx', '.git-x', 'git', '.g.it'];
+    const entries = [...odd, ...fine, 'ok.txt'].map((name) => Buffer.from(`100644 blob ${blob}\t${name}\0`));
+    const tree = execFileSync(REAL_GIT, ['mktree', '-z'], { cwd: d, env: ENV, input: Buffer.concat(entries) }).toString().trim();
+    const commit = execFileSync(REAL_GIT, ['commit-tree', tree, '-m', 'odd'], { cwd: d, env: ENV }).toString().trim();
+    git(d, 'update-ref', 'HEAD', commit);
+    const s = await readSnapshot(d);
+    expect(s.files.map((f) => f.path).sort()).toEqual([...fine, 'ok.txt'].sort());
+    expect(s.dropped.map((x) => x.path).sort()).toEqual([...odd].sort());
+    expect(new Set(s.dropped.map((x) => x.why))).toEqual(new Set(['unsafe-path']));
+  });
+
   it('snapshot read: dirty check with --no-optional-locks and fsmonitor off', async () => {
     const d = fresh();
     put(d, 'a.txt', 'a\n');
@@ -179,8 +252,11 @@ describe('snapshot read (E0c, S4)', () => {
     expect(await isDirty(d)).toBe(true);
     expect(existsSync(marker)).toBe(false);
 
-    const calls = recorder.calls();
-    expect(calls).toHaveLength(4);
+    const all = recorder.calls();
+    expect(all).toHaveLength(8);
+    // Each check: the top-level check, then status.
+    expect(all.map((c) => c.argv[c.argv.indexOf(d) + 1])).toEqual(['rev-parse', 'status', 'rev-parse', 'status', 'rev-parse', 'status', 'rev-parse', 'status']);
+    const calls = all.filter((c) => c.argv.includes('status'));
     for (const c of calls) {
       expect(c.argv.slice(0, HARDENED_CONFIG.length)).toEqual([...HARDENED_CONFIG]);
       expect(c.argv).toContain('core.fsmonitor=false');

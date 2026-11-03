@@ -5,7 +5,7 @@ import { mkdirSync, mkdtempSync, readdirSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { createPushRepo, gitPush, GitTransportError, pushToLoopbackForTests, pushUrl, runGit, type PushRequest } from '../src/proof/git.js';
+import { createPushRepo, gitPush, GitTransportError, runGit, type PushRequest } from '../src/proof/git.js';
 import { startGitHttp } from './helpers/git-http.js';
 import { makeGitRecorder, REAL_GIT } from './helpers/git-recorder.js';
 
@@ -26,21 +26,28 @@ let n = 0;
 
 const text = (b: Uint8Array) => Buffer.from(b).toString('utf8').trim();
 async function pushRepoWithCommit() {
-  const repo = await createPushRepo();
-  const blob = text(await runGit(repo.gitDir, ['hash-object', '-w', '--stdin'], { input: 'hello\n' }));
-  const tree = text(await runGit(repo.gitDir, ['mktree'], { input: `100644 blob ${blob}\thello.txt\n` }));
-  const sha = text(await runGit(repo.gitDir, ['commit-tree', tree, '-m', 'base'], { identity: { name: 'pipegen', email: 'pipegen@example.invalid' } }));
-  return { ...repo, sha };
+  const handle = await createPushRepo();
+  const blob = text(await runGit(handle, ['hash-object', '-w', '--stdin'], { input: 'hello\n' }));
+  const tree = text(await runGit(handle, ['mktree'], { input: `100644 blob ${blob}\thello.txt\n` }));
+  const sha = text(await runGit(handle, ['commit-tree', tree, '-m', 'base'], { identity: { name: 'pipegen', email: 'pipegen@example.invalid' } }));
+  return { handle, sha, remove: handle.remove };
 }
+const req = (m: Awaited<ReturnType<typeof pushRepoWithCommit>>): PushRequest =>
+  ({ repo: m.handle, url: 'https://github.com/acme/pipegen-proof-shop.git', owner: 'acme', appRepo: 'shop', ...cred(token), refs: [{ sha: m.sha, branch: 'main' }] });
 function serverRoot(): string {
   const srv = join(root, `srv-${++n}`);
   mkdirSync(srv);
   execFileSync(REAL_GIT, ['init', '-q', '--bare', 'app.git'], { cwd: srv });
   return srv;
 }
+const routed = (port: number, m: Awaited<ReturnType<typeof pushRepoWithCommit>>) => {
+  recorder.route(port);
+  return gitPush(req(m));
+};
 const pushes = () => recorder.calls().filter((c) => c.argv.includes('push'));
 
 beforeEach(() => {
+  recorder.clear();
   gate.on = false;
   gate.calls = 0;
   gate.onAfter = Infinity;
@@ -60,8 +67,7 @@ describe('git transport and the interrupt gate (E0c, E0b carry)', () => {
     const repo = await pushRepoWithCommit();
     recorder.clear();
     gate.on = true;
-    await expect(gitPush({ gitDir: repo.gitDir, url: pushUrl('acme', 'shop', 'scratch'), owner: 'acme', appRepo: 'shop', token, refs: [{ sha: repo.sha, branch: 'main' }] })).rejects.toThrow(/stopping/);
-    await expect(pushToLoopbackForTests({ gitDir: repo.gitDir, port: 9, repoPath: 'app.git', token, refs: [{ sha: repo.sha, branch: 'main' }] })).rejects.toThrow(/stopping/);
+    await expect(gitPush(req(repo))).rejects.toThrow(/stopping/);
     expect(recorder.calls()).toEqual([]);
     gate.on = false;
     await repo.remove();
@@ -75,7 +81,7 @@ describe('git transport and the interrupt gate (E0c, E0b carry)', () => {
     recorder.clear();
     gate.calls = 0;
     gate.onAfter = 1;   // the entry check passes; the check right before the push sees the stop
-    const err = await pushToLoopbackForTests({ gitDir: repo.gitDir, port: s.port, repoPath: 'app.git', token, refs: [{ sha: repo.sha, branch: 'main' }] }).catch((e: unknown) => e);
+    const err = await routed(s.port, repo).catch((e: unknown) => e);
     expect(err).toBeInstanceOf(GitTransportError);
     expect((err as Error).message).toMatch(/stopping/);
     expect(gate.calls).toBeGreaterThanOrEqual(2);
@@ -92,7 +98,7 @@ describe('git transport and the interrupt gate (E0c, E0b carry)', () => {
     const s = await startGitHttp(srv, { token, holdPushMs: 3000 });
     const repo = await pushRepoWithCommit();
     const started = Date.now();
-    const p = pushToLoopbackForTests({ gitDir: repo.gitDir, port: s.port, repoPath: 'app.git', token, refs: [{ sha: repo.sha, branch: 'main' }] }).catch((e: unknown) => e);
+    const p = routed(s.port, repo).catch((e: unknown) => e);
     await new Promise((r) => setTimeout(r, 500));
     expect(pushes()).toHaveLength(1);
     gate.on = true;

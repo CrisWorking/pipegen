@@ -13,7 +13,8 @@
 // - shows git's output only through shownGitOutput (hideToken, before and after control characters are removed).
 //
 // Pushes (gitPush) go only to https://github.com/<owner>/pipegen-proof-<repo>.git or https://github.com/<owner>/pipelines.git
-// (checkPushUrl, an exact pattern). This is the one exception to "the token goes only to api.github.com" (DECISIONS #64,
+// (checkPushUrl, an exact pattern), and only from a repo made by createPushRepo (an unforgeable handle: the check of its
+// config and the push are two processes, which is safe only because nobody else can write pipegen's 0700 temp dir). This is the one exception to "the token goes only to api.github.com" (DECISIONS #64,
 // #111). The token never goes into argv, a URL, a file or the output: it is in the git child's environment only
 // (PIPEGEN_GIT_TOKEN), and GIT_ASKPASS points at a script in a fresh 0700 temp dir that prints `x-access-token` or that
 // variable, and only for git's two prompts for https://github.com. The dir is removed after the push, and by a sync exit
@@ -25,10 +26,13 @@
 // The snapshot read (ruling S4, a recorded exception to P55 "never run git"): readSnapshot lists HEAD with
 // `ls-tree -r -z -l --full-tree` and reads the blobs with `cat-file --batch`, never `git archive` (export-ignore and
 // export-subst would hide or change files there). Replace refs are ignored. Symlinks (120000) and submodules (160000) are
-// dropped and listed, as are names that are not UTF-8 or not safe paths. isDirty runs `git --no-optional-locks status`
-// (it never rewrites the index). GIT_CEILING_DIRECTORIES stops git from finding a repo above the folder it is given.
+// dropped and listed, as are names that are not UTF-8 or not safe paths (.git and its Windows/macOS look-alikes included).
+// isDirty runs `git --no-optional-locks status` (it never rewrites the index). Reads never fetch: https is turned off
+// again for them and GIT_NO_LAZY_FETCH is set, so a partial clone's missing blobs are an error, not a download. The folder
+// must be the top of its repo: GIT_CEILING_DIRECTORIES stops git from looking above it, and `rev-parse --show-toplevel` is
+// compared with it anyway (the ceiling is a list split at ':', so a parent path holding one escapes it).
 // Git LFS: the files read are the pointer files (no filter runs).
-import { mkdtempSync, rmSync, chmodSync, lstatSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, rmSync, chmodSync, lstatSync, realpathSync, writeFileSync } from 'node:fs';
 import { rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, isAbsolute, join, resolve } from 'node:path';
@@ -253,8 +257,8 @@ export function pushUrl(owner: string, appRepo: string, repo: PushRepo): string 
 
 export interface PushRef { sha: string; branch: string }
 export interface PushRequest {
-  /** An absolute path to the git dir pushed from (a createPushRepo repo). */
-  gitDir: string;
+  /** The repo pushed from: only a live createPushRepo handle is accepted. */
+  repo: PushRepoHandle;
   url: string;
   owner: string;
   appRepo: string;
@@ -271,7 +275,7 @@ const CENTRAL_BRANCH_RE = /^proof\/\d{8}-\d{6}-[0-9a-f]{6}$/;
 /** Only token-shaped values (as hideToken's own rule): no space, newline or quote reaches the askpass output. */
 const TOKEN_RE = /^[A-Za-z0-9_]{20,255}$/;
 
-function refspecs(refs: readonly PushRef[], repo: PushRepo | 'loopback', force: boolean): string[] {
+function refspecs(refs: readonly PushRef[], repo: PushRepo, force: boolean): string[] {
   if (!Array.isArray(refs) || refs.length === 0) throw new GitTransportError('Nothing to push.');
   return refs.map((r) => {
     if (typeof r?.sha !== 'string' || !SHA_RE.test(r.sha)) throw new GitTransportError('A pushed commit is not a full lowercase sha.');
@@ -319,58 +323,58 @@ function askpassScript(origin: string): string {
   ].join('\n');
 }
 
-interface Remote { url: string; origin: string; config: readonly string[]; repo: PushRepo | 'loopback' }
-
 const stopping = () => new GitTransportError('Not pushing: pipegen is stopping.');
 
-async function pushTo(req: Omit<PushRequest, 'url' | 'owner' | 'appRepo'>, remote: Remote): Promise<void> {
-  const gitDir = absolute(req.gitDir, 'The push repo');
+/**
+ * Pushes commits of a pipegen push repo to the scratch repo or to `pipelines` (ruling B6, DECISIONS #111). Checks the gate,
+ * the URL (checkPushUrl), the repo handle, the token's shape and the refs (central: only proof/<runId>) before anything runs.
+ */
+export async function gitPush(req: PushRequest): Promise<void> {
+  if (interrupting()) throw stopping();
+  const target = checkPushUrl(req.url, req.owner, req.appRepo);
+  const gitDir = liveGitDir(req.repo);
   if (typeof req.token !== 'string' || !TOKEN_RE.test(req.token)) throw new GitTransportError('The token is not token-shaped; not pushing.');
-  const specs = refspecs(req.refs, remote.repo, req.force === true);
+  const specs = refspecs(req.refs, target, req.force === true);
   // The token is never in argv, even when a branch or path happens to hold it: /proc and ps show argv to every user.
-  if ([gitDir, remote.url, ...specs].some((a) => a.includes(req.token))) throw new GitTransportError('Not pushing: the token would be on git\'s command line.');
+  if ([gitDir, req.url, ...specs].some((a) => a.includes(req.token))) throw new GitTransportError('Not pushing: the token would be on git\'s command line.');
   await inSession('pipegen-git-', async (s) => {
     const askpass = join(s.dir, 'askpass');
-    writeFileSync(askpass, askpassScript(remote.origin), { mode: 0o700, flag: 'wx' });
+    writeFileSync(askpass, askpassScript(GITHUB_ORIGIN), { mode: 0o700, flag: 'wx' });
     await checkPushRepoConfig(s, gitDir);
     if (interrupting()) throw stopping();
     const env = gitEnv(s.dir, { GIT_ASKPASS: askpass, PIPEGEN_GIT_TOKEN: req.token });
-    await spawnGit(s, [...remote.config, `--git-dir=${gitDir}`, 'push', '--atomic', '--no-verify', '--no-follow-tags', '--recurse-submodules=no', remote.url, ...specs], 'push', {
+    await spawnGit(s, [`--git-dir=${gitDir}`, 'push', '--atomic', '--no-verify', '--no-follow-tags', '--recurse-submodules=no', req.url, ...specs], 'push', {
       env, token: req.token, watchGate: true, timeoutMs: req.timeoutMs ?? PUSH_TIMEOUT_MS, maxBuffer: 1024 * 1024,
     });
   });
 }
 
-/**
- * Pushes commits of a pipegen push repo to the scratch repo or to `pipelines` (ruling B6, DECISIONS #111). Checks the gate,
- * the URL (checkPushUrl), the token's shape and the refs (central: only proof/<runId>) before anything runs.
- */
-export async function gitPush(req: PushRequest): Promise<void> {
-  if (interrupting()) throw stopping();
-  const repo = checkPushUrl(req.url, req.owner, req.appRepo);
-  await pushTo(req, { url: req.url, origin: GITHUB_ORIGIN, config: [], repo });
-}
-
-/**
- * TEST ONLY (a source-scan test keeps it out of src/): gitPush to a loopback smart-HTTP server, the only differences being
- * the remote (http://127.0.0.1:<port>/<repoPath>, with http allowed) and the askpass origin. The token can only reach 127.0.0.1.
- */
-export async function pushToLoopbackForTests(req: Omit<PushRequest, 'url' | 'owner' | 'appRepo'> & { port: number; repoPath: string }): Promise<void> {
-  if (interrupting()) throw stopping();
-  if (!Number.isInteger(req.port) || req.port < 1 || req.port > 65535 || !/^[A-Za-z0-9_-][A-Za-z0-9._-]*\.git$/.test(req.repoPath)) {
-    throw new GitTransportError('A loopback push needs a port and a plain <name>.git path.');
-  }
-  const origin = `http://127.0.0.1:${req.port}`;
-  await pushTo(req, { url: `${origin}/${req.repoPath}`, origin, config: ['-c', 'protocol.http.allow=always'], repo: 'loopback' });
-}
-
 // ---------- the push repo and its plumbing ----------
 
+/** A repo made by createPushRepo. Only the object createPushRepo returned is accepted (not a copy), until it is removed. */
+export interface PushRepoHandle {
+  readonly gitDir: string;
+  remove(): Promise<void>;
+}
+/** The live handles: a path can't be forged into one, and remove() or the exit hook ends one. */
+const liveRepos = new WeakSet<object>();
+
+function liveGitDir(h: unknown): string {
+  if (typeof h !== 'object' || h === null || !liveRepos.has(h)) {
+    throw new GitTransportError('pipegen pushes from and runs plumbing in a repo made by createPushRepo only (this one was not, or was removed).');
+  }
+  return (h as PushRepoHandle).gitDir;
+}
+
 /** A fresh bare repo in its own 0700 temp dir, with git init's config only; removed by remove() or a sync exit hook. */
-export async function createPushRepo(): Promise<{ gitDir: string; remove: () => Promise<void> }> {
+export async function createPushRepo(): Promise<PushRepoHandle> {
   const parent = mkdtempSync(join(tmpdir(), 'pipegen-push-'));
-  const off = onExit(() => rmSync(parent, { recursive: true, force: true }));
   const gitDir = join(parent, 'repo.git');
+  let handle: PushRepoHandle | null = null;
+  const off = onExit(() => {
+    if (handle !== null) liveRepos.delete(handle);
+    rmSync(parent, { recursive: true, force: true });
+  });
   try {
     privateDir(parent);
     await inSession('pipegen-git-', (s) => spawnGit(s, ['init', '-q', '--bare', gitDir], 'init', { env: gitEnv(s.dir) }));
@@ -379,13 +383,17 @@ export async function createPushRepo(): Promise<{ gitDir: string; remove: () => 
     rmSync(parent, { recursive: true, force: true });
     throw e;
   }
-  return {
+  const made: PushRepoHandle = Object.freeze({
     gitDir,
     remove: async () => {
+      liveRepos.delete(made);
       off();
       await rm(parent, { recursive: true, force: true });
     },
-  };
+  });
+  handle = made;
+  liveRepos.add(made);
+  return made;
 }
 
 /** The plumbing E2 builds commits with. Nothing that talks to a remote, changes config or runs other programs. */
@@ -393,9 +401,9 @@ const PLUMBING: ReadonlySet<string> = new Set(['hash-object', 'mktree', 'commit-
 
 export interface Identity { name: string; email: string; date?: string }
 
-/** Runs one plumbing command in a pipegen push repo (hardened, no token). Returns its stdout. */
-export async function runGit(gitDir: string, args: readonly string[], opts: { input?: string | Uint8Array; identity?: Identity; maxBuffer?: number } = {}): Promise<Uint8Array> {
-  const dir = absolute(gitDir, 'The push repo');
+/** Runs one plumbing command in a createPushRepo repo (hardened, no token). Returns its stdout. */
+export async function runGit(repo: PushRepoHandle, args: readonly string[], opts: { input?: string | Uint8Array; identity?: Identity; maxBuffer?: number } = {}): Promise<Uint8Array> {
+  const dir = liveGitDir(repo);
   if (!Array.isArray(args) || !PLUMBING.has(args[0])) throw new GitTransportError(`runGit runs only ${[...PLUMBING].join(', ')}.`);
   const id: Record<string, string> = {};
   if (opts.identity !== undefined) {
@@ -415,26 +423,64 @@ export interface SnapshotFile { path: string; mode: '100644' | '100755'; content
 export interface DroppedEntry { path: string; why: 'symlink' | 'submodule' | 'non-utf8-name' | 'unsafe-path' | 'other' }
 export interface Snapshot { commit: string; files: SnapshotFile[]; dropped: DroppedEntry[] }
 
-/** A read in the user's repo: `-C <dir>`, replace refs off, and git may not look above <dir> for a repo. */
+/** Reads never talk to a remote: https off again (the last -c wins), and no lazy fetch (git 2.44+ reads GIT_NO_LAZY_FETCH). */
+const READ_CONFIG: readonly string[] = Object.freeze(['-c', 'protocol.https.allow=never']);
+
+/**
+ * A read in the user's repo: `-C <dir>`, no transport, replace refs off, and git may not look above <dir> for a repo. A
+ * failure for a missing object of a partial clone gets a message naming the cause.
+ */
 async function readGit(s: Session, dir: string, args: readonly string[], o: Omit<SpawnOpts, 'env'> & { pre?: readonly string[] } = {}): Promise<Spawned & { overflow: boolean }> {
-  const env = gitEnv(s.dir, { GIT_CEILING_DIRECTORIES: dirname(dir) });
-  return spawnGit(s, ['--no-replace-objects', ...(o.pre ?? []), '-C', dir, ...args], args[0], { ...o, env });
+  const env = gitEnv(s.dir, { GIT_CEILING_DIRECTORIES: dirname(dir), GIT_NO_LAZY_FETCH: '1' });
+  try {
+    return await spawnGit(s, [...READ_CONFIG, '--no-replace-objects', ...(o.pre ?? []), '-C', dir, ...args], args[0], { ...o, env });
+  } catch (e) {
+    if (e instanceof GitTransportError && /promisor|lazy fetch|transport 'https' not allowed/i.test(e.message)) {
+      throw new GitTransportError(`HEAD's files are not all in this clone (a partial clone): pipegen reads only what is on disk and fetches nothing. Fetch the missing objects (git fetch --refetch) or use a full clone. (${e.message})`);
+    }
+    throw e;
+  }
 }
 
-const utf8 = new TextDecoder('utf-8', { fatal: true });
-const lossy = new TextDecoder('utf-8');
-const unsafePath = (p: string) => p.includes('\\') || p.split('/').some((c) => c === '' || c === '.' || c === '..' || c.toLowerCase() === '.git');
+/** The folder must be its repo's top: git may have found a repo above it when the ceiling list was split at a ':'. */
+function checkTopLevel(dir: string, top: string): void {
+  let real: string;
+  try {
+    real = realpathSync(dir);
+  } catch {
+    throw new GitTransportError(`${safeText(dir)} can't be resolved.`);
+  }
+  if (top === '' || resolve(top) !== resolve(real)) throw new GitTransportError(`${safeText(dir)} is not the top of a git repo; pipegen reads only the project's own repo.`);
+}
+
+// ignoreBOM: a name that starts with U+FEFF keeps it (by default TextDecoder drops a leading BOM, renaming the file).
+const utf8 = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true });
+const lossy = new TextDecoder('utf-8', { ignoreBOM: true });
+const IGNORABLE = /[\p{Default_Ignorable_Code_Point}]/gu;
+/**
+ * A name a checkout must never write: empty, `.`, `..`, a backslash or a colon (an NTFS stream such as `.git::$DATA`), and
+ * `.git` the way Windows and macOS read names: any case, trailing dots and spaces dropped, invisible characters ignored
+ * (HFS+), and the 8.3 short name `git~1`.
+ */
+function unsafeName(c: string): boolean {
+  if (c === '' || c === '.' || c === '..' || c.includes('\\') || c.includes(':')) return true;
+  const n = c.replace(IGNORABLE, '').toLowerCase().replace(/[. ]+$/, '');
+  return n === '' || n === '.git' || n === 'git~1';
+}
+const unsafePath = (p: string) => p.split('/').some(unsafeName);
 
 /**
  * HEAD's files (ruling S4): `ls-tree -r -z -l --full-tree` then `cat-file --batch`, in the hardened environment. No filter,
  * no export attribute, no replace ref applies. Symlinks, submodules, names that are not UTF-8 and unsafe paths are dropped
  * and listed. Over `maxBytes` (default MAX_SNAPSHOT_BYTES) in all, or a file over MAX_SNAPSHOT_FILE_BYTES, it throws.
  */
-export async function readSnapshot(dir: string, opts: { maxBytes?: number } = {}): Promise<Snapshot> {
+export async function readSnapshot(dir: string, opts: { maxBytes?: number; maxFileBytes?: number } = {}): Promise<Snapshot> {
   const repo = absolute(dir, 'The project folder');
   const maxBytes = opts.maxBytes ?? MAX_SNAPSHOT_BYTES;
+  const maxFileBytes = opts.maxFileBytes ?? MAX_SNAPSHOT_FILE_BYTES;
   return inSession('pipegen-git-', async (s) => {
-    const commit = Buffer.from((await readGit(s, repo, ['rev-parse', '--verify', '--end-of-options', 'HEAD^{commit}'])).stdout).toString('utf8').trim();
+    const [top = '', commit = ''] = Buffer.from((await readGit(s, repo, ['rev-parse', '--show-toplevel', '--verify', '--end-of-options', 'HEAD^{commit}'])).stdout).toString('utf8').split('\n');
+    checkTopLevel(repo, top);
     if (!SHA_RE.test(commit)) throw new GitTransportError('HEAD is not a commit pipegen can read.');
     const listing = Buffer.from((await readGit(s, repo, ['ls-tree', '-r', '-z', '-l', '--full-tree', commit], { maxBuffer: 256 * 1024 * 1024 })).stdout);
     const wanted: { path: string; mode: SnapshotFile['mode']; sha: string; size: number }[] = [];
@@ -464,7 +510,7 @@ export async function readSnapshot(dir: string, opts: { maxBytes?: number } = {}
       else if (type !== 'blob' || (mode !== '100644' && mode !== '100755')) dropped.push({ path, why: 'other' });
       else {
         const bytes = Number(size);
-        if (bytes > MAX_SNAPSHOT_FILE_BYTES) throw new GitTransportError(`${safeText(path)} is over 100 MiB; GitHub refuses such a file.`);
+        if (bytes > maxFileBytes) throw new GitTransportError(`${safeText(path)} is over ${maxFileBytes} bytes; GitHub refuses a pushed file over 100 MiB.`);
         total += bytes;
         if (total > maxBytes) throw new GitTransportError(`HEAD's files add up to more than ${maxBytes} bytes; pipegen can't copy them to the scratch repo.`);
         wanted.push({ path, mode, sha, size: bytes });
@@ -501,6 +547,7 @@ export async function readSnapshot(dir: string, opts: { maxBytes?: number } = {}
 export async function isDirty(dir: string): Promise<boolean> {
   const repo = absolute(dir, 'The project folder');
   return inSession('pipegen-git-', async (s) => {
+    checkTopLevel(repo, Buffer.from((await readGit(s, repo, ['rev-parse', '--show-toplevel'])).stdout).toString('utf8').split('\n')[0]);
     const r = await readGit(s, repo, ['status', '--porcelain=v1', '-z', '--ignore-submodules=all', '--untracked-files=normal'], {
       pre: ['--no-optional-locks'], maxBuffer: 1024 * 1024, overflowOk: true,
     });
