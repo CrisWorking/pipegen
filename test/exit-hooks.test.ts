@@ -162,6 +162,16 @@ describe('exit-hooks: interrupt path (E0b, ruling B2)', () => {
     expect(r.signal).toBe('SIGINT');
   });
 
+  it('a second signal still reaches the registry when every other hook was unregistered during the cleanup', async () => {
+    const r = await child([
+      "const record = (item) => console.log('LEFT ' + item);",
+      "const off = onExit(() => {});",
+      "onInterrupt(async () => { off(); console.log('STARTED'); await new Promise(() => {}); }, { label: 'slow', record });",
+    ].join('\n'), 'SIGINT', 'STARTED');
+    expect(lines(r.stdout)).toEqual(['STARTED', 'LEFT slow: stopped by a second signal']);
+    expect(r.signal).toBe('SIGINT');
+  });
+
   it('SIGTERM takes the same path', async () => {
     const r = await child("onExit(() => console.log('sync'));\nonInterrupt(async () => { await sleep(20); console.log('a1'); });", 'SIGTERM');
     expect(lines(r.stdout)).toEqual(['a1', 'sync']);
@@ -261,6 +271,30 @@ describe('exit-hooks: interrupt path, in process (raising the signal is stubbed)
     onInterrupt(async (ctx) => { ctx.leftover('pr #4\u001b[31m\r\nfake line'); }, { label: 'prs' });
     await interrupt();
     expect(err.join('')).toContain('Left behind: pr #4?[31m??fake line\n');
+  });
+
+  it('interrupt() raises the signal even when another handler of it exists (no handler has seen it yet)', async () => {
+    const { seen } = stubbed();
+    const other = (): void => {};
+    process.on('SIGINT', other);
+    try {
+      onInterrupt(async () => { seen.push('a1'); });
+      await interrupt();
+    } finally {
+      process.removeListener('SIGINT', other);
+    }
+    expect(seen).toEqual(['a1', 'raise SIGINT self']);
+  });
+
+  it('no deadline timer is left behind once a hook ends', async () => {
+    stubbed();
+    vi.useFakeTimers();
+    onInterrupt(async () => {});
+    onInterrupt(() => new Promise(() => {}), { deadlineMs: 10, record: () => {} });
+    const done = interrupt();
+    await vi.advanceTimersByTimeAsync(10);
+    await done;
+    expect(vi.getTimerCount()).toBe(0);
   });
 
   it('a recorder that throws does not stop the cleanup', async () => {
