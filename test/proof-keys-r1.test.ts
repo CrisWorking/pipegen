@@ -78,6 +78,27 @@ describe('E4-R1: the brand from the repo\'s real state (review I1)', () => {
     await K.deleteAll();
     await K.placeholders([SK]);
     expect(isExcerptEvidence(await brand(K))).toBe(true);
+    // a ticket whose window held a user value stays refused, even after a verified deleteAll in that window
+    const t = await K.ticket();
+    await K.real([SK]);
+    await K.deleteAll();
+    await K.placeholders([SK]);
+    expect(await K.evidence(t, [RUN])).toBeNull();
+    expect(K.lastRefusal).toMatch(/after the ticket/);
+  });
+
+  it('a store whose updated_at pipegen couldn\'t read right after it: unknown, no brand until a verified deleteAll', async () => {
+    const w = keysWorld();
+    const K = keysFor(w);
+    w.s.onPut = () => { w.s.listStatus = 500; };   // the list right after the PUT fails
+    await K.placeholders(['A_KEY']);
+    w.s.onPut = undefined;
+    w.s.listStatus = undefined;
+    expect(await brand(K)).toBeNull();
+    expect(K.lastRefusal).toMatch(/A_KEY.*changed outside pipegen/);
+    await K.deleteAll();
+    await K.placeholders(['A_KEY']);
+    expect(isExcerptEvidence(await brand(K))).toBe(true);
   });
 
   it('the secrets list is read whole at both ticket() and evidence(); an unreadable or cut list gives no brand', async () => {
@@ -155,6 +176,9 @@ describe('E4-R2: org secrets and Actions variables (review M6)', () => {
     w.s.variables = [{ name: 'API_TOKEN', value: TYPED }];
     expect(await brand(K)).toBeNull();
     expect(K.lastRefusal).toMatch(/API_TOKEN/);
+    w.s.variables = [{ name: 'OTHER_CONFIG', value: '2026-11-03' }];   // an undeclared name, even holding a date
+    expect(await brand(K)).toBeNull();
+    expect(K.lastRefusal).toMatch(/not one pipegen declares/);
     w.s.variables = [{ name: 'PIPEGEN_BLOCK_FROM', value: TYPED }];   // the declared name holding something that isn't its config
     expect(await brand(K)).toBeNull();
     w.s.variables = null;
