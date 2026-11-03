@@ -160,7 +160,7 @@ describe('fix round 2: the brief', () => {
     expect(P(wf('pull_request', steps('', '      - run: make\n        env: { NODE_OPTIONS: "" }\n'))).join(' ')).toMatch(/NODE_OPTIONS/);
     // an ordinary name is fine; compat jobs are not key-holding
     expect(P(wf('pull_request', '    env: { CI: "true", STRIPE_KEY_NAME: x }\n' + steps('', '      - run: make\n')))).toEqual([]);
-    expect(P('on: pull_request\njobs:\n  a:\n    runs-on: ubuntu-latest\n    env: { NODE_OPTIONS: x }\n    steps: [{ run: make }]\n', 'compat')).toEqual([]);
+    expect(P('on: pull_request\npermissions: { contents: read }\njobs:\n  a:\n    runs-on: ubuntu-latest\n    permissions: { contents: read }\n    env: { NODE_OPTIONS: x }\n    steps: [{ run: make }]\n', 'compat')).toEqual([]);
   });
 
   it('I1-r1 (b): job or workflow defaults.run.shell other than bash or sh is refused', () => {
@@ -209,7 +209,7 @@ describe('fix round 2: the brief', () => {
     expect(P(wf('pull_request', steps('', `      - uses: ${SETUP_NODE}\n        with: { node-version: "24" }\n`))).join(' ')).toMatch(/package-manager-cache/);
     expect(P(wf('pull_request', steps('', `      - uses: ${SETUP_NODE}\n        with: { node-version: "24", package-manager-cache: "false" }\n`)))).toEqual([]);
     // compat jobs may keep a setup cache (no key-holding job reads any cache)
-    expect(P('on: pull_request\njobs:\n  a:\n    runs-on: ubuntu-latest\n    steps: [{ uses: actions/setup-node@v4, with: { cache: npm } }]\n', 'compat')).toEqual([]);
+    expect(P('on: pull_request\npermissions: { contents: read }\njobs:\n  a:\n    runs-on: ubuntu-latest\n    permissions: { contents: read }\n    steps: [{ uses: actions/setup-node@v4, with: { cache: npm } }]\n', 'compat')).toEqual([]);
   });
 });
 

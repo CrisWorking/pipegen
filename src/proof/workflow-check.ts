@@ -82,11 +82,34 @@ const usesPath = (u: string): string => (u.includes('@') ? u.slice(0, u.lastInde
 // ---------- compat marker (m3) ----------
 
 const compatCopies = new WeakSet<object>();
-/** harness.ts marks each compat copy it renders (and only there: a source scan checks it). A copy of the object is unmarked. */
-export function markCompatCopy<T extends object>(f: T): T {
+function deepFreeze<T>(v: T): T {
+  if (typeof v === 'object' && v !== null && !Object.isFrozen(v)) {
+    Object.freeze(v);
+    for (const x of Object.values(v as object)) deepFreeze(x);
+  }
+  return v;
+}
+/**
+ * harness.ts marks each compat copy it renders (and only there: a source scan checks it). The record is frozen, deeply
+ * (fix round 4, C1): its content can't be edited in place, so any edit makes a new object, which is unmarked and checked as
+ * key-holding. A write to a frozen field throws (ES modules are strict).
+ */
+export function markCompatCopy<T extends object>(f: T): Readonly<T> {
+  deepFreeze(f);
   compatCopies.add(f);
   return f;
 }
+
+/**
+ * A reference to the secrets context other than secrets.GITHUB_TOKEN, anywhere in a text (fix round 4, C1): `secrets` followed
+ * by `.`, `[`, `)`, `}`, `,`, a comparison or the end of a line, in any case. A compat copy holds none (S17).
+ */
+export function namesSecret(text: string): boolean {
+  return /\bsecrets\s*(?:[.[),}!=<>&|]|$)/im.test(text.replace(/\bsecrets\s*\.\s*github_token\b/gi, ''));
+}
+/** The runner labels a compat copy may run on (S17, plan Task 2): one plain GitHub-hosted label. */
+export const COMPAT_RUNNER_RE = /^(?:ubuntu|windows|macos)-[a-z0-9][a-z0-9.-]{0,40}$/;
+const READ_ONLY = (p: unknown): boolean => isObj(p) && Object.keys(p).length === 1 && p.contents === 'read';
 /** Whether `f` is a compat copy harness.ts rendered (by identity, never by path). Anything else is checked as key-holding. */
 export const isCompatCopy = (f: unknown): boolean => typeof f === 'object' && f !== null && compatCopies.has(f);
 
@@ -119,7 +142,7 @@ function reviewedSources(list: readonly ReviewedTool[]): Reviewed {
 
 // ---------- one workflow ----------
 
-interface Parsed { path: string; kind: ProofWorkflowKind; wf: Obj | null; problems: string[] }
+interface Parsed { path: string; kind: ProofWorkflowKind; wf: Obj | null; problems: string[]; text?: string }
 
 function triggersOf(on: unknown): string[] | null {
   if (typeof on === 'string') return [on];
@@ -192,8 +215,16 @@ function jobProblems(id: string, job: unknown, p: Parsed, r: Reviewed, localActi
   if (!isObj(job)) return { problems: [at('it is not a map of keys')] };
   const out: string[] = [];
   const keyHolding = p.kind !== 'compat';
+  if (!keyHolding) {
+    // fix round 4 (C1): the S17 invariants, re-asserted on the content every time
+    if ('uses' in job) out.push(at('a compat job calls a reusable workflow'));
+    if ('environment' in job) out.push(at('a compat job uses an environment'));
+    if (!READ_ONLY(job.permissions)) out.push(at('a compat job\'s permissions are not exactly contents: read'));
+    const ro = job['runs-on'];
+    if (typeof ro !== 'string' || !COMPAT_RUNNER_RE.test(ro)) out.push(at('a compat job\'s runs-on is not one plain GitHub-hosted label'));
+    if ('uses' in job) return { problems: out };
+  }
   if ('uses' in job) {
-    if (!keyHolding) return { problems: [] };
     const perm = permissionProblem(job, p.wf?.permissions, r);
     if (perm !== null) out.push(at(perm));
     const u = job.uses;
@@ -250,7 +281,7 @@ function jobProblems(id: string, job: unknown, p: Parsed, r: Reviewed, localActi
 function parse(path: string, content: string, kind: ProofWorkflowKind): Parsed {
   const r = parseYaml(content, 'strict');
   if ('problems' in r) return { path, kind, wf: null, problems: [`pipegen can't read it strictly (${r.problems[0] ?? 'not YAML'})`] };
-  return { path, kind, wf: r.parsed.js, problems: [] };
+  return { path, kind, wf: r.parsed.js, problems: [], text: content };
 }
 
 function triggerProblems(p: Parsed, localCallee: boolean): string[] {
@@ -269,6 +300,11 @@ function workflowRules(p: Parsed, r: Reviewed, localActions: ReadonlySet<string>
   if (p.wf === null) return { problems: p.problems, calls: [] };
   const wf = p.wf;
   const problems = [...triggerProblems(p, localCallee)];
+  if (p.kind === 'compat') {
+    if (wf.on !== 'pull_request') problems.push('a compat copy\'s trigger is not exactly pull_request');
+    if (!READ_ONLY(wf.permissions)) problems.push('a compat copy\'s permissions are not exactly contents: read');
+    if (p.text !== undefined && namesSecret(p.text)) problems.push('a compat copy names a secret other than GITHUB_TOKEN');
+  }
   if (p.kind !== 'compat') {
     problems.push(...envProblems(wf.env, 'the workflow'));
     const sh = shellProblem(wf.defaults, 'the workflow');

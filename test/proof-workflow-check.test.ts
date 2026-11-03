@@ -33,6 +33,8 @@ ${opts.first ?? egress()}
         with:
           persist-credentials: "false"
 ${opts.steps ?? '      - run: npm test\n'}`;
+/** The same workflow as a compat copy renders it: permissions exactly contents: read, at the top and on the job (S17). */
+const asCompat = (content: string) => content.replace('permissions: {}\n', 'permissions:\n  contents: read\n').replace('    runs-on: ubuntu-24.04\n', '    runs-on: ubuntu-24.04\n    permissions:\n      contents: read\n');
 const problems = (content: string, kind: ProofWorkflowKind = 'proof') => proofWorkflowProblems({ path: '.github/workflows/pipegen-x.yml', content }, kind, reviewed);
 
 describe('proof workflow check (I1)', () => {
@@ -91,7 +93,7 @@ describe('proof workflow check (I1)', () => {
     expect(problems(call('CrisWorking/pipelines/.github/workflows/shop--merge.yml@main')).join(' ')).toMatch(/reusable/);
     expect(problems(call('evil/x/.github/workflows/y.yml@' + SHA)).join(' ')).toMatch(/reusable/);
     // compat copies may keep the user's tag-pinned actions (ruling E3-R2), and have no egress step (S17)
-    expect(problems(wf({ first: '      - uses: actions/checkout@v4', steps: '      - run: make\n' }), 'compat')).toEqual([]);
+    expect(problems(asCompat(wf({ first: '      - uses: actions/checkout@v4', steps: '      - run: make\n' })), 'compat')).toEqual([]);
   });
 
   it('proof workflow (E3-R2): no proof job uses actions/cache; no key-holding job enables a setup cache', () => {
@@ -107,7 +109,7 @@ describe('proof workflow check (I1)', () => {
     expect(problems(wf({ steps: `      - uses: ${BUILD_PUSH}\n        with:\n          cache-from: type=gha\n` })).join(' ')).toMatch(/cache/);
     expect(problems(wf({ steps: `      - uses: ${BUILD_PUSH}\n        with:\n          no-cache: "true"\n` }))).toEqual([]);
     // a compat copy holds no key, so a setup cache there is the user's own and can poison nothing that holds keys
-    expect(problems(wf({ first: '      - run: echo', steps: '      - uses: actions/setup-node@v4\n        with:\n          cache: npm\n' }), 'compat')).toEqual([]);
+    expect(problems(asCompat(wf({ first: '      - run: echo', steps: '      - uses: actions/setup-node@v4\n        with:\n          cache: npm\n' })), 'compat')).toEqual([]);
   });
 
   it('proof workflow: a file pipegen can not read strictly is a problem', () => {

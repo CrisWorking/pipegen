@@ -67,7 +67,7 @@ import type { CreatedFile, PipelineDraft, RepoProfile, ReviewedTool, Service } f
 import { safeText } from '../util/safe-text.js';
 import { readSnapshot } from './git.js';
 import { ProofStopError, validBranchName } from './target.js';
-import { checkProofWorkflows, isCompatCopy, markCompatCopy } from './workflow-check.js';
+import { checkProofWorkflows, isCompatCopy, markCompatCopy, namesSecret, proofWorkflowProblems } from './workflow-check.js';
 
 export const HARNESS_PATH = '.github/workflows/pipegen-proof-harness.yml';
 export const COMPAT_PREFIX = '.github/workflows/pipegen-compat-';
@@ -442,7 +442,8 @@ function readsSecret(text: string, wholeIsExpression: boolean): boolean {
 }
 
 function usesSecrets(v: unknown): boolean {
-  for (const s of strings(v)) if (readsSecret(s, false)) return true;
+  // fix round 4 (C1): also any text that names the secrets context outside an expression (the compat check refuses it)
+  for (const s of strings(v)) if (readsSecret(s, false) || namesSecret(s)) return true;
   return false;
 }
 /** The `if` texts of a job and its steps (always expressions, with or without `${{`). */
@@ -523,7 +524,7 @@ function renderCompat(path: string, wf: Obj, jobs: [string, Obj][]): string {
   // job even after structuredClone, and the default would write it as &a1/*a1. The strict parse-back below is the fail-safe:
   // an anchor that ever reached the text would make these jobs not compared, never pushed.
   const doc = new Document(model, { version: '1.2', aliasDuplicateObjects: false });
-  doc.commentBefore = ` pipegen compat copy of ${path} (scratch only, never delivered): read-only, no secrets, pull_request only.`;
+  doc.commentBefore = ` pipegen compat copy of ${path} (scratch only, never delivered): read-only, pull_request only, no secret referenced.`;
   quoteStrings(doc);
   const text = doc.toString({ lineWidth: 0 });
   const back = parseYaml(text, 'strict');
@@ -584,6 +585,12 @@ export function compatCopiesFrom(workflows: readonly { path: string; content: st
     try { text = renderCompat(path, wf, kept); } catch (e) {
       if (!(e instanceof ProofStopError)) throw e;
       for (const [id] of kept) notCompared.push({ workflow: shown, job: safeText(id, 80), why: e.message });
+      continue;
+    }
+    // fix round 4 (C1): never emit a copy the compat rules refuse (a stop of the whole proof): its jobs are not compared instead
+    const own = proofWorkflowProblems({ path: target, content: text }, 'compat');
+    if (own.length > 0) {
+      for (const [id] of kept) notCompared.push({ workflow: shown, job: safeText(id, 80), why: `pipegen's copy would break the compat rules (${own[0] ?? ''})` });
       continue;
     }
     taken.add(target.toLowerCase());
