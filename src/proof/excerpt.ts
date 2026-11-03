@@ -546,9 +546,10 @@ export function unscannedExcerpt(logs: string, scrub: (text: string) => string, 
   // Steps 1-3, and the hide rules. Every real line stays once, in place and untagged, in the text redact reads (a dropped line as its
   // first reading), so redact's own block and key rules link it to the lines around it (scan 5). A line is hidden when:
   // - step 3 drops it (an escape left, or a sequence glued between word characters), or it is in the head guard;
-  // - its token next to a neighbour is MIN_SPLIT_PIECE characters or longer (edgeRun, as shown) and that neighbour is dropped, or both
-  //   lines are suspect and one of them messy: a dropped line can't be read for sure (two insertions can need opposite readings), and
-  //   the value passes pair two suspect lines' forms index by index, so a value split across the two lines can't be checked;
+  // - its token next to a neighbour is MIN_SPLIT_PIECE characters or longer (edgeRun, as shown) and it or that neighbour is messy
+  //   (dropped lines are messy): no reading of a messy line can be trusted (two insertions can need opposite readings, a sequence's
+  //   payload can stand between two pieces of a value, the value passes pair forms index by index), so a value split across the two
+  //   lines can't be checked;
   // - a value pass (valuePasses) finds part of a value in it, alone or with a neighbour (fix round 1, C1(a) and I1);
   // - redact, on one of its readings apart from the log (probeReadings), hides something on it;
   // - it is in a block, section or key a line before it opened:
@@ -619,10 +620,10 @@ export function unscannedExcerpt(logs: string, scrub: (text: string) => string, 
   const hiddenAt = lines0.map((r, i) => {
     let hidden = r.shown === null || i <= hideTo || i < guard || valueHide[i] === 1
       || [i - 1, i + 1].some((j) => {
-        // a dropped neighbour, or a messy one next to a suspect line: their forms can't be paired for sure (two insertions may need
-        // opposite readings; the value passes pair forms index by index), so a long enough token of this line next to it may be a piece
+        // a messy (or dropped) line, or a messy neighbour: no reading of a messy line can be trusted (two insertions can need opposite
+        // readings, a sequence's payload can stand between two pieces of a value), so a long enough token at the shared edge may be a piece
         const y = lines0[j];
-        return y !== undefined && (y.shown === null || ((y.messy || r.messy) && y.suspect && r.suspect)) && edgeOf(r, j > i) >= MIN_SPLIT_PIECE;
+        return y !== undefined && (y.messy || r.messy) && edgeOf(r, j > i) >= MIN_SPLIT_PIECE;
       });
     if (blockCols >= 0) {
       if (r.indentUnsure || r.blank || r.colsMax > blockCols) hidden = true;

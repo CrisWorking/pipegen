@@ -43,18 +43,17 @@ describe('errorExcerpt (E0a, B1)', () => {
       // the value split by a colour code glued between two of its characters: the code may have eaten some, so the line is dropped
       // (fix round 1, C1(b)); a colour code next to a blank is ordinary output and stays
       `${TS}${ESC}[33mwarn${ESC}[39m key ${VALUE.slice(0, 3)}${ESC}[1;31m${VALUE.slice(3)}${ESC}[0m in config`,
-      // (a short last word: a long one next to the messy OSC line below would be hidden, as it may hold a piece of a split value)
       `${TS}${ESC}[31m${ESC}[1mError: Invalid API key provided: ${VALUE} (see docs)${ESC}[0m`,
-      // an OSC 8 hyperlink (BEL- and ST-terminated) and an OSC title
-      `${TS}see ${ESC}]8;;https://example.test/docs${ESC}\\the docs${ESC}]8;;${ESC}\\ ${ESC}]0;title\u0007for help`,
       `${TS}##[error]Process completed with exit code 1.`,
+      // an OSC 8 hyperlink (BEL- and ST-terminated) and an OSC title (a messy line: a neighbour's long token next to it would be hidden)
+      `${TS}see ${ESC}]8;;https://example.test/docs${ESC}\\the docs${ESC}]8;;${ESC}\\ ${ESC}]0;title\u0007for help`,
     ].join('\n');
     const out = await errorExcerpt(log, composed(v), clean());
     expect(out.split('\n')).toEqual([
       '##[group]Run npm test',
       `Error: Invalid API key provided: ${R} (see docs)`,
-      'see the docs for help',
       '##[error]Process completed with exit code 1.',
+      'see the docs for help',
     ]);
     expect(out).not.toMatch(/[\u001b\u0080-\u009f]/);
     expect(out).not.toContain('2026-11-03T');
