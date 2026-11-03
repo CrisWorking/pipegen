@@ -73,7 +73,7 @@ describe('E4 downloads (S2)', () => {
     expect(out.problems.get('pipegen-out-two')).toMatch(/exactly one/);
     expect(out.problems.get('pipegen-out-evil')).toMatch(/host/);
     expect(out.problems.get('pipegen-out-again')).toMatch(/redirect/);
-    expect(out.problems.get('pipegen-out-api200')).toMatch(/redirect/);
+    expect(out.problems.get('pipegen-out-api200')).toMatch(/did not answer with a redirect/);
     // the token went to the API only; the store calls carry no authorization at all; the evil host and the 2nd hop were never called
     for (const c of calls) {
       if (c.url.origin === API) expect(c.headers.authorization).toContain(cred);
@@ -107,6 +107,15 @@ describe('E4 downloads (S2)', () => {
     const out = await downloadRunArtifacts(gh, scratch, RUN, () => true, deps);
     expect(out.problems.get('pipegen-out-x')).toMatch(/size cap/);
     expect(s.pulled()).toBeLessThan(256 * 1024);
+    // a declared length over the cap: refused before a byte of the body is read
+    const s2 = countingStream(4 * 1024 * 1024);
+    const w2 = setup({
+      [`GET ${API}${R}/actions/runs/${RUN}/artifacts`]: listing([art(1, 'pipegen-out-x', 1000)]),
+      [`GET ${API}${R}/actions/artifacts/1/zip`]: redirect(`${STORE}/z`),
+      [`GET ${STORE}/z`]: { stream: s2.stream, headers: { 'content-length': String(4 * 1024 * 1024) } },
+    });
+    expect((await downloadRunArtifacts(w2.gh, w2.scratch, RUN, () => true, w2.deps)).problems.get('pipegen-out-x')).toMatch(/size cap/);
+    expect(s2.pulled()).toBe(0);
     // a listing that is cut short, or of another run: refused before any download
     for (const l of [listing([art(1, 'pipegen-out-x', 10)], { total_count: 9 }), listing([art(1, 'pipegen-out-x', 10, { workflow_run: { id: 1 } })]), { body: { nope: 1 } }]) {
       const w = setup({ [`GET ${API}${R}/actions/runs/${RUN}/artifacts`]: l });

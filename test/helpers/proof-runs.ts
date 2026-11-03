@@ -35,8 +35,8 @@ export interface RunsFake {
   listDelay: number;
   /** No run is ever started (Actions disabled). */
   actionsOff: boolean;
-  /** Extra runs listed for any query (foreign or look-alike runs). */
-  noise: Partial<FakeRun>[];
+  /** Extra runs listed for any query (foreign or look-alike runs). `unfiltered`: listed whatever the query asks (a hostile answer). */
+  noise: (Partial<FakeRun> & { unfiltered?: boolean })[];
   handler: (c: Call) => Reply | undefined;
   transport: ProofTransport;
   /** Starts the runs for a push of `sha` to `branch`. */
@@ -101,8 +101,9 @@ export function runsFake(defaultBranch = 'main'): RunsFake {
       lists++;
       const visible = lists > f.listDelay ? f.runs : [];
       // noise runs take the asked sha unless they name one (look-alikes the matching must refuse)
-      const all = [...visible.map(runBody), ...f.noise.map((n) => runBody({ id: ids++, path: '.github/workflows/x.yml', event: 'push', head_sha: q.get('head_sha') ?? '0'.repeat(40), head_branch: 'x', status: 'completed', conclusion: 'success', run_attempt: 1, jobs: [], artifacts: [], polls: 0, steps: 0, ...n } as FakeRun))];
-      const list = all.filter((r) => (!q.has('head_sha') || r.head_sha === q.get('head_sha')) && (!q.has('event') || r.event === q.get('event')));
+      const asked = (r: { head_sha: string; event: string }) => (!q.has('head_sha') || r.head_sha === q.get('head_sha')) && (!q.has('event') || r.event === q.get('event'));
+      const noise = f.noise.map((n) => ({ u: n.unfiltered === true, r: runBody({ id: ids++, path: '.github/workflows/x.yml', event: 'push', head_sha: q.get('head_sha') ?? '0'.repeat(40), head_branch: 'x', status: 'completed', conclusion: 'success', run_attempt: 1, jobs: [], artifacts: [], polls: 0, steps: 0, ...n } as FakeRun) }));
+      const list = [...visible.map(runBody).filter(asked), ...noise.filter((x) => x.u || asked(x.r)).map((x) => x.r)];
       return json(200, { total_count: list.length, workflow_runs: list });
     }
     let m = /^\/actions\/runs\/(\d+)$/.exec(rest);

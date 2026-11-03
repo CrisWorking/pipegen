@@ -127,7 +127,10 @@ describe('E4 runs', () => {
       // look-alikes the matching must ignore: a fork's run, another repo's, another event, another sha, another branch
       const b = 'proof/20261103-120000-abcdef/main';
       f.noise = [{ path: PIPEGEN, event: 'push', head_branch: b, headRepoId: 1 }, { path: MERGE, event: 'pull_request', head_branch: b, repoId: 2 },
-        { path: `${PIPEGEN}@refs/heads/x`, event: 'push', head_branch: b }, { path: PIPEGEN, event: 'push', head_branch: 'proof/20261103-120000-abcdef/other' }];
+        { path: `${PIPEGEN}@refs/heads/x`, event: 'push', head_branch: b }, { path: PIPEGEN, event: 'push', head_branch: 'proof/20261103-120000-abcdef/other' },
+        // an answer that ignores the query: another event, another sha, another PR's run
+        { path: PIPEGEN, event: 'pull_request', head_branch: b, unfiltered: true }, { path: PIPEGEN, event: 'push', head_branch: b, head_sha: 'd'.repeat(40), unfiltered: true },
+        { path: MERGE, event: 'pull_request', head_branch: b, pr: 999 }];
     });
     const { main } = await session(e);
     const p = await proveVariant(e.g.gh, e.t, { branch: main, merge: true, workflows: WORKFLOWS }, e.opts);
@@ -158,8 +161,9 @@ describe('E4 runs', () => {
     const err = await proveVariant(e.g.gh, e.t, { branch: main, merge: false, workflows: WORKFLOWS }, e.opts).catch((x: unknown) => x);
     expect(err).toBeInstanceOf(ProofStopError);
     expect((err as Error).message).toBe(`No workflow run started on ${SCRATCH}. Is GitHub Actions enabled there?`);
-    expect(e.clock.t).toBeGreaterThanOrEqual(NO_RUN_MS);
-    expect(e.clock.t).toBeLessThan(NO_RUN_MS + 20_000);
+    expect(NO_RUN_MS).toBe(120_000);
+    expect(e.clock.t).toBeGreaterThanOrEqual(120_000);
+    expect(e.clock.t).toBeLessThan(140_000);
     expect(e.g.writes()).toEqual([]);   // no PR was opened
     // a run that shows up late (within the 120 s) is waited for
     const late = env((f) => { simplePlans(f); f.listDelay = 3; });
@@ -215,8 +219,9 @@ describe('E4 runs', () => {
     const handles = await findRuns(e2.g.gh, e2.t, { headSha: s2.main.sha, event: 'push', workflows: [PIPEGEN], branch: s2.main.branch });
     vi.mocked(interrupting).mockReturnValue(true);
     const out = await waitForRuns(e2.g.gh, e2.t, handles, e2.opts);
-    expect(out[0]?.stopped).toBe(true);
+    expect(out[0]).toMatchObject({ stopped: true, conclusion: 'cancelled', note: expect.stringMatching(/pipegen is stopping/) });
     expect(e2.f.cancels).toEqual([]);
+    expect(e2.clock.t).toBe(0);   // returned at once: no poll, no wait
     vi.mocked(interrupting).mockReturnValue(false);
     // the time cap: runs still going are cancelled and reported timed out
     const e3 = env((f) => { f.plans.push[PIPEGEN] = { steps: 1_000 }; });
@@ -321,8 +326,12 @@ describe('E4 re-runs (B3)', () => {
     expect(e.f.prs.map((p) => [p.number, p.head, p.merged])).toEqual([[first.pr, main.branch, true], [again.pr, again.branch.branch, true]]);
     expect(again.pr).not.toBe(first.pr);
     expect(e.f.merges.map((m) => m.pr)).toEqual([first.pr, again.pr]);
-    // resetBase takes only the base snapshot of its own session
-    await expect(resetBase(s, { ...base, commit: main as never }, e.f.transport)).rejects.toThrow(ScratchGuardError);
+    // resetBase takes only the base snapshot of its own session: a proof commit (a real record) is refused, nothing pushed
+    const proofCommit = await buildProofBranch(s, 'main', [[{ path: 'q.txt', content: 'q\n' }]], { pipegenWorkflows: new Set(), parent: main.sha });
+    const n = e.f.pushes.length;
+    await expect(resetBase(s, { ...base, commit: proofCommit }, e.f.transport)).rejects.toThrow(ScratchGuardError);
+    await expect(resetBase(s, { ...base, sha: main.sha }, e.f.transport)).rejects.toThrow(ScratchGuardError);
+    expect(e.f.pushes.length).toBe(n);
   });
 
   it('run: deploy re-run uses a fresh branch name after resetBase', async () => {

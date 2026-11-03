@@ -260,6 +260,12 @@ describe('E4 scratch keys: the access re-check before the store (E1 carries G1, 
     vi.setSystemTime(Date.now() + ACCESS_CHECK_MAX_AGE_MS);
     expect(() => scratchSecretSink(g.gh, fresh)).not.toThrow();
     vi.useRealTimers();
+    // no sink is opened once a stop has begun (and the check is not spent by the refusal)
+    const during = await checkScratchAccess(g.gh, t, quietIo);
+    vi.mocked(interrupting).mockReturnValue(true);
+    expect(() => scratchSecretSink(g.gh, during)).toThrow(/stopping/);
+    vi.mocked(interrupting).mockReturnValue(false);
+    expect(() => scratchSecretSink(g.gh, during)).not.toThrow();
     // the brand can't be made by anyone else: the issuer was taken by repos.ts at load
     expect(() => takeAccessIssuer()).toThrow(/already taken/);
     // guardedWrite refuses every secret write (repo, environment, Dependabot, Codespaces), on the scratch and central repo
@@ -298,6 +304,18 @@ describe('E4 scratch keys: the stop gate and the in-flight writes (E0b carry)', 
     expect(s.values.size).toBe(0);
   });
 
+  it('deleteAll waits for a store of the same keys still in flight (nothing lands after it)', async () => {
+    const { g, s } = keysWorld();
+    const keys = keysFor(g);
+    await keys.placeholders(['A_KEY']);
+    const storing = keys.placeholders(['B_KEY']);   // not awaited: the access re-check reads come first, then the PUT
+    const deleted = await keys.deleteAll();
+    await storing;
+    expect(deleted.sort()).toEqual(['A_KEY', 'B_KEY']);
+    expect(s.values.size).toBe(0);
+    expect(g.seen().lastIndexOf(`PUT ${S_PATH}/B_KEY`)).toBeLessThan(g.seen().lastIndexOf(`DELETE ${S_PATH}/B_KEY`));
+  });
+
   it('every PUT is a tracked write: in flight while it runs, settleWrites waits for it', async () => {
     const { g, s } = keysWorld();
     let release: () => void = () => {};
@@ -331,8 +349,10 @@ describe('E4 excerpt evidence (DECISIONS #113)', () => {
     const { g } = keysWorld();
     const keys = keysFor(g);
     // nothing checked yet (no deleteAll): no evidence, the repo may hold a crashed run's real keys
-    expect(keys.evidence(keys.ticket())).toBeNull();
+    const early = keys.ticket();
+    expect(keys.evidence(early)).toBeNull();
     await keys.setup(['STRIPE_SECRET_KEY']);
+    expect(keys.evidence(early)).toBeNull();   // that window began before the repo was known clean
     const t1 = keys.ticket();
     const e1 = keys.evidence(t1);
     expect(isExcerptEvidence(e1)).toBe(true);
@@ -348,11 +368,34 @@ describe('E4 excerpt evidence (DECISIONS #113)', () => {
     expect(keys.evidence(t2)).toBeNull();                      // that window held the real value
     const t3 = keys.ticket();
     expect(isExcerptEvidence(keys.evidence(t3))).toBe(true);   // a window that started after the switch
-    // a ticket of another ScratchKeys, a forged ticket
+    // a ticket of another ScratchKeys (both clean, placeholders only, no real store ever), a forged ticket
     const other = keysFor(keysWorld().g);
     await other.placeholders(['A_KEY']);
     expect(other.evidence(t3)).toBeNull();
+    const third = keysFor(keysWorld().g);
+    await third.placeholders(['A_KEY']);
+    const tOther = other.ticket();
+    expect(isExcerptEvidence(other.evidence(tOther))).toBe(true);
+    expect(third.evidence(tOther)).toBeNull();
     expect(keys.evidence({ ticket: true } as never)).toBeNull();
+    // a deleteAll after the ticket that leaves a secret behind: its value is unknown, no evidence for that window
+    const dw = keysWorld();
+    const dk = keysFor(dw.g);
+    await dk.placeholders(['A_KEY']);
+    const td = dk.ticket();
+    dw.s.failDelete.set('A_KEY', 500);
+    await expect(dk.deleteAll()).rejects.toThrow(ScratchKeysError);
+    expect(dk.evidence(td)).toBeNull();
+    // a real batch that fails half-way: the first value may have landed, so the window held it
+    const rw = keysWorld();
+    const rk = keysFor(rw.g, vaultWith({ A_KEY: TYPED, B_KEY: `${TYPED}-b` }));
+    await rk.placeholders(['C_KEY']);
+    const tr = rk.ticket();
+    rw.s.failPut.set('B_KEY', 500);
+    await expect(rk.real(['A_KEY', 'B_KEY'])).rejects.toThrow(/Could not store/);
+    expect(rw.s.values.get('A_KEY')).toBe(TYPED);
+    expect(rk.mode).toBe('real');
+    expect(rk.evidence(tr)).toBeNull();
     // a placeholder that failed to overwrite a real value: still real, no evidence
     const w = keysWorld();
     const k = keysFor(w.g);
