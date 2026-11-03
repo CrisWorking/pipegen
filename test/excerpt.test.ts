@@ -6,7 +6,7 @@ import { createHash } from 'node:crypto';
 import { afterEach, describe, expect, it } from 'vitest';
 import { knownValueScrubber, LONG_LINE, SecretScanError, secretScanText } from '../src/ai/redact.js';
 import { SecretVault } from '../src/create/secrets.js';
-import { EXCERPT_CONTEXT_LINES, EXCERPT_MAX_BYTES, EXCERPT_MAX_LINES, EXCERPT_WITHHELD, errorExcerpt, errorSignature, MAX_LOG_CHARS } from '../src/proof/excerpt.js';
+import { EXCERPT_CONTEXT_LINES, EXCERPT_MAX_BYTES, EXCERPT_MAX_LINES, EXCERPT_WITHHELD, errorExcerpt, errorSignature, MAX_LOG_CHARS, unscannedExcerpt } from '../src/proof/excerpt.js';
 import { betterleaksAt, CLEAN, gitleaksAt, makeStub } from './helpers/gitleaks-stub.js';
 import { cleanupRepos } from './helpers/make-repo.js';
 import { fake } from './helpers/secret-repo.js';
@@ -344,7 +344,8 @@ describe('errorExcerpt: scrub before cutting (E0a)', () => {
 
   it('excerpt: ruling E0a-R1: unterminated C1 OSC introducers stay linear (64 KiB line, and many 4 KB lines)', async () => {
     const v = vault();
-    for (const log of [`Error: x\n${'\u009d'.repeat(64 * 1024)}`, `Error: x\n${Array.from({ length: 256 }, () => '\u009d'.repeat(4000)).join('\n')}`]) {
+    // 2,040 of them are 4,080 UTF-8 bytes: under the 4 KB guard, so the whole-sequence reading does run on them
+    for (const log of [`Error: x\n${'\u009d'.repeat(64 * 1024)}`, `Error: x\n${Array.from({ length: 1000 }, () => '\u009d'.repeat(2040)).join('\n')}`]) {
       const t0 = performance.now();
       const out = await errorExcerpt(log, composed(v), clean());
       expect(performance.now() - t0).toBeLessThan(2000);
@@ -404,6 +405,109 @@ describe('errorExcerpt: scrub before cutting (E0a)', () => {
     const out = await errorExcerpt(`${first}\n${second}\nthird`, composed(v), betterleaksAt(stub.bin));
     expect(out.split('\n')).toEqual([first, 'third']);
     expect(Object.values(stub.record().files)[0]).not.toContain('ustar');
+    v.wipe();
+  });
+});
+
+describe('errorExcerpt: regressions from the mutation run and the 200k fuzz runs (E0a)', () => {
+  const BEL = '\u0007';
+  const run = ['Qx7', 'Lm2Wv9Rt4Zp8Kd3Hs'].join('');
+  const PW = ['pass', 'word'].join('');
+  const scrubOnly = (v: SecretVault) => composed(v);
+  const shows = (out: string, piece: string) => out.includes(piece);
+
+  it('excerpt: CRLF logs come out without CR, and a window too big for what is left shrinks around its error line', async () => {
+    const v = vault();
+    expect(await errorExcerpt(`Error: a\r\nnext\r\n`, composed(v), clean())).not.toContain('\r');
+    const at = new Set([0, 50, 99]);
+    const log = lines(100, (i) => `${at.has(i) ? 'error' : 'info'} ${String(i).padStart(2, '0')} ${'w'.repeat(4000)}`);
+    const out = await errorExcerpt(log, composed(v), clean());
+    expect(out).toMatch(/^error 50 /m);
+    v.wipe();
+  });
+
+  it('excerpt: a vault value right after a token is scrubbed before redact can cut it', async () => {
+    const v = new SecretVault();
+    const typed = 'Zq7Rk2mW-9xLp4Tn8Hy';
+    v.set('K_STRIPE', typed);
+    const out = await errorExcerpt(`using ${fake.githubClassic()}${typed} now\nError: x`, composed(v), clean());
+    expect(out).not.toContain('9xLp4Tn8Hy');
+    v.wipe();
+  });
+
+  it('excerpt: a value split by an invisible character is caught by fullScrub, on one line and across two, without flattening the rest', async () => {
+    const v = vault();
+    const one = await errorExcerpt(`Error: a\nkey ${VALUE.slice(0, 8)}\u200b${VALUE.slice(8)}\nnext`, composed(v), clean());
+    expect(one.split('\n')).toHaveLength(3);
+    expect(one).not.toContain(VALUE.slice(8));
+    const two = await errorExcerpt(`Error: a\ntail ${VALUE.slice(0, 8)}\u200b\n${VALUE.slice(8)} rest\nnext`, composed(v), clean());
+    expect(two).not.toContain(VALUE.slice(8));
+    v.wipe();
+  });
+
+  it('excerpt: a short scanner finding drops its line even when the found text is too short to look for elsewhere', async () => {
+    const v = vault();
+    const stub = makeStub(`writeReport(JSON.stringify(findingsFor('zq9').slice(0, 1))); process.exit(1);`);
+    const out = await errorExcerpt('Error: a\nflagged zq9 here\nnext', composed(v), betterleaksAt(stub.bin));
+    expect(out.split('\n')).toEqual(['Error: a', 'next']);
+    v.wipe();
+  });
+
+  it('excerpt: a value split between a shown line and a dropped one shows neither part of the dropped line', async () => {
+    const v = vault();
+    // the value starts in the shown line and ends in the dropped one (its end tag holds), and the other way round (its start tag holds)
+    const a = await errorExcerpt(`ok ${VALUE.slice(0, 10)}\n${VALUE.slice(10)} hidden-tail-text ${ESC}(B\nError: x`, scrubOnly(v), clean());
+    expect(shows(a, 'hidden-tail-text')).toBe(false);
+    const b = await errorExcerpt(`hidden-head-text ${ESC}(B ${VALUE.slice(0, 10)}\n${VALUE.slice(10)} ok\nError: x`, scrubOnly(v), clean());
+    expect(shows(b, 'hidden-head-text')).toBe(false);
+    v.wipe();
+  });
+
+  it('excerpt: a cut inside a key block hides a body that is not armor-shaped up to its END; a one-line key before the cut does not', () => {
+    const body = Array.from({ length: 80 }, (_, i) => `> ${fake.keyBody()}${String(i).padStart(2, '0')}`);
+    const tail = [...body.slice(10), fake.keyEnd(), 'Error: key rejected'].join('\n');
+    const log = ['start', fake.keyBegin(), ...body, fake.keyEnd(), 'Error: key rejected'].join('\n');
+    const out = unscannedExcerpt(log, (t) => t, { maxLogChars: tail.length }).join('\n');
+    for (const b of body) expect(out).not.toContain(b.slice(2));
+    // BEGIN and END on one line before the cut: the tail is not inside a key
+    const tail2 = [...Array.from({ length: 70 }, (_, i) => `line ${i}`), 'Error: before', ...Array.from({ length: 6 }, (_, i) => `after ${i}`), fake.keyEnd(), 'done'].join('\n');
+    const log2 = [`${fake.keyBegin()}${fake.keyBody()}${fake.keyEnd()}`, 'filler', tail2].join('\n');
+    expect(unscannedExcerpt(log2, (t) => t, { maxLogChars: tail2.length }).join('\n')).toContain('Error: before');
+  });
+
+  it('excerpt: armor goes on through a messy body line whose readings keep a long run but no armor shape', async () => {
+    const v = vault();
+    const body = `${fake.keyBody()}Q9`;
+    const out = await errorExcerpt([`${ESC}(Bdump`, `${body}\u2028;x`, 'Error: y'].join('\n'), composed(v), clean());
+    expect(out).not.toContain(body.slice(8, 40));
+    v.wipe();
+  });
+
+  it('excerpt: a dropped line whose reading opens a key with no END after it hides to the end of the log', async () => {
+    const v = vault();
+    const body = Array.from({ length: 4 }, (_, i) => `> ${fake.keyBody()}${i}`);
+    const out = await errorExcerpt([`${ESC}(B${fake.keyBegin()}`, ...body, 'Error: x'].join('\n'), composed(v), clean());
+    for (const b of body) expect(out).not.toContain(b.slice(2));
+    v.wipe();
+  });
+
+  it('excerpt: 200k fuzz regressions: an OSC that ate the `:`, a blank line inside the block, an OSC or a CSI that ate the indentation', async () => {
+    const v = vault();
+    const cases = [
+      // seed 57507 case 83488: an OSC swallowed the opener's `:` (G6)
+      [`  client_sec${ESC}]0;o4a5dlret: ${ESC}\\|\u2028-`, `    ${run}`, `    more-${run}`, 'Error: x'],
+      // a messy opener redact can't name, then a blank line, then the value (G15)
+      [`db_x${ESC}]0;t${BEL}:`, '', `  ${run}`, 'Error: x'],
+      // seed 57506 case 28798: an OSC at the line start swallowed the indentation (G16)
+      [`  ${PW}:`, `    first-${run}`, `${ESC}]0;t      xx${BEL}mid-${run}`, `    last-${run}`, 'Error: x'],
+      // seed 57507 case 101726: a CSI whose intermediates were the indentation's spaces (G19)
+      [`    ${PW}: >`, `      first-${run}`, ` ${ESC}[     omid-${run}`, `      last-${run}`, 'Error: x'],
+    ];
+    for (const c of cases) {
+      const out = await errorExcerpt(c.join('\n'), composed(v), clean());
+      expect(out, JSON.stringify(c[0])).toContain('Error: x');
+      expect(out, JSON.stringify(c[0])).not.toContain(run);
+    }
     v.wipe();
   });
 });
