@@ -40,10 +40,11 @@ describe('errorExcerpt (E0a, B1)', () => {
     const v = vault();
     const log = [
       `\ufeff${TS}##[group]Run npm test`,
-      // the value split by a colour code: only whole once the code is gone (before the next line, which names a key and so starts the
-      // fail-closed armor run that hides a later line holding a long run in any reading)
+      // the value split by a colour code glued between two of its characters: the code may have eaten some, so the line is dropped
+      // (fix round 1, C1(b)); a colour code next to a blank is ordinary output and stays
       `${TS}${ESC}[33mwarn${ESC}[39m key ${VALUE.slice(0, 3)}${ESC}[1;31m${VALUE.slice(3)}${ESC}[0m in config`,
-      `${TS}${ESC}[31m${ESC}[1mError: Invalid API key provided: ${VALUE}${ESC}[0m`,
+      // (a short last word: a long one next to the messy OSC line below would be hidden, as it may hold a piece of a split value)
+      `${TS}${ESC}[31m${ESC}[1mError: Invalid API key provided: ${VALUE} (see docs)${ESC}[0m`,
       // an OSC 8 hyperlink (BEL- and ST-terminated) and an OSC title
       `${TS}see ${ESC}]8;;https://example.test/docs${ESC}\\the docs${ESC}]8;;${ESC}\\ ${ESC}]0;title\u0007for help`,
       `${TS}##[error]Process completed with exit code 1.`,
@@ -51,8 +52,7 @@ describe('errorExcerpt (E0a, B1)', () => {
     const out = await errorExcerpt(log, composed(v), clean());
     expect(out.split('\n')).toEqual([
       '##[group]Run npm test',
-      `warn key ${R} in config`,
-      `Error: Invalid API key provided: ${R}`,
+      `Error: Invalid API key provided: ${R} (see docs)`,
       'see the docs for help',
       '##[error]Process completed with exit code 1.',
     ]);
@@ -160,7 +160,8 @@ describe('errorExcerpt (E0a, B1)', () => {
     expect(out).toContain(`Error: request failed with key ${R}`);
     expect(out).toContain(`placeholder ${R} rejected`);
     expect(out).toContain(`fingerprint key ${R} used`);
-    expect(out).toContain(`tail of key ${R} rest`);
+    // the value split over lines 11 and 12: both lines are hidden (fix round 1: a value across lines can be cut by redact)
+    expect(out).not.toContain('tail of key');
     v.wipe();
   });
 
@@ -435,10 +436,11 @@ describe('errorExcerpt: regressions from the mutation run and the 200k fuzz runs
     v.wipe();
   });
 
-  it('excerpt: a value split by an invisible character is caught by fullScrub, on one line and across two, without flattening the rest', async () => {
+  it('excerpt: a value split by an invisible character never shows, on one line or across two, and the other lines stay', async () => {
     const v = vault();
+    // on one line: since fix round 1 the value pass finds it in the line's stripped form, and the messy line is hidden
     const one = await errorExcerpt(`Error: a\nkey ${VALUE.slice(0, 8)}\u200b${VALUE.slice(8)}\nnext`, composed(v), clean());
-    expect(one.split('\n')).toHaveLength(3);
+    expect(one.split('\n')).toEqual(['Error: a', 'next']);
     expect(one).not.toContain(VALUE.slice(8));
     const two = await errorExcerpt(`Error: a\ntail ${VALUE.slice(0, 8)}\u200b\n${VALUE.slice(8)} rest\nnext`, composed(v), clean());
     expect(two).not.toContain(VALUE.slice(8));

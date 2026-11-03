@@ -9,6 +9,7 @@
 import { writeFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
 import { redact } from '../src/ai/redact.js';
+import { SecretVault } from '../src/create/secrets.js';
 import { unscannedExcerpt } from '../src/proof/excerpt.js';
 
 const CASES = Number(process.env.PIPEGEN_E0A_FUZZ_CASES ?? 5000);
@@ -34,6 +35,31 @@ const NORMAL = [
   '##[group]Run npm test', '##[endgroup]', 'warning: deprecated option', 'FAIL src/key.test.js', '  ● loads the signing key', 'Expected: 200', '',
   'Received: 500', 'Tests: 3 failed, 41 passed', 'error: the key could not be read', 'done in 4.2s',
 ];
+
+/** The insertion alphabet: CSI, OSC and C1 sequences (some unterminated), stray ESC, ESC-other, LS/PS/CR, C0 controls, DEL, invisibles. */
+function insertionPieces(rnd: () => number): (() => string)[] {
+  const int = (n: number) => Math.floor(rnd() * n);
+  const pick = <T>(xs: readonly T[]): T => xs[int(xs.length)] as T;
+  const b64 = (n: number) => Array.from({ length: n }, () => B64[int(64)]).join('');
+  const params = () => Array.from({ length: int(5) }, () => pick([...'0123456789;'])).join('');
+  const final = () => String.fromCharCode(0x40 + int(0x3f));
+  const pieces = [
+    () => `\u001b[${params()}${rnd() < 0.2 ? pick([...' !"#$%&()*+,-./']) : ''}${final()}`,
+    () => `\u001b]${pick(['0;', '8;;'])}${b64(int(10))}${pick(['\u0007', '\u001b\\', ''])}`,
+    () => `\u009b${params()}${final()}`,
+    () => `\u009d${b64(int(10))}${pick(['\u009c', '\u0007', ''])}`,
+    () => String.fromCharCode(0x80 + int(0x20)),
+    () => '\u001b',
+    () => `\u001b${pick(['(', ')', '#', ''])}${final()}`,
+    () => '\u2028',
+    () => '\u2029',
+    () => '\r',
+    // scan 6: C0 controls (not LF, which ends a line), DEL, and the zero-width, bidi and other invisible characters
+    () => String.fromCharCode(pick([...Array.from({ length: 10 }, (_, k) => k), ...Array.from({ length: 21 }, (_, k) => 11 + k), 0x7f])),
+    () => pick(['\u200b', '\u200c', '\u200d', '\u200e', '\u200f', '\u202a', '\u202b', '\u202c', '\u202d', '\u202e', '\u2060', '\u2066', '\u2067', '\u2068', '\u2069', '\ufeff', '\u00ad', '\u180e', '\ufe0f']),
+  ];
+  return pieces;
+}
 
 interface Case { shape: string; log: string; bare: string; runs: string[]; maxLogChars?: number }
 
@@ -83,25 +109,11 @@ function makeCase(rnd: () => number): Case {
       runs.splice(1);
     }
   }
+  // fix round 1 (I5): a foreign log line inside the block (parallel job output), where redact's own rule still covers it
+  if ((shape === 'pem' || shape === 'toml-section') && blockLines.length > 2 && rnd() < 0.3) blockLines.splice(1 + int(blockLines.length - 2), 0, pick(NORMAL.filter((l) => l !== '')));
   const cleanBlock = [...blockLines];
   // insertions anywhere in the block, the first and last lines (markers, key lines) more often
-  const params = () => Array.from({ length: int(5) }, () => pick([...'0123456789;'])).join('');
-  const final = () => String.fromCharCode(0x40 + int(0x3f));
-  const pieces = [
-    () => `\u001b[${params()}${rnd() < 0.2 ? pick([...' !"#$%&()*+,-./']) : ''}${final()}`,
-    () => `\u001b]${pick(['0;', '8;;'])}${b64(int(10))}${pick(['\u0007', '\u001b\\', ''])}`,
-    () => `\u009b${params()}${final()}`,
-    () => `\u009d${b64(int(10))}${pick(['\u009c', '\u0007', ''])}`,
-    () => String.fromCharCode(0x80 + int(0x20)),
-    () => '\u001b',
-    () => `\u001b${pick(['(', ')', '#', ''])}${final()}`,
-    () => '\u2028',
-    () => '\u2029',
-    () => '\r',
-    // scan 6: C0 controls (not LF, which ends a line), DEL, and the zero-width, bidi and other invisible characters
-    () => String.fromCharCode(pick([...Array.from({ length: 10 }, (_, k) => k), ...Array.from({ length: 21 }, (_, k) => 11 + k), 0x7f])),
-    () => pick(['\u200b', '\u200c', '\u200d', '\u200e', '\u200f', '\u202a', '\u202b', '\u202c', '\u202d', '\u202e', '\u2060', '\u2066', '\u2067', '\u2068', '\u2069', '\ufeff', '\u00ad', '\u180e', '\ufe0f']),
-  ];
+  const pieces = insertionPieces(rnd);
   for (let k = int(9); k > 0; k--) {
     const at = rnd() < 0.4 ? pick([0, blockLines.length - 1]) : int(blockLines.length);
     const line = blockLines[at] as string;
@@ -138,7 +150,7 @@ function leaked(excerpt: string, runs: readonly string[]): string[] {
   return out;
 }
 
-describe('excerpt fuzz (E0a, scans 4 and 5)', () => {
+describe('excerpt fuzz (E0a, scans 4 and 5, fix round 1)', () => {
   it(`excerpt fuzz: no 16-character run of a secret in any of redact's multi-line shapes reaches the excerpt (${CASES} cases, seed ${SEED})`, () => {
     const rnd = mulberry32(SEED);
     const scrub = (t: string) => t;
@@ -165,10 +177,91 @@ describe('excerpt fuzz (E0a, scans 4 and 5)', () => {
     const report = [...stats].map(([k, v]) => `${k}: ${v.cases} cases, ${v.checked} checked, ${v.notCoveredClean} not covered by redact even clean, ${v.cuts} cut`).join('\n');
     if (process.env.PIPEGEN_E0A_FUZZ_REPORT !== undefined) writeFileSync(process.env.PIPEGEN_E0A_FUZZ_REPORT, `${report}\n`);
     // the shapes redact covers must be checked in every case
-    for (const shape of ['pem', 'yaml-block', 'yaml-literal', 'toml-section']) {
+    for (const shape of ['pem', 'yaml-block', 'yaml-literal', 'toml-section', 'json-block']) {
       const st = stats.get(shape);
       expect(st, report).toBeDefined();
       expect((st as { checked: number }).checked, report).toBe((st as { cases: number }).cases);
     }
+  }, 900_000);
+});
+
+// ---------- vault mode (fix round 1, I5) ----------
+
+const VALUE_CHARS = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_+/=-';
+// built at runtime (test/no-secret-literals.test.ts)
+const CONN_PREFIX = ['url=postgres:', '//app:'].join('');
+const VALUE_PREFIXES = [['Error: auth failed for '], ['using key '], ['Authori', 'zation', ': Bas', 'ic '], ['  tok', 'en', ': '], ['']].map((p) => p.join(''));
+
+interface VaultCase { log: string; value: string; windows: string[]; form: string; maxLogChars?: number }
+
+/**
+ * A typed value (8-40 characters, sometimes Stripe-shaped) placed in one of the forms knownForms covers (as typed, base64, the base64 of
+ * `user:value`, hex in either case, URL-encoded, JSON-escaped, in a connection string), whole or split over two lines at a random point,
+ * with the insertion alphabet in and around it; plain filler around, and one error line 4-7 lines away so a window edge can fall
+ * between the pieces. `windows`: what must never show (8 characters of the value; 12 of an encoded form, its edges aside).
+ */
+function makeVaultCase(rnd: () => number): VaultCase {
+  const int = (n: number) => Math.floor(rnd() * n);
+  const pick = <T>(xs: readonly T[]): T => xs[int(xs.length)] as T;
+  const value = (rnd() < 0.3 ? 'sk' + '_test_' : '') + Array.from({ length: 8 + int(33) }, () => VALUE_CHARS[int(VALUE_CHARS.length)]).join('');
+  const b64 = (t: string) => Buffer.from(t, 'utf8').toString('base64');
+  const hex = Buffer.from(value, 'utf8').toString('hex');
+  const forms: [string, string][] = [
+    ['raw', value], ['base64', b64(value)], ['basic', b64(`user:${value}`)], ['hex', hex], ['HEX', hex.toUpperCase()],
+    ['url', encodeURIComponent(value)], ['json', JSON.stringify(value).slice(1, -1)], ['conn', value],
+  ];
+  const [form, text] = pick(forms);
+  const prefix = form === 'conn' ? CONN_PREFIX : pick(VALUE_PREFIXES);
+  const suffix = form === 'conn' ? '@db.internal:5432/app' : pick(['', ' rejected', '"', ' (401)']);
+  let lines = [`${prefix}${text}${suffix}`];
+  if (rnd() < 0.5) {
+    const at = prefix.length + 1 + int(text.length - 1);
+    const whole = lines[0] as string;
+    lines = [whole.slice(0, at), `${pick(['', '', '    ', '\t'])}${whole.slice(at)}`];
+  }
+  const pieces = insertionPieces(rnd);
+  for (let k = int(4); k > 0; k--) {
+    const i = int(lines.length);
+    const l = lines[i] as string;
+    const pos = int(l.length + 1);
+    lines[i] = l.slice(0, pos) + pick(pieces)() + l.slice(pos);
+  }
+  const filler = (n: number, tag: string) => Array.from({ length: n }, (_, i) => `${tag} step ${i} ok`);
+  const d = 4 + int(4);
+  const errorFirst = rnd() < 0.5;
+  const before = errorFirst ? [...filler(int(10), 'a'), 'Error: request failed', ...filler(d - 1, 'b')] : filler(int(10), 'a');
+  const after = errorFirst ? filler(int(10), 'c') : [...filler(d - 1, 'c'), 'Error: request failed', ...filler(int(10), 'd')];
+  const stamp = rnd() < 0.5;
+  const all = [...before, ...lines, ...after].map((l) => (stamp ? TS + l : l));
+  const log = all.join('\n');
+  const windows = form === 'raw' || form === 'url' || form === 'json' || form === 'conn'
+    ? Array.from({ length: Math.max(0, value.length - 7) }, (_, i) => value.slice(i, i + 8))
+    : Array.from({ length: Math.max(0, text.length - 15) }, (_, i) => text.slice(i + 2, i + 14));
+  let maxLogChars: number | undefined;
+  if (rnd() < 0.15) {
+    // a cut just before or inside the value's lines
+    const line = before.length + int(lines.length);
+    const pos = all.slice(0, line).reduce((n, l) => n + l.length + 1, 0) + int((all[line] as string).length + 1);
+    if (log.length - pos > 0) maxLogChars = log.length - pos;
+  }
+  return { log, value, windows, form, ...(maxLogChars === undefined ? {} : { maxLogChars }) };
+}
+
+describe('excerpt fuzz, vault mode (E0a fix round 1)', () => {
+  it(`excerpt fuzz: no 8 characters of a vault value (12 of an encoded form) reach the excerpt, through the real vault scrubber (${CASES} cases, seed ${SEED + 1})`, () => {
+    const rnd = mulberry32(SEED + 1);
+    const byForm = new Map<string, number>();
+    for (let c = 0; c < CASES; c++) {
+      const kase = makeVaultCase(rnd);
+      byForm.set(kase.form, (byForm.get(kase.form) ?? 0) + 1);
+      const v = new SecretVault();
+      v.set('K_VALUE', kase.value);
+      const out = unscannedExcerpt(kase.log, v.scrubber(), kase.maxLogChars === undefined ? {} : { maxLogChars: kase.maxLogChars }).join('\n');
+      v.wipe();
+      const hits = kase.windows.filter((w) => out.includes(w));
+      if (hits.length > 0) expect.fail(`vault case ${c} (${kase.form}, seed ${SEED + 1}) leaked ${JSON.stringify(hits.slice(0, 3))}; log ${JSON.stringify(kase.log.slice(-900))} cut ${kase.maxLogChars}; excerpt ${JSON.stringify(out.slice(0, 600))}`);
+    }
+    if (process.env.PIPEGEN_E0A_FUZZ_REPORT !== undefined) writeFileSync(`${process.env.PIPEGEN_E0A_FUZZ_REPORT}.vault`, `${[...byForm].map(([k, n]) => `${k}: ${n}`).join('\n')}\n`);
+    expect(byForm.size).toBe(8);
   }, 900_000);
 });
