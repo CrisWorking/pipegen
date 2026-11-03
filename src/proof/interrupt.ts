@@ -3,6 +3,7 @@
 // first, because interrupt hooks run in registration order.
 import { PromptCancelledError } from '../cli/io.js';
 import { interrupt, onInterrupt, type InterruptHook, type InterruptOptions } from '../util/exit-hooks.js';
+import { safeText } from '../util/safe-text.js';
 
 /** Plan E Task 7's interface, now a thin wrapper over onInterrupt (ruling B2). Returns the unregister function. */
 export function installInterruptHandler(cleanup: InterruptHook, opts?: InterruptOptions): () => void {
@@ -11,14 +12,19 @@ export function installInterruptHandler(cleanup: InterruptHook, opts?: Interrupt
 
 /**
  * Runs a stage of the proof. A Ctrl-C inside a prompt does not raise SIGINT (the prompt reads the key) but throws PromptCancelledError;
- * that takes the same path as the signal: the interrupt hooks, the sync hooks (vault wipe), then SIGINT is raised. The error is thrown
- * again afterwards, so nothing carries on as if the stage had finished. Any other error or result passes through untouched.
+ * that takes the same path as the signal: the interrupt hooks, the sync hooks (vault wipe), then SIGINT is raised. The error's message
+ * is printed first (E0b review M1): the raised SIGINT ends the process before the rethrown error reaches main's handler, so "pipegen
+ * needs an interactive terminal" would otherwise never be shown. It is a constant from io.ts, cleaned anyway. The error is thrown again
+ * afterwards, so nothing carries on as if the stage had finished. Any other error or result passes through untouched.
  */
 export async function interruptOnCancel<T>(stage: () => Promise<T>): Promise<T> {
   try {
     return await stage();
   } catch (e) {
-    if (e instanceof PromptCancelledError) await interrupt('SIGINT');
+    if (e instanceof PromptCancelledError) {
+      try { process.stderr.write(`${safeText(e.message)}\n`); } catch { /* stderr gone */ }
+      await interrupt('SIGINT');
+    }
     throw e;
   }
 }

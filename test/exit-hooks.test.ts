@@ -1,29 +1,61 @@
 // D5: the one exit-hook registry (src/util/exit-hooks.ts). Real signal handling is tested in a child node process.
 // E0b (ruling B2): interrupt hooks (async, each with a deadline) run on the first signal before the sync hooks; a second
 // signal skips to the sync hooks; a PromptCancelledError mid-proof takes the same path (src/proof/interrupt.ts).
+// Fix round 1: a repeat signal within SECOND_SIGNAL_GRACE_MS of the first is ignored (npx forwards the terminal's Ctrl-C); hooks
+// registered during the hook phase run; the gate is sticky; an interrupt that ran hooks ends with 128 + signo whatever exits.
 import { spawn } from 'node:child_process';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
-import { afterEach, describe, expect, it, vi } from 'vitest';
-import { PromptCancelledError } from '../src/cli/io.js';
-import { installInterruptHandler, interruptOnCancel } from '../src/proof/interrupt.js';
-import { DEFAULT_INTERRUPT_DEADLINE_MS, interrupt, interrupting, onExit, onInterrupt, runExitHooks } from '../src/util/exit-hooks.js';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { onExit, runExitHooks } from '../src/util/exit-hooks.js';
 
 const MODULE = resolve(__dirname, '../src/util/exit-hooks.ts');
 const dirs: string[] = [];
-afterEach(() => { runExitHooks(); vi.useRealTimers(); vi.restoreAllMocks(); for (const d of dirs.splice(0)) rmSync(d, { recursive: true, force: true }); });
+
+type EH = typeof import('../src/util/exit-hooks.js');
+type PI = typeof import('../src/proof/interrupt.js');
+type IO = typeof import('../src/cli/io.js');
+/** In-process interrupt tests each get a fresh registry: once an interrupt starts, the module stays interrupted (sticky gate). */
+let live: EH | null = null;
+async function fresh(): Promise<{ eh: EH; pi: PI; io: IO }> {
+  vi.resetModules();
+  const eh = await import('../src/util/exit-hooks.js');
+  const pi = await import('../src/proof/interrupt.js');
+  const io = await import('../src/cli/io.js');
+  live = eh;
+  return { eh, pi, io };
+}
+let exitListeners: Function[] = [];
+let exitCode: typeof process.exitCode;
+beforeEach(() => { exitListeners = process.listeners('exit'); exitCode = process.exitCode; });
+afterEach(() => {
+  runExitHooks();
+  live?.runExitHooks();
+  live = null;
+  for (const l of process.listeners('exit')) if (!exitListeners.includes(l)) process.removeListener('exit', l as () => void);   // a held exit code
+  process.exitCode = exitCode;
+  vi.useRealTimers();
+  vi.restoreAllMocks();
+  for (const d of dirs.splice(0)) rmSync(d, { recursive: true, force: true });
+});
 
 interface Out { code: number | null; signal: NodeJS.Signals | null; stdout: string; stderr: string; ms: number }
-/**
- * Runs `body` (module source after the import of the registry) in a child node, sends `signal` once it prints READY, and collects the
- * result. With `again`, the signal is sent a second time once the child prints that marker.
- */
-function child(body: string, signal: NodeJS.Signals, again?: string): Promise<Out> {
+interface ChildOpts {
+  /** Send the signal again this many ms after the first, once per entry. */
+  extra?: number[];
+  /** Send the signal again `delayMs` after the child prints `marker`. */
+  again?: { marker: string; delayMs: number };
+  /** Keep the child's event loop alive (default true); false lets it end on its own. */
+  keep?: boolean;
+}
+/** Runs `body` (module source after the import of the registry) in a child node, sends `signal` once it prints READY, and collects the result. */
+function child(body: string, signal: NodeJS.Signals, opts: ChildOpts = {}): Promise<Out> {
   const dir = mkdtempSync(join(tmpdir(), 'pg-exit-'));
   dirs.push(dir);
   const file = join(dir, 'c.mjs');
-  writeFileSync(file, `import { onExit, onInterrupt, interrupt } from ${JSON.stringify(MODULE)};\nconst sleep = (ms) => new Promise((r) => setTimeout(r, ms));\n${body}\nconsole.log('READY');\nsetInterval(() => {}, 1000);\n`);
+  const keep = opts.keep === false ? '' : 'setInterval(() => {}, 1000);\n';
+  writeFileSync(file, `import { onExit, onInterrupt, interrupt, interrupting } from ${JSON.stringify(MODULE)};\nconst sleep = (ms) => new Promise((r) => setTimeout(r, ms));\n${body}\nconsole.log('READY');\n${keep}`);
   return new Promise((done, fail) => {
     const p = spawn(process.execPath, [file], { stdio: ['ignore', 'pipe', 'pipe'] });
     let stdout = '';
@@ -31,17 +63,26 @@ function child(body: string, signal: NodeJS.Signals, again?: string): Promise<Ou
     let sent = false;
     let sentAgain = false;
     let t0 = 0;
+    const timers: ReturnType<typeof setTimeout>[] = [];
+    const send = (): void => { try { p.kill(signal); } catch { /* gone */ } };
     const guard = setTimeout(() => { p.kill('SIGKILL'); fail(new Error(`child timed out; output so far: ${stdout}`)); }, 15_000);
     p.stderr.on('data', (b: Buffer) => { stderr += b.toString(); });
     p.stdout.on('data', (b: Buffer) => {
       stdout += b.toString();
-      if (!sent && stdout.includes('READY')) { sent = true; t0 = Date.now(); p.kill(signal); }
-      if (again !== undefined && !sentAgain && stdout.includes(again)) { sentAgain = true; p.kill(signal); }
+      if (!sent && stdout.includes('READY')) {
+        sent = true;
+        t0 = Date.now();
+        send();
+        for (const ms of opts.extra ?? []) timers.push(setTimeout(send, ms));
+      }
+      if (opts.again !== undefined && !sentAgain && stdout.includes(opts.again.marker)) { sentAgain = true; timers.push(setTimeout(send, opts.again.delayMs)); }
     });
-    p.on('exit', (code, sig) => { clearTimeout(guard); done({ code, signal: sig, stdout, stderr, ms: Date.now() - t0 }); });
+    p.on('exit', (code, sig) => { clearTimeout(guard); for (const t of timers) clearTimeout(t); done({ code, signal: sig, stdout, stderr, ms: Date.now() - t0 }); });
   });
 }
 const lines = (s: string): string[] => s.split('\n').filter((l) => l !== '' && l !== 'READY');
+/** Past the grace window: a deliberate second Ctrl-C. */
+const DELIBERATE = 1_500;
 
 describe('exit-hooks: one registry', () => {
   it('runExitHooks runs each hook once and in order; a hook that throws does not stop the others', () => {
@@ -129,22 +170,40 @@ describe('exit-hooks: interrupt path (E0b, ruling B2)', () => {
     const r = await child([
       "const record = (item) => console.log('LEFT ' + item);",
       "onExit(() => console.log('sync'));",
-      "onInterrupt(async (ctx) => { ctx.signal.addEventListener('abort', () => console.log('aborted')); console.log('STARTED'); await new Promise(() => {}); }, { label: 'slow', record });",
+      "onInterrupt(async (ctx) => {",
+      "  ctx.signal.addEventListener('abort', () => console.log('aborted'));",
+      "  onInterrupt(async () => { console.log('late hook ran'); }, { label: 'late', record });",   // registered during the hook phase
+      "  console.log('STARTED');",
+      "  await new Promise(() => {});",
+      "}, { label: 'slow', record });",
       "onInterrupt(async () => { console.log('second hook ran'); }, { label: 'later', record });",
-    ].join('\n'), 'SIGINT', 'STARTED');
-    expect(lines(r.stdout)).toEqual(['STARTED', 'aborted', 'LEFT slow: stopped by a second signal', 'LEFT later: not run (stopped by a second signal)', 'sync']);
+    ].join('\n'), 'SIGINT', { again: { marker: 'STARTED', delayMs: DELIBERATE } });
+    expect(lines(r.stdout)).toEqual(['STARTED', 'aborted', 'LEFT slow: stopped by a second signal', 'LEFT later: not run (stopped by a second signal)', 'LEFT late: not run (stopped by a second signal)', 'sync']);
     expect(r.signal).toBe('SIGINT');
     expect(r.ms).toBeLessThan(10_000);   // the hook's deadline is 90 s: only the second signal ends it this fast
   });
 
+  it('exit-hooks: two SIGINTs a few ms apart (npx forwards the terminal\'s Ctrl-C) → the cleanup still runs fully', async () => {
+    const r = await child([
+      "await sleep(1200);",   // the window counts from the first signal, not from the start of the process
+      "const record = (item) => console.log('LEFT ' + item);",
+      "onExit(() => console.log('sync'));",
+      "onInterrupt(async () => { await sleep(900); console.log('secrets deleted'); }, { label: 'scratch cleanup', record });",
+      "onInterrupt(async () => { console.log('prs closed'); }, { label: 'prs', record });",
+    ].join('\n'), 'SIGINT', { extra: [2, 600] });   // npm's forwarded copy, then a repeat still inside the 1 s window
+    expect(lines(r.stdout)).toEqual(['secrets deleted', 'prs closed', 'sync']);
+    expect(r.signal).toBe('SIGINT');
+  });
+
   it('exit-hooks: PromptCancelledError mid-proof takes the same path', async () => {
+    const { eh, pi, io } = await fresh();
     const seen: string[] = [];
     const kill = vi.spyOn(process, 'kill').mockImplementation(((_pid: number, sig?: string | number) => { seen.push(`raise ${String(sig)}`); return true; }) as typeof process.kill);
     vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
-    onExit(() => seen.push('sync'));
-    installInterruptHandler(async () => { await Promise.resolve(); seen.push('cleanup'); });
-    const cancelled = new PromptCancelledError();
-    await expect(interruptOnCancel(async () => { seen.push('proof'); throw cancelled; })).rejects.toBe(cancelled);
+    eh.onExit(() => seen.push('sync'));
+    pi.installInterruptHandler(async () => { await Promise.resolve(); seen.push('cleanup'); });
+    const cancelled = new io.PromptCancelledError();
+    await expect(pi.interruptOnCancel(async () => { seen.push('proof'); throw cancelled; })).rejects.toBe(cancelled);
     expect(seen).toEqual(['proof', 'cleanup', 'sync', 'raise SIGINT']);
     expect(kill).toHaveBeenCalledWith(process.pid, 'SIGINT');
   });
@@ -155,10 +214,10 @@ describe('exit-hooks: interrupt path (E0b, ruling B2)', () => {
       "for (let i = 0; i < 5; i++) onInterrupt(async () => {});",
       "const off = onInterrupt(async () => {}); off();",
       "console.log('SIGINT ' + process.listenerCount('SIGINT') + ' SIGTERM ' + process.listenerCount('SIGTERM') + ' exit ' + process.listenerCount('exit'));",
-      "onInterrupt(async () => { console.log('during SIGINT ' + process.listenerCount('SIGINT')); });",
+      "onInterrupt(async () => { console.log('during SIGINT ' + process.listenerCount('SIGINT') + ' exit ' + process.listenerCount('exit')); });",
       "onExit(() => console.log('sync'));",
     ].join('\n'), 'SIGINT');
-    expect(lines(r.stdout)).toEqual(['SIGINT 1 SIGTERM 1 exit 1', 'during SIGINT 1', 'sync']);
+    expect(lines(r.stdout)).toEqual(['SIGINT 1 SIGTERM 1 exit 1', 'during SIGINT 1 exit 1', 'sync']);
     expect(r.signal).toBe('SIGINT');
   });
 
@@ -167,9 +226,19 @@ describe('exit-hooks: interrupt path (E0b, ruling B2)', () => {
       "const record = (item) => console.log('LEFT ' + item);",
       "const off = onExit(() => {});",
       "onInterrupt(async () => { off(); console.log('STARTED'); await new Promise(() => {}); }, { label: 'slow', record });",
-    ].join('\n'), 'SIGINT', 'STARTED');
+    ].join('\n'), 'SIGINT', { again: { marker: 'STARTED', delayMs: DELIBERATE } });
     expect(lines(r.stdout)).toEqual(['STARTED', 'LEFT slow: stopped by a second signal']);
     expect(r.signal).toBe('SIGINT');
+  });
+
+  it('a plain exit (no signal) runs the sync hooks and records nothing for the interrupt hooks, with exit code 0', async () => {
+    const r = await child([
+      "const record = (item) => console.log('LEFT ' + item);",
+      "onExit(() => console.log('sync'));",
+      "onInterrupt(async () => { console.log('ran'); }, { label: 'cleanup', record });",
+    ].join('\n'), 'SIGCONT', { keep: false });
+    expect(lines(r.stdout)).toEqual(['sync']);
+    expect(r.code).toBe(0);
   });
 
   it('SIGTERM takes the same path', async () => {
@@ -191,6 +260,42 @@ describe('exit-hooks: interrupt path (E0b, ruling B2)', () => {
     expect(r.stderr).not.toContain('ERRTEXT');
     expect(r.signal).toBe('SIGINT');
   });
+
+  it('a foreign non-exiting SIGINT handler: the process lives on, interrupting() stays true, and it ends with 130', async () => {
+    const r = await child([
+      "process.on('SIGINT', () => console.log('other'));",
+      "onExit(() => console.log('sync'));",
+      "onInterrupt(async () => { await sleep(50); console.log('cleaned'); });",
+      "(async () => { while (!interrupting()) await sleep(5); await sleep(300); console.log('after: interrupting()=' + interrupting()); })();",
+    ].join('\n'), 'SIGINT', { keep: false });
+    expect(lines(r.stdout)).toEqual(['other', 'cleaned', 'sync', 'after: interrupting()=true']);
+    expect(r.signal).toBeNull();
+    expect(r.code).toBe(130);
+  });
+
+  it('process.exit(0) during the cleanup: the cut and pending hooks are recorded, the sync hooks run, the exit code is 130', async () => {
+    const r = await child([
+      "const record = (item) => console.log('LEFT ' + item);",
+      "onExit(() => console.log('sync'));",
+      "onInterrupt(async () => { await sleep(20); process.exit(0); }, { label: 'one', record });",
+      "onInterrupt(async () => { console.log('two ran'); }, { label: 'two', record });",
+    ].join('\n'), 'SIGINT');
+    expect(lines(r.stdout)).toEqual(['LEFT one: cut by the process exiting', 'LEFT two: not run (cut by the process exiting)', 'sync']);
+    expect(r.signal).toBeNull();
+    expect(r.code).toBe(130);
+  });
+
+  it('an uncaught exception in the proof flow during a SIGTERM cleanup: the hook is recorded as cut, the exit code is 143', async () => {
+    const r = await child([
+      "const record = (item) => console.log('LEFT ' + item);",
+      "onExit(() => console.log('sync'));",
+      "onInterrupt(async () => { await sleep(2000); console.log('cleaned'); }, { label: 'slow', record });",
+      "(async () => { while (!interrupting()) await sleep(5); setTimeout(() => { throw new Error('boom'); }, 50); })();",
+    ].join('\n'), 'SIGTERM');
+    expect(lines(r.stdout)).toEqual(['LEFT slow: cut by the process exiting', 'sync']);
+    expect(r.signal).toBeNull();
+    expect(r.code).toBe(143);
+  });
 });
 
 describe('exit-hooks: interrupt path, in process (raising the signal is stubbed)', () => {
@@ -203,32 +308,40 @@ describe('exit-hooks: interrupt path, in process (raising the signal is stubbed)
   }
 
   it('interrupt(): hooks in registration order, each awaited before the next, then the sync hooks, then the signal', async () => {
+    const { eh } = await fresh();
     const { seen } = stubbed();
-    onExit(() => seen.push('sync1'));
-    onInterrupt(async () => { await new Promise((r) => setTimeout(r, 20)); seen.push('a1'); });
-    onExit(() => seen.push('sync2'));
-    onInterrupt(async () => { seen.push('a2'); });
-    await interrupt('SIGTERM');
+    eh.onExit(() => seen.push('sync1'));
+    eh.onInterrupt(async () => { await new Promise((r) => setTimeout(r, 20)); seen.push('a1'); });
+    eh.onExit(() => seen.push('sync2'));
+    eh.onInterrupt(async () => { seen.push('a2'); });
+    await eh.interrupt('SIGTERM');
     expect(seen).toEqual(['a1', 'a2', 'sync1', 'sync2', 'raise SIGTERM self']);
   });
 
   it('interrupt() defaults to SIGINT, and with no interrupt hook still runs the sync hooks and raises', async () => {
+    const { eh } = await fresh();
     const { seen } = stubbed();
-    onExit(() => seen.push('sync'));
-    await interrupt();
+    eh.onExit(() => seen.push('sync'));
+    await eh.interrupt();
     expect(seen).toEqual(['sync', 'raise SIGINT self']);
   });
 
+  it('the grace window for a repeat signal is 1 s', async () => {
+    const { eh } = await fresh();
+    expect(eh.SECOND_SIGNAL_GRACE_MS).toBe(1_000);
+  });
+
   it('the default deadline is 90 s and is printed; a hook is cut at its deadline, not before', async () => {
-    expect(DEFAULT_INTERRUPT_DEADLINE_MS).toBe(90_000);
+    const { eh } = await fresh();
+    expect(eh.DEFAULT_INTERRUPT_DEADLINE_MS).toBe(90_000);
     const { seen, err } = stubbed();
     vi.useFakeTimers();
     const left: string[] = [];
-    onInterrupt(() => new Promise(() => {}), { label: 'stuck', record: (i) => left.push(i) });
-    const done = interrupt();
+    eh.onInterrupt(() => new Promise(() => {}), { label: 'stuck', record: (i) => left.push(i) });
+    const done = eh.interrupt();
     let finished = false;
     void done.then(() => { finished = true; });
-    await vi.advanceTimersByTimeAsync(DEFAULT_INTERRUPT_DEADLINE_MS - 1);
+    await vi.advanceTimersByTimeAsync(eh.DEFAULT_INTERRUPT_DEADLINE_MS - 1);
     expect(finished).toBe(false);
     expect(left).toEqual([]);
     await vi.advanceTimersByTimeAsync(1);
@@ -239,12 +352,13 @@ describe('exit-hooks: interrupt path, in process (raising the signal is stubbed)
   });
 
   it('a custom deadline is used and printed; the hook\'s signal is aborted when it passes', async () => {
+    const { eh } = await fresh();
     const { err } = stubbed();
     vi.useFakeTimers();
     const left: string[] = [];
     let aborted = false;
-    onInterrupt((ctx) => { ctx.signal.addEventListener('abort', () => { aborted = true; }); return new Promise(() => {}); }, { deadlineMs: 2_500, record: (i) => left.push(i) });
-    const done = interrupt();
+    eh.onInterrupt((ctx) => { ctx.signal.addEventListener('abort', () => { aborted = true; }); return new Promise(() => {}); }, { deadlineMs: 2_500, record: (i) => left.push(i) });
+    const done = eh.interrupt();
     await vi.advanceTimersByTimeAsync(2_499);
     expect(aborted).toBe(false);
     await vi.advanceTimersByTimeAsync(1);
@@ -254,32 +368,45 @@ describe('exit-hooks: interrupt path, in process (raising the signal is stubbed)
     expect(err.join('')).toContain('cleanup (up to 2.5 s;');
   });
 
+  it('deadlineMs must be a finite number from 1 to 2147483647 ms, checked when the hook is registered', async () => {
+    const { eh } = await fresh();
+    for (const bad of [Infinity, -Infinity, NaN, 0, 0.5, -1, 2_147_483_648, '100' as unknown as number]) {
+      expect(() => eh.onInterrupt(async () => {}, { deadlineMs: bad }), String(bad)).toThrow(/deadlineMs/);
+    }
+    expect(() => eh.onInterrupt(async () => {}, { deadlineMs: 1 })).not.toThrow();
+    expect(() => eh.onInterrupt(async () => {}, { deadlineMs: 2_147_483_647 })).not.toThrow();
+    expect(() => eh.onInterrupt(async () => {}, { deadlineMs: 1.5 })).not.toThrow();
+  });
+
   it('a hook that finishes in time is not aborted and records nothing; its timer does not hold the process', async () => {
+    const { eh } = await fresh();
     stubbed();
     const left: string[] = [];
     let signal: AbortSignal | undefined;
-    onInterrupt(async (ctx) => { signal = ctx.signal; ctx.leftover('branch proof/1'); }, { record: (i) => left.push(i) });
+    eh.onInterrupt(async (ctx) => { signal = ctx.signal; ctx.leftover('branch proof/1'); }, { record: (i) => left.push(i) });
     const t0 = Date.now();
-    await interrupt();
+    await eh.interrupt();
     expect(Date.now() - t0).toBeLessThan(1_000);
     expect(signal?.aborted).toBe(false);
     expect(left).toEqual(['branch proof/1']);
   });
 
   it('without a recorder, leftovers are printed to stderr with control characters removed', async () => {
+    const { eh } = await fresh();
     const { err } = stubbed();
-    onInterrupt(async (ctx) => { ctx.leftover('pr #4\u001b[31m\r\nfake line'); }, { label: 'prs' });
-    await interrupt();
+    eh.onInterrupt(async (ctx) => { ctx.leftover('pr #4\u001b[31m\r\nfake line'); }, { label: 'prs' });
+    await eh.interrupt();
     expect(err.join('')).toContain('Left behind: pr #4?[31m??fake line\n');
   });
 
   it('interrupt() raises the signal even when another handler of it exists (no handler has seen it yet)', async () => {
+    const { eh } = await fresh();
     const { seen } = stubbed();
     const other = (): void => {};
     process.on('SIGINT', other);
     try {
-      onInterrupt(async () => { seen.push('a1'); });
-      await interrupt();
+      eh.onInterrupt(async () => { seen.push('a1'); });
+      await eh.interrupt();
     } finally {
       process.removeListener('SIGINT', other);
     }
@@ -287,64 +414,127 @@ describe('exit-hooks: interrupt path, in process (raising the signal is stubbed)
   });
 
   it('no deadline timer is left behind once a hook ends', async () => {
+    const { eh } = await fresh();
     stubbed();
     vi.useFakeTimers();
-    onInterrupt(async () => {});
-    onInterrupt(() => new Promise(() => {}), { deadlineMs: 10, record: () => {} });
-    const done = interrupt();
+    eh.onInterrupt(async () => {});
+    eh.onInterrupt(() => new Promise(() => {}), { deadlineMs: 10, record: () => {} });
+    const done = eh.interrupt();
     await vi.advanceTimersByTimeAsync(10);
     await done;
     expect(vi.getTimerCount()).toBe(0);
   });
 
   it('a recorder that throws does not stop the cleanup', async () => {
+    const { eh } = await fresh();
     const { seen } = stubbed();
-    onInterrupt(async (ctx) => { ctx.leftover('x'); seen.push('after leftover'); }, { record: () => { throw new Error('disk full'); } });
-    onExit(() => seen.push('sync'));
-    await interrupt();
+    eh.onInterrupt(async (ctx) => { ctx.leftover('x'); seen.push('after leftover'); }, { record: () => { throw new Error('disk full'); } });
+    eh.onExit(() => seen.push('sync'));
+    await eh.interrupt();
     expect(seen).toEqual(['after leftover', 'sync', 'raise SIGINT self']);
   });
 
-  it('interrupting() is true from the first signal until the sync hooks run', async () => {
+  it('interrupting() turns true when an interrupt starts and stays true for the rest of the process (sticky gate)', async () => {
+    const { eh } = await fresh();
     const { seen } = stubbed();
-    expect(interrupting()).toBe(false);
-    onInterrupt(async () => { seen.push(`during ${interrupting()}`); });
-    onExit(() => seen.push(`sync ${interrupting()}`));
-    const done = interrupt();
-    expect(interrupting()).toBe(true);
+    expect(eh.interrupting()).toBe(false);
+    eh.onInterrupt(async () => { seen.push(`during ${eh.interrupting()}`); });
+    eh.onExit(() => seen.push(`sync ${eh.interrupting()}`));
+    const done = eh.interrupt();
+    expect(eh.interrupting()).toBe(true);
     await done;
-    expect(interrupting()).toBe(false);
-    expect(seen).toEqual(['during true', 'sync false', 'raise SIGINT self']);
+    expect(eh.interrupting()).toBe(true);
+    expect(seen).toEqual(['during true', 'sync true', 'raise SIGINT self']);
+  });
+
+  it('a plain stop without interrupt hooks also closes the gate', async () => {
+    const { eh } = await fresh();
+    stubbed();
+    await eh.interrupt();
+    expect(eh.interrupting()).toBe(true);
   });
 
   it('a second interrupt() while one runs joins it: the hooks run once', async () => {
+    const { eh } = await fresh();
     const { seen } = stubbed();
-    onInterrupt(async () => { await Promise.resolve(); seen.push('a1'); });
-    const one = interrupt();
-    const two = interrupt();
+    eh.onInterrupt(async () => { await Promise.resolve(); seen.push('a1'); });
+    const one = eh.interrupt();
+    const two = eh.interrupt();
     expect(two).toBe(one);
     await one;
     expect(seen).toEqual(['a1', 'raise SIGINT self']);
-    await interrupt();   // a later stop starts afresh (nothing left to run)
+    await eh.interrupt();   // a later stop runs only the sync part (nothing left to run)
     expect(seen).toEqual(['a1', 'raise SIGINT self', 'raise SIGINT self']);
   });
 
-  it('onInterrupt returns an unregister function; runExitHooks (the exit event) forgets the interrupt hooks', async () => {
+  it('a hook registered during the hook phase runs after the running one, in registration order; one unregistered first does not', async () => {
+    const { eh } = await fresh();
     const { seen } = stubbed();
-    const off = onInterrupt(async () => { seen.push('off'); });
+    eh.onInterrupt(async () => {
+      eh.onInterrupt(async () => { seen.push('late1'); }, { label: 'late1' });
+      const off = eh.onInterrupt(async () => { seen.push('dropped'); });
+      eh.onInterrupt(async () => { seen.push('late2'); }, { label: 'late2' });
+      off();
+      await Promise.resolve();
+      seen.push('a1');
+    });
+    eh.onInterrupt(async () => { seen.push('a2'); });
+    eh.onExit(() => seen.push('sync'));
+    await eh.interrupt();
+    expect(seen).toEqual(['a1', 'a2', 'late1', 'late2', 'sync', 'raise SIGINT self']);
+  });
+
+  it('a hook registered after the hook phase is recorded as a leftover at once and never runs', async () => {
+    const { eh } = await fresh();
+    const { seen, err } = stubbed();
+    const left: string[] = [];
+    eh.onInterrupt(async () => { seen.push('a1'); });
+    eh.onExit(() => { eh.onInterrupt(async () => { seen.push('from sync ran'); }, { label: 'from sync', record: (i) => left.push(i) }); });
+    await eh.interrupt();
+    const before = process.listenerCount('SIGINT');
+    const off = eh.onInterrupt(async () => { seen.push('after ran'); }, { label: 'after', record: (i) => left.push(i) });
+    eh.onInterrupt(async () => {}, { label: 'printed' });
+    expect(process.listenerCount('SIGINT')).toBe(before);   // nothing installed for it
+    off();
+    for (const bad of [0, NaN]) expect(() => eh.onInterrupt(async () => {}, { deadlineMs: bad })).toThrow(/deadlineMs/);   // checked in every phase
+    await eh.interrupt();
+    expect(seen).toEqual(['a1', 'raise SIGINT self', 'raise SIGINT self']);
+    expect(left).toEqual(['from sync: not run (registered after the cleanup)', 'after: not run (registered after the cleanup)']);
+    expect(err.join('')).toContain('Left behind: printed: not run (registered after the cleanup)\n');
+  });
+
+  it('after an interrupt with hooks the one exit listener stays (it holds the exit code); new hooks do not add a second', async () => {
+    const { eh } = await fresh();
+    stubbed();
+    const before = process.listenerCount('exit');
+    eh.onInterrupt(async () => {});
+    expect(process.listenerCount('exit')).toBe(before + 1);
+    await eh.interrupt();
+    expect(process.listenerCount('exit')).toBe(before + 1);
+    const off = eh.onExit(() => {});
+    expect(process.listenerCount('exit')).toBe(before + 1);
+    off();
+    expect(process.listenerCount('exit')).toBe(before + 1);
+  });
+
+  it('onInterrupt returns an unregister function; runExitHooks (the exit event) forgets the interrupt hooks', async () => {
+    const { eh } = await fresh();
+    const { seen } = stubbed();
+    const off = eh.onInterrupt(async () => { seen.push('off'); });
     off();
     off();
-    onInterrupt(async () => { seen.push('forgotten'); });
-    runExitHooks();
-    await interrupt();
+    eh.onInterrupt(async () => { seen.push('forgotten'); });
+    eh.runExitHooks();
+    await eh.interrupt();
     expect(seen).toEqual(['raise SIGINT self']);
   });
 
-  it('onInterrupt alone installs the one set of process handlers; they go when the last hook goes', () => {
+  it('onInterrupt alone installs the one set of process handlers; they go when the last hook goes', async () => {
+    const { eh } = await fresh();
     const before = { exit: process.listenerCount('exit'), int: process.listenerCount('SIGINT'), term: process.listenerCount('SIGTERM') };
-    const a = onInterrupt(async () => {});
-    const b = onExit(() => {});
-    const c = onInterrupt(async () => {});
+    const a = eh.onInterrupt(async () => {});
+    const b = eh.onExit(() => {});
+    const c = eh.onInterrupt(async () => {});
     expect(process.listenerCount('exit')).toBe(before.exit + 1);
     expect(process.listenerCount('SIGINT')).toBe(before.int + 1);
     expect(process.listenerCount('SIGTERM')).toBe(before.term + 1);
@@ -358,26 +548,44 @@ describe('exit-hooks: interrupt path, in process (raising the signal is stubbed)
   });
 
   it('installInterruptHandler is onInterrupt (options passed through)', async () => {
+    const { eh, pi } = await fresh();
     const { seen } = stubbed();
     const left: string[] = [];
     const before = process.listenerCount('SIGINT');
-    const off = installInterruptHandler(async (ctx) => { ctx.leftover('l1'); seen.push('h'); }, { label: 'state', record: (i) => left.push(i) });
+    const off = pi.installInterruptHandler(async (ctx) => { ctx.leftover('l1'); seen.push('h'); }, { label: 'state', record: (i) => left.push(i) });
     expect(process.listenerCount('SIGINT')).toBe(before + 1);
     off();
     expect(process.listenerCount('SIGINT')).toBe(before);
-    installInterruptHandler(async (ctx) => { ctx.leftover('l2'); seen.push('h2'); }, { record: (i) => left.push(i) });
-    await interrupt();
+    pi.installInterruptHandler(async (ctx) => { ctx.leftover('l2'); seen.push('h2'); }, { record: (i) => left.push(i) });
+    expect(() => pi.installInterruptHandler(async () => {}, { deadlineMs: 0 })).toThrow(/deadlineMs/);
+    await eh.interrupt();
     expect(seen).toEqual(['h2', 'raise SIGINT self']);
     expect(left).toEqual(['l2']);
   });
 
   it('interruptOnCancel: a result passes through; any other error is rethrown without stopping', async () => {
+    const { eh, pi } = await fresh();
     const { seen } = stubbed();
-    onInterrupt(async () => { seen.push('cleanup'); });
-    await expect(interruptOnCancel(async () => 42)).resolves.toBe(42);
+    eh.onInterrupt(async () => { seen.push('cleanup'); });
+    await expect(pi.interruptOnCancel(async () => 42)).resolves.toBe(42);
     const other = new Error('network');
-    await expect(interruptOnCancel(async () => { throw other; })).rejects.toBe(other);
+    await expect(pi.interruptOnCancel(async () => { throw other; })).rejects.toBe(other);
     expect(seen).toEqual([]);
-    expect(interrupting()).toBe(false);
+    expect(eh.interrupting()).toBe(false);
+  });
+
+  it('interruptOnCancel prints why it stops (no terminal), control characters removed, before the cleanup starts', async () => {
+    const { eh, pi, io } = await fresh();
+    const { seen, err } = stubbed();
+    eh.onInterrupt(async () => { seen.push('cleanup'); });
+    const noTty = new io.PromptCancelledError('pipegen needs an interactive terminal to ask this question.');
+    await expect(pi.interruptOnCancel(async () => { throw noTty; })).rejects.toBe(noTty);
+    expect(err[0]).toBe('pipegen needs an interactive terminal to ask this question.\n');
+    expect(err[1]).toMatch(/^Cleaning up before stopping/);
+    const odd = new io.PromptCancelledError('a\u001b[2Jb\nc');
+    await expect(pi.interruptOnCancel(async () => { throw odd; })).rejects.toBe(odd);
+    expect(err.join('')).not.toContain('\u001b');
+    expect(err.join('')).not.toContain('b\nc');
+    expect(seen).toEqual(['cleanup', 'raise SIGINT self', 'raise SIGINT self']);
   });
 });
