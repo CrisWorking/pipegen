@@ -498,9 +498,11 @@ describe('errorExcerpt: regressions from the mutation run and the 200k fuzz runs
   it('excerpt: only a clean header ends a secret section (a messy line that reads as one does not)', async () => {
     const v = vault();
     const sec = ['[sec', 'rets]'].join('');
-    const out = await errorExcerpt([sec, `a = ${run}`, `${ESC}]0;x${BEL}[other]`, `b = more-${run}`, '[plain]', 'Error: x'].join('\n'), composed(v), clean());
-    expect(out).toContain('Error: x');
-    expect(out).not.toContain(run);
+    for (const header of [`${ESC}]0;x${BEL}[other]`, `${ESC}[1m[other]${ESC}[0m`]) {
+      const out = await errorExcerpt([sec, `a = ${run}`, header, `b = more-${run}`, '[plain]', 'Error: x'].join('\n'), composed(v), clean());
+      expect(out, JSON.stringify(header)).toContain('Error: x');
+      expect(out, JSON.stringify(header)).not.toContain(run);
+    }
     v.wipe();
   });
 
