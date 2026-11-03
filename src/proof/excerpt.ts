@@ -206,8 +206,9 @@ const LONG_RUN = /[A-Za-z0-9+/]{16,}/;
 const SECTION_HEADER = /^[ \t]*\[\[?[^\]]*\]\]?[ \t]*(?:[#;].*)?$/;
 /**
  * Fix round 1 (vault fuzz): the length of the token a line has at its end, or at its start past the indentation (non-blank characters:
- * a typed value can hold any printable character, `%` and quotes too). A dropped line can't be read for sure (two insertions can need
- * opposite readings), so a neighbour whose token next to it is MIN_SPLIT_PIECE characters or longer may hold a piece of a value split
+ * a typed value can hold any printable character, `%` and quotes too). No reading of a messy line (dropped lines included) can be
+ * trusted (two insertions can need opposite readings, a payload can stand between two pieces), so a line whose token at an edge it shares
+ * with a messy line, or a messy line's own token at an edge, is MIN_SPLIT_PIECE characters or longer may hold a piece of a value split
  * across the two lines, and is hidden.
  */
 function edgeRun(line: string, atEnd: boolean): number {
