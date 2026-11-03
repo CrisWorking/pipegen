@@ -1094,6 +1094,91 @@ async function secretScanPass(files: FileEntry[], scanner: SecretScanner, timeou
   }
 }
 
+/** What secretScanText found in one text: see there. */
+export interface TextScan {
+  /** The text's own lines (1-based) a finding was reported on, sorted. */
+  lines: number[];
+  /** Every found text (the reported secret and match) of MIN_GLOBAL_SECRET characters or more. */
+  values: string[];
+  /** A finding that names no line of the text (none, invalid, pipegen's prefix or the canary's lines) or another file. */
+  unplaced: boolean;
+}
+
+/**
+ * Plan E E0a (ruling B1, step 7): the secret scan over one text, such as the fix loop's log excerpt, with the scanner, config,
+ * argv, prefix line, canary (P34) and private temp folder of bundleCode's pass. Allow comments are neutralised first (same
+ * length per line, so lines don't move). It reports where findings are rather than editing the text, so the caller decides
+ * what to drop. Throws SecretScanError when the scan can't run or gives an unusable result, when the text as written is over
+ * SCAN_CHUNK_SAFE_BYTES or shaped like a format the scanners skip (scannersWouldSkip), and when the canary did not come back
+ * exactly once, on its own line: the scan may have read nothing.
+ */
+export async function secretScanText(text: string, scanner: SecretScanner, timeoutMs: number = SECRET_SCAN_TIMEOUT_MS): Promise<TextScan> {
+  const { name, path: bin } = scanner;
+  if (!isAbsolute(bin)) throw new SecretScanError(`The ${name} binary must be given as an absolute path.`);
+  let config: string;
+  try {
+    config = secretScanConfigPath();
+  } catch (e) {
+    throw new SecretScanError(e instanceof Error ? e.message : `pipegen's ${name} config could not be found.`);
+  }
+  const content = neutralizeAllow(String(text));
+  const canary = newCanary();
+  const written = asScanned(content, canary);
+  if (Buffer.byteLength(written) > SCAN_CHUNK_SAFE_BYTES) throw new SecretScanError(`The text is too large to secret-scan whole (over ${SCAN_CHUNK_SAFE_BYTES.toLocaleString('en-US')} bytes as scanned).`);
+  if (scannersWouldSkip(written)) throw new SecretScanError(`The text has a binary-format marker at a fixed byte, so ${name} would skip it.`);
+  const made = await mkdtemp(join(tmpdir(), 'pipegen-secret-scan-'));
+  const guard = guardTempDir(made);
+  try {
+    const tmp = await realpath(made);
+    await chmod(tmp, 0o700);
+    const file = 'f000001.txt';
+    if (skippedByDefaultPaths(join(tmp, file))) {
+      throw new SecretScanError(`The secret scan's temp folder ${safeText(tmp)} is under a folder the ${name} scanner skips (such as node_modules); set TMPDIR to another folder and run again. Nothing was sent.`);
+    }
+    await writeFile(join(tmp, file), written, { flag: 'wx', mode: 0o600 });
+    const reportPath = join(tmp, 'report.json');
+    const code = await runScanner(name, bin, secretScanArgv(name, tmp, config, reportPath), tmp, timeoutMs, (c) => { guard.child = c; });
+    if (code !== SECRET_SCAN_EXIT.clean && code !== SECRET_SCAN_EXIT.found) throw new SecretScanError(`${name} failed (exit code ${code}).`);
+    const reported = (await readReport(name, reportPath)).map(unprefixed);
+    if (code === SECRET_SCAN_EXIT.found && reported.length === 0) throw new SecretScanError(`${name} reported findings but listed none.`);
+    const own = canaryLine(written);
+    const contentLines = content === '' ? 0 : content.split('\n').length - (content.endsWith('\n') ? 1 : 0);
+    const isOurs = (f: Finding) => {
+      const abs = isAbsolute(f.file) ? resolve(f.file) : resolve(tmp, f.file);
+      return insideDir(tmp, abs) && relative(tmp, abs) === file;
+    };
+    let seen = 0;
+    let onLine = true;
+    const lines = new Set<number>();
+    const values = new Set<string>();
+    let unplaced = false;
+    for (const f of reported) {
+      // P34: our canary counts only as itself, on its line; any other canary-rule finding is a real one
+      if (f.rule === CANARY_RULE && f.secret === canary && isOurs(f)) {
+        seen++;
+        if (f.startLine !== own || f.endLine !== own) onLine = false;
+        continue;
+      }
+      for (const t of [f.secret, f.match]) if (t.length >= MIN_GLOBAL_SECRET && t !== R) values.add(t);
+      const { startLine: s, endLine: e } = f;
+      if (!isOurs(f) || s === undefined || e === undefined || !(s <= e && e <= contentLines)) {
+        unplaced = true;
+        continue;
+      }
+      for (let l = s; l <= e; l++) lines.add(l);
+    }
+    if (seen !== 1 || !onLine) throw new SecretScanError(`${name} did not confirm it read the text, so it may not have been checked; nothing was sent.`);
+    return { lines: [...lines].sort((a, b) => a - b), values: [...values], unplaced };
+  } finally {
+    try {
+      guard.child?.kill('SIGKILL');
+      await rm(made, { recursive: true, force: true });
+    } finally {
+      guard.release();
+    }
+  }
+}
+
 // ---------- bundle text ----------
 
 // Bundles that passed bundleCode's secret scan. They are frozen, so they cannot change afterwards;
