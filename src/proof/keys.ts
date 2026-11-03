@@ -40,7 +40,9 @@
 //   - an environment of the repo holds any secret (they override repo secrets for a job that names the environment, and
 //     pipegen never writes one), or an environment variable that isn't a declared name holding its config (fix round 2, R2);
 //   - any of those lists can't be read (unknown fails closed).
-// At evidence() each run is also read: it must be finished, and the brand names each run's (id, attempt) as GitHub gives it,
+// At evidence() each run is also read: it must be finished and its latest attempt must have started strictly after the
+// ticket by GitHub's own clock (the ticket keeps the `date` header of its secrets list; a run from before the ticket may have
+// held a real value; fix round 3, N1), and the brand names each run's (id, attempt) as GitHub gives it,
 // so a later re-run attempt of the same run id is not covered; and a store of a user value anywhere in the repo's state after
 // the mint revokes the brand (evidenceCovers checks the state's real-store count; fix round 2, R1).
 // Recorded residuals: organisation variables are not listed (the one `vars.` a proof workflow reads is PIPEGEN_BLOCK_FROM, a
@@ -135,7 +137,8 @@ interface KeyState {
 }
 /** The registry, by GitHub's repo id. */
 const states = new Map<number, KeyState>();
-interface TicketRec { state: KeyState | null; seq: number; refusal: string | null }
+/** `serverTime`: GitHub's clock at the ticket (the `date` header of its secrets list, ms; NaN when missing or unreadable). */
+interface TicketRec { state: KeyState | null; seq: number; refusal: string | null; serverTime: number }
 const tickets = new WeakMap<object, TicketRec>();
 /** How long deleteAll waits for stores in flight before it deletes anyway (M4). */
 export const DELETE_WAIT_MS = 30_000;
@@ -352,10 +355,12 @@ export class ScratchKeys {
     try {
       const st = await this.#state();
       const seq = st.realSeq;
-      rec = { state: st, seq, refusal: await this.#verify(st) };
+      const meta: { date?: string } = {};
+      const refusal = await this.#verify(st, meta);
+      rec = { state: st, seq, refusal, serverTime: typeof meta.date === 'string' ? Date.parse(meta.date) : Number.NaN };
     } catch (e) {
       if (isTokenRejected(this.#gh, e)) throw githubTokenRejected();
-      rec = { state: null, seq: -1, refusal: `pipegen couldn't read ${this.#scratch.fullName}` };
+      rec = { state: null, seq: -1, refusal: `pipegen couldn't read ${this.#scratch.fullName}`, serverTime: Number.NaN };
     }
     tickets.set(t, rec);
     if (rec.refusal !== null) this.#why = rec.refusal;
@@ -384,10 +389,12 @@ export class ScratchKeys {
     }
     if (rec.state !== st) return refuse('the ticket is for another scratch repo');
     if (rec.seq !== st.realSeq) return refuse(`a value you typed was stored in ${this.#scratch.fullName} after the ticket`);
+    // N1 (fix round 3): only runs that started after the ticket, by GitHub's own clock
+    if (!Number.isFinite(rec.serverTime)) return refuse('the ticket holds no server time from GitHub (the date header of its secrets list was missing or unreadable)');
     // R1: each run finished, its attempt as GitHub gives it
     const pairs = new Set<string>();
     for (const id of runIds) {
-      let d: { id?: unknown; status?: unknown; run_attempt?: unknown } | null;
+      let d: { id?: unknown; status?: unknown; run_attempt?: unknown; run_started_at?: unknown } | null;
       try {
         d = (await githubRead(this.#gh, 'GET /repos/{owner}/{repo}/actions/runs/{run_id}', { owner: this.#scratch.owner, repo: this.#scratch.repo, run_id: id }, this.#clock)).data as typeof d;
       } catch (e) {
@@ -396,6 +403,10 @@ export class ScratchKeys {
       }
       if (d === null || d.id !== id || typeof d.run_attempt !== 'number' || !Number.isSafeInteger(d.run_attempt) || d.run_attempt <= 0) return refuse(`GitHub's answer about run ${id} could not be read`);
       if (d.status !== 'completed') return refuse(`run ${id} is not finished, so jobs of it may still start (with whatever is stored then)`);
+      const started = typeof d.run_started_at === 'string' && /^\d{4}-\d{2}-\d{2}T/.test(d.run_started_at) ? Date.parse(d.run_started_at) : Number.NaN;
+      if (!Number.isFinite(started)) return refuse(`GitHub gave no readable start time for run ${id}`);
+      // its latest attempt started strictly after the ticket: a run from before (maybe with real keys) is never covered
+      if (!(started > rec.serverTime)) return refuse(`run ${id} started before the ticket (or in the same second), so it may have held a value you typed`);
       pairs.add(pairKey(id, d.run_attempt));
     }
     const now = await this.#verify(st);
@@ -436,14 +447,14 @@ export class ScratchKeys {
   }
 
   /** null when the repo's real state allows the brand, else why not (see the file comment). Never throws but for a rejected token. */
-  async #verify(st: KeyState): Promise<string | null> {
+  async #verify(st: KeyState, meta?: { date?: string }): Promise<string | null> {
     const repo = this.#scratch.fullName;
     if (!st.clean) return `${repo} has not been listed empty by pipegen's deleteAll since its last change it can't account for`;
     if (st.busy.size > 0) return `a store to ${repo} is in flight`;
     if (st.realSinceClean) return `a value you typed was stored in ${repo} since its secrets were last deleted`;
     let secrets: { name: string; updatedAt: string | null }[];
     try {
-      secrets = await this.#list();
+      secrets = await this.#list(meta);
     } catch (e) {
       if (isTokenRejected(this.#gh, e)) throw githubTokenRejected();
       return `pipegen couldn't read the secrets of ${repo}`;
@@ -487,6 +498,9 @@ export class ScratchKeys {
       if (isTokenRejected(this.#gh, e)) throw githubTokenRejected();
       return `pipegen couldn't read the environments of ${repo}`;
     }
+    // N6 (fix round 3): `.` and `..` would be read as path segments; refused before any read under them
+    const dots = envs.find((env) => env.name === '.' || env.name === '..');
+    if (dots !== undefined) return `the environment name "${dots.name}" of ${repo} can't be read safely`;
     for (const env of envs) {
       const where = `the environment ${safeText(env.name, 100)} of ${repo}`;
       let es: { name: string }[];
@@ -608,9 +622,9 @@ export class ScratchKeys {
     }
   }
 
-  async #list(): Promise<{ name: string; updatedAt: string | null }[]> {
+  async #list(meta?: { date?: string }): Promise<{ name: string; updatedAt: string | null }[]> {
     try {
-      const all = await this.#listOf('GET /repos/{owner}/{repo}/actions/secrets', 'secrets');
+      const all = await this.#listOf('GET /repos/{owner}/{repo}/actions/secrets', 'secrets', {}, PLAIN_NAME_RE, meta);
       return all.map((x) => ({ name: x.name, updatedAt: typeof x.updated_at === 'string' ? x.updated_at : null }));
     } catch (e) {
       if (isRateStop(e)) throw e;
@@ -621,12 +635,15 @@ export class ScratchKeys {
   }
 
   /** One whole list (every page up to its total_count, no skip), each item with a plain name; throws when it can't be read. */
-  async #listOf(route: string, key: 'secrets' | 'variables' | 'environments', params: Record<string, unknown> = {}, nameRe: RegExp = PLAIN_NAME_RE): Promise<{ name: string; updated_at?: unknown; value?: unknown }[]> {
+  async #listOf(route: string, key: 'secrets' | 'variables' | 'environments', params: Record<string, unknown> = {}, nameRe: RegExp = PLAIN_NAME_RE, meta?: { date?: string }): Promise<{ name: string; updated_at?: unknown; value?: unknown }[]> {
     const items: { name: string; updated_at?: unknown; value?: unknown }[] = [];
     const bad = () => new ScratchKeysError(`the list ${route} could not be read`);
     for (let page = 1; ; page++) {
       if (page > SECRET_LIST_PAGES) throw bad();
-      const d = (await githubRead(this.#gh, route, { ...params, owner: this.#scratch.owner, repo: this.#scratch.repo, per_page: 100, page }, this.#clock)).data as Record<string, unknown> | null;
+      const res = await githubRead(this.#gh, route, { ...params, owner: this.#scratch.owner, repo: this.#scratch.repo, per_page: 100, page }, this.#clock);
+      // GitHub's clock (the first page's date header): the ticket's time for N1
+      if (page === 1 && meta !== undefined && typeof res.headers.date === 'string') meta.date = res.headers.date;
+      const d = res.data as Record<string, unknown> | null;
       const list = d?.[key];
       if (typeof d?.total_count !== 'number' || !Number.isSafeInteger(d.total_count) || d.total_count < 0 || !Array.isArray(list)) throw bad();
       for (const x of list as unknown[]) {

@@ -36,8 +36,15 @@ export interface KeysFake {
   variables: { name: string; value: string }[] | null;
   /** Environments (GET …/environments), each with its secret names and variables (a null list: 403). null: the environment list answers 403. */
   environments: Record<string, { held: string[] | null; vars: { name: string; value: string }[] | null }> | null;
-  /** Workflow runs as GET …/actions/runs/{id} answers them (fix round 2, R1). A run not listed: completed, attempt 1. */
-  runs: Map<number, { status: string; run_attempt: number }>;
+  /**
+   * Workflow runs as GET …/actions/runs/{id} answers them (fix round 2, R1). A run not listed: completed, attempt 1, started a
+   * minute after the server time of that answer. `run_started_at` null: not given.
+   */
+  runs: Map<number, { status: string; run_attempt: number; run_started_at?: string | null }>;
+  /** GitHub's server time (ms): the `date` header of the secrets list (fix round 3, N1). Moves on 1 s per list answer. */
+  serverTime: number;
+  /** The `date` header of the secrets list: a text to send instead, or null to leave it out. */
+  dateHeader?: string | null;
   handler: (c: Call) => Reply | undefined;
 }
 
@@ -49,6 +56,7 @@ export function secretsFake(owner: string, repo: string, keep: Record<string, st
   const f: KeysFake = {
     values: new Map(Object.entries(keep)), failPut: new Map(), failDelete: new Map(), sticky: new Set(),
     updated: new Map(Object.keys(keep).map((k) => [k, stamp()])), orgShared: [], variables: [], environments: {}, runs: new Map(),
+    serverTime: Date.UTC(2026, 10, 3, 10, 0, 0),
     touch: (name, value) => { f.values.set(name, value); f.updated.set(name, stamp()); },
     handler: (c) => {
       const path = decodeURIComponent(c.url.pathname);
@@ -59,7 +67,9 @@ export function secretsFake(owner: string, repo: string, keep: Record<string, st
         const all = [...f.values.keys()].sort();
         const per = Number(c.url.searchParams.get('per_page') ?? '30');
         const n = Number(c.url.searchParams.get('page') ?? '1');
-        return { body: { total_count: all.length, [LIST]: all.slice((n - 1) * per, n * per).map((name) => ({ name, created_at: '2026-11-03T10:00:00Z', updated_at: f.updated.get(name) ?? '2026-11-03T10:00:00Z' })) } };
+        f.serverTime += 1000;
+        const date = f.dateHeader === undefined ? new Date(f.serverTime).toUTCString() : f.dateHeader;
+        return { headers: (date === null ? {} : { date }) as Record<string, string>, body: { total_count: all.length, [LIST]: all.slice((n - 1) * per, n * per).map((name) => ({ name, created_at: '2026-11-03T10:00:00Z', updated_at: f.updated.get(name) ?? '2026-11-03T10:00:00Z' })) } };
       }
       const repoBase = base.slice(0, -'/actions/secrets'.length);
       const forbidden = { status: 403, body: { message: 'Resource not accessible by personal access token' } };
@@ -67,7 +77,8 @@ export function secretsFake(owner: string, repo: string, keep: Record<string, st
       if (runM && c.method === 'GET') {
         const id = Number(runM[1]);
         const r = f.runs.get(id) ?? { status: 'completed', run_attempt: 1 };
-        return { body: { id, ...r, conclusion: r.status === 'completed' ? 'failure' : null } };
+        const started = r.run_started_at === undefined ? new Date(f.serverTime + 60_000).toISOString().replace('.000', '') : r.run_started_at;
+        return { body: { id, status: r.status, run_attempt: r.run_attempt, ...(started === null ? {} : { run_started_at: started }), conclusion: r.status === 'completed' ? 'failure' : null } };
       }
       if (path === `${repoBase}/environments` && c.method === 'GET') {
         if (f.environments === null) return forbidden;
