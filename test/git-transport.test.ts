@@ -373,6 +373,24 @@ describe('git transport (E0c, B6)', () => {
     expect(recorder.calls()).toEqual([]);
   });
 
+  it('git: the test wrapper, routed, still refuses anything naming github.com after its rewrite', () => {
+    recorder.route(9);
+    const run = (args: string[]) => {
+      try {
+        execFileSync(join(recorder.bin, 'git'), args, { stdio: 'pipe', env: { PATH: savedEnv.PATH ?? '', HOME: root } });
+        return 0;
+      } catch (e) {
+        return (e as { status?: number }).status;
+      }
+    };
+    // Local commands only: without the re-check they would run (exit 0 or 1), never touching the network.
+    expect(run(['config', '--file', '/dev/null', '--get-urlmatch', 'http.proxy', 'http://github.com/acme/x.git'])).toBe(97);
+    expect(run(['config', '--file', '/dev/null', '--get-urlmatch', 'http.proxy', 'https://github.com.evil/acme/x.git'])).toBe(97);
+    expect(run(['-c', 'url.https://github.com/.insteadOf=x', 'config', '--file', '/dev/null', '--list'])).toBe(97);
+    // The rewrite itself still works: only the loopback URL is left.
+    expect(run(['config', '--file', '/dev/null', '--get-urlmatch', 'http.proxy', 'https://github.com/acme/pipegen-proof-shop.git'])).toBe(1);
+  });
+
   it('git: refs, token and options are checked before git runs', async () => {
     const repo = await pushRepoWithCommit();
     recorder.clear();

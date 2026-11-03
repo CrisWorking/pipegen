@@ -8,6 +8,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterAll, afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { GitTransportError, HARDENED_CONFIG, isDirty, readSnapshot } from '../src/proof/git.js';
+const NO_TRANSPORT = ['file', 'git', 'ssh', 'http', 'https', 'ext'].flatMap((p) => ['-c', `protocol.${p}.allow=never`]);
 import { makeGitRecorder, REAL_GIT } from './helpers/git-recorder.js';
 
 const root = mkdtempSync(join(tmpdir(), 'pg-e0c-snap-'));
@@ -34,7 +35,7 @@ const commitAll = (dir: string) => {
 const filesOf = (s: Awaited<ReturnType<typeof readSnapshot>>) => Object.fromEntries(s.files.map((f) => [f.path, Buffer.from(f.content).toString('utf8')]));
 
 beforeEach(() => {
-  recorder.clear();
+  recorder.clear();   // also ends oldGit()
   process.env.PATH = `${recorder.bin}:${savedEnv.PATH ?? ''}`;
 });
 afterEach(() => {
@@ -174,9 +175,39 @@ describe('snapshot read (E0c, S4)', () => {
     expect(connections).toBe(0);
     for (const c of recorder.calls()) {
       const i = c.argv.indexOf('-C');
-      expect(c.argv.slice(0, i), c.argv.join(' ')).toEqual([...HARDENED_CONFIG, '-c', 'protocol.https.allow=never', '--no-replace-objects', ...(c.argv.includes('status') ? ['--no-optional-locks'] : [])]);
+      expect(c.argv.slice(0, i), c.argv.join(' ')).toEqual([...HARDENED_CONFIG, ...NO_TRANSPORT, '--no-replace-objects', ...(c.argv.includes('status') ? ['--no-optional-locks'] : [])]);
       expect(c.env.GIT_NO_LAZY_FETCH).toBe('1');
     }
+  });
+
+  it('snapshot read: no transport on any git, even with protocol.file.allow=always in the repo config (no GIT_NO_LAZY_FETCH)', async () => {
+    const up = fresh();
+    put(up, 'a.txt', 'a\n');
+    commitAll(up);
+    git(up, 'config', 'uploadpack.allowFilter', 'true');
+    const blob = git(up, 'rev-parse', 'HEAD:a.txt');
+    const pc = join(root, `partial-file-${++n}`);
+    execFileSync(REAL_GIT, ['clone', '-q', '--no-local', '--no-checkout', '--filter=blob:none', `file://${up}`, pc], { env: ENV });
+    git(pc, 'config', 'protocol.file.allow', 'always');
+    const present = () => {
+      try {
+        execFileSync(REAL_GIT, ['-C', pc, 'cat-file', '-e', blob], { env: { ...ENV, GIT_NO_LAZY_FETCH: '1' }, stdio: 'pipe' });
+        return true;
+      } catch {
+        return false;
+      }
+    };
+    expect(present()).toBe(false);
+    // Positive control: without pipegen's flags, a git that ignores GIT_NO_LAZY_FETCH fetches the blob from the file:// remote.
+    const probe = join(root, `partial-probe-${n}`);
+    execFileSync(REAL_GIT, ['clone', '-q', '--no-local', '--no-checkout', '--filter=blob:none', `file://${up}`, probe], { env: ENV });
+    git(probe, 'config', 'protocol.file.allow', 'always');
+    execFileSync(REAL_GIT, [...HARDENED_CONFIG, '-C', probe, 'cat-file', '-p', blob], { env: ENV, stdio: 'pipe' });
+    expect(execFileSync(REAL_GIT, ['-C', probe, 'cat-file', '-e', blob], { env: { ...ENV, GIT_NO_LAZY_FETCH: '1' }, stdio: 'pipe' }).length).toBe(0);
+    // pipegen's reads, through a git that drops GIT_NO_LAZY_FETCH (as an older git ignores it): no fetch, a clear error.
+    recorder.oldGit();
+    await expect(readSnapshot(pc)).rejects.toThrow(/partial clone/);
+    expect(present()).toBe(false);
   });
 
   it('snapshot read: a folder below a repo whose path holds the list separator (:) is still not a repo', async () => {
@@ -207,20 +238,25 @@ describe('snapshot read (E0c, S4)', () => {
     expect((await readSnapshot(d, { maxFileBytes: 1000 })).files).toHaveLength(2);
   });
 
-  it('snapshot read: Windows and macOS .git look-alikes are unsafe paths', async () => {
+  it('snapshot read: Windows and macOS .git look-alikes are unsafe paths; other names with a colon are kept', async () => {
     const d = fresh();
     put(d, 'ok.txt', 'ok\n');
     commitAll(d);
     const blob = git(d, 'hash-object', '-w', 'ok.txt');
-    const odd = ['.git.', '.git ', '.GIT. .', '.Git..', 'git~1', 'GIT~1', 'Git~1', '.git::$DATA', '.git:stream', 'a:b', '.g\u200cit', '.git\u200d', '\ufeff.git', '.gi\u200et', '...', ' ', '. .'];
-    const fine = ['.gitignore', '.github', 'git~2', 'git~10', 'xgit~1', '.gitx', '.git-x', 'git', '.g.it'];
+    const odd = ['.git.', '.git ', '.GIT. .', '.Git..', 'git~1', 'GIT~1', 'Git~1', '.g\u200cit', '.git\u200d', '\ufeff.git', '.gi\u200et', '...', ' ', '. .',
+      // NTFS streams of .git (the part before the first colon is what Windows names): refused.
+      '.git::$DATA', '.git:stream', '.GIT:stream', '.Git.:x', '.git :x', 'git~1:x', 'GIT~1::$DATA', '.g\u200cit:x', ':x', '.:x', '..:x'];
+    // Colons are legal on Linux, macOS and the runner: kept, so the proof tree is HEAD's.
+    const fine = ['.gitignore', '.github', 'git~2', 'git~10', 'xgit~1', '.gitx', '.git-x', 'git', '.g.it', 'a:b', 'urn:isbn:0451450523', 'x:', '2026-11-03T12:00:00.json', '.gitignore:x', 'git~2:x'];
+    const sub = execFileSync(REAL_GIT, ['mktree', '-z'], { cwd: d, env: ENV, input: Buffer.from(`100644 blob ${blob}\tx:y.ts\x00100644 blob ${blob}\t.git:x\0`) }).toString().trim();
     const entries = [...odd, ...fine, 'ok.txt'].map((name) => Buffer.from(`100644 blob ${blob}\t${name}\0`));
+    entries.push(Buffer.from(`040000 tree ${sub}\tsrc\0`));
     const tree = execFileSync(REAL_GIT, ['mktree', '-z'], { cwd: d, env: ENV, input: Buffer.concat(entries) }).toString().trim();
     const commit = execFileSync(REAL_GIT, ['commit-tree', tree, '-m', 'odd'], { cwd: d, env: ENV }).toString().trim();
     git(d, 'update-ref', 'HEAD', commit);
     const s = await readSnapshot(d);
-    expect(s.files.map((f) => f.path).sort()).toEqual([...fine, 'ok.txt'].sort());
-    expect(s.dropped.map((x) => x.path).sort()).toEqual([...odd].sort());
+    expect(s.files.map((f) => f.path).sort()).toEqual([...fine, 'ok.txt', 'src/x:y.ts'].sort());
+    expect(s.dropped.map((x) => x.path).sort()).toEqual([...odd, 'src/.git:x'].sort());
     expect(new Set(s.dropped.map((x) => x.why))).toEqual(new Set(['unsafe-path']));
   });
 

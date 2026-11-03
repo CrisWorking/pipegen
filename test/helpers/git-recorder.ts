@@ -28,6 +28,8 @@ export interface GitRecorder {
   clear(): void;
   /** Sends github.com pushes to the loopback server on `port` (until clear()). */
   route(port: number): void;
+  /** Drops GIT_NO_LAZY_FETCH before git starts, as a git older than that variable ignores it (until clear()). */
+  oldGit(): void;
 }
 
 export function makeGitRecorder(root: string): GitRecorder {
@@ -37,6 +39,7 @@ export function makeGitRecorder(root: string): GitRecorder {
   mkdirSync(rec, { recursive: true });
   const q = (s: string) => `'${s.replace(/'/g, `'\\''`)}'`;
   const routeFile = join(root, 'route');
+  const oldGitFile = join(root, 'old-git');
   const shim = join(bin, 'askpass-shim');
   writeFileSync(shim, [
     '#!/bin/sh',
@@ -58,11 +61,14 @@ export function makeGitRecorder(root: string): GitRecorder {
     `  stat -c '%a' "$GIT_ASKPASS" > ${q(rec)}/askmode.$n`,
     `  stat -c '%a' "$(dirname "$GIT_ASKPASS")" > ${q(rec)}/askdir.$n`,
     'fi',
+    `if [ -f ${q(oldGitFile)} ]; then unset GIT_NO_LAZY_FETCH; fi`,
     // A test must never reach github.com: unrouted, a call naming it stops here (and the test sees exit 97).
     'case "$*" in *github.com*)',
     `  if [ -f ${q(routeFile)} ]; then`,
     `    port=$(cat ${q(routeFile)})`,
     '    for a do shift; case "$a" in https://github.com/*) a="http://127.0.0.1:$port/app.git" ;; esac; set -- "$@" "$a"; done',
+    // Anything still naming github.com after the rewrite (http://github.com/..., github.com.evil, a -c value) is refused too.
+    '    case "$*" in *github.com*) echo "git recorder: refused to reach github.com" >&2; exit 97 ;; esac',
     `    if [ -n "$GIT_ASKPASS" ]; then PIPEGEN_TEST_REAL_ASKPASS="$GIT_ASKPASS"; GIT_ASKPASS=${q(shim)}; export PIPEGEN_TEST_REAL_ASKPASS GIT_ASKPASS; fi`,
     `    exec ${q(REAL_GIT)} -c protocol.http.allow=always "$@"`,
     '  fi',
@@ -76,8 +82,10 @@ export function makeGitRecorder(root: string): GitRecorder {
   return {
     bin,
     route: (port: number) => writeFileSync(routeFile, String(port)),
+    oldGit: () => writeFileSync(oldGitFile, ''),
     clear: () => {
       rmSync(routeFile, { force: true });
+      rmSync(oldGitFile, { force: true });
       rmSync(rec, { recursive: true, force: true });
       mkdirSync(rec, { recursive: true });
     },

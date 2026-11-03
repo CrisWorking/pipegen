@@ -27,8 +27,8 @@
 // `ls-tree -r -z -l --full-tree` and reads the blobs with `cat-file --batch`, never `git archive` (export-ignore and
 // export-subst would hide or change files there). Replace refs are ignored. Symlinks (120000) and submodules (160000) are
 // dropped and listed, as are names that are not UTF-8 or not safe paths (.git and its Windows/macOS look-alikes included).
-// isDirty runs `git --no-optional-locks status` (it never rewrites the index). Reads never fetch: https is turned off
-// again for them and GIT_NO_LAZY_FETCH is set, so a partial clone's missing blobs are an error, not a download. The folder
+// isDirty runs `git --no-optional-locks status` (it never rewrites the index). Reads never fetch: every transport is turned
+// off by name on the command line and GIT_NO_LAZY_FETCH is set, so a partial clone's missing blobs are an error, not a download. The folder
 // must be the top of its repo: GIT_CEILING_DIRECTORIES stops git from looking above it, and `rev-parse --show-toplevel` is
 // compared with it anyway (the ceiling is a list split at ':', so a parent path holding one escapes it).
 // Git LFS: the files read are the pointer files (no filter runs).
@@ -423,8 +423,13 @@ export interface SnapshotFile { path: string; mode: '100644' | '100755'; content
 export interface DroppedEntry { path: string; why: 'symlink' | 'submodule' | 'non-utf8-name' | 'unsafe-path' | 'other' }
 export interface Snapshot { commit: string; files: SnapshotFile[]; dropped: DroppedEntry[] }
 
-/** Reads never talk to a remote: https off again (the last -c wins), and no lazy fetch (git 2.44+ reads GIT_NO_LAZY_FETCH). */
-const READ_CONFIG: readonly string[] = Object.freeze(['-c', 'protocol.https.allow=never']);
+/**
+ * Reads never talk to a remote. Every transport is turned off by name: a per-protocol key in the user's repo config
+ * (protocol.file.allow=always, say) beats HARDENED_CONFIG's protocol.allow=never, but the command line beats the repo config
+ * key by key. GIT_NO_LAZY_FETCH (git 2.44+ and the 2024 security backports) also stops a partial clone's lazy fetch; the
+ * flags close it on a git without that variable.
+ */
+const READ_CONFIG: readonly string[] = Object.freeze(['file', 'git', 'ssh', 'http', 'https', 'ext'].flatMap((p) => ['-c', `protocol.${p}.allow=never`]));
 
 /**
  * A read in the user's repo: `-C <dir>`, no transport, replace refs off, and git may not look above <dir> for a repo. A
@@ -435,7 +440,7 @@ async function readGit(s: Session, dir: string, args: readonly string[], o: Omit
   try {
     return await spawnGit(s, [...READ_CONFIG, '--no-replace-objects', ...(o.pre ?? []), '-C', dir, ...args], args[0], { ...o, env });
   } catch (e) {
-    if (e instanceof GitTransportError && /promisor|lazy fetch|transport 'https' not allowed/i.test(e.message)) {
+    if (e instanceof GitTransportError && /promisor|lazy fetch|transport '[a-z]+' not allowed/i.test(e.message)) {
       throw new GitTransportError(`HEAD's files are not all in this clone (a partial clone): pipegen reads only what is on disk and fetches nothing. Fetch the missing objects (git fetch --refetch) or use a full clone. (${e.message})`);
     }
     throw e;
@@ -458,13 +463,15 @@ const utf8 = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true });
 const lossy = new TextDecoder('utf-8', { ignoreBOM: true });
 const IGNORABLE = /[\p{Default_Ignorable_Code_Point}]/gu;
 /**
- * A name a checkout must never write: empty, `.`, `..`, a backslash or a colon (an NTFS stream such as `.git::$DATA`), and
- * `.git` the way Windows and macOS read names: any case, trailing dots and spaces dropped, invisible characters ignored
- * (HFS+), and the 8.3 short name `git~1`.
+ * A name a checkout must never write: empty, `.`, `..`, a backslash, and `.git` the way Windows and macOS read names. The
+ * check runs on the part before the first colon (NTFS names the file there and puts a stream after it: `.git::$DATA`,
+ * `.GIT:stream`), with invisible characters ignored (HFS+), any case, trailing dots and spaces dropped, and the 8.3 short
+ * name `git~1`; an empty result is refused too. Other names with a colon (`a:b`, `urn:x`) are legal on Linux, macOS and the
+ * runner, and kept, so the proof tree stays HEAD's.
  */
 function unsafeName(c: string): boolean {
-  if (c === '' || c === '.' || c === '..' || c.includes('\\') || c.includes(':')) return true;
-  const n = c.replace(IGNORABLE, '').toLowerCase().replace(/[. ]+$/, '');
+  if (c === '' || c === '.' || c === '..' || c.includes('\\')) return true;
+  const n = c.split(':')[0].replace(IGNORABLE, '').toLowerCase().replace(/[. ]+$/, '');
   return n === '' || n === '.git' || n === 'git~1';
 }
 const unsafePath = (p: string) => p.split('/').some(unsafeName);
