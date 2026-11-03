@@ -1,32 +1,36 @@
-// Plan E Task 2, first half / sub-task E2 (spec §19; rulings S1, S4, S5, S9, S21, S24, B3, B6; threats T12, T21): what a
-// proof pushes. The scratch repo `pipegen-proof-<repo>` holds the user's real test keys during the proof, so a user
-// workflow in any pushed tree would run next to them, and a push to the wrong repo or ref would touch the user's project.
+// Plan E Task 2, first half / sub-task E2 (spec §19; rulings S1, S4, S5, S9, S21, S24, B3, B6, E2-R1..R5; threats T12,
+// T21): what a proof pushes. The scratch repo `pipegen-proof-<repo>` holds the user's real test keys during the proof, so
+// a user workflow in any pushed tree would run next to them, and a push to the wrong repo or ref would touch the user's
+// project.
 //
-// - The base snapshot (pushBase): HEAD's files as readSnapshot reads them (ruling S4: ls-tree + cat-file, never
+// - The base snapshot (buildBase): HEAD's files as readSnapshot reads them (ruling S4: ls-tree + cat-file, never
 //   `git archive`, so export-ignore / export-subst change nothing; symlinks and submodules dropped and listed), without
-//   anything under .github/workflows/ (the user's workflows never reach the scratch repo) and without the Dependabot and
-//   Renovate configs (S5: the bots would open pull requests there). One commit, no parent, no history, force-pushed to
-//   the scratch repo's default branch (= the app's, S1). It holds no workflow, so pushing it starts nothing. The working
-//   tree is never read: uncommitted changes (untracked files included) only give the warning.
-// - The central draft (pushCentralDraft, the central layout only: draft.centralPin set, S24): proof/<runId> of `pipelines`
-//   = its default head + this project's central files (S21), so shared files resolve. The head is read through the API
-//   (GET only; the transport never fetches) and rebuilt locally; its tree must hash back to the head's own tree sha, so
-//   the copy is exact. The commit has no parent (the head commit object can't be had without a fetch). No workflow in the
-//   pushed tree may start on anything but workflow_call, workflow_dispatch or schedule, so the push starts nothing.
-// - The proof branches (pushProofBranch): proof/<runId>/<variant> = the base (or an earlier proof commit of this session)
-//   + one commit per file set, each with exactly one parent; pushed without force (B3: a later push fast-forwards, and
-//   GitHub refuses one that doesn't). The tree's workflow files must be exactly pipegen's own, never a user workflow path.
-// - pushProofSetup runs the plan's order: Dependabot security updates off (S5) → central draft (central layout) → base →
-//   the scratch default branch set again when the repo was empty (E1 carry) → the app files for the central sha, their
-//   pins checked → every workflow GitHub lists that isn't pipegen's disabled (a safety net) → no run for the base sha
-//   (else stop) → the injected secret store (E4; it must call checkScratchAccess again first) → the main and planted
-//   branches. Planted files (Plan F's, injected, and the E-owned C1b placements, S9) are only on planted.
+//   anything under .github/workflows/ (every workflow of HEAD, pipegen's own earlier files included: the user may have
+//   edited them, E2-R5) and without the Dependabot and Renovate configs (S5). One commit, no parent, no history, for the
+//   scratch repo's default branch (= the app's, S1). It holds no workflow, so pushing it starts nothing. The working tree
+//   is never read: uncommitted changes (untracked files included) only give the warning.
+// - The central draft (buildCentralDraft, the central layout only: draft.centralPin set, S24): proof/<runId> of
+//   `pipelines` = its default head + this project's central files (S21). The head is read through the API (GET only; the
+//   transport never fetches) and rebuilt locally; each blob must hash back and the tree must equal the head's tree sha, so
+//   the copy is exact (E2-R2: the commit has no parent). Every workflow in that tree may start only on workflow_call,
+//   workflow_dispatch or schedule (E2-R3, one `on` key spelled exactly so); a `.github` or `.github/workflows` that is a
+//   symlink or a submodule there is a stop.
+// - The proof branches (buildProofBranch): proof/<runId>/<variant> = the base (or an earlier proof commit of this session)
+//   + one commit per file set, each with exactly one parent, pushed without force (B3). The tree's workflow files must be
+//   exactly the draft's own pipegen workflows (E2-R5: with the draft's content, also at a path HEAD holds).
+// - Every commit is a ProofCommit record (kind, sha, the one branch it may go to) that only this module makes. pushCommit,
+//   and gitTransport itself, push only such a commit of a live session, to its own repo and branch, after checking its
+//   whole tree (and its parents') again (review M2). The session's push repo is never exposed.
+// - pushProofSetup builds every commit first (central, base, main, planted: every tree, path and mode check), then writes,
+//   in the plan's order: Dependabot security updates off (S5) → central → base → the scratch default branch again when
+//   the repo was empty (E1 carry) → every listed workflow that isn't pipegen's disabled → no run for the base sha (else a
+//   stop naming the run) → the injected secret store (E4: it must call checkScratchAccess again first) → main, planted.
+//   A refusal of any build or check comes before any write, store or push (review M1).
 //
 // Pushes go only through the ProofTransport (gitTransport: E0c's gitPush with the token in a closure, never in argv, a URL
-// or output) and only to a GuardedRepo (target.ts): pipelines only refs/heads/proof/<runId>, the scratch repo only its
-// default branch and proof/<runId>/<name>, and proof branches never forced. Every API write is guardedWrite. No push and
-// no write starts once a stop has begun (interrupting(), checked before each step; gitPush and guardedWrite check again).
-// Commits are built in a createPushRepo repo with hash-object, mktree and commit-tree only (runGit).
+// or output) and only to a GuardedRepo (target.ts). Every API write is guardedWrite. No push and no write starts once a
+// stop has begun (interrupting(), checked before each step; gitPush and guardedWrite check again). Commits are built in a
+// createPushRepo repo with hash-object, mktree and commit-tree only (runGit).
 //
 // Known limits (recorded in the E2 report): Windows-reserved names such as `CON` or `a:b` are kept (the runner is Linux);
 // only the pointer files of Git LFS objects are copied, so a docker service holding them is not-proven (filter=lfs);
@@ -61,7 +65,10 @@ export interface ProofFile { path: string | Uint8Array; content: string | Uint8A
 /** A file kept out of a pushed tree, and why. `path` is repo data: show it through safeText. */
 export interface LeftOut { path: string; why: string }
 
-/** The only way src/proof pushes (B6): E0c's gitPush with the token in a closure. Injected, so tests and E8 can wrap it. */
+/**
+ * The only way src/proof pushes (B6). gitTransport is the production one; a test or E8 may wrap it. `from` is a proof
+ * session's own push repo (never exposed): gitTransport refuses any other, and any commit that session didn't build.
+ */
 export interface ProofTransport {
   push(to: GuardedRepo, from: PushRepoHandle, refs: readonly PushRef[], opts?: { force?: boolean }): Promise<void>;
 }
@@ -69,8 +76,23 @@ export interface ProofTransport {
 /** E4's seam: stores the scratch secrets. The real store must call checkScratchAccess again before its first write. */
 export type SecretStoreStep = (scratch: GuardedRepo, ctx: { baseSha: string }) => Promise<void>;
 
+/**
+ * A commit this module built and checked (review M2). Only it makes one (registered, frozen); pushCommit takes nothing
+ * else. `branch` is the one branch it may be pushed to: base → the scratch default branch (forced), central →
+ * proof/<runId> of pipelines, proof → proof/<runId>/<variant> (never forced).
+ */
+export interface ProofCommit {
+  readonly kind: 'base' | 'central' | 'proof';
+  readonly sha: string;
+  readonly branch: string;
+  readonly variant?: Variant;
+  /** Every commit built for this record, oldest first (the last is `sha`). */
+  readonly commits: readonly string[];
+}
+
 const IDENTITY = Object.freeze({ name: 'pipegen', email: 'proof@pipegen.invalid' });
 const SHA_RE = /^[0-9a-f]{40}$/;
+const TOKEN_RE = /^[A-Za-z0-9_]{20,255}$/;
 const PROOF_NAME_RE = /^[a-z0-9][a-z0-9-]{0,80}$/;
 const VARIANT_RE = /^(?:main|planted|dispute-[a-z0-9][a-z0-9-]{0,40}-[ab])$/;
 const TREE_CONCURRENCY = 8;
@@ -133,23 +155,25 @@ function pathBytes(p: string | Uint8Array): Buffer {
 export const isWorkflowPath = (p: string): boolean => p.toLowerCase().startsWith('.github/workflows/');
 const isBotConfig = (p: string): boolean => BOT_CONFIGS.has(p.toLowerCase());
 
-// ---------- the session: one push repo, the trees pipegen made in it ----------
+// ---------- the session: one push repo, the commits pipegen built in it ----------
 
 interface Entry { name: Buffer; mode: string; type: 'blob' | 'commit'; sha: string }
 type Entries = Map<string, Entry>;
 
 export interface BaseSnapshot {
-  /** The base commit (no parent) on the scratch repo's default branch. */
+  /** The base commit (no parent), for the scratch repo's default branch. */
   sha: string;
   tree: string;
+  /** Its ProofCommit record (pushCommit takes it). */
+  commit: ProofCommit;
   /** The user's HEAD commit it copies. */
   head: string;
   dirtyWarning: boolean;
   /** readSnapshot's dropped entries (symlinks, submodules, names that are not UTF-8 or not safe). */
   dropped: DroppedEntry[];
-  /** HEAD files left out: the user's workflows and the bot configs (S5). */
+  /** HEAD files left out: every workflow of HEAD and the bot configs (S5). */
   leftOut: LeftOut[];
-  /** Lower-case paths of HEAD's workflow files (dropped ones included): no proof tree holds a file at one of them. */
+  /** Lower-case paths of HEAD's workflow files (dropped ones included). */
   userWorkflows: string[];
   /** Every path in the base (UTF-8). */
   paths: ReadonlySet<string>;
@@ -162,26 +186,40 @@ export interface BaseSnapshot {
   warnings: string[];
 }
 
+/** What the session knows of a commit it built: checked again, with its parents, right before every push (M2). */
+interface CommitRec {
+  kind: ProofCommit['kind'];
+  branch: string;
+  parent: string | null;
+  entries: Entries;
+  /** Lower-case workflow paths this commit's tree may hold (base: none). */
+  allowed: ReadonlySet<string>;
+  /** Central only: the tree's workflow files, judged by checkCentralTriggers again before the push. */
+  centralWorkflows?: readonly { path: string; content: string }[];
+}
+
 interface SessionState {
   target: ProofTarget;
   repo: PushRepoHandle;
   removed: boolean;
   base: BaseSnapshot | null;
-  /** The entries of each commit pipegen made in this session (base, central, proof commits). */
-  trees: Map<string, Entries>;
+  commits: Map<string, CommitRec>;
   /** mktree input digest → tree sha (identical folders are written once). */
   treeCache: Map<string, string>;
   /** The central commit and its paths (central layout only). */
   central: { sha: string; paths: ReadonlySet<string> } | null;
 }
 
-/** One proof's local push repo. Only openProofSession makes one; remove() ends it (the exit hook too). */
+/** One proof's local push repo and the commits built in it. Only openProofSession makes one; remove() ends it. */
 export interface ProofSession {
   readonly target: ProofTarget;
-  readonly repo: PushRepoHandle;
   remove(): Promise<void>;
 }
 const sessions = new WeakMap<object, SessionState>();
+/** The live session of a push repo (gitTransport takes no other `from`). */
+const repoSessions = new WeakMap<object, SessionState>();
+/** Each ProofCommit record → the session that built it. */
+const commitOwners = new WeakMap<object, SessionState>();
 
 function live(s: ProofSession): SessionState {
   const st = typeof s === 'object' && s !== null ? sessions.get(s) : undefined;
@@ -192,18 +230,28 @@ function live(s: ProofSession): SessionState {
 export async function openProofSession(t: ProofTarget): Promise<ProofSession> {
   if (!isProofTarget(t)) throw new ScratchGuardError('the proof target was not made by proofTarget.');
   const repo = await createPushRepo();
-  const st: SessionState = { target: t, repo, removed: false, base: null, trees: new Map(), treeCache: new Map(), central: null };
+  const st: SessionState = { target: t, repo, removed: false, base: null, commits: new Map(), treeCache: new Map(), central: null };
   const s: ProofSession = Object.freeze({
     target: t,
-    repo,
     remove: async () => {
       st.removed = true;
-      st.trees.clear();
+      st.commits.clear();
       await repo.remove();
     },
   });
   sessions.set(s, st);
+  repoSessions.set(repo, st);
   return s;
+}
+
+function record(st: SessionState, sha: string, rec: CommitRec): void {
+  st.commits.set(sha, rec);
+}
+
+function proofCommit(st: SessionState, c: ProofCommit): ProofCommit {
+  const frozen = Object.freeze({ ...c, commits: Object.freeze([...c.commits]) });
+  commitOwners.set(frozen, st);
+  return frozen;
 }
 
 // ---------- objects ----------
@@ -309,7 +357,7 @@ async function commitTree(st: SessionState, tree: string, parent: string | null,
   return sha;
 }
 
-// ---------- the transport ----------
+// ---------- the transport and the push choke point ----------
 
 /** The refs a guarded repo takes (S3, S21, B3). Throws ScratchGuardError before anything runs. */
 function checkPushRefs(to: GuardedRepo, refs: readonly PushRef[], force: boolean): void {
@@ -333,12 +381,53 @@ function checkPushRefs(to: GuardedRepo, refs: readonly PushRef[], force: boolean
   }
 }
 
-/** The production transport (B6): gitPush to the guarded repo's checked URL, the token held here only. */
+/**
+ * Review M2: the commit `sha` of this session may go to `to` on `branch` (its kind's repo, its own branch, forced only for
+ * the base), and its whole tree, and each parent's, passes the workflow check again: a scratch commit holds no workflow
+ * but the ones it was built to hold (the base none), and the central commit's workflows start on no push.
+ */
+function checkCommitFor(st: SessionState, to: GuardedRepo, sha: string, branch: string, force: boolean): void {
+  const t = st.target;
+  const rec = st.commits.get(sha);
+  if (rec === undefined) throw new ScratchGuardError('pipegen pushes only a commit its proof session built and checked.');
+  if (rec.kind === 'central') {
+    if (to.kind !== 'central' || branch !== `proof/${t.runId}` || force) throw new ScratchGuardError(`the central draft commit goes only to proof/${t.runId} of ${t.central}, never forced.`);
+  } else if (to.kind !== 'scratch') {
+    throw new ScratchGuardError(`a scratch commit never goes to ${to.fullName}.`);
+  } else if (rec.kind === 'base') {
+    if (branch !== t.defaultBranch || !force) throw new ScratchGuardError(`the base snapshot goes only to the default branch ${t.defaultBranch} of ${to.fullName}.`);
+  } else if (branch !== rec.branch || force) {
+    throw new ScratchGuardError(`this proof commit goes only to ${rec.branch}, never forced.`);
+  }
+  for (let r: CommitRec | undefined = rec, n = 0; r !== undefined; r = r.parent === null ? undefined : st.commits.get(r.parent), n++) {
+    if (n > 10_000) throw new ScratchGuardError('the commit chain is too long to check.');
+    if (r.kind === 'central') {
+      const problems = checkCentralTriggers(r.centralWorkflows ?? []);
+      if (problems.length > 0) throw new ScratchGuardError(`the central draft commit holds a workflow that could start: ${problems[0] as string}.`);
+      continue;
+    }
+    for (const k of r.entries.keys()) {
+      const p = shown(bytesOfKey(k));
+      if (isWorkflowPath(p) && !r.allowed.has(p.toLowerCase())) throw new ScratchGuardError(`${safeText(p, 120)} is a workflow this commit was not built to hold; not pushing.`);
+    }
+    if (r.parent !== null && !st.commits.has(r.parent)) throw new ScratchGuardError('a parent of this commit was not built by its proof session.');
+  }
+}
+
+/**
+ * The production transport (B6): gitPush to the guarded repo's checked URL, the token held here only. It pushes only from a
+ * live proof session's repo, and only commits that session built, each to its own repo and branch after the tree check.
+ */
 export function gitTransport(token: string): ProofTransport {
+  if (typeof token !== 'string' || !TOKEN_RE.test(token)) throw new GitTransportError('The token is not token-shaped; pipegen makes no git transport with it.');
   return Object.freeze({
     push: async (to: GuardedRepo, from: PushRepoHandle, refs: readonly PushRef[], opts: { force?: boolean } = {}) => {
       const force = opts.force === true;
       checkPushRefs(to, refs, force);
+      const st = typeof from === 'object' && from !== null ? repoSessions.get(from) : undefined;
+      if (st === undefined || st.removed) throw new ScratchGuardError('pipegen pushes only from a live proof session\'s own repo.');
+      if (st.target !== to.target) throw new ScratchGuardError('the proof session was made for another target.');
+      for (const r of refs) checkCommitFor(st, to, r.sha, r.branch, force);
       notStopping();
       await gitPush({ repo: from, url: scratchPushUrl(to), owner: to.owner, appRepo: to.target.appRepo, token, refs, force });
     },
@@ -374,19 +463,35 @@ async function pushOrStop(transport: ProofTransport, to: GuardedRepo, from: Push
   }
 }
 
+/**
+ * Pushes a commit this session built (review M2): the base forced to the scratch default branch, the central commit to
+ * proof/<runId> of pipelines, a proof commit (and its new parents) to its own branch without force. Any other record, or
+ * one of another session, is refused (ScratchGuardError) before anything runs; the tree is checked again first.
+ */
+export async function pushCommit(s: ProofSession, c: ProofCommit, transport: ProofTransport): Promise<void> {
+  const st = live(s);
+  if (typeof c !== 'object' || c === null || commitOwners.get(c) !== st) throw new ScratchGuardError('the commit was not built by this proof session.');
+  notStopping();
+  const t = st.target;
+  const app = { owner: t.owner, repo: t.appRepo };
+  const to = c.kind === 'central' ? assertCentral(t, app) : assertScratch(t, app);
+  const force = c.kind === 'base';
+  checkCommitFor(st, to, c.sha, c.branch, force);
+  const what: PushWhat = c.kind === 'proof' ? (c.variant === 'planted' ? 'planted' : 'proof') : c.kind;
+  await pushOrStop(transport, to, st.repo, [{ sha: c.sha, branch: c.branch }], force, what);
+}
+
 // ---------- base snapshot ----------
 
 /**
- * The base snapshot of `dir`'s HEAD, force-pushed to the scratch repo's default branch (see the file comment). Once per
- * session. Warns (io.err) on a dirty tree and on Git LFS. `dockerServices`: the services whose docker part runs (the
- * symlink and LFS rules).
+ * Builds the base snapshot of `dir`'s HEAD (see the file comment). Once per session. Warns (io.err) on a dirty tree and on
+ * Git LFS. `dockerServices`: the services whose docker part runs (the symlink and LFS rules). Nothing is pushed.
  */
-export async function pushBase(s: ProofSession, dir: string, deps: { transport: ProofTransport; io: Pick<CliIO, 'err'>; dockerServices?: readonly Pick<Service, 'name' | 'path'>[] }): Promise<BaseSnapshot> {
+export async function buildBase(s: ProofSession, dir: string, deps: { io: Pick<CliIO, 'err'>; dockerServices?: readonly Pick<Service, 'name' | 'path'>[] }): Promise<BaseSnapshot> {
   const st = live(s);
-  if (st.base !== null) throw new GitTransportError('pushBase runs once per proof session.');
+  if (st.base !== null) throw new GitTransportError('The base snapshot is built once per proof session.');
   notStopping();
   const t = st.target;
-  const scratch = assertScratch(t, { owner: t.owner, repo: t.appRepo });
   const warnings: string[] = [];
   const warn = (w: string) => { warnings.push(w); deps.io.err(w); };
 
@@ -404,7 +509,7 @@ export async function pushBase(s: ProofSession, dir: string, deps: { transport: 
   for (const f of snap.files) {
     if (isWorkflowPath(f.path)) {
       userWorkflows.add(f.path.toLowerCase());
-      leftOut.push({ path: f.path, why: 'one of your workflows: never pushed to the scratch repo' });
+      leftOut.push({ path: f.path, why: 'a workflow of your HEAD: never pushed to the scratch repo (pipegen\'s own files come from the draft)' });
       continue;
     }
     if (isBotConfig(f.path)) {
@@ -442,12 +547,19 @@ export async function pushBase(s: ProofSession, dir: string, deps: { transport: 
   for (const k of entries.keys()) if (isWorkflowPath(shown(bytesOfKey(k)))) throw new GitTransportError('A workflow file reached the base snapshot; not pushing.');
   const tree = await writeTree(st, entries.values());
   const sha = await commitTree(st, tree, null, `pipegen proof ${t.runId}: base snapshot of HEAD ${snap.commit}`);
-  await pushOrStop(deps.transport, scratch, st.repo, [{ sha, branch: t.defaultBranch }], true, 'base');
-  st.trees.set(sha, entries);
+  record(st, sha, { kind: 'base', branch: t.defaultBranch, parent: null, entries, allowed: new Set() });
+  const commit = proofCommit(st, { kind: 'base', sha, branch: t.defaultBranch, commits: [sha] });
   const base: BaseSnapshot = {
-    sha, tree, head: snap.commit, dirtyWarning, dropped: snap.dropped, leftOut, userWorkflows: [...userWorkflows].sort(), paths, gitleaksIgnore, lfs, notProven, warnings,
+    sha, tree, commit, head: snap.commit, dirtyWarning, dropped: snap.dropped, leftOut, userWorkflows: [...userWorkflows].sort(), paths, gitleaksIgnore, lfs, notProven, warnings,
   };
   st.base = base;
+  return base;
+}
+
+/** buildBase, then the force-push to the scratch repo's default branch. */
+export async function pushBase(s: ProofSession, dir: string, deps: { transport: ProofTransport; io: Pick<CliIO, 'err'>; dockerServices?: readonly Pick<Service, 'name' | 'path'>[] }): Promise<BaseSnapshot> {
+  const base = await buildBase(s, dir, deps);
+  await pushCommit(s, base.commit, deps.transport);
   return base;
 }
 
@@ -477,8 +589,9 @@ export function symlinkNotProven(dropped: readonly DroppedEntry[], dockerService
 // ---------- central draft (S21) ----------
 
 /**
- * The problems of the workflow files among `files` that could start on a push of proof/<runId>: every trigger must be
- * workflow_call, workflow_dispatch or schedule (none starts on a branch push). A file pipegen can't read is a problem too.
+ * The problems of the workflow files among `files` that could start on a push of proof/<runId> (E2-R3, review M4): one
+ * top-level trigger key, spelled exactly `on` (no `On`, `ON` or other spelling beside or instead of it), and every trigger
+ * workflow_call, workflow_dispatch or schedule. A file pipegen can't read is a problem too.
  */
 export function checkCentralTriggers(files: readonly { path: string; content: string }[]): string[] {
   const problems: string[] = [];
@@ -487,6 +600,11 @@ export function checkCentralTriggers(files: readonly { path: string; content: st
     const name = safeText(f.path, 120);
     const r = parseYaml(f.content, 'user');
     if ('problems' in r) { problems.push(`${name}: pipegen can't read it (${r.problems[0] ?? 'not YAML'})`); continue; }
+    const onKeys = Object.keys(r.parsed.js).filter((k) => k.trim().toLowerCase() === 'on');
+    if (onKeys.length !== 1 || onKeys[0] !== 'on') {
+      problems.push(`${name}: its trigger key must be exactly one \`on\` (found ${onKeys.length === 0 ? 'none' : onKeys.map((k) => JSON.stringify(safeText(k, 20))).join(', ')})`);
+      continue;
+    }
     const on = r.parsed.js.on;
     const triggers = typeof on === 'string' ? [on] : Array.isArray(on) ? on : isObj(on) ? Object.keys(on) : null;
     if (triggers === null || triggers.length === 0 || !triggers.every((x) => typeof x === 'string')) { problems.push(`${name}: pipegen can't read its triggers`); continue; }
@@ -496,8 +614,12 @@ export function checkCentralTriggers(files: readonly { path: string; content: st
   return problems;
 }
 
+export interface CentralLimits { entries?: number; bytes?: number }
+
 /** The default head of `pipelines`, read through the API and checked to rebuild exactly (null: an empty repo). */
-async function readCentralHead(gh: Octokit, st: SessionState, central: GuardedRepo, clock: RateClock): Promise<{ branch: string; commit: string; entries: Entries; workflows: { path: string; content: string }[] } | null> {
+async function readCentralHead(gh: Octokit, st: SessionState, central: GuardedRepo, clock: RateClock, limits: CentralLimits): Promise<{ branch: string; commit: string; entries: Entries; workflows: { path: string; content: string }[] } | null> {
+  const maxEntries = limits.entries ?? MAX_CENTRAL_ENTRIES;
+  const maxBytes = limits.bytes ?? MAX_CENTRAL_BYTES;
   const where = { owner: central.owner, repo: central.repo };
   const cannot = (why: string) => new ProofStopError(`pipegen couldn't copy the default branch of ${central.fullName} for the proof (${why}). Check ${central.fullName}, then run pipegen again.`);
   const get = async (route: string, params: Record<string, unknown>): Promise<unknown> => {
@@ -521,29 +643,39 @@ async function readCentralHead(gh: Octokit, st: SessionState, central: GuardedRe
   if (typeof treeSha !== 'string' || !SHA_RE.test(treeSha)) throw cannot('its head tree could not be read');
   const tr = await get('GET /repos/{owner}/{repo}/git/trees/{tree_sha}', { tree_sha: treeSha, recursive: '1' }) as { truncated?: unknown; tree?: unknown } | null;
   if (tr?.truncated !== false || !Array.isArray(tr.tree)) throw cannot('GitHub gave its file list cut short or not at all');
-  if (tr.tree.length > MAX_CENTRAL_ENTRIES) throw cannot(`it holds more than ${MAX_CENTRAL_ENTRIES} entries`);
+  if (tr.tree.length > maxEntries) throw cannot(`it holds more than ${maxEntries} entries`);
   const blobs: { path: string; mode: string; sha: string }[] = [];
   const entries: Entries = new Map();
-  let total = 0;
+  let reported = 0;
   for (const raw of tr.tree as unknown[]) {
     const e = raw as { path?: unknown; mode?: unknown; type?: unknown; sha?: unknown; size?: unknown };
     if (typeof e.path !== 'string' || typeof e.sha !== 'string' || !SHA_RE.test(e.sha)) throw cannot('an entry could not be read');
+    // review M3: the workflow folder (or .github) as a symlink or a submodule would hide what the trigger check reads
+    const low = e.path.toLowerCase();
+    if ((e.mode === '120000' || e.mode === '160000') && (low === '.github' || low === '.github/workflows')) {
+      throw cannot(`${safeText(e.path, 80)} is a ${e.mode === '120000' ? 'symlink' : 'submodule'}, so pipegen can't check the workflows behind it`);
+    }
     if (e.type === 'tree' && e.mode === '040000') continue;
     const name = pathBytes(e.path);
     if (e.type === 'commit' && e.mode === '160000') { entries.set(keyOf(name), { name, mode: '160000', type: 'commit', sha: e.sha }); continue; }
     if (e.type !== 'blob' || (e.mode !== '100644' && e.mode !== '100755' && e.mode !== '120000')) throw cannot(`${safeText(e.path, 80)} is of a kind pipegen doesn't copy`);
-    total += typeof e.size === 'number' ? e.size : 0;
-    if (total > MAX_CENTRAL_BYTES) throw cannot(`its files add up to more than ${MAX_CENTRAL_BYTES} bytes`);
+    // review M6: a size GitHub doesn't give is unknown (not 0); the cap holds on the bytes read below
+    if (typeof e.size === 'number' && Number.isFinite(e.size) && e.size >= 0) reported += e.size;
+    if (reported > maxBytes) throw cannot(`its files add up to more than ${maxBytes} bytes`);
     blobs.push({ path: e.path, mode: e.mode, sha: e.sha });
   }
   const contents = new Map<string, Uint8Array>();
   const shas = [...new Set(blobs.map((b) => b.sha))];
+  let read = 0;
   for (let i = 0; i < shas.length; i += BLOB_READ_CONCURRENCY) {
     await Promise.all(shas.slice(i, i + BLOB_READ_CONCURRENCY).map(async (sha) => {
       notStopping();
       const b = await get('GET /repos/{owner}/{repo}/git/blobs/{file_sha}', { file_sha: sha }) as { encoding?: unknown; content?: unknown } | null;
       if (b?.encoding !== 'base64' || typeof b.content !== 'string') throw cannot('a file could not be read');
-      contents.set(sha, Buffer.from(b.content.replace(/\s+/g, ''), 'base64'));
+      const bytes = Buffer.from(b.content.replace(/\s+/g, ''), 'base64');
+      read += bytes.length;
+      if (read > maxBytes) throw cannot(`its files add up to more than ${maxBytes} bytes`);
+      contents.set(sha, bytes);
     }));
   }
   const back = await hashBlobs(st.repo, shas.map((x) => contents.get(x) as Uint8Array));
@@ -553,37 +685,46 @@ async function readCentralHead(gh: Octokit, st: SessionState, central: GuardedRe
     entries.set(keyOf(name), { name, mode: b.mode, type: 'blob', sha: b.sha });
   }
   if (await writeTree(st, entries.values()) !== treeSha) throw cannot('the copy does not rebuild its head tree exactly');
+  // a symlink file among the workflows is judged by its target text (not a map: a problem), so it fails closed
   const workflows = blobs.filter((b) => isWorkflowPath(b.path)).map((b) => ({ path: b.path, content: Buffer.from(contents.get(b.sha) as Uint8Array).toString('utf8') }));
   return { branch, commit, entries, workflows };
 }
 
 /**
- * Pushes proof/<runId> of `pipelines` = its default head + this project's central files (S21; the central layout only).
- * Returns the commit sha the caller's `uses:` must pin. ProofStopError when a file isn't central, when a pushed workflow
- * could start on the push, or when the head can't be copied exactly.
+ * Builds proof/<runId> of `pipelines` = its default head + this project's central files (S21; the central layout only).
+ * Its sha is what the caller's `uses:` must pin. ProofStopError when a file isn't central, when a workflow of the tree
+ * could start on the push, or when the head can't be copied exactly. Nothing is pushed.
  */
-export async function pushCentralDraft(s: ProofSession, gh: Octokit, draft: CentralDraft, deps: { transport: ProofTransport; clock?: RateClock }): Promise<string> {
+export async function buildCentralDraft(s: ProofSession, gh: Octokit, draft: CentralDraft, deps: { clock?: RateClock; limits?: CentralLimits } = {}): Promise<ProofCommit> {
   const st = live(s);
   notStopping();
+  if (st.central !== null) throw new GitTransportError('The central draft is built once per proof session.');
   const t = st.target;
   const central = assertCentral(t, { owner: t.owner, repo: t.appRepo });
   checkCentralDraft(draft);
-  const own = draft.files.map((f) => ({ name: pathBytes(f.path), path: f.path, content: Buffer.from(f.content, 'utf8') }));
-  const ownProblems = checkCentralTriggers(draft.files);
+  const own = draft.files.map((f) => ({ name: pathBytes(f.path), path: f.path, content: f.content }));
+  const ownProblems = checkCentralTriggers(own);
   if (ownProblems.length > 0) throw new ProofStopError(`pipegen won't push this central draft: ${ownProblems.join('; ')}.`);
-  const head = await readCentralHead(gh, st, central, deps.clock ?? clockOf(gh));
+  const head = await readCentralHead(gh, st, central, deps.clock ?? clockOf(gh), deps.limits ?? {});
   const entries: Entries = new Map(head?.entries ?? []);
-  for (const e of await blobEntries(st.repo, own.map((f) => ({ name: f.name, content: f.content, mode: '100644' })))) entries.set(keyOf(e.name), e);
-  const ownPaths = new Set(own.map((f) => f.path));
-  const inherited = (head?.workflows ?? []).filter((w) => !ownPaths.has(w.path));
+  for (const e of await blobEntries(st.repo, own.map((f) => ({ name: f.name, content: Buffer.from(f.content, 'utf8'), mode: '100644' })))) entries.set(keyOf(e.name), e);
+  const ownKeys = new Set(own.map((f) => keyOf(f.name)));
+  const inherited = (head?.workflows ?? []).filter((w) => !ownKeys.has(keyOf(Buffer.from(w.path, 'utf8'))));
   const problems = checkCentralTriggers(inherited);
   if (problems.length > 0) throw new ProofStopError(`pipegen won't push proof/${t.runId} to ${central.fullName}: ${problems.join('; ')}. Change that workflow's triggers in ${central.fullName}, then run pipegen again.`);
   const tree = await writeTree(st, entries.values());
   const sha = await commitTree(st, tree, null, `pipegen proof ${t.runId}: central draft for ${t.appRepo}${head === null ? '' : ` on ${head.branch} ${head.commit}`}`);
-  await pushOrStop(deps.transport, central, st.repo, [{ sha, branch: `proof/${t.runId}` }], false, 'central');
-  st.trees.set(sha, entries);
+  const branch = `proof/${t.runId}`;
+  record(st, sha, { kind: 'central', branch, parent: null, entries, allowed: new Set(), centralWorkflows: [...inherited, ...own.map((f) => ({ path: f.path, content: f.content }))] });
   st.central = { sha, paths: new Set([...entries.values()].map((e) => shown(e.name))) };
-  return sha;
+  return proofCommit(st, { kind: 'central', sha, branch, commits: [sha] });
+}
+
+/** buildCentralDraft, then the push to proof/<runId> of pipelines. Returns the commit sha. */
+export async function pushCentralDraft(s: ProofSession, gh: Octokit, draft: CentralDraft, deps: { transport: ProofTransport; clock?: RateClock; limits?: CentralLimits }): Promise<string> {
+  const c = await buildCentralDraft(s, gh, draft, deps);
+  await pushCommit(s, c, deps.transport);
+  return c.sha;
 }
 
 function checkCentralDraft(draft: CentralDraft): void {
@@ -597,30 +738,25 @@ function checkCentralDraft(draft: CentralDraft): void {
 // ---------- proof branches ----------
 
 /**
- * Pushes proof/<runId>/<variant>: one commit per file set, the first on `parent` (default: the base), each with exactly
- * that one parent, then one push without force (B3: GitHub refuses a push that doesn't fast-forward). `pipegenWorkflows`
- * lists pipegen's own workflow files: the resulting tree may hold no other file under .github/workflows/, and none of
- * them may be at a user workflow's path.
+ * Builds proof/<runId>/<variant>: one commit per file set, the first on `parent` (default: the base; else a scratch commit
+ * of this session), each with exactly that one parent. `pipegenWorkflows` lists the draft's own pipegen workflow files
+ * (E2-R5: also at a path HEAD holds; their content is the draft's): the tree may hold no other file under
+ * .github/workflows/. Every path, mode and file/folder clash is checked here. Nothing is pushed.
  */
-export async function pushProofBranch(s: ProofSession, variant: Variant, commits: readonly (readonly ProofFile[])[], deps: { transport: ProofTransport; pipegenWorkflows: ReadonlySet<string>; parent?: string }): Promise<{ variant: Variant; branch: string; sha: string; commits: string[] }> {
+export async function buildProofBranch(s: ProofSession, variant: Variant, commits: readonly (readonly ProofFile[])[], deps: { pipegenWorkflows: ReadonlySet<string>; parent?: string }): Promise<ProofCommit> {
   const st = live(s);
   notStopping();
-  if (st.base === null) throw new GitTransportError('A proof branch needs the base snapshot first (pushBase).');
+  if (st.base === null) throw new GitTransportError('A proof branch needs the base snapshot first (buildBase).');
   if (typeof variant !== 'string' || !VARIANT_RE.test(variant)) throw new GitTransportError(`"${safeText(String(variant), 60)}" is not a proof variant.`);
   const t = st.target;
-  const scratch = assertScratch(t, { owner: t.owner, repo: t.appRepo });
   const parent = deps.parent ?? st.base.sha;
-  const start = st.trees.get(parent);
-  if (start === undefined || parent === st.central?.sha) throw new GitTransportError('The parent commit is not a scratch commit pipegen made in this proof session.');
-  const user = new Set(st.base.userWorkflows);
-  const allowed = new Set<string>();
-  for (const p of deps.pipegenWorkflows) {
-    if (user.has(p.toLowerCase())) throw new GitTransportError(`${safeText(p, 120)} is one of your workflows; pipegen never pushes it.`);
-    allowed.add(p.toLowerCase());
-  }
+  const start = st.commits.get(parent);
+  if (start === undefined || start.kind === 'central') throw new GitTransportError('The parent commit is not a scratch commit pipegen made in this proof session.');
+  const allowed = new Set([...deps.pipegenWorkflows].map((p) => p.toLowerCase()));
+  for (const p of allowed) if (!isWorkflowPath(p)) throw new GitTransportError(`${safeText(p, 120)} is not a workflow path.`);
   const branch = `proof/${t.runId}/${variant}`;
   let cur = parent;
-  let entries = start;
+  let entries = start.entries;
   const made: string[] = [];
   for (const [i, files] of commits.entries()) {
     const next: Entries = new Map(entries);
@@ -634,20 +770,27 @@ export async function pushProofBranch(s: ProofSession, variant: Variant, commits
       return { name, content: typeof f.content === 'string' ? Buffer.from(f.content, 'utf8') : f.content, mode };
     });
     for (const e of await blobEntries(st.repo, add)) next.set(keyOf(e.name), e);
-    // the last line: the tree's workflow files are exactly pipegen's own
+    // the tree's workflow files are exactly pipegen's own (checked again right before the push)
     for (const k of next.keys()) {
       const p = shown(bytesOfKey(k));
-      if (isWorkflowPath(p) && (!allowed.has(p.toLowerCase()) || user.has(p.toLowerCase()))) throw new GitTransportError(`${safeText(p, 120)} is a workflow pipegen didn't list as its own; not pushing.`);
+      if (isWorkflowPath(p) && !allowed.has(p.toLowerCase())) throw new GitTransportError(`${safeText(p, 120)} is a workflow pipegen didn't list as its own; not pushing.`);
     }
     const tree = await writeTree(st, next.values());
-    cur = await commitTree(st, tree, cur, `pipegen proof ${t.runId}: ${variant} (${i + 1}/${commits.length})`);
-    st.trees.set(cur, next);
-    made.push(cur);
+    const sha = await commitTree(st, tree, cur, `pipegen proof ${t.runId}: ${variant} (${i + 1}/${commits.length})`);
+    record(st, sha, { kind: 'proof', branch, parent: cur, entries: next, allowed });
+    cur = sha;
+    made.push(sha);
     entries = next;
   }
-  if (made.length === 0) throw new GitTransportError('A proof branch push needs at least one commit.');
-  await pushOrStop(deps.transport, scratch, st.repo, [{ sha: cur, branch }], false, variant === 'planted' ? 'planted' : 'proof');
-  return { variant, branch, sha: cur, commits: made };
+  if (made.length === 0) throw new GitTransportError('A proof branch needs at least one commit.');
+  return proofCommit(st, { kind: 'proof', sha: cur, branch, variant, commits: made });
+}
+
+/** buildProofBranch, then one push without force (B3: GitHub refuses a push that doesn't fast-forward). */
+export async function pushProofBranch(s: ProofSession, variant: Variant, commits: readonly (readonly ProofFile[])[], deps: { transport: ProofTransport; pipegenWorkflows: ReadonlySet<string>; parent?: string }): Promise<ProofBranch> {
+  const c = await buildProofBranch(s, variant, commits, deps);
+  await pushCommit(s, c, deps.transport);
+  return { variant, branch: c.branch, sha: c.sha, commits: [...c.commits] };
 }
 
 // ---------- planted secrets (C1b, ruling S9) ----------
@@ -784,53 +927,84 @@ export async function disableUserWorkflows(gh: Octokit, scratch: GuardedRepo, pi
   return disabled;
 }
 
-/** No workflow run may exist for the base sha (it holds no workflow): one that does is a stop before any secret is stored. */
+const RUNS_NAMED = 3;
+/**
+ * No workflow run may exist for the base sha (it holds no workflow): one that does is a stop before any secret is stored,
+ * naming the runs (id, name, event, path, head branch: review M7) and what to do.
+ */
 async function checkNoRunForBase(gh: Octokit, scratch: GuardedRepo, baseSha: string, clock: RateClock): Promise<void> {
-  let d: { total_count?: unknown } | null;
+  let d: { total_count?: unknown; workflow_runs?: unknown } | null;
   try {
-    d = (await githubRead(gh, 'GET /repos/{owner}/{repo}/actions/runs', { owner: scratch.owner, repo: scratch.repo, head_sha: baseSha, per_page: 1 }, clock)).data as typeof d;
+    d = (await githubRead(gh, 'GET /repos/{owner}/{repo}/actions/runs', { owner: scratch.owner, repo: scratch.repo, head_sha: baseSha, per_page: 5 }, clock)).data as typeof d;
   } catch (e) {
     hard(gh, e);
     throw new ProofStopError(`pipegen couldn't check the workflow runs of ${scratch.fullName} (${saidOf(e)}), so it stores no secret there.`);
   }
   if (typeof d?.total_count !== 'number') throw new ProofStopError(`GitHub's list of the workflow runs of ${scratch.fullName} could not be read, so pipegen stores no secret there.`);
-  if (d.total_count > 0) {
-    throw new ProofStopError(`ALERT: a workflow run started in ${scratch.fullName} for the base snapshot (${baseSha.slice(0, 12)}), which holds none of your workflows. `
-      + `pipegen stopped before storing any secret there. Check ${scratch.fullName} → Actions (and its rulesets and installed apps) before running pipegen again.`);
-  }
+  if (d.total_count === 0) return;
+  const runs = (Array.isArray(d.workflow_runs) ? d.workflow_runs : []).slice(0, RUNS_NAMED).map((x) => {
+    const r = (x ?? {}) as { id?: unknown; name?: unknown; event?: unknown; path?: unknown; head_branch?: unknown };
+    const f = (v: unknown, n = 80) => (typeof v === 'string' || typeof v === 'number' ? safeText(String(v), n) : '?');
+    return `run ${f(r.id, 20)} "${f(r.name)}" (event ${f(r.event, 40)}, workflow ${f(r.path, 120)}, branch ${f(r.head_branch, 100)})`;
+  });
+  const named = runs.length > 0 ? `: ${runs.join('; ')}${d.total_count > runs.length ? `; and ${d.total_count - runs.length} more` : ''}` : '';
+  throw new ProofStopError(`ALERT: a workflow run started in ${scratch.fullName} for the base snapshot (${baseSha.slice(0, 12)}), which holds none of your workflows${named}. `
+    + `pipegen stopped before storing any secret there. Disable or remove that workflow in ${scratch.fullName} (Actions → the workflow → Disable workflow; `
+    + `for a dynamic one such as CodeQL default setup, turn it off in Settings → Code security), check its rulesets and installed apps, then run pipegen again.`);
 }
 
-// ---------- the caller's pins (S24) ----------
-
-const CENTRAL_USES_RE = /\buses\s*:\s*["']?([A-Za-z0-9-]+)\/pipelines\/([^@\s"'#]+)@([^\s"'#]+)/gi;
+// ---------- the caller's pins (S24, review M5) ----------
 
 /**
- * The central layout: every workflow's `uses: <owner>/pipelines/<file>@<ref>` pins exactly centralSha and names a file of
- * the central commit, and at least one does (the caller). The local layout (no centralSha): none references pipelines.
+ * The central layout: in every pipegen workflow (parsed), each `uses:` of a job or a step that names `<owner>/pipelines`
+ * must be exactly `<owner>/pipelines/<a file of the central commit>@<centralSha>`, the owner the app's, and at least one
+ * must exist (the caller). The local layout (no centralSha): none may name pipelines. A workflow pipegen can't read, or a
+ * `uses` that isn't text, is a stop.
  */
-function checkCentralPins(files: readonly ProofFile[], t: ProofTarget, centralSha: string | undefined, centralPaths: ReadonlySet<string> | undefined): void {
+export function checkCentralPins(files: readonly ProofFile[], t: ProofTarget, centralSha: string | undefined, centralPaths: ReadonlySet<string> | undefined): void {
   let seen = 0;
   for (const f of files) {
     const p = shown(pathBytes(f.path));
-    if (!isWorkflowPath(p)) continue;
+    if (!isWorkflowPath(p) || !/\.ya?ml$/i.test(p)) continue;
     const content = typeof f.content === 'string' ? f.content : Buffer.from(f.content).toString('utf8');
-    for (const m of content.matchAll(CENTRAL_USES_RE)) {
-      const [, owner = '', file = '', ref = ''] = m;
-      const where = `${safeText(p, 120)} (uses ${safeText(`${owner}/pipelines/${file}@${ref}`, 160)})`;
+    const r = parseYaml(content, 'user');
+    if ('problems' in r) throw new ProofStopError(`pipegen can't read its own workflow ${safeText(p, 120)} (${r.problems[0] ?? 'not YAML'}); it won't prove it.`);
+    const uses: unknown[] = [];
+    const jobs = r.parsed.js.jobs;
+    if (isObj(jobs)) {
+      for (const job of Object.values(jobs)) {
+        if (!isObj(job)) continue;
+        if ('uses' in job) uses.push(job.uses);
+        if (Array.isArray(job.steps)) for (const step of job.steps) if (isObj(step) && 'uses' in step) uses.push(step.uses);
+      }
+    }
+    for (const u of uses) {
+      if (typeof u !== 'string') throw new ProofStopError(`${safeText(p, 120)} has a \`uses:\` that isn't text; pipegen won't prove it.`);
+      const at = u.lastIndexOf('@');
+      const target = (at === -1 ? u : u.slice(0, at)).trim();
+      const parts = target.split('/');
+      if (parts.length < 2 || (parts[1] ?? '').toLowerCase() !== 'pipelines' || parts[0] === '.' || parts[0] === '..' || /^[a-z]+:/i.test(target)) continue;
+      const where = `${safeText(p, 120)} (uses ${safeText(u, 160)})`;
+      const owner = parts[0] ?? '';
+      const file = parts.slice(2).join('/');
+      const ref = at === -1 ? '' : u.slice(at + 1);
       if (owner.toLowerCase() !== t.owner.toLowerCase()) throw new ProofStopError(`${where} names another owner's central repo; pipegen won't prove it.`);
       if (centralSha === undefined) throw new ProofStopError(`${where} references the central repo, but this draft has no central pin (the local layout); pipegen won't prove it.`);
       if (ref !== centralSha) throw new ProofStopError(`${where} is not pinned to the central draft commit ${centralSha}; pipegen won't prove it.`);
-      if (!(centralPaths ?? new Set()).has(file)) throw new ProofStopError(`${where} names a file the central draft commit doesn't hold.`);
+      if (file === '' || !(centralPaths ?? new Set()).has(file)) throw new ProofStopError(`${where} names no file of the central draft commit.`);
       seen++;
     }
   }
   if (centralSha !== undefined && seen === 0) throw new ProofStopError(`No workflow of the proof calls the central draft at ${centralSha}; the central layout needs the caller pinned to it.`);
 }
 
-/** The proof branch's files from the assembled ones: user workflow edits and bot configs left out, central files refused. */
-function prepareAppFiles(files: readonly CreatedFile[], userWorkflows: readonly string[]): { proof: ProofFile[]; leftOut: LeftOut[]; workflows: Set<string> } {
+/**
+ * The proof branch's files from the assembled ones (E2-R5): every non-`inserted` workflow of the draft is pipegen's own and
+ * goes in with the draft's content, also at a path HEAD holds (HEAD's copy, maybe edited by the user, stays out of every
+ * tree). pipegen's edits of user workflows (`inserted`) and bot configs are left out; central files are refused.
+ */
+function prepareAppFiles(files: readonly CreatedFile[]): { proof: ProofFile[]; leftOut: LeftOut[]; workflows: Set<string> } {
   if (!Array.isArray(files)) throw new ProofStopError('The assembled proof files are not a list.');
-  const user = new Set(userWorkflows);
   const proof: ProofFile[] = [];
   const leftOut: LeftOut[] = [];
   const workflows = new Set<string>();
@@ -840,7 +1014,6 @@ function prepareAppFiles(files: readonly CreatedFile[], userWorkflows: readonly 
     if (isBotConfig(f.path)) { leftOut.push({ path: f.path, why: 'a Dependabot or Renovate config: left out of the proof (S5)' }); continue; }
     if (isWorkflowPath(f.path)) {
       if (f.inserted !== undefined) { leftOut.push({ path: f.path, why: 'pipegen\'s edit of one of your workflows: your workflows never run in the scratch repo' }); continue; }
-      if (user.has(f.path.toLowerCase())) { leftOut.push({ path: f.path, why: 'a file at the path of one of your workflows: never pushed to the scratch repo' }); continue; }
       workflows.add(f.path);
     }
     proof.push({ path: f.path, content: f.content });
@@ -875,6 +1048,8 @@ export interface ProofSetupDeps {
   /** Wait before the no-run check (default 5000 ms), so a run the base push started can show up. */
   settleMs?: number;
   random?: (n: number) => Uint8Array;
+  /** The central head copy's caps (default MAX_CENTRAL_ENTRIES, MAX_CENTRAL_BYTES). */
+  centralLimits?: CentralLimits;
 }
 
 export interface ProofBranch { variant: Variant; branch: string; sha: string; commits: string[] }
@@ -893,7 +1068,12 @@ export interface ProofSetup {
   defaultBranchState?: DefaultBranchState;
 }
 
-/** The plan's order for one proof (see the file comment). Any failure removes the session and passes through. */
+const branchOf = (c: ProofCommit): ProofBranch => ({ variant: c.variant as Variant, branch: c.branch, sha: c.sha, commits: [...c.commits] });
+
+/**
+ * The plan's order for one proof (see the file comment): every commit is built and checked first (review M1), then the
+ * writes. Any failure removes the session and passes through.
+ */
 export async function pushProofSetup(input: ProofSetupInput, deps: ProofSetupDeps): Promise<ProofSetup> {
   const t = input.target;
   if (!isProofTarget(t)) throw new ScratchGuardError('the proof target was not made by proofTarget.');
@@ -902,7 +1082,6 @@ export async function pushProofSetup(input: ProofSetupInput, deps: ProofSetupDep
   const clock = deps.clock ?? clockOf(deps.gh);
   const warnings: string[] = [];
   const warn = (w: string) => { warnings.push(w); deps.io.err(w); };
-  // what can be checked before anything is written
   if (input.central !== undefined) checkCentralDraft(input.central);
   for (const f of input.plantedFiles) {
     const p = shown(pathBytes(f.path));
@@ -910,19 +1089,28 @@ export async function pushProofSetup(input: ProofSetupInput, deps: ProofSetupDep
   }
   const s = await openProofSession(t);
   try {
-    await turnOffDependabotUpdates(deps.gh, scratch, warn, clock);
-    const centralSha = input.central === undefined ? undefined : await pushCentralDraft(s, deps.gh, input.central, { transport: deps.transport, clock });
-    const base = await pushBase(s, input.dir, { transport: deps.transport, io: deps.io, ...(input.dockerServices === undefined ? {} : { dockerServices: input.dockerServices }) });
+    // 1. build and check every commit (reads only)
+    const central = input.central === undefined ? undefined : await buildCentralDraft(s, deps.gh, input.central, { clock, ...(deps.centralLimits === undefined ? {} : { limits: deps.centralLimits }) });
+    const centralSha = central?.sha;
+    const base = await buildBase(s, input.dir, { io: deps.io, ...(input.dockerServices === undefined ? {} : { dockerServices: input.dockerServices }) });
     warnings.push(...base.warnings);
+    const prepared = prepareAppFiles(await input.appFiles(centralSha));
+    checkCentralPins(prepared.proof, t, centralSha, live(s).central?.paths);
+    const c1b = plantedSecretPlacements(base.paths, { existingIgnore: base.gitleaksIgnore, ...(deps.random === undefined ? {} : { random: deps.random }) });
+    const branchDeps = { pipegenWorkflows: prepared.workflows };
+    const main = await buildProofBranch(s, 'main', [prepared.proof], branchDeps);
+    const planted = await buildProofBranch(s, 'planted', [[...prepared.proof, ...input.plantedFiles, ...c1b.files]], branchDeps);
+
+    // 2. the writes, in the plan's order
+    await turnOffDependabotUpdates(deps.gh, scratch, warn, clock);
+    if (central !== undefined) await pushCommit(s, central, deps.transport);
+    await pushCommit(s, base.commit, deps.transport);
     let defaultBranchState = input.defaultBranchState;
     if (defaultBranchState === 'pending') {
       notStopping();
       defaultBranchState = await setScratchDefaultBranch(deps.gh, scratch, clock);
       if (defaultBranchState === 'pending') throw new ProofStopError(`${scratch.fullName} still shows no branch after the base push; check it on GitHub, then run pipegen again.`);
     }
-    const prepared = prepareAppFiles(await input.appFiles(centralSha), base.userWorkflows);
-    checkCentralPins(prepared.proof, t, centralSha, live(s).central?.paths);
-    const c1b = plantedSecretPlacements(base.paths, { existingIgnore: base.gitleaksIgnore, ...(deps.random === undefined ? {} : { random: deps.random }) });
     notStopping();
     const disabled = await disableUserWorkflows(deps.gh, scratch, prepared.workflows, clock, warn);
     const settle = deps.settleMs ?? 5000;
@@ -932,11 +1120,10 @@ export async function pushProofSetup(input: ProofSetupInput, deps: ProofSetupDep
     notStopping();
     await deps.storeSecrets(scratch, { baseSha: base.sha });
     notStopping();
-    const branchDeps = { transport: deps.transport, pipegenWorkflows: prepared.workflows };
-    const main = await pushProofBranch(s, 'main', [prepared.proof], branchDeps);
-    const planted = await pushProofBranch(s, 'planted', [[...prepared.proof, ...input.plantedFiles, ...c1b.files]], branchDeps);
+    await pushCommit(s, main, deps.transport);
+    await pushCommit(s, planted, deps.transport);
     return {
-      session: s, ...(centralSha === undefined ? {} : { centralSha }), base, branches: { main, planted }, planted: c1b.expected, disabled,
+      session: s, ...(centralSha === undefined ? {} : { centralSha }), base, branches: { main: branchOf(main), planted: branchOf(planted) }, planted: c1b.expected, disabled,
       notProven: base.notProven, leftOut: [...base.leftOut, ...prepared.leftOut], warnings, ...(defaultBranchState === undefined ? {} : { defaultBranchState }),
     };
   } catch (e) {

@@ -11,10 +11,10 @@ import { join } from 'node:path';
 import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { Octokit } from '@octokit/rest';
 import { makeOctokit } from '../src/github/client.js';
-import type { PushRef, PushRepoHandle } from '../src/proof/git.js';
+import { createPushRepo, runGit, type PushRef, type PushRepoHandle } from '../src/proof/git.js';
 import {
-  checkCentralTriggers, disableUserWorkflows, gitTransport, openProofSession, plantedSecretPlacements, pushBase, pushProofBranch,
-  pushProofSetup, symlinkNotProven, type ProofFile, type ProofSetupInput, type ProofTransport,
+  buildProofBranch, checkCentralPins, checkCentralTriggers, disableUserWorkflows, gitTransport, openProofSession, plantedSecretPlacements, pushBase,
+  pushCommit, pushProofBranch, pushProofSetup, symlinkNotProven, type ProofFile, type ProofSetupInput, type ProofTransport,
 } from '../src/proof/snapshot.js';
 import { assertCentral, assertScratch, proofTarget, ProofStopError, ScratchGuardError, type GuardedRepo, type ProofTarget } from '../src/proof/target.js';
 import type { CreatedFile } from '../src/types.js';
@@ -93,8 +93,10 @@ interface Fixture {
   calls: Call[];
   /** Every event in order: API writes, reads of runs, transport pushes, the secret store. */
   events: string[];
-  /** GET …/actions/runs answer for the base sha. */
-  runs: { count: number };
+  /** GET …/actions/runs answer for the base sha (`list`: the runs GitHub names). */
+  runs: { count: number; list?: Record<string, unknown>[] };
+  /** The push repo the last push came from (the session's own, never exposed by the module). */
+  from: { last?: PushRepoHandle };
   workflows: { id: number; path: string; state: string }[];
   target: ProofTarget;
   transport: ProofTransport;
@@ -127,7 +129,7 @@ const blobsByRawPath = (bare: string, rev: string): Map<string, Buffer> => {
 };
 const parents = (bare: string, sha: string) => git(bare, 'rev-list', '--parents', '-n', '1', sha).split(' ').slice(1);
 
-async function fixture(o: { appDefault?: string; scratchEmpty?: boolean; runs?: number; pipelinesFiles?: Record<string, string> } = {}): Promise<Fixture> {
+async function fixture(o: { appDefault?: string; scratchEmpty?: boolean; runs?: number; pipelinesFiles?: Record<string, string>; noSizes?: boolean } = {}): Promise<Fixture> {
   const app = userRepo();
   const srv = fresh('srv');
   const scratchGit = join(srv, `${SCRATCH}.git`);
@@ -149,7 +151,8 @@ async function fixture(o: { appDefault?: string; scratchEmpty?: boolean; runs?: 
   recorder.route(server.port, { byName: true });
 
   const events: string[] = [];
-  const runs = { count: o.runs ?? 0 };
+  const runs: Fixture['runs'] = { count: o.runs ?? 0 };
+  const from: Fixture['from'] = {};
   const workflows: Fixture['workflows'] = [];
   const bareOf = (name: string) => (name === SCRATCH ? scratchGit : name === 'pipelines' ? pipelinesGit : null);
   const defaultOf = (bare: string) => {
@@ -194,7 +197,7 @@ async function fixture(o: { appDefault?: string; scratchEmpty?: boolean; runs?: 
       const tree = out.split('\0').filter((l) => l !== '').map((l) => {
         const [meta, p] = l.split('\t') as [string, string];
         const [mode, type, s, size] = meta.trim().split(/ +/) as [string, string, string, string];
-        return { path: p, mode, type, sha: s, ...(type === 'blob' ? { size: Number(size) } : {}) };
+        return { path: p, mode, type, sha: s, ...(type === 'blob' && o.noSizes !== true ? { size: Number(size) } : {}) };
       });
       return json(200, { sha, tree, truncated: false });
     }
@@ -209,7 +212,7 @@ async function fixture(o: { appDefault?: string; scratchEmpty?: boolean; runs?: 
       if (w !== undefined) w.state = 'disabled_manually';
       return json(200, {});
     }
-    if (m === 'GET' && rest === 'actions/runs') return json(200, { total_count: runs.count, workflow_runs: [] });
+    if (m === 'GET' && rest === 'actions/runs') return json(200, { total_count: runs.count, workflow_runs: runs.list ?? [] });
     return json(404, { message: 'Not Found' });
   };
   const { fetch, calls } = fakeFetch(new Proxy({}, { get: (_t, key) => (typeof key === 'string' ? route : undefined) }) as never);
@@ -217,14 +220,15 @@ async function fixture(o: { appDefault?: string; scratchEmpty?: boolean; runs?: 
   const target = proofTarget({ owner: OWNER, repo: 'shop', private: true, ownerType: 'User', defaultBranch: o.appDefault ?? 'main' }, { runId: RUN_ID });
   const real = gitTransport(PUSH_VALUE);
   const transport: ProofTransport = {
-    push: async (to: GuardedRepo, from: PushRepoHandle, refs: readonly PushRef[], opts?: { force?: boolean }) => {
+    push: async (to: GuardedRepo, repo: PushRepoHandle, refs: readonly PushRef[], opts?: { force?: boolean }) => {
       events.push(`push ${to.repo} ${refs.map((r) => `${opts?.force === true ? '+' : ''}${r.branch}`).join(',')}`);
-      await real.push(to, from, refs, opts);
+      from.last = repo;
+      await real.push(to, repo, refs, opts);
     },
   };
   const stored: GuardedRepo[] = [];
   return {
-    app, srv, scratchGit, pipelinesGit, gh, calls, events, runs, workflows, target, transport, stored,
+    app, srv, scratchGit, pipelinesGit, gh, calls, events, runs, from, workflows, target, transport, stored,
     close: async () => {
       await server.close();
       servers = servers.filter((s) => s !== server);
@@ -371,18 +375,21 @@ describe('E2 base snapshot, central draft, proof branches (Task 2 first half)', 
     // the server saw the token as Basic auth (the askpass answered), so the pushes were authenticated
     expect(servers[0]?.requests.some((q) => q.header !== undefined)).toBe(true);
     // and the transport refuses a value that is not token-shaped, or a target the guard didn't make
-    await expect(gitTransport('not a token').push(assertScratch(f.target, { owner: OWNER, repo: 'shop' }), (await openProofSession(f.target)).repo, [{ sha: 'a'.repeat(40), branch: 'main' }], { force: true })).rejects.toThrow(/token/);
+    expect(() => gitTransport('not a token')).toThrow(/token/);
+    // and the session's push repo is never exposed
+    expect(Object.keys(await openProofSession(f.target))).not.toContain('repo');
     await f.close();
   });
 
   it('snapshot: user workflow files are not in any pushed tree', async () => {
     const f = await fixture();
-    // pipegen's own edit of a user workflow (Plan G insertVerify) and a pipegen file at a user workflow's path are left out
+    // pipegen's own edits of user workflows (Plan G insertVerify) are left out; a draft workflow at a path HEAD holds (any
+    // case) is pipegen's own and goes in with the draft's content (E2-R5)
     const files = (sha: string | undefined) => [
       ...centralCaller(sha),
       created('.github/workflows/ci.yml', `${USER_CI}  verify:\n    runs-on: ubuntu-latest\n`, { inserted: { original: USER_CI, jobs: ['verify'], needs: [] } }),
       created('.github/workflows/deploy.yml', USER_CI, { inserted: { original: USER_CI, jobs: [], needs: [] } }),
-      created('.github/workflows/Nested/DEEP.yaml', USER_CI),
+      created('.github/workflows/Nested/DEEP.yaml', 'on: pull_request\njobs: {}\n'),
     ];
     const r = await pushProofSetup(input(f, { appFiles: files }), deps(f).d);
     const pushedTrees: Record<string, string>[] = [];
@@ -391,7 +398,7 @@ describe('E2 base snapshot, central draft, proof branches (Task 2 first half)', 
         for (const c of git(bare, 'rev-list', sha).split('\n')) pushedTrees.push(treeOf(bare, c));
       }
     }
-    const pipegenOwn = new Set(['.github/workflows/pipegen.yml']);
+    const pipegenOwn = new Set(['.github/workflows/pipegen.yml', '.github/workflows/Nested/DEEP.yaml']);
     for (const t of pushedTrees) {
       for (const p of USER_WORKFLOWS) expect(t[p]).toBeUndefined();
       expect(t['.github/workflows/deploy.yml']).toBeUndefined();
@@ -400,7 +407,8 @@ describe('E2 base snapshot, central draft, proof branches (Task 2 first half)', 
         expect(pipegenOwn.has(p) || ['.github/workflows/pipegen--sign.yml', '.github/workflows/shop--merge.yml'].includes(p), p).toBe(true);
       }
     }
-    expect(r.leftOut.map((l) => l.path)).toEqual(expect.arrayContaining(['.github/workflows/ci.yml', '.github/workflows/deploy.yml', '.github/workflows/Nested/DEEP.yaml']));
+    expect(r.leftOut.filter((l) => /edit of one of your workflows/.test(l.why)).map((l) => l.path).sort()).toEqual(['.github/workflows/ci.yml', '.github/workflows/deploy.yml']);
+    expect(show(f.scratchGit, r.branches.main.sha, '.github/workflows/Nested/DEEP.yaml')).toBe('on: pull_request\njobs: {}');
     // the last line: pushProofBranch itself refuses a tree with a workflow pipegen didn't list
     const s = r.session;
     await expect(pushProofBranch(s, 'main', [[{ path: '.github/workflows/ci.yml', content: USER_CI }]], { transport: f.transport, pipegenWorkflows: new Set(['.github/workflows/pipegen.yml']) }))
@@ -410,9 +418,6 @@ describe('E2 base snapshot, central draft, proof branches (Task 2 first half)', 
     // a workflow inherited from the parent commit that pipegen no longer lists is refused too (the tree check, not only added files)
     await expect(pushProofBranch(s, 'main', [[{ path: 'x.txt', content: 'x' }]], { transport: f.transport, pipegenWorkflows: new Set(), parent: r.branches.main.sha }))
       .rejects.toThrow(/pipegen\.yml is a workflow/);
-    // a user workflow path given as pipegen's own is refused even when no file is added there
-    await expect(pushProofBranch(s, 'planted', [[{ path: 'x.txt', content: 'x' }]], { transport: f.transport, pipegenWorkflows: new Set(['.github/workflows/CI.yml']), parent: r.branches.planted.sha }))
-      .rejects.toThrow(/one of your workflows/);
     await s.remove();
     await f.close();
   });
@@ -623,17 +628,18 @@ describe('E2 base snapshot, central draft, proof branches (Task 2 first half)', 
     expect(show(g.pipelinesGit, r2.centralSha as string, '.github/workflows/shop--merge.yml')).toBe(CENTRAL_MERGE.trim());
     expect(show(g.pipelinesGit, r2.centralSha as string, 'a.txt')).toBe('a');
     // the transport pushes to pipelines only refs/heads/proof/<runId>, never forced
-    const s = await openProofSession(f.target);
+    const h = f.from.last as PushRepoHandle;
     const central = assertCentral(f.target, { owner: OWNER, repo: 'shop' });
     for (const [refs, force] of [[[{ sha, branch: 'main' }], false], [[{ sha, branch: `proof/20261103-120000-000000` }], false], [[{ sha, branch: `proof/${RUN_ID}` }], true]] as const) {
-      await expect(gitTransport(PUSH_VALUE).push(central, s.repo, refs, { force })).rejects.toThrow(ScratchGuardError);
+      await expect(gitTransport(PUSH_VALUE).push(central, h, refs, { force })).rejects.toThrow(ScratchGuardError);
     }
     // nor to the scratch repo any branch but its default and proof/<runId>/…; the default branch only forced, proof branches never
     const scratch = assertScratch(f.target, { owner: OWNER, repo: 'shop' });
     for (const [branch, force] of [['other', false], [`proof/20261103-120000-000000/main`, false], [`proof/${RUN_ID}/main`, true], [`proof/${RUN_ID}`, false]] as const) {
-      await expect(gitTransport(PUSH_VALUE).push(scratch, s.repo, [{ sha, branch }], { force }), branch).rejects.toThrow(ScratchGuardError);
+      await expect(gitTransport(PUSH_VALUE).push(scratch, h, [{ sha, branch }], { force }), branch).rejects.toThrow(ScratchGuardError);
     }
-    await s.remove();
+    await r.session.remove();
+    await r2.session.remove();
     for (const x of [f, g]) await x.close();
   });
 
@@ -914,5 +920,205 @@ describe('E2 central default head read (S21)', () => {
     await expect(pushProofSetup(input(h), { ...deps(h).d, gh: gh3 })).rejects.toThrow(/rebuild its head tree exactly/);
     expect(h.events.some((e) => e.startsWith('push'))).toBe(false);
     for (const x of [f, g, h]) await x.close();
+  });
+});
+
+/** Every object's bytes in a bare repo (reachable or not), as one latin1 string. */
+const everyObject = (bare: string): string => gitBuf(bare, 'cat-file', '--batch-all-objects', '--batch').toString('latin1');
+/** A fake pipelines head for the central read: the tree listing and blobs given. */
+function headGh(tree: Record<string, unknown>[], blobs: Record<string, string> = {}, treeSha = '2'.repeat(40)): Octokit {
+  const { fetch } = fakeFetch(new Proxy({}, {
+    get: () => (c: Call): Reply => {
+      const p = decodeURIComponent(c.url.pathname);
+      if (p === `/repos/${OWNER}/pipelines`) return json(200, { default_branch: 'main' });
+      if (p.endsWith('/git/ref/heads/main')) return json(200, { object: { sha: '1'.repeat(40) } });
+      if (p.includes('/git/commits/')) return json(200, { tree: { sha: treeSha } });
+      if (p.includes('/git/trees/')) return json(200, { sha: treeSha, truncated: false, tree });
+      const blob = /\/git\/blobs\/([0-9a-f]+)$/.exec(p)?.[1];
+      if (blob !== undefined && blobs[blob] !== undefined) return json(200, { encoding: 'base64', content: Buffer.from(blobs[blob] as string).toString('base64') });
+      return json(404, {});
+    },
+  }) as never);
+  return makeOctokit(fake.githubPat(), { fetch, log: () => {} });
+}
+
+describe('E2 fix round 1 (review-E2)', () => {
+  const OLD_MARK = 'user-edited-old-pipegen';
+  const OLD = `on: push\njobs:\n  edited:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo ${OLD_MARK}\n`;
+
+  it('rerun (I1, E2-R5): HEAD holds an old pipegen.yml (central layout) → proof branches carry the draft\'s, the base neither, the HEAD copy nowhere', async () => {
+    const f = await fixture();
+    put(f.app, '.github/workflows/pipegen.yml', OLD);
+    commitAll(f.app, 'pipegen installed earlier, then edited');
+    const r = await pushProofSetup(input(f), deps(f).d);
+    const want = (centralCaller(r.centralSha)[0] as CreatedFile).content.trim();
+    for (const sha of [r.branches.main.sha, r.branches.planted.sha]) expect(show(f.scratchGit, sha, '.github/workflows/pipegen.yml')).toBe(want);
+    expect(treeOf(f.scratchGit, r.base.sha)['.github/workflows/pipegen.yml']).toBeUndefined();
+    for (const bare of [f.scratchGit, f.pipelinesGit]) expect(everyObject(bare)).not.toContain(OLD_MARK);
+    expect(r.base.leftOut.map((l) => l.path)).toContain('.github/workflows/pipegen.yml');
+    await r.session.remove();
+    await f.close();
+  });
+
+  it('rerun (I1, E2-R5): HEAD holds old pipegen.yml and pipegen-merge.yml (local layout) → the draft\'s in the proof branches, HEAD\'s nowhere', async () => {
+    const f = await fixture();
+    put(f.app, '.github/workflows/pipegen.yml', OLD);
+    put(f.app, '.github/workflows/pipegen-merge.yml', OLD.replace(OLD_MARK, `${OLD_MARK}-merge`));
+    commitAll(f.app, 'local layout installed earlier');
+    const r = await pushProofSetup(input(f, { central: undefined, appFiles: () => localLayout() }), deps(f).d);
+    const draft = localLayout();
+    for (const sha of [r.branches.main.sha, r.branches.planted.sha]) {
+      for (const d of draft) expect(show(f.scratchGit, sha, d.path), d.path).toBe(d.content.trim());
+    }
+    const base = treeOf(f.scratchGit, r.base.sha);
+    expect(base['.github/workflows/pipegen.yml']).toBeUndefined();
+    expect(base['.github/workflows/pipegen-merge.yml']).toBeUndefined();
+    expect(everyObject(f.scratchGit)).not.toContain(OLD_MARK);
+    expect(heads(f.pipelinesGit)[`proof/${RUN_ID}`]).toBeUndefined();
+    await r.session.remove();
+    await f.close();
+  });
+
+  it('build first (M1): a file/folder clash or a bad mode refuses with nothing written, stored or pushed', async () => {
+    const cases: [string, Partial<ProofSetupInput>, RegExp][] = [
+      ['app file over a base folder', { appFiles: (sha) => [...centralCaller(sha), created('src', 'x\n')] }, /folder/],
+      ['planted path under an app file', { plantedFiles: [{ path: 'Dockerfile/x', content: 'x' }] }, /folder/],
+      ['planted file with a symlink mode', { plantedFiles: [{ path: 'pipegen-planted/l', content: '/etc', mode: '120000' as never }] }, /mode/],
+    ];
+    for (const [name, o, re] of cases) {
+      const f = await fixture();
+      const before = heads(f.scratchGit);
+      recorder.clear();
+      recorder.route(servers[servers.length - 1]?.port as number, { byName: true });
+      await expect(pushProofSetup(input(f, o), deps(f).d), name).rejects.toThrow(re);
+      expect(f.events, name).toEqual([]);
+      expect(f.stored, name).toEqual([]);
+      expect(f.calls.filter((c) => c.method !== 'GET'), name).toEqual([]);
+      expect(recorder.calls().filter((c) => c.argv.includes('push')), name).toEqual([]);
+      expect(heads(f.scratchGit), name).toEqual(before);
+      await f.close();
+    }
+  });
+
+  it('push choke point (M2): only a commit this session built goes, to its own repo and branch; the push repo is never exposed', async () => {
+    const f = await fixture();
+    const r = await pushProofSetup(input(f), deps(f).d);
+    const h = f.from.last as PushRepoHandle;
+    const real = gitTransport(PUSH_VALUE);
+    const app = { owner: OWNER, repo: 'shop' };
+    const scratch = assertScratch(f.target, app);
+    const central = assertCentral(f.target, app);
+    const before = { s: heads(f.scratchGit), p: heads(f.pipelinesGit) };
+    const main = r.branches.main;
+    const refused: [GuardedRepo, string, string, boolean, RegExp][] = [
+      [scratch, r.centralSha as string, 'main', true, /central draft commit/],
+      [scratch, r.centralSha as string, `proof/${RUN_ID}/x`, false, /central draft commit/],
+      [central, main.sha, `proof/${RUN_ID}`, false, /scratch commit never goes/],
+      [scratch, r.base.sha, `proof/${RUN_ID}/x`, false, /base snapshot goes only/],
+      [scratch, r.base.sha, 'main', false, /base snapshot goes only/],
+      [scratch, main.sha, `proof/${RUN_ID}/planted`, false, /goes only to proof\/.*\/main/],
+      [scratch, main.sha, 'main', true, /goes only to proof\/.*\/main/],
+    ];
+    for (const [to, sha, branch, force, re] of refused) {
+      await expect(real.push(to, h, [{ sha, branch }], { force }), `${to.repo} ${branch}`).rejects.toThrow(re);
+    }
+    // a commit written into the session's repo by hand (not built and checked by snapshot.ts)
+    const forged = Buffer.from(await runGit(h, ['commit-tree', r.base.tree, '-m', 'forged'], { identity: { name: 'x', email: 'x@x.invalid' } })).toString().trim();
+    await expect(real.push(scratch, h, [{ sha: forged, branch: `proof/${RUN_ID}/x` }])).rejects.toThrow(/built and checked/);
+    // a push repo that is not a live session's
+    const other = await createPushRepo();
+    await expect(real.push(scratch, other, [{ sha: main.sha, branch: main.branch }])).rejects.toThrow(/live proof session/);
+    await other.remove();
+    // pushCommit takes only the records this session made
+    await expect(pushCommit(r.session, { ...r.base.commit }, f.transport)).rejects.toThrow(/not built by this proof session/);
+    const g = await fixture();
+    const r2 = await pushProofSetup(input(g), deps(g).d);
+    await expect(pushCommit(r.session, r2.base.commit, f.transport)).rejects.toThrow(/not built by this proof session/);
+    // the record is frozen: its branch can't be changed
+    expect(() => { (r.base.commit as { branch: string }).branch = `proof/${RUN_ID}/x`; }).toThrow();
+    // a removed session's repo pushes nothing
+    await r.session.remove();
+    await expect(real.push(scratch, h, [{ sha: main.sha, branch: main.branch }])).rejects.toThrow(/live proof session/);
+    expect(heads(f.scratchGit)).toEqual(before.s);
+    expect(heads(f.pipelinesGit)).toEqual(before.p);
+    // a fast-forward built later is pushed through the same choke point
+    const c = await buildProofBranch(r2.session, 'main', [[{ path: 'more.txt', content: 'more\n' }]], { pipegenWorkflows: new Set(['.github/workflows/pipegen.yml']), parent: r2.branches.main.sha });
+    await pushCommit(r2.session, c, g.transport);
+    expect(heads(g.scratchGit)[`proof/${RUN_ID}/main`]).toBe(c.sha);
+    await r2.session.remove();
+    for (const x of [f, g]) await x.close();
+  });
+
+  it('central (M3): a .github or .github/workflows that is a symlink or a submodule in the head → stop before anything is pushed', async () => {
+    for (const entry of [
+      { path: '.github', mode: '120000', type: 'blob', sha: '3'.repeat(40), size: 4 },
+      { path: '.GitHub/Workflows', mode: '120000', type: 'blob', sha: '3'.repeat(40), size: 4 },
+      { path: '.github/workflows', mode: '160000', type: 'commit', sha: '4'.repeat(40) },
+    ]) {
+      const f = await fixture();
+      await expect(pushProofSetup(input(f), { ...deps(f).d, gh: headGh([entry]) }), entry.path).rejects.toThrow(/pipelines.*(symlink|submodule)/s);
+      expect(f.events).toEqual([]);
+      await f.close();
+    }
+  });
+
+  it('central (M4): trigger keys are judged in any case; one `on`, spelled exactly so', () => {
+    const yml = (head: string) => `${head}\njobs:\n  a:\n    runs-on: ubuntu-latest\n    steps:\n      - run: "true"\n`;
+    for (const head of ['on: workflow_call\nOn: push', 'ON: push', 'On: workflow_call', 'on: workflow_call\nON: workflow_call', 'true: push', 'jobs0: x']) {
+      expect(checkCentralTriggers([{ path: '.github/workflows/x.yml', content: yml(head) }]), head).not.toEqual([]);
+    }
+    expect(checkCentralTriggers([{ path: '.github/workflows/x.yml', content: yml('"on": workflow_call') }])).toEqual([]);
+    expect(checkCentralTriggers([{ path: '.github/workflows/x.YML', content: yml('on: workflow_call\nOn: push') }])).not.toEqual([]);
+  });
+
+  it('pins (M5): every `uses:` naming <owner>/pipelines, parsed, must be exactly the central file @centralSha', () => {
+    const t = proofTarget({ owner: OWNER, repo: 'shop', private: true, ownerType: 'User', defaultBranch: 'main' }, { runId: RUN_ID });
+    const SHA = 'a'.repeat(40);
+    const paths = new Set(['.github/workflows/shop--merge.yml']);
+    const caller = `jobs:\n  pipegen:\n    uses: ${OWNER}/pipelines/.github/workflows/shop--merge.yml@${SHA}\n`;
+    const wf = (content: string): ProofFile[] => [{ path: '.github/workflows/pipegen.yml', content }];
+    const bad: [string, string][] = [
+      ['block scalar, wrong ref', `jobs:\n  p:\n    uses: >-\n      ${OWNER}/pipelines/.github/workflows/shop--merge.yml@${'b'.repeat(40)}\n`],
+      ['escaped slashes, wrong ref', `jobs:\n  p:\n    uses: "${OWNER}\\/pipelines\\/.github\\/workflows\\/shop--merge.yml@${'b'.repeat(40)}"\n`],
+      ['action form', `${caller}  q:\n    uses: ${OWNER}/pipelines@${SHA}\n`],
+      ['step, wrong ref', `${caller}  s:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: ${OWNER}/pipelines/.github/workflows/shop--merge.yml@main\n`],
+      ['no ref', `jobs:\n  p:\n    uses: ${OWNER}/pipelines/.github/workflows/shop--merge.yml\n`],
+      ['another owner', `${caller}  o:\n    uses: Other/pipelines/.github/workflows/shop--merge.yml@${SHA}\n`],
+      ['a file the commit lacks', `jobs:\n  p:\n    uses: ${OWNER}/pipelines/.github/workflows/nope.yml@${SHA}\n`],
+      ['uses not text', `jobs:\n  p:\n    uses: [a]\n`],
+      ['not YAML', `jobs: [\n`],
+      ['no caller at all', `jobs:\n  p:\n    uses: ./.github/workflows/pipegen-merge.yml\n`],
+    ];
+    for (const [name, content] of bad) expect(() => checkCentralPins(wf(content), t, SHA, paths), name).toThrow(ProofStopError);
+    for (const ok of [caller, `jobs:\n  p:\n    uses: >-\n      crisworking/PIPELINES/.github/workflows/shop--merge.yml@${SHA}\n`, `jobs:\n  p:\n    uses: "${OWNER}\\/pipelines\\/.github\\/workflows\\/shop--merge.yml@${SHA}"\n`]) {
+      expect(() => checkCentralPins(wf(ok), t, SHA, paths), ok).not.toThrow();
+    }
+    // the local layout: any pipelines reference is refused, a local call is fine, non-workflow files are not read
+    expect(() => checkCentralPins(wf(`jobs:\n  p:\n    uses: >-\n      ${OWNER}/pipelines/.github/workflows/shop--merge.yml@${SHA}\n`), t, undefined, undefined)).toThrow(/no central pin/);
+    expect(() => checkCentralPins(wf(`jobs:\n  p:\n    uses: ./.github/workflows/pipegen-merge.yml\n`), t, undefined, undefined)).not.toThrow();
+    expect(() => checkCentralPins([{ path: 'docs/x.yml', content: `uses: ${OWNER}/pipelines/x@main\n` }], t, undefined, undefined)).not.toThrow();
+  });
+
+  it('central (M6): sizes GitHub omits are unknown; the cap holds on the bytes read', async () => {
+    const f = await fixture({ noSizes: true });
+    const total = ['.github/workflows/pipegen--sign.yml', 'records/other.json', 'run.sh'].reduce((n, p) => n + gitBuf(f.pipelinesGit, 'cat-file', 'blob', `main:${p}`).length, 0);
+    await expect(pushProofSetup(input(f), { ...deps(f).d, centralLimits: { bytes: total - 1 } })).rejects.toThrow(new RegExp(`more than ${total - 1} bytes`));
+    expect(f.events).toEqual([]);
+    const g = await fixture({ noSizes: true });
+    const r = await pushProofSetup(input(g), { ...deps(g).d, centralLimits: { bytes: total } });
+    expect(r.centralSha).toMatch(/^[0-9a-f]{40}$/);
+    await r.session.remove();
+    for (const x of [f, g]) await x.close();
+  });
+
+  it('order (M7): the run that started for the base is named, with what to do', async () => {
+    const f = await fixture({ runs: 2 });
+    f.runs.list = [{ id: 4242, name: 'CodeQL', event: 'dynamic', path: 'dynamic/github-code-scanning/codeql', head_branch: 'main' }];
+    const err = await pushProofSetup(input(f), deps(f).d).then(() => null, (e: unknown) => e as Error);
+    expect(err).toBeInstanceOf(ProofStopError);
+    const m = (err as Error).message;
+    for (const part of ['workflow run started', '4242', '"CodeQL"', 'event dynamic', 'workflow dynamic/github-code-scanning/codeql', 'branch main', 'and 1 more', 'Disable or remove that workflow']) expect(m, part).toContain(part);
+    expect(f.events).not.toContain('store-secrets');
+    await f.close();
   });
 });
