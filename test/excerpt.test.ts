@@ -486,7 +486,11 @@ describe('errorExcerpt: regressions from the mutation run and the 200k fuzz runs
   it('excerpt: a dropped line whose reading opens a key with no END after it hides to the end of the log', async () => {
     const v = vault();
     const body = Array.from({ length: 4 }, (_, i) => `> ${fake.keyBody()}${i}`);
-    const out = await errorExcerpt([`${ESC}(B${fake.keyBegin()}`, ...body, 'Error: x'].join('\n'), composed(v), clean());
+    // only the reading that keeps final bytes has the marker whole (the K of KEY is a CSI's final byte); the stray ESC drops the line
+    const begin = fake.keyBegin();
+    const keyAt = begin.lastIndexOf('KEY');
+    const first = `${begin.slice(0, keyAt)}${ESC}[1;3${begin.slice(keyAt)}${ESC}(`;
+    const out = await errorExcerpt([first, ...body, 'Error: x'].join('\n'), composed(v), clean());
     for (const b of body) expect(out).not.toContain(b.slice(2));
     v.wipe();
   });
