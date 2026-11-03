@@ -439,7 +439,13 @@ describe('E1 repos (plan Task 1, preflight S1/S13/S19)', () => {
     // guard is at run time (guardedWrite takes registered handles and write rules; githubRead takes GET routes only).
     // It catches the obvious ways around them: Octokit write calls, a non-literal or spaced route, an aliased or
     // destructured request/graphql, bracket access on a client, .request.bind/call/apply, fetch( and @octokit/request.
-    const FETCH_ALLOWED: string[] = [];   // no file in src/proof needs fetch
+    // E4: download.ts fetches the artifact store's pre-signed URL by hand, without the token (ruling S2); no other file fetches
+    const FETCH_ALLOWED: string[] = ['download.ts'];
+    for (const f of readdirSync(join(import.meta.dirname, '..', 'src', 'proof')).filter((x) => x.endsWith('.ts') && x !== 'download.ts')) {
+      expect(readFileSync(join(import.meta.dirname, '..', 'src', 'proof', f), 'utf8'), f).not.toMatch(/globalThis\s*\.\s*fetch|\.fetch\s*\?\?/);
+    }
+    // and download.ts's store fetch never carries a credential header
+    expect(readFileSync(join(import.meta.dirname, '..', 'src', 'proof', 'download.ts'), 'utf8')).not.toMatch(/authorization|bearer|\btoken\s*:/i);
     for (const f of readdirSync(join(import.meta.dirname, '..', 'src', 'proof')).filter((x) => x.endsWith('.ts'))) {
       const src = readFileSync(join(import.meta.dirname, '..', 'src', 'proof', f), 'utf8');
       if (!FETCH_ALLOWED.includes(f)) expect(src, f).not.toMatch(/\bfetch\s*\(/);

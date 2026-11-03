@@ -27,6 +27,9 @@ import { startGitHttp, type GitHttpServer } from './helpers/git-http.js';
 import { makeGitRecorder, REAL_GIT } from './helpers/git-recorder.js';
 import { fake } from './helpers/secret-repo.js';
 import { compatCopiesFrom } from '../src/proof/harness.js';
+import { SecretVault } from '../src/create/secrets.js';
+import { ScratchKeys, scratchSecretStore } from '../src/proof/keys.js';
+import { secretsFake } from './helpers/scratch-secrets.js';
 
 vi.mock(import('../src/util/exit-hooks.js'), async (orig) => ({ ...(await orig()), interrupting: vi.fn(() => false) }));
 
@@ -139,7 +142,7 @@ const blobsByRawPath = (bare: string, rev: string): Map<string, Buffer> => {
 };
 const parents = (bare: string, sha: string) => git(bare, 'rev-list', '--parents', '-n', '1', sha).split(' ').slice(1);
 
-async function fixture(o: { appDefault?: string; scratchEmpty?: boolean; runs?: number; pipelinesFiles?: Record<string, string>; noSizes?: boolean } = {}): Promise<Fixture> {
+async function fixture(o: { appDefault?: string; scratchEmpty?: boolean; runs?: number; pipelinesFiles?: Record<string, string>; noSizes?: boolean; extra?: (c: Call) => Reply | undefined } = {}): Promise<Fixture> {
   const app = userRepo();
   const srv = fresh('srv');
   const scratchGit = join(srv, `${SCRATCH}.git`);
@@ -173,6 +176,8 @@ async function fixture(o: { appDefault?: string; scratchEmpty?: boolean; runs?: 
     return names.length === 1 ? names[0] as string : head;   // GitHub: the first branch pushed to an empty repo becomes the default
   };
   const route = (c: Call): Reply => {
+    const more = o.extra?.(c);
+    if (more !== undefined) { if (c.method !== 'GET') events.push(`${c.method} ${decodeURIComponent(c.url.pathname)}`); return more; }
     const path = decodeURIComponent(c.url.pathname);
     const parts = path.split('/').filter((p) => p !== '');
     if (parts[0] !== 'repos' || parts[1] !== OWNER) return json(404, { message: 'Not Found' });
@@ -498,6 +503,40 @@ describe('E2 base snapshot, central draft, proof branches (Task 2 first half)', 
     // refused before anything is written: no secret stored, nothing pushed
     expect(g.events).toEqual([]);
     await g.close();
+    await f.close();
+  });
+
+  it('E4: the real store (ScratchKeys) in the seam: delete leftovers, re-check access, then store, before the proof branch push', async () => {
+    const left = 'CRASHED';
+    const held = secretsFake(OWNER, SCRATCH, Object.fromEntries([[left, 'c'.repeat(12)]]));
+    const access = (c: Call): Reply | undefined => {
+      const p = decodeURIComponent(c.url.pathname);
+      if (p === '/user') return { body: { login: OWNER, id: 1 } };
+      if (p === `/repos/${OWNER}/${SCRATCH}/collaborators`) return { body: [{ login: OWNER, id: 1, role_name: 'admin', permissions: { pull: true, triage: true, push: true, maintain: true, admin: true } }] };
+      if (p === `/repos/${OWNER}/${SCRATCH}/invitations` || p === `/repos/${OWNER}/${SCRATCH}/keys`) return { body: [] };
+      return held.handler(c);
+    };
+    const f = await fixture({ extra: access });
+    const keys = new ScratchKeys(f.gh, f.target, new SecretVault(), { io: { prompt: { confirm: async () => false } as never, out: () => {}, err: () => {} } });
+    const d = { ...deps(f).d, [STORE]: scratchSecretStore(keys, ['STRIPE_SECRET_KEY']) };
+    await pushProofSetup(input(f), d);
+    const at = (pred: (e: string) => boolean) => f.events.findIndex(pred);
+    const order = [
+      at((e) => e === 'GET pipegen-proof-shop/actions/runs'),
+      at((e) => e === `DELETE /repos/${OWNER}/${SCRATCH}/actions/secrets/CRASHED`),
+      at((e) => e === `PUT /repos/${OWNER}/${SCRATCH}/actions/secrets/STRIPE_SECRET_KEY`),
+      at((e) => e === `PUT /repos/${OWNER}/${SCRATCH}/actions/secrets/PIPEGEN_FP_KEY`),
+      at((e) => e === `push pipegen-proof-shop proof/${RUN_ID}/main`),
+    ];
+    expect(order.every((i) => i >= 0), f.events.join('\n')).toBe(true);
+    expect([...order].sort((a, b) => a - b)).toEqual(order);
+    // the access re-check ran between the delete and the store
+    const calls = f.calls.map((c) => `${c.method} ${decodeURIComponent(c.url.pathname)}`);
+    const collab = calls.indexOf(`GET /repos/${OWNER}/${SCRATCH}/collaborators`);
+    expect(collab).toBeGreaterThan(calls.indexOf(`DELETE /repos/${OWNER}/${SCRATCH}/actions/secrets/CRASHED`));
+    expect(collab).toBeLessThan(calls.indexOf(`PUT /repos/${OWNER}/${SCRATCH}/actions/secrets/STRIPE_SECRET_KEY`));
+    expect([...held.values.keys()].sort()).toEqual(['PIPEGEN_FP_KEY', 'STRIPE_SECRET_KEY']);
+    expect(keys.mode).toBe('placeholder');
     await f.close();
   });
 

@@ -16,7 +16,8 @@
 //   workflow_dispatch or schedule (E2-R3, one `on` key spelled exactly so); a `.github` or `.github/workflows` that is a
 //   symlink or a submodule there is a stop.
 // - The proof branches (buildProofBranch): proof/<runId>/<variant> = the base (or an earlier proof commit of this session)
-//   + one commit per file set, each with exactly one parent, pushed without force (B3). The tree's workflow files must be
+//   + one commit per file set, each with exactly one parent, pushed without force (B3). A deploy re-run after a merge (E4,
+//   B3) goes to a fresh proof/<runId>/<variant>-<round> (round 2..99): its first commit on the base, a round never reused. The tree's workflow files must be
 //   exactly the draft's own pipegen workflows (E2-R5: with the draft's content, also at a path HEAD holds).
 // - Every commit is a ProofCommit record (kind, sha, the one branch it may go to) that only this module makes. pushCommit,
 //   and gitTransport itself, push only such a commit of a live session, to its own repo and branch, after checking its
@@ -75,7 +76,7 @@ export interface ProofTransport {
   push(to: GuardedRepo, from: PushRepoHandle, refs: readonly PushRef[], opts?: { force?: boolean }): Promise<void>;
 }
 
-/** E4's seam: stores the scratch secrets. The real store must call checkScratchAccess again before its first write. */
+/** E4's seam: stores the scratch secrets. The real store is keys.ts scratchSecretStore (deleteAll, checkScratchAccess, then the store). */
 export type SecretStoreStep = (scratch: GuardedRepo, ctx: { baseSha: string }) => Promise<void>;
 
 /**
@@ -748,20 +749,29 @@ function checkCentralDraft(draft: CentralDraft): void {
  * (E2-R5: also at a path HEAD holds; their content is the draft's): the tree may hold no other file under
  * .github/workflows/. Every path, mode and file/folder clash is checked here. Nothing is pushed.
  */
-export async function buildProofBranch(s: ProofSession, variant: Variant, commits: readonly (readonly ProofFile[])[], deps: { pipegenWorkflows: ReadonlySet<string>; parent?: string }): Promise<ProofCommit> {
+export async function buildProofBranch(s: ProofSession, variant: Variant, commits: readonly (readonly ProofFile[])[], deps: { pipegenWorkflows: ReadonlySet<string>; parent?: string; round?: number }): Promise<ProofCommit> {
   const st = live(s);
   notStopping();
   if (st.base === null) throw new GitTransportError('A proof branch needs the base snapshot first (buildBase).');
   if (typeof variant !== 'string' || !VARIANT_RE.test(variant)) throw new GitTransportError(`"${safeText(String(variant), 60)}" is not a proof variant.`);
+  // E4 (ruling B3): a re-run after a merge (resetBase first) goes to a FRESH branch proof/<runId>/<variant>-<round>, round 2..99
+  const round = deps.round;
+  if (round !== undefined && !(Number.isSafeInteger(round) && round >= 2 && round <= 99)) throw new GitTransportError('A proof round is a whole number from 2 to 99.');
   const t = st.target;
   const parent = deps.parent ?? st.base.sha;
   const start = st.commits.get(parent);
   if (start === undefined || start.kind === 'central') throw new GitTransportError('The parent commit is not a scratch commit pipegen made in this proof session.');
   // review r1-m2: main never builds on planted (or dispute) commits; planted on base, main or planted; a dispute on base,
-  // main or its own branch
-  const branch = `proof/${t.runId}/${variant}`;
+  // main or its own branch. A round branch builds only on the base (its first commit, on a branch never used before) or on itself.
+  const branch = `proof/${t.runId}/${variant}${round === undefined ? '' : `-${round}`}`;
   const mainBranch = `proof/${t.runId}/main`;
-  const okParent = start.kind === 'base' || start.branch === branch || (variant !== 'main' && start.branch === mainBranch);
+  if (round !== undefined) {
+    if (start.kind === 'base' && [...st.commits.values()].some((c) => c.branch === branch)) {
+      throw new GitTransportError(`${branch} was already used; a re-run after a merge goes to a fresh branch (the next round).`);
+    }
+    if (start.kind !== 'base' && start.branch !== branch) throw new GitTransportError(`The parent commit is on ${start.branch}; a ${variant} round commit builds only on the base or ${branch}.`);
+  }
+  const okParent = start.kind === 'base' || start.branch === branch || (round === undefined && variant !== 'main' && start.branch === mainBranch);
   if (!okParent) throw new GitTransportError(`The parent commit is on ${start.branch}; a ${variant} commit builds only on the base${variant === 'main' ? ' or main' : `, main or ${variant}`}.`);
   const allowed = new Set([...deps.pipegenWorkflows].map((p) => p.toLowerCase()));
   for (const p of allowed) if (!isWorkflowPath(p)) throw new GitTransportError(`${safeText(p, 120)} is not a workflow path.`);
@@ -829,7 +839,7 @@ export async function buildProofBranch(s: ProofSession, variant: Variant, commit
 }
 
 /** buildProofBranch, then one push without force (B3: GitHub refuses a push that doesn't fast-forward). */
-export async function pushProofBranch(s: ProofSession, variant: Variant, commits: readonly (readonly ProofFile[])[], deps: { transport: ProofTransport; pipegenWorkflows: ReadonlySet<string>; parent?: string }): Promise<ProofBranch> {
+export async function pushProofBranch(s: ProofSession, variant: Variant, commits: readonly (readonly ProofFile[])[], deps: { transport: ProofTransport; pipegenWorkflows: ReadonlySet<string>; parent?: string; round?: number }): Promise<ProofBranch> {
   const c = await buildProofBranch(s, variant, commits, deps);
   await pushCommit(s, c, deps.transport);
   return { variant, branch: c.branch, sha: c.sha, commits: [...c.commits] };

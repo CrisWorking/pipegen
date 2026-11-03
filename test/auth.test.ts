@@ -406,6 +406,32 @@ describe('makeOctokit', () => {
     expect(calls.some((c: Call) => c.url.host === 'evil.example')).toBe(false);
   });
 
+  it('makeOctokit: a GET that asks redirect: manual gets the redirect back unfollowed (E4 downloads); nothing else changes', async () => {
+    const store = 'https://pipelinesghubeus1.actions.githubusercontent.com/abc/zip?sig=1';
+    const routes: Routes = {
+      [`GET ${API}/repos/o/r/actions/artifacts/7/zip`]: { status: 302, headers: { location: store } },
+      [`GET ${API}/repos/o/r/actions/jobs/9/logs`]: { status: 302, headers: { location: `${API}/repos/o/r/elsewhere` } },
+      [`POST ${API}/repos/o/r/thing`]: { status: 302, headers: { location: store } },
+    };
+    const { gh: client, calls } = gh(routes, fgCred());
+    const res = await client.request('GET /repos/{owner}/{repo}/actions/artifacts/{artifact_id}/zip', { owner: 'o', repo: 'r', artifact_id: 7, request: { redirect: 'manual' } });
+    expect(res.status).toBe(302);
+    expect(res.headers.location).toBe(store);
+    // the store host was never called (only the API call, with the token)
+    expect(calls.map((c) => c.url.href)).toEqual([`${API}/repos/o/r/actions/artifacts/7/zip`]);
+    expect(calls[0]?.headers.authorization).toContain(fgCred());
+    // a same-origin redirect is not followed either when manual is asked
+    const same = await client.request('GET /repos/{owner}/{repo}/actions/jobs/{job_id}/logs', { owner: 'o', repo: 'r', job_id: 9, request: { redirect: 'manual' } });
+    expect(same.status).toBe(302);
+    expect(calls).toHaveLength(2);
+    // without manual: the old rule (another host is refused, nothing sent there)
+    const e = await caught(client.request('GET /repos/{owner}/{repo}/actions/artifacts/{artifact_id}/zip', { owner: 'o', repo: 'r', artifact_id: 7 }));
+    expect(allText(e)).not.toContain(fgCred());
+    // a write that is redirected is never handed back as an answer, manual or not
+    await caught(client.request('POST /repos/{owner}/{repo}/thing', { owner: 'o', repo: 'r', request: { redirect: 'manual' } }));
+    expect(calls.some((c) => c.url.host !== 'api.github.com')).toBe(false);
+  });
+
   it('makeOctokit: every request has its own timeout (Plan U carry-forward)', async () => {
     const hang: typeof fetch = (_input, init) => new Promise((_resolve, reject) => {
       init?.signal?.addEventListener('abort', () => reject(init.signal?.reason));

@@ -157,6 +157,9 @@ function guardedFetch(base: typeof fetch, timeoutMs: number, token: string | nul
   return async (input, init) => {
     let url = new URL(input instanceof Request ? input.url : String(input));
     const method = (init?.method ?? 'GET').toUpperCase();
+    // E4 (ruling S2): a GET whose caller asked `redirect: 'manual'` gets the redirect back unfollowed, so src/proof/download.ts
+    // can fetch the artifact store's URL WITHOUT the token. Nothing is ever sent to another origin from here.
+    const handBack = init?.redirect === 'manual' && method === 'GET';
     for (let hop = 0; ; hop++) {
       if (url.origin !== API_ORIGIN || url.username !== '' || url.password !== '') {
         throw new Error(`pipegen only sends GitHub requests to ${GITHUB_API}, not to ${safeText(url.origin, 100)}.`);
@@ -167,6 +170,7 @@ function guardedFetch(base: typeof fetch, timeoutMs: number, token: string | nul
       if (res.status >= 300 && res.status < 400 && res.status !== 304) {
         const location = res.headers.get('location');
         await res.body?.cancel().catch(() => {});
+        if (handBack) return new Response(null, { status: res.status, statusText: res.statusText, headers: res.headers });
         if (location === null || hop >= MAX_API_REDIRECTS || (method !== 'GET' && method !== 'HEAD')) {
           throw new Error(`GitHub redirected ${method} ${safeText(url.pathname, 120)} and pipegen won't follow it.`);
         }
