@@ -1100,15 +1100,17 @@ describe('fix round 2 (5): a leading slash scopes a protected path to the root',
 // owns only the pipeline's paths, and with no administrator bypass the pull request never merged). The rule: such a finding is waived by
 // an approval from any owner listed in pipegen's own CODEOWNERS block (`# pipegen:begin` … `# pipegen:end` of the BASE commit's file).
 // The approval itself is what readPrContext already counts: APPROVED on exactly the head commit, not by the pull request's author, from a
-// user with write access. A path some rule covers (a user, a team, or a rule that clears ownership) keeps its own owners; protected paths
-// keep theirs too.
-describe('gate-v0.2.1: an owner in pipegen\'s CODEOWNERS block waives a finding in a file no rule covers', () => {
+// user with write access. Ruling D9-4: the same holds when the matching rule names no USER owner (a team-only rule, or a rule that clears
+// ownership), since the gate can not count a team's approval. A path whose rule names a user keeps its own owners; protected paths and
+// shared-config sections keep theirs too (no fallback).
+describe('gate-v0.2.1: an owner in pipegen\'s CODEOWNERS block waives a finding in a file no rule gives a user owner', () => {
   const BLOCK_FILE = [
     '# the repository\'s own rules',
     '/docs/ @dora',
     '/team/ @org/team',
     '/cleared/ @dora',
     '/cleared/x.ts',
+    '/cleared/x.TS',
     '',
     '# pipegen:begin',
     '/.github/workflows/ @alice @Bob',
@@ -1165,29 +1167,44 @@ describe('gate-v0.2.1: an owner in pipegen\'s CODEOWNERS block waives a finding 
     // block owners are compared like approvals, ignoring letter case
     expect(find([sup('src/a.ts')], ['alice'], { found: '.github/CODEOWNERS', blockOwners: ['ALICE'] })).toEqual([]);
   });
-  it('a file a rule DOES cover keeps its own owners: a user rule, a team-only rule, and a rule that clears ownership are not "uncovered"', () => {
+  it('a file whose rule names a user keeps its own owners only: a block owner does not waive it', () => {
     expect(find([sup('docs/a.md')], ['alice'])).toEqual(['integrity:suppression']);
     expect(find([sup('docs/a.md')], ['dora'])).toEqual([]);
-    expect(find([sup('team/a.ts')], ['alice', 'bob'])).toEqual(['integrity:suppression']);
-    expect(find([sup('cleared/x.ts')], ['alice', 'dora'])).toEqual(['integrity:suppression']);
+  });
+  it('D9-4: a team-only rule or a rule that clears ownership names no user, so a block owner waives the file findings there too', () => {
+    for (const name of ['team/a.ts', 'cleared/x.ts']) {
+      for (const f of [sup(name), noPatch(name), caseExt(name.replace(/\.ts$/, '.TS'))]) {
+        expect(find([f], []).length, f.filename).toBe(1);
+        expect(find([f], ['alice']), f.filename).toEqual([]);
+        expect(find([f], ['bob']), f.filename).toEqual([]);
+        // the team's names, the owner the clearing rule replaced, and a stranger do not waive it
+        expect(find([f], ['org', 'team', 'dora', 'mallory']).length, f.filename).toBe(1);
+      }
+    }
+    // without block owners, still nobody
+    expect(find([sup('team/a.ts')], ['alice'], { found: '.github/CODEOWNERS', blockOwners: [] })).toEqual(['integrity:suppression']);
   });
   it('a protected path is never waived by the fallback: only an owner of that path (here a protected file no rule covers stays blocked)', () => {
     expect(find([file('knip.json')], ['alice', 'bob'])).toEqual(['integrity:protected-path']);
     expect(find([file(WF)], ['alice'])).toEqual([]);
+    // a protected file under a team-only rule: no fallback either (D9-4 is for the file findings only)
+    expect(find([file('team/knip.json')], ['alice', 'bob'])).toEqual(['integrity:protected-path']);
     // a section change of a shared file no rule covers: no fallback either
     const f = integrityFindings(ctx({ approvals: ['alice'] }), PROTECTED, RULES, { codeowners: CO, sectionChanges: [{ file: 'pyproject.toml', section: 'tool.ruff' }] });
     expect(ids(f)).toEqual(['integrity:protected-path']);
   });
   it('the message says who can approve: an owner in pipegen\'s block, with write access, on the head commit; nobody when the block lists no user', () => {
     const msg = (co: Record<string, unknown>): string => integrityFindings(ctx({ files: [sup('src/a.ts')] }), PROTECTED, RULES, { codeowners: co as { found: string | null } })[0]?.message ?? '';
-    expect(msg(CO)).toMatch(/No CODEOWNERS rule covers this file, so an owner listed in pipegen's CODEOWNERS block .*write access.* must approve the pull request on its current head commit\./);
+    expect(msg(CO)).toMatch(/No CODEOWNERS rule names a user owner of this file, so an owner listed in pipegen's CODEOWNERS block .*write access.* must approve the pull request on its current head commit\./);
+    const teamMsg = integrityFindings(ctx({ files: [sup('team/a.ts')] }), PROTECTED, RULES, { codeowners: CO })[0]?.message ?? '';
+    expect(teamMsg).toMatch(/No CODEOWNERS rule names a user owner of this file, so an owner listed in pipegen's CODEOWNERS block/);
     expect(msg({ found: '.github/CODEOWNERS', blockOwners: [] })).toMatch(/No user is a code owner of this path/);
     // a protected path no rule covers keeps the old message
     expect(integrityFindings(ctx({ files: [file('knip.json')] }), PROTECTED, RULES, { codeowners: CO })[0]?.message).toMatch(/No user is a code owner of this path/);
   });
   it('through readPrContext: a block owner\'s approval counts only on the head commit, not from the author, and only with write access', async () => {
-    const run = async (reviews: unknown[], over: { author?: string; perms?: [string, unknown][] } = {}): Promise<string[]> => {
-      const g = ghWith([sup('src/a.ts')], { user: { login: over.author ?? 'author' } });
+    const run = async (reviews: unknown[], over: { author?: string; perms?: [string, unknown][]; name?: string } = {}): Promise<string[]> => {
+      const g = ghWith([sup(over.name ?? 'src/a.ts')], { user: { login: over.author ?? 'author' } });
       g.reviews = reviews;
       for (const [l, p] of over.perms ?? []) g.perms.set(l, p);
       const pr = await readPrContextStrict(g, REPO, 5, { expectHeadSha: HEAD, codeowners: RULES });
@@ -1208,6 +1225,13 @@ describe('gate-v0.2.1: an owner in pipegen\'s CODEOWNERS block waives a finding 
     expect(await run([review(1, 'alice', 'APPROVED')], { perms: [['alice', { permission: 'read', role_name: 'maintain' }]] })).toEqual([]);
     // a stranger's approval on the head commit never counts
     expect(await run([review(1, 'mallory', 'APPROVED')])).toEqual(['integrity:suppression']);
+    // D9-4: the same conditions under a team-only rule and a clearing rule
+    for (const name of ['team/a.ts', 'cleared/x.ts']) {
+      expect(await run([review(1, 'alice', 'APPROVED')], { name }), name).toEqual([]);
+      expect(await run([review(1, 'alice', 'APPROVED', SHA('c'))], { name }), name).toEqual(['integrity:suppression']);
+      expect(await run([review(1, 'alice', 'APPROVED')], { name, author: 'alice' }), name).toEqual(['integrity:suppression']);
+      expect(await run([review(1, 'alice', 'APPROVED')], { name, perms: [['alice', { permission: 'read' }]] }), name).toEqual(['integrity:suppression']);
+    }
   });
   it('loadCodeowners: the block owners come from the BASE commit\'s file; a block the pull request adds at the head is never read', async () => {
     const g = new Gh();

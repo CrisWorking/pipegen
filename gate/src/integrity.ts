@@ -745,10 +745,11 @@ const fp = (...parts: string[]): string => createHash('sha256').update(parts.joi
  * exempt), high `integrity:suppression` (an added suppression marker, or any added line in a declared ignore file), high
  * `integrity:case-extension` (a new file name whose extension is a scanned one in another letter case, C5a CF2). All but the first are
  * waived by an approval, on the head commit, of a code owner (a user) of the path (last matching CODEOWNERS rule of the base commit).
- * gate-v0.2.1: a suppression, no-patch or case-extension finding in a file that NO rule covers (ownersOf is undefined) is also waived by an
- * approval from any owner listed in pipegen's own block (`codeowners.blockOwners`, from loadCodeowners); without it nobody could waive one.
- * A covered file (a user rule, a team-only rule, a rule that clears ownership) and every protected path keep their own owners only. The
- * approvals are readPrContext's: on exactly the head commit, never the author's, only from a user with write access.
+ * gate-v0.2.1: a suppression, no-patch or case-extension finding in a file whose last matching rule names no USER owner is also waived by an
+ * approval from any owner listed in pipegen's own block (`codeowners.blockOwners`, from loadCodeowners): no rule matches (ownersOf is
+ * undefined), or the rule names only teams or e-mails, or clears ownership (ownersOf is [], ruling D9-4; the gate can not count a team's
+ * approval). Without it nobody could waive one. A file whose rule names a user, every protected path and every shared-config section keep
+ * their own owners only. The approvals are readPrContext's: on exactly the head commit, never the author's, only from a user with write access.
  */
 export function integrityFindings(
   pr: PrContext, protectedPaths: readonly string[], rules: readonly CodeownersRule[],
@@ -760,10 +761,10 @@ export function integrityFindings(
   const isProtected = pathMatcher(protectedPaths);
   const blockOwners = extra.codeowners?.problem === undefined && Array.isArray(extra.codeowners?.blockOwners) ? extra.codeowners.blockOwners.map((o) => String(o).toLowerCase()) : [];
   const waived = (path: string): boolean => (ownersOf(rules, path) ?? []).some((o) => approvals.has(o));
-  /** For the file findings only (suppression, no-patch, case-extension): a file no rule covers is waived by an owner in pipegen's block. */
+  /** For the file findings only (suppression, no-patch, case-extension): a file no rule gives a user owner is waived by an owner in pipegen's block. */
   const waivedFile = (path: string): boolean => {
-    const o = ownersOf(rules, path);
-    return (o === undefined ? blockOwners : o).some((x) => approvals.has(x));
+    const o = ownersOf(rules, path);   // user owners only (codeOwners drops teams and e-mails)
+    return (o === undefined || o.length === 0 ? blockOwners : o).some((x) => approvals.has(x));
   };
   const push = (ruleId: string, severity: Finding['severity'], file: string | undefined, message: string, key: string, line?: number): void => {
     const k = `${ruleId}\0${file ?? ''}\0${key}`;
@@ -780,8 +781,8 @@ export function integrityFindings(
         : ' The base commit has no CODEOWNERS, so nobody can approve: add one (user owners, not only teams), or merge with an administrator bypass.';
     }
     const o = ownersOf(rules, path);
-    if (o === undefined && file && blockOwners.length > 0) {
-      return ' No CODEOWNERS rule covers this file, so an owner listed in pipegen\'s CODEOWNERS block (a user with write access, not the author) must approve the pull request on its current head commit.';
+    if ((o === undefined || o.length === 0) && file && blockOwners.length > 0) {
+      return ' No CODEOWNERS rule names a user owner of this file, so an owner listed in pipegen\'s CODEOWNERS block (a user with write access, not the author) must approve the pull request on its current head commit.';
     }
     if (o === undefined || o.length === 0) {
       return ' No user is a code owner of this path (a team-only entry cannot approve: the gate cannot read team membership, so name a user as an owner in CODEOWNERS), or merge with an administrator bypass.';

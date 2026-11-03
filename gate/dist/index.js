@@ -8117,7 +8117,7 @@ function integrityFindings(pr, protectedPaths, rules, extra = {}) {
   const waived = (path) => (ownersOf(rules, path) ?? []).some((o) => approvals.has(o));
   const waivedFile = (path) => {
     const o = ownersOf(rules, path);
-    return (o === void 0 ? blockOwners : o).some((x) => approvals.has(x));
+    return (o === void 0 || o.length === 0 ? blockOwners : o).some((x) => approvals.has(x));
   };
   const push = (ruleId, severity, file, message, key, line) => {
     const k = `${ruleId}\0${file ?? ""}\0${key}`;
@@ -8131,8 +8131,8 @@ function integrityFindings(pr, protectedPaths, rules, extra = {}) {
       return extra.codeowners?.found != null ? " CODEOWNERS of the base commit has no rule that names a user, so nobody can approve: add one, or merge with an administrator bypass." : " The base commit has no CODEOWNERS, so nobody can approve: add one (user owners, not only teams), or merge with an administrator bypass.";
     }
     const o = ownersOf(rules, path);
-    if (o === void 0 && file && blockOwners.length > 0) {
-      return " No CODEOWNERS rule covers this file, so an owner listed in pipegen's CODEOWNERS block (a user with write access, not the author) must approve the pull request on its current head commit.";
+    if ((o === void 0 || o.length === 0) && file && blockOwners.length > 0) {
+      return " No CODEOWNERS rule names a user owner of this file, so an owner listed in pipegen's CODEOWNERS block (a user with write access, not the author) must approve the pull request on its current head commit.";
     }
     if (o === void 0 || o.length === 0) {
       return " No user is a code owner of this path (a team-only entry cannot approve: the gate cannot read team membership, so name a user as an owner in CODEOWNERS), or merge with an administrator bypass.";
