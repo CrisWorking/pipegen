@@ -40,9 +40,10 @@ describe('errorExcerpt (E0a, B1)', () => {
     const v = vault();
     const log = [
       `\ufeff${TS}##[group]Run npm test`,
-      `${TS}${ESC}[31m${ESC}[1mError: Invalid API key provided: ${VALUE}${ESC}[0m`,
-      // the value split by a colour code: only whole once the code is gone
+      // the value split by a colour code: only whole once the code is gone (before the next line, which names a key and so starts the
+      // fail-closed armor run that hides a later line holding a long run in any reading)
       `${TS}${ESC}[33mwarn${ESC}[39m key ${VALUE.slice(0, 3)}${ESC}[1;31m${VALUE.slice(3)}${ESC}[0m in config`,
+      `${TS}${ESC}[31m${ESC}[1mError: Invalid API key provided: ${VALUE}${ESC}[0m`,
       // an OSC 8 hyperlink (BEL- and ST-terminated) and an OSC title
       `${TS}see ${ESC}]8;;https://example.test/docs${ESC}\\the docs${ESC}]8;;${ESC}\\ ${ESC}]0;title\u0007for help`,
       `${TS}##[error]Process completed with exit code 1.`,
@@ -50,8 +51,8 @@ describe('errorExcerpt (E0a, B1)', () => {
     const out = await errorExcerpt(log, composed(v), clean());
     expect(out.split('\n')).toEqual([
       '##[group]Run npm test',
-      `Error: Invalid API key provided: ${R}`,
       `warn key ${R} in config`,
+      `Error: Invalid API key provided: ${R}`,
       'see the docs for help',
       '##[error]Process completed with exit code 1.',
     ]);
@@ -292,6 +293,26 @@ describe('errorExcerpt: scrub before cutting (E0a)', () => {
     const tomlOut = await errorExcerpt(toml, composed(v), clean());
     expect(tomlOut).toContain('Error: done');
     expect(tomlOut).not.toContain(valueRun);
+    v.wipe();
+  });
+
+  it('excerpt: ordinary coloured output stays shown (the fail-closed rules need a secret shape)', async () => {
+    const v = vault();
+    const c = (code: string, text: string) => `${TS}${ESC}[${code}m${text}${ESC}[0m`;
+    const log = [
+      c('34', '[INFO] Building app 1.0.0'),
+      c('34', '[INFO] token cache refreshed in 3 ms'),
+      c('31', 'FAIL src/app.test.ts > loads config'),
+      c('2', '    at loadConfig (src/config.ts:12:5)'),
+      c('2', '    at Object.<anonymous> (src/app.test.ts:4:3)'),
+      c('32', '[OK] lint'),
+      c('31', 'Error: expected 200, received 500'),
+    ].join('\n');
+    const out = (await errorExcerpt(log, composed(v), clean())).split('\n');
+    expect(out).toEqual([
+      '[INFO] Building app 1.0.0', '[INFO] token cache refreshed in 3 ms', 'FAIL src/app.test.ts > loads config',
+      '    at loadConfig (src/config.ts:12:5)', '    at Object.<anonymous> (src/app.test.ts:4:3)', '[OK] lint', 'Error: expected 200, received 500',
+    ]);
     v.wipe();
   });
 

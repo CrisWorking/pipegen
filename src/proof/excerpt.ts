@@ -9,9 +9,9 @@
 //      and so is what may be a private key body after it: up to the next END marker when any reading of the dropped line (ruling
 //      E0a-R1: escape sequences removed whole, ESC and C1 removed, every non-printable removed) says PRIVATE or KEY, else while the
 //      lines look like armor (base64, armor headers, blank lines); a line step 2 changed starts the same hide when one of its
-//      readings says PRIVATE or KEY, but stays shown. A dropped line stays in place, as all its readings and tagged,
-//      through the whole-log scrub and redact below, going only after them, so redact still sees a BEGIN line or a `password:` line
-//      that held an escape (security scan findings);
+//      readings says PRIVATE or KEY, but stays shown. Every reading is also redacted apart, and indented-value blocks, secret sections
+//      and key blocks any reading (or a suspect line's shape) opens are hidden in the excerpt itself; see unscannedExcerpt. Lines stay
+//      in place, untagged, for the whole-log redact, and hidden lines go only after the cross-line scrub (security scans 1-5);
 //   4. the error lines and EXCERPT_CONTEXT_LINES around each are picked, at most EXCERPT_MAX_LINES lines and EXCERPT_MAX_BYTES;
 //   5. Plan A redact;
 //   6. the composed scrubber (the caller's: vault.scrubber() then knownValueScrubber over the placeholders and the throwaway scratch
@@ -19,8 +19,9 @@
 //   7. the secret scan (betterleaks, or gitleaks with the switch) over the excerpt: a finding drops its line, and every line that holds
 //      a found text; a finding that can't be placed withholds the excerpt.
 // Scrub before cutting (D5 review I1): step 4 never cuts inside a line (a line is shown whole or not at all; a line over 4 KB is
-// Plan A's LONG_LINE), and before it the scrubber and redact also run over the whole cleaned log, so a value split across lines at
-// the edge of a picked window, or a private key whose BEGIN line is outside it, is gone before any line is picked.
+// Plan A's LONG_LINE), and before it the scrubber (per line, then across lines) and redact also run over the whole cleaned log, so a
+// value split across lines at the edge of a picked window, or a private key whose BEGIN line is outside it, is gone before any line is
+// picked.
 // The secret scan runs a process, so errorExcerpt is async and takes the pinned scanner: the ruling's `(logs, scrub): string` can't
 // run step 7.
 import { createHash, randomBytes } from 'node:crypto';
@@ -192,6 +193,22 @@ const NAMES_KEY = /private|key/i;
  * suspect line holding one opens an indented-value block (and a section, when it is a `[` line) whatever redact says of its readings.
  */
 const NAMES_SECRET = /password|passwd|pwd|secret|token|api[_-]?key|private[_-]?key|access[_-]?key|client[_-]?secret|auth|credential/i;
+/**
+ * Scan 5 fuzz, by shape rather than by name: an inserted final byte can't be told from an eaten letter, so no reading may hold the
+ * key's real name. A suspect line shaped like a block opener (`name:` with an empty value, or a YAML `|`/`>` block) opens an
+ * indented-value block, and one shaped like a section header (`[name]` alone) a section, whatever the name. Anchored: linear.
+ */
+const BLOCK_OPENER = /:[ \t]*(?:[|>][-+0-9]*)?[ \t]*$/;
+// blanks and SGR colour codes (a colour code before the text is the usual case, and swallows nothing; another CSI's intermediates can
+// be the indentation's spaces), then a character that isn't printable: an OSC or another sequence, a C1, a control,
+// LS/PS or an invisible, any of which can have swallowed the indentation
+const INDENT_UNSURE = /^(?:[ \t]|\u001b\[[0-9;]*m)*[\u0000-\u0008\u000a-\u001f\u007f-\u009f\u2028\u2029\u200b-\u200f\u202a-\u202e\u2060-\u2069\ufeff]/;
+// a run a 16-character window of a secret could show in
+const LONG_RUN = /[A-Za-z0-9+/]{16,}/;
+const HEADER_SHAPE = /^[ \t]*\[[^\]]*\]\]?[ \t]*(?:[#;].*)?$/;
+// a `[` first, and a word of a secret name before the first `]`: a header whatever follows it (a sequence's final byte may have
+// become its `[`, and garbage may follow it)
+const SECRET_IN_HEADER = new RegExp(`^[ \\t]*\\[[^\\]]*(?:${NAMES_SECRET.source})`, 'i');
 
 /**
  * Step 4: the error windows (or the end of the log), in line order, with a marker for every gap between two of them. A window that
@@ -296,9 +313,13 @@ interface Read {
   rep: string;
   /** Whether the line was read more than one way (step 2 changed it, step 3 drops it, or it holds a non-printable). */
   suspect: boolean;
+  /** Whether the raw line has an escape, a C1 or another non-printable (a tab aside) before its first printable character: then its
+   *  indentation can't be trusted (an inserted sequence can swallow it). */
+  indentUnsure: boolean;
   /** A suspect line (as for namesKey) with a word of a secret name in any reading; and whether a reading starts with `[`. */
   namesSecret: boolean;
   bracket: boolean;
+  opener: boolean;
 }
 
 /** redact-core's indentOf columns (a tab goes to the next multiple of 8). A copy: that function is not exported. */
@@ -314,17 +335,25 @@ function indentCols(line: string): number {
 // redact-core's sectionName shape: `[name]` or `[[name]]`, then only blanks or a comment
 const SECTION_HEADER = /^[ \t]*\[\[?[^\]]*\]\]?[ \t]*(?:[#;].*)?$/;
 
+// an SGR colour code: the one sequence step 2 removes that changes no text (only its final `m` can be an eaten letter)
+const SGR = /\u001b\[[0-9;]*m/g;
+
 function readLine(raw: string): Read {
   const c = cleanLine(raw);
   const base = c.drop ? null : c.line;
   const suspect = c.drop || c.before !== null || stripChars(c.line).replace(LINE_SEPS, '') !== c.line;
-  const rs = suspect ? readings(c.before ?? c.line) : [];
+  // messy: dropped, or step 2 removed more than SGR colour codes (an OSC, a cursor move, a CSI with intermediates): then no reading can
+  // be trusted, and the fail-closed name and shape rules apply. A line that only had colour codes or non-printables is read as shown,
+  // with an eaten `m` put back and the non-printables taken out (the readings that remove ESC alone leave a colour code's `[`).
+  const messy = c.drop || (c.before !== null && /[\u001b\u0080-\u009f]/.test(c.before.replace(SGR, '')));
+  const rs = messy ? readings(c.before ?? c.line)
+    : suspect ? [...new Set([...(c.before === null ? [] : [withFinals(c.before)]), stripChars(c.line).replace(LINE_SEPS, '')])] : [];
   const all = base === null ? rs : [base, ...rs];
   return {
     shown: base,
     probe: rs.filter((r) => r !== base && r.trim() !== ''),
     ends: all.some((r) => lastKeyMarker(r, 'END') >= 0),
-    namesKey: suspect && all.some((r) => NAMES_KEY.test(r)),
+    namesKey: messy && all.some((r) => NAMES_KEY.test(r)),
     armor: all.some(isArmor),
     cols: all.length === 0 ? 0 : Math.min(...all.map(indentCols)),
     colsMax: all.length === 0 ? 0 : Math.max(...all.map(indentCols)),
@@ -332,9 +361,14 @@ function readLine(raw: string): Read {
     header: all.length > 0 && all.every((r) => SECTION_HEADER.test(r)),
     rep: rs[0] ?? '',
     suspect,
-    namesSecret: suspect && all.some((r) => NAMES_SECRET.test(r)),
-    // a header in some reading, or (a dropped line: garbage can stand before the `[`) a `[` and a later `]` anywhere
-    bracket: all.some((r) => /^[ \t]*\[/.test(r) || (c.drop && /\[[^\]]*\]/.test(r))),
+    indentUnsure: suspect && INDENT_UNSURE.test(c.before ?? c.line),
+    namesSecret: messy && all.some((r) => NAMES_SECRET.test(r)),
+    // a suspect line opens a section when a reading has a header's shape, or (dropped: garbage can stand before the `[`) a `[` and a
+    // later `]` anywhere; and a block when a reading has a block opener's shape
+    bracket: messy && (all.some((r) => bytesOf(r) <= MAX_REGEX_LINE_BYTES && (HEADER_SHAPE.test(r) || SECRET_IN_HEADER.test(r) || (c.drop && /\[[^\]]*\]/.test(r))))
+      // the `[` can be a sequence's own and the name split: a `[` in one reading and a `]` ending one is enough
+      || (all.some((r) => r.includes('[')) && all.some((r) => r.trimEnd().endsWith(']')))),
+    opener: messy && all.some((r) => bytesOf(r) <= MAX_REGEX_LINE_BYTES && BLOCK_OPENER.test(r)),
   };
 }
 
@@ -388,10 +422,13 @@ export function unscannedExcerpt(logs: string, scrub: (text: string) => string, 
   // - a reading in which redact hides something on the line itself: the line is hidden;
   // - one that starts an indented-value block: the more-indented (and blank) lines after it are hidden;
   // - one that starts a secret section: the lines after it are hidden up to the next section header;
-  // - a dropped line, or a suspect one with a word of a secret name in a reading (NAMES_SECRET), does both (a section only for a `[`
-  //   line): its words may be split past repair;
+  // - a dropped line, a suspect one with a word of a secret name in a reading (NAMES_SECRET), or a suspect one shaped like a block
+  //   opener (BLOCK_OPENER: `name:` with nothing after it) opens a block; a suspect one shaped like a section header (HEADER_SHAPE; for
+  //   a dropped line any `[...]`) opens a section: inserted bytes can split or change any word past repair, so shape decides, not name;
   // - the parent of every suspect line (the nearest earlier line indented less) is probed as well, so a block it opens goes on through
-  //   a line whose readings disagree on its indentation; a line continues an open block when any reading is more indented or blank;
+  //   a line whose readings disagree on its indentation; a line continues an open block when any reading is more indented or blank, or
+  //   when garbage stands before its first printable character (INDENT_UNSURE); only a clean header ends a section; a suspect line
+  //   whose scrubbed readings hold a long base64 run goes on with armor;
   // - one that opens a private key, or names one (PRIVATE or KEY in a line step 2 changed or dropped, or that holds a non-printable):
   //   hidden up to the next END marker line (to the end of the log when a reading opened a key and no END follows), else while the
   //   lines look like armor (base64, armor headers, blank lines). The same after a cut inside a key block, and armor mode after any
@@ -405,11 +442,13 @@ export function unscannedExcerpt(logs: string, scrub: (text: string) => string, 
   lines0.forEach((r, i) => {
     const own = r.shown ?? r.rep;
     if (r.suspect) {
-      for (let k = stack.length - 1; k >= 0; k--) {
+      // with its indentation unsure, any ancestor can be the block's opener: all of them (the 32 nearest) are probed
+      for (let k = stack.length - 1, n = 0; k >= 0 && n < 32; k--) {
         const e = stack[k] as { cols: number; i: number };
-        if (e.cols < r.colsMax) {
+        if (e.cols < r.colsMax || r.indentUnsure) {
           if (!(lines0[e.i] as Read).suspect) parents.add(e.i);
-          break;
+          n++;
+          if (!r.indentUnsure) break;
         }
       }
     }
@@ -444,25 +483,29 @@ export function unscannedExcerpt(logs: string, scrub: (text: string) => string, 
   }
   const hiddenAt = lines0.map((r, i) => {
     let hidden = r.shown === null || i <= hideTo || i < guard;
+    // a suspect line's indentation and shape can't be trusted (an inserted sequence can swallow both), so only a clean line ends an
+    // open block, section or armor run
     if (blockCols >= 0) {
-      if (r.blank || r.colsMax > blockCols) hidden = true;
+      if (r.indentUnsure || r.blank || r.colsMax > blockCols) hidden = true;
       else blockCols = -1;
     }
     if (section) {
-      if (r.header) section = false;
+      if (r.header && !r.suspect) section = false;
       else hidden = true;
     }
-    // scan 4: the armor check comes first, so an armor line is hidden even when it also starts a key hide
+    // scan 4: the armor check comes first, so an armor line is hidden even when it also starts a key hide. A suspect line whose
+    // scrubbed readings still hold a long base64 run goes on with armor too (a sequence can leave a body line's rest in no shape)
+    const longRun = r.suspect && (jobOf[i] as number[]).some((j) => LONG_RUN.test(jobs[j] as string));
     if (armor && i > hideTo) {
-      if (r.armor) hidden = true;
-      if (!r.armor || r.ends) armor = false;
+      if (r.armor || longRun) hidden = true;
+      if ((!r.armor && !longRun) || r.ends) armor = false;
     }
     const verdict = (jobOf[i] as number[]).map((j) => probes[j] as Probe);
     if (verdict.some((p) => p.hit)) hidden = true;
     // a dropped line can't be read for sure (garbage nested in a sequence splits any word), so it fails closed on every multi-line rule
     const unreadable = r.shown === null || r.namesSecret;
-    if (verdict.some((p) => p.block) || unreadable) blockCols = blockCols < 0 ? r.cols : Math.min(blockCols, r.cols);
-    if (verdict.some((p) => p.section) || (unreadable && r.bracket)) section = true;
+    if (verdict.some((p) => p.block) || unreadable || r.opener) blockCols = blockCols < 0 ? r.cols : Math.min(blockCols, r.cols);
+    if (verdict.some((p) => p.section) || r.bracket) section = true;
     const opened = verdict.some((p) => p.key);
     if (i >= hideTo) {
       if ((r.namesKey || opened) && !r.ends) startKeyHide(i + 1, opened);
