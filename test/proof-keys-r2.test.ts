@@ -62,7 +62,7 @@ describe('R1: the brand names finished (run id, attempt) pairs and dies with a l
     expect(K.lastRefusal).toMatch(/run 77.*not finished/);
     w.s.runs.set(77, { status: 'queued', run_attempt: 2 });
     expect(await K.evidence(await K.ticket(), [78, 77])).toBeNull();
-    w.s.runs.set(77, { status: 'completed', run_attempt: 3 });
+    w.s.runs.set(77, { status: 'completed', run_attempt: 3, run_started_at: new Date(w.s.serverTime + 600_000).toISOString() });   // re-run after the ticket
     const e = await K.evidence(await K.ticket(), [77, 78]);
     expect(evidenceCovers(e, 77, 3)).toBe(true);
     expect(evidenceCovers(e, 77, 1)).toBe(false);

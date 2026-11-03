@@ -38,7 +38,8 @@ export interface KeysFake {
   environments: Record<string, { held: string[] | null; vars: { name: string; value: string }[] | null }> | null;
   /**
    * Workflow runs as GET …/actions/runs/{id} answers them (fix round 2, R1). A run not listed: completed, attempt 1, started a
-   * minute after the server time of that answer. `run_started_at` null: not given.
+   * minute after the server time of that answer. A run set without run_started_at started at the server time it was set.
+   * `run_started_at` null: not given.
    */
   runs: Map<number, { status: string; run_attempt: number; run_started_at?: string | null }>;
   /** GitHub's server time (ms): the `date` header of the secrets list (fix round 3, N1). Moves on 1 s per list answer. */
@@ -125,6 +126,9 @@ export function secretsFake(owner: string, repo: string, keep: Record<string, st
       return undefined;
     },
   };
+  // a run a test sets without run_started_at started at the server time it was set (as GitHub would report it)
+  const set = f.runs.set.bind(f.runs);
+  f.runs.set = (id, r) => set(id, r.run_started_at === undefined ? { ...r, run_started_at: new Date(f.serverTime).toISOString().replace('.000', '') } : r);
   return f;
 }
 
