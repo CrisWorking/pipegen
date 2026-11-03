@@ -26,14 +26,26 @@ export interface KeysFake {
   listBody?: unknown;
   /** Called on each PUT, before it is applied (a test can start a stop here). */
   onPut?: (name: string) => void;
+  /** The updated_at GitHub lists per name: a new one on every PUT (and on touch). */
+  updated: Map<string, string>;
+  /** A change made outside pipegen: the value is set and updated_at moves. */
+  touch(name: string, value: string): void;
+  /** Organisation secrets visible to the repo (GET …/actions/organization-secrets). null: the list answers 403. */
+  orgShared: string[] | null;
+  /** Repo Actions variables (GET …/actions/variables). null: 403. */
+  variables: { name: string; value: string }[] | null;
   handler: (c: Call) => Reply | undefined;
 }
 
 export function secretsFake(owner: string, repo: string, keep: Record<string, string> = {}): KeysFake {
   const kp = sodium.crypto_box_keypair();
+  let clock = 0;
+  const stamp = () => new Date(Date.UTC(2026, 10, 3, 10, 0, clock++)).toISOString().replace('.000', '');
   const base = `/repos/${owner}/${repo}/actions/secrets`;
   const f: KeysFake = {
     values: new Map(Object.entries(keep)), failPut: new Map(), failDelete: new Map(), sticky: new Set(),
+    updated: new Map(Object.keys(keep).map((k) => [k, stamp()])), orgShared: [], variables: [],
+    touch: (name, value) => { f.values.set(name, value); f.updated.set(name, stamp()); },
     handler: (c) => {
       const path = decodeURIComponent(c.url.pathname);
       if (path === `${base}/public-key` && c.method === 'GET') return { body: { key_id: '3380204578043523366', key: Buffer.from(kp.publicKey).toString('base64') } };
@@ -43,7 +55,16 @@ export function secretsFake(owner: string, repo: string, keep: Record<string, st
         const all = [...f.values.keys()].sort();
         const per = Number(c.url.searchParams.get('per_page') ?? '30');
         const n = Number(c.url.searchParams.get('page') ?? '1');
-        return { body: { total_count: all.length, [LIST]: all.slice((n - 1) * per, n * per).map((name) => ({ name, created_at: '2026-11-03T10:00:00Z', updated_at: '2026-11-03T10:00:00Z' })) } };
+        return { body: { total_count: all.length, [LIST]: all.slice((n - 1) * per, n * per).map((name) => ({ name, created_at: '2026-11-03T10:00:00Z', updated_at: f.updated.get(name) ?? '2026-11-03T10:00:00Z' })) } };
+      }
+      const repoBase = base.slice(0, -'/actions/secrets'.length);
+      if (path === `${repoBase}/actions/organization-secrets` && c.method === 'GET') {
+        if (f.orgShared === null) return { status: 403, body: { message: 'Resource not accessible by personal access token' } };
+        return { body: { total_count: f.orgShared.length, [LIST]: f.orgShared.map((name) => ({ name, created_at: '2026-11-03T10:00:00Z', updated_at: '2026-11-03T10:00:00Z', visibility: 'all' })) } };
+      }
+      if (path === `${repoBase}/actions/variables` && c.method === 'GET') {
+        if (f.variables === null) return { status: 403, body: { message: 'Resource not accessible by personal access token' } };
+        return { body: { total_count: f.variables.length, variables: f.variables.map((v) => ({ ...v, created_at: '2026-11-03T10:00:00Z', updated_at: '2026-11-03T10:00:00Z' })) } };
       }
       if (path.startsWith(`${base}/`)) {
         const name = path.slice(base.length + 1);
@@ -53,12 +74,13 @@ export function secretsFake(owner: string, repo: string, keep: Record<string, st
           if (st !== undefined) return { status: st, body: { message: 'Validation Failed' } };
           const b = JSON.parse(c.body ?? '{}') as { encrypted_value: string; key_id: string };
           f.values.set(name, sodium.to_string(sodium.crypto_box_seal_open(Buffer.from(b.encrypted_value, 'base64'), kp.publicKey, kp.privateKey)));
+          f.updated.set(name, stamp());
           return { status: 201, body: {} };
         }
         if (c.method === 'DELETE') {
           const st = f.failDelete.get(name);
           if (st !== undefined) return { status: st, body: { message: 'Server Error' } };
-          if (!f.sticky.has(name)) f.values.delete(name);
+          if (!f.sticky.has(name)) { f.values.delete(name); f.updated.delete(name); }
           return { status: 200, body: {} };
         }
       }
@@ -76,22 +98,28 @@ export const quietIo: Pick<CliIO, 'prompt' | 'out' | 'err'> = {
   out: () => {}, err: () => {},
 };
 
-/** A world with the scratch repo and its secrets fake. `more` answers other routes first. */
+let nextRepoId = 50_000;
+/**
+ * A world with the scratch repo and its secrets fake. `more` answers other routes first. Each world's scratch repo gets its own
+ * id (ScratchKeys shares its state per repo id), unless `w.repoIds` names one.
+ */
 export function keysWorld(w: WorldOptions = {}, keep: Record<string, string> = {}): { g: World; s: KeysFake } {
   const s = secretsFake(w.owner ?? OWNER, SCRATCH, keep);
-  const g = world({ ...w, repos: { pipelines: { private: true }, [SCRATCH]: { private: true }, ...(w.repos ?? {}) }, extra: (c) => w.extra?.(c) ?? s.handler(c) });
+  const g = world({ ...w, repoIds: { [SCRATCH]: nextRepoId++, ...(w.repoIds ?? {}) }, repos: { pipelines: { private: true }, [SCRATCH]: { private: true }, ...(w.repos ?? {}) }, extra: (c) => w.extra?.(c) ?? s.handler(c) });
   return { g, s };
 }
 
+/** The run id placeholderEvidence's brand names. */
+export const EVIDENCE_RUN = 4242;
 /**
  * Real excerpt evidence (DECISIONS #113) for tests of errorExcerpt: a ScratchKeys over the fake stores one placeholder, a
- * ticket is taken, and the evidence minted. Nothing else can make one.
+ * ticket is taken (the repo listed), and the evidence minted for run EVIDENCE_RUN. Nothing else can make one.
  */
 export async function placeholderEvidence(): Promise<ExcerptEvidence> {
   const { g } = keysWorld();
-  const keys = new ScratchKeys(g.gh, proofTarget(app()), new SecretVault(), { io: quietIo });
+  const keys = new ScratchKeys(g.gh, proofTarget(app()), new SecretVault(), { io: quietIo, readByWorkflows: ['STRIPE_SECRET_KEY'] });
   await keys.placeholders(['STRIPE_SECRET_KEY']);
-  const e = keys.evidence(keys.ticket());
-  if (e === null) throw new Error('no evidence');
+  const e = await keys.evidence(await keys.ticket(), [EVIDENCE_RUN]);
+  if (e === null) throw new Error(`no evidence: ${keys.lastRefusal ?? '?'}`);
   return e;
 }

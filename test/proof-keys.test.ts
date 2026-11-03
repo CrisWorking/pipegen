@@ -149,6 +149,7 @@ describe('E4 scratch keys: deleteAll (S14)', () => {
     expect(deleted.sort()).toEqual(['LEFT_BY_HAND', 'OLD_ONE', 'OLD_TWO']);
     expect(s.values.size).toBe(0);
     expect(g.seen()).toEqual([
+      `GET /repos/${OWNER}/${SCRATCH}`,   // the repo id: the key of the shared key state (fix round 1, E4-R1)
       `GET ${S_PATH}`, `DELETE ${S_PATH}/LEFT_BY_HAND`, `DELETE ${S_PATH}/OLD_ONE`, `DELETE ${S_PATH}/OLD_TWO`, `GET ${S_PATH}`,
     ]);
     expect(keys.mode).toBe('none');
@@ -184,14 +185,16 @@ describe('E4 scratch keys: deleteAll (S14)', () => {
     expect([...s.values.keys()]).toEqual(['STRIPE_SECRET_KEY']);
     const seen = g.seen();
     // the order: list → delete each → list again → the access re-check (reads) → the public key → the store
-    expect(seen.slice(0, 3)).toEqual([`GET ${S_PATH}`, `DELETE ${S_PATH}/CRASHED_RUN_KEY`, `GET ${S_PATH}`]);
+    expect(seen.slice(0, 4)).toEqual([`GET /repos/${OWNER}/${SCRATCH}`, `GET ${S_PATH}`, `DELETE ${S_PATH}/CRASHED_RUN_KEY`, `GET ${S_PATH}`]);
     expect(seen.indexOf(`GET /repos/${OWNER}/${SCRATCH}/collaborators`)).toBeGreaterThan(2);
     expect(seen.indexOf(`GET ${S_PATH}/public-key`)).toBeGreaterThan(seen.indexOf(`GET /repos/${OWNER}/${SCRATCH}/keys`));
-    expect(seen.at(-1)).toBe(`PUT ${S_PATH}/STRIPE_SECRET_KEY`);
+    expect(seen.at(-2)).toBe(`PUT ${S_PATH}/STRIPE_SECRET_KEY`);
+    expect(seen.at(-1)).toBe(`GET ${S_PATH}`);   // fix round 1 (E4-R1): GitHub's updated_at recorded right after the store
     // only before the first: the second store lists nothing again
     const n = g.calls.length;
     await keys.placeholders(['OTHER_KEY']);
-    expect(g.seen().slice(n).filter((p) => p === `GET ${S_PATH}` || p.startsWith(`DELETE ${S_PATH}`))).toEqual([]);
+    expect(g.seen().slice(n).filter((p) => p.startsWith(`DELETE ${S_PATH}`))).toEqual([]);
+    expect(g.seen().slice(n).filter((p) => p === `GET ${S_PATH}`)).toHaveLength(1);   // only the updated_at read after the store
     // a pre-store deleteAll that leaves something: nothing is stored
     const w = keysWorld({}, { STUCK: 's'.repeat(10) });
     w.s.failDelete.set('STUCK', 500);
@@ -349,53 +352,57 @@ describe('E4 excerpt evidence (DECISIONS #113)', () => {
     const { g } = keysWorld();
     const keys = keysFor(g);
     // nothing checked yet (no deleteAll): no evidence, the repo may hold a crashed run's real keys
-    const early = keys.ticket();
-    expect(keys.evidence(early)).toBeNull();
+    const early = (await keys.ticket());
+    expect((await keys.evidence(early, [1]))).toBeNull();
     await keys.setup(['STRIPE_SECRET_KEY']);
-    expect(keys.evidence(early)).toBeNull();   // that window began before the repo was known clean
-    const t1 = keys.ticket();
-    const e1 = keys.evidence(t1);
+    expect((await keys.evidence(early, [1]))).toBeNull();   // that window began before the repo was known clean
+    const t1 = (await keys.ticket());
+    const e1 = (await keys.evidence(t1, [1]));
     expect(isExcerptEvidence(e1)).toBe(true);
     expect(isExcerptEvidence({ ...e1 })).toBe(false);
     expect(Object.isFrozen(e1)).toBe(true);
     // a ticket taken before a real store gives no evidence after it, even once placeholders are back
-    const t2 = keys.ticket();
+    const t2 = (await keys.ticket());
     await keys.real(['STRIPE_SECRET_KEY']);
-    expect(keys.evidence(t2)).toBeNull();
-    expect(keys.evidence(keys.ticket())).toBeNull();          // real now
+    expect((await keys.evidence(t2, [1]))).toBeNull();
+    expect((await keys.evidence(await keys.ticket(), [1]))).toBeNull();          // real now
     await keys.placeholders(['STRIPE_SECRET_KEY']);            // switched back (a new AI change, E7)
     expect(keys.mode).toBe('placeholder');
-    expect(keys.evidence(t2)).toBeNull();                      // that window held the real value
-    const t3 = keys.ticket();
-    expect(isExcerptEvidence(keys.evidence(t3))).toBe(true);   // a window that started after the switch
+    expect((await keys.evidence(t2, [1]))).toBeNull();                      // that window held the real value
+    // E4-R1: a value the user typed was written since the last verified deleteAll, so placeholders over it are not enough
+    expect((await keys.evidence(await keys.ticket(), [1]))).toBeNull();
+    await keys.deleteAll();
+    await keys.placeholders(['STRIPE_SECRET_KEY']);
+    const t3 = (await keys.ticket());
+    expect(isExcerptEvidence((await keys.evidence(t3, [1])))).toBe(true);   // a window after a verified deleteAll
     // a ticket of another ScratchKeys (both clean, placeholders only, no real store ever), a forged ticket
     const other = keysFor(keysWorld().g);
     await other.placeholders(['A_KEY']);
-    expect(other.evidence(t3)).toBeNull();
+    expect((await other.evidence(t3, [1]))).toBeNull();
     const third = keysFor(keysWorld().g);
     await third.placeholders(['A_KEY']);
-    const tOther = other.ticket();
-    expect(isExcerptEvidence(other.evidence(tOther))).toBe(true);
-    expect(third.evidence(tOther)).toBeNull();
-    expect(keys.evidence({ ticket: true } as never)).toBeNull();
+    const tOther = (await other.ticket());
+    expect(isExcerptEvidence((await other.evidence(tOther, [1])))).toBe(true);
+    expect((await third.evidence(tOther, [1]))).toBeNull();
+    expect((await keys.evidence({ ticket: true } as never, [1]))).toBeNull();
     // a deleteAll after the ticket that leaves a secret behind: its value is unknown, no evidence for that window
     const dw = keysWorld();
     const dk = keysFor(dw.g);
     await dk.placeholders(['A_KEY']);
-    const td = dk.ticket();
+    const td = (await dk.ticket());
     dw.s.failDelete.set('A_KEY', 500);
     await expect(dk.deleteAll()).rejects.toThrow(ScratchKeysError);
-    expect(dk.evidence(td)).toBeNull();
+    expect((await dk.evidence(td, [1]))).toBeNull();
     // a real batch that fails half-way: the first value may have landed, so the window held it
     const rw = keysWorld();
     const rk = keysFor(rw.g, vaultWith({ A_KEY: TYPED, B_KEY: `${TYPED}-b` }));
     await rk.placeholders(['C_KEY']);
-    const tr = rk.ticket();
+    const tr = (await rk.ticket());
     rw.s.failPut.set('B_KEY', 500);
     await expect(rk.real(['A_KEY', 'B_KEY'])).rejects.toThrow(/Could not store/);
     expect(rw.s.values.get('A_KEY')).toBe(TYPED);
     expect(rk.mode).toBe('real');
-    expect(rk.evidence(tr)).toBeNull();
+    expect((await rk.evidence(tr, [1]))).toBeNull();
     // a placeholder that failed to overwrite a real value: still real, no evidence
     const w = keysWorld();
     const k = keysFor(w.g);
@@ -403,16 +410,16 @@ describe('E4 excerpt evidence (DECISIONS #113)', () => {
     w.s.failPut.set('STRIPE_SECRET_KEY', 500);
     await expect(k.placeholders(['STRIPE_SECRET_KEY'])).rejects.toThrow(/Could not store/);
     expect(k.mode).toBe('real');
-    expect(k.evidence(k.ticket())).toBeNull();
+    expect((await k.evidence(await k.ticket(), [1]))).toBeNull();
     // a deleteAll that left something: no evidence until a clean list
     const lw = keysWorld({}, { STUCK: 's'.repeat(10) });
     lw.s.failDelete.set('STUCK', 500);
     const lk = keysFor(lw.g);
     await expect(lk.deleteAll()).rejects.toThrow(ScratchKeysError);
-    expect(lk.evidence(lk.ticket())).toBeNull();
+    expect((await lk.evidence(await lk.ticket(), [1]))).toBeNull();
     lw.s.failDelete.clear();
     await lk.deleteAll();
-    expect(isExcerptEvidence(lk.evidence(lk.ticket()))).toBe(true);
+    expect(isExcerptEvidence((await lk.evidence(await lk.ticket(), [1])))).toBe(true);
   });
 });
 

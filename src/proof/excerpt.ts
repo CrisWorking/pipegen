@@ -28,7 +28,7 @@ import { MAX_REGEX_LINE_BYTES } from '../ai/redact-core.js';
 import { redact, secretScanText, type SecretScanner } from '../ai/redact.js';
 import { LATE_MAGIC, SCAN_PREFIX, scannersWouldSkip } from '../ai/scan-staging.js';
 import { holdsEscape, scrubForDisplay, stripChars } from '../util/known-values.js';
-import { isExcerptEvidence, type ExcerptEvidence } from './keys.js';
+import { evidenceCovers, isExcerptEvidence, type ExcerptEvidence } from './keys.js';
 
 /** Lines shown before and after each error line. */
 export const EXCERPT_CONTEXT_LINES = 5;
@@ -735,21 +735,25 @@ export function unscannedExcerpt(logs: string, scrub: (text: string) => string, 
  */
 export type { ExcerptEvidence };
 
-/** Throws unless `evidence` is an object ScratchKeys.evidence minted (E0a-R5). */
-function checkEvidence(evidence: unknown): void {
+/** Throws unless `evidence` is an object ScratchKeys.evidence minted (E0a-R5) for runs that include `runId` (E4 fix round 1, M1). */
+function checkEvidence(evidence: unknown, runId: unknown): void {
   if (!isExcerptEvidence(evidence)) {
     throw new Error('errorExcerpt needs the evidence ScratchKeys mints for a run that held only placeholders or throwaway keys (ruling E0a-R5); nothing was built.');
+  }
+  if (!evidenceCovers(evidence, runId)) {
+    throw new Error('errorExcerpt takes a log only of a run its evidence was minted for, and this log\'s run id is not one of them; nothing was built.');
   }
 }
 
 /**
  * The excerpt of a failing CI log that the fix loop may send to the AI (ruling B1; the steps are in this file's header). `scrub` is the
- * composed known-value scrubber; `evidence` is ruling E0a-R5's (checked first, before any work). The vault scrub, redact and the secret
+ * composed known-value scrubber; `evidence` is ruling E0a-R5's, and `opts.runId` the run the log comes from, which the evidence
+ * must name (both checked first, before any work). The vault scrub, redact and the secret
  * scan stay as defence in depth. Throws when the evidence is wrong, or SecretScanError when the secret scan can't run or does not confirm
  * it read the excerpt: on any throw nothing may be sent.
  */
-export async function errorExcerpt(logs: string, scrub: (text: string) => string, scanner: SecretScanner, evidence: ExcerptEvidence, opts: { timeoutMs?: number } = {}): Promise<string> {
-  checkEvidence(evidence);
+export async function errorExcerpt(logs: string, scrub: (text: string) => string, scanner: SecretScanner, evidence: ExcerptEvidence, opts: { runId: number; timeoutMs?: number }): Promise<string> {
+  checkEvidence(evidence, opts?.runId);
   let lines = unscannedExcerpt(logs, scrub);
   if (lines.length === 0) return '';
   // step 7

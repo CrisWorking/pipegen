@@ -255,10 +255,24 @@ const SECRET_STORE_ROUTE = 'PUT /repos/{owner}/{repo}/actions/secrets/{secret_na
 const SECRET_DELETE_ROUTE = 'DELETE /repos/{owner}/{repo}/actions/secrets/{secret_name}';
 /** Any path with a `secrets` part (repo, environment, Dependabot, Codespaces secrets). */
 const SECRETS_PATH_RE = /(?:^|\/)secrets(?:\/|$)/;
+/** Any path with a `variables` part (repo and environment Actions variables). */
+const VARIABLES_PATH_RE = /(?:^|\/)variables(?:\/|$)/;
+/**
+ * E4 fix round 1 (ruling E4-R2): the only Actions variables pipegen writes to the scratch repo, all non-secret config. An
+ * Actions variable is a value that bypasses the access re-check and the excerpt evidence, so no other name is ever written
+ * (a variable delete stays allowed for E8's cleanup), and ScratchKeys.evidence refuses the brand when any other is there.
+ */
+export const SCRATCH_VARIABLES: readonly string[] = Object.freeze(['PIPEGEN_BLOCK_FROM']);
 
 function checkScratch(r: GuardedRepo, method: string, path: string, p: Params): void {
   // E4 (T12): no secret is written through a plain guardedWrite; scratchSecretSink is the one way (after checkScratchAccess)
   if (method !== 'DELETE' && SECRETS_PATH_RE.test(path)) refuse(`a secret of ${r.fullName} is stored only through scratchSecretSink, right after checkScratchAccess.`);
+  if (method !== 'DELETE' && VARIABLES_PATH_RE.test(path)) {
+    const route = (method === 'POST' && path === '/actions/variables') || (method === 'PATCH' && path === '/actions/variables/{name}');
+    if (!route || !onlyKeys(p, ['name', 'value']) || typeof p.name !== 'string' || !SCRATCH_VARIABLES.includes(p.name) || typeof p.value !== 'string') {
+      refuse(`${r.fullName} takes only the Actions variables pipegen declares (${SCRATCH_VARIABLES.join(', ')}), set by name.`);
+    }
+  }
   if (path === '') {
     if (method === 'PATCH' && Object.keys(p).length > 0 && onlyKeys(p, [...SCRATCH_REPO_PATCH]) && towardsPrivate(p)) return;
     refuse(method === 'DELETE' ? `deleting ${r.fullName} needs the exact name and pipegen's created marker (cleanup).`

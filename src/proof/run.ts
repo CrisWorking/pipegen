@@ -20,7 +20,8 @@
 // default branch only).
 // Waiting: no run within NO_RUN_MS (120 s) is the actionable stop "No workflow run started on pipegen-proof-<repo>. Is
 // GitHub Actions enabled there?" (S13 backstop). Then each run is polled (backoff 15 s → 60 s) until it completes, the time
-// cap passes (cancelled, timed_out), shouldStop() says so (cancelled, returned), or a stop has begun (returned at once; E8's
+// cap passes (cancelled, timed_out), shouldStop() says so (cancelled, returned; then runs of the proof's commits that
+// started late are found and cancelled for STOP_SWEEP_MS, fix round 1 M7), or a stop has begun (returned at once; E8's
 // cleanup cancels). A finished run's jobs are read with filter=all (re-run attempts too), its conclusion mapped (S13), its
 // result artifacts downloaded and the logs of the latest attempt's failed jobs and of the coverage job fetched (S2, S11).
 // Every write is guardedWrite; the PR create, merge and the pushes are tracked writes (inflight.ts).
@@ -87,6 +88,8 @@ export interface WaitOptions {
   logJob?: (job: { name: string; conclusion: string | null }) => boolean;
   /** Artifacts to download (default: isResultArtifact). */
   wantArtifact?: (name: string) => boolean;
+  /** Where a leftover goes (E0b's leftover callback): a PR pipegen couldn't confirm closed, a run it couldn't cancel. */
+  leftover?: (item: string) => void;
 }
 export interface ProofWorkflows {
   /** Workflow files that run on a push of the proof branch. */
@@ -108,6 +111,10 @@ export interface VariantProof {
   stopped: boolean;
   /** Workflows that never started within NO_RUN_MS, while others did. */
   missing: { event: RunEvent; workflow: string }[];
+  /** main with `merge`, not merged: why (fix round 1, M2). */
+  notMerged?: string;
+  /** What was left behind (also given to opts.leftover): names and numbers only. */
+  leftovers: string[];
 }
 
 /** S13: no run within this long after the push or the PR is the "is Actions enabled" stop. */
@@ -117,6 +124,9 @@ export const POLL_START_MS = 15_000;
 export const POLL_MAX_MS = 60_000;
 /** While waiting for runs to show up. */
 export const START_POLL_MS = 10_000;
+/** After shouldStop (M7): how long pipegen keeps looking for runs of the proof's commits that started late, and how often. */
+export const STOP_SWEEP_MS = 30_000;
+export const STOP_SWEEP_STEP_MS = 10_000;
 /** Runs one query may list, and jobs one run may have (5 pages). */
 const MAX_RUNS_LISTED = 100;
 const JOB_PAGES = 5;
@@ -278,13 +288,19 @@ export async function mergeProofPr(gh: Octokit, t: ProofTarget, pr: number, head
   return sha;
 }
 
-/** Closes a proof PR (planted, dispute; or main when the proof stops). */
-export async function closeProofPr(gh: Octokit, t: ProofTarget, pr: number, clock: RateClock = clockOf(gh)): Promise<void> {
+/**
+ * Closes a proof PR (planted, dispute; or main when the proof stops). True only when GitHub's answer says closed (M5); an
+ * answer pipegen can't read is not "closed": the PR is reported through `opts.leftover` and false is returned.
+ */
+export async function closeProofPr(gh: Octokit, t: ProofTarget, pr: number, opts: { clock?: RateClock; leftover?: (item: string) => void } = {}): Promise<boolean> {
   checkTarget(t);
   if (!posInt(pr)) throw new ScratchGuardError('the PR number is not a number.');
-  const res = await guardedWrite(gh, scratchOf(t), 'PATCH /repos/{owner}/{repo}/pulls/{pull_number}', { pull_number: pr, state: 'closed' }, clock);
+  const s = scratchOf(t);
+  const res = await guardedWrite(gh, s, 'PATCH /repos/{owner}/{repo}/pulls/{pull_number}', { pull_number: pr, state: 'closed' }, opts.clock ?? clockOf(gh));
   const seen = prOf(res.data);
-  if (seen !== null && seen.state !== 'closed') throw new ProofStopError(`GitHub didn't confirm PR #${pr} is closed.`);
+  if (seen?.number === pr && seen.state === 'closed') return true;
+  opts.leftover?.(`PR #${pr} of ${s.fullName} may still be open (GitHub's answer to closing it could not be read); close it there`);
+  return false;
 }
 
 /** B3: the base snapshot forced back onto the scratch default branch (the base holds no workflow, so no run starts). */
@@ -477,8 +493,9 @@ async function collect(gh: Octokit, s: GuardedRepo, h: RunHandle, attempt: numbe
   return out;
 }
 
-async function waitEvent(gh: Octokit, t: ProofTarget, q: RunQuery, opts: WaitOptions, into: VariantProof): Promise<RunOutcome[]> {
+async function waitEvent(gh: Octokit, t: ProofTarget, q: RunQuery, opts: WaitOptions, into: VariantProof, queries: RunQuery[]): Promise<RunOutcome[]> {
   if (q.workflows.length === 0) return [];
+  queries.push(q);
   const started = await awaitStart(gh, t, q, opts);
   for (const w of started.missing) into.missing.push({ event: q.event, workflow: w });
   if (started.stopped) {
@@ -499,10 +516,51 @@ const notStopping = (): void => {
 };
 
 /**
+ * M7: after shouldStop, runs of the proof's commits that started late (after the waits' own cancels) are found again and
+ * cancelled, for STOP_SWEEP_MS. Runs already watched are left (finished, or cancelled already). A run pipegen can't cancel,
+ * or a list it can't read, is a leftover.
+ */
+async function sweepCancel(gh: Octokit, t: ProofTarget, queries: readonly RunQuery[], opts: WaitOptions, into: VariantProof, left: (item: string) => void): Promise<void> {
+  const clock = opts.clock ?? realClock;
+  const rate = opts.rateClock ?? clockOf(gh);
+  const s = scratchOf(t);
+  const seen = new Set(into.outcomes.map((o) => o.handle.runId));
+  const end = clock.now() + STOP_SWEEP_MS;
+  for (;;) {
+    if (interrupting()) return;   // E8's cleanup cancels from here
+    for (const q of queries) {
+      let hs: RunHandle[];
+      try {
+        hs = await findRuns(gh, t, q, rate);
+      } catch (e) {
+        if (isRateStop(e)) throw e;
+        left(`the ${q.event} runs of ${q.headSha.slice(0, 12)} in ${s.fullName} could not be listed after the stop; cancel any still running there`);
+        continue;
+      }
+      for (const h of hs) {
+        if (seen.has(h.runId)) continue;
+        seen.add(h.runId);
+        try {
+          await guardedWrite(gh, s, 'POST /repos/{owner}/{repo}/actions/runs/{run_id}/cancel', { run_id: h.runId }, rate);
+        } catch (e) {
+          if (isRateStop(e)) throw e;
+          if ((e as { status?: unknown } | null)?.status === 409) continue;   // already finished
+          left(`run ${h.runId} of ${s.fullName} could not be cancelled after the stop (${said(e)}); cancel it there`);
+        }
+      }
+    }
+    const rest = end - clock.now();
+    if (rest <= 0) return;
+    await clock.sleep(Math.min(STOP_SWEEP_STEP_MS, rest));
+  }
+}
+
+/**
  * One variant, already pushed (E2's pushProofSetup or a re-run): the push runs of its head, the PR (`pr`: the open one a
- * re-run pushed to) and its runs, then for main with `merge` (and `mergeWhen`, default: every PR run succeeded) the merge
- * with the proven head and the merge commit's push runs. A non-main variant is never merged (ScratchGuardError): its PR is
- * closed after its runs (unless `keepOpen`, for its own fix loop).
+ * re-run pushed to) and its runs, then for main with `merge` the merge with the proven head and the merge commit's push runs.
+ * The merge needs every expected pull_request workflow started and successful (M2; a missing one always blocks it), and
+ * `mergeWhen` when given; else `notMerged` says why. A non-main variant is never merged (ScratchGuardError): its PR is closed
+ * after its runs (unless `keepOpen`, for its own fix loop). After shouldStop, late runs are cancelled too (M7).
  */
 export async function proveVariant(gh: Octokit, t: ProofTarget, v: { branch: ProofBranch; merge: boolean; workflows: ProofWorkflows; pr?: number; keepOpen?: boolean },
   opts: WaitOptions & { mergeWhen?: (prOutcomes: RunOutcome[]) => boolean }): Promise<VariantProof> {
@@ -512,10 +570,19 @@ export async function proveVariant(gh: Octokit, t: ProofTarget, v: { branch: Pro
   const main = isMainBranch(t, branch);
   if (v.merge && !main) throw new ScratchGuardError(`only the main proof PR is ever merged; ${branch} is closed after its runs.`);
   const rate = opts.rateClock ?? clockOf(gh);
-  const into: VariantProof = { outcomes: [], closed: false, stopped: false, missing: [] };
+  const into: VariantProof = { outcomes: [], closed: false, stopped: false, missing: [], leftovers: [] };
+  const left = (item: string): void => { into.leftovers.push(item); opts.leftover?.(item); };
+  const queries: RunQuery[] = [];
+  let fired = false;
+  const user = opts.shouldStop;
+  const w: WaitOptions = { ...opts, ...(user === undefined ? {} : { shouldStop: () => { const r = user() === true; if (r) fired = true; return r; } }) };
+  const stopped = async (): Promise<VariantProof> => {
+    if (fired && !interrupting()) await sweepCancel(gh, t, queries, opts, into, left);
+    return into;
+  };
   // 1. the push layer
-  await waitEvent(gh, t, { headSha: v.branch.sha, event: 'push', workflows: v.workflows.push, branch }, opts, into);
-  if (into.stopped) return into;
+  await waitEvent(gh, t, { headSha: v.branch.sha, event: 'push', workflows: v.workflows.push, branch }, w, into, queries);
+  if (into.stopped) return stopped();
   // 2. the PR (a new one, or the open one a re-run pushed to) and its runs
   notStopping();
   if (v.pr === undefined) {
@@ -526,22 +593,37 @@ export async function proveVariant(gh: Octokit, t: ProofTarget, v: { branch: Pro
     into.pr = v.pr;
     into.prUrl = prUrl(scratchOf(t), v.pr);
   }
-  const prOuts = await waitEvent(gh, t, { headSha: v.branch.sha, event: 'pull_request', workflows: v.workflows.pullRequest, branch, pr: into.pr }, opts, into);
-  if (into.stopped) return into;
+  const prOuts = await waitEvent(gh, t, { headSha: v.branch.sha, event: 'pull_request', workflows: v.workflows.pullRequest, branch, pr: into.pr }, w, into, queries);
+  if (into.stopped) return stopped();
   // 3. merge (main) or close (planted, dispute)
   notStopping();
   if (!main) {
     if (v.keepOpen === true) return into;   // a dispute or planted fix loop re-runs it; mergeProofPr refuses while it is open (S27)
-    await closeProofPr(gh, t, into.pr, rate);
-    into.closed = true;
+    into.closed = await closeProofPr(gh, t, into.pr, { clock: rate, leftover: left });
     return into;
   }
   if (!v.merge) return into;
-  const ok = opts.mergeWhen ?? ((o: RunOutcome[]) => o.length > 0 && o.every((x) => x.conclusion === 'success'));
-  if (!ok(prOuts)) return into;
+  const why = mergeBlocker(v.workflows.pullRequest, prOuts, into.missing);
+  if (why !== null) { into.notMerged = why; return into; }
+  if (opts.mergeWhen !== undefined && !opts.mergeWhen(prOuts)) { into.notMerged = 'the caller\'s merge condition (mergeWhen) was not met'; return into; }
   into.mergeSha = await mergeProofPr(gh, t, into.pr, v.branch.sha, rate);
-  await waitEvent(gh, t, { headSha: into.mergeSha, event: 'push', workflows: v.workflows.merge ?? v.workflows.push, branch: t.defaultBranch }, opts, into);
+  await waitEvent(gh, t, { headSha: into.mergeSha, event: 'push', workflows: v.workflows.merge ?? v.workflows.push, branch: t.defaultBranch }, w, into, queries);
+  if (into.stopped) return stopped();
   return into;
+}
+
+/** M2: why the PR runs don't allow the merge (every expected pull_request workflow started and succeeded), or null. */
+function mergeBlocker(expected: readonly string[], prOuts: readonly RunOutcome[], missing: readonly { event: RunEvent; workflow: string }[]): string | null {
+  const never = missing.filter((m) => m.event === 'pull_request').map((m) => m.workflow);
+  if (never.length > 0) return `${never.join(', ')} never started on the PR, so the merge layer is not proven`;
+  if (expected.length === 0 || prOuts.length === 0) return 'no pull_request run proved the merge layer';
+  for (const wf of expected) {
+    const runs = prOuts.filter((o) => o.handle.workflow === wf);
+    if (runs.length === 0) return `${wf} has no run on the PR`;
+    const bad = runs.find((o) => o.conclusion !== 'success');
+    if (bad !== undefined) return `${wf} ended ${bad.conclusion} on the PR`;
+  }
+  return null;
 }
 
 /**

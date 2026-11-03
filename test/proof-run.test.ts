@@ -353,6 +353,63 @@ describe('E4 re-runs (B3)', () => {
   });
 });
 
+describe('E4 fix round 1 (review M2, M5, M7)', () => {
+  it('mergeWhen default: a pull_request workflow that never started means no merge, with the reason', async () => {
+    const e = env((f) => {
+      f.plans.push[PIPEGEN] = {};
+      f.plans.pull_request[MERGE] = {};          // the harness never starts on the PR
+      f.plans.push[HARNESS] = undefined as never;
+    });
+    const { main } = await session(e);
+    const p = await proveVariant(e.g.gh, e.t, { branch: main, merge: true, workflows: WORKFLOWS }, e.opts);
+    expect(p.missing).toEqual([{ event: 'pull_request', workflow: HARNESS }]);
+    expect(p.mergeSha).toBeUndefined();
+    expect(e.f.merges).toEqual([]);
+    expect(p.notMerged).toMatch(new RegExp(`${HARNESS.replace(/\./g, '\\.')}.*never started`));
+    // a failed PR run: no merge either, named
+    const e2 = env((f) => { simplePlans(f); f.plans.pull_request[MERGE] = { jobs: [{ name: 'pipegen / gate', conclusion: 'failure' }] }; });
+    const s2 = await session(e2);
+    const p2 = await proveVariant(e2.g.gh, e2.t, { branch: s2.main, merge: true, workflows: WORKFLOWS }, e2.opts);
+    expect(e2.f.merges).toEqual([]);
+    expect(p2.notMerged).toMatch(/failure/);
+  });
+
+  it('closeProofPr: an answer pipegen can\'t read is not "closed"; the PR is reported as a leftover', async () => {
+    const e = env((f) => { simplePlans(f); f.closeAnswer = { weird: true }; });
+    const { planted } = await session(e);
+    const left: string[] = [];
+    const p = await proveVariant(e.g.gh, e.t, { branch: planted, merge: false, workflows: WORKFLOWS }, { ...e.opts, leftover: (x) => left.push(x) });
+    expect(p.closed).toBe(false);
+    expect(left).toEqual([expect.stringMatching(new RegExp(`PR #${p.pr}.*may still be open`))]);
+    expect(p.leftovers).toEqual(left);
+    const l2: string[] = [];
+    expect(await closeProofPr(e.g.gh, e.t, p.pr as number, { leftover: (x) => l2.push(x) })).toBe(false);
+    expect(l2).toHaveLength(1);
+  });
+
+  it('shouldStop: runs that start after the stop are found again and cancelled (bounded); what can\'t be cancelled is a leftover', async () => {
+    const e = env((f) => { f.plans.push[PIPEGEN] = { steps: 1_000 }; });
+    const { main } = await session(e);
+    let polls = 0;
+    let late = false;
+    const left: string[] = [];
+    const p = await proveVariant(e.g.gh, e.t, { branch: main, merge: false, workflows: { push: [PIPEGEN], pullRequest: [] } }, {
+      ...e.opts, leftover: (x) => left.push(x),
+      shouldStop: () => {
+        if (++polls <= 2) return false;
+        if (!late) { late = true; e.f.pushed(main.branch, main.sha); }   // a second run of the same sha starts as pipegen stops
+        return true;
+      },
+    });
+    expect(p.stopped).toBe(true);
+    const ofMain = e.f.runs.filter((r) => r.head_sha === main.sha).map((r) => r.id).sort();
+    expect(ofMain).toHaveLength(2);
+    expect([...new Set(e.f.cancels)].sort()).toEqual(ofMain);
+    expect(e.clock.t).toBeLessThan(10 * 60_000);
+    expect(left).toEqual([]);
+  });
+});
+
 describe('E4 runs: handles', () => {
   it('waitForRuns takes only handles findRuns made for this target', async () => {
     const e = env(simplePlans);

@@ -35,6 +35,8 @@ export interface RunsFake {
   listDelay: number;
   /** No run is ever started (Actions disabled). */
   actionsOff: boolean;
+  /** PATCH /pulls/{n} answers this body (and changes nothing). */
+  closeAnswer?: unknown;
   /** Extra runs listed for any query (foreign or look-alike runs). `unfiltered`: listed whatever the query asks (a hostile answer). */
   noise: (Partial<FakeRun> & { unfiltered?: boolean })[];
   handler: (c: Call) => Reply | undefined;
@@ -157,7 +159,11 @@ export function runsFake(defaultBranch = 'main'): RunsFake {
       const pr = f.prs.find((p) => p.number === Number(m?.[1]));
       if (pr === undefined) return json(404, { message: 'Not Found' });
       if (c.method === 'GET') return json(200, prBody(pr));
-      if (c.method === 'PATCH') { pr.state = (JSON.parse(c.body ?? '{}') as { state: 'closed' }).state; return json(200, prBody(pr)); }
+      if (c.method === 'PATCH') {
+        if (f.closeAnswer !== undefined) return json(200, f.closeAnswer);   // an answer pipegen can't read; the PR stays as it was
+        pr.state = (JSON.parse(c.body ?? '{}') as { state: 'closed' }).state;
+        return json(200, prBody(pr));
+      }
     }
     m = /^\/pulls\/(\d+)\/merge$/.exec(rest);
     if (m && c.method === 'PUT') {

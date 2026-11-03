@@ -87,7 +87,10 @@ describe('E4 downloads (S2)', () => {
   it('downloads: store URLs that are not plain https on a store host are refused; a body over the cap stops reading', async () => {
     const bad = ['http://pipelinesghubeus22.actions.githubusercontent.com/x', `https://${['u', 'p'].join(':')}@pipelinesghubeus22.actions.githubusercontent.com/x`,
       'https://pipelinesghubeus22.actions.githubusercontent.com:8443/x', 'https://api.github.com/repos/x', 'https://x.blob.core.windows.net.evil.example/x',
-      'https://a.b.blob.core.windows.net/x', 'not a url', ''];
+      'https://a.b.blob.core.windows.net/x', 'not a url', '',
+      // fix round 1 (M8): IP literals, GitHub's own hosts, a trailing dot, an upper-case look-alike
+      'https://140.82.112.21/x', 'https://[::1]/x', 'https://[2606:50c0:8000::154]/x', 'https://github.com/x', 'https://api.github.com/x',
+      'https://pipelinesghubeus22.actions.githubusercontent.com./x', 'https://EVIL.EXAMPLE/x', 'https://PIPELINES.ACTIONS.GITHUBUSERCONTENT.COM.EVIL.EXAMPLE/x'];
     for (const loc of bad) {
       const { gh, scratch, calls, deps } = setup({
         [`GET ${API}${R}/actions/runs/${RUN}/artifacts`]: listing([art(1, 'pipegen-out-x', 100)]),
@@ -124,6 +127,18 @@ describe('E4 downloads (S2)', () => {
       expect(o.problems.size).toBeGreaterThan(0);
       expect(w.calls.filter((c) => c.url.pathname.endsWith('/zip'))).toEqual([]);
     }
+  });
+
+  it('downloads: an upper-case spelling of a store host is the same host (URL lowercases it): fetched there, without the token', async () => {
+    const zip = zipOf('r.json', '{}');
+    const { gh, scratch, calls, deps } = setup({
+      [`GET ${API}${R}/actions/runs/${RUN}/artifacts`]: listing([art(1, 'pipegen-out-x', zip.length)]),
+      [`GET ${API}${R}/actions/artifacts/1/zip`]: redirect('https://PIPELINESGHUBEUS22.Actions.GitHubUserContent.com/u'),
+      [`GET ${STORE}/u`]: { raw: zip },
+    });
+    const out = await downloadRunArtifacts(gh, scratch, RUN, () => true, deps);
+    expect(out.files.get('pipegen-out-x')?.file).toBe('r.json');
+    expect(storeCalls(calls).map((c) => [c.url.href, c.headers.authorization])).toEqual([[`${STORE}/u`, undefined]]);
   });
 
   it('run: job logs fetched per job as text, capped', async () => {

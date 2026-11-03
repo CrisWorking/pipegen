@@ -81,6 +81,8 @@ export interface WorldOptions {
   owners?: Person[] | null;
   /** A status for the first request to a route ("METHOD /path"), with GitHub's rate-limit headers when 403/429. */
   rateLimitOnce?: string;
+  /** E4 fix round 1: the id GitHub gives each repo (default 1000 + the name's length). */
+  repoIds?: Record<string, number>;
   /** E4: answers routes this fake doesn't know (secrets, PRs, runs, artifacts), before its own 404. undefined: not handled. */
   extra?: (c: Call) => Reply | undefined;
 }
@@ -106,7 +108,7 @@ export function world(opts: WorldOptions = {}): World {
   const me = opts.me === undefined ? { login: opts.login ?? owner, id: 1 } : opts.me;
   const limited = new Set<string>();
   const body = (name: string, r: FakeRepo) => ({
-    id: 1000 + name.length, name, full_name: r.fullName ?? `${owner}/${name}`, private: r.private,
+    id: opts.repoIds?.[name] ?? 1000 + name.length, name, full_name: r.fullName ?? `${owner}/${name}`, private: r.private,
     visibility: r.visibility ?? (r.private ? 'private' : 'public'), default_branch: r.default_branch ?? 'main',
     owner: { login: owner, type: ownerType },
     description: r.description ?? helperDescription(name.startsWith('pipegen-proof-') ? 'scratch' : 'central'),

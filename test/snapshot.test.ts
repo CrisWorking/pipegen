@@ -187,7 +187,7 @@ async function fixture(o: { appDefault?: string; scratchEmpty?: boolean; runs?: 
     const rest = parts.slice(3).join('/');
     const m = c.method;
     if (m !== 'GET' || rest === 'actions/runs') events.push(`${m} ${name}/${rest}`);
-    if (m === 'GET' && rest === '') return json(200, { name, full_name: `${OWNER}/${name}`, private: true, visibility: 'private', default_branch: defaultOf(bare), description: name === SCRATCH ? 'pipegen proof runs (private scratch repo)' : '' });
+    if (m === 'GET' && rest === '') return json(200, { id: 1000 + name.length, name, full_name: `${OWNER}/${name}`, private: true, visibility: 'private', default_branch: defaultOf(bare), description: name === SCRATCH ? 'pipegen proof runs (private scratch repo)' : '' });
     if (m === 'PATCH' && rest === '') {
       const b = JSON.parse(c.body ?? '{}') as { default_branch?: string };
       if (b.default_branch !== undefined) {

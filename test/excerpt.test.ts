@@ -12,7 +12,7 @@ import {
 } from '../src/proof/excerpt.js';
 import { betterleaksAt, CLEAN, gitleaksAt, makeStub } from './helpers/gitleaks-stub.js';
 import { cleanupRepos } from './helpers/make-repo.js';
-import { placeholderEvidence } from './helpers/scratch-secrets.js';
+import { EVIDENCE_RUN, placeholderEvidence } from './helpers/scratch-secrets.js';
 import { fake } from './helpers/secret-repo.js';
 
 afterEach(() => cleanupRepos());
@@ -21,7 +21,7 @@ afterEach(() => cleanupRepos());
 let PLACEHOLDERS_ONLY: ExcerptEvidence;
 beforeAll(async () => { PLACEHOLDERS_ONLY = await placeholderEvidence(); });
 const errorExcerpt = (logs: string, scrub: (t: string) => string, scanner: Parameters<typeof errorExcerptWithEvidence>[2], opts?: { timeoutMs?: number }) =>
-  errorExcerptWithEvidence(logs, scrub, scanner, PLACEHOLDERS_ONLY, opts);
+  errorExcerptWithEvidence(logs, scrub, scanner, PLACEHOLDERS_ONLY, { runId: EVIDENCE_RUN, ...opts });
 
 const R = '[REDACTED]';
 // built at runtime: no secret-looking literal is committed (test/no-secret-literals.test.ts)
