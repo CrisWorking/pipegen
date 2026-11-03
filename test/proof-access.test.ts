@@ -119,7 +119,7 @@ describe('checkScratchAccess (E1 fix round 1, I2)', () => {
     expect(no.io.prompt.asked).toEqual([{ msg: `pipegen could not confirm who can push to ${ORG}/${SCRATCH}. Anyone who can push can read your real test keys stored there. Continue?`, def: false }]);
     expect(no.g.writes()).toEqual([]);
     const yes = check({ collaborators: null }, { org: {} }, orgApp(), [true]);
-    expect((await yes.result).accepted).toEqual(['pushers']);
+    expect((await yes.result).accepted).toEqual([expect.stringMatching(/^pushers: /)]);
   });
 
   it('who can push: another user with write, maintain or admin → stop listing them; read and triage do not count; self and org owners excluded', async () => {
@@ -166,7 +166,7 @@ describe('checkScratchAccess (E1 fix round 1, I2)', () => {
     expect([MAX_LIST_PAGES, LIST_PAGE_SIZE]).toEqual([10, 100]);
     const crowd = Array.from({ length: 1001 }, (_, i) => person(`r${i}`, 1000 + i, 'read'));
     const { g, io, result } = check({ collaborators: [person(OWNER, 1, 'admin'), ...crowd] }, {}, app(), [true]);
-    expect((await result).accepted).toEqual(['pushers']);
+    expect((await result).accepted).toEqual([expect.stringMatching(/^pushers: /)]);
     expect(io.prompt.asked.map((a) => a.msg)).toEqual([PUSH_PROMPT]);
     expect(g.calls.filter((c) => c.url.pathname.endsWith('/collaborators')).map((c) => c.url.searchParams.get('page'))).toEqual(['1', '2', '3', '4', '5', '6', '7', '8', '9', '10']);
     // exactly 10 full pages and no more: no prompt
@@ -177,7 +177,7 @@ describe('checkScratchAccess (E1 fix round 1, I2)', () => {
 
   it('owners list past the cap or unreadable: admins can\'t be told from owners → prompt; a writer is still a stop', async () => {
     const admin = check({ collaborators: [person('me', 1, 'admin'), person('boss', 5, 'admin')] }, { me: { login: 'me', id: 1 }, owners: null }, orgApp(), [true]);
-    expect((await admin.result).accepted).toEqual(['pushers']);
+    expect((await admin.result).accepted).toEqual([expect.stringMatching(/^pushers: /)]);
     const writer = check({ collaborators: [person('me', 1, 'admin'), person('dev', 6, 'write')] }, { me: { login: 'me', id: 1 }, owners: null }, orgApp());
     await expect(writer.result).rejects.toThrow(/dev/);
   });
@@ -205,7 +205,7 @@ describe('checkScratchAccess (E1 fix round 1, I2)', () => {
     const custom = person('auditor', 4, 'read');
     custom.role_name = 'security-manager';
     const yes = check({ collaborators: [person(OWNER, 1, 'admin'), custom] }, {}, app(), [true]);
-    expect((await yes.result).accepted).toEqual(['pushers']);
+    expect((await yes.result).accepted).toEqual([expect.stringMatching(/^pushers: /)]);
     expect(yes.io.all()).toMatch(/auditor.*security-manager/);
     const no = check({ collaborators: [person(OWNER, 1, 'admin'), custom] }, {}, app(), [false]);
     await expect(no.result).rejects.toThrow(ProofStopError);
@@ -220,7 +220,7 @@ describe('checkScratchAccess (E1 fix round 1, I2)', () => {
     const odd = check({ keys: [{ id: 3, title: 'odd' }] });   // read_only missing: not known read-only
     await expect(odd.result).rejects.toThrow(/"odd"/);
     const unread = check({ keys: null }, {}, app(), [true]);
-    expect((await unread.result).accepted).toEqual(['pushers']);
+    expect((await unread.result).accepted).toEqual([expect.stringMatching(/^pushers: /)]);
   });
 
   it('forks (org): allow_forking turned off through the guard and read back; still on → the fork prompt; personal repo untouched', async () => {
@@ -239,7 +239,7 @@ describe('checkScratchAccess (E1 fix round 1, I2)', () => {
     expect(forced.io.prompt.asked[0]?.def).toBe(false);
     expect(forced.io.prompt.asked[0]?.msg).toMatch(/fork.*secrets.*Continue\?$/s);
     const forcedYes = check({ allowForking: true, forkingForced: true }, {}, orgApp(), [true]);
-    expect((await forcedYes.result).accepted).toEqual(['forking']);
+    expect((await forcedYes.result).accepted).toEqual([`forking: ${ORG}/${SCRATCH}`]);
 
     const personal = check({ allowForking: true });
     await personal.result;
@@ -250,7 +250,7 @@ describe('checkScratchAccess (E1 fix round 1, I2)', () => {
     const g = world({ owner: ORG, ownerType: 'Organization', org: {}, repos: { [SCRATCH]: { private: true, collaborators: null, allowForking: true, forkingForced: true } } });
     const t = proofTarget(orgApp());
     const first = await checkScratchAccess(g.gh, t, ioWith(true, true));
-    expect(first.accepted).toEqual(['pushers', 'forking']);
+    expect(first.accepted).toEqual([expect.stringMatching(/^pushers: .*couldn't read the full list of people/), `forking: ${ORG}/${SCRATCH}`]);
     const again = ioWith();
     await checkScratchAccess(g.gh, t, again, { accepted: first.accepted });
     expect(again.prompt.asked).toEqual([]);
@@ -297,5 +297,60 @@ describe('checkScratchAccess (E1 fix round 1, I2)', () => {
     const io2 = ioWith();
     expect((await checkProofRepos(made.gh, app(), { ...({ [AU]: { kind: 'app', canCreateRepos: true } } as Pick<ProofRepoOptions, 'auth'>), actions: [] }, io2)).ready).toBe(true);
     expect(io2.prompt.asked).toEqual([]);
+  });
+
+  it('teams fail closed (security scan): a missing or unknown permission → prompt; a permissions object with push, maintain or admin → stop', async () => {
+    for (const team of [{ slug: 'ghost' }, { slug: 'custom', permission: 'security-manager' }, { slug: 'nul', permission: null }]) {
+      const yes = check({ teams: [team] }, {}, orgApp(), [true]);
+      expect((await yes.result).accepted, JSON.stringify(team)).toEqual([expect.stringMatching(new RegExp(`^pushers: the team ${team.slug} has the permission`))]);
+      const no = check({ teams: [team] }, {}, orgApp(), [false]);
+      await expect(no.result, JSON.stringify(team)).rejects.toThrow(ProofStopError);
+      expect(no.io.prompt.asked.map((a) => a.msg)).toEqual([`pipegen could not confirm who can push to ${ORG}/${SCRATCH}. Anyone who can push can read your real test keys stored there. Continue?`]);
+    }
+    for (const flag of ['push', 'maintain', 'admin']) {
+      const t = check({ teams: [{ slug: 'flagged', permission: 'custom-role', permissions: { pull: true, [flag]: true } }] }, {}, orgApp());
+      await expect(t.result, flag).rejects.toThrow(/These teams can push to AcmeOrg\/pipegen-proof-shop: flagged \(custom-role\)/);
+    }
+    const flagsNoPush = check({ teams: [{ slug: 'readers', permission: 'pull', permissions: { pull: true, push: false, maintain: false, admin: false } }, { slug: 'triagers', permission: 'triage' }] }, {}, orgApp());
+    await expect(flagsNoPush.result).resolves.toBeDefined();
+    expect(flagsNoPush.io.prompt.asked).toEqual([]);
+  });
+
+  it('collaborators fail closed (security scan): no permissions object → prompt', async () => {
+    for (const permissions of [undefined, null, 'write']) {
+      const p = { login: 'shadow', id: 5, type: 'User', role_name: 'write', permissions } as never;
+      const no = check({ collaborators: [person(OWNER, 1, 'admin'), p] }, {}, app(), [false]);
+      await expect(no.result, String(permissions)).rejects.toThrow(ProofStopError);
+      expect(no.io.prompt.asked.map((a) => a.msg)).toEqual([PUSH_PROMPT]);
+      expect(no.io.all()).toContain("GitHub didn't say what shadow may do");
+    }
+  });
+
+  it('a Yes covers exactly the doubts it was given (security scan): a new doubt at the second check (E4) asks again', async () => {
+    const g = world({ repos: { [SCRATCH]: { private: true, keys: null } } });
+    const t = proofTarget(app());
+    const first = await checkScratchAccess(g.gh, t, ioWith(true));
+    expect(first.accepted).toEqual([`pushers: pipegen couldn't read the deploy keys of ${OWNER}/${SCRATCH}`]);
+    // the same doubt again: not asked
+    const same = ioWith();
+    expect((await checkScratchAccess(g.gh, t, same, { accepted: first.accepted })).accepted).toEqual(first.accepted);
+    expect(same.prompt.asked).toEqual([]);
+    // a new doubt appears (a custom role), on top of the old one: asked again; No stops
+    const custom = person('auditor', 4, 'read');
+    custom.role_name = 'security-manager';
+    (g.repos[SCRATCH] as FakeRepo).collaborators = [person(OWNER, 1, 'admin'), custom];
+    const again = ioWith(false);
+    await expect(checkScratchAccess(g.gh, t, again, { accepted: first.accepted })).rejects.toThrow(ProofStopError);
+    expect(again.prompt.asked.map((a) => a.msg)).toEqual([PUSH_PROMPT]);
+    // a different doubt in place of the old one: asked again too
+    (g.repos[SCRATCH] as FakeRepo).keys = [];
+    const other = ioWith(true);
+    const r = await checkScratchAccess(g.gh, t, other, { accepted: first.accepted });
+    expect(other.prompt.asked).toHaveLength(1);
+    expect(r.accepted).toEqual([expect.stringContaining('auditor has the custom role security-manager')]);
+    // the key is the sorted reasons, whatever order they were found in
+    const two = world({ repos: { [SCRATCH]: { private: true, keys: null } }, me: null });
+    const k = await checkScratchAccess(two.gh, proofTarget(app()), ioWith(true));
+    expect(k.accepted).toEqual([`pushers: pipegen couldn't read the deploy keys of ${OWNER}/${SCRATCH}; pipegen couldn't read which GitHub user it acts as`]);
   });
 });

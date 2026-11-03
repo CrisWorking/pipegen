@@ -187,14 +187,20 @@ export const LIST_PAGE_SIZE = 100;
 /** A stop names at most this many people, then the count. */
 export const MAX_NAMED = 20;
 const STANDARD_ROLES = new Set(['read', 'triage', 'write', 'maintain', 'admin']);
+const TEAM_PUSH = new Set(['push', 'maintain', 'admin']);
+const TEAM_NO_PUSH = new Set(['pull', 'triage']);
 const RESIDUALS = '(pipegen can\'t rule out org owners, enterprise owners, GitHub Apps installed on all repos, org-wide roles such as "All-repository write", or GitHub staff.)';
 
-/** What checkScratchAccess found. E4 passes `accepted` back on its own call, so the same answered prompt isn't asked twice. */
+/** What checkScratchAccess found. E4 passes `accepted` back on its own call, so the exact same doubt isn't asked about twice. */
 export interface ScratchAccess {
   scratch: GuardedRepo;
   orgPerm?: OrgPermission;
   warnings: string[];
-  /** Prompts the user answered Yes: 'pushers' (who can push could not be confirmed), 'forking' (forking stays on). */
+  /**
+   * Prompts the user answered Yes, each keyed on exactly what was uncertain (security scan, fix round 1): `pushers: ` +
+   * the sorted unsure reasons (logins and teams included), `forking: <owner>/<repo>`. A later call with a different set
+   * of reasons asks again.
+   */
   accepted: string[];
 }
 
@@ -278,7 +284,8 @@ export async function checkScratchAccess(gh: Octokit, t: ProofTarget, io: ProofI
     const pushers: string[] = [];
     for (const p of people) {
       const id = idOf(p);
-      const perms = ((p as { permissions?: unknown } | null)?.permissions ?? {}) as Record<string, unknown>;
+      const rawPerms = (p as { permissions?: unknown } | null)?.permissions;
+      const perms = (rawPerms !== null && typeof rawPerms === 'object' ? rawPerms : {}) as Record<string, unknown>;
       const role = (p as { role_name?: unknown } | null)?.role_name;
       const self = id !== null && id === me;
       // a personal repo's owner holds it anyway (the same residual as an org owner)
@@ -289,6 +296,9 @@ export async function checkScratchAccess(gh: Octokit, t: ProofTarget, io: ProofI
         // admins can't be told from org owners when the owner list is unreadable: ask instead of a false stop
         if (org && owners === null && perms.admin === true) unsure.push(`${loginOf(p)} has admin access, and pipegen couldn't read who owns ${t.owner}`);
         else pushers.push(loginOf(p));
+      } else if (rawPerms === null || typeof rawPerms !== 'object' || Array.isArray(rawPerms)) {
+        // no permissions object: pipegen can't tell (security scan, fix round 1: fail closed, never "no push")
+        unsure.push(`GitHub didn't say what ${loginOf(p)} may do`);
       } else if (typeof role !== 'string' || !STANDARD_ROLES.has(role)) {
         unsure.push(`${loginOf(p)} has the custom role ${safeText(String(role), 60)}, which may allow pushing`);
       }
@@ -303,8 +313,19 @@ export async function checkScratchAccess(gh: Octokit, t: ProofTarget, io: ProofI
     const teams = await readList(gh, clock, 'GET /repos/{owner}/{repo}/teams', { owner: scratch.owner, repo: scratch.repo });
     if (teams === null) unsure.push(`pipegen couldn't read the teams with access to ${scratch.fullName}`);
     else {
-      const pushing = teams.filter((x) => ['push', 'maintain', 'admin'].includes(String((x as { permission?: unknown } | null)?.permission)))
-        .map((x) => `${safeText(String((x as { slug?: unknown }).slug), 60)} (${String((x as { permission?: unknown }).permission)})`);
+      // fail closed (security scan, fix round 1): a `permissions` object with push, maintain or admin true is push; else
+      // the `permission` name: pull or triage is no push, push/maintain/admin is push, anything else (missing, a custom
+      // role) is unsure and goes to the prompt
+      const pushing: string[] = [];
+      for (const x of teams) {
+        const team = (x ?? {}) as { slug?: unknown; permission?: unknown; permissions?: unknown };
+        const slug = safeText(String(team.slug ?? '(unnamed team)'), 60);
+        const name = typeof team.permission === 'string' ? team.permission : undefined;
+        const flags = team.permissions !== null && typeof team.permissions === 'object' ? team.permissions as Record<string, unknown> : null;
+        const flagPush = flags !== null && (flags.push === true || flags.maintain === true || flags.admin === true);
+        if (flagPush || (name !== undefined && TEAM_PUSH.has(name))) pushing.push(`${slug} (${safeText(name ?? 'push', 40)})`);
+        else if (name === undefined || !TEAM_NO_PUSH.has(name)) unsure.push(`the team ${slug} has the permission ${safeText(String(name ?? 'none given'), 40)}, which pipegen can't judge`);
+      }
       if (pushing.length > 0) stops.push(`These teams can push to ${scratch.fullName}: ${pushing.slice(0, MAX_NAMED).join(', ')}${pushing.length > MAX_NAMED ? ` and more (${pushing.length} in all)` : ''}.`);
     }
   }
@@ -343,9 +364,9 @@ export async function checkScratchAccess(gh: Octokit, t: ProofTarget, io: ProofI
   };
   if (unsure.length > 0) {
     io.err(`pipegen couldn't check everything about ${scratch.fullName}: ${unsure.join('; ')}.`);
-    await ask('pushers', pushUnsurePrompt(scratch));
+    await ask(`pushers: ${[...new Set(unsure)].sort().join('; ')}`, pushUnsurePrompt(scratch));
   }
-  if (forkOn) await ask('forking', forkPrompt(scratch));
+  if (forkOn) await ask(`forking: ${scratch.fullName}`, forkPrompt(scratch));
   return result;
 }
 
