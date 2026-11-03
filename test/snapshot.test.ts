@@ -262,6 +262,7 @@ function deps(f: Fixture, o: { settleMs?: number } = {}) {
   };
 }
 
+const EMPTY_TREE = '4b825dc642cb6eb9a060e54bf8d69288fbee4904';
 const USER_WORKFLOWS = ['.github/workflows/ci.yml', '.github/workflows/nested/deep.yaml'];
 const BOTS = ['.github/dependabot.yml', 'renovate.json', '.github/renovate.json5', '.renovaterc'];
 
@@ -402,6 +403,12 @@ describe('E2 base snapshot, central draft, proof branches (Task 2 first half)', 
       .rejects.toThrow(/workflow/);
     await expect(pushProofBranch(s, 'planted', [[{ path: '.GitHub/Workflows/x.yml', content: USER_CI }]], { transport: f.transport, pipegenWorkflows: new Set() }))
       .rejects.toThrow(/workflow/);
+    // a workflow inherited from the parent commit that pipegen no longer lists is refused too (the tree check, not only added files)
+    await expect(pushProofBranch(s, 'main', [[{ path: 'x.txt', content: 'x' }]], { transport: f.transport, pipegenWorkflows: new Set(), parent: r.branches.main.sha }))
+      .rejects.toThrow(/pipegen\.yml is a workflow/);
+    // a user workflow path given as pipegen's own is refused even when no file is added there
+    await expect(pushProofBranch(s, 'planted', [[{ path: 'x.txt', content: 'x' }]], { transport: f.transport, pipegenWorkflows: new Set(['.github/workflows/CI.yml']), parent: r.branches.planted.sha }))
+      .rejects.toThrow(/one of your workflows/);
     await s.remove();
     await f.close();
   });
@@ -446,7 +453,7 @@ describe('E2 base snapshot, central draft, proof branches (Task 2 first half)', 
     expect(show(f.scratchGit, r.branches.main.sha, '.github/workflows/pipegen.yml')).toContain('uses: ./.github/workflows/pipegen-merge.yml');
     // a central `uses` without a central layout is refused
     const g = await fixture();
-    await expect(pushProofSetup(input(g, { central: undefined, appFiles: () => centralCaller('c'.repeat(40)) }), deps(g).d)).rejects.toThrow(/central/);
+    await expect(pushProofSetup(input(g, { central: undefined, appFiles: () => centralCaller('c'.repeat(40)) }), deps(g).d)).rejects.toThrow(/no central pin/);
     await g.close();
     await f.close();
   });
@@ -469,6 +476,8 @@ describe('E2 base snapshot, central draft, proof branches (Task 2 first half)', 
     // a planted file may not be a workflow (it would run), nor be missing
     const g = await fixture();
     await expect(pushProofSetup(input(g, { plantedFiles: [{ path: '.github/workflows/evil.yml', content: USER_CI }] }), deps(g).d)).rejects.toThrow(/workflow/);
+    // refused before anything is written: no secret stored, nothing pushed
+    expect(g.events).toEqual([]);
     await g.close();
     await f.close();
   });
@@ -719,6 +728,8 @@ describe('E2 base snapshot, central draft, proof branches (Task 2 first half)', 
     }
     // a parent pipegen didn't make in this session is refused before any git push
     await expect(pushProofBranch(s, 'planted', [[{ path: 'y', content: 'y' }]], { transport: f.transport, pipegenWorkflows: own, parent: 'd'.repeat(40) })).rejects.toThrow(/parent/);
+    // the central commit (made in this session, in pipelines) is never a scratch parent
+    await expect(pushProofBranch(s, 'planted', [[{ path: 'y', content: 'y' }]], { transport: f.transport, pipegenWorkflows: own, parent: r.centralSha as string })).rejects.toThrow(/parent/);
     // a dispute variant name is checked
     await expect(pushProofBranch(s, 'dispute-../x-a' as never, [[]], { transport: f.transport, pipegenWorkflows: own })).rejects.toThrow(/variant/);
     await s.remove();
@@ -857,8 +868,9 @@ describe('E2 central default head read (S21)', () => {
         const p = decodeURIComponent(c.url.pathname);
         if (p === `/repos/${OWNER}/pipelines`) return json(200, { default_branch: 'main' });
         if (p.endsWith('/git/ref/heads/main')) return json(200, { object: { sha: '1'.repeat(40) } });
-        if (p.includes('/git/commits/')) return json(200, { tree: { sha: '2'.repeat(40) } });
-        if (p.includes('/git/trees/')) return json(200, { sha: '2'.repeat(40), truncated: true, tree: [] });
+        // a list that is consistent (the empty tree) but cut short: only the truncated flag can stop it
+        if (p.includes('/git/commits/')) return json(200, { tree: { sha: EMPTY_TREE } });
+        if (p.includes('/git/trees/')) return json(200, { sha: EMPTY_TREE, truncated: true, tree: [] });
         return json(404, {});
       },
     }) as never);
@@ -880,6 +892,23 @@ describe('E2 central default head read (S21)', () => {
     const gh2 = makeOctokit(fake.githubPat(), { fetch: fetch2, log: () => {} });
     await expect(pushProofSetup(input(g), { ...deps(g).d, gh: gh2 })).rejects.toThrow(/pipelines/);
     expect(g.events.some((e) => e.startsWith('push'))).toBe(false);
-    for (const x of [f, g]) await x.close();
+    // every blob hashes back, but the files don't rebuild the head's tree (an entry left out of the list): stop
+    const h = await fixture();
+    const blobA = execFileSync(REAL_GIT, ['hash-object', '--stdin'], { input: 'a\n', encoding: 'utf8' }).trim();
+    const { fetch: fetch3 } = fakeFetch(new Proxy({}, {
+      get: () => (c: Call): Reply => {
+        const p = decodeURIComponent(c.url.pathname);
+        if (p === `/repos/${OWNER}/pipelines`) return json(200, { default_branch: 'main' });
+        if (p.endsWith('/git/ref/heads/main')) return json(200, { object: { sha: '1'.repeat(40) } });
+        if (p.includes('/git/commits/')) return json(200, { tree: { sha: '2'.repeat(40) } });
+        if (p.includes('/git/trees/')) return json(200, { sha: '2'.repeat(40), truncated: false, tree: [{ path: 'a.txt', mode: '100644', type: 'blob', sha: blobA, size: 2 }] });
+        if (p.includes('/git/blobs/')) return json(200, { encoding: 'base64', content: Buffer.from('a\n').toString('base64'), size: 2 });
+        return json(404, {});
+      },
+    }) as never);
+    const gh3 = makeOctokit(fake.githubPat(), { fetch: fetch3, log: () => {} });
+    await expect(pushProofSetup(input(h), { ...deps(h).d, gh: gh3 })).rejects.toThrow(/rebuild its head tree exactly/);
+    expect(h.events.some((e) => e.startsWith('push'))).toBe(false);
+    for (const x of [f, g, h]) await x.close();
   });
 });
