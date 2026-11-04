@@ -3,11 +3,17 @@
 // injected repo text that makes the AI write a link, an image, HTML or an @mention must never survive (spec §19, T22, Review Focus 7).
 import { describe, expect, it } from 'vitest';
 import { CLEAN_DOC_MAX, CLEAN_DOC_PLACEHOLDER, cleanForDoc, stripForDoc } from '../src/debate/clean.js';
+import { pipegenDocProblems } from '../src/engine/created-judges/pipegen-doc.js';
 import { safeMarkdown } from '../src/util/safe-text.js';
 
 const cps = (s: string): number => Array.from(s).length;
 // Nothing a renderer turns into a link, an image, HTML or a notification.
 const ACTIVE = /https?|:\/\/|www\.|javascript|vbscript|data:|mailto|evil|<|&lt;|&#|@|\uff20|\ufe6b|\]\(|!\\?\[/i;
+// The PIPEGEN.md judge (Plan D) on a cleaned text placed where Plan G puts AI text: a list item, a table cell and a heading.
+const DOC_OPTS = { owner: 'acme', repo: 'app', containsKnownValue: () => false };
+const docProblems = (t: string): string[] => pipegenDocProblems(`# PIPEGEN\n\n- ${t}\n\n| Tool | Why |\n| --- | --- |\n| x | ${t} |\n\n## ${t}\n`, DOC_OPTS);
+// safeMarkdown's own marks: a backslash escape, an entity, the zero-width space it puts in links and mentions, its ellipsis.
+const ESCAPED = /[\\&\u200b\u2026]/;
 const INVISIBLE_OR_CONTROL = /[\p{Cc}\u202a-\u202e\u2066-\u2069\u200e\u200f\u061c\p{Default_Ignorable_Code_Point}\ufff9-\ufffb\u2028\u2029]/u;
 
 describe('clean', () => {
@@ -27,14 +33,18 @@ describe('clean', () => {
 
   it('clean: one line, length capped with …', () => {
     expect(cleanForDoc('line one\nline two\r\n\tline three\u2028four\u2029five\u0085six\vseven\fend')).toBe('line one line two line three four five six seven end');
+    // the cut ends with ' ...': the PIPEGEN.md judge refuses U+2026 (ruling F1-R1)
     const long = cleanForDoc('word '.repeat(200));
     expect(cps(long)).toBe(CLEAN_DOC_MAX);
     expect(CLEAN_DOC_MAX).toBe(400);
-    expect(long.endsWith('…')).toBe(true);
+    expect(long.endsWith('word w ...')).toBe(true);
     expect(long).not.toContain('\n');
     const short = cleanForDoc('word '.repeat(200), 50);
     expect(cps(short)).toBe(50);
-    expect(short.endsWith('…')).toBe(true);
+    expect(short.endsWith(' ...')).toBe(true);
+    expect(cleanForDoc('see www.x and 12345', 4)).toBe('...');
+    expect(cleanForDoc('1234567890', 6)).toBe('12 ...'); // never `12...` (an ordered-list marker safeMarkdown would escape)
+    expect(cleanForDoc('abc www and more', 11)).toBe('abc www ...'); // never `www...`
     expect(cleanForDoc('fits', 4)).toBe('fits');
     // a cap that is not a whole number of at least 1 is a caller bug
     for (const bad of [0, -1, 1.5, Number.NaN, Number.POSITIVE_INFINITY]) expect(() => cleanForDoc('x', bad), String(bad)).toThrow(RangeError);
@@ -58,7 +68,7 @@ describe('clean', () => {
     expect(cleanForDoc('[click](<https://evil.example>) now')).toBe('click now');
     expect(cleanForDoc('a [ref link][r1] and [collapsed][] b')).toBe('a ref link and collapsed b');
     // reference definitions go, wherever the line starts
-    expect(cleanForDoc('a [x] b\n[x]: https://evil.example "t"\n  [y]: <https://evil.example>\n> [z]: evil.example')).toBe('a \\[x\\] b');
+    expect(cleanForDoc('a [x] b\n[x]: https://evil.example "t"\n  [y]: <https://evil.example>\n> [z]: evil.example')).toBe('a x b');
     // images go whole, alt text included, in every form; a link around an image goes too
     expect(cleanForDoc('before ![alt text](https://evil.example/p.png "t") after')).toBe('before after');
     expect(cleanForDoc('before ![alt][r] ![short] after')).toBe('before after');
@@ -67,7 +77,7 @@ describe('clean', () => {
     expect(cleanForDoc('java<b></b>script:alert(1) ok')).toBe('java ok'); // a removed tag leaves a blank, so nothing is glued
     expect(cleanForDoc('java&#x09;script:alert(1) ok')).toBe('ok'); // a removed entity leaves nothing; the URL step comes after
     expect(cleanForDoc('w@ww.evil.example ok')).toBe('ok'); // the @ goes last in a round; the next round sees www.
-    expect(cleanForDoc('see x_www.evil.example ok')).toBe('see x\\_ ok'); // GFM links www. after `_` too
+    expect(cleanForDoc('see x_www.evil.example ok')).toBe('see x ok'); // GFM links www. after `_` too
     expect(cleanForDoc('x <@b>bold</@b> ok')).toBe('x bold ok');
     expect(cleanForDoc('[cl<!-- -->ick](ht<i>tp://evil.example) ok')).toBe('cl ick ok');
     // not a URL: a colon before a digit (image tags, ports, versions) and a colon before a space stay
@@ -79,8 +89,8 @@ describe('clean', () => {
     expect(cleanForDoc('kept <!-- unterminated, hides the rest')).toBe('kept');
     expect(cleanForDoc('x &lt;script&gt; &#x3C;b&#62; &#60 &amp; &nbsp; &#8238; &AMP; y')).toBe('x script b y');
     expect(cleanForDoc('&lt;img src=x onerror=alert(1)&gt;')).toBe('img src=x onerror=alert(1)'); // plain words now
-    // a bare & is not an entity: safeMarkdown writes it as &amp; (once)
-    expect(cleanForDoc('AT&T and R & D')).toBe('AT&amp;T and R &amp; D');
+    // a bare & is not an entity: it is written as `and` (the judge refuses &, and safeMarkdown would write &amp;)
+    expect(cleanForDoc('AT&T and R & D')).toBe('AT and T and R and D');
     const at = cleanForDoc('@octocat @acme/security-team user@example.com \uff20wide \ufe6bsmall @@double');
     expect(at).toBe('octocat acme/security-team userexample.com wide small double');
     expect(at).not.toMatch(/[@\uff20\ufe6b]/);
@@ -88,7 +98,7 @@ describe('clean', () => {
   });
 
   it('clean: leading heading, table and quote characters removed', () => {
-    expect(cleanForDoc('# Title\n## Sub\n| a | b |\n|---|:-:|\n> quote\n> > nested\n- item\n=== \n---\n  #  indented')).toBe('Title Sub a \\| b \\| quote nested item indented');
+    expect(cleanForDoc('# Title\n## Sub\n| a | b |\n|---|:-:|\n> quote\n> > nested\n- item\n=== \n---\n  #  indented')).toBe('Title Sub a b quote nested item indented');
     // also when the start appears only after something before it was removed
     expect(cleanForDoc('<b></b>## x')).toBe('x');
     expect(cleanForDoc('<!-- c -->> quoted')).toBe('quoted');
@@ -97,24 +107,45 @@ describe('clean', () => {
   });
 
   it('clean: result is safeMarkdown applied exactly once (no double escape); the cap counts the output', () => {
-    const x = 'use npm_audit & a*b `code` [x] ~y~ $5 back\\slash 1. step | pipe #12 a // b';
+    const x = 'use npm_audit & a*b `code` [x] ~y~ $5 back\\slash 1. step | pipe #12 a // b www.x GH-1 :rocket: ok!';
+    const stripped = stripForDoc(x);
+    expect(stripped).toBe('use npm audit and a b code x y 5 back slash 1. step pipe 12 a / / b GH 1 : rocket: ok');
     const out = cleanForDoc(x);
-    expect(out).toBe(safeMarkdown(stripForDoc(x), CLEAN_DOC_MAX));
-    expect(stripForDoc(x)).toBe(x); // stripForDoc escapes nothing
-    expect(out).toContain('npm\\_audit');
-    expect(out).toContain('&amp;');
-    expect(out).toContain('back\\\\slash');
-    expect(out).not.toContain('\\\\_'); // not escaped twice
-    expect(out).not.toContain('&amp;amp;');
-    expect(out).not.toContain('\\\\\\\\');
-    // the cap counts the escaped output, not the input
-    const underscores = cleanForDoc('_'.repeat(1_000));
-    expect(cps(underscores)).toBeLessThanOrEqual(CLEAN_DOC_MAX);
-    expect(cps(underscores)).toBeGreaterThanOrEqual(CLEAN_DOC_MAX - 2);
-    expect(underscores).toBe(safeMarkdown('_'.repeat(1_000), CLEAN_DOC_MAX));
-    expect(underscores.endsWith('\\_…')).toBe(true); // never half an escape
-    expect(cps(cleanForDoc('&'.repeat(300), 100))).toBeLessThanOrEqual(100);
-    expect(cleanForDoc('&'.repeat(300), 100).endsWith('&amp;…')).toBe(true);
+    expect(out).toBe(safeMarkdown(stripped, CLEAN_DOC_MAX)); // the one pass, and it has nothing left to do
+    expect(out).toBe(stripped);
+    expect(out).not.toMatch(ESCAPED);
+    // the cap counts the output: `&` grows into ` and `, and the cut is made on that
+    const amps = cleanForDoc('&'.repeat(300), 100);
+    expect(cps(amps)).toBeLessThanOrEqual(100);
+    expect(amps).toBe(`${'and '.repeat(24)}...`);
+    expect(cleanForDoc('a'.repeat(1_000))).toBe(`${'a'.repeat(CLEAN_DOC_MAX - 4)} ...`);
+  });
+
+  it('clean: safeMarkdown is applied once and changes nothing (no backslash, no &amp;, no zero-width in the output)', () => {
+    const inputs = [
+      'npm_audit', 'a*b*c', '~~strike~~', '`code`', 'x|y', 'back\\slash', '$5 and $$x$$', 'AT&T', '&amp;', 'R &amp;amp; D', '#12 and GH-34 and gh-5',
+      'a // b ///c', 'www.example', 'see WWW . ok www', '1. step', '12) step', '3.12 is the version', '- item', '+ item', '= x', ': x', '! end!', 'wow!!',
+      'x :rocket: y :+1: z :a:b:c:', 'a~~~b', '\u201cquoted\u201d it\u2019s \u2013 dash \u2014 and\u2026', 'cafe\u0301 na\u00efve \u4e2d\u6587 \u0645\u0631\u062d\u0628\u0627',
+      '\u{1F600} emoji \u2764\ufe0f', '[^1] footnote ^ caret', '{braces} <angle> and >', 'tab\there', '\u00a0nbsp\u3000ideographic',
+    ];
+    for (const x of inputs) {
+      const out = cleanForDoc(x);
+      expect(safeMarkdown(out, CLEAN_DOC_MAX), JSON.stringify(x)).toBe(out);
+      expect(out, JSON.stringify(x)).not.toMatch(ESCAPED);
+      expect(out, JSON.stringify(x)).not.toContain('&');
+      expect(docProblems(out), JSON.stringify(x)).toEqual([]);
+    }
+    expect(cleanForDoc('\u201cquoted\u201d it\u2019s \u2013 dash and\u2026')).toBe('"quoted" it\'s - dash and...');
+    expect(cleanForDoc('cafe\u0301 x')).toBe('caf\u00e9 x'); // NFC first, so a combining mark joins its letter
+    expect(cleanForDoc('3.12 is the version')).toBe('3 .12 is the version');
+    expect(cleanForDoc('1. step')).toBe('step');
+    expect(cleanForDoc('+ item')).toBe('item');
+    expect(cleanForDoc('= - : + x')).toBe('x');
+    expect(cleanForDoc('see www\u2026 later')).toBe('see www ... later'); // the ellipsis' ASCII form can't make `www.`
+    expect(cleanForDoc('a_b')).toBe('a b');
+    // the fallback (safeMarkdown changed something, so the placeholder is written) never fires: stripForDoc's text is already inert
+    for (const x of inputs) expect(safeMarkdown(stripForDoc(x), Number.MAX_SAFE_INTEGER), JSON.stringify(x)).toBe(stripForDoc(x));
+    expect(cleanForDoc('x :rocket: y')).toBe('x : rocket: y');
   });
 
   it('clean: bidi, zero-width and control characters gone; a link split by them is still removed', () => {
@@ -152,8 +183,9 @@ describe('clean', () => {
     // a value that is not a string (a malformed answer) is empty, not the text "undefined"
     for (const v of [undefined, null, 42, {}]) expect(cleanForDoc(v as unknown as string)).toBe(CLEAN_DOC_PLACEHOLDER);
     // the placeholder obeys the cap too, and still is not empty
-    expect(cleanForDoc('', 5)).toBe('(no …');
-    expect(cleanForDoc('', 1)).toBe('…');
+    expect(cleanForDoc('', 5)).toBe('( ...');
+    expect(cleanForDoc('', 1)).toBe('.');
+    expect(docProblems(CLEAN_DOC_PLACEHOLDER)).toEqual([]);
   });
 
   it('clean: linear on long hostile input (200 KiB of nested [ ( <), and text nested past the round limit gives the placeholder', () => {
@@ -178,5 +210,65 @@ describe('clean', () => {
     expect(cleanForDoc(`keep ${'<a'.repeat(3)}${'>'.repeat(3)}`)).toBe('keep');
     expect(cleanForDoc(`keep ${'<a'.repeat(50)}${'>'.repeat(50)}`)).toBe(CLEAN_DOC_PLACEHOLDER);
     expect(stripForDoc(`keep ${'<a'.repeat(50)}${'>'.repeat(50)}`)).toBe('');
+  });
+
+  it('clean: output passes the PIPEGEN.md judge inside a list item', () => {
+    const reasons = [
+      // the six reasons of the F1 report's probe (R5)
+      'Semgrep instead of CodeQL, because it is faster', 'uses npm_audit and eslint-plugin-security', 'Trivy (fewer false positives) & faster',
+      'costs $0 and covers #12', 'see a // b', 'runs on node:20',
+      // hostile ones
+      'Use [semgrep](https://evil.example/x) <b>now</b> <img src=x onerror=alert(1)> cc @octocat', '![p](https://evil.example/p.png) **bold** _it_',
+      '<!-- c --> &lt;script&gt; javascript:alert(1) data:,x mailto:a@b.c www.evil.example //evil.example', '# Heading\n| a | b |\n> quote\n- item\n1. one',
+      'ht\u200btps://evil.example \u202eevil\u202c w\u00adww.x', '`${{ secrets.TOKEN }}` and ${{ github.token }}', ':rocket: :+1: :a_b: x:y:z',
+      '~~~ fence ~~~', '```yaml', 'a\\b\\', 'end with #', 'end with !', 'GH-12 gh-3', '[x]: https://evil.example', 'C# and F# and C++',
+      '\u0000\u001b[31mred \u0085next', 'see https://docs.github.com/en and https://github.com/acme/app', '1) first 2) second',
+    ];
+    for (const r of reasons) {
+      const out = cleanForDoc(r);
+      expect(docProblems(out), JSON.stringify(r)).toEqual([]);
+      expect(docProblems(cleanForDoc(r, 30)), JSON.stringify(r)).toEqual([]);
+    }
+    expect(cleanForDoc('uses npm_audit and eslint-plugin-security')).toBe('uses npm audit and eslint-plugin-security');
+    expect(cleanForDoc('Trivy (fewer false positives) & faster')).toBe('Trivy (fewer false positives) and faster');
+    expect(cleanForDoc('costs $0 and covers #12')).toBe('costs 0 and covers 12');
+    expect(cleanForDoc('see a // b')).toBe('see a / / b');
+  });
+
+  it('clean: seeded fuzz (5,000 hostile mixes): the output passes the PIPEGEN.md judge and safeMarkdown changes nothing', () => {
+    let seed = 0x5eed_f1;
+    const rnd = (): number => { // mulberry32
+      seed = (seed + 0x6d2b79f5) | 0;
+      let t = Math.imul(seed ^ (seed >>> 15), 1 | seed);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+    const pick = <T,>(xs: readonly T[]): T => xs[Math.floor(rnd() * xs.length)] as T;
+    const PIECES = [
+      'word', 'Semgrep', 'because', ' ', ' ', '  ', '\n', '\r\n', '\t', '.', ',', ':', ';', '!', '?', '(', ')', '/', '//', '-', '--', '+', '=', '%', '*', '**',
+      '_', '__', '~', '~~~', '`', '```', '\\', '|', '#', '##', '>', '<', '[', ']', '](', '![', '{', '}', '^', '$', '$$', '&', '&amp;', '&lt;', '&#60;',
+      '&#x3c;', '&nbsp;', '@', 'a@b.c', '@octocat', '@org/team', 'www.', 'WWW.', 'http', 'https://evil.example/x', 'javascript:', 'data:', 'mailto:',
+      '<b>', '</b>', '<!--', '-->', '<img src=x>', '<https://e.x>', '[t](https://e.x)', '![i](https://e.x/p.png)', '[r]: https://e.x', '1.', '12)',
+      '3.12', 'node:20', ':rocket:', ':', 'GH-', 'gh-1', '#1', '${{', '}}', '\u200b', '\u200d', '\u202e', '\u2066', '\u00ad', '\u2028', '\u0085',
+      '\u0000', '\u001b', '\u001b[31m', '\u0301', '\ufe0f', '\u{E0041}', '\u3164', '\u00a0', '\u3000', '\uff20', '\uff1c', '\uff0f', '\u2026',
+      '\u201c', '\u2019', '\u2014', '\u4e2d', '\u00e9', '\u0645', '\u{1F600}', '\u2764', '\ud800', '\u{10FFFF}', '0', '9', 'A', 'z',
+    ];
+    const CAPS = [1, 4, 5, 9, 30, 200, 400];
+    for (let n = 0; n < 5_000; n++) {
+      let x = '';
+      const len = 1 + Math.floor(rnd() * 40);
+      for (let k = 0; k < len; k++) x += pick(PIECES);
+      const cap = pick(CAPS);
+      const out = cleanForDoc(x, cap);
+      const why = `case ${n}: ${JSON.stringify(x)} cap ${cap} -> ${JSON.stringify(out)}`;
+      expect(out, why).not.toBe('');
+      expect(cps(out), why).toBeLessThanOrEqual(cap);
+      expect(safeMarkdown(out, cap), why).toBe(out);
+      const stripped = stripForDoc(x);
+      expect(safeMarkdown(stripped, Number.MAX_SAFE_INTEGER), why).toBe(stripped); // so the fail-closed fallback never fires
+      if (stripped !== '' && cps(stripped) <= cap) expect(out, why).toBe(stripped);
+      expect(out, why).not.toMatch(ESCAPED);
+      expect(docProblems(out), why).toEqual([]);
+    }
   });
 });
