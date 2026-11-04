@@ -261,6 +261,14 @@ describe('E8 cleanup after the proof', () => {
     expect(writes(e)).toEqual(expect.arrayContaining(['POST /actions/runs/12/cancel', 'POST /actions/runs/14/force-cancel', 'POST /actions/runs/15/force-cancel']));
     expect(res.leftovers.some((l) => /run 15 .*could not be cancelled/.test(l))).toBe(true);
     expect(res.leftovers.some((l) => /run 14\b/.test(l))).toBe(false);
+    // each leftover is on disk the moment it is found (the process may stop right after: E0b), not only at the end
+    const h = await setup({ repoId: 77_012 });
+    h.w.f.runs.push({ id: 15, status: 'in_progress' });
+    h.w.f.fail.set('POST /actions/runs/15/cancel', 500);
+    h.w.f.fail.set('POST /actions/runs/15/force-cancel', 500);
+    const onDisk: boolean[] = [];
+    await cleanupAfterProof(h.w.g.gh, h.t, h.store, h.keys, { canDeleteRepo: true, clock: instant, settleMs: 0, leftover: (l) => { onDisk.push(h.store.load()?.leftovers.includes(l) === true); } });
+    expect(onDisk).toEqual([true]);
     // the leftover is in the state file for `pipegen cleanup`
     expect(e.store.load()?.leftovers.some((l) => /run 15/.test(l))).toBe(true);
     // a cancel that a run ignores (still going after the wait) is force-cancelled before its delete
@@ -286,6 +294,7 @@ describe('E8 cleanup after the proof', () => {
     // a recorded name the list doesn't show (a list lagging behind a store) is deleted by name; its 404 is fine
     const f = await setup({ repoId: 77_008 });
     f.store.recordSecretNames(['DATABASE_URL']);
+    f.w.s.failDelete.set('DATABASE_URL', 404);   // GitHub: no such secret
     const res = await f.clean(false);
     expect(writes(f)).toContain('DELETE /actions/secrets/DATABASE_URL');
     expect(res.leftovers).toEqual([]);
@@ -361,6 +370,17 @@ describe('E8 cleanup after the proof', () => {
     expect(saved?.leftovers).toContain('removing your keys and the proof from the scratch repo: did not finish within 90 s');
     expect(saved?.leftovers.some((l) => l.includes('run 99'))).toBe(false);
     expect(saved?.cleanupDone).toBe(false);
+  });
+
+  it('cleanup: a delete GitHub answers but doesn\'t do is "not deleted"; an empty commit on another tree is refused; cleanup routes stay out of plain writes', async () => {
+    const e = await setup();
+    e.w.f.deleteIgnored = true;
+    expect(await deleteScratchRepo(e.w.g.gh, assertScratch(e.t, app()), 77_001)).toMatchObject({ deleted: false, why: expect.stringMatching(/still shows/) });
+    const s = assertScratch(e.t, app());
+    e.w.f.commitTree = 'f'.repeat(40);
+    await expect(cleanupWrite(e.w.g.gh, s, { op: 'empty-commit' })).rejects.toThrow(/doesn't say it is one/);
+    await expect(cleanupWrite(e.w.g.gh, s, { op: 'reset-default-branch', sha: 'e'.repeat(40) })).rejects.toThrow(/empty commit/);
+    await expect(guardedWrite(e.w.g.gh, s, 'DELETE /repos/{owner}/{repo}/code-scanning/analyses/{analysis_id}{?confirm_delete}', { analysis_id: 70, confirm_delete: 'true' })).rejects.toThrow(/cleanup route/);
   });
 
   it('cleanup: a repo GitHub refuses to delete is emptied instead; a second call joins the first', async () => {

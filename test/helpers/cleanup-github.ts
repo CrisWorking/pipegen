@@ -27,6 +27,10 @@ export interface CleanupFake {
   lateBranches: string[];
   /** The repo DELETE answers this status. */
   deleteStatus?: number;
+  /** The repo DELETE answers OK but the repo stays (GitHub didn't delete it). */
+  deleteIgnored?: boolean;
+  /** The tree GitHub's answer to the empty commit names (default: the tree sent). */
+  commitTree?: string;
   /** Lists answer 403. */
   unreadable: Set<'runs' | 'pulls' | 'refs' | 'caches'>;
   handler: (c: Call) => Reply | undefined;
@@ -58,7 +62,7 @@ export function cleanupFake(scratch = SCRATCH, keys?: KeysFake): CleanupFake {
     const rest = path.slice(R.length);
     if (rest === '' && c.method === 'DELETE') {
       if (f.deleteStatus !== undefined) return json(f.deleteStatus, { message: 'Must have admin rights to Repository.' });
-      f.deleted = true;
+      if (f.deleteIgnored !== true) f.deleted = true;
       return json(200, {});
     }
     if (f.deleted) return notFound();
@@ -126,7 +130,7 @@ export function cleanupFake(scratch = SCRATCH, keys?: KeysFake): CleanupFake {
     }
     if (rest === '/git/commits' && c.method === 'POST') {
       const b = JSON.parse(c.body ?? '{}') as { tree: string; parents: string[] };
-      return json(201, { sha: 'e'.repeat(40), tree: { sha: b.tree }, parents: b.parents.map((sha) => ({ sha })) });
+      return json(201, { sha: 'e'.repeat(40), tree: { sha: f.commitTree ?? b.tree }, parents: b.parents.map((sha) => ({ sha })) });
     }
     // caches, code scanning, variables
     if (rest === '/actions/caches' && c.method === 'GET') {
