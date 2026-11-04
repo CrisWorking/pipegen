@@ -488,17 +488,20 @@ describe('E5-R1: scanner mounts that Bullfrog refuses', () => {
     setGate(o, d, { result: 'block', failedJobs: [{ needId: 'sast', job: jobName }], blockReasons: [`required check semgrep (sast--api) did not succeed (failure)`] });
   };
 
-  it('a scanner job that failed because Bullfrog refused a mount is not-proven with the gate-v0.2.2 note, not pipeline failed', async () => {
+  // E9 decision (rulings E5-R1/E5-R2 withdrawn): since gate-v0.2.2 pipegen's scanner steps copy their folders in (no bind mount, E3-R7),
+  // and the proof workflow check refuses a mount before push. A refused mount on a scanner job is therefore a FAILED pipeline (a floor
+  // need, spec §19), named as a tool error (the fix loop never asks the AI about it), never not-proven and never a pass.
+  it('a scanner job that failed because Bullfrog refused a mount fails the pipeline as a tool error (E9: no longer not-proven pending gate-v0.2.2)', async () => {
     const d = D();
     const m = greenMain(d);
     refuse(m, d);
     const r = await evaluate(d, both(d, m), ctxOf());
-    expect(need(r, 'pipeline', 'sast')).toMatchObject({ status: 'not-proven' });
-    expect(need(r, 'pipeline', 'sast')?.detail).toMatch(/gate-v0\.2\.2/);
+    expect(need(r, 'pipeline', 'sast')).toMatchObject({ status: 'failed' });
+    expect(need(r, 'pipeline', 'sast')?.detail).toMatch(/tool error/);
     expect(need(r, 'pipeline', 'sast')?.detail).toMatch(/Bullfrog/);
-    expect(r.parts.filter((p) => p.status === 'failed')).toEqual([]);
-    // the proof is not complete, though: the pipeline is not proven and ok is false (a floor scanner never ran)
-    expect(part(r, 'pipeline')?.status).toBe('not-proven');
+    expect(need(r, 'pipeline', 'sast')?.detail).not.toMatch(/pending/);
+    expect(part(r, 'pipeline')?.status).toBe('failed');
+    expect(r.parts.some((p) => p.status === 'not-proven' && p.part === 'pipeline')).toBe(false);
     expect(r.ok).toBe(false);
   });
 
@@ -532,7 +535,7 @@ describe('E5-R1: scanner mounts that Bullfrog refuses', () => {
     const r = await evaluate(d, both(d, m), ctxOf());
     expect(part(r, 'pipeline')?.status).toBe('failed');
     expect(need(r, 'pipeline', 'deps')?.status).toBe('failed');
-    expect(need(r, 'pipeline', 'sast')?.status).toBe('not-proven');
+    expect(need(r, 'pipeline', 'sast')?.status).toBe('failed');   // E9: a refused mount fails too (no longer not-proven)
     // a gate block with a reason that does not come from the refused job is a real block
     const m2 = greenMain(d);
     refuse(m2, d);
@@ -545,14 +548,14 @@ describe('E5-R1: scanner mounts that Bullfrog refuses', () => {
     expect(part(await evaluate(d, both(d, m3), ctxOf()), 'pipeline')?.status).toBe('failed');
   });
 
-  it('the planted run: a refused scanner is not-proven for its planted item, not "didn\'t catch"', async () => {
+  it('the planted run: a refused scanner fails as a tool error (E9), not as "didn\'t catch"', async () => {
     const d = D();
     const planted = plantedRuns(d, { skip: (f) => f.file === 'pipegen-planted/sast.js' });
     setConclusion(planted.outcomes[0]!, 'sast--api', 'failure', MOUNT);
     const r = await evaluate(d, both(d, greenMain(d), planted), ctxOf());
-    expect(need(r, 'pipeline', 'sast')?.status).toBe('not-proven');
-    expect(need(r, 'pipeline', 'sast')?.detail).toMatch(/gate-v0\.2\.2/);
-    expect(r.parts.filter((p) => p.status === 'failed')).toEqual([]);
+    expect(need(r, 'pipeline', 'sast')?.status).toBe('failed');
+    expect(need(r, 'pipeline', 'sast')?.detail).toMatch(/tool error: .*Bullfrog/);
+    expect(r.parts.filter((p) => p.status === 'failed').every((p) => /Bullfrog/.test(p.detail ?? ''))).toBe(true);
     expect(r.ok).toBe(false);
   });
 });
@@ -899,9 +902,15 @@ describe('gate block attribution is exact (no substring matching)', () => {
     return { d, m };
   };
   const exact = 'required check semgrep (sast--api) did not succeed (failure)';
-  it('the exact reason the gate writes for the refused job is explained', async () => {
+  it('the exact reason the gate writes for the refused job is explained (by the refused job\'s own failure, E9)', async () => {
     const { d, m } = setup([exact]);
-    expect(part(await evaluate(d, both(d, m), ctxOf()), 'pipeline')?.status).toBe('not-proven');
+    const r = await evaluate(d, both(d, m), ctxOf());
+    expect(part(r, 'pipeline')?.status).toBe('failed');
+    // only the refused job's own failure: the gate's block is explained by it, not reported again as an unexplained block
+    // only the refused job's own failure (the part line repeats it): the gate's block is explained by it, never reported again
+    const failed = r.parts.filter((p) => p.part === 'pipeline' && p.status === 'failed');
+    expect(failed.length).toBeGreaterThan(0);
+    for (const p of failed) expect(p.detail).toMatch(/^sast: tool error: .*Bullfrog/);
   });
   it('a reason that only contains the job id, adds text, or is unrelated is unexplained: pipeline failed', async () => {
     for (const reasons of [[exact, 'required check semgrep (sast--api-e2e) did not succeed (failure)'], [`${exact}; also the protected file changed`], ['sast--api'], ['sast--api failed'], [exact, 'pipeline files changed or suppressions added without code-owner approval on the current commit']]) {

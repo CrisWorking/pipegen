@@ -296,16 +296,18 @@ describe('validateSpec checks every tuning value against the enum built for the 
 });
 
 describe('each option renders as ruled', () => {
-  it('semgrep extra-rules: the folder is mounted read-only beside the base rules and named with its own --config', async () => {
+  it('semgrep extra-rules: the folder is copied in beside the base rules (E9, E3-R7: no bind mount) and named with its own --config', async () => {
     const s = spec('semgrep', { 'extra-rules': ['typescript', 'dockerfile'] }, { service: 'api', workingDir: 'services/api' });
     const r = render(s);
     const st = runStep(s);
     expect(r.steps.length).toBeGreaterThan(1);
-    expect(st.run).toContain('-v "$rules/typescript:/pipegen-rules-extra/typescript:ro"');
-    expect(st.run).toContain('-v "$rules/dockerfile:/pipegen-rules-extra/dockerfile:ro"');
+    // E9 (E3-R7): copied into the container, never bind-mounted
+    expect(st.run).toContain('cp -a -- "$rules/typescript" "$extra/typescript"');
+    expect(st.run).toContain('cp -a -- "$rules/dockerfile" "$extra/dockerfile"');
+    expect(st.run).toMatch(/docker cp -a "\$extra\/\." pipegen-tool-[0-9a-f]{16}:\/pipegen-rules-extra$/m);
     expect(st.run).toContain('--config /pipegen-rules-extra/typescript');
     expect(st.run).toContain('--config /pipegen-rules-extra/dockerfile');
-    expect(st.run).toMatch(/-v "\$rules\/\$PIPEGEN_ARG_0:\/pipegen-rules:ro"/);   // the base set stays (its folder in env, as before)
+    expect(st.run).toMatch(/docker cp -a "\$rules\/\$PIPEGEN_ARG_0\/\." pipegen-tool-[0-9a-f]{16}:\/pipegen-rules$/m);   // the base set stays (its folder in env, as before)
     expect(argEnv(st)[0]).toBe('javascript');
     expect(st.run).toContain('--config /pipegen-rules');
     expect(st.run).toMatch(/pg_fail "the rules folder is missing or a link"/);

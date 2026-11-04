@@ -27,6 +27,8 @@
 // - no cache (E3-R2, clarified E3-R5: "no proof job restores a cache" means key-holding jobs): no actions/cache, no `cache*`
 //   input but its off value, setup-node with package-manager-cache "false"; and, as a lint backstop only (a script can
 //   always be written another way), no run script with a `type=gha` cache or `gh cache`.
+// - E9 (ruling E3-R7): no run script bind-mounts a host path into a container (bindMountProblem; also a lint backstop);
+// - E9 (carry E4-R4 R5): no expression reads a `vars` value other than vars.PIPEGEN_BLOCK_FROM (varsProblem; whole workflow).
 // Compat (E3-R2): no egress step (S17) and the user's own tag-pinned actions may stay (no secret, a contents: read token, its
 // own VM); `actions/cache` is still refused. A compat job may keep a setup cache: no key-holding job reads any cache.
 import type { ReviewedTool } from '../types.js';
@@ -75,6 +77,63 @@ const CACHE_OFF: Readonly<Record<string, readonly string[]>> = Object.freeze({
 /** Lint backstop (m1): a run script that reads or writes the Actions cache. */
 const RUN_CACHE_RE = /type=gha\b|\bgh\s+cache\b|\/actions\/caches\b/i;
 const EGRESS_STEP_KEYS: ReadonlySet<string> = new Set(['name', 'id', 'uses', 'with']);
+
+// ---------- E9: bind mounts (ruling E3-R7) and vars (carry E4-R4 R5) ----------
+
+/** The container command-line tools whose run/create can bind-mount a host path (by the base name of the word). */
+const CONTAINER_CLI_RE = /^(?:.*\/)?(?:docker|podman|nerdctl)$/;
+/** A `--mount` value that is not a bind mount: an explicit volume or tmpfs type (the default type is volume, but only an explicit one passes). */
+const NOT_BIND_RE = /(?:^|,)type=(?:volume|tmpfs)(?:,|$)/i;
+/**
+ * E9 (ruling E3-R7): why a run script bind-mounts a host path into a container, or null. Bullfrog with sudo off refuses those at run
+ * time, and pipegen's own steps copy folders in instead (render-cli.ts), so a mount means a script pipegen did not render. A lint read
+ * (a script can always be written another way), strict on purpose: line continuations are joined, the script is cut into simple
+ * commands at `;`, `&`, `|`, newlines, parentheses and backquotes, quotes are dropped, and after a docker/podman/nerdctl word
+ * every `-v` (alone, with its value attached, or last in a short-flag group), `--volume`, `--volumes-from`, and a `--mount` without an
+ * explicit volume or tmpfs type counts, wherever it stands (also in the container's own command).
+ */
+export function bindMountProblem(script: string): string | null {
+  const commands = script.replace(/\\\r?\n/g, ' ').split(/\|\||&&|\$\(|[;|&()`\n]/);
+  for (const c of commands) {
+    const words = c.split(/\s+/).map((w) => w.replace(/["']/g, '')).filter((w) => w !== '');
+    const at = words.findIndex((w) => CONTAINER_CLI_RE.test(w));
+    if (at < 0) continue;
+    for (let i = at + 1; i < words.length; i++) {
+      const w = words[i] as string;
+      if (/^-(?!-)[A-Za-z]*v/.test(w) || /^--(?:volume|volumes-from)(?:=|$)/.test(w)) return `a run script bind-mounts a host path into a container (${safeText(w, 40)})`;
+      const mount = /^--mount(?:=(.*))?$/.exec(w);
+      if (mount !== null) {
+        const value = mount[1] ?? words[i + 1] ?? '';
+        if (!NOT_BIND_RE.test(value)) return 'a run script bind-mounts a host path into a container (--mount without an explicit volume or tmpfs type)';
+      }
+    }
+  }
+  return null;
+}
+
+/** The expression texts of a parsed workflow: every `${{ … }}` in any key or string value, and the whole of every `if:` value. */
+function expressionsOf(v: unknown, out: string[], key = ''): void {
+  if (typeof v === 'string') {
+    if (key === 'if' && !v.includes('${{')) out.push(v);
+    for (const m of v.matchAll(/\$\{\{([\s\S]*?)\}\}/g)) out.push(m[1] as string);
+    return;
+  }
+  if (Array.isArray(v)) { for (const x of v) expressionsOf(x, out); return; }
+  if (isObj(v)) for (const [k, x] of Object.entries(v)) { expressionsOf(k, out); expressionsOf(x, out, k); }
+}
+/**
+ * Carry E4-R4 R5: the one `vars` reference a key-holding workflow may make is `vars.PIPEGEN_BLOCK_FROM` (the gate's block-from input).
+ * Organisation and repository variables are not listed or emptied by the scratch-key checks, so any other one (a name, an index, the
+ * whole context in toJSON(vars), any case) could carry a value nobody checked into a job beside the keys.
+ */
+function varsProblem(wf: Obj): string | null {
+  const exprs: string[] = [];
+  expressionsOf(wf, exprs);
+  for (const e of exprs) {
+    if (/\bvars\b/i.test(e.replace(/\bvars\s*\.\s*PIPEGEN_BLOCK_FROM\b/gi, ''))) return `it reads a variable other than vars.PIPEGEN_BLOCK_FROM (${safeText(e.trim(), 80)}); a key-holding workflow reads no other vars`;
+  }
+  return null;
+}
 
 const isWorkflowFile = (p: string): boolean => /^\.github\/workflows\/[^/]+\.ya?ml$/i.test(p);
 const usesPath = (u: string): string => (u.includes('@') ? u.slice(0, u.lastIndexOf('@')) : u).toLowerCase();
@@ -274,6 +333,8 @@ function jobProblems(id: string, job: unknown, p: Parsed, r: Reviewed, localActi
     }
     if (uses !== undefined && usesPath(uses) === 'actions/setup-node' && w['package-manager-cache'] !== 'false') out.push(at('setup-node runs without package-manager-cache: "false" (it would restore a cache)'));
     if (typeof s.run === 'string' && RUN_CACHE_RE.test(s.run)) out.push(at('a run script uses the Actions cache (type=gha or gh cache)'));
+    const bind = typeof s.run === 'string' ? bindMountProblem(s.run) : null;
+    if (bind !== null) out.push(at(`${bind}; Bullfrog refuses it with sudo off, and pipegen copies folders in instead (ruling E3-R7)`));
   }
   return { problems: out };
 }
@@ -306,6 +367,8 @@ function workflowRules(p: Parsed, r: Reviewed, localActions: ReadonlySet<string>
     if (p.text !== undefined && namesSecret(p.text)) problems.push('a compat copy names a secret other than GITHUB_TOKEN');
   }
   if (p.kind !== 'compat') {
+    const vars = varsProblem(wf);
+    if (vars !== null) problems.push(vars);
     problems.push(...envProblems(wf.env, 'the workflow'));
     const sh = shellProblem(wf.defaults, 'the workflow');
     if (sh !== null) problems.push(sh);

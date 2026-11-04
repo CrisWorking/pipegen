@@ -322,7 +322,7 @@ describe('S12: rule archives are fetched by commit and checked by tree (real git
       const r = renderSemgrep(semgrepAgainst({ commit: sg.commit, tree: sg.tree }));
       const run = runOf(r).run as string;
       expect(run).toContain('--network none');
-      expect(run).toMatch(/-v "\$rules\/\$PIPEGEN_ARG_\d+:\/pipegen-rules:ro"/);
+      expect(run).toMatch(/docker cp -a "\$rules\/\$PIPEGEN_ARG_\d+\/\." pipegen-tool-[0-9a-f]{16}:\/pipegen-rules$/m);   // E9 (E3-R7): copied in, no bind mount
       expect(run).toContain('--config /pipegen-rules');
       expect(argEnv(runOf(r))).toContain('javascript');
       expect(rulesStep(r).env?.PIPEGEN_RULES_COMMIT).toBe(sg.commit);

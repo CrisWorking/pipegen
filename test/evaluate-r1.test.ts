@@ -123,7 +123,10 @@ describe('messages and branches pinned by the mutation round', () => {
     expect(part(await evaluate(d, both(d, e), ctxOf()), 'pipeline')?.status).toBe('failed');
     const f = greenMain(d);
     refused(f, d, { toolErrors: [{ needId: 'deps', job: 'deps--api', tool: 'osv-scanner', base: false, blocks: false, reason: 'x' }] });
-    expect(part(await evaluate(d, both(d, f), ctxOf()), 'pipeline')?.status).toBe('not-proven');
+    // E9: the refused mount itself fails the pipeline now; only it, not the non-blocking tool error
+    const rf = await evaluate(d, both(d, f), ctxOf());
+    expect(part(rf, 'pipeline')?.status).toBe('failed');
+    expect(rf.parts.filter((p) => p.status === 'failed').every((p) => /Bullfrog/.test(p.detail ?? ''))).toBe(true);
   });
 
   it('a scanner log that only contains the Bullfrog line on a GREEN job is not a refusal', async () => {

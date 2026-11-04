@@ -507,6 +507,7 @@ export function renderCliTool({ spec, tool, service, ctx, hooks, options }: CliA
   let nodeMajor: string | undefined;
   let prefix: string;                  // the launcher: what comes right before the tool's own words
   let pathValue = FIXED_PATH;
+  let dockerRun: { ctr: string; copies: string[]; resultFrom: string | null } | null = null;   // E3-R7: create, copy in, start, copy out
 
   if (kind === 'github-release') {
     steps.push(releaseInstall(tool, install, exe, artifact));
@@ -516,7 +517,11 @@ export function renderCliTool({ spec, tool, service, ctx, hooks, options }: CliA
     const image = imageOf(tool, install);
     steps.push(runStep(`pipegen: pull the ${exe} image`, script([...prologue(artifact), '"${sys[@]}" /usr/bin/docker pull --quiet "$PIPEGEN_IMAGE" > /dev/null']), { PIPEGEN_IMAGE: image }, `tool-pull-${sha16(artifact)}`));
     env.PIPEGEN_IMAGE = image;
-    const docker = ['/usr/bin/docker', 'run', '--rm', '--pull=never'];
+    // E9 (ruling E3-R7): no bind mount. Bullfrog with sudo off refuses every host path a container mounts (spike S8), so the folders go
+    // in with `docker cp -a` (owner and mode kept, so the tool's user can write its result) and the result comes out with `docker cp`,
+    // which copies a link as a link (the result check refuses it). The container gets copies only: it can not touch a runner folder.
+    const ctr = `pipegen-tool-${sha16(artifact)}`;
+    const docker = ['/usr/bin/docker', 'create', '--name', ctr, '--pull=never'];
     // DAST steps (and only those) share the runner's network, because their target is the app started on it (ruling R-D); they run as their image user in a fresh, world-writable work folder
     const dast = tool.categories.some((c) => DAST_CATEGORIES.has(c));
     if ((pol.network === 'host' || pol.asImageUser === true) && !(dast && inWork)) {
@@ -528,27 +533,42 @@ export function renderCliTool({ spec, tool, service, ctx, hooks, options }: CliA
     if (pol.network === 'none') docker.push('--network', 'none');
     if (pol.network === 'host') docker.push('--network', 'host');
     const at = (mount as NonNullable<typeof mount>).at;
+    // what goes into the container (host folder → container folder), copied in before it starts
+    const copies: [string, string][] = [];
     if (inWork) {
       vars.push(`work="$RUNNER_TEMP/pipegen-work/${artifact}"`);
       prep.unshift('mkdir -p "$RUNNER_TEMP/pipegen-work"', 'mkdir "$work"');
-      docker.push('-v', `"$work:${at}"`);
-    } else docker.push('-v', `"$PWD:${at}"`);
+      copies.push(['"$work/."', at]);
+    } else copies.push(['"$PWD/."', at]);
     if (mount?.workdir === true) docker.push('-w', at);
-    if (config !== null && !inWork) docker.push('-v', '"$cfg:/pipegen-cfg:ro"');
+    if (config !== null && !inWork) copies.push(['"$cfg/."', '/pipegen-cfg']);
     if (archive !== undefined) {
-      // the verified rules folder (or its chosen sub-folder), read-only, at the path the reviewed command names
+      // the verified rules folder (or its chosen sub-folder), at the path the reviewed command names
       const sub = built.sub === undefined ? '' : `/${built.sub.slice(1, -1)}`;
       if (built.sub !== undefined) prep.push(`if [ -L "$rules"/${built.sub} ] || [ ! -d "$rules"/${built.sub} ]; then pg_fail "the rules folder is missing or a link"; fi`);
-      docker.push('-v', `"$rules${sub}:${archive.dir}:ro"`);
-      // tuning (6d): more rule folders of the same verified archive, each read-only at its own path (names are reviewed constants)
-      for (const x of tuned.extraRules) {
-        prep.push(`if [ -L "$rules"/${q(x)} ] || [ ! -d "$rules"/${q(x)} ]; then pg_fail "the rules folder is missing or a link"; fi`);
-        docker.push('-v', `"$rules/${x}:${EXTRA_RULES_AT}/${x}:ro"`);
+      copies.push([`"$rules${sub}/."`, archive.dir]);
+      // tuning (6d): more rule folders of the same verified archive, each at its own path (names are reviewed constants). docker cp makes
+      // only the last folder of a path, so they are put together in one fresh folder on the runner first and copied in as one.
+      if (tuned.extraRules.length > 0) {
+        vars.push(`extra="$RUNNER_TEMP/pipegen-rules-extra/${artifact}"`);
+        prep.push('mkdir -p "$RUNNER_TEMP/pipegen-rules-extra"', 'mkdir "$extra"');
+        for (const x of tuned.extraRules) {
+          prep.push(`if [ -L "$rules"/${q(x)} ] || [ ! -d "$rules"/${q(x)} ]; then pg_fail "the rules folder is missing or a link"; fi`);
+          prep.push(`cp -a -- "$rules/${x}" "$extra/${x}"`);
+        }
+        copies.push(['"$extra/."', EXTRA_RULES_AT]);
       }
     }
     for (const n of secrets) docker.push('-e', n);
     docker.push('"$PIPEGEN_IMAGE"', q(exe));
     prefix = docker.join(' ');
+    // the result comes from the folder the tool wrote it in: the work folder, or the copied service folder it runs in (-w)
+    if (out !== null && !inWork && mount?.workdir !== true) return refuse(`${show(tool.id)} writes a result but runs in no folder pipegen copied in, so its result could not be copied out.`);
+    dockerRun = {
+      ctr,
+      copies: copies.map(([from, to]) => `"\${sys[@]}" /usr/bin/docker cp -a ${from} ${ctr}:${to}`),
+      resultFrom: out === null ? null : `${at}/${out}`,
+    };
   } else if (kind === 'npm') {
     const bin = pol.npmBin;
     if (bin === undefined || !/^[A-Za-z0-9_.-]+(?:\/[A-Za-z0-9_.-]+)*$/.test(bin) || bin.includes('..')) return refuse(`${show(tool.id)} has no reviewed bin file, so pipegen won't run it.`);
@@ -709,7 +729,21 @@ export function renderCliTool({ spec, tool, service, ctx, hooks, options }: CliA
   if (fl !== undefined && (built.then.length > 0 || out !== null || staged !== undefined)) return refuse(`${show(tool.id)} lints a file list, which only a single command without a result file can.`);
   let listLines: string[];
   try { listLines = fl === undefined ? [] : [`list="$RUNNER_TEMP/pipegen-files/${artifact}"`, 'mkdir -p "$RUNNER_TEMP/pipegen-files"', 'rm -f -- "$list"', ...fileListLines(fl.extensions, '"$list"')]; } catch { return refuse(`The file list of ${show(tool.id)} is not a list of plain extensions.`); }
-  const runLines = fl === undefined ? [`${chain} || rc=$?`] : fileListRun(launch(built.main), '"$list"');
+  let runLines: string[];
+  if (dockerRun !== null) {
+    // E3-R7: the container is created (the tool's words are its command), filled with copies, started attached, and its result copied
+    // out to "$out" (a missing one fails the result check below); then removed. A leftover of the same name (a re-run) goes first.
+    if (built.then.length > 0 || fl !== undefined) return refuse(`${show(tool.id)} is a docker entry with follow-up commands or a file list, which pipegen does not run in a container.`);
+    const { ctr } = dockerRun;
+    runLines = [
+      `"\${sys[@]}" /usr/bin/docker rm -f ${ctr} > /dev/null 2>&1 || true`,
+      `${launch(built.main)} > /dev/null`,
+      ...dockerRun.copies,
+      `"\${pg_env[@]}" /usr/bin/docker start -a ${ctr} || rc=$?`,
+      ...(dockerRun.resultFrom === null ? [] : [`"\${sys[@]}" /usr/bin/docker cp ${ctr}:${dockerRun.resultFrom} "$out" > /dev/null 2>&1 || true`]),
+      `"\${sys[@]}" /usr/bin/docker rm -f ${ctr} > /dev/null 2>&1 || true`,
+    ];
+  } else runLines = fl === undefined ? [`${chain} || rc=$?`] : fileListRun(launch(built.main), '"$list"');
   const run = script([
     ...prologue(artifact, nodeMajor === undefined ? {} : { nodeMajor }), ...tuneComments, ...vars, ...installLines, ...cdLines(spec.workingDir), ...pathChecks, ...prep, ...cfgLines, ...scopeLines, ...stageLines, ...preCheck,
     ...closureVars, ...allowlist(pathValue, passed, constants, dynamicEnv), ...afterAllow, ...listLines, 'rc=0', ...runLines, ...postCheck, 'exit "$rc"',

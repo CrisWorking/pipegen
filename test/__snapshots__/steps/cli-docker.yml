@@ -49,7 +49,12 @@
       "TMPDIR=$RUNNER_TEMP"
     )
     rc=0
-    "${pg_env[@]}" /usr/bin/docker run --rm --pull=never --security-opt no-new-privileges --cap-drop ALL --network host -v "$work:/zap/wrk" "$PIPEGEN_IMAGE" zap-baseline.py -c zap-baseline.conf -J zap.json -z -silent || rc=$?
+    "${sys[@]}" /usr/bin/docker rm -f pipegen-tool-5ca176964f22c29a > /dev/null 2>&1 || true
+    "${pg_env[@]}" /usr/bin/docker create --name pipegen-tool-5ca176964f22c29a --pull=never --security-opt no-new-privileges --cap-drop ALL --network host "$PIPEGEN_IMAGE" zap-baseline.py -c zap-baseline.conf -J zap.json -z -silent > /dev/null
+    "${sys[@]}" /usr/bin/docker cp -a "$work/." pipegen-tool-5ca176964f22c29a:/zap/wrk
+    "${pg_env[@]}" /usr/bin/docker start -a pipegen-tool-5ca176964f22c29a || rc=$?
+    "${sys[@]}" /usr/bin/docker cp pipegen-tool-5ca176964f22c29a:/zap/wrk/zap.json "$out" > /dev/null 2>&1 || true
+    "${sys[@]}" /usr/bin/docker rm -f pipegen-tool-5ca176964f22c29a > /dev/null 2>&1 || true
     case "$rc" in 0|1|2) ;; *)
       rm -rf -- "$out"
       echo "pipegen: the tool exited with $rc, so its result is not used" >&2

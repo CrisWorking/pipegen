@@ -44,7 +44,7 @@ describe('semgrep scope (ruling 6)', () => {
     expect(block.length).toBeGreaterThan(2);
     expect(block.join('\n')).toContain('-name .semgrepignore');
     expect(block.join('\n')).toContain("printf '%s\\n' node_modules > .semgrepignore");
-    expect(run.indexOf(BEGIN)).toBeLessThan(run.indexOf('/usr/bin/docker run'));
+    expect(run.indexOf(BEGIN)).toBeLessThan(run.indexOf('/usr/bin/docker cp -a'));   // E9 (E3-R7): the scope file is written before the folder is copied in
     expect(run).not.toContain('--no-git-ignore');
     for (const t of reviewedList()) {
       if (t.id === 'semgrep' || t.step.cli === undefined || ARGV_POLICIES[t.id] === undefined) continue;

@@ -10,6 +10,7 @@ sys=(
   "HOME=$home"
 )
 # tuning: also runs the Semgrep rule sets typescript, dockerfile (adds coverage)
+extra="$RUNNER_TEMP/pipegen-rules-extra/pipegen-out-sast--api"
 rules="$RUNNER_TEMP/pipegen-rules/pipegen-out-sast--api"
 for d in services services/api; do
   if [ -L "$d" ] || [ ! -d "$d" ]; then pg_fail "the folder $d is not a real folder inside the repository"; fi
@@ -18,8 +19,12 @@ cd -- ./services/api
 ws="$(cd "$GITHUB_WORKSPACE" && pwd -P)"
 case "$(pwd -P)" in "$ws"/*) ;; *) pg_fail "the working folder is outside the repository" ;; esac
 if [ -L "$rules"/"$PIPEGEN_ARG_0" ] || [ ! -d "$rules"/"$PIPEGEN_ARG_0" ]; then pg_fail "the rules folder is missing or a link"; fi
+mkdir -p "$RUNNER_TEMP/pipegen-rules-extra"
+mkdir "$extra"
 if [ -L "$rules"/typescript ] || [ ! -d "$rules"/typescript ]; then pg_fail "the rules folder is missing or a link"; fi
+cp -a -- "$rules/typescript" "$extra/typescript"
 if [ -L "$rules"/dockerfile ] || [ ! -d "$rules"/dockerfile ]; then pg_fail "the rules folder is missing or a link"; fi
+cp -a -- "$rules/dockerfile" "$extra/dockerfile"
 # pipegen scope: begin
 if [ -d .semgrepignore ] && [ ! -L .semgrepignore ]; then pg_fail "the repository has a folder named .semgrepignore at the scan root, so pipegen can not write its own scope file there"; fi
 "${sys[@]}" find . -name .semgrepignore \( -type f -o -type l \) -delete
@@ -41,18 +46,21 @@ pg_env=(
   "PIPEGEN_ARG_0=$PIPEGEN_ARG_0"
 )
 rc=0
-"${pg_env[@]}" /usr/bin/docker run --rm --pull=never --user "$(id -u):$(id -g)" \
+"${sys[@]}" /usr/bin/docker rm -f pipegen-tool-30d95ff23a1b61aa > /dev/null 2>&1 || true
+"${pg_env[@]}" /usr/bin/docker create --name pipegen-tool-30d95ff23a1b61aa --pull=never --user "$(id -u):$(id -g)" \
     --security-opt no-new-privileges --cap-drop ALL \
-    --network none \
-    -v "<cwd>:/src" -w /src \
-    -v "$rules/$PIPEGEN_ARG_0:/pipegen-rules:ro" \
-    -v "$rules/typescript:/pipegen-rules-extra/typescript:ro" \
-    -v "$rules/dockerfile:/pipegen-rules-extra/dockerfile:ro" "$PIPEGEN_IMAGE" semgrep scan \
+    --network none -w /src "$PIPEGEN_IMAGE" semgrep scan \
     --config /pipegen-rules-extra/typescript \
     --config /pipegen-rules-extra/dockerfile \
     --metrics=off --disable-version-check --max-target-bytes=0 \
     --config /pipegen-rules \
-    --sarif --output semgrep.sarif || rc=$?
+    --sarif --output semgrep.sarif > /dev/null
+"${sys[@]}" /usr/bin/docker cp -a "<cwd>/." pipegen-tool-30d95ff23a1b61aa:/src
+"${sys[@]}" /usr/bin/docker cp -a "$rules/$PIPEGEN_ARG_0/." pipegen-tool-30d95ff23a1b61aa:/pipegen-rules
+"${sys[@]}" /usr/bin/docker cp -a "$extra/." pipegen-tool-30d95ff23a1b61aa:/pipegen-rules-extra
+"${pg_env[@]}" /usr/bin/docker start -a pipegen-tool-30d95ff23a1b61aa || rc=$?
+"${sys[@]}" /usr/bin/docker cp pipegen-tool-30d95ff23a1b61aa:/src/semgrep.sarif "$out" > /dev/null 2>&1 || true
+"${sys[@]}" /usr/bin/docker rm -f pipegen-tool-30d95ff23a1b61aa > /dev/null 2>&1 || true
 case "$rc" in 0) ;; *)
   rm -rf -- "$out"
   echo "pipegen: the tool exited with $rc, so its result is not used" >&2

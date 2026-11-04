@@ -23,8 +23,8 @@
 //   deploy-verify  the harness verify-lookup on the push run of the MERGE commit, and sign-roundtrip when it was rendered.
 // Not-proven (a failing part's logs name a missing secret, an external host refused the placeholder key, an external host can't
 // be reached) never applies to a part that covers a floor need (spec §19): that is failed. One exception is a ruling, not a log
-// reading: a scanner job that failed because Bullfrog refused its bind mount (E3-R7) is not-proven pending gate-v0.2.2 (E5-R1),
-// and it keeps the pipeline from being proven (ok is false), so it is never a pass either.
+// reading, withdrawn in E9: a scanner job that failed because Bullfrog refused its bind mount (E3-R7) was not-proven pending
+// gate-v0.2.2 (E5-R1, E5-R2). gate-v0.2.2's scanner steps mount nothing, so that signature now FAILS the pipeline (BULLFROG_MOUNT_FAIL).
 import type { Octokit } from '@octokit/rest';
 import { coverageNotes, measuredLines, type CoverageDecision } from '../create/coverage.js';
 import { sameResults, type TestCaseResult } from '../create/junit.js';
@@ -109,7 +109,13 @@ export const NEEDS_REAL_KEY = 'needs your real test key';
 export const HARNESS_JOB_PREFIX = 'pipegen proof: ';
 /** The Bullfrog refusal of a bind mount (spike S8: the Docker daemon's own line while sudo is disabled). */
 export const BULLFROG_MOUNT_RE = /Error response from daemon: bullfrog: mounting the host path [^\r\n]{1,300} is not allowed while sudo is disabled/;
-export const E5_R1_NOTE = "its scanner step's bind mount was refused by Bullfrog (egress control with sudo off); pending gate-v0.2.2 (scanner steps without bind mounts), so it is not proven yet";
+/**
+ * E9 decision (rulings E5-R1 and E5-R2 withdrawn): since gate-v0.2.2 pipegen's scanner steps copy their folders in with docker cp (no
+ * bind mount, ruling E3-R7) and the proof workflow check refuses a mount before push, so a refused mount on a scanner job is a step
+ * pipegen did not render. It FAILS the pipeline (a floor need, spec §19), worded as a tool error so the fix loop classifies it locally
+ * (fix.ts classifyFailure: 'tool-error') and never asks the AI; it is never not-proven and never a pass.
+ */
+export const BULLFROG_MOUNT_FAIL = "tool error: its scanner job's container bind mount was refused by Bullfrog (egress control with sudo off); pipegen's scanner steps copy their folders in and never mount one, so this job runs a step pipegen did not render";
 /** A step that read an empty secret (shared with E7's classifier, fix.ts). */
 export const EMPTY_SECRET_RE = /Input required and not supplied|secret.*(?:empty|not set)/i;
 /** An external host refused a key (shared with E7's classifier, fix.ts). */
@@ -370,7 +376,7 @@ async function evaluateInner(draft: PipelineDraft, runs: readonly VariantRuns[],
     return out;
   };
   const refusedNote = (needId: string, hits: readonly Hit[]): void => {
-    sheet.notProven('pipeline', `${st(needId, 60)}: ${E5_R1_NOTE}`, { needId, caps: true, url: hits[0]?.run.handle.url });
+    sheet.fail('pipeline', `${st(needId, 60)}: ${BULLFROG_MOUNT_FAIL}`, needId, hits[0]?.run.handle.url);
     sheet.evidenceOf(`pipeline:${needId}`, hits);
   };
 

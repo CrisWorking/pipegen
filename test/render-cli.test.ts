@@ -122,16 +122,17 @@ describe('6b: github-release (S27)', () => {
 });
 
 describe('6b: docker (S26)', () => {
-  it('docker: the image is pulled by digest from env; run with --rm, the caller\'s uid, the policy mount, and none of the dangerous options', () => {
+  it('docker: the image is pulled by digest from env; created with the caller\'s uid and the policy folder copied in (E9, E3-R7: no bind mount), and none of the dangerous options', () => {
     const t = entry('zap-baseline');
     const r = renderStepWith(spec(t), t, platform(), ctx, PLAIN_ZAP);
     expect(r.steps[0]?.env?.PIPEGEN_IMAGE).toBe(`zaproxy/zap-stable@${t.candidate.pin.digest}`);
     const run = lastRun(r);
-    expect(run).toContain('/usr/bin/docker run --rm');
+    expect(run).toContain('/usr/bin/docker create --name pipegen-tool-');
+    expect(run).toContain('/usr/bin/docker start -a pipegen-tool-');
     expect(run).toContain('--user "$(id -u):$(id -g)"');
     expect(run).toContain('--pull=never');
     expect(run).toContain('/zap/wrk');
-    for (const bad of ['--privileged', 'docker.sock', '--network host', '--network=host', '--pid host', '--pid=host', '--cap-add', '--device', '--ipc', '--volumes-from', '--mount']) expect(run, bad).not.toContain(bad);
+    for (const bad of ['--privileged', 'docker.sock', '--network host', '--network=host', '--pid host', '--pid=host', '--cap-add', '--device', '--ipc', '--volumes-from', '--mount', ' -v ', '--volume']) expect(run, bad).not.toContain(bad);
     expect(run).toContain('"$PIPEGEN_IMAGE"');
   });
 
@@ -151,7 +152,7 @@ describe('6b: docker (S26)', () => {
     const r = renderStepWith(spec(t), t, platform(), ctx, withPolicy('zap-baseline', ['slots', 'asImageUser'], { network: 'none', mount: { at: '/src', source: 'repo', workdir: true } }));
     expect(lastRun(r)).toContain('--network none');
     expect(lastRun(r)).toContain('-w /src');
-    expect(lastRun(r)).toContain(`-v "$${'P'}WD${':'}/src"`);
+    expect(lastRun(r)).toMatch(/docker cp -a "\$PWD\/\." pipegen-tool-[0-9a-f]{16}:\/src$/m);   // E9 (E3-R7)
   });
 
   it('docker: semgrep renders with its rules archive (6c); registry is a job service, not a step', () => {
@@ -525,7 +526,7 @@ describe('6b: outputs (S7)', () => {
     const r = render('zap-baseline', {}, ctx, PLAIN_ZAP);
     const run = lastRun(r);
     expect(run).toContain('work="$RUNNER_TEMP/pipegen-work/pipegen-out-dast"');
-    expect(run).toContain('-v "$work:/zap/wrk"');
+    expect(run).toMatch(/docker cp -a "\$work\/\." pipegen-tool-[0-9a-f]{16}:\/zap\/wrk$/m);   // E9 (E3-R7): copied in, no bind mount
     expect(run).toContain('out="$work/zap.json"');
     expect(run).toContain("printf '%s' \"$PIPEGEN_CONFIG\" > \"$work/zap-baseline.conf\"");
     expect(run).toContain('-c zap-baseline.conf');

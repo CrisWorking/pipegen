@@ -41,16 +41,20 @@ pg_env=(
   "PIPEGEN_ARG_2=$PIPEGEN_ARG_2"
 )
 rc=0
-"${pg_env[@]}" /usr/bin/docker run --rm --pull=never --user "$(id -u):$(id -g)" \
+"${sys[@]}" /usr/bin/docker rm -f pipegen-tool-30d95ff23a1b61aa > /dev/null 2>&1 || true
+"${pg_env[@]}" /usr/bin/docker create --name pipegen-tool-30d95ff23a1b61aa --pull=never --user "$(id -u):$(id -g)" \
     --security-opt no-new-privileges --cap-drop ALL \
-    --network none \
-    -v "<cwd>:/src" -w /src \
-    -v "$rules/$PIPEGEN_ARG_2:/pipegen-rules:ro" "$PIPEGEN_IMAGE" semgrep scan \
+    --network none -w /src "$PIPEGEN_IMAGE" semgrep scan \
     --exclude "$PIPEGEN_ARG_0" \
     --exclude "$PIPEGEN_ARG_1" \
     --metrics=off --disable-version-check --max-target-bytes=0 \
     --config /pipegen-rules \
-    --sarif --output semgrep.sarif || rc=$?
+    --sarif --output semgrep.sarif > /dev/null
+"${sys[@]}" /usr/bin/docker cp -a "<cwd>/." pipegen-tool-30d95ff23a1b61aa:/src
+"${sys[@]}" /usr/bin/docker cp -a "$rules/$PIPEGEN_ARG_2/." pipegen-tool-30d95ff23a1b61aa:/pipegen-rules
+"${pg_env[@]}" /usr/bin/docker start -a pipegen-tool-30d95ff23a1b61aa || rc=$?
+"${sys[@]}" /usr/bin/docker cp pipegen-tool-30d95ff23a1b61aa:/src/semgrep.sarif "$out" > /dev/null 2>&1 || true
+"${sys[@]}" /usr/bin/docker rm -f pipegen-tool-30d95ff23a1b61aa > /dev/null 2>&1 || true
 case "$rc" in 0) ;; *)
   rm -rf -- "$out"
   echo "pipegen: the tool exited with $rc, so its result is not used" >&2

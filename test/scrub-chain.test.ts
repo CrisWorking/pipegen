@@ -444,16 +444,19 @@ describe('ArgvPolicy.findingsExit (ruling B2)', () => {
   });
 });
 
-/** A stand-in for /usr/bin/docker: finds the host folder mounted at the container's /src or /zap/wrk, writes the result there and exits with the given code. */
-function fakeDocker(sb: Sandbox, file: string, code: number, writeResult = true): string {
+/**
+ * A stand-in for /usr/bin/docker (E9, E3-R7: create, copy in, start, copy out; no bind mount): `start` exits with the given code, and
+ * `cp <ctr>:<path> <dest>` (the copy-out of the result) writes the result there when the tool "wrote" one, else fails like a missing file.
+ */
+function fakeDocker(sb: Sandbox, _file: string, code: number, writeResult = true): string {
   const path = join(sb.dir, 'docker-stub');
   writeFileSync(path, [
-    '#!/bin/sh', 'host=""', 'prev=""',
-    'for a in "$@"; do',
-    '  if [ "$prev" = "-v" ]; then case "$a" in *:/src|*:/zap/wrk) host="${a%%:*}" ;; esac; fi',
-    '  prev="$a"', 'done',
-    writeResult ? `[ -z "$host" ] || echo '{"runs":[]}' > "$host/${file}"` : 'true',
-    `exit ${code}`, '',
+    '#!/bin/sh',
+    'case "$1" in',
+    `  start) exit ${code} ;;`,
+    `  cp) if [ "$2" = "-a" ]; then exit 0; fi; ${writeResult ? `echo '{"runs":[]}' > "$3"; exit 0` : 'exit 1'} ;;`,
+    'esac',
+    'exit 0', '',
   ].join('\n'));
   chmodSync(path, 0o755);
   return path;

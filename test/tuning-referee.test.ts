@@ -97,11 +97,11 @@ describe('referee: tampering with one tuned value in the file is a template issu
     expect(has(r, 'template'), show(r)).toBe(true);
   });
   it('an extra rule folder dropped from the mounts', async () => {
-    const r = await tamper(0, ' -v "$rules/dockerfile:/pipegen-rules-extra/dockerfile:ro"', '');
+    const r = await tamper(0, /\n\s*cp -a -- "\$rules\/dockerfile" "\$extra\/dockerfile"/, '');
     expect(has(r, 'template') || has(r, 'unreviewed'), show(r)).toBe(true);
   });
   it('an extra rule folder added that the draft never picked', async () => {
-    const r = await tamper(0, 'dockerfile:/pipegen-rules-extra/dockerfile:ro', 'dockerfile:/pipegen-rules-extra/dockerfile:rw');
+    const r = await tamper(0, '"$extra/dockerfile"', '"$extra/dockerfile2"');
     expect(has(r, 'template'), show(r)).toBe(true);
   });
   it('the semgrep scope block removed (the repo\'s .semgrepignore and semgrep\'s defaults would decide the scope again)', async () => {
