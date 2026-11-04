@@ -7,7 +7,7 @@
 // - usage summed over `usage.iterations` (the per-attempt source of truth when a fallback model ran).
 import Anthropic from '@anthropic-ai/sdk';
 import { betaJSONSchemaOutputFormat } from '@anthropic-ai/sdk/helpers/beta/json-schema';
-import { DEFAULT_MODEL, type AiProvider, type AiRequest, type AiUsage } from '../types.js';
+import { DEFAULT_MODEL, type AiProvider, type AiRequest, type AiTokenCounts, type AiUsage, type AiUsageAttempt } from '../types.js';
 import { fallbackEnabled } from '../util/claude-fallback.js';
 import { safeText } from '../util/safe-text.js';
 import { AiError, count, outputLimit, safeCode, withTimeout } from './errors.js';
@@ -79,19 +79,25 @@ const toUsage = (u: TokenCounts | null | undefined): AiUsage => ({
  * non-empty list, every entry is summed: `message` and `fallback_message` (each model that ran), and also
  * `compaction` and `advisor_message` (pipegen never turns those on, but the SDK types say their tokens are not in
  * the top-level fields, so they are billed on top). Otherwise the top-level fields are used.
+ * Plan E S22: with iterations, `attempts` lists each run with the model it names (`model`, the requested one, when it
+ * names none), so the report prices a fallback run at its own model; the cost cap keeps pricing the sum at ceiling rates.
  */
-export function usageOf(msg: { usage?: (TokenCounts & { iterations?: TokenCounts[] | null }) | null }): AiUsage {
+export function usageOf(msg: { usage?: (TokenCounts & { iterations?: (TokenCounts & { model?: unknown })[] | null }) | null }, model: string): AiUsage {
   const its = msg.usage?.iterations;
   if (!Array.isArray(its) || its.length === 0) return toUsage(msg.usage);
-  const total: Required<AiUsage> = { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0 };
+  const total: AiTokenCounts = { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0 };
+  const attempts: AiUsageAttempt[] = [];
   for (const it of its) {
     const x = toUsage(it);
     total.inputTokens += x.inputTokens;
     total.outputTokens += x.outputTokens;
     total.cacheReadTokens += x.cacheReadTokens ?? 0;
     total.cacheWriteTokens += x.cacheWriteTokens ?? 0;
+    // S22: each run at the model the API names (an entry without one ran on the requested model); for the report only
+    const named = typeof it?.model === 'string' && it.model !== '' ? safeText(it.model, 100) : '';
+    attempts.push({ model: named === '' ? model : named, input: x.inputTokens, output: x.outputTokens, cacheRead: x.cacheReadTokens ?? 0, cacheWrite: x.cacheWriteTokens ?? 0 });
   }
-  return total;
+  return { ...total, attempts };
 }
 
 /** The answer text: text blocks after the last fallback block (a declined model's partial output is dropped). */
@@ -176,7 +182,7 @@ export function claudeProvider(opts: ClaudeOptions): AiProvider {
         }
       });
 
-      const usage = usageOf(msg);
+      const usage = usageOf(msg, model);
       switch (msg.stop_reason) {
         case 'end_turn':
         case 'stop_sequence':

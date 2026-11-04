@@ -22,8 +22,10 @@
 // GitHub Actions enabled there?" (S13 backstop). Then each run is polled (backoff 15 s → 60 s) until it completes, the time
 // cap passes (cancelled, timed_out), shouldStop() says so (cancelled, returned; then runs of the proof's commits that
 // started late are found and cancelled for STOP_SWEEP_MS, fix round 1 M7), or a stop has begun (returned at once; E8's
-// cleanup cancels). A finished run's jobs are read with filter=all (re-run attempts too), its conclusion mapped (S13), its
-// result artifacts downloaded and the logs of the latest attempt's failed jobs and of the coverage job fetched (S2, S11).
+// cleanup cancels). Every cancel is cancelRuns: a run still going FORCE_CANCEL_AFTER_MS after its cancel is
+// force-cancelled (S12, E6). shouldStop may be async: E6's minutesStop (src/proof/minutes.ts) is the minutes cap.
+// A finished run's jobs are read with filter=all (re-run attempts too), its conclusion mapped (S13), its result artifacts
+// downloaded and the logs of the latest attempt's failed jobs and of the coverage job fetched (S2, S11).
 // Every write is guardedWrite; the PR create, merge and the pushes are tracked writes (inflight.ts).
 import type { Octokit } from '@octokit/rest';
 import { isRateStop, type RateClock } from '../engine/github-rate.js';
@@ -79,8 +81,11 @@ export interface WaitOptions {
   /** The most a wait may take (each wait: the push runs, the PR runs, the merge runs). */
   timeoutMs: number;
   onTick?: (status: string) => void;
-  /** Checked before every poll: true → the runs still going are cancelled and the outcomes returned (the minutes cap). */
-  shouldStop?: () => boolean;
+  /**
+   * Checked before every poll: true → the runs still going are cancelled and the outcomes returned (the minutes cap; E6's
+   * minutesStop reads the minutes used, so it may be async).
+   */
+  shouldStop?: () => boolean | Promise<boolean>;
   clock?: PollClock;
   rateClock?: RateClock;
   download?: DownloadDeps;
@@ -127,6 +132,8 @@ export const START_POLL_MS = 10_000;
 /** After shouldStop (M7): how long pipegen keeps looking for runs of the proof's commits that started late, and how often. */
 export const STOP_SWEEP_MS = 30_000;
 export const STOP_SWEEP_STEP_MS = 10_000;
+/** S12 (E6): a run still going this long after its cancel is force-cancelled. */
+export const FORCE_CANCEL_AFTER_MS = 30_000;
 /** Runs one query may list, and jobs one run may have (5 pages). */
 const MAX_RUNS_LISTED = 100;
 const JOB_PAGES = 5;
@@ -358,7 +365,7 @@ async function awaitStart(gh: Octokit, t: ProofTarget, q: RunQuery, opts: WaitOp
   const start = clock.now();
   let found: RunHandle[] = [];
   for (;;) {
-    if (interrupting() || opts.shouldStop?.() === true) return { handles: found, missing: [], stopped: true };
+    if (interrupting() || (await opts.shouldStop?.()) === true) return { handles: found, missing: [], stopped: true };
     found = await findRuns(gh, t, q, rate);
     const missing = q.workflows.filter((w) => !found.some((h) => h.workflow === w));
     if (missing.length === 0) return { handles: found, missing, stopped: false };
@@ -394,6 +401,59 @@ async function readJobs(gh: Octokit, s: GuardedRepo, runId: number, clock: RateC
   return `run ${runId} has more jobs than pipegen reads`;
 }
 
+/**
+ * S12 (E6): cancels runs of the scratch repo (POST …/cancel, each through guardedWrite), then, FORCE_CANCEL_AFTER_MS later,
+ * force-cancels (POST …/force-cancel) every one GitHub still shows as not completed. A cancel GitHub answers 409 means the
+ * run had already finished. Returns, per run id, null when the run is stopped (or finished) and else why pipegen couldn't
+ * stop it ('stopping' when a stop has begun: E8's cleanup cancels then). A run whose force-cancel fails is a leftover.
+ */
+export async function cancelRuns(gh: Octokit, t: ProofTarget, runIds: readonly number[], opts: { clock?: PollClock; rateClock?: RateClock; leftover?: (item: string) => void } = {}): Promise<Map<number, string | null>> {
+  checkTarget(t);
+  const s = scratchOf(t);
+  const clock = opts.clock ?? realClock;
+  const rate = opts.rateClock ?? clockOf(gh);
+  const out = new Map<number, string | null>();
+  const sent: number[] = [];
+  const write = (id: number, what: 'cancel' | 'force-cancel') => guardedWrite(gh, s, `POST /repos/{owner}/{repo}/actions/runs/{run_id}/${what}`, { run_id: id }, rate);
+  for (const id of runIds) {
+    if (!posInt(id)) throw new ScratchGuardError('a run id to cancel is not a whole number above 0.');
+    if (out.has(id)) continue;
+    try {
+      await write(id, 'cancel');
+      out.set(id, null);
+    } catch (e) {
+      if (isRateStop(e)) throw e;
+      if (e instanceof ScratchGuardError) { out.set(id, 'stopping'); continue; }
+      if ((e as { status?: unknown } | null)?.status === 409) { out.set(id, null); continue; }   // already finished
+      out.set(id, said(e));
+    }
+    sent.push(id);   // a cancel that failed is followed by the force-cancel too
+  }
+  if (sent.length === 0) return out;
+  await clock.sleep(FORCE_CANCEL_AFTER_MS);
+  if (interrupting()) return out;   // E8's cleanup cancels from here
+  for (const id of sent) {
+    let d: unknown = null;
+    try {
+      d = (await githubRead(gh, 'GET /repos/{owner}/{repo}/actions/runs/{run_id}', { owner: s.owner, repo: s.repo, run_id: id }, rate)).data;
+    } catch (e) {
+      hard(gh, e);   // an answer pipegen can't read: force-cancel to be safe
+    }
+    if (isPlain(d) && d.id === id && d.status === 'completed') { out.set(id, null); continue; }
+    try {
+      await write(id, 'force-cancel');
+      out.set(id, null);
+    } catch (e) {
+      if (isRateStop(e)) throw e;
+      if ((e as { status?: unknown } | null)?.status === 409) { out.set(id, null); continue; }
+      const why = e instanceof ScratchGuardError ? 'stopping' : said(e);
+      out.set(id, why);
+      if (why !== 'stopping') opts.leftover?.(`run ${id} of ${s.fullName} could not be cancelled (${why}); cancel it there`);
+    }
+  }
+  return out;
+}
+
 interface Pending { h: RunHandle; attempt: number }
 
 /**
@@ -414,15 +474,10 @@ export async function waitForRuns(gh: Octokit, t: ProofTarget, hs: readonly RunH
   const empty = (p: Pending, conclusion: RunConclusion, note: string): RunOutcome =>
     ({ handle: p.h, conclusion, note, stopped: true, attempt: p.attempt, jobs: [], artifacts: new Map(), artifactProblems: new Map() });
   const cancelAll = async (why: string, conclusion: RunConclusion): Promise<void> => {
+    const problems = await cancelRuns(gh, t, pending.map((p) => p.h.runId), { clock, rateClock: rate, ...(opts.leftover === undefined ? {} : { leftover: opts.leftover }) });
     for (const p of pending) {
-      let note = why;
-      try {
-        await guardedWrite(gh, s, 'POST /repos/{owner}/{repo}/actions/runs/{run_id}/cancel', { run_id: p.h.runId }, rate);
-      } catch (e) {
-        if (isRateStop(e)) throw e;
-        note = `${why}; pipegen couldn't cancel it (${e instanceof ScratchGuardError ? 'stopping' : said(e)})`;
-      }
-      done.set(p.h, empty(p, conclusion, note));
+      const problem = problems.get(p.h.runId) ?? null;
+      done.set(p.h, empty(p, conclusion, problem === null ? why : `${why}; pipegen couldn't cancel it (${problem})`));
     }
     pending = [];
   };
@@ -432,7 +487,7 @@ export async function waitForRuns(gh: Octokit, t: ProofTarget, hs: readonly RunH
       pending = [];
       break;
     }
-    if (opts.shouldStop?.() === true) {
+    if ((await opts.shouldStop?.()) === true) {
       await cancelAll('stopped by pipegen before it finished (cancelled)', 'cancelled');
       break;
     }
@@ -575,7 +630,8 @@ export async function proveVariant(gh: Octokit, t: ProofTarget, v: { branch: Pro
   const queries: RunQuery[] = [];
   let fired = false;
   const user = opts.shouldStop;
-  const w: WaitOptions = { ...opts, ...(user === undefined ? {} : { shouldStop: () => { const r = user() === true; if (r) fired = true; return r; } }) };
+  // a run its wait couldn't cancel is this variant's leftover too (E6: cancelRuns reports a failed force-cancel)
+  const w: WaitOptions = { ...opts, leftover: left, ...(user === undefined ? {} : { shouldStop: async () => { const r = (await user()) === true; if (r) fired = true; return r; } }) };
   const stopped = async (): Promise<VariantProof> => {
     if (fired && !interrupting()) await sweepCancel(gh, t, queries, opts, into, left);
     return into;

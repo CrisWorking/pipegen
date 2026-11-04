@@ -28,6 +28,12 @@ export interface RunsFake {
   prs: FakePr[];
   pushes: { branch: string; sha: string; force: boolean; from: PushRepoHandle }[];
   cancels: number[];
+  /** E6 (S12): runs POST …/force-cancel was sent for. */
+  forceCancels: number[];
+  /** Runs a cancel doesn't stop (they go on until force-cancelled); any other run ends cancelled on its cancel. */
+  ignoreCancel: Set<number>;
+  /** POST …/force-cancel answers this status (default 202, the run ends cancelled). */
+  forceStatus?: number;
   merges: { pr: number; sha: string }[];
   /** event → workflow path → what it does (a function sees the sha and branch). Missing: no run for that workflow. */
   plans: { push: Record<string, Plan | ((sha: string, branch: string) => Plan | undefined)>; pull_request: Record<string, Plan | ((sha: string, branch: string) => Plan | undefined)> };
@@ -50,7 +56,7 @@ const json = (status: number, body: unknown): Reply => ({ status, body });
 
 export function runsFake(defaultBranch = 'main'): RunsFake {
   const f: RunsFake = {
-    runs: [], prs: [], pushes: [], cancels: [], merges: [], plans: { push: {}, pull_request: {} }, listDelay: 0, actionsOff: false, noise: [],
+    runs: [], prs: [], pushes: [], cancels: [], forceCancels: [], ignoreCancel: new Set(), merges: [], plans: { push: {}, pull_request: {} }, listDelay: 0, actionsOff: false, noise: [],
     handler: () => undefined, transport: undefined as never, pushed: () => {},
   };
   let lists = 0;
@@ -141,7 +147,23 @@ export function runsFake(defaultBranch = 'main'): RunsFake {
     m = /^\/actions\/jobs\/(\d+)\/logs$/.exec(rest);
     if (m && c.method === 'GET') return { status: 302, headers: { location: `${STORE}/log/${m[1]}` } };
     m = /^\/actions\/runs\/(\d+)\/cancel$/.exec(rest);
-    if (m && c.method === 'POST') { f.cancels.push(Number(m[1])); return json(202, {}); }
+    if (m && c.method === 'POST') {
+      const id = Number(m[1]);
+      f.cancels.push(id);
+      const r = f.runs.find((x) => x.id === id);
+      if (r !== undefined && r.status === 'completed') return json(409, { message: 'Cannot cancel a workflow run that is completed.' });
+      if (r !== undefined && !f.ignoreCancel.has(id)) { r.status = 'completed'; r.conclusion = 'cancelled'; }
+      return json(202, {});
+    }
+    m = /^\/actions\/runs\/(\d+)\/force-cancel$/.exec(rest);
+    if (m && c.method === 'POST') {
+      const id = Number(m[1]);
+      f.forceCancels.push(id);
+      if (f.forceStatus !== undefined) return json(f.forceStatus, { message: 'Server Error' });
+      const r = f.runs.find((x) => x.id === id);
+      if (r !== undefined) { r.status = 'completed'; r.conclusion = 'cancelled'; }
+      return json(202, {});
+    }
     if (rest === '/pulls' && c.method === 'POST') {
       const b = JSON.parse(c.body ?? '{}') as { head: string; base: string };
       const head = f.pushes.filter((p) => p.branch === b.head).at(-1);

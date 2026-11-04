@@ -29,6 +29,7 @@ import type { Octokit } from '@octokit/rest';
 import { count, outputLimit } from '../ai/errors.js';
 import { ollamaHostOf } from '../ai/ollama.js';
 import { AiError, COST_CAP_MESSAGE, refusalFallbackNoteFor, type AiErrorKind } from '../ai/provider.js';
+import { AiSpendMeter, type AiAttempt } from '../ai/spend-meter.js';
 import {
   bundleCode, bundleTopFolders, COUNTING_ONLY_NOTE, countedBundleRoot, EXCLUDED_PATTERNS, findSecretLike, isExcludedPath, redact, SECRET_SCANNER_ENV, SecretScanError, type SecretScanner, type SecretScannerName,
   HIDDEN_NAME, scrubKnownValues, type CodeBundle, type ScanFound,
@@ -53,7 +54,7 @@ import { readProject } from '../read/project.js';
 import { supportLevel } from '../read/support.js';
 import { skippedWorkflowCount } from '../read/workflows.js';
 import {
-  DEFAULT_MODEL, type AiProvider, type AiRequest, type AiUsage, type Capabilities, type Need, type Part, type PipelineDraft, type RepoProfile,
+  DEFAULT_MODEL, type AiProvider, type AiTokenCounts, type Capabilities, type Need, type Part, type PipelineDraft, type RepoProfile,
   type ReviewedTool, type Service,
   type NeedCategory,
 } from '../types.js';
@@ -188,11 +189,12 @@ export interface AuditAi {
   /** Planner, discovery and AI-step notes; deduped. */
   notes: string[];
   /** Every AI attempt of this step, summed by the spend meter (the needs call, its retry and every discovery attempt, failed ones included; rulings B2, U13). */
-  usage: Required<AiUsage>;
+  usage: AiTokenCounts;
   /**
    * ABOUT what the AI step cost at list price (USD): the sum of `attempts[].listUsd`. It is an approximation: cache reads
-   * are priced as full input (no cache discount), and a run the refusal fallback sent to another model is priced at the
-   * primary model's list price. Each attempt is priced in the tier its own prompt length falls in. 0 for a local model.
+   * are priced as full input (no cache discount). A run the refusal fallback sent to another model is priced at that
+   * model's list price when the provider names it (AiUsage.attempts, Plan E S22), else at the primary model's. Each
+   * attempt is priced in the tier its own prompt length falls in. 0 for a local model.
    */
   costUsd: number;
   /** One record per attempt that reported usage (failed ones included), in the order they settled. */
@@ -207,14 +209,7 @@ export interface AuditAi {
 }
 
 /** One settled AI attempt and its list cost (see AuditAi.costUsd for why the cost is "about"). */
-export interface AiAttempt {
-  model: string;
-  input: number;
-  output: number;
-  cacheRead: number;
-  cacheWrite: number;
-  listUsd: number;
-}
+export type { AiAttempt };
 
 export interface AuditDeps {
   /** Always set; an anonymous client works for a public repo. */
@@ -978,90 +973,9 @@ const AI_KIND_TEXT: Readonly<Record<AiErrorKind, string>> = {
   'cost-cap': 'one more AI call could pass the AI cost limit you agreed to',
 };
 
-/**
- * The audit's AI spend meter (ruling U13), the single record of what the AI calls of this step used (review M1). Every
- * attempt goes through `provider` (planNeeds and suggestTools get it; completeValidated's retries are attempts of their
- * own), and before one is sent the meter reserves its worst case (requestCeilingUsd: every byte a token, the full output
- * limit, the highest price it could bill at). An attempt that doesn't fit (spent + reserved + its worst case > cap) is
- * refused with AiError('cost-cap') and never sent, the needs call included. After the attempt, the reservation is swapped
- * for the cost of its usage at the same prices; an error without usage (a timeout, a dropped connection) keeps the full
- * reservation, since the provider may still bill what it produced. capUsd null: nothing is refused for a local model (Ollama); for a paid provider null counts as 0, so everything is refused (review H1).
- */
-export class AiSpendMeter {
-  /** USD settled so far (usage priced at the ceiling rates, plus the reservations of attempts that ended without usage). */
-  spentUsd = 0;
-  /** USD reserved for attempts in flight. */
-  reservedUsd = 0;
-  /** Every attempt's usage, summed (failed attempts that reported usage included). */
-  readonly usage: Required<AiUsage> = { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0 };
-  /** Each settled attempt with its own list cost (tier by its own prompt length); costUsd is their sum. */
-  readonly attempts: AiAttempt[] = [];
-  /** The cap in force: capUsd, except that null means 0 for a paid provider. null only for Ollama (no cap). */
-  readonly effectiveCapUsd: number | null;
-  /** What planNeeds and suggestTools are given: the same name and model, every call metered (no other field is copied). */
-  readonly provider: AiProvider;
-  readonly #inner: AiProvider;
-  constructor(inner: AiProvider, readonly capUsd: number | null) {
-    this.#inner = inner;
-    this.effectiveCapUsd = capUsd === null && inner.name !== 'ollama' ? 0 : capUsd;
-    this.provider = { name: inner.name, model: inner.model, complete: (req) => this.#complete(req) };
-  }
-  async #complete(req: AiRequest): Promise<{ data: unknown; usage: AiUsage }> {
-    let reserved = 0;
-    const cap = this.effectiveCapUsd;
-    if (cap !== null) {
-      // one validator for the output limit (review N3): anything set but not a whole number above 0 is refused here;
-      // no limit at all means no bound (Infinity), so the attempt can't fit any cap
-      const worst = requestCeilingUsd(this.#inner, aiRequestBytes(req), outputLimit(req.maxOutputTokens) ?? Number.POSITIVE_INFINITY);
-      if (worst !== 'local') {
-        if (!(this.spentUsd + this.reservedUsd + worst <= cap)) throw new AiError('cost-cap', COST_CAP_MESSAGE);
-        reserved = worst;
-        this.reservedUsd += worst;
-      }
-    }
-    let r: { data: unknown; usage: AiUsage };
-    try {
-      r = await this.#inner.complete(req);
-    } catch (e) {
-      if (e instanceof AiError && e.usage !== undefined) this.#settle(reserved, e.usage);
-      else this.#keep(reserved);
-      throw e;
-    }
-    this.#settle(reserved, r.usage);
-    return r;
-  }
-  #settle(reserved: number, u: AiUsage | undefined): void {
-    // An answer that reports no prompt tokens can't be priced: keep the full reservation (review N5).
-    if (u === undefined || u === null || count(u.inputTokens) + count(u.cacheReadTokens) + count(u.cacheWriteTokens) === 0) {
-      if (u !== undefined && u !== null) this.#addUsage(u);
-      this.#keep(reserved);
-      return;
-    }
-    this.reservedUsd -= reserved;
-    this.#addUsage(u);
-    const c = usageCeilingUsd(this.#inner, u);
-    if (c !== 'local') this.spentUsd += c;
-  }
-  /** Total list cost of the attempts (USD). */
-  get costUsd(): number {
-    return this.attempts.reduce((sum, a) => sum + a.listUsd, 0);
-  }
-  #addUsage(u: AiUsage): void {
-    const listUsd = usageCostUsd(this.#inner, u);
-    this.attempts.push({
-      model: this.#inner.model, input: count(u.inputTokens), output: count(u.outputTokens),
-      cacheRead: count(u.cacheReadTokens), cacheWrite: count(u.cacheWriteTokens), listUsd: listUsd === 'local' ? 0 : listUsd,
-    });
-    this.usage.inputTokens += count(u.inputTokens);
-    this.usage.outputTokens += count(u.outputTokens);
-    this.usage.cacheReadTokens += count(u.cacheReadTokens);
-    this.usage.cacheWriteTokens += count(u.cacheWriteTokens);
-  }
-  #keep(reserved: number): void {
-    this.reservedUsd -= reserved;
-    this.spentUsd += reserved;
-  }
-}
+// The audit's AI spend meter (ruling U13) lives in src/ai/spend-meter.ts since Plan E ruling B4 (one meter for the audit and the
+// proof run); it is exported from here too, so the audit's callers and tests keep their import.
+export { AiSpendMeter };
 
 /**
  * The needs request's size (UTF-8 bytes) for estimateAuditAi, before consent: the counting bundle's bytes (aiBundle)

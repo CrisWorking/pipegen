@@ -229,7 +229,9 @@ export interface ProofResult { ok: boolean; parts: PartResult[]; findings: Findi
 
 // ---------- AI ----------
 export interface AiRequest { system: string; user: string; schemaName: string; jsonSchema: object; timeoutMs: number; maxOutputTokens?: number }   // maxOutputTokens: the most output (thinking included) the provider may produce; Claude's CLAUDE_MAX_TOKENS when unset
-export interface AiUsage { inputTokens: number; outputTokens: number; cacheReadTokens?: number; cacheWriteTokens?: number }
+export interface AiUsage { inputTokens: number; outputTokens: number; cacheReadTokens?: number; cacheWriteTokens?: number; attempts?: AiUsageAttempt[] }   // attempts (Plan E S22): each model run the call billed, for the reported cost only (the cap prices the summed counts at ceiling rates)
+export interface AiUsageAttempt { model: string; input: number; output: number; cacheRead: number; cacheWrite: number }   // Claude: one per usage.iterations entry (the refusal fallback's run at its own model)
+export type AiTokenCounts = Required<Omit<AiUsage, 'attempts'>>;   // the four counts, summed
 export interface AiProvider { name: 'claude' | 'openai' | 'ollama'; model: string; complete(req: AiRequest): Promise<{ data: unknown; usage: AiUsage }> }   // usage feeds the AI cost meter (Plan E)
 
 // ---------- reviewed tools (moved here from Plan B Task 8 in round 3: Plan B Task 4 needs it earlier) ----------

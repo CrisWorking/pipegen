@@ -250,13 +250,15 @@ describe('claude', () => {
     const f = fakeFetch(() => sse(claudeMessage({ content, usage })));
     const r = await claudeProvider({ key: runtimeKey('ak'), fetch: f.fetch }).complete(request());
     expect(r.data).toEqual({ answer: 'yes', count: 2 });
-    expect(r.usage).toEqual(u(220, 50, 10, 50));
+    // Plan E S22: each run with its own model, for the reported cost (the cap prices the sum)
+    const runs = [{ model: DEFAULT_MODEL, input: 100, output: 20, cacheRead: 0, cacheWrite: 50 }, { model: 'claude-opus-4-8', input: 120, output: 30, cacheRead: 10, cacheWrite: 0 }];
+    expect(r.usage).toEqual({ ...u(220, 50, 10, 50), attempts: runs });
 
     // both models declined: the refusal error still carries every billed attempt
     const g = fakeFetch(() => sse(claudeMessage({ stop_reason: 'refusal', content: [], usage })));
     const err = await caught(claudeProvider({ key: runtimeKey('ak'), fetch: g.fetch }).complete(request()));
     expect(err.kind).toBe('refusal');
-    expect(err.usage).toEqual(u(220, 50, 10, 50));
+    expect(err.usage).toEqual({ ...u(220, 50, 10, 50), attempts: runs });
 
     // an empty iterations list falls back to the top-level counts
     const h = fakeFetch(() => sse(claudeMessage({ usage: { ...claudeUsage(7, 3, 0, 0), iterations: [] } })));
