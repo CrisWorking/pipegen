@@ -89,6 +89,8 @@ export interface WorldOptions {
 
 export interface World {
   gh: Octokit;
+  /** The fake fetch behind `gh` (E8: for a client the CLI builds itself, through CliIO.fetch). */
+  fetch: typeof fetch;
   calls: Call[];
   repos: Record<string, FakeRepo>;
   /** Calls that change something (POST, PUT, PATCH, DELETE). */
@@ -223,7 +225,7 @@ export function world(opts: WorldOptions = {}): World {
   }) as never);
   const gh = makeOctokit(fake.githubPat(), { fetch, log: () => {} });
   return {
-    gh, calls, repos,
+    gh, calls, repos, fetch,
     writes: () => calls.filter((c) => c.method !== 'GET' && c.method !== 'HEAD'),
     seen: () => calls.map((c) => `${c.method} ${decodeURIComponent(c.url.pathname)}`),
   };

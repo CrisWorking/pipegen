@@ -95,6 +95,11 @@ export interface WaitOptions {
   wantArtifact?: (name: string) => boolean;
   /** Where a leftover goes (E0b's leftover callback): a PR pipegen couldn't confirm closed, a run it couldn't cancel. */
   leftover?: (item: string) => void;
+  /**
+   * E8 (ruling S20: PRs recorded before they are created): `before(head)` runs right before proveVariant opens a PR from
+   * `head` (the state file records it, synchronously; a throw stops before the PR is opened), `opened(head, n)` right after.
+   */
+  recordPr?: { before(head: string): void; opened(head: string, pr: number): void };
 }
 export interface ProofWorkflows {
   /** Workflow files that run on a push of the proof branch. */
@@ -642,7 +647,9 @@ export async function proveVariant(gh: Octokit, t: ProofTarget, v: { branch: Pro
   // 2. the PR (a new one, or the open one a re-run pushed to) and its runs
   notStopping();
   if (v.pr === undefined) {
+    opts.recordPr?.before(branch);
     const pr = await openProofPr(gh, t, branch, rate);
+    opts.recordPr?.opened(branch, pr.number);
     into.pr = pr.number;
     into.prUrl = pr.url;
   } else {

@@ -267,6 +267,23 @@ describe('E1 repos (plan Task 1, preflight S1/S13/S19)', () => {
     await expect(pub.result).rejects.toThrow(ProofStopError);
   });
 
+  it('repos: the id GitHub gave a created repo goes to onCreated before anything else is sent (E8, ruling E1-R4)', async () => {
+    const order: string[] = [];
+    let g!: ReturnType<typeof world>;
+    const made = run({ repos: { pipelines: { private: true } }, repoIds: { [SCRATCH]: 31_337 } }, app(), {
+      ...by(appMode), onCreated: (repo, id) => { order.push(`${repo} ${id} after ${g.seen().length} calls`); },
+    });
+    g = made.g;
+    const r = await made.result;
+    const post = g.seen().indexOf('POST /user/repos');
+    expect(order).toEqual([`${SCRATCH} 31337 after ${post + 1} calls`]);   // right after the create's answer
+    expect(r.createdIds).toEqual({ [SCRATCH]: 31_337 });
+    // a record that can't be written stops the proof before the new repo is used
+    const stop = run({ repos: { pipelines: { private: true } } }, app(), { ...by(appMode), onCreated: () => { throw new Error('state not saved'); } });
+    await expect(stop.result).rejects.toThrow('state not saved');
+    expect(stop.g.seen().slice(stop.g.seen().indexOf('POST /user/repos') + 1)).toEqual([]);
+  });
+
   it('repos: exists but 404 for the app → prints add-to-installation steps', async () => {
     const { g, i, result } = run({ repos: { pipelines: { private: true }, [SCRATCH]: { private: true, hidden: true } } }, app(), by(appMode));
     const r = await result;

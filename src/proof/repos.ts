@@ -58,6 +58,12 @@ export interface ProofRepoOptions {
   /** The run id (default: a new one). */
   runId?: string;
   clock?: RateClock;
+  /**
+   * E8 (rulings S3, E1-R4): called right after pipegen created a helper repo, with GitHub's id for it, before anything else is
+   * sent. The state file records the scratch repo's id there (StateStore.scratchCreated): a later delete needs it. It must
+   * write synchronously; if it throws, the proof stops (the repo stays, pipegen won't delete what it didn't record).
+   */
+  onCreated?: (repo: string, id: number) => void;
 }
 
 export interface ProofRepos {
@@ -67,6 +73,8 @@ export interface ProofRepos {
   repos: RepoCheck[];
   /** Repos pipegen created in this call (App mode). */
   created: string[];
+  /** E8: GitHub's id of each repo pipegen created in this call (by name), when its answer gave one. */
+  createdIds?: Record<string, number>;
   /** When ready: always the app's default branch (S1). */
   scratchDefaultBranch?: string;
   /** 'pending': the scratch repo has no commit yet; E2 calls setScratchDefaultBranch again after the base push. */
@@ -636,14 +644,21 @@ export async function checkProofRepos(gh: Octokit, app: ProofApp, opts: ProofRep
     if (t.ownerType === 'Organization' || (login !== null && login.toLowerCase() === t.owner.toLowerCase())) {
       toPrint = [];
       for (const r of missing) {
+        let made: Record<string, unknown>;
         try {
-          await createHelperRepo(gh, r, login, clock);
+          made = await createHelperRepo(gh, r, login, clock);
         } catch (e) {
           if (e instanceof ScratchGuardError || e instanceof ProofStopError) throw e;
           rethrowHard(gh, e);
           const body = hideToken(JSON.stringify((e as { response?: { data?: unknown } } | null)?.response?.data ?? ''));
           if (statusOf(e) === 422 && /already exists/i.test(body)) { unreachable.push(r); continue; }
           throw new GitHubAccessError(`pipegen couldn't create ${r.fullName} (${saidOf(e)}).`, { status: statusOf(e) });
+        }
+        // E8: the id GitHub gave the new repo goes to the state file first (the only proof pipegen created it)
+        const id = made.id;
+        if (typeof id === 'number' && Number.isSafeInteger(id) && id > 0) {
+          opts.onCreated?.(r.repo, id);
+          (result.createdIds ??= {})[r.repo] = id;
         }
         // the App reaches what it creates at once (S9): read it again, and use it only when GitHub shows it private
         const again = await readHelper(gh, r.owner, r.repo, clock);

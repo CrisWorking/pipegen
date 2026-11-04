@@ -167,7 +167,7 @@ const readToml = (ctx: Ctx, rel: string) => readStructured(ctx, rel, parseToml);
 const readYaml = (ctx: Ctx, rel: string) => readStructured(ctx, rel, parseYamlLimited);
 
 /** Owner and repo from the `origin` URL in .git/config, read as plain text. Never runs git. */
-async function readOrigin(root: string): Promise<{ owner: string; repo: string }> {
+export async function readOrigin(root: string): Promise<{ owner: string; repo: string }> {
   const gitDir = joinOs(root, '.git');
   const gitInfo = await lstat(gitDir).catch(() => null);
   if (gitInfo === null) throw new NotGitHubRepoError('This folder is not a git repository (no .git folder found).');

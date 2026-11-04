@@ -242,7 +242,7 @@ export class ScratchKeys {
    * through `leftover` (E0b's callback) and keeps the state unverified. Returns the names deleted; throws ScratchKeysError
    * naming the leftovers when the list can't be read or a secret stays.
    */
-  async deleteAll(opts: { waitMs?: number; leftover?: (item: string) => void } = {}): Promise<string[]> {
+  async deleteAll(opts: { waitMs?: number; leftover?: (item: string) => void; alsoNames?: readonly string[] } = {}): Promise<string[]> {
     const report = opts.leftover ?? this.#leftover;
     // R6: the deletes go by the guarded scratch names first; the id-based bookkeeping comes after, and its failure is a leftover
     const known = this.#st;
@@ -256,7 +256,7 @@ export class ScratchKeys {
     let purge: { deleted: string[]; leftovers: string[] } | null = null;
     let failure: unknown = null;
     try {
-      purge = await this.#purge();
+      purge = await this.#purge(opts.alsoNames ?? []);
     } catch (e) {
       failure = e;
     }
@@ -296,17 +296,26 @@ export class ScratchKeys {
     return deleted;
   }
 
-  /** List, delete each by name, list again (the guarded scratch target only; no state). Throws when a list can't be read. */
-  async #purge(): Promise<{ deleted: string[]; leftovers: string[] }> {
+  /**
+   * List, delete each by name, list again (the guarded scratch target only; no state). Throws when a list can't be read.
+   * `alsoNames` (E8: the names the state file recorded, and this process stored) are deleted too when the first list
+   * didn't show them (a list that lags behind a store that landed); for those a 404 is "already gone".
+   */
+  async #purge(alsoNames: readonly string[] = []): Promise<{ deleted: string[]; leftovers: string[] }> {
     const first = (await this.#list()).map((e) => e.name);
     const deleted: string[] = [];
     const failed: string[] = [];
-    for (const name of first) {
+    const listed = new Set(first.map((n) => n.toUpperCase()));
+    const extra = [...new Set(alsoNames.filter((n) => typeof n === 'string' && PLAIN_NAME_RE.test(n)).map((n) => n.toUpperCase()))].filter((n) => !listed.has(n));
+    for (const name of [...first, ...extra]) {
       try {
         await deleteScratchSecret(this.#gh, this.#scratch, name, this.#clock);
         deleted.push(name);
       } catch (e) {
         if (e instanceof ScratchGuardError) throw e;
+        if (isRateStop(e)) throw e;
+        if (isTokenRejected(this.#gh, e)) throw githubTokenRejected();
+        if (!listed.has(name) && (e as { status?: unknown } | null)?.status === 404) continue;   // a recorded name already gone
         failed.push(name);
       }
     }
@@ -659,6 +668,37 @@ export class ScratchKeys {
 }
 
 const isTokenRejected = (gh: Octokit, e: unknown): boolean => (e as { status?: unknown } | null)?.status === 401 && !isAnonymousClient(gh);
+
+/**
+ * E8 (carry E4-R4 R7): the secret names the proof's workflows read, for ScratchKeysDeps.readByWorkflows: every
+ * `secrets.NAME` and `secrets['NAME']` / `secrets["NAME"]` in the given workflow texts, upper-cased, sorted. null when a
+ * workflow reads the secrets in a way no name can be taken from (`secrets[expr]`, `toJSON(secrets)`, `secrets` alone):
+ * then every organisation secret counts as read (the fail-closed default of ScratchKeys).
+ */
+export function workflowSecretNames(workflows: readonly { content: string | Uint8Array }[]): string[] | null {
+  const names = new Set<string>();
+  for (const w of workflows) {
+    const text = typeof w.content === 'string' ? w.content : Buffer.from(w.content).toString('utf8');
+    for (const m of text.matchAll(/\bsecrets\b/g)) {
+      const rest = text.slice((m.index ?? 0) + m[0].length);
+      const dot = /^\s*\.\s*([A-Za-z_][A-Za-z0-9_]*)/.exec(rest);
+      const idx = /^\s*\[\s*(['"])([A-Za-z_][A-Za-z0-9_]*)\1\s*\]/.exec(rest);
+      const name = dot?.[1] ?? idx?.[2];
+      if (name === undefined) {
+        // the word outside an expression (a key `secrets: inherit`, a comment, a step name) reads nothing by itself;
+        // `secrets: inherit` passes every secret to a called workflow, so it counts as unknown
+        const at = m.index ?? 0;
+        const end = text.indexOf('\n', at);
+        const line = text.slice(text.lastIndexOf('\n', at) + 1, end === -1 ? undefined : end);
+        if (/^\s*#/.test(line)) continue;
+        if (/^\s*secrets\s*:\s*(?:#.*)?$/.test(line)) continue;   // a `secrets:` map of a called workflow: its values are expressions read above
+        return null;
+      }
+      names.add(name.toUpperCase());
+    }
+  }
+  return [...names].sort();
+}
 
 /**
  * E2's secret-store seam (pushProofSetup's `storeSecrets`): the real ScratchKeys store, wired. It runs after the no-run

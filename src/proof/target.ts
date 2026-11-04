@@ -14,8 +14,8 @@
 //   stop has begun (the sticky interrupting() gate, E0b), takes only a write route under /repos/{owner}/{repo} whose
 //   owner and repo it fills in itself, refuses Octokit's reserved options (baseUrl, headers, request, url, …) and path
 //   values with dot segments, and then applies the per-repo rules:
-//     scratch: the sections in SCRATCH_SECTIONS; never the repo delete (E8 adds it with the exact name and the
-//       "pipegen created it" marker, ruling S3), never a visibility change but to private, never a transfer, fork,
+//     scratch: the sections in SCRATCH_SECTIONS; never the repo delete (deleteScratchRepo is the one, E8: the exact
+//       name, pipegen's marker and the id recorded at creation, ruling S3), never a visibility change but to private, never a transfer, fork,
 //       collaborator, webhook, deploy key, dispatch (no workflow_dispatch, plan Global Constraints) or Actions access change;
 //     central: make it private (the literal { private: true }, ruling M1), set its Actions access level to this owner
 //       type's (the plan's ensureActionsAccess; ruling E1-R1), and create, move or delete refs/heads/proof/<runId>
@@ -32,6 +32,14 @@
 //   issuer below once, at load), a brand is used for one store batch only, and it is good for ACCESS_CHECK_MAX_AGE_MS. So
 //   the pre-store re-check can't be skipped or reused. deleteScratchSecret is the one write allowed while stopping: it
 //   only removes a key (E8's Ctrl-C cleanup).
+// - Cleanup (E8; rulings S3, S14, S18, B2; threat T12): cleanupWrite(gh, repo, op) sends one of a fixed list of removal
+//   writes (cancel / force-cancel / delete a run, close a PR, delete a branch, an Actions cache, an Actions variable, a code
+//   scanning analysis; the scratch default branch reset to one empty commit whose tree is git's empty tree). It is the only
+//   other way, beside the secret delete, a write is sent while a stop is under way: the stop gate stays as it is for every
+//   other write (it is NOT weakened), and these ops only remove. The route of each op is built here; the per-repo rules still
+//   apply (central: only refs/heads/proof/<runId>). deleteScratchRepo is the one repo delete: the exact scratch name, pipegen's
+//   created marker AND the repo id recorded when pipegen created it, all read back from GitHub right before the DELETE;
+//   anything that doesn't match is "not deleted" (the caller empties the repo instead and shows the gh command).
 // Later tasks extend SCRATCH_SECTIONS (or add a dedicated function here) under review; they never call Octokit writes
 // themselves (a source scan in test/proof-repos.test.ts checks src/proof).
 import { randomBytes } from 'node:crypto';
@@ -196,7 +204,7 @@ export function scratchPushUrl(r: GuardedRepo): string {
 const WRITE_METHODS = new Set(['POST', 'PUT', 'PATCH', 'DELETE']);
 /** Octokit request options (and the two names the guard fills in): never taken from a caller. */
 const RESERVED = new Set(['owner', 'repo', 'baseUrl', 'headers', 'request', 'method', 'url', 'mediaType', 'data']);
-const ROUTE_RE = /^(POST|PUT|PATCH|DELETE) \/repos\/\{owner\}\/\{repo\}((?:\/(?:[a-z0-9_-]+|\{[a-z_]+\}))*)$/;
+const ROUTE_RE = /^(POST|PUT|PATCH|DELETE) \/repos\/\{owner\}\/\{repo\}((?:\/(?:[a-z0-9_-]+|\{[a-z_]+\}))*)(\{\?confirm_delete\})?$/;
 const PATH_VALUE_RE = /^[A-Za-z0-9._/-]{1,255}$/;
 /**
  * The scratch repo's write sections (the first path part after /repos/{owner}/{repo}). E2-E8 need git data and refs,
@@ -249,8 +257,12 @@ function checkCentral(r: GuardedRepo, method: string, path: string, p: Params): 
   refuse(`${method} ${path || '/'} is not a write pipegen makes to ${r.fullName}.`);
 }
 
-/** How a write is sent: a plain guardedWrite, the secret sink's store, or the secret delete (allowed while stopping). */
-type WriteMode = 'plain' | 'secret-store' | 'secret-delete';
+/**
+ * How a write is sent: a plain guardedWrite, the secret sink's store, the secret delete (allowed while stopping), a cleanup
+ * op (cleanupWrite: allowed while stopping, the route built from a fixed op list), or the scratch repo delete (deleteScratchRepo).
+ */
+type WriteMode = 'plain' | 'secret-store' | 'secret-delete' | 'cleanup' | 'repo-delete';
+const REPO_DELETE_ROUTE = 'DELETE /repos/{owner}/{repo}';
 const SECRET_STORE_ROUTE = 'PUT /repos/{owner}/{repo}/actions/secrets/{secret_name}';
 const SECRET_DELETE_ROUTE = 'DELETE /repos/{owner}/{repo}/actions/secrets/{secret_name}';
 /** Any path with a `secrets` part (repo, environment, Dependabot, Codespaces secrets). */
@@ -302,14 +314,16 @@ export async function guardedWrite(gh: Octokit, r: GuardedRepo, route: string, p
 async function writeChecked(gh: Octokit, r: GuardedRepo, route: string, params: Params, clock: RateClock, mode: WriteMode): Promise<{ status: number; data: unknown }> {
   requireGuarded(r);
   checkTarget(r.target, { owner: r.target.owner, repo: r.target.appRepo });
-  const stopGate = mode === 'secret-delete' ? () => {} : notStopping;
+  // E8: the removal writes of the cleanup (and the repo delete) are sent while a stop is under way; nothing else is
+  const stopGate = mode === 'secret-delete' || mode === 'cleanup' || mode === 'repo-delete' ? () => {} : notStopping;
   stopGate();
-  if (mode !== 'plain') {
-    const want = mode === 'secret-store' ? SECRET_STORE_ROUTE : SECRET_DELETE_ROUTE;
+  if (mode === 'secret-store' || mode === 'secret-delete' || mode === 'repo-delete') {
+    const want = mode === 'secret-store' ? SECRET_STORE_ROUTE : mode === 'secret-delete' ? SECRET_DELETE_ROUTE : REPO_DELETE_ROUTE;
     if (r.kind !== 'scratch' || route !== want) refuse(`only ${want} on the scratch repo goes this way.`);
   }
   const m = ROUTE_RE.exec(route);
   if (m === null) refuse(`"${safeText(route, 120)}" is not a write under /repos/{owner}/{repo}.`);
+  if (m[3] !== undefined && mode !== 'cleanup') refuse(`"${safeText(route, 120)}" is a cleanup route.`);
   const method = m[1] as string;
   const path = m[2] as string;
   if (!WRITE_METHODS.has(method)) refuse(`${method} is not a write.`);
@@ -323,7 +337,9 @@ async function writeChecked(gh: Octokit, r: GuardedRepo, route: string, params: 
     }
   }
   if (r.kind === 'central') checkCentral(r, method, path, params);
-  else if (mode === 'secret-store') {
+  else if (mode === 'repo-delete') {
+    if (Object.keys(params).length > 0) refuse('the scratch repo delete takes no parameter.');
+  } else if (mode === 'secret-store') {
     if (!onlyKeys(params, ['secret_name', 'encrypted_value', 'key_id'])) refuse('a secret store takes only secret_name, encrypted_value and key_id.');
   } else if (mode === 'secret-delete') {
     if (!onlyKeys(params, ['secret_name'])) refuse('a secret delete takes only secret_name.');
@@ -471,4 +487,136 @@ export function scratchSecretSink(gh: Octokit, access: object, clock: RateClock 
 export async function deleteScratchSecret(gh: Octokit, scratch: GuardedRepo, name: string, clock: RateClock = clockOf(gh)): Promise<void> {
   requireGuarded(scratch, 'scratch');
   await writeChecked(gh, scratch, SECRET_DELETE_ROUTE, { secret_name: name }, clock, 'secret-delete');
+}
+
+// ---------- the cleanup's removal writes and the scratch repo delete (E8) ----------
+
+/** git's empty tree: the only tree the cleanup's empty commit may point to (the scratch default branch emptied; ruling B6). */
+export const EMPTY_TREE_SHA = '4b825dc642cb6eb9a060e54bf8d69288fbee4904';
+export const EMPTY_COMMIT_MESSAGE = 'pipegen: scratch repo emptied after the proof';
+const SHA40_RE = /^[0-9a-f]{40}$/;
+const VARIABLE_NAME_RE = /^[A-Za-z0-9_]{1,200}$/;
+const posId = (v: unknown): v is number => typeof v === 'number' && Number.isSafeInteger(v) && v > 0;
+
+/** One removal write of the cleanup. Each maps to one fixed route; nothing here adds or changes content but the empty commit. */
+export type CleanupOp =
+  | { op: 'cancel-run' | 'force-cancel-run' | 'delete-run'; runId: number }
+  | { op: 'close-pr'; pr: number }
+  | { op: 'delete-branch'; branch: string }
+  | { op: 'delete-cache'; cacheId: number }
+  | { op: 'delete-variable'; name: string }
+  | { op: 'delete-analysis'; analysisId: number }
+  | { op: 'empty-commit' }
+  | { op: 'reset-default-branch'; sha: string };
+
+/** The empty commits GitHub made for a cleanup (by guarded repo): reset-default-branch takes only one of them. */
+const emptyCommits = new WeakMap<object, Set<string>>();
+
+/**
+ * E8: one removal write of the cleanup, also while a stop is under way (B2: the Ctrl-C cleanup). The scratch repo takes every
+ * op; the central repo only `delete-branch` of proof/<runId> (checkCentral). A branch delete never names the scratch default
+ * branch (it is emptied instead: `empty-commit`, then `reset-default-branch` with the sha GitHub gave that empty commit,
+ * forced). Rate stops and GitHub's errors pass through (a 401 as githubTokenRejected); the caller tolerates 404/409/422.
+ */
+export async function cleanupWrite(gh: Octokit, r: GuardedRepo, op: CleanupOp, clock: RateClock = clockOf(gh)): Promise<{ status: number; data: unknown }> {
+  requireGuarded(r);
+  const t = r.target;
+  const kind = (op as { op?: unknown } | null)?.op;
+  if (r.kind === 'central' && kind !== 'delete-branch') refuse(`the cleanup only deletes the branch proof/${t.runId} of ${r.fullName}.`);
+  const send = (route: string, params: Params) => writeChecked(gh, r, route, params, clock, 'cleanup');
+  switch (op.op) {
+    case 'cancel-run':
+    case 'force-cancel-run':
+    case 'delete-run': {
+      if (!posId(op.runId)) refuse('a run id is not a whole number above 0.');
+      const route = op.op === 'delete-run' ? 'DELETE /repos/{owner}/{repo}/actions/runs/{run_id}'
+        : `POST /repos/{owner}/{repo}/actions/runs/{run_id}/${op.op === 'cancel-run' ? 'cancel' : 'force-cancel'}`;
+      return send(route, { run_id: op.runId });
+    }
+    case 'close-pr':
+      if (!posId(op.pr)) refuse('a PR number is not a whole number above 0.');
+      return send('PATCH /repos/{owner}/{repo}/pulls/{pull_number}', { pull_number: op.pr, state: 'closed' });
+    case 'delete-branch': {
+      if (typeof op.branch !== 'string' || !validBranchName(op.branch)) refuse('the branch to delete is not a branch name.');
+      if (r.kind === 'scratch' && op.branch === t.defaultBranch) refuse(`the default branch of ${r.fullName} is emptied, never deleted.`);
+      return send('DELETE /repos/{owner}/{repo}/git/refs/{ref}', { ref: `heads/${op.branch}` });
+    }
+    case 'delete-cache':
+      if (!posId(op.cacheId)) refuse('a cache id is not a whole number above 0.');
+      return send('DELETE /repos/{owner}/{repo}/actions/caches/{cache_id}', { cache_id: op.cacheId });
+    case 'delete-variable':
+      if (typeof op.name !== 'string' || !VARIABLE_NAME_RE.test(op.name)) refuse('the variable to delete is not a variable name.');
+      return send('DELETE /repos/{owner}/{repo}/actions/variables/{name}', { name: op.name });
+    case 'delete-analysis':
+      if (!posId(op.analysisId)) refuse('an analysis id is not a whole number above 0.');
+      return send('DELETE /repos/{owner}/{repo}/code-scanning/analyses/{analysis_id}{?confirm_delete}', { analysis_id: op.analysisId, confirm_delete: 'true' });
+    case 'empty-commit': {
+      const res = await send('POST /repos/{owner}/{repo}/git/commits', { message: EMPTY_COMMIT_MESSAGE, tree: EMPTY_TREE_SHA, parents: [] });
+      const d = (res.data ?? {}) as { sha?: unknown; tree?: { sha?: unknown } | null; parents?: unknown };
+      if (typeof d.sha !== 'string' || !SHA40_RE.test(d.sha) || d.tree?.sha !== EMPTY_TREE_SHA || !Array.isArray(d.parents) || d.parents.length !== 0) {
+        throw new ProofStopError(`GitHub's answer to making the empty commit in ${r.fullName} doesn't say it is one.`);
+      }
+      let made = emptyCommits.get(r);
+      if (made === undefined) emptyCommits.set(r, made = new Set());
+      made.add(d.sha);
+      return res;
+    }
+    case 'reset-default-branch':
+      if (typeof op.sha !== 'string' || !emptyCommits.get(r)?.has(op.sha)) refuse('the default branch is reset only to the empty commit the cleanup made.');
+      return send('PATCH /repos/{owner}/{repo}/git/refs/{ref}', { ref: `heads/${t.defaultBranch}`, sha: op.sha, force: true });
+    default:
+      return refuse('that is not a cleanup write.');
+  }
+}
+
+/** What deleteScratchRepo did: `why` (plain text) when the repo was not deleted. */
+export interface RepoDeleteResult { deleted: boolean; why?: string }
+
+/**
+ * E8 (rulings S3, E1-R4; S9): deletes the scratch repo, only when all of these hold, each read from GitHub right before the
+ * DELETE: GitHub's answer is the exact name `<owner>/pipegen-proof-<repo>` (full_name, name and owner as the target has them),
+ * its description is pipegen's created marker, and its id is `recordedId`, the id GitHub gave the repo when pipegen created it
+ * (the state file's record). Anything else, or a recorded id that isn't one, is `{ deleted: false, why }`: the caller empties
+ * the repo instead and shows the gh command. The caller also decides the token may delete repos (Auth.canDeleteRepos).
+ * After the DELETE, a read must answer 404, else it is "not deleted". Rate stops and a rejected token are thrown.
+ */
+export async function deleteScratchRepo(gh: Octokit, r: GuardedRepo, recordedId: number | undefined, clock: RateClock = clockOf(gh)): Promise<RepoDeleteResult> {
+  requireGuarded(r, 'scratch');
+  const t = r.target;
+  checkTarget(t, { owner: t.owner, repo: t.appRepo });
+  if (r.repo !== `${SCRATCH_PREFIX}${t.appRepo}` || r.repo.toLowerCase() === t.appRepo.toLowerCase()) refuse(`${r.fullName} is not the scratch repo of ${t.owner}/${t.appRepo}.`);
+  if (!posId(recordedId)) return { deleted: false, why: `pipegen has no record of creating ${r.fullName}, so it only empties it` };
+  const statusOf = (e: unknown) => (e as { status?: unknown } | null)?.status;
+  const hardStop = (e: unknown): void => {
+    if (isRateStop(e)) throw e;
+    if (statusOf(e) === 401 && !isAnonymousClient(gh)) throw githubTokenRejected();
+  };
+  let d: Record<string, unknown>;
+  try {
+    d = ((await githubRead(gh, 'GET /repos/{owner}/{repo}', { owner: r.owner, repo: r.repo }, clock)).data ?? {}) as Record<string, unknown>;
+  } catch (e) {
+    hardStop(e);
+    return { deleted: false, why: `pipegen couldn't read ${r.fullName} before deleting it` };
+  }
+  const owner = (d.owner as { login?: unknown } | null | undefined)?.login;
+  if (d.full_name !== r.fullName || d.name !== r.repo || owner !== t.owner) {
+    return { deleted: false, why: `GitHub's answer for ${r.fullName} names another repo, so pipegen doesn't delete it` };
+  }
+  if (d.description !== SCRATCH_MARKER) return { deleted: false, why: `${r.fullName} doesn't carry pipegen's marker, so pipegen doesn't delete it` };
+  if (d.id !== recordedId) return { deleted: false, why: `${r.fullName} is not the repo pipegen created (its id differs from the one recorded), so pipegen doesn't delete it` };
+  try {
+    await writeChecked(gh, r, REPO_DELETE_ROUTE, {}, clock, 'repo-delete');
+  } catch (e) {
+    if (e instanceof ScratchGuardError) throw e;
+    hardStop(e);
+    const st = statusOf(e);
+    return { deleted: false, why: `GitHub refused to delete ${r.fullName}${typeof st === 'number' ? ` (HTTP ${st})` : ''}` };
+  }
+  try {
+    await githubRead(gh, 'GET /repos/{owner}/{repo}', { owner: r.owner, repo: r.repo }, clock);
+  } catch (e) {
+    hardStop(e);
+    if (statusOf(e) === 404) return { deleted: true };
+  }
+  return { deleted: false, why: `GitHub still shows ${r.fullName} after the delete` };
 }
