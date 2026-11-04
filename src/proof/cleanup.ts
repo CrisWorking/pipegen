@@ -250,8 +250,10 @@ async function clean(gh: Octokit, t: ProofTarget, store: StateStore, keys: Scrat
   // the leftovers of this cleanup replace those an earlier cleanup of this run recorded (each was looked for again above);
   // anything recorded meanwhile by someone else (the interrupt registry: a hook cut by its deadline) stays
   save((n) => {
-    // fix round 2 (N-1): a repo pipegen can't see wasn't looked at again, so what earlier cleanups recorded there stays
-    n.leftovers = [...new Set([...left, ...n.leftovers.filter((l) => !dropped.has(l) && (scratchMissing || !before.has(l)))])];
+    // fix round 2 (N-1): a repo pipegen can't see wasn't looked at again, so what earlier cleanups recorded about it stays
+    // (the central repo's were looked at again in step 6)
+    const unchecked = (l: string): boolean => scratchMissing && !l.includes(`${t.owner}/${t.central}`);
+    n.leftovers = [...new Set([...left, ...n.leftovers.filter((l) => !dropped.has(l) && (unchecked(l) || !before.has(l)))])];
     n.cleanupDone = n.leftovers.length === 0;
     if (n.stage === 'proven') n.stage = 'cleaned';
   });

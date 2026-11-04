@@ -1,7 +1,9 @@
 // E8 fix round 2 (review-E8-r1.md N-1, O-1, N-2, N-3, O-2): a stale "deleted" mark, YAML-decoded secret names, the minutes
 // read under a deadline, no minutes lost across a resume, and repo creation only with a permit from an armed store.
 // The reviewer's probes (tmp-E8-review-r1/) are tests here, with the outcome they should have. No network.
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { cleanupCommand } from '../src/cli/cleanup.js';
+import type { CliIO } from '../src/cli/io.js';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
@@ -74,12 +76,36 @@ describe('E8 fix round 2: a stale "deleted" mark (N-1)', () => {
       ['PR', () => store.recordPr(`proof/${RUN}/b`), false],
       ['proving', () => { store.setStage('interrupted'); store.setStage('proving'); }, false],
       ['central branch', () => store.recordBranch('central', `proof/${RUN}`, 'main'), true],
+      ['a scratch branch recorded before', () => store.recordBranch('scratch', `proof/${RUN}/a`, 'main'), false],
     ];
     for (const [what, use, stays] of uses) {
       store.update((n) => { n.scratchDeleted = true; });
       use();
       expect(store.load()?.scratchDeleted, what).toBe(stays);
     }
+  });
+});
+
+describe('E8 fix round 2: pipegen cleanup after the probe (N-1)', () => {
+  it('cli: Yes ("I deleted it") forgets what was left in the scratch repo, the hook\'s cut too; the central repo\'s stay', async () => {
+    const w = cleanupWorld({}, {}, nextId++);
+    const { store, h } = await proving();
+    store.recordSecretNames(['STRIPE_SECRET_KEY']);
+    store.record('removing your keys and the proof from the scratch repo: did not finish within 90 s');
+    store.record(`the branch proof/${RUN} of ${OWNER}/pipelines is still there; delete it there`);
+    store.recordBranch('central', `proof/${RUN}`, 'main');
+    w.f.central.add(`proof/${RUN}`);
+    w.f.deleted = true;
+    const repo = home();
+    mkdirSync(join(repo, '.git'));
+    writeFileSync(join(repo, '.git', 'config'), `[remote "origin"]\n\turl = https://github.com/${OWNER}/shop.git\n`);
+    const io: CliIO = { ...quietIo, prompt: { ...quietIo.prompt, confirm: async () => true }, out: () => {}, err: () => {},
+      env: Object.fromEntries([['GITHUB_TOKEN', fake.githubPat()], ['XDG_CACHE_HOME', join(h, '.cache')]]), cwd: repo, fetch: w.g.fetch };
+    expect(await cleanupCommand(repo, io, { allowBroad: false })).toBe(0);
+    const st = (await StateStore.open(app(), { home: h, env: {} })).state;
+    expect(st?.leftovers).toEqual([]);   // the cut hook's leftover went with the repo; the central branch was deleted and read again
+    expect(st).toMatchObject({ scratchDeleted: true, cleanupDone: true });
+    expect(w.f.central.size).toBe(0);
   });
 });
 
