@@ -646,10 +646,11 @@ function plantedChecks(
   const gateHits = hitsIn(prP, (n) => jobNameMatches(n, 'gate'));
   const gateRun = gateHits[0]?.run;
   if (gateRun === undefined) { sheet.fail('pipeline', "the gate job did not run on the planted pull request, so the gate is not shown to block planted problems"); return; }
+  // a block is the gate job's conclusion `failure` and nothing else: cancelled, timed out or unfinished is not "blocked"
   const gs = stateOf(gateHits);
   const read = gateResultOf(gateRun);
   if (gs === 'success') sheet.fail('pipeline', "the gate didn't block planted problems: it passed on the planted pull request", undefined, gateRun.handle.url);
-  else if (gs !== 'failed') { sheet.fail('pipeline', 'the gate job did not finish on the planted pull request, so it is not shown to block planted problems', undefined, gateRun.handle.url); return; }
+  else if (gs !== 'failed' || gateHits.some((h) => h.job.conclusion !== 'failure')) { sheet.fail('pipeline', 'the gate job did not finish on the planted pull request, so it is not shown to block planted problems', undefined, gateRun.handle.url); return; }
   if (!read.ok) { sheet.fail('pipeline', `the planted pull request's gate report is not usable, so no scanner is shown to catch its planted item: ${read.reason}`, undefined, gateRun.handle.url); return; }
   const doc = read.doc;
   if (doc.pass) { sheet.fail('pipeline', "the gate didn't block planted problems: its report says it passed", undefined, gateRun.handle.url); return; }
@@ -741,7 +742,7 @@ async function testsPart(
     const { state: s, hits } = ownedState(layers, prP, id);
     if (s === 'failed') {
       const f = judge.classify(true, failing(hits), `test job`);
-      sheet.fail('tests', f.detail, n.id, hits[0]?.run.handle.url);
+      if (f.status === 'failed') sheet.fail('tests', f.detail, n.id, hits[0]?.run.handle.url); else sheet.notProven('tests', f.detail, { needId: n.id, caps: true });
       sheet.evidenceOf('tests', failing(hits));
     } else if (s !== 'success') sheet.fail('tests', `the test job ${st(id, 80)} did not run on the pull request (${s === 'skipped' ? 'skipped' : 'missing'}), so the tests are not proven`, n.id);
   }
