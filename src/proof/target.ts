@@ -14,7 +14,10 @@
 //   stop has begun (the sticky interrupting() gate, E0b), takes only a write route under /repos/{owner}/{repo} whose
 //   owner and repo it fills in itself, refuses Octokit's reserved options (baseUrl, headers, request, url, …) and path
 //   values with dot segments, and then applies the per-repo rules:
-//     scratch: the sections in SCRATCH_SECTIONS; never the repo delete (deleteScratchRepo is the one, E8: the exact
+//     scratch: exactly the writes in SCRATCH_WRITES (final review I-1: the ones pipegen makes, each with its parameter
+//       check; no contents, git blob/tree/commit/tag, ref move or environment write, so a workflow reaches the scratch repo
+//       only through a push of a commit checkProofWorkflows passed); cleanupWrite's ops only in cleanup mode
+//       (CLEANUP_WRITES: the empty commit and the forced reset of the default branch exist only there); never the repo delete (deleteScratchRepo is the one, E8: the exact
 //       name, pipegen's marker and the id recorded at creation, ruling S3), never a visibility change but to private, never a transfer, fork,
 //       collaborator, webhook, deploy key, dispatch (no workflow_dispatch, plan Global Constraints) or Actions access change;
 //     central: make it private (the literal { private: true }, ruling M1), set its Actions access level to this owner
@@ -41,7 +44,7 @@
 //   apply (central: only refs/heads/proof/<runId>). deleteScratchRepo is the one repo delete: the exact scratch name, pipegen's
 //   created marker AND the repo id recorded when pipegen created it, all read back from GitHub right before the DELETE;
 //   anything that doesn't match is "not deleted" (the caller empties the repo instead and shows the gh command).
-// Later tasks extend SCRATCH_SECTIONS (or add a dedicated function here) under review; they never call Octokit writes
+// Later tasks extend SCRATCH_WRITES (or add a dedicated function here) under review; they never call Octokit writes
 // themselves (a source scan in test/proof-repos.test.ts checks src/proof).
 import { randomBytes } from 'node:crypto';
 import type { Octokit } from '@octokit/rest';
@@ -208,13 +211,6 @@ const RESERVED = new Set(['owner', 'repo', 'baseUrl', 'headers', 'request', 'met
 const ROUTE_RE = /^(POST|PUT|PATCH|DELETE) \/repos\/\{owner\}\/\{repo\}((?:\/(?:[a-z0-9_-]+|\{[a-z_]+\}))*)(\{\?confirm_delete\})?$/;
 const PATH_VALUE_RE = /^[A-Za-z0-9._/-]{1,255}$/;
 /**
- * The scratch repo's write sections (the first path part after /repos/{owner}/{repo}). E2-E8 need git data and refs,
- * PRs and merges, secrets and variables, workflow disable/enable, run cancel/re-run/delete, caches, code scanning
- * analyses (S18), Dependabot security fixes off (S5) and environments. `actions` sub-paths in SCRATCH_ACTIONS_DENIED are refused.
- */
-const SCRATCH_SECTIONS = new Set(['git', 'pulls', 'actions', 'code-scanning', 'automated-security-fixes', 'vulnerability-alerts', 'environments', 'contents']);
-const SCRATCH_ACTIONS_DENIED = /\/dispatches$|^\/actions\/permissions(?:\/|$)|^\/actions\/runners|^\/actions\/oidc/;
-/**
  * PATCH /repos/{owner}/{repo} on the scratch repo: only these keys; visibility only towards private, forking only off
  * (fix round 1, G4), and the description only pipegen's marker (M5).
  */
@@ -277,7 +273,47 @@ const VARIABLES_PATH_RE = /(?:^|\/)variables(?:\/|$)/;
  */
 export const SCRATCH_VARIABLES: readonly string[] = Object.freeze(['PIPEGEN_BLOCK_FROM']);
 
-function checkScratch(r: GuardedRepo, method: string, path: string, p: Params): void {
+type RouteCheck = (t: ProofTarget, p: Params) => boolean;
+const SHA_RE = /^[0-9a-f]{40}$/;
+const runOnly: RouteCheck = (_t, p) => onlyKeys(p, ['run_id']);
+/**
+ * Final review I-1 (ruling E-F1): the scratch repo's writes ("METHOD path" under /repos/{owner}/{repo}), exactly the ones
+ * pipegen makes, each with the check its parameters must pass. No write that adds or changes content (contents, git blobs,
+ * trees, commits, tags, a branch moved to another commit) and no environment write: a workflow reaches the scratch repo
+ * only through a git push of a commit buildProofBranch checked (checkProofWorkflows), and nothing re-enables a workflow
+ * disableUserWorkflows turned off. Callers: repos.ts (forking off, the marker, setScratchDefaultBranch's branch and
+ * default), snapshot.ts (Dependabot updates off, a user workflow disabled), run.ts (the proof PR opened, merged, closed;
+ * runs cancelled, force-cancelled, failed jobs re-run), and the declared Actions variable (E4-R2). test/proof-target.test.ts
+ * scans src/proof for the routes, so a new caller fails a test until it is listed here.
+ */
+const SCRATCH_WRITES: ReadonlyMap<string, RouteCheck> = new Map<string, RouteCheck>([
+  // repos.ts setScratchDefaultBranch: the app's default branch, made at the scratch default branch's head
+  ['POST /git/refs', (t, p) => onlyKeys(p, ['ref', 'sha']) && p.ref === `refs/heads/${t.defaultBranch}` && typeof p.sha === 'string' && SHA_RE.test(p.sha)],
+  ['POST /pulls', (t, p) => onlyKeys(p, ['title', 'head', 'base', 'body']) && p.base === t.defaultBranch
+    && typeof p.head === 'string' && p.head.startsWith(`proof/${t.runId}/`)],
+  ['PUT /pulls/{pull_number}/merge', (_t, p) => onlyKeys(p, ['pull_number', 'sha', 'merge_method'])],
+  ['PATCH /pulls/{pull_number}', (_t, p) => onlyKeys(p, ['pull_number', 'state']) && p.state === 'closed'],
+  ['POST /actions/runs/{run_id}/cancel', runOnly],
+  ['POST /actions/runs/{run_id}/force-cancel', runOnly],
+  ['POST /actions/runs/{run_id}/rerun-failed-jobs', runOnly],
+  ['PUT /actions/workflows/{workflow_id}/disable', (_t, p) => onlyKeys(p, ['workflow_id'])],
+  ['DELETE /automated-security-fixes', (_t, p) => Object.keys(p).length === 0],
+  // the declared variable's name and value are checked above (SCRATCH_VARIABLES); a variable delete stays allowed
+  ['POST /actions/variables', () => true],
+  ['PATCH /actions/variables/{name}', () => true],
+  ['DELETE /actions/variables/{name}', (_t, p) => onlyKeys(p, ['name'])],
+]);
+/**
+ * The routes cleanupWrite builds (its op list fixes the parameters): removals, plus the cleanup's empty commit and the forced
+ * reset of the scratch default branch to it, which exist only here (I-1: never through a plain guardedWrite).
+ */
+const CLEANUP_WRITES: ReadonlySet<string> = new Set([
+  'POST /actions/runs/{run_id}/cancel', 'POST /actions/runs/{run_id}/force-cancel', 'DELETE /actions/runs/{run_id}',
+  'PATCH /pulls/{pull_number}', 'DELETE /git/refs/{ref}', 'DELETE /actions/caches/{cache_id}', 'DELETE /actions/variables/{name}',
+  'DELETE /code-scanning/analyses/{analysis_id}', 'POST /git/commits', 'PATCH /git/refs/{ref}',
+]);
+
+function checkScratch(r: GuardedRepo, method: string, path: string, p: Params, mode: 'plain' | 'cleanup'): void {
   // E4 (T12): no secret is written through a plain guardedWrite; scratchSecretSink is the one way (after checkScratchAccess)
   if (method !== 'DELETE' && SECRETS_PATH_RE.test(path)) refuse(`a secret of ${r.fullName} is stored only through scratchSecretSink, right after checkScratchAccess.`);
   if (method !== 'DELETE' && VARIABLES_PATH_RE.test(path)) {
@@ -286,14 +322,19 @@ function checkScratch(r: GuardedRepo, method: string, path: string, p: Params): 
       refuse(`${r.fullName} takes only the Actions variables pipegen declares (${SCRATCH_VARIABLES.join(', ')}), set by name.`);
     }
   }
-  if (path === '') {
+  if (path === '' && mode === 'plain') {
     if (method === 'PATCH' && Object.keys(p).length > 0 && onlyKeys(p, [...SCRATCH_REPO_PATCH]) && towardsPrivate(p)) return;
     refuse(method === 'DELETE' ? `deleting ${r.fullName} needs the exact name and pipegen's created marker (cleanup).`
       : `${method} on ${r.fullName} may only make it private, turn forking off, set its default branch or pipegen's marker.`);
   }
-  const section = path.split('/')[1] ?? '';
-  if (!SCRATCH_SECTIONS.has(section)) refuse(`${method} ${path} is not a write pipegen makes to ${r.fullName}.`);
-  if (section === 'actions' && SCRATCH_ACTIONS_DENIED.test(path)) refuse(`${method} ${path} is never called on ${r.fullName}.`);
+  const key = `${method} ${path}`;
+  if (mode === 'cleanup') {
+    if (CLEANUP_WRITES.has(key)) return;
+    refuse(`${key} is not a write of pipegen's cleanup of ${r.fullName}.`);
+  }
+  const check = SCRATCH_WRITES.get(key);
+  if (check === undefined) refuse(`${key} is not a write pipegen makes to ${r.fullName}.`);
+  if (!check(r.target, p)) refuse(`${key} on ${r.fullName} takes only the parameters pipegen sends.`);
 }
 
 /**
@@ -344,7 +385,7 @@ async function writeChecked(gh: Octokit, r: GuardedRepo, route: string, params: 
     if (!onlyKeys(params, ['secret_name', 'encrypted_value', 'key_id'])) refuse('a secret store takes only secret_name, encrypted_value and key_id.');
   } else if (mode === 'secret-delete') {
     if (!onlyKeys(params, ['secret_name'])) refuse('a secret delete takes only secret_name.');
-  } else checkScratch(r, method, path, params);
+  } else checkScratch(r, method, path, params, mode === 'cleanup' ? 'cleanup' : 'plain');
   try {
     // checked again before every attempt (review I1): withRateLimit may wait up to 60 s, then send the call again
     const res = await withRateLimit(() => { stopGate(); return gh.request(route, { ...params, owner: r.owner, repo: r.repo }); }, clock);

@@ -51,7 +51,8 @@ describe('E1 guardedWrite (S3)', () => {
   it('scratch: writes under /repos/{owner}/{repo} go out with the guarded owner and repo', async () => {
     const g = world({ repos: both });
     const s = assertScratch(proofTarget(app()), app());
-    await guardedWrite(g.gh, s, 'POST /repos/{owner}/{repo}/git/refs', { ref: 'refs/heads/proof/x', sha: SHA_MAIN });
+    // final review I-1: the one ref the API makes on the scratch repo is its default branch (setScratchDefaultBranch)
+    await guardedWrite(g.gh, s, 'POST /repos/{owner}/{repo}/git/refs', { ref: 'refs/heads/main', sha: SHA_MAIN });
     expect(g.seen()).toEqual([`POST /repos/${OWNER}/${SCRATCH}/git/refs`]);
   });
 
@@ -191,5 +192,126 @@ describe('E1 guardedWrite (S3)', () => {
     const io = { prompt: { confirm: async () => true, select: async () => { throw new Error(); }, text: async () => '' } as never, out: () => {}, err: () => {} };
     await expect(checkProofRepos(g.gh, app(), { ...({ ['au' + 'th']: { kind: 'fine-grained', canCreateRepos: false } } as Pick<ProofRepoOptions, 'auth'>), actions: [] }, io)).rejects.toThrow(/renamed or transferred/);
     expect(g.writes()).toEqual([]);
+  });
+});
+
+// Final review I-1 (ruling E-F1): the scratch guard admitted writes that skip checkProofWorkflows (the reviewer's probe,
+// tmp-final-review/probe-guard.test.ts). The scratch repo now takes exactly the writes pipegen makes; every workflow reaches
+// it only through a git push of a commit buildProofBranch checked. The empty commit and the forced reset of the default
+// branch exist only as cleanupWrite ops.
+describe('final review I-1: the scratch guard takes only the writes pipegen makes', () => {
+  const RUN_ID = '20261103-120000-abcdef';
+  const sha = 'a'.repeat(40);
+
+  it('refuses (nothing sent) every write that could put an unchecked workflow or setting in the scratch repo', async () => {
+    const g = world({ repos: both });
+    const s = assertScratch(proofTarget(app(), { runId: RUN_ID }), app());
+    const refused: [string, Record<string, unknown>][] = [
+      // the probe's shapes
+      ['PUT /repos/{owner}/{repo}/contents/{path}', { path: '.github/workflows/evil.yml', message: 'x', content: 'eA==', branch: 'main' }],
+      ['POST /repos/{owner}/{repo}/git/blobs', { content: 'on: push', encoding: 'utf-8' }],
+      ['POST /repos/{owner}/{repo}/git/trees', { tree: [] }],
+      ['POST /repos/{owner}/{repo}/git/commits', { message: 'x', tree: 'a'.repeat(40), parents: [] }],
+      ['PATCH /repos/{owner}/{repo}/git/refs/{ref}', { ref: 'heads/main', sha, force: true }],
+      ['PUT /repos/{owner}/{repo}/environments/{environment_name}', { environment_name: 'prod' }],
+      ['POST /repos/{owner}/{repo}/actions/runs/{run_id}/approve', { run_id: 1 }],
+      // the same families, other shapes
+      ['DELETE /repos/{owner}/{repo}/contents/{path}', { path: 'README.md', message: 'x', sha }],
+      ['PUT /repos/{owner}/{repo}/contents/{path}', { path: 'README.md', message: 'x', content: 'eA==' }],
+      ['POST /repos/{owner}/{repo}/git/tags', { tag: 'v1', message: 'x', object: sha, type: 'commit' }],
+      ['PATCH /repos/{owner}/{repo}/git/refs/{ref}', { ref: `heads/proof/${RUN_ID}/main`, sha }],
+      ['POST /repos/{owner}/{repo}/git/refs', { ref: `refs/heads/proof/${RUN_ID}/x`, sha }],   // pushes make proof branches, never the API
+      ['POST /repos/{owner}/{repo}/git/refs', { ref: 'refs/tags/v1', sha }],
+      ['POST /repos/{owner}/{repo}/git/refs', { ref: 'refs/heads/main', sha, extra: 1 }],
+      ['POST /repos/{owner}/{repo}/git/refs', { ref: 'refs/heads/main', sha: 'HEAD' }],
+      ['DELETE /repos/{owner}/{repo}/git/refs/{ref}', { ref: `heads/proof/${RUN_ID}/main` }],   // cleanupWrite's
+      ['DELETE /repos/{owner}/{repo}/environments/{environment_name}', { environment_name: 'prod' }],
+      ['POST /repos/{owner}/{repo}/environments/{environment_name}/deployment-branch-policies', { environment_name: 'prod', name: 'main' }],
+      ['PUT /repos/{owner}/{repo}/actions/workflows/{workflow_id}/enable', { workflow_id: 7 }],   // would undo the safety net
+      ['POST /repos/{owner}/{repo}/actions/runs/{run_id}/rerun', { run_id: 1 }],
+      ['POST /repos/{owner}/{repo}/actions/jobs/{job_id}/rerun', { job_id: 1 }],
+      ['DELETE /repos/{owner}/{repo}/actions/runs/{run_id}', { run_id: 1 }],                       // cleanupWrite's
+      ['DELETE /repos/{owner}/{repo}/actions/caches/{cache_id}', { cache_id: 1 }],                 // cleanupWrite's
+      ['PUT /repos/{owner}/{repo}/vulnerability-alerts', {}],
+      ['POST /repos/{owner}/{repo}/code-scanning/sarifs', { commit_sha: sha, ref: 'refs/heads/main', sarif: 'x' }],
+      ['POST /repos/{owner}/{repo}/pulls', { title: 't', head: 'other', base: 'main', body: 'b' }],
+      ['POST /repos/{owner}/{repo}/pulls', { title: 't', head: `proof/${RUN_ID}/main`, base: 'other', body: 'b' }],
+      ['POST /repos/{owner}/{repo}/pulls', { title: 't', head: 'proof/20261103-120000-ffffff/main', base: 'main', body: 'b' }],
+      ['PATCH /repos/{owner}/{repo}/pulls/{pull_number}', { pull_number: 3, base: 'other' }],
+      ['PATCH /repos/{owner}/{repo}/pulls/{pull_number}', { pull_number: 3, state: 'open' }],
+      ['PUT /repos/{owner}/{repo}/pulls/{pull_number}/merge', { pull_number: 3, sha, merge_method: 'merge', commit_message: 'x' }],
+      ['POST /repos/{owner}/{repo}/actions/runs/{run_id}/cancel', { run_id: 1, extra: 1 }],
+      ['PUT /repos/{owner}/{repo}/actions/workflows/{workflow_id}/disable', { workflow_id: 7, extra: 1 }],
+      ['DELETE /repos/{owner}/{repo}/automated-security-fixes', { extra: 1 }],
+      ['PUT /repos/{owner}/{repo}/automated-security-fixes', {}],
+    ];
+    for (const [route, params] of refused) {
+      await expect(guardedWrite(g.gh, s, route, params), `${route} ${JSON.stringify(params)}`).rejects.toThrow(ScratchGuardError);
+    }
+    expect(g.calls).toEqual([]);
+  });
+
+  /** Every write route src/proof sends through guardedWrite on the scratch repo, with the parameters its caller sends. */
+  const used: [string, Record<string, unknown>][] = [
+    ['PATCH /repos/{owner}/{repo}', { allow_forking: false }],                                         // repos.ts
+    ['PATCH /repos/{owner}/{repo}', { description: 'pipegen proof scratch repo' }],                     // repos.ts (the marker; checked below)
+    ['PATCH /repos/{owner}/{repo}', { default_branch: 'main' }],                                       // repos.ts setScratchDefaultBranch
+    ['PATCH /repos/{owner}/{repo}', { private: true }],                                                // target.ts makeRepoPrivate
+    ['PATCH /repos/{owner}/{repo}', { visibility: 'private' }],
+    ['POST /repos/{owner}/{repo}/git/refs', { ref: 'refs/heads/main', sha }],                         // repos.ts setScratchDefaultBranch
+    ['POST /repos/{owner}/{repo}/pulls', { title: 't', head: `proof/${RUN_ID}/main`, base: 'main', body: 'b' }],   // run.ts openProofPr
+    ['PUT /repos/{owner}/{repo}/pulls/{pull_number}/merge', { pull_number: 3, sha, merge_method: 'merge' }],      // run.ts mergeProofPr
+    ['PATCH /repos/{owner}/{repo}/pulls/{pull_number}', { pull_number: 3, state: 'closed' }],                     // run.ts closeProofPr
+    ['POST /repos/{owner}/{repo}/actions/runs/{run_id}/cancel', { run_id: 12 }],                                  // run.ts cancelRuns
+    ['POST /repos/{owner}/{repo}/actions/runs/{run_id}/force-cancel', { run_id: 12 }],                            // run.ts cancelRuns
+    ['POST /repos/{owner}/{repo}/actions/runs/{run_id}/rerun-failed-jobs', { run_id: 12 }],                       // run.ts rerunFailedJobs
+    ['DELETE /repos/{owner}/{repo}/automated-security-fixes', {}],                                     // snapshot.ts
+    ['PUT /repos/{owner}/{repo}/actions/workflows/{workflow_id}/disable', { workflow_id: 7 }],         // snapshot.ts disableUserWorkflows
+    ['POST /repos/{owner}/{repo}/actions/variables', { name: 'PIPEGEN_BLOCK_FROM', value: '2026-11-03' }],        // E4-R2's declared variable
+    ['PATCH /repos/{owner}/{repo}/actions/variables/{name}', { name: 'PIPEGEN_BLOCK_FROM', value: '2026-11-03' }],
+    ['DELETE /repos/{owner}/{repo}/actions/variables/{name}', { name: 'MY_KEY' }],
+  ];
+
+  it('every write route pipegen calls on the scratch repo still passes the guard', async () => {
+    const g = world({ repos: both });
+    const s = assertScratch(proofTarget(app(), { runId: RUN_ID }), app());
+    const { SCRATCH_MARKER } = await import('../src/proof/target.js');
+    for (const [route, params0] of used) {
+      const params = params0.description === undefined ? params0 : { description: SCRATCH_MARKER };
+      await guardedWrite(g.gh, s, route, params).catch((e: unknown) => { if (e instanceof ScratchGuardError) throw new Error(`${route}: ${e.message}`); });
+    }
+    expect(g.calls).toHaveLength(used.length);
+  });
+
+  it('source scan: every write route src/proof sends through guardedWrite is one the test above covers', async () => {
+    const { readFileSync, readdirSync } = await import('node:fs');
+    const dir = new URL('../src/proof/', import.meta.url);
+    const covered = new Set(used.map(([r]) => r));
+    const found = new Set<string>();
+    for (const f of readdirSync(dir).filter((x) => x.endsWith('.ts') && x !== 'target.ts')) {
+      const src = readFileSync(new URL(f, dir), 'utf8');
+      for (const m of src.matchAll(/['`]((?:POST|PUT|PATCH|DELETE) \/repos\/\{owner\}\/\{repo\}[^'`]*)['`]/g)) {
+        const r = m[1] as string;
+        // run.ts cancelRuns: `…/${what}` with what = cancel | force-cancel
+        for (const x of r.includes('${what}') ? [r.replace('${what}', 'cancel'), r.replace('${what}', 'force-cancel')] : [r]) found.add(x);
+      }
+    }
+    // the reads and the central repo's writes are not scratch writes
+    for (const r of ['PUT /repos/{owner}/{repo}/actions/permissions/access']) found.delete(r);
+    expect([...found].filter((r) => !covered.has(r))).toEqual([]);
+    expect(found.size).toBeGreaterThanOrEqual(10);
+  });
+
+  it('the empty commit and the forced reset of the default branch go only through cleanupWrite (cleanup mode)', async () => {
+    const { cleanupWrite } = await import('../src/proof/target.js');
+    const g = world({ repos: both, extra: (c) => (c.method === 'POST' && c.url.pathname.endsWith('/git/commits')
+      ? { status: 201, body: { sha: 'b'.repeat(40), tree: { sha: '4b825dc642cb6eb9a060e54bf8d69288fbee4904' }, parents: [] } }
+      : undefined) });
+    const s = assertScratch(proofTarget(app(), { runId: RUN_ID }), app());
+    await expect(guardedWrite(g.gh, s, 'POST /repos/{owner}/{repo}/git/commits', { message: 'pipegen: scratch repo emptied after the proof', tree: '4b825dc642cb6eb9a060e54bf8d69288fbee4904', parents: [] })).rejects.toThrow(ScratchGuardError);
+    expect(g.calls).toEqual([]);
+    const made = await cleanupWrite(g.gh, s, { op: 'empty-commit' });
+    await cleanupWrite(g.gh, s, { op: 'reset-default-branch', sha: (made.data as { sha: string }).sha }).catch((e: unknown) => { if (e instanceof ScratchGuardError) throw e; });
+    expect(g.seen()).toEqual([`POST /repos/${OWNER}/${SCRATCH}/git/commits`, `PATCH /repos/${OWNER}/${SCRATCH}/git/refs/heads/main`]);
   });
 });
