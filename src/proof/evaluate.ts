@@ -457,6 +457,34 @@ async function evaluateInner(draft: PipelineDraft, runs: readonly VariantRuns[],
   };
 }
 
+/** The conclusions a failed job can carry in the gate's own text `required check <tool> (<job>) did not succeed (<result>)`. */
+const GATE_RESULTS = ['failure', 'cancelled', 'timed_out', 'skipped', 'startup_failure', 'action_required', 'neutral', 'stale'] as const;
+/**
+ * Whether EVERY reason of a failed gate is a job whose failure is reported elsewhere (E5-R1 refused scanners, owned jobs that failed).
+ * result.json gives no job id per reason, so a reason counts only when it equals, character for character, the text gate/src/decide.ts
+ * writes for a structured entry (failedJobs, or a blocking toolError) of an explained job. Anything else is unexplained: a reason that
+ * only contains a job id (`test` inside `test-e2e`), extra text, no reasons at all, a finding, a not-run fork check, a settings error.
+ */
+export function blockExplained(d: GateResultDoc, jobList: readonly JobListEntry[], explained: ReadonlySet<string>): boolean {
+  if (d.pass || d.blocking.length > 0 || d.notRun.length > 0 || d.blockReasons.length === 0) return false;
+  const expected = new Set<string>();
+  const toolOf = (job: string): string | null => { const e = jobList.find((x) => x.job === job); return e === undefined ? null : (e.tool ?? e.needId); };
+  let refs = 0;
+  for (const f of d.failedJobs) {
+    const tool = toolOf(f.job);
+    if (!explained.has(f.job) || tool === null) return false;
+    for (const r of GATE_RESULTS) expected.add(`required check ${tool} (${f.job}) did not succeed (${r})`);
+    refs++;
+  }
+  for (const t of d.toolErrors) {
+    if (!t.blocks) continue;
+    if (!explained.has(t.job)) return false;
+    expected.add(`tool error in ${t.tool ?? t.needId} (${t.job})${t.base ? ' on the base commit' : ''}: re-run the job`);
+    refs++;
+  }
+  return refs > 0 && d.blockReasons.every((r) => expected.has(r));
+}
+
 // ---------- pipeline: main variant ----------
 
 type RefusedIn = (runs: readonly RunOutcome[]) => Map<string, Hit[]>;
@@ -483,7 +511,10 @@ function pipelineMain(
   for (const rs of [prP, mergeP, pushP]) for (const [needId, hits] of refusedIn(rs)) refused.set(needId, [...(refused.get(needId) ?? []), ...hits]);
   for (const [needId, hits] of refused) refusedNote(needId, hits);
   const refusedJobs = new Set([...refused.values()].flat().map((h) => h.job));
-  const explainedIds = new Set<string>([...ownedJobs, ...[...scannerJobs].filter(([, n]) => refused.has(n)).map(([j]) => j)]);
+  // jobs whose failure is reported elsewhere: a refused scanner (E5-R1), or an owned job that really failed in some layer (its part then
+  // fails or is not-proven for it, because ownedState says failed and the part runs classify on it)
+  const failedOwned = [...ownedJobs].filter((id) => ownedState(layers, prP, id).state === 'failed');
+  const explainedIds = new Set<string>([...failedOwned, ...[...scannerJobs].filter(([, n]) => refused.has(n)).map(([j]) => j)]);
   const isExplained = (jobId: string): boolean => explainedIds.has(jobId);
 
   // every pipegen job in every layer: green, except the jobs other parts own and the refused ones
@@ -528,11 +559,7 @@ function pipelineMain(
   } else if (gateState === 'failed') {
     // the gate blocked the main PR. Fine only when every reason is a job that is explained elsewhere (another part owns it, or its mount was refused)
     const d = read.ok ? read.doc : null;
-    const attributed = d === null ? 0 : d.failedJobs.length + d.notRun.length + d.toolErrors.filter((t) => t.blocks).length;
-    const explained = d !== null && !d.pass && attributed > 0 && d.blocking.length === 0
-      && d.failedJobs.every((f) => isExplained(f.job)) && d.notRun.every((f) => isExplained(f.job))
-      && d.toolErrors.every((t) => !t.blocks || isExplained(t.job))
-      && d.blockReasons.every((r) => [...explainedIds].some((id) => r.includes(id)));
+    const explained = d !== null && blockExplained(d, jobList, explainedIds);
     if (!explained || d === null) {
       const why = d === null ? read.ok ? '' : ` (${(read as { reason: string }).reason})` : d.blocking.length > 0 ? `: ${d.blocking.slice(0, 5).map((f) => `${st(f.tool, 40)} ${st(f.ruleId, 60)}${f.file === undefined ? '' : ` in ${st(f.file, 80)}`}`).join(', ')}` : d.blockReasons.length > 0 ? `: ${d.blockReasons.slice(0, 3).map((r) => st(r, 160)).join(' | ')}` : '';
       sheet.fail('pipeline', `the gate blocked the pull request${why}`, undefined, gateRun.handle.url);
@@ -546,8 +573,10 @@ function pipelineMain(
       if (!e.blocking || e.range === true || isExplained(e.job)) continue;
       if (e.tool !== undefined && /^zap/.test(e.tool)) continue;
       if (e.artifact !== undefined) {
-        const has = prP.some((r) => r.artifacts.has(e.artifact as string));
-        const problem = prP.map((r) => r.artifactProblems.get(e.artifact as string)).find((p) => p !== undefined);
+        // the artifact must come from the run of the job that produced it, a pipegen workflow run (never a compat copy's)
+        const producers = hitsIn(prP, (n) => jobNameMatches(n, e.job)).map((h) => h.run);
+        const has = producers.some((r) => r.artifacts.has(e.artifact as string));
+        const problem = producers.map((r) => r.artifactProblems.get(e.artifact as string)).find((p) => p !== undefined);
         if (!has) sheet.fail('pipeline', problem !== undefined ? `report unreadable: the result of ${st(e.needId, 60)} (${st(e.artifact, 100)}): ${st(problem, 200)}` : `the result of ${st(e.needId, 60)} (${st(e.artifact, 100)}) is missing`, e.needId);
       }
       if (doc !== null) {
@@ -572,8 +601,17 @@ function zapAndNuclei(draft: PipelineDraft, sheet: Sheet, jobList: readonly JobL
 }
 
 // ---------- compat copies ----------
+/** A compat copy is the user's own workflow: it never legitimately holds a pipegen result. Its artifacts are never a source of proof, and holding one is a failure. */
+function compatSpoof(layers: Layers, sheet: Sheet): void {
+  for (const run of ofKind([...layers.push, ...layers.pr, ...layers.merge], 'compat')) {
+    const spoof = [...run.artifacts.keys(), ...run.artifactProblems.keys()].filter((n) => n === GATE_RESULT_ARTIFACT || n.startsWith('pipegen-out-'));
+    if (spoof.length > 0) sheet.fail('pipeline', `the compat copy ${st(run.handle.workflow.replace(COMPAT_PREFIX, '.github/workflows/'), 100)} carries a pipegen result artifact (${spoof.slice(0, 3).map((n) => st(n, 80)).join(', ')}); it is ignored as a source of proof`, undefined, run.handle.url);
+  }
+}
+
 
 function compat(main: VariantRuns, layers: Layers, ctx: EvalContext, sheet: Sheet): void {
+  compatSpoof(layers, sheet);
   for (const run of ofKind(layers.pr, 'compat')) {
     const user = run.handle.workflow.replace(COMPAT_PREFIX, '.github/workflows/');
     const jobs = latest(run.jobs);
@@ -602,6 +640,7 @@ function plantedChecks(
   const prP = ofKind(layers.pr, 'pipegen');
   if (planted.stopped === true || layers.pr.some((o) => o.stopped === true)) { sheet.fail('pipeline', 'the proof was stopped before the planted pull request finished, so the scanners are not shown to catch anything'); return; }
   if (prP.length === 0) { sheet.fail('pipeline', "pipegen's workflow did not run on the planted pull request, so the gate is not shown to block planted problems"); return; }
+  compatSpoof(layers, sheet);
   const refused = refusedIn(prP);
   for (const [needId, hits] of refused) refusedNote(needId, hits);
   const gateHits = hitsIn(prP, (n) => jobNameMatches(n, 'gate'));
@@ -712,18 +751,20 @@ async function testsPart(
     for (const r of runs) { const f = r.artifacts.get(name); if (f !== undefined) return { file: f.bytes }; }
     return {};
   };
-  const everyPr = layers.pr;
+  // the first run's JUnit only from pipegen's own PR runs; the repeat's only from the harness run that holds the tests-repeat job
+  const firstRuns = prP;
+  const repeatRuns = hitsIn(harnessPr, harnessId('tests-repeat')).map((h) => h.run);
   for (const c of created) {
     const names = junitArtifactNames(c.service);
     const svc = st(c.service, 60);
-    const get = async (artifact: string, label: string): Promise<TestCaseResult[] | null> => {
-      const a = findArtifact(artifact, everyPr);
+    const get = async (artifact: string, label: string, from: readonly RunOutcome[]): Promise<TestCaseResult[] | null> => {
+      const a = findArtifact(artifact, from);
       if (a.file === undefined) { sheet.fail('tests', a.problem !== undefined ? `report unreadable: the ${label} JUnit of ${svc}: ${st(a.problem, 200)}` : `the ${label} JUnit report of ${svc} (${st(artifact, 100)}) was not uploaded, so its tests are not proven`, 'created-tests'); return null; }
       const r = await readReport(ctx, a.file);
       if (!r.ok) { sheet.fail('tests', `${label} JUnit of ${svc}: ${r.reason}`, 'created-tests'); return null; }
       return r.cases;
     };
-    const first = await get(names.first, 'first-run');
+    const first = await get(names.first, 'first-run', firstRuns);
     if (first !== null) {
       const skippedN = first.filter((x) => x.status === 'skip').length;
       const failedN = first.filter((x) => x.status === 'fail').length;
@@ -738,7 +779,7 @@ async function testsPart(
       if (s === 'failed') { sheet.fail('tests', `the repeat run of the created tests failed: ${failing(hits).map(describeJob).join(', ')}`, 'created-tests', hits[0]?.run.handle.url); sheet.evidenceOf('tests', failing(hits)); }
       else if (s !== 'success') sheet.fail('tests', 'the repeat run of the created tests did not run, so flaky tests are not ruled out', 'created-tests');
     }
-    const repeat = await get(names.repeat, 'repeat');
+    const repeat = await get(names.repeat, 'repeat', repeatRuns);
     if (first !== null && repeat !== null) {
       const same = sameResults(first, repeat);
       if (!same.ok) {

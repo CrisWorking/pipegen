@@ -482,7 +482,7 @@ describe('E5-R1: scanner mounts that Bullfrog refuses', () => {
     setConclusion(o, 'gate', 'failure');
     o.conclusion = 'failure';
     o.artifacts.delete(resultArtifactName('sast', 'api'));
-    setGate(o, d, { result: 'block', failedJobs: [{ needId: 'sast', job: jobName }], blockReasons: [`sast--api failed`] });
+    setGate(o, d, { result: 'block', failedJobs: [{ needId: 'sast', job: jobName }], blockReasons: [`required check semgrep (sast--api) did not succeed (failure)`] });
   };
 
   it('a scanner job that failed because Bullfrog refused a mount is not-proven with the gate-v0.2.2 note, not pipeline failed', async () => {
@@ -538,7 +538,7 @@ describe('E5-R1: scanner mounts that Bullfrog refuses', () => {
     // blocking findings from another scanner on the main PR are real
     const m3 = greenMain(d);
     refuse(m3, d);
-    setGate(prRun(m3), d, { result: 'block', blocking: [gateFinding('secrets', 'gitleaks', { file: 'a.js', secret: true })], failedJobs: [{ needId: 'sast', job: 'sast--api' }], blockReasons: ['sast--api failed'] });
+    setGate(prRun(m3), d, { result: 'block', blocking: [gateFinding('secrets', 'gitleaks', { file: 'a.js', secret: true })], failedJobs: [{ needId: 'sast', job: 'sast--api' }], blockReasons: ['required check semgrep (sast--api) did not succeed (failure)'] });
     expect(part(await evaluate(d, both(d, m3), ctxOf()), 'pipeline')?.status).toBe('failed');
   });
 
@@ -877,5 +877,110 @@ describe('owned checks fail in any layer; skipped parts do not hide a red job', 
     const r = await evaluate(d, both(d, m), ctxOf());
     expect(part(r, 'precommit')?.status).toBe('not-proven');
     expect(part(r, 'pipeline')?.status).toBe('failed');
+  });
+});
+
+describe('gate block attribution is exact (no substring matching)', () => {
+  const MOUNT = 'docker: Error response from daemon: bullfrog: mounting the host path /w is not allowed while sudo is disabled';
+  const setup = (reasons: string[], over: Record<string, unknown> = {}) => {
+    const d = D();
+    const m = greenMain(d);
+    const o = prRun(m);
+    setConclusion(o, 'sast--api', 'failure', MOUNT);
+    setConclusion(o, 'gate', 'failure');
+    o.conclusion = 'failure';
+    o.artifacts.delete(resultArtifactName('sast', 'api'));
+    setGate(o, d, { result: 'block', failedJobs: [{ needId: 'sast', job: 'sast--api' }], blockReasons: reasons, ...over });
+    return { d, m };
+  };
+  const exact = 'required check semgrep (sast--api) did not succeed (failure)';
+  it('the exact reason the gate writes for the refused job is explained', async () => {
+    const { d, m } = setup([exact]);
+    expect(part(await evaluate(d, both(d, m), ctxOf()), 'pipeline')?.status).toBe('not-proven');
+  });
+  it('a reason that only contains the job id, adds text, or is unrelated is unexplained: pipeline failed', async () => {
+    for (const reasons of [[exact, 'required check semgrep (sast--api-e2e) did not succeed (failure)'], [`${exact}; also the protected file changed`], ['sast--api'], ['sast--api failed'], [exact, 'pipeline files changed or suppressions added without code-owner approval on the current commit']]) {
+      const { d, m } = setup(reasons);
+      expect(part(await evaluate(d, both(d, m), ctxOf()), 'pipeline')?.status, reasons.join('|')).toBe('failed');
+    }
+  });
+  it('a failed gate with no block reasons is unexplained', async () => {
+    const { d, m } = setup([]);
+    expect(part(await evaluate(d, both(d, m), ctxOf()), 'pipeline')?.status).toBe('failed');
+  });
+  it('a reason for a job id that is only a prefix of the refused one does not count', async () => {
+    const { d, m } = setup([exact], { failedJobs: [{ needId: 'sast', job: 'sast--api-e2e' }] });
+    expect(part(await evaluate(d, both(d, m), ctxOf()), 'pipeline')?.status).toBe('failed');
+  });
+  it('a blocking tool error on an owned job explains the block only when that job really failed', async () => {
+    const d = D();
+    const toolErr = { needId: 'unit-tests', job: 'unit-tests--api', base: false, blocks: true, reason: 'x' };
+    const reason = 'tool error in unit-tests (unit-tests--api): re-run the job';
+    const green = greenMain(d);
+    setConclusion(prRun(green), 'gate', 'failure');
+    setGate(prRun(green), d, { result: 'block', toolErrors: [toolErr], blockReasons: [reason] });
+    // unit-tests did not fail: nobody reports it, so the gate's block is the pipeline's failure
+    expect(part(await evaluate(d, both(d, green), ctxOf()), 'pipeline')?.status).toBe('failed');
+    // unit-tests failed: the tests part reports it, and the explained block does not fail the pipeline twice
+    const red = greenMain(d);
+    setConclusion(prRun(red), 'gate', 'failure');
+    setConclusion(prRun(red), 'unit-tests--api', 'failure', 'boom');
+    setGate(prRun(red), d, { result: 'block', toolErrors: [toolErr], blockReasons: [reason] });
+    const r = await evaluate(d, both(d, red), ctxOf());
+    expect(part(r, 'tests')?.status).toBe('failed');
+    expect(part(r, 'pipeline')?.status).toBe('proven');
+    expect(r.ok).toBe(false);
+  });
+});
+
+describe('a compat run is never a source of proof', () => {
+  const compatWith = (artifacts: ReturnType<typeof file>[]) => run({ workflow: `${COMPAT_PREFIX}ci.yml`, event: 'pull_request', jobs: [job('build')], artifacts });
+  it('a compat artifact named like a pipegen result is a failure and supplies nothing', async () => {
+    const d = D();
+    const m = greenMain(d);
+    m.outcomes.push(compatWith([file('pipegen-out-junit-api', 'junit.xml', xml([['s > a', 'pass'], ['s > b', 'pass']])), file('pipegen-out-sast--api', 'results.sarif', '{}')]));
+    const r = await evaluate(d, both(d, m), ctxOf());
+    expect(part(r, 'pipeline')?.status).toBe('failed');
+    expect(part(r, 'pipeline')?.detail).toMatch(/compat copy .*ci\.yml.*pipegen result artifact/);
+    // the same in the planted variant and the gate result name
+    const p = plantedRuns(d);
+    p.outcomes.push(compatWith([file(GATE_RESULT_ARTIFACT, 'result.json', '{}')]));
+    expect(part(await evaluate(d, both(d, greenMain(d), p), ctxOf()), 'pipeline')?.status).toBe('failed');
+  });
+  it('the created tests are not proven by a compat run holding both JUnit reports', async () => {
+    const d = D();
+    const GOOD = xml([['s > a', 'pass'], ['s > b', 'pass']]);
+    const m = greenMain(d);
+    m.outcomes.push(compatWith([file('pipegen-out-junit-api', 'junit.xml', GOOD), file('pipegen-out-junit-repeat-api', 'junit.xml', GOOD)]));
+    harnessPr(m).jobs.push(harnessJob('tests-repeat'));
+    const r = await evaluate(d, both(d, m), ctxOf({ createdTests: [{ service: 'api', staticCount: 2 }], readJunit, harnessJobs: ['egress-check', 'app-start', 'verify-lookup', 'tests-repeat'] }));
+    expect(part(r, 'tests')?.status).toBe('failed');
+    expect(part(r, 'tests')?.detail).toMatch(/not uploaded/);
+    expect(r.ok).toBe(false);
+  });
+  it('the repeat report counts only from the harness run (a pipegen PR run holding it is not the repeat)', async () => {
+    const d = D();
+    const GOOD = xml([['s > a', 'pass'], ['s > b', 'pass']]);
+    const m = greenMain(d);
+    prRun(m).artifacts.set('pipegen-out-junit-api', file('pipegen-out-junit-api', 'junit.xml', GOOD));
+    prRun(m).artifacts.set('pipegen-out-junit-repeat-api', file('pipegen-out-junit-repeat-api', 'junit.xml', GOOD));
+    harnessPr(m).jobs.push(harnessJob('tests-repeat'));
+    const r = await evaluate(d, both(d, m), ctxOf({ createdTests: [{ service: 'api', staticCount: 2 }], readJunit, harnessJobs: ['egress-check', 'app-start', 'verify-lookup', 'tests-repeat'] }));
+    expect(part(r, 'tests')?.status).toBe('failed');
+  });
+  it('a result artifact for a need counts only from the run holding that need\'s job', async () => {
+    const d = D();
+    const m = greenMain(d);
+    prRun(m).artifacts.delete(resultArtifactName('sast', 'api'));
+    m.outcomes[0]!.artifacts.set(resultArtifactName('sast', 'api'), file(resultArtifactName('sast', 'api'), 'results.sarif', '{}'));   // the push run holds no sast job
+    const r = await evaluate(d, both(d, m), ctxOf());
+    expect(need(r, 'pipeline', 'sast')?.status).toBe('failed');
+  });
+  it('a gate report in a compat or harness run is never read as the gate\'s', async () => {
+    const d = D();
+    const m = greenMain(d);
+    prRun(m).artifacts.delete(GATE_RESULT_ARTIFACT);
+    harnessPr(m).artifacts.set(GATE_RESULT_ARTIFACT, gateDoc({ runId: harnessPr(m).handle.runId }, d));
+    expect(part(await evaluate(d, both(d, m), ctxOf()), 'pipeline')?.status).toBe('failed');
   });
 });
